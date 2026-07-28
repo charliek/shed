@@ -77,7 +77,11 @@ test-host-agent-diff:
 	}
 	cd tests/host-agent-diff && uv sync && uv run pytest -v
 	go test ./cmd/shed-host-agent/... -run Golden
-	cd crates && PATH="$$HOME/.cargo/bin:$$PATH" cargo test -p shed-host-agent golden
+	# Both Rust crates: the daemon bin owns tests/golden.rs, while the in-crate
+	# golden runners (load_discovered_servers, ssh_payload_shapes, the config/
+	# aws/docker/egress vectors) moved into shed-broker with the crate split. A
+	# filter scoped to the bin alone silently ran ZERO of them.
+	cd crates && PATH="$$HOME/.cargo/bin:$$PATH" cargo test -p shed-host-agent -p shed-broker golden
 
 # Parallel dev shed-server lifecycle (Mac VZ).
 #
@@ -115,6 +119,63 @@ DEV_LOG_PATH := $(HOME)/.shed/dev/server.log
 DEV_PID_PATH := $(HOME)/.shed/dev/server.pid
 DEV_CONFIG   := $(CURDIR)/configs/server.dev-parallel.mac.yaml
 
+# auth.mode for the dev server: "token" (default) or "mtls". "token" needs no
+# override at all; "mtls" renders a throwaway copy with auth.mode: mtls (see
+# DEV_GENERATED_CONFIG below). Honored by dev-server-up / dev-server-restart
+# (and the -fc variants below). Forwarded to `make test-integration-dev[-fc]`
+# so tests/integration/test_mtls.py can detect which mode the running dev
+# server is actually in (it skips cleanly unless this is "mtls" — see that
+# module's docstring for the detection mechanism).
+SHED_DEV_AUTH_MODE ?= token
+
+# OPTIONAL, per-machine: relocate the dev server's blob-heavy state (images,
+# instances, snapshots, uppers) off the boot volume. Unset by default, which
+# is the committed config's `~/Library/Application Support/shed-dev/vz` — so
+# every other developer's behavior is unchanged and nothing about this is
+# machine-specific in the repo.
+#
+# Set it in your shell profile when this machine's boot volume can't host a
+# multi-GB dev image store, e.g.:
+#   export SHED_DEV_STATE_DIR=/Volumes/miniext/shed-dev/vz
+#
+# socket_dir is deliberately NOT relocated (unix socket path length limits) —
+# see scripts/render-dev-config.sh. The volume must be mounted; dev-server-up
+# refuses to start otherwise rather than silently building a second, empty
+# image store on the mount point.
+SHED_DEV_STATE_DIR ?=
+
+# The rendered config, written whenever ANY override above is active. With no
+# overrides the targets run the committed $(DEV_CONFIG) directly — byte
+# identical to having no generation step at all.
+DEV_GENERATED_CONFIG := $(HOME)/.shed/dev/server.generated.yaml
+DEV_RENDER_ARGS := $(if $(filter mtls,$(SHED_DEV_AUTH_MODE)),--mtls,) \
+                   $(if $(SHED_DEV_STATE_DIR),--state-dir $(SHED_DEV_STATE_DIR),)
+
+# Refuse to start when SHED_DEV_STATE_DIR points somewhere unwritable — an
+# external volume that isn't mounted, typically. Without this the server
+# happily creates an empty store on the bare mount point, then reports "image
+# not found" for every create, which reads like a product bug rather than
+# "plug the drive in". No-op when the variable is unset.
+define check-dev-state-dir
+@if [ -n "$(SHED_DEV_STATE_DIR)" ]; then \
+  parent="$$(dirname "$(SHED_DEV_STATE_DIR)")"; \
+  while [ ! -d "$$parent" ] && [ "$$parent" != "/" ]; do parent="$$(dirname "$$parent")"; done; \
+  case "$(SHED_DEV_STATE_DIR)" in \
+    /Volumes/*) vol="/$$(echo "$(SHED_DEV_STATE_DIR)" | cut -d/ -f2-3)"; \
+      if ! mount | grep -q " on $$vol "; then \
+        echo "ERROR: SHED_DEV_STATE_DIR=$(SHED_DEV_STATE_DIR) but $$vol is not mounted."; \
+        echo "       Mount the volume, or unset SHED_DEV_STATE_DIR to use the"; \
+        echo "       default under ~/Library/Application Support/shed-dev/vz."; \
+        exit 1; \
+      fi ;; \
+  esac; \
+  if ! mkdir -p "$(SHED_DEV_STATE_DIR)" 2>/dev/null || [ ! -w "$(SHED_DEV_STATE_DIR)" ]; then \
+    echo "ERROR: SHED_DEV_STATE_DIR=$(SHED_DEV_STATE_DIR) is not writable."; \
+    exit 1; \
+  fi; \
+fi
+endef
+
 # shed-build-tools image ref to inject when the dev binary runs.
 # Dev binaries embed Version="vX.Y.Z-N-gHASH-dirty", which
 # BuildToolsRefForTag returns "" for by design (dev-build isolation).
@@ -142,33 +203,62 @@ dev-server-up: build
 	  echo "       or 'make dev-server-down' to stop it first."; \
 	  exit 1; \
 	fi
+	@case "$(SHED_DEV_AUTH_MODE)" in \
+	  token|mtls) ;; \
+	  *) echo "ERROR: SHED_DEV_AUTH_MODE must be 'token' or 'mtls' (got '$(SHED_DEV_AUTH_MODE)')"; exit 1 ;; \
+	esac
+	$(call check-dev-state-dir)
+	@# Select the config: with NO overrides (the default) the committed
+	@# $(DEV_CONFIG) runs untouched — no generation step at all. Any override
+	@# (SHED_DEV_AUTH_MODE=mtls and/or SHED_DEV_STATE_DIR) renders a throwaway
+	@# variant first; the committed base is never edited. Combined into the
+	@# SAME shell invocation as the nohup launch below (Make starts a fresh
+	@# subshell per recipe line; RUN_CONFIG must survive into the launch line).
+	@#
 	@# Inline env so we don't pollute the caller's launchctl domain
 	@# (and so the brew server's launchctl env is left alone). Note
 	@# the env var name: shed-server reads SHED_BUILD_TOOLS_REF; the
 	@# Makefile-level variable that holds its value is named
 	@# RELEASE_BUILD_TOOLS_REF (because it points at the *release*
 	@# tooling image).
-	@SHED_BUILD_TOOLS_REF="$(RELEASE_BUILD_TOOLS_REF)" \
-	  nohup bin/shed-server serve --config "$(DEV_CONFIG)" \
+	@if [ -n "$(strip $(DEV_RENDER_ARGS))" ]; then \
+	  ./scripts/render-dev-config.sh "$(DEV_CONFIG)" "$(DEV_GENERATED_CONFIG)" $(DEV_RENDER_ARGS) \
+	    && RUN_CONFIG="$(DEV_GENERATED_CONFIG)"; \
+	else \
+	  RUN_CONFIG="$(DEV_CONFIG)"; \
+	fi; \
+	SHED_BUILD_TOOLS_REF="$(RELEASE_BUILD_TOOLS_REF)" \
+	  nohup bin/shed-server serve --config "$$RUN_CONFIG" \
 	    > "$(DEV_LOG_PATH)" 2>&1 & \
 	  echo $$! > "$(DEV_PID_PATH)"
-	@# Readiness probe — same shape used everywhere in this Makefile.
+	@# Readiness probe. Reads the server's OWN readiness line rather than
+	@# probing with the CLI: a CLI probe needs an enrolled client entry, which
+	@# under auth.mode: mtls does not exist until `shed server add` has run —
+	@# so a CLI probe reports a perfectly healthy mtls server as "not
+	@# reachable". The log line is mode-independent and needs no credential.
 	@for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do \
-	  if shed -s $(SHED_VZ_DEV_SERVER) list >/dev/null 2>&1; then \
+	  if grep -q "Shed server is ready" "$(DEV_LOG_PATH)" 2>/dev/null; then \
 	    echo "Dev VZ shed-server ($(SHED_VZ_DEV_SERVER)) ready after $${i}s."; \
 	    break; \
 	  fi; \
 	  if [ "$$i" = "15" ]; then \
-	    echo "WARNING: Dev VZ shed-server ($(SHED_VZ_DEV_SERVER)) not reachable after 15 s."; \
+	    echo "WARNING: Dev VZ shed-server ($(SHED_VZ_DEV_SERVER)) did not report ready after 15 s."; \
 	    echo "  - Tail the log:  make dev-server-logs   (or 'tail $(DEV_LOG_PATH)')"; \
-	    echo "  - CLI entry:     verify ~/.shed/config.yaml has '$(SHED_VZ_DEV_SERVER)' on port 18080"; \
 	    echo "  - Brew server:   should be unaffected; 'shed -s $(SHED_VZ_SERVER) list' still works"; \
 	  fi; \
 	  sleep 1; \
 	done
 	@echo ""
 	@echo "Dev shed-server up: pid $$(cat $(DEV_PID_PATH))"
-	@echo "  Config:  $(DEV_CONFIG)"
+	@echo "  Auth mode: $(SHED_DEV_AUTH_MODE)"
+	@if [ -n "$(strip $(DEV_RENDER_ARGS))" ]; then \
+	  echo "  Config:  $(DEV_GENERATED_CONFIG) (generated from $(DEV_CONFIG))"; \
+	else \
+	  echo "  Config:  $(DEV_CONFIG)"; \
+	fi
+	@if [ -n "$(SHED_DEV_STATE_DIR)" ]; then \
+	  echo "  State:   $(SHED_DEV_STATE_DIR) (SHED_DEV_STATE_DIR)"; \
+	fi
 	@echo "  Log:     $(DEV_LOG_PATH)"
 	@echo "  CLI:     shed -s $(SHED_VZ_DEV_SERVER) list"
 	@echo "Run 'make test-integration-dev' to run the suite against it."
@@ -230,6 +320,12 @@ dev-server-status:
 	  fi; \
 	  echo "Log:        $(DEV_LOG_PATH)"; \
 	  echo "Config:     $(DEV_CONFIG)"; \
+	  if [ -n "$(SHED_DEV_STATE_DIR)" ]; then \
+	    echo "State dir:  $(SHED_DEV_STATE_DIR) (SHED_DEV_STATE_DIR now in effect)"; \
+	  fi; \
+	  echo "Auth mode:  $(SHED_DEV_AUTH_MODE) (the SHED_DEV_AUTH_MODE value now in effect;"; \
+	  echo "            not introspected from the running process — rerun with the"; \
+	  echo "            same value used at 'dev-server-up'/'-restart' time)"; \
 	else \
 	  echo "Dev server: NOT running"; \
 	  if [ -f "$(DEV_PID_PATH)" ]; then \
@@ -278,10 +374,24 @@ test-integration-dev: build
 	@# uses it). Today's tests all use `shed_server`; future
 	@# dev-specific meta-tests can use `shed_server_dev` without needing
 	@# a different Make target.
-	SHED_VZ_SERVER=$(SHED_VZ_DEV_SERVER) \
+	@#
+	@# SHED_DEV_AUTH_MODE is forwarded explicitly (not just relied on to be
+	@# inherited) so `tests/integration/test_mtls.py` sees the exact value
+	@# the dev server was last started/restarted with, regardless of how
+	@# this target was invoked (env var vs. `make ... SHED_DEV_AUTH_MODE=`).
+	@# PATH puts THIS tree's freshly built bin/ first, so the suite drives the
+	@# branch's `shed` rather than the brew-installed release. Without it the
+	@# fixtures resolve `shed` via shutil.which() to /opt/homebrew/bin/shed and
+	@# silently test the OLD client against the dev server — wrong for any
+	@# client-side change, and fatal under auth.mode: mtls, where a pre-mtls
+	@# client cannot complete the TLS handshake at all and every VZ test skips
+	@# with a misleading "dev server is not reachable".
+	PATH="$(CURDIR)/bin:$$PATH" \
+	  SHED_VZ_SERVER=$(SHED_VZ_DEV_SERVER) \
 	  SHED_VZ_LOG_PATH=$(DEV_LOG_PATH) \
 	  SHED_VZ_DEV_SERVER=$(SHED_VZ_DEV_SERVER) \
 	  SHED_VZ_DEV_LOG_PATH=$(DEV_LOG_PATH) \
+	  SHED_DEV_AUTH_MODE=$(SHED_DEV_AUTH_MODE) \
 	  $(MAKE) test-integration
 
 # Parallel dev shed-server lifecycle (FC remote).
@@ -301,7 +411,7 @@ test-integration-dev: build
 # Setup (one-time per dev workstation):
 #   1. Add a ~/.shed/config.yaml entry for $(SHED_FC_DEV_SERVER)
 #      (snippet in CLAUDE.md / tests/integration/README.md), OR run
-#      `shed server add $(FC_REMOTE_HOST) --port 18080 --name $(SHED_FC_DEV_SERVER)`
+#      `shed server add $(FC_REMOTE_HOST) --port 18080 --ssh-port 12222 --name $(SHED_FC_DEV_SERVER)`
 #      after the first `make dev-server-up-fc`.
 #
 # Assumed infrastructure (same as today's deb install):
@@ -341,6 +451,13 @@ FC_DEV_PID_PATH  ?= /tmp/shed-server-dev.pid
 # The egress proxy must sit next to the running shed-server binary so it
 # resolves as its sibling. The dev server runs from /tmp, so install here.
 FC_DEV_PROXY_PATH ?= /tmp/shed-egress-proxy
+
+# Local (this workstation) staging path for the rendered mtls variant of
+# configs/server.dev-parallel.linux-fc.yaml, used when SHED_DEV_AUTH_MODE=mtls
+# (see the SHED_DEV_AUTH_MODE comment above the Mac dev-server-up target).
+# Rendered here, then scp'd to the remote in place of the static committed
+# config — the committed file is never edited.
+FC_DEV_LOCAL_MTLS_CONFIG ?= $(HOME)/.shed/dev/server.fc-mtls-generated.yaml
 
 # Cross-compile shed-server for the remote host's GOARCH. Detects arch
 # at recipe time via `ssh <host> uname -m`; refuses to silently default
@@ -387,16 +504,23 @@ dev-server-up-fc: build-fc-remote-server
 	  echo "       or 'make dev-server-down-fc' to stop it first."; \
 	  exit 1; \
 	fi
-	@# scp binary + config to the remote. PID-unique tmp suffix so two
-	@# concurrent install runs on the same host don't clobber each
-	@# other's uploaded files (belt-and-suspenders — the dev
-	@# workstation is single-user).
-	@UPLOAD_BIN=/tmp/shed-server-dev.upload.$$$$; \
+	@# Select the config to upload: SHED_DEV_AUTH_MODE=token (default) uploads
+	@# the committed configs/server.dev-parallel.linux-fc.yaml untouched; =mtls
+	@# renders a throwaway mtls variant locally first (never edits the
+	@# committed base) and uploads that instead. Same pattern as the Mac
+	@# dev-server-up target; see the SHED_DEV_AUTH_MODE comment there.
+	@case "$(SHED_DEV_AUTH_MODE)" in \
+	  token) LOCAL_CFG="configs/server.dev-parallel.linux-fc.yaml" ;; \
+	  mtls) ./scripts/render-dev-config.sh configs/server.dev-parallel.linux-fc.yaml "$(FC_DEV_LOCAL_MTLS_CONFIG)" --mtls && LOCAL_CFG="$(FC_DEV_LOCAL_MTLS_CONFIG)" ;; \
+	  *) echo "ERROR: SHED_DEV_AUTH_MODE must be 'token' or 'mtls' (got '$(SHED_DEV_AUTH_MODE)')"; exit 1 ;; \
+	esac; \
+	echo "Uploading $$LOCAL_CFG (SHED_DEV_AUTH_MODE=$(SHED_DEV_AUTH_MODE))..."; \
+	UPLOAD_BIN=/tmp/shed-server-dev.upload.$$$$; \
 	 UPLOAD_CFG=/tmp/shed-server-dev.upload.$$$$.yaml; \
 	 UPLOAD_PROXY=/tmp/shed-egress-proxy-dev.upload.$$$$; \
 	 scp bin/shed-server-fc-remote $(FC_REMOTE_HOST):$$UPLOAD_BIN && \
 	 scp bin/shed-egress-proxy-fc-remote $(FC_REMOTE_HOST):$$UPLOAD_PROXY && \
-	 scp configs/server.dev-parallel.linux-fc.yaml $(FC_REMOTE_HOST):$$UPLOAD_CFG && \
+	 scp "$$LOCAL_CFG" $(FC_REMOTE_HOST):$$UPLOAD_CFG && \
 	 ssh -o BatchMode=yes $(FC_REMOTE_HOST) "set -e; \
 	   sudo install -m 755 $$UPLOAD_BIN $(FC_DEV_BIN_PATH); \
 	   sudo install -m 755 $$UPLOAD_PROXY $(FC_DEV_PROXY_PATH); \
@@ -423,8 +547,9 @@ dev-server-up-fc: build-fc-remote-server
 	done
 	@echo ""
 	@echo "Dev FC shed-server up on $(FC_REMOTE_HOST):"
+	@echo "  Auth mode: $(SHED_DEV_AUTH_MODE)"
 	@echo "  Binary:  $(FC_DEV_BIN_PATH)"
-	@echo "  Config:  $(FC_DEV_CONFIG)"
+	@echo "  Config:  $(FC_DEV_CONFIG) (remote path; rendered from $(SHED_DEV_AUTH_MODE) mode locally, then uploaded)"
 	@echo "  Log:     $(FC_DEV_LOG_PATH)"
 	@echo "  PID:     $(FC_DEV_PID_PATH)"
 	@echo "  CLI:     shed -s $(SHED_FC_DEV_SERVER) list"
@@ -491,6 +616,9 @@ dev-server-status-fc:
 	fi
 	@echo "Log:           $(FC_REMOTE_HOST):$(FC_DEV_LOG_PATH)"
 	@echo "Config:        $(FC_REMOTE_HOST):$(FC_DEV_CONFIG)"
+	@echo "Auth mode:     $(SHED_DEV_AUTH_MODE) (the SHED_DEV_AUTH_MODE value now in effect;"
+	@echo "               not introspected from the running process — rerun with the"
+	@echo "               same value used at 'dev-server-up-fc'/'-restart-fc' time)"
 
 dev-server-logs-fc:
 	@ssh -t $(FC_REMOTE_HOST) "sudo -n tail -F $(FC_DEV_LOG_PATH)"
@@ -519,11 +647,18 @@ test-integration-dev-fc:
 	  echo "Dev FC server not running on $(FC_REMOTE_HOST); starting via dev-server-up-fc..."; \
 	  $(MAKE) dev-server-up-fc; \
 	fi
-	SHED_FC_HOST=$(FC_REMOTE_HOST) \
+	@# SHED_DEV_AUTH_MODE is forwarded explicitly for the same reason as in
+	@# test-integration-dev: tests/integration/test_mtls.py needs to see the
+	@# exact value the remote dev server was last (re)started with.
+	@# Same PATH reasoning as test-integration-dev: drive the branch's `shed`,
+	@# not the brew-installed release.
+	PATH="$(CURDIR)/bin:$$PATH" \
+	  SHED_FC_HOST=$(FC_REMOTE_HOST) \
 	  SHED_FC_SERVER=$(SHED_FC_DEV_SERVER) \
 	  SHED_FC_LOG_PATH=$(FC_DEV_LOG_PATH) \
 	  SHED_FC_DEV_SERVER=$(SHED_FC_DEV_SERVER) \
 	  SHED_FC_DEV_LOG_PATH=$(FC_DEV_LOG_PATH) \
+	  SHED_DEV_AUTH_MODE=$(SHED_DEV_AUTH_MODE) \
 	  $(MAKE) test-integration
 
 # Cross-compile for release

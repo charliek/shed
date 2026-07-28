@@ -26,7 +26,9 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 
 use shed_core::approval::protocol::{self, HostAgentInbound};
-use shed_core::approval::{ApprovalDecision, DecidedBy, HelloAck, TokenResponse};
+use shed_core::approval::{
+    ApprovalDecision, CredentialResponse, DecidedBy, HelloAck, TokenResponse,
+};
 
 use crate::traits::ClockRef;
 
@@ -66,6 +68,23 @@ pub enum HostAgentClientError {
     NotConnected,
     TimedOut,
     Disconnected,
+    /// The connected agent does not advertise a capability this request needs.
+    ///
+    /// It is a distinct variant, and it is checked BEFORE the frame is written,
+    /// because the alternative is indistinguishable from a hang: an agent that
+    /// predates a message drops it silently, so the app would sit through the
+    /// full timeout and then report "timed out" for what is really a version
+    /// mismatch with a one-line fix.
+    Unsupported(&'static str),
+    /// The capability the caller decided on is no longer the one this connection
+    /// holds — the connection was replaced (or its ack withdrawn) between the
+    /// decision and the send. Distinct from `Unsupported` because the fix is
+    /// "try again in a moment", not "upgrade something".
+    CapabilityLost,
+    /// The CSR handed down is larger than this socket is willing to carry — the
+    /// outbound half of the credential size caps. Never produced by the core's
+    /// own keypairs; a guard against relaying something that is not a CSR.
+    OversizedCsr(usize),
 }
 
 impl std::fmt::Display for HostAgentClientError {
@@ -74,6 +93,22 @@ impl std::fmt::Display for HostAgentClientError {
             HostAgentClientError::NotConnected => "host agent not connected",
             HostAgentClientError::TimedOut => "timed out waiting for host agent reply",
             HostAgentClientError::Disconnected => "host agent connection dropped",
+            HostAgentClientError::Unsupported(cap) => {
+                return write!(
+                f,
+                "the connected shed-host-agent does not support `{cap}`; upgrade shed-host-agent"
+            )
+            }
+            HostAgentClientError::CapabilityLost => {
+                "the shed-host-agent connection changed before the request could be sent"
+            }
+            HostAgentClientError::OversizedCsr(bytes) => {
+                return write!(
+                    f,
+                    "refusing to send a {bytes}-byte CSR (cap {})",
+                    crate::token_minter::limits::MAX_CSR_BYTES
+                )
+            }
         };
         f.write_str(s)
     }
@@ -89,6 +124,46 @@ struct State {
     /// correlated `token.response` (matched by `in_reply_to`). `remove` is the
     /// single-resume guard — whoever removes the sender owns its resume.
     pending: HashMap<String, oneshot::Sender<TokenResponse>>,
+    /// The same, for `credential.get`. A separate map rather than one keyed on a
+    /// sum type: the two replies are different frames with different fields, and
+    /// a shared map would have to carry a runtime discriminant whose only job
+    /// would be to turn a mismatch into a panic or a silent drop.
+    pending_credentials: HashMap<String, oneshot::Sender<CredentialResponse>>,
+    /// What the connected agent advertised in its ACCEPTED `hello_ack`.
+    ///
+    /// `None` is the tri-state's `Unknown`: no accepted ack has been seen on the
+    /// CURRENT connection (startup, reconnect, a rejected/superseded ack).
+    /// `Some(list)` — possibly empty — is a real answer from a live agent, and
+    /// an empty list is what an agent too old to advertise anything sends.
+    /// Conflating the two is the §7 P5 bug: "we have not asked yet" would become
+    /// "the agent is old", producing either a false upgrade error or a silent
+    /// `token.get` against a certificate-only server.
+    capabilities: Option<Vec<String>>,
+    /// Bumped on every connection change (connect, disconnect, superseded ack),
+    /// so a capability answer can be BOUND to the connection it was learned on
+    /// and re-checked at send time.
+    generation: u64,
+}
+
+/// What this connection knows about the agent's `credential.get` support
+/// (plan 002 §7 P5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgentCapabilityState {
+    /// No accepted `hello_ack` seen yet on the current connection.
+    Unknown,
+    /// The ack advertised `credential.get`.
+    Supported,
+    /// The ack arrived WITHOUT `credential.get` — a shipped older agent.
+    Unsupported,
+}
+
+/// A capability answer plus the connection generation it was learned on. Passing
+/// it back into [`HostAgentClient::request_credential`] is what makes the
+/// decision and the send atomic with respect to a reconnect.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CapabilitySnapshot {
+    pub state: AgentCapabilityState,
+    pub generation: u64,
 }
 
 struct Inner {
@@ -97,6 +172,54 @@ struct Inner {
     running: AtomicBool,
     state: Mutex<State>,
     loop_handle: Mutex<Option<JoinHandle<()>>>,
+    /// Publishes every capability transition so a pre-ack caller can AWAIT the
+    /// answer instead of guessing. A watch (not a Notify) so a waiter that
+    /// subscribes after the ack still sees the current value immediately.
+    cap_tx: tokio::sync::watch::Sender<CapabilitySnapshot>,
+}
+
+impl Inner {
+    /// Replace the current connection's capability answer and publish it.
+    /// `caps` is `None` for "unknown" (connect/disconnect/rejected ack).
+    /// The generation always advances, so any snapshot taken before this call is
+    /// now stale by construction.
+    /// Learn this connection's capabilities from a `hello_ack`.
+    ///
+    /// Only an ACCEPTED ack teaches anything: a rejection means the agent
+    /// declined this client, so whatever it listed describes a session we do not
+    /// have. A second ack on the same connection supersedes the first (and bumps
+    /// the generation), so a decision made against the earlier one cannot be
+    /// spent.
+    fn apply_hello_ack(&self, ack: &HelloAck) {
+        self.set_capabilities(ack.accepted.then(|| ack.agent_capabilities.clone()));
+    }
+
+    fn set_capabilities(&self, caps: Option<Vec<String>>) {
+        let snapshot = {
+            let mut st = self.state.lock().unwrap();
+            st.capabilities = caps;
+            st.generation = st.generation.wrapping_add(1);
+            capability_snapshot(&st)
+        };
+        // Ignore a send error: it only means nothing is currently awaiting.
+        let _ = self.cap_tx.send(snapshot);
+    }
+}
+
+/// The tri-state + generation for a locked state. Free fn so both the public
+/// readers and the send-time re-check share one derivation.
+fn capability_snapshot(st: &State) -> CapabilitySnapshot {
+    let state = match &st.capabilities {
+        None => AgentCapabilityState::Unknown,
+        Some(caps) if caps.iter().any(|c| c == protocol::CAP_CREDENTIAL_GET) => {
+            AgentCapabilityState::Supported
+        }
+        Some(_) => AgentCapabilityState::Unsupported,
+    };
+    CapabilitySnapshot {
+        state,
+        generation: st.generation,
+    }
 }
 
 /// A shareable handle to the host-agent connection. Cloneable so the coordinator
@@ -109,6 +232,10 @@ pub struct HostAgentClient {
 
 impl HostAgentClient {
     pub fn new(socket_path: impl Into<PathBuf>, clock: ClockRef) -> Self {
+        let (cap_tx, _) = tokio::sync::watch::channel(CapabilitySnapshot {
+            state: AgentCapabilityState::Unknown,
+            generation: 0,
+        });
         Self {
             inner: Arc::new(Inner {
                 socket_path: socket_path.into(),
@@ -117,8 +244,12 @@ impl HostAgentClient {
                 state: Mutex::new(State {
                     writer: None,
                     pending: HashMap::new(),
+                    pending_credentials: HashMap::new(),
+                    capabilities: None,
+                    generation: 0,
                 }),
                 loop_handle: Mutex::new(None),
+                cap_tx,
             }),
         }
     }
@@ -135,7 +266,9 @@ impl HostAgentClient {
             let mut st = self.inner.state.lock().unwrap();
             st.writer = None;
             st.pending.clear();
+            st.pending_credentials.clear();
         }
+        self.inner.set_capabilities(None);
         let (event_tx, event_rx) = mpsc::unbounded_channel();
         self.inner.running.store(true, Ordering::SeqCst);
         let inner = self.inner.clone();
@@ -150,9 +283,14 @@ impl HostAgentClient {
         if let Some(h) = self.inner.loop_handle.lock().unwrap().take() {
             h.abort();
         }
-        let mut st = self.inner.state.lock().unwrap();
-        st.writer = None;
-        st.pending.clear(); // dropping the senders fails awaiting `request_token`
+        {
+            let mut st = self.inner.state.lock().unwrap();
+            st.writer = None;
+            // Dropping the senders fails everything awaiting a reply.
+            st.pending.clear();
+            st.pending_credentials.clear();
+        }
+        self.inner.set_capabilities(None);
     }
 
     pub fn is_connected(&self) -> bool {
@@ -218,6 +356,134 @@ impl HostAgentClient {
             Err(_) => {
                 // Timed out — drop our sender so a late reply is a no-op.
                 self.inner.state.lock().unwrap().pending.remove(&id);
+                Err(HostAgentClientError::TimedOut)
+            }
+        }
+    }
+
+    /// Whether the connected agent DEFINITELY advertises `capability`. `false`
+    /// while disconnected or pre-ack — callers that must distinguish "no" from
+    /// "not known yet" use [`Self::credential_capability`] instead.
+    pub fn supports(&self, capability: &str) -> bool {
+        self.inner
+            .state
+            .lock()
+            .unwrap()
+            .capabilities
+            .as_ref()
+            .is_some_and(|caps| caps.iter().any(|c| c == capability))
+    }
+
+    /// The tri-state `credential.get` capability of the CURRENT connection.
+    /// A cached read — never I/O, so it is safe under the provider's mint mutex.
+    pub fn credential_capability(&self) -> AgentCapabilityState {
+        self.credential_capability_snapshot().state
+    }
+
+    /// As [`Self::credential_capability`], carrying the connection generation so
+    /// the decision can be re-checked when the frame is finally written.
+    pub fn credential_capability_snapshot(&self) -> CapabilitySnapshot {
+        capability_snapshot(&self.inner.state.lock().unwrap())
+    }
+
+    /// Wait (bounded) for this connection to learn its capability, returning the
+    /// first non-`Unknown` snapshot or the still-unknown one on timeout.
+    ///
+    /// Only an mtls-expecting mint should pay this: a token-mode server learns
+    /// nothing useful from the ack and keeps every shipped build's immediate
+    /// `token.get`.
+    pub async fn await_credential_capability(&self, timeout: Duration) -> CapabilitySnapshot {
+        let mut rx = self.inner.cap_tx.subscribe();
+        // Re-read under the lock first: the ack may have landed between the
+        // caller's snapshot and the subscribe.
+        let current = self.credential_capability_snapshot();
+        if current.state != AgentCapabilityState::Unknown {
+            return current;
+        }
+        let wait = async {
+            loop {
+                if rx.changed().await.is_err() {
+                    // The sender lives in `Inner`, which this handle keeps
+                    // alive; unreachable in practice, but never spin on it.
+                    return self.credential_capability_snapshot();
+                }
+                let snapshot = *rx.borrow_and_update();
+                if snapshot.state != AgentCapabilityState::Unknown {
+                    return snapshot;
+                }
+            }
+        };
+        tokio::time::timeout(timeout, wait)
+            .await
+            .unwrap_or_else(|_| self.credential_capability_snapshot())
+    }
+
+    /// Request a CONTROL credential for `server` in whichever shape that server
+    /// issues, relaying `csr_base64` — a CSR THIS process generated, whose
+    /// private key never leaves it.
+    ///
+    /// The capability is checked first, so an agent too old to know the message
+    /// produces `Unsupported` immediately rather than a timeout: an old agent
+    /// does not reject an unknown frame, it drops it, and "no reply ever" is
+    /// indistinguishable from a hang without this check.
+    ///
+    /// As with `request_token`, a fail-closed reply (its `error` set) comes back
+    /// inside the `CredentialResponse` for the caller to inspect; it is not an
+    /// `Err`.
+    pub async fn request_credential(
+        &self,
+        server: &str,
+        csr_base64: Option<&str>,
+        capability: CapabilitySnapshot,
+        timeout: Duration,
+    ) -> Result<CredentialResponse, HostAgentClientError> {
+        if capability.state != AgentCapabilityState::Supported {
+            return Err(HostAgentClientError::Unsupported(
+                protocol::CAP_CREDENTIAL_GET,
+            ));
+        }
+        // The outbound half of the size caps: we refuse to PUT an oversized
+        // value on this socket, not only to accept one from it.
+        if let Some(csr) = csr_base64 {
+            if csr.len() > crate::token_minter::limits::MAX_CSR_BYTES {
+                return Err(HostAgentClientError::OversizedCsr(csr.len()));
+            }
+        }
+        let id = new_id();
+        let (tx, rx) = oneshot::channel();
+        {
+            let mut st = self.inner.state.lock().unwrap();
+            // Re-check the capability against the connection we are about to
+            // write to, under the SAME lock that hands out the writer. Between
+            // the caller's decision and here the socket may have reconnected —
+            // and the new agent on the other end need not be the old one.
+            if capability_snapshot(&st) != capability {
+                return Err(HostAgentClientError::CapabilityLost);
+            }
+            let Some(writer) = st.writer.clone() else {
+                return Err(HostAgentClientError::NotConnected);
+            };
+            st.pending_credentials.insert(id.clone(), tx);
+            if writer
+                .send(with_newline(protocol::credential_get(
+                    &id, server, csr_base64,
+                )))
+                .is_err()
+            {
+                st.pending_credentials.remove(&id);
+                return Err(HostAgentClientError::NotConnected);
+            }
+        }
+        match tokio::time::timeout(timeout, rx).await {
+            Ok(Ok(resp)) => Ok(resp),
+            Ok(Err(_)) => Err(HostAgentClientError::Disconnected),
+            Err(_) => {
+                self.inner
+                    .state
+                    .lock()
+                    .unwrap()
+                    .pending_credentials
+                    .remove(&id);
                 Err(HostAgentClientError::TimedOut)
             }
         }
@@ -291,6 +557,9 @@ async fn run_loop(
         let (writer_tx, writer_rx) = mpsc::unbounded_channel::<Vec<u8>>();
         let mut writer_task = tokio::spawn(writer_loop(write_half, writer_rx));
         inner.state.lock().unwrap().writer = Some(writer_tx.clone());
+        // A NEW connection knows nothing yet, and its generation must differ
+        // from the previous one's so an in-flight decision cannot be spent here.
+        inner.set_capabilities(None);
 
         // Register with a hello.
         let hello = protocol::hello(
@@ -319,7 +588,9 @@ async fn run_loop(
             let mut st = inner.state.lock().unwrap();
             st.writer = None;
             st.pending.clear();
+            st.pending_credentials.clear();
         }
+        inner.set_capabilities(None);
         writer_task.abort();
         let _ = event_tx.send(HostAgentEvent::Disconnected);
         if !inner.running.load(Ordering::SeqCst) {
@@ -367,9 +638,11 @@ async fn read_frames(
                 let _ = writer_tx.send(with_newline(pong));
             }
             HostAgentInbound::HelloAck(ack) => {
+                inner.apply_hello_ack(&ack);
                 let _ = event_tx.send(HostAgentEvent::Connected(ack));
             }
             HostAgentInbound::TokenResponse(resp) => resolve_pending(inner, resp),
+            HostAgentInbound::CredentialResponse(resp) => resolve_pending_credential(inner, resp),
             other => {
                 let _ = event_tx.send(HostAgentEvent::Frame(Box::new(other)));
             }
@@ -388,6 +661,20 @@ fn resolve_pending(inner: &Arc<Inner>, resp: TokenResponse) {
         .remove(&resp.in_reply_to);
     if let Some(tx) = tx {
         let _ = tx.send(resp); // oneshot: consumed on send; a dropped rx is fine
+    }
+}
+
+/// Resume the `credential.get` matching `resp.in_reply_to`. Same single-resume
+/// guard as `resolve_pending`.
+fn resolve_pending_credential(inner: &Arc<Inner>, resp: CredentialResponse) {
+    let tx = inner
+        .state
+        .lock()
+        .unwrap()
+        .pending_credentials
+        .remove(&resp.in_reply_to);
+    if let Some(tx) = tx {
+        let _ = tx.send(resp);
     }
 }
 
@@ -526,6 +813,7 @@ async fn read_frame_capped(
 mod tests {
     use super::*;
     use serde_json::{json, Value};
+    use shed_core::approval::CAP_CREDENTIAL_GET;
     use std::sync::Arc;
     use tokio::sync::Mutex as AsyncMutex;
 
@@ -545,6 +833,7 @@ mod tests {
 
     struct Records {
         token_gets: Vec<Value>,
+        credential_gets: Vec<Value>,
         responses: Vec<Value>,
         hello_count: usize,
         token_seq: u32,
@@ -557,6 +846,11 @@ mod tests {
         path: PathBuf,
         records: Arc<Mutex<Records>>,
         token_mode: Arc<Mutex<TokenMode>>,
+        /// Whether this double advertises `credential.get`. DEFAULT FALSE, i.e.
+        /// the double is an OLD agent unless a test says otherwise — so every
+        /// pre-existing assertion keeps describing the pairing it was written for,
+        /// and the new capability has to be opted into deliberately.
+        advertise_credential_get: Arc<Mutex<bool>>,
         write_half: Arc<AsyncMutex<Option<OwnedWriteHalf>>>,
         _accept: JoinHandle<()>,
     }
@@ -568,13 +862,20 @@ mod tests {
             let listener = tokio::net::UnixListener::bind(&path).unwrap();
             let records = Arc::new(Mutex::new(Records {
                 token_gets: Vec::new(),
+                credential_gets: Vec::new(),
                 responses: Vec::new(),
                 hello_count: 0,
                 token_seq: 0,
             }));
             let token_mode = Arc::new(Mutex::new(TokenMode::Ok));
+            let advertise_credential_get = Arc::new(Mutex::new(false));
             let write_half = Arc::new(AsyncMutex::new(None));
-            let (r, m, w) = (records.clone(), token_mode.clone(), write_half.clone());
+            let (r, m, w, c) = (
+                records.clone(),
+                token_mode.clone(),
+                write_half.clone(),
+                advertise_credential_get.clone(),
+            );
             let accept = tokio::spawn(async move {
                 loop {
                     let Ok((stream, _)) = listener.accept().await else {
@@ -582,7 +883,7 @@ mod tests {
                     };
                     let (read_half, wh) = stream.into_split();
                     *w.lock().await = Some(wh);
-                    serve_conn(read_half, r.clone(), m.clone(), w.clone()).await;
+                    serve_conn(read_half, r.clone(), m.clone(), w.clone(), c.clone()).await;
                     *w.lock().await = None;
                 }
             });
@@ -590,6 +891,7 @@ mod tests {
                 path,
                 records,
                 token_mode,
+                advertise_credential_get,
                 write_half,
                 _accept: accept,
             }
@@ -620,6 +922,15 @@ mod tests {
 
         fn set_token_mode(&self, mode: TokenMode) {
             *self.token_mode.lock().unwrap() = mode;
+        }
+
+        /// Make this double a NEW agent (advertises `credential.get`).
+        fn advertise_credential_get(&self) {
+            *self.advertise_credential_get.lock().unwrap() = true;
+        }
+
+        fn credential_gets(&self) -> Vec<Value> {
+            self.records.lock().unwrap().credential_gets.clone()
         }
 
         fn hello_count(&self) -> usize {
@@ -654,6 +965,7 @@ mod tests {
         records: Arc<Mutex<Records>>,
         token_mode: Arc<Mutex<TokenMode>>,
         write_half: Arc<AsyncMutex<Option<OwnedWriteHalf>>>,
+        advertise_credential_get: Arc<Mutex<bool>>,
     ) {
         let mut reader = BufReader::new(read_half);
         let mut line = Vec::new();
@@ -673,12 +985,17 @@ mod tests {
             match msg.get("type").and_then(|t| t.as_str()) {
                 Some("hello") => {
                     records.lock().unwrap().hello_count += 1;
-                    let ack = json!({
+                    let mut ack = json!({
                         "type": "hello_ack", "v": 2,
                         "namespaces": ["ssh-agent", "aws-credentials", "docker-credentials"],
                         "gate_namespaces": ["ssh-agent"],
                         "request_timeout_ms": 25000, "accepted": true,
                     });
+                    // An OLD agent omits the key entirely — it is not `[]`, it is
+                    // absent, and that absence is the whole signal.
+                    if *advertise_credential_get.lock().unwrap() {
+                        ack["agent_capabilities"] = json!([CAP_CREDENTIAL_GET]);
+                    }
                     send_on(&write_half, ack).await;
                 }
                 Some("approval_response") => records.lock().unwrap().responses.push(msg),
@@ -719,6 +1036,28 @@ mod tests {
                             .await;
                         }
                     }
+                }
+                Some("credential.get") => {
+                    let (id, server) = {
+                        records.lock().unwrap().credential_gets.push(msg.clone());
+                        (
+                            msg.get("id")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("")
+                                .to_string(),
+                            msg.get("server")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("")
+                                .to_string(),
+                        )
+                    };
+                    // Answer as an mtls server would: a certificate, no token.
+                    send_on(
+                        &write_half,
+                        json!({"type":"credential.response","in_reply_to":id,"server":server,
+                               "auth_mode":"mtls","client_cert":"PEM","cert_serial":"0a0b"}),
+                    )
+                    .await;
                 }
                 _ => {}
             }
@@ -1066,5 +1405,411 @@ mod tests {
         assert_eq!(peer_uid(&client), Some(our_uid()));
         assert!(peer_trusted(peer_uid(&client), our_uid()));
         let _ = std::fs::remove_file(&path);
+    }
+
+    // -----------------------------------------------------------------------
+    // Plan 002 §7 P9 — the shared, language-neutral desktop-credential vectors.
+    //
+    // These are the SAME files the Swift decoder tests
+    // (`desktop/Tests/ShedKitTests/HostAgentCredentialFixtureTests.swift`) and
+    // the Go/Rust AGENT suites read. The point is not that each language has a
+    // test — it is that a divergence in how Go, Rust and Swift read one byte
+    // string fails a test, per commit, instead of surfacing as a field report.
+    // -----------------------------------------------------------------------
+
+    fn fixture(name: &str) -> Value {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/host-agent-diff/fixtures/desktop-credential")
+            .join(name);
+        let raw = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("read fixture {}: {e}", path.display()));
+        serde_json::from_str(&raw).expect("fixture is valid JSON")
+    }
+
+    /// Every `hello_ack` vector, through the PRODUCTION decoder and the
+    /// PRODUCTION capability derivation (`Inner::apply_hello_ack`).
+    ///
+    /// `unknown` is deliberately unreachable from any frame: it is the pre-ack
+    /// state, asserted separately below, and conflating it with `unsupported` is
+    /// the §7 P5 bug these vectors exist to prevent.
+    #[test]
+    fn golden_hello_ack_capability() {
+        let fx = fixture("hello_ack.json");
+        assert_eq!(fx["protocol_version"], 1, "fixture version skew");
+        let vectors = fx["vectors"].as_array().expect("vectors");
+        assert!(!vectors.is_empty());
+        for v in vectors {
+            let name = v["name"].as_str().unwrap();
+            let line = serde_json::to_vec(&v["frame"]).unwrap();
+            let ack = match protocol::decode(&line).unwrap() {
+                HostAgentInbound::HelloAck(a) => a,
+                other => panic!("{name}: expected hello_ack, got {other:?}"),
+            };
+            let client = HostAgentClient::new("/nonexistent.sock", Arc::new(FixedClock));
+            assert_eq!(
+                client.credential_capability(),
+                AgentCapabilityState::Unknown,
+                "{name}: a fresh connection has learned nothing"
+            );
+            client.inner.apply_hello_ack(&ack);
+            let want = match v["expected_capability"].as_str().unwrap() {
+                "supported" => AgentCapabilityState::Supported,
+                "unsupported" => AgentCapabilityState::Unsupported,
+                other => panic!("{name}: unexpected fixture capability {other:?}"),
+            };
+            assert_eq!(client.credential_capability(), want, "{name}");
+        }
+    }
+
+    /// A REJECTED ack teaches nothing: the agent declined this client, so the
+    /// list it sent describes a session we do not have. Not a fixture vector —
+    /// every vector is an accepted ack — but the same derivation.
+    #[test]
+    fn a_rejected_hello_ack_leaves_the_capability_unknown() {
+        let line =
+            br#"{"type":"hello_ack","agent_capabilities":["credential.get"],"accepted":false}"#;
+        let ack = match protocol::decode(line).unwrap() {
+            HostAgentInbound::HelloAck(a) => a,
+            other => panic!("expected hello_ack, got {other:?}"),
+        };
+        let client = HostAgentClient::new("/nonexistent.sock", Arc::new(FixedClock));
+        client.inner.apply_hello_ack(&ack);
+        assert_eq!(
+            client.credential_capability(),
+            AgentCapabilityState::Unknown
+        );
+    }
+
+    /// Every `credential.get` vector, through the PRODUCTION frame builder: the
+    /// exact key set (a CSR-less request OMITS the key rather than sending
+    /// `""`, which is what makes an mtls server's refusal legible), the values,
+    /// and the §7 P3 key-containment assertion over the bytes actually written.
+    #[test]
+    fn golden_credential_get_frame() {
+        let fx = fixture("credential_get.json");
+        assert_eq!(fx["protocol_version"], 1, "fixture version skew");
+        let forbidden: Vec<String> = fx["forbidden_substrings"]
+            .as_array()
+            .expect("forbidden_substrings")
+            .iter()
+            .map(|s| s.as_str().unwrap().to_lowercase())
+            .collect();
+        assert!(!forbidden.is_empty());
+        let vectors = fx["vectors"].as_array().expect("vectors");
+        assert!(!vectors.is_empty());
+        for v in vectors {
+            let name = v["name"].as_str().unwrap();
+            let server = v["request"]["server"].as_str().unwrap();
+            let csr = v["request"]["csr"].as_str();
+            // Passed through VERBATIM (including the empty-string vector): the
+            // builder owns the omit-when-empty rule, so this asserts it rather
+            // than reimplementing it.
+            let line = protocol::credential_get("req-id", server, csr);
+            let got: Value = serde_json::from_str(&line).unwrap();
+
+            let mut keys: Vec<&str> = got
+                .as_object()
+                .unwrap()
+                .keys()
+                .map(String::as_str)
+                .collect();
+            keys.sort_unstable();
+            let mut want_keys: Vec<&str> = v["expected_keys"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|k| k.as_str().unwrap())
+                .collect();
+            want_keys.sort_unstable();
+            assert_eq!(keys, want_keys, "{name}: key set");
+
+            // `id` is a per-request UUID — presence, not value.
+            let mut want = v["expected_frame"].clone();
+            want["id"] = got["id"].clone();
+            assert_eq!(got, want, "{name}: frame");
+
+            let lowered = line.to_lowercase();
+            for marker in &forbidden {
+                assert!(
+                    !lowered.contains(marker),
+                    "{name}: app→agent frame carries private-key marker {marker:?}"
+                );
+            }
+        }
+    }
+
+    /// The outbound half of the size caps: an oversized CSR is refused rather
+    /// than written. `max_csr_bytes` is the fixture's, so the cap cannot drift
+    /// from what the other clients enforce.
+    #[tokio::test]
+    async fn oversized_csr_is_refused_before_it_is_written() {
+        let fx = fixture("credential_get.json");
+        let cap = fx["max_csr_bytes"].as_u64().unwrap() as usize;
+        assert_eq!(cap, crate::token_minter::limits::MAX_CSR_BYTES);
+        let agent = TestAgent::start();
+        agent.advertise_credential_get();
+        let client = agent.client(Arc::new(FixedClock));
+        let _events = client.start(HelloClientInfo {
+            name: "t".into(),
+            version: "1".into(),
+            pid: 1,
+            capabilities: vec![],
+            replay_events: 0,
+        });
+        assert!(agent.wait_hello(1).await);
+        assert!(wait_until(|| client.supports(CAP_CREDENTIAL_GET)).await);
+        let huge = "A".repeat(cap + 1);
+        let err = client
+            .request_credential(
+                "mini2",
+                Some(&huge),
+                client.credential_capability_snapshot(),
+                Duration::from_secs(2),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(err, HostAgentClientError::OversizedCsr(cap + 1));
+        assert!(
+            agent.credential_gets().is_empty(),
+            "an over-cap CSR must never reach the socket"
+        );
+        client.stop();
+    }
+
+    /// The generation binding (§7 P5): a snapshot taken on one connection cannot
+    /// be spent on the next one. A reconnect between the decision and the send
+    /// is refused as `CapabilityLost` — "try again", not "upgrade something".
+    #[tokio::test]
+    async fn a_capability_snapshot_from_a_previous_connection_is_refused() {
+        let agent = TestAgent::start();
+        agent.advertise_credential_get();
+        let client = agent.client(Arc::new(FixedClock));
+        let _events = client.start(HelloClientInfo {
+            name: "t".into(),
+            version: "1".into(),
+            pid: 1,
+            capabilities: vec![],
+            replay_events: 0,
+        });
+        assert!(agent.wait_hello(1).await);
+        assert!(wait_until(|| client.supports(CAP_CREDENTIAL_GET)).await);
+        let stale = client.credential_capability_snapshot();
+        agent.drop_conn().await;
+        assert!(agent.wait_hello(2).await);
+        assert!(
+            wait_until(|| client.credential_capability_snapshot().generation != stale.generation)
+                .await
+        );
+        let err = client
+            .request_credential("mini2", Some("QUJD"), stale, Duration::from_millis(500))
+            .await
+            .unwrap_err();
+        assert_eq!(err, HostAgentClientError::CapabilityLost);
+        client.stop();
+    }
+
+    /// The pre-ack wait: `await_credential_capability` returns as soon as the
+    /// ack lands, and reports the still-unknown state on timeout rather than
+    /// inventing an answer.
+    #[tokio::test]
+    async fn await_capability_resolves_on_the_ack_and_times_out_unknown() {
+        // No agent at all → nothing to learn, and the wait must END.
+        let client = HostAgentClient::new("/nonexistent-shed-agent.sock", Arc::new(FixedClock));
+        let snapshot = client
+            .await_credential_capability(Duration::from_millis(150))
+            .await;
+        assert_eq!(snapshot.state, AgentCapabilityState::Unknown);
+
+        let agent = TestAgent::start();
+        agent.advertise_credential_get();
+        let client = agent.client(Arc::new(FixedClock));
+        let _events = client.start(HelloClientInfo {
+            name: "t".into(),
+            version: "1".into(),
+            pid: 1,
+            capabilities: vec![],
+            replay_events: 0,
+        });
+        let snapshot = client
+            .await_credential_capability(Duration::from_secs(5))
+            .await;
+        assert_eq!(snapshot.state, AgentCapabilityState::Supported);
+        client.stop();
+    }
+
+    /// Plan 002 §7 P5's live-agent rows, driven through the REAL minter (the
+    /// pre-ack rows live in `token_minter.rs`, which needs no agent at all).
+    #[tokio::test]
+    async fn minter_capability_table_against_a_live_agent() {
+        use crate::auth_modes::AuthModeRegistry;
+        use crate::token_minter::HostAgentTokenMinter;
+        use shed_core::token::{CredentialRequest, MintedCredential, TokenMinter};
+
+        let hello = || HelloClientInfo {
+            name: "t".into(),
+            version: "1".into(),
+            pid: 1,
+            capabilities: vec![],
+            replay_events: 0,
+        };
+
+        // --- unsupported + expects mtls: the honest "upgrade shed-host-agent". ---
+        let agent = TestAgent::start();
+        let client = agent.client(Arc::new(FixedClock));
+        let _events = client.start(hello());
+        assert!(agent.wait_hello(1).await);
+        assert!(
+            wait_until(|| client.credential_capability() == AgentCapabilityState::Unsupported)
+                .await
+        );
+        let modes = Arc::new(AuthModeRegistry::new());
+        modes.record("mini2", shed_core::token::AuthMode::Mtls);
+        let minter = HostAgentTokenMinter::new(client.clone()).with_modes(modes.clone());
+        assert!(
+            !minter.supports_mtls(),
+            "an agent that advertised nothing cannot relay a CSR"
+        );
+        let e = minter
+            .mint_credential("mini2", &CredentialRequest::default())
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{e:?}").contains("upgrade shed-host-agent"),
+            "an OLD agent + an mtls server is a real upgrade case: {e:?}"
+        );
+        assert!(agent.credential_gets().is_empty());
+        client.stop();
+
+        // --- unsupported + token server: unchanged, forever. ---
+        let agent = TestAgent::start();
+        let client = agent.client(Arc::new(FixedClock));
+        let _events = client.start(hello());
+        assert!(agent.wait_hello(1).await);
+        assert!(
+            wait_until(|| client.credential_capability() == AgentCapabilityState::Unsupported)
+                .await
+        );
+        let modes = Arc::new(AuthModeRegistry::new());
+        let minter = HostAgentTokenMinter::new(client.clone()).with_modes(modes.clone());
+        match minter
+            .mint_credential("mini2", &CredentialRequest::default())
+            .await
+            .unwrap()
+        {
+            MintedCredential::Token(t) => assert_eq!(t.token, "fake-tok-1"),
+            other => panic!("expected the legacy token.get, got {other:?}"),
+        }
+        assert!(agent.credential_gets().is_empty());
+        client.stop();
+
+        // --- supported: the CSR crosses, the certificate comes back, and the
+        //     minter records the learned mode SYNCHRONOUSLY (the observer would
+        //     only get there after the core adopts). ---
+        let agent = TestAgent::start();
+        agent.advertise_credential_get();
+        let client = agent.client(Arc::new(FixedClock));
+        let _events = client.start(hello());
+        assert!(agent.wait_hello(1).await);
+        assert!(wait_until(|| client.supports(CAP_CREDENTIAL_GET)).await);
+        let modes = Arc::new(AuthModeRegistry::new());
+        let minter = HostAgentTokenMinter::new(client.clone()).with_modes(modes.clone());
+        assert!(minter.supports_mtls());
+        match minter
+            .mint_credential("mini2", &CredentialRequest::with_csr("QUJD"))
+            .await
+            .unwrap()
+        {
+            MintedCredential::Certificate(c) => assert_eq!(c.cert_pem, "PEM"),
+            other => panic!("expected a certificate, got {other:?}"),
+        }
+        assert_eq!(agent.credential_gets()[0]["csr"], "QUJD");
+        assert!(
+            modes.expects_mtls("mini2"),
+            "the minter must record the mode it just saw, without waiting for the observer"
+        );
+        client.stop();
+    }
+
+    /// The desktop↔host-agent compat matrix, from the APP's side.
+    #[tokio::test]
+    async fn credential_get_compat_matrix() {
+        // --- NEW app, OLD agent: no capability advertised. ---
+        let agent = TestAgent::start();
+        let client = agent.client(Arc::new(FixedClock));
+        let _events = client.start(HelloClientInfo {
+            name: "t".into(),
+            version: "1".into(),
+            pid: 1,
+            capabilities: vec![],
+            replay_events: 0,
+        });
+        assert!(agent.wait_hello(1).await);
+        assert!(
+            !client.supports(CAP_CREDENTIAL_GET),
+            "an agent that advertised nothing must not appear to support anything"
+        );
+        // The ack HAS landed, so the tri-state is a real answer (Unsupported),
+        // not the pre-ack Unknown.
+        assert!(
+            wait_until(|| client.credential_capability() == AgentCapabilityState::Unsupported)
+                .await
+        );
+        let err = client
+            .request_credential(
+                "mini2",
+                Some("QUJD"),
+                client.credential_capability_snapshot(),
+                Duration::from_millis(200),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(err, HostAgentClientError::Unsupported(CAP_CREDENTIAL_GET));
+        // The message has to name what to upgrade — that is the entire reason the
+        // capability exists instead of a timeout.
+        assert!(
+            err.to_string().contains("upgrade shed-host-agent"),
+            "unhelpful mismatch error: {err}"
+        );
+        // And nothing was written: an old agent must never receive a frame it
+        // would silently drop.
+        assert!(agent.credential_gets().is_empty());
+        // token.get against the same old agent still works untouched.
+        let resp = client
+            .request_token("mini2", Duration::from_secs(2))
+            .await
+            .unwrap();
+        assert_eq!(resp.token.as_deref(), Some("fake-tok-1"));
+        client.stop();
+
+        // --- NEW app, NEW agent: the CSR crosses and a certificate comes back. ---
+        let agent = TestAgent::start();
+        agent.advertise_credential_get();
+        let client = agent.client(Arc::new(FixedClock));
+        let _events = client.start(HelloClientInfo {
+            name: "t".into(),
+            version: "1".into(),
+            pid: 1,
+            capabilities: vec![],
+            replay_events: 0,
+        });
+        assert!(agent.wait_hello(1).await);
+        assert!(wait_until(|| client.supports(CAP_CREDENTIAL_GET)).await);
+        let resp = client
+            .request_credential(
+                "mini2",
+                Some("QUJD"),
+                client.credential_capability_snapshot(),
+                Duration::from_secs(2),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.auth_mode.as_deref(), Some("mtls"));
+        assert_eq!(resp.client_cert.as_deref(), Some("PEM"));
+        assert!(resp.token.is_none());
+        let sent = agent.credential_gets();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0]["csr"], "QUJD", "the CSR must cross verbatim");
+        assert_eq!(sent[0]["server"], "mini2");
+        client.stop();
     }
 }

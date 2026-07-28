@@ -166,7 +166,11 @@ pub fn resolve_launch(
         _ => match (preset.helper(), scripts_dir) {
             (Some((interp, script)), Some(dir)) => LaunchInvocation {
                 executable: interp.to_string(),
-                arguments: vec![format!("{dir}/{script}"), shed.to_string(), cmd.command.clone()],
+                arguments: vec![
+                    format!("{dir}/{script}"),
+                    shed.to_string(),
+                    cmd.command.clone(),
+                ],
             },
             _ => default_terminal(cmd),
         },
@@ -204,7 +208,8 @@ fn default_terminal(cmd: &TerminalCommand) -> LaunchInvocation {
     #[cfg(target_os = "macos")]
     {
         let escaped = cmd.command.replace('\\', "\\\\").replace('"', "\\\"");
-        let script = format!("tell application \"Terminal\"\nactivate\ndo script \"{escaped}\"\nend tell");
+        let script =
+            format!("tell application \"Terminal\"\nactivate\ndo script \"{escaped}\"\nend tell");
         LaunchInvocation {
             executable: "/usr/bin/osascript".to_string(),
             arguments: vec!["-e".to_string(), script],
@@ -234,10 +239,15 @@ mod tests {
         assert_eq!(
             c.argv,
             [
-                "ssh", "-t",
-                "-o", "StrictHostKeyChecking=yes",
-                "-o", "UserKnownHostsFile=/home/u/.shed/known_hosts",
-                "web@10.0.0.5", "-p", "2222",
+                "ssh",
+                "-t",
+                "-o",
+                "StrictHostKeyChecking=yes",
+                "-o",
+                "UserKnownHostsFile=/home/u/.shed/known_hosts",
+                "web@10.0.0.5",
+                "-p",
+                "2222",
             ]
         );
         // The shell line round-trips (no quoting needed for these safe args).
@@ -250,7 +260,10 @@ mod tests {
     #[test]
     fn ssh_command_attaches_tmux_when_session_given() {
         let c = ssh_command("web", "h", 22, "/k", Some("main"));
-        assert_eq!(&c.argv[c.argv.len() - 4..], ["tmux", "attach", "-t", "main"]);
+        assert_eq!(
+            &c.argv[c.argv.len() - 4..],
+            ["tmux", "attach", "-t", "main"]
+        );
         // An empty session is treated as none.
         let c0 = ssh_command("web", "h", 22, "/k", Some(""));
         assert!(!c0.argv.contains(&"tmux".to_string()));
@@ -260,7 +273,9 @@ mod tests {
     fn shell_quote_escapes_unsafe_args() {
         // A known_hosts path with a space must be quoted so the line re-parses.
         let c = ssh_command("web", "h", 22, "/home/a b/.shed/known_hosts", None);
-        assert!(c.command.contains("'UserKnownHostsFile=/home/a b/.shed/known_hosts'"));
+        assert!(c
+            .command
+            .contains("'UserKnownHostsFile=/home/a b/.shed/known_hosts'"));
         assert_eq!(shell_quote("it's"), r"'it'\''s'");
     }
 
@@ -322,7 +337,10 @@ mod tests {
         let cmd = ssh_command("web", "h", 22, "/k", None);
         let g = resolve_launch(TerminalPreset::Ghostty, &cmd, "web", None, Some("/opt/bin"));
         assert_eq!(g.executable, "/bin/bash");
-        assert_eq!(g.arguments, ["/opt/bin/shed-open-ghostty", "web", &cmd.command]);
+        assert_eq!(
+            g.arguments,
+            ["/opt/bin/shed-open-ghostty", "web", &cmd.command]
+        );
         let r = resolve_launch(TerminalPreset::Roost, &cmd, "web", None, Some("/opt/bin"));
         assert_eq!(r.executable, "/usr/bin/python3");
         assert_eq!(r.arguments[0], "/opt/bin/shed-open-roost.py");

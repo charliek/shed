@@ -234,7 +234,7 @@ func TestHandlePluginRespondOwnershipEnforced(t *testing.T) {
 		t.Fatal(err)
 	}
 	srv.tokens = store
-	srv.cfg.Auth = &config.AuthConfig{Mode: config.AuthModeSecure}
+	srv.cfg.Auth = &config.AuthConfig{Mode: config.AuthModeToken}
 	srv.plugins.EnableOwnershipTracking() // a server with HTTP auth enforced does this
 	srv.bridge.RegisterShed("dev", &plugin.ShedConn{
 		Name: "dev",

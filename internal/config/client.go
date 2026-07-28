@@ -2,9 +2,11 @@ package config
 
 import (
 	"fmt"
+	"net"
 	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -57,15 +59,92 @@ type ServerEntry struct {
 	// "sha256:<hex>", captured at `shed server add`. When set, the client
 	// verifies the presented cert against it (no CA needed).
 	TLSCertFingerprint string `yaml:"tls_cert_fingerprint,omitempty"`
+	// AuthMode records the credential shape the server issued at the last
+	// bootstrap: AuthModeToken (a bearer token) or AuthModeMTLS (a client
+	// certificate).
+	//
+	// ABSENT MEANS TOKEN. Every entry written before client-certificate support
+	// existed has no auth_mode key, and those are all token/open servers — so an
+	// empty value must never be read as "unknown, go find out". It is a CACHE of
+	// what the server last said, not a setting: a bootstrap that comes back in
+	// the other mode rewrites it (see the mode-flip path in cmd/shed/client.go),
+	// which is what lets an operator switch a server's auth.mode without every
+	// client needing to be re-added.
+	AuthMode string `yaml:"auth_mode,omitempty"`
+	// ClientCertFile / ClientKeyFile locate this entry's client certificate and
+	// its private key under the creds dir (see ServerCredsDir). Paths rather
+	// than inline PEM: the key must live in a 0600 file of its own, not inside a
+	// config the user hand-edits, copies between machines, and pastes into
+	// issues.
+	ClientCertFile string `yaml:"client_cert_file,omitempty"`
+	ClientKeyFile  string `yaml:"client_key_file,omitempty"`
+	// ClientCertExpiresAt is when ClientCertFile's certificate expires, so the
+	// client can re-enroll before a request races expiry — the mtls counterpart
+	// of ControlTokenExpiresAt. Cached here so the proactive check costs no file
+	// read; the certificate itself remains the authority.
+	ClientCertExpiresAt time.Time `yaml:"client_cert_expires_at,omitempty"`
+}
+
+// IsMTLS reports whether this entry last bootstrapped a client certificate.
+func (e *ServerEntry) IsMTLS() bool { return e.AuthMode == AuthModeMTLS }
+
+// UsesTLS reports whether this entry's control plane is HTTPS — which, for a
+// shed-server, means the server enforces auth (token or mtls). Open mode serves
+// plain HTTP and has no HTTPS listener at all, so this is the one durable
+// signal in a stored entry that separates "this server wants a credential" from
+// "this server wants nothing".
+//
+// Either marker alone is enough: `shed server add` writes both an https api_url
+// and a tls_cert_fingerprint for a secure server, but an entry is user-editable
+// and a half-filled one still points at a listener that will demand a
+// credential.
+func (e *ServerEntry) UsesTLS() bool {
+	return e.TLSCertFingerprint != "" ||
+		strings.HasPrefix(strings.ToLower(e.APIURL), "https://")
+}
+
+// NeedsEnrollment reports whether this entry holds NO credential it could
+// present to a server that demands one, and has enough information (host + ssh
+// port) to obtain one over the SSH `_bootstrap` channel.
+//
+// It exists because "no credential recorded" is ambiguous in a stored entry and
+// the two readings need opposite handling:
+//
+//   - an OPEN server legitimately has no credential, and must never pay an SSH
+//     round-trip to discover that. It is plain HTTP, so UsesTLS is false.
+//   - a SECURE server's entry that lost its credential fields must enroll. That
+//     is a routine condition during an upgrade, not a corner case: a pre-mtls
+//     client that loads and re-saves config.yaml silently drops every key its
+//     ServerEntry struct does not know (auth_mode, client_cert_file,
+//     client_key_file, client_cert_expires_at), leaving exactly this shape —
+//     an https entry with nothing to present. Without enrollment such an entry
+//     fails forever, because the client has no credential to be rejected and so
+//     never reaches its reactive re-mint.
+//
+// A legacy static token (a control_token with no expiry) is NOT this case: it
+// has something to present and is deliberately never re-minted.
+func (e *ServerEntry) NeedsEnrollment() bool {
+	if !e.UsesTLS() || e.Host == "" || e.SSHPort == 0 {
+		return false
+	}
+	if e.IsMTLS() {
+		return e.ClientCertFile == "" || e.ClientKeyFile == ""
+	}
+	return e.ControlToken == ""
 }
 
 // BaseURL returns the control-plane base URL for the entry: APIURL when set
 // (it carries scheme+host+port), else the legacy plain http://Host:HTTPPort.
+//
+// The host:port is joined with net.JoinHostPort, not printf: Host may be an
+// IPv6 literal ("::1"), and "http://::1:8080" is not a URL any client can parse.
+// The bracketed form is what every http.Client, url.Parse, and SSH-first
+// open-mode add downstream of this needs.
 func (e *ServerEntry) BaseURL() string {
 	if e.APIURL != "" {
 		return strings.TrimRight(e.APIURL, "/")
 	}
-	return fmt.Sprintf("http://%s:%d", e.Host, e.HTTPPort)
+	return "http://" + net.JoinHostPort(e.Host, strconv.Itoa(e.HTTPPort))
 }
 
 // ShedCache caches the location of a shed.
@@ -286,6 +365,20 @@ func (c *ClientConfig) RemoveShedCache(name string) {
 	delete(c.Sheds, name)
 }
 
+// KnownHostLine renders the exact ~/.shed/known_hosts line for an endpoint, in
+// OpenSSH's syntax: a bare hostname on port 22, the bracketed "[host]:port"
+// form otherwise.
+//
+// It is exported because it is also the IDENTITY of a line: RemoveKnownHost
+// matches on it, and `shed server add` keeps it around so a failed add can undo
+// exactly the line it wrote and nothing else.
+func KnownHostLine(host string, port int, hostKey string) string {
+	if port == 22 {
+		return host + " " + strings.TrimSpace(hostKey)
+	}
+	return fmt.Sprintf("[%s]:%d %s", host, port, strings.TrimSpace(hostKey))
+}
+
 // AddKnownHost adds an SSH host key to the known_hosts file.
 func AddKnownHost(host string, port int, hostKey string) error {
 	knownHostsPath := GetKnownHostsPath()
@@ -296,14 +389,6 @@ func AddKnownHost(host string, port int, hostKey string) error {
 		return fmt.Errorf("failed to create directory: %w", err)
 	}
 
-	// Format the entry
-	var entry string
-	if port == 22 {
-		entry = fmt.Sprintf("%s %s\n", host, hostKey)
-	} else {
-		entry = fmt.Sprintf("[%s]:%d %s\n", host, port, hostKey)
-	}
-
 	// Append to file
 	f, err := os.OpenFile(knownHostsPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0600)
 	if err != nil {
@@ -311,10 +396,61 @@ func AddKnownHost(host string, port int, hostKey string) error {
 	}
 	defer f.Close()
 
-	if _, err := f.WriteString(entry); err != nil {
+	if _, err := f.WriteString(KnownHostLine(host, port, hostKey) + "\n"); err != nil {
 		return fmt.Errorf("failed to write to known_hosts: %w", err)
 	}
 
+	return nil
+}
+
+// RemoveKnownHost deletes ONE line from ~/.shed/known_hosts: the exact line
+// AddKnownHost would have written for this endpoint and key.
+//
+// It exists so a `shed server add` that pins a host key and then fails — an
+// unauthorized SSH key, a verification that does not answer, a duplicate name —
+// can leave the file exactly as it found it. Pinning a key for a server that was
+// never added is quiet residue: it silently pre-trusts that endpoint for the
+// next attempt, which is precisely the decision the operator was in the middle
+// of making.
+//
+// The match is on the whole rendered line, so an entry the user (or an earlier
+// successful add) put there is never touched — not even for the same host with a
+// different key, and not a "@cert-authority"/"@revoked" marked line, whose
+// leading token makes it a different line. Only the LAST occurrence is removed:
+// the line this call is undoing is the one most recently appended.
+//
+// A missing file, or a file with no such line, is not an error — the caller is
+// undoing something it may never have done.
+func RemoveKnownHost(host string, port int, hostKey string) error {
+	path := GetKnownHostsPath()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return fmt.Errorf("failed to read known_hosts %s: %w", path, err)
+	}
+
+	want := KnownHostLine(host, port, hostKey)
+	lines := strings.Split(string(data), "\n")
+	drop := -1
+	for i, ln := range lines {
+		if strings.TrimSpace(ln) == want {
+			drop = i
+		}
+	}
+	if drop < 0 {
+		return nil
+	}
+	lines = append(lines[:drop], lines[drop+1:]...)
+
+	out := strings.Join(lines, "\n")
+	if out != "" && !strings.HasSuffix(out, "\n") {
+		out += "\n"
+	}
+	if err := atomicWriteFile(path, []byte(out), 0600); err != nil {
+		return fmt.Errorf("failed to rewrite known_hosts %s: %w", path, err)
+	}
 	return nil
 }
 

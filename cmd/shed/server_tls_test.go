@@ -17,12 +17,12 @@ func TestPinnedTransport(t *testing.T) {
 	pin := servertls.Fingerprint(srv.Certificate().Raw)
 
 	t.Run("empty fingerprint yields default transport", func(t *testing.T) {
-		if pinnedTransport("") != nil {
+		if servertls.PinnedTransport("", nil) != nil {
 			t.Error("empty fingerprint should yield a nil (default) transport")
 		}
 	})
 	t.Run("correct pin connects", func(t *testing.T) {
-		c := &http.Client{Transport: pinnedTransport(pin)}
+		c := &http.Client{Transport: servertls.PinnedTransport(pin, nil)}
 		resp, err := c.Get(srv.URL)
 		if err != nil {
 			t.Fatalf("pinned request failed: %v", err)
@@ -33,7 +33,7 @@ func TestPinnedTransport(t *testing.T) {
 		}
 	})
 	t.Run("wrong pin is rejected", func(t *testing.T) {
-		c := &http.Client{Transport: pinnedTransport("sha256:" + strings.Repeat("00", 32))}
+		c := &http.Client{Transport: servertls.PinnedTransport("sha256:"+strings.Repeat("00", 32), nil)}
 		if _, err := c.Get(srv.URL); err == nil {
 			t.Error("a wrong pin must be rejected")
 		}

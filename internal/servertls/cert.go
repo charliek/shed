@@ -5,6 +5,7 @@
 package servertls
 
 import (
+	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
@@ -15,7 +16,6 @@ import (
 	"encoding/hex"
 	"encoding/pem"
 	"fmt"
-	"math/big"
 	"net"
 	"net/http"
 	"os"
@@ -60,6 +60,23 @@ func Fingerprint(der []byte) string {
 	return "sha256:" + hex.EncodeToString(sum[:])
 }
 
+// ClientCertSource supplies the client certificate a client presents to an
+// mtls-mode server. It returns nil when the client currently holds no
+// certificate (token mode, an open server, or a not-yet-enrolled client).
+//
+// It is called by the TLS stack on EVERY handshake, from whichever goroutine is
+// dialing, so implementations must be safe for concurrent use. That per-
+// handshake call is the whole point: see PinnedClientConfig.
+//
+// ctx is the HANDSHAKE's context. For an http.Transport dial that is the
+// context of the request which triggered the dial, and for a raw tls.Client it
+// is whatever the caller passed to HandshakeContext — either way it lets a
+// caller pin the exact credential this attempt should transmit, instead of the
+// source re-reading a live value that a concurrent refresh may already have
+// replaced (see clienttoken.WithPinned). A source that does not care may ignore
+// it entirely.
+type ClientCertSource func(ctx context.Context) *tls.Certificate
+
 // PinnedClientConfig returns a tls.Config that verifies the server's
 // self-signed cert by the pinned fingerprint ("sha256:<hex>") instead of a CA
 // chain — the shared trust primitive for every in-repo client (the CLI control
@@ -67,7 +84,29 @@ func Fingerprint(der []byte) string {
 // chain/hostname check because the self-signed cert is its own anchor;
 // VerifyPeerCertificate re-imposes trust by comparing the pin, so a mismatched
 // (or absent) cert fails the handshake.
-func PinnedClientConfig(fingerprint string) *tls.Config {
+//
+// certs supplies the client certificate presented to an mtls-mode server; pass
+// nil for a client that will never present one.
+//
+// GetClientCertificate is installed UNCONDITIONALLY — even when certs is nil,
+// and even when the client currently holds no certificate. That is the single
+// design decision this whole client-side mtls path rests on:
+//
+//   - The TLS stack consults the callback on every handshake, so a re-minted
+//     certificate is picked up with no transport rebuild. Certificates are
+//     short-lived (auth.token_ttl), so rotation is routine, not exceptional.
+//   - A server that flips between token and mtls mode therefore needs no new
+//     transport either. The client's *http.Transport (and its connection pool,
+//     and every http.Client sharing it) is built once, at construction, from
+//     config that may already be out of date — and stays correct.
+//   - When there is nothing to present the callback returns an EMPTY
+//     tls.Certificate rather than an error. An error aborts the handshake
+//     client-side; an empty certificate lets the exchange reach the server so it
+//     can answer with its own certificate_required alert, which is exactly the
+//     signal the reactive re-enrollment path classifies (see
+//     internal/clienttoken.IsAuthFailure). Failing client-side would turn a
+//     recoverable "I need to enroll" into an opaque dial error.
+func PinnedClientConfig(fingerprint string, certs ClientCertSource) *tls.Config {
 	return &tls.Config{
 		MinVersion:         tls.VersionTLS12,
 		InsecureSkipVerify: true, // not insecure: VerifyPeerCertificate pins the cert
@@ -80,7 +119,28 @@ func PinnedClientConfig(fingerprint string) *tls.Config {
 			}
 			return nil
 		},
+		GetClientCertificate: func(cri *tls.CertificateRequestInfo) (*tls.Certificate, error) {
+			if certs != nil {
+				if cert := certs(handshakeContext(cri)); cert != nil {
+					return cert, nil
+				}
+			}
+			return &tls.Certificate{}, nil
+		},
 	}
+}
+
+// handshakeContext returns the context crypto/tls is running this handshake
+// under, never nil. A hand-constructed CertificateRequestInfo (a test, or a TLS
+// stack that does not populate it) carries no context, and a source that reads
+// a pinned value from it simply finds none and falls back.
+func handshakeContext(cri *tls.CertificateRequestInfo) context.Context {
+	if cri != nil {
+		if ctx := cri.Context(); ctx != nil {
+			return ctx
+		}
+	}
+	return context.Background()
 }
 
 // PinnedTransport returns an *http.Transport (as http.RoundTripper) whose TLS
@@ -91,11 +151,18 @@ func PinnedClientConfig(fingerprint string) *tls.Config {
 // they all verify identically. The nil return is untyped on purpose: returning
 // a typed (*http.Transport)(nil) would make a non-nil http.RoundTripper wrapping
 // a nil pointer, which http.Client would use instead of DefaultTransport.
-func PinnedTransport(fingerprint string) http.RoundTripper {
+//
+// certs wires client-certificate authentication (see PinnedClientConfig); nil
+// for a client that will never present one. An empty fingerprint still returns
+// a nil RoundTripper even when certs is non-nil: without a pin there is no
+// https endpoint to authenticate to, and mtls is only ever served over the
+// pinned TLS listener. Presenting a certificate on an unpinned connection would
+// be sending a credential to an unverified peer.
+func PinnedTransport(fingerprint string, certs ClientCertSource) http.RoundTripper {
 	if fingerprint == "" {
 		return nil
 	}
-	return &http.Transport{TLSClientConfig: PinnedClientConfig(fingerprint)}
+	return &http.Transport{TLSClientConfig: PinnedClientConfig(fingerprint, certs)}
 }
 
 // loadIfCovers loads the persisted cert+key and returns it only when it parses
@@ -181,9 +248,9 @@ func generate(certPath, keyPath string, dnsNames []string, ips []net.IP) (tls.Ce
 	if err != nil {
 		return tls.Certificate{}, nil, fmt.Errorf("generate key: %w", err)
 	}
-	serial, err := rand.Int(rand.Reader, new(big.Int).Lsh(big.NewInt(1), 128))
+	serial, err := randomSerial()
 	if err != nil {
-		return tls.Certificate{}, nil, fmt.Errorf("generate serial: %w", err)
+		return tls.Certificate{}, nil, err
 	}
 	now := time.Now()
 	tmpl := &x509.Certificate{
@@ -214,17 +281,30 @@ func persist(certPath, keyPath string, der []byte, priv *ecdsa.PrivateKey) error
 			return fmt.Errorf("create cert dir: %w", err)
 		}
 	}
-	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
-	if err := os.WriteFile(certPath, certPEM, 0644); err != nil {
+	if err := os.WriteFile(certPath, encodeCertPEM(der), 0644); err != nil {
 		return fmt.Errorf("write cert: %w", err)
 	}
-	keyDER, err := x509.MarshalECPrivateKey(priv)
+	keyPEM, err := encodeECKeyPEM(priv)
 	if err != nil {
-		return fmt.Errorf("marshal key: %w", err)
+		return err
 	}
-	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER})
 	if err := os.WriteFile(keyPath, keyPEM, 0600); err != nil {
 		return fmt.Errorf("write key: %w", err)
 	}
 	return nil
+}
+
+// encodeCertPEM wraps a DER certificate in a PEM CERTIFICATE block. Shared by
+// both the server leaf (above) and the internal CA (ca.go).
+func encodeCertPEM(der []byte) []byte {
+	return pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
+}
+
+// encodeECKeyPEM marshals an EC private key to a SEC 1 PEM block.
+func encodeECKeyPEM(key *ecdsa.PrivateKey) ([]byte, error) {
+	keyDER, err := x509.MarshalECPrivateKey(key)
+	if err != nil {
+		return nil, fmt.Errorf("marshal EC private key: %w", err)
+	}
+	return pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER}), nil
 }

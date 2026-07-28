@@ -15,6 +15,7 @@ package main
 import (
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -24,6 +25,7 @@ import (
 	"time"
 
 	"github.com/charliek/shed/internal/ext/protocol"
+	"github.com/charliek/shed/sdk"
 	"gopkg.in/yaml.v3"
 )
 
@@ -50,6 +52,16 @@ func readFixture(t *testing.T, name string, into any) {
 	if err := json.Unmarshal(data, into); err != nil {
 		t.Fatalf("unmarshal fixture %s: %v", path, err)
 	}
+}
+
+// desktopCredentialFixture reads one of the plan 002 §7 P9 desktop-credential
+// vectors — the SAME files the Rust agent runner
+// (crates/shed-host-agent/src/desktop_protocol.rs), the Rust client
+// (crates/shed-app), and the Swift client
+// (desktop/Tests/ShedKitTests/HostAgentCredentialFixtureTests.swift) read.
+func desktopCredentialFixture(t *testing.T, name string, into any) {
+	t.Helper()
+	readFixture(t, filepath.Join("desktop-credential", name), into)
 }
 
 func equalStrings(a, b []string) bool {
@@ -99,6 +111,7 @@ type goldenTarget struct {
 	TLSFingerprint string `json:"tls_fingerprint"`
 	SSHHost        string `json:"ssh_host"`
 	SSHPort        int    `json:"ssh_port"`
+	AuthMode       string `json:"auth_mode"`
 }
 
 func TestGoldenLoadDiscoveredServers(t *testing.T) {
@@ -823,6 +836,256 @@ func TestGoldenDockerPathAugment(t *testing.T) {
 		got := augmentPATH(env, v.ExtraDirs)
 		if pv := pathValue(t, got); pv != v.ExpectedPath {
 			t.Errorf("%s: augmentPATH PATH = %q, want %q", v.Name, pv, v.ExpectedPath)
+		}
+	}
+}
+
+// --- plan 002 §7 P9: the shared desktop-credential wire vectors -------------
+//
+// These three tests are the Go half of the cross-language gate. The point is
+// not that each language has a test — it is that a divergence in how Go, Rust
+// and Swift interpret ONE byte string fails a test per commit, instead of
+// showing up as a field report against a version pairing nobody ran.
+//
+// Go is only ever the AGENT here (there is no Go desktop client), so it asserts
+// the two directions an agent actually owns: the frames it EMITS
+// (hello_ack.agent_capabilities, credential.response) and the frame it DECODES
+// (credential.get). The client-side arm mapping — which of these frames may be
+// adopted, and which must be refused — is asserted by the Rust client
+// (crates/shed-app/src/token_minter.rs) and Swift against the same file.
+
+// TestGoldenDesktopHelloAckCapability pins the capability derivation every
+// client performs on an ack, using the PRODUCTION capability constant, and
+// pins that THIS build's own ack is a `supported` one. Renaming capCredentialGet
+// (or dropping it from agentCapabilities) fails here.
+func TestGoldenDesktopHelloAckCapability(t *testing.T) {
+	// The frame is nested under "frame"; decode it as the production outbound
+	// struct so the json tags (incl. the omitempty that makes an OLD agent's
+	// absent key meaningful) are the ones under test.
+	var fx struct {
+		ProtocolVersion int `json:"protocol_version"`
+		Vectors         []struct {
+			Name     string          `json:"name"`
+			Frame    json.RawMessage `json:"frame"`
+			Expected string          `json:"expected_capability"`
+		} `json:"vectors"`
+	}
+	desktopCredentialFixture(t, "hello_ack.json", &fx)
+	if fx.ProtocolVersion != 1 {
+		t.Fatalf("hello_ack.json protocol_version = %d, want 1 (version skew)", fx.ProtocolVersion)
+	}
+	if len(fx.Vectors) == 0 {
+		t.Fatal("hello_ack.json has no vectors")
+	}
+
+	supports := func(ack helloAckMsg) bool {
+		for _, c := range ack.AgentCapabilities {
+			if c == capCredentialGet {
+				return true
+			}
+		}
+		return false
+	}
+	for _, v := range fx.Vectors {
+		var ack helloAckMsg
+		if err := json.Unmarshal(v.Frame, &ack); err != nil {
+			t.Errorf("%s: decode hello_ack: %v", v.Name, err)
+			continue
+		}
+		want := map[string]bool{"supported": true, "unsupported": false}
+		expected, ok := want[v.Expected]
+		if !ok {
+			t.Fatalf("%s: unexpected fixture capability %q", v.Name, v.Expected)
+		}
+		if got := supports(ack); got != expected {
+			t.Errorf("%s: supports(%q) = %v, want %v", v.Name, capCredentialGet, got, expected)
+		}
+	}
+
+	// This build's own ack must be a `supported` one — the fixture's rule
+	// applied to production output, not to a literal.
+	if !supports(helloAckMsg{AgentCapabilities: agentCapabilities()}) {
+		t.Errorf("this agent's hello_ack does not advertise %q", capCredentialGet)
+	}
+}
+
+// TestGoldenDesktopCredentialResponse pins the frames this agent EMITS against
+// the shared vectors — through the REAL path, end to end: a live DesktopServer
+// on a real socket, a real handshake, a real `credential.get`, and a minter
+// returning the vector's credential. What is asserted is the wire object the
+// app would actually read, so a `handleCredentialGet` that dropped or misrouted
+// `auth_mode` fails here (a fixture→struct→JSON round-trip would not — it never
+// executes the population path).
+//
+// Only `agent_emits` vectors are emitter cases; the rest describe frames only a
+// client decodes, several of which this agent CANNOT produce (see the fixture's
+// _comment).
+func TestGoldenDesktopCredentialResponse(t *testing.T) {
+	var fx struct {
+		ProtocolVersion int    `json:"protocol_version"`
+		Server          string `json:"server"`
+		Vectors         []struct {
+			Name       string `json:"name"`
+			AgentEmits bool   `json:"agent_emits"`
+			Frame      struct {
+				ID         string `json:"id"`
+				Ts         string `json:"ts"`
+				InReplyTo  string `json:"in_reply_to"`
+				Server     string `json:"server"`
+				AuthMode   string `json:"auth_mode"`
+				Token      string `json:"token"`
+				ClientCert string `json:"client_cert"`
+				CertSerial string `json:"cert_serial"`
+				ExpiresAt  string `json:"expires_at"`
+				Error      string `json:"error"`
+			} `json:"frame"`
+		} `json:"vectors"`
+	}
+	desktopCredentialFixture(t, "credential_response.json", &fx)
+	if fx.ProtocolVersion != 1 {
+		t.Fatalf("credential_response.json protocol_version = %d, want 1 (version skew)", fx.ProtocolVersion)
+	}
+	// The fixture's server must be the one the drive config names, or the mint
+	// would fail to resolve and every vector would collapse to an error reply.
+	var raw struct {
+		Vectors []struct {
+			Name       string          `json:"name"`
+			AgentEmits bool            `json:"agent_emits"`
+			Frame      json.RawMessage `json:"frame"`
+		} `json:"vectors"`
+	}
+	desktopCredentialFixture(t, "credential_response.json", &raw)
+
+	emitted := 0
+	for i, v := range fx.Vectors {
+		if !v.AgentEmits {
+			continue
+		}
+		emitted++
+		f := v.Frame
+		if f.Server != fx.Server {
+			t.Fatalf("%s: vector server %q != fixture server %q", v.Name, f.Server, fx.Server)
+		}
+		t.Run(v.Name, func(t *testing.T) {
+			// The minter's answer, reconstructed from the vector. `Bundle.Mode()`
+			// is what normalizes it on the way out, so feeding the literal the
+			// fixture shows is feeding the production path its real input.
+			var res mintResult
+			switch {
+			case f.Error != "":
+				res = mintResult{err: errors.New(f.Error)}
+			case f.AuthMode == sdk.AuthModeMTLS:
+				res = mintResult{cred: sdk.Credential{Bundle: sdk.Bundle{
+					AuthMode:   sdk.AuthModeMTLS,
+					ClientCert: f.ClientCert,
+					CertSerial: f.CertSerial,
+					ExpiresAt:  parseFixtureTime(t, f.ExpiresAt),
+				}}}
+			default:
+				res = mintResult{cred: tokenCredential(f.Token, parseFixtureTime(t, f.ExpiresAt))}
+			}
+			// The request id is the vector's in_reply_to, so the echoed field is
+			// asserted for real rather than normalized away.
+			got := driveCredentialGetFrame(t,
+				&fakeMinter{results: []mintResult{res}},
+				goldenShedConfig(fx.Server),
+				credentialGetMsg{Type: "credential.get", ID: f.InReplyTo, Server: f.Server, CSR: "QUJD"})
+
+			var want map[string]any
+			if err := json.Unmarshal(raw.Vectors[i].Frame, &want); err != nil {
+				t.Fatal(err)
+			}
+			// `id` and `ts` are generated per reply — presence, not value.
+			for _, k := range []string{"id", "ts"} {
+				if got[k] == nil || got[k] == "" {
+					t.Errorf("reply is missing a generated %q", k)
+				}
+				want[k] = got[k]
+			}
+			if !reflect.DeepEqual(got, want) {
+				gj, _ := json.Marshal(got)
+				wj, _ := json.Marshal(want)
+				t.Errorf("live credential.response frame mismatch\n got: %s\nwant: %s", gj, wj)
+			}
+		})
+	}
+	if emitted == 0 {
+		t.Fatal("credential_response.json marks no vector agent_emits")
+	}
+}
+
+// goldenShedConfig is a secure (https) + ssh-reachable entry for `name`, the
+// minimum `controlTokenProvider.resolve` needs before it will mint. `auth_mode`
+// is deliberately absent: what the server ISSUES is the minter's answer, not
+// the config's claim, and the vectors cover both shapes against this one entry.
+func goldenShedConfig(name string) string {
+	return "\nservers:\n  " + name + ":\n    api_url: https://" + name +
+		".example:8443\n    host: " + name + ".example\n    ssh_port: 2222\n"
+}
+
+// parseFixtureTime turns a vector's RFC3339 `expires_at` into the time the
+// minter would return; an empty string is the no-expiry case (a zero time, which
+// the handler omits).
+func parseFixtureTime(t *testing.T, s string) time.Time {
+	t.Helper()
+	if s == "" {
+		return time.Time{}
+	}
+	ts, err := time.Parse(time.RFC3339, s)
+	if err != nil {
+		t.Fatalf("fixture expires_at %q: %v", s, err)
+	}
+	return ts
+}
+
+// TestGoldenDesktopCredentialGet pins the agent's DECODE of the app's request.
+// The load-bearing case is the CSR-less one: `csr` absent must read as "no CSR"
+// (the condition an mtls server answers with its own explicit upgrade error),
+// never as a zero-length CSR the agent would relay as if it were one.
+func TestGoldenDesktopCredentialGet(t *testing.T) {
+	var fx struct {
+		ProtocolVersion int `json:"protocol_version"`
+		MaxCSRBytes     int `json:"max_csr_bytes"`
+		Vectors         []struct {
+			Name    string `json:"name"`
+			Request struct {
+				Server string  `json:"server"`
+				CSR    *string `json:"csr"`
+			} `json:"request"`
+			Frame json.RawMessage `json:"expected_frame"`
+			Keys  []string        `json:"expected_keys"`
+		} `json:"vectors"`
+	}
+	desktopCredentialFixture(t, "credential_get.json", &fx)
+	if fx.ProtocolVersion != 1 {
+		t.Fatalf("credential_get.json protocol_version = %d, want 1 (version skew)", fx.ProtocolVersion)
+	}
+	if len(fx.Vectors) == 0 {
+		t.Fatal("credential_get.json has no vectors")
+	}
+	for _, v := range fx.Vectors {
+		var req credentialGetMsg
+		if err := json.Unmarshal(v.Frame, &req); err != nil {
+			t.Errorf("%s: decode credential.get: %v", v.Name, err)
+			continue
+		}
+		if req.Type != "credential.get" {
+			t.Errorf("%s: type = %q", v.Name, req.Type)
+		}
+		if req.Server != v.Request.Server {
+			t.Errorf("%s: server = %q, want %q", v.Name, req.Server, v.Request.Server)
+		}
+		// The fixture's `expected_keys` is authoritative on whether the wire
+		// carried a csr; a null/empty request csr is omitted by the sender, so
+		// the agent must see the empty string either way.
+		wantCSR := ""
+		for _, k := range v.Keys {
+			if k == "csr" && v.Request.CSR != nil {
+				wantCSR = *v.Request.CSR
+			}
+		}
+		if req.CSR != wantCSR {
+			t.Errorf("%s: csr = %q, want %q", v.Name, req.CSR, wantCSR)
 		}
 	}
 }

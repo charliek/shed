@@ -693,3 +693,21 @@ def test_launch_dialog_opens(tauri):
     tauri.show_window()
     png, w, h = tauri.screenshot(scale=1)
     assert png[:8] == PNG_MAGIC and w > 0 and h > 0
+
+
+def test_hosts_auth_reports_the_config_mode_unlearned(tauri):
+    # Plan 002 C3: the app's mtls surface. The hermetic fixture config carries no
+    # `auth_mode`, and ABSENT MEANS TOKEN — an entry written before client
+    # certificates existed describes a token/open server.
+    #
+    # `learned` is the load-bearing half: False says "this is only what the CLI
+    # cached", True says "a mint in THIS session produced that shape". The mock
+    # server is tokenless (no minter is installed in test mode), so nothing can
+    # be learned here — which is exactly the assertion that the flag is not
+    # hard-coded to the config value.
+    hosts = tauri.hosts_auth()
+    assert [h["name"] for h in hosts] == sorted(h["name"] for h in hosts), "name-sorted"
+    assert "mock" in [h["name"] for h in hosts]
+    mock_host = next(h for h in hosts if h["name"] == "mock")
+    assert mock_host["auth_mode"] == "token"
+    assert mock_host["learned"] is False

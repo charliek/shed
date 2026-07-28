@@ -19,8 +19,9 @@ const (
 	// reservedAPIUser is a special username reserved for API access.
 	reservedAPIUser = "_api"
 
-	// reservedBootstrapUser issues a short-lived HTTP bearer token over the
-	// authenticated SSH channel (see bootstrap.go). Like _api it is not a shed.
+	// reservedBootstrapUser issues a short-lived HTTP credential — a bearer
+	// token, or a client certificate in mtls mode — over the authenticated SSH
+	// channel (see bootstrap.go). Like _api it is not a shed.
 	reservedBootstrapUser = "_bootstrap"
 
 	// containerReadyTimeout is the maximum time to wait for a container to be ready.

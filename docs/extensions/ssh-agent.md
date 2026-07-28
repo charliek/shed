@@ -77,9 +77,9 @@ ssh:
   mode: agent-forward  # or "local-keys"
 ```
 
-## Secure-mode token bootstrap
+## Token-mode token bootstrap
 
-When the shed server runs in `auth.mode: secure`, the host agent mints its own
+When the shed server runs in `auth.mode: token`, the host agent mints its own
 short-lived API token over the server's reserved `_bootstrap` SSH channel (rather
 than reading a pasted `credentials_token`). It does this by invoking your
 **system `ssh` client**, so the SSH identity is resolved exactly the way

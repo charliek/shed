@@ -32,7 +32,7 @@ shed server add localhost --name my-server
 ```
 
 For a server you reach **over the network**, the server must bind a non-loopback
-`bind_address` (since v0.7.4 the default is loopback-only). Secure mode is the
+`bind_address` (since v0.7.4 the default is loopback-only). Token mode is the
 preferred networked posture — pin its TLS cert and mint a token over SSH:
 
 ```bash
@@ -45,7 +45,7 @@ For an open server on a trusted private network (configured with
 [Security Configuration guide](../guides/security-configuration.md) for the
 server-side posture setup.
 
-This connects to the server, retrieves its SSH host key (and, in secure mode,
+This connects to the server, retrieves its SSH host key (and, in token mode,
 pins the TLS cert and mints your token), and saves the configuration.
 
 ## Create a Shed

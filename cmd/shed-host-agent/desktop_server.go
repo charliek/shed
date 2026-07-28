@@ -231,11 +231,12 @@ func (s *DesktopServer) handleConn(ctx context.Context, conn net.Conn) {
 	// approval_request to this connection before the handshake completes.
 	if err := c.send(helloAckMsg{
 		V: desktopProtocolVersion, Type: "hello_ack", ID: newID(), Ts: nowRFC3339(),
-		Agent:            agentInfo{Version: s.agentVersion, ApprovalMethod: "shed-desktop"},
-		Namespaces:       []string{protocol.NamespaceSSHAgent, protocol.NamespaceAWSCredentials, protocol.NamespaceDockerCredentials, namespaceEgress},
-		GateNamespaces:   s.gateNamespaces,
-		RequestTimeoutMS: int(s.timeout / time.Millisecond),
-		Accepted:         true,
+		Agent:             agentInfo{Version: s.agentVersion, ApprovalMethod: "shed-desktop"},
+		Namespaces:        []string{protocol.NamespaceSSHAgent, protocol.NamespaceAWSCredentials, protocol.NamespaceDockerCredentials, namespaceEgress},
+		GateNamespaces:    s.gateNamespaces,
+		AgentCapabilities: agentCapabilities(),
+		RequestTimeoutMS:  int(s.timeout / time.Millisecond),
+		Accepted:          true,
 	}); err != nil {
 		return
 	}
@@ -284,6 +285,11 @@ func (s *DesktopServer) handleConn(ctx context.Context, conn net.Conn) {
 				// and must not stall this connection's read loop (and thus approvals).
 				go s.handleTokenGet(c, req)
 			}
+		case "credential.get":
+			var req credentialGetMsg
+			if json.Unmarshal(line, &req) == nil {
+				go s.handleCredentialGet(c, req)
+			}
 		case "pong":
 			// liveness only
 		}
@@ -306,6 +312,35 @@ func (s *DesktopServer) handleTokenGet(c *consumerConn, req tokenGetMsg) {
 		resp.Token = tok
 		if !exp.IsZero() {
 			resp.ExpiresAt = exp.UTC().Format(time.RFC3339)
+		}
+	}
+	_ = c.send(resp)
+}
+
+// handleCredentialGet answers a credential.get: obtain a control-scoped
+// credential for the requested server — relaying the app's CSR so an mtls-mode
+// server can issue a certificate against a key that never leaves the app — and
+// reply with credential.response.
+//
+// On any failure Error is set and every credential field stays empty: fail
+// closed, never a partial credential, and never a response that looks like a
+// success with nothing in it.
+func (s *DesktopServer) handleCredentialGet(c *consumerConn, req credentialGetMsg) {
+	resp := credentialResponseMsg{
+		V: desktopProtocolVersion, Type: "credential.response", ID: newID(), Ts: nowRFC3339(),
+		InReplyTo: req.ID, Server: req.Server,
+	}
+	if s.controlTokens == nil {
+		resp.Error = "control-credential minting is not available"
+	} else if cred, err := s.controlTokens.Credential(req.Server, req.CSR); err != nil {
+		resp.Error = err.Error()
+	} else {
+		resp.AuthMode = cred.AuthMode
+		resp.Token = cred.Token
+		resp.ClientCert = cred.ClientCert
+		resp.CertSerial = cred.CertSerial
+		if !cred.ExpiresAt.IsZero() {
+			resp.ExpiresAt = cred.ExpiresAt.UTC().Format(time.RFC3339)
 		}
 	}
 	_ = c.send(resp)

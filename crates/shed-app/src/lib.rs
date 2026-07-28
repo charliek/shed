@@ -7,6 +7,7 @@
 //! Swift-only (poller, df/images, the reachability rollup) will also land (A1a-add).
 
 pub mod audit_store;
+pub mod auth_modes;
 pub mod backend;
 #[cfg(feature = "broker")]
 pub mod broker_bridge;
@@ -21,17 +22,21 @@ pub mod token_minter;
 pub mod traits;
 
 pub use audit_store::AuditStore;
+pub use auth_modes::{AuthModeRegistry, AuthModeState};
 pub use backend::{Backend, HostDiskUsage, HostEgressProfiles, RcTarget, Reachability};
 #[cfg(feature = "broker")]
 pub use broker_bridge::{
     detect_mode, load_or_synthesize, probe_sockets, probe_sockets_at, resolve_mode, BrokerConfig,
     BrokerError, DetectedMode, EffectiveMode, EmbeddedHostAgent, ModePref, ModeProbe, ResolvedMode,
 };
-#[cfg(feature = "rc")]
-pub use rc::{RcRunner, RcRunnerRef, RcService, RunOutput, TokioProcessRunner};
 pub use coordinator::{Coordinator, CoordinatorDeps, SshPrefs};
 pub use fakes::{AlwaysApprovedGate, FakeNotifier, NoopEventSink};
-pub use host_agent::{HelloClientInfo, HostAgentClient, HostAgentClientError, HostAgentEvent};
+pub use host_agent::{
+    AgentCapabilityState, CapabilitySnapshot, HelloClientInfo, HostAgentClient,
+    HostAgentClientError, HostAgentEvent,
+};
+#[cfg(feature = "rc")]
+pub use rc::{RcRunner, RcRunnerRef, RcService, RunOutput, TokioProcessRunner};
 pub use rc_events_watcher::{RcEventsWatcher, RcWatcherUpdate};
 pub use token_minter::HostAgentTokenMinter;
 pub use traits::{

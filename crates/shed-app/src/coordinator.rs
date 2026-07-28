@@ -284,7 +284,9 @@ impl Coordinator {
     /// The current provider (AWS/Docker) modes — the single source of truth the
     /// Preferences getter reads back (a namespace absent from the map is Deny).
     pub async fn provider_modes(&self) -> HashMap<String, ApprovalDecision> {
-        self.request(Command::ProviderModes).await.unwrap_or_default()
+        self.request(Command::ProviderModes)
+            .await
+            .unwrap_or_default()
     }
 
     /// Remove exactly ONE per-shed rule (the Preferences "Per-shed overrides"
@@ -360,9 +362,7 @@ impl Coordinator {
     /// The current SSH approval prefs (drives the Preferences dropdown). Falls back
     /// to the default if the actor is gone.
     pub async fn ssh_prefs(&self) -> SshPrefs {
-        self.request(Command::SshPrefs)
-            .await
-            .unwrap_or_default()
+        self.request(Command::SshPrefs).await.unwrap_or_default()
     }
 
     async fn request<T>(&self, make: impl FnOnce(oneshot::Sender<T>) -> Command) -> Option<T> {
@@ -519,10 +519,10 @@ impl State {
                 }
                 self.pending.clear();
                 self.gating.clear(); // A2: any in-flight gates are moot now
-                // A3: drop ALL session grants — a reconnected (possibly different /
-                // squatting) agent must not inherit an auto-approve made to the
-                // previous connection. Clearing everything is simpler + strictly
-                // safer than scoping to a namespace across a reconnect.
+                                     // A3: drop ALL session grants — a reconnected (possibly different /
+                                     // squatting) agent must not inherit an auto-approve made to the
+                                     // previous connection. Clearing everything is simpler + strictly
+                                     // safer than scoping to a namespace across a reconnect.
                 self.session_grants.clear();
                 self.sink.emit(CoordinatorEvent::Approvals);
                 // The delegation is gone until we re-handshake; clear it (and signal
@@ -962,11 +962,7 @@ impl State {
     /// rule reflects it (and re-evaluate the pending queue for parity with the SSH
     /// path). Only the two provider namespaces are accepted — anything else is a
     /// caller error (SSH has its own prefs path; other namespaces have no mode).
-    fn set_provider_mode(
-        &mut self,
-        ns: String,
-        decision: ApprovalDecision,
-    ) -> Result<(), String> {
+    fn set_provider_mode(&mut self, ns: String, decision: ApprovalDecision) -> Result<(), String> {
         if ns != namespace::AWS && ns != namespace::DOCKER {
             return Err(format!("provider mode not settable for namespace {ns:?}"));
         }
@@ -1257,7 +1253,11 @@ mod tests {
         // r3 same shed must RE-PROMPT (queue, not auto-approve) — the grant is gone.
         h.inject(ssh_req("r3", "s", 5_000));
         assert!(h.wait_queued(1).await);
-        assert_eq!(h.responder.calls().len(), 2, "r3 was auto-approved from a stale grant");
+        assert_eq!(
+            h.responder.calls().len(),
+            2,
+            "r3 was auto-approved from a stale grant"
+        );
     }
 
     // -- harness helpers -----------------------------------------------------
@@ -1487,7 +1487,10 @@ mod tests {
                 .all(|c| c.decision != ApprovalDecision::Approve),
             "an expired request was policy-approved"
         );
-        assert!(!h.coord.approvals_list().await.is_empty(), "r1 should linger");
+        assert!(
+            !h.coord.approvals_list().await.is_empty(),
+            "r1 should linger"
+        );
         // The tick then denies it.
         h.coord.expire_now().await;
         assert!(h.wait_calls(1).await);
@@ -1881,6 +1884,7 @@ mod tests {
             .send(HostAgentEvent::Connected(shed_core::approval::HelloAck {
                 namespaces: vec![],
                 gate_namespaces: vec!["ssh-agent".into()],
+                agent_capabilities: vec![],
                 request_timeout_ms: 25_000,
                 accepted: true,
             }))
@@ -1987,7 +1991,11 @@ mod tests {
             .await
             .expect("docker is a settable provider namespace");
         assert_eq!(
-            h.coord.provider_modes().await.get(namespace::DOCKER).copied(),
+            h.coord
+                .provider_modes()
+                .await
+                .get(namespace::DOCKER)
+                .copied(),
             Some(ApprovalDecision::Approve)
         );
         h.inject(req("d2", namespace::DOCKER, "s", "", 5_000));

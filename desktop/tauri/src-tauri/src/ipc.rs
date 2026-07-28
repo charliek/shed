@@ -313,6 +313,7 @@ impl Handler {
             "create.status" => self.create_status(params),
             "create.cancel" => self.create_cancel(params),
             "system.df" => Ok(json!({ "usage": self.backend.system_df().await })),
+            "hosts.auth" => Ok(self.hosts_auth()),
             "egress.profiles" => Ok(self.egress_dump()),
             "egress.show" => self.egress_show(params),
             "terminal.preview" => self.terminal_preview(params),
@@ -1052,6 +1053,35 @@ impl Handler {
         crate::login_item_set(&self.app, &self.env, enabled).map_err(|e| err("action_failed", e))?;
         self.emit_prefs_changed();
         Ok(json!({}))
+    }
+
+    /// `hosts.auth` → per-server credential mode: what the config entry claims
+    /// and what this SESSION has learned (plan 002 §7 P1).
+    ///
+    /// The app's whole mtls surface, and deliberately a read-only one. Nothing
+    /// here is persisted — `~/.shed/config.yaml` is CLI-owned, this parser is
+    /// read-only and lossy, and a learned mode costs one silent re-bootstrap on
+    /// the next cold launch. `learned` is what distinguishes "the CLI cached
+    /// this" from "a mint proved it", which is what a driver needs to assert a
+    /// live token→mtls flip.
+    fn hosts_auth(&self) -> Value {
+        let hosts = self
+            .app
+            .try_state::<Arc<shed_app::AuthModeRegistry>>()
+            .map(|r| {
+                r.snapshot()
+                    .into_iter()
+                    .map(|(name, s)| {
+                        json!({
+                            "name": name,
+                            "auth_mode": s.mode.as_str(),
+                            "learned": s.learned,
+                        })
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        json!({ "hosts": hosts })
     }
 
     /// `broker.status` → the resolved broker mode + probe evidence + config source +

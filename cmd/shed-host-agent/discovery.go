@@ -32,7 +32,31 @@ type shedServerEntry struct {
 	// TLSCertFingerprint pins the server's self-signed TLS cert
 	// ("sha256:<hex>"). Matches the shed CLI's tls_cert_fingerprint field.
 	TLSCertFingerprint string `yaml:"tls_cert_fingerprint,omitempty"`
+	// AuthMode is the credential shape the server last issued ("token" or
+	// "mtls"), cached by `shed server add`. Matches the shed CLI's auth_mode
+	// field.
+	//
+	// It is read but NOT trusted as the enrollment decision: the agent always
+	// bootstraps CSR-first (sdk/bootstrap.RunCredential) and adopts whatever the
+	// server returns, so a stale value cannot lock it into the wrong mode. What
+	// it buys is knowing, before the first mint, whether a persisted certificate
+	// is worth loading from the agent's own store, and being able to answer the
+	// desktop's token.get with an explicit "this server is mtls" error instead
+	// of a mint that silently returns no token.
+	//
+	// Absent means token (a legacy entry, or one written by a pre-mtls client).
+	// The empty string is preserved verbatim rather than defaulted, so "never
+	// recorded" and "recorded as token" stay distinguishable.
+	AuthMode string `yaml:"auth_mode,omitempty"`
 }
+
+// The auth modes a shed server can be in, as recorded in the CLI config entry.
+// They mirror sdk.AuthModeToken / sdk.AuthModeMTLS; redefined locally under the
+// same convention as the rest of this file (see shedClientConfig).
+const (
+	authModeToken = "token"
+	authModeMTLS  = "mtls"
+)
 
 // defaultShedHTTPPort matches shed's default server HTTP port.
 const defaultShedHTTPPort = 8080
@@ -95,6 +119,7 @@ func LoadDiscoveredServers(path string) ([]ServerTarget, error) {
 			TLSFingerprint: entry.TLSCertFingerprint,
 			SSHHost:        entry.Host,
 			SSHPort:        entry.SSHPort,
+			AuthMode:       entry.AuthMode,
 		})
 	}
 	sort.Slice(targets, func(i, j int) bool { return targets[i].Name < targets[j].Name })

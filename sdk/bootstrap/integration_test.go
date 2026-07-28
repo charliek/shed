@@ -19,6 +19,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -52,6 +53,15 @@ func newSigner(t *testing.T) (ssh.Signer, ed25519.PrivateKey) {
 // key and answers a single exec by writing bundleJSON then exiting 0. Returns the
 // listen port and the host key it presents.
 func startServer(t *testing.T, bundleJSON string) (port int, hostKey ssh.Signer) {
+	port, hostKey, _ = startRecordingServer(t, bundleJSON)
+	return port, hostKey
+}
+
+// startRecordingServer is startServer plus the exec request line the client
+// sent, which is the only place the CSR argument is observable from outside the
+// package. Sends on a buffered channel so a test reads exactly the one exchange
+// it triggered.
+func startRecordingServer(t *testing.T, bundleJSON string) (port int, hostKey ssh.Signer, commands <-chan string) {
 	t.Helper()
 	hostKey, _ = newSigner(t)
 	cfg := &ssh.ServerConfig{
@@ -67,19 +77,20 @@ func startServer(t *testing.T, bundleJSON string) (port int, hostKey ssh.Signer)
 	}
 	t.Cleanup(func() { _ = ln.Close() })
 
+	seen := make(chan string, 8)
 	go func() {
 		for {
 			nConn, err := ln.Accept()
 			if err != nil {
 				return
 			}
-			go serveOne(nConn, cfg, bundleJSON)
+			go serveOne(nConn, cfg, bundleJSON, seen)
 		}
 	}()
-	return ln.Addr().(*net.TCPAddr).Port, hostKey
+	return ln.Addr().(*net.TCPAddr).Port, hostKey, seen
 }
 
-func serveOne(nConn net.Conn, cfg *ssh.ServerConfig, bundleJSON string) {
+func serveOne(nConn net.Conn, cfg *ssh.ServerConfig, bundleJSON string, seen chan<- string) {
 	conn, chans, reqs, err := ssh.NewServerConn(nConn, cfg)
 	if err != nil {
 		_ = nConn.Close()
@@ -102,6 +113,15 @@ func serveOne(nConn net.Conn, cfg *ssh.ServerConfig, bundleJSON string) {
 				if req.Type == "exec" {
 					if req.WantReply {
 						_ = req.Reply(true, nil)
+					}
+					// The exec payload is a single string: the remote command line,
+					// i.e. everything sshArgs appended after the host.
+					var payload struct{ Command string }
+					if err := ssh.Unmarshal(req.Payload, &payload); err == nil && seen != nil {
+						select {
+						case seen <- payload.Command:
+						default:
+						}
 					}
 					_, _ = ch.Write([]byte(bundleJSON))
 					_, _ = ch.SendRequest("exit-status", false, ssh.Marshal(struct{ Code uint32 }{0}))
@@ -177,6 +197,91 @@ func TestRunSuccess(t *testing.T) {
 	if got.Token != want.Token || got.Scope != "control" || got.HTTPSPort != 8443 {
 		t.Errorf("bundle = %+v, want %+v", got, want)
 	}
+}
+
+// TestRunNeverSendsACSRButRunCredentialDoes pins the split between the two
+// entry points, asserted from the SERVER's side: Run is token-only and must
+// stay that way (the host-agent depends on it), while RunCredential submits a
+// CSR to every server so a mode flip needs no client change.
+//
+// It drives the real Run/RunCredential over the real ssh client rather than
+// inspecting the argv a hand-cleared Params would produce. That distinction is
+// the whole point of the test: the property under protection is that RUN
+// clears CSRBase64, and any assertion that clears the field itself would still
+// pass after Run stopped doing so.
+func TestRunNeverSendsACSRButRunCredentialDoes(t *testing.T) {
+	requireSSH(t)
+
+	// A token bundle: what a token-mode (or pre-mtls) server answers with. Both
+	// entry points accept it, so one server serves both halves of the test.
+	bundleJSON, err := json.Marshal(sdk.Bundle{
+		HTTPSPort: 8443, TLSCertFingerprint: "sha256:abc", Token: "shed_control_xyz", Scope: "control",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	port, hostKey, commands := startRecordingServer(t, string(bundleJSON))
+
+	home := t.TempDir()
+	kh := writeKnownHosts(t, home, port, hostKey.PublicKey())
+	writeClientIdentity(t, home, port, kh)
+	t.Setenv("HOME", home)
+	t.Setenv("SSH_AUTH_SOCK", "")
+
+	p := bootstrap.Params{
+		Host: "127.0.0.1", Port: port, KnownHostsPath: kh, Scope: "control", ClientKind: "test",
+		// Set deliberately. Run must DISCARD it — a caller passing one (or a
+		// struct copied from a RunCredential call site) must not turn Run into an
+		// enrolling client behind the host-agent's back.
+		CSRBase64: "QUJD",
+	}
+
+	nextCommand := func(t *testing.T) string {
+		t.Helper()
+		select {
+		case cmd := <-commands:
+			return cmd
+		case <-time.After(10 * time.Second):
+			t.Fatal("server never received an exec request")
+			return ""
+		}
+	}
+
+	t.Run("Run discards the CSR", func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		if _, err := bootstrap.Run(ctx, p); err != nil {
+			t.Fatalf("Run: %v", err)
+		}
+		cmd := nextCommand(t)
+		if strings.Contains(cmd, "csr=") {
+			t.Errorf("Run sent a CSR: request line = %q", cmd)
+		}
+		if !strings.Contains(cmd, "control") {
+			t.Errorf("request line = %q, want it to carry the scope", cmd)
+		}
+	})
+
+	t.Run("RunCredential sends one", func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		cred, err := bootstrap.RunCredential(ctx, p)
+		if err != nil {
+			t.Fatalf("RunCredential: %v", err)
+		}
+		if cred.Mode() != sdk.AuthModeToken {
+			t.Errorf("Mode() = %q, want token (the server answered with a token bundle)", cred.Mode())
+		}
+		cmd := nextCommand(t)
+		if !strings.Contains(cmd, "csr=") {
+			t.Fatalf("RunCredential sent no CSR: request line = %q — "+
+				"the Run assertion above would pass vacuously if this path were also CSR-free", cmd)
+		}
+		// And it is a freshly generated one, not the placeholder Run was handed.
+		if strings.Contains(cmd, "csr=QUJD ") || strings.HasSuffix(cmd, "csr=QUJD") {
+			t.Errorf("RunCredential relayed the caller's CSRBase64 instead of generating one: %q", cmd)
+		}
+	})
 }
 
 // writeClientIdentity generates a client key and a ~/.ssh/config that offers it

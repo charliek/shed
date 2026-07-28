@@ -8,6 +8,25 @@
 
 import Foundation
 
+/// The credential shape a server issues. Mirrors `ShedRustCore.AuthMode` /
+/// Go `config.AuthMode*`, kept in ShedKit so config, clients and tests can name
+/// it without importing the FFI (the bridging init lives in
+/// `Net/CredentialModeObserver.swift`).
+public enum ShedAuthMode: String, Sendable, Equatable {
+    case token
+    case mtls
+
+    /// Decode a config/wire value. Absent, empty, the legacy `"secure"` spelling
+    /// and any UNRECOGNIZED value all decode as `.token` — the Go/Rust rule for
+    /// a STORED entry (`ABSENT MEANS TOKEN`; an entry predating certificates is
+    /// a token server). This is the config-cache rule and is deliberately NOT
+    /// the rule for a live `credential.response`, where an unknown mode is
+    /// refused outright (`CredentialResponse.validatedCredential(for:)`).
+    public init(configValue: String?) {
+        self = configValue?.trimmingCharacters(in: .whitespaces) == "mtls" ? .mtls : .token
+    }
+}
+
 public struct ShedServerEntry: Sendable, Equatable {
     public let name: String
     public let host: String
@@ -20,8 +39,17 @@ public struct ShedServerEntry: Sendable, Equatable {
     public let apiURL: String
     /// Pinned TLS cert fingerprint ("sha256:<hex>"); empty for plain HTTP.
     public let tlsCertFingerprint: String
+    /// The RAW `auth_mode` value: the credential shape the server issued at the
+    /// server's last bootstrap, as the CLI cached it. **Absent means token** —
+    /// every entry written before client certificates existed omits the key and
+    /// all of those are token/open servers. Read-only, like the rest of this
+    /// parser: the desktop never writes config.yaml (plan 002 §7 P1).
+    public let authModeValue: String
 
-    public init(name: String, host: String, httpPort: Int, sshPort: Int, controlToken: String = "", apiURL: String = "", tlsCertFingerprint: String = "") {
+    /// The parsed credential shape (absent/unknown ⇒ `.token`, Go/Rust rule).
+    public var authMode: ShedAuthMode { ShedAuthMode(configValue: authModeValue) }
+
+    public init(name: String, host: String, httpPort: Int, sshPort: Int, controlToken: String = "", apiURL: String = "", tlsCertFingerprint: String = "", authModeValue: String = "") {
         self.name = name
         self.host = host
         self.httpPort = httpPort
@@ -29,6 +57,7 @@ public struct ShedServerEntry: Sendable, Equatable {
         self.controlToken = controlToken
         self.apiURL = apiURL
         self.tlsCertFingerprint = tlsCertFingerprint
+        self.authModeValue = authModeValue
     }
 }
 
@@ -94,7 +123,11 @@ public struct ShedConfig: Sendable, Equatable {
                 // so a hand-edited upper/mixed-case pin still matches at handshake
                 // time rather than silently failing every connection.
                 let tlsCertFingerprint = fields["tls_cert_fingerprint"]?.scalar?.lowercased() ?? ""
-                entries.append(ShedServerEntry(name: name, host: host, httpPort: httpPort, sshPort: sshPort, controlToken: controlToken, apiURL: apiURL, tlsCertFingerprint: tlsCertFingerprint))
+                // Lowercased to match the Rust parser (`config.rs`), which
+                // stores the raw value lowercased; interpretation is
+                // ShedAuthMode's.
+                let authModeValue = fields["auth_mode"]?.scalar?.lowercased() ?? ""
+                entries.append(ShedServerEntry(name: name, host: host, httpPort: httpPort, sshPort: sshPort, controlToken: controlToken, apiURL: apiURL, tlsCertFingerprint: tlsCertFingerprint, authModeValue: authModeValue))
             }
         }
         entries.sort { $0.name < $1.name }

@@ -939,17 +939,36 @@ pub fn run() {
             // The broker runtime reads the persisted pref LIVE (for `broker.status`'s
             // `pref`/`restart_required`), so hand it its own store handle.
             let broker_prefs = prefs.clone();
+            // The per-server credential-mode registry (plan 002 §7 P1/P5), built
+            // EMPTY here because the minter that reads it is constructed before
+            // the Backend that seeds it from config — the same launch order the
+            // embedded broker already imposes. In-memory only: config.yaml is
+            // CLI-owned and this app never writes it.
+            let auth_modes = Arc::new(shed_app::AuthModeRegistry::new());
+            let build_modes = auth_modes.clone();
+            let backend_modes = auth_modes.clone();
             let (backend, broker_runtime, coordinator) =
                 tauri::async_runtime::block_on(async move {
-                    let spine =
-                        broker::build(env_ref, broker_pref, broker_probe, broker_prefs, build_clock);
+                    let spine = broker::build(
+                        env_ref,
+                        broker_pref,
+                        broker_probe,
+                        broker_prefs,
+                        build_clock,
+                        build_modes,
+                    );
                     // Hermetic in test mode (every host → the mock); the minter is the
-                    // resolved mode's (external UDS token.get, or the embedded provider).
-                    let backend = Arc::new(Backend::from_env_parts_with_minter(
+                    // resolved mode's (external UDS credential.get, or the embedded
+                    // provider). `backend_modes` is seeded from the config's
+                    // `auth_mode` entries here and attached as every provider's
+                    // CredentialObserver, so an adopted mode is learned in all three
+                    // broker modes.
+                    let backend = Arc::new(Backend::from_env_parts_with_credentials(
                         env_ref.test_mode,
                         env_ref.mock_base_url.as_deref(),
                         &env_ref.config_path,
                         spine.minter.as_ref(),
+                        Some(&backend_modes),
                         &env_ref.mock_unreachable_hosts,
                     ));
                     let coordinator = Coordinator::spawn(
@@ -976,6 +995,7 @@ pub fn run() {
             app.manage(backend.clone());
             app.manage(broker_runtime);
             app.manage(coordinator.clone());
+            app.manage(auth_modes);
 
             // The terminal ops (preset resolution, launch, detection, the pref), shared
             // by the IPC handler + the frontend invoke commands (needs the Backend above).

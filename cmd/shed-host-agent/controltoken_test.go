@@ -8,6 +8,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	sdk "github.com/charliek/shed/sdk"
 )
 
 func writeShedConfig(t *testing.T, content string) string {
@@ -35,7 +37,7 @@ servers:
 func TestControlTokenProviderAlwaysMintsFresh(t *testing.T) {
 	cfg := writeShedConfig(t, prodSecureShedConfig)
 	far := time.Now().Add(24 * time.Hour)
-	fm := &fakeMinter{results: []mintResult{{tok: "ctl-1", exp: far}, {tok: "ctl-2", exp: far}}}
+	fm := &fakeMinter{results: []mintResult{tokenMint("ctl-1", far), tokenMint("ctl-2", far)}}
 	p := newControlTokenProvider(context.Background(), fm, cfg)
 
 	tok, exp, err := p.Token("prod")
@@ -66,7 +68,7 @@ func TestControlTokenProviderAlwaysMintsFresh(t *testing.T) {
 func TestControlTokenProviderRefreshesAfterServerRestart(t *testing.T) {
 	cfg := writeShedConfig(t, prodSecureShedConfig)
 	far := time.Now().Add(24 * time.Hour)
-	fm := &fakeMinter{results: []mintResult{{tok: "before-restart", exp: far}, {tok: "after-restart", exp: far}}}
+	fm := &fakeMinter{results: []mintResult{tokenMint("before-restart", far), tokenMint("after-restart", far)}}
 	p := newControlTokenProvider(context.Background(), fm, cfg)
 
 	if tok, _, err := p.Token("prod"); err != nil || tok != "before-restart" {
@@ -88,12 +90,12 @@ func TestControlTokenProviderConcurrentOverlapSingleFlight(t *testing.T) {
 	started := make(chan struct{}) // closed once the single mint is actually in flight
 	release := make(chan struct{}) // held open so the other callers pile onto that mint
 	var calls int32
-	mf := minterFunc(func(context.Context, ServerTarget, string) (string, time.Time, error) {
+	mf := minterFunc(func(context.Context, ServerTarget, string) (sdk.Credential, error) {
 		if atomic.AddInt32(&calls, 1) == 1 {
 			close(started) // first (and only, if single-flight holds) mint has begun
 		}
 		<-release
-		return "tok", time.Now().Add(24 * time.Hour), nil
+		return tokenCredential("tok", time.Now().Add(24*time.Hour)), nil
 	})
 	p := newControlTokenProvider(context.Background(), mf, cfg)
 
@@ -136,7 +138,7 @@ servers:
     http_port: 8080
     ssh_port: 2222
 `)
-	fm := &fakeMinter{results: []mintResult{{tok: "x", exp: time.Now().Add(time.Hour)}}}
+	fm := &fakeMinter{results: []mintResult{tokenMint("x", time.Now().Add(time.Hour))}}
 	p := newControlTokenProvider(context.Background(), fm, cfg)
 
 	// All three error before any mint. "open-http" is the case the new https gate

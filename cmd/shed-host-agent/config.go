@@ -144,6 +144,22 @@ type ServerTarget struct {
 	// entry omitted ssh_port, in which case the agent can't self-mint regardless.
 	SSHHost string
 	SSHPort int
+	// AuthMode is the credential shape the server last issued, as recorded in
+	// the shed CLI config ("token", "mtls", or "" for an entry that predates the
+	// field). It is knowledge, not policy — see shedServerEntry.AuthMode.
+	AuthMode string
+}
+
+// IsMTLS reports whether the server was last seen issuing client certificates.
+//
+// It is deliberately NOT the signal that decides whether to enroll — every
+// secure server is enrolled against CSR-first, and the server's answer decides
+// the mode. It is the signal for the two places where acting on stale knowledge
+// is harmless but acting on none is not: whether to bother loading a persisted
+// certificate at startup, and whether the desktop's legacy token.get can be
+// answered at all.
+func (t ServerTarget) IsMTLS() bool {
+	return strings.EqualFold(t.AuthMode, authModeMTLS)
 }
 
 // IsSecure reports whether the server is reached over https — the authoritative

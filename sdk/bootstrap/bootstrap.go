@@ -73,18 +73,31 @@ var (
 	// than mistaking it for a MITM. Retryable (the user may fix ssh config / load
 	// the agent / get added to the allowlist).
 	ErrNoSSHIdentities = errors.New("sdk/bootstrap: ssh could not authenticate with any available identity")
+
+	// errNoCertificatePEM / errCertKeyMismatch report a malformed or wrong
+	// client_cert in an mtls bundle (see clientKeyPair.matchesIssuedCert).
+	errNoCertificatePEM = errors.New("sdk/bootstrap: bundle client_cert is not a PEM CERTIFICATE block")
+	errCertKeyMismatch  = errors.New("sdk/bootstrap: issued certificate does not match the submitted key")
 )
 
 // Params describes one bootstrap exchange. Host/Port address the server's SSH
 // endpoint; KnownHostsPath is the pinned trust root (~/.shed/known_hosts);
-// Scope is the token scope ("control"/"credentials"); ClientKind is advisory
-// audit metadata ("cli"/"host-agent"/"desktop") and may be empty.
+// Scope is the credential scope ("control"/"credentials"); ClientKind is
+// advisory audit metadata ("cli"/"host-agent"/"desktop") and may be empty.
 type Params struct {
 	Host           string
 	Port           int
 	KnownHostsPath string
 	Scope          string
 	ClientKind     string
+	// CSRBase64 is a standard-base64 PKCS#10 CertificationRequest DER, sent as
+	// the `csr=<value>` request argument so an mtls-mode server can issue a
+	// client certificate. Empty means "no CSR" — the legacy, token-only shape.
+	//
+	// Callers do not build this themselves: RunCredential generates the keypair
+	// and fills it in. It is a Params field (rather than an internal detail)
+	// only so validate() covers it on the same path as every other argv element.
+	CSRBase64 string
 }
 
 // sshArgs builds the `ssh` argv for a bootstrap exchange (asserted directly by
@@ -134,8 +147,20 @@ func sshArgs(p Params) []string {
 	if p.ClientKind != "" {
 		args = append(args, p.ClientKind)
 	}
+	// The server parses everything after the scope order-independently, so the
+	// CSR is appended last and a kind-less request (`control csr=...`) is equally
+	// valid. A pre-mtls server only ever inspected position 1, so the extra
+	// argument is silently ignored there — which is what makes always sending it
+	// safe against every server generation.
+	if p.CSRBase64 != "" {
+		args = append(args, csrArgPrefix+p.CSRBase64)
+	}
 	return args
 }
+
+// csrArgPrefix names the CSR request argument. It MUST match the server's
+// csrArgKey in internal/sshd/bootstrap.go.
+const csrArgPrefix = "csr="
 
 // validate rejects inputs that could break argv construction or inject ssh
 // options before they reach exec. A host that is empty, contains whitespace/an
@@ -162,6 +187,36 @@ func validate(p Params) error {
 	if strings.ContainsAny(p.ClientKind, " \t\r\n") {
 		return fmt.Errorf("sdk/bootstrap: invalid client kind %q", p.ClientKind)
 	}
+	// The CSR rides in a single argv element (`csr=<base64>`) that the server
+	// splits on the FIRST "=" and then base64-decodes. Whitespace would split it
+	// into two request arguments (the second of which the server would read as a
+	// client kind), and a NUL would truncate the argv element at exec. Neither
+	// can occur in standard base64, so anything outside that alphabet means the
+	// value was not produced by newClientKeyPair and must not reach exec.
+	return validateCSRArg(p.CSRBase64)
+}
+
+// validateCSRArg enforces that the CSR argument is a single argv token of
+// standard-base64 characters. Empty (no CSR) is valid.
+//
+// It scans the alphabet rather than attempting a decode: encoding/base64
+// silently SKIPS "\r" and "\n" while decoding, so a successful decode would
+// prove nothing about the argv element staying one token.
+func validateCSRArg(csr string) error {
+	if csr == "" {
+		return nil
+	}
+	for i := 0; i < len(csr); i++ {
+		c := csr[i]
+		switch {
+		case c >= 'A' && c <= 'Z', c >= 'a' && c <= 'z', c >= '0' && c <= '9':
+		case c == '+', c == '/', c == '=':
+		default:
+			// The value itself is not echoed: it is long, and a corrupted one is
+			// not more legible for being printed in full.
+			return fmt.Errorf("sdk/bootstrap: invalid csr argument: byte %d is not standard base64", i)
+		}
+	}
 	return nil
 }
 
@@ -173,8 +228,82 @@ func validate(p Params) error {
 //   - ErrHostKeyVerificationFailed / ErrNoSSHIdentities and other non-terminal
 //     errors otherwise.
 //
-// stdout (which carries the token) is never placed in an error or logged.
+// stdout (which carries the credential) is never placed in an error or logged.
+//
+// Run sends no CSR, so an mtls-mode server refuses it with the upgrade message.
+// Use RunCredential to speak to a server of either mode.
 func Run(ctx context.Context, p Params) (sdk.Bundle, error) {
+	p.CSRBase64 = "" // Run is the token-only entry point; RunCredential owns CSRs
+	return run(ctx, p)
+}
+
+// RunCredential is the mode-agnostic bootstrap: it generates a fresh P-256
+// keypair, submits the CSR alongside the request, and returns whichever
+// credential the server issued — a bearer token or a client certificate + the
+// matching private key.
+//
+// The CSR is sent UNCONDITIONALLY, to every server, because the client cannot
+// know the server's mode in advance and the mode can change under it. That is
+// safe in all three directions:
+//
+//   - a pre-mtls server only ever read request position 1, so the extra
+//     argument is ignored and a token comes back;
+//   - a token-mode server accepts and then deliberately ignores csr= for exactly
+//     that legacy parity, so a token comes back;
+//   - an mtls-mode server signs it.
+//
+// Always sending it is therefore what makes a mode flip a non-event for the
+// caller: whichever mode the server is in today, one exchange returns the
+// credential that mode issues.
+func RunCredential(ctx context.Context, p Params) (sdk.Credential, error) {
+	kp, err := newClientKeyPair()
+	if err != nil {
+		return sdk.Credential{}, err
+	}
+	p.CSRBase64 = kp.csrB64
+
+	bundle, err := run(ctx, p)
+	if err != nil {
+		return sdk.Credential{}, err
+	}
+	if bundle.Mode() != sdk.AuthModeMTLS {
+		// Token mode: the generated key is simply discarded. Generating it
+		// unconditionally costs a P-256 keygen (microseconds) and buys a single
+		// code path that does not have to predict the server's mode.
+		return sdk.Credential{Bundle: bundle}, nil
+	}
+	if err := kp.matchesIssuedCert([]byte(bundle.ClientCert)); err != nil {
+		return sdk.Credential{}, err
+	}
+	return sdk.Credential{Bundle: bundle, KeyPEM: kp.keyPEM}, nil
+}
+
+// RunWithCSR submits a CSR the CALLER generated and returns the raw bundle.
+//
+// It is the relay shape, and it exists for exactly one reason: the desktop app
+// holds a credential whose private key must never leave the app process, while
+// the SSH channel that can get that key certified belongs to the host-agent.
+// The app generates the keypair, sends only the CSR across the local socket,
+// and the host-agent runs this — passing the CSR through untouched and handing
+// back the certificate the server issued. No private key exists on the
+// host-agent side of that exchange, which is why RunCredential (which generates
+// its own keypair and would return a certificate the app cannot use) is the
+// wrong entry point for it.
+//
+// An empty p.CSRBase64 makes this identical to Run, and against an mtls server
+// the result is the server's own explicit upgrade error — the honest answer for
+// a caller that had no CSR to relay.
+//
+// The returned Bundle is validated for shape (an mtls bundle must carry a
+// certificate, a token bundle a token) but NOT against a private key: this side
+// does not have one. Verifying that the certificate matches the key is the
+// caller's job, at the end of the relay, where the key is.
+func RunWithCSR(ctx context.Context, p Params) (sdk.Bundle, error) {
+	return run(ctx, p)
+}
+
+// run is the shared body of Run, RunCredential and RunWithCSR.
+func run(ctx context.Context, p Params) (sdk.Bundle, error) {
 	if err := validate(p); err != nil {
 		return sdk.Bundle{}, err
 	}
@@ -247,8 +376,13 @@ func classify(runErr error, exit int, hostKeyChanged bool, stderrText string) er
 }
 
 // decodeBundle validates ssh stdout: a single JSON object, no trailing garbage,
-// a non-empty token, and (when the server echoes one) a matching scope. The raw
-// stdout is NEVER included in an error — it carries the token.
+// the credential its declared mode requires, and (when the server echoes one) a
+// matching scope. The raw stdout is NEVER included in an error — it carries the
+// credential.
+//
+// Mode dispatch is the one subtle part. A bundle with NO auth_mode key is a
+// pre-mtls server's token bundle and must validate exactly as it always did —
+// see sdk.Bundle.Mode, which owns that rule.
 func decodeBundle(out []byte, wantScope string) (sdk.Bundle, error) {
 	dec := json.NewDecoder(bytes.NewReader(out))
 	var b sdk.Bundle
@@ -261,24 +395,61 @@ func decodeBundle(out []byte, wantScope string) (sdk.Bundle, error) {
 	if _, err := dec.Token(); err != io.EOF {
 		return sdk.Bundle{}, errors.New("sdk/bootstrap: unexpected trailing data after bootstrap bundle")
 	}
-	if strings.TrimSpace(b.Token) == "" {
-		return sdk.Bundle{}, errors.New("sdk/bootstrap: bootstrap returned an empty token")
-	}
-	// The bundle must carry a reachable API endpoint — the caller builds the base
-	// URL from the dialed host plus HTTPSPort (preferred) or HTTPPort. A token with
-	// neither is unusable, so reject it here rather than failing opaquely later.
-	if b.HTTPSPort == 0 && b.HTTPPort == 0 {
-		return sdk.Bundle{}, errors.New("sdk/bootstrap: bootstrap bundle has no usable API port")
-	}
-	// HTTPS is pinned via the TLS fingerprint (see Bundle); an HTTPS port without
-	// one can't be verified, so reject it rather than risk an unpinned downgrade.
-	if b.HTTPSPort != 0 && strings.TrimSpace(b.TLSCertFingerprint) == "" {
-		return sdk.Bundle{}, errors.New("sdk/bootstrap: bootstrap bundle advertises HTTPS without a TLS fingerprint to pin")
+	if b.Mode() == sdk.AuthModeMTLS {
+		if err := validateMTLSBundle(b); err != nil {
+			return sdk.Bundle{}, err
+		}
+	} else if err := validateTokenBundle(b); err != nil {
+		return sdk.Bundle{}, err
 	}
 	if b.Scope != "" && b.Scope != wantScope {
 		return sdk.Bundle{}, fmt.Errorf("sdk/bootstrap: scope mismatch: requested %q, got %q", wantScope, b.Scope)
 	}
 	return b, nil
+}
+
+// validateTokenBundle is the pre-mtls validation ladder, unchanged: it is what
+// a legacy bundle (no auth_mode) and an explicit token bundle both go through.
+func validateTokenBundle(b sdk.Bundle) error {
+	if strings.TrimSpace(b.Token) == "" {
+		return errors.New("sdk/bootstrap: bootstrap returned an empty token")
+	}
+	// The bundle must carry a reachable API endpoint — the caller builds the base
+	// URL from the dialed host plus HTTPSPort (preferred) or HTTPPort. A token with
+	// neither is unusable, so reject it here rather than failing opaquely later.
+	if b.HTTPSPort == 0 && b.HTTPPort == 0 {
+		return errors.New("sdk/bootstrap: bootstrap bundle has no usable API port")
+	}
+	// HTTPS is pinned via the TLS fingerprint (see Bundle); an HTTPS port without
+	// one can't be verified, so reject it rather than risk an unpinned downgrade.
+	if b.HTTPSPort != 0 && strings.TrimSpace(b.TLSCertFingerprint) == "" {
+		return errors.New("sdk/bootstrap: bootstrap bundle advertises HTTPS without a TLS fingerprint to pin")
+	}
+	return nil
+}
+
+// validateMTLSBundle checks what an mtls bundle must carry. The requirements
+// are strictly tighter than the token shape's: the certificate is the entire
+// credential, and mtls exists only on the TLS listener, so an https port and a
+// pin are not optional the way they are for a token (which a legacy server may
+// still serve over plain HTTP).
+func validateMTLSBundle(b sdk.Bundle) error {
+	if strings.TrimSpace(b.ClientCert) == "" {
+		return errors.New("sdk/bootstrap: mtls bundle carries no client certificate")
+	}
+	if b.HTTPSPort == 0 {
+		return errors.New("sdk/bootstrap: mtls bundle has no HTTPS port (mtls is only served over TLS)")
+	}
+	if strings.TrimSpace(b.TLSCertFingerprint) == "" {
+		return errors.New("sdk/bootstrap: mtls bundle advertises HTTPS without a TLS fingerprint to pin")
+	}
+	// A bearer token alongside a certificate would be a server that does not
+	// know its own mode; the mtls middleware never reads the Authorization
+	// header, so carrying one could only mislead.
+	if strings.TrimSpace(b.Token) != "" {
+		return errors.New("sdk/bootstrap: mtls bundle unexpectedly carries a bearer token")
+	}
+	return nil
 }
 
 // lookSSH resolves the ssh binary, falling back to the standard macOS path so a

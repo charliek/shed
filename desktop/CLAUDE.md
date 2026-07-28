@@ -140,6 +140,38 @@ Test pointers:
   embedded path, only that the standalone daemon built from the same lib is
   wire-identical.
 
+## mTLS credentials
+
+Both UIs can drive a `shed-server` running `auth.mode: mtls` (client
+certificates instead of bearer tokens — see the root `docs/reference/
+security.md#mtls-mode`), but **only through the Rust-core path**. The
+legacy Swift `URLSession` transport (`SHED_DESKTOP_RUST_CORE=0`) has no
+certificate machinery at all and fails fast with an explicit error the
+moment it's asked to talk to an mtls server, rather than attempting a
+handshake it can't complete — see `ShedServerClient.swift`'s zero-network
+guard. There is no equivalent escape hatch on Tauri; it's Rust-core-only by
+construction.
+
+The private key is generated inside the Rust core's credential provider and
+**never crosses the FFI/UDS boundary** — only the CSR goes out (to the
+host-agent, over the UDS `credential.get` message) and the signed public
+certificate comes back. Swift/Tauri code never holds, sees, or serializes
+key material. The app process itself **persists no credential**: the
+control-scope certificate lives in memory only, and a cold launch re-mints
+it from scratch over SSH via the host-agent relay (matches the existing
+no-persistence posture of the Rust core's control-scope token, just extended
+to certificates). The embedded broker (Tauri) and the standalone
+`shed-host-agent` both persist their own credentials-scope certificate in
+their state dir, same as they do for tokens — that's a different scope/
+process and a different tradeoff (see the credential-ownership table in
+`~/.claude/plans/shed/001-mtls-mode.md` §3 D6 if working in this area).
+
+A desktop app newer than its `shed-host-agent` install can't use mTLS at all
+until the agent is upgraded — see the [Upgrading to
+mTLS](../docs/upgrades/token-to-mtls.md) guide's "desktop users" section for
+the exact failure mode and the required upgrade order (agent before/with the
+app; they're separate release selectors).
+
 ## Socket paths
 
 - **mac IPC:** `~/Library/Caches/ShedDesktop/shed-desktop.sock` (override `SHED_DESKTOP_SOCKET`).

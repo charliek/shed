@@ -2,8 +2,9 @@
 //! `HostAgentProtocol.swift`. Newline-delimited JSON, one typed envelope per
 //! line. Mirrors the mini-RFC in shed-extensions.
 //!
-//!   app -> agent:  hello, approval_response, pong, token.get
-//!   agent -> app:  hello_ack, approval_request, event, ping, token.response
+//!   app -> agent:  hello, approval_response, pong, token.get, credential.get
+//!   agent -> app:  hello_ack, approval_request, event, ping, token.response,
+//!                  credential.response
 //!
 //! Pure: `id`/`ts` are caller-supplied (the stateful client owns UUID + clock),
 //! so this crate never touches time or randomness.
@@ -15,6 +16,18 @@ use super::models::{ApprovalDecision, ApprovalRequest, AuditEntry, AuditSource, 
 
 pub const HOST_AGENT_PROTOCOL_VERSION: u32 = 2;
 
+/// The `credential.get` capability, as advertised by the agent in its
+/// `hello_ack` and checked by the app before it sends one.
+///
+/// shed-desktop and shed-host-agent are SEPARATELY RELEASED, so every
+/// combination of versions runs in the field. The `v` counter cannot express
+/// that — it is stamped on every frame and never checked on receive, and
+/// bumping it would break exactly the old pairing it is meant to describe. A
+/// named capability can: an app that needs certificates and does not find this
+/// string in the ack reports "upgrade shed-host-agent" instead of sending a
+/// message the agent will silently drop and then waiting out the timeout.
+pub const CAP_CREDENTIAL_GET: &str = "credential.get";
+
 /// A frame from the host agent (or the fake), decoded by `type`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HostAgentInbound {
@@ -23,6 +36,7 @@ pub enum HostAgentInbound {
     Event(AuditEventFrame),
     Ping { id: String },
     TokenResponse(TokenResponse),
+    CredentialResponse(CredentialResponse),
     Unknown { r#type: String },
 }
 
@@ -32,10 +46,24 @@ pub struct HelloAck {
     pub namespaces: Vec<String>,
     #[serde(default)]
     pub gate_namespaces: Vec<String>,
+    /// Optional messages this agent answers. An agent that predates capability
+    /// advertisement omits the key entirely, which decodes to an empty vec —
+    /// and "empty" is the honest reading of "an agent that told us nothing",
+    /// because the only capability that has ever existed is one such an agent
+    /// does not have.
+    #[serde(default)]
+    pub agent_capabilities: Vec<String>,
     #[serde(default)]
     pub request_timeout_ms: i64,
     #[serde(default)]
     pub accepted: bool,
+}
+
+impl HelloAck {
+    /// Whether the connected agent advertises `capability`.
+    pub fn supports(&self, capability: &str) -> bool {
+        self.agent_capabilities.iter().any(|c| c == capability)
+    }
 }
 
 /// The `event` frame — a superset of the host agent's audit row, covering all
@@ -69,6 +97,29 @@ pub struct TokenResponse {
     #[serde(default)]
     pub server: String,
     pub token: Option<String>,
+    pub expires_at: Option<String>,
+    pub error: Option<String>,
+}
+
+/// The `credential.response` frame — the agent's reply to a `credential.get`.
+///
+/// `auth_mode` names which of `token` / `client_cert` is populated, so the app
+/// never has to infer the server's mode from which field happens to be
+/// non-empty. On failure `error` is set and every credential field is `None`
+/// (fail closed).
+///
+/// There is no private key here and there never will be: the app generated the
+/// keypair, sent only its CSR, and keeps the key. The certificate coming back
+/// is public material.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct CredentialResponse {
+    pub in_reply_to: String,
+    #[serde(default)]
+    pub server: String,
+    pub auth_mode: Option<String>,
+    pub token: Option<String>,
+    pub client_cert: Option<String>,
+    pub cert_serial: Option<String>,
     pub expires_at: Option<String>,
     pub error: Option<String>,
 }
@@ -128,6 +179,9 @@ pub fn decode(line: &[u8]) -> Result<HostAgentInbound, serde_json::Error> {
             HostAgentInbound::Ping { id: p.id }
         }
         "token.response" => HostAgentInbound::TokenResponse(serde_json::from_slice(line)?),
+        "credential.response" => {
+            HostAgentInbound::CredentialResponse(serde_json::from_slice(line)?)
+        }
         other => HostAgentInbound::Unknown {
             r#type: other.to_string(),
         },
@@ -184,9 +238,41 @@ pub fn pong(id: &str, ts: &str) -> String {
 
 /// Request a CONTROL token for `server` from the host agent. The reply is a
 /// `token.response` whose `in_reply_to` echoes `id` for correlation.
+///
+/// Frozen: this is the message every shipped app knows, and it can only ever
+/// carry a bearer token. Against an mtls-mode server a new agent answers it
+/// with an explicit upgrade error rather than a token that cannot exist. New
+/// clients should send `credential_get` instead.
 pub fn token_get(id: &str, server: &str) -> String {
     json!({ "v": HOST_AGENT_PROTOCOL_VERSION, "type": "token.get", "id": id, "server": server })
         .to_string()
+}
+
+/// Request a CONTROL credential for `server` in whichever shape that server
+/// issues. The reply is a `credential.response` whose `in_reply_to` echoes `id`.
+///
+/// `csr_base64` is a standard-base64 PKCS#10 CertificationRequest DER generated
+/// BY THIS PROCESS. Only the request crosses the socket; the private key that
+/// will match the issued certificate never leaves here, which is the whole
+/// reason this is a relay rather than the agent minting on the app's behalf.
+/// `None` omits the field — an app with no use for certificates may ask without
+/// one, and an mtls server then answers with its own explicit upgrade error.
+///
+/// Send it only when the agent advertised [`CAP_CREDENTIAL_GET`]; an agent that
+/// did not will drop the frame silently.
+pub fn credential_get(id: &str, server: &str, csr_base64: Option<&str>) -> String {
+    let mut obj = json!({
+        "v": HOST_AGENT_PROTOCOL_VERSION, "type": "credential.get", "id": id, "server": server,
+    });
+    // An EMPTY csr is omitted, not sent as `""`: the agents' `omitempty` /
+    // `#[serde(default)]` decode both to "no CSR", so emitting the key would put
+    // a third spelling of the same statement on the wire — and the whole point
+    // of the absent key is that an mtls server's refusal stays legible. Pinned
+    // by the shared `credential_get.json` vectors (plan 002 §7 P9).
+    if let Some(csr) = csr_base64.filter(|c| !c.is_empty()) {
+        obj["csr"] = json!(csr);
+    }
+    obj.to_string()
 }
 
 #[cfg(test)]
@@ -372,5 +458,93 @@ mod tests {
         assert_eq!(e2.id, "fallback-id");
         assert_eq!(e2.ts, "fallback-ts");
         assert_eq!(e2.code.as_deref(), Some("X"));
+    }
+
+    #[test]
+    fn hello_ack_capabilities_default_to_absent_for_an_old_agent() {
+        // A NEW agent advertises what it answers.
+        let line =
+            br#"{"type":"hello_ack","agent_capabilities":["credential.get"],"accepted":true}"#;
+        match decode(line).unwrap() {
+            HostAgentInbound::HelloAck(a) => {
+                assert!(a.supports(CAP_CREDENTIAL_GET));
+                assert!(!a.supports("something.else"));
+            }
+            other => panic!("expected hello_ack, got {other:?}"),
+        }
+        // An OLD agent omits the key entirely. That must decode cleanly to "no
+        // capabilities" — it is the exact condition the app turns into
+        // "upgrade shed-host-agent", so a decode error here would replace a
+        // legible message with a dropped connection.
+        let old = br#"{"type":"hello_ack","namespaces":["ssh-agent"],"accepted":true}"#;
+        match decode(old).unwrap() {
+            HostAgentInbound::HelloAck(a) => {
+                assert!(a.agent_capabilities.is_empty());
+                assert!(!a.supports(CAP_CREDENTIAL_GET));
+            }
+            other => panic!("expected hello_ack, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn credential_get_carries_the_csr_and_omits_it_when_absent() {
+        let with = credential_get("q1", "mini2", Some("QUJD"));
+        let v: Value = serde_json::from_str(&with).unwrap();
+        assert_eq!(v["type"], "credential.get");
+        assert_eq!(v["v"], HOST_AGENT_PROTOCOL_VERSION);
+        assert_eq!(v["id"], "q1");
+        assert_eq!(v["server"], "mini2");
+        assert_eq!(v["csr"], "QUJD");
+
+        let without = credential_get("q2", "mini2", None);
+        let v: Value = serde_json::from_str(&without).unwrap();
+        assert!(
+            v.get("csr").is_none(),
+            "an absent CSR must omit the key: {without}"
+        );
+
+        // token.get is FROZEN: adding credential.get must not have widened it.
+        let tok: Value = serde_json::from_str(&token_get("q3", "mini2")).unwrap();
+        assert_eq!(
+            tok,
+            serde_json::json!({"v": HOST_AGENT_PROTOCOL_VERSION, "type": "token.get", "id": "q3", "server": "mini2"})
+        );
+    }
+
+    #[test]
+    fn decodes_credential_response_in_both_modes_and_on_failure() {
+        let token = br#"{"type":"credential.response","in_reply_to":"q1","server":"mini2","auth_mode":"token","token":"tok","expires_at":"2030-01-01T00:00:00Z"}"#;
+        match decode(token).unwrap() {
+            HostAgentInbound::CredentialResponse(r) => {
+                assert_eq!(r.in_reply_to, "q1");
+                assert_eq!(r.auth_mode.as_deref(), Some("token"));
+                assert_eq!(r.token.as_deref(), Some("tok"));
+                assert!(r.client_cert.is_none());
+                assert!(r.error.is_none());
+            }
+            other => panic!("expected credential.response, got {other:?}"),
+        }
+        let mtls = br#"{"type":"credential.response","in_reply_to":"q2","server":"mini2","auth_mode":"mtls","client_cert":"-----BEGIN CERTIFICATE-----\n","cert_serial":"0a0b"}"#;
+        match decode(mtls).unwrap() {
+            HostAgentInbound::CredentialResponse(r) => {
+                assert_eq!(r.auth_mode.as_deref(), Some("mtls"));
+                assert!(r.client_cert.is_some());
+                assert_eq!(r.cert_serial.as_deref(), Some("0a0b"));
+                assert!(
+                    r.token.is_none(),
+                    "an mtls answer must carry no bearer token"
+                );
+            }
+            other => panic!("expected credential.response, got {other:?}"),
+        }
+        // Fail closed: an errored reply carries no credential fields at all.
+        let failed = br#"{"type":"credential.response","in_reply_to":"q3","server":"mini2","error":"unknown server"}"#;
+        match decode(failed).unwrap() {
+            HostAgentInbound::CredentialResponse(r) => {
+                assert_eq!(r.error.as_deref(), Some("unknown server"));
+                assert!(r.auth_mode.is_none() && r.token.is_none() && r.client_cert.is_none());
+            }
+            other => panic!("expected credential.response, got {other:?}"),
+        }
     }
 }

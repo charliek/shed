@@ -23,6 +23,15 @@ final class AppModel: NSObject, UiBridge {
     let state = AppState()
 
     private var clients: [String: ShedServerClient] = [:]
+    /// The credential shape each server issues, learned this session and held
+    /// for the app's LIFETIME — deliberately not inside a client (plan 002 §7
+    /// P1). `reconnect()` rebuilds every client from config, and config is the
+    /// CLI's cache: it still says `token` after a server flips to certificates.
+    /// A store that died with the clients would let a config-watcher rebuild
+    /// throw away what the session had already proved, and the next mint would
+    /// send a `token.get` to an mtls-only server. In memory only — nothing is
+    /// ever written back to `~/.shed/config.yaml`.
+    private let authModes = AuthModeRegistry()
     private var defaultServerName: String?
     private var creates: [String: CreateProgress] = [:]
     // The task driving each in-flight create's SSE stream, retained so
@@ -412,19 +421,40 @@ final class AppModel: NSObject, UiBridge {
             let provider: ControlTokenProvider? = mockBase == nil
                 ? hostAgent.map { ControlTokenProvider.hostAgent($0, server: entry.name) }
                 : nil
+            // The hermetic mock is an open plain-http server; forcing .token
+            // keeps a test config carrying auth_mode from tripping the legacy
+            // path's mtls refusal (§7 P6) against a server that wants nothing.
+            let authMode: ShedAuthMode = mockBase == nil ? entry.authMode : .token
+            // Learned-mode sink: in-memory only (§7 P1). The diagnostic log is
+            // the surface — it's where "why is this host unreachable?" is
+            // answered, and a silent token→mtls flip belongs in that trail. The
+            // sink runs on the Rust dispatcher thread and must return promptly;
+            // DiagnosticLog hands off to its own queue.
+            let diag = self.diag
+            let serverName = entry.name
             clients[entry.name] = ShedServerClient(
                 baseURL: baseURL, serverName: entry.name,
                 token: entry.controlToken, tlsCertFingerprint: pin,
                 tokenProvider: provider, useRustCore: ShedBackend.shared.rustCore,
-                // The Rust path's control-token minter uses the same host agent as
-                // the Swift provider — dropped in test mode (mock is tokenless), so
-                // e2e stays hermetic.
-                hostAgent: mockBase == nil ? hostAgent : nil)
+                // The Rust path's control-credential minter uses the same host
+                // agent as the Swift provider — dropped in test mode (mock is
+                // tokenless), so e2e stays hermetic.
+                hostAgent: mockBase == nil ? hostAgent : nil,
+                authMode: authMode,
+                // The app-lifetime learned-mode store, handed to every rebuild:
+                // the client is reconstructed, what the session proved is not.
+                authModes: authModes,
+                onCredentialModeChanged: { _, mode in
+                    diag?.log(.info, "auth", "credential mode changed", [
+                        ("server", serverName), ("mode", mode.rawValue),
+                    ])
+                })
             diag?.log(.info, "config", "resolved server", [
                 ("server", entry.name),
                 ("endpoint", baseURL.absoluteString),
                 ("pinned", String(!pin.isEmpty)),
                 ("tokenProvider", String(provider != nil)),
+                ("authMode", authMode.rawValue),
             ])
         }
         self.clients = clients

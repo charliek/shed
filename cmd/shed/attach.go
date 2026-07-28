@@ -146,7 +146,7 @@ func runAttach(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
-	client := NewAPIClientFromEntry(entry, clientConfig.GetCreateTimeout())
+	client := NewAPIClientFromNamedEntry(serverName, entry, clientConfig.GetCreateTimeout())
 	shed, err := ensureRunningShed(client, name)
 	if err != nil {
 		return err
@@ -166,7 +166,7 @@ func runAttach(cmd *cobra.Command, args []string) error {
 // (The session name was validated in validateAttachFlags.)
 func attachPlain(name, serverName string, entry *config.ServerEntry, shed *config.Shed) error {
 	if attachNewFlag {
-		sessions, err := listShedSessions(entry, name)
+		sessions, err := listShedSessions(serverName, entry, name)
 		if err != nil {
 			return fmt.Errorf("failed to check existing sessions: %w", err)
 		}
@@ -369,8 +369,8 @@ func printRCFollowups(shedName string, dto rc.Session) {
 // listShedSessions is a thin wrapper so attachPlain can list sessions for the
 // --new guard without reaching for a package-level client. Only the session rows
 // are needed here (a name-existence check); warnings are for `shed sessions`.
-func listShedSessions(entry *config.ServerEntry, name string) ([]config.Session, error) {
-	resp, err := NewAPIClientFromEntry(entry, DefaultTimeout).ListSessions(name)
+func listShedSessions(serverName string, entry *config.ServerEntry, name string) ([]config.Session, error) {
+	resp, err := NewAPIClientFromNamedEntry(serverName, entry, DefaultTimeout).ListSessions(name)
 	if err != nil {
 		return nil, err
 	}

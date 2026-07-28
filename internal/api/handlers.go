@@ -22,20 +22,29 @@ import (
 // handleGetInfo returns server information.
 // GET /api/info
 func (s *Server) handleGetInfo(w http.ResponseWriter, r *http.Request) {
-	authMode := config.AuthModeOpen
-	if s.cfg.Secure() {
-		authMode = config.AuthModeSecure
-	}
 	info := config.ServerInfo{
-		Name:         s.cfg.Name,
-		Version:      version.Info(),
-		SSHPort:      s.cfg.SSHPort,
-		HTTPPort:     s.cfg.HTTPPort,
-		Backend:      s.cfg.DefaultBackend,
-		AuthMode:     authMode,
+		Name:     s.cfg.Name,
+		Version:  version.Info(),
+		SSHPort:  s.cfg.SSHPort,
+		HTTPPort: s.cfg.HTTPPort,
+		Backend:  s.cfg.DefaultBackend,
+		// Token mode reports the legacy "secure" spelling: released clients
+		// gate their credential bootstrap on that exact string, and reporting
+		// "token" would make them save an entry with no credential (see
+		// config.LegacyWireAuthMode). Current clients normalize on decode.
+		AuthMode:     config.LegacyWireAuthMode(s.cfg.AuthModeValue()),
 		DefaultImage: s.cfg.ActiveDefaultImage(),
 		HTTPSPort:    s.cfg.HTTPSPort,
 		Features:     serverFeatures(),
+	}
+	// Client-CA visibility, mtls only. Reaching /api/info in mtls mode already
+	// required a valid client certificate (that mode has no bootstrap
+	// exemptions), so this is reported to authenticated callers only.
+	if s.cfg.MTLSMode() {
+		info.CAFingerprint = s.caFingerprint
+		if !s.caNotAfter.IsZero() {
+			info.CANotAfter = s.caNotAfter.UTC().Format(time.RFC3339)
+		}
 	}
 
 	writeJSON(w, http.StatusOK, info)

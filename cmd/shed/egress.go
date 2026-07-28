@@ -64,11 +64,11 @@ func init() {
 
 func runEgressSet(cmd *cobra.Command, args []string) error {
 	name := args[0]
-	entry, _, err := getServerEntry()
+	entry, serverName, err := getServerEntry()
 	if err != nil {
 		return err
 	}
-	client := NewAPIClientFromEntry(entry, DefaultTimeout)
+	client := NewAPIClientFromNamedEntry(serverName, entry, DefaultTimeout)
 	shed, err := client.EgressSet(name, egressSetProfiles)
 	if err != nil {
 		return fmt.Errorf("failed to set egress for %s: %w", name, err)
@@ -86,11 +86,11 @@ func runEgressSet(cmd *cobra.Command, args []string) error {
 
 func runEgressOff(cmd *cobra.Command, args []string) error {
 	name := args[0]
-	entry, _, err := getServerEntry()
+	entry, serverName, err := getServerEntry()
 	if err != nil {
 		return err
 	}
-	client := NewAPIClientFromEntry(entry, DefaultTimeout)
+	client := NewAPIClientFromNamedEntry(serverName, entry, DefaultTimeout)
 	if _, err := client.EgressOff(name); err != nil {
 		return fmt.Errorf("failed to turn egress off for %s: %w", name, err)
 	}
@@ -103,11 +103,11 @@ func runEgressOff(cmd *cobra.Command, args []string) error {
 
 func runEgressShow(cmd *cobra.Command, args []string) error {
 	name := args[0]
-	entry, _, err := getServerEntry()
+	entry, serverName, err := getServerEntry()
 	if err != nil {
 		return err
 	}
-	client := NewAPIClientFromEntry(entry, DefaultTimeout)
+	client := NewAPIClientFromNamedEntry(serverName, entry, DefaultTimeout)
 	status, err := client.EgressShow(name)
 	if err != nil {
 		return fmt.Errorf("failed to get egress status for %s: %w", name, err)

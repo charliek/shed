@@ -43,9 +43,12 @@ sheds:
 | `servers.<name>.http_port` | int | HTTP API port |
 | `servers.<name>.ssh_port` | int | SSH server port |
 | `servers.<name>.api_url` | string | HTTPS control-plane URL (e.g. `https://host:8443`); overrides scheme+host+port. Set by `shed server add --https-port`. |
-| `servers.<name>.tls_cert_fingerprint` | string | Pinned TLS cert fingerprint (`sha256:...`). |
-| `servers.<name>.control_token` | string | Control-scoped bearer token for the CLI/desktop. Auto-written and refreshed by `shed server add` in secure mode. |
+| `servers.<name>.tls_cert_fingerprint` | string | Pinned TLS cert fingerprint (`sha256:...`) — the server's own leaf, pinned in every enforced mode. |
+| `servers.<name>.control_token` | string | Control-scoped bearer token for the CLI/desktop. Auto-written and refreshed by `shed server add` in token mode. Absent in mtls mode. |
 | `servers.<name>.control_token_expires_at` | timestamp | Expiry of `control_token`; the CLI refreshes near this and on a 401. Auto-managed. |
+| `servers.<name>.auth_mode` | string | The credential shape the server last issued at bootstrap: `token` or `mtls`. **Absent means `token`** (every entry written before certificate support existed predates this field). Not a setting — it's a cache of what the server last said; a bootstrap that comes back in the other mode rewrites it, which is how an operator can flip a server's `auth.mode` without re-adding every client. |
+| `servers.<name>.client_cert_file` / `client_key_file` | string | Paths (under `~/.shed/creds/<server>/`, mode 0700/0600) to this entry's client certificate and private key. Set only in mtls mode. |
+| `servers.<name>.client_cert_expires_at` | timestamp | Expiry of the client certificate; the CLI re-enrolls before a request would race expiry. Set only in mtls mode. |
 | `default_server` | string | Default server for commands |
 | `sheds` | map | Cached shed locations |
 | `create_timeout` | duration | Timeout for create/start operations (default: `10m`) |
@@ -78,10 +81,10 @@ log_level: info
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `name` | string | `shed-server` | Server identifier |
-| `http_port` | int | `8080` | Plain-HTTP API port. **Required in open mode; optional in secure mode** (secure serves no plain HTTP, so it is omitted from `/api/info` and the written client config entry). |
+| `http_port` | int | `8080` | Plain-HTTP API port. **Required in open mode; optional in token/mtls mode** (an enforced mode serves no plain HTTP, so it is omitted from `/api/info` and the written client config entry). |
 | `ssh_port` | int | `2222` | SSH server port |
-| `bind_address` | string | `127.0.0.1` | Interface every listener (HTTP, HTTPS, SSH) binds to. **Defaults to loopback in both modes** — shed is local-first. Set a specific IP (LAN/tailnet), `0.0.0.0` or `*` (all IPv4), or `::` (all interfaces) to face the network. A non-loopback bind in **open** mode also requires `allow_insecure_exposure: true`; secure mode needs no acknowledgment. |
-| `allow_insecure_exposure` | bool | `false` | Acknowledge binding a **non-loopback** `bind_address` in **open** mode (no transport security). Required there, ignored in secure mode and for loopback binds. |
+| `bind_address` | string | `127.0.0.1` | Interface every listener (HTTP, HTTPS, SSH) binds to. **Defaults to loopback in every mode** — shed is local-first. Set a specific IP (LAN/tailnet), `0.0.0.0` or `*` (all IPv4), or `::` (all interfaces) to face the network. A non-loopback bind in **open** mode also requires `allow_insecure_exposure: true`; token/mtls mode needs no acknowledgment. |
+| `allow_insecure_exposure` | bool | `false` | Acknowledge binding a **non-loopback** `bind_address` in **open** mode (no transport security). Required there, ignored in token/mtls mode and for loopback binds. |
 | `trusted_proxy` | bool | `false` | Trust the client-supplied `X-Forwarded-For` header for the request source IP. Only enable behind a reverse proxy that overwrites that header; the default uses the real TCP peer address. |
 | `default_backend` | string | `detect` | Backend to use when none is specified (`detect`, `firecracker`, `vz`). `detect` auto-selects based on platform: `vz` on macOS, `firecracker` on Linux. |
 | `mounts` | map | `{}` | Host directories to mount into sheds (formerly `credentials`) |
@@ -98,27 +101,43 @@ log_level: info
 ### Authentication mode
 
 `auth.mode` is the headline switch. The default `open` posture is unchanged —
-ideal on a tailnet or trusted LAN (plain HTTP, no tokens, no TLS); the SSH
-allowlist (`auth.ssh`) is the one independently-tunable layer there. `secure` is
-the internet-facing posture: it derives the full bundle (SSH enforce + HTTP
-tokens + TLS-only) and refuses to start without an SSH key source. Two invariants
-hold: **tokens ⟺ TLS ⟺ secure** and **https ⟺ secure**. See [Security](security.md)
-and the [Security Configuration guide](../guides/security-configuration.md).
+ideal on a tailnet or trusted LAN (plain HTTP, no credential, no TLS); the SSH
+allowlist (`auth.ssh`) is the one independently-tunable layer there. `token`
+and `mtls` are the internet-facing postures: both derive the same hardened
+bundle (SSH enforce + HTTP credential enforce + TLS-only) and refuse to start
+without an SSH key source; they differ only in the shape of the HTTP
+credential — a bearer token minted over SSH (`token`) versus a client
+certificate, bound to a key that never leaves the client, issued over SSH
+(`mtls`). Two invariants hold for both enforced modes: **credential ⟺ TLS ⟺
+enforced mode** and **https ⟺ enforced mode**. `mtls` is the **recommended
+posture for anything internet-facing**; `token` is retained (not deprecated)
+because `curl`/scripts/CI/third-party callers can't present a client
+certificate. See [Security](security.md) — in particular [mTLS
+mode](security.md#mtls-mode) — and the [Security Configuration
+guide](../guides/security-configuration.md).
+
+| `auth.mode` | HTTP credential | SSH allowlist | Notes |
+|-------------|------------------|----------------|-------|
+| `open` (default) | none | as configured (`auth.ssh.mode: off`/`warn`) | Plain HTTP; `https_port` rejected. |
+| `token` | bearer token, minted over the `_bootstrap` SSH channel | forced `enforce` | TLS-only; `curl`/scripts can present the token directly. `secure` is a permanent deprecated alias, normalized at load with a one-time stderr warning. |
+| `mtls` | client certificate, issued over the `_bootstrap` SSH channel (CSR in, signed cert out); revalidated on every request | forced `enforce` | TLS-only; recommended for internet-facing deployments. Revocation removes the SSH key (coarser than token's per-token revoke). `curl`/scripts cannot authenticate. |
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `auth.mode` | string | `open` | `open` enforces nothing (plain HTTP only); `secure` derives SSH-allowlist enforce + HTTP-token enforce + TLS-only (`https_port` defaults to `8443`; **no plain-HTTP listener is served**), and **fails to start without a key source**. |
-| `auth.token_ttl` | duration | `24h` | Lifetime of a bootstrap-minted HTTP token. Clients refresh transparently near expiry / on a 401. |
+| `auth.mode` | string | `open` | `open` enforces nothing (plain HTTP only); `token`/`mtls` both derive SSH-allowlist enforce + HTTP-credential enforce + TLS-only (`https_port` defaults to `8443`; **no plain-HTTP listener is served**), and **fail to start without a key source**. `secure` is accepted as a deprecated alias for `token`, normalized at load with a one-time stderr warning. |
+| `auth.token_ttl` | duration | `24h` | Lifetime of a bootstrap-minted HTTP token (`token` mode) or issued client certificate (`mtls` mode). Clients refresh/re-enroll transparently near expiry / on an auth failure. |
 
 The pre-v0.7.1 `public_exposure` flag and `auth.http.tokens` list are removed and
-**rejected at startup** — set `auth.mode: secure` and let `shed server add` mint
-tokens over SSH. As of v0.7.2 the whole `auth.http` block is gone (HTTP
-enforcement derives from `auth.mode: secure`), and `https_port` /
-`auth.ssh.mode: enforce` are valid only in secure mode — see
-[Upgrading v0.7.1 → v0.7.2](../upgrades/v0.7.1-to-v0.7.2.md). As of v0.7.4
+**rejected at startup** — set `auth.mode: token` (or `mtls`) and let
+`shed server add` obtain a credential over SSH. As of v0.7.2 the whole
+`auth.http` block is gone (HTTP enforcement derives from `auth.mode`), and
+`https_port` / `auth.ssh.mode: enforce` are valid only in an enforced mode —
+see [Upgrading v0.7.1 → v0.7.2](../upgrades/v0.7.1-to-v0.7.2.md). As of v0.7.4
 `http_bind`/`ssh_bind`/`internal_http_port` are removed in favour of a single
-`bind_address` (loopback by default), and `http_port` is optional in secure mode
-— see [Upgrading v0.7.3 → v0.7.4](../upgrades/v0.7.3-to-v0.7.4.md).
+`bind_address` (loopback by default), and `http_port` is optional in an
+enforced mode — see
+[Upgrading v0.7.3 → v0.7.4](../upgrades/v0.7.3-to-v0.7.4.md). `mtls` mode was
+added afterward — see [Upgrading to mTLS](../upgrades/token-to-mtls.md).
 
 ### SSH authentication
 
@@ -137,27 +156,35 @@ With `mode: enforce`, the server refuses to start if no keys resolve (empty inli
 
 ```yaml
 auth:
-  mode: secure               # open (default) | secure — secure forces ssh enforce
+  mode: token                # open (default) | token | mtls — both enforced modes force ssh enforce
   ssh:
-    github_users: [charliek]  # a key source is required in secure mode
+    github_users: [charliek]  # a key source is required in an enforced mode
 ```
 
 ### TLS and network surface
 
-TLS and network-surface fields. HTTP token enforcement is **not** an independent
-field — it is derived from `auth.mode: secure` (there is no `auth.http` block).
-`secure` turns on TLS for you, and `https_port` is valid only in secure mode. See
+TLS and network-surface fields. HTTP credential enforcement is **not** an
+independent field — it is derived from `auth.mode: token`/`mtls` (there is no
+`auth.http` block). Either enforced mode turns on TLS for you, and
+`https_port` is valid only in an enforced mode. See
 [Security](security.md) and the
 [Security Configuration guide](../guides/security-configuration.md).
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `https_port` | int | `8443` in secure | Serve HTTPS with a self-signed, client-pinned cert, bound to `bind_address`. **Requires `auth.mode: secure`** (rejected in open mode); defaults to `8443` there. In secure mode this is the *only* listener — no plain HTTP is served. |
-| `tls_names` | list | `[]` | Extra hostnames/IPs added as cert SANs. `localhost`, `127.0.0.1`, `::1` are always included. |
+| `https_port` | int | `8443` in an enforced mode | Serve HTTPS with a self-signed, client-pinned cert, bound to `bind_address`. **Requires `auth.mode: token` or `mtls`** (rejected in open mode); defaults to `8443` there. In `token`/`mtls` mode this is the *only* listener — no plain HTTP is served. In `mtls` mode the listener also runs `RequireAndVerifyClientCert` against the internal CA (see [mTLS mode](security.md#mtls-mode)). |
+| `tls_names` | list | `[]` | Extra hostnames/IPs added as cert SANs (on the server's own leaf; unrelated to the mtls client-CA). `localhost`, `127.0.0.1`, `::1` are always included. |
 | `tls_cert_file` / `tls_key_file` | string | next to host key | Override where the TLS cert + key are persisted. |
-| `bind_address` | string | `127.0.0.1` | Interface every listener binds to (loopback by default in both modes). Set a specific IP, `0.0.0.0`/`*` (all IPv4), or `::` (all interfaces) to face the network. A non-loopback bind in **open** mode also requires `allow_insecure_exposure: true`. |
-| `allow_insecure_exposure` | bool | `false` | Acknowledge a non-loopback `bind_address` in **open** mode (no transport security). Ignored in secure mode. |
+| `bind_address` | string | `127.0.0.1` | Interface every listener binds to (loopback by default in every mode). Set a specific IP, `0.0.0.0`/`*` (all IPv4), or `::` (all interfaces) to face the network. A non-loopback bind in **open** mode also requires `allow_insecure_exposure: true`. |
+| `allow_insecure_exposure` | bool | `false` | Acknowledge a non-loopback `bind_address` in **open** mode (no transport security). Ignored in token/mtls mode. |
 | `trusted_proxy` | bool | `false` | Trust `X-Forwarded-For` (only behind a proxy that overwrites it). |
+
+`mtls` mode additionally persists a small internal CA (`ca_cert.pem` /
+`ca_key.pem`, next to the TLS cert/key) the first time the server starts in
+that mode — it signs client certificates only; the server's own leaf above is
+unaffected. There is no separate config field for it: it is generated lazily,
+logged (fingerprint + expiry) at startup, and surfaced on `GET /api/info` as
+`ca_fingerprint` / `ca_not_after` (see [API reference](api.md#get-apiinfo)).
 
 ### Mounts
 

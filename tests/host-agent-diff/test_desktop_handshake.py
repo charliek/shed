@@ -2,7 +2,12 @@
 channel, sends a `hello`, and receives a `hello_ack`. The masked ack is canonical-
 equal across the Go and Rust daemons — same `v`/`type`/namespaces/gate/timeout, with
 only the volatile `id`/`ts`/`agent.version` masked (D3). The 'watch none' launch
-config makes ssh the sole gated namespace (`gate_namespaces:["ssh-agent"]`)."""
+config makes ssh the sole gated namespace (`gate_namespaces:["ssh-agent"]`).
+
+The ack also carries `agent_capabilities` — the list an app checks before sending an
+optional message. It is diffed, not masked: a capability the two impls disagree about
+is precisely the bug the advertisement exists to prevent, since an app would then get
+"upgrade shed-host-agent" from one daemon and a working certificate from the other."""
 
 import pytest
 
@@ -33,6 +38,7 @@ def test_desktop_hello_ack_masked_canonical_equal(daemon, watch_none_config, dif
         "egress",
     ]
     assert ack["gate_namespaces"] == ["ssh-agent"]
+    assert ack["agent_capabilities"] == ["credential.get"]
     assert ack["request_timeout_ms"] == 25000
     # An accepted ack omits `reason` (only the superseded ack sets it).
     assert "reason" not in ack

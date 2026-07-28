@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"io"
@@ -86,15 +87,19 @@ func TestEgressSubscriber_Stream(t *testing.T) {
 	}
 }
 
-// fakeTokenSource is a tokenSource returning a fixed token and counting Invalidate.
+// fakeTokenSource is an egressCredentialSource returning a fixed credential and
+// counting Invalidate. cert is nil in token state (the default) and set in mtls
+// state, exactly as the real source reports its two shapes.
 type fakeTokenSource struct {
 	token       string
+	cert        *tls.Certificate
 	err         error
 	invalidated int
 }
 
-func (f *fakeTokenSource) Token() (string, error) { return f.token, f.err }
-func (f *fakeTokenSource) Invalidate()            { f.invalidated++ }
+func (f *fakeTokenSource) Token() (string, error)              { return f.token, f.err }
+func (f *fakeTokenSource) ClientCertificate() *tls.Certificate { return f.cert }
+func (f *fakeTokenSource) Invalidate()                         { f.invalidated++ }
 
 func TestEgressSubscriber_SendsControlToken(t *testing.T) {
 	var gotAuth string
@@ -146,7 +151,7 @@ func TestEgressSubscriber_DisabledReturnsUnavailable(t *testing.T) {
 }
 
 func TestEgressHTTPClient_PinOnPlainURLFailsClosed(t *testing.T) {
-	c := egressHTTPClient("http://localhost:8080", "sha256:deadbeef")
+	c := egressHTTPClient("http://localhost:8080", "sha256:deadbeef", nil)
 	req, _ := http.NewRequest(http.MethodGet, "http://localhost:8080/api/egress/stream", nil)
 	if _, err := c.Transport.RoundTrip(req); err == nil {
 		t.Error("expected fail-closed error when a TLS pin is set on a non-https URL")

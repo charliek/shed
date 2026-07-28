@@ -64,7 +64,7 @@ The default config at `/etc/shed/server.yaml` binds **loopback only**
 reachable only on the box itself. Since you reach this host from a workstation,
 edit the config so it faces the network.
 
-**Recommended — secure mode** (pinned TLS + minted bearer tokens + an SSH key
+**Recommended — token mode** (pinned TLS + minted bearer tokens + an SSH key
 allowlist; the preferred posture for anything networked):
 
 ```yaml
@@ -75,11 +75,11 @@ ssh_port: 2222
 default_backend: firecracker
 
 auth:
-  mode: secure                   # forces SSH enforce + HTTP tokens + TLS-only
+  mode: token                    # forces SSH enforce + HTTP tokens + TLS-only
   ssh:
     github_users: [your-github-username]   # only these keys may SSH in (and mint tokens)
 bind_address: 0.0.0.0            # face the network (or a specific tailnet/LAN IP)
-# https_port defaults to 8443; http_port is optional in secure mode.
+# https_port defaults to 8443; http_port is optional in token mode.
 
 firecracker:
   pull_policy: missing
@@ -112,7 +112,7 @@ for the Firecracker-specific fields (bridge name/CIDR, vsock, resource defaults)
 ```bash
 sudo systemctl start shed-server
 systemctl status shed-server                  # should be active (running)
-# secure mode (TLS-only) — check over HTTPS on the box:
+# token mode (TLS-only) — check over HTTPS on the box:
 curl -sk https://localhost:8443/api/info      # name, version, backend: firecracker
 # open mode instead? use: curl -s http://localhost:8080/api/info
 ```
@@ -122,8 +122,8 @@ The first `shed create` pulls the matching `shed-fc-full` image automatically
 
 ## 5. Connect from your workstation
 
-From the Mac/Linux box that has the `shed` CLI (over Tailscale/LAN). For a secure
-server, `shed server add --https-port` pins the TLS cert + SSH host key and mints
+From the Mac/Linux box that has the `shed` CLI (over Tailscale/LAN). For a
+token-mode server, `shed server add --https-port` pins the TLS cert + SSH host key and mints
 your token over SSH (your key must be in the `github_users` allowlist):
 
 ```bash

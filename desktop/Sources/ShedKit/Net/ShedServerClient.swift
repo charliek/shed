@@ -18,6 +18,9 @@ public enum ShedClientError: Error, CustomStringConvertible {
     case transport(String)
     case decode(String)
     case create(String)
+    /// The configured auth mode cannot be served by this client's network path
+    /// (plan 002 §7 P6: an mtls server under `SHED_DESKTOP_RUST_CORE=0`).
+    case unsupportedAuthMode(String)
 
     public var description: String {
         switch self {
@@ -25,6 +28,7 @@ public enum ShedClientError: Error, CustomStringConvertible {
         case .transport(let m): return "transport error: \(m)"
         case .decode(let m): return "decode error: \(m)"
         case .create(let m): return "create failed: \(m)"
+        case .unsupportedAuthMode(let m): return m
         }
     }
 }
@@ -48,7 +52,11 @@ public struct ShedServerClient: Sendable {
     // the token/pin paths stay Swift until M3/M4.
     private let rustAdapter: RustShedCoreAdapter?
 
-    public init(baseURL: URL, serverName: String, token: String = "", tlsCertFingerprint: String = "", tokenProvider: ControlTokenProvider? = nil, session: URLSession? = nil, useRustCore: Bool = false, hostAgent: HostAgentClient? = nil) {
+    /// `authModes` is the app-lifetime learned-mode store (§7 P1). Pass the
+    /// SAME instance on every rebuild — that is what keeps a mode this session
+    /// proved from being discarded when the config watcher rebuilds clients.
+    /// Omitted → this client gets a private store (its previous behavior).
+    public init(baseURL: URL, serverName: String, token: String = "", tlsCertFingerprint: String = "", tokenProvider: ControlTokenProvider? = nil, session: URLSession? = nil, useRustCore: Bool = false, hostAgent: HostAgentClient? = nil, authMode: ShedAuthMode = .token, authModes: AuthModeRegistry? = nil, onCredentialModeChanged: CredentialModeObserver.Sink? = nil) {
         self.baseURL = baseURL
         self.serverName = serverName
         self.token = token
@@ -89,16 +97,40 @@ public struct ShedServerClient: Sendable {
                 adapter = try RustShedCoreAdapter(
                     baseURL: baseURL.absoluteString, serverName: serverName,
                     token: token, pin: tlsCertFingerprint.isEmpty ? nil : tlsCertFingerprint,
-                    hostAgent: hostAgent)
+                    hostAgent: hostAgent, authMode: authMode, authModes: authModes,
+                    onModeChanged: onCredentialModeChanged)
             } catch {
                 configError = .transport(
                     "Rust shed-core adapter failed to construct for host \(serverName): \(error); "
                     + "refusing to silently fall back to Swift (set SHED_DESKTOP_RUST_CORE=0 to force it)")
             }
         }
+        if !useRustCore, authMode == .mtls {
+            // Plan 002 §7 P6, the zero-network guarantee: only the Rust core can
+            // present a client certificate. On the legacy URLSession path an
+            // mtls server can never be authenticated, so refuse HERE — before
+            // any URLRequest exists, on every path including the streaming
+            // create — rather than emit unauthenticatable traffic that dies in a
+            // TLS handshake and reads like a network fault. (An entry whose
+            // server has flipped but whose config still says token is NOT
+            // covered: it fails with the raw TLS error, documented in §7 P6; the
+            // Rust-core default path self-heals.)
+            //
+            // This OVERWRITES a pin/plain-http diagnosis on purpose: both are
+            // terminal, but only one of them names the actual fix. Fixing the
+            // pin would leave the user exactly as unable to connect.
+            configError = .unsupportedAuthMode(
+                "\(serverName) requires mtls; the legacy network path cannot authenticate — "
+                    + "unset SHED_DESKTOP_RUST_CORE")
+        }
         self.configError = configError
         self.rustAdapter = adapter
     }
+
+    /// The credential shape the Rust core has adopted for this server this
+    /// session (nil before the first mint, or on the legacy path). In-memory
+    /// only — the desktop never writes it back to config.yaml (§7 P1).
+    public var learnedAuthMode: ShedAuthMode? { rustAdapter?.learnedAuthMode }
 
     /// The bearer token to send. For a provider-backed (secure) client the host
     /// agent is authoritative: on ANY mint failure — down, refused, or a

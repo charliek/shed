@@ -1,6 +1,6 @@
 // HostAgentClient token.get correlation tests (Phase 5b). Drives the real
-// client against a minimal in-test UDS host-agent that speaks the same
-// newline-JSON framing, exercising the request/response correlation, the
+// client against the shared in-test UDS host-agent (`FakeHostAgent` in
+// TestSupport.swift), exercising the request/response correlation, the
 // fail-closed error reply, the timeout backstop, and the disconnect path.
 
 import Darwin
@@ -10,34 +10,6 @@ import XCTest
 @testable import ShedKit
 
 final class HostAgentClientTokenTests: XCTestCase {
-    private static let info = HelloClientInfo(
-        name: "test", version: "0", pid: 1, capabilities: [], replayEvents: 0)
-
-    private func tempSocketPath() -> String {
-        // Short path under /tmp — sockaddr_un.sun_path is ~104 bytes and the
-        // system temp dir is too long on macOS.
-        "/tmp/shed-fake-\(UUID().uuidString.prefix(8)).sock"
-    }
-
-    /// Start the client draining its event stream (realistic usage; also keeps
-    /// the AsyncStream alive so it isn't terminated before the test runs).
-    private func startDraining(_ client: HostAgentClient) -> Task<Void, Never> {
-        let stream = client.start(client: Self.info)
-        return Task { for await _ in stream {} }
-    }
-
-    /// Poll until the client has a live fd (connectOnce sets it right after the
-    /// UDS connect succeeds), failing after ~5s.
-    private func waitConnected(
-        _ client: HostAgentClient, file: StaticString = #filePath, line: UInt = #line
-    ) async throws {
-        for _ in 0..<200 {
-            if client.isConnected { return }
-            try await Task.sleep(for: .milliseconds(25))
-        }
-        XCTFail("client never connected to fake host-agent", file: file, line: line)
-    }
-
     func testRequestTokenRoundTrip() async throws {
         let path = tempSocketPath()
         let fake = FakeHostAgent(
@@ -145,95 +117,72 @@ final class HostAgentClientTokenTests: XCTestCase {
     }
 }
 
-/// Minimal in-test UDS server mimicking shed-host-agent's framing: accepts one
-/// client, greets with a `hello_ack`, then replies to `token.get` per `mode`.
-/// Reuses ShedKit's public socket helpers (makeUnixSocketAddress/writeAll/
-/// LineFrameReader) so the wire path matches the real agent.
-final class FakeHostAgent: @unchecked Sendable {
-    enum Mode {
-        /// `server` overrides the echoed `token.get` server when non-nil (wrong-server tests).
-        case reply(token: String?, expiresAt: String?, error: String?, server: String? = nil)
-        case silent  // read the token.get, never reply (drives the client timeout)
-        case dropOnGet  // close the conn on token.get (drives the disconnect path)
+/// A one-shot, thread-safe latch (the write hook runs off the test's actor).
+private final class Latch: @unchecked Sendable {
+    private let lock = NSLock()
+    private var fired = false
+    /// `true` the first time only.
+    func fire() -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        if fired { return false }
+        fired = true
+        return true
     }
-    enum FakeError: Error { case socket, address, bind, listen }
-
-    private let path: String
-    private let mode: Mode
-    private var listenFD: Int32 = -1
-
-    init(path: String, mode: Mode) {
-        self.path = path
-        self.mode = mode
+    var didFire: Bool {
+        lock.lock(); defer { lock.unlock() }
+        return fired
     }
+}
 
-    func start() throws {
-        unlink(path)
-        let fd = socket(AF_UNIX, SOCK_STREAM, 0)
-        guard fd >= 0 else { throw FakeError.socket }
-        guard var addr = makeUnixSocketAddress(path: path) else {
-            Darwin.close(fd)
-            throw FakeError.address
-        }
-        let rc = withUnsafePointer(to: &addr) { p in
-            p.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
-                Darwin.bind(fd, sa, socklen_t(MemoryLayout<sockaddr_un>.size))
+/// The send-time capability check and the frame write are ONE atomic step.
+/// Rust holds its state lock across the same span (`shed-app`'s
+/// `host_agent.rs`); Swift used to unlock in between, which left a window where
+/// the validated connection could be replaced and the `credential.get` land on
+/// the NEW, not-yet-acked one — dropped by an old agent, or answered by a new
+/// one with an extra mint whose reply has no waiter.
+final class HostAgentClientAtomicSendTests: XCTestCase {
+    func testValidatedCredentialGetIsNeverWrittenOnAReplacedConnection() async throws {
+        let path = tempSocketPath()
+        let fake = FakeHostAgent(path: path, advertisesCredentialGet: true)
+        try fake.start()
+        defer { fake.stop() }
+
+        let client = HostAgentClient(socketPath: path)
+        let latch = Latch()
+        // Hooked at the instant between "the capability check passed" and the
+        // write: tear the validated connection down and give the client every
+        // chance to replace it (its reconnect backoff is 0.5 s). It cannot —
+        // swapping the fd needs the very lock this request is holding — so the
+        // frame can only ever reach the connection that was validated.
+        client.beforeWriteHookForTests = { [weak fake] in
+            guard let fake, latch.fire() else { return }
+            fake.dropConnection()
+            let deadline = Date().addingTimeInterval(1.2)
+            while Date() < deadline, fake.connectionCount() == 1 {
+                Thread.sleep(forTimeInterval: 0.02)
             }
         }
-        guard rc == 0 else { Darwin.close(fd); throw FakeError.bind }
-        guard Darwin.listen(fd, 1) == 0 else { Darwin.close(fd); throw FakeError.listen }
-        listenFD = fd
-        let t = Thread { [weak self] in self?.serve() }
-        t.stackSize = 1 << 20
-        t.start()
-    }
 
-    func stop() {
-        if listenFD >= 0 { Darwin.close(listenFD); listenFD = -1 }
-        unlink(path)
-    }
+        let drain = startDraining(client)
+        defer { drain.cancel(); client.stop() }
+        try await waitConnected(client)
+        try await waitCapability(client, .supported)
+        let snapshot = client.credentialCapabilitySnapshot
 
-    private func serve() {
-        let conn = accept(listenFD, nil, nil)
-        guard conn >= 0 else { return }
-        // Greet so the client's runLoop yields .connected (also realistic).
-        _ = writeAll(
-            fd: conn,
-            data: lineData([
-                "v": hostAgentProtocolVersion, "type": "hello_ack",
-                "namespaces": [], "gate_namespaces": [],
-                "request_timeout_ms": 5000, "accepted": true,
-            ]))
-        var reader = LineFrameReader(fd: conn)
-        while let line = try? reader.readLine() {
-            guard let obj = try? JSONSerialization.jsonObject(with: line) as? [String: Any],
-                obj["type"] as? String == "token.get"
-            else { continue }
-            let id = obj["id"] as? String ?? ""
-            let server = obj["server"] as? String ?? ""
-            switch mode {
-            case .silent:
-                continue
-            case .dropOnGet:
-                Darwin.close(conn)
-                return
-            case .reply(let token, let expiresAt, let error, let serverOverride):
-                var resp: [String: Any] = [
-                    "v": hostAgentProtocolVersion, "type": "token.response",
-                    "in_reply_to": id, "server": serverOverride ?? server,
-                ]
-                if let token { resp["token"] = token }
-                if let expiresAt { resp["expires_at"] = expiresAt }
-                if let error { resp["error"] = error }
-                _ = writeAll(fd: conn, data: lineData(resp))
-            }
+        // The request itself is allowed to fail — the connection it validated
+        // was torn down under it. What must never happen is the frame showing
+        // up on the replacement.
+        _ = try? await client.requestCredential(
+            server: "prod", csrBase64: "Q1NS", capability: snapshot, timeout: .seconds(2))
+
+        XCTAssertTrue(latch.didFire, "the write hook never ran — the test proved nothing")
+        // Let the reconnect land so there IS a later connection to inspect.
+        try await Task.sleep(for: .milliseconds(900))
+        XCTAssertGreaterThan(fake.connectionCount(), 1, "the client should have reconnected")
+        for index in 1..<fake.connectionCount() {
+            XCTAssertFalse(
+                fake.frameTypes(connection: index).contains("credential.get"),
+                "a credential.get validated against connection 0 landed on connection \(index)")
         }
-        Darwin.close(conn)
-    }
-
-    private func lineData(_ obj: [String: Any]) -> Data {
-        var d = (try? JSONSerialization.data(withJSONObject: obj)) ?? Data()
-        d.append(0x0a)
-        return d
     }
 }

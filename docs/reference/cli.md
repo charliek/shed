@@ -32,31 +32,51 @@ shed server add <host> [flags]
 | Flag | Short | Default | Description |
 |------|-------|---------|-------------|
 | `--name` | `-n` | Derived from host | Friendly name for server |
-| `--port` | `-p` | `8080` | HTTP API port (bootstrap; ignored when `--https-port` is set) |
-| `--https-port` | | | HTTPS port; when set, bootstrap over TLS and pin the server's self-signed cert |
-| `--secure` | | `false` | Bootstrap over TLS on the default secure port (8443) without probing plain HTTP first |
+| `--ssh-port` | | `2222` | SSH port used for first contact (host-key pin + credential bootstrap) |
+| `--port` | `-p` | `8080` | HTTP API port; used only by the no-credential fallback (ignored when `--https-port` is set) |
+| `--https-port` | | | HTTPS port to reach the server on: overrides the port its bootstrap bundle reports, and selects the TLS endpoint for the no-credential fallback |
+| `--secure` | | `false` | Fallback only: go straight to TLS on the default secure port (8443) instead of probing plain HTTP |
 | `--fingerprint` | | | Expected SSH host-key fingerprint (`SHA256:...`); verified out-of-band and fails on mismatch |
 | `--tls-fingerprint` | | | Expected TLS cert fingerprint (`sha256:...`); verified out-of-band and fails on mismatch |
 | `--trust-on-first-use` | | `false` | Trust the server's SSH host key (and TLS cert) without prompting |
 
-The SSH port is automatically discovered from the server's `/api/info` endpoint.
+**First contact is over SSH.** `server add` scans the server's SSH port (`--ssh-port`, default `2222`), pins the host key in `~/.shed/known_hosts`, and then mints a credential over the reserved `_bootstrap` SSH channel. The bundle the server returns describes everything else — API port, TLS pin, and which credential shape the server issues — and the entry is only saved after an authenticated `GET /api/info` over that endpoint succeeds.
 
-The command pins the server's SSH host key (in `~/.shed/known_hosts`). It prints the SHA256 fingerprint and, on an interactive terminal, asks you to confirm it before trusting — closing the add-time MITM window. Supply `--fingerprint SHA256:...` (read from the server's startup log) to verify out-of-band, or `--trust-on-first-use` to accept without a prompt. When stdin is not a terminal (scripts/CI), the key is trusted on first use unless `--fingerprint` is given.
+This order is what makes an `auth.mode: mtls` server addable at all: its HTTPS listener requires a client certificate to complete the handshake, so an unenrolled client cannot read `/api/info` over HTTP first. Since the SSH port is no longer discovered from `/api/info`, a server listening on a non-default SSH port needs `--ssh-port`.
 
-With `--https-port`, the command also pins the server's TLS certificate (over a connection it verifies before trusting), shows its fingerprint, and writes `api_url` + `tls_cert_fingerprint` into the server entry so the control plane runs over TLS. See [Security](security.md#native-pinned-tls).
+The host key is confirmed before it is pinned, closing the add-time MITM window: the command prints the SHA256 fingerprint and, on an interactive terminal, asks you to confirm. Supply `--fingerprint SHA256:...` (read from the server's startup log) to verify out-of-band, or `--trust-on-first-use` to accept without a prompt. When stdin is not a terminal (scripts/CI), the key is trusted on first use unless `--fingerprint` is given; `--json` refuses to trust silently. A host already pinned with a **different** key is a hard error — never a silent re-pin.
 
-If you omit `--https-port`, `server add` first tries plain HTTP and, when that is refused — a TLS-only `auth.mode: secure` server serves no plain-HTTP listener — automatically retries the pinned-TLS bootstrap on the default secure port (`8443`). Pass `--secure` to skip the plain-HTTP probe and go straight to TLS, or `--https-port` for a non-default TLS port.
+What the bootstrap returns decides the rest:
 
-When the server runs in `auth.mode: secure`, `server add` also **mints a control token automatically** — there is no `shed-server token new` and no token to paste. After pinning the host key it reads `GET /api/info` to detect secure mode, then connects over the reserved `_bootstrap` SSH channel (the same pinned key); the server re-verifies your key against its allowlist and returns a scoped, short-TTL token, which the CLI writes as `control_token` + `control_token_expires_at` in the server entry. The token is never printed. Your SSH key must therefore be on the server's allowlist (`auth.ssh.github_users` / `authorized_keys`). From then on the CLI refreshes the token transparently — near expiry and on a `401` — so you never run a token command. See [HTTP tokens are minted over SSH](security.md#http-tokens-are-minted-over-ssh).
+| Server | Result |
+|---|---|
+| `auth.mode: token` | A scoped, short-TTL control token, written as `control_token` + `control_token_expires_at` (never printed) |
+| `auth.mode: mtls` | A client certificate + key, written `0600` under `~/.shed/creds/<name>/` and referenced by `client_cert_file` / `client_key_file` |
+| `auth.mode: open` | The server issues no credential, so the command falls back to the HTTP probe (`--port`, `--https-port`, `--secure`) to find the API endpoint |
+
+In both credentialed modes your SSH key must be on the server's allowlist (`auth.ssh.github_users` / `authorized_keys`); a key that is not is a hard error, not a downgrade. From then on the CLI refreshes the credential transparently — near expiry and on a rejection — so you never run a token command. See [HTTP tokens are minted over SSH](security.md#http-tokens-are-minted-over-ssh) and [Security](security.md#native-pinned-tls).
+
+`--https-port` names the port **you** reach the server's TLS listener on. It overrides the HTTPS port the bootstrap bundle advertises when the `api_url` is built, which is what makes a port-mapped or externally published deployment addable; the pinned certificate fingerprint always comes from the bundle, and the verification request still has to succeed, so a wrong port fails during the add rather than on your next command.
+
+#### When the SSH port cannot be scanned
+
+The host-key scan dials `<host>:<ssh-port>` directly. `ssh` does not: the bootstrap runs the real ssh client, which honors `~/.ssh/config` — `HostName`, `Port`, `ProxyJump`, `ProxyCommand`, `IdentityAgent`. A scan that cannot connect therefore proves nothing, and `server add` does not stop there. It warns, pins nothing, and runs the bootstrap anyway:
+
+- **ssh reaches the server.** Host-key verification is ssh's: `StrictHostKeyChecking=yes` against `~/.shed/known_hosts`, with the global `known_hosts` and every `ssh_config`-supplied host-key source disabled. Nothing is trusted that was not already pinned there, so an unpinned host is refused **by ssh**. If you reach a server through `~/.ssh/config`, pin its key yourself first — `ssh-keyscan -p <port> <hostname> >> ~/.shed/known_hosts` — and the add proceeds normally.
+- **ssh cannot reach it either.** There is no SSH evidence at all, so the command falls back to the HTTP probe, exactly as it did before first contact moved to SSH. It refuses to write an entry if that probe reports `auth.mode: token` or `mtls`: those servers issue their credential over SSH and nowhere else, so an entry written here could never authenticate.
+
+#### A failed add leaves nothing behind
+
+A host key this command pins is un-pinned again if any later step fails, so a retry starts from the state you were in. The config entry and the credential material are written as one transaction: the credential is staged first, and whichever half fails, the other is undone — the config on disk always names credential material that exists and matches the auth mode recorded beside it.
 
 **Example:**
 
 ```bash
 shed server add mini-desktop.tailnet.ts.net --name mini
 shed server add vps.example.com --name vps --fingerprint SHA256:HtYK...j4Y
-shed server add vps.example.com --https-port 8443 --name vps   # secure: pin TLS + mint a control token
-shed server add secure.example.com --secure --name sec         # secure on the default TLS port (8443)
-shed server add secure.example.com --name sec                  # same: plain HTTP refused → auto-retry TLS:8443
+shed server add secure.example.com --name sec                  # token or mtls: everything comes from the SSH bootstrap
+shed server add mini3 --ssh-port 12222 --name mini3-dev        # a server on a non-default SSH port
+shed server add lan-box --port 8080 --name lan                 # auth.mode: open — added over plain HTTP
 ```
 
 ### shed server update
@@ -66,8 +86,16 @@ regenerates its cert).
 
 ```bash
 shed server update <name> --tls-fingerprint sha256:<new>   # pin a new value out-of-band
-shed server update <name> --refetch                        # fetch the cert and re-pin
+shed server update <name> --refetch                        # re-read the pin over SSH and re-pin
 ```
+
+`--refetch` follows the same SSH-first path as `shed server add`: it re-verifies
+the pinned host key, re-bootstraps, and takes the new TLS pin from the bundle —
+which is the only way to re-pin an `auth.mode: mtls` server, whose HTTPS
+listener will not complete a handshake with an unenrolled client. It re-enrolls
+the entry's credential as a side effect, so a server that changed `auth.mode`
+lands on the right one. An `auth.mode: open` server (no bundle) still has its
+certificate read directly off its `api_url`.
 
 Rotating an existing pin in a non-interactive session requires
 `--trust-on-first-use`.

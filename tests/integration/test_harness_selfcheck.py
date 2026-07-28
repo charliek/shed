@@ -15,6 +15,7 @@ Two kinds, deliberately separated:
 from __future__ import annotations
 
 import json
+import ssl
 import urllib.request
 
 import pytest
@@ -22,9 +23,23 @@ import pytest
 import fixtures.devcontrol as devcontrol
 
 
-def _api_info(http_port: int) -> dict:
+def _api_info(config: dict) -> dict:
+    """Fetch `/api/info`, choosing scheme/port the same way
+    `devcontrol._wait_reachable` does: an enforced-mode CONFIG (today's
+    committed dev-parallel base is `auth.mode: token`) is TLS-only, so read
+    `https_port` off the CONFIG the server was actually started with — never
+    the CLIENT ENTRY, which carries no `http_port` at all once the server
+    enforces token/mtls (see `fixtures/devcontrol.py`'s module docstring)."""
+    ctx = None
+    if devcontrol._config_enforced(config):
+        port = int(config.get("https_port") or 8443)
+        scheme = "https"
+        ctx = ssl._create_unverified_context()
+    else:
+        port = int(config.get("http_port") or 8080)
+        scheme = "http"
     with urllib.request.urlopen(
-        f"http://localhost:{http_port}/api/info", timeout=10
+        f"{scheme}://localhost:{port}/api/info", timeout=10, context=ctx
     ) as resp:
         return json.loads(resp.read().decode("utf-8"))
 
@@ -59,6 +74,26 @@ def test_assert_dev_target_accepts_offset_port_dev(monkeypatch):
     assert devcontrol.assert_dev_target("x-dev") == entry
 
 
+def test_assert_dev_target_accepts_https_only_dev_entry(monkeypatch):
+    """A '-dev' entry with NO `http_port` at all — the real shape an SSH-first
+    `shed server add` now records for an enforced-mode (token/mtls) server,
+    per `shed --json server list` (see `fixtures/devcontrol.py`'s module
+    docstring and `_ports`'s https_port/endpoint fallback) — is still
+    accepted via the `https_port` fallback, not misdiagnosed as malformed."""
+    entry = {
+        "name": "x-dev",
+        "host": "localhost",
+        "endpoint": "https://localhost:18443",
+        "ssh_port": 12222,
+        "https_port": 18443,
+        "security": "secure",
+    }
+    monkeypatch.setattr(
+        devcontrol, "resolve_server_entry", lambda name, timeout=10: entry
+    )
+    assert devcontrol.assert_dev_target("x-dev") == entry
+
+
 def test_assert_dev_target_rejects_malformed_ports(monkeypatch):
     """A '-dev' entry with missing/zero ports fails closed, not defaulted."""
     monkeypatch.setattr(
@@ -84,6 +119,8 @@ def test_config_ports_safe_rejects_prod_and_nonpositive():
 # --- Live mechanism tests (real dev-server restart) ------------------------
 
 
+@devcontrol.skip_needs_open_mode_dev_server
+@devcontrol.skip_mtls_reconfigure
 @pytest.mark.vz
 @pytest.mark.slow
 def test_dev_config_roundtrips_override(vz_server_dev):
@@ -94,19 +131,20 @@ def test_dev_config_roundtrips_override(vz_server_dev):
     host:port) so the change is observable and harmless.
     """
     server = vz_server_dev.name
-    entry = devcontrol.resolve_server_entry(server)
-    assert entry is not None
-    http_port = int(entry["http_port"])
+    # The override below only changes `name`; ports/mode are unchanged from
+    # the committed base, so the same resolved config is valid for all three
+    # fetches (before, during, and after the override).
+    base_config = devcontrol._merge_config({})
 
-    base_name = _api_info(http_port)["name"]
+    base_name = _api_info(base_config)["name"]
     sentinel = "harness-selfcheck-name"
     assert base_name != sentinel
 
     with devcontrol.dev_config({"name": sentinel}, server):
-        assert _api_info(http_port)["name"] == sentinel
+        assert _api_info(base_config)["name"] == sentinel
 
     # Restored to the committed base config.
-    assert _api_info(http_port)["name"] == base_name
+    assert _api_info(base_config)["name"] == base_name
 
 
 @pytest.mark.vz

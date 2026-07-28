@@ -42,6 +42,17 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 sha2 = "0.10"
 uuid = { version = "1", features = ["v4"] }
 httpmock = "0.7"
+# Client-certificate enrollment (shed-core's `csr` module): P-256 keypair + CSR
+# generation, pure Rust on the ring backend rustls already pulls in.
+# `default-features = false` + `ring` deliberately omits rcgen's `pem` (its own
+# base64 wrapper — shed-core encodes PEM itself) and never enables `aws_lc_rs`
+# (a C/asm stack that must not enter this dependency-clean workspace).
+rcgen = { version = "0.13", default-features = false, features = ["ring"] }
+# Standard-alphabet base64 for the CSR request argument and PEM bodies. Already
+# in the lock tree (reqwest/httpmock); no new transitive surface.
+base64 = "0.22"
+# Test-only TLS listener for the in-process mtls server tests.
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
 
 [profile.release]
 lto = "thin"

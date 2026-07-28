@@ -23,7 +23,7 @@ name: my-server-dev
 # Offset from brew's 8080/2222 so both can run simultaneously.
 http_port: 18080
 ssh_port: 12222
-# Secure-mode TLS listener; offset from brew's default 8443.
+# Token-mode TLS listener; offset from brew's default 8443.
 https_port: 18443
 
 # Loopback (also the v0.7.4 default) — the suite drives this dev server over
@@ -33,10 +33,10 @@ bind_address: 127.0.0.1
 default_backend: vz
 log_level: debug
 
-# LOCAL (uncommitted) mobile-testing overrides: secure mode + the shed-mobile
+# LOCAL (uncommitted) mobile-testing overrides: token mode + the shed-mobile
 # app key so the pinned-HTTPS mobile client can mint tokens and connect.
 auth:
-  mode: secure
+  mode: token
   ssh:
     github_users: [charliek]
     authorized_keys:
@@ -87,11 +87,11 @@ vz:
   # Pin to the latest release's images so the dev binary uses the
   # release-shaped upper-template fast path (sub-100 ms rootfs phase).
   # Bump in lockstep with shed releases; see docs/reference/images.md.
-  default_image: ghcr.io/charliek/shed-vz-full:v0.5.9
+  default_image: ghcr.io/charliek/shed-vz-full:v0.8.0
   image_aliases:
-    base: ghcr.io/charliek/shed-vz-base:v0.5.9
-    extensions: ghcr.io/charliek/shed-vz-extensions:v0.5.9
-    full: ghcr.io/charliek/shed-vz-full:v0.5.9
+    base: ghcr.io/charliek/shed-vz-base:v0.8.0
+    extensions: ghcr.io/charliek/shed-vz-extensions:v0.8.0
+    full: ghcr.io/charliek/shed-vz-full:v0.8.0
   pull_policy: missing
 
   # Separate state-dirs under `shed-dev/` so prune from the brew server

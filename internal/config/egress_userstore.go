@@ -146,7 +146,7 @@ func (s *UserProfileStore) Put(name string, p EgressProfile) error {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if err := atomicWriteFile(filepath.Join(s.dir, name+".yaml"), data); err != nil {
+	if err := atomicWriteFile(filepath.Join(s.dir, name+".yaml"), data, 0o600); err != nil {
 		return err
 	}
 	s.m[name] = p.clone()
@@ -164,17 +164,5 @@ func (s *UserProfileStore) Delete(name string) error {
 		return err
 	}
 	delete(s.m, name)
-	return nil
-}
-
-func atomicWriteFile(path string, data []byte) error {
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o600); err != nil {
-		return err
-	}
-	if err := os.Rename(tmp, path); err != nil {
-		_ = os.Remove(tmp)
-		return err
-	}
 	return nil
 }

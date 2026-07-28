@@ -27,7 +27,8 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::desktop_protocol::{
-    self as protocol, ApprovalResponseMsg, AuditEntryView, ClientInfo, DesktopInbound, TokenGetMsg,
+    self as protocol, ApprovalResponseMsg, AuditEntryView, ClientInfo, CredentialGetMsg,
+    DesktopInbound, TokenGetMsg,
 };
 
 use shed_broker::approval::{ApprovalGate, ApprovalOutcome};
@@ -35,12 +36,14 @@ use shed_broker::audit::{AuditEntry, AuditFanout};
 use shed_broker::config::{
     NS_AWS_CREDENTIALS, NS_DOCKER_CREDENTIALS, NS_SSH_AGENT, POLICY_SHED_DESKTOP,
 };
-use shed_broker::controltoken::ControlTokenMinter;
+use shed_broker::controltoken::{ControlCredentialMinter, ControlTokenMinter};
 // `MintedControlToken` is named only by the test minters (`StubControlMinter` /
 // `GatedMinter`); production code returns it via the trait without naming the type.
 #[cfg(test)]
 use shed_broker::controltoken::MintedControlToken;
 use shed_broker::status::{now_rfc3339, now_unix, rfc3339_utc};
+#[cfg(test)]
+use shed_core::approval::CAP_CREDENTIAL_GET;
 
 /// 1 MiB per-line cap on inbound frames — a larger frame is a protocol violation
 /// (disconnect), never unbounded memory growth. Matches Go's `maxFrameBytes`.
@@ -213,6 +216,11 @@ pub struct DesktopServer {
     gate_namespaces: Vec<String>,
     timeout: Duration,
     minter: Option<Arc<dyn ControlTokenMinter>>,
+    /// Answers `credential.get`. Separate from `minter` because the two messages
+    /// are separate: `token.get` is frozen at bearer tokens, and this one relays
+    /// the app's CSR so an mtls server can issue a certificate for a key the app
+    /// never releases. `None` makes `credential.get` fail closed.
+    credential_minter: Option<Arc<dyn ControlCredentialMinter>>,
     conn_counter: AtomicU64,
     inner: Mutex<Inner>,
 }
@@ -221,12 +229,14 @@ impl DesktopServer {
     /// Build a server. `approval_timeout` bounds each delegated approval before a
     /// fail-closed deny (a non-positive value falls back to 25s, matching
     /// `NewDesktopServer`). `gate_namespaces` are advertised in `hello_ack`. A
-    /// `None` minter makes `token.get` fail closed.
+    /// A `None` minter makes `token.get` fail closed; a `None` `credential_minter`
+    /// does the same for `credential.get`.
     pub fn new(
         agent_version: String,
         gate_namespaces: Vec<String>,
         approval_timeout: Duration,
         minter: Option<Arc<dyn ControlTokenMinter>>,
+        credential_minter: Option<Arc<dyn ControlCredentialMinter>>,
     ) -> Arc<Self> {
         let timeout = if approval_timeout.is_zero() {
             DEFAULT_APPROVAL_TIMEOUT
@@ -238,6 +248,7 @@ impl DesktopServer {
             gate_namespaces,
             timeout,
             minter,
+            credential_minter,
             conn_counter: AtomicU64::new(0),
             inner: Mutex::new(Inner {
                 consumer: None,
@@ -407,6 +418,7 @@ impl DesktopServer {
             &self.agent_version,
             &namespaces,
             &self.gate_namespaces,
+            &protocol::agent_capabilities(),
             self.timeout.as_millis() as i64,
             true,
             None,
@@ -461,6 +473,14 @@ impl DesktopServer {
                     // superseded connection (Go closes the old conn on promote).
                     let this = Arc::clone(&self);
                     tokio::spawn(async move { this.handle_token_get(conn_id, req).await });
+                }
+                Ok(DesktopInbound::CredentialGet(req)) => {
+                    // Same task-per-request discipline as token.get, and for the
+                    // same reason: the mint is a bounded SSH round-trip that must
+                    // not stall approvals, and the reply is gated on this
+                    // connection still being the active consumer.
+                    let this = Arc::clone(&self);
+                    tokio::spawn(async move { this.handle_credential_get(conn_id, req).await });
                 }
                 Ok(DesktopInbound::Pong) => {} // liveness only
                 Ok(DesktopInbound::Hello(_)) | Ok(DesktopInbound::Unknown { .. }) => {}
@@ -537,6 +557,45 @@ impl DesktopServer {
         }
     }
 
+    /// Answer a `credential.get`: relay the app's CSR to the server and reply with
+    /// whichever credential it issued. Fail-closed in the same two senses as
+    /// `handle_token_get` — an error carries no credential fields, and the reply
+    /// is delivered only if this connection is still the active consumer.
+    async fn handle_credential_get(&self, conn_id: u64, req: CredentialGetMsg) {
+        let (credential, error) = match &self.credential_minter {
+            None => (
+                None,
+                Some("control-credential minting is not available".to_string()),
+            ),
+            Some(minter) => match minter.mint_control_credential(&req.server, &req.csr).await {
+                Ok(minted) => (Some(minted), None),
+                Err(msg) => (None, Some(msg)),
+            },
+        };
+        let frame = protocol::credential_response(
+            &new_id(),
+            &now_rfc3339(),
+            &req.id,
+            &req.server,
+            credential.as_ref().map(|c| c.auth_mode.as_str()),
+            credential.as_ref().map(|c| c.token.as_str()),
+            credential.as_ref().map(|c| c.client_cert.as_str()),
+            credential.as_ref().map(|c| c.cert_serial.as_str()),
+            credential.as_ref().and_then(|c| c.expires_at.as_deref()),
+            error.as_deref(),
+        );
+        let send_result = {
+            let inner = self.inner.lock().unwrap();
+            match inner.consumer.as_ref() {
+                Some(c) if c.id == conn_id => Some(c.writer.try_send(with_newline(frame))),
+                _ => None, // superseded / gone -> never write a credential to a stale conn
+            }
+        };
+        if let Some(Err(_)) = send_result {
+            self.demote(conn_id); // queue full / closed -> stalled reader, fail closed
+        }
+    }
+
     fn promote(
         &self,
         conn_id: u64,
@@ -565,6 +624,7 @@ impl DesktopServer {
                     &new_id(),
                     &now_rfc3339(),
                     &self.agent_version,
+                    &[],
                     &[],
                     &[],
                     0,
@@ -814,10 +874,22 @@ mod tests {
             gate: Vec<String>,
             timeout: Duration,
         ) -> Self {
+            Self::start_with(minter, None, gate, timeout)
+        }
+
+        /// `start` plus an explicit credential minter, for the `credential.get`
+        /// legs. A `None` credential minter is the pre-mtls agent shape.
+        fn start_with(
+            minter: Option<Arc<dyn ControlTokenMinter>>,
+            credential_minter: Option<Arc<dyn ControlCredentialMinter>>,
+            gate: Vec<String>,
+            timeout: Duration,
+        ) -> Self {
             let path = std::env::temp_dir().join(format!("shed-ds-test-{}.sock", new_id()));
             let _ = std::fs::remove_file(&path);
             let listener = UnixListener::bind(&path).unwrap();
-            let server = DesktopServer::new("v-test".into(), gate, timeout, minter);
+            let server =
+                DesktopServer::new("v-test".into(), gate, timeout, minter, credential_minter);
             let serve = server.clone();
             let serve_path = path.clone();
             tokio::spawn(async move {
@@ -1306,6 +1378,186 @@ mod tests {
         assert!(
             wait_until(move || gone.consumer_info().is_none()).await,
             "an over-cap newline-terminated frame must disconnect the consumer"
+        );
+    }
+
+    /// A stand-in credential minter: records the CSR it was handed and returns a
+    /// canned mtls credential, so the relay can be asserted without SSH.
+    struct StubCredentialMinter {
+        seen_csr: Arc<Mutex<Vec<String>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl ControlCredentialMinter for StubCredentialMinter {
+        async fn mint_control_credential(
+            &self,
+            _server: &str,
+            csr_base64: &str,
+        ) -> Result<shed_broker::controltoken::MintedControlCredential, String> {
+            self.seen_csr.lock().unwrap().push(csr_base64.to_string());
+            Ok(shed_broker::controltoken::MintedControlCredential {
+                auth_mode: "mtls".into(),
+                token: String::new(),
+                client_cert: "PEM".into(),
+                cert_serial: "0a0b".into(),
+                expires_at: Some("2030-01-01T00:00:00Z".into()),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn hello_ack_advertises_credential_get() {
+        let h = Harness::start(None, vec![], Duration::from_secs(25));
+        let mut app = TestApp::connect(&h.path).await;
+        let ack = app.handshake(0).await;
+        let caps = ack["agent_capabilities"]
+            .as_array()
+            .expect("agent_capabilities must be advertised");
+        assert!(caps.iter().any(|c| c == CAP_CREDENTIAL_GET));
+    }
+
+    #[tokio::test]
+    async fn credential_get_relays_the_csr_and_returns_the_certificate() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let h = Harness::start_with(
+            Some(Arc::new(StubControlMinter)),
+            Some(Arc::new(StubCredentialMinter {
+                seen_csr: seen.clone(),
+            })),
+            vec![],
+            Duration::from_secs(25),
+        );
+        let mut app = TestApp::connect(&h.path).await;
+        app.handshake(0).await;
+        app.send(json!({"type": "credential.get", "id": "q1", "server": "mini2", "csr": "QUJD"}))
+            .await;
+        let resp = app.recv().await;
+        assert_eq!(resp["type"], "credential.response");
+        assert_eq!(resp["in_reply_to"], "q1");
+        assert_eq!(resp["server"], "mini2");
+        assert_eq!(resp["auth_mode"], "mtls");
+        assert_eq!(resp["client_cert"], "PEM");
+        assert_eq!(resp["cert_serial"], "0a0b");
+        assert!(resp.get("token").is_none(), "mtls carries no bearer token");
+        assert!(resp.get("error").is_none());
+        // The CSR crossed verbatim — the app's key never left the app, so a
+        // mangled CSR would produce a certificate nobody can present.
+        assert_eq!(seen.lock().unwrap().as_slice(), ["QUJD"]);
+    }
+
+    /// The OTHER direction of the mismatch: an agent build with no credential
+    /// minter wired (or one whose broker cannot relay) fails closed with a named
+    /// error rather than an empty success.
+    #[tokio::test]
+    async fn credential_get_without_a_minter_fails_closed() {
+        let h = Harness::start(
+            Some(Arc::new(StubControlMinter)),
+            vec![],
+            Duration::from_secs(25),
+        );
+        let mut app = TestApp::connect(&h.path).await;
+        app.handshake(0).await;
+        app.send(json!({"type": "credential.get", "id": "q1", "server": "mini2"}))
+            .await;
+        let resp = app.recv().await;
+        assert_eq!(resp["error"], "control-credential minting is not available");
+        assert!(resp.get("auth_mode").is_none());
+        assert!(resp.get("token").is_none());
+        assert!(resp.get("client_cert").is_none());
+    }
+
+    // --- plan 002 §7 P9: the shared credential.response vectors, LIVE --------
+    //
+    // The frames THIS build emits, asserted end to end: a real socket, a real
+    // handshake, a real `credential.get`, and a minter answering with the
+    // vector's credential. That is the point — a fixture -> struct -> JSON
+    // round-trip would stay green while `handle_credential_get` dropped or
+    // misrouted `auth_mode`, which is precisely the failure whose blast radius
+    // is "every client refuses the response". Go asserts the same vectors
+    // against its own handler (`cmd/shed-host-agent/golden_test.go`), so the two
+    // agents cannot drift apart — or be wrong together.
+
+    /// A minter that answers with one canned credential (or one error), so a
+    /// fixture vector can be replayed through the production handler.
+    struct FixtureCredentialMinter {
+        answer: Result<shed_broker::controltoken::MintedControlCredential, String>,
+    }
+
+    #[async_trait::async_trait]
+    impl ControlCredentialMinter for FixtureCredentialMinter {
+        async fn mint_control_credential(
+            &self,
+            _server: &str,
+            _csr_base64: &str,
+        ) -> Result<shed_broker::controltoken::MintedControlCredential, String> {
+            self.answer.clone().map_err(|e| e.to_string())
+        }
+    }
+
+    #[tokio::test]
+    async fn golden_desktop_credential_response_over_the_live_socket() {
+        let fx = crate::desktop_protocol::desktop_fixture("credential_response.json");
+        assert_eq!(fx["protocol_version"], 1, "fixture version skew");
+        let mut emitted = 0;
+        for v in fx["vectors"].as_array().expect("vectors") {
+            if v["agent_emits"] != json!(true) {
+                continue;
+            }
+            emitted += 1;
+            let name = v["name"].as_str().unwrap();
+            let f = &v["frame"];
+            let field = |k: &str| f[k].as_str().unwrap_or("").to_string();
+
+            // The minter's answer, reconstructed from the vector. `auth_mode` is
+            // already normalized to the token/mtls literal by
+            // `ControlTokenProvider::mint_control_credential`, so feeding the
+            // literal the fixture shows is feeding the handler its real input.
+            let err = field("error");
+            let answer = if err.is_empty() {
+                Ok(shed_broker::controltoken::MintedControlCredential {
+                    auth_mode: field("auth_mode"),
+                    token: field("token"),
+                    client_cert: field("client_cert"),
+                    cert_serial: field("cert_serial"),
+                    expires_at: f["expires_at"].as_str().map(String::from),
+                })
+            } else {
+                Err(err)
+            };
+
+            let h = Harness::start_with(
+                Some(Arc::new(StubControlMinter)),
+                Some(Arc::new(FixtureCredentialMinter { answer })),
+                vec![],
+                Duration::from_secs(25),
+            );
+            let mut app = TestApp::connect(&h.path).await;
+            app.handshake(0).await;
+            // The request id is the vector's in_reply_to, so the echoed field is
+            // asserted for real rather than normalized away.
+            app.send(json!({
+                "type": "credential.get",
+                "id": f["in_reply_to"],
+                "server": f["server"],
+                "csr": "QUJD",
+            }))
+            .await;
+            let got = app.recv().await;
+
+            // `id` and `ts` are generated per reply — presence, not value.
+            let mut want = f.clone();
+            for k in ["id", "ts"] {
+                assert!(
+                    got[k].as_str().is_some_and(|s| !s.is_empty()),
+                    "{name}: reply is missing a generated {k}"
+                );
+                want[k] = got[k].clone();
+            }
+            assert_eq!(got, want, "{name}: live credential.response frame");
+        }
+        assert!(
+            emitted > 0,
+            "credential_response.json marks no vector agent_emits"
         );
     }
 }

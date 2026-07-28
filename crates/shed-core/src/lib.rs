@@ -5,14 +5,18 @@
 //! defensive semantics pinned by shed-desktop's `ModelDecodingTests` exactly.
 
 pub mod approval;
+pub mod authfail;
 pub mod config;
 pub mod create;
+pub mod csr;
 pub mod http;
 pub mod models;
 pub mod rc;
 pub mod rc_events;
 pub mod sse;
 pub mod terminal;
+#[cfg(test)]
+mod testtls;
 pub mod tls;
 pub mod token;
 

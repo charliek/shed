@@ -44,6 +44,10 @@ pub mod config;
 // `ControlTokenMinter`/`MintedControlToken` seam relocated here from the daemon's
 // `desktop` module, so the core carries no dependency on the desktop server).
 pub mod controltoken;
+// The agent's own on-disk client-credential store (the mtls certificate + key it enrolls
+// for itself). `pub` so an embedder can point it at its own state root and so
+// `shed server rm`-shaped cleanup has a name to call.
+pub mod credstore;
 pub mod discovery;
 pub mod docker_backend;
 // The always-on egress-audit SSE consumer — internal; the supervisor spawns it.
@@ -51,13 +55,15 @@ mod egress;
 pub mod minter;
 pub mod sockets;
 pub mod ssh_backend;
+#[cfg(test)]
+mod testalert;
 // The agent-forward SSH backend — internal; `ssh_backend` resolves into it.
 mod ssh_backend_agent;
 pub mod status;
 // The native macOS Touch-ID / biometrics approval gate (`#[cfg(target_os="macos")]`
 // inside; off-mac the biometric policies fail closed to deny-all).
-pub mod touchid;
 pub mod supervisor;
+pub mod touchid;
 pub mod watcher;
 
 // --- Curated crate-root re-exports (the API surface the daemon bin + the future
@@ -68,7 +74,11 @@ pub use approval::{
 };
 pub use audit::{AuditEntry, AuditFanout, AuditSink, JsonlAuditSink};
 pub use config::HostAgentConfig;
-pub use controltoken::{ControlTokenMinter, ControlTokenProvider, MintedControlToken};
+pub use controltoken::{
+    ControlCredentialMinter, ControlTokenMinter, ControlTokenProvider, MintedControlCredential,
+    MintedControlToken,
+};
+pub use credstore::CredStore;
 pub use discovery::{load_discovered_servers, ServerTarget};
 pub use sockets::{connect_unix_timeout, desktop_socket_path, socket_is_live, status_socket_path};
 pub use status::{build_live_status, LiveStatus, NamespaceHealth, ServerHealth};

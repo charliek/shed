@@ -275,8 +275,10 @@ discovery:
   debounce: 500ms       # fsnotify mode; default 500ms
 ```
 - `ServerSelector.UnmarshalYAML` (`config.go:85`): scalar `""`/`all`→All; other scalar→single name; sequence→list (empty list kept non-nil = "watch none"). Bad kind → `discovery.servers must be "all" or a list of server names`.
-- The **discovery source** (`~/.shed/config.yaml`, a shed CLI config) is parsed by `LoadDiscoveredServers` (`discovery.go:62`) into `ServerTarget`s: prefers `api_url` (https) over `host:http_port` (default port 8080); carries `credentials_token`→Token, `tls_cert_fingerprint`→TLSFingerprint, `ssh_port`→SSHPort; **skips empty-host entries**; **sorts by name**. Missing file → empty (not an error); malformed YAML → error.
-- `IsSecure()` = URL has `https://` prefix (case-insensitive, `config.go:154`) — the sole open-vs-secure signal (drives self-minting).
+- The **discovery source** (`~/.shed/config.yaml`, a shed CLI config) is parsed by `LoadDiscoveredServers` (`discovery.go`) into `ServerTarget`s: prefers `api_url` (https) over `host:http_port` (default port 8080); carries `credentials_token`→Token, `tls_cert_fingerprint`→TLSFingerprint, `ssh_port`→SSHPort, `auth_mode`→AuthMode; **skips empty-host entries**; **sorts by name**. Missing file → empty (not an error); malformed YAML → error. Pinned by the golden fixture `tests/host-agent-diff/fixtures/load_discovered_servers.json`.
+- `IsSecure()` = URL has `https://` prefix (case-insensitive) — the sole open-vs-secure signal, and still the sole driver of self-minting.
+- `AuthMode` is carried **VERBATIM**: not defaulted, not normalized, not validated. `""` (never recorded, a legacy entry) and `"token"` (recorded) stay distinguishable, because only the former means "this client has never been told". `IsMTLS()` is a case-insensitive equality against `"mtls"`.
+- It is **knowledge, not policy**: `shouldMint` deliberately ignores it. Both secure modes are reached over https and mint over the same channel, and the mint itself is CSR-first and mode-agnostic, so the SERVER's answer decides the credential shape. Keying the mint decision on a cached string would let a stale entry disable brokering entirely — precisely the failure a mode flip must not cause. What `auth_mode` buys is (a) whether a persisted certificate is worth loading before the first mint and (b) answering the desktop's legacy `token.get` with an explicit "upgrade the app" instead of a doomed round-trip.
 
 ### 5.7 Minimal launch configs per mode (a harness can write these verbatim)
 
@@ -439,27 +441,70 @@ more authentication methods` → `ErrNoSSHIdentities` (retryable). ctx cancel/ti
 
 ### 7.2 CONTROL vs CREDENTIALS
 
-- `scopeCredentials` (`credmint.go:50`) — the agent's own bus brokering token (secure servers). Attached via `sdk.WithTokenProvider(credentialSource)` in `startWatcherGroup` when `shouldMint` (`watcher/supervisor.go:46`).
-- `scopeControl` — used for (a) the egress SSE stream (control-scoped route) and (b) the desktop's `token.get` on the app's behalf (`controltoken.go`).
-- Difference is only the `Scope` param in the argv + a distinct `credentialSource`.
+- `scopeCredentials` — the agent's own bus brokering credential (secure servers). Attached via **both** `sdk.WithTokenProvider` and `sdk.WithClientCertificates` in `busClientOptions` when `shouldMint` (`supervisor.go`): one object serving both interfaces, because a bearer token and a client certificate are two shapes of the same credential and only the server knows which is current.
+- `scopeControl` — used for (a) the egress SSE stream (control-scoped route) and (b) the desktop's `credential.get`/`token.get` on the app's behalf (`controltoken.go`).
+- Difference is only the `Scope` param in the argv + a distinct `credentialSource`. **One certificate carries one scope**, so in mtls mode these are two genuinely different certificates, not one credential used twice.
 
-### 7.3 Caching / refresh / expiry (`credentialSource`, `credmint.go:155`)
+### 7.2b The two mint entry points
 
-- `Token()` serves cache while fresh; `staleLocked` = within `tokenRefreshWindow` (**2h**) of expiry (zero expiry = non-expiring, `credmint.go:257`).
-- **Single-flight** (`inflightMint`): N concurrent callers share one mint (`credmint.go:262`).
-- `Invalidate()` (called by SDK after 401) clears the cached token → next `Token()` re-mints.
-- **Host-key mismatch is TERMINAL**: latched in `terminalErr`, never retried (`credmint.go:282`) — fail closed forever for that server.
-- `refreshLoop` proactively re-mints at ~50% of remaining TTL, jittered ±25%, clamped [1m, 12h]; `defaultRefreshDelay=1h` before first mint (`credmint.go:294,311`).
-- `controlTokenProvider.Token(server)` (`controltoken.go:46`) **always** `forceTokenWithExpiry` (fresh, never serves this source's completed cache) because a restarted server silently invalidates control tokens. Rejects (before any mint): unknown server, no SSH endpoint, or open (non-https) server (`controltoken.go:57`).
+| entry point | keypair | used by | result |
+|---|---|---|---|
+| `CredentialMinter.Mint` → `sdkbootstrap.RunCredential` | generated HERE, per mint | the agent's own bus + egress credentials | `sdk.Credential` — token, or certificate **+ the matching key** |
+| `CredentialMinter.MintRelayed` → `sdkbootstrap.RunWithCSR` | generated by the CALLER (the desktop app) | `credential.get` (§8.6b); and, with an empty CSR, `token.get` | `sdk.Bundle` — token, or certificate and **no key** |
+
+The relay exists because the desktop's key must not leave the desktop. `RunCredential` on
+that path would return a certificate for a key the agent holds — useless to the app that
+has to present it.
+
+**`ssh` argv, mtls addition:** the remote command becomes `<scope> [<clientKind>] [csr=<b64>]`.
+The `csr=` element goes through the same argv validation as every other element (single
+token, no whitespace, no NUL). A token-mode server accepts and deliberately IGNORES it, so
+the CSR is sent unconditionally by `RunCredential` — which is what makes a server-side mode
+flip a non-event for the client.
+
+### 7.3 Caching / refresh / expiry (`credentialSource`, `credmint.go`)
+
+Backed by `internal/clienttoken.Source` — the same two-state credential machine the CLI
+uses, not a second implementation.
+
+- `Token()` mints when there is nothing usable or the credential is within
+  `clienttoken.RefreshWindow` (**2h**) of expiry; otherwise serves the cache. In **mtls
+  state it returns `("", nil)`** — the credential is real, it simply is not a bearer
+  token, and the certificate path carries it instead. A non-nil error means there is no
+  credential of any shape.
+- `ClientCertificate()` returns the certificate to present, or nil in token state. It
+  **never mints**: it runs inside the TLS handshake, where an SSH round-trip would stall a
+  dial behind an operation the handshake's deadline knows nothing about. `Token()` — which
+  every request path calls first — is where the mint happens.
+- **Single-flight + generation-aware**: N concurrent callers share one mint; a caller whose
+  credential was already replaced does not trigger a second.
+- `Invalidate()` (called by the SDK after a 401 **or an auth-shaped TLS alert**, classified
+  by `sdk/authfail`) re-mints. A refused certificate has no 401 to carry it — the server
+  rejects it in (TLS 1.2) or right after (TLS 1.3) the handshake — so the transport error
+  is classified too, on both the bus and the egress stream.
+- **Host-key mismatch is TERMINAL**: latched, never retried — fail closed forever for that server.
+- `refreshLoop` proactively re-mints at ~50% of remaining TTL, jittered ±25%, clamped [1m, 12h]; `defaultRefreshDelay=1h` before first mint.
+- **Persistence** (credentials scope only): the issued certificate + key are written to the
+  agent's OWN store — `<state>/host-agent/creds/credentials/<escaped-server>/{client.pem,client.key}`,
+  0700 dirs / 0600 files, atomic temp+rename, key first, whole write under a per-server
+  flock (`sdk/creds`). Deliberately NOT `~/.shed/creds`, which is the CLI's control-scope
+  material: two processes rotating into one directory would overwrite each other in place.
+  A stored certificate is loaded at start only when the entry records `auth_mode: mtls`,
+  and is REMOVED when a mint comes back in token mode (a flip back leaves inert material
+  for a mode the server no longer serves). The control scope persists nothing.
+- `controlTokenProvider.Token(server)` **always** mints fresh (never serves a cache) because
+  a restarted server silently invalidates control tokens; concurrent asks for one server
+  coalesce. `Credential(server, csr)` does NOT coalesce — two requests carry two CSRs, and
+  sharing one answer would hand an app a certificate for a key it does not hold. Both
+  reject, before any mint: unknown server, no SSH endpoint, or open (non-https) server.
 
 ### 7.4 Test seam for deterministic minting
 
-`CredentialMinter.bootstrapRun` is a field (default `sdkbootstrap.Run`,
-`credmint.go:33,42`). Tests set `m.bootstrapRun = func(ctx, Params)(Bundle,err)`
-(`credmint_test.go:112`) → no ssh, no server. At the `credentialSource` layer the
-`minter` interface is faked by `fakeMinter` (canned `[]mintResult`, counts calls,
-`credmint_test.go:193`) and `minterFunc`. A harness drives minting entirely
-through these — no live ssh needed.
+`CredentialMinter.bootstrapRun` (default `sdkbootstrap.RunCredential`) and
+`relayRun` (default `sdkbootstrap.RunWithCSR`) are fields. Tests set them → no ssh,
+no server. At the `credentialSource` layer the `minter` interface is faked by
+`fakeMinter` (canned `[]mintResult`, counts calls, records the relayed CSRs) and
+`minterFunc`. A harness drives minting entirely through these — no live ssh needed.
 
 ---
 
@@ -467,8 +512,17 @@ through these — no live ssh needed.
 
 Protocol v2, newline-delimited JSON, one typed envelope per line
 (`desktop_protocol.go:15`). Directions: app→agent `hello`, `approval_response`,
-`pong`, `token.get`; agent→app `hello_ack`, `approval_request`, `event`, `ping`,
-`token.response`.
+`pong`, `token.get`, `credential.get`; agent→app `hello_ack`, `approval_request`,
+`event`, `ping`, `token.response`, `credential.response`.
+
+**Version skew is handled by capability, not by `v`.** `v` is stamped on every frame
+and never checked on receive, and bumping it would break the very pairing it is meant
+to describe — shed-desktop and shed-host-agent ship separately, so every combination
+of versions runs in the field. The agent instead names what it answers, in
+`hello_ack.agent_capabilities` (§8.1), and the app checks before sending an optional
+message. An agent too old to know a message does not reject it, it drops it, so
+without the advertisement a mismatch would surface as a request timeout rather than a
+sentence naming what to upgrade.
 
 ### 8.1 Handshake (`desktop_server.go:208`)
 - New conn must send a `hello` within **2s** (read deadline), else the conn is dropped (`desktop_server.go:216`). A first line whose `type != "hello"` → dropped.
@@ -478,9 +532,17 @@ Protocol v2, newline-delimited JSON, one typed envelope per line
   "agent": { "version":<build>, "approval_method":"shed-desktop" },
   "namespaces": ["ssh-agent","aws-credentials","docker-credentials","egress"],
   "gate_namespaces": [...],           // == desktopGateNamespaces(cfg)
+  "agent_capabilities": ["credential.get"],  // omitempty — see below
   "request_timeout_ms": <timeout ms>,
   "accepted": true }
 ```
+- `agent_capabilities` is **omitempty**, and its ABSENCE is load-bearing: that is exactly
+  what an agent predating capability advertisement emits, and what a new app turns into
+  "upgrade shed-host-agent". It is absent, never `null` and never `[]` — a third state
+  nobody reads. (Contrast `namespaces`/`gate_namespaces`, which are non-omitempty and so
+  marshal as `null` when nil.)
+- The **superseded** ack (`accepted:false`) carries no capabilities either: it is a bare
+  `helloAckMsg{}` (§8.2), so the key is absent there too.
 - `hello.client{name,version,pid}` is stored and surfaced in status (`client_name`/`client_version`).
 - `hello.replay_events` (int) drives replay (§8.4).
 
@@ -517,6 +579,43 @@ Protocol v2, newline-delimited JSON, one typed envelope per line
   "token":<...>(omitempty), "expires_at":<...>(omitempty), "error":<...>(omitempty) }
 ```
 - `nil controlTokens` → `error:"control-token minting is not available"`. Mint error → `error:<msg>`, token/expires_at empty (**fail closed, never a partial token**). Success → token + (non-zero) expiry. Backed by `controlTokenProvider` (§7.3).
+- **FROZEN at bearer tokens, and the request carries NO `csr=`.** This is the message every
+  shipped app knows, and a certificate cannot be delivered through a `token.response`.
+  Against a server whose entry records `auth_mode: mtls` the agent therefore answers with
+  an explicit error naming the component to upgrade — `server %q issues client
+  certificates (auth.mode: mtls); this shed-desktop is too old to use one — upgrade the
+  app` (`controltoken.go:errDesktopTooOldForMTLS`) — **before** any SSH round-trip, and
+  never a certificate the app cannot present.
+
+### 8.6b credential.get → credential.response (`handleCredentialGet`)
+
+The mode-agnostic successor to `token.get`, and a SEPARATE message rather than a widened
+one. Silently extending `token.get` would leave a new app unable to tell "the server is in
+token mode" from "the agent is old", and would let a new agent answer an old app with a
+`token.response` carrying no token — which decodes fine and fails later.
+
+- Inbound `credential.get{type,id,server,csr?}`, handled in its own goroutine.
+- `csr` is standard-base64 PKCS#10 DER **generated by the APP**. Only the request crosses
+  the socket; the private key that will pair with the issued certificate never leaves the
+  app process (plan 001 §D6). The agent passes it through **verbatim** as the bootstrap's
+  `csr=` argument — it does not parse, re-encode, or substitute one. `csr` is optional
+  (`omitempty`); absent means the bootstrap sends no `csr=` argument at all (**not** an
+  empty one, which the server rejects).
+- Reply:
+```jsonc
+{ "v":2, "type":"credential.response", "id":<uuid>, "ts":<rfc3339>,
+  "in_reply_to": <req.id>, "server": <req.server>,
+  "auth_mode":"token"|"mtls"(omitempty),
+  "token":<...>(omitempty),        // token mode only
+  "client_cert":<PEM>(omitempty),  // mtls mode only
+  "cert_serial":<hex>(omitempty), "expires_at":<...>(omitempty),
+  "error":<...>(omitempty) }
+```
+- `auth_mode` names which shape is populated, so the app never infers the mode from which
+  field happens to be non-empty. **Never both**; on error, **neither** (fail closed).
+- `nil` credential provider → `error:"control-credential minting is not available"`.
+- Go: `MintRelayed` → `sdkbootstrap.RunWithCSR` (the relay entry point — it validates the
+  bundle's SHAPE but not against a private key, because this side does not have one).
 
 ### 8.7 Frame safety
 - 1 MiB per-line cap (`maxFrameBytes`, `:19`); 5s write deadline per frame (`consumerWriteTimeout`, `:107`); 10s server→app `ping` keepalive; `pong` is liveness-only.

@@ -7,20 +7,25 @@ The `shed-server` exposes a REST API for managing sheds.
 !!! note "Authentication"
     In `auth.mode: open` (the default) the API has no authentication — security
     relies on a trusted network (Tailscale, firewall rules). In `auth.mode:
-    secure` every request needs an `Authorization: Bearer <token>` header of the
+    token` every request needs an `Authorization: Bearer <token>` header of the
     required scope, except the bootstrap endpoints `GET /api/info` and
-    `GET /api/ssh-host-key`. The credential bus (`/api/plugins/*`) requires the
-    `credentials` scope; the Connect tunnel
+    `GET /api/ssh-host-key`. In `auth.mode: mtls` every request instead needs a
+    client certificate of the required scope presented at the TLS handshake
+    (`RequireAndVerifyClientCert`) — an unauthenticated peer never reaches the
+    router at all, so `GET /api/info` and `GET /api/ssh-host-key` are moot
+    (unreachable pre-certificate) rather than exempt. The credential bus
+    (`/api/plugins/*`) requires the `credentials` scope; the Connect tunnel
     (`/api/sheds/{name}/connect/{port}`) and the egress audit stream
     (`/api/egress/stream`) accept **either** `control` or `credentials`;
-    everything else needs `control`. Tokens are **not** issued over HTTP —
-    they are minted over the SSH `_bootstrap` channel (see
+    everything else needs `control`. Neither a bearer token nor a client
+    certificate is ever issued over plain HTTP —
+    both are minted/issued over the SSH `_bootstrap` channel (see
     [Authentication](#authentication)). See [Security](security.md) for the full
     model and pinned TLS.
 
 ## Authentication
 
-In `secure` mode the HTTP API is token-gated, but tokens are **not** issued over
+In `token` mode the HTTP API is token-gated, but tokens are **not** issued over
 HTTP. A client mints one over a reserved **`_bootstrap` SSH channel**:
 
 1. Connect to the SSH port as user `_bootstrap` over the pinned host key.
@@ -53,6 +58,38 @@ unknown token gets `401`; clients refresh transparently near expiry and retry
 once on a `401`. Removing a key from the SSH allowlist purges every token minted
 for it on the next authoritative refresh. See
 [Security › HTTP tokens are minted over SSH](security.md#http-tokens-are-minted-over-ssh).
+
+### mtls mode
+
+In `mtls` mode the same `_bootstrap` channel issues a **client certificate**
+instead of a token: the client appends a CSR to the request line
+(`"<scope> [<kind>] csr=<base64(std, DER)>"`), and the server's internal CA
+signs it, composing the subject entirely from authenticated knowledge (the
+SSH key fingerprint, the requested scope/kind) — any subject fields, SANs, or
+extensions in the CSR itself are ignored. The bundle carries a certificate
+instead of a token:
+
+```json
+{
+  "auth_mode": "mtls",
+  "https_port": 8443,
+  "tls_cert_fingerprint": "sha256:…",
+  "client_cert": "-----BEGIN CERTIFICATE-----\n…",
+  "scope": "control",
+  "cert_serial": "…",
+  "expires_at": "2026-06-15T00:00:00Z"
+}
+```
+
+There is no `Authorization: Bearer` request in mtls mode — the certificate is
+presented at the TLS handshake and **re-validated on every request**
+(expiry, live SSH allowlist membership, and scope), giving it the same
+revocation-lands-on-the-next-request property as tokens. A bootstrap request
+with no `csr=` argument against an mtls-mode server fails with an explicit
+`this server requires auth.mode: mtls; upgrade shed (client certificate
+support)` error rather than a silent fallback. See [Security › mTLS
+mode](security.md#mtls-mode) for the full guarantee and the accepted
+limitations.
 
 ## Endpoints
 
@@ -94,7 +131,7 @@ for it on the next authoritative refresh. See
 
 Returns server metadata and capabilities.
 
-**Response:**
+**Response (open or token mode):**
 
 ```json
 {
@@ -103,13 +140,54 @@ Returns server metadata and capabilities.
   "ssh_port": 2222,
   "http_port": 8080,
   "backend": "vz",
-  "auth_mode": "secure"
+  "auth_mode": "token"
+}
+```
+
+**Response (mtls mode) — reachable only by a client that already presents a
+valid certificate, since the listener runs `RequireAndVerifyClientCert`:**
+
+```json
+{
+  "name": "mini-desktop",
+  "version": "1.0.0",
+  "ssh_port": 2222,
+  "backend": "vz",
+  "auth_mode": "mtls",
+  "ca_fingerprint": "sha256:…",
+  "ca_not_after": "2036-06-15T00:00:00Z"
 }
 ```
 
 The `backend` field reflects the resolved backend for this server (`vz` or `firecracker`). When the server is configured with `default_backend: detect`, this field shows the auto-detected value.
 
-`auth_mode` is `open` or `secure`. This endpoint is reachable without a token (it is bootstrap-exempt) so `shed server add` can read the mode and ports before the client holds one — in `secure` mode it then mints a token over SSH.
+`ca_fingerprint` / `ca_not_after` are present **only in mtls mode** — the
+internal CA's fingerprint and expiry, so `shed server info`-style tooling can
+surface CA state (see [Security › CA rotation](security.md#accepted-limitations)).
+
+!!! warning "The wire contract: `auth_mode` reports `"secure"` for token mode"
+    This field's *effective* values are `open`, `token`, and `mtls`, but the
+    **wire spelling for token mode is the legacy `"secure"`**, not `"token"`.
+    A released pre-rename client decides whether to bootstrap a credential at
+    all by checking the literal string `"secure"`; reporting `"token"` here
+    would make that client skip bootstrapping and save a credential-less
+    entry that 401s on every command forever. So the server deliberately
+    keeps reporting `"secure"` for token mode on this one wire surface
+    indefinitely (`config.LegacyWireAuthMode`), and every current client
+    normalizes `"secure"` back to `"token"` on decode
+    (`config.NormalizeAuthMode`) before comparing it against anything. `open`
+    and `mtls` pass through unchanged — `open` predates the rename, and an
+    mtls-mode `/api/info` is certificate-gated, so no pre-rename client can
+    ever observe it. If you are parsing this field yourself, treat `"secure"`
+    and `"token"` as the same value.
+
+This endpoint is reachable without a credential in `open` and `token` mode
+(it is bootstrap-exempt) so `shed server add` can read the mode and ports
+before the client holds one. In `mtls` mode it is **not** exempt in practice
+— the TLS handshake itself requires a certificate, so an un-enrolled client
+can never reach this endpoint at all; `shed server add` instead learns the
+mode from the `_bootstrap` SSH bundle's `auth_mode` field (see
+[Authentication](#authentication)).
 
 ### GET /api/ssh-host-key
 
@@ -926,7 +1004,7 @@ After the 101 response, the connection becomes a bidirectional byte stream to th
 | 502 | `CONNECT_FAILED` | Could not connect to the port (service not running) |
 | 503 | `SHED_NOT_RUNNING` | Shed is not running |
 
-**Security:** In `open` mode the Connect API relies on network-level trust (Tailscale, firewall) like the rest of the API; in `secure` mode it requires a bearer token of the `control` **or** `credentials` scope over pinned TLS. It connects to the VM's loopback interface and does not support arbitrary destinations.
+**Security:** In `open` mode the Connect API relies on network-level trust (Tailscale, firewall) like the rest of the API; in `token` mode it requires a bearer token of the `control` **or** `credentials` scope over pinned TLS. It connects to the VM's loopback interface and does not support arbitrary destinations.
 
 **Consumers:**
 

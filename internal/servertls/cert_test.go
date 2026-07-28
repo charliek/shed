@@ -164,7 +164,7 @@ func TestPinnedClientConfig(t *testing.T) {
 		t.Fatalf("generate other cert: %v", err)
 	}
 
-	cfg := PinnedClientConfig(Fingerprint(goodDER))
+	cfg := PinnedClientConfig(Fingerprint(goodDER), nil)
 
 	// The config must keep the self-signed trust model intact: skip the default
 	// CA/hostname chain check (the cert is its own anchor) but floor the version

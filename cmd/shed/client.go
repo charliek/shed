@@ -4,12 +4,16 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/tls"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -18,6 +22,7 @@ import (
 	"github.com/charliek/shed/internal/clienttoken"
 	"github.com/charliek/shed/internal/config"
 	"github.com/charliek/shed/internal/servertls"
+	"github.com/charliek/shed/sdk"
 )
 
 // DefaultTimeout for quick API operations (list, stop, delete, etc.)
@@ -29,33 +34,83 @@ type APIClient struct {
 	httpClient    *http.Client
 	transport     http.RoundTripper // non-nil when TLS-pinned; shared by every client below
 	createTimeout time.Duration
-	// tokens holds the bearer token and, in secure mode, transparently re-mints
-	// it (proactively near expiry, reactively on a 401). Static for open servers,
+	// tokens holds the client's credential — a bearer token or a client
+	// certificate — and transparently re-mints it (proactively near expiry,
+	// reactively on an auth-shaped failure). Static for open servers,
 	// plain-HTTP clients, and legacy fixed tokens. Never nil.
+	//
+	// The transport above is built ONCE from this source and never rebuilt: the
+	// certificate is fetched per handshake via GetClientCertificate, so a
+	// rotation — or a token↔mtls mode flip — changes what is presented without
+	// touching the transport or its connection pool.
 	tokens *clienttoken.Source
 }
 
-// setAuth adds the bearer token header when the client has a non-empty token.
-func (c *APIClient) setAuth(req *http.Request) {
-	if tok := c.tokens.Token(); tok != "" {
+// pinCredential stamps cred onto req as the ONE credential this attempt will
+// transmit, through both channels a request can carry one:
+//
+//   - the Authorization header, in token state (in mtls state it adds nothing —
+//     the credential travels in the handshake and the server's mtls middleware
+//     never reads the header);
+//   - the request context, which the TLS stack hands back to the transport's
+//     GetClientCertificate during the handshake (see clienttoken.WithPinned).
+//
+// Taking BOTH from one captured value is what makes the generation a caller
+// records the generation it actually sends. Reading the live Source separately
+// in each place leaves a window in which a concurrent re-mint lands between
+// them, and the reactive retry then re-sends the credential the server just
+// rejected — Refresh treats the recorded generation as already superseded and
+// skips the mint that would have fixed it.
+//
+// It returns the request to use: attaching a context produces a shallow copy,
+// so the caller MUST send the returned one.
+func pinCredential(req *http.Request, cred clienttoken.Credential) *http.Request {
+	req = req.WithContext(clienttoken.WithPinned(req.Context(), cred))
+	if tok := cred.BearerToken(); tok != "" {
 		req.Header.Set("Authorization", "Bearer "+tok)
+	}
+	return req
+}
+
+// setAuth pins the client's CURRENT credential onto a request that has no
+// re-auth retry wrapped around it (the long-timeout and streaming paths that
+// build their own client). Those cannot act on a rejection anyway, so capturing
+// at send time is all there is to do — but they still go through one atomic
+// capture, so header and handshake agree.
+func (c *APIClient) setAuth(req *http.Request) *http.Request {
+	cred, _ := c.tokens.Current()
+	return pinCredential(req, cred)
+}
+
+// closeIdleConnections drops pooled keep-alive connections on the pinned
+// transport.
+//
+// It is called after a re-mint, and it is not an optimization. A pooled
+// connection was authenticated with the OLD certificate at handshake time;
+// reusing it would replay the credential the server just rejected, so the retry
+// would fail exactly as the original request did. Forcing a fresh handshake is
+// what makes "re-mint, then retry once" actually retry with the new credential.
+// (In token state the header is per-request, so this is merely harmless.)
+func (c *APIClient) closeIdleConnections() {
+	if t, ok := c.transport.(*http.Transport); ok {
+		t.CloseIdleConnections()
 	}
 }
 
-// currentToken returns the client's current in-memory bearer (control) token. It
-// may have been re-minted since construction — proactively near expiry or
-// reactively on a 401 — even when persisting the refresh back to config was
-// skipped (ambiguous alias) or failed. The tunnel path reads it so a forwarded
-// connection dials with the freshest token rather than the possibly-stale one in
-// the config entry.
+// currentToken returns the client's current in-memory bearer (control) token,
+// or "" in mtls state. It may have been re-minted since construction —
+// proactively near expiry or reactively on an auth failure — even when
+// persisting the refresh back to config was skipped (ambiguous alias) or
+// failed. The tunnel path reads it so a forwarded connection dials with the
+// freshest token rather than the possibly-stale one in the config entry.
 func (c *APIClient) currentToken() string {
 	return c.tokens.Token()
 }
 
-// TokenSource returns the client's token source, so a long-lived consumer (the
-// tunnel daemon) can seed its own Source from the freshly-refreshed token+expiry
-// this client obtained during setup.
-func (c *APIClient) TokenSource() *clienttoken.Source {
+// CredentialSource returns the client's credential source, so a long-lived
+// consumer (the tunnel daemon) can seed its own Source from the
+// freshly-refreshed credential this client obtained during setup.
+func (c *APIClient) CredentialSource() *clienttoken.Source {
 	return c.tokens
 }
 
@@ -67,137 +122,378 @@ func (c *APIClient) newHTTPClient(timeout time.Duration) *http.Client {
 	return &http.Client{Timeout: timeout, Transport: c.transport}
 }
 
-// pinnedTransport returns a transport that verifies the server's leaf cert
-// against the pinned "sha256:<hex>" fingerprint instead of a CA chain, or nil
-// when there is no pin (plain HTTP). It delegates to servertls.PinnedTransport
-// so the CLI, the Connect tunnel, and the startup probe build the pinned
-// transport identically from one place.
-func pinnedTransport(fingerprint string) http.RoundTripper {
-	return servertls.PinnedTransport(fingerprint)
-}
-
 // NewAPIClient creates a plain-HTTP API client for the given host and port
 // (the bootstrap path, before any TLS pin is known).
+//
+// host:port is joined with net.JoinHostPort, not printf: an IPv6 literal has to
+// be bracketed or the result is not a parseable URL, and this constructor is on
+// the open-mode add path where the host comes straight from the command line.
 func NewAPIClient(host string, port int, createTimeout time.Duration) *APIClient {
-	return newAPIClient(fmt.Sprintf("http://%s:%d", host, port), "", "", createTimeout)
+	return newAPIClient("http://"+net.JoinHostPort(host, strconv.Itoa(port)), "", "", createTimeout)
 }
 
-// newAPIClient is the shared constructor: an explicit base URL, an optional
-// bearer token, and an optional TLS pin fingerprint.
+// newAPIClient is the shared constructor for a client with a STATIC credential:
+// an explicit base URL, an optional bearer token, and an optional TLS pin.
 func newAPIClient(baseURL, token, tlsFingerprint string, createTimeout time.Duration) *APIClient {
+	return newAPIClientWithSource(baseURL, tlsFingerprint, clienttoken.Static(token), createTimeout)
+}
+
+// newAPIClientWithSource is the real constructor: it builds the pinned
+// transport around src (via servertls, so the CLI, the Connect tunnel, and the
+// startup probe all verify identically) so the TLS stack pulls the current
+// client certificate from it per handshake. An empty fingerprint yields a nil
+// transport — the plain-HTTP path.
+//
+// Order matters here. The source is created BEFORE the transport and never
+// swapped afterwards, so the GetClientCertificate closure has a stable target
+// and no request can observe a half-installed credential.
+func newAPIClientWithSource(baseURL, tlsFingerprint string, src *clienttoken.Source, createTimeout time.Duration) *APIClient {
 	c := &APIClient{
 		baseURL:       strings.TrimRight(baseURL, "/"),
-		transport:     pinnedTransport(tlsFingerprint),
+		transport:     servertls.PinnedTransport(tlsFingerprint, src.CertificateFor),
 		createTimeout: createTimeout,
-		tokens:        clienttoken.Static(token),
+		tokens:        src,
 	}
 	c.httpClient = c.newHTTPClient(DefaultTimeout)
 	return c
 }
 
-// NewAPIClientFromEntry creates an API client from a server entry, honoring its
-// api_url/TLS pin and control token. When the entry carries a bootstrap-minted
-// control token (ControlTokenExpiresAt non-zero), the client transparently
-// re-mints it over SSH — proactively before expiry and reactively on a 401 —
-// persisting it back to the config entry it came from.
+// NewAPIClientFromEntry creates an API client from an entry whose config name is
+// not available to the caller. It preserves the historical single-match
+// behavior by inferring the name from the endpoint. When there is no unique
+// match, refresh still works for this client's lifetime but is not persisted.
+//
+// Callers that already resolved a server name must use
+// NewAPIClientFromNamedEntry instead. Endpoint matching cannot distinguish two
+// aliases for the same server, while the selected/map-key name can.
 func NewAPIClientFromEntry(entry *config.ServerEntry, createTimeout time.Duration) *APIClient {
-	c := newAPIClient(entry.BaseURL(), entry.ControlToken, entry.TLSCertFingerprint, createTimeout)
-	if entry.ControlTokenExpiresAt.IsZero() {
-		return c // static/legacy token or open server — no refresh
+	name, matches := matchingServerName(entry)
+	reason := ""
+	switch {
+	case matches == 0:
+		reason = "no configured server matches this entry"
+	case matches > 1:
+		reason = "multiple configured server aliases match this endpoint"
 	}
-	// Resolve which config entry this is, so a refreshed token can be persisted.
-	// "" means no unambiguous match (a one-off entry, or duplicate aliases to the
-	// same endpoint) — the refresh still works for this client's lifetime, it
-	// just isn't saved.
-	name := serverNameForEntry(entry)
-	c.tokens = clienttoken.New(entry.ControlToken, entry.ControlTokenExpiresAt,
-		controlTokenRefresh(entry.Host, entry.SSHPort, name))
-	// Proactively re-mint a near-expiry token so a request never races expiry. A
-	// mint failure here is non-fatal (EnsureFresh keeps the stale token); the
-	// reactive 401-retry surfaces any error on the next request.
-	c.tokens.EnsureFresh()
+	return newAPIClientFromEntry(entry, name, reason, createTimeout)
+}
+
+// NewAPIClientFromNamedEntry creates an API client for the named config entry.
+// name is authoritative: it is the alias selected by --server/default
+// resolution or the map key being iterated, so duplicate endpoint aliases still
+// persist refreshed credentials to the entry the command is actually using.
+//
+// The endpoint identity is checked against the current config before name is
+// trusted. A stale or incorrect caller must never write a credential to the
+// wrong alias; on mismatch the client remains usable in memory and a successful
+// mint reports the persistence skip under -v.
+func NewAPIClientFromNamedEntry(name string, entry *config.ServerEntry, createTimeout time.Duration) *APIClient {
+	persistName, reason := verifiedServerName(name, entry)
+	return newAPIClientFromEntry(entry, persistName, reason, createTimeout)
+}
+
+func newAPIClientFromEntry(entry *config.ServerEntry, persistName, unpersistedReason string, createTimeout time.Duration) *APIClient {
+	initial, refreshable := entryCredential(entry, persistName)
+	if !refreshable {
+		// Static/legacy token or open server — no refresh wiring, exactly as
+		// before client certificates existed.
+		return newAPIClient(entry.BaseURL(), entry.ControlToken, entry.TLSCertFingerprint, createTimeout)
+	}
+	refresh := controlCredentialRefresh(entry.Host, entry.SSHPort, persistName)
+	if unpersistedReason != "" {
+		refresh = observableMintOnlyRefresh(entry.Host, unpersistedReason, refresh)
+	}
+	src := clienttoken.New(initial, refresh)
+	c := newAPIClientWithSource(entry.BaseURL(), entry.TLSCertFingerprint, src, createTimeout)
+	// Proactively re-mint a near-expiry credential so a request never races
+	// expiry. A mint failure here is non-fatal (EnsureFresh keeps the stale
+	// credential); the reactive retry surfaces any error on the next request.
+	src.EnsureFresh()
 	return c
 }
 
-// controlTokenRefresh returns a refresh callback that mints a control token over
-// the SSH bootstrap channel and, when persistName != "", best-effort persists it
-// to that config entry. It is shared by NewAPIClientFromEntry (persisting) and
-// the tunnel daemon (persistName "" — mint-only, so a long-lived daemon never
-// rewrites the user's config from its own stale in-memory copy).
-func controlTokenRefresh(host string, sshPort int, persistName string) func() (string, time.Time, error) {
-	return func() (string, time.Time, error) {
-		bundle, err := bootstrapFn(host, sshPort, "control", "cli")
+// observableMintOnlyRefresh makes an accidental persistence skip visible while
+// preserving the best-effort contract: the freshly minted credential is still
+// returned and the command still succeeds. The tunnel daemon deliberately uses
+// controlCredentialRefresh(..., "") directly, without this wrapper, because
+// its mint-only policy is intentional rather than a name-resolution failure.
+func observableMintOnlyRefresh(host, reason string, refresh func() (clienttoken.Credential, error)) func() (clienttoken.Credential, error) {
+	return func() (clienttoken.Credential, error) {
+		cred, err := refresh()
+		if err == nil && verboseLevel > 0 {
+			fmt.Fprintf(os.Stderr, "warning: refreshed credential for %s was not persisted: %s\n", host, reason)
+		}
+		return cred, err
+	}
+}
+
+// entryCredential reads a server entry's stored credential into the Source's
+// shape and reports whether it is one the client should re-mint.
+//
+// The mtls branch is checked first and gated on the recorded auth_mode, so an
+// entry that still has stale certificate files from before a flip back to token
+// mode does not present them. A certificate that fails to load is NOT an error:
+// it degrades to "refreshable with no usable credential", which EnsureFresh
+// mints for before the first request goes out. Failing hard would leave the user
+// with an unusable entry and no way back short of deleting files by hand.
+//
+// The same reasoning covers an entry with NO credential recorded at all. That is
+// not necessarily an open server — it is also what a secure server's entry looks
+// like after a pre-mtls client loaded and re-saved config.yaml, silently
+// dropping every key its ServerEntry struct predates (auth_mode,
+// client_cert_file, client_key_file, client_cert_expires_at). Both binaries
+// being present is normal during an upgrade, so this shape is expected, and
+// ServerEntry.NeedsEnrollment is what tells the two apart: an https entry with
+// nothing to present enrolls, a plain-HTTP (open) one stays static and pays no
+// SSH round-trip. Read as "open" the secure case fails forever — the client
+// holds no credential to be rejected, so the reactive re-mint has nothing to
+// fire on, and every invocation dies at the same TLS `certificate required`.
+func entryCredential(entry *config.ServerEntry, name string) (cred clienttoken.Credential, refreshable bool) {
+	if entry.IsMTLS() {
+		cert, err := loadClientCert(entry, name)
+		if err != nil && verboseLevel > 0 {
+			fmt.Fprintf(os.Stderr, "warning: could not load client certificate for %s (re-enrolling): %v\n", entry.Host, err)
+		}
+		if cert != nil {
+			return clienttoken.MTLSCredential(cert, entry.ClientCertExpiresAt), true
+		}
+		// No usable certificate — refreshable, holding nothing. EnsureFresh
+		// enrolls on that (Credential.Usable), so no fake expiry is needed.
+		return clienttoken.Credential{Mode: clienttoken.ModeMTLS}, true
+	}
+	if entry.ControlTokenExpiresAt.IsZero() {
+		// Either an open server / legacy static token (static, as always), or a
+		// secure entry stripped of its credential (enroll — holding nothing, so
+		// EnsureFresh mints before the first request).
+		return clienttoken.Credential{}, entry.NeedsEnrollment()
+	}
+	return clienttoken.TokenCredential(entry.ControlToken, entry.ControlTokenExpiresAt), true
+}
+
+// loadClientCert reads the entry's client certificate + key off disk, under the
+// named server's credential lock so a concurrent rotation is never observed
+// half-committed. A missing path or an unreadable/mismatched pair returns
+// (nil, err) — see entryCredential for why that is recoverable rather than
+// fatal. name may be "" (an ambiguous or one-off entry), which loads unlocked:
+// nothing writes that entry either, so there is nothing to serialize against.
+func loadClientCert(entry *config.ServerEntry, name string) (*tls.Certificate, error) {
+	if entry.ClientCertFile == "" || entry.ClientKeyFile == "" {
+		return nil, errors.New("no client certificate on file")
+	}
+	return config.LoadClientCredentials(name, entry.ClientCertFile, entry.ClientKeyFile)
+}
+
+// controlCredentialRefresh returns a refresh callback that mints a control
+// credential over the SSH bootstrap channel and, when persistName != "",
+// best-effort persists it to that config entry. It is shared by
+// the entry-based API clients (persisting) and the tunnel daemon (persistName "" —
+// mint-only, so a long-lived daemon never rewrites the user's config from its
+// own stale in-memory copy).
+//
+// The bootstrap always submits a CSR, so the server answers in whatever mode it
+// is actually in. Whichever comes back is adopted here AND written to the
+// stored entry — that write is the mode-flip migration, and it runs in both
+// directions.
+func controlCredentialRefresh(host string, sshPort int, persistName string) func() (clienttoken.Credential, error) {
+	return func() (clienttoken.Credential, error) {
+		res, err := bootstrapCredentialFn(host, sshPort, "control", "cli")
 		if err != nil {
-			return "", time.Time{}, err
+			return clienttoken.Credential{}, err
+		}
+		if res.Mode() == sdk.AuthModeMTLS {
+			return adoptMTLSCredential(res, persistName)
 		}
 		if persistName != "" {
 			// Best-effort: a Save failure never wastes the mint or fails the
 			// request (the next process just re-mints).
-			persistControlToken(persistName, bundle.Token, bundle.ExpiresAt)
+			persistTokenCredential(persistName, res.Bundle.Token, res.Bundle.ExpiresAt)
 		}
-		return bundle.Token, bundle.ExpiresAt, nil
+		return clienttoken.TokenCredential(res.Bundle.Token, res.Bundle.ExpiresAt), nil
 	}
 }
 
+// adoptMTLSCredential turns a freshly issued certificate into a usable
+// credential and, when the entry is unambiguous, persists the pair to the creds
+// dir + the config entry.
+//
+// A persist failure is NOT fatal to the mint. The in-memory certificate is
+// valid and the current command should proceed on it; the next process simply
+// re-enrolls. That mirrors the token path exactly — the alternative (failing the
+// user's command because a file write failed) trades a working request for a
+// tidy disk.
+func adoptMTLSCredential(res sdk.Credential, persistName string) (clienttoken.Credential, error) {
+	cert, err := tls.X509KeyPair([]byte(res.Bundle.ClientCert), res.KeyPEM)
+	if err != nil {
+		return clienttoken.Credential{}, fmt.Errorf("assemble issued client certificate: %w", err)
+	}
+	if persistName != "" {
+		persistMTLSCredential(persistName, res)
+	}
+	return clienttoken.MTLSCredential(&cert, res.Bundle.ExpiresAt), nil
+}
+
 // configMu serializes refresh-path access to the shared clientConfig global —
-// the serverNameForEntry lookup and the token persist (map write + Save). The
+// the server-name lookup and credential persist (map write + Save). The
 // `--all` fan-out (forEachServer) constructs clients, and thus refreshes,
 // concurrently across goroutines; without this, two near-expiry refreshes would
 // race on the Servers map (a fatal "concurrent map writes") and clobber each
 // other's config.yaml save.
 var configMu sync.Mutex
 
-// persistControlToken writes a freshly re-minted control token back to the named
-// config entry and saves. It is best-effort: name == "" (no unambiguous config
-// entry) is a no-op, and a Save failure is warned-but-not-fatal — the token is
-// already valid in memory, so the command proceeds and the next process re-mints
-// rather than the request failing. configMu serializes the map write + Save
-// against concurrent refreshes from the `--all` fan-out.
-func persistControlToken(name, token string, expiresAt time.Time) {
+// persistTokenCredential writes a freshly re-minted control token back to the
+// named config entry and saves. It is best-effort: name == "" (no unambiguous
+// config entry) is a no-op, and a Save failure is warned-but-not-fatal — the
+// token is already valid in memory, so the command proceeds and the next
+// process re-mints rather than the request failing. The write goes through
+// saveServerEntry, which holds configMu against the `--all` fan-out.
+//
+// It also completes the mtls→token half of a mode flip: an entry that used to
+// hold a certificate has its cert fields cleared and its files deleted, so a
+// server switched back to token mode leaves no private key sitting on disk.
+//
+// The deletion is ORDERED AFTER a successful save, and is skipped when the save
+// fails. Deleting first (or unconditionally) trades one failure for a worse
+// one: the save is best-effort and a full disk or a permission problem leaves
+// config.yaml still naming those files, so removing them would strand the entry
+// pointing at credentials that no longer exist. Keeping them costs an orphaned
+// key only in the case where the config still refers to it — and the next
+// successful save cleans it up.
+func persistTokenCredential(name, token string, expiresAt time.Time) {
 	if name == "" {
 		return
 	}
+	var hadCert bool
+	saveErr := saveServerEntry(name, "refreshed token", func(e *config.ServerEntry) {
+		hadCert = e.AuthMode == config.AuthModeMTLS
+		e.AuthMode = config.AuthModeToken
+		e.ControlToken = token
+		e.ControlTokenExpiresAt = expiresAt
+		e.ClientCertFile, e.ClientKeyFile = "", ""
+		e.ClientCertExpiresAt = time.Time{}
+	})
+	if !hadCert {
+		return
+	}
+	if saveErr != nil {
+		fmt.Fprintf(os.Stderr, "warning: keeping the stale client certificate for %q on disk: "+
+			"the config entry still points at it because the save above failed\n", name)
+		return
+	}
+	// The config is now saved WITHOUT the paths, so a removal failure can only
+	// leave an orphan file — never a config pointing at a deleted one.
+	if err := config.RemoveServerCredentials(name); err != nil {
+		fmt.Fprintf(os.Stderr, "warning: could not remove stale client certificate for %q: %v\n", name, err)
+	}
+}
+
+// persistMTLSCredential writes a freshly issued client certificate + key to the
+// creds dir and points the named config entry at them, completing the
+// token→mtls half of a mode flip (the stale bearer token is cleared — it is
+// dead weight the mtls middleware would never read, and a secret with no
+// remaining purpose).
+//
+// Same best-effort contract as persistTokenCredential: every failure is a
+// warning, because the credential is already usable in memory.
+func persistMTLSCredential(name string, res sdk.Credential) {
+	certPath, keyPath, err := config.WriteClientCredentials(name, []byte(res.Bundle.ClientCert), res.KeyPEM)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "warning: could not store client certificate for %q: %v\n", name, err)
+		return
+	}
+	_ = saveServerEntry(name, "client certificate", func(e *config.ServerEntry) {
+		e.AuthMode = config.AuthModeMTLS
+		e.ClientCertFile = certPath
+		e.ClientKeyFile = keyPath
+		e.ClientCertExpiresAt = res.Bundle.ExpiresAt
+		e.ControlToken = ""
+		e.ControlTokenExpiresAt = time.Time{}
+	})
+}
+
+// saveServerEntry applies mutate to the named config entry and saves, holding
+// configMu across the read-modify-write + Save. Every credential persist goes
+// through here, so the locking discipline the `--all` fan-out depends on lives
+// in exactly one place. what names the credential for the warning a failed Save
+// prints; the failure is never fatal (see persistTokenCredential).
+//
+// It warns AND returns the save error. The warning is the user-facing half and
+// every caller relies on it; the return value exists for the one caller that
+// must not proceed on a failed save — deleting superseded credential files is
+// only safe once the config that stopped referring to them is durable.
+func saveServerEntry(name, what string, mutate func(*config.ServerEntry)) error {
 	configMu.Lock()
 	defer configMu.Unlock()
 	e := clientConfig.Servers[name]
-	e.ControlToken = token
-	e.ControlTokenExpiresAt = expiresAt
+	mutate(&e)
 	clientConfig.Servers[name] = e
 	if err := clientConfig.Save(); err != nil {
-		fmt.Fprintf(os.Stderr, "warning: could not persist refreshed token for %q: %v\n", name, err)
+		fmt.Fprintf(os.Stderr, "warning: could not persist %s for %q: %v\n", what, name, err)
+		return err
 	}
+	return nil
 }
 
 // serverNameForEntry returns the config name whose stored entry UNIQUELY matches
 // e by its stable identity (host + ssh port + api_url), or "" when there is no
 // match (a one-off entry) or more than one (duplicate aliases to the same
-// endpoint). Returning "" on ambiguity is deliberate: a refreshed token is only
-// persisted when the target entry is unambiguous, so it can never be written to
-// the wrong alias. Used so a refreshed token can be written back without
-// threading the name through every call site.
+// endpoint). It is the compatibility fallback for NewAPIClientFromEntry;
+// callers that possess the authoritative alias use NewAPIClientFromNamedEntry.
 //
 // ControlToken is deliberately NOT part of the key: the refresh path rewrites
 // it, so matching on it would make an entry stop matching its own config row
 // after the first re-mint.
 func serverNameForEntry(e *config.ServerEntry) string {
+	name, _ := matchingServerName(e)
+	return name
+}
+
+// matchingServerName is serverNameForEntry plus the match count needed to make
+// a skipped persistence observable without changing the compatibility helper's
+// signature.
+func matchingServerName(e *config.ServerEntry) (string, int) {
 	configMu.Lock()
 	defer configMu.Unlock()
 	match := ""
+	matches := 0
 	for n, se := range clientConfig.Servers {
-		if se.Host == e.Host && se.SSHPort == e.SSHPort && se.APIURL == e.APIURL {
-			if match != "" {
-				return "" // ambiguous — refuse to persist to the wrong alias
-			}
+		if sameServerEndpoint(se, *e) {
+			matches++
 			match = n
 		}
 	}
-	return match
+	if matches != 1 {
+		return "", matches
+	}
+	return match, matches
 }
 
-// sendRequest builds and sends a single JSON request. It is the per-attempt
-// work factored out of doRequest so the 401 path can retry with a refreshed
-// token.
-func (c *APIClient) sendRequest(method, path string, body interface{}) (*http.Response, error) {
+// verifiedServerName accepts a caller-resolved alias only while its current
+// config row still names the same endpoint. This is the guard against a stale
+// entry/name pair persisting a private key under an unrelated alias.
+func verifiedServerName(name string, e *config.ServerEntry) (string, string) {
+	if name == "" {
+		return "", "the caller did not provide a server name"
+	}
+	configMu.Lock()
+	defer configMu.Unlock()
+	stored, ok := clientConfig.Servers[name]
+	if !ok {
+		return "", fmt.Sprintf("configured server %q no longer exists", name)
+	}
+	if !sameServerEndpoint(stored, *e) {
+		return "", fmt.Sprintf("configured server %q no longer matches this endpoint", name)
+	}
+	return name, ""
+}
+
+func sameServerEndpoint(a, b config.ServerEntry) bool {
+	return a.Host == b.Host && a.SSHPort == b.SSHPort && a.APIURL == b.APIURL
+}
+
+// sendRequest builds and sends a single JSON request with cred as its pinned
+// credential. It is the per-attempt work factored out of doRequest so the
+// auth-failure path can retry with a refreshed one.
+func (c *APIClient) sendRequest(method, path string, body interface{}, cred clienttoken.Credential) (*http.Response, error) {
 	var bodyReader io.Reader
 	if body != nil {
 		bodyData, err := json.Marshal(body)
@@ -213,46 +509,112 @@ func (c *APIClient) sendRequest(method, path string, body interface{}) (*http.Re
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
-	c.setAuth(req)
+	req = pinCredential(req, cred)
 	return c.httpClient.Do(req)
 }
 
-// refreshedOn401 is the shared on-401 re-mint for the request paths. When resp is
-// a 401 and the token source can refresh, it closes resp.Body, re-mints the token
-// that failed (sentToken — the generation the caller sent, so a concurrent
-// refresh isn't double-minted), and returns retry=true so the caller re-runs its
-// request exactly once (panel decision #11). A static token (not Refreshable) or
-// a non-401 returns retry=false. Only a failed re-mint returns an error; each
-// caller wraps its own resend error as it sees fit.
-func (c *APIClient) refreshedOn401(resp *http.Response, sentToken string) (retry bool, err error) {
-	if resp.StatusCode != http.StatusUnauthorized || !c.tokens.Refreshable() {
-		return false, nil
+// reauthenticated is the shared reactive re-mint for the request paths.
+//
+// It fires on an AUTH-SHAPED FAILURE, not on a status code: an HTTP 401, or a
+// TLS-level rejection that never produced a response at all (see
+// clienttoken.IsAuthFailure). The second case is what an mtls server's refusal
+// looks like — under TLS 1.3 the server's certificate_required/expired alert
+// surfaces as an error out of http.Client.Do — and it is classified regardless
+// of the mode this client believes it is in, so a server flipped between token
+// and mtls recovers on its own.
+//
+// sentGen is the credential generation the caller actually TRANSMITTED (see
+// pinCredential), so a concurrent refresh isn't double-minted and a rejection
+// is never attributed to the wrong generation. On a re-mint it drops pooled
+// connections, because a keep-alive conn still carries the handshake identity
+// that was just rejected.
+//
+// It returns the credential the retry must use — the freshly minted one, or the
+// current one when a concurrent caller already replaced the rejected
+// generation. A static credential (not Refreshable) or a non-auth outcome
+// returns retry=false. Only a failed re-mint returns an error. Callers reach it
+// through sendWithReauth, which owns the retry-once policy.
+func (c *APIClient) reauthenticated(resp *http.Response, reqErr error, sentGen uint64) (fresh clienttoken.Credential, retry bool, err error) {
+	status := 0
+	if resp != nil {
+		status = resp.StatusCode
 	}
-	_ = resp.Body.Close()
-	if _, rerr := c.tokens.Refresh(sentToken); rerr != nil {
-		return false, fmt.Errorf("re-authenticating after 401: %w", rerr)
+	if !clienttoken.IsAuthFailure(status, reqErr) || !c.tokens.Refreshable() {
+		return clienttoken.Credential{}, false, nil
 	}
-	return true, nil
+	if resp != nil {
+		_ = resp.Body.Close()
+	}
+	fresh, rerr := c.tokens.Refresh(sentGen)
+	if rerr != nil {
+		return clienttoken.Credential{}, false, fmt.Errorf("re-authenticating after %s: %w", authFailureReason(status), rerr)
+	}
+	c.closeIdleConnections()
+	return fresh, true, nil
+}
+
+// authFailureReason names what triggered a re-mint, for the error a failed
+// re-mint produces. It keeps the long-standing "after 401" wording for the
+// token path rather than churning an existing message, and names the TLS case
+// distinctly — the two look nothing alike to a user reading the failure.
+func authFailureReason(status int) string {
+	if status == http.StatusUnauthorized {
+		return "401"
+	}
+	return "a TLS client-certificate rejection"
+}
+
+// sendWithReauth runs send and, on an auth-shaped failure, re-mints and runs it
+// exactly once more. It is the single place the retry policy lives, shared by
+// the doRequest path and the SSE streaming paths that bypass it.
+//
+// The credential and its generation are captured ONCE, atomically, before the
+// first send, and the captured credential is handed to send — which pins it to
+// the request so both the Authorization header and the TLS handshake use that
+// exact value. That is what makes sentGen provably the generation transmitted,
+// and it is load-bearing rather than tidy: if the request could transmit a
+// generation newer than the one recorded, Refresh would see the recorded one as
+// already superseded, skip the re-mint, and the single retry would re-send the
+// credential the server had just rejected.
+//
+// wrapErr shapes the transport error each caller reports (a streaming caller
+// distinguishes a context deadline, for instance). A failed RE-MINT is returned
+// unwrapped: it already says what went wrong, and describing it as a connection
+// failure would send the reader after the wrong problem.
+func (c *APIClient) sendWithReauth(send func(clienttoken.Credential) (*http.Response, error), wrapErr func(error) error) (*http.Response, error) {
+	cred, sentGen := c.tokens.Current()
+	resp, err := send(cred)
+	fresh, retry, rerr := c.reauthenticated(resp, err, sentGen)
+	if rerr != nil {
+		return nil, rerr
+	}
+	if retry {
+		resp, err = send(fresh)
+	}
+	if err != nil {
+		return nil, wrapErr(err)
+	}
+	return resp, nil
+}
+
+// connectFailure is the long-standing wording for a request that never reached
+// the server.
+func connectFailure(err error) error {
+	return fmt.Errorf("failed to connect to server: %w", err)
 }
 
 // doRequest performs an HTTP request with JSON body and response handling. It
 // handles connection errors, status validation, and JSON decoding, and
-// transparently re-mints + retries once on a 401 (an expired bootstrap token).
+// transparently re-mints + retries once on an auth-shaped failure (an expired
+// bootstrap token, or a rejected/expired client certificate).
 func (c *APIClient) doRequest(method, path string, body, result interface{}, expectedStatus ...int) error {
-	sent := c.tokens.Token()
-	resp, err := c.sendRequest(method, path, body)
+	resp, err := c.sendWithReauth(
+		func(cred clienttoken.Credential) (*http.Response, error) {
+			return c.sendRequest(method, path, body, cred)
+		},
+		connectFailure)
 	if err != nil {
-		return fmt.Errorf("failed to connect to server: %w", err)
-	}
-	retry, rerr := c.refreshedOn401(resp, sent)
-	if rerr != nil {
-		return rerr
-	}
-	if retry {
-		resp, err = c.sendRequest(method, path, body)
-		if err != nil {
-			return fmt.Errorf("failed to connect to server: %w", err)
-		}
+		return err
 	}
 	defer resp.Body.Close()
 
@@ -305,7 +667,7 @@ func (c *APIClient) doRequestWithTimeout(method, path string, body, result inter
 		req.Header.Set("Content-Type", "application/json")
 	}
 
-	c.setAuth(req)
+	req = c.setAuth(req)
 
 	// Create a client without a Timeout for long-running requests.
 	// Important: When both http.Client.Timeout and context deadline are set,
@@ -354,6 +716,10 @@ func (c *APIClient) GetInfo() (*config.ServerInfo, error) {
 	if err := c.doRequest(http.MethodGet, "/api/info", nil, &info); err != nil {
 		return nil, err
 	}
+	// Both released servers and current token-mode servers report the legacy
+	// "secure" spelling on this wire (config.LegacyWireAuthMode); normalize
+	// here so every consumer compares against the canonical constants.
+	info.AuthMode = config.NormalizeAuthMode(info.AuthMode)
 	return &info, nil
 }
 
@@ -409,21 +775,32 @@ func (c *APIClient) CreateShedWithProgress(req *config.CreateShedRequest, wantBl
 	if wantBlobProgress {
 		url += "?progress=blob"
 	}
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(bodyData))
-	if err != nil {
-		return nil, fmt.Errorf("failed to create request: %w", err)
-	}
-	httpReq.Header.Set("Content-Type", "application/json")
-	httpReq.Header.Set("Accept", "text/event-stream")
-	c.setAuth(httpReq)
-
+	// Streaming: no client-level timeout, context deadline only — so this
+	// bypasses doRequest and wires its own send through the shared retry
+	// policy (mirrors DeleteShedWithProgress). The credential is re-read per
+	// send so the retry carries the re-minted one; the body is a fresh reader
+	// each time because the first send consumed it.
 	client := c.newHTTPClient(0)
-	resp, err := client.Do(httpReq)
-	if err != nil {
-		if ctx.Err() == context.DeadlineExceeded {
-			return nil, fmt.Errorf("request timed out after %v (use --timeout to increase)", c.createTimeout)
+	send := func(cred clienttoken.Credential) (*http.Response, error) {
+		httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(bodyData))
+		if err != nil {
+			return nil, fmt.Errorf("failed to create request: %w", err)
 		}
-		return nil, fmt.Errorf("failed to connect to server: %w", err)
+		httpReq.Header.Set("Content-Type", "application/json")
+		httpReq.Header.Set("Accept", "text/event-stream")
+		httpReq = pinCredential(httpReq, cred)
+		return client.Do(httpReq)
+	}
+	wrapSendErr := func(err error) error {
+		if ctx.Err() == context.DeadlineExceeded {
+			return fmt.Errorf("request timed out after %v (use --timeout to increase)", c.createTimeout)
+		}
+		return connectFailure(err)
+	}
+
+	resp, err := c.sendWithReauth(send, wrapSendErr)
+	if err != nil {
+		return nil, err
 	}
 	defer resp.Body.Close()
 
@@ -615,41 +992,34 @@ func (c *APIClient) DeleteShedWithProgress(name string, onProgress func(backend.
 	defer cancel()
 
 	// The streaming client (no client-level timeout, context deadline only)
-	// bypasses doRequest, so replicate its send + 401-refresh here. Rebuilding
-	// per send is fine — a DELETE has no body. Delete, unlike create, has no
-	// GetInfo pre-flight to refresh a stale bootstrap token, so this is the only
-	// place a mid-session token expiry gets re-minted.
+	// bypasses doRequest, so replicate its send + reactive re-auth here.
+	// Rebuilding per send is fine — a DELETE has no body. (An earlier version of
+	// this comment claimed create was covered by its GetInfo pre-flight: it is
+	// not. /api/info is bootstrap-EXEMPT in token mode, so it answers 200 with a
+	// stale credential and can never trigger a re-mint. Create wires its own
+	// send through sendWithReauth for exactly that reason.)
 	client := c.newHTTPClient(0)
-	send := func() (*http.Response, error) {
+	send := func(cred clienttoken.Credential) (*http.Response, error) {
 		httpReq, err := http.NewRequestWithContext(ctx, http.MethodDelete, c.baseURL+"/api/sheds/"+name, nil)
 		if err != nil {
 			return nil, fmt.Errorf("failed to create request: %w", err)
 		}
 		httpReq.Header.Set("Accept", "text/event-stream")
-		c.setAuth(httpReq)
-		resp, err := client.Do(httpReq)
-		if err != nil {
-			if ctx.Err() == context.DeadlineExceeded {
-				return nil, fmt.Errorf("request timed out after %v (use --timeout to increase)", c.createTimeout)
-			}
-			return nil, fmt.Errorf("failed to connect to server: %w", err)
+		httpReq = pinCredential(httpReq, cred)
+		return client.Do(httpReq)
+	}
+	// The deadline reads as a timeout, not a connection failure — that wording
+	// predates mtls and is kept.
+	wrapSendErr := func(err error) error {
+		if ctx.Err() == context.DeadlineExceeded {
+			return fmt.Errorf("request timed out after %v (use --timeout to increase)", c.createTimeout)
 		}
-		return resp, nil
+		return connectFailure(err)
 	}
 
-	sent := c.tokens.Token()
-	resp, err := send()
+	resp, err := c.sendWithReauth(send, wrapSendErr)
 	if err != nil {
 		return err
-	}
-	retry, rerr := c.refreshedOn401(resp, sent)
-	if rerr != nil {
-		return rerr
-	}
-	if retry {
-		if resp, err = send(); err != nil {
-			return err
-		}
 	}
 	defer resp.Body.Close()
 
@@ -791,20 +1161,29 @@ func (c *APIClient) PullImageWithProgress(dockerRef, tag, platform string, withL
 	if wantBlobProgress {
 		url += "?progress=blob"
 	}
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(bodyData))
-	if err != nil {
-		return nil, fmt.Errorf("failed to create request: %w", err)
-	}
-	httpReq.Header.Set("Content-Type", "application/json")
-	httpReq.Header.Set("Accept", "text/event-stream")
-	c.setAuth(httpReq)
-
-	resp, err := c.newHTTPClient(0).Do(httpReq)
-	if err != nil {
-		if ctx.Err() == context.DeadlineExceeded {
-			return nil, fmt.Errorf("pull timed out after 30m")
+	// Same shape as CreateShedWithProgress: a streaming send routed through the
+	// shared re-auth policy rather than a bare client.Do.
+	pullClient := c.newHTTPClient(0)
+	send := func(cred clienttoken.Credential) (*http.Response, error) {
+		httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(bodyData))
+		if err != nil {
+			return nil, fmt.Errorf("failed to create request: %w", err)
 		}
-		return nil, fmt.Errorf("failed to connect to server: %w", err)
+		httpReq.Header.Set("Content-Type", "application/json")
+		httpReq.Header.Set("Accept", "text/event-stream")
+		httpReq = pinCredential(httpReq, cred)
+		return pullClient.Do(httpReq)
+	}
+	wrapSendErr := func(err error) error {
+		if ctx.Err() == context.DeadlineExceeded {
+			return fmt.Errorf("pull timed out after 30m")
+		}
+		return connectFailure(err)
+	}
+
+	resp, err := c.sendWithReauth(send, wrapSendErr)
+	if err != nil {
+		return nil, err
 	}
 	defer resp.Body.Close()
 

@@ -1,0 +1,82 @@
+{
+  "_comment": "Plan 002 §7 P9 — language-neutral hello_ack vectors for the desktop credential handshake. Each vector is a hello_ack frame exactly as an agent writes it, plus the capability an app must derive from it. `unsupported` is the OLD-agent signal (the agent_capabilities key is absent, empty, or lists only other capabilities); `supported` requires the literal \"credential.get\" entry. The third app-side state, `unknown`, is deliberately NOT reachable from any frame here: it is the PRE-ACK state (no hello_ack seen yet on this connection), and conflating it with `unsupported` is the §7 P5 bug these vectors exist to prevent. Consumed by desktop/Tests/ShedKitTests/HostAgentCredentialFixtureTests.swift (the Swift client), crates/shed-app/src/host_agent.rs (the Rust client, through the real connection-state machine), and both agent suites (cmd/shed-host-agent/golden_test.go, crates/shed-host-agent/src/desktop_protocol.rs), which additionally assert that the ack THIS build emits is a `supported` one.",
+  "protocol_version": 1,
+  "vectors": [
+    {
+      "name": "old_agent_no_capability_key",
+      "frame": {
+        "v": 2,
+        "type": "hello_ack",
+        "id": "a1",
+        "ts": "2026-07-25T00:00:00Z",
+        "agent": { "version": "v0.7.4", "approval_method": "shed-desktop" },
+        "namespaces": ["ssh-agent", "aws-credentials", "docker-credentials"],
+        "gate_namespaces": ["ssh-agent"],
+        "request_timeout_ms": 25000,
+        "accepted": true
+      },
+      "expected_capability": "unsupported"
+    },
+    {
+      "name": "new_agent_credential_get",
+      "frame": {
+        "v": 2,
+        "type": "hello_ack",
+        "id": "a2",
+        "ts": "2026-07-25T00:00:00Z",
+        "agent": { "version": "v0.8.0", "approval_method": "shed-desktop" },
+        "namespaces": ["ssh-agent", "aws-credentials", "docker-credentials", "egress"],
+        "gate_namespaces": ["ssh-agent"],
+        "agent_capabilities": ["credential.get"],
+        "request_timeout_ms": 25000,
+        "accepted": true
+      },
+      "expected_capability": "supported"
+    },
+    {
+      "name": "empty_capability_list",
+      "frame": {
+        "v": 2,
+        "type": "hello_ack",
+        "id": "a3",
+        "ts": "2026-07-25T00:00:00Z",
+        "namespaces": [],
+        "gate_namespaces": [],
+        "agent_capabilities": [],
+        "request_timeout_ms": 25000,
+        "accepted": true
+      },
+      "expected_capability": "unsupported"
+    },
+    {
+      "name": "only_unrelated_future_capability",
+      "frame": {
+        "v": 2,
+        "type": "hello_ack",
+        "id": "a4",
+        "ts": "2026-07-25T00:00:00Z",
+        "namespaces": [],
+        "gate_namespaces": [],
+        "agent_capabilities": ["credential.subscribe"],
+        "request_timeout_ms": 25000,
+        "accepted": true
+      },
+      "expected_capability": "unsupported"
+    },
+    {
+      "name": "credential_get_among_others",
+      "frame": {
+        "v": 2,
+        "type": "hello_ack",
+        "id": "a5",
+        "ts": "2026-07-25T00:00:00Z",
+        "namespaces": [],
+        "gate_namespaces": [],
+        "agent_capabilities": ["credential.subscribe", "credential.get"],
+        "request_timeout_ms": 25000,
+        "accepted": true
+      },
+      "expected_capability": "supported"
+    }
+  ]
+}

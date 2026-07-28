@@ -4,6 +4,13 @@
 # Exercises: multiple servers (sorted by name), default_server, a control token
 # present + absent, api_url + a mixed-case pin (lowercased), an inline comment,
 # an ignored field (added_at), and an inline empty map `{}` (all-defaults).
+#
+# The `secure` entry additionally carries the mtls credential keys a real entry
+# gets once its server runs `auth.mode: mtls` (plan 001 D6). The server SET is
+# unchanged on purpose: the Swift parser ignores keys it does not model, so its
+# ConfigParityTests keep passing byte-for-byte while the Rust parser asserts the
+# new fields — and `mini2`, which omits `auth_mode` entirely, pins the
+# absent-means-token rule.
 default_server: mini2
 servers:
     mini2:
@@ -18,5 +25,9 @@ servers:
         ssh_port: 2222
         api_url: https://localhost:8443
         tls_cert_fingerprint: SHA256:AABBCC   # mixed case -> lowercased
+        auth_mode: mtls
+        client_cert_file: /Users/dev/.shed/creds/secure/client.crt
+        client_key_file: /Users/dev/.shed/creds/secure/client.key
+        client_cert_expires_at: 2026-07-26T12:00:00Z
     minimal: {}
 sheds: {}

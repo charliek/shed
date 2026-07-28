@@ -57,7 +57,7 @@ func runReset(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	client := NewAPIClientFromEntry(entry, DefaultTimeout)
+	client := NewAPIClientFromNamedEntry(serverName, entry, DefaultTimeout)
 	shed, err := client.ResetShed(name)
 	if err != nil {
 		return fmt.Errorf("failed to reset shed: %w", err)

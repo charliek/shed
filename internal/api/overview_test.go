@@ -296,9 +296,9 @@ func TestOverview_RC0_SkipsEnrichment(t *testing.T) {
 	}
 }
 
-// newSecureRCServer builds a secure-mode server (bearer tokens enforced) backed
+// newTokenModeRCServer builds a token-mode server (bearer tokens enforced) backed
 // by be, with a control and a credentials token minted for scope assertions.
-func newSecureRCServer(t *testing.T, be *rcFakeBackend) (srv *Server, control, credentials string) {
+func newTokenModeRCServer(t *testing.T, be *rcFakeBackend) (srv *Server, control, credentials string) {
 	t.Helper()
 	store := authtoken.NewStore()
 	control, _, err := store.Mint("SHA256:test", authtoken.ScopeControl, authtoken.ClientCLI, time.Hour)
@@ -309,7 +309,7 @@ func newSecureRCServer(t *testing.T, be *rcFakeBackend) (srv *Server, control, c
 	if err != nil {
 		t.Fatalf("mint credentials: %v", err)
 	}
-	srv = NewServer(be, &config.ServerConfig{Name: "test-server", Auth: &config.AuthConfig{Mode: config.AuthModeSecure}}, "", nil, nil)
+	srv = NewServer(be, &config.ServerConfig{Name: "test-server", Auth: &config.AuthConfig{Mode: config.AuthModeToken}}, "", nil, nil)
 	srv.SetTokenStore(store)
 	return srv, control, credentials
 }
@@ -319,7 +319,7 @@ func newSecureRCServer(t *testing.T, be *rcFakeBackend) (srv *Server, control, c
 // accepted (200); an unauthenticated request is 401.
 func TestOverview_Scope(t *testing.T) {
 	be := &rcFakeBackend{} // empty: handler returns 200 with no sheds
-	srv, control, credentials := newSecureRCServer(t, be)
+	srv, control, credentials := newTokenModeRCServer(t, be)
 
 	call := func(token string) int {
 		r := httptest.NewRequest(http.MethodGet, "/api/overview", nil)

@@ -43,6 +43,11 @@ const (
 	// tokenSweepInterval is how often expired HTTP bearer tokens are reaped
 	// from the in-memory store (expired tokens are also dropped on validate).
 	tokenSweepInterval = 10 * time.Minute
+
+	// caExpiryWarnWindow is how much remaining client-CA lifetime triggers a
+	// startup warning. Rotation is a manual, fleet-wide re-enrollment, so the
+	// notice has to arrive long before issuance actually stops.
+	caExpiryWarnWindow = 90 * 24 * time.Hour
 )
 
 // newHTTPServer builds an http.Server with the shared, SSE-safe timeouts.
@@ -54,6 +59,49 @@ func newHTTPServer(addr string, h http.Handler) *http.Server {
 		ReadTimeout:       httpReadTimeout,
 		IdleTimeout:       httpIdleTimeout,
 	}
+}
+
+// buildHTTPSTLSConfig assembles the tls.Config the HTTPS listener runs with.
+// It is the ONE place the client-authentication posture is decided, extracted
+// from runServe so a test can assert on the real production assembly rather
+// than on a hand-built lookalike — if this function stops requiring client
+// certificates in mtls mode, TestBuildHTTPSTLSConfig fails.
+//
+// clientCA is non-nil only in mtls mode (runServe loads it there and nowhere
+// else, and aborts startup if the load fails); authorized is the live
+// SSH-allowlist predicate. In token and open mode the result is a plain
+// server-auth-only config: no ClientAuth, no ClientCAs.
+//
+// Both conditions are required deliberately, and the belt-and-braces costs
+// nothing: an mtls server that somehow reached here with no CA would produce a
+// listener that asks for no certificate — but it would not be open, because the
+// API middleware gates on cfg.MTLSMode() alone and refuses every request that
+// arrives without one.
+//
+// mtls adds three things: trust only the internal CA, require a client
+// certificate that verifies against it, and refuse the handshake outright when
+// the identity that certificate names has left the SSH allowlist.
+//
+// The allowlist check is the FIRST of two, not the only one. A TLS peer's
+// identity is established at the handshake and then held for the life of the
+// connection, so on a pooled keep-alive connection neither expiry nor
+// de-authorization would ever be noticed again — the API middleware re-derives
+// both from the presented certificate on every request, and is the
+// authoritative gate. Checking here as well means a de-authorized client is
+// turned away at the door rather than allowed to open connections and collect
+// 401s. It is installed as VerifyConnection specifically because crypto/tls
+// skips VerifyPeerCertificate on RESUMED sessions (see servertls/clientauth.go).
+func buildHTTPSTLSConfig(cfg *config.ServerConfig, cert tls.Certificate, clientCA *servertls.CA, authorized func(string) bool) *tls.Config {
+	tlsCfg := &tls.Config{
+		Certificates: []tls.Certificate{cert},
+		MinVersion:   tls.VersionTLS12,
+	}
+	if cfg.MTLSMode() && clientCA != nil {
+		tlsCfg.ClientCAs = clientCA.Pool()
+		tlsCfg.ClientAuth = tls.RequireAndVerifyClientCert
+		tlsCfg.VerifyConnection = servertls.AllowlistConnectionVerifier(authorized)
+	}
+	return tlsCfg
 }
 
 // defaultHostKeyPath returns the default path for the SSH host key.
@@ -82,6 +130,15 @@ func tlsCertPaths(cfg *config.ServerConfig, stateDir string) (certPath, keyPath 
 	return certPath, keyPath
 }
 
+// caCertPaths returns the client-CA cert + key file paths, alongside the TLS
+// listener's own material in stateDir. It mirrors tlsCertPaths but takes no
+// config override: the CA is server-internal (it exists only to sign the client
+// certs this server then trusts), so there is no tls_cert_file-style knob for
+// pointing it elsewhere.
+func caCertPaths(stateDir string) (certPath, keyPath string) {
+	return filepath.Join(stateDir, "ca_cert.pem"), filepath.Join(stateDir, "ca_key.pem")
+}
+
 var serveCmd = &cobra.Command{
 	Use:   "serve",
 	Short: "Run the shed server",
@@ -96,11 +153,20 @@ func runServe(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("failed to load config: %w", err)
 	}
 
-	// Secure-mode preflight: refuse to start `auth.mode: secure` without an SSH
-	// key source (an empty enforced allowlist would lock everyone out). Runs
-	// before anything binds; inert in open mode.
-	if err := cfg.PreflightSecure(); err != nil {
-		return fmt.Errorf("secure-mode preflight: %w", err)
+	// Enforced-mode preflight: refuse to start `auth.mode: token` or `mtls`
+	// without an SSH key source (an empty enforced allowlist would lock
+	// everyone out). Runs before anything binds; inert in open mode.
+	if err := cfg.PreflightAuth(); err != nil {
+		return fmt.Errorf("auth preflight: %w", err)
+	}
+
+	// mtls authenticates clients at the TLS handshake, so the HTTPS listener IS
+	// the enforcement point — there is no other listener a client could reach.
+	// Config load defaults https_port in every enforced mode, so this is
+	// unreachable through a validated config; it exists so a hand-built config
+	// (a test, a tool) can never produce an mtls server with nothing enforcing.
+	if cfg.MTLSMode() && !cfg.HTTPSEnabled() {
+		return fmt.Errorf("auth.mode: mtls requires https_port (client certificates are verified at the TLS handshake)")
 	}
 
 	log.Printf("Starting shed-server...")
@@ -111,10 +177,10 @@ func runServe(cmd *cobra.Command, args []string) error {
 
 	// Initialize plugin system (before backends, since backends use the bridge)
 	pluginRegistry := plugin.NewRegistry()
-	// Track pending requests only when HTTP auth is enforced — the /respond
-	// ownership gate is consulted only then, so an unauthenticated server does
-	// no bookkeeping.
-	if cfg.HTTPAuthEnforced() {
+	// Track pending requests only when auth is enforced (token or mtls) — the
+	// /respond ownership gate is consulted only then, so an unauthenticated
+	// open-mode server does no bookkeeping.
+	if cfg.AuthEnforced() {
 		pluginRegistry.EnableOwnershipTracking()
 	}
 	pluginBridge := plugin.NewBridge(pluginRegistry)
@@ -269,11 +335,42 @@ func runServe(cmd *cobra.Command, args []string) error {
 	}
 	hostKey := sshServer.GetHostPublicKey()
 
+	// Client CA (mtls mode only): the internal root that signs the short-lived
+	// client certificates issued over the SSH bootstrap channel, and the trust
+	// anchor the HTTPS listener verifies presented client certificates against.
+	// Loaded — never silently regenerated — from the state dir.
+	var clientCA *servertls.CA
+	if cfg.MTLSMode() {
+		caCertPath, caKeyPath := caCertPaths(filepath.Dir(hostKeyPath))
+		ca, err := servertls.LoadOrGenerateCA(caCertPath, caKeyPath)
+		if err != nil {
+			return fmt.Errorf("client CA: %w", err)
+		}
+		clientCA = &ca
+		notAfter := ca.NotAfter()
+		log.Printf("Client CA fingerprint: %s (expires %s)", ca.Fingerprint(), notAfter.UTC().Format(time.RFC3339))
+		// The CA is issued for a decade and is never rotated automatically —
+		// rotating it invalidates every client certificate fleet-wide, so the
+		// operator has to schedule it. Start saying so with a season's notice.
+		if remaining := time.Until(notAfter); remaining < caExpiryWarnWindow {
+			log.Printf("WARNING: client CA expires in %d days (%s) — rotate it (delete %s and %s, then re-enroll every client) before issuance stops.",
+				int(remaining.Hours()/24), notAfter.UTC().Format(time.RFC3339), caCertPath, caKeyPath)
+		}
+	}
+
 	// Initialize HTTP API server
 	apiServer := api.NewServer(be, cfg, hostKey, pluginRegistry, pluginBridge)
 	apiServer.SetEgressAudit(egressAudit)         // nil-safe: no-op when egress disabled
 	apiServer.SetEgressUserStore(egressUserStore) // nil-safe: no-op when egress disabled
 	apiServer.SetTokenStore(tokenStore)           // shared with the SSH bootstrap handler (1c)
+	if clientCA != nil {
+		// mtls: the middleware re-validates every request's client certificate
+		// against the LIVE allowlist, so removing an SSH key de-authorizes its
+		// certificates on the next request — the same "revocation lands
+		// immediately" property the token store gets from RevokeBySubject.
+		apiServer.SetClientCertAuthorizer(sshAllowlist.IsAuthorizedFingerprint)
+		apiServer.SetClientCAInfo(clientCA.Fingerprint(), clientCA.NotAfter())
+	}
 
 	// Warn when bind_address is unset: as of v0.7.4 that defaults to loopback
 	// (was all-interfaces), so a server that relied on the old default is now
@@ -282,9 +379,9 @@ func runServe(cmd *cobra.Command, args []string) error {
 	// resolved addresses separately below.
 	if cfg.BindAddress == "" {
 		if cfg.PlainHTTPEnabled() {
-			log.Printf("WARNING: bind_address is unset — binding loopback (127.0.0.1) only. This was all-interfaces before v0.7.4. To reach this open-mode server off-box, set bind_address (e.g. 0.0.0.0) + allow_insecure_exposure: true, or switch to auth.mode: secure.")
+			log.Printf("WARNING: bind_address is unset — binding loopback (127.0.0.1) only. This was all-interfaces before v0.7.4. To reach this open-mode server off-box, set bind_address (e.g. 0.0.0.0) + allow_insecure_exposure: true, or switch to auth.mode: token.")
 		} else {
-			log.Printf("bind_address is unset — binding loopback (127.0.0.1) only. Set bind_address (e.g. 0.0.0.0) to reach this secure server off-box.")
+			log.Printf("bind_address is unset — binding loopback (127.0.0.1) only. Set bind_address (e.g. 0.0.0.0) to reach this token/mtls-mode server off-box.")
 		}
 	}
 
@@ -292,8 +389,8 @@ func runServe(cmd *cobra.Command, args []string) error {
 	// listeners share this single handler.
 	publicHandler := apiServer.Router()
 
-	// Plain-HTTP listener. In secure mode it is not started — only the pinned-TLS
-	// (https_port) listener faces clients (TLS-only).
+	// Plain-HTTP listener. In an enforced mode (token or mtls) it is not
+	// started — only the pinned-TLS (https_port) listener faces clients.
 	var httpServer *http.Server
 	if cfg.PlainHTTPEnabled() {
 		httpServer = newHTTPServer(cfg.HTTPListenAddr(), publicHandler)
@@ -312,26 +409,32 @@ func runServe(cmd *cobra.Command, args []string) error {
 		tlsFingerprint = servertls.Fingerprint(der)
 		log.Printf("TLS cert fingerprint: %s", tlsFingerprint)
 		httpsServer = newHTTPServer(cfg.HTTPSListenAddr(), publicHandler)
-		httpsServer.TLSConfig = &tls.Config{
-			Certificates: []tls.Certificate{cert},
-			MinVersion:   tls.VersionTLS12,
-		}
+		httpsServer.TLSConfig = buildHTTPSTLSConfig(cfg, cert, clientCA, sshAllowlist.IsAuthorizedFingerprint)
 	}
 
-	// Wire the SSH bootstrap handler: it mints HTTP tokens into the shared
-	// store and returns them (with the TLS pin + ports) over the authenticated
-	// SSH channel, so `shed server add` needs no manual token/pin step.
-	sshServer.SetBootstrap(tokenStore, sshd.BootstrapInfo{
+	// Wire the SSH bootstrap handler: it issues an HTTP credential over the
+	// authenticated SSH channel and returns it (with the TLS pin + ports), so
+	// `shed server add` needs no manual token/pin step. In token mode that is a
+	// bearer token minted into the shared store; in mtls mode it is a client
+	// certificate signed by clientCA, and the token store is deliberately NOT
+	// handed over — that path must never mint a bearer token.
+	bootstrapTokens := tokenStore
+	if cfg.MTLSMode() {
+		bootstrapTokens = nil
+	}
+	sshServer.SetBootstrap(bootstrapTokens, sshd.BootstrapInfo{
 		HTTPPort:       cfg.HTTPPort,
 		HTTPSPort:      cfg.HTTPSPort,
 		TLSFingerprint: tlsFingerprint,
 		TokenTTL:       cfg.TokenTTL(),
+		AuthMode:       cfg.AuthModeValue(),
+		CA:             clientCA,
 	})
 
 	// Channel to collect errors from servers (HTTP, HTTPS, SSH).
 	errChan := make(chan error, 3)
 
-	// Start HTTP server in goroutine (skipped in secure mode — TLS-only)
+	// Start HTTP server in goroutine (skipped in token mode — TLS-only)
 	if httpServer != nil {
 		go func() {
 			log.Printf("HTTP server listening on %s", httpServer.Addr)
@@ -378,7 +481,7 @@ func runServe(cmd *cobra.Command, args []string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
 	defer cancel()
 
-	// Shutdown HTTP server (when serving — skipped in secure mode)
+	// Shutdown HTTP server (when serving — skipped in token mode)
 	if httpServer != nil {
 		log.Printf("Shutting down HTTP server...")
 		if err := httpServer.Shutdown(ctx); err != nil {

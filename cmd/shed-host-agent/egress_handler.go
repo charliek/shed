@@ -14,6 +14,8 @@ import (
 	"net/http"
 	"strings"
 	"time"
+
+	"github.com/charliek/shed/sdk/authfail"
 )
 
 // namespaceEgress is the audit namespace for egress-control decisions. It is
@@ -42,11 +44,19 @@ type egressDecision struct {
 // disabled on the server. Run backs off hard on it instead of tight-looping.
 var errEgressUnavailable = errors.New("egress stream: unavailable (disabled on server)")
 
-// tokenSource provides — and on a 401 invalidates — the control-scoped bearer
-// token for the egress stream on a secure server. *credentialSource satisfies
-// it; nil for an open server (which sends no minted token).
-type tokenSource interface {
+// egressCredentialSource provides — and on a refusal re-mints — the
+// control-scoped credential for the egress stream on a secure server, in
+// whichever of its two shapes the server issues. *credentialSource satisfies it;
+// nil for an open server (which sends nothing minted).
+//
+// The certificate half is here and not only on the bus because this subscriber
+// builds its OWN http.Client: the SDK's HostClient streams the plugin bus and
+// nothing else, so an egress transport that knew only about bearer tokens would
+// be the one client the agent owns that cannot reach an mtls server — silently,
+// as a stream that reconnects forever.
+type egressCredentialSource interface {
 	Token() (string, error)
+	ClientCertificate() *tls.Certificate
 	Invalidate()
 }
 
@@ -57,7 +67,7 @@ type EgressSubscriber struct {
 	server     string
 	url        string
 	token      string
-	tokens     tokenSource // control-token source for a secure server; nil = open
+	creds      egressCredentialSource // control credential for a secure server; nil = open
 	httpClient *http.Client
 	audit      *AuditLogger
 	logger     *slog.Logger
@@ -65,16 +75,16 @@ type EgressSubscriber struct {
 
 // NewEgressSubscriber builds a subscriber for one server target with its own
 // authenticated HTTP client (the SDK HostClient only streams the plugin bus): a
-// fingerprint-pinned transport for https, else a plain client. tokens supplies
-// the control-scoped token for a secure server (the egress route is
+// fingerprint-pinned transport for https, else a plain client. creds supplies
+// the control-scoped credential for a secure server (the egress route is
 // control-scoped, unlike the credentials-scoped bus); pass nil for an open server.
-func NewEgressSubscriber(t ServerTarget, tokens tokenSource, audit *AuditLogger, logger *slog.Logger) *EgressSubscriber {
+func NewEgressSubscriber(t ServerTarget, creds egressCredentialSource, audit *AuditLogger, logger *slog.Logger) *EgressSubscriber {
 	return &EgressSubscriber{
 		server:     t.Name,
 		url:        strings.TrimRight(t.URL, "/"),
 		token:      t.Token,
-		tokens:     tokens,
-		httpClient: egressHTTPClient(t.URL, t.TLSFingerprint),
+		creds:      creds,
+		httpClient: egressHTTPClient(t.URL, t.TLSFingerprint, creds),
 		audit:      audit,
 		logger:     logger,
 	}
@@ -84,13 +94,18 @@ func NewEgressSubscriber(t ServerTarget, tokens tokenSource, audit *AuditLogger,
 // (re-minted near expiry by the source), else the static configured token (open
 // servers send their usually-empty token). A mint error sends none — the request
 // then 401s and Run retries after Invalidate.
+//
+// It returns "" in mtls state too, and that is not a failure: the credential
+// travelled in the handshake instead, and an mtls server never reads this
+// header. Calling it is still what drives the mint — the source enrolls here,
+// before the dial, precisely so the handshake below has something to present.
 func (s *EgressSubscriber) bearer() string {
-	if s.tokens == nil {
+	if s.creds == nil {
 		return s.token
 	}
-	tok, err := s.tokens.Token()
+	tok, err := s.creds.Token()
 	if err != nil {
-		s.logger.Debug("egress: control-token mint failed", "server", s.server, "error", err)
+		s.logger.Debug("egress: control credential mint failed", "server", s.server, "error", err)
 		return ""
 	}
 	return tok
@@ -140,13 +155,18 @@ func (s *EgressSubscriber) stream(ctx context.Context) error {
 	}
 	resp, err := s.httpClient.Do(req)
 	if err != nil {
+		// A refused CLIENT CERTIFICATE lands here rather than as a status: the
+		// server rejects it in (TLS 1.2) or immediately after (TLS 1.3) the
+		// handshake, so there is no response to carry a 401. Without this the
+		// stream would reconnect forever presenting the credential the server
+		// just refused.
+		s.invalidateOnAuthFailure(0, err)
 		return err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		if resp.StatusCode == http.StatusUnauthorized && s.tokens != nil {
-			s.tokens.Invalidate() // expired/revoked control token → re-mint on reconnect
-		}
+		// Expired/revoked/de-authorized credential → re-mint on reconnect.
+		s.invalidateOnAuthFailure(resp.StatusCode, nil)
 		if resp.StatusCode == http.StatusNotImplemented || resp.StatusCode == http.StatusNotFound {
 			return errEgressUnavailable
 		}
@@ -192,12 +212,34 @@ func egressAuditEntry(server string, d egressDecision) AuditEntry {
 	}
 }
 
+// invalidateOnAuthFailure asks the credential source to re-mint when the server
+// refused what was presented, and reports whether it did. The two shapes of
+// refusal — an HTTP 401 and a peer TLS alert naming a certificate problem — are
+// classified together (sdk/authfail), because they are the same event seen from
+// the two modes and the subscriber cannot know which mode the server is in.
+func (s *EgressSubscriber) invalidateOnAuthFailure(status int, err error) bool {
+	if s.creds == nil || !authfail.IsAuthFailure(status, err) {
+		return false
+	}
+	s.creds.Invalidate()
+	return true
+}
+
 // egressHTTPClient returns the authenticated-transport client for the stream:
 // a fingerprint-pinned transport for an https URL + pin, a fail-closed client
 // when a pin is set on a non-https URL, else a plain client. SSE is long-lived,
-// so there is no overall request timeout. Mirrors the SDK's TLS pin (the sdk is
-// a separate module and cannot be imported here).
-func egressHTTPClient(serverURL, fingerprint string) *http.Client {
+// so there is no overall request timeout. Mirrors the SDK's TLS pin (this
+// package deliberately duplicates the small, stable pin shape rather than
+// depending on the server-side servertls package).
+//
+// creds, when non-nil, is installed as GetClientCertificate — unconditionally,
+// even while it holds nothing. That is what keeps a token↔mtls flip invisible
+// to this long-lived transport: the TLS stack asks per handshake, so a
+// credential that changes shape underneath it needs no rebuild. It is installed
+// only alongside a pin, for the same reason the SDK does: mtls is served only
+// over the pinned HTTPS listener, and an unpinned connection must never be
+// handed a client certificate.
+func egressHTTPClient(serverURL, fingerprint string, creds egressCredentialSource) *http.Client {
 	if fingerprint == "" {
 		return &http.Client{}
 	}
@@ -218,6 +260,19 @@ func egressHTTPClient(serverURL, fingerprint string) *http.Client {
 	}
 	tlsCfg.InsecureSkipVerify = true // verification is done by VerifyPeerCertificate (pin)
 	tlsCfg.VerifyPeerCertificate = egressPinVerifier(fingerprint)
+	if creds != nil {
+		tlsCfg.GetClientCertificate = func(*tls.CertificateRequestInfo) (*tls.Certificate, error) {
+			if cert := creds.ClientCertificate(); cert != nil {
+				return cert, nil
+			}
+			// An EMPTY certificate, not an error: the handshake must proceed and
+			// let the server decide. Returning an error aborts the connection
+			// client-side, turning "this server wants a certificate I do not have
+			// yet" into an opaque dial failure instead of the server's own
+			// certificate_required alert that the re-enrollment path keys on.
+			return &tls.Certificate{}, nil
+		}
+	}
 	tr.TLSClientConfig = tlsCfg
 	return &http.Client{Transport: tr}
 }

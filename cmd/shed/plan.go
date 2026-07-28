@@ -82,7 +82,7 @@ func runPlan(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	_, entry, found := locateShed(planShedFlag)
+	serverName, entry, found := locateShed(planShedFlag)
 	shedCreated := false
 	switch decidePlanShed(found, planRepoFlag) {
 	case planErrorMissingNoRepo:
@@ -98,7 +98,7 @@ func runPlan(cmd *cobra.Command, args []string) error {
 			return fmt.Errorf("creating shed %q: %w", planShedFlag, cerr)
 		}
 		shedCreated = true
-		if _, entry, found = locateShed(planShedFlag); !found {
+		if serverName, entry, found = locateShed(planShedFlag); !found {
 			return fmt.Errorf("shed %q was created but could not be located afterward", planShedFlag)
 		}
 	case planWarnIgnoreRepo:
@@ -106,7 +106,7 @@ func runPlan(cmd *cobra.Command, args []string) error {
 	case planUseExisting:
 	}
 
-	client := NewAPIClientFromEntry(entry, clientConfig.GetCreateTimeout())
+	client := NewAPIClientFromNamedEntry(serverName, entry, clientConfig.GetCreateTimeout())
 	if _, err := ensureRunningShed(client, planShedFlag); err != nil {
 		return planFailAfterCreate(shedCreated, planShedFlag, err)
 	}
@@ -245,8 +245,8 @@ func readPlanArg(file string) (string, error) {
 // so the miss must be quiet. Honors -s/--server; otherwise checks the cached server,
 // then every configured server. Returns found=false when none has it.
 func locateShed(name string) (string, *config.ServerEntry, bool) {
-	exists := func(entry *config.ServerEntry) bool {
-		_, err := NewAPIClientFromEntry(entry, DefaultTimeout).GetShed(name)
+	exists := func(serverName string, entry *config.ServerEntry) bool {
+		_, err := NewAPIClientFromNamedEntry(serverName, entry, DefaultTimeout).GetShed(name)
 		return err == nil
 	}
 	if serverFlag != "" {
@@ -254,19 +254,19 @@ func locateShed(name string) (string, *config.ServerEntry, bool) {
 		if err != nil {
 			return "", nil, false
 		}
-		if exists(entry) {
+		if exists(serverFlag, entry) {
 			return serverFlag, entry, true
 		}
 		return "", nil, false
 	}
 	if cached, err := clientConfig.GetShedServer(name); err == nil {
-		if entry, err := clientConfig.GetServer(cached); err == nil && exists(entry) {
+		if entry, err := clientConfig.GetServer(cached); err == nil && exists(cached, entry) {
 			return cached, entry, true
 		}
 	}
 	for serverName, e := range clientConfig.Servers {
 		entry := e
-		if exists(&entry) {
+		if exists(serverName, &entry) {
 			return serverName, &entry, true
 		}
 	}

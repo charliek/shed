@@ -31,7 +31,9 @@ use serde::Deserialize;
 use tokio::sync::watch;
 
 use shed_core::sse::SseParser;
-use shed_core::tls::pinned_client_config;
+use shed_core::tls::{
+    pinned_client_config, pinned_client_config_with_client_auth, ClientCertResolver,
+};
 
 use crate::audit::{AuditEntry, AuditSink};
 use crate::bus::BusLog;
@@ -162,6 +164,11 @@ impl std::fmt::Display for EgressStreamError {
 pub trait EgressTokenSource: Send + Sync {
     async fn token(&self) -> Result<String, String>;
     fn invalidate(&self);
+    /// The bearer still held after `token()` failed (see the bus
+    /// `TokenProvider::surviving_token` — same Go-parity contract).
+    fn surviving_token(&self) -> Option<String> {
+        None
+    }
 }
 
 /// Bridge the caching, invalidatable control-token source onto [`EgressTokenSource`].
@@ -181,6 +188,22 @@ impl EgressTokenSource for Arc<crate::minter::CredentialSource> {
         // bare `self.invalidate()` would recurse into THIS method).
         (**self).invalidate()
     }
+    fn surviving_token(&self) -> Option<String> {
+        (**self).surviving_bearer()
+    }
+}
+
+/// The credential seam for one egress stream, as a pair because both halves come from the
+/// SAME control-scope [`crate::minter::CredentialSource`]: the bearer it resolves in token
+/// state, and the client identity it arms in mtls state. An open server supplies neither.
+///
+/// They are grouped rather than passed as two more parameters because they are never
+/// meaningfully independent — a stream with an identity but no bearer source, or the
+/// reverse, would be a source only half wired in.
+#[derive(Default, Clone)]
+pub struct EgressCredentials {
+    pub tokens: Option<Arc<dyn EgressTokenSource>>,
+    pub client_certs: Option<Arc<ClientCertResolver>>,
 }
 
 /// An injectable sleep seam so the backoff machine ([`EgressSubscriber::run`]) is
@@ -231,7 +254,16 @@ fn backoff_step(prev: Duration, outcome: &Result<(), EgressStreamError>) -> (Dur
 /// with no https-only guard (an `http://` redirect would be followed UNPINNED); the Rust
 /// client REFUSES non-https redirects (matching shed-core's pinned session) — a Rust-side
 /// improvement kept on purpose, not parity.
-pub fn egress_http_client(server_url: &str, fingerprint: &str) -> Result<reqwest::Client, String> {
+/// `client_certs` installs the control-scope credential source's client-certificate
+/// resolver, so an `auth.mode: mtls` server authenticates this stream by the CERTIFICATE
+/// (plan 001 D5's adaptive transport — read at handshake time, so a rotation never
+/// rebuilds the client). `None` for an open/static-token server, which could never
+/// present one.
+pub fn egress_http_client(
+    server_url: &str,
+    fingerprint: &str,
+    client_certs: Option<Arc<ClientCertResolver>>,
+) -> Result<reqwest::Client, String> {
     let builder =
         reqwest::Client::builder().redirect(reqwest::redirect::Policy::custom(|attempt| {
             if attempt.url().scheme() == "https" {
@@ -249,7 +281,11 @@ pub fn egress_http_client(server_url: &str, fingerprint: &str) -> Result<reqwest
             "egress stream: TLS pin set but server URL {server_url:?} is not https; refusing unpinned plaintext"
         ));
     }
-    let cfg = pinned_client_config(fingerprint).map_err(|e| e.to_string())?;
+    let cfg = match client_certs {
+        Some(resolver) => pinned_client_config_with_client_auth(fingerprint, resolver),
+        None => pinned_client_config(fingerprint),
+    }
+    .map_err(|e| e.to_string())?;
     builder
         .use_preconfigured_tls(cfg)
         .build()
@@ -282,11 +318,15 @@ impl EgressSubscriber {
         mut url: String,
         token: String,
         tls_fingerprint: &str,
-        tokens: Option<Arc<dyn EgressTokenSource>>,
+        creds: EgressCredentials,
         audit: Arc<dyn AuditSink>,
         log: Arc<dyn BusLog>,
     ) -> Self {
-        let http = egress_http_client(&url, tls_fingerprint);
+        let EgressCredentials {
+            tokens,
+            client_certs,
+        } = creds;
+        let http = egress_http_client(&url, tls_fingerprint, client_certs);
         // Trim trailing '/' in place (Go's `strings.TrimRight(t.URL, "/")`), consuming the
         // owned `url` rather than re-allocating.
         url.truncate(url.trim_end_matches('/').len());
@@ -305,17 +345,24 @@ impl EgressSubscriber {
     /// a secure server, else the static config token (`None` when empty). A mint error →
     /// `None` (the request then 401s and `run` retries after `invalidate`). Mirror
     /// `bearer()` + the `if tok != ""` header guard.
+    ///
+    /// In mtls mode the source resolves to the EMPTY string and no header is sent — the
+    /// stream authenticates with the certificate the same source armed on this
+    /// subscriber's transport. The mint still runs, which is exactly what arms it.
     async fn bearer(&self) -> Option<String> {
         let tok = match &self.tokens {
             None => self.token.clone(),
             Some(src) => match src.token().await {
                 Ok(t) => t,
                 Err(e) => {
+                    // A failed re-mint keeps the surviving bearer on the wire
+                    // (Go parity; in mtls state the armed certificate carries
+                    // the identity instead and "" stays correct).
                     self.log.debug(&format!(
                         "egress: control-token mint failed server={} error={e}",
                         self.server
                     ));
-                    String::new()
+                    src.surviving_token().unwrap_or_default()
                 }
             },
         };
@@ -339,7 +386,13 @@ impl EgressSubscriber {
         let mut req = http
             .get(&url)
             .header(reqwest::header::ACCEPT, "text/event-stream");
-        if let Some(tok) = self.bearer().await {
+        // The bearer fetch can itself be a full SSH mint (after an
+        // invalidation), so it races shutdown like every other network await.
+        let bearer = tokio::select! {
+            _ = wait_shutdown(shutdown.clone()) => return Ok(()),
+            t = self.bearer() => t,
+        };
+        if let Some(tok) = bearer {
             req = req.bearer_auth(tok);
         }
 
@@ -348,7 +401,22 @@ impl EgressSubscriber {
             _ = wait_shutdown(shutdown.clone()) => return Ok(()),
             r = req.send() => match r {
                 Ok(r) => r,
-                Err(e) => return Err(EgressStreamError::Other(format!("connecting: {e}"))),
+                // A refused CLIENT CERTIFICATE lands here rather than as a
+                // status: the server rejects it in (TLS 1.2) or just after
+                // (TLS 1.3) the handshake, so there is no response to carry a
+                // 401 (Go: egress stream's invalidateOnAuthFailure(0, err)).
+                // Flatten first — reqwest's Display drops the alert — then
+                // invalidate so the backoff-reconnect re-mints instead of
+                // presenting the refused credential forever.
+                Err(e) => {
+                    let reason = format!("connecting: {}", shed_core::authfail::flatten(&e));
+                    if shed_core::authfail::is_auth_shaped_message(&reason) {
+                        if let Some(src) = &self.tokens {
+                            src.invalidate();
+                        }
+                    }
+                    return Err(EgressStreamError::Other(reason));
+                }
             }
         };
 
@@ -542,7 +610,10 @@ mod tests {
             url.into(),
             token.into(),
             "",
-            tokens,
+            EgressCredentials {
+                tokens,
+                ..Default::default()
+            },
             audit,
             silent_log(),
         )
@@ -556,6 +627,59 @@ mod tests {
         let (tx, rx) = watch::channel(false);
         let _ = Box::leak(Box::new(tx));
         rx
+    }
+
+    /// Blocker-2 regression (whole-branch review): a TLS certificate alert at
+    /// connect — an mtls server refusing the credential at the handshake, so
+    /// no response exists to carry a 401 — must invalidate the token source so
+    /// the backoff-reconnect re-mints, and the flattened alert must survive
+    /// into the surfaced error (reqwest's Display drops it).
+    #[tokio::test]
+    async fn stream_tls_auth_connect_failure_invalidates() {
+        let srv =
+            crate::testalert::AlertServer::spawn(crate::testalert::CERTIFICATE_REQUIRED).await;
+        let tokens = FakeTokenSource::ok("tok");
+        let sub = subscriber(
+            &srv.base_url(),
+            "",
+            Some(tokens.clone()),
+            CollectingAudit::new(),
+        );
+        let err = sub.stream(&never_shutdown()).await.unwrap_err();
+        assert!(
+            matches!(&err, EgressStreamError::Other(m) if m.contains("received fatal alert")),
+            "the flattened alert must survive into the error: {err}"
+        );
+        assert_eq!(
+            tokens.invalidated(),
+            1,
+            "the classified connect failure must invalidate the source"
+        );
+    }
+
+    /// A NON-auth connect failure (nothing listening) must NOT invalidate — a
+    /// server restart is not a credential problem, and re-minting on it would
+    /// churn SSH for nothing.
+    #[tokio::test]
+    async fn stream_plain_connect_failure_does_not_invalidate() {
+        // Bind-then-drop for a port with nothing listening.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        let tokens = FakeTokenSource::ok("tok");
+        let sub = subscriber(
+            &format!("http://{addr}"),
+            "",
+            Some(tokens.clone()),
+            CollectingAudit::new(),
+        );
+        let err = sub.stream(&never_shutdown()).await.unwrap_err();
+        assert!(matches!(&err, EgressStreamError::Other(_)), "err = {err}");
+        assert_eq!(
+            tokens.invalidated(),
+            0,
+            "connection-refused must not trigger a re-mint"
+        );
     }
 
     // ---- egress_audit_entry (mirror TestEgressAuditEntry[_NoResolvedIP] + goldens) ---
@@ -741,7 +865,7 @@ mod tests {
             "http://127.0.0.1:1".into(),
             String::new(),
             "sha256:deadbeef", // pin + non-https → fail-closed → Other error each iter
-            None,
+            EgressCredentials::default(),
             audit,
             silent_log(),
         );
@@ -890,9 +1014,62 @@ mod tests {
     fn pin_on_plain_url_fails_closed() {
         // A pin set on an http:// URL → the client build fails closed (the scheme check
         // replicated here, since build_http_client does not itself fail closed).
-        assert!(egress_http_client("http://localhost:8080", "sha256:deadbeef").is_err());
+        assert!(egress_http_client("http://localhost:8080", "sha256:deadbeef", None).is_err());
         // Sanity: a pin on https builds, and no pin builds.
-        assert!(egress_http_client("http://localhost:8080", "").is_ok());
+        assert!(egress_http_client("http://localhost:8080", "", None).is_ok());
+    }
+
+    /// The egress stream presents its OWN control-scope certificate: the resolver it is
+    /// built with is the one the control-scope credential source writes through, and the
+    /// pinned config reads it live at handshake time (plan 001 D5).
+    #[test]
+    fn client_auth_is_installed_from_the_control_source_resolver() {
+        use shed_core::tls::{pinned_client_config_with_client_auth, ClientCertResolver};
+        const PIN: &str = "sha256:2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824";
+
+        let resolver = Arc::new(ClientCertResolver::new());
+        // The stream builds over https with the resolver installed...
+        assert!(egress_http_client("https://x:8443", PIN, Some(resolver.clone())).is_ok());
+        // ...and fails closed on a pin over plain http exactly as before.
+        assert!(egress_http_client("http://x:8080", PIN, Some(resolver.clone())).is_err());
+
+        // The config that gets installed reads through the SAME handle the source writes.
+        let cfg = pinned_client_config_with_client_auth(PIN, resolver.clone()).unwrap();
+        assert!(cfg.client_auth_cert_resolver.resolve(&[], &[]).is_none());
+        let key = rcgen::KeyPair::generate().unwrap();
+        let leaf = rcgen::CertificateParams::new(Vec::<String>::new())
+            .unwrap()
+            .self_signed(&key)
+            .unwrap();
+        let certified = shed_core::tls::certified_key_from_pem(
+            &shed_core::csr::pem_encode(shed_core::csr::PEM_LABEL_CERTIFICATE, leaf.der()),
+            &key.serialize_der(),
+        )
+        .unwrap();
+        resolver.set(Some(Arc::new(certified)));
+        assert!(cfg.client_auth_cert_resolver.resolve(&[], &[]).is_some());
+    }
+
+    /// In mtls state the control-scope source resolves to an EMPTY bearer, so the stream
+    /// sends no `Authorization` header — and does NOT fall back to the static config token.
+    #[tokio::test]
+    async fn no_bearer_header_is_sent_in_mtls_state() {
+        struct MtlsSource;
+        #[async_trait::async_trait]
+        impl EgressTokenSource for MtlsSource {
+            async fn token(&self) -> Result<String, String> {
+                Ok(String::new()) // what CredentialSource::token yields in mtls state
+            }
+            fn invalidate(&self) {}
+        }
+        let audit = CollectingAudit::new();
+        let sub = subscriber(
+            "https://x:8443",
+            "a-static-token-that-must-not-leak",
+            Some(Arc::new(MtlsSource)),
+            audit,
+        );
+        assert_eq!(sub.bearer().await, None);
     }
 
     #[tokio::test]

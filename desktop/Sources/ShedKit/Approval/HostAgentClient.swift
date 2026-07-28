@@ -35,6 +35,12 @@ public enum HostAgentClientError: Error, Equatable, CustomStringConvertible, Sen
     case timedOut
     case disconnected
     case encodingFailed
+    case unexpectedReply
+    /// The connection that advertised `credential.get` is gone (or has not
+    /// announced itself yet) — transient, retried by the next request.
+    case capabilityLost
+    /// The connection that is live right now does not answer `credential.get`.
+    case capabilityUnsupported
 
     public var description: String {
         switch self {
@@ -42,8 +48,30 @@ public enum HostAgentClientError: Error, Equatable, CustomStringConvertible, Sen
         case .timedOut: return "timed out waiting for host agent reply"
         case .disconnected: return "host agent connection dropped"
         case .encodingFailed: return "failed to encode host agent request"
+        case .unexpectedReply: return "host agent answered with the wrong reply type"
+        case .capabilityLost: return "host agent connection changed before the credential request was sent"
+        case .capabilityUnsupported: return "host agent does not answer credential.get"
         }
     }
+}
+
+/// The capability learned on ONE connection, tagged with that connection's
+/// generation. Handing both to a caller is what lets a request that decided to
+/// use `credential.get` re-check, at send time, that it is still talking to the
+/// connection that advertised it — a reconnect between the decision and the
+/// write must not smuggle the old answer onto the new socket.
+public struct AgentCapabilitySnapshot: Sendable, Equatable {
+    public let state: AgentCapabilityState
+    public let generation: UInt64
+}
+
+/// A correlated reply to an app→agent request. One pending table serves both
+/// request types; the requester asserts the arm it asked for, so an agent that
+/// answers a `credential.get` with a `token.response` fails closed instead of
+/// being silently reinterpreted.
+enum HostAgentReply: Sendable {
+    case token(TokenResponse)
+    case credential(CredentialResponse)
 }
 
 public final class HostAgentClient: @unchecked Sendable {
@@ -52,15 +80,34 @@ public final class HostAgentClient: @unchecked Sendable {
     private var currentFD: Int32 = -1
     private var running = false
     private var loopTask: Task<Void, Never>?
-    /// In-flight `token.get` requests keyed by request id, each awaiting the
-    /// correlated `token.response` (matched by `in_reply_to`). Guarded by `lock`.
-    /// removeValue is the single-resume guard — whoever removes a continuation
-    /// owns its (exactly-once) resume.
-    private var pending: [String: CheckedContinuation<TokenResponse, Error>] = [:]
+    /// In-flight `token.get` / `credential.get` requests keyed by request id,
+    /// each awaiting the correlated reply (matched by `in_reply_to`). Guarded by
+    /// `lock`. removeValue is the single-resume guard — whoever removes a
+    /// continuation owns its (exactly-once) resume.
+    private var pending: [String: CheckedContinuation<HostAgentReply, Error>] = [:]
+    /// What the CURRENT connection's `hello_ack` said about `credential.get`
+    /// (plan 002 §7 P5). `.unknown` until the ack lands and again after every
+    /// disconnect: a capability is a property of the agent on the other end of
+    /// THIS connection, and a reconnect may land on a different build. Guarded
+    /// by `lock` so the minter can read it without awaiting anything.
+    private var capability: AgentCapabilityState = .unknown
+    /// Bumped for every connection this client establishes. The capability above
+    /// describes THIS generation and nothing else.
+    private var connectionGeneration: UInt64 = 0
     /// Per-request timeout tasks keyed by the same id; cancelled when the request
     /// resolves (reply/disconnect/stop) so a resolved request leaves no lingering
     /// timer. Guarded by `lock`.
     private var pendingTimeouts: [String: Task<Void, Never>] = [:]
+    /// TEST SEAM — nil in production, set before `start()` by one test.
+    ///
+    /// Invoked on the requesting thread immediately BEFORE a correlated
+    /// request's frame is written, with `lock` HELD. That is the invariant it
+    /// exists to prove: whatever the closure does while it runs, the connection
+    /// the request just validated cannot be closed and replaced before the
+    /// write, because every path that swaps `currentFD` needs this same lock.
+    /// Keep it adjacent to the write — a version of this file that wrote after
+    /// unlocking would have its bug window exactly here.
+    var beforeWriteHookForTests: (@Sendable () -> Void)?
 
     public init(socketPath: String) {
         self.socketPath = socketPath
@@ -90,6 +137,7 @@ public final class HostAgentClient: @unchecked Sendable {
             _ = Darwin.shutdown(currentFD, SHUT_RDWR)
             currentFD = -1
         }
+        capability = .unknown
         lock.unlock()
         task?.cancel()
         failAllPending(error: HostAgentClientError.disconnected)
@@ -98,6 +146,40 @@ public final class HostAgentClient: @unchecked Sendable {
     public var isConnected: Bool {
         lock.lock(); defer { lock.unlock() }
         return currentFD >= 0
+    }
+
+    /// What this connection's `hello_ack` said about `credential.get`, with the
+    /// connection generation it describes. A cached read of state the read loop
+    /// maintains — NEVER I/O, because the Rust provider calls it (via
+    /// `TokenMinter.supportsMtls`) while holding its own mint lock.
+    public var credentialCapabilitySnapshot: AgentCapabilitySnapshot {
+        lock.lock(); defer { lock.unlock() }
+        return AgentCapabilitySnapshot(state: capability, generation: connectionGeneration)
+    }
+
+    /// The capability alone, for callers that only branch on it.
+    public var credentialCapability: AgentCapabilityState { credentialCapabilitySnapshot.state }
+
+    /// Await the current connection's capability, resolving as soon as a
+    /// `hello_ack` lands. Returns a `.unknown` snapshot if `timeout` elapses
+    /// first — the caller decides what an unresolved capability means for the
+    /// request it is about to make; this never guesses on its behalf.
+    ///
+    /// Polled rather than continuation-based: the wait is bounded, sub-second in
+    /// practice (the ack is the agent's first frame), and the alternative is a
+    /// waiter list that must also be woken from every disconnect path.
+    public func awaitCredentialCapability(timeout: Duration = .seconds(2)) async -> AgentCapabilitySnapshot {
+        let deadline = ContinuousClock.now.advanced(by: timeout)
+        while true {
+            let snapshot = credentialCapabilitySnapshot
+            if snapshot.state != .unknown { return snapshot }
+            if ContinuousClock.now >= deadline || Task.isCancelled { return snapshot }
+            try? await Task.sleep(for: .milliseconds(20))
+        }
+    }
+
+    private func setCapability(_ state: AgentCapabilityState) {
+        lock.lock(); capability = state; lock.unlock()
     }
 
     /// Send an approve/deny for a request. No-op (→ host fails closed) if
@@ -122,16 +204,72 @@ public final class HostAgentClient: @unchecked Sendable {
         guard let data = try? HostAgentProtocol.tokenGet(id: id, server: server) else {
             throw HostAgentClientError.encodingFailed
         }
-        return try await withCheckedThrowingContinuation { (cont: CheckedContinuation<TokenResponse, Error>) in
-            // Take the lock, fail fast if disconnected, else register before
-            // writing so a fast reply can't race ahead of registration. (writeLine
-            // re-takes the lock, so write after unlock — NSLock isn't reentrant.)
+        guard case .token(let resp) = try await request(id: id, data: data, timeout: timeout) else {
+            throw HostAgentClientError.unexpectedReply
+        }
+        return resp
+    }
+
+    /// Request a mode-agnostic CONTROL credential for `server` over the UDS,
+    /// relaying `csrBase64` (the Rust core's PKCS#10 request) when it has one.
+    ///
+    /// `capability` is the snapshot the CALLER decided on. It is re-checked here
+    /// under the lock, at send time, against the live connection: a reconnect (or
+    /// a supersede) between the decision and the write invalidates it, and the
+    /// request throws `.capabilityLost` / `.capabilityUnsupported` instead of
+    /// putting a `credential.get` on a socket whose agent never advertised it.
+    ///
+    /// Like `requestToken`, a fail-closed reply (its `error` set) is RETURNED,
+    /// not thrown — interpreting it is `validatedCredential(for:)`'s job.
+    public func requestCredential(
+        server: String, csrBase64: String?, capability: AgentCapabilitySnapshot,
+        timeout: Duration = .seconds(10)
+    ) async throws -> CredentialResponse {
+        let id = UUID().uuidString
+        let data = try HostAgentProtocol.credentialGet(id: id, server: server, csrBase64: csrBase64)
+        let reply = try await request(id: id, data: data, timeout: timeout) { [self] in
+            // Called with `lock` held — read the ivars directly, never re-enter.
+            guard capability.state == .supported else { return .capabilityUnsupported }
+            guard self.capability == .supported else {
+                return self.capability == .unsupported ? .capabilityUnsupported : .capabilityLost
+            }
+            return connectionGeneration == capability.generation ? nil : .capabilityLost
+        }
+        guard case .credential(let resp) = reply else {
+            throw HostAgentClientError.unexpectedReply
+        }
+        return resp
+    }
+
+    /// Send one correlated request and await its reply. Shared by `token.get`
+    /// and `credential.get` so the registration/timeout/disconnect handling has
+    /// exactly one implementation.
+    ///
+    /// The connected check, `precondition`, the registration AND the write all
+    /// happen under ONE lock acquisition (the Rust client holds its state lock
+    /// across the same span — `shed-app/src/host_agent.rs`). Unlocking between
+    /// the check and the write would leave a window in which the validated
+    /// connection can drop and be replaced: the frame would then land on a NEW,
+    /// not-yet-acked connection whose agent may not support it — an old agent
+    /// drops it, a new one performs an extra mint whose reply has no waiter.
+    private func request(
+        id: String, data: Data, timeout: Duration,
+        precondition: (() -> HostAgentClientError?)? = nil
+    ) async throws -> HostAgentReply {
+        try await withCheckedThrowingContinuation { (cont: CheckedContinuation<HostAgentReply, Error>) in
             lock.lock()
             guard currentFD >= 0 else {
                 lock.unlock()
                 cont.resume(throwing: HostAgentClientError.notConnected)
                 return
             }
+            if let failure = precondition?() {
+                lock.unlock()
+                cont.resume(throwing: failure)
+                return
+            }
+            // Register before writing so a fast reply can't race ahead of
+            // registration (the reader needs this same lock to resolve it).
             pending[id] = cont
             // Arm the timeout only AFTER registering, so it can always find the
             // continuation (a tiny timeout can't fire before registration). It's a
@@ -142,19 +280,28 @@ public final class HostAgentClient: @unchecked Sendable {
                 guard !Task.isCancelled else { return }
                 self?.failPending(id: id, error: HostAgentClientError.timedOut)
             }
+            beforeWriteHookForTests?()
+            guard writeLineLocked(data) else {
+                // The write failed on the very fd we validated. Unregister and
+                // fail now rather than leaving the caller to its timeout.
+                pending.removeValue(forKey: id)
+                pendingTimeouts.removeValue(forKey: id)?.cancel()
+                lock.unlock()
+                cont.resume(throwing: HostAgentClientError.notConnected)
+                return
+            }
             lock.unlock()
-            writeLine(data)
         }
     }
 
-    /// Resume the request matching `resp.inReplyTo`. A no-op if it already timed
-    /// out or was failed by a disconnect (removeValue is the single-resume guard).
-    private func resolvePending(_ resp: TokenResponse) {
+    /// Resume the request matching `inReplyTo`. A no-op if it already timed out
+    /// or was failed by a disconnect (removeValue is the single-resume guard).
+    private func resolvePending(inReplyTo: String, with reply: HostAgentReply) {
         lock.lock()
-        let cont = pending.removeValue(forKey: resp.inReplyTo)
-        pendingTimeouts.removeValue(forKey: resp.inReplyTo)?.cancel()
+        let cont = pending.removeValue(forKey: inReplyTo)
+        pendingTimeouts.removeValue(forKey: inReplyTo)?.cancel()
         lock.unlock()
-        cont?.resume(returning: resp)
+        cont?.resume(returning: reply)
     }
 
     private func failPending(id: String, error: Error) {
@@ -202,15 +349,28 @@ public final class HostAgentClient: @unchecked Sendable {
                 case .ping(let id):
                     if let pong = try? HostAgentProtocol.pong(id: id, ts: DateFormatting.nowISO8601()) { writeLine(pong) }
                 case .helloAck(let ack):
+                    // Learn the capability BEFORE announcing the connection, so a
+                    // consumer that reacts to .connected already sees it resolved.
+                    // A REJECTION ("superseded": another app took the consumer
+                    // slot) is not an old agent — it is a connection that will
+                    // answer nothing. Back to `.unknown`, which the credential
+                    // path treats as "not usable yet" rather than manufacturing
+                    // an upgrade error out of a hand-off.
+                    setCapability(ack.accepted ? AgentCapabilityState(helloAck: ack) : .unknown)
                     continuation.yield(.connected(ack))
                 case .tokenResponse(let resp):
                     // Correlated reply — resume the waiter, never surface as a frame.
-                    resolvePending(resp)
+                    resolvePending(inReplyTo: resp.inReplyTo, with: .token(resp))
+                case .credentialResponse(let resp):
+                    resolvePending(inReplyTo: resp.inReplyTo, with: .credential(resp))
                 default:
                     continuation.yield(.frame(frame))
                 }
             }
             closeCurrentIf(fd)
+            // The capability described THAT agent process; the next connection
+            // re-learns it from its own hello_ack (plan 002 §7 P5 reconnect).
+            setCapability(.unknown)
             // Fail any in-flight token requests so awaiting callers don't hang
             // until their individual timeout fires.
             failAllPending(error: HostAgentClientError.disconnected)
@@ -222,7 +382,15 @@ public final class HostAgentClient: @unchecked Sendable {
 
     private func isRunning() -> Bool { lock.lock(); defer { lock.unlock() }; return running }
 
-    private func setCurrentFD(_ fd: Int32) { lock.lock(); currentFD = fd; lock.unlock() }
+    /// Install a freshly connected fd and open a new capability generation: the
+    /// new agent has said nothing yet, so nothing is known about it.
+    private func setCurrentFD(_ fd: Int32) {
+        lock.lock()
+        currentFD = fd
+        connectionGeneration &+= 1
+        capability = .unknown
+        lock.unlock()
+    }
 
     private func closeCurrentIf(_ fd: Int32) {
         // Close UNDER the lock so a concurrent writeLine can't write to this
@@ -234,13 +402,24 @@ public final class HostAgentClient: @unchecked Sendable {
     }
 
     private func writeLine(_ data: Data) {
-        var frame = data
-        frame.append(0x0a)
         // Hold the lock across the whole write so the fd can't be closed +
         // reused mid-write (the frames are tiny control messages).
         lock.lock(); defer { lock.unlock() }
-        guard currentFD >= 0 else { return }
-        _ = writeAll(fd: currentFD, data: frame)
+        _ = writeLineLocked(data)
+    }
+
+    /// `writeLine`'s body, for callers that already hold `lock` (NSLock is not
+    /// reentrant). Exists so a correlated request can validate the connection,
+    /// register its waiter and write WITHOUT ever dropping the lock — see
+    /// `request(id:data:timeout:precondition:)`.
+    ///
+    /// Returns whether the frame reached the socket; `false` for "not
+    /// connected" as well as a failed write.
+    private func writeLineLocked(_ data: Data) -> Bool {
+        var frame = data
+        frame.append(0x0a)
+        guard currentFD >= 0 else { return false }
+        return writeAll(fd: currentFD, data: frame)
     }
 
     private func connectOnce() -> Int32? {
@@ -253,6 +432,12 @@ public final class HostAgentClient: @unchecked Sendable {
             }
         }
         if rc != 0 { Darwin.close(fd); return nil }
+        // Writing to a socket the agent has closed must return EPIPE, not raise
+        // SIGPIPE. The app ignores the signal process-wide (`ShedBackend`), but
+        // this fd is rolled by hand and outlives that assumption in any host
+        // that doesn't (a test runner, an embedder) — so say it on the socket.
+        var on: Int32 = 1
+        _ = setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &on, socklen_t(MemoryLayout<Int32>.size))
         return fd
     }
 }

@@ -59,6 +59,12 @@ impl TokenProvider for Arc<CredentialSource> {
         // bare `self.invalidate()` would recurse into THIS method).
         (**self).invalidate()
     }
+    fn surviving_token(&self) -> Option<String> {
+        (**self).surviving_bearer()
+    }
+    fn presenting_certificate(&self) -> bool {
+        (**self).holds_certificate()
+    }
 }
 
 /// The server-agnostic components every per-server watcher group shares — built once in
@@ -393,6 +399,7 @@ mod tests {
             tls_fingerprint: String::new(),
             ssh_host: String::new(),
             ssh_port: 0,
+            auth_mode: String::new(),
         }
     }
 
@@ -461,6 +468,7 @@ mod tests {
             tls_fingerprint: String::new(),
             ssh_host: "h".into(),
             ssh_port: 2222,
+            auth_mode: String::new(),
         }
     }
 
@@ -523,6 +531,7 @@ mod tests {
                 tls_fingerprint: String::new(),
                 ssh_host: v["ssh_host"].as_str().unwrap().to_string(),
                 ssh_port: v["ssh_port"].as_u64().unwrap() as u16,
+                auth_mode: String::new(),
             };
             assert_eq!(
                 should_mint(&deps, &target),
@@ -591,6 +600,7 @@ mod tests {
             tls_fingerprint: pin.into(),
             ssh_host: String::new(),
             ssh_port: 0,
+            auth_mode: String::new(),
         };
         s.reconcile(vec![mk("t1", "")]).await;
         s.reconcile(vec![mk("t2", "")]).await; // token rotated
@@ -731,10 +741,10 @@ mod tests {
         async fn mint(&self, _t: &ServerTarget, _scope: &str) -> Result<Minted, MinterError> {
             let i = self.calls.fetch_add(1, Ordering::SeqCst);
             let token = if i == 0 { "tok1" } else { "tok2" };
-            Ok(Minted {
-                token: token.to_string(),
-                expiry: Some(crate::status::now_unix() + 24 * 3600),
-            })
+            Ok(Minted::token(
+                token,
+                Some(crate::status::now_unix() + 24 * 3600),
+            ))
         }
     }
 }

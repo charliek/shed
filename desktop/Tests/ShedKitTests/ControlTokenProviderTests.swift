@@ -162,19 +162,6 @@ final class ControlTokenProviderTests: XCTestCase {
 
     // MARK: - hostAgent factory (real client adapter)
 
-    private static let info = HelloClientInfo(
-        name: "test", version: "0", pid: 1, capabilities: [], replayEvents: 0)
-
-    private func tempSocketPath() -> String { "/tmp/shed-ctl-\(UUID().uuidString.prefix(8)).sock" }
-
-    private func waitConnected(_ client: HostAgentClient) async throws {
-        for _ in 0..<200 {
-            if client.isConnected { return }
-            try await Task.sleep(for: .milliseconds(25))
-        }
-        XCTFail("client never connected to fake host-agent")
-    }
-
     func testHostAgentFactorySuccessParsesTokenAndExpiry() async throws {
         let path = tempSocketPath()
         let fake = FakeHostAgent(
@@ -182,8 +169,7 @@ final class ControlTokenProviderTests: XCTestCase {
         try fake.start()
         defer { fake.stop() }
         let client = HostAgentClient(socketPath: path)
-        let stream = client.start(client: Self.info)
-        let drain = Task { for await _ in stream {} }
+        let drain = startDraining(client)
         defer { drain.cancel(); client.stop() }
         try await waitConnected(client)
 
@@ -197,8 +183,7 @@ final class ControlTokenProviderTests: XCTestCase {
         try fake.start()
         defer { fake.stop() }
         let client = HostAgentClient(socketPath: path)
-        let stream = client.start(client: Self.info)
-        let drain = Task { for await _ in stream {} }
+        let drain = startDraining(client)
         defer { drain.cancel(); client.stop() }
         try await waitConnected(client)
 
@@ -221,8 +206,7 @@ final class ControlTokenProviderTests: XCTestCase {
         try fake.start()
         defer { fake.stop() }
         let client = HostAgentClient(socketPath: path)
-        let stream = client.start(client: Self.info)
-        let drain = Task { for await _ in stream {} }
+        let drain = startDraining(client)
         defer { drain.cancel(); client.stop() }
         try await waitConnected(client)
 

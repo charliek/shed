@@ -94,13 +94,13 @@ servers:
     ssh_port: 12222
 ```
 
-Or run `shed server add localhost --port 18080 --name my-server-dev` after the first `make dev-server-up` — it registers the entry by probing the running server's `/info` endpoint.
+Or run `shed server add localhost --port 18080 --ssh-port 12222 --name my-server-dev` after the first `make dev-server-up` — first contact is SSH-first, so the dev server's SSH port (12222) must be named explicitly.
 
 **FC remote parallel-dev** (same shape, over SSH to `$SHED_FC_HOST`):
 
 ```bash
 # One-time setup: register the FC dev entry (after first dev-server-up-fc):
-shed server add mini3 --port 18080 --name mini3-dev
+shed server add mini3 --port 18080 --ssh-port 12222 --name mini3-dev
 
 # Per dev cycle:
 make dev-server-up-fc                    # launches dev shed-server on mini3:18080

@@ -277,7 +277,8 @@ impl RcService {
         if out.exit_code != 0 {
             return Err(rc::error_from_exit(out.exit_code, &out.stderr, &out.stdout));
         }
-        let session = RcSession::from_dto(rc::decode_session(&out.stdout)?, &target.server_name, shed);
+        let session =
+            RcSession::from_dto(rc::decode_session(&out.stdout)?, &target.server_name, shed);
         self.store
             .lock()
             .unwrap()
@@ -374,9 +375,7 @@ impl RcService {
                 // other sheds' sessions — a blanket rebuild would wrongly clobber
                 // them (a latent bug in Swift's unconditional rebuild).
                 store.retain(|_, s| !probed.contains(&(s.host.clone(), s.shed.clone())));
-                caps.retain(|k, _| {
-                    !probed.iter().any(|(h, n)| *k == caps_key(h, n))
-                });
+                caps.retain(|k, _| !probed.iter().any(|(h, n)| *k == caps_key(h, n)));
             }
             for (server, shed, sessions, shed_caps) in probe_results {
                 for s in sessions {
@@ -537,14 +536,24 @@ mod tests {
         let runner = FakeRunner::ok("");
         let svc = test_service(runner.clone(), true);
         let s = svc
-            .launch(target(), "web", RcKind::ClaudeRc, Some("demo".into()), None, None)
+            .launch(
+                target(),
+                "web",
+                RcKind::ClaudeRc,
+                Some("demo".into()),
+                None,
+                None,
+            )
             .await
             .unwrap();
         assert_eq!(s.state, RcState::Ready);
         assert_eq!(s.host, "srv");
         assert_eq!(s.display_name, "demo");
         assert_eq!(s.tmux_session, format!("rc-{}", s.slug));
-        assert!(s.url.unwrap().starts_with("https://claude.ai/code/session_"));
+        assert!(s
+            .url
+            .unwrap()
+            .starts_with("https://claude.ai/code/session_"));
         assert!(s.managed);
         assert!(s.rc_id.is_some());
         assert_eq!(s.created_by.as_deref(), Some("shed-desktop/1.2.3"));
@@ -566,14 +575,23 @@ mod tests {
             .launch(target(), "web", RcKind::ClaudeBroker, None, None, None)
             .await
             .unwrap();
-        assert!(s.url.unwrap().starts_with("https://claude.ai/code?environment=env_"));
+        assert!(s
+            .url
+            .unwrap()
+            .starts_with("https://claude.ai/code?environment=env_"));
     }
 
     #[tokio::test]
     async fn test_mode_kill_removes_and_list_filters() {
         let svc = test_service(FakeRunner::ok(""), true);
-        let a = svc.launch(target(), "web", RcKind::Shell, None, None, None).await.unwrap();
-        let _b = svc.launch(target(), "api", RcKind::Shell, None, None, None).await.unwrap();
+        let a = svc
+            .launch(target(), "web", RcKind::Shell, None, None, None)
+            .await
+            .unwrap();
+        let _b = svc
+            .launch(target(), "api", RcKind::Shell, None, None, None)
+            .await
+            .unwrap();
         assert_eq!(svc.list(vec![], None, None).await.len(), 2);
         // filter by shed
         let only_web = svc.list(vec![], None, Some("web")).await;
@@ -589,17 +607,41 @@ mod tests {
         let svc = test_service(FakeRunner::ok(""), true);
         // control char
         assert!(matches!(
-            svc.launch(target(), "web", RcKind::ClaudeRc, None, None, Some("bad\nvalue".into())).await,
+            svc.launch(
+                target(),
+                "web",
+                RcKind::ClaudeRc,
+                None,
+                None,
+                Some("bad\nvalue".into())
+            )
+            .await,
             Err(RcError::BadRequest(_))
         ));
         // prompt for broker
         assert!(matches!(
-            svc.launch(target(), "web", RcKind::ClaudeBroker, None, None, Some("nope".into())).await,
+            svc.launch(
+                target(),
+                "web",
+                RcKind::ClaudeBroker,
+                None,
+                None,
+                Some("nope".into())
+            )
+            .await,
             Err(RcError::BadRequest(_))
         ));
         // control char in display name
         assert!(matches!(
-            svc.launch(target(), "web", RcKind::Shell, Some("a\nb".into()), None, None).await,
+            svc.launch(
+                target(),
+                "web",
+                RcKind::Shell,
+                Some("a\nb".into()),
+                None,
+                None
+            )
+            .await,
             Err(RcError::BadRequest(_))
         ));
     }
@@ -646,7 +688,14 @@ mod tests {
         let runner = FakeRunner::ok(DTO_JSON);
         let svc = test_service(runner.clone(), false);
         let s = svc
-            .launch(target(), "web", RcKind::ClaudeRc, None, Some("/w".into()), Some("hi".into()))
+            .launch(
+                target(),
+                "web",
+                RcKind::ClaudeRc,
+                None,
+                Some("/w".into()),
+                Some("hi".into()),
+            )
             .await
             .unwrap();
         // from_dto: the DTO's slug/id win; host/shed injected.
@@ -692,7 +741,9 @@ mod tests {
     async fn generate_slug_is_confusable_free_and_6_chars() {
         let s = generate_slug();
         assert_eq!(s.chars().count(), 6);
-        assert!(s.chars().all(|c| "abcdefghjkmnpqrstuvwxyz23456789".contains(c)));
+        assert!(s
+            .chars()
+            .all(|c| "abcdefghjkmnpqrstuvwxyz23456789".contains(c)));
     }
 
     // ---- regression: the timeout watchdog actually fires (adversarial finding 1) ----
@@ -762,7 +813,11 @@ mod tests {
         assert_eq!(both.len(), 2);
         // A list filtered to web probes only web; it must NOT clobber the api session.
         let web = svc
-            .list(vec![(shed_running("web", "srv"), target())], None, Some("web"))
+            .list(
+                vec![(shed_running("web", "srv"), target())],
+                None,
+                Some("web"),
+            )
             .await;
         assert_eq!(web.len(), 1);
         // The api session survives (a filtered read keeps un-probed sheds' rows).

@@ -42,6 +42,10 @@ const (
 	ClientCLI       = "cli"
 	ClientHostAgent = "host-agent"
 	ClientDesktop   = "desktop"
+	// ClientMobile is the shed mobile app. The app itself sends the literal
+	// "shed-mobile" on the wire today; the bootstrap parser normalizes that
+	// spelling to this canonical value (see internal/sshd/bootstrap.go).
+	ClientMobile = "mobile"
 )
 
 // record is the server-side record for one minted token. The plaintext is never

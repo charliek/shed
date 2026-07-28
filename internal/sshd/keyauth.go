@@ -49,6 +49,14 @@ type KeyAllowlist struct {
 
 	mu   sync.RWMutex
 	keys map[string]string // marshaled public key -> SHA-256 fingerprint
+	// fps is the same live key set indexed the other way: the set of
+	// gossh.FingerprintSHA256 strings currently allowlisted. It exists so the
+	// mtls HTTP path can answer "is this certificate CN still authorized?" in
+	// O(1) on every request without marshaling a key it does not have (a client
+	// certificate carries a fingerprint string, not the SSH public key). Always
+	// swapped together with keys, under the same lock, so the two views can
+	// never disagree.
+	fps map[string]struct{}
 
 	// onRemove, when set, is called (outside the lock) with the fingerprints of
 	// keys that left the allowlist on a rebuild, so a caller can revoke their
@@ -66,6 +74,7 @@ func NewKeyAllowlist(cfg *config.SSHAuthConfig, cacheDir string) (*KeyAllowlist,
 	a := &KeyAllowlist{
 		mode:       config.SSHAuthOff,
 		keys:       map[string]string{},
+		fps:        map[string]struct{}{},
 		lastGitHub: map[string][]byte{},
 	}
 	if cfg == nil || cfg.Mode == "" || cfg.Mode == config.SSHAuthOff {
@@ -116,6 +125,33 @@ func (a *KeyAllowlist) IsAuthorized(key gossh.PublicKey) bool {
 	return ok
 }
 
+// IsAuthorizedFingerprint reports whether a key with this SHA-256 fingerprint
+// is in the allowlist right now. fp must be in canonical gossh.FingerprintSHA256
+// form ("SHA256:<43 base64 chars>") — the same string the mtls bootstrap path
+// burns into an issued client certificate's Subject CN.
+//
+// It reads the LIVE in-memory set, so a key removed by a background refresh
+// stops being authorized as soon as that rebuild lands: the HTTP mtls
+// middleware calls this per request, which is how certificate revocation takes
+// effect without a CRL. The same last-known-good semantics as IsAuthorized
+// apply — a failed GitHub refetch never shrinks the set, so a transient outage
+// cannot revoke a live certificate.
+//
+// It answers only "is this fingerprint allowlisted", never "is the allowlist
+// being enforced": in off/warn mode the set may be empty or advisory, and this
+// returns false for everything it does not literally contain. Callers that must
+// fail closed therefore get that for free; callers in a non-enforcing posture
+// must not use it as an authorization oracle.
+func (a *KeyAllowlist) IsAuthorizedFingerprint(fp string) bool {
+	if fp == "" {
+		return false
+	}
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	_, ok := a.fps[fp]
+	return ok
+}
+
 func (a *KeyAllowlist) size() int {
 	a.mu.RLock()
 	defer a.mu.RUnlock()
@@ -163,9 +199,17 @@ func (a *KeyAllowlist) rebuild() error {
 		a.addGitHubUser(set, user)
 	}
 
+	// Derive the fingerprint index before taking the lock, then swap both views
+	// atomically so no reader can observe a keys/fps mismatch.
+	fps := make(map[string]struct{}, len(set))
+	for _, fingerprint := range set {
+		fps[fingerprint] = struct{}{}
+	}
+
 	a.mu.Lock()
 	old := a.keys
 	a.keys = set
+	a.fps = fps
 	a.mu.Unlock()
 
 	// Authoritative diff: a key in the old set but absent from the new one was

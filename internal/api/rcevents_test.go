@@ -295,7 +295,7 @@ func TestRCEvents_MethodGuard(t *testing.T) {
 // doesn't block on the long-lived SSE loop.
 func TestRCEvents_Scope(t *testing.T) {
 	be := &rcFakeBackend{} // empty: discover finds no sheds, no upstreams
-	srv, control, credentials := newSecureRCServer(t, be)
+	srv, control, credentials := newTokenModeRCServer(t, be)
 
 	call := func(token string, bound bool) int {
 		ctx := context.Background()

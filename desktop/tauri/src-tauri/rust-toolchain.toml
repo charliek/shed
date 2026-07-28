@@ -1,0 +1,14 @@
+# Mirrors crates/rust-toolchain.toml: channel = "stable" (not an exact version)
+# so the already-installed stable toolchain is used without rustup re-downloading
+# a pinned identity.
+#
+# It exists here because this is a SEPARATE workspace (deliberately — see
+# crates/CLAUDE.md's workspace-boundary rule), so it does not inherit the core
+# workspace's file. Without it a developer whose rustup DEFAULT is older than
+# this lockfile's MSRV floor (`time` needs 1.88) gets a resolution error that
+# looks like a dependency bug; CI never sees it because every Rust job installs
+# `stable` and uses it as the default.
+[toolchain]
+channel = "stable"
+components = ["rustfmt", "clippy"]
+profile = "minimal"

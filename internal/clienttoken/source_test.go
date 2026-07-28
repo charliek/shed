@@ -19,7 +19,7 @@ func TestNeedsRefresh(t *testing.T) {
 		{"zero expiry (static token / open server) never refreshes", time.Time{}, false},
 		{"far-future expiry does not refresh", now.Add(24 * time.Hour), false},
 		{"within the refresh window refreshes", now.Add(time.Hour), true},
-		{"exactly at the window edge refreshes", now.Add(tokenRefreshWindow), true},
+		{"exactly at the window edge refreshes", now.Add(RefreshWindow), true},
 		{"expired refreshes", now.Add(-time.Minute), true},
 	}
 	for _, tt := range tests {
@@ -33,11 +33,17 @@ func TestNeedsRefresh(t *testing.T) {
 
 // countingRefresh returns a refresh callback that mints "tokN" tokens and counts
 // invocations.
-func countingRefresh(count *int32, ttl time.Duration) func() (string, time.Time, error) {
-	return func() (string, time.Time, error) {
+func countingRefresh(count *int32, ttl time.Duration) func() (Credential, error) {
+	return func() (Credential, error) {
 		n := atomic.AddInt32(count, 1)
-		return "tok" + strconv.Itoa(int(n)), time.Now().Add(ttl), nil
+		return TokenCredential("tok"+strconv.Itoa(int(n)), time.Now().Add(ttl)), nil
 	}
+}
+
+// gen returns the source's current generation, for the prevGen argument.
+func gen(s *Source) uint64 {
+	_, g := s.Current()
+	return g
 }
 
 func TestStaticSourceNeverMints(t *testing.T) {
@@ -52,19 +58,19 @@ func TestStaticSourceNeverMints(t *testing.T) {
 	if s.Token() != "static-tok" {
 		t.Errorf("EnsureFresh mutated a static token: %q", s.Token())
 	}
-	tok, err := s.Refresh("static-tok")
+	cred, err := s.Refresh(gen(s))
 	if !errors.Is(err, ErrStatic) {
 		t.Errorf("Refresh on static: err = %v, want ErrStatic", err)
 	}
-	if tok != "" && tok != "static-tok" {
-		t.Errorf("Refresh on static returned unexpected token %q", tok)
+	if cred.Token != "static-tok" {
+		t.Errorf("Refresh on static returned unexpected token %q", cred.Token)
 	}
 }
 
 func TestEnsureFreshWithinWindowMintsOnce(t *testing.T) {
 	var count int32
 	// Expiry inside the window ⇒ EnsureFresh should mint.
-	s := New("old", time.Now().Add(time.Hour), countingRefresh(&count, 24*time.Hour))
+	s := New(TokenCredential("old", time.Now().Add(time.Hour)), countingRefresh(&count, 24*time.Hour))
 	s.EnsureFresh()
 	if got := atomic.LoadInt32(&count); got != 1 {
 		t.Fatalf("mint count = %d, want 1", got)
@@ -81,7 +87,7 @@ func TestEnsureFreshWithinWindowMintsOnce(t *testing.T) {
 
 func TestEnsureFreshFarFromExpiryDoesNotMint(t *testing.T) {
 	var count int32
-	s := New("old", time.Now().Add(24*time.Hour), countingRefresh(&count, 24*time.Hour))
+	s := New(TokenCredential("old", time.Now().Add(24*time.Hour)), countingRefresh(&count, 24*time.Hour))
 	s.EnsureFresh()
 	if got := atomic.LoadInt32(&count); got != 0 {
 		t.Errorf("mint count = %d, want 0 (far from expiry)", got)
@@ -94,26 +100,104 @@ func TestEnsureFreshFarFromExpiryDoesNotMint(t *testing.T) {
 func TestEnsureFreshZeroExpiryDoesNotMint(t *testing.T) {
 	var count int32
 	// Refreshable but zero expiry: proactive refresh must not fire.
-	s := New("old", time.Time{}, countingRefresh(&count, 24*time.Hour))
+	s := New(TokenCredential("old", time.Time{}), countingRefresh(&count, 24*time.Hour))
 	s.EnsureFresh()
 	if got := atomic.LoadInt32(&count); got != 0 {
 		t.Errorf("mint count = %d, want 0 (zero expiry)", got)
 	}
 }
 
+// TestCredentialUsable pins the predicate EnsureFresh uses to decide "we hold
+// nothing — mint before the first request". It is deliberately about the
+// PAYLOAD, not the mode: a recorded mode with its material missing is exactly
+// as unpresentable as no credential at all.
+func TestCredentialUsable(t *testing.T) {
+	tests := []struct {
+		name string
+		cred Credential
+		want bool
+	}{
+		{"a bearer token is usable", TokenCredential("tok", time.Now()), true},
+		{"a certificate is usable", MTLSCredential(certFor("c1"), time.Now()), true},
+		{"the zero credential holds nothing", Credential{}, false},
+		{"mtls with no certificate holds nothing", Credential{Mode: ModeMTLS}, false},
+		{"token mode with an empty token holds nothing", Credential{Mode: ModeToken}, false},
+		{"a certificate recorded under token mode is not presentable", Credential{Mode: ModeToken, Cert: certFor("c1")}, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := tt.cred.Usable(); got != tt.want {
+				t.Errorf("Usable = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+// TestEnsureFreshWithNoCredentialMints is the state-machine gap that made a
+// credential-less config entry fail forever: a Source that CAN mint but holds
+// nothing has no expiry to be near, so an expiry-only proactive check never
+// fires — and, holding nothing, it also has no credential for a server to
+// reject, so the reactive path has nothing to trigger on either. It must mint
+// up front.
+func TestEnsureFreshWithNoCredentialMints(t *testing.T) {
+	tests := []struct {
+		name    string
+		initial Credential
+	}{
+		{"no credential at all (entry stripped by an older client)", Credential{}},
+		{"mtls mode with no certificate (credential files gone)", Credential{Mode: ModeMTLS}},
+		{"mtls mode with no certificate and a far-future expiry", Credential{Mode: ModeMTLS, ExpiresAt: time.Now().Add(24 * time.Hour)}},
+		{"token mode with an empty token", Credential{Mode: ModeToken, ExpiresAt: time.Now().Add(24 * time.Hour)}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var count int32
+			s := New(tt.initial, countingRefresh(&count, 24*time.Hour))
+			s.EnsureFresh()
+			if got := atomic.LoadInt32(&count); got != 1 {
+				t.Fatalf("mint count = %d, want 1 (the source held nothing to present)", got)
+			}
+			if s.Token() != "tok1" {
+				t.Errorf("token = %q, want tok1", s.Token())
+			}
+			// And exactly once: the minted credential is usable and far from
+			// expiry, so a second call must be a no-op rather than an SSH
+			// round-trip per client construction.
+			s.EnsureFresh()
+			if got := atomic.LoadInt32(&count); got != 1 {
+				t.Errorf("mint count = %d after a successful mint, want 1", got)
+			}
+		})
+	}
+}
+
+// TestEnsureFreshWithNoCredentialStaysStatic: an open server holds nothing
+// either, and must NOT pay a mint for it. The gate is the refresh callback (a
+// static Source has none), not the credential.
+func TestEnsureFreshWithNoCredentialStaysStatic(t *testing.T) {
+	s := Static("")
+	if s.Refreshable() {
+		t.Fatal("an empty Static source must not be refreshable")
+	}
+	s.EnsureFresh() // must not panic, must not mint
+	if cred, _ := s.Current(); cred.Usable() {
+		t.Errorf("an open-server source acquired a credential: %+v", cred)
+	}
+}
+
 func TestRefreshMintsAndUpdatesExpiry(t *testing.T) {
 	var count int32
 	exp := time.Now().Add(24 * time.Hour)
-	s := New("old", time.Now().Add(time.Hour), func() (string, time.Time, error) {
+	s := New(TokenCredential("old", time.Now().Add(time.Hour)), func() (Credential, error) {
 		atomic.AddInt32(&count, 1)
-		return "new", exp, nil
+		return TokenCredential("new", exp), nil
 	})
-	tok, err := s.Refresh("old")
+	cred, err := s.Refresh(gen(s))
 	if err != nil {
 		t.Fatalf("Refresh: %v", err)
 	}
-	if tok != "new" || s.Token() != "new" {
-		t.Errorf("token = %q / %q, want new", tok, s.Token())
+	if cred.Token != "new" || s.Token() != "new" {
+		t.Errorf("token = %q / %q, want new", cred.Token, s.Token())
 	}
 	if !s.ExpiresAt().Equal(exp) {
 		t.Errorf("expiry = %v, want %v (updated on refresh)", s.ExpiresAt(), exp)
@@ -125,19 +209,20 @@ func TestRefreshMintsAndUpdatesExpiry(t *testing.T) {
 
 func TestRefreshGenerationAware(t *testing.T) {
 	var count int32
-	s := New("old", time.Now().Add(time.Hour), countingRefresh(&count, 24*time.Hour))
-	// First 401 with prev=old ⇒ mints (token becomes tok1).
-	if _, err := s.Refresh("old"); err != nil {
+	s := New(TokenCredential("old", time.Now().Add(time.Hour)), countingRefresh(&count, 24*time.Hour))
+	gen0 := gen(s)
+	// First auth failure at generation 0 ⇒ mints (token becomes tok1).
+	if _, err := s.Refresh(gen0); err != nil {
 		t.Fatal(err)
 	}
-	// A second, stale 401 that still thinks the token is "old" must NOT re-mint;
-	// it should observe the already-advanced token.
-	tok, err := s.Refresh("old")
+	// A second, stale auth failure that still names generation 0 must NOT
+	// re-mint; it should observe the already-advanced credential.
+	cred, err := s.Refresh(gen0)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if tok != "tok1" {
-		t.Errorf("stale Refresh returned %q, want the current tok1", tok)
+	if cred.Token != "tok1" {
+		t.Errorf("stale Refresh returned %q, want the current tok1", cred.Token)
 	}
 	if got := atomic.LoadInt32(&count); got != 1 {
 		t.Errorf("mint count = %d, want 1 (generation-aware, no double mint)", got)
@@ -146,14 +231,164 @@ func TestRefreshGenerationAware(t *testing.T) {
 
 func TestRefreshError(t *testing.T) {
 	sentinel := errors.New("mint boom")
-	s := New("old", time.Now().Add(time.Hour), func() (string, time.Time, error) {
-		return "", time.Time{}, sentinel
+	s := New(TokenCredential("old", time.Now().Add(time.Hour)), func() (Credential, error) {
+		return Credential{}, sentinel
 	})
-	if _, err := s.Refresh("old"); !errors.Is(err, sentinel) {
+	if _, err := s.Refresh(gen(s)); !errors.Is(err, sentinel) {
 		t.Errorf("Refresh err = %v, want the mint error", err)
 	}
 	if s.Token() != "old" {
 		t.Errorf("token = %q, want old (unchanged after a failed mint)", s.Token())
+	}
+}
+
+// TestRejectFailedMintDisqualifiesTheCredential pins the reactive-rejection
+// contract (whole-branch review blocker 4): after the server refuses a
+// credential and the replacement mint FAILS, EnsureFreshErr must stop
+// vouching for the rejected-but-locally-unexpired credential — it re-attempts
+// the mint and surfaces the mint error, instead of letting a retry silently
+// re-send what the server just refused.
+func TestRejectFailedMintDisqualifiesTheCredential(t *testing.T) {
+	sentinel := errors.New("ssh mint down")
+	var mints int32
+	s := New(TokenCredential("rejected", time.Now().Add(24*time.Hour)), func() (Credential, error) {
+		atomic.AddInt32(&mints, 1)
+		return Credential{}, sentinel
+	})
+
+	// Sanity: far-from-expiry credential passes EnsureFreshErr before the
+	// rejection — the disqualification below is Reject's doing, not expiry's.
+	if err := s.EnsureFreshErr(); err != nil {
+		t.Fatalf("EnsureFreshErr before rejection: %v", err)
+	}
+
+	if _, err := s.Reject(gen(s)); !errors.Is(err, sentinel) {
+		t.Fatalf("Reject err = %v, want the mint error", err)
+	}
+	// The credential itself survives — presenting something the server might
+	// still accept beats presenting nothing.
+	if s.Token() != "rejected" {
+		t.Errorf("token = %q, want the surviving rejected credential", s.Token())
+	}
+	// But EnsureFreshErr no longer vouches for it: it re-attempts the mint
+	// and surfaces the error.
+	if err := s.EnsureFreshErr(); !errors.Is(err, sentinel) {
+		t.Errorf("EnsureFreshErr after rejection = %v, want the mint error surfaced", err)
+	}
+	if got := atomic.LoadInt32(&mints); got != 2 {
+		t.Errorf("mint attempts = %d, want 2 (Reject + the re-attempt)", got)
+	}
+}
+
+// TestRejectRecoversOnNextSuccessfulMint: the rejection mark clears when a
+// mint succeeds, restoring the EnsureFreshErr fast path.
+func TestRejectRecoversOnNextSuccessfulMint(t *testing.T) {
+	var mints int32
+	fail := int32(1)
+	s := New(TokenCredential("rejected", time.Now().Add(24*time.Hour)), func() (Credential, error) {
+		atomic.AddInt32(&mints, 1)
+		if atomic.LoadInt32(&fail) == 1 {
+			return Credential{}, errors.New("ssh mint down")
+		}
+		return TokenCredential("fresh", time.Now().Add(24*time.Hour)), nil
+	})
+
+	if _, err := s.Reject(gen(s)); err == nil {
+		t.Fatal("Reject should fail while the minter is down")
+	}
+	atomic.StoreInt32(&fail, 0) // SSH is back
+	if err := s.EnsureFreshErr(); err != nil {
+		t.Fatalf("EnsureFreshErr with the minter back: %v", err)
+	}
+	if s.Token() != "fresh" {
+		t.Errorf("token = %q, want fresh", s.Token())
+	}
+	// The mark is cleared: no further mint on the next check.
+	before := atomic.LoadInt32(&mints)
+	if err := s.EnsureFreshErr(); err != nil {
+		t.Fatalf("EnsureFreshErr after recovery: %v", err)
+	}
+	if got := atomic.LoadInt32(&mints); got != before {
+		t.Errorf("mint attempts advanced %d→%d after recovery, want no further mints", before, got)
+	}
+}
+
+// TestRefreshFailureDoesNotDisqualify: a PROACTIVE refresh failing says
+// nothing about the credential it would have replaced — the server may still
+// accept it happily, so EnsureFreshErr keeps its fast path.
+func TestRefreshFailureDoesNotDisqualify(t *testing.T) {
+	calls := int32(0)
+	s := New(TokenCredential("current", time.Now().Add(24*time.Hour)), func() (Credential, error) {
+		atomic.AddInt32(&calls, 1)
+		return Credential{}, errors.New("transient")
+	})
+	if _, err := s.Refresh(gen(s)); err == nil {
+		t.Fatal("Refresh should surface the mint error")
+	}
+	if err := s.EnsureFreshErr(); err != nil {
+		t.Errorf("EnsureFreshErr after a failed PROACTIVE refresh = %v, want nil (credential not rejected)", err)
+	}
+	if got := atomic.LoadInt32(&calls); got != 1 {
+		t.Errorf("mint attempts = %d, want 1 (no forced re-mint)", got)
+	}
+}
+
+// TestRejectStaleGenerationDoesNotDisqualify: a caller whose rejection lost
+// the race against a concurrent successful re-mint must not poison the NEW
+// credential's standing.
+func TestRejectStaleGenerationDoesNotDisqualify(t *testing.T) {
+	s := New(TokenCredential("old", time.Now().Add(time.Hour)), func() (Credential, error) {
+		return TokenCredential("new", time.Now().Add(24*time.Hour)), nil
+	})
+	gen0 := gen(s)
+	if _, err := s.Refresh(gen0); err != nil { // concurrent re-mint already advanced
+		t.Fatal(err)
+	}
+	// The stale rejection names gen0; the current credential is gen1.
+	if _, err := s.Reject(gen0); err != nil {
+		t.Fatalf("stale Reject should observe the advanced credential, got %v", err)
+	}
+	if err := s.EnsureFreshErr(); err != nil {
+		t.Errorf("EnsureFreshErr = %v, want nil (new credential not marked rejected)", err)
+	}
+}
+
+// TestRejectLosingTheMintRaceDoesNotPoisonTheFreshCredential exercises the
+// gen-guard in Reject's marking branch. The production interleaving it stands
+// in for is two SEQUENTIAL singleflight batches: caller A's Reject(gen0) mint
+// fails and its batch completes; caller B's Refresh(gen0) then starts a NEW
+// batch that mints successfully (gen→1) — all before A, which is off the
+// lock between its batch returning and its marking, acquires mu. The
+// white-box mutation inside the failing callback (which runs without mu
+// held) reproduces that timing deterministically. The FRESH credential must
+// not inherit A's stale rejection. Without the locked `gen == prevGen` guard
+// this test fails: EnsureFreshErr would re-mint and surface an error against
+// a perfectly good credential.
+func TestRejectLosingTheMintRaceDoesNotPoisonTheFreshCredential(t *testing.T) {
+	var s *Source
+	var mints int32
+	s = New(TokenCredential("rejected", time.Now().Add(time.Hour)), func() (Credential, error) {
+		atomic.AddInt32(&mints, 1)
+		// A concurrent mint lands while this one is failing.
+		s.mu.Lock()
+		s.cred = TokenCredential("fresh", time.Now().Add(24*time.Hour))
+		s.gen++
+		s.credRejected = false
+		s.mu.Unlock()
+		return Credential{}, errors.New("this mint failed")
+	})
+
+	if _, err := s.Reject(gen(s)); err == nil {
+		t.Fatal("Reject should surface its own mint failure")
+	}
+	if s.Token() != "fresh" {
+		t.Fatalf("token = %q, want the concurrently-minted fresh one", s.Token())
+	}
+	if err := s.EnsureFreshErr(); err != nil {
+		t.Errorf("EnsureFreshErr = %v, want nil (the fresh credential must not carry the stale rejection)", err)
+	}
+	if got := atomic.LoadInt32(&mints); got != 1 {
+		t.Errorf("mint attempts = %d, want 1 (no forced re-mint of the fresh credential)", got)
 	}
 }
 
@@ -163,11 +398,12 @@ func TestRefreshError(t *testing.T) {
 func TestRefreshConcurrentCoalesces(t *testing.T) {
 	var count int32
 	release := make(chan struct{})
-	s := New("old", time.Now().Add(time.Hour), func() (string, time.Time, error) {
+	s := New(TokenCredential("old", time.Now().Add(time.Hour)), func() (Credential, error) {
 		atomic.AddInt32(&count, 1)
 		<-release // hold the mint open so concurrent callers pile onto singleflight
-		return "new", time.Now().Add(24 * time.Hour), nil
+		return TokenCredential("new", time.Now().Add(24*time.Hour)), nil
 	})
+	gen0 := gen(s)
 
 	const n = 16
 	var wg sync.WaitGroup
@@ -176,12 +412,12 @@ func TestRefreshConcurrentCoalesces(t *testing.T) {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			tok, err := s.Refresh("old")
+			cred, err := s.Refresh(gen0)
 			if err != nil {
 				t.Errorf("goroutine %d: %v", i, err)
 				return
 			}
-			toks[i] = tok
+			toks[i] = cred.Token
 		}(i)
 	}
 	// Let the goroutines enter Refresh, then release the single in-flight mint.
@@ -209,19 +445,21 @@ func TestRefreshDifferentGenerationsDoNotCoalesce(t *testing.T) {
 	var once sync.Once
 	mintStarted := make(chan struct{})
 	release := make(chan struct{})
-	s := New("cur", time.Now().Add(time.Hour), func() (string, time.Time, error) {
+	s := New(TokenCredential("cur", time.Now().Add(time.Hour)), func() (Credential, error) {
 		atomic.AddInt32(&count, 1)
 		once.Do(func() { close(mintStarted) })
 		<-release
-		return "minted", time.Now().Add(24 * time.Hour), nil
+		return TokenCredential("minted", time.Now().Add(24*time.Hour)), nil
 	})
+	gen0 := gen(s)
 
 	curDone := make(chan string, 1)
-	go func() { tok, _ := s.Refresh("cur"); curDone <- tok }() // current gen → mints (blocks)
-	<-mintStarted                                              // mint is in flight
+	go func() { c, _ := s.Refresh(gen0); curDone <- c.Token }() // current gen → mints (blocks)
+	<-mintStarted                                               // mint is in flight
 
 	staleDone := make(chan string, 1)
-	go func() { tok, _ := s.Refresh("stale"); staleDone <- tok }() // different gen → must not coalesce
+	// A DIFFERENT (already-superseded) generation must not coalesce onto it.
+	go func() { c, _ := s.Refresh(gen0 + 99); staleDone <- c.Token }()
 	select {
 	case tok := <-staleDone:
 		if tok != "cur" {
@@ -244,7 +482,7 @@ func TestRefreshDifferentGenerationsDoNotCoalesce(t *testing.T) {
 // under -race with no assertion beyond "no data race / no panic".
 func TestEnsureFreshAndRefreshRace(t *testing.T) {
 	var count int32
-	s := New("old", time.Now().Add(time.Hour), countingRefresh(&count, time.Hour))
+	s := New(TokenCredential("old", time.Now().Add(time.Hour)), countingRefresh(&count, time.Hour))
 	var wg sync.WaitGroup
 	for i := 0; i < 24; i++ {
 		wg.Add(1)
@@ -253,7 +491,7 @@ func TestEnsureFreshAndRefreshRace(t *testing.T) {
 			if i%2 == 0 {
 				s.EnsureFresh()
 			} else {
-				_, _ = s.Refresh(s.Token())
+				_, _ = s.Refresh(gen(s))
 			}
 			_ = s.Token()
 			_ = s.ExpiresAt()

@@ -97,6 +97,7 @@ def _broker_app(
     local_keys_ssh: bool = False,
     conflict_namespaces: tuple[str, ...] = (),
     clear_ssh_auth_sock: bool = True,
+    shed_config_path: Path = CONFIG,
 ):
     """Launch a self-managed tauri instance with a PRIVATE mock shed-server, yield
     `(client, mock, info)`, and tear both down. `info` carries `ssh_blob`, `audit_path`,
@@ -115,6 +116,10 @@ def _broker_app(
     * `conflict_namespaces` — pre-register these on the mock so their subscribe 409s.
     * `clear_ssh_auth_sock` — drop `$SSH_AUTH_SOCK` from the child env (default) so
       `ssh.mode: ""` auto-detect can never reach the developer's real ssh-agent.
+    * `shed_config_path` — the app's OWN `~/.shed/config.yaml` (`SHED_TAURI_SHED_CONFIG`),
+      i.e. what `hosts.auth` seeds its per-server credential modes from. Distinct from
+      `discovery_mock`, which writes the config the embedded BROKER discovers servers
+      through.
     """
     cfg = ui._SUBPROC["tauri"]
     if not cfg.binary.exists():
@@ -164,7 +169,7 @@ def _broker_app(
 
         env = ui.subproc_env(
             cfg, runtime_dir=runtime_dir, mock_base_url=mock.base_url,
-            config_path=CONFIG, host_agent_socket=host_agent_socket,
+            config_path=shed_config_path, host_agent_socket=host_agent_socket,
         )
         # subproc_env only SETS the host-agent socket when one is given; clear an
         # inherited value so `None` truly means "no configured desktop socket".
@@ -482,3 +487,56 @@ def test_synthesized_default_namespace_set():
             lambda: set(_server_ns_states(client.broker_status())) == {"ssh-agent", "docker-credentials"},
             timeout=20, what="exactly ssh-agent + docker-credentials subscribed")
         assert "aws-credentials" not in mock.subscribed_namespaces(), mock.subscribed_namespaces()
+
+
+# ---------------------------------------------------------------------------
+# Cell (f) — per-server credential mode across all three broker modes (plan 002 C3)
+# ---------------------------------------------------------------------------
+
+MTLS_CONFIG = FIXTURES / "config-mtls.yaml"
+
+
+@pytest.mark.parametrize(
+    "mode,use_fake_agent",
+    [("embedded", False), ("external", True), ("headless-coexist", False)],
+)
+def test_hosts_auth_surfaces_the_config_mode_in_every_broker_mode(mode, use_fake_agent):
+    """`hosts.auth` reports each server's credential mode regardless of WHICH broker
+    is doing the minting.
+
+    The three modes reach mtls by different routes — external relays the CSR over the
+    UDS, embedded and headless-coexist relay it into the in-process broker — but the
+    app's view of "what shape does this server issue" is one registry seeded from
+    config and updated by the core's CredentialObserver. This is the cell that would
+    fail if a mode were wired without it.
+
+    `learned` must be False everywhere: the hermetic mock is tokenless (no minter is
+    installed in test mode), so nothing has been proven, and a surface that echoed the
+    config into `learned` would be lying about the one thing it exists to report.
+    """
+    fake = None
+    sock = None
+    try:
+        if use_fake_agent:
+            fake = FakeHostAgent()
+            fake.start()
+            sock = fake.socket_path
+        elif mode == "headless-coexist":
+            # Only the STATUS socket is live ⇒ a headless daemon owns brokering;
+            # the app is configured with the (absent) desktop sibling.
+            fake = FakeHostAgent(status_only=True)
+            fake.start()
+            sock = os.path.join(os.path.dirname(fake.socket_path), "host-agent.sock")
+        with _broker_app(host_agent_socket=sock, shed_config_path=MTLS_CONFIG) as (
+            client, _mock, _info,
+        ):
+            assert client.broker_status()["effective_mode"] == mode
+            hosts = {h["name"]: h for h in client.hosts_auth()}
+            assert set(hosts) == {"legacy", "mock"}
+            assert hosts["mock"]["auth_mode"] == "mtls"
+            # ABSENT MEANS TOKEN — an entry written before certificates existed.
+            assert hosts["legacy"]["auth_mode"] == "token"
+            assert all(h["learned"] is False for h in hosts.values())
+    finally:
+        if fake:
+            fake.stop()
