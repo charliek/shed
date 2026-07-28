@@ -473,11 +473,23 @@ func hostPortFromAPIURL(apiURL string) (string, int, error) {
 func runServerRemove(cmd *cobra.Command, args []string) error {
 	name := args[0]
 
-	if err := clientConfig.RemoveServer(name); err != nil {
+	// "Is there such a server" is decided ONCE, here. Inside the update it
+	// could not be: Update applies its mutation to the fresh on-disk snapshot
+	// and then to the in-memory one, so a not-found error raised on the second
+	// application would report a failure for a removal already committed to
+	// disk. The mutation itself is idempotent — removing an absent entry is the
+	// state the caller asked for — so the two applications always agree.
+	if _, err := clientConfig.GetServer(name); err != nil {
 		return err
 	}
-
-	if err := clientConfig.Save(); err != nil {
+	if err := updateClientConfig(func(c *config.ClientConfig) error {
+		if _, ok := c.Servers[name]; ok {
+			// Ignores only the not-found error, which the guard above rules out
+			// for the in-memory snapshot and the check here rules out for disk.
+			_ = c.RemoveServer(name)
+		}
+		return nil
+	}); err != nil {
 		return fmt.Errorf("failed to save config: %w", err)
 	}
 
@@ -505,11 +517,16 @@ func runServerRemove(cmd *cobra.Command, args []string) error {
 func runServerSetDefault(cmd *cobra.Command, args []string) error {
 	name := args[0]
 
-	if err := clientConfig.SetDefaultServer(name); err != nil {
+	// Validated once, outside the update, for the same reason as the removal
+	// above: a mutation that can fail on its second application would report a
+	// failure for a change already on disk. What is left is a plain assignment.
+	if _, err := clientConfig.GetServer(name); err != nil {
 		return err
 	}
-
-	if err := clientConfig.Save(); err != nil {
+	if err := updateClientConfig(func(c *config.ClientConfig) error {
+		c.DefaultServer = name
+		return nil
+	}); err != nil {
 		return fmt.Errorf("failed to save config: %w", err)
 	}
 
@@ -563,9 +580,26 @@ func runServerUpdate(cmd *cobra.Command, args []string) error {
 	}
 	newFingerprint := normalizeTLSFingerprint(serverUpdateTLSFingerprint)
 
-	entry.TLSCertFingerprint = newFingerprint
-	clientConfig.Servers[name] = *entry
-	if err := clientConfig.Save(); err != nil {
+	// Write only the pin, onto whatever the entry currently is — not the whole
+	// `entry` snapshot read above. A credential refresh in another process may
+	// have rewritten this row's token or certificate paths since; re-pinning
+	// must not roll those back.
+	//
+	// The entry's existence was established by the GetServer at the top of this
+	// function; a row that has vanished from a snapshot since is skipped rather
+	// than raised, because Update applies this twice and an error on the second
+	// application would report a failure for a pin already written. Skipping is
+	// also the right merge: re-creating the row from a lone fingerprint would
+	// resurrect a server the user just removed.
+	if err := updateClientConfig(func(c *config.ClientConfig) error {
+		stored, ok := c.Servers[name]
+		if !ok {
+			return nil
+		}
+		stored.TLSCertFingerprint = newFingerprint
+		c.Servers[name] = stored
+		return nil
+	}); err != nil {
 		return fmt.Errorf("failed to save config: %w", err)
 	}
 

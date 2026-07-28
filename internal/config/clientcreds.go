@@ -93,6 +93,29 @@ func StageClientCredentials(name string, certPEM, keyPEM []byte) (*StagedClientC
 	return clientCredStore().Stage(name, certPEM, keyPEM)
 }
 
+// LockServerCredentials takes the exclusive advisory lock guarding one server's
+// credential pair and returns the release function.
+//
+// It is exported so a caller can hold that lock across a SEQUENCE the store
+// cannot see as one operation — specifically, the CLI's credential persists,
+// which have to update config.yaml and the credential files together. Writing
+// the files and updating the config are two separately-locked commits, and a
+// token↔mtls flip racing an mtls enrollment can interleave them into "config
+// names a certificate that the other persist just deleted". Holding this lock
+// across both halves is what makes that pair atomic.
+//
+// LOCK ORDERING (the whole invariant, in one place): this lock is taken BEFORE
+// the client-config file lock, never after, and no path takes it while holding
+// the config lock. Update's mutation closure must therefore never call anything
+// in this file — Load/Write/Remove/Stage/Commit all sit under this lock.
+//
+// It is NOT re-entrant: flock keys on the open file description, so calling
+// LoadClientCredentials or WriteClientCredentials (which take the same lock
+// internally) while holding this one deadlocks the process against itself.
+// Callers hold it around Remove — which does not lock — and around config
+// updates.
+func LockServerCredentials(name string) (func(), error) { return clientCredStore().Lock(name) }
+
 // RemoveServerCredentials deletes a server's credential directory. It is called
 // by `shed server rm`: leaving a private key behind for a server the user has
 // explicitly forgotten is exactly the kind of quiet residue that turns up years

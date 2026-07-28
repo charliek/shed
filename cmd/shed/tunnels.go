@@ -315,7 +315,7 @@ func tunnelCredentialSource(client *APIClient, entry *config.ServerEntry, target
 		return nil
 	}
 	cred, _ := client.CredentialSource().Current()
-	return clienttoken.New(cred, controlCredentialRefresh(entry.Host, entry.SSHPort, "")) // "" persistName ⇒ mint-only
+	return clienttoken.New(cred, controlCredentialRefresh(*entry, "")) // "" persistName ⇒ mint-only
 }
 
 func runForegroundTunnel(mgr *tunnels.Manager, shedName string, target tunnels.ConnectTarget, source *clienttoken.Source, ports []tunnels.PortMapping, profile string) error {

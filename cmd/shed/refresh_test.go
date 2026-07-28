@@ -150,16 +150,16 @@ func TestProactiveRefreshOnNearExpiry(t *testing.T) {
 	defer func() { clientConfig, bootstrapCredentialFn = origCfg, origBF }()
 
 	cfgPath := filepath.Join(t.TempDir(), "config.yaml")
-	cfg, err := config.LoadClientConfigFromPath(cfgPath) // empty, but with its path set so Save works
+	cfg, err := config.LoadClientConfigFromPath(cfgPath) // empty, but with its path set so writes work
 	if err != nil {
 		t.Fatal(err)
 	}
 	clientConfig = cfg
 	nearExpiry := time.Now().Add(30 * time.Minute) // inside the 2h window
-	clientConfig.Servers["s"] = config.ServerEntry{
+	putServerEntry(t, "s", config.ServerEntry{
 		Host: "h", SSHPort: 2222, APIURL: "https://h:8443",
 		ControlToken: "old", ControlTokenExpiresAt: nearExpiry,
-	}
+	})
 
 	newExpiry := time.Now().Add(24 * time.Hour)
 	bootstrapCredentialFn = func(string, int, string, string) (sdk.Credential, error) {
@@ -243,10 +243,10 @@ func TestConcurrentRefreshNoRace(t *testing.T) {
 	clientConfig = cfg
 	nearExpiry := time.Now().Add(30 * time.Minute) // inside the 2h window → all refresh
 	for _, n := range []string{"s1", "s2", "s3", "s4", "s5", "s6", "s7", "s8"} {
-		clientConfig.Servers[n] = config.ServerEntry{
+		putServerEntry(t, n, config.ServerEntry{
 			Host: n + ".example", SSHPort: 2222, APIURL: "https://" + n + ".example:8443",
 			ControlToken: "old", ControlTokenExpiresAt: nearExpiry,
-		}
+		})
 	}
 	newExpiry := time.Now().Add(24 * time.Hour)
 	bootstrapCredentialFn = func(host string, _ int, _, _ string) (sdk.Credential, error) {

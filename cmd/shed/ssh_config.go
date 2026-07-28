@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"sort"
+	"time"
 
 	"github.com/spf13/cobra"
 
@@ -149,6 +150,13 @@ func getShedInfo(name string) ([]shedInfo, error) {
 
 func getAllShedsInfo() ([]shedInfo, error) {
 	var result []shedInfo
+	// Cache rows are collected during the scan and written in ONE locked
+	// update at the end: the mutation closure has to be a pure function of the
+	// config it is handed (it runs against the fresh on-disk snapshot and then
+	// against the in-memory one), so it cannot be interleaved with the HTTP
+	// calls that produce the rows.
+	type cacheRow struct{ name, server, status string }
+	var cacheRows []cacheRow
 
 	// Query all servers for their sheds
 	for serverName, entry := range clientConfig.Servers {
@@ -169,12 +177,20 @@ func getAllShedsInfo() ([]shedInfo, error) {
 				server:     &entryCopy,
 			})
 			// Update cache
-			clientConfig.CacheShed(shed.Name, serverName, shed.Status)
+			cacheRows = append(cacheRows, cacheRow{shed.Name, serverName, shed.Status})
 		}
 	}
 
-	// Save updated cache
-	if err := clientConfig.Save(); err != nil {
+	// Save updated cache. One timestamp for the whole batch: Update applies the
+	// closure to the fresh on-disk snapshot and then to the in-memory one, and a
+	// per-call time.Now() would make those two disagree.
+	cachedAt := time.Now()
+	if err := updateClientConfig(func(c *config.ClientConfig) error {
+		for _, r := range cacheRows {
+			c.CacheShedAt(r.name, r.server, r.status, cachedAt)
+		}
+		return nil
+	}); err != nil {
 		if verboseLevel > 0 {
 			fmt.Fprintf(os.Stderr, "Warning: failed to save cache: %v\n", err)
 		}

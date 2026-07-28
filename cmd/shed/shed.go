@@ -258,8 +258,7 @@ func runCreate(cmd *cobra.Command, args []string) error {
 	}
 
 	// Cache the shed location
-	clientConfig.CacheShed(name, serverName, shed.Status)
-	if err := clientConfig.Save(); err != nil {
+	if err := cacheShedLocation(name, serverName, shed.Status); err != nil {
 		fmt.Fprintf(os.Stderr, "Warning: failed to save cache: %v\n", err)
 	}
 
@@ -358,8 +357,6 @@ func runList(cmd *cobra.Command, args []string) error {
 			}
 			for _, shed := range resp.Sheds {
 				allSheds = append(allSheds, shedWithServer{shed: shed, server: name})
-				// Update cache
-				clientConfig.CacheShed(shed.Name, name, shed.Status)
 			}
 		}
 	} else {
@@ -370,13 +367,21 @@ func runList(cmd *cobra.Command, args []string) error {
 		}
 		for _, shed := range resp.Sheds {
 			allSheds = append(allSheds, shedWithServer{shed: shed, server: serverName})
-			// Update cache
-			clientConfig.CacheShed(shed.Name, serverName, shed.Status)
 		}
 	}
 
-	// Save updated cache
-	if err := clientConfig.Save(); err != nil {
+	// Save the updated cache in ONE locked update: the mutation closure runs
+	// against the fresh on-disk snapshot and then against the in-memory one, so
+	// it has to be a pure function of the config it is handed — collected rows
+	// rather than work interleaved with the calls above, and one timestamp
+	// taken here rather than a fresh time.Now() per application.
+	cachedAt := time.Now()
+	if err := updateClientConfig(func(c *config.ClientConfig) error {
+		for _, s := range allSheds {
+			c.CacheShedAt(s.shed.Name, s.server, s.shed.Status, cachedAt)
+		}
+		return nil
+	}); err != nil {
 		if verboseLevel > 0 {
 			fmt.Fprintf(os.Stderr, "Warning: failed to save cache: %v\n", err)
 		}
@@ -714,8 +719,10 @@ func runDelete(cmd *cobra.Command, args []string) error {
 	}
 
 	// Remove from cache
-	clientConfig.RemoveShedCache(name)
-	if err := clientConfig.Save(); err != nil {
+	if err := updateClientConfig(func(c *config.ClientConfig) error {
+		c.RemoveShedCache(name)
+		return nil
+	}); err != nil {
 		if verboseLevel > 0 {
 			fmt.Fprintf(os.Stderr, "Warning: failed to save cache: %v\n", err)
 		}
@@ -760,8 +767,7 @@ func runStart(cmd *cobra.Command, args []string) error {
 	}
 
 	// Update cache
-	clientConfig.CacheShed(name, serverName, shed.Status)
-	if err := clientConfig.Save(); err != nil {
+	if err := cacheShedLocation(name, serverName, shed.Status); err != nil {
 		if verboseLevel > 0 {
 			fmt.Fprintf(os.Stderr, "Warning: failed to save cache: %v\n", err)
 		}
@@ -803,8 +809,7 @@ func runStop(cmd *cobra.Command, args []string) error {
 	}
 
 	// Update cache
-	clientConfig.CacheShed(name, serverName, shed.Status)
-	if err := clientConfig.Save(); err != nil {
+	if err := cacheShedLocation(name, serverName, shed.Status); err != nil {
 		if verboseLevel > 0 {
 			fmt.Fprintf(os.Stderr, "Warning: failed to save cache: %v\n", err)
 		}

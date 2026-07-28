@@ -199,7 +199,7 @@ func newAPIClientFromEntry(entry *config.ServerEntry, persistName, unpersistedRe
 		// before client certificates existed.
 		return newAPIClient(entry.BaseURL(), entry.ControlToken, entry.TLSCertFingerprint, createTimeout)
 	}
-	refresh := controlCredentialRefresh(entry.Host, entry.SSHPort, persistName)
+	refresh := controlCredentialRefresh(*entry, persistName)
 	if unpersistedReason != "" {
 		refresh = observableMintOnlyRefresh(entry.Host, unpersistedReason, refresh)
 	}
@@ -294,19 +294,25 @@ func loadClientCert(entry *config.ServerEntry, name string) (*tls.Certificate, e
 // is actually in. Whichever comes back is adopted here AND written to the
 // stored entry — that write is the mode-flip migration, and it runs in both
 // directions.
-func controlCredentialRefresh(host string, sshPort int, persistName string) func() (clienttoken.Credential, error) {
+//
+// endpoint is the entry this client was built from, carried through so the
+// persist can re-verify — under the config lock, against the config as it is at
+// persist time — that persistName still names THIS endpoint. Host and ssh port
+// alone would not be enough for that check, and by the time a mint completes
+// the name may have been removed or repointed by another process.
+func controlCredentialRefresh(endpoint config.ServerEntry, persistName string) func() (clienttoken.Credential, error) {
 	return func() (clienttoken.Credential, error) {
-		res, err := bootstrapCredentialFn(host, sshPort, "control", "cli")
+		res, err := bootstrapCredentialFn(endpoint.Host, endpoint.SSHPort, "control", "cli")
 		if err != nil {
 			return clienttoken.Credential{}, err
 		}
 		if res.Mode() == sdk.AuthModeMTLS {
-			return adoptMTLSCredential(res, persistName)
+			return adoptMTLSCredential(res, persistName, endpoint)
 		}
 		if persistName != "" {
 			// Best-effort: a Save failure never wastes the mint or fails the
 			// request (the next process just re-mints).
-			persistTokenCredential(persistName, res.Bundle.Token, res.Bundle.ExpiresAt)
+			persistTokenCredential(persistName, endpoint, res.Bundle.Token, res.Bundle.ExpiresAt)
 		}
 		return clienttoken.TokenCredential(res.Bundle.Token, res.Bundle.ExpiresAt), nil
 	}
@@ -321,24 +327,65 @@ func controlCredentialRefresh(host string, sshPort int, persistName string) func
 // re-enrolls. That mirrors the token path exactly — the alternative (failing the
 // user's command because a file write failed) trades a working request for a
 // tidy disk.
-func adoptMTLSCredential(res sdk.Credential, persistName string) (clienttoken.Credential, error) {
+func adoptMTLSCredential(res sdk.Credential, persistName string, endpoint config.ServerEntry) (clienttoken.Credential, error) {
 	cert, err := tls.X509KeyPair([]byte(res.Bundle.ClientCert), res.KeyPEM)
 	if err != nil {
 		return clienttoken.Credential{}, fmt.Errorf("assemble issued client certificate: %w", err)
 	}
 	if persistName != "" {
-		persistMTLSCredential(persistName, res)
+		persistMTLSCredential(persistName, endpoint, res)
 	}
 	return clienttoken.MTLSCredential(&cert, res.Bundle.ExpiresAt), nil
 }
 
-// configMu serializes refresh-path access to the shared clientConfig global —
-// the server-name lookup and credential persist (map write + Save). The
-// `--all` fan-out (forEachServer) constructs clients, and thus refreshes,
-// concurrently across goroutines; without this, two near-expiry refreshes would
-// race on the Servers map (a fatal "concurrent map writes") and clobber each
-// other's config.yaml save.
+// configMu serializes access to the shared clientConfig global WITHIN this
+// process — the server-name lookups (matchingServerName, verifiedServerName)
+// and every mutation. The `--all` fan-out (forEachServer) constructs clients,
+// and thus refreshes, concurrently across goroutines; without this, two
+// near-expiry refreshes would race on the Servers map (a fatal "concurrent map
+// writes").
+//
+// It says nothing about other PROCESSES. Cross-process correctness is
+// ClientConfig.Update's file lock (internal/config): every write in this
+// package goes through updateClientConfig, which takes configMu and then calls
+// Update. The two mutexes are layered, not alternatives — configMu makes reads
+// and writes mutually exclusive in-process, Update's file lock makes the
+// read-modify-write of config.yaml atomic against a second `shed`.
 var configMu sync.Mutex
+
+// updateClientConfig is the single write path for the shared clientConfig: it
+// holds configMu (against this process's concurrent readers) across
+// ClientConfig.Update (which holds the config FILE lock against other
+// processes, loads a fresh on-disk snapshot, saves it, and only then re-applies
+// the mutation in memory).
+//
+// Every mutation closure must be a pure function of the config it is handed —
+// Update runs it twice, once on the fresh snapshot and once on the in-memory
+// one — so it must not read the clientConfig global or accumulate state.
+//
+// LOCK ORDERING: a caller that also needs a server's credential lock
+// (config.LockServerCredentials) takes THAT first. Nothing reached from here
+// touches the credential store, so the order can never invert.
+func updateClientConfig(mutate func(*config.ClientConfig) error) error {
+	configMu.Lock()
+	defer configMu.Unlock()
+	return clientConfig.Update(mutate)
+}
+
+// cacheShedLocation records where a shed lives, through the locked write path.
+// The create/start/stop commands all end with exactly this one-line mutation.
+//
+// The timestamp is taken ONCE and passed in: Update applies the mutation to the
+// fresh on-disk snapshot and then to the in-memory one, so a CacheShed that
+// stamped time.Now() itself would leave the file and the running process
+// holding rows that differ in updated_at for no reason anyone chose.
+func cacheShedLocation(shedName, serverName, status string) error {
+	now := time.Now()
+	return updateClientConfig(func(c *config.ClientConfig) error {
+		c.CacheShedAt(shedName, serverName, status, now)
+		return nil
+	})
+}
 
 // persistTokenCredential writes a freshly re-minted control token back to the
 // named config entry and saves. It is best-effort: name == "" (no unambiguous
@@ -358,13 +405,41 @@ var configMu sync.Mutex
 // pointing at credentials that no longer exist. Keeping them costs an orphaned
 // key only in the case where the config still refers to it — and the next
 // successful save cleans it up.
-func persistTokenCredential(name, token string, expiresAt time.Time) {
+//
+// LOCK ORDERING — the server's credential lock is taken FIRST and held across
+// BOTH the config update and the deletion, then the config file lock is taken
+// underneath it (inside saveServerEntry). Holding it across the pair is what
+// closes the token↔mtls transition race: a concurrent mtls persist cannot slip
+// its own config update between this save and this deletion and end up naming
+// files this call is about to remove (see persistMTLSCredential, which takes
+// the same lock in the same order). No path anywhere takes a credential lock
+// while holding the config lock, so the two can never deadlock.
+//
+// It is taken unconditionally, before anything is read, rather than only when a
+// certificate turns out to need deleting: which snapshot holds one is precisely
+// what a concurrent flip can change under us, so deciding first and locking
+// second would re-open the window. The cost is an empty lock file under
+// ~/.shed/creds for token-only servers, which is inert.
+func persistTokenCredential(name string, endpoint config.ServerEntry, token string, expiresAt time.Time) {
 	if name == "" {
 		return
 	}
-	var hadCert bool
-	saveErr := saveServerEntry(name, "refreshed token", func(e *config.ServerEntry) {
-		hadCert = e.AuthMode == config.AuthModeMTLS
+	unlockCreds, err := config.LockServerCredentials(name)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "warning: could not lock the credential store for %q: %v\n", name, err)
+		return
+	}
+	defer unlockCreds()
+
+	// True if ANY view of this entry held a certificate: the entry this client
+	// was built from (which is what the deletion is cleaning up after, and the
+	// only view available when the save fails before it can read the file),
+	// plus whichever snapshot saveServerEntry's mutation sees.
+	hadCert := endpoint.AuthMode == config.AuthModeMTLS
+	saveErr := saveServerEntry(name, "refreshed token", endpoint, func(e *config.ServerEntry) {
+		if e.AuthMode == config.AuthModeMTLS {
+			hadCert = true
+		}
 		e.AuthMode = config.AuthModeToken
 		e.ControlToken = token
 		e.ControlTokenExpiresAt = expiresAt
@@ -380,7 +455,9 @@ func persistTokenCredential(name, token string, expiresAt time.Time) {
 		return
 	}
 	// The config is now saved WITHOUT the paths, so a removal failure can only
-	// leave an orphan file — never a config pointing at a deleted one.
+	// leave an orphan file — never a config pointing at a deleted one. Remove
+	// takes no lock of its own, which is exactly why it is safe to call while
+	// holding this one.
 	if err := config.RemoveServerCredentials(name); err != nil {
 		fmt.Fprintf(os.Stderr, "warning: could not remove stale client certificate for %q: %v\n", name, err)
 	}
@@ -394,13 +471,38 @@ func persistTokenCredential(name, token string, expiresAt time.Time) {
 //
 // Same best-effort contract as persistTokenCredential: every failure is a
 // warning, because the credential is already usable in memory.
-func persistMTLSCredential(name string, res sdk.Credential) {
+//
+// LOCK ORDERING — same invariant as persistTokenCredential, and the reason the
+// existence re-check below is not paranoia. WriteClientCredentials takes the
+// server's credential lock internally and releases it before returning (flock
+// is not re-entrant, so this call cannot be made under our own hold of it), so
+// there IS a window between the write and the config update in which a
+// concurrent mtls→token persist can delete the pair. Taking the lock after the
+// write and re-checking the files under it closes that window: from here to the
+// end of the config update, nothing can remove them.
+func persistMTLSCredential(name string, endpoint config.ServerEntry, res sdk.Credential) {
 	certPath, keyPath, err := config.WriteClientCredentials(name, []byte(res.Bundle.ClientCert), res.KeyPEM)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "warning: could not store client certificate for %q: %v\n", name, err)
 		return
 	}
-	_ = saveServerEntry(name, "client certificate", func(e *config.ServerEntry) {
+
+	unlockCreds, err := config.LockServerCredentials(name)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "warning: could not lock the credential store for %q: %v\n", name, err)
+		return
+	}
+	defer unlockCreds()
+
+	for _, p := range []string{certPath, keyPath} {
+		if _, err := os.Stat(p); err != nil {
+			fmt.Fprintf(os.Stderr, "warning: not recording a client certificate for %q: "+
+				"%s went away before it could be persisted (a concurrent switch back to token mode)\n", name, p)
+			return
+		}
+	}
+
+	_ = saveServerEntry(name, "client certificate", endpoint, func(e *config.ServerEntry) {
 		e.AuthMode = config.AuthModeMTLS
 		e.ClientCertFile = certPath
 		e.ClientKeyFile = keyPath
@@ -410,27 +512,59 @@ func persistMTLSCredential(name string, res sdk.Credential) {
 	})
 }
 
-// saveServerEntry applies mutate to the named config entry and saves, holding
-// configMu across the read-modify-write + Save. Every credential persist goes
-// through here, so the locking discipline the `--all` fan-out depends on lives
-// in exactly one place. what names the credential for the warning a failed Save
-// prints; the failure is never fatal (see persistTokenCredential).
+// saveServerEntry applies mutate to the named config entry through
+// updateClientConfig — configMu in-process, the config file lock across
+// processes, mutation applied to a fresh on-disk snapshot and then to the
+// in-memory one. Every credential persist goes through here, so the locking
+// discipline lives in exactly one place. what names the credential for the
+// warning a failed save prints; the failure is never fatal (see
+// persistTokenCredential).
 //
-// It warns AND returns the save error. The warning is the user-facing half and
-// every caller relies on it; the return value exists for the one caller that
-// must not proceed on a failed save — deleting superseded credential files is
-// only safe once the config that stopped referring to them is durable.
-func saveServerEntry(name, what string, mutate func(*config.ServerEntry)) error {
-	configMu.Lock()
-	defer configMu.Unlock()
-	e := clientConfig.Servers[name]
-	mutate(&e)
-	clientConfig.Servers[name] = e
-	if err := clientConfig.Save(); err != nil {
-		fmt.Fprintf(os.Stderr, "warning: could not persist %s for %q: %v\n", what, name, err)
-		return err
+// endpoint is what the credential was minted against, and the entry is
+// RE-VERIFIED against it inside the lock — the same test verifiedServerName
+// applies before a client is built, applied again at the only moment that
+// matters. Minting is an SSH round-trip; a `shed server rm` or a `shed server
+// update` in another process can land inside it. Without the re-check, a
+// removed entry would be resurrected by the persist (as a bare credential row
+// for a server the user deleted) and a repointed one would be handed a private
+// key issued by a different server. Both abort instead: the credential stays
+// usable in memory for this command and the next process re-enrolls.
+//
+// It warns AND returns the error. The warning is the user-facing half and every
+// caller relies on it; the return value exists for the one caller that must not
+// proceed on a failed save — deleting superseded credential files is only safe
+// once the config that stopped referring to them is durable.
+func saveServerEntry(name, what string, endpoint config.ServerEntry, mutate func(*config.ServerEntry)) error {
+	applied := 0
+	err := updateClientConfig(func(c *config.ClientConfig) error {
+		stored, ok := c.Servers[name]
+		if !ok {
+			return fmt.Errorf("configured server %q no longer exists", name)
+		}
+		if !sameServerEndpoint(stored, endpoint) {
+			return fmt.Errorf("configured server %q no longer names the endpoint this credential was issued for", name)
+		}
+		mutate(&stored)
+		c.Servers[name] = stored
+		applied++
+		return nil
+	})
+	if err == nil {
+		return nil
 	}
-	return nil
+	// Which application refused decides what this failure MEANS. Update runs
+	// the mutation on the fresh on-disk snapshot first and writes the file
+	// between the two, so a refusal with something already applied is the
+	// in-memory one — the durable half is done, and reporting a failure would
+	// make the caller skip the credential-file deletion that the completed save
+	// has already made safe. Only a refusal before any application is a persist
+	// that did not happen.
+	if applied > 0 {
+		fmt.Fprintf(os.Stderr, "warning: persisted %s for %q, but this process's in-memory config no longer matches: %v\n", what, name, err)
+		return nil
+	}
+	fmt.Fprintf(os.Stderr, "warning: could not persist %s for %q: %v\n", what, name, err)
+	return err
 }
 
 // serverNameForEntry returns the config name whose stored entry UNIQUELY matches

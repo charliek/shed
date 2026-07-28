@@ -848,17 +848,36 @@ func addOverHTTP(host string, sshPort int) error {
 	return reportAddedServer(name, entry)
 }
 
-// saveAddedServer commits the new entry to config.yaml, restoring the in-memory
-// config if the write fails — a failed add must leave the process's view of the
-// config identical to the file's.
+// saveAddedServer commits the new entry to config.yaml through the locked
+// update primitive, so the add merges into whatever a concurrent `shed` process
+// has committed rather than renaming a stale whole-file snapshot over it.
+//
+// A failed add leaves the process's view of the config identical to the file's
+// with no explicit rollback: Update mutates the in-memory config only AFTER the
+// file write succeeds.
+//
+// The duplicate check and the AddedAt stamp both happen HERE, before the
+// update, rather than inside it via ClientConfig.AddServer. Update applies its
+// mutation twice — once to the fresh on-disk snapshot, once to the in-memory
+// one — so a mutation that stamps time.Now() would write two different instants
+// to the two, and a mutation that can return an error would report a FAILED add
+// for a row already durably on disk. What goes into the closure is therefore a
+// plain, idempotent assignment of one fully-formed entry.
 func saveAddedServer(name string, entry config.ServerEntry) error {
-	prevDefault := clientConfig.DefaultServer
-	if err := clientConfig.AddServer(name, entry); err != nil {
-		return err
+	if _, exists := clientConfig.Servers[name]; exists {
+		return fmt.Errorf("server '%s' already exists", name)
 	}
-	if err := clientConfig.Save(); err != nil {
-		delete(clientConfig.Servers, name)
-		clientConfig.DefaultServer = prevDefault
+	entry.AddedAt = time.Now()
+	if err := updateClientConfig(func(c *config.ClientConfig) error {
+		c.Servers[name] = entry
+		// First server wins the default, per snapshot: if another process has
+		// meanwhile set one on disk, that choice stands and only this process's
+		// (defaultless) view adopts the new entry.
+		if c.DefaultServer == "" {
+			c.DefaultServer = name
+		}
+		return nil
+	}); err != nil {
 		return fmt.Errorf("failed to save config: %w", err)
 	}
 	return nil
@@ -1007,17 +1026,15 @@ func refetchAfterHostKey(name string, entry *config.ServerEntry, pin pinnedHostK
 	return nil
 }
 
-// saveUpdatedServer writes a modified entry back to config.yaml, restoring the
-// previous in-memory entry if the write fails.
+// saveUpdatedServer writes a modified entry back to config.yaml through the
+// locked update primitive. No explicit in-memory rollback is needed: Update
+// applies the mutation in memory only after the file write has succeeded, so a
+// failure leaves this process's view exactly as the file's.
 func saveUpdatedServer(name string, updated config.ServerEntry) error {
-	prev, existed := clientConfig.Servers[name]
-	clientConfig.Servers[name] = updated
-	if err := clientConfig.Save(); err != nil {
-		if existed {
-			clientConfig.Servers[name] = prev
-		} else {
-			delete(clientConfig.Servers, name)
-		}
+	if err := updateClientConfig(func(c *config.ClientConfig) error {
+		c.Servers[name] = updated
+		return nil
+	}); err != nil {
 		return fmt.Errorf("failed to save config: %w", err)
 	}
 	return nil

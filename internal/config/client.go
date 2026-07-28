@@ -1,13 +1,19 @@
 package config
 
 import (
+	"errors"
 	"fmt"
+	"maps"
+	"math/rand/v2"
 	"net"
 	"net/url"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
+	"sync"
+	"syscall"
 	"time"
 
 	"gopkg.in/yaml.v3"
@@ -19,6 +25,23 @@ type ClientConfig struct {
 	DefaultServer string                 `yaml:"default_server"`
 	Sheds         map[string]ShedCache   `yaml:"sheds"`
 	CreateTimeout time.Duration          `yaml:"create_timeout,omitempty"`
+
+	// updateMu serializes Update against itself inside THIS process, so the
+	// read-modify-write it performs on the in-memory maps is never interleaved
+	// with another goroutine's.
+	//
+	// It is deliberately narrow: it guards mutation, not reading. The CLI keeps
+	// its own package-level `configMu` (cmd/shed/client.go) around the paths
+	// that READ the shared clientConfig maps — the server-name lookups the
+	// `--all` fan-out performs concurrently — and routes every write through
+	// one helper that takes configMu and then calls Update. That is what makes
+	// reads and writes mutually exclusive; this mutex only guarantees that
+	// Update itself is atomic for any other holder of the same *ClientConfig.
+	//
+	// Nothing outside Update takes it, so it can never be held while the config
+	// FILE lock is being acquired by an unrelated path (see Update's ordering
+	// note).
+	updateMu sync.Mutex
 
 	// Path to config file (not serialized)
 	path string `yaml:"-"`
@@ -234,7 +257,130 @@ func LoadClientConfigFromPath(path string) (*ClientConfig, error) {
 	return cfg, nil
 }
 
+// clientConfigLockName is the basename of the advisory lock file that
+// serializes whole-file client-config updates ACROSS PROCESSES.
+//
+// It is a SIBLING of config.yaml — derived from the config path, so a config
+// loaded from an arbitrary location (LoadClientConfigFromPath) locks beside
+// itself rather than against some other tree's file — and deliberately NOT the
+// credential store's `%lock/` directory: config locking must not couple to the
+// creds Store's root or lifecycle, and the two locks are taken together in a
+// pinned order (see cmd/shed/client.go's persist paths).
+//
+// The "%" prefix keeps it collision-proof against anything else this directory
+// holds: every other name here is a fixed English basename (config.yaml,
+// known_hosts, tunnels.yaml, creds/, logs/), and no shed-server name reaches
+// this level at all.
+const clientConfigLockName = "%config.lock"
+
+// lockClientConfig takes the exclusive advisory lock guarding whole-file
+// updates to the config at path, and returns the release function.
+//
+// It is held across the WHOLE read-modify-write of Update — the fresh load, the
+// mutation, and the rename — because that is the only span in which "merge my
+// change into what is currently on disk" means anything. SaveToPath serializes
+// the ENTIRE snapshot, so two unsynchronized processes do not merge: the second
+// rename discards everything the first wrote.
+//
+// The lock FILE is created if absent and then NEVER removed, for the same
+// inode-stability reason as sdk/creds' per-server locks: deleting it out from
+// under a process that holds it lets the next locker create a fresh inode and
+// lock THAT instead — two "exclusive" holders, the classic broken-mutex shape.
+// An empty file costs nothing to leave behind.
+func lockClientConfig(path string) (func(), error) {
+	if path == "" {
+		return nil, errors.New("client config: no path to lock")
+	}
+	dir := filepath.Dir(path)
+	// The config directory may not exist yet — a first `shed server add` writes
+	// into a bare home. SaveToPath creates it for the same reason; the lock has
+	// to exist BEFORE the save, so it creates it too.
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		return nil, fmt.Errorf("failed to create config directory: %w", err)
+	}
+	lockPath := filepath.Join(dir, clientConfigLockName)
+	f, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0600)
+	if err != nil {
+		return nil, fmt.Errorf("open config lock %s: %w", lockPath, err)
+	}
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != nil {
+		_ = f.Close()
+		return nil, fmt.Errorf("lock config %s: %w", lockPath, err)
+	}
+	return func() {
+		_ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
+		_ = f.Close()
+	}, nil
+}
+
+// Update applies mutate to the client configuration as a locked
+// read-modify-write against what is CURRENTLY on disk, and is the only
+// supported way to change a config that other processes may also be changing.
+//
+// The problem it solves is that SaveToPath writes the whole document: a `shed
+// list` that loaded the config a minute ago and then refreshes its shed cache
+// renames its entire stale snapshot over whatever a concurrent `shed server
+// add` — or a credential re-mint — just committed. Last writer wins, and what
+// it wins with is everything, including the fields it never touched.
+//
+// So Update does not save the receiver. It:
+//
+//  1. takes updateMu (in-process) and then the config file lock (cross-process,
+//     blocking; ORDER: creds lock, if any, is taken by the caller BEFORE this —
+//     see cmd/shed/client.go — and nothing here ever takes a creds lock);
+//  2. loads a FRESH snapshot from the receiver's path (a missing file is the
+//     empty config, exactly as LoadClientConfigFromPath treats it);
+//  3. runs mutate on that snapshot and saves it;
+//  4. runs the SAME mutate on the receiver.
+//
+// Step 4 is a re-application rather than a wholesale replacement on purpose:
+// concurrent readers of the in-memory config hold live map values, and swapping
+// the maps out from under them would make an unrelated entry momentarily
+// vanish. Mutations are field writes, so applying them to both snapshots is
+// well-defined; a closure that is not a pure function of the config it is
+// handed (one that consumes state on first call, say) is a caller bug.
+//
+// mutate returning an error on the fresh snapshot aborts everything: nothing is
+// written and the receiver is untouched. A save failure has the same shape —
+// the receiver is only mutated AFTER the file is durable, so a process's view
+// never gets ahead of the file. (The one asymmetry: an error from the second
+// call is returned after the disk write has already committed.)
+func (c *ClientConfig) Update(mutate func(*ClientConfig) error) error {
+	if mutate == nil {
+		return errors.New("client config: Update requires a mutation")
+	}
+	if c.path == "" {
+		return errors.New("client config: this configuration has no path to save to")
+	}
+
+	c.updateMu.Lock()
+	defer c.updateMu.Unlock()
+
+	unlock, err := lockClientConfig(c.path)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+
+	fresh, err := LoadClientConfigFromPath(c.path)
+	if err != nil {
+		return err
+	}
+	if err := mutate(fresh); err != nil {
+		return err
+	}
+	if err := fresh.SaveToPath(c.path); err != nil {
+		return err
+	}
+	return mutate(c)
+}
+
 // Save writes the configuration to disk.
+//
+// It is the UNSYNCHRONIZED writer: it renames this whole snapshot over the file,
+// discarding anything another process committed since this one loaded. Reach for
+// Update instead for any mutation the CLI performs; Save survives for the
+// first-write paths that own the file outright and for tests.
 func (c *ClientConfig) Save() error {
 	return c.SaveToPath(c.path)
 }
@@ -252,9 +398,24 @@ func (c *ClientConfig) SaveToPath(path string) error {
 		return fmt.Errorf("failed to marshal config: %w", err)
 	}
 
-	// Write atomically via temp file
-	tmpPath := path + ".tmp"
+	// Write atomically via a temp file whose name is unique to this attempt.
+	//
+	// A shared "<path>.tmp" is a second, unlocked rendezvous point: two writers
+	// pick the same name, interleave their bytes in it, and one of them renames
+	// the other's half-written document into place — an atomic rename of
+	// corrupt content. Pid + a random component makes collision practically
+	// impossible even between two writers that are not otherwise serialized
+	// (Update's lock covers the CLI's own writers; this covers everything else,
+	// including a crash-orphaned name being reused). Orphans left by a crash
+	// between create and rename are accepted; the rename-failure cleanup below
+	// is what handles the ordinary case.
+	tmpPath := fmt.Sprintf("%s.tmp.%d.%d", path, os.Getpid(), rand.Uint64())
 	if err := os.WriteFile(tmpPath, data, 0600); err != nil {
+		// WriteFile creates the file before it can fail on the write itself, so
+		// the failure path has to clean up too — otherwise every full-disk or
+		// interrupted save leaves another uniquely-named orphan next to the
+		// config, and unique names mean nothing ever reclaims them.
+		os.Remove(tmpPath)
 		return fmt.Errorf("failed to write config file: %w", err)
 	}
 
@@ -268,6 +429,13 @@ func (c *ClientConfig) SaveToPath(path string) error {
 }
 
 // AddServer adds a new server to the configuration.
+//
+// Like CacheShed, it is NOT safe as an Update mutation: it stamps AddedAt with
+// time.Now() (two applications, two instants) and it can FAIL — and an Update
+// mutation that fails on the second application fails after the file has
+// already been written, turning a successful add into a reported error. Callers
+// under Update validate first and then assign a fully-formed entry; see
+// cmd/shed/server_add.go:saveAddedServer.
 func (c *ClientConfig) AddServer(name string, entry ServerEntry) error {
 	if _, exists := c.Servers[name]; exists {
 		return fmt.Errorf("server '%s' already exists", name)
@@ -292,11 +460,15 @@ func (c *ClientConfig) RemoveServer(name string) error {
 
 	delete(c.Servers, name)
 
-	// Clear default if we removed it
+	// Clear default if we removed it, promoting the alphabetically first
+	// remaining server. Sorted rather than "whatever the map yields first":
+	// Update applies a mutation to two snapshots (the fresh on-disk one and the
+	// caller's in-memory one) and a map-order pick would hand them different
+	// defaults, so the file and the running process would disagree about which
+	// server is now default.
 	if c.DefaultServer == name {
 		c.DefaultServer = ""
-		// Set new default to first remaining server
-		for serverName := range c.Servers {
+		for _, serverName := range slices.Sorted(maps.Keys(c.Servers)) {
 			c.DefaultServer = serverName
 			break
 		}
@@ -342,12 +514,25 @@ func (c *ClientConfig) SetDefaultServer(name string) error {
 	return nil
 }
 
-// CacheShed caches a shed's location.
+// CacheShed caches a shed's location, stamped now.
+//
+// It is NOT safe inside an Update mutation: Update runs the mutation twice (the
+// fresh on-disk snapshot, then the caller's in-memory one) and the two calls
+// would stamp two different instants, so the file and the running process would
+// hold rows that differ in a field neither ever meant to disagree on. Use
+// CacheShedAt with a timestamp taken once, outside the mutation.
 func (c *ClientConfig) CacheShed(name string, server string, status string) {
+	c.CacheShedAt(name, server, status, time.Now())
+}
+
+// CacheShedAt is CacheShed with the timestamp supplied by the caller, which is
+// what makes a cache write a deterministic function of its inputs and therefore
+// usable as an Update mutation.
+func (c *ClientConfig) CacheShedAt(name string, server string, status string, at time.Time) {
 	c.Sheds[name] = ShedCache{
 		Server:    server,
 		Status:    status,
-		UpdatedAt: time.Now(),
+		UpdatedAt: at,
 	}
 }
 
