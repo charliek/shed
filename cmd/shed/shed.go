@@ -842,23 +842,15 @@ func stopTunnelsForShed(name string) {
 }
 
 // findShedServer finds which server hosts a shed.
-// It first checks the cache, then queries servers if not found.
+// An explicit --server flag wins unconditionally, even if the shed is cached
+// under a different server — the cache is consulted only in the unqualified
+// form (no --server flag). In the unqualified form it checks the cache first,
+// then queries servers if not found there.
 func findShedServer(name string) (string, *config.ServerEntry, error) {
-	// Check cache first
-	if cachedServer, err := clientConfig.GetShedServer(name); err == nil {
-		entry, err := clientConfig.GetServer(cachedServer)
-		if err == nil {
-			// Verify the shed still exists
-			client := NewAPIClientFromNamedEntry(cachedServer, entry, DefaultTimeout)
-			if _, err := client.GetShed(name); err == nil {
-				return cachedServer, entry, nil
-			}
-			// Shed not found on cached server, clear cache and search
-			clientConfig.RemoveShedCache(name)
-		}
-	}
-
-	// If --server flag is set, only check that server
+	// If --server flag is set, only check that server. This must be checked
+	// BEFORE the cache: an explicit --server naming a server other than the
+	// one the shed is cached under must win, not be silently overridden by
+	// the cache (#298).
 	if serverFlag != "" {
 		entry, err := clientConfig.GetServer(serverFlag)
 		if err != nil {
@@ -872,6 +864,20 @@ func findShedServer(name string) (string, *config.ServerEntry, error) {
 			return "", nil, fmt.Errorf("shed %q not found on %s", name, serverFlag)
 		}
 		return serverFlag, entry, nil
+	}
+
+	// Check cache first (unqualified form only)
+	if cachedServer, err := clientConfig.GetShedServer(name); err == nil {
+		entry, err := clientConfig.GetServer(cachedServer)
+		if err == nil {
+			// Verify the shed still exists
+			client := NewAPIClientFromNamedEntry(cachedServer, entry, DefaultTimeout)
+			if _, err := client.GetShed(name); err == nil {
+				return cachedServer, entry, nil
+			}
+			// Shed not found on cached server, clear cache and search
+			clientConfig.RemoveShedCache(name)
+		}
 	}
 
 	// Try default server first
