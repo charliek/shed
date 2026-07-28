@@ -8,6 +8,10 @@ config, waits for its status socket, yields a handle that can query `status
 [--json]`, and on exit sends SIGTERM, asserts a clean exit 0, and asserts both sockets
 are unlinked.
 
+`differential` additionally pins each agreed value to a committed golden under
+`goldens/` (see the "Goldens" block below `_shutdown`): recorded from a run where
+both implementations agreed, asserted on every later run.
+
 Hermetic by construction: every test gets a fresh `$SHED_HOST_AGENT_SOCKET_DIR` and
 `$HOME` (so no real `~/.ssh` / `~/.shed` is read), `SSH_AUTH_SOCK` is stripped (the Go
 daemon falls back to an empty local-keys backend), and there is no network.
@@ -17,7 +21,9 @@ from __future__ import annotations
 
 import contextlib
 import dataclasses
+import json
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -26,6 +32,8 @@ import time
 from pathlib import Path
 
 import pytest
+
+from normalize import canonical
 
 # tests/host-agent-diff/conftest.py -> tests -> repo root.
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -722,19 +730,226 @@ def discovery_off_config() -> str:
     return DISCOVERY_OFF_CONFIG
 
 
+# --- Goldens (plan 006 D1) -------------------------------------------------
+#
+# Every `differential()` value is ALSO pinned to a committed golden file, so the
+# agreed wire shape survives the Go daemon's retirement: the goldens are recorded
+# from a run where BOTH implementations agreed (the strongest provenance available),
+# and after the sunset the Rust value is asserted against them.
+#
+# The golden key is the pytest nodeid, sanitized to a safe-but-readable filename —
+# so parametrized cases get distinct files for free and the 55 `differential()` call
+# sites stay untouched (the check lives in the fixture body).
+GOLDENS_DIR = Path(__file__).resolve().parent / "goldens"
+
+# Anything outside this set is collapsed to `_` in a golden key (`::` separators,
+# parametrize-id brackets, spaces, ...).
+_KEY_UNSAFE = re.compile(r"[^A-Za-z0-9._-]+")
+
+# Session-wide golden bookkeeping (no state survives across pytest runs):
+#   claimed  — sanitized key -> the nodeid that claimed it (collision detection)
+#   visited  — keys checked/recorded this session (stale-golden detection)
+#   expected — nodeids of collected tests that request `differential`
+#   enforce_stale — whether the stale check may run at all (see the hooks below)
+_GOLDEN_SESSION: dict = {
+    "claimed": {},
+    "visited": set(),
+    "expected": set(),
+    "enforce_stale": True,
+}
+
+
+def _update_golden() -> bool:
+    """True when the run is in RECORD mode (`UPDATE_GOLDEN=1`). Any non-empty value
+    other than `0` records, so `UPDATE_GOLDEN=true` works too."""
+    return os.environ.get("UPDATE_GOLDEN", "") not in ("", "0")
+
+
+def _golden_key(nodeid: str) -> str:
+    """Sanitize a pytest nodeid into a golden filename stem: readable (test file +
+    test name + params), safe on every filesystem. `test_ssh_backend.py::
+    test_ssh_local_sign_rsa[0-ssh-rsa]` -> `test_ssh_backend__test_ssh_local_sign_rsa_0-ssh-rsa`."""
+    key = nodeid.replace(".py::", "__")
+    key = _KEY_UNSAFE.sub("_", key).strip("_")
+    assert key, f"nodeid sanitized to an empty golden key: {nodeid!r}"
+    return key
+
+
+def _claim_golden_key(nodeid: str) -> str:
+    """Return the golden key for `nodeid`, failing if a DIFFERENT nodeid already
+    claimed it this session. Sanitization is lossy (`[a/b]` and `[a_b]` collapse to
+    the same stem), and a silent collision would mean two cells sharing — and
+    overwriting — one golden file. Keys are collision-free by construction today;
+    this makes that a checked property rather than an assumption."""
+    key = _golden_key(nodeid)
+    # Claimed case-insensitively: common macOS filesystems are case-insensitive, so
+    # two keys differing only in case would share one file there while CI (Linux,
+    # case-sensitive) saw two — catch that class at claim time.
+    owner = _GOLDEN_SESSION["claimed"].setdefault(key.lower(), nodeid)
+    assert owner == nodeid, (
+        f"golden key collision: {nodeid!r} and {owner!r} both sanitize to {key!r} "
+        "(compared case-insensitively). Rename one of the tests (or its parametrize "
+        "id) so the two cells get distinct golden files."
+    )
+    return key
+
+
+def _check_golden(nodeid: str, value) -> None:
+    """Assert (or, under `UPDATE_GOLDEN=1`, record) the golden for `nodeid`.
+
+    Both sides are compared through one canonical serialization
+    (`json.dumps(..., sort_keys=True)`), so key order and pretty-print details can
+    never read as a diff, while bool/int stay distinct — a bare parsed-object
+    compare would let Python's `1 == True` silently accept a type drift. Record
+    mode asserts JSON round-trip fidelity FIRST: a value carrying tuples, bytes,
+    sets, non-string keys or NaN/Infinity changes shape (or emits non-JSON) on the
+    way to disk and would then never compare equal in assert mode, so it must fail
+    loudly here."""
+    key = _claim_golden_key(nodeid)
+    path = GOLDENS_DIR / f"{key}.json"
+    recorded = canonical(value)
+    # Visited in BOTH modes: a recorded golden is not stale either.
+    _GOLDEN_SESSION["visited"].add(key)
+
+    if _update_golden():
+        try:
+            roundtrip = json.loads(json.dumps(recorded, allow_nan=False))
+        except ValueError:
+            roundtrip = None
+        assert recorded == roundtrip, (
+            f"{nodeid}: differential value does not survive a JSON round-trip — it "
+            "carries a non-JSON type (tuple/set/bytes/non-string key/NaN/Infinity). "
+            f"Return plain dict/list/str/int/bool/None from the scenario. value={value!r}"
+        )
+        text = json.dumps(recorded, indent=2, sort_keys=True) + "\n"
+        GOLDENS_DIR.mkdir(exist_ok=True)
+        # Idempotent by CONTENT: an unchanged golden is not rewritten, so a re-record
+        # leaves a clean `git status` (stable mtimes are not promised, nor needed).
+        if not path.exists() or path.read_text() != text:
+            path.write_text(text)
+        return
+
+    assert path.exists(), (
+        f"{nodeid}: no golden at {path}. Record it (with both implementations "
+        "agreeing) via: UPDATE_GOLDEN=1 uv run pytest"
+    )
+    expected = json.loads(path.read_text())
+    assert json.dumps(expected, sort_keys=True) == json.dumps(recorded, sort_keys=True), (
+        f"golden mismatch for {nodeid} ({path}):\n"
+        f"--- golden ---\n{json.dumps(expected, indent=2, sort_keys=True)}\n"
+        f"--- actual ---\n{json.dumps(recorded, indent=2, sort_keys=True)}\n"
+        "If the new value is correct, re-record with UPDATE_GOLDEN=1."
+    )
+
+
+def pytest_collection_modifyitems(config, items) -> None:
+    """Record which collected tests use `differential`, and decide whether the
+    stale-golden check may run at all.
+
+    Stale detection compares committed golden files against the keys visited this
+    session, so it is only meaningful on a FULL, unfiltered run: `-k`/`-m`, explicit
+    file/nodeid arguments, `--last-failed`-style reruns and `--collect-only` all
+    leave goldens unvisited for reasons that are not staleness. `pytest_deselected`
+    and `pytest_runtest_logreport` below disable it for the remaining cases (a
+    deselected, skipped or failing differential cell)."""
+    _GOLDEN_SESSION["expected"] = {
+        item.nodeid for item in items if "differential" in getattr(item, "fixturenames", ())
+    }
+    opt = config.option
+    filtered = bool(
+        getattr(opt, "keyword", "")
+        or getattr(opt, "markexpr", "")
+        or getattr(opt, "file_or_dir", None)
+        or getattr(opt, "lf", False)
+        or getattr(opt, "failedfirst", False)
+        or getattr(opt, "collectonly", False)
+    )
+    if filtered:
+        _GOLDEN_SESSION["enforce_stale"] = False
+
+
+def pytest_deselected(items) -> None:
+    """A deselected cell leaves its golden unvisited — not stale."""
+    if items:
+        _GOLDEN_SESSION["enforce_stale"] = False
+
+
+def pytest_runtest_logreport(report) -> None:
+    """A differential cell that skipped or failed never reached its golden — so the
+    stale check would false-fire. Non-differential outcomes (the style-B per-impl
+    tests) are irrelevant to it and don't disable it."""
+    if report.nodeid in _GOLDEN_SESSION["expected"] and (report.skipped or report.failed):
+        _GOLDEN_SESSION["enforce_stale"] = False
+
+
+def pytest_sessionfinish(session, exitstatus) -> None:
+    """End-of-session golden accounting, enforced ONLY on a clean full run.
+
+    The `exitstatus == 0` gate is load-bearing: an early abort (`-x`, `--maxfail`,
+    a collection error, Ctrl-C) exits non-zero with cells legitimately unrun, so
+    enforcing there would both false-flag stale goldens and clobber pytest's own
+    exit code (2/3) with a generic 1. On a clean run two things must hold:
+    1. every collected differential test actually CALLED the fixture — requesting
+       `differential` and never invoking it would otherwise pass silently with no
+       golden check at all;
+    2. every committed golden was visited — a renamed or deleted test must not
+       leave phantom coverage behind."""
+    if exitstatus != 0 or not _GOLDEN_SESSION["enforce_stale"] or not GOLDENS_DIR.is_dir():
+        return
+    reporter = session.config.pluginmanager.get_plugin("terminalreporter")
+
+    def _fail(title: str, lines: list) -> None:
+        if reporter is not None:
+            reporter.write_sep("=", title, red=True, bold=True)
+            for line in lines:
+                reporter.write_line(line)
+        session.exitstatus = 1
+
+    claimed_nodeids = set(_GOLDEN_SESSION["claimed"].values())
+    uncalled = sorted(_GOLDEN_SESSION["expected"] - claimed_nodeids)
+    if uncalled:
+        _fail(
+            "differential fixture never called",
+            [f"{len(uncalled)} test(s) request `differential` but never invoked it — "
+             "no golden was checked:"] + [f"  {n}" for n in uncalled],
+        )
+        return
+    stale = sorted(
+        p.name for p in GOLDENS_DIR.glob("*.json") if p.stem not in _GOLDEN_SESSION["visited"]
+    )
+    if stale:
+        _fail(
+            "stale goldens",
+            [f"{len(stale)} committed golden file(s) were not visited by this run — "
+             "the owning test was renamed or deleted. Delete them (or restore the test):"]
+            + [f"  {GOLDENS_DIR / name}" for name in stale],
+        )
+
+
 @pytest.fixture
-def differential():
+def differential(request):
     """Return `run(scenario) -> value`, where `scenario(impl) -> normalized value`.
     Runs the scenario for both `go` and `rust`, asserts the normalized values are
-    equal (with a readable diff on mismatch), and returns the common value."""
+    equal (with a readable diff on mismatch), pins the agreed value to this test's
+    golden (see "Goldens" above), and returns the common value."""
+
+    calls = {"n": 0}
 
     def _run(scenario):
+        calls["n"] += 1
+        assert calls["n"] == 1, (
+            f"{request.node.nodeid}: differential() called twice in one test. The "
+            "golden key is the nodeid, so a second call would overwrite the first "
+            "call's golden — split the test (or parametrize it) so each cell makes "
+            "exactly one call."
+        )
         go = scenario("go")
         rust = scenario("rust")
         assert go == rust, (
             "differential mismatch (go != rust):\n"
             f"--- go ---\n{go!r}\n--- rust ---\n{rust!r}"
         )
+        _check_golden(request.node.nodeid, go)
         return go
 
     return _run

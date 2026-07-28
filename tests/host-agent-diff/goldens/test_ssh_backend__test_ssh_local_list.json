@@ -1,0 +1,43 @@
+{
+  "audit": {
+    "approval": "none",
+    "detail": "3 keys",
+    "ns": "ssh-agent",
+    "op": "list",
+    "result": "ok",
+    "shed": "web",
+    "ts": "<ts>"
+  },
+  "response": {
+    "final": true,
+    "id": "<id>",
+    "in_reply_to": "list-1",
+    "namespace": "ssh-agent",
+    "payload": {
+      "keys": [
+        {
+          "blob": "AAAAC3NzaC1lZDI1NTE5AAAAILMdrPP0NLsfgrc8JIa6OWX1qhgyfW/UwJTSXdRuUsJJ",
+          "comment": "id_ed25519",
+          "format": "ssh-ed25519"
+        },
+        {
+          "blob": "AAAAB3NzaC1yc2EAAAADAQABAAABAQCiRtypkVRGUS3w4E+ylwnHsfpibFplmuXStZ10SyPZSwTc2AI9RUKDX0JugXyXGMArSBsfmSd1oTMyY+ExJwB7bwmg+r8imkLQaqAm4KmNferH8xqcnpx+Y7TO7+SdtxoNaBTV4PzKfd8wruwubEtEFbtoFdSCVd+YP1F1D008hZNgEXqX5AvzwQjhGY+l3SGzH10WgzQek74k0DIcj/oyD3YSeWneKpppoqVZ0MJjeZrTTSq8FLZK4dSRLFN+dllqiitMtEsmflMmii077vYgBX/PBLrDHuIgtvBTaSmsWl49vVkKHyG11bbhvGVjUchN4ZgLvJHuejHpVU8PSKYD",
+          "comment": "id_rsa",
+          "format": "ssh-rsa"
+        },
+        {
+          "blob": "AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBEM4urryzyzBoSteEYV1VRkKaVn85MkuZd6h+U8JrVtbLXToSv3n1XQlWXqhPARxghMG4iiuP5udvFeahgPrkpo=",
+          "comment": "id_ecdsa",
+          "format": "ecdsa-sha2-nistp256"
+        }
+      ]
+    },
+    "shed": {
+      "backend": "vz",
+      "name": "web",
+      "server": "mini2"
+    },
+    "timestamp": "<ts>",
+    "type": "response"
+  }
+}

@@ -1,0 +1,18 @@
+{
+  "final": true,
+  "id": "<id>",
+  "in_reply_to": "st-1",
+  "namespace": "docker-credentials",
+  "payload": {
+    "allow_all": false,
+    "connected": true,
+    "registry_count": 2
+  },
+  "shed": {
+    "backend": "vz",
+    "name": "web",
+    "server": "mini2"
+  },
+  "timestamp": "<ts>",
+  "type": "response"
+}

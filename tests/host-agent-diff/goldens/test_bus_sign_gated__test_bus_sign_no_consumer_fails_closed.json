@@ -1,0 +1,27 @@
+{
+  "audit": {
+    "approval": "shed-desktop",
+    "ns": "ssh-agent",
+    "op": "sign",
+    "result": "denied",
+    "shed": "web",
+    "ts": "<ts>"
+  },
+  "response": {
+    "final": true,
+    "id": "<id>",
+    "in_reply_to": "sign-1",
+    "namespace": "ssh-agent",
+    "payload": {
+      "code": "SIGN_FAILED",
+      "error": "approval denied"
+    },
+    "shed": {
+      "backend": "vz",
+      "name": "web",
+      "server": "mini2"
+    },
+    "timestamp": "<ts>",
+    "type": "response"
+  }
+}

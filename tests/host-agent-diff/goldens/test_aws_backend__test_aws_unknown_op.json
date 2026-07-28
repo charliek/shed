@@ -1,0 +1,17 @@
+{
+  "final": true,
+  "id": "<id>",
+  "in_reply_to": "unk-1",
+  "namespace": "aws-credentials",
+  "payload": {
+    "code": "INTERNAL_ERROR",
+    "error": "unknown operation: delete"
+  },
+  "shed": {
+    "backend": "vz",
+    "name": "web",
+    "server": "mini2"
+  },
+  "timestamp": "<ts>",
+  "type": "response"
+}

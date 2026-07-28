@@ -1,0 +1,1 @@
+"shed-host-agent is not running \u2014 nothing is listening at <DIR>/host-agent-status.sock\nStart it (Homebrew): brew services start shed-host-agent\n  or run it directly: shed-host-agent -config <path>\n"

@@ -1,0 +1,28 @@
+{
+  "live": {
+    "approval": "none",
+    "detail": "1 keys",
+    "id": "<id>",
+    "kind": "audit",
+    "ns": "ssh-agent",
+    "op": "list",
+    "result": "ok",
+    "shed": "web",
+    "ts": "<ts>",
+    "type": "event",
+    "v": 2
+  },
+  "replayed": {
+    "approval": "none",
+    "detail": "1 keys",
+    "id": "<id>",
+    "kind": "audit",
+    "ns": "ssh-agent",
+    "op": "list",
+    "result": "ok",
+    "shed": "web",
+    "ts": "<ts>",
+    "type": "event",
+    "v": 2
+  }
+}

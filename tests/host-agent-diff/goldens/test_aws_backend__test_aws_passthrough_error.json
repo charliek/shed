@@ -1,0 +1,28 @@
+{
+  "audit": {
+    "approval": "approve-all",
+    "detail": "passthrough: profile \"shed-test\" in <HOME>/.aws/credentials has no static credentials; run your SSO/SAML login (e.g. `aws sso login`) to refresh",
+    "ns": "aws-credentials",
+    "op": "get_credentials",
+    "result": "error",
+    "shed": "web",
+    "ts": "<ts>"
+  },
+  "response": {
+    "final": true,
+    "id": "<id>",
+    "in_reply_to": "err-1",
+    "namespace": "aws-credentials",
+    "payload": {
+      "code": "ASSUME_ROLE_FAILED",
+      "error": "credential request failed"
+    },
+    "shed": {
+      "backend": "vz",
+      "name": "web",
+      "server": "mini2"
+    },
+    "timestamp": "<ts>",
+    "type": "response"
+  }
+}

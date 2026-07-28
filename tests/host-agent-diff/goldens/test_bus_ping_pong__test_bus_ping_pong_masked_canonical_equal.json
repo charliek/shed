@@ -1,0 +1,16 @@
+{
+  "final": true,
+  "id": "<id>",
+  "in_reply_to": "ping-1",
+  "namespace": "ssh-agent",
+  "payload": {
+    "status": "ok"
+  },
+  "shed": {
+    "backend": "vz",
+    "name": "web",
+    "server": "mini2"
+  },
+  "timestamp": "<ts>",
+  "type": "response"
+}
