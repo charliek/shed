@@ -16,7 +16,14 @@ public final class AppState: ObservableObject {
     @Published public var pane: DashboardPane = .sheds
     @Published public var hosts: [ShedHost] = []
     @Published public var sheds: [Shed] = []
-    @Published public var lastError: String?
+    /// The banner text. Written only through `setBanner(_:failure:)` so it can
+    /// never drift from `lastFailure` — the tooltip must describe the SAME
+    /// failure the banner names (plan 006 D6).
+    @Published public private(set) var lastError: String?
+    /// The typed cause behind `lastError`, when it came from a host probe. Any
+    /// other banner writer clears it, so a later action's message can never be
+    /// hovered to reveal an unrelated host's detail.
+    @Published public private(set) var lastFailure: HostFailure?
     /// The most recent in-flight/finished create, for the create sheet.
     @Published public var activeCreate: CreateProgress?
     /// Header indicator; wired to the real host-agent connection in M3.
@@ -109,8 +116,22 @@ public final class AppState: ObservableObject {
         sheds.filter { $0.status == .running }.count
     }
 
+    /// Set (or clear) the banner. `failure` is the typed cause when the text is
+    /// a host probe's summary; every other caller leaves it nil.
+    public func setBanner(_ text: String?, failure: HostFailure? = nil) {
+        lastError = text
+        lastFailure = text == nil ? nil : failure
+    }
+
+    /// The Sheds pane's empty-state text — one definition, rendered by
+    /// `ShedListView` and reported by `ui.state` (so the harness asserts the
+    /// string the user actually sees, not a copy of it).
+    public var shedsEmptyState: String { HostFailure.shedsEmptyState(hosts: hosts) }
+
     /// Snapshot for the `ui.state` IPC op.
     public func snapshot() -> UIState {
-        UIState(pane: pane.rawValue, hosts: hosts, sheds: sheds, hostAgentConnected: hostAgentConnected, lastError: lastError)
+        UIState(pane: pane.rawValue, hosts: hosts, sheds: sheds,
+                hostAgentConnected: hostAgentConnected, lastError: lastError,
+                shedsEmptyState: shedsEmptyState)
     }
 }

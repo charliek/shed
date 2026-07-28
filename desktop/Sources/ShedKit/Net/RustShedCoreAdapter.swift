@@ -219,8 +219,10 @@ final class RustShedCoreAdapter: @unchecked Sendable {
 }
 
 /// A create error whose description IS the Rust message, so AppModel's
-/// `progress.error = "\(error)"` renders exactly what the Rust path stored
-/// (e.g. "create failed: ...") without double-wrapping it.
+/// `CustomStringConvertible` is load-bearing: it is what
+/// `HostFailure.displayMessage(for:)` reads, so the create progress surfaces
+/// exactly what the Rust path stored (e.g. "create failed: ...") without
+/// double-wrapping it or degrading to NSError boilerplate.
 private struct RustCreateError: Error, CustomStringConvertible {
     let message: String
     var description: String { message }

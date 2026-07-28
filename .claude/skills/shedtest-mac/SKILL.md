@@ -53,6 +53,30 @@ it works headless in CI.
   IPC op that lets an agent observe/drive it, and a pytest that exercises it. That
   is the definition of done here, not a manual click-through.
 
+## A module that needs a DIFFERENT launch (config / env overrides)
+
+Only **one** mac app can exist at a time — the control socket + single-instance lock are
+at fixed paths under `~/Library/Caches/ShedDesktop/` and are NOT moved by
+`SHED_DESKTOP_STATE_DIR` — so the Tauri trick of spawning a second, self-managed instance
+(`test_tauri_downhost.py`) has no mac analog. A mac module that needs a different config
+or launch env **owns the app for its duration**: quit the session instance, launch its
+own, and relaunch the session one (shared `mock` fixture + `fixtures/config.yaml`) in the
+fixture's `finally`. `test_agent_upgrade.py` is the worked example. Modules run
+sequentially, so the session `fake` host-agent can be reused — there is no second
+connection to steal.
+
+Launch-time overrides the harness can pass (test mode only, `ui.launch(...)`):
+
+| override | effect |
+|---|---|
+| `unreachable_hosts=(...)` | those server names are pointed at a closed port (deterministic ECONNREFUSED) |
+| `credential_hosts=(...)` | those server names keep their REAL credential wiring against the mock — the fake host-agent + the config's `auth_mode` — instead of the tokenless open-mode shortcut |
+| `MockShedServer(require_auth=True)` | a private mock instance that 401s an unauthenticated `/api` request (the auth-shaped refusal a secure shed-server gives) |
+
+The last two together are what make a mint failure observable end to end: an open-mode
+200 would swallow it (a mint error only surfaces on an auth-shaped or transport-level
+outcome), so without the 401 the assertion would be vacuous.
+
 ## Rust-core parity leg
 
 The shed-server protocol path can run through the shared Rust core in `crates/`

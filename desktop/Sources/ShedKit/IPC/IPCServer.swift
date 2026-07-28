@@ -163,7 +163,12 @@ public final class IPCServer {
         } catch let err as IPCHandlerError {
             return IPCResponse.failure(id: request.id, code: err.code, message: err.message)
         } catch {
-            return IPCResponse.failure(id: request.id, code: "internal", message: "\(error)")
+            // A backend op can throw a `ShedError` straight from the Rust core;
+            // this body is what `shedctl` prints and what the harness asserts on,
+            // so it gets the human sentence, not the enum case (shed#300).
+            return IPCResponse.failure(
+                id: request.id, code: "internal",
+                message: HostFailure.displayMessage(for: error))
         }
     }
 }

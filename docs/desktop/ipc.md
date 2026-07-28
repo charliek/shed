@@ -20,7 +20,7 @@ Request structs reject unknown fields. Errors use stable codes: `unknown-op`,
 | op | params | result |
 |----|--------|--------|
 | `identify` | — | `socket_path`, `pid`, `app_label`, `app_id`, `ui_version`, `protocol_version`, `test_mode`, `mock_base_url?` |
-| `ui.state` | — | `pane`, `hosts[]`, `sheds[]`, `host_agent_connected`, `last_error?` |
+| `ui.state` | — | `pane`, `hosts[]`, `sheds[]`, `host_agent_connected`, `last_error?`, `sheds_empty_state` |
 | `ui.navigate` | `pane` (sheds\|approvals\|agents\|activity\|egress\|system) | `pane` |
 | `ui.set_ssh_approval` | `method?`, `scope?`, `ttl?` | `{}` (applies SSH approval prefs + resets live SSH grants) |
 | `ui.show_window` | — | `{}` |
@@ -29,8 +29,8 @@ Request structs reject unknown fields. Errors use stable codes: `unknown-op`,
 | `ui.open_preferences` | — | `{}` |
 | `ui.open_menu` | `open` (bool) | `open` |
 | `host.list` | — | `hosts[]` |
-| `sheds.list` | `host?` | `sheds[]` |
-| `sheds.refresh` | — | `{}` (forces an immediate poll) |
+| `sheds.list` | `host?` | `sheds[]` (Tauri also returns `host_errors[]`) |
+| `sheds.refresh` | — | `{}` (forces an immediate poll); Tauri returns the `sheds.list` payload the UI committed |
 | `system.df` | — | `usage[]` (per-host `GET /api/system/df`: totals + image/shed/orphan disk entries) |
 | `app.window_metrics` | — | `window_width`, `window_height`, `sidebar_width`, `visible_pane` |
 | `app.screenshot` | `surface` (window\|menu), `scale` (1\|2) | `png` (base64), `width`, `height`, `scale`, `surface` |
@@ -38,6 +38,29 @@ Request structs reject unknown fields. Errors use stable codes: `unknown-op`,
 The screenshot renders the target window's content view to a PNG in-process — no screen
 capture permission, works even when the window is occluded or off-screen. Capturing the
 menu requires it to be open first (`ui.open_menu {open:true}`).
+
+**Per-host failures (Tauri).** A host whose sheds can't be listed is reported beside the
+rows rather than dropped: `host_errors[]` carries `{server, kind, summary, detail}` per
+failed host, where `kind` is `agent_upgrade_required` or `other`, `summary` is the
+one-line text the pane shows (remedy first), and `detail` is the hover/log body. It is
+always present — `[]` when every host is healthy. The Tauri UI-truth op `dashboard.dump`
+returns `{rows, host_errors, empty}`: the rendered shed rows, the rendered host-error
+strip, and the rendered empty state (`{title, body}`, `null` when the list rendered).
+
+**Per-host failures (mac).** The same shape rides on the host itself. Each entry in
+`hosts[]` carries `name`, `host`, `http_port`, `ssh_port`, `reachable`, `backend?`,
+`version?`, `last_error?` and — when the probe failed — a typed `failure`:
+
+| field | meaning |
+|-------|---------|
+| `server` | the configured server name the failure belongs to |
+| `kind` | `agent_upgrade_required` (shed-host-agent is too old to obtain a certificate) or `other` |
+| `summary` | the one-line banner text, remedy first (also mirrored into `last_error`) |
+| `detail` | the full cause — the sidebar tooltip and the diagnostic log body |
+
+`sheds_empty_state` is the sentence the Sheds pane's empty state renders: a known
+`failure.kind` speaks (naming the remedy) instead of the generic "check
+~/.shed/config.yaml" advice, which remains for a failure with no recognized cause.
 
 ## Lifecycle, create + terminal
 
@@ -98,3 +121,9 @@ When launched with `SHED_DESKTOP_TEST_MODE=1`, `identify` reports `test_mode: tr
 `mock_base_url` the app's HTTP clients were redirected to, so the harness can confirm a run
 is hermetic before asserting anything. Fault-injection ops (like `policy.set`) are gated
 behind this flag.
+
+Two launch-time overrides exist only in test mode, both taking comma-separated server
+names: `SHED_DESKTOP_MOCK_UNREACHABLE_HOSTS` points a host at a closed port (a
+deterministic per-host failure), and `SHED_DESKTOP_MOCK_CREDENTIAL_HOSTS` keeps a host's
+REAL control-credential wiring — the host agent plus the config's `auth_mode` — against
+the mock, so the mint → refusal → banner chain is drivable end to end.

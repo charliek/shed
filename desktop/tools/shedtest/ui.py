@@ -223,7 +223,8 @@ def _quit_subproc(target: str) -> None:
 
 
 def launch(target: str = "mac", *, mock_base_url: str, config_path: Path, state_dir: Path,
-           host_agent_socket: str | None = None, unreachable_hosts: tuple[str, ...] = ()) -> None:
+           host_agent_socket: str | None = None, unreachable_hosts: tuple[str, ...] = (),
+           credential_hosts: tuple[str, ...] = ()) -> None:
     """Launch the UI hermetically and block until it answers `identify`.
 
     `state_dir` is the throwaway per-session dir: on mac SHED_DESKTOP_STATE_DIR;
@@ -233,11 +234,16 @@ def launch(target: str = "mac", *, mock_base_url: str, config_path: Path, state_
     config server NAMES the backend points at a closed port instead of the mock
     (the `<PREFIX>_MOCK_UNREACHABLE_HOSTS` down-host override) so the per-host error
     row is exercisable e2e; wired for both targets, though only tauri drives it now.
+    `credential_hosts` are server NAMES that keep their REAL control-credential
+    wiring against the mock (host agent + the config's auth_mode) instead of the
+    tokenless open-mode shortcut — the agent-upgrade scenario's override, mac-only
+    for now (the Tauri backend has no counterpart yet).
     """
     if target == "mac":
         _launch_mac(mock_base_url=mock_base_url, config_path=config_path,
                     state_dir=state_dir, host_agent_socket=host_agent_socket,
-                    unreachable_hosts=unreachable_hosts)
+                    unreachable_hosts=unreachable_hosts,
+                    credential_hosts=credential_hosts)
     elif target in _SUBPROC:
         _launch_subproc(target, mock_base_url=mock_base_url, config_path=config_path,
                         runtime_dir=state_dir, host_agent_socket=host_agent_socket,
@@ -248,7 +254,8 @@ def launch(target: str = "mac", *, mock_base_url: str, config_path: Path, state_
 
 def _launch_mac(*, mock_base_url: str, config_path: Path, state_dir: Path,
                 host_agent_socket: str | None,
-                unreachable_hosts: tuple[str, ...] = ()) -> None:
+                unreachable_hosts: tuple[str, ...] = (),
+                credential_hosts: tuple[str, ...] = ()) -> None:
     if platform.system() != "Darwin":
         raise RuntimeError("the mac target requires macOS")
     if not APP.is_dir():
@@ -263,6 +270,8 @@ def _launch_mac(*, mock_base_url: str, config_path: Path, state_dir: Path,
         argv += ["--env", f"SHED_DESKTOP_HOST_AGENT_SOCKET={host_agent_socket}"]
     if unreachable_hosts:
         argv += ["--env", f"SHED_DESKTOP_MOCK_UNREACHABLE_HOSTS={','.join(unreachable_hosts)}"]
+    if credential_hosts:
+        argv += ["--env", f"SHED_DESKTOP_MOCK_CREDENTIAL_HOSTS={','.join(credential_hosts)}"]
     # Throwaway UserDefaults suite so preferences never touch the dev's real
     # defaults (the SHED_DESKTOP_STATE_DIR analog for UserDefaults).
     argv += ["--env", f"SHED_DESKTOP_DEFAULTS_SUITE={DEFAULTS_SUITE}"]

@@ -32,7 +32,12 @@ public struct ShedHost: Codable, Sendable, Equatable {
     public var backend: String?
     public var version: String?
     /// Why the host is unreachable (sanitized for display), or nil when reachable.
+    /// Kept as the `failure`'s summary, so a string-only consumer is unchanged.
     public var lastError: String?
+    /// The same failure, TYPED (plan 006 D6 / shed#300): what the banner, the
+    /// tooltip and the empty state branch on. nil when reachable, or when the
+    /// host was populated without a probe result.
+    public var failure: HostFailure?
 
     enum CodingKeys: String, CodingKey {
         case name, host
@@ -40,12 +45,13 @@ public struct ShedHost: Codable, Sendable, Equatable {
         case sshPort = "ssh_port"
         case reachable, backend, version
         case lastError = "last_error"
+        case failure
     }
 
     public init(
         name: String, host: String, httpPort: Int, sshPort: Int,
         reachable: Bool = false, backend: String? = nil, version: String? = nil,
-        lastError: String? = nil
+        lastError: String? = nil, failure: HostFailure? = nil
     ) {
         self.name = name
         self.host = host
@@ -55,6 +61,7 @@ public struct ShedHost: Codable, Sendable, Equatable {
         self.backend = backend
         self.version = version
         self.lastError = lastError
+        self.failure = failure
     }
 }
 
@@ -69,6 +76,22 @@ extension ShedHost {
         h.backend = info?.backend
         h.version = info?.version
         h.lastError = info != nil ? nil : ShedHost.sanitizeProbeError(error)
+        h.failure = nil
+        return h
+    }
+
+    /// The TYPED probe result (plan 006 D6): the failure is kept whole — kind
+    /// for branching, detail for the tooltip — and `lastError` keeps carrying
+    /// its summary so every string-only consumer is unchanged. Both text fields
+    /// are sanitized, so nothing secret reaches the UI by either route.
+    public func applyingProbe(info: ServerInfo?, failure: HostFailure?) -> ShedHost {
+        var h = self
+        h.reachable = info != nil
+        h.backend = info?.backend
+        h.version = info?.version
+        let sanitized: HostFailure? = info != nil ? nil : failure?.sanitized()
+        h.failure = sanitized
+        h.lastError = sanitized.map(\.summary)
         return h
     }
 
@@ -345,19 +368,26 @@ public struct UIState: Codable, Sendable, Equatable {
     public var sheds: [Shed]
     public var hostAgentConnected: Bool
     public var lastError: String?
+    /// The text the Sheds pane's empty state renders right now — observable so
+    /// the harness can assert WHICH cause it names (plan 006 D6: a known host
+    /// failure speaks instead of the generic config.yaml advice).
+    public var shedsEmptyState: String
 
     enum CodingKeys: String, CodingKey {
         case pane, hosts, sheds
         case hostAgentConnected = "host_agent_connected"
         case lastError = "last_error"
+        case shedsEmptyState = "sheds_empty_state"
     }
 
-    public init(pane: String, hosts: [ShedHost], sheds: [Shed], hostAgentConnected: Bool = false, lastError: String? = nil) {
+    public init(pane: String, hosts: [ShedHost], sheds: [Shed], hostAgentConnected: Bool = false,
+                lastError: String? = nil, shedsEmptyState: String? = nil) {
         self.pane = pane
         self.hosts = hosts
         self.sheds = sheds
         self.hostAgentConnected = hostAgentConnected
         self.lastError = lastError
+        self.shedsEmptyState = shedsEmptyState ?? HostFailure.shedsEmptyState(hosts: hosts)
     }
 }
 

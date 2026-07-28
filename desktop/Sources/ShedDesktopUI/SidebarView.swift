@@ -36,7 +36,9 @@ struct SidebarView: View {
                 }
                 .padding(.horizontal, 10)
                 .padding(.vertical, 5)
-                .help(host.lastError ?? "")
+                // The FULL cause (plan 006 D6): the banner shows the one-line
+                // remedy-first summary, the tooltip carries the detail behind it.
+                .help(host.failure?.detail ?? host.lastError ?? "")
             }
             Spacer()
         }
