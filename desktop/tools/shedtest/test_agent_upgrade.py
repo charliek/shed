@@ -24,6 +24,17 @@ duration — it quits the session instance, runs against its own, and relaunches
 the session one at teardown. The session `fake` host-agent is reused (the module
 never runs concurrently with the session app, so there is no connection to
 steal).
+
+**No IPC client is held across the fixture boundary.** The Swift IPC server
+serves each open connection from a blocking read on a cooperative-pool thread,
+so an idle connection permanently consumes one — and the pool is only as wide as
+the machine's CPU count (3 on the CI runner). A module-scoped client left open
+across the autouse `_reset_policy` fixture starves the pool there, and its
+`policy.set` is accepted by the kernel but never served (see the shedtest-mac
+skill). The fixture therefore opens a client, uses it, and CLOSES it before
+yielding; each test takes the standard function-scoped `shed` client, which is
+created after the autouse fixtures have finished, exactly as every other module
+does.
 """
 
 from __future__ import annotations
@@ -71,24 +82,41 @@ def upgrade(mock, fake):
     secure = MockShedServer(require_auth=True)
     secure.start()
     token_baseline = len(fake.token_requests)
+    hello_baseline = fake.hello_count
     state_dir = Path(tempfile.mkdtemp(prefix="shed-e2e-upgrade-"))
     ui.quit("mac")
     ui.launch("mac", mock_base_url=secure.base_url, config_path=UPGRADE_CONFIG,
               state_dir=state_dir, host_agent_socket=fake.socket_path,
               credential_hosts=(HOST,))
-    client = ShedDesktop(ui.socket_path("mac"))
+    ok = False
     try:
-        assert fake.wait_connected(timeout=15), "the app never handshook with the fake agent"
-        # The capability is learned per connection; until the ack lands the mint
-        # refuses with the (correct, transient) "still connecting" sentence. Drive
-        # refreshes until the settled, typed failure appears.
-        client.wait_until(_typed_failure(client), timeout=30,
-                          what="the agent-upgrade host failure")
-        yield types.SimpleNamespace(client=client, fake=fake, token_baseline=token_baseline)
+        # `wait_connected` is sticky (the session app already set it), so count
+        # handshakes instead: THIS app must have said hello to the fake before
+        # any capability claim means anything.
+        assert fake.wait_hello_count(hello_baseline + 1, timeout=30), \
+            "the app never handshook with the fake agent"
+        client = ShedDesktop(ui.socket_path("mac"))
+        try:
+            # The capability is learned per connection; until the ack lands the
+            # mint refuses with the (correct, transient) "still connecting"
+            # sentence. Poll until the settled, typed failure appears — reading
+            # state, not forcing refreshes: `sheds.refresh` chains behind any
+            # in-flight poll, so hammering it queues work rather than hastening
+            # it. The app polls every 5s on its own.
+            client.wait_until(lambda: _failure_kind(client) == "agent_upgrade_required",
+                              timeout=40, what="the agent-upgrade host failure")
+        finally:
+            client.close()
+        ok = True
+        yield types.SimpleNamespace(fake=fake, token_baseline=token_baseline)
     finally:
-        client.close()
         ui.quit("mac")
-        shutil.rmtree(state_dir, ignore_errors=True)
+        # Keep the app's log dir when something went wrong — it is the only
+        # record of a launch/wedge failure on CI, where nothing else is captured.
+        if ok:
+            shutil.rmtree(state_dir, ignore_errors=True)
+        else:
+            print(f"\n[agent-upgrade] app state/log dir kept for diagnosis: {state_dir}")
         secure.stop()
         # Hand the session instance back exactly as `_app_session` launched it.
         ui.launch("mac", mock_base_url=mock.base_url, config_path=SESSION_CONFIG,
@@ -96,12 +124,9 @@ def upgrade(mock, fake):
                   host_agent_socket=fake.socket_path)
 
 
-def _typed_failure(client: ShedDesktop):
-    def ready() -> bool:
-        client.refresh()
-        host = client.host_list()[0]
-        return (host.get("failure") or {}).get("kind") == "agent_upgrade_required"
-    return ready
+def _failure_kind(client: ShedDesktop) -> str | None:
+    hosts = client.host_list()
+    return ((hosts[0].get("failure") or {}).get("kind")) if hosts else None
 
 
 def _host(client: ShedDesktop) -> dict:
@@ -110,8 +135,8 @@ def _host(client: ShedDesktop) -> dict:
     return hosts[0]
 
 
-def test_host_failure_is_typed_and_names_the_remedy_first(upgrade):
-    host = _host(upgrade.client)
+def test_host_failure_is_typed_and_names_the_remedy_first(upgrade, shed):
+    host = _host(shed)
     assert host["reachable"] is False
     failure = host["failure"]
     assert failure["kind"] == "agent_upgrade_required", failure
@@ -127,16 +152,16 @@ def test_host_failure_is_typed_and_names_the_remedy_first(upgrade):
     assert host["last_error"] == failure["summary"]
 
 
-def test_banner_leads_with_the_upgrade_and_leaks_no_enum_wrapper(upgrade):
-    state = upgrade.client.ui_state()
+def test_banner_leads_with_the_upgrade_and_leaks_no_enum_wrapper(upgrade, shed):
+    state = shed.ui_state()
     banner = state["last_error"]
     assert banner.startswith("Upgrade shed-host-agent"), banner
     for wrapper in ENUM_WRAPPERS:
         assert wrapper not in banner, f"the banner leaked {wrapper!r}: {banner}"
 
 
-def test_empty_state_names_the_upgrade_not_config_yaml(upgrade):
-    state = upgrade.client.ui_state()
+def test_empty_state_names_the_upgrade_not_config_yaml(upgrade, shed):
+    state = shed.ui_state()
     assert state["sheds"] == [], "the 401-ing host can list nothing"
     empty = state["sheds_empty_state"]
     assert empty.startswith("Upgrade shed-host-agent"), empty
