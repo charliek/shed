@@ -15,7 +15,7 @@ The Go tree (`cmd/`, `internal/`, the CLI/server/agent) is the primary product. 
 
 The Go build never traverses `crates/` or `desktop/` (`go list ./...` / `golangci-lint` stay Go-only); root `make build`/`test`/`check` are Go-only. Desktop targets are reached via the reserved `desktop-` passthrough (`make desktop-<target>`, e.g. `make desktop-build`) or `make -C desktop <target>`.
 
-**Three pytest suites, never merged:** `tests/integration/` is the live server-facing create-cycle suite (drives a real `shed-server`); `desktop/tools/shedtest/` is the mock-server UI harness (drives the real app over its IPC socket, hermetic); `tests/host-agent-diff/` is the hermetic Go-vs-Rust host-agent **differential** harness — it spawns BOTH `shed-host-agent` daemon binaries (Go `cmd/shed-host-agent` + Rust `crates/shed-host-agent`) and asserts equal wire-visible output under a defined canonicalization, so it needs Go + Rust + Python (run it with `make test-host-agent-diff`). Different worlds — don't cross-wire them.
+**Three pytest suites, never merged:** `tests/integration/` is the live server-facing create-cycle suite (drives a real `shed-server`); `desktop/tools/shedtest/` is the mock-server UI harness (drives the real app over its IPC socket, hermetic); `tests/host-agent-diff/` is the hermetic shed-host-agent **wire** harness — it spawns the Rust `crates/shed-host-agent` daemon binary and asserts its wire-visible output, under a defined canonicalization, against committed goldens (recorded from the last agreeing Go↔Rust run before the Go daemon was retired in plan 006), so it needs Rust + Python/uv, no Go toolchain (run it with `make test-host-agent-diff`). Different worlds — don't cross-wire them.
 
 ## Release model
 
@@ -148,7 +148,7 @@ See `docs/development/testing.md` for the full operator guide — adding a test,
 - `cmd/shed/` — CLI binary (command handlers split across `shed.go`, `console.go`, `attach.go`, `sessions.go`, `tunnels.go`, `sync.go`, `ssh_config.go`, etc.)
 - `cmd/shed-server/` — Server daemon binary
 - `cmd/shed-agent/` — In-VM agent binary (Firecracker/VZ)
-- `cmd/shed-host-agent/` — Host-side credential broker (imported from shed-extensions). **CGO on darwin** for the Touch ID / LocalAuthentication approval gate (`touchid_{darwin,stub}.go` build tags); linux build is CGO-free. Its release job runs on **macos-latest** to build the darwin CGO half.
+- `crates/shed-host-agent/` — Host-side credential broker, in Rust (see `crates/CLAUDE.md`). The Go `cmd/shed-host-agent` it replaced was retired in plan 006. Its Touch ID / LocalAuthentication approval gate uses `objc2` to link the framework directly — no CGO. Its release job (`.goreleaser.host-agent.yaml`, `builder: rust`) still runs on **macos-latest** to match the real release runner (cross-compiling linux via `cargo zigbuild`).
 - `cmd/shed-machine-rc/` — Host-side RC-session helper (native machine sibling of `shed-ext-rc`)
 - `cmd/shed-ext-ssh-agent/`, `cmd/shed-ext-aws-credentials/`, `cmd/docker-credential-shed/`, `cmd/shed-ext-rc/` — In-VM guest extension binaries (imported from shed-extensions). Cross-compiled for linux and staged into the rootfs build context by `scripts/stage-guest-binaries.sh`; not shipped as host `bin/` artifacts.
 - `internal/api/` — HTTP API handlers (Chi router)

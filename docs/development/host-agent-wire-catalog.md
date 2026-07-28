@@ -1,10 +1,20 @@
 # shed-host-agent — Wire-Visible Behavior Catalog
 
-Reference for a Go-vs-Rust differential test harness. Every entry is something a
-harness can **observe from outside the process** — a bus response payload, a
-durable-log line, a UDS frame, a subprocess argv, an exit code — not internal Go
-structure. All citations are `file.go:line` in
-`.../wt-host-agent-rust/cmd/shed-host-agent/` unless another package is named.
+**Authority.** The Rust implementation (`crates/shed-host-agent`, `crates/shed-broker`)
+is authoritative for shed-host-agent's wire-visible behavior. Its executable contract
+coverage is the goldens + fixture vectors under `tests/host-agent-diff/` (see that
+directory's README) — those, not this document, are what a behavior change must keep
+green.
+
+This document predates the Rust port and was written against the Go daemon
+(`cmd/shed-host-agent`), which was retired in plan 006. Every `file.go:line` citation
+below is **traceability only**: it points at where the described behavior was proven
+against the Go implementation, resolvable with `git show bbd73e2^:cmd/shed-host-agent/<path>`
+(`bbd73e2^` is the last commit that carried `cmd/shed-host-agent` before its deletion;
+see `git log -- cmd/shed-host-agent`). The citations are **not** re-pointed at the Rust
+source line-by-line — treat the prose as the contract and the Rust crates + the golden
+fixtures as its current, executable form. All citations are `file.go:line` in
+`cmd/shed-host-agent/` at that commit unless another package is named.
 
 Protocol/const source of truth: `internal/ext/protocol/{ssh,aws,docker}.go`
 (namespaces, ops, codes, payload field names) and `sdk/envelope.go` (envelope).

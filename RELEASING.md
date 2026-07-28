@@ -205,8 +205,7 @@ appcast, debs, apt dispatch, rc-tag rehearsals) live in
      - `.goreleaser.host-agent.yaml` — the Rust `shed-host-agent`
        binary (`builder: rust`, via `cargo zigbuild`), a GH linux
        tarball, `checksums-host-agent.txt`, `Formula/shed-host-agent.rb`
-       — **no `.deb`**, brew-only. Also builds (but doesn't archive) the
-       two Go rollback ids — see "Host-agent" below.
+       — **no `.deb`**, brew-only. See "Host-agent" below.
      - `.goreleaser.machine-rc.yaml` — the `shed-machine-rc` binary,
        `checksums-machine-rc.txt`, `Formula/shed-machine-rc.rb`,
        `shed-machine-rc_*.deb`.
@@ -282,17 +281,16 @@ desktop-only prerelease is allowed (the Tauri rc-rehearsal path).
 
 The Go binaries' version comes from a build-time `-X` ldflag injected
 by GoReleaser via each split config's `builds[].ldflags`
-(`.goreleaser.server.yaml`, `.goreleaser.machine-rc.yaml`, and the Go
-rollback ids in `.goreleaser.host-agent.yaml`). The Docker images are
-tagged from `GITHUB_REF_NAME` at workflow time. None of those need a
-source-tree bump.
+(`.goreleaser.server.yaml`, `.goreleaser.machine-rc.yaml`). The Docker
+images are tagged from `GITHUB_REF_NAME` at workflow time. None of
+those need a source-tree bump.
 
 > **Cross-selector subtlety — the Rust `shed-host-agent`.** Its source
 > version (`crates/Cargo.toml [workspace.package].version`) tracks the
 > **desktop** selector (both live in the shared Rust workspace), but the
 > binary **ships on its own `host-agent` selector**
-> (`crates/shed-host-agent/VERSION`, see "Host-agent: Rust binary, Go
-> rollback" below) — the two are intentionally independent and will
+> (`crates/shed-host-agent/VERSION`, see "Host-agent: Rust binary"
+> below) — the two are intentionally independent and will
 > normally show different values. The shipped `shed-host-agent version`
 > is **not** `CARGO_PKG_VERSION` either way; GoReleaser's `builder: rust`
 > build in `.goreleaser.host-agent.yaml` sets
@@ -308,16 +306,16 @@ skip `docs:`, `test:`, `chore:`, `ci:`) go on the GitHub Release body.
 `pyproject.toml` is for mkdocs only and has its own version cadence;
 not touched by `update-version.sh`.
 
-## Host-agent: Rust binary, Go rollback
+## Host-agent: Rust binary
 
 `host-agent` ships on its **own** selector
 (`crates/shed-host-agent/VERSION`, see "Component selection" above) —
-it no longer rides the `server`/`go` selector. It's still built from
-the **Rust** `crates/shed-host-agent` (not the Go `cmd/shed-host-agent`),
-with the version injected from the tag, via GoReleaser's OSS
-`builder: rust` in `.goreleaser.host-agent.yaml` (which runs `cargo
-zigbuild`; the `release` + `release-snapshot` jobs install `zig` +
-`cargo-zigbuild`, and the `release` job only pays that install cost when
+it no longer rides the `server`/`go` selector. It's built from the
+**Rust** `crates/shed-host-agent`, with the version injected from the
+tag, via GoReleaser's OSS `builder: rust` in
+`.goreleaser.host-agent.yaml` (which runs `cargo zigbuild`; the
+`release` + `release-snapshot` jobs install `zig` + `cargo-zigbuild`,
+and the `release` job only pays that install cost when
 `ship_host_agent` is true). `builder: prebuilt` is GoReleaser
 **Pro-only** and was not an option.
 
@@ -326,22 +324,29 @@ zigbuild`; the `release` + `release-snapshot` jobs install `zig` +
   paths), same bundled `extensions.example.yaml` → `etc/shed/extensions.yaml`,
   same `shed-host-agent status`/`version` surface. The swap only changed where
   the binary is compiled from. No apt/`.deb` (the host-agent is brew-only).
-- **The Go build is kept as rollback insurance.** The Go ids
-  `shed-host-agent-{darwin,linux}` now live in
-  `.goreleaser.host-agent.yaml` (GoReleaser compiles every `builds[]`
-  entry regardless of archive references, so they are still built +
-  CI-exercised every snapshot; `release-snapshot` asserts them in
-  `dist/host-agent/artifacts.json`) but are **detached from the
-  archive**. To revert to the Go binary, flip
-  `archives[shed-host-agent].ids` back to the two Go ids in
-  `.goreleaser.host-agent.yaml` — a one-line change that already
-  compiles green.
-- **Retirement trigger (a SEPARATE future task, not yet done).** Once the Rust
-  `shed-host-agent` has shipped clean for ~2 releases, delete `cmd/shed-host-agent`,
-  the two Go goreleaser ids, and the `hostagent`-filter's `cmd/shed-host-agent/**`
-  entry; the Go-vs-Rust differential harness (`tests/host-agent-diff/`) retires
-  with the Go daemon. Do this deliberately in its own PR — do NOT bundle it with
-  a feature change.
+- **The Go daemon and its rollback path are retired.** `cmd/shed-host-agent`,
+  the Go goreleaser ids (`shed-host-agent-{darwin,linux}`), and the
+  `hostagent`-filter's `cmd/shed-host-agent/**` CI entry were deleted in plan
+  006 (mtls-cleanup / host-agent sunset). This is a deliberate, explicit
+  waiver of the retirement window this section previously described (**"~2
+  clean releases"**): only **v0.8.0** had shipped the Rust agent when
+  retirement landed here — the maintainer accepted that early, judging the
+  Rust port's differential coverage (see below) sufficient. Source-level
+  rollback (flipping a goreleaser id back to a Go build) **ends with this
+  change** — there is no Go source left in the tree to build.
+- **Post-removal rollback procedure.** If the Rust `shed-host-agent` needs to
+  be rolled back after this point, reinstall the last released formula/bottle
+  that still carries the desired behavior — e.g. `brew install
+  shed-host-agent` pinned at `v0.8.0` (or the prior tag) via the formula's
+  versioned bottle/tap history. There is no source-level revert; this is an
+  install-time pin.
+- **The differential harness became the golden-pinned wire harness.** Every
+  value the Go-vs-Rust differential harness once asserted was recorded as a
+  golden before the Go daemon was deleted, so `tests/host-agent-diff/` keeps
+  its coverage — it now runs the Rust `shed-host-agent` daemon alone against
+  those committed goldens instead of against a live Go process. See
+  `tests/host-agent-diff/README.md` for the mechanics and why the directory
+  and Makefile target still say "diff".
 
 ## Snapshot / dev versioning
 
