@@ -60,6 +60,11 @@ pub struct HostAgentTokenMinter {
     /// synchronously below). `None` for a build with no registry — a token-only
     /// deployment, which is every pre-mtls caller.
     modes: Option<Arc<AuthModeRegistry>>,
+    /// When a pre-ack capability wait last concluded still-`Unknown` — the
+    /// negative-result memo behind guard 2 in [`Self::mint_credential`] (one
+    /// caller per burst pays the wait; the provider mutex serializes the rest
+    /// behind it).
+    unknown_waited_at: std::sync::Mutex<Option<std::time::Instant>>,
 }
 
 impl HostAgentTokenMinter {
@@ -69,7 +74,21 @@ impl HostAgentTokenMinter {
             timeout: DEFAULT_TOKEN_TIMEOUT,
             capability_wait: CAPABILITY_WAIT,
             modes: None,
+            unknown_waited_at: std::sync::Mutex::new(None),
         }
+    }
+
+    /// Guard 2's read: did a capability wait conclude still-`Unknown` within the
+    /// last `capability_wait` window?
+    fn recent_unknown_wait(&self) -> bool {
+        self.unknown_waited_at
+            .lock()
+            .unwrap()
+            .is_some_and(|t| t.elapsed() < self.capability_wait)
+    }
+
+    fn note_unknown_wait(&self) {
+        *self.unknown_waited_at.lock().unwrap() = Some(std::time::Instant::now());
     }
 
     /// Attach the per-server mode registry that drives the §7 P5 capability
@@ -81,8 +100,9 @@ impl HostAgentTokenMinter {
 
     /// Shorten the pre-ack capability wait (tests only — production takes
     /// [`CAPABILITY_WAIT`], which is sized for a real agent's first frame).
+    /// `pub(crate)`: `host_agent.rs`'s live-double minter tests tune it too.
     #[cfg(test)]
-    fn with_capability_wait(mut self, wait: Duration) -> Self {
+    pub(crate) fn with_capability_wait(mut self, wait: Duration) -> Self {
         self.capability_wait = wait;
         self
     }
@@ -103,22 +123,38 @@ impl HostAgentTokenMinter {
         }
     }
 
-    /// The user-facing sentence for a transport/capability failure: "upgrade
-    /// shed-host-agent" when the live agent genuinely cannot do this, "still
-    /// connecting" when the answer is simply not in yet.
-    fn capability_message(err: &HostAgentClientError, server: &str) -> String {
+    /// The user-facing error for a transport/capability failure: the TYPED
+    /// upgrade case when the live agent genuinely cannot do this (shed#300 —
+    /// presentation branches on it), a "still connecting" `Config` when the
+    /// answer is simply not in yet. `wants_mtls` picks the wording of the
+    /// latter: the pre-ack wait runs for token servers too (plan 006 D5), and
+    /// telling a token-mode operator their server "requires mtls" would send
+    /// them debugging the wrong thing.
+    fn capability_error(err: &HostAgentClientError, server: &str, wants_mtls: bool) -> ShedError {
         match err {
-            HostAgentClientError::Unsupported(_) => format!(
-                "shed-host-agent is too old to obtain a client certificate for {server}, \
-                 which requires mtls; upgrade shed-host-agent"
-            ),
+            HostAgentClientError::Unsupported(cap) => ShedError::AgentUpgradeRequired {
+                server: server.to_string(),
+                detail: format!(
+                    "the connected shed-host-agent does not support `{cap}`, and {server} \
+                     requires auth.mode: mtls"
+                ),
+            },
             HostAgentClientError::CapabilityLost
             | HostAgentClientError::NotConnected
-            | HostAgentClientError::Disconnected => format!(
-                "connecting to shed-host-agent; {server} requires mtls and the agent has not \
-                 announced its capabilities yet"
-            ),
-            other => format!("{other} while obtaining a credential for {server}"),
+            | HostAgentClientError::Disconnected => ShedError::Config(if wants_mtls {
+                format!(
+                    "connecting to shed-host-agent; {server} requires mtls and the agent has \
+                     not announced its capabilities yet"
+                )
+            } else {
+                format!(
+                    "connecting to shed-host-agent; it has not announced its capabilities \
+                     yet, so no credential for {server} can be minted"
+                )
+            }),
+            other => {
+                ShedError::Config(format!("{other} while obtaining a credential for {server}"))
+            }
         }
     }
 }
@@ -171,13 +207,47 @@ impl TokenMinter for HostAgentTokenMinter {
     ) -> Result<MintedCredential, ShedError> {
         let wants_mtls = self.expects_mtls(server);
         let mut capability = self.client.credential_capability_snapshot();
-        // Only an mtls-expecting mint pays the wait: a token entry learns nothing
-        // useful from the ack and keeps every shipped build's immediate token.get.
-        if capability.state == AgentCapabilityState::Unknown && wants_mtls {
+        // The pre-ack wait is unconditional across modes (plan 006 D5, revising
+        // plan 002's mtls-only gate): before the first `hello_ack` this
+        // connection has learned NOTHING — the ack is the agent's first frame —
+        // so a `token.get` fired into that silence spends its whole reply
+        // timeout to learn less than this bounded wait does. If the ack lands
+        // inside the window, proceed per the resolved state (an alive agent
+        // with a late ack still succeeds, at most `capability_wait` later). If
+        // it never lands, the specific "not announced its capabilities"
+        // sentence below beats the outer request bound instead of losing to it
+        // (shed#297: the generic `credential resolution timeout` was the OUTER
+        // timeout cancelling this future before it could say anything). The
+        // deliberate trade (plan 006, CR H2): a down/never-acking agent now
+        // costs a token mint `capability_wait` before failing WITH a diagnosis,
+        // instead of failing later with none.
+        //
+        // The negative-result memo keeps that trade from STACKING (the
+        // adversarial-review finding): the provider holds its mutex across a
+        // mint, so concurrent callers serialize through here — without the
+        // memo, N dashboard panes against a wedged/absent agent would each
+        // queue a full wait and push the later ones past their outer request
+        // bounds. One caller per burst pays the wait; the rest fail fast with
+        // the same diagnosis. Self-healing: once the ack lands the state is no
+        // longer Unknown and this whole branch is skipped. Deliberately NOT
+        // gated on `is_connected()` — at cold launch the first mint can run
+        // before the dial completes, and an instant "not connected" there would
+        // regress the alive-agent-late-ack case the wait exists to serve.
+        if capability.state == AgentCapabilityState::Unknown {
+            if self.recent_unknown_wait() {
+                return Err(Self::capability_error(
+                    &HostAgentClientError::CapabilityLost,
+                    server,
+                    wants_mtls,
+                ));
+            }
             capability = self
                 .client
                 .await_credential_capability(self.capability_wait)
                 .await;
+            if capability.state == AgentCapabilityState::Unknown {
+                self.note_unknown_wait();
+            }
         }
         match capability.state {
             AgentCapabilityState::Supported => {
@@ -197,7 +267,7 @@ impl TokenMinter for HostAgentTokenMinter {
                     .client
                     .request_credential(server, csr, capability, self.timeout)
                     .await
-                    .map_err(|e| ShedError::Config(Self::capability_message(&e, server)))?;
+                    .map_err(|e| Self::capability_error(&e, server, wants_mtls))?;
                 let minted = map_credential_response(resp, server)?;
                 if matches!(minted, MintedCredential::Certificate(_)) && csr.is_none() {
                     return Err(ShedError::Config(format!(
@@ -208,18 +278,23 @@ impl TokenMinter for HostAgentTokenMinter {
                 self.record_mode(server, minted.mode());
                 Ok(minted)
             }
-            AgentCapabilityState::Unsupported if wants_mtls => {
-                Err(ShedError::Config(Self::capability_message(
-                    &HostAgentClientError::Unsupported("credential.get"),
-                    server,
-                )))
-            }
-            AgentCapabilityState::Unknown if wants_mtls => Err(ShedError::Config(
-                Self::capability_message(&HostAgentClientError::CapabilityLost, server),
+            AgentCapabilityState::Unsupported if wants_mtls => Err(Self::capability_error(
+                &HostAgentClientError::Unsupported("credential.get"),
+                server,
+                wants_mtls,
             )),
-            // Token-mode servers keep the behavior every shipped build has: send
-            // the token.get. `request_token` itself fails fast when there is no
-            // live connection.
+            // Still Unknown after the bounded wait — the agent has emitted
+            // nothing at all. Diagnosable for BOTH modes (plan 006 D5): sending
+            // a token.get here would only trade this specific sentence for a
+            // reply-timeout the outer request bound truncates to a generic
+            // transport error.
+            AgentCapabilityState::Unknown => Err(Self::capability_error(
+                &HostAgentClientError::CapabilityLost,
+                server,
+                wants_mtls,
+            )),
+            // Unsupported + token server: an old-but-alive agent answers
+            // token.get exactly as every shipped build did.
             _ => self.mint(server).await.map(MintedCredential::Token),
         }
     }
@@ -629,6 +704,116 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dead_socket_burst_pays_the_wait_once() {
+        // The negative-result memo on a socket that never connects: the first
+        // mint pays the bounded wait, an immediately-following mint fails fast
+        // with the same diagnosis. Pins the adversarial-review finding that
+        // serialized callers must not stack waits.
+        let modes = Arc::new(AuthModeRegistry::new());
+        modes.record("prod", AuthMode::Token);
+        let wait = Duration::from_millis(300);
+        let minter = disconnected_minter(modes).with_capability_wait(wait);
+        let started = std::time::Instant::now();
+        let first = minter
+            .mint_credential("prod", &CredentialRequest::default())
+            .await
+            .unwrap_err();
+        assert!(started.elapsed() >= wait, "the first mint pays the wait");
+        assert!(
+            matches!(&first, ShedError::Config(m) if m.contains("connecting to shed-host-agent")),
+            "got {first:?}"
+        );
+        let started = std::time::Instant::now();
+        let second = minter
+            .mint_credential("prod", &CredentialRequest::default())
+            .await
+            .unwrap_err();
+        assert!(
+            started.elapsed() < wait / 2,
+            "the second mint must hit the memo: {:?}",
+            started.elapsed()
+        );
+        assert!(
+            matches!(&second, ShedError::Config(m) if m.contains("not announced its capabilities")),
+            "got {second:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn wedged_agent_burst_pays_the_wait_once() {
+        // Guard 2: a connected-but-silent agent (the SIGSTOP shape — connect
+        // succeeds, hello_ack never arrives). The first mint pays the bounded
+        // wait; an immediately-following mint hits the negative-result memo and
+        // fails fast with the same diagnosis, so serialized callers don't stack
+        // waits past their outer bounds.
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("host-agent.sock");
+        let listener = tokio::net::UnixListener::bind(&sock).unwrap();
+        // Accept and hold connections open, reading nothing back: a socket
+        // that is alive but never speaks.
+        let _silent = tokio::spawn(async move {
+            let mut held = Vec::new();
+            loop {
+                match listener.accept().await {
+                    Ok((conn, _)) => held.push(conn),
+                    Err(_) => return,
+                }
+            }
+        });
+        let client = HostAgentClient::new(&sock, Arc::new(FixedClock));
+        let _events = client.start(crate::host_agent::HelloClientInfo {
+            name: "t".into(),
+            version: "1".into(),
+            pid: 1,
+            capabilities: vec![],
+            replay_events: 0,
+        });
+        let wait = Duration::from_millis(300);
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !client.is_connected() && std::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(client.is_connected(), "test double never accepted");
+
+        let modes = Arc::new(AuthModeRegistry::new());
+        modes.record("prod", AuthMode::Token);
+        let minter = HostAgentTokenMinter::new(client.clone())
+            .with_modes(modes)
+            .with_capability_wait(wait);
+
+        let started = std::time::Instant::now();
+        let first = minter
+            .mint_credential("prod", &CredentialRequest::default())
+            .await
+            .unwrap_err();
+        let first_elapsed = started.elapsed();
+        assert!(
+            first_elapsed >= wait,
+            "the first mint pays the wait: {first_elapsed:?}"
+        );
+        assert!(
+            matches!(&first, ShedError::Config(m) if m.contains("not announced its capabilities")),
+            "got {first:?}"
+        );
+
+        let started = std::time::Instant::now();
+        let second = minter
+            .mint_credential("prod", &CredentialRequest::default())
+            .await
+            .unwrap_err();
+        assert!(
+            started.elapsed() < wait / 2,
+            "the second mint must hit the memo, not re-pay the wait: {:?}",
+            started.elapsed()
+        );
+        assert!(
+            matches!(&second, ShedError::Config(m) if m.contains("not announced its capabilities")),
+            "got {second:?}"
+        );
+        client.stop();
+    }
+
+    #[tokio::test]
     async fn pre_ack_supports_mtls_follows_what_is_known_about_the_servers() {
         // Nothing known → no keypair is generated for anyone (today's behavior
         // for the entire token-mode fleet).
@@ -660,25 +845,78 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pre_ack_token_mint_keeps_the_immediate_token_get() {
-        // A token entry learns nothing from the ack, so it does NOT pay the
-        // wait — it takes the legacy path and fails on the dead socket.
+    async fn pre_ack_token_mint_waits_then_reports_connecting() {
+        // Plan 006 D5 (revising plan 002's mtls-only gate): a token entry pays
+        // the same bounded pre-ack wait, and an unreachable agent yields the
+        // specific "not announced its capabilities" sentence instead of a
+        // token.get transport failure the outer request bound would truncate
+        // to a generic timeout. The wording must NOT claim the server requires
+        // mtls — it doesn't.
         let modes = Arc::new(AuthModeRegistry::new());
         modes.record("prod", AuthMode::Token);
         let e = disconnected_minter(modes)
             .mint_credential("prod", &CredentialRequest::default())
             .await
             .unwrap_err();
+        let ShedError::Config(m) = e else {
+            panic!("expected the bounded-wait Config error, got a different variant");
+        };
+        assert!(m.contains("connecting to shed-host-agent"), "{m}");
+        assert!(m.contains("no credential for prod"), "{m}");
         assert!(
-            matches!(&e, ShedError::Transport(m) if m.contains("not connected")),
-            "expected the token.get transport failure, got {e:?}"
+            !m.contains("requires mtls"),
+            "token-mode wording must not claim mtls: {m}"
+        );
+        assert!(!m.contains("upgrade"), "{m}");
+    }
+
+    #[test]
+    fn agent_upgrade_error_matches_the_shared_fixture() {
+        // The wording contract with the Swift twin (plan 006 D6): both
+        // languages derive the SAME typed case with the same remedy-first
+        // message from an `unsupported` capability, pinned by the shared
+        // fixture rather than two copies of the strings.
+        let fx = fixture("hello_ack.json");
+        let spec = &fx["unsupported_mint_error"];
+        let server = spec["server"].as_str().unwrap();
+        assert_eq!(spec["kind"], "agent_upgrade_required", "fixture kind skew");
+
+        let e = HostAgentTokenMinter::capability_error(
+            &HostAgentClientError::Unsupported("credential.get"),
+            server,
+            true,
+        );
+        let ShedError::AgentUpgradeRequired { server: s, detail } = &e else {
+            panic!("expected the typed upgrade case, got {e:?}");
+        };
+        assert_eq!(s, server);
+        let rendered = e.to_string();
+        let must_contain = |haystack: &str, key: &str| {
+            for needle in spec[key]
+                .as_array()
+                .unwrap_or_else(|| panic!("{key} is an array"))
+            {
+                let needle = needle.as_str().unwrap();
+                assert!(
+                    haystack.contains(needle),
+                    "{key}: {haystack:?} lacks {needle:?}"
+                );
+            }
+        };
+        must_contain(&rendered, "message_must_contain");
+        must_contain(detail, "detail_must_contain");
+        // Remedy-first is the point (banners truncate from the end): the
+        // rendered message must LEAD with the action.
+        assert!(
+            rendered.starts_with("upgrade shed-host-agent"),
+            "{rendered}"
         );
     }
 
-    fn credential_fixture() -> serde_json::Value {
-        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(
-            "../../tests/host-agent-diff/fixtures/desktop-credential/credential_response.json",
-        );
+    fn fixture(name: &str) -> serde_json::Value {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/host-agent-diff/fixtures/desktop-credential")
+            .join(name);
         let raw = std::fs::read_to_string(&path)
             .unwrap_or_else(|e| panic!("read fixture {}: {e}", path.display()));
         serde_json::from_str(&raw).expect("fixture is valid JSON")
@@ -686,7 +924,7 @@ mod tests {
 
     #[test]
     fn golden_credential_response_arms() {
-        let fx = credential_fixture();
+        let fx = fixture("credential_response.json");
         assert_eq!(fx["protocol_version"], 1, "fixture version skew");
         let server = fx["server"].as_str().unwrap();
 

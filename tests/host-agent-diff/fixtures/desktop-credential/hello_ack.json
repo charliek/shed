@@ -1,5 +1,5 @@
 {
-  "_comment": "Plan 002 §7 P9 — language-neutral hello_ack vectors for the desktop credential handshake. Each vector is a hello_ack frame exactly as an agent writes it, plus the capability an app must derive from it. `unsupported` is the OLD-agent signal (the agent_capabilities key is absent, empty, or lists only other capabilities); `supported` requires the literal \"credential.get\" entry. The third app-side state, `unknown`, is deliberately NOT reachable from any frame here: it is the PRE-ACK state (no hello_ack seen yet on this connection), and conflating it with `unsupported` is the §7 P5 bug these vectors exist to prevent. Consumed by desktop/Tests/ShedKitTests/HostAgentCredentialFixtureTests.swift (the Swift client), crates/shed-app/src/host_agent.rs (the Rust client, through the real connection-state machine), and both agent suites (cmd/shed-host-agent/golden_test.go, crates/shed-host-agent/src/desktop_protocol.rs), which additionally assert that the ack THIS build emits is a `supported` one.",
+  "_comment": "Plan 002 §7 P9 — language-neutral hello_ack vectors for the desktop credential handshake. Each vector is a hello_ack frame exactly as an agent writes it, plus the capability an app must derive from it. `unsupported` is the OLD-agent signal (the agent_capabilities key is absent, empty, or lists only other capabilities); `supported` requires the literal \"credential.get\" entry. The third app-side state, `unknown`, is deliberately NOT reachable from any frame here: it is the PRE-ACK state (no hello_ack seen yet on this connection), and conflating it with `unsupported` is the §7 P5 bug these vectors exist to prevent. Consumed by desktop/Tests/ShedKitTests/HostAgentCredentialFixtureTests.swift (the Swift client), crates/shed-app/src/host_agent.rs (the Rust client, through the real connection-state machine), and the agent suite (crates/shed-host-agent/src/desktop_protocol.rs), which additionally asserts that the ack THIS build emits is a `supported` one.",
   "protocol_version": 1,
   "vectors": [
     {
@@ -78,5 +78,12 @@
       },
       "expected_capability": "supported"
     }
-  ]
+  ],
+  "unsupported_mint_error": {
+    "_note": "Plan 006 D6 (shed#300): the TYPED error a client must derive when a mint against an mtls server meets an `unsupported` capability. `kind` is the typed case (Rust ShedError::AgentUpgradeRequired / the Swift FFI mirror); `message_must_contain` pins the remedy-first wording of the rendered error; `detail_must_contain` pins the cause carried in the detail field. Consumed by the Rust minter tests (crates/shed-app/src/token_minter.rs) and the Swift mapper tests. Additive: the `vectors` array above is unchanged and its consumers are unaffected.",
+    "server": "prod",
+    "kind": "agent_upgrade_required",
+    "message_must_contain": ["upgrade shed-host-agent"],
+    "detail_must_contain": ["does not support `credential.get`", "requires auth.mode: mtls"]
+  }
 }
