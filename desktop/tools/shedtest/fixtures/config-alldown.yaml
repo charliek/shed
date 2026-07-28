@@ -1,0 +1,17 @@
+# All-hosts-down fixture for the empty-state deference E2E (test_tauri_downhost.py).
+# TWO servers, BOTH named in the launch's SHED_*_MOCK_UNREACHABLE_HOSTS override, so
+# the backend points each at a closed port: zero listable sheds AND two per-host
+# failures — the shape the Sheds empty state must defer to instead of the generic
+# "No sheds yet" copy (shed#300), and the two-failed-hosts case `host_errors` exists
+# for. Host/port are placeholders — the server name is what the override matches on.
+servers:
+    down1:
+        host: 127.0.0.1
+        http_port: 8080
+        ssh_port: 2222
+    down2:
+        host: 127.0.0.1
+        http_port: 8080
+        ssh_port: 2222
+default_server: down1
+sheds: {}
