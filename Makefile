@@ -1,4 +1,4 @@
-.PHONY: build build-cli build-server build-egress-proxy build-agent build-firstboot build-host-agent build-machine-rc build-tools build-fc-remote-server test test-integration test-host-agent-diff test-integration-dev test-integration-dev-fc dev-server-up dev-server-down dev-server-status dev-server-logs dev-server-restart dev-server-up-fc dev-server-down-fc dev-server-status-fc dev-server-logs-fc dev-server-restart-fc release clean dev-server dev-cli check check-kernel-pin coverage lint-all docs docs-serve firecracker-rootfs download-firecracker vz-rootfs vz-rootfs-base vz-rootfs-all
+.PHONY: build build-cli build-server build-egress-proxy build-agent build-firstboot build-machine-rc build-tools build-fc-remote-server test test-integration test-host-agent-diff test-integration-dev test-integration-dev-fc dev-server-up dev-server-down dev-server-status dev-server-logs dev-server-restart dev-server-up-fc dev-server-down-fc dev-server-status-fc dev-server-logs-fc dev-server-restart-fc release clean dev-server dev-cli check check-kernel-pin coverage lint-all docs docs-serve firecracker-rootfs download-firecracker vz-rootfs vz-rootfs-base vz-rootfs-all
 
 GOARCH ?= $(shell go env GOARCH)
 
@@ -8,7 +8,7 @@ BUILD_DATE := $(shell date -u +"%Y-%m-%dT%H:%M:%SZ")
 LDFLAGS := -ldflags "-X github.com/charliek/shed/internal/version.Version=$(VERSION) -X github.com/charliek/shed/internal/version.GitCommit=$(GIT_COMMIT) -X github.com/charliek/shed/internal/version.BuildDate=$(BUILD_DATE)"
 
 # Build all binaries
-build: build-cli build-server build-egress-proxy build-agent build-firstboot build-host-agent build-machine-rc
+build: build-cli build-server build-egress-proxy build-agent build-firstboot build-machine-rc
 
 # Build CLI only
 build-cli:
@@ -29,10 +29,6 @@ build-agent:
 # Build shed-firstboot only (in-VM oneshot for identity regen)
 build-firstboot:
 	GOOS=linux GOARCH=$(GOARCH) go build $(LDFLAGS) -o bin/shed-firstboot ./cmd/shed-firstboot
-
-# Build shed-host-agent only (host-side agent; darwin CGO/Touch ID via build tags)
-build-host-agent:
-	go build $(LDFLAGS) -o bin/shed-host-agent ./cmd/shed-host-agent
 
 # Build shed-machine-rc only (host-side machine rc helper)
 build-machine-rc:
@@ -63,12 +59,14 @@ test-integration:
 	}
 	cd tests/integration && uv sync && uv run pytest -v
 
-# Hermetic Go-vs-Rust host-agent differential harness (the THIRD pytest suite —
-# never merged with tests/integration or desktop/tools/shedtest). It spawns BOTH
-# shed-host-agent daemon binaries (Go cmd/shed-host-agent + Rust
-# crates/shed-host-agent) and asserts equal wire-visible output under a defined
-# canonicalization, then runs the language-neutral golden-fixture runners in each
-# language. Needs Go + Rust (cargo on PATH) + uv. See tests/host-agent-diff/README.md.
+# Hermetic host-agent wire harness (the THIRD pytest suite — never merged with
+# tests/integration or desktop/tools/shedtest). It spawns the Rust
+# crates/shed-host-agent daemon and asserts its wire-visible output under a
+# defined canonicalization against goldens recorded from the last agreeing
+# Go↔Rust run (the Go cmd/shed-host-agent twin was sunset — see plan
+# 006-mtls-cleanup-hostagent-sunset.md), then runs the language-neutral
+# golden-fixture runners in Rust. Needs Rust (cargo on PATH) + uv. See
+# tests/host-agent-diff/README.md.
 test-host-agent-diff:
 	@command -v uv >/dev/null 2>&1 || { \
 	  echo "uv is required for the host-agent differential harness."; \
@@ -76,7 +74,6 @@ test-host-agent-diff:
 	  exit 1; \
 	}
 	cd tests/host-agent-diff && uv sync && uv run pytest -v
-	go test ./cmd/shed-host-agent/... -run Golden
 	# Both Rust crates: the daemon bin owns tests/golden.rs, while the in-crate
 	# golden runners (load_discovered_servers, ssh_payload_shapes, the config/
 	# aws/docker/egress vectors) moved into shed-broker with the crate split. A

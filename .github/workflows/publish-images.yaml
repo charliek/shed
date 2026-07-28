@@ -543,10 +543,11 @@ jobs:
         needs.publish-fc.result == 'success' &&
         needs.smoke.result == 'success'))
     # macos-latest: the shipped shed-host-agent is Rust (builder: rust / cargo
-    # zigbuild — cross-builds the linux targets from macOS via zig), and the
-    # detached Go rollback ids still compile here (darwin needs CGO for Touch ID).
-    # This mirrors the ci.yml release-snapshot job so the snapshot is a faithful
-    # dry-run. The image-publish jobs above keep their linux runners.
+    # zigbuild — cross-builds the linux targets from macOS via zig). The Go
+    # twin (cmd/shed-host-agent) was sunset (plan
+    # 006-mtls-cleanup-hostagent-sunset.md). This mirrors the ci.yml
+    # release-snapshot job so the snapshot is a faithful dry-run. The
+    # image-publish jobs above keep their linux runners.
     runs-on: macos-latest
     permissions:
       contents: write

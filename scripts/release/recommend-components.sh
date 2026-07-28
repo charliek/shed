@@ -64,6 +64,10 @@ set -euo pipefail
 PATHS_SERVER=(
   cmd
   ':(exclude)cmd/shed-machine-rc'
+  # cmd/shed-host-agent was deleted from the tree (plan 006 C3 — the Go
+  # host-agent sunset), but the exclusion stays: it's needed so diffs against
+  # PRE-DELETION tags still classify correctly. Prune after the next
+  # host-agent release makes every future basis tag post-deletion.
   ':(exclude)cmd/shed-host-agent'
   internal
   sdk
@@ -96,6 +100,10 @@ PATHS_HOST_AGENT=(
   crates/shed-core
   crates/rust-toolchain.toml
   configs/extensions.example.yaml
+  # cmd/shed-host-agent was deleted from the tree (plan 006 C3 — the Go
+  # host-agent sunset), but the entry stays: it's needed so diffs against
+  # PRE-DELETION tags still classify correctly. Prune after the next
+  # host-agent release makes every future basis tag post-deletion.
   cmd/shed-host-agent
   .goreleaser.host-agent.yaml
 )

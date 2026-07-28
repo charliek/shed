@@ -105,7 +105,6 @@ jobs:
               - 'crates/rust-toolchain.toml'
               - 'crates/Cargo.toml'
               - 'crates/Cargo.lock'
-              - 'cmd/shed-host-agent/**'
               - 'sdk/**'
               - 'internal/ext/protocol/**'
               - 'tests/host-agent-diff/**'
@@ -180,12 +179,13 @@ jobs:
     # Also gated on `hostagent`: the SHIPPED shed-host-agent binary is now built
     # from crates/shed-host-agent/ (builder: rust), so a crates-only PR must run
     # this snapshot to prove the release build still resolves. The `hostagent`
-    # filter already scopes crates/shed-host-agent/** (+ cmd/shed-host-agent/**).
+    # filter already scopes crates/shed-host-agent/**.
     if: ${{ needs.changes.outputs.go == 'true' || needs.changes.outputs.hostagent == 'true' || needs.changes.outputs.ci == 'true' }}
-    # macos-latest matches the real release runner. The shipped shed-host-agent is
+    # macos-latest matches the real release runner: the shipped shed-host-agent is
     # Rust (builder: rust / cargo zigbuild — cross-builds the linux targets from
-    # macOS via zig); the detached Go rollback ids still compile here (darwin needs
-    # CGO for Touch ID). goreleaser cross-builds the Go linux ids (CGO off) fine.
+    # macOS via zig). The Go twin (cmd/shed-host-agent) was sunset (plan
+    # 006-mtls-cleanup-hostagent-sunset.md); this job now builds only the Rust
+    # binary, but stays on macos-latest to match the real release runner.
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v6
@@ -223,8 +223,8 @@ jobs:
         run: |
           go mod tidy && git diff --exit-code go.mod go.sum
           git check-ignore -q packaging/server.yaml.generated
-      # First-ever CI exercise of the darwin build-tag half (the Go rollback
-      # shed-host-agent's touchid_darwin.go, CGO) — de-risks the macos release job.
+      # First-ever CI exercise of the darwin build-tag half (internal/vz and
+      # friends) on this runner — de-risks the macos release job.
       - name: Run tests
         run: go test ./...
       # Three snapshot invocations, one per split config, in the FIXED release
@@ -293,22 +293,8 @@ jobs:
           amd64_file="$(file "$workdir/shed-host-agent")"
           echo "$amd64_file" | grep -q 'Mach-O.*x86_64' || { echo "::error::darwin/amd64 is not a well-formed x86_64 Mach-O: $amd64_file"; exit 1; }
           echo "darwin/amd64: $amd64_file"
-          # (iv) rollback insurance: the detached Go ids still compiled (host-agent dist).
-          python3 - <<'PY'
-          import json,sys
-          arts=json.load(open('dist/host-agent/artifacts.json'))
-          seen={}
-          for a in arts:
-              ex=a.get('extra') or {}
-              if a.get('type')=='Binary' and ex.get('ID') in ('shed-host-agent-darwin','shed-host-agent-linux'):
-                  seen.setdefault(ex['ID'],set()).add(f"{a.get('goos')}/{a.get('goarch')}")
-          want={'shed-host-agent-darwin':{'darwin/amd64','darwin/arm64'},'shed-host-agent-linux':{'linux/amd64','linux/arm64'}}
-          if {k:seen.get(k) for k in want}!={k:v for k,v in want.items()}:
-              print(f"::error::Go rollback builds missing from artifacts.json: got {seen}");sys.exit(1)
-          print("Go rollback ids present:",{k:sorted(v) for k,v in seen.items()})
-          PY
           rm -rf "$workdir"
-          # (v) plan 002 D6: per-dist exact (type, ID) allowlists — typed, so a
+          # (iv) plan 002 D6: per-dist exact (type, ID) allowlists — typed, so a
           # dropped ARCHIVE block is caught even when its BUILD still contributes
           # the same ID string (codex review finding). Equality proves expected-
           # present AND forbidden-absent. Plus partition invariants (deb
@@ -331,9 +317,9 @@ jobs:
               "host-agent": {
                   "dist": "dist/host-agent",
                   "typed_ids": {
-                      # Go rollback ids compile as binaries but are detached from
-                      # the archive — Binary-only, by design (RELEASING.md).
-                      "Binary": {"shed-host-agent", "shed-host-agent-darwin", "shed-host-agent-linux"},
+                      # Rust-only shape (plan 006 C3 — the Go twin was sunset):
+                      # exactly one build id, archived under the same id.
+                      "Binary": {"shed-host-agent"},
                       "Archive": {"shed-host-agent"},
                       "Linux Package": set(),
                   },
@@ -508,21 +494,20 @@ jobs:
           cargo test -p shed-core --all-targets --locked
           cargo clippy -p shed-core --all-targets --locked -- -D warnings
 
-  # The Go-vs-Rust host-agent differential leg (Phase 3 leg 3a.1). One Linux job
-  # covers BOTH the standalone Rust daemon's build+test+clippy (so it can't Mac-dev
-  # bit-rot — it persists as the 3a.2 headless fallback) AND the hermetic
-  # differential harness that spawns both daemon binaries and asserts equal
-  # wire-visible output. Go + Rust + Python on one runner (the "third pytest suite").
+  # The host-agent wire-goldens leg (Phase 3 leg 3a.1; the Go twin sunset by
+  # plan 006-mtls-cleanup-hostagent-sunset.md). One Linux job covers BOTH the
+  # standalone Rust daemon's build+test+clippy (so it can't Mac-dev bit-rot —
+  # it persists as the 3a.2 headless fallback) AND the hermetic wire harness
+  # that spawns the daemon and asserts its wire-visible output against goldens
+  # recorded from the last agreeing Go↔Rust run. Rust + Python on one runner
+  # (the "third pytest suite").
   host-agent-diff:
-    name: host-agent-diff (Go vs Rust)
+    name: host-agent-diff (wire goldens)
     needs: changes
     if: ${{ needs.changes.outputs.hostagent == 'true' || needs.changes.outputs.ci == 'true' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
-      - uses: actions/setup-go@v6
-        with:
-          go-version: '1.25'
       - name: Rust toolchain
         run: |
           rustup toolchain install stable --profile minimal --component clippy
@@ -546,9 +531,9 @@ jobs:
         run: |
           cargo test -p shed-host-agent --all-targets --locked --no-default-features
           cargo clippy -p shed-host-agent --all-targets --locked --no-default-features -- -D warnings
-      - name: Go-vs-Rust differential + golden runners
-        # Builds both daemon binaries (conftest) and runs the pytest differential
-        # + the Go and Rust golden-fixture runners.
+      - name: Wire goldens + golden runners
+        # Builds the Rust daemon binary (conftest) and runs the pytest suite
+        # against the recorded goldens + the Rust golden-fixture runners.
         run: make test-host-agent-diff
 
   deb:

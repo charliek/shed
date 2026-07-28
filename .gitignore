@@ -4,8 +4,6 @@ dist/
 /shed
 /shed-server
 /shed-agent
-# bare `go build ./cmd/shed-host-agent` drops the binary at the repo root
-/shed-host-agent
 firecracker/shed-agent
 vz/shed-agent
 # Guest extension binaries + /etc overlay staged into the rootfs build
