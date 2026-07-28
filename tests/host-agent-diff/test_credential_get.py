@@ -1,20 +1,20 @@
-"""The desktop `credential.get` differential — the mode-agnostic control-credential
-relay that `token.get` cannot express.
+"""The desktop `credential.get` cells — the mode-agnostic control-credential relay
+that `token.get` cannot express.
 
 A desktop client sends `credential.get{server:"prod", csr:"<base64 DER>"}` (surface A);
 the daemon's control-credential provider resolves `prod` from the shed CLI config
 (`~/.shed/config.yaml`), runs a CONTROL-scope SSH `_bootstrap` **passing the app's CSR
-through verbatim**, and replies `credential.response`. The Go `cmd/shed-host-agent` and
-the Rust `crates/shed-host-agent` are asserted to produce equal wire-visible output.
+through verbatim**, and replies `credential.response`. That wire-visible output is
+golden-pinned.
 
 Two things are pinned here that no other cell covers:
 
-1. **The CSR reaches `ssh` unmodified, in both impls.** The private key that will pair
-   with the issued certificate never leaves the desktop app, so a CSR that either
-   daemon rewrote, re-encoded, or quietly regenerated would yield a certificate the app
-   cannot present — and it would fail later, at a TLS handshake, with no trace back to
-   here. The shim records the argv, so the `csr=<b64>` element is compared Go-vs-Rust
-   AND against the expected vector.
+1. **The CSR reaches `ssh` unmodified.** The private key that will pair with the
+   issued certificate never leaves the desktop app, so a CSR the daemon rewrote,
+   re-encoded, or quietly regenerated would yield a certificate the app cannot present
+   — and it would fail later, at a TLS handshake, with no trace back to here. The shim
+   records the argv, so the `csr=<b64>` element is golden-pinned AND asserted against
+   the expected vector.
 
 2. **The token-mode answer.** The shim server returns a TOKEN bundle (the same fixed
    bundle `test_token_get.py` uses), which is the everyday case: an app that asks with
@@ -23,8 +23,8 @@ Two things are pinned here that no other cell covers:
    values — the app branches on `auth_mode`, and a response carrying both shapes (or
    neither) is the ambiguity the separate message was introduced to remove.
 
-Both daemons resolve `ssh` from PATH to the SAME committed shim, so the credential
-fields are deterministic and compared UNMASKED (see `mask_credential_response`).
+The daemon resolves `ssh` from PATH to a committed shim, so the credential fields are
+deterministic and pinned UNMASKED (see `mask_credential_response`).
 """
 
 from __future__ import annotations
@@ -100,7 +100,7 @@ def test_credential_get_relays_the_csr(daemon, single_server_config, differentia
     assert resp["id"] == "<id>"
     assert resp["ts"] == "<ts>"
 
-    # --- the relayed CSR: equal Go-vs-Rust (differential) + the expected vector ---
+    # --- the relayed CSR: golden-pinned + asserted against the expected vector ---
     argv = result["argv"]
     csr_args = [a for a in argv if a.startswith("csr=")]
     assert csr_args == [f"csr={APP_CSR}"], (

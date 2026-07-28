@@ -1,10 +1,9 @@
-"""A synthetic shed-server plugin bus for the surface-B differential tests.
+"""A synthetic shed-server plugin bus for the surface-B wire tests.
 
-Stands in for shed-server's plugin message-bus HTTP API (`sdk/hostclient.go`) so
-BOTH host-agent daemons — the Go `cmd/shed-host-agent` and the Rust
-`crates/shed-host-agent` bus client (`bus.rs`) — can subscribe, receive a pushed
-request Envelope, and POST a response back, entirely on `127.0.0.1` with no real
-server. It exposes exactly the three routes a single-server daemon touches:
+Stands in for shed-server's plugin message-bus HTTP API (`sdk/hostclient.go`) so the
+host-agent's bus client (`crates/shed-host-agent/bus.rs`) can subscribe, receive a
+pushed request Envelope, and POST a response back, entirely on `127.0.0.1` with no
+real server. It exposes exactly the three routes a single-server daemon touches:
 
 * `GET /api/plugins/listeners/{ns}/messages` — the SSE subscribe. Records that a
   subscribe happened for `{ns}` (and the `Authorization` header — `None` in open
@@ -12,17 +11,15 @@ server. It exposes exactly the three routes a single-server daemon touches:
   `data: {json}\\n\\n` frame until teardown.
 * `POST /api/plugins/listeners/{ns}/respond` — reads the response Envelope body,
   records it keyed by namespace, and returns **204** (the status the client
-  expects; a non-204 is a bus error on both sides).
-* `GET /api/egress/stream` — the always-on egress-audit consumer's route, hit by
-  BOTH daemons now (the endpoint sets converged). Two modes, chosen at construction
-  (`SyntheticBus(egress=...)`):
-    - `"unavailable"` (default) → **501**, so each daemon's egress subscriber backs
-      off hard (5m, DEBUG-quiet) — the harness asserts per-impl `egress_hits() == 1`
-      within a short window to prove that hard backoff (no reconnect).
+  expects; a non-204 is a bus error).
+* `GET /api/egress/stream` — the always-on egress-audit consumer's route. Two modes,
+  chosen at construction (`SyntheticBus(egress=...)`):
+    - `"unavailable"` (default) → **501**, so the daemon's egress subscriber backs
+      off hard (5m, DEBUG-quiet) — the harness asserts `egress_hits() == 1` within a
+      short window to prove that hard backoff (no reconnect).
     - `"events"` → **200** + a held `text/event-stream` that pushes `data:` decision
-      frames (`push_egress`) with FIXED timestamps, so both daemons write the SAME
-      durable audit JSONL line (a deterministic differential — Go stamps `now()` only
-      for an ABSENT ts).
+      frames (`push_egress`) with FIXED timestamps, so the durable audit JSONL line is
+      deterministic (`now()` is stamped only for an ABSENT ts).
 * Any other path — **404**.
 
 Threading model mirrors the plain-`socket`/blocking style of `desktop_client.py`:
@@ -228,7 +225,7 @@ class SyntheticBus:
 
     def egress_hits(self) -> int:
         """How many times `GET /api/egress/stream` has been hit by this bus instance's
-        daemon (each impl gets its OWN `SyntheticBus`, so this is a per-impl counter).
+        daemon (each daemon gets its OWN `SyntheticBus`, so this is a per-daemon counter).
         Both impls hit it now (the always-on egress subscriber)."""
         with self._cond:
             return self._egress_hits
@@ -331,13 +328,13 @@ class _BusHandler(BaseHTTPRequestHandler):
     # -- route handlers ------------------------------------------------------
 
     def _serve_egress(self) -> None:
-        """The `GET /api/egress/stream` route. Records the hit (both impls now GET it),
+        """The `GET /api/egress/stream` route. Records the hit,
         then either 501s (`"unavailable"` mode → the daemon backs off hard) or holds a
         200 `text/event-stream` and pushes queued decision frames (`"events"` mode)."""
         bus = self._bus
         bus._record_egress()
         if bus._egress_mode != "events":
-            # Egress disabled → 501; each impl's subscriber backs off the hard 5m.
+            # Egress disabled → 501; the subscriber backs off the hard 5m.
             self._send_empty(501)
             return
         self._stream_sse(bus._egress_queue)

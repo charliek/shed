@@ -3,22 +3,22 @@
 A desktop client sends `token.get{server:"prod"}` (surface A); the daemon's control-token
 provider resolves `prod` from the shed CLI config (`~/.shed/config.yaml`), mints a CONTROL
 token over the server's SSH `_bootstrap` channel by invoking the system `ssh` client, and
-replies `token.response`. The Go `cmd/shed-host-agent` and the Rust `crates/shed-host-agent`
-are asserted to produce equal wire-visible output.
+replies `token.response`. The daemon's wire-visible output is asserted against the
+recorded golden.
 
-**Deterministic seam → the minted token is compared UNMASKED.** Both daemons resolve `ssh`
-from PATH to the SAME committed shim (`conftest._write_ssh_shim`), which prints one fixed
-`sdk.Bundle` and captures its argv. So `mask_token_response` leaves `token`/`expires_at` to
-be diffed — pinning that both impls carry the minted token through and format the expiry to
-UTC RFC3339 identically — while the volatile `id`/`ts` are masked.
+**Deterministic seam → the minted token is golden-pinned UNMASKED.** The daemon resolves
+`ssh` from PATH to a committed shim (`conftest._write_ssh_shim`), which prints one fixed
+`sdk.Bundle` and captures its argv. So `mask_token_response` leaves `token`/`expires_at`
+unmasked — pinning that the daemon carries the minted token through and formats the
+expiry to UTC RFC3339 — while the volatile `id`/`ts` are masked.
 
-**The `ssh` argv is compared too** (the minter cell's control-scope live check). Each impl
-runs with its OWN isolated `$HOME`, so the raw argv differ in the one env-dependent element
-`-o UserKnownHostsFile=<HOME>/.shed/known_hosts`; we home-normalize that (replace the impl's
-`$HOME` with `<HOME>`, analogous to `mask_live_status` stripping the socket-path prefix) and
-then (a) the `differential` fixture asserts the normalized argv are equal Go-vs-Rust — the
-byte-for-byte `ssh_args` parity check — and (b) assert them against the expected vector
-(control scope, `_bootstrap` user, the 17 `-o` options in order).
+**The `ssh` argv is pinned too** (the minter cell's control-scope live check). The daemon
+runs with an isolated `$HOME`, so the raw argv carry one env-dependent element
+`-o UserKnownHostsFile=<HOME>/.shed/known_hosts`; we home-normalize that (replace the
+daemon's `$HOME` with `<HOME>`, analogous to `mask_live_status` stripping the socket-path
+prefix) and then (a) golden-pin the normalized argv — the byte-for-byte `ssh_args` check —
+and (b) assert them against the expected vector (control scope, `_bootstrap` user, the 17
+`-o` options in order).
 """
 
 from __future__ import annotations
@@ -56,7 +56,7 @@ KNOWN_HOSTS = f"[prod.example]:2222 ssh-ed25519 {_PUB_BLOB}\n"
 
 # The fixed `sdk.Bundle` the shim prints: CONTROL scope (must match the token.get scope or
 # decode rejects), an https port + fingerprint, a non-empty token, a fixed whole-second
-# `Z` expiry (so parse→UTC→render is byte-identical across impls). No single quotes (the
+# `Z` expiry (so parse→UTC→render is byte-identical run to run). No single quotes (the
 # shim wraps it in `printf '%s' '<bundle>'`).
 SHIM_BUNDLE = (
     '{"https_port":8443,"tls_cert_fingerprint":"sha256:deadbeef",'
@@ -185,7 +185,7 @@ def test_token_get(daemon, single_server_config, differential):
     assert resp["id"] == "<id>"
     assert resp["ts"] == "<ts>"
 
-    # --- the minter's ssh argv: equal Go-vs-Rust (differential) + the expected vector ---
+    # --- the minter's ssh argv: golden-pinned + asserted against the expected vector ---
     argv = result["argv"]
     assert argv == EXPECTED_ARGV
     # The control-scope live check: the remote command's <scope> is `control`.
@@ -194,25 +194,23 @@ def test_token_get(daemon, single_server_config, differential):
 
 
 # A MALFORMED `~/.shed/config.yaml` the control-token provider reads when resolving a
-# server for `token.get`. Before the config-port slice the Rust `load_discovered_servers`
-# reused the permissive line/colon `yaml_lite` reader, which never errored; Go
-# `LoadDiscoveredServers` errored on malformed YAML. The reader is now backed by
-# `saphyr-parser`, so BOTH impls surface an error — wrapped as `reading server config:`
-# in the `token.response.error`.
+# server for `token.get`. Before the config-port slice `load_discovered_servers` reused
+# the permissive line/colon `yaml_lite` reader, which never errored. The reader is now
+# backed by `saphyr-parser`, so a malformed doc surfaces an error — wrapped as
+# `reading server config:` in the `token.response.error`.
 MALFORMED_SHED_CONFIG = "{{invalid yaml"
 
 
-@pytest.mark.parametrize("impl", ["go", "rust"])
+@pytest.mark.parametrize("impl", ["rust"])
 def test_token_get_malformed_shed_config(daemon, single_server_config, impl):
     """A `token.get` against a daemon whose `~/.shed/config.yaml` is MALFORMED fails
     closed: the control-token provider's resolve reads the config, the parse errors, and
     the daemon replies `token.response{error}` (never a partial token).
 
-    The OUTER wrapper prefix `reading server config:` is the only shared, assertable
-    surface (P: C3): Go's inner text is `parsing shed config <path>` (`discovery.go:73`
-    for malformed) while Rust's is `parsing shed config <path>: <saphyr msg>` — the inner
-    body is yaml-lib specific and excluded (docker suffix precedent), so this asserts the
-    outer prefix per-impl (NOT a full-string differential). The launch config itself is a
+    Style-B (no golden): only the OUTER wrapper prefix `reading server config:` is
+    assertable. The inner body is `parsing shed config <path>: <saphyr msg>` — yaml-lib
+    specific, and excluded from the pinned surface (docker suffix precedent), so
+    recording the full string would freeze a parser's phrasing. The launch config itself is a
     VALID single-server block config, so the daemon boots normally; only the SEPARATE
     `~/.shed/config.yaml` the minter reads is malformed (the M2 "different file, different
     chain" reason this stays a distinct cell from the config-validate matrix)."""

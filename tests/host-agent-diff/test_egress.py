@@ -1,25 +1,22 @@
-"""Surface-B egress: the always-on egress-audit SSE consumer, asserted equal across the
-Go `cmd/shed-host-agent` and the Rust `crates/shed-host-agent`.
+"""Surface-B egress: the always-on egress-audit SSE consumer, golden-pinned.
 
-Both daemons run a per-server, read-only `GET /api/egress/stream` subscriber (Go's
-watcher group; Rust's `egress.rs` side task on `run_single_server_bus`). With egress
-wired on both sides the endpoint sets fully converge — the synthetic bus no longer
-merely tolerates a Go-only egress GET, it asserts BOTH impls hit the route.
+The daemon runs a per-server, read-only `GET /api/egress/stream` subscriber
+(`egress.rs`'s side task on `run_single_server_bus`).
 
 Three cells (open server — the harness runs single-server open mode, so the token path
 is `None`/static; the 401-invalidate + control-token scope are unit-owned in
-`egress.rs`, Go's `_SendsControlToken`/`_401Invalidates` are httptest+fake):
+`egress.rs`):
 
-1. **subscription convergence** — both impls GET `/api/egress/stream` when the bus
-   starts (`wait_for_egress`), the endpoint-set-converged proof.
+1. **subscription** — the daemon GETs `/api/egress/stream` when the bus starts
+   (`wait_for_egress`).
 2. **events** — the bus serves a 200 stream and pushes ONE decision frame with a FIXED
-   timestamp; both impls write the SAME durable audit JSONL line. The frame ts is fixed
-   (`2020-01-01T00:00:00Z`), so Go's `LogEntry` keeps it verbatim (it stamps `now()`
-   ONLY for an empty ts) — the whole line is deterministic and is diffed UNMASKED,
-   including the always-present `"approval":""` byte.
-3. **501 hard-backoff** — the bus 501s egress; each impl backs off the hard 5m (DEBUG-
-   quiet), so within a short window its OWN `egress_hits()` stays at 1 (per-impl — each
-   impl gets its own `SyntheticBus`), proving no fast reconnect.
+   timestamp, and the daemon writes a durable audit JSONL line. The frame ts is fixed
+   (`2020-01-01T00:00:00Z`) and kept verbatim (`now()` is stamped ONLY for an empty ts)
+   — the whole line is deterministic and pinned UNMASKED, including the always-present
+   `"approval":""` byte.
+3. **501 hard-backoff** — the bus 501s egress; the daemon backs off the hard 5m (DEBUG-
+   quiet), so within a short window `egress_hits()` stays at 1, proving no fast
+   reconnect.
 """
 
 from __future__ import annotations
@@ -33,7 +30,7 @@ from synthetic_bus import SyntheticBus
 
 # A single streamed egress decision (shed-server's `egressDecision` wire shape:
 # ts/shed/host/port/resolved_ip/protocol/verdict/reason). The FIXED ts makes the
-# resulting audit line deterministic on both impls (see the events cell).
+# resulting audit line deterministic (see the events cell).
 DECISION = {
     "ts": "2020-01-01T00:00:00Z",
     "shed": "web",
@@ -45,10 +42,10 @@ DECISION = {
     "reason": "default-deny",
 }
 
-# The durable audit JSONL line `egressAuditEntry(server="", DECISION)` produces on BOTH
+# The durable audit JSONL line the egress decision produces (`server=""`) on
 # impls: ns=egress, op=protocol, result=verdict, detail=host:port (resolved_ip),
 # reason echoed, ts kept from the frame, `approval:""` present, and `server` omitted
-# (single-server mode leaves it empty → omitempty on both sides).
+# (single-server mode leaves it empty → skipped when empty).
 EXPECTED_AUDIT = {
     "ts": "2020-01-01T00:00:00Z",
     "shed": "web",
@@ -82,7 +79,7 @@ def test_egress_subscription_convergence(daemon, single_server_config, different
 
 @pytest.mark.differential
 def test_egress_events_audit_diff(daemon, single_server_config, differential):
-    """A fixed-ts decision frame → the SAME durable audit JSONL line on both impls,
+    """A fixed-ts decision frame → a deterministic durable audit JSONL line,
     diffed UNMASKED (deterministic frame ts), including the `"approval":""` byte."""
 
     def scenario(impl):
@@ -98,14 +95,14 @@ def test_egress_events_audit_diff(daemon, single_server_config, differential):
     # The empty-but-PRESENT approval byte (egress leaves approval empty; the wire keeps
     # the key). A dropped key would fail the whole-line compare above too, but pin it.
     assert "approval" in line and line["approval"] == ""
-    # ts is DIFFED (not masked): both impls rendered the frame ts identically.
+    # ts is PINNED (not masked): the frame ts is rendered verbatim.
     assert line["ts"] == "2020-01-01T00:00:00Z"
 
 
 @pytest.mark.differential
 def test_egress_501_hard_backoff_no_reconnect(daemon, single_server_config, differential):
-    """A 501 egress route → each impl backs off the hard 5m (not the normal exp backoff),
-    so within a short window its OWN `egress_hits()` stays at 1 (per-impl counter)."""
+    """A 501 egress route → the daemon backs off the hard 5m (not the normal exp
+    backoff), so within a short window `egress_hits()` stays at 1."""
 
     def scenario(impl):
         with SyntheticBus() as bus:  # default "unavailable" (501)

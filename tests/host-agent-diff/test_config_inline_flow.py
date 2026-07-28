@@ -1,20 +1,19 @@
-"""Inline flow-style YAML config parses identically in BOTH impls (the config-parse ·
-inline-flow parity, closed by the saphyr parser swap).
+"""Inline flow-style YAML config parses (the config-parse · inline-flow contract,
+closed by the saphyr parser swap).
 
-Before the config-port slice the Rust `yaml_lite` reader was a line/colon reader that
+Before the config-port slice the `yaml_lite` reader was a line/colon reader that
 treated an inline flow map like `ssh: { approval: { policy: shed-desktop } }` as an
-opaque scalar and fell back to all-`deny-all` with an empty gate list, while the Go
-daemon (real YAML) parsed it — a tracked `xfail`. The reader is now backed by
+opaque scalar and fell back to all-`deny-all` with an empty gate list — a tracked
+`xfail` against the retired Go daemon, which parsed it. The reader is now backed by
 `saphyr-parser`, which parses flow maps + flow sequences natively, so this cell drives a
-FULLY flow-style launch config through both daemons and asserts their masked
-`LiveStatus` is canonical-equal, with the three approval policies parsed out of the flow
-maps (not defaulted to deny-all).
+FULLY flow-style launch config through the daemon and golden-pins the masked
+`LiveStatus`, with the three approval policies parsed out of the flow maps (not
+defaulted to deny-all).
 
 This is the wire-visible half the plan's M3 disposition endorses: `LiveStatus.policies`
-is the observable proof that inline-flow `approval.policy` values are parsed. (The Go
-daemon has always parsed flow style, so the differential is a real Rust-parity check, not
-a tautology — a Rust regression to the old opaque-scalar behavior would surface here as
-`policies: {all deny-all}` != Go.) It is the SAME watch-none scenario as
+is the observable proof that inline-flow `approval.policy` values are parsed — a
+regression to the old opaque-scalar behavior surfaces here as
+`policies: {all deny-all}`. It is the SAME watch-none scenario as
 `test_status_running.py`, only written in flow style — so the expected values match that
 cell exactly.
 
@@ -33,7 +32,7 @@ from normalize import canonical, mask_live_status
 # braces (`{{`/`}}`) survive the `daemon` fixture's `.format()` as single braces; the
 # `{audit_log}` / `{source}` fields are filled by the fixture. Equivalent to
 # conftest.WATCH_NONE_CONFIG but flow-style — chosen so the Rust parser must handle nested
-# flow maps + a flow sequence, and so BOTH impls report an empty `servers` list.
+# flow maps + a flow sequence, and so the daemon reports an empty `servers` list.
 INLINE_FLOW_CONFIG = (
     "ssh: {{ approval: {{ policy: shed-desktop }} }}\n"
     "aws: {{ approval: {{ policy: approve-all }} }}\n"
@@ -56,12 +55,12 @@ def test_inline_flow_config_parses_equal(daemon, differential):
 
     # The flow-map `approval.policy` values were parsed (not defaulted to deny-all) —
     # exactly the block-style expectation from test_status_running.py, proving flow and
-    # block style parse identically on BOTH impls.
+    # block style parse identically.
     assert masked["policies"] == {
         "ssh-agent": "shed-desktop",
         "aws-credentials": "approve-all",
         "docker-credentials": "deny-all",
     }
     assert masked["gate_namespaces"] == ["ssh-agent"]
-    # The empty flow sequence `servers: []` parsed as "watch none" on both impls.
+    # The empty flow sequence `servers: []` parsed as "watch none".
     assert masked["servers"] == []

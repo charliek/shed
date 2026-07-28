@@ -1,25 +1,25 @@
 """Surface-B secure bus — TLS-pinned subscribe + credentials-scope self-mint (4b).
 
 A SECURE server (https `api_url`, an SSH endpoint, a `tls_cert_fingerprint` pin) reached
-via `discovery:` drives BOTH daemons to:
+via `discovery:` drives the daemon to:
 
 * self-mint a **credentials-scope** token over the server's SSH `_bootstrap` channel (the
   PATH-shim `ssh` returns a fixed bundle) — the credentials-scope wire the minter + egress
   slices deferred to the supervisor slice, and
 * subscribe to the bus over **https**, pinning the synthetic bus's committed leaf cert
-  (`tls_cert_fingerprint = "sha256:" + hex(sha256(leaf_DER))` — the SAME derivation Go's
-  `sdk.WithTLSPin`/`certFingerprint` and Rust's `shed_core::tls::fingerprint` use), and
+  (`tls_cert_fingerprint = "sha256:" + hex(sha256(leaf_DER))` — the derivation
+  `shed_core::tls::fingerprint` uses), and
   present `Authorization: Bearer <minted>`.
 
 The synthetic bus serves TLS with a **committed** self-signed cert/key pair (Python's
 stdlib `ssl` cannot generate one). Cells:
 
 * **credentials-scope live mint** — the subscribe succeeds under the pin and carries the
-  minted credentials token (asserted equal Go-vs-Rust and against the fixed bundle).
-* **401 → invalidate + re-mint + reconnect** — the bus 401s the first subscribe; both
-  daemons invalidate the token, re-mint, and reconnect (a second subscribe, fresh Bearer).
+  minted credentials token (golden-pinned, and asserted against the fixed bundle).
+* **401 → invalidate + re-mint + reconnect** — the bus 401s the first subscribe; the
+  daemon invalidates the token, re-mints, and reconnects (a second subscribe, fresh Bearer).
 * **wrong-pin fails closed** — a discovery config with a WRONG fingerprint never completes
-  the TLS handshake, so the bus records NO subscribe (both impls fail closed).
+  the TLS handshake, so the bus records NO subscribe.
 """
 
 from __future__ import annotations
@@ -98,7 +98,7 @@ def test_secure_bus_credentials_mint(daemon, discovery_poll_config, differential
 
     auth = differential(scenario)
     # The subscribe succeeded UNDER THE PIN (it wouldn't reach the bus otherwise) and carries
-    # the minted credentials-scope token — deterministic, compared UNMASKED + equal Go-vs-Rust.
+    # the minted credentials-scope token — deterministic, so it is golden-pinned UNMASKED.
     assert auth == EXPECTED_BEARER
 
 
@@ -119,15 +119,15 @@ def test_secure_bus_401_remint_reconnect(daemon, discovery_poll_config, differen
 
     auths = differential(scenario)
     # Both the initial (401'd) and the reconnect subscribe carry the minted Bearer; the
-    # re-mint returns the same fixed bundle, so both are EXPECTED_BEARER on both impls.
+    # re-mint returns the same fixed bundle, so both are EXPECTED_BEARER.
     assert auths == [EXPECTED_BEARER, EXPECTED_BEARER]
 
 
-@pytest.mark.parametrize("impl", ["go", "rust"])
+@pytest.mark.parametrize("impl", ["rust"])
 def test_secure_bus_wrong_pin_fails_closed(daemon, discovery_poll_config, impl):
     """A WRONG `tls_cert_fingerprint` fails the pin at the TLS handshake, so the client
-    never completes an HTTP request → the bus records NO subscribe. Both impls fail closed
-    (per-impl assertion — no cross-impl value to diff, just the absence of a subscribe)."""
+    never completes an HTTP request → the bus records NO subscribe. Style-B (no golden):
+    the assertion is an ABSENCE, which has no recordable value."""
     from synthetic_bus import SyntheticBus
 
     wrong_pin = "sha256:" + ("00" * 32)

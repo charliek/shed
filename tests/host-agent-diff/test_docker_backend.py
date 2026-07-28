@@ -1,27 +1,26 @@
-"""The Docker credential backend differential — surface-B `get`/`list`/`status`/`ping`/
-`unknown` over the docker-credentials namespace, asserted equal across the Go
-`cmd/shed-host-agent` and the Rust `crates/shed-host-agent`.
+"""The Docker credential backend — surface-B `get`/`list`/`status`/`ping`/`unknown`
+over the docker-credentials namespace, golden-pinned.
 
 **Hermetic by construction.** The `daemon` fixture writes the Docker `config.json`
-fixture into each impl's isolated `<HOME>/.docker/config.json` (`install_docker_config`
-kwarg), and `_clean_env` strips `DOCKER_CONFIG`, so both impls resolve the SAME config
-off `$HOME` with no real `~/.docker` read. The credential-helper exec seam is a fake
+fixture into the daemon's isolated `<HOME>/.docker/config.json` (`install_docker_config`
+kwarg), and `_clean_env` strips `DOCKER_CONFIG`, so the SAME config resolves off
+`$HOME` with no real `~/.docker` read. The credential-helper exec seam is a fake
 `docker-credential-testhelper` (a python3 script, 0755 + shebang) installed into a
-PATH-prepended `helper-bin` dir (`docker_helper_bundle` kwarg); it appends a per-impl
-JSONL transcript of `{argv, stdin}` — argv+stdin ONLY, never PATH/env — and prints a
-fixed bundle, so the exec seam is deterministic and its transcript is diffable.
+PATH-prepended `helper-bin` dir (`docker_helper_bundle` kwarg); it appends a JSONL
+transcript of `{argv, stdin}` — argv+stdin ONLY, never PATH/env — and prints a fixed
+bundle, so the exec seam is deterministic and its transcript is pinnable.
 
 **The unconfigured crux.** Unlike AWS (which gates itself off when unconfigured), the
-Docker backend is non-nil even absent — so BOTH impls subscribe `docker-credentials`
-for every server. Every cell `wait_for_subscribe("docker-credentials")` first (proving
-the subscription on both impls); the dedicated `test_docker_unconfigured` cell proves
-the crux directly (a minimal `docker:` block still subscribes + denies).
+Docker backend is non-nil even absent — so `docker-credentials` is subscribed for every
+server. Every cell `wait_for_subscribe("docker-credentials")` first (proving the
+subscription); the dedicated `test_docker_unconfigured` cell proves the crux directly
+(a minimal `docker:` block still subscribes + denies).
 
-**Error-string policy.** Only PREFIXES + codes are diffed live — the base64/JSON/
-exit-status runtime SUFFIXES are impl-dependent and excluded (helper-failure `reason` is
-unit-owned). The audit `reason`s asserted here (`registry "x" not in allowlist`,
-`no credentials found for "x"`, `denied: approval policy is deny-all`) carry NO runtime
-suffix, so they ARE diffed byte-for-byte.
+**Error-string policy.** Only PREFIXES + codes are pinned live — the base64/JSON/
+exit-status runtime SUFFIXES are environment-dependent and excluded (helper-failure
+`reason` is unit-owned). The audit `reason`s asserted here (`registry "x" not in
+allowlist`, `no credentials found for "x"`, `denied: approval policy is deny-all`) carry
+NO runtime suffix, so they ARE pinned byte-for-byte.
 """
 
 from __future__ import annotations
@@ -88,7 +87,7 @@ def _req(req_id: str, operation: str, **extra) -> dict:
 
 def test_docker_helper_shim_contract(tmp_path):
     """Drive the generated fake helper directly (no daemon): it must capture argv+stdin
-    to the transcript and print the bundle verbatim — the contract the differential relies
+    to the transcript and print the bundle verbatim — the contract the cells rely
     on. Uses the conftest writer via a throwaway helper file."""
     from conftest import _write_docker_helper
 
@@ -160,7 +159,7 @@ def test_docker_get_inline_auth(daemon, differential):
 
 @pytest.mark.differential
 def test_docker_get_helper(daemon, differential):
-    """get via a credHelper (the live exec seam): the helper transcript diffed Go-vs-Rust,
+    """get via a credHelper (the live exec seam): the helper transcript golden-pinned,
     the response payload diffed, and the ok audit diffed."""
     config_json = json.dumps({"credHelpers": {"ghcr.io": "testhelper"}})
     docker_block = "docker:\n  allow_all: true\n  approval:\n    policy: approve-all\n"
@@ -191,7 +190,7 @@ def test_docker_get_helper(daemon, differential):
         "username": "helper-user",
         "secret": "helper-secret",
     }
-    # The exec seam: argv `["get"]`, stdin = the raw server_url, identical on both impls.
+    # The exec seam: argv `["get"]`, stdin = the raw server_url.
     assert result["transcript"] == [{"argv": ["get"], "stdin": "ghcr.io"}]
     assert result["audit"]["result"] == "ok"
     assert result["audit"]["detail"] == "ghcr.io"
@@ -390,7 +389,7 @@ def test_docker_unknown_op(daemon, differential):
 def test_docker_unconfigured(daemon, differential):
     """The unconfigured crux: a minimal `docker:` block (ONLY approval.policy, NO
     registries/allow_all/config_path) and NO `~/.docker/config.json` under the isolated
-    `$HOME`. BOTH impls STILL subscribe `docker-credentials` (proven by
+    `$HOME`. The daemon STILL subscribes `docker-credentials` (proven by
     `wait_for_subscribe`) AND a `get` returns `REGISTRY_NOT_ALLOWED` (empty allowlist,
     allow_all false) — the live proof of the non-nil-when-unconfigured constructor."""
     docker_block = "docker:\n  approval:\n    policy: approve-all\n"

@@ -3,15 +3,14 @@
 A single-server (no `discovery:` block) daemon connects to the synthetic shed-server
 plugin bus and subscribes to `ssh-agent`. The test pushes a `ping` request Envelope
 over that SSE stream and awaits the daemon's response POST. The masked pong is
-canonical-equal across the Go and Rust daemons — same correlation, namespace, type,
-final flag, `{"status":"ok"}` payload, and echoed `shed`, with only the volatile
-`id`/`timestamp` masked (D3, `mask_bus_response`).
+golden-pinned — correlation, namespace, type, final flag, `{"status":"ok"}` payload,
+and echoed `shed`, with only the volatile `id`/`timestamp` masked (D3,
+`mask_bus_response`).
 
-Slice asymmetry (a known contract gap, not a diff target): the Go daemon in
-single-server mode ALSO GETs `/api/egress/stream` (always-on egress subscriber) and
-would subscribe to aws/docker if configured; the Rust slice-1b daemon subscribes to
-`ssh-agent` only. The synthetic bus 501s egress and the test compares only the
-ssh-agent response, so the asymmetry is tolerated by construction.
+Scoped by construction: the daemon in single-server mode also GETs
+`/api/egress/stream` (the always-on egress subscriber) and would subscribe to
+aws/docker if configured. The synthetic bus 501s egress and this cell pins only the
+ssh-agent response.
 """
 
 import pytest
@@ -21,7 +20,7 @@ from synthetic_bus import SyntheticBus
 
 # The request Envelope shed-server would deliver to the ssh-agent listener: a
 # `ping` op with a fixed id + shed so the correlation (`in_reply_to`) and echoed
-# `shed` are pinned constants both impls must reproduce.
+# `shed` are pinned constants the response must reproduce.
 PING_REQUEST = {
     "id": "ping-1",
     "namespace": "ssh-agent",

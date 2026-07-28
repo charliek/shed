@@ -1,27 +1,25 @@
-"""The SSH backend differential — surface-B `list`/`sign`/`status` in BOTH backend
-modes, asserted equal across the Go `cmd/shed-host-agent` and the Rust
-`crates/shed-host-agent`.
+"""The SSH backend — surface-B `list`/`sign`/`status` in BOTH backend modes,
+golden-pinned.
 
 Two modes:
 
 * **local-keys** (`ssh.mode: local-keys`, `SSH_AUTH_SOCK` stripped, the committed
-  `id_ed25519`+`id_rsa`+`id_ecdsa` fixtures installed in each `$HOME/.ssh`): the
-  daemon signs with the on-disk keys. `list` is masked-canonical-equal + its durable
-  audit line diffed; `sign` verifies the produced RSA/ECDSA blob per-impl against the
-  fixture pubkey (verify-not-bytes, per the harness plan) and diffs the `format`;
-  `status` is canonical-equal.
-* **agent-forward** (auto-detect: no `ssh.mode`, `SSH_AUTH_SOCK` → a per-impl
-  `fake_ssh_agent.py`): the daemon proxies to the fake host agent. `list` is
-  canonical-equal (3 identities); `sign` ed25519 → the fake's REAL deterministic
-  signature, so the blob is compared UNMASKED; `sign` rsa flags=2 → the fake's canned
-  blob byte-equal + the recorded `flags==2` (wire passthrough); `status` is
-  canonical-equal. The **fake's transcript** (msg type / keyblob / data / flags) is
-  compared Go-vs-Rust so the two daemons are proven to issue the same wire requests.
+  `id_ed25519`+`id_rsa`+`id_ecdsa` fixtures installed in `$HOME/.ssh`): the daemon
+  signs with the on-disk keys. `list` is masked-canonical-pinned + its durable audit
+  line pinned; `sign` verifies the produced RSA/ECDSA blob against the fixture pubkey
+  (verify-not-bytes, per the harness plan) and pins the `format`; `status` is pinned.
+* **agent-forward** (auto-detect: no `ssh.mode`, `SSH_AUTH_SOCK` → a
+  `fake_ssh_agent.py`): the daemon proxies to the fake host agent. `list` is pinned
+  (3 identities); `sign` ed25519 → the fake's REAL deterministic signature, so the blob
+  is pinned UNMASKED; `sign` rsa flags=2 → the fake's canned blob byte-equal + the
+  recorded `flags==2` (wire passthrough); `status` is pinned. The **fake's transcript**
+  (msg type / keyblob / data / flags) is pinned too, so the exact wire requests the
+  daemon issues are frozen.
 
 **Gate policy — `approve-all`, deliberately.** These cells prove the *backend signing
 and wire behavior*, not the approval gate — the gated (shed-desktop delegate →
-approve/deny) `sign` path is already differentially enforced by `test_bus_sign_gated.py`
-(with a deterministic ed25519 blob compared unmasked). Using `approve-all` here avoids
+approve/deny) `sign` path is already covered by `test_bus_sign_gated.py`
+(with a deterministic ed25519 blob pinned unmasked). Using `approve-all` here avoids
 a scripted desktop consumer per cell (and the flakiness that adds) while still driving
 the full decode → gate → backend → response + audit flow. The `list`/`status` ops are
 ungated regardless.
@@ -181,7 +179,7 @@ def test_ssh_local_list(daemon, differential):
     keys = resp["payload"]["keys"]
     assert [k["comment"] for k in keys] == EXPECTED_COMMENTS
     assert [k["format"] for k in keys] == EXPECTED_FORMATS
-    # Each blob is the fixture's marshaled pubkey (b64), byte-equal across impls.
+    # Each blob is the fixture's marshaled pubkey (b64), byte-pinned.
     assert keys[0]["blob"] == ED25519_PUB_B64
     assert keys[1]["blob"] == RSA_PUB_B64
     assert keys[2]["blob"] == ECDSA_PUB_B64
@@ -211,7 +209,7 @@ def test_ssh_local_sign_rsa(daemon, differential, flags, fmt):
                 payload = mask_bus_response(bus.await_response("ssh-agent", timeout=10.0))["payload"]
                 assert payload["format"] == fmt, f"{impl}: {payload}"
                 assert payload["rest"] == ""
-                # verify-not-bytes: the blob cryptographically verifies per-impl.
+                # verify-not-bytes: the blob cryptographically verifies.
                 _verify_rsa("test_rsa", base64.b64decode(payload["blob"]), flags)
                 return {"format": payload["format"]}
 
@@ -250,7 +248,7 @@ def test_ssh_local_status(daemon, differential):
 
 
 # =====================================================================================
-# agent-forward mode (auto-detect via a per-impl fake ssh-agent)
+# agent-forward mode (auto-detect via a fake ssh-agent)
 # =====================================================================================
 
 
@@ -305,7 +303,7 @@ def test_ssh_agent_sign_ed25519(daemon, differential):
     result = differential(scenario)
     payload = result["response"]["payload"]
     # The fake real-signs ed25519 deterministically → the blob is byte-identical across
-    # impls (compared UNMASKED via `differential`) and verifies against the pubkey.
+    # runs (pinned UNMASKED in the golden) and verifies against the pubkey.
     assert payload["format"] == "ssh-ed25519"
     assert payload["rest"] == ""
     blob = base64.b64decode(payload["blob"])
@@ -339,7 +337,7 @@ def test_ssh_agent_sign_rsa_flags2(daemon, differential):
 
     result = differential(scenario)
     payload = result["response"]["payload"]
-    # The fake returns a canned blob (byte-equal both impls — proves passthrough, not a
+    # The fake returns a canned blob (byte-pinned — proves passthrough, not a
     # real signature) with the flag-selected format.
     assert payload["format"] == "rsa-sha2-256"
     assert base64.b64decode(payload["blob"]) == CANNED_RSA_BLOB

@@ -1,11 +1,11 @@
-"""A daemon started with an unreadable `-config` path exits 1 in BOTH impls. Only the
-exit code is compared: the stderr here is the operational log (Go `slog` vs Rust
-`tracing`-style lines), which the plan explicitly excludes from the differential."""
+"""A daemon started with an unreadable `-config` path exits 1. Only the exit code is
+asserted: the stderr here is the operational log (`tracing`-style lines), which the
+harness plan explicitly excludes from the compared surface."""
 
 import pytest
 
 
-@pytest.mark.parametrize("impl", ["go", "rust"])
+@pytest.mark.parametrize("impl", ["rust"])
 def test_config_load_error_exit1(run_cli, impl):
     # No subcommand + a bogus -config path => daemon mode, which fails to load the
     # config and exits 1 before binding any socket.

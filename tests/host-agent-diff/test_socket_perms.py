@@ -1,7 +1,7 @@
-"""The daemon-created status socket is a socket with owner-only 0600 perms on BOTH
-impls (the fixed public-interface socket is explicitly chmod'd by the daemon, not
-left at the process umask). Socket-dir 0700 re-chmod and stale-vs-live rebinding are
-driven in `test_socket_rebind.py` (A1)."""
+"""The daemon-created status socket is a socket with owner-only 0600 perms (the fixed
+public-interface socket is explicitly chmod'd by the daemon, not left at the process
+umask). Socket-dir 0700 re-chmod and stale-vs-live rebinding are driven in
+`test_socket_rebind.py` (A1)."""
 
 import os
 import stat

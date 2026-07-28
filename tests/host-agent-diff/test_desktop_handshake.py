@@ -1,13 +1,13 @@
 """Surface-A handshake: a fake shed-desktop app connects to the always-on approval
-channel, sends a `hello`, and receives a `hello_ack`. The masked ack is canonical-
-equal across the Go and Rust daemons — same `v`/`type`/namespaces/gate/timeout, with
-only the volatile `id`/`ts`/`agent.version` masked (D3). The 'watch none' launch
-config makes ssh the sole gated namespace (`gate_namespaces:["ssh-agent"]`).
+channel, sends a `hello`, and receives a `hello_ack`. The masked ack is golden-pinned
+— `v`/`type`/namespaces/gate/timeout, with only the volatile `id`/`ts`/`agent.version`
+masked (D3). The 'watch none' launch config makes ssh the sole gated namespace
+(`gate_namespaces:["ssh-agent"]`).
 
 The ack also carries `agent_capabilities` — the list an app checks before sending an
-optional message. It is diffed, not masked: a capability the two impls disagree about
-is precisely the bug the advertisement exists to prevent, since an app would then get
-"upgrade shed-host-agent" from one daemon and a working certificate from the other."""
+optional message. It is pinned, not masked: a silent change to that list is precisely
+the bug the advertisement exists to prevent, since an app would then get "upgrade
+shed-host-agent" where a working certificate was expected."""
 
 import pytest
 

@@ -1,9 +1,9 @@
-"""A daemon started with an unknown `ssh.mode` exits 1 in BOTH impls — and does so
-whether the config is single-server OR carries a `discovery:` block. Resolution runs
+"""A daemon started with an unknown `ssh.mode` exits 1 — and does so whether the
+config is single-server OR carries a `discovery:` block. Resolution runs
 UNCONDITIONALLY at startup (before any socket binds), so the mode is validated even in
 multi-server mode where the single-server bus stays off (the exact case the
-unconditional-resolve relocation protects). Only the exit code is compared — the
-stderr is the operational log (Go `slog` vs Rust `tracing`), which the plan excludes.
+unconditional-resolve relocation protects). Only the exit code is asserted — the
+stderr is the operational log (`tracing` lines), which the plan excludes.
 
 Distinct from `test_config_error.py` (that is a file-not-found → exit 1); this drives a
 readable config whose `ssh.mode` value is bad.
@@ -23,13 +23,13 @@ from conftest import _clean_env
 BOGUS_SINGLE = "ssh:\n  mode: bogus\n"
 
 # Multi-server: the SAME bogus mode plus a valid `discovery:` block (the block shape
-# both parsers accept — Go `DiscoveryConfig`, Rust `has_key("discovery")`). Resolution
-# still runs first and exits 1 before the discovery source is ever read.
+# the parser accepts — `has_key("discovery")`). Resolution still runs first and exits 1
+# before the discovery source is ever read.
 BOGUS_DISCOVERY = "ssh:\n  mode: bogus\ndiscovery:\n  servers: []\n  watch: off\n  source: {source}\n"
 
 
 @pytest.mark.parametrize("shape", ["single-server", "discovery"])
-@pytest.mark.parametrize("impl", ["go", "rust"])
+@pytest.mark.parametrize("impl", ["rust"])
 def test_ssh_unknown_mode_exits_1(binaries, tmp_path_factory, impl, shape):
     root = tmp_path_factory.mktemp(f"modeerr-{impl}")
     home = root / "home"

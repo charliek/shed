@@ -1,31 +1,29 @@
-"""The gated cross-surface (A+B) **sign** differential — the capstone scenario.
+"""The gated cross-surface (A+B) **sign** flow — the capstone scenario.
 
 A single bus `sign` request (surface B) drives a delegated `approval_request` to the
 connected desktop consumer (surface A); on **approve** the daemon signs the challenge
 with the committed ed25519 key and returns an `SSHSignResponse` on the bus PLUS an
 audit `event` to the desktop and a durable JSONL line; on **deny** it returns
-`{approval denied, SIGN_FAILED}` and a `denied` audit. The Go `cmd/shed-host-agent`
-and the Rust `crates/shed-host-agent` are asserted to produce equal wire-visible
-output under the harness's canonicalization (`differential`).
+`{approval denied, SIGN_FAILED}` and a `denied` audit. All of that wire-visible
+output is golden-pinned under the harness's canonicalization (`differential`).
 
 Ties BOTH surfaces together: the bus response (B), the approval_request + audit
-event (A), and the durable audit line all cross the Go/Rust seam in one flow, wired
-in single-server mode (no `discovery:`) with `ssh.mode: local-keys` +
-`ssh.approval.policy: shed-desktop`.
+event (A), and the durable audit line all travel one flow, wired in single-server
+mode (no `discovery:`) with `ssh.mode: local-keys` + `ssh.approval.policy:
+shed-desktop`.
 
-**Deterministic ed25519 → the signature blob is compared UNMASKED.** ed25519 signing
+**Deterministic ed25519 → the signature blob is pinned UNMASKED.** ed25519 signing
 is deterministic (RFC 8032: the nonce is derived from key+message, not randomness),
-so Go's `x/crypto/ssh` ed25519 signer and the Rust `ed25519-dalek` backend, loading
-the SAME committed `~/.ssh/id_ed25519` and signing the SAME fixed challenge, produce
-the SAME 64 bytes. The `mask_bus_response` mask leaves `payload` (hence `blob`) to be
-diffed, so the differential compares the signature byte-for-byte across impls — and
-we additionally pin it (`EXPECTED_SIGN_BLOB_B64`) as an absolute golden.
+so the `ed25519-dalek` backend, loading the committed `~/.ssh/id_ed25519` and signing
+the fixed challenge, always produces the SAME 64 bytes. The `mask_bus_response` mask
+leaves `payload` (hence `blob`) unmasked, so the golden carries the signature
+byte-for-byte — and we additionally pin it inline (`EXPECTED_SIGN_BLOB_B64`) as an
+absolute constant.
 
-Slice asymmetry (a known contract gap, absorbed by the harness, not diffed): the Go
-daemon in single-server mode also GETs `/api/egress/stream` (501 → 5m backoff) and
-subscribes to `docker-credentials`; the Rust slice-1c daemon wires `ssh-agent` only.
-The synthetic bus tolerates the extra Go subscribes and only the ssh-agent flow is
-compared. See the harness README.
+Scoped by construction: the daemon in single-server mode also GETs
+`/api/egress/stream` (501 → 5m backoff) and subscribes to `docker-credentials`. The
+synthetic bus tolerates those and only the ssh-agent flow is pinned here. See the
+harness README.
 """
 
 from __future__ import annotations
@@ -46,15 +44,15 @@ from normalize import (
 from synthetic_bus import SyntheticBus
 
 # NOTE: `fixtures/test_ed25519{,.pub}` is a THROWAWAY, non-secret, passphrase-less
-# ed25519 keypair generated once solely for this differential (comment `hadiff-test`).
-# It is intentionally committed so both daemons load an identical key; it guards
+# ed25519 keypair generated once solely for these cells (comment `hadiff-test`).
+# It is intentionally committed so every run loads an identical key; it guards
 # nothing and must never be reused anywhere real. (Not `.gitignore`-blocked — the repo
 # ignores `*.key`/`*.pem`, not extension-less OpenSSH keys.)
 FIXTURES_DIR = Path(__file__).resolve().parent / "fixtures"
 
 # The committed test key's SSH-wire public-key blob, derived at collection time from
 # the 2nd whitespace field of `test_ed25519.pub` — exactly `base64(string("ssh-ed25519")
-# || string(pubkey_bytes))`, i.e. Go's `ssh.PublicKey.Marshal()` / the Rust
+# || string(pubkey_bytes))`, i.e. the Rust
 # `marshaled_pub`. Deriving it from the committed `.pub` guarantees it never drifts
 # from the private key the `daemon` fixture installs into `<HOME>/.ssh/id_ed25519`.
 TEST_ED25519_PUB_BLOB = (FIXTURES_DIR / "test_ed25519.pub").read_text().split()[1]
@@ -80,7 +78,7 @@ EXPECTED_SIGN_BLOB_B64 = (
 # The request Envelope shed-server would deliver to the ssh-agent listener: a `sign`
 # op carrying the committed pubkey blob + the fixed challenge, with a fixed id + shed
 # so the correlation (`in_reply_to`), the echoed `shed`, and the audit/approval `shed`
-# are pinned constants both impls must reproduce.
+# are pinned constants the flow must reproduce.
 SIGN_REQUEST = {
     "id": "sign-1",
     "namespace": "ssh-agent",
@@ -127,7 +125,7 @@ def _sign_scenario(daemon, sign_config, decision: str):
 
                     # Surface B: the bus response; then surface A: the audit `event`
                     # fan-out; then the durable JSONL line (written before the event on
-                    # both impls, so it is present once the event has arrived).
+                    # written before the fan-out, so it is present once the event has arrived).
                     response = bus.await_response("ssh-agent", timeout=10.0)
                     event = app.await_frame("event", timeout=10.0)
                     audit = d.read_audit_jsonl(expect=1, timeout=10.0)[0]
@@ -210,7 +208,7 @@ def test_bus_sign_gated_approve(daemon, sign_config, differential):
         "decided_by": "user",
     }
 
-    # --- durable audit JSONL (channel 2) — same masked record across impls ---
+    # --- durable audit JSONL (channel 2) — the masked record, golden-pinned ---
     assert result["audit"] == {
         "ts": "<ts>",
         "shed": "web",
@@ -279,7 +277,7 @@ def test_bus_sign_gated_deny(daemon, sign_config, differential):
 # and — unlike the consumer-deny path above (`decided_by:"user"`) — NO `decided_by`. The
 # no-consumer / timeout gate returns the ERROR path (`desktopGate.Approve` →
 # `ApprovalOutcome{}` + err on Go; `denied_no_decision()` on Rust), so the empty
-# `DecidedBy`/`Scope`/`TTL` are all omitted (omitempty on both sides).
+# `DecidedBy`/`Scope`/`TTL` are all omitted (skipped when empty).
 FAIL_CLOSED_AUDIT = {
     "ts": "<ts>",
     "shed": "web",
@@ -325,7 +323,7 @@ def test_bus_sign_no_consumer_fails_closed(daemon, sign_config, differential):
 @pytest.mark.differential
 def test_bus_sign_timeout_fails_closed(daemon, sign_config, differential):
     """A3 · timeout fail-closed. A consumer connects and receives the `approval_request`
-    but NEVER replies; with a SHORT `approval_timeout` (1s) both daemons time out and
+    but NEVER replies; with a SHORT `approval_timeout` (1s) the daemon times out and
     deny — Go on `time.After(s.timeout)`, Rust on the `tokio::time::sleep` arm of the
     `select!` — returning `{approval denied, SIGN_FAILED}` + the same no-`decided_by`
     denied audit. This exercises the EXISTING timeout arm; per D7 (ACCEPT, no divergence)

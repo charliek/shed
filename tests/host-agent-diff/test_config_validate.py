@@ -1,17 +1,18 @@
-"""A daemon started with a valid-YAML-but-INVALID (or malformed) `-config` exits 1 in
-BOTH impls — the live half of the config-validate parity. Each vector is a config Go's
-`LoadConfig`/`Validate` rejects (`cmd/shed-host-agent/config.go`): an unknown/biometric
-policy, an `aws.mode`/`aws.sheds` error, a non-positive/invalid `approval_timeout`, a
-duplicate map key, or malformed YAML. The Rust `HostAgentConfig::load` now rejects the
-SAME set (saphyr parser + `validate()` port), so both daemons exit 1 before binding any
-socket.
+"""A daemon started with a valid-YAML-but-INVALID (or malformed) `-config` exits 1 —
+the live half of the config-validate contract. Each vector is a config
+`HostAgentConfig::load` must reject: an unknown/biometric policy, an
+`aws.mode`/`aws.sheds` error, a non-positive/invalid `approval_timeout`, a duplicate
+map key, or malformed YAML. (The vector set is the one the retired Go
+`LoadConfig`/`Validate` rejected; the saphyr parser + `validate()` port matched it,
+which is what the shared `config_validate.json` fixture records.) The daemon exits 1
+before binding any socket.
 
 Direct-launch-await-exit-1 pattern (like `test_ssh_mode_error.py` / `test_config_error.py`),
 NOT the `daemon` fixture — a rejected config never binds a socket, so there is nothing to
-query; only the exit code is compared. The operational log (Go `slog` vs Rust `tracing`)
-is the message channel and is excluded from the differential; per-vector message
-substrings are pinned language-neutrally by the `config_validate.json` golden (both
-runners), not here.
+query; only the exit code is asserted. The operational log (`tracing` lines) is the
+message channel and is excluded from the compared surface; per-vector message
+substrings are pinned language-neutrally by the `config_validate.json` fixture's
+in-crate runner, not here.
 
 There is deliberately NO exit-0 positive control: a VALID config boots the daemon and
 runs forever (it never exits), so this exit-code pattern cannot assert exit 0. The
@@ -31,8 +32,8 @@ import pytest
 from conftest import _clean_env
 
 # (id, config_yaml) — each valid YAML but an invalid config, OR malformed YAML. Mirrors
-# the config_validate.json golden's invalid vectors; the golden pins the per-vector
-# message substring, this cell pins the live exit-1 parity on both impls.
+# the config_validate.json fixture's invalid vectors; the fixture pins the per-vector
+# message substring, this cell pins the live exit-1 behavior.
 BAD_CONFIGS = [
     ("unknown-ssh-policy", "ssh:\n  approval:\n    policy: maybe\n"),
     ("biometrics-for-aws", "aws:\n  approval:\n    policy: biometrics\n"),
@@ -52,7 +53,7 @@ BAD_CONFIGS = [
 
 
 @pytest.mark.parametrize("cfg_id,config_yaml", BAD_CONFIGS, ids=[c[0] for c in BAD_CONFIGS])
-@pytest.mark.parametrize("impl", ["go", "rust"])
+@pytest.mark.parametrize("impl", ["rust"])
 def test_invalid_config_exits_1(binaries, tmp_path_factory, impl, cfg_id, config_yaml):
     root = tmp_path_factory.mktemp(f"cfgvalidate-{impl}")
     home = root / "home"

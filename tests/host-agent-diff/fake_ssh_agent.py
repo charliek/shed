@@ -1,10 +1,9 @@
-"""A fake ssh-agent on a UDS for the agent-forward differential cells.
+"""A fake ssh-agent on a UDS for the agent-forward cells.
 
 Stands in for the host SSH agent ($SSH_AUTH_SOCK) that the host-agent's
-**agent-forward** backend proxies to, so BOTH daemons — the Go
-`cmd/shed-host-agent` (`ssh_backend_agent.go`, via x/crypto's agent client) and the
-Rust `crates/shed-host-agent` (`ssh_backend_agent.rs`, the hand-rolled client) — speak
-the SAME three messages against it and produce identical wire-visible output.
+**agent-forward** backend (`crates/shed-host-agent/ssh_backend_agent.rs`, the
+hand-rolled client) proxies to, so the three messages it speaks are exercised against
+a deterministic peer.
 
 **Wire behavior mirrors the in-Rust unit fake** (`ssh_backend_agent.rs` tests) EXACTLY
 — it serves only the three messages the backend uses:
@@ -17,7 +16,7 @@ the SAME three messages against it and produce identical wire-visible output.
   `SSH_AGENT_SIGN_RESPONSE(14)` `string sigblob` where `sigblob = string(format) ‖
   string(blob)`:
     - the **ed25519** identity → a REAL deterministic ed25519 signature (RFC 8032) over
-      `data` (so both impls proxy the SAME 64 bytes → the blob compares UNMASKED);
+      `data` (so the proxied 64 bytes are fixed → the blob is golden-pinned UNMASKED);
     - the **rsa** identity → a CANNED fixed blob (not a real signature — transcript-/
       byte-verified only), `format` selected from `flags` the way a real agent labels
       it: `flags&2` → `rsa-sha2-256`, else `flags&4` → `rsa-sha2-512`, else `ssh-rsa`;
@@ -27,9 +26,9 @@ the SAME three messages against it and produce identical wire-visible output.
   connection (the auto-detect probe connects then closes without sending) is ignored.
 
 Every served request is appended to a JSONL **transcript** (`{"type": N, "key_b64":
-..., "data_b64": ..., "flags": N}` for sign, `{"type": 11}` for list) so the
-differential can assert the two daemons issued the same wire requests in the same
-order (flags passthrough included).
+..., "data_b64": ..., "flags": N}` for sign, `{"type": 11}` for list) so a cell can
+golden-pin the exact wire requests the daemon issued, in order (flags passthrough
+included).
 """
 
 from __future__ import annotations
@@ -52,7 +51,7 @@ SSH_AGENTC_SIGN_REQUEST = 13
 SSH_AGENT_SIGN_RESPONSE = 14
 
 # Deterministic CANNED signature blobs for the rsa/ecdsa identities — fixed bytes the
-# fake returns regardless of impl, so both daemons proxy the SAME blob (byte-compared).
+# fake returns for every request, so the proxied blob is fixed (byte-compared).
 # NOT real signatures (transcript-verified only), per the harness plan.
 CANNED_RSA_BLOB = b"hadiff-canned-rsa-signature-blob-v1"
 CANNED_ECDSA_BLOB = b"hadiff-canned-ecdsa-signature-blob-v1"

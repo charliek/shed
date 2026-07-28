@@ -1,19 +1,22 @@
-"""Fixtures for the hermetic Go-vs-Rust host-agent differential harness (slice 0).
+"""Fixtures for the hermetic host-agent **wire** harness.
 
-The session `binaries` fixture builds BOTH daemon binaries (`go build` + `cargo
-build`, with `~/.cargo/bin` on PATH) once and returns their paths. `run_cli` drives
-a one-shot subcommand (`version`, `status`, ...) against a chosen impl in an isolated
-HOME + socket dir. `daemon` is a context manager that launches a daemon with a valid
-config, waits for its status socket, yields a handle that can query `status
-[--json]`, and on exit sends SIGTERM, asserts a clean exit 0, and asserts both sockets
-are unlinked.
+The session `binaries` fixture builds the `shed-host-agent` daemon (`cargo build`,
+with `~/.cargo/bin` on PATH) once and returns its path. `run_cli` drives a one-shot
+subcommand (`version`, `status`, ...) against a chosen impl in an isolated HOME +
+socket dir. `daemon` is a context manager that launches a daemon with a valid config,
+waits for its status socket, yields a handle that can query `status [--json]`, and on
+exit sends SIGTERM, asserts a clean exit 0, and asserts both sockets are unlinked.
 
-`differential` additionally pins each agreed value to a committed golden under
-`goldens/` (see the "Goldens" block below `_shutdown`): recorded from a run where
-both implementations agreed, asserted on every later run.
+`differential` asserts the Rust daemon's wire-visible output against a committed
+golden under `goldens/` (see the "Goldens" block below `_shutdown`). Those goldens
+were recorded (73755c0-era) from a run where the Go and Rust daemons produced
+IDENTICAL values, so each one is a two-implementation agreement frozen in place —
+that is what the Go daemon's retirement handed forward. The `impl` seam and the
+fixture's `scenario(impl)` signature survive because the whole harness is written in
+terms of it; `"rust"` is the only impl now.
 
 Hermetic by construction: every test gets a fresh `$SHED_HOST_AGENT_SOCKET_DIR` and
-`$HOME` (so no real `~/.ssh` / `~/.shed` is read), `SSH_AUTH_SOCK` is stripped (the Go
+`$HOME` (so no real `~/.ssh` / `~/.shed` is read), `SSH_AUTH_SOCK` is stripped (the
 daemon falls back to an empty local-keys backend), and there is no network.
 """
 
@@ -40,9 +43,10 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 
 # Committed, throwaway, passphrase-less OpenSSH ed25519 test key (see
 # fixtures/test_ed25519). The `daemon` fixture writes it to a daemon's isolated
-# `<HOME>/.ssh/id_ed25519` so BOTH the Go local-keys backend and the Rust
-# `LocalEd25519Backend` load the SAME key — ed25519 is deterministic (RFC 8032), so
-# the two sign the same challenge to the same 64 bytes (compared UNMASKED).
+# `<HOME>/.ssh/id_ed25519` so the `LocalEd25519Backend` loads a FIXED key — ed25519 is
+# deterministic (RFC 8032), so the same challenge always signs to the same 64 bytes,
+# which is why the sign blob is golden-pinned UNMASKED. (Its Go twin loaded the same
+# committed key, which is how the recorded blob is a two-implementation agreement.)
 FIXTURES_DIR = Path(__file__).resolve().parent / "fixtures"
 TEST_ED25519_KEY = FIXTURES_DIR / "test_ed25519"
 
@@ -52,10 +56,9 @@ STATUS_SOCK_NAME = "host-agent-status.sock"
 DESKTOP_SOCK_NAME = "host-agent.sock"
 
 # The "watch none" launch config: ssh delegated to shed-desktop, aws approve-all,
-# docker deny-all, logging on, discovery watching zero servers. Chosen so BOTH impls
-# report an EMPTY `servers` list (Go's supervisor watches nothing; Rust has no
-# supervisor yet) while still exercising a non-trivial policy/gate mix. Written in
-# BLOCK style on purpose: the Rust slice-0 `yaml_lite` parser handles block maps only,
+# docker deny-all, logging on, discovery watching zero servers. Chosen so the daemon
+# reports an EMPTY `servers` list while still exercising a non-trivial policy/gate
+# mix. Written in BLOCK style on purpose: the Rust `yaml_lite` parser handles block maps only,
 # not inline flow maps like `ssh: { approval: { policy: X } }` — see README "Known
 # contract gaps". `{audit_log}` / `{source}` are filled in with per-test temp paths.
 WATCH_NONE_CONFIG = """\
@@ -78,17 +81,16 @@ discovery:
 """
 
 # The single-server (NO `discovery:` block) launch config for the surface-B bus
-# tests. With no `discovery:` key BOTH impls run in single-server mode (Go
-# `cfg.Discovery == nil`; Rust `is_single_server()`), connect to `server:`, and
-# subscribe to `ssh-agent`. `server:` is filled by `single_server_config(bus_url)`
-# (via a plain string replace, leaving `{audit_log}` for the `daemon` fixture's
-# `.format()` — an unused `{source}` kwarg there is harmless). BLOCK style on
-# purpose (the Rust `yaml_lite` parser is block-only; see WATCH_NONE_CONFIG /
-# README "Known contract gaps"). `ssh.approval.policy: approve-all` is a valid ssh
-# policy on both sides — but ping is NOT gated, so it's irrelevant to the pong; it
-# just exercises a non-empty gate. No `aws:`/`docker:` blocks → those backends stay
-# nil → the daemon subscribes to ssh-agent only (plus, on Go, the always-on egress
-# GET, which the synthetic bus 501s).
+# tests. With no `discovery:` key the daemon runs in single-server mode
+# (`is_single_server()`), connects to `server:`, and subscribes to `ssh-agent`.
+# `server:` is filled by `single_server_config(bus_url)` (via a plain string replace,
+# leaving `{audit_log}` for the `daemon` fixture's `.format()` — an unused `{source}`
+# kwarg there is harmless). BLOCK style on purpose (the Rust `yaml_lite` parser is
+# block-only; see WATCH_NONE_CONFIG / README "Known contract gaps").
+# `ssh.approval.policy: approve-all` is a valid ssh policy — but ping is NOT gated, so
+# it's irrelevant to the pong; it just exercises a non-empty gate. No `aws:`/`docker:`
+# blocks → those backends stay nil → the daemon subscribes to ssh-agent only (plus the
+# always-on egress GET, which the synthetic bus 501s).
 SINGLE_SERVER_CONFIG = """\
 server: {server}
 ssh:
@@ -109,12 +111,11 @@ def _single_server_config(bus_url: str) -> str:
 
 # The single-server config for the gated cross-surface **sign** differential
 # (`test_bus_sign_gated.py`). Same single-server shape as SINGLE_SERVER_CONFIG (no
-# `discovery:` block → both impls run single-server, subscribe to `ssh-agent`), but
-# with `ssh.mode: local-keys` (so the committed ed25519 key the `daemon` fixture
-# installs is loaded — on BOTH impls) and `ssh.approval.policy: shed-desktop` (so a
-# `sign` is DELEGATED to the connected desktop consumer; Go builds a `desktopGate`,
-# Rust a `DesktopGate`, and both fan the resulting audit out to that consumer as an
-# `event`). BLOCK style on purpose (the Rust `yaml_lite` parser is block-only; see
+# `discovery:` block → single-server mode, subscribes to `ssh-agent`), but with
+# `ssh.mode: local-keys` (so the committed ed25519 key the `daemon` fixture installs
+# is loaded) and `ssh.approval.policy: shed-desktop` (so a `sign` is DELEGATED to the
+# connected desktop consumer via a `DesktopGate`, which fans the resulting audit out
+# to that consumer as an `event`). BLOCK style on purpose (the Rust `yaml_lite` parser is block-only; see
 # WATCH_NONE_CONFIG / README "Known contract gaps"). `{server}` is filled by
 # `sign_config(bus_url)`; `{audit_log}` survives to the `daemon` fixture's `.format`.
 SIGN_CONFIG = """\
@@ -136,10 +137,10 @@ def _sign_config(bus_url: str) -> str:
 
 
 # The discovery `watch: poll` launch config (short poll interval so the convergence
-# differential resolves within a test deadline). BOTH impls build a supervisor and
-# reconcile the desired server set from `{source}` (a `~/.shed/config.yaml`-style
-# `servers:` doc) every poll tick — so an appearance/change of `{source}` converges the
-# `servers[]` on both. The live differential drives POLL for determinism (production's
+# cell resolves within a test deadline). The daemon builds a supervisor and
+# reconciles the desired server set from `{source}` (a `~/.shed/config.yaml`-style
+# `servers:` doc) every poll tick — so an appearance/change of `{source}` converges
+# `servers[]`. The live cell drives POLL for determinism (production's
 # default is event-driven `notify`; that path is unit-covered). BLOCK style (the Rust
 # reader is block-only). `{source}`/`{audit_log}` are filled by the `daemon` fixture.
 DISCOVERY_POLL_CONFIG = """\
@@ -195,23 +196,22 @@ class CliResult:
 
 
 def _clean_env(socket_dir, home, path_prepend=None, ssh_auth_sock=None) -> dict:
-    """A hermetic environment: real PATH (so `go`/system tools resolve) but an
-    isolated HOME + socket dir, and no ambient ssh-agent. `path_prepend` (a dir)
-    goes on the FRONT of PATH so a shim binary (e.g. a fake `ssh`) is resolved
-    before the real one — both daemons use `exec.LookPath`/`look_ssh` on PATH.
+    """A hermetic environment: real PATH (so system tools resolve) but an isolated
+    HOME + socket dir, and no ambient ssh-agent. `path_prepend` (a dir) goes on the
+    FRONT of PATH so a shim binary (e.g. a fake `ssh`) is resolved before the real
+    one — the daemon uses `look_ssh` on PATH.
 
     `SSH_AUTH_SOCK` is stripped by default (so the local-keys backend is the
-    auto-detect result); pass `ssh_auth_sock` to point BOTH daemons' agent-forward
-    backend at a fake agent (the ssh-backend tests) — it is set AFTER the strip so it
-    wins."""
+    auto-detect result); pass `ssh_auth_sock` to point the agent-forward backend at a
+    fake agent (the ssh-backend tests) — it is set AFTER the strip so it wins."""
     env = dict(os.environ)
     env["SHED_HOST_AGENT_SOCKET_DIR"] = str(socket_dir)
     env["HOME"] = str(home)
     env.pop("SSH_AUTH_SOCK", None)
     env.pop("XDG_RUNTIME_DIR", None)
     # Strip DOCKER_CONFIG so `find_docker_config` resolves the isolated
-    # `<HOME>/.docker/config.json` on BOTH impls (a dev-Mac DOCKER_CONFIG would
-    # otherwise leak a real Docker config into the differential — non-hermetic).
+    # `<HOME>/.docker/config.json` (a dev-Mac DOCKER_CONFIG would otherwise leak a
+    # real Docker config into a golden-checked cell — non-hermetic).
     env.pop("DOCKER_CONFIG", None)
     if path_prepend is not None:
         env["PATH"] = str(path_prepend) + os.pathsep + env.get("PATH", "")
@@ -246,11 +246,13 @@ def _build(cmd, cwd, env=None) -> None:
 
 
 @pytest.fixture(scope="session")
-def binaries(tmp_path_factory) -> dict:
-    """Build both daemon binaries once and return `{"go": path, "rust": path}`."""
-    go_bin = tmp_path_factory.mktemp("go-bin") / "shed-host-agent-go"
-    _build(["go", "build", "-o", str(go_bin), "./cmd/shed-host-agent"], cwd=REPO_ROOT)
+def binaries() -> dict:
+    """Build the daemon binary once and return `{"rust": path}`.
 
+    Still a dict keyed by impl — every `run_cli`/`daemon` call site is written as
+    `binaries[impl]`, and the `impl` seam is what makes a golden's provenance
+    readable ("the value both implementations produced"). `"rust"` is the only key
+    since the Go daemon's retirement."""
     cargo_env = dict(os.environ)
     cargo_env["PATH"] = (
         str(Path.home() / ".cargo" / "bin") + os.pathsep + cargo_env.get("PATH", "")
@@ -273,16 +275,15 @@ def binaries(tmp_path_factory) -> dict:
         target_dir = REPO_ROOT / "crates" / "target"
     rust_bin = target_dir / "debug" / "shed-host-agent"
 
-    assert go_bin.exists(), f"go binary missing: {go_bin}"
     assert rust_bin.exists(), f"rust binary missing: {rust_bin}"
-    return {"go": str(go_bin), "rust": str(rust_bin)}
+    return {"rust": str(rust_bin)}
 
 
 @pytest.fixture
 def run_cli(binaries, tmp_path_factory):
     """Return `run(impl, *args, socket_dir=None, home=None) -> CliResult`. Each call
     gets a fresh isolated socket dir + HOME unless one is passed (to let a scenario
-    point both impls at the same dir)."""
+    point several invocations at the same dir)."""
 
     def _call(impl, *args, socket_dir=None, home=None) -> CliResult:
         if socket_dir is None:
@@ -335,9 +336,8 @@ class DaemonHandle:
         )
         # The DURABLE audit JSONL (`logging.path`), distinct from the operational log
         # above. Populated by gated ops (the sign flow); a fan-out `event` is sent
-        # AFTER the file line is written on both impls (Rust `JsonlAuditSink::log`,
-        # Go `AuditLogger.LogEntry`), so a durable line is readable once the desktop
-        # consumer has seen the matching `event`.
+        # AFTER the file line is written (`JsonlAuditSink::log`), so a durable line is
+        # readable once the desktop consumer has seen the matching `event`.
         self.audit_log_path = Path(audit_log_path)
         self.status_sock = Path(socket_dir) / STATUS_SOCK_NAME
         self.desktop_sock = Path(socket_dir) / DESKTOP_SOCK_NAME
@@ -464,13 +464,14 @@ def daemon(binaries, tmp_path_factory):
 
         # Install the committed ed25519 key into this daemon's isolated
         # `<HOME>/.ssh/id_ed25519` (dir 0700, file 0600) BEFORE launch, so a
-        # local-keys `sign` finds the SAME key on both impls (Go `os.UserHomeDir()`
-        # + Rust `user_home_dir()` both resolve `$HOME`, set by `_clean_env`).
-        # `install_ssh_key=True` installs id_ed25519 (unchanged default). The additive
-        # `install_ssh_keys` kwarg installs a list of committed fixture STEMS (e.g.
-        # "test_ed25519","test_rsa","test_ecdsa") as `<HOME>/.ssh/id_<algo>` — the
-        # local-keys backend loads them in STANDARD_KEY_FILES order (ed25519, rsa,
-        # ecdsa) on both impls. A stem `test_<algo>` maps to `id_<algo>`.
+        # local-keys `sign` finds the SAME key every run (`user_home_dir()` resolves
+        # `$HOME`, set by `_clean_env`), which is what makes the golden-pinned sign
+        # blob reproducible. `install_ssh_key=True` installs id_ed25519 (unchanged
+        # default). The additive `install_ssh_keys` kwarg installs a list of committed
+        # fixture STEMS (e.g. "test_ed25519","test_rsa","test_ecdsa") as
+        # `<HOME>/.ssh/id_<algo>` — the local-keys backend loads them in
+        # STANDARD_KEY_FILES order (ed25519, rsa, ecdsa). A stem `test_<algo>` maps to
+        # `id_<algo>`.
         keys_to_install: list[str] = []
         if install_ssh_key:
             keys_to_install.append("test_ed25519")
@@ -488,10 +489,10 @@ def daemon(binaries, tmp_path_factory):
 
         # Install the AWS shared-credentials fixture into this daemon's isolated
         # `<HOME>/.aws/{credentials,config}` BEFORE launch, so a passthrough vend reads
-        # the SAME profile on both impls (Go `~/.aws/credentials` default + Rust
-        # `user_home_dir().join(".aws")`, both keyed off `$HOME`). The config file is
-        # written EMPTY (Go's `LoadSharedConfigProfile` merges config + credentials; the
-        # credentials file carries the static keys). Hermetic by construction — no
+        # the SAME profile every run (`user_home_dir().join(".aws")`, keyed off
+        # `$HOME`). The config file is written EMPTY (the shared-config loader merges
+        # config + credentials; the credentials file carries the static keys).
+        # Hermetic by construction — no
         # AWS_SHARED_CREDENTIALS_FILE env plumbing needed (that route is unit-covered).
         if install_aws_credentials is not None:
             aws_dir = home / ".aws"
@@ -501,7 +502,7 @@ def daemon(binaries, tmp_path_factory):
 
         # Install the Docker `config.json` fixture into this daemon's isolated
         # `<HOME>/.docker/config.json` BEFORE launch, so a `get`/`list` reads the SAME
-        # config on both impls (`find_docker_config` resolves `$HOME/.docker/config.json`
+        # config every run (`find_docker_config` resolves `$HOME/.docker/config.json`
         # with DOCKER_CONFIG stripped by `_clean_env`). Hermetic by construction — no
         # DOCKER_CONFIG env plumbing. When None (the UNCONFIGURED cell), no file is
         # written, so the default path is absent → the backend denies every registry.
@@ -522,9 +523,9 @@ def daemon(binaries, tmp_path_factory):
                 (shed_dir / "known_hosts").write_text(known_hosts)
 
         # Install a shim `ssh` (a PATH-front executable) that appends its argv to a
-        # capture file, then prints the fixed bundle — so BOTH daemons mint
-        # deterministically over the same fake ssh (Go `exec.LookPath` / Rust
-        # `look_ssh` both resolve it from PATH). See `fake_seams` self-test.
+        # capture file, then prints the fixed bundle — so the daemon mints
+        # deterministically over a fake ssh (`look_ssh` resolves it from PATH). See
+        # the `fake_seams` self-test.
         ssh_argv_file = None
         path_prepend = None
         if ssh_shim_bundle is not None:
@@ -536,8 +537,8 @@ def daemon(binaries, tmp_path_factory):
 
         # Install a fake `docker-credential-testhelper` (a python3 script, 0755 + shebang)
         # into a PATH-PREPENDED `helper-bin` dir — `look_helper_path` resolves via PATH
-        # (`which`-equivalent) FIRST, so the front-of-PATH shim wins on both impls. It
-        # captures its argv + stdin (the server_url) to a per-impl transcript JSONL,
+        # (`which`-equivalent) FIRST, so the front-of-PATH shim wins. It captures its
+        # argv + stdin (the server_url) to a per-daemon transcript JSONL,
         # then prints the fixed bundle. The two cells are mutually exclusive with the ssh
         # shim (both want `path_prepend`).
         docker_transcript_file = None
@@ -653,7 +654,7 @@ def _shutdown(impl, proc, status_sock, desktop_sock) -> None:
 def _write_ssh_shim(path: Path, argv_file: Path, bundle_json: str) -> None:
     """Write an executable `#!/bin/sh` shim `ssh` that records its argv (one element
     per line, so a multi-arg invocation is unambiguous) and prints the fixed bundle to
-    stdout, exit 0 — the deterministic seam both daemons mint over. `printf '%s'` (no
+    stdout, exit 0 — the deterministic seam the daemon mints over. `printf '%s'` (no
     trailing newline) keeps stdout a single JSON object (trailing whitespace is fine)."""
     script = (
         "#!/bin/sh\n"
@@ -668,10 +669,10 @@ def _write_ssh_shim(path: Path, argv_file: Path, bundle_json: str) -> None:
 def _write_docker_helper(path: Path, transcript_file: Path, bundle_json: str) -> None:
     """Write an executable `#!/usr/bin/env python3` fake `docker-credential-testhelper`
     that (a) reads stdin (the raw `server_url`), (b) appends ONE JSONL record of its
-    argv + stdin — argv+stdin ONLY, NEVER the augmented PATH/env (per-impl/host-dependent;
+    argv + stdin — argv+stdin ONLY, NEVER the augmented PATH/env (host-dependent;
     APPEND parity is the `augment_path` golden's job) — to `transcript_file`, and (c)
-    prints the fixed `bundle_json` to stdout, exit 0. The deterministic exec seam both
-    daemons run over."""
+    prints the fixed `bundle_json` to stdout, exit 0. The deterministic exec seam the
+    daemon runs over."""
     script = (
         "#!/usr/bin/env python3\n"
         "import sys, json\n"
@@ -732,10 +733,10 @@ def discovery_off_config() -> str:
 
 # --- Goldens (plan 006 D1) -------------------------------------------------
 #
-# Every `differential()` value is ALSO pinned to a committed golden file, so the
-# agreed wire shape survives the Go daemon's retirement: the goldens are recorded
-# from a run where BOTH implementations agreed (the strongest provenance available),
-# and after the sunset the Rust value is asserted against them.
+# Every `differential()` value is pinned to a committed golden file — that is how the
+# agreed wire shape survived the Go daemon's retirement. The goldens were recorded
+# (73755c0) from a run where BOTH implementations produced the same value, the
+# strongest provenance available; the Rust daemon is now asserted against them.
 #
 # The golden key is the pytest nodeid, sanitized to a safe-but-readable filename —
 # so parametrized cases get distinct files for free and the 55 `differential()` call
@@ -830,8 +831,10 @@ def _check_golden(nodeid: str, value) -> None:
         return
 
     assert path.exists(), (
-        f"{nodeid}: no golden at {path}. Record it (with both implementations "
-        "agreeing) via: UPDATE_GOLDEN=1 uv run pytest"
+        f"{nodeid}: no golden at {path}. A NEW cell records its first golden via: "
+        "UPDATE_GOLDEN=1 uv run pytest — for an EXISTING cell, a missing golden means "
+        "the file was deleted, and re-recording would silently bless whatever the "
+        "daemon does today. See README 'Recording and updating goldens'."
     )
     expected = json.loads(path.read_text())
     assert json.dumps(expected, sort_keys=True) == json.dumps(recorded, sort_keys=True), (
@@ -929,9 +932,17 @@ def pytest_sessionfinish(session, exitstatus) -> None:
 @pytest.fixture
 def differential(request):
     """Return `run(scenario) -> value`, where `scenario(impl) -> normalized value`.
-    Runs the scenario for both `go` and `rust`, asserts the normalized values are
-    equal (with a readable diff on mismatch), pins the agreed value to this test's
-    golden (see "Goldens" above), and returns the common value."""
+
+    Runs the scenario against the `rust` daemon, asserts the normalized value against
+    this test's recorded golden (see "Goldens" above), and returns it. The goldens
+    were recorded while the Go daemon still existed, from a run in which the two
+    implementations produced identical values — so the assertion each cell makes is
+    still "the wire shape both implementations agreed on", now enforced against one
+    runner instead of two.
+
+    `scenario` keeps its `impl` parameter: the name of the compared implementation is
+    what makes the harness readable, and it is the seam a second runner would slot
+    back into."""
 
     calls = {"n": 0}
 
@@ -943,13 +954,8 @@ def differential(request):
             "call's golden — split the test (or parametrize it) so each cell makes "
             "exactly one call."
         )
-        go = scenario("go")
         rust = scenario("rust")
-        assert go == rust, (
-            "differential mismatch (go != rust):\n"
-            f"--- go ---\n{go!r}\n--- rust ---\n{rust!r}"
-        )
-        _check_golden(request.node.nodeid, go)
-        return go
+        _check_golden(request.node.nodeid, rust)
+        return rust
 
     return _run
