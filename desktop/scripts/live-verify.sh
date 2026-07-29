@@ -1,12 +1,14 @@
 #!/usr/bin/env bash
 # live-verify.sh — exercise the shed-desktop approval gate against the REAL
-# shed-host-agent (Go) over the Unix-domain socket, end to end.
+# shed-host-agent (Rust) over the Unix-domain socket, end to end.
 #
 # The hermetic pytest harness covers everything against a Python fake agent;
-# this is the one path that puts the real Go agent and the real .app in the
+# this is the one path that puts the real Rust agent and the real .app in the
 # loop, so it validates the cross-implementation wire protocol (hello /
 # hello_ack / approval_request / approval_response / event, incl. the #21
-# `server` field) that no fake can prove.
+# `server` field) that no fake can prove. (The daemon shipped as Go through
+# v0.7.x; the Go twin was sunset in plan 006-mtls-cleanup-hostagent-sunset.md
+# — this script now builds the Rust daemon from crates/shed-host-agent.)
 #
 # Modes:
 #   --handshake  (default) Build a real host-agent, start it with the desktop
@@ -31,13 +33,13 @@ MODE="handshake"
 [ "${1:-}" = "--handshake" ] && MODE="handshake"
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-# The shed-host-agent (Go) now lives in this monorepo at cmd/shed-host-agent
-# (one level above the desktop package root).
+# The shed-host-agent (Rust) lives in this monorepo's crates/ workspace at
+# crates/shed-host-agent (one level above the desktop package root).
 MONO_ROOT="$(cd "${REPO_ROOT}/.." && pwd)"
 APP="$REPO_ROOT/build/ShedDesktop.app"
 CTL="$APP/Contents/Resources/bin/shedctl"
 APP_SOCK="$HOME/Library/Caches/ShedDesktop/shed-desktop.sock"
-GO="${GO:-$(command -v go || echo "$HOME/.local/share/mise/shims/go")}"
+CARGO="${CARGO:-$(command -v cargo || echo "$HOME/.cargo/bin/cargo")}"
 
 TMP="$(mktemp -d -t shed-live-verify)"
 CFG="$TMP/extensions.yaml"
@@ -68,11 +70,12 @@ cleanup() {
 trap cleanup EXIT
 
 [ -d "$APP" ] || die "no app bundle at $APP (run: make bundle)"
-[ -d "$MONO_ROOT/cmd/shed-host-agent" ] || die "cmd/shed-host-agent not found under $MONO_ROOT"
-[ -x "$GO" ] || die "go toolchain not found (set GO=/path/to/go)"
+[ -d "$MONO_ROOT/crates/shed-host-agent" ] || die "crates/shed-host-agent not found under $MONO_ROOT"
+[ -x "$CARGO" ] || die "cargo toolchain not found (set CARGO=/path/to/cargo)"
 
-say "Building shed-host-agent from $MONO_ROOT ($(cd "$MONO_ROOT" && git rev-parse --short HEAD 2>/dev/null || echo '?'))"
-( cd "$MONO_ROOT" && "$GO" build -o "$AGENT_BIN" ./cmd/shed-host-agent ) || die "host-agent build failed"
+say "Building shed-host-agent from $MONO_ROOT/crates ($(cd "$MONO_ROOT" && git rev-parse --short HEAD 2>/dev/null || echo '?'))"
+( cd "$MONO_ROOT/crates" && "$CARGO" build -p shed-host-agent ) || die "host-agent build failed"
+cp "$MONO_ROOT/crates/target/debug/shed-host-agent" "$AGENT_BIN" || die "could not find built shed-host-agent at $MONO_ROOT/crates/target/debug/shed-host-agent"
 ok "built $AGENT_BIN"
 
 if [ "$MODE" = "full" ]; then
@@ -137,7 +140,7 @@ for _ in $(seq 1 60); do "$CTL" identify >/dev/null 2>&1 && break; sleep 0.25; d
 "$CTL" identify >/dev/null 2>&1 || die "app never answered its IPC socket"
 ok "app up"
 
-say "Waiting for the hello/hello_ack handshake (real Go agent ↔ real Swift app)"
+say "Waiting for the hello/hello_ack handshake (real Rust agent ↔ real Swift app)"
 connected=""
 for _ in $(seq 1 40); do
   if "$CTL" call ui.state 2>/dev/null | grep -q '"host_agent_connected"[[:space:]]*:[[:space:]]*true'; then

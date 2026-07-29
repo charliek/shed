@@ -6,7 +6,7 @@ explicitly, per the deliverable."""
 import pytest
 
 
-@pytest.mark.parametrize("impl", ["go", "rust"])
+@pytest.mark.parametrize("impl", ["rust"])
 def test_sigterm_clean_exit_and_sockets_unlinked(daemon, watch_none_config, impl):
     with daemon(impl, watch_none_config) as d:
         # While running: the status socket exists and is serving.
@@ -17,7 +17,6 @@ def test_sigterm_clean_exit_and_sockets_unlinked(daemon, watch_none_config, impl
         desktop_sock = d.desktop_sock
 
     # After the context exits (SIGTERM sent + clean-exit/unlink asserted in teardown),
-    # both socket paths are gone. (The Rust slice-0 daemon has no desktop server, so
-    # its desktop socket was never created — 'unlinked' holds trivially there.)
+    # both socket paths are gone.
     assert not status_sock.exists(), f"{impl}: status socket lingered after shutdown"
     assert not desktop_sock.exists(), f"{impl}: desktop socket lingered after shutdown"

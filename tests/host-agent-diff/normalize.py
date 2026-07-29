@@ -1,11 +1,12 @@
-"""Canonicalization + volatile-field masking for the host-agent differential.
+"""Canonicalization + volatile-field masking for the host-agent wire harness.
 
-Two disciplines from the harness plan (D2 comparison model, D3 normalization):
+Two disciplines from the harness plan (D2 comparison model, D3 normalization), both
+of which now serve the recorded goldens:
 
 * **D2 — structural canonical-JSON, never raw bytes.** `canonical()` parses have
   already happened (callers pass Python objects from `json.loads`); it recursively
-  sorts object keys so a Go `map` and a Rust `BTreeMap` (or field-declaration order)
-  can never read as a diff. Lists stay order-sensitive.
+  sorts object keys so serializer field order can never read as a diff. Lists stay
+  order-sensitive.
 
 * **D3 — determinism over blanking.** Mask as *little* as possible: only the fields
   that genuinely vary run-to-run (`pid`, `version`, timestamps, absolute paths). Every
@@ -31,7 +32,8 @@ MASK_ID = "<id>"
 MASK_EXPIRES = "<expires_at>"
 
 # RFC3339 with second precision and either a `Z` or a numeric offset. Both daemons
-# emit `...Z` (Go `time.RFC3339` on a UTC time; Rust's std-only formatter), but accept
+# emit `...Z` (the daemon's std-only formatter; the retired Go twin's `time.RFC3339`
+# on a UTC time), but accept
 # an offset too so the shape check isn't brittle.
 _RFC3339 = re.compile(
     r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$"
@@ -91,8 +93,8 @@ def mask_live_status(obj: dict, socket_dir: str, config_path: str) -> dict:
     cp = out.get("config_path")
     assert isinstance(cp, str) and cp, f"config_path missing/empty: {cp!r}"
     if config_path:
-        # The daemon must echo back the exact config path it was given (each impl
-        # resolves it the same way — Go filepath.Abs, Rust lexical clean).
+        # The daemon must echo back the exact config path it was given (resolved by a
+        # lexical clean).
         assert cp == config_path, f"config_path {cp!r} != expected {config_path!r}"
     else:
         assert os.path.isabs(cp), f"config_path not absolute: {cp!r}"
@@ -136,8 +138,8 @@ def mask_hello_ack(obj: dict) -> dict:
     """Mask the volatile fields of a desktop `hello_ack` frame, leaving everything
     else to be diffed (D3 normalization for surface A).
 
-    Masked (volatile): `id` (a UUID — v7 in Go, v4 in Rust, so never diffable) and
-    `ts` (RFC3339, shape-asserted first). On an **accepted** ack `agent.version` is
+    Masked (volatile): `id` (a fresh UUID per frame) and `ts` (RFC3339, shape-asserted
+    first). On an **accepted** ack `agent.version` is
     also masked (the build string, shape-asserted **nonempty** first — same discipline
     as `mask_live_status`).
 
@@ -145,9 +147,8 @@ def mask_hello_ack(obj: dict) -> dict:
     `namespaces`, `gate_namespaces`, `agent_capabilities`, `request_timeout_ms` — and,
     on a **superseded**
     (`accepted:false`) ack, `agent.version` too: that ack carries the ZERO-value agent
-    `{"version":"","approval_method":""}` (Go `desktop_server.go:355` sends a bare
-    `helloAckMsg{}`; the Rust `hello_ack` builder emits an empty agent whenever
-    `accepted` is false). An empty `version` there is a stable constant, not a volatile
+    `{"version":"","approval_method":""}` (the `hello_ack` builder emits an empty agent
+    whenever `accepted` is false). An empty `version` there is a stable constant, not a volatile
     build string, so it is diffed as-is rather than masked (and masking it would trip
     the nonempty shape-assert).
 
@@ -156,8 +157,7 @@ def mask_hello_ack(obj: dict) -> dict:
     assert obj.get("type") == "hello_ack", f"not a hello_ack frame: {obj!r}"
     out = dict(obj)
 
-    # id: a nonempty string (UUID). Masked — the two impls use different UUID
-    # versions, and it varies per-frame regardless.
+    # id: a nonempty string (UUID). Masked — it varies per-frame.
     _id = out.get("id")
     assert isinstance(_id, str) and _id, f"hello_ack.id missing/empty: {_id!r}"
     out["id"] = MASK_ID
@@ -192,9 +192,9 @@ def mask_bus_response(obj: dict) -> dict:
     """Mask the volatile fields of a bus **response** Envelope (surface B), leaving
     everything else to be diffed (D3 normalization).
 
-    Masked (volatile): `id` (a fresh UUID — v7 in Go's `NewResponse`, v4 in Rust's
-    `new_response`, so never diffable) and `timestamp` (the response mint time,
-    RFC3339 shape-asserted first so the mask can't paper over a malformed value).
+    Masked (volatile): `id` (a fresh UUID per response, `new_response`) and
+    `timestamp` (the response mint time, RFC3339 shape-asserted first so the mask
+    can't paper over a malformed value).
 
     Diffed (stable — NOT masked): `in_reply_to` (the correlation id, which MUST echo
     the request's `id`), `namespace`, `type`, `final`, `payload`, and `shed`. The
@@ -205,8 +205,7 @@ def mask_bus_response(obj: dict) -> dict:
     assert obj.get("type") == "response", f"not a response envelope: {obj!r}"
     out = dict(obj)
 
-    # id: a nonempty UUID string. Masked — the two impls use different UUID
-    # versions, and it varies per-response regardless.
+    # id: a nonempty UUID string. Masked — it varies per-response.
     _id = out.get("id")
     assert isinstance(_id, str) and _id, f"bus response id missing/empty: {_id!r}"
     out["id"] = MASK_ID
@@ -222,17 +221,16 @@ def mask_token_response(obj: dict) -> dict:
     """Mask the volatile fields of a desktop `token.response` frame (surface A), leaving
     everything else to be diffed (D3 normalization for the minter flow).
 
-    Masked (volatile): `id` (a fresh UUID — v7 in Go's `newID`, v4 in Rust, never
-    diffable) and `ts` (RFC3339 send time, shape-asserted BEFORE masking).
+    Masked (volatile): `id` (a fresh UUID per frame) and `ts` (RFC3339 send time,
+    shape-asserted BEFORE masking).
 
     Diffed (stable — NOT masked): `v`, `type`, `in_reply_to` (the correlation id, which
     MUST echo the request's `id`), `server`, `token`, and `expires_at`. The `token` +
-    `expires_at` are DETERMINISTIC here — both daemons mint over the SAME PATH-shim `ssh`
-    returning a fixed bundle — so they are compared UNMASKED (same "determinism over
-    blanking" rationale as the sign blob), which pins that both impls carry the minted
-    token through and format the expiry to UTC RFC3339 identically. On a success the
-    `error` key is ABSENT (omitempty on both sides), so a canonical compare pins its
-    absence; the caller asserts it.
+    `expires_at` are DETERMINISTIC here — the daemon mints over a PATH-shim `ssh`
+    returning a fixed bundle — so they are pinned UNMASKED (same "determinism over
+    blanking" rationale as the sign blob), which pins that the daemon carries the minted
+    token through and formats the expiry to UTC RFC3339. On a success the `error` key is
+    ABSENT (skipped when empty), so the golden pins its absence; the caller asserts it.
 
     Returns a new object; the input is not mutated.
     """
@@ -253,8 +251,8 @@ def mask_approval_request(obj: dict) -> dict:
     """Mask the volatile fields of a desktop `approval_request` frame (surface A),
     leaving everything else to be diffed (D3 normalization).
 
-    Masked (volatile): `id` (a fresh UUID — v7 in Go's `newID`, v4 in Rust, so never
-    diffable), `ts` (RFC3339 send time), and `expires_at` (`now + approval_timeout`).
+    Masked (volatile): `id` (a fresh UUID per frame), `ts` (RFC3339 send time), and
+    `expires_at` (`now + approval_timeout`).
     Both timestamps have their RFC3339 shape asserted BEFORE masking so the mask can't
     paper over a malformed value; distinct sentinels (`<ts>` vs `<expires_at>`) make a
     cross-field leak obvious.
@@ -285,14 +283,14 @@ def mask_event(obj: dict) -> dict:
     """Mask the volatile fields of a desktop `event` frame — the 1:1 audit fan-out
     (surface A, catalog §3.3) — leaving everything else to be diffed.
 
-    Masked (volatile): `id` (a fresh UUID per frame — v7 in Go, v4 in Rust) and `ts`
-    (the underlying audit entry's own timestamp, RFC3339 shape-asserted first).
+    Masked (volatile): `id` (a fresh UUID per frame) and `ts` (the underlying audit
+    entry's own timestamp, RFC3339 shape-asserted first).
 
     Diffed (stable — NOT masked): `v`, `type` (`"event"`), `kind` (`"audit"`), and
-    every carried audit field present after Go's omitempty (`shed`, `ns`, `op`,
+    every carried audit field that survives the empty-field skip (`shed`, `ns`, `op`,
     `result`, `detail`, `code`, `reason`, `approval`, `decided_by`, `scope`, `ttl`,
-    `server`). An empty audit field is OMITTED on both sides (Go omitempty == the Rust
-    `is_empty_str` skip), so a canonical compare pins the exact present-key set — e.g.
+    `server`). An empty audit field is OMITTED (`is_empty_str`), so the golden pins the
+    exact present-key set — e.g.
     the deny event carries NO `detail`/`code`, the single-server event carries NO
     `server`. The caller asserts the stable fields.
 
@@ -317,12 +315,10 @@ def mask_audit_entry(obj: dict) -> dict:
 
     Masked (volatile): `ts` only (RFC3339 UTC stamped by the sink, shape-asserted
     first). Every other field — `server` (omitempty), `shed`, `ns`, `op`, `result`,
-    `detail`, `code`, `reason`, `approval`, `decided_by`, `scope`, `ttl` — is diffed;
-    Go's omitempty set == the Rust `WireEntry` `skip_serializing_if`, so the present-key
-    set is itself pinned by a canonical compare (a missing `detail`/`code` on the deny
-    line, a missing `server` in single-server mode). Field *order* in the file (Go
-    struct order `ts,server,shed,ns,op,result,detail,code,reason,approval,decided_by,
-    scope,ttl`) is normalized away by `canonical()`.
+    `detail`, `code`, `reason`, `approval`, `decided_by`, `scope`, `ttl` — is pinned;
+    the `WireEntry` `skip_serializing_if` set means the present-key set is itself
+    golden-pinned (a missing `detail`/`code` on the deny line, a missing `server` in
+    single-server mode). Field *order* in the file is normalized away by `canonical()`.
 
     Returns a new object; the input is not mutated.
     """
@@ -365,15 +361,15 @@ def mask_credential_response(obj: dict) -> dict:
     """Mask the volatile fields of a desktop `credential.response` frame (surface A),
     leaving everything else to be diffed.
 
-    Masked (volatile): `id` (a fresh UUID — v7 in Go, v4 in Rust) and `ts` (RFC3339
-    send time, shape-asserted BEFORE masking).
+    Masked (volatile): `id` (a fresh UUID per frame) and `ts` (RFC3339 send time,
+    shape-asserted BEFORE masking).
 
     Diffed (stable — NOT masked): `v`, `type`, `in_reply_to`, `server`, `auth_mode`,
     `token`, `client_cert`, `cert_serial`, and `expires_at`. Same "determinism over
-    blanking" rationale as `mask_token_response`: both daemons run the SAME PATH-shim
+    blanking" rationale as `mask_token_response`: the daemon runs over a PATH-shim
     `ssh` returning a fixed bundle, so the credential fields ARE deterministic, and
-    diffing them is what pins that both impls map the bundle onto the wire identically
-    — including which fields they OMIT, which is the load-bearing half in a message
+    pinning them is what freezes how the bundle maps onto the wire
+    — including which fields are OMITTED, which is the load-bearing half in a message
     whose whole job is to say "here is a token" or "here is a certificate", never both.
 
     Returns a new object; the input is not mutated.

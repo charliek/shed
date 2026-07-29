@@ -24,6 +24,51 @@ export type Shed = {
   memory_mb?: number | null;
 };
 
+/** Why a host couldn't be listed. `agent_upgrade_required` is the one cause whose
+ *  remedy is a user action; `other` is the open set (rendered generically). */
+export type HostFailureKind = "agent_upgrade_required" | "other";
+
+/** One host's failure in presentation shape (`shed_app::HostFailure`): `summary`
+ *  is the one-line strip text with the REMEDY FIRST (strips truncate from the
+ *  end), `detail` is the tooltip body. */
+export type HostFailure = {
+  server: string;
+  kind: HostFailureKind;
+  summary: string;
+  detail: string;
+};
+
+/** The `list_sheds` / `sheds.list` payload: the sheds of every reachable host,
+ *  plus the per-host failures beside them (additive — a host that can't be listed
+ *  is surfaced, not silently dropped). Both keys are ALWAYS emitted (`host_errors`
+ *  is `[]` when every host is healthy) — the Rust side and this bundle ship in one
+ *  binary, so there is no older-payload path to defend against; the `?? []` at the
+ *  fetch sites covers only a failed `invoke` (which yields no payload at all). */
+export type ShedsPayload = { sheds: Shed[]; host_errors: HostFailure[] };
+
+/** The Sheds pane's empty state — reported as UI truth so the harness can assert
+ *  that a host failure (not the generic "nothing here yet" copy) is what a user
+ *  with zero listable sheds actually reads. */
+export type EmptyState = { title: string; body: string };
+
+/** The Sheds empty state, deferring to a per-host failure when there is one: with
+ *  no sheds AND a failed host, leading with "No sheds yet" would imply everything
+ *  is fine (shed#300). The single source for both the render and the reported
+ *  UI truth. */
+export function shedsEmptyState(sheds: Shed[], hostErrors: HostFailure[]): EmptyState | null {
+  if (sheds.length > 0) return null; // the list renders instead
+  if (hostErrors.length === 1) {
+    return { title: hostErrors[0].summary, body: `No sheds could be listed from ${hostErrors[0].server}.` };
+  }
+  if (hostErrors.length > 1) {
+    return { title: "Some hosts are unreachable", body: hostErrors.map((e) => e.summary).join(" · ") };
+  }
+  return {
+    title: "No sheds yet",
+    body: "No sheds on the configured hosts. Create one to spin up an isolated dev environment.",
+  };
+}
+
 /** Running inside a Tauri webview (vs a plain browser during `vite dev`)? */
 export function inTauri(): boolean {
   return typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
@@ -70,9 +115,23 @@ function report(
   modal: Modal,
   badges: Badges,
   mode?: string,
+  hostErrors: HostFailure[] = [],
 ) {
   void invoke("ui_report", {
-    snapshot: { pane, style: sampleStyle(mode), sheds, refresh_token: refreshToken, modal, badges },
+    snapshot: {
+      pane,
+      style: sampleStyle(mode),
+      sheds,
+      refresh_token: refreshToken,
+      modal,
+      badges,
+      // The Sheds pane's failure surface (`dashboard.dump.host_errors` / `.empty`):
+      // the strip rows, and the empty state ONLY while that pane is rendered — an
+      // off-pane `empty` would report copy nobody is reading (the `agents.dump`
+      // on-pane rule).
+      host_errors: hostErrors,
+      empty: pane === "sheds" ? shedsEmptyState(sheds, hostErrors) : null,
+    },
   });
 }
 
@@ -102,8 +161,9 @@ export function useUiBridge(
   agentCount: number,
   hostCount: number,
   pending: number,
-): { sheds: Shed[]; refresh: () => void } {
+): { sheds: Shed[]; hostErrors: HostFailure[]; refresh: () => void } {
   const [sheds, setSheds] = useState<Shed[]>([]);
+  const [hostErrors, setHostErrors] = useState<HostFailure[]>([]);
   const [refreshToken, setRefreshToken] = useState(0);
   // paneRef lets the mount effect read the latest pane for its initial report
   // without taking `pane` as a dep (which would re-subscribe the listeners).
@@ -111,19 +171,36 @@ export function useUiBridge(
   paneRef.current = pane;
   const ready = useRef(false);
   const fetchGen = useRef(0);
+  // The highest refresh token not yet echoed. A token-bearing fetch records it
+  // BEFORE awaiting, so whichever fetch ends up committing rows echoes it —
+  // see `fetchSheds`.
+  const pendingToken = useRef(0);
 
   // Fetch the live shed list and store it; on a refresh, also advance the echoed
   // token so Rust's synchronous `sheds.refresh` observes completion. A generation
   // guard drops a superseded (slower, older) fetch so it can't overwrite a newer
-  // one's rows. The token echo runs BEFORE the guard: this fetch DID complete, so
-  // a token-bearing `sheds.refresh` must be acknowledged even when a concurrent
-  // background poll (token 0) supersedes its rows — else the op blocks to timeout.
+  // one's rows.
+  //
+  // The token is HANDED OFF rather than echoed by whichever fetch happens to
+  // finish: a token-bearing fetch claims it before awaiting, and the fetch that
+  // actually COMMITS rows echoes it. So (a) `sheds.refresh` never sees its token
+  // acknowledged against rows that were then dropped — the reply it builds from
+  // the reported snapshot is the state that was really committed — and (b) a
+  // concurrent background poll (token 0) superseding it still discharges the
+  // token, so the op can't block to timeout.
   const fetchSheds = useCallback(async (token: number) => {
     const gen = ++fetchGen.current;
-    const rows = (await invoke<Shed[]>("list_sheds")) ?? [];
-    if (token > 0) setRefreshToken(token);
-    if (gen !== fetchGen.current) return; // a newer fetch started — drop this one's rows
-    setSheds(rows);
+    if (token > pendingToken.current) pendingToken.current = token;
+    const payload = await invoke<ShedsPayload>("list_sheds");
+    if (gen !== fetchGen.current) return; // a newer fetch started — it owns the commit + the echo
+    setSheds(payload?.sheds ?? []);
+    // The failed hosts travel WITH the rows (one payload, one state update) so the
+    // strip can never describe a different fetch than the list it sits above.
+    setHostErrors(payload?.host_errors ?? []);
+    if (pendingToken.current > 0) {
+      setRefreshToken(pendingToken.current);
+      pendingToken.current = 0;
+    }
   }, []);
 
   useEffect(() => {
@@ -238,11 +315,11 @@ export function useUiBridge(
     // `hosts` = the configured-host count (with reachability) the shell supplies —
     // covers zero-shed hosts, unlike a sheds-derived distinct-host count.
     const badges: Badges = { sheds: sheds.length, agents: agentCount, hosts: hostCount, pending };
-    report(pane, sheds, refreshToken, modal, badges, mode);
-  }, [pane, sheds, refreshToken, modal, mode, agentCount, hostCount, pending]);
+    report(pane, sheds, refreshToken, modal, badges, mode, hostErrors);
+  }, [pane, sheds, hostErrors, refreshToken, modal, mode, agentCount, hostCount, pending]);
 
   const refresh = useCallback(() => void fetchSheds(0), [fetchSheds]);
-  return { sheds, refresh };
+  return { sheds, hostErrors, refresh };
 }
 
 /** Fire a lifecycle action (a shed card button). The caller re-fetches via the
@@ -819,9 +896,17 @@ export function useRcSessions(): {
 
 /* ---- menu-bar popover (B1b) ------------------------------------------------ */
 
-/** The live shed list (the same `list_sheds` the dashboard + `sheds.list` use). */
+/** The live sheds + per-host failures (the same `list_sheds` the dashboard +
+ *  `sheds.list` use). */
+export async function fetchShedsPayload(): Promise<ShedsPayload> {
+  const p = await invoke<ShedsPayload>("list_sheds");
+  return { sheds: p?.sheds ?? [], host_errors: p?.host_errors ?? [] };
+}
+
+/** Just the rows, for callers that render no failure surface (the tray popover's
+ *  running-shed list — the dashboard is where a failed host is explained). */
 export async function fetchSheds(): Promise<Shed[]> {
-  return (await invoke<Shed[]>("list_sheds")) ?? [];
+  return (await fetchShedsPayload()).sheds;
 }
 
 /** Footer actions the popover invokes. A 2nd webview can't call the IPC ops or emit

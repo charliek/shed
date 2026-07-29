@@ -1,0 +1,29 @@
+{
+  "audit": {
+    "approval": "approve-all",
+    "detail": "expires:none",
+    "ns": "aws-credentials",
+    "op": "get_credentials",
+    "result": "ok",
+    "shed": "web",
+    "ts": "<ts>"
+  },
+  "response": {
+    "final": true,
+    "id": "<id>",
+    "in_reply_to": "cred-2",
+    "namespace": "aws-credentials",
+    "payload": {
+      "access_key_id": "ASIATESTKEY00000001",
+      "secret_access_key": "testSecretAccessKey00000001",
+      "session_token": "testSessionTokenABCDEF00000001"
+    },
+    "shed": {
+      "backend": "vz",
+      "name": "web",
+      "server": "mini2"
+    },
+    "timestamp": "<ts>",
+    "type": "response"
+  }
+}

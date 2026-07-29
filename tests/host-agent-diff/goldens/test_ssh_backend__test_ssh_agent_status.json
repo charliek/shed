@@ -1,0 +1,12 @@
+{
+  "payload": {
+    "connected": true,
+    "key_count": 3,
+    "mode": "agent-forward"
+  },
+  "transcript": [
+    {
+      "type": 11
+    }
+  ]
+}

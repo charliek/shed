@@ -4,19 +4,19 @@ A single-server (no `discovery:` block) daemon runs ONE supervisor with a single
 target (`name:""`). It connects to the synthetic shed-server plugin bus and subscribes to
 `ssh-agent` + `docker-credentials` (the docker backend is non-nil even unconfigured). The
 supervisor's `health()` surfaces each subscription's connection state into
-`status --json`'s `servers[]`, which the Go and Rust daemons must render identically
-(masking only the volatile per-namespace `since`, RFC3339 shape-asserted first).
+`status --json`'s `servers[]`, which is golden-pinned (masking only the volatile
+per-namespace `since`, RFC3339 shape-asserted first).
 
 Two cells:
 
 * **connected** — the bus holds both SSE streams open, so both namespaces reach
-  `connected` on both impls. `servers[]` is one entry (`name:""`) with two namespaces.
+  `connected`. `servers[]` is one entry (`name:""`) with two namespaces.
 * **409-rejected** (the terminal-state cell) — the bus answers 409 for `ssh-agent`'s
   subscribe. The SDK stops that namespace terminally (`rejected`, no hot-retry) and
   surfaces it observably; `docker-credentials` stays `connected`. Both impls report the
-  SAME `state:"rejected"` (asserted UNMASKED) and the SAME `last_error`
-  (`"namespace already has an active subscriber: "` — Go's `errSubscribeConflict` + the
-  trimmed empty body == Rust's `format!` with an empty body).
+  `state:"rejected"` (pinned UNMASKED) and the `last_error`
+  (`"namespace already has an active subscriber: "` — the `format!` with an empty
+  body).
 """
 
 from __future__ import annotations
@@ -50,8 +50,8 @@ def _state_of(servers, ns):
 
 
 def _normalize_url(servers, bus_url):
-    """Replace the (per-impl, dynamic-port) synthetic-bus URL with a stable `<bus>`
-    placeholder so the two impls' `servers[].url` compare equal — each impl runs its OWN
+    """Replace the (dynamic-port) synthetic-bus URL with a stable `<bus>`
+    placeholder so `servers[].url` is recordable — each daemon runs its OWN
     `SyntheticBus` on a fresh port (analogous to home-normalizing the ssh argv). Returns a
     new list; asserts every url matched the bus so a real url divergence still surfaces."""
     out = []

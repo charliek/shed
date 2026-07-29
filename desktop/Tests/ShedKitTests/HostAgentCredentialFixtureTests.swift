@@ -10,6 +10,7 @@
 // `credential.response` takes on its way to the Rust core.
 
 import Foundation
+import ShedRustCore
 import XCTest
 
 @testable import ShedKit
@@ -78,6 +79,43 @@ final class HostAgentCredentialFixtureTests: XCTestCase {
             }
             XCTAssertNotEqual(AgentCapabilityState(helloAck: ack), .unknown)
         }
+    }
+
+    /// Plan 006 D6 (shed#300): the TYPED error an `unsupported` capability must
+    /// produce for an mtls server, pinned by the SHARED fixture block so the
+    /// Swift minter and the Rust one cannot word it differently. The message
+    /// must LEAD with the remedy — banners are one line and truncate from the
+    /// end, so an action buried behind the context is an action nobody reads.
+    func testUnsupportedMintErrorMatchesTheSharedWording() throws {
+        let spec = try XCTUnwrap(fixture("hello_ack")["unsupported_mint_error"] as? [String: Any])
+        let server = try XCTUnwrap(spec["server"] as? String)
+        let error = HostAgentTokenMinter.capabilityError(
+            for: .capabilityUnsupported, server: server, wantsMtls: true)
+        guard case .AgentUpgradeRequired(let forServer, let detail) = error else {
+            return XCTFail("the unsupported capability must be the typed case, got \(error)")
+        }
+        XCTAssertEqual(forServer, server)
+
+        let failure = HostFailure.from(server: server, error: error)
+        XCTAssertEqual(failure.kind.rawValue, spec["kind"] as? String)
+
+        let message = HostFailure.displayMessage(for: error).lowercased()
+        for needle in try XCTUnwrap(spec["message_must_contain"] as? [String]) {
+            XCTAssertTrue(message.contains(needle.lowercased()), "message lacks \"\(needle)\": \(message)")
+        }
+        for needle in try XCTUnwrap(spec["detail_must_contain"] as? [String]) {
+            XCTAssertTrue(detail.contains(needle), "detail lacks \"\(needle)\": \(detail)")
+        }
+        XCTAssertTrue(
+            message.hasPrefix("upgrade shed-host-agent"),
+            "the remedy must come FIRST, got: \(message)")
+        XCTAssertTrue(
+            failure.summary.hasPrefix("Upgrade shed-host-agent"),
+            "the banner summary must lead with the remedy, got: \(failure.summary)")
+        XCTAssertFalse(
+            failure.summary.contains("Config(message:")
+                || failure.summary.contains("AgentUpgradeRequired("),
+            "no generated-enum wrapper may reach the banner: \(failure.summary)")
     }
 
     // MARK: - credential.response → arm (§2 C2(ii): fail closed)

@@ -1,0 +1,29 @@
+{
+  "audit": {
+    "approval": "approve-all",
+    "detail": "ghcr.io",
+    "ns": "docker-credentials",
+    "op": "get",
+    "result": "ok",
+    "shed": "web",
+    "ts": "<ts>"
+  },
+  "response": {
+    "final": true,
+    "id": "<id>",
+    "in_reply_to": "inl-1",
+    "namespace": "docker-credentials",
+    "payload": {
+      "secret": "inline-secret",
+      "server_url": "ghcr.io",
+      "username": "inline-user"
+    },
+    "shed": {
+      "backend": "vz",
+      "name": "web",
+      "server": "mini2"
+    },
+    "timestamp": "<ts>",
+    "type": "response"
+  }
+}

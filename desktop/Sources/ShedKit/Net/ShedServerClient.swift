@@ -100,9 +100,20 @@ public struct ShedServerClient: Sendable {
                     hostAgent: hostAgent, authMode: authMode, authModes: authModes,
                     onModeChanged: onCredentialModeChanged)
             } catch {
+                // Rendered through the one message extractor, never `"\(error)"`
+                // — a `ShedError` interpolates as its CASE (`Config(message: …)`)
+                // and that text ends up in the banner (shed#300).
+                //
+                // The typed identity is not at risk HERE: construction only
+                // validates the base URL / pin / client build (it performs no
+                // mint), so the shapes this can throw are `Config`/`Transport`,
+                // never `AgentUpgradeRequired`. Every error that CAN carry the
+                // typed case comes from a request, and those propagate untouched
+                // through `rustAdapter` to `AppModel`'s typed capture.
                 configError = .transport(
-                    "Rust shed-core adapter failed to construct for host \(serverName): \(error); "
-                    + "refusing to silently fall back to Swift (set SHED_DESKTOP_RUST_CORE=0 to force it)")
+                    "Rust shed-core adapter failed to construct for host \(serverName): "
+                    + "\(HostFailure.displayMessage(for: error)); refusing to silently fall back "
+                    + "to Swift (set SHED_DESKTOP_RUST_CORE=0 to force it)")
             }
         }
         if !useRustCore, authMode == .mtls {

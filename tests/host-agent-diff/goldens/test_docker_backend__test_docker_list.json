@@ -1,0 +1,30 @@
+{
+  "audit": {
+    "approval": "none",
+    "detail": "count:2",
+    "ns": "docker-credentials",
+    "op": "list",
+    "result": "ok",
+    "shed": "web",
+    "ts": "<ts>"
+  },
+  "response": {
+    "final": true,
+    "id": "<id>",
+    "in_reply_to": "lst-1",
+    "namespace": "docker-credentials",
+    "payload": {
+      "registries": {
+        "gcr.io": "(credential helper)",
+        "ghcr.io": "user"
+      }
+    },
+    "shed": {
+      "backend": "vz",
+      "name": "web",
+      "server": "mini2"
+    },
+    "timestamp": "<ts>",
+    "type": "response"
+  }
+}

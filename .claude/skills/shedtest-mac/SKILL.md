@@ -53,6 +53,59 @@ it works headless in CI.
   IPC op that lets an agent observe/drive it, and a pytest that exercises it. That
   is the definition of done here, not a manual click-through.
 
+## A module that needs a DIFFERENT launch (config / env overrides)
+
+Only **one** mac app can exist at a time — the control socket + single-instance lock are
+at fixed paths under `~/Library/Caches/ShedDesktop/` and are NOT moved by
+`SHED_DESKTOP_STATE_DIR` — so the Tauri trick of spawning a second, self-managed instance
+(`test_tauri_downhost.py`) has no mac analog. A mac module that needs a different config
+or launch env **owns the app for its duration**: quit the session instance, launch its
+own, and relaunch the session one (shared `mock` fixture + `fixtures/config.yaml`) in the
+fixture's `finally`. `test_agent_upgrade.py` is the worked example. Modules run
+sequentially, so the session `fake` host-agent can be reused — there is no second
+connection to steal.
+
+Launch-time overrides the harness can pass (test mode only, `ui.launch(...)`):
+
+| override | effect |
+|---|---|
+| `unreachable_hosts=(...)` | those server names are pointed at a closed port (deterministic ECONNREFUSED) |
+| `credential_hosts=(...)` | those server names keep their REAL credential wiring against the mock — the fake host-agent + the config's `auth_mode` — instead of the tokenless open-mode shortcut |
+| `MockShedServer(require_auth=True)` | a private mock instance that 401s an unauthenticated `/api` request (the auth-shaped refusal a secure shed-server gives) |
+
+The last two together are what make a mint failure observable end to end: an open-mode
+200 would swallow it (a mint error only surfaces on an auth-shaped or transport-level
+outcome), so without the 401 the assertion would be vacuous.
+
+### Never hold an IPC client open across tests (the CI-only wedge)
+
+The Swift `IPCServer` serves each accepted connection from a **blocking read on a
+cooperative-pool thread**, so every *idle* connection permanently consumes one — and the
+pool is only as wide as the machine's CPU count. Measured on a 10-core Mac: with **7**
+idle connections held, the next connection is accepted by the kernel but never served —
+`connect()` and `send()` succeed and the reply never comes, surfacing as
+`client.Timeout: no IPC response within socket timeout`. The ceiling is roughly
+`ncpu − 3` (the accept loop and the host-agent read loop each pin one too), so on the
+**3-vCPU GitHub runner it is ~0**: ONE long-lived client is enough to wedge the app.
+
+Consequences for a fixture author:
+
+- Take the function-scoped `shed`/`client` fixture (open per test, closed after), like
+  every existing module. A **module- or session-scoped fixture that yields a live client
+  is the trap**: it is created BEFORE the autouse `_reset_policy`, whose `policy.set`
+  then starves — the failure lands on a conftest fixture, pointing away from the module
+  that actually caused it, and it passes locally on a many-core dev Mac.
+- A fixture that needs IPC during setup should open a client, use it, and **close it
+  before yielding**.
+- The symptom to recognize: `client.Timeout` on a *shared* autouse fixture, CI-only,
+  affecting a contiguous run of tests that then "heals" for later modules.
+- Reproduce it locally without CI: hold N clients open in a loop and probe with an
+  extra one until it times out.
+
+Also: prefer polling read ops (`host.list`, `ui.state`) over hammering `sheds.refresh` in
+a `wait_until` — a refresh chains behind any in-flight poll, so calling it every 100 ms
+queues work rather than hastening it. The app polls every 5 s on its own.
+
 ## Rust-core parity leg
 
 The shed-server protocol path can run through the shared Rust core in `crates/`

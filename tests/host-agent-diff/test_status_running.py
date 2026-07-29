@@ -1,6 +1,6 @@
 """A running daemon's `status --json` (a `LiveStatus` blob) and `status` text render
-are equal across the impls after masking the volatile fields (D3 normalization). The
-'watch none' config makes BOTH report an empty `servers` list."""
+are golden-pinned after masking the volatile fields (D3 normalization). The
+'watch none' config makes it report an empty `servers` list."""
 
 import json
 

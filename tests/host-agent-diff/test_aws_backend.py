@@ -1,22 +1,20 @@
-"""The AWS credential backend differential — surface-B `get_credentials`/`status`/
-`ping`/unknown over the aws-credentials namespace, in **passthrough** mode, asserted
-equal across the Go `cmd/shed-host-agent` and the Rust `crates/shed-host-agent`.
+"""The AWS credential backend — surface-B `get_credentials`/`status`/`ping`/unknown
+over the aws-credentials namespace, in **passthrough** mode, golden-pinned.
 
 **Passthrough only, by design.** The hand-rolled INI reader + expiry-hint scan is the
-only differentially-tested path (both impls read the same `<HOME>/.aws/credentials`
-profile with no SDK involved). The **assume-role** path is owned by unit tests (the
-`AssumeRoler` fake) + the `aws_expiry`/`aws_resolve` goldens — there is no Go STS seam
-to drive live, so it is reclassified out-of-scope for the live diff (README table).
+only live-driven path (the `<HOME>/.aws/credentials` profile is read with no SDK
+involved). The **assume-role** path is owned by unit tests (the `AssumeRoler` fake) +
+the `aws_expiry`/`aws_resolve` fixture vectors — there is no STS seam to drive live,
+so it is out-of-scope for the live cells (README table).
 
-**Hermetic by construction.** The `daemon` fixture writes the fixture profile into each
-impl's isolated `<HOME>/.aws/credentials` (+ an empty `<HOME>/.aws/config`), so no real
-`~/.aws` is read and the two impls resolve the SAME profile off `$HOME`. The env-var
+**Hermetic by construction.** The `daemon` fixture writes the fixture profile into the
+daemon's isolated `<HOME>/.aws/credentials` (+ an empty `<HOME>/.aws/config`), so no
+real `~/.aws` is read and the SAME profile resolves off `$HOME` every run. The env-var
 resolution route (`AWS_SHARED_CREDENTIALS_FILE`) is covered by Rust unit tests instead.
 
 **Subscription-set.** Each scenario `wait_for_subscribe("aws-credentials")` before
-pushing, so BOTH impls are proven to subscribe the aws-credentials namespace when the
-AWS backend is configured (the Rust side now wires it; docker + egress asymmetry
-remains — see the README).
+pushing, so the aws-credentials namespace is proven subscribed when the AWS backend is
+configured.
 """
 
 from __future__ import annotations
@@ -40,7 +38,7 @@ AWS_KEY_2 = "ASIATESTKEY00000002"
 AWS_SECRET_2 = "testSecretAccessKey00000002"
 AWS_TOKEN_2 = "testSessionTokenABCDEF00000002"
 
-# A fixed expiry hint → a deterministic wire `expiration` + `cached_until` on both impls.
+# A fixed expiry hint → a deterministic wire `expiration` + `cached_until`.
 EXPIRY = "2030-01-01T00:00:00Z"
 
 # --- fixture profiles (INI text written to <HOME>/.aws/credentials) -------------------
@@ -63,7 +61,7 @@ CREDS_NO_EXPIRY = (
 # A profile present but with NO static credentials (region only) → the exact
 # no-static-credentials error, which embeds the shared-credentials PATH. Chosen for the
 # error cell because it (a) is an EXACT Go string ported byte-for-byte to Rust and (b)
-# carries the per-impl `<HOME>/.aws/credentials` path, so it genuinely exercises the
+# carries the daemon's `<HOME>/.aws/credentials` path, so it genuinely exercises the
 # home-normalization the plan requires (the no-session-token branch carries no path).
 CREDS_NO_STATIC = f"[{PROFILE}]\nregion = us-east-1\n"
 
@@ -225,8 +223,8 @@ def test_aws_passthrough_error(daemon, differential):
                 resp = bus.await_response("aws-credentials", timeout=10.0)
                 audit = d.read_audit_jsonl(expect=1, timeout=10.0)[0]
                 captured[impl] = {"response": resp, "audit": dict(audit)}
-                # Home-normalize the per-impl `<HOME>/.aws/credentials` path embedded in
-                # the error detail before diffing (each impl has its own isolated $HOME;
+                # Home-normalize the `<HOME>/.aws/credentials` path embedded in
+                # the error detail before pinning (each daemon has its own isolated $HOME;
                 # follow the minter argv home-normalize precedent).
                 norm = dict(audit)
                 norm["detail"] = norm["detail"].replace(d.home, "<HOME>")
@@ -306,7 +304,7 @@ def test_aws_unknown_op(daemon, differential):
 
     result = differential(scenario)
     assert result["in_reply_to"] == "unk-1"
-    # Go's exact `unknown operation: <op>` INTERNAL_ERROR (AWSCodeInternal).
+    # The exact `unknown operation: <op>` INTERNAL_ERROR (AWSCodeInternal).
     assert result["payload"] == {"error": "unknown operation: delete", "code": "INTERNAL_ERROR"}
 
 
@@ -314,7 +312,7 @@ def test_aws_unknown_op(daemon, differential):
 def test_aws_relogin_pickup(daemon, differential):
     """A fresh `aws sso login` (an atomic tmp+rename rewrite of the credentials file
     between two get_credentials) is picked up immediately: passthrough re-reads the file
-    every call (no cache), so the second vend reflects the new keys on BOTH impls."""
+    every call (no cache), so the second vend reflects the new keys."""
 
     def scenario(impl):
         with SyntheticBus() as bus:

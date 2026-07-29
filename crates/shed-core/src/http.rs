@@ -47,6 +47,15 @@ pub enum ShedError {
     Create(String),
     #[error("{0}")]
     Config(String),
+    /// The host-side credential broker must be upgraded before this server is
+    /// usable — the one mint failure whose remedy is a user ACTION rather than
+    /// waiting or debugging, so it is a typed case instead of a `Config` string:
+    /// presentation layers branch on it (banner leads with the remedy, `detail`
+    /// demoted to tooltip/log) and the empty state stops blaming config.yaml
+    /// (shed#300). The Display keeps the remedy FIRST so even a string-only
+    /// consumer truncates the context, never the action.
+    #[error("upgrade shed-host-agent — it is too old to obtain a client certificate for {server} ({detail})")]
+    AgentUpgradeRequired { server: String, detail: String },
 }
 
 const GET_TIMEOUT: Duration = Duration::from_secs(8);
@@ -135,20 +144,45 @@ impl Resolution {
 /// The mint error leads (it is the actionable half — "upgrade
 /// shed-host-agent", "the SSH bootstrap is unreachable"), with the refusal
 /// itself as context so the reader can still see WHAT the server said: an HTTP
-/// status, or the flattened TLS alert of a handshake-level refusal. The mint
-/// error's variant is preserved so a consumer mapping [`ShedError`] onto its own
-/// error surface (the FFI, the Swift/Tauri clients) keeps the same category.
+/// status, or the flattened TLS alert of a handshake-level refusal. Leading
+/// with the mint message is load-bearing, not cosmetic: banners truncate from
+/// the END, and refusal-first ordering was exactly how the actionable clause
+/// got cut off (shed#300). The mint error's variant is preserved so a consumer
+/// mapping [`ShedError`] onto its own error surface (the FFI, the Swift/Tauri
+/// clients) keeps the same category.
 fn refused_because(outcome: &Result<reqwest::Response, ShedError>, mint: ShedError) -> ShedError {
     let refusal = match outcome {
         Ok(resp) => format!("HTTP {}", resp.status().as_u16()),
         Err(e) => e.to_string(),
     };
-    let describe = |m: String| format!("the server refused this request ({refusal}): {m}");
+    let describe = |m: String| format!("{m} (request refused: {refusal})");
     match mint {
         ShedError::Config(m) => ShedError::Config(describe(m)),
         ShedError::Transport(m) => ShedError::Transport(describe(m)),
+        ShedError::AgentUpgradeRequired { server, detail } => ShedError::AgentUpgradeRequired {
+            server,
+            detail: format!("{detail}; request refused: {refusal}"),
+        },
         other => ShedError::Transport(describe(other.to_string())),
     }
+}
+
+/// Annotate a TRANSPORT-LEVEL wire failure with the mint failure that left the
+/// request unauthenticated. The wire error keeps its identity (it is what
+/// actually happened on the socket); the mint error rides along as context,
+/// because an unclassified handshake refusal plus "credential setup failed:
+/// upgrade shed-host-agent" is diagnosable where either alone is not. Only for
+/// `Err` outcomes — never for an HTTP status (see the call site's comment).
+fn with_mint_context(wire: &ShedError, mint: &ShedError) -> ShedError {
+    // A `Transport` keeps its inner message rather than its `Display` so the
+    // annotated form is not re-prefixed with "transport error: ".
+    let wire = match wire {
+        ShedError::Transport(m) => m.clone(),
+        other => other.to_string(),
+    };
+    ShedError::Transport(format!(
+        "{wire}; additionally, credential setup failed: {mint}"
+    ))
 }
 
 /// Report a refusal the retry machinery decided not to act on: the mint error
@@ -496,9 +530,20 @@ impl Client {
     /// The timeout is the ONLY error it can produce: a mint failure is carried
     /// inside the [`Resolution`], not raised (see [`Self::credential`]).
     async fn bounded_credential(&self, bound: Duration) -> Result<Resolution, ShedError> {
+        // The message names the stage that stalled: this timeout fires when the
+        // MINTER (shed-host-agent on desktop; the SSH bootstrap elsewhere) sat on
+        // the resolution past the request bound, and "credential resolution" alone
+        // read as a generic transport stall (shed#297) — pointing the operator at
+        // the network instead of the agent.
         tokio::time::timeout(bound, self.credential())
             .await
-            .map_err(|_| ShedError::Transport("credential resolution timeout".into()))
+            .map_err(|_| {
+                ShedError::Transport(
+                    "credential resolution timed out; the credential minter \
+                     (shed-host-agent on desktop) did not answer in time"
+                        .into(),
+                )
+            })
     }
 
     /// Reactive invalidation of the credential a request actually used, BOUNDED
@@ -670,6 +715,19 @@ impl Client {
             transport: transport.clone(),
         };
         if !auth_shaped || self.token_provider.is_none() {
+            // The mint-error promotion below runs only for auth-shaped refusals,
+            // so this `!auth_shaped` return fires FIRST and would silently drop a
+            // carried mint error (the control-flow subtlety of shed#297's
+            // secondary hole — do not "simplify" the promotion above this
+            // return). When the wire itself failed and nothing was presented,
+            // the failed mint is context the raw error lacks: append it WITHOUT
+            // replacing the wire error's identity. A `BadStatus` (404/500) or a
+            // healthy response keeps today's behavior — an open-mode server
+            // answers fine while carrying a mint error, and an unrelated HTTP
+            // status must never be masked by a host-agent message.
+            if let (Err(wire), None, Some(mint)) = (&outcome, &used, &mint_error) {
+                return Err(with_mint_context(wire, mint));
+            }
             return outcome.map(sent);
         }
         // Nothing was presented because the mint failed: report THAT, and do not
@@ -2051,6 +2109,110 @@ mod tests {
         assert_eq!(c.bearer().await, None);
     }
 
+    // ---- plan 006 D5/D6 — mint-error plumbing + the typed upgrade case ----
+
+    #[test]
+    fn refused_because_leads_with_the_mint_error() {
+        // Banners truncate from the END; refusal-first ordering was exactly how
+        // the actionable clause got cut off (shed#300).
+        let outcome: Result<reqwest::Response, ShedError> = Err(ShedError::Transport(
+            "received fatal alert: CertificateRequired".into(),
+        ));
+        let e = refused_because(
+            &outcome,
+            ShedError::Config("upgrade shed-host-agent".into()),
+        );
+        let ShedError::Config(m) = e else {
+            panic!("variant must be preserved");
+        };
+        assert!(m.starts_with("upgrade shed-host-agent"), "{m}");
+        assert!(
+            m.contains("(request refused: transport error: received fatal alert"),
+            "{m}"
+        );
+    }
+
+    #[test]
+    fn refused_because_preserves_the_typed_upgrade_case() {
+        let outcome: Result<reqwest::Response, ShedError> =
+            Err(ShedError::Transport("tls alert".into()));
+        let e = refused_because(
+            &outcome,
+            ShedError::AgentUpgradeRequired {
+                server: "mini2".into(),
+                detail: "does not support `credential.get`".into(),
+            },
+        );
+        let ShedError::AgentUpgradeRequired { server, detail } = e else {
+            panic!("the typed case must survive the refusal wrap, got {e:?}");
+        };
+        assert_eq!(server, "mini2");
+        assert!(detail.starts_with("does not support"), "{detail}");
+        assert!(detail.contains("request refused"), "{detail}");
+    }
+
+    #[test]
+    fn mint_context_keeps_the_wire_errors_identity() {
+        let wire = ShedError::Transport("connection refused".into());
+        let mint = ShedError::Config("upgrade shed-host-agent".into());
+        let ShedError::Transport(m) = with_mint_context(&wire, &mint) else {
+            panic!("the wire error's variant must survive");
+        };
+        assert!(m.starts_with("connection refused"), "{m}");
+        assert!(
+            m.contains("additionally, credential setup failed: upgrade"),
+            "{m}"
+        );
+    }
+
+    #[tokio::test]
+    async fn unrelated_status_is_never_masked_by_a_mint_error() {
+        // An open-mode 404 (or any non-auth status) must surface AS the status:
+        // the carried mint error explains nothing about it (plan 006 D5's
+        // narrowing — the blanket "mint error wins when nothing was presented"
+        // would have replaced this 404 with a host-agent message).
+        let server = MockServer::start_async().await;
+        server
+            .mock_async(|w, t| {
+                w.method(GET).path("/api/info");
+                t.status(404);
+            })
+            .await;
+        let c = Client::new(
+            server.base_url(),
+            "mini2".into(),
+            String::new(),
+            None,
+            Some(Arc::new(FailMinter)),
+        )
+        .unwrap();
+        let e = c.info().await.unwrap_err();
+        assert!(matches!(e, ShedError::BadStatus(404)), "got {e:?}");
+    }
+
+    #[tokio::test]
+    async fn transport_failure_with_a_failed_mint_carries_both() {
+        // The shed#297 secondary hole: a non-auth-shaped TRANSPORT failure used
+        // to silently drop the carried mint error at the `!auth_shaped` early
+        // return. Now the wire error keeps its identity and the mint failure
+        // rides along as context.
+        let c = Client::new(
+            // Port 1 is never listening: a fast ECONNREFUSED.
+            "http://127.0.0.1:1".into(),
+            "mini2".into(),
+            String::new(),
+            None,
+            Some(Arc::new(FailMinter)),
+        )
+        .unwrap();
+        let e = c.info().await.unwrap_err();
+        let ShedError::Transport(m) = e else {
+            panic!("expected the wire transport identity, got a different variant");
+        };
+        assert!(m.contains("additionally, credential setup failed"), "{m}");
+        assert!(m.contains("mint down"), "{m}");
+    }
+
     #[test]
     fn pin_on_non_https_is_config_error() {
         let result = Client::new(
@@ -3010,7 +3172,7 @@ mod tests {
             // the outer one. What this pins is that a never-resolving mint ends
             // the call instead of hanging it.
             ShedError::Transport(msg) => assert!(
-                msg.contains("credential resolution timeout") || msg.contains("connect"),
+                msg.contains("credential resolution timed out") || msg.contains("connect"),
                 "got: {msg}"
             ),
             other => panic!("expected a Transport timeout, got {other:?}"),

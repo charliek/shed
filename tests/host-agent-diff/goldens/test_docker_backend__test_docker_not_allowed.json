@@ -1,0 +1,30 @@
+{
+  "audit": {
+    "approval": "approve-all",
+    "code": "REGISTRY_NOT_ALLOWED",
+    "detail": "blocked.io",
+    "ns": "docker-credentials",
+    "op": "get",
+    "reason": "registry \"blocked.io\" not in allowlist",
+    "result": "error",
+    "shed": "web",
+    "ts": "<ts>"
+  },
+  "response": {
+    "final": true,
+    "id": "<id>",
+    "in_reply_to": "na-1",
+    "namespace": "docker-credentials",
+    "payload": {
+      "code": "REGISTRY_NOT_ALLOWED",
+      "error": "credential request failed"
+    },
+    "shed": {
+      "backend": "vz",
+      "name": "web",
+      "server": "mini2"
+    },
+    "timestamp": "<ts>",
+    "type": "response"
+  }
+}

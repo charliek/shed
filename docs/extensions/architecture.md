@@ -89,8 +89,12 @@ sequenceDiagram
 
 ## Package Structure
 
-All extension code lives in the shed monorepo. Guest and host binaries share the
-`internal/ext/` packages and the `github.com/charliek/shed/sdk` module.
+All extension code lives in the shed monorepo. The guest binaries are Go and share the
+`internal/ext/` packages and the `github.com/charliek/shed/sdk` module. The host binary,
+`shed-host-agent`, is a separate Rust crate (`crates/shed-host-agent`, built on the
+shared `crates/shed-broker` core) that ports the same wire protocol — it talks to
+shed-server over the identical `sdk.HostClient`-shaped SSE subscribe/respond endpoints,
+so guest and host still agree on the wire even though they no longer share Go source.
 
 ### Guest-Side
 
@@ -103,7 +107,16 @@ All extension code lives in the shed monorepo. Guest and host binaries share the
 
 ### Host-Side
 
-- **`cmd/shed-host-agent/`** — Main binary. Loads config, initializes backends, and subscribes to namespaces via the `github.com/charliek/shed/sdk` host client (SSE — handles subscription, reconnection, and response delivery). Dispatches requests to handlers and runs SSH, AWS, and Docker handlers concurrently. The darwin build is CGO-enabled for the Touch ID / LocalAuthentication approval gate.
+- **`crates/shed-host-agent/`** — the daemon shell (CLI, signals, socket bind, the
+  desktop UDS server) over **`crates/shed-broker`**, the embeddable broker core: it
+  subscribes to namespaces via a Rust port of the `sdk.HostClient` SSE
+  subscribe/respond protocol (handles subscription, reconnection, and response
+  delivery), dispatches requests to the SSH, AWS, and Docker handlers concurrently, and
+  hosts the approval gates. The `biometrics`/`biometrics-or-password` policies use a
+  native macOS Touch ID / LocalAuthentication gate built on `objc2` — it links the
+  LocalAuthentication framework directly, so the binary needs no CGO on darwin (unlike
+  the Go daemon it replaced). The `shed-desktop` policy instead delegates the approval
+  decision to a connected desktop app over the UDS channel described below.
 
 ### Shared
 

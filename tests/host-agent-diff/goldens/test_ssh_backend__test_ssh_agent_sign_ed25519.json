@@ -1,0 +1,28 @@
+{
+  "response": {
+    "final": true,
+    "id": "<id>",
+    "in_reply_to": "ed-1",
+    "namespace": "ssh-agent",
+    "payload": {
+      "blob": "tdXR3UG+f19oEjGP3qLCS3RYIaka9+WmoNoEQvBOWgzVbUZ1/OGk4rcq0terXqrdMvXwB7NfIMI8OvJMmnyACw==",
+      "format": "ssh-ed25519",
+      "rest": ""
+    },
+    "shed": {
+      "backend": "vz",
+      "name": "web",
+      "server": "mini2"
+    },
+    "timestamp": "<ts>",
+    "type": "response"
+  },
+  "transcript": [
+    {
+      "data_b64": "c2hlZC1ob3N0LWFnZW50IHNzaC1iYWNrZW5kIGRpZmZlcmVudGlhbCBjaGFsbGVuZ2UgdjE=",
+      "flags": 0,
+      "key_b64": "AAAAC3NzaC1lZDI1NTE5AAAAILMdrPP0NLsfgrc8JIa6OWX1qhgyfW/UwJTSXdRuUsJJ",
+      "type": 13
+    }
+  ]
+}

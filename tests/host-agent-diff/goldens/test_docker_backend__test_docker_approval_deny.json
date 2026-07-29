@@ -1,0 +1,30 @@
+{
+  "audit": {
+    "approval": "deny-all",
+    "code": "APPROVAL_DENIED",
+    "detail": "ghcr.io",
+    "ns": "docker-credentials",
+    "op": "get",
+    "reason": "denied: approval policy is deny-all",
+    "result": "denied",
+    "shed": "web",
+    "ts": "<ts>"
+  },
+  "response": {
+    "final": true,
+    "id": "<id>",
+    "in_reply_to": "deny-1",
+    "namespace": "docker-credentials",
+    "payload": {
+      "code": "REGISTRY_NOT_ALLOWED",
+      "error": "approval denied"
+    },
+    "shed": {
+      "backend": "vz",
+      "name": "web",
+      "server": "mini2"
+    },
+    "timestamp": "<ts>",
+    "type": "response"
+  }
+}

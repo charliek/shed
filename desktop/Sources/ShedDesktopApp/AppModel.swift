@@ -165,10 +165,10 @@ final class AppModel: NSObject, UiBridge {
                 try LoginItem.setEnabled(on)
                 if on && !LoginItem.isEnabled {
                     // register() succeeded but the item is .requiresApproval.
-                    self.state.lastError = "Approve “shed desktop” in System Settings › Login Items to finish enabling launch at login."
+                    self.state.setBanner("Approve “shed desktop” in System Settings › Login Items to finish enabling launch at login.")
                 }
             } catch {
-                self.state.lastError = "launch at login: \(error)"
+                self.state.setBanner("launch at login: \(HostFailure.displayMessage(for: error))")
                 self.prefs.launchAtLogin = LoginItem.isEnabled
             }
         }
@@ -287,18 +287,18 @@ final class AppModel: NSObject, UiBridge {
             Task { [weak self] in
                 guard let self else { return }
                 do { try await self.shedAction(action, host: shed.host, name: shed.name) }
-                catch { self.state.lastError = "\(action.rawValue) \(shed.name): \(error)" }
+                catch { self.state.setBanner("\(action.rawValue) \(shed.name): \(HostFailure.displayMessage(for: error))") }
             }
         }
         state.onOpenTerminal = { [weak self] shed in
             guard let self else { return }
             do { _ = try self.openTerminal(shed: shed.name, host: shed.host, session: nil) }
-            catch { self.state.lastError = "terminal \(shed.name): \(error)" }
+            catch { self.state.setBanner("terminal \(shed.name): \(HostFailure.displayMessage(for: error))") }
         }
         state.onCreate = { [weak self] host, request in
             guard let self else { return }
             do { _ = try self.startCreate(host: host, request: request) }
-            catch { self.state.lastError = "create \(request.name): \(error)" }
+            catch { self.state.setBanner("create \(request.name): \(HostFailure.displayMessage(for: error))") }
         }
         state.onRcLaunch = { [weak self] input in
             Task { [weak self] in
@@ -308,27 +308,27 @@ final class AppModel: NSObject, UiBridge {
                         host: input.host, shed: input.shed, kind: input.kind,
                         displayName: input.displayName, workdir: nil,
                         initialPrompt: input.initialPrompt)
-                } catch { self.state.lastError = "launch \(input.shed): \(error)" }
+                } catch { self.state.setBanner("launch \(input.shed): \(HostFailure.displayMessage(for: error))") }
             }
         }
         state.onRcKill = { [weak self] session in
             Task { [weak self] in
                 guard let self else { return }
                 do { try await self.rcKill(host: session.host, shed: session.shed, slug: session.slug) }
-                catch { self.state.lastError = "kill \(session.slug): \(error)" }
+                catch { self.state.setBanner("kill \(session.slug): \(HostFailure.displayMessage(for: error))") }
             }
         }
         state.onRcRefresh = { [weak self] in
             Task { [weak self] in
                 guard let self else { return }
                 do { _ = try await self.rcList(host: nil, shed: nil) }
-                catch { self.state.lastError = "rc list: \(error)" }
+                catch { self.state.setBanner("rc list: \(HostFailure.displayMessage(for: error))") }
             }
         }
         state.onRcAttach = { [weak self] session in
             guard let self else { return }
             do { _ = try self.openTerminal(shed: session.shed, host: session.host, session: session.tmuxSession) }
-            catch { self.state.lastError = "console \(session.slug): \(error)" }
+            catch { self.state.setBanner("console \(session.slug): \(HostFailure.displayMessage(for: error))") }
         }
         state.onSystemRefresh = { [weak self] in
             Task { [weak self] in _ = await self?.refreshSystemUsage() }
@@ -346,7 +346,7 @@ final class AppModel: NSObject, UiBridge {
             Task { [weak self] in
                 guard let self else { return }
                 do { try await self.decideApproval(id: req.id, choice: choice) }
-                catch { self.state.lastError = "approval \(req.id): \(error)" }
+                catch { self.state.setBanner("approval \(req.id): \(HostFailure.displayMessage(for: error))") }
             }
         }
         state.onRevealAuditLog = { [weak self] in
@@ -418,13 +418,21 @@ final class AppModel: NSObject, UiBridge {
             // (token.get); on a mint failure the client sends no token (a secure
             // server 401s → offline, an open server still works) — never the
             // static config token. The hermetic mock has no provider (static token).
-            let provider: ControlTokenProvider? = mockBase == nil
+            //
+            // TEST-ONLY exception: a host named in `mockCredentialHosts` keeps
+            // its real wiring against the mock, so the harness can drive the
+            // whole mint→refusal→banner chain (an old fake host-agent + an
+            // mtls-configured entry + a 401-ing mock) instead of unit-testing
+            // the two ends of it separately.
+            let realCredentials = mockBase == nil
+                || ShedBackend.shared.mockCredentialHosts.contains(entry.name)
+            let provider: ControlTokenProvider? = realCredentials
                 ? hostAgent.map { ControlTokenProvider.hostAgent($0, server: entry.name) }
                 : nil
             // The hermetic mock is an open plain-http server; forcing .token
             // keeps a test config carrying auth_mode from tripping the legacy
             // path's mtls refusal (§7 P6) against a server that wants nothing.
-            let authMode: ShedAuthMode = mockBase == nil ? entry.authMode : .token
+            let authMode: ShedAuthMode = realCredentials ? entry.authMode : .token
             // Learned-mode sink: in-memory only (§7 P1). The diagnostic log is
             // the surface — it's where "why is this host unreachable?" is
             // answered, and a silent token→mtls flip belongs in that trail. The
@@ -439,7 +447,7 @@ final class AppModel: NSObject, UiBridge {
                 // The Rust path's control-credential minter uses the same host
                 // agent as the Swift provider — dropped in test mode (mock is
                 // tokenless), so e2e stays hermetic.
-                hostAgent: mockBase == nil ? hostAgent : nil,
+                hostAgent: realCredentials ? hostAgent : nil,
                 authMode: authMode,
                 // The app-lifetime learned-mode store, handed to every rebuild:
                 // the client is reconstructed, what the session proved is not.
@@ -522,9 +530,9 @@ final class AppModel: NSObject, UiBridge {
         let generation = reloadGeneration
         var newHosts = state.hosts
         var allSheds: [Shed] = []
-        var errors: [String] = []
+        var failures: [HostFailure] = []
 
-        await withTaskGroup(of: (String, ServerInfo?, [Shed], String?).self) { group in
+        await withTaskGroup(of: (String, ServerInfo?, [Shed], HostFailure?).self) { group in
             for client in clients {
                 group.addTask {
                     // info + sheds are independent GETs — fetch them
@@ -534,19 +542,30 @@ final class AppModel: NSObject, UiBridge {
                     do {
                         return (client.serverName, try await info, try await sheds, nil)
                     } catch {
-                        return (client.serverName, nil, [], "\(client.serverName): \(error)")
+                        // Typed BEFORE stringification (plan 006 D6 / shed#300):
+                        // interpolating the error here rendered the generated FFI
+                        // enum's CASE (`Config(message: "…")`) into the banner and
+                        // threw away the one thing the UI must branch on — whether
+                        // this host needs shed-host-agent upgraded.
+                        return (client.serverName, nil, [],
+                                HostFailure.from(server: client.serverName, error: error))
                     }
                 }
             }
-            for await (name, info, sheds, err) in group {
+            for await (name, info, sheds, raw) in group {
+                // Sanitize ONCE, here: the host row and the banner rollup below
+                // must carry the same redacted text, or a token-shaped string
+                // scrubbed out of the row would still reach `lastError`.
+                let failure = raw?.sanitized()
                 if let idx = newHosts.firstIndex(where: { $0.name == name }) {
-                    newHosts[idx] = newHosts[idx].applyingProbe(info: info, error: err)
+                    newHosts[idx] = newHosts[idx].applyingProbe(info: info, failure: failure)
                 }
                 allSheds.append(contentsOf: sheds)
-                if let err { errors.append(err) }
+                if let failure { failures.append(failure) }
                 diag?.log(info != nil ? .info : .warn, "probe",
                           info != nil ? "reachable" : "unreachable",
-                          [("server", name), ("error", err ?? "")])
+                          [("server", name), ("error", failure?.summary ?? ""),
+                           ("detail", failure?.detail ?? "")])
             }
         }
 
@@ -559,8 +578,17 @@ final class AppModel: NSObject, UiBridge {
         allSheds.sort { ($0.host, $0.name) < ($1.host, $1.name) }
         state.hosts = newHosts
         state.sheds = allSheds
-        state.lastError = errors.isEmpty ? nil
-            : (errors.count == 1 ? errors[0] : "\(errors.count) hosts unreachable")
+        // The banner is the single failure's remedy-first summary (it leads with
+        // the action, so `lineLimit(1)` truncates context, never the fix), or a
+        // count when several hosts are down — same rule as the Rust backend's
+        // `Reachability.last_error`.
+        switch failures.count {
+        case 0: state.setBanner(nil)
+        case 1: state.setBanner(failures[0].summary, failure: failures[0])
+        // Several hosts down: no single cause to hover, so no typed failure
+        // rides along (the per-host details stay on the sidebar dots).
+        case let n: state.setBanner("\(n) hosts unreachable")
+        }
         updateStatusItemTitle()
     }
 
@@ -586,7 +614,7 @@ final class AppModel: NSObject, UiBridge {
                 group.addTask {
                     // Unreachable host → a row with an error, never a hard failure.
                     do { return HostDiskUsage(host: client.serverName, usage: try await client.systemDF()) }
-                    catch { return HostDiskUsage(host: client.serverName, error: "\(error)") }
+                    catch { return HostDiskUsage(host: client.serverName, error: HostFailure.displayMessage(for: error)) }
                 }
             }
             for await item in group { result.append(item) }
@@ -618,7 +646,7 @@ final class AppModel: NSObject, UiBridge {
                 group.addTask {
                     // Unreachable host → a row with an error, never a hard failure.
                     do { return HostImageList(host: client.serverName, images: try await client.listImages()) }
-                    catch { return HostImageList(host: client.serverName, error: "\(error)") }
+                    catch { return HostImageList(host: client.serverName, error: HostFailure.displayMessage(for: error)) }
                 }
             }
             for await item in group { result.append(item) }
@@ -647,7 +675,7 @@ final class AppModel: NSObject, UiBridge {
                 group.addTask {
                     // Unreachable host / egress disabled → a row with an error, never a hard failure.
                     do { return HostEgressProfiles(host: client.serverName, profiles: try await client.egressProfiles()) }
-                    catch { return HostEgressProfiles(host: client.serverName, profiles: [], error: "\(error)") }
+                    catch { return HostEgressProfiles(host: client.serverName, profiles: [], error: HostFailure.displayMessage(for: error)) }
                 }
             }
             for await item in group { result.append(item) }
@@ -926,7 +954,7 @@ final class AppModel: NSObject, UiBridge {
                 await self?.refreshSheds()
             } catch {
                 progress.state = .error
-                progress.error = "\(error)"
+                progress.error = HostFailure.displayMessage(for: error)
                 self?.updateCreate(progress)
             }
             // Drop only the task handle: the final progress stays in `creates`
@@ -1322,7 +1350,7 @@ final class AppModel: NSObject, UiBridge {
                 reason: "Approve \(req.namespace) \(req.op) for shed \(req.shed)",
                 biometricsOnly: item.gate == .biometrics)
             guard ok else {
-                state.lastError = "Touch ID not confirmed for \(req.shed)"
+                state.setBanner("Touch ID not confirmed for \(req.shed)")
                 return  // stay pending; user can retry or it expires
             }
             // The request may have expired (and been denied) while the biometric

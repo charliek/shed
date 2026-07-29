@@ -82,8 +82,8 @@ countdown expires.
 ## Verifying it live
 
 Everything above is exercised hermetically by the pytest harness against a Python fake
-agent (`make -C desktop e2e-ci`). The one path a fake can't prove — the **real Go agent ↔
-real Swift app** wire protocol — is covered by `scripts/live-verify.sh`:
+agent (`make -C desktop e2e-ci`). The one path a fake can't prove — the **real Rust
+host-agent ↔ real Swift app** wire protocol — is covered by `scripts/live-verify.sh`:
 
 ```bash
 # Non-disruptive: builds a real host-agent, starts it on a private socket with
@@ -99,5 +99,5 @@ real Swift app** wire protocol — is covered by `scripts/live-verify.sh`:
 ./desktop/scripts/live-verify.sh --full
 ```
 
-The script builds the agent from the in-repo `cmd/shed-host-agent` (the credential broker
-lives in this monorepo). It is not part of CI — it needs a real VM in the loop.
+The script builds the agent from the in-repo `crates/shed-host-agent` (the credential
+broker lives in this monorepo). It is not part of CI — it needs a real VM in the loop.

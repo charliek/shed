@@ -1,19 +1,19 @@
-"""Discovery reload — the `off`/`poll` convergence differential.
+"""Discovery reload — the `off`/`poll` convergence cells.
 
-Both daemons build ONE supervisor and reconcile the desired server set from a discovery
+The daemon builds ONE supervisor and reconciles the desired server set from a discovery
 `source:` (`~/.shed/config.yaml`-style `servers:` doc) per the `watch:` mode. This drives
-BOTH impls with a source that starts absent and then appears, asserting they converge to
-the SAME `servers[]` set (by name):
+a source that starts absent and then appears, pinning the `servers[]` set (by name) it
+converges to:
 
 * **poll** (short interval) — picks up the appearance within a deadline.
 * **off** — reconciles ONCE at startup and never reloads, so the later appearance is NOT
   picked up (`servers[]` stays empty).
 
-The live differential drives POLL for determinism (production's default watch mode is
+The live cells drive POLL for determinism (production's default watch mode is
 event-driven `notify`; that path is covered by the `watcher.rs` `notify`-backed unit
-smoke). The `since` value is masked; only the server NAME set is compared, so the
-per-namespace connection state (an unreachable target reconnects with an impl-specific
-`last_error`) is not a diff target here — the `servers[]` state shape is owned by
+smoke). The `since` value is masked; only the server NAME set is pinned, so the
+per-namespace connection state (an unreachable target reconnects with a timing-
+dependent `last_error`) is not pinned here — the `servers[]` state shape is owned by
 `test_servers.py`.
 """
 

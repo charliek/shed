@@ -56,6 +56,12 @@ pub enum ShedError {
     Create { message: String },
     #[error("{message}")]
     Config { message: String },
+    /// Typed mirror of the core's agent-upgrade case (shed#300): Swift branches
+    /// on it for the remedy-first banner + empty-state deference instead of
+    /// pattern-matching strings. Same field split as the core: the remedy is
+    /// the case itself, `detail` is tooltip/log context.
+    #[error("upgrade shed-host-agent — it is too old to obtain a client certificate for {server} ({detail})")]
+    AgentUpgradeRequired { server: String, detail: String },
 }
 
 impl From<CoreError> for ShedError {
@@ -66,6 +72,9 @@ impl From<CoreError> for ShedError {
             CoreError::Decode(message) => ShedError::Decode { message },
             CoreError::Create(message) => ShedError::Create { message },
             CoreError::Config(message) => ShedError::Config { message },
+            CoreError::AgentUpgradeRequired { server, detail } => {
+                ShedError::AgentUpgradeRequired { server, detail }
+            }
         }
     }
 }
@@ -612,6 +621,9 @@ fn core_error_from_ffi(e: ShedError) -> CoreError {
         ShedError::Decode { message } => CoreError::Decode(message),
         ShedError::Create { message } => CoreError::Create(message),
         ShedError::Config { message } => CoreError::Config(message),
+        ShedError::AgentUpgradeRequired { server, detail } => {
+            CoreError::AgentUpgradeRequired { server, detail }
+        }
     }
 }
 
@@ -829,6 +841,40 @@ mod tests {
     use super::*;
     use std::sync::Mutex;
     use std::time::Duration;
+
+    /// The typed upgrade case round-trips the FFI mapping both directions with
+    /// its fields intact (plan 006 D6): Swift branches on the case, so a lossy
+    /// mapping (e.g. flattening to Config) would silently disable the shed#300
+    /// presentation.
+    #[test]
+    fn agent_upgrade_required_round_trips_the_ffi_mapping() {
+        let core = CoreError::AgentUpgradeRequired {
+            server: "mini2".into(),
+            detail: "does not support `credential.get`".into(),
+        };
+        let ffi: ShedError = core.into();
+        assert!(
+            matches!(&ffi, ShedError::AgentUpgradeRequired { server, detail }
+                if server == "mini2" && detail.contains("credential.get")),
+            "lossy core->ffi mapping: {ffi:?}"
+        );
+        let ffi_rendered = ffi.to_string();
+        let back = core_error_from_ffi(ffi);
+        assert!(
+            matches!(&back, CoreError::AgentUpgradeRequired { server, detail }
+                if server == "mini2" && detail.contains("credential.get")),
+            "lossy ffi->core mapping: {back:?}"
+        );
+        assert!(
+            back.to_string().starts_with("upgrade shed-host-agent"),
+            "{back}"
+        );
+        // The two `#[error(..)]` templates are hand-duplicated across the crate
+        // boundary (the established convention for every variant here) — pin
+        // them to each other so editing one and not the other fails a test
+        // rather than shipping two different sentences to Swift.
+        assert_eq!(ffi_rendered, back.to_string(), "core/ffi Display drift");
+    }
 
     // ---- the foreign minter contract (plan 002 §7 P2) ----
 

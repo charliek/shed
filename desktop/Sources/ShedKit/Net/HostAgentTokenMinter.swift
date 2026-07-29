@@ -37,6 +37,11 @@ final class HostAgentTokenMinter: ShedRustCore.TokenMinter, @unchecked Sendable 
     /// client start out knowing what an earlier one proved.
     private let onMintedMode: (@Sendable (ShedAuthMode) -> Void)?
     private let lock = NSLock()
+    /// When a pre-ack capability wait last concluded still-`.unknown` — the
+    /// negative-result memo behind guard 2 in `mintCredential` (one caller per
+    /// burst pays the wait; the provider's mint lock serializes the rest behind
+    /// it). Guarded by `lock`, like `lastMintedMode`.
+    private var unknownWaitedAt: ContinuousClock.Instant?
     /// The shape THIS minter last saw the server issue, recorded synchronously
     /// as the response is mapped. The observer learns the same thing, but only
     /// after the core has adopted the credential and its dispatcher has run —
@@ -66,6 +71,20 @@ final class HostAgentTokenMinter: ShedRustCore.TokenMinter, @unchecked Sendable 
         let local = lastMintedMode
         lock.unlock()
         return local == .mtls || expectsMtls()
+    }
+
+    /// Guard 2's read: did a capability wait conclude still-`.unknown` within
+    /// the last `capabilityWait` window?
+    private func recentUnknownWait() -> Bool {
+        lock.lock()
+        let at = unknownWaitedAt
+        lock.unlock()
+        guard let at else { return false }
+        return at.duration(to: .now) < capabilityWait
+    }
+
+    private func noteUnknownWait() {
+        lock.lock(); unknownWaitedAt = .now; lock.unlock()
     }
 
     private func recordMintedMode(_ mode: ShedAuthMode) {
@@ -107,12 +126,11 @@ final class HostAgentTokenMinter: ShedRustCore.TokenMinter, @unchecked Sendable 
     //                                              re-checked against the SAME
     //                                              connection at send time
     //   .unsupported no             false          token.get (unchanged, forever)
-    //   .unsupported yes            false          refuse: upgrade shed-host-agent
-    //   .unknown     no             false          token.get IMMEDIATELY (no wait:
-    //                                              a token entry has nothing to
-    //                                              learn from the ack)
-    //   .unknown     yes            true           await the ack (bounded), then
-    //                                              the row it resolves to; still
+    //   .unsupported yes            false          refuse: the TYPED
+    //                                              AgentUpgradeRequired error
+    //   .unknown     any            per config     await the ack (bounded, BOTH
+    //                                              modes — plan 006 D5), then the
+    //                                              row it resolves to; still
     //                                              unknown → refuse: "connecting
     //                                              to shed-host-agent", retried by
     //                                              the next request
@@ -146,10 +164,35 @@ final class HostAgentTokenMinter: ShedRustCore.TokenMinter, @unchecked Sendable 
     {
         let wantsMtls = expectsMtlsNow()
         var capability = hostAgent.credentialCapabilitySnapshot
-        // Only an mtls-expecting mint pays the wait: a token entry learns nothing
-        // useful from the ack and keeps every shipped build's immediate token.get.
-        if capability.state == .unknown, wantsMtls {
+        // The pre-ack wait is unconditional across modes (plan 006 D5, revising
+        // plan 002's mtls-only gate; the Rust minter's `mint_credential` carries
+        // the same change): before the first `hello_ack` this connection has
+        // learned NOTHING — the ack is the agent's first frame — so a `token.get`
+        // fired into that silence spends its whole reply timeout to learn less
+        // than this bounded wait does. If the ack lands inside the window,
+        // proceed per the resolved state (an alive agent with a late ack still
+        // succeeds, at most `capabilityWait` later). If it never lands, the
+        // specific "not announced its capabilities" sentence below beats the
+        // outer request bound instead of losing to it (shed#297). The deliberate
+        // trade: a down/never-acking agent now costs a token mint
+        // `capabilityWait` before failing WITH a diagnosis, instead of failing
+        // later with none.
+        //
+        // The negative-result memo keeps that trade from STACKING: the Rust
+        // provider holds its mint lock across a `mintCredential`, so concurrent
+        // callers serialize through here — without the memo, N dashboard panes
+        // against a wedged/absent agent would each queue a full wait and push the
+        // later ones past their outer request bounds. One caller per burst pays
+        // the wait; the rest fail fast with the same diagnosis. Self-healing:
+        // once the ack lands the state is no longer `.unknown` and this whole
+        // branch is skipped.
+        if capability.state == .unknown {
+            if recentUnknownWait() {
+                throw Self.capabilityError(
+                    for: .capabilityLost, server: server, wantsMtls: wantsMtls)
+            }
             capability = await hostAgent.awaitCredentialCapability(timeout: capabilityWait)
+            if capability.state == .unknown { noteUnknownWait() }
         }
         switch capability.state {
         case .supported:
@@ -164,7 +207,10 @@ final class HostAgentTokenMinter: ShedRustCore.TokenMinter, @unchecked Sendable 
                 resp = try await hostAgent.requestCredential(
                     server: server, csrBase64: csr, capability: capability)
             } catch let e as HostAgentClientError {
-                return .failed(message: message(for: e, server: server))
+                // Same mapping as the capability arms below (Rust's
+                // `map_err(capability_error)`): a connection that turned out not
+                // to answer `credential.get` is the typed upgrade case here too.
+                throw Self.capabilityError(for: e, server: server, wantsMtls: wantsMtls)
             }
             let validated = resp.validatedCredential(for: server)
             if case .certificate = validated, csr == nil {
@@ -175,33 +221,49 @@ final class HostAgentTokenMinter: ShedRustCore.TokenMinter, @unchecked Sendable 
             return map(validated)
         case .unsupported:
             guard !wantsMtls else {
-                return .failed(message: message(for: .capabilityUnsupported, server: server))
+                throw Self.capabilityError(
+                    for: .capabilityUnsupported, server: server, wantsMtls: wantsMtls)
             }
+            // Unsupported + token server: an old-but-alive agent answers
+            // token.get exactly as every shipped build did.
             return .token(token: try await mint(server: server))
         case .unknown:
-            guard !wantsMtls else {
-                return .failed(message: message(for: .capabilityLost, server: server))
-            }
-            // Token-mode servers keep the pre-ack behavior every shipped build
-            // has: send the token.get. `requestToken` itself fails fast when
-            // there is no live connection.
-            return .token(token: try await mint(server: server))
+            // Still unknown after the bounded wait — the agent has emitted
+            // nothing at all. Diagnosable for BOTH modes (plan 006 D5): sending
+            // a token.get here would only trade this specific sentence for a
+            // reply timeout the outer request bound truncates to a generic
+            // transport error.
+            throw Self.capabilityError(for: .capabilityLost, server: server, wantsMtls: wantsMtls)
         }
     }
 
-    /// The user-facing sentence for a transport/capability failure: "upgrade
-    /// shed-host-agent" when the live agent genuinely cannot do this, "still
-    /// connecting" when the answer is simply not in yet.
-    private func message(for error: HostAgentClientError, server: String) -> String {
+    /// The user-facing error for a transport/capability failure — the Swift twin
+    /// of the Rust minter's `capability_error`, case for case and string for
+    /// string: the TYPED upgrade case when the live agent genuinely cannot do
+    /// this (shed#300 — presentation branches on it), a "still connecting"
+    /// `Config` when the answer is simply not in yet.
+    ///
+    /// `wantsMtls` picks the wording of the latter: the pre-ack wait runs for
+    /// token servers too (plan 006 D5), and telling a token-mode operator their
+    /// server "requires mtls" would send them debugging the wrong thing.
+    static func capabilityError(
+        for error: HostAgentClientError, server: String, wantsMtls: Bool
+    ) -> ShedRustCore.ShedError {
         switch error {
         case .capabilityUnsupported:
-            return "shed-host-agent is too old to obtain a client certificate for \(server), "
-                + "which requires mtls; upgrade shed-host-agent"
+            return .AgentUpgradeRequired(
+                server: server,
+                detail: "the connected shed-host-agent does not support `credential.get`, and "
+                    + "\(server) requires auth.mode: mtls")
         case .capabilityLost, .notConnected, .disconnected:
-            return "connecting to shed-host-agent; \(server) requires mtls and the agent has not "
-                + "announced its capabilities yet"
+            return .Config(
+                message: wantsMtls
+                    ? "connecting to shed-host-agent; \(server) requires mtls and the agent has "
+                        + "not announced its capabilities yet"
+                    : "connecting to shed-host-agent; it has not announced its capabilities yet, "
+                        + "so no credential for \(server) can be minted")
         default:
-            return "\(error) while obtaining a credential for \(server)"
+            return .Config(message: "\(error) while obtaining a credential for \(server)")
         }
     }
 

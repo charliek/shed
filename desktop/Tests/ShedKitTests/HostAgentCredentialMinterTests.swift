@@ -58,6 +58,32 @@ final class HostAgentCredentialMinterTests: XCTestCase {
             hostAgent: client, expectsMtls: { expectsMtls }, capabilityWait: wait)
     }
 
+    /// Run a mint that must be refused by THROWING a `ShedError.Config`, and
+    /// return the sentence the user sees. The mechanism is asserted, not merely
+    /// tolerated: a capability refusal is an `Err` in the Rust minter, and the
+    /// `failed` arm is reserved for a refusal the AGENT explained in its own
+    /// words — a capability arm returning `failed` would be a silent divergence
+    /// from the twin.
+    private func thrownRefusal(
+        _ minter: HostAgentTokenMinter, server: String, csrBase64: String?,
+        file: StaticString = #filePath, line: UInt = #line
+    ) async -> String {
+        do {
+            let result = try await minter.mintCredential(server: server, csrBase64: csrBase64)
+            XCTFail("expected a THROWN refusal, got \(result)", file: file, line: line)
+            return ""
+        } catch let e as ShedRustCore.ShedError {
+            guard case .Config(let message) = e else {
+                XCTFail("expected the Config refusal, got \(e)", file: file, line: line)
+                return ""
+            }
+            return message
+        } catch {
+            XCTFail("expected a ShedError, got \(error)", file: file, line: line)
+            return ""
+        }
+    }
+
     // MARK: - pre-ack (capability .unknown)
 
     func testCapabilityIsUnknownUntilTheAckArrives() async throws {
@@ -72,11 +98,8 @@ final class HostAgentCredentialMinterTests: XCTestCase {
     func testPreAckMtlsMintRefusesInsteadOfSendingATokenGet() async throws {
         // The ack lands well after the minter's 200ms capability wait.
         try await withAgent(advertisesCredentialGet: true, helloAckDelayMs: 1_200) { client, fake in
-            let result = try await minter(client, expectsMtls: true).mintCredential(
-                server: "prod", csrBase64: Self.csr)
-            guard case .failed(let message) = result else {
-                return XCTFail("expected a refusal before the ack, got \(result)")
-            }
+            let message = await thrownRefusal(
+                minter(client, expectsMtls: true), server: "prod", csrBase64: Self.csr)
             XCTAssertTrue(
                 message.contains("connecting to shed-host-agent"),
                 "the pre-ack refusal must name the transient cause, got: \(message)")
@@ -91,15 +114,66 @@ final class HostAgentCredentialMinterTests: XCTestCase {
         }
     }
 
-    func testPreAckTokenServerKeepsTheLegacyTokenGetPath() async throws {
-        try await withAgent(advertisesCredentialGet: false, helloAckDelayMs: 600) { client, fake in
-            let result = try await minter(client, expectsMtls: false).mintCredential(
-                server: "prod", csrBase64: nil)
+    // MARK: - the token-mode cold path (plan 006 D5) — the wait runs for it too
+
+    func testPreAckTokenServerWaitsForTheAckThenSendsTheTokenGet() async throws {
+        // The ack lands INSIDE the wait: the mint proceeds exactly per the state
+        // it resolves to (an alive agent with a late ack still succeeds, at most
+        // `capabilityWait` later) — the half of the D5 trade that must not
+        // regress a working deployment.
+        try await withAgent(advertisesCredentialGet: false, helloAckDelayMs: 150) { client, fake in
+            let result = try await minter(client, expectsMtls: false, wait: .seconds(2))
+                .mintCredential(server: "prod", csrBase64: nil)
             guard case .token(let token) = result else {
                 return XCTFail("expected the token arm, got \(result)")
             }
             XCTAssertEqual(token.token, FakeHostAgent.defaultToken)
             XCTAssertEqual(fake.frameTypes(), ["hello", "token.get"])
+        }
+    }
+
+    func testPreAckTokenServerThatNeverAcksFailsWithTheSpecificSentence() async throws {
+        // The other half of the trade (accepted deliberately): a never-acking
+        // agent costs a token mint the bounded wait and then fails WITH a
+        // diagnosis, instead of firing a token.get into silence and failing later
+        // with the outer request bound's generic timeout (shed#297).
+        try await withAgent(advertisesCredentialGet: false, helloAckDelayMs: 5_000) { client, fake in
+            let message = await thrownRefusal(
+                minter(client, expectsMtls: false), server: "prod", csrBase64: nil)
+            XCTAssertTrue(
+                message.contains("connecting to shed-host-agent"),
+                "the refusal must name the transient cause, got: \(message)")
+            XCTAssertTrue(
+                message.contains("no credential for prod can be minted"),
+                "the token-mode wording must name the server, got: \(message)")
+            XCTAssertFalse(
+                message.contains("requires mtls"),
+                "a token-mode operator must not be sent debugging mtls: \(message)")
+            // (The fake hasn't drained the buffered `hello` yet — it acks late by
+            // construction here — so assert on what must NEVER appear.)
+            XCTAssertFalse(
+                fake.frameTypes().contains("token.get"),
+                "no token.get may go out into the silence")
+        }
+    }
+
+    func testOnlyOneCallerPerBurstPaysTheCapabilityWait() async throws {
+        // The negative-result memo: the provider serializes mints, so without it
+        // N queued callers would each pay a full wait and the later ones would
+        // blow their outer request bounds. The second mint inside the window
+        // fails FAST with the same sentence.
+        try await withAgent(advertisesCredentialGet: false, helloAckDelayMs: 5_000) { client, _ in
+            let m = minter(client, expectsMtls: false, wait: .milliseconds(600))
+            let first = ContinuousClock.now
+            _ = try? await m.mintCredential(server: "prod", csrBase64: nil)
+            let waited = first.duration(to: .now)
+            XCTAssertGreaterThan(waited, .milliseconds(400), "the first caller must pay the wait")
+
+            let second = ContinuousClock.now
+            let message = await thrownRefusal(m, server: "prod", csrBase64: nil)
+            let memoed = second.duration(to: .now)
+            XCTAssertLessThan(memoed, .milliseconds(300), "the memo must short-circuit the wait")
+            XCTAssertTrue(message.contains("connecting to shed-host-agent"), message)
         }
     }
 
@@ -118,17 +192,27 @@ final class HostAgentCredentialMinterTests: XCTestCase {
         }
     }
 
-    func testOldAgentMtlsServerRefusesWithAnUpgradeError() async throws {
+    func testOldAgentMtlsServerRefusesWithTheTypedUpgradeError() async throws {
         try await withAgent(advertisesCredentialGet: false, waitFor: .unsupported) { client, fake in
             let m = minter(client, expectsMtls: true)
             XCTAssertFalse(m.supportsMtls(), "an agent that cannot relay a CSR must not claim it can")
-            let result = try await m.mintCredential(server: "prod", csrBase64: nil)
-            guard case .failed(let message) = result else {
-                return XCTFail("expected a refusal, got \(result)")
+            do {
+                let result = try await m.mintCredential(server: "prod", csrBase64: nil)
+                return XCTFail("expected the typed refusal, got \(result)")
+            } catch let e as ShedRustCore.ShedError {
+                // TYPED, not a string (shed#300): presentation branches on the
+                // case to lead the banner with the remedy and to stop the empty
+                // state blaming ~/.shed/config.yaml.
+                guard case .AgentUpgradeRequired(let server, let detail) = e else {
+                    return XCTFail("expected AgentUpgradeRequired, got \(e)")
+                }
+                XCTAssertEqual(server, "prod")
+                XCTAssertTrue(detail.contains("does not support `credential.get`"), detail)
+                XCTAssertTrue(detail.contains("requires auth.mode: mtls"), detail)
+                XCTAssertTrue(
+                    HostFailure.displayMessage(for: e).hasPrefix("upgrade shed-host-agent"),
+                    "the rendered message must LEAD with the remedy")
             }
-            XCTAssertTrue(
-                message.contains("upgrade shed-host-agent"),
-                "the refusal must name the component to upgrade, got: \(message)")
             // No token.get: a bearer token cannot authenticate to an mtls server,
             // and asking for one would surface as an opaque 401/TLS alert instead.
             XCTAssertEqual(fake.frameTypes(), ["hello"])
@@ -247,11 +331,8 @@ final class HostAgentCredentialMinterTests: XCTestCase {
             }
             XCTAssertEqual(client.credentialCapability, .unknown)
 
-            let result = try await minter(client, expectsMtls: true).mintCredential(
-                server: "prod", csrBase64: Self.csr)
-            guard case .failed(let message) = result else {
-                return XCTFail("expected a refusal on a superseded connection, got \(result)")
-            }
+            let message = await thrownRefusal(
+                minter(client, expectsMtls: true), server: "prod", csrBase64: Self.csr)
             XCTAssertTrue(message.contains("connecting to shed-host-agent"), message)
             XCTAssertEqual(fake.frameTypes(), ["hello"], "nothing may be sent on a dead consumer slot")
         }

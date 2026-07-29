@@ -23,7 +23,10 @@ pub mod traits;
 
 pub use audit_store::AuditStore;
 pub use auth_modes::{AuthModeRegistry, AuthModeState};
-pub use backend::{Backend, HostDiskUsage, HostEgressProfiles, RcTarget, Reachability};
+pub use backend::{
+    Backend, HostDiskUsage, HostEgressProfiles, HostFailure, HostFailureKind, RcTarget,
+    Reachability,
+};
 #[cfg(feature = "broker")]
 pub use broker_bridge::{
     detect_mode, load_or_synthesize, probe_sockets, probe_sockets_at, resolve_mode, BrokerConfig,

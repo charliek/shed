@@ -8,9 +8,9 @@
 //! `AppHandle` (its methods are thread-safe) or the shared [`SharedUi`], so —
 //! unlike GTK — no main-thread marshalling channel is needed. The backend ops
 //! (`sheds.*` / `shed.*` / `create.*`, A1b) run on the shared [`Backend`], and
-//! `dashboard.dump` reads the sheds the frontend reported (UI truth, not a
-//! backend re-query), which is why `sheds.refresh` round-trips through the
-//! frontend before returning.
+//! `dashboard.dump` reads the sheds — plus the host-error strip + empty state —
+//! the frontend reported (UI truth, not a backend re-query), which is why
+//! `sheds.refresh` round-trips through the frontend before returning.
 
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -24,7 +24,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::runtime::Handle;
 
-use shed_app::{Backend, Coordinator, RcService};
+use shed_app::{Backend, Coordinator, Reachability, RcService};
 use shed_core::approval::{
     ApprovalChoice, ApprovalDecision, ApprovalMethod, ApprovalScope, PolicyRule, SshApprovalPolicy,
 };
@@ -49,6 +49,21 @@ const REFRESH_POLL: Duration = Duration::from_millis(15);
 /// Build an `(code, message)` error pair for the IPC error envelope.
 fn err(code: &str, message: impl Into<String>) -> (String, String) {
     (code.to_string(), message.into())
+}
+
+/// The sheds listing payload — `{sheds, host_errors}` — the one shape every
+/// listing answer takes: the `sheds.list` IPC op, the frontend's `list_sheds`
+/// command, and (from the frontend's committed snapshot rather than a fresh
+/// query) `sheds.refresh` / `dashboard.dump`. So the harness/`shedctl` and the
+/// WebView can never see a different shape.
+///
+/// `host_errors` is ADDITIVE (plan 006 D6 / shed#300): the `sheds` array keeps its
+/// pre-existing contract (healthy hosts' sheds, in host order), and the per-host
+/// failures that [`Backend::list_sheds`] drops on the floor are carried beside it
+/// — plural, because one failed host is not the only case. Healthy = `[]`, never
+/// absent, so a consumer can read it unconditionally.
+pub(crate) fn sheds_payload(r: &Reachability) -> Value {
+    json!({ "sheds": r.sheds, "host_errors": r.host_errors })
 }
 
 /// A required string param, or a `bad_request` error naming the missing key — the
@@ -254,6 +269,17 @@ impl Handler {
         self.ui.lock().ok().and_then(|s| s.get("main", key))
     }
 
+    /// The `{sheds, host_errors}` payload the DASHBOARD last committed — read from
+    /// its reported snapshot, never a fresh backend query. Shared by
+    /// `dashboard.dump` and `sheds.refresh` so both answer with the listing the UI
+    /// is actually showing.
+    fn reported_sheds_payload(&self) -> Value {
+        json!({
+            "sheds": self.ui_get("sheds").unwrap_or_else(|| json!([])),
+            "host_errors": self.ui_get("host_errors").unwrap_or_else(|| json!([])),
+        })
+    }
+
     /// Dispatch one op. `Ok(result)` → an `ok` envelope; `Err((code, message))` →
     /// an error envelope.
     pub async fn dispatch(&self, op: &str, params: &Value) -> Result<Value, (String, String)> {
@@ -300,10 +326,15 @@ impl Handler {
                 Ok(json!({}))
             }
             "app.screenshot" => self.screenshot().await,
-            "sheds.list" => Ok(json!({ "sheds": self.backend.list_sheds().await })),
+            "sheds.list" => Ok(sheds_payload(&self.backend.refresh().await)),
             "sheds.refresh" => self.sheds_refresh().await,
             "dashboard.dump" => {
-                Ok(json!({ "rows": self.ui_get("sheds").unwrap_or_else(|| json!([])) }))
+                let reported = self.reported_sheds_payload();
+                Ok(json!({
+                    "rows": reported["sheds"],
+                    "host_errors": reported["host_errors"],
+                    "empty": self.ui_get("empty").unwrap_or(Value::Null),
+                }))
             }
             "shed.start" => self.shed_action(params, "start").await,
             "shed.stop" => self.shed_action(params, "stop").await,
@@ -533,6 +564,19 @@ impl Handler {
     /// synchronous and the harness relies on that). Best-effort at the edges: if
     /// the frontend hasn't mounted yet (cold start) just emit and return — its
     /// mount-fetch populates the dashboard — and never hang if it's slow/gone.
+    ///
+    /// Answers with the SAME `{sheds, host_errors}` shape as `sheds.list`, taken
+    /// from the snapshot the frontend just committed — the echo this op already
+    /// waited for.
+    ///
+    /// SINGLE-REFRESH INVARIANT: exactly ONE host listing serves both the render
+    /// and this reply. Re-querying the backend here would (a) let the reply
+    /// disagree with what the user is looking at, and (b) stack a second
+    /// multi-host fetch on top of the frontend round-trip — worst case ~2×
+    /// `REFRESH_WAIT`, past the harness's per-op timeout. With no frontend (cold
+    /// start: nothing was emitted-to and nothing waited on) that one listing is a
+    /// direct backend read instead, since there is no UI snapshot to be
+    /// authoritative.
     async fn sheds_refresh(&self) -> Result<Value, (String, String)> {
         let token = self.refresh_seq.fetch_add(1, Ordering::SeqCst) + 1;
         // snapshot present ⟹ the frontend attached BOTH listeners then reported
@@ -540,13 +584,15 @@ impl Handler {
         let has_frontend = self.ui.lock().ok().is_some_and(|s| s.has("main"));
         let _ = self.app.emit("refresh", json!({ "token": token }));
         if !has_frontend {
-            return Ok(json!({}));
+            return Ok(sheds_payload(&self.backend.refresh().await));
         }
         let deadline = Instant::now() + REFRESH_WAIT;
         loop {
             let echoed = self.ui.lock().ok().map_or(0, |s| s.refresh_token("main"));
             if echoed >= token || Instant::now() >= deadline {
-                return Ok(json!({}));
+                // Timed out ⇒ the snapshot is the pre-refresh one; still the
+                // truthful answer to "what is the dashboard showing".
+                return Ok(self.reported_sheds_payload());
             }
             tokio::time::sleep(REFRESH_POLL).await;
         }
@@ -1278,7 +1324,89 @@ async fn handle_line(line: &str, handler: &Handler) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use shed_app::HostFailure;
+    use shed_core::http::ShedError;
     use std::path::PathBuf;
+
+    /// A `Reachability` as `Backend::refresh()` would return it, without needing a
+    /// live backend: `sheds` decoded from the wire shape, `host_errors` built
+    /// through the SAME `HostFailure::from_error` mapping the backend uses.
+    fn reachability(shed_names: &[(&str, &str)], failures: &[(&str, ShedError)]) -> Reachability {
+        let sheds = shed_names
+            .iter()
+            .map(|(host, name)| {
+                serde_json::from_value(json!({"host": host, "name": name, "status": "running"}))
+                    .expect("shed fixture decodes")
+            })
+            .collect();
+        let host_errors: Vec<HostFailure> = failures
+            .iter()
+            .map(|(host, e)| HostFailure::from_error(host, e))
+            .collect();
+        let last_error = match host_errors.as_slice() {
+            [] => None,
+            [only] => Some(only.summary.clone()),
+            many => Some(format!("{} hosts unreachable", many.len())),
+        };
+        Reachability {
+            sheds,
+            last_error,
+            host_errors,
+        }
+    }
+
+    #[test]
+    fn sheds_payload_carries_host_errors_for_two_failed_hosts() {
+        // The shape shed#300 needs: one host that needs a host-agent upgrade and
+        // one generic failure, BOTH present — the singular shape couldn't
+        // represent two failed hosts (plan 006 D6).
+        let r = reachability(
+            &[("mock", "alpha")],
+            &[
+                (
+                    "mini2",
+                    ShedError::AgentUpgradeRequired {
+                        server: "mini2".into(),
+                        detail: "the installed shed-host-agent has no credential.get".into(),
+                    },
+                ),
+                ("mini3", ShedError::BadStatus(500)),
+            ],
+        );
+        let p = sheds_payload(&r);
+
+        // The pre-existing `sheds` array is untouched (additive contract).
+        let sheds = p["sheds"].as_array().expect("sheds is an array");
+        assert_eq!(sheds.len(), 1);
+        assert_eq!(sheds[0]["name"], "alpha");
+        assert_eq!(sheds[0]["host"], "mock");
+
+        let errs = p["host_errors"].as_array().expect("host_errors is an array");
+        assert_eq!(errs.len(), 2, "both failed hosts survive: {p}");
+        assert_eq!(errs[0]["server"], "mini2");
+        assert_eq!(errs[0]["kind"], "agent_upgrade_required");
+        assert!(
+            errs[0]["summary"]
+                .as_str()
+                .unwrap()
+                .starts_with("Upgrade shed-host-agent"),
+            "the summary must lead with the remedy: {}",
+            errs[0]["summary"]
+        );
+        assert!(errs[0]["detail"].as_str().unwrap().contains("credential.get"));
+        assert_eq!(errs[1]["server"], "mini3");
+        assert_eq!(errs[1]["kind"], "other");
+        assert!(!errs[1]["summary"].as_str().unwrap().is_empty());
+    }
+
+    #[test]
+    fn sheds_payload_reports_no_host_errors_when_healthy() {
+        // Healthy hosts ⇒ `host_errors` is present-and-empty, never absent, so a
+        // consumer (the WebView strip, shedctl) can read it unconditionally.
+        let p = sheds_payload(&reachability(&[("mock", "alpha"), ("mock", "beta")], &[]));
+        assert_eq!(p["sheds"].as_array().unwrap().len(), 2);
+        assert_eq!(p["host_errors"], json!([]));
+    }
 
     #[test]
     fn rc_kind_parses_wire_value_or_rejects() {

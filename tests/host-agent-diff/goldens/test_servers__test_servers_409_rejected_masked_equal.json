@@ -1,0 +1,19 @@
+[
+  {
+    "name": "",
+    "namespaces": [
+      {
+        "namespace": "docker-credentials",
+        "since": "<ts>",
+        "state": "connected"
+      },
+      {
+        "last_error": "namespace already has an active subscriber: ",
+        "namespace": "ssh-agent",
+        "since": "<ts>",
+        "state": "rejected"
+      }
+    ],
+    "url": "<bus>"
+  }
+]

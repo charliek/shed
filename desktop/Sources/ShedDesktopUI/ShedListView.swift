@@ -11,10 +11,14 @@ struct ShedListView: View {
             HStack(spacing: 8) {
                 Text("Sheds").font(.system(size: 26, weight: .bold)).foregroundStyle(Theme.text)
                 if let err = state.lastError {
+                    // One line, and the summary leads with the REMEDY (plan 006
+                    // D6), so truncation eats the context rather than the action.
+                    // The full cause is the sidebar tooltip + the DiagnosticLog.
                     Label(err, systemImage: "exclamationmark.triangle")
                         .font(.system(size: 11))
                         .foregroundStyle(Theme.attention)
                         .lineLimit(1)
+                        .help(state.lastFailure?.detail ?? err)
                 }
                 Spacer()
                 Button {
@@ -48,17 +52,31 @@ struct ShedListView: View {
         }
     }
 
+    /// A host failure whose cause the app RECOGNIZES, if any — the empty state
+    /// defers to it rather than blaming ~/.shed/config.yaml (shed#300).
+    private var knownHostFailure: HostFailure? {
+        state.hosts.compactMap(\.failure).first { $0.kind != .other }
+    }
+
     private var emptyState: some View {
         VStack(spacing: 8) {
             Spacer()
             Image(systemName: "tray").font(.system(size: 26)).foregroundStyle(Theme.textMuted)
-            Text(state.hosts.contains(where: \.reachable)
-                 ? "No sheds across the reachable hosts."
-                 : "No reachable hosts. Check ~/.shed/config.yaml and that shed-server is running.")
+            // `AppState.shedsEmptyState` owns the choice of sentence (and is what
+            // `ui.state` reports), so the rendered text and the observable one
+            // cannot drift.
+            Text(state.shedsEmptyState)
                 .font(.system(size: 12))
                 .foregroundStyle(Theme.textSecondary)
                 .multilineTextAlignment(.center)
                 .frame(maxWidth: 320)
+            if let known = knownHostFailure, !state.hosts.contains(where: \.reachable) {
+                Text(known.detail)
+                    .font(.system(size: 11))
+                    .foregroundStyle(Theme.textMuted)
+                    .multilineTextAlignment(.center)
+                    .frame(maxWidth: 340)
+            }
             Button("Reconnect") { state.onReconnect?() }
                 .buttonStyle(.plain)
                 .font(.system(size: 12, weight: .medium))

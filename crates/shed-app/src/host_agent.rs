@@ -389,9 +389,10 @@ impl HostAgentClient {
     /// Wait (bounded) for this connection to learn its capability, returning the
     /// first non-`Unknown` snapshot or the still-unknown one on timeout.
     ///
-    /// Only an mtls-expecting mint should pay this: a token-mode server learns
-    /// nothing useful from the ack and keeps every shipped build's immediate
-    /// `token.get`.
+    /// Every mint pays this pre-ack (plan 006 D5 — a `token.get` fired before
+    /// the ack spends its whole reply timeout to learn less); the minter's
+    /// negative-result memo keeps serialized callers from each re-paying it
+    /// against a wedged or absent agent.
     pub async fn await_credential_capability(&self, timeout: Duration) -> CapabilitySnapshot {
         let mut rx = self.inner.cap_tx.subscribe();
         // Re-read under the lock first: the ack may have landed between the
@@ -1096,6 +1097,18 @@ mod tests {
         }
     }
 
+    /// The minimal hello for tests that care only about the CONNECTION (no
+    /// approval seam, no replay) — the credential/minter rows below.
+    fn bare_hello() -> HelloClientInfo {
+        HelloClientInfo {
+            name: "t".into(),
+            version: "1".into(),
+            pid: 1,
+            capabilities: vec![],
+            replay_events: 0,
+        }
+    }
+
     #[tokio::test]
     async fn handshake_emits_connected() {
         let agent = TestAgent::start();
@@ -1645,13 +1658,7 @@ mod tests {
         use crate::token_minter::HostAgentTokenMinter;
         use shed_core::token::{CredentialRequest, MintedCredential, TokenMinter};
 
-        let hello = || HelloClientInfo {
-            name: "t".into(),
-            version: "1".into(),
-            pid: 1,
-            capabilities: vec![],
-            replay_events: 0,
-        };
+        let hello = bare_hello;
 
         // --- unsupported + expects mtls: the honest "upgrade shed-host-agent". ---
         let agent = TestAgent::start();
@@ -1673,9 +1680,15 @@ mod tests {
             .mint_credential("mini2", &CredentialRequest::default())
             .await
             .unwrap_err();
+        // The TYPED case (plan 006 D6), not a string: presentation branches on
+        // it for the remedy-first banner + empty-state deference (shed#300).
         assert!(
-            format!("{e:?}").contains("upgrade shed-host-agent"),
+            matches!(&e, shed_core::http::ShedError::AgentUpgradeRequired { server, .. } if server == "mini2"),
             "an OLD agent + an mtls server is a real upgrade case: {e:?}"
+        );
+        assert!(
+            e.to_string().starts_with("upgrade shed-host-agent"),
+            "remedy must lead: {e}"
         );
         assert!(agent.credential_gets().is_empty());
         client.stop();
@@ -1727,6 +1740,39 @@ mod tests {
             modes.expects_mtls("mini2"),
             "the minter must record the mode it just saw, without waiting for the observer"
         );
+        client.stop();
+    }
+
+    /// Plan 006 D5's other half of the token-mode trade-off: the unconditional
+    /// pre-ack wait must not cost an ALIVE agent anything but latency. The mint
+    /// starts before the ack has landed (capability `Unknown`), the ack resolves
+    /// the wait mid-window, and the legacy token.get proceeds and succeeds.
+    #[tokio::test]
+    async fn pre_ack_token_mint_proceeds_when_the_ack_lands_inside_the_wait() {
+        use crate::auth_modes::AuthModeRegistry;
+        use crate::token_minter::HostAgentTokenMinter;
+        use shed_core::token::{CredentialRequest, MintedCredential, TokenMinter};
+
+        let agent = TestAgent::start();
+        let client = agent.client(Arc::new(FixedClock));
+        let _events = client.start(bare_hello());
+        // Deliberately NO wait_hello / capability wait here: the mint itself
+        // races the ack, which is the cold-launch window under test. A generous
+        // capability_wait keeps a slow CI machine from turning the race into a
+        // false Unknown timeout.
+        let modes = Arc::new(AuthModeRegistry::new());
+        modes.record("mini2", shed_core::token::AuthMode::Token);
+        let minter = HostAgentTokenMinter::new(client.clone())
+            .with_modes(modes)
+            .with_capability_wait(Duration::from_secs(5));
+        match minter
+            .mint_credential("mini2", &CredentialRequest::default())
+            .await
+            .unwrap()
+        {
+            MintedCredential::Token(t) => assert_eq!(t.token, "fake-tok-1"),
+            other => panic!("expected the token.get to proceed after the ack, got {other:?}"),
+        }
         client.stop();
     }
 

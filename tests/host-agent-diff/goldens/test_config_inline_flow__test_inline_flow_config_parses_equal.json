@@ -1,0 +1,21 @@
+{
+  "approval_channel": {
+    "consumer_connected": false,
+    "socket_path": "<dir>/host-agent.sock"
+  },
+  "config_path": "<config_path>",
+  "gate_namespaces": [
+    "ssh-agent"
+  ],
+  "pid": "<pid>",
+  "policies": {
+    "aws-credentials": "approve-all",
+    "docker-credentials": "deny-all",
+    "ssh-agent": "shed-desktop"
+  },
+  "schema": 1,
+  "servers": [],
+  "started_at": "<ts>",
+  "version": "<version>",
+  "written_at": "<ts>"
+}

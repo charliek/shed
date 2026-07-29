@@ -74,12 +74,14 @@ fn ui_report(
 }
 
 /// The WebView's live shed list — `invoke("list_sheds")` on mount + on each
-/// `refresh` event. Returns host-stamped sheds (all configured hosts, concurrently
-/// via the shared `Backend`); the harness reads the same data via the `sheds.list`
-/// IPC op.
+/// `refresh` event. Returns `{sheds, host_errors}`: host-stamped sheds (all
+/// configured hosts, concurrently via the shared `Backend`) PLUS the per-host
+/// failures, so a host that can't be listed is surfaced instead of silently
+/// dropped (plan 006 D6 / shed#300). Same payload the harness reads via the
+/// `sheds.list` IPC op — [`ipc::sheds_payload`] is the single shaper.
 #[tauri::command]
 async fn list_sheds(backend: tauri::State<'_, Arc<Backend>>) -> Result<serde_json::Value, String> {
-    Ok(serde_json::json!(backend.list_sheds().await))
+    Ok(ipc::sheds_payload(&backend.refresh().await))
 }
 
 /// The configured hosts a create can target (the New-Shed dialog's picker) — even

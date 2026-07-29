@@ -233,6 +233,22 @@ func testClientConfig(t *testing.T) string {
 	return cfgPath
 }
 
+// putServerEntry installs an entry in BOTH the in-memory config and the file on
+// disk, which is the state every real command starts from.
+//
+// It matters because the credential persist re-verifies its target under the
+// config lock, against a FRESH read of config.yaml: an entry that exists only
+// in this process's memory looks exactly like one another process just removed,
+// and the persist correctly refuses to resurrect it.
+func putServerEntry(t *testing.T, name string, entry config.ServerEntry) {
+	t.Helper()
+	if err := clientConfig.Update(func(c *config.ClientConfig) {
+		c.Servers[name] = entry
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
 // stubBootstrap installs a bootstrap that returns mint()'s credential and
 // counts the calls. testClientConfig restores the original on cleanup, so every
 // test that stubs the bootstrap must call that first.
@@ -279,7 +295,7 @@ func TestMTLSClientAuthenticatesEndToEnd(t *testing.T) {
 	m := newMTLSServer(t)
 	cred := m.credential(t, "cli-key", farFromExpiry)
 	entry := mtlsEntry(t, m, "srv", cred)
-	clientConfig.Servers["srv"] = entry
+	putServerEntry(t, "srv", entry)
 
 	mints := stubBootstrap(func() sdk.Credential { return m.credential(t, "cli-key", farFromExpiry) })
 
@@ -321,7 +337,7 @@ func TestExpiredClientCertTriggersExactlyOneSilentRemint(t *testing.T) {
 		expired := m.credential(t, "cli-key", alreadyExpired)
 		entry := mtlsEntry(t, m, "srv", expired)
 		entry.ClientCertExpiresAt = time.Now().Add(24 * time.Hour) // a lie: nothing proactive fires
-		clientConfig.Servers["srv"] = entry
+		putServerEntry(t, "srv", entry)
 
 		mints := stubBootstrap(func() sdk.Credential { return m.credential(t, "cli-key", farFromExpiry) })
 
@@ -350,7 +366,7 @@ func TestExpiredClientCertTriggersExactlyOneSilentRemint(t *testing.T) {
 		m := newMTLSServer(t)
 
 		expired := m.credential(t, "cli-key", alreadyExpired)
-		clientConfig.Servers["srv"] = mtlsEntry(t, m, "srv", expired)
+		putServerEntry(t, "srv", mtlsEntry(t, m, "srv", expired))
 
 		mints := stubBootstrap(func() sdk.Credential { return m.credential(t, "cli-key", farFromExpiry) })
 
@@ -379,7 +395,7 @@ func TestExpiredClientCertTriggersExactlyOneSilentRemint(t *testing.T) {
 		if err := os.Remove(entry.ClientCertFile); err != nil {
 			t.Fatal(err)
 		}
-		clientConfig.Servers["srv"] = entry
+		putServerEntry(t, "srv", entry)
 
 		mints := stubBootstrap(func() sdk.Credential { return m.credential(t, "cli-key", farFromExpiry) })
 
@@ -406,7 +422,7 @@ func TestTransportSurvivesRotation(t *testing.T) {
 	m := newMTLSServer(t)
 
 	first := m.credential(t, "cli-key", farFromExpiry)
-	clientConfig.Servers["srv"] = mtlsEntry(t, m, "srv", first)
+	putServerEntry(t, "srv", mtlsEntry(t, m, "srv", first))
 
 	second := m.credential(t, "cli-key", farFromExpiry)
 	if second.Bundle.CertSerial == first.Bundle.CertSerial || second.Bundle.CertSerial == "" {
@@ -464,14 +480,14 @@ func TestModeFlipTokenToMTLS(t *testing.T) {
 	cfgPath := testClientConfig(t)
 	m := newMTLSServer(t)
 
-	clientConfig.Servers["srv"] = config.ServerEntry{
+	putServerEntry(t, "srv", config.ServerEntry{
 		Host: "127.0.0.1", SSHPort: 2222,
 		APIURL:                m.srv.URL,
 		TLSCertFingerprint:    m.pin,
 		AuthMode:              config.AuthModeToken,
 		ControlToken:          "shed_ctl_stale",
 		ControlTokenExpiresAt: time.Now().Add(24 * time.Hour), // far from expiry: only the reactive path can fire
-	}
+	})
 
 	issued := m.credential(t, "cli-key", farFromExpiry)
 	mints := stubBootstrap(func() sdk.Credential { return issued })
@@ -538,7 +554,7 @@ func TestModeFlipMTLSToToken(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	clientConfig.Servers["srv"] = config.ServerEntry{
+	putServerEntry(t, "srv", config.ServerEntry{
 		Host: "127.0.0.1", SSHPort: 2222,
 		APIURL:              srv.URL,
 		TLSCertFingerprint:  pin,
@@ -546,7 +562,7 @@ func TestModeFlipMTLSToToken(t *testing.T) {
 		ClientCertFile:      certPath,
 		ClientKeyFile:       keyPath,
 		ClientCertExpiresAt: time.Now().Add(24 * time.Hour), // far from expiry: reactive path only
-	}
+	})
 
 	newExpiry := time.Now().Add(24 * time.Hour)
 	mints := stubBootstrap(func() sdk.Credential {
@@ -612,11 +628,11 @@ func TestCredentialLessEntryEnrolls(t *testing.T) {
 
 		// Exactly what an older client leaves behind: endpoint + pin, no
 		// credential fields at all.
-		clientConfig.Servers["srv"] = config.ServerEntry{
+		putServerEntry(t, "srv", config.ServerEntry{
 			Host: "127.0.0.1", SSHPort: 2222,
 			APIURL:             m.srv.URL,
 			TLSCertFingerprint: m.pin,
-		}
+		})
 
 		issued := m.credential(t, "cli-key", farFromExpiry)
 		mints := stubBootstrap(func() sdk.Credential { return issued })
@@ -688,11 +704,11 @@ func TestCredentialLessEntryEnrolls(t *testing.T) {
 		defer srv.Close()
 		pin := servertls.Fingerprint(srv.Certificate().Raw)
 
-		clientConfig.Servers["srv"] = config.ServerEntry{
+		putServerEntry(t, "srv", config.ServerEntry{
 			Host: "127.0.0.1", SSHPort: 2222,
 			APIURL:             srv.URL,
 			TLSCertFingerprint: pin,
-		}
+		})
 
 		newExpiry := time.Now().Add(24 * time.Hour)
 		mints := stubBootstrap(func() sdk.Credential {
@@ -742,7 +758,7 @@ func TestCredentialLessEntryEnrolls(t *testing.T) {
 		defer srv.Close()
 
 		host, port := hostPortOf(t, srv.URL)
-		clientConfig.Servers["srv"] = config.ServerEntry{Host: host, HTTPPort: port, SSHPort: 2222}
+		putServerEntry(t, "srv", config.ServerEntry{Host: host, HTTPPort: port, SSHPort: 2222})
 
 		mints := stubBootstrap(func() sdk.Credential { return sdk.Credential{} })
 
@@ -770,8 +786,8 @@ func TestNamedEntryEnrollsWithDuplicateEndpointAlias(t *testing.T) {
 		APIURL:             "https://localhost:18443",
 		TLSCertFingerprint: m.pin,
 	}
-	clientConfig.Servers["my-server-dev"] = entry
-	clientConfig.Servers["dev-mtls"] = entry
+	putServerEntry(t, "my-server-dev", entry)
+	putServerEntry(t, "dev-mtls", entry)
 
 	issued := m.credential(t, "cli-key", farFromExpiry)
 	mints := stubBootstrap(func() sdk.Credential { return issued })
@@ -868,7 +884,7 @@ func TestTunnelCredentialSourceRefreshIsMintOnly(t *testing.T) {
 		APIURL:             "https://localhost:18443",
 		TLSCertFingerprint: m.pin,
 	}
-	clientConfig.Servers["dev-mtls"] = entry
+	putServerEntry(t, "dev-mtls", entry)
 	client := newAPIClientWithSource(
 		entry.BaseURL(),
 		entry.TLSCertFingerprint,
@@ -948,7 +964,7 @@ func TestReauthDropsPooledConnection(t *testing.T) {
 	m := newMTLSServer(t)
 
 	first := m.credential(t, "cli-key", farFromExpiry)
-	clientConfig.Servers["srv"] = mtlsEntry(t, m, "srv", first)
+	putServerEntry(t, "srv", mtlsEntry(t, m, "srv", first))
 
 	second := m.credential(t, "cli-key", farFromExpiry)
 	mints := stubBootstrap(func() sdk.Credential { return second })

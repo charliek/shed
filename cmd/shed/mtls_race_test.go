@@ -64,7 +64,7 @@ func TestRequestTransmitsTheGenerationItRecorded(t *testing.T) {
 		m := newMTLSServer(t)
 
 		captured := m.credential(t, "cli-key", farFromExpiry)
-		clientConfig.Servers["srv"] = mtlsEntry(t, m, "srv", captured)
+		putServerEntry(t, "srv", mtlsEntry(t, m, "srv", captured))
 
 		racing := m.credential(t, "cli-key", farFromExpiry)
 		if racing.Bundle.CertSerial == captured.Bundle.CertSerial {
@@ -123,14 +123,14 @@ func TestRequestTransmitsTheGenerationItRecorded(t *testing.T) {
 		}))
 		defer srv.Close()
 
-		clientConfig.Servers["srv"] = config.ServerEntry{
+		putServerEntry(t, "srv", config.ServerEntry{
 			Host: "127.0.0.1", SSHPort: 2222,
 			APIURL:                srv.URL,
 			TLSCertFingerprint:    servertls.Fingerprint(srv.Certificate().Raw),
 			AuthMode:              config.AuthModeToken,
 			ControlToken:          "captured",
 			ControlTokenExpiresAt: time.Now().Add(24 * time.Hour), // far from expiry: nothing proactive fires
-		}
+		})
 		mints := stubBootstrap(func() sdk.Credential {
 			return sdk.Credential{Bundle: sdk.Bundle{
 				AuthMode: sdk.AuthModeToken, HTTPSPort: 443, Scope: "control",
@@ -174,7 +174,7 @@ func TestReauthRetriesWithTheCredentialRefreshReturned(t *testing.T) {
 	m := newMTLSServer(t)
 
 	stale := m.credential(t, "cli-key", farFromExpiry)
-	clientConfig.Servers["srv"] = mtlsEntry(t, m, "srv", stale)
+	putServerEntry(t, "srv", mtlsEntry(t, m, "srv", stale))
 
 	replacement := m.credential(t, "cli-key", farFromExpiry)
 	mints := stubBootstrap(func() sdk.Credential { return replacement })
@@ -216,17 +216,21 @@ func TestPersistTokenCredentialDeletesOnlyAfterASuccessfulSave(t *testing.T) {
 		cfgPath := testClientConfig(t)
 		certPath, keyPath := mtlsEntryForFlip(t)
 
-		// Make Save fail without touching permissions (so the test behaves the
-		// same as root): SaveToPath renames its temp file onto cfgPath, and a
-		// rename onto a directory always fails.
+		// Make the config update fail without touching permissions (so the test
+		// behaves the same as root): put a DIRECTORY where config.yaml has to
+		// be. Update reads the file and then renames a temp file onto it, and
+		// neither can be done to a directory.
+		if err := os.Remove(cfgPath); err != nil {
+			t.Fatal(err)
+		}
 		if err := os.MkdirAll(cfgPath, 0700); err != nil {
 			t.Fatal(err)
 		}
-		if err := clientConfig.Save(); err == nil {
-			t.Fatal("test setup: Save was expected to fail")
+		if err := clientConfig.Update(func(*config.ClientConfig) {}); err == nil {
+			t.Fatal("test setup: the config update was expected to fail")
 		}
 
-		persistTokenCredential("srv", "fresh-token", time.Now().Add(24*time.Hour))
+		persistTokenCredential("srv", clientConfig.Servers["srv"], "fresh-token", time.Now().Add(24*time.Hour))
 
 		for _, p := range []string{certPath, keyPath} {
 			if _, err := os.Stat(p); err != nil {
@@ -241,7 +245,7 @@ func TestPersistTokenCredentialDeletesOnlyAfterASuccessfulSave(t *testing.T) {
 		testClientConfig(t)
 		certPath, keyPath := mtlsEntryForFlip(t)
 
-		persistTokenCredential("srv", "fresh-token", time.Now().Add(24*time.Hour))
+		persistTokenCredential("srv", clientConfig.Servers["srv"], "fresh-token", time.Now().Add(24*time.Hour))
 
 		if got := clientConfig.Servers["srv"]; got.AuthMode != config.AuthModeToken || got.ControlToken != "fresh-token" {
 			t.Errorf("entry did not migrate to token mode: %+v", got)
@@ -265,7 +269,7 @@ func mtlsEntryForFlip(t *testing.T) (certPath, keyPath string) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	clientConfig.Servers["srv"] = config.ServerEntry{
+	putServerEntry(t, "srv", config.ServerEntry{
 		Host: "127.0.0.1", SSHPort: 2222,
 		APIURL:              m.srv.URL,
 		TLSCertFingerprint:  m.pin,
@@ -273,7 +277,7 @@ func mtlsEntryForFlip(t *testing.T) (certPath, keyPath string) {
 		ClientCertFile:      certPath,
 		ClientKeyFile:       keyPath,
 		ClientCertExpiresAt: cred.Bundle.ExpiresAt,
-	}
+	})
 	return certPath, keyPath
 }
 
@@ -293,7 +297,7 @@ func TestMismatchedStoredPairReEnrolls(t *testing.T) {
 	if err := os.WriteFile(entry.ClientKeyFile, other.KeyPEM, 0600); err != nil {
 		t.Fatal(err)
 	}
-	clientConfig.Servers["srv"] = entry
+	putServerEntry(t, "srv", entry)
 
 	issued := m.credential(t, "cli-key", farFromExpiry)
 	mints := stubBootstrap(func() sdk.Credential { return issued })

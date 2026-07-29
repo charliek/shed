@@ -1,12 +1,12 @@
-"""A fake shed-desktop app for the surface-A differential tests.
+"""A fake shed-desktop app for the surface-A wire tests.
 
 Drives the desktop approval channel (`<socketDir>/host-agent.sock`, the always-on
 protocol-v2 NDJSON UDS server) exactly as the real shed-desktop app would: connect,
 send a `hello`, and read the newline-delimited typed frames the agent sends back
 (`hello_ack`, `approval_request`, `event`, `ping`, `token.response`). A background
 reader thread records every inbound frame and auto-answers `ping` with `pong` (the
-server treats `pong` as liveness-only — Go `desktop_server.go:287`, Rust
-`DesktopInbound::Pong`), so a slow test can't strand the keepalive.
+server treats `pong` as liveness-only — `DesktopInbound::Pong`), so a slow test can't
+strand the keepalive.
 
 Design mirrors `conftest.py`'s plain-`socket`/blocking style. Every client is a
 context manager that connects on enter and closes on exit (the socket is always
@@ -189,7 +189,7 @@ class DesktopClient:
                 self._cond.notify_all()
 
     def _auto_pong(self, ping: dict) -> None:
-        """Answer a server `ping` with a `pong` (liveness-only for both impls). Best
+        """Answer a server `ping` with a `pong` (liveness-only). Best
         effort: a closed socket just means the keepalive no longer matters."""
         try:
             reply = {"type": "pong", "v": 2}

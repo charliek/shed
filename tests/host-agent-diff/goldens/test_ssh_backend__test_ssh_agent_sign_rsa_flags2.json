@@ -1,0 +1,28 @@
+{
+  "response": {
+    "final": true,
+    "id": "<id>",
+    "in_reply_to": "rsa-1",
+    "namespace": "ssh-agent",
+    "payload": {
+      "blob": "aGFkaWZmLWNhbm5lZC1yc2Etc2lnbmF0dXJlLWJsb2ItdjE=",
+      "format": "rsa-sha2-256",
+      "rest": ""
+    },
+    "shed": {
+      "backend": "vz",
+      "name": "web",
+      "server": "mini2"
+    },
+    "timestamp": "<ts>",
+    "type": "response"
+  },
+  "transcript": [
+    {
+      "data_b64": "c2hlZC1ob3N0LWFnZW50IHNzaC1iYWNrZW5kIGRpZmZlcmVudGlhbCBjaGFsbGVuZ2UgdjE=",
+      "flags": 2,
+      "key_b64": "AAAAB3NzaC1yc2EAAAADAQABAAABAQCiRtypkVRGUS3w4E+ylwnHsfpibFplmuXStZ10SyPZSwTc2AI9RUKDX0JugXyXGMArSBsfmSd1oTMyY+ExJwB7bwmg+r8imkLQaqAm4KmNferH8xqcnpx+Y7TO7+SdtxoNaBTV4PzKfd8wruwubEtEFbtoFdSCVd+YP1F1D008hZNgEXqX5AvzwQjhGY+l3SGzH10WgzQek74k0DIcj/oyD3YSeWneKpppoqVZ0MJjeZrTTSq8FLZK4dSRLFN+dllqiitMtEsmflMmii077vYgBX/PBLrDHuIgtvBTaSmsWl49vVkKHyG11bbhvGVjUchN4ZgLvJHuejHpVU8PSKYD",
+      "type": 13
+    }
+  ]
+}

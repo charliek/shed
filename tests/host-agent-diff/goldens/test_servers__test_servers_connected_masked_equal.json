@@ -1,0 +1,18 @@
+[
+  {
+    "name": "",
+    "namespaces": [
+      {
+        "namespace": "docker-credentials",
+        "since": "<ts>",
+        "state": "connected"
+      },
+      {
+        "namespace": "ssh-agent",
+        "since": "<ts>",
+        "state": "connected"
+      }
+    ],
+    "url": "<bus>"
+  }
+]

@@ -128,7 +128,14 @@ _SSE_POLL = 0.1
 
 
 class MockShedServer:
-    def __init__(self):
+    def __init__(self, require_auth: bool = False):
+        # When set, every /api/* route answers 401 unless the request carried an
+        # Authorization header (plan 006 D6): the AUTH-SHAPED refusal a secure
+        # shed-server gives a client that presented nothing. It is what lets the
+        # harness observe a failed control-credential mint as a per-host failure
+        # instead of a silently-successful open-mode request. Constructor-only —
+        # `reset()` must not clear it (the instance IS the secure server).
+        self.require_auth = require_auth
         # The app's background poller reads this state from handler threads
         # concurrently with test setup mutating it, so all access is guarded.
         self._lock = threading.Lock()
@@ -350,6 +357,18 @@ class MockShedServer:
                 self.end_headers()
                 self.wfile.write(payload)
 
+            def _unauthorized(self) -> bool:
+                """A secure-server 401 for an unauthenticated /api request (the
+                mock's whole auth model: presented something, or did not)."""
+                if not state.require_auth:
+                    return False
+                if not urlsplit(self.path).path.startswith("/api/"):
+                    return False
+                if self.headers.get("Authorization"):
+                    return False
+                self._send(401, {"error": "unauthorized"})
+                return True
+
             def _body(self) -> dict:
                 length = int(self.headers.get("Content-Length", 0))
                 if not length:
@@ -357,6 +376,8 @@ class MockShedServer:
                 return json.loads(self.rfile.read(length) or b"{}")
 
             def do_GET(self):
+                if self._unauthorized():
+                    return
                 path = urlsplit(self.path).path
                 # -- plugin message-bus routes (leg 3a.2) --
                 if path == _EGRESS_PATH:
@@ -456,6 +477,8 @@ class MockShedServer:
                 self.end_headers()
 
             def do_POST(self):
+                if self._unauthorized():
+                    return
                 path = urlsplit(self.path).path
                 m = _RESPOND_RE.match(path)
                 if m:
@@ -475,6 +498,8 @@ class MockShedServer:
                     self._send(404, {"error": "not found"})
 
             def do_DELETE(self):
+                if self._unauthorized():
+                    return
                 parts = self.path.strip("/").split("/")
                 if len(parts) == 3 and parts[:2] == ["api", "sheds"]:
                     self._send(200 if state._delete(parts[2]) else 404, {"ok": True})

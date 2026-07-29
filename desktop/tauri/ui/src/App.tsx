@@ -24,8 +24,8 @@ import {
   fetchEgressProfiles, reportEgress, inTauri,
   openPreferences, setAppearanceState,
   rcLaunch, rcKill, reportAgents, useRcSessions,
-  useCoordinatorData, useNowTick,
-  type Pane, type Shed, type HostDiskUsage,
+  useCoordinatorData, useNowTick, shedsEmptyState,
+  type Pane, type Shed, type HostDiskUsage, type HostFailure,
   type Modal, type CreateProgress, type Approval, type AuditEntry,
   type EgressProfile, type EgressProfileInfo, type HostEgressProfiles, type EgressReport,
   type RcSession, type RcKind, type RcState,
@@ -104,8 +104,28 @@ function HostLabel({ host }: { host: string }) {
 }
 
 /* ---- Sheds pane ----------------------------------------------------------- */
-function ShedsPane({ sheds, refresh, onNew }: { sheds: Shed[]; refresh: () => void; onNew: () => void }) {
+/** The per-host failure strip above the shed list: one row per host that couldn't
+ *  be listed, leading with the remedy (`summary`), the full context on hover
+ *  (`detail`). Without it a failed host is silently absent from the pane and the
+ *  user reads an empty dashboard as "nothing to see" (shed#300). */
+function HostErrorStrip({ errors }: { errors: HostFailure[] }) {
+  return (
+    <div className="mb-[18px] flex flex-col gap-2">
+      {errors.map((e) => (
+        <div key={e.server} title={e.detail} className={cn(cardCls, "flex items-start gap-2.5 px-[18px] py-3")}>
+          <Dot className="mt-[5px] h-2 w-2 flex-none" style={{ background: "var(--shed-danger)" }} />
+          <div className="min-w-0 break-words font-mono text-[12px] leading-relaxed" style={{ color: "var(--shed-danger)" }}>{e.summary}</div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function ShedsPane({ sheds, hostErrors, refresh, onNew }: { sheds: Shed[]; hostErrors: HostFailure[]; refresh: () => void; onNew: () => void }) {
   const act = (action: string, s: Shed) => void shedAction(action, s.name, s.host).then(refresh);
+  // The empty state defers to a host failure when there is one — same helper the
+  // bridge reports as UI truth, so the pane and `dashboard.dump.empty` agree.
+  const empty = shedsEmptyState(sheds, hostErrors);
   return (
     <div>
       <PageHead
@@ -117,8 +137,9 @@ function ShedsPane({ sheds, refresh, onNew }: { sheds: Shed[]; refresh: () => vo
           </div>
         }
       />
-      {sheds.length === 0 ? (
-        <Empty icon={Boxes} title="No sheds yet" body="No sheds on the configured hosts. Create one to spin up an isolated dev environment." />
+      {hostErrors.length > 0 && <HostErrorStrip errors={hostErrors} />}
+      {empty ? (
+        <Empty icon={Boxes} title={empty.title} body={empty.body} />
       ) : (
         groupByHost(sheds).map(([host, rows]) => (
           <div key={host} className="mb-[22px] last:mb-0">
@@ -1048,7 +1069,7 @@ export default function App() {
   // The bridge owns the single full `ui_report`; hand it the badge inputs (sheds
   // derived there, hosts/agents/pending from here) and the mode so the report is one
   // complete snapshot, never a partial that races the `main` slot / tray count.
-  const { sheds, refresh } = useUiBridge(pane, setPane, modal, mode, agentCount, hostCount, pending);
+  const { sheds, hostErrors, refresh } = useUiBridge(pane, setPane, modal, mode, agentCount, hostCount, pending);
 
   // Apply the appearance to the root BEFORE the bridge's report effect samples it (a
   // layout effect runs ahead of that passive effect), so `ui.computed_style` reflects
@@ -1096,7 +1117,13 @@ export default function App() {
   // Sidebar hosts = the configured hosts with reachability (from system_df), NOT the
   // sheds-derived set — so zero-shed hosts still appear, the System badge counts
   // configured hosts, and each dot reflects real reachability.
-  const hosts = hostRows.map((h) => ({ name: h.host, reachable: h.usage != null }));
+  // …each carrying the shed-listing failure for that host (if any) as its dot
+  // tooltip — the remedy plus the full detail the strip demotes to hover.
+  const hosts = hostRows.map((h) => ({
+    name: h.host,
+    reachable: h.usage != null,
+    failure: hostErrors.find((e) => e.server === h.host),
+  }));
 
   return (
     <div className="flex h-full">
@@ -1143,7 +1170,11 @@ export default function App() {
           <span className="font-mono text-[10px] font-semibold tracking-[.1em] text-shed-text-muted">HOSTS</span>
         </div>
         {hosts.map((h) => (
-          <div key={h.name} className="flex items-center gap-2.5 px-2.5 py-1.5 text-[13px] font-medium text-shed-text">
+          <div
+            key={h.name}
+            title={h.failure ? `${h.failure.summary}\n\n${h.failure.detail}` : undefined}
+            className="flex items-center gap-2.5 px-2.5 py-1.5 text-[13px] font-medium text-shed-text"
+          >
             <Dot className="h-2 w-2" style={{ background: h.reachable ? "var(--shed-ok)" : "var(--shed-text-muted)" }} />
             <span className="truncate">{h.name}</span>
           </div>
@@ -1173,7 +1204,7 @@ export default function App() {
         </header>
         <main className="flex-1 overflow-auto bg-shed-bg px-[38px] pb-6 pt-7">
           <div data-pane={pane} className="mx-auto max-w-[880px]">
-            {pane === "sheds" && <ShedsPane sheds={sheds} refresh={refresh} onNew={() => setModal("create")} />}
+            {pane === "sheds" && <ShedsPane sheds={sheds} hostErrors={hostErrors} refresh={refresh} onNew={() => setModal("create")} />}
             {pane === "approvals" && <ApprovalsPane approvals={approvals} />}
             {pane === "agents" && <AgentsPane sessions={rcSessions} onLaunch={() => setModal("launch")} refresh={refreshRc} />}
             {pane === "activity" && <ActivityPane />}

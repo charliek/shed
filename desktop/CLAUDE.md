@@ -135,10 +135,9 @@ Test pointers:
   /api/plugins/listeners/{ns}/respond`), shape-pinned against
   `tests/host-agent-diff`'s synthetic bus and `docs/development/host-agent-wire-catalog.md`
   so the fakes can't drift independently.
-- The Go-vs-Rust differential harness (`make test-host-agent-diff`, 108 cells) still
-  protects the extracted `shed-broker` core itself — it doesn't know about the
-  embedded path, only that the standalone daemon built from the same lib is
-  wire-identical.
+- The `tests/host-agent-diff` wire harness (`make test-host-agent-diff`) still protects
+  the extracted `shed-broker` core itself — it doesn't know about the embedded path,
+  only that the standalone daemon built from the same lib matches its pinned goldens.
 
 ## mTLS credentials
 

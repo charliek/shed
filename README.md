@@ -36,7 +36,7 @@ Three binaries:
 
 - **`shed`** — the CLI on your developer machine.
 - **`shed-server`** — the daemon on each host (HTTP API + SSH server) that runs VMs via the VZ (macOS) or Firecracker (Linux) backend.
-- **`shed-host-agent`** — optional host-side credential broker (built in-tree from `cmd/shed-host-agent`); on macOS it pairs with the [shed-desktop](https://charliek.github.io/shed/desktop/) approval app (in this monorepo under `desktop/`, with its shared Rust client core under `crates/`).
+- **`shed-host-agent`** — optional host-side credential broker (built in-tree from `crates/shed-host-agent`); on macOS it pairs with the [shed-desktop](https://charliek.github.io/shed/desktop/) approval app (in this monorepo under `desktop/`, with its shared Rust client core under `crates/`).
 
 ```text
 Developer Machine                Remote Server / Local Mac

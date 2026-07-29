@@ -1,5 +1,6 @@
 """tauri-only down-host E2E: a per-host UNREACHABLE server surfaces as an error
-row end-to-end (the Egress pane's error rows + the System pane's per-host df),
+row end-to-end (the Egress pane's error rows, the System pane's per-host df, and
+— shed#300 — the Sheds pane's host-error strip + its failure-aware empty state),
 while the reachable `mock` host stays healthy.
 
 This is the e2e closure of the gap `test_tauri.py::test_egress_profiles_render`
@@ -10,7 +11,9 @@ socket + single-instance lock (keyed to the socket dir), so it coexists with the
 session instance without touching the session fixture — pointed at the dedicated
 down-host fixture (`config-downhost.yaml`: servers `mock` + `down`) with `down`
 named in the `SHED_TAURI_MOCK_UNREACHABLE_HOSTS` override (the backend redirects
-it to a closed port → deterministic ECONNREFUSED).
+it to a closed port → deterministic ECONNREFUSED). A second fixture
+(`config-alldown.yaml`, BOTH servers overridden) covers the every-host-down case:
+zero sheds + two failures, where the empty state must defer to the failures.
 
 Gated on `--target tauri` (skipped otherwise), like `test_tauri.py`.
 """
@@ -37,12 +40,14 @@ pytestmark = pytest.mark.skipif(
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
 DOWNHOST_CONFIG = FIXTURES / "config-downhost.yaml"
+ALLDOWN_CONFIG = FIXTURES / "config-alldown.yaml"
 
 
 @contextmanager
-def _downhost_app(mock_base_url: str):
+def _downhost_app(mock_base_url: str, *, config: Path = DOWNHOST_CONFIG,
+                  unreachable: tuple[str, ...] = ("down",)):
     """Launch a SECOND, independent tauri instance (its own throwaway HOME +
-    XDG_RUNTIME_DIR → its own socket/lock) with the down-host fixture + the `down`
+    XDG_RUNTIME_DIR → its own socket/lock) with a down-host fixture + the matching
     unreachable override, yield a ready client, and tear it down. Reuses the shared
     `ui` subprocess helpers (env / hermetic-wait / terminate) but passes its OWN
     socket/proc, so it never touches ui._state (the session instance's
@@ -65,8 +70,8 @@ def _downhost_app(mock_base_url: str):
         sock = runtime_dir / cfg.sock_rel
         log = runtime_dir / "downhost-ui.log"
         env = ui.subproc_env(cfg, runtime_dir=runtime_dir, mock_base_url=mock_base_url,
-                             config_path=DOWNHOST_CONFIG, host_agent_socket=agent.socket_path,
-                             unreachable_hosts=("down",))
+                             config_path=config, host_agent_socket=agent.socket_path,
+                             unreachable_hosts=unreachable)
         log_fh = open(log, "wb")
         proc = subprocess.Popen([str(cfg.binary)], env=env, stdout=log_fh, stderr=subprocess.STDOUT)
         try:
@@ -94,6 +99,16 @@ def downhost(mock):
     — and its private fake host-agent — is throwaway. The session `fake` fixture is
     deliberately NOT requested, so this module never perturbs it."""
     with _downhost_app(mock.base_url) as client:
+        yield client
+
+
+@pytest.fixture
+def alldown(mock):
+    """A ready client for an instance where EVERY configured host is unreachable
+    (`config-alldown.yaml`, both servers overridden) — zero listable sheds plus two
+    per-host failures, the empty-state-deference + two-failed-hosts shape."""
+    with _downhost_app(mock.base_url, config=ALLDOWN_CONFIG,
+                       unreachable=("down1", "down2")) as client:
         yield client
 
 
@@ -137,6 +152,61 @@ def test_badges_count_both_configured_hosts(downhost):
     downhost.wait_until(lambda: (downhost.badges() or {}).get("hosts") == 2,
                         timeout=15, what="badges report 2 configured hosts")
     assert downhost.badges()["hosts"] == 2
+
+
+def test_sheds_host_error_strip_renders_above_the_list(downhost):
+    # shed#300: the failed host used to be silently filter_mapped away — the Sheds
+    # pane showed the reachable host's sheds and NOTHING about `down`. Now
+    # `sheds.list` carries it and the pane renders a strip row for it ABOVE the
+    # (non-empty) list, so the empty state is not what's being asserted here.
+    # The mock's closed-port simulation is a transport failure → kind `other`
+    # (the AgentUpgradeRequired kind is pinned at the Rust unit level —
+    # ipc.rs::sheds_payload_carries_host_errors_for_two_failed_hosts).
+    errs = downhost.sheds_host_errors()
+    assert [e["server"] for e in errs] == ["down"], f"unexpected host_errors: {errs}"
+    assert errs[0]["kind"] == "other"
+    assert errs[0]["summary"].startswith("down: "), f"summary must name the host: {errs[0]}"
+    assert errs[0]["detail"], f"strip row has no hover detail: {errs[0]}"
+    # …and the rows the reachable host serves are untouched by the failure.
+    assert downhost.sheds_list(), "the reachable mock host's sheds vanished"
+
+    # UI truth: the pane RENDERED that strip alongside a non-empty list (so no
+    # empty state is showing).
+    downhost.wait_until(lambda: len(downhost.dashboard_dump()["host_errors"]) == 1,
+                        timeout=15, what="host-error strip rendered")
+    d = downhost.dashboard_dump()
+    assert d["rows"], f"the reachable host's rows are missing: {d}"
+    assert d["empty"] is None, f"a non-empty list must render no empty state: {d}"
+    assert d["host_errors"][0]["summary"] == errs[0]["summary"]
+
+
+def test_empty_state_defers_to_host_failures(alldown):
+    # Every host down ⇒ zero sheds. The generic "No sheds yet" copy would tell a
+    # user everything is fine and they simply haven't created one — the exact
+    # config-blaming failure mode shed#300 is about. With TWO failures the empty
+    # state leads with the unreachability and lists both summaries.
+    alldown.wait_until(lambda: len(alldown.dashboard_dump()["host_errors"]) == 2,
+                       timeout=20, what="both host failures rendered")
+    d = alldown.dashboard_dump()
+    assert d["rows"] == [], f"no host is reachable, so no rows: {d}"
+    assert {e["server"] for e in d["host_errors"]} == {"down1", "down2"}, f"unexpected: {d}"
+    empty = d["empty"]
+    assert empty is not None, "the Sheds pane rendered no empty state"
+    assert empty["title"] == "Some hosts are unreachable", f"unexpected empty state: {empty}"
+    assert "No sheds yet" not in empty["title"]
+    for e in d["host_errors"]:
+        assert e["summary"] in empty["body"], f"{e['summary']!r} missing from {empty['body']!r}"
+
+
+def test_sheds_refresh_returns_the_same_payload_as_list(alldown):
+    # `sheds.refresh` (drive the frontend, wait for the echo) answers with the SAME
+    # {sheds, host_errors} shape as `sheds.list`, so a refreshing caller can't be
+    # handed a payload that omits the failures. The values come from the snapshot
+    # the frontend just committed — ONE listing serves both the render and this
+    # reply (no second backend fetch stacked on the round-trip).
+    r = alldown.call("sheds.refresh")
+    assert r["sheds"] == []
+    assert {e["server"] for e in r["host_errors"]} == {"down1", "down2"}, f"unexpected: {r}"
 
 
 def test_identify_stays_hermetic(downhost, mock):

@@ -101,6 +101,14 @@ class IPCClient:
         params = {"host": host} if host else {}
         return self.call("sheds.list", params)["sheds"]
 
+    def sheds_host_errors(self, host: str | None = None) -> list[dict]:
+        """The per-host failures `sheds.list` carries beside the rows
+        (`[{server, kind, summary, detail}]`) — a host that couldn't be listed is
+        surfaced, not silently dropped (shed#300). Tauri-only for now; absent on a
+        client that doesn't publish it → []."""
+        params = {"host": host} if host else {}
+        return self.call("sheds.list", params).get("host_errors", [])
+
     def sheds_refresh(self) -> None:
         """Re-fetch + re-render the dashboard so the UI-truth op reflects it."""
         self.call("sheds.refresh")
@@ -394,6 +402,12 @@ class TauriClient(_ApprovalOps, _RcOps, _RustCoreClient):
         """The RC sessions the Agents pane rendered — the drivable `agents.dump`
         UI truth (empty unless the UI is on the agents pane)."""
         return self.call("agents.dump")["sessions"]
+
+    def dashboard_dump(self) -> dict:
+        """The Sheds pane's full UI truth: `{rows, host_errors, empty}` — the shed
+        rows, the rendered host-error strip, and the rendered empty state
+        (`{title, body}`, null when the list rendered or another pane is up)."""
+        return self.call("dashboard.dump")
 
     def provider_modes_get(self) -> dict:
         """The AWS/Docker provider approval modes ({namespace: 'approve'|'deny'}) —

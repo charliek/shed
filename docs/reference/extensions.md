@@ -319,7 +319,7 @@ for env := range ch {
 
 The `extensions` and `full` images come with shed's credential extensions pre-installed, providing SSH agent forwarding, AWS credential proxying, and Docker credential brokering. `extensions` is the lightweight starting point (base OS + credential extensions + Docker creds helper, no coding agents); `full` layers the coding agents on top. Create a shed with `--image extensions` (or `--image full` for the kitchen-sink default), enable extensions in your server config, and run the host agent to enable credential brokering.
 
-These extensions are concrete implementations built on the plugin bus above, and their source lives in this repository (`cmd/shed-ext-*`, `cmd/shed-host-agent`, `internal/ext/`). See the Extensions reference for setup and usage:
+These extensions are concrete implementations built on the plugin bus above, and their source lives in this repository (`cmd/shed-ext-*`, `internal/ext/` for the guest side; `crates/shed-host-agent` and `crates/shed-broker` for the host-side broker). See the Extensions reference for setup and usage:
 
 - [Architecture](../extensions/architecture.md) — component layout and message flows
 - [Configuration](../extensions/configuration.md) — host agent `extensions.yaml`

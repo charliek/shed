@@ -350,19 +350,23 @@ impl Backend {
     /// surfaces the rollup); the Tauri client surfaces `last_error`.
     pub async fn refresh(&self) -> Reachability {
         let mut sheds = Vec::new();
-        let mut errors = Vec::new();
+        let mut host_errors = Vec::new();
         for (name, result) in self.per_host(async |c: &Client| c.list_sheds().await).await {
             match result {
                 Ok(mut s) => sheds.append(&mut s),
-                Err(e) => errors.push(format!("{name}: {e}")),
+                Err(e) => host_errors.push(HostFailure::from_error(&name, &e)),
             }
         }
-        let last_error = match errors.len() {
-            0 => None,
-            1 => errors.into_iter().next(),
-            n => Some(format!("{n} hosts unreachable")),
+        let last_error = match host_errors.as_slice() {
+            [] => None,
+            [only] => Some(only.summary.clone()),
+            many => Some(format!("{} hosts unreachable", many.len())),
         };
-        Reachability { sheds, last_error }
+        Reachability {
+            sheds,
+            last_error,
+            host_errors,
+        }
     }
 
     /// Per-host disk usage (`GET /api/system/df`) for the System pane. Unlike
@@ -527,6 +531,61 @@ fn known_hosts_path() -> String {
 pub struct Reachability {
     pub sheds: Vec<Shed>,
     pub last_error: Option<String>,
+    /// The per-host failures in presentation shape — plural, because one failed
+    /// host is not the only case (plan 006 D6). `last_error` stays as the
+    /// pre-existing string rollup; consumers that can render structure use this.
+    pub host_errors: Vec<HostFailure>,
+}
+
+/// One host's failure in presentation shape (plan 006 D6 / shed#300): `kind` is
+/// what a UI branches on, `summary` is the one-line banner text with the REMEDY
+/// FIRST (banners truncate from the end), `detail` is the tooltip/log body.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct HostFailure {
+    pub server: String,
+    pub kind: HostFailureKind,
+    pub summary: String,
+    pub detail: String,
+}
+
+/// The known causes a UI treats specially. `Other` is the open set — an
+/// unrecognized failure renders generically but still names its host.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HostFailureKind {
+    AgentUpgradeRequired,
+    Other,
+}
+
+impl HostFailure {
+    /// Presentation mapping for one host's error. The typed
+    /// [`ShedError::AgentUpgradeRequired`] keeps its remedy as the whole
+    /// summary; everything else leads with the host name so multi-host strips
+    /// stay scannable.
+    pub fn from_error(server: &str, e: &ShedError) -> Self {
+        match e {
+            ShedError::AgentUpgradeRequired {
+                server: for_server,
+                detail,
+            } => Self {
+                server: server.to_string(),
+                kind: HostFailureKind::AgentUpgradeRequired,
+                summary: format!(
+                    "Upgrade shed-host-agent — it can't obtain a certificate for {for_server}."
+                ),
+                detail: detail.clone(),
+            },
+            other => {
+                let detail = other.to_string();
+                Self {
+                    server: server.to_string(),
+                    kind: HostFailureKind::Other,
+                    summary: format!("{server}: {detail}"),
+                    detail,
+                }
+            }
+        }
+    }
 }
 
 /// One host's disk usage, or the error that host returned — the System pane shows
@@ -568,6 +627,31 @@ mod tests {
     fn client_at(name: &str, base_url: String) -> (String, Client) {
         let client = Client::new(base_url, name.to_string(), String::new(), None, None).unwrap();
         (name.to_string(), client)
+    }
+
+    /// The presentation mapping (plan 006 D6 / shed#300): the typed upgrade
+    /// case leads with the remedy and keeps its kind; everything else names its
+    /// host and stays `Other`.
+    #[test]
+    fn host_failure_presentation_mapping() {
+        let up = HostFailure::from_error(
+            "dev-mtls",
+            &ShedError::AgentUpgradeRequired {
+                server: "dev-mtls".into(),
+                detail: "does not support `credential.get`".into(),
+            },
+        );
+        assert_eq!(up.kind, HostFailureKind::AgentUpgradeRequired);
+        assert!(
+            up.summary.starts_with("Upgrade shed-host-agent"),
+            "{}",
+            up.summary
+        );
+        assert!(up.detail.contains("credential.get"), "{}", up.detail);
+
+        let other = HostFailure::from_error("mini3", &ShedError::BadStatus(500));
+        assert_eq!(other.kind, HostFailureKind::Other);
+        assert!(other.summary.starts_with("mini3: "), "{}", other.summary);
     }
 
     fn server_entry(name: &str) -> shed_core::config::ShedServerEntry {

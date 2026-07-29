@@ -88,8 +88,8 @@ The Tauri (Linux) client mirrors these with a `SHED_TAURI_*` prefix
 | `SHED_DESKTOP_DMG_FANCY` | `=1` uses `create-dmg` for a styled DMG (off on headless runners). |
 | `SHED_DESKTOP_TAG` / `_APPCAST` / `_SIGN_FILE` / `_REPO` / `_MIN_MACOS` | Inputs to `scripts/update-appcast.py` (tag, appcast path, Sparkle signature file, `owner/repo`, min macOS). |
 
-`scripts/live-verify.sh` builds the real Go host-agent from the in-repo
-`cmd/shed-host-agent` (the credential broker now lives in this monorepo); no
+`scripts/live-verify.sh` builds the real Rust host-agent from the in-repo
+`crates/shed-host-agent` (the credential broker lives in this monorepo); no
 external checkout is needed.
 
 See [RELEASING.md](https://github.com/charliek/shed/blob/main/desktop/RELEASING.md) for the

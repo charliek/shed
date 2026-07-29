@@ -1,0 +1,19 @@
+# Seed shed config for the agent-upgrade E2E module (test_agent_upgrade.py).
+#
+# ONE server, cached by the CLI as an mtls server. The module launches the app
+# with `mtlshost` named in SHED_DESKTOP_MOCK_CREDENTIAL_HOSTS, so the entry keeps
+# its real control-credential wiring (the fake host-agent + this auth_mode)
+# against a mock that answers 401 — the shape a secure shed-server presents to a
+# client that could not mint anything. With the fake agent advertising no
+# `credential.get` (an OLD agent), the mint fails with the typed
+# AgentUpgradeRequired error and the whole banner/empty-state chain is
+# observable. Kept SEPARATE from config.yaml so the shared suite sees no such
+# host.
+servers:
+    mtlshost:
+        host: 127.0.0.1
+        http_port: 8080
+        ssh_port: 2222
+        auth_mode: mtls
+default_server: mtlshost
+sheds: {}

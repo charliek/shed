@@ -8,8 +8,8 @@
 # See RELEASING.md "Component selection" for the selector law and the flow.
 # Boilerplate is duplicated across the three (goreleaser `includes` is Pro-only).
 #
-# No before-hooks: this component builds Rust (+ Go rollback) and ships no deb,
-# so there is nothing to render. Keeping before-hooks empty also guarantees this
+# No before-hooks: this component builds Rust and ships no deb, so there is
+# nothing to render. Keeping before-hooks empty also guarantees this
 # invocation never mutates a tracked file between the server and machine-rc runs.
 
 version: 2
@@ -21,46 +21,13 @@ project_name: shed
 dist: dist/host-agent
 
 builds:
-  - id: shed-host-agent-darwin
-    binary: shed-host-agent
-    main: ./cmd/shed-host-agent
-    env:
-      - CGO_ENABLED=1
-    goos:
-      - darwin
-    goarch:
-      - amd64
-      - arm64
-    ldflags:
-      - -s -w
-      - -X github.com/charliek/shed/internal/version.Version={{.Version}}
-      - -X github.com/charliek/shed/internal/version.GitCommit={{.ShortCommit}}
-      - -X github.com/charliek/shed/internal/version.BuildDate={{.Date}}
-
-  - id: shed-host-agent-linux
-    binary: shed-host-agent
-    main: ./cmd/shed-host-agent
-    env:
-      - CGO_ENABLED=0
-    goos:
-      - linux
-    goarch:
-      - amd64
-      - arm64
-    ldflags:
-      - -s -w
-      - -X github.com/charliek/shed/internal/version.Version={{.Version}}
-      - -X github.com/charliek/shed/internal/version.GitCommit={{.ShortCommit}}
-      - -X github.com/charliek/shed/internal/version.BuildDate={{.Date}}
-
   # The SHIPPED host-agent binary — Rust (crates/shed-host-agent), built by
   # goreleaser's OSS `builder: rust` (which runs `cargo zigbuild`) on the
   # macos-latest release runner; it cross-compiles all four targets, linux via
-  # zig (probe-proven: linux ELF from macOS). The two Go ids above stay defined
-  # (goreleaser compiles every build regardless of archive refs) as ~2-release
-  # rollback insurance, but are detached from the archive below — flip
-  # archives[shed-host-agent].ids back to them to revert. See RELEASING.md
-  # "Host-agent: Rust binary, Go rollback". No `main:` (rust builder rejects it).
+  # zig (probe-proven: linux ELF from macOS). The Go twin (cmd/shed-host-agent)
+  # was sunset — see plan 006-mtls-cleanup-hostagent-sunset.md; the
+  # post-removal rollback procedure is a prior-release brew formula reinstall,
+  # documented in RELEASING.md. No `main:` (rust builder rejects it).
   - id: shed-host-agent
     builder: rust
     binary: shed-host-agent
@@ -98,10 +65,9 @@ builds:
 
 archives:
   - id: shed-host-agent
-    # Ships the RUST build (id: shed-host-agent) — the Go ids
-    # (shed-host-agent-{darwin,linux}) stay defined + compiled as rollback
-    # insurance; flip this back to them to revert. Archive name/layout and the
-    # bundled extensions.example.yaml are UNCHANGED (install-identity anchor).
+    # Ships the RUST build (id: shed-host-agent) — the only build in this
+    # config since the Go twin's sunset. Archive name/layout and the bundled
+    # extensions.example.yaml are UNCHANGED (install-identity anchor).
     ids:
       - shed-host-agent
     formats:

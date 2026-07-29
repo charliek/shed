@@ -36,6 +36,15 @@ public final class ShedBackend {
     /// error row is exercisable e2e. Empty unless test mode + the var is set.
     public private(set) var mockUnreachableHosts: Set<String> = []
 
+    /// TEST-ONLY: the comma-separated server names from
+    /// `SHED_DESKTOP_MOCK_CREDENTIAL_HOSTS` (parsed only in test mode) that keep
+    /// their REAL control-credential wiring against the mock — the host agent and
+    /// the config's `auth_mode`, instead of the tokenless open-mode shortcut every
+    /// other mock host takes. It is what makes the mint→refusal→banner chain
+    /// (plan 006 D5/D6) exercisable end to end against the fake host agent, with
+    /// a mock that answers 401. Empty unless test mode + the var is set.
+    public private(set) var mockCredentialHosts: Set<String> = []
+
     /// Route read/lifecycle/create ops through the Rust shed-core. Default **on**
     /// (M0); `SHED_DESKTOP_RUST_CORE=0` forces the legacy Swift `URLSession` path
     /// (a rollback escape hatch kept for ≥2 releases). Reported by `identify` as
@@ -51,6 +60,14 @@ public final class ShedBackend {
     /// Overridable via `SHED_DESKTOP_HOST_AGENT_SOCKET` so the test fake
     /// can stand in for the real host agent.
     public private(set) var hostAgentSocketPath: String = ""
+
+    /// A comma-separated server-name list from the environment.
+    private static func hostSet(_ raw: String?) -> Set<String> {
+        Set(
+            (raw ?? "").split(separator: ",")
+                .map { $0.trimmingCharacters(in: .whitespaces) }
+                .filter { !$0.isEmpty })
+    }
 
     private var started = false
 
@@ -82,12 +99,9 @@ public final class ShedBackend {
         // Only consulted in the mock branch; parse it only in test mode so a stray
         // env var can never affect a production run.
         self.mockUnreachableHosts = self.testMode
-            ? Set(
-                (env["SHED_DESKTOP_MOCK_UNREACHABLE_HOSTS"] ?? "")
-                    .split(separator: ",")
-                    .map { $0.trimmingCharacters(in: .whitespaces) }
-                    .filter { !$0.isEmpty })
-            : []
+            ? Self.hostSet(env["SHED_DESKTOP_MOCK_UNREACHABLE_HOSTS"]) : []
+        self.mockCredentialHosts = self.testMode
+            ? Self.hostSet(env["SHED_DESKTOP_MOCK_CREDENTIAL_HOSTS"]) : []
 
         let home = (env["HOME"] ?? NSHomeDirectory()) as NSString
         self.shedConfigPath = env["SHED_DESKTOP_SHED_CONFIG"]

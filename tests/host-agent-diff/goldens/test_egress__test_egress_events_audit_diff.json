@@ -1,0 +1,10 @@
+{
+  "approval": "",
+  "detail": "evil.com:443 (1.2.3.4)",
+  "ns": "egress",
+  "op": "https",
+  "reason": "default-deny",
+  "result": "deny",
+  "shed": "web",
+  "ts": "2020-01-01T00:00:00Z"
+}

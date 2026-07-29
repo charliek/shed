@@ -258,8 +258,7 @@ func runCreate(cmd *cobra.Command, args []string) error {
 	}
 
 	// Cache the shed location
-	clientConfig.CacheShed(name, serverName, shed.Status)
-	if err := clientConfig.Save(); err != nil {
+	if err := cacheShedLocation(name, serverName, shed.Status); err != nil {
 		fmt.Fprintf(os.Stderr, "Warning: failed to save cache: %v\n", err)
 	}
 
@@ -358,8 +357,6 @@ func runList(cmd *cobra.Command, args []string) error {
 			}
 			for _, shed := range resp.Sheds {
 				allSheds = append(allSheds, shedWithServer{shed: shed, server: name})
-				// Update cache
-				clientConfig.CacheShed(shed.Name, name, shed.Status)
 			}
 		}
 	} else {
@@ -370,13 +367,20 @@ func runList(cmd *cobra.Command, args []string) error {
 		}
 		for _, shed := range resp.Sheds {
 			allSheds = append(allSheds, shedWithServer{shed: shed, server: serverName})
-			// Update cache
-			clientConfig.CacheShed(shed.Name, serverName, shed.Status)
 		}
 	}
 
-	// Save updated cache
-	if err := clientConfig.Save(); err != nil {
+	// Save the updated cache in ONE locked update: the mutation closure runs
+	// against the fresh on-disk snapshot and then against the in-memory one, so
+	// it has to be a pure function of the config it is handed — collected rows
+	// rather than work interleaved with the calls above, and one timestamp
+	// taken here rather than a fresh time.Now() per application.
+	cachedAt := time.Now()
+	if err := updateClientConfig(func(c *config.ClientConfig) {
+		for _, s := range allSheds {
+			c.CacheShedAt(s.shed.Name, s.server, s.shed.Status, cachedAt)
+		}
+	}); err != nil {
 		if verboseLevel > 0 {
 			fmt.Fprintf(os.Stderr, "Warning: failed to save cache: %v\n", err)
 		}
@@ -714,8 +718,9 @@ func runDelete(cmd *cobra.Command, args []string) error {
 	}
 
 	// Remove from cache
-	clientConfig.RemoveShedCache(name)
-	if err := clientConfig.Save(); err != nil {
+	if err := updateClientConfig(func(c *config.ClientConfig) {
+		c.RemoveShedCache(name)
+	}); err != nil {
 		if verboseLevel > 0 {
 			fmt.Fprintf(os.Stderr, "Warning: failed to save cache: %v\n", err)
 		}
@@ -760,8 +765,7 @@ func runStart(cmd *cobra.Command, args []string) error {
 	}
 
 	// Update cache
-	clientConfig.CacheShed(name, serverName, shed.Status)
-	if err := clientConfig.Save(); err != nil {
+	if err := cacheShedLocation(name, serverName, shed.Status); err != nil {
 		if verboseLevel > 0 {
 			fmt.Fprintf(os.Stderr, "Warning: failed to save cache: %v\n", err)
 		}
@@ -803,8 +807,7 @@ func runStop(cmd *cobra.Command, args []string) error {
 	}
 
 	// Update cache
-	clientConfig.CacheShed(name, serverName, shed.Status)
-	if err := clientConfig.Save(); err != nil {
+	if err := cacheShedLocation(name, serverName, shed.Status); err != nil {
 		if verboseLevel > 0 {
 			fmt.Fprintf(os.Stderr, "Warning: failed to save cache: %v\n", err)
 		}
@@ -842,23 +845,15 @@ func stopTunnelsForShed(name string) {
 }
 
 // findShedServer finds which server hosts a shed.
-// It first checks the cache, then queries servers if not found.
+// An explicit --server flag wins unconditionally, even if the shed is cached
+// under a different server — the cache is consulted only in the unqualified
+// form (no --server flag). In the unqualified form it checks the cache first,
+// then queries servers if not found there.
 func findShedServer(name string) (string, *config.ServerEntry, error) {
-	// Check cache first
-	if cachedServer, err := clientConfig.GetShedServer(name); err == nil {
-		entry, err := clientConfig.GetServer(cachedServer)
-		if err == nil {
-			// Verify the shed still exists
-			client := NewAPIClientFromNamedEntry(cachedServer, entry, DefaultTimeout)
-			if _, err := client.GetShed(name); err == nil {
-				return cachedServer, entry, nil
-			}
-			// Shed not found on cached server, clear cache and search
-			clientConfig.RemoveShedCache(name)
-		}
-	}
-
-	// If --server flag is set, only check that server
+	// If --server flag is set, only check that server. This must be checked
+	// BEFORE the cache: an explicit --server naming a server other than the
+	// one the shed is cached under must win, not be silently overridden by
+	// the cache (#298).
 	if serverFlag != "" {
 		entry, err := clientConfig.GetServer(serverFlag)
 		if err != nil {
@@ -872,6 +867,20 @@ func findShedServer(name string) (string, *config.ServerEntry, error) {
 			return "", nil, fmt.Errorf("shed %q not found on %s", name, serverFlag)
 		}
 		return serverFlag, entry, nil
+	}
+
+	// Check cache first (unqualified form only)
+	if cachedServer, err := clientConfig.GetShedServer(name); err == nil {
+		entry, err := clientConfig.GetServer(cachedServer)
+		if err == nil {
+			// Verify the shed still exists
+			client := NewAPIClientFromNamedEntry(cachedServer, entry, DefaultTimeout)
+			if _, err := client.GetShed(name); err == nil {
+				return cachedServer, entry, nil
+			}
+			// Shed not found on cached server, clear cache and search
+			clientConfig.RemoveShedCache(name)
+		}
 	}
 
 	// Try default server first

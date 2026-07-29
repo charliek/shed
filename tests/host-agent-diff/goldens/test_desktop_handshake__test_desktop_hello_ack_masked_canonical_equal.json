@@ -1,0 +1,24 @@
+{
+  "accepted": true,
+  "agent": {
+    "approval_method": "shed-desktop",
+    "version": "<version>"
+  },
+  "agent_capabilities": [
+    "credential.get"
+  ],
+  "gate_namespaces": [
+    "ssh-agent"
+  ],
+  "id": "<id>",
+  "namespaces": [
+    "ssh-agent",
+    "aws-credentials",
+    "docker-credentials",
+    "egress"
+  ],
+  "request_timeout_ms": 25000,
+  "ts": "<ts>",
+  "type": "hello_ack",
+  "v": 2
+}

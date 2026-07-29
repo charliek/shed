@@ -1,0 +1,30 @@
+{
+  "audit": {
+    "approval": "approve-all",
+    "code": "CREDENTIALS_NOT_FOUND",
+    "detail": "ghcr.io",
+    "ns": "docker-credentials",
+    "op": "get",
+    "reason": "no credentials found for \"ghcr.io\"",
+    "result": "anonymous",
+    "shed": "web",
+    "ts": "<ts>"
+  },
+  "response": {
+    "final": true,
+    "id": "<id>",
+    "in_reply_to": "nf-1",
+    "namespace": "docker-credentials",
+    "payload": {
+      "code": "CREDENTIALS_NOT_FOUND",
+      "error": "credential request failed"
+    },
+    "shed": {
+      "backend": "vz",
+      "name": "web",
+      "server": "mini2"
+    },
+    "timestamp": "<ts>",
+    "type": "response"
+  }
+}

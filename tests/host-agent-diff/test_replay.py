@@ -1,18 +1,18 @@
-"""The event replay ring differential (A2) — the `replay_events`-on-connect surface.
+"""The event replay ring (A2) — the `replay_events`-on-connect surface.
 
-The desktop server buffers EVERY audit `event` frame into a bounded ring (`ringMax`
-/ `RING_MAX = 100`) **regardless of whether a consumer is connected** (Go
-`desktop_server.go:forwardAudit`, Rust `desktop.rs:publish_audit`, wired from the
-audit sink `audit.rs:JsonlAuditSink::log`). When a fresh consumer connects with
+The desktop server buffers EVERY audit `event` frame into a bounded ring
+(`RING_MAX = 100`) **regardless of whether a consumer is connected**
+(`desktop.rs:publish_audit`, wired from the audit sink
+`audit.rs:JsonlAuditSink::log`). When a fresh consumer connects with
 `hello.replay_events: N > 0`, the server replays the last `N` buffered frames
-verbatim (each keeps its ORIGINAL `id`/`ts` — Go re-marshals the stored `eventMsg`,
-Rust re-sends the stored serialized bytes) before the live stream continues.
+verbatim (each keeps its ORIGINAL `id`/`ts` — the stored serialized bytes are
+re-sent) before the live stream continues.
 
-This drives it end-to-end on BOTH daemons: with NO desktop consumer connected, a
-non-gated audit-producing bus op (ssh `list`, `approval: none`, no gate) buffers an
-`event` in each ring; THEN a consumer connects requesting replay and both daemons
-replay the SAME buffered frame (`mask_event`-equal, id/ts masked). A subsequent live
-`list` then fans out to the now-connected consumer — the buffered-then-live path.
+This drives it end-to-end: with NO desktop consumer connected, a non-gated
+audit-producing bus op (ssh `list`, `approval: none`, no gate) buffers an `event` in
+the ring; THEN a consumer connects requesting replay and the buffered frame is
+replayed (golden-pinned via `mask_event`, id/ts masked). A subsequent live `list`
+then fans out to the now-connected consumer — the buffered-then-live path.
 
 Single-server mode (`server:` at the synthetic bus), `ssh.mode: local-keys` with the
 committed ed25519 key installed so `list` reports `1 keys`. The `list` op is ungated
@@ -67,7 +67,7 @@ def _connect_and_replay(
 ) -> tuple[DesktopClient, dict]:
     """Connect a desktop consumer requesting replay of the last `replay_n` events and
     return `(client, replayed_event)` once a buffered `event` is replayed. Reconnects
-    until the ring append has landed: Go's `forwardAudit` appends to the ring on a
+    until the ring append has landed: the audit fan-out appends to the ring on a
     goroutine, so the durable audit line (which we wait for first) can precede the ring
     append by a scheduling hop; replay is one-shot per `hello`, so a connect that raced
     an empty ring is retried on a fresh connection (the ring persists — replay only

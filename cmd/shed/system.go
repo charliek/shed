@@ -477,10 +477,18 @@ func runSystemPruneSingle() error {
 	}
 
 	// Invalidate client-side shed cache for any instance we deleted.
-	for _, n := range deletedShedNames(report) {
-		clientConfig.RemoveShedCache(n)
-	}
-	if err := clientConfig.Save(); err != nil {
+	//
+	// ACCEPTED RACE (pre-existing, reviewed): between the prune and this update,
+	// another process can re-cache one of these names — a `shed create` reusing
+	// it, say — and this delete then removes a row that is once again valid. The
+	// cache is cosmetic and self-healing (findShedServer re-resolves on a miss),
+	// so the fix would cost more than the symptom.
+	deleted := deletedShedNames(report)
+	if err := updateClientConfig(func(c *config.ClientConfig) {
+		for _, n := range deleted {
+			c.RemoveShedCache(n)
+		}
+	}); err != nil {
 		fmt.Fprintf(os.Stderr, "Warning: failed to save client config: %v\n", err)
 	}
 
@@ -568,18 +576,21 @@ func runSystemPruneAll() error {
 	})
 
 	// Invalidate client shed cache for every deleted instance across servers.
-	cacheDirty := false
+	// Same accepted race as the single-server path above: a name re-cached
+	// between the prune and this update is dropped, and the cache self-heals.
+	var deleted []string
 	for _, r := range execResults {
 		if r.Err != nil || r.Value == nil {
 			continue
 		}
-		for _, n := range deletedShedNames(r.Value) {
-			clientConfig.RemoveShedCache(n)
-			cacheDirty = true
-		}
+		deleted = append(deleted, deletedShedNames(r.Value)...)
 	}
-	if cacheDirty {
-		if err := clientConfig.Save(); err != nil {
+	if len(deleted) > 0 {
+		if err := updateClientConfig(func(c *config.ClientConfig) {
+			for _, n := range deleted {
+				c.RemoveShedCache(n)
+			}
+		}); err != nil {
 			fmt.Fprintf(os.Stderr, "Warning: failed to save client config: %v\n", err)
 		}
 	}

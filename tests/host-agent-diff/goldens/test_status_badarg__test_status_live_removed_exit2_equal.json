@@ -1,0 +1,1 @@
+"status: --live was removed; `status` now always queries the running agent\n"
