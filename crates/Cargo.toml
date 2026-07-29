@@ -14,7 +14,7 @@ members = ["shed-core", "shed-core-ffi", "shed-app", "shedctl", "shed-broker", "
 default-members = ["shed-core", "shed-core-ffi", "shed-app", "shedctl", "shed-broker", "shed-host-agent"]
 
 [workspace.package]
-version = "0.8.0"
+version = "0.8.1"
 edition = "2021"
 rust-version = "1.85"
 license = "MIT"
