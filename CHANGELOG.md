@@ -18,9 +18,9 @@ All notable changes to this project will be documented in this file.
   archived charliek/shed-desktop repo.
 -->
 
-## Unreleased
+## v0.8.1 — 2026-07-28
 
-**Ships:** server, host-agent, desktop
+**Ships:** server, host-agent, machine-rc, desktop
 
 ### Added
 
@@ -90,8 +90,63 @@ All notable changes to this project will be documented in this file.
   behavior change, the desktop component-upgrade ordering, and the
   fleet-wide-but-self-healing CA rotation story.
 
+### Removed
+
+- **The Go `shed-host-agent` is retired.** The shipped binary has been the
+  Rust `crates/shed-host-agent` since the GoReleaser `builder: rust` swap;
+  the Go twin under `cmd/shed-host-agent` survived only as rollback
+  insurance and as one half of the Go-vs-Rust differential test harness.
+  Both are gone, along with the two detached Go build ids, the
+  release-snapshot assertions that pinned them, and `make build`'s
+  `build-host-agent` target. **Install identity is unchanged** — same
+  formula, same binary and archive names, same flags, env, and
+  `status`/`version` surface; nothing about upgrading or running the agent
+  changes. What does change is the rollback path: source-level rollback
+  ends here, so falling back now means reinstalling the previous release's
+  Homebrew formula. The harness kept its coverage rather than losing it —
+  every cell's canonical wire output was recorded as a committed golden
+  **while both implementations still agreed** (verified on macOS and Linux
+  before the freeze), so it now pins the Rust daemon against those frozen
+  values; the cross-language fixture vectors and their Rust/Swift consumers
+  are untouched.
+
 ### Fixed
 
+- **The desktop apps now lead with the remedy when `shed-host-agent` is too
+  old to obtain a certificate.** This is the unattended Sparkle-update
+  state — the app auto-updates, the Homebrew agent doesn't — and both
+  clients mishandled it: the macOS app truncated the actionable clause off
+  the end of the banner, leaked a raw `Config(message: "…")` enum wrapper
+  into user-facing text, and then contradicted itself with a "check
+  `~/.shed/config.yaml` and that shed-server is running" empty state
+  pointing at two things that were fine; the Tauri app dropped failed hosts
+  from its Sheds pane entirely, so the only symptom was an empty list with
+  no explanation. The failure is now a typed case end to end: a short
+  remedy-first sentence in the banner, transport detail demoted to the
+  tooltip and log, an empty state that names the real cause, per-host error
+  rows on the Tauri Sheds pane, and host tooltips on both.
+- **A mint attempted before the host agent has announced its capabilities
+  now says so.** It previously surfaced as a generic
+  `credential resolution timeout` — the request's outer timeout cancelling
+  the mint before the specific, actionable error could be produced — which
+  read as a network problem rather than "the agent is wedged or still
+  starting". Both the Rust and Swift minters now wait a bounded moment for
+  the agent's handshake, in every auth mode, and report the actual
+  condition; a burst of concurrent requests pays that wait once.
+- **`shed --server B <cmd> <shed>` no longer operates on a different
+  server.** `--server` was consulted only when the shed name missed the
+  local location cache, so an explicit flag could be silently overridden
+  for `delete`/`reset`/`stop`. An explicit `--server` now wins
+  unconditionally; the cache still serves the unqualified form.
+- **Concurrent `shed` processes no longer clobber each other's
+  `~/.shed/config.yaml`.** Each process loaded the whole config, mutated
+  its own entry, and wrote the entire stale snapshot back, so a credential
+  persist racing any other config write could silently lose its recorded
+  certificate paths and re-mint over SSH on every later command. Config
+  writes now take a cross-process lock and re-read under it before
+  mutating, credential persists verify the entry still exists and still
+  points at the endpoint they minted against, and the temp file used for
+  the atomic rename is unique per write.
 - **`GET /api/info`'s `auth_mode` field keeps reporting the legacy `"secure"`
   spelling for token mode on the wire**, so already-released clients (which
   gate their bootstrap decision on that exact string) keep working unchanged
