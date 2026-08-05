@@ -1,0 +1,177 @@
+# =============================================================================
+# Documentation Style Guidelines
+# =============================================================================
+# - Professional, direct tone (no marketing language)
+# - Tables for all CLI options and configuration fields
+# - Code blocks with language hints (yaml, bash, json, go)
+# - Use admonitions sparingly (only for important notes/warnings)
+# - Examples should be copy-pasteable
+# - Keep pages focused and concise - one topic per page
+# - No deep troubleshooting guides - keep it minimal but useful
+# =============================================================================
+
+[project]
+
+site_name = "shed"
+site_description = "Lightweight tool for managing persistent, containerized development environments"
+site_author = "shed Contributors"
+site_url = "https://charliek.github.io/shed/"
+
+repo_name = "charliek/shed"
+repo_url = "https://github.com/charliek/shed"
+edit_uri = "edit/main/docs/"
+
+docs_dir = "docs"
+site_dir = "site-build"
+
+dev_addr = "127.0.0.1:7070"
+
+nav = [
+  { "Home" = "index.md" },
+  { "Getting Started" = [
+    { "Overview" = "getting-started/quick-start.md" },
+    { "macOS Quickstart" = "getting-started/macos-quickstart.md" },
+    { "Linux Quickstart" = "getting-started/linux-quickstart.md" },
+    { "Developer Setup" = [
+      { "macOS (VZ)" = "getting-started/vz-setup.md" },
+      { "Firecracker (Linux)" = "getting-started/fc-setup.md" },
+    ] },
+    { "Upgrades" = [
+      { "v0.4 → v0.5" = "upgrades/v0.4-to-v0.5.md" },
+      { "v0.5.1 → v0.5.2" = "upgrades/v0.5.1-to-v0.5.2.md" },
+      { "v0.5.7 → v0.5.8" = "upgrades/v0.5.7-to-v0.5.8.md" },
+      { "v0.6 → v0.7" = "upgrades/v0.6-to-v0.7.md" },
+      { "v0.7.0 → v0.7.1" = "upgrades/v0.7.0-to-v0.7.1.md" },
+    ] },
+  ] },
+  { "Tutorials" = [
+    { "Build Your Own Image" = "tutorials/build-your-own-image.md" },
+    { "Provisioning a Gradle Project" = "tutorials/gradle-provisioning.md" },
+    { "Provisioning a TypeScript Project" = "tutorials/typescript-provisioning.md" },
+    { "Provisioning a Python Project" = "tutorials/python-provisioning.md" },
+  ] },
+  { "Guides" = [
+    { "Security Configuration" = "guides/security-configuration.md" },
+    { "Public VPS Deployment" = "guides/vps-deployment.md" },
+  ] },
+  { "Reference" = [
+    { "CLI" = "reference/cli.md" },
+    { "Configuration" = "reference/configuration.md" },
+    { "Security" = "reference/security.md" },
+    { "Egress Control" = "reference/egress.md" },
+    { "Snapshots" = "reference/snapshots.md" },
+    { "Disk Management" = "reference/disk-management.md" },
+    { "Storage Model" = "reference/storage-model.md" },
+    { "Tunnels" = "reference/tunnels.md" },
+    { "File Sync" = "reference/sync.md" },
+    { "Provisioning" = "reference/provisioning.md" },
+    { "Firecracker Operations" = "reference/fc-operations.md" },
+    { "VZ Operations (macOS)" = "reference/vz-operations.md" },
+    { "Images" = "reference/images.md" },
+    { "Build Tools" = "reference/build-tools.md" },
+    { "Extensions" = "reference/extensions.md" },
+    { "HTTP API" = "reference/api.md" },
+  ] },
+  { "Extensions" = [
+    { "Architecture" = "extensions/architecture.md" },
+    { "Configuration" = "extensions/configuration.md" },
+    { "SSH Agent" = "extensions/ssh-agent.md" },
+    { "AWS Credentials" = "extensions/aws-credentials.md" },
+    { "Docker Credentials" = "extensions/docker-credentials.md" },
+    { "Host Agent IPC" = "extensions/host-agent-ipc.md" },
+    { "shed-desktop Approval" = "extensions/desktop-approval.md" },
+    { "Status CLI" = "extensions/status-cli.md" },
+    { "RC Session Helper" = "extensions/rc-helper.md" },
+    { "shed-machine-rc" = "extensions/shed-machine-rc.md" },
+    { "Security Posture" = "extensions/security-posture.md" },
+  ] },
+  { "Desktop" = [
+    { "Overview" = "desktop/index.md" },
+    { "Installation" = "desktop/installation.md" },
+    { "First Run" = "desktop/first-run.md" },
+    { "Architecture" = "desktop/architecture.md" },
+    { "Rust core" = "desktop/rust-core.md" },
+    { "Configuration" = "desktop/configuration.md" },
+    { "Approvals" = "desktop/approvals.md" },
+    { "RC sessions" = "desktop/rc-sessions.md" },
+    { "IPC" = "desktop/ipc.md" },
+    { "shedctl CLI" = "desktop/cli.md" },
+    { "Development setup" = "desktop/development-setup.md" },
+    { "Test automation" = "desktop/test-automation.md" },
+  ] },
+  { "Discovery" = [
+    { "Monorepo Consolidation" = "discovery/monorepo-consolidation.md" },
+    { "Monorepo Phase 2 Validation" = "discovery/monorepo-phase2-validation.md" },
+    { "Auth & Transport Security" = "discovery/auth-and-transport-security.md" },
+    { "Auth & Transport Plan" = "discovery/auth-transport-plan.md" },
+    { "Lazy Rootfs Streaming" = "discovery/lazy-rootfs-streaming.md" },
+    { "Proxy Integration" = "discovery/proxy_integration_design.md" },
+    { "Runtime Optimization Backlog" = "discovery/runtime-optimization-backlog.md" },
+  ] },
+  { "Development" = [
+    { "Setup" = "development/setup.md" },
+    { "Testing" = "development/testing.md" },
+    { "Architecture" = "development/architecture.md" },
+    { "In-shed Build Debugging" = "development/in-shed-build-debugging.md" },
+  ] },
+  { "Roadmap" = "ROADMAP.md" },
+]
+
+# -----------------------------------------------------------------------------
+# Theme
+# -----------------------------------------------------------------------------
+# The shared StrideLabs theme (stridelabs-docs-theme, pinned in pyproject.toml)
+# supplies the palette, the self-hosted type stack, the feature toggles, and
+# the owl + project-icon header lockup. Anything set here overrides it.
+#
+# Do NOT add a [project.theme.font] table: the theme sets `font: false` and
+# ships its own woff2 faces, so setting one re-enables Zensical's Google Fonts
+# <link> on every page while the self-hosted faces keep loading anyway.
+[project.theme]
+name = "stridelabs"
+
+# The icon that says *which* tool this is -- rendered beside the shared owl.
+[project.theme.icon]
+logo = "material/server"
+
+# -----------------------------------------------------------------------------
+# Extra
+# -----------------------------------------------------------------------------
+[[project.extra.social]]
+icon = "fontawesome/brands/github"
+link = "https://github.com/charliek/shed"
+
+# -----------------------------------------------------------------------------
+# Markdown extensions
+# -----------------------------------------------------------------------------
+[project.markdown_extensions.admonition]
+[project.markdown_extensions.attr_list]
+[project.markdown_extensions.md_in_html]
+[project.markdown_extensions.pymdownx.inlinehilite]
+[project.markdown_extensions.pymdownx.snippets]
+[project.markdown_extensions.pymdownx.details]
+
+[project.markdown_extensions.pymdownx.highlight]
+anchor_linenums = true
+line_spans = "__span"
+pygments_lang_class = true
+
+[project.markdown_extensions.pymdownx.superfences]
+custom_fences = [
+  { name = "mermaid", class = "mermaid", format = "pymdownx.superfences.fence_code_format" },
+]
+
+[project.markdown_extensions.pymdownx.tabbed]
+alternate_style = true
+
+# NOTE: the callable namespace is "zensical.extensions.emoji", not
+# "material.extensions.emoji" - the latter aborts the build under Zensical.
+[project.markdown_extensions.pymdownx.emoji]
+emoji_generator = "zensical.extensions.emoji.to_svg"
+emoji_index = "zensical.extensions.emoji.twemoji"
+
+[project.markdown_extensions.pymdownx.tasklist]
+custom_checkbox = true
+
+[project.markdown_extensions.toc]
+permalink = true

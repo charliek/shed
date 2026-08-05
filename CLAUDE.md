@@ -163,7 +163,7 @@ See `docs/development/testing.md` for the full operator guide — adding a test,
 - `guest/extensions/etc/` — Guest overlay (systemd units, `environment.d`, `shed-extensions.d` manifests) staged into the rootfs alongside the guest binaries
 - `crates/` — shared Rust client core workspace (see `crates/CLAUDE.md` and "Monorepo layout" above)
 - `desktop/` — Swift/Tauri desktop app + `shedtest` harness (see `desktop/CLAUDE.md`)
-- `docs/` — MkDocs documentation site (desktop docs under `docs/desktop/`)
+- `docs/` — Zensical documentation site (desktop docs under `docs/desktop/`)
 
 ## In-repo skills
 
@@ -222,7 +222,10 @@ Images are stored content-addressed under `{images_dir}/blobs/sha256/<digest>` (
 
 ## Documentation
 
-Docs use MkDocs Material. See `mkdocs.yml` for style guidelines (top comment block). Key rules:
+Docs use [Zensical](https://zensical.org) with the shared
+[stridelabs-docs-theme](https://github.com/charliek/stridelabs-docs-theme) package
+(pinned by tag in `pyproject.toml`; palette/fonts/features live there, not here).
+See `zensical.toml` for style guidelines (top comment block). Key rules:
 - Professional, direct tone
 - Tables for CLI options and config fields
 - Code blocks with language hints

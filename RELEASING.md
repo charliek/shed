@@ -303,7 +303,7 @@ those need a source-tree bump.
 in-repo history. GoReleaser's auto-generated release notes (filtered:
 skip `docs:`, `test:`, `chore:`, `ci:`) go on the GitHub Release body.
 
-`pyproject.toml` is for mkdocs only and has its own version cadence;
+`pyproject.toml` is for the docs site only and has its own version cadence;
 not touched by `update-version.sh`.
 
 ## Host-agent: Rust binary

@@ -100,9 +100,17 @@ desktop/artifacts/
 
 # Documentation build
 site-build/
+
+# Zensical differential-build cache (root only -- the anchor keeps this from
+# also swallowing a nested .cache/ elsewhere in the tree)
+/.cache/
 .venv/
-uv.lock
-# … but the integration test suite's lockfile is committed for reproducibility:
+# NOTE: the root lockfile IS committed. The docs group carries a git
+# dependency (stridelabs-docs-theme, pinned by tag); tags are mutable, so the
+# lockfile's resolved commit SHA is the only integrity check there is, and CI
+# builds docs with `uv sync --locked`. Same reproducibility rationale as the
+# three lockfiles already committed below.
+# The integration test suite's lockfile is committed for reproducibility:
 !tests/integration/uv.lock
 # … and the desktop workspace's lockfile is committed too:
 !desktop/uv.lock

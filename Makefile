@@ -746,12 +746,12 @@ lint-all: lint
 # Build documentation
 docs:
 	uv sync --group docs
-	uv run mkdocs build
+	uv run --locked zensical build --strict
 
 # Serve documentation locally
 docs-serve:
 	uv sync --group docs
-	uv run mkdocs serve
+	uv run --locked zensical serve
 
 # Firecracker targets
 
