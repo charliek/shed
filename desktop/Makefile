@@ -249,10 +249,10 @@ smoke-launch-window: bundle  ## Non-test launch/reopen window behavior (issue #4
 
 .PHONY: docs docs-serve
 docs:  ## Build the mkdocs site into site-build/
-	uv run --group docs mkdocs build
+	uv run --locked --group docs zensical build --strict
 
 docs-serve:  ## Serve the docs locally with live reload
-	uv run --group docs mkdocs serve
+	uv run --locked --group docs zensical serve
 
 # ---- lint / format ----------------------------------------------------
 
