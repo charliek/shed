@@ -178,6 +178,15 @@ func TestClassifyRCProxyPath(t *testing.T) {
 		// ever sees ids that already passed this same grammar, so with the shared
 		// rc.ApprovalIDRe symbol that branch is unreachable through the proxy.
 		{http.MethodPost, "v1/sessions/abc234/approvals/.leading-dot", false, http.StatusNotFound},
+		// The cursor hook INGEST route is GUEST-INTERNAL and deliberately NOT on the
+		// allowlist (plan 008 §3.5): the hub accepts it on loopback from the agent's own
+		// preseeded hook script, and nothing outside the shed has any business injecting a
+		// session's feed. It must therefore look like any other unknown path here — 404,
+		// before any dial — in every method and query shape.
+		{http.MethodPost, "v1/ingest/cursor", false, http.StatusNotFound},
+		{http.MethodGet, "v1/ingest/cursor", false, http.StatusNotFound},
+		{http.MethodPost, "v1/ingest", false, http.StatusNotFound},
+		{http.MethodPost, "v1/ingest/cursor/abc234", false, http.StatusNotFound},
 	}
 	for _, tc := range cases {
 		gotOK, gotStatus := classifyRCProxyPath(tc.method, tc.rest)
@@ -350,6 +359,10 @@ func TestRCProxy_ApprovalRoutes_RejectedBeforeDial(t *testing.T) {
 		// normalize it into an allowed path, so the handler rejects it explicitly
 		// (exact-path-or-404 — the classification must describe the path as sent).
 		{http.MethodPost, "/api/sheds/proj/rc//v1/sessions/abc234/turn", http.StatusNotFound},
+		// The cursor hook ingest route is guest-internal: a caller reaching for it through
+		// the server proxy is rejected before the dial, query string and all.
+		{http.MethodPost, "/api/sheds/proj/rc/v1/ingest/cursor", http.StatusNotFound},
+		{http.MethodPost, "/api/sheds/proj/rc/v1/ingest/cursor?slug=abc234&event=stop", http.StatusNotFound},
 	}
 	for _, tc := range cases {
 		r := httptest.NewRequest(tc.method, tc.path, nil)

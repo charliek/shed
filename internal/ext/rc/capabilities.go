@@ -220,7 +220,7 @@ func BuildCapabilities(probe AgentProbe, installed InstalledProbe) Capabilities 
 //	claude-rc | true       | tui       | false | ""    | activity | false     | tmux
 //	codex     | true       | tui       | true  | gated | messages | false     | tmux
 //	opencode  | true       | remote    | true  | turn  | messages | true      | tmux
-//	cursor    | true       | tui       | false | ""    | activity | false     | tmux
+//	cursor    | true       | tui       | true  | gated | messages | false     | tmux
 func kindFeatures() map[Kind]KindFeatures {
 	out := map[Kind]KindFeatures{}
 	for _, k := range allKinds {
@@ -255,6 +255,14 @@ func kindFeatures() map[Kind]KindFeatures {
 			// is deliberate; the two rows are no longer asserted equal.
 			kf.Feed, kf.Input = "messages", inputModeTurn
 			kf.Approvals, kf.Interrupt = approvalsRemote, true
+		case KindCursor:
+			// cursor's own hook scripts push its turn boundaries, tool calls and messages
+			// into the hub (watch_cursor.go), which is a normalized message feed — and its
+			// composer anchor gates POST /input exactly as codex's does. `gated` (not
+			// `turn`) because the delivery is still the pane: cursor has no protocol to
+			// take a whole turn through. approvals stays "tui": there is nothing the hub
+			// can honor remotely, only the pane-anchor signal that the TUI is asking.
+			kf.Feed, kf.Input = "messages", inputModeGated
 		}
 		// watch is the deprecated spelling of feed == "messages"; derived here rather
 		// than set by hand so the two cannot drift (invariant-tested besides).

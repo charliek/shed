@@ -340,9 +340,6 @@ func (w *opencodeWatcher) snapshot(now time.Time) (activity Activity, message st
 		// never report fresh, and force expiredWorking=false so pane-stability drives (fix #6).
 		return w.curActivity, w.curMessage, false, false
 	}
-	if w.curActivity == "" || w.curActivity == ActivityUnknown {
-		return w.curActivity, w.curMessage, false, false
-	}
 	healthy := w.seedApplied && w.connected
 	if healthy && !w.lastFrameAt.IsZero() && now.Sub(w.lastFrameAt) >= ocFrameStaleWindow {
 		healthy = false // heartbeat-stale: the stream is wedged even if the socket has not errored
@@ -352,14 +349,8 @@ func (w *opencodeWatcher) snapshot(now time.Time) (activity Activity, message st
 		// pane-stability (both flags false — see the doc above).
 		return w.curActivity, w.curMessage, false, false
 	}
-	sinceEvent := time.Duration(-1)
-	if !w.lastEventAt.IsZero() {
-		sinceEvent = now.Sub(w.lastEventAt)
-	}
-	recent := sinceEvent >= 0 && sinceEvent < watcherFreshWindow
-	workingGrace := w.curActivity == ActivityWorking && sinceEvent >= 0 && sinceEvent < watcherWorkingGrace
-	fresh = w.curSettled || recent || workingGrace
-	expiredWorking = w.curActivity == ActivityWorking && !fresh
+	// Transport healthy: from here the ordinary quiet-source rule applies (watch.go).
+	fresh, expiredWorking = watcherFreshness(w.curActivity, w.curSettled, w.lastEventAt, now)
 	return w.curActivity, w.curMessage, fresh, expiredWorking
 }
 

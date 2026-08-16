@@ -8,10 +8,12 @@ import (
 )
 
 // The message feed is the non-TUI view's data source: as the codex rollout watcher
-// folds the JSONL turn stream (see watch_codex.go's codexFold) and the opencode
-// watcher folds its HTTP/SSE event stream (see watch_opencode.go's opencodeFold), each
-// also emits normalized conversation messages, which the reconcile loop drains into a
-// per-session ring buffer here. GET /v1/sessions/{slug}/messages pages that ring;
+// folds the JSONL turn stream (see watch_codex.go's codexFold), the opencode watcher
+// folds its HTTP/SSE event stream (watch_opencode.go's opencodeFold), and the cursor
+// watcher folds the hook events its preseeded scripts push into the hub
+// (watch_cursor.go's cursorFold), each also emits normalized conversation messages,
+// which the reconcile loop drains into a per-session ring buffer here.
+// GET /v1/sessions/{slug}/messages pages that ring;
 // message.appended SSE events notify subscribers a new message landed (the body is
 // fetched from /messages — the notification stays tiny). claude feeds activity only
 // in this phase, so its sessions have a ring that simply never fills.

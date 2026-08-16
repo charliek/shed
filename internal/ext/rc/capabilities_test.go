@@ -12,12 +12,13 @@ import (
 
 // TestKindFeatures pins the NORMATIVE per-kind matrix exhaustively — every field of
 // every kind kindFeatures() carries an entry for, plus the deliberate omission of
-// claude-broker and shell. codex and opencode light up the message feed (their
-// watchers, watch_codex.go / watch_opencode.go, fold a normalized feed); claude-rc and
-// cursor carry the activity feed only (the stability/transcript engines derive activity
-// for them, but no message feed exists). OPENCODE is the live lane: its embedded
-// HTTP+SSE server takes whole turns, interrupts and approvals through the hub, so its
-// row alone reads input "turn" / approvals "remote" / interrupt true. Every other kind
+// claude-broker and shell. codex, opencode and cursor light up the message feed (their
+// watchers — watch_codex.go / watch_opencode.go / watch_cursor.go — fold a normalized
+// feed, the last of them from hook events pushed into the hub); claude-rc carries the
+// activity feed only (the transcript engine derives activity for it, but no message feed
+// exists). OPENCODE is the live lane: its embedded HTTP+SSE server takes whole turns,
+// interrupts and approvals through the hub, so its row alone reads
+// input "turn" / approvals "remote" / interrupt true. Every other kind
 // is TUI-lane: approvals on the pane, no interrupt verb, gated line input at most.
 func TestKindFeatures(t *testing.T) {
 	kf := kindFeatures()
@@ -29,7 +30,7 @@ func TestKindFeatures(t *testing.T) {
 		{KindClaudeRC, KindFeatures{PostInput: true, Approvals: "tui", Watch: false, Input: "", Feed: "activity", Interrupt: false, Attach: "tmux"}},
 		{KindCodex, KindFeatures{PostInput: true, Approvals: "tui", Watch: true, Input: "gated", Feed: "messages", Interrupt: false, Attach: "tmux"}},
 		{KindOpencode, KindFeatures{PostInput: true, Approvals: "remote", Watch: true, Input: "turn", Feed: "messages", Interrupt: true, Attach: "tmux"}},
-		{KindCursor, KindFeatures{PostInput: true, Approvals: "tui", Watch: false, Input: "", Feed: "activity", Interrupt: false, Attach: "tmux"}},
+		{KindCursor, KindFeatures{PostInput: true, Approvals: "tui", Watch: true, Input: "gated", Feed: "messages", Interrupt: false, Attach: "tmux"}},
 	}
 	for _, c := range cases {
 		t.Run(string(c.kind), func(t *testing.T) {

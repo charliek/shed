@@ -431,13 +431,14 @@ func TestMessageRingSinceBeyondTailTruncated(t *testing.T) {
 }
 
 // The gated feed-input surface is DERIVED from kind_features (input == "gated"), not
-// from a hardcoded kind list — the drift hazard the derivation removed. Exactly ONE kind
-// qualifies now: codex. opencode moved to the whole-turn lane (input == "turn"), which
-// supersedes gating, and every other kind advertises no feed input at all.
+// from a hardcoded kind list — the drift hazard the derivation removed. TWO kinds qualify
+// now: codex and cursor (whose hook feed made it steerable from a phone — the whole point
+// of gating it). opencode moved to the whole-turn lane (input == "turn"), which supersedes
+// gating, and every other kind advertises no feed input at all.
 func TestInputGatedKindDerivedFromCapabilities(t *testing.T) {
 	kf := kindFeatures()
 	for _, k := range allKinds {
-		want := k == KindCodex
+		want := k == KindCodex || k == KindCursor
 		t.Run(string(k), func(t *testing.T) {
 			if got := kf[k].Input == inputModeGated; got != want {
 				t.Errorf("kind_features[%q].Input = %q, gated = %v, want gated = %v", k, kf[k].Input, got, want)

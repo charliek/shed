@@ -297,6 +297,18 @@ final class RCBinaryTests: XCTestCase {
         XCTAssertTrue(opencode.interrupt)
         XCTAssertEqual(opencode.attachKind, "tmux")
 
+        // cursor joined the feed kinds in plan 008: its own hook scripts push the session's
+        // activity and messages into the hub, and its composer anchor gates feed input — so
+        // its row matches codex's shape. approvals stay "tui": the hub can see cursor's
+        // approval prompt on the pane but has no way to answer it.
+        let cursor = try XCTUnwrap(caps.kindFeatures["cursor"])
+        XCTAssertEqual(cursor.feed, "messages")
+        XCTAssertTrue(cursor.feedMessages)
+        XCTAssertEqual(cursor.input, "gated")
+        XCTAssertEqual(cursor.approvals, "tui")
+        XCTAssertFalse(cursor.interrupt)
+        XCTAssertEqual(cursor.attachKind, "tmux")
+
         let full = dtos[0]
         XCTAssertEqual(full.kind, .claudeRc)
         XCTAssertEqual(full.state, .ready)

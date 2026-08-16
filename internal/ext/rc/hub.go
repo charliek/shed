@@ -229,6 +229,13 @@ type Hub struct {
 	// disappears (see reconcile).
 	inputLockMu sync.Mutex
 	inputLocks  map[string]*sync.Mutex
+
+	// ingestMu guards preWatcher: the per-slug queues of cursor hook events that arrived
+	// before reconcile built the session's watcher (see hub_ingest.go). Its OWN lock, not
+	// trackMu: an ingest burst must never contend with the reconcile loop's tracked-state
+	// work, and the two are never held together.
+	ingestMu   sync.Mutex
+	preWatcher map[string]*preWatcherQueue
 }
 
 func newHub(cfg HubConfig) *Hub {
@@ -237,6 +244,7 @@ func newHub(cfg HubConfig) *Hub {
 		tracked:    map[string]*trackedSession{},
 		subs:       map[*subscriber]struct{}{},
 		inputLocks: map[string]*sync.Mutex{},
+		preWatcher: map[string]*preWatcherQueue{},
 	}
 }
 
@@ -282,6 +290,10 @@ func (h *Hub) handler() http.Handler {
 	mux.HandleFunc("POST /v1/sessions/{slug}/turn", h.handleTurn)
 	mux.HandleFunc("POST /v1/sessions/{slug}/interrupt", h.handleInterrupt)
 	mux.HandleFunc("POST /v1/sessions/{slug}/approvals/{id}", h.handleApproval)
+	// The cursor hook ingest route (hub_ingest.go). Unlike every route above it is called
+	// by a process INSIDE the shed (the preseeded hook script), never by the server proxy —
+	// which deliberately does not allowlist it — and it carries its own 256 KiB body cap.
+	mux.HandleFunc("POST /v1/ingest/cursor", h.handleIngestCursor)
 	return mux
 }
 
@@ -595,8 +607,8 @@ func (h *Hub) handleInput(w http.ResponseWriter, r *http.Request) {
 //   - the kind's ApprovalAnchor visible on the FRESH pane → reject. Same hole, other
 //     evidence: for kinds whose approval state is derived from the pane rather than
 //     from a lane, the anchor is the only signal, and it must be consulted against the
-//     pane captured for THIS delivery. Live for codex; cursor's anchor joins it. It reads
-//     visiblePane, NOT pane — an anchor must only ever see the visible frame, because a
+//     pane captured for THIS delivery. Live for codex and cursor. It reads visiblePane,
+//     NOT pane — an anchor must only ever see the visible frame, because a
 //     dialog sitting in scrollback was answered long ago and gating on it would wedge the
 //     session's input forever (see captureVisiblePane). visiblePane is captured only for
 //     anchor-declaring kinds and is "" otherwise, which no anchor matches. Note the arm is
@@ -604,6 +616,19 @@ func (h *Hub) handleInput(w http.ResponseWriter, r *http.Request) {
 //     frame showing the dialog is enough to refuse a keystroke, because a wrongly-refused
 //     post costs a retry while a wrongly-accepted one answers an approval nobody meant to
 //     give.
+//   - an EXPIRED-WORKING verdict on a kind whose composer survives a modal
+//     (AgentSpec.ComposerUnderModal — cursor) → reject. This is the belt to the anchor
+//     arm's braces. For codex the degraded path is safe because its overlay REPLACES the
+//     composer, so a pane showing a dialog cannot match the prompt anchor. cursor draws
+//     its composer, disabled, UNDER the dialog — so if a widget shape the ApprovalAnchor
+//     does not yet know about is on screen, the merge (working verdict expired + a frozen
+//     pane that stability reads as idle) would fall through to "the composer is visible,
+//     accept", and the posted line would be typed into that widget, where a "y" anywhere
+//     in it answers the prompt. The last structured evidence said a turn was in flight and
+//     nothing has contradicted it, so the honest answer is "not now". A cursor turn that
+//     genuinely ended emits `stop`, which settles the fold indefinitely and takes the
+//     accept path below; the residual false-reject (a session whose hook relay broke
+//     mid-turn) resolves when the watcher is rebuilt with no verdict.
 //   - a FRESH watcher needs_input → accept outright (the structured signal is settled
 //     and authoritative; the pane may legitimately not match the anchor).
 //   - anything else (merged idle/unknown, or a stability-derived needs_input whose
@@ -628,6 +653,9 @@ func (h *Hub) inputAccepted(watcher sessionWatcher, stability Activity, kind Kin
 		return false
 	}
 	if anchor := approvalAnchorFor(kind); anchor != nil && anchor.MatchString(visiblePane) {
+		return false
+	}
+	if expiredWorking && composerUnderModal(kind) {
 		return false
 	}
 	if watcherFresh && watcherAct == ActivityNeedsInput {

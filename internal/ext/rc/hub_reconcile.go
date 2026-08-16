@@ -70,8 +70,8 @@ type trackedSession struct {
 	// does not re-scan the filesystem on every single tick forever.
 	correlateTried int
 
-	// ring is the session's message feed (populated by the codex and opencode watchers
-	// in this phase; every tracked session has one so /messages returns 200-empty for a
+	// ring is the session's message feed (populated by the codex, opencode and cursor
+	// watchers; every tracked session has one so /messages returns 200-empty for a
 	// known slug and 404 only for an unknown one). Its own mutex guards concurrent access.
 	ring *messageRing
 	// lastStability is the raw pane-stability verdict from the most recent successful
@@ -94,7 +94,7 @@ type trackedSession struct {
 	pendingApprovals []FeedApproval
 
 	// paneApproval is the PANE-derived approval state for kinds whose approvals never
-	// reach a protocol (AgentSpec.ApprovalAnchor kinds — codex today, cursor next).
+	// reach a protocol (AgentSpec.ApprovalAnchor kinds — codex and cursor).
 	// Deliberately a SEPARATE field from pendingApprovals, not a merge into that slice:
 	// pendingApprovals is wholly owned by the publishing watcher (reconcile and the
 	// approvals verb both REPLACE it from approvalPublisher), so a pane entry living
@@ -377,9 +377,9 @@ func (h *Hub) reconcile() {
 			watcherActivity, watcherMessage, watcherFresh, watcherExpiredWorking = watcher.snapshot(now)
 		}
 
-		// Pane-anchor approvals (AgentSpec.ApprovalAnchor kinds). For codex/cursor the
-		// dialog reaches no protocol, so the pane is the only evidence that the session is
-		// blocked on the operator.
+		// Pane-anchor approvals (AgentSpec.ApprovalAnchor kinds: codex and cursor). For
+		// both, the dialog reaches no protocol, so the pane is the only evidence that the
+		// session is blocked on the operator.
 		//
 		// This takes its OWN capture, deliberately, instead of reusing the frame the
 		// stability tracker just took: the tracker captures 200 lines of SCROLLBACK too
@@ -387,7 +387,7 @@ func (h *Hub) reconcile() {
 		// wrong thing to ask "is a modal on screen?" — an answered dialog, or one that was
 		// up when the agent crashed out to a shell, stays in the history verbatim, so an
 		// episode opened off scrollback could never clear. The cost is one extra tmux exec
-		// per anchor-kind session per tick (codex only today), run unlocked like the rest
+		// per anchor-kind session per tick (codex and cursor), run unlocked like the rest
 		// of the heavy per-session work. A capture failure means NO EVIDENCE, not
 		// "cleared": the episode is held untouched and the next tick decides.
 		paneApproval := tr.paneApproval
@@ -422,6 +422,19 @@ func (h *Hub) reconcile() {
 		h.trackMu.Lock()
 		if newW != nil {
 			tr.watcher = newW
+			// SECOND drain of the cursor pre-watcher queue, and the load-bearing one.
+			// ensureWatcher drained at CONSTRUCTION so this tick's refresh folds whatever was
+			// already queued — but construction happens ~one full unlocked pass earlier (a
+			// tracker capture, the watcher refresh, an anchor capture), and until the
+			// assignment on the line above, the ingest handler still reads tr.watcher == nil
+			// and keeps queueing. Those events would land in a FRESH queue that nothing ever
+			// drains: ensureWatcher no-ops once tr.watcher is set, so the kickoff prompt would
+			// sit there until the TTL dropped it. Draining HERE, immediately after the
+			// publish, closes the window — the handler either sees the watcher and pushes, or
+			// queued before this point and is drained now (folded next tick). Lock order is
+			// trackMu → ingestMu → watcher.mu, and no path takes them the other way round (the
+			// ingest handler releases trackMu before it pushes or queues).
+			h.drainPreWatcher(s.Slug, newW)
 		}
 		// Only a publishing watcher owns this field: a kind whose approvals are not lane-
 		// derived must keep whatever it holds (nothing — the pane-anchor kinds live in the
@@ -509,6 +522,11 @@ func (h *Hub) reconcile() {
 
 	h.trackMu.Unlock()
 
+	// Janitor for the cursor ingest queues: drop anything held for a slug that is gone or
+	// that never grew a watcher within the TTL (hub_ingest.go). Runs after the trackMu
+	// release — it takes its own lock and the two are never held together.
+	h.prunePreWatcher(now, present)
+
 	for _, e := range events {
 		h.broadcast(e)
 	}
@@ -564,6 +582,20 @@ func (h *Hub) ensureWatcher(tr *trackedSession, s Session) sessionWatcher {
 		// trusted pin; "" means the watcher searches its SSE stream for the session id.
 		agentID := agentSessionEnv(h.cfg.runner, s.TmuxSession)
 		return newOpencodeWatcher(port, s.Workdir, agentID, h.cfg.now, h.cfg.logf)
+	}
+
+	// cursor diverges from BOTH paths: its watcher is PUSH-fed by the agent's own hook
+	// scripts (watch_cursor.go), so there is nothing to correlate and nothing to connect —
+	// no file to find, no port to read, no retry budget to spend. It is built on the first
+	// eligible tick and is immediately usable; the pin arrives later, inside the hook
+	// payloads (drainConfirmedAgentID, like opencode). The one construction-time step is
+	// draining the hub's PRE-WATCHER queue into it: hook events for this slug that landed
+	// before this moment (the kickoff prompt above all) are pushed now, so they fold on
+	// this very tick rather than being lost to the gap between create and first tick.
+	if s.Kind == KindCursor {
+		w := newCursorWatcher(agentSessionEnv(h.cfg.runner, s.TmuxSession), h.cfg.logf)
+		h.drainPreWatcher(s.Slug, w)
+		return w
 	}
 
 	if tr.correlateTried >= maxCorrelateTries {

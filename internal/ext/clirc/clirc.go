@@ -312,6 +312,7 @@ func doCreate(cfg Config, d deps, args []string) int {
 		Wait:             *wait,
 		InteractiveShell: *interactive,
 		PermissionMode:   mode,
+		Warnf:            warnHook(d),
 		EnsureHub:        ensureHubHook(d),
 	}, d.sleep)
 	if err != nil {
@@ -504,6 +505,18 @@ func realEnsureHub(d deps) {
 	rc.EnsureHub(hubConfig(d), d.stderr)
 }
 
+// warnHook returns the CreateOptions.Warnf callback, routing rc.Create's non-fatal
+// diagnostics (a skipped/failed preseed) to stderr so stdout stays the DTO the caller
+// parses. nil when no stderr is wired (tests), which discards them.
+func warnHook(d deps) func(string, ...any) {
+	if d.stderr == nil {
+		return nil
+	}
+	return func(format string, args ...any) {
+		fmt.Fprintf(d.stderr, "shed-ext-rc: "+format+"\n", args...)
+	}
+}
+
 // ensureHubHook returns the CreateOptions.EnsureHub callback, or nil when no
 // ensureHub is wired (tests) so create performs no hub side effect.
 func ensureHubHook(d deps) func() {
@@ -620,6 +633,7 @@ func doClaude(cfg Config, d deps, args []string) int {
 		Wait:             true,
 		InteractiveShell: true,
 		PermissionMode:   mode,
+		Warnf:            warnHook(d),
 		EnsureHub:        ensureHubHook(d),
 	}, d.sleep)
 	if err != nil {

@@ -288,6 +288,37 @@ func TestIsManagedVersion(t *testing.T) {
 	}
 }
 
+// SHED_RC_SLUG is stamped for EVERY kind (unlike the opencode-only port key), because it
+// is how a process launched INSIDE the session addresses that session on the hub — the
+// cursor hook relay reads it out of the inherited tmux session env. Additive: SHED_RC_V
+// stays at 2, so a reader that never looks at the key is unaffected.
+func TestBuildEnvArgsStampsSlugForEveryKind(t *testing.T) {
+	if SchemaVersion != 2 {
+		t.Errorf("SchemaVersion = %d: SHED_RC_SLUG is ADDITIVE and must not bump it", SchemaVersion)
+	}
+	for _, kind := range allKinds {
+		t.Run(string(kind), func(t *testing.T) {
+			args, err := BuildEnvArgs(Metadata{
+				ID: "id-1", DisplayName: "x", Kind: kind, Workdir: "/home/shed",
+				CreatedBy: "shed-ext-rc/1", CreatedAt: "2026-06-19T18:53:00Z", Slug: "abc234",
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !slices.Contains(args, envSlug+"=abc234") {
+				t.Errorf("args = %v, want %s=abc234", args, envSlug)
+			}
+		})
+	}
+	// The single-line grammar applies to it like every other value.
+	if _, err := BuildEnvArgs(Metadata{
+		ID: "id-1", DisplayName: "x", Kind: KindShell, Workdir: "/home/shed",
+		CreatedBy: "shed-ext-rc/1", CreatedAt: "2026-06-19T18:53:00Z", Slug: "a\nb",
+	}); err == nil {
+		t.Error("a control character in the slug must be rejected")
+	}
+}
+
 func TestBuildEnvArgsRoundTrip(t *testing.T) {
 	m := Metadata{
 		ID: "id-1", DisplayName: "Friday Bug Fix", Kind: KindClaudeRC,

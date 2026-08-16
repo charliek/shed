@@ -2117,6 +2117,17 @@ mod tests {
         assert_eq!(opencode.approvals, "remote");
         assert!(opencode.interrupt);
         assert_eq!(opencode.attach_kind(), ATTACH_TMUX);
+        // cursor joined the feed kinds in plan 008: its own hook scripts push turn
+        // boundaries, tool calls and messages into the hub, and its composer anchor gates
+        // `/input` — so its row reads like codex's (messages + gated), while approvals stay
+        // "tui" (the hub can only OBSERVE cursor's prompt, never answer it).
+        let cursor = &caps.kind_features["cursor"];
+        assert_eq!(cursor.feed, "messages");
+        assert!(cursor.feed_messages());
+        assert!(cursor.input_gated());
+        assert_eq!(cursor.approvals, "tui");
+        assert!(!cursor.interrupt);
+        assert_eq!(cursor.attach_kind(), ATTACH_TMUX);
         // A kind with the activity dimension only: no message feed, still tmux.
         let claude = &caps.kind_features["claude-rc"];
         assert_eq!(claude.feed, "activity");

@@ -55,6 +55,12 @@ type CreateOptions struct {
 	// claude's own default). e.g. "auto" or "bypassPermissions" for an unattended
 	// run; with bypassPermissions, Wait also auto-accepts the one-time bypass dialog.
 	PermissionMode string
+	// Warnf reports a NON-FATAL create-time diagnostic. Today it carries preseed
+	// outcomes: a preseed never fails a create (the session is usable either way), but a
+	// silently skipped one is invisible — most sharply cursor's, whose mount guard
+	// deliberately declines to write hooks.json into a host auth mount and would
+	// otherwise leave the operator wondering why the session has no feed. nil discards.
+	Warnf func(format string, args ...any)
 	// EnsureHub, when non-nil, is invoked (best-effort) once a session has been
 	// created, to make sure the local rc activity hub is running so the new session
 	// is watched. It must never fail or meaningfully delay the create — a spawn
@@ -142,17 +148,22 @@ func Create(r Runner, env Getenv, opts CreateOptions, sleep func(time.Duration))
 		CreatedAt:   time.Now().UTC().Format(time.RFC3339),
 		Target:      opts.Target,
 		Port:        port,
+		Slug:        slug,
 	}
 	envArgs, err := BuildEnvArgs(meta)
 	if err != nil {
 		return Session{}, fmt.Errorf("%w: %v", ErrBadArgs, err)
 	}
 
-	// Best-effort trust/onboarding pre-seed for tools that need one (claude; the
-	// accept-trust fallback covers any failure, so a preseed error never fails the
-	// create). Dispatched through the agent registry — nil Preseed = no-op.
+	// Best-effort per-tool preseed (claude: trust + onboarding, where the accept-trust
+	// fallback covers any failure; cursor: the hub's hook relay, where a failure costs the
+	// session its message feed but not its usability). Dispatched through the agent
+	// registry — nil Preseed = no-op. A failure NEVER fails the create; it is reported
+	// through Warnf so a skipped preseed is visible instead of silent.
 	if spec, ok := specForKind(opts.Kind); ok && spec.Preseed != nil {
-		_ = spec.Preseed(workdir, env)
+		if err := spec.Preseed(workdir, env); err != nil && opts.Warnf != nil {
+			opts.Warnf("%s preseed skipped: %v", spec.Tool, err)
+		}
 	}
 
 	inner := InnerCommand(opts.Kind, displayName, opts.PermissionMode, opts.InteractiveShell, port)

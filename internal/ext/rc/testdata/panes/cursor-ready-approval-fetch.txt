@@ -1,0 +1,24 @@
+  Cursor Agent
+  v2026.08.11-e8db854
+  Tip: Use /run-everything to skip all approvals.
+
+
+  check the upstream changelog
+
+
+  Fetching the changelog page.
+
+  WebFetch  https://example.com/changelog
+
+ ──────────────────────────────────────────────────────────────────────────────
+ Allow this web fetch?
+
+     Fetch (y)
+   → Always allow example.com (tab)
+     Skip (esc or n)
+
+  → Add a follow-up
+
+
+  Auto · 9.8%
+  ~

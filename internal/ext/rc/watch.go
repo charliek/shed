@@ -25,16 +25,26 @@ import (
 // correlated watcher wins; a broken/absent one falls back to stability so activity
 // never goes dark.
 //
+// cursor is the third shape and the only PUSH one: it has neither a log to tail nor a
+// server to subscribe to, so the hub preseeds the agent's own hook scripts to POST each
+// event to its loopback ingest route, and cursorWatcher (watch_cursor.go) folds what
+// arrives.
+//
 // Layout of the watcher stack:
 //   - lineTailer (watch_tail.go): resilient byte-level tailing (codex/claude only).
 //   - activityFold (below): a per-kind fold of the parsed line/event stream into an
-//     activity verdict + last-message preview (codexFold, claudeFold, opencodeFold).
+//     activity verdict + last-message preview (codexFold, claudeFold, opencodeFold; the
+//     cursor fold takes hook EVENTS rather than lines, so it implements messageProducer
+//     but not this interface — see watch_cursor.go).
 //   - fileWatcher (below): tailer + fold + a freshness-annotated snapshot (codex/claude).
 //   - opencodeWatcher (watch_opencode_transport.go): SSE/REST client + fold + a
 //     freshness-annotated snapshot (opencode's sessionWatcher).
+//   - cursorWatcher (watch_cursor.go): bounded push inbox + fold + a freshness-annotated
+//     snapshot, fed by the hub's ingest handler (cursor's sessionWatcher).
 //   - correlation (below + the per-kind files): mapping a tmux session to its file.
 //   - fsNudger (below): the fsnotify layer that wakes reconcile sub-tick on a write
-//     (codex/claude only; opencode's SSE stream is its own wakeup source).
+//     (codex/claude only; opencode's SSE stream and cursor's hook POSTs are their own
+//     arrival signals — both land between ticks and are folded on the next one).
 
 // watcherFreshWindow bounds how long a correlated watcher's non-settled, non-working
 // activity is trusted after its last folded event. A settled verdict (needs_input/
@@ -81,10 +91,12 @@ type activityFold interface {
 	settled() bool
 }
 
-// messageProducer is an activityFold that ALSO produces a normalized message feed
-// (codex and opencode; claude feeds activity only in this phase). The fileWatcher/
-// opencodeWatcher drains it on each refresh; a fold that does not implement it
-// contributes no feed messages.
+// messageProducer is a fold that ALSO produces a normalized message feed (codex,
+// opencode and cursor; claude feeds activity only in this phase). Every watcher drains it
+// on each refresh; a fold that does not implement it contributes no feed messages. It is
+// declared separately from activityFold, and asserted separately, because the cursor fold
+// produces a feed without being an activityFold at all (its unit is a hook EVENT, not a
+// JSONL line).
 //
 // Ambiguous correlation caveat (accepted): a watcher attached on an AMBIGUOUS window
 // match is follow-only and its ACTIVITY stays untrusted (unknown) until an in-file
@@ -198,30 +210,42 @@ func (w *fileWatcher) drainPending() []feedMessage {
 	return out
 }
 
-// snapshot reports the watcher's activity + message and its authority at now:
+// watcherFreshness is THE quiet-source freshness rule, shared verbatim by every watcher
+// that has one (fileWatcher below, opencodeWatcher once its transport is healthy,
+// cursorWatcher on its pushes). Given a verdict, whether it is settled, and when the
+// source last produced an event, it reports the verdict's authority at now:
 //
-//   - fresh: the verdict is authoritative outright — settled (needs_input/idle;
-//     trusted indefinitely, the 30s/quiet rule is theirs by construction), recent
-//     (last event within watcherFreshWindow), or working within watcherWorkingGrace.
-//   - expiredWorking: a working verdict whose file has been quiet past the grace —
+//   - fresh: authoritative outright — settled (needs_input/idle; trusted indefinitely,
+//     the 30s/quiet rule is theirs by construction), recent (last event within
+//     watcherFreshWindow), or working within watcherWorkingGrace.
+//   - expiredWorking: a working verdict whose source has been quiet past the grace —
 //     not discarded, but demoted to conditional: the merge lets stability take over
 //     only if stability holds a settled quiet verdict (see mergedActivity).
 //
-// An empty/unknown verdict is never fresh.
+// An empty/unknown verdict is never fresh. A zero lastEventAt means "nothing folded
+// yet", which is neither recent nor within the grace.
+func watcherFreshness(activity Activity, settled bool, lastEventAt, now time.Time) (fresh, expiredWorking bool) {
+	if activity == "" || activity == ActivityUnknown {
+		return false, false
+	}
+	sinceEvent := time.Duration(-1)
+	if !lastEventAt.IsZero() {
+		sinceEvent = now.Sub(lastEventAt)
+	}
+	recent := sinceEvent >= 0 && sinceEvent < watcherFreshWindow
+	workingGrace := activity == ActivityWorking && sinceEvent >= 0 && sinceEvent < watcherWorkingGrace
+	fresh = settled || recent || workingGrace
+	expiredWorking = activity == ActivityWorking && !fresh
+	return fresh, expiredWorking
+}
+
+// snapshot reports the watcher's activity + message and its authority at now (the shared
+// watcherFreshness rule above — a tailed file is quiet or it is not; there is no transport
+// health dimension here).
 func (w *fileWatcher) snapshot(now time.Time) (activity Activity, message string, fresh, expiredWorking bool) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	if w.curActivity == "" || w.curActivity == ActivityUnknown {
-		return w.curActivity, w.curMessage, false, false
-	}
-	sinceEvent := time.Duration(-1)
-	if !w.lastEventAt.IsZero() {
-		sinceEvent = now.Sub(w.lastEventAt)
-	}
-	recent := sinceEvent >= 0 && sinceEvent < watcherFreshWindow
-	workingGrace := w.curActivity == ActivityWorking && sinceEvent >= 0 && sinceEvent < watcherWorkingGrace
-	fresh = w.curSettled || recent || workingGrace
-	expiredWorking = w.curActivity == ActivityWorking && !fresh
+	fresh, expiredWorking = watcherFreshness(w.curActivity, w.curSettled, w.lastEventAt, now)
 	return w.curActivity, w.curMessage, fresh, expiredWorking
 }
 
@@ -273,10 +297,11 @@ func mergedActivity(watcherActivity Activity, watcherMessage string, watcherFres
 
 // watchableKind reports whether a kind has a structured-signal watcher: codex/claude
 // tail a JSONL file (rollout / transcript), opencode subscribes to its embedded
-// HTTP+SSE server (watch_opencode_transport.go). Other kinds derive activity from pane
-// stability alone.
+// HTTP+SSE server (watch_opencode_transport.go), and cursor is fed by its own hook
+// scripts pushing into the hub's ingest route (watch_cursor.go). Other kinds derive
+// activity from pane stability alone.
 func watchableKind(k Kind) bool {
-	return k == KindCodex || IsClaudeKind(k) || k == KindOpencode
+	return k == KindCodex || IsClaudeKind(k) || k == KindOpencode || k == KindCursor
 }
 
 // correlation is the outcome of mapping a tmux session to its agent JSONL file.
