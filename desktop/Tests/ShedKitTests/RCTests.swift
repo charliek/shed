@@ -266,8 +266,9 @@ final class RCBinaryTests: XCTestCase {
 
         // The golden gained a capabilities block (in lockstep with the Go golden).
         let caps = try XCTUnwrap(parsed.capabilities)
-        XCTAssertEqual(caps.rcVersion, 3)
+        XCTAssertEqual(caps.rcVersion, 4)
         XCTAssertTrue(caps.hasFeature("generic-perm"))
+        XCTAssertTrue(caps.hasFeature("contract-v2"))
         XCTAssertEqual(caps.agents["codex"]?.installed, true)
         XCTAssertEqual(caps.agents["cursor"]?.installed, false)
         // Gating: claude/codex/opencode installed + advertised → offered; cursor
@@ -277,12 +278,27 @@ final class RCBinaryTests: XCTestCase {
         XCTAssertFalse(caps.offers(.cursor))
         XCTAssertFalse(caps.creatableKinds.contains(.claudeBroker))
 
+        // Contract v2 kind_features additions (normative R0 matrix): codex streams
+        // a normalized message feed and attaches over tmux; interrupt is
+        // unconditionally false in this phase.
+        let codex = try XCTUnwrap(caps.kindFeatures["codex"])
+        XCTAssertEqual(codex.feed, "messages")
+        XCTAssertTrue(codex.feedMessages)
+        XCTAssertFalse(codex.interrupt)
+        XCTAssertEqual(codex.attachKind, "tmux")
+
         let full = dtos[0]
         XCTAssertEqual(full.kind, .claudeRc)
         XCTAssertEqual(full.state, .ready)
         XCTAssertTrue(full.managed)
         XCTAssertNotNil(full.id)
         XCTAssertEqual(full.url, "https://claude.ai/code/session_01RCkTDrdZ2Rr12sD5dfMjgr")
+        // Contract v2 session fields: lane + the activity trio.
+        XCTAssertEqual(full.lane, "tui")
+        XCTAssertEqual(full.laneOrTui, "tui")
+        XCTAssertEqual(full.activity, "working")
+        XCTAssertNotNil(full.activityAt)
+        XCTAssertEqual(full.lastMessage, "Running the test suite now.")
 
         let minimal = dtos[1]
         XCTAssertEqual(minimal.kind, .claudeBroker)
@@ -290,9 +306,34 @@ final class RCBinaryTests: XCTestCase {
         XCTAssertNil(minimal.displayName)   // omitted, not null
         XCTAssertNil(minimal.workdir)
         XCTAssertNil(minimal.url)
-        // The adapter fills the <shed>/<slug> display fallback the binary can't know.
+        XCTAssertEqual(minimal.lane, "tui")
+        // The adapter fills the <shed>/<slug> display fallback the binary can't know
+        // and propagates lane through to the enriched RcSession.
         let adapted = RemoteControl.rcSession(fromDTO: minimal, serverName: "h", shed: "demo")
         XCTAssertEqual(adapted.displayName, "demo/brk900")
+        XCTAssertEqual(adapted.laneOrTui, "tui")
+    }
+
+    /// A v3-shaped payload (contract v2's `feed`/`interrupt`/`attach` absent, only
+    /// the deprecated `watch`/`input` present) must still decode safely — the
+    /// tolerant defaults, and `feedMessages`' fallback to `watch` when `feed` is
+    /// blank, are what let an old shed image's payload render without crashing.
+    func testV3KindFeaturesDecodesWithFeedFallback() throws {
+        let json = #"""
+        {"post_input":true,"approvals":"tui","watch":true,"input":"gated"}
+        """#
+        let f = try JSONDecoder().decode(RcKindFeatures.self, from: Data(json.utf8))
+        XCTAssertTrue(f.postInput)
+        XCTAssertEqual(f.approvals, "tui")
+        XCTAssertTrue(f.watch)
+        XCTAssertEqual(f.input, "gated")
+        XCTAssertEqual(f.feed, "")           // absent → default
+        XCTAssertFalse(f.interrupt)          // absent → default
+        XCTAssertEqual(f.attach, "")         // absent → default
+        // feed is blank, so feedMessages falls back to the deprecated watch bit.
+        XCTAssertTrue(f.feedMessages)
+        // attach is blank, so attachKind falls back to the tmux default.
+        XCTAssertEqual(f.attachKind, "tmux")
     }
 
     /// An old baked-in binary's bare `{"rc_sessions":[…]}` envelope decodes with
@@ -309,6 +350,9 @@ final class RCBinaryTests: XCTestCase {
     /// agents yields an empty creatable set (the launch UIs show "unavailable"
     /// rather than inventing claude).
     func testPresentButEmptyCapabilitiesOfferNothing() throws {
+        // Deliberately v3-shaped (no contract-v2 kind_features fields, empty map):
+        // exercises the offers/creatable gating, which doesn't care about rc_version
+        // or the new fields — left as v3 input rather than bumped to the current golden.
         let stdout = #"""
         {"rc_sessions":[],
          "capabilities":{"rc_version":3,
@@ -326,6 +370,9 @@ final class RCBinaryTests: XCTestCase {
     /// (old/downgraded image) must LOSE its stale cached entry; un-probed sheds
     /// keep theirs. Pins the merge AppModel.rcList applies.
     func testMergeCapabilitiesDowngradeRemovesStaleEntry() throws {
+        // Deliberately v3-shaped: this test is only about the cache-merge mechanics,
+        // not the capabilities content, so it stays on the older shape rather than
+        // being bumped to the current golden.
         let capsJSON = #"""
         {"rc_sessions":[],
          "capabilities":{"rc_version":3,"kinds":["shell"],"agents":{},
@@ -378,5 +425,31 @@ final class RCWireTests: XCTestCase {
         XCTAssertFalse(s.managed)
         XCTAssertNil(s.rcID)
         XCTAssertNil(s.createdBy)
+    }
+
+    /// A wrong-TYPED field inside a pending_approvals element must degrade that
+    /// field to its default (the Rust mirror's tolerance), never fail the whole
+    /// session decode.
+    func testFeedApprovalDecodeToleratesWrongTypes() throws {
+        let json = #"""
+        {"slug":"ab12cd","tmux_session":"rc-ab12cd","kind":"codex","state":"ready",
+         "managed":true,"lane":"tui",
+         "pending_approvals":[{"id":42,"status":"pending","decisions":"allow"}]}
+        """#
+        let dto = try JSONDecoder().decode(RcSessionDTO.self, from: Data(json.utf8))
+        let a = try XCTUnwrap(dto.pendingApprovals?.first)
+        XCTAssertEqual(a.id, "")          // wrong-typed → default, not a throw
+        XCTAssertEqual(a.status, "pending")
+        XCTAssertEqual(a.decisions, [])   // wrong-typed → default
+    }
+
+    /// The enriched-session adapter sanitizes the guest-controlled preview the way
+    /// the Rust core does: Unicode format chars (bidi override) stripped, trimmed,
+    /// only-format-chars degrades to nil.
+    func testAdapterCleansLastMessagePreview() throws {
+        XCTAssertEqual(RemoteControl.cleanPreview("a\u{202E}b  "), "ab")
+        XCTAssertNil(RemoteControl.cleanPreview("\u{202E}\u{FEFF}"))
+        XCTAssertNil(RemoteControl.cleanPreview("   "))
+        XCTAssertNil(RemoteControl.cleanPreview(nil))
     }
 }

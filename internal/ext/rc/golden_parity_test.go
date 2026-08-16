@@ -18,9 +18,10 @@ import (
 // to prevent (a fixture updated in one tree and forgotten in another) fails here
 // instead of silently diverging until a client breaks.
 //
-// The desktop Swift fixture is deliberately NOT listed yet: it is refreshed in the
-// same commit that updates RCTests.swift's assertions, and adding it here before that
-// would fail this test mid-branch.
+// The desktop Swift fixture joined this guard in C4b, the same commit that refreshed it
+// and updated RCTests.swift's assertions — listing it any earlier would have failed this
+// test mid-branch (the Swift fixture was intentionally left stale from C1 through C4a to
+// avoid breaking Swift tests before the mirror work landed; see plan 007 §3.8).
 func TestGoldenCopiesAreByteIdentical(t *testing.T) {
 	repoRoot := filepath.Join("..", "..", "..")
 
@@ -37,6 +38,7 @@ func TestGoldenCopiesAreByteIdentical(t *testing.T) {
 			copies: []string{
 				"cmd/shed/testdata/rcSessionDto.golden.json",
 				"crates/fixtures/rcSessionDto.golden.json",
+				"desktop/Tests/ShedKitTests/Fixtures/rcSessionDto.golden.json",
 			},
 		},
 		{
@@ -65,8 +67,8 @@ func TestGoldenCopiesAreByteIdentical(t *testing.T) {
 						"The goldens are byte-identical copies by convention — re-copy the canonical over it "+
 						"(from the repo root):\n"+
 						"  cp %s %s\n"+
-						"then re-run the consuming tests: cmd/shed, crates/, and the desktop Swift fixture "+
-						"once C4b adds it here.", copyPath, c.canonical, c.canonical, copyPath)
+						"then re-run the consuming tests: cmd/shed, crates/, and the desktop Swift fixture.",
+						copyPath, c.canonical, c.canonical, copyPath)
 				}
 			}
 		})

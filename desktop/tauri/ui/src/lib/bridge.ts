@@ -745,8 +745,19 @@ export type RcState =
 
 /** One agent's install-probe result (capabilities.agents). */
 export type RcAgentInfo = { installed: boolean; version?: string | null };
-/** Per-kind UI hints (capabilities.kind_features). */
-export type RcKindFeatures = { post_input: boolean; approvals: string };
+/** Per-kind UI hints (capabilities.kind_features). `watch`/`input` are additive
+ *  hub hints; `feed`/`interrupt`/`attach` are contract-v2 additions (all optional
+ *  so a v3-or-earlier payload still type-checks against this shape). Mirrors
+ *  `shed_core::rc::RcKindFeatures`. */
+export type RcKindFeatures = {
+  post_input: boolean;
+  approvals: string;
+  watch?: boolean;
+  input?: string;
+  feed?: string;
+  interrupt?: boolean;
+  attach?: string;
+};
 /** A shed's RC capabilities — mirrors `shed_core::rc::RcCapabilities`. */
 export type RcCapabilities = {
   rc_version: number;
@@ -791,8 +802,18 @@ export function rcAuthHint(kind: RcKind): string {
   }
 }
 
+/** An approval request row (contract v2). Mirrors `shed_core::rc::RcFeedApproval`. */
+export type RcFeedApproval = {
+  id: string;
+  status: string;
+  decision?: string | null;
+  decisions?: string[];
+};
+
 /** A remote-control session, as shed-app serializes it (the pane's fields). The
- *  table/wire identity is the computed `host/shed/slug`, not encoded. */
+ *  table/wire identity is the computed `host/shed/slug`, not encoded. `lane`,
+ *  the activity trio, and `pending_approvals` are contract-v2 additions
+ *  (optional so a v3-or-earlier payload still type-checks). */
 export type RcSession = {
   host: string;
   shed: string;
@@ -808,6 +829,11 @@ export type RcSession = {
   created_at?: string | null;
   target_label?: string | null;
   managed: boolean;
+  lane?: string | null;
+  activity?: string | null;
+  activity_at?: string | null;
+  last_message?: string | null;
+  pending_approvals?: RcFeedApproval[] | null;
 };
 
 /** The `rc.list` result: live sessions plus the per-shed capabilities captured
