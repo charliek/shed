@@ -19,6 +19,20 @@ var (
 	machineCfg = Config{ProgName: "shed-machine-rc", DefaultCreatedBy: "shed-machine-rc", EnableClaudeVerb: true}
 )
 
+// TestMain defaults the installed-agent probe to "present" for the whole package.
+// A unit test must not depend on which agent binaries happen to be installed on the
+// test host: the claude/create verbs run through the installed-agent gate, and its
+// production probe (realBinProbe) shells out to `bash -{l,i}c 'command -v <bin>'`,
+// which passes on a dev machine with the agent installed but fails in CI where it is
+// not. The tests that are actually ABOUT the probe set their own — TestRealBinProbeShellVerb
+// swaps binProbeExec to capture args, and TestCreateInstalledAgentGateWiring injects an
+// explicit deps.binProbe via runCLIBinProbe (which bypasses binProbeExec entirely) — so
+// this default only makes the incidental verb tests deterministic.
+func TestMain(m *testing.M) {
+	binProbeExec = func(context.Context, ...string) bool { return true }
+	os.Exit(m.Run())
+}
+
 // fakeRunner records every tmux invocation and returns canned results, so the
 // dispatch is exercised end-to-end (flags → rc options → tmux argv) without a real
 // tmux or any filesystem/network side effect beyond the injected temp HOME.
