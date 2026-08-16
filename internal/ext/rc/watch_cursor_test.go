@@ -255,9 +255,14 @@ func TestCursorFoldToleratesUnknownAndMalformed(t *testing.T) {
 	if msgs := f.drainMessages(); len(msgs) != 0 {
 		t.Errorf("no feed rows expected, got %+v", msgs)
 	}
-	// A malformed payload must not have pinned anything either.
+	// Pinning runs BEFORE foldEvent (see applyEvent), so it is independent of whether the
+	// event tells the fold anything: every case above except the unparseable-JSON one carries
+	// a well-formed session_id, so notePin pins it regardless of the event being
+	// unwired/unknown/empty. Only a payload that fails to unmarshal (no session_id reaches
+	// notePin at all) or an id that fails validCursorSessionID's grammar (see
+	// TestCursorFoldPinningAndRepin) leaves the fold unpinned.
 	if f.pinnedID != cursorTestSessionID {
-		t.Logf("pin from the tolerated events = %q", f.pinnedID)
+		t.Errorf("pinnedID = %q, want %q — a tolerated event with a valid session_id still pins", f.pinnedID, cursorTestSessionID)
 	}
 }
 
@@ -311,6 +316,32 @@ func TestCursorFoldPinningAndRepin(t *testing.T) {
 	msgs := f.drainMessages()
 	if len(msgs) == 0 || !strings.Contains(msgs[0].Text, "switched to another chat") {
 		t.Errorf("the switch must be announced with a status row, got %+v", msgs)
+	}
+}
+
+// A repin whose triggering event does NOT itself put the fold into cursorStateWorking (e.g.
+// postToolUse, which only closes a tool call) must not leave activity() reading the OLD
+// chat's working state forever — switching away from a mid-turn chat to a parked one should
+// read unknown (not working) until the new chat's own event says otherwise, letting pane
+// stability drive the gap.
+func TestCursorFoldRepinResetsState(t *testing.T) {
+	f := newCursorFold("")
+	// Pin to the first chat and drive it mid-turn (a submitted prompt with an open tool call).
+	f.applyEvent(hookEv("beforeSubmitPrompt", `{`+sid(cursorTestSessionID)+`,"prompt":"go"}`))
+	f.applyEvent(hookEv("preToolUse", `{`+sid(cursorTestSessionID)+`,"tool_name":"Shell","tool_input":{"command":"sleep 30"}}`))
+	if got := f.activity(); got != ActivityWorking {
+		t.Fatalf("setup: activity = %q, want working mid-turn", got)
+	}
+
+	// The operator switches to a parked chat via an event that does NOT set working —
+	// postToolUse only closes a tool call, exactly the case the fix targets.
+	const other = "9129668a-885b-48ef-b61b-d80f981d4d68"
+	f.applyEvent(hookEv("postToolUse", `{`+sid(other)+`,"tool_name":"Shell"}`))
+	if f.pinnedID != other {
+		t.Fatalf("pinnedID = %q, want the repin to %q", f.pinnedID, other)
+	}
+	if got := f.activity(); got == ActivityWorking {
+		t.Errorf("activity = %q after a repin via a non-working event, want NOT stuck working", got)
 	}
 }
 

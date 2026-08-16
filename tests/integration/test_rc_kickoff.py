@@ -166,6 +166,11 @@ def test_attach_kind_shell_detach_probe_kill(shed_server_dev, test_shed_name_dev
         # must never mask the real assertion failure above.
         if slug is not None:
             try:
-                server.cli("sessions", "kill", shed, f"rc-{slug}", timeout=30)
-            except Exception:
-                pass
+                result = server.cli("sessions", "kill", shed, f"rc-{slug}", timeout=30)
+                if result.returncode != 0:
+                    print(
+                        f"warning: cleanup `sessions kill {shed} rc-{slug}` failed "
+                        f"(exit {result.returncode}): stdout={result.stdout!r} stderr={result.stderr!r}"
+                    )
+            except Exception as exc:
+                print(f"warning: cleanup `sessions kill {shed} rc-{slug}` raised: {exc!r}")

@@ -88,6 +88,24 @@ func TestReportRCCreateOutcome(t *testing.T) {
 	}
 }
 
+// TestRCCreateRequestedWorkdirAlone pins the --workdir fix: --workdir alone (no
+// --kind/--prompt/other RC flag) must still route `shed attach` to RC create rather than
+// silently falling through to plain tmux attach and discarding the workdir.
+func TestRCCreateRequestedWorkdirAlone(t *testing.T) {
+	origWorkdir := attachWorkdirFlag
+	t.Cleanup(func() { attachWorkdirFlag = origWorkdir })
+
+	attachWorkdirFlag = ""
+	if rcCreateRequested() {
+		t.Fatal("no RC flags set: rcCreateRequested should be false")
+	}
+
+	attachWorkdirFlag = "/home/shed/proj"
+	if !rcCreateRequested() {
+		t.Fatal("--workdir alone must request RC create, not fall through to plain attach")
+	}
+}
+
 // TestResolveRCPermMode pins the shared --skip/--permission-mode handling used by
 // both `shed attach` and `shed plan`: mutual exclusion, per-kind validity
 // (rc.PermModeAcceptedBy), and the default fallback when neither flag is given.

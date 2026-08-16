@@ -201,6 +201,29 @@ func TestPreseedCursorHooksIdempotent(t *testing.T) {
 	}
 }
 
+// A HOME containing a single quote produces a scriptPath that shellQuote must escape (an
+// embedded quote becomes the POSIX `'\”` trick), which used to defeat cursorHookEntryPresent's
+// raw-Contains check on the SECOND preseed and append a duplicate entry every run. Regression
+// test: a second preseed against such a HOME must still be idempotent.
+func TestPreseedCursorHooksIdempotentWithQuoteInPath(t *testing.T) {
+	home := filepath.Join(t.TempDir(), "o'brien")
+	if err := os.MkdirAll(home, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	env := envFunc(map[string]string{"HOME": home})
+	for i := 0; i < 2; i++ {
+		if err := PreseedCursorHooks("/x", env); err != nil {
+			t.Fatal(err)
+		}
+	}
+	m := readConfig(t, cursorHooksPath(home))
+	for _, event := range cursorHookEvents {
+		if cmds := hookEntries(t, m, event); len(cmds) != 1 {
+			t.Fatalf("hooks[%q] = %v after 2 preseeds with a quote in HOME, want one entry (idempotent)", event, cmds)
+		}
+	}
+}
+
 func TestPreseedCursorHooksLeavesMalformedUntouched(t *testing.T) {
 	home := t.TempDir()
 	if err := os.MkdirAll(filepath.Join(home, ".cursor"), 0o700); err != nil {

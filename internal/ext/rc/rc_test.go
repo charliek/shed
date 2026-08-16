@@ -715,9 +715,11 @@ func TestToolFor(t *testing.T) {
 		Kind("bogus"):    "the agent",
 	}
 	for k, want := range cases {
-		if got := ToolFor(k); got != want {
-			t.Errorf("ToolFor(%q) = %q, want %q", k, got, want)
-		}
+		t.Run(string(k), func(t *testing.T) {
+			if got := ToolFor(k); got != want {
+				t.Errorf("ToolFor(%q) = %q, want %q", k, got, want)
+			}
+		})
 	}
 }
 

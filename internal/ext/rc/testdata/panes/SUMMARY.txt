@@ -182,7 +182,7 @@ ready/prompt anchor still matches while the dialog owns the keyboard.
 RE-CAPTURE LIVE when an approval prompt is at hand; the labels are evidence, the frame
 is reconstruction.
 
-The fixture set covers FOUR of the eight decision surfaces (shell, hook-requested,
+The fixture set covers FIVE of the eight decision surfaces (shell, hook-requested,
 delete, write, web-fetch); the remaining ones (MCP, web search, edit) are pinned as
 synthetic headline+row pairs in TestCursorApprovalAnchorCoversEveryDecisionSurface.
 Exhaustiveness is a SAFETY property here, not tidiness: a surface the anchor misses opens

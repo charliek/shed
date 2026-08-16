@@ -315,8 +315,8 @@ public struct RcAgentInfo: Codable, Sendable, Equatable {
 /// Per-kind UI hints from `capabilities.kind_features`. Mirrors `rc.KindFeatures` /
 /// `shed_core::rc::RcKindFeatures`.
 ///
-/// `watch` and `input` are additive hub hints (the feed kinds — codex and
-/// opencode — carry them; absent decodes to `false`/`""`). `input` is
+/// `watch` and `input` are additive hub hints (the feed kinds — codex, opencode, and
+/// cursor — carry them; absent decodes to `false`/`""`). `input` is
 /// single-valued: `"gated"` (`POST /input` only while waiting), `"turn"` (whole
 /// turns through `POST /turn`, so `/input` no longer applies — opencode today),
 /// or `""`. Contract v2 adds three more, all additive so an

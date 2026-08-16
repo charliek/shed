@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -529,6 +530,12 @@ func (f *cursorFold) notePin(id string) bool {
 	if switched {
 		f.openTools = 0
 		f.lastMsg = ""
+		// The previous chat's turn state describes a conversation no longer on screen — carrying
+		// it forward would read as ActivityWorking indefinitely (until a `stop` for the NEW
+		// chat, which needs a submitted turn that may never come if the parked chat is just
+		// sitting idle). Reset to unknown-until-next-event so pane stability drives the gap,
+		// same as a brand-new fold before its first hook.
+		f.state = ""
 		f.emitStatus("cursor switched to another chat (" + id + ")")
 	}
 	return true
@@ -560,7 +567,11 @@ func (f *cursorFold) lastMessage() string { return SanitizeLastMessage(f.lastMsg
 func (f *cursorFold) settled() bool       { return f.confirmed && f.state == cursorStateIdle }
 
 // activity is the fold's verdict: unknown until a hook confirms the session is alive, then
-// working while a turn (or a tool call) is in flight and needs_input once `stop` lands.
+// working while a turn (or a tool call) is in flight and needs_input once `stop` lands. A
+// chat switch (notePin) resets state to "" — the previous chat's turn state does not apply
+// to whatever the operator switched to — so activity reads unknown again until the next
+// event for the new chat folds something, letting pane stability drive the gap instead of
+// pinning the verdict at working indefinitely.
 // needs_approval is deliberately absent — cursor emits NO approval hook, so that verdict
 // comes from the pane anchor in reconcile (see the cursorWatcher doc).
 func (f *cursorFold) activity() Activity {
@@ -573,8 +584,10 @@ func (f *cursorFold) activity() Activity {
 	switch f.state {
 	case cursorStateIdle:
 		return ActivityNeedsInput
-	default:
+	case cursorStateWorking:
 		return ActivityWorking
+	default:
+		return ActivityUnknown
 	}
 }
 
@@ -642,6 +655,13 @@ func cursorEditDetail(p *cursorHookPayload) string {
 // live feed.
 const maxCursorTranscriptLines = 200
 
+// readCursorTranscriptTailBytes bounds readCursorTranscript's read to the file's last N
+// bytes before scanning, so a transcript that has grown to thousands of lines does not get
+// read in full just to keep the last maxCursorTranscriptLines — this runs synchronously in
+// the reconcile tick. A var, not a const, so a test can shrink it for a deterministic
+// bounded-tail case without needing a multi-hundred-KB fixture.
+var readCursorTranscriptTailBytes int64 = 256 * 1024
+
 // cursorSlugForWorkdir renders cursor's own project-directory slug for a workdir: the
 // absolute path with every '/' replaced by '-' and the leading '/' dropped. Verified live
 // in the spike (plan 008 §3.5 evidence): a workdir of `/home/shed/proj` slugs to
@@ -683,6 +703,13 @@ func cursorTranscriptPath(home, workdir, sessionID string) string {
 // fail on this), and an unscannable line (including a partial last line, since the
 // transcript is written incrementally and a hub can restart mid-write) is simply skipped
 // rather than aborting the whole read.
+//
+// The read itself is bounded to the file's last readCursorTranscriptTailBytes: a file larger
+// than that is opened and seeked to the tail rather than scanned start-to-finish, since only
+// the last maxCursorTranscriptLines survive anyway and this runs synchronously in the
+// reconcile tick. A seek lands mid-line more often than not, so the first line scanned after
+// a seek is always discarded — its head is missing and it is not a real line, matching the
+// same tolerance the (much rarer) partial-last-line case already gets.
 func readCursorTranscript(path string) []feedMessage {
 	f, err := os.Open(path)
 	if err != nil {
@@ -690,15 +717,34 @@ func readCursorTranscript(path string) []feedMessage {
 	}
 	defer f.Close()
 
+	sought := false
+	if info, statErr := f.Stat(); statErr == nil && info.Size() > readCursorTranscriptTailBytes {
+		if _, seekErr := f.Seek(-readCursorTranscriptTailBytes, io.SeekEnd); seekErr == nil {
+			sought = true
+		}
+	}
+
 	sc := bufio.NewScanner(f)
 	sc.Buffer(make([]byte, 0, 64*1024), 2*1024*1024)
-	var window [][]byte
+	window := make([][]byte, 0, maxCursorTranscriptLines)
+	first := true
 	for sc.Scan() {
-		line := append([]byte(nil), sc.Bytes()...) // Scan()'s buffer is reused; must copy to retain
-		window = append(window, line)
-		if len(window) > maxCursorTranscriptLines {
-			window = window[1:]
+		if first {
+			first = false
+			if sought {
+				continue // the seek's first line is a headless fragment, not a real line
+			}
 		}
+		line := append([]byte(nil), sc.Bytes()...) // Scan()'s buffer is reused; must copy to retain
+		if len(window) == cap(window) {
+			// Shift the ring IN PLACE (copy, not window[1:]): a bare reslice would leave the
+			// dropped line's backing-array slot still referencing its bytes, so retention
+			// would never actually cap at maxCursorTranscriptLines. The copy overwrites that
+			// slot, letting the dropped line's bytes be reclaimed.
+			copy(window, window[1:])
+			window = window[:len(window)-1]
+		}
+		window = append(window, line)
 	}
 	// sc.Err() (an oversized line, a mid-read I/O error) is deliberately not surfaced:
 	// whatever made it into window before the scan stopped is still valid best-effort

@@ -181,6 +181,43 @@ func TestPreseedClaudeConfigLeavesMalformedUntouched(t *testing.T) {
 	}
 }
 
+// json.Decoder decodes one top-level value and stops silently, so a file with extra bytes
+// after a valid-looking object would otherwise be accepted and then rewritten minus its
+// tail. readJSONObject (shared by both the claude and cursor preseeds) must reject that as
+// malformed and leave the file untouched — same contract as fully-invalid JSON.
+func TestPreseedClaudeConfigLeavesTrailingJSONUntouched(t *testing.T) {
+	home := t.TempDir()
+	path := filepath.Join(home, ".claude.json")
+	original := []byte(`{"theme":"dark"}{"extra":true}`)
+	if err := os.WriteFile(path, original, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := PreseedClaudeConfig("/home/shed/proj", envFunc(map[string]string{"HOME": home})); err == nil {
+		t.Fatal("expected an error for trailing JSON after the top-level value")
+	}
+	data, _ := os.ReadFile(path)
+	if string(data) != string(original) {
+		t.Fatalf("file with trailing JSON was modified: %q", data)
+	}
+}
+
+// Same contract, but the trailing bytes are not JSON at all.
+func TestPreseedClaudeConfigLeavesTrailingNonJSONUntouched(t *testing.T) {
+	home := t.TempDir()
+	path := filepath.Join(home, ".claude.json")
+	original := []byte(`{"theme":"dark"} garbage after`)
+	if err := os.WriteFile(path, original, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := PreseedClaudeConfig("/home/shed/proj", envFunc(map[string]string{"HOME": home})); err == nil {
+		t.Fatal("expected an error for trailing non-JSON data")
+	}
+	data, _ := os.ReadFile(path)
+	if string(data) != string(original) {
+		t.Fatalf("file with trailing non-JSON data was modified: %q", data)
+	}
+}
+
 func TestPreseedClaudeConfigConcurrent(t *testing.T) {
 	home := t.TempDir()
 	env := envFunc(map[string]string{"HOME": home})

@@ -2,6 +2,7 @@ package rc
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -246,6 +247,69 @@ func TestReadCursorTranscriptLineCap(t *testing.T) {
 	}
 	if rows[len(rows)-1].Text != wantLast {
 		t.Errorf("last row.Text = %q, want %q", rows[len(rows)-1].Text, wantLast)
+	}
+}
+
+// The read itself is bounded to the file's tail (readCursorTranscriptTailBytes), not just
+// the parsed-line count: a file bigger than the bound must not be scanned from the start,
+// and the seek's headless first line must not leak a spurious row. Shrinks the bound (a var
+// for exactly this) to keep the fixture small and the byte math exact, rather than needing a
+// multi-hundred-KB file to exercise the real 256 KiB default.
+func TestReadCursorTranscriptBoundedTail(t *testing.T) {
+	orig := readCursorTranscriptTailBytes
+	t.Cleanup(func() { readCursorTranscriptTailBytes = orig })
+
+	line := func(label string) string {
+		enc, err := json.Marshal(map[string]any{
+			"role": "user",
+			"message": map[string]any{
+				"content": []any{map[string]any{"type": "text", "text": label}},
+			},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return string(enc) + "\n"
+	}
+
+	const oldCount, newCount = 50, 10
+	var oldLines, newLines []string
+	for i := 0; i < oldCount; i++ {
+		oldLines = append(oldLines, line(fmt.Sprintf("OLD-%03d", i)))
+	}
+	for i := 0; i < newCount; i++ {
+		newLines = append(newLines, line(fmt.Sprintf("NEW-%03d", i)))
+	}
+	// Every line is the same fixed length ("OLD-NNN"/"NEW-NNN" are both 7 bytes), so the
+	// byte math below is exact.
+	lineLen := int64(len(oldLines[0]))
+	for _, l := range append(append([]string{}, oldLines...), newLines...) {
+		if int64(len(l)) != lineLen {
+			t.Fatalf("fixture lines are not fixed-length: %q is %d bytes, want %d", l, len(l), lineLen)
+		}
+	}
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "t.jsonl")
+	content := strings.Join(oldLines, "") + strings.Join(newLines, "")
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// The bound covers exactly the "new" lines plus half of the last "old" line, so the seek
+	// lands mid-line in that last old line — it must be dropped, not misread as a row — and
+	// every "new" line is fully intact.
+	readCursorTranscriptTailBytes = int64(newCount)*lineLen + lineLen/2
+
+	rows := readCursorTranscript(path)
+	if len(rows) != newCount {
+		t.Fatalf("got %d rows, want %d (only the lines inside the tail bound)", len(rows), newCount)
+	}
+	for i, r := range rows {
+		want := fmt.Sprintf("NEW-%03d", i)
+		if r.Text != want {
+			t.Errorf("rows[%d].Text = %q, want %q — an OLD line or the seek's partial fragment leaked in", i, r.Text, want)
+		}
 	}
 }
 

@@ -232,8 +232,12 @@ type Hub struct {
 
 	// ingestMu guards preWatcher: the per-slug queues of cursor hook events that arrived
 	// before reconcile built the session's watcher (see hub_ingest.go). Its OWN lock, not
-	// trackMu: an ingest burst must never contend with the reconcile loop's tracked-state
-	// work, and the two are never held together.
+	// trackMu, so the ingest handler never contends with reconcile while it only needs
+	// ingestMu — the handler takes trackMu, releases it, and only THEN takes ingestMu (or the
+	// watcher's own mutex), never nesting the two. Reconcile is the one path that holds both
+	// at once, and always in the same order: trackMu outer, ingestMu (via drainPreWatcher)
+	// nested inside it (see hub_reconcile.go). No path ever takes ingestMu first and trackMu
+	// second.
 	ingestMu   sync.Mutex
 	preWatcher map[string]*preWatcherQueue
 }

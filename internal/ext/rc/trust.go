@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -162,6 +163,19 @@ func readJSONObject(path string) (map[string]any, fs.FileMode, error) {
 	dec := json.NewDecoder(bytes.NewReader(data))
 	dec.UseNumber()
 	if err := dec.Decode(&config); err != nil {
+		return nil, 0, fmt.Errorf("existing %s is not valid JSON; leaving untouched: %w", path, err)
+	}
+	// json.Decoder decodes ONE value and stops; it happily accepts concatenated values
+	// after it (dec.More() only reports whitespace-vs-more-tokens within an array/object, it
+	// does not catch trailing top-level bytes). A second Decode must hit io.EOF — anything
+	// else, valid JSON or not, means the file has trailing content this preseed cannot
+	// account for, and the merge-never-clobber contract says leave it untouched rather than
+	// silently drop the tail on rewrite.
+	var trailing json.RawMessage
+	if err := dec.Decode(&trailing); err != io.EOF {
+		if err == nil {
+			err = fmt.Errorf("trailing data after the top-level JSON value")
+		}
 		return nil, 0, fmt.Errorf("existing %s is not valid JSON; leaving untouched: %w", path, err)
 	}
 	if config == nil {

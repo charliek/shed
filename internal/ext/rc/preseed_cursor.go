@@ -308,14 +308,23 @@ func jsonShapeOf(v any) string {
 // invokes the hub's script. Matched on the SCRIPT PATH appearing anywhere in the entry's
 // command (not on the exact command string) so a hand-edited invocation — extra flags, a
 // different quoting style, a wrapper — counts as ours and is not duplicated on every
-// create. A non-object entry, or one with no string command, is simply not a match.
+// create. Checked against BOTH the raw path and its shellQuote'd form (what this preseed
+// itself writes, see below): shellQuote escapes embedded single quotes as `'\”`, which
+// splits a raw scriptPath containing a quote across the escape sequence, so a raw-only
+// Contains check would miss our own prior entry and append a duplicate on every preseed. A
+// non-object entry, or one with no string command, is simply not a match.
 func cursorHookEntryPresent(entries []any, scriptPath string) bool {
+	quoted := shellQuote(scriptPath)
 	for _, raw := range entries {
 		entry, ok := raw.(map[string]any)
 		if !ok {
 			continue
 		}
-		if cmd, ok := entry["command"].(string); ok && strings.Contains(cmd, scriptPath) {
+		cmd, ok := entry["command"].(string)
+		if !ok {
+			continue
+		}
+		if strings.Contains(cmd, scriptPath) || strings.Contains(cmd, quoted) {
 			return true
 		}
 	}
