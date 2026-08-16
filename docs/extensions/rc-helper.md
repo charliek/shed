@@ -414,7 +414,12 @@ the `contract-v2` capability feature token rather than interpreting the mux's ba
   (`oc-<uuid>`) since `prompt_async` answers with no body; clients must not parse it.
 - `interrupt` → `202 {"interrupting": true}` (acknowledges the interrupt was
   *delivered*, not that the turn has stopped — the stop itself surfaces on the
-  feed/activity stream).
+  feed/activity stream). It cancels **generation**, not an approval gate the turn
+  already surfaced: if the model had emitted a tool call that raised a permission
+  request before the interrupt landed, the session stays `needs_approval` with that
+  approval still pending after the interrupt is acknowledged — a client must resolve
+  (or the operator must answer in the TUI) that approval to reach `idle`. Verified
+  live against opencode 1.18.18.
 - `approvals/{id}` → `200 {"resolved": true, "decision": "<decision>"}`. A replay of
   the **same** decision on an already-resolved id is idempotent → `200`, with **no
   second upstream POST** (the resolution is recorded synchronously the moment the
