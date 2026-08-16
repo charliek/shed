@@ -81,6 +81,20 @@ established in agent-sessions.md.
 
 ## The contract (v2 of the hub wire)
 
+> **Status: SHIPPED (R0, 2026-08-16).** This section is the original design
+> sketch, kept as rationale; the **normative as-built contract lives in
+> [`docs/extensions/rc-helper.md`](../extensions/rc-helper.md)**. As-built
+> deltas from the sketch (panel-review outcomes): `post_input` is retained
+> (nothing supersedes pane-typed input — only `watch` is deprecated, and it is
+> now *derived* from `feed`); sessions additionally gained a
+> `pending_approvals` snapshot so an actionable approval survives feed-ring
+> eviction; the verbs reject with a single 409 vocabulary
+> (`not_supported` = never per capabilities, `not_accepting` = not now — no
+> 501s) and their **success shapes are pinned now** (202 `{turn_id}` /
+> 202 `{interrupting}` / 200 `{resolved, decision}`) so R3 cannot recontract
+> them; approval ids have a contract grammar
+> (`^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$`).
+
 The existing hub wire (sessions / activity / messages / gated input / SSE) is
 already agent-neutral; it grows into a verb + capability contract. All changes
 are additive to the DTO but the semantics may break freely (experimental).
@@ -92,12 +106,16 @@ Session (existing DTO) gains:
   lane: "tui" | "structured"        # how the session is executed/observed
 ```
 
-A kind may back sessions in either lane (e.g. `cursor` = TUI lane;
-`cursor-acp` = structured lane — or one kind with a create-time lane option;
-pick during contract implementation). Both lanes register identically: slug,
-kind, lifecycle state, activity, feed. Structured-lane sessions may have no
-tmux pane; TUI-lane sessions may have no turn semantics. The capability matrix
-is what tells clients the difference.
+**Decided (R0): a kind is lane-homogeneous.** All sessions of one kind share
+one lane, so kind-keyed `kind_features` stays a complete description;
+structured lanes arrive as **distinct kinds** (e.g. a serve-backed opencode
+kind beside the TUI one). `lane` is still current-*state*, not identity — the
+Happy-style takeover/handoff (one session switched between runners over the
+agent's native resume) stays contract-compatible via a future session-level
+capability overlay, deferred until a phase builds it. Both lanes register
+identically: slug, kind, lifecycle state, activity, feed. Structured-lane
+sessions may have no tmux pane; TUI-lane sessions may have no turn semantics.
+The capability matrix is what tells clients the difference.
 
 ### Per-kind (× lane) capabilities
 
@@ -199,44 +217,46 @@ New crate in `crates/` (name TBD), on `shed-core` + `shed-app`:
 Each phase names its mobile checkpoint — the phone-facing behavior that proves
 the phase (even when the mobile UI itself lands a phase later).
 
+> **R0 status: SHIPPED** — PR #308 (`feature/plan-007-rc-contract-v2`,
+> 2026-08-16). The landed contract is `docs/extensions/rc-helper.md` (the
+> panel-corrected version — `409 not_supported`/`not_accepting`, no `501`s —
+> is what the `409` in the R0 row refers to). R1 handoff items recorded in
+> plan 007 §9: watcher freshness for `needs_approval` (`watch.go` treats only
+> `working` specially), the input-acceptance gate interaction, and in-guest
+> verification via the rootfs-rebuild loop
+> (`.claude/skills/testing-vm-agent-changes`).
+
 | Phase | Ships | Mobile checkpoint |
 |---|---|---|
-| **R0 — Contract v2** | `lane` field, extended `kind_features`, turn/interrupt/approval verbs (409 where unimplemented), typed approval feed entries, `needs_approval` activity; Go hub + Rust `rc.rs` + fixtures updated in lockstep | Mobile decodes v2 envelope; existing watch screens render unchanged off capabilities |
-
-> **R0 status:** shipped on branch `feature/plan-007-rc-contract-v2` (2026-08-16),
-> pending PR. See `docs/extensions/rc-helper.md` for the landed contract (the
-> panel-corrected version — `409 not_supported`/`not_accepting`, no `501`s — is what the
-> `409` in the table row above refers to).
+| **R0 — Contract v2** ✅ | `lane` field, extended `kind_features`, turn/interrupt/approval verbs (409 where unimplemented), typed approval feed entries + `pending_approvals`, `needs_approval` activity; Go hub + server proxy + Rust/Swift/TS mirrors + byte-parity-guarded fixtures in lockstep | Mobile decodes v2 envelope; existing watch screens render unchanged off capabilities |
 | **R1 — Cursor TUI hardening** | cursor hooks→hub ingestion (activity + `needs_approval`), transcript-tail partial feed; cursor stops being stability-only | Cursor session on a shed shows live activity + "approval pending — open TUI" on the phone |
 | **R2 — Rust porcelain v1** | new crate: `agent`/`ls`/`watch`/`attach`/`plan`/`kill` across `local\|machine\|shed`; drives Go engine binaries; machines section in config | n/a directly (CLI), but exercises the same shed-core target model mobile will use |
-| **R3 — Structured lane prototype** | opencode **or** codex app-server adapter in the guest hub behind the v2 verbs; decision on kind-vs-lane-option modeling | **Approve a tool call and steer a turn from the phone** — the bar for the whole design |
+| **R3 — Structured lane prototype** | a lane adapter in the guest hub behind the v2 verbs, as a **new distinct kind**. Spike is now three-way: **opencode** (front-runner — the hub already speaks its SSE/REST via the `--port` watcher, so the adapter is incremental Go; t3code ships on the same v2 API), codex app-server (most mature protocol, needs a Go JSON-RPC client), cursor-ACP (viable per t3code's long-lived-child pattern, needs a Go ACP client). **Primary design problem: the structured-session registry** — a session with no tmux pane breaks "tmux is the source of truth", so the hub needs its own registry (in-memory + agent-side persistence for resume) | **Approve a tool call and steer a turn from the phone** — the bar for the whole design |
 | **R4 — Machines in clients** | machine targets in shed-core surfaced in mobile + Tauri (SSH-forwarded hub); unified sessions view everywhere | Machine sessions listed + watchable next to shed sessions on the phone |
-| **R5 — Second lane + notifier** | second structured lane (whichever of opencode/codex wasn't R3; cursor-ACP if `session/load` is fixed); desktop notifier off aggregate SSE; host-agent hub spike (start of shed-machine-rc retirement) | `needs_input`/`needs_approval` reaches the phone while the app is open (SSE); push is a separate decision |
+| **R5 — Second lane + notifier** | second structured lane (from the R3 spike's runners-up); desktop notifier off aggregate SSE; host-agent hub spike (start of shed-machine-rc retirement) | `needs_input`/`needs_approval` reaches the phone while the app is open (SSE); push is a separate decision |
 
-R0 is deliberately small and unblocks everything; R1–R2 are independent of the
-lane bet; R3 is where the two-lane model proves out or gets revised.
+R0 was deliberately small and unblocks everything; R1–R2 are independent of
+the lane bet; R3 is where the two-lane model proves out or gets revised.
 
 ## Open questions
 
-1. **Kind-vs-lane modeling** — `cursor` + `cursor-acp` as distinct kinds, or
-   one kind with a create-time `lane` option? (Distinct kinds are simpler for
-   capabilities and the registry; decide in R0.) Third option from Happy:
-   **lane as mutable session state** — the same session switches runners over
-   the agent's native resume (claude `--resume`, codex `thread/resume`,
-   opencode server sessions). Too ambitious for v1, but R0's DTO should treat
-   `lane` as current-state (not immutable identity) so a takeover/handoff verb
-   can exist later without a contract break.
-2. **Prototype agent for R3** — opencode (richest primitives, experimental
-   routes, MIT reference all around) vs codex app-server (most mature
-   protocol, auth-policy ambiguity). Leaning: decide after R0 with a 1-day
-   spike each.
+1. ~~**Kind-vs-lane modeling**~~ **RESOLVED in R0**: kinds are
+   lane-homogeneous; structured lanes arrive as distinct kinds; `lane` is
+   current-state (not identity) so the Happy-style takeover/handoff stays
+   contract-compatible via a future session-level capability overlay.
+2. **Prototype agent for R3** — now three-way (see the R3 roadmap row):
+   opencode (front-runner: incremental Go on the existing `--port` transport;
+   t3code ships on the same v2 API) vs codex app-server (most mature protocol,
+   auth-policy ambiguity, new Go JSON-RPC client) vs cursor-ACP (t3code-proven
+   long-lived-child pattern, new Go ACP client). Decide with a short spike.
 3. **Porcelain name + scope** — agent-only vs future full client CLI.
 4. **Mobile push** — SSE-while-open is the R5 bar; true push (FCM/ntfy/relay)
    is unscoped. Decide when R4 lands.
-5. **Structured-lane sessions in `shed sessions`/tmux views** — a session with
-   no pane breaks the "tmux is the source of truth" invariant; the structured
-   lane needs its own registry inside the hub (in-memory + agent-side
-   persistence like codex `thread/resume`). Design detail for R0/R3.
+5. **Structured-session registry** — promoted to **R3's primary design
+   problem** (see the roadmap row): a session with no pane breaks "tmux is the
+   source of truth"; the hub needs its own registry (in-memory + agent-side
+   persistence like codex `thread/resume` / opencode server sessions), plus a
+   decision on how such sessions appear in `shed sessions`.
 6. **Auth posture per lane** — codex ChatGPT-auth opt-in wording; claude SDK
    credits (if a claude lane is ever wanted); opencode server password
    handling when the hub fronts it.
