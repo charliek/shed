@@ -49,6 +49,7 @@ type fakeOpencode struct {
 	eventStatus    int                                   // non-zero → /event replies this status and returns (e.g. 401)
 	messagesStatus int                                   // non-zero → /message replies this status (e.g. 500)
 	statusStatus   int                                   // non-zero → /session/status replies this status (e.g. 500)
+	questionStatus int                                   // non-zero → /question replies this status (e.g. 500)
 	beforeMessages func(call int64, ctx context.Context) // optional gate at the start of /message (call is 1-based)
 }
 
@@ -133,7 +134,12 @@ func newFakeOpencode(t *testing.T) *fakeOpencode {
 	mux.HandleFunc("/question", func(w http.ResponseWriter, r *http.Request) {
 		f.mu.Lock()
 		body := f.questionBody
+		st := f.questionStatus
 		f.mu.Unlock()
+		if st != 0 {
+			w.WriteHeader(st)
+			return
+		}
 		_, _ = io.WriteString(w, body)
 	})
 	f.ts = httptest.NewServer(mux)
@@ -1091,5 +1097,377 @@ func TestOpencodeWatcherCloseDuringRESTSeed(t *testing.T) {
 	case <-w.done:
 	case <-time.After(2 * time.Second):
 		t.Fatal("goroutine leaked (run did not exit after close during REST seed)")
+	}
+}
+
+// ---- approvals: fold state over the live transport ----
+
+// askThenReply starts a watcher against a busy fake opencode that announces ONE permission ask
+// (per_1, bash, metadata.command "ls -la") and then holds its matching permission.replied
+// ("once" → allow) until the returned channel is closed — the shared fixture for the two tests
+// that need a live ask whose resolution the test times.
+func askThenReply(t *testing.T) (*opencodeWatcher, *hubClock, chan struct{}) {
+	t.Helper()
+	f := newFakeOpencode(t)
+	f.statusBody = fmt.Sprintf(`{%q:{"type":"busy"}}`, ocFixtureSID)
+	ask := fmt.Sprintf(`{"type":"permission.asked","properties":{"id":"per_1","sessionID":%q,"permission":"bash","patterns":["ls"],"metadata":{"command":"ls -la"}}}`, ocFixtureSID)
+	replied := fmt.Sprintf(`{"type":"permission.replied","properties":{"sessionID":%q,"requestID":"per_1","reply":"once"}}`, ocFixtureSID)
+	release := make(chan struct{})
+	f.onEvent = func(conn int64, w io.Writer, flush func(), ctx context.Context) {
+		writeSSE(w, flush, sseServerConnected)
+		writeSSE(w, flush, ask)
+		select {
+		case <-release:
+			writeSSE(w, flush, replied)
+		case <-ctx.Done():
+			return
+		}
+		<-ctx.Done()
+	}
+	clk := opencodeClock()
+	w := newOpencodeWatcher(f.port(t), ocFixtureDir, ocFixtureSID, clk.now, nil)
+	t.Cleanup(w.close)
+	return w, clk, release
+}
+
+// A permission.asked on the live stream flips the watcher to needs_approval, publishes the
+// pending snapshot, and emits the approval_request row; the permission.replied that follows
+// resolves it (one resolved row) and releases the verdict. A needs_approval verdict is SETTLED,
+// so it stays authoritative while the transport is healthy.
+func TestOpencodeWatcherApprovalArc(t *testing.T) {
+	w, clk, release := askThenReply(t)
+
+	var rows []feedMessage
+	refreshUntil(t, w, clk, &rows, "the ask blocks the session", func() bool {
+		act, _, _, _ := w.snapshot(clk.now())
+		return act == ActivityNeedsApproval
+	})
+	_, _, fresh, expWorking := w.snapshot(clk.now())
+	if !fresh || expWorking {
+		t.Fatalf("needs_approval snapshot = fresh:%v expiredWorking:%v, want fresh:true (settled)", fresh, expWorking)
+	}
+	pend := w.pendingApprovals()
+	if len(pend) != 1 || pend[0].ID != "per_1" || pend[0].Status != approvalStatusPending || len(pend[0].Decisions) != 3 {
+		t.Fatalf("pendingApprovals = %+v, want the one open ask with three decisions", pend)
+	}
+	if status, decision, ok := w.approvalState("per_1"); !ok || status != approvalStatusPending || decision != "" {
+		t.Fatalf("approvalState = (%q,%q,%v), want (pending,\"\",true)", status, decision, ok)
+	}
+	if len(rows) != 1 || rows[0].Type != feedTypeApprovalRequest || rows[0].Approval == nil ||
+		rows[0].Approval.ID != "per_1" || rows[0].Tool == nil || rows[0].Tool.Detail != "ls -la" {
+		t.Fatalf("feed rows = %s, want one pending approval_request row with the command detail", formatOpencodeRows(rows))
+	}
+
+	close(release)
+	refreshUntil(t, w, clk, &rows, "the reply releases the session", func() bool {
+		act, _, _, _ := w.snapshot(clk.now())
+		return act == ActivityWorking
+	})
+	if got := w.pendingApprovals(); len(got) != 0 {
+		t.Fatalf("pendingApprovals after the reply = %+v, want empty", got)
+	}
+	if status, decision, ok := w.approvalState("per_1"); !ok || status != approvalStatusResolved || decision != approvalDecisionAllow {
+		t.Fatalf("approvalState after the reply = (%q,%q,%v), want (resolved,allow,true)", status, decision, ok)
+	}
+	if len(rows) != 2 || rows[1].Approval == nil || rows[1].Approval.Status != approvalStatusResolved ||
+		rows[1].Approval.Decision != approvalDecisionAllow {
+		t.Fatalf("feed rows = %s, want a second, resolved row carrying decision allow", formatOpencodeRows(rows))
+	}
+}
+
+// The dead-stream demotion, pinned: a needs_approval verdict is settled (trusted indefinitely
+// while healthy), but a wedged stream revokes that authority — snapshot reports BOTH flags
+// false so pane stability drives. An approval nobody is still watching for must not outlive
+// the evidence for it.
+func TestOpencodeWatcherNeedsApprovalDemotedOnDeadStream(t *testing.T) {
+	f := newFakeOpencode(t)
+	f.statusBody = fmt.Sprintf(`{%q:{"type":"busy"}}`, ocFixtureSID)
+	ask := fmt.Sprintf(`{"type":"permission.asked","properties":{"id":"per_1","sessionID":%q,"permission":"bash","patterns":["ls"]}}`, ocFixtureSID)
+	f.onEvent = func(conn int64, w io.Writer, flush func(), ctx context.Context) {
+		writeSSE(w, flush, sseServerConnected)
+		writeSSE(w, flush, ask)
+		<-ctx.Done() // no further frames (not even heartbeats): the stream goes stale
+	}
+
+	clk := opencodeClock()
+	w := newOpencodeWatcher(f.port(t), ocFixtureDir, ocFixtureSID, clk.now, nil)
+	t.Cleanup(w.close)
+
+	refreshUntil(t, w, clk, nil, "needs_approval, healthy", func() bool {
+		act, _, fresh, _ := w.snapshot(clk.now())
+		return act == ActivityNeedsApproval && fresh
+	})
+
+	clk.advance(ocFrameStaleWindow + time.Second)
+	w.refresh(clk.now())
+	act, _, fresh, expWorking := w.snapshot(clk.now())
+	if act != ActivityNeedsApproval {
+		t.Fatalf("activity = %q, want needs_approval (verdict retained, just untrusted)", act)
+	}
+	if fresh || expWorking {
+		t.Fatalf("heartbeat-stale needs_approval = fresh:%v expiredWorking:%v, want both false", fresh, expWorking)
+	}
+	if merged, _ := mergedActivity(act, "", fresh, expWorking, ActivityIdle); merged != ActivityIdle {
+		t.Fatalf("mergedActivity = %q, want idle (stability drives a dead stream)", merged)
+	}
+}
+
+// Restart/reconnect rebuild: the REST seed (GET /permission + /question, pin-filtered)
+// reconstructs the open-ask state — pending_approvals survives a hub restart as the contract
+// requires — and a reseed emits no duplicate rows.
+func TestOpencodeWatcherSeedRebuildsApprovals(t *testing.T) {
+	f := newFakeOpencode(t)
+	f.statusBody = fmt.Sprintf(`{%q:{"type":"busy"}}`, ocFixtureSID)
+	f.permissionBody = fmt.Sprintf(
+		`[{"id":"per_seed","sessionID":%q,"permission":"bash","patterns":["ls"],"metadata":{"command":"ls"}},`+
+			`{"id":"per_other","sessionID":"ses_other","permission":"edit","patterns":["x.go"]}]`, ocFixtureSID)
+	f.questionBody = fmt.Sprintf(`[{"id":"que_seed","sessionID":%q,"questions":[{"header":"Which file?"}]}]`, ocFixtureSID)
+	f.onEvent = func(conn int64, w io.Writer, flush func(), ctx context.Context) {
+		writeSSE(w, flush, sseServerConnected)
+		if conn == 1 {
+			return // drop the first connection → reconnect + full reseed
+		}
+		<-ctx.Done()
+	}
+
+	clk := opencodeClock()
+	w := newOpencodeWatcher(f.port(t), ocFixtureDir, ocFixtureSID, clk.now, nil)
+	t.Cleanup(w.close)
+
+	var rows []feedMessage
+	refreshUntil(t, w, clk, &rows, "the seed rebuilds the open asks", func() bool {
+		act, _, _, _ := w.snapshot(clk.now())
+		return act == ActivityNeedsApproval
+	})
+	pollUntil(t, "a reconnect reseeds", func() bool { return f.eventConns.Load() >= 2 })
+	refreshUntil(t, w, clk, &rows, "the reseed is folded", func() bool {
+		return f.messagesHits.Load() >= 2
+	})
+	// Drain once more so any row the reseed produced is observed before asserting.
+	w.refresh(clk.now())
+	rows = append(rows, w.drainPending()...)
+
+	pend := w.pendingApprovals()
+	if len(pend) != 1 || pend[0].ID != "per_seed" {
+		t.Fatalf("pendingApprovals = %+v, want only the pinned session's open ask", pend)
+	}
+	if _, _, ok := w.approvalState("per_other"); ok {
+		t.Error("another session's permission must never enter this watcher's fold (pin filter)")
+	}
+	var approvals, statusRows int
+	for _, m := range rows {
+		switch m.Type {
+		case feedTypeApprovalRequest:
+			approvals++
+		case feedTypeStatus:
+			statusRows++
+		}
+	}
+	if approvals != 1 || statusRows != 1 {
+		t.Fatalf("rows = %s, want exactly one approval row + one question status row across both seeds",
+			formatOpencodeRows(rows))
+	}
+}
+
+// A permission answered while the stream was down is retired by the next reseed: the seed's
+// authoritative open-ask set no longer lists it, so the fold closes it (with no decision — the
+// TUI answered, the hub cannot know which way) instead of blocking the session forever.
+func TestOpencodeWatcherSeedRetiresAnsweredApproval(t *testing.T) {
+	f := newFakeOpencode(t)
+	f.statusBody = fmt.Sprintf(`{%q:{"type":"busy"}}`, ocFixtureSID)
+	f.permissionBody = fmt.Sprintf(`[{"id":"per_1","sessionID":%q,"permission":"bash","patterns":["ls"]}]`, ocFixtureSID)
+	drop := make(chan struct{})
+	f.onEvent = func(conn int64, w io.Writer, flush func(), ctx context.Context) {
+		writeSSE(w, flush, sseServerConnected)
+		if conn == 1 {
+			<-drop // hold connection 1 open until the test answers the ask out-of-band
+			return
+		}
+		<-ctx.Done()
+	}
+
+	clk := opencodeClock()
+	w := newOpencodeWatcher(f.port(t), ocFixtureDir, ocFixtureSID, clk.now, nil)
+	t.Cleanup(w.close)
+
+	refreshUntil(t, w, clk, nil, "the seeded ask blocks the session", func() bool {
+		act, _, _, _ := w.snapshot(clk.now())
+		return act == ActivityNeedsApproval
+	})
+
+	// The operator answers in the TUI while our stream is down: the server stops listing it.
+	f.mu.Lock()
+	f.permissionBody = "[]"
+	f.mu.Unlock()
+	close(drop)
+
+	refreshUntil(t, w, clk, nil, "the reseed retires the answered ask", func() bool {
+		act, _, _, _ := w.snapshot(clk.now())
+		return act == ActivityWorking
+	})
+	if got := w.pendingApprovals(); len(got) != 0 {
+		t.Fatalf("pendingApprovals = %+v, want empty after the reseed", got)
+	}
+	status, decision, ok := w.approvalState("per_1")
+	if !ok || status != approvalStatusResolved || decision != "" {
+		t.Fatalf("approvalState = (%q,%q,%v), want (resolved,\"\",true)", status, decision, ok)
+	}
+}
+
+// markApprovalResolved is the verb handler's synchronous bookkeeping: it resolves under the
+// watcher mutex, updates the verdict immediately (no wait for the next tick), and dedupes
+// against the permission.replied event that follows — exactly one resolved row.
+func TestOpencodeWatcherMarkApprovalResolved(t *testing.T) {
+	w, clk, release := askThenReply(t)
+
+	var rows []feedMessage
+	refreshUntil(t, w, clk, &rows, "the ask blocks the session", func() bool {
+		act, _, _, _ := w.snapshot(clk.now())
+		return act == ActivityNeedsApproval
+	})
+
+	if !w.markApprovalResolved("per_1", approvalDecisionAllow) {
+		t.Fatal("markApprovalResolved must resolve the open ask")
+	}
+	// The verdict moves WITHOUT a refresh — the handler's answer must not lag a tick.
+	if act, _, _, _ := w.snapshot(clk.now()); act != ActivityWorking {
+		t.Fatalf("activity right after the local mark = %q, want working", act)
+	}
+	if w.markApprovalResolved("per_1", approvalDecisionAllow) {
+		t.Error("a same-decision replay must report false (already resolved, no second POST)")
+	}
+	// An id this fold never saw asked records a resolved tombstone (the C2 handler answers
+	// 404 before it would ever get here; the tombstone is what stops a later ask replay from
+	// re-opening an answered permission).
+	if !w.markApprovalResolved("per_unknown", approvalDecisionAllow) {
+		t.Error("an unseen id must record a tombstone")
+	}
+	if status, _, ok := w.approvalState("per_unknown"); !ok || status != approvalStatusResolved {
+		t.Errorf("tombstone state = (%q,%v), want (resolved,true)", status, ok)
+	}
+
+	// opencode's own event for per_1 now lands: still exactly one resolved row FOR per_1.
+	close(release)
+	pollUntil(t, "the replied frame is delivered", func() bool {
+		w.refresh(clk.now())
+		rows = append(rows, w.drainPending()...)
+		return len(rows) >= 2
+	})
+	w.refresh(clk.now())
+	rows = append(rows, w.drainPending()...)
+	resolved := 0
+	for _, m := range rows {
+		if m.Approval != nil && m.Approval.Status == approvalStatusResolved && m.Approval.ID == "per_1" {
+			resolved++
+		}
+	}
+	if resolved != 1 {
+		t.Fatalf("per_1 resolved rows = %d, want exactly 1 (local mark + event are one resolution):\n%s",
+			resolved, formatOpencodeRows(rows))
+	}
+}
+
+// The approvals map is the one piece of fold state a handler goroutine may write, so the
+// two-writer discipline (stream-fed refresh vs. verb-driven resolve) is exercised directly
+// under -race: concurrent markApprovalResolved / approvalState / pendingApprovals calls run
+// against a stream that keeps folding, and exactly one of the racers may claim each ask.
+func TestOpencodeWatcherApprovalsConcurrentAccess(t *testing.T) {
+	const asks = 20
+	f := newFakeOpencode(t)
+	f.statusBody = fmt.Sprintf(`{%q:{"type":"busy"}}`, ocFixtureSID)
+	f.onEvent = func(conn int64, w io.Writer, flush func(), ctx context.Context) {
+		writeSSE(w, flush, sseServerConnected)
+		for i := 0; i < asks; i++ {
+			writeSSE(w, flush, fmt.Sprintf(
+				`{"type":"permission.asked","properties":{"id":"per_%d","sessionID":%q,"permission":"bash","patterns":["ls"]}}`,
+				i, ocFixtureSID))
+		}
+		<-ctx.Done()
+	}
+
+	clk := opencodeClock()
+	w := newOpencodeWatcher(f.port(t), ocFixtureDir, ocFixtureSID, clk.now, nil)
+	t.Cleanup(w.close)
+
+	refreshUntil(t, w, clk, nil, "the asks are folded", func() bool {
+		return len(w.pendingApprovals()) == asks
+	})
+
+	var wg sync.WaitGroup
+	var resolvedCount atomic.Int64
+	for g := 0; g < 4; g++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 0; i < asks; i++ {
+				id := fmt.Sprintf("per_%d", i)
+				if w.markApprovalResolved(id, approvalDecisionAllow) {
+					resolvedCount.Add(1)
+				}
+				_, _, _ = w.approvalState(id)
+				_ = w.pendingApprovals()
+			}
+		}()
+	}
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 50; i++ {
+			w.refresh(clk.now())
+			_ = w.drainPending()
+		}
+	}()
+	wg.Wait()
+
+	if got := resolvedCount.Load(); got != asks {
+		t.Fatalf("resolutions claimed = %d, want %d (each ask resolves exactly once)", got, asks)
+	}
+	if got := w.pendingApprovals(); len(got) != 0 {
+		t.Fatalf("pendingApprovals = %+v, want empty once every ask is resolved", got)
+	}
+}
+
+// The seed marker's halves are independent END TO END: with GET /question failing on every
+// connection, GET /permission still carries authority, so an approval answered in the TUI is
+// retired by the next reseed. (Before the split, one failing read blocked all healing.)
+func TestOpencodeWatcherSeedHealsPermissionsWithQuestionReadFailing(t *testing.T) {
+	f := newFakeOpencode(t)
+	f.statusBody = fmt.Sprintf(`{%q:{"type":"busy"}}`, ocFixtureSID)
+	f.permissionBody = fmt.Sprintf(`[{"id":"per_1","sessionID":%q,"permission":"bash","patterns":["ls"]}]`, ocFixtureSID)
+	f.questionStatus = http.StatusInternalServerError // /question is down for the whole test
+	drop := make(chan struct{})
+	f.onEvent = func(conn int64, w io.Writer, flush func(), ctx context.Context) {
+		writeSSE(w, flush, sseServerConnected)
+		if conn == 1 {
+			<-drop
+			return
+		}
+		<-ctx.Done()
+	}
+
+	clk := opencodeClock()
+	w := newOpencodeWatcher(f.port(t), ocFixtureDir, ocFixtureSID, clk.now, nil)
+	t.Cleanup(w.close)
+
+	refreshUntil(t, w, clk, nil, "the seeded ask blocks the session", func() bool {
+		act, _, _, _ := w.snapshot(clk.now())
+		return act == ActivityNeedsApproval
+	})
+
+	// Answered in the TUI: the server stops listing it. The question read still fails.
+	f.mu.Lock()
+	f.permissionBody = "[]"
+	f.mu.Unlock()
+	close(drop)
+
+	refreshUntil(t, w, clk, nil, "the reseed retires the answered ask", func() bool {
+		act, _, _, _ := w.snapshot(clk.now())
+		return act == ActivityWorking
+	})
+	if got := w.pendingApprovals(); len(got) != 0 {
+		t.Fatalf("pendingApprovals = %+v, want empty — a failing /question must not block permission healing", got)
+	}
+	if w.hasOpenApprovals() {
+		t.Error("hasOpenApprovals must be false once the ask is retired")
 	}
 }

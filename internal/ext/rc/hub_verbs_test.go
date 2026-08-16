@@ -341,9 +341,9 @@ func TestVerbErrorCodeSpellings(t *testing.T) {
 }
 
 // The pending_approvals overlay: a hub-layer field the one-shot list path never sets.
-// No producer fills it in this phase, so the wire value is always absent — the test
-// pins BOTH halves of that seam (absent by default; copied, not aliased, when a future
-// lane publishes into it).
+// Nothing publishes it for a codex session (its approvals are answered in the TUI), so
+// the wire value stays absent — the test pins BOTH halves of the seam (absent by
+// default; copied, not aliased, when a lane publishes into it).
 func TestHubSessionsPendingApprovalsOverlay(t *testing.T) {
 	f := newHubTmux()
 	clk := &hubClock{t: time.Unix(1_700_000_000, 0).UTC()}
@@ -410,5 +410,66 @@ func TestHubSessionsPendingApprovalsOverlay(t *testing.T) {
 	if snapshot[0].Decisions[0] != approvalDecisionAllow {
 		t.Errorf("copied row aliases the tracked Decisions slice (got %q) — deep-copy required",
 			snapshot[0].Decisions[0])
+	}
+}
+
+// Reconcile republishes the lane's OPEN approvals into the session's pending_approvals
+// snapshot every tick (approvalPublisher). Pending-only by wire contract: a resolved entry
+// disappears from the snapshot, and its resolution state is answered by the watcher instead.
+// A watcher that does not publish leaves the field alone — it is not a blanket writer.
+func TestReconcilePublishesPendingApprovals(t *testing.T) {
+	f := newHubTmux()
+	clk := &hubClock{t: time.Unix(1_700_000_000, 0).UTC()}
+	h := newTestHub(f, clk)
+	f.set("rc-apv001", codexReadyPane(), managedEnv("id-a", KindCodex))
+	h.reconcile()
+
+	// White-box: attach a publishing watcher the way ensureWatcher commits a real one.
+	pub := &stubApprovalWatcher{stubWatcher: stubWatcher{activity: ActivityNeedsApproval, fresh: true}}
+	pub.approvals = []FeedApproval{{ID: "per_1", Status: approvalStatusPending,
+		Decisions: []string{approvalDecisionAllow, approvalDecisionAllowAlways, approvalDecisionDeny}}}
+	h.trackMu.Lock()
+	h.tracked["apv001"].watcher = pub
+	h.trackMu.Unlock()
+
+	h.reconcile()
+	h.trackMu.Lock()
+	got := h.tracked["apv001"].pendingApprovals
+	h.trackMu.Unlock()
+	if len(got) != 1 || got[0].ID != "per_1" || got[0].Status != approvalStatusPending {
+		t.Fatalf("pendingApprovals = %+v, want the lane's one open ask", got)
+	}
+
+	// It surfaces on the wire through the /v1/sessions overlay.
+	srv := httptest.NewServer(h.handler())
+	defer srv.Close()
+	var body hubSessionsResponse
+	getJSON(t, srv.URL+"/v1/sessions", &body)
+	if len(body.Sessions) != 1 || len(body.Sessions[0].PendingApprovals) != 1 ||
+		body.Sessions[0].PendingApprovals[0].ID != "per_1" {
+		t.Fatalf("session row pending_approvals = %+v, want the published snapshot", body.Sessions)
+	}
+
+	// Resolution is a REMOVAL from the snapshot (never a resolved entry in it).
+	pub.approvals = nil
+	h.reconcile()
+	h.trackMu.Lock()
+	got = h.tracked["apv001"].pendingApprovals
+	h.trackMu.Unlock()
+	if len(got) != 0 {
+		t.Fatalf("pendingApprovals after the lane cleared it = %+v, want empty", got)
+	}
+
+	// A non-publishing watcher must not blank a snapshot it does not own.
+	h.trackMu.Lock()
+	h.tracked["apv001"].watcher = &stubWatcher{activity: ActivityIdle}
+	h.tracked["apv001"].pendingApprovals = []FeedApproval{{ID: "pane-1", Status: approvalStatusPending}}
+	h.trackMu.Unlock()
+	h.reconcile()
+	h.trackMu.Lock()
+	got = h.tracked["apv001"].pendingApprovals
+	h.trackMu.Unlock()
+	if len(got) != 1 || got[0].ID != "pane-1" {
+		t.Fatalf("pendingApprovals = %+v, want the non-lane entry retained", got)
 	}
 }

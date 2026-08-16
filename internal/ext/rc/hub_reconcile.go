@@ -81,13 +81,14 @@ type trackedSession struct {
 
 	// pendingApprovals is the session's currently-open approval requests — the
 	// hub-layer source for Session.PendingApprovals, overlaid onto the /v1/sessions
-	// rows (see handleSessions). NOTHING writes it in this phase: no lane produces
-	// approvals yet, so reconcile never populates it and the overlay is always a
-	// no-op. It exists so the field is plumbed end-to-end now (contract fixed, value
-	// always absent on the wire) and a lane adapter has exactly one place to maintain
-	// the per-session pending map — including rebuilding it from its native protocol
-	// after a hub restart, which is the whole point of the snapshot: the feed ring's
-	// approval rows can be evicted or lost, this cannot.
+	// rows (see handleSessions). Reconcile republishes it every tick from the
+	// session's watcher when that watcher knows its lane's approvals
+	// (approvalPublisher — opencode today); kinds whose approvals are pane-derived
+	// leave it empty. PENDING ONLY by wire contract: it answers "what is still open",
+	// and resolution state stays in the watcher (approvalState) where the approvals
+	// verb reads it. Rebuilding it from the native protocol after a hub restart is the
+	// whole point of the snapshot: the feed ring's approval rows can be evicted or
+	// lost, this cannot.
 	pendingApprovals []FeedApproval
 }
 
@@ -204,6 +205,8 @@ func (h *Hub) reconcile() {
 		var watcherMessage string
 		watcherFresh, watcherExpiredWorking := false, false
 		var msgEvents []hubEvent
+		var pendingApprovals []FeedApproval
+		publishesApprovals := false
 		if watcher != nil {
 			watcher.refresh(now)
 			// A deferred (ambiguous-correlation) back-write happens only once the first
@@ -234,6 +237,15 @@ func (h *Hub) reconcile() {
 				seq := tr.ring.append(m, now)
 				msgEvents = append(msgEvents, messageAppendedEvent(s.Slug, seq))
 			}
+			// Republish the lane's OPEN approvals every tick (approvalPublisher — the same
+			// narrow type-assert precedent as confirmedAgentIDDrainer above). The snapshot is
+			// pending-only by wire contract: resolution state lives in the watcher's fold,
+			// where the approvals verb reads it. Read unlocked (the watcher self-synchronizes)
+			// and committed under trackMu below with the rest of the handler-visible fields.
+			if ap, ok := watcher.(approvalPublisher); ok {
+				pendingApprovals = ap.pendingApprovals()
+				publishesApprovals = true
+			}
 			watcherActivity, watcherMessage, watcherFresh, watcherExpiredWorking = watcher.snapshot(now)
 		}
 
@@ -241,6 +253,12 @@ func (h *Hub) reconcile() {
 		h.trackMu.Lock()
 		if newW != nil {
 			tr.watcher = newW
+		}
+		// Only a publishing watcher owns this field: a kind whose approvals are not lane-
+		// derived must keep whatever it holds (nothing today; the pane-anchor kinds populate
+		// it from reconcile in a later commit) rather than be blanked by an unrelated tick.
+		if publishesApprovals {
+			tr.pendingApprovals = pendingApprovals
 		}
 		if capErr == nil {
 			// Remember the raw stability verdict for the input handler's acceptance

@@ -39,10 +39,20 @@ import (
 //         (input:{}) tracks the call as open (working) but emits nothing. A tool part whose
 //         state.status is none of pending/running/completed/error is tolerantly ignored (no
 //         confirm, no pending-set change, no emit).
-//   - permission.asked / question.asked  → a display-only `status` feed row (role system);
-//     NO activity change. Emitted only when it carries meaningful content (a non-empty
-//     permission kind / at least one non-empty question); an empty/null-properties ask is
-//     ignored rather than emitting a hollow row.
+//   - permission.asked  → an OPEN APPROVAL: a tracked pending entry (which drives the
+//     activity verdict to needs_approval) plus an `approval_request` feed row carrying the
+//     addressable id and the decisions the lane honors. permission.replied closes the entry
+//     and appends the matching resolved row.
+//   - question.asked / question.replied / question.rejected  → a display-only `status` feed
+//     row (role system) as before, but an open question DOES count toward needs_approval.
+//     Questions never enter pending_approvals: their answer vocabulary is not the
+//     allow/allow_always/deny decision enum, so they are not addressable by the approvals
+//     verb (remote question-answering is a future contract extension). needs_approval with
+//     an empty pending_approvals is therefore a legal, expected state.
+//
+// Both asks are folded only when they carry meaningful content (a non-empty permission kind /
+// at least one non-empty question); an empty/null-properties ask is ignored rather than
+// emitting a hollow row.
 //
 // Everything else — message.part.removed, session.error, session.created/updated, server.*,
 // session.next.*, message.part.delta, step-start/step-finish, catalog/plugin, an unknown
@@ -65,15 +75,59 @@ type ocEnvelope struct {
 
 // ocProperties is the union of the properties fields the fold reads across event types.
 type ocProperties struct {
-	SessionID  string         `json:"sessionID"`
-	Status     *ocStatus      `json:"status"`     // session.status
-	Info       *ocMessageInfo `json:"info"`       // message.updated
-	Part       *ocPart        `json:"part"`       // message.part.updated
-	Time       int64          `json:"time"`       // message.part.updated update time (epoch ms)
-	ID         string         `json:"id"`         // permission.asked (per_…) / question.asked (que_…)
-	Permission string         `json:"permission"` // permission.asked kind ("bash", "edit", …)
-	Patterns   []string       `json:"patterns"`   // permission.asked matched commands/globs
-	Questions  []ocQuestion   `json:"questions"`  // question.asked
+	SessionID  string          `json:"sessionID"`
+	Status     *ocStatus       `json:"status"`     // session.status
+	Info       *ocMessageInfo  `json:"info"`       // message.updated
+	Part       *ocPart         `json:"part"`       // message.part.updated
+	Time       int64           `json:"time"`       // message.part.updated update time (epoch ms)
+	ID         string          `json:"id"`         // permission.asked (per_…) / question.asked (que_…)
+	Permission string          `json:"permission"` // permission.asked kind ("bash", "edit", …)
+	Patterns   []string        `json:"patterns"`   // permission.asked matched commands/globs
+	Metadata   *ocPermMetadata `json:"metadata"`   // permission.asked call detail (metadata.command)
+	Questions  []ocQuestion    `json:"questions"`  // question.asked
+
+	// RequestID / Reply are the reply-event fields (permission.replied,
+	// question.replied/rejected): opencode addresses the resolved request by requestID and
+	// names its native reply ("once"|"always"|"reject"). `id` is accepted as a tolerant
+	// fallback address (see replyTarget) — a missed resolution would strand an approval
+	// pending forever, which is the one failure mode worth being generous about. The
+	// question answers[] payload is deliberately NOT read: the fold only needs to know the
+	// question closed.
+	RequestID string `json:"requestID"`
+	Reply     string `json:"reply"`
+
+	// These four ride the hub-SYNTHESIZED approval-seed marker only (ocApprovalSeedType,
+	// pushed by the REST seed — see applyApprovalSeed). No opencode event carries them, and
+	// the live-stream routing whitelist (foldRelevantType) does not admit the marker's type,
+	// so they can only ever arrive from our own seed path. Each *Known flag says its half's
+	// REST read succeeded — only then is that half's id list authoritative.
+	PermissionIDs    []string `json:"permissionIDs"`
+	QuestionIDs      []string `json:"questionIDs"`
+	PermissionsKnown bool     `json:"permissionsKnown"`
+	QuestionsKnown   bool     `json:"questionsKnown"`
+}
+
+// ocApprovalSeedType is the type of the hub-synthesized envelope the REST seed pushes AFTER
+// the individual permission.asked/question.asked replays: it carries the authoritative set of
+// asks still open on the server, which is what lets the fold retire an ask that was answered
+// while the stream was down (applyApprovalSeed). Namespaced under `shed.` because it is ours,
+// not opencode's.
+const ocApprovalSeedType = "shed.approval.seed"
+
+// ocPermMetadata is permission.asked's metadata bag. Only the command is read — it is the
+// tool detail on the approval row (what the operator is being asked to allow).
+type ocPermMetadata struct {
+	Command string `json:"command"`
+}
+
+// replyTarget is the approval id a replied/rejected event addresses. opencode carries it as
+// requestID; `id` is a tolerant fallback so a spelling difference cannot strand a pending
+// entry (and with it, a stuck needs_approval verdict).
+func (p *ocProperties) replyTarget() string {
+	if p.RequestID != "" {
+		return p.RequestID
+	}
+	return p.ID
 }
 
 // ocStatus is session.status's status union, discriminated by type (busy|idle|retry).
@@ -162,16 +216,39 @@ type opencodeFold struct {
 
 	emitted map[string]bool // dedup: "<id>|<phase>" already emitted (survives reseed + gap)
 	msgs    []feedMessage   // produced-but-undrained feed messages
+
+	// pendingPerms tracks permission asks by their opencode id (per_…); permOrder keeps ask
+	// order for the pending_approvals snapshot. A RESOLVED entry is RETAINED (not deleted):
+	// the approvals verb must distinguish an id it never saw (404 unknown_approval) from one
+	// already answered (same-decision replay is idempotent, a different decision is 409
+	// already_resolved) — see approvalState. Growth is bounded by the session's total asks,
+	// like the emitted dedup set.
+	pendingPerms map[string]*ocPendingPerm
+	permOrder    []string
+	// pendingQuestions holds the OPEN question.asked ids → their summary text. Questions
+	// count toward needs_approval but never enter pending_approvals (see the file doc).
+	pendingQuestions map[string]string
+}
+
+// ocPendingPerm is one permission ask: the summary text it produced (so the resolved row can
+// repeat it) plus its resolution state. Keyed by the opencode request id (per_… — the approvals
+// verb's address); the ask's kind/detail ride the pending row only and are not retained.
+type ocPendingPerm struct {
+	text     string // the sanitized human-readable summary carried by both rows
+	resolved bool
+	decision string // the contract decision that resolved it ("" when resolved outside the hub)
 }
 
 func newOpencodeFold() *opencodeFold {
 	return &opencodeFold{
-		pending:      map[string]bool{},
-		msgRole:      map[string]string{},
-		msgCreated:   map[string]int64{},
-		msgCompleted: map[string]int64{},
-		parts:        map[string]*ocPartCache{},
-		emitted:      map[string]bool{},
+		pending:          map[string]bool{},
+		msgRole:          map[string]string{},
+		msgCreated:       map[string]int64{},
+		msgCompleted:     map[string]int64{},
+		parts:            map[string]*ocPartCache{},
+		emitted:          map[string]bool{},
+		pendingPerms:     map[string]*ocPendingPerm{},
+		pendingQuestions: map[string]string{},
 	}
 }
 
@@ -236,29 +313,18 @@ func (f *opencodeFold) applyLine(line []byte) bool {
 			return false // step-start, step-finish, file, agent, subtask, snapshot, …
 		}
 	case "permission.asked":
-		// Require a meaningful permission kind: absent/null properties (or an empty kind)
-		// must not fabricate a hollow "awaiting approval:" row.
-		if props.Permission == "" {
-			return false
-		}
-		text := "awaiting approval: " + props.Permission
-		if len(props.Patterns) > 0 {
-			text += " — " + strings.Join(props.Patterns, ", ")
-		}
-		f.emitStatusRow("perm", props.ID, text)
-		return true
+		return f.applyPermissionAsked(&props)
+	case "permission.replied":
+		// Map opencode's native reply back onto the contract's decision enum. An
+		// unrecognized/absent reply still CLOSES the ask (with no decision): the request is
+		// demonstrably answered, and a stuck entry would pin needs_approval forever.
+		return f.resolvePermission(props.replyTarget(), opencodeDecisionFromReply(props.Reply))
 	case "question.asked":
-		// Require at least one question with real text: no questions (or an empty question)
-		// must not fabricate a hollow "awaiting answer:" row.
-		if len(props.Questions) == 0 {
-			return false
-		}
-		hdr := firstNonEmpty(props.Questions[0].Header, props.Questions[0].Text)
-		if hdr == "" {
-			return false
-		}
-		f.emitStatusRow("ques", props.ID, "awaiting answer: "+hdr)
-		return true
+		return f.applyQuestionAsked(&props)
+	case "question.replied", "question.rejected":
+		return f.clearQuestion(props.replyTarget())
+	case ocApprovalSeedType:
+		return f.applyApprovalSeed(&props)
 	default:
 		// session.created/updated, session.error, message.part.removed, message.part.delta,
 		// session.next.*, server.*, catalog/plugin, and any unknown type: ignored.
@@ -425,6 +491,270 @@ func (f *opencodeFold) applyToolPart(p *ocPart, updTime int64) bool {
 	return true
 }
 
+// ---- approvals (permission asks + questions) ----
+
+// applyPermissionAsked tracks a permission ask and emits its PENDING approval_request row.
+//
+// An ask with NO id stays on the pre-approvals display-only status-row path: the id is both
+// the row's wire address (FeedApproval.ID, which the approvals verb resolves) and the key a
+// permission.replied clears, so an id-less ask could never be answered remotely NOR retired —
+// tracking it would pin needs_approval forever on a session nothing can unblock.
+//
+// A re-ask of an id already tracked is usually a reseed replay and changes nothing — with ONE
+// exception, the REOPEN rule: an entry resolved with an EMPTY decision was closed by
+// applyApprovalSeed (or by a reply whose vocabulary we could not read), i.e. it was retired on
+// the evidence "the server no longer lists it". A later ask for that same id is NEWER, stronger
+// evidence that it IS open — a stale/racing REST snapshot retired it wrongly — so the entry is
+// reopened and its rows re-announced (both dedup slots are cleared, since the client needs the
+// pending row again to render the buttons). An entry resolved with a KNOWN decision stays
+// closed: a real reply was observed for it, and no ask replay outranks that.
+func (f *opencodeFold) applyPermissionAsked(props *ocProperties) bool {
+	// Require a meaningful permission kind: absent/null properties (or an empty kind) must
+	// not fabricate a hollow "awaiting approval:" row.
+	if props.Permission == "" {
+		return false
+	}
+	text := "awaiting approval: " + props.Permission
+	if len(props.Patterns) > 0 {
+		text += " — " + strings.Join(props.Patterns, ", ")
+	}
+	if props.ID == "" {
+		f.emitStatusRow("perm", "", text)
+		return true
+	}
+	if ent, seen := f.pendingPerms[props.ID]; seen {
+		if !ent.resolved || ent.decision != "" {
+			return false // still open, or genuinely answered: a replay is not a state change
+		}
+		// REOPEN (see the doc): drop the resolution and both dedup slots so the pending row is
+		// re-announced and a later real resolution can emit its own row.
+		ent.resolved = false
+		ent.text = text
+		delete(f.emitted, permKey(props.ID, approvalStatusPending))
+		delete(f.emitted, permKey(props.ID, approvalStatusResolved))
+	} else {
+		f.pendingPerms[props.ID] = &ocPendingPerm{text: text}
+		f.permOrder = append(f.permOrder, props.ID)
+	}
+	var detail string
+	if props.Metadata != nil {
+		detail = props.Metadata.Command
+	}
+	// An open approval IS the activity verdict now (needs_approval), so — unlike the old
+	// display-only row — an ask is activity-relevant evidence and confirms the fold.
+	f.confirmed = true
+	f.emitOnce(permKey(props.ID, approvalStatusPending), feedMessage{
+		Role: feedRoleTool,
+		Type: feedTypeApprovalRequest,
+		Text: text,
+		Tool: &feedTool{Name: props.Permission, Detail: detail},
+		Approval: &FeedApproval{
+			ID:        props.ID,
+			Status:    approvalStatusPending,
+			Decisions: opencodeDecisions(),
+		},
+	})
+	return true
+}
+
+// resolvePermission marks an open ask resolved with decision (which may be "" when the answer
+// happened outside the hub) and appends the RESOLVED approval row.
+//
+// IDEMPOTENT BY DESIGN, and that is load-bearing: the approvals verb marks an entry resolved
+// synchronously the moment its POST succeeds (so a same-decision replay cannot re-POST), and
+// opencode's own permission.replied event for the same id arrives on the stream moments later.
+// Exactly one resolved row must reach the feed, so the second call is a no-op.
+//
+// A reply for an id this fold never saw asked (the ask predates the watcher, or a gap swallowed
+// it) records a resolved TOMBSTONE rather than being dropped: without it a later ask replay —
+// a reseed racing the reply, or history the server had not yet dropped — would open a PENDING
+// entry for a permission that is demonstrably answered, stranding the session at
+// needs_approval. The tombstone makes that replay hit the resolved-with-a-known-decision no-op
+// above. Its resolved row still goes out (the client folding rule explicitly allows a resolved
+// row with no pending row before it).
+//
+// Accepted, not fixed: an entry the approvals verb resolved that a reconnect's GET /permission
+// still lists stays resolved here — the ask replay's reopen rule does not apply to it because
+// its decision is known. That contradicts a reply the server acknowledged, and it self-heals
+// the moment the TUI drops the request from its store.
+func (f *opencodeFold) resolvePermission(id, decision string) bool {
+	if id == "" {
+		return false
+	}
+	ent := f.pendingPerms[id]
+	switch {
+	case ent == nil:
+		ent = &ocPendingPerm{text: "approval resolved"}
+		f.pendingPerms[id] = ent
+		f.permOrder = append(f.permOrder, id)
+	case ent.resolved:
+		return false
+	}
+	ent.resolved = true
+	ent.decision = decision
+	f.emitOnce(permKey(id, approvalStatusResolved), feedMessage{
+		Role:     feedRoleTool,
+		Type:     feedTypeApprovalRequest,
+		Text:     ent.text,
+		Approval: &FeedApproval{ID: id, Status: approvalStatusResolved, Decision: decision},
+	})
+	return true
+}
+
+// applyQuestionAsked emits the display-only status row for a question and, when the question
+// is addressable (it carries an id), tracks it as open so it counts toward needs_approval. An
+// id-less question is display-only for the same reason an id-less permission is: nothing could
+// ever clear it.
+func (f *opencodeFold) applyQuestionAsked(props *ocProperties) bool {
+	// Require at least one question with real text: no questions (or an empty question) must
+	// not fabricate a hollow "awaiting answer:" row.
+	if len(props.Questions) == 0 {
+		return false
+	}
+	hdr := firstNonEmpty(props.Questions[0].Header, props.Questions[0].Text)
+	if hdr == "" {
+		return false
+	}
+	text := "awaiting answer: " + hdr
+	f.emitStatusRow("ques", props.ID, text)
+	if props.ID != "" {
+		if _, seen := f.pendingQuestions[props.ID]; !seen {
+			f.pendingQuestions[props.ID] = text
+			f.confirmed = true // an open question is the needs_approval verdict (see applyPermissionAsked)
+		}
+	}
+	return true
+}
+
+// clearQuestion retires an open question (question.replied / question.rejected). No feed row:
+// the ask's row was display-only, and questions carry no approval state to resolve.
+func (f *opencodeFold) clearQuestion(id string) bool {
+	if id == "" {
+		return false
+	}
+	if _, open := f.pendingQuestions[id]; !open {
+		return false
+	}
+	delete(f.pendingQuestions, id)
+	return true
+}
+
+// applyApprovalSeed reconciles the fold's open asks against the REST seed's AUTHORITATIVE view
+// of what is still open on the server (GET /permission + GET /question, pin-filtered). Every
+// reconnect reseeds, which is what makes this the SELF-HEALING path: a permission.replied or
+// question.replied lost to a disconnect or an inbox gap leaves a locally-open entry the server
+// no longer lists, and it is retired here. Such a permission is closed with NO decision — the
+// answer was given in the TUI, and the hub cannot know which way it went.
+//
+// The two halves carry INDEPENDENT authority (permsKnown / questionsKnown): a failed REST read
+// must never be mistaken for "nothing is open", which would retire live approvals — but neither
+// may it block the other's healing. GET /permission succeeding while GET /question fails still
+// retires answered permissions, and vice versa.
+func (f *opencodeFold) applyApprovalSeed(props *ocProperties) bool {
+	changed := false
+	if props.PermissionsKnown {
+		openPerms := idSet(props.PermissionIDs)
+		for _, id := range f.permOrder {
+			// resolvePermission is the guard: an entry already resolved reports false.
+			if !openPerms[id] && f.resolvePermission(id, "") {
+				changed = true
+			}
+		}
+	}
+	if props.QuestionsKnown {
+		openQuestions := idSet(props.QuestionIDs)
+		for id := range f.pendingQuestions {
+			if !openQuestions[id] {
+				delete(f.pendingQuestions, id)
+				changed = true
+			}
+		}
+	}
+	return changed
+}
+
+// idSet lifts an id list to a membership set.
+func idSet(ids []string) map[string]bool {
+	set := make(map[string]bool, len(ids))
+	for _, id := range ids {
+		set[id] = true
+	}
+	return set
+}
+
+// openApprovals counts what the session is BLOCKED on: unresolved permission asks plus open
+// questions. Both drive activity needs_approval; only the permissions are addressable.
+func (f *opencodeFold) openApprovals() int {
+	n := len(f.pendingQuestions)
+	for _, ent := range f.pendingPerms {
+		if !ent.resolved {
+			n++
+		}
+	}
+	return n
+}
+
+// approvalState reports a tracked ask's status/decision. ok=false means the id is unknown to
+// this fold — the approvals verb's 404 unknown_approval. This, NOT the pending_approvals
+// snapshot, is the resolution-state oracle: the snapshot is pending-only by wire contract.
+func (f *opencodeFold) approvalState(id string) (status, decision string, ok bool) {
+	ent := f.pendingPerms[id]
+	if ent == nil {
+		return "", "", false
+	}
+	if ent.resolved {
+		return approvalStatusResolved, ent.decision, true
+	}
+	return approvalStatusPending, "", true
+}
+
+// pendingApprovals renders the still-open permission asks as the wire's pending_approvals
+// snapshot, in ask order. Freshly allocated on every call (the decisions slice included) so a
+// consumer can hand it straight to the session DTO without aliasing fold state.
+func (f *opencodeFold) pendingApprovals() []FeedApproval {
+	var out []FeedApproval
+	for _, id := range f.permOrder {
+		ent := f.pendingPerms[id]
+		if ent == nil || ent.resolved {
+			continue
+		}
+		out = append(out, FeedApproval{
+			ID:        id,
+			Status:    approvalStatusPending,
+			Decisions: opencodeDecisions(),
+		})
+	}
+	return out
+}
+
+// opencodeDecisions is the decision set opencode's session-scoped reply route honors
+// (once/always/reject), in contract spelling. A FRESH slice per call: every copy of it ends up
+// on the wire in a row or a snapshot that must not alias another's.
+func opencodeDecisions() []string {
+	return []string{approvalDecisionAllow, approvalDecisionAllowAlways, approvalDecisionDeny}
+}
+
+// permKey is the emit/dedup key for one phase (pending|resolved) of an approval row. Distinct
+// from emitStatusRow's "perm|id:<id>" key so the two paths can never collide.
+func permKey(id, phase string) string { return "perm|id:" + id + "|" + phase }
+
+// opencodeDecisionFromReply maps opencode's native permission reply vocabulary onto the
+// contract's decision enum (the inverse of what the approvals verb sends: allow→once,
+// allow_always→always, deny→reject). An unrecognized/absent reply maps to "" — "resolved,
+// decision unknown", which still closes the ask (see the permission.replied arm).
+func opencodeDecisionFromReply(reply string) string {
+	switch reply {
+	case "once":
+		return approvalDecisionAllow
+	case "always":
+		return approvalDecisionAllowAlways
+	case "reject":
+		return approvalDecisionDeny
+	default:
+		return ""
+	}
+}
+
 // emitOnce queues a feed message unless its dedup key was already emitted; empty-text
 // non-tool messages are dropped (and do NOT consume the dedup slot, so a later non-empty
 // snapshot of the same part can still emit). Returns true when a message was queued.
@@ -490,6 +820,12 @@ func (f *opencodeFold) activity() Activity {
 	if !f.confirmed {
 		return ActivityUnknown
 	}
+	// needs_approval is checked BEFORE the pending-tool arm: the tool call that triggered the
+	// ask is still open (opencode holds it) so the pending set says "working", but the session
+	// is blocked on the operator, not on the model. The block is what the client must see.
+	if f.openApprovals() > 0 {
+		return ActivityNeedsApproval
+	}
 	if len(f.pending) > 0 {
 		return ActivityWorking
 	}
@@ -499,7 +835,21 @@ func (f *opencodeFold) activity() Activity {
 	return ActivityWorking
 }
 
-func (f *opencodeFold) settled() bool { return f.activity() == ActivityNeedsInput }
+// settled reports an EVENT-BOUNDED end state — one that stays true until an event changes it,
+// so the transport trusts it indefinitely while the stream is healthy (snapshot's freshness
+// rule) instead of expiring it after the 30 s window. needs_approval qualifies alongside
+// needs_input: an open ask is cleared only by a replied/rejected event or a reseed, never by
+// the passage of time. (A DEAD stream is the deliberate exception — see snapshot: an unhealthy
+// transport reports not-fresh and pane stability drives, so a needs_approval derived from a
+// wedged connection cannot outlive the evidence for it.)
+func (f *opencodeFold) settled() bool {
+	switch f.activity() {
+	case ActivityNeedsInput, ActivityNeedsApproval:
+		return true
+	default:
+		return false
+	}
+}
 
 func (f *opencodeFold) lastMessage() string { return SanitizeLastMessage(f.lastMsg) }
 
@@ -527,6 +877,11 @@ func (f *opencodeFold) applyStatusFallback(idle bool) bool {
 // verdict at working. It KEEPS the emitted-part dedup set (and the cached snapshots) so
 // reseed idempotency survives a gap: after the transport forces a full reconnect+reseed,
 // the replayed history must not re-emit rows it already produced.
+//
+// The open-approval state is deliberately KEPT too: unlike a tool call, an approval that the
+// gap may have swallowed a reply for is retired authoritatively by the reseed's approval-seed
+// marker (applyApprovalSeed), so clearing it here would only blink needs_approval off and back
+// on for the sessions whose asks are genuinely still open.
 func (f *opencodeFold) noteGap() {
 	f.pending = map[string]bool{}
 }

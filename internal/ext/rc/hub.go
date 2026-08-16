@@ -307,12 +307,12 @@ func (h *Hub) handleSessions(w http.ResponseWriter, _ *http.Request) {
 		}
 		// pending_approvals is a HUB-LAYER overlay (the one-shot List above never
 		// sets it): the open-approval snapshot that keeps a session actionable after
-		// the feed ring evicted the rows announcing them. Nothing populates
-		// tr.pendingApprovals in this phase, so this is always a no-op and the field
-		// stays absent on the wire — the seam exists so a lane adapter has exactly
-		// one place to publish from. Copied, never aliased: the response row must not
-		// share a slice with live hub state. An empty snapshot copies to nil, which
-		// omitempty drops — hence no guard.
+		// the feed ring evicted the rows announcing them. Reconcile republishes
+		// tr.pendingApprovals each tick from the lane that knows its approvals
+		// (opencode today); for every other kind it stays empty and omitempty drops
+		// the field. Copied, never aliased: the response row must not share a slice
+		// with live hub state. An empty snapshot copies to nil, which omitempty
+		// drops — hence no guard.
 		sessions[i].PendingApprovals = copyApprovals(tr.pendingApprovals)
 	}
 	h.trackMu.Unlock()
@@ -558,6 +558,23 @@ func (h *Hub) handleInput(w http.ResponseWriter, r *http.Request) {
 //   - merged working → reject. This covers a fresh working verdict AND the
 //     expired-working case (a >120s-quiet tool call whose stability is not settled) —
 //     delivering mid-turn would interleave input into an active turn.
+//   - merged needs_approval → reject. An approval dialog OWNS the keyboard: the pane
+//     is quiet and may even still match the composer anchor, so without this arm a
+//     posted line would be typed straight into the dialog and answer it by accident.
+//     This arm covers the kinds whose approval state is lane-derived (opencode).
+//   - the watcher reports ANY open approval (approvalBlocker) → reject, DELIBERATELY
+//     IGNORING transport health and freshness. The arm above rides the merge, and the
+//     merge demotes an unhealthy watcher to pane stability — so a wedged SSE stream
+//     would re-open exactly the hole the merge arm closes, with a real dialog still on
+//     the pane. The asymmetry is intentional: a stale reject costs the caller a retry
+//     once the reseed clears the ask, a stale accept costs an approval nobody meant to
+//     give. It also catches opencode QUESTIONS, which block the keyboard but never
+//     appear in pending_approvals.
+//   - the kind's ApprovalAnchor visible on the FRESH pane → reject. Same hole, other
+//     evidence: for kinds whose approval state is derived from the pane rather than
+//     from a lane, the anchor is the only signal, and it must be consulted against the
+//     pane captured for THIS delivery. No kind declares an anchor yet (the field is
+//     nil everywhere until the codex/cursor anchors land), so the arm is inert today.
 //   - a FRESH watcher needs_input → accept outright (the structured signal is settled
 //     and authoritative; the pane may legitimately not match the anchor).
 //   - anything else (merged idle/unknown, or a stability-derived needs_input whose
@@ -575,7 +592,13 @@ func (h *Hub) inputAccepted(watcher sessionWatcher, stability Activity, kind Kin
 		watcherAct, _, watcherFresh, expiredWorking = watcher.snapshot(h.cfg.now())
 	}
 	merged, _ := mergedActivity(watcherAct, "", watcherFresh, expiredWorking, stability)
-	if merged == ActivityWorking {
+	if merged == ActivityWorking || merged == ActivityNeedsApproval {
+		return false
+	}
+	if blocker, ok := watcher.(approvalBlocker); ok && blocker.hasOpenApprovals() {
+		return false
+	}
+	if anchor := approvalAnchorFor(kind); anchor != nil && anchor.MatchString(pane) {
 		return false
 	}
 	if watcherFresh && watcherAct == ActivityNeedsInput {

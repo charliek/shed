@@ -29,12 +29,16 @@ const (
 	ActivityUnknown Activity = "unknown"
 
 	// ActivityNeedsApproval — the session is blocked on an approval the operator
-	// must answer. This is a LEGAL WIRE VALUE of the contract (clients must decode
-	// and render it), not a reserved placeholder: it decodes distinctly in every
-	// mirror and flows end-to-end through the hub events → aggregator → client
-	// projection path. No derivation produces it YET — the derivations land in later
-	// phases (cursor's hook stream, the structured lanes' native approval events),
-	// and until one does, approval handling in practice remains "open the TUI".
+	// must answer. Produced today by the opencode watcher's fold, from that lane's
+	// native permission/question events (an open ask outranks the tool call it
+	// suspended: the model is not working, the operator is). The pane-derived
+	// producers for the kinds whose approvals never reach a protocol land alongside
+	// their anchors.
+	//
+	// A needs_approval session does NOT necessarily carry pending_approvals: an
+	// opencode QUESTION blocks the session but is not addressable by the approvals
+	// verb, so the snapshot is legitimately empty and the client's affordance is
+	// "open the TUI".
 	ActivityNeedsApproval Activity = "needs_approval"
 )
 

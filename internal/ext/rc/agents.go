@@ -71,6 +71,18 @@ type AgentSpec struct {
 	// pane-derived and that expose no anchor. Matched against the RAW captured pane
 	// (not the normalized snapshot) so composer chrome survives.
 	PromptAnchor *regexp.Regexp
+	// ApprovalAnchor matches a pane showing this tool's APPROVAL dialog — the chrome a
+	// TUI puts up when it is blocked on the operator's yes/no. It is the pane-side
+	// counterpart to a lane's native approval events: kinds whose approvals never reach
+	// a protocol (codex's rollout carries no approval record; cursor has no approval
+	// hook) can only be known to be blocked by looking at the pane. Two consumers: the
+	// input gate rejects a post while it matches (typed input would answer the dialog by
+	// accident), and reconcile derives needs_approval from it.
+	//
+	// nil for EVERY kind in this commit — the anchors themselves (option-line chrome,
+	// with fixtures) land with the codex and cursor work. Matched, like PromptAnchor,
+	// against the RAW captured pane so dialog chrome survives normalization.
+	ApprovalAnchor *regexp.Regexp
 }
 
 // PaneResult is a Classify outcome: the derived lifecycle state plus the optional
@@ -294,6 +306,17 @@ var agentRegistry = []*AgentSpec{
 func promptAnchorFor(k Kind) *regexp.Regexp {
 	if spec, ok := specForKind(k); ok {
 		return spec.PromptAnchor
+	}
+	return nil
+}
+
+// approvalAnchorFor returns the kind's approval-dialog regex, or nil for an unregistered
+// kind or a spec that declares none (every spec today — see AgentSpec.ApprovalAnchor).
+// nil means "this kind has no pane-derived approval signal", which callers must treat as
+// "no evidence", never as "not blocked".
+func approvalAnchorFor(k Kind) *regexp.Regexp {
+	if spec, ok := specForKind(k); ok {
+		return spec.ApprovalAnchor
 	}
 	return nil
 }

@@ -34,10 +34,18 @@ import (
 //     (c) sets the discovered-confirmedID slot. It NEVER holds the lock across a network
 //     wait (Do / Body.Read / backoff sleep).
 //   - refresh(now) — called by reconcile on the MAIN goroutine — is the ONLY place the
-//     fold is mutated: under the mutex it drains the inbox → fold.applyLine, handles the
-//     seedComplete / overflowGap markers, and reads the fold's verdict + feed. The
-//     opencodeFold is NOT concurrency-safe (watch_opencode.go); this single-writer-under-
-//     mutex discipline is exactly what makes it safe.
+//     STREAM mutates the fold: under the mutex it drains the inbox → fold.applyLine, handles
+//     the seedComplete / overflowGap markers, and reads the fold's verdict + feed.
+//   - The ONE exception, and the only fold state written off the reconcile goroutine, is the
+//     APPROVALS map: markApprovalResolved records a resolution from the HTTP goroutine the
+//     moment the approvals verb's upstream POST succeeds (it must be synchronous — a
+//     same-decision replay arriving before the next tick would otherwise re-POST), and
+//     approvalState/pendingApprovals read it from handler goroutines. Every one of those
+//     takes the SAME watcher mutex, so the fold still has exactly one writer at a time; what
+//     changed versus plan 007 is only WHICH goroutine may be that writer.
+//
+// The opencodeFold is NOT concurrency-safe (watch_opencode.go); this
+// single-writer-under-the-watcher-mutex discipline is exactly what makes it safe.
 //
 // See §3.3 (correlation state machine), §3.4 (transport), §3.6 (transport-health
 // freshness) of the plan for the authoritative behavior this implements.
@@ -96,6 +104,8 @@ type opencodeWatcher struct {
 var (
 	_ sessionWatcher          = (*opencodeWatcher)(nil)
 	_ confirmedAgentIDDrainer = (*opencodeWatcher)(nil)
+	_ approvalPublisher       = (*opencodeWatcher)(nil)
+	_ approvalBlocker         = (*opencodeWatcher)(nil)
 )
 
 // confirmedAgentIDDrainer is the second, small interface reconcile type-asserts on a
@@ -104,6 +114,23 @@ var (
 // exactly. Only opencodeWatcher implements it — the fileWatchers correlate off-line.
 type confirmedAgentIDDrainer interface {
 	drainConfirmedAgentID() string
+}
+
+// approvalPublisher is the third such interface: a watcher whose lane knows which approvals
+// are still open, so reconcile can publish them into the session's pending_approvals snapshot
+// each tick. PENDING ONLY — resolution state stays in the watcher (approvalState), because the
+// wire contract defines pending_approvals as "what is still open", not an approval log. Only
+// opencodeWatcher implements it today; a watcher that does not leaves the snapshot untouched.
+type approvalPublisher interface {
+	pendingApprovals() []FeedApproval
+}
+
+// approvalBlocker is the input gate's counterpart to approvalPublisher: "is this session
+// currently blocked on an approval it would type an answer into?". Separate because it is a
+// STRICTLY WIDER question than the snapshot — it counts open questions too, which are never
+// addressable and so never appear in pending_approvals, yet own the keyboard exactly the same.
+type approvalBlocker interface {
+	hasOpenApprovals() bool
 }
 
 // inboxKind discriminates the records the goroutine pushes onto the inbox.
@@ -478,6 +505,77 @@ func (w *opencodeWatcher) getPinned() string {
 	return w.pinnedID
 }
 
+// ---- approvals: the fold state handler goroutines may touch (see the CONCURRENCY MODEL) ----
+
+// approvalState reports a tracked approval's status/decision, or ok=false when this session
+// never saw the id. It is the approvals verb's oracle for the 404-vs-replay-vs-conflict
+// decision — deliberately NOT the pending_approvals snapshot, which is pending-only and so
+// cannot distinguish "already answered" from "never existed". A CLOSED watcher answers
+// not-found: its session is gone, so no id is resolvable through it.
+func (w *opencodeWatcher) approvalState(id string) (status, decision string, ok bool) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.closed {
+		return "", "", false
+	}
+	return w.fold.approvalState(id)
+}
+
+// markApprovalResolved records a resolution the HUB performed (the approvals verb's upstream
+// POST returned 200) without waiting for opencode's permission.replied event to come back
+// around the stream. Synchronous on purpose: a same-decision replay arriving before the next
+// reconcile tick must see the entry already resolved and answer idempotently instead of
+// re-POSTing. Emission stays single: the fold's resolve is idempotent, so the later
+// permission.replied for the same id adds no second row.
+//
+// Returns true when THIS call resolved the entry (false = unknown id, already resolved, or a
+// closed watcher).
+func (w *opencodeWatcher) markApprovalResolved(id, decision string) bool {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.closed {
+		return false
+	}
+	if !w.fold.resolvePermission(id, decision) {
+		return false
+	}
+	// Re-derive the cached verdict and collect the resolved row under the SAME lock, so a
+	// session whose only blocker was this approval stops reporting needs_approval immediately
+	// rather than at the next tick. lastEventAt is deliberately NOT stamped: it tracks STREAM
+	// evidence, and a local resolve is not a frame.
+	w.curActivity = w.fold.activity()
+	w.curSettled = w.fold.settled()
+	w.pending = append(w.pending, w.fold.drainMessages()...)
+	return true
+}
+
+// pendingApprovals returns the still-open approvals for reconcile to publish (approvalPublisher).
+// Freshly allocated per call — the caller stores it in handler-visible state.
+func (w *opencodeWatcher) pendingApprovals() []FeedApproval {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.closed {
+		return nil
+	}
+	return w.fold.pendingApprovals()
+}
+
+// hasOpenApprovals reports whether ANY ask (permission or question) is still open, for the
+// input gate (approvalBlocker). Deliberately independent of transport health and freshness:
+// when the stream wedges, the activity verdict is demoted to pane stability and the gate's
+// merged-needs_approval arm stops firing — but a dialog the operator has not answered is still
+// on the pane, and a posted line would answer it by accident. The asymmetry is intentional:
+// a stale reject costs a retry after the next reseed, a stale accept costs an unintended
+// approval. A CLOSED watcher blocks nothing (its session is gone).
+func (w *opencodeWatcher) hasOpenApprovals() bool {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.closed {
+		return false
+	}
+	return w.fold.openApprovals() > 0
+}
+
 func (w *opencodeWatcher) isClosed() bool {
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -724,16 +822,35 @@ func (w *opencodeWatcher) seedHistory(id string) (seedFallback, error) {
 	}
 	fb := seedFallback{set: true, idle: !present || statusType == "idle"}
 
-	for _, p := range w.restPermissions(id) {
+	// Open asks: replay each one (deduped by the fold), collecting its id, then push the
+	// approval-seed marker carrying the authoritative open-id sets. That marker is what retires
+	// an ask answered while the stream was down (applyApprovalSeed). The two reads carry
+	// INDEPENDENT authority: whichever succeeded marks its half known, so a FAILED read is never
+	// folded as "nothing is open" AND never blocks the other half from healing.
+	perms, permsOK := w.restPermissions(id)
+	permIDs := make([]string, 0, len(perms))
+	for _, p := range perms {
 		if !w.pushSynth(synthEnvelope{Type: "permission.asked", Properties: synthProps{
-			SessionID: id, ID: p.ID, Permission: p.Permission, Patterns: p.Patterns,
+			SessionID: id, ID: p.ID, Permission: p.Permission, Patterns: p.Patterns, Metadata: p.Metadata,
 		}}) {
 			return seedFallback{}, errInboxOverflow
 		}
+		permIDs = append(permIDs, p.ID)
 	}
-	for _, q := range w.restQuestions(id) {
+	questions, questionsOK := w.restQuestions(id)
+	quesIDs := make([]string, 0, len(questions))
+	for _, q := range questions {
 		if !w.pushSynth(synthEnvelope{Type: "question.asked", Properties: synthProps{
 			SessionID: id, ID: q.ID, Questions: q.Questions,
+		}}) {
+			return seedFallback{}, errInboxOverflow
+		}
+		quesIDs = append(quesIDs, q.ID)
+	}
+	if permsOK || questionsOK {
+		if !w.pushSynth(synthEnvelope{Type: ocApprovalSeedType, Properties: synthProps{
+			SessionID: id, PermissionIDs: permIDs, QuestionIDs: quesIDs,
+			PermissionsKnown: permsOK, QuestionsKnown: questionsOK,
 		}}) {
 			return seedFallback{}, errInboxOverflow
 		}
@@ -828,24 +945,28 @@ func (w *opencodeWatcher) restStatus(id string) (statusType string, present bool
 }
 
 type restPermission struct {
-	ID         string   `json:"id"`
-	SessionID  string   `json:"sessionID"`
-	Permission string   `json:"permission"`
-	Patterns   []string `json:"patterns"`
+	ID         string          `json:"id"`
+	SessionID  string          `json:"sessionID"`
+	Permission string          `json:"permission"`
+	Patterns   []string        `json:"patterns"`
+	Metadata   json.RawMessage `json:"metadata"` // passed through so a seeded row carries the same tool detail as a live one
 }
 
-func (w *opencodeWatcher) restPermissions(id string) []restPermission {
+// restPermissions reads the GLOBAL /permission list and filters it to the pinned session (the
+// route is store-wide — see the session-scoping invariant: global GETs are legal for seed and
+// discovery, always pin-filtered; hub-initiated MUTATIONS are always session-scoped). ok=false
+// distinguishes a failed read from an empty one, which the approval-seed marker depends on.
+func (w *opencodeWatcher) restPermissions(id string) (out []restPermission, ok bool) {
 	var all []restPermission
 	if err := w.getJSON("/permission", &all); err != nil {
-		return nil
+		return nil, false
 	}
-	var out []restPermission
 	for _, p := range all {
 		if p.SessionID == id {
 			out = append(out, p)
 		}
 	}
-	return out
+	return out, true
 }
 
 type restQuestion struct {
@@ -854,18 +975,19 @@ type restQuestion struct {
 	Questions json.RawMessage `json:"questions"`
 }
 
-func (w *opencodeWatcher) restQuestions(id string) []restQuestion {
+// restQuestions mirrors restPermissions for the global /question list (same pin filter, same
+// ok semantics).
+func (w *opencodeWatcher) restQuestions(id string) (out []restQuestion, ok bool) {
 	var all []restQuestion
 	if err := w.getJSON("/question", &all); err != nil {
-		return nil
+		return nil, false
 	}
-	var out []restQuestion
 	for _, q := range all {
 		if q.SessionID == id {
 			out = append(out, q)
 		}
 	}
-	return out
+	return out, true
 }
 
 // restFindCandidate picks the newest ROOT session (empty parentID) whose canonical directory
@@ -940,7 +1062,17 @@ type synthProps struct {
 	ID         string          `json:"id,omitempty"`
 	Permission string          `json:"permission,omitempty"`
 	Patterns   []string        `json:"patterns,omitempty"`
+	Metadata   json.RawMessage `json:"metadata,omitempty"`
 	Questions  json.RawMessage `json:"questions,omitempty"`
+	// The approval-seed marker's payload (ocApprovalSeedType only). The AUTHORITY is the
+	// per-half Known flag, never the presence of a list: an absent list decodes as the empty
+	// set, which is the "nothing is open on the server" statement that retires a locally-open
+	// ask — and that statement counts only when its half's REST read actually succeeded.
+	// omitempty keeps every other synthesized envelope free of these fields.
+	PermissionIDs    []string `json:"permissionIDs,omitempty"`
+	QuestionIDs      []string `json:"questionIDs,omitempty"`
+	PermissionsKnown bool     `json:"permissionsKnown,omitempty"`
+	QuestionsKnown   bool     `json:"questionsKnown,omitempty"`
 }
 
 // pushSynth marshals a synthesized envelope and pushes it onto the inbox. Returns false on
@@ -1063,10 +1195,14 @@ func peekEnvelope(payload []byte) *ocPeek {
 // foldRelevantType reports whether an envelope type is one the fold consumes (so only those
 // are pushed to the inbox; server.*/session.created/step-* etc. update lastFrameAt for the
 // heartbeat/pin logic but never enter the fold).
+// The reply/rejected types are as load-bearing as the asked ones: without them an approval
+// would never be retired from the fold, so a session answered in the TUI would sit at
+// needs_approval until the next reconnect reseed.
 func foldRelevantType(typ string) bool {
 	switch typ {
 	case "session.status", "session.idle", "message.updated", "message.part.updated",
-		"permission.asked", "question.asked":
+		"permission.asked", "permission.replied",
+		"question.asked", "question.replied", "question.rejected":
 		return true
 	default:
 		return false

@@ -73,9 +73,10 @@ const (
 	// feedTypeApprovalRequest is an approval row: an agent asked for permission to
 	// do something. It rides role `tool` with `text` carrying the sanitized
 	// human-readable summary, `tool{name,detail}` the call being approved, and
-	// `approval` the machine-readable state. Nothing produces it in this phase (no
-	// lane emits approvals yet) — the shape is contracted now so a lane can start
-	// emitting it without recontracting clients.
+	// `approval` the machine-readable state. A resolution is a SECOND row with the
+	// same id and status "resolved" — never an edit of the first (see FeedApproval).
+	// Produced by the opencode fold's permission asks; other lanes emit it as their
+	// approval surfaces land.
 	feedTypeApprovalRequest = "approval_request"
 )
 
