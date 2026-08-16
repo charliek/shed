@@ -1,6 +1,9 @@
 package rc
 
-import "testing"
+import (
+	"slices"
+	"testing"
+)
 
 // kindFeatures() is asserted LIVE here (not only via the shared golden fixture — see
 // golden_test.go's doc comment: the fixture is byte-identical across several in-repo
@@ -74,6 +77,31 @@ func TestKindFeaturesWatchFeedLockstep(t *testing.T) {
 					features.Watch, features.Feed, "messages")
 			}
 		})
+	}
+}
+
+// TestCapabilityFeatures pins the advertised feature set BY VALUE, in order. The
+// tokens are a public contract (clients gate behavior on them), so adding, renaming or
+// reordering one is a wire change that must be a deliberate edit here — not a silent
+// side effect. `contract-v2` in particular must ship in the same change as the routes
+// it advertises: a token that arrives early tells clients to call verbs that 404.
+func TestCapabilityFeatures(t *testing.T) {
+	want := []string{"generic-perm", "plan-stdin", "prompt-b64", "serve", "activity", "messages", "contract-v2"}
+	if !slices.Equal(capabilityFeatures, want) {
+		t.Errorf("capabilityFeatures = %v, want %v", capabilityFeatures, want)
+	}
+
+	// The assembled payload carries the same list — and a COPY of it, so a client-side
+	// mutation of the returned slice can never rewrite the package's own token list.
+	caps := BuildCapabilities(func(string) AgentInfo { return AgentInfo{} }, nil)
+	if caps.RCVersion != CapabilityVersion {
+		t.Errorf("rc_version = %d, want %d", caps.RCVersion, CapabilityVersion)
+	}
+	if !slices.Equal(caps.Features, want) {
+		t.Errorf("BuildCapabilities features = %v, want %v", caps.Features, want)
+	}
+	if len(caps.Features) > 0 && &caps.Features[0] == &capabilityFeatures[0] {
+		t.Error("BuildCapabilities must hand out a copy of capabilityFeatures, not the slice itself")
 	}
 }
 

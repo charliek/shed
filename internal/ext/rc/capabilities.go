@@ -11,7 +11,7 @@ import (
 // from SchemaVersion (SHED_RC_V, the on-session tmux-env metadata schema, which stays
 // 2 — session metadata is unchanged): a client learns what a shed's binary can do
 // from CapabilityVersion + the feature list, not from the metadata schema.
-const CapabilityVersion = 3
+const CapabilityVersion = 4
 
 // capabilityFeatures is the feature list (a set of stable tokens) advertised to
 // clients for capability discovery, replacing error-string sniffing. It advertises
@@ -30,7 +30,15 @@ const CapabilityVersion = 3
 //     messages + the message.appended SSE event) and gated feed input (POST
 //     /v1/sessions/{slug}/input). Per-kind availability is in kind_features
 //     (watch / input); this token says the endpoints exist on this binary.
-var capabilityFeatures = []string{"generic-perm", "plan-stdin", "prompt-b64", "serve", "activity", "messages"}
+//   - contract-v2 — the v2 wire contract: `lane` on every session DTO, the
+//     feed/interrupt/attach hints in kind_features, the turn/interrupt/approvals hub
+//     verbs (routed and fully specified — they answer 409 not_supported until a lane
+//     implements them; see hub_verbs.go), the `approval_request` feed row with its
+//     approval block, and `pending_approvals` on the session. This token is the
+//     client's ROUTE-EXISTENCE check: a server without it may 404 the new verbs at
+//     the mux, so a client reads the token instead of interpreting a bare 404.
+//     Advertised in the same change that shipped the routes — never ahead of them.
+var capabilityFeatures = []string{"generic-perm", "plan-stdin", "prompt-b64", "serve", "activity", "messages", "contract-v2"}
 
 // AgentInfo is one agent's install probe result under capabilities.agents. Version is
 // omitted when the agent is not installed (or its version could not be read).

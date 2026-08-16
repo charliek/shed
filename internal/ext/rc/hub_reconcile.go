@@ -15,8 +15,9 @@ import (
 //     session:null);
 //   - activity.changed when a session's DISPLAYED activity (lifecycle-trumps-activity
 //     precedence applied) changes to a VALID, NON-EMPTY value. The wire contract
-//     only advertises working|needs_input|idle|unknown — the suppressed value ("")
-//     is never emitted as an activity.changed (a strict decoder would reject it);
+//     only advertises working|needs_input|needs_approval|idle|unknown — the
+//     suppressed value ("") is never emitted as an activity.changed (a strict
+//     decoder would reject it);
 //     a transition INTO suppression always coincides with a blocking lifecycle
 //     state change, which already emits session.updated (carrying the new state).
 //
@@ -33,7 +34,13 @@ type trackedSession struct {
 	// which is acceptable: there is no identity to pin).
 	id        string // SHED_RC_ID
 	createdAt string // SHED_RC_CREATED_AT (normalized RFC3339, "" when absent)
-	tracker   *StabilityTracker
+	// kind is the session's agent kind, captured when the entry was built. It is the
+	// hub's capability key: the contract-v2 verb handlers (hub_verbs.go) look the
+	// kind's kind_features row up from it rather than re-deriving the session from a
+	// fresh pane capture. A kind is stamped at create time and never changes for a
+	// given incarnation — a recreate replaces this whole entry.
+	kind    Kind
+	tracker *StabilityTracker
 
 	// activity is the DISPLAYED activity (DisplayActivity already applied): "" means
 	// the activity dimension is suppressed (blocking lifecycle state). Used for both
@@ -71,6 +78,17 @@ type trackedSession struct {
 	// uses — without it, a long-quiet working session (>120s tool call) would fall
 	// to the anchor path and deliver mid-turn.
 	lastStability Activity
+
+	// pendingApprovals is the session's currently-open approval requests — the
+	// hub-layer source for Session.PendingApprovals, overlaid onto the /v1/sessions
+	// rows (see handleSessions). NOTHING writes it in this phase: no lane produces
+	// approvals yet, so reconcile never populates it and the overlay is always a
+	// no-op. It exists so the field is plumbed end-to-end now (contract fixed, value
+	// always absent on the wire) and a lane adapter has exactly one place to maintain
+	// the per-session pending map — including rebuilding it from its native protocol
+	// after a hub restart, which is the whole point of the snapshot: the feed ring's
+	// approval rows can be evicted or lost, this cannot.
+	pendingApprovals []FeedApproval
 }
 
 // newTrackedSession builds tracker state for a freshly seen session. The tracker
@@ -89,6 +107,7 @@ func (h *Hub) newTrackedSession(s Session) *trackedSession {
 	return &trackedSession{
 		id:        s.ID,
 		createdAt: s.CreatedAt,
+		kind:      s.Kind,
 		tracker:   NewStabilityTracker(s.Kind, capture, h.cfg.now, h.cfg.quiet),
 		lastState: s.State,
 		ring:      newMessageRing(),
@@ -96,9 +115,13 @@ func (h *Hub) newTrackedSession(s Session) *trackedSession {
 }
 
 // sameIdentity reports whether s is still the session this tracker state was built
-// for (see the id/createdAt doc on trackedSession).
+// for (see the id/createdAt doc on trackedSession). Kind participates because the
+// tracked kind is what the verb handlers authorize against (verbFeatures): a legacy
+// session with empty id/created_at recreated at the same slug as a DIFFERENT kind
+// would otherwise keep the old incarnation's kind — outcome-neutral while every verb
+// rejects, an authorization bug the day one kind advertises a verb.
 func (tr *trackedSession) sameIdentity(s Session) bool {
-	return tr.id == s.ID && tr.createdAt == s.CreatedAt
+	return tr.id == s.ID && tr.createdAt == s.CreatedAt && tr.kind == s.Kind
 }
 
 // reconcile runs one enumeration+tick pass and broadcasts the resulting events. It

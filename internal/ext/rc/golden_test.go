@@ -73,6 +73,13 @@ func TestGoldenFixtureDecodes(t *testing.T) {
 	if caps.RCVersion != CapabilityVersion {
 		t.Errorf("rc_version = %d, want %d", caps.RCVersion, CapabilityVersion)
 	}
+	// The golden's feature list must be EXACTLY what this binary advertises — the
+	// goldens must never advertise a capability ahead of (or behind) the code, which
+	// is the whole reason the version bump and the `contract-v2` token land in the
+	// same commit as the routes they describe.
+	if !reflect.DeepEqual(caps.Features, capabilityFeatures) {
+		t.Errorf("golden features = %v, want %v", caps.Features, capabilityFeatures)
+	}
 	if len(caps.Kinds) != len(allKinds) {
 		t.Errorf("capabilities.kinds = %d, want %d", len(caps.Kinds), len(allKinds))
 	}
