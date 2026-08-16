@@ -171,6 +171,27 @@ per-agent native lanes behind one contract, not a single-protocol bet.
 
 ## The Rust porcelain
 
+> **Refined direction (plan 008, Aug 2026).** The porcelain is a **Rust tool called
+> from shed skills** — the entry point is a Claude Code (or other agent) skill kicking
+> off a session from a local machine into a shed or a remote machine, doing the
+> environment setup a raw `tmux`/`ssh` invocation can't (auth checks, workdir
+> resolution, posture flags), with eventual auto-install so a skill never assumes the
+> tool is already on the caller's machine. The **engine logic is ported to Rust
+> first**, with `shed-machine-rc` (Go) kept running as the **reference oracle** during
+> the port — the same golden-harness pattern `tests/host-agent-diff` established for
+> the Go→Rust host-agent migration (record goldens from the last agreeing Go↔Rust run,
+> assert the new Rust engine's wire-visible output against them under a defined
+> canonicalization) is the template. `shed-machine-rc` is **deleted once the Rust
+> engine reaches parity**, not before. **Crate-split rule**: split only on
+> dependency/consumer boundaries, never speculatively — `shed-core` stays the pure
+> kernel (no I/O-heavy or lane-specific logic), the rc engine starts life under
+> `shed-app`'s `rc` feature (one crate, feature-gated) and graduates to its own crate
+> only once it has **two** real consumers (the porcelain CLI and, e.g., the desktop
+> app), and lane protocol clients (opencode's SSE/REST client, a future codex
+> app-server client, a future cursor ACP client) are separate **leaf crates** from day
+> one, since they are reused by both the CLI and any future direct-connect mobile
+> path.
+
 New crate in `crates/` (name TBD), on `shed-core` + `shed-app`:
 
 ```bash
@@ -223,20 +244,62 @@ the phase (even when the mobile UI itself lands a phase later).
 > is what the `409` in the R0 row refers to). R1 handoff items recorded in
 > plan 007 §9: watcher freshness for `needs_approval` (`watch.go` treats only
 > `working` specially), the input-acceptance gate interaction, and in-guest
-> verification via the rootfs-rebuild loop
+> verification via the rootfs-rebuild loop, all of which plan 008 (below) resolved
+> as part of shipping R1 itself.
+>
+> **R1 status: SHIPPED** — plan 008 (`feature/plan-008-observatory`). The scope grew
+> beyond the R1 row's original "cursor TUI hardening" framing into the full
+> observatory block (see the row and [Spike findings](#spike-findings-aug-2026)
+> below); the as-built contract is `docs/extensions/rc-helper.md`.
 > (`.claude/skills/testing-vm-agent-changes`).
 
 | Phase | Ships | Mobile checkpoint |
 |---|---|---|
 | **R0 — Contract v2** ✅ | `lane` field, extended `kind_features`, turn/interrupt/approval verbs (409 where unimplemented), typed approval feed entries + `pending_approvals`, `needs_approval` activity; Go hub + server proxy + Rust/Swift/TS mirrors + byte-parity-guarded fixtures in lockstep | Mobile decodes v2 envelope; existing watch screens render unchanged off capabilities |
-| **R1 — Cursor TUI hardening** | cursor hooks→hub ingestion (activity + `needs_approval`), transcript-tail partial feed; cursor stops being stability-only | Cursor session on a shed shows live activity + "approval pending — open TUI" on the phone |
+| **R1 — Observatory (opencode dual-control, cursor/codex signals, kickoff hardening)** ✅ | **Shipped, plan 008** — grew beyond the original "cursor TUI hardening" scope into the full block: opencode's turn/interrupt/approvals verbs live (dual control — the same session stays tmux-attachable while the hub steers it), `needs_approval` + informational approval feed rows for codex and cursor (pane-anchor, debounced), cursor hooks→hub ingestion (activity, turn boundaries, message feed, gated input), and `shed attach`/`shed plan` kickoff hardening (installed-agent gate, plan permission posture, `--workdir`, opencode needs-auth classification). See `docs/extensions/rc-helper.md` for the as-built contract | Cursor session on a shed shows live activity + hook-derived feed; a codex/cursor approval prompt reads `needs_approval` + "open the TUI"; an opencode session is steered (turn/interrupt/approve) through the hub while still tmux-attachable |
 | **R2 — Rust porcelain v1** | new crate: `agent`/`ls`/`watch`/`attach`/`plan`/`kill` across `local\|machine\|shed`; drives Go engine binaries; machines section in config | n/a directly (CLI), but exercises the same shed-core target model mobile will use |
-| **R3 — Structured lane prototype** | a lane adapter in the guest hub behind the v2 verbs, as a **new distinct kind**. Spike is now three-way: **opencode** (front-runner — the hub already speaks its SSE/REST via the `--port` watcher, so the adapter is incremental Go; t3code ships on the same v2 API), codex app-server (most mature protocol, needs a Go JSON-RPC client), cursor-ACP (viable per t3code's long-lived-child pattern, needs a Go ACP client). **Primary design problem: the structured-session registry** — a session with no tmux pane breaks "tmux is the source of truth", so the hub needs its own registry (in-memory + agent-side persistence for resume) | **Approve a tool call and steer a turn from the phone** — the bar for the whole design |
+| **R3 — Structured lane prototype** | a lane adapter in the guest hub behind the v2 verbs, as a **new distinct kind**. Spike is now three-way: **opencode** (front-runner — the hub already speaks its SSE/REST via the `--port` watcher, so the adapter is incremental Go; t3code ships on the same v2 API), codex app-server (most mature protocol, needs a Go JSON-RPC client), cursor-ACP (viable per t3code's long-lived-child pattern, needs a Go ACP client). **Primary design problem: the structured-session registry** — a session with no tmux pane breaks "tmux is the source of truth", so the hub needs its own registry (in-memory + agent-side persistence for resume). **Note (post-R1):** R1 already wired opencode's turn/interrupt/approvals verbs onto the *existing* TUI-lane kind (dual control — no new kind, the session stays tmux-attachable) — see `docs/extensions/rc-helper.md`; R3's "new distinct kind" is for a lane with **no** tmux pane at all (a headless structured session), a different and larger step than R1's dual-control shape | **Approve a tool call and steer a turn from the phone** — the bar for the whole design |
 | **R4 — Machines in clients** | machine targets in shed-core surfaced in mobile + Tauri (SSH-forwarded hub); unified sessions view everywhere | Machine sessions listed + watchable next to shed sessions on the phone |
 | **R5 — Second lane + notifier** | second structured lane (from the R3 spike's runners-up); desktop notifier off aggregate SSE; host-agent hub spike (start of shed-machine-rc retirement) | `needs_input`/`needs_approval` reaches the phone while the app is open (SSE); push is a separate decision |
 
 R0 was deliberately small and unblocks everything; R1–R2 are independent of
 the lane bet; R3 is where the two-lane model proves out or gets revised.
+
+## Spike findings (Aug 2026)
+
+Live/source spikes run for R1 (plan 008), superseding or sharpening the per-agent
+table above:
+
+- **cursor hooks fire fully, but only in TUI mode.** `stop`, `afterAgentResponse`, and
+  `beforeSubmitPrompt` — the turn-boundary signals — are **TUI-only**; they are absent
+  entirely in `-p` (print/headless) mode. `session_id` in every hook payload equals the
+  transcript directory/filename, so correlation is exact once a hook fires; there is
+  **no approval-pending hook event** at all (confirmed live) — a session blocked on the
+  allowlist prompt is indistinguishable from a long-running tool call by hooks alone,
+  which is why cursor's `needs_approval` is a **pane anchor**, not a hook derivation
+  (see `docs/extensions/rc-helper.md`).
+- **opencode's v1 (unprefixed) API is the real control surface; v2 is not usable for
+  turn-start.** `POST /session/{id}/prompt_async` and `POST /session/{id}/abort` on v1
+  both work as expected (verified live, including mid-turn steering and an idle abort);
+  the newer `/api/session/{id}/prompt` (v2) route **admits a turn but never promotes it
+  on an idle session** — a dead end for turn-start regardless of how appealing "v2" as a
+  name sounds. The **global-store hazard is confirmed and worse than assumed**: one
+  TUI's embedded server lists sessions from every directory on the machine, and the
+  global permission-reply route can answer another project's ask — this is exactly what
+  the [session-scoping invariant](../extensions/rc-helper.md#session-scoping-invariant-hub-initiated-mutations)
+  in the as-built contract exists to structurally prevent for the hub's own adapters
+  (it does not, and cannot, fix the hazard for anything else talking to that same
+  embedded server).
+- **codex approvals are provably absent from the rollout JSONL.** The persistence
+  policy (`rollout/src/policy.rs` in the codex source) filters every
+  approval-request-shaped record before it is ever written to disk, and the
+  associated tool-call record is written *before* the approval gate runs — so a
+  session blocked on an approval overlay is byte-identical in the log to a
+  long-running tool call. A census over hundreds of local rollout files / over a
+  thousand turns found **zero** approval-shaped records. This is not a gap that a
+  better JSONL parser could close; it is why codex's `needs_approval`, like cursor's,
+  is a pane anchor keyed on the approval overlay's stable option-row chrome rather than
+  any log-derived signal.
 
 ## Open questions
 

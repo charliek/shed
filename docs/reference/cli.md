@@ -910,6 +910,7 @@ otherwise it attaches. Use `--slug` to connect to an existing `rc-<slug>` sessio
 | `--edit` | | `false` | Compose the kickoff prompt in `$EDITOR` |
 | `--permission-mode` | | `auto` | `default`, `auto`, `skip` (all kinds); Claude also accepts `acceptEdits`, `plan`, `dontAsk`, `bypassPermissions` |
 | `--skip` | | `false` | Shorthand for the generic `skip` mode (full permission bypass) |
+| `--workdir` | | `$SHED_WORKSPACE`/`$HOME` | Working directory inside the shed for the RC session |
 | `--name` | | `<shed>/<slug>` | Session display name |
 | `--slug` | | generated | Connect to `rc-<slug>`, or set the slug for a new session |
 | `--detach` | `-d` | `false` | Create the RC session, print its summary, and return without attaching |
@@ -930,6 +931,18 @@ produce a browser URL — for the others, watch the session with
 neutrally (name + state only). A shed whose baked-in `shed-ext-rc` predates multi-agent
 RC rejects the new kinds with a "recreate the shed" error; the Claude flows keep working
 on existing sheds.
+
+Before doing any tmux work, `create` checks that a non-shell kind's agent binary is
+actually reachable on the session's launch PATH; a missing binary fails with a named
+error ("agent 'cursor-agent' is not installed in this shed's image...") instead of the
+opaque "session died on create" a missing binary used to produce.
+
+**Steering an agent from the hub, not just the pane.** For kinds whose
+`kind_features` row advertises it (opencode today — see `docs/extensions/rc-helper.md`),
+the rc hub's `turn`/`interrupt`/`approvals` verbs let a client steer and approve the
+session through the server's rc proxy while it stays attachable in the terminal at the
+same time. That surface is reached through the hub API, not through `shed attach`
+itself; `shed attach --slug <slug>` remains the terminal-side view for every kind.
 
 **Permission modes.** The generic tri-state `default` | `auto` | `skip` is accepted by
 every kind and mapped per agent to real flags (the VM is already the sandbox): `auto`
@@ -959,7 +972,8 @@ skill.
 Ships a plan file to a shed and runs it autonomously — the one-command porcelain over
 `shed attach`'s Remote Control mode. It creates the shed if missing (with `--repo`),
 writes the plan HOME-rooted inside the shed, starts an agent session under the `auto`
-posture, and reports the session.
+posture by default (override with `--permission-mode`/`--skip`, sharing `shed attach`'s
+validation and mutual exclusion), and reports the session.
 
 ```bash
 shed plan <file> --shed <name> [flags]
@@ -971,6 +985,9 @@ shed plan <file> --shed <name> [flags]
 | `--repo` | | | Create the shed from this repo (`owner/repo` or URL) if it doesn't exist |
 | `--kind` | | `claude-rc` | Agent kind: `claude-rc`, `codex`, `cursor`, `opencode`, `shell` |
 | `--prompt` | `-p` | | Optional framing prepended to the composed plan kickoff |
+| `--permission-mode` | | `auto` | `default`, `auto`, `skip` (all kinds); Claude also accepts `acceptEdits`, `plan`, `dontAsk`, `bypassPermissions` |
+| `--skip` | | `false` | Shorthand for `--permission-mode skip` (full permission bypass) |
+| `--workdir` | | `$SHED_WORKSPACE`/`$HOME` | Working directory inside the shed for the RC session |
 | `--detach` | `-d` | `false` | Report the session and return instead of attaching when it's ready |
 | `-s, --server` | | cached/default | Which server hosts (or should create) the shed |
 

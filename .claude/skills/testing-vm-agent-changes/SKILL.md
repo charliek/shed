@@ -208,6 +208,29 @@ the agent tests).
 > while looking green. When validating an rc change, rebuild **both**
 > `./scripts/build-vz-rootfs.sh --variant full …` **and** `--variant extensions …` (FC:
 > the matching `build-firecracker-rootfs.sh` invocations) so both aliases carry your build.
+> This two-variant rebuild requirement was correct before plan 008 and stays correct — no
+> change needed there.
+
+**New guest surfaces since plan 008 (opencode dual-control + cursor hooks) — smoke
+these explicitly when touching the rc hub, since the existing integration suite has no
+coverage for them yet (a `test_rc_kickoff.py`-style CLI-driven suite is future work):**
+
+- **opencode verbs** (`turn`/`interrupt`/`approvals/{id}`, live only for opencode):
+  create an opencode rc session on the rebuilt image, drive a turn/interrupt/approval
+  through `curl` against the server's `/api/sheds/{name}/rc/v1/sessions/{slug}/{verb}`
+  proxy route (or the guest-local hub port directly, `shed exec <shed> curl
+  127.0.0.1:1029/v1/sessions`), and confirm the steer renders in the attached TUI at
+  the same time — that's the dual-control property the whole design bets on. Two
+  sessions in one opencode store is the WS-B regression to re-check by hand
+  occasionally: steering session A must never touch session B.
+- **cursor hook ingestion**: create a cursor rc session on a host with cursor auth
+  mounted (`~/.config/cursor`, **not** `~/.cursor` — see
+  `docs/reference/configuration.md`), run a turn, and confirm the feed
+  (`GET .../messages`) picks up hook-derived rows (`beforeSubmitPrompt`, tool
+  use/result, `afterAgentResponse`) and that `~/.shed-rc-hub/hub.log` shows no
+  `hooks.json` write-skip warning (the foreign-device guard). If cursor auth mounts
+  aren't set up on the dev host, this leg is Mac-local-hub-only — see the plan's
+  §Verified conditionality note for AC-3.
 
 ### Fast loop: copy the binary into a running shed
 

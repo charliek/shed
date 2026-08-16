@@ -67,11 +67,13 @@ mounts:
     source: ~/.shed/mounts/gh
     target: /home/shed/.config/gh
     readonly: false
-  cursor:
-    source: ~/.shed/mounts/cursor
-    target: /home/shed/.cursor
-    readonly: false
-  # Linux cursor-agent tokens live OUTSIDE ~/.cursor:
+  # Linux cursor-agent tokens live OUTSIDE ~/.cursor, in ~/.config/cursor — mount
+  # ONLY this. Intentionally NOT mounting ~/.cursor: the rc hub's cursor preseed
+  # writes a hook relay into ~/.cursor/hooks.json (the only live signal a cursor
+  # session produces) and SKIPS that write whenever ~/.cursor is on a different
+  # device than $HOME (its host-auth-mount guard, PreseedCursorHooks in
+  # internal/ext/rc/preseed_cursor.go) — mounting ~/.cursor here would silently
+  # disable the hook feed for every cursor rc session on this dev server.
   cursor_config:
     source: ~/.shed/mounts/cursor-config
     target: /home/shed/.config/cursor
