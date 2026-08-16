@@ -25,6 +25,7 @@ var (
 	attachKindFlag       string
 	attachNameFlag       string
 	attachSlugFlag       string
+	attachWorkdirFlag    string
 	attachPromptFlag     string
 	attachPromptFileFlag string
 	attachEditFlag       bool
@@ -70,6 +71,7 @@ func init() {
 	attachCmd.Flags().StringVar(&attachKindFlag, "kind", "", "RC session kind ("+strings.Join(rc.KindStrings(), "|")+"); triggers RC create")
 	attachCmd.Flags().StringVar(&attachNameFlag, "name", "", "RC session display name (default <shed>/<slug>)")
 	attachCmd.Flags().StringVar(&attachSlugFlag, "slug", "", "RC slug: connect to rc-<slug>, or set the slug for a new session")
+	attachCmd.Flags().StringVar(&attachWorkdirFlag, "workdir", "", "Working directory inside the shed for the RC session (default $SHED_WORKSPACE/$HOME)")
 	attachCmd.Flags().StringVarP(&attachPromptFlag, "prompt", "p", "", "Kickoff prompt (use --prompt-file/--edit for multi-line)")
 	attachCmd.Flags().StringVar(&attachPromptFileFlag, "prompt-file", "", "Read the kickoff prompt from a file (- for stdin)")
 	attachCmd.Flags().BoolVar(&attachEditFlag, "edit", false, "Compose the kickoff prompt in $EDITOR")
@@ -109,13 +111,10 @@ func validateAttachFlags() error {
 		if err := validateRCKind(kind); err != nil {
 			return err
 		}
-		if attachSkipFlag && attachPermModeFlag != "" {
-			return fmt.Errorf("--skip and --permission-mode are mutually exclusive")
+		if _, err := resolveRCPermMode(kind, attachPermModeFlag, attachSkipFlag, rc.PermModeAuto); err != nil {
+			return err
 		}
-		if attachPermModeFlag != "" && !rc.PermModeAcceptedBy(rc.Kind(kind), attachPermModeFlag) {
-			return fmt.Errorf("invalid --permission-mode %q for --kind %s (all kinds accept default|auto|skip; claude also accepts acceptEdits|plan|dontAsk|bypassPermissions)", attachPermModeFlag, kind)
-		}
-		if kind == "claude-broker" && rcInputRequested() {
+		if kind == string(rc.KindClaudeBroker) && rcInputRequested() {
 			return fmt.Errorf("claude-broker sessions are driven from claude.ai and take no prompt/plan")
 		}
 		if attachSlugFlag != "" && !rcSlugRe.MatchString(attachSlugFlag) {
@@ -226,6 +225,28 @@ func validateRCKind(kind string) error {
 	return nil
 }
 
+// resolveRCPermMode applies the --skip shorthand and the --skip/--permission-mode
+// mutual exclusion, validates the resolved mode against kind's registry
+// (rc.PermModeAcceptedBy), and falls back to dflt when neither flag is given ("" dflt
+// means "no posture flag"). Shared by `shed attach` and `shed plan` so the two
+// commands' permission-mode handling — and its validation — can't drift apart.
+func resolveRCPermMode(kind, permMode string, skip bool, dflt string) (string, error) {
+	if skip && permMode != "" {
+		return "", fmt.Errorf("--skip and --permission-mode are mutually exclusive")
+	}
+	mode := permMode
+	if skip {
+		mode = rc.PermModeSkip
+	}
+	if mode == "" {
+		mode = dflt
+	}
+	if mode != "" && !rc.PermModeAcceptedBy(rc.Kind(kind), mode) {
+		return "", fmt.Errorf("invalid --permission-mode %q for --kind %s (all kinds accept default|auto|skip; claude also accepts acceptEdits|plan|dontAsk|bypassPermissions)", mode, kind)
+	}
+	return mode, nil
+}
+
 // runAttachRCCreate creates an rc-<slug> Remote Control session via shed-ext-rc:
 // resolves prompt/plan, ships the plan, sets the permission posture, starts the
 // session, then prints the URL (--detach) or attaches.
@@ -236,12 +257,11 @@ func runAttachRCCreate(name, serverName string, entry *config.ServerEntry) error
 	if kind == "" {
 		kind = "claude-rc"
 	}
-	mode := attachPermModeFlag
-	if attachSkipFlag {
-		mode = rc.PermModeSkip
-	}
-	if mode == "" {
-		mode = rc.PermModeAuto // default autonomous posture (mapped per agent)
+	// Already validated in validateAttachFlags; the error here is unreachable in
+	// practice but handled rather than ignored.
+	mode, err := resolveRCPermMode(kind, attachPermModeFlag, attachSkipFlag, rc.PermModeAuto)
+	if err != nil {
+		return err
 	}
 
 	prompt, planContent, havePlan, err := resolveRCInputs(rcInputs{
@@ -280,6 +300,7 @@ func runAttachRCCreate(name, serverName string, entry *config.ServerEntry) error
 		kind:           kind,
 		displayName:    displayName,
 		slug:           slug,
+		workdir:        attachWorkdirFlag,
 		permissionMode: mode,
 	}
 	if havePlan {
@@ -303,7 +324,7 @@ func runAttachRCCreate(name, serverName string, entry *config.ServerEntry) error
 		return err
 	}
 
-	if attachDetachFlag || kind == "claude-broker" {
+	if attachDetachFlag || kind == string(rc.KindClaudeBroker) {
 		printRCSummary(name, dto)
 		return nil
 	}
@@ -315,22 +336,22 @@ func runAttachRCCreate(name, serverName string, entry *config.ServerEntry) error
 // left running for the user to act on, or dead); handled=false means the session is live
 // (ready/starting) and the caller proceeds to attach or print its summary.
 //
-// This encodes the exit contract: needs-auth / needs-trust leave the session running and
-// exit 0 (the create succeeded; the user just has to log in / accept trust), while a
-// dead-on-create is a session-level FAILURE that must exit non-zero — a bad posture flag
-// or missing runtime that killed the agent must never read as success to a script or the
-// -d path (aligns with `shed plan`'s reportPlanOutcome).
+// This encodes attach's OWN exit contract: needs-auth / needs-trust leave the session
+// running and exit 0 (the create succeeded interactively; the user just has to log in /
+// accept trust and reattach), while a dead-on-create is a session-level FAILURE that
+// must exit non-zero — a bad posture flag or missing runtime that killed the agent must
+// never read as success to a script or the -d path. This DELIBERATELY DIFFERS from
+// `shed plan`'s reportPlanOutcome, which exits non-zero on needs-auth/needs-trust too:
+// attach is interactive (a human is there to notice and fix it), while plan is meant to
+// run unattended, so a session stuck on auth/trust IS a plan-run failure, not attach's
+// "created, just finish the login" success.
 func reportRCCreateOutcome(w io.Writer, name, slug, kind string, dto rc.Session) (bool, error) {
 	switch dto.State {
 	case rc.StateNeedsAuth:
-		// Per-agent remediation: the login flow differs per tool (claude's /login,
-		// codex login, opencode auth login, cursor-agent login), so the hint comes
-		// from the agent registry.
-		agent := "the agent"
-		if rc.IsClaudeKind(rc.Kind(kind)) {
-			agent = "Claude"
-		}
-		fmt.Fprintf(w, "Session rc-%s created but %s is not logged in in this shed.\n", slug, agent)
+		// Per-agent remediation: both the tool name and the login flow (claude's
+		// /login, codex login, opencode auth login, cursor-agent login) come from the
+		// agent registry — no hand-hardcoded "Claude".
+		fmt.Fprintf(w, "Session rc-%s created but %s is not logged in in this shed.\n", slug, rc.ToolFor(rc.Kind(kind)))
 		fmt.Fprintf(w, "Log in once: shed attach %s  →  %s, then retry.\n", name, rc.AuthHintFor(rc.Kind(kind)))
 		return true, nil
 	case rc.StateNeedsTrust:

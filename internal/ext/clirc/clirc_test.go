@@ -2,6 +2,7 @@ package clirc
 
 import (
 	"bytes"
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"os"
@@ -603,4 +604,131 @@ func TestCreateDoesNotSpawnHubInTests(t *testing.T) {
 			// tmux calls, so reaching exit 0 with no panic confirms no daemon side effect.
 		})
 	}
+}
+
+// runCLIBinProbe is runCLI with an injectable installed-agent probe (the
+// bash -lc/-ic-based gate on `create`/`claude`), built directly rather than via
+// runCLI/runCLIProbe so d.binProbe can be set — those helpers intentionally leave it
+// nil (skip the gate) for every OTHER dispatch test.
+func runCLIBinProbe(cfg Config, r rc.Runner, binProbe rc.InstalledProbe, args ...string) (int, string, string) {
+	var out, errb bytes.Buffer
+	d := deps{
+		runner:   r,
+		getenv:   func(string) string { return "" },
+		stdin:    strings.NewReader(""),
+		stdout:   &out,
+		stderr:   &errb,
+		hostname: func() string { return "testhost" },
+		sleep:    func(time.Duration) {},
+		probe:    func(string) rc.AgentInfo { return rc.AgentInfo{} },
+		binProbe: binProbe,
+	}
+	return run(cfg, d, args), out.String(), errb.String()
+}
+
+// TestCreateInstalledAgentGateWiring pins the dispatch-level wiring of the
+// installed-agent gate (effectiveBinProbe → rc.Create's BinProbe): a missing binary
+// surfaces the named ErrBadArgs error and exit 2 without ever touching tmux; a
+// present binary proceeds to create the session.
+func TestCreateInstalledAgentGateWiring(t *testing.T) {
+	t.Run("missing binary rejected, exit 2, no tmux call", func(t *testing.T) {
+		r := &fakeRunner{}
+		probe := func(bin string) bool { return false }
+		code, _, errOut := runCLIBinProbe(extCfg, r, probe,
+			"create", "--kind", "codex", "--slug", "abc123", "--workdir", "/tmp")
+		if code != 2 {
+			t.Fatalf("code=%d, want 2 (stderr %q)", code, errOut)
+		}
+		if !strings.Contains(errOut, "codex") || !strings.Contains(errOut, "not found on the session PATH") {
+			t.Errorf("stderr should name the missing binary: %q", errOut)
+		}
+		if len(r.calls) != 0 {
+			t.Errorf("must not touch tmux when the agent is missing, got calls: %v", r.calls)
+		}
+	})
+
+	t.Run("present binary proceeds", func(t *testing.T) {
+		r := &fakeRunner{}
+		probe := func(bin string) bool { return true }
+		code, _, errOut := runCLIBinProbe(extCfg, r, probe,
+			"create", "--kind", "codex", "--slug", "abc123", "--workdir", "/tmp")
+		if code != 0 {
+			t.Fatalf("code=%d, want 0 (stderr %q)", code, errOut)
+		}
+		if newSessionCall(t, r) == nil {
+			t.Fatal("expected a new-session call")
+		}
+	})
+
+	t.Run("nil binProbe (production default) resolves to a real, non-panicking probe", func(t *testing.T) {
+		// effectiveBinProbe falls back to realBinProbe when d.binProbe is nil (Run's
+		// production deps, and this call). No --interactive-shell here, so this also
+		// exercises the login-shell (`bash -lc`) branch end-to-end. This only proves
+		// the wiring resolves to a callable probe with no panic/hang under its 2s
+		// timeout — the exit code is host-dependent (whether "codex" happens to be on
+		// this machine's PATH), which is exactly why every OTHER test in this file
+		// injects a fake instead.
+		r := &fakeRunner{}
+		code, _, errOut := runCLIBinProbe(extCfg, r, nil,
+			"create", "--kind", "codex", "--slug", "abc123", "--workdir", "/tmp")
+		if code != 0 && code != 2 {
+			t.Fatalf("unexpected exit code=%d, stderr=%q", code, errOut)
+		}
+	})
+}
+
+// TestRealBinProbeShellVerb pins the fix for the PATH mismatch: realBinProbe must
+// issue a LOGIN shell (`bash -lc`) when interactiveShell=false — the dominant guest
+// path, where the inner tmux command is a bare exec inheriting the pane's env, and
+// that pane was created by shed-ext-rc running over SSH under the server's `bash -lc`
+// wrap — and an INTERACTIVE shell (`bash -ic`) only when interactiveShell=true (the
+// case innerCommandTUI's own `bash -ic` wrap actually uses). Captured via a fake
+// binProbeExec (swapped in place of the package var) rather than spawning real bash,
+// mirroring the fakeRunner/fakeTmux convention used for tmux calls elsewhere.
+func TestRealBinProbeShellVerb(t *testing.T) {
+	orig := binProbeExec
+	defer func() { binProbeExec = orig }()
+
+	var gotArgs []string
+	var stubResult bool
+	binProbeExec = func(ctx context.Context, args ...string) bool {
+		gotArgs = append([]string(nil), args...)
+		return stubResult
+	}
+
+	t.Run("interactiveShell=false uses a login shell (-lc)", func(t *testing.T) {
+		stubResult = true
+		if !realBinProbe("codex", false) {
+			t.Fatal("want true (stub returns true)")
+		}
+		if len(gotArgs) < 2 || gotArgs[0] != "bash" || gotArgs[1] != "-lc" {
+			t.Fatalf("want bash -lc, got argv %v", gotArgs)
+		}
+		if !strings.Contains(strings.Join(gotArgs, " "), "command -v") || !strings.Contains(strings.Join(gotArgs, " "), "codex") {
+			t.Fatalf("argv missing command -v codex: %v", gotArgs)
+		}
+	})
+
+	t.Run("interactiveShell=true uses an interactive shell (-ic)", func(t *testing.T) {
+		stubResult = true
+		if !realBinProbe("cursor-agent", true) {
+			t.Fatal("want true (stub returns true)")
+		}
+		if len(gotArgs) < 2 || gotArgs[0] != "bash" || gotArgs[1] != "-ic" {
+			t.Fatalf("want bash -ic, got argv %v", gotArgs)
+		}
+	})
+
+	t.Run("missing-bin reject and present-bin-proceed still hold on both shell modes", func(t *testing.T) {
+		for _, interactive := range []bool{false, true} {
+			stubResult = false
+			if realBinProbe("nope", interactive) {
+				t.Errorf("interactiveShell=%v: want false when the stub reports not-found", interactive)
+			}
+			stubResult = true
+			if !realBinProbe("codex", interactive) {
+				t.Errorf("interactiveShell=%v: want true when the stub reports found", interactive)
+			}
+		}
+	})
 }

@@ -14,11 +14,14 @@ import (
 )
 
 var (
-	planShedFlag    string
-	planRepoFlag    string
-	planKindFlag    string
-	planFramingFlag string
-	planDetachFlag  bool
+	planShedFlag     string
+	planRepoFlag     string
+	planKindFlag     string
+	planFramingFlag  string
+	planDetachFlag   bool
+	planWorkdirFlag  string
+	planPermModeFlag string
+	planSkipFlag     bool
 )
 
 var planCmd = &cobra.Command{
@@ -54,6 +57,9 @@ func init() {
 	planCmd.Flags().StringVar(&planKindFlag, "kind", "", "Agent kind ("+strings.Join(rc.KindStrings(), "|")+"); default claude-rc")
 	planCmd.Flags().StringVarP(&planFramingFlag, "prompt", "p", "", "Optional framing prepended to the composed plan kickoff")
 	planCmd.Flags().BoolVarP(&planDetachFlag, "detach", "d", false, "Report the session and return instead of attaching when it is ready")
+	planCmd.Flags().StringVar(&planWorkdirFlag, "workdir", "", "Working directory inside the shed for the RC session (default $SHED_WORKSPACE/$HOME)")
+	planCmd.Flags().StringVar(&planPermModeFlag, "permission-mode", "", "Permission mode (default auto): default|auto|skip; claude also accepts acceptEdits|plan|dontAsk|bypassPermissions")
+	planCmd.Flags().BoolVar(&planSkipFlag, "skip", false, "Shorthand for --permission-mode skip (full bypass)")
 
 	rootCmd.AddCommand(planCmd)
 }
@@ -73,6 +79,13 @@ func runPlan(cmd *cobra.Command, args []string) error {
 	}
 	if planShedFlag == "" {
 		return fmt.Errorf("--shed <name> is required")
+	}
+	// Sharing attach's --skip/--permission-mode validation (mutual exclusion +
+	// registry check) keeps the two commands' posture handling from drifting apart;
+	// default stays "auto" (unchanged behavior) when neither flag is given.
+	mode, err := resolveRCPermMode(kind, planPermModeFlag, planSkipFlag, rc.PermModeAuto)
+	if err != nil {
+		return err
 	}
 
 	// Read + validate the plan before any side effect, so an empty/oversized/binary
@@ -116,7 +129,7 @@ func runPlan(cmd *cobra.Command, args []string) error {
 		return err
 	}
 	if verboseLevel > 0 {
-		fmt.Printf("Shipping plan to %s as %s session rc-%s (mode=%s)...\n", planShedFlag, kind, slug, rc.PermModeAuto)
+		fmt.Printf("Shipping plan to %s as %s session rc-%s (mode=%s)...\n", planShedFlag, kind, slug, mode)
 	}
 	dto, err := createRCSession(rcCreateOptions{
 		shedName:       planShedFlag,
@@ -124,7 +137,8 @@ func runPlan(cmd *cobra.Command, args []string) error {
 		kind:           kind,
 		displayName:    planShedFlag + "/" + slug,
 		slug:           slug,
-		permissionMode: rc.PermModeAuto,
+		workdir:        planWorkdirFlag,
+		permissionMode: mode,
 		plan:           planContent,
 		planFraming:    planFramingFlag,
 	})

@@ -1,0 +1,19 @@
+
+
+
+                                                                              Connect a provider                                                                          esc
+
+                                                                              Search
+
+
+                                                                             Popular
+                                                                               opencode                                                                    (Recommended)
+                                                                               Anthropic                                                                   (API key)
+                                                                               OpenAI                                                                       (ChatGPT Plus/Pro or API key)
+                                                                               GitHub Copilot
+                                                                               Google
+
+                                                                             Providers
+                                                                               Other                                                                        Custom provider
+
+

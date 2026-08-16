@@ -637,6 +637,90 @@ func TestCreatePermissionModeValidation(t *testing.T) {
 	})
 }
 
+func TestCreateInstalledAgentGate(t *testing.T) {
+	t.Run("missing binary rejected before any tmux work", func(t *testing.T) {
+		f := &fakeTmux{}
+		probe := func(bin string) bool {
+			if bin != "cursor-agent" {
+				t.Errorf("probe called with unexpected bin %q", bin)
+			}
+			return false // simulates `bash -lc/-ic 'command -v cursor-agent'` exiting non-zero
+		}
+		_, err := Create(f, func(string) string { return "/home/shed" },
+			CreateOptions{Kind: KindCursor, Slug: "abc123", BinProbe: probe}, noSleep)
+		if !errors.Is(err, ErrBadArgs) {
+			t.Fatalf("want ErrBadArgs, got %v", err)
+		}
+		if !strings.Contains(err.Error(), "cursor-agent") || !strings.Contains(err.Error(), "not found on the session PATH") {
+			t.Fatalf("error should name the binary and say not found on the session PATH: %v", err)
+		}
+		if len(f.calls) != 0 {
+			t.Fatalf("must not touch tmux when the agent binary is missing, got calls: %v", f.calls)
+		}
+	})
+
+	t.Run("present binary proceeds", func(t *testing.T) {
+		f := &fakeTmux{handler: func(args []string) Result { return Result{Code: 0} }}
+		probed := false
+		probe := func(bin string) bool {
+			probed = true
+			if bin != "codex" {
+				t.Errorf("probe called with unexpected bin %q", bin)
+			}
+			return true
+		}
+		if _, err := Create(f, func(string) string { return "/home/shed" },
+			CreateOptions{Kind: KindCodex, Slug: "abc123", BinProbe: probe}, noSleep); err != nil {
+			t.Fatalf("Create: %v", err)
+		}
+		if !probed {
+			t.Fatal("probe was never called")
+		}
+		if f.callWith("new-session") == nil {
+			t.Fatal("a present binary should proceed to tmux new-session")
+		}
+	})
+
+	t.Run("nil BinProbe skips the check (opt-in gate)", func(t *testing.T) {
+		f := &fakeTmux{handler: func(args []string) Result { return Result{Code: 0} }}
+		if _, err := Create(f, func(string) string { return "/home/shed" },
+			CreateOptions{Kind: KindCodex, Slug: "abc123"}, noSleep); err != nil {
+			t.Fatalf("Create with nil BinProbe should not gate: %v", err)
+		}
+	})
+
+	t.Run("shell kind is never probed (no Bin to check)", func(t *testing.T) {
+		f := &fakeTmux{handler: func(args []string) Result { return Result{Code: 0} }}
+		probe := func(bin string) bool {
+			t.Errorf("probe should not be called for shell, got bin %q", bin)
+			return false
+		}
+		if _, err := Create(f, func(string) string { return "/home/shed" },
+			CreateOptions{Kind: KindShell, Slug: "abc123", BinProbe: probe}, noSleep); err != nil {
+			t.Fatalf("Create: %v", err)
+		}
+	})
+}
+
+// TestToolFor pins the registry-sourced tool-name lookup the CLI uses in place of a
+// hand-hardcoded "Claude" (see cmd/shed/attach.go's reportRCCreateOutcome).
+func TestToolFor(t *testing.T) {
+	cases := map[Kind]string{
+		KindClaudeRC:     "claude",
+		KindClaudeBroker: "claude",
+		KindCodex:        "codex",
+		KindOpencode:     "opencode",
+		KindCursor:       "cursor",
+		KindShell:        "shell",
+		Kind("bogus"):    "the agent",
+	}
+	for k, want := range cases {
+		if got := ToolFor(k); got != want {
+			t.Errorf("ToolFor(%q) = %q, want %q", k, got, want)
+		}
+	}
+}
+
 func TestKillIdempotent(t *testing.T) {
 	f := &fakeTmux{handler: func(args []string) Result {
 		return Result{Code: 1, Stderr: "can't find session: rc-x"}

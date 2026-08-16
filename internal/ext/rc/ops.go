@@ -61,6 +61,30 @@ type CreateOptions struct {
 	// deliberately declines to write hooks.json into a host auth mount and would
 	// otherwise leave the operator wondering why the session has no feed. nil discards.
 	Warnf func(format string, args ...any)
+	// BinProbe gates Create for a non-shell kind: before any tmux work, it checks
+	// whether the kind's agent binary is reachable on the launch PATH via
+	// `bash -lc/-ic 'command -v <bin>'` — the caller (clirc.go's effectiveBinProbe)
+	// MUST bind the same shell VERB as this same call's InteractiveShell, because the
+	// two launch paths genuinely differ:
+	//
+	//   - InteractiveShell=false (the dominant guest path — shed-ext-rc's `create`
+	//     with no --interactive-shell) — the inner tmux command is a bare, unwrapped
+	//     exec that inherits the pane's environment, and that pane was itself created
+	//     by shed-ext-rc running over SSH under the server's `bash -lc` wrap: a LOGIN
+	//     shell (/etc/profile.d/*.sh + /etc/environment.d). The probe must match with
+	//     a login shell too, or it consults a NARROWER PATH than the real launch and
+	//     false-negative-rejects an agent that lives on the login PATH.
+	//   - InteractiveShell=true (native-machine callers, e.g. shed-machine-rc's
+	//     `claude` verb) — innerCommandTUI genuinely wraps the inner command in
+	//     `bash -ic` (an rc-file PATH: nvm/asdf/mise shims sourced from .bashrc), so
+	//     the probe must match with an interactive shell.
+	//
+	// A plain exec.LookPath, or the fixed login-shell probe capabilities.go uses for
+	// discovery, would get the wrong answer for one of the two cases above. Skipped
+	// entirely for a kind whose spec declares no Bin (shell has none to probe). nil
+	// skips the check (tests, and any caller with nothing to probe); production wires
+	// the real bash-backed probe (see clirc.go's realBinProbe).
+	BinProbe InstalledProbe
 	// EnsureHub, when non-nil, is invoked (best-effort) once a session has been
 	// created, to make sure the local rc activity hub is running so the new session
 	// is watched. It must never fail or meaningfully delay the create — a spawn
@@ -75,6 +99,21 @@ type CreateOptions struct {
 func Create(r Runner, env Getenv, opts CreateOptions, sleep func(time.Duration)) (Session, error) {
 	if !IsValidKind(opts.Kind) {
 		return Session{}, fmt.Errorf("%w: unknown kind %q", ErrBadArgs, opts.Kind)
+	}
+	// Installed-agent gate: before any tmux work, confirm the kind's binary is
+	// actually reachable on the launch PATH. Without this, a missing binary surfaces
+	// only as an opaque "session died on create (state=dead)" once the tmux inner
+	// command exits immediately — this turns that into a named, actionable error.
+	// Skipped for a kind with no Bin (shell) and when no probe is wired (nil BinProbe
+	// — see the field doc).
+	if spec, ok := specForKind(opts.Kind); ok && spec.Bin != "" && opts.BinProbe != nil {
+		if !opts.BinProbe(spec.Bin) {
+			// internal/ext/rc backs both a shed's shed-ext-rc (agents baked into the
+			// rootfs image) and a native machine's shed-machine-rc (agents user-installed),
+			// so the remediation names both possibilities rather than assuming one.
+			return Session{}, fmt.Errorf("%w: agent %q was not found on the session PATH — it may be missing from this shed's image (recreate from a newer image) or not installed on this machine; or pick another --kind",
+				ErrBadArgs, spec.Bin)
+		}
 	}
 	if opts.Prompt != "" {
 		if !AcceptsTypedInput(opts.Kind) {
@@ -425,6 +464,17 @@ func Kill(r Runner, slug string) error {
 		return nil
 	}
 	return fmt.Errorf("tmux kill-session failed: %s", strings.TrimSpace(res.Stderr))
+}
+
+// ToolFor returns the human-facing tool token backing a kind's sessions ("claude",
+// "codex", "opencode", "cursor", "shell"), or "the agent" for an unregistered kind.
+// Registry-sourced so a CLI's needs-auth guidance names the actual tool instead of
+// hand-hardcoding "Claude" (see cmd/shed/attach.go's reportRCCreateOutcome).
+func ToolFor(k Kind) string {
+	if spec, ok := specForKind(k); ok && spec.Tool != "" {
+		return spec.Tool
+	}
+	return "the agent"
 }
 
 func firstNonEmpty(vals ...string) string {

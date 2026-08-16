@@ -782,14 +782,66 @@ var (
 	// word-bounded phrases, not bare "login" — to avoid tripping on ordinary agent
 	// chatter in a conversation.
 	opencodeAuthScreenRe = regexp.MustCompile(`(?i)\bsign in\b|\blog ?in to\b|\bauthenticate\b|\bopencode auth\b`)
+
+	// opencodeAuthDialogRe matches opencode's auto-opened "Connect a provider" dialog
+	// — the widget opencode's TUI pops up UNPROMPTED the instant its sync effect sees
+	// `sync.data.provider.length === 0` (packages/tui/src/app.tsx: "only trigger when
+	// we transition into an empty-provider state"), which is exactly the state of a
+	// freshly-baked shed image before `opencode auth login` has ever run — the "reads
+	// starting → timeout" gap this anchor closes.
+	//
+	// SOURCE, not guesswork — read out of the opencode monorepo's TUI package
+	// (packages/tui/src, commit 4643e65ad63 as checked out locally for this change):
+	//
+	//	component/dialog-provider.tsx — `<DialogSelect title="Connect a provider"
+	//	                                 options={options()} />`; PROVIDER_PRIORITY
+	//	                                 groups every built-in provider (opencode,
+	//	                                 openai, anthropic, google, github-copilot,
+	//	                                 opencode-go) under the category "Popular".
+	//	ui/dialog-select.tsx          — the title renders bold, left-column, with
+	//	                                 "esc" trailing on the SAME row (so the title
+	//	                                 is not itself end-of-line-anchorable); each
+	//	                                 category header renders BOLD, ALONE, on its
+	//	                                 own line, a few rows below.
+	//	app.tsx                       — `dialog.replace(() => <DialogProviderList />)`
+	//	                                 gated on the empty-provider transition.
+	//	ui/dialog.tsx                 — the Dialog wrapper is a full-screen
+	//	                                 `position="absolute"` overlay (zIndex 3000),
+	//	                                 so — like codex's approval overlay — it
+	//	                                 REPLACES whatever the composer/home screen
+	//	                                 would otherwise draw; opencodePlaceholderRe /
+	//	                                 opencodeFooterRe never co-render with it on a
+	//	                                 real pane.
+	//
+	// THE CONJUNCTION (same discipline as codex/cursor's approval anchors, § their
+	// docs): the headline alone is not trusted — "Connect a provider" is ordinary
+	// English an agent could in principle quote back — so the anchor additionally
+	// requires the "Popular" category header, which appears alone on its own line a
+	// few rows below the title and exists only while this exact widget is mounted
+	// (see TestClassifyFalsePositives for the negative: the headline alone, without
+	// the category header, must not classify as needs-auth).
+	//
+	// FIXTURE PROVENANCE: testdata/panes/opencode-needs-auth.txt is reconstructed
+	// from the source above, NOT captured from a live pane (no fixture-capture shed
+	// was spun up for this change) — same provenance discipline as cursor's approval
+	// fixtures. Re-capture live when convenient.
+	opencodeAuthDialogRe = regexp.MustCompile(
+		`(?m)^[ \t]*Connect a provider\b` +
+			`(?:[^\n]*\n){0,10}` +
+			`[ \t]*Popular[ \t]*$`)
 )
 
-// classifyOpencode derives an opencode pane's lifecycle state. opencode has no trust
-// gate; its logged-out screen was not captured live, so needs-auth is left to the
-// shared signals for now (a future anchor slots in here). The composer placeholder is
-// unconditional ready; the persistent footer alone means ready only when the pane does
-// not look like an auth/onboarding screen (opencodeAuthScreenRe).
+// classifyOpencode derives an opencode pane's lifecycle state. The auto-opened
+// "Connect a provider" dialog (opencodeAuthDialogRe) is checked first — it is opencode's
+// only captured POSITIVE needs-auth signal (a zero-provider session), and it fully
+// replaces the composer/footer on screen, so it never races the ready checks below. The
+// composer placeholder is unconditional ready; the persistent footer alone means ready
+// only when the pane does not look like an auth/onboarding screen (opencodeAuthScreenRe,
+// the pre-existing guard kept for any onboarding text this anchor doesn't cover).
 func classifyOpencode(_ Kind, pane string) PaneResult {
+	if opencodeAuthDialogRe.MatchString(pane) {
+		return PaneResult{State: StateNeedsAuth}
+	}
 	if opencodePlaceholderRe.MatchString(pane) {
 		return PaneResult{State: StateReady}
 	}
