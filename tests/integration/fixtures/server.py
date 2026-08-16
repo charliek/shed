@@ -503,6 +503,28 @@ class LocalServer:
             )
         return json.loads(r.stdout or "{}")
 
+    def cli(self, *args: str, timeout: int = 60) -> subprocess.CompletedProcess:
+        """Run an arbitrary `shed -s <name> <args...>` client CLI invocation.
+
+        The other helpers on this class (`create`/`exec`/`stop`/...) each wrap
+        one specific subcommand with its own parsing. Some behavior — notably
+        `shed attach --kind ...` (Remote Control session kickoff) — is only
+        reachable through the client CLI itself; there is no server-side
+        create/exec route that exercises the CLI's own flag validation,
+        argv-building, and output rendering. `cli()` is the generic escape
+        hatch for that: it returns the raw `CompletedProcess` so the caller
+        can assert on the exit code and parse stdout/stderr itself (e.g.
+        `attach`'s RC-create summary is plain text, not JSON — see
+        `printRCSummary`/`reportRCCreateOutcome` in cmd/shed/attach.go, which
+        don't consult `--json`).
+        """
+        return subprocess.run(
+            ["shed", "-s", self.name, *args],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+
     # ------------------------------------------------------------------
     # Log handling (overridden in RemoteServer)
     # ------------------------------------------------------------------
