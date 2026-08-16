@@ -313,10 +313,27 @@ func (h *Hub) handleSessions(w http.ResponseWriter, _ *http.Request) {
 		// one place to publish from. Copied, never aliased: the response row must not
 		// share a slice with live hub state. An empty snapshot copies to nil, which
 		// omitempty drops — hence no guard.
-		sessions[i].PendingApprovals = append([]FeedApproval(nil), tr.pendingApprovals...)
+		sessions[i].PendingApprovals = copyApprovals(tr.pendingApprovals)
 	}
 	h.trackMu.Unlock()
 	writeJSON(w, http.StatusOK, hubSessionsResponse{Sessions: sessions})
+}
+
+// copyApprovals deep-copies an approval snapshot for serving. The per-element
+// Decisions slice is copied too: a shallow copy of the outer slice would leave
+// every served row aliasing the tracked entry's Decisions backing array, so a lane
+// mutating its snapshot after this point could rewrite a response already built (or
+// race the encoder). An empty snapshot copies to nil, which omitempty drops.
+func copyApprovals(in []FeedApproval) []FeedApproval {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make([]FeedApproval, len(in))
+	for i, a := range in {
+		a.Decisions = append([]string(nil), a.Decisions...)
+		out[i] = a
+	}
+	return out
 }
 
 // hubSessionsResponse is the GET /v1/sessions body. Distinct from the one-shot

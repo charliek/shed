@@ -159,6 +159,15 @@ public struct RcFeedApproval: Codable, Sendable, Equatable {
         self.decisions = decisions
     }
 
+    /// One `decisions[]` element, decoded lossily: a non-string element degrades
+    /// to `nil` (dropped) instead of failing the array.
+    private struct LossyDecision: Decodable {
+        let value: String?
+        init(from decoder: Decoder) throws {
+            value = try? decoder.singleValueContainer().decode(String.self)
+        }
+    }
+
     public init(from decoder: Decoder) throws {
         // `try?` per field, not `try`: a wrong-TYPED field must degrade to its
         // default like the Rust mirror's tolerant deserializer — a plain
@@ -169,7 +178,12 @@ public struct RcFeedApproval: Codable, Sendable, Equatable {
         id = (try? c.decodeIfPresent(String.self, forKey: .id)) ?? nil ?? ""
         status = (try? c.decodeIfPresent(String.self, forKey: .status)) ?? nil ?? ""
         decision = (try? c.decodeIfPresent(String.self, forKey: .decision)) ?? nil
-        decisions = (try? c.decodeIfPresent([String].self, forKey: .decisions)) ?? nil ?? []
+        // Degrades PER ELEMENT like the Rust mirror's filter_map
+        // (`crates/shed-core/src/rc.rs`): `["allow",5,"deny"]` → `["allow","deny"]`,
+        // not `[]`. A wholly wrong-typed `decisions` (not an array) still degrades
+        // to `[]` via the outer `try?`.
+        let raw = (try? c.decodeIfPresent([LossyDecision].self, forKey: .decisions)) ?? nil
+        decisions = (raw ?? []).compactMap(\.value)
     }
 
     /// Whether this row reports an approval still awaiting an answer.

@@ -440,7 +440,20 @@ final class RCWireTests: XCTestCase {
         let a = try XCTUnwrap(dto.pendingApprovals?.first)
         XCTAssertEqual(a.id, "")          // wrong-typed → default, not a throw
         XCTAssertEqual(a.status, "pending")
-        XCTAssertEqual(a.decisions, [])   // wrong-typed → default
+        XCTAssertEqual(a.decisions, [])   // wrong-typed (not an array) → default
+
+        // A MIXED decisions array degrades per ELEMENT like the Rust mirror's
+        // filter_map — the string entries survive, only the wrong-typed ones drop.
+        let mixed = #"""
+        {"slug":"ab12cd","tmux_session":"rc-ab12cd","kind":"codex","state":"ready",
+         "managed":true,"lane":"tui",
+         "pending_approvals":[{"id":"ap-1","status":"pending",
+                              "decisions":["allow",5,"deny",null,{"x":1}]}]}
+        """#
+        let mixedDTO = try JSONDecoder().decode(RcSessionDTO.self, from: Data(mixed.utf8))
+        let m = try XCTUnwrap(mixedDTO.pendingApprovals?.first)
+        XCTAssertEqual(m.id, "ap-1")
+        XCTAssertEqual(m.decisions, ["allow", "deny"])
     }
 
     /// The enriched-session adapter sanitizes the guest-controlled preview the way

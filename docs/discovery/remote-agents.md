@@ -87,7 +87,7 @@ are additive to the DTO but the semantics may break freely (experimental).
 
 ### Session model
 
-```
+```text
 Session (existing DTO) gains:
   lane: "tui" | "structured"        # how the session is executed/observed
 ```
@@ -116,7 +116,7 @@ is what tells clients the difference.
 Existing: `create / list / probe / kill / input (gated) / accept-trust`.
 New (structured lane implements; TUI lane 409s where unsupported):
 
-```
+```text
 POST /v1/sessions/{slug}/turn          start a turn (prompt + options)
 POST /v1/sessions/{slug}/interrupt     interrupt the active turn
 POST /v1/sessions/{slug}/approvals/{id}  respond {decision: allow|allow_always|deny}
@@ -143,8 +143,8 @@ them later if a direct path ever wins.)
 |---|---|---|---|
 | **claude** | classifier + transcript-tail activity (shipped); stays primary | **None planned.** Official remote-control is the remote surface (Max-safe: watch/steer/approve from claude.ai + mobile apps) | Anthropic blocks Pro/Max OAuth in third-party SDK/headless use (enforced 2026-04); subscriptions instead carry a **metered Agent SDK credit pool** (2026-06). A claude structured lane is therefore *possible but metered* — cost decision, deferred |
 | **cursor** | **Harden first**: hooks (`~/.cursor/hooks.json` — `beforeShellExecution`/`preToolUse` fire in CLI and can veto) → hub activity + `needs_approval`; transcript tail (`~/.cursor/projects/<p>/agent-transcripts/*.jsonl`, claude-style JSONL, tool *outputs excluded*) → partial message feed | `cursor-acp` later: permissions + tool streaming work over ACP, but **`session/load` is broken server-side** (confirmed by Cursor staff 2026-03, unresolved), no fork, turn-completion hooks contested in headless. **t3code ships cursor-ACP in production anyway** by keeping a long-lived ACP child per session — `session/load` is attempted only on restart, guarded by their own timeout + replay-idle-gap — so the lane is viable under "process lifetime = session lifetime, resume best-effort" (exactly the invariant a hub-resident lane gives us) | Re-test `session/load` before building the ACP lane; hook coverage claims vs. staff statements conflict — verify live |
-| **codex** | rollout-JSONL feed + gated input (shipped) | `codex app-server` (stdio/unix-socket): thread/turn/item, `turn/steer|interrupt`, real approval RPCs, `thread/resume|fork` — **most mature protocol of the four** | `codex remote-control` pairs only with OpenAI's closed relay (their apps) — not our transport. ChatGPT-subscription auth for automation: permissive in practice, formally undocumented — offer as opt-in, document the ambiguity |
-| **opencode** | SSE watcher via per-session `--port` (shipped — already half a serve-split) | serve-backed sessions via its HTTP/SSE API: prompt w/ `steer|queue` delivery, `/interrupt`, permission + question reply endpoints; remote TUI via `opencode attach` | The needed session/permission/question routes are opencode's self-labeled **experimental v2** — but **t3code ships on exactly that surface** (`@opencode-ai/sdk/v2`, spawned server per session torn down with the session scope, consuming `permission.asked/replied` + `question.asked` events), so "experimental" is load-bearing in a 100k-user product. `attach` has two maintainer-declined bugs (password attach broken; infinite hang on server death) — front sessions with our hub, don't depend on raw `attach`; pin the SDK/API version |
+| **codex** | rollout-JSONL feed + gated input (shipped) | `codex app-server` (stdio/unix-socket): thread/turn/item, `turn/steer\|interrupt`, real approval RPCs, `thread/resume|fork` — **most mature protocol of the four** | `codex remote-control` pairs only with OpenAI's closed relay (their apps) — not our transport. ChatGPT-subscription auth for automation: permissive in practice, formally undocumented — offer as opt-in, document the ambiguity |
+| **opencode** | SSE watcher via per-session `--port` (shipped — already half a serve-split) | serve-backed sessions via its HTTP/SSE API: prompt w/ `steer\|queue` delivery, `/interrupt`, permission + question reply endpoints; remote TUI via `opencode attach` | The needed session/permission/question routes are opencode's self-labeled **experimental v2** — but **t3code ships on exactly that surface** (`@opencode-ai/sdk/v2`, spawned server per session torn down with the session scope, consuming `permission.asked/replied` + `question.asked` events), so "experimental" is load-bearing in a 100k-user product. `attach` has two maintainer-declined bugs (password attach broken; infinite hang on server death) — front sessions with our hub, don't depend on raw `attach`; pin the SDK/API version |
 | **shell** | as shipped | n/a | |
 
 ACP is real and maturing (cross-vendor org, Apache-2.0, v0.13.x, JetBrains +
@@ -155,7 +155,7 @@ per-agent native lanes behind one contract, not a single-protocol bet.
 
 New crate in `crates/` (name TBD), on `shed-core` + `shed-app`:
 
-```
+```bash
 <tool> agent codex                       # local machine, auto posture; prints watch/attach info
 <tool> agent claude --on mini2           # over SSH (engine binary on the machine)
 <tool> agent opencode --shed mytopic     # in a shed (server API path)
@@ -201,12 +201,12 @@ the phase (even when the mobile UI itself lands a phase later).
 
 | Phase | Ships | Mobile checkpoint |
 |---|---|---|
-| **R0 — Contract v2** | `lane` field, extended `kind_features`, turn/interrupt/approval verbs (501/409 where unimplemented), typed approval feed entries, `needs_approval` activity; Go hub + Rust `rc.rs` + fixtures updated in lockstep | Mobile decodes v2 envelope; existing watch screens render unchanged off capabilities |
+| **R0 — Contract v2** | `lane` field, extended `kind_features`, turn/interrupt/approval verbs (409 where unimplemented), typed approval feed entries, `needs_approval` activity; Go hub + Rust `rc.rs` + fixtures updated in lockstep | Mobile decodes v2 envelope; existing watch screens render unchanged off capabilities |
 
 > **R0 status:** shipped on branch `feature/plan-007-rc-contract-v2` (2026-08-16),
 > pending PR. See `docs/extensions/rc-helper.md` for the landed contract (the
-> panel-corrected version — `409 not_supported`/`not_accepting`, no `501`s — supersedes
-> the "501/409" note in the table row above).
+> panel-corrected version — `409 not_supported`/`not_accepting`, no `501`s — is what the
+> `409` in the table row above refers to).
 | **R1 — Cursor TUI hardening** | cursor hooks→hub ingestion (activity + `needs_approval`), transcript-tail partial feed; cursor stops being stability-only | Cursor session on a shed shows live activity + "approval pending — open TUI" on the phone |
 | **R2 — Rust porcelain v1** | new crate: `agent`/`ls`/`watch`/`attach`/`plan`/`kill` across `local\|machine\|shed`; drives Go engine binaries; machines section in config | n/a directly (CLI), but exercises the same shed-core target model mobile will use |
 | **R3 — Structured lane prototype** | opencode **or** codex app-server adapter in the guest hub behind the v2 verbs; decision on kind-vs-lane-option modeling | **Approve a tool call and steer a turn from the phone** — the bar for the whole design |

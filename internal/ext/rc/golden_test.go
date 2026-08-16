@@ -3,6 +3,8 @@ package rc
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -59,9 +61,11 @@ func TestGoldenFixtureDecodes(t *testing.T) {
 			t.Errorf("session[%d] lane = %q, want %q (every kind is a TUI lane this phase)", i, s.Lane, LaneTUI)
 		}
 	}
-	// pending_approvals is hub-layer-only and empty in this phase — it must not
-	// appear in the one-shot `list` fixture.
-	if len(full.PendingApprovals) != 0 || len(minimal.PendingApprovals) != 0 {
+	// pending_approvals is hub-layer-only in this phase — it must be ABSENT from
+	// the one-shot `list` fixture, not merely empty (an `"pending_approvals": []`
+	// fixture would be a wire-visible field the omitempty tag promises not to emit,
+	// so nil-check rather than len-check).
+	if full.PendingApprovals != nil || minimal.PendingApprovals != nil {
 		t.Errorf("no producer emits pending_approvals in this phase: %+v / %+v",
 			full.PendingApprovals, minimal.PendingApprovals)
 	}
@@ -202,7 +206,9 @@ func TestFeedMessageGoldenDecodes(t *testing.T) {
 
 // decodeGoldenStrict reads a testdata golden and decodes it into v with unknown fields
 // REJECTED — a stray or renamed field on either side fails the contract rather than
-// being silently dropped.
+// being silently dropped. The fixture must also be exactly ONE JSON value: a second
+// value after the first is rejected (same drain-to-EOF decision the hub's own body
+// decoder makes), so a golden can't quietly carry trailing junk the decoder ignores.
 func decodeGoldenStrict(t *testing.T, name string, v any) {
 	t.Helper()
 	data, err := os.ReadFile(filepath.Join("testdata", name))
@@ -213,5 +219,8 @@ func decodeGoldenStrict(t *testing.T, name string, v any) {
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(v); err != nil {
 		t.Fatalf("%s failed to decode into the Go types: %v", name, err)
+	}
+	if err := dec.Decode(new(json.RawMessage)); !errors.Is(err, io.EOF) {
+		t.Fatalf("%s must hold exactly one JSON value; trailing content (decode err = %v)", name, err)
 	}
 }

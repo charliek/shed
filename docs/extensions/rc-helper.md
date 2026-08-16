@@ -227,8 +227,7 @@ not `null`) when unknown; `managed` is always present.
   "target_label": "shed:t1@host",
   "activity": "working",
   "activity_at": "2026-06-19T18:54:12Z",
-  "last_message": "Running the test suite now.",
-  "pending_approvals": []
+  "last_message": "Running the test suite now."
 }
 ```
 

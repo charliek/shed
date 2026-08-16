@@ -366,7 +366,17 @@ func (s *Server) handleRCProxy(w http.ResponseWriter, r *http.Request) {
 			pr.Out.Header = allowlistedHubHeaders(pr.In.Header)
 		},
 		Transport: s.newHubTransport(shedName),
-		ErrorHandler: func(w http.ResponseWriter, _ *http.Request, _ error) {
+		ErrorHandler: func(w http.ResponseWriter, _ *http.Request, err error) {
+			// The request body is STREAMED to the guest hub by the transport, so
+			// our own rcHubInputBodyLimit cap trips mid-RoundTrip and surfaces
+			// here rather than as the stdlib's auto-413. Preserve the documented
+			// 413 contract for the POST verbs instead of mislabelling a
+			// client-side overflow as an upstream failure.
+			var maxErr *http.MaxBytesError
+			if errors.As(err, &maxErr) {
+				writeError(w, http.StatusRequestEntityTooLarge, "REQUEST_TOO_LARGE", "request body exceeds the 16 KiB limit")
+				return
+			}
 			// A dial/read failure after ensure-start (e.g. the hub raced an
 			// idle-exit between the probe and the forward) is a 502.
 			writeError(w, http.StatusBadGateway, "RC_PROXY_FAILED", "rc hub request failed")

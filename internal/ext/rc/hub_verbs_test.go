@@ -397,4 +397,18 @@ func TestHubSessionsPendingApprovalsOverlay(t *testing.T) {
 	if still != "call_01" {
 		t.Errorf("mutating a response row rewrote hub state (%q) — the overlay must copy", still)
 	}
+
+	// The per-element Decisions slice must be copied too, not just the outer
+	// slice — otherwise a lane rewriting its tracked snapshot's Decisions in place
+	// would rewrite a response the handler already built. Exercised against the
+	// copy helper directly: the handler's copy is gone by the time the response is
+	// readable, so this is the only place the pre-encode row can be observed.
+	h.trackMu.Lock()
+	snapshot := copyApprovals(h.tracked["pnd001"].pendingApprovals)
+	h.tracked["pnd001"].pendingApprovals[0].Decisions[0] = "mutated"
+	h.trackMu.Unlock()
+	if snapshot[0].Decisions[0] != approvalDecisionAllow {
+		t.Errorf("copied row aliases the tracked Decisions slice (got %q) — deep-copy required",
+			snapshot[0].Decisions[0])
+	}
 }

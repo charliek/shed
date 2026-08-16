@@ -361,23 +361,22 @@ func TestRCProxy_ApprovalRoutes_RejectedBeforeDial(t *testing.T) {
 	}
 }
 
-// TestRCProxy_OversizedPOSTBody documents (rather than merely asserts) the actual
-// outcome of the blanket rcHubInputBodyLimit cap when it is exceeded THROUGH the
-// proxy, for any of the POST verbs (turn included — the plan's C3 scope covers
-// verifying, not changing, this behavior).
+// TestRCProxy_OversizedPOSTBody pins the documented 413 contract for the POST
+// verbs when the blanket rcHubInputBodyLimit cap is exceeded THROUGH the proxy
+// (turn included).
 //
-// The cap does NOT produce a clean 413 at this layer: http.MaxBytesReader's
-// "requestTooLarge" auto-413 hook only fires when the ResponseWriter is the real
+// The stdlib's own auto-413 never fires on this path: http.MaxBytesReader's
+// "requestTooLarge" hook only triggers when the ResponseWriter is the real
 // *http.response the stdlib server constructs per connection (an unexported
 // interface check) — httptest.ResponseRecorder is not that type, and more
-// fundamentally the body here is being STREAMED to the upstream guest hub by
-// httputil.ReverseProxy/http.Transport, not read directly by our handler. When the
-// wrapped reader trips the cap mid-stream, the Transport sees a body-read error,
-// RoundTrip fails, and ReverseProxy's ErrorHandler runs — which this file maps to
-// 502 RC_PROXY_FAILED. So an oversized proxied body surfaces as 502, not 413; the
-// hub's OWN 413 (internal/ext/rc/hub_verbs.go, decodeHubBody) is what a client
-// actually relies on for a clean rejection — the server-side cap here exists to
-// bound what gets streamed into the guest, not to be the authoritative error.
+// fundamentally the body here is STREAMED to the upstream guest hub by
+// httputil.ReverseProxy/http.Transport, not read directly by our handler. So when
+// the wrapped reader trips the cap mid-stream the Transport sees a body-read
+// error, RoundTrip fails, and ReverseProxy's ErrorHandler runs — which is why the
+// ErrorHandler classifies *http.MaxBytesError explicitly and answers 413
+// REQUEST_TOO_LARGE, keeping 502 RC_PROXY_FAILED for genuine upstream failures.
+// The hub enforces the same 16 KiB independently (internal/ext/rc/hub_verbs.go,
+// decodeHubBody), so a direct-to-hub caller sees a matching rejection.
 func TestRCProxy_OversizedPOSTBody(t *testing.T) {
 	addr := startFakeHub(t, hubMuxOpts{})
 	be := &rcFakeBackend{dialFn: dialTo(addr)}
@@ -390,8 +389,8 @@ func TestRCProxy_OversizedPOSTBody(t *testing.T) {
 	w := httptest.NewRecorder()
 	srv.Router().ServeHTTP(w, r)
 
-	if w.Code != http.StatusBadGateway || !strings.Contains(w.Body.String(), "RC_PROXY_FAILED") {
-		t.Fatalf("oversized proxied body: got %d %s, want 502 RC_PROXY_FAILED (see the doc comment above for why not 413)",
+	if w.Code != http.StatusRequestEntityTooLarge || !strings.Contains(w.Body.String(), "REQUEST_TOO_LARGE") {
+		t.Fatalf("oversized proxied body: got %d %s, want 413 REQUEST_TOO_LARGE",
 			w.Code, w.Body.String())
 	}
 }
