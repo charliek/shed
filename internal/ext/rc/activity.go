@@ -28,11 +28,13 @@ const (
 	// which means "no activity dimension at all" (hub absent / lifecycle trumps).
 	ActivityUnknown Activity = "unknown"
 
-	// ActivityNeedsApproval is RESERVED in the wire contract for a future
-	// approval-gating dimension. No derivation produces it in this phase and no
-	// client AC references it — approval handling remains "open the TUI" via the
-	// needs-* lifecycle states. It is declared here so the enum's wire values are
-	// fixed up front and a later phase can start emitting it without a contract bump.
+	// ActivityNeedsApproval — the session is blocked on an approval the operator
+	// must answer. This is a LEGAL WIRE VALUE of the contract (clients must decode
+	// and render it), not a reserved placeholder: it decodes distinctly in every
+	// mirror and flows end-to-end through the hub events → aggregator → client
+	// projection path. No derivation produces it YET — the derivations land in later
+	// phases (cursor's hook stream, the structured lanes' native approval events),
+	// and until one does, approval handling in practice remains "open the TUI".
 	ActivityNeedsApproval Activity = "needs_approval"
 )
 

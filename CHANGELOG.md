@@ -18,6 +18,31 @@ All notable changes to this project will be documented in this file.
   archived charliek/shed-desktop repo.
 -->
 
+## Unreleased
+
+**Ships:** server
+
+### Added
+
+- **RC wire-contract v2 (`rc_version` 3 → 4).** The `shed-ext-rc` guest hub gains a
+  `lane` field on every session DTO (always present; `"tui"` for every kind today),
+  `kind_features` grows `feed`/`interrupt`/`attach` alongside the existing
+  `post_input`/`approvals`/`watch`/`input` (`watch` is now deprecated in favor of
+  `feed`, kept in lockstep; `post_input` stays current), and three reserved hub verbs
+  — `POST /v1/sessions/{slug}/turn`, `/interrupt`, `/approvals/{id}` — are routed on
+  both the hub and the server's proxy allowlist with their full 413/400/404/409
+  precedence and success shapes pinned, so clients (mobile above all) can code
+  against a stable surface before any lane implements them (every kind answers `409
+  not_supported` today). The message feed gains an `approval_request` row type
+  carrying a machine-readable `approval` block (id-keyed, last-write-wins), sessions
+  gain a `pending_approvals` snapshot (hub-layer, empty this phase), and
+  `needs_approval` becomes a legal `activity` wire value (still unproduced). New
+  `capabilities` feature token `contract-v2` is the client's route-existence check.
+  The Rust and Swift/TS mirrors are updated to match, and all four golden fixture
+  copies are enforced byte-identical by a new parity guard. See
+  `docs/extensions/rc-helper.md` for the full contract. Contract-only — no lane
+  implementation, no new activity derivation, no client UI behavior change.
+
 ## v0.8.1 — 2026-07-28
 
 **Ships:** server, host-agent, machine-rc, desktop

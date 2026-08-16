@@ -58,6 +58,12 @@ pub enum RcEvent {
         activity: Option<RcActivity>,
         state: Option<RcState>,
         last_message: Option<String>,
+        /// The session's lane (contract v2), carried verbatim off the nested
+        /// `session` body when present. `None` on a removal, on an older hub
+        /// that predates the field, and on a wrong-typed value. Additive: a
+        /// consumer that ignores it behaves exactly as before, while one that
+        /// reads it sees a future lane transition without an overview refetch.
+        lane: Option<String>,
         removed: bool,
     },
     /// `event: message.appended` — a new feed message landed. `data: {shed,
@@ -121,6 +127,7 @@ pub fn parse_rc_event(e: &SseEvent) -> Option<RcEvent> {
                 activity: sess.and_then(|s| activity_of(s.get("activity"))),
                 state: sess.and_then(|s| state_of(s.get("state"))),
                 last_message: sess.and_then(|s| clean_display(s.get("last_message"))),
+                lane: sess.and_then(|s| opt_trimmed(s.get("lane"))),
                 removed: sess.is_none(),
             })
         }
@@ -268,6 +275,10 @@ impl ActivityOverlay {
                 state,
                 last_message,
                 removed,
+                // `lane` is carried on the event for consumers that read the
+                // frame directly; the activity overlay folds only the live
+                // activity dimensions, so it is not merged here.
+                ..
             } => {
                 let key = (shed.clone(), slug.clone());
                 // A kill (no session body) removes the patch entirely —
@@ -412,6 +423,27 @@ mod tests {
     }
 
     #[test]
+    fn needs_approval_survives_decode_and_the_fold() {
+        // Contract v2's new activity value must reach a card as itself — the
+        // stream is where it will arrive first (no derivation produces it yet),
+        // so pin it end to end: frame → typed event → overlay patch.
+        let ev = parse(
+            "activity.changed",
+            r#"{"shed":"proj","slug":"cdx777","activity":"needs_approval","state":"ready"}"#,
+        )
+        .unwrap();
+        let RcEvent::ActivityChanged { activity, .. } = &ev else {
+            panic!("wrong variant: {ev:?}");
+        };
+        assert_eq!(*activity, Some(RcActivity::NeedsApproval));
+        let o = ActivityOverlay::empty().apply(&ev);
+        assert_eq!(
+            o.lookup("proj", "cdx777").unwrap().activity,
+            Some(RcActivity::NeedsApproval)
+        );
+    }
+
+    #[test]
     fn activity_changed_payload_last_message_supersedes_held() {
         let ev = parse(
             "activity.changed",
@@ -469,9 +501,39 @@ mod tests {
                 activity: Some(RcActivity::Idle),
                 state: Some(RcState::Dead),
                 last_message: Some("bye".into()),
+                lane: None, // this hub predates contract v2
                 removed: false,
             }
         );
+    }
+
+    #[test]
+    fn session_updated_carries_lane_from_the_session_body() {
+        // Contract v2: the lane rides the nested session body, so a future lane
+        // transition reaches the client without an overview refetch.
+        let ev = parse(
+            "session.updated",
+            r#"{"shed":"proj","slug":"cdx777","session":
+                {"state":"ready","activity":"working","lane":"structured"}}"#,
+        )
+        .unwrap();
+        let RcEvent::SessionUpdated { lane, removed, .. } = &ev else {
+            panic!("wrong variant: {ev:?}");
+        };
+        assert_eq!(lane.as_deref(), Some("structured"));
+        assert!(!removed);
+        // Wrong-typed / blank / removal → None (never an error, never a guess).
+        for data in [
+            r#"{"shed":"p","slug":"a","session":{"state":"ready","lane":7}}"#,
+            r#"{"shed":"p","slug":"a","session":{"state":"ready","lane":"  "}}"#,
+            r#"{"shed":"p","slug":"a","session":null}"#,
+        ] {
+            let ev = parse("session.updated", data).unwrap();
+            let RcEvent::SessionUpdated { lane, .. } = &ev else {
+                panic!("wrong variant: {ev:?}");
+            };
+            assert_eq!(*lane, None, "data: {data}");
+        }
     }
 
     #[test]
@@ -592,6 +654,7 @@ mod tests {
                     activity: None,
                     state: None,
                     last_message: None,
+                    lane: None,
                     removed: true,
                 },
                 "data: {data}"
@@ -758,6 +821,7 @@ mod tests {
             activity: None,
             state: None,
             last_message: None,
+            lane: None,
             removed: true,
         });
         assert!(o.lookup("p", "a").is_none());
@@ -773,6 +837,7 @@ mod tests {
             activity: Some(RcActivity::Working),
             state: Some(RcState::Ready),
             last_message: Some("pre-death context".into()),
+            lane: None,
             removed: false,
         });
         o = o.apply(&RcEvent::MessageAppended {
@@ -806,6 +871,7 @@ mod tests {
                 activity: None,
                 state: None,
                 last_message: None,
+                lane: None,
                 removed: true,
             },
             RcEvent::MessageAppended {

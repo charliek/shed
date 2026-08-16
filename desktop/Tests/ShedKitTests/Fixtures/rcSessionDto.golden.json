@@ -6,24 +6,29 @@
       "kind": "claude-rc",
       "state": "ready",
       "managed": true,
+      "lane": "tui",
       "display_name": "charliek/abc234",
       "workdir": "/home/shed",
       "url": "https://claude.ai/code/session_01RCkTDrdZ2Rr12sD5dfMjgr",
       "id": "9f1c0e7a-1111-4222-8333-444455556666",
       "created_by": "shed-remote-agent/0.1.0",
       "created_at": "2026-06-19T18:53:00Z",
-      "target_label": "shed:t1@localmac-dev"
+      "target_label": "shed:t1@localmac-dev",
+      "activity": "working",
+      "activity_at": "2026-06-19T18:54:12Z",
+      "last_message": "Running the test suite now."
     },
     {
       "slug": "brk900",
       "tmux_session": "rc-brk900",
       "kind": "claude-broker",
       "state": "starting",
-      "managed": false
+      "managed": false,
+      "lane": "tui"
     }
   ],
   "capabilities": {
-    "rc_version": 3,
+    "rc_version": 4,
     "kinds": ["claude-broker", "claude-rc", "codex", "opencode", "cursor", "shell"],
     "agents": {
       "claude": { "installed": true, "version": "2.1.206" },
@@ -31,12 +36,12 @@
       "opencode": { "installed": true, "version": "1.17.11" },
       "cursor": { "installed": false }
     },
-    "features": ["generic-perm", "plan-stdin", "prompt-b64"],
+    "features": ["generic-perm", "plan-stdin", "prompt-b64", "serve", "activity", "messages", "contract-v2"],
     "kind_features": {
-      "claude-rc": { "post_input": true, "approvals": "tui" },
-      "codex": { "post_input": true, "approvals": "tui" },
-      "opencode": { "post_input": true, "approvals": "tui" },
-      "cursor": { "post_input": true, "approvals": "tui" }
+      "claude-rc": { "post_input": true, "approvals": "tui", "feed": "activity", "interrupt": false, "attach": "tmux" },
+      "codex": { "post_input": true, "approvals": "tui", "watch": true, "input": "gated", "feed": "messages", "interrupt": false, "attach": "tmux" },
+      "opencode": { "post_input": true, "approvals": "tui", "watch": true, "input": "gated", "feed": "messages", "interrupt": false, "attach": "tmux" },
+      "cursor": { "post_input": true, "approvals": "tui", "feed": "activity", "interrupt": false, "attach": "tmux" }
     }
   }
 }

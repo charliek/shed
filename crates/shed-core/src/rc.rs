@@ -24,6 +24,14 @@ pub const DEFAULT_WORKDIR: &str = "/workspace";
 pub const TOOL_NAME: &str = "shed-desktop";
 /// tmux session name prefix.
 pub const TMUX_PREFIX: &str = "rc-";
+/// The default session lane (contract v2) — an rc-tmux pane. Every kind in this
+/// phase is `tui`, and an OLD (pre-v2) payload that omits `lane` entirely is read
+/// as this value ([`RcSessionDto::lane_or_tui`]).
+pub const LANE_TUI: &str = "tui";
+/// The default terminal-attach mode (contract v2) — attach to the rc-tmux
+/// session. The fallback an absent/empty `kind_features.attach` decodes to
+/// ([`RcKindFeatures::attach_kind`]).
+pub const ATTACH_TMUX: &str = "tmux";
 
 /// RC session kind (Convention v2). `<tool>-<mode>` so the model can grow to
 /// other agents later; `shell` is tool-agnostic. Mirrors the guest's `rc.Kind`
@@ -205,18 +213,24 @@ impl RcState {
 /// Derived live by the rc hub and reported additively inside a session's `rc`
 /// block. Mirrors the guest's `rc.Activity` (`internal/ext/rc/activity.go`) and
 /// mobile's `RcActivity` (`rc_models.dart:125-147`): `working` (producing
-/// output), `needs_input` (idle at a prompt anchor), `idle` (quiescent), and
-/// `unknown` (live but indeterminate).
+/// output), `needs_input` (idle at a prompt anchor), `needs_approval` (blocked
+/// on an approval the user must answer), `idle` (quiescent), and `unknown` (live
+/// but indeterminate).
 ///
 /// Deliberately NO `Other(String)` case (unlike [`RcKind`]'s unknown-kind
-/// policy): an UNRECOGNIZED token — a future value, or the reserved
-/// `needs_approval` the hub does not derive yet — maps to
+/// policy): an UNRECOGNIZED token — any future value — maps to
 /// [`RcActivity::Unknown`] (Dart parity, `rc_models.dart:125-146`), so it
 /// renders neutrally (no badge) and consumers key off a single variant.
+///
+/// [`RcActivity::NeedsApproval`] is a LEGAL wire value as of contract v2 and is
+/// decoded distinctly (it used to fold into `Unknown`), even though no producer
+/// derives it yet — the hub's approval-aware lanes land in a later phase and must
+/// not have to recontract the clients to emit it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum RcActivity {
     Working,
     NeedsInput,
+    NeedsApproval,
     Idle,
     Unknown,
 }
@@ -226,6 +240,7 @@ impl RcActivity {
         match self {
             RcActivity::Working => "working",
             RcActivity::NeedsInput => "needs_input",
+            RcActivity::NeedsApproval => "needs_approval",
             RcActivity::Idle => "idle",
             RcActivity::Unknown => "unknown",
         }
@@ -237,6 +252,7 @@ impl RcActivity {
         match s {
             "working" => RcActivity::Working,
             "needs_input" => RcActivity::NeedsInput,
+            "needs_approval" => RcActivity::NeedsApproval,
             "idle" => RcActivity::Idle,
             _ => RcActivity::Unknown,
         }
@@ -294,6 +310,15 @@ pub struct RcSessionDto {
     // is required — a DTO omitting it is a shed-ext-rc contract violation, not a
     // silent "unmanaged". (The enriched `RcSession` model below stays defensive.)
     pub managed: bool,
+    /// The session's CURRENT lane (contract v2): `"tui"` (an rc-tmux pane) or
+    /// `"structured"` (a native-protocol lane). The guest emits it on EVERY
+    /// session — managed, unmanaged, unknown-kind alike — but it stays `Option`
+    /// here because an OLD (pre-v2) binary's payload omits it; read it through
+    /// [`RcSessionDto::lane_or_tui`], which applies the contract's absent-⇒-`tui`
+    /// rule. Carried verbatim (never parsed into an enum): a future lane value
+    /// must render neutrally, not vanish the session.
+    #[serde(default)]
+    pub lane: Option<String>,
     pub display_name: Option<String>,
     pub workdir: Option<String>,
     pub url: Option<String>,
@@ -312,6 +337,46 @@ pub struct RcSessionDto {
     /// A short, hub-sanitized (ANSI/control-stripped, ≤200 runes) preview of
     /// the session's most recent message. Absent when the hub has none.
     pub last_message: Option<String>,
+    /// The session's currently-unresolved approval requests (contract v2) — the
+    /// snapshot that keeps a session ACTIONABLE after the feed ring evicted (or a
+    /// hub restart lost) the `approval_request` rows that announced them. A
+    /// HUB-LAYER field: the one-shot `list` path this DTO usually comes from never
+    /// sets it, and nothing produces approvals in this phase, so it is absent
+    /// (`None`) on every wire today. See [`RcFeedApproval`] for the folding rule.
+    #[serde(default)]
+    pub pending_approvals: Option<Vec<RcFeedApproval>>,
+}
+
+impl RcSessionDto {
+    /// The session's lane with the contract's old-payload rule applied (see
+    /// [`lane_or_tui`]).
+    pub fn lane_or_tui(&self) -> &str {
+        lane_or_tui(self.lane.as_deref())
+    }
+}
+
+/// The shared shape of every contract-v2 "absent means the phase-1 default"
+/// read ([`lane_or_tui`], [`RcKindFeatures::attach_kind`]): a non-empty value
+/// wins, anything else (absent, or the empty string an out-of-contract producer
+/// or a re-emitting server can leave behind) reads as `fallback`.
+fn nonempty_or<'a>(value: &'a str, fallback: &'a str) -> &'a str {
+    // trim() so a whitespace-only value counts as absent — keeps this serde-path rule
+    // byte-equivalent with the overview flat adapter, which trims before its
+    // absent-check (models.rs opt_trimmed). A padded-but-real token passes through
+    // trimmed, never as its padded form.
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        fallback
+    } else {
+        trimmed
+    }
+}
+
+/// The contract's old-payload lane rule, in one place for both the DTO and the
+/// enriched session: an absent (pre-v2 binary) or empty `lane` reads as
+/// [`LANE_TUI`], so a client never has to distinguish "absent" from `"tui"`.
+pub fn lane_or_tui(lane: Option<&str>) -> &str {
+    nonempty_or(lane.unwrap_or_default(), LANE_TUI)
 }
 
 /// The `shed-ext-rc list` response shape. Strict on `rc_sessions` like Swift's
@@ -351,14 +416,38 @@ pub struct RcAgentInfo {
 /// typed-input *capability* bool (a typed line reaches the pane over the
 /// TUI-only path), while `input` is the *gating mode* of the separate feed-input
 /// channel — a kind can have `post_input: true` with no feed input at all.
+///
+/// Contract v2 adds three more (again serde-default, so a v1/v3 payload decodes
+/// unchanged): `feed` is what the hub can stream for the kind (`"messages"` — a
+/// normalized conversation feed; `"activity"` — the activity dimension only;
+/// `"none"`), `interrupt` reports the `turn/interrupt` verb (false for every kind
+/// in this phase), and `attach` is how a terminal reaches the session (`"tmux"`,
+/// `"native-remote"`, `"none"`). **`watch` is DEPRECATED by `feed`** — the guest
+/// holds `watch == (feed == "messages")` in lockstep (invariant-tested on the
+/// producer side) until every client reads `feed`, so the two can be trusted to
+/// agree; read them through [`RcKindFeatures::feed_messages`], which prefers
+/// `feed` and falls back to `watch` on a payload that predates it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RcKindFeatures {
     pub post_input: bool,
     pub approvals: String,
+    /// DEPRECATED by [`RcKindFeatures::feed`] (kept until clients migrate; the
+    /// producer maintains the lockstep described on the struct).
     #[serde(default)]
     pub watch: bool,
     #[serde(default)]
     pub input: String,
+    /// Empty on a pre-v2 payload — and, per the producer's omitempty note, on a
+    /// newer server re-emitting an older guest's decoded capabilities. Use
+    /// [`RcKindFeatures::feed_messages`] rather than comparing this directly.
+    #[serde(default)]
+    pub feed: String,
+    #[serde(default)]
+    pub interrupt: bool,
+    /// Empty on a pre-v2 payload; read it through
+    /// [`RcKindFeatures::attach_kind`], which applies the `"tmux"` fallback.
+    #[serde(default)]
+    pub attach: String,
 }
 
 impl RcKindFeatures {
@@ -367,6 +456,27 @@ impl RcKindFeatures {
     /// mobile's `KindFeatures.inputGated` (`rc_capabilities.dart:136`).
     pub fn input_gated(&self) -> bool {
         self.input == "gated"
+    }
+
+    /// Whether the hub streams a normalized MESSAGE feed for this kind (`GET
+    /// /messages` + `message.appended`) — the pinned v3-fallback read of the
+    /// deprecated `watch` bit: `feed == "messages"`, or, when `feed` is absent
+    /// (a pre-v2 payload, or an older guest's capabilities re-emitted by a newer
+    /// server), the legacy `watch` flag. A kind whose `feed` is `"activity"` or
+    /// `"none"` has no message feed even though it may carry activity.
+    pub fn feed_messages(&self) -> bool {
+        // trim() so a whitespace-only feed counts as absent — the same policy as
+        // nonempty_or (lane/attach) and the overview flat adapter, so every path
+        // answers identically on a padded payload.
+        let feed = self.feed.trim();
+        feed == "messages" || (feed.is_empty() && self.watch)
+    }
+
+    /// How a terminal reaches this kind's sessions, with the contract's
+    /// absent-⇒-[`ATTACH_TMUX`] fallback applied (every kind in this phase
+    /// attaches over tmux, so a payload that predates the field means `"tmux"`).
+    pub fn attach_kind(&self) -> &str {
+        nonempty_or(&self.attach, ATTACH_TMUX)
     }
 }
 
@@ -437,6 +547,11 @@ pub struct RcSession {
     pub workdir: Option<String>,
     pub kind: RcKind,
     pub state: RcState,
+    /// The session's current lane (see [`RcSessionDto::lane`]). `None` on a row
+    /// that came from a pre-v2 producer; [`RcSession::lane_or_tui`] applies the
+    /// absent-⇒-`"tui"` rule.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lane: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub url: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -454,6 +569,13 @@ pub struct RcSession {
     pub activity_at: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_message: Option<String>,
+    /// Pending approvals snapshot (see [`RcSessionDto::pending_approvals`]).
+    /// Carried through [`RcSession::from_dto`] so a hub-listed session's
+    /// actionable approvals reach app/IPC consumers instead of being dropped at
+    /// the adaptation boundary — always absent in this phase (no producer), but
+    /// the lane that populates it must not need a client contract change.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_approvals: Option<Vec<RcFeedApproval>>,
     #[serde(default)]
     pub managed: bool,
 }
@@ -462,6 +584,12 @@ impl RcSession {
     /// The table/wire identity — `host/shed/slug`.
     pub fn id(&self) -> String {
         composite_id(&self.host, &self.shed, &self.slug)
+    }
+
+    /// The session's lane with the contract's old-payload rule applied (see
+    /// [`lane_or_tui`]).
+    pub fn lane_or_tui(&self) -> &str {
+        lane_or_tui(self.lane.as_deref())
     }
 
     /// Adapt a binary DTO into an `RcSession`, injecting the host/shed the binary
@@ -479,6 +607,10 @@ impl RcSession {
             workdir: Some(dto.workdir.unwrap_or_else(|| DEFAULT_WORKDIR.to_string())),
             kind: dto.kind,
             state: dto.state,
+            // Verbatim, absence included: the fallback lives in the accessor, so
+            // "the producer said tui" stays distinguishable from "the producer is
+            // too old to say".
+            lane: dto.lane,
             url: dto.url,
             rc_id: dto.id,
             created_by: dto.created_by,
@@ -500,6 +632,7 @@ impl RcSession {
                     Some(cleaned)
                 }
             }),
+            pending_approvals: dto.pending_approvals,
             managed: dto.managed,
         }
     }
@@ -867,11 +1000,79 @@ impl RcFeedTool {
     }
 }
 
+/// The machine-readable state of an approval request (contract v2), carried by an
+/// `approval_request` feed row and — once a lane produces approvals — by a
+/// session's [`RcSessionDto::pending_approvals`] snapshot. Mirrors the guest's
+/// `rc.FeedApproval` (`internal/ext/rc/hub_messages.go`).
+///
+/// **CLIENT FOLDING RULE: approval rows are an id-keyed, LAST-WRITE-WINS stream.**
+/// A resolution is a SECOND appended row with the same `id` and `status`
+/// `"resolved"` — never an edit of the first. A client must NOT require having
+/// seen the `pending` row before the `resolved` one: ring eviction (or a hub
+/// restart) can drop the earlier row entirely, and the session's
+/// `pending_approvals` snapshot is the authoritative answer to "what is still
+/// open".
+///
+/// Every field decodes tolerantly (wrong-typed → default), like the rest of the
+/// feed: an approval a client cannot interpret must degrade to an un-actionable
+/// row, never break the page.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize)]
+pub struct RcFeedApproval {
+    /// The lane-assigned approval id — the address the approval verb resolves
+    /// (`POST /v1/sessions/{slug}/approvals/{id}`). Hub-sanitized/bounded;
+    /// grammar `^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$`.
+    pub id: String,
+    /// `"pending"` or `"resolved"`.
+    pub status: String,
+    /// The decision that resolved it (`None` while pending).
+    pub decision: Option<String>,
+    /// The decisions this request accepts (a subset of `allow`/`allow_always`/
+    /// `deny`), advertised per request so a client renders exactly the buttons
+    /// the lane will honor. Empty when the producer advertised none.
+    pub decisions: Vec<String>,
+}
+
+impl RcFeedApproval {
+    fn from_map(o: &serde_json::Map<String, serde_json::Value>) -> RcFeedApproval {
+        RcFeedApproval {
+            // Identifier-shaped fields, not prose: trimmed-verbatim (no
+            // Cf-stripping — the hub already strips every control/whitespace
+            // rune from an approval token).
+            id: opt_trimmed(o.get("id")).unwrap_or_default(),
+            status: opt_trimmed(o.get("status")).unwrap_or_default(),
+            decision: opt_trimmed(o.get("decision")),
+            decisions: o
+                .get("decisions")
+                .and_then(serde_json::Value::as_array)
+                .map(|a| a.iter().filter_map(|d| opt_trimmed(Some(d))).collect())
+                .unwrap_or_default(),
+        }
+    }
+
+    /// Whether this row reports an approval still awaiting an answer — the
+    /// actionable half of the last-write-wins fold.
+    pub fn is_pending(&self) -> bool {
+        self.status == "pending"
+    }
+}
+
+impl<'de> Deserialize<'de> for RcFeedApproval {
+    /// Tolerant (a non-object — including `null` — decodes to the default
+    /// approval), so the [`RcSessionDto::pending_approvals`] serde path inherits
+    /// the feed's never-throw posture.
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let v = serde_json::Value::deserialize(d)?;
+        Ok(v.as_object()
+            .map(RcFeedApproval::from_map)
+            .unwrap_or_default())
+    }
+}
+
 /// One normalized conversation message in the feed. `role` ∈ {user, assistant,
 /// tool, system}; `msg_type` (wire key `type`) ∈ {text, tool_use, tool_result,
-/// reasoning, status}. `seq` is monotonic per hub run (restarts from 1 on hub
-/// restart — a client that sees a seq lower than one it holds does a full
-/// refetch). Mirrors mobile's `RcFeedMessage` (`rc_feed.dart:29-58`); every
+/// reasoning, status, approval_request}. `seq` is monotonic per hub run (restarts
+/// from 1 on hub restart — a client that sees a seq lower than one it holds does a
+/// full refetch). Mirrors mobile's `RcFeedMessage` (`rc_feed.dart:29-58`); every
 /// field decodes tolerantly (wrong-typed → default/`None`, never an error).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct RcFeedMessage {
@@ -883,6 +1084,10 @@ pub struct RcFeedMessage {
     pub msg_type: String,
     pub text: Option<String>,
     pub tool: Option<RcFeedTool>,
+    /// The approval block of an `approval_request` row (contract v2) — `None` on
+    /// every other message type. `text`/`tool` still carry the human-readable
+    /// summary of what is being approved.
+    pub approval: Option<RcFeedApproval>,
 }
 
 impl RcFeedMessage {
@@ -899,6 +1104,24 @@ impl RcFeedMessage {
                 .get("tool")
                 .and_then(serde_json::Value::as_object)
                 .map(RcFeedTool::from_map),
+            // Same map-only rule as `tool`: anything else is no approval block,
+            // so an `approval_request` row with a malformed block degrades to an
+            // un-actionable message instead of a decode failure.
+            approval: o
+                .get("approval")
+                .and_then(serde_json::Value::as_object)
+                .map(RcFeedApproval::from_map),
+        }
+    }
+
+    /// Whether this row is an `approval_request` carrying a usable approval block
+    /// — the predicate a client keys its approve/deny affordance off (a row typed
+    /// `approval_request` with no decodable block is not actionable).
+    pub fn approval_request(&self) -> Option<&RcFeedApproval> {
+        if self.msg_type == "approval_request" {
+            self.approval.as_ref()
+        } else {
+            None
         }
     }
 }
@@ -1726,6 +1949,7 @@ mod tests {
             tmux_session: "rc-abc".into(),
             kind: RcKind::ClaudeRc,
             state: RcState::Ready,
+            lane: Some(LANE_TUI.to_string()),
             managed: true,
             display_name: None,
             workdir: None,
@@ -1737,6 +1961,7 @@ mod tests {
             activity: None,
             activity_at: None,
             last_message: None,
+            pending_approvals: None,
         };
         let s = RcSession::from_dto(dto, "srv", "web");
         assert_eq!(s.host, "srv");
@@ -1745,6 +1970,8 @@ mod tests {
         assert_eq!(s.workdir.as_deref(), Some(DEFAULT_WORKDIR)); // fallback
         assert_eq!(s.rc_id.as_deref(), Some("id-1")); // id → rc_id
         assert_eq!(s.id(), "srv/web/abc");
+        assert_eq!(s.lane.as_deref(), Some(LANE_TUI)); // propagated verbatim
+        assert_eq!(s.lane_or_tui(), LANE_TUI);
     }
 
     #[test]
@@ -1755,6 +1982,7 @@ mod tests {
                 tmux_session: "rc-abc".into(),
                 kind: RcKind::Shell,
                 state: RcState::Ready,
+                lane: Some(LANE_TUI.to_string()),
                 managed: false,
                 display_name: Some("dev".into()),
                 workdir: Some("/w".into()),
@@ -1766,6 +1994,7 @@ mod tests {
                 activity: None,
                 activity_at: None,
                 last_message: None,
+                pending_approvals: None,
             },
             "srv",
             "web",
@@ -1774,11 +2003,19 @@ mod tests {
         assert_eq!(j["tmux_session"], "rc-abc");
         assert_eq!(j["kind"], "shell");
         assert_eq!(j["managed"], false);
+        assert_eq!(j["lane"], "tui");
         // None optionals are omitted (Swift's encodeIfPresent parity), and `id`
         // (the computed key) is never on the wire.
         assert!(j.get("url").is_none());
         assert!(j.get("rc_id").is_none());
         assert!(j.get("id").is_none());
+        // …including `lane` itself when the producer was too old to send one.
+        let legacy = RcSession {
+            lane: None,
+            ..s.clone()
+        };
+        assert!(serde_json::to_value(&legacy).unwrap().get("lane").is_none());
+        assert_eq!(legacy.lane_or_tui(), LANE_TUI); // read through the fallback
     }
 
     #[test]
@@ -1810,30 +2047,22 @@ mod tests {
         ));
     }
 
-    /// Decode the canonical golden fixture (byte-identical to shed-remote-agent's
-    /// `rcSessionDto.golden.json` + the Swift `RCTests` guard): a full managed
-    /// session + a minimal legacy one (only required fields). Pins cross-repo
-    /// wire parity for the list DTO.
+    /// The crates-local copy of the canonical `list` golden
+    /// (`internal/ext/rc/testdata/rcSessionDto.golden.json`), byte-compared
+    /// against every other copy by the Go parity test in `internal/ext/rc`. It
+    /// lives under `crates/` — not read across the tree — because the
+    /// `make -C desktop core-linux` Docker leg mounts only this workspace.
+    const LIST_GOLDEN: &str = include_str!("../../fixtures/rcSessionDto.golden.json");
+
+    /// Decode the canonical golden fixture: a full managed session + a minimal
+    /// legacy one (only required fields), plus the v4 capabilities block. Pins
+    /// cross-repo wire parity for the whole `list` envelope — deliberately
+    /// through [`decode_list_response`], the only decode path that VALIDATES the
+    /// capabilities half.
     #[test]
     fn decode_list_matches_golden_fixture() {
-        let golden = r#"{
-          "rc_sessions": [
-            {
-              "slug": "abc234", "tmux_session": "rc-abc234", "kind": "claude-rc",
-              "state": "ready", "managed": true, "display_name": "charliek/abc234",
-              "workdir": "/home/shed",
-              "url": "https://claude.ai/code/session_01RCkTDrdZ2Rr12sD5dfMjgr",
-              "id": "9f1c0e7a-1111-4222-8333-444455556666",
-              "created_by": "shed-remote-agent/0.1.0", "created_at": "2026-06-19T18:53:00Z",
-              "target_label": "shed:t1@localmac-dev"
-            },
-            {
-              "slug": "brk900", "tmux_session": "rc-brk900",
-              "kind": "claude-broker", "state": "starting", "managed": false
-            }
-          ]
-        }"#;
-        let dtos = decode_list(golden).unwrap();
+        let resp = decode_list_response(LIST_GOLDEN).unwrap();
+        let dtos = resp.rc_sessions;
         assert_eq!(dtos.len(), 2);
         // Full session: all fields present, id → rc_id via from_dto.
         let full = RcSession::from_dto(dtos[0].clone(), "mini3", "demo");
@@ -1845,12 +2074,136 @@ mod tests {
             Some("9f1c0e7a-1111-4222-8333-444455556666")
         );
         assert_eq!(full.created_by.as_deref(), Some("shed-remote-agent/0.1.0"));
+        assert_eq!(full.activity, Some(RcActivity::Working));
         // Minimal legacy session: absent optionals default, fallbacks applied.
         assert!(!dtos[1].managed);
         let minimal = RcSession::from_dto(dtos[1].clone(), "h", "demo");
         assert_eq!(minimal.display_name, "demo/brk900"); // <shed>/<slug> fallback
         assert_eq!(minimal.workdir.as_deref(), Some(DEFAULT_WORKDIR)); // fallback
         assert!(minimal.rc_id.is_none());
+        // `lane` is ALWAYS present on the wire — on the managed row and on the
+        // minimal unmanaged one alike (contract v2's always-present rule).
+        assert_eq!(dtos[0].lane.as_deref(), Some(LANE_TUI));
+        assert_eq!(dtos[1].lane.as_deref(), Some(LANE_TUI));
+        assert_eq!(full.lane_or_tui(), LANE_TUI);
+        assert_eq!(minimal.lane_or_tui(), LANE_TUI);
+        // Nothing produces approvals in this phase.
+        assert!(dtos[0].pending_approvals.is_none());
+
+        // Capabilities: the v4 block, validated (not skipped) on this path.
+        let caps = resp.capabilities.expect("golden carries capabilities");
+        assert_eq!(caps.rc_version, 4);
+        assert!(caps.has_feature("contract-v2")); // the route-existence token
+        assert!(caps.has_feature("messages")); // v1 tokens retained
+        let codex = &caps.kind_features["codex"];
+        assert_eq!(codex.feed, "messages");
+        assert!(codex.feed_messages());
+        assert!(!codex.interrupt); // no lane implements the verb yet
+        assert_eq!(codex.attach_kind(), ATTACH_TMUX);
+        assert!(codex.watch); // held in lockstep with feed == "messages"
+        assert!(codex.input_gated());
+        // A kind with the activity dimension only: no message feed, still tmux.
+        let claude = &caps.kind_features["claude-rc"];
+        assert_eq!(claude.feed, "activity");
+        assert!(!claude.feed_messages());
+        assert!(!claude.watch); // lockstep the other way
+        assert_eq!(claude.attach_kind(), ATTACH_TMUX);
+        // claude-broker and shell stay OMITTED — absent entry = no affordances.
+        assert!(!caps.kind_features.contains_key("claude-broker"));
+        assert!(!caps.kind_features.contains_key("shell"));
+    }
+
+    /// The crates-local copy of the canonical feed golden
+    /// (`internal/ext/rc/testdata/feedMessage.golden.json`), byte-locked to it by
+    /// the same Go parity test.
+    const FEED_GOLDEN: &str = include_str!("../../fixtures/feedMessage.golden.json");
+
+    /// Pin the feed page shape, including the contract-v2 `approval_request`
+    /// rows: a pending request and its resolution carrying the SAME id (the
+    /// id-keyed, last-write-wins folding rule — a resolution is a second appended
+    /// row, never an edit of the first).
+    #[test]
+    fn feed_golden_decodes_approval_rows() {
+        let page: RcMessagesPage = serde_json::from_str(FEED_GOLDEN).unwrap();
+        assert!(!page.truncated);
+        assert_eq!(page.messages.len(), 4);
+        // The ordinary rows are unaffected by the new field.
+        assert_eq!(page.messages[0].msg_type, "text");
+        assert!(page.messages[0].approval.is_none());
+        assert_eq!(page.messages[1].msg_type, "tool_use");
+        assert_eq!(
+            page.messages[1].tool.as_ref().unwrap().name.as_deref(),
+            Some("exec")
+        );
+        // Pending: decisions advertised per request, no decision yet.
+        let pending = page.messages[2]
+            .approval_request()
+            .expect("row 3 is an actionable approval request");
+        assert_eq!(pending.id, "call_01HQ8Z3K.tool:2");
+        assert!(pending.is_pending());
+        assert_eq!(pending.decision, None);
+        assert_eq!(pending.decisions, ["allow", "allow_always", "deny"]);
+        // The human-readable half rides the ordinary text/tool fields.
+        assert_eq!(
+            page.messages[2].text.as_deref(),
+            Some("Allow running `rm -rf build/`?")
+        );
+        // Resolved: same id, status flipped, the decision that resolved it.
+        let resolved = page.messages[3].approval_request().unwrap();
+        assert_eq!(resolved.id, pending.id);
+        assert!(!resolved.is_pending());
+        assert_eq!(resolved.status, "resolved");
+        assert_eq!(resolved.decision.as_deref(), Some("allow"));
+        assert!(resolved.decisions.is_empty()); // absent once resolved
+    }
+
+    #[test]
+    fn feed_approval_decode_is_tolerant() {
+        // Wrong-typed / malformed approval fields degrade that field — a feed
+        // page never fails to decode over one bad row.
+        let page = RcMessagesPage::from_value(
+            &serde_json::from_str(
+                r#"{"messages":[
+                    {"seq":1,"role":"tool","type":"approval_request","approval":42},
+                    {"seq":2,"role":"tool","type":"approval_request",
+                     "approval":{"id":7,"status":"  pending  ","decisions":["allow",5,"deny"]}},
+                    {"seq":3,"role":"tool","type":"text",
+                     "approval":{"id":"a1","status":"pending"}}
+                ]}"#,
+            )
+            .unwrap(),
+        );
+        // A non-object approval is no approval block at all (the `tool` rule).
+        assert!(page.messages[0].approval.is_none());
+        assert!(page.messages[0].approval_request().is_none());
+        // Wrong-typed id → "", tokens trimmed, non-string decisions dropped.
+        let a = page.messages[1].approval.as_ref().unwrap();
+        assert_eq!(a.id, "");
+        assert_eq!(a.status, "pending");
+        assert_eq!(a.decisions, ["allow", "deny"]);
+        // A block on a non-approval row decodes but is not an approval request.
+        assert!(page.messages[2].approval.is_some());
+        assert!(page.messages[2].approval_request().is_none());
+    }
+
+    #[test]
+    fn pending_approvals_decode_tolerantly_on_the_session_dto() {
+        // The hub-layer snapshot (nothing produces it yet): absent → None, and a
+        // present list decodes through the same tolerant approval reader.
+        let dtos = decode_list(
+            r#"{"rc_sessions":[
+                {"slug":"a","tmux_session":"rc-a","kind":"codex","state":"ready","managed":true,
+                 "lane":"tui","pending_approvals":[
+                    {"id":"call_1","status":"pending","decisions":["allow","deny"]},
+                    "nonsense"]}
+            ]}"#,
+        )
+        .unwrap();
+        let pending = dtos[0].pending_approvals.as_ref().unwrap();
+        assert_eq!(pending.len(), 2);
+        assert_eq!(pending[0].id, "call_1");
+        assert!(pending[0].is_pending());
+        assert_eq!(pending[1], RcFeedApproval::default()); // non-object → default
     }
 
     #[test]
@@ -1944,6 +2297,118 @@ mod tests {
         assert!(!f.input_gated());
     }
 
+    // ---- contract v2: lane + feed/interrupt/attach, and the v3 fallbacks ----
+
+    /// A whole v3-shaped payload — no `lane`, no `feed`/`interrupt`/`attach`,
+    /// `rc_version: 3`, no `contract-v2` token — must decode with the pinned
+    /// client defaults rather than degrading or failing. This is the mixed-fleet
+    /// case: a new client against an old baked-in guest binary.
+    #[test]
+    fn v3_payload_decodes_with_contract_v2_defaults() {
+        let resp = decode_list_response(
+            r#"{"rc_sessions":[
+                {"slug":"cdx1","tmux_session":"rc-cdx1","kind":"codex","state":"ready",
+                 "managed":true,"activity":"needs_input"},
+                {"slug":"brk1","tmux_session":"rc-brk1","kind":"claude-broker",
+                 "state":"starting","managed":false}
+              ],
+              "capabilities":{"rc_version":3,
+                "kinds":["codex","claude-rc","shell"],
+                "agents":{"codex":{"installed":true}},
+                "features":["generic-perm","serve","activity","messages"],
+                "kind_features":{
+                  "codex":{"post_input":true,"approvals":"tui","watch":true,"input":"gated"},
+                  "claude-rc":{"post_input":true,"approvals":"tui"}}}}"#,
+        )
+        .unwrap();
+        // Absent lane → "tui" through the accessor, on the DTO and the enriched
+        // session alike; the raw field stays None (absent ≠ asserted).
+        for dto in &resp.rc_sessions {
+            assert_eq!(dto.lane, None);
+            assert_eq!(dto.lane_or_tui(), LANE_TUI);
+        }
+        let s = RcSession::from_dto(resp.rc_sessions[0].clone(), "srv", "web");
+        assert_eq!(s.lane, None);
+        assert_eq!(s.lane_or_tui(), LANE_TUI);
+
+        let caps = resp.capabilities.unwrap();
+        assert_eq!(caps.rc_version, 3);
+        assert!(!caps.has_feature("contract-v2")); // the routes may 404 on this guest
+        let codex = &caps.kind_features["codex"];
+        // Absent feed → the deprecated `watch` bit answers "is there a message
+        // feed?"; absent attach → tmux; absent interrupt → false.
+        assert_eq!(codex.feed, "");
+        assert!(codex.feed_messages());
+        assert_eq!(codex.attach_kind(), ATTACH_TMUX);
+        assert!(!codex.interrupt);
+        // A v3 kind with neither hint has no message feed at all.
+        let claude = &caps.kind_features["claude-rc"];
+        assert!(!claude.feed_messages());
+        assert_eq!(claude.attach_kind(), ATTACH_TMUX);
+    }
+
+    #[test]
+    fn feed_hint_supersedes_watch_and_attach_is_carried_verbatim() {
+        // With `feed` present it WINS: a v2 producer that (wrongly) let the
+        // deprecated lockstep drift can't resurrect a message feed the kind
+        // does not have — and vice versa.
+        let f: RcKindFeatures = serde_json::from_str(
+            r#"{"post_input":true,"approvals":"tui","watch":true,"feed":"activity",
+                "interrupt":false,"attach":"tmux"}"#,
+        )
+        .unwrap();
+        assert!(!f.feed_messages());
+        let f: RcKindFeatures = serde_json::from_str(
+            r#"{"post_input":true,"approvals":"remote","watch":false,"feed":"messages",
+                "interrupt":true,"attach":"native-remote"}"#,
+        )
+        .unwrap();
+        assert!(f.feed_messages());
+        assert!(f.interrupt);
+        // Future values ride through verbatim (no enum, no coercion).
+        assert_eq!(f.attach_kind(), "native-remote");
+        assert_eq!(f.approvals, "remote");
+        // "none" is a real feed value, distinct from absent.
+        let f: RcKindFeatures =
+            serde_json::from_str(r#"{"post_input":false,"approvals":"tui","feed":"none"}"#)
+                .unwrap();
+        assert!(!f.feed_messages());
+    }
+
+    #[test]
+    fn needs_approval_survives_the_dto_to_session_path() {
+        // Contract v2 promotes needs_approval from "reserved" to a decoded value
+        // (the wire round-trip is pinned in `rc_activity_wire_round_trip`); here,
+        // that it reaches an enriched session as itself rather than as Unknown.
+        let dtos = decode_list(
+            r#"{"rc_sessions":[{"slug":"a","tmux_session":"rc-a","kind":"codex",
+                "state":"ready","managed":true,"lane":"tui","activity":"needs_approval"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(dtos[0].activity, Some(RcActivity::NeedsApproval));
+        let s = RcSession::from_dto(dtos[0].clone(), "srv", "web");
+        assert_eq!(s.activity, Some(RcActivity::NeedsApproval));
+    }
+
+    #[test]
+    fn lane_is_carried_verbatim_including_future_values() {
+        // A structured-lane session from a future guest renders neutrally, not
+        // dropped and not coerced (same posture as the unknown-kind policy).
+        let dtos = decode_list(
+            r#"{"rc_sessions":[
+                {"slug":"a","tmux_session":"rc-a","kind":"codex","state":"ready",
+                 "managed":true,"lane":"structured"},
+                {"slug":"b","tmux_session":"rc-b","kind":"codex","state":"ready",
+                 "managed":true,"lane":""}]}"#,
+        )
+        .unwrap();
+        assert_eq!(dtos[0].lane.as_deref(), Some("structured"));
+        assert_eq!(dtos[0].lane_or_tui(), "structured");
+        // An explicit empty string is out-of-contract; it reads as tui, so no
+        // client ever renders a blank lane.
+        assert_eq!(dtos[1].lane_or_tui(), LANE_TUI);
+    }
+
     // ---- activity dimension ----
 
     #[test]
@@ -1951,6 +2416,7 @@ mod tests {
         for (wire, activity) in [
             ("working", RcActivity::Working),
             ("needs_input", RcActivity::NeedsInput),
+            ("needs_approval", RcActivity::NeedsApproval),
             ("idle", RcActivity::Idle),
             ("unknown", RcActivity::Unknown),
         ] {
@@ -1962,14 +2428,14 @@ mod tests {
                 activity
             );
         }
-        // Any unrecognized token — the reserved needs_approval, a future value,
-        // or garbage — maps to Unknown (Dart parity, rc_models.dart:125-146;
-        // deliberately NOT RcKind's preserve-raw policy), and Unknown
-        // round-trips as the real "unknown" wire value.
-        assert_eq!(RcActivity::from_wire("needs_approval"), RcActivity::Unknown);
+        // Any unrecognized token — a future value or garbage — maps to Unknown
+        // (Dart parity, rc_models.dart:125-146; deliberately NOT RcKind's
+        // preserve-raw policy), and Unknown round-trips as the real "unknown"
+        // wire value. (needs_approval left this set in contract v2 — it is a
+        // decoded variant now, so it rides the round-trip table above.)
         assert_eq!(RcActivity::from_wire("borg"), RcActivity::Unknown);
         assert_eq!(
-            serde_json::from_value::<RcActivity>("needs_approval".into()).unwrap(),
+            serde_json::from_value::<RcActivity>("borg".into()).unwrap(),
             RcActivity::Unknown
         );
         assert_eq!(

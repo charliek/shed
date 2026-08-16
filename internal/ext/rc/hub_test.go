@@ -528,6 +528,41 @@ func TestHubReconcileLegacyRecreateByCreatedAt(t *testing.T) {
 	}
 }
 
+// A recreate that changes ONLY the kind (same slug, and — the legacy worst case —
+// no id and an unchanged created_at) must still replace the tracked entry: the verb
+// handlers authorize against the tracked kind (verbFeatures), so a stale kind would
+// become an authorization bug the day any kind advertises a verb.
+func TestHubReconcileKindChangeIsARecreate(t *testing.T) {
+	f := newHubTmux()
+	clk := &hubClock{t: time.Unix(1_700_000_000, 0).UTC()}
+	h := newTestHub(f, clk)
+
+	envFor := func(kind Kind) string {
+		return strings.Join([]string{
+			envV + "=2", // no SHED_RC_ID, fixed created_at: kind is the only delta
+			envKind + "=" + string(kind),
+			envCreatedAt + "=2026-01-01T00:00:00Z",
+		}, "\n") + "\n"
+	}
+
+	f.set("rc-kchg11", "output A", envFor(KindShell))
+	h.reconcile()
+	sub := h.subscribe()
+
+	f.set("rc-kchg11", "output A", envFor(KindCodex))
+	h.reconcile()
+
+	if evs := drainEvents(sub); countEvents(evs, "session.updated") == 0 {
+		t.Fatalf("expected session.updated on a kind-detected recreate, got %+v", evs)
+	}
+	h.trackMu.Lock()
+	tr := h.tracked["kchg11"]
+	h.trackMu.Unlock()
+	if tr == nil || tr.kind != KindCodex {
+		t.Fatalf("tracker kept the stale kind: %+v", tr)
+	}
+}
+
 // ---- lifecycle-trumps-activity precedence ----
 
 func TestHubReconcileLifecycleTrumpsActivity(t *testing.T) {

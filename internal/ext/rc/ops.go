@@ -193,6 +193,9 @@ func Create(r Runner, env Getenv, opts CreateOptions, sleep func(time.Duration))
 		TmuxSession: name,
 		Kind:        opts.Kind,
 		State:       StateStarting,
+		// lane is derived from the kind exactly as ParseSession derives it, so the
+		// create DTO and a later list/probe of the same session agree.
+		Lane:        laneForKind(opts.Kind),
 		Managed:     true,
 		DisplayName: displayName,
 		Workdir:     workdir,

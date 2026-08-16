@@ -40,11 +40,25 @@ const (
 	// contract: default 100, hard cap 200).
 	defaultMessagesLimit = 100
 	maxMessagesLimit     = 200
+
+	// maxApprovalTokenBytes caps each identifier-shaped approval field (the id and
+	// every advertised decision token) at the length of the id's wire grammar
+	// (^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$ — the contract's 128-char ceiling, wide
+	// enough for the native ids lanes carry: codex call ids, ACP/opencode request
+	// ids). The grammar itself is enforced at the hub's approval handler (where a
+	// bad id is a 4xx); the ring only BOUNDS what a producer hands it, so a
+	// misbehaving lane adapter can never inflate the ring's byte budget.
+	maxApprovalTokenBytes = 128
+	// maxApprovalDecisions caps how many advertised decisions one approval row may
+	// carry. The decision vocabulary is a fixed, tiny enum (allow/allow_always/
+	// deny); the cap exists so the slice cannot be used as unbounded payload.
+	maxApprovalDecisions = 8
 )
 
 // Feed message role/type tokens (the wire contract's message shape). role ∈
 // {user, assistant, tool, system}; type ∈ {text, tool_use, tool_result, reasoning,
-// status}. The producers (codexFold) map their native events onto these.
+// status, approval_request}. The producers (codexFold) map their native events onto
+// these.
 const (
 	feedRoleUser      = "user"
 	feedRoleAssistant = "assistant"
@@ -56,6 +70,23 @@ const (
 	feedTypeToolResult = "tool_result"
 	feedTypeReasoning  = "reasoning"
 	feedTypeStatus     = "status"
+	// feedTypeApprovalRequest is an approval row: an agent asked for permission to
+	// do something. It rides role `tool` with `text` carrying the sanitized
+	// human-readable summary, `tool{name,detail}` the call being approved, and
+	// `approval` the machine-readable state. Nothing produces it in this phase (no
+	// lane emits approvals yet) — the shape is contracted now so a lane can start
+	// emitting it without recontracting clients.
+	feedTypeApprovalRequest = "approval_request"
+)
+
+// Approval status / decision tokens (the wire contract's approval vocabulary).
+const (
+	approvalStatusPending  = "pending"
+	approvalStatusResolved = "resolved"
+
+	approvalDecisionAllow       = "allow"
+	approvalDecisionAllowAlways = "allow_always"
+	approvalDecisionDeny        = "deny"
 )
 
 // feedTool carries a tool call/result's name + a compact detail (the invocation
@@ -63,6 +94,78 @@ const (
 type feedTool struct {
 	Name   string `json:"name,omitempty"`
 	Detail string `json:"detail,omitempty"`
+}
+
+// FeedApproval is the machine-readable state of an approval request carried by an
+// `approval_request` feed row (and, once a lane produces them, by a session's
+// pending_approvals snapshot — hence exported: it is part of the Session DTO).
+//
+// CLIENT FOLDING RULE: approval rows are an id-keyed, LAST-WRITE-WINS stream. A
+// resolution is a SECOND appended row with the same id and status "resolved" — never
+// an edit of the first. A client must not require having seen the `pending` row
+// before the `resolved` one: ring eviction (or a hub restart) can drop the earlier
+// row entirely, and the session's pending_approvals snapshot is the authoritative
+// answer to "what is still open".
+type FeedApproval struct {
+	// ID is the lane-assigned approval id — the address the approval verb resolves
+	// (POST /v1/sessions/{slug}/approvals/{id}). Grammar:
+	// ^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$.
+	ID string `json:"id"`
+	// Status is "pending" or "resolved".
+	Status string `json:"status"`
+	// Decision is the decision that resolved it (empty while pending).
+	Decision string `json:"decision,omitempty"`
+	// Decisions are the decisions this request accepts, advertised per request so a
+	// client renders exactly the buttons the lane will honor (a subset of
+	// allow/allow_always/deny).
+	Decisions []string `json:"decisions,omitempty"`
+}
+
+// sanitize bounds an approval's fields before it enters the ring: every field is a
+// single-token value (never prose), so each is run through the token sanitizer
+// (ANSI + ALL control/whitespace stripping — unlike feed text, a token has no
+// legitimate newlines or tabs), the id is capped at the grammar's length ceiling,
+// and the advertised decision list is capped in count. Validity (the id grammar,
+// the decision enum) is the producing/handling layer's job; this is the ring's
+// byte-budget guard, so no producer can inflate the ring past its accounted size.
+func (a *FeedApproval) sanitize() {
+	a.ID = truncateBytes(sanitizeFeedToken(a.ID), maxApprovalTokenBytes)
+	a.Status = truncateBytes(sanitizeFeedToken(a.Status), maxApprovalTokenBytes)
+	a.Decision = truncateBytes(sanitizeFeedToken(a.Decision), maxApprovalTokenBytes)
+	if len(a.Decisions) > maxApprovalDecisions {
+		a.Decisions = a.Decisions[:maxApprovalDecisions]
+	}
+	for i := range a.Decisions {
+		a.Decisions[i] = truncateBytes(sanitizeFeedToken(a.Decisions[i]), maxApprovalTokenBytes)
+	}
+}
+
+// sanitizeFeedToken strips ANSI escapes plus EVERY control and whitespace rune from
+// a single-token approval field (id/status/decision). Feed text keeps newlines and
+// tabs (multi-line prose is content there); a token that contains them is malformed,
+// and preserving them would let a crafted value smuggle separators into a field the
+// contract defines as one token.
+func sanitizeFeedToken(s string) string {
+	if s == "" {
+		return ""
+	}
+	s = ansiEscapeRe.ReplaceAllString(s, "")
+	return strings.Map(func(r rune) rune {
+		if r <= 0x20 || r == 0x7f || (r >= 0x80 && r <= 0x9f) {
+			return -1
+		}
+		return r
+	}, s)
+}
+
+// size is the approval's contribution to the ring's byte budget (id + status +
+// decision + every advertised decision).
+func (a *FeedApproval) size() int {
+	n := len(a.ID) + len(a.Status) + len(a.Decision)
+	for _, d := range a.Decisions {
+		n += len(d)
+	}
+	return n
 }
 
 // feedMessage is one normalized conversation message in the ring / on the wire.
@@ -73,13 +176,20 @@ type feedMessage struct {
 	Type string    `json:"type"`
 	Text string    `json:"text,omitempty"`
 	Tool *feedTool `json:"tool,omitempty"`
+	// Approval is set on (and only on) an `approval_request` row.
+	Approval *FeedApproval `json:"approval,omitempty"`
 }
 
-// size is the message's contribution to the ring's byte budget (text + tool fields).
+// size is the message's contribution to the ring's byte budget (text + tool +
+// approval fields — every string that rides the row is accounted, so the 1 MiB
+// budget stays honest for an approval-heavy feed).
 func (m feedMessage) size() int {
 	n := len(m.Text)
 	if m.Tool != nil {
 		n += len(m.Tool.Name) + len(m.Tool.Detail)
+	}
+	if m.Approval != nil {
+		n += m.Approval.size()
 	}
 	return n
 }
@@ -107,6 +217,23 @@ func (r *messageRing) append(m feedMessage, now time.Time) uint64 {
 	if m.Tool != nil {
 		m.Tool.Name = sanitizeFeedText(m.Tool.Name)
 		m.Tool.Detail = sanitizeFeedText(m.Tool.Detail)
+	}
+	if m.Approval != nil {
+		// Stored as a COPY (with its own decisions slice) rather than the producer's
+		// pointer: an approval's state changes by appending a second row, so a
+		// producer that reuses/mutates its struct must never be able to rewrite a row
+		// already accounted in r.bytes.
+		a := *m.Approval
+		// Cap the decision COUNT before copying: copying first would allocate (and
+		// retain, via the stored row) a producer-sized backing array that the ring's
+		// byte budget never accounts for.
+		src := a.Decisions
+		if len(src) > maxApprovalDecisions {
+			src = src[:maxApprovalDecisions]
+		}
+		a.Decisions = append([]string(nil), src...)
+		a.sanitize()
+		m.Approval = &a
 	}
 	if m.TS == "" {
 		m.TS = now.UTC().Format(time.RFC3339)
@@ -189,11 +316,21 @@ func sanitizeFeedText(s string) string {
 	if len(s) <= maxFeedMessageBytes {
 		return s
 	}
-	cut := maxFeedMessageBytes
-	for cut > 0 && !utf8.RuneStart(s[cut]) {
-		cut-- // back up to a rune boundary so a multi-byte codepoint is never split
+	return truncateBytes(s, maxFeedMessageBytes) + feedTruncMarker
+}
+
+// truncateBytes caps s at n bytes on a rune boundary (never mid-codepoint). It appends
+// no marker of its own: sanitizeFeedText adds one for prose, while the identifier
+// fields (approval ids, enum tokens) it also guards would only be muddied by a marker
+// inside the value.
+func truncateBytes(s string, n int) string {
+	if len(s) <= n {
+		return s
 	}
-	return s[:cut] + feedTruncMarker
+	for n > 0 && !utf8.RuneStart(s[n]) {
+		n-- // back up to a rune boundary so a multi-byte codepoint is never split
+	}
+	return s[:n]
 }
 
 // hubMessagesResponse is the GET /v1/sessions/{slug}/messages body.

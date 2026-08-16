@@ -272,6 +272,18 @@ public struct RcSession: Codable, Sendable, Equatable, Identifiable {
     public var createdAt: String?
     public var targetLabel: String?
     public var managed: Bool
+    /// The session's CURRENT lane (contract v2): `"tui"` or `"structured"`.
+    /// Absent on a pre-v2 payload — read through `laneOrTui`, which applies the
+    /// contract's absent-⇒-`"tui"` rule.
+    public var lane: String?
+    /// Live-activity dimension (additive; derived by the rc hub). Absent when no
+    /// hub is running, the kind is unsupported, or a blocking lifecycle state
+    /// suppressed it.
+    public var activity: String?
+    /// RFC3339 timestamp the activity was last derived/changed; absent with `activity`.
+    public var activityAt: String?
+    /// A short preview of the session's most recent message. Absent when the hub has none.
+    public var lastMessage: String?
 
     public var id: String { Self.compositeID(host: host, shed: shed, slug: slug) }
 
@@ -279,6 +291,12 @@ public struct RcSession: Codable, Sendable, Equatable, Identifiable {
     /// a kill that has only those three parts keys exactly the same entry.
     public static func compositeID(host: String, shed: String, slug: String) -> String {
         "\(host)/\(shed)/\(slug)"
+    }
+
+    /// The session's lane with the contract's old-payload rule applied: absent
+    /// or blank reads as `"tui"`. Mirrors `RcSessionDTO.laneOrTui`.
+    public var laneOrTui: String {
+        RemoteControl.laneOrTui(lane)
     }
 
     enum CodingKeys: String, CodingKey {
@@ -290,14 +308,19 @@ public struct RcSession: Codable, Sendable, Equatable, Identifiable {
         case createdBy = "created_by"
         case createdAt = "created_at"
         case targetLabel = "target_label"
-        case managed
+        case managed, lane
+        case activity
+        case activityAt = "activity_at"
+        case lastMessage = "last_message"
     }
 
     public init(
         host: String, shed: String, slug: String, tmuxSession: String,
         displayName: String, workdir: String, kind: RcKind, state: RcState, url: String? = nil,
         rcID: String? = nil, createdBy: String? = nil, createdAt: String? = nil,
-        targetLabel: String? = nil, managed: Bool = false
+        targetLabel: String? = nil, managed: Bool = false,
+        lane: String? = nil, activity: String? = nil, activityAt: String? = nil,
+        lastMessage: String? = nil
     ) {
         self.host = host
         self.shed = shed
@@ -313,10 +336,15 @@ public struct RcSession: Codable, Sendable, Equatable, Identifiable {
         self.createdAt = createdAt
         self.targetLabel = targetLabel
         self.managed = managed
+        self.lane = lane
+        self.activity = activity
+        self.activityAt = activityAt
+        self.lastMessage = lastMessage
     }
 
-    // Defensive decode (the repo convention): the v1 metadata + `managed` are
-    // absent on older wire payloads, so default them rather than fail.
+    // Defensive decode (the repo convention): the v1 metadata, `managed`, and the
+    // contract-v2 additions (`lane`, the activity trio) are absent on older wire
+    // payloads, so default them rather than fail.
     public init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         host = try c.decode(String.self, forKey: .host)
@@ -333,6 +361,10 @@ public struct RcSession: Codable, Sendable, Equatable, Identifiable {
         createdAt = try c.decodeIfPresent(String.self, forKey: .createdAt)
         targetLabel = try c.decodeIfPresent(String.self, forKey: .targetLabel)
         managed = try c.decodeIfPresent(Bool.self, forKey: .managed) ?? false
+        lane = try c.decodeIfPresent(String.self, forKey: .lane)
+        activity = try c.decodeIfPresent(String.self, forKey: .activity)
+        activityAt = try c.decodeIfPresent(String.self, forKey: .activityAt)
+        lastMessage = try c.decodeIfPresent(String.self, forKey: .lastMessage)
     }
 }
 

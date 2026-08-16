@@ -61,11 +61,14 @@ func (e hubEvent) frame() []byte {
 // shed each upstream belongs to.
 //
 // Contract: `activity` is always one of the advertised non-empty enum values
-// (working|needs_input|idle|unknown) — an activity.changed is NEVER emitted for
-// the suppressed ("") dimension. When a blocking lifecycle state (needs-trust/
-// needs-auth/dead) suppresses activity, the transition is announced by a
-// session.updated (which carries the state); clients derive "drop the activity
-// badge" from that state, per the lifecycle-trumps-activity precedence.
+// (working|needs_input|needs_approval|idle|unknown) — an activity.changed is NEVER
+// emitted for the suppressed ("") dimension. needs_approval is a legal wire value of
+// the enum (clients must decode it) even though no derivation produces it yet, so a
+// later phase can start emitting it without a contract change; see activity.go. When a
+// blocking lifecycle state (needs-trust/needs-auth/dead) suppresses activity, the
+// transition is announced by a session.updated (which carries the state); clients
+// derive "drop the activity badge" from that state, per the lifecycle-trumps-activity
+// precedence.
 type activityChangedData struct {
 	Shed       string   `json:"shed"`
 	Slug       string   `json:"slug"`

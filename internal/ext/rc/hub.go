@@ -267,6 +267,11 @@ func (h *Hub) pruneInputLock(slug string) {
 // handler builds the hub's HTTP routes. Go's method+wildcard ServeMux patterns
 // give automatic 405s for a wrong method on a known path and 404s for unknown
 // paths, so only the real handlers need explicit status codes.
+//
+// The last three are the contract-v2 verbs (turn / interrupt / approvals). They are
+// routed and fully validated here but implemented by no lane yet — every request ends
+// in 409 not_supported. See hub_verbs.go for the precedence rules, the 409 vocabulary,
+// and the pinned success shapes.
 func (h *Hub) handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /v1/health", h.handleHealth)
@@ -274,6 +279,9 @@ func (h *Hub) handler() http.Handler {
 	mux.HandleFunc("GET /v1/events", h.handleEvents)
 	mux.HandleFunc("GET /v1/sessions/{slug}/messages", h.handleMessages)
 	mux.HandleFunc("POST /v1/sessions/{slug}/input", h.handleInput)
+	mux.HandleFunc("POST /v1/sessions/{slug}/turn", h.handleTurn)
+	mux.HandleFunc("POST /v1/sessions/{slug}/interrupt", h.handleInterrupt)
+	mux.HandleFunc("POST /v1/sessions/{slug}/approvals/{id}", h.handleApproval)
 	return mux
 }
 
@@ -297,9 +305,35 @@ func (h *Hub) handleSessions(w http.ResponseWriter, _ *http.Request) {
 			sessions[i].ActivityAt = tr.activityAt
 			sessions[i].LastMessage = tr.lastMessage
 		}
+		// pending_approvals is a HUB-LAYER overlay (the one-shot List above never
+		// sets it): the open-approval snapshot that keeps a session actionable after
+		// the feed ring evicted the rows announcing them. Nothing populates
+		// tr.pendingApprovals in this phase, so this is always a no-op and the field
+		// stays absent on the wire — the seam exists so a lane adapter has exactly
+		// one place to publish from. Copied, never aliased: the response row must not
+		// share a slice with live hub state. An empty snapshot copies to nil, which
+		// omitempty drops — hence no guard.
+		sessions[i].PendingApprovals = copyApprovals(tr.pendingApprovals)
 	}
 	h.trackMu.Unlock()
 	writeJSON(w, http.StatusOK, hubSessionsResponse{Sessions: sessions})
+}
+
+// copyApprovals deep-copies an approval snapshot for serving. The per-element
+// Decisions slice is copied too: a shallow copy of the outer slice would leave
+// every served row aliasing the tracked entry's Decisions backing array, so a lane
+// mutating its snapshot after this point could rewrite a response already built (or
+// race the encoder). An empty snapshot copies to nil, which omitempty drops.
+func copyApprovals(in []FeedApproval) []FeedApproval {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make([]FeedApproval, len(in))
+	for i, a := range in {
+		a.Decisions = append([]string(nil), a.Decisions...)
+		out[i] = a
+	}
+	return out
 }
 
 // hubSessionsResponse is the GET /v1/sessions body. Distinct from the one-shot
@@ -395,16 +429,10 @@ type inputRequest struct {
 func (h *Hub) handleInput(w http.ResponseWriter, r *http.Request) {
 	slug := r.PathValue("slug")
 
-	// Bound the body BEFORE decoding so an oversized payload is a 413, not an OOM.
-	r.Body = http.MaxBytesReader(w, r.Body, 16<<10)
+	// decodeHubBody (hub_verbs.go) bounds the body BEFORE decoding, so an oversized
+	// payload is a 413 rather than an OOM, under the one cap every hub POST shares.
 	var req inputRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		var maxErr *http.MaxBytesError
-		if errors.As(err, &maxErr) {
-			writeError(w, http.StatusRequestEntityTooLarge, "too_large", "input body exceeds 16 KiB")
-			return
-		}
-		writeError(w, http.StatusBadRequest, "invalid_json", "malformed request body")
+	if !decodeHubBody(w, r, &req) {
 		return
 	}
 

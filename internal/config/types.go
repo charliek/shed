@@ -205,6 +205,12 @@ type SessionRC struct {
 	DisplayName string `json:"display_name,omitempty"`
 	URL         string `json:"url,omitempty"`
 	CreatedBy   string `json:"created_by,omitempty"`
+	// Lane is the session's current lane (contract v2): "tui" or "structured",
+	// projected straight from rc.Session.Lane. omitempty here (unlike the always-
+	// present wire field) is deliberate: a shed running a pre-lane guest binary
+	// yields an empty string, and a client reading an ABSENT lane must treat it as
+	// "tui" — the same old-payload rule rc.Session documents at its own field.
+	Lane string `json:"lane,omitempty"`
 	// Live-activity dimension (Phase C), projected from the rc DTO so listings can
 	// carry it once a hub is running. Absent when the hub is not running / the kind
 	// is unsupported. Activity is one of working|needs_input|idle|unknown; ActivityAt

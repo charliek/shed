@@ -831,6 +831,9 @@ impl Handler {
                 .get("state")
                 .and_then(|v| serde_json::from_value(v.clone()).ok())
                 .unwrap_or(RcState::Ready),
+            // Every kind is tui-laned in this phase, so the fixture op stamps the
+            // lane the guest would derive rather than taking it as a param.
+            lane: Some(rc::LANE_TUI.to_string()),
             url: opt("url"),
             rc_id: opt("rc_id"),
             created_by: opt("created_by"),
@@ -839,6 +842,7 @@ impl Handler {
             activity: None,
             activity_at: None,
             last_message: None,
+            pending_approvals: None,
             managed,
         })
     }

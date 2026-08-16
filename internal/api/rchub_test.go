@@ -67,6 +67,22 @@ func startFakeHub(t *testing.T, opts hubMuxOpts) string {
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"delivered":true}`))
 	})
+	// The contract-v2 verbs (internal/ext/rc/hub_verbs.go): the fake hub answers
+	// with the pinned success shape so the proxy tests can assert routing/pass-through
+	// independent of the real hub's current not_supported rejection (R0 rejects
+	// every kind; the proxy allowlist doesn't know or care what the hub decides).
+	inner.HandleFunc("POST /v1/sessions/{slug}/turn", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"turn_id":"t1"}`))
+	})
+	inner.HandleFunc("POST /v1/sessions/{slug}/interrupt", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"interrupting":true}`))
+	})
+	inner.HandleFunc("POST /v1/sessions/{slug}/approvals/{id}", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"resolved":true,"decision":"allow"}`))
+	})
 	inner.HandleFunc("GET /v1/events", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
 		fl, _ := w.(http.Flusher)
@@ -91,8 +107,10 @@ func dialTo(addr string) func(context.Context, string, uint16) (net.Conn, error)
 }
 
 // TestClassifyRCProxyPath pins the allowlist + traversal defense at the unit
-// level: only the four exact method/path shapes pass; a wrong method is 405; an
-// unknown path or an unsafe {slug} (dots, traversal, empty) is 404.
+// level: only the seven exact method/path shapes pass (the four pre-existing GET
+// /POST-input routes plus the contract-v2 turn/interrupt/approvals verbs added in
+// C3); a wrong method is 405; an unknown path or an unsafe {slug}/{id} (dots,
+// traversal, empty, slash-bearing) is 404.
 func TestClassifyRCProxyPath(t *testing.T) {
 	cases := []struct {
 		method, rest string
@@ -103,20 +121,63 @@ func TestClassifyRCProxyPath(t *testing.T) {
 		{http.MethodGet, "v1/events", true, 0},
 		{http.MethodGet, "v1/sessions/abc234/messages", true, 0},
 		{http.MethodPost, "v1/sessions/abc234/input", true, 0},
+		// The three contract-v2 verbs (C3).
+		{http.MethodPost, "v1/sessions/abc234/turn", true, 0},
+		{http.MethodPost, "v1/sessions/abc234/interrupt", true, 0},
+		{http.MethodPost, "v1/sessions/abc234/approvals/call_01HQ8Z3K", true, 0},
+		// The approval id grammar (rc.ApprovalIDRe) allows the dot/colon/underscore/
+		// dash a native lane id carries — prove one of each passes the classifier.
+		{http.MethodPost, "v1/sessions/abc234/approvals/req-42_a.b:c", true, 0},
 		// Wrong method on a known path → 405.
 		{http.MethodPost, "v1/sessions", false, http.StatusMethodNotAllowed},
 		{http.MethodGet, "v1/sessions/abc234/input", false, http.StatusMethodNotAllowed},
 		{http.MethodDelete, "v1/events", false, http.StatusMethodNotAllowed},
-		// Unknown paths → 404.
+		{http.MethodGet, "v1/sessions/abc234/turn", false, http.StatusMethodNotAllowed},
+		{http.MethodGet, "v1/sessions/abc234/interrupt", false, http.StatusMethodNotAllowed},
+		{http.MethodGet, "v1/sessions/abc234/approvals/call_01HQ8Z3K", false, http.StatusMethodNotAllowed},
+		// Unknown paths → 404 (steer is not a contract verb).
 		{http.MethodGet, "v1/bogus", false, http.StatusNotFound},
 		{http.MethodGet, "v1/sessions/abc234/history", false, http.StatusNotFound},
 		{http.MethodGet, "v2/sessions", false, http.StatusNotFound},
+		{http.MethodPost, "v1/sessions/abc234/steer", false, http.StatusNotFound},
 		// Unsafe slug (dot / traversal / empty) → 404, never proxied.
 		{http.MethodGet, "v1/sessions/a.b/messages", false, http.StatusNotFound},
 		{http.MethodGet, "v1/sessions/../messages", false, http.StatusNotFound},
 		{http.MethodPost, "v1/sessions//input", false, http.StatusNotFound},
 		// Extra depth → 404.
 		{http.MethodGet, "v1/sessions/abc/x/messages", false, http.StatusNotFound},
+		// Traversal guard on the {slug} wildcard, turn/interrupt/approvals routes:
+		// a literal ".." and a percent-encoded "%2E%2E" (chi's wildcard capture
+		// preserves the RAW, still-encoded segment when the request's raw path
+		// differs from its decoded form — verified in TestRCProxy_TraversalGuard_
+		// PercentEncoded — so a "%2E%2E" segment reaches the classifier literally
+		// and fails rcSlugRe on the '%' character, not because it was decoded to
+		// "..") must both 404 before any dial.
+		{http.MethodPost, "v1/sessions/../turn", false, http.StatusNotFound},
+		{http.MethodPost, "v1/sessions/%2E%2E/turn", false, http.StatusNotFound},
+		{http.MethodPost, "v1/sessions/../interrupt", false, http.StatusNotFound},
+		{http.MethodPost, "v1/sessions/%2E%2E/interrupt", false, http.StatusNotFound},
+		{http.MethodPost, "v1/sessions/../approvals/call_01", false, http.StatusNotFound},
+		{http.MethodPost, "v1/sessions/%2E%2E/approvals/call_01", false, http.StatusNotFound},
+		// Traversal guard on the {id} wildcard (approvals only): same two shapes,
+		// rejected by rc.ApprovalIDRe's must-start-alphanumeric rule (".." can never
+		// match) or, for the percent-encoded form, by the disallowed '%' character.
+		{http.MethodPost, "v1/sessions/abc234/approvals/..", false, http.StatusNotFound},
+		{http.MethodPost, "v1/sessions/abc234/approvals/%2E%2E", false, http.StatusNotFound},
+		// Slash-bearing ids → 404: a literal "/" simply adds a path segment (wrong
+		// depth for the 5-segment approvals shape); a percent-encoded "%2F" stays a
+		// single segment (chi preserves the raw encoding here too) and fails
+		// rc.ApprovalIDRe on '%'. Either way the id can never smuggle a path
+		// separator into the proxied request.
+		{http.MethodPost, "v1/sessions/abc234/approvals/a/b", false, http.StatusNotFound},
+		{http.MethodPost, "v1/sessions/abc234/approvals/a%2Fb", false, http.StatusNotFound},
+		// An approval id that is syntactically invalid (fails rc.ApprovalIDRe) but
+		// contains none of the above traversal/slash characters still 404s here —
+		// this is the proxy-classifier half of the documented asymmetry at
+		// classifyRCProxyPath: the hub's own 400 invalid_approval_id branch only
+		// ever sees ids that already passed this same grammar, so with the shared
+		// rc.ApprovalIDRe symbol that branch is unreachable through the proxy.
+		{http.MethodPost, "v1/sessions/abc234/approvals/.leading-dot", false, http.StatusNotFound},
 	}
 	for _, tc := range cases {
 		gotOK, gotStatus := classifyRCProxyPath(tc.method, tc.rest)
@@ -170,6 +231,167 @@ func TestRCProxy_AllowlistRouting(t *testing.T) {
 	}
 	if w := do(http.MethodGet, "/api/sheds/proj/rc/v1/bogus"); w.Code != http.StatusNotFound {
 		t.Errorf("GET v1/bogus = %d, want 404", w.Code)
+	}
+}
+
+// TestRCProxy_VerbRoutesAllowlistRouting is TestRCProxy_AllowlistRouting's
+// companion for the three contract-v2 verbs added in C3: each is proxied through
+// to the live fake hub (which answers with the pinned success shape) end-to-end,
+// alongside the reject shapes those routes introduce — wrong method (405), an
+// unrecognized verb on an otherwise well-formed session path (404), and an
+// approval id that fails rc.ApprovalIDRe (404, never dialed — see
+// TestRCProxy_ApprovalRoutes_RejectedBeforeDial for the no-dial proof).
+func TestRCProxy_VerbRoutesAllowlistRouting(t *testing.T) {
+	addr := startFakeHub(t, hubMuxOpts{})
+	be := &rcFakeBackend{dialFn: dialTo(addr)}
+	srv := newRCServer(be)
+
+	do := func(method, path, body string) *httptest.ResponseRecorder {
+		var rdr io.Reader
+		if body != "" {
+			rdr = strings.NewReader(body)
+		}
+		r := httptest.NewRequest(method, path, rdr)
+		w := httptest.NewRecorder()
+		srv.Router().ServeHTTP(w, r)
+		return w
+	}
+
+	if w := do(http.MethodPost, "/api/sheds/proj/rc/v1/sessions/abc234/turn", `{"text":"hi"}`); w.Code != http.StatusOK {
+		t.Errorf("POST turn = %d, want 200 (body %s)", w.Code, w.Body.String())
+	}
+	if w := do(http.MethodPost, "/api/sheds/proj/rc/v1/sessions/abc234/interrupt", ""); w.Code != http.StatusOK {
+		t.Errorf("POST interrupt = %d, want 200 (body %s)", w.Code, w.Body.String())
+	}
+	if w := do(http.MethodPost, "/api/sheds/proj/rc/v1/sessions/abc234/approvals/call_01HQ8Z3K", `{"decision":"allow"}`); w.Code != http.StatusOK {
+		t.Errorf("POST approvals = %d, want 200 (body %s)", w.Code, w.Body.String())
+	}
+
+	// Wrong method on a known verb path → 405, before any dial.
+	if w := do(http.MethodGet, "/api/sheds/proj/rc/v1/sessions/abc234/turn", ""); w.Code != http.StatusMethodNotAllowed {
+		t.Errorf("GET turn = %d, want 405", w.Code)
+	}
+	// An unrecognized verb → 404 (the classifier's example case: steer is not a
+	// contract verb).
+	if w := do(http.MethodPost, "/api/sheds/proj/rc/v1/sessions/abc234/steer", ""); w.Code != http.StatusNotFound {
+		t.Errorf("POST steer = %d, want 404", w.Code)
+	}
+	// An approval id that fails rc.ApprovalIDRe → 404 before any dial (the path
+	// simply isn't recognized; see classifyRCProxyPath's doc comment for the
+	// asymmetry with the hub's own 400 invalid_approval_id branch).
+	if w := do(http.MethodPost, "/api/sheds/proj/rc/v1/sessions/abc234/approvals/..", ""); w.Code != http.StatusNotFound {
+		t.Errorf("POST approvals/.. = %d, want 404", w.Code)
+	}
+}
+
+// TestRCProxy_TraversalGuard_PercentEncoded proves the traversal guard holds for
+// a REAL HTTP request carrying a percent-encoded ".." (not just the classifier
+// unit test's literal string input). chi's wildcard capture returns the raw,
+// still-encoded path segment whenever the request's raw path differs from its
+// decoded form — so "%2E%2E" reaches classifyRCProxyPath as the literal four
+// characters '%','2','E','.'… (never silently decoded to "..") and is rejected by
+// rcSlugRe/rc.ApprovalIDRe on the disallowed '%' character. Both outcomes (a
+// decoded ".." and a still-encoded "%2E%2E") land on the same 404 verdict, so a
+// server that DID decode first would not be distinguishable from this test's pass
+// — the point is that neither encoding ever reaches a dial.
+func TestRCProxy_TraversalGuard_PercentEncoded(t *testing.T) {
+	be := &rcFakeBackend{
+		dialFn: func(context.Context, string, uint16) (net.Conn, error) {
+			panic("must not dial: traversal path should 404 before any dial")
+		},
+	}
+	srv := newRCServer(be)
+
+	for _, path := range []string{
+		"/api/sheds/proj/rc/v1/sessions/%2E%2E/turn",
+		"/api/sheds/proj/rc/v1/sessions/abc234/approvals/%2E%2E",
+		"/api/sheds/proj/rc/v1/sessions/abc234/approvals/a%2Fb",
+	} {
+		r := httptest.NewRequest(http.MethodPost, path, nil)
+		w := httptest.NewRecorder()
+		srv.Router().ServeHTTP(w, r)
+		if w.Code != http.StatusNotFound {
+			t.Errorf("POST %s = %d, want 404", path, w.Code)
+		}
+	}
+}
+
+// TestRCProxy_ApprovalRoutes_RejectedBeforeDial proves "rejected before dial" is
+// literal, not just a status-code coincidence: dialFn panics if ever invoked, so a
+// classifier bug that let a traversal/invalid-id request through to
+// ensureHubReachable/the proxy transport would fail this test even if the final
+// status still happened to read 404.
+func TestRCProxy_ApprovalRoutes_RejectedBeforeDial(t *testing.T) {
+	be := &rcFakeBackend{
+		dialFn: func(context.Context, string, uint16) (net.Conn, error) {
+			panic("must not dial: rejected shape should 404/405 before any dial")
+		},
+	}
+	srv := newRCServer(be)
+
+	cases := []struct {
+		method, path string
+		wantStatus   int
+	}{
+		{http.MethodGet, "/api/sheds/proj/rc/v1/sessions/abc234/turn", http.StatusMethodNotAllowed},
+		// Every non-POST method on each new route must 405 WITHOUT dialing — the
+		// routing test's fake hub is method-aware, so only this panicking-dial table
+		// proves a wrong method never reaches the guest.
+		{http.MethodHead, "/api/sheds/proj/rc/v1/sessions/abc234/turn", http.StatusMethodNotAllowed},
+		{http.MethodPut, "/api/sheds/proj/rc/v1/sessions/abc234/interrupt", http.StatusMethodNotAllowed},
+		{http.MethodDelete, "/api/sheds/proj/rc/v1/sessions/abc234/interrupt", http.StatusMethodNotAllowed},
+		{http.MethodGet, "/api/sheds/proj/rc/v1/sessions/abc234/approvals/call_01", http.StatusMethodNotAllowed},
+		{http.MethodOptions, "/api/sheds/proj/rc/v1/sessions/abc234/approvals/call_01", http.StatusMethodNotAllowed},
+		{http.MethodPost, "/api/sheds/proj/rc/v1/sessions/abc234/steer", http.StatusNotFound},
+		{http.MethodPost, "/api/sheds/proj/rc/v1/sessions/../turn", http.StatusNotFound},
+		{http.MethodPost, "/api/sheds/proj/rc/v1/sessions/abc234/approvals/..", http.StatusNotFound},
+		{http.MethodPost, "/api/sheds/proj/rc/v1/sessions/abc234/approvals/a/b", http.StatusNotFound},
+		// A doubled slash after /rc is an EMPTY segment: TrimPrefix would otherwise
+		// normalize it into an allowed path, so the handler rejects it explicitly
+		// (exact-path-or-404 — the classification must describe the path as sent).
+		{http.MethodPost, "/api/sheds/proj/rc//v1/sessions/abc234/turn", http.StatusNotFound},
+	}
+	for _, tc := range cases {
+		r := httptest.NewRequest(tc.method, tc.path, nil)
+		w := httptest.NewRecorder()
+		srv.Router().ServeHTTP(w, r)
+		if w.Code != tc.wantStatus {
+			t.Errorf("%s %s = %d, want %d", tc.method, tc.path, w.Code, tc.wantStatus)
+		}
+	}
+}
+
+// TestRCProxy_OversizedPOSTBody pins the documented 413 contract for the POST
+// verbs when the blanket rcHubInputBodyLimit cap is exceeded THROUGH the proxy
+// (turn included).
+//
+// The stdlib's own auto-413 never fires on this path: http.MaxBytesReader's
+// "requestTooLarge" hook only triggers when the ResponseWriter is the real
+// *http.response the stdlib server constructs per connection (an unexported
+// interface check) — httptest.ResponseRecorder is not that type, and more
+// fundamentally the body here is STREAMED to the upstream guest hub by
+// httputil.ReverseProxy/http.Transport, not read directly by our handler. So when
+// the wrapped reader trips the cap mid-stream the Transport sees a body-read
+// error, RoundTrip fails, and ReverseProxy's ErrorHandler runs — which is why the
+// ErrorHandler classifies *http.MaxBytesError explicitly and answers 413
+// REQUEST_TOO_LARGE, keeping 502 RC_PROXY_FAILED for genuine upstream failures.
+// The hub enforces the same 16 KiB independently (internal/ext/rc/hub_verbs.go,
+// decodeHubBody), so a direct-to-hub caller sees a matching rejection.
+func TestRCProxy_OversizedPOSTBody(t *testing.T) {
+	addr := startFakeHub(t, hubMuxOpts{})
+	be := &rcFakeBackend{dialFn: dialTo(addr)}
+	srv := newRCServer(be)
+
+	oversized := strings.Repeat("a", rcHubInputBodyLimit+1)
+	r := httptest.NewRequest(http.MethodPost, "/api/sheds/proj/rc/v1/sessions/abc234/turn",
+		strings.NewReader(`{"text":"`+oversized+`"}`))
+	r.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	srv.Router().ServeHTTP(w, r)
+
+	if w.Code != http.StatusRequestEntityTooLarge || !strings.Contains(w.Body.String(), "REQUEST_TOO_LARGE") {
+		t.Fatalf("oversized proxied body: got %d %s, want 413 REQUEST_TOO_LARGE",
+			w.Code, w.Body.String())
 	}
 }
 

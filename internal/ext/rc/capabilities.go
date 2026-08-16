@@ -11,7 +11,7 @@ import (
 // from SchemaVersion (SHED_RC_V, the on-session tmux-env metadata schema, which stays
 // 2 — session metadata is unchanged): a client learns what a shed's binary can do
 // from CapabilityVersion + the feature list, not from the metadata schema.
-const CapabilityVersion = 3
+const CapabilityVersion = 4
 
 // capabilityFeatures is the feature list (a set of stable tokens) advertised to
 // clients for capability discovery, replacing error-string sniffing. It advertises
@@ -30,7 +30,15 @@ const CapabilityVersion = 3
 //     messages + the message.appended SSE event) and gated feed input (POST
 //     /v1/sessions/{slug}/input). Per-kind availability is in kind_features
 //     (watch / input); this token says the endpoints exist on this binary.
-var capabilityFeatures = []string{"generic-perm", "plan-stdin", "prompt-b64", "serve", "activity", "messages"}
+//   - contract-v2 — the v2 wire contract: `lane` on every session DTO, the
+//     feed/interrupt/attach hints in kind_features, the turn/interrupt/approvals hub
+//     verbs (routed and fully specified — they answer 409 not_supported until a lane
+//     implements them; see hub_verbs.go), the `approval_request` feed row with its
+//     approval block, and `pending_approvals` on the session. This token is the
+//     client's ROUTE-EXISTENCE check: a server without it may 404 the new verbs at
+//     the mux, so a client reads the token instead of interpreting a bare 404.
+//     Advertised in the same change that shipped the routes — never ahead of them.
+var capabilityFeatures = []string{"generic-perm", "plan-stdin", "prompt-b64", "serve", "activity", "messages", "contract-v2"}
 
 // AgentInfo is one agent's install probe result under capabilities.agents. Version is
 // omitted when the agent is not installed (or its version could not be read).
@@ -39,19 +47,52 @@ type AgentInfo struct {
 	Version   string `json:"version,omitempty"`
 }
 
-// KindFeatures describes what a client can do with a kind's sessions. v1 agents are
-// TUI-only, so approvals happen in the terminal ("tui"); post_input reports whether a
-// typed line can be delivered to the pane. watch reports whether the hub produces a
-// live message feed for the kind (GET /messages + message.appended); input reports the
-// feed-input posting mode — "gated" means POST /input is accepted only while the
-// session is waiting (see the hub's acceptance re-check), "" means no feed input (the
-// TUI-only post_input path still applies). Both are codex- and opencode-only in this
-// phase; omitempty keeps the wire shape unchanged for the other kinds.
+// KindFeatures describes what a client can do with a kind's sessions — the whole
+// point being that a client (notably mobile) renders watch/steer/approve affordances
+// from capabilities alone, without a per-kind table of its own. A kind is
+// lane-homogeneous (see AgentSpec.Lane), so this kind-keyed row is a COMPLETE
+// description of every session of that kind.
+//
+//   - post_input — a typed line can be delivered to the session's pane (the
+//     prompt/attach kickoff path). NOT superseded by anything in v2: it describes
+//     pane-delivered input, which the feed-input surface below does not replace.
+//   - approvals — where approvals are answered: "tui" (in the terminal) for every
+//     kind in this phase. The documented future value "remote" is the predicate for
+//     the hub's approval verb.
+//   - watch — DEPRECATED by feed; retained until clients migrate. The producer holds
+//     `watch == (feed == "messages")` in lockstep (invariant-tested in
+//     capabilities_test.go), so a v1 client reading watch and a v2 client reading
+//     feed see the same thing. Removed once no client reads it.
+//   - input — the feed-input posting mode: "gated" means POST /input is accepted
+//     only while the session is waiting (the hub's acceptance re-check), "" means no
+//     feed input (the TUI-only post_input path still applies). The future value
+//     "turn" denotes a lane that takes whole turns.
+//   - feed — what the hub can stream for the kind: "messages" (a normalized
+//     conversation feed: GET /messages + message.appended), "activity" (the activity
+//     dimension only — the stability/transcript engines derive it, but there is no
+//     message feed), or "none" (no hub signal at all).
+//   - interrupt — the turn/interrupt verb is supported. false for every kind in this
+//     phase.
+//   - attach — how a terminal reaches the session: "tmux" (attach to the rc-tmux
+//     session), "native-remote" (the agent's own remote surface), or "none".
+//
+// feed and attach carry omitempty but are NEVER empty in this binary's own output
+// (kindFeatures always assigns both, and the strict golden pins them present) — the
+// omitempty exists for RE-EMISSION fidelity: a newer server decoding an OLDER guest's
+// capabilities and marshaling them onward (overview embeds this struct raw) must
+// re-emit the fields as ABSENT, not as "", so the client-side absent-field fallbacks
+// (absent feed falls back to watch; absent attach means "tmux") apply cleanly on
+// mixed-version fleets and the out-of-matrix values ""/"" never appear on any wire.
+// interrupt stays unconditional: false is its real matrix value, and an absent bool
+// already decodes to the same default everywhere.
 type KindFeatures struct {
 	PostInput bool   `json:"post_input"`
 	Approvals string `json:"approvals"`
 	Watch     bool   `json:"watch,omitempty"`
 	Input     string `json:"input,omitempty"`
+	Feed      string `json:"feed,omitempty"`
+	Interrupt bool   `json:"interrupt"`
+	Attach    string `json:"attach,omitempty"`
 }
 
 // Capabilities is the `shed-ext-rc capabilities` payload and the block embedded in the
@@ -168,25 +209,46 @@ func BuildCapabilities(probe AgentProbe, installed InstalledProbe) Capabilities 
 
 // kindFeatures returns the per-kind UI hints for the agent kinds that accept a typed
 // kickoff and drive approvals through the TUI. claude-broker (driven from claude.ai,
-// not the pane) and shell (no agent approval surface) are omitted.
+// not the pane) and shell (no agent approval surface) are OMITTED entirely — an absent
+// entry means "no feed/input/approval affordances", exactly the client behavior those
+// two kinds already have.
+//
+// The emitted matrix (pinned exhaustively by capabilities_test.go):
+//
+//	kind      | post_input | approvals | watch | input | feed     | interrupt | attach
+//	claude-rc | true       | tui       | false | ""    | activity | false     | tmux
+//	codex     | true       | tui       | true  | gated | messages | false     | tmux
+//	opencode  | true       | tui       | true  | gated | messages | false     | tmux
+//	cursor    | true       | tui       | false | ""    | activity | false     | tmux
 func kindFeatures() map[Kind]KindFeatures {
 	out := map[Kind]KindFeatures{}
 	for _, k := range allKinds {
-		switch k {
-		case KindClaudeBroker, KindShell:
+		if k == KindClaudeBroker || k == KindShell {
 			continue
-		default:
-			kf := KindFeatures{PostInput: AcceptsTypedInput(k), Approvals: "tui"}
-			// The message feed + gated input are codex- and opencode-only in this phase:
-			// codex's rollout JSONL and opencode's HTTP/SSE event stream are the two
-			// watchers the hub folds into a normalized feed, and whose composer anchor
-			// gates input acceptance.
-			if k == KindCodex || k == KindOpencode {
-				kf.Watch = true
-				kf.Input = "gated"
-			}
-			out[k] = kf
 		}
+		// Every kind in this phase is a TUI-lane session: approvals are answered on the
+		// pane, a terminal reaches it by attaching to tmux, and no lane implements
+		// turn/interrupt yet. "activity" is the feed floor — the hub's
+		// stability/transcript engines derive the activity dimension for every watched
+		// kind even where no message feed exists.
+		kf := KindFeatures{
+			PostInput: AcceptsTypedInput(k),
+			Approvals: "tui",
+			Feed:      "activity",
+			Attach:    "tmux",
+		}
+		// The message feed + gated input are codex- and opencode-only in this phase:
+		// codex's rollout JSONL and opencode's HTTP/SSE event stream are the two
+		// watchers the hub folds into a normalized feed, and whose composer anchor gates
+		// input acceptance.
+		if k == KindCodex || k == KindOpencode {
+			kf.Feed = "messages"
+			kf.Input = "gated"
+		}
+		// watch is the deprecated spelling of feed == "messages"; derived here rather
+		// than set by hand so the two cannot drift (invariant-tested besides).
+		kf.Watch = kf.Feed == "messages"
+		out[k] = kf
 	}
 	return out
 }

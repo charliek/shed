@@ -130,6 +130,66 @@ public struct RcClassification: Sendable, Equatable {
     }
 }
 
+/// The machine-readable state of an approval request (contract v2), carried by an
+/// `approval_request` feed row and — once a lane produces approvals — by a
+/// session's `pendingApprovals` snapshot. Mirrors the guest's `rc.FeedApproval`
+/// and `shed_core::rc::RcFeedApproval`. Every field decodes tolerantly (a
+/// wrong-typed value degrades to the zero value rather than failing the row).
+public struct RcFeedApproval: Codable, Sendable, Equatable {
+    /// The lane-assigned approval id — the address the approval verb resolves
+    /// (`POST /v1/sessions/{slug}/approvals/{id}`).
+    public let id: String
+    /// `"pending"` or `"resolved"`.
+    public let status: String
+    /// The decision that resolved it (absent while pending).
+    public let decision: String?
+    /// The decisions this request accepts, advertised per request so a client
+    /// renders exactly the buttons the lane will honor. Empty when the producer
+    /// advertised none.
+    public let decisions: [String]
+
+    enum CodingKeys: String, CodingKey {
+        case id, status, decision, decisions
+    }
+
+    public init(id: String, status: String, decision: String? = nil, decisions: [String] = []) {
+        self.id = id
+        self.status = status
+        self.decision = decision
+        self.decisions = decisions
+    }
+
+    /// One `decisions[]` element, decoded lossily: a non-string element degrades
+    /// to `nil` (dropped) instead of failing the array.
+    private struct LossyDecision: Decodable {
+        let value: String?
+        init(from decoder: Decoder) throws {
+            value = try? decoder.singleValueContainer().decode(String.self)
+        }
+    }
+
+    public init(from decoder: Decoder) throws {
+        // `try?` per field, not `try`: a wrong-TYPED field must degrade to its
+        // default like the Rust mirror's tolerant deserializer — a plain
+        // decodeIfPresent still throws on type mismatch, and one malformed
+        // pending_approvals[] element would otherwise fail the WHOLE session/list
+        // decode instead of degrading one approval to an un-actionable row.
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = (try? c.decodeIfPresent(String.self, forKey: .id)) ?? nil ?? ""
+        status = (try? c.decodeIfPresent(String.self, forKey: .status)) ?? nil ?? ""
+        decision = (try? c.decodeIfPresent(String.self, forKey: .decision)) ?? nil
+        // Degrades PER ELEMENT like the Rust mirror's filter_map
+        // (`crates/shed-core/src/rc.rs`): `["allow",5,"deny"]` → `["allow","deny"]`,
+        // not `[]`. A wholly wrong-typed `decisions` (not an array) still degrades
+        // to `[]` via the outer `try?`.
+        let raw = (try? c.decodeIfPresent([LossyDecision].self, forKey: .decisions)) ?? nil
+        decisions = (raw ?? []).compactMap(\.value)
+    }
+
+    /// Whether this row reports an approval still awaiting an answer.
+    public var isPending: Bool { status == "pending" }
+}
+
 /// The neutral, target-agnostic session shape printed by `shed-ext-rc` (it runs
 /// inside the shed and can't know the host alias / shed name — the app injects those
 /// and maps `id`→`rcID`). Optional fields are absent (not null) when unknown.
@@ -139,6 +199,10 @@ public struct RcSessionDTO: Codable, Sendable, Equatable {
     public let kind: RcKind
     public let state: RcState
     public let managed: Bool
+    /// The session's CURRENT lane (contract v2): `"tui"` or `"structured"`.
+    /// Absent on a pre-v2 binary's payload — read through `laneOrTui`, which
+    /// applies the contract's absent-⇒-`"tui"` rule.
+    public let lane: String?
     public let displayName: String?
     public let workdir: String?
     public let url: String?
@@ -146,16 +210,87 @@ public struct RcSessionDTO: Codable, Sendable, Equatable {
     public let createdBy: String?
     public let createdAt: String?
     public let targetLabel: String?
+    /// Live-activity dimension (additive; derived by the rc hub). Absent when no
+    /// hub is running, the kind is unsupported, or a blocking lifecycle state
+    /// suppressed it.
+    public let activity: String?
+    /// RFC3339 timestamp the activity was last derived/changed; absent with `activity`.
+    public let activityAt: String?
+    /// A short preview of the session's most recent message. Absent when the hub has none.
+    public let lastMessage: String?
+    /// The session's currently-unresolved approval requests (contract v2) — absent
+    /// on every wire today (no producer in this phase).
+    public let pendingApprovals: [RcFeedApproval]?
 
     enum CodingKeys: String, CodingKey {
         case slug
         case tmuxSession = "tmux_session"
-        case kind, state, managed
+        case kind, state, managed, lane
         case displayName = "display_name"
         case workdir, url, id
         case createdBy = "created_by"
         case createdAt = "created_at"
         case targetLabel = "target_label"
+        case activity
+        case activityAt = "activity_at"
+        case lastMessage = "last_message"
+        case pendingApprovals = "pending_approvals"
+    }
+
+    public init(
+        slug: String, tmuxSession: String, kind: RcKind, state: RcState, managed: Bool,
+        lane: String? = nil, displayName: String? = nil, workdir: String? = nil,
+        url: String? = nil, id: String? = nil, createdBy: String? = nil,
+        createdAt: String? = nil, targetLabel: String? = nil, activity: String? = nil,
+        activityAt: String? = nil, lastMessage: String? = nil,
+        pendingApprovals: [RcFeedApproval]? = nil
+    ) {
+        self.slug = slug
+        self.tmuxSession = tmuxSession
+        self.kind = kind
+        self.state = state
+        self.managed = managed
+        self.lane = lane
+        self.displayName = displayName
+        self.workdir = workdir
+        self.url = url
+        self.id = id
+        self.createdBy = createdBy
+        self.createdAt = createdAt
+        self.targetLabel = targetLabel
+        self.activity = activity
+        self.activityAt = activityAt
+        self.lastMessage = lastMessage
+        self.pendingApprovals = pendingApprovals
+    }
+
+    // Tolerant decode: `lane`, the activity trio, and `pending_approvals` are all
+    // additive (contract v2); an older binary's payload omitting them decodes fine.
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        slug = try c.decode(String.self, forKey: .slug)
+        tmuxSession = try c.decode(String.self, forKey: .tmuxSession)
+        kind = try c.decode(RcKind.self, forKey: .kind)
+        state = try c.decode(RcState.self, forKey: .state)
+        managed = try c.decode(Bool.self, forKey: .managed)
+        lane = try c.decodeIfPresent(String.self, forKey: .lane)
+        displayName = try c.decodeIfPresent(String.self, forKey: .displayName)
+        workdir = try c.decodeIfPresent(String.self, forKey: .workdir)
+        url = try c.decodeIfPresent(String.self, forKey: .url)
+        id = try c.decodeIfPresent(String.self, forKey: .id)
+        createdBy = try c.decodeIfPresent(String.self, forKey: .createdBy)
+        createdAt = try c.decodeIfPresent(String.self, forKey: .createdAt)
+        targetLabel = try c.decodeIfPresent(String.self, forKey: .targetLabel)
+        activity = try c.decodeIfPresent(String.self, forKey: .activity)
+        activityAt = try c.decodeIfPresent(String.self, forKey: .activityAt)
+        lastMessage = try c.decodeIfPresent(String.self, forKey: .lastMessage)
+        pendingApprovals = try c.decodeIfPresent([RcFeedApproval].self, forKey: .pendingApprovals)
+    }
+
+    /// The session's lane with the contract's old-payload rule applied: absent or
+    /// blank reads as `"tui"`.
+    public var laneOrTui: String {
+        RemoteControl.laneOrTui(lane)
     }
 }
 
@@ -177,13 +312,83 @@ public struct RcAgentInfo: Codable, Sendable, Equatable {
     public let version: String?
 }
 
-/// Per-kind UI hints from `capabilities.kind_features`. Mirrors `rc.KindFeatures`.
+/// Per-kind UI hints from `capabilities.kind_features`. Mirrors `rc.KindFeatures` /
+/// `shed_core::rc::RcKindFeatures`.
+///
+/// `watch` and `input` are additive hub hints (codex-only in this phase; absent
+/// decodes to `false`/`""`). Contract v2 adds three more, all additive so an
+/// old (v3 or earlier) payload omitting them decodes with safe defaults rather
+/// than failing: `feed` is what the hub can stream for the kind (`"messages"`,
+/// `"activity"`, or `"none"`), `interrupt` reports the `turn/interrupt` verb
+/// (`false` for every kind in this phase), and `attach` is how a terminal
+/// reaches the session (`"tmux"`, `"native-remote"`, or `"none"`). `watch` is
+/// DEPRECATED by `feed` — the guest holds `watch == (feed == "messages")` in
+/// lockstep until every client reads `feed`; read them through
+/// `feedMessages`, which prefers `feed` and falls back to `watch` on a payload
+/// that predates it.
 public struct RcKindFeatures: Codable, Sendable, Equatable {
     public let postInput: Bool
     public let approvals: String
+    public let watch: Bool
+    public let input: String
+    /// Empty on a pre-v2 payload — read through `feedMessages` rather than
+    /// comparing this directly.
+    public let feed: String
+    public let interrupt: Bool
+    /// Empty on a pre-v2 payload — read through `attachKind`, which applies
+    /// the `"tmux"` fallback.
+    public let attach: String
+
     enum CodingKeys: String, CodingKey {
         case postInput = "post_input"
-        case approvals
+        case approvals, watch, input, feed, interrupt, attach
+    }
+
+    public init(
+        postInput: Bool, approvals: String, watch: Bool = false, input: String = "",
+        feed: String = "", interrupt: Bool = false, attach: String = ""
+    ) {
+        self.postInput = postInput
+        self.approvals = approvals
+        self.watch = watch
+        self.input = input
+        self.feed = feed
+        self.interrupt = interrupt
+        self.attach = attach
+    }
+
+    // Tolerant decode: `watch`/`input`/`feed`/`interrupt`/`attach` are all additive
+    // (contract v2 or later); an older payload omitting them decodes with the safe
+    // defaults above instead of failing.
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        postInput = try c.decode(Bool.self, forKey: .postInput)
+        approvals = try c.decode(String.self, forKey: .approvals)
+        watch = try c.decodeIfPresent(Bool.self, forKey: .watch) ?? false
+        input = try c.decodeIfPresent(String.self, forKey: .input) ?? ""
+        feed = try c.decodeIfPresent(String.self, forKey: .feed) ?? ""
+        interrupt = try c.decodeIfPresent(Bool.self, forKey: .interrupt) ?? false
+        attach = try c.decodeIfPresent(String.self, forKey: .attach) ?? ""
+    }
+
+    /// Whether feed input is gated (`input == "gated"`) — a watch view's input
+    /// bar is only ever enabled for a gated kind waiting for input.
+    public var inputGated: Bool { input == "gated" }
+
+    /// Whether the hub streams a normalized message feed for this kind — the
+    /// v3-fallback read of the deprecated `watch` bit: `feed == "messages"`, or,
+    /// when `feed` is absent/blank, the legacy `watch` flag. Mirrors
+    /// `shed_core::rc::RcKindFeatures::feed_messages`.
+    public var feedMessages: Bool {
+        let trimmed = feed.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed == "messages" || (trimmed.isEmpty && watch)
+    }
+
+    /// How a terminal reaches this kind's sessions, with the contract's
+    /// absent-⇒-`"tmux"` fallback applied. Mirrors `RcKindFeatures::attach_kind`.
+    public var attachKind: String {
+        let trimmed = attach.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? "tmux" : trimmed
     }
 }
 
@@ -261,9 +466,22 @@ public enum RemoteControl {
     public static let toolName = "shed-desktop"
     /// Convention schema version the binary writes.
     public static let schemaVersion = 2
+    /// The default session lane (contract v2) — an rc-tmux pane. Every kind in
+    /// this phase is `tui`, and an old (pre-v2) payload that omits `lane`
+    /// entirely is read as this value (`laneOrTui`).
+    public static let laneTui = "tui"
 
     // Confusable-free alphabet (no i, l, o, 0, 1) — matches the convention.
     static let slugAlphabet = "abcdefghjkmnpqrstuvwxyz23456789"
+
+    /// The contract's old-payload lane rule, shared by the DTO and the enriched
+    /// session: an absent (pre-v2 binary) or blank `lane` reads as `laneTui`, so
+    /// a client never has to distinguish "absent" from `"tui"`. Mirrors
+    /// `shed_core::rc::lane_or_tui`.
+    public static func laneOrTui(_ lane: String?) -> String {
+        let trimmed = (lane ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? laneTui : trimmed
+    }
 
     public static func tmuxName(slug: String) -> String { "\(tmuxPrefix)\(slug)" }
 
@@ -383,7 +601,27 @@ public enum RemoteControl {
             workdir: dto.workdir ?? defaultWorkdir,
             kind: dto.kind, state: dto.state, url: dto.url,
             rcID: dto.id, createdBy: dto.createdBy, createdAt: dto.createdAt,
-            targetLabel: dto.targetLabel, managed: dto.managed)
+            targetLabel: dto.targetLabel, managed: dto.managed,
+            // Verbatim, absence included: the fallback lives in `laneOrTui`, so
+            // "the producer said tui" stays distinguishable from "the producer
+            // is too old to say".
+            lane: dto.lane, activity: dto.activity, activityAt: dto.activityAt,
+            lastMessage: cleanPreview(dto.lastMessage))
+    }
+
+    /// Sanitize a guest-controlled preview string the way the Rust core's
+    /// `from_dto` does (`strip_format_chars` + trim + drop-empty): strip Unicode
+    /// FORMAT characters (category Cf — bidi overrides like U+202E, zero-widths,
+    /// BOM) that the hub's ANSI/C0C1 sanitizer deliberately leaves alone, trim
+    /// whitespace, and degrade a value that was ONLY such characters to nil. The
+    /// Swift path must not be laxer than the Rust/overview paths on text it
+    /// renders into the UI.
+    static func cleanPreview(_ s: String?) -> String? {
+        guard let s else { return nil }
+        let stripped = String(String.UnicodeScalarView(
+            s.unicodeScalars.filter { $0.properties.generalCategory != .format }))
+        let trimmed = stripped.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
     }
 
     /// Reconcile per-shed capability probe results into a cache keyed by shed id:

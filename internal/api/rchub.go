@@ -240,9 +240,26 @@ func (s *Server) startHub(ctx context.Context, shedName string) error {
 //	GET  v1/events
 //	GET  v1/sessions/{slug}/messages
 //	POST v1/sessions/{slug}/input
+//	POST v1/sessions/{slug}/turn
+//	POST v1/sessions/{slug}/interrupt
+//	POST v1/sessions/{slug}/approvals/{id}
 //
 // A known path with the wrong method yields 405; anything else (including an
-// unsafe {slug}) yields 404 — so a traversal attempt never reaches a dial.
+// unsafe {slug} or {id}) yields 404 — so a traversal attempt never reaches a dial.
+// {slug} is validated by rcSlugRe; {id} on the approvals route is validated by
+// rc.ApprovalIDRe, the SAME contract grammar the hub handler itself re-checks
+// (internal/ext/rc/hub_verbs.go) — the two are kept in lockstep via that shared
+// symbol rather than a second, possibly-drifting copy of the pattern.
+//
+// Doc note on the resulting asymmetry (contract decision, not a bug): a
+// proxy-invalid id (fails rc.ApprovalIDRe) never reaches the guest — the path is
+// simply not recognized, so it 404s here exactly like any other unknown path. The
+// hub's own handler re-validates the id and answers 400 invalid_approval_id for an
+// id that is syntactically invalid BUT would still have reached it — with the
+// grammar shared between both layers, that set is empty: nothing the proxy accepts
+// can fail the hub's re-check. The hub's 400 branch exists for direct-to-hub
+// callers (the local foreground smoke, and any future non-proxied client), not for
+// anything the proxy forwards.
 func classifyRCProxyPath(method, rest string) (allowed bool, rejectStatus int) {
 	segs := strings.Split(rest, "/")
 	switch {
@@ -253,6 +270,13 @@ func classifyRCProxyPath(method, rest string) (allowed bool, rejectStatus int) {
 	case len(segs) == 4 && segs[0] == "v1" && segs[1] == "sessions" && segs[3] == "messages" && rcSlugRe.MatchString(segs[2]):
 		return methodGate(method, http.MethodGet)
 	case len(segs) == 4 && segs[0] == "v1" && segs[1] == "sessions" && segs[3] == "input" && rcSlugRe.MatchString(segs[2]):
+		return methodGate(method, http.MethodPost)
+	case len(segs) == 4 && segs[0] == "v1" && segs[1] == "sessions" && segs[3] == "turn" && rcSlugRe.MatchString(segs[2]):
+		return methodGate(method, http.MethodPost)
+	case len(segs) == 4 && segs[0] == "v1" && segs[1] == "sessions" && segs[3] == "interrupt" && rcSlugRe.MatchString(segs[2]):
+		return methodGate(method, http.MethodPost)
+	case len(segs) == 5 && segs[0] == "v1" && segs[1] == "sessions" && segs[3] == "approvals" &&
+		rcSlugRe.MatchString(segs[2]) && rc.ApprovalIDRe.MatchString(segs[4]):
 		return methodGate(method, http.MethodPost)
 	default:
 		return false, http.StatusNotFound
@@ -272,6 +296,9 @@ func methodGate(got, want string) (bool, int) {
 //	GET  /api/sheds/{name}/rc/v1/events                    (SSE)
 //	GET  /api/sheds/{name}/rc/v1/sessions/{slug}/messages
 //	POST /api/sheds/{name}/rc/v1/sessions/{slug}/input
+//	POST /api/sheds/{name}/rc/v1/sessions/{slug}/turn
+//	POST /api/sheds/{name}/rc/v1/sessions/{slug}/interrupt
+//	POST /api/sheds/{name}/rc/v1/sessions/{slug}/approvals/{id}
 //
 // Control scope, enforced by the auth middleware's default branch (this route is
 // neither the credential bus, the Connect tunnel, nor the egress stream). The
@@ -279,7 +306,18 @@ func methodGate(got, want string) (bool, int) {
 // most once) before the request is forwarded.
 func (s *Server) handleRCProxy(w http.ResponseWriter, r *http.Request) {
 	shedName := chi.URLParam(r, "name")
-	rest := strings.TrimPrefix(chi.URLParam(r, "*"), "/")
+	rest := chi.URLParam(r, "*")
+	// chi's wildcard has NO leading slash for a well-formed path ("/rc/v1/…" →
+	// "v1/…"); a leading slash means the request carried an empty segment
+	// ("/rc//v1/…" → "/v1/…"). The old TrimPrefix here silently normalized that
+	// malformed path into an allowed one, so the classification no longer described
+	// the exact path the client sent. Exact-path-or-404 is the boundary's contract —
+	// reject instead of normalizing. (Interior empty segments already fail the
+	// segment-literal matches below.)
+	if strings.HasPrefix(rest, "/") {
+		writeError(w, http.StatusNotFound, "NOT_FOUND", "unknown rc endpoint")
+		return
+	}
 
 	allowed, rejectStatus := classifyRCProxyPath(r.Method, rest)
 	if !allowed {
@@ -328,7 +366,17 @@ func (s *Server) handleRCProxy(w http.ResponseWriter, r *http.Request) {
 			pr.Out.Header = allowlistedHubHeaders(pr.In.Header)
 		},
 		Transport: s.newHubTransport(shedName),
-		ErrorHandler: func(w http.ResponseWriter, _ *http.Request, _ error) {
+		ErrorHandler: func(w http.ResponseWriter, _ *http.Request, err error) {
+			// The request body is STREAMED to the guest hub by the transport, so
+			// our own rcHubInputBodyLimit cap trips mid-RoundTrip and surfaces
+			// here rather than as the stdlib's auto-413. Preserve the documented
+			// 413 contract for the POST verbs instead of mislabelling a
+			// client-side overflow as an upstream failure.
+			var maxErr *http.MaxBytesError
+			if errors.As(err, &maxErr) {
+				writeError(w, http.StatusRequestEntityTooLarge, "REQUEST_TOO_LARGE", "request body exceeds the 16 KiB limit")
+				return
+			}
 			// A dial/read failure after ensure-start (e.g. the hub raced an
 			// idle-exit between the probe and the forward) is a 502.
 			writeError(w, http.StatusBadGateway, "RC_PROXY_FAILED", "rc hub request failed")

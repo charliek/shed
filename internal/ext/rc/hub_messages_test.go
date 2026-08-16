@@ -122,6 +122,129 @@ func TestMessageRingDropOldestByBytes(t *testing.T) {
 	}
 }
 
+// ---- ring: approval rows (byte accounting + append/since round-trip) ----
+
+// approvalMsg builds a pending approval_request row: role `tool`, a human-readable
+// summary in text, and the machine-readable approval block.
+func approvalMsg(id, text string) feedMessage {
+	return feedMessage{
+		Role: feedRoleTool,
+		Type: feedTypeApprovalRequest,
+		Text: text,
+		Approval: &FeedApproval{
+			ID:        id,
+			Status:    approvalStatusPending,
+			Decisions: []string{approvalDecisionAllow, approvalDecisionAllowAlways, approvalDecisionDeny},
+		},
+	}
+}
+
+// An approval row's payload counts toward the ring's 1 MiB byte budget: size() sums
+// id + status + decision + every advertised decision alongside text/tool, so an
+// approval-heavy feed can never exceed the budget it is accounted against.
+func TestMessageRingApprovalBytesCounted(t *testing.T) {
+	m := approvalMsg("call_01HQ8Z3K.tool:2", "Allow running `rm -rf build/`?")
+	wantApproval := len(m.Approval.ID) + len(approvalStatusPending) +
+		len(approvalDecisionAllow) + len(approvalDecisionAllowAlways) + len(approvalDecisionDeny)
+	if got := m.Approval.size(); got != wantApproval {
+		t.Errorf("approval size = %d, want %d", got, wantApproval)
+	}
+	// The row's size is its text PLUS the whole approval payload — proof the approval
+	// fields are accounted rather than ignored.
+	if got, want := m.size(), len(m.Text)+wantApproval; got != want {
+		t.Errorf("message size = %d, want %d (text + approval payload)", got, want)
+	}
+
+	// The ring's running total agrees with the per-message accounting.
+	r := newMessageRing()
+	r.append(m, ringClock)
+	if r.bytes != m.size() {
+		t.Errorf("ring bytes = %d, want %d", r.bytes, m.size())
+	}
+}
+
+// An approval_request row survives append → since unchanged (ids, status, decisions),
+// and its resolution is a SECOND row carrying the same id — the id-keyed,
+// last-write-wins stream clients fold.
+func TestMessageRingApprovalRoundTrip(t *testing.T) {
+	r := newMessageRing()
+	const id = "call_01HQ8Z3K.tool:2"
+	r.append(approvalMsg(id, "Allow running `rm -rf build/`?"), ringClock)
+	resolved := approvalMsg(id, "Allow running `rm -rf build/`?")
+	resolved.Approval.Status = approvalStatusResolved
+	resolved.Approval.Decision = approvalDecisionAllow
+	resolved.Approval.Decisions = nil
+	r.append(resolved, ringClock)
+
+	got, truncated := r.since(0, 10)
+	if truncated {
+		t.Error("a contiguous page must not report truncated")
+	}
+	if len(got) != 2 {
+		t.Fatalf("want both approval rows, got %d", len(got))
+	}
+	pending, done := got[0], got[1]
+	if pending.Type != feedTypeApprovalRequest || pending.Role != feedRoleTool {
+		t.Errorf("pending row = %s/%s, want %s/%s", pending.Role, pending.Type, feedRoleTool, feedTypeApprovalRequest)
+	}
+	if pending.Approval == nil || pending.Approval.ID != id ||
+		pending.Approval.Status != approvalStatusPending || len(pending.Approval.Decisions) != 3 {
+		t.Fatalf("pending approval mangled by the ring: %+v", pending.Approval)
+	}
+	if done.Approval == nil || done.Approval.ID != id ||
+		done.Approval.Status != approvalStatusResolved || done.Approval.Decision != approvalDecisionAllow {
+		t.Fatalf("resolved approval mangled by the ring: %+v", done.Approval)
+	}
+	if done.Seq <= pending.Seq {
+		t.Errorf("the resolution must be appended after the request (seqs %d, %d)", pending.Seq, done.Seq)
+	}
+}
+
+// Approval fields are sanitized and BOUNDED on the way into the ring (ANSI/control
+// stripping, the grammar's 128-byte id ceiling, a capped decision list) so a
+// misbehaving producer cannot inflate the ring past its accounted byte budget. The
+// stored row is a copy — mutating the producer's struct afterwards cannot rewrite it.
+func TestMessageRingApprovalSanitizedAndBounded(t *testing.T) {
+	r := newMessageRing()
+	m := feedMessage{
+		Role: feedRoleTool,
+		Type: feedTypeApprovalRequest,
+		Approval: &FeedApproval{
+			// The id smuggles whitespace/control separators a feed TEXT sanitizer
+			// would keep (tab, newline, DEL, a C1 CSI) — the token sanitizer must
+			// drop them all, then the length cap applies.
+			ID:        "a\tb\nc\x7fd\u009be" + strings.Repeat("x", maxApprovalTokenBytes+50),
+			Status:    "\x1b[31mpen ding\x1b[0m",
+			Decisions: make([]string, maxApprovalDecisions+5),
+		},
+	}
+	for i := range m.Approval.Decisions {
+		m.Approval.Decisions[i] = approvalDecisionAllow
+	}
+	r.append(m, ringClock)
+
+	got, _ := r.since(0, 10)
+	a := got[0].Approval
+	if len(a.ID) != maxApprovalTokenBytes {
+		t.Errorf("id = %d bytes, want capped at %d", len(a.ID), maxApprovalTokenBytes)
+	}
+	if a.Status != approvalStatusPending {
+		t.Errorf("status = %q, want the ANSI stripped to %q", a.Status, approvalStatusPending)
+	}
+	if len(a.Decisions) != maxApprovalDecisions {
+		t.Errorf("decisions = %d, want capped at %d", len(a.Decisions), maxApprovalDecisions)
+	}
+	if r.bytes != got[0].size() {
+		t.Errorf("ring bytes = %d, want the sanitized size %d", r.bytes, got[0].size())
+	}
+
+	// The producer mutating its own struct after the append must not touch the ring.
+	m.Approval.ID = "rewritten"
+	if again, _ := r.since(0, 10); again[0].Approval.ID == "rewritten" {
+		t.Error("the ring stored the producer's pointer instead of a copy")
+	}
+}
+
 // ---- sanitizeFeedText: strip + preserve newlines + rune-safe truncation ----
 
 func TestSanitizeFeedText(t *testing.T) {

@@ -389,6 +389,30 @@ func TestParseSessionV1IsUnmanaged(t *testing.T) {
 	}
 }
 
+// lane is derived (never stored), so it is present on EVERY parsed row: a managed
+// session of a known kind, a legacy/unmanaged one, and a managed session whose kind
+// this binary does not recognize (the unknown-kind policy renders it neutrally, which
+// is the TUI affordance set).
+func TestParseSessionDerivesLane(t *testing.T) {
+	cases := []struct {
+		name    string
+		tmux    string
+		envDump string
+	}{
+		{"managed known kind", "rc-abc234", "SHED_RC_V=2\nSHED_RC_KIND=codex"},
+		{"legacy unmanaged", "rc-legacy", "SHED_RC_KIND=shell"},
+		{"managed unknown kind", "rc-fut001", "SHED_RC_V=2\nSHED_RC_KIND=some-future-kind"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			s := ParseSession(c.tmux, c.envDump, "", nil)
+			if s.Lane != LaneTUI {
+				t.Errorf("lane = %q, want %q", s.Lane, LaneTUI)
+			}
+		})
+	}
+}
+
 func TestParseSessionOmitsDisplayNameWhenUnstored(t *testing.T) {
 	// nil fallback + no stored name → empty display_name (omitted from the DTO so
 	// the app applies its own fallback).

@@ -146,6 +146,19 @@ type Session struct {
 	Kind        Kind   `json:"kind"`
 	State       State  `json:"state"`
 	Managed     bool   `json:"managed"`
+	// Lane is the session's CURRENT lane (contract v2): "tui" (an rc-tmux pane) or
+	// "structured" (a native-protocol lane). ALWAYS present on every session —
+	// managed, unmanaged, and unknown-kind rows alike — so a client never has to
+	// distinguish "absent" from "tui"; it is derived at DTO-build time from the
+	// kind's AgentSpec (laneForKind), never stored in the tmux env. Old payloads
+	// (pre-v2 binaries) omit it: a client reading one treats absent as "tui".
+	//
+	// Documented as current state, not identity: a future takeover/handoff feature
+	// (one session moved between an interactive and a headless runner) would ride a
+	// session-level effective-capabilities overlay — the earmarked mechanism, not
+	// built here. Until then a kind is lane-homogeneous (see AgentSpec.Lane), so
+	// kind-keyed kind_features remains an accurate description of every session.
+	Lane        string `json:"lane"`
 	DisplayName string `json:"display_name,omitempty"`
 	Workdir     string `json:"workdir,omitempty"`
 	URL         string `json:"url,omitempty"`
@@ -165,6 +178,16 @@ type Session struct {
 	// message (ANSI/control-stripped, whitespace-collapsed, ≤200 runes). See
 	// SanitizeLastMessage.
 	LastMessage string `json:"last_message,omitempty"`
+
+	// PendingApprovals is the session's currently-unresolved approval requests —
+	// the snapshot that keeps a session ACTIONABLE after the feed ring evicted (or
+	// a hub restart lost) the `approval_request` rows that announced them. It is a
+	// HUB-LAYER field only: the one-shot `list` path never sets it (no hub, no
+	// approval state), and it is empty in this phase because nothing produces
+	// approvals yet. A lane adapter maintains the per-session pending map and
+	// rebuilds it from its native protocol after a hub restart. omitempty keeps the
+	// wire shape unchanged for every producer that has nothing to report.
+	PendingApprovals []FeedApproval `json:"pending_approvals,omitempty"`
 }
 
 // ListResponse is the `list` subcommand's stdout shape. Capabilities is embedded so a
