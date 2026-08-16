@@ -12,7 +12,7 @@ purpose**:
 
 - **`SHED_RC_V` = 2** — the on-session tmux-env *metadata* schema (the `SHED_RC_*`
   keys). Unchanged by multi-agent support; session metadata is the same shape.
-- **`rc_version` = 3** — the *capability/protocol* version reported by
+- **`rc_version` = 4** — the *capability/protocol* version reported by
   `capabilities` and the `list` envelope. A client learns what a shed's binary can do
   from `rc_version` + the `features` list, not from the metadata schema.
 
@@ -126,20 +126,22 @@ shed-ext-rc create --kind claude-rc --name demo --wait --plan-stdin \
 `capabilities` (and the block embedded in the `list` envelope) is the discovery
 mechanism that replaces error-string sniffing: a client reads what a shed's binary can
 do rather than probing by triggering failures. `rc_version` is the capability/protocol
-version (currently **3**), decoupled from `SHED_RC_V` (metadata schema, still **2**).
+version (currently **4**), decoupled from `SHED_RC_V` (metadata schema, still **2**).
 
 ```json
 {
-  "rc_version": 3,
+  "rc_version": 4,
   "kinds": ["claude-broker", "claude-rc", "codex", "opencode", "cursor", "shell"],
   "agents": {
     "claude": { "installed": true, "version": "2.1.206" },
     "codex":  { "installed": false }
   },
-  "features": ["generic-perm", "plan-stdin", "prompt-b64", "serve", "activity", "messages"],
+  "features": ["generic-perm", "plan-stdin", "prompt-b64", "serve", "activity", "messages", "contract-v2"],
   "kind_features": {
-    "codex": { "post_input": true, "approvals": "tui", "watch": true, "input": "gated" },
-    "opencode": { "post_input": true, "approvals": "tui", "watch": true, "input": "gated" }
+    "claude-rc": { "post_input": true, "approvals": "tui", "feed": "activity", "interrupt": false, "attach": "tmux" },
+    "codex": { "post_input": true, "approvals": "tui", "watch": true, "input": "gated", "feed": "messages", "interrupt": false, "attach": "tmux" },
+    "opencode": { "post_input": true, "approvals": "tui", "watch": true, "input": "gated", "feed": "messages", "interrupt": false, "attach": "tmux" },
+    "cursor": { "post_input": true, "approvals": "tui", "feed": "activity", "interrupt": false, "attach": "tmux" }
   }
 }
 ```
@@ -149,14 +151,57 @@ version (currently **3**), decoupled from `SHED_RC_V` (metadata schema, still **
 | `rc_version` | Capability/protocol version. Bumped when the capability shape or a feature contract changes; **not** tied to `SHED_RC_V`. |
 | `kinds` | Every kind this binary offers (order matches the pinned wire contract). |
 | `agents` | Per-tool install probe (`command -v` + `--version`, 2 s budget). `version` omitted when not installed. |
-| `features` | Stable feature tokens — `generic-perm` (the `default`/`auto`/`skip` tri-state), `plan-stdin`, `prompt-b64`, `serve` (the on-demand rc activity hub), `activity` (the live activity dimension), `messages` (the codex/opencode message feed + gated input endpoints). A token is appended in the same change that ships its feature. |
-| `kind_features` | Per-kind UI hints. `post_input` = a typed line can be delivered to the pane; `approvals` = where approvals happen (v1 agents are TUI-only → `tui`); `watch` = the hub produces a live message feed for the kind (`GET …/messages` + the `message.appended` event); `input` = feed-input posting mode (`gated` = `POST …/input` accepted only while the session is waiting, absent = no feed input). `watch`/`input` are codex- and opencode-only in this phase. `claude-broker` and `shell` are omitted. |
+| `features` | Stable feature tokens — `generic-perm` (the `default`/`auto`/`skip` tri-state), `plan-stdin`, `prompt-b64`, `serve` (the on-demand rc activity hub), `activity` (the live activity dimension), `messages` (the codex/opencode message feed + gated input endpoints), `contract-v2` (the v2 wire contract: `lane` on every session DTO, the `feed`/`interrupt`/`attach` hints in `kind_features`, the `turn`/`interrupt`/`approvals` hub verbs — routed and fully specified, but answering `409 not_supported` until a lane implements them — the `approval_request` feed row, and `pending_approvals` on the session). A token is appended in the same change that ships its feature; `contract-v2` is a client's **route-existence** check — a server without it may 404 the new verbs at the mux, so a client reads the token instead of interpreting a bare 404. |
+| `kind_features` | Per-kind UI hints — see [`kind_features` matrix](#kind_features-matrix) below. |
 
 The `list` envelope embeds this block as `capabilities`. It is a pointer with
 `omitempty`, so an **old** binary's bare `{"rc_sessions":[…]}` output still decodes — a
 consumer tolerates the absence and simply has no capability data for that shed. Absence
 of a feature token (or the whole block) is how a client detects an image that predates
 multi-agent RC; new kinds / plan delivery require a recreated shed.
+
+### `kind_features` matrix
+
+`kind_features` is the per-kind row a client (mobile above all) renders watch/steer/
+approve affordances from, without keeping its own per-kind table. A kind is
+**lane-homogeneous** — every session of a kind shares one lane — so this kind-keyed row
+is a complete description of every session of that kind. `claude-broker` and `shell` are
+**omitted entirely**: an absent entry means no feed/input/approval affordances, exactly
+today's client behavior for those two kinds.
+
+| Field | Meaning |
+|-------|---------|
+| `post_input` | A typed line can be delivered to the session's pane (the prompt/attach kickoff path). **Not deprecated** — nothing in contract v2 supersedes it. |
+| `approvals` | Where approvals are answered: `tui` (in the terminal) for every kind in this phase. Documented future value `remote` — the predicate for the `approvals` hub verb. |
+| `watch` | **Deprecated** by `feed` (superseded, not removed): retained until clients migrate. The producer holds `watch == (feed == "messages")` in lockstep, so a v1 client reading `watch` and a v2 client reading `feed` see the same thing. Absent-field fallback: a client that only knows `watch` should keep using it. |
+| `input` | Feed-input posting mode: `gated` (`POST …/input` accepted only while the session is waiting) or `""` (no feed input — the TUI-only `post_input` path still applies). Documented future value `turn`, denoting a lane that takes whole turns via the `turn` verb. |
+| `feed` | What the hub can stream for the kind: `messages` (a normalized conversation feed — `GET …/messages` + `message.appended`), `activity` (the activity dimension only — no message feed), or `none` (no hub signal at all). Supersedes `watch`. |
+| `interrupt` | The `turn/interrupt` verb is supported. `false` for every kind in this phase. |
+| `attach` | How a terminal reaches the session: `tmux` (attach to the rc-tmux session), `native-remote` (the agent's own remote surface), or `none`. |
+
+Normative R0 matrix (exhaustive — pinned by `capabilities_test.go`):
+
+| kind | post_input | approvals | watch | input | feed | interrupt | attach |
+|---|---|---|---|---|---|---|---|
+| claude-rc | true | tui | false | "" | activity | false | tmux |
+| codex | true | tui | true | gated | messages | false | tmux |
+| opencode | true | tui | true | gated | messages | false | tmux |
+| cursor | true | tui | false | "" | activity | false | tmux |
+
+(`feed:"activity"` for claude-rc/cursor because the hub's stability/transcript engines
+already derive the activity dimension for them; `"none"` is reserved for kinds with no
+hub signal at all.)
+
+`feed` and `attach` carry `omitempty` but are **never** empty in this binary's own
+output (the strict golden pins them present) — the `omitempty` exists so a newer server
+re-emitting an **older** guest's decoded capabilities (the overview embeds the struct
+raw) emits the fields as absent rather than `""`. `interrupt` is unconditional: `false`
+is its real matrix value, and an absent bool already decodes to the same default
+everywhere.
+
+**Client fallbacks for absent fields** (a v3 payload, or a re-emitted older guest's
+capabilities): absent `feed` → fall back to `watch`; absent `attach` → treat as `tmux`;
+absent `lane` on the session DTO → treat as `"tui"`.
 
 ## JSON output
 
@@ -172,6 +217,7 @@ not `null`) when unknown; `managed` is always present.
   "kind": "claude-rc",
   "state": "ready",
   "managed": true,
+  "lane": "tui",
   "display_name": "demo",
   "workdir": "/home/shed",
   "url": "https://claude.ai/code/session_…",
@@ -181,7 +227,8 @@ not `null`) when unknown; `managed` is always present.
   "target_label": "shed:t1@host",
   "activity": "working",
   "activity_at": "2026-06-19T18:54:12Z",
-  "last_message": "Running the test suite now."
+  "last_message": "Running the test suite now.",
+  "pending_approvals": []
 }
 ```
 
@@ -195,6 +242,24 @@ guest-attested route; clients must never treat it as an authoritative target.
 derived live from the pane (never stored). A golden fixture of this shape
 (`internal/ext/rc/testdata/rcSessionDto.golden.json`) is byte-identical to the consuming
 repos' copies and asserted to decode in each — the guard against contract drift.
+
+`lane` (contract v2) is the session's **current** lane — `"tui"` (an rc-tmux pane) or
+`"structured"` (a native-protocol lane) — and is **always present** on every session:
+managed, unmanaged, and unknown-kind rows alike. It is derived at DTO-build time from
+the kind's registry entry, never stored in the tmux env; every kind in this phase
+derives `"tui"`, including unknown kinds. It documents current state, not identity — a
+future takeover/handoff feature (one session moved between an interactive and a
+headless runner over the agent's own resume) would ride a session-level
+effective-capabilities overlay layered on top, not a change to this field. Old
+payloads (pre-v2 binaries) omit `lane`; a client reading one treats absent as `"tui"`.
+
+`pending_approvals` (contract v2) is the session's currently-unresolved approval
+requests — the snapshot that keeps a session actionable after the feed ring evicted (or
+a hub restart lost) the `approval_request` rows that announced them. It is a
+**hub-layer** field only: the one-shot `list` path never sets it (no hub running, no
+approval state to report), and it is **always empty in this phase** — nothing produces
+approvals yet. `omitempty`, so its absence carries no meaning beyond "nothing to
+report."
 
 The `activity`, `activity_at`, and `last_message` fields are the additive **live
 activity** dimension (a resident per-shed rc hub derives them). They are optional and
@@ -269,9 +334,67 @@ All endpoints are loopback-only and reached through the server proxy at
 | `GET /v1/events` | — | SSE stream (activity/session/message notifications) | — |
 | `GET /v1/sessions/{slug}/messages` | `since=<seq>` (exclusive), `limit=<n≤200, default 100>` | `{"messages":[…],"truncated":bool}` | `400` bad `since`/`limit`; `404` unknown slug |
 | `POST /v1/sessions/{slug}/input` | body `{"text":"…"}` (≤16 KiB) | `{"delivered":true}` | `400` invalid/unsafe/empty text; `404` unknown/gone slug; `409` not accepting; `413` body too large |
+| `POST /v1/sessions/{slug}/turn` | body `{"text": string, "options": object?}` (≤16 KiB) | *(reserved)* `202 {"turn_id": "<opaque>"}` | `400` empty/whitespace text or malformed JSON; `404` unknown slug; `409` `not_supported` (every kind, this phase) or `not_accepting` (busy — reserved); `413` body too large |
+| `POST /v1/sessions/{slug}/interrupt` | body ignored (still size-capped) | *(reserved)* `202 {"interrupting": true}` | `404` unknown slug; `409` `not_supported` (every kind, this phase) or `not_accepting` (no active turn — reserved); `413` body too large |
+| `POST /v1/sessions/{slug}/approvals/{id}` | body `{"decision": "allow"\|"allow_always"\|"deny"}` (≤16 KiB) | *(reserved)* `200 {"resolved": true, "decision": "<decision>"}` | `400` invalid decision, malformed JSON, or an `{id}` that fails the approval-id grammar (below); `404` unknown slug, or `unknown_approval` for a well-formed but unrecognized id (reserved); `409` `not_supported` (every kind, this phase) or `already_resolved` for a different decision on an already-resolved id (reserved — same-decision replay is idempotent, `200`); `413` body too large |
 
 Errors carry a JSON envelope `{"error":"<code>","message":"…"}`. A hub-down condition is
 surfaced by the proxy, not the hub — see [Hub-down degrade](#hub-down-degrade).
+
+#### Contract-v2 verbs: `turn` / `interrupt` / `approvals/{id}`
+
+These three routes exist **now** so clients (mobile above all) can be written against a
+stable surface, but **no lane implements them in this phase**: every handler validates
+fully and then rejects with `409 not_supported`, because no kind's `kind_features` row
+advertises the verb (`input == "turn"` / `interrupt == true` / `approvals == "remote"`).
+The success shapes above are pinned by the contract now — schema-tested, unemitted —
+so a later lane implementation cannot recontract clients that already coded against
+them.
+
+**Handler precedence** (identical across the three verbs, and matching `POST /input`'s
+precedent): body size (`413`, 16 KiB cap) → body validation (`400` `invalid_json` /
+`empty_text` / `invalid_decision` / `invalid_approval_id`) → tracked-session lookup
+(`404` `unknown_slug`) → capability check (`409` `not_supported`). `turn` with
+empty/whitespace text is a `400`. `interrupt` reads no body — any body is ignored, but
+still size-capped by the proxy. Unknown body fields are ignored; `Content-Type` is not
+enforced (both match the existing `/input` handler). R0 handlers take no input mutex
+and capture no pane — there is nothing to deliver — and use the same tracked-lookup
+rule `GET /messages` does (`404` for an unknown slug, no re-derivation from tmux).
+
+**409 vocabulary** (defined once here — mirrored by the `hub.go` doc comment in
+`internal/ext/rc/hub_verbs.go`):
+
+| Code | Meaning |
+|---|---|
+| `not_supported` | This session's kind/lane **never** supports the verb — capabilities said so, and retrying or waiting changes nothing. Every kind returns this for all three verbs today. |
+| `not_accepting` | The verb **is** supported but not right now (the existing `/input` vocabulary: wrong activity, recreated identity; and, once a lane lands, a `turn` while a turn is running, or an `interrupt` with no active turn). Retryable in principle. |
+
+There are deliberately no `501`s — one envelope, one vocabulary, for every rejection. A
+client that must distinguish "this server is too old to have the route at all" reads
+the `contract-v2` capability feature token rather than interpreting the mux's bare
+`404`.
+
+**Success semantics (pinned now, unemitted in R0)**:
+
+- `turn` → `202 {"turn_id": "<opaque>"}` (lane-assigned; clients must not parse it).
+  Turn-while-busy → `409 not_accepting`.
+- `interrupt` → `202 {"interrupting": true}` (acknowledges the interrupt was
+  *delivered*, not that the turn has stopped — the stop itself surfaces on the
+  feed/activity stream). No active turn → `409 not_accepting`.
+- `approvals/{id}` → `200 {"resolved": true, "decision": "<decision>"}`. A replay of
+  the **same** decision on an already-resolved id is idempotent → `200`. A
+  **different** decision on an already-resolved id → `409 already_resolved`. An
+  unknown (but well-formed) id → `404 unknown_approval`.
+
+**Approval-id grammar** (a contract decision, not an inherited regex):
+`^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$` — starts alphanumeric (so `.`/`..`/`...` can
+never match; path traversal is excluded by the grammar itself), allows the `.`/`:`/
+`_`/`-` seen in native ids (codex call ids, ACP/opencode request ids), capped at 128
+characters. The same expression gates both the hub handler and the server-side proxy
+path classifier — a malformed id 404s at the proxy before it ever reaches the guest; a
+syntactically invalid id sent **directly** to the hub (bypassing the proxy) is a `400
+invalid_approval_id`, not a `404` — a `404` here would wrongly imply the id was
+well-formed but unknown.
 
 ### SSE events (`GET /v1/events`)
 
@@ -365,9 +488,64 @@ into a display-only `status` feed row (role `system`) — e.g. `awaiting approva
 produced — see [Activity dimension](#activity-dimension)). There is no retraction event;
 the row is simply superseded by whatever the feed emits next.
 
-Message shape: `{seq, ts, role, type, text, tool{name, detail}}` where `role ∈
+Message shape: `{seq, ts, role, type, text, tool{name, detail}, approval}` where `role ∈
 {user, assistant, tool, system}` and `type ∈ {text, tool_use, tool_result, reasoning,
-status}` (unknown native events map to a `status` row rather than being dropped).
+status, approval_request}` (unknown native events map to a `status` row rather than
+being dropped).
+
+**`approval_request` (contract v2).** An approval row: an agent asked for permission to
+do something. It rides `role: "tool"` with `text` carrying a sanitized human-readable
+summary, `tool{name, detail}` the call being approved, and `approval` the
+machine-readable state:
+
+```json
+{
+  "seq": 3,
+  "ts": "2026-08-14T10:00:05Z",
+  "role": "tool",
+  "type": "approval_request",
+  "text": "Allow running `rm -rf build/`?",
+  "tool": { "name": "exec", "detail": "rm -rf build/" },
+  "approval": {
+    "id": "call_01HQ8Z3K.tool:2",
+    "status": "pending",
+    "decisions": ["allow", "allow_always", "deny"]
+  }
+}
+```
+
+| `approval` field | Meaning |
+|---|---|
+| `id` | The lane-assigned approval id — the address the `approvals/{id}` hub verb resolves. Grammar: `^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$` (starts alphanumeric, `.`/`:`/`_`/`-` allowed, max 128 chars — same grammar as the `approvals/{id}` route above). |
+| `status` | `pending` or `resolved`. |
+| `decision` | The decision that resolved it (`allow`/`allow_always`/`deny`); empty/omitted while pending. |
+| `decisions` | The decisions this request accepts, advertised per request so a client renders exactly the buttons the lane will honor (a subset of `allow`/`allow_always`/`deny`). |
+
+A resolution is a **second** appended row with the same `id` and `status: "resolved"` —
+never an edit of the first:
+
+```json
+{
+  "seq": 4,
+  "ts": "2026-08-14T10:00:11Z",
+  "role": "tool",
+  "type": "approval_request",
+  "text": "Allow running `rm -rf build/`?",
+  "approval": { "id": "call_01HQ8Z3K.tool:2", "status": "resolved", "decision": "allow" }
+}
+```
+
+**Client folding rule.** Approval rows are an **id-keyed, last-write-wins stream**. A
+client must not require seeing the `pending` row before the `resolved` one — ring
+eviction (or a hub restart) can drop the earlier row entirely — and the session's
+[`pending_approvals`](#json-output) snapshot is the authoritative answer to "what is
+still open," independent of what the ring happens to retain.
+
+Nothing produces `approval_request` rows in this phase (no lane emits approvals yet) —
+the shape is contracted now so a lane can start emitting it without a client-side
+recontract. `size()` accounting for the ring's byte budget counts the approval's `id` +
+`status` + `decision` + every advertised `decisions` entry, alongside `text`/`tool`, so
+an approval-heavy feed still honors the ring's 1 MiB cap.
 
 **`seq` semantics.** `seq` is monotonic **per hub run**, starting at 1, and **restarts
 from 1 on hub restart** (or a session recreate). `since` is **exclusive**. Two
@@ -465,12 +643,14 @@ The hub is exposed to clients by two server endpoints (advertised as the `rc-pro
 `rc-events` feature tokens on `GET /api/info` and `GET /api/overview`):
 
 - **`/api/sheds/{name}/rc/*`** — a reverse proxy into the shed's hub over
-  `backend.DialService(shed, 1029)`, with a **strict method/path allowlist** (only `GET`
-  sessions/events/messages and `POST` input; the `{slug}` is pattern-validated so no
-  traversal reaches the proxied path), SSE flushing, hop-by-hop header stripping, bounded
-  response bodies, and control-scope auth. It **ensure-starts** the hub at most once per
-  shed (singleflight) behind a **circuit breaker** (3 failed starts in 5 min → 503 for
-  the window, no exec storm).
+  `backend.DialService(shed, 1029)`, with a **strict method/path allowlist** (`GET`
+  sessions/events/messages; `POST` input/turn/interrupt/approvals; the `{slug}` is
+  pattern-validated on every route, and the approvals route additionally validates
+  `{id}` against the same approval-id grammar the hub handler re-checks, so no
+  traversal reaches the proxied path on either wildcard), SSE flushing, hop-by-hop
+  header stripping, bounded response bodies, and control-scope auth. It
+  **ensure-starts** the hub at most once per shed (singleflight) behind a **circuit
+  breaker** (3 failed starts in 5 min → 503 for the window, no exec storm).
 - **`GET /api/rc/events`** — a **demand-driven** aggregate SSE stream across every shed:
   zero connected clients ⇒ zero upstream hub connections; the first client opens one
   upstream per shed that is running and has rc sessions. An upstream drop yields a

@@ -202,6 +202,11 @@ the phase (even when the mobile UI itself lands a phase later).
 | Phase | Ships | Mobile checkpoint |
 |---|---|---|
 | **R0 — Contract v2** | `lane` field, extended `kind_features`, turn/interrupt/approval verbs (501/409 where unimplemented), typed approval feed entries, `needs_approval` activity; Go hub + Rust `rc.rs` + fixtures updated in lockstep | Mobile decodes v2 envelope; existing watch screens render unchanged off capabilities |
+
+> **R0 status:** shipped on branch `feature/plan-007-rc-contract-v2` (2026-08-16),
+> pending PR. See `docs/extensions/rc-helper.md` for the landed contract (the
+> panel-corrected version — `409 not_supported`/`not_accepting`, no `501`s — supersedes
+> the "501/409" note in the table row above).
 | **R1 — Cursor TUI hardening** | cursor hooks→hub ingestion (activity + `needs_approval`), transcript-tail partial feed; cursor stops being stability-only | Cursor session on a shed shows live activity + "approval pending — open TUI" on the phone |
 | **R2 — Rust porcelain v1** | new crate: `agent`/`ls`/`watch`/`attach`/`plan`/`kill` across `local\|machine\|shed`; drives Go engine binaries; machines section in config | n/a directly (CLI), but exercises the same shed-core target model mobile will use |
 | **R3 — Structured lane prototype** | opencode **or** codex app-server adapter in the guest hub behind the v2 verbs; decision on kind-vs-lane-option modeling | **Approve a tool call and steer a turn from the phone** — the bar for the whole design |
