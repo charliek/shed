@@ -77,11 +77,15 @@ type AgentSpec struct {
 	// a protocol (codex's rollout carries no approval record; cursor has no approval
 	// hook) can only be known to be blocked by looking at the pane. Two consumers: the
 	// input gate rejects a post while it matches (typed input would answer the dialog by
-	// accident), and reconcile derives needs_approval from it.
+	// accident), and reconcile derives needs_approval from it (debounced two ticks each
+	// way, emitting informational approval rows — see hub_reconcile.go).
 	//
-	// nil for EVERY kind in this commit — the anchors themselves (option-line chrome,
-	// with fixtures) land with the codex and cursor work. Matched, like PromptAnchor,
-	// against the RAW captured pane so dialog chrome survives normalization.
+	// Declared by codex today; cursor's lands with its hook work. Every anchor is
+	// option-line CHROME (the widget's gutter + numbered row + whole-line envelope),
+	// never a headline: headlines get quoted in agent prose and survive in the
+	// transcript after the dialog is answered, so they can neither be trusted nor
+	// observed to clear. Matched, like PromptAnchor, against the RAW captured pane so
+	// dialog chrome survives normalization.
 	ApprovalAnchor *regexp.Regexp
 }
 
@@ -192,6 +196,81 @@ var (
 	shellPromptAnchorRe = regexp.MustCompile(`(?m)^\s*\[shed:[^\]]+\][^$]*\$\s*$`)
 )
 
+// Approval anchors — the blocked-on-a-yes/no dialog chrome per tool (AgentSpec.
+// ApprovalAnchor). Structural, whole-line expressions in the cursorReadyRe tradition:
+// what makes a match trustworthy is the WIDGET SHAPE around the words, not the words.
+var (
+	// codexApprovalAnchorRe matches one rendered OPTION ROW of codex's approval overlay
+	// (tui/src/bottom_pane/approval_overlay.rs, rendered through list_selection_view.rs).
+	// Fixtures: testdata/panes/codex-ready-approval-exec.txt (exec prompt) and
+	// codex-ready-approval-network.txt (network prompt), adapted from the codex repo's
+	// committed TUI snapshots; codex-ready-approval-resolved.txt (overlay gone) and
+	// codex-ready-approval-quoted.txt (the same words as assistant prose) are the
+	// negatives.
+	//
+	// Why option rows and not the HEADLINE ("Would you like to run the following
+	// command?"): a headline is ordinary English that an agent quotes back in its own
+	// prose all the time, and — decisively — the headline scrolls into the transcript
+	// while the overlay is torn down, so it does NOT disappear when the dialog is
+	// answered. The option rows do: they exist only while the widget is mounted, which
+	// is exactly the interval the anchor is supposed to describe.
+	//
+	// Shape, from list_selection_view.rs's row builder (`format!("{prefix} {n}. ")`,
+	// prefix '›' when selected and ' ' otherwise, an optional " (key)" shortcut hint
+	// appended by the row renderer):
+	//
+	//	› 1. Yes, proceed (y)
+	//	  2. No, and tell Codex what to do differently (esc)
+	//
+	// The regex therefore requires TWO pieces of widget chrome, in order:
+	//
+	//  1. a whole option row at COLUMN 0 with no leading indent — the selection gutter
+	//     (`›`, or the single space that replaces it on an unselected row), a space, the
+	//     enabled-row number, `. `, one of the pinned labels, an optional parenthesized
+	//     shortcut hint, and end of line;
+	//  2. within the next few lines, the overlay's footer `Press enter to confirm or esc
+	//     to cancel` (codex's OTHER list views end "esc to go back" — this exact wording
+	//     belongs to the approval overlay, and the cross-thread variant only APPENDS
+	//     " or o to open thread", so a prefix match holds).
+	//
+	// The conjunction is what makes the quoted-prose fixture
+	// (codex-ready-approval-quoted.txt) a genuine negative. Requiring only the option row
+	// would not be enough on its own: codex renders assistant text with a `• ` bullet and
+	// a two-space body indent, so a markdown list inside a message can land at exactly
+	// the same column as an UNSELECTED option row. Requiring only the `›` marker would
+	// fail the opposite way — the operator can arrow the marker onto a row whose label is
+	// outside the pinned set, and the anchor would report the dialog gone while it is
+	// still up. Demanding the row AND the footer costs an agent-prose false positive both
+	// pieces of chrome in the right order, and costs a live dialog nothing.
+	//
+	// KNOWN LIMITATION (accepted, inherent to a pane-derived signal): a VERBATIM
+	// reproduction of the whole dialog on screen — `cat`ing this package's own fixture
+	// files, pasting a transcript that preserves the gutter and the footer — reproduces
+	// both pieces of chrome and does read as an approval. No regex can separate "the
+	// widget is mounted" from "a perfect picture of the widget is on screen" when the
+	// pane is all we get, and the debounce cannot help (the text is static, so it agrees
+	// with itself indefinitely). Two things bound the damage: the anchor is evaluated
+	// against the VISIBLE FRAME only (captureVisiblePane), so a false episode lives
+	// exactly as long as the text is on screen and clears when it scrolls away, and the
+	// consequence is an informational row plus a decision-less pending entry — nothing is
+	// auto-approved and nothing is auto-denied. The real fix is a structured lane (codex
+	// app-server), not a better regex.
+	//
+	// Label set (deliberately small, per plan 008 §3.6): every exec / patch / network
+	// approval renders at least one of these three rows — "Yes, proceed" (exec+patch
+	// option 1), "Yes, just this once" (network option 1), and "No, and tell Codex what
+	// to do differently" (the Cancel option, present on all three) — so the anchor is
+	// stable no matter which row the operator has arrowed onto. The shortcut hint is
+	// optional because the approval keymap is configurable; the labels are compiled
+	// literals. KNOWN GAP, and the extension point when it matters: the newer
+	// additional-permissions overlay ("Would you like to grant these permissions?") uses
+	// a disjoint label set ("Yes, grant these permissions for this turn" … "No, continue
+	// without permissions") and is not matched.
+	codexApprovalAnchorRe = regexp.MustCompile(
+		`(?m)^[› ] \d+\. (?:Yes, proceed|Yes, just this once|No, and tell Codex what to do differently)(?: \([^()\n]{1,16}\))? *\n` +
+			`(?:[^\n]*\n){0,12} *Press enter to confirm or esc to cancel`)
+)
+
 // noPostureMap is the generic tri-state mapping for tools whose modes need no flags
 // at all (shell): every generic mode is accepted but produces nothing. Agent specs
 // define their own maps with the real flags.
@@ -247,6 +326,11 @@ var agentRegistry = []*AgentSpec{
 		},
 		AuthHint:     "run `codex` and complete login (`codex login`)",
 		PromptAnchor: codexPromptAnchorRe,
+		// codex's approvals never reach a protocol — its rollout JSONL filters every
+		// approval record out (see plan 008 §2), so a session blocked on the overlay is
+		// byte-identical in the log to a long-running tool call. The pane is the only
+		// evidence there is.
+		ApprovalAnchor: codexApprovalAnchorRe,
 	},
 	{
 		Tool:         toolOpencode,
@@ -311,9 +395,9 @@ func promptAnchorFor(k Kind) *regexp.Regexp {
 }
 
 // approvalAnchorFor returns the kind's approval-dialog regex, or nil for an unregistered
-// kind or a spec that declares none (every spec today — see AgentSpec.ApprovalAnchor).
-// nil means "this kind has no pane-derived approval signal", which callers must treat as
-// "no evidence", never as "not blocked".
+// kind or a spec that declares none (every kind but codex today — see
+// AgentSpec.ApprovalAnchor). nil means "this kind has no pane-derived approval signal",
+// which callers must treat as "no evidence", never as "not blocked".
 func approvalAnchorFor(k Kind) *regexp.Regexp {
 	if spec, ok := specForKind(k); ok {
 		return spec.ApprovalAnchor

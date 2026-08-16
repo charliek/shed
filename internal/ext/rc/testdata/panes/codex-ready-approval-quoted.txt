@@ -1,0 +1,25 @@
+╭────────────────────────────────────────────╮
+│ >_ OpenAI Codex (v0.145.0)                 │
+│                                            │
+│ model:     gpt-5.4 high   /model to change │
+│ directory: ~                               │
+╰────────────────────────────────────────────╯
+
+› Explain how the approval prompt works before you touch anything
+
+• When a command needs approval, Codex draws an overlay. The headline reads
+  "Would you like to run the following command?", the reason and the command
+  itself follow, and then it lists the choices:
+
+  1. "Yes, proceed" — runs the command once and continues the turn.
+  2. "Yes, and don't ask again for commands that start with `echo`" — records
+     an execpolicy amendment for that prefix.
+  3. "No, and tell Codex what to do differently" — cancels and hands the turn
+     back to you so you can redirect.
+
+  You answer with enter, or press esc to cancel. Nothing is running right now,
+  so there is no dialog on screen — I was only describing one.
+
+› Find and fix a bug in @filename
+
+  gpt-5.4 high · ~

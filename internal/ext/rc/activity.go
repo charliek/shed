@@ -29,16 +29,20 @@ const (
 	ActivityUnknown Activity = "unknown"
 
 	// ActivityNeedsApproval — the session is blocked on an approval the operator
-	// must answer. Produced today by the opencode watcher's fold, from that lane's
-	// native permission/question events (an open ask outranks the tool call it
-	// suspended: the model is not working, the operator is). The pane-derived
-	// producers for the kinds whose approvals never reach a protocol land alongside
-	// their anchors.
+	// must answer. Two producers, one meaning (an open ask outranks the tool call it
+	// suspended: the model is not working, the operator is):
+	//   - the opencode watcher's fold, from that lane's native permission/question
+	//     events;
+	//   - reconcile's debounced ApprovalAnchor match on the pane, for the kinds whose
+	//     approvals never reach a protocol at all (codex, cursor) — it OVERRIDES the
+	//     watcher/stability merge, because for those kinds every other signal
+	//     describes the suspended work rather than the dialog on top of it.
 	//
 	// A needs_approval session does NOT necessarily carry pending_approvals: an
 	// opencode QUESTION blocks the session but is not addressable by the approvals
 	// verb, so the snapshot is legitimately empty and the client's affordance is
-	// "open the TUI".
+	// "open the TUI". A pane-derived episode DOES carry an entry, but a decisionless
+	// one (approvals:"tui") — same affordance.
 	ActivityNeedsApproval Activity = "needs_approval"
 )
 

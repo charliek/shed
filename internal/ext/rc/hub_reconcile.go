@@ -2,6 +2,8 @@ package rc
 
 import (
 	"fmt"
+	"regexp"
+	"strings"
 	"time"
 )
 
@@ -90,6 +92,132 @@ type trackedSession struct {
 	// whole point of the snapshot: the feed ring's approval rows can be evicted or
 	// lost, this cannot.
 	pendingApprovals []FeedApproval
+
+	// paneApproval is the PANE-derived approval state for kinds whose approvals never
+	// reach a protocol (AgentSpec.ApprovalAnchor kinds — codex today, cursor next).
+	// Deliberately a SEPARATE field from pendingApprovals, not a merge into that slice:
+	// pendingApprovals is wholly owned by the publishing watcher (reconcile and the
+	// approvals verb both REPLACE it from approvalPublisher), so a pane entry living
+	// there would be blanked by the next republish. Reconcile is its sole writer; the
+	// /v1/sessions overlay unions the two (see approvalSnapshot).
+	paneApproval paneApprovalState
+}
+
+// paneApprovalDebounceTicks is how many CONSECUTIVE ticks the anchor must agree before
+// the hub changes its mind — in BOTH directions. Two ticks (4s at the active cadence)
+// is the smallest value that costs a single-tick blip nothing: a capture that catches
+// the overlay mid-draw, or one that momentarily misses it because a redraw was in
+// flight, is contradicted by the very next tick and never reaches the wire. The cost is
+// one tick of latency on a genuine transition, which is far below human reaction time
+// on the phone this signal exists for.
+const paneApprovalDebounceTicks = 2
+
+// paneApprovalState is one session's debounced pane-anchor approval episode. An EPISODE
+// runs from a debounced detection to a debounced clear and owns exactly one id and
+// exactly one pending feed row; ids are "pane-<n>" with n monotonic per session
+// (per hub lifetime — the ring's seq has the same restart semantics).
+//
+// Reconcile-only: the streak counters are never read outside the reconcile goroutine,
+// and the handler-visible part (pending/id) is committed under trackMu with the rest of
+// the tick's output.
+type paneApprovalState struct {
+	matchTicks int  // consecutive ticks the anchor matched (reset by a non-match)
+	clearTicks int  // consecutive ticks the anchor did not match (reset by a match)
+	pending    bool // debounced verdict: an approval episode is open
+	id         string
+	// text is the open episode's one-line summary (the matched option row). It stands in
+	// for the session's last_message while the episode runs: the watcher's own preview
+	// describes the tool call the dialog SUSPENDED, which on a phone reads as "the agent
+	// is busy doing this" at the exact moment the truth is "the agent is waiting on you".
+	text     string
+	episodes int
+}
+
+// abandon drops an open episode WITHOUT announcing a resolution — the exit for a session
+// that stopped being observable (a blocking lifecycle state; most sharply, codex dying
+// with its dialog on screen) rather than one whose dialog was answered. episodes is
+// deliberately NOT reset: ids stay monotonic for the session's whole life, so a client
+// folding by id can never see pane-1 mean two different asks.
+func (p *paneApprovalState) abandon() {
+	p.matchTicks, p.clearTicks = 0, 0
+	p.pending = false
+	p.id = ""
+	p.text = ""
+}
+
+// observe folds one tick's anchor verdict into the debounce and reports a debounced
+// TRANSITION as the feed status it should announce: approvalStatusPending when an
+// episode just opened, approvalStatusResolved when the dialog is provably gone, and ""
+// (the common case) when nothing changed. id is the transitioning episode's id,
+// non-empty exactly when status is.
+func (p *paneApprovalState) observe(matched bool) (status, id string) {
+	if matched {
+		p.matchTicks++
+		p.clearTicks = 0
+	} else {
+		p.clearTicks++
+		p.matchTicks = 0
+	}
+	switch {
+	case !p.pending && matched && p.matchTicks >= paneApprovalDebounceTicks:
+		p.pending = true
+		p.episodes++
+		p.id = fmt.Sprintf("pane-%d", p.episodes)
+		return approvalStatusPending, p.id
+	case p.pending && !matched && p.clearTicks >= paneApprovalDebounceTicks:
+		id = p.id
+		p.pending = false
+		p.id = ""
+		return approvalStatusResolved, id
+	}
+	return "", ""
+}
+
+// paneApprovalRow builds an INFORMATIONAL approval_request feed row for a pane-derived
+// episode. `tool` is omitted (the hub never learns which call the dialog guards — the
+// pane shows chrome, not a structured request) and `decisions` is omitted for the
+// reason in approvalSnapshot. A resolved row additionally omits `decision`: the operator
+// answered in the TUI and the hub cannot know which way they went — legal per the
+// contract's loosening for out-of-hub resolutions.
+func paneApprovalRow(id, status, text string) feedMessage {
+	return feedMessage{
+		Role:     feedRoleTool,
+		Type:     feedTypeApprovalRequest,
+		Text:     text,
+		Approval: &FeedApproval{ID: id, Status: status},
+	}
+}
+
+// firstAnchorLine returns the WHOLE pane line containing the anchor's first match, as a
+// sanitized one-line preview — the row's human-readable text. Expanded to the enclosing
+// line rather than reported as the match text so the row reads as what the operator
+// sees on screen even for an anchor that matches a fragment (or, as codex's does, a
+// multi-line span of chrome).
+func firstAnchorLine(anchor *regexp.Regexp, pane string) string {
+	loc := anchor.FindStringIndex(pane)
+	if loc == nil {
+		return ""
+	}
+	start := strings.LastIndexByte(pane[:loc[0]], '\n') + 1
+	line, _, _ := strings.Cut(pane[start:], "\n")
+	return SanitizeLastMessage(line)
+}
+
+// approvalSnapshot is the session's pending_approvals overlay: the lane-published
+// entries (opencode) UNIONED with the open pane-derived episode (codex/cursor). The two
+// sources are disjoint in practice — a kind's approvals are either lane-derived or
+// pane-derived, never both — but they are unioned rather than switched so a kind that
+// someday has both keeps every open ask visible. The pane entry carries no `decisions`:
+// the kind's kind_features row says approvals:"tui", so there is NOTHING the hub can
+// honor remotely and a capability-driven client must render zero decision buttons ("open
+// the TUI"). Called under trackMu; the result is deep-copied by the caller before it
+// reaches a response.
+func (tr *trackedSession) approvalSnapshot() []FeedApproval {
+	if !tr.paneApproval.pending {
+		return tr.pendingApprovals
+	}
+	pane := FeedApproval{ID: tr.paneApproval.id, Status: approvalStatusPending}
+	return append(append([]FeedApproval(nil), tr.pendingApprovals...), pane)
 }
 
 // newTrackedSession builds tracker state for a freshly seen session. The tracker
@@ -249,17 +377,59 @@ func (h *Hub) reconcile() {
 			watcherActivity, watcherMessage, watcherFresh, watcherExpiredWorking = watcher.snapshot(now)
 		}
 
+		// Pane-anchor approvals (AgentSpec.ApprovalAnchor kinds). For codex/cursor the
+		// dialog reaches no protocol, so the pane is the only evidence that the session is
+		// blocked on the operator.
+		//
+		// This takes its OWN capture, deliberately, instead of reusing the frame the
+		// stability tracker just took: the tracker captures 200 lines of SCROLLBACK too
+		// (the lifecycle classifiers need that history), and scrollback is exactly the
+		// wrong thing to ask "is a modal on screen?" — an answered dialog, or one that was
+		// up when the agent crashed out to a shell, stays in the history verbatim, so an
+		// episode opened off scrollback could never clear. The cost is one extra tmux exec
+		// per anchor-kind session per tick (codex only today), run unlocked like the rest
+		// of the heavy per-session work. A capture failure means NO EVIDENCE, not
+		// "cleared": the episode is held untouched and the next tick decides.
+		paneApproval := tr.paneApproval
+		if anchor := approvalAnchorFor(s.Kind); anchor != nil {
+			if DisplayActivity(s.State, ActivityWorking) == "" {
+				// Blocking lifecycle state (needs-trust / needs-auth / dead). The activity
+				// dimension is suppressed anyway, and a session that DIED mid-dialog resolved
+				// nothing — so an open episode is dropped SILENTLY, with no resolved row. The
+				// state change is what tells the client (session.updated already carries it);
+				// a resolved row would assert an answer that was never given.
+				paneApproval.abandon()
+			} else if vis := captureVisiblePane(h.cfg.runner, s.TmuxSession); vis.Code == 0 {
+				// Exactly ONE pending row per episode (a debounced open transitions once) and
+				// one resolved row on its debounced clear. The ring is self-synchronized, so
+				// this appends while unlocked like the watcher's own drain above.
+				if status, id := paneApproval.observe(anchor.MatchString(vis.Stdout)); status != "" {
+					text := "" // a resolved row has nothing to preview: the dialog is gone
+					if status == approvalStatusPending {
+						text = firstAnchorLine(anchor, vis.Stdout)
+					}
+					// Retained for the duration of the episode: while it is open this REPLACES
+					// the session's last_message (see the merge below), and on the resolved
+					// transition the same assignment clears it.
+					paneApproval.text = text
+					seq := tr.ring.append(paneApprovalRow(id, status, text), now)
+					msgEvents = append(msgEvents, messageAppendedEvent(s.Slug, seq))
+				}
+			}
+		}
+
 		// --- Re-acquire trackMu to commit handler-visible fields. ---
 		h.trackMu.Lock()
 		if newW != nil {
 			tr.watcher = newW
 		}
 		// Only a publishing watcher owns this field: a kind whose approvals are not lane-
-		// derived must keep whatever it holds (nothing today; the pane-anchor kinds populate
-		// it from reconcile in a later commit) rather than be blanked by an unrelated tick.
+		// derived must keep whatever it holds (nothing — the pane-anchor kinds live in the
+		// separate field below) rather than be blanked by an unrelated tick.
 		if publishesApprovals {
 			tr.pendingApprovals = pendingApprovals
 		}
+		tr.paneApproval = paneApproval
 		if capErr == nil {
 			// Remember the raw stability verdict for the input handler's acceptance
 			// re-check (it re-runs the same watcher+stability merge as below).
@@ -272,6 +442,21 @@ func (h *Hub) reconcile() {
 		}
 
 		mergedRaw, mergedMsg := mergedActivity(watcherActivity, watcherMessage, watcherFresh, watcherExpiredWorking, raw)
+		// An open pane-anchor episode OVERRIDES the merge: the dialog owns the session,
+		// and every other signal describes the suspended work underneath it. codex's
+		// rollout in particular still reads `working` (the tool-call record is written
+		// BEFORE the approval gate), and pane stability reads the frozen dialog as idle —
+		// both would be wrong. Lifecycle still trumps this, via DisplayActivity below.
+		//
+		// last_message rides along: the merged preview describes the SUSPENDED tool call,
+		// which pairs with needs_approval to read as "busy running this" precisely when the
+		// session is waiting on the operator. The episode's own summary — the option row —
+		// is what the client should show next to the badge, and it is restored to the
+		// normal merge the moment the episode clears.
+		if paneApproval.pending {
+			mergedRaw = ActivityNeedsApproval
+			mergedMsg = paneApproval.text
+		}
 		eff := DisplayActivity(s.State, mergedRaw)
 		// last_message rides with the activity dimension: a suppressed (blocking
 		// lifecycle) activity drops the message too, per DisplayActivity's contract.

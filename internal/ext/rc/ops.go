@@ -312,10 +312,23 @@ func sessionsForNames(r Runner, names []string, displayFallback func(slug string
 	return sessions
 }
 
-// capturePaneChecked returns a session's pane text, mapping a gone session to
-// ErrSessionNotFound (shared by probe/prompt/accept-trust).
+// capturePaneChecked returns a session's pane text (visible frame + 200 lines of
+// scrollback), mapping a gone session to ErrSessionNotFound (shared by
+// probe/prompt/accept-trust).
 func capturePaneChecked(r Runner, name string) (string, error) {
-	res := capturePane(r, name)
+	return checkedCapture(capturePane(r, name), name)
+}
+
+// captureVisiblePaneChecked is capturePaneChecked's VISIBLE-FRAME twin, with the same
+// error mapping. Used wherever scrollback would be a lie about the present — the
+// ApprovalAnchor evaluations (see captureVisiblePane).
+func captureVisiblePaneChecked(r Runner, name string) (string, error) {
+	return checkedCapture(captureVisiblePane(r, name), name)
+}
+
+// checkedCapture maps a capture-pane Result onto (text, error): a gone session becomes
+// ErrSessionNotFound so callers can tell it from a transient tmux failure.
+func checkedCapture(res Result, name string) (string, error) {
 	if res.Code != 0 {
 		if isMissingSession(res.Stderr) {
 			return "", fmt.Errorf("%w: %s", ErrSessionNotFound, name)

@@ -68,9 +68,25 @@ func createSession(r Runner, name, workdir string, envArgs []string, inner strin
 	return r.Run(args...)
 }
 
-// capturePane returns the last 200 lines of a session's pane.
+// capturePane returns the last 200 lines of a session's pane — the VISIBLE frame plus
+// up to 200 lines of scrollback. Scrollback is what makes lifecycle classification work:
+// a boot banner, a login URL, or the shell prompt an agent exited to has usually
+// scrolled off by the time anyone looks, and the classifiers need to see it.
 func capturePane(r Runner, name string) Result {
 	return r.Run("capture-pane", "-t", name, "-p", "-S", "-200")
+}
+
+// captureVisiblePane returns ONLY what is on screen right now (no -S, so no scrollback).
+//
+// This is the capture that ANY "is a modal on screen?" question must use. Scrollback is
+// history: a TUI's approval dialog that was answered — or that was on screen when the
+// agent crashed out to a shell, or that a resize reflowed out of view — stays in the
+// scrollback verbatim, so an anchor evaluated against `capturePane` can keep reporting a
+// dialog that no longer exists and has no way to ever clear. The visible frame IS the
+// present tense, and a modal that is not in it is not up. Callers that classify
+// lifecycle or diff for stability must keep using capturePane.
+func captureVisiblePane(r Runner, name string) Result {
+	return r.Run("capture-pane", "-t", name, "-p")
 }
 
 // listSessionNames returns the rc-* tmux session names (empty if no server/sessions).

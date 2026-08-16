@@ -50,6 +50,51 @@ Dead [codex-dead.txt = EMPTY]: launched as `bash -ilc codex`, so exit killed the
   tmux session/server. Signal: capture-pane errors / "no server running" / "can't find
   session". No shell-prompt frame (use persistent bash -il to get one).
 
+CODEX APPROVAL OVERLAY (ADAPTED, not live-captured — plan 008 C3)
+-----------------------------------------------------------------
+anchors: ApprovalAnchor = codexApprovalAnchorRe (agents.go) — an option row at column 0
+         followed within 12 lines by the overlay footer.
+Provenance: the codex account's quota was exhausted when these were needed, so the five
+codex-ready-approval-*.txt + codex-ready-tool-running.txt fixtures were ADAPTED from the
+codex repo's COMMITTED TUI snapshots rather than captured from a live pane:
+  ~/projects/codex/codex-rs/tui/src/bottom_pane/snapshots/
+    codex_tui__bottom_pane__approval_overlay__tests__network_exec_prompt.snap
+  ~/projects/codex/codex-rs/tui/src/chatwidget/snapshots/
+    codex_tui__chatwidget__tests__approval_modal_exec.snap
+    codex_tui__chatwidget__tests__approval_modal_patch.snap
+    codex_tui__chatwidget__tests__chatwidget_exec_and_status_layout_vt100_snapshot.snap
+The overlay block in each fixture is byte-faithful to those snapshots; the surrounding
+transcript/banner/composer chrome is the live codex-ready.txt shape, so the file reads
+as a whole 200x50 `tmux capture-pane -p` frame. Re-capture live when quota allows.
+
+Active exec approval [codex-ready-approval-exec.txt] — headline, reason, command, then
+  the option rows and footer (source: approval_overlay.rs, rendered through
+  list_selection_view.rs's `format!("{prefix} {n}. ")` row builder, prefix '›' when
+  selected and ' ' otherwise, plus an optional " (key)" shortcut hint):
+    "  Would you like to run the following command?"
+    "› 1. Yes, proceed (y)"
+    "  3. No, and tell Codex what to do differently (esc)"
+    "  Press enter to confirm or esc to cancel"
+Active network approval [codex-ready-approval-network.txt] — same widget, different
+  labels, and the selection arrowed onto row 4 (proves the anchor does not depend on
+  WHICH row carries the '›'):
+    "  Do you want to approve network access to "example.com"?"
+    "  1. Yes, just this once (y)"  "› 4. No, and tell Codex what to do differently (esc)"
+Post-resolution [codex-ready-approval-resolved.txt] — the SAME session after the
+  operator answered: the option rows and the footer are GONE, but note the headline
+  "Would you like to run the following command?" is STILL on screen (it scrolled into the
+  transcript). That is precisely why the ApprovalAnchor is option-line chrome and not the
+  headline: only the option rows/footer disappear when the dialog is answered.
+Quoted prose [codex-ready-approval-quoted.txt] — an assistant message DESCRIBING the
+  dialog: the headline in prose, a markdown numbered list quoting the option labels at
+  codex's two-space message-body indent. Must NOT match the anchor. It is defeated twice
+  over — the labels are quoted/have prose trailing them, and there is no
+  "Press enter to confirm or esc to cancel" footer.
+Long tool call, no overlay [codex-ready-tool-running.txt] — the negative that matters
+  most: codex's rollout JSONL writes the tool-call record BEFORE the approval gate, so a
+  session blocked on approval and one running a slow tool are byte-identical in the log.
+  Only the pane tells them apart, and this fixture is the "not blocked" side.
+
 OPENCODE (1.17.11)
 ------------------
 Launches straight to ready composer (already authed to a GLM-5.1 Z.AI Coding Plan).

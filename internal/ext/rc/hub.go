@@ -309,11 +309,12 @@ func (h *Hub) handleSessions(w http.ResponseWriter, _ *http.Request) {
 		// sets it): the open-approval snapshot that keeps a session actionable after
 		// the feed ring evicted the rows announcing them. Reconcile republishes
 		// tr.pendingApprovals each tick from the lane that knows its approvals
-		// (opencode today); for every other kind it stays empty and omitempty drops
-		// the field. Copied, never aliased: the response row must not share a slice
-		// with live hub state. An empty snapshot copies to nil, which omitempty
-		// drops — hence no guard.
-		sessions[i].PendingApprovals = copyApprovals(tr.pendingApprovals)
+		// (opencode today) and tracks the pane-anchor kinds' episode separately;
+		// approvalSnapshot unions the two. For a kind with neither it stays empty and
+		// omitempty drops the field. Copied, never aliased: the response row must not
+		// share a slice with live hub state. An empty snapshot copies to nil, which
+		// omitempty drops — hence no guard.
+		sessions[i].PendingApprovals = copyApprovals(tr.approvalSnapshot())
 	}
 	h.trackMu.Unlock()
 	writeJSON(w, http.StatusOK, hubSessionsResponse{Sessions: sessions})
@@ -534,7 +535,25 @@ func (h *Hub) handleInput(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "capture_failed", "pane re-capture failed")
 		return
 	}
-	if !h.inputAccepted(watcher, stability, fresh.Kind, deliverPane) {
+	// The ApprovalAnchor arm needs the VISIBLE frame, not deliverPane's 200 lines of
+	// scrollback: an approval dialog that was already answered stays in the history
+	// verbatim, and gating on that would wedge the session's input permanently. Captured
+	// only for kinds that declare an anchor, and a failure to capture it is fail-CLOSED
+	// (the same posture as every other unresolved question on this path) rather than a
+	// silent "no dialog".
+	var visiblePane string
+	if approvalAnchorFor(fresh.Kind) != nil {
+		visiblePane, err = captureVisiblePaneChecked(h.cfg.runner, name)
+		if err != nil {
+			if errors.Is(err, ErrSessionNotFound) {
+				writeError(w, http.StatusNotFound, "unknown_slug", "rc session is gone")
+				return
+			}
+			writeError(w, http.StatusInternalServerError, "capture_failed", "pane re-capture failed")
+			return
+		}
+	}
+	if !h.inputAccepted(watcher, stability, fresh.Kind, deliverPane, visiblePane) {
 		writeError(w, http.StatusConflict, "not_accepting", "session is not waiting for input")
 		return
 	}
@@ -576,8 +595,15 @@ func (h *Hub) handleInput(w http.ResponseWriter, r *http.Request) {
 //   - the kind's ApprovalAnchor visible on the FRESH pane → reject. Same hole, other
 //     evidence: for kinds whose approval state is derived from the pane rather than
 //     from a lane, the anchor is the only signal, and it must be consulted against the
-//     pane captured for THIS delivery. No kind declares an anchor yet (the field is
-//     nil everywhere until the codex/cursor anchors land), so the arm is inert today.
+//     pane captured for THIS delivery. Live for codex; cursor's anchor joins it. It reads
+//     visiblePane, NOT pane — an anchor must only ever see the visible frame, because a
+//     dialog sitting in scrollback was answered long ago and gating on it would wedge the
+//     session's input forever (see captureVisiblePane). visiblePane is captured only for
+//     anchor-declaring kinds and is "" otherwise, which no anchor matches. Note the arm is
+//     deliberately UNDEBOUNCED, unlike reconcile's needs_approval derivation: a single
+//     frame showing the dialog is enough to refuse a keystroke, because a wrongly-refused
+//     post costs a retry while a wrongly-accepted one answers an approval nobody meant to
+//     give.
 //   - a FRESH watcher needs_input → accept outright (the structured signal is settled
 //     and authoritative; the pane may legitimately not match the anchor).
 //   - anything else (merged idle/unknown, or a stability-derived needs_input whose
@@ -585,7 +611,7 @@ func (h *Hub) handleInput(w http.ResponseWriter, r *http.Request) {
 //     the kind's prompt anchor is visible on the FRESH pane. Requiring the fresh
 //     anchor here is what closes the lookup→lock race — a pane that flipped back to
 //     churning no longer shows the composer and is rejected.
-func (h *Hub) inputAccepted(watcher sessionWatcher, stability Activity, kind Kind, pane string) bool {
+func (h *Hub) inputAccepted(watcher sessionWatcher, stability Activity, kind Kind, pane, visiblePane string) bool {
 	var (
 		watcherAct                   Activity
 		watcherFresh, expiredWorking bool
@@ -601,7 +627,7 @@ func (h *Hub) inputAccepted(watcher sessionWatcher, stability Activity, kind Kin
 	if blocker, ok := watcher.(approvalBlocker); ok && blocker.hasOpenApprovals() {
 		return false
 	}
-	if anchor := approvalAnchorFor(kind); anchor != nil && anchor.MatchString(pane) {
+	if anchor := approvalAnchorFor(kind); anchor != nil && anchor.MatchString(visiblePane) {
 		return false
 	}
 	if watcherFresh && watcherAct == ActivityNeedsInput {
