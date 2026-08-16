@@ -1,13 +1,18 @@
 package rc
 
 import (
+	"bytes"
+	"cmp"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -23,6 +28,13 @@ import (
 const (
 	ocFixtureSID = "ses_07cbd4370ffeF17Wb3Ius82a2g"
 	ocFixtureDir = "/private/tmp/oc-cap-kAr0"
+
+	// ocOtherSID is a SECOND session in the same fake's store — the global-store hazard
+	// made concrete: one embedded server lists (and, on a global route, would answer for)
+	// sessions belonging to other directories/processes. Every WS-B test that needs a
+	// bystander uses this id.
+	ocOtherSID = "ses_07cbd4370ffeOTHERsession9zz"
+	ocOtherDir = "/private/tmp/oc-cap-other"
 )
 
 // ---- fake opencode server (httptest double: /event SSE + REST seed endpoints) ----
@@ -33,6 +45,7 @@ const (
 // starting the watcher; counters are atomic so a test goroutine can observe progress.
 type fakeOpencode struct {
 	ts *httptest.Server
+	t  *testing.T // for the scoping-invariant guard, which FAILS the test from the handler
 
 	eventConns   atomic.Int64 // number of /event connections opened
 	sessionHits  atomic.Int64 // GET /session calls (candidate lookup)
@@ -51,11 +64,34 @@ type fakeOpencode struct {
 	statusStatus   int                                   // non-zero → /session/status replies this status (e.g. 500)
 	questionStatus int                                   // non-zero → /question replies this status (e.g. 500)
 	beforeMessages func(call int64, ctx context.Context) // optional gate at the start of /message (call is 1-based)
+
+	// ---- verb lane (mutations) ----
+	promptStatus     int // non-zero → POST /session/{id}/prompt_async replies this status (default 204)
+	abortStatus      int // non-zero → POST /session/{id}/abort replies this status (default 200)
+	permissionStatus int // non-zero → POST /session/{id}/permissions/{id} replies this (default 200)
+
+	// beforeMutation, when set, runs at the start of every POST (with its path) — a gate a
+	// test uses to hold one verb's upstream call in flight while it drives another.
+	beforeMutation func(path string)
+
+	// pinGuard, when set, is the ONLY opencode session id a MUTATION may address: a POST
+	// to any other session's scoped route — or to a global route at all — fails the test
+	// (see the WS-B invariant guard below).
+	pinGuard string
+	requests []ocRequest // every request, in order (method + path + body)
+}
+
+// ocRequest is one recorded request against the fake.
+type ocRequest struct {
+	method string
+	path   string
+	body   string
 }
 
 func newFakeOpencode(t *testing.T) *fakeOpencode {
 	t.Helper()
 	f := &fakeOpencode{
+		t:              t,
 		sessionBody:    "[]",
 		messagesBody:   "[]",
 		statusBody:     "{}",
@@ -104,8 +140,13 @@ func newFakeOpencode(t *testing.T) *fakeOpencode {
 		_, _ = io.WriteString(w, body)
 	})
 	mux.HandleFunc("/session/", func(w http.ResponseWriter, r *http.Request) {
-		// Subtree: /session/{id}/message is history (a longer /session/status match wins
-		// its exact path). Anything else under /session/ is unknown → 404.
+		// Subtree: the three session-scoped MUTATIONS (POST), plus /session/{id}/message
+		// history (a longer /session/status match wins its exact path). Anything else
+		// under /session/ is unknown → 404.
+		if r.Method == http.MethodPost {
+			f.serveMutation(w, r)
+			return
+		}
 		if strings.HasSuffix(r.URL.Path, "/message") {
 			call := f.messagesHits.Add(1)
 			f.mu.Lock()
@@ -142,9 +183,152 @@ func newFakeOpencode(t *testing.T) *fakeOpencode {
 		}
 		_, _ = io.WriteString(w, body)
 	})
-	f.ts = httptest.NewServer(mux)
+	f.ts = httptest.NewServer(f.recordAndGuard(mux))
 	t.Cleanup(f.ts.Close)
 	return f
+}
+
+// ocScopedMutationRe is the ONLY shape a hub-initiated mutation may take:
+// POST /session/{id}/prompt_async | /abort | /permissions/{permID}. Anything else a POST
+// could reach — the global /permission/{id}/reply and /question/{id}/reply|reject write
+// routes above all — is an invariant violation by construction (WS-B, plan §3.4).
+var ocScopedMutationRe = regexp.MustCompile(`^/session/([^/]+)/(prompt_async|abort|permissions/[^/]+)$`)
+
+// mutationViolation returns why a POST to path breaks the session-scoping invariant
+// ("" when it does not). pin, when non-empty, is the session id the caller is pinned to:
+// a scoped route addressing any OTHER session is just as much a violation as a global
+// one — it steers somebody else's TUI.
+func mutationViolation(path, pin string) string {
+	m := ocScopedMutationRe.FindStringSubmatch(path)
+	if m == nil {
+		return "not a session-scoped mutation route"
+	}
+	if pin != "" && m[1] != pin {
+		return "addressed session " + m[1] + ", not the pinned " + pin
+	}
+	return ""
+}
+
+// recordAndGuard wraps the fake's mux: it records every request (so a test can assert
+// exactly which routes a verb touched) and ENFORCES the mutation-scoping invariant —
+// a violating POST fails the test immediately and is answered 500, so the offending verb
+// can never look successful. Reads are deliberately unguarded: global GETs
+// (/session, /session/status, /permission, /question) are legal for seed/discovery and
+// are pin-filtered client-side.
+func (f *fakeOpencode) recordAndGuard(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+		_ = r.Body.Close()
+		r.Body = io.NopCloser(bytes.NewReader(body))
+
+		f.mu.Lock()
+		f.requests = append(f.requests, ocRequest{method: r.Method, path: r.URL.Path, body: string(body)})
+		pin := f.pinGuard
+		f.mu.Unlock()
+
+		if r.Method == http.MethodPost {
+			if v := mutationViolation(r.URL.Path, pin); v != "" {
+				// Errorf (not Fatalf): this runs on the server's goroutine.
+				f.t.Errorf("session-scoping invariant violated — %s: POST %s", v, r.URL.Path)
+				w.WriteHeader(http.StatusInternalServerError)
+				return
+			}
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// serveMutation answers the three session-scoped verb routes the way live opencode does
+// (prompt_async → 204 empty, abort → 200 `true`, permissions/{id} → 200 `true`), with a
+// per-route status override so a test can drive the upstream-failure branch.
+func (f *fakeOpencode) serveMutation(w http.ResponseWriter, r *http.Request) {
+	f.mu.Lock()
+	prompt, abort, perm := f.promptStatus, f.abortStatus, f.permissionStatus
+	gate := f.beforeMutation
+	f.mu.Unlock()
+	if gate != nil {
+		gate(r.URL.Path)
+	}
+
+	status := http.StatusNotFound
+	switch {
+	case strings.HasSuffix(r.URL.Path, "/prompt_async"):
+		status = cmp.Or(prompt, http.StatusNoContent)
+	case strings.HasSuffix(r.URL.Path, "/abort"):
+		status = cmp.Or(abort, http.StatusOK)
+	case strings.Contains(r.URL.Path, "/permissions/"):
+		status = cmp.Or(perm, http.StatusOK)
+	}
+	w.WriteHeader(status)
+	if status == http.StatusOK {
+		_, _ = io.WriteString(w, "true")
+	}
+}
+
+// paths returns the recorded paths for one method, in order.
+func (f *fakeOpencode) paths(method string) []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var out []string
+	for _, req := range f.requests {
+		if req.method == method {
+			out = append(out, req.path)
+		}
+	}
+	return out
+}
+
+// postPaths returns the recorded POST paths (in order).
+func (f *fakeOpencode) postPaths() []string { return f.paths(http.MethodPost) }
+
+// postBody returns the body of the single recorded POST whose path ends in suffix (or ""
+// when there is none), so a test can assert the exact wire body a verb sent.
+func (f *fakeOpencode) postBody(suffix string) string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, req := range f.requests {
+		if req.method == http.MethodPost && strings.HasSuffix(req.path, suffix) {
+			return req.body
+		}
+	}
+	return ""
+}
+
+// getPaths returns every recorded GET path (in order) — the read side of the invariant:
+// session-scoped GETs must address the pin, global ones are legal and filtered.
+func (f *fakeOpencode) getPaths() []string { return f.paths(http.MethodGet) }
+
+// holdOpenSSE installs the default /event stream — announce server.connected, then hold
+// the connection open until the watcher closes it — unless the test already installed one.
+// The shared default for every test that needs a live-but-quiet transport.
+func (f *fakeOpencode) holdOpenSSE() {
+	if f.onEvent != nil {
+		return
+	}
+	f.onEvent = func(conn int64, w io.Writer, flush func(), ctx context.Context) {
+		writeSSE(w, flush, sseServerConnected)
+		<-ctx.Done()
+	}
+}
+
+// streamAsk installs an /event stream that announces server.connected followed by ONE
+// permission.asked for sid, then holds open — the "session with one pending ask" fixture
+// the approvals verb needs, in a single home rather than re-spelled per test.
+func (f *fakeOpencode) streamAsk(sid, id string) {
+	ask := fmt.Sprintf(
+		`{"type":"permission.asked","properties":{"id":%q,"sessionID":%q,"permission":"bash","patterns":["ls"],"metadata":{"command":"ls -la"}}}`,
+		id, sid)
+	f.onEvent = func(conn int64, w io.Writer, flush func(), ctx context.Context) {
+		writeSSE(w, flush, sseServerConnected)
+		writeSSE(w, flush, ask)
+		<-ctx.Done()
+	}
+}
+
+func (f *fakeOpencode) setPinGuard(id string) {
+	f.mu.Lock()
+	f.pinGuard = id
+	f.mu.Unlock()
 }
 
 func (f *fakeOpencode) port(t *testing.T) int {
@@ -1469,5 +1653,471 @@ func TestOpencodeWatcherSeedHealsPermissionsWithQuestionReadFailing(t *testing.T
 	}
 	if w.hasOpenApprovals() {
 		t.Error("hasOpenApprovals must be false once the ask is retired")
+	}
+}
+
+// ---- WS-B: the session-scoping invariant, adversarially ----
+//
+// The fake's guard (recordAndGuard) fails the test on ANY POST that is not a
+// {pinned}-scoped verb route, so these tests assert the POSITIVE half (the exact routes
+// and bodies each verb uses) while the guard covers the negative half (a global
+// /permission/{id}/reply, a sibling session's route) from underneath every test in the
+// package that ever POSTs.
+
+// pinnedVerbWatcher starts a watcher already pinned (priorID) to sid against a fake whose
+// mutation guard admits ONLY sid, with an /event stream that stays open. sid "" is the
+// UNPINNED case: no prior pin to correlate to, and no id the guard would admit.
+func pinnedVerbWatcher(t *testing.T, f *fakeOpencode, sid string) (*opencodeWatcher, *hubClock) {
+	t.Helper()
+	f.setPinGuard(sid)
+	f.holdOpenSSE()
+	clk := opencodeClock()
+	w := newOpencodeWatcher(f.port(t), ocFixtureDir, sid, clk.now, nil)
+	t.Cleanup(w.close)
+	return w, clk
+}
+
+// (a) Every verb addresses the pinned session's scoped v1 route — and nothing else. The
+// bodies are pinned too: prompt_async's single text part and the permission reply's
+// native vocabulary (allow → once) are the wire contract with opencode.
+func TestOpencodeVerbsUseOnlyPinnedSessionRoutes(t *testing.T) {
+	f := newFakeOpencode(t)
+	w, _ := pinnedVerbWatcher(t, f, ocFixtureSID)
+
+	turnID, err := w.startTurn(context.Background(), "run the tests")
+	if err != nil {
+		t.Fatalf("startTurn: %v", err)
+	}
+	if !strings.HasPrefix(turnID, "oc-") || len(turnID) <= len("oc-") {
+		t.Errorf("turn id = %q, want a non-empty hub-generated handle", turnID)
+	}
+	if err := w.interruptTurn(context.Background()); err != nil {
+		t.Fatalf("interruptTurn: %v", err)
+	}
+	if err := w.resolveApproval(context.Background(), "per_1", approvalDecisionAllow); err != nil {
+		t.Fatalf("resolveApproval: %v", err)
+	}
+
+	want := []string{
+		"/session/" + ocFixtureSID + "/prompt_async",
+		"/session/" + ocFixtureSID + "/abort",
+		"/session/" + ocFixtureSID + "/permissions/per_1",
+	}
+	if got := f.postPaths(); !slices.Equal(got, want) {
+		t.Fatalf("POST paths = %v, want %v", got, want)
+	}
+	if body := f.postBody("/prompt_async"); body != `{"parts":[{"type":"text","text":"run the tests"}]}` {
+		t.Errorf("prompt_async body = %s, want the single text part", body)
+	}
+	if body := f.postBody("/permissions/per_1"); body != `{"response":"once"}` {
+		t.Errorf("permission reply body = %s, want the native `once` reply for allow", body)
+	}
+}
+
+// The decision mapping in full, each answered on the pinned session's scoped route.
+func TestOpencodeResolveApprovalDecisionMapping(t *testing.T) {
+	cases := []struct{ decision, reply string }{
+		{approvalDecisionAllow, "once"},
+		{approvalDecisionAllowAlways, "always"},
+		{approvalDecisionDeny, "reject"},
+	}
+	for _, c := range cases {
+		t.Run(c.decision, func(t *testing.T) {
+			f := newFakeOpencode(t)
+			w, _ := pinnedVerbWatcher(t, f, ocFixtureSID)
+			if err := w.resolveApproval(context.Background(), "per_"+c.reply, c.decision); err != nil {
+				t.Fatalf("resolveApproval: %v", err)
+			}
+			if body := f.postBody("/permissions/per_" + c.reply); body != `{"response":"`+c.reply+`"}` {
+				t.Fatalf("%s → body %s, want response %q", c.decision, body, c.reply)
+			}
+		})
+	}
+	// An out-of-enum decision never reaches the wire (the handler 400s first; this is the
+	// belt-and-braces half).
+	f := newFakeOpencode(t)
+	w, _ := pinnedVerbWatcher(t, f, ocFixtureSID)
+	if err := w.resolveApproval(context.Background(), "per_1", "maybe"); err == nil {
+		t.Error("an unmapped decision must error, not POST a guess")
+	}
+	if got := f.postPaths(); len(got) != 0 {
+		t.Errorf("unmapped decision produced POSTs %v, want none", got)
+	}
+}
+
+// (b) Two rc sessions pinned to two different opencode sessions in the SAME store: verbs
+// on one leave the other completely untouched. This is the global-store hazard in
+// miniature — the thing a global write route would get wrong.
+func TestOpencodeVerbsLeaveOtherSessionUntouched(t *testing.T) {
+	f := newFakeOpencode(t)
+	f.sessionBody = fmt.Sprintf(`[{"id":%q,"directory":%q,"parentID":""},{"id":%q,"directory":%q,"parentID":""}]`,
+		ocFixtureSID, ocFixtureDir, ocOtherSID, ocOtherDir)
+	f.holdOpenSSE()
+	clk := opencodeClock()
+	// Both watchers speak to the same embedded server; each is pinned to its own session.
+	a := newOpencodeWatcher(f.port(t), ocFixtureDir, ocFixtureSID, clk.now, nil)
+	t.Cleanup(a.close)
+	b := newOpencodeWatcher(f.port(t), ocOtherDir, ocOtherSID, clk.now, nil)
+	t.Cleanup(b.close)
+	// No pinGuard here (both ids are legitimate for SOME watcher) — the assertion is that
+	// A's verbs produced no traffic addressed to B.
+	f.setPinGuard("")
+
+	if _, err := a.startTurn(context.Background(), "steer A"); err != nil {
+		t.Fatalf("startTurn: %v", err)
+	}
+	if err := a.interruptTurn(context.Background()); err != nil {
+		t.Fatalf("interruptTurn: %v", err)
+	}
+	if err := a.resolveApproval(context.Background(), "per_a", approvalDecisionDeny); err != nil {
+		t.Fatalf("resolveApproval: %v", err)
+	}
+
+	for _, p := range f.postPaths() {
+		if !strings.HasPrefix(p, "/session/"+ocFixtureSID+"/") {
+			t.Errorf("verb on session A touched %s — every mutation must be A-scoped", p)
+		}
+	}
+	if got := len(f.postPaths()); got != 3 {
+		t.Errorf("POSTs = %d, want exactly the 3 A-scoped verb calls", got)
+	}
+}
+
+// (c) A verb on an UNPINNED watcher is a typed 409-shaped rejection with ZERO HTTP
+// requests: the hub never guesses "the newest session" for an uncorrelated TUI.
+func TestOpencodeVerbsUnpinnedRejectWithoutRequest(t *testing.T) {
+	f := newFakeOpencode(t) // empty store: no candidate to follow, so the pin stays ""
+	w, _ := pinnedVerbWatcher(t, f, "")
+
+	if _, err := w.startTurn(context.Background(), "hi"); !errors.Is(err, errNoAgentSession) {
+		t.Errorf("startTurn on an unpinned watcher = %v, want errNoAgentSession", err)
+	}
+	if err := w.interruptTurn(context.Background()); !errors.Is(err, errNoAgentSession) {
+		t.Errorf("interruptTurn on an unpinned watcher = %v, want errNoAgentSession", err)
+	}
+	if err := w.resolveApproval(context.Background(), "per_1", approvalDecisionAllow); !errors.Is(err, errNoAgentSession) {
+		t.Errorf("resolveApproval on an unpinned watcher = %v, want errNoAgentSession", err)
+	}
+	if got := f.postPaths(); len(got) != 0 {
+		t.Errorf("unpinned verbs sent %v, want no request at all", got)
+	}
+}
+
+// A CLOSED watcher is gone, not unpinned: the verbs report the closed sentinel (which the
+// handler maps to the same retryable 409) and send nothing.
+func TestOpencodeVerbsOnClosedWatcher(t *testing.T) {
+	f := newFakeOpencode(t)
+	w, _ := pinnedVerbWatcher(t, f, ocFixtureSID)
+	w.close()
+
+	if _, err := w.startTurn(context.Background(), "hi"); !errors.Is(err, errWatcherClosed) {
+		t.Errorf("startTurn on a closed watcher = %v, want errWatcherClosed", err)
+	}
+	if err := w.interruptTurn(context.Background()); !errors.Is(err, errWatcherClosed) {
+		t.Errorf("interruptTurn on a closed watcher = %v, want errWatcherClosed", err)
+	}
+	if got := f.postPaths(); len(got) != 0 {
+		t.Errorf("closed-watcher verbs sent %v, want nothing", got)
+	}
+}
+
+// An upstream non-2xx surfaces as an error (the handler's 409 not_accepting) rather than
+// a silent success — the verb must never report a steer that did not land.
+func TestOpencodeVerbsUpstreamFailure(t *testing.T) {
+	f := newFakeOpencode(t)
+	f.promptStatus = http.StatusInternalServerError
+	f.abortStatus = http.StatusInternalServerError
+	f.permissionStatus = http.StatusInternalServerError
+	w, _ := pinnedVerbWatcher(t, f, ocFixtureSID)
+
+	if _, err := w.startTurn(context.Background(), "hi"); err == nil {
+		t.Error("a 500 from prompt_async must surface as an error")
+	}
+	if err := w.interruptTurn(context.Background()); err == nil {
+		t.Error("a 500 from abort must surface as an error")
+	}
+	if err := w.resolveApproval(context.Background(), "per_1", approvalDecisionAllow); err == nil {
+		t.Error("a 500 from the permission reply must surface as an error")
+	}
+}
+
+// The IDLE-ABORT mapping, pinned: opencode answers an abort on an idle session
+// successfully (200 `true`), and the lane PASSES THAT THROUGH — the hub does not
+// second-guess the lane with a fabricated "no active turn" rejection.
+func TestOpencodeInterruptIdleSessionSucceeds(t *testing.T) {
+	f := newFakeOpencode(t)
+	f.statusBody = "{}" // idle: the pinned id is absent from the status map
+	w, clk := pinnedVerbWatcher(t, f, ocFixtureSID)
+
+	refreshUntil(t, w, clk, nil, "the session settles idle", func() bool {
+		act, _, _, _ := w.snapshot(clk.now())
+		return act == ActivityNeedsInput
+	})
+	if err := w.interruptTurn(context.Background()); err != nil {
+		t.Fatalf("interrupt on an idle session = %v, want success (200 passthrough)", err)
+	}
+	if got := f.postPaths(); len(got) != 1 || got[0] != "/session/"+ocFixtureSID+"/abort" {
+		t.Fatalf("POST paths = %v, want the pinned session's abort", got)
+	}
+}
+
+// (d) The READ side of the invariant, pinned as part of it: global GETs are legal for
+// seed/discovery (and are used), every SESSION-SCOPED GET addresses the pin, and the
+// global lists are filtered to the pin client-side — another session's open permission
+// never enters this watcher's fold.
+func TestOpencodeSeedGETsArePinFiltered(t *testing.T) {
+	f := newFakeOpencode(t)
+	f.statusBody = fmt.Sprintf(`{%q:{"type":"busy"}}`, ocFixtureSID)
+	f.permissionBody = fmt.Sprintf(
+		`[{"id":"per_mine","sessionID":%q,"permission":"bash","patterns":["ls"]},`+
+			`{"id":"per_theirs","sessionID":%q,"permission":"edit","patterns":["x.go"]}]`, ocFixtureSID, ocOtherSID)
+	f.questionBody = fmt.Sprintf(`[{"id":"que_theirs","sessionID":%q,"questions":[{"header":"Which file?"}]}]`, ocOtherSID)
+	w, clk := pinnedVerbWatcher(t, f, ocFixtureSID)
+
+	refreshUntil(t, w, clk, nil, "the seed folds the pinned session's ask", func() bool {
+		act, _, _, _ := w.snapshot(clk.now())
+		return act == ActivityNeedsApproval
+	})
+
+	if pend := w.pendingApprovals(); len(pend) != 1 || pend[0].ID != "per_mine" {
+		t.Fatalf("pendingApprovals = %+v, want only the pinned session's ask", pend)
+	}
+	if _, _, ok := w.approvalState("per_theirs"); ok {
+		t.Error("another session's permission entered the fold — the global GET must be pin-filtered")
+	}
+	if !w.hasOpenApprovals() {
+		t.Error("the pinned session's own ask must still block")
+	}
+
+	gets := f.getPaths()
+	var sawGlobal bool
+	for _, p := range gets {
+		if p == "/permission" || p == "/question" || p == "/session/status" {
+			sawGlobal = true // legal: discovery/seed reads, filtered above
+			continue
+		}
+		if strings.HasPrefix(p, "/session/") && !strings.HasPrefix(p, "/session/"+ocFixtureSID+"/") {
+			t.Errorf("session-scoped GET %s addresses a session other than the pin", p)
+		}
+	}
+	if !sawGlobal {
+		t.Errorf("expected the seed to use the global discovery GETs; saw %v", gets)
+	}
+}
+
+// ---- pin hardening: a pin must be a single safe path segment ----
+
+// ocMalformedPins are the shapes that would ESCAPE the session-scoped route if they were
+// ever interpolated into a URL: traversal, an embedded segment, a query/fragment splice,
+// whitespace, and an over-long value.
+var ocMalformedPins = []string{
+	"ses_A/../../session/VICTIM",
+	"ses_A/x",
+	"ses_A?scope=project",
+	"ses_A#frag",
+	"ses A",
+	"ses_A%2fVICTIM",
+	"../ses_A",
+	strings.Repeat("s", 300),
+}
+
+// A prior back-write (SHED_RC_AGENT_SESSION — guest-writable tmux env) that is not a safe
+// path segment is DISCARDED: the watcher behaves as UNPINNED, so verbs reject with the
+// no-agent-session sentinel and nothing is ever POSTed. Invariant hardening — an in-guest
+// process can reach the port directly, but a request arriving over the server proxy must
+// never be steerable onto another session.
+func TestOpencodeWatcherRejectsMalformedPriorPin(t *testing.T) {
+	for _, bad := range ocMalformedPins {
+		t.Run(strconv.Quote(bad), func(t *testing.T) {
+			f := newFakeOpencode(t)
+			f.onEvent = func(conn int64, w io.Writer, flush func(), ctx context.Context) {
+				writeSSE(w, flush, sseServerConnected)
+				<-ctx.Done()
+			}
+			clk := opencodeClock()
+			w := newOpencodeWatcher(f.port(t), ocFixtureDir, bad, clk.now, nil)
+			t.Cleanup(w.close)
+
+			if got := w.getPinned(); got != "" {
+				t.Fatalf("pinned = %q, want \"\" (a malformed pin is no pin)", got)
+			}
+			if _, err := w.startTurn(context.Background(), "hi"); !errors.Is(err, errNoAgentSession) {
+				t.Errorf("startTurn = %v, want errNoAgentSession", err)
+			}
+			if err := w.resolveApproval(context.Background(), "per_1", approvalDecisionAllow); !errors.Is(err, errNoAgentSession) {
+				t.Errorf("resolveApproval = %v, want errNoAgentSession", err)
+			}
+			if got := f.postPaths(); len(got) != 0 {
+				t.Errorf("a malformed pin produced requests %v, want none", got)
+			}
+		})
+	}
+}
+
+// The same rule on the DISCOVERY path: a session.created carrying a malformed id (a
+// hostile or corrupt embedded server) is not a pin — the watcher keeps searching, never
+// back-writes it, and stays unaddressable. A well-formed id on the same stream still pins,
+// so the guard rejects the value, not the path.
+func TestOpencodeWatcherRejectsMalformedDiscoveredPin(t *testing.T) {
+	f := newFakeOpencode(t)
+	f.statusBody = fmt.Sprintf(`{%q:{"type":"busy"}}`, ocFixtureSID)
+	release := make(chan struct{})
+	f.onEvent = func(conn int64, w io.Writer, flush func(), ctx context.Context) {
+		writeSSE(w, flush, sseServerConnected)
+		writeSSE(w, flush, fmt.Sprintf(
+			`{"type":"session.created","properties":{"sessionID":"evil","info":{"id":"ses_A/../../session/VICTIM","directory":%q,"parentID":""}}}`, ocFixtureDir))
+		<-release
+		writeSSE(w, flush, fmt.Sprintf(
+			`{"type":"session.created","properties":{"sessionID":%q,"info":{"id":%q,"directory":%q,"parentID":""}}}`,
+			ocFixtureSID, ocFixtureSID, ocFixtureDir))
+		<-ctx.Done()
+	}
+	clk := opencodeClock()
+	w := newOpencodeWatcher(f.port(t), ocFixtureDir, "", clk.now, nil)
+	t.Cleanup(w.close)
+
+	for i := 0; i < 20; i++ {
+		w.refresh(clk.now())
+		if got := w.getPinned(); got != "" {
+			t.Fatalf("pinned = %q on a malformed session.created, want no pin", got)
+		}
+		if got := w.drainConfirmedAgentID(); got != "" {
+			t.Fatalf("back-wrote a malformed id: %q", got)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	close(release)
+	pollUntil(t, "the well-formed id still pins", func() bool { return w.getPinned() == ocFixtureSID })
+}
+
+// The SECOND layer, independent of the shape check: every interpolated segment is escaped,
+// so even a value that somehow reached the builder stays ONE segment. Pinned on the
+// builder directly because the validated pin can no longer carry such a value — and
+// because the approval id (whose grammar admits "." and ":") reaches it from the request
+// path.
+func TestOpencodeSessionPathEscapesEverySegment(t *testing.T) {
+	if got, want := ocSessionPath("ses_A/../victim", "permissions", "per/../x"),
+		"/session/ses_A%2F..%2Fvictim/permissions/per%2F..%2Fx"; got != want {
+		t.Errorf("ocSessionPath = %q, want %q", got, want)
+	}
+	// The ordinary shapes are untouched (an escaped path must still be the real route).
+	if got, want := ocSessionPath(ocFixtureSID, "prompt_async"), "/session/"+ocFixtureSID+"/prompt_async"; got != want {
+		t.Errorf("ocSessionPath = %q, want %q", got, want)
+	}
+	if got, want := ocSessionPath(ocFixtureSID, "permissions", "per_01HQ8Z3K.tool:2"),
+		"/session/"+ocFixtureSID+"/permissions/per_01HQ8Z3K.tool:2"; got != want {
+		t.Errorf("ocSessionPath = %q, want %q", got, want)
+	}
+}
+
+// validOpencodeSessionID is the shape rule itself: real ids pass, anything that is not a
+// single unreserved segment fails.
+func TestValidOpencodeSessionID(t *testing.T) {
+	for _, ok := range []string{ocFixtureSID, "ses_07cbd4370ffeF17Wb3Ius82a2g", "abc-123_XYZ", "9"} {
+		if !validOpencodeSessionID(ok) {
+			t.Errorf("validOpencodeSessionID(%q) = false, want true", ok)
+		}
+	}
+	bad := append([]string{"", "ses.A", "ses:A", "ses/A", "."}, ocMalformedPins...)
+	for _, b := range bad {
+		if validOpencodeSessionID(b) {
+			t.Errorf("validOpencodeSessionID(%q) = true, want false", b)
+		}
+	}
+}
+
+// ---- the resolution claim: one upstream POST per ask, ever ----
+
+// Two concurrent resolves of the SAME id: the claim makes the check-then-act atomic, so
+// exactly one request POSTs upstream and the other is told the resolution is in flight.
+// Deterministic — the fake holds the first POST in a gate while the second runs.
+func TestOpencodeApprovalClaimSerializesConcurrentResolves(t *testing.T) {
+	f := newFakeOpencode(t)
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	f.beforeMutation = func(path string) {
+		close(entered)
+		<-release // hold the upstream call open while the racing request runs
+	}
+	w, clk := pinnedVerbWatcher(t, f, ocFixtureSID)
+	// Fold one pending ask through the (fake) stream so the claim has something to take.
+	w.mu.Lock()
+	w.fold.applyLine([]byte(fmt.Sprintf(
+		`{"type":"permission.asked","properties":{"id":"per_1","sessionID":%q,"permission":"bash","patterns":["ls"]}}`, ocFixtureSID)))
+	w.mu.Unlock()
+	_ = clk
+
+	if got := w.claimApproval("per_1", approvalDecisionAllow); got != approvalClaimed {
+		t.Fatalf("first claim = %v, want approvalClaimed", got)
+	}
+	done := make(chan error, 1)
+	go func() { done <- w.resolveApproval(context.Background(), "per_1", approvalDecisionAllow) }()
+	<-entered
+
+	// While the first resolve is in flight, a second request cannot claim (and therefore
+	// cannot POST).
+	if got := w.claimApproval("per_1", approvalDecisionAllow); got != approvalClaimBusy {
+		t.Fatalf("concurrent claim = %v, want approvalClaimBusy (same decision included)", got)
+	}
+	if got := w.claimApproval("per_1", approvalDecisionDeny); got != approvalClaimBusy {
+		t.Fatalf("concurrent conflicting claim = %v, want approvalClaimBusy", got)
+	}
+
+	close(release)
+	if err := <-done; err != nil {
+		t.Fatalf("resolveApproval: %v", err)
+	}
+	if got := w.commitApproval("per_1", approvalDecisionAllow); got != approvalDecisionAllow {
+		t.Fatalf("commitApproval = %q, want the recorded decision %q", got, approvalDecisionAllow)
+	}
+	// Post-commit the ask is settled, so a further claim reports settled (never busy —
+	// the claim was consumed) and the handler answers from the recorded state.
+	if got := w.claimApproval("per_1", approvalDecisionAllow); got != approvalClaimSettled {
+		t.Fatalf("post-commit claim = %v, want approvalClaimSettled", got)
+	}
+	if got := f.postPaths(); len(got) != 1 {
+		t.Fatalf("upstream POSTs = %v, want exactly one", got)
+	}
+}
+
+// A released claim (the upstream write failed) leaves the ask answerable again — a failed
+// POST resolved nothing, so the operator or a retry must still be able to take it.
+func TestOpencodeApprovalClaimReleasedOnFailure(t *testing.T) {
+	f := newFakeOpencode(t)
+	w, _ := pinnedVerbWatcher(t, f, ocFixtureSID)
+	w.mu.Lock()
+	w.fold.applyLine([]byte(fmt.Sprintf(
+		`{"type":"permission.asked","properties":{"id":"per_1","sessionID":%q,"permission":"bash","patterns":["ls"]}}`, ocFixtureSID)))
+	w.mu.Unlock()
+
+	if got := w.claimApproval("per_1", approvalDecisionAllow); got != approvalClaimed {
+		t.Fatalf("claim = %v, want approvalClaimed", got)
+	}
+	w.releaseApproval("per_1")
+	if got := w.claimApproval("per_1", approvalDecisionDeny); got != approvalClaimed {
+		t.Fatalf("claim after release = %v, want approvalClaimed", got)
+	}
+	if status, _, ok := w.approvalState("per_1"); !ok || status != approvalStatusPending {
+		t.Errorf("approvalState = (%q,%v), want it still pending after a released claim", status, ok)
+	}
+}
+
+// The stream wins a race it lands first: opencode's own permission.replied resolving the
+// id before the commit means the FOLD's decision is the truth, and commitApproval reports
+// that recorded value rather than the caller's.
+func TestOpencodeCommitApprovalReportsTheRecordedDecision(t *testing.T) {
+	f := newFakeOpencode(t)
+	w, _ := pinnedVerbWatcher(t, f, ocFixtureSID)
+	w.mu.Lock()
+	w.fold.applyLine([]byte(fmt.Sprintf(
+		`{"type":"permission.asked","properties":{"id":"per_1","sessionID":%q,"permission":"bash","patterns":["ls"]}}`, ocFixtureSID)))
+	// The stream's reply lands first, recording allow_always ("always").
+	w.fold.applyLine([]byte(fmt.Sprintf(
+		`{"type":"permission.replied","properties":{"sessionID":%q,"requestID":"per_1","reply":"always"}}`, ocFixtureSID)))
+	w.mu.Unlock()
+
+	if got := w.commitApproval("per_1", approvalDecisionAllow); got != approvalDecisionAllowAlways {
+		t.Fatalf("commitApproval = %q, want the stream-recorded %q", got, approvalDecisionAllowAlways)
 	}
 }

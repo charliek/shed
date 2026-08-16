@@ -287,6 +287,16 @@ final class RCBinaryTests: XCTestCase {
         XCTAssertFalse(codex.interrupt)
         XCTAssertEqual(codex.attachKind, "tmux")
 
+        // opencode is the first LIVE lane (its embedded server takes whole turns,
+        // interrupts and approvals through the hub), so its row diverges from codex's
+        // deliberately: input "turn" supersedes "gated" and approvals are "remote".
+        let opencode = try XCTUnwrap(caps.kindFeatures["opencode"])
+        XCTAssertEqual(opencode.feed, "messages")
+        XCTAssertEqual(opencode.input, "turn")
+        XCTAssertEqual(opencode.approvals, "remote")
+        XCTAssertTrue(opencode.interrupt)
+        XCTAssertEqual(opencode.attachKind, "tmux")
+
         let full = dtos[0]
         XCTAssertEqual(full.kind, .claudeRc)
         XCTAssertEqual(full.state, .ready)

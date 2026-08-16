@@ -117,7 +117,7 @@ func (h *Hub) newTrackedSession(s Session) *trackedSession {
 
 // sameIdentity reports whether s is still the session this tracker state was built
 // for (see the id/createdAt doc on trackedSession). Kind participates because the
-// tracked kind is what the verb handlers authorize against (verbFeatures): a legacy
+// tracked kind is what the verb handlers authorize against (verbTarget): a legacy
 // session with empty id/created_at recreated at the same slug as a DIFFERENT kind
 // would otherwise keep the old incarnation's kind — outcome-neutral while every verb
 // rejects, an authorization bug the day one kind advertises a verb.

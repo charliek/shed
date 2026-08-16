@@ -405,13 +405,17 @@ pub struct RcAgentInfo {
 /// Per-kind UI hints from [`RcCapabilities::kind_features`]. Mirrors the guest's
 /// `rc.KindFeatures` and mobile's `KindFeatures` (`rc_capabilities.dart:116-144`):
 /// `post_input` reports whether a typed line reaches the pane, `approvals` is
-/// where approvals surface (v1 agents are TUI-only → `"tui"`).
+/// where approvals surface (`"tui"` — answered in the terminal; `"remote"` —
+/// answered through the hub's `POST /approvals/{id}` verb, opencode today).
 ///
-/// `watch` and `input` are additive hub hints (codex-only in this phase; absent
-/// → `false` / `""`): `watch` reports whether the hub produces a live message
-/// feed for the kind (`GET /messages` + `message.appended`), and `input` is the
-/// feed-input posting **mode string** — `"gated"` means `POST /input` is
-/// accepted only while the session is waiting, `""` means no feed input. Note
+/// `watch` and `input` are additive hub hints (the feed kinds — codex and
+/// opencode — carry them; absent → `false` / `""`): `watch` reports whether the
+/// hub produces a live message feed for the kind (`GET /messages` +
+/// `message.appended`), and `input` is the feed-input posting **mode string**,
+/// single-valued — `"gated"` means `POST /input` is accepted only while the
+/// session is waiting, `"turn"` means the lane takes whole turns through `POST
+/// /turn` (and `/input` no longer applies — opencode today), `""` means no feed
+/// input at all. Note
 /// the distinction from the adjacent `post_input`: `post_input` is the
 /// typed-input *capability* bool (a typed line reaches the pane over the
 /// TUI-only path), while `input` is the *gating mode* of the separate feed-input
@@ -420,8 +424,8 @@ pub struct RcAgentInfo {
 /// Contract v2 adds three more (again serde-default, so a v1/v3 payload decodes
 /// unchanged): `feed` is what the hub can stream for the kind (`"messages"` — a
 /// normalized conversation feed; `"activity"` — the activity dimension only;
-/// `"none"`), `interrupt` reports the `turn/interrupt` verb (false for every kind
-/// in this phase), and `attach` is how a terminal reaches the session (`"tmux"`,
+/// `"none"`), `interrupt` reports the `turn/interrupt` verb (true for opencode,
+/// false elsewhere), and `attach` is how a terminal reaches the session (`"tmux"`,
 /// `"native-remote"`, `"none"`). **`watch` is DEPRECATED by `feed`** — the guest
 /// holds `watch == (feed == "messages")` in lockstep (invariant-tested on the
 /// producer side) until every client reads `feed`, so the two can be trusted to
@@ -2102,6 +2106,17 @@ mod tests {
         assert_eq!(codex.attach_kind(), ATTACH_TMUX);
         assert!(codex.watch); // held in lockstep with feed == "messages"
         assert!(codex.input_gated());
+        // opencode is the first LIVE lane: whole turns, interrupt and remotely
+        // answerable approvals all go through the hub's verbs, so its row diverges
+        // from codex's on purpose (input "turn" supersedes "gated" — the single
+        // input field is one-of, so `/input` no longer applies to the kind).
+        let opencode = &caps.kind_features["opencode"];
+        assert_eq!(opencode.feed, "messages");
+        assert_eq!(opencode.input, "turn");
+        assert!(!opencode.input_gated());
+        assert_eq!(opencode.approvals, "remote");
+        assert!(opencode.interrupt);
+        assert_eq!(opencode.attach_kind(), ATTACH_TMUX);
         // A kind with the activity dimension only: no message feed, still tmux.
         let claude = &caps.kind_features["claude-rc"];
         assert_eq!(claude.feed, "activity");

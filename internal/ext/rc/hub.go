@@ -488,9 +488,12 @@ func (h *Hub) handleInput(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusConflict, "not_accepting", "session was recreated")
 		return
 	}
-	// Feed input is codex- and opencode-only in this phase (kind_features.input ==
-	// "gated").
-	if !inputGatedKind(fresh.Kind) {
+	// The gated feed-input surface is DERIVED from the kind's advertised row rather
+	// than from a second hardcoded list: kind_features.input is single-valued, so a
+	// kind that graduates to a whole-turn lane ("turn" — opencode) stops accepting
+	// /input in the same edit that flips its row, and the capability a client reads can
+	// never disagree with the gate it hits.
+	if kindFeatureRow(fresh.Kind).Input != inputModeGated {
 		writeError(w, http.StatusConflict, "not_accepting", "this kind does not accept feed input")
 		return
 	}

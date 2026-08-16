@@ -275,21 +275,25 @@ func TestHubInputIdentityGuardIs409(t *testing.T) {
 	}
 }
 
-// opencode is input-gated (kind_features.input == "gated"), but gating alone doesn't
-// accept: with no recorded SHED_RC_OPENCODE_PORT this session has no correlated
-// watcher, and its pane doesn't match the opencode prompt anchor (a bare "opencode
-// ready" string, not the composer placeholder or footer) — so the degraded-path
-// fallback rejects it.
-func TestHubInputUngatedPaneAnchorMismatchIs409(t *testing.T) {
+// The opencode /input BEHAVIOR BREAK, pinned: opencode's row moved to input "turn"
+// (whole turns through POST /v1/sessions/{slug}/turn), and `input` is single-valued —
+// so /input no longer applies to the kind at all. It 409s on a pane that DOES match the
+// opencode composer anchor, i.e. the rejection can only be the kind gate itself, and it
+// is final for every opencode session regardless of activity. codex stays gated (its
+// happy path above is the counterpart pin).
+func TestHubInputOpencodeNotGatedAfterTurnFlip(t *testing.T) {
 	f := newHubTmux()
 	clk := &hubClock{t: time.Unix(1_700_000_000, 0).UTC()}
-	f.set("rc-ng111", "opencode ready", managedEnv("id-ng", KindOpencode))
+	f.set("rc-ng111", opencodeReadyPane(), managedEnv("id-ng", KindOpencode))
 	_, srv := newInputHub(t, f, clk)
 
 	resp := postInput(t, srv.URL+"/v1/sessions/ng111/input", `{"text":"hi"}`)
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusConflict {
-		t.Fatalf("uncorrelated opencode session, anchor mismatch, status = %d, want 409", resp.StatusCode)
+		t.Fatalf("opencode /input status = %d, want 409 (the kind is no longer gated)", resp.StatusCode)
+	}
+	if body := readAll(t, resp); !strings.Contains(body, "does not accept feed input") {
+		t.Errorf("rejection = %s, want the kind-gate message (not an activity rejection)", body)
 	}
 }
 

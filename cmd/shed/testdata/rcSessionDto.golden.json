@@ -40,7 +40,7 @@
     "kind_features": {
       "claude-rc": { "post_input": true, "approvals": "tui", "feed": "activity", "interrupt": false, "attach": "tmux" },
       "codex": { "post_input": true, "approvals": "tui", "watch": true, "input": "gated", "feed": "messages", "interrupt": false, "attach": "tmux" },
-      "opencode": { "post_input": true, "approvals": "tui", "watch": true, "input": "gated", "feed": "messages", "interrupt": false, "attach": "tmux" },
+      "opencode": { "post_input": true, "approvals": "remote", "watch": true, "input": "turn", "feed": "messages", "interrupt": true, "attach": "tmux" },
       "cursor": { "post_input": true, "approvals": "tui", "feed": "activity", "interrupt": false, "attach": "tmux" }
     }
   }

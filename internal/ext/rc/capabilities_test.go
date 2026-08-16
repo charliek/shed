@@ -12,12 +12,13 @@ import (
 
 // TestKindFeatures pins the NORMATIVE per-kind matrix exhaustively — every field of
 // every kind kindFeatures() carries an entry for, plus the deliberate omission of
-// claude-broker and shell. codex and opencode light up the message feed + gated input
-// (their watchers, watch_codex.go / watch_opencode.go, fold a normalized feed and
-// gate input on the composer anchor); claude-rc and cursor carry the activity feed
-// only (the stability/transcript engines derive activity for them, but no message
-// feed exists). Every kind is a TUI lane: approvals on the pane, attach over tmux, no
-// interrupt verb in this phase.
+// claude-broker and shell. codex and opencode light up the message feed (their
+// watchers, watch_codex.go / watch_opencode.go, fold a normalized feed); claude-rc and
+// cursor carry the activity feed only (the stability/transcript engines derive activity
+// for them, but no message feed exists). OPENCODE is the live lane: its embedded
+// HTTP+SSE server takes whole turns, interrupts and approvals through the hub, so its
+// row alone reads input "turn" / approvals "remote" / interrupt true. Every other kind
+// is TUI-lane: approvals on the pane, no interrupt verb, gated line input at most.
 func TestKindFeatures(t *testing.T) {
 	kf := kindFeatures()
 
@@ -27,7 +28,7 @@ func TestKindFeatures(t *testing.T) {
 	}{
 		{KindClaudeRC, KindFeatures{PostInput: true, Approvals: "tui", Watch: false, Input: "", Feed: "activity", Interrupt: false, Attach: "tmux"}},
 		{KindCodex, KindFeatures{PostInput: true, Approvals: "tui", Watch: true, Input: "gated", Feed: "messages", Interrupt: false, Attach: "tmux"}},
-		{KindOpencode, KindFeatures{PostInput: true, Approvals: "tui", Watch: true, Input: "gated", Feed: "messages", Interrupt: false, Attach: "tmux"}},
+		{KindOpencode, KindFeatures{PostInput: true, Approvals: "remote", Watch: true, Input: "turn", Feed: "messages", Interrupt: true, Attach: "tmux"}},
 		{KindCursor, KindFeatures{PostInput: true, Approvals: "tui", Watch: false, Input: "", Feed: "activity", Interrupt: false, Attach: "tmux"}},
 	}
 	for _, c := range cases {
@@ -57,12 +58,12 @@ func TestKindFeatures(t *testing.T) {
 		t.Errorf("kind_features has %d rows, want exactly the %d pinned above", len(kf), len(cases))
 	}
 
-	// opencode must carry the IDENTICAL shape as codex (parity is the point of the
-	// feed work) — guard against a future edit that special-cases one kind and drifts
-	// the other.
-	if oc, codex := kf[KindOpencode], kf[KindCodex]; oc != codex {
-		t.Errorf("KindOpencode features %+v != KindCodex features %+v, want parity", oc, codex)
-	}
+	// There was a codex==opencode PARITY assertion here through plan 007: while both
+	// kinds were feed+gated-input TUI sessions, drift between them was a bug. The
+	// divergence is now INTENTIONAL — opencode's embedded server makes it the first
+	// live lane (turn/interrupt/remote approvals) and codex has no equivalent surface —
+	// so the parity guard is deliberately gone. The exhaustive rows above are the
+	// guard: either kind's row moving is a visible edit here.
 }
 
 // TestKindFeaturesWatchFeedLockstep is the deprecation invariant: `watch` is the

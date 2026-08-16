@@ -5,8 +5,10 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -28,6 +30,8 @@ const (
 	verbSlugCodex   = "vrb001"
 	verbSlugShell   = "vrb002"
 	verbSlugUnknown = "vrb003"
+	verbSlugClaude  = "vrb004"
+	verbSlugCursor  = "vrb005"
 )
 
 // newVerbHub builds a reconciled hub serving the three verb routes over httptest.
@@ -39,6 +43,8 @@ func newVerbHub(t *testing.T) *httptest.Server {
 	f.set("rc-"+verbSlugCodex, codexReadyPane(), managedEnv("id-vc", KindCodex))
 	f.set("rc-"+verbSlugShell, "$ ", managedEnv("id-vs", KindShell))
 	f.set("rc-"+verbSlugUnknown, "whatever", managedEnv("id-vu", Kind("some-future-kind")))
+	f.set("rc-"+verbSlugClaude, "claude\n> ", managedEnv("id-vcl", KindClaudeRC))
+	f.set("rc-"+verbSlugCursor, "cursor\n> ", managedEnv("id-vcu", KindCursor))
 	h.reconcile()
 	srv := httptest.NewServer(h.handler())
 	t.Cleanup(srv.Close)
@@ -70,6 +76,26 @@ func doRequest(t *testing.T, method, url, body string) *http.Response {
 	return resp
 }
 
+// verbCases is the {turn, interrupt, approvals} triple — one valid request per verb,
+// written down ONCE so a fourth verb (or a changed route/body shape) is a single edit
+// rather than a hunt through every test that drives "all three".
+var verbCases = []struct{ name, path, body string }{
+	{"turn", "/turn", `{"text":"do the thing"}`},
+	{"interrupt", "/interrupt", ""},
+	{"approvals", "/approvals/per_1", `{"decision":"allow"}`},
+}
+
+// wantAllVerbs drives every verb against one session and asserts they all answer the
+// SAME envelope — the shape of every "this session cannot serve the verbs" case.
+func wantAllVerbs(t *testing.T, base string, status int, code string) {
+	t.Helper()
+	for _, v := range verbCases {
+		t.Run(v.name, func(t *testing.T) {
+			wantEnvelope(t, doRequest(t, http.MethodPost, base+v.path, v.body), status, code)
+		})
+	}
+}
+
 // wantEnvelope asserts the response is the hub's {error, message} envelope with the
 // given status + error code and a non-empty human message.
 func wantEnvelope(t *testing.T, resp *http.Response, status int, code string) {
@@ -94,29 +120,19 @@ func wantEnvelope(t *testing.T, resp *http.Response, status int, code string) {
 	}
 }
 
-// Every kind fails every verb's capability check in this phase: codex advertises
-// input "gated" (not "turn"), interrupt false and approvals "tui"; shell and an unknown
-// kind have no kind_features row at all, which means "no affordances" and must be just
-// as final a rejection as an explicit false.
-func TestHubVerbsNotSupportedForEveryKind(t *testing.T) {
+// EVERY kind except opencode fails every verb's capability check: codex advertises input
+// "gated" (not "turn"), interrupt false and approvals "tui"; claude-rc and cursor
+// advertise no feed input at all; shell and an unknown kind have no kind_features row,
+// which means "no affordances" and must be just as final a rejection as an explicit
+// false. (opencode's live lane is covered by the opencode section at the end of this
+// file.)
+func TestHubVerbsNotSupportedForEveryOtherKind(t *testing.T) {
 	srv := newVerbHub(t)
 
-	verbs := []struct {
-		name string
-		path string
-		body string
-	}{
-		{"turn", "/turn", `{"text":"do the thing"}`},
-		{"interrupt", "/interrupt", ""},
-		{"approvals", "/approvals/call_01", `{"decision":"allow"}`},
-	}
-	for _, slug := range []string{verbSlugCodex, verbSlugShell, verbSlugUnknown} {
-		for _, v := range verbs {
-			t.Run(slug+"/"+v.name, func(t *testing.T) {
-				resp := doRequest(t, http.MethodPost, srv.URL+"/v1/sessions/"+slug+v.path, v.body)
-				wantEnvelope(t, resp, http.StatusConflict, errNotSupported)
-			})
-		}
+	for _, slug := range []string{verbSlugCodex, verbSlugShell, verbSlugUnknown, verbSlugClaude, verbSlugCursor} {
+		t.Run(slug, func(t *testing.T) {
+			wantAllVerbs(t, srv.URL+"/v1/sessions/"+slug, http.StatusConflict, errNotSupported)
+		})
 	}
 }
 
@@ -471,5 +487,373 @@ func TestReconcilePublishesPendingApprovals(t *testing.T) {
 	h.trackMu.Unlock()
 	if len(got) != 1 || got[0].ID != "pane-1" {
 		t.Fatalf("pendingApprovals = %+v, want the non-lane entry retained", got)
+	}
+}
+
+// ---- the opencode lane, end to end over the real mux ----
+//
+// These drive the verbs through the hub's own handler chain against a tracked opencode
+// session whose watcher is a REAL opencodeWatcher talking to the fake embedded server —
+// so the success shapes, the rejection matrix, and the WS-B scoping guard (the fake fails
+// the test on any unscoped POST) are all exercised on the path a client actually takes.
+
+const verbSlugOpencode = "vrb010"
+
+// opencodeVerbEnv is a managed opencode session's tmux env plus the two keys the watcher
+// needs: the create-time embedded-server port, and a prior back-written agent session id
+// — the latter so the watcher is PINNED synchronously at construction and a handler test
+// never races SSE discovery.
+func opencodeVerbEnv(id string, port int, agentSession string) string {
+	env := managedEnv(id, KindOpencode) + envOpencodePort + "=" + strconv.Itoa(port) + "\n"
+	if agentSession != "" {
+		env += envAgentSession + "=" + agentSession + "\n"
+	}
+	return env
+}
+
+// newOpencodeVerbHub reconciles a hub tracking one live opencode session against f and
+// returns the served hub plus its committed watcher. agentSession "" leaves the watcher
+// UNPINNED (the uncorrelated-TUI case).
+func newOpencodeVerbHub(t *testing.T, f *fakeOpencode, agentSession string) (*httptest.Server, *Hub, *opencodeWatcher, *hubClock) {
+	t.Helper()
+	f.holdOpenSSE()
+	tm := newHubTmux()
+	clk := opencodeClock()
+	h := newTestHub(tm, clk)
+	tm.set("rc-"+verbSlugOpencode, opencodeReadyPane(), opencodeVerbEnv("id-vo", f.port(t), agentSession))
+	h.reconcile() // ensureWatcher builds + commits the opencode watcher
+
+	h.trackMu.Lock()
+	watcher, _ := h.tracked[verbSlugOpencode].watcher.(*opencodeWatcher)
+	h.trackMu.Unlock()
+	if watcher == nil {
+		t.Fatal("reconcile did not commit an opencode watcher for the tracked session")
+	}
+	t.Cleanup(watcher.close) // this hub never ticks again, so nothing else closes it
+
+	srv := httptest.NewServer(h.handler())
+	t.Cleanup(srv.Close)
+	return srv, h, watcher, clk
+}
+
+// wantJSON asserts a response's status and its EXACT decoded body (key set included).
+func wantJSON(t *testing.T, resp *http.Response, status int, want map[string]any) {
+	t.Helper()
+	defer resp.Body.Close()
+	body := readAll(t, resp)
+	if resp.StatusCode != status {
+		t.Fatalf("status = %d, want %d (body %s)", resp.StatusCode, status, body)
+	}
+	var got map[string]any
+	if err := json.Unmarshal([]byte(body), &got); err != nil {
+		t.Fatalf("body is not JSON: %v (%s)", err, body)
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("body = %s, want %v", body, want)
+	}
+}
+
+// waitForAsk drives the watcher until the ask the fake announced (f.streamAsk) has reached
+// the fold, so the approvals verb has a PENDING entry to resolve.
+func waitForAsk(t *testing.T, w *opencodeWatcher, clk *hubClock, id string) {
+	t.Helper()
+	refreshUntil(t, w, clk, nil, "the ask reaches the fold", func() bool {
+		_, _, ok := w.approvalState(id)
+		return ok
+	})
+}
+
+// The pinned SUCCESS shapes, produced for real: 202 {"turn_id"}, 202
+// {"interrupting":true}, 200 {"resolved","decision"} — exactly those keys, nothing else.
+func TestHubVerbsOpencodeSuccessShapes(t *testing.T) {
+	f := newFakeOpencode(t)
+	f.setPinGuard(ocFixtureSID)
+	f.streamAsk(ocFixtureSID, "per_1")
+	srv, h, w, clk := newOpencodeVerbHub(t, f, ocFixtureSID)
+	base := srv.URL + "/v1/sessions/" + verbSlugOpencode
+
+	// turn → 202 with an opaque, non-empty handle (the value itself is deliberately
+	// unspecified beyond being a string a client must not parse).
+	resp := doRequest(t, http.MethodPost, base+"/turn", `{"text":"run the tests"}`)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusAccepted {
+		t.Fatalf("turn status = %d, want 202 (%s)", resp.StatusCode, readAll(t, resp))
+	}
+	var turn map[string]any
+	if err := json.Unmarshal([]byte(readAll(t, resp)), &turn); err != nil {
+		t.Fatalf("turn body: %v", err)
+	}
+	if len(turn) != 1 {
+		t.Fatalf("turn body = %v, want exactly {turn_id}", turn)
+	}
+	if id, _ := turn["turn_id"].(string); id == "" {
+		t.Fatalf("turn_id = %v, want a non-empty opaque handle", turn["turn_id"])
+	}
+
+	// interrupt → 202 {"interrupting":true}.
+	wantJSON(t, doRequest(t, http.MethodPost, base+"/interrupt", ""),
+		http.StatusAccepted, map[string]any{"interrupting": true})
+
+	// approvals → 200 {"resolved":true,"decision":"allow"} once the ask is pending.
+	waitForAsk(t, w, clk, "per_1")
+	wantJSON(t, doRequest(t, http.MethodPost, base+"/approvals/per_1", `{"decision":"allow"}`),
+		http.StatusOK, map[string]any{"resolved": true, "decision": approvalDecisionAllow})
+
+	// The resolution is recorded synchronously on BOTH sides of the seam: the watcher's
+	// fold, and the session's pending_approvals snapshot (no wait for the next tick).
+	if status, decision, ok := w.approvalState("per_1"); !ok || status != approvalStatusResolved || decision != approvalDecisionAllow {
+		t.Errorf("approvalState = (%q,%q,%v), want (resolved,allow,true)", status, decision, ok)
+	}
+	h.trackMu.Lock()
+	pending := h.tracked[verbSlugOpencode].pendingApprovals
+	h.trackMu.Unlock()
+	for _, a := range pending {
+		if a.ID == "per_1" {
+			t.Errorf("pending_approvals still lists the resolved ask: %+v", pending)
+		}
+	}
+
+	// Exactly the three pinned, session-scoped routes were touched (the fake's guard
+	// covers the negative half from underneath).
+	if got := f.postPaths(); len(got) != 3 {
+		t.Errorf("upstream POSTs = %v, want one per verb", got)
+	}
+}
+
+// The opencode rejection matrix — every branch the handler flow defines, over the mux.
+func TestHubVerbsOpencodeRejectionMatrix(t *testing.T) {
+	t.Run("unpinned session", func(t *testing.T) {
+		f := newFakeOpencode(t) // empty store → the watcher never pins
+		srv, _, _, _ := newOpencodeVerbHub(t, f, "")
+		base := srv.URL + "/v1/sessions/" + verbSlugOpencode
+
+		for _, c := range verbCases {
+			t.Run(c.name, func(t *testing.T) {
+				resp := doRequest(t, http.MethodPost, base+c.path, c.body)
+				// approvals resolves state BEFORE it would address the session, so an
+				// unpinned session answers 404 there (the id is unknown to the fold) and
+				// 409 not_accepting for the two delivery verbs.
+				want := errNotAccepting
+				status := http.StatusConflict
+				if c.name == "approvals" {
+					want, status = errUnknownApproval, http.StatusNotFound
+				}
+				wantEnvelope(t, resp, status, want)
+			})
+		}
+		if got := f.postPaths(); len(got) != 0 {
+			t.Errorf("an unpinned session produced upstream POSTs %v, want none", got)
+		}
+	})
+
+	t.Run("unknown approval id", func(t *testing.T) {
+		f := newFakeOpencode(t)
+		f.setPinGuard(ocFixtureSID)
+		srv, _, _, _ := newOpencodeVerbHub(t, f, ocFixtureSID)
+		wantEnvelope(t, doRequest(t, http.MethodPost,
+			srv.URL+"/v1/sessions/"+verbSlugOpencode+"/approvals/per_nope", `{"decision":"allow"}`),
+			http.StatusNotFound, errUnknownApproval)
+		if got := f.postPaths(); len(got) != 0 {
+			t.Errorf("an unknown id must not reach the agent, got %v", got)
+		}
+	})
+
+	t.Run("replay", func(t *testing.T) {
+		f := newFakeOpencode(t)
+		f.setPinGuard(ocFixtureSID)
+		f.streamAsk(ocFixtureSID, "per_1")
+		srv, _, w, clk := newOpencodeVerbHub(t, f, ocFixtureSID)
+		base := srv.URL + "/v1/sessions/" + verbSlugOpencode + "/approvals/per_1"
+		waitForAsk(t, w, clk, "per_1")
+
+		wantJSON(t, doRequest(t, http.MethodPost, base, `{"decision":"allow"}`),
+			http.StatusOK, map[string]any{"resolved": true, "decision": approvalDecisionAllow})
+		posts := len(f.postPaths())
+
+		// SAME decision replayed → 200 idempotent, and — the point of the synchronous
+		// bookkeeping — NO second upstream POST.
+		wantJSON(t, doRequest(t, http.MethodPost, base, `{"decision":"allow"}`),
+			http.StatusOK, map[string]any{"resolved": true, "decision": approvalDecisionAllow})
+		if got := len(f.postPaths()); got != posts {
+			t.Errorf("a same-decision replay POSTed again (%d → %d)", posts, got)
+		}
+
+		// A DIFFERENT decision on the same id → 409 already_resolved, still no POST.
+		wantEnvelope(t, doRequest(t, http.MethodPost, base, `{"decision":"deny"}`),
+			http.StatusConflict, errAlreadyResolved)
+		if got := len(f.postPaths()); got != posts {
+			t.Errorf("a conflicting replay POSTed anyway (%d → %d)", posts, got)
+		}
+	})
+
+	t.Run("upstream failure", func(t *testing.T) {
+		f := newFakeOpencode(t)
+		f.setPinGuard(ocFixtureSID)
+		f.promptStatus = http.StatusInternalServerError
+		f.abortStatus = http.StatusInternalServerError
+		f.permissionStatus = http.StatusInternalServerError
+		f.streamAsk(ocFixtureSID, "per_1")
+		srv, _, w, clk := newOpencodeVerbHub(t, f, ocFixtureSID)
+		base := srv.URL + "/v1/sessions/" + verbSlugOpencode
+		waitForAsk(t, w, clk, "per_1")
+
+		// An upstream failure is a retryable 409 not_accepting on every verb — never a
+		// 5xx, never a success.
+		wantAllVerbs(t, base, http.StatusConflict, errNotAccepting)
+
+		// A failed resolve leaves the ask OPEN (no local mark on an upstream failure), so
+		// the operator can retry or answer in the TUI.
+		if status, _, ok := w.approvalState("per_1"); !ok || status != approvalStatusPending {
+			t.Errorf("approvalState after a failed resolve = (%q,%v), want it still pending", status, ok)
+		}
+	})
+
+	t.Run("no watcher yet", func(t *testing.T) {
+		// An opencode session whose watcher has not been built (no recorded port — a
+		// pre-upgrade session) advertises the verbs by kind but cannot serve them: the
+		// defensive no-lane 409, now genuinely reachable.
+		tm := newHubTmux()
+		clk := opencodeClock()
+		h := newTestHub(tm, clk)
+		tm.set("rc-vrb011", opencodeReadyPane(), managedEnv("id-vo2", KindOpencode))
+		h.reconcile()
+		srv := httptest.NewServer(h.handler())
+		defer srv.Close()
+		wantAllVerbs(t, srv.URL+"/v1/sessions/vrb011", http.StatusConflict, errNotAccepting)
+	})
+}
+
+// Two concurrent approvals requests for the SAME id, over the real mux: the watcher's
+// claim makes the read-then-POST atomic, so exactly ONE upstream POST is made. The loser
+// is told the resolution is in flight (409 not_accepting, retryable) rather than
+// double-answering the ask. Deterministic: the fake holds the winner's upstream call open
+// while the loser runs.
+func TestHubVerbsOpencodeConcurrentResolvePostsOnce(t *testing.T) {
+	f := newFakeOpencode(t)
+	f.setPinGuard(ocFixtureSID)
+	f.streamAsk(ocFixtureSID, "per_1")
+	entered, release := make(chan struct{}), make(chan struct{})
+	var once sync.Once
+	f.beforeMutation = func(string) {
+		once.Do(func() { close(entered) })
+		<-release
+	}
+	srv, _, w, clk := newOpencodeVerbHub(t, f, ocFixtureSID)
+	base := srv.URL + "/v1/sessions/" + verbSlugOpencode + "/approvals/per_1"
+	waitForAsk(t, w, clk, "per_1")
+
+	first := make(chan *http.Response, 1)
+	go func() { first <- doRequest(t, http.MethodPost, base, `{"decision":"allow"}`) }()
+	select {
+	case <-entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the first resolve never reached the upstream POST")
+	}
+
+	// The racing request cannot claim the id, so it never reaches the network.
+	second := doRequest(t, http.MethodPost, base, `{"decision":"allow"}`)
+	body := readAll(t, second)
+	second.Body.Close()
+	if second.StatusCode != http.StatusConflict || !strings.Contains(body, errNotAccepting) ||
+		!strings.Contains(body, "already in progress") {
+		t.Fatalf("concurrent resolve = %d %s, want 409 not_accepting (in progress)", second.StatusCode, body)
+	}
+
+	close(release)
+	wantJSON(t, <-first, http.StatusOK,
+		map[string]any{"resolved": true, "decision": approvalDecisionAllow})
+	if got := f.postPaths(); len(got) != 1 {
+		t.Fatalf("upstream POSTs = %v, want exactly one for the two concurrent requests", got)
+	}
+	// And the settled ask answers idempotently afterwards, still without a second POST.
+	wantJSON(t, doRequest(t, http.MethodPost, base, `{"decision":"allow"}`), http.StatusOK,
+		map[string]any{"resolved": true, "decision": approvalDecisionAllow})
+	if got := f.postPaths(); len(got) != 1 {
+		t.Fatalf("upstream POSTs = %v after the replay, want still exactly one", got)
+	}
+}
+
+// A lane failure's WIRE message must not carry hub-internal addressing: the upstream URL
+// embeds the loopback port and the pinned agent session id, which belong in the hub log,
+// not in a client's error envelope. The status code survives (it is what distinguishes
+// "the agent said no" from "the agent never answered"), and the sentinels — which leak
+// nothing — stay verbatim.
+func TestHubVerbsOpencodeLaneErrorsDoNotLeakInternals(t *testing.T) {
+	f := newFakeOpencode(t)
+	f.setPinGuard(ocFixtureSID)
+	f.promptStatus = http.StatusInternalServerError
+	srv, _, _, _ := newOpencodeVerbHub(t, f, ocFixtureSID)
+
+	resp := doRequest(t, http.MethodPost, srv.URL+"/v1/sessions/"+verbSlugOpencode+"/turn", `{"text":"hi"}`)
+	body := readAll(t, resp)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusConflict {
+		t.Fatalf("status = %d, want 409 (%s)", resp.StatusCode, body)
+	}
+	if !strings.Contains(body, "upstream status 500") {
+		t.Errorf("message = %s, want the upstream status summarized", body)
+	}
+	for _, secret := range []string{ocFixtureSID, "/session/", "127.0.0.1", strconv.Itoa(f.port(t))} {
+		if strings.Contains(body, secret) {
+			t.Errorf("message leaks hub-internal addressing (%q): %s", secret, body)
+		}
+	}
+
+	// The unpinned sentinel is operator-facing and stays verbatim.
+	f2 := newFakeOpencode(t)
+	srv2, _, _, _ := newOpencodeVerbHub(t, f2, "")
+	resp2 := doRequest(t, http.MethodPost, srv2.URL+"/v1/sessions/"+verbSlugOpencode+"/turn", `{"text":"hi"}`)
+	body2 := readAll(t, resp2)
+	resp2.Body.Close()
+	if !strings.Contains(body2, "agent session not established yet") {
+		t.Errorf("unpinned message = %s, want the remediation sentinel", body2)
+	}
+}
+
+// The post-resolve republish must never write into an ORPHAN: reconcile can replace the
+// tracked entry (a recreate) while the upstream POST is in flight, and the handler still
+// holds the old pointer. It republishes only when the entry it copied is still THE tracked
+// entry; otherwise the next tick republishes from the live watcher.
+func TestRepublishApprovalsSkipsAReplacedEntry(t *testing.T) {
+	f := newHubTmux()
+	clk := &hubClock{t: time.Unix(1_700_000_000, 0).UTC()}
+	h := newTestHub(f, clk)
+	f.set("rc-rpb001", opencodeReadyPane(), managedEnv("id-rp", KindOpencode))
+	h.reconcile()
+
+	pub := &stubApprovalWatcher{stubWatcher: stubWatcher{activity: ActivityIdle}} // nothing open
+	h.trackMu.Lock()
+	tr := h.tracked["rpb001"]
+	tr.pendingApprovals = []FeedApproval{{ID: "per_1", Status: approvalStatusPending}}
+	h.trackMu.Unlock()
+
+	// Still the tracked entry → the snapshot is refreshed from the lane.
+	h.republishApprovals("rpb001", tr, pub)
+	h.trackMu.Lock()
+	got := h.tracked["rpb001"].pendingApprovals
+	h.trackMu.Unlock()
+	if len(got) != 0 {
+		t.Fatalf("pendingApprovals = %+v, want the lane's (empty) snapshot", got)
+	}
+
+	// A recreate replaces the entry: the orphan the handler holds must be left alone, and
+	// the LIVE entry must not be rewritten from a dead incarnation's watcher either.
+	orphan := tr
+	orphan.pendingApprovals = []FeedApproval{{ID: "per_orphan", Status: approvalStatusPending}}
+	live := h.newTrackedSession(Session{Slug: "rpb001", TmuxSession: "rc-rpb001", Kind: KindOpencode})
+	live.pendingApprovals = []FeedApproval{{ID: "per_live", Status: approvalStatusPending}}
+	h.trackMu.Lock()
+	h.tracked["rpb001"] = live
+	h.trackMu.Unlock()
+
+	h.republishApprovals("rpb001", orphan, pub)
+	if len(orphan.pendingApprovals) != 1 || orphan.pendingApprovals[0].ID != "per_orphan" {
+		t.Errorf("orphan entry was rewritten: %+v", orphan.pendingApprovals)
+	}
+	h.trackMu.Lock()
+	got = h.tracked["rpb001"].pendingApprovals
+	h.trackMu.Unlock()
+	if len(got) != 1 || got[0].ID != "per_live" {
+		t.Errorf("live entry = %+v, want the current incarnation's own snapshot", got)
 	}
 }

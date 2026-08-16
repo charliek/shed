@@ -340,14 +340,6 @@ type hubMessagesResponse struct {
 	Truncated bool          `json:"truncated"`
 }
 
-// inputGatedKind reports whether a kind exposes the gated feed-input surface
-// (kind_features.input == "gated"). Only codex and opencode in this phase — the
-// message feed + POST /input cover those two kinds; other kinds keep TUI-only input
-// (`post_input`).
-func inputGatedKind(k Kind) bool {
-	return k == KindCodex || k == KindOpencode
-}
-
 // trimFeedText is a small helper used by producers to drop leading/trailing
 // whitespace on a captured message before it enters the ring (the sanitizer keeps
 // internal newlines; producers just tidy the ends).

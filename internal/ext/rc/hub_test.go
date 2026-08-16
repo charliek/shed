@@ -530,7 +530,7 @@ func TestHubReconcileLegacyRecreateByCreatedAt(t *testing.T) {
 
 // A recreate that changes ONLY the kind (same slug, and — the legacy worst case —
 // no id and an unchanged created_at) must still replace the tracked entry: the verb
-// handlers authorize against the tracked kind (verbFeatures), so a stale kind would
+// handlers authorize against the tracked kind (verbTarget), so a stale kind would
 // become an authorization bug the day any kind advertises a verb.
 func TestHubReconcileKindChangeIsARecreate(t *testing.T) {
 	f := newHubTmux()
