@@ -595,6 +595,14 @@ func (h *Hub) ensureWatcher(tr *trackedSession, s Session) sessionWatcher {
 	if s.Kind == KindCursor {
 		w := newCursorWatcher(agentSessionEnv(h.cfg.runner, s.TmuxSession), h.cfg.logf)
 		h.drainPreWatcher(s.Slug, w)
+		// Restart backfill (plan 008 §3.5 "Transcript tail = restart backfill only" / C5):
+		// a VALIDATED prior pin (a hub restart mid-session — newCursorWatcher already
+		// discarded a malformed one) means there is a transcript worth reading once, so a
+		// restarted hub is not blank until the next hook fires. A fresh session (no prior
+		// pin) attempts no read at all. Best-effort — see seedFromTranscript's doc.
+		if w.priorID != "" {
+			w.seedFromTranscript(h.cfg.getenv("HOME"), s.Workdir, w.priorID)
+		}
 		return w
 	}
 

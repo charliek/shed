@@ -1,9 +1,13 @@
 package rc
 
 import (
+	"bufio"
 	"encoding/json"
 	"fmt"
+	"os"
+	"path/filepath"
 	"regexp"
+	"strings"
 	"sync"
 	"time"
 )
@@ -247,6 +251,46 @@ func (w *cursorWatcher) drainConfirmedAgentID() string {
 	id := w.confirmedID
 	w.confirmedID = ""
 	return id
+}
+
+// seedFromTranscript is a ONE-SHOT, construction-time backfill (plan 008 §3.5 "Transcript
+// tail = restart backfill only" / C5): called from ensureWatcher exactly once, and only
+// when the watcher was built with an existing SHED_RC_AGENT_SESSION pin (a hub restart
+// mid-session) — so a restarted hub is not blank until the next hook fires. sessionID is
+// w.priorID (already grammar-validated by newCursorWatcher).
+//
+// This reads cursor's OWN transcript JSONL, a different payload shape than a hook event
+// (user/assistant lines with text/tool_use content blocks — see cursorTranscriptLine), so
+// it appends the rows it produces directly to w.pending rather than routing through
+// w.fold: the fold's state machine (activity, open-tool count, last message) stays driven
+// EXCLUSIVELY by hooks, per the watcher's doc — this is a feed-content side channel, never
+// a verdict source. No live tailing: hooks are the only live channel (the transcript lags
+// mid-turn and carries no tool results, per the spike).
+//
+// Best-effort throughout, matching the preseed posture: a missing/unreadable file, a
+// malformed or partial last line (the transcript is written incrementally, so a hub
+// restart can land mid-write), or an unresolvable path all yield zero rows silently —
+// nothing here may fail watcher construction.
+//
+// Dedup note (documented limitation, not a bug): rows seeded here are NOT deduped against
+// subsequent LIVE hook events — e.g. the in-flight turn that was running when the hub
+// restarted will reappear via its own afterAgentResponse/stop hooks. The live feed starts
+// fresh post-restart; a small overlap at the seam is acceptable.
+func (w *cursorWatcher) seedFromTranscript(home, workdir, sessionID string) {
+	path := cursorTranscriptPath(home, workdir, sessionID)
+	if path == "" {
+		return
+	}
+	rows := readCursorTranscript(path)
+	if len(rows) == 0 {
+		return
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.closed {
+		return
+	}
+	w.pending = append(w.pending, rows...)
 }
 
 // close marks the watcher terminally closed. There is no I/O to unwind (pushes are the
@@ -587,4 +631,165 @@ func cursorEditDetail(p *cursorHookPayload) string {
 		return fmt.Sprintf("%s (%d %s)", path, n, unit)
 	}
 	return path
+}
+
+// ---- transcript restart-backfill (plan 008 §3.5 / C5) ----
+
+// maxCursorTranscriptLines bounds the backfill to the transcript's LAST N raw lines
+// (before parsing — a line can fold to zero, one, or several feed rows). Cheap insurance
+// on top of the ring's own byte/count caps (§3.5's ingest cap precedent): a long-running
+// session's transcript can run to thousands of lines, and this is restart history, not the
+// live feed.
+const maxCursorTranscriptLines = 200
+
+// cursorSlugForWorkdir renders cursor's own project-directory slug for a workdir: the
+// absolute path with every '/' replaced by '-' and the leading '/' dropped. Verified live
+// in the spike (plan 008 §3.5 evidence): a workdir of `/home/shed/proj` slugs to
+// `home-shed-proj`, giving
+// `~/.cursor/projects/home-shed-proj/agent-transcripts/<session-id>/<session-id>.jsonl`.
+func cursorSlugForWorkdir(workdir string) string {
+	if workdir == "" {
+		return ""
+	}
+	abs := workdir
+	if a, err := filepath.Abs(abs); err == nil {
+		abs = a
+	}
+	abs = strings.TrimPrefix(abs, "/")
+	if abs == "" {
+		return ""
+	}
+	return strings.ReplaceAll(abs, "/", "-")
+}
+
+// cursorTranscriptPath derives the transcript JSONL path for a (home, workdir,
+// sessionID) triple, or "" when any input is unusable (no HOME, no workdir, or a
+// sessionID that fails the same UUID grammar every other cursor id is held to —
+// this id ends up as a path segment). "" tells seedFromTranscript to skip silently.
+func cursorTranscriptPath(home, workdir, sessionID string) string {
+	if home == "" || !validCursorSessionID(sessionID) {
+		return ""
+	}
+	slug := cursorSlugForWorkdir(workdir)
+	if slug == "" {
+		return ""
+	}
+	return filepath.Join(home, ".cursor", "projects", slug, "agent-transcripts", sessionID, sessionID+".jsonl")
+}
+
+// readCursorTranscript reads path's last maxCursorTranscriptLines lines and folds each
+// into zero or more feed rows (parseCursorTranscriptLine), in file order. Best-effort: a
+// missing/unreadable file returns nil (no error to the caller — construction must never
+// fail on this), and an unscannable line (including a partial last line, since the
+// transcript is written incrementally and a hub can restart mid-write) is simply skipped
+// rather than aborting the whole read.
+func readCursorTranscript(path string) []feedMessage {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil
+	}
+	defer f.Close()
+
+	sc := bufio.NewScanner(f)
+	sc.Buffer(make([]byte, 0, 64*1024), 2*1024*1024)
+	var window [][]byte
+	for sc.Scan() {
+		line := append([]byte(nil), sc.Bytes()...) // Scan()'s buffer is reused; must copy to retain
+		window = append(window, line)
+		if len(window) > maxCursorTranscriptLines {
+			window = window[1:]
+		}
+	}
+	// sc.Err() (an oversized line, a mid-read I/O error) is deliberately not surfaced:
+	// whatever made it into window before the scan stopped is still valid best-effort
+	// history, and this is a backfill, not an authoritative read.
+
+	var rows []feedMessage
+	for _, raw := range window {
+		rows = append(rows, parseCursorTranscriptLine(raw)...)
+	}
+	return rows
+}
+
+// cursorTranscriptLine is one row of cursor's transcript JSONL — a DIFFERENT shape than a
+// hook payload (verified in the spike: user/assistant lines only, no tool results, no
+// ids, no timestamps, plus a trailing `{"type":"turn_ended",...}`).
+type cursorTranscriptLine struct {
+	Role    string                   `json:"role"` // "user" | "assistant" (absent on turn_ended)
+	Type    string                   `json:"type"` // "turn_ended" on the trailing row, else absent
+	Message *cursorTranscriptMessage `json:"message"`
+}
+
+type cursorTranscriptMessage struct {
+	Content []cursorTranscriptBlock `json:"content"`
+}
+
+// cursorTranscriptBlock is one content block. tool_use blocks carry no id (unlike a hook's
+// preToolUse/postToolUse pair, the transcript has nothing to correlate a result back to —
+// which is exactly why tool RESULTS never appear here at all).
+type cursorTranscriptBlock struct {
+	Type  string          `json:"type"` // "text" | "tool_use"
+	Text  string          `json:"text"`
+	Name  string          `json:"name"`
+	Input json.RawMessage `json:"input"`
+}
+
+// parseCursorTranscriptLine folds one transcript line into feed rows: a user text block
+// becomes a user row; an assistant text block becomes an assistant row and an assistant
+// tool_use block becomes a tool_use row. turn_ended and any block type this shape does not
+// name (there is no tool_result in a cursor transcript — the spike confirmed it) are
+// ignored. A line that fails to unmarshal (malformed or a partial last line) yields no
+// rows rather than erroring.
+func parseCursorTranscriptLine(raw []byte) []feedMessage {
+	var line cursorTranscriptLine
+	if json.Unmarshal(raw, &line) != nil || line.Message == nil {
+		return nil
+	}
+	var rows []feedMessage
+	switch line.Role {
+	case feedRoleUser:
+		for _, b := range line.Message.Content {
+			if b.Type != "text" || trimFeedText(b.Text) == "" {
+				continue
+			}
+			rows = append(rows, feedMessage{Role: feedRoleUser, Type: feedTypeText, Text: b.Text})
+		}
+	case feedRoleAssistant:
+		for _, b := range line.Message.Content {
+			switch b.Type {
+			case "text":
+				if trimFeedText(b.Text) == "" {
+					continue
+				}
+				rows = append(rows, feedMessage{Role: feedRoleAssistant, Type: feedTypeText, Text: b.Text})
+			case "tool_use":
+				rows = append(rows, feedMessage{
+					Role: feedRoleTool,
+					Type: feedTypeToolUse,
+					Tool: &feedTool{Name: b.Name, Detail: cursorTranscriptToolDetail(b.Input)},
+				})
+			}
+		}
+	}
+	return rows
+}
+
+// cursorTranscriptToolDetail renders a transcript tool_use block's compact detail. The
+// transcript's own input shapes differ from a hook's tool_input (e.g. Write carries
+// `path`, not `file_path` — see the spike capture), so this is deliberately a SEPARATE
+// field list from cursorToolDetail rather than a shared helper.
+func cursorTranscriptToolDetail(input json.RawMessage) string {
+	var in struct {
+		Command string `json:"command"`
+		Path    string `json:"path"`
+	}
+	if len(input) > 0 && json.Unmarshal(input, &in) == nil {
+		if in.Command != "" {
+			return in.Command
+		}
+		if in.Path != "" {
+			return in.Path
+		}
+	}
+	return compactJSON(input)
 }
