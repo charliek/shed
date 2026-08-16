@@ -344,6 +344,23 @@ func TestListEnvelopeCarriesCapabilities(t *testing.T) {
 	if resp.Capabilities.RCVersion != rc.CapabilityVersion {
 		t.Errorf("rc_version = %d, want %d", resp.Capabilities.RCVersion, rc.CapabilityVersion)
 	}
+	// contract v2, asserted on the REAL emitted bytes (not just the struct): every
+	// session row carries `lane`, and each kind_features row carries the
+	// always-present feed/attach hints.
+	if len(resp.RCSessions) != 1 {
+		t.Fatalf("want the one rc-aaa session, got %d", len(resp.RCSessions))
+	}
+	if resp.RCSessions[0].Lane != rc.LaneTUI {
+		t.Errorf("session lane = %q, want %q", resp.RCSessions[0].Lane, rc.LaneTUI)
+	}
+	if !strings.Contains(out, `"lane":"tui"`) {
+		t.Errorf("emitted session JSON must carry lane:\n%s", out)
+	}
+	for kind, kf := range resp.Capabilities.KindFeatures {
+		if kf.Feed == "" || kf.Attach == "" {
+			t.Errorf("kind_features[%q] = %+v, want feed/attach always present", kind, kf)
+		}
+	}
 }
 
 func TestClaudeVerbNeedsAuthSummary(t *testing.T) {

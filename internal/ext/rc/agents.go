@@ -23,6 +23,15 @@ type AgentSpec struct {
 	Bin string
 	// Kinds are the session kinds this tool provides. Disjoint across specs.
 	Kinds []Kind
+	// Lane is the session lane every kind of this tool runs in (contract v2):
+	// LaneTUI (an rc-tmux pane driven through capture/send-keys) or LaneStructured
+	// (a native protocol lane — codex app-server, cursor ACP, opencode server API).
+	// A KIND IS LANE-HOMOGENEOUS: all sessions of one kind share one lane, which is
+	// what keeps the kind-keyed kind_features map a complete description of what a
+	// client can do. A structured lane therefore arrives as a DISTINCT kind beside
+	// the TUI kind (with its own spec + kind_features row), never as a second lane
+	// on an existing kind. Every spec in this phase is LaneTUI.
+	Lane string
 	// InnerCommand builds the command the tmux session runs for one of the tool's
 	// kinds. Signature mirrors the exported InnerCommand: display name (already
 	// resolved by the caller), the generic/claude permission mode ("" = omit),
@@ -103,6 +112,30 @@ func (s *AgentSpec) validMode(m string) bool {
 	return ok
 }
 
+// Session lanes (AgentSpec.Lane / Session.Lane — the contract-v2 wire values).
+const (
+	// LaneTUI is the universal substrate: an rc-tmux session whose pane is captured
+	// and driven with send-keys. Every kind in this phase is a TUI lane, and an
+	// UNKNOWN (unregistered) kind renders as one too — the neutral rendering a client
+	// already applies to it is exactly the TUI affordance set.
+	LaneTUI = "tui"
+	// LaneStructured is an agent driven over its native protocol (codex app-server,
+	// cursor ACP, opencode server API) rather than through a pane. Declared now so
+	// the wire values are fixed up front; no kind derives it in this phase.
+	LaneStructured = "structured"
+)
+
+// laneForKind returns the lane a kind's sessions run in, defaulting to LaneTUI for an
+// unregistered kind or a spec that declares none (the unknown-kind policy: a preserved
+// raw kind renders neutrally, which is the TUI affordance set). The DTO's `lane` is
+// ALWAYS present, so this never returns "".
+func laneForKind(k Kind) string {
+	if spec, ok := specForKind(k); ok && spec.Lane != "" {
+		return spec.Lane
+	}
+	return LaneTUI
+}
+
 // Tool-name tokens (AgentSpec.Tool).
 const (
 	toolClaude   = "claude"
@@ -163,6 +196,7 @@ var agentRegistry = []*AgentSpec{
 		Tool:         toolClaude,
 		Bin:          "claude",
 		Kinds:        []Kind{KindClaudeBroker, KindClaudeRC},
+		Lane:         LaneTUI,
 		InnerCommand: innerCommandClaude,
 		Classify:     classifyClaude,
 		Preseed:      PreseedClaudeConfig,
@@ -182,6 +216,7 @@ var agentRegistry = []*AgentSpec{
 		Tool:         toolCodex,
 		Bin:          "codex",
 		Kinds:        []Kind{KindCodex},
+		Lane:         LaneTUI,
 		InnerCommand: innerCommandTUI("codex"),
 		Classify:     classifyCodex,
 		// codex's directory-trust gate is a pre-selected "Yes, continue" prompt, so it
@@ -205,6 +240,7 @@ var agentRegistry = []*AgentSpec{
 		Tool:         toolOpencode,
 		Bin:          "opencode",
 		Kinds:        []Kind{KindOpencode},
+		Lane:         LaneTUI,
 		InnerCommand: innerCommandTUI("opencode"),
 		Classify:     classifyOpencode,
 		Preseed:      nil,
@@ -222,6 +258,7 @@ var agentRegistry = []*AgentSpec{
 		Tool:         toolCursor,
 		Bin:          "cursor-agent",
 		Kinds:        []Kind{KindCursor},
+		Lane:         LaneTUI,
 		InnerCommand: innerCommandTUI("cursor-agent"),
 		Classify:     classifyCursor,
 		Preseed:      nil,
@@ -240,6 +277,7 @@ var agentRegistry = []*AgentSpec{
 		Tool:         toolShell,
 		Bin:          "",
 		Kinds:        []Kind{KindShell},
+		Lane:         LaneTUI,
 		InnerCommand: innerCommandShell,
 		Classify:     classifyShell,
 		Preseed:      nil,

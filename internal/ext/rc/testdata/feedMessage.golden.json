@@ -1,0 +1,44 @@
+{
+  "messages": [
+    {
+      "seq": 1,
+      "ts": "2026-08-14T10:00:00Z",
+      "role": "user",
+      "type": "text",
+      "text": "Run the test suite."
+    },
+    {
+      "seq": 2,
+      "ts": "2026-08-14T10:00:03Z",
+      "role": "tool",
+      "type": "tool_use",
+      "tool": { "name": "exec", "detail": "make test" }
+    },
+    {
+      "seq": 3,
+      "ts": "2026-08-14T10:00:05Z",
+      "role": "tool",
+      "type": "approval_request",
+      "text": "Allow running `rm -rf build/`?",
+      "tool": { "name": "exec", "detail": "rm -rf build/" },
+      "approval": {
+        "id": "call_01HQ8Z3K.tool:2",
+        "status": "pending",
+        "decisions": ["allow", "allow_always", "deny"]
+      }
+    },
+    {
+      "seq": 4,
+      "ts": "2026-08-14T10:00:11Z",
+      "role": "tool",
+      "type": "approval_request",
+      "text": "Allow running `rm -rf build/`?",
+      "approval": {
+        "id": "call_01HQ8Z3K.tool:2",
+        "status": "resolved",
+        "decision": "allow"
+      }
+    }
+  ],
+  "truncated": false
+}

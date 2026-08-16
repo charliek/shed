@@ -6,6 +6,7 @@
       "kind": "claude-rc",
       "state": "ready",
       "managed": true,
+      "lane": "tui",
       "display_name": "charliek/abc234",
       "workdir": "/home/shed",
       "url": "https://claude.ai/code/session_01RCkTDrdZ2Rr12sD5dfMjgr",
@@ -22,7 +23,8 @@
       "tmux_session": "rc-brk900",
       "kind": "claude-broker",
       "state": "starting",
-      "managed": false
+      "managed": false,
+      "lane": "tui"
     }
   ],
   "capabilities": {
@@ -36,10 +38,10 @@
     },
     "features": ["generic-perm", "plan-stdin", "prompt-b64", "serve", "activity", "messages"],
     "kind_features": {
-      "claude-rc": { "post_input": true, "approvals": "tui" },
-      "codex": { "post_input": true, "approvals": "tui", "watch": true, "input": "gated" },
-      "opencode": { "post_input": true, "approvals": "tui" },
-      "cursor": { "post_input": true, "approvals": "tui" }
+      "claude-rc": { "post_input": true, "approvals": "tui", "feed": "activity", "interrupt": false, "attach": "tmux" },
+      "codex": { "post_input": true, "approvals": "tui", "watch": true, "input": "gated", "feed": "messages", "interrupt": false, "attach": "tmux" },
+      "opencode": { "post_input": true, "approvals": "tui", "watch": true, "input": "gated", "feed": "messages", "interrupt": false, "attach": "tmux" },
+      "cursor": { "post_input": true, "approvals": "tui", "feed": "activity", "interrupt": false, "attach": "tmux" }
     }
   }
 }

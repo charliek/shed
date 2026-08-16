@@ -104,8 +104,10 @@ func normalizeCreatedAt(raw string) string {
 }
 
 // ParseSession reconstructs one session's DTO from its tmux env dump + pane. State
-// and url are derived from the pane (never stored). A session with no valid
-// SHED_RC_V (>= MinManagedVersion) is legacy/unmanaged: kind defaults to
+// and url are derived from the pane (never stored), and lane from the kind's AgentSpec
+// (laneForKind) — which is why lane is present on legacy/unmanaged and unknown-kind
+// rows too. A session with no valid SHED_RC_V (>= MinManagedVersion) is
+// legacy/unmanaged: kind defaults to
 // claude-broker, display name to the fallback, stray SHED_RC_* values ignored.
 // displayFallback receives the slug (e.g. "<shed>/<slug>").
 func ParseSession(tmuxSession, envDump, pane string, displayFallback func(slug string) string) Session {
@@ -129,6 +131,7 @@ func ParseSession(tmuxSession, envDump, pane string, displayFallback func(slug s
 			TmuxSession: tmuxSession,
 			Kind:        kind,
 			State:       state,
+			Lane:        laneForKind(kind),
 			URL:         url,
 			DisplayName: fallbackName,
 			Managed:     false,
@@ -146,6 +149,7 @@ func ParseSession(tmuxSession, envDump, pane string, displayFallback func(slug s
 		TmuxSession: tmuxSession,
 		Kind:        kind,
 		State:       state,
+		Lane:        laneForKind(kind),
 		URL:         url,
 		DisplayName: name,
 		Workdir:     val(envWorkdir),
