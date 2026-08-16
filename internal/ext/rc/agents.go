@@ -344,10 +344,18 @@ var (
 	// half is ever matched alone. The three dynamic labels are anchored on their fixed
 	// prefix, since they interpolate a path/command/domain.
 	//
-	// The SECOND layer under this, for the surface a future cursor release adds before this
-	// regex learns it: inputAccepted refuses the degraded composer-anchor path outright for a
-	// kind whose composer survives a modal (AgentSpec.ComposerUnderModal), so an unmatched
-	// widget costs a missing badge rather than a stray keystroke.
+	// SAFETY-CRITICAL: for a ComposerUnderModal kind (cursor), THIS regex matched against the
+	// FRESH visible pane is the SOLE guard against typing into a modal. inputAccepted's
+	// expired-working arm recovers gated input whenever no ApprovalAnchor matches the visible
+	// frame AND pane-stability has settled on needs_input (plan 008 C9) — there is no longer a
+	// blanket reject beneath it. Because cursor draws its composer, disabled, UNDER the dialog,
+	// a decision surface this regex does NOT know about still settles the composer to
+	// needs_input, and the gate would then ACCEPT a keystroke straight into that widget (where
+	// a "y" answers it). Keeping cursorApprovalAnchorRe EXHAUSTIVE across every decision surface
+	// decision-logic.ts can render is therefore load-bearing, not cosmetic — a missed or newly
+	// added surface is an auto-approval hole. TestCursorApprovalAnchorCoversEveryDecisionSurface
+	// pins the exhaustiveness; a future cursor-upgrade audit that adds a surface MUST teach this
+	// regex in the same change.
 	//
 	// KNOWN LIMITATION, shared with codex and inherent to a pane-derived signal: a verbatim
 	// reproduction of the widget on screen reads as the widget. The consequence is an

@@ -224,12 +224,14 @@ func TestComposerUnderModalMatchesTheFixtures(t *testing.T) {
 	}
 }
 
-// THE HOLE THE FLAG CLOSES: a cursor approval surface the anchor does not recognize, with
-// the operator away long enough for the working verdict to expire and the frozen pane to
-// settle. Without the expired-working arm the degraded path sees cursor's still-drawn
-// composer and ACCEPTS — and the posted text would be typed into the widget, where a "y"
-// answers it. Simulated with an anchor-invisible pane, which is precisely what an
-// unrecognized widget looks like to the gate.
+// The expired-working arm's REJECT side (its guarded-recovery accept side is
+// TestCursorInputGateExpiredWorkingIdleComposerRecovers). When the working verdict has
+// expired and the fresh visible pane shows no KNOWN approval surface, input is recovered
+// only if pane-stability has settled on needs_input; a stability verdict that is anything
+// else (idle here — the frozen pane stopped but never reached the composer verdict) still
+// rejects. The exhaustive ApprovalAnchor (not a blanket guess) is what keeps a real dialog
+// impossible to type into — see TestCursorApprovalAnchorCoversEveryDecisionSurface for the
+// exhaustiveness that (a) leans on.
 func TestCursorInputGateRejectsExpiredWorkingUnderAnUnknownModal(t *testing.T) {
 	f := newHubTmux()
 	start := time.Unix(1_700_000_000, 0).UTC()
@@ -247,8 +249,8 @@ func TestCursorInputGateRejectsExpiredWorkingUnderAnUnknownModal(t *testing.T) {
 	}
 
 	// The pane the gate sees: a widget the anchor does not know, with cursor's composer
-	// still drawn beneath it, and a stability verdict of idle (the frozen pane stopped
-	// changing) — the exact combination that used to accept.
+	// still drawn beneath it, and a stability verdict of idle — NOT the settled needs_input
+	// the recovery requires, so the arm rejects.
 	unknownModal := paneFixture(t, "cursor-ready") + "\n Some future approval widget?\n   → Yes, do it (y)\n"
 	if approvalAnchorFor(KindCursor).MatchString(unknownModal) {
 		t.Fatal("premise: this pane must NOT match the approval anchor")
@@ -256,12 +258,18 @@ func TestCursorInputGateRejectsExpiredWorkingUnderAnUnknownModal(t *testing.T) {
 	if !promptAnchorFor(KindCursor).MatchString(unknownModal) {
 		t.Fatal("premise: cursor's composer must still be visible under the widget")
 	}
+	// NOTE: this rejects ONLY because stability is idle (recovery condition (b) fails), NOT
+	// because the unknown widget is detected — the anchor cannot see it. It does NOT pin
+	// safety for the unknown-surface + stability==needs_input case: that is the ACCEPTED
+	// residual (the composer settles to needs_input under the widget and the gate recovers),
+	// mitigated only by keeping the ApprovalAnchor exhaustive (see agents.go / plan 008 C9).
 	if h.inputAccepted(w, ActivityIdle, KindCursor, unknownModal, unknownModal) {
-		t.Error("an expired-working cursor verdict must never accept via the composer anchor")
+		t.Error("expired-working cursor with a non-needs_input stability must reject")
 	}
 
-	// The legitimate case is unaffected: a turn that genuinely ended emits `stop`, which
-	// settles the fold — and a settled verdict accepts, however long it has been quiet.
+	// The legitimate case is unaffected: when `stop` DOES fire (reliably only on turn 1 on
+	// current builds) it settles the fold, and a settled verdict accepts however long it
+	// has been quiet.
 	w.pushHookEvent(hookEv("stop", `{"session_id":"`+cursorTestSessionID+`","status":"completed"}`))
 	w.refresh(clk.now())
 	clk.advance(24 * time.Hour)
@@ -298,5 +306,135 @@ func TestCursorInputGateRejectsWhileWorking(t *testing.T) {
 	w.refresh(clk.now())
 	if !h.inputAccepted(w, ActivityIdle, KindCursor, paneFixture(t, "cursor-ready"), paneFixture(t, "cursor-ready")) {
 		t.Error("a settled hook verdict must accept input")
+	}
+}
+
+// --- plan 008 Finding-B: the expired-working cursor guarded recovery ---
+//
+// cursor's `stop` hook only fires reliably on a session's FIRST turn on current builds, so
+// past turn 1 the fold sticks at expired-working forever. The old C4 arm blanket-rejected
+// every /input on such a fold, breaking the phone-steering path after one turn even when the
+// pane sits at a clean idle composer. The arm now RECOVERS input when the fresh visible pane
+// shows no known approval surface AND pane-stability has settled on needs_input — while still
+// making typing-into-a-dialog impossible via the exhaustive ApprovalAnchor.
+//
+// expiredCursorWatcher is a scripted expired-working cursor verdict: activity=working with
+// authority demoted past the grace, the state a stuck fold is in.
+func expiredCursorWatcher() *stubWatcher {
+	return &stubWatcher{activity: ActivityWorking, expiredWorking: true}
+}
+
+// (1) THE F1-SAFETY PIN. An expired-working cursor fold whose FRESH visible pane matches the
+// ApprovalAnchor is a real dialog on screen: /input must REJECT even though stability has
+// settled on needs_input (cursor draws its composer, disabled, under the dialog, so the
+// needs_input verdict is real and would otherwise be the recovery's green light). This is the
+// load-bearing test — if it ever accepts, a posted "y" answers an approval nobody meant to
+// give.
+func TestCursorInputGateExpiredWorkingRealDialogRejected(t *testing.T) {
+	f := newHubTmux()
+	clk := &hubClock{t: time.Unix(1_700_000_000, 0).UTC()}
+	h := newTestHub(f, clk)
+
+	approval := paneFixture(t, "cursor-ready-approval-shell")
+	if !approvalAnchorFor(KindCursor).MatchString(approval) {
+		t.Fatal("premise: the approval fixture must match the ApprovalAnchor on the visible frame")
+	}
+	// stability=needs_input is the worst case: the composer under the dialog settles, so the
+	// recovery's condition (b) holds — only condition (a) (no anchor) stands between a posted
+	// line and the widget. The anchor MUST be that guard.
+	for _, fx := range []string{"cursor-ready-approval-shell", "cursor-ready-approval-delete", "cursor-ready-approval-write"} {
+		dialog := paneFixture(t, fx)
+		if h.inputAccepted(expiredCursorWatcher(), ActivityNeedsInput, KindCursor, dialog, dialog) {
+			t.Errorf("%s: an expired-working cursor with a real dialog on the visible frame must REJECT", fx)
+		}
+	}
+}
+
+// (2) THE RECOVERY (Finding-B). An expired-working cursor fold whose fresh visible pane is a
+// clean idle composer (ApprovalAnchor absent) AND whose stability has settled on needs_input
+// ACCEPTS — this is the phone-steering path working past turn 1 without a watcher rebuild.
+func TestCursorInputGateExpiredWorkingIdleComposerRecovers(t *testing.T) {
+	f := newHubTmux()
+	clk := &hubClock{t: time.Unix(1_700_000_000, 0).UTC()}
+	h := newTestHub(f, clk)
+
+	ready := paneFixture(t, "cursor-ready")
+	if approvalAnchorFor(KindCursor).MatchString(ready) {
+		t.Fatal("premise: the clean composer must NOT match the ApprovalAnchor")
+	}
+	if !h.inputAccepted(expiredCursorWatcher(), ActivityNeedsInput, KindCursor, ready, ready) {
+		t.Error("expired-working cursor + clean idle composer + settled needs_input must ACCEPT (recovery)")
+	}
+	// Scrollback is not evidence about the present: a dialog answered long ago sits in the
+	// 200-line history (the `pane` arg) while the visible frame is clean — still a recovery.
+	stale := paneFixture(t, "cursor-ready-approval-shell")
+	if !h.inputAccepted(expiredCursorWatcher(), ActivityNeedsInput, KindCursor, stale, ready) {
+		t.Error("a dialog only in scrollback must not block the recovery (the anchor reads the visible frame)")
+	}
+}
+
+// (3) NO FALSE ACCEPT MID-WORK. Anchor absent but stability NOT settled at needs_input →
+// REJECT: a working stability keeps the merge at working (the first arm bites), and even a
+// settled-but-idle stability (the pane stopped without reaching the composer verdict) fails
+// the recovery's condition (b).
+func TestCursorInputGateExpiredWorkingUnsettledStabilityRejected(t *testing.T) {
+	f := newHubTmux()
+	clk := &hubClock{t: time.Unix(1_700_000_000, 0).UTC()}
+	h := newTestHub(f, clk)
+
+	ready := paneFixture(t, "cursor-ready")
+	// Still churning: stability=working ⇒ merged stays working ⇒ reject.
+	if h.inputAccepted(expiredCursorWatcher(), ActivityWorking, KindCursor, ready, ready) {
+		t.Error("expired-working cursor with a still-churning (working) stability must REJECT")
+	}
+	// Settled but idle (no composer verdict): passes the merge but fails recovery condition
+	// (b), so the guarded arm itself rejects.
+	if h.inputAccepted(expiredCursorWatcher(), ActivityIdle, KindCursor, ready, ready) {
+		t.Error("expired-working cursor with a settled-idle (not needs_input) stability must REJECT")
+	}
+}
+
+// (4) REGRESSION: the fresh-fold first-turn path is untouched. On turn 1 `stop` fires, the
+// fold is fresh+settled, and /input accepts outright (the structured signal is authoritative)
+// — the phone-steering path a session was always able to use on its first turn.
+func TestCursorInputGateFreshFirstTurnAccepts(t *testing.T) {
+	f := newHubTmux()
+	clk := &hubClock{t: time.Unix(1_700_000_000, 0).UTC()}
+	h := newTestHub(f, clk)
+
+	w := newCursorWatcher("", nil)
+	w.pushHookEvent(hookEv("beforeSubmitPrompt", `{"session_id":"`+cursorTestSessionID+`","prompt":"go"}`))
+	w.refresh(clk.now())
+	w.pushHookEvent(hookEv("stop", `{"session_id":"`+cursorTestSessionID+`","status":"completed"}`))
+	w.refresh(clk.now())
+	if _, _, fresh, expired := w.snapshot(clk.now()); !fresh || expired {
+		t.Fatalf("premise: a just-settled fold must be fresh, not expired (fresh=%v expired=%v)", fresh, expired)
+	}
+	ready := paneFixture(t, "cursor-ready")
+	if !h.inputAccepted(w, ActivityNeedsInput, KindCursor, ready, ready) {
+		t.Error("a fresh settled cursor fold (turn 1) must accept /input")
+	}
+}
+
+// (5) CODEX UNAFFECTED. The guarded arm is gated on ComposerUnderModal, which is FALSE for
+// codex (its overlay replaces the composer), so the arm never runs for codex — its
+// expired-working behavior is exactly what it was: a settled needs_input at a clean composer
+// accepts via the prompt-anchor path, and a codex dialog on the visible frame rejects via
+// codex's own ApprovalAnchor.
+func TestCursorInputGateCodexExpiredWorkingUnchanged(t *testing.T) {
+	f := newHubTmux()
+	clk := &hubClock{t: time.Unix(1_700_000_000, 0).UTC()}
+	h := newTestHub(f, clk)
+
+	if composerUnderModal(KindCodex) {
+		t.Fatal("premise: codex must NOT declare ComposerUnderModal (its overlay hides the composer)")
+	}
+	ready := codexReadyPane()
+	if !h.inputAccepted(expiredCursorWatcher(), ActivityNeedsInput, KindCodex, ready, ready) {
+		t.Error("codex expired-working + settled needs_input + clean composer must accept (unchanged)")
+	}
+	dialog := paneFixture(t, "codex-ready-approval-exec")
+	if h.inputAccepted(expiredCursorWatcher(), ActivityNeedsInput, KindCodex, dialog, dialog) {
+		t.Error("codex expired-working + a dialog on the visible frame must reject via codex's own anchor")
 	}
 }

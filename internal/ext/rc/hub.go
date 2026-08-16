@@ -617,18 +617,23 @@ func (h *Hub) handleInput(w http.ResponseWriter, r *http.Request) {
 //     post costs a retry while a wrongly-accepted one answers an approval nobody meant to
 //     give.
 //   - an EXPIRED-WORKING verdict on a kind whose composer survives a modal
-//     (AgentSpec.ComposerUnderModal — cursor) → reject. This is the belt to the anchor
-//     arm's braces. For codex the degraded path is safe because its overlay REPLACES the
-//     composer, so a pane showing a dialog cannot match the prompt anchor. cursor draws
-//     its composer, disabled, UNDER the dialog — so if a widget shape the ApprovalAnchor
-//     does not yet know about is on screen, the merge (working verdict expired + a frozen
-//     pane that stability reads as idle) would fall through to "the composer is visible,
-//     accept", and the posted line would be typed into that widget, where a "y" anywhere
-//     in it answers the prompt. The last structured evidence said a turn was in flight and
-//     nothing has contradicted it, so the honest answer is "not now". A cursor turn that
-//     genuinely ended emits `stop`, which settles the fold indefinitely and takes the
-//     accept path below; the residual false-reject (a session whose hook relay broke
-//     mid-turn) resolves when the watcher is rebuilt with no verdict.
+//     (AgentSpec.ComposerUnderModal — cursor) → a GUARDED recovery, not a blanket
+//     reject. cursor's `stop` hook (its settled boundary) only fires reliably on a
+//     session's FIRST turn on current builds; later turns leave the fold stuck
+//     expired-working, so a blanket reject makes gated input (the phone-steering path)
+//     work only once — even while the pane sits at a clean, idle "Add a follow-up"
+//     composer with no dialog. Recover input, but ONLY when the pane is provably not a
+//     dialog: (a) the kind's ApprovalAnchor — EXHAUSTIVE over cursor's decision surfaces
+//     (TestCursorApprovalAnchorCoversEveryDecisionSurface), so no-match means no approval
+//     surface — does NOT match the FRESH visible pane, AND (b) pane-stability has
+//     independently SETTLED on needs_input (a quiet, anchor-matching composer confirmed by
+//     the reconcile-side engine over its full quiet period — the same `lastStability`
+//     verdict reconcile merges). Either failing rejects: a matching anchor means a real
+//     dialog owns the keyboard (a "y" in a posted line would answer it — the exhaustive
+//     anchor, not a blanket guess, is what keeps typing-into-a-dialog impossible), and an
+//     unsettled stability means the turn may still be live. codex is UNAFFECTED — its
+//     overlay REPLACES the composer (ComposerUnderModal=false), so this arm never runs for
+//     it and a codex pane showing a dialog simply cannot match its prompt anchor.
 //   - a FRESH watcher needs_input → accept outright (the structured signal is settled
 //     and authoritative; the pane may legitimately not match the anchor).
 //   - anything else (merged idle/unknown, or a stability-derived needs_input whose
@@ -656,7 +661,14 @@ func (h *Hub) inputAccepted(watcher sessionWatcher, stability Activity, kind Kin
 		return false
 	}
 	if expiredWorking && composerUnderModal(kind) {
-		return false
+		// Guarded recovery (see the doc comment's ComposerUnderModal bullet). Accept
+		// ONLY when the fresh visible pane shows no known approval surface AND stability
+		// has settled on needs_input. The anchor arm above already rejected on a matching
+		// visible pane; re-checking it here keeps this arm self-evidently safe under any
+		// future re-ordering, so the F1 hole stays closed on the arm's own terms.
+		anchor := approvalAnchorFor(kind)
+		modalOnScreen := anchor != nil && anchor.MatchString(visiblePane)
+		return !modalOnScreen && stability == ActivityNeedsInput
 	}
 	if watcherFresh && watcherAct == ActivityNeedsInput {
 		return true
