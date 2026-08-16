@@ -227,6 +227,7 @@ func toSessionRC(s rc.Session) *config.SessionRC {
 		DisplayName: s.DisplayName,
 		URL:         s.URL,
 		CreatedBy:   s.CreatedBy,
+		Lane:        s.Lane,
 	}
 	// Activity dimension carries the lifecycle-trumps-activity precedence: a
 	// needs-auth/dead row never shows activity. When DisplayActivity suppresses the

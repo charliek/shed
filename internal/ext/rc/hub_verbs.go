@@ -95,7 +95,7 @@ const (
 // falling through to a success with no effect.
 const noLaneMsg = "no lane is attached to this session"
 
-// rcApprovalIDRe is the CONTRACT grammar for an approval id — a deliberate design
+// ApprovalIDRe is the CONTRACT grammar for an approval id — a deliberate design
 // decision, not an inherited slug regex:
 //
 //	^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$
@@ -106,10 +106,11 @@ const noLaneMsg = "no lane is attached to this session"
 // call ids, ACP/opencode request ids), and caps the whole id at 128 characters (the
 // same ceiling maxApprovalTokenBytes enforces on the ring side).
 //
-// The server-side proxy path classifier (classifyRCProxyPath in internal/api/rchub.go)
-// mirrors this EXACT expression so a malformed id is rejected before the proxy dials
+// Exported because it is shared, not package-private: the server-side proxy path
+// classifier (classifyRCProxyPath in internal/api/rchub.go) mirrors this EXACT
+// expression via this symbol so a malformed id is rejected before the proxy dials
 // the guest — the two must be kept in lockstep; {slug} keeps its own rcSlugRe there.
-var rcApprovalIDRe = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$`)
+var ApprovalIDRe = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$`)
 
 // turnRequest is the POST /v1/sessions/{slug}/turn body. Unknown fields are ignored
 // (the input handler's precedent; Content-Type is not enforced either).
@@ -232,7 +233,7 @@ func (h *Hub) handleApproval(w http.ResponseWriter, r *http.Request) {
 	// A syntactically invalid id is a malformed REQUEST, not a missing approval: 400,
 	// never 404 — a 404 here would imply the id was well-formed but unknown, which is
 	// the distinct (reserved) unknown_approval case.
-	if !rcApprovalIDRe.MatchString(r.PathValue("id")) {
+	if !ApprovalIDRe.MatchString(r.PathValue("id")) {
 		writeError(w, http.StatusBadRequest, "invalid_approval_id",
 			"approval id must match ^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 		return

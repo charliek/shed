@@ -244,7 +244,7 @@ func TestHubInterruptIgnoresBody(t *testing.T) {
 	}
 }
 
-// rcApprovalIDRe is the contract grammar (mirrored by the server proxy's path
+// ApprovalIDRe is the contract grammar (mirrored by the server proxy's path
 // classifier): it must accept the native id shapes lanes carry and reject anything that
 // could be a path segment in disguise.
 // One flat table rather than subtests: several ids are (deliberately) whitespace or
@@ -281,7 +281,7 @@ func TestApprovalIDGrammar(t *testing.T) {
 		{strings.Repeat("z", 129), false}, // one past the ceiling
 	}
 	for _, c := range cases {
-		if got := rcApprovalIDRe.MatchString(c.id); got != c.ok {
+		if got := ApprovalIDRe.MatchString(c.id); got != c.ok {
 			t.Errorf("contract grammar accepted %q = %v, want %v", c.id, got, c.ok)
 		}
 	}

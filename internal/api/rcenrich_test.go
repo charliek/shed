@@ -198,6 +198,35 @@ func TestToSessionRC_LifecycleSuppressesActivityDimension(t *testing.T) {
 	}
 }
 
+// TestToSessionRC_Lane pins the additive Lane projection (contract v2): a
+// populated rc.Session.Lane copies straight through, and a session decoded from
+// an old (pre-lane) guest binary — where rc.Session.Lane is the Go zero value
+// because the field was simply absent on the wire — projects to an empty
+// config.SessionRC.Lane rather than a synthesized "tui". The doc-commented rule
+// (config/types.go) is that the CLIENT treats an absent wire field as "tui"; the
+// projection itself stays a faithful, non-inventive copy.
+func TestToSessionRC_Lane(t *testing.T) {
+	base := rc.Session{Slug: "abc234", TmuxSession: "rc-abc234", Kind: rc.KindCodex, Managed: true}
+
+	for _, tc := range []struct {
+		name string
+		lane string
+	}{
+		{"populated tui", "tui"},
+		{"populated structured", "structured"},
+		{"absent (old binary)", ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := base
+			s.Lane = tc.lane
+			got := toSessionRC(s)
+			if got.Lane != tc.lane {
+				t.Errorf("toSessionRC(lane=%q).Lane = %q, want %q", tc.lane, got.Lane, tc.lane)
+			}
+		})
+	}
+}
+
 func TestEnrich_NewEnvelope_PopulatesRCAndCachesCaps(t *testing.T) {
 	be := &rcFakeBackend{
 		sessions: map[string][]config.Session{
