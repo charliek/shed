@@ -235,6 +235,9 @@ impl RcService {
                 workdir: Some(workdir.unwrap_or_else(|| rc::DEFAULT_WORKDIR.to_string())),
                 kind,
                 state: RcState::Ready,
+                // Every kind is tui-laned in this phase (the guest derives the
+                // same value from the kind's spec on the real path).
+                lane: Some(rc::LANE_TUI.to_string()),
                 url,
                 rc_id: Some(uuid::Uuid::new_v4().to_string()),
                 created_by: Some(created_by),
@@ -243,6 +246,7 @@ impl RcService {
                 activity: None,
                 activity_at: None,
                 last_message: None,
+                pending_approvals: None,
                 managed: true,
             };
             self.store
@@ -654,6 +658,8 @@ mod tests {
                 tmux_session: "rc-legacy1".into(),
                 kind: RcKind::ClaudeBroker,
                 state: RcState::Ready,
+                // A pre-contract-v2 payload carries no lane at all.
+                lane: None,
                 managed: false,
                 display_name: None,
                 workdir: None,
@@ -665,6 +671,7 @@ mod tests {
                 activity: None,
                 activity_at: None,
                 last_message: None,
+                pending_approvals: None,
             },
             "srv",
             "web",

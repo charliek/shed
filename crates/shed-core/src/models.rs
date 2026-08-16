@@ -429,6 +429,10 @@ fn rc_session_from_flat(j: &serde_json::Map<String, Value>, shed_name: &str) -> 
         // straight to fromWire, rc_models.dart:258-259); absent → "".
         kind: RcKind::from_wire(raw_str(j.get("kind"))),
         state: RcState::from_wire(raw_str(j.get("state"))),
+        // Contract v2, carried verbatim: absent/blank stays `None`, so an old
+        // server's silence never masquerades as a producer-asserted lane (the
+        // `lane_or_tui()` accessor owns the "tui" fallback).
+        lane: opt_trimmed(j.get("lane")),
         url: opt_trimmed(j.get("url")),
         rc_id: opt_trimmed(j.get("id")), // id → rc_id, as in `from_dto`
         created_by: opt_trimmed(j.get("created_by")),
@@ -442,6 +446,10 @@ fn rc_session_from_flat(j: &serde_json::Map<String, Value>, shed_name: &str) -> 
         // overrides like U+202E) the hub's ANSI/C0C1 sanitizer does not cover
         // (`rc_models.dart:269-271`).
         last_message: clean_display(j.get("last_message")),
+        // Not surfaced on the overview flat wire (the server projection carries no
+        // pending approvals); the DTO/from_dto path is where a hub-listed snapshot
+        // arrives. Absent here, always.
+        pending_approvals: None,
         managed: j.get("managed").and_then(Value::as_bool).unwrap_or(false),
         slug,
     }
@@ -588,6 +596,13 @@ fn overview_capabilities(obj: &serde_json::Map<String, Value>) -> RcCapabilities
                         approvals: opt_trimmed(o.get("approvals")).unwrap_or_default(),
                         watch: is_true(o.get("watch")),
                         input: opt_trimmed(o.get("input")).unwrap_or_default(),
+                        // Contract v2; absent/wrong-typed → the same empty/false
+                        // defaults the serde path uses, which the
+                        // `feed_messages()` / `attach_kind()` accessors then
+                        // resolve through their v3 fallbacks.
+                        feed: opt_trimmed(o.get("feed")).unwrap_or_default(),
+                        interrupt: is_true(o.get("interrupt")),
+                        attach: opt_trimmed(o.get("attach")).unwrap_or_default(),
                     },
                 )
             })
@@ -749,6 +764,7 @@ impl<'de> Deserialize<'de> for Overview {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::rc::{ATTACH_TMUX, LANE_TUI};
 
     #[test]
     fn opt_trimmed_trims_on_darts_set_including_bom() {
@@ -1075,16 +1091,51 @@ mod tests {
     }
 
     #[test]
-    fn overview_kind_features_carries_codex_watch_and_gated_input() {
+    fn overview_kind_features_carries_hub_hints() {
+        // Every kind_features hint — v1's watch/input and contract v2's
+        // feed/interrupt/attach alike — is invisible on this hand-rolled
+        // Value-walk path until explicitly picked up, so pin the whole row.
         let o = golden_overview();
         let caps = proj(&o).capabilities.as_ref().unwrap();
         let codex = &caps.kind_features["codex"];
         assert!(codex.watch);
         assert!(codex.input_gated());
-        // claude-rc carries neither hint → additive defaults.
+        assert_eq!(codex.feed, "messages");
+        assert!(codex.feed_messages());
+        assert!(!codex.interrupt); // no lane implements the verb yet
+        assert_eq!(codex.attach_kind(), ATTACH_TMUX);
+        // claude-rc carries neither v1 hint → additive defaults; on v2 it is the
+        // activity-only kind: no message feed, same tmux attach.
         let claude = &caps.kind_features["claude-rc"];
         assert!(!claude.watch);
         assert!(!claude.input_gated());
+        assert_eq!(claude.feed, "activity");
+        assert!(!claude.feed_messages());
+        assert_eq!(claude.attach_kind(), ATTACH_TMUX);
+    }
+
+    #[test]
+    fn overview_session_carries_lane_and_absent_lane_reads_as_tui() {
+        // The enriched row projects `lane` through (server `toSessionRC`); the
+        // fixture's second shed session comes from an OLDER guest whose payload
+        // has no lane at all — it must read as "tui" without inventing a value.
+        let o = golden_overview();
+        let p = proj(&o);
+        assert_eq!(p.sessions[0].lane.as_deref(), Some(LANE_TUI));
+        assert_eq!(p.sessions[0].lane_or_tui(), LANE_TUI);
+        assert_eq!(p.sessions[1].lane, None);
+        assert_eq!(p.sessions[1].lane_or_tui(), LANE_TUI);
+        // A future lane value is carried verbatim, never coerced.
+        let o: Overview = serde_json::from_str(
+            r#"{"sheds":[{"name":"web","status":"running","sessions":[
+                {"name":"rc-s1","rc":{"kind":"codex","state":"ready","lane":"structured"}},
+                {"name":"rc-s2","rc":{"kind":"codex","state":"ready","lane":"  "}}]}]}"#,
+        )
+        .unwrap();
+        assert_eq!(o.sheds[0].sessions[0].lane.as_deref(), Some("structured"));
+        assert_eq!(o.sheds[0].sessions[0].lane_or_tui(), "structured");
+        assert_eq!(o.sheds[0].sessions[1].lane, None); // blank → absent
+        assert_eq!(o.sheds[0].sessions[1].lane_or_tui(), LANE_TUI);
     }
 
     #[test]
@@ -1125,8 +1176,9 @@ mod tests {
     fn overview_running_shed_carries_rc_capabilities() {
         let o = golden_overview();
         let caps = proj(&o).capabilities.as_ref().unwrap();
-        assert_eq!(caps.rc_version, 3);
-        // codex advertised + installed → offered; opencode not installed → not.
+        assert_eq!(caps.rc_version, 4);
+        assert!(caps.has_feature("contract-v2")); // the v2 route-existence token
+                                                  // codex advertised + installed → offered; opencode not installed → not.
         assert!(caps.offers(&RcKind::Codex));
         assert!(caps.creatable_kinds().contains(&RcKind::Codex));
         assert!(!caps.offers(&RcKind::Opencode));
