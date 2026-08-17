@@ -1,0 +1,33 @@
+[package]
+name = "sx"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "sx — the Rust porcelain for RC agent sessions. This crate carries the engine-compat `sx rc *` surface (a wire-compatible sibling of the Go shed-machine-rc one-shot verbs, pinned by the tests/rc-parity differential harness); the porcelain verbs land in plan 009 C7."
+
+[[bin]]
+name = "sx"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+shed-core = { path = "../shed-core" }
+# The ported one-shot RC engine lives behind shed-app's non-default `rc` feature.
+shed-app = { path = "../shed-app", features = ["rc"] }
+serde_json = { workspace = true }
+# `--prompt-b64` framing. Go's `base64.StdEncoding.DecodeString` requires padding
+# but IGNORES \r/\n and ACCEPTS non-canonical trailing bits — sx mirrors that via
+# a custom engine (`decode_b64_go`), NOT the stricter stock STANDARD engine.
+# Already a workspace dependency in the lock tree
+# (shed-core uses it for CSR/PEM), so this adds no new transitive surface.
+base64 = { workspace = true }
+
+[dev-dependencies]
+# The engine's fake tmux runner (`rc_engine::fake::FakeTmux`), exposed by shed-app's
+# test-only `test-support` feature. A dev-dependency (resolver v2) so the feature is
+# enabled for `cargo test -p sx` and NEVER for the shipped binary.
+shed-app = { path = "../shed-app", features = ["rc", "test-support"] }

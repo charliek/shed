@@ -56,8 +56,11 @@ pub mod plan;
 pub mod text;
 pub mod tmux;
 
-#[cfg(test)]
-pub(crate) mod fake;
+/// The engine's test doubles. Compiled only for this crate's own tests or when a
+/// consumer enables the `test-support` feature from its `[dev-dependencies]`
+/// (`sx`'s dispatch tests do) — never in a production build.
+#[cfg(any(test, feature = "test-support"))]
+pub mod fake;
 
 pub use netutil::free_loopback_port;
 pub use ops::{

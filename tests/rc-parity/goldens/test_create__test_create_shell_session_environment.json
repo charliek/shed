@@ -1,0 +1,10 @@
+{
+  "SHED_RC_CREATED_AT": "<ts>",
+  "SHED_RC_CREATED_BY": "<prog>",
+  "SHED_RC_DISPLAY_NAME": "parity-shell",
+  "SHED_RC_ID": "<id>",
+  "SHED_RC_KIND": "shell",
+  "SHED_RC_SLUG": "aa1111",
+  "SHED_RC_V": "2",
+  "SHED_RC_WORKDIR": "<home>"
+}

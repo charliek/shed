@@ -12,14 +12,14 @@ use super::tmux::{TmuxResult, TmuxRunner};
 
 type Handler = Box<dyn Fn(&[&str]) -> TmuxResult>;
 
-pub(crate) struct FakeTmux {
+pub struct FakeTmux {
     calls: RefCell<Vec<Vec<String>>>,
     handler: Handler,
 }
 
 impl FakeTmux {
     /// A fake answering through `handler` (which receives the raw argv).
-    pub(crate) fn new(handler: impl Fn(&[&str]) -> TmuxResult + 'static) -> Self {
+    pub fn new(handler: impl Fn(&[&str]) -> TmuxResult + 'static) -> Self {
         Self {
             calls: RefCell::new(Vec::new()),
             handler: Box::new(handler),
@@ -28,17 +28,17 @@ impl FakeTmux {
 
     /// A fake where every verb succeeds with empty output — Go's
     /// `&fakeTmux{handler: func(...) Result { return Result{Code: 0} }}`.
-    pub(crate) fn ok() -> Self {
+    pub fn ok() -> Self {
         Self::new(|_| TmuxResult::default())
     }
 
     /// Every recorded argv, in call order.
-    pub(crate) fn calls(&self) -> Vec<Vec<String>> {
+    pub fn calls(&self) -> Vec<Vec<String>> {
         self.calls.borrow().clone()
     }
 
     /// The FIRST recorded call whose verb is `verb` (Go's `callWith`).
-    pub(crate) fn call_with(&self, verb: &str) -> Option<Vec<String>> {
+    pub fn call_with(&self, verb: &str) -> Option<Vec<String>> {
         self.calls
             .borrow()
             .iter()
@@ -48,7 +48,7 @@ impl FakeTmux {
 
     /// How many recorded calls used `verb` — the keystroke-count pins (exactly
     /// one Enter for a trust accept, …).
-    pub(crate) fn count_with(&self, verb: &str) -> usize {
+    pub fn count_with(&self, verb: &str) -> usize {
         self.calls
             .borrow()
             .iter()
@@ -58,7 +58,7 @@ impl FakeTmux {
 
     /// Whether any recorded call carried `arg` anywhere in its argv (Go's
     /// `containsArg`).
-    pub(crate) fn any_arg(&self, arg: &str) -> bool {
+    pub fn any_arg(&self, arg: &str) -> bool {
         self.calls
             .borrow()
             .iter()
@@ -77,7 +77,7 @@ impl TmuxRunner for FakeTmux {
 
 /// A [`super::ops::GetEnv`] body over a fixed table, unset keys reading `""`
 /// (Go's `envFrom`, `plan_test.go:12`).
-pub(crate) fn env_from(pairs: &[(&str, &str)]) -> impl Fn(&str) -> String {
+pub fn env_from(pairs: &[(&str, &str)]) -> impl Fn(&str) -> String {
     let map: HashMap<String, String> = pairs
         .iter()
         .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
@@ -86,6 +86,6 @@ pub(crate) fn env_from(pairs: &[(&str, &str)]) -> impl Fn(&str) -> String {
 }
 
 /// The common case: a table carrying only `HOME`.
-pub(crate) fn home_env(home: &str) -> impl Fn(&str) -> String {
+pub fn home_env(home: &str) -> impl Fn(&str) -> String {
     env_from(&[("HOME", home)])
 }

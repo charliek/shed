@@ -119,4 +119,5 @@ site-build/
 # Python tooling caches for the integration suite
 tests/integration/.pytest_cache/
 tests/host-agent-diff/.pytest_cache/
+tests/rc-parity/.pytest_cache/
 **/__pycache__/
