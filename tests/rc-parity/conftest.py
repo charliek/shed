@@ -64,9 +64,9 @@ HUB_PORT = 1029
 #   codex/opencode/cursor -> their ready anchor  -> state "ready"
 #   claude                -> neutral text        -> state "starting"
 #
-# claude stays neutral on purpose: its ready state needs a URL, and a synthetic
-# claude.ai URL in a golden reads like a real one. C5's reactive shims (trust /
-# bypass dialogs that redraw after a keystroke) grow out of these.
+# claude stays neutral on purpose: its ready state needs a URL, so a static claude
+# shim can only ever be `starting`. The REACTIVE variants below (a dialog that
+# redraws after the engine's keystroke) are what exercise its ready path.
 SHIM_PANES = {
     "claude": ["claude fixture pane (rc-parity)"],
     "codex": ["Find and fix a bug in @filename"],
@@ -74,14 +74,95 @@ SHIM_PANES = {
     "cursor-agent": ["→ Plan, search, build anything"],
 }
 
-SHIM_TEMPLATE = """\
+# The version a shim answers `--version` with. Capability discovery probes every
+# agent binary with `bash -lc "'<bin>' --version"`; without this branch the shim
+# would print its pane and block on `cat` until the probe's timeout, and every
+# agent would degrade to "installed, version unknown" — testing the budget instead
+# of the parse. The value is masked in the differential (shape-asserted only).
+SHIM_VERSION = "rc-parity fake agent 1.2.3"
+
+# The preamble every shim shares: answer the capability probe, then record the argv
+# the engine actually launched us with.
+SHIM_PREAMBLE = """\
 #!/bin/sh
-# rc-parity fake agent — records argv, prints a fixed pane, then holds the pane
-# open on stdin so a delivered prompt echoes back for capture-pane assertions.
+# rc-parity fake agent — nothing real is ever launched.
+case "$1" in
+  --version) printf '%s\\n' '{version}'; exit 0 ;;
+esac
 for a in "$@"; do printf '%s\\n' "$a" >> "$HOME/agent-argv.txt"; done
+"""
+
+# The STATIC shim: draw a fixed pane, then hold the pane open on stdin so a
+# delivered prompt echoes back for capture-pane assertions.
+SHIM_TEMPLATE = (
+    SHIM_PREAMBLE
+    + """\
 {pane}
 exec cat
 """
+)
+
+# The REACTIVE shim (plan 009 §3.6): draw a dialog, block until the engine sends a
+# line-terminating keystroke — recording EVERY byte that arrives, in hex — then
+# redraw as ready. It is what proves the `--wait` poller's keystrokes: a static
+# pane would eat the whole 20 s timeout and prove nothing.
+#
+# Two mechanics worth knowing before reading a recorded transcript:
+#
+#   * the pane's tty is in CANONICAL mode (the shim never puts it in raw mode), so
+#     the CR that `tmux send-keys Enter` writes is delivered to the process as LF
+#     (ICRNL) and nothing is readable until that line terminator arrives. A `Down`
+#     (ESC [ B) therefore shows up in the SAME read burst as the Enter that
+#     follows it — which is exactly the ordering assertion we want.
+#   * the redraw pushes the dialog out of the engine's CAPTURE WINDOW with blank
+#     lines rather than an escape sequence (portable across dash and bash, whose
+#     `printf` disagree about `\033`). That window is `capture-pane -S -200` —
+#     the visible frame PLUS 200 lines of scrollback (`tmux.go:76`) — so scrolling
+#     the dialog off the visible pane is NOT enough: a trust dialog still inside
+#     the window keeps classifying as needs-trust, and the poller (whose accept is
+#     latched once) would then return needs-trust instead of ready. Hence 220
+#     lines. A real TUI redraws on the alternate screen and leaves no scrollback
+#     at all; this is the line-oriented equivalent.
+REACTIVE_TEMPLATE = (
+    SHIM_PREAMBLE
+    + """\
+{dialog}
+while :; do
+  b=$(dd bs=1 count=1 2>/dev/null | od -An -tx1 | tr -d ' \\n')
+  [ -n "$b" ] || break
+  printf '%s\\n' "$b" >> "$HOME/agent-stdin.hex"
+  [ "$b" = "0a" ] && break
+done
+i=0
+while [ $i -lt 220 ]; do printf '\\n'; i=$((i+1)); done
+{ready}
+exec cat
+"""
+)
+
+# claude's dialogs and its ready screen, anchored on the real classifier's regexes
+# (`internal/ext/rc/rc.go:374-398`, `agents.go:674-681`) — short lines, because a
+# detached tmux pane is 80 columns.
+TRUST_DIALOG = ["Quick safety check", "Yes, I trust this folder"]
+BYPASS_DIALOG = ["WARNING: Bypass Permissions mode", "2. Yes, I accept"]
+CLAUDE_READY = ["Remote Control active", "https://claude.ai/code/session_TESTTEST"]
+
+
+def _printf(lines) -> str:
+    return "printf '%s\\n' " + " ".join(f"'{line}'" for line in lines)
+
+
+def static_shim(pane) -> str:
+    """A shim that draws `pane` once and holds it open."""
+    return SHIM_TEMPLATE.format(version=SHIM_VERSION, pane=_printf(pane))
+
+
+def reactive_shim(dialog, ready=CLAUDE_READY) -> str:
+    """A shim that draws `dialog`, records the engine's keystrokes, then redraws
+    `ready` — the seam the `--wait` trust/bypass scenarios drive."""
+    return REACTIVE_TEMPLATE.format(
+        version=SHIM_VERSION, dialog=_printf(dialog), ready=_printf(ready)
+    )
 
 
 @dataclasses.dataclass
@@ -186,10 +267,13 @@ def hub_port_guard():
     )
 
 
-def _write_shims(shim_dir: Path) -> None:
-    for name, pane in SHIM_PANES.items():
-        lines = " ".join(f"'{line}'" for line in pane)
-        script = SHIM_TEMPLATE.format(pane=f"printf '%s\\n' {lines}")
+def _write_shims(shim_dir: Path, overrides: dict | None = None) -> None:
+    """Install the four fake agents. `overrides` replaces a named agent's script
+    wholesale (the reactive `--wait` variants) — both legs of a differential must
+    always be given the SAME overrides, or the two are not running one scenario."""
+    scripts = {name: static_shim(pane) for name, pane in SHIM_PANES.items()}
+    scripts.update(overrides or {})
+    for name, script in scripts.items():
         path = shim_dir / name
         path.write_text(script)
         os.chmod(path, 0o755)
@@ -237,7 +321,15 @@ def _clean_env(home: Path, tmux_tmpdir: Path, shim_dir: Path, tmux_path: str) ->
 class Leg:
     """One implementation running in its own HOME + tmux server."""
 
-    def __init__(self, impl: str, binary: str, home: Path, tmux_tmpdir: Path, tmux_bin: str):
+    def __init__(
+        self,
+        impl: str,
+        binary: str,
+        home: Path,
+        tmux_tmpdir: Path,
+        tmux_bin: str,
+        shims: dict | None = None,
+    ):
         self.impl = impl
         self.binary = binary
         self.home = home
@@ -245,8 +337,14 @@ class Leg:
         self.tmux_bin = tmux_bin
         self.shim_dir = home / "shims"
         self.shim_dir.mkdir()
-        _write_shims(self.shim_dir)
+        _write_shims(self.shim_dir, shims)
         self.env = _clean_env(home, tmux_tmpdir, self.shim_dir, tmux_bin)
+
+    def uninstall_agents(self, *names: str) -> None:
+        """Take agent binaries OFF this leg's PATH — how a capability differential
+        proves an `installed: false` row rather than asserting only the true one."""
+        for name in names:
+            (self.shim_dir / name).unlink(missing_ok=True)
 
     # -- the CLI under test -------------------------------------------------
 
@@ -310,13 +408,29 @@ class Leg:
         res = self.tmux("capture-pane", "-p", "-t", name)
         return res.stdout if res.returncode == 0 else ""
 
+    def read_bytes(self, relative: str) -> bytes:
+        """A file under this leg's HOME, as RAW BYTES — the preseed artifacts'
+        comparison model (plan 009 §3.5)."""
+        return (self.home / relative).read_bytes()
+
+    def _shim_log(self, relative: str) -> str:
+        """A file a shim appends to, or `""` when it does not exist yet — every
+        reader below is polled while the shim may not have written anything."""
+        try:
+            return (self.home / relative).read_text()
+        except OSError:
+            return ""
+
+    def agent_stdin_hex(self) -> list:
+        """The bytes the reactive shim received on stdin, one lowercase hex pair
+        per element, in arrival order — the proof of WHICH keystrokes the `--wait`
+        poller sent (a single Enter for trust; Down then Enter for bypass)."""
+        raw = self._shim_log("agent-stdin.hex")
+        return [line for line in raw.split("\n") if line.strip()]
+
     def agent_argv(self) -> list:
         """The argv the PATH-shim agent recorded (one element per line)."""
-        try:
-            raw = (self.home / "agent-argv.txt").read_text()
-        except OSError:
-            return []
-        lines = raw.split("\n")
+        lines = self._shim_log("agent-argv.txt").split("\n")
         # A complete capture ends with the trailing newline of its last element.
         return lines[:-1] if lines and lines[-1] == "" else []
 
@@ -350,8 +464,34 @@ class Leg:
 
         return self._poll(f"pane of {name} never showed {needle!r}", drawn, timeout)
 
-    def wait_for_agent_argv(self, timeout: float = 15) -> list:
-        return self._poll("the shim agent never recorded its argv", self.agent_argv, timeout)
+    def wait_for_agent_argv(self, count: int, timeout: float = 15) -> list:
+        """Poll until the shim has recorded at least `count` argv elements.
+
+        The count is REQUIRED, mirroring `wait_for_stdin_hex`, because the shim
+        writes its argv file element by element: polling for "non-empty" can read
+        a half-written file and hand back a short list. That is not theoretical —
+        it was observed live, one leg seeing 3 elements where the other saw 4,
+        which surfaces as a spurious cross-implementation diff rather than as an
+        honest failure. Waiting for the expected LENGTH makes the read
+        deterministic.
+        """
+
+        def recorded():
+            got = self.agent_argv()
+            return got if len(got) >= count else None
+
+        return self._poll(
+            f"the shim agent never recorded {count} argv element(s)", recorded, timeout
+        )
+
+    def wait_for_stdin_hex(self, count: int, timeout: float = 15) -> list:
+        """Poll until the reactive shim has recorded at least `count` bytes."""
+
+        def recorded():
+            got = self.agent_stdin_hex()
+            return got if len(got) >= count else None
+
+        return self._poll(f"the shim never received {count} stdin byte(s)", recorded, timeout)
 
     # -- teardown -----------------------------------------------------------
 
@@ -374,15 +514,19 @@ def isolated(binaries, tmux_bin, tmp_path_factory):
     Independent differentials use this — both legs pass the SAME pinned
     `--slug`/`--name`, so the two DTOs compare with no slug masking at all. (The
     SHARED flavor — one server + one HOME serving both implementations, for the
-    cross-impl interop and preseed-in-place cells — arrives with C6.)"""
+    cross-impl interop and preseed-in-place cells — arrives with C6.)
+
+    `shims` (the reactive `--wait` variants) applies when the leg is first built;
+    a scenario must pass the same value on both legs, which it does by
+    construction when it is a constant in the test body."""
     made: dict = {}
 
-    def _leg(impl: str) -> Leg:
+    def _leg(impl: str, shims: dict | None = None) -> Leg:
         if impl not in made:
             home = tmp_path_factory.mktemp(f"home-{impl}")
             # Shallow (AF_UNIX limit), NOT under pytest's nested tmp tree.
             tmux_tmpdir = Path(tempfile.mkdtemp(prefix="rcp-"))
-            made[impl] = Leg(impl, binaries[impl], home, tmux_tmpdir, tmux_bin)
+            made[impl] = Leg(impl, binaries[impl], home, tmux_tmpdir, tmux_bin, shims)
         return made[impl]
 
     yield _leg

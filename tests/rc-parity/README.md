@@ -38,7 +38,11 @@ and **tmux ≥ 3.2** (`new-session -e` is how session metadata is stamped — an
 floor on BOTH implementations, asserted by the `tmux_bin` fixture).
 
 Nothing real is ever launched: the four agent binaries (`claude`, `codex`, `opencode`,
-`cursor-agent`) are `sh` shims on a constructed PATH.
+`cursor-agent`) are `sh` shims on a constructed PATH. Each answers `--version` (so
+capability discovery probes something deterministic) and records the argv it was
+launched with; the **reactive** variants additionally record every stdin byte and
+redraw as ready once a keystroke arrives — which is what makes the `--wait`
+trust/bypass cells finish in one poll tick instead of eating the 20 s timeout.
 
 ## Recording and updating goldens
 
@@ -66,12 +70,16 @@ failed differential cell.
 | stderr | only the contract classes' messages, masked. Everything else (usage dumps, third-party parser detail) is out of contract. |
 | `show-environment` | a sorted key→value mapping of the `SHED_RC_*`/`OPENCODE_*` keys. tmux's render ORDER is a tmux-version detail; `BuildEnvArgs` ordering is pinned by Rust unit tests instead (§3.6). |
 | inner-command argv | the exact argv the agent received, order-sensitive (recorded by the shim). |
-| preseed artifacts, plan files | **raw bytes** — a mixed fleet rewrites these in place. Arrives with C5. |
+| preseed artifacts (`~/.claude.json`, `~/.cursor/hooks.json`), the cursor hook script, plan files | **raw bytes** — a mixed fleet rewrites these in place, so key order, indentation, HTML escaping and number fidelity are all contract. The only substitutions are the leg's `HOME` and the per-run pytest workdir. |
+| `capabilities` (standalone and embedded in `list`) | structural, with the agent **version values** masked after a `<major>.<minor>.<patch>` shape assert. `installed` booleans are diffed — the shims pin them, including the false case. |
+| `--wait` keystrokes | the exact bytes the agent received on stdin, in hex, in order (recorded by a reactive shim). |
 | `version` | fully masked after a `<prog> <version>` shape assert. |
 
-Masks: `<id>` (uuid), `<ts>` (RFC3339, shape-asserted first), `<home>`, `<port>`,
-`<prog>` (the binary's own name — `shed-machine-rc` vs `sx` is a designed difference,
-not a divergence), `<detail>` (a third-party parser's wording).
+Masks: `<id>` (uuid), `<ts>` (RFC3339, shape-asserted first), `<home>`, `<workdir>`
+(the per-run pytest dir a preseed records as a `projects` key), `<port>`,
+`<version>` (an agent's probed version), `<prog>` (the binary's own name —
+`shed-machine-rc` vs `sx` is a designed difference, not a divergence), `<detail>`
+(a third-party parser's wording).
 
 ## Hermeticity
 
@@ -104,17 +112,40 @@ both use the same pinned slug — independent differentials with no cross-talk.
 cross-impl interop cells (create with Go, probe/prompt/kill with Rust and vice versa)
 and preseed-in-place idempotence.
 
-## Scope today (C4) and what is coming
+## Scope today (C5) and what is coming
 
-Here: `version`, `create` (DTO + session environment + inner-command argv, `shell` and
-`opencode`), `probe`, `kill` (including its idempotence), `list` on an empty server,
-and the exit-code classes.
+Here — 42 differential cells, one golden each:
 
-**The `list` differential strips the `capabilities` block from BOTH sides** — Go's
-`doList` always embeds it and the Rust engine has no `capabilities.rs` until C5. That
-is a pinned decision (plan 009 §5, C4 row), not a bug: flip `strip_capabilities` in
-`normalize.mask_list` at C5 when the full envelope lands.
+* `version`; `create` (DTO + session environment + inner-command argv, `shell` and
+  `opencode`); `probe`; `kill` (including its idempotence); `list`; the exit-code
+  classes (`test_version.py`, `test_create.py`, `test_probe_kill.py`,
+  `test_exit_classes.py`).
+* **Preseeds as raw bytes** (`test_preseed.py`): `~/.claude.json` against a seeded
+  matrix — absent, empty, `null`, unknown keys with nested objects/arrays, the
+  number-fidelity set (`>2^53`, `1e10`, `0.10`, `-0`), HTML/`U+2028`/non-ASCII
+  escaping, the trailing-garbage refusal (file untouched, create still exit 0, the
+  reason on stderr), and merge idempotence — plus `~/.cursor/hooks.json` (fresh,
+  idempotent, user hooks preserved), the hub hook script's bytes and mode, and a
+  plan file's bytes and mode (with `--prompt-b64` framing riding alongside without
+  touching the file).
+* **Capabilities** (`test_capabilities.py`): the payload with two agents
+  deliberately off PATH, the full `list` envelope beside a live session, and the
+  absence of the block on a bare session DTO.
+* **`--wait` transitions** (`test_wait.py`): the trust dialog answered with exactly
+  one Enter, the bypass dialog answered with `Down` then Enter (`1b 5b 42 0a`), and
+  the single-line vs bracketed-paste kickoff deliveries.
 
-C5 adds the preseed raw-byte matrix, the capabilities surface, and reactive shims for
-the `--wait` trust/bypass auto-accept scenarios. C6 adds cross-impl interop,
-multi-line paste delivery, and the CI job.
+The C4 carve-out that stripped `capabilities` from the `list` differential is
+**gone** — both implementations embed the block, so the full envelope is compared
+and that golden was deliberately re-recorded.
+
+C6 adds cross-impl interop (create with Go, probe/prompt/kill with Rust and vice
+versa), the shared-HOME fixture flavor, and the CI job.
+
+### Known sensitivity
+
+Capability discovery has a hard **750 ms** budget shared by all agent probes, and a
+laggard degrades to "installed, version unknown" — deliberately, on both sides. If a
+machine is loaded enough that one leg's probes miss the budget and the other's do
+not, a capabilities cell fails on the `version` key rather than flaking silently.
+Re-run before investigating.

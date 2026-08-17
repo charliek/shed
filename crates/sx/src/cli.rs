@@ -24,14 +24,19 @@
 
 use std::cell::RefCell;
 use std::io::{Read, Write};
+use std::sync::Arc;
 use std::time::Duration;
 
 use base64::Engine as _;
+use shed_app::rc_engine::capabilities::{
+    build_capabilities, real_agent_probe, real_installed_probe, AgentProbe, InstalledProbe,
+};
 use shed_app::rc_engine::ops::{real_bin_probe, CreateOptions, Engine, EngineError, PromptOptions};
 use shed_app::rc_engine::plan::{plan_from_bytes, PLAN_MAX_BYTES};
+use shed_app::rc_engine::preseed;
 use shed_app::rc_engine::text::quote_go;
 use shed_app::rc_engine::tmux::TmuxRunner;
-use shed_core::rc::RcKind;
+use shed_core::rc::{RcCapabilities, RcKind};
 
 use crate::args::{boolean, parse, value, ArgError, Parsed, Spec};
 
@@ -92,6 +97,8 @@ type BinProbeFn<'a> = Box<dyn Fn(&str, bool) -> bool + 'a>;
 type HookFn<'a> = Box<dyn Fn() + 'a>;
 /// The `--wait` poll / settle sleep.
 type SleepFn<'a> = Box<dyn Fn(Duration) + 'a>;
+/// The per-tool create-time preseed (`AgentSpec.Preseed`).
+type PreseedFn<'a> = Box<dyn Fn(&RcKind, &str, &dyn Fn(&str) -> String) -> Result<(), String> + 'a>;
 
 /// The side-effecting dependencies — real in [`Deps::production`], fakes in tests.
 pub struct Deps<'a> {
@@ -114,6 +121,16 @@ pub struct Deps<'a> {
     pub sleep: Option<SleepFn<'a>>,
     /// Overrides the inter-keystroke settle (tests pass `Duration::ZERO`).
     pub settle: Option<Duration>,
+    /// Overrides the capability probe (`d.probe`, `clirc.go:391`). `None` uses
+    /// the real `bash -lc` probes; an injected one ALSO disables the fast
+    /// installed-only fallback, exactly as Go's `effectiveInstalled`
+    /// (`clirc.go:392`) does — an injected probe answers promptly and never hits
+    /// the budget.
+    pub probe: Option<AgentProbe>,
+    /// The per-tool preseed dispatch (`AgentSpec.Preseed`). `None` skips it
+    /// entirely — the same "absent hook" shape as `bin_probe`/`ensure_hub`, and
+    /// what the dispatch tests want: a preseed WRITES to `$HOME`.
+    pub preseed: Option<PreseedFn<'a>>,
 }
 
 impl<'a> Deps<'a> {
@@ -130,7 +147,30 @@ impl<'a> Deps<'a> {
             ensure_hub: Some(Box::new(ensure_hub)),
             sleep: None,
             settle: None,
+            probe: None,
+            preseed: Some(Box::new(preseed::dispatch)),
         }
+    }
+
+    /// The capability probe pair (`effectiveProbe`/`effectiveInstalled`,
+    /// `clirc.go:383-397`): the injected probe with NO fast fallback, or the real
+    /// login-shell probes.
+    fn probes(&self) -> (AgentProbe, Option<InstalledProbe>) {
+        match &self.probe {
+            Some(probe) => (Arc::clone(probe), None),
+            None => (
+                Arc::new(real_agent_probe),
+                Some(Arc::new(real_installed_probe)),
+            ),
+        }
+    }
+
+    /// The capabilities payload (`rc.BuildCapabilities(...)`), shared by
+    /// `capabilities` and the `list` envelope — Go assembles it the same way in
+    /// both places, one guest exec feeding both.
+    fn capabilities(&self) -> RcCapabilities {
+        let (probe, installed) = self.probes();
+        build_capabilities(&probe, installed.as_ref())
     }
 
     fn write_out(&self, text: &str) {
@@ -164,6 +204,9 @@ impl<'a> Deps<'a> {
         if let Some(settle) = self.settle {
             engine = engine.with_settle(settle);
         }
+        if let Some(preseed) = &self.preseed {
+            engine = engine.with_preseed(&**preseed);
+        }
         engine
     }
 }
@@ -189,13 +232,7 @@ fn run_rc(deps: &Deps, args: &[String]) -> i32 {
     match cmd.as_str() {
         "create" => finish(deps, do_create(deps, rest)),
         "list" => finish(deps, do_list(deps, rest)),
-        "capabilities" => {
-            // C5 ports `capabilities.go` (the budgeted concurrent agent probes).
-            // Until then this exits non-zero rather than emitting a partial
-            // payload a consumer would cache as truth.
-            deps.write_err(&format!("{PROG}: capabilities: not yet ported"));
-            1
-        }
+        "capabilities" => finish(deps, do_capabilities(deps, rest)),
         "probe" => finish(deps, do_probe(deps, rest)),
         "accept-trust" => finish(deps, do_slug_only(deps, rest, |e, s| e.accept_trust(s))),
         "prompt" => finish(deps, do_prompt(deps, rest)),
@@ -361,11 +398,23 @@ fn do_create(deps: &Deps, args: &[String]) -> Result<i32, ExitOr> {
 
 fn do_list(deps: &Deps, args: &[String]) -> Result<i32, ExitOr> {
     parse_flags(deps, &[], args)?;
-    // The `capabilities` block Go's `doList` embeds lands with C5; until then
-    // the envelope carries `rc_sessions` only (the harness strips the block
-    // from the Go side so the differential stays honest — plan 009 §5, C4).
-    let resp = deps.engine(false).list(None);
+    let mut resp = deps.engine(false).list(None);
+    // One invocation feeds both the session list and capability discovery
+    // (`doList`, `clirc.go:356-364`) — the block is an `omitempty` pointer on the
+    // Go side, and always present here because this producer always assembles it.
+    resp.capabilities = Some(deps.capabilities());
     Ok(print_json(deps, serde_json::to_string(&resp)))
+}
+
+/// The capabilities payload (kinds, per-agent install/version, features, per-kind
+/// UI hints) — the discovery mechanism that replaces error-string sniffing
+/// (`doCapabilities`, `clirc.go:371`).
+fn do_capabilities(deps: &Deps, args: &[String]) -> Result<i32, ExitOr> {
+    parse_flags(deps, &[], args)?;
+    Ok(print_json(
+        deps,
+        serde_json::to_string(&deps.capabilities()),
+    ))
 }
 
 fn do_probe(deps: &Deps, args: &[String]) -> Result<i32, ExitOr> {

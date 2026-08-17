@@ -13,6 +13,7 @@ use std::time::Duration;
 use serde_json::Value;
 use shed_app::rc_engine::fake::FakeTmux;
 use shed_app::rc_engine::tmux::{TmuxResult, TmuxRunner};
+use shed_core::rc::RcAgentInfo;
 
 use super::*;
 
@@ -74,6 +75,14 @@ fn run_with(runner: &dyn TmuxRunner, env: &[(&str, &str)], stdin: &str, args: &[
         ensure_hub: None,
         sleep: Some(Box::new(|_| {})),
         settle: Some(Duration::ZERO),
+        // A fixed probe (so no `bash` is spawned and the budget is never hit) and
+        // NO preseed — a preseed writes into `$HOME`, which a dispatch unit test
+        // must never do.
+        probe: Some(Arc::new(|bin: &str| RcAgentInfo {
+            installed: bin != "cursor-agent",
+            version: (bin != "cursor-agent").then(|| "1.2.3".to_string()),
+        })),
+        preseed: None,
     };
     let argv: Vec<String> = args.iter().map(|s| (*s).to_string()).collect();
     let code = run(&deps, &argv);
@@ -145,14 +154,6 @@ fn help_exits_zero() {
     let (out, _) = run_ok(&["help"]);
     assert_eq!(out.code, 0);
     assert!(out.stderr.contains("usage: sx"));
-}
-
-#[test]
-fn capabilities_is_stubbed_until_c5() {
-    let (out, _) = run_ok(&["rc", "capabilities"]);
-    assert_eq!(out.code, 1);
-    assert!(out.stderr.contains("capabilities: not yet ported"));
-    assert!(out.stdout.is_empty());
 }
 
 // ---------------------------------------------------------------------------
@@ -524,15 +525,63 @@ fn prompt_requires_non_empty_stdin() {
 }
 
 #[test]
-fn list_emits_an_envelope_without_a_capabilities_block() {
-    // C4: the Rust list carries `rc_sessions` only — capabilities lands with C5,
-    // and the parity harness strips the block from the Go side until then.
+fn list_embeds_the_capabilities_block() {
+    // `doList` (`clirc.go:356`) feeds both halves from one invocation: the
+    // sessions AND the capability discovery block clients read instead of
+    // sniffing error strings.
     let fake = FakeTmux::ok();
     let out = run_with(&fake, HOME_ENV, "", &["rc", "list"]);
     assert_eq!(out.code, 0, "stderr={:?}", out.stderr);
     let env = out.json();
     assert_eq!(env["rc_sessions"], Value::Array(vec![]));
-    assert!(env.get("capabilities").is_none());
+    let caps = &env["capabilities"];
+    assert_eq!(caps["rc_version"], 4);
+    assert_eq!(caps["kinds"][0], "claude-broker");
+    assert_eq!(caps["agents"]["claude"]["installed"], true);
+    assert_eq!(caps["kind_features"]["opencode"]["input"], "turn");
+}
+
+#[test]
+fn capabilities_prints_the_discovery_payload() {
+    let fake = FakeTmux::ok();
+    let out = run_with(&fake, HOME_ENV, "", &["rc", "capabilities"]);
+    assert_eq!(out.code, 0, "stderr={:?}", out.stderr);
+    let caps = out.json();
+    assert_eq!(caps["rc_version"], 4);
+    assert_eq!(
+        caps["features"],
+        serde_json::json!([
+            "generic-perm",
+            "plan-stdin",
+            "prompt-b64",
+            "serve",
+            "activity",
+            "messages",
+            "contract-v2"
+        ])
+    );
+    // The injected probe reports cursor-agent absent — and an absent agent omits
+    // its `version` key entirely (Go's omitempty).
+    assert_eq!(
+        caps["agents"]["cursor"],
+        serde_json::json!({"installed": false})
+    );
+    assert_eq!(caps["agents"]["codex"]["version"], "1.2.3");
+    // shell has no binary, so it is never probed.
+    assert!(caps["agents"].get("shell").is_none());
+    // Both omitted kinds stay out of kind_features while remaining in `kinds`.
+    assert!(caps["kind_features"].get("shell").is_none());
+    assert!(caps["kind_features"].get("claude-broker").is_none());
+}
+
+#[test]
+fn capabilities_rejects_a_stray_positional() {
+    err(
+        2,
+        "unexpected argument \"x\"",
+        &["rc", "capabilities", "x"],
+        "",
+    );
 }
 
 #[test]

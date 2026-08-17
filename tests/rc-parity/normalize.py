@@ -6,20 +6,21 @@ Two disciplines inherited from `tests/host-agent-diff/normalize.py`:
   sorts object keys; lists stay order-sensitive. This is the comparison model plan
   009 §3.5 pins for DTO stdout: Go's `json.Encoder` HTML-escapes `<`/`>`/`&` and
   appends a newline, serde_json does neither, and no consumer byte-compares
-  stdout — so field PRESENCE is contract, byte shape is not. (Preseed artifacts,
-  which a mixed fleet rewrites in place, ARE a raw-bytes surface — they arrive
-  with C5.)
+  stdout — so field PRESENCE is contract, byte shape is not. Preseed artifacts,
+  which a mixed fleet rewrites IN PLACE, are the exception: `mask_file_bytes`
+  compares them as raw bytes, with no canonicalization at all.
 
 * **D3 — determinism over blanking.** Mask as little as possible and SHAPE-ASSERT
   before masking, so a mask can never hide a malformed value. Distinct sentinels
   make a cross-field leak obvious when eyeballing a golden.
 
-The four sentinels here are exactly the four axes on which two correct
-implementations must differ: a fresh uuid, a wall-clock stamp, the isolated HOME
-each leg runs under, and the loopback port opencode was handed. `<prog>` is the
-fifth — the binary's own name, which is deliberately NOT the same on both sides
-(`shed-machine-rc` vs `sx`) and which the plan pins as a masked token rather than
-a divergence.
+The sentinels are exactly the axes on which two correct implementations (or two
+runs) must differ: a fresh uuid, a wall-clock stamp, the isolated HOME each leg
+runs under, the per-run pytest workdir a preseed records as a `projects` key, the
+loopback port opencode was handed, and the agent version a probe read. `<prog>` is
+the odd one out — the binary's own name, which is deliberately NOT the same on
+both sides (`shed-machine-rc` vs `sx`) and which the plan pins as a masked token
+rather than a divergence.
 """
 
 from __future__ import annotations
@@ -34,6 +35,13 @@ MASK_HOME = "<home>"
 MASK_PORT = "<port>"
 MASK_PROG = "<prog>"
 MASK_DETAIL = "<detail>"
+MASK_VERSION = "<version>"
+MASK_WORKDIR = "<workdir>"
+
+# An agent version as `ParseAgentVersion` returns it for the shims' `--version`
+# line. Shape-asserted before masking so an implementation that failed to PARSE
+# (and echoed the whole line, or reported "") is a failure, not a mask.
+_VERSION = re.compile(r"^\d+\.\d+\.\d+$")
 
 # RFC3339 with second precision. Go stamps `time.Now().UTC().Format(time.RFC3339)`
 # and the Rust engine's clock seam formats seconds-precision UTC with a `Z`; an
@@ -90,16 +98,32 @@ def mask_prog(text: str) -> str:
     return _PROG_RE.sub(MASK_PROG, text)
 
 
-def mask_home(text: str, home: str) -> str:
-    """Replace the leg's isolated HOME prefix with `<home>`, keeping any suffix —
-    so `<home>/.shed-plans/plan-aa1111.md` still diffs its structure."""
-    if not home:
+def _mask_path(text: str, path: str, mask: str) -> str:
+    """Replace `path` with `mask` wherever it appears, keeping any suffix — so
+    `<home>/.shed-plans/plan-aa1111.md` still diffs its structure.
+
+    The realpath form is substituted too: macOS resolves /var -> /private/var, and
+    an engine reads the path verbatim while tmux (or a preseed's own `os.Getwd`)
+    may report the resolved one.
+
+    LONGEST candidate first, and never over a set: on macOS one form is a strict
+    SUFFIX-bearing prefix of the other (`/var/...` vs `/private/var/...`), so
+    replacing the short one first leaves `/private<mask>` behind while replacing
+    the long one first is clean. Iterating a set made that order depend on
+    PYTHONHASHSEED, which differs per process — so the two legs of a differential
+    could canonicalize the same path differently and diff on the masking rather
+    than on the behavior."""
+    if not path:
         return text
-    # The realpath form too: macOS resolves /var -> /private/var, and the engine
-    # reads $HOME verbatim while tmux may report the resolved path.
-    for candidate in {home, os.path.realpath(home)}:
-        text = text.replace(candidate, MASK_HOME)
+    candidates = sorted({path, os.path.realpath(path)}, key=len, reverse=True)
+    for candidate in candidates:
+        text = text.replace(candidate, mask)
     return text
+
+
+def mask_home(text: str, home: str) -> str:
+    """Replace the leg's isolated HOME prefix with `<home>`."""
+    return _mask_path(text, home, MASK_HOME)
 
 
 def mask_text(text: str, home: str) -> str:
@@ -159,21 +183,80 @@ def mask_session(dto: dict, home: str) -> dict:
     return out
 
 
-def mask_list(envelope: dict, home: str, *, strip_capabilities: bool = True) -> dict:
-    """Mask a `list` envelope.
+def mask_capabilities(caps: dict) -> dict:
+    """Mask a `capabilities` payload: only the agent VERSION strings, and only
+    after a shape assert.
 
-    `strip_capabilities` drops the block from BOTH sides: Go's `doList` always
-    embeds it and the Rust engine has no `capabilities.rs` until C5, so C4 pins
-    the sessions half only (plan 009 §5, C4 row). The full envelope compare lands
-    with C5 — flip this to False there rather than growing a second masker."""
+    Everything else is diffed: `rc_version`, the ordered `kinds` list, the ordered
+    `features` token list, the whole `kind_features` matrix, and — load-bearing —
+    each agent's `installed` boolean, which the PATH shims pin deterministically
+    (an uninstalled agent is one the test removed from the shim dir).
+
+    The version values are masked because they are the one thing a real
+    installation would change under the harness's feet; the shape assert
+    (`<major>.<minor>.<patch>`) still proves BOTH implementations parsed the shim's
+    `--version` output rather than reporting an empty string."""
+    assert isinstance(caps, dict), f"not a capabilities payload: {caps!r}"
+    out = dict(caps)
+    agents = out.get("agents")
+    assert isinstance(agents, dict), f"capabilities.agents missing: {caps!r}"
+    masked = {}
+    for tool, info in agents.items():
+        assert isinstance(info, dict), f"agents[{tool}] is not an object: {info!r}"
+        row = dict(info)
+        assert isinstance(row.get("installed"), bool), f"agents[{tool}].installed: {info!r}"
+        if "version" in row:
+            assert row["installed"], f"agents[{tool}] reports a version while not installed"
+            assert _VERSION.match(str(row["version"])), (
+                f"agents[{tool}].version is not version-shaped: {row['version']!r} — "
+                "both implementations must PARSE the probe output, not echo it"
+            )
+            row["version"] = MASK_VERSION
+        masked[tool] = row
+    out["agents"] = masked
+    return out
+
+
+def mask_list(envelope: dict, home: str) -> dict:
+    """Mask a `list` envelope — the sessions AND the embedded capabilities block.
+
+    Go's `doList` always embeds capabilities (`clirc.go:356`), and since C5 so does
+    `sx rc list`, so the FULL envelope is compared here. (C4 stripped the block
+    from both sides while the Rust engine had no `capabilities.rs`; that carve-out
+    is gone.)"""
     assert isinstance(envelope, dict), f"not a list envelope: {envelope!r}"
     out = dict(envelope)
     sessions = out.get("rc_sessions")
     assert isinstance(sessions, list), f"rc_sessions missing/not a list: {envelope!r}"
     out["rc_sessions"] = [mask_session(s, home) for s in sessions]
-    if strip_capabilities:
-        out.pop("capabilities", None)
+    caps = out.get("capabilities")
+    assert isinstance(caps, dict), (
+        f"the list envelope must embed a capabilities block: {envelope!r}"
+    )
+    out["capabilities"] = mask_capabilities(caps)
     return out
+
+
+def mask_file_bytes(raw: bytes, home: str, workdir: str | None = None) -> str:
+    """A preseed artifact as a RAW-BYTES surface (plan 009 §3.5).
+
+    The only transformation is the leg's isolated HOME prefix — a genuine per-leg
+    difference, exactly like `<home>` everywhere else — and it is applied to the
+    decoded text, never to the structure: no JSON parse, no key sorting, no
+    whitespace normalization. Two implementations whose writers disagree on key
+    order, indentation, HTML escaping or number fidelity fail HERE, which is the
+    entire point of the byte-exact writer.
+
+    `workdir` masks the create's `--workdir`, which the claude preseed writes as
+    a `projects` KEY. Both legs of a cell pass the same directory (that is what
+    makes the two documents byte-identical), so masking it costs the differential
+    nothing — but the path is a per-RUN pytest tmp dir, and an unmasked one would
+    make every golden here stale on the next run.
+
+    The bytes must be UTF-8 (both writers emit UTF-8 JSON or a POSIX shell
+    script); a decode failure is a real finding, not something to paper over."""
+    text = _mask_path(raw.decode("utf-8"), workdir or "", MASK_WORKDIR)
+    return mask_home(text, home)
 
 
 def mask_env(dump: dict, home: str) -> dict:

@@ -1,0 +1,18 @@
+{
+  "dto": {
+    "created_at": "<ts>",
+    "created_by": "<prog>",
+    "display_name": "parity-kickoff",
+    "id": "<id>",
+    "kind": "claude-rc",
+    "lane": "tui",
+    "managed": true,
+    "slug": "kk1111",
+    "state": "ready",
+    "tmux_session": "rc-kk1111",
+    "url": "https://claude.ai/code/session_TESTTEST",
+    "workdir": "<home>"
+  },
+  "marker_count": 2,
+  "tail": "PARITYMARKER do the thing"
+}

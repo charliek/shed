@@ -20,18 +20,17 @@
 //! [`crate::rc`] client (`RcService`, the thin SSH client OF this engine running
 //! on a remote) is a different layer entirely and is untouched.
 //!
-//! ## What is here (C3) and what is not
+//! ## What is here
 //!
-//! Here: [`tmux`] (the runner seam + verb helpers, `tmux.go`), [`ops`] (create /
-//! list / probe / prompt / kill / accept-trust + the `--wait` poller, `ops.go`),
-//! [`plan`] (`plan.go`), [`netutil`] (`netutil.go`), and [`text`] (the two prompt
-//! helpers from `rc.go` that C1 did not carry over).
-//!
-//! Not here yet: the claude/cursor **preseeds** (`trust.go`,
-//! `preseed_cursor.go`) and **capabilities** probing (`capabilities.go`) — C5.
-//! [`ops::Engine::with_preseed`] already carries the seam so create's ordering
-//! (preseed strictly BEFORE `tmux new-session`) is pinned now rather than
-//! retrofitted later.
+//! [`tmux`] (the runner seam + verb helpers, `tmux.go`), [`ops`] (create / list /
+//! probe / prompt / kill / accept-trust + the `--wait` poller, `ops.go`),
+//! [`plan`] (`plan.go`), [`netutil`] (`netutil.go`), [`text`] (the two prompt
+//! helpers from `rc.go` that C1 did not carry over), the create-time
+//! **preseeds** ([`trust`] = `trust.go`, [`preseed_cursor`] =
+//! `preseed_cursor.go`, dispatched per kind by [`preseed`] the way
+//! `AgentSpec.Preseed` is), the byte-exact Go-`encoding/json` writer they rewrite
+//! their files with ([`go_json`]), and **capability discovery**
+//! ([`capabilities`] = `capabilities.go`).
 //!
 //! Never here: the activity **hub** (`serve`). It stays the Go binary this block
 //! (plan 009 §0); the engine only carries the best-effort *ensure* hook
@@ -50,11 +49,16 @@
 //! - Error **classes** (and their `invalid arguments: ` / `rc session …` message
 //!   prefixes) are wire contract — see [`ops::EngineError`].
 
+pub mod capabilities;
+pub mod go_json;
 pub mod netutil;
 pub mod ops;
 pub mod plan;
+pub mod preseed;
+pub mod preseed_cursor;
 pub mod text;
 pub mod tmux;
+pub mod trust;
 
 /// The engine's test doubles. Compiled only for this crate's own tests or when a
 /// consumer enables the `test-support` feature from its `[dev-dependencies]`
@@ -62,12 +66,17 @@ pub mod tmux;
 #[cfg(any(test, feature = "test-support"))]
 pub mod fake;
 
+pub use capabilities::{
+    build_capabilities, real_agent_probe, real_installed_probe, AgentProbe, InstalledProbe,
+    CAPABILITY_FEATURES, CAPABILITY_VERSION, PROBE_BUDGET,
+};
 pub use netutil::free_loopback_port;
 pub use ops::{
     real_bin_probe, CreateOptions, Engine, EngineError, GetEnv, PromptOptions, DEFAULT_CREATED_BY,
     DEFAULT_POLL_EVERY, DEFAULT_WAIT_TIMEOUT, ENV_NO_HUB, PROMPT_DELIVER_SETTLE,
 };
 pub use plan::{compose_plan_kickoff, plan_from_bytes, plan_path, PLAN_MAX_BYTES};
+pub use preseed::{dispatch as preseed_for_kind, PreseedError};
 pub use text::{has_unsafe_prompt_chars, normalize_newlines};
 pub use tmux::{
     is_duplicate_session, is_missing_session, ExecRunner, Tmux, TmuxResult, TmuxRunner,

@@ -111,6 +111,7 @@ def test_create_opencode_inner_command_argv(differential, isolated):
         leg = isolated(impl)
         _create_opencode(leg)
         leg.wait_for_session(f"rc-{OPENCODE_SLUG}")
-        return mask_argv(leg.wait_for_agent_argv(), str(leg.home))
+        # 4 elements: `--port <p> --hostname 127.0.0.1`.
+        return mask_argv(leg.wait_for_agent_argv(4), str(leg.home))
 
     differential(scenario)

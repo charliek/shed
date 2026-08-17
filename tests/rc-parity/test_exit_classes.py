@@ -161,19 +161,18 @@ def test_missing_slug_flag_is_bad_args(differential, isolated):
 
 def test_list_on_an_empty_server(differential, isolated):
     """The envelope with no sessions: `rc_sessions` is ALWAYS an array (never null
-    or absent), and the `capabilities` block is stripped from BOTH sides at C4 —
-    Go's `doList` always embeds it and the Rust engine has no capabilities module
-    until C5 (plan 009 §5)."""
+    or absent), and the `capabilities` block both implementations embed rides
+    along (C5 — the C4 strip is gone, so this golden was deliberately
+    re-recorded)."""
 
     def scenario(impl):
         leg = isolated(impl)
         res = leg.run("list")
         assert res.returncode == 0, f"{impl}: exit {res.returncode}: {res.stderr}"
         envelope = res.json()
-        # The Go side really does carry the block today — pin that it was there to
-        # strip, so C5 flipping `strip_capabilities` is a deliberate act.
-        if impl == "go":
-            assert "capabilities" in envelope, envelope
+        assert "capabilities" in envelope, envelope
         return mask_list(envelope, str(leg.home))
 
-    assert differential(scenario)["rc_sessions"] == []
+    envelope = differential(scenario)
+    assert envelope["rc_sessions"] == []
+    assert envelope["capabilities"]["rc_version"] == 4

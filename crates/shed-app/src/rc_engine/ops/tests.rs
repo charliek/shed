@@ -1020,6 +1020,51 @@ fn preseed_runs_before_new_session_and_never_fails_the_create() {
     );
 }
 
+/// The REAL preseed dispatch, on a `~/.claude.json` nested far past the JSON
+/// parser's depth cap — end to end through the engine, not just the module.
+///
+/// This is the regression cell for a process ABORT: an uncapped recursive parser
+/// overflows the stack on this input, and a Rust stack overflow is a SIGABRT, so
+/// the failure mode was `sx` dying mid-create rather than a create that carries
+/// on. Contract: warn-and-skip, `new-session` still runs, file untouched.
+#[test]
+fn a_pathologically_deep_claude_json_warns_and_the_create_still_succeeds() {
+    let home = tempfile::tempdir().unwrap();
+    let path = home.path().join(".claude.json");
+    let depth = 100_000;
+    let deep = format!("{{\"a\":{}{}}}", "[".repeat(depth), "]".repeat(depth));
+    std::fs::write(&path, &deep).unwrap();
+
+    let f = FakeTmux::ok();
+    let ticks = Cell::new(Duration::ZERO);
+    let warned = Cell::new(String::new());
+    let eng = engine(&f, &ticks)
+        .with_env(home_env(home.path().to_str().unwrap()))
+        .with_warn(|m| warned.set(m.to_string()))
+        .with_preseed(crate::rc_engine::preseed::dispatch);
+
+    let mut opts = CreateOptions::new(RcKind::ClaudeRc);
+    opts.slug = "abc123".to_string();
+    let session = eng.create(opts).unwrap();
+
+    assert_eq!(
+        session.state,
+        RcState::Starting,
+        "the create still succeeds"
+    );
+    let warning = warned.take();
+    assert!(
+        warning.starts_with("claude preseed skipped: ") && warning.contains("exceeded max depth"),
+        "want the depth refusal on the warn sink, got: {warning}"
+    );
+    assert!(
+        f.calls().iter().any(|c| c[0] == "new-session"),
+        "the session must still have been created"
+    );
+    // Merge — never clobber: a declined preseed leaves the bytes as they were.
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), deep);
+}
+
 // ---------------------------------------------------------------------------
 // list / probe (Go TestListParsesAll :874, TestProbeMissing :752)
 // ---------------------------------------------------------------------------
