@@ -68,6 +68,15 @@ const (
 	// hubPidName is the advisory/debug pidfile inside hubDirName (NOT the lock —
 	// the port bind is the lock).
 	hubPidName = "hub.pid"
+
+	// EnvNoHub is a PROCESS-environment kill-switch (not a SHED_RC_* session key):
+	// when set to any non-empty value, the create path skips its best-effort hub
+	// ensure entirely. It exists for hermetic harnesses (the Go↔Rust rc parity
+	// suite) that must not have every `create` spawn a detached daemon on the
+	// fixed loopback port; production never sets it, and an explicit `serve` is
+	// unaffected. The Rust engine honors the same variable so the switch works
+	// symmetrically across the mixed fleet.
+	EnvNoHub = "SHED_RC_NO_HUB"
 )
 
 // Hub tuning defaults. All are overridable via HubConfig for tests; production
@@ -949,10 +958,12 @@ func probeHubIdentity(addr string, budget time.Duration) error {
 // EnsureHub best-effort ensures a hub is running for this host/shed, spawning the
 // detached daemon if needed. It NEVER fails its caller (create) — a spawn failure
 // is logged to stderr and swallowed. This is the single helper the create path
-// and (later) the server proxy call.
-func EnsureHub(cfg HubConfig, stderr io.Writer) {
+// and (later) the server proxy call. progName prefixes the (best-effort) failure
+// line so the binary reports as itself — shed-machine-rc must not claim to be
+// shed-ext-rc.
+func EnsureHub(cfg HubConfig, stderr io.Writer, progName string) {
 	if err := DetachHub(cfg); err != nil && stderr != nil {
-		fmt.Fprintf(stderr, "shed-ext-rc: rc hub ensure failed (best-effort): %v\n", err)
+		fmt.Fprintf(stderr, "%s: rc hub ensure failed (best-effort): %v\n", progName, err)
 	}
 }
 
