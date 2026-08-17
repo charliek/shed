@@ -1,0 +1,26 @@
+  Cursor Agent
+  v2026.08.11-e8db854
+  Tip: Use /run-everything to skip all approvals.
+
+
+  run the release build
+
+
+  I'll run the release build script now.
+
+  Shell  ./scripts/build.sh --release
+
+ ──────────────────────────────────────────────────────────────────────────────
+ Run this command?
+ Not in allowlist: ./scripts/build.sh --release
+
+   → Run (once) (y)
+     Add Shell(./scripts/build.sh) to allowlist? (tab)
+     Run Everything (shift+tab)
+     Skip & tell the agent what to do instead (esc or n)
+
+  → Add a follow-up
+
+
+  Auto · 12.4%
+  ~

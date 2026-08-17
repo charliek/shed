@@ -300,7 +300,26 @@ pub enum RcError {
 /// inside the shed and can't know the host alias / shed name — the app injects
 /// those and maps `id`→`rc_id`). Optional fields are absent (not null) when
 /// unknown; `managed` defaults to false on a legacy payload.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+/// # Serialization (added for the Rust rc engine — plan 009)
+///
+/// The `Serialize` half exists so the ported engine can PRODUCE this wire shape,
+/// not only consume it, and its field-presence semantics mirror the Go
+/// producer's struct tags EXACTLY (`internal/ext/rc/rc.go:154-202`), because the
+/// Go↔Rust parity harness compares stdout structurally — key ORDER is
+/// irrelevant, key PRESENCE is contract:
+///
+/// - `slug`, `tmux_session`, `kind`, `state`, `managed` — always present
+///   (`managed` notably even when `false`).
+/// - `lane` — Go has no `omitempty` and always emits it; here it is `Option`
+///   only because an OLD (pre-v2) producer's payload omits it. Emitted whenever
+///   present and skipped when absent, so a decode→encode round trip is faithful
+///   and the engine (which always sets it) is byte-comparable with Go.
+/// - every other field — absent, never `null` and never `""`. The engine's
+///   [`crate::rc_agents::parse_session`] maps Go's empty strings to `None` at
+///   construction, so `skip_serializing_if = "Option::is_none"` reproduces
+///   `omitempty` exactly without an empty-string special case (which would break
+///   round-tripping).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct RcSessionDto {
     pub slug: String,
     pub tmux_session: String,
@@ -317,25 +336,35 @@ pub struct RcSessionDto {
     /// [`RcSessionDto::lane_or_tui`], which applies the contract's absent-⇒-`tui`
     /// rule. Carried verbatim (never parsed into an enum): a future lane value
     /// must render neutrally, not vanish the session.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lane: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub display_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub workdir: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub created_by: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub created_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub target_label: Option<String>,
     /// Live-activity dimension (additive inside the `rc` block; derived by the
     /// rc hub). Absent when no hub is running, the kind is unsupported, or the
     /// server suppressed it (a blocking lifecycle state trumps activity).
     /// Mirrors mobile's `RcSession.activity` (`rc_models.dart:222-234`).
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub activity: Option<RcActivity>,
     /// RFC3339 timestamp the activity was last derived/changed; absent with
     /// `activity`.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub activity_at: Option<String>,
     /// A short, hub-sanitized (ANSI/control-stripped, ≤200 runes) preview of
     /// the session's most recent message. Absent when the hub has none.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub last_message: Option<String>,
     /// The session's currently-unresolved approval requests (contract v2) — the
     /// snapshot that keeps a session ACTIONABLE after the feed ring evicted (or a
@@ -343,7 +372,7 @@ pub struct RcSessionDto {
     /// HUB-LAYER field: the one-shot `list` path this DTO usually comes from never
     /// sets it, and nothing produces approvals in this phase, so it is absent
     /// (`None`) on every wire today. See [`RcFeedApproval`] for the folding rule.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pending_approvals: Option<Vec<RcFeedApproval>>,
 }
 
@@ -385,10 +414,14 @@ pub fn lane_or_tui(lane: Option<&str>) -> &str {
 /// `capabilities`: an OLD baked-in binary's bare `{"rc_sessions":[…]}` envelope has
 /// no block, so it decodes to `None` (the capability-discovery leg degrades, it
 /// does not error).
-#[derive(Debug, Clone, Deserialize)]
+///
+/// Serializes with the producer's presence semantics (`rc.go:208-211`):
+/// `rc_sessions` is ALWAYS emitted (as `[]` when there are none), `capabilities`
+/// is an `omitempty` pointer and is omitted when absent.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 pub struct RcSessionListDto {
     pub rc_sessions: Vec<RcSessionDto>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub capabilities: Option<RcCapabilities>,
 }
 
@@ -431,27 +464,43 @@ pub struct RcAgentInfo {
 /// producer side) until every client reads `feed`, so the two can be trusted to
 /// agree; read them through [`RcKindFeatures::feed_messages`], which prefers
 /// `feed` and falls back to `watch` on a payload that predates it.
+///
+/// **Serialization mirrors the Go producer's `omitempty` set exactly**
+/// (`internal/ext/rc/capabilities.go:96-104`): `post_input`, `approvals` and
+/// `interrupt` are unconditional; `watch` is skipped when `false`, and `input` /
+/// `feed` / `attach` when empty. That re-emission fidelity is the whole point of
+/// the Go tags — a newer producer re-emitting an OLDER guest's decoded
+/// capabilities must emit the unknown fields as ABSENT, not as `""`/`false`, so
+/// the client-side absent-field fallbacks ([`RcKindFeatures::feed_messages`],
+/// [`RcKindFeatures::attach_kind`]) still apply on a mixed-version fleet.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RcKindFeatures {
     pub post_input: bool,
     pub approvals: String,
     /// DEPRECATED by [`RcKindFeatures::feed`] (kept until clients migrate; the
     /// producer maintains the lockstep described on the struct).
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_false")]
     pub watch: bool,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub input: String,
     /// Empty on a pre-v2 payload — and, per the producer's omitempty note, on a
     /// newer server re-emitting an older guest's decoded capabilities. Use
     /// [`RcKindFeatures::feed_messages`] rather than comparing this directly.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub feed: String,
     #[serde(default)]
     pub interrupt: bool,
     /// Empty on a pre-v2 payload; read it through
     /// [`RcKindFeatures::attach_kind`], which applies the `"tmux"` fallback.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub attach: String,
+}
+
+/// Go's `omitempty` on a `bool` field: `false` is the zero value and is omitted.
+/// (`serde` has no built-in for this — `skip_serializing_if` needs a predicate
+/// over a reference.)
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 impl RcKindFeatures {
@@ -1028,11 +1077,16 @@ pub struct RcFeedApproval {
     pub id: String,
     /// `"pending"` or `"resolved"`.
     pub status: String,
-    /// The decision that resolved it (`None` while pending).
+    /// The decision that resolved it (`None` while pending). Go tags it
+    /// `omitempty` (hub_messages.go), so serialization skips `None` — absent,
+    /// never `null` — matching every other optional on the wire.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub decision: Option<String>,
     /// The decisions this request accepts (a subset of `allow`/`allow_always`/
     /// `deny`), advertised per request so a client renders exactly the buttons
-    /// the lane will honor. Empty when the producer advertised none.
+    /// the lane will honor. Empty when the producer advertised none — and, like
+    /// Go's `omitempty`, skipped entirely when empty rather than emitted as `[]`.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub decisions: Vec<String>,
 }
 
@@ -2137,6 +2191,125 @@ mod tests {
         // claude-broker and shell stay OMITTED — absent entry = no affordances.
         assert!(!caps.kind_features.contains_key("claude-broker"));
         assert!(!caps.kind_features.contains_key("shell"));
+    }
+
+    /// The `Serialize` half added for the Rust rc engine (plan 009) must be a
+    /// faithful inverse of the decoder: decode the canonical golden → re-encode →
+    /// decode again → identical. A `skip_serializing_if` that is too eager (an
+    /// emitted field dropped) or too lax (an absent field materialized as
+    /// `null`/`""`) breaks this immediately, which is exactly the class of bug the
+    /// Go↔Rust differential would otherwise catch a whole commit later.
+    #[test]
+    fn list_envelope_round_trips_through_serialization() {
+        let first = decode_list_response(LIST_GOLDEN).unwrap();
+        let encoded = serde_json::to_string(&first).unwrap();
+        let second = decode_list_response(&encoded).unwrap();
+        assert_eq!(first, second);
+        // Stronger: the re-encode is STRUCTURALLY identical to the golden itself
+        // — the exact comparison model the Go↔Rust parity harness applies to DTO
+        // stdout (parse → compare; key order irrelevant, key PRESENCE contract).
+        // Byte comparison is deliberately NOT asserted: Go's `json.Marshal` sorts
+        // map keys and HTML-escapes `<`/`>`/`&`, serde_json does neither, and no
+        // consumer of this stdout byte-compares it (they all parse).
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&encoded).unwrap(),
+            serde_json::from_str::<serde_json::Value>(LIST_GOLDEN).unwrap(),
+        );
+    }
+
+    /// Mirrors the Go producer's `TestSessionMarshalOmitsEmptyOptionals`
+    /// (`internal/ext/rc/golden_test.go:119`): a minimal DTO re-marshals with its
+    /// optional fields ABSENT (not `null`, not `""`), while `managed` and `lane`
+    /// are the always-present exceptions. This is the wire contract the Swift
+    /// Codable and TS Zod consumers rely on.
+    #[test]
+    fn minimal_session_marshals_without_empty_optionals() {
+        let dto = RcSessionDto {
+            slug: "x".into(),
+            tmux_session: "rc-x".into(),
+            kind: RcKind::Shell,
+            state: RcState::Starting,
+            managed: false,
+            lane: Some(LANE_TUI.into()),
+            display_name: None,
+            workdir: None,
+            url: None,
+            id: None,
+            created_by: None,
+            created_at: None,
+            target_label: None,
+            activity: None,
+            activity_at: None,
+            last_message: None,
+            pending_approvals: None,
+        };
+        let s = serde_json::to_string(&dto).unwrap();
+        for omitted in [
+            "display_name",
+            "workdir",
+            "url",
+            "\"id\"",
+            "created_by",
+            "created_at",
+            "target_label",
+            "activity",
+            "activity_at",
+            "last_message",
+            "pending_approvals",
+            "null",
+        ] {
+            assert!(
+                !s.contains(omitted),
+                "expected {omitted} to be omitted, got {s}"
+            );
+        }
+        // managed is always present (even when false); so is lane.
+        assert!(s.contains(r#""managed":false"#), "{s}");
+        assert!(s.contains(r#""lane":"tui""#), "{s}");
+    }
+
+    /// The `kind_features` omitempty set, pinned on the SERIALIZE side: a zero
+    /// `watch`/`input`/`feed`/`attach` must vanish from the payload (so an older
+    /// guest's capabilities re-emitted by a newer producer keep triggering the
+    /// client-side absent-field fallbacks), while `post_input`, `approvals` and
+    /// `interrupt` are always written.
+    #[test]
+    fn kind_features_marshal_omits_the_go_omitempty_set() {
+        let bare = RcKindFeatures {
+            post_input: true,
+            approvals: "tui".into(),
+            watch: false,
+            input: String::new(),
+            feed: String::new(),
+            interrupt: false,
+            attach: String::new(),
+        };
+        let s = serde_json::to_string(&bare).unwrap();
+        assert_eq!(
+            s,
+            r#"{"post_input":true,"approvals":"tui","interrupt":false}"#
+        );
+        // A populated row keeps every field.
+        let full = RcKindFeatures {
+            watch: true,
+            input: "gated".into(),
+            feed: "messages".into(),
+            attach: "tmux".into(),
+            ..bare
+        };
+        let s = serde_json::to_string(&full).unwrap();
+        for key in ["watch", "input", "feed", "attach"] {
+            assert!(s.contains(key), "{key} missing from {s}");
+        }
+        // `version` on an uninstalled agent is omitempty on the Go side too.
+        let uninstalled = RcAgentInfo {
+            installed: false,
+            version: None,
+        };
+        assert_eq!(
+            serde_json::to_string(&uninstalled).unwrap(),
+            r#"{"installed":false}"#
+        );
     }
 
     /// The crates-local copy of the canonical feed golden

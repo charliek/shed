@@ -1,0 +1,19 @@
+╭────────────────────────────────────────────╮
+│ >_ OpenAI Codex (v0.145.0)                 │
+│                                            │
+│ model:     gpt-5.4 high   /model to change │
+│ directory: ~                               │
+╰────────────────────────────────────────────╯
+
+› Run the full integration suite
+
+• Starting the suite now; this one takes a while.
+
+• Ran make test-integration
+  └ collecting ... 214 items
+
+⠹ Running make test-integration (2m14s • esc to interrupt)
+
+› Find and fix a bug in @filename
+
+  gpt-5.4 high · ~

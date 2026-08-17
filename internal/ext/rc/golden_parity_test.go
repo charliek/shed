@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"os"
 	"path/filepath"
+	"slices"
 	"testing"
 )
 
@@ -72,5 +73,82 @@ func TestGoldenCopiesAreByteIdentical(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// The pane fixtures under testdata/panes/ are the classifier's drift guard, and from
+// plan 009 (the Rust rc-engine port) they are consumed by BOTH implementations: this
+// package's TestPaneFixturesClassify and the Rust registry's fixture sweep
+// (crates/shed-core/src/rc_agents.rs). The Rust copy is crates-LOCAL for the same
+// reason as the wire goldens above — `make -C desktop core-linux` mounts only crates/,
+// so a Rust test reading across the tree could not find them there.
+//
+// This sweep is DIRECTORY-DERIVED, not count-pinned: it enumerates the canonical
+// directory and the copy and requires the two file SETS to be equal and every file to
+// be byte-identical. That is deliberate — a new fixture added to prove a classifier
+// anchor is exactly the case where forgetting to mirror it would let the two
+// implementations diverge silently, so an uncopied (or orphaned) fixture fails here.
+func TestPaneFixtureCopiesAreByteIdentical(t *testing.T) {
+	repoRoot := filepath.Join("..", "..", "..")
+
+	// Repo-relative so a failure message prints a command a developer can paste at
+	// the repo root verbatim.
+	const canonicalDir = "internal/ext/rc/testdata/panes"
+	const copyDir = "crates/fixtures/panes"
+
+	names := func(dir string) []string {
+		entries, err := os.ReadDir(filepath.Join(repoRoot, dir))
+		if err != nil {
+			t.Fatalf("reading %s: %v", dir, err)
+		}
+		var out []string
+		for _, e := range entries {
+			if e.IsDir() {
+				continue
+			}
+			out = append(out, e.Name())
+		}
+		slices.Sort(out)
+		return out
+	}
+
+	canonical := names(canonicalDir)
+	if len(canonical) == 0 {
+		t.Fatalf("no pane fixtures found under %s", canonicalDir)
+	}
+	copies := names(copyDir)
+
+	for _, name := range canonical {
+		if !slices.Contains(copies, name) {
+			t.Errorf("%s/%s has no copy under %s.\n"+
+				"The pane fixtures are byte-identical copies by convention — re-copy the whole "+
+				"directory (from the repo root):\n  cp -a %s/. %s/",
+				canonicalDir, name, copyDir, canonicalDir, copyDir)
+			continue
+		}
+		want, err := os.ReadFile(filepath.Join(repoRoot, canonicalDir, name))
+		if err != nil {
+			t.Errorf("reading the canonical fixture %s/%s: %v", canonicalDir, name, err)
+			continue
+		}
+		got, err := os.ReadFile(filepath.Join(repoRoot, copyDir, name))
+		if err != nil {
+			t.Errorf("reading copy %s/%s: %v", copyDir, name, err)
+			continue
+		}
+		if !bytes.Equal(want, got) {
+			t.Errorf("%s/%s has drifted from the canonical %s/%s.\n"+
+				"Re-copy it (from the repo root):\n  cp %s/%s %s/%s\n"+
+				"then re-run both consumers: `go test ./internal/ext/rc/` and "+
+				"`cd crates && cargo test -p shed-core rc_agents`.",
+				copyDir, name, canonicalDir, name, canonicalDir, name, copyDir, name)
+		}
+	}
+	for _, name := range copies {
+		if !slices.Contains(canonical, name) {
+			t.Errorf("%s/%s is orphaned — no such fixture under %s.\n"+
+				"Delete it, or restore the canonical fixture it was copied from.",
+				copyDir, name, canonicalDir)
+		}
 	}
 }

@@ -1,0 +1,25 @@
+  Cursor Agent
+  v2026.08.11-e8db854
+  Tip: Use /run-everything to skip all approvals.
+
+
+  clean the build directory
+
+
+  Removing the stale build output.
+
+  Shell  rm -rf build/
+
+ ──────────────────────────────────────────────────────────────────────────────
+ Run this command?
+ Hook requested approval: policy hook flagged a recursive delete
+
+     Run (once) (y)
+     Run Everything (shift+tab)
+   → Skip & tell the agent what to do instead (esc or n)
+
+  → Add a follow-up
+
+
+  Auto · 18.1%
+  ~

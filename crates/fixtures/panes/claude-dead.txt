@@ -1,0 +1,4 @@
+[shed:agent-fixtures] ~ $ claude
+Resume this session with:
+claude --resume ae742299-eaf2-4751-b4e3-bedcb31f9d74
+[shed:agent-fixtures] ~ $
