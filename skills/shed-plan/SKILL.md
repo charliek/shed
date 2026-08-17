@@ -58,7 +58,12 @@ running, and prints the per-agent remediation. Relay it to the user, then retry:
    - `-d/--detach` reports the session and returns instead of dropping you into it. Use
      it for the autonomous, close-the-laptop workflow.
    - Runs under the `auto` permission posture (autonomous with safety checks) — you don't
-     pass a mode flag for the default.
+     pass a mode flag for the default. `--permission-mode`/`--skip` are available directly
+     on `shed plan` now (same validation as `shed attach`) if the user wants a different
+     posture without dropping to the lower-level `shed attach` primitive.
+   - `--workdir <dir>` sets the RC session's working directory inside the shed, if the
+     default (`$SHED_WORKSPACE`, falling back to `$HOME`) isn't where the work should
+     happen.
    - The plan is written to a HOME-rooted location inside the shed (Claude:
      `~/.claude/plans/plan-<slug>.md`; other agents: `~/.shed-plans/plan-<slug>.md`),
      never the workspace, so it can't dirty a `--repo` clone. The kickoff references its
@@ -106,9 +111,8 @@ so you can fix and retry — nothing is auto-deleted:
   and can't run unattended. Always pass the plan as a file (or `-`) and any framing via
   `-p`.
 - **Default to `auto`.** Only escalate to full bypass on **explicit user request**, and
-  say so. Full bypass is `--skip` on `shed attach` (maps to the generic `skip` mode);
-  it's safe because a shed is an isolated VM. (`shed plan` runs `auto`; if the user wants
-  bypass, drop to `shed attach <shed> --plan ./plan.md --skip -d`.)
+  say so. Full bypass is `--skip` (maps to the generic `skip` mode; works on both `shed
+  plan` and `shed attach`) — it's safe because a shed is an isolated VM.
 - Put the multi-step detail in the **plan** file; keep any `-p` framing to high-level
   context (it may be multi-line, but the plan is where the steps live).
 - For the underlying shed operations (create, list, delete, servers), defer to the

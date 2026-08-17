@@ -3,6 +3,7 @@ package rc
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"os"
@@ -289,29 +290,259 @@ func TestOpencodeFoldMultiSnapshot(t *testing.T) {
 	}
 }
 
-// permission.asked is a display-only status feed row: it emits one system/status row and
-// does NOT change the activity verdict (which stays whatever session.status last said).
-func TestOpencodeFoldPermissionStatusRow(t *testing.T) {
+// permission.asked is an OPEN APPROVAL: it emits an approval_request row carrying the
+// addressable id + the honored decisions, and it flips the verdict to needs_approval even
+// though the tool call that triggered it is still open (the session is blocked on the
+// operator, not on the model).
+func TestOpencodeFoldPermissionApprovalRow(t *testing.T) {
 	f := newOpencodeFold()
 	f.applyLine([]byte(`{"type":"session.status","properties":{"sessionID":"s","status":{"type":"busy"}}}`))
 	if got := f.activity(); got != ActivityWorking {
 		t.Fatalf("after busy = %q, want working", got)
 	}
-	f.applyLine([]byte(`{"type":"permission.asked","properties":{"id":"per_1","sessionID":"s","permission":"bash","patterns":["rm -rf /tmp/x","ls"]}}`))
-	// Activity is unaffected by the permission ask.
+	f.applyLine([]byte(`{"type":"message.part.updated","properties":{"sessionID":"s","part":{"id":"p1","messageID":"m1","type":"tool","tool":"bash","callID":"c1","state":{"status":"running","input":{"command":"rm -rf /tmp/x"}}}},"time":1784613621168}`))
 	if got := f.activity(); got != ActivityWorking {
-		t.Fatalf("after permission.asked = %q, want working (unaffected)", got)
+		t.Fatalf("with an open tool call = %q, want working", got)
+	}
+
+	f.applyLine([]byte(`{"type":"permission.asked","properties":{"id":"per_1","sessionID":"s","permission":"bash","patterns":["rm -rf /tmp/x","ls"],"metadata":{"command":"rm -rf /tmp/x"}}}`))
+	if got := f.activity(); got != ActivityNeedsApproval {
+		t.Fatalf("after permission.asked = %q, want needs_approval (outranks the open tool call)", got)
+	}
+	if !f.settled() {
+		t.Error("needs_approval is an event-bounded end state: settled() must be true")
+	}
+
+	got := f.drainMessages()
+	// The tool_use row for the open call, then the approval row.
+	if len(got) != 2 {
+		t.Fatalf("drained %d rows, want 2 (tool_use + approval_request):\n%s", len(got), formatOpencodeRows(got))
+	}
+	m := got[1]
+	if m.Role != feedRoleTool || m.Type != feedTypeApprovalRequest {
+		t.Fatalf("row = (%s/%s), want (tool/approval_request)", m.Role, m.Type)
+	}
+	if !strings.Contains(m.Text, "awaiting approval: bash") || !strings.Contains(m.Text, "rm -rf /tmp/x") {
+		t.Fatalf("approval text = %q, want it to name the permission + patterns", m.Text)
+	}
+	if m.Tool == nil || m.Tool.Name != "bash" || m.Tool.Detail != "rm -rf /tmp/x" {
+		t.Fatalf("approval tool block = %+v, want {bash, rm -rf /tmp/x}", m.Tool)
+	}
+	if m.Approval == nil {
+		t.Fatal("approval_request row must carry an approval block")
+	}
+	if m.Approval.ID != "per_1" || m.Approval.Status != approvalStatusPending || m.Approval.Decision != "" {
+		t.Fatalf("approval = %+v, want id per_1 / pending / no decision", m.Approval)
+	}
+	wantDecisions := []string{approvalDecisionAllow, approvalDecisionAllowAlways, approvalDecisionDeny}
+	if !slices.Equal(m.Approval.Decisions, wantDecisions) {
+		t.Fatalf("decisions = %v, want %v", m.Approval.Decisions, wantDecisions)
+	}
+
+	// The snapshot surface: pending-only, ask-ordered, and state-queryable by id.
+	pend := f.pendingApprovals()
+	if len(pend) != 1 || pend[0].ID != "per_1" || pend[0].Status != approvalStatusPending {
+		t.Fatalf("pendingApprovals = %+v, want the one open ask", pend)
+	}
+	status, decision, ok := f.approvalState("per_1")
+	if !ok || status != approvalStatusPending || decision != "" {
+		t.Fatalf("approvalState(per_1) = (%q,%q,%v), want (pending,\"\",true)", status, decision, ok)
+	}
+	if _, _, ok := f.approvalState("per_nope"); ok {
+		t.Error("approvalState must report ok=false for an id this session never saw")
+	}
+}
+
+// permission.replied closes the ask, appends the resolved row with the decision mapped back
+// from the native reply, and releases the verdict to whatever the session was doing.
+func TestOpencodeFoldPermissionReplied(t *testing.T) {
+	cases := []struct {
+		name     string
+		reply    string
+		decision string
+	}{
+		{"once maps to allow", "once", approvalDecisionAllow},
+		{"always maps to allow_always", "always", approvalDecisionAllowAlways},
+		{"reject maps to deny", "reject", approvalDecisionDeny},
+		{"an unrecognized reply still closes the ask", "sideways", ""},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			f := newOpencodeFold()
+			f.applyLine([]byte(`{"type":"session.status","properties":{"sessionID":"s","status":{"type":"busy"}}}`))
+			f.applyLine([]byte(`{"type":"permission.asked","properties":{"id":"per_1","sessionID":"s","permission":"bash","patterns":["ls"]}}`))
+			f.drainMessages()
+
+			line := []byte(`{"type":"permission.replied","properties":{"sessionID":"s","requestID":"per_1","reply":"` + c.reply + `"}}`)
+			if !f.applyLine(line) {
+				t.Fatal("permission.replied on an open ask must advance state")
+			}
+			if got := f.activity(); got != ActivityWorking {
+				t.Fatalf("after the reply = %q, want working (the ask no longer blocks)", got)
+			}
+			if len(f.pendingApprovals()) != 0 {
+				t.Fatalf("pendingApprovals = %+v, want empty after the reply", f.pendingApprovals())
+			}
+			status, decision, ok := f.approvalState("per_1")
+			if !ok || status != approvalStatusResolved || decision != c.decision {
+				t.Fatalf("approvalState = (%q,%q,%v), want (resolved,%q,true)", status, decision, ok, c.decision)
+			}
+
+			got := f.drainMessages()
+			if len(got) != 1 {
+				t.Fatalf("drained %d rows, want 1 resolved row:\n%s", len(got), formatOpencodeRows(got))
+			}
+			m := got[0]
+			if m.Role != feedRoleTool || m.Type != feedTypeApprovalRequest || m.Approval == nil {
+				t.Fatalf("row = (%s/%s) approval=%+v, want a tool/approval_request row", m.Role, m.Type, m.Approval)
+			}
+			if m.Approval.ID != "per_1" || m.Approval.Status != approvalStatusResolved || m.Approval.Decision != c.decision {
+				t.Fatalf("approval = %+v, want id per_1 / resolved / decision %q", m.Approval, c.decision)
+			}
+
+			// Idempotent: a replayed reply (or the event arriving after a local mark) is a no-op.
+			if f.applyLine(line) {
+				t.Error("a replayed permission.replied must not advance state")
+			}
+			if got := f.drainMessages(); len(got) != 0 {
+				t.Fatalf("replayed reply emitted %d rows, want 0:\n%s", len(got), formatOpencodeRows(got))
+			}
+		})
+	}
+}
+
+// The verb handler's local mark and opencode's own permission.replied are two announcements
+// of ONE resolution: whichever lands first emits the single resolved row, the other is a
+// no-op. (The handler marks synchronously so a same-decision replay cannot re-POST.)
+func TestOpencodeFoldResolveDedupAgainstLocalMark(t *testing.T) {
+	f := newOpencodeFold()
+	f.applyLine([]byte(`{"type":"session.status","properties":{"sessionID":"s","status":{"type":"busy"}}}`))
+	f.applyLine([]byte(`{"type":"permission.asked","properties":{"id":"per_1","sessionID":"s","permission":"bash","patterns":["ls"]}}`))
+	f.drainMessages()
+
+	if !f.resolvePermission("per_1", approvalDecisionAllow) {
+		t.Fatal("the local mark must resolve an open ask")
+	}
+	if f.resolvePermission("per_1", approvalDecisionAllow) {
+		t.Error("a second local mark must be a no-op")
+	}
+	// The stream's own event for the same id lands next: still exactly one resolved row.
+	if f.applyLine([]byte(`{"type":"permission.replied","properties":{"sessionID":"s","requestID":"per_1","reply":"once"}}`)) {
+		t.Error("permission.replied after a local mark must not advance state")
 	}
 	got := f.drainMessages()
 	if len(got) != 1 {
-		t.Fatalf("drained %d rows, want 1:\n%s", len(got), formatOpencodeRows(got))
+		t.Fatalf("drained %d rows, want exactly 1 resolved row:\n%s", len(got), formatOpencodeRows(got))
 	}
-	m := got[0]
-	if m.Role != feedRoleSystem || m.Type != feedTypeStatus {
-		t.Fatalf("row = (%s/%s), want (system/status)", m.Role, m.Type)
+	if got[0].Approval == nil || got[0].Approval.Status != approvalStatusResolved {
+		t.Fatalf("row = %+v, want the resolved approval row", got[0].Approval)
 	}
-	if !strings.Contains(m.Text, "awaiting approval: bash") || !strings.Contains(m.Text, "rm -rf /tmp/x") {
-		t.Fatalf("status text = %q, want it to name the permission + patterns", m.Text)
+	// A reply for an id this fold never saw asked leaves a resolved TOMBSTONE (with its own
+	// resolved row) rather than being dropped — so a later ask replay cannot open a pending
+	// entry for a permission that is already answered.
+	if !f.resolvePermission("per_never_asked", approvalDecisionDeny) {
+		t.Fatal("a reply for an unseen id must record a tombstone")
+	}
+	status, decision, ok := f.approvalState("per_never_asked")
+	if !ok || status != approvalStatusResolved || decision != approvalDecisionDeny {
+		t.Fatalf("tombstone state = (%q,%q,%v), want (resolved,deny,true)", status, decision, ok)
+	}
+	if got := f.drainMessages(); len(got) != 1 || got[0].Approval == nil ||
+		got[0].Approval.Status != approvalStatusResolved {
+		t.Fatalf("tombstone rows = %s, want its one resolved row", formatOpencodeRows(got))
+	}
+	// The ask finally replays (a reseed racing the reply): it must NOT re-open the entry.
+	if f.applyLine([]byte(`{"type":"permission.asked","properties":{"id":"per_never_asked","sessionID":"s","permission":"bash","patterns":["ls"]}}`)) {
+		t.Error("an ask replay for a tombstoned id must not advance state")
+	}
+	if got := f.pendingApprovals(); len(got) != 0 {
+		t.Fatalf("pendingApprovals = %+v, want empty (the tombstone stays closed)", got)
+	}
+	if got := f.openApprovals(); got != 0 {
+		t.Fatalf("openApprovals = %d, want 0 — a replied permission must never block the session", got)
+	}
+}
+
+// A question blocks the session (needs_approval) but is NOT addressable: it keeps the
+// display-only status row and never enters pending_approvals — the legal "needs_approval with
+// an empty snapshot" state. question.replied / question.rejected clear it.
+func TestOpencodeFoldQuestionBlocksWithoutPendingApproval(t *testing.T) {
+	for _, clearType := range []string{"question.replied", "question.rejected"} {
+		t.Run(clearType, func(t *testing.T) {
+			f := newOpencodeFold()
+			f.applyLine([]byte(`{"type":"session.idle","properties":{"sessionID":"s"}}`))
+			f.applyLine([]byte(`{"type":"question.asked","properties":{"id":"que_1","sessionID":"s","questions":[{"header":"Which file?","text":"pick one"}]}}`))
+			if got := f.activity(); got != ActivityNeedsApproval {
+				t.Fatalf("after question.asked = %q, want needs_approval", got)
+			}
+			if got := f.pendingApprovals(); len(got) != 0 {
+				t.Fatalf("pendingApprovals = %+v, want empty (questions are not addressable)", got)
+			}
+			if _, _, ok := f.approvalState("que_1"); ok {
+				t.Error("a question must not be resolvable through the approvals verb")
+			}
+			got := f.drainMessages()
+			if len(got) != 1 || got[0].Role != feedRoleSystem || got[0].Type != feedTypeStatus {
+				t.Fatalf("question row = %s, want one system/status row", formatOpencodeRows(got))
+			}
+
+			f.applyLine([]byte(`{"type":"` + clearType + `","properties":{"sessionID":"s","requestID":"que_1"}}`))
+			if got := f.activity(); got != ActivityNeedsInput {
+				t.Fatalf("after %s = %q, want needs_input (the block cleared)", clearType, got)
+			}
+			if got := f.drainMessages(); len(got) != 0 {
+				t.Fatalf("clearing a question emitted %d rows, want 0:\n%s", len(got), formatOpencodeRows(got))
+			}
+		})
+	}
+}
+
+// The reseed's approval-seed marker is the AUTHORITATIVE open-ask set: an ask the server no
+// longer lists was answered while the stream was down, so it is retired (resolved with NO
+// decision — the hub cannot know which way the TUI went), while a still-listed ask survives
+// the reseed without a duplicate row.
+func TestOpencodeFoldApprovalSeedRetiresAnsweredAsks(t *testing.T) {
+	f := newOpencodeFold()
+	f.applyLine([]byte(`{"type":"session.status","properties":{"sessionID":"s","status":{"type":"busy"}}}`))
+	f.applyLine([]byte(`{"type":"permission.asked","properties":{"id":"per_1","sessionID":"s","permission":"bash","patterns":["ls"]}}`))
+	f.applyLine([]byte(`{"type":"permission.asked","properties":{"id":"per_2","sessionID":"s","permission":"edit","patterns":["a.go"]}}`))
+	f.applyLine([]byte(`{"type":"question.asked","properties":{"id":"que_1","sessionID":"s","questions":[{"header":"Which file?"}]}}`))
+	if got := f.drainMessages(); len(got) != 3 {
+		t.Fatalf("initial drain = %d rows, want 3:\n%s", len(got), formatOpencodeRows(got))
+	}
+
+	// A reconnect replays the still-open asks, then the marker: per_2 + que_1 remain open,
+	// per_1 and the question's sibling were answered in the TUI meanwhile.
+	f.applyLine([]byte(`{"type":"permission.asked","properties":{"id":"per_2","sessionID":"s","permission":"edit","patterns":["a.go"]}}`))
+	f.applyLine([]byte(`{"type":"question.asked","properties":{"id":"que_1","sessionID":"s","questions":[{"header":"Which file?"}]}}`))
+	if !f.applyLine([]byte(`{"type":"` + ocApprovalSeedType + `","properties":{"sessionID":"s","permissionIDs":["per_2"],"questionIDs":["que_1"],"permissionsKnown":true,"questionsKnown":true}}`)) {
+		t.Fatal("the seed marker retired an ask, so it must advance state")
+	}
+
+	pend := f.pendingApprovals()
+	if len(pend) != 1 || pend[0].ID != "per_2" {
+		t.Fatalf("pendingApprovals = %+v, want only per_2", pend)
+	}
+	status, decision, ok := f.approvalState("per_1")
+	if !ok || status != approvalStatusResolved || decision != "" {
+		t.Fatalf("approvalState(per_1) = (%q,%q,%v), want (resolved,\"\",true) — answered outside the hub", status, decision, ok)
+	}
+	got := f.drainMessages()
+	if len(got) != 1 {
+		t.Fatalf("reseed drain = %d rows, want 1 (per_1 resolved; no duplicates):\n%s", len(got), formatOpencodeRows(got))
+	}
+	if got[0].Approval == nil || got[0].Approval.ID != "per_1" || got[0].Approval.Decision != "" {
+		t.Fatalf("row approval = %+v, want per_1 resolved with no decision", got[0].Approval)
+	}
+
+	// A marker listing nothing (both halves known) retires everything still open, questions
+	// included.
+	f.applyLine([]byte(`{"type":"` + ocApprovalSeedType + `","properties":{"sessionID":"s","permissionsKnown":true,"questionsKnown":true}}`))
+	if got := f.openApprovals(); got != 0 {
+		t.Fatalf("openApprovals after an empty marker = %d, want 0", got)
+	}
+	if got := f.activity(); got != ActivityWorking {
+		t.Fatalf("activity = %q, want working (nothing blocks any more)", got)
 	}
 }
 
@@ -337,9 +568,12 @@ func TestOpencodeFoldNoteGapKeepsDedup(t *testing.T) {
 
 // ---- opencode fold: correctness edge cases (tolerant parsing / no fabricated rows) ----
 
-// Fix 1: a permission.asked with NO id keys its dedup slot on the row's content, so a
-// reseed replay (which also carries no id) emits exactly one status row, not one per replay.
-func TestOpencodeFoldStatusRowDedupNoID(t *testing.T) {
+// An ask with NO id stays on the display-only status-row path: the id is both the wire
+// address the approvals verb resolves and the key a replied event clears, so an id-less ask
+// could never be answered NOR retired — tracking it would strand the session at
+// needs_approval forever. Its dedup slot is keyed on the row's content, so a reseed replay
+// (which also carries no id) emits exactly one row, not one per replay.
+func TestOpencodeFoldIDLessAskStaysDisplayOnly(t *testing.T) {
 	f := newOpencodeFold()
 	line := []byte(`{"type":"permission.asked","properties":{"sessionID":"s","permission":"bash","patterns":["ls"]}}`)
 	f.applyLine(line)
@@ -350,6 +584,15 @@ func TestOpencodeFoldStatusRowDedupNoID(t *testing.T) {
 	}
 	if got[0].Role != feedRoleSystem || got[0].Type != feedTypeStatus {
 		t.Fatalf("row = (%s/%s), want (system/status)", got[0].Role, got[0].Type)
+	}
+	if got[0].Approval != nil {
+		t.Fatalf("an id-less ask must not carry an approval block: %+v", got[0].Approval)
+	}
+	if n := f.openApprovals(); n != 0 {
+		t.Fatalf("openApprovals = %d, want 0 (an unclearable ask must not block the session)", n)
+	}
+	if got := f.activity(); got != ActivityUnknown {
+		t.Fatalf("activity = %q, want unknown (a display-only ask confirms nothing)", got)
 	}
 }
 
@@ -392,7 +635,8 @@ func TestOpencodeFoldSyntheticSnapshotDropsCachedPartial(t *testing.T) {
 }
 
 // Fix 4: permission.asked / question.asked with absent/empty content must not emit a
-// fabricated row, and must report applyLine=false.
+// fabricated row, and must report applyLine=false. Under the approvals fold this also means
+// a hollow ask creates NO pending state: it cannot block the session at needs_approval.
 func TestOpencodeFoldEmptyAskNoRow(t *testing.T) {
 	cases := []struct {
 		name string
@@ -409,6 +653,9 @@ func TestOpencodeFoldEmptyAskNoRow(t *testing.T) {
 			}
 			if got := f.drainMessages(); len(got) != 0 {
 				t.Fatalf("%s emitted %d rows, want 0:\n%s", c.name, len(got), formatOpencodeRows(got))
+			}
+			if n := f.openApprovals(); n != 0 {
+				t.Fatalf("%s opened %d approvals, want 0", c.name, n)
 			}
 		})
 	}
@@ -1578,4 +1825,150 @@ func TestReconcileOpencodeWatcherOverridesStability(t *testing.T) {
 	if !slices.Contains(tm.setEnvCalls(), wantEnv) {
 		t.Fatalf("set-environment calls = %v, want one == %q", tm.setEnvCalls(), wantEnv)
 	}
+}
+
+// The producer→wire seam: the rows the opencode fold emits must be legal for the surfaces
+// that consume them — the id addressable by the approvals verb (ApprovalIDRe, which the server
+// proxy mirrors), the advertised decisions inside the contract's enum, and the omitempty rules
+// intact after the ring's sanitize/copy (no `decision` on a pending row, no `decisions` on a
+// resolved one).
+func TestOpencodeApprovalRowsAreWireLegal(t *testing.T) {
+	f := newOpencodeFold()
+	f.applyLine([]byte(`{"type":"session.status","properties":{"sessionID":"s","status":{"type":"busy"}}}`))
+	f.applyLine([]byte(`{"type":"permission.asked","properties":{"id":"per_f8342bca6001","sessionID":"s","permission":"bash","patterns":["ls"],"metadata":{"command":"ls"}}}`))
+	f.applyLine([]byte(`{"type":"permission.replied","properties":{"sessionID":"s","requestID":"per_f8342bca6001","reply":"always"}}`))
+
+	ring := newMessageRing()
+	for _, m := range f.drainMessages() {
+		ring.append(m, time.Unix(1_700_000_000, 0).UTC())
+	}
+	rows, _ := ring.since(0, 10)
+	if len(rows) != 2 {
+		t.Fatalf("ring holds %d rows, want the pending + resolved pair:\n%s", len(rows), formatOpencodeRows(rows))
+	}
+	pending, resolved := rows[0], rows[1]
+	if !ApprovalIDRe.MatchString(pending.Approval.ID) {
+		t.Errorf("approval id %q does not match the contract grammar — the verb could never address it", pending.Approval.ID)
+	}
+	for _, d := range pending.Approval.Decisions {
+		if !validApprovalDecision(d) {
+			t.Errorf("advertised decision %q is outside the contract enum", d)
+		}
+	}
+	raw, err := json.Marshal(pending)
+	if err != nil {
+		t.Fatalf("marshal pending row: %v", err)
+	}
+	if strings.Contains(string(raw), `"decision"`) {
+		t.Errorf("pending row must omit `decision`: %s", raw)
+	}
+	raw, err = json.Marshal(resolved)
+	if err != nil {
+		t.Fatalf("marshal resolved row: %v", err)
+	}
+	if strings.Contains(string(raw), `"decisions"`) {
+		t.Errorf("resolved row must omit `decisions` (nothing left to choose): %s", raw)
+	}
+	if !strings.Contains(string(raw), `"decision":"`+approvalDecisionAllowAlways+`"`) {
+		t.Errorf("resolved row must carry the mapped decision: %s", raw)
+	}
+}
+
+// The REOPEN rule: a seed-retired ask (resolved with NO decision — retired only because a REST
+// snapshot did not list it) is REOPENED by a later ask replay, which is newer and stronger
+// evidence that it is genuinely open. Without this, one stale/racing GET /permission would
+// silently un-block a session that is still waiting on the operator. An ask genuinely answered
+// (resolved with a KNOWN decision) is NOT reopened.
+func TestOpencodeFoldSeedRetiredAskReopens(t *testing.T) {
+	ask := []byte(`{"type":"permission.asked","properties":{"id":"per_1","sessionID":"s","permission":"bash","patterns":["ls"]}}`)
+	emptySeed := []byte(`{"type":"` + ocApprovalSeedType + `","properties":{"sessionID":"s","permissionsKnown":true,"questionsKnown":true}}`)
+
+	f := newOpencodeFold()
+	f.applyLine([]byte(`{"type":"session.status","properties":{"sessionID":"s","status":{"type":"busy"}}}`))
+	f.applyLine(ask)
+	f.applyLine(emptySeed) // a stale snapshot retires it
+	if got := f.activity(); got != ActivityWorking {
+		t.Fatalf("after the retiring seed = %q, want working", got)
+	}
+	f.drainMessages()
+
+	// The next reseed replays the ask: it is still open after all.
+	if !f.applyLine(ask) {
+		t.Fatal("an ask replay for a seed-retired entry must reopen it (state advanced)")
+	}
+	if got := f.activity(); got != ActivityNeedsApproval {
+		t.Fatalf("after the reopening ask = %q, want needs_approval", got)
+	}
+	if pend := f.pendingApprovals(); len(pend) != 1 || pend[0].ID != "per_1" {
+		t.Fatalf("pendingApprovals = %+v, want per_1 open again", pend)
+	}
+	status, _, ok := f.approvalState("per_1")
+	if !ok || status != approvalStatusPending {
+		t.Fatalf("approvalState = (%q,%v), want (pending,true)", status, ok)
+	}
+	// The client needs the pending row again to render the buttons, so it is re-announced.
+	got := f.drainMessages()
+	if len(got) != 1 || got[0].Approval == nil || got[0].Approval.Status != approvalStatusPending ||
+		len(got[0].Approval.Decisions) != 3 {
+		t.Fatalf("reopen rows = %s, want one re-announced pending approval row", formatOpencodeRows(got))
+	}
+	// A real reply closes it, and now an ask replay must NOT reopen it.
+	f.applyLine([]byte(`{"type":"permission.replied","properties":{"sessionID":"s","requestID":"per_1","reply":"once"}}`))
+	f.drainMessages()
+	if f.applyLine(ask) {
+		t.Error("an ask replay must not reopen an entry resolved with a known decision")
+	}
+	if got := f.openApprovals(); got != 0 {
+		t.Fatalf("openApprovals = %d, want 0 (a genuinely answered ask stays closed)", got)
+	}
+}
+
+// The seed marker's two halves carry INDEPENDENT authority: a failed GET /question must not
+// block permission healing (and vice versa), or one persistently failing read would strand
+// every answered approval as pending forever.
+func TestOpencodeFoldApprovalSeedHalvesAreIndependent(t *testing.T) {
+	newFold := func(t *testing.T) *opencodeFold {
+		t.Helper()
+		f := newOpencodeFold()
+		f.applyLine([]byte(`{"type":"session.status","properties":{"sessionID":"s","status":{"type":"busy"}}}`))
+		f.applyLine([]byte(`{"type":"permission.asked","properties":{"id":"per_1","sessionID":"s","permission":"bash","patterns":["ls"]}}`))
+		f.applyLine([]byte(`{"type":"question.asked","properties":{"id":"que_1","sessionID":"s","questions":[{"header":"Which file?"}]}}`))
+		f.drainMessages()
+		return f
+	}
+
+	t.Run("permissions heal while the question read failed", func(t *testing.T) {
+		f := newFold(t)
+		f.applyLine([]byte(`{"type":"` + ocApprovalSeedType + `","properties":{"sessionID":"s","permissionsKnown":true}}`))
+		if status, _, _ := f.approvalState("per_1"); status != approvalStatusResolved {
+			t.Errorf("per_1 = %q, want resolved (its half's read succeeded)", status)
+		}
+		if len(f.pendingQuestions) != 1 {
+			t.Errorf("pendingQuestions = %v, want the question retained (its read failed)", f.pendingQuestions)
+		}
+		if got := f.activity(); got != ActivityNeedsApproval {
+			t.Errorf("activity = %q, want needs_approval (the question still blocks)", got)
+		}
+	})
+
+	t.Run("questions heal while the permission read failed", func(t *testing.T) {
+		f := newFold(t)
+		f.applyLine([]byte(`{"type":"` + ocApprovalSeedType + `","properties":{"sessionID":"s","questionsKnown":true}}`))
+		if len(f.pendingQuestions) != 0 {
+			t.Errorf("pendingQuestions = %v, want empty (its half's read succeeded)", f.pendingQuestions)
+		}
+		if status, _, _ := f.approvalState("per_1"); status != approvalStatusPending {
+			t.Errorf("per_1 = %q, want pending (a failed read is never 'nothing is open')", status)
+		}
+	})
+
+	t.Run("a marker with neither half known retires nothing", func(t *testing.T) {
+		f := newFold(t)
+		if f.applyLine([]byte(`{"type":"` + ocApprovalSeedType + `","properties":{"sessionID":"s"}}`)) {
+			t.Error("a marker with no authority must not advance state")
+		}
+		if got := f.openApprovals(); got != 2 {
+			t.Errorf("openApprovals = %d, want 2 (both asks retained)", got)
+		}
+	})
 }

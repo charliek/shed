@@ -144,7 +144,12 @@ type rcCreateOptions struct {
 	displayName    string
 	slug           string
 	permissionMode string // "" omits the flag
-	prompt         string // kickoff line delivered via --prompt-stdin (empty -> none)
+	// workdir, when set, is passed through as `--workdir` (the guest's create --workdir
+	// flag) so the RC session's tmux pane starts there instead of the guest's
+	// $SHED_WORKSPACE/$HOME default. Empty means "let the guest decide" (unchanged
+	// behavior).
+	workdir string
+	prompt  string // kickoff line delivered via --prompt-stdin (empty -> none)
 	// plan, when set, is delivered via --plan-stdin: the guest writes it to a per-kind
 	// HOME-rooted file and composes+delivers the kickoff, so the plan never touches the
 	// workdir (a --repo clone / --local-dir host dir). Mutually exclusive with prompt.
@@ -154,13 +159,13 @@ type rcCreateOptions struct {
 	planFraming string
 }
 
-// createRCSession invokes `shed-ext-rc create --wait` over SSH and returns the
-// parsed session DTO. Each shed-ext-rc argument is shell-quoted into one command
-// string (the server re-parses through bash -lc). stdin carries the kickoff prompt
-// (--prompt-stdin) or the plan (--plan-stdin) — never argv, per the convention — with
-// any plan framing base64-encoded onto argv so a single exec ships plan + framing.
-func createRCSession(opts rcCreateOptions) (rc.Session, error) {
-	argv := []string{
+// buildRCCreateArgv builds the `shed-ext-rc create` argv from opts, plus the stdin
+// payload it implies (the kickoff prompt or the plan — never argv, per the
+// convention) — split out from createRCSession so the flag-threading logic
+// (kind/slug/name/workdir/mode/plan-vs-prompt) is unit-testable without a real SSH
+// round-trip.
+func buildRCCreateArgv(opts rcCreateOptions) (argv []string, stdin string) {
+	argv = []string{
 		"shed-ext-rc", "create",
 		"--kind", opts.kind,
 		"--slug", opts.slug,
@@ -171,10 +176,12 @@ func createRCSession(opts rcCreateOptions) (rc.Session, error) {
 	if opts.displayName != "" {
 		argv = append(argv, "--name", opts.displayName)
 	}
+	if opts.workdir != "" {
+		argv = append(argv, "--workdir", opts.workdir)
+	}
 	if opts.permissionMode != "" {
 		argv = append(argv, "--permission-mode", opts.permissionMode)
 	}
-	stdin := ""
 	switch {
 	case opts.plan != "":
 		argv = append(argv, "--plan-stdin")
@@ -186,6 +193,16 @@ func createRCSession(opts rcCreateOptions) (rc.Session, error) {
 		argv = append(argv, "--prompt-stdin")
 		stdin = opts.prompt
 	}
+	return argv, stdin
+}
+
+// createRCSession invokes `shed-ext-rc create --wait` over SSH and returns the
+// parsed session DTO. Each shed-ext-rc argument is shell-quoted into one command
+// string (the server re-parses through bash -lc). stdin carries the kickoff prompt
+// (--prompt-stdin) or the plan (--plan-stdin) — never argv, per the convention — with
+// any plan framing base64-encoded onto argv so a single exec ships plan + framing.
+func createRCSession(opts rcCreateOptions) (rc.Session, error) {
+	argv, stdin := buildRCCreateArgv(opts)
 	quoted := make([]string, len(argv))
 	for i, a := range argv {
 		quoted[i] = shellQuoteArg(a)

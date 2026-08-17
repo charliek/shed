@@ -59,6 +59,7 @@ shed create big --repo org/large-repo --timeout 30m
 | Command | Purpose |
 |---------|---------|
 | `shed attach <name> [-S <session>] [--new]` | Attach to a persistent tmux session (creates if absent). Detach: `Ctrl-B D` |
+| `shed attach <name> --kind <k> [--plan <file>\|--prompt <p>] [--slug <s>] [--workdir <dir>] [--permission-mode <m>\|--skip] [-d]` | Start (or reattach to) a **Remote Control** agent session (`rc-<slug>`): `--kind` picks the agent (`claude-rc`, `claude-broker`, `codex`, `cursor`, `opencode`, `shell`), `--plan`/`--prompt` deliver a kickoff, `--slug` targets an existing `rc-<slug>`, `--workdir` sets the session's working directory (default `$SHED_WORKSPACE`/`$HOME`), `-d` prints the summary and returns instead of attaching. For the one-command "ship a plan, run it autonomously" flow, prefer `shed plan` or the `shed-plan` skill. |
 | `shed console <name>` | Direct bash shell; ephemeral (dies on disconnect). Auto-starts a stopped shed |
 | `shed exec <name> <command...> [-S <session>]` | Run a single command over SSH; argv is passed through verbatim (not a shell) |
 | `shed sessions [shed] [--all]` | List tmux sessions (one shed, default server, or all servers) |
@@ -67,6 +68,8 @@ shed create big --repo org/large-repo --timeout 30m
 ```bash
 shed attach codelens
 shed attach codelens -S debug
+shed attach codelens --kind codex -d               # start a codex RC session, print summary, return
+shed attach codelens --slug abc234                 # reattach to an existing rc-abc234 session
 shed exec codelens git status
 shed exec codelens bash -lc "cd /workspace && npm test"   # shell features need an explicit shell
 shed sessions --all

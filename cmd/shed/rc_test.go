@@ -173,6 +173,83 @@ func TestResolveRCInputs(t *testing.T) {
 	})
 }
 
+// TestBuildRCCreateArgv pins the client-side flag threading into the guest
+// `shed-ext-rc create` argv — notably --workdir (plan 008 §3.7 item 3), which was
+// previously dropped on the floor by createRCSession.
+func TestBuildRCCreateArgv(t *testing.T) {
+	entry := &config.ServerEntry{Host: "mini3", SSHPort: 2222}
+
+	t.Run("workdir omitted when empty", func(t *testing.T) {
+		argv, _ := buildRCCreateArgv(rcCreateOptions{shedName: "s", entry: entry, kind: "shell", slug: "abc123"})
+		for _, a := range argv {
+			if a == "--workdir" {
+				t.Fatalf("--workdir should be omitted when opts.workdir is empty: %v", argv)
+			}
+		}
+	})
+
+	t.Run("workdir threaded through", func(t *testing.T) {
+		argv, _ := buildRCCreateArgv(rcCreateOptions{
+			shedName: "s", entry: entry, kind: "shell", slug: "abc123", workdir: "/home/shed/myproj",
+		})
+		if !argvHasPair(argv, "--workdir", "/home/shed/myproj") {
+			t.Fatalf("--workdir /home/shed/myproj not found in argv: %v", argv)
+		}
+	})
+
+	t.Run("permission mode threaded through", func(t *testing.T) {
+		argv, _ := buildRCCreateArgv(rcCreateOptions{
+			shedName: "s", entry: entry, kind: "codex", slug: "abc123", permissionMode: "auto",
+		})
+		if !argvHasPair(argv, "--permission-mode", "auto") {
+			t.Fatalf("--permission-mode auto not found in argv: %v", argv)
+		}
+	})
+
+	t.Run("plan delivery uses --plan-stdin, not --prompt-stdin, and carries stdin", func(t *testing.T) {
+		argv, stdin := buildRCCreateArgv(rcCreateOptions{
+			shedName: "s", entry: entry, kind: "claude-rc", slug: "abc123", plan: "do the thing",
+		})
+		if !containsStr(argv, "--plan-stdin") || containsStr(argv, "--prompt-stdin") {
+			t.Fatalf("plan delivery argv wrong: %v", argv)
+		}
+		if stdin != "do the thing" {
+			t.Fatalf("stdin = %q, want the plan content", stdin)
+		}
+	})
+
+	t.Run("prompt delivery uses --prompt-stdin, and carries stdin", func(t *testing.T) {
+		argv, stdin := buildRCCreateArgv(rcCreateOptions{
+			shedName: "s", entry: entry, kind: "claude-rc", slug: "abc123", prompt: "hi",
+		})
+		if !containsStr(argv, "--prompt-stdin") || containsStr(argv, "--plan-stdin") {
+			t.Fatalf("prompt delivery argv wrong: %v", argv)
+		}
+		if stdin != "hi" {
+			t.Fatalf("stdin = %q, want the prompt", stdin)
+		}
+	})
+}
+
+func containsStr(argv []string, want string) bool {
+	for _, a := range argv {
+		if a == want {
+			return true
+		}
+	}
+	return false
+}
+
+// argvHasPair reports whether argv contains flag immediately followed by value.
+func argvHasPair(argv []string, flag, value string) bool {
+	for i := 0; i < len(argv)-1; i++ {
+		if argv[i] == flag && argv[i+1] == value {
+			return true
+		}
+	}
+	return false
+}
+
 func TestGenRCSlug(t *testing.T) {
 	seen := map[string]bool{}
 	for range 50 {

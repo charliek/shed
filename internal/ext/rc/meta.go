@@ -16,6 +16,10 @@ type Metadata struct {
 	CreatedBy   string
 	CreatedAt   string // RFC3339 UTC (…Z)
 	Target      string // optional advisory label
+	// Slug is the session's slug (the tmux name's suffix), stamped into SHED_RC_SLUG for
+	// every kind so a process launched INSIDE the session can address it on the hub (see
+	// envSlug). Set by Create from the same resolved slug it builds the tmux name from.
+	Slug string
 	// Port is opencode's allocated loopback SSE/HTTP server port (0 = none / not
 	// opencode). Set by Create via freeLoopbackPort (netutil.go) BEFORE Metadata is
 	// built, so BuildEnvArgs below can stamp it into the session env for the hub's
@@ -34,9 +38,11 @@ func envValue(key, value string) (string, error) {
 }
 
 // BuildEnvArgs returns the `-e KEY=value …` argv fragment for `tmux new-session`,
-// in deterministic order. SHED_RC_TARGET is included only when set; SHED_RC_OPENCODE_PORT
-// only when the kind is opencode and a port was allocated. Values are validated
-// against the single-line grammar.
+// in deterministic order. SHED_RC_SLUG is stamped unconditionally for every kind (it is
+// how a process running inside the session addresses that session on the hub — see
+// envSlug); SHED_RC_TARGET is included only when set; SHED_RC_OPENCODE_PORT only when the
+// kind is opencode and a port was allocated. Values are validated against the single-line
+// grammar.
 //
 // For an opencode session it ALSO appends a bare `OPENCODE_SERVER_PASSWORD=` (empty
 // value) launch-env override, regardless of whether a port was allocated — opencode's
@@ -56,6 +62,7 @@ func BuildEnvArgs(m Metadata) ([]string, error) {
 		{envWorkdir, m.Workdir},
 		{envCreatedBy, m.CreatedBy},
 		{envCreatedAt, m.CreatedAt},
+		{envSlug, m.Slug},
 	}
 	if m.Target != "" {
 		pairs = append(pairs, [2]string{envTarget, m.Target})

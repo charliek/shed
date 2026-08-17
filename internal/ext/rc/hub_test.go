@@ -43,7 +43,8 @@ func (c *hubClock) advance(d time.Duration) {
 type hubTmux struct {
 	mu      sync.Mutex
 	names   []string          // rc-* (and other) session names for `ls`
-	panes   map[string]string // tmux name → capture-pane stdout
+	panes   map[string]string // tmux name → capture-pane -S -200 stdout (visible + scrollback)
+	visible map[string]string // tmux name → capture-pane (no -S) stdout; unset ⇒ same as panes
 	envs    map[string]string // tmux name → show-environment stdout
 	gone    map[string]bool   // tmux name → capture-pane reports "can't find pane"
 	flaky   map[string]bool   // tmux name → capture-pane fails TRANSIENTLY (not gone)
@@ -54,9 +55,22 @@ type hubTmux struct {
 
 func newHubTmux() *hubTmux {
 	return &hubTmux{
-		panes: map[string]string{}, envs: map[string]string{},
+		panes: map[string]string{}, visible: map[string]string{}, envs: map[string]string{},
 		gone: map[string]bool{}, flaky: map[string]bool{},
 	}
+}
+
+// setVisible pins what a VISIBLE-frame capture (no -S) answers for a session, leaving the
+// scrollback capture untouched — the split that lets a test put chrome in the history
+// only. Clearing it (vis == "") restores "visible == scrollback".
+func (f *hubTmux) setVisible(name, vis string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if vis == "" {
+		delete(f.visible, name)
+		return
+	}
+	f.visible[name] = vis
 }
 
 // setLsFail makes `ls` fail transiently (stderr must not read as "no server").
@@ -119,6 +133,15 @@ func (f *hubTmux) Run(args ...string) Result {
 		}
 		if f.flaky[name] {
 			return Result{Code: 1, Stderr: "lost server connection (transient)"}
+		}
+		// Real tmux answers a VISIBLE-frame capture (no -S) differently from a
+		// scrollback one — the seam the ApprovalAnchor path depends on. A session with
+		// no explicit visible frame configured answers both the same, so every test
+		// that does not care is unaffected.
+		if indexOf(args, "-S") < 0 {
+			if vis, ok := f.visible[name]; ok {
+				return Result{Stdout: vis}
+			}
 		}
 		return Result{Stdout: f.panes[name]}
 	case "show-environment":
@@ -530,7 +553,7 @@ func TestHubReconcileLegacyRecreateByCreatedAt(t *testing.T) {
 
 // A recreate that changes ONLY the kind (same slug, and — the legacy worst case —
 // no id and an unchanged created_at) must still replace the tracked entry: the verb
-// handlers authorize against the tracked kind (verbFeatures), so a stale kind would
+// handlers authorize against the tracked kind (verbTarget), so a stale kind would
 // become an authorization bug the day any kind advertises a verb.
 func TestHubReconcileKindChangeIsARecreate(t *testing.T) {
 	f := newHubTmux()

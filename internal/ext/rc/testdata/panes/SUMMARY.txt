@@ -50,6 +50,51 @@ Dead [codex-dead.txt = EMPTY]: launched as `bash -ilc codex`, so exit killed the
   tmux session/server. Signal: capture-pane errors / "no server running" / "can't find
   session". No shell-prompt frame (use persistent bash -il to get one).
 
+CODEX APPROVAL OVERLAY (ADAPTED, not live-captured — plan 008 C3)
+-----------------------------------------------------------------
+anchors: ApprovalAnchor = codexApprovalAnchorRe (agents.go) — an option row at column 0
+         followed within 12 lines by the overlay footer.
+Provenance: the codex account's quota was exhausted when these were needed, so the five
+codex-ready-approval-*.txt + codex-ready-tool-running.txt fixtures were ADAPTED from the
+codex repo's COMMITTED TUI snapshots rather than captured from a live pane:
+  ~/projects/codex/codex-rs/tui/src/bottom_pane/snapshots/
+    codex_tui__bottom_pane__approval_overlay__tests__network_exec_prompt.snap
+  ~/projects/codex/codex-rs/tui/src/chatwidget/snapshots/
+    codex_tui__chatwidget__tests__approval_modal_exec.snap
+    codex_tui__chatwidget__tests__approval_modal_patch.snap
+    codex_tui__chatwidget__tests__chatwidget_exec_and_status_layout_vt100_snapshot.snap
+The overlay block in each fixture is byte-faithful to those snapshots; the surrounding
+transcript/banner/composer chrome is the live codex-ready.txt shape, so the file reads
+as a whole 200x50 `tmux capture-pane -p` frame. Re-capture live when quota allows.
+
+Active exec approval [codex-ready-approval-exec.txt] — headline, reason, command, then
+  the option rows and footer (source: approval_overlay.rs, rendered through
+  list_selection_view.rs's `format!("{prefix} {n}. ")` row builder, prefix '›' when
+  selected and ' ' otherwise, plus an optional " (key)" shortcut hint):
+    "  Would you like to run the following command?"
+    "› 1. Yes, proceed (y)"
+    "  3. No, and tell Codex what to do differently (esc)"
+    "  Press enter to confirm or esc to cancel"
+Active network approval [codex-ready-approval-network.txt] — same widget, different
+  labels, and the selection arrowed onto row 4 (proves the anchor does not depend on
+  WHICH row carries the '›'):
+    "  Do you want to approve network access to "example.com"?"
+    "  1. Yes, just this once (y)"  "› 4. No, and tell Codex what to do differently (esc)"
+Post-resolution [codex-ready-approval-resolved.txt] — the SAME session after the
+  operator answered: the option rows and the footer are GONE, but note the headline
+  "Would you like to run the following command?" is STILL on screen (it scrolled into the
+  transcript). That is precisely why the ApprovalAnchor is option-line chrome and not the
+  headline: only the option rows/footer disappear when the dialog is answered.
+Quoted prose [codex-ready-approval-quoted.txt] — an assistant message DESCRIBING the
+  dialog: the headline in prose, a markdown numbered list quoting the option labels at
+  codex's two-space message-body indent. Must NOT match the anchor. It is defeated twice
+  over — the labels are quoted/have prose trailing them, and there is no
+  "Press enter to confirm or esc to cancel" footer.
+Long tool call, no overlay [codex-ready-tool-running.txt] — the negative that matters
+  most: codex's rollout JSONL writes the tool-call record BEFORE the approval gate, so a
+  session blocked on approval and one running a slow tool are byte-identical in the log.
+  Only the pane tells them apart, and this fixture is the "not blocked" side.
+
 OPENCODE (1.17.11)
 ------------------
 Launches straight to ready composer (already authed to a GLM-5.1 Z.AI Coding Plan).
@@ -109,6 +154,69 @@ Device/browser login [cursor-login.txt] (after any keypress):
 Dead [cursor-dead.txt]: on C-c while unauth, prints reason then shell:
   "Authentication required to use Cursor Agent. Please run 'agent login' to authenticate."
   anchors: /Authentication required to use Cursor Agent/, /run 'agent login'/
+
+CURSOR APPROVAL PROMPT (RECONSTRUCTED from the shipped bundle — plan 008 C4)
+---------------------------------------------------------------------------
+anchors: ApprovalAnchor = cursorApprovalAnchorRe (agents.go) — a whole-line HEADLINE
+         followed within 8 lines by a whole-line OPTION ROW.
+Provenance: NOT captured from a live pane. cursor-agent ships its TUI as readable
+(minified) JS, so the four cursor-ready-approval-*.txt fixtures were reconstructed from
+the installed bundle, version 2026.08.11-e8db854:
+  ~/.local/share/cursor-agent/versions/2026.08.11-e8db854/6260.index.js
+    ./src/components/prompt/decision-logic.ts      headline per operation type + the
+                                                   option label/hint list per type
+    ./src/components/prompt/decision-dropdown.tsx  the row: paddingLeft 1, the selection
+                                                   marker ("→ " selected / "  " not, from
+                                                   pager/tokens.ts), the label, " (hint)"
+    ./src/components/pager-shell.tsx               the surface: paddingX 1 and a
+                                                   border-TOP rule only (no side borders)
+  ~/.local/share/cursor-agent/versions/2026.08.11-e8db854/index.js
+    the policy engine's reason list — "Not in allowlist: <cmds>" and
+    "Hook requested approval: <msg>"
+The headline/labels/hints/marker/indentation are source-faithful; the surrounding
+transcript + composer frame is the live cursor-ready-active.txt shape. The composer
+placeholder is kept VISIBLE beneath the decision surface because the prompt bar renders
+its text input in a DISABLED (dimmed, placeholder-still-drawn) variant while a decision
+is pending — which is also exactly why the input gate needs the approval anchor: the
+ready/prompt anchor still matches while the dialog owns the keyboard.
+RE-CAPTURE LIVE when an approval prompt is at hand; the labels are evidence, the frame
+is reconstruction.
+
+The fixture set covers FIVE of the eight decision surfaces (shell, hook-requested,
+delete, write, web-fetch); the remaining ones (MCP, web search, edit) are pinned as
+synthetic headline+row pairs in TestCursorApprovalAnchorCoversEveryDecisionSurface.
+Exhaustiveness is a SAFETY property here, not tidiness: a surface the anchor misses opens
+no approval episode, the pane freezes, the watcher's working verdict expires — and the
+input gate would then see cursor's still-drawn composer and accept a posted line into the
+widget, where a "y" anywhere in it hits cursor's y=approve keybind. (The second layer
+against that is AgentSpec.ComposerUnderModal; see agents.go.)
+
+Active shell approval [cursor-ready-approval-shell.txt] — the not-in-allowlist prompt,
+  selection on the first row:
+    " Run this command?"
+    " Not in allowlist: ./scripts/build.sh --release"
+    "   → Run (once) (y)"
+    "     Add Shell(./scripts/build.sh) to allowlist? (tab)"
+    "     Run Everything (shift+tab)"
+    "     Skip & tell the agent what to do instead (esc or n)"
+Hook-requested approval [cursor-ready-approval-hook.txt] — same widget, the hook's reason
+  line in place of the allowlist one, and the selection arrowed onto the LAST row (proves
+  the anchor does not depend on WHICH row carries the marker).
+Delete approval [cursor-ready-approval-delete.txt] — the one-word label set
+  ("Delete"/"Keep"), which is only safe to anchor on because the headline half
+  ("Delete this file?") carries the trust.
+Write approval [cursor-ready-approval-write.txt] — no auto-run row at all, plus the
+  DYNAMIC "Add Write(<path>) to allowlist?" label (anchored on its fixed prefix).
+Web-fetch approval [cursor-ready-approval-fetch.txt] — the other dynamic label,
+  "Always allow <domain>", with the selection arrowed onto it.
+Post-resolution [cursor-ready-approval-resolved.txt] — the same session after answering:
+  the option rows are gone but the headline "Run this command?" is STILL on screen (it
+  scrolled into the transcript). That is why the anchor is a conjunction and never the
+  headline alone.
+Quoted prose [cursor-ready-approval-quoted.txt] — the agent DESCRIBING the prompt: the
+  headline and all three labels inline in sentences AND as a markdown bullet list. Must
+  NOT match — bullets are not an accepted gutter and the inline mentions are not whole
+  lines.
 
 CROSS-AGENT NOTES / SURPRISES
 -----------------------------

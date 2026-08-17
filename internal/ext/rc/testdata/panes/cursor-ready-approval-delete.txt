@@ -1,0 +1,23 @@
+  Cursor Agent
+  v2026.08.11-e8db854
+  Tip: Use /run-everything to skip all approvals.
+
+
+  clean up the generated fixtures
+
+
+  Removing the stale generated file.
+
+  Delete  build/fixtures.json
+
+ ──────────────────────────────────────────────────────────────────────────────
+ Delete this file?
+
+   → Delete (y)
+     Keep (n)
+
+  → Add a follow-up
+
+
+  Auto · 21.7%
+  ~

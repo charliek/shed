@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -61,45 +62,15 @@ func PreseedClaudeConfig(workdir string, getenv func(string) string) error {
 		return fmt.Errorf("creating config dir: %w", err)
 	}
 
-	// Lock on a sibling lockfile (not the config itself) so each holder reads the
-	// current config after acquiring the lock — an atomic rename by another holder
-	// would otherwise leave us writing through a stale, unlinked inode.
-	lockPath := path + ".shed-ext-rc.lock"
-	lock, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o600)
+	unlock, err := lockSibling(path)
 	if err != nil {
-		return fmt.Errorf("opening trust lock: %w", err)
-	}
-	defer func() { _ = lock.Close() }()
-	if err := syscall.Flock(int(lock.Fd()), syscall.LOCK_EX); err != nil {
 		return fmt.Errorf("locking trust file: %w", err)
 	}
-	defer func() { _ = syscall.Flock(int(lock.Fd()), syscall.LOCK_UN) }()
+	defer unlock()
 
-	mode := fs.FileMode(0o600)
-	config := map[string]any{}
-	if data, err := os.ReadFile(path); err == nil {
-		if info, statErr := os.Stat(path); statErr == nil {
-			mode = info.Mode().Perm()
-		}
-		if len(data) > 0 {
-			// UseNumber so large integers in OAuth/MCP/unknown keys round-trip
-			// exactly (a plain decode would coerce them through float64 and could
-			// rewrite them in scientific notation / lose precision).
-			dec := json.NewDecoder(bytes.NewReader(data))
-			dec.UseNumber()
-			if err := dec.Decode(&config); err != nil {
-				// Malformed existing config — do NOT clobber it. Best-effort: bail.
-				return fmt.Errorf("existing %s is not valid JSON; leaving untouched: %w", path, err)
-			}
-			// A literal `null` (or any non-object) decodes a map to nil; re-seed an
-			// empty object rather than panic on the assignment below. Other non-object
-			// JSON (array/number/string) fails Decode above and is left untouched.
-			if config == nil {
-				config = map[string]any{}
-			}
-		}
-	} else if !errors.Is(err, fs.ErrNotExist) {
-		return fmt.Errorf("reading %s: %w", path, err)
+	config, mode, err := readJSONObject(path)
+	if err != nil {
+		return err
 	}
 
 	// Merge: set only projects[workdir].hasTrustDialogAccepted, preserving every
@@ -138,14 +109,90 @@ func PreseedClaudeConfig(workdir string, getenv func(string) string) error {
 	if err != nil {
 		return fmt.Errorf("encoding trust config: %w", err)
 	}
-	return atomicWrite(path, out, mode)
+	return atomicWrite(path, ".claude.json.*.tmp", out, mode)
+}
+
+// lockSibling takes an exclusive flock on a SIBLING lockfile (path + a fixed suffix),
+// never on the target file itself: each holder must read the CURRENT file after acquiring
+// the lock, and an atomic rename by another holder would otherwise leave the waiter
+// writing through a stale, unlinked inode. Shared by every merge-never-clobber preseed
+// (claude's .claude.json, cursor's hooks.json) so they serialize identically. The
+// returned func releases the lock and closes the file; it is never nil on success.
+func lockSibling(path string) (func(), error) {
+	lock, err := os.OpenFile(path+".shed-ext-rc.lock", os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return nil, err
+	}
+	if err := syscall.Flock(int(lock.Fd()), syscall.LOCK_EX); err != nil {
+		_ = lock.Close()
+		return nil, err
+	}
+	return func() {
+		_ = syscall.Flock(int(lock.Fd()), syscall.LOCK_UN)
+		_ = lock.Close()
+	}, nil
+}
+
+// readJSONObject reads a merge-never-clobber preseed target (claude's .claude.json,
+// cursor's hooks.json) and returns its decoded top-level object plus the file mode a
+// rewrite must preserve. Shared by both preseeds so the tolerance rules cannot drift:
+//
+//   - an absent or empty file yields an EMPTY object at mode 0600 (the create case);
+//   - an existing file's permission bits are carried through to the rewrite;
+//   - the decode uses UseNumber so large integers anywhere in the document (OAuth/MCP
+//     keys, timeouts, a version) round-trip exactly instead of through float64;
+//   - a literal `null` decodes the map to nil and is re-seeded as an empty object;
+//   - anything else malformed is an ERROR, and every caller's contract is to leave the
+//     file exactly as it is when one comes back.
+func readJSONObject(path string) (map[string]any, fs.FileMode, error) {
+	config := map[string]any{}
+	mode := fs.FileMode(0o600)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return config, mode, nil
+		}
+		return nil, 0, fmt.Errorf("reading %s: %w", path, err)
+	}
+	if info, statErr := os.Stat(path); statErr == nil {
+		mode = info.Mode().Perm()
+	}
+	if len(data) == 0 {
+		return config, mode, nil
+	}
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.UseNumber()
+	if err := dec.Decode(&config); err != nil {
+		return nil, 0, fmt.Errorf("existing %s is not valid JSON; leaving untouched: %w", path, err)
+	}
+	// json.Decoder decodes ONE value and stops; it happily accepts concatenated values
+	// after it (dec.More() only reports whitespace-vs-more-tokens within an array/object, it
+	// does not catch trailing top-level bytes). A second Decode must hit io.EOF — anything
+	// else, valid JSON or not, means the file has trailing content this preseed cannot
+	// account for, and the merge-never-clobber contract says leave it untouched rather than
+	// silently drop the tail on rewrite.
+	var trailing json.RawMessage
+	if err := dec.Decode(&trailing); err != io.EOF {
+		if err == nil {
+			err = fmt.Errorf("trailing data after the top-level JSON value")
+		}
+		return nil, 0, fmt.Errorf("existing %s is not valid JSON; leaving untouched: %w", path, err)
+	}
+	if config == nil {
+		config = map[string]any{}
+	}
+	return config, mode, nil
 }
 
 // atomicWrite writes data to a temp file in path's directory, fsyncs it, and
-// renames it over path (atomic on the same filesystem).
-func atomicWrite(path string, data []byte, mode fs.FileMode) error {
+// renames it over path (atomic on the same filesystem). tmpPattern is the
+// os.CreateTemp pattern for the temp file — passed in rather than hardcoded so each
+// preseed's leftovers (if a process dies between create and rename) are identifiable
+// as its own, and so a directory holding two different preseeded files never sees one
+// writer's debris attributed to the other.
+func atomicWrite(path, tmpPattern string, data []byte, mode fs.FileMode) error {
 	dir := filepath.Dir(path)
-	tmp, err := os.CreateTemp(dir, ".claude.json.*.tmp")
+	tmp, err := os.CreateTemp(dir, tmpPattern)
 	if err != nil {
 		return fmt.Errorf("creating temp config: %w", err)
 	}

@@ -55,6 +55,36 @@ type CreateOptions struct {
 	// claude's own default). e.g. "auto" or "bypassPermissions" for an unattended
 	// run; with bypassPermissions, Wait also auto-accepts the one-time bypass dialog.
 	PermissionMode string
+	// Warnf reports a NON-FATAL create-time diagnostic. Today it carries preseed
+	// outcomes: a preseed never fails a create (the session is usable either way), but a
+	// silently skipped one is invisible — most sharply cursor's, whose mount guard
+	// deliberately declines to write hooks.json into a host auth mount and would
+	// otherwise leave the operator wondering why the session has no feed. nil discards.
+	Warnf func(format string, args ...any)
+	// BinProbe gates Create for a non-shell kind: before any tmux work, it checks
+	// whether the kind's agent binary is reachable on the launch PATH via
+	// `bash -lc/-ic 'command -v <bin>'` — the caller (clirc.go's effectiveBinProbe)
+	// MUST bind the same shell VERB as this same call's InteractiveShell, because the
+	// two launch paths genuinely differ:
+	//
+	//   - InteractiveShell=false (the dominant guest path — shed-ext-rc's `create`
+	//     with no --interactive-shell) — the inner tmux command is a bare, unwrapped
+	//     exec that inherits the pane's environment, and that pane was itself created
+	//     by shed-ext-rc running over SSH under the server's `bash -lc` wrap: a LOGIN
+	//     shell (/etc/profile.d/*.sh + /etc/environment.d). The probe must match with
+	//     a login shell too, or it consults a NARROWER PATH than the real launch and
+	//     false-negative-rejects an agent that lives on the login PATH.
+	//   - InteractiveShell=true (native-machine callers, e.g. shed-machine-rc's
+	//     `claude` verb) — innerCommandTUI genuinely wraps the inner command in
+	//     `bash -ic` (an rc-file PATH: nvm/asdf/mise shims sourced from .bashrc), so
+	//     the probe must match with an interactive shell.
+	//
+	// A plain exec.LookPath, or the fixed login-shell probe capabilities.go uses for
+	// discovery, would get the wrong answer for one of the two cases above. Skipped
+	// entirely for a kind whose spec declares no Bin (shell has none to probe). nil
+	// skips the check (tests, and any caller with nothing to probe); production wires
+	// the real bash-backed probe (see clirc.go's realBinProbe).
+	BinProbe InstalledProbe
 	// EnsureHub, when non-nil, is invoked (best-effort) once a session has been
 	// created, to make sure the local rc activity hub is running so the new session
 	// is watched. It must never fail or meaningfully delay the create — a spawn
@@ -69,6 +99,21 @@ type CreateOptions struct {
 func Create(r Runner, env Getenv, opts CreateOptions, sleep func(time.Duration)) (Session, error) {
 	if !IsValidKind(opts.Kind) {
 		return Session{}, fmt.Errorf("%w: unknown kind %q", ErrBadArgs, opts.Kind)
+	}
+	// Installed-agent gate: before any tmux work, confirm the kind's binary is
+	// actually reachable on the launch PATH. Without this, a missing binary surfaces
+	// only as an opaque "session died on create (state=dead)" once the tmux inner
+	// command exits immediately — this turns that into a named, actionable error.
+	// Skipped for a kind with no Bin (shell) and when no probe is wired (nil BinProbe
+	// — see the field doc).
+	if spec, ok := specForKind(opts.Kind); ok && spec.Bin != "" && opts.BinProbe != nil {
+		if !opts.BinProbe(spec.Bin) {
+			// internal/ext/rc backs both a shed's shed-ext-rc (agents baked into the
+			// rootfs image) and a native machine's shed-machine-rc (agents user-installed),
+			// so the remediation names both possibilities rather than assuming one.
+			return Session{}, fmt.Errorf("%w: agent %q was not found on the session PATH — it may be missing from this shed's image (recreate from a newer image) or not installed on this machine; or pick another --kind",
+				ErrBadArgs, spec.Bin)
+		}
 	}
 	if opts.Prompt != "" {
 		if !AcceptsTypedInput(opts.Kind) {
@@ -142,17 +187,22 @@ func Create(r Runner, env Getenv, opts CreateOptions, sleep func(time.Duration))
 		CreatedAt:   time.Now().UTC().Format(time.RFC3339),
 		Target:      opts.Target,
 		Port:        port,
+		Slug:        slug,
 	}
 	envArgs, err := BuildEnvArgs(meta)
 	if err != nil {
 		return Session{}, fmt.Errorf("%w: %v", ErrBadArgs, err)
 	}
 
-	// Best-effort trust/onboarding pre-seed for tools that need one (claude; the
-	// accept-trust fallback covers any failure, so a preseed error never fails the
-	// create). Dispatched through the agent registry — nil Preseed = no-op.
+	// Best-effort per-tool preseed (claude: trust + onboarding, where the accept-trust
+	// fallback covers any failure; cursor: the hub's hook relay, where a failure costs the
+	// session its message feed but not its usability). Dispatched through the agent
+	// registry — nil Preseed = no-op. A failure NEVER fails the create; it is reported
+	// through Warnf so a skipped preseed is visible instead of silent.
 	if spec, ok := specForKind(opts.Kind); ok && spec.Preseed != nil {
-		_ = spec.Preseed(workdir, env)
+		if err := spec.Preseed(workdir, env); err != nil && opts.Warnf != nil {
+			opts.Warnf("%s preseed skipped: %v", spec.Tool, err)
+		}
 	}
 
 	inner := InnerCommand(opts.Kind, displayName, opts.PermissionMode, opts.InteractiveShell, port)
@@ -312,10 +362,23 @@ func sessionsForNames(r Runner, names []string, displayFallback func(slug string
 	return sessions
 }
 
-// capturePaneChecked returns a session's pane text, mapping a gone session to
-// ErrSessionNotFound (shared by probe/prompt/accept-trust).
+// capturePaneChecked returns a session's pane text (visible frame + 200 lines of
+// scrollback), mapping a gone session to ErrSessionNotFound (shared by
+// probe/prompt/accept-trust).
 func capturePaneChecked(r Runner, name string) (string, error) {
-	res := capturePane(r, name)
+	return checkedCapture(capturePane(r, name), name)
+}
+
+// captureVisiblePaneChecked is capturePaneChecked's VISIBLE-FRAME twin, with the same
+// error mapping. Used wherever scrollback would be a lie about the present — the
+// ApprovalAnchor evaluations (see captureVisiblePane).
+func captureVisiblePaneChecked(r Runner, name string) (string, error) {
+	return checkedCapture(captureVisiblePane(r, name), name)
+}
+
+// checkedCapture maps a capture-pane Result onto (text, error): a gone session becomes
+// ErrSessionNotFound so callers can tell it from a transient tmux failure.
+func checkedCapture(res Result, name string) (string, error) {
 	if res.Code != 0 {
 		if isMissingSession(res.Stderr) {
 			return "", fmt.Errorf("%w: %s", ErrSessionNotFound, name)
@@ -401,6 +464,17 @@ func Kill(r Runner, slug string) error {
 		return nil
 	}
 	return fmt.Errorf("tmux kill-session failed: %s", strings.TrimSpace(res.Stderr))
+}
+
+// ToolFor returns the human-facing tool token backing a kind's sessions ("claude",
+// "codex", "opencode", "cursor", "shell"), or "the agent" for an unregistered kind.
+// Registry-sourced so a CLI's needs-auth guidance names the actual tool instead of
+// hand-hardcoding "Claude" (see cmd/shed/attach.go's reportRCCreateOutcome).
+func ToolFor(k Kind) string {
+	if spec, ok := specForKind(k); ok && spec.Tool != "" {
+		return spec.Tool
+	}
+	return "the agent"
 }
 
 func firstNonEmpty(vals ...string) string {

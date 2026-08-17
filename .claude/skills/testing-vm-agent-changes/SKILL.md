@@ -208,6 +208,68 @@ the agent tests).
 > while looking green. When validating an rc change, rebuild **both**
 > `./scripts/build-vz-rootfs.sh --variant full …` **and** `--variant extensions …` (FC:
 > the matching `build-firecracker-rootfs.sh` invocations) so both aliases carry your build.
+> This two-variant rebuild requirement was correct before plan 008 and stays correct — no
+> change needed there.
+
+**New guest surfaces since plan 008 (opencode dual-control + cursor hooks):**
+`tests/integration/test_rc_kickoff.py` now gives CLI-path coverage — `shed attach
+--kind shell -d` end to end through the client CLI's own argv-building, flag
+validation, and plain-text output rendering (see its module docstring). What it does
+NOT cover, because both need a real agent login plus a rebuilt rootfs and so stay out
+of CI's reach for now, are the two guest-side runtime surfaces below — smoke these by
+hand when touching the rc hub:
+
+- **opencode verbs** (`turn`/`interrupt`/`approvals/{id}`, live only for opencode):
+  create an opencode rc session on the rebuilt image, drive a turn/interrupt/approval
+  through `curl` against the server's `/api/sheds/{name}/rc/v1/sessions/{slug}/{verb}`
+  proxy route (or the guest-local hub port directly, `shed exec <shed> curl
+  127.0.0.1:1029/v1/sessions`), and confirm the steer renders in the attached TUI at
+  the same time — that's the dual-control property the whole design bets on. Two
+  sessions in one opencode store is the WS-B regression to re-check by hand
+  occasionally: steering session A must never touch session B. Runnable example below.
+- **cursor hook ingestion**: create a cursor rc session on a host with cursor auth
+  mounted (`~/.config/cursor`, **not** `~/.cursor` — see
+  `docs/reference/configuration.md`), run a turn, and confirm the feed
+  (`GET .../messages`) picks up hook-derived rows (`beforeSubmitPrompt`, tool
+  use/result, `afterAgentResponse`) and that `~/.shed-rc-hub/hub.log` shows no
+  `hooks.json` write-skip warning (the foreign-device guard). If cursor auth mounts
+  aren't set up on the dev host, this leg is Mac-local-hub-only — see the plan's
+  §Verified conditionality note for AC-3.
+
+Copy-pasteable opencode-verb smoke, against the parallel dev server (`make
+dev-server-up`, port 18080) — full route reference in `docs/extensions/rc-helper.md`
+§Contract-v2 verbs:
+
+```bash
+# 1. Create an opencode rc session on the rebuilt image (prints the session DTO,
+#    including "slug"); opencode must already be logged in on that host.
+shed -s my-server-dev attach dbg --kind opencode -d
+
+# 2. Drive a turn through the SERVER'S PROXY route. 18080 is the dev server's
+#    http_port; if the dev config runs `auth.mode: token`, add
+#    `-H "Authorization: Bearer <token>"` (see docs/development/testing.md).
+curl -sS -X POST \
+  http://127.0.0.1:18080/api/sheds/dbg/rc/v1/sessions/<slug>/turn \
+  -H 'content-type: application/json' \
+  -d '{"text":"list the files in this directory"}'
+
+# 3. Interrupt the in-flight turn (body is ignored, still size-capped).
+curl -sS -X POST \
+  http://127.0.0.1:18080/api/sheds/dbg/rc/v1/sessions/<slug>/interrupt
+
+# 4. Resolve a pending approval (the id comes from GET .../sessions' pending_approvals,
+#    or an approval_request row on the feed).
+curl -sS -X POST \
+  http://127.0.0.1:18080/api/sheds/dbg/rc/v1/sessions/<slug>/approvals/<id> \
+  -H 'content-type: application/json' \
+  -d '{"decision":"allow"}'
+
+# Or skip the server proxy and hit the GUEST-LOCAL hub directly (same routes minus the
+# /api/sheds/<name> prefix, no server auth — this is how a shed reaches its own hub):
+shed -s my-server-dev exec dbg -- curl -sS -X POST \
+  127.0.0.1:1029/v1/sessions/<slug>/turn \
+  -H 'content-type: application/json' -d '{"text":"list the files in this directory"}'
+```
 
 ### Fast loop: copy the binary into a running shed
 

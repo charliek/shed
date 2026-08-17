@@ -14,6 +14,10 @@ import (
 // AND matches the codex prompt anchor (so the degraded idle+anchor input policy accepts).
 func codexReadyPane() string { return "codex\n> " + codexComposerPlaceholder }
 
+// opencodeReadyPane is an opencode pane parked at its composer placeholder — it matches the
+// opencode prompt anchor, so a gate rejection on it can only come from an activity arm.
+func opencodeReadyPane() string { return "opencode\n> Ask anything..." }
+
 // ---- GET /v1/sessions/{slug}/messages ----
 
 func TestHubHTTPMessagesPagingTruncatedAnd404(t *testing.T) {
@@ -270,21 +274,157 @@ func TestHubInputIdentityGuardIs409(t *testing.T) {
 	}
 }
 
-// opencode is input-gated (kind_features.input == "gated"), but gating alone doesn't
-// accept: with no recorded SHED_RC_OPENCODE_PORT this session has no correlated
-// watcher, and its pane doesn't match the opencode prompt anchor (a bare "opencode
-// ready" string, not the composer placeholder or footer) — so the degraded-path
-// fallback rejects it.
-func TestHubInputUngatedPaneAnchorMismatchIs409(t *testing.T) {
+// The opencode /input BEHAVIOR BREAK, pinned: opencode's row moved to input "turn"
+// (whole turns through POST /v1/sessions/{slug}/turn), and `input` is single-valued —
+// so /input no longer applies to the kind at all. It 409s on a pane that DOES match the
+// opencode composer anchor, i.e. the rejection can only be the kind gate itself, and it
+// is final for every opencode session regardless of activity. codex stays gated (its
+// happy path above is the counterpart pin).
+func TestHubInputOpencodeNotGatedAfterTurnFlip(t *testing.T) {
 	f := newHubTmux()
 	clk := &hubClock{t: time.Unix(1_700_000_000, 0).UTC()}
-	f.set("rc-ng111", "opencode ready", managedEnv("id-ng", KindOpencode))
+	f.set("rc-ng111", opencodeReadyPane(), managedEnv("id-ng", KindOpencode))
 	_, srv := newInputHub(t, f, clk)
 
 	resp := postInput(t, srv.URL+"/v1/sessions/ng111/input", `{"text":"hi"}`)
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusConflict {
-		t.Fatalf("uncorrelated opencode session, anchor mismatch, status = %d, want 409", resp.StatusCode)
+		t.Fatalf("opencode /input status = %d, want 409 (the kind is no longer gated)", resp.StatusCode)
+	}
+	if body := readAll(t, resp); !strings.Contains(body, "does not accept feed input") {
+		t.Errorf("rejection = %s, want the kind-gate message (not an activity rejection)", body)
+	}
+}
+
+// stubWatcher is a scripted sessionWatcher for the gate tests: it reports a fixed verdict
+// with fixed authority, so a merge case (needs_approval, expired-working, …) can be exercised
+// without standing up a real tail or SSE transport.
+type stubWatcher struct {
+	activity       Activity
+	message        string
+	fresh          bool
+	expiredWorking bool
+	approvals      []FeedApproval
+}
+
+func (s *stubWatcher) refresh(time.Time) {}
+func (s *stubWatcher) snapshot(time.Time) (Activity, string, bool, bool) {
+	return s.activity, s.message, s.fresh, s.expiredWorking
+}
+func (s *stubWatcher) drainPending() []feedMessage { return nil }
+func (s *stubWatcher) hadEvent() bool              { return true }
+func (s *stubWatcher) close()                      {}
+
+// stubApprovalWatcher adds the two approval surfaces: the snapshot reconcile publishes
+// (approvalPublisher) and the blocked-on-a-dialog question the input gate asks
+// (approvalBlocker). blocked models an open ask that is NOT in the snapshot — an opencode
+// question — so the two can be driven apart.
+type stubApprovalWatcher struct {
+	stubWatcher
+	blocked bool
+}
+
+func (s *stubApprovalWatcher) pendingApprovals() []FeedApproval { return s.approvals }
+func (s *stubApprovalWatcher) hasOpenApprovals() bool           { return s.blocked || len(s.approvals) > 0 }
+
+var (
+	_ sessionWatcher    = (*stubWatcher)(nil)
+	_ approvalPublisher = (*stubApprovalWatcher)(nil)
+	_ approvalBlocker   = (*stubApprovalWatcher)(nil)
+)
+
+// An approval dialog owns the keyboard: a merged needs_approval verdict rejects typed input
+// even though the pane is quiet and still matches the kind's composer anchor — without the
+// arm the posted line would answer the dialog by accident.
+func TestHubInputNeedsApprovalRejected(t *testing.T) {
+	f := newHubTmux()
+	clk := &hubClock{t: time.Unix(1_700_000_000, 0).UTC()}
+	h := newTestHub(f, clk)
+
+	blocked := &stubWatcher{activity: ActivityNeedsApproval, fresh: true}
+	if h.inputAccepted(blocked, ActivityNeedsInput, KindOpencode, opencodeReadyPane(), opencodeReadyPane()) {
+		t.Error("a fresh needs_approval watcher must reject input even on an anchored pane")
+	}
+	// The same watcher without authority falls through to stability, which is the settled
+	// pane verdict — the gate is driven by the MERGE, not by the raw watcher value.
+	stale := &stubWatcher{activity: ActivityNeedsApproval}
+	if !h.inputAccepted(stale, ActivityNeedsInput, KindOpencode, opencodeReadyPane(), opencodeReadyPane()) {
+		t.Error("a stale needs_approval watcher must yield to the settled stability verdict")
+	}
+}
+
+// The CONSERVATIVE arm: when the transport is unhealthy the merge demotes the watcher to pane
+// stability, so the merged-needs_approval arm cannot fire — but the dialog is still on the pane.
+// A watcher reporting any open ask therefore rejects regardless of freshness, and it covers
+// opencode QUESTIONS, which block the keyboard without ever entering pending_approvals.
+func TestHubInputOpenApprovalRejectsWhenTransportUnhealthy(t *testing.T) {
+	f := newHubTmux()
+	clk := &hubClock{t: time.Unix(1_700_000_000, 0).UTC()}
+	h := newTestHub(f, clk)
+
+	// Unhealthy watcher: fresh=false → the merge hands the verdict to stability (needs_input),
+	// which on an anchored pane would otherwise accept.
+	stale := &stubApprovalWatcher{stubWatcher: stubWatcher{activity: ActivityNeedsApproval}}
+	stale.approvals = []FeedApproval{{ID: "per_1", Status: approvalStatusPending}}
+	if merged, _ := mergedActivity(ActivityNeedsApproval, "", false, false, ActivityNeedsInput); merged != ActivityNeedsInput {
+		t.Fatalf("test premise: an unhealthy watcher must merge to stability, got %q", merged)
+	}
+	if h.inputAccepted(stale, ActivityNeedsInput, KindOpencode, opencodeReadyPane(), opencodeReadyPane()) {
+		t.Error("an open approval must reject even when the transport went unhealthy")
+	}
+
+	// A question: nothing in the snapshot, still blocking.
+	question := &stubApprovalWatcher{stubWatcher: stubWatcher{activity: ActivityNeedsInput, fresh: true}, blocked: true}
+	if h.inputAccepted(question, ActivityNeedsInput, KindOpencode, opencodeReadyPane(), opencodeReadyPane()) {
+		t.Error("an open question must reject even though pending_approvals is empty")
+	}
+
+	// Once nothing is open, the same (fresh, settled) watcher accepts again.
+	clear := &stubApprovalWatcher{stubWatcher: stubWatcher{activity: ActivityNeedsInput, fresh: true}}
+	if !h.inputAccepted(clear, ActivityNeedsInput, KindOpencode, opencodeReadyPane(), opencodeReadyPane()) {
+		t.Error("with no open ask the gate must accept a settled session")
+	}
+}
+
+// The second arm: a kind whose approvals are pane-derived rejects while its ApprovalAnchor
+// matches the FRESH pane — now live, driven by codex's real anchor against the committed
+// approval fixtures. The watcher is deliberately FRESH and settled (needs_input), the one
+// verdict that otherwise short-circuits to accept: that is what makes this arm bite, and
+// it is not hypothetical for codex, whose rollout cannot see the dialog at all.
+// UNDEBOUNCED on purpose (unlike reconcile's needs_approval derivation): one frame showing
+// the dialog is enough to refuse a keystroke that would otherwise answer it.
+func TestHubInputApprovalAnchorRejected(t *testing.T) {
+	f := newHubTmux()
+	clk := &hubClock{t: time.Unix(1_700_000_000, 0).UTC()}
+	h := newTestHub(f, clk)
+
+	if approvalAnchorFor(KindCodex) == nil {
+		t.Fatal("test premise: codex must declare an ApprovalAnchor")
+	}
+	settled := &stubWatcher{activity: ActivityNeedsInput, fresh: true}
+
+	for _, fx := range []string{"codex-ready-approval-exec", "codex-ready-approval-network"} {
+		if h.inputAccepted(settled, ActivityNeedsInput, KindCodex, paneFixture(t, fx), paneFixture(t, fx)) {
+			t.Errorf("%s: an approval dialog on the fresh pane must reject input", fx)
+		}
+	}
+	// The same session once the dialog is answered: the overlay is gone (the headline is
+	// still in the transcript) and the composer is back — input flows again.
+	if !h.inputAccepted(settled, ActivityNeedsInput, KindCodex, paneFixture(t, "codex-ready-approval-resolved"), paneFixture(t, "codex-ready-approval-resolved")) {
+		t.Error("the post-resolution pane must accept input again")
+	}
+	// Agent prose quoting the dialog must not lock the keyboard either.
+	if !h.inputAccepted(settled, ActivityNeedsInput, KindCodex, paneFixture(t, "codex-ready-approval-quoted"), paneFixture(t, "codex-ready-approval-quoted")) {
+		t.Error("quoted prose must not gate input")
+	}
+	if !h.inputAccepted(settled, ActivityNeedsInput, KindCodex, codexReadyPane(), codexReadyPane()) {
+		t.Error("without the anchor on the pane the gate must still accept")
+	}
+	// The arm reads the VISIBLE frame, never the scrollback: a dialog answered ten
+	// minutes ago is still in the 200-line history, and gating on that would wedge the
+	// session's input for as long as it stayed there.
+	if !h.inputAccepted(settled, ActivityNeedsInput, KindCodex, paneFixture(t, "codex-ready-approval-exec"), codexReadyPane()) {
+		t.Error("an approval dialog present ONLY in the scrollback must not gate input")
 	}
 }
 
@@ -303,7 +443,7 @@ func TestHubInputAcceptedWatcherBranch(t *testing.T) {
 	writeFile(t, settled, `{"type":"event_msg","payload":{"type":"task_complete","last_agent_message":"done"}}`+"\n")
 	wSettled := newFileWatcher(settled, true, newCodexFold())
 	wSettled.refresh(clk.now())
-	if !h.inputAccepted(wSettled, ActivityWorking, KindCodex, "no anchor here") {
+	if !h.inputAccepted(wSettled, ActivityWorking, KindCodex, "no anchor here", "no anchor here") {
 		t.Error("a fresh needs_input watcher must accept regardless of the pane anchor")
 	}
 
@@ -314,7 +454,7 @@ func TestHubInputAcceptedWatcherBranch(t *testing.T) {
 		`{"type":"response_item","payload":{"type":"custom_tool_call","call_id":"c1","name":"exec"}}`+"\n")
 	wWorking := newFileWatcher(working, true, newCodexFold())
 	wWorking.refresh(clk.now())
-	if h.inputAccepted(wWorking, ActivityWorking, KindCodex, codexReadyPane()) {
+	if h.inputAccepted(wWorking, ActivityWorking, KindCodex, codexReadyPane(), codexReadyPane()) {
 		t.Error("a fresh working watcher must reject even with the composer anchor present")
 	}
 }
@@ -341,12 +481,12 @@ func TestHubInputLongQuietWorkingRejected(t *testing.T) {
 	clk.advance(watcherWorkingGrace + time.Second) // file quiet past the working grace
 
 	// Stability unsettled (working) → merged stays working → reject despite the anchor.
-	if h.inputAccepted(w, ActivityWorking, KindCodex, codexReadyPane()) {
+	if h.inputAccepted(w, ActivityWorking, KindCodex, codexReadyPane(), codexReadyPane()) {
 		t.Error("expired-working with unsettled stability must reject (still mid-turn)")
 	}
 	// Stability settled (idle: the pane genuinely stopped) → the merge releases to
 	// stability and the anchor path may accept.
-	if !h.inputAccepted(w, ActivityIdle, KindCodex, codexReadyPane()) {
+	if !h.inputAccepted(w, ActivityIdle, KindCodex, codexReadyPane(), codexReadyPane()) {
 		t.Error("expired-working with settled-idle stability + anchor should accept")
 	}
 }

@@ -220,6 +220,36 @@ mounts:
     target: /home/shed/.claude
     readonly: false
 
+  # Codex CLI config/auth
+  codex:
+    source: ~/.codex
+    target: /home/shed/.codex
+    readonly: false
+
+  # opencode auth + state (NOT ~/.config/opencode — that is not where opencode
+  # keeps its login/state; two mounts, both writable)
+  opencode_data:
+    source: ~/.local/share/opencode
+    target: /home/shed/.local/share/opencode
+    readonly: false
+  opencode_state:
+    source: ~/.local/state/opencode
+    target: /home/shed/.local/state/opencode
+    readonly: false
+
+  # cursor-agent auth — ~/.config/cursor ONLY. On Linux (the guest OS) the
+  # cursor-agent CLI keeps its login tokens here, not under ~/.cursor. Do NOT
+  # also mount ~/.cursor: shed's rc hub writes a hook relay into
+  # ~/.cursor/hooks.json so cursor-agent sessions report activity/feed to the
+  # hub, and it deliberately SKIPS that write whenever ~/.cursor sits on a
+  # different filesystem than $HOME (its "this is a host auth mount, not a
+  # guest-local dir" guard) — mounting ~/.cursor silently disables the hook
+  # feed for every cursor session in the shed. Leave ~/.cursor guest-local.
+  cursor:
+    source: ~/.config/cursor
+    target: /home/shed/.config/cursor
+    readonly: false
+
   # GitHub CLI
   gh:
     source: ~/.config/gh
@@ -238,6 +268,9 @@ mounts:
     target: /home/shed/.config/gcloud
     readonly: true
 ```
+
+See `configs/server.dev-parallel.mac.yaml` for these mounts in a complete, working
+server config (the same shape `make dev-server-up` uses for local agent-auth testing).
 
 ### Exclude Patterns
 

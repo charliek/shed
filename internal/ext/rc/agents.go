@@ -47,9 +47,12 @@ type AgentSpec struct {
 	// shed-guest "exited to shell" dead signal is applied by ClassifyPane before this
 	// runs, so a spec's Classify only handles its live states.
 	Classify func(kind Kind, pane string) PaneResult
-	// Preseed prepares on-disk tool config so a fresh session reaches ready
-	// unattended (claude: trust + onboarding). nil when the tool needs none, or when
-	// its trust gate is auto-accepted from the pane instead (codex).
+	// Preseed prepares on-disk tool config before the session launches: claude's trust +
+	// onboarding gates (so a fresh session reaches ready unattended), cursor's hook relay
+	// (so the hub gets a signal at all — see PreseedCursorHooks). nil when the tool needs
+	// none, or when its trust gate is auto-accepted from the pane instead (codex).
+	// Best-effort by contract: Create reports a failure through CreateOptions.Warnf and
+	// carries on.
 	Preseed func(workdir string, getenv func(string) string) error
 	// PermMap maps a generic permission mode (default/auto/skip) to this tool's argv
 	// flags. Every spec defines all three keys; a value of nil means "no posture flag"
@@ -71,6 +74,44 @@ type AgentSpec struct {
 	// pane-derived and that expose no anchor. Matched against the RAW captured pane
 	// (not the normalized snapshot) so composer chrome survives.
 	PromptAnchor *regexp.Regexp
+	// ApprovalAnchor matches a pane showing this tool's APPROVAL dialog — the chrome a
+	// TUI puts up when it is blocked on the operator's yes/no. It is the pane-side
+	// counterpart to a lane's native approval events: kinds whose approvals never reach
+	// a protocol (codex's rollout carries no approval record; cursor has no approval
+	// hook) can only be known to be blocked by looking at the pane. Two consumers: the
+	// input gate rejects a post while it matches (typed input would answer the dialog by
+	// accident), and reconcile derives needs_approval from it (debounced two ticks each
+	// way, emitting informational approval rows — see hub_reconcile.go).
+	//
+	// Declared by codex and cursor — the two kinds whose approvals reach no protocol at
+	// all. Every anchor is built on the widget's OPTION-ROW chrome (the gutter/selection
+	// marker plus the whole-line label envelope), never on a headline alone: headlines get
+	// quoted in agent prose and survive in the transcript after the dialog is answered, so
+	// they can neither be trusted nor observed to clear, whereas option rows exist exactly
+	// while the widget is mounted. (cursor's anchor conjoins a headline WITH an option row,
+	// because its TUI draws no footer to conjoin against — see cursorApprovalAnchorRe.)
+	// Matched, like PromptAnchor, against the RAW captured pane so dialog chrome survives
+	// normalization.
+	ApprovalAnchor *regexp.Regexp
+	// ComposerUnderModal records that this tool KEEPS ITS INPUT COMPOSER DRAWN while a
+	// modal owns the keyboard — so its PromptAnchor is NOT evidence the session is
+	// accepting input. It is a per-tool rendering fact, verified against the committed
+	// fixtures (TestComposerUnderModalMatchesTheFixtures):
+	//
+	//   codex  — false: the approval overlay REPLACES the composer area, so a pane showing
+	//            the dialog does not match codexPromptAnchorRe at all. The prompt anchor is
+	//            self-sufficient evidence there.
+	//   cursor — TRUE: the prompt bar renders its text input in a disabled, dimmed variant
+	//            with the placeholder still drawn beneath the decision surface, so
+	//            cursorReadyRe matches a pane that is blocked on an approval.
+	//
+	// The consequence is in the input gate (hub.go inputAccepted): for such a kind, an
+	// EXPIRED-WORKING watcher verdict may not fall through to the degraded
+	// "composer-anchor accepts" path. That path exists for kinds whose composer means
+	// "ready"; where the composer is drawn under a modal it means nothing, and accepting
+	// there would type into whatever widget owns the keyboard — for cursor, a line
+	// containing "y" would hit its y=approve keybind and answer the dialog.
+	ComposerUnderModal bool
 }
 
 // PaneResult is a Classify outcome: the derived lifecycle state plus the optional
@@ -180,6 +221,186 @@ var (
 	shellPromptAnchorRe = regexp.MustCompile(`(?m)^\s*\[shed:[^\]]+\][^$]*\$\s*$`)
 )
 
+// Approval anchors — the blocked-on-a-yes/no dialog chrome per tool (AgentSpec.
+// ApprovalAnchor). Structural, whole-line expressions in the cursorReadyRe tradition:
+// what makes a match trustworthy is the WIDGET SHAPE around the words, not the words.
+var (
+	// codexApprovalAnchorRe matches one rendered OPTION ROW of codex's approval overlay
+	// (tui/src/bottom_pane/approval_overlay.rs, rendered through list_selection_view.rs).
+	// Fixtures: testdata/panes/codex-ready-approval-exec.txt (exec prompt) and
+	// codex-ready-approval-network.txt (network prompt), adapted from the codex repo's
+	// committed TUI snapshots; codex-ready-approval-resolved.txt (overlay gone) and
+	// codex-ready-approval-quoted.txt (the same words as assistant prose) are the
+	// negatives.
+	//
+	// Why option rows and not the HEADLINE ("Would you like to run the following
+	// command?"): a headline is ordinary English that an agent quotes back in its own
+	// prose all the time, and — decisively — the headline scrolls into the transcript
+	// while the overlay is torn down, so it does NOT disappear when the dialog is
+	// answered. The option rows do: they exist only while the widget is mounted, which
+	// is exactly the interval the anchor is supposed to describe.
+	//
+	// Shape, from list_selection_view.rs's row builder (`format!("{prefix} {n}. ")`,
+	// prefix '›' when selected and ' ' otherwise, an optional " (key)" shortcut hint
+	// appended by the row renderer):
+	//
+	//	› 1. Yes, proceed (y)
+	//	  2. No, and tell Codex what to do differently (esc)
+	//
+	// The regex therefore requires TWO pieces of widget chrome, in order:
+	//
+	//  1. a whole option row at COLUMN 0 with no leading indent — the selection gutter
+	//     (`›`, or the single space that replaces it on an unselected row), a space, the
+	//     enabled-row number, `. `, one of the pinned labels, an optional parenthesized
+	//     shortcut hint, and end of line;
+	//  2. within the next few lines, the overlay's footer `Press enter to confirm or esc
+	//     to cancel` (codex's OTHER list views end "esc to go back" — this exact wording
+	//     belongs to the approval overlay, and the cross-thread variant only APPENDS
+	//     " or o to open thread", so a prefix match holds).
+	//
+	// The conjunction is what makes the quoted-prose fixture
+	// (codex-ready-approval-quoted.txt) a genuine negative. Requiring only the option row
+	// would not be enough on its own: codex renders assistant text with a `• ` bullet and
+	// a two-space body indent, so a markdown list inside a message can land at exactly
+	// the same column as an UNSELECTED option row. Requiring only the `›` marker would
+	// fail the opposite way — the operator can arrow the marker onto a row whose label is
+	// outside the pinned set, and the anchor would report the dialog gone while it is
+	// still up. Demanding the row AND the footer costs an agent-prose false positive both
+	// pieces of chrome in the right order, and costs a live dialog nothing.
+	//
+	// KNOWN LIMITATION (accepted, inherent to a pane-derived signal): a VERBATIM
+	// reproduction of the whole dialog on screen — `cat`ing this package's own fixture
+	// files, pasting a transcript that preserves the gutter and the footer — reproduces
+	// both pieces of chrome and does read as an approval. No regex can separate "the
+	// widget is mounted" from "a perfect picture of the widget is on screen" when the
+	// pane is all we get, and the debounce cannot help (the text is static, so it agrees
+	// with itself indefinitely). Two things bound the damage: the anchor is evaluated
+	// against the VISIBLE FRAME only (captureVisiblePane), so a false episode lives
+	// exactly as long as the text is on screen and clears when it scrolls away, and the
+	// consequence is an informational row plus a decision-less pending entry — nothing is
+	// auto-approved and nothing is auto-denied. The real fix is a structured lane (codex
+	// app-server), not a better regex.
+	//
+	// Label set (deliberately small, per plan 008 §3.6): every exec / patch / network
+	// approval renders at least one of these three rows — "Yes, proceed" (exec+patch
+	// option 1), "Yes, just this once" (network option 1), and "No, and tell Codex what
+	// to do differently" (the Cancel option, present on all three) — so the anchor is
+	// stable no matter which row the operator has arrowed onto. The shortcut hint is
+	// optional because the approval keymap is configurable; the labels are compiled
+	// literals. KNOWN GAP, and the extension point when it matters: the newer
+	// additional-permissions overlay ("Would you like to grant these permissions?") uses
+	// a disjoint label set ("Yes, grant these permissions for this turn" … "No, continue
+	// without permissions") and is not matched.
+	codexApprovalAnchorRe = regexp.MustCompile(
+		`(?m)^[› ] \d+\. (?:Yes, proceed|Yes, just this once|No, and tell Codex what to do differently)(?: \([^()\n]{1,16}\))? *\n` +
+			`(?:[^\n]*\n){0,12} *Press enter to confirm or esc to cancel`)
+
+	// cursorApprovalAnchorRe matches cursor-agent's approval prompt (its "decision
+	// surface"): the widget the TUI mounts when a command is not in the allowlist, or a
+	// hook asked for approval, and the turn is blocked on the operator.
+	//
+	// SOURCE, not guesswork — the strings and the row chrome are read out of the installed
+	// cursor-agent bundle (2026.08.11-e8db854), which ships its TUI as readable (minified)
+	// JS:
+	//   src/components/prompt/decision-logic.ts     — the headline per operation type
+	//                                                 (`Run this command?` …) and the option
+	//                                                 label+hint list per type
+	//   src/components/prompt/decision-dropdown.tsx — the row: paddingLeft, then the
+	//                                                 selection marker ("→ " selected,
+	//                                                 "  " not — pager/tokens.ts), the
+	//                                                 label, then " (hint)"
+	//   the policy engine's reason list            — `Not in allowlist: <cmds>` and
+	//                                                 `Hook requested approval: <msg>`
+	//
+	// THE CONJUNCTION (the structural equivalent of codex's option-row + footer): a
+	// whole-line HEADLINE, then within a few lines a whole-line OPTION ROW. Neither half is
+	// trusted alone. A headline alone is ordinary English an agent quotes back — and, like
+	// codex's, it scrolls into the transcript and survives the answer, so it can never be
+	// observed to clear (testdata/panes/cursor-ready-approval-resolved.txt keeps it
+	// deliberately). An option label alone is a phrase an agent explaining the prompt puts
+	// at the end of a line. Both, in order, is the widget.
+	//
+	// The row's accepted gutter is exactly what the dropdown renders: leading indent and an
+	// optional "→ " marker. Markdown bullets (`- `, `* `) are NOT accepted, because that is
+	// precisely how an assistant renders a list of the same labels — see
+	// cursor-ready-approval-quoted.txt, which quotes the labels inline AND as a bulleted
+	// list and must not match.
+	//
+	// THE LABEL SET IS EXHAUSTIVE OVER ALL EIGHT DECISION SURFACES, deliberately — and this
+	// is where it differs from codex's small pinned set. A surface whose rows do not match
+	// opens no episode, which does not merely lose a badge: the pane freezes, the watcher's
+	// working verdict expires after the grace, and the input gate's degraded path would see
+	// cursor's still-drawn composer and accept a posted line straight into the widget, where
+	// a "y" anywhere in the text hits cursor's y=approve keybind. Missing a surface here is
+	// therefore an AUTO-APPROVAL bug, not a cosmetic one, so every label decision-logic.ts
+	// can render is listed: shell (Run (once) / Run outside sandbox (once) / Add Shell(…) to
+	// allowlist? / Skip & tell the agent what to do instead), MCP (Run (once) / Allowlist MCP
+	// Tool / Reject & propose changes / Skip), delete (Delete / Keep), write (Proceed /
+	// Reject & propose changes / Add Write(…) to allowlist? / Add to allowlist), web search
+	// (Allow search / Skip), web fetch (Fetch / Always allow <domain> / Skip), the edit
+	// surface (headline-only), and the shared auto-run row (Run Everything / Run in Sandbox /
+	// Checking Run Everything availability). The generic one-word labels (Skip, Keep, Delete,
+	// Proceed, Fetch) are only safe because the HEADLINE half carries the trust — neither
+	// half is ever matched alone. The three dynamic labels are anchored on their fixed
+	// prefix, since they interpolate a path/command/domain.
+	//
+	// SAFETY-CRITICAL: for a ComposerUnderModal kind (cursor), THIS regex matched against the
+	// FRESH visible pane is the SOLE guard against typing into a modal. inputAccepted's
+	// expired-working arm recovers gated input whenever no ApprovalAnchor matches the visible
+	// frame AND pane-stability has settled on needs_input (plan 008 C9) — there is no longer a
+	// blanket reject beneath it. Because cursor draws its composer, disabled, UNDER the dialog,
+	// a decision surface this regex does NOT know about still settles the composer to
+	// needs_input, and the gate would then ACCEPT a keystroke straight into that widget (where
+	// a "y" answers it). Keeping cursorApprovalAnchorRe EXHAUSTIVE across every decision surface
+	// decision-logic.ts can render is therefore load-bearing, not cosmetic — a missed or newly
+	// added surface is an auto-approval hole. TestCursorApprovalAnchorCoversEveryDecisionSurface
+	// pins the exhaustiveness; a future cursor-upgrade audit that adds a surface MUST teach this
+	// regex in the same change.
+	//
+	// KNOWN LIMITATION, shared with codex and inherent to a pane-derived signal: a verbatim
+	// reproduction of the widget on screen reads as the widget. The consequence is an
+	// informational row plus a refused keystroke — nothing is auto-approved — and the anchor
+	// only ever sees the VISIBLE frame (captureVisiblePane), so a false episode clears the
+	// moment the text scrolls away.
+	//
+	// FIXTURE PROVENANCE: reconstructed from the bundle above, NOT captured from a live
+	// pane (the hook spike recorded payloads, not panes, and cursor's account was not
+	// re-run for a capture). The labels, hints, headline, marker and indentation are
+	// source-faithful; the surrounding transcript/composer frame is the live
+	// cursor-ready-active.txt shape. Re-capture live when convenient — see
+	// testdata/panes/SUMMARY.txt.
+	cursorApprovalAnchorRe = regexp.MustCompile(
+		`(?m)^[ \t]*` + cursorApprovalHeadline + `[ \t]*\n` +
+			`(?:[^\n]*\n){0,8}` +
+			`[ \t]*(?:→ )?` + cursorApprovalOption + `[ \t]*$`)
+)
+
+// cursorApprovalHeadline is the decision surface's bold headline, one alternative per
+// operation type (decision-logic.ts), plus the hook-approval reason line — which owns its
+// line, carries the hook's message after the colon, and appears in no other widget.
+const cursorApprovalHeadline = `(?:Run this command\?|Run this command outside the sandbox\?` +
+	`|Run this MCP tool\?|Delete this file\?|Write to this file\?` +
+	`|Allow this web search\?|Allow this web fetch\?|Proceed with this edit\?` +
+	`|Hook requested approval:[^\n]*)`
+
+// cursorApprovalOption is one option row's LABEL — every label decision-logic.ts can push,
+// across all eight decision surfaces (see the anchor's doc for why exhaustiveness is a
+// safety property here, not a nicety). Two families:
+//
+//   - FIXED labels, which own their whole line up to an optional " (hint)";
+//   - PREFIX labels, which interpolate a path/command/domain ("Add Write(<path>) to
+//     allowlist?", "Add Shell(<cmds>) to allowlist?", "Always allow <domain>") and so
+//     consume the rest of the line.
+//
+// The hint suffix is attached HERE rather than at the call site, because a prefix label
+// already swallows its own trailing hint.
+const cursorApprovalOption = `(?:(?:Run \(once\)|Run outside sandbox \(once\)|Run Everything` +
+	`|Run in Sandbox|Checking Run Everything availability` +
+	`|Skip & tell the agent what to do instead|Reject & propose changes` +
+	`|Allowlist MCP Tool|Add to allowlist|Allow search|Delete|Keep|Proceed|Fetch|Skip)` +
+	`(?: \([^()\n]{1,16}\))?` +
+	`|(?:Always allow |Add Write\(|Add Shell\()[^\n]*)`
+
 // noPostureMap is the generic tri-state mapping for tools whose modes need no flags
 // at all (shell): every generic mode is accepted but produces nothing. Agent specs
 // define their own maps with the real flags.
@@ -235,6 +456,11 @@ var agentRegistry = []*AgentSpec{
 		},
 		AuthHint:     "run `codex` and complete login (`codex login`)",
 		PromptAnchor: codexPromptAnchorRe,
+		// codex's approvals never reach a protocol — its rollout JSONL filters every
+		// approval record out (see plan 008 §2), so a session blocked on the overlay is
+		// byte-identical in the log to a long-running tool call. The pane is the only
+		// evidence there is.
+		ApprovalAnchor: codexApprovalAnchorRe,
 	},
 	{
 		Tool:         toolOpencode,
@@ -261,7 +487,11 @@ var agentRegistry = []*AgentSpec{
 		Lane:         LaneTUI,
 		InnerCommand: innerCommandTUI("cursor-agent"),
 		Classify:     classifyCursor,
-		Preseed:      nil,
+		// cursor's preseed is not a trust/onboarding gate (it has none) — it installs the
+		// hub's hook relay into ~/.cursor/hooks.json, which is the ONLY live signal a cursor
+		// session produces (see preseed_cursor.go and watch_cursor.go). Best-effort like
+		// every Preseed: a failure costs the session its feed, never its create.
+		Preseed: PreseedCursorHooks,
 		PermMap: map[string][]string{
 			PermModeDefault: nil,
 			// cursor has no mid-tier posture; auto stays default until one exists.
@@ -272,6 +502,15 @@ var agentRegistry = []*AgentSpec{
 		// cursorReadyRe is the authed composer placeholder ("→ Plan, search, build
 		// anything", testdata/panes/cursor-ready.txt) — reused as the prompt anchor.
 		PromptAnchor: cursorReadyRe,
+		// cursor emits NO approval hook event (verified in the spike): a session blocked on
+		// the allowlist prompt looks, on the hook stream, exactly like a long tool call. So
+		// — as for codex — the pane is the only evidence, and it is what drives both the
+		// needs_approval verdict and the input gate's refusal.
+		ApprovalAnchor: cursorApprovalAnchorRe,
+		// cursor draws its composer (disabled) UNDER the decision surface, so the prompt
+		// anchor above keeps matching while an approval owns the keyboard — see the field's
+		// doc for what the input gate does about it.
+		ComposerUnderModal: true,
 	},
 	{
 		Tool:         toolShell,
@@ -296,6 +535,25 @@ func promptAnchorFor(k Kind) *regexp.Regexp {
 		return spec.PromptAnchor
 	}
 	return nil
+}
+
+// approvalAnchorFor returns the kind's approval-dialog regex, or nil for an unregistered
+// kind or a spec that declares none (codex and cursor declare one — see
+// AgentSpec.ApprovalAnchor). nil means "this kind has no pane-derived approval signal",
+// which callers must treat as "no evidence", never as "not blocked".
+func approvalAnchorFor(k Kind) *regexp.Regexp {
+	if spec, ok := specForKind(k); ok {
+		return spec.ApprovalAnchor
+	}
+	return nil
+}
+
+// composerUnderModal reports whether the kind's composer stays drawn while a modal owns
+// the keyboard (AgentSpec.ComposerUnderModal). false for an unregistered kind — and for a
+// kind with no prompt anchor at all the question never arises.
+func composerUnderModal(k Kind) bool {
+	spec, ok := specForKind(k)
+	return ok && spec.ComposerUnderModal
 }
 
 // kindToSpec indexes the registry by kind for O(1) lookup. It is populated in init()
@@ -532,14 +790,66 @@ var (
 	// word-bounded phrases, not bare "login" — to avoid tripping on ordinary agent
 	// chatter in a conversation.
 	opencodeAuthScreenRe = regexp.MustCompile(`(?i)\bsign in\b|\blog ?in to\b|\bauthenticate\b|\bopencode auth\b`)
+
+	// opencodeAuthDialogRe matches opencode's auto-opened "Connect a provider" dialog
+	// — the widget opencode's TUI pops up UNPROMPTED the instant its sync effect sees
+	// `sync.data.provider.length === 0` (packages/tui/src/app.tsx: "only trigger when
+	// we transition into an empty-provider state"), which is exactly the state of a
+	// freshly-baked shed image before `opencode auth login` has ever run — the "reads
+	// starting → timeout" gap this anchor closes.
+	//
+	// SOURCE, not guesswork — read out of the opencode monorepo's TUI package
+	// (packages/tui/src, commit 4643e65ad63 as checked out locally for this change):
+	//
+	//	component/dialog-provider.tsx — `<DialogSelect title="Connect a provider"
+	//	                                 options={options()} />`; PROVIDER_PRIORITY
+	//	                                 groups every built-in provider (opencode,
+	//	                                 openai, anthropic, google, github-copilot,
+	//	                                 opencode-go) under the category "Popular".
+	//	ui/dialog-select.tsx          — the title renders bold, left-column, with
+	//	                                 "esc" trailing on the SAME row (so the title
+	//	                                 is not itself end-of-line-anchorable); each
+	//	                                 category header renders BOLD, ALONE, on its
+	//	                                 own line, a few rows below.
+	//	app.tsx                       — `dialog.replace(() => <DialogProviderList />)`
+	//	                                 gated on the empty-provider transition.
+	//	ui/dialog.tsx                 — the Dialog wrapper is a full-screen
+	//	                                 `position="absolute"` overlay (zIndex 3000),
+	//	                                 so — like codex's approval overlay — it
+	//	                                 REPLACES whatever the composer/home screen
+	//	                                 would otherwise draw; opencodePlaceholderRe /
+	//	                                 opencodeFooterRe never co-render with it on a
+	//	                                 real pane.
+	//
+	// THE CONJUNCTION (same discipline as codex/cursor's approval anchors, § their
+	// docs): the headline alone is not trusted — "Connect a provider" is ordinary
+	// English an agent could in principle quote back — so the anchor additionally
+	// requires the "Popular" category header, which appears alone on its own line a
+	// few rows below the title and exists only while this exact widget is mounted
+	// (see TestClassifyFalsePositives for the negative: the headline alone, without
+	// the category header, must not classify as needs-auth).
+	//
+	// FIXTURE PROVENANCE: testdata/panes/opencode-needs-auth.txt is reconstructed
+	// from the source above, NOT captured from a live pane (no fixture-capture shed
+	// was spun up for this change) — same provenance discipline as cursor's approval
+	// fixtures. Re-capture live when convenient.
+	opencodeAuthDialogRe = regexp.MustCompile(
+		`(?m)^[ \t]*Connect a provider\b` +
+			`(?:[^\n]*\n){0,10}` +
+			`[ \t]*Popular[ \t]*$`)
 )
 
-// classifyOpencode derives an opencode pane's lifecycle state. opencode has no trust
-// gate; its logged-out screen was not captured live, so needs-auth is left to the
-// shared signals for now (a future anchor slots in here). The composer placeholder is
-// unconditional ready; the persistent footer alone means ready only when the pane does
-// not look like an auth/onboarding screen (opencodeAuthScreenRe).
+// classifyOpencode derives an opencode pane's lifecycle state. The auto-opened
+// "Connect a provider" dialog (opencodeAuthDialogRe) is checked first — it is opencode's
+// only captured POSITIVE needs-auth signal (a zero-provider session), and it fully
+// replaces the composer/footer on screen, so it never races the ready checks below. The
+// composer placeholder is unconditional ready; the persistent footer alone means ready
+// only when the pane does not look like an auth/onboarding screen (opencodeAuthScreenRe,
+// the pre-existing guard kept for any onboarding text this anchor doesn't cover).
 func classifyOpencode(_ Kind, pane string) PaneResult {
+	if opencodeAuthDialogRe.MatchString(pane) {
+		return PaneResult{State: StateNeedsAuth}
+	}
 	if opencodePlaceholderRe.MatchString(pane) {
 		return PaneResult{State: StateReady}
 	}

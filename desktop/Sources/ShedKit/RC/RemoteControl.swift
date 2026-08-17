@@ -315,12 +315,15 @@ public struct RcAgentInfo: Codable, Sendable, Equatable {
 /// Per-kind UI hints from `capabilities.kind_features`. Mirrors `rc.KindFeatures` /
 /// `shed_core::rc::RcKindFeatures`.
 ///
-/// `watch` and `input` are additive hub hints (codex-only in this phase; absent
-/// decodes to `false`/`""`). Contract v2 adds three more, all additive so an
+/// `watch` and `input` are additive hub hints (the feed kinds — codex, opencode, and
+/// cursor — carry them; absent decodes to `false`/`""`). `input` is
+/// single-valued: `"gated"` (`POST /input` only while waiting), `"turn"` (whole
+/// turns through `POST /turn`, so `/input` no longer applies — opencode today),
+/// or `""`. Contract v2 adds three more, all additive so an
 /// old (v3 or earlier) payload omitting them decodes with safe defaults rather
 /// than failing: `feed` is what the hub can stream for the kind (`"messages"`,
 /// `"activity"`, or `"none"`), `interrupt` reports the `turn/interrupt` verb
-/// (`false` for every kind in this phase), and `attach` is how a terminal
+/// (`true` for opencode, `false` elsewhere), and `attach` is how a terminal
 /// reaches the session (`"tmux"`, `"native-remote"`, or `"none"`). `watch` is
 /// DEPRECATED by `feed` — the guest holds `watch == (feed == "messages")` in
 /// lockstep until every client reads `feed`; read them through

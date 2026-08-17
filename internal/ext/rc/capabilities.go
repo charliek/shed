@@ -3,6 +3,7 @@ package rc
 import (
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -32,8 +33,9 @@ const CapabilityVersion = 4
 //     (watch / input); this token says the endpoints exist on this binary.
 //   - contract-v2 — the v2 wire contract: `lane` on every session DTO, the
 //     feed/interrupt/attach hints in kind_features, the turn/interrupt/approvals hub
-//     verbs (routed and fully specified — they answer 409 not_supported until a lane
-//     implements them; see hub_verbs.go), the `approval_request` feed row with its
+//     verbs (routed and fully specified — live for a kind whose kind_features row
+//     advertises them, 409 not_supported elsewhere; see hub_verbs.go), the
+//     `approval_request` feed row with its
 //     approval block, and `pending_approvals` on the session. This token is the
 //     client's ROUTE-EXISTENCE check: a server without it may 404 the new verbs at
 //     the mux, so a client reads the token instead of interpreting a bare 404.
@@ -56,23 +58,22 @@ type AgentInfo struct {
 //   - post_input — a typed line can be delivered to the session's pane (the
 //     prompt/attach kickoff path). NOT superseded by anything in v2: it describes
 //     pane-delivered input, which the feed-input surface below does not replace.
-//   - approvals — where approvals are answered: "tui" (in the terminal) for every
-//     kind in this phase. The documented future value "remote" is the predicate for
-//     the hub's approval verb.
+//   - approvals — where approvals are answered: "tui" (in the terminal) or "remote"
+//     (through the hub's POST /approvals/{id} verb — opencode today).
 //   - watch — DEPRECATED by feed; retained until clients migrate. The producer holds
 //     `watch == (feed == "messages")` in lockstep (invariant-tested in
 //     capabilities_test.go), so a v1 client reading watch and a v2 client reading
 //     feed see the same thing. Removed once no client reads it.
-//   - input — the feed-input posting mode: "gated" means POST /input is accepted
-//     only while the session is waiting (the hub's acceptance re-check), "" means no
-//     feed input (the TUI-only post_input path still applies). The future value
-//     "turn" denotes a lane that takes whole turns.
+//   - input — the feed-input posting mode, SINGLE-VALUED: "gated" means POST /input is
+//     accepted only while the session is waiting (the hub's acceptance re-check),
+//     "turn" means the lane takes whole turns through POST /turn (and POST /input no
+//     longer applies — opencode today), "" means no feed input at all (the TUI-only
+//     post_input path still applies).
 //   - feed — what the hub can stream for the kind: "messages" (a normalized
 //     conversation feed: GET /messages + message.appended), "activity" (the activity
 //     dimension only — the stability/transcript engines derive it, but there is no
 //     message feed), or "none" (no hub signal at all).
-//   - interrupt — the turn/interrupt verb is supported. false for every kind in this
-//     phase.
+//   - interrupt — the interrupt verb is supported (opencode today; false elsewhere).
 //   - attach — how a terminal reaches the session: "tmux" (attach to the rc-tmux
 //     session), "native-remote" (the agent's own remote surface), or "none".
 //
@@ -207,8 +208,8 @@ func BuildCapabilities(probe AgentProbe, installed InstalledProbe) Capabilities 
 	}
 }
 
-// kindFeatures returns the per-kind UI hints for the agent kinds that accept a typed
-// kickoff and drive approvals through the TUI. claude-broker (driven from claude.ai,
+// kindFeatures returns the per-kind UI hints for the agent kinds the hub can watch and
+// steer. claude-broker (driven from claude.ai,
 // not the pane) and shell (no agent approval surface) are OMITTED entirely — an absent
 // entry means "no feed/input/approval affordances", exactly the client behavior those
 // two kinds already have.
@@ -218,32 +219,50 @@ func BuildCapabilities(probe AgentProbe, installed InstalledProbe) Capabilities 
 //	kind      | post_input | approvals | watch | input | feed     | interrupt | attach
 //	claude-rc | true       | tui       | false | ""    | activity | false     | tmux
 //	codex     | true       | tui       | true  | gated | messages | false     | tmux
-//	opencode  | true       | tui       | true  | gated | messages | false     | tmux
-//	cursor    | true       | tui       | false | ""    | activity | false     | tmux
+//	opencode  | true       | remote    | true  | turn  | messages | true      | tmux
+//	cursor    | true       | tui       | true  | gated | messages | false     | tmux
 func kindFeatures() map[Kind]KindFeatures {
 	out := map[Kind]KindFeatures{}
 	for _, k := range allKinds {
 		if k == KindClaudeBroker || k == KindShell {
 			continue
 		}
-		// Every kind in this phase is a TUI-lane session: approvals are answered on the
-		// pane, a terminal reaches it by attaching to tmux, and no lane implements
-		// turn/interrupt yet. "activity" is the feed floor — the hub's
-		// stability/transcript engines derive the activity dimension for every watched
-		// kind even where no message feed exists.
+		// The BASE row is a TUI-lane session: approvals answered on the pane, a terminal
+		// reaching it by attaching to tmux, no turn/interrupt verb, no feed input.
+		// "activity" is the feed floor — the hub's stability/transcript engines derive the
+		// activity dimension for every watched kind even where no message feed exists.
+		// Each divergent kind then states its WHOLE row once (no layered overrides), so a
+		// field's value is readable without simulating the assignments above it.
 		kf := KindFeatures{
 			PostInput: AcceptsTypedInput(k),
 			Approvals: "tui",
 			Feed:      "activity",
 			Attach:    "tmux",
 		}
-		// The message feed + gated input are codex- and opencode-only in this phase:
-		// codex's rollout JSONL and opencode's HTTP/SSE event stream are the two
-		// watchers the hub folds into a normalized feed, and whose composer anchor gates
-		// input acceptance.
-		if k == KindCodex || k == KindOpencode {
-			kf.Feed = "messages"
-			kf.Input = "gated"
+		switch k {
+		case KindCodex:
+			// codex's rollout JSONL is folded into a normalized message feed, and its
+			// composer anchor gates POST /input acceptance.
+			kf.Feed, kf.Input = "messages", inputModeGated
+		case KindOpencode:
+			// opencode is the first LIVE lane: its TUI runs an embedded HTTP+SSE server
+			// the hub steers through (watch_opencode_transport.go's verb lane), so whole
+			// turns, interrupts and approvals all go through the hub rather than the pane.
+			// `input` is single-valued, so "turn" REPLACES the "gated" codex spelling:
+			// POST /input no longer applies to opencode (a behavior break for hub clients
+			// — the turn verb is the steering surface, and the create/prompt kickoff path
+			// still delivers the first prompt via post_input). The divergence from codex
+			// is deliberate; the two rows are no longer asserted equal.
+			kf.Feed, kf.Input = "messages", inputModeTurn
+			kf.Approvals, kf.Interrupt = approvalsRemote, true
+		case KindCursor:
+			// cursor's own hook scripts push its turn boundaries, tool calls and messages
+			// into the hub (watch_cursor.go), which is a normalized message feed — and its
+			// composer anchor gates POST /input exactly as codex's does. `gated` (not
+			// `turn`) because the delivery is still the pane: cursor has no protocol to
+			// take a whole turn through. approvals stays "tui": there is nothing the hub
+			// can honor remotely, only the pane-anchor signal that the TUI is asking.
+			kf.Feed, kf.Input = "messages", inputModeGated
 		}
 		// watch is the deprecated spelling of feed == "messages"; derived here rather
 		// than set by hand so the two cannot drift (invariant-tested besides).
@@ -252,6 +271,18 @@ func kindFeatures() map[Kind]KindFeatures {
 	}
 	return out
 }
+
+// kindFeatureRows memoizes the derived matrix for the REQUEST paths (the gates in
+// handleInput and verbTarget), which read a single row per request and must not rebuild
+// the whole table to do it. kindFeatures() is pure, so the memoization is invisible;
+// BuildCapabilities keeps calling it directly for a FRESH map, because that map is handed
+// to callers and serialized and so must never alias this shared one.
+var kindFeatureRows = sync.OnceValue(kindFeatures)
+
+// kindFeatureRow returns a kind's advertised row — the single accessor every capability
+// gate reads, so a gate can never disagree with what a client was told. An unregistered
+// kind (or a newer client's) yields the ZERO row, which advertises no affordance at all.
+func kindFeatureRow(k Kind) KindFeatures { return kindFeatureRows()[k] }
 
 // versionRe extracts a version substring from an agent's `--version` output, tolerant
 // of a leading "v" and a trailing build suffix. Matches "2.1.196 (Claude Code)",

@@ -11,10 +11,14 @@ import (
 	"math/rand"
 	"net"
 	"net/http"
+	"net/url"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/google/uuid"
 )
 
 // opencodeWatcher is the SSE/REST-backed sessionWatcher for an opencode session. Unlike
@@ -27,17 +31,28 @@ import (
 //
 // CONCURRENCY MODEL (the load-bearing invariant — mirror watch.go's activityFold note):
 //
-//   - A single background goroutine (run) owns ALL HTTP I/O: correlation, the SSE read
-//     loop, and the REST seed. It NEVER mutates the fold. Under the watcher mutex it only
+//   - A single background goroutine (run) owns all READ-side HTTP I/O: correlation, the SSE
+//     read loop, and the REST seed. (The verb lane's three POSTs are the only other HTTP
+//     traffic; they run on handler goroutines, share w.client, and touch no fold state
+//     beyond the approvals map below — see "the verb lane" further down.)
+//     It NEVER mutates the fold. Under the watcher mutex it only
 //     (a) pushes routing-filtered raw envelope payloads (and marker records) onto the
 //     bounded inbox, (b) updates the transport-health fields (connected/lastFrameAt), and
 //     (c) sets the discovered-confirmedID slot. It NEVER holds the lock across a network
 //     wait (Do / Body.Read / backoff sleep).
 //   - refresh(now) — called by reconcile on the MAIN goroutine — is the ONLY place the
-//     fold is mutated: under the mutex it drains the inbox → fold.applyLine, handles the
-//     seedComplete / overflowGap markers, and reads the fold's verdict + feed. The
-//     opencodeFold is NOT concurrency-safe (watch_opencode.go); this single-writer-under-
-//     mutex discipline is exactly what makes it safe.
+//     STREAM mutates the fold: under the mutex it drains the inbox → fold.applyLine, handles
+//     the seedComplete / overflowGap markers, and reads the fold's verdict + feed.
+//   - The ONE exception, and the only fold state written off the reconcile goroutine, is the
+//     APPROVALS map: markApprovalResolved records a resolution from the HTTP goroutine the
+//     moment the approvals verb's upstream POST succeeds (it must be synchronous — a
+//     same-decision replay arriving before the next tick would otherwise re-POST), and
+//     approvalState/pendingApprovals read it from handler goroutines. Every one of those
+//     takes the SAME watcher mutex, so the fold still has exactly one writer at a time; what
+//     changed versus plan 007 is only WHICH goroutine may be that writer.
+//
+// The opencodeFold is NOT concurrency-safe (watch_opencode.go); this
+// single-writer-under-the-watcher-mutex discipline is exactly what makes it safe.
 //
 // See §3.3 (correlation state machine), §3.4 (transport), §3.6 (transport-health
 // freshness) of the plan for the authoritative behavior this implements.
@@ -73,6 +88,10 @@ type opencodeWatcher struct {
 	inbox      []inboxItem
 	inboxBytes int
 
+	// resolving is the set of approval ids whose upstream resolve POST is IN FLIGHT (id →
+	// the decision being written). It is the verb path's atomic claim — see claimApproval.
+	resolving map[string]string
+
 	// correlation
 	pinnedID      string // the session id we filter/seed on ("" while still searching)
 	confirmedID   string // an SSE-discovered pin awaiting drainConfirmedAgentID ("" = none/drained)
@@ -96,6 +115,8 @@ type opencodeWatcher struct {
 var (
 	_ sessionWatcher          = (*opencodeWatcher)(nil)
 	_ confirmedAgentIDDrainer = (*opencodeWatcher)(nil)
+	_ approvalPublisher       = (*opencodeWatcher)(nil)
+	_ approvalBlocker         = (*opencodeWatcher)(nil)
 )
 
 // confirmedAgentIDDrainer is the second, small interface reconcile type-asserts on a
@@ -104,6 +125,23 @@ var (
 // exactly. Only opencodeWatcher implements it — the fileWatchers correlate off-line.
 type confirmedAgentIDDrainer interface {
 	drainConfirmedAgentID() string
+}
+
+// approvalPublisher is the third such interface: a watcher whose lane knows which approvals
+// are still open, so reconcile can publish them into the session's pending_approvals snapshot
+// each tick. PENDING ONLY — resolution state stays in the watcher (approvalState), because the
+// wire contract defines pending_approvals as "what is still open", not an approval log. Only
+// opencodeWatcher implements it today; a watcher that does not leaves the snapshot untouched.
+type approvalPublisher interface {
+	pendingApprovals() []FeedApproval
+}
+
+// approvalBlocker is the input gate's counterpart to approvalPublisher: "is this session
+// currently blocked on an approval it would type an answer into?". Separate because it is a
+// STRICTLY WIDER question than the snapshot — it counts open questions too, which are never
+// addressable and so never appear in pending_approvals, yet own the keyboard exactly the same.
+type approvalBlocker interface {
+	hasOpenApprovals() bool
 }
 
 // inboxKind discriminates the records the goroutine pushes onto the inbox.
@@ -184,19 +222,27 @@ func newOpencodeWatcher(port int, workdir, agentID string, now func() time.Time,
 	if logf == nil {
 		logf = func(string, ...any) {}
 	}
+	// A prior back-write that is not a safe path segment is DISCARDED (not merely unused):
+	// treating it as no pin at all keeps the watcher's addressing invariant intact and lets
+	// correlation discover — and back-write — a real id (see validOpencodeSessionID).
+	if agentID != "" && !validOpencodeSessionID(agentID) {
+		logf("rc hub: opencode watcher on port %d ignoring a malformed %s pin", port, envAgentSession)
+		agentID = ""
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	w := &opencodeWatcher{
-		baseURL:  fmt.Sprintf("http://127.0.0.1:%d", port),
-		workdir:  canonicalDir(workdir),
-		priorID:  agentID,
-		client:   newLoopbackClient(),
-		nowFn:    now,
-		logf:     logf,
-		ctx:      ctx,
-		cancel:   cancel,
-		done:     make(chan struct{}),
-		fold:     newOpencodeFold(),
-		pinnedID: agentID, // a prior back-write is the pin; "" means "search the SSE stream"
+		baseURL:   fmt.Sprintf("http://127.0.0.1:%d", port),
+		workdir:   canonicalDir(workdir),
+		priorID:   agentID,
+		client:    newLoopbackClient(),
+		nowFn:     now,
+		logf:      logf,
+		ctx:       ctx,
+		cancel:    cancel,
+		done:      make(chan struct{}),
+		fold:      newOpencodeFold(),
+		resolving: map[string]string{},
+		pinnedID:  agentID, // a prior back-write is the pin; "" means "search the SSE stream"
 	}
 	go w.run()
 	return w
@@ -294,9 +340,6 @@ func (w *opencodeWatcher) snapshot(now time.Time) (activity Activity, message st
 		// never report fresh, and force expiredWorking=false so pane-stability drives (fix #6).
 		return w.curActivity, w.curMessage, false, false
 	}
-	if w.curActivity == "" || w.curActivity == ActivityUnknown {
-		return w.curActivity, w.curMessage, false, false
-	}
 	healthy := w.seedApplied && w.connected
 	if healthy && !w.lastFrameAt.IsZero() && now.Sub(w.lastFrameAt) >= ocFrameStaleWindow {
 		healthy = false // heartbeat-stale: the stream is wedged even if the socket has not errored
@@ -306,14 +349,8 @@ func (w *opencodeWatcher) snapshot(now time.Time) (activity Activity, message st
 		// pane-stability (both flags false — see the doc above).
 		return w.curActivity, w.curMessage, false, false
 	}
-	sinceEvent := time.Duration(-1)
-	if !w.lastEventAt.IsZero() {
-		sinceEvent = now.Sub(w.lastEventAt)
-	}
-	recent := sinceEvent >= 0 && sinceEvent < watcherFreshWindow
-	workingGrace := w.curActivity == ActivityWorking && sinceEvent >= 0 && sinceEvent < watcherWorkingGrace
-	fresh = w.curSettled || recent || workingGrace
-	expiredWorking = w.curActivity == ActivityWorking && !fresh
+	// Transport healthy: from here the ordinary quiet-source rule applies (watch.go).
+	fresh, expiredWorking = watcherFreshness(w.curActivity, w.curSettled, w.lastEventAt, now)
 	return w.curActivity, w.curMessage, fresh, expiredWorking
 }
 
@@ -461,8 +498,13 @@ func (w *opencodeWatcher) markFrame() {
 }
 
 // setPinned records the correlated session id. When discovered (SSE-trusted, not a prior
-// back-write) its id is enqueued ONCE for drainConfirmedAgentID.
+// back-write) its id is enqueued ONCE for drainConfirmedAgentID. A pin that is not a SAFE
+// PATH SEGMENT is refused outright (treated as no pin at all) — see validOpencodeSessionID.
 func (w *opencodeWatcher) setPinned(id string, discovered bool) {
+	if id != "" && !validOpencodeSessionID(id) {
+		w.logf("rc hub: opencode watcher %s ignoring malformed session id", w.baseURL)
+		return
+	}
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	w.pinnedID = id
@@ -472,11 +514,379 @@ func (w *opencodeWatcher) setPinned(id string, discovered bool) {
 	}
 }
 
+// ocSessionIDRe is the SHAPE an opencode session id must have to be usable as a pin: one
+// path segment of unreserved characters, which every real id ("ses_07cbd…") satisfies.
+//
+// INVARIANT HARDENING, not a trust boundary: the pin arrives from the session's tmux env
+// (SHED_RC_AGENT_SESSION — guest-writable) or from the SSE stream, and any in-guest process
+// can already talk to the embedded server's port directly. What this protects is the property
+// the WS-B invariant states about the HUB: a request arriving over the server proxy can never
+// be made to address another opencode session. Without it a pin like `x/../../session/VICTIM`
+// or `ses_A?scope=` would re-target a mutation while still looking session-scoped, defeating
+// the structural guarantee (and every test asserting it). Rejected pins are treated as NO pin:
+// verbs answer 409 not_accepting and correlation is free to discover a real id later.
+var ocSessionIDRe = regexp.MustCompile(`^[A-Za-z0-9_-]+$`)
+
+func validOpencodeSessionID(id string) bool {
+	return id != "" && len(id) <= 256 && ocSessionIDRe.MatchString(id)
+}
+
+// ocSessionPath builds a session-scoped route with EVERY interpolated segment escaped. The
+// pin is already shape-validated (validOpencodeSessionID) — the escaping is the second layer,
+// and it is the ONLY guard on the approval id, which reaches here from the request path (the
+// handler's ApprovalIDRe admits dots and colons, so escaping, not the grammar, is what keeps
+// a segment a segment).
+func ocSessionPath(id string, tail ...string) string {
+	p := "/session/" + url.PathEscape(id)
+	for _, seg := range tail {
+		p += "/" + url.PathEscape(seg)
+	}
+	return p
+}
+
 func (w *opencodeWatcher) getPinned() string {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	return w.pinnedID
 }
+
+// ---- approvals: the fold state handler goroutines may touch (see the CONCURRENCY MODEL) ----
+
+// approvalState reports a tracked approval's status/decision, or ok=false when this session
+// never saw the id. It is the approvals verb's oracle for the 404-vs-replay-vs-conflict
+// decision — deliberately NOT the pending_approvals snapshot, which is pending-only and so
+// cannot distinguish "already answered" from "never existed". A CLOSED watcher answers
+// not-found: its session is gone, so no id is resolvable through it.
+func (w *opencodeWatcher) approvalState(id string) (status, decision string, ok bool) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.closed {
+		return "", "", false
+	}
+	return w.fold.approvalState(id)
+}
+
+// markApprovalResolved records a resolution the HUB performed (the approvals verb's upstream
+// POST returned 200) without waiting for opencode's permission.replied event to come back
+// around the stream. Synchronous on purpose: a same-decision replay arriving before the next
+// reconcile tick must see the entry already resolved and answer idempotently instead of
+// re-POSTing. Emission stays single: the fold's resolve is idempotent, so the later
+// permission.replied for the same id adds no second row.
+//
+// Returns true when THIS call resolved the entry (false = unknown id, already resolved, or a
+// closed watcher). The verb path goes through claimApproval/commitApproval instead — this is
+// the underlying primitive (and the direct entry point the fold-level tests drive).
+func (w *opencodeWatcher) markApprovalResolved(id, decision string) bool {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.closed {
+		return false
+	}
+	return w.markApprovalResolvedLocked(id, decision)
+}
+
+func (w *opencodeWatcher) markApprovalResolvedLocked(id, decision string) bool {
+	if !w.fold.resolvePermission(id, decision) {
+		return false
+	}
+	// Re-derive the cached verdict and collect the resolved row under the SAME lock, so a
+	// session whose only blocker was this approval stops reporting needs_approval immediately
+	// rather than at the next tick. lastEventAt is deliberately NOT stamped: it tracks STREAM
+	// evidence, and a local resolve is not a frame.
+	w.curActivity = w.fold.activity()
+	w.curSettled = w.fold.settled()
+	w.pending = append(w.pending, w.fold.drainMessages()...)
+	return true
+}
+
+// ---- the resolution CLAIM (the verb path's concurrency guard) ----
+//
+// The approvals handler is check-then-act — read the state, then POST — so two concurrent
+// requests for the same id would both read "pending" and both POST upstream. The claim makes
+// the transition atomic: exactly one request owns an id's resolution at a time. The claim is
+// held only across the upstream POST (released on failure, consumed by the commit on success),
+// lives in the watcher because that is where the approval state lives, and takes the SAME
+// mutex as everything else here.
+
+// approvalClaim is claimApproval's verdict.
+type approvalClaim int
+
+const (
+	// approvalClaimed — this caller owns the resolution and must release or commit it.
+	approvalClaimed approvalClaim = iota
+	// approvalClaimBusy — another request holds the claim right now. Retryable: the caller
+	// answers 409 not_accepting rather than POSTing a second time. Deliberately returned for
+	// a SAME-decision concurrent request too — "already in flight" is the honest answer, and
+	// the retry sees the recorded resolution and answers idempotently.
+	approvalClaimBusy
+	// approvalClaimSettled — the entry is no longer pending (resolved between the handler's
+	// state read and the claim — a permission.replied on the stream, or a racing request that
+	// just committed) or unknown. The caller re-reads the state and answers from it.
+	approvalClaimSettled
+)
+
+// claimApproval atomically transitions a PENDING ask to resolution-in-flight for decision.
+// A closed watcher answers settled (its state is unreadable anyway — approvalState reports
+// not-found, which the handler turns into 404).
+func (w *opencodeWatcher) claimApproval(id, decision string) approvalClaim {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.closed {
+		return approvalClaimSettled
+	}
+	if _, busy := w.resolving[id]; busy {
+		return approvalClaimBusy
+	}
+	if status, _, ok := w.fold.approvalState(id); !ok || status != approvalStatusPending {
+		return approvalClaimSettled
+	}
+	if w.resolving == nil {
+		w.resolving = map[string]string{}
+	}
+	w.resolving[id] = decision
+	return approvalClaimed
+}
+
+// releaseApproval drops a claim whose upstream POST failed, so the operator (or a retry) can
+// try again. It does NOT touch the fold: a failed POST resolved nothing.
+func (w *opencodeWatcher) releaseApproval(id string) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	delete(w.resolving, id)
+}
+
+// commitApproval consumes the claim and records the resolution, returning the decision the
+// fold ACTUALLY holds for the id — which the handler echoes instead of blindly repeating the
+// request's. They differ in one race: opencode's own permission.replied for this id can land
+// (and resolve the entry) between the POST and the commit, in which case the STREAM's record
+// wins and is reported. A recorded-but-empty decision (an entry closed with no known answer)
+// falls back to the caller's decision, because the wire shape requires a non-empty one.
+func (w *opencodeWatcher) commitApproval(id, decision string) string {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	delete(w.resolving, id)
+	if w.closed {
+		return decision
+	}
+	w.markApprovalResolvedLocked(id, decision)
+	if _, recorded, ok := w.fold.approvalState(id); ok && recorded != "" {
+		return recorded
+	}
+	return decision
+}
+
+// pendingApprovals returns the still-open approvals for reconcile to publish (approvalPublisher).
+// Freshly allocated per call — the caller stores it in handler-visible state.
+func (w *opencodeWatcher) pendingApprovals() []FeedApproval {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.closed {
+		return nil
+	}
+	return w.fold.pendingApprovals()
+}
+
+// hasOpenApprovals reports whether ANY ask (permission or question) is still open, for the
+// input gate (approvalBlocker). Deliberately independent of transport health and freshness:
+// when the stream wedges, the activity verdict is demoted to pane stability and the gate's
+// merged-needs_approval arm stops firing — but a dialog the operator has not answered is still
+// on the pane, and a posted line would answer it by accident. The asymmetry is intentional:
+// a stale reject costs a retry after the next reseed, a stale accept costs an unintended
+// approval. A CLOSED watcher blocks nothing (its session is gone).
+func (w *opencodeWatcher) hasOpenApprovals() bool {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.closed {
+		return false
+	}
+	return w.fold.openApprovals() > 0
+}
+
+// ---- the verb lane: hub-initiated MUTATIONS (turn / interrupt / approval resolve) ----
+//
+// SESSION-SCOPING INVARIANT (normative — see docs/extensions/rc-helper.md): every
+// hub-initiated mutation addresses the rc session's PINNED opencode sessionID through a
+// session-scoped v1 route. Never a global write route (POST /permission/{id}/reply,
+// /question/{id}/reply) — one TUI's embedded server lists sessions from every directory
+// on the machine, so a global write can answer a permission belonging to an unrelated
+// project. The invariant is enforced STRUCTURALLY: these methods take no session
+// parameter, they read the pin themselves, and an unpinned session is a 409 rather than
+// a guess.
+//
+// All three run on the CALLER's request context (bounded by ocVerbTimeout) and share the
+// watcher's loopback client. They never touch w.ctx except through isClosed/mutTarget —
+// a closed watcher is "gone", which the handler maps to 409 not_accepting. They also
+// never hold the mutex across the POST (the pin is copied out first).
+//
+// RECREATE WINDOW (accepted): reconcile can replace the tracked session and close this
+// watcher while a POST is in flight; the request then targets the dead per-create port,
+// fails, and surfaces as a retryable 409 — no extra locking buys anything.
+
+// ocVerbTimeout bounds one verb's upstream call. Deliberately the same 5s as restTimeout:
+// these are loopback POSTs to a process on this machine, and a client waiting on a steer
+// must get an answer (or a retryable 409) promptly rather than hanging on a wedged TUI.
+const ocVerbTimeout = 5 * time.Second
+
+// errNoAgentSession is the unpinned-session sentinel: the watcher is healthy but no
+// opencode session has been correlated yet (a fresh, promptless TUI has none to correlate
+// to). Its text is operator-facing — the handler surfaces it verbatim (writeLaneError).
+var errNoAgentSession = errors.New("agent session not established yet — deliver the first prompt via the prompt/attach path")
+
+// Compile-time checks that the opencode watcher serves all three verb lanes.
+var (
+	_ turnStarter      = (*opencodeWatcher)(nil)
+	_ turnInterrupter  = (*opencodeWatcher)(nil)
+	_ approvalResolver = (*opencodeWatcher)(nil)
+)
+
+// startTurn delivers text as one whole turn: POST /session/{pinned}/prompt_async with a
+// single text part (204). NO busy check — opencode natively queues/steers typed input
+// while a turn runs, so the lane forwards regardless of the session's activity (see the
+// lane-defined-busy-409 note in hub_verbs.go). The returned turn id is HUB-generated and
+// opaque: prompt_async answers with no body, and the contract says clients must not parse
+// the handle.
+func (w *opencodeWatcher) startTurn(ctx context.Context, text string) (string, error) {
+	id, err := w.mutTarget()
+	if err != nil {
+		return "", err
+	}
+	body := ocPromptRequest{Parts: []ocPromptPart{{Type: "text", Text: text}}}
+	if err := w.postJSON(ctx, ocSessionPath(id, "prompt_async"), body); err != nil {
+		return "", err
+	}
+	return "oc-" + uuid.NewString(), nil
+}
+
+// interruptTurn aborts the pinned session's running turn: POST /session/{pinned}/abort.
+// The upstream answer is PASSED THROUGH — opencode answers an abort on an IDLE session
+// successfully too, and that maps to 202 {"interrupting":true} rather than a fabricated
+// "no active turn" rejection: the hub does not second-guess the lane about what is
+// running (the feed/activity stream is where a client sees whether anything stopped).
+func (w *opencodeWatcher) interruptTurn(ctx context.Context) error {
+	id, err := w.mutTarget()
+	if err != nil {
+		return err
+	}
+	return w.postJSON(ctx, ocSessionPath(id, "abort"), struct{}{})
+}
+
+// resolveApproval answers one permission ask: POST
+// /session/{pinned}/permissions/{id} {"response": "once"|"always"|"reject"}. The
+// SESSION-SCOPED route is the whole point (the global /permission/{id}/reply would
+// answer other projects' asks). The caller has already validated the decision and
+// established that the ask is pending; the local bookkeeping (markApprovalResolved) is
+// the caller's too, so this method is purely the upstream write.
+func (w *opencodeWatcher) resolveApproval(ctx context.Context, id, decision string) error {
+	reply, ok := opencodeReplyFromDecision(decision)
+	if !ok {
+		return fmt.Errorf("unsupported decision %q", decision)
+	}
+	sid, err := w.mutTarget()
+	if err != nil {
+		return err
+	}
+	return w.postJSON(ctx, ocSessionPath(sid, "permissions", id), ocPermissionReply{Response: reply})
+}
+
+// mutTarget copies the pinned session id out under the mutex — the one place a mutation
+// learns its address. A closed watcher is gone; an uncorrelated one has nothing to
+// address, and guessing (newest/latest session) is exactly what the scoping invariant
+// forbids.
+func (w *opencodeWatcher) mutTarget() (string, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.closed {
+		return "", errWatcherClosed
+	}
+	if w.pinnedID == "" {
+		return "", errNoAgentSession
+	}
+	return w.pinnedID, nil
+}
+
+// ocPromptRequest / ocPromptPart are prompt_async's body: the v1 parts array (the v2
+// /api/session/{id}/prompt route admits a turn but never promotes it on an idle session,
+// so v1 is the control surface).
+type ocPromptRequest struct {
+	Parts []ocPromptPart `json:"parts"`
+}
+
+type ocPromptPart struct {
+	Type string `json:"type"`
+	Text string `json:"text"`
+}
+
+// ocPermissionReply is the session-scoped permission reply body.
+type ocPermissionReply struct {
+	Response string `json:"response"`
+}
+
+// opencodeReplyFromDecision maps the contract's decision enum onto opencode's native
+// permission reply vocabulary — the exact inverse of opencodeDecisionFromReply, so a
+// decision we send comes back off the stream as the same decision. `always` is
+// session-scoped in opencode (verified live), which is what makes allow_always safe to
+// forward. ok=false for anything outside the enum (the handler rejects those with a 400
+// long before this).
+func opencodeReplyFromDecision(decision string) (string, bool) {
+	switch decision {
+	case approvalDecisionAllow:
+		return "once", true
+	case approvalDecisionAllowAlways:
+		return "always", true
+	case approvalDecisionDeny:
+		return "reject", true
+	default:
+		return "", false
+	}
+}
+
+// postJSON is the single mutation primitive: a bounded POST on the CALLER's context, its
+// body drained (so the connection is reusable) and its status checked. ANY 2xx is
+// success — the three routes answer 204 (prompt_async) and 200 (abort, permissions)
+// today, and a version that swaps one for the other has not changed the outcome. A
+// non-2xx, a timeout, or a closed watcher all return an error the handler maps to a
+// single retryable 409.
+func (w *opencodeWatcher) postJSON(ctx context.Context, path string, body any) error {
+	if w.isClosed() {
+		return errWatcherClosed
+	}
+	raw, err := json.Marshal(body)
+	if err != nil {
+		return err
+	}
+	ctx, cancel := context.WithTimeout(ctx, ocVerbTimeout)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, w.baseURL+path, bytes.NewReader(raw))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := w.client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = resp.Body.Close() }()
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, maxRESTBytes))
+	if resp.StatusCode < 200 || resp.StatusCode > 299 {
+		return &ocStatusError{status: resp.StatusCode, path: path}
+	}
+	return nil
+}
+
+// ocStatusError is an upstream non-2xx. It carries the path for the HUB LOG (and for tests)
+// while exposing the status separately, because the status is safe to report to a caller and
+// the path is not: it embeds the pinned opencode session id, which the wire contract never
+// discloses to a client (see writeLaneError).
+type ocStatusError struct {
+	status int
+	path   string
+}
+
+func (e *ocStatusError) Error() string {
+	return fmt.Sprintf("POST %s: status %d", e.path, e.status)
+}
+
+func (e *ocStatusError) Status() int { return e.status }
 
 func (w *opencodeWatcher) isClosed() bool {
 	w.mu.Lock()
@@ -724,16 +1134,35 @@ func (w *opencodeWatcher) seedHistory(id string) (seedFallback, error) {
 	}
 	fb := seedFallback{set: true, idle: !present || statusType == "idle"}
 
-	for _, p := range w.restPermissions(id) {
+	// Open asks: replay each one (deduped by the fold), collecting its id, then push the
+	// approval-seed marker carrying the authoritative open-id sets. That marker is what retires
+	// an ask answered while the stream was down (applyApprovalSeed). The two reads carry
+	// INDEPENDENT authority: whichever succeeded marks its half known, so a FAILED read is never
+	// folded as "nothing is open" AND never blocks the other half from healing.
+	perms, permsOK := w.restPermissions(id)
+	permIDs := make([]string, 0, len(perms))
+	for _, p := range perms {
 		if !w.pushSynth(synthEnvelope{Type: "permission.asked", Properties: synthProps{
-			SessionID: id, ID: p.ID, Permission: p.Permission, Patterns: p.Patterns,
+			SessionID: id, ID: p.ID, Permission: p.Permission, Patterns: p.Patterns, Metadata: p.Metadata,
 		}}) {
 			return seedFallback{}, errInboxOverflow
 		}
+		permIDs = append(permIDs, p.ID)
 	}
-	for _, q := range w.restQuestions(id) {
+	questions, questionsOK := w.restQuestions(id)
+	quesIDs := make([]string, 0, len(questions))
+	for _, q := range questions {
 		if !w.pushSynth(synthEnvelope{Type: "question.asked", Properties: synthProps{
 			SessionID: id, ID: q.ID, Questions: q.Questions,
+		}}) {
+			return seedFallback{}, errInboxOverflow
+		}
+		quesIDs = append(quesIDs, q.ID)
+	}
+	if permsOK || questionsOK {
+		if !w.pushSynth(synthEnvelope{Type: ocApprovalSeedType, Properties: synthProps{
+			SessionID: id, PermissionIDs: permIDs, QuestionIDs: quesIDs,
+			PermissionsKnown: permsOK, QuestionsKnown: questionsOK,
 		}}) {
 			return seedFallback{}, errInboxOverflow
 		}
@@ -772,8 +1201,8 @@ func (w *opencodeWatcher) rootPinFromCreated(pk *ocPeek) (string, bool) {
 		return "", false
 	}
 	info := pk.Properties.Info
-	if info.ID == "" || info.ParentID != "" {
-		return "", false
+	if !validOpencodeSessionID(info.ID) || info.ParentID != "" {
+		return "", false // a malformed id is not addressable, so it is not a pin
 	}
 	if !dirMatchCanon(info.Directory, w.workdir) {
 		return "", false
@@ -810,7 +1239,7 @@ type restMessage struct {
 
 func (w *opencodeWatcher) restMessages(id string) ([]restMessage, error) {
 	var out []restMessage
-	if err := w.getJSON("/session/"+id+"/message", &out); err != nil {
+	if err := w.getJSON(ocSessionPath(id, "message"), &out); err != nil {
 		return nil, err
 	}
 	return out, nil
@@ -828,24 +1257,28 @@ func (w *opencodeWatcher) restStatus(id string) (statusType string, present bool
 }
 
 type restPermission struct {
-	ID         string   `json:"id"`
-	SessionID  string   `json:"sessionID"`
-	Permission string   `json:"permission"`
-	Patterns   []string `json:"patterns"`
+	ID         string          `json:"id"`
+	SessionID  string          `json:"sessionID"`
+	Permission string          `json:"permission"`
+	Patterns   []string        `json:"patterns"`
+	Metadata   json.RawMessage `json:"metadata"` // passed through so a seeded row carries the same tool detail as a live one
 }
 
-func (w *opencodeWatcher) restPermissions(id string) []restPermission {
+// restPermissions reads the GLOBAL /permission list and filters it to the pinned session (the
+// route is store-wide — see the session-scoping invariant: global GETs are legal for seed and
+// discovery, always pin-filtered; hub-initiated MUTATIONS are always session-scoped). ok=false
+// distinguishes a failed read from an empty one, which the approval-seed marker depends on.
+func (w *opencodeWatcher) restPermissions(id string) (out []restPermission, ok bool) {
 	var all []restPermission
 	if err := w.getJSON("/permission", &all); err != nil {
-		return nil
+		return nil, false
 	}
-	var out []restPermission
 	for _, p := range all {
 		if p.SessionID == id {
 			out = append(out, p)
 		}
 	}
-	return out
+	return out, true
 }
 
 type restQuestion struct {
@@ -854,18 +1287,19 @@ type restQuestion struct {
 	Questions json.RawMessage `json:"questions"`
 }
 
-func (w *opencodeWatcher) restQuestions(id string) []restQuestion {
+// restQuestions mirrors restPermissions for the global /question list (same pin filter, same
+// ok semantics).
+func (w *opencodeWatcher) restQuestions(id string) (out []restQuestion, ok bool) {
 	var all []restQuestion
 	if err := w.getJSON("/question", &all); err != nil {
-		return nil
+		return nil, false
 	}
-	var out []restQuestion
 	for _, q := range all {
 		if q.SessionID == id {
 			out = append(out, q)
 		}
 	}
-	return out
+	return out, true
 }
 
 // restFindCandidate picks the newest ROOT session (empty parentID) whose canonical directory
@@ -881,8 +1315,8 @@ func (w *opencodeWatcher) restFindCandidate() (string, bool) {
 		return "", false
 	}
 	for _, s := range sessions {
-		if s.ID == "" || s.ParentID != "" {
-			continue
+		if !validOpencodeSessionID(s.ID) || s.ParentID != "" {
+			continue // same rule as the SSE pin: an unaddressable id is never followed
 		}
 		if dirMatchCanon(s.Directory, w.workdir) {
 			return s.ID, true
@@ -940,7 +1374,17 @@ type synthProps struct {
 	ID         string          `json:"id,omitempty"`
 	Permission string          `json:"permission,omitempty"`
 	Patterns   []string        `json:"patterns,omitempty"`
+	Metadata   json.RawMessage `json:"metadata,omitempty"`
 	Questions  json.RawMessage `json:"questions,omitempty"`
+	// The approval-seed marker's payload (ocApprovalSeedType only). The AUTHORITY is the
+	// per-half Known flag, never the presence of a list: an absent list decodes as the empty
+	// set, which is the "nothing is open on the server" statement that retires a locally-open
+	// ask — and that statement counts only when its half's REST read actually succeeded.
+	// omitempty keeps every other synthesized envelope free of these fields.
+	PermissionIDs    []string `json:"permissionIDs,omitempty"`
+	QuestionIDs      []string `json:"questionIDs,omitempty"`
+	PermissionsKnown bool     `json:"permissionsKnown,omitempty"`
+	QuestionsKnown   bool     `json:"questionsKnown,omitempty"`
 }
 
 // pushSynth marshals a synthesized envelope and pushes it onto the inbox. Returns false on
@@ -1063,10 +1507,14 @@ func peekEnvelope(payload []byte) *ocPeek {
 // foldRelevantType reports whether an envelope type is one the fold consumes (so only those
 // are pushed to the inbox; server.*/session.created/step-* etc. update lastFrameAt for the
 // heartbeat/pin logic but never enter the fold).
+// The reply/rejected types are as load-bearing as the asked ones: without them an approval
+// would never be retired from the fold, so a session answered in the TUI would sit at
+// needs_approval until the next reconnect reseed.
 func foldRelevantType(typ string) bool {
 	switch typ {
 	case "session.status", "session.idle", "message.updated", "message.part.updated",
-		"permission.asked", "question.asked":
+		"permission.asked", "permission.replied",
+		"question.asked", "question.replied", "question.rejected":
 		return true
 	default:
 		return false

@@ -56,6 +56,15 @@ type deps struct {
 	// payload. nil → the real command-based probe (command -v + --version, 2s budget);
 	// tests inject a fake so no external process is spawned.
 	probe rc.AgentProbe
+	// binProbe gates rc.Create's installed-agent check: `bash -lc/-ic 'command -v
+	// <bin>'`, the shell VERB matched to the create's InteractiveShell so the probe
+	// consults the SAME PATH the inner tmux command is about to launch through (see
+	// realBinProbe's doc — this is a per-call match, not a fixed shell mode). nil in
+	// tests (so create's gate is skipped and no real process is spawned);
+	// effectiveBinProbe wires the real bash-backed probe (realBinProbe) when nil AND
+	// the caller is production (Run leaves this nil too — the nil-check lives in
+	// effectiveBinProbe, mirroring effectiveProbe).
+	binProbe rc.InstalledProbe
 	// ensureHub best-effort spawns/verifies the local rc hub after a successful
 	// create. nil in tests (so create never forks a real daemon); Run wires the real
 	// detached-serve spawn. Gating it here keeps hub side effects out of the pure
@@ -312,6 +321,8 @@ func doCreate(cfg Config, d deps, args []string) int {
 		Wait:             *wait,
 		InteractiveShell: *interactive,
 		PermissionMode:   mode,
+		Warnf:            warnHook(d),
+		BinProbe:         effectiveBinProbe(d, *interactive),
 		EnsureHub:        ensureHubHook(d),
 	}, d.sleep)
 	if err != nil {
@@ -390,6 +401,56 @@ func effectiveInstalled(d deps) rc.InstalledProbe {
 // hung agent binary can't stall capability discovery. (BuildCapabilities additionally
 // enforces a tighter shared budget across all probes.)
 const agentProbeTimeout = 2 * time.Second
+
+// effectiveBinProbe returns the injected create-time installed-agent probe, or the
+// real bash-based probe when none was injected (production), bound to interactiveShell
+// — the caller MUST pass the SAME value it is about to hand rc.CreateOptions.
+// InteractiveShell for this create, or the probe consults the wrong PATH (see
+// realBinProbe's doc). Distinct from effectiveProbe/effectiveInstalled (capabilities'
+// always-login-shell discovery probe, which has no such split).
+func effectiveBinProbe(d deps, interactiveShell bool) rc.InstalledProbe {
+	if d.binProbe != nil {
+		return d.binProbe
+	}
+	return func(bin string) bool { return realBinProbe(bin, interactiveShell) }
+}
+
+// binProbeExec runs the installed-agent probe's `bash <flag> 'command -v <bin>'`
+// invocation and reports success (exit 0). A package var (not a deps field, since
+// nothing about it is per-dispatch state) so realBinProbe's shell-VERB selection is
+// unit-testable by capturing argv without spawning a real bash.
+var binProbeExec = func(ctx context.Context, args ...string) bool {
+	return exec.CommandContext(ctx, args[0], args[1:]...).Run() == nil
+}
+
+// realBinProbe is the production installed-agent gate for Create: `bash <flag>
+// 'command -v <bin>'`, where <flag> matches the SAME shell mode the inner tmux command
+// is about to launch through (AgentSpec.InnerCommand / innerCommandTUI):
+//
+//   - interactiveShell=false (the dominant guest path: doCreate's default, and every
+//     `shed attach`/`shed plan` create) — the inner command is a bare, unwrapped exec
+//     that inherits the tmux PANE's environment, and that pane was created by
+//     shed-ext-rc running over SSH under the server's `bash -lc` wrap (a LOGIN shell:
+//     /etc/profile.d/*.sh + /etc/environment.d sourced). So the probe must ALSO use a
+//     login shell (`bash -lc`) — an interactive-non-login `bash -ic` here would consult
+//     a narrower PATH than the real launch and false-negative-reject an agent that
+//     lives on the login PATH but not the bare interactive one.
+//   - interactiveShell=true (doClaude's host-only `claude` verb, and any native-machine
+//     caller that opts into the `bash -ic` wrap for an rc-file PATH) — the inner
+//     command genuinely launches through `bash -ic`, so the probe matches with `-ic`.
+//
+// `command` is a bash builtin, so even a shell too minimal to define anything else
+// still answers (as not-found) rather than crashing. bin values come from the registry
+// (fixed literals), never user input.
+func realBinProbe(bin string, interactiveShell bool) bool {
+	ctx, cancel := context.WithTimeout(context.Background(), agentProbeTimeout)
+	defer cancel()
+	flag := "-lc"
+	if interactiveShell {
+		flag = "-ic"
+	}
+	return binProbeExec(ctx, "bash", flag, "command -v "+shellQuote(bin))
+}
 
 // realInstalledProbe reports whether an agent binary is on PATH via `command -v` —
 // a shell builtin, so this is fast even when the binary itself is unresponsive. bin
@@ -502,6 +563,18 @@ func hubConfig(d deps) rc.HubConfig {
 // never fork a real daemon.
 func realEnsureHub(d deps) {
 	rc.EnsureHub(hubConfig(d), d.stderr)
+}
+
+// warnHook returns the CreateOptions.Warnf callback, routing rc.Create's non-fatal
+// diagnostics (a skipped/failed preseed) to stderr so stdout stays the DTO the caller
+// parses. nil when no stderr is wired (tests), which discards them.
+func warnHook(d deps) func(string, ...any) {
+	if d.stderr == nil {
+		return nil
+	}
+	return func(format string, args ...any) {
+		fmt.Fprintf(d.stderr, "shed-ext-rc: "+format+"\n", args...)
+	}
 }
 
 // ensureHubHook returns the CreateOptions.EnsureHub callback, or nil when no
@@ -620,6 +693,8 @@ func doClaude(cfg Config, d deps, args []string) int {
 		Wait:             true,
 		InteractiveShell: true,
 		PermissionMode:   mode,
+		Warnf:            warnHook(d),
+		BinProbe:         effectiveBinProbe(d, true),
 		EnsureHub:        ensureHubHook(d),
 	}, d.sleep)
 	if err != nil {

@@ -43,6 +43,35 @@ All notable changes to this project will be documented in this file.
   `docs/extensions/rc-helper.md` for the full contract. Contract-only — no lane
   implementation, no new activity derivation, no client UI behavior change.
 
+- **The rc observatory goes live: opencode dual-control, cursor/codex approval
+  signals, kickoff hardening.** The contract-v2 verbs shipped as scaffolding above now
+  have a real lane: **opencode's `turn`/`interrupt`/`approvals/{id}` are live**,
+  steering the session through its TUI's embedded HTTP+SSE server while the same
+  session stays tmux-attachable (dual control — a client and a human can watch/steer
+  the same session at once). Every other kind still answers `409 not_supported`.
+  `needs_approval` is now produced for the first time, from two different mechanisms
+  matched to what each agent actually exposes: opencode derives it from live
+  `permission.asked`/`question.asked` events (settled, demoted to stability on a dead
+  SSE stream), while codex and cursor — whose native surfaces carry no
+  approval-pending signal at all (codex's rollout JSONL provably filters approval
+  records before they're written; cursor's hooks fire no approval event) — derive it
+  from a debounced pane anchor and emit **informational** `approval_request` rows
+  (`approvals` stays `"tui"`; no decisions are ever remotely honored). Cursor stops
+  being stability-only: a hub-owned hook script (merged into `~/.cursor/hooks.json`,
+  never clobbering existing entries) relays turn boundaries, tool calls/results, and
+  assistant messages into a normalized message feed and `gated` input, over a new
+  guest-internal ingest route (`POST /v1/ingest/cursor`, 256 KiB cap, never proxied by
+  the server). Kickoff hardening: `shed create`/`attach`/`plan` gate on the target
+  agent binary actually being installed (naming it in the error, instead of an opaque
+  "died on create"), `shed plan` gains `--permission-mode`/`--skip` (previously
+  `shed attach`-only), both `attach` and `plan` gain `--workdir`, and opencode gets a
+  positive needs-auth classifier (its "Connect a provider" dialog) instead of reading
+  `starting` until timeout. **Behavior break:** opencode's `POST /input` now returns
+  the ordinary non-gated `409` — `kind_features.input` moved from `gated` to `turn` for
+  opencode, and steering moves to the `turn` verb; no shipped client posted to
+  opencode's `/input`, so first-party consumers move in lockstep. See
+  `docs/extensions/rc-helper.md` for the full as-built contract.
+
 ## v0.8.1 — 2026-07-28
 
 **Ships:** server, host-agent, machine-rc, desktop

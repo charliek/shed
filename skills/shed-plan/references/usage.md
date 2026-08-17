@@ -6,7 +6,8 @@ version-matched source.
 ## One command: ship a plan and run it
 
 ```bash
-shed plan <file> --shed <name> [--repo <owner/repo>] [-s <server>] [--kind <k>] [-p "<framing>"] [-d]
+shed plan <file> --shed <name> [--repo <owner/repo>] [-s <server>] [--kind <k>] \
+  [-p "<framing>"] [--permission-mode <m> | --skip] [--workdir <dir>] [-d]
 ```
 
 | Flag | Purpose |
@@ -17,11 +18,15 @@ shed plan <file> --shed <name> [--repo <owner/repo>] [-s <server>] [--kind <k>] 
 | `-s, --server <name>` | Which server. **Ask the user if unspecified.** |
 | `--kind <k>` | Agent kind: `claude-rc` (default), `codex`, `cursor`, `opencode`, `shell`. |
 | `-p, --prompt <framing>` | Optional framing prepended to the composed plan kickoff (may be multi-line). |
+| `--permission-mode <m>` | `default` \| `auto` (default) \| `skip` for all kinds; Claude also accepts `acceptEdits` \| `plan` \| `dontAsk` \| `bypassPermissions`. |
+| `--skip` | Shorthand for `--permission-mode skip` (full bypass). Confirm with the user first — mutually exclusive with `--permission-mode`. |
+| `--workdir <dir>` | Working directory inside the shed for the RC session (default `$SHED_WORKSPACE`/`$HOME`). |
 | `-d, --detach` | Report the session and return instead of attaching when it's ready. |
 
-Runs under the `auto` permission posture. The plan is written HOME-rooted inside the
-shed (Claude: `~/.claude/plans/plan-<slug>.md`; others: `~/.shed-plans/plan-<slug>.md`),
-never the workspace, and the kickoff references its absolute path.
+Runs under the `auto` permission posture by default. The plan is written HOME-rooted
+inside the shed (Claude: `~/.claude/plans/plan-<slug>.md`; others:
+`~/.shed-plans/plan-<slug>.md`), never the workspace, and the kickoff references its
+absolute path.
 
 **Exit contract:** `0` only when the session reached `ready` and the kickoff was
 delivered. `needs-auth` / `needs-trust`, a failed session, or an old shed image exits
@@ -46,6 +51,7 @@ shed attach <shed> --plan <file> -d [--kind <k>] [--skip] [-p "<framing>"]
 | `-p, --prompt <line>` | Framing prepended to the plan kickoff. Multi-line via `--prompt-file`. |
 | `--permission-mode <m>` | `default` \| `auto` (default) \| `skip` for all kinds; Claude also accepts `acceptEdits` \| `plan` \| `dontAsk` \| `bypassPermissions`. |
 | `--skip` | Shorthand for the generic `skip` mode (full bypass). Confirm with the user first. |
+| `--workdir <dir>` | Working directory inside the shed for the RC session (default `$SHED_WORKSPACE`/`$HOME`). |
 | `--name <display>` | Session display name (default `<shed>/<slug>`). |
 | `--slug <slug>` | Set the session slug (otherwise generated). |
 

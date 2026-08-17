@@ -179,6 +179,23 @@ func TestClassifyFalsePositives(t *testing.T) {
 		}
 	})
 
+	t.Run("opencode connect-a-provider headline alone (quoted) is not needs-auth", func(t *testing.T) {
+		// The conjunction requires the "Popular" category header too; a bare mention
+		// of the dialog's headline (e.g. an agent's own reply, or the composer still
+		// drawn) must not misfire.
+		pane := "  Ask anything... \"Fix broken tests\"\n  I can help you Connect a provider if you'd like.\n  ctrl+p commands"
+		if s, _ := ClassifyPane(KindOpencode, pane); s != StateReady {
+			t.Errorf("opencode headline-only mention = %s, want ready (placeholder wins, no false needs-auth)", s)
+		}
+	})
+
+	t.Run("opencode connect-a-provider headline without the Popular category is not needs-auth", func(t *testing.T) {
+		pane := "  Some assistant text that happens to say Connect a provider mid-sentence.\n"
+		if s, _ := ClassifyPane(KindOpencode, pane); s == StateNeedsAuth {
+			t.Errorf("opencode headline alone (no category header) = %s, want NOT needs-auth", s)
+		}
+	})
+
 	t.Run("cursor auth-before-delivery is needs-auth", func(t *testing.T) {
 		if s, _ := ClassifyPane(KindCursor, "Cursor Agent\nPress any key to log in..."); s != StateNeedsAuth {
 			t.Errorf("cursor login splash = %s, want needs-auth", s)
