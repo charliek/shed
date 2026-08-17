@@ -20,7 +20,7 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
-**Ships:** server
+**Ships:** server, machine-rc
 
 ### Added
 
@@ -71,6 +71,30 @@ All notable changes to this project will be documented in this file.
   opencode, and steering moves to the `turn` verb; no shipped client posted to
   opencode's `/input`, so first-party consumers move in lockstep. See
   `docs/extensions/rc-helper.md` for the full as-built contract.
+
+- **RC engine seams for the Rust porcelain, and a `machines:` config section the CLI
+  stops eating.** Three narrow, behavior-neutral changes on the Go side, landed for the
+  Rust one-shot engine port (`sx`, below). (1) A new `SHED_RC_NO_HUB` environment
+  kill-switch (any non-empty value) makes `shed-ext-rc`/`shed-machine-rc` skip the post-create activity-hub
+  ensure — every `create` otherwise spawns or health-probes a detached `serve` daemon on
+  `127.0.0.1:1029` unconditionally, which a hermetic test harness cannot tolerate.
+  Unset, nothing changes. (2) The `warnHook` and `EnsureHub` diagnostic lines hardcoded
+  the `shed-ext-rc: ` prefix regardless of binary, so **`shed-machine-rc` reported
+  itself as `shed-ext-rc`**; both now stamp the running binary's own program name.
+  (3) `~/.shed/config.yaml` may now carry a top-level `machines:` section (native RC
+  hosts — the schema is owned by the Rust client core), and the `shed` CLI round-trips
+  it **byte-intact** through the whole-document rewrite that `shed server add`, a
+  shed-cache refresh, a token mint, or a `shed delete` performs. Previously any such
+  command silently deleted a hand-added section. Go never interprets the subtree.
+
+  The porcelain itself — `sx` (`crates/sx`: `agent`/`plan`/`ls`/`watch`/`attach`/`kill`
+  across `local | machine:<name> | shed:<name>[@<server>]`, plus the engine-compat
+  `sx rc <subcommand>`) — and the `tests/rc-parity` Go↔Rust differential harness that
+  pins its wire compatibility **ship no release component**: they are unreleased dev
+  tooling built from `crates/`, and giving `sx` a release component is future work.
+  `shed-machine-rc` is unaffected as a product: it remains the machine hub provider
+  (the hub is deliberately not ported) and the parity oracle. See
+  `docs/extensions/sx.md`.
 
 ## v0.8.1 — 2026-07-28
 

@@ -88,6 +88,49 @@ running, and prints the per-agent remediation. Relay it to the user, then retry:
    - Status across sheds: `shed sessions` (shows KIND + RC-STATE for `rc-*` sessions)
    - Stop it: `shed sessions kill <shed> rc-<slug>`
 
+## Target a native machine instead of a shed (`sx`)
+
+When the user wants the plan run on a **machine** rather than a shed ("run it on my
+mac-mini", "kick this off on mini2 itself"), the tool is `sx` — the RC porcelain
+(`docs/extensions/sx.md`). It is **unreleased and installed nowhere by default**, so
+resolve it in this order and stop at the first that works:
+
+1. `sx` on `PATH` (`command -v sx`).
+2. A shed checkout on this machine: `cd <shed-repo>/crates && cargo run -q -p sx -- <args>`
+   (or `<shed-repo>/crates/target/{debug,release}/sx` if it is already built).
+3. **Fallback — the released Go engine over SSH**, when the machine has
+   `shed-machine-rc` but this machine has no `sx`:
+   ```bash
+   ssh <machine> shed-machine-rc create --kind claude-rc --name "<machine>/plan" \
+     --wait --interactive-shell --permission-mode auto --plan-stdin < ./plan.md
+   ```
+4. **Neither available** — say so and stop. Do not improvise a raw `tmux`/`ssh`
+   kickoff; the posture flags, installed-agent gate, and trust/onboarding pre-seed are
+   exactly what these tools exist to apply.
+
+With `sx` the flow is one command, and the plan file stays local (it is read here and
+shipped over stdin):
+
+```bash
+sx plan ./plan.md --on machine:<name>          # a machines: entry in ~/.shed/config.yaml
+sx plan ./plan.md                              # this machine
+sx plan ./plan.md --on shed:<name>@<server>    # a shed, same porcelain
+sx plan ./plan.md --on machine:<name> --tool codex
+```
+
+Same posture rules as `shed plan`: `auto` by default, `--skip` only on explicit user
+request. Report back with `sx watch <slug> --on machine:<name>` (activity stream),
+`sx attach <slug> --on machine:<name>` (terminal), `sx kill <slug> --on machine:<name>`.
+
+Prerequisite for a machine target: a `machines:` entry in `~/.shed/config.yaml` (name,
+`host`, optional `user`/`ssh_port`/`rc_bin`). If the section is missing, ask the user
+before writing one — and warn that a `shed` CLI older than the `machines:` passthrough
+deletes the section on its next config rewrite.
+
+**Sheds remain the default.** Use `shed plan` for shed targets unless the user
+specifically wants the porcelain; a machine is not an isolated VM, so the blast radius
+of an autonomous run is the user's real machine.
+
 ## Exit contract (what the non-zero cases mean)
 
 `shed plan` exits **0 only when the session reached `ready` and the kickoff was

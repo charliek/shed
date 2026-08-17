@@ -50,12 +50,18 @@ established in agent-sessions.md.
    as exactly this boundary). Thin v1: it *drives* the existing Go engine
    binaries. Structured-lane protocol clients are written as Rust crates so the
    porcelain, Tauri, Swift (FFI), and Flutter (FRB) all reuse them.
+   **Shipped as `sx` in R2** — with one deliberate escalation on "thin": the
+   one-shot engine is *ported* to Rust for local targets rather than shelled out
+   to, with the Go binary retained as a differential oracle (see
+   [The Rust porcelain](#the-rust-porcelain)). The hub is not ported.
 5. **Shed-first, machines over time.** Machine reach starts client-side
    (SSH exec + SSH port-forward of the hub), inheriting into mobile/Tauri via
    shed-core. Longer-term the machine-side hub/adapters can fold into
    `shed-host-agent` (Rust, already resident on machines). **`shed-machine-rc`
    (Go) is deletable** once absorbed — the RC convention/wire is the invariant
-   that must survive, not any binary.
+   that must survive, not any binary. **R2 pinned the "once":** the hub was
+   deliberately left out of the Rust port, so `shed-machine-rc` stays — machine
+   hub provider and parity oracle — until the `shed-host-agent` hub lands (R5).
 6. **t3code: learn, don't adopt.** (MIT, `~/projects/t3code`.) Its
    orchestration verbs (`thread.turn.start/interrupt`, `thread.approval.respond`,
    `thread.user-input.respond` — "callers name a thread, not an agent"), its
@@ -171,6 +177,50 @@ per-agent native lanes behind one contract, not a single-protocol bet.
 
 ## The Rust porcelain
 
+> **Status: SHIPPED (R2, plan 009, Aug 2026)** — the binary is **`sx`**
+> (`crates/sx`), documented end-user-style in
+> [`docs/extensions/sx.md`](../extensions/sx.md). What the block settled, beyond the
+> sketch below:
+>
+> - **Name: `sx`.** Short enough for a skill (and a human) to type constantly, no
+>   collision with `shed`/`shed-server`/`shed-agent`/`shed-ext-*`/`shedctl`/
+>   `shed-host-agent` or any brew formula in the tap. It ships in **no release
+>   component** yet — built from `crates/`, installed by hand.
+> - **The engine is ported, not driven.** The sketch's "thin v1 drives the Go
+>   binaries" became a real one-shot engine port: `shed-core::rc_agents` (registry,
+>   classifiers, env/DTO shapes) + `shed-app::rc_engine` (tmux, ops, plan, preseeds,
+>   capabilities) behind `sx rc <subcommand>`, wire-compatible with
+>   `shed-machine-rc <subcommand>`. Remote targets still exec the far side's RC
+>   binary over SSH — that IS the wire.
+> - **The `serve` hub stays Go — settled, not deferred.** Its future home is
+>   `shed-host-agent` (the v2 brokered direction below), so it was deliberately left
+>   out of the port. `sx` best-effort spawns `shed-machine-rc serve --detach` on
+>   create and reads that hub over loopback (or an `ssh -L` tunnel for a machine).
+> - **Consequence: `shed-machine-rc` is NOT deleted.** It survives as the machine hub
+>   provider *and* as the parity oracle. Its VERSION manifest and release component
+>   are untouched. Retirement stays parked behind the host-agent hub (R5).
+> - **The mixed-fleet guarantee is a harness, not a promise.** `tests/rc-parity/`
+>   (51 cells, the fourth pytest suite) runs each scenario against both binaries,
+>   requires the normalized results to agree, and pins the agreed value to a golden —
+>   structural canonical JSON for DTO stdout, **raw bytes** for preseed artifacts
+>   (`~/.claude.json`, `~/.cursor/hooks.json`, the hook script, plan files), which a
+>   mixed fleet rewrites in place. Cross-impl interop cells create with one
+>   implementation and probe/list/prompt/kill with the other, both directions.
+> - **Consumer audit (informational, keep-by-default).** `claude-broker` *creation*
+>   is live in exactly two places — `shed attach --kind claude-broker` and
+>   shed-remote-agent's New Shed page; everywhere else it survives as a
+>   display/classification kind. Standalone `accept-trust` is fully consumer-dead
+>   (trust is handled by the create-time preseed and the `--wait` poller's inline
+>   Enter). Both were ported unchanged; dropping either is a wire-contract change for
+>   a later block.
+> - **Follow-ups recorded:** wire the host-agent token minter into `sx` (an mTLS-only
+>   server today needs the `shed:<name>@<server>` form); add a cursor
+>   workspace-trust anchor + auto-accept as a lockstep Go+Rust change (current
+>   `cursor-agent` builds open a trust dialog neither implementation classifies, so
+>   both read `starting`); `sx` steering verbs off the hub/proxy wire; `sx ls`
+>   fan-out concurrency (`--fast`); engine-crate graduation once it has two real
+>   consumers; `sx` auto-install from skills and a release component for it.
+
 > **Refined direction (plan 008, Aug 2026).** The porcelain is a **Rust tool called
 > from shed skills** — the entry point is a Claude Code (or other agent) skill kicking
 > off a session from a local machine into a shed or a remote machine, doing the
@@ -192,24 +242,27 @@ per-agent native lanes behind one contract, not a single-protocol bet.
 > one, since they are reused by both the CLI and any future direct-connect mobile
 > path.
 
-New crate in `crates/` (name TBD), on `shed-core` + `shed-app`:
+New crate in `crates/` — **`crates/sx`, binary `sx`** — on `shed-core` + `shed-app`.
+As built (the sketch's `--shed` spelling became the one uniform `--on`):
 
 ```bash
-<tool> agent codex                       # local machine, auto posture; prints watch/attach info
-<tool> agent claude --on mini2           # over SSH (engine binary on the machine)
-<tool> agent opencode --shed mytopic     # in a shed (server API path)
-<tool> ls                                # unified sessions: local + machines + sheds
-<tool> watch <slug> / attach <slug> / plan <file> --on ... / kill <slug>
+sx agent codex                           # local machine, auto posture; prints watch/attach info
+sx agent claude --on machine:mini2       # over SSH (engine binary on the machine)
+sx agent opencode --on shed:mytopic      # in a shed (SSH to the guest helper)
+sx ls                                    # unified sessions: local + machines + sheds
+sx watch <slug> / attach <slug> / plan <file> --on ... / kill <slug>
 ```
 
-- **Thin v1**: drives the existing Go engine binaries (`shed-machine-rc`
-  locally/over SSH, `shed-ext-rc` in sheds via the server API) exactly as the
-  desktop app does; tmux choreography stays where it is. The `claude`
-  convenience verb generalizes to every agent and every target.
-- Target model: `local | machine:<name> | shed:<name>@<server>` resolved from
-  `~/.shed/config.yaml` (+ a machines section it grows).
-- Scope question (open): agent porcelain only, or eventually *the* shed client
-  CLI absorbing the Go CLI's client half. Start narrow; nothing forecloses the
+- **v1 as built**: the one-shot engine is ported to Rust and runs in-process for
+  `local`; `machine:`/`shed:` targets exec the far side's Go RC binary over SSH
+  (`shed-machine-rc` / `shed-ext-rc`), which is the wire the desktop app uses too.
+  tmux choreography stays where the sessions are. The `claude` convenience verb is
+  absorbed by `sx agent <tool>` rather than ported.
+- Target model: `local | machine:<name> | shed:<name>[@<server>]` resolved from
+  `~/.shed/config.yaml` (+ the `machines:` section it grew; the Go CLI carries it
+  as a schema-agnostic passthrough so a config rewrite stops deleting it).
+- Scope question (still open): agent porcelain only, or eventually *the* shed client
+  CLI absorbing the Go CLI's client half. Started narrow; nothing forecloses the
   larger scope.
 - Agent workflows (`shed attach --kind`, `shed plan`) migrate here over time;
   the Go `shed` CLI keeps shed/VM lifecycle.
@@ -257,7 +310,7 @@ the phase (even when the mobile UI itself lands a phase later).
 |---|---|---|
 | **R0 — Contract v2** ✅ | `lane` field, extended `kind_features`, turn/interrupt/approval verbs (409 where unimplemented), typed approval feed entries + `pending_approvals`, `needs_approval` activity; Go hub + server proxy + Rust/Swift/TS mirrors + byte-parity-guarded fixtures in lockstep | Mobile decodes v2 envelope; existing watch screens render unchanged off capabilities |
 | **R1 — Observatory (opencode dual-control, cursor/codex signals, kickoff hardening)** ✅ | **Shipped, plan 008** — grew beyond the original "cursor TUI hardening" scope into the full block: opencode's turn/interrupt/approvals verbs live (dual control — the same session stays tmux-attachable while the hub steers it), `needs_approval` + informational approval feed rows for codex and cursor (pane-anchor, debounced), cursor hooks→hub ingestion (activity, turn boundaries, message feed, gated input), and `shed attach`/`shed plan` kickoff hardening (installed-agent gate, plan permission posture, `--workdir`, opencode needs-auth classification). See `docs/extensions/rc-helper.md` for the as-built contract | Cursor session on a shed shows live activity + hook-derived feed; a codex/cursor approval prompt reads `needs_approval` + "open the TUI"; an opencode session is steered (turn/interrupt/approve) through the hub while still tmux-attachable |
-| **R2 — Rust porcelain v1** | new crate: `agent`/`ls`/`watch`/`attach`/`plan`/`kill` across `local\|machine\|shed`; drives Go engine binaries; machines section in config | n/a directly (CLI), but exercises the same shed-core target model mobile will use |
+| **R2 — Rust porcelain v1** ✅ | **Shipped, plan 009** — `crates/sx`, binary `sx`: `agent`/`plan`/`ls`/`watch`/`attach`/`kill` across `local\|machine:<m>\|shed:<s>[@<server>]`, plus the engine-compat `sx rc <subcommand>`. The one-shot RC engine is **ported** (not merely driven): `shed-core::rc_agents` + `shed-app::rc_engine`, with `shed-machine-rc` kept alive as the machine hub provider and the **parity oracle** — `tests/rc-parity/` (51 cells) diffs both implementations per scenario and pins the agreement to goldens. The hub (`serve`) stays Go by decision (future home: `shed-host-agent`). `machines:` config section in shed-core, round-trip-preserved by the Go CLI. Unreleased dev tooling: no release component. See [`docs/extensions/sx.md`](../extensions/sx.md) | n/a directly (CLI), but exercises the same shed-core target model mobile will use |
 | **R3 — Structured lane prototype** | a lane adapter in the guest hub behind the v2 verbs, as a **new distinct kind**. Spike is now three-way: **opencode** (front-runner — the hub already speaks its SSE/REST via the `--port` watcher, so the adapter is incremental Go; t3code ships on the same v2 API), codex app-server (most mature protocol, needs a Go JSON-RPC client), cursor-ACP (viable per t3code's long-lived-child pattern, needs a Go ACP client). **Primary design problem: the structured-session registry** — a session with no tmux pane breaks "tmux is the source of truth", so the hub needs its own registry (in-memory + agent-side persistence for resume). **Note (post-R1):** R1 already wired opencode's turn/interrupt/approvals verbs onto the *existing* TUI-lane kind (dual control — no new kind, the session stays tmux-attachable) — see `docs/extensions/rc-helper.md`; R3's "new distinct kind" is for a lane with **no** tmux pane at all (a headless structured session), a different and larger step than R1's dual-control shape | **Approve a tool call and steer a turn from the phone** — the bar for the whole design |
 | **R4 — Machines in clients** | machine targets in shed-core surfaced in mobile + Tauri (SSH-forwarded hub); unified sessions view everywhere | Machine sessions listed + watchable next to shed sessions on the phone |
 | **R5 — Second lane + notifier** | second structured lane (from the R3 spike's runners-up); desktop notifier off aggregate SSE; host-agent hub spike (start of shed-machine-rc retirement) | `needs_input`/`needs_approval` reaches the phone while the app is open (SSE); push is a separate decision |
@@ -312,7 +365,9 @@ table above:
    t3code ships on the same v2 API) vs codex app-server (most mature protocol,
    auth-policy ambiguity, new Go JSON-RPC client) vs cursor-ACP (t3code-proven
    long-lived-child pattern, new Go ACP client). Decide with a short spike.
-3. **Porcelain name + scope** — agent-only vs future full client CLI.
+3. ~~**Porcelain name**~~ **RESOLVED in R2**: the binary is `sx` (`crates/sx`).
+   **Scope stays open** — agent-only today vs eventually absorbing the Go CLI's
+   client half; `shed attach --kind` / `shed plan` have not migrated.
 4. **Mobile push** — SSE-while-open is the R5 bar; true push (FCM/ntfy/relay)
    is unscoped. Decide when R4 lands.
 5. **Structured-session registry** — promoted to **R3's primary design

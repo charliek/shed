@@ -83,6 +83,7 @@ nav = [
     { "Status CLI" = "extensions/status-cli.md" },
     { "RC Session Helper" = "extensions/rc-helper.md" },
     { "shed-machine-rc" = "extensions/shed-machine-rc.md" },
+    { "sx (RC porcelain)" = "extensions/sx.md" },
     { "Security Posture" = "extensions/security-posture.md" },
   ] },
   { "Desktop" = [
