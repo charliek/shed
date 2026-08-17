@@ -7,7 +7,7 @@
   "lane": "tui",
   "managed": true,
   "slug": "ll2222",
-  "state": "starting",
+  "state": "ready",
   "tmux_session": "rc-ll2222",
   "workdir": "<home>"
 }

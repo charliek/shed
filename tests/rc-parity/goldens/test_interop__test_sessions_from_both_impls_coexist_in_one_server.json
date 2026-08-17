@@ -77,14 +77,27 @@
     {
       "created_at": "<ts>",
       "created_by": "<prog>",
-      "display_name": "parity-list",
+      "display_name": "interop-io3333",
       "id": "<id>",
       "kind": "codex",
       "lane": "tui",
       "managed": true,
-      "slug": "ll1111",
+      "slug": "io3333",
       "state": "ready",
-      "tmux_session": "rc-ll1111",
+      "tmux_session": "rc-io3333",
+      "workdir": "<home>"
+    },
+    {
+      "created_at": "<ts>",
+      "created_by": "<prog>",
+      "display_name": "interop-io4444",
+      "id": "<id>",
+      "kind": "opencode",
+      "lane": "tui",
+      "managed": true,
+      "slug": "io4444",
+      "state": "ready",
+      "tmux_session": "rc-io4444",
       "workdir": "<home>"
     }
   ]

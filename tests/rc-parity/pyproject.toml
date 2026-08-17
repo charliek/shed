@@ -16,9 +16,10 @@ addopts = "-ra --strict-markers"
 markers = [
     "differential: a scenario run against BOTH implementations, asserted equal and pinned to a golden",
 ]
-# Hermetic by construction: a fresh HOME + tmux server per implementation leg, the
-# hub kill-switch on, no network. Warnings are errors so a leaked subprocess pipe
-# or an unreaped child cannot slip past silently.
+# Hermetic by construction: a fresh HOME + tmux server per context (one per
+# implementation leg under the `isolated` flavor, one shared by both under
+# `shared`), the hub kill-switch on, no network. Warnings are errors so a leaked
+# subprocess pipe or an unreaped child cannot slip past silently.
 filterwarnings = [
     "error",
     "default::DeprecationWarning",

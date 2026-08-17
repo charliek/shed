@@ -87,10 +87,12 @@ Masks: `<id>` (uuid), `<ts>` (RFC3339, shape-asserted first), `<home>`, `<workdi
   loopback port **1029**. `SHED_RC_NO_HUB=1` (the C2 oracle seam, honored identically
   by the Rust engine's hook) is set for every leg, and a session-scoped guard asserts
   no test-spawned process ended up holding the port.
-* **tmux.** Each implementation leg gets its own `TMUX_TMPDIR` — a *shallow* `mkdtemp`,
-  because an AF_UNIX bind path caps at ~104 bytes and pytest's tmp tree blows past it —
-  so the two legs run on separate servers. Teardown kills each server and asserts no
-  `rc-*` session survived.
+* **tmux.** Each *context* gets its own `TMUX_TMPDIR` — a *shallow* `mkdtemp`, because
+  an AF_UNIX bind path caps at ~104 bytes and pytest's tmp tree blows past it. Under
+  the `isolated` flavor a context is one implementation leg, so the two legs run on
+  separate servers and cannot see each other's sessions; under `shared` one context
+  serves both. Teardown `kill-server`s every context this test built, which IS the
+  session cleanup — a cell may legitimately leave sessions behind for it.
 * **PATH.** `bash -lc`/`-l`/`-ic` rebuild PATH from `/etc/profile` (+ macOS
   `path_helper`), so a prepend on the pytest process vanishes. Each leg therefore gets
   a fresh `HOME` with `.bash_profile`, `.bashrc` and `.profile` prepending its shim dir,
@@ -105,16 +107,26 @@ Masks: `<id>` (uuid), `<ts>` (RFC3339, shape-asserted first), `<home>`, `<workdi
 
 ## Isolation flavors
 
-**isolated** (this commit): each implementation gets its own tmux server + HOME, and
-both use the same pinned slug — independent differentials with no cross-talk.
+**isolated** — each implementation gets its own tmux server + HOME, and both use the
+same pinned slug: independent differentials with no cross-talk. Everything except
+`test_interop.py` uses this.
 
-**shared** (C6): one server + one HOME serving both implementations, for the
-cross-impl interop cells (create with Go, probe/prompt/kill with Rust and vice versa)
-and preseed-in-place idempotence.
+**shared** — ONE tmux server + ONE HOME that both implementations drive, selected per
+call (`rig.run(impl, verb, …)`). Sharing is not a convenience here, it is the property
+under test: interop means one binary reading, prompting and killing a session the
+OTHER created (two sealed servers cannot express that), and preseed-in-place means two
+binaries merging into one file on one machine, in sequence. Coexisting sessions take
+DISTINCT pinned slugs — a shared server is exactly where a repeated slug is the
+duplicate-slug error.
 
-## Scope today (C5) and what is coming
+A test may ask for several NAMED shared rigs (`shared("chain-go")`,
+`shared("chain-rust")`): the interop cells stay differentials by varying *which
+implementation drives*, so each direction needs its own world. Teardown is the same
+discipline as `isolated` — every rig's server is killed and its `TMUX_TMPDIR` removed.
 
-Here — 42 differential cells, one golden each:
+## Scope today (C6) and what is coming
+
+Here — 51 differential cells, one golden each:
 
 * `version`; `create` (DTO + session environment + inner-command argv, `shell` and
   `opencode`); `probe`; `kill` (including its idempotence); `list`; the exit-code
@@ -135,12 +147,36 @@ Here — 42 differential cells, one golden each:
   one Enter, the bypass dialog answered with `Down` then Enter (`1b 5b 42 0a`), and
   the single-line vs bracketed-paste kickoff deliveries.
 
+* **Cross-impl interop** (`test_interop.py`, the shared flavor): a Go-created
+  session probed + listed identically by both binaries and vice versa; two
+  sessions of different kinds created by different binaries coexisting in ONE
+  server and enumerated identically by both; the full chain (create with one,
+  `prompt` + `kill` with the other, then the creator's `probe` → exit 4) run both
+  ways round and compared; `accept-trust` answered across the boundary on a
+  reactive trust shim (the transcript proves the single Enter, and the creator
+  then reads `ready`); and the preseed files merged in place across the boundary
+  — Go→Rust and Rust→Go compared byte for byte against the pure-Go reference
+  sequence, for `~/.claude.json` and `~/.cursor/hooks.json`.
+
 The C4 carve-out that stripped `capabilities` from the `list` differential is
 **gone** — both implementations embed the block, so the full envelope is compared
 and that golden was deliberately re-recorded.
 
-C6 adds cross-impl interop (create with Go, probe/prompt/kill with Rust and vice
-versa), the shared-HOME fixture flavor, and the CI job.
+## CI
+
+`.github/workflows/ci.yml` runs this suite as the **`rc-parity (Go↔Rust wire
+goldens)`** job (part of the required `ci-success` check), gated on the `rcparity`
+path filter: both engines (`internal/ext/rc`, `internal/ext/clirc`,
+`crates/shed-core`, `crates/shed-app`), both CLIs (`cmd/shed-machine-rc`,
+`cmd/shed-ext-rc`, `crates/sx`), this harness, and the shared build manifests
+(`crates/Cargo.*`, `crates/rust-toolchain.toml`, `go.mod`/`go.sum`).
+
+The job installs Go + Rust + uv, `apt-get install`s **tmux** (not preinstalled on
+GitHub runners) and asserts the ≥ 3.2 floor before building anything, then runs the
+Rust legs no other job covers — `cargo test`/`clippy` for `-p shed-app --features rc`
+and `-p sx` — followed by `make test-rc-parity`. It is the only job in that workflow
+with a `timeout-minutes`, because it drives real tmux sessions and a wedged pane is a
+hang rather than a failure.
 
 ### Known sensitivity
 

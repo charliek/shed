@@ -91,6 +91,10 @@ def test_list_embeds_capabilities_beside_a_live_session(differential, isolated):
         )
         assert res.returncode == 0, f"{impl}: exit {res.returncode}: {res.stderr}"
         leg.wait_for_session(f"rc-{slug}")
+        # Wait for the shim's pane draw too: `state` is otherwise a race between
+        # the draw and the list — macOS lost it (pinning "starting"), Linux won
+        # it ("ready"), and the golden went platform-dependent (C6 review HIGH).
+        leg.wait_for_pane(f"rc-{slug}", "Find and fix a bug")
         listed = leg.run("list")
         assert listed.returncode == 0, f"{impl}: exit {listed.returncode}"
         return mask_list(listed.json(), str(leg.home))
@@ -112,6 +116,7 @@ def test_probe_carries_no_capabilities(differential, isolated):
         )
         assert res.returncode == 0, f"{impl}: exit {res.returncode}: {res.stderr}"
         leg.wait_for_session(f"rc-{slug}")
+        leg.wait_for_pane(f"rc-{slug}", "Find and fix a bug")  # same race as the list cell
         dto = leg.run("probe", "--slug", slug).json()
         assert "capabilities" not in dto, dto
         return mask_session(dto, str(leg.home))

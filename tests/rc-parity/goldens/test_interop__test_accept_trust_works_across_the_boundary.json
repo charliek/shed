@@ -1,0 +1,24 @@
+{
+  "accept_trust": {
+    "code": 0,
+    "stderr": "",
+    "stdout": ""
+  },
+  "keystrokes": [
+    "0a"
+  ],
+  "probe_by_creator": {
+    "created_at": "<ts>",
+    "created_by": "<prog>",
+    "display_name": "interop-io6666",
+    "id": "<id>",
+    "kind": "claude-rc",
+    "lane": "tui",
+    "managed": true,
+    "slug": "io6666",
+    "state": "ready",
+    "tmux_session": "rc-io6666",
+    "url": "https://claude.ai/code/session_TESTTEST",
+    "workdir": "<home>"
+  }
+}

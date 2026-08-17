@@ -14,11 +14,13 @@ Hermeticity, in the order the traps bite:
   oracle seam, honored identically by the Rust engine) neutralizes it on both
   sides; a session-scoped guard asserts no test-spawned process ended up holding
   the port.
-* **tmux.** Each implementation LEG gets its own `TMUX_TMPDIR` — a shallow
-  `mkdtemp`, because an AF_UNIX path caps at ~104 bytes and pytest's tmp tree
-  blows past that — so the two legs run on separate tmux servers and cannot see
-  each other's sessions. Both legs use the SAME pinned `--slug`/`--name`, which is
-  what lets the DTOs compare with no slug masking.
+* **tmux.** Each CONTEXT gets its own `TMUX_TMPDIR` — a shallow `mkdtemp`,
+  because an AF_UNIX path caps at ~104 bytes and pytest's tmp tree blows past
+  that. In the `isolated` flavor a context is one implementation LEG, so the two
+  legs run on separate tmux servers, cannot see each other's sessions, and use
+  the SAME pinned `--slug`/`--name` — which is what lets the DTOs compare with no
+  slug masking. In the `shared` flavor one context serves BOTH implementations
+  (interop + preseed-in-place), so coexisting sessions take distinct slugs.
 * **PATH.** `bash -lc` (the installed-agent gate) and `bash -l` (the shell kind)
   REBUILD PATH from `/etc/profile` + macOS `path_helper`, so prepending onto the
   pytest process's PATH vanishes. `_clean_env` therefore writes `.bash_profile`,
@@ -318,20 +320,34 @@ def _clean_env(home: Path, tmux_tmpdir: Path, shim_dir: Path, tmux_path: str) ->
     return env
 
 
-class Leg:
-    """One implementation running in its own HOME + tmux server."""
+def argv_prefix(impl: str, binary: str) -> list:
+    """The implementation's argv prefix: the Go binary takes the verb directly,
+    `sx` namespaces it under `rc` (plan 009 §3.2)."""
+    assert impl in ("go", "rust"), f"unknown implementation {impl!r}"
+    return [binary] if impl == "go" else [binary, "rc"]
+
+
+class Rig:
+    """One hermetic CONTEXT: a fresh HOME, a private tmux server, a shim PATH.
+
+    Everything below the CLI invocation — the environment, the tmux observation
+    helpers, the deadline polls, the teardown — is context-level, not
+    implementation-level, which is exactly why the two flavors can share it:
+
+    * `Leg` binds the context to ONE implementation (the isolated flavor: two
+      contexts, one per impl).
+    * `SharedRig` binds ONE context to BOTH implementations (the shared flavor:
+      each call names the impl that should run the verb)."""
 
     def __init__(
         self,
-        impl: str,
-        binary: str,
+        label: str,
         home: Path,
         tmux_tmpdir: Path,
         tmux_bin: str,
         shims: dict | None = None,
     ):
-        self.impl = impl
-        self.binary = binary
+        self.label = label
         self.home = home
         self.tmux_tmpdir = tmux_tmpdir
         self.tmux_bin = tmux_bin
@@ -341,21 +357,17 @@ class Leg:
         self.env = _clean_env(home, tmux_tmpdir, self.shim_dir, tmux_bin)
 
     def uninstall_agents(self, *names: str) -> None:
-        """Take agent binaries OFF this leg's PATH — how a capability differential
-        proves an `installed: false` row rather than asserting only the true one."""
+        """Take agent binaries OFF this context's PATH — how a capability
+        differential proves an `installed: false` row rather than asserting only
+        the true one."""
         for name in names:
             (self.shim_dir / name).unlink(missing_ok=True)
 
     # -- the CLI under test -------------------------------------------------
 
-    def argv_for(self, sub: str, args) -> list:
-        """The implementation's argv prefix: the Go binary takes the verb
-        directly, `sx` namespaces it under `rc` (plan 009 §3.2)."""
-        prefix = [self.binary] if self.impl == "go" else [self.binary, "rc"]
-        return prefix + [sub] + list(args)
-
-    def run(self, sub: str, *args, stdin: str | None = None, timeout: float = 60) -> RunResult:
-        argv = self.argv_for(sub, args)
+    def _invoke(
+        self, argv: list, stdin: str | None = None, timeout: float = 60
+    ) -> RunResult:
         proc = subprocess.run(
             argv,
             env=self.env,
@@ -409,8 +421,8 @@ class Leg:
         return res.stdout if res.returncode == 0 else ""
 
     def read_bytes(self, relative: str) -> bytes:
-        """A file under this leg's HOME, as RAW BYTES — the preseed artifacts'
-        comparison model (plan 009 §3.5)."""
+        """A file under this context's HOME, as RAW BYTES — the preseed
+        artifacts' comparison model (plan 009 §3.5)."""
         return (self.home / relative).read_bytes()
 
     def _shim_log(self, relative: str) -> str:
@@ -444,7 +456,7 @@ class Leg:
             if last:
                 return last
             time.sleep(0.02)
-        raise AssertionError(f"{self.impl}: {what} within {timeout}s; last={last!r}")
+        raise AssertionError(f"{self.label}: {what} within {timeout}s; last={last!r}")
 
     def wait_for_session(self, name: str, timeout: float = 10) -> list:
         def listed():
@@ -497,13 +509,84 @@ class Leg:
 
     def teardown(self) -> None:
         # kill-server IS the session cleanup: each test gets its own private
-        # per-leg server, so nothing can leak across tests, and cells may
-        # legitimately leave sessions for this reaper. (An earlier "stray rc-*"
-        # assert here was dead code — it ran after kill-server, when sessions()
-        # can only read [] — and arming it would wrongly fail those cells, so it
-        # was removed rather than falsely advertised; C4 review finding.)
+        # server, so nothing can leak across tests, and cells may legitimately
+        # leave sessions for this reaper. (An earlier "stray rc-*" assert here
+        # was dead code — it ran after kill-server, when sessions() can only read
+        # [] — and arming it would wrongly fail those cells, so it was removed
+        # rather than falsely advertised; C4 review finding.)
         self.tmux("kill-server")
         shutil.rmtree(self.tmux_tmpdir, ignore_errors=True)
+
+
+class Leg(Rig):
+    """One implementation running in its own HOME + tmux server (the ISOLATED
+    flavor). `run()` needs no impl argument — the leg IS the implementation."""
+
+    def __init__(
+        self,
+        impl: str,
+        binary: str,
+        home: Path,
+        tmux_tmpdir: Path,
+        tmux_bin: str,
+        shims: dict | None = None,
+    ):
+        super().__init__(impl, home, tmux_tmpdir, tmux_bin, shims)
+        self.impl = impl
+        self.binary = binary
+
+    def argv_for(self, sub: str, args) -> list:
+        return argv_prefix(self.impl, self.binary) + [sub] + list(args)
+
+    def run(self, sub: str, *args, stdin: str | None = None, timeout: float = 60) -> RunResult:
+        return self._invoke(self.argv_for(sub, args), stdin=stdin, timeout=timeout)
+
+
+class SharedRig(Rig):
+    """BOTH implementations against ONE tmux server and ONE HOME (the SHARED
+    flavor). `run(impl, verb, …)` picks which binary executes the verb.
+
+    Why sharing is not an optional convenience here:
+
+    * **Interop** is the mixed-fleet property itself — a session one binary
+      created is a session the other must be able to read, prompt and kill. Two
+      isolated servers cannot express it: each implementation would only ever see
+      its own sessions, and the cell would prove nothing beyond what the isolated
+      differentials already prove.
+    * **Preseed-in-place** is about ONE file on ONE machine that both binaries
+      merge into, in sequence. The byte-exactness that matters is what the SECOND
+      writer does to the FIRST writer's document, which only exists when the two
+      share a HOME.
+
+    Because both implementations see one server, coexisting sessions must carry
+    DISTINCT pinned slugs (a shared server is exactly where a duplicate slug is
+    an error — see `test_exit_classes.test_duplicate_slug_is_exit_3`)."""
+
+    def __init__(
+        self,
+        label: str,
+        binaries: dict,
+        home: Path,
+        tmux_tmpdir: Path,
+        tmux_bin: str,
+        shims: dict | None = None,
+    ):
+        super().__init__(label, home, tmux_tmpdir, tmux_bin, shims)
+        self.binaries = dict(binaries)
+
+    def argv_for(self, impl: str, sub: str, args) -> list:
+        return argv_prefix(impl, self.binaries[impl]) + [sub] + list(args)
+
+    def run(
+        self, impl: str, sub: str, *args, stdin: str | None = None, timeout: float = 60
+    ) -> RunResult:
+        return self._invoke(self.argv_for(impl, sub, args), stdin=stdin, timeout=timeout)
+
+
+def _fresh_context(tmp_path_factory, name: str) -> tuple:
+    home = tmp_path_factory.mktemp(f"home-{name}")
+    # Shallow (AF_UNIX limit), NOT under pytest's nested tmp tree.
+    return home, Path(tempfile.mkdtemp(prefix="rcp-"))
 
 
 @pytest.fixture
@@ -512,9 +595,9 @@ def isolated(binaries, tmux_bin, tmp_path_factory):
     implementation gets its OWN tmux server and HOME.
 
     Independent differentials use this — both legs pass the SAME pinned
-    `--slug`/`--name`, so the two DTOs compare with no slug masking at all. (The
-    SHARED flavor — one server + one HOME serving both implementations, for the
-    cross-impl interop and preseed-in-place cells — arrives with C6.)
+    `--slug`/`--name`, so the two DTOs compare with no slug masking at all. The
+    cross-impl interop and preseed-in-place cells use the `shared` flavor below
+    instead, where one server + one HOME serve both implementations.
 
     `shims` (the reactive `--wait` variants) applies when the leg is first built;
     a scenario must pass the same value on both legs, which it does by
@@ -523,15 +606,39 @@ def isolated(binaries, tmux_bin, tmp_path_factory):
 
     def _leg(impl: str, shims: dict | None = None) -> Leg:
         if impl not in made:
-            home = tmp_path_factory.mktemp(f"home-{impl}")
-            # Shallow (AF_UNIX limit), NOT under pytest's nested tmp tree.
-            tmux_tmpdir = Path(tempfile.mkdtemp(prefix="rcp-"))
+            home, tmux_tmpdir = _fresh_context(tmp_path_factory, impl)
             made[impl] = Leg(impl, binaries[impl], home, tmux_tmpdir, tmux_bin, shims)
         return made[impl]
 
     yield _leg
     for leg in made.values():
         leg.teardown()
+
+
+@pytest.fixture
+def shared(binaries, tmux_bin, tmp_path_factory):
+    """The SHARED flavor (plan 009 §3.6): `make(name, shims=None) -> SharedRig`
+    — ONE tmux server + ONE HOME that BOTH implementations drive.
+
+    `name` identifies the context, not the implementation: a test that needs two
+    independent shared worlds (a cross-impl chain compared against its mirror; a
+    Go→Rust preseed compared against the pure-Go reference) asks for two names
+    and gets two servers + two HOMEs. Asking for the same name twice returns the
+    same rig, so a scenario can be written straight-line.
+
+    Teardown is the same discipline as `isolated`: every rig built here gets its
+    server killed and its `TMUX_TMPDIR` removed, whatever the test did."""
+    made: dict = {}
+
+    def _rig(name: str = "shared", shims: dict | None = None) -> SharedRig:
+        if name not in made:
+            home, tmux_tmpdir = _fresh_context(tmp_path_factory, name)
+            made[name] = SharedRig(name, binaries, home, tmux_tmpdir, tmux_bin, shims)
+        return made[name]
+
+    yield _rig
+    for rig in made.values():
+        rig.teardown()
 
 
 # --- Goldens ---------------------------------------------------------------

@@ -1,0 +1,14 @@
+{
+  "kill": {
+    "code": 0,
+    "stderr": "",
+    "stdout": ""
+  },
+  "marker_count": 2,
+  "probe_after_kill": 4,
+  "prompt": {
+    "code": 0,
+    "stderr": "",
+    "stdout": ""
+  }
+}
