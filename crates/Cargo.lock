@@ -3474,10 +3474,16 @@ checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
 name = "sx"
 version = "0.8.1"
 dependencies = [
+ "async-trait",
  "base64 0.22.1",
+ "futures-util",
+ "libc",
+ "reqwest",
+ "serde",
  "serde_json",
  "shed-app",
  "shed-core",
+ "tokio",
 ]
 
 [[package]]

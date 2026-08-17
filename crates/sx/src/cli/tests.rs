@@ -83,6 +83,12 @@ fn run_with(runner: &dyn TmuxRunner, env: &[(&str, &str)], stdin: &str, args: &[
             version: (bin != "cursor-agent").then(|| "1.2.3".to_string()),
         })),
         preseed: None,
+        // The porcelain seams: no ssh, a fixed hostname (so a default display
+        // name is deterministic), and a runtime nothing in the `rc` namespace
+        // ever builds.
+        remote: None,
+        hostname: Some(Box::new(|| "testhost".to_string())),
+        runtime: std::cell::OnceCell::new(),
     };
     let argv: Vec<String> = args.iter().map(|s| (*s).to_string()).collect();
     let code = run(&deps, &argv);

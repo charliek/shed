@@ -1,10 +1,15 @@
 //! `sx` — the Rust porcelain for RC agent sessions (plan 009).
 //!
-//! Today it exposes ONE namespace: `sx rc <subcommand>`, the ported one-shot RC
-//! engine, wire-compatible with `shed-machine-rc <subcommand>` under the
-//! comparison model the `tests/rc-parity` differential harness enforces. The
-//! porcelain verbs proper (`sx agent`, `sx plan`, `sx ls`, `sx watch`,
-//! `sx attach`, `sx kill`, with `--on local|machine:<m>|shed:<s>`) land in C7.
+//! Two layers, one binary:
+//!
+//! - **`sx rc <subcommand>`** — the ported one-shot RC engine, wire-compatible
+//!   with `shed-machine-rc <subcommand>` under the comparison model the
+//!   `tests/rc-parity` differential harness enforces. Byte-stable by contract.
+//! - **the porcelain verbs** ([`porcelain`]) — `sx agent`, `sx plan`, `sx ls`,
+//!   `sx watch`, `sx attach`, `sx kill`, each taking `--on local | machine:<m> |
+//!   shed:<s>[@<server>]` ([`target`]). These choose defaults, print prose, and
+//!   reach remote machines and sheds over SSH ([`ssh`]); they are what a skill
+//!   (or a person) actually types.
 //!
 //! House style: hand-rolled argument parsing (no clap anywhere in this
 //! workspace), a pure parse layer ([`args`]) feeding a dispatch layer ([`cli`])
@@ -17,6 +22,9 @@
 
 mod args;
 mod cli;
+mod porcelain;
+mod ssh;
+mod target;
 
 use shed_app::rc_engine::tmux::ExecRunner;
 

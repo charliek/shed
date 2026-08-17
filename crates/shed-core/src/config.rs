@@ -149,15 +149,53 @@ fn is_http_url_with_host(s: &str) -> bool {
     !host.is_empty() && !host.contains(char::is_whitespace)
 }
 
-/// The parsed `~/.shed/config.yaml`: server entries (sorted by name) + the
-/// default server.
+/// One `machines:` entry — a **native** host (not a shed) that runs the RC
+/// helper, reachable over plain SSH (plan 009 §3.3).
+///
+/// The section is **Rust-defined and Rust-owned**: the Go `shed` CLI carries it
+/// as a schema-agnostic passthrough (`ClientConfig.Machines yaml.Node`, added in
+/// plan 009 C2) purely so a whole-document `SaveToPath` round-trip cannot delete
+/// it. Nothing in Go interprets these fields.
+///
+/// Absent optionals mean "defer to ssh": no `user` → whatever `~/.ssh/config` (or
+/// the current login) resolves, no `known_hosts` → the user's normal file with
+/// the user's normal strictness, no `rc_bin` → `shed-machine-rc` on the remote
+/// login PATH. That deliberately differs from a shed target, whose host key is
+/// always pinned in `~/.shed/known_hosts` — a machine is an ordinary SSH host the
+/// operator already manages.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MachineEntry {
+    pub name: String,
+    /// Defaults to the machine name (same rule as [`ShedServerEntry::host`]).
+    pub host: String,
+    /// SSH login user; `None` → let ssh decide.
+    pub user: Option<String>,
+    /// Defaults to 22.
+    pub ssh_port: u16,
+    /// Absolute path (or bare name) of the RC helper on the remote. `None` →
+    /// `shed-machine-rc`, resolved on the remote's login PATH.
+    pub rc_bin: Option<String>,
+    /// `UserKnownHostsFile` to pin against; `None` → ssh's own default.
+    pub known_hosts: Option<String>,
+}
+
+/// The parsed `~/.shed/config.yaml`: server entries (sorted by name), machine
+/// entries (sorted by name), and the default server.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ShedConfig {
     pub servers: Vec<ShedServerEntry>,
+    /// The `machines:` section — native RC hosts (plan 009 §3.3). Empty when the
+    /// key is absent, so every pre-existing config parses unchanged.
+    pub machines: Vec<MachineEntry>,
     pub default_server: Option<String>,
 }
 
 impl ShedConfig {
+    /// A machine entry by name.
+    pub fn machine(&self, name: &str) -> Option<&MachineEntry> {
+        self.machines.iter().find(|m| m.name == name)
+    }
+
     /// Load + parse the config at `path`. A missing/unreadable file → an empty
     /// config (a degraded but non-fatal state the dashboard surfaces, never an
     /// error) — mirrors Swift's `load`.
@@ -208,8 +246,38 @@ impl ShedConfig {
             }
         }
         servers.sort_by(|a, b| a.name.cmp(&b.name));
+
+        // `machines:` — the same nested-map shape as `servers:`, so yaml_lite
+        // needs no change (it has no block-sequence support and never will).
+        let mut machines = Vec::new();
+        if let Some(Node::Map(machine_map)) = top.get("machines") {
+            for (name, value) in machine_map {
+                let Node::Map(fields) = value else { continue };
+                let scalar = |k: &str| fields.get(k).and_then(Node::as_scalar);
+                // An optional string is ABSENT when the key is missing OR its
+                // value is empty: `rc_bin:` with nothing after it must mean "use
+                // the default", not "run the empty-string binary".
+                let opt = |k: &str| scalar(k).filter(|s| !s.is_empty()).map(str::to_string);
+                machines.push(MachineEntry {
+                    name: name.clone(),
+                    host: scalar("host")
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or(name)
+                        .to_string(),
+                    user: opt("user"),
+                    ssh_port: scalar("ssh_port")
+                        .and_then(|s| s.parse().ok())
+                        .unwrap_or(22),
+                    rc_bin: opt("rc_bin"),
+                    known_hosts: opt("known_hosts"),
+                });
+            }
+        }
+        machines.sort_by(|a, b| a.name.cmp(&b.name));
+
         ShedConfig {
             servers,
+            machines,
             default_server: top
                 .get("default_server")
                 .and_then(Node::as_scalar)
@@ -499,6 +567,69 @@ default_server: ghost
         assert_eq!(minimal.http_port, 8080);
         assert_eq!(minimal.ssh_port, 22);
         assert_eq!(minimal.resolved_endpoint().base_url, "http://minimal:8080");
+    }
+
+    /// The `machines:` half of the same fixture (plan 009 C7). Swift does not
+    /// model the key and structurally ignores it (an unknown top-level entry in
+    /// `top`), which is why adding the block leaves `ConfigParityTests` passing
+    /// unchanged — the same lockstep argument the mtls fields made above.
+    #[test]
+    fn parity_fixture_carries_the_machines_section() {
+        let config = ShedConfig::parse(include_str!("../../fixtures/config_sample.yaml"));
+        let names: Vec<&str> = config.machines.iter().map(|m| m.name.as_str()).collect();
+        assert_eq!(names, ["bare", "localmac", "mini2box"]);
+
+        let full = config.machine("localmac").expect("localmac");
+        assert_eq!(full.host, "localhost");
+        assert_eq!(full.user.as_deref(), Some("charliek"));
+        assert_eq!(full.ssh_port, 2022);
+        assert_eq!(
+            full.rc_bin.as_deref(),
+            Some("/opt/homebrew/bin/shed-machine-rc")
+        );
+        assert_eq!(
+            full.known_hosts.as_deref(),
+            Some("/Users/dev/.ssh/known_hosts")
+        );
+
+        // A present-but-EMPTY optional is absent, not `Some("")` — the default
+        // binary must still be used.
+        let partial = config.machine("mini2box").expect("mini2box");
+        assert_eq!(partial.host, "mini2box"); // host defaults to the entry name
+        assert_eq!(partial.user.as_deref(), Some("builder"));
+        assert_eq!(partial.ssh_port, 22);
+        assert_eq!(partial.rc_bin, None);
+        assert_eq!(partial.known_hosts, None);
+
+        // `bare: {}` → every default.
+        assert_eq!(
+            config.machine("bare"),
+            Some(&MachineEntry {
+                name: "bare".into(),
+                host: "bare".into(),
+                user: None,
+                ssh_port: 22,
+                rc_bin: None,
+                known_hosts: None,
+            })
+        );
+        assert_eq!(config.machine("nope"), None);
+    }
+
+    /// An old config (no `machines:` key at all) parses to an EMPTY machine list
+    /// — never an error, and never a phantom entry.
+    #[test]
+    fn machines_absent_is_empty_and_servers_are_unaffected() {
+        let config = ShedConfig::parse(
+            "\
+servers:
+    mini2:
+        host: mini2
+default_server: mini2
+",
+        );
+        assert!(config.machines.is_empty());
+        assert_eq!(config.servers.len(), 1);
     }
 
     /// The mtls half of the same fixture (plan 001 D6). Swift does not model

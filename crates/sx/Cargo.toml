@@ -5,7 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
-description = "sx — the Rust porcelain for RC agent sessions. This crate carries the engine-compat `sx rc *` surface (a wire-compatible sibling of the Go shed-machine-rc one-shot verbs, pinned by the tests/rc-parity differential harness); the porcelain verbs land in plan 009 C7."
+description = "sx — the Rust porcelain for RC agent sessions: the kickoff/observe verbs (agent, plan, ls, watch, attach, kill) over local tmux, native machines, and sheds, on top of the engine-compat `sx rc *` surface (a wire-compatible sibling of the Go shed-machine-rc one-shot verbs, pinned by the tests/rc-parity differential harness)."
 
 [[bin]]
 name = "sx"
@@ -18,6 +18,9 @@ workspace = true
 shed-core = { path = "../shed-core" }
 # The ported one-shot RC engine lives behind shed-app's non-default `rc` feature.
 shed-app = { path = "../shed-app", features = ["rc"] }
+# Deriving the hub's small response envelopes (`porcelain::hub`); every DTO that
+# crosses a shed-server or rc wire is already defined in shed-core.
+serde = { workspace = true }
 serde_json = { workspace = true }
 # `--prompt-b64` framing. Go's `base64.StdEncoding.DecodeString` requires padding
 # but IGNORES \r/\n and ACCEPTS non-canonical trailing bits — sx mirrors that via
@@ -25,9 +28,30 @@ serde_json = { workspace = true }
 # Already a workspace dependency in the lock tree
 # (shed-core uses it for CSR/PEM), so this adds no new transitive surface.
 base64 = { workspace = true }
+# `gethostname(2)` for the porcelain's default `<host>/<slug>` display name
+# (Go's `shortHostname`, the posture `sx agent` absorbs from the `claude` verb).
+# Already a direct dependency of `shed-app` (and therefore already in the lock
+# tree), so this pulls in nothing new; there is no std API for it.
+libc = "0.2"
+# The remote targets (`--on machine:` / `--on shed:`) drive `shed-app`'s async
+# `RcRunner`/`Backend`, and `sx watch` streams SSE — all of which need a reactor.
+# One lazily-built CURRENT-THREAD runtime per process (see `Deps::block_on`), so
+# a purely local `sx agent` never constructs one.
+tokio = { workspace = true }
+# The local/machine activity hub speaks plain HTTP + SSE on 127.0.0.1:1029, which
+# `shed-core`'s `Client` (a shed-SERVER protocol client: TLS pinning, control-token
+# FSM, mTLS) cannot address. reqwest is already in this workspace's lock tree with
+# these exact features via shed-core, so declaring it here adds ZERO new crates —
+# strictly less surface than growing shed-core a non-shed-server HTTP client.
+reqwest = { workspace = true }
+# `bytes_stream()` on the SSE response body (shed-core parses the frames).
+futures-util = { workspace = true }
 
 [dev-dependencies]
 # The engine's fake tmux runner (`rc_engine::fake::FakeTmux`), exposed by shed-app's
 # test-only `test-support` feature. A dev-dependency (resolver v2) so the feature is
 # enabled for `cargo test -p sx` and NEVER for the shipped binary.
 shed-app = { path = "../shed-app", features = ["rc", "test-support"] }
+# Implementing the `RcRunner` seam in the dispatch tests (a recording fake that
+# captures the ssh argv + stdin instead of spawning ssh).
+async-trait = { workspace = true }

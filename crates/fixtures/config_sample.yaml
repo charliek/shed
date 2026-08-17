@@ -11,6 +11,13 @@
 # ConfigParityTests keep passing byte-for-byte while the Rust parser asserts the
 # new fields — and `mini2`, which omits `auth_mode` entirely, pins the
 # absent-means-token rule.
+#
+# The `machines:` block (plan 009 §3.3) is the Rust-owned native-RC-host section:
+# a full entry (`localmac`), a defaults-only one (`mini2box` — host falls back to
+# the entry name, ssh_port to 22, every optional to absent), and an inline empty
+# map (`bare`). The Swift parser does not model the key at all and structurally
+# ignores it (unknown top-level keys are just another entry in `top`), so
+# ConfigParityTests keeps passing byte-for-byte on the SERVER assertions it owns.
 default_server: mini2
 servers:
     mini2:
@@ -30,4 +37,15 @@ servers:
         client_key_file: /Users/dev/.shed/creds/secure/client.key
         client_cert_expires_at: 2026-07-26T12:00:00Z
     minimal: {}
+machines:
+    localmac:
+        host: localhost
+        user: charliek
+        ssh_port: 2022
+        rc_bin: /opt/homebrew/bin/shed-machine-rc
+        known_hosts: /Users/dev/.ssh/known_hosts
+    mini2box:
+        user: builder
+        rc_bin:                      # present-but-empty -> absent (use the default)
+    bare: {}
 sheds: {}

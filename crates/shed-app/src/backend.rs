@@ -921,6 +921,7 @@ mod tests {
         let config = ShedConfig {
             servers: vec![server_entry("mock"), server_entry("down")],
             default_server: Some("mock".into()),
+            ..Default::default()
         };
         let unreachable: HashSet<String> = ["down".to_string()].into_iter().collect();
         let backend =
@@ -958,6 +959,7 @@ mod tests {
                 ..Default::default()
             }],
             default_server: Some("prod".into()),
+            ..Default::default()
         };
         let backend = Backend::from_config(&config, Some("http://mock"));
         // host-less → default "prod": ssh web@10.0.0.9 -p 2200, tmux-attaching "main".

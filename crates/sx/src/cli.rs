@@ -22,7 +22,7 @@
 //! unit-testable against a fake tmux runner with no process, no stdio and no
 //! wall-clock sleep — the same seam shape Go's `clirc.deps` provides.
 
-use std::cell::RefCell;
+use std::cell::{OnceCell, RefCell};
 use std::io::{Read, Write};
 use std::sync::Arc;
 use std::time::Duration;
@@ -36,7 +36,8 @@ use shed_app::rc_engine::plan::{plan_from_bytes, PLAN_MAX_BYTES};
 use shed_app::rc_engine::preseed;
 use shed_app::rc_engine::text::quote_go;
 use shed_app::rc_engine::tmux::TmuxRunner;
-use shed_core::rc::{RcCapabilities, RcKind};
+use shed_app::RcRunnerRef;
+use shed_core::rc::{RcCapabilities, RcKind, PERM_MODE_SKIP};
 
 use crate::args::{boolean, parse, value, ArgError, Parsed, Spec};
 
@@ -52,25 +53,13 @@ pub const PROG: &str = "sx";
 /// differ only by the one token the harness masks.
 pub const DEFAULT_CREATED_BY: &str = PROG;
 
-/// The generic full-bypass posture `--skip` expands to (Go's `rc.PermModeSkip`);
-/// the registry maps it per agent to that tool's real flag.
-const PERM_MODE_SKIP: &str = "skip";
-
 /// The binary whose `serve` verb backs the local activity hub. The hub is NOT
 /// ported (plan 009 §0) — on a machine it stays the Go daemon, so `sx`'s
 /// ensure-hub hook simply drives it when it is installed.
 const HUB_BIN: &str = "shed-machine-rc";
 
-const USAGE: &str = "\
-usage: sx <command> [flags]
-
-commands:
-  rc <subcommand>   the one-shot RC engine (create|list|capabilities|probe|
-                    accept-trust|prompt|kill|version) — wire-compatible with
-                    `shed-machine-rc <subcommand>`
-  version
-  help
-";
+/// The top-level usage — owned by [`crate::porcelain`], which knows every verb.
+const USAGE: &str = crate::porcelain::USAGE;
 
 const RC_USAGE: &str = "\
 usage: sx rc <command> [flags]
@@ -99,6 +88,8 @@ type HookFn<'a> = Box<dyn Fn() + 'a>;
 type SleepFn<'a> = Box<dyn Fn(Duration) + 'a>;
 /// The per-tool create-time preseed (`AgentSpec.Preseed`).
 type PreseedFn<'a> = Box<dyn Fn(&RcKind, &str, &dyn Fn(&str) -> String) -> Result<(), String> + 'a>;
+/// This machine's short hostname (the porcelain's default display-name prefix).
+type HostnameFn<'a> = Box<dyn Fn() -> String + 'a>;
 
 /// The side-effecting dependencies — real in [`Deps::production`], fakes in tests.
 pub struct Deps<'a> {
@@ -131,6 +122,17 @@ pub struct Deps<'a> {
     /// entirely — the same "absent hook" shape as `bin_probe`/`ensure_hub`, and
     /// what the dispatch tests want: a preseed WRITES to `$HOME`.
     pub preseed: Option<PreseedFn<'a>>,
+    /// The porcelain's REMOTE process seam (`ssh …`), shared with `shed-app`'s
+    /// `RcService` so a test can record argv + stdin without spawning ssh.
+    /// `None` builds the real [`TokioProcessRunner`] on first use.
+    pub remote: Option<RcRunnerRef>,
+    /// This machine's short hostname, for the default `<host>/<slug>` display
+    /// name. Injected so the name is deterministic under test.
+    pub hostname: Option<HostnameFn<'a>>,
+    /// The tokio runtime the remote/HTTP paths block on, built on first use —
+    /// a purely local `sx agent` never constructs one. `pub` only so a test in a
+    /// sibling module can build a `Deps` literal; nothing reads it directly.
+    pub runtime: OnceCell<tokio::runtime::Runtime>,
 }
 
 impl<'a> Deps<'a> {
@@ -149,7 +151,47 @@ impl<'a> Deps<'a> {
             settle: None,
             probe: None,
             preseed: Some(Box::new(preseed::dispatch)),
+            remote: None,
+            hostname: Some(Box::new(short_hostname)),
+            runtime: OnceCell::new(),
         }
+    }
+
+    /// Read one environment variable through the injected reader.
+    pub fn env(&self, key: &str) -> String {
+        (self.env)(key)
+    }
+
+    /// This machine's short hostname (`""` when unknown), the default display
+    /// name's prefix.
+    pub fn hostname(&self) -> String {
+        match &self.hostname {
+            Some(f) => f(),
+            None => String::new(),
+        }
+    }
+
+    /// The remote (ssh) process seam.
+    pub fn remote_runner(&self) -> RcRunnerRef {
+        match &self.remote {
+            Some(runner) => Arc::clone(runner),
+            None => crate::porcelain::default_remote_runner(),
+        }
+    }
+
+    /// Block on an async operation using this process's single lazily-built
+    /// runtime. A current-thread runtime is deliberate: `sx` runs ONE remote op
+    /// (or one SSE stream) at a time, and a multi-thread pool would cost a
+    /// thread-per-core spawn on every invocation of a CLI whose whole job is to
+    /// be cheap enough for a skill to call in a loop.
+    pub fn block_on<F: std::future::Future>(&self, fut: F) -> F::Output {
+        let rt = self.runtime.get_or_init(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("build a current-thread tokio runtime")
+        });
+        rt.block_on(fut)
     }
 
     /// The capability probe pair (`effectiveProbe`/`effectiveInstalled`,
@@ -168,18 +210,18 @@ impl<'a> Deps<'a> {
     /// The capabilities payload (`rc.BuildCapabilities(...)`), shared by
     /// `capabilities` and the `list` envelope — Go assembles it the same way in
     /// both places, one guest exec feeding both.
-    fn capabilities(&self) -> RcCapabilities {
+    pub fn capabilities(&self) -> RcCapabilities {
         let (probe, installed) = self.probes();
         build_capabilities(&probe, installed.as_ref())
     }
 
-    fn write_out(&self, text: &str) {
+    pub fn write_out(&self, text: &str) {
         let mut w = self.stdout.borrow_mut();
         let _ = w.write_all(text.as_bytes());
         let _ = w.flush();
     }
 
-    fn write_err(&self, line: &str) {
+    pub fn write_err(&self, line: &str) {
         let mut w = self.stderr.borrow_mut();
         let _ = w.write_all(line.as_bytes());
         let _ = w.write_all(b"\n");
@@ -188,7 +230,7 @@ impl<'a> Deps<'a> {
 
     /// An engine over the injected seams for a create with this `interactive`
     /// posture (the bin probe MUST match it — see `real_bin_probe`'s doc).
-    fn engine(&self, interactive: bool) -> Engine<'_> {
+    pub fn engine(&self, interactive: bool) -> Engine<'_> {
         let mut engine = Engine::new(self.runner)
             .with_env(&*self.env)
             .with_warn(move |msg| self.write_err(&format!("{PROG}: {msg}")));
@@ -216,12 +258,47 @@ pub fn run(deps: &Deps, args: &[String]) -> i32 {
     let Some((cmd, rest)) = args.split_first() else {
         return print_usage(deps, USAGE, 2);
     };
+    // The porcelain verbs get first refusal; `rc`/`version`/`help` are the
+    // remainder, so a future verb can never silently shadow the engine-compat
+    // namespace (`porcelain::dispatch` returns None for anything it doesn't own).
+    if let Some(code) = crate::porcelain::dispatch(deps, cmd, rest) {
+        return code;
+    }
     match cmd.as_str() {
         "rc" => run_rc(deps, rest),
         "version" | "--version" | "-v" => print_version(deps),
         "help" | "-h" | "--help" => print_usage(deps, USAGE, 0),
         other => unknown_command(deps, other, USAGE),
     }
+}
+
+/// This machine's hostname truncated at the first dot (`""` on error) — Go's
+/// `shortHostname` (`clirc.go:736`), which the absorbed `claude` verb used for
+/// the same default display name.
+fn short_hostname() -> String {
+    let raw = match hostname_raw() {
+        Some(h) => h,
+        None => return String::new(),
+    };
+    match raw.find('.') {
+        // `i > 0` matches Go exactly: a leading dot is not a truncation point.
+        Some(i) if i > 0 => raw[..i].to_string(),
+        _ => raw,
+    }
+}
+
+/// `gethostname(2)` without a dependency: the POSIX name of this host.
+fn hostname_raw() -> Option<String> {
+    // SAFETY: `buf` is a live, correctly-sized allocation for the whole call and
+    // `gethostname` writes at most `len` bytes into it.
+    let mut buf = vec![0u8; 256];
+    let rc = unsafe { libc::gethostname(buf.as_mut_ptr().cast(), buf.len()) };
+    if rc != 0 {
+        return None;
+    }
+    let end = buf.iter().position(|b| *b == 0).unwrap_or(buf.len());
+    buf.truncate(end);
+    String::from_utf8(buf).ok().filter(|s| !s.is_empty())
 }
 
 /// The `sx rc <subcommand>` namespace — the engine-compat surface.
