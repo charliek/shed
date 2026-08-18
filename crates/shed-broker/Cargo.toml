@@ -15,7 +15,11 @@ workspace = true
 
 [dependencies]
 serde = { workspace = true }
-serde_json = { workspace = true }
+# `raw_value` (feature-only, no new deps): rc_hub's folds keep tool-input
+# payloads as raw bytes so their compact-JSON detail rendering preserves the
+# producer's key order, exactly like Go's json.Compact — a decoded Value would
+# re-sort object keys and diverge from the Go hub's feed rows.
+serde_json = { workspace = true, features = ["raw_value"] }
 thiserror = { workspace = true }
 # net (UnixListener/UnixStream) + io-util (AsyncWriteExt/BufReader) + sync
 # (mpsc/oneshot/watch) + process (the SSH-bootstrap minter shells `ssh` via

@@ -1,9 +1,8 @@
 //! The per-session message feed — a port of `internal/ext/rc/hub_messages.go`
-//! (the ring, the sanitizers, and the feed wire vocabulary), plus the two
-//! text-hygiene helpers it leans on from `activity.go` (the ANSI-escape
-//! stripper and the control-character filter). Still Go-only: `trimFeedText`
-//! (`hub_messages.go:348`) — a producer helper that arrives with the folds
-//! (H5).
+//! (the ring, the sanitizers, the feed wire vocabulary, and the producer-side
+//! `trimFeedText`), plus the text-hygiene helpers it leans on from
+//! `activity.go` (the ANSI-escape stripper, the control-character filter, and
+//! the folds' `SanitizeLastMessage` preview sanitizer).
 //!
 //! These are the strict PRODUCER-side wire shapes; the tolerant client-side
 //! twins live in `shed_core::rc` (`RcFeedTool`/`RcFeedApproval`/
@@ -343,9 +342,17 @@ pub struct HubMessagesResponse {
     pub truncated: bool,
 }
 
-/// Go-nil-slice tolerance: decode an explicit `null` as the default (the local
-/// twin of `shed_core::models::null_default`, which is crate-private there).
-fn null_default<'de, D, T>(d: D) -> Result<T, D::Error>
+/// Go-null tolerance: decode an explicit `null` as the default (the local twin
+/// of `shed_core::models::null_default`, which is crate-private there).
+///
+/// This is THE fold-side tolerance shim (H5 review finding, HIGH): Go's
+/// `json.Unmarshal` treats `null` into a string/slice field as a NO-OP with no
+/// error, so a producer line carrying `"stop_reason":null` (42k+ occurrences
+/// in real claude transcripts) still folds — while a bare serde `String` field
+/// treats the same `null` as a type error and kills the whole line. Every
+/// decoded string/Vec field on the fold envelopes rides this. A genuinely
+/// WRONG type (a number where a string belongs) still errors, exactly like Go.
+pub(crate) fn null_default<'de, D, T>(d: D) -> Result<T, D::Error>
 where
     D: serde::Deserializer<'de>,
     T: Default + Deserialize<'de>,
@@ -429,6 +436,39 @@ fn truncate_bytes(s: &str, mut n: usize) -> &str {
         n -= 1; // back up to a char boundary so a multi-byte codepoint is never split
     }
     &s[..n]
+}
+
+/// Bounds a sanitized last-message preview (`maxLastMessageRunes`,
+/// `activity.go:72`). 200 runes is a one-to-two-line preview on a phone —
+/// enough to recognize the message, small enough to keep listing/SSE payloads
+/// tiny.
+const MAX_LAST_MESSAGE_RUNES: usize = 200;
+
+/// Turns raw agent/JSONL text into a safe, compact one-line preview
+/// (`SanitizeLastMessage`, `activity.go:95`): strip ANSI escape sequences,
+/// drop remaining control characters (C0 except whitespace, DEL, and the C1
+/// range — so a smuggled CSI can't survive), collapse every run of whitespace
+/// to a single space, trim, and truncate to [`MAX_LAST_MESSAGE_RUNES`] on a
+/// char boundary (never mid-codepoint). The result is plain, single-line,
+/// bounded. Every fold's `last_message` runs through this.
+pub(crate) fn sanitize_last_message(s: &str) -> String {
+    let s = ANSI_ESCAPE_RE.replace_all(s, "");
+    let s = strip_non_whitespace_controls(&s);
+    // Go's strings.Fields splits on Unicode whitespace and rejoins with a
+    // single ASCII space — split_whitespace is the same set (char::is_whitespace
+    // == unicode.IsSpace); collapse + trim in one step.
+    let s = s.split_whitespace().collect::<Vec<_>>().join(" ");
+    match s.char_indices().nth(MAX_LAST_MESSAGE_RUNES) {
+        Some((byte_idx, _)) => s[..byte_idx].to_string(),
+        None => s,
+    }
+}
+
+/// Drops leading/trailing whitespace on a captured message before it enters
+/// the ring — the sanitizer keeps internal newlines; producers just tidy the
+/// ends (`trimFeedText`, `hub_messages.go:348`).
+pub(crate) fn trim_feed_text(s: &str) -> &str {
+    s.trim_matches([' ', '\t', '\n', '\r'])
 }
 
 #[cfg(test)]
@@ -705,6 +745,111 @@ mod tests {
 
         // An ODD cap against 2-byte codepoints forces the boundary back-up arm.
         assert_eq!(truncate_bytes("ééé", 3), "é");
+    }
+
+    // Mirrors TestSanitizeLastMessage (activity_test.go:9) — the full strip +
+    // collapse table.
+    #[test]
+    fn sanitize_last_message_table() {
+        let cases: [(&str, &str, &str); 18] = [
+            ("plain passes through", "hello world", "hello world"),
+            (
+                "collapses runs of whitespace",
+                "hello   \t\n  world",
+                "hello world",
+            ),
+            (
+                "trims leading and trailing whitespace",
+                "  \tpadded\n ",
+                "padded",
+            ),
+            (
+                "strips CSI color codes",
+                "\x1b[31mred\x1b[0m and \x1b[1;32mgreen\x1b[0m",
+                "red and green",
+            ),
+            (
+                "strips CSI with colon params (ISO 8613-6 truecolor)",
+                "\x1b[38:2:255:0:0mred\x1b[0m",
+                "red",
+            ),
+            (
+                "strips CSI with > private param",
+                "\x1b[>4;2mtext\x1b[0m",
+                "text",
+            ),
+            ("strips CSI with = private param", "\x1b[=3htext", "text"),
+            (
+                "strips OSC hyperlink (BEL-terminated)",
+                "\x1b]8;;https://example.com\x07link text\x1b]8;;\x07",
+                "link text",
+            ),
+            (
+                "strips OSC (ST-terminated)",
+                "\x1b]0;window title\x1b\\body",
+                "body",
+            ),
+            (
+                "strips unterminated OSC hyperlink (chunk-cut capture)",
+                "before \x1b]8;;https://example.com/truncat",
+                "before",
+            ),
+            (
+                "strips lone two-byte escape",
+                "before\x1bMafter",
+                "beforeafter",
+            ),
+            ("drops NUL and BEL control chars", "a\x00b\x07c", "abc"),
+            ("drops DEL", "x\x7fy", "xy"),
+            ("drops C1 controls (8-bit CSI)", "a\u{9b}c", "ac"),
+            (
+                "keeps multibyte content intact",
+                "café résumé — 日本語",
+                "café résumé — 日本語",
+            ),
+            (
+                "newline between words collapses to space",
+                "line one\nline two",
+                "line one line two",
+            ),
+            ("empty stays empty", "", ""),
+            ("whitespace-only becomes empty", "   \n\t  ", ""),
+        ];
+        for (name, input, want) in cases {
+            assert_eq!(sanitize_last_message(input), want, "{name}");
+        }
+    }
+
+    // Mirrors TestSanitizeLastMessageTruncatesOnRuneBoundary
+    // (activity_test.go:47).
+    #[test]
+    fn sanitize_last_message_truncates_on_char_boundary() {
+        // ascii truncates to 200 runes.
+        assert_eq!(
+            sanitize_last_message(&"a".repeat(250)).chars().count(),
+            MAX_LAST_MESSAGE_RUNES
+        );
+        // multibyte truncates on a codepoint boundary (never mid-rune).
+        let got = sanitize_last_message(&"世".repeat(250));
+        assert_eq!(got.chars().count(), MAX_LAST_MESSAGE_RUNES);
+        assert_eq!(got.len(), MAX_LAST_MESSAGE_RUNES * 3, "200 3-byte runes");
+        // a run at exactly 200 runes is unchanged.
+        let exact = "x".repeat(MAX_LAST_MESSAGE_RUNES);
+        assert_eq!(sanitize_last_message(&exact), exact);
+        // escape sequences do not count toward the length budget.
+        let body = "z".repeat(MAX_LAST_MESSAGE_RUNES);
+        assert_eq!(
+            sanitize_last_message(&format!("\x1b[31m{body}\x1b[0m")),
+            body
+        );
+    }
+
+    #[test]
+    fn trim_feed_text_trims_ends_only() {
+        assert_eq!(
+            trim_feed_text(" \t\na body\nkeeps\ninner\n \r"),
+            "a body\nkeeps\ninner"
+        );
     }
 
     // The Go hub's EMPTY page marshals `messages:null` (nil slice, no

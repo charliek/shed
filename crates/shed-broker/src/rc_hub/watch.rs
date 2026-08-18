@@ -12,9 +12,12 @@
 //! session: a fresh, correlated watcher wins; a broken/absent one falls back
 //! to stability so activity never goes dark.
 //!
+//! From H5 it also carries the fold contracts ([`ActivityFold`] /
+//! [`MessageProducer`] — Go's `activityFold`/`messageProducer` interfaces,
+//! `watch.go:73`/`107`) and `listJSONLUnder`, consumed by the per-kind folds in
+//! [`super::watch_claude`] / [`super::watch_codex`] / [`super::watch_cursor`].
 //! Still Go-only until their commits: `fileWatcher` + `fsNudger` (H7 —
-//! transports), the per-kind folds + `correlateCodex`/`correlateClaude`
-//! (H5/H6), `listJSONLUnder` (H5, with its correlate consumers).
+//! transports), the opencode fold (H6) and its SSE transport (H8).
 
 use std::path::Path;
 use std::time::Duration;
@@ -23,6 +26,258 @@ use chrono::{DateTime, Utc};
 use shed_core::rc::{RcActivity, RcKind};
 use shed_core::rc_agents::{has_control_chars, parse_env, ENV_AGENT_SESSION, ENV_OPENCODE_PORT};
 use shed_rc_engine::tmux::Tmux;
+
+use super::messages::FeedMessage;
+
+/// Folds a kind's parsed JSONL line stream into a live activity verdict
+/// (`activityFold`, `watch.go:73`). Implementations hold cumulative state
+/// across `apply_line` calls (turn boundaries, pending tool calls, the last
+/// message) and are NOT safe for concurrent use — the owning watcher
+/// serializes access.
+pub trait ActivityFold {
+    /// Folds one raw JSONL line, returning true when it advanced meaningful
+    /// state (an activity-relevant event). Irrelevant/unparseable lines return
+    /// false and leave state untouched (tolerant parsing).
+    fn apply_line(&mut self, line: &[u8]) -> bool;
+    /// Clears all state (the tailer reported a truncation/rotation).
+    fn reset(&mut self);
+    /// Tells the fold a record was LOST mid-stream (the tailer skipped an
+    /// oversized line). Any state that depends on having seen every record —
+    /// pending tool-call ids awaiting their output — must be dropped, leaving
+    /// the verdict to coarser signals (turn boundaries) until the next turn
+    /// re-establishes it.
+    fn note_gap(&mut self);
+    /// The current verdict: [`RcActivity::Unknown`] until a confirming event.
+    fn activity(&self) -> RcActivity;
+    /// A sanitized preview of the most recent agent message (`""` if none).
+    fn last_message(&self) -> String;
+    /// Whether the verdict is a terminal waiting state (needs_input/idle) —
+    /// authoritative even when the file has gone quiet.
+    fn settled(&self) -> bool;
+}
+
+/// A fold that ALSO produces a normalized message feed (`messageProducer`,
+/// `watch.go:107`) — codex, opencode and cursor; claude feeds activity only in
+/// this phase. Every watcher drains it on each refresh. It is a separate trait
+/// from [`ActivityFold`] because the cursor fold produces a feed without being
+/// an `ActivityFold` at all (its unit is a hook EVENT, not a JSONL line).
+pub trait MessageProducer {
+    /// Returns and clears the feed messages produced since the last drain.
+    fn drain_messages(&mut self) -> Vec<FeedMessage>;
+}
+
+/// Walks `root` and returns every `*.jsonl` path, tolerating per-directory
+/// permission errors (a skipped subdir does not abort the walk) —
+/// `listJSONLUnder`, `watch.go:420`. `matches` filters basenames.
+pub fn list_jsonl_under(root: &str, matches: impl Fn(&str) -> bool) -> Vec<String> {
+    let mut out = Vec::new();
+    // Go's filepath.WalkDir LSTATs the root: a symlinked root is not a
+    // directory and yields nothing (fs::read_dir would happily follow it).
+    if !std::fs::symlink_metadata(root).is_ok_and(|m| m.is_dir()) {
+        return out;
+    }
+    walk_jsonl(Path::new(root), &matches, &mut out);
+    out
+}
+
+fn walk_jsonl(dir: &Path, matches: &impl Fn(&str) -> bool, out: &mut Vec<String>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return; // permission/transient on this dir → skip it, keep walking
+    };
+    // Sorted per directory, like Go's WalkDir: the result order feeds
+    // correlate_codex's exact-id scan (first match wins), so iteration order
+    // is contract — fs::read_dir alone is platform-arbitrary (H5 review).
+    let mut entries: Vec<_> = entries.flatten().collect();
+    entries.sort_by_key(std::fs::DirEntry::file_name);
+    for entry in entries {
+        let path = entry.path();
+        let Ok(ft) = entry.file_type() else { continue };
+        if ft.is_dir() {
+            walk_jsonl(&path, matches, out);
+            continue;
+        }
+        let Some(base) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        // ends_with mirrors Go's filepath.Ext check, dotfiles included
+        // (`filepath.Ext(".jsonl") == ".jsonl"`; Path::extension() sees none).
+        if base.ends_with(".jsonl") && matches(base) {
+            if let Some(p) = path.to_str() {
+                out.push(p.to_string());
+            }
+        }
+    }
+}
+
+/// Renders a raw JSON value as compact (whitespace-stripped) text — used for a
+/// tool_use's input detail (`compactJSON`, `watch_opencode.go:932`; consumed
+/// by the cursor fold now, the opencode fold at H6). Mirrors Go's
+/// `json.Compact`: the ORIGINAL bytes minus inter-token whitespace — no
+/// reordering, no number reformatting — falling back to the trimmed raw text
+/// when the value is not valid JSON.
+pub(crate) fn compact_json(raw: &str) -> String {
+    if raw.is_empty() {
+        return String::new();
+    }
+    if serde_json::from_str::<serde::de::IgnoredAny>(raw).is_err() {
+        return raw.trim().to_string();
+    }
+    // Strip whitespace outside string literals, byte-preserving inside them.
+    let mut out = String::with_capacity(raw.len());
+    let mut in_str = false;
+    let mut escaped = false;
+    for c in raw.chars() {
+        if in_str {
+            out.push(c);
+            if escaped {
+                escaped = false;
+            } else if c == '\\' {
+                escaped = true;
+            } else if c == '"' {
+                in_str = false;
+            }
+            continue;
+        }
+        match c {
+            '"' => {
+                in_str = true;
+                out.push(c);
+            }
+            ' ' | '\t' | '\n' | '\r' => {}
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+/// Captures a raw field VERBATIM, `null` included (`Option<Box<RawValue>>`'s
+/// stock decode maps `null` to `None`, but Go's `json.RawMessage` holds the
+/// four bytes `null` and `compactJSON` renders them — a tool_input of `null`
+/// must produce the detail `"null"`, not `""`; H5 review finding).
+pub(crate) fn raw_opt<'de, D>(d: D) -> Result<Option<Box<serde_json::value::RawValue>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    serde::Deserialize::deserialize(d).map(Some)
+}
+
+/// Captures any JSON value — `null` included — as `Some` (a stock
+/// `Option<Value>` maps an explicit `null` to `None`, re-conflating it with an
+/// absent field; Go's RawMessage keeps the two distinct).
+pub(crate) fn value_opt<'de, D>(d: D) -> Result<Option<serde_json::Value>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    serde::Deserialize::deserialize(d).map(Some)
+}
+
+/// Decodes a nested OBJECT field with Go `encoding/json` semantics (H5 review
+/// RES-3): an object decodes, `null` (or absent, via `#[serde(default)]`) is
+/// `None`, and ANY other JSON shape errors — serde derives would otherwise
+/// accept the positional seq/tuple form (`["user",…]`) that Go rejects.
+/// Routed through a raw capture so `RawValue` fields inside `T` keep their
+/// original bytes.
+pub(crate) fn object_opt<'de, D, T>(d: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::de::DeserializeOwned,
+{
+    let raw: Box<serde_json::value::RawValue> = serde::Deserialize::deserialize(d)?;
+    let s = raw.get().trim();
+    if s.starts_with('{') {
+        return serde_json::from_str::<T>(s)
+            .map(Some)
+            .map_err(serde::de::Error::custom);
+    }
+    if s == "null" {
+        return Ok(None);
+    }
+    Err(serde::de::Error::custom("expected a JSON object"))
+}
+
+/// Decodes an array-of-objects field with Go semantics (H5 review RES-3):
+/// `null` is the nil slice (empty), every element must be an OBJECT (Go's
+/// whole-array unmarshal errors on a positional-form element where serde
+/// derives would accept it), and a non-array errors. Raw-routed so `RawValue`
+/// fields inside `T` keep their bytes.
+pub(crate) fn vec_objects<'de, D, T>(d: D) -> Result<Vec<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::de::DeserializeOwned,
+{
+    let raws: Option<Vec<Box<serde_json::value::RawValue>>> = serde::Deserialize::deserialize(d)?;
+    let Some(raws) = raws else {
+        return Ok(Vec::new());
+    };
+    raws.into_iter()
+        .map(|r| {
+            let s = r.get().trim();
+            if !s.starts_with('{') {
+                return Err(serde::de::Error::custom("expected a JSON object element"));
+            }
+            serde_json::from_str::<T>(s).map_err(serde::de::Error::custom)
+        })
+        .collect()
+}
+
+/// The first non-whitespace byte of a JSON document (Go's decoder skips
+/// exactly space/tab/newline/CR before the value). The folds gate their
+/// top-level struct decodes on `Some(b'{')` — Go's `Unmarshal` into a struct
+/// rejects any other shape (and a top-level `null` no-ops into the zero
+/// value, which every top-level call site's zero value routes to the same
+/// "not folded" outcome).
+pub(crate) fn json_first_byte(line: &[u8]) -> Option<u8> {
+    line.iter()
+        .copied()
+        .find(|b| !matches!(b, b' ' | b'\t' | b'\n' | b'\r'))
+}
+
+/// `firstNonEmpty` (`ops.go:480`) for the two-candidate case every fold call
+/// site has.
+pub(crate) fn first_non_empty<'a>(a: &'a str, b: &'a str) -> &'a str {
+    if !a.is_empty() {
+        a
+    } else {
+        b
+    }
+}
+
+/// Test-only helpers shared by the per-kind fold test mods (the Go suite gets
+/// these from being one package; here they are the one local home so the fold
+/// test mods stay pure scenario code).
+#[cfg(test)]
+pub(crate) mod test_support {
+    use chrono::{DateTime, TimeZone, Utc};
+
+    /// A `GetEnv` answering HOME from a tempdir and `""` for everything else —
+    /// the Go suite's `t.Setenv("HOME", dir)` fixture.
+    pub(crate) fn home_getenv(home: &std::path::Path) -> impl Fn(&str) -> String {
+        let home = home.to_str().expect("utf-8 tempdir").to_string();
+        move |k: &str| {
+            if k == "HOME" {
+                home.clone()
+            } else {
+                String::new()
+            }
+        }
+    }
+
+    /// The non-blank lines of a shared JSONL fixture (`crates/fixtures/jsonl`).
+    pub(crate) fn fixture_lines(name: &str) -> Vec<Vec<u8>> {
+        let path = format!("{}/../fixtures/jsonl/{name}", env!("CARGO_MANIFEST_DIR"));
+        let data = std::fs::read(&path).expect("fixture readable");
+        data.split(|&b| b == b'\n')
+            .filter(|l| !l.iter().all(u8::is_ascii_whitespace))
+            .map(<[u8]>::to_vec)
+            .collect()
+    }
+
+    /// The correlation fixtures' reference created-at (`watch_test.go`'s
+    /// `base`).
+    pub(crate) fn base_time() -> DateTime<Utc> {
+        Utc.with_ymd_and_hms(2026, 7, 11, 17, 0, 0).unwrap()
+    }
+}
 
 /// Bounds how long a correlated watcher's non-settled, non-working activity is
 /// trusted after its last folded event (`watcherFreshWindow`, `watch.go:53`).
