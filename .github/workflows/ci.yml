@@ -599,7 +599,27 @@ jobs:
       # tmux: NOT preinstalled on GitHub runners, and it is the engine's hard
       # dependency on both sides.
       - name: C toolchain + tmux
-        run: sudo apt-get update && sudo apt-get install -y build-essential tmux
+        # Bounded + retried on purpose. A stalled apt mirror (the Azure mirror
+        # unreachable, archive.ubuntu.com hanging mid-fetch) once produced ZERO
+        # output for 29 minutes and ate this job's whole 30-minute budget, so a
+        # 2-minute infrastructure blip cancelled the job and read like a harness
+        # hang. `timeout` bounds each attempt (a hang, not a failure, is the
+        # observed shape — a bare retry loop would never re-enter), and the
+        # step cap is the backstop.
+        timeout-minutes: 8
+        run: |
+          set -euo pipefail
+          ok=""
+          for attempt in 1 2 3; do
+            if sudo timeout 120 apt-get update; then ok=1; break; fi
+            echo "apt-get update stalled or failed (attempt ${attempt}/3); retrying" >&2
+            sleep 10
+          done
+          if [ -z "${ok}" ]; then
+            echo "::error::apt-get update failed 3x — mirror outage?"
+            exit 1
+          fi
+          sudo timeout 300 apt-get install -y build-essential tmux
       - name: Assert tmux >= 3.2
         # `new-session -e` (how BOTH implementations stamp session metadata)
         # arrived in tmux 3.2. The harness asserts this too, but only after
