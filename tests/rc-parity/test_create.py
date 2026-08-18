@@ -115,3 +115,34 @@ def test_create_opencode_inner_command_argv(differential, isolated):
         return mask_argv(leg.wait_for_agent_argv(4), str(leg.home))
 
     differential(scenario)
+
+
+CURSOR_SLUG = "bb3333"
+
+
+def test_create_cursor_inner_command_argv(differential, isolated):
+    """cursor's spec-owned base flag: the agent must be launched with `--trust`
+    (the workspace-trust skip both implementations append BEFORE any permission
+    flags). This is the only harness surface that covers the base-flag mirror —
+    the DTO and env cells cannot see the inner command, so without this cell a
+    one-sided change to the flag would still read 51/51 (patch-cluster review
+    finding)."""
+
+    def scenario(impl):
+        leg = isolated(impl)
+        res = leg.run(
+            "create",
+            "--kind",
+            "cursor",
+            "--slug",
+            CURSOR_SLUG,
+            "--name",
+            "parity-cursor",
+        )
+        assert res.returncode == 0, f"{impl}: exit {res.returncode}: {res.stderr}"
+        leg.wait_for_session(f"rc-{CURSOR_SLUG}")
+        # 1 element: `--trust` (bare kickoff, no permission mode, no port).
+        return mask_argv(leg.wait_for_agent_argv(1), str(leg.home))
+
+    argv = differential(scenario)
+    assert argv == ["--trust"], argv
