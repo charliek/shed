@@ -143,10 +143,16 @@ build_prereqs() {
     echo ""
     echo "=== Building shed-agent binary (linux/arm64) ==="
     cd "$PROJECT_ROOT"
-    GOOS=linux GOARCH=arm64 go build -o "$VZ_DIR/shed-agent" ./cmd/shed-agent
+    # Same stamps + derivation as stage-guest-binaries.sh (env-overridable;
+    # commit-date BuildDate keeps the BuildKit bind-mount layer cache stable).
+    GV="${VERSION:-$(git describe --tags --always --dirty 2>/dev/null || echo dev)}"
+    GC="${GIT_COMMIT:-$(git rev-parse --short HEAD 2>/dev/null || echo unknown)}"
+    GD="${BUILD_DATE:-$(git show -s --format=%cI HEAD 2>/dev/null || echo unknown)}"
+    GUEST_LDFLAGS="-X github.com/charliek/shed/internal/version.Version=$GV -X github.com/charliek/shed/internal/version.GitCommit=$GC -X github.com/charliek/shed/internal/version.BuildDate=$GD"
+    GOOS=linux GOARCH=arm64 go build -ldflags "$GUEST_LDFLAGS" -o "$VZ_DIR/shed-agent" ./cmd/shed-agent
 
     echo "=== Building shed-firstboot binary (linux/arm64) ==="
-    GOOS=linux GOARCH=arm64 go build -o "$VZ_DIR/shed-firstboot" ./cmd/shed-firstboot
+    GOOS=linux GOARCH=arm64 go build -ldflags "$GUEST_LDFLAGS" -o "$VZ_DIR/shed-firstboot" ./cmd/shed-firstboot
 
     echo "=== Staging guest extension binaries + /etc overlay (linux/arm64) ==="
     "$SCRIPT_DIR/stage-guest-binaries.sh" "$VZ_DIR" arm64

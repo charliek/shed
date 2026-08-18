@@ -295,7 +295,12 @@ jobs:
           GOOS=linux GOARCH=arm64 go build -ldflags "$LDFLAGS" -o vz/shed-agent ./cmd/shed-agent
           GOOS=linux GOARCH=arm64 go build -ldflags "$LDFLAGS" -o vz/shed-firstboot ./cmd/shed-firstboot
           # Guest extension binaries + /etc overlay staged into the same context.
-          ./scripts/stage-guest-binaries.sh vz arm64
+          # Same stamps as shed-agent above — bare version, not git-describe's
+          # v-prefixed form (one rootfs, one version convention).
+          VERSION="${{ steps.version.outputs.bare }}" \
+          GIT_COMMIT="${{ steps.version.outputs.sha }}" \
+          BUILD_DATE="${{ steps.version.outputs.date }}" \
+            ./scripts/stage-guest-binaries.sh vz arm64
           # Host-side CLI used to drive OCI conversion + push.
           mkdir -p bin
           go build -ldflags "$LDFLAGS" -o bin/shed ./cmd/shed
@@ -427,7 +432,10 @@ jobs:
           GOOS=linux GOARCH=amd64 go build -ldflags "$LDFLAGS" -o firecracker/shed-agent ./cmd/shed-agent
           GOOS=linux GOARCH=amd64 go build -ldflags "$LDFLAGS" -o firecracker/shed-firstboot ./cmd/shed-firstboot
           # Guest extension binaries + /etc overlay staged into the same context.
-          ./scripts/stage-guest-binaries.sh firecracker amd64
+          VERSION="${{ steps.version.outputs.bare }}" \
+          GIT_COMMIT="${{ steps.version.outputs.sha }}" \
+          BUILD_DATE="${{ steps.version.outputs.date }}" \
+            ./scripts/stage-guest-binaries.sh firecracker amd64
           mkdir -p bin
           go build -ldflags "$LDFLAGS" -o bin/shed ./cmd/shed
 
