@@ -1,0 +1,26 @@
+  Cursor Agent
+  v2026.08.11-e8db854
+  Tip: Use /run-everything to skip all approvals.
+
+
+  what happens when cursor asks me to approve a command?
+
+
+  When the allowlist prompt appears it asks Run this command? and offers three
+  choices. Run (once) allows just that invocation, Run Everything stops the
+  prompting for the rest of the session, and Skip & tell the agent what to do
+  instead refuses it and hands control back to me:
+
+  - Run (once)
+  - Run Everything
+  - Skip & tell the agent what to do instead
+
+  A hook can also request one, which shows as Hook requested approval: followed
+  by the hook's own message.
+
+
+  → Add a follow-up
+
+
+  Auto · 4.2%
+  ~

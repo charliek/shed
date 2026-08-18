@@ -1,0 +1,106 @@
+{
+  "list": {
+    "capabilities": {
+      "agents": {
+        "claude": {
+          "installed": true,
+          "version": "<version>"
+        },
+        "codex": {
+          "installed": true,
+          "version": "<version>"
+        },
+        "cursor": {
+          "installed": true,
+          "version": "<version>"
+        },
+        "opencode": {
+          "installed": true,
+          "version": "<version>"
+        }
+      },
+      "features": [
+        "generic-perm",
+        "plan-stdin",
+        "prompt-b64",
+        "serve",
+        "activity",
+        "messages",
+        "contract-v2"
+      ],
+      "kind_features": {
+        "claude-rc": {
+          "approvals": "tui",
+          "attach": "tmux",
+          "feed": "activity",
+          "interrupt": false,
+          "post_input": true
+        },
+        "codex": {
+          "approvals": "tui",
+          "attach": "tmux",
+          "feed": "messages",
+          "input": "gated",
+          "interrupt": false,
+          "post_input": true,
+          "watch": true
+        },
+        "cursor": {
+          "approvals": "tui",
+          "attach": "tmux",
+          "feed": "messages",
+          "input": "gated",
+          "interrupt": false,
+          "post_input": true,
+          "watch": true
+        },
+        "opencode": {
+          "approvals": "remote",
+          "attach": "tmux",
+          "feed": "messages",
+          "input": "turn",
+          "interrupt": true,
+          "post_input": true,
+          "watch": true
+        }
+      },
+      "kinds": [
+        "claude-broker",
+        "claude-rc",
+        "codex",
+        "opencode",
+        "cursor",
+        "shell"
+      ],
+      "rc_version": 4
+    },
+    "rc_sessions": [
+      {
+        "created_at": "<ts>",
+        "created_by": "<prog>",
+        "display_name": "interop-io1111",
+        "id": "<id>",
+        "kind": "codex",
+        "lane": "tui",
+        "managed": true,
+        "slug": "io1111",
+        "state": "ready",
+        "tmux_session": "rc-io1111",
+        "workdir": "<home>"
+      }
+    ]
+  },
+  "probe": {
+    "created_at": "<ts>",
+    "created_by": "<prog>",
+    "display_name": "interop-io1111",
+    "id": "<id>",
+    "kind": "codex",
+    "lane": "tui",
+    "managed": true,
+    "slug": "io1111",
+    "state": "ready",
+    "tmux_session": "rc-io1111",
+    "workdir": "<home>"
+  }
+}

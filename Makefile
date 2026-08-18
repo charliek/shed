@@ -1,4 +1,4 @@
-.PHONY: build build-cli build-server build-egress-proxy build-agent build-firstboot build-machine-rc build-tools build-fc-remote-server test test-integration test-host-agent-diff test-integration-dev test-integration-dev-fc dev-server-up dev-server-down dev-server-status dev-server-logs dev-server-restart dev-server-up-fc dev-server-down-fc dev-server-status-fc dev-server-logs-fc dev-server-restart-fc release clean dev-server dev-cli check check-kernel-pin coverage lint-all docs docs-serve firecracker-rootfs download-firecracker vz-rootfs vz-rootfs-base vz-rootfs-all
+.PHONY: build build-cli build-server build-egress-proxy build-agent build-firstboot build-machine-rc build-tools build-fc-remote-server test test-integration test-host-agent-diff test-rc-parity test-integration-dev test-integration-dev-fc dev-server-up dev-server-down dev-server-status dev-server-logs dev-server-restart dev-server-up-fc dev-server-down-fc dev-server-status-fc dev-server-logs-fc dev-server-restart-fc release clean dev-server dev-cli check check-kernel-pin coverage lint-all docs docs-serve firecracker-rootfs download-firecracker vz-rootfs vz-rootfs-base vz-rootfs-all
 
 GOARCH ?= $(shell go env GOARCH)
 
@@ -79,6 +79,26 @@ test-host-agent-diff:
 	# aws/docker/egress vectors) moved into shed-broker with the crate split. A
 	# filter scoped to the bin alone silently ran ZERO of them.
 	cd crates && PATH="$$HOME/.cargo/bin:$$PATH" cargo test -p shed-host-agent -p shed-broker golden
+
+# Go↔Rust RC-engine parity harness (the FOURTH pytest suite — never merged with
+# tests/integration, tests/host-agent-diff or desktop/tools/shedtest). It builds
+# BOTH one-shot implementations — `shed-machine-rc` (Go, the oracle) and `sx`
+# (Rust) — runs each scenario against both against a hermetic tmux server, asserts
+# the two agree under tests/rc-parity/normalize.py, and pins the agreed value to a
+# committed golden. Needs Go, Rust (cargo on PATH), uv, and tmux >= 3.2.
+# See tests/rc-parity/README.md.
+test-rc-parity:
+	@command -v uv >/dev/null 2>&1 || { \
+	  echo "uv is required for the rc parity harness."; \
+	  echo "Install: brew install uv  (or https://docs.astral.sh/uv/getting-started/installation/)"; \
+	  exit 1; \
+	}
+	@command -v tmux >/dev/null 2>&1 || { \
+	  echo "tmux (>= 3.2) is required for the rc parity harness."; \
+	  echo "Install: brew install tmux  (or apt-get install -y tmux)"; \
+	  exit 1; \
+	}
+	cd tests/rc-parity && uv sync && PATH="$$HOME/.cargo/bin:$$PATH" uv run pytest -v
 
 # Parallel dev shed-server lifecycle (Mac VZ).
 #

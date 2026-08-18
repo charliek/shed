@@ -93,15 +93,30 @@ impl RcRunner for TokioProcessRunner {
             let _ = err.read_to_end(&mut buf).await;
             buf
         });
-        // Write + close stdin (dropping the handle closes it). RC stdin is a
-        // <=2000-byte prompt, well under the pipe buffer, so this can't block.
-        if let Some(mut si) = child.stdin.take() {
-            if let Some(s) = &stdin {
-                let _ = si.write_all(s.as_bytes()).await;
+        // Write + close stdin (dropping the handle closes it), then wait — both
+        // INSIDE the watchdog.
+        //
+        // The contract is no longer "a short prompt that cannot block": stdin
+        // now carries plan documents up to `PLAN_MAX_BYTES` (1 MiB), far past
+        // any pipe buffer, so `write_all` genuinely blocks until the far side
+        // drains it. That is fine — ssh reads its stdin continuously — but it
+        // means (a) the write must be bounded by the same watchdog as the wait,
+        // or a wedged reader hangs the caller forever, and (b) a short/failed
+        // write must PROPAGATE: silently swallowing it ships a truncated plan
+        // and the remote agent starts work on half a document.
+        let write_then_wait = async {
+            if let Some(mut si) = child.stdin.take() {
+                if let Some(s) = &stdin {
+                    si.write_all(s.as_bytes()).await?;
+                }
             }
-        }
-
-        match tokio::time::timeout(timeout, child.wait()).await {
+            child.wait().await
+        };
+        // Bound to a `let` so the watchdog future — which holds `&mut child` —
+        // is dropped HERE. As a match scrutinee it would live to the end of the
+        // match and the timeout arm could not reach `child.start_kill()`.
+        let waited = tokio::time::timeout(timeout, write_then_wait).await;
+        match waited {
             Ok(status) => {
                 // Completed within the watchdog: drain both pipes (they EOF as the
                 // exited child's write-ends close).
@@ -774,6 +789,47 @@ mod tests {
         assert!(
             started.elapsed() < Duration::from_secs(5),
             "watchdog must fire (~300ms), not wait for the child's 30s"
+        );
+    }
+
+    /// A plan-sized stdin (`PLAN_MAX_BYTES` is 1 MiB) is orders of magnitude past
+    /// a 64 KiB pipe buffer, so `write_all` only completes because the child is
+    /// draining concurrently. Pins that the write is inside the watchdog scope
+    /// AND that nothing is truncated on the way through.
+    #[tokio::test]
+    async fn runner_writes_a_plan_sized_stdin_without_truncating_or_deadlocking() {
+        let payload = "x".repeat(1024 * 1024);
+        let out = TokioProcessRunner
+            .run(
+                vec!["cat".to_string()],
+                Some(payload.clone()),
+                Duration::from_secs(30),
+            )
+            .await
+            .unwrap();
+        assert_eq!(out.exit_code, 0, "stderr: {}", out.stderr);
+        assert_eq!(out.stdout.len(), payload.len());
+        assert_eq!(out.stdout, payload);
+    }
+
+    /// A child that never reads stdin and never exits: the write blocks once the
+    /// pipe fills, and the WATCHDOG — not the caller — is what ends it. Before the
+    /// write moved inside the timeout this hung forever.
+    #[tokio::test]
+    async fn runner_watchdog_bounds_a_wedged_stdin_writer() {
+        let started = std::time::Instant::now();
+        let out = TokioProcessRunner
+            .run(
+                vec!["sleep".to_string(), "30".to_string()],
+                Some("y".repeat(1024 * 1024)),
+                Duration::from_millis(300),
+            )
+            .await
+            .unwrap();
+        assert_eq!(out.exit_code, 124);
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the watchdog must bound the WRITE too, not just the wait"
         );
     }
 

@@ -1,0 +1,18 @@
+{
+  "dto": {
+    "created_at": "<ts>",
+    "created_by": "<prog>",
+    "display_name": "parity-paste",
+    "id": "<id>",
+    "kind": "claude-rc",
+    "lane": "tui",
+    "managed": true,
+    "slug": "kk2222",
+    "state": "ready",
+    "tmux_session": "rc-kk2222",
+    "url": "https://claude.ai/code/session_TESTTEST",
+    "workdir": "<home>"
+  },
+  "marker_count": 4,
+  "mentions_the_plan": true
+}

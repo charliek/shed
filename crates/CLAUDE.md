@@ -23,6 +23,20 @@ re-implemented per language. The root `CLAUDE.md` owns the monorepo layout + rel
   in `desktop/scripts/build-core.sh`.
 - **`shedctl`** — a headless UDS/IPC client on `shed-core` (no GUI-toolkit dep), shipped in the
   Linux `.deb` and drives the Tauri app's socket. In `default-members`.
+- **`sx`** — the RC **porcelain** binary (plan 009), on `shed-core` + `shed-app` (with the
+  non-default `rc` feature enabled by its own manifest, so `cargo build -p sx` needs no
+  flags). Today it exposes one namespace, `sx rc <verb>` — the ported one-shot engine,
+  wire-compatible with the Go `shed-machine-rc <verb>` under the comparison model
+  `tests/rc-parity` enforces (`make test-rc-parity` builds BOTH binaries and diffs them) — and
+  the **porcelain verbs** on top of it: `sx agent <tool>` / `sx plan <file>` (kickoff) and
+  `sx ls` / `sx watch` / `sx attach` / `sx kill` (observe), each taking
+  `--on local | machine:<name> | shed:<name>[@<server>]`. `machine:` entries come from the
+  `machines:` section of `~/.shed/config.yaml` (Rust-defined, Go-passthrough); a shed's SSH
+  endpoint comes from `shed-app`'s `Backend`. Hand-rolled arg parsing, like `shedctl`, with the
+  house subject-first grammar (`sx watch <slug> --on …`). In `default-members`. Its
+  dev-dependencies enable shed-app's **`test-support`** feature, which exports
+  `rc_engine::fake` (the fake tmux runner) across the crate boundary — test-only by
+  construction (`#[cfg(any(test, feature = "test-support"))]`).
 - **`shed-broker`** — the embeddable host-agent broker core: the shed-server plugin bus,
   the multi-server supervisor + discovery watcher, the SSH/AWS/Docker/egress credential
   backends, the SSH-bootstrap minter + control-token provider, the approval/audit seams
@@ -77,7 +91,13 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo clippy -p shed-app --features rc --all-targets -- -D warnings
 cargo clippy -p shed-app --features broker --all-targets -- -D warnings
 cargo clippy -p shed-app --features broker,rc --all-targets -- -D warnings
+cargo test -p sx                                     # the RC porcelain CLI
 ```
+
+Note: because `sx` is a default member that enables shed-app's `rc` feature, a bare
+`cargo test`/`clippy --workspace` now also compiles (and runs) the `rc` modules through
+feature unification. The explicit `-p shed-app --features rc` legs above stay — they are
+what covers the crate when it is built ALONE (and what CI runs).
 
 `shed-core` also builds/tests on Linux — `make -C desktop core-linux` runs it in Docker.
 

@@ -1,0 +1,4 @@
+{
+  "bytes": "{\"theme\":\"dark\"} garbage after",
+  "warning": "<prog>: claude preseed skipped: existing <home>/.claude.json is not valid JSON; leaving untouched:<detail>"
+}

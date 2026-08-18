@@ -1,0 +1,5 @@
+{
+  "code": 2,
+  "stderr": "<prog>: invalid arguments: --plan-stdin given but stdin is empty",
+  "stdout": ""
+}

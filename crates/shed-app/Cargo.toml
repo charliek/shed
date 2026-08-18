@@ -42,6 +42,14 @@ libc = "0.2"
 # which has no RC pane) never compiles it; the Tauri client enables it. `make test`
 # must pass `--features rc` or the rc unit tests are cfg'd out.
 rc = ["tokio/process"]
+# The engine's test doubles (`rc_engine::fake` — the fake tmux runner + the env
+# table) exported for ANOTHER crate's tests, today `sx`'s dispatch tests, which
+# must assert against the same recorded-argv shape the engine's own tables do.
+# NON-default and named `test-support` so it is unmistakable: a consumer enabling
+# it in `[dependencies]` (rather than `[dev-dependencies]`) is doing it wrong —
+# the module is `#[cfg]`'d in only under `test` or this feature, so a shipped
+# binary never carries it.
+test-support = []
 # The in-process broker bridge (`broker_bridge.rs`): the embedded host-agent replacement
 # backed by `shed-broker`. NON-default (mirrors `rc`) so a featureless `shed-app` stays
 # broker-free — `cargo test --features broker` runs its unit tests.

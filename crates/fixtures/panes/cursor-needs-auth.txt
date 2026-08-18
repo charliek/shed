@@ -1,0 +1,53 @@
+[shed:agent-fixtures] ~ $ cursor-agent
+Tip: You can start the Cursor CLI with `agent` (same as `cursor-agent`).
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+                                                                                       Cursor Agent
+                                                                                       v2026.07.09-a3815c0
+                                                                                       Press any key to log in...
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

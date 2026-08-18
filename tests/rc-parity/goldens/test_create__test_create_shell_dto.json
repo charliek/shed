@@ -1,0 +1,13 @@
+{
+  "created_at": "<ts>",
+  "created_by": "<prog>",
+  "display_name": "parity-shell",
+  "id": "<id>",
+  "kind": "shell",
+  "lane": "tui",
+  "managed": true,
+  "slug": "aa1111",
+  "state": "starting",
+  "tmux_session": "rc-aa1111",
+  "workdir": "<home>"
+}

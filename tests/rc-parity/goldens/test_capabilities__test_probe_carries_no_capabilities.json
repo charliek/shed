@@ -1,0 +1,13 @@
+{
+  "created_at": "<ts>",
+  "created_by": "<prog>",
+  "display_name": "parity-probe",
+  "id": "<id>",
+  "kind": "codex",
+  "lane": "tui",
+  "managed": true,
+  "slug": "ll2222",
+  "state": "ready",
+  "tmux_session": "rc-ll2222",
+  "workdir": "<home>"
+}

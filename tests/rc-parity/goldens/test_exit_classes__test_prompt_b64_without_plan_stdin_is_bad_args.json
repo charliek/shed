@@ -1,0 +1,5 @@
+{
+  "code": 2,
+  "stderr": "<prog>: invalid arguments: --prompt-b64 is only valid with --plan-stdin",
+  "stdout": ""
+}

@@ -194,6 +194,20 @@ impl RcState {
         }
     }
 
+    /// The wire spelling — the exact inverse of [`RcState::from_wire`] and of
+    /// the kebab-case serde derive above, for the places that render a state as
+    /// text (a CLI table, a summary line) rather than serializing a DTO.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            RcState::Starting => "starting",
+            RcState::Ready => "ready",
+            RcState::Reconnecting => "reconnecting",
+            RcState::NeedsTrust => "needs-trust",
+            RcState::NeedsAuth => "needs-auth",
+            RcState::Dead => "dead",
+        }
+    }
+
     /// Whether this lifecycle state permits showing the live activity
     /// dimension. The server already drops activity for a blocking state
     /// (needs-trust / needs-auth / dead — lifecycle trumps activity); the
@@ -300,7 +314,26 @@ pub enum RcError {
 /// inside the shed and can't know the host alias / shed name — the app injects
 /// those and maps `id`→`rc_id`). Optional fields are absent (not null) when
 /// unknown; `managed` defaults to false on a legacy payload.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+/// # Serialization (added for the Rust rc engine — plan 009)
+///
+/// The `Serialize` half exists so the ported engine can PRODUCE this wire shape,
+/// not only consume it, and its field-presence semantics mirror the Go
+/// producer's struct tags EXACTLY (`internal/ext/rc/rc.go:154-202`), because the
+/// Go↔Rust parity harness compares stdout structurally — key ORDER is
+/// irrelevant, key PRESENCE is contract:
+///
+/// - `slug`, `tmux_session`, `kind`, `state`, `managed` — always present
+///   (`managed` notably even when `false`).
+/// - `lane` — Go has no `omitempty` and always emits it; here it is `Option`
+///   only because an OLD (pre-v2) producer's payload omits it. Emitted whenever
+///   present and skipped when absent, so a decode→encode round trip is faithful
+///   and the engine (which always sets it) is byte-comparable with Go.
+/// - every other field — absent, never `null` and never `""`. The engine's
+///   [`crate::rc_agents::parse_session`] maps Go's empty strings to `None` at
+///   construction, so `skip_serializing_if = "Option::is_none"` reproduces
+///   `omitempty` exactly without an empty-string special case (which would break
+///   round-tripping).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct RcSessionDto {
     pub slug: String,
     pub tmux_session: String,
@@ -317,25 +350,35 @@ pub struct RcSessionDto {
     /// [`RcSessionDto::lane_or_tui`], which applies the contract's absent-⇒-`tui`
     /// rule. Carried verbatim (never parsed into an enum): a future lane value
     /// must render neutrally, not vanish the session.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lane: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub display_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub workdir: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub created_by: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub created_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub target_label: Option<String>,
     /// Live-activity dimension (additive inside the `rc` block; derived by the
     /// rc hub). Absent when no hub is running, the kind is unsupported, or the
     /// server suppressed it (a blocking lifecycle state trumps activity).
     /// Mirrors mobile's `RcSession.activity` (`rc_models.dart:222-234`).
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub activity: Option<RcActivity>,
     /// RFC3339 timestamp the activity was last derived/changed; absent with
     /// `activity`.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub activity_at: Option<String>,
     /// A short, hub-sanitized (ANSI/control-stripped, ≤200 runes) preview of
     /// the session's most recent message. Absent when the hub has none.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub last_message: Option<String>,
     /// The session's currently-unresolved approval requests (contract v2) — the
     /// snapshot that keeps a session ACTIONABLE after the feed ring evicted (or a
@@ -343,7 +386,7 @@ pub struct RcSessionDto {
     /// HUB-LAYER field: the one-shot `list` path this DTO usually comes from never
     /// sets it, and nothing produces approvals in this phase, so it is absent
     /// (`None`) on every wire today. See [`RcFeedApproval`] for the folding rule.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pending_approvals: Option<Vec<RcFeedApproval>>,
 }
 
@@ -385,10 +428,14 @@ pub fn lane_or_tui(lane: Option<&str>) -> &str {
 /// `capabilities`: an OLD baked-in binary's bare `{"rc_sessions":[…]}` envelope has
 /// no block, so it decodes to `None` (the capability-discovery leg degrades, it
 /// does not error).
-#[derive(Debug, Clone, Deserialize)]
+///
+/// Serializes with the producer's presence semantics (`rc.go:208-211`):
+/// `rc_sessions` is ALWAYS emitted (as `[]` when there are none), `capabilities`
+/// is an `omitempty` pointer and is omitted when absent.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 pub struct RcSessionListDto {
     pub rc_sessions: Vec<RcSessionDto>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub capabilities: Option<RcCapabilities>,
 }
 
@@ -431,27 +478,43 @@ pub struct RcAgentInfo {
 /// producer side) until every client reads `feed`, so the two can be trusted to
 /// agree; read them through [`RcKindFeatures::feed_messages`], which prefers
 /// `feed` and falls back to `watch` on a payload that predates it.
+///
+/// **Serialization mirrors the Go producer's `omitempty` set exactly**
+/// (`internal/ext/rc/capabilities.go:96-104`): `post_input`, `approvals` and
+/// `interrupt` are unconditional; `watch` is skipped when `false`, and `input` /
+/// `feed` / `attach` when empty. That re-emission fidelity is the whole point of
+/// the Go tags — a newer producer re-emitting an OLDER guest's decoded
+/// capabilities must emit the unknown fields as ABSENT, not as `""`/`false`, so
+/// the client-side absent-field fallbacks ([`RcKindFeatures::feed_messages`],
+/// [`RcKindFeatures::attach_kind`]) still apply on a mixed-version fleet.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RcKindFeatures {
     pub post_input: bool,
     pub approvals: String,
     /// DEPRECATED by [`RcKindFeatures::feed`] (kept until clients migrate; the
     /// producer maintains the lockstep described on the struct).
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_false")]
     pub watch: bool,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub input: String,
     /// Empty on a pre-v2 payload — and, per the producer's omitempty note, on a
     /// newer server re-emitting an older guest's decoded capabilities. Use
     /// [`RcKindFeatures::feed_messages`] rather than comparing this directly.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub feed: String,
     #[serde(default)]
     pub interrupt: bool,
     /// Empty on a pre-v2 payload; read it through
     /// [`RcKindFeatures::attach_kind`], which applies the `"tmux"` fallback.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub attach: String,
+}
+
+/// Go's `omitempty` on a `bool` field: `false` is the zero value and is omitted.
+/// (`serde` has no built-in for this — `skip_serializing_if` needs a predicate
+/// over a reference.)
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 impl RcKindFeatures {
@@ -741,6 +804,12 @@ pub const CLAUDE_EXTRA_MODES: [&str; 4] = ["acceptEdits", "plan", "dontAsk", "by
 /// agent kind. Mirrors mobile's `defaultRcPermissionMode` (`rc_service.dart:65`).
 pub const DEFAULT_RC_PERMISSION_MODE: &str = "auto";
 
+/// The generic full-bypass posture a `--skip` shorthand expands to, before the
+/// per-agent registry maps it to that tool's real flag. Mirrors the guest's
+/// `rc.PermModeSkip` (`internal/ext/rc/rc.go`); a member of
+/// [`GENERIC_PERMISSION_MODES`], so it is valid for every kind.
+pub const PERM_MODE_SKIP: &str = "skip";
+
 /// The permission modes valid for `kind`: the full claude set (generic
 /// tri-state + historical extras, in that display order) for the claude kinds,
 /// else the generic tri-state (codex/cursor/opencode/shell). Mirrors the
@@ -856,13 +925,7 @@ pub fn create_invocation(
     permission_mode: Option<&str>,
     prompt: Option<&str>,
 ) -> Result<(Vec<String>, Option<String>), RcError> {
-    let mode = validate_permission_mode(kind, permission_mode)?;
-    let effective = if kind.accepts_typed_input() {
-        prompt
-    } else {
-        None
-    };
-    let argv = create_argv(
+    create_invocation_v2(&CreateSpec {
         bin,
         kind,
         name,
@@ -870,10 +933,158 @@ pub fn create_invocation(
         workdir,
         created_by,
         target,
-        mode,
-        effective.is_some(),
-    );
-    Ok((argv, effective.map(str::to_string)))
+        permission_mode,
+        // The desktop's posture, unchanged: always wait, never `bash -ic`.
+        wait: true,
+        interactive_shell: false,
+        payload: match prompt {
+            Some(p) => CreatePayload::Prompt(p),
+            None => CreatePayload::None,
+        },
+    })
+}
+
+/// What rides on the remote `create`'s **stdin**, and which framing flag
+/// announces it. Modeled as one enum rather than three independent fields
+/// because the combinations are not free: stdin carries AT MOST one payload, and
+/// `--prompt-b64` is only meaningful alongside `--plan-stdin` (`clirc.go:268`) —
+/// a shape a builder taking `prompt_stdin: bool, plan_stdin: bool,
+/// prompt_b64: Option<_>` would let a caller get wrong.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum CreatePayload<'a> {
+    /// No stdin at all.
+    #[default]
+    None,
+    /// `--prompt-stdin` + the kickoff line on stdin.
+    Prompt(&'a str),
+    /// `--plan-stdin` + the plan document on stdin, plus an optional
+    /// `--prompt-b64 <b64>` caller framing (the base64 is the CALLER's — this
+    /// builder never encodes, so it stays pure and byte-predictable).
+    Plan {
+        text: &'a str,
+        framing_b64: Option<&'a str>,
+    },
+}
+
+/// Everything a remote `create` invocation needs, as one struct (plan 009 §3.2).
+///
+/// [`create_invocation`] — the desktop's builder — hardcodes `--wait`, knows only
+/// `--prompt-stdin`, and always spells the binary `shed-ext-rc`'s way. The
+/// porcelain needs four more axes (`--interactive-shell`, no-wait,
+/// `--plan-stdin`, `--prompt-b64`) against a **parameterized** remote binary
+/// (`shed-machine-rc` on a machine, `shed-ext-rc` in a shed), so this is the
+/// superset builder; `create_invocation` delegates to it and its argv is
+/// unchanged byte-for-byte (see `create_invocation_delegates_byte_identically`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreateSpec<'a> {
+    /// The remote RC binary: `shed-ext-rc` (guest) or `shed-machine-rc`/an
+    /// absolute path (machine).
+    pub bin: &'a str,
+    pub kind: &'a RcKind,
+    pub name: &'a str,
+    pub slug: &'a str,
+    pub workdir: Option<&'a str>,
+    pub created_by: &'a str,
+    pub target: &'a str,
+    /// The RAW caller mode; validated by [`create_invocation_v2`] exactly as
+    /// [`create_invocation`] validates its own.
+    pub permission_mode: Option<&'a str>,
+    /// `--wait`: block until ready, auto-accept trust, deliver the kickoff.
+    pub wait: bool,
+    /// `--interactive-shell`: wrap the inner command in `bash -ic`. A
+    /// local/machine posture ONLY — a guest session's SSH `bash -lc` wrap already
+    /// supplies a login PATH, so `shed:` targets must leave it off (plan 009
+    /// §3.2 dispatch table).
+    pub interactive_shell: bool,
+    pub payload: CreatePayload<'a>,
+}
+
+impl<'a> CreateSpec<'a> {
+    /// A spec with everything absent except the two things that have no default.
+    pub fn new(bin: &'a str, kind: &'a RcKind) -> Self {
+        Self {
+            bin,
+            kind,
+            name: "",
+            slug: "",
+            workdir: None,
+            created_by: "",
+            target: "",
+            permission_mode: None,
+            wait: false,
+            interactive_shell: false,
+            payload: CreatePayload::None,
+        }
+    }
+}
+
+/// Build the remote `create` argv + its stdin from a [`CreateSpec`].
+///
+/// Flag order (stable — the harness and the goldens read it):
+///
+/// ```text
+/// <bin> create --kind K --name N --slug S --created-by C --target T
+///        [--wait] [--interactive-shell] [--workdir W] [--permission-mode M]
+///        [--prompt-stdin | --plan-stdin [--prompt-b64 B]]
+/// ```
+///
+/// Validation matches [`create_invocation`]: the permission mode goes through
+/// [`validate_permission_mode`] (dropped for a kind with no posture, rejected
+/// when outside the kind's set), and a kickoff PROMPT is dropped for a kind that
+/// takes no typed input. A **plan** is NOT dropped that way — plan delivery is
+/// rejected outright by the guest for such a kind (`cmd/shed/plan.go:77-79`), and
+/// silently turning a `sx plan --tool …` into a plan-less session would be worse
+/// than the remote's explicit exit 2.
+pub fn create_invocation_v2(spec: &CreateSpec) -> Result<(Vec<String>, Option<String>), RcError> {
+    let mode = validate_permission_mode(spec.kind, spec.permission_mode)?;
+    let mut argv = vec![
+        spec.bin.to_string(),
+        "create".to_string(),
+        "--kind".to_string(),
+        spec.kind.as_str().to_string(),
+        "--name".to_string(),
+        spec.name.to_string(),
+        "--slug".to_string(),
+        spec.slug.to_string(),
+        "--created-by".to_string(),
+        spec.created_by.to_string(),
+        "--target".to_string(),
+        spec.target.to_string(),
+    ];
+    if spec.wait {
+        argv.push("--wait".to_string());
+    }
+    if spec.interactive_shell {
+        argv.push("--interactive-shell".to_string());
+    }
+    if let Some(w) = spec.workdir.filter(|s| !s.is_empty()) {
+        argv.push("--workdir".to_string());
+        argv.push(w.to_string());
+    }
+    if let Some(m) = mode {
+        argv.push("--permission-mode".to_string());
+        argv.push(m.to_string());
+    }
+    let stdin = match &spec.payload {
+        CreatePayload::None => None,
+        CreatePayload::Prompt(text) => {
+            if !spec.kind.accepts_typed_input() {
+                None
+            } else {
+                argv.push("--prompt-stdin".to_string());
+                Some((*text).to_string())
+            }
+        }
+        CreatePayload::Plan { text, framing_b64 } => {
+            argv.push("--plan-stdin".to_string());
+            if let Some(b64) = framing_b64.filter(|s| !s.is_empty()) {
+                argv.push("--prompt-b64".to_string());
+                argv.push(b64.to_string());
+            }
+            Some((*text).to_string())
+        }
+    };
+    Ok((argv, stdin))
 }
 
 pub fn list_argv(bin: &str) -> Vec<String> {
@@ -884,6 +1095,17 @@ pub fn kill_argv(bin: &str, slug: &str) -> Vec<String> {
     vec![
         bin.to_string(),
         "kill".to_string(),
+        "--slug".to_string(),
+        slug.to_string(),
+    ]
+}
+
+/// Argv for a `probe` — one session's current DTO, the fallback a client polls
+/// when no message feed is available.
+pub fn probe_argv(bin: &str, slug: &str) -> Vec<String> {
+    vec![
+        bin.to_string(),
+        "probe".to_string(),
         "--slug".to_string(),
         slug.to_string(),
     ]
@@ -913,7 +1135,27 @@ pub fn prompt_argv(bin: &str, slug: &str, session_id: Option<&str>) -> Vec<Strin
 /// Map a non-zero exit code + stderr to an `RcError`. SSH-transport failures (the
 /// binary never ran) surface as `Failed` with the ssh stderr. Mirrors Swift's
 /// `RemoteControl.error`.
+///
+/// The detail-less fallback names **`shed-ext-rc`** — verbatim Swift
+/// (`RemoteControl.swift:590`), whose only remote is a shed's guest helper. Any
+/// caller that may be talking to a DIFFERENT rc binary (a machine's
+/// `shed-machine-rc`, an operator-configured path) should use
+/// [`error_from_exit_with_bin`] so the message names what actually failed.
 pub fn error_from_exit(exit_code: i32, stderr: &str, stdout: &str) -> RcError {
+    error_from_exit_with_bin(DEFAULT_RC_BIN, exit_code, stderr, stdout)
+}
+
+/// The rc helper [`error_from_exit`] names when the caller does not say. The
+/// guest binary, because that is the only remote the desktop/Swift path has.
+pub const DEFAULT_RC_BIN: &str = "shed-ext-rc";
+
+/// [`error_from_exit`], but naming the binary that actually exited.
+///
+/// Only the detail-less fallback differs; every classified arm (2/3/4/127, the
+/// "command not found" sniff, a non-empty detail) is identical, so this is
+/// wire-neutral — no consumer parses these strings, and the Go side has no
+/// counterpart at all (the class exists only in the Swift/Rust clients).
+pub fn error_from_exit_with_bin(bin: &str, exit_code: i32, stderr: &str, stdout: &str) -> RcError {
     let detail = if stderr.is_empty() { stdout } else { stderr }
         .trim()
         .to_string();
@@ -926,7 +1168,8 @@ pub fn error_from_exit(exit_code: i32, stderr: &str, stdout: &str) -> RcError {
             if stderr.to_lowercase().contains("command not found") {
                 RcError::MissingBinary
             } else if detail.is_empty() {
-                RcError::Failed(format!("shed-ext-rc exited {exit_code}"))
+                let bin = if bin.is_empty() { DEFAULT_RC_BIN } else { bin };
+                RcError::Failed(format!("{bin} exited {exit_code}"))
             } else {
                 RcError::Failed(detail)
             }
@@ -1028,11 +1271,16 @@ pub struct RcFeedApproval {
     pub id: String,
     /// `"pending"` or `"resolved"`.
     pub status: String,
-    /// The decision that resolved it (`None` while pending).
+    /// The decision that resolved it (`None` while pending). Go tags it
+    /// `omitempty` (hub_messages.go), so serialization skips `None` — absent,
+    /// never `null` — matching every other optional on the wire.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub decision: Option<String>,
     /// The decisions this request accepts (a subset of `allow`/`allow_always`/
     /// `deny`), advertised per request so a client renders exactly the buttons
-    /// the lane will honor. Empty when the producer advertised none.
+    /// the lane will honor. Empty when the producer advertised none — and, like
+    /// Go's `omitempty`, skipped entirely when empty rather than emitted as `[]`.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub decisions: Vec<String>,
 }
 
@@ -1661,6 +1909,192 @@ mod tests {
         assert!(!argv.contains(&"--prompt-stdin".to_string()));
     }
 
+    #[test]
+    fn state_as_str_round_trips_through_from_wire_and_serde() {
+        for state in [
+            RcState::Starting,
+            RcState::Ready,
+            RcState::Reconnecting,
+            RcState::NeedsTrust,
+            RcState::NeedsAuth,
+            RcState::Dead,
+        ] {
+            let wire = state.as_str();
+            assert_eq!(RcState::from_wire(wire), state);
+            // …and it is the same token the serde derive emits.
+            assert_eq!(
+                serde_json::to_string(&state).unwrap(),
+                format!("\"{wire}\"")
+            );
+        }
+    }
+
+    // ---- create_invocation_v2: the porcelain's superset builder (plan 009 C7) ----
+
+    /// The delegation contract: with the desktop's fixed posture (wait on,
+    /// interactive off, prompt payload) v2 must produce EXACTLY what the old
+    /// hand-rolled builder produced — otherwise the desktop's wire moved.
+    ///
+    /// **Both halves.** argv alone is only half the invocation: `--prompt-stdin`
+    /// is a promise that the prompt arrives on stdin, and a delegation that got
+    /// the argv right while dropping (or inventing) the stdin payload would
+    /// still move the wire. So the stdin half is pinned to the same rule the
+    /// legacy path applied — the prompt iff the kind accepts typed input.
+    #[test]
+    fn create_invocation_delegates_byte_identically() {
+        for (kind, workdir, mode, prompt) in [
+            (RcKind::ClaudeRc, Some("/work"), Some("auto"), Some("hi")),
+            (RcKind::Shell, None, None, None),
+            (RcKind::Codex, Some(""), Some("skip"), Some("go")),
+        ] {
+            let legacy = create_argv(
+                "shed-ext-rc",
+                &kind,
+                "web/abc",
+                "abc",
+                workdir,
+                "shed-desktop/1.0",
+                "shed:web@srv",
+                validate_permission_mode(&kind, mode).unwrap(),
+                prompt.is_some() && kind.accepts_typed_input(),
+            );
+            let (argv, stdin) = create_invocation(
+                "shed-ext-rc",
+                &kind,
+                "web/abc",
+                "abc",
+                workdir,
+                "shed-desktop/1.0",
+                "shed:web@srv",
+                mode,
+                prompt,
+            )
+            .unwrap();
+            assert_eq!(argv, legacy, "kind {kind:?}");
+
+            // The stdin half, pinned to the legacy rule: the prompt rides stdin
+            // exactly when the kind accepts typed input — and `--prompt-stdin`
+            // appears in argv exactly then too, so the two halves agree.
+            let want_stdin = prompt.filter(|_| kind.accepts_typed_input());
+            assert_eq!(stdin.as_deref(), want_stdin, "kind {kind:?} stdin");
+            assert_eq!(
+                argv.contains(&"--prompt-stdin".to_string()),
+                want_stdin.is_some(),
+                "kind {kind:?}: the framing flag and the payload must agree"
+            );
+        }
+    }
+
+    #[test]
+    fn v2_interactive_shell_is_present_only_when_asked() {
+        let kind = RcKind::ClaudeRc;
+        let mut spec = CreateSpec::new("shed-machine-rc", &kind);
+        spec.name = "mac/abc234";
+        spec.slug = "abc234";
+        spec.wait = true;
+
+        // Machine/local posture: the flag rides right after --wait.
+        spec.interactive_shell = true;
+        let (argv, stdin) = create_invocation_v2(&spec).unwrap();
+        assert_eq!(stdin, None);
+        let wait = argv.iter().position(|a| a == "--wait").unwrap();
+        assert_eq!(argv[wait + 1], "--interactive-shell");
+
+        // Guest posture: absent entirely (the SSH `bash -lc` wrap supplies PATH).
+        spec.interactive_shell = false;
+        let (argv, _) = create_invocation_v2(&spec).unwrap();
+        assert!(!argv.contains(&"--interactive-shell".to_string()));
+    }
+
+    #[test]
+    fn v2_no_wait_simply_omits_the_wait_flag() {
+        let kind = RcKind::Shell;
+        let mut spec = CreateSpec::new("shed-machine-rc", &kind);
+        spec.wait = false;
+        let (argv, _) = create_invocation_v2(&spec).unwrap();
+        assert!(!argv.contains(&"--wait".to_string()));
+        // …and the surrounding argv is otherwise the same document.
+        spec.wait = true;
+        let (waiting, _) = create_invocation_v2(&spec).unwrap();
+        let without: Vec<&String> = waiting.iter().filter(|a| *a != "--wait").collect();
+        assert_eq!(without, argv.iter().collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn v2_plan_stdin_pairs_with_prompt_b64_framing() {
+        let kind = RcKind::ClaudeRc;
+        let mut spec = CreateSpec::new("shed-ext-rc", &kind);
+        spec.slug = "abc234";
+        spec.wait = true;
+
+        // A plan with framing: --plan-stdin then --prompt-b64 <b64>, plan on stdin.
+        spec.payload = CreatePayload::Plan {
+            text: "# plan\n",
+            framing_b64: Some("ZnJhbWluZw=="),
+        };
+        let (argv, stdin) = create_invocation_v2(&spec).unwrap();
+        assert_eq!(stdin.as_deref(), Some("# plan\n"));
+        let at = argv.iter().position(|a| a == "--plan-stdin").unwrap();
+        assert_eq!(argv[at + 1..], ["--prompt-b64", "ZnJhbWluZw=="]);
+        assert!(!argv.contains(&"--prompt-stdin".to_string()));
+
+        // No framing (and an empty one, which is the same thing): the flag is gone.
+        for framing in [None, Some("")] {
+            spec.payload = CreatePayload::Plan {
+                text: "# plan\n",
+                framing_b64: framing,
+            };
+            let (argv, stdin) = create_invocation_v2(&spec).unwrap();
+            assert_eq!(stdin.as_deref(), Some("# plan\n"));
+            assert!(argv.ends_with(&["--plan-stdin".to_string()]));
+        }
+    }
+
+    #[test]
+    fn v2_drops_a_prompt_for_a_kind_that_takes_none_but_never_a_plan() {
+        let kind = RcKind::ClaudeBroker;
+        let mut spec = CreateSpec::new("b", &kind);
+        spec.payload = CreatePayload::Prompt("hi");
+        let (argv, stdin) = create_invocation_v2(&spec).unwrap();
+        assert_eq!(stdin, None);
+        assert!(!argv.contains(&"--prompt-stdin".to_string()));
+
+        // A PLAN is passed through so the remote's own exit-2 rejection is what
+        // the operator sees, rather than a silently plan-less session.
+        spec.payload = CreatePayload::Plan {
+            text: "p",
+            framing_b64: None,
+        };
+        let (argv, stdin) = create_invocation_v2(&spec).unwrap();
+        assert_eq!(stdin.as_deref(), Some("p"));
+        assert!(argv.contains(&"--plan-stdin".to_string()));
+    }
+
+    #[test]
+    fn v2_validates_the_permission_mode_and_parameterizes_the_binary() {
+        let kind = RcKind::ClaudeRc;
+        let mut spec = CreateSpec::new("/opt/homebrew/bin/shed-machine-rc", &kind);
+        spec.permission_mode = Some("nonsense");
+        assert!(matches!(
+            create_invocation_v2(&spec),
+            Err(RcError::BadRequest(_))
+        ));
+
+        spec.permission_mode = Some("bypassPermissions");
+        let (argv, _) = create_invocation_v2(&spec).unwrap();
+        assert_eq!(argv[0], "/opt/homebrew/bin/shed-machine-rc");
+        assert!(argv
+            .windows(2)
+            .any(|w| w == ["--permission-mode", "bypassPermissions"]));
+
+        // A kind with no posture drops the mode silently (create_invocation parity).
+        let shell = RcKind::Shell;
+        let mut spec = CreateSpec::new("b", &shell);
+        spec.permission_mode = Some("auto");
+        let (argv, _) = create_invocation_v2(&spec).unwrap();
+        assert!(!argv.contains(&"--permission-mode".to_string()));
+    }
+
     // ---- permission modes (ported from mobile's rc_service_test.dart:58-253) ----
 
     #[test]
@@ -1890,9 +2324,10 @@ mod tests {
     }
 
     #[test]
-    fn list_and_kill_argv() {
+    fn list_kill_and_probe_argv() {
         assert_eq!(list_argv("b"), ["b", "list"]);
         assert_eq!(kill_argv("b", "abc"), ["b", "kill", "--slug", "abc"]);
+        assert_eq!(probe_argv("b", "abc"), ["b", "probe", "--slug", "abc"]);
     }
 
     #[test]
@@ -1936,6 +2371,21 @@ mod tests {
         assert_eq!(
             error_from_exit(1, "", ""),
             RcError::Failed("shed-ext-rc exited 1".into())
+        );
+        // …and a caller that knows which binary it ran says so, without moving
+        // any classified arm.
+        assert_eq!(
+            error_from_exit_with_bin("shed-machine-rc", 1, "", ""),
+            RcError::Failed("shed-machine-rc exited 1".into())
+        );
+        assert_eq!(
+            error_from_exit_with_bin("", 1, "", ""),
+            error_from_exit(1, "", ""),
+            "an empty binary name falls back to the Swift-parity default"
+        );
+        assert_eq!(
+            error_from_exit_with_bin("shed-machine-rc", 4, "gone", ""),
+            error_from_exit(4, "gone", "")
         );
         // stdout is the fallback detail when stderr is empty.
         assert_eq!(
@@ -2137,6 +2587,125 @@ mod tests {
         // claude-broker and shell stay OMITTED — absent entry = no affordances.
         assert!(!caps.kind_features.contains_key("claude-broker"));
         assert!(!caps.kind_features.contains_key("shell"));
+    }
+
+    /// The `Serialize` half added for the Rust rc engine (plan 009) must be a
+    /// faithful inverse of the decoder: decode the canonical golden → re-encode →
+    /// decode again → identical. A `skip_serializing_if` that is too eager (an
+    /// emitted field dropped) or too lax (an absent field materialized as
+    /// `null`/`""`) breaks this immediately, which is exactly the class of bug the
+    /// Go↔Rust differential would otherwise catch a whole commit later.
+    #[test]
+    fn list_envelope_round_trips_through_serialization() {
+        let first = decode_list_response(LIST_GOLDEN).unwrap();
+        let encoded = serde_json::to_string(&first).unwrap();
+        let second = decode_list_response(&encoded).unwrap();
+        assert_eq!(first, second);
+        // Stronger: the re-encode is STRUCTURALLY identical to the golden itself
+        // — the exact comparison model the Go↔Rust parity harness applies to DTO
+        // stdout (parse → compare; key order irrelevant, key PRESENCE contract).
+        // Byte comparison is deliberately NOT asserted: Go's `json.Marshal` sorts
+        // map keys and HTML-escapes `<`/`>`/`&`, serde_json does neither, and no
+        // consumer of this stdout byte-compares it (they all parse).
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&encoded).unwrap(),
+            serde_json::from_str::<serde_json::Value>(LIST_GOLDEN).unwrap(),
+        );
+    }
+
+    /// Mirrors the Go producer's `TestSessionMarshalOmitsEmptyOptionals`
+    /// (`internal/ext/rc/golden_test.go:119`): a minimal DTO re-marshals with its
+    /// optional fields ABSENT (not `null`, not `""`), while `managed` and `lane`
+    /// are the always-present exceptions. This is the wire contract the Swift
+    /// Codable and TS Zod consumers rely on.
+    #[test]
+    fn minimal_session_marshals_without_empty_optionals() {
+        let dto = RcSessionDto {
+            slug: "x".into(),
+            tmux_session: "rc-x".into(),
+            kind: RcKind::Shell,
+            state: RcState::Starting,
+            managed: false,
+            lane: Some(LANE_TUI.into()),
+            display_name: None,
+            workdir: None,
+            url: None,
+            id: None,
+            created_by: None,
+            created_at: None,
+            target_label: None,
+            activity: None,
+            activity_at: None,
+            last_message: None,
+            pending_approvals: None,
+        };
+        let s = serde_json::to_string(&dto).unwrap();
+        for omitted in [
+            "display_name",
+            "workdir",
+            "url",
+            "\"id\"",
+            "created_by",
+            "created_at",
+            "target_label",
+            "activity",
+            "activity_at",
+            "last_message",
+            "pending_approvals",
+            "null",
+        ] {
+            assert!(
+                !s.contains(omitted),
+                "expected {omitted} to be omitted, got {s}"
+            );
+        }
+        // managed is always present (even when false); so is lane.
+        assert!(s.contains(r#""managed":false"#), "{s}");
+        assert!(s.contains(r#""lane":"tui""#), "{s}");
+    }
+
+    /// The `kind_features` omitempty set, pinned on the SERIALIZE side: a zero
+    /// `watch`/`input`/`feed`/`attach` must vanish from the payload (so an older
+    /// guest's capabilities re-emitted by a newer producer keep triggering the
+    /// client-side absent-field fallbacks), while `post_input`, `approvals` and
+    /// `interrupt` are always written.
+    #[test]
+    fn kind_features_marshal_omits_the_go_omitempty_set() {
+        let bare = RcKindFeatures {
+            post_input: true,
+            approvals: "tui".into(),
+            watch: false,
+            input: String::new(),
+            feed: String::new(),
+            interrupt: false,
+            attach: String::new(),
+        };
+        let s = serde_json::to_string(&bare).unwrap();
+        assert_eq!(
+            s,
+            r#"{"post_input":true,"approvals":"tui","interrupt":false}"#
+        );
+        // A populated row keeps every field.
+        let full = RcKindFeatures {
+            watch: true,
+            input: "gated".into(),
+            feed: "messages".into(),
+            attach: "tmux".into(),
+            ..bare
+        };
+        let s = serde_json::to_string(&full).unwrap();
+        for key in ["watch", "input", "feed", "attach"] {
+            assert!(s.contains(key), "{key} missing from {s}");
+        }
+        // `version` on an uninstalled agent is omitempty on the Go side too.
+        let uninstalled = RcAgentInfo {
+            installed: false,
+            version: None,
+        };
+        assert_eq!(
+            serde_json::to_string(&uninstalled).unwrap(),
+            r#"{"installed":false}"#
+        );
     }
 
     /// The crates-local copy of the canonical feed golden

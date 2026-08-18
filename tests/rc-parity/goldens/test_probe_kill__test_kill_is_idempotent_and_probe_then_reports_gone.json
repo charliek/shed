@@ -1,0 +1,14 @@
+{
+  "accept_trust_missing": 4,
+  "kill": [
+    0,
+    "",
+    ""
+  ],
+  "kill_again": [
+    0,
+    "",
+    ""
+  ],
+  "probe_gone": 4
+}

@@ -1,0 +1,5 @@
+{
+  "mode": "0o600",
+  "plan": "# parity plan\n\n- step one\n- step two\n\ntrailing structure\n\n",
+  "state": "ready"
+}

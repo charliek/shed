@@ -1,0 +1,12 @@
+{
+  "OPENCODE_SERVER_PASSWORD": "",
+  "SHED_RC_CREATED_AT": "<ts>",
+  "SHED_RC_CREATED_BY": "<prog>",
+  "SHED_RC_DISPLAY_NAME": "parity-opencode",
+  "SHED_RC_ID": "<id>",
+  "SHED_RC_KIND": "opencode",
+  "SHED_RC_OPENCODE_PORT": "<port>",
+  "SHED_RC_SLUG": "bb2222",
+  "SHED_RC_V": "2",
+  "SHED_RC_WORKDIR": "<home>"
+}

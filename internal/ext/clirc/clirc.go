@@ -68,8 +68,9 @@ type deps struct {
 	// ensureHub best-effort spawns/verifies the local rc hub after a successful
 	// create. nil in tests (so create never forks a real daemon); Run wires the real
 	// detached-serve spawn. Gating it here keeps hub side effects out of the pure
-	// dispatch tests while giving production the ensure-on-create behavior.
-	ensureHub func(d deps)
+	// dispatch tests while giving production the ensure-on-create behavior. Takes
+	// cfg so the failure line carries this binary's own prog name.
+	ensureHub func(cfg Config, d deps)
 }
 
 // Run dispatches args with real process dependencies and returns a process exit code.
@@ -321,9 +322,9 @@ func doCreate(cfg Config, d deps, args []string) int {
 		Wait:             *wait,
 		InteractiveShell: *interactive,
 		PermissionMode:   mode,
-		Warnf:            warnHook(d),
+		Warnf:            warnHook(cfg, d),
 		BinProbe:         effectiveBinProbe(d, *interactive),
-		EnsureHub:        ensureHubHook(d),
+		EnsureHub:        ensureHubHook(cfg, d),
 	}, d.sleep)
 	if err != nil {
 		return fail(cfg, d, err)
@@ -559,31 +560,38 @@ func hubConfig(d deps) rc.HubConfig {
 }
 
 // realEnsureHub is the production ensureHub: spawn/verify the detached rc hub,
-// logging any (best-effort) failure to stderr. Wired only in Run so dispatch tests
-// never fork a real daemon.
-func realEnsureHub(d deps) {
-	rc.EnsureHub(hubConfig(d), d.stderr)
+// logging any (best-effort) failure to stderr under this binary's own prog name.
+// Wired only in Run so dispatch tests never fork a real daemon.
+func realEnsureHub(cfg Config, d deps) {
+	rc.EnsureHub(hubConfig(d), d.stderr, cfg.ProgName)
 }
 
 // warnHook returns the CreateOptions.Warnf callback, routing rc.Create's non-fatal
 // diagnostics (a skipped/failed preseed) to stderr so stdout stays the DTO the caller
-// parses. nil when no stderr is wired (tests), which discards them.
-func warnHook(d deps) func(string, ...any) {
+// parses. Prefixed with cfg.ProgName so shed-machine-rc reports as itself, not as
+// shed-ext-rc. nil when no stderr is wired (tests), which discards them.
+func warnHook(cfg Config, d deps) func(string, ...any) {
 	if d.stderr == nil {
 		return nil
 	}
 	return func(format string, args ...any) {
-		fmt.Fprintf(d.stderr, "shed-ext-rc: "+format+"\n", args...)
+		fmt.Fprintf(d.stderr, cfg.ProgName+": "+format+"\n", args...)
 	}
 }
 
 // ensureHubHook returns the CreateOptions.EnsureHub callback, or nil when no
-// ensureHub is wired (tests) so create performs no hub side effect.
-func ensureHubHook(d deps) func() {
+// ensureHub is wired (tests) so create performs no hub side effect. The
+// rc.EnvNoHub process-env kill-switch also yields nil — a hermetic harness must
+// be able to run `create` without every invocation spawning a detached daemon on
+// the fixed loopback port (explicit `serve` is unaffected).
+func ensureHubHook(cfg Config, d deps) func() {
 	if d.ensureHub == nil {
 		return nil
 	}
-	return func() { d.ensureHub(d) }
+	if d.getenv != nil && d.getenv(rc.EnvNoHub) != "" {
+		return nil
+	}
+	return func() { d.ensureHub(cfg, d) }
 }
 
 // doServe runs the local rc activity hub. With --detach it double-forks a detached
@@ -693,9 +701,9 @@ func doClaude(cfg Config, d deps, args []string) int {
 		Wait:             true,
 		InteractiveShell: true,
 		PermissionMode:   mode,
-		Warnf:            warnHook(d),
+		Warnf:            warnHook(cfg, d),
 		BinProbe:         effectiveBinProbe(d, true),
-		EnsureHub:        ensureHubHook(d),
+		EnsureHub:        ensureHubHook(cfg, d),
 	}, d.sleep)
 	if err != nil {
 		return fail(cfg, d, err)

@@ -34,6 +34,7 @@ jobs:
       packaging: ${{ steps.filter.outputs.packaging }}
       harness: ${{ steps.filter.outputs.harness }}
       hostagent: ${{ steps.filter.outputs.hostagent }}
+      rcparity: ${{ steps.filter.outputs.rcparity }}
       docs: ${{ steps.filter.outputs.docs }}
       ci: ${{ steps.filter.outputs.ci }}
     steps:
@@ -115,6 +116,31 @@ jobs:
               - 'internal/ext/protocol/**'
               - 'tests/host-agent-diff/**'
               - 'docs/development/host-agent-wire-catalog.md'
+              - 'go.mod'
+              - 'go.sum'
+            rcparity:
+              # The Go-vs-Rust RC-engine differential leg (plan 009): BOTH one-shot
+              # implementations, the harness that runs them side by side, and the
+              # shared build manifests a dependency bump would ride in on.
+              #
+              # Rust side: the ported engine (`shed-app`'s `rc` feature) over the
+              # pure kernel (`shed-core::rc_agents`), plus the `sx` CLI that is the
+              # binary under test. Go side: the engine (`internal/ext/rc`), its CLI
+              # shell (`internal/ext/clirc`) and BOTH binaries built from them — the
+              # oracle `shed-machine-rc` and the guest `shed-ext-rc`, which share the
+              # same wire surface.
+              - 'crates/shed-core/**'
+              - 'crates/shed-app/**'
+              - 'crates/sx/**'
+              - 'crates/Cargo.toml'
+              - 'crates/Cargo.lock'
+              - 'crates/rust-toolchain.toml'
+              - 'internal/ext/rc/**'
+              - 'internal/ext/clirc/**'
+              - 'internal/version/**'
+              - 'cmd/shed-machine-rc/**'
+              - 'cmd/shed-ext-rc/**'
+              - 'tests/rc-parity/**'
               - 'go.mod'
               - 'go.sum'
             docs:
@@ -542,6 +568,71 @@ jobs:
         # against the recorded goldens + the Rust golden-fixture runners.
         run: make test-host-agent-diff
 
+  # The Go↔Rust RC-engine parity leg (plan 009 §3.6) — the FOURTH pytest suite.
+  # Same organization as host-agent-diff above: one Linux job covers BOTH the
+  # Rust crates' own build/test/clippy AND the differential harness that drives
+  # the two binaries side by side. The cargo legs here are what close the §2.2
+  # gap — no other job compiles `shed-app --features rc` or `sx` at all, so
+  # without them the ported engine and the porcelain would only ever be built as
+  # a side effect of the harness (no tests, no clippy).
+  rc-parity:
+    name: rc-parity (Go↔Rust wire goldens)
+    needs: changes
+    if: ${{ needs.changes.outputs.rcparity == 'true' || needs.changes.outputs.ci == 'true' }}
+    runs-on: ubuntu-latest
+    # The only job in this workflow with a timeout: it drives REAL tmux sessions,
+    # so a wedged pane (an agent shim that never draws, a poller that never
+    # settles) is a hang rather than a failure. The whole leg runs in ~3 min
+    # locally; 30 minutes is generous headroom that still fails the same day.
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+      # Builds the Go oracle (`shed-machine-rc`) — same version as the other Go jobs.
+      - uses: actions/setup-go@v6
+        with:
+          go-version: '1.25'
+      - name: Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal --component clippy
+          rustc --version && cargo --version
+      # build-essential: ring's crypto backend (shed-core) needs a C toolchain.
+      # tmux: NOT preinstalled on GitHub runners, and it is the engine's hard
+      # dependency on both sides.
+      - name: C toolchain + tmux
+        run: sudo apt-get update && sudo apt-get install -y build-essential tmux
+      - name: Assert tmux >= 3.2
+        # `new-session -e` (how BOTH implementations stamp session metadata)
+        # arrived in tmux 3.2. The harness asserts this too, but only after
+        # building both binaries — failing here makes the cause unmistakable.
+        run: |
+          set -euo pipefail
+          raw="$(tmux -V)"
+          echo "${raw}"
+          major="$(printf '%s' "${raw}" | sed -E 's/^tmux[^0-9]*([0-9]+)\.([0-9]+).*/\1/')"
+          minor="$(printf '%s' "${raw}" | sed -E 's/^tmux[^0-9]*([0-9]+)\.([0-9]+).*/\2/')"
+          if [ "${major}" -lt 3 ] || { [ "${major}" -eq 3 ] && [ "${minor}" -lt 2 ]; }; then
+            echo "::error::${raw} is below the 3.2 floor required by \`new-session -e\`"
+            exit 1
+          fi
+      - uses: astral-sh/setup-uv@v6
+      # The ported engine lives behind shed-app's non-default `rc` feature and the
+      # porcelain is `sx` — neither is reached by core-linux (`-p shed-core`) or by
+      # host-agent-diff (`-p shed-broker -p shed-host-agent`). Both are named
+      # explicitly: a filter that matched nothing would run ZERO tests silently
+      # (the lesson recorded on `test-host-agent-diff` in the Makefile).
+      - name: Rust engine + porcelain — test + clippy (Linux)
+        working-directory: crates
+        run: |
+          cargo test -p shed-app --features rc --all-targets --locked
+          cargo clippy -p shed-app --features rc --all-targets --locked -- -D warnings
+          cargo test -p sx --all-targets --locked
+          cargo clippy -p sx --all-targets --locked -- -D warnings
+      - name: Go↔Rust parity harness
+        # Builds BOTH implementations and runs every differential cell against the
+        # committed goldens (a clean unfiltered run, so the stale-golden sweep is
+        # armed).
+        run: make test-rc-parity
+
   deb:
     name: deb
     needs: changes
@@ -739,12 +830,12 @@ jobs:
   ci-success:
     name: ci-success
     if: always()
-    needs: [changes, test, lint, plugin, release-snapshot, swift, core-linux, host-agent-diff, deb, tauri-linux, tauri-mac, docs-build]
+    needs: [changes, test, lint, plugin, release-snapshot, swift, core-linux, host-agent-diff, rc-parity, deb, tauri-linux, tauri-mac, docs-build]
     runs-on: ubuntu-latest
     steps:
       - name: Require no job failed (skipped-by-filter counts as pass)
         run: |
-          results="${{ needs.changes.result }} ${{ needs.test.result }} ${{ needs.lint.result }} ${{ needs.plugin.result }} ${{ needs.release-snapshot.result }} ${{ needs.swift.result }} ${{ needs.core-linux.result }} ${{ needs.host-agent-diff.result }} ${{ needs.deb.result }} ${{ needs.tauri-linux.result }} ${{ needs.tauri-mac.result }} ${{ needs.docs-build.result }}"
+          results="${{ needs.changes.result }} ${{ needs.test.result }} ${{ needs.lint.result }} ${{ needs.plugin.result }} ${{ needs.release-snapshot.result }} ${{ needs.swift.result }} ${{ needs.core-linux.result }} ${{ needs.host-agent-diff.result }} ${{ needs.rc-parity.result }} ${{ needs.deb.result }} ${{ needs.tauri-linux.result }} ${{ needs.tauri-mac.result }} ${{ needs.docs-build.result }}"
           echo "job results: ${results}"
           for r in ${results}; do
             case "${r}" in

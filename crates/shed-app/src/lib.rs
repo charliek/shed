@@ -16,6 +16,11 @@ pub mod fakes;
 pub mod host_agent;
 #[cfg(feature = "rc")]
 pub mod rc;
+/// The ported one-shot RC **engine** (plan 009 C3) — the local, synchronous
+/// producer of RC sessions, as opposed to [`rc`]'s async client of a REMOTE one.
+/// Behind the same `rc` feature: a consumer that has no RC pane wants neither.
+#[cfg(feature = "rc")]
+pub mod rc_engine;
 pub mod rc_events_watcher;
 pub mod timefmt;
 pub mod token_minter;
@@ -40,6 +45,11 @@ pub use host_agent::{
 };
 #[cfg(feature = "rc")]
 pub use rc::{RcRunner, RcRunnerRef, RcService, RunOutput, TokioProcessRunner};
+#[cfg(feature = "rc")]
+pub use rc_engine::{
+    CreateOptions as RcCreateOptions, Engine as RcEngine, EngineError as RcEngineError, ExecRunner,
+    PromptOptions as RcPromptOptions, TmuxResult, TmuxRunner,
+};
 pub use rc_events_watcher::{RcEventsWatcher, RcWatcherUpdate};
 pub use token_minter::HostAgentTokenMinter;
 pub use traits::{

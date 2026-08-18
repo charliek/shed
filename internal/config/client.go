@@ -26,6 +26,14 @@ type ClientConfig struct {
 	Sheds         map[string]ShedCache   `yaml:"sheds"`
 	CreateTimeout time.Duration          `yaml:"create_timeout,omitempty"`
 
+	// Machines is an OPAQUE passthrough of the `machines:` section owned by the
+	// Rust porcelain (sx) — remote-machine targets for rc-session kickoff. Go
+	// neither reads nor validates it (the schema is defined Rust-side); the field
+	// exists ONLY so SaveToPath's whole-document rewrite round-trips the subtree
+	// instead of silently deleting user data on the next `shed` command that
+	// updates this file (cache refresh, `shed server add`, token mint…).
+	Machines yaml.Node `yaml:"machines,omitempty"`
+
 	// updateMu serializes Update against itself inside THIS process, so the
 	// read-modify-write it performs on the in-memory maps is never interleaved
 	// with another goroutine's.

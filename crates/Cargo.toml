@@ -4,14 +4,19 @@
 # standalone workspace in ../tauri/src-tauri) linking shed-core + shed-app directly.
 [workspace]
 resolver = "2"
-members = ["shed-core", "shed-core-ffi", "shed-app", "shedctl", "shed-broker", "shed-host-agent"]
+members = ["shed-core", "shed-core-ffi", "shed-app", "shedctl", "shed-broker", "shed-host-agent", "sx"]
 # All members are default members: a plain `cargo build` / `cargo test` (and
 # `make core-test`) build shed-core + shed-core-ffi + shed-app + shedctl. shedctl
 # (the headless Linux CLI driver for the shed-desktop IPC socket) has no GUI-toolkit
 # dependency, so it gets Mac `cargo test` coverage too; the Mac bundle is unaffected
 # (build-core.sh is `-p shed-core-ffi`-scoped). The Tauri client (WebKitGTK) lives
 # in its OWN workspace so its heavy deps never enter this one.
-default-members = ["shed-core", "shed-core-ffi", "shed-app", "shedctl", "shed-broker", "shed-host-agent"]
+#
+# `sx` (the RC porcelain, plan 009) is a member AND a default member: it is a
+# plain CLI on shed-core + shed-app, so it belongs in every workspace-wide build
+# and test. It enables shed-app's non-default `rc` feature itself, which is why
+# `cargo build -p sx` (the parity harness's build step) needs no extra flags.
+default-members = ["shed-core", "shed-core-ffi", "shed-app", "shedctl", "shed-broker", "shed-host-agent", "sx"]
 
 [workspace.package]
 version = "0.8.1"

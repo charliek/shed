@@ -1,0 +1,5 @@
+{
+  "code": 2,
+  "stderr": "<prog>: invalid arguments: invalid slug \"BAD_slug!\"",
+  "stdout": ""
+}
