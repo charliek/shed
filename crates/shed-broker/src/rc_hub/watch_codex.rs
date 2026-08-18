@@ -406,17 +406,26 @@ fn codex_message_text(content: &Value) -> String {
         #[serde(default, deserialize_with = "null_default")]
         text: String,
     }
-    // Go's whole-array unmarshal errors on a non-array OR a non-object
-    // element (the positional form serde would accept — RES-3).
+    // Element-wise with FULL Go semantics: a non-array yields "", a `null`
+    // element is the zero block (Go's null no-op applies at array-element
+    // level too — H6 review), and any other non-object element fails the
+    // whole array (the positional form serde would accept — RES-3).
     let Some(arr) = content.as_array() else {
         return String::new();
     };
-    if !arr.iter().all(Value::is_object) {
-        return String::new();
+    let mut blocks = Vec::with_capacity(arr.len());
+    for el in arr {
+        if el.is_null() {
+            blocks.push(TextBlock::default());
+        } else if el.is_object() {
+            let Ok(b) = TextBlock::deserialize(el) else {
+                return String::new();
+            };
+            blocks.push(b);
+        } else {
+            return String::new();
+        }
     }
-    let Ok(blocks) = Vec::<TextBlock>::deserialize(content) else {
-        return String::new();
-    };
     let mut out = String::new();
     for b in blocks {
         if !b.text.is_empty() {
@@ -850,6 +859,17 @@ mod tests {
             peek_codex_rollout(absent.to_str().unwrap()).is_none(),
             "an absent payload fails the peek, like Go"
         );
+    }
+
+    // The null-ELEMENT pin (H6 review, HIGH): a null message-content element
+    // is the zero block, like Go — the surrounding text still folds.
+    #[test]
+    fn codex_null_content_element() {
+        let mut f = CodexFold::new();
+        assert!(f.apply_line(
+            br#"{"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"text":"a"},null]}}"#
+        ));
+        assert_eq!(f.last_message(), "a");
     }
 
     // RES-3 pins (H5 review re-run): the top-level seq form and a seq-form

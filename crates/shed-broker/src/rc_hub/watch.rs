@@ -15,9 +15,9 @@
 //! From H5 it also carries the fold contracts ([`ActivityFold`] /
 //! [`MessageProducer`] — Go's `activityFold`/`messageProducer` interfaces,
 //! `watch.go:73`/`107`) and `listJSONLUnder`, consumed by the per-kind folds in
-//! [`super::watch_claude`] / [`super::watch_codex`] / [`super::watch_cursor`].
-//! Still Go-only until their commits: `fileWatcher` + `fsNudger` (H7 —
-//! transports), the opencode fold (H6) and its SSE transport (H8).
+//! [`super::watch_claude`] / [`super::watch_codex`] / [`super::watch_cursor`] /
+//! [`super::watch_opencode`]. Still Go-only until their commits: `fileWatcher`
+//! + `fsNudger` (H7 — transports) and the opencode SSE transport (H8).
 
 use std::path::Path;
 use std::time::Duration;
@@ -110,8 +110,8 @@ fn walk_jsonl(dir: &Path, matches: &impl Fn(&str) -> bool, out: &mut Vec<String>
 }
 
 /// Renders a raw JSON value as compact (whitespace-stripped) text — used for a
-/// tool_use's input detail (`compactJSON`, `watch_opencode.go:932`; consumed
-/// by the cursor fold now, the opencode fold at H6). Mirrors Go's
+/// tool_use's input detail (`compactJSON`, `watch_opencode.go:932`; consumed by
+/// the cursor and opencode folds). Mirrors Go's
 /// `json.Compact`: the ORIGINAL bytes minus inter-token whitespace — no
 /// reordering, no number reformatting — falling back to the trimmed raw text
 /// when the value is not valid JSON.
@@ -203,7 +203,7 @@ where
 pub(crate) fn vec_objects<'de, D, T>(d: D) -> Result<Vec<T>, D::Error>
 where
     D: serde::Deserializer<'de>,
-    T: serde::de::DeserializeOwned,
+    T: serde::de::DeserializeOwned + Default,
 {
     let raws: Option<Vec<Box<serde_json::value::RawValue>>> = serde::Deserialize::deserialize(d)?;
     let Some(raws) = raws else {
@@ -212,12 +212,44 @@ where
     raws.into_iter()
         .map(|r| {
             let s = r.get().trim();
-            if !s.starts_with('{') {
-                return Err(serde::de::Error::custom("expected a JSON object element"));
+            if s.starts_with('{') {
+                return serde_json::from_str::<T>(s).map_err(serde::de::Error::custom);
             }
-            serde_json::from_str::<T>(s).map_err(serde::de::Error::custom)
+            if s == "null" {
+                // Go's null-is-a-no-op applies at EVERY level, array elements
+                // included: a null element decodes to the zero value (H6
+                // review, HIGH).
+                return Ok(T::default());
+            }
+            Err(serde::de::Error::custom("expected a JSON object element"))
         })
         .collect()
+}
+
+/// A `Vec<String>` field with FULL Go null semantics (H6 review, HIGH): the
+/// field itself may be `null` (nil slice → empty) and so may any ELEMENT
+/// (Go's `[]string` decodes a null element as `""`); a wrong-typed element
+/// still errors, like Go.
+pub(crate) fn null_string_vec<'de, D>(d: D) -> Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let v: Option<Vec<Option<String>>> = serde::Deserialize::deserialize(d)?;
+    Ok(v.unwrap_or_default()
+        .into_iter()
+        .map(Option::unwrap_or_default)
+        .collect())
+}
+
+/// [`object_opt`] for a NON-pointer nested struct field (Go's value-typed
+/// nested structs, e.g. a part's `time`): an object decodes, `null` no-ops to
+/// the zero value, any other shape errors.
+pub(crate) fn object_default<'de, D, T>(d: D) -> Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::de::DeserializeOwned + Default,
+{
+    Ok(object_opt(d)?.unwrap_or_default())
 }
 
 /// The first non-whitespace byte of a JSON document (Go's decoder skips

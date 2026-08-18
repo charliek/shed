@@ -28,6 +28,9 @@
 //! - [`watch_cursor`] — the cursor hook-event fold + transcript
 //!   restart-backfill (`watch_cursor.go`'s pure half; the push-fed watcher
 //!   wrapper follows in H7).
+//! - [`watch_opencode`] — the opencode pure fold: approval seed halves,
+//!   reopen rule, tombstones, question rows (`watch_opencode.go`; its
+//!   SSE/REST transport follows in H8).
 
 pub mod messages;
 pub mod stability;
@@ -36,3 +39,4 @@ pub mod watch;
 pub mod watch_claude;
 pub mod watch_codex;
 pub mod watch_cursor;
+pub mod watch_opencode;

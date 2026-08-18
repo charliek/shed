@@ -245,12 +245,22 @@ impl ActivityFold for ClaudeFold {
 /// one bad element; `from_value` on the array mirrors that).
 fn claude_blocks(content: Option<&Value>) -> Option<Vec<ClaudeBlock>> {
     let arr = content?.as_array()?;
-    // Go's whole-array unmarshal errors on a non-object element (the
-    // positional seq form serde would accept — RES-3).
-    if !arr.iter().all(Value::is_object) {
-        return None;
+    // Element-wise with FULL Go semantics: an object decodes, a `null`
+    // element is the zero block (Go's null-is-a-no-op applies at every level,
+    // array elements included — H6 review), and any other shape fails the
+    // whole array like Go's unmarshal (the positional seq form serde would
+    // accept — RES-3).
+    let mut blocks = Vec::with_capacity(arr.len());
+    for el in arr {
+        if el.is_null() {
+            blocks.push(ClaudeBlock::default());
+        } else if el.is_object() {
+            blocks.push(ClaudeBlock::deserialize(el).ok()?);
+        } else {
+            return None;
+        }
     }
-    Vec::<ClaudeBlock>::deserialize(content?).ok()
+    Some(blocks)
 }
 
 // ---- correlation ----
@@ -545,6 +555,19 @@ mod tests {
         // A non-object BLOCK element fails the array, like Go.
         assert!(!f2.apply_line(br#"{"type":"assistant","message":{"content":[["text","x"]]}}"#));
         assert_eq!(f2.activity(), RcActivity::Unknown);
+    }
+
+    // The null-ELEMENT pin (H6 review, HIGH): a null content-block element
+    // decodes as the zero block, like Go — the line (and its text preview)
+    // must survive.
+    #[test]
+    fn claude_fold_null_block_element() {
+        let mut f = ClaudeFold::new();
+        assert!(f.apply_line(
+            br#"{"type":"assistant","message":{"content":[{"type":"text","text":"a"},null]}}"#
+        ));
+        assert_eq!(f.activity(), RcActivity::NeedsInput);
+        assert_eq!(f.last_message(), "a");
     }
 
     // Mirrors TestEncodeClaudeProject (watch_test.go:1032).

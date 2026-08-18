@@ -1349,6 +1349,17 @@ mod tests {
         assert_eq!(rows[0].tool.as_ref().unwrap().detail, r#"["x"]"#);
     }
 
+    // The null-ELEMENT pin (H6 review, HIGH): a null transcript content
+    // block is the zero block, like Go — the real row survives.
+    #[test]
+    fn transcript_null_content_element() {
+        let rows = parse_cursor_transcript_line(
+            br#"{"role":"assistant","message":{"content":[{"type":"text","text":"a"},null]}}"#,
+        );
+        assert_eq!(rows.len(), 1, "rows: {rows:?}");
+        assert_eq!(rows[0].text, "a");
+    }
+
     // ---- transcript backfill ----
 
     // Mirrors TestCursorSlugForWorkdir (watch_cursor_transcript_test.go:23).
