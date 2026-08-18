@@ -38,6 +38,11 @@
 //! - [`watch_opencode`] — the opencode pure fold: approval seed halves,
 //!   reopen rule, tombstones, question rows (`watch_opencode.go`; its
 //!   SSE/REST transport follows in H8).
+//! - [`watch_opencode_transport`] — the opencode SSE/REST transport + verb
+//!   lane (H8): the run-thread connect→pin→seed→live state machine with its
+//!   generation barriers, the approvals claim FSM, the hand-rolled loopback
+//!   HTTP client (the plan's sanctioned TcpStream fallback — close() must
+//!   unblock a blocked read), and the private SSE scanner.
 //! - Transports I (H7): the [`watch`] module additionally carries the
 //!   `SessionWatcher` contract + `FileWatcher` + the `notify`-backed
 //!   `FsNudger`; [`watch_cursor`] the push-fed `CursorWatcher`; [`ingest`]
@@ -53,3 +58,4 @@ pub mod watch_claude;
 pub mod watch_codex;
 pub mod watch_cursor;
 pub mod watch_opencode;
+pub mod watch_opencode_transport;
