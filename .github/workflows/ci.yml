@@ -104,6 +104,9 @@ jobs:
               # A change there is a change to the shipped daemon's behavior, so it must
               # trigger the differential harness + the release-snapshot.
               - 'crates/shed-broker/**'
+              # shed-broker depends on shed-rc-engine from plan 010 H4 (the rc_hub
+              # port), so an engine-only change now reaches the shipped daemon too.
+              - 'crates/shed-rc-engine/**'
               # The Rust host-agent has a path-dep on shed-core, and the release
               # build (builder: rust) reads rust-toolchain.toml — a change to
               # either can break the shipped binary, so both must trigger the
@@ -133,6 +136,10 @@ jobs:
               - 'crates/shed-core/**'
               - 'crates/shed-app/**'
               - 'crates/shed-rc-engine/**'
+              # The hub port (plan 010): shed-broker carries `rc_hub` — the Rust
+              # side of the hub differential family — from H4 on, so a
+              # broker-only PR must not skip the wire gate.
+              - 'crates/shed-broker/**'
               - 'crates/sx/**'
               - 'crates/Cargo.toml'
               - 'crates/Cargo.lock'
@@ -143,6 +150,12 @@ jobs:
               - 'cmd/shed-machine-rc/**'
               - 'cmd/shed-ext-rc/**'
               - 'tests/rc-parity/**'
+              # The crates-local fixture COPIES (panes, jsonl, wire goldens).
+              # The byte-parity sweep that guards them is a Go test, and the
+              # `go` filter excludes crates/** — so a copy-only edit would
+              # otherwise run NO job that executes the guard. This filter plus
+              # the fixture-guard step in the rc-parity job below close that.
+              - 'crates/fixtures/**'
               - 'go.mod'
               - 'go.sum'
             docs:
@@ -681,6 +694,13 @@ jobs:
           cargo clippy -p shed-app --features rc --all-targets --locked -- -D warnings
           cargo test -p sx --all-targets --locked
           cargo clippy -p sx --all-targets --locked -- -D warnings
+      - name: Fixture-copy byte-parity guard
+        # The crates-local fixture copies (crates/fixtures/{panes,jsonl} + the
+        # wire goldens) are guarded by Go sweeps in internal/ext/rc — but the
+        # `go` job's filter excludes crates/**, so a copy-only edit reaches
+        # ONLY this job (via the rcparity filter's crates/fixtures/** entry).
+        # Run the sweeps here so copy drift can never land green.
+        run: go test ./internal/ext/rc/ -run 'CopiesAreByteIdentical' -count=1
       - name: Go↔Rust parity harness
         # Builds BOTH implementations and runs every differential cell against the
         # committed goldens (a clean unfiltered run, so the stale-golden sweep is

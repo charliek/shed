@@ -28,6 +28,21 @@ libc = "0.2"
 # leaf-cert TLS pin verifier (tls.rs). Always-on because the bus is not
 # feature-gated.
 shed-core = { path = "../shed-core" }
+# The RC engine (plan 010): rc_hub sits on its tmux verb layer (the
+# show/set-environment seams under the correlation back-write land in H4; the
+# reconcile loop's capture/list verbs follow). This dep is exactly why the
+# engine graduated out of shed-app — a broker→shed-app dep would cycle through
+# shed-app's `broker` feature.
+shed-rc-engine = { path = "../shed-rc-engine" }
+# rc_hub's pane-stability normalizers + the ANSI-escape stripper (ports of the
+# Go `regexp` tables in stability.go / activity.go). Same pin as shed-core's.
+regex = "1"
+# rc_hub's time currency: the hub's freshness windows, ring timestamps, and
+# JSONL correlation stamps all mirror Go `time.Time` semantics (sub-second
+# durations, RFC3339(nano) parse, second-precision UTC `Z` format). Same
+# minimal pin as shed-rc-engine's clock seam; no `clock` feature — the hub is
+# clock-injected end to end.
+chrono = { version = "0.4", default-features = false, features = ["std"] }
 async-trait = { workspace = true }
 uuid = { workspace = true }
 # The host-agent config reader's YAML parser (config.rs `yaml_lite` mod). The repo's

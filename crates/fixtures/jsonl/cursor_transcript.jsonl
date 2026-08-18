@@ -1,0 +1,5 @@
+{"role":"user","message":{"content":[{"type":"text","text":"Run the build and report results."}]}}
+{"role":"assistant","message":{"content":[{"type":"text","text":"Running the build now."},{"type":"tool_use","name":"Shell","input":{"command":"make build","description":"Run the build"}}]}}
+{"role":"assistant","message":{"content":[{"type":"text","text":"Build succeeded."}]}}
+{"role":"user","message":{"content":[{"type":"text","text":"Thanks"}]}}
+{"type":"turn_ended","status":"completed"}

@@ -53,6 +53,11 @@ pub mod docker_backend;
 // The always-on egress-audit SSE consumer — internal; the supervisor spawns it.
 mod egress;
 pub mod minter;
+// The RC activity hub (plan 010): the Go machine hub (`shed-machine-rc serve`)
+// ported into the broker core so the `shed-host-agent` daemon can host it (and
+// the desktop can embed it later). Grows file-by-file against the Go originals
+// in `internal/ext/rc/` — see `docs/discovery/rc-hub-port.md` for the map.
+pub mod rc_hub;
 pub mod sockets;
 pub mod ssh_backend;
 #[cfg(test)]

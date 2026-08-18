@@ -97,6 +97,9 @@ PATHS_SERVER=(
 PATHS_HOST_AGENT=(
   crates/shed-host-agent
   crates/shed-broker
+  # shed-broker depends on shed-rc-engine from plan 010 H4 (the rc_hub port),
+  # so an engine-only change now reaches the shipped host-agent binary.
+  crates/shed-rc-engine
   crates/shed-core
   crates/rust-toolchain.toml
   configs/extensions.example.yaml

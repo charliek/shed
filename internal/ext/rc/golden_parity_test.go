@@ -89,12 +89,34 @@ func TestGoldenCopiesAreByteIdentical(t *testing.T) {
 // anchor is exactly the case where forgetting to mirror it would let the two
 // implementations diverge silently, so an uncopied (or orphaned) fixture fails here.
 func TestPaneFixtureCopiesAreByteIdentical(t *testing.T) {
-	repoRoot := filepath.Join("..", "..", "..")
+	assertFixtureDirCopyByteIdentical(t,
+		"internal/ext/rc/testdata/panes",
+		"crates/fixtures/panes",
+		"`go test ./internal/ext/rc/` and `cd crates && cargo test -p shed-core rc_agents`")
+}
 
-	// Repo-relative so a failure message prints a command a developer can paste at
-	// the repo root verbatim.
-	const canonicalDir = "internal/ext/rc/testdata/panes"
-	const copyDir = "crates/fixtures/panes"
+// The JSONL turn-stream fixtures under testdata/jsonl/ are the folds' SHARED tables
+// (plan 010 H4): this package's fold tests drive them through
+// codexFold/claudeFold/opencodeFold and the cursor transcript backfill, and the Rust
+// hub's fold mirrors (crates/shed-broker/src/rc_hub/) consume the crates-local copy.
+// The copies land with the sweep at H4 so the guard exists BEFORE their Rust
+// consumers arrive with the folds (H5/H6). Same directory-derived sweep as the panes
+// above, same rationale.
+func TestJSONLFixtureCopiesAreByteIdentical(t *testing.T) {
+	assertFixtureDirCopyByteIdentical(t,
+		"internal/ext/rc/testdata/jsonl",
+		"crates/fixtures/jsonl",
+		"`go test ./internal/ext/rc/` and `cd crates && cargo test -p shed-broker rc_hub`")
+}
+
+// assertFixtureDirCopyByteIdentical enumerates a canonical fixture directory and its
+// crates-local copy and requires the two file SETS to be equal and every file to be
+// byte-identical. Paths are repo-relative so a failure message prints commands a
+// developer can paste at the repo root verbatim; reRun names the consuming test
+// commands to re-run after a re-copy.
+func assertFixtureDirCopyByteIdentical(t *testing.T, canonicalDir, copyDir, reRun string) {
+	t.Helper()
+	repoRoot := filepath.Join("..", "..", "..")
 
 	names := func(dir string) []string {
 		entries, err := os.ReadDir(filepath.Join(repoRoot, dir))
@@ -114,14 +136,14 @@ func TestPaneFixtureCopiesAreByteIdentical(t *testing.T) {
 
 	canonical := names(canonicalDir)
 	if len(canonical) == 0 {
-		t.Fatalf("no pane fixtures found under %s", canonicalDir)
+		t.Fatalf("no fixtures found under %s", canonicalDir)
 	}
 	copies := names(copyDir)
 
 	for _, name := range canonical {
 		if !slices.Contains(copies, name) {
 			t.Errorf("%s/%s has no copy under %s.\n"+
-				"The pane fixtures are byte-identical copies by convention — re-copy the whole "+
+				"The fixtures are byte-identical copies by convention — re-copy the whole "+
 				"directory (from the repo root):\n  cp -a %s/. %s/",
 				canonicalDir, name, copyDir, canonicalDir, copyDir)
 			continue
@@ -139,9 +161,8 @@ func TestPaneFixtureCopiesAreByteIdentical(t *testing.T) {
 		if !bytes.Equal(want, got) {
 			t.Errorf("%s/%s has drifted from the canonical %s/%s.\n"+
 				"Re-copy it (from the repo root):\n  cp %s/%s %s/%s\n"+
-				"then re-run both consumers: `go test ./internal/ext/rc/` and "+
-				"`cd crates && cargo test -p shed-core rc_agents`.",
-				copyDir, name, canonicalDir, name, canonicalDir, name, copyDir, name)
+				"then re-run both consumers: %s.",
+				copyDir, name, canonicalDir, name, canonicalDir, name, copyDir, name, reRun)
 		}
 	}
 	for _, name := range copies {
