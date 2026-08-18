@@ -2,9 +2,9 @@
 the sessions overlay, messages paging, the whole 4xx/409 matrix for the four
 POST verbs, and the bare-mux status shapes.
 
-Recorded from the Go hub BEFORE any Rust hub exists (`hub_differential` is
-Go-only until H12) — these goldens ARE the frozen `/v1` wire the Rust port must
-answer byte-for-byte under this canonicalization.
+Their goldens were recorded from the Go hub BEFORE any Rust hub existed (the
+H1½ Go-only phase) — the frozen `/v1` wire — and since H12 both legs answer
+them equality-then-pin under this canonicalization.
 
 Every cell that needs a session uses a pinned slug and polls the hub until the
 reconcile loop has tracked it; nothing here sleeps. The codex kind is the
@@ -13,7 +13,7 @@ contract-v2 verbs deterministically rejected (`not_supported` — codex
 advertises none), and its static shim pane settles to a stable activity under
 the fast-tick tuning. `input` is NOT in this family's tracked-session cells on
 purpose: codex input is `gated` (it would type into the live shim pane) — the
-delivery path is the side-effect family's territory (H12).
+delivery path is the side-effect family's territory (`test_hub_effects.py`).
 """
 
 import json

@@ -1,0 +1,7 @@
+{
+  "body": {
+    "error": "not_supported",
+    "message": "this session's kind does not ingest cursor hook events"
+  },
+  "status": 409
+}

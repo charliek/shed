@@ -218,7 +218,11 @@ def binaries(tmp_path_factory) -> dict:
     cargo_env["PATH"] = (
         str(Path.home() / ".cargo" / "bin") + os.pathsep + cargo_env.get("PATH", "")
     )
-    _build(["cargo", "build", "-p", "sx"], cwd=CRATES_ROOT, env=cargo_env)
+    _build(
+        ["cargo", "build", "-p", "sx", "-p", "shed-host-agent", "--locked"],
+        cwd=CRATES_ROOT,
+        env=cargo_env,
+    )
     env_target = os.environ.get("CARGO_TARGET_DIR")
     if env_target:
         target_dir = Path(env_target)
@@ -228,8 +232,13 @@ def binaries(tmp_path_factory) -> dict:
         target_dir = CRATES_ROOT / "target"
     rust_bin = target_dir / "debug" / "sx"
     assert rust_bin.exists(), f"rust binary missing: {rust_bin}"
+    # The hub family's Rust daemon (plan 010 H12): the host-agent binary whose
+    # `rc-hub` subcommand is the harness leg. The Go hub daemon needs no extra
+    # build — it IS shed-machine-rc (`serve --foreground`).
+    rust_hub_bin = target_dir / "debug" / "shed-host-agent"
+    assert rust_hub_bin.exists(), f"rust hub binary missing: {rust_hub_bin}"
 
-    return {"go": str(go_bin), "rust": str(rust_bin)}
+    return {"go": str(go_bin), "rust": str(rust_bin), "rust_hub": str(rust_hub_bin)}
 
 
 @pytest.fixture(scope="session")
@@ -852,11 +861,11 @@ def differential(request):
 # never an explicit `serve`, and the `hub_port_guard` stays green because every
 # hub binds an ephemeral port, not 1029.
 #
-# PHASING: until the Rust hub exists (plan 010 H12), `hub_differential` runs the
-# Go leg only and pins its golden — the wire is frozen before any Rust is
-# written. Flip `HUB_RUST_LIVE` at H12 to light up the equality compare.
+# PHASING: from H12 both legs run and every cell is equality-then-pin — the
+# H1½..H11 goldens (recorded from the Go hub alone) are the frozen wire the
+# Rust hub now has to match before anything is (re)pinned.
 
-HUB_RUST_LIVE = False
+HUB_RUST_LIVE = True
 
 # Fast ticks for the differential (both legs ALWAYS get the same values):
 # active/idle drive reconcile latency, quiet drives stability settle, idle-exit
@@ -885,19 +894,21 @@ class HubLeg(Leg):
     PATH) so it observes exactly the sessions this leg's CLI creates. Its
     stdout/stderr go to `$HOME/hub.log` for post-mortems."""
 
-    def __init__(self, *args, **kwargs):
+    def __init__(self, *args, hub_binary: str | None = None, **kwargs):
         super().__init__(*args, **kwargs)
         self.hub_port = _free_loopback_port()
         self.hub_addr = f"127.0.0.1:{self.hub_port}"
+        # The DAEMON binary. Go's hub lives inside the CLI binary
+        # (`shed-machine-rc serve`); the Rust hub lives in the host-agent
+        # (`shed-host-agent rc-hub`) while the CLI half of this leg stays sx.
+        self.hub_binary = hub_binary or self.binary
         self._hub_proc: subprocess.Popen | None = None
         self._hub_log = None
 
     def _hub_argv(self) -> list:
         if self.impl == "go":
-            return [self.binary, "serve", "--foreground"]
-        raise NotImplementedError(
-            "the Rust hub leg lights up at plan-010 H12 (`shed-host-agent rc-hub`)"
-        )
+            return [self.hub_binary, "serve", "--foreground"]
+        return [self.hub_binary, "rc-hub"]
 
     def start_hub(self) -> None:
         assert self._hub_proc is None, f"{self.label}: hub already started"
@@ -958,6 +969,96 @@ class HubLeg(Leg):
             except ValueError:
                 parsed = None
         return {"status": status, "json": parsed}
+
+    def hub_events_until(
+        self, what: str, predicate, timeout: float = 20, on_subscribed=None
+    ) -> list:
+        """Read SSE EVENTS (comments dropped) from ONE `/v1/events`
+        subscription until `predicate(events)` is truthy; returns every event
+        read, in arrival order (the within-tick ordering is wire). Bounded:
+        raises on the deadline rather than blocking forever. Reads go through
+        `HTTPResponse.read1`, which de-chunks (both hubs stream chunked).
+
+        `on_subscribed` (if given) runs after the literal `: ok` opener is
+        read — the server-side proof the subscriber is REGISTERED — so a cell
+        can trigger the events it wants to observe with no subscription race
+        (subscribe → act → read, never act-then-hope)."""
+        conn = http.client.HTTPConnection("127.0.0.1", self.hub_port, timeout=5)
+        events: list = []
+        buf = b""
+        try:
+            conn.request("GET", "/v1/events")
+            resp = conn.getresponse()
+            assert resp.status == 200, f"{self.label}: /v1/events status {resp.status}"
+            deadline = time.monotonic() + timeout
+
+            def read_line() -> str:
+                nonlocal buf
+                while b"\n" not in buf:
+                    assert time.monotonic() < deadline, (
+                        f"{self.label}: {what} — read {len(events)} events before "
+                        f"the deadline: {events!r}"
+                    )
+                    try:
+                        chunk = resp.read1(4096)
+                    except (TimeoutError, OSError):
+                        # A heartbeat gap longer than the socket timeout: let
+                        # the deadline assert above be the one that speaks.
+                        continue
+                    if not chunk:
+                        raise AssertionError(f"{self.label}: SSE stream ended early")
+                    buf += chunk
+                line, _, buf = buf.partition(b"\n")
+                return line.decode().rstrip("\r")
+
+            if on_subscribed is not None:
+                opener = read_line()
+                assert opener == ": ok", (
+                    f"{self.label}: the stream must open with the literal "
+                    f"`: ok` comment, got {opener!r}"
+                )
+                read_line()  # its trailing blank line
+                on_subscribed()
+                # The trigger (a full create, on the appear cell) has its own
+                # timeout; restart the deadline so `timeout` bounds WAITING
+                # FOR FRAMES, not the trigger.
+                deadline = time.monotonic() + timeout
+
+            name, data_lines = None, []
+            while not predicate(events):
+                assert time.monotonic() < deadline, (
+                    f"{self.label}: {what} — read {len(events)} events before the "
+                    f"deadline: {events!r}"
+                )
+                text = read_line()
+                if text.startswith(":"):
+                    continue  # `: ok` opener + heartbeats — liveness, not wire
+                if text.startswith("event: "):
+                    name = text[len("event: ") :]
+                elif text.startswith("data: "):
+                    data_lines.append(text[len("data: ") :])
+                elif text == "" and (name or data_lines):
+                    events.append(
+                        {"event": name, "data": json.loads("\n".join(data_lines))}
+                    )
+                    name, data_lines = None, []
+        finally:
+            conn.close()
+        return events
+
+    def hub_events_socket(self):
+        """A RAW subscribed socket for the stalled-reader cell: the request is
+        written and the response is never read. Caller closes it."""
+        # A tiny receive buffer closes the TCP window once the hub has written
+        # a few KB — what makes the write deadline observable without megabytes
+        # of traffic. It must be set BEFORE connect (the window is negotiated
+        # at the handshake; shrinking afterwards has no reliable effect).
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1)
+        sock.settimeout(10)
+        sock.connect(("127.0.0.1", self.hub_port))
+        sock.sendall(b"GET /v1/events HTTP/1.1\r\nHost: hub\r\n\r\n")
+        return sock
 
     def wait_hub(self, what: str, predicate, timeout: float = 15):
         """Deadline-poll an observable through the hub API (never a sleep)."""
@@ -1028,7 +1129,15 @@ def hub_leg(binaries, tmux_bin, tmp_path_factory):
             # Register BEFORE start_hub: a failed/slow health handshake raises,
             # and an unregistered leg's daemon (idle-exit pinned to 24h) would
             # outlive the pytest process on its port, log handle open.
-            leg = HubLeg(impl, binaries[impl], home, tmux_tmpdir, tmux_bin, shims)
+            leg = HubLeg(
+                impl,
+                binaries[impl],
+                home,
+                tmux_tmpdir,
+                tmux_bin,
+                shims,
+                hub_binary=binaries["rust_hub"] if impl == "rust" else None,
+            )
             made[impl] = leg
             leg.start_hub()
         return made[impl]
@@ -1046,10 +1155,10 @@ def hub_leg(binaries, tmux_bin, tmp_path_factory):
 
 @pytest.fixture
 def hub_differential(request):
-    """The hub family's PHASED differential (see the section comment above):
-    `run(scenario) -> value` where `scenario(impl) -> normalized value`. Go-only
-    until `HUB_RUST_LIVE` flips at H12; the golden always records the Go oracle,
-    so today's goldens ARE the frozen wire the Rust hub must match."""
+    """The hub family's differential (see the section comment above):
+    `run(scenario) -> value` where `scenario(impl) -> normalized value`. Both
+    legs run (equality-then-pin) since H12; the golden always records the Go
+    oracle — the wire the H1½ Go-only phase froze."""
     return _differential_runner(
         request,
         "shed-machine-rc serve",

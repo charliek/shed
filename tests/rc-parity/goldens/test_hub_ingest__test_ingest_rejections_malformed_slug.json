@@ -1,0 +1,7 @@
+{
+  "body": {
+    "error": "invalid_slug",
+    "message": "slug is missing or malformed"
+  },
+  "status": 400
+}

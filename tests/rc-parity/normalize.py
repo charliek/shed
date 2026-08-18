@@ -31,6 +31,7 @@ from typing import Any
 
 MASK_ID = "<id>"
 MASK_TS = "<ts>"
+MASK_SEQ = "<seq>"
 MASK_PID = "<pid>"
 MASK_HOME = "<home>"
 MASK_PORT = "<port>"
@@ -383,4 +384,22 @@ def mask_hub_sessions(payload: dict, home: str) -> dict:
     sessions = out.get("sessions")
     assert isinstance(sessions, list), f"sessions missing/not a list: {payload!r}"
     out["sessions"] = [mask_hub_session(s, home) for s in sessions]
+    return out
+
+
+def masked_feed_rows(rows: list) -> list:
+    """Mask a /messages feed row list for the hub cells: `seq` and `ts` are
+    SHAPE-ASSERTED before masking (the D3 discipline — a mask must never
+    invent the key it hides; these cells are the only place a non-empty feed
+    row is observed, so this is the wire's only seq/ts shape pin)."""
+    out = []
+    for row in rows:
+        masked = dict(row)
+        assert isinstance(masked.get("seq"), int) and masked["seq"] >= 1, (
+            f"feed row seq must be a positive integer: {row!r}"
+        )
+        assert_rfc3339(masked.get("ts"), "message.ts")
+        masked["seq"] = MASK_SEQ
+        masked["ts"] = MASK_TS
+        out.append(masked)
     return out

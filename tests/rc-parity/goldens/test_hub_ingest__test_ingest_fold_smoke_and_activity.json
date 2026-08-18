@@ -1,0 +1,12 @@
+{
+  "activity_after_stop": "needs_input",
+  "rows": [
+    {
+      "role": "user",
+      "seq": "<seq>",
+      "text": "build the thing",
+      "ts": "<ts>",
+      "type": "text"
+    }
+  ]
+}
