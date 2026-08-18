@@ -180,6 +180,46 @@ the agreed value to a committed golden. Preseed artifacts (`~/.claude.json`,
 — a mixed fleet rewrites those files in place, so merge idempotence only survives if both
 implementations write identical bytes. Run it with `make test-rc-parity`.
 
+## The machine hub
+
+Live activity on a machine (`sx ls` activity columns, `sx watch`) comes from the
+**machine RC hub** — the same loopback HTTP service a shed runs, bound to
+`127.0.0.1:1029`. Two providers exist during the transition window, and `sx`
+treats them identically:
+
+- **`shed-host-agent`** (the daemon) hosts the hub as a supervised resident
+  role — the long-term home. It binds the port at startup, defers politely
+  while another hub holds it, and takes over when that hub exits. Opt out with
+  `rc_hub.enabled: false` in the agent's config.
+- **`shed-machine-rc serve`** (the standalone Go daemon) — the original
+  provider, still spawned by `sx`'s create-time ensure as a fallback until the
+  binary retires.
+
+`sx` itself is **probe-first**: create's best-effort hub ensure checks
+`GET /v1/health` on the fixed port and is done if a healthy hub — either
+provider — answers; only when no healthy hub answers does it fall back to spawning
+`shed-machine-rc serve --detach` (or, with no binary installed, a one-line
+stderr hint naming the agent). Sessions work without any hub; only live
+activity is missing.
+
+**The trust model is the machine's own.** There is no server proxy on a
+machine: the hub binds loopback only and does no authorization — the loopback
+bind plus your SSH tunnel (`ssh -L`) IS the boundary. Never widen the bind.
+Note what "local" means here: every process of every app running under any
+uid that can reach loopback on the machine — not a sandboxed VM. That is
+still the machine's existing trust boundary (a local process that could POST
+to the hub's cursor-hook ingest could already drive the same tmux session
+directly with `send-keys`), so the hub adds a convenience channel within
+local trust, not a new boundary — but the scope of "local" is the whole
+machine, and it is worth saying plainly.
+
+**Machine-posture deltas from the guest hub** (deliberate, not drift): inside
+the agent the hub is a supervised resident role — no 15-minute idle exit, no
+detach double-fork, no pidfile; at zero sessions the watchers quiesce and the
+recurring cost is one `tmux ls` per idle tick. The agent's bind loop retries
+rather than exits, so a permanently held port shows up as `RC hub: deferred`
+in `shed-host-agent status`, not a dead daemon.
+
 ## v1 limits
 
 - **mTLS-enrolled servers need the shed host agent running.** Locating an unqualified

@@ -629,16 +629,36 @@ fn read_plan_stdin(deps: &Deps) -> Result<String, EngineError> {
         .map_err(|_| EngineError::bad_args("plan is not valid UTF-8 (is stdin a binary file?)"))
 }
 
-/// The best-effort hub ensure: spawn `shed-machine-rc serve --detach` when that
-/// binary is on PATH.
-///
-/// The hub is not ported (plan 009 §0) — on a machine it stays the Go daemon — so
-/// this drives it rather than reimplementing it, and does nothing at all when the
-/// binary is absent (a machine with only `sx` simply has no activity hub). Never
-/// fatal: `create` has already succeeded by the time this runs, and the engine
-/// skips it entirely when `SHED_RC_NO_HUB` is set.
+/// The hub's fixed loopback address + byte-frozen health identity token —
+/// local mirrors of `shed_broker::rc_hub::hub::{HUB_ADDR, HUB_APP_ID}` (sx
+/// deliberately does not link shed-broker; its axum/notify/aws leaf deps
+/// belong to the daemon, not the porcelain).
+/// The probe targets the PRODUCTION port only, by design: the
+/// `SHED_RC_HUB_ADDR` env seam is a test seam (honored by the daemons, set by
+/// the parity harness — which also sets `SHED_RC_NO_HUB`, so sx's ensure
+/// never runs there), and sx's whole surface consistently ignores it.
+const HUB_ADDR: &str = "127.0.0.1:1029";
+const HUB_APP_ID: &str = "shed-rc-hub";
+
+/// The best-effort hub ensure, PROBE-FIRST (plan 010 §2.7): a healthy hub on
+/// the fixed port — the Go `shed-machine-rc` daemon during the mixed window,
+/// or the `shed-host-agent`-hosted hub — means done. Only when no hub answers
+/// does the spawn fallback run: `shed-machine-rc serve --detach` if that
+/// binary is on PATH (kept until the binary retires at H15, deleted in the
+/// same commit), else a best-effort stderr hint naming the agent as the
+/// machine hub's owner. Never fatal: `create` has already succeeded by the
+/// time this runs, and the engine skips it entirely when `SHED_RC_NO_HUB` is
+/// set.
 fn ensure_hub() {
+    if hub_is_healthy(HUB_ADDR, std::time::Duration::from_millis(500)) {
+        return;
+    }
     let Some(bin) = look_path(HUB_BIN) else {
+        eprintln!(
+            "{PROG}: no rc hub is running and {HUB_BIN} is not installed; install or \
+start shed-host-agent to serve the machine hub (best-effort — sessions still \
+work, without live activity)"
+        );
         return;
     };
     let spawned = std::process::Command::new(bin)
@@ -661,6 +681,68 @@ fn ensure_hub() {
         },
         Err(err) => eprintln!("{PROG}: rc hub ensure failed (best-effort): {err}"),
     }
+}
+
+/// ONE bounded identity check against `addr`'s `/v1/health` — the sx-local
+/// twin of the hub's `queryHubHealth` (hub.go:916): a dial + GET under one
+/// ABSOLUTE deadline, true only when a 200 body carries the byte-frozen
+/// `app` token. Any failure — nothing listening, a squatter, a slow peer —
+/// reads as "no healthy hub" and falls through to the spawn/hint path.
+pub(crate) fn hub_is_healthy(addr: &str, timeout: std::time::Duration) -> bool {
+    use std::io::{Read, Write};
+    let deadline = std::time::Instant::now() + timeout;
+    // Zero folds into None (std rejects a zero socket timeout) — the twin of
+    // the broker probe's rule (hub.rs).
+    let remaining = |d: std::time::Instant| {
+        d.checked_duration_since(std::time::Instant::now())
+            .filter(|left| !left.is_zero())
+    };
+    let probe = || -> Option<bool> {
+        let sock_addr: std::net::SocketAddr = addr.parse().ok()?;
+        let mut conn =
+            std::net::TcpStream::connect_timeout(&sock_addr, remaining(deadline)?).ok()?;
+        conn.set_write_timeout(Some(remaining(deadline)?)).ok()?;
+        conn.write_all(
+            format!("GET /v1/health HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n")
+                .as_bytes(),
+        )
+        .ok()?;
+        let mut buf = Vec::new();
+        let mut chunk = [0u8; 2048];
+        while buf.len() < 8192 {
+            // ONE sample: a deadline expiring between a guard and a re-read
+            // would otherwise arm set_read_timeout(None) = NO timeout — the
+            // exact unbounded-probe class the H11 review fixed hub-side.
+            let Some(left) = remaining(deadline) else {
+                break;
+            };
+            if conn.set_read_timeout(Some(left)).is_err() {
+                break; // judge whatever is buffered, as the broker probe does
+            }
+            match conn.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                Err(_) => break,
+            }
+        }
+        let text = String::from_utf8_lossy(&buf);
+        let (head, body) = text.split_once("\r\n\r\n")?;
+        // DELIBERATELY simpler than the broker probe: no chunked decoding and
+        // one flat 8 KiB cap. Both hubs emit a small Content-Length health
+        // body; anything else parses as not-a-hub, which errs toward the
+        // idempotent spawn fallback.
+        if head.split_whitespace().nth(1)? != "200" {
+            return Some(false);
+        }
+        // Tolerant one-value read: the app token is the identity, everything
+        // else on the body is the hub's own business.
+        let v: serde_json::Value = serde_json::Deserializer::from_str(body.trim())
+            .into_iter()
+            .next()?
+            .ok()?;
+        Some(v.get("app").and_then(|a| a.as_str()) == Some(HUB_APP_ID))
+    };
+    probe().unwrap_or(false)
 }
 
 /// Decode base64 with Go `encoding/base64.StdEncoding.DecodeString` semantics

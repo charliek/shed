@@ -18,6 +18,15 @@ It is a one-shot CLI (no daemon); all `tmux` work happens locally on the machine
 and `tmux` must be installed on the machine (with `claude` authenticated) — the same
 prerequisites a shed image bakes in.
 
+!!! note "On the road to retirement"
+    The Rust port of this engine ships as [`sx rc`](sx.md) (wire-identical —
+    the `tests/rc-parity` differential suite is the proof), and the machine
+    activity hub this binary's `serve` provides is now also hosted by the
+    [`shed-host-agent` daemon](sx.md#the-machine-hub). Once the mixed-fleet
+    window closes, `shed-machine-rc` retires: `sx` takes over the remote verb
+    surface and the agent owns the hub. Until then everything on this page
+    stays supported, and the two hub providers coexist via bind-as-lock.
+
 ## Install
 
 === "macOS (Homebrew)"

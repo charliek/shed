@@ -108,6 +108,13 @@ resolve it in this order and stop at the first that works:
    kickoff; the posture flags, installed-agent gate, and trust/onboarding pre-seed are
    exactly what these tools exist to apply.
 
+Live activity for machine sessions comes from the machine RC hub on the target: the
+`shed-host-agent` daemon hosts it as a resident role (the long-term home), and the
+standalone `shed-machine-rc serve` daemon still provides it on machines without the
+agent during the transition — `sx` probes first and spawns the fallback only when no
+hub answers. A machine with neither still runs sessions fine; it just reports no live
+activity in `sx ls`/`sx watch`.
+
 With `sx` the flow is one command, and the plan file stays local (it is read here and
 shipped over stdin):
 

@@ -18,6 +18,30 @@ All notable changes to this project will be documented in this file.
   archived charliek/shed-desktop repo.
 -->
 
+## Unreleased
+
+_Staged by plan 010 (the machine-hub port); at release time fold this body
+into the new `## vX.Y.Z` section and replace this note with a real
+`**Ships:**` line (host-agent at minimum; machine-rc if the retirement lands
+in the same tag) — release-plan.sh never reads an `## Unreleased` heading._
+
+- **The machine RC hub moves into `shed-host-agent`.** The daemon hosts the
+  activity hub (`127.0.0.1:1029`) as a supervised resident role: bind-as-lock
+  with a polite defer-and-retry while an older `shed-machine-rc serve` holds
+  the port, `rc_hub.enabled` config knob (default on), an `RC hub:` line in
+  `shed-host-agent status` (+ the `rc_hub` LiveStatus field), and a
+  `shed-host-agent rc-hub` foreground diagnostic subcommand. The hub itself is
+  a Rust port of the Go hub (`shed-broker`'s `rc_hub`), wire-identical at
+  `/v1` under the `tests/rc-parity` hub differential family (snapshot, SSE,
+  side-effect, opencode-lane, and cursor-ingest cells — both daemons run side
+  by side in CI).
+- **`sx` create's hub ensure is probe-first**: a healthy hub of either
+  provider short-circuits; the `shed-machine-rc serve --detach` spawn remains
+  as the fallback for machines without the agent.
+- Machine-posture docs: `docs/extensions/sx.md` gains "The machine hub"
+  (trust model: loopback + SSH tunnel is the boundary; no proxy on machines),
+  `shed-machine-rc.md` carries the retirement roadmap note.
+
 ## v0.8.2 — 2026-08-17
 
 **Ships:** server, machine-rc
