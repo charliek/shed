@@ -18,9 +18,19 @@ All notable changes to this project will be documented in this file.
   archived charliek/shed-desktop repo.
 -->
 
-## Unreleased
+## v0.8.2 — 2026-08-17
 
 **Ships:** server, machine-rc
+
+This patch makes the observatory real on live sheds: the guest rc hub, the v2
+wire contract, and the cursor/codex/opencode signals shipped in the three
+preceding blocks have all been sitting unreleased, so a rebaked rootfs is what
+this tag is for. The client-side Rust porcelain (`sx`) and its Go↔Rust parity
+harness land in-tree but ship **no release component** — `sx` is built from
+`crates/` for now. `host-agent` and `desktop` are deliberately NOT bumped: they
+pick up only library-level `crates/` changes (notably an `RcRunner` stdin
+error-propagation fix the desktop will inherit), which ride the next desktop
+release rather than forcing a DMG/appcast cycle here.
 
 ### Added
 
