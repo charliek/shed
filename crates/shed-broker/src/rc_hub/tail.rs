@@ -380,7 +380,7 @@ impl LineTailer {
     /// Whether the tailer currently holds an open handle (the closed-watcher
     /// no-op assertions use this; Go tests reach the field directly).
     #[cfg(test)]
-    fn is_open(&self) -> bool {
+    pub(crate) fn is_open(&self) -> bool {
         self.f.is_some()
     }
 }

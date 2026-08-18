@@ -19,6 +19,9 @@
 
 use std::io::{BufRead, Seek, SeekFrom};
 use std::sync::LazyLock;
+use std::sync::Mutex;
+
+use chrono::{DateTime, Utc};
 
 use regex::Regex;
 use serde::Deserialize;
@@ -32,8 +35,9 @@ use super::messages::{
     FEED_TYPE_TOOL_RESULT, FEED_TYPE_TOOL_USE,
 };
 use super::watch::{
-    compact_json, first_non_empty, json_first_byte, object_opt, raw_opt, vec_objects,
-    MessageProducer,
+    compact_json, first_non_empty, json_first_byte, noop_logf, object_opt, raw_opt, vec_objects,
+    watcher_freshness, ConfirmedAgentIdDrainer, CursorIngester, LogFn, MessageProducer,
+    SessionWatcher,
 };
 
 /// Bounds what may be trusted as a cursor session id (`cursorSessionIDRe`,
@@ -543,6 +547,351 @@ fn cursor_edit_detail(p: &CursorHookPayload) -> String {
         0 => path.to_string(),
         1 => format!("{path} (1 edit)"),
         n => format!("{path} ({n} edits)"),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// the push-fed watcher (watch_cursor.go:62-304) — plan 010 H7
+// ---------------------------------------------------------------------------
+
+/// The PUSH-FED [`SessionWatcher`] for a cursor-agent session
+/// (`cursorWatcher`, `watch_cursor.go:62`). The third transport shape in the
+/// watcher stack and the only one that initiates no I/O at all:
+///
+/// - codex/claude — pull: tail an append-only JSONL file
+///   ([`super::watch::FileWatcher`]).
+/// - opencode — pull: subscribe to the agent's embedded HTTP+SSE server (H8).
+/// - cursor — PUSH: the agent's own hook scripts POST each event to the hub's
+///   loopback ingest route, which hands it to this watcher.
+///
+/// CONCURRENCY MODEL (Go exercises it under -race;
+/// `cursor_watcher_concurrent_push_and_refresh` is this port's pin): TWO
+/// writers, one mutex, no thread of its own. `push_hook_event` runs on the
+/// HTTP handler thread and appends to the bounded inbox under the lock — it
+/// never folds. `refresh` is the ONLY method that mutates the fold, under the
+/// SAME lock — and it is called from TWO places (reconcile's tick and the
+/// input handler's acceptance re-check). That is safe precisely because the
+/// mutex, not thread identity, serializes it.
+///
+/// FRESHNESS: reuses the [`super::watch::FileWatcher`] rule (settled trusted
+/// indefinitely,
+/// non-settled fresh for the window, working for the grace) rather than the
+/// opencode watcher's transport-health rule — a hook relay has no connection
+/// to be unhealthy; the hub either received an event or it did not, exactly
+/// like a file that has or has not grown.
+///
+/// NOT an approval surface: cursor has no approval hook event, so this
+/// watcher deliberately does NOT override the `SessionWatcher` approval
+/// accessors (needs_approval for cursor comes from the pane anchor in
+/// reconcile).
+/// (No clock of its own, deliberately: every timestamp this watcher needs is
+/// the `now` reconcile hands to refresh/snapshot. Go also retains its `logf`
+/// as a field, but only construction ever logs — the local suffices here.)
+pub struct CursorWatcher {
+    inner: Mutex<CursorWatcherInner>,
+}
+
+struct CursorWatcherInner {
+    fold: CursorFold,
+    inbox: Vec<CursorHookEvent>,
+    inbox_bytes: usize,
+    /// An inbox overflow dropped an event: fold.note_gap() on the next refresh.
+    gapped: bool,
+    /// Terminal: push/refresh/snapshot no-op (see close).
+    closed: bool,
+
+    /// The SHED_RC_AGENT_SESSION pin from a previous hub lifetime ("" if
+    /// none). Suppresses a redundant back-write when the hook stream pins the
+    /// same id again.
+    prior_id: String,
+    /// A newly pinned agent session id awaiting drain_confirmed_agent_id.
+    confirmed_id: String,
+
+    // fold-derived verdict (refresh writes; snapshot reads)
+    last_event_at: Option<DateTime<Utc>>,
+    cur_activity: RcActivity,
+    cur_message: String,
+    cur_settled: bool,
+    pending: Vec<FeedMessage>,
+}
+
+/// The inbox bounds (`maxCursorInboxItems`/`maxCursorInboxBytes`,
+/// `watch_cursor.go:124-125`): count AND bytes. The byte bound is the
+/// load-bearing one — a single afterShellExecution payload may be up to the
+/// ingest cap (256 KiB), so a count-only bound would admit ~64 MiB. On
+/// overflow the incoming event is dropped and a gap is recorded.
+pub const MAX_CURSOR_INBOX_ITEMS: usize = 256;
+pub const MAX_CURSOR_INBOX_BYTES: usize = 4 << 20;
+
+impl CursorWatcher {
+    /// Builds a push-fed watcher for a cursor session (`newCursorWatcher`,
+    /// `watch_cursor.go:137`). `prior_id` is the back-written
+    /// SHED_RC_AGENT_SESSION from an earlier hub lifetime ("" if none); a
+    /// malformed one is discarded rather than trusted (a tmux env var is
+    /// operator-writable, and the id ends up on the wire and in a
+    /// back-write).
+    ///
+    /// Unlike the file watchers there is nothing to correlate and nothing to
+    /// open: the watcher is usable the moment it exists, which is why the
+    /// hub constructs it immediately with no correlation input and simply
+    /// drains the pre-watcher inbox into it.
+    pub fn new(prior_id: &str, logf: Option<LogFn>) -> CursorWatcher {
+        let logf = logf.unwrap_or_else(noop_logf);
+        let mut prior_id = prior_id.to_string();
+        if !prior_id.is_empty() && !valid_cursor_session_id(&prior_id) {
+            logf(&format!(
+                "rc hub: cursor watcher ignoring a malformed {} pin",
+                shed_core::rc_agents::ENV_AGENT_SESSION
+            ));
+            prior_id.clear();
+        }
+        CursorWatcher {
+            inner: Mutex::new(CursorWatcherInner {
+                fold: CursorFold::new(&prior_id),
+                inbox: Vec::new(),
+                inbox_bytes: 0,
+                gapped: false,
+                closed: false,
+                prior_id,
+                confirmed_id: String::new(),
+                last_event_at: None,
+                cur_activity: RcActivity::Unknown,
+                cur_message: String::new(),
+                cur_settled: false,
+                pending: Vec::new(),
+            }),
+        }
+    }
+
+    /// A ONE-SHOT, construction-time backfill (`seedFromTranscript`,
+    /// `watch_cursor.go:280`): called exactly once, and only when the watcher
+    /// was built with an existing SHED_RC_AGENT_SESSION pin (a hub restart
+    /// mid-session) — so a restarted hub is not blank until the next hook
+    /// fires. `session_id` is the prior pin (already grammar-validated at
+    /// construction).
+    ///
+    /// Reads cursor's OWN transcript JSONL — a different payload shape than a
+    /// hook event — so it appends the rows directly to `pending` rather than
+    /// routing through the fold: the fold's state machine stays driven
+    /// EXCLUSIVELY by hooks; this is a feed-content side channel, never a
+    /// verdict source. Best-effort throughout: a missing/unreadable file, a
+    /// malformed or partial last line, or an unresolvable path all yield zero
+    /// rows silently — nothing here may fail watcher construction.
+    ///
+    /// Dedup note (documented limitation, not a bug): rows seeded here are
+    /// NOT deduped against subsequent LIVE hook events — the in-flight turn
+    /// that was running when the hub restarted will reappear via its own
+    /// hooks. A small overlap at the seam is acceptable.
+    pub fn seed_from_transcript(&self, home: &str, workdir: &str, session_id: &str) {
+        let path = cursor_transcript_path(home, workdir, session_id);
+        if path.is_empty() {
+            return;
+        }
+        let rows = read_cursor_transcript(&path);
+        if rows.is_empty() {
+            return;
+        }
+        let mut w = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if w.closed {
+            return;
+        }
+        w.pending.extend(rows);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn prior_id(&self) -> String {
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .prior_id
+            .clone()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fold_pinned_id(&self) -> String {
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .fold
+            .pinned_id()
+            .to_string()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fold_open_tools(&self) -> usize {
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .fold
+            .open_tools()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn gapped(&self) -> bool {
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .gapped
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_gapped(&self) {
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .gapped = true;
+    }
+}
+
+impl CursorIngester for CursorWatcher {
+    /// Appends an event to the inbox under the watcher mutex
+    /// (`pushHookEvent`, `watch_cursor.go:159` — the ingest handler's
+    /// thread). A CLOSED watcher drops silently; an overflowing inbox drops
+    /// the event and records a gap so the next refresh can clear the state
+    /// that assumed a complete stream. Dropping the NEWEST (rather than the
+    /// oldest) keeps the retained prefix contiguous, which is what the fold's
+    /// turn-boundary reasoning wants.
+    fn push_hook_event(&self, ev: CursorHookEvent) -> bool {
+        let mut w = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if w.closed {
+            return false;
+        }
+        if w.inbox.len() >= MAX_CURSOR_INBOX_ITEMS
+            || w.inbox_bytes + ev.payload.len() > MAX_CURSOR_INBOX_BYTES
+        {
+            w.gapped = true;
+            return false;
+        }
+        w.inbox_bytes += ev.payload.len();
+        w.inbox.push(ev);
+        true
+    }
+}
+
+impl ConfirmedAgentIdDrainer for CursorWatcher {
+    /// Returns and clears a newly pinned cursor session id for reconcile to
+    /// back-write into SHED_RC_AGENT_SESSION (`drainConfirmedAgentID`,
+    /// `watch_cursor.go:249`; "" when none / already drained). A RE-PIN (the
+    /// operator switched chats in the TUI) surfaces here again with the new
+    /// id, which is the point: the session's identity follows what its TUI is
+    /// showing.
+    fn drain_confirmed_agent_id(&self) -> String {
+        let mut w = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        std::mem::take(&mut w.confirmed_id)
+    }
+}
+
+impl SessionWatcher for CursorWatcher {
+    /// Drains the inbox under the mutex and folds each event
+    /// (`(*cursorWatcher).refresh`, `watch_cursor.go:177`), mirroring the
+    /// file watcher's refresh but sourced from pushes rather than a tailer.
+    /// A CLOSED watcher no-ops.
+    fn refresh(&self, now: DateTime<Utc>) {
+        let w = &mut *self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if w.closed {
+            return;
+        }
+        if w.gapped {
+            // Events were lost to inbox overflow: drop the state that assumes
+            // every record was seen (open tool calls), leaving the verdict to
+            // the next turn boundary.
+            w.fold.note_gap();
+            w.gapped = false;
+        }
+        let items = std::mem::take(&mut w.inbox);
+        w.inbox_bytes = 0;
+        for ev in &items {
+            if w.fold.apply_event(ev) {
+                w.last_event_at = Some(now);
+            }
+        }
+        w.cur_activity = w.fold.activity();
+        w.cur_message = w.fold.last_message();
+        w.cur_settled = w.fold.settled();
+        let msgs = MessageProducer::drain_messages(&mut w.fold);
+        w.pending.extend(msgs);
+        // A hook-carried session id that differs from what was already
+        // back-written is the only pin cursor gives us; surface it for
+        // reconcile to stamp.
+        let id = w.fold.drain_new_pin();
+        if !id.is_empty() && id != w.prior_id {
+            w.confirmed_id = id.clone();
+            w.prior_id = id;
+        }
+    }
+
+    /// The verdict + its authority at `now`, on the file watcher's rule
+    /// (`snapshot`, `watch_cursor.go:213` — see the FRESHNESS note on
+    /// [`CursorWatcher`] for why the transport-health rule does not apply).
+    fn snapshot(&self, now: DateTime<Utc>) -> (RcActivity, String, bool, bool) {
+        let w = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if w.closed {
+            // A closed watcher has no authority: force expired_working=false
+            // so pane stability drives.
+            return (w.cur_activity, w.cur_message.clone(), false, false);
+        }
+        let (fresh, expired_working) =
+            watcher_freshness(w.cur_activity, w.cur_settled, w.last_event_at, now);
+        (
+            w.cur_activity,
+            w.cur_message.clone(),
+            fresh,
+            expired_working,
+        )
+    }
+
+    /// Returns and clears the feed messages folded since the last drain, in
+    /// stream order (`drainPending`, `watch_cursor.go:227`).
+    fn drain_pending(&self) -> Vec<FeedMessage> {
+        let mut w = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        std::mem::take(&mut w.pending)
+    }
+
+    /// Whether at least one activity-relevant hook event has been folded
+    /// (`hadEvent`, `watch_cursor.go:239`).
+    fn had_event(&self) -> bool {
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .last_event_at
+            .is_some()
+    }
+
+    /// Marks the watcher terminally closed (`close`, `watch_cursor.go:300`).
+    /// There is no I/O to unwind (pushes are the transport), so this only
+    /// stops later pushes/refreshes from mutating a discarded watcher.
+    /// Idempotent.
+    fn close(&self) {
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .closed = true;
+    }
+
+    fn as_cursor_ingester(&self) -> Option<&dyn CursorIngester> {
+        Some(self)
+    }
+
+    fn as_confirmed_agent_id_drainer(&self) -> Option<&dyn ConfirmedAgentIdDrainer> {
+        Some(self)
     }
 }
 
@@ -1358,6 +1707,257 @@ mod tests {
         );
         assert_eq!(rows.len(), 1, "rows: {rows:?}");
         assert_eq!(rows[0].text, "a");
+    }
+
+    // ---- the push-fed watcher (H7) ----
+
+    use super::super::watch::test_support::{plus, t0};
+    use super::super::watch::{ConfirmedAgentIdDrainer, CursorIngester, SessionWatcher};
+    use super::super::watch::{WATCHER_FRESH_WINDOW, WATCHER_WORKING_GRACE};
+    use std::time::Duration;
+
+    // Mirrors TestCursorWatcherSnapshotFreshness (watch_cursor_test.go:351).
+    #[test]
+    fn cursor_watcher_snapshot_freshness() {
+        let mut now = t0();
+        let w = CursorWatcher::new("", None);
+
+        // Nothing folded yet → no verdict, never fresh: the merge must fall
+        // through to pane stability.
+        let (act, _, fresh, expired) = w.snapshot(now);
+        assert_eq!((act, fresh, expired), (RcActivity::Unknown, false, false));
+
+        w.push_hook_event(hook_ev(
+            "beforeSubmitPrompt",
+            &format!(r#"{{{},"prompt":"go"}}"#, sid_field(SID)),
+        ));
+        w.refresh(now);
+        let (act, _, fresh, _) = w.snapshot(now);
+        assert_eq!((act, fresh), (RcActivity::Working, true));
+        // Past the 30s window but inside the 120s working grace: still fresh.
+        now = plus(now, WATCHER_FRESH_WINDOW + Duration::from_secs(1));
+        let (_, _, fresh, expired) = w.snapshot(now);
+        assert!(fresh && !expired, "inside the working grace");
+        // Past the grace: demoted to conditional (expired_working).
+        now = plus(now, WATCHER_WORKING_GRACE);
+        let (_, _, fresh, expired) = w.snapshot(now);
+        assert!(!fresh && expired, "past the working grace");
+
+        // A settled verdict is trusted indefinitely — a waiting cursor emits
+        // no hooks at all, so quiet is exactly what "waiting" looks like.
+        w.push_hook_event(hook_ev(
+            "stop",
+            &format!(r#"{{{},"status":"completed"}}"#, sid_field(SID)),
+        ));
+        w.refresh(now);
+        now = plus(now, Duration::from_secs(24 * 3600));
+        let (act, _, fresh, expired) = w.snapshot(now);
+        assert_eq!((act, fresh, expired), (RcActivity::NeedsInput, true, false));
+
+        // close() revokes authority and refuses pushes.
+        w.close();
+        let (_, _, fresh, expired) = w.snapshot(now);
+        assert!(!fresh && !expired, "a closed watcher has no authority");
+        assert!(
+            !w.push_hook_event(hook_ev("stop", "{}")),
+            "closed refuses pushes"
+        );
+    }
+
+    // Mirrors TestCursorWatcherDrainConfirmedAgentID
+    // (watch_cursor_test.go:412): the pin reaches reconcile's back-write, a
+    // repeated pin is not re-surfaced, a malformed prior pin is discarded at
+    // construction.
+    #[test]
+    fn cursor_watcher_drain_confirmed_agent_id() {
+        let now = t0();
+        let w = CursorWatcher::new("", None);
+        w.push_hook_event(hook_ev(
+            "sessionStart",
+            &format!(r#"{{{}}}"#, sid_field(SID)),
+        ));
+        w.refresh(now);
+        assert_eq!(w.drain_confirmed_agent_id(), SID);
+        assert_eq!(
+            w.drain_confirmed_agent_id(),
+            "",
+            "cleared on the second drain"
+        );
+
+        // A watcher rebuilt with the SAME prior pin (a hub restart) must not
+        // re-stamp it.
+        let w2 = CursorWatcher::new(SID, None);
+        w2.push_hook_event(hook_ev(
+            "stop",
+            &format!(r#"{{{},"status":"completed"}}"#, sid_field(SID)),
+        ));
+        w2.refresh(now);
+        assert_eq!(
+            w2.drain_confirmed_agent_id(),
+            "",
+            "a repeated pin is silent"
+        );
+
+        // A malformed prior pin is discarded rather than trusted.
+        let w3 = CursorWatcher::new("../evil", None);
+        assert_eq!(
+            (w3.prior_id().as_str(), w3.fold_pinned_id().as_str()),
+            ("", "")
+        );
+    }
+
+    // Mirrors TestCursorWatcherInboxBounds (watch_cursor_test.go:441): the
+    // inbox is bounded by COUNT and by BYTES, and an overflow records a gap
+    // that releases the open-tool state on the next refresh.
+    #[test]
+    fn cursor_watcher_inbox_bounds() {
+        let now = t0();
+
+        let w = CursorWatcher::new("", None);
+        for i in 0..MAX_CURSOR_INBOX_ITEMS {
+            assert!(
+                w.push_hook_event(hook_ev("stop", r#"{"status":"completed"}"#)),
+                "push {i} refused before the count bound"
+            );
+        }
+        assert!(
+            !w.push_hook_event(hook_ev("stop", r#"{"status":"completed"}"#)),
+            "a push past the count bound must be refused"
+        );
+        assert!(w.gapped(), "an overflow must record a gap");
+
+        // Byte bound: one payload over the budget is refused at count 1.
+        let w2 = CursorWatcher::new("", None);
+        let big = format!(
+            r#"{{"output":"{}"}}"#,
+            "x".repeat(MAX_CURSOR_INBOX_BYTES + 1)
+        );
+        assert!(!w2.push_hook_event(hook_ev("afterShellExecution", &big)));
+
+        // The gap releases open-tool state on the next refresh.
+        let w3 = CursorWatcher::new("", None);
+        w3.push_hook_event(hook_ev(
+            "preToolUse",
+            &format!(
+                r#"{{{},"tool_name":"Shell","tool_input":{{"command":"sleep 900"}}}}"#,
+                sid_field(SID)
+            ),
+        ));
+        w3.refresh(now);
+        assert_eq!(w3.fold_open_tools(), 1, "premise: the tool call is open");
+        w3.set_gapped();
+        w3.refresh(now);
+        assert_eq!(w3.fold_open_tools(), 0, "a gap drops the open-tool count");
+    }
+
+    // The concurrency pin (TestCursorWatcherConcurrentPushAndRefresh,
+    // watch_cursor_test.go:484): the ingest side pushes while the reconcile
+    // side refreshes/snapshots/drains, and a second refresher (Go's input
+    // handler re-check) runs concurrently too — the mutex, not thread
+    // identity, is what serializes the fold. (Go runs under -race; here the
+    // Mutex + Send/Sync bounds make the same claim and this exercises real
+    // contention.)
+    #[test]
+    fn cursor_watcher_concurrent_push_and_refresh() {
+        let now = t0();
+        let w = std::sync::Arc::new(CursorWatcher::new("", None));
+
+        const PUSHERS: usize = 4;
+        const PER_PUSHER: usize = 200;
+        let mut handles = Vec::new();
+        for p in 0..PUSHERS {
+            let w = std::sync::Arc::clone(&w);
+            handles.push(std::thread::spawn(move || {
+                for i in 0..PER_PUSHER {
+                    w.push_hook_event(hook_ev(
+                        "preToolUse",
+                        &format!(
+                            r#"{{{},"tool_name":"Shell","tool_input":{{"command":"echo {p}-{i}"}}}}"#,
+                            sid_field(SID)
+                        ),
+                    ));
+                }
+            }));
+        }
+        // The reconcile side, concurrent with every push.
+        {
+            let w = std::sync::Arc::clone(&w);
+            handles.push(std::thread::spawn(move || {
+                for _ in 0..500 {
+                    w.refresh(now);
+                    w.snapshot(now);
+                    w.drain_pending();
+                    w.drain_confirmed_agent_id();
+                    w.had_event();
+                }
+            }));
+        }
+        // The input-handler side: a SECOND concurrent refresher (Go's
+        // inputAccepted re-check runs refresh on an HTTP goroutine).
+        {
+            let w = std::sync::Arc::clone(&w);
+            handles.push(std::thread::spawn(move || {
+                for _ in 0..500 {
+                    w.refresh(now);
+                    w.snapshot(now);
+                }
+            }));
+        }
+        for h in handles {
+            h.join().expect("thread");
+        }
+        w.refresh(now);
+        w.drain_pending();
+        assert!(w.had_event(), "events were pushed and folded");
+    }
+
+    // Mirrors TestCursorWatcherSeedFromTranscript
+    // (watch_cursor_transcript_test.go:338) + the missing-file, no-pin, and
+    // closed-watcher arms.
+    #[test]
+    fn cursor_watcher_seed_from_transcript() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let home_str = home.path().to_str().unwrap();
+        const WORKDIR: &str = "/home/shed/proj";
+        // Copy the shared fixture to the exact path cursor_transcript_path
+        // derives.
+        let path = cursor_transcript_path(home_str, WORKDIR, SID);
+        assert!(!path.is_empty());
+        std::fs::create_dir_all(std::path::Path::new(&path).parent().unwrap()).expect("mkdir");
+        let fixture = format!(
+            "{}/../fixtures/jsonl/cursor_transcript.jsonl",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        std::fs::copy(&fixture, &path).expect("copy fixture");
+
+        let w = CursorWatcher::new(SID, None);
+        assert_eq!(
+            w.prior_id(),
+            SID,
+            "construction validates but keeps the pin"
+        );
+        w.seed_from_transcript(home_str, WORKDIR, &w.prior_id());
+        let rows = w.drain_pending();
+        assert_eq!(rows.len(), 5, "rows: {rows:?}");
+        assert!(w.drain_pending().is_empty(), "seeding is one-shot");
+
+        // Missing file: silent no-op.
+        let empty_home = tempfile::tempdir().expect("tempdir");
+        let w2 = CursorWatcher::new(SID, None);
+        w2.seed_from_transcript(empty_home.path().to_str().unwrap(), WORKDIR, SID);
+        assert!(w2.drain_pending().is_empty());
+
+        // No prior pin: nothing to seed from, structurally.
+        let w3 = CursorWatcher::new("", None);
+        assert_eq!(w3.prior_id(), "");
+        w3.seed_from_transcript(home_str, WORKDIR, "");
+        assert!(w3.drain_pending().is_empty());
+
+        // A closed watcher no-ops.
+        let w4 = CursorWatcher::new(SID, None);
+        w4.close();
+        w4.seed_from_transcript(home_str, WORKDIR, SID);
+        assert!(w4.drain_pending().is_empty());
     }
 
     // ---- transcript backfill ----

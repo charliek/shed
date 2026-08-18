@@ -242,7 +242,10 @@ impl MessageRing {
     /// producer aliasing (and the pre-copy cap) unrepresentable; the count cap
     /// lives in `sanitize` alone.
     pub fn append(&self, mut m: FeedMessage, now: DateTime<Utc>) -> u64 {
-        let mut r = self.inner.lock().expect("message ring lock poisoned");
+        let mut r = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
 
         m.text = sanitize_feed_text(&m.text);
         if let Some(t) = &mut m.tool {
@@ -292,7 +295,10 @@ impl MessageRing {
         } else {
             (limit as usize).min(MAX_MESSAGES_LIMIT)
         };
-        let r = self.inner.lock().expect("message ring lock poisoned");
+        let r = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
 
         // Beyond-tail cursor. This also absorbs the u64 edge: any since_seq >
         // r.seq (u64::MAX included) is a stale cursor from another incarnation,

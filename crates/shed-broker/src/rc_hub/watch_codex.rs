@@ -376,6 +376,10 @@ impl ActivityFold for CodexFold {
     fn settled(&self) -> bool {
         self.activity() == RcActivity::NeedsInput
     }
+
+    fn drain_fold_messages(&mut self) -> Vec<FeedMessage> {
+        MessageProducer::drain_messages(self)
+    }
 }
 
 /// Renders a `(custom_)function_call_output` `output` field, which is either a

@@ -529,6 +529,10 @@ impl ActivityFold for OpencodeFold {
             RcActivity::NeedsInput | RcActivity::NeedsApproval
         )
     }
+
+    fn drain_fold_messages(&mut self) -> Vec<FeedMessage> {
+        MessageProducer::drain_messages(self)
+    }
 }
 
 impl OpencodeFold {

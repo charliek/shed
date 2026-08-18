@@ -13,6 +13,13 @@
 //! native-machine binary (`shed-machine-rc`) once the `shed-host-agent` daemon
 //! hosts it at parity.
 //!
+//! Lock-poisoning posture (H7 review): every rc_hub mutex recovers via
+//! `PoisonError::into_inner` rather than propagating the poison — Go's
+//! `defer mu.Unlock()` runs during a panic's unwind, so a panicking fold
+//! leaves the Go hub usable, and one cross-thread panic must not cascade into
+//! a permanently dead watcher here either. (The same partially-updated-state
+//! risk exists in both semantics.)
+//!
 //! Landed so far (plan 010 H4/H5 — the pure cores, no HTTP dependency yet):
 //!
 //! - [`messages`] — the per-session feed ring + wire vocabulary
@@ -31,7 +38,13 @@
 //! - [`watch_opencode`] — the opencode pure fold: approval seed halves,
 //!   reopen rule, tombstones, question rows (`watch_opencode.go`; its
 //!   SSE/REST transport follows in H8).
+//! - Transports I (H7): the [`watch`] module additionally carries the
+//!   `SessionWatcher` contract + `FileWatcher` + the `notify`-backed
+//!   `FsNudger`; [`watch_cursor`] the push-fed `CursorWatcher`; [`ingest`]
+//!   the pre-watcher queue half of `hub_ingest.go` (the HTTP handler follows
+//!   in H10).
 
+pub mod ingest;
 pub mod messages;
 pub mod stability;
 pub mod tail;
