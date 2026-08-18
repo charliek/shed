@@ -86,7 +86,7 @@ shed sessions kill <shed> rc-<slug>       # stop the session
 
 `shed plan` only targets sheds. For a **native machine**, the porcelain is `sx`
 (unreleased — resolve it per the SKILL's guarded order: `PATH`, then
-`cargo run -q -p sx --` from a shed checkout, then plain `shed-machine-rc` over SSH).
+`cargo run -q -p sx --` from a shed checkout, then the remote engine over SSH).
 
 ```bash
 sx plan <file> [--on <target>] [--tool <t>] [-p "<framing>"] \

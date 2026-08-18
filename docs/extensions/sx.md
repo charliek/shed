@@ -10,13 +10,14 @@ It is a Rust CLI built from `crates/sx` on the shared client core (`shed-core` +
 | Layer | Commands | Contract |
 |------|----------|----------|
 | Porcelain | `agent`, `plan`, `ls`, `watch`, `attach`, `kill` | Human/skill-facing. Chooses defaults, prints prose, reaches remote targets. |
-| Engine-compat | `sx rc <subcommand>` | The ported one-shot RC engine, wire-compatible with [`shed-machine-rc <subcommand>`](shed-machine-rc.md). |
+| Engine-compat | `sx rc <subcommand>` | The ported one-shot RC engine, wire-compatible with the retired [`shed-machine-rc <subcommand>`](shed-machine-rc.md) (the `tests/rc-parity` differential suite is the standing proof). |
 
 !!! warning "Unreleased"
     `sx` ships in no release component — no Homebrew formula, no `.deb`, no GitHub
     release artifact. It is built from source (below) and its surface may change without
-    a deprecation cycle. `shed-machine-rc` and `shed-ext-rc` remain the released,
-    supported RC binaries.
+    a deprecation cycle. `shed-ext-rc` remains the released, supported guest RC
+    binary; `shed-machine-rc` is retired (its last release stays installable —
+    see [its page](shed-machine-rc.md)).
 
 ## Build and install
 
@@ -68,7 +69,7 @@ machines:
 | `host` | the entry name | SSH hostname or IP. |
 | `user` | ssh's own default | SSH login user. |
 | `ssh_port` | `22` | SSH port. |
-| `rc_bin` | `shed-machine-rc` | RC helper on the machine. Use an absolute path when the binary is not on the **non-login** `PATH` an SSH exec sees (Homebrew's `/opt/homebrew/bin` typically is not). |
+| `rc_bin` | `sx rc` (two argv words) | RC helper on the machine. The default invokes the remote `sx` binary (`sx rc <verb>` — wire-identical to the retired `shed-machine-rc <verb>`). Set it to keep a machine on a still-installed `shed-machine-rc` through the mixed fleet, or to an absolute path when the binary is not on the **non-login** `PATH` an SSH exec sees (Homebrew's `/opt/homebrew/bin` typically is not). An override is a SINGLE binary invoked `<rc_bin> <verb>`. |
 | `known_hosts` | ssh's own default | `UserKnownHostsFile` to pin against; same semantics as a server entry. |
 
 !!! warning "Older `shed` CLIs delete this section"
@@ -131,7 +132,7 @@ The rules that change behavior per target and per tool:
 | Permission posture | `sx agent claude` defaults to `auto` (the posture the `shed-machine-rc claude` verb it absorbs used). Every other tool gets **no posture flag** — its own default — because "auto" means something different in each agent's CLI. `sx plan` defaults to `auto` for every tool, matching `shed plan`. |
 | Waiting | Kickoff verbs wait for the session to reach `ready` and then deliver the prompt/plan. `--no-wait` (agent only) is **rejected together with `-p`/`--plan`**: a kickoff is delivered only after the pane is ready, so "don't wait" and "deliver this" contradict each other. |
 | Exit code | A waiting create that did not reach `ready` exits non-zero (a script can tell `ready` from `needs-auth`/`starting`); `--no-wait` always exits `0`. Remote engine exit classes `2`/`3`/`4` pass through the SSH hop verbatim; anything else — including a transport failure — collapses to `1`. |
-| Hub | On a create, `sx` best-effort spawns `shed-machine-rc serve --detach` when that binary is on `PATH` (the [activity hub](rc-helper.md#the-rc-activity-hub-serve) is not ported — on a machine it stays the Go daemon). Failure is a stderr line, never fatal. Set `SHED_RC_NO_HUB=1` to skip it entirely. |
+| Hub | On a create, `sx` best-effort probes the [machine hub](#the-machine-hub) (`GET /v1/health` on the fixed port); when nothing healthy answers it prints a one-line stderr hint naming `shed-host-agent` as the hub's owner — never fatal, and it never spawns anything. Set `SHED_RC_NO_HUB=1` to skip it entirely. |
 
 ### Observing
 
@@ -191,15 +192,15 @@ treats them identically:
   role — the long-term home. It binds the port at startup, defers politely
   while another hub holds it, and takes over when that hub exits. Opt out with
   `rc_hub.enabled: false` in the agent's config.
-- **`shed-machine-rc serve`** (the standalone Go daemon) — the original
-  provider, still spawned by `sx`'s create-time ensure as a fallback until the
-  binary retires.
+- **`shed-machine-rc serve`** (the standalone Go daemon, retired) — the
+  original provider. A still-installed copy keeps working through the mixed
+  window: the agent defers while it holds the port and takes over when it
+  exits.
 
-`sx` itself is **probe-first**: create's best-effort hub ensure checks
+`sx` itself is **probe-only**: create's best-effort hub ensure checks
 `GET /v1/health` on the fixed port and is done if a healthy hub — either
-provider — answers; only when no healthy hub answers does it fall back to spawning
-`shed-machine-rc serve --detach` (or, with no binary installed, a one-line
-stderr hint naming the agent). Sessions work without any hub; only live
+provider — answers; otherwise it prints a one-line stderr hint naming the
+agent as the hub's owner. Sessions work without any hub; only live
 activity is missing.
 
 **The trust model is the machine's own.** There is no server proxy on a
@@ -248,5 +249,5 @@ in `shed-host-agent status`, not a dead daemon.
 
 - [`shed-ext-rc` (RC session helper)](rc-helper.md) — the wire contract, kinds,
   permission modes, JSON DTO, exit codes, and the activity hub.
-- [`shed-machine-rc`](shed-machine-rc.md) — the released Go engine on native machines,
-  and the hub `sx watch` reads from.
+- [`shed-machine-rc`](shed-machine-rc.md) — the retired Go engine on native
+  machines, whose verb surface and hub `sx` + `shed-host-agent` replace.

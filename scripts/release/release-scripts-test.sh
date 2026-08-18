@@ -6,16 +6,18 @@
 #   scripts/release/recommend-components.sh  (next-tag component recommender)
 #
 # Runs every synthetic combination the release model depends on — per-component
-# (server / host-agent / machine-rc / desktop) and combined plans / neither→
-# exit 1 / lockstep-broken→exit 1 / malformed-manifest→exit 1 / prerelease×
+# (server / host-agent / desktop) and combined plans / neither→exit 1 /
+# lockstep-broken→exit 1 / malformed-manifest→exit 1 / prerelease×
 # goreleaser-component→exit 1 / desktop-only-prerelease→pass / the `**Ships:**`
 # CHANGELOG cross-check (legacy alias, unknown token, duplicate, mismatch,
 # missing entry, Unreleased-skipping) — plus the update-version.sh contract
 # asserts (unknown component errors + valid-set listing; `--components server`
 # leaves desktop manifests untouched; `--components desktop` bumps all four
-# desktop surfaces + both locks; per-component host-agent / machine-rc bumps;
-# the 4-way combined bump; `go` alias warns on stderr; prerelease rejected for
-# goreleaser components but allowed desktop-only; idempotent re-run).
+# desktop surfaces + both locks; the per-component host-agent bump;
+# the 3-way combined bump; `go` alias warns on stderr; prerelease rejected for
+# goreleaser components but allowed desktop-only; idempotent re-run; the
+# RETIRED `machine-rc` component rejected by both the bumper and the Ships
+# grammar — plan 010).
 #
 # recommend-components.sh is exercised against a SEPARATE throwaway git repo
 # (built below) with synthetic tagged history — proving the last-shipped walk,
@@ -62,7 +64,6 @@ tar -C "${REPO_ROOT}" -cf - \
   .claude-plugin/plugin.json \
   desktop/VERSION \
   crates/shed-host-agent/VERSION \
-  cmd/shed-machine-rc/VERSION \
   CHANGELOG.md \
   crates \
   desktop/tauri/src-tauri \
@@ -83,15 +84,15 @@ RECO="${SCRATCH}/scripts/release/recommend-components.sh"
 
 # Hermetic baseline. The tar copy above imports the REAL component manifests at
 # whatever version the repo currently sits at, so a shipped version can leak into
-# a synthetic case: once v0.8.0 shipped, crates/shed-host-agent/VERSION and
-# cmd/shed-machine-rc/VERSION both read 0.8.0, and the desktop-only `v0.8.0` case
-# below then matched THREE components instead of one (issue #280). Reset all four
-# selectors to a sentinel equal to NONE of the tags this test uses, so every
+# a synthetic case: once v0.8.0 shipped, crates/shed-host-agent/VERSION reads
+# 0.8.0, and the desktop-only `v0.8.0` case below then matched extra components
+# instead of one (issue #280). Reset all three selectors to a sentinel equal to
+# NONE of the tags this test uses, so every
 # case's residual (unbumped) manifest cannot collide with that case's tag — the
 # test fully owns version state regardless of the repo's current release. (Uses
 # update-version.sh's desktop arm, so it needs the primed cargo index above.)
 BASELINE=0.0.0
-"${UV}" "${BASELINE}" --components server,host-agent,machine-rc,desktop >/dev/null
+"${UV}" "${BASELINE}" --components server,host-agent,desktop >/dev/null
 
 PASS=0
 step() { echo "--- $*"; }
@@ -116,13 +117,13 @@ run_plan() {
   PLAN_OUT="$("${RP}" "$@" 2>/dev/null)" || PLAN_RC=$?
 }
 
-# The exact 5-line stdout release-plan.sh emits, in emission order. Building the
+# The exact 4-line stdout release-plan.sh emits, in emission order. Building the
 # expectation from named booleans keeps the assertions readable as the ship set
 # changes case-to-case.
 expect_plan() {
-  # $1 server, $2 host-agent, $3 machine-rc, $4 desktop, $5 goreleaser
-  printf 'ship_server=%s\nship_host_agent=%s\nship_machine_rc=%s\nship_desktop=%s\nship_goreleaser=%s' \
-    "$1" "$2" "$3" "$4" "$5"
+  # $1 server, $2 host-agent, $3 desktop, $4 goreleaser
+  printf 'ship_server=%s\nship_host_agent=%s\nship_desktop=%s\nship_goreleaser=%s' \
+    "$1" "$2" "$3" "$4"
 }
 
 # Write a synthetic scratch CHANGELOG.md for the version under test. The tag's
@@ -139,7 +140,7 @@ write_changelog() {
 
 ## Unreleased
 
-**Ships:** server, host-agent, machine-rc, desktop
+**Ships:** server, host-agent, desktop
 
 ### Added
 - decoy entry (must never be read for a released tag)
@@ -159,7 +160,7 @@ if out="$("${UV}" 1.0.0 --components gopher 2>&1)"; then
   fail "unknown component 'gopher' was accepted"
 fi
 echo "${out}" | grep -q "unknown component 'gopher'" || fail "error message missing the offending component: ${out}"
-echo "${out}" | grep -q "server, host-agent, machine-rc, desktop" || fail "error message doesn't list valid components: ${out}"
+echo "${out}" | grep -q "server, host-agent, desktop" || fail "error message doesn't list valid components: ${out}"
 ok "rejected with valid-name listing"
 
 # ---------------------------------------------------------------------------
@@ -175,7 +176,7 @@ step "release-plan.sh: server-only tag (only plugin.json matches)"
 write_changelog 9.9.9 "server"
 run_plan v9.9.9
 [ "${PLAN_RC}" -eq 0 ] || fail "server-only plan exited ${PLAN_RC}"
-[ "${PLAN_OUT}" = "$(expect_plan true false false false true)" ] || fail "server-only plan stdout: ${PLAN_OUT}"
+[ "${PLAN_OUT}" = "$(expect_plan true false false true)" ] || fail "server-only plan stdout: ${PLAN_OUT}"
 ok "ship_server=true, others false, ship_goreleaser=true"
 
 # ---------------------------------------------------------------------------
@@ -199,7 +200,7 @@ step "release-plan.sh: desktop-only tag (no goreleaser manifest matches)"
 write_changelog 0.8.0 "desktop"
 run_plan v0.8.0
 [ "${PLAN_RC}" -eq 0 ] || fail "desktop-only plan exited ${PLAN_RC}"
-[ "${PLAN_OUT}" = "$(expect_plan false false false true false)" ] || fail "desktop-only plan stdout: ${PLAN_OUT}"
+[ "${PLAN_OUT}" = "$(expect_plan false false true false)" ] || fail "desktop-only plan stdout: ${PLAN_OUT}"
 ok "ship_desktop=true only, ship_goreleaser=false"
 
 # ---------------------------------------------------------------------------
@@ -209,7 +210,7 @@ step "update-version.sh --components go,desktop; release-plan sees a combined ta
 write_changelog 0.8.0 "server, desktop"
 run_plan v0.8.0
 [ "${PLAN_RC}" -eq 0 ] || fail "combined plan exited ${PLAN_RC}"
-[ "${PLAN_OUT}" = "$(expect_plan true false false true true)" ] || fail "combined plan stdout: ${PLAN_OUT}"
+[ "${PLAN_OUT}" = "$(expect_plan true false true true)" ] || fail "combined plan stdout: ${PLAN_OUT}"
 ok "ship_server=true ship_desktop=true ship_goreleaser=true"
 
 # ---------------------------------------------------------------------------
@@ -217,7 +218,7 @@ step "release-plan.sh: GITHUB_REF_NAME fallback (no positional arg)"
 run_plan_env_rc=0
 plan_env_out="$(GITHUB_REF_NAME=v0.8.0 "${RP}" 2>/dev/null)" || run_plan_env_rc=$?
 [ "${run_plan_env_rc}" -eq 0 ] || fail "GITHUB_REF_NAME fallback exited ${run_plan_env_rc}"
-[ "${plan_env_out}" = "$(expect_plan true false false true true)" ] || fail "GITHUB_REF_NAME fallback stdout: ${plan_env_out}"
+[ "${plan_env_out}" = "$(expect_plan true false true true)" ] || fail "GITHUB_REF_NAME fallback stdout: ${plan_env_out}"
 ok "reads the tag from GITHUB_REF_NAME"
 
 # ---------------------------------------------------------------------------
@@ -270,13 +271,11 @@ ok "stale lock entry caught; bumper repairs it"
 # known shape for the next. C1 has no update-version.sh arm for the new VERSION
 # files (that's C2), so they're written directly here.
 #
-# Entering state: plugin.json=0.8.0, host-agent=0.0.0, machine-rc=0.0.0 (the
-# hermetic baseline — never bumped above), desktop surfaces=0.8.0 (lockstep
-# intact).
+# Entering state: plugin.json=0.8.0, host-agent=0.0.0 (the hermetic baseline —
+# never bumped above), desktop surfaces=0.8.0 (lockstep intact).
 # ===========================================================================
 
 HOST_AGENT_VER="${SCRATCH}/crates/shed-host-agent/VERSION"
-MACHINE_RC_VER="${SCRATCH}/cmd/shed-machine-rc/VERSION"
 
 # ---------------------------------------------------------------------------
 step "release-plan.sh: host-agent-only tag (only crates/shed-host-agent/VERSION matches)"
@@ -284,17 +283,17 @@ printf '1.2.3\n' > "${HOST_AGENT_VER}"
 write_changelog 1.2.3 "host-agent"
 run_plan v1.2.3
 [ "${PLAN_RC}" -eq 0 ] || fail "host-agent-only plan exited ${PLAN_RC}"
-[ "${PLAN_OUT}" = "$(expect_plan false true false false true)" ] || fail "host-agent-only plan stdout: ${PLAN_OUT}"
+[ "${PLAN_OUT}" = "$(expect_plan false true false true)" ] || fail "host-agent-only plan stdout: ${PLAN_OUT}"
 ok "ship_host_agent=true only, ship_goreleaser=true"
 
 # ---------------------------------------------------------------------------
-step "release-plan.sh: machine-rc-only tag (only cmd/shed-machine-rc/VERSION matches)"
-printf '3.4.5\n' > "${MACHINE_RC_VER}"
-write_changelog 3.4.5 "machine-rc"
-run_plan v3.4.5
-[ "${PLAN_RC}" -eq 0 ] || fail "machine-rc-only plan exited ${PLAN_RC}"
-[ "${PLAN_OUT}" = "$(expect_plan false false true false true)" ] || fail "machine-rc-only plan stdout: ${PLAN_OUT}"
-ok "ship_machine_rc=true only, ship_goreleaser=true"
+step "release-plan.sh: retired 'machine-rc' Ships token exits 1 naming the retirement"
+write_changelog 1.2.3 "host-agent, machine-rc"
+run_plan v1.2.3
+[ "${PLAN_RC}" -eq 1 ] || fail "retired machine-rc token plan exited ${PLAN_RC} (want 1)"
+out="$("${RP}" v1.2.3 2>&1 || true)"
+echo "${out}" | grep -q "retired in plan 010" || fail "retired-token error missing the retirement message: ${out}"
+ok "'machine-rc' in a Ships line rejected with the retirement message"
 
 # ---------------------------------------------------------------------------
 step "release-plan.sh: combined server + host-agent (both manifests at 4.0.0)"
@@ -303,7 +302,7 @@ printf '4.0.0\n' > "${HOST_AGENT_VER}"
 write_changelog 4.0.0 "server, host-agent"
 run_plan v4.0.0
 [ "${PLAN_RC}" -eq 0 ] || fail "server+host-agent plan exited ${PLAN_RC}"
-[ "${PLAN_OUT}" = "$(expect_plan true true false false true)" ] || fail "server+host-agent plan stdout: ${PLAN_OUT}"
+[ "${PLAN_OUT}" = "$(expect_plan true true false true)" ] || fail "server+host-agent plan stdout: ${PLAN_OUT}"
 ok "ship_server=true ship_host_agent=true ship_goreleaser=true"
 
 # ---------------------------------------------------------------------------
@@ -312,7 +311,7 @@ step "release-plan.sh: legacy 'server/CLI' alias accepted (server + desktop tag)
 write_changelog 0.8.0 "server/CLI, desktop"
 run_plan v0.8.0
 [ "${PLAN_RC}" -eq 0 ] || fail "legacy-alias plan exited ${PLAN_RC}"
-[ "${PLAN_OUT}" = "$(expect_plan true false false true true)" ] || fail "legacy-alias plan stdout: ${PLAN_OUT}"
+[ "${PLAN_OUT}" = "$(expect_plan true false true true)" ] || fail "legacy-alias plan stdout: ${PLAN_OUT}"
 ok "server/CLI alias maps to server; ship_server=true ship_desktop=true"
 
 # ---------------------------------------------------------------------------
@@ -367,7 +366,7 @@ step "release-plan.sh: desktop-only prerelease plans cleanly (no Ships check)"
 "${UV}" 2.1.0-rc.1 --components desktop >/dev/null   # desktop surfaces at the rc, lockstep held
 run_plan v2.1.0-rc.1
 [ "${PLAN_RC}" -eq 0 ] || fail "desktop-only prerelease plan exited ${PLAN_RC}"
-[ "${PLAN_OUT}" = "$(expect_plan false false false true false)" ] || fail "desktop-only prerelease stdout: ${PLAN_OUT}"
+[ "${PLAN_OUT}" = "$(expect_plan false false true false)" ] || fail "desktop-only prerelease stdout: ${PLAN_OUT}"
 ok "ship_desktop=true only; prerelease skips the Ships cross-check"
 
 # ---------------------------------------------------------------------------
@@ -465,55 +464,53 @@ echo "${out}" | grep -qF "has no **Ships:** line" || fail "duplicate-heading err
 ok "only the first duplicate section is parsed; its missing Ships line is caught (no borrow from the second)"
 
 # ===========================================================================
-# C2: update-version.sh new arms (host-agent / machine-rc / 4-way), the `go`
-# deprecation alias, and the prerelease matrix. These run last (they mutate the
-# shared scratch manifests; nothing after them depends on the resulting state).
+# C2: update-version.sh arms (host-agent / the retired machine-rc / 3-way), the
+# `go` deprecation alias, and the prerelease matrix. These run last (they mutate
+# the shared scratch manifests; nothing after them depends on the state left).
 # ===========================================================================
 
 hostagent_ver() { tr -d '[:space:]' < "${HOST_AGENT_VER}"; }
-machinerc_ver() { tr -d '[:space:]' < "${MACHINE_RC_VER}"; }
 
 # ---------------------------------------------------------------------------
 step "update-version.sh --components host-agent bumps ONLY crates/shed-host-agent/VERSION"
 before_desktop="$(desktop_state)"
 before_plugin="$(jq -r '.version' "${SCRATCH}/.claude-plugin/plugin.json")"
-before_mrc="$(machinerc_ver)"
 "${UV}" 6.1.0 --components host-agent >/dev/null
 [ "$(hostagent_ver)" = "6.1.0" ] || fail "host-agent VERSION didn't bump to 6.1.0"
-[ "$(machinerc_ver)" = "${before_mrc}" ] || fail "--components host-agent touched machine-rc VERSION"
 [ "$(jq -r '.version' "${SCRATCH}/.claude-plugin/plugin.json")" = "${before_plugin}" ] || fail "--components host-agent touched plugin.json"
 [ "$(desktop_state)" = "${before_desktop}" ] || fail "--components host-agent touched a desktop surface"
-ok "host-agent VERSION=6.1.0; plugin/machine-rc/desktop untouched"
+ok "host-agent VERSION=6.1.0; plugin/desktop untouched"
 
 # ---------------------------------------------------------------------------
-step "update-version.sh --components machine-rc bumps ONLY cmd/shed-machine-rc/VERSION"
+step "update-version.sh: retired 'machine-rc' component hard-errors with the retirement message"
 before_desktop="$(desktop_state)"
 before_plugin="$(jq -r '.version' "${SCRATCH}/.claude-plugin/plugin.json")"
 before_ha="$(hostagent_ver)"
-"${UV}" 6.2.0 --components machine-rc >/dev/null
-[ "$(machinerc_ver)" = "6.2.0" ] || fail "machine-rc VERSION didn't bump to 6.2.0"
-[ "$(hostagent_ver)" = "${before_ha}" ] || fail "--components machine-rc touched host-agent VERSION"
-[ "$(jq -r '.version' "${SCRATCH}/.claude-plugin/plugin.json")" = "${before_plugin}" ] || fail "--components machine-rc touched plugin.json"
-[ "$(desktop_state)" = "${before_desktop}" ] || fail "--components machine-rc touched a desktop surface"
-ok "machine-rc VERSION=6.2.0; plugin/host-agent/desktop untouched"
+if out="$("${UV}" 6.2.0 --components machine-rc 2>&1)"; then
+  fail "retired component 'machine-rc' was accepted"
+fi
+echo "${out}" | grep -q "retired in plan 010" || fail "retired-component error missing the retirement message: ${out}"
+[ "$(hostagent_ver)" = "${before_ha}" ] || fail "rejected machine-rc bump touched host-agent VERSION"
+[ "$(jq -r '.version' "${SCRATCH}/.claude-plugin/plugin.json")" = "${before_plugin}" ] || fail "rejected machine-rc bump touched plugin.json"
+[ "$(desktop_state)" = "${before_desktop}" ] || fail "rejected machine-rc bump touched a desktop surface"
+ok "machine-rc rejected with the retirement message; nothing touched"
 
 # ---------------------------------------------------------------------------
-step "update-version.sh --components server,host-agent,machine-rc,desktop bumps all four"
-"${UV}" 6.3.0 --components server,host-agent,machine-rc,desktop >/dev/null
-[ "$(jq -r '.version' "${SCRATCH}/.claude-plugin/plugin.json")" = "6.3.0" ] || fail "4-way: plugin.json didn't bump"
-[ "$(hostagent_ver)" = "6.3.0" ] || fail "4-way: host-agent VERSION didn't bump"
-[ "$(machinerc_ver)" = "6.3.0" ] || fail "4-way: machine-rc VERSION didn't bump"
-[ "$(tr -d '[:space:]' < "${SCRATCH}/desktop/VERSION")" = "6.3.0" ] || fail "4-way: desktop/VERSION didn't bump"
-grep -q '^version = "6.3.0"' "${SCRATCH}/crates/Cargo.toml" || fail "4-way: crates/Cargo.toml didn't bump"
-ok "server + host-agent + machine-rc + desktop all at 6.3.0"
+step "update-version.sh --components server,host-agent,desktop bumps all three"
+"${UV}" 6.3.0 --components server,host-agent,desktop >/dev/null
+[ "$(jq -r '.version' "${SCRATCH}/.claude-plugin/plugin.json")" = "6.3.0" ] || fail "3-way: plugin.json didn't bump"
+[ "$(hostagent_ver)" = "6.3.0" ] || fail "3-way: host-agent VERSION didn't bump"
+[ "$(tr -d '[:space:]' < "${SCRATCH}/desktop/VERSION")" = "6.3.0" ] || fail "3-way: desktop/VERSION didn't bump"
+grep -q '^version = "6.3.0"' "${SCRATCH}/crates/Cargo.toml" || fail "3-way: crates/Cargo.toml didn't bump"
+ok "server + host-agent + desktop all at 6.3.0"
 
 # ---------------------------------------------------------------------------
-step "update-version.sh: the 4-way bump is idempotent (byte-identical re-run)"
-before="$(desktop_state)$(jq -r '.version' "${SCRATCH}/.claude-plugin/plugin.json")$(hostagent_ver)$(machinerc_ver)"
-"${UV}" 6.3.0 --components server,host-agent,machine-rc,desktop >/dev/null
-after="$(desktop_state)$(jq -r '.version' "${SCRATCH}/.claude-plugin/plugin.json")$(hostagent_ver)$(machinerc_ver)"
-[ "${before}" = "${after}" ] || fail "re-running the 4-way bump changed bytes"
-ok "4-way re-run is a no-op"
+step "update-version.sh: the 3-way bump is idempotent (byte-identical re-run)"
+before="$(desktop_state)$(jq -r '.version' "${SCRATCH}/.claude-plugin/plugin.json")$(hostagent_ver)"
+"${UV}" 6.3.0 --components server,host-agent,desktop >/dev/null
+after="$(desktop_state)$(jq -r '.version' "${SCRATCH}/.claude-plugin/plugin.json")$(hostagent_ver)"
+[ "${before}" = "${after}" ] || fail "re-running the 3-way bump changed bytes"
+ok "3-way re-run is a no-op"
 
 # ---------------------------------------------------------------------------
 step "update-version.sh: 'go' is a deprecated alias for 'server' AND warns on stderr"
@@ -531,9 +528,9 @@ echo "${out}" | grep -q "stable-only" || fail "prerelease-host-agent error missi
 ok "7.0.0-rc.1 --components host-agent rejected"
 
 # ---------------------------------------------------------------------------
-step "update-version.sh: prerelease + server,machine-rc rejected; prerelease desktop-only allowed"
-if "${UV}" 7.0.0-rc.1 --components server,machine-rc >/dev/null 2>&1; then
-  fail "prerelease server,machine-rc bump was accepted"
+step "update-version.sh: prerelease + server,host-agent rejected; prerelease desktop-only allowed"
+if "${UV}" 7.0.0-rc.1 --components server,host-agent >/dev/null 2>&1; then
+  fail "prerelease server,host-agent bump was accepted"
 fi
 "${UV}" 7.0.0-rc.1 --components desktop >/dev/null || fail "desktop-only prerelease bump was rejected"
 [ "$(tr -d '[:space:]' < "${SCRATCH}/desktop/VERSION")" = "7.0.0-rc.1" ] || fail "desktop-only prerelease didn't bump desktop/VERSION"
@@ -564,8 +561,8 @@ ok "go,go bumps plugin.json and warns once"
 # failed-tag caveat path must stay non-fatal.
 #
 # Synthetic history:
-#   v0.9.0  plugin.json 0.9.0, desktop/VERSION 0.9.0; NO host-agent/machine-rc
-#           VERSION files (pre-migration) → their walk FALLS BACK to this tag.
+#   v0.9.0  plugin.json 0.9.0, desktop/VERSION 0.9.0; NO host-agent VERSION
+#           file (pre-migration) → its walk FALLS BACK to this tag.
 #   v0.9.1  desktop-only: desktop/VERSION 0.9.1 (plugin still 0.9.0) + a commit
 #           touching ONLY crates/Cargo.toml + Cargo.lock (desktop lockfile churn).
 #   HEAD    post-v0.9.1: sdk/x.go, .claude-plugin/plugin-meta.txt, desktop/ui.txt,
@@ -577,7 +574,7 @@ mkdir -p "${FIX}"
 git -C "${FIX}" init -q
 gitf() { git -C "${FIX}" -c user.email=t@t -c user.name=t "$@"; }
 
-# --- base tree + v0.9.0 (pre-migration; no host-agent/machine-rc VERSION) ---
+# --- base tree + v0.9.0 (pre-migration; no host-agent VERSION) ---
 mkdir -p "${FIX}/.claude-plugin" "${FIX}/sdk" "${FIX}/crates/shed-broker/src" "${FIX}/desktop"
 printf '{"version": "0.9.0"}\n' > "${FIX}/.claude-plugin/plugin.json"
 printf '0.9.0\n' > "${FIX}/desktop/VERSION"
@@ -629,29 +626,28 @@ printf 'pub fn broker() { /* changed */ }\n' > "${FIX}/crates/shed-broker/src/li
 gitf add -A; gitf commit -q -m 'host-agent: shed-broker change'
 
 # ---------------------------------------------------------------------------
-step "recommend-components.sh: patch 0.9.2 → server (sdk+plugin), host-agent (broker), desktop (ui); NOT machine-rc"
+step "recommend-components.sh: patch 0.9.2 → server (sdk+plugin), host-agent (broker), desktop (ui)"
 run_reco 0.9.2
 [ "${RECO_RC}" -eq 0 ] || fail "patch recommend exited ${RECO_RC}: ${RECO_ERR}"
 echo "${RECO_OUT}" | grep -qx "level=patch" || fail "patch level wrong: ${RECO_OUT}"
 echo "${RECO_OUT}" | grep -qx "recommended_components=server,host-agent,desktop" || fail "patch recommendation wrong: ${RECO_OUT} // ${RECO_ERR}"
 echo "${RECO_ERR}" | grep -q "CAVEAT (failed-tag)" || fail "gh-skip failed-tag caveat not printed (should stay non-fatal): ${RECO_ERR}"
-ok "server,host-agent,desktop (machine-rc correctly unflagged; gh-skip caveat non-fatal)"
+ok "server,host-agent,desktop (gh-skip caveat non-fatal)"
 
 # ---------------------------------------------------------------------------
-step "recommend-components.sh: last-shipped fallback (host-agent/machine-rc → v0.9.0 via plugin match; desktop → v0.9.1)"
+step "recommend-components.sh: last-shipped fallback (host-agent → v0.9.0 via plugin match; desktop → v0.9.1)"
 echo "${RECO_ERR}" | grep -Eq '^[[:space:]]*server[[:space:]]+v0\.9\.0[[:space:]]' || fail "server last-shipped not v0.9.0: ${RECO_ERR}"
 echo "${RECO_ERR}" | grep -Eq '^[[:space:]]*host-agent[[:space:]]+v0\.9\.0[[:space:]]' || fail "host-agent last-shipped not v0.9.0 (fallback): ${RECO_ERR}"
-echo "${RECO_ERR}" | grep -Eq '^[[:space:]]*machine-rc[[:space:]]+v0\.9\.0[[:space:]]' || fail "machine-rc last-shipped not v0.9.0 (fallback): ${RECO_ERR}"
 echo "${RECO_ERR}" | grep -Eq '^[[:space:]]*desktop[[:space:]]+v0\.9\.1[[:space:]]' || fail "desktop last-shipped not v0.9.1: ${RECO_ERR}"
-ok "host-agent/machine-rc fell back to v0.9.0; desktop resolved to v0.9.1"
+ok "host-agent fell back to v0.9.0; desktop resolved to v0.9.1"
 
 # ---------------------------------------------------------------------------
 step "recommend-components.sh: minor 0.10.0 → ALL components regardless of diffs"
 run_reco 0.10.0
 [ "${RECO_RC}" -eq 0 ] || fail "minor recommend exited ${RECO_RC}: ${RECO_ERR}"
 echo "${RECO_OUT}" | grep -qx "level=minor" || fail "minor level wrong: ${RECO_OUT}"
-echo "${RECO_OUT}" | grep -qx "recommended_components=server,host-agent,machine-rc,desktop" || fail "minor recommendation wrong: ${RECO_OUT}"
-ok "all four components (a minor bump ships the fleet)"
+echo "${RECO_OUT}" | grep -qx "recommended_components=server,host-agent,desktop" || fail "minor recommendation wrong: ${RECO_OUT}"
+ok "all three components (a minor bump ships the fleet)"
 
 # ---------------------------------------------------------------------------
 step "recommend-components.sh: target == max (0.9.1) and target < max (0.8.0) both exit 1 (monotonicity)"
@@ -693,14 +689,14 @@ ok "0.07.11 rejected (leading zeros barred)"
 # ---------------------------------------------------------------------------
 # H1: the pre-migration fallback must require the VERSION file to be ABSENT at a
 # tag — a post-migration tag that carries the file but shipped server-only
-# (VERSION stale, plugin==tag) did NOT ship host-agent/machine-rc and must NOT be
-# borrowed as the basis. A SEPARATE fixture (so it can't perturb the state the
+# (VERSION stale, plugin==tag) did NOT ship host-agent and must NOT be borrowed
+# as the basis. A SEPARATE fixture (so it can't perturb the state the
 # tests above thread through the shared reco-fixture).
 #
-#   v1.0.0  plugin=1.0.0, desktop=1.0.0, NO host-agent/machine-rc VERSION
+#   v1.0.0  plugin=1.0.0, desktop=1.0.0, NO host-agent VERSION
 #           (pre-migration → the legitimate fallback basis).
-#   v1.1.0  server-only: plugin=1.1.0, and the host-agent/machine-rc VERSION
-#           files NOW EXIST but at a STALE 1.0.0 (migration happened; the tag
+#   v1.1.0  server-only: plugin=1.1.0, and the host-agent VERSION file NOW
+#           EXISTS but at a STALE 1.0.0 (migration happened; the tag
 #           shipped server only). first-loop finds no VERSION==tag; the FIXED
 #           fallback skips v1.1.0 (file present) and lands on v1.0.0. A fallback
 #           lacking the absent-file guard would wrongly pick v1.1.0.
@@ -710,7 +706,7 @@ FIX2="${SCRATCH}/reco-fixture-h1"
 mkdir -p "${FIX2}"
 git -C "${FIX2}" init -q
 gitf2() { git -C "${FIX2}" -c user.email=t@t -c user.name=t "$@"; }
-mkdir -p "${FIX2}/.claude-plugin" "${FIX2}/crates/shed-host-agent" "${FIX2}/cmd/shed-machine-rc" "${FIX2}/crates/shed-broker/src" "${FIX2}/desktop"
+mkdir -p "${FIX2}/.claude-plugin" "${FIX2}/crates/shed-host-agent" "${FIX2}/crates/shed-broker/src" "${FIX2}/desktop"
 printf '{"version": "1.0.0"}\n' > "${FIX2}/.claude-plugin/plugin.json"
 printf '1.0.0\n' > "${FIX2}/desktop/VERSION"
 printf 'pub fn broker() {}\n' > "${FIX2}/crates/shed-broker/src/lib.rs"
@@ -719,8 +715,7 @@ gitf2 tag v1.0.0
 # migration + server-only 1.1.0: VERSION files appear but stale at 1.0.0.
 printf '{"version": "1.1.0"}\n' > "${FIX2}/.claude-plugin/plugin.json"
 printf '1.0.0\n' > "${FIX2}/crates/shed-host-agent/VERSION"
-printf '1.0.0\n' > "${FIX2}/cmd/shed-machine-rc/VERSION"
-gitf2 add -A; gitf2 commit -q -m 'v1.1.0 server-only (VERSION files present, stale 1.0.0)'
+gitf2 add -A; gitf2 commit -q -m 'v1.1.0 server-only (VERSION file present, stale 1.0.0)'
 gitf2 tag v1.1.0
 # a post-tag change so the walk has a diff to compute.
 printf 'pub fn broker() { /* changed */ }\n' > "${FIX2}/crates/shed-broker/src/lib.rs"
@@ -729,9 +724,8 @@ h1_rc=0
 h1_err="$(cd "${FIX2}" && RECOMMEND_NO_GH=1 "${RECO}" 1.1.1 2>&1 1>/dev/null)" || h1_rc=$?
 [ "${h1_rc}" -eq 0 ] || fail "H1 recommend exited ${h1_rc}: ${h1_err}"
 echo "${h1_err}" | grep -Eq '^[[:space:]]*host-agent[[:space:]]+v1\.0\.0[[:space:]]' || fail "H1: host-agent basis not v1.0.0 (fallback picked the stale-VERSION server tag?): ${h1_err}"
-echo "${h1_err}" | grep -Eq '^[[:space:]]*machine-rc[[:space:]]+v1\.0\.0[[:space:]]' || fail "H1: machine-rc basis not v1.0.0: ${h1_err}"
 echo "${h1_err}" | grep -Eq '^[[:space:]]*host-agent[[:space:]]+v1\.1\.0[[:space:]]' && fail "H1: host-agent wrongly used v1.1.0 as basis: ${h1_err}"
-ok "host-agent/machine-rc fell back to v1.0.0; the stale-VERSION v1.1.0 tag was NOT borrowed"
+ok "host-agent fell back to v1.0.0; the stale-VERSION v1.1.0 tag was NOT borrowed"
 
 # ---------------------------------------------------------------------------
 # H2: a stable target must dominate a same-base prerelease held in a manifest.

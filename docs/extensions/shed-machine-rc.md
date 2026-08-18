@@ -18,14 +18,22 @@ It is a one-shot CLI (no daemon); all `tmux` work happens locally on the machine
 and `tmux` must be installed on the machine (with `claude` authenticated) — the same
 prerequisites a shed image bakes in.
 
-!!! note "On the road to retirement"
-    The Rust port of this engine ships as [`sx rc`](sx.md) (wire-identical —
-    the `tests/rc-parity` differential suite is the proof), and the machine
-    activity hub this binary's `serve` provides is now also hosted by the
-    [`shed-host-agent` daemon](sx.md#the-machine-hub). Once the mixed-fleet
-    window closes, `shed-machine-rc` retires: `sx` takes over the remote verb
-    surface and the agent owns the hub. Until then everything on this page
-    stays supported, and the two hub providers coexist via bind-as-lock.
+!!! warning "Retired (plan 010)"
+    `shed-machine-rc` is **retired** as a release component. The Rust port of
+    this engine ships as [`sx rc`](sx.md) (wire-identical — the
+    `tests/rc-parity` differential suite is the standing proof), and the
+    machine activity hub this binary's `serve` provided is hosted by the
+    [`shed-host-agent` daemon](sx.md#the-machine-hub). `sx --on machine:`
+    targets now default to invoking the remote `sx` binary; a
+    `machines[].rc_bin` override keeps a machine on a still-installed
+    `shed-machine-rc` through the mixed fleet.
+
+    **Already installed?** Nothing breaks. The brew formula and apt entry
+    keep serving the last-shipped release (v0.8.2), and a running
+    `shed-machine-rc serve` hub coexists with the agent via bind-as-lock —
+    the agent defers while the Go hub holds the port and takes over when it
+    exits. No new releases will ship; this page is kept one release for link
+    stability and documents the retired binary as last shipped.
 
 ## Install
 

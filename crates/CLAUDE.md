@@ -34,7 +34,8 @@ re-implemented per language. The root `CLAUDE.md` owns the monorepo layout + rel
 - **`sx`** — the RC **porcelain** binary (plan 009), on `shed-core` + `shed-app` (with the
   non-default `rc` feature enabled by its own manifest, so `cargo build -p sx` needs no
   flags). Today it exposes one namespace, `sx rc <verb>` — the ported one-shot engine,
-  wire-compatible with the Go `shed-machine-rc <verb>` under the comparison model
+  wire-compatible with the Go oracle (`tests/rc-parity/oracle`, the retired
+  `shed-machine-rc`'s main) under the comparison model
   `tests/rc-parity` enforces (`make test-rc-parity` builds BOTH binaries and diffs them) — and
   the **porcelain verbs** on top of it: `sx agent <tool>` / `sx plan <file>` (kickoff) and
   `sx ls` / `sx watch` / `sx attach` / `sx kill` (observe), each taking

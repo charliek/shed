@@ -131,8 +131,10 @@ jobs:
               # kernel (`shed-core::rc_agents`), plus the `sx` CLI that is the
               # binary under test. Go side: the engine (`internal/ext/rc`), its CLI
               # shell (`internal/ext/clirc`) and BOTH binaries built from them — the
-              # oracle `shed-machine-rc` and the guest `shed-ext-rc`, which share the
-              # same wire surface.
+              # test-only oracle (tests/rc-parity/oracle — the retired
+              # shed-machine-rc's main, covered by the tests/rc-parity/** entry
+              # below) and the guest `shed-ext-rc`, which share the same wire
+              # surface.
               - 'crates/shed-core/**'
               - 'crates/shed-app/**'
               - 'crates/shed-rc-engine/**'
@@ -151,7 +153,6 @@ jobs:
               - 'internal/ext/rc/**'
               - 'internal/ext/clirc/**'
               - 'internal/version/**'
-              - 'cmd/shed-machine-rc/**'
               - 'cmd/shed-ext-rc/**'
               - 'tests/rc-parity/**'
               # The crates-local fixture COPIES (panes, jsonl, wire goldens).
@@ -278,10 +279,10 @@ jobs:
       # friends) on this runner — de-risks the macos release job.
       - name: Run tests
         run: go test ./...
-      # Three snapshot invocations, one per split config, in the FIXED release
-      # order (server → host-agent → machine-rc). All three run unconditionally
-      # here — the snapshot is the pre-tag proof of every component, incl. the
-      # Rust host-agent leg. Each writes its own dist/<component>/ subdir.
+      # Two snapshot invocations, one per split config, in the FIXED release
+      # order (server → host-agent). Both run unconditionally here — the
+      # snapshot is the pre-tag proof of every component, incl. the Rust
+      # host-agent leg. Each writes its own dist/<component>/ subdir.
       - name: GoReleaser snapshot — server
         uses: goreleaser/goreleaser-action@v7
         with:
@@ -292,31 +293,12 @@ jobs:
         with:
           version: v2.15.3
           args: release --snapshot --clean -f .goreleaser.host-agent.yaml
-      - name: GoReleaser snapshot — machine-rc
-        uses: goreleaser/goreleaser-action@v7
-        with:
-          version: v2.15.3
-          args: release --snapshot --clean -f .goreleaser.machine-rc.yaml
       - name: Assert release artifacts
         run: |
           set -euo pipefail
           # Each split config writes its own dist/<component>/ subdir (plan 002
           # D2); the checks below are re-pointed accordingly.
-          # (i) shed-machine-rc archives: darwin+linux × amd64+arm64, each containing
-          # EXACTLY the one binary (ids: selectors must keep other builds out).
-          for tgz in dist/machine-rc/shed-machine-rc_*.tar.gz; do
-            entries=$(tar tzf "$tgz" | grep -c .)
-            bins=$(tar tzf "$tgz" | grep -c '^shed-machine-rc$')
-            { [ "$entries" = "1" ] && [ "$bins" = "1" ]; } || { echo "::error::$tgz must contain exactly the shed-machine-rc binary and nothing else"; tar tzf "$tgz"; exit 1; }
-          done
-          for os in darwin linux; do
-            for arch in amd64 arm64; do
-              ls "dist/machine-rc/shed-machine-rc_${os}_${arch}.tar.gz" >/dev/null || { echo "::error::missing dist/machine-rc/shed-machine-rc_${os}_${arch}.tar.gz"; exit 1; }
-            done
-          done
-          # (ii) per-arch shed-machine-rc .debs, named to match apt-charliek's glob.
-          ls dist/machine-rc/shed-machine-rc_*_amd64.deb dist/machine-rc/shed-machine-rc_*_arm64.deb
-          # (iii) ALL FOUR shed-host-agent archives (now Rust) carry the binary AND
+          # (i) ALL FOUR shed-host-agent archives (now Rust) carry the binary AND
           # the example config.
           workdir="$(mktemp -d)"
           for os in darwin linux; do
@@ -345,7 +327,7 @@ jobs:
           echo "$amd64_file" | grep -q 'Mach-O.*x86_64' || { echo "::error::darwin/amd64 is not a well-formed x86_64 Mach-O: $amd64_file"; exit 1; }
           echo "darwin/amd64: $amd64_file"
           rm -rf "$workdir"
-          # (iv) plan 002 D6: per-dist exact (type, ID) allowlists — typed, so a
+          # (ii) plan 002 D6: per-dist exact (type, ID) allowlists — typed, so a
           # dropped ARCHIVE block is caught even when its BUILD still contributes
           # the same ID string (codex review finding). Equality proves expected-
           # present AND forbidden-absent. Plus partition invariants (deb
@@ -377,17 +359,6 @@ jobs:
                   "checksums": "checksums-host-agent.txt",
                   "formulas": {"shed-host-agent.rb"},
                   "has_deb": False,
-              },
-              "machine-rc": {
-                  "dist": "dist/machine-rc",
-                  "typed_ids": {
-                      "Binary": {"shed-machine-rc"},
-                      "Archive": {"shed-machine-rc"},
-                      "Linux Package": {"shed-machine-rc"},
-                  },
-                  "checksums": "checksums-machine-rc.txt",
-                  "formulas": {"shed-machine-rc.rb"},
-                  "has_deb": True,
               },
           }
           ALL_CHECKSUMS = {c["checksums"] for c in EXPECTED.values()}
@@ -436,7 +407,7 @@ jobs:
                           fail(f"upload basename {b} collides: {all_basenames[b]} and {comp}")
                       all_basenames[b] = comp
               print(f"{comp}: IDs OK; deb={'yes' if debs else 'no'}; checksums={spec['checksums']}; formulas parse OK")
-          print(f"partition OK: {len(all_basenames)} unique upload basenames across three dists")
+          print(f"partition OK: {len(all_basenames)} unique upload basenames across two dists")
           PY
           echo "release snapshot artifacts OK"
 
@@ -634,7 +605,7 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v6
-      # Builds the Go oracle (`shed-machine-rc`) — same version as the other Go jobs.
+      # Builds the Go oracle (tests/rc-parity/oracle) — same version as the other Go jobs.
       - uses: actions/setup-go@v6
         with:
           go-version: '1.25'

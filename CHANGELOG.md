@@ -5,12 +5,13 @@ All notable changes to this project will be documented in this file.
 <!--
   `**Ships:**` convention: each release entry opens with a `**Ships:** …`
   line naming the components that tag actually shipped, using the
-  canonical tokens `server`, `host-agent`, `machine-rc`, `desktop`
+  canonical tokens `server`, `host-agent`, `desktop`
   (comma-separated; legacy `server/CLI` is accepted as an alias for
-  `server`, for entries written before the rename). A component ships iff
+  `server`, for entries written before the rename; `machine-rc` appears in
+  historical entries but is REJECTED on new ones — the component was
+  retired in plan 010). A component ships iff
   its version manifest equals the tag (server: .claude-plugin/plugin.json;
-  host-agent: crates/shed-host-agent/VERSION; machine-rc:
-  cmd/shed-machine-rc/VERSION; desktop: desktop/VERSION) — see
+  host-agent: crates/shed-host-agent/VERSION; desktop: desktop/VERSION) — see
   RELEASING.md "Component selection". ENFORCED by
   scripts/release/release-plan.sh on stable tags (a mismatched, missing,
   unknown, or duplicate token fails the release); prerelease tags have no
@@ -20,10 +21,11 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
-_Staged by plan 010 (the machine-hub port); at release time fold this body
-into the new `## vX.Y.Z` section and replace this note with a real
-`**Ships:**` line (host-agent at minimum; machine-rc if the retirement lands
-in the same tag) — release-plan.sh never reads an `## Unreleased` heading._
+_Staged by plan 010 (the machine-hub port + retirement); at release time fold
+this body into the new `## vX.Y.Z` section and replace this note with a real
+`**Ships:**` line — **host-agent** (the hub lands there; the `machine-rc`
+token is retired and release-plan.sh now rejects it). release-plan.sh never
+reads an `## Unreleased` heading._
 
 - **The machine RC hub moves into `shed-host-agent`.** The daemon hosts the
   activity hub (`127.0.0.1:1029`) as a supervised resident role: bind-as-lock
@@ -35,12 +37,26 @@ in the same tag) — release-plan.sh never reads an `## Unreleased` heading._
   `/v1` under the `tests/rc-parity` hub differential family (snapshot, SSE,
   side-effect, opencode-lane, and cursor-ingest cells — both daemons run side
   by side in CI).
-- **`sx` create's hub ensure is probe-first**: a healthy hub of either
-  provider short-circuits; the `shed-machine-rc serve --detach` spawn remains
-  as the fallback for machines without the agent.
+- **`sx` create's hub ensure is probe-first** (now probe-only, below): a
+  healthy hub of either provider short-circuits.
 - Machine-posture docs: `docs/extensions/sx.md` gains "The machine hub"
   (trust model: loopback + SSH tunnel is the boundary; no proxy on machines),
-  `shed-machine-rc.md` carries the retirement roadmap note.
+  `shed-machine-rc.md` carries the retirement note.
+- **The `machine-rc` component is retired** (plan 010 H15, evidence-gated on
+  live e2e on this Mac + mini3). `cmd/shed-machine-rc`,
+  `.goreleaser.machine-rc.yaml`, and the component wiring (release scripts,
+  CI snapshot leg, apt dispatch) are deleted;
+  `update-version.sh`/`release-plan.sh` reject the `machine-rc` token, and
+  `publish-images.yaml` fails loudly if a re-dispatched pre-retirement tag
+  plans `ship_machine_rc=true`. The parity harness's Go oracle relocated to
+  `tests/rc-parity/oracle/` (byte-identical main, test-only, same
+  `shed-machine-rc` identity the goldens pin). `sx --on machine:` targets now
+  default to the remote `sx rc <verb>` argv (wire-identical; the
+  `machines[].rc_bin` override keeps Go-binary machines working), and `sx`'s
+  create-time hub ensure no longer spawns `shed-machine-rc serve` — it
+  probes, and hints at `shed-host-agent` when nothing answers. Published
+  brew/apt artifacts stay frozen at v0.8.2 and installed binaries keep
+  working through the mixed window (the agent's bind-retry absorbs them).
 
 ## v0.8.2 — 2026-08-17
 

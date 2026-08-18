@@ -607,10 +607,12 @@ fn kill_on_a_machine_sends_the_kill_argv() {
     let code = dispatch(&deps, "kill", &argv(&["abc234", "--on", "machine:mini2"])).unwrap();
     assert_eq!(code, 0);
     let (called, _) = runner.only_call();
+    // The post-retirement default: `sx rc <verb>` as two argv words (a
+    // machines[].rc_bin override would collapse the prefix to one).
     assert!(called
         .last()
         .unwrap()
-        .contains("'shed-machine-rc' 'kill' '--slug' 'abc234'"));
+        .contains("'sx' 'rc' 'kill' '--slug' 'abc234'"));
     assert!(out.stdout.text().contains("Killed abc234 on machine:mini2"));
 }
 

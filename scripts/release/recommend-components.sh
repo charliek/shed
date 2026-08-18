@@ -1,10 +1,13 @@
 #!/usr/bin/env bash
 # Recommend which release components a NEXT stable tag should ship.
 #
-# The monorepo carries four release components on ONE vX.Y.Z tag family
-# (see RELEASING.md "Component selection"): server, host-agent, machine-rc,
-# desktop. This script inspects committed history and prints a RECOMMENDATION;
-# it never bumps a manifest, never writes a file, never mutates git. The human
+# The monorepo carries three release components on ONE vX.Y.Z tag family
+# (see RELEASING.md "Component selection"): server, host-agent, desktop.
+# (machine-rc was retired in plan 010 — the shed-host-agent daemon hosts the
+# machine RC hub and `sx` carries the one-shot verbs.)
+#
+# This script inspects committed history and prints a RECOMMENDATION; it never
+# bumps a manifest, never writes a file, never mutates git. The human
 # reviews the recommendation, edits it if needed, authors the CHANGELOG
 # `**Ships:**` line, then runs scripts/release/update-version.sh with the
 # confirmed set. This is deliberately advisory:
@@ -63,6 +66,10 @@ set -euo pipefail
 # The two helper cmd/ subtrees (their own components) are subtracted.
 PATHS_SERVER=(
   cmd
+  # cmd/shed-machine-rc was deleted from the tree (plan 010 H15 — the
+  # machine-rc retirement), but the exclusion stays: it's needed so diffs
+  # against PRE-DELETION tags still classify correctly. Prune once every
+  # plausible basis tag is post-deletion.
   ':(exclude)cmd/shed-machine-rc'
   # cmd/shed-host-agent was deleted from the tree (plan 006 C3 — the Go
   # host-agent sunset), but the exclusion stays: it's needed so diffs against
@@ -111,17 +118,6 @@ PATHS_HOST_AGENT=(
   .goreleaser.host-agent.yaml
 )
 
-# machine-rc: coarse on purpose (internal/** + go.mod/go.sum over-flag, which is
-# free under human confirm — a missed machine-rc change is not).
-# shellcheck disable=SC2034  # read via get_paths()
-PATHS_MACHINE_RC=(
-  cmd/shed-machine-rc
-  internal
-  go.mod
-  go.sum
-  .goreleaser.machine-rc.yaml
-)
-
 # desktop: the app + every crate it links + the shared cargo manifests/locks
 # (which the desktop bump owns).
 # shellcheck disable=SC2034  # read via get_paths()
@@ -141,7 +137,7 @@ PATHS_DESKTOP=(
 )
 
 # Canonical component order (drives every output list).
-COMPONENTS=(server host-agent machine-rc desktop)
+COMPONENTS=(server host-agent desktop)
 
 # ---------------------------------------------------------------------------
 # Argument + repo preconditions.
@@ -221,7 +217,6 @@ manifest_path() {
   case "$1" in
     server) echo ".claude-plugin/plugin.json" ;;
     host-agent) echo "crates/shed-host-agent/VERSION" ;;
-    machine-rc) echo "cmd/shed-machine-rc/VERSION" ;;
     desktop) echo "desktop/VERSION" ;;
   esac
 }
@@ -233,7 +228,6 @@ get_paths() {
   case "$1" in
     server)     paths=("${PATHS_SERVER[@]}") ;;
     host-agent) paths=("${PATHS_HOST_AGENT[@]}") ;;
-    machine-rc) paths=("${PATHS_MACHINE_RC[@]}") ;;
     desktop)    paths=("${PATHS_DESKTOP[@]}") ;;
   esac
 }
@@ -245,13 +239,12 @@ comp_index() {
   case "$1" in
     server) echo 0 ;;
     host-agent) echo 1 ;;
-    machine-rc) echo 2 ;;
-    desktop) echo 3 ;;
+    desktop) echo 2 ;;
   esac
 }
 
 # Current manifest version from the working tree; empty if the file is absent
-# (host-agent / machine-rc VERSION files don't exist pre-migration).
+# (the host-agent VERSION file doesn't exist pre-migration).
 current_manifest() {
   local comp="$1" path
   path="${REPO_ROOT}/$(manifest_path "${comp}")"
@@ -307,7 +300,7 @@ while IFS= read -r t; do
 done < <(git -C "${REPO_ROOT}" tag -l 'v*' | sort -V -r)
 
 # find_lastship <comp> → echoes the newest tag T that SHIPPED the component.
-# A tag T ships host-agent / machine-rc iff EITHER:
+# A tag T ships host-agent iff EITHER:
 #   (a) its VERSION file exists at T and equals T's version (post-migration, its
 #       own selector), OR
 #   (b) its VERSION file does NOT exist at T (pre-migration era) AND plugin.json
@@ -325,7 +318,7 @@ find_lastship() {
       echo "${t}"; return 0
     fi
   done
-  if [ "${comp}" = "host-agent" ] || [ "${comp}" = "machine-rc" ]; then
+  if [ "${comp}" = "host-agent" ]; then
     for t in "${TAGS[@]}"; do
       # Fallback is pre-migration ONLY: skip any tag where the component already
       # had its own VERSION selector (its ship there is decided by loop (a)).

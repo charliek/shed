@@ -14,6 +14,12 @@ Sheds keep the Go guest hub (`shed-ext-rc`, baked into images) — the Go code
 here is NOT deleted by the port; it remains the differential oracle
 (`tests/rc-parity`, hub family).
 
+> **Status: the port shipped and the retirement landed (H15).** Every row
+> below is ported; the harness's Go leg builds from
+> `tests/rc-parity/oracle/main.go` (the retired `cmd/shed-machine-rc`'s main,
+> relocated test-only); the `machine-rc` release component is retired per
+> RELEASING.md's retired-component note.
+
 ## File → module map
 
 | Go source (internal/ext/rc/) | LOC | Rust destination (shed-broker/src/rc_hub/) | Go tests |

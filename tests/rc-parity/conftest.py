@@ -1,7 +1,9 @@
 """Fixtures for the Go↔Rust RC one-shot parity harness (plan 009 §3.6).
 
-Builds BOTH implementations once per session — `shed-machine-rc` (Go, the oracle)
-and `sx` (Rust) — and drives them as black-box subprocesses against a hermetic
+Builds BOTH implementations once per session — the Go oracle
+(`tests/rc-parity/oracle`, the retired shed-machine-rc's main, still running
+under the `shed-machine-rc` identity the goldens were recorded with) and `sx`
+(Rust) — and drives them as black-box subprocesses against a hermetic
 tmux server, asserting their wire-visible output is identical under
 `normalize.py`'s canonicalization, then pinning it to a committed golden recorded
 from the Go side.
@@ -209,7 +211,7 @@ def binaries(tmp_path_factory) -> dict:
     out_dir = tmp_path_factory.mktemp("bin")
     go_bin = out_dir / "shed-machine-rc"
     _build(
-        ["go", "build", "-o", str(go_bin), "./cmd/shed-machine-rc"],
+        ["go", "build", "-o", str(go_bin), "./tests/rc-parity/oracle"],
         cwd=REPO_ROOT,
     )
     assert go_bin.exists(), f"go binary missing: {go_bin}"

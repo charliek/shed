@@ -1,26 +1,27 @@
 # GoReleaser config — SERVER component (plan 002: release component model).
 #
-# One of THREE split configs. The release job invokes goreleaser once per
-# SHIPPING component, in the FIXED order: server → host-agent → machine-rc.
+# One of TWO split configs. The release job invokes goreleaser once per
+# SHIPPING component, in the FIXED order: server → host-agent.
 #   - .goreleaser.server.yaml      (this file): brew `shed`, apt `shed-server` deb
 #   - .goreleaser.host-agent.yaml  : brew `shed-host-agent` + GH linux tarball
-#   - .goreleaser.machine-rc.yaml  : brew + apt `shed-machine-rc`
+# (.goreleaser.machine-rc.yaml was deleted with the machine-rc component's
+# retirement in plan 010.)
 # See RELEASING.md "Component selection" for the selector law and the flow.
-# Boilerplate is duplicated across the three (goreleaser `includes` is Pro-only).
+# Boilerplate is duplicated across the two (goreleaser `includes` is Pro-only).
 
 version: 2
 
 project_name: shed
 
 # Own subdir of dist/ (covered by .gitignore's `dist/`); `--clean` wipes only
-# this dir, never a sibling config's, so the three snapshots/releases coexist.
+# this dir, never a sibling config's, so both snapshots/releases coexist.
 dist: dist/server
 
 before:
   hooks:
     # ONLY the sed that renders packaging/server.yaml.generated (gitignored) for
     # the shed-deb nfpm below. NO `go mod tidy` here: the release job runs the
-    # three configs sequentially (server → host-agent → machine-rc) and asserts
+    # two configs sequentially (server → host-agent) and asserts
     # a clean tree; a before-hook MUST NOT mutate a tracked file (go.mod/go.sum)
     # or invocation #2 aborts on the dirty-check. CI asserts tidiness separately
     # (go mod tidy && git diff --exit-code go.mod go.sum).
@@ -398,7 +399,7 @@ nfpms:
       postinstall: packaging/postinstall.sh
 
 checksum:
-  # Unique per-config name: the three configs publish to the SAME GH release
+  # Unique per-config name: both configs publish to the SAME GH release
   # (shared tag), so a shared `checksums.txt` would clobber across invocations.
   name_template: "checksums-server.txt"
   algorithm: sha256
@@ -409,8 +410,8 @@ release:
     name: shed
   draft: false
   prerelease: auto
-  # keep-existing: the first SHIPPING invocation (server → host-agent →
-  # machine-rc) creates the release + the goreleaser-changelog body; later
+  # keep-existing: the first SHIPPING invocation (server → host-agent)
+  # creates the release + the goreleaser-changelog body; later
   # invocations upload their assets without touching the body.
   mode: keep-existing
   # replace_existing_artifacts: a re-run of a partially-failed release job

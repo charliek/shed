@@ -23,7 +23,7 @@
 //! | target | create runs | `--interactive-shell` |
 //! |---|---|---|
 //! | `local` | the in-process engine, this machine's tmux | on |
-//! | `machine:<m>` | `ssh <m> <rc_bin> create …` | on |
+//! | `machine:<m>` | `ssh <m> sx rc create …` (or `<rc_bin> create …`) | on |
 //! | `shed:<s>` | `ssh <shed> shed-ext-rc create …` | **off** (the guest contract) |
 //!
 //! Everything remote goes through the async [`RcRunner`](shed_app::RcRunner)
@@ -215,8 +215,8 @@ fn kill(deps: &Deps, slug: &str, p: &Parsed) -> VerbResult {
     match &resolved {
         Resolved::Local => deps.engine(false).kill(slug)?,
         remote => {
-            let bin = remote_bin(deps, remote)?;
-            let argv = shed_core::rc::kill_argv(&bin, slug);
+            let prefix = remote_prefix(deps, remote)?;
+            let argv = prefix.splice(shed_core::rc::kill_argv(prefix.bin(), slug));
             remote_exec(deps, remote, &argv, None)?;
         }
     }
@@ -272,22 +272,44 @@ fn pin_shed_server(deps: &Deps, resolved: Resolved) -> Result<Resolved, VerbErro
     })
 }
 
-/// The RC binary to invoke on a REMOTE target. A shed always runs the guest
-/// helper; a machine runs whatever its entry named.
-pub fn remote_bin(deps: &Deps, resolved: &Resolved) -> Result<String, VerbError> {
+/// The RC argv prefix a REMOTE target is invoked through: a shed always runs
+/// the guest helper (one token), a machine runs `sx rc` (two tokens) unless its
+/// entry named an `rc_bin` override — see [`target::machine_rc_prefix`].
+///
+/// The shed-core argv builders take a single `bin` for argv[0], so a call site
+/// builds with [`Self::bin`] (the prefix's LAST token) and then [`Self::splice`]s
+/// the full prefix back over argv[0] — that keeps a multi-token prefix as
+/// separate argv words under the one quoter.
+pub struct RemotePrefix(Vec<String>);
+
+impl RemotePrefix {
+    /// The `bin` string the shed-core argv builders take: the prefix's last token.
+    pub fn bin(&self) -> &str {
+        self.0.last().map(String::as_str).unwrap_or_default()
+    }
+
+    /// Replace `argv[0]` (built from [`Self::bin`]) with the full prefix.
+    pub fn splice(&self, mut argv: Vec<String>) -> Vec<String> {
+        argv.splice(0..1, self.0.iter().cloned());
+        argv
+    }
+}
+
+/// The [`RemotePrefix`] for a resolved remote target.
+pub fn remote_prefix(deps: &Deps, resolved: &Resolved) -> Result<RemotePrefix, VerbError> {
     match resolved {
         Resolved::Local => Err(VerbError::failed(
-            "internal: remote_bin called for the local target",
+            "internal: remote_prefix called for the local target",
         )),
-        Resolved::Machine(entry) => Ok(target::machine_rc_bin(entry).to_string()),
+        Resolved::Machine(entry) => Ok(RemotePrefix(target::machine_rc_prefix(entry))),
         Resolved::Shed { .. } => {
             // `SHED_EXT_RC_BIN` is the same dev/proof override `RcService` honors.
             let overridden = deps.env("SHED_EXT_RC_BIN");
-            Ok(if overridden.is_empty() {
+            Ok(RemotePrefix(vec![if overridden.is_empty() {
                 target::SHED_RC_BIN.to_string()
             } else {
                 overridden
-            })
+            }]))
         }
     }
 }
@@ -326,8 +348,8 @@ pub fn remote_exec(
         .block_on(async move { runner.run(argv, stdin, REMOTE_TIMEOUT).await })
         .map_err(|e| VerbError::failed(format!("ssh failed: {e}")))?;
     if out.exit_code != 0 {
-        // Name the binary that actually exited: on a machine that is
-        // `shed-machine-rc` (or whatever the entry configured), not the guest's
+        // Name the binary that actually exited: on a machine that is `sx`
+        // (or whatever the entry's rc_bin configured), not the guest's
         // `shed-ext-rc` — the default the Swift-parity wrapper assumes.
         let bin = remote_argv.first().map(String::as_str).unwrap_or_default();
         let err =

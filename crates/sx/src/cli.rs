@@ -53,11 +53,6 @@ pub const PROG: &str = "sx";
 /// differ only by the one token the harness masks.
 pub const DEFAULT_CREATED_BY: &str = PROG;
 
-/// The binary whose `serve` verb backs the local activity hub. The hub is NOT
-/// ported (plan 009 §0) — on a machine it stays the Go daemon, so `sx`'s
-/// ensure-hub hook simply drives it when it is installed.
-const HUB_BIN: &str = "shed-machine-rc";
-
 /// The top-level usage — owned by [`crate::porcelain`], which knows every verb.
 const USAGE: &str = crate::porcelain::USAGE;
 
@@ -640,47 +635,21 @@ fn read_plan_stdin(deps: &Deps) -> Result<String, EngineError> {
 const HUB_ADDR: &str = "127.0.0.1:1029";
 const HUB_APP_ID: &str = "shed-rc-hub";
 
-/// The best-effort hub ensure, PROBE-FIRST (plan 010 §2.7): a healthy hub on
-/// the fixed port — the Go `shed-machine-rc` daemon during the mixed window,
-/// or the `shed-host-agent`-hosted hub — means done. Only when no hub answers
-/// does the spawn fallback run: `shed-machine-rc serve --detach` if that
-/// binary is on PATH (kept until the binary retires at H15, deleted in the
-/// same commit), else a best-effort stderr hint naming the agent as the
-/// machine hub's owner. Never fatal: `create` has already succeeded by the
-/// time this runs, and the engine skips it entirely when `SHED_RC_NO_HUB` is
-/// set.
+/// The best-effort hub ensure, PROBE-ONLY (plan 010 §2.7, spawn fallback
+/// deleted at H15 with the `shed-machine-rc` binary): a healthy hub on the
+/// fixed port — the `shed-host-agent`-hosted hub, or a still-installed Go
+/// `shed-machine-rc` daemon during the mixed window — means done. Otherwise a
+/// best-effort stderr hint names the agent as the machine hub's owner. Never
+/// fatal: `create` has already succeeded by the time this runs, and the
+/// engine skips it entirely when `SHED_RC_NO_HUB` is set.
 fn ensure_hub() {
     if hub_is_healthy(HUB_ADDR, std::time::Duration::from_millis(500)) {
         return;
     }
-    let Some(bin) = look_path(HUB_BIN) else {
-        eprintln!(
-            "{PROG}: no rc hub is running and {HUB_BIN} is not installed; install or \
-start shed-host-agent to serve the machine hub (best-effort — sessions still \
-work, without live activity)"
-        );
-        return;
-    };
-    let spawned = std::process::Command::new(bin)
-        .args(["serve", "--detach"])
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn();
-    match spawned {
-        // `serve --detach` double-forks and returns as soon as the port is up, so
-        // reaping it here is bounded; a child left unwaited would be a zombie for
-        // the rest of the (short) process lifetime. A NON-ZERO exit (e.g. a
-        // foreign process squatting the hub port) gets one best-effort line,
-        // matching Go's EnsureHub diagnostics (`hub.go:964`) — never an error.
-        Ok(mut child) => match child.wait() {
-            Ok(status) if !status.success() => {
-                eprintln!("{PROG}: rc hub ensure failed (best-effort): {HUB_BIN} serve --detach exited {status}");
-            }
-            _ => {}
-        },
-        Err(err) => eprintln!("{PROG}: rc hub ensure failed (best-effort): {err}"),
-    }
+    eprintln!(
+        "{PROG}: no rc hub is running; install and start shed-host-agent to serve \
+the machine hub (best-effort — sessions still work, without live activity)"
+    );
 }
 
 /// ONE bounded identity check against `addr`'s `/v1/health` — the sx-local
@@ -760,21 +729,6 @@ fn decode_b64_go(input: &str) -> Result<Vec<u8>, base64::DecodeError> {
     );
     let stripped: String = input.chars().filter(|c| *c != '\r' && *c != '\n').collect();
     GO_STD.decode(stripped)
-}
-
-/// `exec.LookPath` for a bare binary name: the first executable match on `PATH`.
-fn look_path(bin: &str) -> Option<std::path::PathBuf> {
-    let path = std::env::var_os("PATH")?;
-    std::env::split_paths(&path)
-        .map(|dir| dir.join(bin))
-        .find(|candidate| is_executable(candidate))
-}
-
-fn is_executable(path: &std::path::Path) -> bool {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::metadata(path)
-        .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
-        .unwrap_or(false)
 }
 
 #[cfg(test)]

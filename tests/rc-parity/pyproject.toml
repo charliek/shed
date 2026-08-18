@@ -1,7 +1,7 @@
 [project]
 name = "rc-parity"
 version = "0.1.0"
-description = "Go↔Rust differential harness for the one-shot RC engine: drives the real `shed-machine-rc <verb>` and `sx rc <verb>` binaries against a hermetic tmux server and asserts their wire-visible output, under a defined canonicalization, is identical — then pins it to a golden recorded from the Go (oracle) side."
+description = "Go↔Rust differential harness for the one-shot RC engine: drives the real Go-oracle `shed-machine-rc <verb>` (built test-only from tests/rc-parity/oracle) and `sx rc <verb>` binaries against a hermetic tmux server and asserts their wire-visible output, under a defined canonicalization, is identical — then pins it to a golden recorded from the Go (oracle) side."
 requires-python = ">=3.11"
 # pytest only. The binaries are driven as black-box subprocesses and the
 # compared payloads are canonicalized with the stdlib `json` — no client

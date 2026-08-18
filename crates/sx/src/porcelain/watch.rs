@@ -38,7 +38,7 @@ use crate::args::Parsed;
 use crate::cli::Deps;
 use crate::porcelain::hub::{HubClient, HubError, HUB_PORT};
 use crate::porcelain::{
-    load_config, remote_bin, remote_exec, resolve_target, VerbError, VerbResult,
+    load_config, remote_exec, remote_prefix, resolve_target, VerbError, VerbResult,
 };
 use crate::ssh;
 use crate::target::Resolved;
@@ -513,8 +513,8 @@ fn probe_once(deps: &Deps, resolved: &Resolved, slug: &str) -> Result<RcSessionD
     match resolved {
         Resolved::Local => Ok(deps.engine(false).probe(slug, None)?),
         remote => {
-            let bin = remote_bin(deps, remote)?;
-            let argv = shed_core::rc::probe_argv(&bin, slug);
+            let prefix = remote_prefix(deps, remote)?;
+            let argv = prefix.splice(shed_core::rc::probe_argv(prefix.bin(), slug));
             let stdout = remote_exec(deps, remote, &argv, None)?;
             shed_core::rc::decode_session(&stdout).map_err(|e| VerbError::failed(e.to_string()))
         }

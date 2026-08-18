@@ -5,7 +5,7 @@
 //! | spelling | meaning |
 //! |---|---|
 //! | `local` (or omitted) | this machine, in-process engine, local tmux |
-//! | `machine:<name>` | a `machines:` entry — SSH to a native host running `shed-machine-rc` |
+//! | `machine:<name>` | a `machines:` entry — SSH to a native host running `sx` |
 //! | `shed:<name>` | a shed, resolved across the configured servers |
 //! | `shed:<name>@<server>` | the same, pinned to one server (skips the HTTP lookup) |
 //!
@@ -15,8 +15,11 @@
 
 use shed_core::config::{MachineEntry, ShedConfig};
 
-/// The remote RC helper a `machine:` target uses when its entry names none.
-pub const DEFAULT_MACHINE_RC_BIN: &str = "shed-machine-rc";
+/// The remote RC argv prefix a `machine:` target uses when its entry names no
+/// `rc_bin`: `sx rc <verb>` — wire-identical to the retired
+/// `shed-machine-rc <verb>` (tests/rc-parity is the standing proof; plan 010
+/// H15 flipped the default when the brew/apt component was retired).
+pub const DEFAULT_MACHINE_RC_PREFIX: &[&str] = &["sx", "rc"];
 
 /// The guest RC helper inside a shed. Baked into the `extensions`/`full` images
 /// and on the shed user's login PATH.
@@ -177,9 +180,18 @@ pub fn resolve(target: &Target, config: &ShedConfig) -> Result<Resolved, String>
     }
 }
 
-/// The RC helper binary to invoke on a machine target.
-pub fn machine_rc_bin(entry: &MachineEntry) -> &str {
-    entry.rc_bin.as_deref().unwrap_or(DEFAULT_MACHINE_RC_BIN)
+/// The RC argv prefix to invoke on a machine target. A `machines[].rc_bin`
+/// override names a SINGLE binary invoked Go-style (`<rc_bin> <verb>`) — the
+/// mixed-fleet escape hatch for a machine still running the retired
+/// `shed-machine-rc`; the default is [`DEFAULT_MACHINE_RC_PREFIX`].
+pub fn machine_rc_prefix(entry: &MachineEntry) -> Vec<String> {
+    match entry.rc_bin.as_deref() {
+        Some(bin) => vec![bin.to_string()],
+        None => DEFAULT_MACHINE_RC_PREFIX
+            .iter()
+            .map(|s| s.to_string())
+            .collect(),
+    }
 }
 
 /// `~/.shed/config.yaml` — the same path the Go CLI computes
@@ -294,19 +306,25 @@ machines:
     }
 
     #[test]
-    fn resolving_a_machine_reads_its_entry_and_its_binary() {
+    fn resolving_a_machine_reads_its_entry_and_its_rc_prefix() {
         let cfg = config();
         let Resolved::Machine(entry) = resolve(&parse("machine:mini2"), &cfg).unwrap() else {
             panic!("expected a machine");
         };
         assert_eq!(entry.host, "mini2.local");
-        assert_eq!(machine_rc_bin(&entry), "/opt/homebrew/bin/shed-machine-rc");
+        assert_eq!(
+            machine_rc_prefix(&entry),
+            vec!["/opt/homebrew/bin/shed-machine-rc".to_string()]
+        );
 
         let Resolved::Machine(entry) = resolve(&parse("machine:plain"), &cfg).unwrap() else {
             panic!("expected a machine");
         };
         assert_eq!(entry.host, "plain");
-        assert_eq!(machine_rc_bin(&entry), DEFAULT_MACHINE_RC_BIN);
+        assert_eq!(
+            machine_rc_prefix(&entry),
+            vec!["sx".to_string(), "rc".to_string()]
+        );
     }
 
     #[test]

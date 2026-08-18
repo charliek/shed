@@ -13,10 +13,13 @@ with them:
 ## Purpose
 
 The one-shot RC engine now exists twice: in Go (`internal/ext/rc` + `internal/ext/clirc`,
-shipped as `shed-machine-rc` and the guest's `shed-ext-rc`) and in Rust
-(`crates/shed-core::rc_agents` + `crates/shed-app::rc_engine`, shipped as `sx`). The Go
-side stays alive as the machine hub provider **and as this harness's oracle** (plan
-009 §0).
+shipped as the guest's `shed-ext-rc`) and in Rust (`crates/shed-core::rc_agents` +
+`crates/shed-app::rc_engine`, shipped as `sx`). The Go side stays alive for sheds
+**and as this harness's oracle** (plan 009 §0): the
+machine-facing `shed-machine-rc` binary retired at plan 010 H15, and its main
+lives on test-only as `tests/rc-parity/oracle/main.go` — byte-identical behavior
+(same `clirc.Run` call, same `shed-machine-rc` ProgName the goldens were
+recorded under), built by this suite, shipped nowhere.
 
 Each cell here runs the SAME scenario against BOTH binaries, asserts the two
 normalized results are identical, and then pins the Go value to a committed golden.
@@ -33,8 +36,8 @@ make test-rc-parity          # from the repo root (uv guard + tmux guard)
 cd tests/rc-parity && uv sync && uv run pytest -v
 ```
 
-Requirements: **Go** (builds `shed-machine-rc`), **Rust/cargo** (builds `sx`), **uv**,
-and **tmux ≥ 3.2** (`new-session -e` is how session metadata is stamped — an implicit
+Requirements: **Go** (builds the oracle from `tests/rc-parity/oracle`),
+**Rust/cargo** (builds `sx`), **uv**, and **tmux ≥ 3.2** (`new-session -e` is how session metadata is stamped — an implicit
 floor on BOTH implementations, asserted by the `tmux_bin` fixture).
 
 Nothing real is ever launched: the four agent binaries (`claude`, `codex`, `opencode`,
@@ -195,9 +198,10 @@ and that golden was deliberately re-recorded.
 `.github/workflows/ci.yml` runs this suite as the **`rc-parity (Go↔Rust wire
 goldens)`** job (part of the required `ci-success` check), gated on the `rcparity`
 path filter: both engines (`internal/ext/rc`, `internal/ext/clirc`,
-`crates/shed-core`, `crates/shed-app`), both CLIs (`cmd/shed-machine-rc`,
-`cmd/shed-ext-rc`, `crates/sx`), this harness, and the shared build manifests
-(`crates/Cargo.*`, `crates/rust-toolchain.toml`, `go.mod`/`go.sum`).
+`crates/shed-core`, `crates/shed-app`), the CLIs (the `tests/rc-parity/oracle` Go
+leg via this harness's own path entry, `cmd/shed-ext-rc`, `crates/sx`), this
+harness, and the shared build manifests (`crates/Cargo.*`,
+`crates/rust-toolchain.toml`, `go.mod`/`go.sum`).
 
 The job installs Go + Rust + uv, `apt-get install`s **tmux** (not preinstalled on
 GitHub runners) and asserts the ≥ 3.2 floor before building anything, then runs the
