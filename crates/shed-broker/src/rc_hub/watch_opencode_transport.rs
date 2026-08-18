@@ -819,6 +819,56 @@ impl SessionWatcher for OpencodeWatcher {
     fn as_approval_blocker(&self) -> Option<&dyn super::watch::ApprovalBlocker> {
         Some(self)
     }
+
+    fn as_turn_starter(&self) -> Option<&dyn super::verbs::TurnStarter> {
+        Some(self)
+    }
+
+    fn as_turn_interrupter(&self) -> Option<&dyn super::verbs::TurnInterrupter> {
+        Some(self)
+    }
+
+    fn as_approval_resolver(&self) -> Option<&dyn super::verbs::ApprovalResolver> {
+        Some(self)
+    }
+}
+
+// The verb-lane trait impls (`hub_verbs.go:95-120` — the narrow interfaces
+// the handlers type-assert; only this watcher implements them today). Each
+// boxes the inherent async method; the handler's own cancellation stands in
+// for Go's request context.
+impl super::verbs::TurnStarter for OpencodeWatcher {
+    fn start_turn<'a>(&'a self, text: &'a str) -> super::verbs::LaneFuture<'a, String> {
+        Box::pin(OpencodeWatcher::start_turn(self, text))
+    }
+}
+
+impl super::verbs::TurnInterrupter for OpencodeWatcher {
+    fn interrupt_turn(&self) -> super::verbs::LaneFuture<'_, ()> {
+        Box::pin(OpencodeWatcher::interrupt_turn(self))
+    }
+}
+
+impl super::verbs::ApprovalResolver for OpencodeWatcher {
+    fn approval_state(&self, id: &str) -> Option<(String, String)> {
+        OpencodeWatcher::approval_state(self, id)
+    }
+    fn claim_approval(&self, id: &str, decision: &str) -> ApprovalClaim {
+        OpencodeWatcher::claim_approval(self, id, decision)
+    }
+    fn release_approval(&self, id: &str) {
+        OpencodeWatcher::release_approval(self, id);
+    }
+    fn commit_approval(&self, id: &str, decision: &str) -> String {
+        OpencodeWatcher::commit_approval(self, id, decision)
+    }
+    fn resolve_approval<'a>(
+        &'a self,
+        id: &'a str,
+        decision: &'a str,
+    ) -> super::verbs::LaneFuture<'a, ()> {
+        Box::pin(OpencodeWatcher::resolve_approval(self, id, decision))
+    }
 }
 
 impl super::watch::ApprovalPublisher for OpencodeWatcher {

@@ -267,7 +267,7 @@ fn claude_blocks(content: Option<&Value>) -> Option<Vec<ClaudeBlock>> {
 
 /// `~/.claude/projects` (`""` when HOME is unset) — `claudeProjectsRoot`,
 /// `watch_claude.go:185`.
-fn claude_projects_root(getenv: GetEnv<'_>) -> String {
+pub(crate) fn claude_projects_root(getenv: GetEnv<'_>) -> String {
     let home = getenv("HOME");
     if home.is_empty() {
         return String::new();

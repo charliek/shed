@@ -2047,4 +2047,68 @@ mod tests {
         );
         assert_eq!(f2.activity(), RcActivity::Working);
     }
+
+    // Mirrors TestOpencodeApprovalRowsAreWireLegal (`watch_test.go:1835`) —
+    // the producer→wire seam, deferred from H6 until ApprovalIDRe landed
+    // (H10): the rows the fold emits must be legal for the surfaces that
+    // consume them — the id addressable by the approvals verb (the grammar
+    // the server proxy mirrors), the advertised decisions inside the contract
+    // enum, and the omitempty rules intact after the ring's sanitize/copy (no
+    // `decision` on a pending row, no `decisions` on a resolved one).
+    #[test]
+    fn opencode_approval_rows_are_wire_legal() {
+        use super::super::messages::{MessageRing, APPROVAL_DECISION_ALLOW_ALWAYS};
+        use super::super::verbs::APPROVAL_ID_RE;
+        use super::super::watch::MessageProducer;
+        use chrono::TimeZone;
+
+        let mut f = OpencodeFold::new();
+        f.apply_line(
+            br#"{"type":"session.status","properties":{"sessionID":"s","status":{"type":"busy"}}}"#,
+        );
+        f.apply_line(
+            br#"{"type":"permission.asked","properties":{"id":"per_f8342bca6001","sessionID":"s","permission":"bash","patterns":["ls"],"metadata":{"command":"ls"}}}"#,
+        );
+        f.apply_line(
+            br#"{"type":"permission.replied","properties":{"sessionID":"s","requestID":"per_f8342bca6001","reply":"always"}}"#,
+        );
+
+        let ring = MessageRing::new();
+        let now = chrono::Utc.timestamp_opt(1_700_000_000, 0).unwrap();
+        for m in f.drain_messages() {
+            ring.append(m, now);
+        }
+        let (rows, _) = ring.since(0, 10);
+        assert_eq!(rows.len(), 2, "want the pending + resolved pair: {rows:?}");
+        let (pending, resolved) = (&rows[0], &rows[1]);
+
+        let pa = pending.approval.as_ref().expect("pending approval");
+        assert!(
+            APPROVAL_ID_RE.is_match(&pa.id),
+            "approval id {:?} does not match the contract grammar — the verb could never address it",
+            pa.id
+        );
+        for d in &pa.decisions {
+            assert!(
+                matches!(d.as_str(), "allow" | "allow_always" | "deny"),
+                "advertised decision {d:?} is outside the contract enum"
+            );
+        }
+        let raw = serde_json::to_string(pending).unwrap();
+        assert!(
+            !raw.contains("\"decision\""),
+            "pending row must omit `decision`: {raw}"
+        );
+        let raw = serde_json::to_string(resolved).unwrap();
+        assert!(
+            !raw.contains("\"decisions\""),
+            "resolved row must omit `decisions` (nothing left to choose): {raw}"
+        );
+        assert!(
+            raw.contains(&format!(
+                "\"decision\":\"{APPROVAL_DECISION_ALLOW_ALWAYS}\""
+            )),
+            "resolved row must carry the mapped decision: {raw}"
+        );
+    }
 }

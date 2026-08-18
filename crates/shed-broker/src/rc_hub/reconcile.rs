@@ -174,8 +174,8 @@ pub(crate) struct TrackedSession {
     pub id: String,
     pub created_at: String,
     /// The hub's capability key, stamped when the entry was built — the verb
-    /// handlers (H10) authorize against it rather than re-deriving from a
-    /// fresh capture. A recreate replaces this whole entry.
+    /// handlers authorize against it rather than re-deriving from a fresh
+    /// capture. A recreate replaces this whole entry.
     pub kind: RcKind,
     /// Behind its own mutex so the heavy phase can tick it with the track
     /// lock released (reconcile is its sole user — the lock is uncontended).
@@ -242,7 +242,6 @@ impl TrackedSession {
     /// no `decisions` (approvals:"tui" — a capability-driven client renders
     /// zero decision buttons). Called under the track lock; the caller
     /// deep-copies before serving.
-    #[allow(dead_code)] // consumed by the H10 /v1/sessions overlay
     pub(crate) fn approval_snapshot(&self) -> Vec<FeedApproval> {
         if !self.pane_approval.pending {
             return self.pending_approvals.clone();
@@ -260,9 +259,9 @@ impl TrackedSession {
 /// Deep-copies an approval snapshot for serving (`copyApprovals`,
 /// `hub.go:353`). Rust's `Clone` on [`FeedApproval`] already copies the
 /// `decisions` vector, so the aliasing hazard Go guards against cannot arise;
-/// the helper stays for structural fidelity (and the H10 handler's use). The
-/// Go nil-on-empty (→ omitempty) shaping happens at the DTO layer.
-#[allow(dead_code)] // consumed by the H10 /v1/sessions overlay
+/// the helper stays for structural fidelity (and marks the /v1/sessions
+/// overlay's copy point). The Go nil-on-empty (→ omitempty) shaping happens at
+/// the DTO layer.
 pub(crate) fn copy_approvals(approvals: &[FeedApproval]) -> Vec<FeedApproval> {
     approvals.to_vec()
 }
@@ -272,6 +271,21 @@ pub(crate) fn copy_approvals(approvals: &[FeedApproval]) -> Vec<FeedApproval> {
 /// cadence is >1min of retry, comfortably longer than the file-appears
 /// latency, while a never-appearing file stops re-scanning forever.
 pub const MAX_CORRELATE_TRIES: u32 = 40;
+
+/// The session DTOs for the given tmux session names (`sessionsForNames`,
+/// `ops.go:355`) — the shared enumeration loop behind the /v1/sessions
+/// handler's one-shot List and reconcile's pass (which lists names through
+/// the CHECKED variant first). The hub passes no display fallback.
+pub(crate) fn sessions_for_names(tmux: &Tmux<'_>, names: &[String]) -> Vec<RcSessionDto> {
+    names
+        .iter()
+        .map(|name| {
+            let env = tmux.show_environment(name);
+            let pane = tmux.capture_pane(name).stdout;
+            parse_session(name, &env, &pane, None)
+        })
+        .collect()
+}
 
 /// What the entry phase clones out for one session's unlocked heavy work.
 struct HeavySnapshot {
@@ -287,7 +301,7 @@ impl Hub {
     /// Builds tracker state for a freshly seen session (`newTrackedSession`,
     /// `hub_reconcile.go:227`). The tracker captures the session's pane on
     /// demand via the hub's runner — a modest extra capture-pane per tick.
-    fn new_tracked_session(&self, s: &RcSessionDto) -> TrackedSession {
+    pub(crate) fn new_tracked_session(&self, s: &RcSessionDto) -> TrackedSession {
         let name = s.tmux_session.clone();
         let runner = Arc::clone(&self.cfg.runner);
         let capture = Box::new(move || {
@@ -353,16 +367,7 @@ impl Hub {
                 return;
             }
         };
-        let sessions: Vec<RcSessionDto> = names
-            .iter()
-            .map(|name| {
-                // `sessionsForNames` (`ops.go:355`) — the shared enumeration
-                // loop; the hub passes no display fallback.
-                let env = tmux.show_environment(name);
-                let pane = tmux.capture_pane(name).stdout;
-                parse_session(name, &env, &pane, None)
-            })
-            .collect();
+        let sessions = sessions_for_names(&tmux, &names);
         let now = (self.cfg.now)();
 
         let mut events: Vec<HubEvent> = Vec::new();
@@ -1389,9 +1394,9 @@ mod tests {
 
     // Mirrors TestPaneApprovalReachesSSEAndSessions' SSE half: needs_approval
     // reaches the activity.changed stream and the message.appended
-    // notification through the normal machinery (the /v1/sessions HTTP half
-    // lands with the H10 shell; the overlay source is asserted via
-    // approval_snapshot here).
+    // notification through the normal machinery (the /v1/sessions HTTP half is
+    // `sessions_pending_approvals_overlay` in hub_http_tests.rs; the overlay
+    // source is asserted via approval_snapshot here).
     #[test]
     fn pane_approval_reaches_sse_and_snapshot() {
         let (h, _f, _set_pane, slug) =

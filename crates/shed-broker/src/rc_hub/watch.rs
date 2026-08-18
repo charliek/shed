@@ -108,6 +108,18 @@ pub trait SessionWatcher: Send + Sync {
     fn as_approval_blocker(&self) -> Option<&dyn ApprovalBlocker> {
         None
     }
+    /// Go's `turnStarter` type-assert (`hub_verbs.go:97`).
+    fn as_turn_starter(&self) -> Option<&dyn super::verbs::TurnStarter> {
+        None
+    }
+    /// Go's `turnInterrupter` type-assert (`hub_verbs.go:102`).
+    fn as_turn_interrupter(&self) -> Option<&dyn super::verbs::TurnInterrupter> {
+        None
+    }
+    /// Go's `approvalResolver` type-assert (`hub_verbs.go:113`).
+    fn as_approval_resolver(&self) -> Option<&dyn super::verbs::ApprovalResolver> {
+        None
+    }
 }
 
 /// A watcher whose lane knows which approvals are still open, so reconcile can

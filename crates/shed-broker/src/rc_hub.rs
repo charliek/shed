@@ -46,19 +46,30 @@
 //! - Transports I (H7): the [`watch`] module additionally carries the
 //!   `SessionWatcher` contract + `FileWatcher` + the `notify`-backed
 //!   `FsNudger`; [`watch_cursor`] the push-fed `CursorWatcher`; [`ingest`]
-//!   the pre-watcher queue half of `hub_ingest.go` (the HTTP handler follows
-//!   in H10).
+//!   the pre-watcher queue half of `hub_ingest.go` (its HTTP handler came
+//!   with H10, below).
 //! - Hub core I (H9): [`hub`] — config resolution, the four-lock `Hub` state,
 //!   the per-slug input locks, the `inputAccepted` seven-arm gate, and the
-//!   idle-exit decision (`hub.go`'s core; the axum shell, verbs, and
-//!   lifecycle land in H10); [`reconcile`] — the heartbeat: `trackedSession`,
-//!   the pane-anchor debounce, `approvalSnapshot`, `ensureWatcher`
-//!   (`hub_reconcile.go`); [`events`] — event payloads + frame encoding + the
-//!   subscriber fan-out (`hub_events.go`'s pure half; the SSE handler follows
-//!   in H10).
+//!   idle-exit decision (`hub.go`'s core); [`reconcile`] — the heartbeat:
+//!   `trackedSession`, the pane-anchor debounce, `approvalSnapshot`,
+//!   `ensureWatcher` (`hub_reconcile.go`); [`events`] — event payloads +
+//!   frame encoding + the subscriber fan-out (`hub_events.go`).
+//! - Hub core II (H10): the **axum 0.8 HTTP shell** per plan 010 s2.2 — the
+//!   Router is served from a hand-rolled accept loop over hyper's http1
+//!   connection with the Go per-connection posture, and contract-shaped body
+//!   handling is manual:
+//!   [`hub`] adds the /v1 router, the sessions/health/messages/input
+//!   handlers, `serve`, `bind_hub_listener` (bind-as-lock), the s2.5
+//!   env-seam config, and the reconcile-loop driver; [`verbs`] the
+//!   contract-v2 verb handlers + claim FSM + `APPROVAL_ID_RE`
+//!   (`hub_verbs.go`); [`events`] the SSE streaming handler; [`ingest`] the
+//!   cursor hook route. The identity-probe client (`queryHubHealth` /
+//!   `probeHubIdentity`) lands with H11's bind-retry FSM.
 
 pub mod events;
 pub mod hub;
+#[cfg(test)]
+mod hub_http_tests;
 #[cfg(test)]
 pub(crate) mod hub_test_support;
 pub mod ingest;
@@ -66,6 +77,7 @@ pub mod messages;
 pub mod reconcile;
 pub mod stability;
 pub mod tail;
+pub mod verbs;
 pub mod watch;
 pub mod watch_claude;
 pub mod watch_codex;

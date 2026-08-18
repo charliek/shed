@@ -131,7 +131,6 @@ impl HubTmux {
     }
 
     /// Makes a session's capture-pane fail transiently (a hiccup, NOT gone).
-    #[allow(dead_code)] // the H10 input-handler 500-path tests use it
     pub fn set_flaky(&self, name: &str, flaky: bool) {
         let mut st = self.lock();
         if flaky {
@@ -141,14 +140,12 @@ impl HubTmux {
         }
     }
 
-    #[allow(dead_code)] // the H10 input-delivery tests assert on it
     pub fn recorded(&self) -> Vec<String> {
         self.lock().sent.clone()
     }
 
     /// The recorded set-environment "KEY=VALUE" pairs (asserts the
     /// SHED_RC_AGENT_SESSION back-write).
-    #[allow(dead_code)] // the H10 back-write tests assert on it
     pub fn set_env_calls(&self) -> Vec<String> {
         self.lock().set_envs.clone()
     }
@@ -293,6 +290,9 @@ pub(crate) fn hub_config(f: &Arc<HubTmux>, clk: &Arc<HubClock>) -> HubConfig {
         heartbeat: Duration::ZERO,
         write_timeout: Duration::ZERO,
         subscriber_buffer: 0,
+        // Go's tests zero the sendLineSettle global; the config seam is the
+        // Rust spelling.
+        send_line_settle: Some(Duration::ZERO),
     }
 }
 
@@ -322,6 +322,30 @@ pub(crate) fn rig() -> (Hub, Arc<HubTmux>, Arc<HubClock>) {
 /// arguments (the input gate) and never script tmux or time.
 pub(crate) fn test_hub() -> Hub {
     rig().0
+}
+
+/// A Go-minimal config over an arbitrary runner (the `hookedTmux` wrapper
+/// tests need a runner that is not a bare `HubTmux`).
+pub(crate) fn hub_config_with_runner(
+    runner: Arc<dyn shed_rc_engine::tmux::TmuxRunner + Send + Sync>,
+    now: impl Fn() -> DateTime<Utc> + Send + Sync + 'static,
+) -> HubConfig {
+    HubConfig {
+        runner,
+        getenv: Arc::new(|_| String::new()),
+        now: Some(Arc::new(now)),
+        logf: Some(Arc::new(|_| {})),
+        addr: String::new(),
+        version: String::new(),
+        active_interval: Duration::ZERO,
+        idle_interval: Duration::ZERO,
+        quiet_period: Duration::ZERO,
+        idle_timeout: Duration::ZERO,
+        heartbeat: Duration::ZERO,
+        write_timeout: Duration::ZERO,
+        subscriber_buffer: 0,
+        send_line_settle: Some(Duration::ZERO),
+    }
 }
 
 /// A decoded SSE frame (`drainedEvent`, `hub_test.go:253`).
@@ -364,4 +388,245 @@ pub(crate) fn pane_fixture(name: &str) -> String {
         env!("CARGO_MANIFEST_DIR")
     );
     std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("fixture {path}: {e}"))
+}
+
+// ---------------------------------------------------------------------------
+// Shared scripted watchers (`stubWatcher`/`stubApprovalWatcher`,
+// hub_input_test.go:302-332) — used by the input-gate unit tests (hub.rs) and
+// the HTTP mirrors (hub_http_tests.rs).
+// ---------------------------------------------------------------------------
+
+use chrono::DateTime as ChronoDateTime;
+use shed_core::rc::RcActivity;
+
+use super::messages::{FeedApproval, FeedMessage};
+use super::watch::{ApprovalBlocker, ApprovalPublisher, SessionWatcher};
+
+/// A scripted watcher verdict (`stubWatcher`, `hub_input_test.go:302`).
+pub(crate) struct StubWatcher {
+    pub activity: RcActivity,
+    pub message: String,
+    pub fresh: bool,
+    pub expired_working: bool,
+}
+
+impl Default for StubWatcher {
+    fn default() -> StubWatcher {
+        StubWatcher {
+            // Go's zero Activity ("") maps to Unknown (the H4 decision).
+            activity: RcActivity::Unknown,
+            message: String::new(),
+            fresh: false,
+            expired_working: false,
+        }
+    }
+}
+
+impl SessionWatcher for StubWatcher {
+    fn refresh(&self, _now: ChronoDateTime<Utc>) {}
+    fn snapshot(&self, _now: ChronoDateTime<Utc>) -> (RcActivity, String, bool, bool) {
+        (
+            self.activity,
+            self.message.clone(),
+            self.fresh,
+            self.expired_working,
+        )
+    }
+    fn drain_pending(&self) -> Vec<FeedMessage> {
+        Vec::new()
+    }
+    fn had_event(&self) -> bool {
+        true
+    }
+    fn close(&self) {}
+}
+
+/// `stubApprovalWatcher` (`hub_input_test.go:322`): adds the snapshot
+/// reconcile publishes and the blocked-on-a-dialog question the input gate
+/// asks. `blocked` models an open ask NOT in the snapshot — an opencode
+/// question — so the two can be driven apart.
+#[derive(Default)]
+pub(crate) struct StubApprovalWatcher {
+    pub stub: StubWatcher,
+    pub approvals: Vec<FeedApproval>,
+    pub blocked: bool,
+}
+
+impl SessionWatcher for StubApprovalWatcher {
+    fn refresh(&self, now: ChronoDateTime<Utc>) {
+        self.stub.refresh(now);
+    }
+    fn snapshot(&self, now: ChronoDateTime<Utc>) -> (RcActivity, String, bool, bool) {
+        self.stub.snapshot(now)
+    }
+    fn drain_pending(&self) -> Vec<FeedMessage> {
+        Vec::new()
+    }
+    fn had_event(&self) -> bool {
+        true
+    }
+    fn close(&self) {}
+    fn as_approval_publisher(&self) -> Option<&dyn ApprovalPublisher> {
+        Some(self)
+    }
+    fn as_approval_blocker(&self) -> Option<&dyn ApprovalBlocker> {
+        Some(self)
+    }
+}
+
+impl ApprovalPublisher for StubApprovalWatcher {
+    fn pending_approvals(&self) -> Vec<FeedApproval> {
+        self.approvals.clone()
+    }
+}
+impl ApprovalBlocker for StubApprovalWatcher {
+    fn has_open_approvals(&self) -> bool {
+        self.blocked || !self.approvals.is_empty()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// HTTP-level helpers (the httptest.NewServer(h.handler()) idiom).
+// ---------------------------------------------------------------------------
+
+/// Serves the hub's router on an ephemeral loopback port. Serving stops when
+/// the test's runtime is dropped — DROPPING the returned handle only detaches
+/// the task, it does not abort it, so a test that wants to stop the server
+/// early must `.abort()` the handle itself.
+pub(crate) async fn serve_hub(hub: &Arc<Hub>) -> (String, tokio::task::JoinHandle<()>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind ephemeral");
+    let addr = listener.local_addr().expect("addr");
+    let h = Arc::clone(hub);
+    let handle = tokio::spawn(async move {
+        let _ = super::hub::serve(h, listener).await;
+    });
+    (format!("http://{addr}"), handle)
+}
+
+/// The shared loopback client (`verbClient` — never follows redirects, so a
+/// mux-level redirect surfaces as itself). ONE client for the whole suite: a
+/// fresh `reqwest::Client` per call would build a connection pool + TLS config
+/// per request.
+static CLIENT: std::sync::LazyLock<reqwest::Client> = std::sync::LazyLock::new(|| {
+    reqwest::Client::builder()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .expect("client")
+});
+
+pub(crate) fn http_client() -> reqwest::Client {
+    CLIENT.clone() // cheap: reqwest::Client is an Arc handle
+}
+
+/// One request, no body for an empty string (`doRequest`,
+/// `hub_verbs_test.go:61`).
+pub(crate) async fn do_request(
+    client: &reqwest::Client,
+    method: reqwest::Method,
+    url: &str,
+    body: &str,
+) -> reqwest::Response {
+    let mut req = client
+        .request(method, url)
+        .header("Content-Type", "application/json");
+    if !body.is_empty() {
+        req = req.body(body.to_string());
+    }
+    req.send().await.expect("request")
+}
+
+/// A raw, blocking loopback POST that sends the request line VERBATIM — for
+/// the two cases a reqwest request cannot express: a path reqwest's `Url`
+/// parser would rewrite client-side (it resolves `%2E%2E` dot segments, where
+/// Go's `net/url` keeps them escaped), and a POST issued from INSIDE the sync
+/// reconcile pass (a reqwest client would need the async runtime that thread
+/// is blocking). Returns the status code.
+pub(crate) fn raw_post(authority: &str, path_and_query: &str, body: &str) -> u16 {
+    use std::io::{Read, Write};
+    let mut conn = std::net::TcpStream::connect(authority).expect("connect");
+    let req = format!(
+        "POST {path_and_query} HTTP/1.1\r\nHost: hub\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    conn.write_all(req.as_bytes()).expect("write");
+    let mut buf = Vec::new();
+    let _ = conn.read_to_end(&mut buf);
+    let head = String::from_utf8_lossy(&buf);
+    head.split_whitespace()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0)
+}
+
+/// Asserts the hub's `{error, message}` envelope (`wantEnvelope`,
+/// `hub_verbs_test.go:101`): status + error code, a non-empty human message,
+/// and EXACTLY those two keys.
+pub(crate) async fn want_envelope(resp: reqwest::Response, status: u16, code: &str) {
+    let got_status = resp.status().as_u16();
+    let body = resp.text().await.expect("body");
+    let env: std::collections::HashMap<String, String> = serde_json::from_str(&body)
+        .unwrap_or_else(|e| {
+            panic!("status {got_status} body is not the JSON error envelope: {e} ({body})")
+        });
+    assert_eq!(got_status, status, "status (body {body})");
+    assert_eq!(
+        env.get("error").map(String::as_str),
+        Some(code),
+        "error code (body {body})"
+    );
+    assert!(
+        env.get("message").is_some_and(|m| !m.is_empty()),
+        "envelope must carry a human message: {body}"
+    );
+    assert_eq!(
+        env.len(),
+        2,
+        "envelope must be exactly {{error, message}}: {body}"
+    );
+}
+
+/// A managed opencode session's env plus the two keys the watcher needs
+/// (`opencodeVerbEnv`, `hub_verbs_test.go:506`): the create-time embedded
+/// server port, and (optionally) a prior back-written agent session id so the
+/// watcher is PINNED synchronously at construction.
+pub(crate) fn opencode_verb_env(id: &str, port: u16, agent_session: &str) -> String {
+    let mut env = format!(
+        "{}{}={port}\n",
+        managed_env(id, &RcKind::Opencode),
+        shed_core::rc_agents::ENV_OPENCODE_PORT
+    );
+    if !agent_session.is_empty() {
+        env.push_str(&format!(
+            "{}={agent_session}\n",
+            shed_core::rc_agents::ENV_AGENT_SESSION
+        ));
+    }
+    env
+}
+
+/// `opencodeReadyPane` (`hub_input_test.go:19`) — parked at the opencode
+/// composer placeholder, so a gate rejection can only come from an activity
+/// arm.
+pub(crate) fn opencode_ready_pane() -> String {
+    "opencode\n> Ask anything...".to_string()
+}
+
+/// `codexReadyPane` (`hub_input_test.go:15`).
+pub(crate) fn codex_ready_pane() -> String {
+    "codex\n> Find and fix a bug in @filename".to_string()
+}
+
+/// `waitFor` (`hub_test.go:864`) — async polling variant.
+pub(crate) async fn wait_for(what: &str, mut cond: impl FnMut() -> bool) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    while std::time::Instant::now() < deadline {
+        if cond() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    panic!("condition not met within timeout: {what}");
 }

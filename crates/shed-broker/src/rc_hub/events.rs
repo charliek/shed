@@ -1,7 +1,7 @@
-//! SSE fan-out for GET /v1/events — `internal/ext/rc/hub_events.go`. Plan 010
-//! H9 lands the PURE half (event payloads + frame encoding) and the subscriber
-//! machinery (bounded queues, non-blocking broadcast, close); the HTTP handler
-//! (`handleEvents`/`writeSSE`) arrives with the axum shell in H10.
+//! SSE fan-out for GET /v1/events — `internal/ext/rc/hub_events.go`: the event
+//! payloads + frame encoding, the subscriber machinery (bounded queues,
+//! non-blocking broadcast, close), and the streaming HTTP handler
+//! (`handleEvents`/`writeSSE`) on the axum shell (H10).
 //!
 //! Each connected client gets a subscriber with a bounded queue; the reconcile
 //! loop broadcasts pre-encoded event frames to every subscriber with a
@@ -10,68 +10,86 @@
 //! is best-effort notification: a client that misses events refetches the
 //! /v1/sessions snapshot on reconnect (no Last-Event-ID replay).
 
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
-use std::sync::mpsc::{Receiver, SyncSender, TrySendError};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll};
 
+use axum::extract::State;
+use axum::response::Response;
+use bytes::Bytes;
 use serde::Serialize;
 use shed_core::rc::{RcActivity, RcSessionDto, RcState};
+use tokio::sync::mpsc::error::TrySendError;
+use tokio::sync::mpsc::{Receiver, Sender};
+use tokio::sync::Notify;
+
+use super::hub::Hub;
 
 /// One connected SSE client (`subscriber`, `hub_events.go:20`). The Go
-/// buffered channel maps to a bounded `sync_channel`; the `closed` channel maps
-/// to an atomic flag + condvar (H10's handler waits on the condvar the way
-/// Go's select waits on the channel).
+/// buffered channel maps to a bounded `tokio::sync::mpsc` channel — its
+/// `try_send` is callable from the SYNC broadcast path (the reconcile thread)
+/// while the SSE handler `recv().await`s, which is exactly Go's
+/// buffered-chan-select shape (that arm, and only that arm, has no lost-wakeup
+/// window). The `closed` channel maps to an atomic flag + [`Notify`], whose
+/// `notify_one` STORES a permit so a close landing between the pump's
+/// `is_closed` check and its next park is still delivered.
 ///
 /// Frames are `Arc`-shared, not copied: Go hands every subscriber the same
 /// `[]byte` from one `frame()` call, and [`Hub::broadcast`] does the same here.
 pub struct Subscriber {
-    tx: SyncSender<Arc<[u8]>>,
-    /// The receive side, drained by the SSE handler (H10) or a test. Behind a
-    /// mutex because `Receiver` is not Sync; only one drainer exists.
-    rx: Mutex<Receiver<Arc<[u8]>>>,
+    tx: Sender<Arc<[u8]>>,
+    /// The receive side; the SSE handler takes it once
+    /// ([`Subscriber::take_rx`]), tests drain in place via
+    /// [`Subscriber::try_recv`].
+    rx: Mutex<Option<Receiver<Arc<[u8]>>>>,
     closed: AtomicBool,
-    /// Wakes a handler blocked between frames when the hub closes the stream
-    /// or a frame arrives (paired with the [`Hub`]-side notify on broadcast).
-    ///
-    /// CAVEAT: `wake_mu` guards no state — the queue lives in the channel and
-    /// `closed` is an atomic — so this pair does NOT close the lost-wakeup
-    /// window (a broadcast landing between the handler's empty `try_recv` and
-    /// its `wait` is missed). H10's SSE handler must therefore use
-    /// `wait_timeout`, which the 25 s heartbeat forces anyway.
-    pub(crate) wake: Condvar,
-    pub(crate) wake_mu: Mutex<()>,
+    /// Wakes the handler parked in its select when the hub closes the stream
+    /// (Go's `<-sub.closed` arm).
+    closed_wake: Notify,
     /// Frames dropped due to a full queue (debug/metric — `dropped`).
     pub dropped: AtomicI64,
 }
 
 impl Subscriber {
     /// Closes the stream (idempotent — Go's `once`-guarded channel close).
+    ///
+    /// `notify_one`, not `notify_waiters`: the latter wakes only waiters that
+    /// are ALREADY parked, so a close landing between the pump's loop-top
+    /// `is_closed` check and its next park would be missed and the stream
+    /// would linger until the next heartbeat. `notify_one` stores a permit for
+    /// the next `notified()`, closing that window. There is only ever one
+    /// waiter (the pump).
     pub fn close(&self) {
         self.closed.store(true, Ordering::SeqCst);
-        self.notify();
+        self.closed_wake.notify_one();
     }
 
     pub fn is_closed(&self) -> bool {
         self.closed.load(Ordering::SeqCst)
     }
 
-    /// Wakes a handler parked between frames (see the [`wake`] caveat).
-    ///
-    /// [`wake`]: Subscriber::wake
-    fn notify(&self) {
-        let _g = self
-            .wake_mu
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        self.wake.notify_all();
+    /// Parks until [`close`](Subscriber::close) is called (the handler's
+    /// `<-sub.closed` select arm). Re-check [`is_closed`](Subscriber::is_closed)
+    /// after waking.
+    pub(crate) async fn closed_notified(&self) {
+        self.closed_wake.notified().await;
     }
 
-    /// Non-blocking drain of one queued frame (the H10 handler's and the
-    /// tests' read side).
+    /// Hands the receive side to the SSE handler (once).
+    pub(crate) fn take_rx(&self) -> Option<Receiver<Arc<[u8]>>> {
+        self.rx
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+    }
+
+    /// Non-blocking drain of one queued frame (the tests' read side).
     pub fn try_recv(&self) -> Option<Arc<[u8]>> {
         self.rx
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_mut()?
             .try_recv()
             .ok()
     }
@@ -219,13 +237,12 @@ pub fn message_appended_event(slug: &str, seq: u64) -> HubEvent {
 impl super::hub::Hub {
     /// Registers a new SSE subscriber (`subscribe`, `hub_events.go:126`).
     pub fn subscribe(&self) -> Arc<Subscriber> {
-        let (tx, rx) = std::sync::mpsc::sync_channel(self.cfg.sub_buffer);
+        let (tx, rx) = tokio::sync::mpsc::channel(self.cfg.sub_buffer.max(1));
         let s = Arc::new(Subscriber {
             tx,
-            rx: Mutex::new(rx),
+            rx: Mutex::new(Some(rx)),
             closed: AtomicBool::new(false),
-            wake: Condvar::new(),
-            wake_mu: Mutex::new(()),
+            closed_wake: Notify::new(),
             dropped: AtomicI64::new(0),
         });
         self.lock_subs().push(Arc::clone(&s));
@@ -254,8 +271,8 @@ impl super::hub::Hub {
         let subs = self.lock_subs();
         for s in subs.iter() {
             match s.tx.try_send(Arc::clone(&frame)) {
-                Ok(()) => s.notify(),
-                Err(TrySendError::Full(_) | TrySendError::Disconnected(_)) => {
+                Ok(()) => {}
+                Err(TrySendError::Full(_) | TrySendError::Closed(_)) => {
                     s.dropped.fetch_add(1, Ordering::Relaxed);
                 }
             }
@@ -270,6 +287,128 @@ impl super::hub::Hub {
             s.close();
         }
     }
+}
+
+/// Unsubscribes on drop — the pump's `defer h.unsubscribe(sub)`.
+struct Unsubscriber {
+    hub: Arc<Hub>,
+    sub: Arc<Subscriber>,
+}
+
+impl Drop for Unsubscriber {
+    fn drop(&mut self) {
+        self.hub.unsubscribe(&self.sub);
+    }
+}
+
+/// The streaming response body: frames handed off from the pump task through a
+/// CAPACITY-1 channel (see [`handle_events`]).
+struct FrameStream(Receiver<Result<Bytes, std::convert::Infallible>>);
+
+impl futures_util::Stream for FrameStream {
+    type Item = Result<Bytes, std::convert::Infallible>;
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        self.0.poll_recv(cx)
+    }
+}
+
+/// Serves GET /v1/events as an SSE stream (`handleEvents`,
+/// `hub_events.go:182`): registers a subscriber, then writes queued event
+/// frames plus a periodic heartbeat comment until the client disconnects or
+/// the hub closes the stream. The `: ok` opener and `: heartbeat` comments are
+/// LITERAL (wire-pinned).
+///
+/// Go's per-frame `SetWriteDeadline` — which covers the Flush, so a wedged
+/// client can't park the handler as a permanent subscriber — maps to the §2.2
+/// design: a CAPACITY-1 channel between this pump and the connection's body
+/// stream, with the hub write timeout on each frame handoff. hyper only polls
+/// the body while the connection can make write progress, so a wedged TCP peer
+/// stops draining the channel, the handoff misses the deadline, and the pump
+/// drops the subscriber — preserving Go's observable semantics (slow → frames
+/// dropped by broadcast; wedged → stream ended, subscriber removed).
+///
+/// Go's `case <-ctx.Done(): return` (the client went away) maps to the
+/// `body_tx.closed()` arm: hyper drops the response body when the connection
+/// dies, which drops the receiving half of the handoff channel. Without that
+/// arm a vanished client would stay a registered subscriber until the next
+/// frame or heartbeat — up to 25 s of holding the reconcile loop at the ACTIVE
+/// cadence.
+///
+/// NOT PORTED (recorded): Go's opening `rc.Flush()` guard, which answers 500
+/// `no_flush` "streaming unsupported" when the `ResponseWriter` cannot flush.
+/// That branch is unreachable on Go's own `net/http` server and has no analog
+/// here — an axum streaming body IS the flush contract, so there is nothing to
+/// interrogate before committing the head.
+pub(crate) async fn handle_events(State(hub): State<Arc<Hub>>) -> Response {
+    let sub = hub.subscribe();
+    let mut rx = sub.take_rx().expect("fresh subscriber holds its receiver");
+    let heartbeat = hub.cfg.heartbeat;
+    let write_timeout = hub.cfg.write_timeout;
+
+    let (body_tx, body_rx) =
+        tokio::sync::mpsc::channel::<Result<Bytes, std::convert::Infallible>>(1);
+    let pump_hub = Arc::clone(&hub);
+    let pump_sub = Arc::clone(&sub);
+    tokio::spawn(async move {
+        let _guard = Unsubscriber {
+            hub: pump_hub,
+            sub: Arc::clone(&pump_sub),
+        };
+        // A frame handoff under the write deadline (`writeSSE`,
+        // `hub_events.go:236`): false ends the stream — the client is gone
+        // (send error) or wedged (deadline hit).
+        async fn hand_off(
+            tx: &Sender<Result<Bytes, std::convert::Infallible>>,
+            deadline: std::time::Duration,
+            frame: Bytes,
+        ) -> bool {
+            matches!(
+                tokio::time::timeout(deadline, tx.send(Ok(frame))).await,
+                Ok(Ok(()))
+            )
+        }
+
+        // Open the stream with a comment so proxies see bytes immediately.
+        if !hand_off(&body_tx, write_timeout, Bytes::from_static(b": ok\n\n")).await {
+            return;
+        }
+        // Heartbeat comments keep the connection warm through idle periods
+        // (Go's Ticker — the first tick lands one interval in, not at start).
+        // `Skip` is the Ticker's own missed-tick semantics: a tick the pump was
+        // too busy to take is DROPPED and the cadence keeps its original phase.
+        let mut heartbeat_tick =
+            tokio::time::interval_at(tokio::time::Instant::now() + heartbeat, heartbeat);
+        heartbeat_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            if pump_sub.is_closed() {
+                return; // hub idle-exit / shutdown closed the stream
+            }
+            let frame: Bytes = tokio::select! {
+                _ = body_tx.closed() => return, // Go's <-ctx.Done(): client went away
+                _ = pump_sub.closed_notified() => continue, // re-check at loop top
+                got = rx.recv() => match got {
+                    // Zero-copy: the frame the broadcast built is handed on as
+                    // the SAME allocation every subscriber shares.
+                    Some(f) => Bytes::from_owner(f),
+                    None => return, // subscriber dropped from the hub side
+                },
+                _ = heartbeat_tick.tick() => Bytes::from_static(b": heartbeat\n\n"),
+            };
+            if !hand_off(&body_tx, write_timeout, frame).await {
+                return;
+            }
+        }
+    });
+
+    // Headers before the body, as in Go. hyper owns the `Connection` header on
+    // HTTP/1.1 keep-alive connections, so Go's explicit `Connection:
+    // keep-alive` is implicit here (the harness compares canonicalized
+    // headers, not this hop-by-hop one).
+    Response::builder()
+        .header("Content-Type", "text/event-stream")
+        .header("Cache-Control", "no-cache")
+        .body(axum::body::Body::from_stream(FrameStream(body_rx)))
+        .expect("static SSE response head")
 }
 
 #[cfg(test)]

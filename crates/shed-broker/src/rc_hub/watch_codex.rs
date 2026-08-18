@@ -446,7 +446,7 @@ fn codex_message_text(content: &Value) -> String {
 
 /// `~/.codex/sessions` (`""` when HOME is unset) — `codexSessionsRoot`,
 /// `watch_codex.go:289`.
-fn codex_sessions_root(getenv: GetEnv<'_>) -> String {
+pub(crate) fn codex_sessions_root(getenv: GetEnv<'_>) -> String {
     let home = getenv("HOME");
     if home.is_empty() {
         return String::new();

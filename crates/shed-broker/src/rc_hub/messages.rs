@@ -330,12 +330,11 @@ impl MessageRing {
 /// The `GET /v1/sessions/{slug}/messages` body (`hubMessagesResponse`,
 /// `hub_messages.go:340`).
 ///
-/// EMPTY-PAGE WIRE NOTE for the H10 handler: Go's field has no `omitempty`
-/// and the hub passes the nil slice `since` returns for an empty page, so the
-/// Go hub serializes `{"messages":null,...}` where a `Vec` serializes `[]`.
-/// The handler must either match Go's `null` or the differential harness must
-/// canonicalize it — do not ship the divergence silently (the tolerant
-/// client-side twin `shed_core::rc::RcMessagesPage` accepts both).
+/// EMPTY-PAGE WIRE NOTE (resolved at H10): Go's HANDLER coerces the nil
+/// slice `since` returns to `[]feedMessage{}` before encoding
+/// (`hub.go:440-442`), so the wire is `[]` on both sides — a `Vec` matches it
+/// naturally. The `null_default` deserializer below stays as defensive
+/// tolerance for any non-handler producer.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HubMessagesResponse {

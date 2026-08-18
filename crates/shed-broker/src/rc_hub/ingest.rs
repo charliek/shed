@@ -1,8 +1,7 @@
-//! The cursor hook ingest — `internal/ext/rc/hub_ingest.go`. Plan 010 H7
-//! lands the PRE-WATCHER QUEUE half (the bounds, the event-name grammar, and
-//! the queue/drain/prune mechanics reconcile and the route share); the HTTP
-//! handler itself (`handleIngestCursor`, its 413→400→404→409→202 precedence)
-//! arrives with the HTTP shell in H10.
+//! The cursor hook ingest — `internal/ext/rc/hub_ingest.go`: the PRE-WATCHER
+//! QUEUE (the bounds, the event-name grammar, the queue/drain/prune mechanics)
+//! and the HTTP handler (`handleIngestCursor`, its 413→400→404→409→202
+//! precedence) on the axum shell (H10).
 //!
 //! The queue exists for one real window: hook events that arrive before
 //! reconcile has built the session's watcher. `shed attach --kind cursor
@@ -50,7 +49,7 @@ pub const PRE_WATCHER_TTL: std::time::Duration = std::time::Duration::from_secs(
 static CURSOR_HOOK_EVENT_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^[A-Za-z][A-Za-z0-9_]{0,63}$").expect("hook event regex"));
 
-/// `cursorHookEventRe.MatchString` for the H10 handler + tests.
+/// `cursorHookEventRe.MatchString` — the route's `?event=` gate.
 pub fn valid_cursor_hook_event(event: &str) -> bool {
     CURSOR_HOOK_EVENT_RE.is_match(event)
 }
@@ -176,6 +175,138 @@ impl PreWatcherQueues {
     }
 }
 
+/// The queued-body JSON answer for an accepted hook (`{"accepted": true}`).
+#[derive(serde::Serialize)]
+struct IngestAccepted {
+    accepted: bool,
+}
+
+/// Serves POST /v1/ingest/cursor (`handleIngestCursor`, `hub_ingest.go:74`) —
+/// the hub's one guest-internal route, deliberately NOT on the server proxy's
+/// allowlist. Precedence mirrors the verb handlers (body size → request
+/// validation → tracked lookup → capability):
+///
+/// ```text
+/// 413 too_large      — the payload exceeds the 256 KiB ingest cap (dropped)
+/// 400 invalid_slug / invalid_event — malformed query parameters
+/// 404 unknown_slug   — no such rc session
+/// 409 not_supported  — tracked but not a cursor session
+/// 202                — accepted (pushed to the watcher, or queued for it)
+/// ```
+///
+/// EVERY failure mode is a plain status + envelope: the hook script ignores
+/// the response entirely, so these codes exist for operators and tests.
+pub(crate) async fn handle_ingest_cursor(
+    axum::extract::State(hub): axum::extract::State<std::sync::Arc<super::hub::Hub>>,
+    axum::extract::RawQuery(query): axum::extract::RawQuery,
+    req: axum::extract::Request,
+) -> axum::response::Response {
+    use super::hub::{write_error, write_json};
+    use super::verbs::ERR_NOT_SUPPORTED;
+    use http::StatusCode;
+
+    // Its OWN cap — 256 KiB, not the shared 16 KiB POST cap: an
+    // afterShellExecution.output routinely exceeds 16 KiB. NOT the shared
+    // wroteTooLarge helper either (that one spells the 16 KiB cap, which
+    // would be a lie on this route).
+    let payload =
+        match super::verbs::read_body_capped(req.into_body(), HUB_INGEST_MAX_BODY_BYTES).await {
+            Ok((_, true)) => {
+                return write_error(
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    "too_large",
+                    "hook payload exceeds 256 KiB",
+                );
+            }
+            Ok((buf, false)) => buf,
+            Err(()) => {
+                return write_error(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_body",
+                    "hook payload could not be read",
+                );
+            }
+        };
+
+    // Query params via Go's url.Values.Get contract (first occurrence wins on
+    // duplicates — H10 review MEDIUM: last-wins re-addressed a hook event).
+    let slug = super::hub::query_get(query.as_deref(), "slug");
+    let slug = slug.as_str();
+    if !shed_core::rc_agents::valid_caller_slug(slug) {
+        return write_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_slug",
+            "slug is missing or malformed",
+        );
+    }
+    let event = super::hub::query_get(query.as_deref(), "event");
+    let event = event.as_str();
+    if !valid_cursor_hook_event(event) {
+        return write_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_event",
+            "event is missing or malformed",
+        );
+    }
+
+    // The tracked entry is the authorization: an untracked slug is a 404 (the
+    // handleMessages rule — no re-derivation from tmux), and a tracked slug
+    // of another kind is a 409 — this payload shape is cursor's, and folding
+    // it anywhere else would be a category error.
+    let (kind, watcher) = {
+        let ts = hub.lock_track();
+        match ts.tracked.get(slug) {
+            None => {
+                drop(ts);
+                return write_error(StatusCode::NOT_FOUND, "unknown_slug", "no such rc session");
+            }
+            Some(tr) => (tr.kind.clone(), tr.watcher.clone()),
+        }
+    };
+    if kind != shed_core::rc::RcKind::Cursor {
+        return write_error(
+            StatusCode::CONFLICT,
+            ERR_NOT_SUPPORTED,
+            "this session's kind does not ingest cursor hook events",
+        );
+    }
+
+    // The watcher pointer was copied out under the track lock; the push takes
+    // the WATCHER's mutex, never the hub's. THE QUEUE IS FOR THE PRE-WATCHER
+    // WINDOW ONLY: once a watcher exists the event is pushed or DROPPED,
+    // never queued (see the module doc — a queued event against a closed
+    // watcher would be drained into the NEXT incarnation). Either way the
+    // answer is 202: the hook script cannot act on anything else.
+    let ev = CursorHookEvent {
+        event: event.to_string(),
+        payload,
+    };
+    match watcher {
+        None => {
+            // The create → first-reconcile-tick window, where the kickoff
+            // prompt's beforeSubmitPrompt lands.
+            hub.ingest.queue(slug, ev, (hub.cfg.now)(), &hub.cfg.logf);
+        }
+        Some(w) => match w.as_cursor_ingester() {
+            None => {
+                // Unreachable today; dropping rather than queueing keeps the
+                // pre-watcher-only invariant true if that ever changes.
+                (hub.cfg.logf)(&format!(
+                    "rc hub: cursor session {slug} has a non-ingesting watcher; dropping {event}"
+                ));
+            }
+            Some(ing) => {
+                if !ing.push_hook_event(ev) {
+                    (hub.cfg.logf)(&format!(
+                        "rc hub: cursor watcher for {slug} refused a {event} event (closed or full); dropping"
+                    ));
+                }
+            }
+        },
+    }
+    write_json(StatusCode::ACCEPTED, &IngestAccepted { accepted: true })
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::hub_test_support::{hook_ev as ev, CURSOR_SID};
@@ -203,8 +334,8 @@ mod tests {
     }
 
     // queue → drain in arrival order, exactly once (the mechanics half of
-    // hub_ingest_test.go's pre-watcher cases; the route precedence arrives
-    // with the H10 handler).
+    // hub_ingest_test.go's pre-watcher cases; the route precedence is
+    // asserted over the real shell in hub_http_tests.rs).
     #[test]
     fn queue_drain_order_and_idempotence() {
         let queues = PreWatcherQueues::new();
