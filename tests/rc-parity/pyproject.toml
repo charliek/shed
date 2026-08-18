@@ -3,9 +3,11 @@ name = "rc-parity"
 version = "0.1.0"
 description = "Go↔Rust differential harness for the one-shot RC engine: drives the real `shed-machine-rc <verb>` and `sx rc <verb>` binaries against a hermetic tmux server and asserts their wire-visible output, under a defined canonicalization, is identical — then pins it to a golden recorded from the Go (oracle) side."
 requires-python = ">=3.11"
-# pytest only. The two binaries are driven as black-box subprocesses and the
-# compared payloads are canonicalized with the stdlib `json` — no client library,
-# no crypto, no HTTP.
+# pytest only. The binaries are driven as black-box subprocesses and the
+# compared payloads are canonicalized with the stdlib `json` — no client
+# library, no crypto. The hub family (plan 010) speaks loopback HTTP to the two
+# resident hub daemons via the stdlib `http.client` — still no dependencies,
+# and never a network beyond 127.0.0.1.
 dependencies = [
     "pytest>=8.0",
 ]
@@ -15,6 +17,7 @@ testpaths = ["."]
 addopts = "-ra --strict-markers"
 markers = [
     "differential: a scenario run against BOTH implementations, asserted equal and pinned to a golden",
+    "hub: the resident-daemon hub family (plan 010) — Go-golden until the Rust hub lights up at H12",
 ]
 # Hermetic by construction: a fresh HOME + tmux server per context (one per
 # implementation leg under the `isolated` flavor, one shared by both under

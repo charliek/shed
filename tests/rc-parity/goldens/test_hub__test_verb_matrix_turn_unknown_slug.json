@@ -1,0 +1,7 @@
+{
+  "body": {
+    "error": "unknown_slug",
+    "message": "no such rc session"
+  },
+  "status": 404
+}

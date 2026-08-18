@@ -124,9 +124,19 @@ A test may ask for several NAMED shared rigs (`shared("chain-go")`,
 implementation drives*, so each direction needs its own world. Teardown is the same
 discipline as `isolated` — every rig's server is killed and its `TMUX_TMPDIR` removed.
 
-## Scope today (C6) and what is coming
+## Scope today and what is coming
 
-Here — 51 differential cells, one golden each:
+Two families now share the goldens dir and the stale-sweep: the ONE-SHOT family
+(plan 009 — 52 cells) and the HUB family (plan 010 — `test_hub.py`, marker
+`hub`): resident hub daemons on ephemeral loopback ports via the sanctioned
+`SHED_RC_HUB_ADDR`/`SHED_RC_HUB_*_MS` seams, snapshot cells (health identity,
+sessions overlay, messages paging, the 4xx/409 verb matrix, bare-mux
+status-only) pinned from the Go hub. The hub family's `hub_differential` is
+**Go-only until the Rust hub exists** (plan 010 H12) — its goldens are the
+frozen wire the Rust port must answer — then it becomes equality-then-pin like
+everything else.
+
+The one-shot family — 52 differential cells, one golden each:
 
 * `version`; `create` (DTO + session environment + inner-command argv, `shell` and
   `opencode`); `probe`; `kill` (including its idempotence); `list`; the exit-code

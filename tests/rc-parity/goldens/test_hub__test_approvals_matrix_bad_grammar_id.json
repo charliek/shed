@@ -1,0 +1,7 @@
+{
+  "body": {
+    "error": "invalid_approval_id",
+    "message": "approval id must match ^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$"
+  },
+  "status": 400
+}

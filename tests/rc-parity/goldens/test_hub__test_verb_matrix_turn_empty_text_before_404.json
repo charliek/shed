@@ -1,0 +1,7 @@
+{
+  "body": {
+    "error": "empty_text",
+    "message": "text is required"
+  },
+  "status": 400
+}

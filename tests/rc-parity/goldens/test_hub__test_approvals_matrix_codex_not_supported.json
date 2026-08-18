@@ -1,0 +1,7 @@
+{
+  "body": {
+    "error": "not_supported",
+    "message": "approvals for this session's kind are answered in the terminal"
+  },
+  "status": 409
+}
