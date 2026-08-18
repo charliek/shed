@@ -19,8 +19,11 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"math"
+	"net"
 	"os"
 	"os/exec"
+	"strconv"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -552,18 +555,99 @@ func doKill(cfg Config, d deps, args []string) int {
 	})
 }
 
-// hubConfig builds the rc.HubConfig from the injected process dependencies. Only
-// the tmux runner and env are wired; the hub applies its own defaults for clock,
-// intervals, and the loopback address.
-func hubConfig(d deps) rc.HubConfig {
-	return rc.HubConfig{Runner: d.runner, Getenv: d.getenv}
+// Sanctioned oracle seams (plan 010, same protocol as rc.EnvNoHub): process-env
+// overrides for the hub's bind address and tuning intervals, wired HERE — never
+// inside the rc package — so the Go↔Rust differential harness can run both hub
+// implementations on distinct ephemeral ports with fast ticks. Inert unless set;
+// test-only, not user surface (deliberately undocumented in docs/reference).
+const (
+	// envHubAddr overrides the hub bind/dial address. Loopback-enforced: any
+	// value whose host is not 127.0.0.1 is IGNORED (with a stderr note) — this
+	// dispatcher is shared with the guest shed-ext-rc, and a stray environment.d
+	// export must never widen the unauthenticated hub onto a shed bridge.
+	envHubAddr = "SHED_RC_HUB_ADDR"
+	// The interval overrides, all positive integer milliseconds; invalid or
+	// non-positive values are ignored (the hub's own defaults apply). Note the
+	// Go hub treats a zero/negative resolved value as "use the default", so
+	// these seams cannot express "never" — the harness pins large finite
+	// values instead (plan 010 §2.5).
+	envHubActiveMS       = "SHED_RC_HUB_ACTIVE_MS"
+	envHubIdleMS         = "SHED_RC_HUB_IDLE_MS"
+	envHubQuietMS        = "SHED_RC_HUB_QUIET_MS"
+	envHubIdleExitMS     = "SHED_RC_HUB_IDLE_EXIT_MS"
+	envHubHeartbeatMS    = "SHED_RC_HUB_HEARTBEAT_MS"
+	envHubWriteTimeoutMS = "SHED_RC_HUB_WRITE_TIMEOUT_MS"
+)
+
+// hubConfig builds the rc.HubConfig from the injected process dependencies: the
+// tmux runner and env, plus any sanctioned env-seam overrides (above). Absent
+// overrides, the hub applies its own defaults for clock, intervals, and the
+// loopback address. cfg supplies the prog-name prefix for ignored-override notes.
+func hubConfig(cfg Config, d deps) rc.HubConfig {
+	hc := rc.HubConfig{Runner: d.runner, Getenv: d.getenv}
+	applyHubEnvOverrides(&hc, cfg, d)
+	return hc
+}
+
+// applyHubEnvOverrides reads the sanctioned env seams into hc. Every malformed
+// or rejected value is ignored with a stderr note (never an error — a bad test
+// seam must not change production behavior beyond the note).
+func applyHubEnvOverrides(hc *rc.HubConfig, cfg Config, d deps) {
+	if d.getenv == nil {
+		return
+	}
+	note := func(format string, args ...any) {
+		if d.stderr != nil {
+			fmt.Fprintf(d.stderr, cfg.ProgName+": "+format+"\n", args...)
+		}
+	}
+	if v := d.getenv(envHubAddr); v != "" {
+		// Concrete port required: ":0" would make the child bind a random port
+		// the parent's probe can never find (and bindHubListener can never see
+		// EADDRINUSE on port 0, so bind-as-lock would silently vanish). The
+		// harness picks its own free ports and passes them literally.
+		host, port, err := net.SplitHostPort(v)
+		p, perr := strconv.Atoi(port)
+		if err != nil || host != "127.0.0.1" || perr != nil || p < 1 || p > 65535 {
+			note("ignoring %s=%q: must be 127.0.0.1:<port 1-65535>", envHubAddr, v)
+		} else {
+			hc.Addr = v
+		}
+	}
+	for _, o := range []struct {
+		env string
+		dst *time.Duration
+	}{
+		{envHubActiveMS, &hc.ActiveInterval},
+		{envHubIdleMS, &hc.IdleInterval},
+		{envHubQuietMS, &hc.QuietPeriod},
+		{envHubIdleExitMS, &hc.IdleTimeout},
+		{envHubHeartbeatMS, &hc.Heartbeat},
+		{envHubWriteTimeoutMS, &hc.WriteTimeout},
+	} {
+		v := d.getenv(o.env)
+		if v == "" {
+			continue
+		}
+		// The ceiling guards the time.Duration multiply: an overflowed (negative)
+		// duration would fall through resolve()'s <=0 check back to the DEFAULT —
+		// the exact opposite of the override's intent — or wrap to a microsecond
+		// spin. ~292 years is plenty for "large finite".
+		const maxMS = int64(math.MaxInt64) / int64(time.Millisecond)
+		ms, err := strconv.ParseInt(v, 10, 64)
+		if err != nil || ms <= 0 || ms > maxMS {
+			note("ignoring %s=%q: must be a positive integer (milliseconds)", o.env, v)
+			continue
+		}
+		*o.dst = time.Duration(ms) * time.Millisecond
+	}
 }
 
 // realEnsureHub is the production ensureHub: spawn/verify the detached rc hub,
 // logging any (best-effort) failure to stderr under this binary's own prog name.
 // Wired only in Run so dispatch tests never fork a real daemon.
 func realEnsureHub(cfg Config, d deps) {
-	rc.EnsureHub(hubConfig(d), d.stderr, cfg.ProgName)
+	rc.EnsureHub(hubConfig(cfg, d), d.stderr, cfg.ProgName)
 }
 
 // warnHook returns the CreateOptions.Warnf callback, routing rc.Create's non-fatal
@@ -612,12 +696,12 @@ func doServe(cfg Config, d deps, args []string) int {
 		return fail(cfg, d, fmt.Errorf("%w: --detach and --foreground are mutually exclusive", rc.ErrBadArgs))
 	}
 	if *detach {
-		if err := rc.DetachHub(hubConfig(d)); err != nil {
+		if err := rc.DetachHub(hubConfig(cfg, d)); err != nil {
 			return fail(cfg, d, err)
 		}
 		return 0
 	}
-	if err := rc.RunHub(hubConfig(d)); err != nil {
+	if err := rc.RunHub(hubConfig(cfg, d)); err != nil {
 		return fail(cfg, d, err)
 	}
 	return 0
