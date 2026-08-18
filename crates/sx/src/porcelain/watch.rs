@@ -408,9 +408,16 @@ fn stream_shed(
     }
 }
 
-/// A plain (static-token) shed-server client for one server entry — see
-/// [`crate::porcelain::shed_ssh_target`] for why `sx` does not take the
-/// host-agent minter path.
+/// A plain (static-token) shed-server client for one server entry.
+///
+/// Deliberately NOT on the host-agent minter path that [`crate::backend`] wires
+/// for the one-shot fan-out, and the difference is the LIFETIME: this client
+/// holds an SSE stream open until the user stops watching, and the agent's
+/// credential socket is single-consumer/last-writer-wins — minting here would
+/// keep a running desktop app superseded for as long as `sx watch` runs, to buy
+/// a feed. An mTLS server (no static token) therefore 401s here and `sx watch`
+/// does what it already does for any unreachable feed: degrades to probe polling
+/// over SSH, with a note saying why.
 fn server_client(deps: &Deps, server: Option<&str>) -> Result<shed_core::http::Client, VerbError> {
     let config = load_config(deps);
     let entry = select_server(&config, server)?;

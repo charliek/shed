@@ -98,7 +98,7 @@ func TestInnerCommand(t *testing.T) {
 		// codex/cursor ignore a nonzero port even though the signature accepts one —
 		// only opencode's builder branch consumes it.
 		{"codex ignores port", KindCodex, "x", "", false, 4096, "codex"},
-		{"cursor ignores port", KindCursor, "x", "", false, 4096, "cursor-agent"},
+		{"cursor ignores port", KindCursor, "x", "", false, 4096, "cursor-agent --trust"},
 	}
 	for _, c := range cases {
 		t.Run(c.caseName, func(t *testing.T) {

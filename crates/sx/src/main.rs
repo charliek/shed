@@ -21,6 +21,7 @@
 //! does not check it either; the parity CI job asserts the installed version.
 
 mod args;
+mod backend;
 mod cli;
 mod porcelain;
 mod ssh;

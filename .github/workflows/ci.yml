@@ -516,7 +516,21 @@ jobs:
           rustup toolchain install stable --profile minimal --component clippy
           rustc --version && cargo --version
       - name: C toolchain (ring's crypto backend needs build-essential)
-        run: sudo apt-get update && sudo apt-get install -y build-essential
+        # Bounded+retried apt — see the "C toolchain + tmux" step's rationale.
+        timeout-minutes: 12
+        run: |
+          set -euo pipefail
+          ok=""
+          for attempt in 1 2 3; do
+            if sudo timeout 120 apt-get update; then ok=1; break; fi
+            echo "apt-get update stalled or failed (attempt ${attempt}/3); retrying" >&2
+            sleep 10
+          done
+          if [ -z "${ok}" ]; then
+            echo "::error::apt-get update failed 3x — mirror outage?"
+            exit 1
+          fi
+          sudo timeout 300 apt-get install -y build-essential
       - name: shed-core — test + clippy (Linux)
         # Scoped to -p shed-core so the macOS-only shed-core-ffi (uniffi) is never
         # dragged in. --all-targets runs the pinned-TLS verifier + redirect/
@@ -545,7 +559,21 @@ jobs:
           rustup toolchain install stable --profile minimal --component clippy
           rustc --version && cargo --version
       - name: C toolchain (ring's crypto backend needs build-essential)
-        run: sudo apt-get update && sudo apt-get install -y build-essential
+        # Bounded+retried apt — see the "C toolchain + tmux" step's rationale.
+        timeout-minutes: 12
+        run: |
+          set -euo pipefail
+          ok=""
+          for attempt in 1 2 3; do
+            if sudo timeout 120 apt-get update; then ok=1; break; fi
+            echo "apt-get update stalled or failed (attempt ${attempt}/3); retrying" >&2
+            sleep 10
+          done
+          if [ -z "${ok}" ]; then
+            echo "::error::apt-get update failed 3x — mirror outage?"
+            exit 1
+          fi
+          sudo timeout 300 apt-get install -y build-essential
       - uses: astral-sh/setup-uv@v6
       # The broker core lives in `shed-broker` now; the bin is the daemon shell over
       # it. Both must build/test/clippy-clean for the shipped daemon to be sound.
@@ -605,8 +633,10 @@ jobs:
         # 2-minute infrastructure blip cancelled the job and read like a harness
         # hang. `timeout` bounds each attempt (a hang, not a failure, is the
         # observed shape — a bare retry loop would never re-enter), and the
-        # step cap is the backstop.
-        timeout-minutes: 8
+        # step cap is the backstop — sized ABOVE the loop's worst case
+        # (3x120s update + sleeps + 300s install ≈ 11.3 min) so the loud
+        # ::error:: diagnostic can actually fire before GitHub kills the step.
+        timeout-minutes: 12
         run: |
           set -euo pipefail
           ok=""
@@ -670,11 +700,30 @@ jobs:
           rustup toolchain install stable --profile minimal
           rustc --version && cargo --version
       - name: Tauri (WebKitGTK) build deps + nfpm
+        # Bounded+retried apt — see the "C toolchain + tmux" step's rationale.
+        # Two install cycles chained (webkitgtk deps, then nfpm off its own repo),
+        # so the retry helper is a local function rather than duplicated twice.
+        timeout-minutes: 24
         run: |
-          sudo apt-get update && sudo apt-get install -y build-essential pkg-config \
+          set -euo pipefail
+          apt_update() {
+            ok=""
+            for attempt in 1 2 3; do
+              if sudo timeout 120 apt-get update; then ok=1; break; fi
+              echo "apt-get update stalled or failed (attempt ${attempt}/3); retrying" >&2
+              sleep 10
+            done
+            if [ -z "${ok}" ]; then
+              echo "::error::apt-get update failed 3x — mirror outage?"
+              exit 1
+            fi
+          }
+          apt_update
+          sudo timeout 300 apt-get install -y build-essential pkg-config \
             libwebkit2gtk-4.1-dev libgtk-3-dev libsoup-3.0-dev librsvg2-dev libayatana-appindicator3-dev
           echo 'deb [trusted=yes] https://repo.goreleaser.com/apt/ /' | sudo tee /etc/apt/sources.list.d/goreleaser.list
-          sudo apt-get update && sudo apt-get install -y nfpm
+          apt_update
+          sudo timeout 300 apt-get install -y nfpm
       - name: Node (the Vite/React frontend bundle)
         uses: actions/setup-node@v4
         with:

@@ -358,28 +358,28 @@ fn rc_error_exit_code(remote: i32) -> i32 {
 /// exactly one match is required — an ambiguous name is an error naming the
 /// candidates, never a silent pick.
 ///
-/// **Auth posture (a deliberate v1 choice):** the Backend is built WITHOUT the
-/// host-agent token minter, so a secure server is reached with the static
-/// `control_token` its config entry already holds. The minter is a UDS client
-/// with its own approval/capability handshake — appropriate for a long-lived
-/// desktop process, disproportionate for a one-shot CLI. The consequence is
-/// bounded and only ever hits the shed-NAME lookup: `--on shed:<name>@<server>`
-/// needs no HTTP and always works, and `sx watch --on shed:…` degrades to probe
-/// polling rather than failing (see [`watch`]).
+/// **Auth posture:** the fan-out's Backend is built WITH the host-agent control-
+/// token minter (see [`crate::backend`]), the same way the desktop builds its
+/// external-mode one — that is what lets a server enrolled for `auth.mode: mtls`
+/// (which by construction holds no static `control_token`) be listed at all.
+/// Wiring is gated on the agent actually answering: with no host agent running,
+/// the Backend is the plain static-token one and behavior is unchanged. Either
+/// way the failure stays per-server, so the `@server` form — pure config plus
+/// SSH, no HTTP and no credential — always works, and `sx watch --on shed:…`
+/// degrades to probe polling rather than failing (see [`watch`]).
 pub fn shed_ssh_target(
     deps: &Deps,
     shed: &str,
     server: Option<&str>,
 ) -> Result<shed_app::RcTarget, VerbError> {
-    let config_path = target::default_config_path(&*deps.env);
-    let backend =
-        shed_app::Backend::from_env_parts(false, None, std::path::Path::new(&config_path));
     if let Some(server) = server {
-        return backend
+        // Pure config: no HTTP, so no credential and no agent.
+        return crate::backend::config_backend(deps)
             .resolve_rc_target(Some(server))
             .map_err(|e| VerbError::bad_args(format!("shed:{shed}@{server}: {e}")));
     }
-    let targets = deps.block_on(async { backend.rc_targets(None, Some(shed)).await });
+    let targets =
+        crate::backend::with_backend(deps, async |b| b.rc_targets(None, Some(shed)).await);
     pick_shed_target(shed, targets.into_iter().map(|(_, t)| t).collect())
 }
 

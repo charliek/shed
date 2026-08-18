@@ -9,9 +9,9 @@
 #
 # It cross-compiles the four guest binaries — shed-ext-ssh-agent,
 # shed-ext-aws-credentials, docker-credential-shed, shed-ext-rc — for
-# linux/<goarch> (CGO disabled, no ldflags, matching how the rootfs scripts
-# build shed-agent; the live "version != v0.4.9" assert is satisfied either
-# way), then mirrors guest/extensions/etc/ into <context-dir>/ext-etc/.
+# linux/<goarch> (CGO disabled; version-stamped via the same -X ldflags the
+# Makefile uses, see below), then mirrors guest/extensions/etc/ into
+# <context-dir>/ext-etc/.
 #
 # Single source of truth: the rootfs build scripts, the publish CI workflow,
 # and publish-images-local.sh all call this rather than re-deriving the build
@@ -34,13 +34,30 @@ esac
 
 cd "$PROJECT_ROOT"
 
-# Guest extension binaries. No ldflags (reports "dev"), matching how the rootfs
-# scripts build shed-agent; CGO disabled so the linux/<goarch> cross-compile is
-# static and needs no host toolchain.
+# Version stamping, mirroring the Makefile's LDFLAGS exactly (same three -X
+# flags, same git-describe derivation) so the guest binaries report a real
+# version instead of internal/version's "dev" default. Works unchanged in
+# Version resolution, in caller-priority order:
+#   1. $VERSION / $GIT_COMMIT / $BUILD_DATE from the environment — what
+#      publish-images.yaml passes, so the guest binaries carry EXACTLY the same
+#      stamps as shed-agent/shed-firstboot in the same image (bare "0.8.2", not
+#      "v0.8.2" — the two conventions coexisting in one rootfs was a
+#      patch-cluster review finding).
+#   2. git describe on a dev checkout: "vX.Y.Z-N-g<sha>" (-dirty with edits).
+# BUILD_DATE defaults to the COMMIT date, not `date -u`: the staged bytes feed a
+# BuildKit bind-mount whose layer cache is keyed on them, so a wall-clock stamp
+# would bust the rootfs cache on every local rebuild for zero information.
+VERSION="${VERSION:-$(git describe --tags --always --dirty 2>/dev/null || echo "dev")}"
+GIT_COMMIT="${GIT_COMMIT:-$(git rev-parse --short HEAD 2>/dev/null || echo "unknown")}"
+BUILD_DATE="${BUILD_DATE:-$(git show -s --format=%cI HEAD 2>/dev/null || echo "unknown")}"
+LDFLAGS="-X github.com/charliek/shed/internal/version.Version=$VERSION -X github.com/charliek/shed/internal/version.GitCommit=$GIT_COMMIT -X github.com/charliek/shed/internal/version.BuildDate=$BUILD_DATE"
+
+# Guest extension binaries. CGO disabled so the linux/<goarch> cross-compile
+# is static and needs no host toolchain.
 for cmd in shed-ext-ssh-agent shed-ext-aws-credentials docker-credential-shed shed-ext-rc; do
     echo "=== Building $cmd (linux/$goarch) ==="
     CGO_ENABLED=0 GOOS=linux GOARCH="$goarch" \
-        go build -o "$ctx_dir/$cmd" "./cmd/$cmd"
+        go build -ldflags "$LDFLAGS" -o "$ctx_dir/$cmd" "./cmd/$cmd"
 done
 
 # Guest /etc overlay (systemd units, environment.d, shed-extensions.d configs).

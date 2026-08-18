@@ -28,7 +28,7 @@ use crate::cli::Deps;
 use crate::porcelain::{
     load_config, remote_bin, remote_exec, resolve_target, VerbError, VerbResult,
 };
-use crate::target::{self, Resolved};
+use crate::target::Resolved;
 
 /// One rendered session.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -195,10 +195,10 @@ fn collect_everything(deps: &Deps, listing: &mut Listing) {
     if config.servers.is_empty() {
         return;
     }
-    let config_path = target::default_config_path(&*deps.env);
-    let backend =
-        shed_app::Backend::from_env_parts(false, None, std::path::Path::new(&config_path));
-    let sheds = deps.block_on(async { backend.rc_targets(None, None).await });
+    // WITH the host-agent minter when one is running (`crate::backend`): an
+    // mTLS-enrolled server holds no static token, and without a mintable
+    // credential its sheds are silently absent from this listing.
+    let sheds = crate::backend::with_backend(deps, async |b| b.rc_targets(None, None).await);
     for (shed, rc_target) in sheds {
         let resolved = Resolved::Shed {
             name: shed.name.clone(),

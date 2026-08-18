@@ -52,7 +52,7 @@ interactive terminal **attach** is *not* routed through it (it stays a direct
 | `claude-rc` | `claude --name <display> /rc` (interactive REPL; the create-time default). With `--permission-mode <m>`, uses `claude --remote-control --name <display> --permission-mode <m>` instead so the posture carries into the live session. |
 | `claude-broker` | `claude remote-control --name <display> [--permission-mode <m>] --spawn same-dir` |
 | `codex` | `codex` TUI |
-| `cursor` | `cursor-agent` TUI |
+| `cursor` | `cursor-agent --trust` TUI (`--trust` skips the workspace-trust dialog — the same posture as the claude kinds' trust preseed; without it an unattended kickoff in a fresh workspace stalls at a dialog no classifier models) |
 | `opencode` | `opencode` TUI |
 | `shell` | `bash -l` |
 

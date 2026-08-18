@@ -393,6 +393,18 @@ pub fn inner_command(
         }
         AgentTool::Codex | AgentTool::Opencode | AgentTool::Cursor => {
             let mut cmd = tool.bin().unwrap_or_default().to_string();
+            // Spec-owned base posture flags, emitted BEFORE the permission
+            // flags (Go `innerCommandTUI(bin, baseFlags...)` — order is
+            // wire-visible and pinned by the rc-parity argv transcripts).
+            // cursor: --trust skips the workspace-trust dialog, which neither
+            // classifier models (same posture as claude's trust preseed; the
+            // rc environment is a sandbox VM or a deliberately-targeted
+            // machine). Verified live 2026-08-17. If any OTHER tool ever grows
+            // a base flag, mirror Go's spec-owned baseFlags shape AND add its
+            // argv parity cell — this arm is the whole mirror today.
+            if matches!(tool, AgentTool::Cursor) {
+                cmd.push_str(" --trust");
+            }
             if !flags.is_empty() {
                 cmd.push(' ');
                 cmd.push_str(&flags.join(" "));
@@ -1214,7 +1226,7 @@ mod tests {
                 "",
                 false,
                 4096,
-                "cursor-agent",
+                "cursor-agent --trust",
             ),
             // Posture flags land before the opencode port flags.
             (
@@ -1251,7 +1263,7 @@ mod tests {
                 "skip",
                 false,
                 0,
-                "cursor-agent --force",
+                "cursor-agent --trust --force",
             ),
             (
                 "cursor auto has no flag",
@@ -1260,7 +1272,7 @@ mod tests {
                 "auto",
                 false,
                 0,
-                "cursor-agent",
+                "cursor-agent --trust",
             ),
             (
                 "default posture passes nothing",

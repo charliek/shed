@@ -481,11 +481,19 @@ var agentRegistry = []*AgentSpec{
 		PromptAnchor: opencodePromptAnchorRe,
 	},
 	{
-		Tool:         toolCursor,
-		Bin:          "cursor-agent",
-		Kinds:        []Kind{KindCursor},
-		Lane:         LaneTUI,
-		InnerCommand: innerCommandTUI("cursor-agent"),
+		Tool:  toolCursor,
+		Bin:   "cursor-agent",
+		Kinds: []Kind{KindCursor},
+		Lane:  LaneTUI,
+		// --trust skips cursor's workspace-trust dialog, which is otherwise a
+		// hard stop for an unattended kickoff: neither classifier models that
+		// dialog (it postdates the pane fixtures), so a fresh workspace read
+		// `starting` until the wait timed out. Same posture as claude's trust
+		// PRESEED (PreseedClaudeConfig marks the workdir trusted) — the rc
+		// environment is a sandbox VM or a deliberately-targeted machine.
+		// Verified live 2026-08-17: without the flag the dialog shows; with it
+		// the composer is immediately ready.
+		InnerCommand: innerCommandTUI("cursor-agent", "--trust"),
 		Classify:     classifyCursor,
 		// cursor's preseed is not a trust/onboarding gate (it has none) — it installs the
 		// hub's hook relay into ~/.cursor/hooks.json, which is the ONLY live signal a cursor
@@ -647,10 +655,17 @@ func innerCommandClaude(kind Kind, displayName, permissionMode string, interacti
 // it rides inside the `bash -ic '<cmd>'` quoting like every other flag. codex/cursor
 // (and opencode with port == 0) never hit this branch, so a nonzero port passed for a
 // non-opencode kind is silently a no-op — only opencode consumes it.
-func innerCommandTUI(bin string) func(kind Kind, displayName, permissionMode string, interactiveShell bool, port int) string {
+// baseFlags are emitted immediately after bin, BEFORE the permission flags —
+// a fixed spec-owned posture (cursor's --trust), not caller input. The order is
+// wire-visible in the tmux inner command, so the Rust port (rc_agents.rs)
+// mirrors it exactly and the rc-parity argv transcripts pin it.
+func innerCommandTUI(bin string, baseFlags ...string) func(kind Kind, displayName, permissionMode string, interactiveShell bool, port int) string {
 	return func(kind Kind, _, permissionMode string, interactiveShell bool, port int) string {
 		flags, _ := permFlagsFor(kind, permissionMode)
 		cmd := bin
+		if len(baseFlags) > 0 {
+			cmd += " " + strings.Join(baseFlags, " ")
+		}
 		if len(flags) > 0 {
 			cmd += " " + strings.Join(flags, " ")
 		}
