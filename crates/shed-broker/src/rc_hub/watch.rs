@@ -100,6 +100,35 @@ pub trait SessionWatcher: Send + Sync {
     fn as_confirmed_agent_id_drainer(&self) -> Option<&dyn ConfirmedAgentIdDrainer> {
         None
     }
+    /// Go's `approvalPublisher` type-assert (`watch_opencode_transport.go:135`).
+    fn as_approval_publisher(&self) -> Option<&dyn ApprovalPublisher> {
+        None
+    }
+    /// Go's `approvalBlocker` type-assert (`watch_opencode_transport.go:143`).
+    fn as_approval_blocker(&self) -> Option<&dyn ApprovalBlocker> {
+        None
+    }
+}
+
+/// A watcher whose lane knows which approvals are still open, so reconcile can
+/// publish them into the session's pending_approvals snapshot each tick
+/// (`approvalPublisher`, `watch_opencode_transport.go:135`). PENDING ONLY —
+/// resolution state stays in the watcher (approvalState), because the wire
+/// contract defines pending_approvals as "what is still open", not an approval
+/// log. Only the opencode watcher implements it today; a watcher that does not
+/// leaves the snapshot untouched.
+pub trait ApprovalPublisher {
+    fn pending_approvals(&self) -> Vec<super::messages::FeedApproval>;
+}
+
+/// The input gate's counterpart to [`ApprovalPublisher`]: "is this session
+/// currently blocked on an approval it would type an answer into?"
+/// (`approvalBlocker`, `watch_opencode_transport.go:143`). Separate because it
+/// is a STRICTLY WIDER question than the snapshot — it counts open questions
+/// too, which are never addressable and so never appear in pending_approvals,
+/// yet own the keyboard exactly the same.
+pub trait ApprovalBlocker {
+    fn has_open_approvals(&self) -> bool;
 }
 
 /// The narrow interface the hub's ingest handler pushes through

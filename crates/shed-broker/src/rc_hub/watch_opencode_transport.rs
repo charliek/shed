@@ -811,6 +811,26 @@ impl SessionWatcher for OpencodeWatcher {
     fn as_confirmed_agent_id_drainer(&self) -> Option<&dyn ConfirmedAgentIdDrainer> {
         Some(self)
     }
+
+    fn as_approval_publisher(&self) -> Option<&dyn super::watch::ApprovalPublisher> {
+        Some(self)
+    }
+
+    fn as_approval_blocker(&self) -> Option<&dyn super::watch::ApprovalBlocker> {
+        Some(self)
+    }
+}
+
+impl super::watch::ApprovalPublisher for OpencodeWatcher {
+    fn pending_approvals(&self) -> Vec<FeedApproval> {
+        OpencodeWatcher::pending_approvals(self)
+    }
+}
+
+impl super::watch::ApprovalBlocker for OpencodeWatcher {
+    fn has_open_approvals(&self) -> bool {
+        OpencodeWatcher::has_open_approvals(self)
+    }
 }
 
 impl ConfirmedAgentIdDrainer for OpencodeWatcher {

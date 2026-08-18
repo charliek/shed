@@ -48,9 +48,22 @@
 //!   `FsNudger`; [`watch_cursor`] the push-fed `CursorWatcher`; [`ingest`]
 //!   the pre-watcher queue half of `hub_ingest.go` (the HTTP handler follows
 //!   in H10).
+//! - Hub core I (H9): [`hub`] — config resolution, the four-lock `Hub` state,
+//!   the per-slug input locks, the `inputAccepted` seven-arm gate, and the
+//!   idle-exit decision (`hub.go`'s core; the axum shell, verbs, and
+//!   lifecycle land in H10); [`reconcile`] — the heartbeat: `trackedSession`,
+//!   the pane-anchor debounce, `approvalSnapshot`, `ensureWatcher`
+//!   (`hub_reconcile.go`); [`events`] — event payloads + frame encoding + the
+//!   subscriber fan-out (`hub_events.go`'s pure half; the SSE handler follows
+//!   in H10).
 
+pub mod events;
+pub mod hub;
+#[cfg(test)]
+pub(crate) mod hub_test_support;
 pub mod ingest;
 pub mod messages;
+pub mod reconcile;
 pub mod stability;
 pub mod tail;
 pub mod watch;

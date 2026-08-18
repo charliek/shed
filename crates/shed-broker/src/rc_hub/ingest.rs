@@ -178,17 +178,11 @@ impl PreWatcherQueues {
 
 #[cfg(test)]
 mod tests {
+    use super::super::hub_test_support::{hook_ev as ev, CURSOR_SID};
     use super::super::watch::test_support::base_time as t0;
     use super::super::watch::{noop_logf, SessionWatcher};
     use super::super::watch_cursor::CursorWatcher;
     use super::*;
-
-    fn ev(event: &str, payload: &str) -> CursorHookEvent {
-        CursorHookEvent {
-            event: event.to_string(),
-            payload: payload.as_bytes().to_vec(),
-        }
-    }
 
     // The hook-event grammar (`cursorHookEventRe`).
     #[test]
@@ -220,7 +214,7 @@ mod tests {
             "abc123",
             ev(
                 "beforeSubmitPrompt",
-                r#"{"session_id":"4113a71f-0a42-4a6d-89b9-483e44b74103","prompt":"go"}"#,
+                &format!(r#"{{"session_id":"{CURSOR_SID}","prompt":"go"}}"#),
             ),
             t0(),
             &logf,

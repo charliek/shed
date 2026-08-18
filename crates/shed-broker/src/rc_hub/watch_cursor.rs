@@ -663,6 +663,18 @@ impl CursorWatcher {
         }
     }
 
+    /// The validated prior SHED_RC_AGENT_SESSION pin this watcher was built
+    /// with ("" when none / discarded as malformed). Go's reconcile reads
+    /// `w.priorID` directly (`hub_reconcile.go:603`) to decide whether a
+    /// restart backfill is worth attempting.
+    pub(crate) fn prior_id(&self) -> String {
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .prior_id
+            .clone()
+    }
+
     /// A ONE-SHOT, construction-time backfill (`seedFromTranscript`,
     /// `watch_cursor.go:280`): called exactly once, and only when the watcher
     /// was built with an existing SHED_RC_AGENT_SESSION pin (a hub restart
@@ -699,15 +711,6 @@ impl CursorWatcher {
             return;
         }
         w.pending.extend(rows);
-    }
-
-    #[cfg(test)]
-    pub(crate) fn prior_id(&self) -> String {
-        self.inner
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .prior_id
-            .clone()
     }
 
     #[cfg(test)]
@@ -1186,20 +1189,12 @@ fn cursor_transcript_tool_detail(input: Option<&RawValue>) -> String {
 
 #[cfg(test)]
 mod tests {
+    use super::super::hub_test_support::{hook_ev, CURSOR_SID as SID};
     use super::*;
     use std::io::Write;
 
-    /// The spike capture's own conversation id (`cursorTestSessionID`,
-    /// `watch_cursor_test.go:20`).
-    const SID: &str = "4113a71f-0a42-4a6d-89b9-483e44b74103";
+    /// A second, unrelated conversation id — the "not this session" negative.
     const OTHER_SID: &str = "9129668a-885b-48ef-b61b-d80f981d4d68";
-
-    fn hook_ev(event: &str, payload: &str) -> CursorHookEvent {
-        CursorHookEvent {
-            event: event.to_string(),
-            payload: payload.as_bytes().to_vec(),
-        }
-    }
 
     fn sid_field(id: &str) -> String {
         format!(r#""session_id":"{id}""#)
