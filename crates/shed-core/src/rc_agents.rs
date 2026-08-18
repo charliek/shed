@@ -6,14 +6,12 @@
 //! that become the tmux `new-session` command, the complete pane classifiers
 //! (trust / auth / ready / dead, with every anchor regex), permission-flag
 //! resolution, the `SHED_RC_*` metadata writer/reader, and slug generation.
-//! Deliberately NOT here (deferred with the hub, which is not being ported this
-//! block): `ApprovalAnchor` and `ComposerUnderModal` from the Go registry —
-//! both are hub-only consumers, and cursor's approval anchor is SAFETY-critical
-//! there (the sole guard against typing into a modal, `agents.go:347-358`), so
-//! porting them without their consumer would invite silent drift. A future hub
-//! port must bring them along; this registry is complete for the ONE-SHOT verbs
-//! only. (`PromptAnchor` IS ported — as inert registry data — because it rides
-//! the same per-kind table the one-shot classifiers live in.)
+//! Since plan 010 (the hub port) it also carries the hub's pane-derived
+//! approval machinery: [`approval_anchor_for`] and [`composer_under_modal`],
+//! consumed by shed-broker's `rc_hub`. cursor's approval anchor is
+//! SAFETY-critical there — the sole guard against typing into a modal
+//! (`agents.go:347-358`) — and its exhaustiveness over cursor's decision
+//! surfaces is pinned by a test mirroring the Go one.
 //! `rc.rs`'s [`crate::rc::classify_pane`] is a DIFFERENT, deliberately narrower
 //! thing — a claude-only best-effort CLIENT classifier pinned to Swift parity —
 //! and stays untouched. Engine callers (the Rust rc engine in `shed-app`, the
@@ -82,6 +80,11 @@ pub const ENV_TARGET: &str = "SHED_RC_TARGET";
 pub const ENV_SLUG: &str = "SHED_RC_SLUG";
 /// opencode's allocated loopback HTTP/SSE port (opencode kind only).
 pub const ENV_OPENCODE_PORT: &str = "SHED_RC_OPENCODE_PORT";
+/// The hub's correlation back-write (`envAgentSession`, `rc.go:137`): the
+/// agent's own session id, stamped via `tmux set-environment` once a watcher
+/// correlates, so a hub restart re-correlates exactly. ADDITIVE — never part of
+/// `build_env_args` (create does not know it); the hub is the only writer.
+pub const ENV_AGENT_SESSION: &str = "SHED_RC_AGENT_SESSION";
 /// The prefix `parse_env` filters a `tmux show-environment` dump down to.
 pub const ENV_PREFIX: &str = "SHED_RC_";
 
@@ -722,11 +725,9 @@ static RE_SHELL_PROMPT_ANCHOR: LazyLock<Regex> = LazyLock::new(|| {
 /// pane-stability engine uses to split `needs_input` from plain `idle` on a quiet
 /// pane (`promptAnchorFor`, `agents.go:533`). `None` for an unregistered kind.
 ///
-/// Ported as registry DATA for completeness: the only consumers today are the Go
-/// hub's stability engine (which is NOT ported this block — the hub stays Go),
-/// so nothing in Rust reads these yet. They live here so the registry is one
-/// table rather than one-and-a-bit, and so the port's next consumer does not have
-/// to re-derive them from the agent bundles.
+/// Consumed by the hub's stability engine (shed-broker's `rc_hub`, plan 010) to
+/// split `needs_input` from `idle` on a settled pane, and read against the
+/// approval fixtures by the `composer_under_modal` pin below.
 pub fn prompt_anchor_for(kind: &RcKind) -> Option<&'static Regex> {
     match tool_for(kind)? {
         AgentTool::Claude => Some(&RE_CLAUDE_PROMPT_ANCHOR),
@@ -736,6 +737,88 @@ pub fn prompt_anchor_for(kind: &RcKind) -> Option<&'static Regex> {
         AgentTool::Cursor => Some(&RE_CURSOR_READY),
         AgentTool::Shell => Some(&RE_SHELL_PROMPT_ANCHOR),
     }
+}
+
+// ---------------------------------------------------------------------------
+// approval anchors (agents.go:225-403) — the hub's pane-derived approval signal
+// ---------------------------------------------------------------------------
+//
+// Ported for the plan-010 hub port (shed-broker's rc_hub is the consumer).
+// Structural, whole-line expressions in the ready-anchor tradition: what makes a
+// match trustworthy is the WIDGET SHAPE around the words, not the words. Each
+// regex's full rationale — why option rows and not headlines, why the cursor
+// anchor is a headline+option CONJUNCTION, the verbatim-reproduction limitation —
+// lives with the Go originals (`agents.go:228-370`); the Rust side pins the same
+// fixtures and the same exhaustiveness table rather than restating the essay.
+
+/// One rendered OPTION ROW of codex's approval overlay, conjoined with the
+/// overlay's own footer within the next few lines (`codexApprovalAnchorRe`,
+/// `agents.go:294`). The footer wording belongs to the approval overlay alone
+/// (other codex list views end "esc to go back"); the row half requires the
+/// column-0 selection gutter (`›` or its replacing space) so assistant prose
+/// bullets — which land at the same column with a `• ` gutter — never match.
+static RE_CODEX_APPROVAL_ANCHOR: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"(?m)^[› ] [0-9]+\. (?:Yes, proceed|Yes, just this once|No, and tell Codex what to do differently)(?: \([^()\n]{1,16}\))? *\n(?:[^\n]*\n){0,12} *Press enter to confirm or esc to cancel",
+    )
+    .unwrap()
+});
+
+/// The decision surface's bold headline, one alternative per operation type,
+/// plus the hook-approval reason line (`cursorApprovalHeadline`, `agents.go:383`).
+const CURSOR_APPROVAL_HEADLINE: &str = "(?:Run this command\\?|Run this command outside the sandbox\\?|Run this MCP tool\\?|Delete this file\\?|Write to this file\\?|Allow this web search\\?|Allow this web fetch\\?|Proceed with this edit\\?|Hook requested approval:[^\n]*)";
+
+/// One option row's LABEL — every label decision-logic.ts can push, across all
+/// eight decision surfaces (`cursorApprovalOption`, `agents.go:398`). Two
+/// families: FIXED labels owning their whole line up to an optional " (hint)",
+/// and PREFIX labels ("Add Write(", "Add Shell(", "Always allow ") that
+/// interpolate a path/command/domain and consume the rest of the line.
+///
+/// EXHAUSTIVENESS over the surfaces is a SAFETY property, not a nicety
+/// (`agents.go:330-358`): cursor keeps its composer drawn — disabled — UNDER the
+/// dialog, so for a [`composer_under_modal`] kind this regex against the fresh
+/// visible pane is the SOLE guard between the input gate's guarded-recovery arm
+/// and typing into the widget (where a "y" answers it). A cursor upgrade that
+/// adds a surface MUST teach this label set in the same change — the
+/// exhaustiveness test mirrors Go's `TestCursorApprovalAnchorCoversEveryDecisionSurface`.
+const CURSOR_APPROVAL_OPTION: &str = "(?:(?:Run \\(once\\)|Run outside sandbox \\(once\\)|Run Everything|Run in Sandbox|Checking Run Everything availability|Skip & tell the agent what to do instead|Reject & propose changes|Allowlist MCP Tool|Add to allowlist|Allow search|Delete|Keep|Proceed|Fetch|Skip)(?: \\([^()\n]{1,16}\\))?|(?:Always allow |Add Write\\(|Add Shell\\()[^\n]*)";
+
+/// cursor-agent's approval prompt: a whole-line HEADLINE, then within a few
+/// lines a whole-line OPTION ROW (`cursorApprovalAnchorRe`, `agents.go:372`).
+/// Neither half is trusted alone — a headline is quotable prose that survives
+/// the answer in the transcript; an option label can end a line of prose. The
+/// row's accepted gutter is indent plus an optional "→ " marker; markdown
+/// bullets (`- `, `* `) are deliberately NOT accepted (that is how an assistant
+/// lists the same labels).
+static RE_CURSOR_APPROVAL_ANCHOR: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(&format!(
+        "(?m)^[ \t]*{CURSOR_APPROVAL_HEADLINE}[ \t]*\n(?:[^\n]*\n){{0,8}}[ \t]*(?:→ )?{CURSOR_APPROVAL_OPTION}[ \t]*$"
+    ))
+    .unwrap()
+});
+
+/// The kind's APPROVAL-DIALOG anchor (`approvalAnchorFor`, `agents.go:550`) —
+/// the chrome the hub's pane-anchor mechanism matches against the VISIBLE frame
+/// only. `None` means "this kind has no pane-derived approval signal", which
+/// callers must treat as "no evidence", never as "not blocked". codex and
+/// cursor declare one; opencode's approvals ride its protocol lane and claude's
+/// remote-control surface has no dialog to anchor.
+pub fn approval_anchor_for(kind: &RcKind) -> Option<&'static Regex> {
+    match tool_for(kind)? {
+        AgentTool::Codex => Some(&RE_CODEX_APPROVAL_ANCHOR),
+        AgentTool::Cursor => Some(&RE_CURSOR_APPROVAL_ANCHOR),
+        AgentTool::Claude | AgentTool::Opencode | AgentTool::Shell => None,
+    }
+}
+
+/// Whether the kind KEEPS ITS INPUT COMPOSER DRAWN while a modal owns the
+/// keyboard (`composerUnderModal`, `agents.go:561`; `AgentSpec.ComposerUnderModal`).
+/// A RENDERING FACT pinned against the pane fixtures: codex's overlay replaces
+/// the composer (false), cursor draws its composer disabled underneath (true).
+/// The hub input gate's expired-working guarded-recovery arm is derived from
+/// this flag — a wrong value is a silent auto-approval hole, not a cosmetic bug.
+pub fn composer_under_modal(kind: &RcKind) -> bool {
+    matches!(tool_for(kind), Some(AgentTool::Cursor))
 }
 
 // ---------------------------------------------------------------------------
@@ -1762,6 +1845,246 @@ mod tests {
             seen += 1;
         }
         assert!(seen > 0, "no state fixtures were exercised");
+    }
+
+    // ---- approval anchors (plan 010 H3; mirrors hub_pane_approvals_test.go +
+    //      cursor_approval_test.go's anchor-level tests — the hub-gate tests ride
+    //      the rc_hub port) ----
+
+    fn pane_fixture(name: &str) -> String {
+        let path = panes_dir().join(format!("{name}.txt"));
+        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()))
+    }
+
+    /// The whole pane line containing the anchor's first match — what
+    /// `firstAnchorLine` (`hub_reconcile.go:196`) reports as the row's text,
+    /// minus its sanitize step (the fixtures are clean text).
+    fn first_anchor_line<'p>(anchor: &Regex, pane: &'p str) -> &'p str {
+        let Some(m) = anchor.find(pane) else {
+            return "";
+        };
+        let start = pane[..m.start()].rfind('\n').map_or(0, |i| i + 1);
+        pane[start..].split('\n').next().unwrap_or("")
+    }
+
+    #[test]
+    fn approval_anchors_declared_for_exactly_codex_and_cursor() {
+        for kind in all_kinds() {
+            let want = matches!(kind, RcKind::Codex | RcKind::Cursor);
+            assert_eq!(
+                approval_anchor_for(&kind).is_some(),
+                want,
+                "{}",
+                kind.as_str()
+            );
+        }
+        assert!(composer_under_modal(&RcKind::Cursor));
+        assert!(!composer_under_modal(&RcKind::Codex));
+    }
+
+    /// Mirrors `TestCodexApprovalAnchorFixtures` (`hub_pane_approvals_test.go:33`).
+    #[test]
+    fn codex_approval_anchor_fixtures() {
+        let anchor = approval_anchor_for(&RcKind::Codex).unwrap();
+        for (fixture, want) in [
+            ("codex-ready-approval-exec", true),
+            ("codex-ready-approval-network", true), // selection arrowed onto row 4
+            ("codex-ready-approval-resolved", false),
+            ("codex-ready-approval-quoted", false),
+            ("codex-ready-tool-running", false),
+            ("codex-ready", false),
+            ("codex-needs-trust", false), // "1. Yes, continue" is a DIFFERENT widget
+        ] {
+            let pane = pane_fixture(fixture);
+            assert_eq!(anchor.is_match(&pane), want, "{fixture}");
+            if want {
+                // The row's text must be the option row itself, not the whole span.
+                let line = first_anchor_line(anchor, &pane);
+                assert!(
+                    !line.contains("Press enter") && line.contains(". "),
+                    "{fixture}: first_anchor_line = {line:?}, want the single option row"
+                );
+            }
+        }
+    }
+
+    /// Mirrors `TestCodexApprovalAnchorIgnoresHeadline` (`hub_pane_approvals_test.go:69`).
+    #[test]
+    fn codex_approval_anchor_ignores_headline() {
+        let anchor = approval_anchor_for(&RcKind::Codex).unwrap();
+        let headline = "  Would you like to run the following command?";
+        assert!(
+            pane_fixture("codex-ready-approval-resolved").contains(headline),
+            "test premise: the post-resolution fixture must still carry the headline"
+        );
+        assert!(
+            !anchor.is_match(headline),
+            "the headline alone must never match the anchor"
+        );
+    }
+
+    /// Mirrors `TestCursorApprovalAnchorFixtures` (`cursor_approval_test.go:17`).
+    #[test]
+    fn cursor_approval_anchor_fixtures() {
+        let anchor = approval_anchor_for(&RcKind::Cursor).unwrap();
+        for (fixture, want) in [
+            ("cursor-ready-approval-shell", true),
+            ("cursor-ready-approval-hook", true), // selection arrowed onto the LAST row
+            ("cursor-ready-approval-delete", true), // the one-word label set (Delete/Keep)
+            ("cursor-ready-approval-write", true), // no auto-run row; a dynamic Add Write(…)
+            ("cursor-ready-approval-fetch", true), // a dynamic Always allow <domain>
+            ("cursor-ready-approval-resolved", false),
+            ("cursor-ready-approval-quoted", false),
+            ("cursor-ready", false),
+            ("cursor-ready-active", false),
+            ("cursor-needs-auth", false),
+        ] {
+            let pane = pane_fixture(fixture);
+            assert_eq!(anchor.is_match(&pane), want, "{fixture}");
+            if want {
+                // The match starts on the widget's headline line — what the
+                // operator is being asked.
+                let line = first_anchor_line(anchor, &pane).trim();
+                assert!(
+                    line.ends_with('?') || line.starts_with("Hook requested approval:"),
+                    "{fixture}: first_anchor_line = {line:?}, want the headline line"
+                );
+            }
+        }
+    }
+
+    /// Mirrors `TestCursorApprovalAnchorCoversEveryDecisionSurface`
+    /// (`cursor_approval_test.go:60`). EXHAUSTIVENESS is a SAFETY property: a
+    /// surface whose rows do not match opens no episode, and the input gate is
+    /// then one expired-working verdict away from typing into the widget (a
+    /// posted "y" answers it). A cursor release that adds a surface fails HERE.
+    #[test]
+    fn cursor_approval_anchor_covers_every_decision_surface() {
+        let anchor = approval_anchor_for(&RcKind::Cursor).unwrap();
+        for (name, headline, option) in [
+            ("shell", "Run this command?", "   → Run (once) (y)"),
+            (
+                "shell/sandbox",
+                "Run this command outside the sandbox?",
+                "   → Run outside sandbox (once) (y)",
+            ),
+            (
+                "shell/allowlist",
+                "Run this command?",
+                "     Add Shell(npm test) to allowlist? (tab)",
+            ),
+            (
+                "shell/autorun",
+                "Run this command?",
+                "     Run Everything (shift+tab)",
+            ),
+            (
+                "shell/sandbox-autorun",
+                "Run this command?",
+                "     Run in Sandbox (shift+tab)",
+            ),
+            (
+                "shell/autorun-loading",
+                "Run this command?",
+                "     Checking Run Everything availability (loading)",
+            ),
+            ("mcp", "Run this MCP tool?", "     Allowlist MCP Tool (tab)"),
+            ("mcp/skip", "Run this MCP tool?", "     Skip (esc or n)"),
+            ("delete", "Delete this file?", "   → Delete (y)"),
+            ("delete/keep", "Delete this file?", "     Keep (n)"),
+            ("write", "Write to this file?", "   → Proceed (y)"),
+            (
+                "write/reject",
+                "Write to this file?",
+                "     Reject & propose changes (esc or n or p)",
+            ),
+            (
+                "write/allowlist",
+                "Write to this file?",
+                "     Add Write(/tmp/x.toml) to allowlist? (tab)",
+            ),
+            (
+                "write/allowlist-generic",
+                "Write to this file?",
+                "     Add to allowlist (tab)",
+            ),
+            ("search", "Allow this web search?", "   → Allow search (y)"),
+            ("fetch", "Allow this web fetch?", "   → Fetch (y)"),
+            (
+                "fetch/always",
+                "Allow this web fetch?",
+                "     Always allow example.com (tab)",
+            ),
+            ("edit", "Proceed with this edit?", "   → Proceed (y)"),
+            (
+                "hook",
+                "Hook requested approval: policy said no",
+                "   → Run (once) (y)",
+            ),
+        ] {
+            let pane = format!(" {headline}\n\n{option}\n");
+            assert!(
+                anchor.is_match(&pane),
+                "the {name} surface does not match the anchor:\n{pane}"
+            );
+        }
+    }
+
+    /// Mirrors `TestCursorApprovalAnchorNeedsBothHalves` (`cursor_approval_test.go:95`).
+    #[test]
+    fn cursor_approval_anchor_needs_both_halves() {
+        let anchor = approval_anchor_for(&RcKind::Cursor).unwrap();
+        let headline = " Run this command?";
+        let option_row = "   → Run (once) (y)";
+        assert!(
+            pane_fixture("cursor-ready-approval-resolved").contains("Run this command?"),
+            "test premise: the post-resolution fixture must still carry the headline"
+        );
+        assert!(
+            !anchor.is_match(&format!("{headline}\nsome unrelated line\n")),
+            "the headline alone must never match"
+        );
+        assert!(
+            !anchor.is_match(&format!("blah\n{option_row}\n")),
+            "an option row alone must never match"
+        );
+        // Markdown bullets are how an assistant lists the labels — never an
+        // accepted gutter.
+        assert!(
+            !anchor.is_match(" Run this command?\n - Run (once)\n"),
+            "a bulleted label must not satisfy the option-row half"
+        );
+        // The real widget: both halves, in order.
+        assert!(
+            anchor.is_match(&format!(
+                "{headline}\n Not in allowlist: ls\n\n{option_row}\n"
+            )),
+            "headline + option row must match"
+        );
+    }
+
+    /// Mirrors `TestComposerUnderModalMatchesTheFixtures` (`cursor_approval_test.go:201`):
+    /// the flag is a rendering FACT — codex's overlay replaces the composer (its
+    /// prompt anchor cannot match a dialog pane), cursor's is drawn disabled
+    /// underneath (its prompt anchor still matches).
+    #[test]
+    fn composer_under_modal_matches_the_fixtures() {
+        for (kind, fixture) in [
+            (RcKind::Codex, "codex-ready-approval-exec"),
+            (RcKind::Codex, "codex-ready-approval-network"),
+            (RcKind::Cursor, "cursor-ready-approval-shell"),
+            (RcKind::Cursor, "cursor-ready-approval-delete"),
+            (RcKind::Cursor, "cursor-ready-approval-write"),
+        ] {
+            let anchor = prompt_anchor_for(&kind)
+                .unwrap_or_else(|| panic!("{} must declare a PromptAnchor", kind.as_str()));
+            let composer_visible = anchor.is_match(&pane_fixture(fixture));
+            assert_eq!(
+                composer_visible,
+                composer_under_modal(&kind),
+                "{fixture}: composer visibility vs ComposerUnderModal"
+            );
+        }
     }
 
     // ---- slugs (mirrors Go TestGenSlug, rc_test.go:37) ----

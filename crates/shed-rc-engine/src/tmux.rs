@@ -204,30 +204,63 @@ impl<'a> Tmux<'a> {
 
     /// `tmux capture-pane -t <name> -p -S -200` — the visible frame plus
     /// [`CAPTURE_SCROLLBACK`] lines of history (`capturePane`, `tmux.go:75`).
-    ///
-    /// (Go's scrollback-free twin `captureVisiblePane` is NOT ported: its only
-    /// consumers are the hub's approval anchors, which stay Go this block.)
+    /// Scrollback is what makes lifecycle classification work; callers asking
+    /// "is a modal on screen NOW?" must use [`Self::capture_visible_pane`].
     pub fn capture_pane(&self, name: &str) -> TmuxResult {
         self.run(&["capture-pane", "-t", name, "-p", "-S", CAPTURE_SCROLLBACK])
     }
 
+    /// `tmux capture-pane -t <name> -p` — ONLY what is on screen right now, no
+    /// scrollback (`captureVisiblePane`, `tmux.go:88`).
+    ///
+    /// This is the capture ANY "is a modal on screen?" question must use:
+    /// scrollback is history — an approval dialog that was answered (or crashed
+    /// past, or reflowed away) stays there verbatim, so an anchor evaluated
+    /// against [`Self::capture_pane`] could report a dialog forever. The visible
+    /// frame IS the present tense. Consumers: the hub's approval anchors + the
+    /// pane-anchor episodes (plan 010).
+    pub fn capture_visible_pane(&self, name: &str) -> TmuxResult {
+        self.run(&["capture-pane", "-t", name, "-p"])
+    }
+
     /// The `rc-*` tmux session names (`listSessionNames`, `tmux.go:96`).
     ///
-    /// **Any listing failure reads as an empty list** — that is the one-shot
-    /// contract (Go keeps a `…Checked` variant for the hub's reconcile loop,
-    /// which must not mistake a transient tmux hiccup for "every session is
-    /// gone"; the hub is not ported, so neither is that variant).
+    /// **Any listing failure reads as an empty list** — the one-shot contract.
+    /// The hub's reconcile loop uses [`Self::list_session_names_checked`] so a
+    /// transient tmux hiccup is not mistaken for "every session is gone".
     pub fn list_session_names(&self) -> Vec<String> {
+        self.list_session_names_checked().unwrap_or_default()
+    }
+
+    /// The `rc-*` names, distinguishing a REAL empty (tmux answered "no server
+    /// running"/"no sessions" — killing the last session stops the server) from
+    /// a transient listing failure (tmux missing/hiccuping), returned as an
+    /// error so a stateful caller (the hub) keeps its tracked state instead of
+    /// treating every session as gone (`listSessionNamesChecked`, `tmux.go:106`).
+    pub fn list_session_names_checked(&self) -> Result<Vec<String>, String> {
         let res = self.run(&["ls", "-F", "#{session_name}"]);
         if res.code != 0 {
-            return Vec::new();
+            if is_missing_session(&res.stderr) {
+                return Ok(Vec::new()); // no server / no sessions: a genuine empty
+            }
+            return Err(format!("tmux ls failed: {}", res.stderr.trim()));
         }
-        res.stdout
+        Ok(res
+            .stdout
             .split('\n')
             .map(str::trim)
             .filter(|line| line.starts_with(TMUX_PREFIX))
             .map(str::to_string)
-            .collect()
+            .collect())
+    }
+
+    /// `tmux set-environment -t <name> <key> <value>` — the primitive under the
+    /// hub's `SHED_RC_AGENT_SESSION` correlation back-write
+    /// (`backWriteAgentSession`, `watch.go:411`). The best-effort +
+    /// control-char-guard POLICY stays with that hub caller; this is just the
+    /// verb.
+    pub fn set_environment(&self, name: &str, key: &str, value: &str) -> TmuxResult {
+        self.run(&["set-environment", "-t", name, key, value])
     }
 
     /// A session's `SHED_RC_*`-filtered `show-environment` dump
@@ -397,6 +430,65 @@ mod tests {
             ..Default::default()
         });
         assert!(Tmux::new(&f).list_session_names().is_empty());
+    }
+
+    // ---- the hub-facing checked/visible verbs (plan 010 H3) ----
+
+    #[test]
+    fn capture_visible_pane_argv_has_no_scrollback() {
+        let f = FakeTmux::ok();
+        Tmux::new(&f).capture_visible_pane("rc-x");
+        assert_eq!(f.calls()[0], vec!["capture-pane", "-t", "rc-x", "-p"]);
+    }
+
+    /// Mirrors `listSessionNamesChecked`'s three-way contract (`tmux.go:106`):
+    /// a no-server answer is a GENUINE empty, a transient failure is an error
+    /// (the hub must not treat every session as gone), and success filters to
+    /// the rc- prefix.
+    #[test]
+    fn list_session_names_checked_distinguishes_empty_from_transient() {
+        let gone = FakeTmux::new(|_| TmuxResult {
+            stderr: "no server running on /tmp/tmux".to_string(),
+            code: 1,
+            ..Default::default()
+        });
+        assert_eq!(
+            Tmux::new(&gone).list_session_names_checked().unwrap(),
+            Vec::<String>::new()
+        );
+
+        let hiccup = FakeTmux::new(|_| TmuxResult {
+            stderr: "error connecting to socket".to_string(),
+            code: 1,
+            ..Default::default()
+        });
+        let err = Tmux::new(&hiccup).list_session_names_checked().unwrap_err();
+        assert!(err.starts_with("tmux ls failed: "), "{err}");
+
+        let ok = FakeTmux::new(|_| TmuxResult {
+            stdout: "rc-aaa\nother\n".to_string(),
+            ..Default::default()
+        });
+        assert_eq!(
+            Tmux::new(&ok).list_session_names_checked().unwrap(),
+            vec!["rc-aaa"]
+        );
+    }
+
+    #[test]
+    fn set_environment_argv() {
+        let f = FakeTmux::ok();
+        Tmux::new(&f).set_environment("rc-x", "SHED_RC_AGENT_SESSION", "abc-123");
+        assert_eq!(
+            f.calls()[0],
+            vec![
+                "set-environment",
+                "-t",
+                "rc-x",
+                "SHED_RC_AGENT_SESSION",
+                "abc-123",
+            ]
+        );
     }
 
     #[test]

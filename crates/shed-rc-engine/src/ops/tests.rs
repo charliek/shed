@@ -8,9 +8,9 @@ use std::cell::Cell;
 use std::sync::Arc;
 
 use super::*;
+use crate::clock::Clock;
 use crate::fake::{env_from, home_env, FakeTmux};
 use crate::tmux::TmuxResult;
-use crate::clock::Clock;
 
 /// A pinned wall clock so `created_at` (and therefore the `new-session` argv) is
 /// deterministic.
@@ -1479,4 +1479,38 @@ fn real_bin_probe_answers_for_a_known_builtin_and_a_missing_binary() {
     assert!(real_bin_probe("sh", false));
     assert!(!real_bin_probe("definitely-not-a-real-binary-xyzzy", false));
     assert!(real_bin_probe("sh", true));
+}
+
+/// The checked captures' error mapping (`checkedCapture`, `ops.go:381`), on both
+/// the scrollback and visible-frame variants (plan 010 H3): a gone session is
+/// `SessionNotFound` (the hub's disappearance signal), a transient tmux failure
+/// stays a generic error (the hub must NOT prune tracked state on it).
+#[test]
+fn checked_captures_map_gone_vs_transient() {
+    let gone = FakeTmux::new(|_| TmuxResult {
+        stderr: "can't find session: rc-x".to_string(),
+        code: 1,
+        ..Default::default()
+    });
+    let t = Tmux::new(&gone);
+    assert!(matches!(
+        capture_pane_checked(&t, "rc-x"),
+        Err(EngineError::SessionNotFound(_))
+    ));
+    assert!(matches!(
+        capture_visible_pane_checked(&t, "rc-x"),
+        Err(EngineError::SessionNotFound(_))
+    ));
+    assert_eq!(gone.calls()[1], vec!["capture-pane", "-t", "rc-x", "-p"]);
+
+    let hiccup = FakeTmux::new(|_| TmuxResult {
+        stderr: "server exited unexpectedly".to_string(),
+        code: 1,
+        ..Default::default()
+    });
+    let t = Tmux::new(&hiccup);
+    assert!(matches!(
+        capture_visible_pane_checked(&t, "rc-x"),
+        Err(EngineError::Other(_))
+    ));
 }

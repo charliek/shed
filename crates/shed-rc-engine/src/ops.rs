@@ -17,7 +17,7 @@ use shed_core::rc_agents::{
 
 use super::plan::{compose_plan_kickoff, validate_plan_inputs, write_plan};
 use super::text::{has_unsafe_prompt_chars, normalize_newlines, quote_go};
-use super::tmux::{is_duplicate_session, is_missing_session, Tmux, TmuxRunner};
+use super::tmux::{is_duplicate_session, is_missing_session, Tmux, TmuxResult, TmuxRunner};
 use crate::clock::{system_clock, ClockRef};
 
 // ---------------------------------------------------------------------------
@@ -48,7 +48,8 @@ const AGENT_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 /// `create` spawn a detached daemon on the fixed loopback port. **The literal is
 /// cross-implementation contract** — the Go binary reads the same variable, so
 /// one switch neutralizes both sides symmetrically. Duplicated here rather than
-/// imported because the hub itself is not ported (plan 009 §3.1).
+/// imported because it gates the ENSURE hook, not the hub (the Rust hub lives
+/// in shed-broker's rc_hub — plan 010).
 pub const ENV_NO_HUB: &str = "SHED_RC_NO_HUB";
 
 /// The engine's LAST-RESORT `created_by` when a caller supplies none
@@ -129,6 +130,40 @@ impl std::fmt::Display for EngineError {
 }
 
 impl std::error::Error for EngineError {}
+
+// ---------------------------------------------------------------------------
+// checked captures (ops.go:355-390) — shared by the one-shot verbs and the hub
+// ---------------------------------------------------------------------------
+
+/// Map a capture-pane [`TmuxResult`] onto text-or-error: a gone session becomes
+/// [`EngineError::SessionNotFound`] so callers can tell it from a transient
+/// tmux failure (`checkedCapture`, `ops.go:381`).
+fn checked_capture(res: TmuxResult, name: &str) -> Result<String, EngineError> {
+    if res.code != 0 {
+        if is_missing_session(&res.stderr) {
+            return Err(EngineError::SessionNotFound(name.to_string()));
+        }
+        return Err(EngineError::Other(format!(
+            "tmux capture-pane failed: {}",
+            res.stderr.trim()
+        )));
+    }
+    Ok(res.stdout)
+}
+
+/// A session's pane text — visible frame + 200 lines of scrollback — with the
+/// gone-session mapping (`capturePaneChecked`, `ops.go:367`). Free-standing so
+/// the hub (plan 010) shares it without holding an [`Engine`].
+pub fn capture_pane_checked(tmux: &Tmux, name: &str) -> Result<String, EngineError> {
+    checked_capture(tmux.capture_pane(name), name)
+}
+
+/// The VISIBLE-FRAME twin (`captureVisiblePaneChecked`, `ops.go:373`), same
+/// error mapping — used wherever scrollback would be a lie about the present
+/// (the ApprovalAnchor evaluations).
+pub fn capture_visible_pane_checked(tmux: &Tmux, name: &str) -> Result<String, EngineError> {
+    checked_capture(tmux.capture_visible_pane(name), name)
+}
 
 // ---------------------------------------------------------------------------
 // injected seams
@@ -816,17 +851,7 @@ impl<'a> Engine<'a> {
     /// shared by probe/prompt/accept-trust, which is what makes all three exit 4
     /// on a missing slug.
     fn capture_pane_checked(&self, name: &str) -> Result<String, EngineError> {
-        let res = self.tmux.capture_pane(name);
-        if res.code != 0 {
-            if is_missing_session(&res.stderr) {
-                return Err(EngineError::SessionNotFound(name.to_string()));
-            }
-            return Err(EngineError::Other(format!(
-                "tmux capture-pane failed: {}",
-                res.stderr.trim()
-            )));
-        }
-        Ok(res.stdout)
+        capture_pane_checked(&self.tmux, name)
     }
 
     /// Capture a session's pane + env and parse it into a DTO (`loadSession`,

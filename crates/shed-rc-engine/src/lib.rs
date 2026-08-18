@@ -82,8 +82,9 @@ pub use capabilities::{
 pub use clock::{system_clock, Clock, ClockRef, SystemClock};
 pub use netutil::free_loopback_port;
 pub use ops::{
-    real_bin_probe, CreateOptions, Engine, EngineError, GetEnv, PromptOptions, DEFAULT_CREATED_BY,
-    DEFAULT_POLL_EVERY, DEFAULT_WAIT_TIMEOUT, ENV_NO_HUB, PROMPT_DELIVER_SETTLE,
+    capture_pane_checked, capture_visible_pane_checked, real_bin_probe, CreateOptions, Engine,
+    EngineError, GetEnv, PromptOptions, DEFAULT_CREATED_BY, DEFAULT_POLL_EVERY,
+    DEFAULT_WAIT_TIMEOUT, ENV_NO_HUB, PROMPT_DELIVER_SETTLE,
 };
 pub use plan::{compose_plan_kickoff, plan_from_bytes, plan_path, PLAN_MAX_BYTES};
 pub use preseed::{dispatch as preseed_for_kind, PreseedError};
