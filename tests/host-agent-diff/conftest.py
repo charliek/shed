@@ -460,7 +460,17 @@ def daemon(binaries, tmp_path_factory):
         source = root / "nonexistent-discovery.yaml"
         config_path = root / "extensions.yaml"
         log_path = root / "op.log"
-        config_path.write_text(config_text.format(audit_log=audit_log, source=source))
+        # HERMETIC: disable the machine rc-hub role (plan 010 H11) for every
+        # harness daemon — the role would otherwise bind the REAL fixed
+        # loopback port (1029, conflicting with a genuinely running hub and
+        # with parallel runs) and reconcile against the developer's real tmux
+        # server. Appended unconditionally: no scenario template sets the key,
+        # and the harness owns this decision rather than negotiating with one.
+        # The role's own surfaces are covered by unit tests + the status
+        # goldens, which pin the `disabled` report.
+        config = config_text.format(audit_log=audit_log, source=source)
+        config += "\nrc_hub:\n  enabled: false\n"
+        config_path.write_text(config)
 
         # Install the committed ed25519 key into this daemon's isolated
         # `<HOME>/.ssh/id_ed25519` (dir 0700, file 0600) BEFORE launch, so a

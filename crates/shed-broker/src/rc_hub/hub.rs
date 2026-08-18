@@ -927,6 +927,219 @@ pub fn bind_hub_listener(addr: &str) -> std::io::Result<(Option<std::net::TcpLis
 }
 
 // ---------------------------------------------------------------------------
+// The identity handshake CLIENT (`queryHubHealth`/`probeHubIdentity`,
+// hub.go:916-956) — used by the host-agent's mixed-fleet bind retry (H11) and
+// sx's ensure-hub probe (H13). Sync std networking on purpose: both callers
+// probe from outside the hub's own runtime (the bind-retry task wraps it in
+// spawn_blocking; sx has no runtime at all).
+//
+// TWO accepted deltas vs Go's `net/http` client, both harmless for the
+// loopback identity check this is:
+//
+//   - NO redirect following (Go's default client follows up to 10). A 3xx from
+//     the port holder reads as "not a hub" — the real hub answers 200 inline,
+//     and a redirecting squatter is exactly what we want to refuse.
+//   - NUMERIC addresses only: `addr` is parsed as a `SocketAddr`, never
+//     resolved through DNS. Every caller is loopback-enforced (`HUB_ADDR`, or
+//     a `SHED_RC_HUB_ADDR` that [`apply_hub_env_overrides`] has already pinned
+//     to 127.0.0.1), so there is no name to resolve.
+// ---------------------------------------------------------------------------
+
+/// The head/body byte caps. Go bounds the DECODED body with
+/// `io.LimitReader(resp.Body, 4096)`; `net/http` bounds the response head
+/// separately (`MaxResponseHeaderBytes`). 8 KiB of head is far more than a
+/// health answer needs and keeps a hostile holder from growing our buffer.
+const PROBE_HEAD_CAP: usize = 8192;
+const PROBE_BODY_CAP: usize = 4096;
+
+/// The PROBE's decode of `/v1/health` — deliberately narrower than the
+/// serialized [`HubHealth`] (whose shape is frozen and unchanged): the
+/// identity decision reads `app` and nothing else, so `version`/`pid` are not
+/// declared at all. serde ignores unknown fields, which reproduces Go's
+/// tolerance — `json.Decoder` zero-fills an absent `version`, and its
+/// `PID int` accepts a negative pid — without carrying two never-read fields.
+/// (It is tolerant of a `pid` that isn't even a number, where Go's decoder
+/// would type-error into "not a hub"; no hub emits that, and erring toward
+/// "this IS a hub" only ever makes the bind-retry back off politely.)
+#[derive(serde::Deserialize)]
+struct HubHealthProbe {
+    #[serde(default)]
+    app: String,
+}
+
+/// The remaining slice of an ABSOLUTE probe deadline (`None` once elapsed;
+/// zero is folded into `None` because std rejects a zero socket timeout).
+///
+/// The budget is TOTAL, exactly like Go's `http.Client{Timeout}`, which covers
+/// dial + write + the whole body read. Re-arming each read with the full
+/// timeout instead would let a slow drip (one byte per timeout-minus-epsilon)
+/// hold the probe open indefinitely — and, through the host-agent's bind-retry
+/// task, hold up daemon shutdown.
+fn remaining(deadline: std::time::Instant) -> Option<Duration> {
+    let left = deadline.checked_duration_since(std::time::Instant::now())?;
+    (!left.is_zero()).then_some(left)
+}
+
+/// ONE identity check against `addr`'s /v1/health (`queryHubHealth`,
+/// `hub.go:916`):
+///
+/// - `Ok(true)`  — a live hub answered with `app == HUB_APP_ID`;
+/// - `Ok(false)` — SOMETHING is listening but it is not a hub;
+/// - `Err(_)`    — nothing answered at all (connection refused / timeout).
+///
+/// The raw TCP dial exists only to split "nothing listening" from "listening
+/// but not a hub" — a mere successful dial is never treated as a hub (the
+/// identity comes from the HTTP handshake, not the port being open).
+///
+/// `timeout` is the TOTAL budget for the whole exchange (see [`remaining`]);
+/// running out of it after something answered is "listening, but not speaking
+/// our HTTP" → `Ok(false)`, matching Go, where a `client.Get` timeout takes
+/// the same error arm.
+pub fn query_hub_health(addr: &str, timeout: Duration) -> std::io::Result<bool> {
+    let deadline = std::time::Instant::now() + timeout;
+    let sock_addr = addr
+        .parse::<std::net::SocketAddr>()
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+    let Some(dial_budget) = remaining(deadline) else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "probe budget elapsed",
+        ));
+    };
+    let conn = std::net::TcpStream::connect_timeout(&sock_addr, dial_budget)?;
+    drop(conn);
+
+    // The HTTP handshake. Any failure past the dial — connect refused mid-way,
+    // a non-HTTP answer, a non-200, a body that isn't the health JSON, or the
+    // budget running out — reads as "listening, but not a hub" (Ok(false)),
+    // exactly Go's client.Get error arm.
+    Ok(probe_health(&sock_addr, addr, deadline).unwrap_or(false))
+}
+
+/// The HTTP half of [`query_hub_health`]: `None`/`Some(false)` both mean "not
+/// a hub"; every step is bounded by the shared absolute `deadline`.
+fn probe_health(
+    sock_addr: &std::net::SocketAddr,
+    host: &str,
+    deadline: std::time::Instant,
+) -> Option<bool> {
+    use std::io::{Read, Write};
+    let mut conn = std::net::TcpStream::connect_timeout(sock_addr, remaining(deadline)?).ok()?;
+    conn.set_read_timeout(Some(remaining(deadline)?)).ok()?;
+    conn.set_write_timeout(Some(remaining(deadline)?)).ok()?;
+    conn.write_all(
+        format!("GET /v1/health HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n").as_bytes(),
+    )
+    .ok()?;
+
+    // Bounded read: the head cap, the body cap, and a little chunked-framing
+    // overhead. `Connection: close` makes the hub end the body with EOF.
+    let wire_cap = PROBE_HEAD_CAP + PROBE_BODY_CAP + 256;
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 2048];
+    while buf.len() < wire_cap {
+        // Re-arm with what is LEFT of the total budget, never the full timeout.
+        let Some(left) = remaining(deadline) else {
+            return Some(false); // out of budget: it answered, but not in time
+        };
+        if conn.set_read_timeout(Some(left)).is_err() {
+            break;
+        }
+        match conn.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+            Err(_) => break, // timeout / reset: judge what we already have
+        }
+    }
+
+    let split = find_subslice(&buf, b"\r\n\r\n")?;
+    if split > PROBE_HEAD_CAP {
+        return Some(false);
+    }
+    let head = String::from_utf8_lossy(&buf[..split]).into_owned();
+    let mut lines = head.split("\r\n");
+    let status: u16 = lines.next()?.split_whitespace().nth(1)?.parse().ok()?;
+    if status != 200 {
+        return Some(false);
+    }
+    let chunked = lines.any(|line| match line.split_once(':') {
+        Some((k, v)) => {
+            k.trim().eq_ignore_ascii_case("transfer-encoding")
+                && v.split(',')
+                    .any(|t| t.trim().eq_ignore_ascii_case("chunked"))
+        }
+        None => false,
+    });
+    let raw_body = &buf[split + 4..];
+    let body = if chunked {
+        dechunk(raw_body, PROBE_BODY_CAP)?
+    } else {
+        raw_body.to_vec()
+    };
+    // Go's `io.LimitReader(resp.Body, 4096)`, applied to the DECODED body.
+    let body = &body[..body.len().min(PROBE_BODY_CAP)];
+    // The FIRST JSON value only: Go's `Decoder.Decode` stops at the end of the
+    // first value and never looks at what trails it.
+    let hh: HubHealthProbe = serde_json::Deserializer::from_slice(body)
+        .into_iter()
+        .next()?
+        .ok()?;
+    Some(hh.app == HUB_APP_ID)
+}
+
+fn find_subslice(hay: &[u8], needle: &[u8]) -> Option<usize> {
+    hay.windows(needle.len()).position(|w| w == needle)
+}
+
+/// Minimal `Transfer-Encoding: chunked` decode (`net/http` does this for Go).
+/// Chunk extensions are ignored, a truncated wire yields what arrived, and
+/// malformed framing is `None` → "not a hub".
+fn dechunk(mut body: &[u8], cap: usize) -> Option<Vec<u8>> {
+    let mut out = Vec::new();
+    while out.len() < cap {
+        let idx = find_subslice(body, b"\r\n")?;
+        let size_line = std::str::from_utf8(&body[..idx]).ok()?;
+        let n = usize::from_str_radix(size_line.split(';').next()?.trim(), 16).ok()?;
+        body = &body[idx + 2..];
+        if n == 0 {
+            break; // terminal chunk (any trailer is irrelevant here)
+        }
+        let take = n.min(body.len());
+        out.extend_from_slice(&body[..take]);
+        if take < n {
+            break; // truncated by EOF / the wire cap
+        }
+        body = &body[n..];
+        if body.starts_with(b"\r\n") {
+            body = &body[2..];
+        }
+    }
+    Some(out)
+}
+
+/// Polls `addr` until a VERIFIED hub answers /v1/health or the budget elapses
+/// (`probeHubIdentity`, `hub.go:943`). A foreign listener fails fast with a
+/// clear error — it will never become a hub. Each attempt gets Go's 500 ms,
+/// clamped to what is left so the CALLER's budget is the hard ceiling.
+pub fn probe_hub_identity(addr: &str, budget: Duration) -> Result<(), String> {
+    let deadline = std::time::Instant::now() + budget;
+    while let Some(left) = remaining(deadline) {
+        match query_hub_health(addr, left.min(Duration::from_millis(500))) {
+            Ok(true) => return Ok(()),
+            Ok(false) => {
+                return Err(format!(
+                    "port {addr} is held by another process that is not a shed rc hub"
+                ));
+            }
+            Err(_) => std::thread::sleep(Duration::from_millis(20).min(left)),
+        }
+    }
+    Err(format!(
+        "rc hub did not come up on {addr} within the probe budget"
+    ))
+}
+
+// ---------------------------------------------------------------------------
 // The sanctioned env seams (plan 010 §2.5 — `clirc.applyHubEnvOverrides`,
 // clirc.go:596; the Rust hub honors the SAME variables so the Go↔Rust
 // differential harness runs both implementations on distinct ephemeral ports
@@ -960,17 +1173,23 @@ pub fn apply_hub_env_overrides(
 ) {
     let addr = getenv(ENV_HUB_ADDR);
     if !addr.is_empty() {
-        let valid = addr.rsplit_once(':').is_some_and(|(host, port)| {
+        // NORMALIZED at acceptance: the stored value is what gets bound and
+        // dialed, and neither `TcpListener::bind` nor `SocketAddr::parse`
+        // accepts a bracketed IPv4 literal — storing "[127.0.0.1]:80" verbatim
+        // would leave the role retrying a bind that can never succeed.
+        let normalized = addr.rsplit_once(':').and_then(|(host, port)| {
             // net.SplitHostPort strips a bracketed host ("[127.0.0.1]:80" is
             // accepted by Go — H10 review LOW).
             let host = host
                 .strip_prefix('[')
                 .and_then(|h| h.strip_suffix(']'))
                 .unwrap_or(host);
-            host == "127.0.0.1" && port.parse::<u32>().is_ok_and(|p| (1..=65535).contains(&p))
+            let ok =
+                host == "127.0.0.1" && port.parse::<u32>().is_ok_and(|p| (1..=65535).contains(&p));
+            ok.then(|| format!("{host}:{port}"))
         });
-        if valid {
-            cfg.addr = addr;
+        if let Some(normalized) = normalized {
+            cfg.addr = normalized;
         } else {
             note(&format!(
                 "ignoring {ENV_HUB_ADDR}={addr:?}: must be 127.0.0.1:<port 1-65535>"

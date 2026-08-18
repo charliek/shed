@@ -38,7 +38,32 @@ pub struct LiveStatus {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub gate_namespaces: Vec<String>,
     pub approval_channel: ApprovalChannelStatus,
+    /// The machine rc-hub role's state (plan 010 H11). `#[serde(default)]` on
+    /// the DECODE side is version skew: a new `status` CLI talking to an old
+    /// daemon that predates the field must render the rest of the snapshot,
+    /// not exit 1 on a missing key. (Encoding is unconditional — a current
+    /// daemon always reports it.)
+    #[serde(default)]
+    pub rc_hub: RcHubStatus,
     pub servers: Vec<ServerHealth>,
+}
+
+/// The rc-hub role's self-report (plan 010 §2.6).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RcHubStatus {
+    /// `listening` (serving on `addr`), `deferred` (the port is held — the Go
+    /// machine hub during the mixed window, or a squatter — and the role is
+    /// retrying; it is also the state for the instant before the role's first
+    /// bind attempt), or `disabled` (`rc_hub.enabled` resolved false).
+    ///
+    /// EMPTY is the decode-only default: an old daemon that predates the field
+    /// reports no rc-hub state at all, which is not the same as `disabled` —
+    /// the text renderer omits the line rather than claiming either.
+    #[serde(default)]
+    pub state: String,
+    /// The bind/dial address (present unless disabled).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub addr: String,
 }
 
 /// `ApprovalChannelStatus` describes the approval-channel socket and its current
@@ -83,6 +108,7 @@ pub fn build_live_status(
     started_at: &str,
     version: &str,
     consumer: Option<(String, String)>,
+    rc_hub: RcHubStatus,
     servers: Vec<ServerHealth>,
 ) -> LiveStatus {
     // Keyed by the fixed status/gate namespace order; the BTreeMap re-sorts on
@@ -112,6 +138,7 @@ pub fn build_live_status(
             client_name,
             client_version,
         },
+        rc_hub,
         servers,
     }
 }
@@ -350,6 +377,10 @@ mod tests {
                 client_name: "ShedDesktop".to_string(),
                 client_version: "1.2.0".to_string(),
             },
+            rc_hub: RcHubStatus {
+                state: "listening".to_string(),
+                addr: "127.0.0.1:1029".to_string(),
+            },
             servers: vec![ServerHealth {
                 name: "mac".to_string(),
                 url: "http://localhost:8080".to_string(),
@@ -401,6 +432,10 @@ mod tests {
                 client_name: String::new(),
                 client_version: String::new(),
             },
+            rc_hub: RcHubStatus {
+                state: "listening".to_string(),
+                addr: "127.0.0.1:1029".to_string(),
+            },
             servers: vec![],
         };
         let compact = serde_json::to_string(&ls).unwrap();
@@ -413,5 +448,42 @@ mod tests {
             compact.contains("\"consumer_connected\":false"),
             "{compact}"
         );
+        // The rc-hub block is NOT omitempty — a current daemon always reports it.
+        assert!(
+            compact.contains("\"rc_hub\":{\"state\":\"listening\""),
+            "{compact}"
+        );
+    }
+
+    /// Decode-side version skew (plan 010 H11): a snapshot from a daemon that
+    /// predates `rc_hub` must still decode — the new `status` CLI renders the
+    /// rest instead of exiting 1 — and the missing field reads as "unreported"
+    /// (empty state), never as `disabled`.
+    #[test]
+    fn snapshot_without_rc_hub_still_decodes() {
+        let ls = LiveStatus {
+            schema: STATUS_SCHEMA_VERSION,
+            version: "v1".to_string(),
+            pid: 1,
+            started_at: String::new(),
+            written_at: String::new(),
+            config_path: String::new(),
+            policies: policies(&[("ssh-agent", "deny-all")]),
+            gate_namespaces: vec![],
+            approval_channel: ApprovalChannelStatus {
+                socket_path: "/s".to_string(),
+                consumer_connected: false,
+                client_name: String::new(),
+                client_version: String::new(),
+            },
+            rc_hub: RcHubStatus::default(),
+            servers: vec![],
+        };
+        let mut v: serde_json::Value = serde_json::to_value(&ls).unwrap();
+        v.as_object_mut().unwrap().remove("rc_hub");
+        let back: LiveStatus = serde_json::from_value(v).expect("old snapshot decodes");
+        assert_eq!(back.rc_hub, RcHubStatus::default());
+        assert!(back.rc_hub.state.is_empty(), "unreported, not `disabled`");
+        assert_eq!(back, ls);
     }
 }

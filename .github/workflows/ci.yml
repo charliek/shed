@@ -140,6 +140,10 @@ jobs:
               # side of the hub differential family — from H4 on, so a
               # broker-only PR must not skip the wire gate.
               - 'crates/shed-broker/**'
+              # From H11 the shed-host-agent bin MOUNTS the hub (the `rc-hub`
+              # debug subcommand is the harness's Rust leg from H12), so a
+              # bin-only change must run the wire gate too.
+              - 'crates/shed-host-agent/**'
               - 'crates/sx/**'
               - 'crates/Cargo.toml'
               - 'crates/Cargo.lock'

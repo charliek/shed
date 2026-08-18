@@ -14,8 +14,8 @@ use reqwest::Method;
 use shed_core::rc::{RcActivity, RcKind};
 
 use super::hub::{
-    apply_hub_env_overrides, bind_hub_listener, Hub, HubConfig, HubSessionsResponse,
-    ENV_HUB_ACTIVE_MS, ENV_HUB_ADDR,
+    apply_hub_env_overrides, bind_hub_listener, probe_hub_identity, query_hub_health, Hub,
+    HubConfig, HubSessionsResponse, ENV_HUB_ACTIVE_MS, ENV_HUB_ADDR,
 };
 use super::hub_test_support::{
     codex_ready_pane, do_request, http_client, hub_config, managed_env, new_test_hub,
@@ -2483,7 +2483,10 @@ async fn query_params_first_occurrence_wins() {
 }
 
 // H10 review LOW pin: net.SplitHostPort strips a bracketed host, so
-// SHED_RC_HUB_ADDR=[127.0.0.1]:80 is accepted (loopback) on both sides.
+// SHED_RC_HUB_ADDR=[127.0.0.1]:80 is accepted (loopback) on both sides — and
+// H11 review LOW: it is NORMALIZED at acceptance, because the stored value is
+// what std binds and dials, and neither accepts brackets around an IPv4
+// literal.
 #[test]
 fn env_addr_accepts_bracketed_loopback() {
     let mut cfg = hub_config(&HubTmux::new(), &HubClock::new());
@@ -2497,5 +2500,213 @@ fn env_addr_accepts_bracketed_loopback() {
     };
     apply_hub_env_overrides(&mut cfg, &env, &mut |_| noted = true);
     assert!(!noted, "a bracketed loopback host must not be rejected");
-    assert_eq!(cfg.addr, "[127.0.0.1]:80");
+    assert_eq!(cfg.addr, "127.0.0.1:80", "brackets stripped at acceptance");
+    assert!(
+        cfg.addr.parse::<std::net::SocketAddr>().is_ok(),
+        "the stored addr must be bindable/dialable as-is"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The identity handshake CLIENT (`queryHubHealth`/`probeHubIdentity`,
+// hub.go:916-956). These live here — beside the hub they probe — rather than in
+// the host-agent bin, so `cargo test -p shed-broker` covers the client half of
+// the frozen wire.
+// ---------------------------------------------------------------------------
+
+/// A canned-response HTTP holder: every accepted connection gets `response`
+/// verbatim and is then closed. `query_hub_health` dials twice (the raw
+/// identity dial, then the HTTP one), so it serves a few.
+fn canned_health_server(response: String) -> String {
+    let ln = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = ln.local_addr().expect("addr").to_string();
+    std::thread::spawn(move || {
+        use std::io::Write;
+        for conn in ln.incoming().flatten().take(4) {
+            let mut conn = conn;
+            let _ = conn.write_all(response.as_bytes());
+        }
+    });
+    addr
+}
+
+fn http_200(body: &str) -> String {
+    format!(
+        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    )
+}
+
+/// A free loopback address with nothing listening on it.
+fn dead_addr() -> String {
+    let ln = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = ln.local_addr().expect("addr").to_string();
+    drop(ln);
+    addr
+}
+
+// The three-way answer: a REAL hub → true, a listening non-hub → false ("it
+// answered, but it is not us"), nothing listening → Err.
+#[tokio::test(flavor = "multi_thread")]
+async fn query_hub_health_classifies_hub_squatter_nothing() {
+    let (url, _s) = serve_hub(&Arc::new(new_test_hub(&HubTmux::new(), &HubClock::new()))).await;
+    let hub_addr = url.trim_start_matches("http://").to_string();
+    let verdict = tokio::task::spawn_blocking(move || {
+        query_hub_health(&hub_addr, Duration::from_secs(2)).unwrap()
+    })
+    .await
+    .unwrap();
+    assert!(verdict, "a real hub answers its own identity handshake");
+
+    let squat = canned_health_server("not http at all\n".to_string());
+    let verdict = tokio::task::spawn_blocking(move || {
+        query_hub_health(&squat, Duration::from_secs(2)).unwrap()
+    })
+    .await
+    .unwrap();
+    assert!(!verdict, "a listening non-hub is Ok(false), never an error");
+
+    let dead = dead_addr();
+    let err = tokio::task::spawn_blocking(move || query_hub_health(&dead, Duration::from_secs(2)));
+    assert!(
+        err.await.unwrap().is_err(),
+        "nothing listening is the error arm"
+    );
+}
+
+// H11 review HIGH: the budget is ABSOLUTE. A holder dripping one byte per
+// (timeout - epsilon) keeps every individual read "successful", so a per-read
+// timeout would never fire — Go's http.Client Timeout covers the whole
+// exchange, and so does ours.
+#[test]
+fn query_hub_health_honors_an_absolute_deadline_against_a_drip() {
+    let ln = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = ln.local_addr().expect("addr").to_string();
+    std::thread::spawn(move || {
+        use std::io::Write;
+        for conn in ln.incoming().flatten().take(4) {
+            std::thread::spawn(move || {
+                let mut conn = conn;
+                // FASTER than the whole budget (200ms drip vs a 250ms budget)
+                // — that is the attack: every individual read completes, so a
+                // per-read timeout re-arms forever. Capped at 20 drips (4s) so
+                // the thread can never outlive the suite.
+                for _ in 0..20 {
+                    if conn.write_all(b"H").is_err() {
+                        return;
+                    }
+                    let _ = conn.flush();
+                    std::thread::sleep(Duration::from_millis(200));
+                }
+            });
+        }
+    });
+
+    let budget = Duration::from_millis(250);
+    let started = std::time::Instant::now();
+    let verdict = query_hub_health(&addr, budget).expect("something IS listening");
+    let elapsed = started.elapsed();
+    assert!(!verdict, "a dripping holder is not a hub");
+    // A per-read timeout would run the full 20-drip (4s) script here.
+    assert!(
+        elapsed < budget * 4,
+        "the probe must respect its total budget (took {elapsed:?} of a {budget:?} budget)"
+    );
+}
+
+// probe_hub_identity: a verified hub → Ok; a foreign listener → fast error;
+// nothing listening → the budget is the ceiling, not a suggestion.
+#[tokio::test(flavor = "multi_thread")]
+async fn probe_hub_identity_verified_foreign_and_budgeted() {
+    let (url, _s) = serve_hub(&Arc::new(new_test_hub(&HubTmux::new(), &HubClock::new()))).await;
+    let hub_addr = url.trim_start_matches("http://").to_string();
+    tokio::task::spawn_blocking(move || {
+        probe_hub_identity(&hub_addr, Duration::from_secs(3)).expect("verified hub")
+    })
+    .await
+    .unwrap();
+
+    let squat = canned_health_server("HTTP/1.1 500 Nope\r\nContent-Length: 0\r\n\r\n".to_string());
+    let err = tokio::task::spawn_blocking(move || {
+        probe_hub_identity(&squat, Duration::from_secs(3)).unwrap_err()
+    })
+    .await
+    .unwrap();
+    assert!(err.contains("not a shed rc hub"), "{err}");
+
+    let dead = dead_addr();
+    let (err, elapsed) = tokio::task::spawn_blocking(move || {
+        let started = std::time::Instant::now();
+        let err = probe_hub_identity(&dead, Duration::from_millis(300)).unwrap_err();
+        (err, started.elapsed())
+    })
+    .await
+    .unwrap();
+    assert!(err.contains("did not come up"), "{err}");
+    assert!(
+        elapsed < Duration::from_millis(1500),
+        "the budget bounds the poll loop (took {elapsed:?})"
+    );
+}
+
+// The probe decode is as tolerant as Go's `json.Decoder` + `LimitReader`:
+// trailing bytes after the first JSON value are ignored, a chunked body is
+// de-chunked, and `version`/`pid` are never load-bearing (absent, or negative
+// — Go's `PID int` accepts both).
+#[test]
+fn probe_decode_tolerates_trailing_chunked_and_odd_pid() {
+    let hub_body = r#"{"app":"shed-rc-hub","version":"t","pid":1}"#;
+    let cells: Vec<(&str, String)> = vec![
+        (
+            "trailing garbage after the first value",
+            http_200(&format!("{hub_body} NOT JSON AT ALL")),
+        ),
+        (
+            "absent pid",
+            http_200(r#"{"app":"shed-rc-hub","version":"t"}"#),
+        ),
+        (
+            "negative pid",
+            http_200(r#"{"app":"shed-rc-hub","version":"t","pid":-1}"#),
+        ),
+        (
+            "absent version and pid",
+            http_200(r#"{"app":"shed-rc-hub"}"#),
+        ),
+        ("chunked body", {
+            let (a, b) = hub_body.split_at(10);
+            format!(
+                "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n\
+                 {:x}\r\n{a}\r\n{:x}\r\n{b}\r\n0\r\n\r\n",
+                a.len(),
+                b.len()
+            )
+        }),
+    ];
+    for (name, response) in cells {
+        let addr = canned_health_server(response);
+        assert!(
+            query_hub_health(&addr, Duration::from_secs(2)).unwrap(),
+            "{name}: must still read as a hub"
+        );
+    }
+
+    // …and the refusals stay refusals.
+    for (name, response) in [
+        (
+            "non-200",
+            "HTTP/1.1 503 Nope\r\nContent-Length: 0\r\n\r\n".to_string(),
+        ),
+        ("wrong app", http_200(r#"{"app":"something-else","pid":1}"#)),
+        (
+            "no body at all",
+            "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n".to_string(),
+        ),
+    ] {
+        let addr = canned_health_server(response);
+        assert!(
+            !query_hub_health(&addr, Duration::from_secs(2)).unwrap(),
+            "{name}: must not read as a hub"
+        );
+    }
 }

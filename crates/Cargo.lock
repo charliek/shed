@@ -3352,6 +3352,7 @@ dependencies = [
  "serde_json",
  "shed-broker",
  "shed-core",
+ "shed-rc-engine",
  "tempfile",
  "tokio",
  "uuid",

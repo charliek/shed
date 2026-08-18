@@ -419,6 +419,10 @@ pub struct HostAgentConfig {
     /// (commit 3); in commit 1 only the config tests + the docker_resolve golden
     /// read it.
     pub docker: DockerConfig,
+    /// Whether the daemon hosts the machine rc hub (plan 010 §2.6 —
+    /// `rc_hub.enabled`, default true; any scalar [`parse_yaml_bool`] resolves
+    /// to false disables, anything unresolvable leaves it on).
+    pub rc_hub_enabled: bool,
 }
 
 impl HostAgentConfig {
@@ -562,6 +566,19 @@ impl HostAgentConfig {
                 Some(dc)
             }
         };
+        // The machine rc-hub role knob (plan 010 §2.6): `rc_hub.enabled`, default
+        // TRUE — an additive key old configs don't carry (the reader is
+        // unknown-key-tolerant, so its absence is the common case). The scalar goes
+        // through [`parse_yaml_bool`], the house YAML-1.1 bool vocabulary (the D2
+        // fix), so `no`/`off`/`n`/`False` disable it exactly like `false` does; a
+        // value yaml.v3 would NOT resolve to a bool (`nonsense`, `1`, `0`, a quoted
+        // `'false'`) — and an absent key, a null, or a non-scalar — leaves the role
+        // ON. Fail-open by design: the hub is loopback-only and this knob exists to
+        // opt OUT, so an unreadable value must never silently disable it.
+        let rc_hub_enabled = root
+            .get_path(&["rc_hub", "enabled"])
+            .and_then(parse_yaml_bool)
+            .unwrap_or(true);
         // Deprecated `desktop.*` keys are IGNORED but must not be ignored SILENTLY —
         // Go's `warnDeprecatedDesktopKeys` logs one line per key that is set, and the
         // two daemons are maintained as behavioural twins. Presence is what matters,
@@ -628,6 +645,7 @@ impl HostAgentConfig {
             discovery,
             aws: AwsConfig::from_node(root),
             docker: DockerConfig::from_node(root),
+            rc_hub_enabled,
         })
     }
 
@@ -3284,5 +3302,72 @@ aws:
                 other => panic!("value {value:?}: bad fixture `resolved` {other:?}"),
             }
         }
+    }
+
+    // The rc-hub role knob (plan 010 §2.6): default true; the FULL yaml.v3 bool
+    // vocabulary disables it (the D2 fix — `no`/`off`/`n`/`False` are not
+    // strings here); null/absent/unresolvable leave it on (fail-open opt-out).
+    #[test]
+    fn rc_hub_enabled_knob() {
+        let load = |yaml: &str| {
+            let dir = std::env::temp_dir().join(format!(
+                "rc-hub-knob-{}-{:x}",
+                std::process::id(),
+                yaml.as_bytes()
+                    .iter()
+                    .fold(0u64, |a, b| a.wrapping_mul(131).wrapping_add(u64::from(*b)))
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            let p = dir.join("extensions.yaml");
+            std::fs::write(&p, yaml).unwrap();
+            let cfg = HostAgentConfig::load(p.to_str().unwrap()).expect("valid config");
+            let _ = std::fs::remove_dir_all(&dir);
+            cfg
+        };
+        assert!(
+            load("server: http://localhost:8080\n").rc_hub_enabled,
+            "absent → on"
+        );
+        // Every resolving-false form disables — NOT just the literal `false`.
+        for off in [
+            "false", "False", "FALSE", "no", "No", "NO", "off", "Off", "n", "N",
+        ] {
+            assert!(
+                !load(&format!("rc_hub:\n  enabled: {off}\n")).rc_hub_enabled,
+                "rc_hub.enabled: {off} → off"
+            );
+        }
+        for on in ["true", "True", "TRUE", "yes", "Yes", "on", "ON", "y", "Y"] {
+            assert!(
+                load(&format!("rc_hub:\n  enabled: {on}\n")).rc_hub_enabled,
+                "rc_hub.enabled: {on} → on"
+            );
+        }
+        assert!(load("rc_hub:\n").rc_hub_enabled, "bare key → on");
+        assert!(
+            load("rc_hub:\n  enabled: null\n").rc_hub_enabled,
+            "explicit null → on"
+        );
+        assert!(
+            load("rc_hub:\n  enabled:\n    nested: map\n").rc_hub_enabled,
+            "non-scalar → on"
+        );
+        for residue in ["nonsense", "1", "0", "tRUe"] {
+            assert!(
+                load(&format!("rc_hub:\n  enabled: {residue}\n")).rc_hub_enabled,
+                "rc_hub.enabled: {residue} → on (fail-open opt-out knob)"
+            );
+        }
+        // House residue, shared with every other bool key: the reader drops
+        // quoting, so a QUOTED 'false' still resolves to the bool (yaml.v3
+        // would keep it a string and Go's `*bool` decode would error).
+        assert!(
+            !load("rc_hub:\n  enabled: 'false'\n").rc_hub_enabled,
+            "quoted 'false' → off (quoting is not preserved by the reader)"
+        );
+        assert!(
+            !load("rc_hub:\n  enabled: \"false\"\n").rc_hub_enabled,
+            "quoted \"false\" → off"
+        );
     }
 }
