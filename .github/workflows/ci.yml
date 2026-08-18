@@ -123,14 +123,16 @@ jobs:
               # implementations, the harness that runs them side by side, and the
               # shared build manifests a dependency bump would ride in on.
               #
-              # Rust side: the ported engine (`shed-app`'s `rc` feature) over the
-              # pure kernel (`shed-core::rc_agents`), plus the `sx` CLI that is the
+              # Rust side: the graduated engine crate (`shed-rc-engine`,
+              # re-exported through `shed-app`'s `rc` feature) over the pure
+              # kernel (`shed-core::rc_agents`), plus the `sx` CLI that is the
               # binary under test. Go side: the engine (`internal/ext/rc`), its CLI
               # shell (`internal/ext/clirc`) and BOTH binaries built from them — the
               # oracle `shed-machine-rc` and the guest `shed-ext-rc`, which share the
               # same wire surface.
               - 'crates/shed-core/**'
               - 'crates/shed-app/**'
+              - 'crates/shed-rc-engine/**'
               - 'crates/sx/**'
               - 'crates/Cargo.toml'
               - 'crates/Cargo.lock'
@@ -673,6 +675,8 @@ jobs:
       - name: Rust engine + porcelain — test + clippy (Linux)
         working-directory: crates
         run: |
+          cargo test -p shed-rc-engine --features test-support --all-targets --locked
+          cargo clippy -p shed-rc-engine --features test-support --all-targets --locked -- -D warnings
           cargo test -p shed-app --features rc --all-targets --locked
           cargo clippy -p shed-app --features rc --all-targets --locked -- -D warnings
           cargo test -p sx --all-targets --locked

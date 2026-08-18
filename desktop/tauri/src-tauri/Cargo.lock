@@ -4357,6 +4357,7 @@ dependencies = [
  "serde_json",
  "shed-broker",
  "shed-core",
+ "shed-rc-engine",
  "tokio",
  "uuid",
 ]
@@ -4441,6 +4442,17 @@ dependencies = [
  "tempfile",
  "tokio",
  "zbus",
+]
+
+[[package]]
+name = "shed-rc-engine"
+version = "0.8.1"
+dependencies = [
+ "chrono",
+ "libc",
+ "serde_json",
+ "shed-core",
+ "uuid",
 ]
 
 [[package]]

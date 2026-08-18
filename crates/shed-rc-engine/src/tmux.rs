@@ -310,7 +310,7 @@ impl<'a> Tmux<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::rc_engine::fake::FakeTmux;
+    use crate::fake::FakeTmux;
 
     // ---- error classes (mirrors Go TestIsMissingSession, rc_test.go:734) ----
 

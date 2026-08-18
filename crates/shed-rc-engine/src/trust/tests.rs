@@ -7,12 +7,12 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 
-use crate::rc_engine::fake::env_from;
+use crate::fake::env_from;
 
 use super::*;
 
 /// A `HOME`-only env table over the `&Path` a tempdir hands back (the shared
-/// [`crate::rc_engine::fake::home_env`] takes a `&str`).
+/// [`crate::fake::home_env`] takes a `&str`).
 fn home_env(home: &Path) -> impl Fn(&str) -> String {
     env_from(&[("HOME", home.to_str().expect("a UTF-8 temp path"))])
 }
@@ -53,11 +53,11 @@ fn cross_impl_literals_match_the_go_strings() {
     assert_eq!(LOCK_SUFFIX, ".shed-ext-rc.lock");
     assert_eq!(CLAUDE_TMP_PATTERN, ".claude.json.*.tmp");
     assert_eq!(
-        crate::rc_engine::preseed_cursor::HOOKS_TMP_PATTERN,
+        crate::preseed_cursor::HOOKS_TMP_PATTERN,
         ".hooks.json.*.tmp"
     );
     assert_eq!(
-        crate::rc_engine::preseed_cursor::SCRIPT_TMP_PATTERN,
+        crate::preseed_cursor::SCRIPT_TMP_PATTERN,
         ".cursor-hook.sh.*.tmp"
     );
 }

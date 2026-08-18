@@ -164,7 +164,7 @@ fn run(kind: &RcKind, workdir: &str, env: GetEnv) -> Result<(), PreseedError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::rc_engine::fake::{env_from, home_env};
+    use crate::fake::{env_from, home_env};
 
     #[test]
     fn claude_kinds_seed_the_trust_file() {

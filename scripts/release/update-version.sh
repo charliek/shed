@@ -43,7 +43,7 @@
 #                                              workspace — Cargo.toml
 #                                              [package].version + tauri.conf.json
 #                                              + Cargo.lock regen (the lock pins
-#                                              shed-core/shed-app by version, so a
+#                                              the workspace path-dep crates by version, so a
 #                                              stale lock breaks the .deb's
 #                                              `cargo build --locked`).
 #
@@ -274,19 +274,19 @@ if $DO_DESKTOP; then
   fi
   # Regenerate the Tauri lock: `cargo update --workspace` rewrites the lock,
   # refreshing both the workspace member (shed-desktop-tauri) AND the
-  # shed-core/shed-app path-dep entries (re-read from crates/Cargo.toml, now
+  # workspace path-dep entries (re-read from crates/Cargo.toml, now
   # $V) — like the crates step above.
   cargo update --workspace --offline >/dev/null
   if ! grep -q "^version = \"$V\"" Cargo.lock; then
     echo "error: desktop/tauri/src-tauri/Cargo.lock did not update to $V." >&2
     exit 1
   fi
-  # Guard the exact failure this step prevents: the shed-core/shed-app
-  # path-dep lock entries (which build-deb.sh's `cargo build --locked` pins)
+  # Guard the exact failure this step prevents: the workspace path-dep
+  # lock entries (which build-deb.sh's `cargo build --locked` pins)
   # must have refreshed to $V. The generic check above only proves the member
   # (shed-desktop-tauri) is $V; a future cargo change that stopped refreshing
   # path deps would slip past it.
-  for dep in shed-core shed-app; do
+  for dep in shed-core shed-app shed-rc-engine shed-broker; do
     if ! grep -A1 "^name = \"${dep}\"$" Cargo.lock | grep -q "^version = \"$V\""; then
       echo "error: desktop/tauri/src-tauri/Cargo.lock still pins ${dep} at the old version (expected $V)." >&2
       exit 1

@@ -8,9 +8,9 @@ use std::cell::Cell;
 use std::sync::Arc;
 
 use super::*;
-use crate::rc_engine::fake::{env_from, home_env, FakeTmux};
-use crate::rc_engine::tmux::TmuxResult;
-use crate::traits::Clock;
+use crate::fake::{env_from, home_env, FakeTmux};
+use crate::tmux::TmuxResult;
+use crate::clock::Clock;
 
 /// A pinned wall clock so `created_at` (and therefore the `new-session` argv) is
 /// deterministic.
@@ -1041,7 +1041,7 @@ fn a_pathologically_deep_claude_json_warns_and_the_create_still_succeeds() {
     let eng = engine(&f, &ticks)
         .with_env(home_env(home.path().to_str().unwrap()))
         .with_warn(|m| warned.set(m.to_string()))
-        .with_preseed(crate::rc_engine::preseed::dispatch);
+        .with_preseed(crate::preseed::dispatch);
 
     let mut opts = CreateOptions::new(RcKind::ClaudeRc);
     opts.slug = "abc123".to_string();

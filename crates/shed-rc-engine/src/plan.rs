@@ -254,7 +254,7 @@ pub(crate) fn validate_plan_inputs(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::rc_engine::fake::{env_from, home_env};
+    use crate::fake::{env_from, home_env};
 
     // ---- paths (mirrors Go TestPlanPathPerKind, plan_test.go:19) ----
 

@@ -126,6 +126,9 @@ PATHS_DESKTOP=(
   desktop
   crates/shed-core
   crates/shed-app
+  # The Tauri client compiles the engine via shed-app's `rc` feature — an
+  # engine-only source edit must flag desktop or the .deb silently ships stale.
+  crates/shed-rc-engine
   crates/shed-core-ffi
   crates/shedctl
   crates/shed-broker

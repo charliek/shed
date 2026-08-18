@@ -18,7 +18,7 @@ use shed_core::rc_agents::{
 use super::plan::{compose_plan_kickoff, validate_plan_inputs, write_plan};
 use super::text::{has_unsafe_prompt_chars, normalize_newlines, quote_go};
 use super::tmux::{is_duplicate_session, is_missing_session, Tmux, TmuxRunner};
-use crate::traits::{system_clock, ClockRef};
+use crate::clock::{system_clock, ClockRef};
 
 // ---------------------------------------------------------------------------
 // tunables (ops.go:25-31, clirc.go:403)

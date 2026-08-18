@@ -1,0 +1,38 @@
+[package]
+name = "shed-rc-engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "shed-rc-engine — the one-shot Remote-Control engine ported from the Go guest binary (plan 009), graduated out of shed-app at its second consumer (plan 010: shed-broker's rc_hub). Synchronous by design; sits on the pure shed-core rc_agents kernel."
+
+[lib]
+name = "shed_rc_engine"
+path = "src/lib.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+shed-core = { path = "../shed-core" }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+# flock(2) for the claude-preseed file lock + close(2) in netutil — Unix-only,
+# like the engine itself (tmux is its hard dependency).
+libc = "0.2"
+# The engine's own clock seam formats `created_at` (second-precision UTC `Z`).
+# `clock` disabled — "now" flows through the injectable seam, same posture as
+# shed-app's traits::Clock.
+chrono = { version = "0.4", default-features = false, features = ["std"] }
+
+[features]
+# The engine's test doubles (`fake` — the fake tmux runner + the env table)
+# exported for ANOTHER crate's tests (sx's dispatch tests; shed-broker's hub
+# tests). NON-default and named `test-support` so a `[dependencies]` enablement
+# is unmistakably wrong — the module is `#[cfg]`'d in only under `test` or this
+# feature, so a shipped binary never carries it.
+test-support = []
+
+[dev-dependencies]
+# Temp HOMEs/workdirs for the preseed + plan + tailer-style tests. Dev-only.
+tempfile = "3"

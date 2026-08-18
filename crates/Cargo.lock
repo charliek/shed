@@ -3190,6 +3190,7 @@ dependencies = [
  "serde_json",
  "shed-broker",
  "shed-core",
+ "shed-rc-engine",
  "tempfile",
  "tokio",
  "uuid",
@@ -3278,6 +3279,18 @@ dependencies = [
  "shed-core",
  "tempfile",
  "tokio",
+ "uuid",
+]
+
+[[package]]
+name = "shed-rc-engine"
+version = "0.8.1"
+dependencies = [
+ "chrono",
+ "libc",
+ "serde_json",
+ "shed-core",
+ "tempfile",
  "uuid",
 ]
 
