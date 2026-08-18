@@ -36,8 +36,10 @@ libc = "0.2"
 # The remote targets (`--on machine:` / `--on shed:`) drive `shed-app`'s async
 # `RcRunner`/`Backend`, and `sx watch` streams SSE — all of which need a reactor.
 # One lazily-built CURRENT-THREAD runtime per process (see `Deps::block_on`), so
-# a purely local `sx agent` never constructs one.
-tokio = { workspace = true }
+# a purely local `sx agent` never constructs one. `net` is declared here (not
+# merely inherited through shed-app's feature unification) because `crate::backend`
+# dials the host agent's status socket itself for its liveness probe.
+tokio = { workspace = true, features = ["net"] }
 # The local/machine activity hub speaks plain HTTP + SSE on 127.0.0.1:1029, which
 # `shed-core`'s `Client` (a shed-SERVER protocol client: TLS pinning, control-token
 # FSM, mTLS) cannot address. reqwest is already in this workspace's lock tree with

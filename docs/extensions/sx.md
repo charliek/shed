@@ -182,19 +182,26 @@ implementations write identical bytes. Run it with `make test-rc-parity`.
 
 ## v1 limits
 
-- **mTLS-enrolled servers need the `@server` form.** Locating an unqualified
-  `shed:<name>` uses the HTTP API with the static `control_token` from the server entry;
-  a server enrolled for mTLS with no static token cannot be queried, because `sx` does
-  not build the host-agent token minter (a UDS handshake sized for a long-lived desktop
-  process, not a one-shot CLI). `--on shed:<name>@<server>` is pure config plus SSH and
-  always works.
+- **mTLS-enrolled servers need the shed host agent running.** Locating an unqualified
+  `shed:<name>`, and the full `sx ls` fan-out, both query the HTTP API. A server enrolled
+  for mTLS holds no static `control_token`, so its credential has to be minted: `sx`
+  connects to `shed-host-agent` over its UDS and mints one exactly as the desktop does.
+  The wiring is gated on the agent actually answering — with no agent running (or a stale
+  socket left by a crashed one) `sx` falls back to the static `control_token` from each
+  server entry, which is enough for token-mode servers and leaves an mTLS server's sheds
+  out of the listing. The inverse also holds: **with** a live agent the minter takes over
+  for *every* server, so a token-mode server whose config token works but whose host-agent
+  SSH key is not allowlisted there drops out of the fan-out (the same posture the desktop
+  runs — the agent is expected to hold keys for the servers this machine uses).
+  `--on shed:<name>@<server>` is pure config plus SSH: it needs no credential, no agent,
+  and always works.
 - **`sx watch` is a line stream**, not a TUI.
 - **No steering verbs.** `turn`, `interrupt`, and approval responses ride the hub/proxy
   HTTP surface consumed by the desktop and mobile clients; they are not in `sx` v1.
-- **Cursor's workspace-trust dialog reads as `starting`.** Current `cursor-agent` builds
-  open a workspace-trust prompt that neither the Go engine nor `sx` classifies, so the
-  wait poller's trust auto-accept does not fire. Accept it once per workspace in the TUI
-  (`sx attach <slug>`, press `a`), then the session proceeds normally.
+- **Cursor workspace trust is handled automatically.** The engine launches
+  `cursor-agent --trust` (both implementations, lockstep), so a fresh workspace
+  goes straight to the ready composer instead of stalling at the trust dialog —
+  the same posture as the claude kinds' trust preseed.
 - **No auto-install.** A skill or script invoking `sx` must handle its absence itself.
 
 ## See also
