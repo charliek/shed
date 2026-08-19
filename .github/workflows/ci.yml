@@ -104,6 +104,9 @@ jobs:
               # A change there is a change to the shipped daemon's behavior, so it must
               # trigger the differential harness + the release-snapshot.
               - 'crates/shed-broker/**'
+              # shed-broker depends on shed-rc-engine from plan 010 H4 (the rc_hub
+              # port), so an engine-only change now reaches the shipped daemon too.
+              - 'crates/shed-rc-engine/**'
               # The Rust host-agent has a path-dep on shed-core, and the release
               # build (builder: rust) reads rust-toolchain.toml — a change to
               # either can break the shipped binary, so both must trigger the
@@ -123,14 +126,26 @@ jobs:
               # implementations, the harness that runs them side by side, and the
               # shared build manifests a dependency bump would ride in on.
               #
-              # Rust side: the ported engine (`shed-app`'s `rc` feature) over the
-              # pure kernel (`shed-core::rc_agents`), plus the `sx` CLI that is the
+              # Rust side: the graduated engine crate (`shed-rc-engine`,
+              # re-exported through `shed-app`'s `rc` feature) over the pure
+              # kernel (`shed-core::rc_agents`), plus the `sx` CLI that is the
               # binary under test. Go side: the engine (`internal/ext/rc`), its CLI
               # shell (`internal/ext/clirc`) and BOTH binaries built from them — the
-              # oracle `shed-machine-rc` and the guest `shed-ext-rc`, which share the
-              # same wire surface.
+              # test-only oracle (tests/rc-parity/oracle — the retired
+              # shed-machine-rc's main, covered by the tests/rc-parity/** entry
+              # below) and the guest `shed-ext-rc`, which share the same wire
+              # surface.
               - 'crates/shed-core/**'
               - 'crates/shed-app/**'
+              - 'crates/shed-rc-engine/**'
+              # The hub port (plan 010): shed-broker carries `rc_hub` — the Rust
+              # side of the hub differential family — from H4 on, so a
+              # broker-only PR must not skip the wire gate.
+              - 'crates/shed-broker/**'
+              # From H11 the shed-host-agent bin MOUNTS the hub (the `rc-hub`
+              # debug subcommand is the harness's Rust leg from H12), so a
+              # bin-only change must run the wire gate too.
+              - 'crates/shed-host-agent/**'
               - 'crates/sx/**'
               - 'crates/Cargo.toml'
               - 'crates/Cargo.lock'
@@ -138,9 +153,14 @@ jobs:
               - 'internal/ext/rc/**'
               - 'internal/ext/clirc/**'
               - 'internal/version/**'
-              - 'cmd/shed-machine-rc/**'
               - 'cmd/shed-ext-rc/**'
               - 'tests/rc-parity/**'
+              # The crates-local fixture COPIES (panes, jsonl, wire goldens).
+              # The byte-parity sweep that guards them is a Go test, and the
+              # `go` filter excludes crates/** — so a copy-only edit would
+              # otherwise run NO job that executes the guard. This filter plus
+              # the fixture-guard step in the rc-parity job below close that.
+              - 'crates/fixtures/**'
               - 'go.mod'
               - 'go.sum'
             docs:
@@ -259,10 +279,10 @@ jobs:
       # friends) on this runner — de-risks the macos release job.
       - name: Run tests
         run: go test ./...
-      # Three snapshot invocations, one per split config, in the FIXED release
-      # order (server → host-agent → machine-rc). All three run unconditionally
-      # here — the snapshot is the pre-tag proof of every component, incl. the
-      # Rust host-agent leg. Each writes its own dist/<component>/ subdir.
+      # Two snapshot invocations, one per split config, in the FIXED release
+      # order (server → host-agent). Both run unconditionally here — the
+      # snapshot is the pre-tag proof of every component, incl. the Rust
+      # host-agent leg. Each writes its own dist/<component>/ subdir.
       - name: GoReleaser snapshot — server
         uses: goreleaser/goreleaser-action@v7
         with:
@@ -273,31 +293,12 @@ jobs:
         with:
           version: v2.15.3
           args: release --snapshot --clean -f .goreleaser.host-agent.yaml
-      - name: GoReleaser snapshot — machine-rc
-        uses: goreleaser/goreleaser-action@v7
-        with:
-          version: v2.15.3
-          args: release --snapshot --clean -f .goreleaser.machine-rc.yaml
       - name: Assert release artifacts
         run: |
           set -euo pipefail
           # Each split config writes its own dist/<component>/ subdir (plan 002
           # D2); the checks below are re-pointed accordingly.
-          # (i) shed-machine-rc archives: darwin+linux × amd64+arm64, each containing
-          # EXACTLY the one binary (ids: selectors must keep other builds out).
-          for tgz in dist/machine-rc/shed-machine-rc_*.tar.gz; do
-            entries=$(tar tzf "$tgz" | grep -c .)
-            bins=$(tar tzf "$tgz" | grep -c '^shed-machine-rc$')
-            { [ "$entries" = "1" ] && [ "$bins" = "1" ]; } || { echo "::error::$tgz must contain exactly the shed-machine-rc binary and nothing else"; tar tzf "$tgz"; exit 1; }
-          done
-          for os in darwin linux; do
-            for arch in amd64 arm64; do
-              ls "dist/machine-rc/shed-machine-rc_${os}_${arch}.tar.gz" >/dev/null || { echo "::error::missing dist/machine-rc/shed-machine-rc_${os}_${arch}.tar.gz"; exit 1; }
-            done
-          done
-          # (ii) per-arch shed-machine-rc .debs, named to match apt-charliek's glob.
-          ls dist/machine-rc/shed-machine-rc_*_amd64.deb dist/machine-rc/shed-machine-rc_*_arm64.deb
-          # (iii) ALL FOUR shed-host-agent archives (now Rust) carry the binary AND
+          # (i) ALL FOUR shed-host-agent archives (now Rust) carry the binary AND
           # the example config.
           workdir="$(mktemp -d)"
           for os in darwin linux; do
@@ -326,7 +327,7 @@ jobs:
           echo "$amd64_file" | grep -q 'Mach-O.*x86_64' || { echo "::error::darwin/amd64 is not a well-formed x86_64 Mach-O: $amd64_file"; exit 1; }
           echo "darwin/amd64: $amd64_file"
           rm -rf "$workdir"
-          # (iv) plan 002 D6: per-dist exact (type, ID) allowlists — typed, so a
+          # (ii) plan 002 D6: per-dist exact (type, ID) allowlists — typed, so a
           # dropped ARCHIVE block is caught even when its BUILD still contributes
           # the same ID string (codex review finding). Equality proves expected-
           # present AND forbidden-absent. Plus partition invariants (deb
@@ -358,17 +359,6 @@ jobs:
                   "checksums": "checksums-host-agent.txt",
                   "formulas": {"shed-host-agent.rb"},
                   "has_deb": False,
-              },
-              "machine-rc": {
-                  "dist": "dist/machine-rc",
-                  "typed_ids": {
-                      "Binary": {"shed-machine-rc"},
-                      "Archive": {"shed-machine-rc"},
-                      "Linux Package": {"shed-machine-rc"},
-                  },
-                  "checksums": "checksums-machine-rc.txt",
-                  "formulas": {"shed-machine-rc.rb"},
-                  "has_deb": True,
               },
           }
           ALL_CHECKSUMS = {c["checksums"] for c in EXPECTED.values()}
@@ -417,7 +407,7 @@ jobs:
                           fail(f"upload basename {b} collides: {all_basenames[b]} and {comp}")
                       all_basenames[b] = comp
               print(f"{comp}: IDs OK; deb={'yes' if debs else 'no'}; checksums={spec['checksums']}; formulas parse OK")
-          print(f"partition OK: {len(all_basenames)} unique upload basenames across three dists")
+          print(f"partition OK: {len(all_basenames)} unique upload basenames across two dists")
           PY
           echo "release snapshot artifacts OK"
 
@@ -615,7 +605,7 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v6
-      # Builds the Go oracle (`shed-machine-rc`) — same version as the other Go jobs.
+      # Builds the Go oracle (tests/rc-parity/oracle) — same version as the other Go jobs.
       - uses: actions/setup-go@v6
         with:
           go-version: '1.25'
@@ -673,10 +663,19 @@ jobs:
       - name: Rust engine + porcelain — test + clippy (Linux)
         working-directory: crates
         run: |
+          cargo test -p shed-rc-engine --features test-support --all-targets --locked
+          cargo clippy -p shed-rc-engine --features test-support --all-targets --locked -- -D warnings
           cargo test -p shed-app --features rc --all-targets --locked
           cargo clippy -p shed-app --features rc --all-targets --locked -- -D warnings
           cargo test -p sx --all-targets --locked
           cargo clippy -p sx --all-targets --locked -- -D warnings
+      - name: Fixture-copy byte-parity guard
+        # The crates-local fixture copies (crates/fixtures/{panes,jsonl} + the
+        # wire goldens) are guarded by Go sweeps in internal/ext/rc — but the
+        # `go` job's filter excludes crates/**, so a copy-only edit reaches
+        # ONLY this job (via the rcparity filter's crates/fixtures/** entry).
+        # Run the sweeps here so copy drift can never land green.
+        run: go test ./internal/ext/rc/ -run 'CopiesAreByteIdentical' -count=1
       - name: Go↔Rust parity harness
         # Builds BOTH implementations and runs every differential cell against the
         # committed goldens (a clean unfiltered run, so the stale-golden sweep is

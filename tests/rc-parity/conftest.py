@@ -1,7 +1,9 @@
 """Fixtures for the Go↔Rust RC one-shot parity harness (plan 009 §3.6).
 
-Builds BOTH implementations once per session — `shed-machine-rc` (Go, the oracle)
-and `sx` (Rust) — and drives them as black-box subprocesses against a hermetic
+Builds BOTH implementations once per session — the Go oracle
+(`tests/rc-parity/oracle`, the retired shed-machine-rc's main, still running
+under the `shed-machine-rc` identity the goldens were recorded with) and `sx`
+(Rust) — and drives them as black-box subprocesses against a hermetic
 tmux server, asserting their wire-visible output is identical under
 `normalize.py`'s canonicalization, then pinning it to a committed golden recorded
 from the Go side.
@@ -37,6 +39,7 @@ No sleeps anywhere: every wait is a deadline poll that reports its last snapshot
 from __future__ import annotations
 
 import dataclasses
+import http.client
 import json
 import os
 import re
@@ -208,7 +211,7 @@ def binaries(tmp_path_factory) -> dict:
     out_dir = tmp_path_factory.mktemp("bin")
     go_bin = out_dir / "shed-machine-rc"
     _build(
-        ["go", "build", "-o", str(go_bin), "./cmd/shed-machine-rc"],
+        ["go", "build", "-o", str(go_bin), "./tests/rc-parity/oracle"],
         cwd=REPO_ROOT,
     )
     assert go_bin.exists(), f"go binary missing: {go_bin}"
@@ -217,7 +220,11 @@ def binaries(tmp_path_factory) -> dict:
     cargo_env["PATH"] = (
         str(Path.home() / ".cargo" / "bin") + os.pathsep + cargo_env.get("PATH", "")
     )
-    _build(["cargo", "build", "-p", "sx"], cwd=CRATES_ROOT, env=cargo_env)
+    _build(
+        ["cargo", "build", "-p", "sx", "-p", "shed-host-agent", "--locked"],
+        cwd=CRATES_ROOT,
+        env=cargo_env,
+    )
     env_target = os.environ.get("CARGO_TARGET_DIR")
     if env_target:
         target_dir = Path(env_target)
@@ -227,8 +234,13 @@ def binaries(tmp_path_factory) -> dict:
         target_dir = CRATES_ROOT / "target"
     rust_bin = target_dir / "debug" / "sx"
     assert rust_bin.exists(), f"rust binary missing: {rust_bin}"
+    # The hub family's Rust daemon (plan 010 H12): the host-agent binary whose
+    # `rc-hub` subcommand is the harness leg. The Go hub daemon needs no extra
+    # build — it IS shed-machine-rc (`serve --foreground`).
+    rust_hub_bin = target_dir / "debug" / "shed-host-agent"
+    assert rust_hub_bin.exists(), f"rust hub binary missing: {rust_hub_bin}"
 
-    return {"go": str(go_bin), "rust": str(rust_bin)}
+    return {"go": str(go_bin), "rust": str(rust_bin), "rust_hub": str(rust_hub_bin)}
 
 
 @pytest.fixture(scope="session")
@@ -721,8 +733,13 @@ def _check_golden(nodeid: str, value) -> None:
 
 
 def pytest_collection_modifyitems(config, items) -> None:
+    # Both golden-pinning fixtures participate in the staleness accounting —
+    # `fixturenames` membership is an exact-name test, so the hub family must be
+    # named explicitly.
     _GOLDEN_SESSION["expected"] = {
-        item.nodeid for item in items if "differential" in getattr(item, "fixturenames", ())
+        item.nodeid
+        for item in items
+        if {"differential", "hub_differential"} & set(getattr(item, "fixturenames", ()))
     }
     opt = config.option
     filtered = bool(
@@ -789,15 +806,21 @@ def pytest_sessionfinish(session, exitstatus) -> None:
         )
 
 
-@pytest.fixture
-def differential(request):
-    """Return `run(scenario) -> value`, where `scenario(impl) -> normalized value`.
+def _dump(value) -> str:
+    """The stable rendering a differential compares on and reports with."""
+    return json.dumps(value, indent=2, sort_keys=True)
 
-    Runs the scenario against BOTH implementations, asserts the two normalized
-    values are equal (with a readable diff), then pins the GO value — the oracle —
-    to this test's golden. The golden therefore records "the wire shape the two
+
+def _differential_runner(request, go_label: str, rust_label: str | None):
+    """The body BOTH differential fixtures return: run the scenario against the Go
+    oracle, assert the Rust leg agrees (with a readable diff), then pin the GO
+    value to this test's golden — so a golden always records "the wire shape the
     implementations agreed on", exactly as `tests/host-agent-diff`'s did before
-    its Go twin was retired."""
+    its Go twin was retired.
+
+    `rust_label` is None for a family whose Rust leg does not exist YET: the Go
+    value is still pinned, freezing the wire before any Rust is written. The
+    labels name the binaries in the divergence report."""
     calls = {"n": 0}
 
     def _run(scenario):
@@ -808,15 +831,338 @@ def differential(request):
             "first's golden — split (or parametrize) the test."
         )
         go = canonical(scenario("go"))
-        rust = canonical(scenario("rust"))
-        assert json.dumps(go, indent=2, sort_keys=True) == json.dumps(
-            rust, indent=2, sort_keys=True
-        ), (
-            f"Go↔Rust divergence in {request.node.nodeid}:\n"
-            f"--- go (shed-machine-rc) ---\n{json.dumps(go, indent=2, sort_keys=True)}\n"
-            f"--- rust (sx rc) ---\n{json.dumps(rust, indent=2, sort_keys=True)}"
-        )
+        if rust_label is not None:
+            rust = canonical(scenario("rust"))
+            assert _dump(go) == _dump(rust), (
+                f"Go↔Rust divergence in {request.node.nodeid}:\n"
+                f"--- go ({go_label}) ---\n{_dump(go)}\n"
+                f"--- rust ({rust_label}) ---\n{_dump(rust)}"
+            )
         _check_golden(request.node.nodeid, go)
         return go
 
     return _run
+
+
+@pytest.fixture
+def differential(request):
+    """The one-shot family's differential: `run(scenario) -> value`, where
+    `scenario(impl) -> normalized value`. Both implementations always run."""
+    return _differential_runner(request, "shed-machine-rc", "sx rc")
+
+
+# --- The hub family (plan 010) ---------------------------------------------
+#
+# Resident-daemon differential: each leg runs a REAL hub daemon — Go:
+# `shed-machine-rc serve --foreground`; Rust (from H12): `shed-host-agent
+# rc-hub` — on its OWN ephemeral loopback port via the sanctioned
+# `SHED_RC_HUB_ADDR` seam, with IDENTICAL fast-tick tuning overrides so no cell
+# ever settle-and-compares. The overrides go on the DAEMON subprocess env only,
+# never `os.environ`, so the one-shot cells cannot inherit them. `_clean_env`'s
+# `SHED_RC_NO_HUB=1` is correct here and kept: it gates create-time ensure only,
+# never an explicit `serve`, and the `hub_port_guard` stays green because every
+# hub binds an ephemeral port, not 1029.
+#
+# PHASING: from H12 both legs run and every cell is equality-then-pin — the
+# H1½..H11 goldens (recorded from the Go hub alone) are the frozen wire the
+# Rust hub now has to match before anything is (re)pinned.
+
+HUB_RUST_LIVE = True
+
+# Fast ticks for the differential (both legs ALWAYS get the same values):
+# active/idle drive reconcile latency, quiet drives stability settle, idle-exit
+# is pinned LARGE-FINITE because the Go seam cannot express "never" (resolve()
+# maps <=0 back to the 15m default — plan 010 §2.5).
+HUB_TUNING = {
+    "SHED_RC_HUB_ACTIVE_MS": "100",
+    "SHED_RC_HUB_IDLE_MS": "250",
+    "SHED_RC_HUB_QUIET_MS": "500",
+    "SHED_RC_HUB_IDLE_EXIT_MS": "86400000",
+    "SHED_RC_HUB_HEARTBEAT_MS": "1000",
+    "SHED_RC_HUB_WRITE_TIMEOUT_MS": "2000",
+}
+
+
+def _free_loopback_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        return sock.getsockname()[1]
+
+
+class HubLeg(Leg):
+    """A `Leg` plus a resident hub daemon bound to an ephemeral loopback port.
+
+    The daemon shares the leg's hermetic env (HOME, TMUX_TMPDIR, constructed
+    PATH) so it observes exactly the sessions this leg's CLI creates. Its
+    stdout/stderr go to `$HOME/hub.log` for post-mortems."""
+
+    def __init__(self, *args, hub_binary: str | None = None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.hub_port = _free_loopback_port()
+        self.hub_addr = f"127.0.0.1:{self.hub_port}"
+        # The DAEMON binary. Go's hub lives inside the CLI binary
+        # (`shed-machine-rc serve`); the Rust hub lives in the host-agent
+        # (`shed-host-agent rc-hub`) while the CLI half of this leg stays sx.
+        self.hub_binary = hub_binary or self.binary
+        self._hub_proc: subprocess.Popen | None = None
+        self._hub_log = None
+
+    def _hub_argv(self) -> list:
+        if self.impl == "go":
+            return [self.hub_binary, "serve", "--foreground"]
+        return [self.hub_binary, "rc-hub"]
+
+    def start_hub(self) -> None:
+        assert self._hub_proc is None, f"{self.label}: hub already started"
+        env = dict(self.env)
+        env["SHED_RC_HUB_ADDR"] = self.hub_addr
+        env.update(HUB_TUNING)
+        self._hub_log = open(self.home / "hub.log", "wb")
+        self._hub_proc = subprocess.Popen(
+            self._hub_argv(),
+            env=env,
+            stdout=self._hub_log,
+            stderr=self._hub_log,
+            stdin=subprocess.DEVNULL,
+        )
+        # Readiness = the identity handshake, not a bare open port.
+
+        def healthy():
+            if self._hub_proc.poll() is not None:
+                raise AssertionError(
+                    f"{self.label}: hub exited {self._hub_proc.returncode} before "
+                    f"ready — see {self.home / 'hub.log'}:\n"
+                    f"{(self.home / 'hub.log').read_text()}"
+                )
+            try:
+                got = self.hub_request("GET", "/v1/health")
+            except OSError:
+                return None
+            body = got["json"] or {}
+            return got if body.get("app") == "shed-rc-hub" else None
+
+        self._poll("hub never answered its health identity", healthy, 10)
+
+    def hub_request(
+        self,
+        method: str,
+        path: str,
+        body: bytes | str | None = None,
+        headers: dict | None = None,
+        timeout: float = 10,
+    ) -> dict:
+        """One HTTP exchange with this leg's hub: `{"status": int, "json": ...}`.
+        `json` is None for an empty or non-JSON body — cells that assert an
+        envelope get a readable failure from the golden compare."""
+        if isinstance(body, str):
+            body = body.encode()
+        conn = http.client.HTTPConnection("127.0.0.1", self.hub_port, timeout=timeout)
+        try:
+            conn.request(method, path, body=body, headers=headers or {})
+            resp = conn.getresponse()
+            raw = resp.read()
+            status = resp.status
+        finally:
+            conn.close()
+        parsed = None
+        if raw:
+            try:
+                parsed = json.loads(raw.decode("utf-8"))
+            except ValueError:
+                parsed = None
+        return {"status": status, "json": parsed}
+
+    def hub_events_until(
+        self, what: str, predicate, timeout: float = 20, on_subscribed=None
+    ) -> list:
+        """Read SSE EVENTS (comments dropped) from ONE `/v1/events`
+        subscription until `predicate(events)` is truthy; returns every event
+        read, in arrival order (the within-tick ordering is wire). Bounded:
+        raises on the deadline rather than blocking forever. Reads go through
+        `HTTPResponse.read1`, which de-chunks (both hubs stream chunked).
+
+        `on_subscribed` (if given) runs after the literal `: ok` opener is
+        read — the server-side proof the subscriber is REGISTERED — so a cell
+        can trigger the events it wants to observe with no subscription race
+        (subscribe → act → read, never act-then-hope)."""
+        conn = http.client.HTTPConnection("127.0.0.1", self.hub_port, timeout=5)
+        events: list = []
+        buf = b""
+        try:
+            conn.request("GET", "/v1/events")
+            resp = conn.getresponse()
+            assert resp.status == 200, f"{self.label}: /v1/events status {resp.status}"
+            deadline = time.monotonic() + timeout
+
+            def read_line() -> str:
+                nonlocal buf
+                while b"\n" not in buf:
+                    assert time.monotonic() < deadline, (
+                        f"{self.label}: {what} — read {len(events)} events before "
+                        f"the deadline: {events!r}"
+                    )
+                    try:
+                        chunk = resp.read1(4096)
+                    except (TimeoutError, OSError):
+                        # A heartbeat gap longer than the socket timeout: let
+                        # the deadline assert above be the one that speaks.
+                        continue
+                    if not chunk:
+                        raise AssertionError(f"{self.label}: SSE stream ended early")
+                    buf += chunk
+                line, _, buf = buf.partition(b"\n")
+                return line.decode().rstrip("\r")
+
+            if on_subscribed is not None:
+                opener = read_line()
+                assert opener == ": ok", (
+                    f"{self.label}: the stream must open with the literal "
+                    f"`: ok` comment, got {opener!r}"
+                )
+                read_line()  # its trailing blank line
+                on_subscribed()
+                # The trigger (a full create, on the appear cell) has its own
+                # timeout; restart the deadline so `timeout` bounds WAITING
+                # FOR FRAMES, not the trigger.
+                deadline = time.monotonic() + timeout
+
+            name, data_lines = None, []
+            while not predicate(events):
+                assert time.monotonic() < deadline, (
+                    f"{self.label}: {what} — read {len(events)} events before the "
+                    f"deadline: {events!r}"
+                )
+                text = read_line()
+                if text.startswith(":"):
+                    continue  # `: ok` opener + heartbeats — liveness, not wire
+                if text.startswith("event: "):
+                    name = text[len("event: ") :]
+                elif text.startswith("data: "):
+                    data_lines.append(text[len("data: ") :])
+                elif text == "" and (name or data_lines):
+                    events.append(
+                        {"event": name, "data": json.loads("\n".join(data_lines))}
+                    )
+                    name, data_lines = None, []
+        finally:
+            conn.close()
+        return events
+
+    def hub_events_socket(self):
+        """A RAW subscribed socket for the stalled-reader cell: the request is
+        written and the response is never read. Caller closes it."""
+        # A tiny receive buffer closes the TCP window once the hub has written
+        # a few KB — what makes the write deadline observable without megabytes
+        # of traffic. It must be set BEFORE connect (the window is negotiated
+        # at the handshake; shrinking afterwards has no reliable effect).
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1)
+        sock.settimeout(10)
+        sock.connect(("127.0.0.1", self.hub_port))
+        sock.sendall(b"GET /v1/events HTTP/1.1\r\nHost: hub\r\n\r\n")
+        return sock
+
+    def wait_hub(self, what: str, predicate, timeout: float = 15):
+        """Deadline-poll an observable through the hub API (never a sleep)."""
+        return self._poll(what, predicate, timeout)
+
+    def wait_tracked(self, slug: str, timeout: float = 15) -> dict:
+        """Poll until the RECONCILE loop has tracked `slug`, returning its entry.
+
+        Merely appearing in `GET /v1/sessions` is NOT tracked-ness: that
+        endpoint lists from tmux one-shot, while `/messages` and the verbs use
+        the reconcile-built tracked map — a verb fired in the gap earns a 404
+        `unknown_slug` instead of its kind-based 409 (observed live while
+        recording the first goldens). The ACTIVITY OVERLAY is the observable
+        proof the tracked session exists: only a tracked entry carries it."""
+
+        def tracked():
+            got = self.hub_request("GET", "/v1/sessions")
+            for entry in (got["json"] or {}).get("sessions", []):
+                if entry.get("slug") == slug and "activity" in entry:
+                    return entry
+            return None
+
+        return self.wait_hub(f"hub never tracked slug {slug}", tracked, timeout)
+
+    def stop_hub(self) -> None:
+        """Stop the daemon and close its log. Reap failures must not skip the
+        log close (an unclosed file is a ResourceWarning, which
+        `filterwarnings = error` pins on some LATER unrelated test), and the
+        port-free assert runs LAST so it can never leave the daemon running."""
+        proc, self._hub_proc = self._hub_proc, None
+        try:
+            if proc is not None:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait(timeout=5)
+        finally:
+            if self._hub_log is not None:
+                self._hub_log.close()
+                self._hub_log = None
+        # The port must actually be free — a lingering holder would poison the
+        # next cell's bind (and mirrors the one-shot suite's 1029 guard).
+        self._poll(
+            f"nothing released {self.hub_addr} after the hub stopped",
+            lambda: not _port_in_use(self.hub_port),
+            5,
+        )
+
+    def teardown(self) -> None:
+        # finally: a wedged hub reap must not leak the tmux server + TMUX_TMPDIR.
+        try:
+            self.stop_hub()
+        finally:
+            super().teardown()
+
+
+@pytest.fixture
+def hub_leg(binaries, tmux_bin, tmp_path_factory):
+    """`make(impl, shims=None) -> HubLeg` — an isolated leg with its resident hub
+    already healthy. Mirrors the `isolated` flavor: one context per impl."""
+    made: dict = {}
+
+    def _leg(impl: str, shims: dict | None = None) -> HubLeg:
+        if impl not in made:
+            home, tmux_tmpdir = _fresh_context(tmp_path_factory, f"hub-{impl}")
+            # Register BEFORE start_hub: a failed/slow health handshake raises,
+            # and an unregistered leg's daemon (idle-exit pinned to 24h) would
+            # outlive the pytest process on its port, log handle open.
+            leg = HubLeg(
+                impl,
+                binaries[impl],
+                home,
+                tmux_tmpdir,
+                tmux_bin,
+                shims,
+                hub_binary=binaries["rust_hub"] if impl == "rust" else None,
+            )
+            made[impl] = leg
+            leg.start_hub()
+        return made[impl]
+
+    yield _leg
+    # One leg's teardown failure must not leak the other leg's daemon.
+    errors = []
+    for leg in made.values():
+        try:
+            leg.teardown()
+        except Exception as exc:  # noqa: BLE001 - reported below, never swallowed
+            errors.append(f"{leg.label}: {exc}")
+    assert not errors, "hub leg teardown failed: " + "; ".join(errors)
+
+
+@pytest.fixture
+def hub_differential(request):
+    """The hub family's differential (see the section comment above):
+    `run(scenario) -> value` where `scenario(impl) -> normalized value`. Both
+    legs run (equality-then-pin) since H12; the golden always records the Go
+    oracle — the wire the H1½ Go-only phase froze."""
+    return _differential_runner(
+        request,
+        "shed-machine-rc serve",
+        "shed-host-agent rc-hub" if HUB_RUST_LIVE else None,
+    )

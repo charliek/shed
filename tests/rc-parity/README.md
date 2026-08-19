@@ -13,10 +13,13 @@ with them:
 ## Purpose
 
 The one-shot RC engine now exists twice: in Go (`internal/ext/rc` + `internal/ext/clirc`,
-shipped as `shed-machine-rc` and the guest's `shed-ext-rc`) and in Rust
-(`crates/shed-core::rc_agents` + `crates/shed-app::rc_engine`, shipped as `sx`). The Go
-side stays alive as the machine hub provider **and as this harness's oracle** (plan
-009 §0).
+shipped as the guest's `shed-ext-rc`) and in Rust (`crates/shed-core::rc_agents` +
+`crates/shed-app::rc_engine`, shipped as `sx`). The Go side stays alive for sheds
+**and as this harness's oracle** (plan 009 §0): the
+machine-facing `shed-machine-rc` binary retired at plan 010 H15, and its main
+lives on test-only as `tests/rc-parity/oracle/main.go` — byte-identical behavior
+(same `clirc.Run` call, same `shed-machine-rc` ProgName the goldens were
+recorded under), built by this suite, shipped nowhere.
 
 Each cell here runs the SAME scenario against BOTH binaries, asserts the two
 normalized results are identical, and then pins the Go value to a committed golden.
@@ -33,8 +36,8 @@ make test-rc-parity          # from the repo root (uv guard + tmux guard)
 cd tests/rc-parity && uv sync && uv run pytest -v
 ```
 
-Requirements: **Go** (builds `shed-machine-rc`), **Rust/cargo** (builds `sx`), **uv**,
-and **tmux ≥ 3.2** (`new-session -e` is how session metadata is stamped — an implicit
+Requirements: **Go** (builds the oracle from `tests/rc-parity/oracle`),
+**Rust/cargo** (builds `sx`), **uv**, and **tmux ≥ 3.2** (`new-session -e` is how session metadata is stamped — an implicit
 floor on BOTH implementations, asserted by the `tmux_bin` fixture).
 
 Nothing real is ever launched: the four agent binaries (`claude`, `codex`, `opencode`,
@@ -124,9 +127,37 @@ A test may ask for several NAMED shared rigs (`shared("chain-go")`,
 implementation drives*, so each direction needs its own world. Teardown is the same
 discipline as `isolated` — every rig's server is killed and its `TMUX_TMPDIR` removed.
 
-## Scope today (C6) and what is coming
+## Scope today and what is coming
 
-Here — 51 differential cells, one golden each:
+Two families share the goldens dir and the stale-sweep: the ONE-SHOT family
+(plan 009 — 52 cells) and the HUB family (plan 010 — `test_hub*.py`, marker
+`hub`): resident hub daemons on ephemeral loopback ports via the sanctioned
+`SHED_RC_HUB_ADDR`/`SHED_RC_HUB_*_MS` seams. Since H12 BOTH legs run —
+Go: `shed-machine-rc serve --foreground`, Rust: `shed-host-agent rc-hub` (the
+harness builds `-p shed-host-agent` alongside `sx`) — and every cell is
+equality-then-pin against the goldens the Go hub froze at H1½. Cell families:
+
+* **snapshot** (`test_hub.py`): health identity, the sessions overlay,
+  messages paging, the 4xx/409 verb matrix (stream-cap 413-vs-400 pins
+  included), bare-mux status-only;
+* **SSE** (`test_hub_sse.py`): the appear→activity within-tick order via a
+  registered-before-create subscription (the `: ok` opener is the
+  registration proof), and the stalled-reader survivability cell (the
+  connection-teardown half stays unit-level per side — the TCP close is
+  legitimately different plumbing);
+* **side-effects** (`test_hub_effects.py`): the `SHED_RC_AGENT_SESSION`
+  correlation back-write and `/input` delivery onto the pane;
+* **lane** (`test_hub_lane.py`): the contract-v2 verbs against a live
+  opencode lane — each leg drives its own `fake_opencode.py` instance
+  (identical scripts) whose pinGuard fails the cell on any unscoped POST;
+  turn/interrupt/approvals incl. the idempotent same-decision replay with no
+  second upstream POST;
+* **ingest** (`test_hub_ingest.py`): the cursor hook route by direct POST
+  (the preseeded script targets the fixed production port — one-shot-suite
+  territory), its precedence matrix, the no-lost-kickoff property, and the
+  fold smoke.
+
+The one-shot family — 52 differential cells, one golden each:
 
 * `version`; `create` (DTO + session environment + inner-command argv, `shell` and
   `opencode`); `probe`; `kill` (including its idempotence); `list`; the exit-code
@@ -167,9 +198,10 @@ and that golden was deliberately re-recorded.
 `.github/workflows/ci.yml` runs this suite as the **`rc-parity (Go↔Rust wire
 goldens)`** job (part of the required `ci-success` check), gated on the `rcparity`
 path filter: both engines (`internal/ext/rc`, `internal/ext/clirc`,
-`crates/shed-core`, `crates/shed-app`), both CLIs (`cmd/shed-machine-rc`,
-`cmd/shed-ext-rc`, `crates/sx`), this harness, and the shared build manifests
-(`crates/Cargo.*`, `crates/rust-toolchain.toml`, `go.mod`/`go.sum`).
+`crates/shed-core`, `crates/shed-app`), the CLIs (the `tests/rc-parity/oracle` Go
+leg via this harness's own path entry, `cmd/shed-ext-rc`, `crates/sx`), this
+harness, and the shared build manifests (`crates/Cargo.*`,
+`crates/rust-toolchain.toml`, `go.mod`/`go.sum`).
 
 The job installs Go + Rust + uv, `apt-get install`s **tmux** (not preinstalled on
 GitHub runners) and asserts the ≥ 3.2 floor before building anything, then runs the

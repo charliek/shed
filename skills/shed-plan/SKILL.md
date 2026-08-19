@@ -98,15 +98,22 @@ resolve it in this order and stop at the first that works:
 1. `sx` on `PATH` (`command -v sx`).
 2. A shed checkout on this machine: `cd <shed-repo>/crates && cargo run -q -p sx -- <args>`
    (or `<shed-repo>/crates/target/{debug,release}/sx` if it is already built).
-3. **Fallback — the released Go engine over SSH**, when the machine has
-   `shed-machine-rc` but this machine has no `sx`:
+3. **Fallback — the engine over SSH**, when this machine has no `sx` but the
+   target machine has one (or a still-installed, retired `shed-machine-rc` —
+   the two are wire-identical):
    ```bash
-   ssh <machine> shed-machine-rc create --kind claude-rc --name "<machine>/plan" \
+   ssh <machine> sx rc create --kind claude-rc --name "<machine>/plan" \
      --wait --interactive-shell --permission-mode auto --plan-stdin < ./plan.md
+   # (swap `sx rc` for `shed-machine-rc` on a machine still running the retired binary)
    ```
 4. **Neither available** — say so and stop. Do not improvise a raw `tmux`/`ssh`
    kickoff; the posture flags, installed-agent gate, and trust/onboarding pre-seed are
    exactly what these tools exist to apply.
+
+Live activity for machine sessions comes from the machine RC hub on the target,
+hosted by the `shed-host-agent` daemon as a resident role — install and start the
+agent to get it. `sx` probes and hints; it never starts a hub. A machine without one
+still runs sessions fine; it just reports no live activity in `sx ls`/`sx watch`.
 
 With `sx` the flow is one command, and the plan file stays local (it is read here and
 shipped over stdin):

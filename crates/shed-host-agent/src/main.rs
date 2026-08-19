@@ -26,6 +26,7 @@ mod desktop_protocol;
 // The socket bind ceremony (touches `Log`) + the status UDS server / `status` CLI
 // client (only the daemon serves that socket). Path resolution + liveness probes +
 // the LiveStatus snapshot builder live in `shed_broker::{sockets,status}`.
+mod rc_hub_role;
 mod socket_bind;
 mod status_server;
 mod version;
@@ -67,6 +68,7 @@ fn run(args: &[String]) -> i32 {
             0
         }
         Ok(Command::Status { json_out }) => run_status(json_out, &mut io::stdout().lock()),
+        Ok(Command::RcHub) => rc_hub_role::run_rc_hub_foreground(&full_info()),
         Ok(Command::Daemon {
             config_path,
             log_file,
@@ -85,6 +87,9 @@ enum Command {
     Status {
         json_out: bool,
     },
+    /// The foreground rc-hub debug subcommand (plan 010 §2.6 — the rc-parity
+    /// harness's Rust leg; a diagnostic, not user surface).
+    RcHub,
     Daemon {
         config_path: String,
         log_file: String,
@@ -199,6 +204,19 @@ fn parse_subcommand(
                 }
             }
             Ok(Command::Status { json_out })
+        }
+        // MUST be matched before the daemon catch-all: the catch-all treats
+        // unknown positionals as daemon mode, and `shed-host-agent rc-hub`
+        // starting the full credential daemon against real sockets is exactly
+        // the failure §2.6 pins a parse test against.
+        "rc-hub" => {
+            if let Some(other) = rest.first() {
+                return Err(ArgError {
+                    message: format!("rc-hub: unknown argument {other:?}"),
+                    code: 2,
+                });
+            }
+            Ok(Command::RcHub)
         }
         _ => Ok(Command::Daemon {
             config_path,
@@ -449,12 +467,25 @@ fn run_daemon(config_path: &str, log_file: &str) -> i32 {
     // The status snapshot is recomputed per connection (fresh written_at/pid) and now
     // includes the supervisor's per-server health (`servers[]`). It reports the desktop
     // consumer identity when the feature is on, else no consumer.
+    // The rc-hub role's live self-report (plan 010 §2.6): shared between the
+    // role task (writes) and the status snapshot (reads). Starts `deferred`
+    // (the role flips it to listening/disabled as it starts).
+    let rc_hub_status = Arc::new(std::sync::Mutex::new(shed_broker::status::RcHubStatus {
+        state: if cfg.rc_hub_enabled {
+            "deferred".to_string()
+        } else {
+            "disabled".to_string()
+        },
+        addr: String::new(),
+    }));
+
     let health: Arc<dyn Fn() -> LiveStatus + Send + Sync> = {
         let cfg = cfg.clone();
         let config_path = resolved_config_path;
         let started_at = started_at.clone();
         let version = version.clone();
         let sup = sup.clone();
+        let rc_hub_status = rc_hub_status.clone();
         #[cfg(feature = "desktop-forwarding")]
         let desktop_server = desktop_server.clone();
         Arc::new(move || {
@@ -462,12 +493,17 @@ fn run_daemon(config_path: &str, log_file: &str) -> i32 {
             let consumer = desktop_server.consumer_info();
             #[cfg(not(feature = "desktop-forwarding"))]
             let consumer = None;
+            let rc_hub = rc_hub_status
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
             build_live_status(
                 &cfg,
                 &config_path,
                 &started_at,
                 &version,
                 consumer,
+                rc_hub,
                 sup.health(),
             )
         })
@@ -501,6 +537,20 @@ fn run_daemon(config_path: &str, log_file: &str) -> i32 {
             let rx = listener_rx.clone();
             tasks.push(tokio::spawn(async move {
                 serve_status_socket(listener, status_path, health, wait_shutdown(rx)).await;
+            }));
+        }
+
+        // The rc-hub role (plan 010 §2.6): races the same post-drain
+        // listener_shutdown watch as the UDS listeners; the reconcile thread
+        // starts/stops inside the role.
+        {
+            let status = rc_hub_status.clone();
+            let rx = listener_rx.clone();
+            let role_log = bus_log.clone();
+            let role_version = version.clone();
+            let enabled = cfg.rc_hub_enabled;
+            tasks.push(tokio::spawn(async move {
+                rc_hub_role::run_rc_hub_role(role_version, enabled, status, rx, role_log).await;
             }));
         }
 
@@ -717,6 +767,31 @@ mod tests {
         assert!(matches!(
             parse_args(&owned(&["status", "-json"])).unwrap(),
             Command::Status { json_out: true }
+        ));
+    }
+
+    // §2.6 pins this parse explicitly: the daemon catch-all treats unknown
+    // positionals as daemon mode, so `rc-hub` must match BEFORE it — a missed
+    // arm would start the full credential daemon against real sockets.
+    #[test]
+    fn parses_rc_hub_before_the_daemon_catch_all() {
+        assert!(matches!(
+            parse_args(&owned(&["rc-hub"])).unwrap(),
+            Command::RcHub
+        ));
+        // Leading flags still parse ahead of it.
+        assert!(matches!(
+            parse_args(&owned(&["-config", "/x.yaml", "rc-hub"])).unwrap(),
+            Command::RcHub
+        ));
+        // Extra arguments are a usage error, not a silent daemon start.
+        let err = parse_args(&owned(&["rc-hub", "--bogus"])).unwrap_err();
+        assert_eq!(err.code, 2);
+        assert!(err.message.contains("rc-hub: unknown argument"));
+        // The catch-all still routes other positionals to the daemon.
+        assert!(matches!(
+            parse_args(&owned(&["something-else"])).unwrap(),
+            Command::Daemon { .. }
         ));
     }
 

@@ -1,0 +1,37 @@
+{
+  "rows": [
+    {
+      "approval": {
+        "decisions": [
+          "allow",
+          "allow_always",
+          "deny"
+        ],
+        "id": "per_9",
+        "status": "pending"
+      },
+      "role": "tool",
+      "seq": "<seq>",
+      "text": "awaiting approval: bash \u2014 ls",
+      "tool": {
+        "detail": "ls -la",
+        "name": "bash"
+      },
+      "ts": "<ts>",
+      "type": "approval_request"
+    },
+    {
+      "approval": {
+        "decision": "allow_always",
+        "id": "per_9",
+        "status": "resolved"
+      },
+      "role": "tool",
+      "seq": "<seq>",
+      "text": "awaiting approval: bash \u2014 ls",
+      "ts": "<ts>",
+      "type": "approval_request"
+    }
+  ],
+  "violations": []
+}

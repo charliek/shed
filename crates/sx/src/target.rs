@@ -5,7 +5,7 @@
 //! | spelling | meaning |
 //! |---|---|
 //! | `local` (or omitted) | this machine, in-process engine, local tmux |
-//! | `machine:<name>` | a `machines:` entry — SSH to a native host running `shed-machine-rc` |
+//! | `machine:<name>` | a `machines:` entry — SSH to a native host running `sx` |
 //! | `shed:<name>` | a shed, resolved across the configured servers |
 //! | `shed:<name>@<server>` | the same, pinned to one server (skips the HTTP lookup) |
 //!
@@ -15,8 +15,12 @@
 
 use shed_core::config::{MachineEntry, ShedConfig};
 
-/// The remote RC helper a `machine:` target uses when its entry names none.
-pub const DEFAULT_MACHINE_RC_BIN: &str = "shed-machine-rc";
+/// The `sx` binary a `machine:` target invokes when its entry names none —
+/// resolved on the machine's non-login SSH `PATH`.
+pub const DEFAULT_MACHINE_SX_BIN: &str = "sx";
+
+/// The `sx` namespace carrying the one-shot engine verbs.
+const RC_NAMESPACE: &str = "rc";
 
 /// The guest RC helper inside a shed. Baked into the `extensions`/`full` images
 /// and on the shed user's login PATH.
@@ -177,9 +181,19 @@ pub fn resolve(target: &Target, config: &ShedConfig) -> Result<Resolved, String>
     }
 }
 
-/// The RC helper binary to invoke on a machine target.
-pub fn machine_rc_bin(entry: &MachineEntry) -> &str {
-    entry.rc_bin.as_deref().unwrap_or(DEFAULT_MACHINE_RC_BIN)
+/// The RC argv prefix to invoke on a machine target: `<sx> rc`.
+/// `machines[].rc_bin` names WHERE SX LIVES on that machine — an absolute path
+/// when it is not on the non-login `PATH` an SSH exec sees — and the `rc`
+/// namespace is always appended.
+pub fn machine_rc_prefix(entry: &MachineEntry) -> Vec<String> {
+    vec![
+        entry
+            .rc_bin
+            .as_deref()
+            .unwrap_or(DEFAULT_MACHINE_SX_BIN)
+            .to_string(),
+        RC_NAMESPACE.to_string(),
+    ]
 }
 
 /// `~/.shed/config.yaml` — the same path the Go CLI computes
@@ -287,26 +301,33 @@ mod tests {
 machines:
     mini2:
         host: mini2.local
-        rc_bin: /opt/homebrew/bin/shed-machine-rc
+        rc_bin: /opt/homebrew/bin/sx
     plain: {}
 ",
         )
     }
 
     #[test]
-    fn resolving_a_machine_reads_its_entry_and_its_binary() {
+    fn resolving_a_machine_reads_its_entry_and_its_rc_prefix() {
         let cfg = config();
         let Resolved::Machine(entry) = resolve(&parse("machine:mini2"), &cfg).unwrap() else {
             panic!("expected a machine");
         };
         assert_eq!(entry.host, "mini2.local");
-        assert_eq!(machine_rc_bin(&entry), "/opt/homebrew/bin/shed-machine-rc");
+        // An override says WHERE sx lives; the `rc` namespace is still appended.
+        assert_eq!(
+            machine_rc_prefix(&entry),
+            vec!["/opt/homebrew/bin/sx".to_string(), "rc".to_string()]
+        );
 
         let Resolved::Machine(entry) = resolve(&parse("machine:plain"), &cfg).unwrap() else {
             panic!("expected a machine");
         };
         assert_eq!(entry.host, "plain");
-        assert_eq!(machine_rc_bin(&entry), DEFAULT_MACHINE_RC_BIN);
+        assert_eq!(
+            machine_rc_prefix(&entry),
+            vec!["sx".to_string(), "rc".to_string()]
+        );
     }
 
     #[test]

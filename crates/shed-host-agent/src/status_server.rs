@@ -196,6 +196,19 @@ pub fn render_status(out: &mut dyn Write, ls: &LiveStatus) {
     }
     let _ = writeln!(out);
 
+    // The machine rc-hub role (plan 010 §2.6): one line answering "is the
+    // machine hub up" without log-diving. An EMPTY state means the daemon
+    // predates the field (`RcHubStatus`'s decode default) — omit the line
+    // rather than assert a state that daemon never reported.
+    if !ls.rc_hub.state.is_empty() {
+        if ls.rc_hub.addr.is_empty() {
+            let _ = writeln!(out, "RC hub:   {}", ls.rc_hub.state);
+        } else {
+            let _ = writeln!(out, "RC hub:   {}  ({})", ls.rc_hub.state, ls.rc_hub.addr);
+        }
+        let _ = writeln!(out);
+    }
+
     let _ = writeln!(out, "Servers ({}):", ls.servers.len());
     if ls.servers.is_empty() {
         let _ = writeln!(out, "  (none being watched)");
@@ -360,6 +373,10 @@ mod tests {
                 client_name: "ShedDesktop".to_string(),
                 client_version: "1.2.0".to_string(),
             },
+            rc_hub: shed_broker::status::RcHubStatus {
+                state: "listening".to_string(),
+                addr: "127.0.0.1:1029".to_string(),
+            },
             servers: vec![ServerHealth {
                 name: "mac".to_string(),
                 url: "http://localhost:8080".to_string(),
@@ -386,6 +403,8 @@ mod tests {
             "Approval channel:",
             "  socket    /Users/x/Library/Application Support/shed/host-agent.sock",
             "  consumer  connected (ShedDesktop 1.2.0)",
+            "",
+            "RC hub:   listening  (127.0.0.1:1029)",
             "",
             "Servers (1):",
             "  mac  (http://localhost:8080)",
@@ -414,6 +433,10 @@ mod tests {
                 consumer_connected: true,
                 client_name: "App".to_string(),
                 client_version: String::new(),
+            },
+            rc_hub: shed_broker::status::RcHubStatus {
+                state: "listening".to_string(),
+                addr: "127.0.0.1:1029".to_string(),
             },
             servers: vec![
                 ServerHealth {
@@ -452,6 +475,8 @@ mod tests {
             "  socket    /s.sock",
             "  consumer  connected (App)",
             "",
+            "RC hub:   listening  (127.0.0.1:1029)",
+            "",
             "Servers (2):",
             "  (default)  (http://localhost:8080)",
             "    ok  ssh-agent           connected",
@@ -484,6 +509,10 @@ mod tests {
                 client_name: String::new(),
                 client_version: String::new(),
             },
+            rc_hub: shed_broker::status::RcHubStatus {
+                state: "listening".to_string(),
+                addr: "127.0.0.1:1029".to_string(),
+            },
             servers: vec![],
         };
         let mut out: Vec<u8> = Vec::new();
@@ -494,10 +523,30 @@ mod tests {
             "Approval policies:",
             "none connected",
             "fail closed",
+            "RC hub:   listening",
             "Servers (0):",
             "(none being watched)",
         ] {
             assert!(got.contains(landmark), "missing {landmark:?} in:\n{got}");
         }
+    }
+
+    /// Version skew (plan 010 H11): a snapshot from a daemon that predates the
+    /// rc-hub field decodes to an EMPTY state — the renderer omits the line
+    /// rather than reporting a state that daemon never claimed.
+    #[test]
+    fn render_status_omits_the_rc_hub_line_when_unreported() {
+        let mut ls = sample_status();
+        ls.rc_hub = shed_broker::status::RcHubStatus::default();
+        let mut out: Vec<u8> = Vec::new();
+        render_status(&mut out, &ls);
+        let got = String::from_utf8(out).unwrap();
+        assert!(
+            !got.contains("RC hub"),
+            "unreported must render nothing:\n{got}"
+        );
+        // The rest of the report is unaffected.
+        assert!(got.contains("Approval channel:"), "{got}");
+        assert!(got.contains("Servers ("), "{got}");
     }
 }

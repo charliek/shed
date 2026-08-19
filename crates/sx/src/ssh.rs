@@ -173,7 +173,7 @@ mod tests {
             host: "mini2.local".into(),
             user: Some("charliek".into()),
             ssh_port: 2022,
-            rc_bin: Some("/opt/bin/shed-machine-rc".into()),
+            rc_bin: Some("/opt/bin/sx".into()),
             known_hosts: Some("/kh".into()),
         }
     }
@@ -189,7 +189,7 @@ mod tests {
 
     #[test]
     fn a_full_machine_entry_pins_user_port_and_host_key() {
-        let argv = machine_argv(&full(), &["shed-machine-rc".into(), "list".into()]);
+        let argv = machine_argv(&full(), &["sx".into(), "rc".into(), "list".into()]);
         assert_eq!(argv[0], "ssh");
         assert!(argv.contains(&"BatchMode=yes".to_string()));
         assert!(argv.contains(&"StrictHostKeyChecking=yes".to_string()));
@@ -198,12 +198,12 @@ mod tests {
         assert!(argv.contains(&"charliek@mini2.local".to_string()));
         // The remote command is one always-quoted line after the `--` terminator.
         assert_eq!(argv[argv.len() - 2], "--");
-        assert_eq!(argv[argv.len() - 1], "'shed-machine-rc' 'list'");
+        assert_eq!(argv[argv.len() - 1], "'sx' 'rc' 'list'");
     }
 
     #[test]
     fn a_bare_machine_entry_says_nothing_ssh_config_can_decide() {
-        let argv = machine_argv(&bare(), &["shed-machine-rc".into(), "list".into()]);
+        let argv = machine_argv(&bare(), &["sx".into(), "rc".into(), "list".into()]);
         // No host-key override, no -p: ~/.ssh/config keeps its say.
         assert!(!argv.iter().any(|a| a.starts_with("UserKnownHostsFile")));
         assert!(!argv.contains(&"StrictHostKeyChecking=yes".to_string()));

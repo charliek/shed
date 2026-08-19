@@ -291,7 +291,9 @@ live activity a one-shot exec cannot observe.
 > loopback: it is reachable solely through the server's `DialService` proxy (or an SSH
 > forward). Binding a non-loopback interface would expose an unauthenticated control
 > surface on a shed's shared bridge — never widen it. **The server-side proxy is the
-> authorization boundary**; the hub itself does no authz. The proxy also strips the
+> authorization boundary**; the hub itself does no authz. (On native **machines**
+> there is no proxy — the loopback bind plus the operator's SSH tunnel is the
+> boundary; see [the machine hub](sx.md#the-machine-hub).) The proxy also strips the
 > client's `Authorization`/`Cookie` before forwarding, so the guest-local hub never sees
 > server-API credentials.
 
@@ -307,7 +309,9 @@ live activity a one-shot exec cannot observe.
   `EADDRINUSE` verifies the holder's identity over `GET /v1/health` (see below) and, if
   it is a hub, exits 0 (a redundant start); a *foreign* process squatting the port is
   reported as an error, never mistaken for a hub. The pidfile under `~/.shed-rc-hub` is
-  advisory/debug only — the port bind decides ownership.
+  advisory/debug only — the port bind decides ownership. (The pidfile is a **Go-hub**
+  detail: the agent-hosted machine hub writes none — the daemon supervises the process
+  and `/v1/health` carries the pid.)
 - **Health identity.** `GET /v1/health` returns `{"app":"shed-rc-hub","version",
   "pid"}`. A bare open port proves only that *something* listens; the `app` token is what
   distinguishes a real hub from a squatter, and every start/probe path verifies it.

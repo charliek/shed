@@ -17,10 +17,10 @@ Two disciplines inherited from `tests/host-agent-diff/normalize.py`:
 The sentinels are exactly the axes on which two correct implementations (or two
 runs) must differ: a fresh uuid, a wall-clock stamp, the isolated HOME each leg
 runs under, the per-run pytest workdir a preseed records as a `projects` key, the
-loopback port opencode was handed, and the agent version a probe read. `<prog>` is
-the odd one out — the binary's own name, which is deliberately NOT the same on
-both sides (`shed-machine-rc` vs `sx`) and which the plan pins as a masked token
-rather than a divergence.
+loopback port opencode was handed, the pid of a resident daemon, and the agent
+version a probe read. `<prog>` is the odd one out — the binary's own name, which
+is deliberately NOT the same on both sides (`shed-machine-rc` vs `sx`) and which
+the plan pins as a masked token rather than a divergence.
 """
 
 from __future__ import annotations
@@ -31,6 +31,8 @@ from typing import Any
 
 MASK_ID = "<id>"
 MASK_TS = "<ts>"
+MASK_SEQ = "<seq>"
+MASK_PID = "<pid>"
 MASK_HOME = "<home>"
 MASK_PORT = "<port>"
 MASK_PROG = "<prog>"
@@ -320,4 +322,84 @@ def mask_stderr(text: str, home: str, *, truncate_after: str | None = None) -> s
         idx = out.find(truncate_after)
         assert idx >= 0, f"stderr {out!r} does not contain {truncate_after!r}"
         out = out[: idx + len(truncate_after)] + MASK_DETAIL
+    return out
+
+
+# --- Hub payloads (plan 010) ------------------------------------------------
+#
+# The hub family compares HTTP payloads from resident daemons rather than CLI
+# stdout; the D2/D3 disciplines are identical.
+
+
+def mask_hub_health(payload: dict) -> dict:
+    """Mask `/v1/health`: `app` is the byte-frozen identity token and is DIFFED;
+    `version` and `pid` are legitimately different per leg (the Go binary's
+    ldflags version vs the host-agent's crate version; two distinct daemons) and
+    are masked AFTER shape asserts, so a hub that reports an empty version or a
+    bogus pid fails rather than masks."""
+    assert isinstance(payload, dict), f"not a health payload: {payload!r}"
+    out = dict(payload)
+    assert out.get("app") == "shed-rc-hub", (
+        f"health.app is the byte-frozen identity token: {payload!r}"
+    )
+    version = out.get("version")
+    assert isinstance(version, str) and version.strip(), (
+        f"health.version must be a non-empty string: {payload!r}"
+    )
+    out["version"] = MASK_VERSION
+    pid = out.get("pid")
+    assert isinstance(pid, int) and pid > 0, (
+        f"health.pid must be a positive integer: {payload!r}"
+    )
+    out["pid"] = MASK_PID
+    return out
+
+
+def mask_hub_session(dto: dict, home: str) -> dict:
+    """Mask a hub `/v1/sessions` entry: the one-shot DTO masks, plus the activity
+    overlay's timestamp.
+
+    Diffed: `activity`, `last_message` and `pending_approvals` — a cell polls
+    until the activity has SETTLED, so the overlay is deterministic. Masked:
+    `activity_at`, a wall-clock stamp, after its shape assert — and the overlay
+    arrives or is absent as a WHOLE, so `activity_at` without `activity` fails
+    rather than masks."""
+    out = mask_session(dto, home)
+    if "activity_at" in out:
+        assert_rfc3339(out["activity_at"], "session.activity_at")
+        out["activity_at"] = MASK_TS
+        assert "activity" in out, (
+            f"activity_at without activity — the overlay must drop the whole "
+            f"dimension together: {dto!r}"
+        )
+    return out
+
+
+def mask_hub_sessions(payload: dict, home: str) -> dict:
+    """Mask a `/v1/sessions` envelope, ordering preserved (the hub lists in its
+    own order; the cells create sessions with pinned slugs so order is
+    deterministic)."""
+    assert isinstance(payload, dict), f"not a sessions envelope: {payload!r}"
+    out = dict(payload)
+    sessions = out.get("sessions")
+    assert isinstance(sessions, list), f"sessions missing/not a list: {payload!r}"
+    out["sessions"] = [mask_hub_session(s, home) for s in sessions]
+    return out
+
+
+def masked_feed_rows(rows: list) -> list:
+    """Mask a /messages feed row list for the hub cells: `seq` and `ts` are
+    SHAPE-ASSERTED before masking (the D3 discipline — a mask must never
+    invent the key it hides; these cells are the only place a non-empty feed
+    row is observed, so this is the wire's only seq/ts shape pin)."""
+    out = []
+    for row in rows:
+        masked = dict(row)
+        assert isinstance(masked.get("seq"), int) and masked["seq"] >= 1, (
+            f"feed row seq must be a positive integer: {row!r}"
+        )
+        assert_rfc3339(masked.get("ts"), "message.ts")
+        masked["seq"] = MASK_SEQ
+        masked["ts"] = MASK_TS
+        out.append(masked)
     return out

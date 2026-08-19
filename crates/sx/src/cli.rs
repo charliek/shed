@@ -7,8 +7,8 @@
 //! harness — is:
 //!
 //! - the same subcommands: `create`, `list`, `capabilities`, `probe`,
-//!   `accept-trust`, `prompt`, `kill`, `version` (the hub's `serve` is NOT ported;
-//!   plan 009 §0 keeps it in the Go binary);
+//!   `accept-trust`, `prompt`, `kill`, `version` (the hub's `serve` is not a
+//!   one-shot verb — the machine hub is a `shed-host-agent` role, plan 010);
 //! - the same stdin framing (`--prompt-stdin` / `--plan-stdin` + `--prompt-b64`),
 //!   including the CLI-level error messages, which are Go's verbatim;
 //! - wire-equivalent stdout — structurally-equal canonical JSON, one document +
@@ -52,11 +52,6 @@ pub const PROG: &str = "sx";
 /// `shed-machine-rc/<version>`), so the two implementations' provenance stamps
 /// differ only by the one token the harness masks.
 pub const DEFAULT_CREATED_BY: &str = PROG;
-
-/// The binary whose `serve` verb backs the local activity hub. The hub is NOT
-/// ported (plan 009 §0) — on a machine it stays the Go daemon, so `sx`'s
-/// ensure-hub hook simply drives it when it is installed.
-const HUB_BIN: &str = "shed-machine-rc";
 
 /// The top-level usage — owned by [`crate::porcelain`], which knows every verb.
 const USAGE: &str = crate::porcelain::USAGE;
@@ -629,38 +624,93 @@ fn read_plan_stdin(deps: &Deps) -> Result<String, EngineError> {
         .map_err(|_| EngineError::bad_args("plan is not valid UTF-8 (is stdin a binary file?)"))
 }
 
-/// The best-effort hub ensure: spawn `shed-machine-rc serve --detach` when that
-/// binary is on PATH.
-///
-/// The hub is not ported (plan 009 §0) — on a machine it stays the Go daemon — so
-/// this drives it rather than reimplementing it, and does nothing at all when the
-/// binary is absent (a machine with only `sx` simply has no activity hub). Never
-/// fatal: `create` has already succeeded by the time this runs, and the engine
-/// skips it entirely when `SHED_RC_NO_HUB` is set.
+/// The hub's fixed loopback address + byte-frozen health identity token —
+/// local mirrors of `shed_broker::rc_hub::hub::{HUB_ADDR, HUB_APP_ID}` (sx
+/// deliberately does not link shed-broker; its axum/notify/aws leaf deps
+/// belong to the daemon, not the porcelain).
+/// The probe targets the PRODUCTION port only, by design: the
+/// `SHED_RC_HUB_ADDR` env seam is a test seam (honored by the daemons, set by
+/// the parity harness — which also sets `SHED_RC_NO_HUB`, so sx's ensure
+/// never runs there), and sx's whole surface consistently ignores it.
+const HUB_ADDR: &str = "127.0.0.1:1029";
+const HUB_APP_ID: &str = "shed-rc-hub";
+
+/// The best-effort hub ensure, PROBE-ONLY (plan 010 §2.7; the spawn fallback
+/// died at H15 with the `shed-machine-rc` binary): a healthy hub answering on
+/// the fixed port means done. Otherwise a best-effort stderr hint names
+/// `shed-host-agent` as the machine hub's owner. Never fatal: `create` has
+/// already succeeded by the time this runs, and the engine skips it entirely
+/// when `SHED_RC_NO_HUB` is set.
 fn ensure_hub() {
-    let Some(bin) = look_path(HUB_BIN) else {
+    if hub_is_healthy(HUB_ADDR, std::time::Duration::from_millis(500)) {
         return;
-    };
-    let spawned = std::process::Command::new(bin)
-        .args(["serve", "--detach"])
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn();
-    match spawned {
-        // `serve --detach` double-forks and returns as soon as the port is up, so
-        // reaping it here is bounded; a child left unwaited would be a zombie for
-        // the rest of the (short) process lifetime. A NON-ZERO exit (e.g. a
-        // foreign process squatting the hub port) gets one best-effort line,
-        // matching Go's EnsureHub diagnostics (`hub.go:964`) — never an error.
-        Ok(mut child) => match child.wait() {
-            Ok(status) if !status.success() => {
-                eprintln!("{PROG}: rc hub ensure failed (best-effort): {HUB_BIN} serve --detach exited {status}");
-            }
-            _ => {}
-        },
-        Err(err) => eprintln!("{PROG}: rc hub ensure failed (best-effort): {err}"),
     }
+    eprintln!(
+        "{PROG}: no rc hub is running; install and start shed-host-agent to serve \
+the machine hub (best-effort — sessions still work, without live activity)"
+    );
+}
+
+/// ONE bounded identity check against `addr`'s `/v1/health` — the sx-local
+/// twin of the hub's `queryHubHealth` (hub.go:916): a dial + GET under one
+/// ABSOLUTE deadline, true only when a 200 body carries the byte-frozen
+/// `app` token. Any failure — nothing listening, a squatter, a slow peer —
+/// reads as "no healthy hub" and falls through to the spawn/hint path.
+pub(crate) fn hub_is_healthy(addr: &str, timeout: std::time::Duration) -> bool {
+    use std::io::{Read, Write};
+    let deadline = std::time::Instant::now() + timeout;
+    // Zero folds into None (std rejects a zero socket timeout) — the twin of
+    // the broker probe's rule (hub.rs).
+    let remaining = |d: std::time::Instant| {
+        d.checked_duration_since(std::time::Instant::now())
+            .filter(|left| !left.is_zero())
+    };
+    let probe = || -> Option<bool> {
+        let sock_addr: std::net::SocketAddr = addr.parse().ok()?;
+        let mut conn =
+            std::net::TcpStream::connect_timeout(&sock_addr, remaining(deadline)?).ok()?;
+        conn.set_write_timeout(Some(remaining(deadline)?)).ok()?;
+        conn.write_all(
+            format!("GET /v1/health HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n")
+                .as_bytes(),
+        )
+        .ok()?;
+        let mut buf = Vec::new();
+        let mut chunk = [0u8; 2048];
+        while buf.len() < 8192 {
+            // ONE sample: a deadline expiring between a guard and a re-read
+            // would otherwise arm set_read_timeout(None) = NO timeout — the
+            // exact unbounded-probe class the H11 review fixed hub-side.
+            let Some(left) = remaining(deadline) else {
+                break;
+            };
+            if conn.set_read_timeout(Some(left)).is_err() {
+                break; // judge whatever is buffered, as the broker probe does
+            }
+            match conn.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                Err(_) => break,
+            }
+        }
+        let text = String::from_utf8_lossy(&buf);
+        let (head, body) = text.split_once("\r\n\r\n")?;
+        // DELIBERATELY simpler than the broker probe: no chunked decoding and
+        // one flat 8 KiB cap. Both hubs emit a small Content-Length health
+        // body; anything else parses as not-a-hub, which errs toward the
+        // idempotent spawn fallback.
+        if head.split_whitespace().nth(1)? != "200" {
+            return Some(false);
+        }
+        // Tolerant one-value read: the app token is the identity, everything
+        // else on the body is the hub's own business.
+        let v: serde_json::Value = serde_json::Deserializer::from_str(body.trim())
+            .into_iter()
+            .next()?
+            .ok()?;
+        Some(v.get("app").and_then(|a| a.as_str()) == Some(HUB_APP_ID))
+    };
+    probe().unwrap_or(false)
 }
 
 /// Decode base64 with Go `encoding/base64.StdEncoding.DecodeString` semantics
@@ -678,21 +728,6 @@ fn decode_b64_go(input: &str) -> Result<Vec<u8>, base64::DecodeError> {
     );
     let stripped: String = input.chars().filter(|c| *c != '\r' && *c != '\n').collect();
     GO_STD.decode(stripped)
-}
-
-/// `exec.LookPath` for a bare binary name: the first executable match on `PATH`.
-fn look_path(bin: &str) -> Option<std::path::PathBuf> {
-    let path = std::env::var_os("PATH")?;
-    std::env::split_paths(&path)
-        .map(|dir| dir.join(bin))
-        .find(|candidate| is_executable(candidate))
-}
-
-fn is_executable(path: &std::path::Path) -> bool {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::metadata(path)
-        .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
-        .unwrap_or(false)
 }
 
 #[cfg(test)]

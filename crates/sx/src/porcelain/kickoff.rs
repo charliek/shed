@@ -23,7 +23,7 @@ use shed_core::rc_agents;
 
 use crate::args::Parsed;
 use crate::cli::{Deps, DEFAULT_CREATED_BY};
-use crate::porcelain::{remote_bin, remote_exec, resolve_target, VerbError, VerbResult};
+use crate::porcelain::{remote_exec, remote_prefix, resolve_target, VerbError, VerbResult};
 use crate::target::{Resolved, Target};
 
 /// What rides on the remote create's stdin (the owned twin of
@@ -238,9 +238,9 @@ pub fn execute(
             .engine(kickoff.interactive_shell)
             .create(kickoff.create_options())?),
         remote => {
-            let bin = remote_bin(deps, remote)?;
-            let (argv, stdin) = kickoff.remote_invocation(&bin)?;
-            let stdout = remote_exec(deps, remote, &argv, stdin)?;
+            let prefix = remote_prefix(deps, remote)?;
+            let (argv, stdin) = kickoff.remote_invocation(prefix.bin())?;
+            let stdout = remote_exec(deps, remote, &prefix.splice(argv), stdin)?;
             rc::decode_session(&stdout).map_err(|e| VerbError::failed(e.to_string()))
         }
     }

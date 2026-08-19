@@ -19,6 +19,10 @@ shed-core = { path = "../shed-core" }
 # It carries the heavy leaf deps (aws-sdk-*/notify/saphyr-parser); keeping it optional
 # means a default `shed-app` (and the mac FFI build) never links them.
 shed-broker = { path = "../shed-broker", optional = true }
+# The graduated one-shot RC engine (plan 010 H2) — ONLY under the non-default `rc`
+# feature; `lib.rs` re-exports it as `shed_app::rc_engine` so sx and the desktop
+# keep their pre-graduation paths.
+shed-rc-engine = { path = "../shed-rc-engine", optional = true }
 # `net` (UnixStream) + `io-util` (buffered line reader) for the host-agent UDS
 # client, on top of the workspace's rt/macros/sync/time.
 tokio = { workspace = true, features = ["net", "io-util"] }
@@ -37,19 +41,22 @@ chrono = { version = "0.4", default-features = false, features = ["std"] }
 libc = "0.2"
 
 [features]
-# The Remote-Control layer (`rc.rs`): process/SSH spawning via `tokio/process`.
-# NON-default so a featureless consumer of `shed-app` (e.g. the mac FFI build,
-# which has no RC pane) never compiles it; the Tauri client enables it. `make test`
-# must pass `--features rc` or the rc unit tests are cfg'd out.
-rc = ["tokio/process"]
+# The Remote-Control layer: `rc.rs` (process/SSH spawning via `tokio/process`)
+# plus the graduated engine crate re-exported as `rc_engine`. NON-default so a
+# featureless consumer of `shed-app` (e.g. the mac FFI build, which has no RC
+# pane) never compiles either; the Tauri client enables it. `make test` must
+# pass `--features rc` or the rc unit tests are cfg'd out.
+rc = ["dep:shed-rc-engine", "tokio/process"]
 # The engine's test doubles (`rc_engine::fake` — the fake tmux runner + the env
 # table) exported for ANOTHER crate's tests, today `sx`'s dispatch tests, which
 # must assert against the same recorded-argv shape the engine's own tables do.
+# Forwards to the graduated crate's feature (the `?` keeps the dep optional —
+# enabling test-support alone must not drag the engine in without `rc`).
 # NON-default and named `test-support` so it is unmistakable: a consumer enabling
 # it in `[dependencies]` (rather than `[dev-dependencies]`) is doing it wrong —
 # the module is `#[cfg]`'d in only under `test` or this feature, so a shipped
 # binary never carries it.
-test-support = []
+test-support = ["shed-rc-engine?/test-support"]
 # The in-process broker bridge (`broker_bridge.rs`): the embedded host-agent replacement
 # backed by `shed-broker`. NON-default (mirrors `rc`) so a featureless `shed-app` stays
 # broker-free — `cargo test --features broker` runs its unit tests.

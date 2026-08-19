@@ -10,13 +10,14 @@ It is a Rust CLI built from `crates/sx` on the shared client core (`shed-core` +
 | Layer | Commands | Contract |
 |------|----------|----------|
 | Porcelain | `agent`, `plan`, `ls`, `watch`, `attach`, `kill` | Human/skill-facing. Chooses defaults, prints prose, reaches remote targets. |
-| Engine-compat | `sx rc <subcommand>` | The ported one-shot RC engine, wire-compatible with [`shed-machine-rc <subcommand>`](shed-machine-rc.md). |
+| Engine-compat | `sx rc <subcommand>` | The one-shot RC engine — the frozen wire a `machine:` target speaks, and what the [retired `shed-machine-rc`](shed-machine-rc.md) used to serve (the `tests/rc-parity` differential suite is the standing proof). |
 
 !!! warning "Unreleased"
     `sx` ships in no release component — no Homebrew formula, no `.deb`, no GitHub
     release artifact. It is built from source (below) and its surface may change without
-    a deprecation cycle. `shed-machine-rc` and `shed-ext-rc` remain the released,
-    supported RC binaries.
+    a deprecation cycle. `shed-ext-rc` remains the released, supported guest RC
+    binary. Machine targets need `sx` present on the far side — see
+    [Build and install](#build-and-install).
 
 ## Build and install
 
@@ -68,7 +69,7 @@ machines:
 | `host` | the entry name | SSH hostname or IP. |
 | `user` | ssh's own default | SSH login user. |
 | `ssh_port` | `22` | SSH port. |
-| `rc_bin` | `shed-machine-rc` | RC helper on the machine. Use an absolute path when the binary is not on the **non-login** `PATH` an SSH exec sees (Homebrew's `/opt/homebrew/bin` typically is not). |
+| `rc_bin` | `sx` | Where `sx` lives on that machine — the remote invocation is always `<rc_bin> rc <verb>`. Set an absolute path when `sx` is not on the **non-login** `PATH` an SSH exec sees (Homebrew's `/opt/homebrew/bin` typically is not). |
 | `known_hosts` | ssh's own default | `UserKnownHostsFile` to pin against; same semantics as a server entry. |
 
 !!! warning "Older `shed` CLIs delete this section"
@@ -131,7 +132,7 @@ The rules that change behavior per target and per tool:
 | Permission posture | `sx agent claude` defaults to `auto` (the posture the `shed-machine-rc claude` verb it absorbs used). Every other tool gets **no posture flag** — its own default — because "auto" means something different in each agent's CLI. `sx plan` defaults to `auto` for every tool, matching `shed plan`. |
 | Waiting | Kickoff verbs wait for the session to reach `ready` and then deliver the prompt/plan. `--no-wait` (agent only) is **rejected together with `-p`/`--plan`**: a kickoff is delivered only after the pane is ready, so "don't wait" and "deliver this" contradict each other. |
 | Exit code | A waiting create that did not reach `ready` exits non-zero (a script can tell `ready` from `needs-auth`/`starting`); `--no-wait` always exits `0`. Remote engine exit classes `2`/`3`/`4` pass through the SSH hop verbatim; anything else — including a transport failure — collapses to `1`. |
-| Hub | On a create, `sx` best-effort spawns `shed-machine-rc serve --detach` when that binary is on `PATH` (the [activity hub](rc-helper.md#the-rc-activity-hub-serve) is not ported — on a machine it stays the Go daemon). Failure is a stderr line, never fatal. Set `SHED_RC_NO_HUB=1` to skip it entirely. |
+| Hub | On a create, `sx` best-effort probes the [machine hub](#the-machine-hub) (`GET /v1/health` on the fixed port); when nothing healthy answers it prints a one-line stderr hint naming `shed-host-agent` as the hub's owner — never fatal, and it never spawns anything. Set `SHED_RC_NO_HUB=1` to skip it entirely. |
 
 ### Observing
 
@@ -180,6 +181,44 @@ the agreed value to a committed golden. Preseed artifacts (`~/.claude.json`,
 — a mixed fleet rewrites those files in place, so merge idempotence only survives if both
 implementations write identical bytes. Run it with `make test-rc-parity`.
 
+## The machine hub
+
+Live activity on a machine (`sx ls` activity columns, `sx watch`) comes from the
+**machine RC hub** — the same loopback HTTP service a shed runs, bound to
+`127.0.0.1:1029`. **`shed-host-agent` hosts it**, as a supervised resident role:
+the daemon binds the port at startup and keeps the hub up for as long as it
+runs. Opt out with `rc_hub.enabled: false` in the agent's config.
+
+Because the daemon is supervised (brew services / systemd), the hub does not
+come and go with session activity — unlike the retired `shed-machine-rc serve`,
+which exited after 15 idle minutes. If some other process already holds the
+port, the agent logs it, retries with backoff, and takes over when the port
+frees.
+
+`sx` itself is **probe-only**: create's best-effort hub ensure checks
+`GET /v1/health` on the fixed port and is done if a healthy hub answers;
+otherwise it prints a one-line stderr hint naming the agent as the hub's
+owner. It never starts a hub. Sessions work without one; only live activity
+is missing.
+
+**The trust model is the machine's own.** There is no server proxy on a
+machine: the hub binds loopback only and does no authorization — the loopback
+bind plus your SSH tunnel (`ssh -L`) IS the boundary. Never widen the bind.
+Note what "local" means here: every process of every app running under any
+uid that can reach loopback on the machine — not a sandboxed VM. That is
+still the machine's existing trust boundary (a local process that could POST
+to the hub's cursor-hook ingest could already drive the same tmux session
+directly with `send-keys`), so the hub adds a convenience channel within
+local trust, not a new boundary — but the scope of "local" is the whole
+machine, and it is worth saying plainly.
+
+**Machine-posture deltas from the guest hub** (deliberate, not drift): inside
+the agent the hub is a supervised resident role — no 15-minute idle exit, no
+detach double-fork, no pidfile; at zero sessions the watchers quiesce and the
+recurring cost is one `tmux ls` per idle tick. The agent's bind loop retries
+rather than exits, so a permanently held port shows up as `RC hub: deferred`
+in `shed-host-agent status`, not a dead daemon.
+
 ## v1 limits
 
 - **mTLS-enrolled servers need the shed host agent running.** Locating an unqualified
@@ -208,5 +247,5 @@ implementations write identical bytes. Run it with `make test-rc-parity`.
 
 - [`shed-ext-rc` (RC session helper)](rc-helper.md) — the wire contract, kinds,
   permission modes, JSON DTO, exit codes, and the activity hub.
-- [`shed-machine-rc`](shed-machine-rc.md) — the released Go engine on native machines,
-  and the hub `sx watch` reads from.
+- [`shed-machine-rc`](shed-machine-rc.md) — the retired Go engine this
+  replaced (tombstone).

@@ -15,7 +15,11 @@ workspace = true
 
 [dependencies]
 serde = { workspace = true }
-serde_json = { workspace = true }
+# `raw_value` (feature-only, no new deps): rc_hub's folds keep tool-input
+# payloads as raw bytes so their compact-JSON detail rendering preserves the
+# producer's key order, exactly like Go's json.Compact — a decoded Value would
+# re-sort object keys and diverge from the Go hub's feed rows.
+serde_json = { workspace = true, features = ["raw_value"] }
 thiserror = { workspace = true }
 # net (UnixListener/UnixStream) + io-util (AsyncWriteExt/BufReader) + sync
 # (mpsc/oneshot/watch) + process (the SSH-bootstrap minter shells `ssh` via
@@ -28,6 +32,21 @@ libc = "0.2"
 # leaf-cert TLS pin verifier (tls.rs). Always-on because the bus is not
 # feature-gated.
 shed-core = { path = "../shed-core" }
+# The RC engine (plan 010): rc_hub sits on its tmux verb layer (the
+# show/set-environment seams under the correlation back-write land in H4; the
+# reconcile loop's capture/list verbs follow). This dep is exactly why the
+# engine graduated out of shed-app — a broker→shed-app dep would cycle through
+# shed-app's `broker` feature.
+shed-rc-engine = { path = "../shed-rc-engine" }
+# rc_hub's pane-stability normalizers + the ANSI-escape stripper (ports of the
+# Go `regexp` tables in stability.go / activity.go). Same pin as shed-core's.
+regex = "1"
+# rc_hub's time currency: the hub's freshness windows, ring timestamps, and
+# JSONL correlation stamps all mirror Go `time.Time` semantics (sub-second
+# durations, RFC3339(nano) parse, second-precision UTC `Z` format). Same
+# minimal pin as shed-rc-engine's clock seam; no `clock` feature — the hub is
+# clock-injected end to end.
+chrono = { version = "0.4", default-features = false, features = ["std"] }
 async-trait = { workspace = true }
 uuid = { workspace = true }
 # The host-agent config reader's YAML parser (config.rs `yaml_lite` mod). The repo's
@@ -56,6 +75,32 @@ notify = "8"
 # unifies one reqwest/rustls build across the workspace.
 reqwest = { workspace = true }
 futures-util = { workspace = true }
+# The rc hub's HTTP shell (plan 010 H10, §2.2 — user-directed house stack):
+# axum 0.8 routes the frozen /v1 surface; the Router is served from a manual
+# accept loop (NOT axum::serve) so the Go server's per-connection posture —
+# ReadHeaderTimeout 10s, deliberately NO global write timeout (hub.go:747-757)
+# — is set per-connection.
+# hyper's http1 server conn is used DIRECTLY (not hyper-util's `auto` builder,
+# whose server-auto feature also serves h2c): Go's hub listens on a plain
+# net.Listener and is HTTP/1.1-only, so an h2c surface would be a wire shape
+# the original does not have.
+# Default axum features are trimmed to what the hub uses: no json/form
+# extractors (contract-shaped body handling is manual), no ws, no multipart,
+# and no `tokio` (that feature exists for axum::serve / into_make_service,
+# neither of which the hand-rolled accept loop needs).
+# hyper/http/bytes are the same builds reqwest already pulls — cargo unifies.
+# Leaf-crate only: the §7 reverse-dep AC (`cargo tree -i axum`) proves it does
+# NOT reach shed-core / shed-core-ffi / default-features shed-app.
+axum = { version = "0.8", default-features = false, features = ["http1", "query"] }
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio", "service"] }
+http = "1"
+bytes = "1"
+# Go's url.Values.Get contract for the hub's query params: FIRST occurrence
+# wins on duplicates (H10 review: axum's Query<HashMap> is last-wins, which
+# flipped live outcomes on duplicated slug/event/since params). Same build
+# reqwest's `url` already pulls — no new node.
+form_urlencoded = "1"
 # Named directly (rather than reached through shed-core) for the two client-identity types
 # the credential source owns: `rustls::sign::CertifiedKey` (the assembled leaf+key it arms)
 # and, via shed-core, the `ClientCertResolver` it writes through on every rotation. Same

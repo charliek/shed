@@ -1,0 +1,7 @@
+{
+  "body": {
+    "error": "invalid_decision",
+    "message": "decision must be one of allow, allow_always, deny"
+  },
+  "status": 400
+}

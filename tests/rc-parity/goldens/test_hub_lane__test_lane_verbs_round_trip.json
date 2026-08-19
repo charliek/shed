@@ -1,0 +1,55 @@
+{
+  "conflict": {
+    "body": {
+      "error": "already_resolved",
+      "message": "this approval was already resolved"
+    },
+    "status": 409
+  },
+  "interrupt": {
+    "body": {
+      "interrupting": true
+    },
+    "status": 202
+  },
+  "replay": {
+    "body": {
+      "decision": "allow",
+      "resolved": true
+    },
+    "status": 200
+  },
+  "replay_posted_again": false,
+  "resolve": {
+    "body": {
+      "decision": "allow",
+      "resolved": true
+    },
+    "status": 200
+  },
+  "turn": {
+    "body": {},
+    "handle": "<turn_id>",
+    "status": 202
+  },
+  "upstream_bodies": {
+    "abort": {},
+    "per_1": {
+      "response": "once"
+    },
+    "prompt_async": {
+      "parts": [
+        {
+          "text": "run the tests",
+          "type": "text"
+        }
+      ]
+    }
+  },
+  "upstream_posts": [
+    "abort",
+    "per_1",
+    "prompt_async"
+  ],
+  "violations": []
+}

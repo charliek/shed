@@ -5,18 +5,58 @@ All notable changes to this project will be documented in this file.
 <!--
   `**Ships:**` convention: each release entry opens with a `**Ships:** …`
   line naming the components that tag actually shipped, using the
-  canonical tokens `server`, `host-agent`, `machine-rc`, `desktop`
+  canonical tokens `server`, `host-agent`, `desktop`
   (comma-separated; legacy `server/CLI` is accepted as an alias for
-  `server`, for entries written before the rename). A component ships iff
+  `server`, for entries written before the rename; `machine-rc` appears in
+  historical entries but is REJECTED on new ones — the component was
+  retired in plan 010). A component ships iff
   its version manifest equals the tag (server: .claude-plugin/plugin.json;
-  host-agent: crates/shed-host-agent/VERSION; machine-rc:
-  cmd/shed-machine-rc/VERSION; desktop: desktop/VERSION) — see
+  host-agent: crates/shed-host-agent/VERSION; desktop: desktop/VERSION) — see
   RELEASING.md "Component selection". ENFORCED by
   scripts/release/release-plan.sh on stable tags (a mismatched, missing,
   unknown, or duplicate token fails the release); prerelease tags have no
   entry and are exempt. shed-desktop's pre-monorepo changelog stays in the
   archived charliek/shed-desktop repo.
 -->
+
+## Unreleased
+
+_Staged by plan 010 (the machine-hub port + retirement); at release time fold
+this body into the new `## vX.Y.Z` section and replace this note with a real
+`**Ships:**` line — **host-agent** (the hub lands there; the `machine-rc`
+token is retired and release-plan.sh now rejects it). release-plan.sh never
+reads an `## Unreleased` heading._
+
+- **The machine RC hub moves into `shed-host-agent`.** The daemon hosts the
+  activity hub (`127.0.0.1:1029`) as a supervised resident role: bind-as-lock
+  with a polite defer-and-retry while an older `shed-machine-rc serve` holds
+  the port, `rc_hub.enabled` config knob (default on), an `RC hub:` line in
+  `shed-host-agent status` (+ the `rc_hub` LiveStatus field), and a
+  `shed-host-agent rc-hub` foreground diagnostic subcommand. The hub itself is
+  a Rust port of the Go hub (`shed-broker`'s `rc_hub`), wire-identical at
+  `/v1` under the `tests/rc-parity` hub differential family (snapshot, SSE,
+  side-effect, opencode-lane, and cursor-ingest cells — both daemons run side
+  by side in CI).
+- **`sx` create's hub ensure is probe-first** (now probe-only, below): a
+  healthy hub of either provider short-circuits.
+- Machine-posture docs: `docs/extensions/sx.md` gains "The machine hub"
+  (trust model: loopback + SSH tunnel is the boundary; no proxy on machines),
+  `shed-machine-rc.md` carries the retirement note.
+- **The `machine-rc` component is retired** (plan 010 H15, evidence-gated on
+  live e2e on this Mac + mini3). `cmd/shed-machine-rc`,
+  `.goreleaser.machine-rc.yaml`, and the component wiring (release scripts,
+  CI snapshot leg, apt dispatch) are deleted;
+  `update-version.sh`/`release-plan.sh` reject the `machine-rc` token, and
+  `publish-images.yaml` fails loudly if a re-dispatched pre-retirement tag
+  plans `ship_machine_rc=true`. The parity harness's Go oracle relocated to
+  `tests/rc-parity/oracle/` (byte-identical main, test-only, same
+  `shed-machine-rc` identity the goldens pin). `sx --on machine:` targets now
+  default to the remote `sx rc <verb>` argv (wire-identical; the
+  `machines[].rc_bin` override now names WHERE `sx` LIVES on that machine),
+  and `sx`'s create-time hub ensure no longer spawns anything — it probes,
+  and hints at `shed-host-agent` when nothing answers. Artifacts published
+  before the retirement are not withdrawn but are unsupported; the intended
+  move is `sx` + `shed-host-agent`.
 
 ## v0.8.2 — 2026-08-17
 

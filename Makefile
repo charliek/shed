@@ -1,4 +1,4 @@
-.PHONY: build build-cli build-server build-egress-proxy build-agent build-firstboot build-machine-rc build-tools build-fc-remote-server test test-integration test-host-agent-diff test-rc-parity test-integration-dev test-integration-dev-fc dev-server-up dev-server-down dev-server-status dev-server-logs dev-server-restart dev-server-up-fc dev-server-down-fc dev-server-status-fc dev-server-logs-fc dev-server-restart-fc release clean dev-server dev-cli check check-kernel-pin coverage lint-all docs docs-serve firecracker-rootfs download-firecracker vz-rootfs vz-rootfs-base vz-rootfs-all
+.PHONY: build build-cli build-server build-egress-proxy build-agent build-firstboot build-tools build-fc-remote-server test test-integration test-host-agent-diff test-rc-parity test-integration-dev test-integration-dev-fc dev-server-up dev-server-down dev-server-status dev-server-logs dev-server-restart dev-server-up-fc dev-server-down-fc dev-server-status-fc dev-server-logs-fc dev-server-restart-fc release clean dev-server dev-cli check check-kernel-pin coverage lint-all docs docs-serve firecracker-rootfs download-firecracker vz-rootfs vz-rootfs-base vz-rootfs-all
 
 GOARCH ?= $(shell go env GOARCH)
 
@@ -8,7 +8,7 @@ BUILD_DATE := $(shell date -u +"%Y-%m-%dT%H:%M:%SZ")
 LDFLAGS := -ldflags "-X github.com/charliek/shed/internal/version.Version=$(VERSION) -X github.com/charliek/shed/internal/version.GitCommit=$(GIT_COMMIT) -X github.com/charliek/shed/internal/version.BuildDate=$(BUILD_DATE)"
 
 # Build all binaries
-build: build-cli build-server build-egress-proxy build-agent build-firstboot build-machine-rc
+build: build-cli build-server build-egress-proxy build-agent build-firstboot
 
 # Build CLI only
 build-cli:
@@ -29,10 +29,6 @@ build-agent:
 # Build shed-firstboot only (in-VM oneshot for identity regen)
 build-firstboot:
 	GOOS=linux GOARCH=$(GOARCH) go build $(LDFLAGS) -o bin/shed-firstboot ./cmd/shed-firstboot
-
-# Build shed-machine-rc only (host-side machine rc helper)
-build-machine-rc:
-	go build $(LDFLAGS) -o bin/shed-machine-rc ./cmd/shed-machine-rc
 
 # Desktop app targets live in desktop/Makefile; `make desktop-<target>` forwards
 # (e.g. `make desktop-build`, `make desktop-test`). `desktop-` is a reserved
@@ -82,8 +78,9 @@ test-host-agent-diff:
 
 # Go↔Rust RC-engine parity harness (the FOURTH pytest suite — never merged with
 # tests/integration, tests/host-agent-diff or desktop/tools/shedtest). It builds
-# BOTH one-shot implementations — `shed-machine-rc` (Go, the oracle) and `sx`
-# (Rust) — runs each scenario against both against a hermetic tmux server, asserts
+# BOTH one-shot implementations — the Go oracle (tests/rc-parity/oracle, the
+# retired shed-machine-rc's main, kept test-only) and `sx` (Rust) — runs each
+# scenario against both against a hermetic tmux server, asserts
 # the two agree under tests/rc-parity/normalize.py, and pins the agreed value to a
 # committed golden. Needs Go, Rust (cargo on PATH), uv, and tmux >= 3.2.
 # See tests/rc-parity/README.md.

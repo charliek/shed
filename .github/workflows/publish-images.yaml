@@ -5,10 +5,13 @@ name: Publish Images and Release
 #
 #   release-plan                    (~10 s)   which components does this tag
 #                                             ship? (ship_server /
-#                                             ship_host_agent /
-#                                             ship_machine_rc / ship_desktop,
+#                                             ship_host_agent / ship_desktop,
 #                                             plus ship_goreleaser = any of
-#                                             the first three)
+#                                             the first two). Fails LOUDLY on
+#                                             a re-dispatched pre-retirement
+#                                             tag whose own release-plan.sh
+#                                             says ship_machine_rc=true (the
+#                                             component was retired, plan 010)
 #
 #   Server component (ship_server):
 #   1. publish-build-tools          (~2 min)  shed-build-tools image
@@ -17,10 +20,10 @@ name: Publish Images and Release
 #                                             (no needs — runs in parallel
 #                                             with the image chain)
 #
-#   Goreleaser components (ship_goreleaser — server, host-agent, machine-rc):
+#   Goreleaser components (ship_goreleaser — server, host-agent):
 #   4. release                      (~5 min)  one goreleaser invocation PER
 #                                             SHIPPING component (config order
-#                                             server → host-agent → machine-rc,
+#                                             server → host-agent,
 #                                             .goreleaser.<component>.yaml) +
 #                                             per-component apt-charliek
 #                                             dispatches — fires only on
@@ -59,8 +62,8 @@ name: Publish Images and Release
 # needs skippable jobs, so each carries an explicit `!cancelled() && …`
 # or `always() && …` guard: a skipped upstream must not block, a FAILED
 # upstream must, and a user-cancelled run must publish nothing). Traced
-# per scenario (tag push; "helper" = host-agent and/or machine-rc with
-# ship_server false):
+# per scenario (tag push; "helper" = host-agent with ship_server
+# false):
 #
 #   job                    | server tag  | helper-only tag | desktop-only tag | combined (srv+desk)
 #   -----------------------|-------------|-----------------|------------------|--------------------
@@ -117,8 +120,8 @@ name: Publish Images and Release
 # desktop-release-create re-runs only for desktop-only tags and is
 # idempotent (reuses the existing release). Dispatching a PRE-MIGRATION
 # tag runs that tag's old two-output release-plan.sh — the shim in the
-# release-plan step maps legacy ship_go to the three goreleaser
-# components so image republishes of old tags keep working.
+# release-plan step maps legacy ship_go to the goreleaser components so
+# image republishes of old tags keep working.
 
 on:
   push:
@@ -141,8 +144,8 @@ concurrency:
 jobs:
   # Which components does this tag ship? A component ships iff its version
   # manifest equals the tag (server: .claude-plugin/plugin.json; host-agent:
-  # crates/shed-host-agent/VERSION; machine-rc: cmd/shed-machine-rc/VERSION;
-  # desktop: desktop/VERSION, with the crates/tauri surfaces lockstep-verified).
+  # crates/shed-host-agent/VERSION; desktop: desktop/VERSION, with the
+  # crates/tauri surfaces lockstep-verified).
   # scripts/release/release-plan.sh fails loudly when NO manifest matches
   # (forgotten update-version.sh run) and cross-checks the CHANGELOG's
   # **Ships:** line on stable tags, which fails this job and skips the
@@ -153,10 +156,9 @@ jobs:
     outputs:
       ship_server: ${{ steps.plan.outputs.ship_server }}
       ship_host_agent: ${{ steps.plan.outputs.ship_host_agent }}
-      ship_machine_rc: ${{ steps.plan.outputs.ship_machine_rc }}
       ship_desktop: ${{ steps.plan.outputs.ship_desktop }}
-      # true iff any of server/host-agent/machine-rc — computed in the
-      # script (bash-tested) so workflow expressions never re-derive it.
+      # true iff any of server/host-agent — computed in the script
+      # (bash-tested) so workflow expressions never re-derive it.
       ship_goreleaser: ${{ steps.plan.outputs.ship_goreleaser }}
     steps:
       - name: Checkout
@@ -175,12 +177,33 @@ jobs:
           # stdout is exactly the ship_* key=value lines; diagnostics go
           # to stderr (still visible in the log).
           scripts/release/release-plan.sh "$VERSION" > plan.out
+          # Old-tag guard (plan 010): the machine-rc component is RETIRED —
+          # this workflow (from the dispatching ref) has no machine-rc jobs.
+          # A POST-migration, PRE-retirement tag's own release-plan.sh (from
+          # the checked-out tag) can still emit ship_machine_rc=true;
+          # silently ignoring it would be exactly the silent-no-ship failure
+          # the exit-1 guard exists to prevent. Scope by event: on a tag
+          # PUSH (the only event whose `release` job builds goreleaser
+          # artifacts) fail loudly; on a workflow_dispatch image republish
+          # the `release` job never runs anyway (tag-push gated), so a hard
+          # fail would only break the documented image-recovery path for
+          # every pre-retirement tag — warn loudly and continue instead.
+          if grep -q '^ship_machine_rc=true' plan.out; then
+            if [ "${{ github.event_name }}" = "push" ]; then
+              echo "::error::tag ${VERSION} ships the RETIRED machine-rc component and this workflow cannot build it. Build shed-machine-rc from the tag's own workflow (its ref carries the machine-rc jobs) or accept the gap. See RELEASING.md."
+              exit 1
+            fi
+            echo "::warning::tag ${VERSION} planned ship_machine_rc=true, but the machine-rc component is retired — this dispatch republishes images only (the release job is tag-push gated) and no machine-rc artifact is affected. See RELEASING.md."
+          fi
           # Legacy-tag shim: this workflow file comes from the DISPATCHING
           # ref (main), but the script above comes from the CHECKED-OUT tag.
           # A workflow_dispatch republish of a pre-migration tag therefore
           # runs the old two-output script (ship_go/ship_desktop only). Old
-          # ship_go shipped the server, host-agent, and machine-rc artifacts
-          # together — map it so image republishes of old tags keep working.
+          # ship_go shipped every Go artifact together — map it so image
+          # republishes of old tags keep working. (No ship_machine_rc
+          # mapping: this workflow has no machine-rc jobs to feed, and
+          # pre-migration goreleaser artifacts only ever republish from the
+          # tag's own workflow.)
           if grep -q '^ship_go=' plan.out && ! grep -q '^ship_server=' plan.out; then
             # Strict true|false capture — immune to trailing whitespace/CRLF
             # in the legacy script's output (a stray '\r' would otherwise
@@ -189,7 +212,6 @@ jobs:
             {
               echo "ship_server=${go_val}"
               echo "ship_host_agent=${go_val}"
-              echo "ship_machine_rc=${go_val}"
               echo "ship_goreleaser=${go_val}"
             } >> plan.out
           fi
@@ -519,15 +541,14 @@ jobs:
     uses: ./.github/workflows/smoke-linux.yml
 
   # goreleaser + apt-charliek dispatches — one goreleaser invocation per
-  # SHIPPING component (.goreleaser.{server,host-agent,machine-rc}.yaml,
-  # fixed order). Only fires on tag-push events (not manual
-  # workflow_dispatch republishes).
+  # SHIPPING component (.goreleaser.{server,host-agent}.yaml, fixed
+  # order). Only fires on tag-push events (not manual workflow_dispatch
+  # republishes).
   #
   # The `if:` below is load-bearing; read it with these rules in mind:
   # * `!cancelled()` (NOT the implicit success()) lets the job evaluate
-  #   over SKIPPED needs — on a helper-only tag (host-agent/machine-rc
-  #   without server) the whole image chain skips and this job must still
-  #   run. `always()` would be wrong: a user-cancelled run must publish
+  #   over SKIPPED needs — on a helper-only tag (host-agent without
+  #   server) the whole image chain skips and this job must still run. `always()` would be wrong: a user-cancelled run must publish
   #   nothing.
   # * GHA outputs are STRINGS and any non-empty string is truthy, so
   #   every comparison is an explicit == / != against 'true'.
@@ -590,8 +611,8 @@ jobs:
       # fast if a target is unavailable. The build env SHED_HOST_AGENT_VERSION=
       # {{ .Version }} lives in .goreleaser.host-agent.yaml, so it applies
       # identically to the snapshot and this release — no per-job version
-      # munging. Only needed when the host-agent ships (the other configs are
-      # pure Go) — skipping saves ~3 min on server/machine-rc-only tags.
+      # munging. Only needed when the host-agent ships (the server config is
+      # pure Go) — skipping saves ~3 min on server-only tags.
       - name: Rust toolchain + zig cross tooling
         if: success() && needs.release-plan.outputs.ship_host_agent == 'true'
         run: |
@@ -641,8 +662,8 @@ jobs:
           permission-contents: write
 
       # One invocation per SHIPPING component, fixed order server →
-      # host-agent → machine-rc. All three configs use release.mode
-      # keep-existing + replace_existing_artifacts, so whichever runs FIRST
+      # host-agent. Both configs use release.mode keep-existing +
+      # replace_existing_artifacts, so whichever runs FIRST
       # creates the GH release with the goreleaser-changelog body (the
       # changelog is derived from the repo tag range — identical whichever
       # config generates it) and later invocations only add their assets.
@@ -662,8 +683,8 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           # GoReleaser reads HOMEBREW_TAP_TOKEN from this env var (see the
           # split configs: brews[].repository.token). Feed it the
-          # App-minted token instead of a PAT (one mint, reused by all
-          # three invocations — token TTL 1h, the job runs well under it).
+          # App-minted token instead of a PAT (one mint, reused by both
+          # invocations — token TTL 1h, the job runs well under it).
           HOMEBREW_TAP_TOKEN: ${{ steps.tap.outputs.token }}
 
       - name: Run GoReleaser (host-agent)
@@ -676,30 +697,18 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           HOMEBREW_TAP_TOKEN: ${{ steps.tap.outputs.token }}
 
-      - name: Run GoReleaser (machine-rc)
-        if: success() && needs.release-plan.outputs.ship_machine_rc == 'true'
-        uses: goreleaser/goreleaser-action@v7
-        with:
-          version: v2.15.3
-          args: release --clean -f .goreleaser.machine-rc.yaml
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          HOMEBREW_TAP_TOKEN: ${{ steps.tap.outputs.token }}
-
       # Mint a release-bot App token scoped to charliek/apt-charliek for
       # the publish dispatches. The App must be installed on apt-charliek
       # (verify via sanity-check-app.yml). Replaces the legacy
       # APT_DISPATCH_TOKEN PAT. Only minted when a deb-shipping component
-      # is in the plan (server or machine-rc — host-agent has no deb).
+      # is in the plan (server — host-agent has no deb; the retired
+      # machine-rc's apt entry stays frozen at its last-shipped release).
       # NOTE: the dispatches are freshness nudges only — apt-charliek
       # re-scans every tracked package's release ASSETS on every publish
       # run and ignores the dispatch payload for correctness, which is
       # exactly why unshipped components must produce no assets at all.
       - name: Mint an apt-charliek App token
-        if: >-
-          success() &&
-          (needs.release-plan.outputs.ship_server == 'true' ||
-           needs.release-plan.outputs.ship_machine_rc == 'true')
+        if: success() && needs.release-plan.outputs.ship_server == 'true'
         id: apt
         uses: actions/create-github-app-token@v3
         with:
@@ -728,33 +737,6 @@ jobs:
               --method POST \
               -f event_type=publish \
               -F "client_payload[package]=shed-server" \
-              -F "client_payload[tag]=${{ github.ref_name }}" 2>&1; then
-              echo "::notice::Watch apt publish at https://github.com/charliek/apt-charliek/actions"
-              exit 0
-            fi
-            echo "::warning::dispatch attempt $attempt failed; sleeping $((attempt * 5))s"
-            if [ "$attempt" -eq 3 ]; then
-              echo "::error::apt-charliek dispatch failed after 3 attempts — check the stderr above for the API error"
-              exit 1
-            fi
-            sleep $((attempt * 5))
-          done
-
-      # Second dispatch for the shed-machine-rc .deb (the monorepo now ships it,
-      # formerly from charliek/shed-extensions). Same minted token, same
-      # idempotent-with-retry pattern; only the client_payload package differs.
-      # NOTE: apt-charliek's packages.yaml must repoint shed-machine-rc to
-      # charliek/shed before the first monorepo tag or this dispatch no-ops.
-      - name: Trigger apt-charliek publish (shed-machine-rc)
-        if: success() && needs.release-plan.outputs.ship_machine_rc == 'true'
-        env:
-          GH_TOKEN: ${{ steps.apt.outputs.token }}
-        run: |
-          for attempt in 1 2 3; do
-            if gh api repos/charliek/apt-charliek/dispatches \
-              --method POST \
-              -f event_type=publish \
-              -F "client_payload[package]=shed-machine-rc" \
               -F "client_payload[tag]=${{ github.ref_name }}" 2>&1; then
               echo "::notice::Watch apt publish at https://github.com/charliek/apt-charliek/actions"
               exit 0

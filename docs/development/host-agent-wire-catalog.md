@@ -176,6 +176,10 @@ Fan-out happens even when file logging is disabled (`audit.go:104` comment).
     "client_name": "ShedDesktop",    // omitempty; from consumer hello
     "client_version": "1.2.0"        // omitempty
   },
+  "rc_hub": {                        // the machine rc-hub role (plan 010 §2.6)
+    "state": "listening",            // listening | deferred | disabled
+    "addr": "127.0.0.1:1029"         // omitempty; the bind/dial address
+  },
   "servers": [                       // sorted by name (Supervisor.Health)
     { "name": "mini2", "url": "https://...",
       "namespaces": [

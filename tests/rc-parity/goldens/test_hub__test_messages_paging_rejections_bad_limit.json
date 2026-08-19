@@ -1,0 +1,7 @@
+{
+  "body": {
+    "error": "invalid_limit",
+    "message": "limit must be a non-negative integer"
+  },
+  "status": 400
+}

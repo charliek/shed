@@ -49,6 +49,11 @@ docker:
 logging:
   enabled: true
   path: ~/.local/share/shed/extensions-audit.log
+
+# Machine RC hub — the agent hosts it on 127.0.0.1:1029 by default.
+# Set to false to opt this machine out of hosting it.
+rc_hub:
+  enabled: true
 ```
 
 ### Approval model
@@ -249,6 +254,9 @@ It reports:
 - which **config file** the running agent loaded (the absolute `config_path`);
 - the **effective approval policy** per provider, and which are delegated to shed-desktop;
 - the **approval channel**: its socket path and whether a consumer (e.g. shed-desktop) is connected;
+- the **RC hub**: whether this machine's hub is `listening` (with its address), `deferred` (another
+  hub or a foreign process holds the port — the agent retries and takes it over when it frees up),
+  or `disabled` (`rc_hub.enabled: false`);
 - each **watched server**: per-namespace connection state — `connected`, `reconnecting` (with the
   failure reason), or `stopped`.
 
@@ -268,6 +276,7 @@ checks connectivity from inside a shed.)
 | `--log-file` | `""` (stderr) | Write the operational log to this file, size-capped + rotated (the brew service sets it; empty logs to stderr) |
 | `version` | — | Print version and exit |
 | `status [--json]` | — | Query the running daemon's self-report (config, policies, connection state) and exit (see [Diagnostics](#diagnostics)) |
+| `rc-hub` | — | Diagnostic: run the machine RC hub in the foreground until interrupted, logging to stderr. Reads no config file (`--config`/`--log-file` and `rc_hub.enabled` are ignored) — the daemon normally hosts the hub itself |
 
 ### shed-ext-ssh-agent
 

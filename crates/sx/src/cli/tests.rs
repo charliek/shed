@@ -606,3 +606,83 @@ fn subcommands_reject_stray_positionals_and_unknown_flags() {
         "",
     );
 }
+
+// The probe-first ensure's identity check (plan 010 §2.7): a healthy hub
+// answers true; a squatter, wrong app, non-200, or nothing at all answer
+// false — and a byte-trickling peer cannot outlive the absolute deadline.
+#[test]
+fn hub_is_healthy_classifies_and_bounds() {
+    use std::io::{Read, Write};
+    fn canned(body: &'static str, status: &'static str) -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        std::thread::spawn(move || {
+            for conn in listener.incoming().flatten().take(1) {
+                let mut conn = conn;
+                let mut buf = [0u8; 1024];
+                let _ = conn.read(&mut buf);
+                let _ = conn.write_all(
+                    format!(
+                        "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                    .as_bytes(),
+                );
+            }
+        });
+        addr
+    }
+
+    let hub = canned(r#"{"app":"shed-rc-hub","version":"t","pid":1}"#, "200 OK");
+    assert!(super::hub_is_healthy(
+        &hub,
+        std::time::Duration::from_secs(2)
+    ));
+
+    let squatter = canned(r#"{"app":"not-a-hub"}"#, "200 OK");
+    assert!(!super::hub_is_healthy(
+        &squatter,
+        std::time::Duration::from_secs(2)
+    ));
+
+    let error = canned(r#"{"app":"shed-rc-hub"}"#, "500 Nope");
+    assert!(!super::hub_is_healthy(
+        &error,
+        std::time::Duration::from_secs(2)
+    ));
+
+    // Nothing listening: TEST-NET-1 is guaranteed unroutable, so the connect
+    // times out deterministically (a dropped ephemeral port could be re-bound
+    // by a parallel test).
+    assert!(!super::hub_is_healthy(
+        "192.0.2.1:1",
+        std::time::Duration::from_millis(200)
+    ));
+
+    // A drip peer: accepts, then trickles — the ABSOLUTE deadline bounds the
+    // whole probe (the hub-side H11 review class).
+    let drip = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let drip_addr = drip.local_addr().unwrap().to_string();
+    std::thread::spawn(move || {
+        if let Some(Ok(mut conn)) = drip.incoming().next() {
+            let mut buf = [0u8; 1024];
+            let _ = conn.read(&mut buf);
+            for _ in 0..100 {
+                if conn.write_all(b"x").is_err() {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+        }
+    });
+    let start = std::time::Instant::now();
+    assert!(!super::hub_is_healthy(
+        &drip_addr,
+        std::time::Duration::from_millis(300)
+    ));
+    assert!(
+        start.elapsed() < std::time::Duration::from_secs(2),
+        "the absolute deadline must bound a trickling peer: {:?}",
+        start.elapsed()
+    );
+}

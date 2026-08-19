@@ -26,7 +26,7 @@ use shed_core::rc::{RcCapabilities, RcSessionDto, RcSessionListDto};
 use crate::args::Parsed;
 use crate::cli::Deps;
 use crate::porcelain::{
-    load_config, remote_bin, remote_exec, resolve_target, VerbError, VerbResult,
+    load_config, remote_exec, remote_prefix, resolve_target, VerbError, VerbResult,
 };
 use crate::target::Resolved;
 
@@ -228,8 +228,9 @@ pub fn envelope_for(deps: &Deps, resolved: &Resolved) -> Result<RcSessionListDto
             Ok(envelope)
         }
         remote => {
-            let bin = remote_bin(deps, remote)?;
-            let stdout = remote_exec(deps, remote, &shed_core::rc::list_argv(&bin), None)?;
+            let prefix = remote_prefix(deps, remote)?;
+            let argv = prefix.splice(shed_core::rc::list_argv(prefix.bin()));
+            let stdout = remote_exec(deps, remote, &argv, None)?;
             shed_core::rc::decode_list_response(&stdout)
                 .map_err(|e| VerbError::failed(e.to_string()))
         }

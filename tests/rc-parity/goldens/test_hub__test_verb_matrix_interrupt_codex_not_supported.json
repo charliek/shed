@@ -1,0 +1,7 @@
+{
+  "body": {
+    "error": "not_supported",
+    "message": "this session's kind does not support interrupt"
+  },
+  "status": 409
+}
