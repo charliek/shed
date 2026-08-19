@@ -2521,10 +2521,33 @@ fn canned_health_server(response: String) -> String {
     let ln = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
     let addr = ln.local_addr().expect("addr").to_string();
     std::thread::spawn(move || {
-        use std::io::Write;
+        use std::io::{Read, Write};
         for conn in ln.incoming().flatten().take(4) {
             let mut conn = conn;
+            // DRAIN THE REQUEST BEFORE ANSWERING. Closing a socket that still
+            // has unread bytes in its receive queue sends RST, not FIN — and an
+            // RST discards data the peer has not yet read, including the
+            // response we just wrote. Writing-then-closing without reading
+            // therefore raced the prober's read and made this file's decode
+            // cells flake under load (seen locally at H11, then reproduced in
+            // CI). A real hub reads its request too, so draining is also the
+            // more faithful double. The read is bounded: `query_hub_health`'s
+            // dial probe connects and closes WITHOUT sending a request, which
+            // lands here as an immediate EOF.
+            let _ = conn.set_read_timeout(Some(Duration::from_secs(2)));
+            let mut req = Vec::new();
+            let mut byte = [0u8; 1];
+            while !req.ends_with(b"\r\n\r\n") && req.len() < 4096 {
+                match conn.read(&mut byte) {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => req.push(byte[0]),
+                }
+            }
             let _ = conn.write_all(response.as_bytes());
+            let _ = conn.flush();
+            // Half-close so the peer sees EOF (the `Connection: close` body
+            // terminator) rather than a reset.
+            let _ = conn.shutdown(std::net::Shutdown::Write);
         }
     });
     addr
