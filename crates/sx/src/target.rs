@@ -15,11 +15,12 @@
 
 use shed_core::config::{MachineEntry, ShedConfig};
 
-/// The remote RC argv prefix a `machine:` target uses when its entry names no
-/// `rc_bin`: `sx rc <verb>` — wire-identical to the retired
-/// `shed-machine-rc <verb>` (tests/rc-parity is the standing proof; plan 010
-/// H15 flipped the default when the brew/apt component was retired).
-pub const DEFAULT_MACHINE_RC_PREFIX: &[&str] = &["sx", "rc"];
+/// The `sx` binary a `machine:` target invokes when its entry names none —
+/// resolved on the machine's non-login SSH `PATH`.
+pub const DEFAULT_MACHINE_SX_BIN: &str = "sx";
+
+/// The `sx` namespace carrying the one-shot engine verbs.
+const RC_NAMESPACE: &str = "rc";
 
 /// The guest RC helper inside a shed. Baked into the `extensions`/`full` images
 /// and on the shed user's login PATH.
@@ -180,18 +181,19 @@ pub fn resolve(target: &Target, config: &ShedConfig) -> Result<Resolved, String>
     }
 }
 
-/// The RC argv prefix to invoke on a machine target. A `machines[].rc_bin`
-/// override names a SINGLE binary invoked Go-style (`<rc_bin> <verb>`) — the
-/// mixed-fleet escape hatch for a machine still running the retired
-/// `shed-machine-rc`; the default is [`DEFAULT_MACHINE_RC_PREFIX`].
+/// The RC argv prefix to invoke on a machine target: `<sx> rc`.
+/// `machines[].rc_bin` names WHERE SX LIVES on that machine — an absolute path
+/// when it is not on the non-login `PATH` an SSH exec sees — and the `rc`
+/// namespace is always appended.
 pub fn machine_rc_prefix(entry: &MachineEntry) -> Vec<String> {
-    match entry.rc_bin.as_deref() {
-        Some(bin) => vec![bin.to_string()],
-        None => DEFAULT_MACHINE_RC_PREFIX
-            .iter()
-            .map(|s| s.to_string())
-            .collect(),
-    }
+    vec![
+        entry
+            .rc_bin
+            .as_deref()
+            .unwrap_or(DEFAULT_MACHINE_SX_BIN)
+            .to_string(),
+        RC_NAMESPACE.to_string(),
+    ]
 }
 
 /// `~/.shed/config.yaml` — the same path the Go CLI computes
@@ -299,7 +301,7 @@ mod tests {
 machines:
     mini2:
         host: mini2.local
-        rc_bin: /opt/homebrew/bin/shed-machine-rc
+        rc_bin: /opt/homebrew/bin/sx
     plain: {}
 ",
         )
@@ -312,9 +314,10 @@ machines:
             panic!("expected a machine");
         };
         assert_eq!(entry.host, "mini2.local");
+        // An override says WHERE sx lives; the `rc` namespace is still appended.
         assert_eq!(
             machine_rc_prefix(&entry),
-            vec!["/opt/homebrew/bin/shed-machine-rc".to_string()]
+            vec!["/opt/homebrew/bin/sx".to_string(), "rc".to_string()]
         );
 
         let Resolved::Machine(entry) = resolve(&parse("machine:plain"), &cfg).unwrap() else {

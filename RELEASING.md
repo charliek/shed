@@ -35,14 +35,16 @@ guard).
 > verbs, so the component is retired: `cmd/shed-machine-rc`,
 > `.goreleaser.machine-rc.yaml`, and its selector are deleted, and
 > `update-version.sh`/`release-plan.sh` reject the `machine-rc` token.
-> **Published-artifact afterlife:** the brew formula and the apt entry
-> keep serving the last-shipped `shed-machine-rc`, and installed
-> binaries linger indefinitely — deliberately absorbed at runtime by
-> the agent's bind-retry (the agent defers while a Go hub holds the
-> port and takes over when it exits). The brew formula gets a
-> deprecation caveat at the next release touching the tap; the apt
-> entry is left frozen. Don't over-read "component retired" — nothing
-> already installed breaks.
+> **Published artifacts are not withdrawn, but they are not supported.**
+> Nothing new is built for them and they get no fixes; the intended
+> move is `sx` + `shed-host-agent` (see
+> [`docs/extensions/shed-machine-rc.md`](docs/extensions/shed-machine-rc.md)).
+> Housekeeping to do at the tap/apt repos, not blocking here: drop
+> `Formula/shed-machine-rc.rb` from `charliek/homebrew-tap`, and drop the
+> `shed-machine-rc` entry from `charliek/apt-charliek`'s `packages.yaml`
+> (that entry still points at the pre-monorepo `charliek/shed-extensions`
+> repo — it was never repointed, so the v0.8.x machine-rc debs were never
+> indexed by apt in the first place).
 > **Old-tag guard:** a PRE-retirement tag's own `release-plan.sh` can
 > emit `ship_machine_rc=true`; the current `publish-images.yaml` has no
 > machine-rc jobs. On a tag **push** it **fails loudly** instead of

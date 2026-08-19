@@ -7,8 +7,8 @@
 //! harness — is:
 //!
 //! - the same subcommands: `create`, `list`, `capabilities`, `probe`,
-//!   `accept-trust`, `prompt`, `kill`, `version` (the hub's `serve` is NOT ported;
-//!   plan 009 §0 keeps it in the Go binary);
+//!   `accept-trust`, `prompt`, `kill`, `version` (the hub's `serve` is not a
+//!   one-shot verb — the machine hub is a `shed-host-agent` role, plan 010);
 //! - the same stdin framing (`--prompt-stdin` / `--plan-stdin` + `--prompt-b64`),
 //!   including the CLI-level error messages, which are Go's verbatim;
 //! - wire-equivalent stdout — structurally-equal canonical JSON, one document +
@@ -635,13 +635,12 @@ fn read_plan_stdin(deps: &Deps) -> Result<String, EngineError> {
 const HUB_ADDR: &str = "127.0.0.1:1029";
 const HUB_APP_ID: &str = "shed-rc-hub";
 
-/// The best-effort hub ensure, PROBE-ONLY (plan 010 §2.7, spawn fallback
-/// deleted at H15 with the `shed-machine-rc` binary): a healthy hub on the
-/// fixed port — the `shed-host-agent`-hosted hub, or a still-installed Go
-/// `shed-machine-rc` daemon during the mixed window — means done. Otherwise a
-/// best-effort stderr hint names the agent as the machine hub's owner. Never
-/// fatal: `create` has already succeeded by the time this runs, and the
-/// engine skips it entirely when `SHED_RC_NO_HUB` is set.
+/// The best-effort hub ensure, PROBE-ONLY (plan 010 §2.7; the spawn fallback
+/// died at H15 with the `shed-machine-rc` binary): a healthy hub answering on
+/// the fixed port means done. Otherwise a best-effort stderr hint names
+/// `shed-host-agent` as the machine hub's owner. Never fatal: `create` has
+/// already succeeded by the time this runs, and the engine skips it entirely
+/// when `SHED_RC_NO_HUB` is set.
 fn ensure_hub() {
     if hub_is_healthy(HUB_ADDR, std::time::Duration::from_millis(500)) {
         return;

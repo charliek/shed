@@ -52,11 +52,11 @@ reads an `## Unreleased` heading._
   `tests/rc-parity/oracle/` (byte-identical main, test-only, same
   `shed-machine-rc` identity the goldens pin). `sx --on machine:` targets now
   default to the remote `sx rc <verb>` argv (wire-identical; the
-  `machines[].rc_bin` override keeps Go-binary machines working), and `sx`'s
-  create-time hub ensure no longer spawns `shed-machine-rc serve` — it
-  probes, and hints at `shed-host-agent` when nothing answers. Published
-  brew/apt artifacts stay frozen at v0.8.2 and installed binaries keep
-  working through the mixed window (the agent's bind-retry absorbs them).
+  `machines[].rc_bin` override now names WHERE `sx` LIVES on that machine),
+  and `sx`'s create-time hub ensure no longer spawns anything — it probes,
+  and hints at `shed-host-agent` when nothing answers. Artifacts published
+  before the retirement are not withdrawn but are unsupported; the intended
+  move is `sx` + `shed-host-agent`.
 
 ## v0.8.2 — 2026-08-17
 

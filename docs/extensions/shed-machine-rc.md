@@ -1,103 +1,42 @@
-# shed-machine-rc (RC sessions on a native machine)
+# shed-machine-rc (retired)
 
-`shed-machine-rc` is the **host-side** sibling of [`shed-ext-rc`](rc-helper.md): the same
-RC Session Convention v2 engine, shipped as a CLI you install on a **native machine** — a
-laptop, workstation, or tailnet host — instead of baked into a shed image. It creates,
-lists, probes, prompts, and tears down the same `rc-<slug>` `tmux` sessions running
-`claude` (or a shell), and prints the same neutral [JSON DTO](rc-helper.md#json-output).
+`shed-machine-rc` was the host-side sibling of [`shed-ext-rc`](rc-helper.md): the same
+RC Session Convention v2 engine, shipped as a CLI for **native machines** — a laptop,
+workstation, or tailnet host — instead of baked into a shed image. It created and drove
+`rc-<slug>` `tmux` sessions, and its `serve` verb ran the machine's RC activity hub.
 
-This lets the orchestrators that already drive sheds — shed-remote-agent, and (in future)
-shed-mobile — bootstrap and watch `claude remote-control` sessions on machines that aren't
-sheds, by invoking it over SSH exactly as they invoke `shed-ext-rc` inside a shed:
+**It is retired.** Both halves have a replacement:
 
-```bash
-ssh <user>@<machine> shed-machine-rc <command> [flags]
-```
+| What it did | What does it now |
+|---|---|
+| the one-shot verbs (`create`, `list`, `probe`, `prompt`, `kill`, …) | [`sx rc <verb>`](sx.md) — wire-identical, and what `sx --on machine:<name>` invokes over SSH |
+| `serve` — the machine RC activity hub on `127.0.0.1:1029` | the [`shed-host-agent` daemon](sx.md#the-machine-hub), which hosts the hub as a supervised resident role |
 
-It is a one-shot CLI (no daemon); all `tmux` work happens locally on the machine. `claude`
-and `tmux` must be installed on the machine (with `claude` authenticated) — the same
-prerequisites a shed image bakes in.
+The Rust port is wire-identical by construction, not by assertion: the
+`tests/rc-parity` differential suite builds a test-only copy of this binary's engine
+(`tests/rc-parity/oracle`) and diffs it against `sx` verb-by-verb, and runs both hub
+implementations side by side against the same `/v1` cells. That suite is the standing
+proof and still runs on every relevant change.
 
-!!! warning "Retired (plan 010)"
-    `shed-machine-rc` is **retired** as a release component. The Rust port of
-    this engine ships as [`sx rc`](sx.md) (wire-identical — the
-    `tests/rc-parity` differential suite is the standing proof), and the
-    machine activity hub this binary's `serve` provided is hosted by the
-    [`shed-host-agent` daemon](sx.md#the-machine-hub). `sx --on machine:`
-    targets now default to invoking the remote `sx` binary; a
-    `machines[].rc_bin` override keeps a machine on a still-installed
-    `shed-machine-rc` through the mixed fleet.
+!!! warning "No new releases"
+    The `machine-rc` release component is gone — `cmd/shed-machine-rc`, its
+    goreleaser config, and its version selector are deleted from the tree, and the
+    release scripts reject the `machine-rc` token outright. Artifacts published
+    before the retirement are not being withdrawn, but nothing new will be built
+    from them and they receive no fixes. **Move machines to `sx` +
+    `shed-host-agent`.**
 
-    **Already installed?** Nothing breaks. The brew formula and apt entry
-    keep serving the last-shipped release (v0.8.2), and a running
-    `shed-machine-rc serve` hub coexists with the agent via bind-as-lock —
-    the agent defers while the Go hub holds the port and takes over when it
-    exits. No new releases will ship; this page is kept one release for link
-    stability and documents the retired binary as last shipped.
+The Go engine itself lives on: it is what [`shed-ext-rc`](rc-helper.md) — baked into
+every `extensions`/`full` rootfs image — is built from, and sheds continue to run the
+Go hub in-guest. Only the machine-facing binary retired.
 
-## Install
+## Migrating a machine
 
-=== "macOS (Homebrew)"
-
-    ```bash
-    brew install charliek/tap/shed-machine-rc
-    ```
-
-=== "Linux (apt)"
-
-    Add the `apt.stridelabs.ai` repository once (the same repo that serves `shed-server`;
-    skip if you already have it), then install:
-
-    ```bash
-    sudo install -d -m 0755 /etc/apt/keyrings
-    curl -fsSL https://apt.stridelabs.ai/pubkey.gpg | \
-      sudo tee /etc/apt/keyrings/apt-charliek.gpg > /dev/null
-    echo 'deb [signed-by=/etc/apt/keyrings/apt-charliek.gpg] https://apt.stridelabs.ai noble main' | \
-      sudo tee /etc/apt/sources.list.d/apt-charliek.list
-    sudo apt update
-    sudo apt install shed-machine-rc
-    ```
-
-    The `.deb` installs to `/usr/local/bin`.
-
-## `claude` — start a session and walk away
-
-The host-only convenience verb starts a local `claude` remote-control session in the
-autonomous **`auto`** posture, waits until it is ready, prints the `claude.ai` URL, and
-returns — leaving the session live in `tmux` and watchable from your phone or from
-shed-remote-agent / shed-mobile:
-
-```bash
-shed-machine-rc claude
-#   Started claude-rc session "mymac/ab12cd" — permission-mode=auto (tools run UNATTENDED).
-#     Watch/steer from your phone or browser: https://claude.ai/code/session_…
-#     Attach locally:  tmux attach -t rc-ab12cd
-#     Visible to shed-remote-agent / shed-mobile on this machine.
-```
-
-| Flag | Effect |
-|------|--------|
-| `--name <display>` | Display name (default `<hostname>/<slug>`). |
-| `--workdir <dir>` | Working directory (default `$SHED_WORKSPACE`, then `$HOME`). |
-| `--slug <s>` | Caller-supplied slug (generated when empty). |
-| `--permission-mode <m>` | Override the posture (default `auto`); see [permission modes](rc-helper.md#permission-modes). |
-| `--skip` | Shorthand for `--permission-mode bypassPermissions` (mutually exclusive with `--permission-mode`). |
-
-!!! warning
-    The `claude` verb runs the session **unattended** (`auto` by default, full bypass with
-    `--skip`). It is a deliberate, human-initiated local convenience — review what you are
-    handing off before you walk away.
-
-## Other commands
-
-`create`, `list`, `probe`, `accept-trust`, `prompt`, and `kill` are **identical** to
-`shed-ext-rc` — see the [RC Session Helper reference](rc-helper.md) for the full command
-table, kinds, permission modes, the JSON DTO, exit codes, and the workspace-trust /
-onboarding pre-seed. Two host-specific differences:
-
-- The default `--created-by` provenance is `shed-machine-rc` (vs `shed-ext-rc`).
-- An orchestrator invoking it over SSH must be able to find it on the machine's
-  **non-login** `PATH`. The `.deb` installs to `/usr/local/bin` (already searched); a
-  Homebrew install on Apple-Silicon macOS lands in `/opt/homebrew/bin`, which a non-login
-  SSH shell may not search — point the orchestrator at an absolute path in that case (e.g.
-  shed-remote-agent's per-machine `rc_bin`).
+1. Install `shed-host-agent` and let it run; it hosts the hub (see
+   [The machine hub](sx.md#the-machine-hub)). Unlike `shed-machine-rc serve`, it does
+   not exit after an idle period.
+2. Put `sx` on the machine (see [Build and install](sx.md#build-and-install)). If it
+   is not on the non-login `PATH` an SSH exec sees, point `machines[].rc_bin` at its
+   absolute path.
+3. Remove the old binary at your convenience — `brew uninstall shed-machine-rc`, or
+   `apt remove shed-machine-rc`. Nothing in the current tree invokes it.

@@ -1,7 +1,6 @@
 //! A minimal client for the **local activity hub** on `127.0.0.1:1029` —
-//! served by the `shed-host-agent` daemon's resident role (plan 010) or, on
-//! machines without the agent during the mixed window, the standalone Go
-//! `shed-machine-rc serve` daemon. The wire is identical either way (the
+//! served on machines by the `shed-host-agent` daemon's resident role (plan
+//! 010) and in a shed by the guest hub. The wire is identical either way (the
 //! rc-parity hub family is the proof), so this client is provider-blind.
 //!
 //! `sx watch` *reads* the hub over plain loopback HTTP, and reaches a

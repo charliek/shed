@@ -63,8 +63,8 @@ observe:
 
 engine-compat:
   rc <subcommand>   the one-shot RC engine (create|list|capabilities|probe|
-                    accept-trust|prompt|kill|version) — wire-compatible with
-                    `shed-machine-rc <subcommand>`
+                    accept-trust|prompt|kill|version) — the frozen machine/guest
+                    RC wire; what `--on machine:` invokes on the far side
 
   version
   help
