@@ -1,0 +1,134 @@
+# GoReleaser config — SX component (plan 011: `sx` becomes its own release
+# component, taking the brew+apt channel pair the retired machine-rc vacated).
+#
+# One of THREE split configs. The release job invokes goreleaser once per
+# SHIPPING component, in the FIXED order: server → host-agent → sx.
+#   - .goreleaser.server.yaml      : brew `shed`, apt `shed-server` deb
+#   - .goreleaser.host-agent.yaml  : brew `shed-host-agent` + GH linux tarball
+#   - .goreleaser.sx.yaml          (this file): brew `sx` + apt `sx` deb
+# See RELEASING.md "Component selection" for the selector law and the flow.
+# Boilerplate is duplicated across the three (goreleaser `includes` is Pro-only).
+#
+# No before-hooks: this component builds Rust and renders nothing, so there is
+# nothing to generate. Keeping before-hooks empty also guarantees this
+# invocation never mutates a tracked file between the sequential runs.
+
+version: 2
+
+project_name: shed
+
+# Own subdir of dist/ (covered by .gitignore's `dist/`); `--clean` wipes only
+# this dir, never a sibling config's, so all three snapshots/releases coexist.
+dist: dist/sx
+
+builds:
+  # The SHIPPED sx binary — Rust (crates/sx), built by goreleaser's OSS
+  # `builder: rust` (which runs `cargo zigbuild`) on the macos-latest release
+  # runner; it cross-compiles all four targets, linux via zig. Same path the
+  # host-agent leg has proven since plan 006. No `main:` (rust builder rejects it).
+  - id: sx
+    builder: rust
+    binary: sx
+    dir: crates
+    # --package= is REQUIRED: crates/ is a Cargo workspace and goreleaser's rust
+    # builder refuses a workspace build without --package/-p (it detects the
+    # `--package=`/`-p=` prefix). --locked pins the committed Cargo.lock;
+    # --release is the builder default but explicit here.
+    flags:
+      - --release
+      - --locked
+      - --package=sx
+    # NOTE (linux glibc floor): the two *-unknown-linux-gnu targets link against
+    # cargo-zigbuild's default glibc, ~2.30 (Ubuntu 20.04+ / RHEL 9+), and that
+    # floor cannot be pinned lower on the pinned goreleaser v2.15.3. Unlike the
+    # host-agent's, THIS component's linux artifact is a deb on a primary
+    # install path, so the floor is part of its support statement — the full
+    # rationale and the escape hatch live in RELEASING.md § "sx: Rust binary".
+    targets:
+      - aarch64-apple-darwin
+      - x86_64-apple-darwin
+      - aarch64-unknown-linux-gnu
+      - x86_64-unknown-linux-gnu
+    env:
+      # Baked into `sx version` at compile time (crates/sx/src/version.rs
+      # option_env!). {{ .Version }} is the tag, already v-stripped (a snapshot
+      # pseudo-version under --snapshot), so the shipped version tracks the sx
+      # release tag rather than CARGO_PKG_VERSION (which follows the desktop
+      # selector and is not bumped on an sx-only tag).
+      - SX_VERSION={{ .Version }}
+
+archives:
+  - id: sx
+    ids:
+      - sx
+    formats:
+      - tar.gz
+    name_template: "sx_{{ .Os }}_{{ .Arch }}"
+
+nfpms:
+  # The simplest possible deb: one binary in /usr/local/bin. `sx` is a plain
+  # CLI — no systemd unit, no config file, no maintainer scripts. (Contrast
+  # .goreleaser.server.yaml's shed-deb, which carries all three.)
+  - id: sx-deb
+    package_name: sx
+    # apt-charliek indexes by scanning the release assets for `sx_*.deb`, so the
+    # name must match the glob in its packages.yaml entry.
+    file_name_template: "sx_{{ .Version }}_{{ .Arch }}"
+    vendor: charliek
+    homepage: "https://github.com/charliek/shed"
+    maintainer: "Charlie Knudsen"
+    description: "RC session porcelain — kickoff and observe agent sessions locally, on machines, and in sheds"
+    license: MIT
+    formats:
+      - deb
+    bindir: /usr/local/bin
+    ids:
+      - sx
+
+brews:
+  - name: sx
+    ids:
+      - sx
+    repository:
+      owner: charliek
+      name: homebrew-tap
+      token: "{{ .Env.HOMEBREW_TAP_TOKEN }}"
+    directory: Formula
+    homepage: "https://github.com/charliek/shed"
+    description: "RC session porcelain for agent sessions on machines and sheds"
+    license: "MIT"
+    install: |
+      bin.install "sx"
+    test: |
+      system bin/"sx", "version"
+
+checksum:
+  # Unique per-config name: all three configs publish to the SAME GH release
+  # (shared tag), so a shared `checksums.txt` would clobber across invocations.
+  name_template: "checksums-sx.txt"
+  algorithm: sha256
+
+release:
+  github:
+    owner: charliek
+    name: shed
+  draft: false
+  prerelease: auto
+  # keep-existing: the first SHIPPING invocation (server → host-agent → sx)
+  # creates the release + the goreleaser-changelog body; later invocations
+  # upload their assets without touching the body.
+  mode: keep-existing
+  # replace_existing_artifacts: a re-run of a partially-failed release job
+  # replaces its own already-uploaded assets instead of dying `already_exists`
+  # under keep-existing.
+  replace_existing_artifacts: true
+
+changelog:
+  use: github
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+      - "^chore:"
+      - "^ci:"
