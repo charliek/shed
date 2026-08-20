@@ -35,8 +35,10 @@ Go hub in-guest. Only the machine-facing binary retired.
 1. Install `shed-host-agent` and let it run; it hosts the hub (see
    [The machine hub](sx.md#the-machine-hub)). Unlike `shed-machine-rc serve`, it does
    not exit after an idle period.
-2. Put `sx` on the machine (see [Build and install](sx.md#build-and-install)). If it
-   is not on the non-login `PATH` an SSH exec sees, point `machines[].rc_bin` at its
-   absolute path.
+2. Install `sx` on the machine — `brew install charliek/tap/sx` on macOS,
+   `sudo apt install sx` on Debian/Ubuntu (see [Install](sx.md#install)). It takes the
+   same brew+apt channel pair this binary had, so it lands in `/usr/local/bin` (apt) or
+   the Homebrew prefix. If that is not on the non-login `PATH` an SSH exec sees, point
+   `machines[].rc_bin` at its absolute path.
 3. Remove the old binary at your convenience — `brew uninstall shed-machine-rc`, or
    `apt remove shed-machine-rc`. Nothing in the current tree invokes it.

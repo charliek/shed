@@ -22,10 +22,10 @@ the lockstep at workflow time and refuses to ship a drifted tree.
 1. **`desktop-release-create`** — desktop-only tags need a GitHub
    Release to upload into, so this job `gh release create`s one
    (idempotent). It runs only when **no** goreleaser component ships
-   (`ship_goreleaser != 'true'`, i.e. neither server nor host-agent).
+   (`ship_goreleaser != 'true'`, i.e. none of server, host-agent or sx).
    Whenever any goreleaser component *does* ship, this job is
    **skipped**: the root `release` job now runs one `goreleaser release`
-   invocation per shipping component (server → host-agent,
+   invocation per shipping component (server → host-agent → sx,
    `release.mode: keep-existing`), and the FIRST of those invocations
    creates the release and owns the
    changelog body — later goreleaser invocations, and the desktop jobs

@@ -137,7 +137,7 @@ def mask_version(stdout: str) -> str:
     """The `version` verb's line, fully masked after a shape assert.
 
     The two implementations report genuinely different things (`shed-machine-rc
-    dev (commit: ..., built: ...)` vs `sx <crate version>`), so the SHAPE — a
+    dev (commit: ..., built: ...)` vs `sx <release-injected or crate version>`), so the SHAPE — a
     program name, a space, a non-empty version — is the contract, not the text."""
     line = stdout.rstrip("\n")
     assert "\n" not in line, f"version wrote more than one line: {stdout!r}"

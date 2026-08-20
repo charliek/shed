@@ -7,10 +7,11 @@
 #
 #   server      .claude-plugin/plugin.json  .version
 #   host-agent  crates/shed-host-agent/VERSION
+#   sx          crates/sx/VERSION
 #   desktop     desktop/VERSION
 #
-# `server` and `host-agent` are the two goreleaser-published components;
-# `ship_goreleaser` is their OR (true iff the tag ships at least one
+# `server`, `host-agent` and `sx` are the three goreleaser-published
+# components; `ship_goreleaser` is their OR (true iff the tag ships at least one
 # goreleaser component). Only `desktop` has a beta channel — the goreleaser
 # components are stable-only.
 #
@@ -26,6 +27,7 @@
 #
 #   ship_server=true|false
 #   ship_host_agent=true|false
+#   ship_sx=true|false
 #   ship_desktop=true|false
 #   ship_goreleaser=true|false     # OR of the goreleaser components
 #
@@ -127,25 +129,29 @@ if [ -z "${SERVER_V}" ] || [ "${SERVER_V}" = "null" ] || [[ ! "${SERVER_V}" =~ ^
 fi
 
 HOST_AGENT_V="$(read_version_file "${REPO_ROOT}/crates/shed-host-agent/VERSION")"
+SX_V="$(read_version_file "${REPO_ROOT}/crates/sx/VERSION")"
 DESKTOP_V="$(read_version_file "${REPO_ROOT}/desktop/VERSION")"
 
 SHIP_SERVER=false
 [ "${SERVER_V}" = "${V}" ] && SHIP_SERVER=true
 SHIP_HOST_AGENT=false
 [ "${HOST_AGENT_V}" = "${V}" ] && SHIP_HOST_AGENT=true
+SHIP_SX=false
+[ "${SX_V}" = "${V}" ] && SHIP_SX=true
 SHIP_DESKTOP=false
 [ "${DESKTOP_V}" = "${V}" ] && SHIP_DESKTOP=true
 
 # ship_goreleaser is the OR of the goreleaser components, computed here
 # (not inferred in YAML) so the "any goreleaser component" decision is unit-tested.
 SHIP_GORELEASER=false
-if [ "${SHIP_SERVER}" = "true" ] || [ "${SHIP_HOST_AGENT}" = "true" ]; then
+if [ "${SHIP_SERVER}" = "true" ] || [ "${SHIP_HOST_AGENT}" = "true" ] \
+   || [ "${SHIP_SX}" = "true" ]; then
   SHIP_GORELEASER=true
 fi
 
 if [ "${SHIP_SERVER}" = "false" ] && [ "${SHIP_HOST_AGENT}" = "false" ] \
-   && [ "${SHIP_DESKTOP}" = "false" ]; then
-  echo "::error::tag ${TAG} matches NO component manifest (server .claude-plugin/plugin.json=${SERVER_V}, host-agent crates/shed-host-agent/VERSION=${HOST_AGENT_V}, desktop desktop/VERSION=${DESKTOP_V}). Run scripts/release/update-version.sh ${V} --components ... and re-tag — refusing a silent no-op release." >&2
+   && [ "${SHIP_SX}" = "false" ] && [ "${SHIP_DESKTOP}" = "false" ]; then
+  echo "::error::tag ${TAG} matches NO component manifest (server .claude-plugin/plugin.json=${SERVER_V}, host-agent crates/shed-host-agent/VERSION=${HOST_AGENT_V}, sx crates/sx/VERSION=${SX_V}, desktop desktop/VERSION=${DESKTOP_V}). Run scripts/release/update-version.sh ${V} --components ... and re-tag — refusing a silent no-op release." >&2
   exit 1
 fi
 
@@ -179,7 +185,7 @@ fi
 # prerelease (`-suffix`) tag must not select any of them. A desktop-only
 # prerelease (the Tauri rc rehearsal) is fine and falls through cleanly.
 if [ "${IS_PRERELEASE}" = "true" ] && [ "${SHIP_GORELEASER}" = "true" ]; then
-  echo "::error::prerelease tag ${TAG} ships a goreleaser component (server=${SHIP_SERVER}, host-agent=${SHIP_HOST_AGENT}) — those components are stable-only (only desktop has a beta channel). Cut a stable tag, or bump only the desktop surfaces for an rc." >&2
+  echo "::error::prerelease tag ${TAG} ships a goreleaser component (server=${SHIP_SERVER}, host-agent=${SHIP_HOST_AGENT}, sx=${SHIP_SX}) — those components are stable-only (only desktop has a beta channel). Cut a stable tag, or bump only the desktop surfaces for an rc." >&2
   exit 1
 fi
 
@@ -227,7 +233,8 @@ if [ "${IS_PRERELEASE}" = "false" ]; then
   fi
   # This local run is mandatory on stock macOS bash (3.2), which has no
   # associative arrays — so the "already seen this token" set is tracked by a
-  # linear scan over actual_ships (canonical, ≤4 elements) rather than an
+  # linear scan over actual_ships (canonical, ≤4 elements — server, host-agent,
+  # sx, desktop) rather than an
   # associative `ship_seen`. Index-loop the scan so an empty actual_ships can't
   # trip `set -u` on the `[@]` expansion.
   actual_ships=()
@@ -241,13 +248,13 @@ if [ "${IS_PRERELEASE}" = "false" ]; then
     # Legacy alias, applied BEFORE canonical + duplicate checks.
     [ "${tok}" = "server/CLI" ] && tok="server"
     case "${tok}" in
-      server|host-agent|desktop) ;;
+      server|host-agent|sx|desktop) ;;
       machine-rc)
         echo "::error::CHANGELOG.md '## v${V}' **Ships:** line names 'machine-rc' — the component was retired in plan 010 (the hub ships in host-agent; sx carries the one-shot verbs)." >&2
         exit 1
         ;;
       *)
-        echo "::error::CHANGELOG.md '## v${V}' **Ships:** line has unknown token '${tok}' (valid: server, host-agent, desktop; alias: server/CLI)." >&2
+        echo "::error::CHANGELOG.md '## v${V}' **Ships:** line has unknown token '${tok}' (valid: server, host-agent, sx, desktop; alias: server/CLI)." >&2
         exit 1
         ;;
     esac
@@ -266,6 +273,7 @@ if [ "${IS_PRERELEASE}" = "false" ]; then
   expected_ships=()
   [ "${SHIP_SERVER}" = "true" ] && expected_ships+=(server)
   [ "${SHIP_HOST_AGENT}" = "true" ] && expected_ships+=(host-agent)
+  [ "${SHIP_SX}" = "true" ] && expected_ships+=(sx)
   [ "${SHIP_DESKTOP}" = "true" ] && expected_ships+=(desktop)
 
   actual_sorted="$(printf '%s\n' "${actual_ships[@]}" | sort | paste -sd, -)"
@@ -276,9 +284,10 @@ if [ "${IS_PRERELEASE}" = "false" ]; then
   fi
 fi
 
-echo "release plan for ${TAG}: server=${SHIP_SERVER} host-agent=${SHIP_HOST_AGENT} desktop=${SHIP_DESKTOP} goreleaser=${SHIP_GORELEASER} (manifests: server=${SERVER_V}, host-agent=${HOST_AGENT_V}, desktop=${DESKTOP_V})" >&2
+echo "release plan for ${TAG}: server=${SHIP_SERVER} host-agent=${SHIP_HOST_AGENT} sx=${SHIP_SX} desktop=${SHIP_DESKTOP} goreleaser=${SHIP_GORELEASER} (manifests: server=${SERVER_V}, host-agent=${HOST_AGENT_V}, sx=${SX_V}, desktop=${DESKTOP_V})" >&2
 
 echo "ship_server=${SHIP_SERVER}"
 echo "ship_host_agent=${SHIP_HOST_AGENT}"
+echo "ship_sx=${SHIP_SX}"
 echo "ship_desktop=${SHIP_DESKTOP}"
 echo "ship_goreleaser=${SHIP_GORELEASER}"

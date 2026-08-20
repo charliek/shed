@@ -46,6 +46,8 @@ re-implemented per language. The root `CLAUDE.md` owns the monorepo layout + rel
   dev-dependencies enable shed-app's **`test-support`** feature, which exports
   `rc_engine::fake` (the fake tmux runner) across the crate boundary — test-only by
   construction (`#[cfg(any(test, feature = "test-support"))]`).
+  Since plan 011 `sx` is also its **own release component** (brew + apt) — see the
+  version-lockstep section below.
 - **`shed-broker`** — the embeddable host-agent broker core: the shed-server plugin bus,
   the multi-server supervisor + discovery watcher, the SSH/AWS/Docker/egress credential
   backends, the SSH-bootstrap minter + control-token provider, the approval/audit seams
@@ -122,3 +124,13 @@ At **release**, this workspace's `Cargo.toml` version is bumped in **lockstep** 
 `desktop/VERSION` (and the Tauri manifests) by `scripts/release/update-version.sh X.Y.Z
 --components desktop`; `scripts/release/release-plan.sh` hard-verifies the lockstep before the
 desktop leg ships. Don't hand-edit the version out of step.
+
+**Two crates here ship on their own selectors, deliberately OUT of that lockstep:**
+`crates/shed-host-agent/VERSION` (the `host-agent` component) and `crates/sx/VERSION`
+(the `sx` component, plan 011). Those files are ship-**selectors** only — the shipped
+binary's version is the tag, injected at build time by the component's goreleaser
+config (`SHED_HOST_AGENT_VERSION` / `SX_VERSION`) and read via `option_env!` in each
+crate's `version.rs`. So `sx version` on a released build reports the release tag, NOT
+`CARGO_PKG_VERSION` (which follows the desktop selector and is not bumped on an
+sx-only tag). Expect all three versions to differ in normal operation; that is the
+design, not drift. See the root `RELEASING.md` "Component selection".

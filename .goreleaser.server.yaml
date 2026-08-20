@@ -1,13 +1,14 @@
 # GoReleaser config — SERVER component (plan 002: release component model).
 #
-# One of TWO split configs. The release job invokes goreleaser once per
-# SHIPPING component, in the FIXED order: server → host-agent.
+# One of THREE split configs. The release job invokes goreleaser once per
+# SHIPPING component, in the FIXED order: server → host-agent → sx.
 #   - .goreleaser.server.yaml      (this file): brew `shed`, apt `shed-server` deb
 #   - .goreleaser.host-agent.yaml  : brew `shed-host-agent` + GH linux tarball
+#   - .goreleaser.sx.yaml          : brew `sx` + apt `sx` deb (plan 011)
 # (.goreleaser.machine-rc.yaml was deleted with the machine-rc component's
-# retirement in plan 010.)
+# retirement in plan 010; sx took over its brew+apt slot.)
 # See RELEASING.md "Component selection" for the selector law and the flow.
-# Boilerplate is duplicated across the two (goreleaser `includes` is Pro-only).
+# Boilerplate is duplicated across the three (goreleaser `includes` is Pro-only).
 
 version: 2
 
@@ -21,7 +22,7 @@ before:
   hooks:
     # ONLY the sed that renders packaging/server.yaml.generated (gitignored) for
     # the shed-deb nfpm below. NO `go mod tidy` here: the release job runs the
-    # two configs sequentially (server → host-agent) and asserts
+    # split configs sequentially (server → host-agent → sx) and asserts
     # a clean tree; a before-hook MUST NOT mutate a tracked file (go.mod/go.sum)
     # or invocation #2 aborts on the dirty-check. CI asserts tidiness separately
     # (go mod tidy && git diff --exit-code go.mod go.sum).
@@ -399,7 +400,7 @@ nfpms:
       postinstall: packaging/postinstall.sh
 
 checksum:
-  # Unique per-config name: both configs publish to the SAME GH release
+  # Unique per-config name: all three configs publish to the SAME GH release
   # (shared tag), so a shared `checksums.txt` would clobber across invocations.
   name_template: "checksums-server.txt"
   algorithm: sha256
@@ -410,7 +411,7 @@ release:
     name: shed
   draft: false
   prerelease: auto
-  # keep-existing: the first SHIPPING invocation (server → host-agent)
+  # keep-existing: the first SHIPPING invocation (server → host-agent → sx)
   # creates the release + the goreleaser-changelog body; later
   # invocations upload their assets without touching the body.
   mode: keep-existing

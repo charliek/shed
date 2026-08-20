@@ -12,20 +12,42 @@ It is a Rust CLI built from `crates/sx` on the shared client core (`shed-core` +
 | Porcelain | `agent`, `plan`, `ls`, `watch`, `attach`, `kill` | Human/skill-facing. Chooses defaults, prints prose, reaches remote targets. |
 | Engine-compat | `sx rc <subcommand>` | The one-shot RC engine — the frozen wire a `machine:` target speaks, and what the [retired `shed-machine-rc`](shed-machine-rc.md) used to serve (the `tests/rc-parity` differential suite is the standing proof). |
 
-!!! warning "Unreleased"
-    `sx` ships in no release component — no Homebrew formula, no `.deb`, no GitHub
-    release artifact. It is built from source (below) and its surface may change without
-    a deprecation cycle. `shed-ext-rc` remains the released, supported guest RC
-    binary. Machine targets need `sx` present on the far side — see
-    [Build and install](#build-and-install).
+!!! warning "Packaged for development, not frozen"
+    `sx` ships as its own release component (Homebrew + apt) **so the dev loop across
+    your machines doesn't need a Rust toolchain on each one** — not as a stability
+    promise. Its surface may still change without a deprecation cycle. `shed-ext-rc`
+    remains the released, supported guest RC binary. Machine targets need `sx` present
+    on the far side — see [Install](#install).
 
-## Build and install
+## Install
 
-```bash
-cd crates && cargo build --release -p sx
-# binary at crates/target/release/sx — put it on PATH yourself, e.g.:
-ln -sf "$PWD/target/release/sx" ~/.local/bin/sx
-```
+=== "macOS (Homebrew)"
+
+    ```bash
+    brew install charliek/tap/sx
+    ```
+
+=== "Debian/Ubuntu (apt)"
+
+    ```bash
+    sudo apt update && sudo apt install sx
+    ```
+
+    Requires the [charliek apt repo](https://github.com/charliek/apt-charliek) to be
+    configured. The published binaries are cross-built with a **glibc ≥ 2.30** floor
+    (Ubuntu 20.04+ / RHEL 9+).
+
+=== "From source"
+
+    ```bash
+    cd crates && cargo build --release -p sx
+    # binary at crates/target/release/sx — put it on PATH yourself, e.g.:
+    ln -sf "$PWD/target/release/sx" ~/.local/bin/sx
+    ```
+
+`sx` advances on its own tag: a release ships it only when `crates/sx/VERSION`
+equals the tag, so an `sx` fix does not drag the server or desktop components
+along with it. `sx version` reports the release tag, not the crate version.
 
 Requirements on whichever host actually runs a session: **tmux ≥ 3.2** (`new-session -e`
 is how session metadata is stamped — an implicit floor the Go engine shares), `bash`, and

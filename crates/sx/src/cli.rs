@@ -316,8 +316,9 @@ fn run_rc(deps: &Deps, args: &[String]) -> i32 {
 }
 
 /// The identity line, identical on both namespaces (`sx version`, `sx rc version`).
+/// Version source, and why it is not `CARGO_PKG_VERSION`: see [`crate::version`].
 fn print_version(deps: &Deps) -> i32 {
-    deps.write_out(&format!("{PROG} {}\n", env!("CARGO_PKG_VERSION")));
+    deps.write_out(&format!("{PROG} {}\n", crate::version::version()));
     0
 }
 

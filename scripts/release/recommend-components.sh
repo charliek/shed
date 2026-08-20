@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Recommend which release components a NEXT stable tag should ship.
 #
-# The monorepo carries three release components on ONE vX.Y.Z tag family
-# (see RELEASING.md "Component selection"): server, host-agent, desktop.
+# The monorepo carries four release components on ONE vX.Y.Z tag family
+# (see RELEASING.md "Component selection"): server, host-agent, sx, desktop.
 # (machine-rc was retired in plan 010 — the shed-host-agent daemon hosts the
 # machine RC hub and `sx` carries the one-shot verbs.)
 #
@@ -42,7 +42,8 @@
 # Hard failures (exit 1): shallow clone; target not strictly greater than the
 # max current manifest version (the tag family is monotonic — "never reuse a
 # version" — which makes the bump-level compare well-defined); no historical
-# basis for a component. exit 2: a malformed / prerelease target argument.
+# basis for a component that is NOT in NEVER_SHIPPED (see below). exit 2: a
+# malformed / prerelease target argument.
 
 set -euo pipefail
 
@@ -118,6 +119,21 @@ PATHS_HOST_AGENT=(
   .goreleaser.host-agent.yaml
 )
 
+# sx: the RC porcelain binary + every crate it links. Same exclusion rationale
+# as host-agent: crates/Cargo.toml + crates/Cargo.lock are DELIBERATELY absent
+# (every desktop bump rewrites them, which would flag sx after every desktop
+# release). Accepted gap: a [workspace.dependencies]-only bump won't auto-flag
+# sx either — the human confirm is the backstop.
+# shellcheck disable=SC2034  # read via get_paths()
+PATHS_SX=(
+  crates/sx
+  crates/shed-app
+  crates/shed-rc-engine
+  crates/shed-core
+  crates/rust-toolchain.toml
+  .goreleaser.sx.yaml
+)
+
 # desktop: the app + every crate it links + the shared cargo manifests/locks
 # (which the desktop bump owns).
 # shellcheck disable=SC2034  # read via get_paths()
@@ -137,7 +153,44 @@ PATHS_DESKTOP=(
 )
 
 # Canonical component order (drives every output list).
-COMPONENTS=(server host-agent desktop)
+COMPONENTS=(server host-agent sx desktop)
+
+# Components that have NEVER shipped in any tag — the first-ship bootstrap.
+#
+# find_lastship() walks tags for one whose manifest equals the tag; failing
+# that, the caller hard-errors "no historical basis". That error is the right
+# behavior for an ESTABLISHED component (it means the repo/tag state is broken)
+# but it is the WRONG behavior for a brand-new one, which by definition has no
+# basis and no pre-migration era to fall back to either.
+#
+# A component listed here is instead reported with the basis "(never shipped)",
+# treated as changed=yes unconditionally (there is no <lastship>..HEAD range to
+# diff), and therefore recommended at every level including patch — which is
+# exactly right: a component that has never shipped always wants shipping on the
+# next tag. Anything NOT listed keeps the hard error, so the sentinel can never
+# silently mask a genuine repo-state bug.
+#
+# Self-healing: once a tag ships the component, loop (a) of find_lastship finds
+# it and this list is never consulted again. PRUNE the entry then.
+#
+# sx (plan 011) is listed because it ships for the first time on whatever tag
+# next carries crates/sx/VERSION; the file is seeded at 0.0.0, a version no tag
+# will ever carry, so the walk correctly finds nothing.
+NEVER_SHIPPED=(sx)
+
+# True (exit 0) iff $1 is in NEVER_SHIPPED. Index-loop the scan (rather than
+# `for c in "${NEVER_SHIPPED[@]}"`) so that pruning the LAST entry — which the
+# comment above tells the next person to do — leaves an empty array that can't
+# trip `set -u` on the `[@]` expansion under stock macOS bash 3.2. Same guard
+# release-plan.sh applies to its actual_ships scan.
+never_shipped() {
+  local i=0
+  while [ "${i}" -lt "${#NEVER_SHIPPED[@]}" ]; do
+    [ "${NEVER_SHIPPED[${i}]}" = "$1" ] && return 0
+    i=$((i + 1))
+  done
+  return 1
+}
 
 # ---------------------------------------------------------------------------
 # Argument + repo preconditions.
@@ -217,6 +270,7 @@ manifest_path() {
   case "$1" in
     server) echo ".claude-plugin/plugin.json" ;;
     host-agent) echo "crates/shed-host-agent/VERSION" ;;
+    sx) echo "crates/sx/VERSION" ;;
     desktop) echo "desktop/VERSION" ;;
   esac
 }
@@ -228,6 +282,7 @@ get_paths() {
   case "$1" in
     server)     paths=("${PATHS_SERVER[@]}") ;;
     host-agent) paths=("${PATHS_HOST_AGENT[@]}") ;;
+    sx)         paths=("${PATHS_SX[@]}") ;;
     desktop)    paths=("${PATHS_DESKTOP[@]}") ;;
   esac
 }
@@ -235,12 +290,28 @@ get_paths() {
 # The 0-based index of a component in COMPONENTS (its slot in the parallel
 # LASTSHIP / CHANGED / SAMPLES indexed arrays — bash-3.2's stand-in for the
 # associative arrays this walk would otherwise key on the component name).
+#
+# DERIVED from COMPONENTS rather than a hand-maintained parallel case map: a
+# hardcoded map means adding a component is two edits (append to COMPONENTS,
+# and renumber every later entry here), and getting the second one wrong
+# misindexes silently. Deriving it makes COMPONENTS the single source of truth.
+#
+# The trailing hard error is load-bearing, not defensive noise: falling off the
+# end would echo the EMPTY STRING, and bash 3.2 evaluates an empty array
+# subscript as 0 rather than erroring — so `LASTSHIP[${ci}]=…` would silently
+# write into the `server` slot and the unknown component would vanish from the
+# report with no diagnostic. (That is the same silent-misindex class the
+# hardcoded map had; deriving the index alone only moves it.) A future
+# component added to manifest_path()/get_paths() but forgotten in COMPONENTS
+# now fails loudly here instead.
 comp_index() {
-  case "$1" in
-    server) echo 0 ;;
-    host-agent) echo 1 ;;
-    desktop) echo 2 ;;
-  esac
+  local i=0
+  while [ "${i}" -lt "${#COMPONENTS[@]}" ]; do
+    [ "${COMPONENTS[${i}]}" = "$1" ] && { echo "${i}"; return; }
+    i=$((i + 1))
+  done
+  echo "::error::comp_index: '$1' is not in COMPONENTS (${COMPONENTS[*]}) — add it there, or the parallel LASTSHIP/CHANGED/SAMPLES arrays would silently misindex." >&2
+  exit 1
 }
 
 # Current manifest version from the working tree; empty if the file is absent
@@ -408,12 +479,24 @@ CHANGED=()
 SAMPLES=()
 GH_CAVEAT=false
 
+FIRST_SHIP=false
+
 for comp in "${COMPONENTS[@]}"; do
   ci="$(comp_index "${comp}")"
-  lastship="$(find_lastship "${comp}")" || {
-    echo "error: no historical basis for component '${comp}' (no tag matches its manifest, no fallback)." >&2
-    exit 1
-  }
+  if ! lastship="$(find_lastship "${comp}")"; then
+    # No basis. For a NEVER_SHIPPED component that is expected (see the list's
+    # comment): report it as a first ship and always recommend it. For anything
+    # else it is a repo/tag-state bug and must stay loud.
+    if ! never_shipped "${comp}"; then
+      echo "error: no historical basis for component '${comp}' (no tag matches its manifest, no fallback)." >&2
+      exit 1
+    fi
+    LASTSHIP[${ci}]="(never shipped)"
+    CHANGED[${ci}]=yes
+    SAMPLES[${ci}]="(first ship — no diff basis)"
+    FIRST_SHIP=true
+    continue
+  fi
   LASTSHIP[${ci}]="${lastship}"
 
   # Failed-tag / caveat probe for the chosen basis tag.
@@ -457,11 +540,11 @@ done
 {
   echo
   echo "recommend-components: target ${TARGET}  (max current manifest ${MAX_VER} → level: ${LEVEL})"
-  printf '  %-11s  %-13s  %-8s  %s\n' "component" "last-shipped" "changed?" "sample paths"
-  printf '  %-11s  %-13s  %-8s  %s\n' "---------" "------------" "--------" "------------"
+  printf '  %-11s  %-15s  %-8s  %s\n' "component" "last-shipped" "changed?" "sample paths"
+  printf '  %-11s  %-15s  %-8s  %s\n' "---------" "------------" "--------" "------------"
   for comp in "${COMPONENTS[@]}"; do
     ci="$(comp_index "${comp}")"
-    printf '  %-11s  %-13s  %-8s  %s\n' "${comp}" "${LASTSHIP[${ci}]}" "${CHANGED[${ci}]}" "${SAMPLES[${ci}]}"
+    printf '  %-11s  %-15s  %-8s  %s\n' "${comp}" "${LASTSHIP[${ci}]}" "${CHANGED[${ci}]}" "${SAMPLES[${ci}]}"
   done
   echo
   if [ "${LEVEL}" = "patch" ]; then
@@ -469,8 +552,12 @@ done
   else
     echo "  ${LEVEL} → recommending ALL components (a version-line bump ships the fleet)."
   fi
-  echo "  CAVEAT (host-agent): a [workspace.dependencies]-only bump in crates/Cargo.toml is"
+  echo "  CAVEAT (host-agent, sx): a [workspace.dependencies]-only bump in crates/Cargo.toml is"
   echo "         NOT auto-detected (that file is excluded to avoid desktop-bump false positives)."
+  if [ "${FIRST_SHIP}" = "true" ]; then
+    echo "  NOTE (first ship): a component shown as '(never shipped)' has no diff basis — it is"
+    echo "         recommended unconditionally. Prune it from NEVER_SHIPPED once it has shipped once."
+  fi
   if [ "${GH_CAVEAT}" = "true" ]; then
     echo "  CAVEAT (failed-tag): gh unavailable/unauthed — could not verify the chosen basis"
     echo "         tags actually shipped assets. A failed tag would still count as 'last shipped'."

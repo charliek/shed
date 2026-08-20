@@ -5,9 +5,10 @@ name: Publish Images and Release
 #
 #   release-plan                    (~10 s)   which components does this tag
 #                                             ship? (ship_server /
-#                                             ship_host_agent / ship_desktop,
-#                                             plus ship_goreleaser = any of
-#                                             the first two). Fails LOUDLY on
+#                                             ship_host_agent / ship_sx /
+#                                             ship_desktop, plus
+#                                             ship_goreleaser = any of the
+#                                             first three). Fails LOUDLY on
 #                                             a re-dispatched pre-retirement
 #                                             tag whose own release-plan.sh
 #                                             says ship_machine_rc=true (the
@@ -20,10 +21,10 @@ name: Publish Images and Release
 #                                             (no needs — runs in parallel
 #                                             with the image chain)
 #
-#   Goreleaser components (ship_goreleaser — server, host-agent):
+#   Goreleaser components (ship_goreleaser — server, host-agent, sx):
 #   4. release                      (~5 min)  one goreleaser invocation PER
 #                                             SHIPPING component (config order
-#                                             server → host-agent,
+#                                             server → host-agent → sx,
 #                                             .goreleaser.<component>.yaml) +
 #                                             per-component apt-charliek
 #                                             dispatches — fires only on
@@ -62,7 +63,7 @@ name: Publish Images and Release
 # needs skippable jobs, so each carries an explicit `!cancelled() && …`
 # or `always() && …` guard: a skipped upstream must not block, a FAILED
 # upstream must, and a user-cancelled run must publish nothing). Traced
-# per scenario (tag push; "helper" = host-agent with ship_server
+# per scenario (tag push; "helper" = host-agent and/or sx with ship_server
 # false):
 #
 #   job                    | server tag  | helper-only tag | desktop-only tag | combined (srv+desk)
@@ -83,6 +84,13 @@ name: Publish Images and Release
 #   image chain skips (ship_server=false) while `release` still runs
 #   (ship_goreleaser) — so desktop-release-create stays skipped and the
 #   goreleaser invocation that runs first owns the release + notes.
+#
+#   The `release` job's own STEPS are gated per component, so an sx-only tag
+#   (plan 011) runs the job with only the sx goreleaser invocation and only
+#   the sx apt dispatch: the server/host-agent goreleaser steps skip, the
+#   shed-server dispatch skips, and NO rootfs images are published (the whole
+#   image chain is ship_server-gated). That is the cheap dev-loop tag this
+#   component exists for.
 #
 # The two mac desktop jobs are MUTUALLY EXCLUSIVE on the same prerelease/stable
 # axis, and it's cross-cutting to the go/desktop/combined columns above:
@@ -144,8 +152,8 @@ concurrency:
 jobs:
   # Which components does this tag ship? A component ships iff its version
   # manifest equals the tag (server: .claude-plugin/plugin.json; host-agent:
-  # crates/shed-host-agent/VERSION; desktop: desktop/VERSION, with the
-  # crates/tauri surfaces lockstep-verified).
+  # crates/shed-host-agent/VERSION; sx: crates/sx/VERSION; desktop:
+  # desktop/VERSION, with the crates/tauri surfaces lockstep-verified).
   # scripts/release/release-plan.sh fails loudly when NO manifest matches
   # (forgotten update-version.sh run) and cross-checks the CHANGELOG's
   # **Ships:** line on stable tags, which fails this job and skips the
@@ -156,8 +164,9 @@ jobs:
     outputs:
       ship_server: ${{ steps.plan.outputs.ship_server }}
       ship_host_agent: ${{ steps.plan.outputs.ship_host_agent }}
+      ship_sx: ${{ steps.plan.outputs.ship_sx }}
       ship_desktop: ${{ steps.plan.outputs.ship_desktop }}
-      # true iff any of server/host-agent — computed in the script
+      # true iff any of server/host-agent/sx — computed in the script
       # (bash-tested) so workflow expressions never re-derive it.
       ship_goreleaser: ${{ steps.plan.outputs.ship_goreleaser }}
     steps:
@@ -212,6 +221,9 @@ jobs:
             {
               echo "ship_server=${go_val}"
               echo "ship_host_agent=${go_val}"
+              # sx did not exist pre-migration, so a legacy tag can never have
+              # shipped it — always false, never ${go_val}.
+              echo "ship_sx=false"
               echo "ship_goreleaser=${go_val}"
             } >> plan.out
           fi
@@ -541,14 +553,14 @@ jobs:
     uses: ./.github/workflows/smoke-linux.yml
 
   # goreleaser + apt-charliek dispatches — one goreleaser invocation per
-  # SHIPPING component (.goreleaser.{server,host-agent}.yaml, fixed
+  # SHIPPING component (.goreleaser.{server,host-agent,sx}.yaml, fixed
   # order). Only fires on tag-push events (not manual workflow_dispatch
   # republishes).
   #
   # The `if:` below is load-bearing; read it with these rules in mind:
   # * `!cancelled()` (NOT the implicit success()) lets the job evaluate
-  #   over SKIPPED needs — on a helper-only tag (host-agent without
-  #   server) the whole image chain skips and this job must still run. `always()` would be wrong: a user-cancelled run must publish
+  #   over SKIPPED needs — on a helper-only tag (host-agent and/or sx
+  #   without server) the whole image chain skips and this job must still run. `always()` would be wrong: a user-cancelled run must publish
   #   nothing.
   # * GHA outputs are STRINGS and any non-empty string is truthy, so
   #   every comparison is an explicit == / != against 'true'.
@@ -571,7 +583,7 @@ jobs:
         needs.publish-vz.result == 'success' &&
         needs.publish-fc.result == 'success' &&
         needs.smoke.result == 'success'))
-    # macos-latest: the shipped shed-host-agent is Rust (builder: rust / cargo
+    # macos-latest: the shipped shed-host-agent and sx are Rust (builder: rust / cargo
     # zigbuild — cross-builds the linux targets from macOS via zig). The Go
     # twin (cmd/shed-host-agent) was sunset (plan
     # 006-mtls-cleanup-hostagent-sunset.md). This mirrors the ci.yml
@@ -611,10 +623,14 @@ jobs:
       # fast if a target is unavailable. The build env SHED_HOST_AGENT_VERSION=
       # {{ .Version }} lives in .goreleaser.host-agent.yaml, so it applies
       # identically to the snapshot and this release — no per-job version
-      # munging. Only needed when the host-agent ships (the server config is
-      # pure Go) — skipping saves ~3 min on server-only tags.
+      # munging (the sx config carries SX_VERSION={{ .Version }} the same way).
+      # Only needed when a RUST component ships (the server config is pure Go)
+      # — skipping saves ~3 min on server-only tags.
       - name: Rust toolchain + zig cross tooling
-        if: success() && needs.release-plan.outputs.ship_host_agent == 'true'
+        if: >-
+          success() &&
+          (needs.release-plan.outputs.ship_host_agent == 'true' ||
+           needs.release-plan.outputs.ship_sx == 'true')
         run: |
           # Kept byte-identical to ci.yml's release-snapshot step (see the note
           # there): explicit rustfmt+clippy (rust-toolchain.toml declares them),
@@ -662,7 +678,7 @@ jobs:
           permission-contents: write
 
       # One invocation per SHIPPING component, fixed order server →
-      # host-agent. Both configs use release.mode keep-existing +
+      # host-agent → sx. All configs use release.mode keep-existing +
       # replace_existing_artifacts, so whichever runs FIRST
       # creates the GH release with the goreleaser-changelog body (the
       # changelog is derived from the repo tag range — identical whichever
@@ -697,18 +713,33 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           HOMEBREW_TAP_TOKEN: ${{ steps.tap.outputs.token }}
 
+      - name: Run GoReleaser (sx)
+        if: success() && needs.release-plan.outputs.ship_sx == 'true'
+        uses: goreleaser/goreleaser-action@v7
+        with:
+          version: v2.15.3
+          args: release --clean -f .goreleaser.sx.yaml
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          HOMEBREW_TAP_TOKEN: ${{ steps.tap.outputs.token }}
+
       # Mint a release-bot App token scoped to charliek/apt-charliek for
       # the publish dispatches. The App must be installed on apt-charliek
       # (verify via sanity-check-app.yml). Replaces the legacy
       # APT_DISPATCH_TOKEN PAT. Only minted when a deb-shipping component
-      # is in the plan (server — host-agent has no deb; the retired
+      # is in the plan (server or sx — host-agent has no deb; the retired
       # machine-rc's apt entry stays frozen at its last-shipped release).
+      # ONE mint feeds both dispatch steps below (token TTL 1h; the job runs
+      # well under it), same as the tap token feeds all three goreleaser runs.
       # NOTE: the dispatches are freshness nudges only — apt-charliek
       # re-scans every tracked package's release ASSETS on every publish
       # run and ignores the dispatch payload for correctness, which is
       # exactly why unshipped components must produce no assets at all.
       - name: Mint an apt-charliek App token
-        if: success() && needs.release-plan.outputs.ship_server == 'true'
+        if: >-
+          success() &&
+          (needs.release-plan.outputs.ship_server == 'true' ||
+           needs.release-plan.outputs.ship_sx == 'true')
         id: apt
         uses: actions/create-github-app-token@v3
         with:
@@ -719,7 +750,7 @@ jobs:
           # POST /repos/.../dispatches requires contents:write.
           permission-contents: write
 
-      - name: Trigger apt-charliek publish
+      - name: Trigger apt-charliek publish (shed-server)
         if: success() && needs.release-plan.outputs.ship_server == 'true'
         env:
           GH_TOKEN: ${{ steps.apt.outputs.token }}
@@ -737,6 +768,38 @@ jobs:
               --method POST \
               -f event_type=publish \
               -F "client_payload[package]=shed-server" \
+              -F "client_payload[tag]=${{ github.ref_name }}" 2>&1; then
+              echo "::notice::Watch apt publish at https://github.com/charliek/apt-charliek/actions"
+              exit 0
+            fi
+            echo "::warning::dispatch attempt $attempt failed; sleeping $((attempt * 5))s"
+            if [ "$attempt" -eq 3 ]; then
+              echo "::error::apt-charliek dispatch failed after 3 attempts — check the stderr above for the API error"
+              exit 1
+            fi
+            sleep $((attempt * 5))
+          done
+
+      # The sx deb (plan 011). Its own step, not a second package in the one
+      # above, because the two components ship INDEPENDENTLY: an sx-only tag
+      # fires this while the shed-server dispatch is skipped, and vice versa —
+      # and a per-component step keeps that visible in the job log.
+      - name: Trigger apt-charliek publish (sx)
+        if: success() && needs.release-plan.outputs.ship_sx == 'true'
+        env:
+          GH_TOKEN: ${{ steps.apt.outputs.token }}
+        run: |
+          # Retry rationale is identical to the shed-server dispatch above: a
+          # transient network/API blip must not fail the release after
+          # GoReleaser already succeeded, apt-charliek's publish workflow is
+          # idempotent so a missed dispatch self-heals on the next release, and
+          # stderr is captured so a real install-state failure (App not
+          # installed, scoped-perms mismatch) is diagnosable from the log.
+          for attempt in 1 2 3; do
+            if gh api repos/charliek/apt-charliek/dispatches \
+              --method POST \
+              -f event_type=publish \
+              -F "client_payload[package]=sx" \
               -F "client_payload[tag]=${{ github.ref_name }}" 2>&1; then
               echo "::notice::Watch apt publish at https://github.com/charliek/apt-charliek/actions"
               exit 0

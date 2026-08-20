@@ -23,9 +23,10 @@ One `vX.Y.Z` tag family, **manifest-selected** — a component ships iff its ver
 
 - **server** selector = `.claude-plugin/plugin.json` (renamed from `go`; file unchanged); ships the CLI/server/agent brew + apt + rootfs images.
 - **host-agent** selector = `crates/shed-host-agent/VERSION`; ships brew `shed-host-agent` + a GH linux tarball (brew-only, no apt).
+- **sx** selector = `crates/sx/VERSION`; ships brew `sx` + an apt `sx` deb — the channel pair machine-rc vacated. Rust, `builder: rust`/`cargo zigbuild` like host-agent, so its linux deb carries a **glibc ≥ 2.30** floor (Ubuntu 20.04+). Packaged for the dev loop, not as a stability promise.
 - **desktop** selector = `desktop/VERSION` (with `crates/Cargo.toml`, the Tauri `Cargo.toml`/`tauri.conf.json`, and both Cargo locks in verified **lockstep**); ships the DMG + Sparkle appcast + `shed-desktop` debs.
 
-`scripts/release/update-version.sh X.Y.Z --components server,host-agent,desktop` bumps the selected manifests (default `server`; `go` accepted as a deprecated alias). `scripts/release/recommend-components.sh X.Y.Z` recommends the component set (all three on a minor/major bump, only what changed since each component's last-shipped tag on a patch) for the human to confirm/edit before bumping. `scripts/release/release-plan.sh` maps a tag → `ship_server`/`ship_host_agent`/`ship_desktop` and **exits 1 if none match** (forgotten-bump guard). Each `CHANGELOG.md` entry opens with a `**Ships:**` line naming the components — **enforced** by `release-plan.sh` against the manifest-computed set on stable tags. A **desktop-only** tag publishes **no** rootfs images; a **helper-only** tag (host-agent, no server) also publishes no images and leaves the other components' brew/apt entries pinned at their prior release. (The former fourth component, **machine-rc**, was retired in plan 010 — the shed-host-agent daemon hosts the machine RC hub and `sx` carries the one-shot verbs; its brew/apt artifacts stay frozen at v0.8.2.) Full detail in `RELEASING.md` (and `desktop/RELEASING.md` for the recurring desktop steps).
+`scripts/release/update-version.sh X.Y.Z --components server,host-agent,sx,desktop` bumps the selected manifests (default `server`; `go` accepted as a deprecated alias). `scripts/release/recommend-components.sh X.Y.Z` recommends the component set (all four on a minor/major bump, only what changed since each component's last-shipped tag on a patch; a never-shipped component is bootstrapped via the script's `NEVER_SHIPPED` list rather than hard-erroring) for the human to confirm/edit before bumping. `scripts/release/release-plan.sh` maps a tag → `ship_server`/`ship_host_agent`/`ship_sx`/`ship_desktop` and **exits 1 if none match** (forgotten-bump guard). Each `CHANGELOG.md` entry opens with a `**Ships:**` line naming the components — **enforced** by `release-plan.sh` against the manifest-computed set on stable tags. A **desktop-only** tag publishes **no** rootfs images; a **helper-only** tag (host-agent and/or sx, no server) also publishes no images and leaves the other components' brew/apt entries pinned at their prior release. (The former **machine-rc** component was retired in plan 010 — the shed-host-agent daemon hosts the machine RC hub and `sx` carries the one-shot verbs; its brew/apt artifacts stay frozen at v0.8.2, and plan 011 handed its brew+apt slot to `sx`.) Full detail in `RELEASING.md` (and `desktop/RELEASING.md` for the recurring desktop steps).
 
 ## Build & Test
 
@@ -39,7 +40,7 @@ make coverage           # Tests with coverage report
 make test-integration   # Run the pytest-based integration suite (see below)
 ```
 
-Tools are managed via [mise](https://mise.jdx.dev/) — run `mise install` to set up Go and golangci-lint.
+Tools are managed via [mise](https://mise.jdx.dev/) — run `mise install` to set up Go and golangci-lint, plus `goreleaser` (pinned to CI's exact version) and `zig` (release tooling; only needed for a local `make snapshot-<component>` run).
 
 ### Integration test suite (`tests/integration/`)
 
