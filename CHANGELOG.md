@@ -5,13 +5,14 @@ All notable changes to this project will be documented in this file.
 <!--
   `**Ships:**` convention: each release entry opens with a `**Ships:** …`
   line naming the components that tag actually shipped, using the
-  canonical tokens `server`, `host-agent`, `desktop`
+  canonical tokens `server`, `host-agent`, `sx`, `desktop`
   (comma-separated; legacy `server/CLI` is accepted as an alias for
   `server`, for entries written before the rename; `machine-rc` appears in
   historical entries but is REJECTED on new ones — the component was
   retired in plan 010). A component ships iff
   its version manifest equals the tag (server: .claude-plugin/plugin.json;
-  host-agent: crates/shed-host-agent/VERSION; desktop: desktop/VERSION) — see
+  host-agent: crates/shed-host-agent/VERSION; sx: crates/sx/VERSION;
+  desktop: desktop/VERSION) — see
   RELEASING.md "Component selection". ENFORCED by
   scripts/release/release-plan.sh on stable tags (a mismatched, missing,
   unknown, or duplicate token fails the release); prerelease tags have no
@@ -21,11 +22,12 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
-_Staged by plan 010 (the machine-hub port + retirement); at release time fold
-this body into the new `## vX.Y.Z` section and replace this note with a real
-`**Ships:**` line — **host-agent** (the hub lands there; the `machine-rc`
-token is retired and release-plan.sh now rejects it). release-plan.sh never
-reads an `## Unreleased` heading._
+_Staged by plans 010 (the machine-hub port + retirement) and 011 (shipping
+`sx`); at release time fold this body into the new `## vX.Y.Z` section and
+replace this note with a real `**Ships:**` line — **host-agent, sx** (the hub
+lands in host-agent; `sx` is now its own component, and the `machine-rc` token
+is retired and rejected by release-plan.sh). release-plan.sh never reads an
+`## Unreleased` heading._
 
 - **The machine RC hub moves into `shed-host-agent`.** The daemon hosts the
   activity hub (`127.0.0.1:1029`) as a supervised resident role: bind-as-lock
@@ -57,6 +59,27 @@ reads an `## Unreleased` heading._
   and hints at `shed-host-agent` when nothing answers. Artifacts published
   before the retirement are not withdrawn but are unsupported; the intended
   move is `sx` + `shed-host-agent`.
+- **`sx` becomes its own release component** (plan 011), taking the brew + apt
+  channel pair `machine-rc` vacated: selector `crates/sx/VERSION`, its own
+  `.goreleaser.sx.yaml` (`builder: rust`/`cargo zigbuild`, all four
+  darwin/linux targets, a minimal one-binary deb and a `bin.install`-only
+  formula), and a `ship_sx` output threaded through `release-plan.sh`,
+  `update-version.sh`, `recommend-components.sh`, the CI snapshot leg and the
+  publish workflow's goreleaser + apt-dispatch steps. Machines can now
+  `apt install sx` / `brew install charliek/tap/sx` instead of needing a Rust
+  toolchain. The published linux binaries carry a **glibc ≥ 2.30** floor
+  (Ubuntu 20.04+ / RHEL 9+) — see RELEASING.md "sx: Rust binary".
+- **`sx version` reports the release tag**, not `CARGO_PKG_VERSION` (which
+  tracks the *desktop* selector and is not bumped on an sx-only tag):
+  `crates/sx/src/version.rs` mirrors the host-agent's `pick_version` +
+  `option_env!("SX_VERSION")` shape. The RC wire is unaffected — the parity
+  harness masks the version value.
+- **The component recommender bootstraps a never-shipped component.**
+  `recommend-components.sh` carries a `NEVER_SHIPPED` list (today: `sx`) whose
+  members report the basis `(never shipped)` and are recommended
+  unconditionally, instead of tripping the "no historical basis" hard error a
+  brand-new component would otherwise hit on its first run. Components not on
+  that list keep the hard error.
 
 ## v0.8.2 — 2026-08-17
 
