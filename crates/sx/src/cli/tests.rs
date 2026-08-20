@@ -123,15 +123,21 @@ fn err(code: i32, stderr_needle: &str, args: &[&str], stdin: &str) {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn version_prints_prog_and_crate_version() {
+fn version_prints_prog_and_release_version() {
+    // The value is whatever `crate::version` resolves (release-injected
+    // SX_VERSION, else CARGO_PKG_VERSION) — asserted through the same function
+    // the binary uses so the two can't drift. The SHAPE (`sx <non-blank>`) is
+    // the contract the rc-parity harness masks against.
     for args in [&["version"][..], &["rc", "version"][..], &["--version"][..]] {
         let (out, _) = run_ok(args);
         assert_eq!(out.code, 0);
         assert_eq!(
             out.stdout,
-            format!("{PROG} {}\n", env!("CARGO_PKG_VERSION")),
+            format!("{PROG} {}\n", crate::version::version()),
             "args {args:?}"
         );
+        let v = out.stdout.trim_end().strip_prefix("sx ").expect("sx-prefixed");
+        assert!(!v.trim().is_empty(), "args {args:?}: blank version");
     }
 }
 

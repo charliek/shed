@@ -26,6 +26,7 @@ mod cli;
 mod porcelain;
 mod ssh;
 mod target;
+mod version;
 
 use shed_app::rc_engine::tmux::ExecRunner;
 
