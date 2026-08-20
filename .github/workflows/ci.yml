@@ -34,6 +34,7 @@ jobs:
       packaging: ${{ steps.filter.outputs.packaging }}
       harness: ${{ steps.filter.outputs.harness }}
       hostagent: ${{ steps.filter.outputs.hostagent }}
+      sx: ${{ steps.filter.outputs.sx }}
       rcparity: ${{ steps.filter.outputs.rcparity }}
       docs: ${{ steps.filter.outputs.docs }}
       ci: ${{ steps.filter.outputs.ci }}
@@ -121,6 +122,23 @@ jobs:
               - 'docs/development/host-agent-wire-catalog.md'
               - 'go.mod'
               - 'go.sum'
+            sx:
+              # The SHIPPED `sx` binary (plan 011: sx is its own release
+              # component, brew + apt). This filter exists so the
+              # release-snapshot job runs on an sx-only PR — without it a change
+              # to crates/sx/** would match none of go/hostagent/ci and the sx
+              # release build would go unproven on exactly the PRs most likely
+              # to break it. The shared crates below are sx's link-time deps;
+              # the `hostagent` filter lists most of them too (both binaries
+              # come out of the same workspace), which is fine — the two
+              # filters are ORed into one job gate.
+              - 'crates/sx/**'
+              - 'crates/shed-app/**'
+              - 'crates/shed-rc-engine/**'
+              - 'crates/shed-core/**'
+              - 'crates/Cargo.toml'
+              - 'crates/Cargo.lock'
+              - 'crates/rust-toolchain.toml'
             rcparity:
               # The Go-vs-Rust RC-engine differential leg (plan 009): BOTH one-shot
               # implementations, the harness that runs them side by side, and the
@@ -228,16 +246,17 @@ jobs:
   release-snapshot:
     name: GoReleaser snapshot (artifact sanity)
     needs: changes
-    # Also gated on `hostagent`: the SHIPPED shed-host-agent binary is now built
-    # from crates/shed-host-agent/ (builder: rust), so a crates-only PR must run
-    # this snapshot to prove the release build still resolves. The `hostagent`
-    # filter already scopes crates/shed-host-agent/**.
-    if: ${{ needs.changes.outputs.go == 'true' || needs.changes.outputs.hostagent == 'true' || needs.changes.outputs.ci == 'true' }}
-    # macos-latest matches the real release runner: the shipped shed-host-agent is
-    # Rust (builder: rust / cargo zigbuild — cross-builds the linux targets from
-    # macOS via zig). The Go twin (cmd/shed-host-agent) was sunset (plan
-    # 006-mtls-cleanup-hostagent-sunset.md); this job now builds only the Rust
-    # binary, but stays on macos-latest to match the real release runner.
+    # Also gated on `hostagent` and `sx`: the SHIPPED shed-host-agent and sx
+    # binaries are both built from crates/ (builder: rust), so a crates-only PR
+    # must run this snapshot to prove the release builds still resolve. Those
+    # two filters scope crates/shed-host-agent/** and crates/sx/** respectively.
+    if: ${{ needs.changes.outputs.go == 'true' || needs.changes.outputs.hostagent == 'true' || needs.changes.outputs.sx == 'true' || needs.changes.outputs.ci == 'true' }}
+    # macos-latest matches the real release runner: the shipped shed-host-agent
+    # and sx are Rust (builder: rust / cargo zigbuild — cross-builds the linux
+    # targets from macOS via zig). The Go twin (cmd/shed-host-agent) was sunset
+    # (plan 006-mtls-cleanup-hostagent-sunset.md); this job builds the Go server
+    # component plus the two Rust binaries, on macos-latest to match the real
+    # release runner.
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v6
@@ -266,7 +285,7 @@ jobs:
           # .goreleaser.host-agent.yaml).
           brew install zig
           cargo install --locked --version 0.23.0 cargo-zigbuild
-      # Mirrors the release job's guard (plan 002 D5): the three configs are
+      # Mirrors the release job's guard (plan 002 D5): the split configs are
       # invoked sequentially and a before-hook MUST NOT mutate a tracked file
       # (go.mod/go.sum) or a later invocation aborts on its own dirty-check. We
       # assert tidiness here instead of running `go mod tidy` in a before-hook,
@@ -279,10 +298,10 @@ jobs:
       # friends) on this runner — de-risks the macos release job.
       - name: Run tests
         run: go test ./...
-      # Two snapshot invocations, one per split config, in the FIXED release
-      # order (server → host-agent). Both run unconditionally here — the
-      # snapshot is the pre-tag proof of every component, incl. the Rust
-      # host-agent leg. Each writes its own dist/<component>/ subdir.
+      # Three snapshot invocations, one per split config, in the FIXED release
+      # order (server → host-agent → sx). All run unconditionally here — the
+      # snapshot is the pre-tag proof of every component, incl. both Rust
+      # legs. Each writes its own dist/<component>/ subdir.
       - name: GoReleaser snapshot — server
         uses: goreleaser/goreleaser-action@v7
         with:
@@ -293,6 +312,11 @@ jobs:
         with:
           version: v2.15.3
           args: release --snapshot --clean -f .goreleaser.host-agent.yaml
+      - name: GoReleaser snapshot — sx
+        uses: goreleaser/goreleaser-action@v7
+        with:
+          version: v2.15.3
+          args: release --snapshot --clean -f .goreleaser.sx.yaml
       - name: Assert release artifacts
         run: |
           set -euo pipefail
@@ -318,16 +342,43 @@ jobs:
           # codesign step; a future zig that drops it fails loudly here, pre-tag).
           tar xzf dist/host-agent/shed-host-agent_darwin_arm64.tar.gz -C "$workdir" shed-host-agent
           arm64_out="$("$workdir/shed-host-agent" version)"
-          echo "darwin/arm64: $arm64_out"
+          echo "shed-host-agent darwin/arm64: $arm64_out"
           case "$arm64_out" in shed-host-agent\ *) ;; *) echo "::error::darwin/arm64 version output unexpected: $arm64_out"; exit 1;; esac
           codesign -dv "$workdir/shed-host-agent" 2>&1 | grep -q 'Signature=adhoc' || { echo "::error::arm64 shed-host-agent lost its ad-hoc signature"; codesign -dv "$workdir/shed-host-agent" 2>&1; exit 1; }
           rm -f "$workdir/shed-host-agent"
           tar xzf dist/host-agent/shed-host-agent_darwin_amd64.tar.gz -C "$workdir" shed-host-agent
           amd64_file="$(file "$workdir/shed-host-agent")"
           echo "$amd64_file" | grep -q 'Mach-O.*x86_64' || { echo "::error::darwin/amd64 is not a well-formed x86_64 Mach-O: $amd64_file"; exit 1; }
-          echo "darwin/amd64: $amd64_file"
+          echo "shed-host-agent darwin/amd64: $amd64_file"
+          rm -f "$workdir/shed-host-agent"
+          # (i-b) the sx archives (plan 011). Same shape, minus the bundled
+          # config: `sx` ships a lone binary. The native arm64 run also proves
+          # the SX_VERSION injection reached the binary — a `sx <blank>` line
+          # would mean .goreleaser.sx.yaml's build env stopped applying, which
+          # is invisible to `tar tzf` and to the rc-parity harness (it masks the
+          # version value).
+          for os in darwin linux; do
+            for arch in amd64 arm64; do
+              tgz="dist/sx/sx_${os}_${arch}.tar.gz"
+              ls "$tgz" >/dev/null || { echo "::error::missing $tgz"; exit 1; }
+              tar tzf "$tgz" | grep -qx 'sx' || { echo "::error::$tgz missing sx binary"; tar tzf "$tgz"; exit 1; }
+            done
+          done
+          tar xzf dist/sx/sx_darwin_arm64.tar.gz -C "$workdir" sx
+          sx_out="$("$workdir/sx" version)"
+          echo "sx darwin/arm64: $sx_out"
+          case "$sx_out" in
+            "sx "?*) ;;
+            *) echo "::error::darwin/arm64 sx version output unexpected (want 'sx <version>'): $sx_out"; exit 1;;
+          esac
+          rm -f "$workdir/sx"
+          tar xzf dist/sx/sx_darwin_amd64.tar.gz -C "$workdir" sx
+          sx_amd64_file="$(file "$workdir/sx")"
+          echo "$sx_amd64_file" | grep -q 'Mach-O.*x86_64' || { echo "::error::sx darwin/amd64 is not a well-formed x86_64 Mach-O: $sx_amd64_file"; exit 1; }
+          echo "sx darwin/amd64: $sx_amd64_file"
           rm -rf "$workdir"
-          # (ii) plan 002 D6: per-dist exact (type, ID) allowlists — typed, so a
+          # (ii) plan 002 D6 (extended to sx by plan 011): per-dist exact
+          # (type, ID) allowlists — typed, so a
           # dropped ARCHIVE block is caught even when its BUILD still contributes
           # the same ID string (codex review finding). Equality proves expected-
           # present AND forbidden-absent. Plus partition invariants (deb
@@ -359,6 +410,19 @@ jobs:
                   "checksums": "checksums-host-agent.txt",
                   "formulas": {"shed-host-agent.rb"},
                   "has_deb": False,
+              },
+              "sx": {
+                  "dist": "dist/sx",
+                  "typed_ids": {
+                      # plan 011: one Rust build, archived under the same id,
+                      # plus the minimal deb (one binary, no unit/config).
+                      "Binary": {"sx"},
+                      "Archive": {"sx"},
+                      "Linux Package": {"sx-deb"},
+                  },
+                  "checksums": "checksums-sx.txt",
+                  "formulas": {"sx.rb"},
+                  "has_deb": True,
               },
           }
           ALL_CHECKSUMS = {c["checksums"] for c in EXPECTED.values()}
@@ -407,7 +471,7 @@ jobs:
                           fail(f"upload basename {b} collides: {all_basenames[b]} and {comp}")
                       all_basenames[b] = comp
               print(f"{comp}: IDs OK; deb={'yes' if debs else 'no'}; checksums={spec['checksums']}; formulas parse OK")
-          print(f"partition OK: {len(all_basenames)} unique upload basenames across two dists")
+          print(f"partition OK: {len(all_basenames)} unique upload basenames across {len(EXPECTED)} dists")
           PY
           echo "release snapshot artifacts OK"
 
