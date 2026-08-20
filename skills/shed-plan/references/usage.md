@@ -85,7 +85,8 @@ shed sessions kill <shed> rc-<slug>       # stop the session
 ## Machine targets (`sx`)
 
 `shed plan` only targets sheds. For a **native machine**, the porcelain is `sx`
-(unreleased — resolve it per the SKILL's guarded order: `PATH`, then
+(install with `brew install charliek/tap/sx` or `sudo apt install sx`; when it may
+not be present, resolve it per the SKILL's guarded order: `PATH`, then
 `cargo run -q -p sx --` from a shed checkout, then the remote engine over SSH).
 
 ```bash

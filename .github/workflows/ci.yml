@@ -343,7 +343,14 @@ jobs:
           tar xzf dist/host-agent/shed-host-agent_darwin_arm64.tar.gz -C "$workdir" shed-host-agent
           arm64_out="$("$workdir/shed-host-agent" version)"
           echo "shed-host-agent darwin/arm64: $arm64_out"
-          case "$arm64_out" in shed-host-agent\ *) ;; *) echo "::error::darwin/arm64 version output unexpected: $arm64_out"; exit 1;; esac
+          # Compare against the version GORELEASER recorded for this run, not
+          # just a `<prog> <non-blank>` shape. A shape check cannot detect the
+          # real regression — a dropped/renamed build `env:` block — because
+          # version.rs deliberately falls back to CARGO_PKG_VERSION, which is
+          # also non-blank. Only an equality check against .Version fails when
+          # the injection stops applying.
+          ha_want="$(python3 -c 'import json;print(json.load(open("dist/host-agent/metadata.json"))["version"])')"
+          [ "$arm64_out" = "shed-host-agent $ha_want" ] || { echo "::error::shed-host-agent version is '$arm64_out', expected 'shed-host-agent $ha_want' — SHED_HOST_AGENT_VERSION injection is not reaching the binary"; exit 1; }
           codesign -dv "$workdir/shed-host-agent" 2>&1 | grep -q 'Signature=adhoc' || { echo "::error::arm64 shed-host-agent lost its ad-hoc signature"; codesign -dv "$workdir/shed-host-agent" 2>&1; exit 1; }
           rm -f "$workdir/shed-host-agent"
           tar xzf dist/host-agent/shed-host-agent_darwin_amd64.tar.gz -C "$workdir" shed-host-agent
@@ -352,11 +359,11 @@ jobs:
           echo "shed-host-agent darwin/amd64: $amd64_file"
           rm -f "$workdir/shed-host-agent"
           # (i-b) the sx archives (plan 011). Same shape, minus the bundled
-          # config: `sx` ships a lone binary. The native arm64 run also proves
-          # the SX_VERSION injection reached the binary — a `sx <blank>` line
-          # would mean .goreleaser.sx.yaml's build env stopped applying, which
-          # is invisible to `tar tzf` and to the rc-parity harness (it masks the
-          # version value).
+          # config: `sx` ships a lone binary. The native arm64 run asserts the
+          # binary reports goreleaser's own .Version for this run — the check
+          # that actually catches .goreleaser.sx.yaml's build `env:` block
+          # silently ceasing to apply, which is invisible to `tar tzf` and to
+          # the rc-parity harness (it masks the version value by design).
           for os in darwin linux; do
             for arch in amd64 arm64; do
               tgz="dist/sx/sx_${os}_${arch}.tar.gz"
@@ -367,10 +374,8 @@ jobs:
           tar xzf dist/sx/sx_darwin_arm64.tar.gz -C "$workdir" sx
           sx_out="$("$workdir/sx" version)"
           echo "sx darwin/arm64: $sx_out"
-          case "$sx_out" in
-            "sx "?*) ;;
-            *) echo "::error::darwin/arm64 sx version output unexpected (want 'sx <version>'): $sx_out"; exit 1;;
-          esac
+          sx_want="$(python3 -c 'import json;print(json.load(open("dist/sx/metadata.json"))["version"])')"
+          [ "$sx_out" = "sx $sx_want" ] || { echo "::error::sx version is '$sx_out', expected 'sx $sx_want' — SX_VERSION injection is not reaching the binary"; exit 1; }
           rm -f "$workdir/sx"
           tar xzf dist/sx/sx_darwin_amd64.tar.gz -C "$workdir" sx
           sx_amd64_file="$(file "$workdir/sx")"

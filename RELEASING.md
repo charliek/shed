@@ -231,7 +231,7 @@ appcast, debs, apt dispatch, rc-tag rehearsals) live in
      once, shared by every invocation below.
    - Runs **one `goreleaser release --clean -f <config>` invocation per
      shipping goreleaser component**, in fixed order **server →
-     host-agent**, each step individually gated on its own
+     host-agent → sx**, each step individually gated on its own
      `ship_<component> == 'true'`:
      - `.goreleaser.server.yaml` — 3 Go binaries × OS/arch matrix with
        ldflag versioning, `checksums-server.txt`, `Formula/shed.rb`
@@ -240,7 +240,15 @@ appcast, debs, apt dispatch, rc-tag rehearsals) live in
        binary (`builder: rust`, via `cargo zigbuild`), a GH linux
        tarball, `checksums-host-agent.txt`, `Formula/shed-host-agent.rb`
        — **no `.deb`**, brew-only. See "Host-agent" below.
-     - Both share `release.mode: keep-existing` +
+     - `.goreleaser.sx.yaml` — the Rust `sx` binary (`builder: rust`,
+       via `cargo zigbuild`), archives for all four targets,
+       `checksums-sx.txt`, `Formula/sx.rb`, **and** `sx_*.deb` (via
+       nfpm — one binary, no unit/config/scripts). See "sx: Rust
+       binary" below.
+     - The Rust toolchain + zig install step is gated on
+       `ship_host_agent || ship_sx`, so a pure-Go server-only tag skips
+       it (~3 min).
+     - All three share `release.mode: keep-existing` +
        `release.replace_existing_artifacts: true`, identical
        `changelog`/`prerelease: auto`/`project_name: shed`. **The FIRST
        shipping invocation creates the GitHub Release and writes the
@@ -259,10 +267,14 @@ appcast, debs, apt dispatch, rc-tag rehearsals) live in
        A tracked-file mutation between invocation N and N+1 would fail
        goreleaser's dirty-check on the second invocation.
    - Mints a release-bot App token scoped to `charliek/apt-charliek`.
-   - Dispatches `event_type=publish` to apt-charliek for the one
+   - Dispatches `event_type=publish` to apt-charliek, one step per
      apt-carrying component — `client_payload[package]=shed-server`
-     (`if: ship_server`); host-agent has no apt dispatch (brew-only).
-     Retry loop with stderr capture for diagnosability. These dispatches
+     (`if: ship_server`) and `client_payload[package]=sx` (`if:
+     ship_sx`); host-agent has no apt dispatch (brew-only). They are
+     separate steps, not one multi-package step, because the two
+     components ship independently. The token mint above is gated on
+     `ship_server || ship_sx` — an exact superset of the two dispatch
+     gates. Retry loop with stderr capture for diagnosability. These dispatches
      are freshness nudges only — see "The apt reality" above; the split
      configs (no assets built for an unshipped component) are what
      actually keeps it out of apt's scan.
@@ -421,6 +433,23 @@ since plan 006, so the `release` + `release-snapshot` jobs install
   snapshot CI does, from the `.mise.toml`-pinned goreleaser/zig, once
   `cargo-zigbuild` and the three non-native rustup targets are installed
   (the target's comment lists both commands).
+
+> **Cross-repo prerequisite — REQUIRED BEFORE THE FIRST SX-SHIPPING TAG.**
+> `charliek/apt-charliek`'s `packages.yaml` must carry an `sx` entry
+> (`repo: charliek/shed`, `glob: "sx_*.deb"`). apt-charliek indexes by
+> scanning release assets for globs it has entries for, so **without it the
+> first sx tag fails silently in the worst way**: the deb builds, uploads,
+> and the dispatch fires; apt-charliek's publish run goes green and indexes
+> nothing, and `apt install sx` keeps reporting no candidate. Landed by
+> `charliek/apt-charliek#19`, which also drops the stale `shed-machine-rc`
+> entry.
+>
+> That entry is deliberately `optional: true` while no sx tag exists —
+> otherwise every publish run (triggered by ANY tracked package) hard-fails
+> on the missing asset. **After the first sx-shipping tag, flip it to
+> `optional: false`** so a later regression fails loudly again, and prune
+> `sx` from `NEVER_SHIPPED` in `recommend-components.sh`. The brew side
+> needs no prerequisite: goreleaser pushes `Formula/sx.rb` itself.
 
 ## Snapshot / dev versioning
 

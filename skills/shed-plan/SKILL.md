@@ -92,8 +92,9 @@ running, and prints the per-agent remediation. Relay it to the user, then retry:
 
 When the user wants the plan run on a **machine** rather than a shed ("run it on my
 mac-mini", "kick this off on mini2 itself"), the tool is `sx` — the RC porcelain
-(`docs/extensions/sx.md`). It is **unreleased and installed nowhere by default**, so
-resolve it in this order and stop at the first that works:
+(`docs/extensions/sx.md`). It ships as its own release component (brew `sx` / apt
+`sx`) but is **not guaranteed present** on a given machine, so resolve it in this
+order and stop at the first that works:
 
 1. `sx` on `PATH` (`command -v sx`).
 2. A shed checkout on this machine: `cd <shed-repo>/crates && cargo run -q -p sx -- <args>`

@@ -295,12 +295,23 @@ get_paths() {
 # hardcoded map means adding a component is two edits (append to COMPONENTS,
 # and renumber every later entry here), and getting the second one wrong
 # misindexes silently. Deriving it makes COMPONENTS the single source of truth.
+#
+# The trailing hard error is load-bearing, not defensive noise: falling off the
+# end would echo the EMPTY STRING, and bash 3.2 evaluates an empty array
+# subscript as 0 rather than erroring — so `LASTSHIP[${ci}]=…` would silently
+# write into the `server` slot and the unknown component would vanish from the
+# report with no diagnostic. (That is the same silent-misindex class the
+# hardcoded map had; deriving the index alone only moves it.) A future
+# component added to manifest_path()/get_paths() but forgotten in COMPONENTS
+# now fails loudly here instead.
 comp_index() {
   local i=0
   while [ "${i}" -lt "${#COMPONENTS[@]}" ]; do
     [ "${COMPONENTS[${i}]}" = "$1" ] && { echo "${i}"; return; }
     i=$((i + 1))
   done
+  echo "::error::comp_index: '$1' is not in COMPONENTS (${COMPONENTS[*]}) — add it there, or the parallel LASTSHIP/CHANGED/SAMPLES arrays would silently misindex." >&2
+  exit 1
 }
 
 # Current manifest version from the working tree; empty if the file is absent
@@ -529,11 +540,11 @@ done
 {
   echo
   echo "recommend-components: target ${TARGET}  (max current manifest ${MAX_VER} → level: ${LEVEL})"
-  printf '  %-11s  %-13s  %-8s  %s\n' "component" "last-shipped" "changed?" "sample paths"
-  printf '  %-11s  %-13s  %-8s  %s\n' "---------" "------------" "--------" "------------"
+  printf '  %-11s  %-15s  %-8s  %s\n' "component" "last-shipped" "changed?" "sample paths"
+  printf '  %-11s  %-15s  %-8s  %s\n' "---------" "------------" "--------" "------------"
   for comp in "${COMPONENTS[@]}"; do
     ci="$(comp_index "${comp}")"
-    printf '  %-11s  %-13s  %-8s  %s\n' "${comp}" "${LASTSHIP[${ci}]}" "${CHANGED[${ci}]}" "${SAMPLES[${ci}]}"
+    printf '  %-11s  %-15s  %-8s  %s\n' "${comp}" "${LASTSHIP[${ci}]}" "${CHANGED[${ci}]}" "${SAMPLES[${ci}]}"
   done
   echo
   if [ "${LEVEL}" = "patch" ]; then

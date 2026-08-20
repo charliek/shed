@@ -1,17 +1,18 @@
 # GoReleaser config — HOST-AGENT component (plan 002: release component model).
 #
-# One of TWO split configs. The release job invokes goreleaser once per
-# SHIPPING component, in the FIXED order: server → host-agent.
+# One of THREE split configs. The release job invokes goreleaser once per
+# SHIPPING component, in the FIXED order: server → host-agent → sx.
 #   - .goreleaser.server.yaml      : brew `shed`, apt `shed-server` deb
 #   - .goreleaser.host-agent.yaml  (this file): brew `shed-host-agent` + GH linux tarball
+#   - .goreleaser.sx.yaml          : brew `sx` + apt `sx` deb (plan 011)
 # (.goreleaser.machine-rc.yaml was deleted with the machine-rc component's
-# retirement in plan 010.)
+# retirement in plan 010; sx took over its brew+apt slot.)
 # See RELEASING.md "Component selection" for the selector law and the flow.
-# Boilerplate is duplicated across the two (goreleaser `includes` is Pro-only).
+# Boilerplate is duplicated across the three (goreleaser `includes` is Pro-only).
 #
 # No before-hooks: this component builds Rust and ships no deb, so there is
 # nothing to render. Keeping before-hooks empty also guarantees this
-# invocation never mutates a tracked file between the two runs.
+# invocation never mutates a tracked file between the sequential runs.
 
 version: 2
 
@@ -125,7 +126,7 @@ brews:
       system bin/"shed-host-agent", "version"
 
 checksum:
-  # Unique per-config name: both configs publish to the SAME GH release
+  # Unique per-config name: all three configs publish to the SAME GH release
   # (shared tag), so a shared `checksums.txt` would clobber across invocations.
   name_template: "checksums-host-agent.txt"
   algorithm: sha256
@@ -136,7 +137,7 @@ release:
     name: shed
   draft: false
   prerelease: auto
-  # keep-existing: the first SHIPPING invocation (server → host-agent)
+  # keep-existing: the first SHIPPING invocation (server → host-agent → sx)
   # creates the release + the goreleaser-changelog body; later
   # invocations upload their assets without touching the body.
   mode: keep-existing
