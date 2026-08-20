@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Bump shed's release version for the selected components.
 #
-# The monorepo carries THREE release components on ONE vX.Y.Z tag family. A
+# The monorepo carries FOUR release components on ONE vX.Y.Z tag family. A
 # component ships in a release iff its version manifest equals the tag
 # (scripts/release/release-plan.sh is the CI-side selector):
 #
@@ -26,6 +26,16 @@
 #                 (Intentionally divergent from crates/Cargo.toml's workspace
 #                 version, which the desktop component owns.)
 #
+#   sx          — the RC session porcelain (brew `sx` + apt `sx` deb), the
+#                 channel pair the retired machine-rc vacated. Same shape as
+#                 host-agent: its shipped version is the tag, injected as
+#                 SX_VERSION by .goreleaser.sx.yaml and read by
+#                 crates/sx/src/version.rs — so its ship selector is a
+#                 standalone file, crates/sx/VERSION, written here and
+#                 grep-verified. Seeded at 0.0.0 (a version no tag carries)
+#                 because sx has never shipped; see recommend-components.sh's
+#                 NEVER_SHIPPED note.
+#
 #   (machine-rc — RETIRED in plan 010: the shed-host-agent daemon hosts the
 #                 machine RC hub and `sx` carries the one-shot verbs. Selecting
 #                 it here is a hard error.)
@@ -49,13 +59,13 @@
 #
 # Contract (cc-plugins:release-workflows references/update-version/README.md):
 #   - first arg: semver string, no `v` prefix
-#   - optional `--components server,host-agent,desktop`
+#   - optional `--components server,host-agent,sx,desktop`
 #     (default: server — preserves the historical one-arg behavior; the release
 #     skill computes the set from recommend-components.sh and passes it
 #     explicitly). `go` accepted as a deprecated alias for `server`.
 #   - unknown component → hard error listing valid names
 #   - PRERELEASE versions (X.Y.Z-suffix) are rejected for the goreleaser
-#     components (server / host-agent) — they are stable-only. A desktop-only
+#     components (server / host-agent / sx) — they are stable-only. A desktop-only
 #     prerelease is allowed (the Tauri rc-rehearsal path).
 #   - idempotent (a same-version re-run leaves the tree unchanged)
 #   - no network (cargo runs --offline)
@@ -65,13 +75,14 @@
 # Usage:
 #   scripts/release/update-version.sh 0.8.0                              # server only
 #   scripts/release/update-version.sh 0.8.0 --components host-agent
+#   scripts/release/update-version.sh 0.8.0 --components sx
 #   scripts/release/update-version.sh 0.8.0 --components desktop
-#   scripts/release/update-version.sh 0.8.0 --components server,host-agent,desktop
+#   scripts/release/update-version.sh 0.8.0 --components server,host-agent,sx,desktop
 
 set -euo pipefail
 
 usage() {
-  echo "usage: $0 <X.Y.Z[-suffix]> [--components server,host-agent,desktop]" >&2
+  echo "usage: $0 <X.Y.Z[-suffix]> [--components server,host-agent,sx,desktop]" >&2
   echo "  e.g. $0 0.8.0 --components server,desktop   (default components: server)" >&2
   exit 2
 }
@@ -119,10 +130,11 @@ esac
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 
-VALID_COMPONENTS="server, host-agent, desktop"
+VALID_COMPONENTS="server, host-agent, sx, desktop"
 
 DO_SERVER=false
 DO_HOST_AGENT=false
+DO_SX=false
 DO_DESKTOP=false
 IFS=',' read -r -a comps <<< "${COMPONENTS}"
 [ "${#comps[@]}" -gt 0 ] || { echo "error: --components is empty (valid: ${VALID_COMPONENTS})" >&2; exit 2; }
@@ -140,6 +152,7 @@ for c in "${comps[@]}"; do
       ;;
     server) DO_SERVER=true ;;
     host-agent) DO_HOST_AGENT=true ;;
+    sx) DO_SX=true ;;
     machine-rc)
       echo "error: component 'machine-rc' was retired in plan 010 — the hub ships in host-agent; sx carries the one-shot verbs (valid: ${VALID_COMPONENTS})" >&2
       exit 2
@@ -153,18 +166,18 @@ for c in "${comps[@]}"; do
 done
 
 # Stable-only guard for the goreleaser components. A prerelease version is only
-# meaningful for a desktop-only rc rehearsal; selecting server/host-agent with a
-# `-suffix` version is a mistake (goreleaser components have no beta channel —
+# meaningful for a desktop-only rc rehearsal; selecting server/host-agent/sx with
+# a `-suffix` version is a mistake (goreleaser components have no beta channel —
 # release-plan.sh would reject the resulting tag anyway).
 if [ "${IS_PRERELEASE}" = "true" ]; then
-  if $DO_SERVER || $DO_HOST_AGENT; then
-    echo "error: prerelease version '${V}' selects a goreleaser component (server/host-agent), which are stable-only." >&2
+  if $DO_SERVER || $DO_HOST_AGENT || $DO_SX; then
+    echo "error: prerelease version '${V}' selects a goreleaser component (server/host-agent/sx), which are stable-only." >&2
     echo "       Only --components desktop may take a prerelease (the Tauri rc-rehearsal path)." >&2
     exit 1
   fi
 fi
 
-# Write a standalone VERSION ship-selector (host-agent) and grep-verify the
+# Write a standalone VERSION ship-selector (host-agent / sx) and grep-verify the
 # write landed. The file is a ship-selector ONLY — the shipped binary's version
 # is the tag ldflag (crates/shed-host-agent/src/version.rs), NOT this file —
 # and is intentionally independent of crates/Cargo.toml's workspace version
@@ -202,6 +215,11 @@ fi
 # -------------------------------------------------------- component: host-agent
 if $DO_HOST_AGENT; then
   bump_selector_file "crates/shed-host-agent/VERSION"
+fi
+
+# --------------------------------------------------------------------- sx
+if $DO_SX; then
+  bump_selector_file "crates/sx/VERSION"
 fi
 
 # ----------------------------------------------------------- component: desktop
