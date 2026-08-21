@@ -319,8 +319,9 @@ the phase (even when the mobile UI itself lands a phase later).
 | **R2 — Rust porcelain v1** ✅ | **Shipped, plan 009** — `crates/sx`, binary `sx`: `agent`/`plan`/`ls`/`watch`/`attach`/`kill` across `local\|machine:<m>\|shed:<s>[@<server>]`, plus the engine-compat `sx rc <subcommand>`. The one-shot RC engine is **ported** (not merely driven): `shed-core::rc_agents` + `shed-app::rc_engine`, with `shed-machine-rc` kept alive as the machine hub provider and the **parity oracle** — `tests/rc-parity/` (51 cells) diffs both implementations per scenario and pins the agreement to goldens. The hub (`serve`) stayed Go at R2 by decision; **plan 010 then ported it into `shed-host-agent` and retired `shed-machine-rc` entirely** (see R2.5 below). `machines:` config section in shed-core, round-trip-preserved by the Go CLI. Its own release component since R2.6 (brew + apt), still dev-first: packaged, not surface-frozen. See [`docs/extensions/sx.md`](../extensions/sx.md) | n/a directly (CLI), but exercises the same shed-core target model mobile will use |
 | **R3 — Structured lane prototype** | a lane adapter in the guest hub behind the v2 verbs, as a **new distinct kind**. Spike is now three-way: **opencode** (front-runner — the hub already speaks its SSE/REST via the `--port` watcher, so the adapter is incremental Go; t3code ships on the same v2 API), codex app-server (most mature protocol, needs a Go JSON-RPC client), cursor-ACP (viable per t3code's long-lived-child pattern, needs a Go ACP client). **Primary design problem: the structured-session registry** — a session with no tmux pane breaks "tmux is the source of truth", so the hub needs its own registry (in-memory + agent-side persistence for resume). **Note (post-R1):** R1 already wired opencode's turn/interrupt/approvals verbs onto the *existing* TUI-lane kind (dual control — no new kind, the session stays tmux-attachable) — see `docs/extensions/rc-helper.md`; R3's "new distinct kind" is for a lane with **no** tmux pane at all (a headless structured session), a different and larger step than R1's dual-control shape | **Approve a tool call and steer a turn from the phone** — the bar for the whole design |
 | **R2.5 — Machine hub in the agent + machine-rc retirement** ✅ | **Shipped, plan 010** (PR #312) — the RC activity hub ported Go→Rust into `shed-broker::rc_hub` and hosted by the **`shed-host-agent`** daemon as a supervised resident role (bind-as-lock, `rc_hub.enabled` knob, `rc_hub` LiveStatus field, `rc-hub` foreground diagnostic). Wire parity is mechanical: `tests/rc-parity` grew a HUB family that runs BOTH hub daemons on ephemeral ports and diffs `/v1` (snapshot/SSE/side-effect/opencode-lane/cursor-ingest), 100 cells total. Live e2e on this Mac + mini3. **`shed-machine-rc` is retired**: binary + goreleaser config + selector deleted, component stripped from the release model, oracle main relocated test-only to `tests/rc-parity/oracle/`. The Go engine lives on as `shed-ext-rc` (guest) and as the differential oracle. **Net effect for machines: the hub no longer idle-exits** — it is up whenever the agent is | Machine hub is a stable, always-on, known-address endpoint — the precondition R4 needs |
-| **R2.6 — Ship `sx`** ✅ | **Shipped, plan 011** — the retirement's loose end closed: `sx` is its own release component with selector `crates/sx/VERSION` and its own `.goreleaser.sx.yaml`, publishing **brew + apt** (the distribution slot machine-rc vacated) via the same `builder: rust`/`cargo zigbuild` path host-agent uses. `sx version` now reports the release tag (`SX_VERSION` injection) instead of the desktop-tracking `CARGO_PKG_VERSION`. The recommender grew a `NEVER_SHIPPED` first-ship bootstrap — the one genuinely new problem a brand-new component posed. Helper-only-tag shape means an sx tag publishes **no** rootfs images and leaves server/desktop pinned. **Dev-first**: the wiring landed without cutting a tag; that call is the maintainer's, made when development needs `sx` on mini2/mini3 | Unblocks every machine-target story, including R4's |
-| **R4 — Machines in clients** | machine targets in shed-core surfaced in mobile + Tauri (SSH-forwarded hub); unified sessions view everywhere | Machine sessions listed + watchable next to shed sessions on the phone |
+| **R2.6 — Ship `sx`** ✅ | **Shipped, plan 011** — the retirement's loose end closed: `sx` is its own release component with selector `crates/sx/VERSION` and its own `.goreleaser.sx.yaml`, publishing **brew + apt** (the distribution slot machine-rc vacated) via the same `builder: rust`/`cargo zigbuild` path host-agent uses. `sx version` now reports the release tag (`SX_VERSION` injection) instead of the desktop-tracking `CARGO_PKG_VERSION`. The recommender grew a `NEVER_SHIPPED` first-ship bootstrap — the one genuinely new problem a brand-new component posed. Helper-only-tag shape means an sx tag publishes **no** rootfs images and leaves server/desktop pinned. **Dev-first**: the wiring landed without cutting a tag. **Merged 2026-08-20** (shed `d2c406c`, plus `charliek/apt-charliek` and `charliek/homebrew-tap` housekeeping) and deliberately **UNTAGGED** — see standing decision 3 | Unblocks every machine-target story, including R4's |
+| **R4 — Machines in clients** ⬅ **next** | machine targets in shed-core surfaced in mobile + Tauri (SSH-forwarded hub); unified sessions view everywhere. **Carries the hub-home graduation**: `shed_broker::rc_hub` (the engine) is already a library, but its ~518 lines of role-hosting — bind-as-lock, the bind-retry FSM, the reconcile-thread lifecycle — are bin-local in `crates/shed-host-agent/src/rc_hub_role.rs`, and `shed-app`'s `broker_bridge.rs` does not mount it. R4 is where the Tauri app becomes the **second consumer**, so this is the moment to graduate the role into `shed-broker` (the same rule that graduated `shed-rc-engine` out of `shed-app`) rather than earlier against a hypothetical caller. It is NOT gated on the Swift sunset — Swift depends on host-agent for UDS credential brokering, not for the hub, so the move is behaviour-neutral for it | Machine sessions listed + watchable next to shed sessions on the phone |
+| **R6 — Desktop graduation + `shed-host-agent` disposition** | **Direction set 2026-08-21; a desktop-track block, listed here because it owns the hub-home decision R4 depends on.** The **Swift** app is removed outright and the **Tauri** app graduates (pending more testing). The Tauri crate already links `shed-app { features = ["rc", "broker"] }`, so it embeds `shed-broker` in-process — `broker_bridge.rs` is a drop-in for the `HostAgentClient` UDS path, presenting the same Coordinator surface (approvals, audit fan-in, `TokenMinter`, mtls-capable). So the app already replaces host-agent's **credential-brokering** feature set; it does **not** replace the **hub** (see R4). **`shed-host-agent` then becomes a headless-only survivor** — kept for machines/servers where the user wants no desktop app (mini2/mini3), not deprecated outright. Two consequences to plan for: (a) **its brew-only posture inverts** — it ships brew + a GH linux tarball today, justified as "brew/macOS is the only wired install path", which is backwards for a headless-Linux audience; it wants an **apt deb**, and `sx` has now proven that exact machinery (Rust binary → minimal one-binary nfpm deb, no unit/config/scripts). (b) **the hub's always-on guarantee weakens** on desktops — a launchd daemon with `keep_alive true` is a stronger liveness contract than a user-quittable app; lose it deliberately, not by accident | A desktop user installs one app and no daemon; a headless box installs `sx` + `shed-host-agent` from apt and nothing else |
 | **R5 — Second lane + notifier** | second structured lane (from the R3 spike's runners-up); desktop notifier off aggregate SSE. *(Its third item — "host-agent hub spike (start of shed-machine-rc retirement)" — was not spiked but completed outright by plan 010; see R2.5.)* | `needs_input`/`needs_approval` reaches the phone while the app is open (SSE); push is a separate decision |
 
 R0 was deliberately small and unblocks everything; R1–R2 are independent of
@@ -339,12 +340,31 @@ original row text where they conflict:
    machinery (R2.6) exists to make the dev loop fast across this Mac +
    mini2/mini3; a release is cut when development needs one, not on a
    user-facing cadence.
+3. **Release trigger (2026-08-21): not until the machine story works
+   end-to-end, mobile included.** R2.6's wiring is merged but deliberately
+   UNTAGGED. `sx` is buildable from source and that is enough for
+   development, so the next tag waits until the story proves out through
+   R4 — machine sessions listed and watchable from shed-mobile — rather
+   than being cut just because the machinery exists. Corollary: when it
+   IS cut, prefer an **`sx`-only tag**. The component model makes that
+   exact (a tag ships a component iff its manifest equals the tag), and
+   `sx` is the component whose shape is settled — `host-agent` and
+   `desktop` are both mid-transition (decision 4) and should graduate on
+   their own tags.
+4. **The desktop app is graduating and `shed-host-agent` is becoming a
+   headless-only daemon** (2026-08-21) — see **R6**. This is the standing
+   context for every host-agent decision from here: do not add desktop-
+   shaped surface to it, and do not assume it is installed on a machine
+   that runs the app.
 
 Sequencing from here: **R4 (machines in clients)** — R2.6 is done, so the
 small thing that stood in front of R4 is out of the way. R4 is the payoff:
 mobile is design-critical and now has both a stable machine hub to talk to
 and an installable `sx` on the machines it targets. **R3** is independent
-of both and can slot in whenever the lane bet is due.
+of both and can slot in whenever the lane bet is due. **R6** runs on its
+own track (a desktop concern), but it OWNS one decision R4 depends on —
+where the hub is hosted once the app, not a daemon, is the desktop's
+broker.
 
 ## Spike findings (Aug 2026)
 
@@ -398,6 +418,22 @@ table above:
    client half; `shed attach --kind` / `shed plan` have not migrated.
 4. **Mobile push** — SSE-while-open is the R5 bar; true push (FCM/ntfy/relay)
    is unscoped. Decide when R4 lands.
+4b. **How `sx` gets an mtls credential once host-agent leaves desktops (R6).**
+   `sx` has TWO host-agent touchpoints, not one — the hub (`sx watch`) and,
+   less obviously, the **control-token minter**: `crates/sx/src/backend.rs`
+   wires `HostAgentTokenMinter` "exactly as the desktop's external mode does",
+   gated on the agent answering. So `sx` inherited the **desktop** client's
+   credential strategy rather than the Go CLI's — the Go CLI instead reads a
+   credential STORE (`internal/config/clientcreds.go` → `~/.shed/creds`, material
+   the server issues over the SSH bootstrap channel; no daemon). Scope today is
+   narrow: only the HTTP fan-out (`sx ls`, unqualified `shed:<name>`) wires the
+   minter; the qualified `--on shed:<name>@<server>` form is pure config, no HTTP.
+   **Under R6, a desktop `sx` with no host-agent loses the minter** and
+   unqualified `shed:<name>` against an mtls server fails closed. Escape hatch
+   already exists and should be evaluated first: `shed-core`'s config supports
+   `client_cert_file` / `client_key_file`, which is exactly the
+   `~/.shed/creds/secure/client.{crt,key}` layout the Go CLI uses — i.e. teach
+   `sx` the CLI's daemon-free store path rather than inventing one.
 5. **Structured-session registry** — promoted to **R3's primary design
    problem** (see the roadmap row): a session with no pane breaks "tmux is the
    source of truth"; the hub needs its own registry (in-memory + agent-side
