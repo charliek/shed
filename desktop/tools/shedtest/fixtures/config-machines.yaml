@@ -6,9 +6,15 @@
 # spawned. What matters is the SHAPE: two machines, so the suite covers both the
 # reachable and the unreachable case in one launch.
 #
-# `sleepy` exists to prove the unreachable posture. It is not special in any way
-# — both entries are identical to the app; the difference is that the harness
-# only serves a hub for one of them.
+# THREE machines, one per health band, because the sidebar and the pane both
+# claim an ordering (reachable → connecting → offline) that two bands cannot
+# prove:
+#   * `mini3`  — a hub that answers        → reachable
+#   * `sleepy` — no hub at all             → connecting (never reached)
+#   * `flaky`  — a hub that answers, then  → offline (reached once, gone now)
+#                the harness stops it
+# None of them is special to the app; all three entries are identical, and the
+# difference is entirely in what the harness serves.
 servers:
     mock:
         host: 127.0.0.1
@@ -21,5 +27,8 @@ machines:
         host: 127.0.0.1
         user: nobody
     sleepy:
+        host: 127.0.0.1
+        user: nobody
+    flaky:
         host: 127.0.0.1
         user: nobody

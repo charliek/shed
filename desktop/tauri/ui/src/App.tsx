@@ -6,7 +6,7 @@
 import { useCallback, useEffect, useId, useLayoutEffect, useRef, useState } from "react";
 import {
   Boxes, Shield, Sparkles, ScrollText, Globe, HardDrive, Box, Plus,
-  Terminal, RotateCw, Square, Play, Trash2, RefreshCw, ExternalLink, Key,
+  Terminal, RotateCw, Square, Play, Trash2, RefreshCw, ExternalLink, Key, Server,
   Fingerprint, Moon, Sun, Settings, X,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
@@ -23,13 +23,13 @@ import {
   fetchApprovals, decideApproval, fetchActivity, fetchGateNamespaces,
   fetchEgressProfiles, reportEgress, inTauri,
   openPreferences, setAppearanceState,
-  rcLaunch, killSession, sessionKey, reportAgents, useRcSessions,
-  useCoordinatorData, useNowTick, shedsEmptyState,
+  rcLaunch, killSession, sessionKey, reportAgents, reportMachinesPane, useRcSessions,
+  useCoordinatorData, useNowTick, shedsEmptyState, hostFailureFor,
   type Pane, type Shed, type HostDiskUsage, type HostFailure,
   type Modal, type CreateProgress, type Approval, type AuditEntry,
   type EgressProfile, type EgressProfileInfo, type HostEgressProfiles, type EgressReport,
   type RcSession, type RcKind, type RcState,
-  type RcCapabilities, type MachineStatus, offeredKinds, rcAuthHint,
+  type RcCapabilities, type MachineStatus, type MachinePaneRow, offeredKinds, rcAuthHint,
 } from "@/lib/bridge";
 
 /** "server/shed" when multi-server, else the shed name. */
@@ -55,6 +55,11 @@ function approveHint(scope: Approval["default_scope"]): string {
 }
 const NAV: [Pane, string, typeof Box][] = [
   ["sheds", "Sheds", Boxes],
+  // Machines sit beside Sheds because they are the same kind of thing to a
+  // person — somewhere your sessions run. Only the way they are REACHED
+  // differs (a shed through its server's API, a machine over SSH to its own
+  // activity hub), and that belongs in the plumbing, not the navigation.
+  ["machines", "Machines", Server],
   ["approvals", "Approvals", Shield],
   ["agents", "Agents", Sparkles],
   ["activity", "Activity", ScrollText],
@@ -103,24 +108,56 @@ function HostLabel({ host }: { host: string }) {
   );
 }
 
-/* ---- Sheds pane ----------------------------------------------------------- */
-/** The per-host failure strip above the shed list: one row per host that couldn't
- *  be listed, leading with the remedy (`summary`), the full context on hover
- *  (`detail`). Without it a failed host is silently absent from the pane and the
- *  user reads an empty dashboard as "nothing to see" (shed#300). */
-function HostErrorStrip({ errors }: { errors: HostFailure[] }) {
+/** A sidebar section heading (SHED SERVERS / MACHINES). */
+function SidebarSection({ label }: { label: string }) {
   return (
-    <div className="mb-[18px] flex flex-col gap-2">
-      {errors.map((e) => (
-        <div key={e.server} title={e.detail} className={cn(cardCls, "flex items-start gap-2.5 px-[18px] py-3")}>
-          <Dot className="mt-[5px] h-2 w-2 flex-none" style={{ background: "var(--shed-danger)" }} />
-          <div className="min-w-0 break-words font-mono text-[12px] leading-relaxed" style={{ color: "var(--shed-danger)" }}>{e.summary}</div>
-        </div>
-      ))}
+    <div className="flex items-center px-2.5 pb-2 pt-2.5 first-of-type:pt-0.5">
+      <span className="font-mono text-[10px] font-semibold tracking-[.1em] text-shed-text-muted">{label}</span>
     </div>
   );
 }
 
+/** One status row: a dot, a name, and an optional right-aligned note. Shared by
+ *  both sections so a server and a machine read the same way — the difference
+ *  between them is how they're reached, which is not a thing to look at. */
+function SidebarRow({ name, tone, note, title, onClick }:
+  { name: string; tone: "ok" | "pending" | "off"; note?: string; title?: string; onClick?: () => void }) {
+  const color = tone === "ok" ? "var(--shed-ok)" : tone === "pending" ? "var(--shed-attention)" : "var(--shed-text-muted)";
+  const body = (
+    <>
+      <Dot className="h-2 w-2 flex-none" style={{ background: color }} />
+      <span className="min-w-0 flex-1 truncate">{name}</span>
+      {note && <span className="flex-none font-mono text-[10.5px] text-shed-text-muted">{note}</span>}
+    </>
+  );
+  const cls = "flex w-full items-center gap-2.5 px-2.5 py-1.5 text-left text-[13px] font-medium text-shed-text";
+  return onClick ? (
+    <button type="button" onClick={onClick} title={title} className={cn(cls, "nav-item rounded-[7px]")}>{body}</button>
+  ) : (
+    <div title={title} className={cls}>{body}</div>
+  );
+}
+
+/* ---- sidebar status vocabulary -------------------------------------------- */
+/** A machine's sidebar note: one clean word, never the raw transport error.
+ *
+ *  "no route to host" is the right thing to show someone who came looking for a
+ *  reason; it is the wrong thing to put in a status list they scan. The raw
+ *  `detail` stays one hover away. */
+function machineSidebarNote(m: MachineStatus): string {
+  if (m.reachable) return m.sessions === 1 ? "1 session" : `${m.sessions} sessions`;
+  return m.connected_once ? "offline" : "connecting";
+}
+
+/** Healthy first, then still-connecting, then offline — and alphabetical inside
+ *  each band so the list doesn't reshuffle as machines come and go. A list whose
+ *  order changes under you is one you stop trusting at a glance. */
+function sortedMachines(machines: MachineStatus[]): MachineStatus[] {
+  const rank = (m: MachineStatus) => (m.reachable ? 0 : m.connected_once ? 2 : 1);
+  return [...machines].sort((a, b) => rank(a) - rank(b) || a.name.localeCompare(b.name));
+}
+
+/* ---- Sheds pane ----------------------------------------------------------- */
 function ShedsPane({ sheds, hostErrors, refresh, onNew }: { sheds: Shed[]; hostErrors: HostFailure[]; refresh: () => void; onNew: () => void }) {
   const act = (action: string, s: Shed) => void shedAction(action, s.name, s.host).then(refresh);
   // The empty state defers to a host failure when there is one — same helper the
@@ -137,7 +174,10 @@ function ShedsPane({ sheds, hostErrors, refresh, onNew }: { sheds: Shed[]; hostE
           </div>
         }
       />
-      {hostErrors.length > 0 && <HostErrorStrip errors={hostErrors} />}
+      {/* No per-host error strip here by design: an unreachable server is a
+          STATUS, and status lives in the sidebar's SHED SERVERS section (with the
+          reason on hover) and the System pane. This pane's only duty when it
+          can't list is to not claim "no sheds yet" — which `empty` handles. */}
       {empty ? (
         <Empty icon={Boxes} title={empty.title} body={empty.body} />
       ) : (
@@ -260,6 +300,14 @@ function rcStateTone(state: RcState): Tone {
 function AgentsPane({ sessions, machines, onLaunch, refresh }:
   { sessions: RcSession[]; machines: MachineStatus[]; onLaunch: () => void; refresh: () => void }) {
   const [error, setError] = useState<string | null>(null);
+  // With machines configured but none reachable, "no agents running" is a claim
+  // this pane cannot actually make — it has not been able to look. Say so, and
+  // point at the pane that carries the reason.
+  const down = machines.filter((m) => !m.reachable).length;
+  const emptyBody =
+    down > 0 && down === machines.length
+      ? `Launch an agent inside a shed. ${down === 1 ? "The configured machine is" : `All ${down} configured machines are`} unreachable — see the Machines pane.`
+      : "Launch an agent — a REPL, a shell, or a coding agent — inside a shed. Sessions keep running after you disconnect.";
 
   // Refresh the shared RC state on mount so navigating to the pane re-lists (the
   // shared state, so the sidebar badge stays consistent — one source of truth).
@@ -286,8 +334,8 @@ function AgentsPane({ sessions, machines, onLaunch, refresh }:
           <X size={16} className="mt-px flex-none" /> <span className="min-w-0 break-words">{error}</span>
         </div>
       )}
-      {sessions.length === 0 && machines.length === 0 ? (
-        <Empty icon={Sparkles} title="No agents running" body="Launch an agent — a REPL, a shell, or a coding agent — inside a shed. Sessions keep running after you disconnect." />
+      {sessions.length === 0 ? (
+        <Empty icon={Sparkles} title="No agents running" body={emptyBody} />
       ) : (
         <div className="flex flex-col gap-3">
           {sessions.map((s) => (
@@ -296,33 +344,43 @@ function AgentsPane({ sessions, machines, onLaunch, refresh }:
             // collide into one React key.
             <SessionCard key={sessionKey(s)} session={s} onKilled={refresh} onError={setError} />
           ))}
-          {/* A configured machine that is unreachable gets a row even with no
-              sessions — that row IS the information ("mini3 is asleep"), and it
-              is a normal state rather than an error. */}
-          {machines.filter((m) => !m.reachable).map((m) => (
-            <MachineDownCard key={m.origin} machine={m} />
-          ))}
         </div>
       )}
     </div>
   );
 }
 
-/** A configured machine that is not currently reachable.
+/* ---- Machines pane -------------------------------------------------------- */
+/** The status chip's text — the SINGLE source for both the render and the
+ *  reported UI truth, so `machines.dump` can never claim a word the pane
+ *  doesn't show. "connecting" (never yet reached) and "unreachable" (reached
+ *  once, gone now) are deliberately different claims. */
+function machineStatusLabel(m: MachineStatus): string {
+  if (m.reachable) return "reachable";
+  return m.connected_once ? "unreachable" : "connecting";
+}
+
+/** The sub-line under a machine's name: its session count when it's up, the
+ *  REASON it isn't when it's down. */
+function machineDetailLine(m: MachineStatus, sessions: number): string {
+  if (m.reachable) return `${sessions} ${sessions === 1 ? "session" : "sessions"}`;
+  return m.detail ?? "waiting for the machine's activity hub";
+}
+/** A configured machine: its reachability, and why not when it isn't.
  *
- *  Rendered as an informational row, NOT an error: a machine that is asleep,
- *  off-network, or simply not running a hub is the normal case. The `detail`
- *  is shown verbatim because "no route to host" and "nothing is listening on
- *  1029" are different problems with different fixes, and flattening them to
- *  "offline" would throw away the only actionable part. */
-function MachineDownCard({ machine: m }: { machine: MachineStatus }) {
+ *  Unreachable is rendered as INFORMATION, not an error — a machine that is
+ *  asleep, off-network, or simply not running a hub is the everyday case. The
+ *  `detail` is shown verbatim because "no route to host" and "nothing is
+ *  listening on 1029" are different problems with different fixes, and
+ *  flattening them to "offline" would throw away the only actionable part. */
+function MachineCard({ machine: m, sessions }: { machine: MachineStatus; sessions: number }) {
   return (
     <div
       className={cn(cardCls, "flex items-center gap-4 px-[18px] py-4")}
-      style={{ opacity: 0.7 }}
+      style={{ opacity: m.reachable ? 1 : 0.7 }}
       data-machine={m.name}
     >
-      <StatusChip tone="attention" label={m.connected_once ? "unreachable" : "connecting"} />
+      <StatusChip tone={m.reachable ? "ok" : "attention"} label={machineStatusLabel(m)} />
       <div className="min-w-0 flex-1">
         <div className="mb-1 flex flex-wrap items-center gap-2.5">
           <span className="text-[16px] font-semibold text-shed-text">{m.name}</span>
@@ -331,9 +389,86 @@ function MachineDownCard({ machine: m }: { machine: MachineStatus }) {
           </span>
         </div>
         <div className="truncate font-mono text-[12px] text-shed-text-muted">
-          {m.detail ?? "waiting for the machine's activity hub"}
+          {machineDetailLine(m, sessions)}
         </div>
       </div>
+    </div>
+  );
+}
+
+/** The Machines pane — machines sit beside sheds because they are the same kind
+ *  of thing to a person: somewhere your sessions run. Each machine's card leads
+ *  its own sessions, so "what is mini3 doing" is one place rather than a filter
+ *  over the Agents list.
+ *
+ *  Machines are configured in `~/.shed/config.yaml` (the `machines:` section that
+ *  `sx` reads) and are read ONCE at startup, so there is deliberately no add/edit
+ *  affordance here — an in-app editor that silently needed a relaunch would be
+ *  worse than the file. */
+function MachinesPane({ machines, sessions, refresh }:
+  { machines: MachineStatus[]; sessions: RcSession[]; refresh: () => void }) {
+  const [error, setError] = useState<string | null>(null);
+  useEffect(() => { refresh(); }, [refresh]);
+  const reachable = machines.filter((m) => m.reachable).length;
+
+  // Grouped by ORIGIN, never by shed: a hub reports an EMPTY shed on every
+  // machine session, so two machines sharing a slug would collide into one row.
+  const grouped = machines.map((m) => ({ machine: m, rows: sessions.filter((s) => s.origin === m.origin) }));
+
+  const reported = grouped.map(({ machine: m, rows }) => ({
+    name: m.name,
+    origin: m.origin,
+    reachable: m.reachable,
+    status: machineStatusLabel(m),
+    detail: machineDetailLine(m, rows.length),
+    sessions: rows.map((s) => s.slug),
+  }));
+  // Publish what this pane rendered — keyed on the VALUE, so an unrelated parent
+  // re-render (the 5s shed poll, an approval, an appearance flip) does not
+  // re-report.
+  const reportedKey = JSON.stringify(reported);
+  useEffect(() => {
+    reportMachinesPane(JSON.parse(reportedKey) as MachinePaneRow[]);
+  }, [reportedKey]);
+  // CLEAR on UNMOUNT only — a separate `[]` effect on purpose. Folding the clear
+  // into the cleanup above would run it before every re-report, opening a window
+  // where `machines.dump` reads null while the pane is plainly on screen.
+  useEffect(() => () => reportMachinesPane(null), []);
+
+  return (
+    <div>
+      <PageHead
+        title="Machines"
+        accessory={
+          <span className="font-mono text-[13px] text-shed-text-muted">
+            {reachable} of {machines.length} reachable
+          </span>
+        }
+        right={<RefreshHeadButton onClick={refresh} />}
+      />
+      {error && (
+        <div className={cn(cardCls, "mb-3 flex items-start gap-2 p-3.5 text-[13px]")} style={{ borderColor: "var(--shed-danger)", color: "var(--shed-danger)" }}>
+          <X size={16} className="mt-px flex-none" /> <span className="min-w-0 break-words">{error}</span>
+        </div>
+      )}
+      {machines.length === 0 ? (
+        <Empty
+          icon={Server}
+          title="No machines configured"
+          body="A machine is a computer you reach over SSH that runs the shed activity hub. Add one under machines: in ~/.shed/config.yaml."
+        />
+      ) : (
+        grouped.map(({ machine: m, rows }) => (
+          <div key={m.origin} className="mb-[22px] flex flex-col gap-3 last:mb-0">
+            <MachineCard machine={m} sessions={rows.length} />
+            {rows.map((s) => (
+              <div key={sessionKey(s)} className="pl-[18px]">
+                <SessionCard session={s} onKilled={refresh} onError={setError} />
+              </div>
+            ))}
+          </div>
+        ))
+      )}
     </div>
   );
 }
@@ -1130,10 +1265,21 @@ export default function App() {
     };
   }, []);
   const hostCount = hostRows.length;
+  // Machines in the sidebar's status foot, healthy-first (see `sortedMachines`).
+  const sidebarMachines = sortedMachines(rcMachines);
   // The bridge owns the single full `ui_report`; hand it the badge inputs (sheds
-  // derived there, hosts/agents/pending from here) and the mode so the report is one
-  // complete snapshot, never a partial that races the `main` slot / tray count.
-  const { sheds, hostErrors, refresh } = useUiBridge(pane, setPane, modal, mode, agentCount, hostCount, pending);
+  // derived there, hosts/agents/pending from here), the sidebar's rendered rows,
+  // and the mode so the report is one complete snapshot, never a partial that
+  // races the `main` slot / tray count.
+  const { sheds, hostErrors, refresh } = useUiBridge(pane, setPane, modal, mode, agentCount, hostCount, pending, {
+    servers: hostRows.map((h) => ({ name: h.host, reachable: h.usage != null })),
+    machines: sidebarMachines.map((m) => ({
+      name: m.name,
+      origin: m.origin,
+      status: machineStatusLabel(m),
+      note: machineSidebarNote(m),
+    })),
+  });
 
   // Apply the appearance to the root BEFORE the bridge's report effect samples it (a
   // layout effect runs ahead of that passive effect), so `ui.computed_style` reflects
@@ -1186,7 +1332,7 @@ export default function App() {
   const hosts = hostRows.map((h) => ({
     name: h.host,
     reachable: h.usage != null,
-    failure: hostErrors.find((e) => e.server === h.host),
+    failure: hostFailureFor(hostErrors, h.host),
   }));
 
   return (
@@ -1203,6 +1349,7 @@ export default function App() {
           const badge =
             id === "sheds" ? sheds.length
             : id === "agents" ? agentCount
+            : id === "machines" ? rcMachines.length
             : id === "system" ? hosts.length
             : isApprovals && pending ? pending : null;
           const alert = isApprovals && pending > 0;
@@ -1230,19 +1377,35 @@ export default function App() {
           );
         })}
         <div className="flex-1" />
-        <div className="flex items-center px-2.5 pb-2 pt-0.5">
-          <span className="font-mono text-[10px] font-semibold tracking-[.1em] text-shed-text-muted">HOSTS</span>
-        </div>
+        {/* The status foot: the two kinds of place a session can run, in the same
+            vocabulary. This is where "is that box up" lives — which is why the
+            Sheds pane no longer carries an error strip. */}
+        <SidebarSection label="SHED SERVERS" />
         {hosts.map((h) => (
-          <div
+          <SidebarRow
             key={h.name}
+            name={h.name}
+            tone={h.reachable ? "ok" : "off"}
+            // Unreachable is a word in the list; the reason is on hover.
+            note={h.reachable ? undefined : "offline"}
             title={h.failure ? `${h.failure.summary}\n\n${h.failure.detail}` : undefined}
-            className="flex items-center gap-2.5 px-2.5 py-1.5 text-[13px] font-medium text-shed-text"
-          >
-            <Dot className="h-2 w-2" style={{ background: h.reachable ? "var(--shed-ok)" : "var(--shed-text-muted)" }} />
-            <span className="truncate">{h.name}</span>
-          </div>
+          />
         ))}
+        {sidebarMachines.length > 0 && (
+          <>
+            <SidebarSection label="MACHINES" />
+            {sidebarMachines.map((m) => (
+              <SidebarRow
+                key={m.origin}
+                name={m.name}
+                tone={m.reachable ? "ok" : m.connected_once ? "off" : "pending"}
+                note={machineSidebarNote(m)}
+                title={m.reachable ? m.origin : (m.detail ?? undefined)}
+                onClick={() => setPane("machines")}
+              />
+            ))}
+          </>
+        )}
       </aside>
 
       {/* main column */}
@@ -1269,6 +1432,7 @@ export default function App() {
         <main className="flex-1 overflow-auto bg-shed-bg px-[38px] pb-6 pt-7">
           <div data-pane={pane} className="mx-auto max-w-[880px]">
             {pane === "sheds" && <ShedsPane sheds={sheds} hostErrors={hostErrors} refresh={refresh} onNew={() => setModal("create")} />}
+            {pane === "machines" && <MachinesPane machines={rcMachines} sessions={rcSessions} refresh={refreshRc} />}
             {pane === "approvals" && <ApprovalsPane approvals={approvals} />}
             {pane === "agents" && <AgentsPane sessions={rcSessions} machines={rcMachines} onLaunch={() => setModal("launch")} refresh={refreshRc} />}
             {pane === "activity" && <ActivityPane />}

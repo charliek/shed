@@ -427,6 +427,8 @@ impl Handler {
             "rc.kill" => self.rc_kill(params).await,
             "rc.inject_test" => self.rc_inject_test(params),
             "machines.list" => Ok(self.machines_list()),
+            "machines.dump" => Ok(self.machines_dump()),
+            "sidebar.dump" => Ok(self.sidebar_dump()),
             "machine.kill" => self.machine_kill(params).await,
             "agents.dump" => Ok(self.agents_dump()),
             "prefs.get" => Ok(self.prefs_get()),
@@ -596,7 +598,7 @@ impl Handler {
         let pane = params.get("pane").and_then(Value::as_str).unwrap_or("");
         if !matches!(
             pane,
-            "sheds" | "approvals" | "agents" | "activity" | "egress" | "system"
+            "sheds" | "machines" | "approvals" | "agents" | "activity" | "egress" | "system"
         ) {
             return Err(err("bad_request", format!("unknown pane: {pane:?}")));
         }
@@ -820,6 +822,37 @@ impl Handler {
     /// ("mini3 is asleep"), and a sessions-only payload has nowhere to put it.
     fn machines_list(&self) -> Value {
         json!({ "machines": self.machines.status() })
+    }
+
+    /// `machines.dump` → what the MACHINES PANE actually rendered (UI truth, like
+    /// `agents.dump`/`egress.profiles`), as opposed to `machines.list`, which is
+    /// the backend's view and answers off-pane.
+    ///
+    /// The distinction is the whole point: `machines.list` can be perfect while
+    /// nothing reaches the pane — exactly the bug that shipped machine state to
+    /// the IPC op but never to the window. Off-pane this is `null`, not a stale
+    /// snapshot from the last mount.
+    fn machines_dump(&self) -> Value {
+        let on_pane = self
+            .ui_get("pane")
+            .and_then(|p| p.as_str().map(|s| s == "machines"))
+            .unwrap_or(false);
+        let machines = if on_pane {
+            self.ui_get("machines_pane").unwrap_or(Value::Null)
+        } else {
+            Value::Null
+        };
+        json!({ "machines": machines })
+    }
+
+    /// `sidebar.dump` → the sidebar's status foot as rendered: `{servers,
+    /// machines}`.
+    ///
+    /// Unlike the pane dumps this answers from ANY pane — the sidebar is always
+    /// mounted, and that is exactly why it is where "is that box up" lives now
+    /// that the Sheds pane carries no error strip.
+    fn sidebar_dump(&self) -> Value {
+        self.ui_get("sidebar").unwrap_or(Value::Null)
     }
 
     /// `machine.kill {machine, slug}` → kill a session on a machine.

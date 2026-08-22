@@ -154,11 +154,13 @@ def test_badges_count_both_configured_hosts(downhost):
     assert downhost.badges()["hosts"] == 2
 
 
-def test_sheds_host_error_strip_renders_above_the_list(downhost):
+def test_a_failed_host_is_still_carried_and_surfaced_in_the_sidebar(downhost):
     # shed#300: the failed host used to be silently filter_mapped away — the Sheds
-    # pane showed the reachable host's sheds and NOTHING about `down`. Now
-    # `sheds.list` carries it and the pane renders a strip row for it ABOVE the
-    # (non-empty) list, so the empty state is not what's being asserted here.
+    # pane showed the reachable host's sheds and NOTHING about `down`. It is still
+    # carried end-to-end; what changed is WHERE a person reads it. The Sheds pane
+    # renders no error strip (an unreachable server is a status, and status lives
+    # in the sidebar's SHED SERVERS section + the System pane); the payload keeps
+    # the failure, which drives the sidebar and the empty state.
     # The mock's closed-port simulation is a transport failure → kind `other`
     # (the AgentUpgradeRequired kind is pinned at the Rust unit level —
     # ipc.rs::sheds_payload_carries_host_errors_for_two_failed_hosts).
@@ -166,18 +168,39 @@ def test_sheds_host_error_strip_renders_above_the_list(downhost):
     assert [e["server"] for e in errs] == ["down"], f"unexpected host_errors: {errs}"
     assert errs[0]["kind"] == "other"
     assert errs[0]["summary"].startswith("down: "), f"summary must name the host: {errs[0]}"
-    assert errs[0]["detail"], f"strip row has no hover detail: {errs[0]}"
+    assert errs[0]["detail"], f"the failure has no hover detail: {errs[0]}"
     # …and the rows the reachable host serves are untouched by the failure.
     assert downhost.sheds_list(), "the reachable mock host's sheds vanished"
 
-    # UI truth: the pane RENDERED that strip alongside a non-empty list (so no
-    # empty state is showing).
+    # UI truth: the shell holds the failure alongside a non-empty list (so no
+    # empty state is showing) …
     downhost.wait_until(lambda: len(downhost.dashboard_dump()["host_errors"]) == 1,
-                        timeout=15, what="host-error strip rendered")
+                        timeout=15, what="the host failure to reach the shell")
     d = downhost.dashboard_dump()
     assert d["rows"], f"the reachable host's rows are missing: {d}"
     assert d["empty"] is None, f"a non-empty list must render no empty state: {d}"
     assert d["host_errors"][0]["summary"] == errs[0]["summary"]
+
+    # … and the SIDEBAR is where it is actually visible. Two claims, both needed:
+    # the row exists and is marked unreachable (which `system.df` alone could
+    # produce), AND the row carries the FAILURE'S OWN text as its hover detail —
+    # which only `hostErrors` can supply. Without the second assertion, dropping
+    # the reason from the row (leaving a bare dot with no way to find out why)
+    # would still pass, and the whole point of moving the strip here is that the
+    # reason survives the move.
+    downhost.wait_until(
+        lambda: any(sv["name"] == "down" for sv in downhost.sidebar_dump()["servers"]),
+        timeout=15, what="the failed host to appear in the sidebar",
+    )
+    servers = {sv["name"]: sv for sv in downhost.sidebar_dump()["servers"]}
+    assert servers["down"]["reachable"] is False, f"sidebar hid the failure: {servers}"
+    assert servers["down"]["detail"] == errs[0]["summary"], (
+        f"the sidebar row lost the reason: {servers['down']}"
+    )
+    # A healthy host carries no reason — the detail is not a decoration.
+    healthy = [sv for sv in servers.values() if sv["reachable"]]
+    assert healthy, "the reachable host vanished from the sidebar"
+    assert all(sv["detail"] == "" for sv in healthy), f"spurious detail: {healthy}"
 
 
 def test_empty_state_defers_to_host_failures(alldown):
@@ -192,10 +215,14 @@ def test_empty_state_defers_to_host_failures(alldown):
     assert {e["server"] for e in d["host_errors"]} == {"down1", "down2"}, f"unexpected: {d}"
     empty = d["empty"]
     assert empty is not None, "the Sheds pane rendered no empty state"
-    assert empty["title"] == "Some hosts are unreachable", f"unexpected empty state: {empty}"
+    assert empty["title"] == "Some shed servers are unreachable", f"unexpected empty state: {empty}"
     assert "No sheds yet" not in empty["title"]
+    # It NAMES the servers and points at the sidebar, but carries no raw transport
+    # error — the reason is one place (the sidebar row's hover), not reprinted here.
     for e in d["host_errors"]:
-        assert e["summary"] in empty["body"], f"{e['summary']!r} missing from {empty['body']!r}"
+        assert e["server"] in empty["body"], f"{e['server']!r} missing from {empty['body']!r}"
+        assert e["summary"] not in empty["body"], f"raw error text leaked into {empty['body']!r}"
+    assert "SHED SERVERS" in empty["body"], f"the empty state points nowhere: {empty}"
 
 
 def test_sheds_refresh_returns_the_same_payload_as_list(alldown):

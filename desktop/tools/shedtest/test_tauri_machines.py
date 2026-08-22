@@ -77,6 +77,11 @@ class _HubServer(ThreadingHTTPServer):
 
 
 class _HubHandler(BaseHTTPRequestHandler):
+    #: Sessions this hub reports. Overridden to `{}` for the health-only hub,
+    #: whose whole job is a reachability band — reusing the same snapshot would
+    #: list the same slug under two machines.
+    snapshot = SNAPSHOT
+
     def log_message(self, *args):  # keep pytest output clean
         pass
 
@@ -84,7 +89,7 @@ class _HubHandler(BaseHTTPRequestHandler):
         if self.path == "/v1/health":
             self._json({"app": HUB_APP_ID, "version": "shedtest-fake"})
         elif self.path == "/v1/sessions":
-            self._json(SNAPSHOT)
+            self._json(self.snapshot)
         elif self.path == "/v1/events":
             # An SSE stream that stays OPEN: the watcher holds this connection,
             # so closing it immediately would look like a disconnect and the app
@@ -121,21 +126,61 @@ def _free_port() -> int:
         return s.getsockname()[1]
 
 
-@pytest.fixture(scope="module")
-def fake_hub():
-    """A loopback hub the app reaches through the FixedPort seam."""
+class _EmptyHubHandler(_HubHandler):
+    """A hub that is up and has nothing running."""
+
+    snapshot = {"sessions": []}  # noqa: RUF012 (mirrors the base attribute)
+
+
+def _start_hub(handler: type[_HubHandler] = _HubHandler) -> tuple[int, _HubServer]:
     port = _free_port()
-    server = _HubServer(("127.0.0.1", port), _HubHandler)
+    server = _HubServer(("127.0.0.1", port), handler)
     server.stopping = threading.Event()  # type: ignore[attr-defined]
     threading.Thread(target=server.serve_forever, daemon=True).start()
-    yield port
+    return port, server
+
+
+def _stop_hub(server: _HubServer) -> None:
     server.stopping.set()  # type: ignore[attr-defined]
     server.shutdown()
     server.server_close()
 
 
 @pytest.fixture(scope="module")
-def machine_app(fake_hub, mock):
+def fake_hub():
+    """A loopback hub the app reaches through the FixedPort seam."""
+    port, server = _start_hub()
+    yield port
+    _stop_hub(server)
+
+
+@pytest.fixture(scope="module")
+def flaky_hub():
+    """A hub that answers, and that a test can then KILL.
+
+    This is the only way to produce the third health band: a machine that
+    `connected_once` and is now unreachable — "offline", as opposed to "never
+    reached". A fixture with only reachable and never-reached machines cannot
+    tell an ordering regression from a correct sort.
+
+    Yields `(port, stop)`; `stop` is idempotent so the teardown is safe after a
+    test has already called it.
+    """
+    port, server = _start_hub(_EmptyHubHandler)
+    stopped = False
+
+    def stop() -> None:
+        nonlocal stopped
+        if not stopped:
+            stopped = True
+            _stop_hub(server)
+
+    yield port, stop
+    stop()
+
+
+@pytest.fixture(scope="module")
+def machine_app(fake_hub, flaky_hub, mock):
     """A SECOND, self-managed app instance pointed at the fake hub.
 
     Self-managed rather than the shared session app because the machine config
@@ -154,10 +199,11 @@ def machine_app(fake_hub, mock):
         mock_base_url=mock.base_url,
         config_path=FIXTURES / "config-machines.yaml",
         state_dir=state_dir,
-        # mini3 gets the fake hub; `sleepy` is deliberately UNMAPPED, which
-        # the app treats as permanently unreachable — the everyday asleep case,
-        # with no ssh and no real machine involved.
-        machine_hub_ports={"mini3": fake_hub},
+        # mini3 gets the fake hub; `flaky` gets one a test will kill; `sleepy`
+        # is deliberately UNMAPPED, which the app treats as permanently
+        # unreachable — the everyday asleep case, with no ssh and no real
+        # machine involved. One machine per health band (see the fixture config).
+        machine_hub_ports={"mini3": fake_hub, "flaky": flaky_hub[0]},
     )
     client = TauriClient(ui.socket_path("tauri"))
     # The WebView mounts AFTER `identify`, so wait for its first snapshot before
@@ -216,7 +262,10 @@ def test_a_reachable_machine_reports_its_health(machine_app):
         what="the machine to report reachable",
     )
     machines = machine_app.call("machines.list")["machines"]
-    assert [m["name"] for m in machines] == ["mini3", "sleepy"]
+    # `machines.list` is the BACKEND's view: every configured machine, name-
+    # ordered, with no health ranking. The healthy-first ordering is a rendering
+    # concern and is asserted against the sidebar, not here.
+    assert [m["name"] for m in machines] == ["flaky", "mini3", "sleepy"]
     live = next(m for m in machines if m["name"] == "mini3")
     assert live["reachable"] is True
     assert live["connected_once"] is True
@@ -273,6 +322,130 @@ def test_the_agents_pane_renders_machine_rows(machine_app):
     row = next(s for s in rendered if s.get("origin_kind") == "machine")
     assert row["display_name"] == "machine probe"
     assert row["origin"] == "machine:mini3"
+
+
+def test_the_machines_pane_groups_each_machine_with_its_own_sessions(machine_app):
+    """The Machines pane's UI truth: a row per CONFIGURED machine — reachable or
+    not — each leading the sessions that belong to it.
+
+    `machines.dump` is deliberately not `machines.list`: the backend view can be
+    perfect while nothing reaches the window, which is precisely the bug this
+    pane's first cut shipped with.
+    """
+    machine_app.call("ui.navigate", {"pane": "machines"})
+    machine_app.wait_until(
+        lambda: (machine_app.machines_dump() or []) and
+        any(r["sessions"] for r in machine_app.machines_dump()),
+        timeout=30,
+        what="the machines pane to render a machine with its session",
+    )
+    rows = {r["name"]: r for r in machine_app.machines_dump()}
+    assert set(rows) == {"mini3", "sleepy", "flaky"}, f"unexpected pane rows: {rows}"
+
+    live = rows["mini3"]
+    assert live["reachable"] is True
+    assert live["status"] == "reachable"
+    assert live["origin"] == "machine:mini3"
+    # The session is grouped UNDER its machine, keyed by origin — not left to be
+    # found by filtering the Agents list.
+    assert live["sessions"], f"mini3's session is not grouped under it: {live}"
+    # A reachable machine's sub-line is its session COUNT (the reason slot is
+    # only used when there is something wrong to report).
+    n = len(live["sessions"])
+    assert live["detail"] == f"{n} session" + ("" if n == 1 else "s"), live
+
+    # `sleepy` never answered, so it is "connecting", NOT "unreachable" — a
+    # distinction the raw boolean cannot make and a user needs (it may yet come up).
+    down = rows["sleepy"]
+    assert down["reachable"] is False
+    assert down["status"] == "connecting", f"unexpected status: {down}"
+    assert down["sessions"] == []
+    assert down["detail"], "a machine that isn't up must say why"
+
+
+def test_the_machines_dump_is_null_off_pane_and_fresh_on_return(machine_app):
+    """A pane dump reports what is RENDERED, so off-pane it must be null and a
+    return to the pane must re-report rather than resurrect a stale snapshot.
+
+    Note what each half proves. The off-pane null is enforced by the Rust gate
+    (`machines_dump` answers null unless the reported pane is `machines`), so it
+    does NOT by itself prove the frontend cleared — the frontend's
+    clear-on-unmount is defence in depth. The RETURN half is the load-bearing
+    one: it can only pass if the pane re-reports on mount.
+    """
+    # Start from somewhere else, so the first wait below is a real transition
+    # and not a condition the previous test already satisfied.
+    machine_app.call("ui.navigate", {"pane": "sheds"})
+    machine_app.wait_until(
+        lambda: machine_app.machines_dump() is None,
+        timeout=15, what="the machines dump to be null off-pane",
+    )
+
+    machine_app.call("ui.navigate", {"pane": "machines"})
+    machine_app.wait_until(
+        lambda: machine_app.machines_dump() is not None,
+        timeout=30, what="the machines pane to re-report on return",
+    )
+    rows = machine_app.machines_dump()
+    assert {r["name"] for r in rows} == {"mini3", "sleepy", "flaky"}, rows
+
+    # A smoke check for the on-pane null flap, and honestly only that: a clear
+    # folded into the report effect's cleanup (rather than a mount/unmount effect
+    # of its own) re-clears before every re-report, and each parent re-render —
+    # the 5s shed poll, an approval, an appearance flip — would then open a
+    # window where this reads null with the pane plainly on screen. The window is
+    # sub-millisecond, so sampling cannot RELIABLY catch it; the actual defence
+    # is the effect split in `MachinesPane`. This only fails loudly if the flap
+    # ever becomes wide.
+    for _ in range(20):
+        assert machine_app.machines_dump() is not None, "machines.dump flapped to null on-pane"
+
+
+def test_the_sidebar_lists_machines_under_the_shed_servers(machine_app, flaky_hub):
+    """The sidebar's status foot carries BOTH kinds of place a session can run,
+    in one vocabulary — and unlike a pane dump it answers from anywhere, because
+    the sidebar is always mounted.
+
+    Ordering is load-bearing and spans THREE bands: reachable, then never-yet-
+    reached ("connecting"), then reached-and-now-gone ("offline"). A status list
+    that reshuffles as machines come and go is one you stop trusting at a glance.
+
+    Producing the third band is why `flaky` exists: its hub answers, so the app
+    records `connected_once`, and then this test KILLS it. Without that, a
+    regression that ordered offline above connecting would pass unnoticed.
+    """
+    _, stop_flaky = flaky_hub
+    machine_app.wait_until(
+        lambda: any(
+            m["name"] == "flaky" and m["status"] == "reachable"
+            for m in machine_app.sidebar_dump().get("machines") or []
+        ),
+        timeout=30, what="flaky to connect before it is killed",
+    )
+    stop_flaky()
+    machine_app.wait_until(
+        lambda: any(
+            m["name"] == "flaky" and m["status"] == "unreachable"
+            for m in machine_app.sidebar_dump().get("machines") or []
+        ),
+        timeout=60, what="flaky to go offline after its hub died",
+    )
+
+    bar = machine_app.sidebar_dump()
+    assert bar["servers"], "the sidebar lost the shed servers"
+    names = [m["name"] for m in bar["machines"]]
+    assert names == ["mini3", "sleepy", "flaky"], (
+        f"expected reachable -> connecting -> offline, got {names}: "
+        f"{bar['machines']}"
+    )
+
+    live, connecting, offline = bar["machines"]
+    assert live["status"] == "reachable"
+    # The NOTE is what a person reads in the list — a clean word or a count,
+    # never the raw transport error (which stays on hover).
+    assert live["note"].endswith("session") or live["note"].endswith("sessions"), live
+    assert connecting["note"] == "connecting", f"raw error text leaked: {connecting}"
+    assert offline["note"] == "offline", f"raw error text leaked: {offline}"
 
 
 def test_killing_a_machine_session_routes_over_the_machine_not_a_server(machine_app):

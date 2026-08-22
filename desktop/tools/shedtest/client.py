@@ -405,9 +405,28 @@ class TauriClient(_ApprovalOps, _RcOps, _RustCoreClient):
 
     def dashboard_dump(self) -> dict:
         """The Sheds pane's full UI truth: `{rows, host_errors, empty}` — the shed
-        rows, the rendered host-error strip, and the rendered empty state
-        (`{title, body}`, null when the list rendered or another pane is up)."""
+        rows, the per-host failures the shell knows about, and the rendered empty
+        state (`{title, body}`, null when the list rendered or another pane is up).
+
+        `host_errors` is DATA the shell carries, not a rendered strip: the Sheds
+        pane deliberately renders no error rows (the sidebar's SHED SERVERS
+        section owns "is that box up" — see `sidebar_dump`). It still drives the
+        sidebar tooltips and the empty state's copy."""
         return self.call("dashboard.dump")
+
+    def machines_dump(self) -> list[dict] | None:
+        """What the MACHINES PANE rendered: a row per machine (`{name, origin,
+        reachable, status, detail, sessions}`), or None off-pane.
+
+        Distinct from `machines.list` on purpose — that is the backend's view and
+        answers from anywhere; this proves the state reached the window."""
+        return self.call("machines.dump")["machines"]
+
+    def sidebar_dump(self) -> dict:
+        """The sidebar's status foot as rendered: `{servers, machines}`. Answers
+        from any pane (the sidebar is always mounted), which is why it is where
+        an unreachable server or machine is guaranteed to be visible."""
+        return self.call("sidebar.dump")
 
     def provider_modes_get(self) -> dict:
         """The AWS/Docker provider approval modes ({namespace: 'approve'|'deny'}) —
