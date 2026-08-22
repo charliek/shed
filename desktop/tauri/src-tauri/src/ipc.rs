@@ -74,6 +74,7 @@ pub(crate) async fn rc_list_payload(
     backend: &Backend,
     rc_service: &RcService,
     machines: &crate::machines::Machines,
+    live: &crate::live_activity::LiveActivityLayer,
     host: Option<&str>,
     shed: Option<&str>,
 ) -> Value {
@@ -116,6 +117,11 @@ pub(crate) async fn rc_list_payload(
                 obj.insert("origin_kind".into(), json!("shed"));
                 obj.insert("stale".into(), json!(false));
             }
+            // The live overlay LAST, so the stream's view wins over the
+            // one-shot's — the one-shot cannot know activity at all, so anything
+            // the stream has to say about it is strictly newer. Additive: a
+            // session the stream has not mentioned is left exactly as listed.
+            live.apply(&mut row, &s.host, &s.shed, &s.slug);
             row
         })
         .collect();
@@ -298,6 +304,10 @@ pub struct Handler {
     /// the sessions each reports. Reached over an SSH-forwarded hub rather than a
     /// shed server's HTTP proxy — the second reach path the sessions view merges.
     machines: Arc<crate::machines::Machines>,
+    /// Live activity for SHED rows, folded from each host's `/api/rc/events`.
+    /// Machine rows need no equivalent — they are read from their hub, which
+    /// knows activity already.
+    live: Arc<crate::live_activity::LiveActivityLayer>,
     /// Monotonic token stamped onto each `sheds.refresh` so it can wait for the
     /// frontend to echo it back (a synchronous refresh — see [`Self::sheds_refresh`]).
     refresh_seq: AtomicU64,
@@ -316,6 +326,7 @@ impl Handler {
         rc_service: Arc<RcService>,
         prefs: SharedPrefs,
         machines: Arc<crate::machines::Machines>,
+        live: Arc<crate::live_activity::LiveActivityLayer>,
     ) -> Self {
         Self {
             env,
@@ -327,6 +338,7 @@ impl Handler {
             rc_service,
             prefs,
             machines,
+            live,
             refresh_seq: AtomicU64::new(0),
             pid: std::process::id(),
         }
@@ -841,7 +853,15 @@ impl Handler {
     async fn rc_list(&self, params: &Value) -> Result<Value, (String, String)> {
         let host = params.get("host").and_then(Value::as_str);
         let shed = params.get("shed").and_then(Value::as_str);
-        Ok(rc_list_payload(&self.backend, &self.rc_service, &self.machines, host, shed).await)
+        Ok(rc_list_payload(
+            &self.backend,
+            &self.rc_service,
+            &self.machines,
+            &self.live,
+            host,
+            shed,
+        )
+        .await)
     }
 
     /// `machines.list` → `{machines}`: per-machine reachability for the sessions

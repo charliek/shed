@@ -11,6 +11,7 @@ mod approval;
 mod broker;
 mod env;
 mod ipc;
+mod live_activity;
 mod machines;
 mod prefs;
 mod screenshot;
@@ -259,13 +260,14 @@ async fn rc_list(
     backend: tauri::State<'_, Arc<Backend>>,
     rc: tauri::State<'_, Arc<RcService>>,
     machines: tauri::State<'_, Arc<machines::Machines>>,
+    live: tauri::State<'_, Arc<live_activity::LiveActivityLayer>>,
     host: Option<String>,
     shed: Option<String>,
 ) -> Result<serde_json::Value, String> {
     // The SAME shaper the socket IPC `rc.list` uses — not a parallel build with
     // a comment claiming they match (which is how machine sessions reached the
     // IPC op but never the pane).
-    Ok(ipc::rc_list_payload(&backend, &rc, &machines, host.as_deref(), shed.as_deref()).await)
+    Ok(ipc::rc_list_payload(&backend, &rc, &machines, &live, host.as_deref(), shed.as_deref()).await)
 }
 
 #[tauri::command]
@@ -1112,6 +1114,22 @@ pub fn run() {
             ));
             app.manage(machines.clone());
 
+            // Live activity for SHED sessions. Machine rows carry theirs already
+            // (the app reads those hubs directly); shed rows are listed by the
+            // one-shot, which by design never sets it — so without this the same
+            // list shows two different amounts of truth depending on how each row
+            // was fetched. Same `refresh` event, so both layers converge on one
+            // repaint path.
+            let live_refresh = app.handle().clone();
+            let live_activity = Arc::new(live_activity::LiveActivityLayer::start(
+                &tauri::async_runtime::handle().inner().clone(),
+                &backend,
+                Arc::new(move || {
+                    let _ = live_refresh.emit("refresh", serde_json::json!({}));
+                }),
+            ));
+            app.manage(live_activity.clone());
+
             // The terminal ops (preset resolution, launch, detection, the pref), shared
             // by the IPC handler + the frontend invoke commands (needs the Backend above).
             let terminal: termctl::SharedTerminal = Arc::new(termctl::TerminalCtl::new(
@@ -1131,6 +1149,7 @@ pub fn run() {
                 rc_service.clone(),
                 prefs,
                 machines,
+                live_activity,
             );
             // block_on enters Tauri's tokio runtime so tokio's UnixListener can
             // register with the reactor; then serve on the same runtime.

@@ -285,6 +285,19 @@ impl Backend {
         self.clients.iter().map(|(name, _)| name.clone()).collect()
     }
 
+    /// Every configured host paired with its read client.
+    ///
+    /// For the long-lived per-host SUBSCRIBERS (the live-activity SSE watcher),
+    /// which need a client each and outlive any single request. `Client` clones
+    /// cheaply — the transport and token cache are Arc-backed — so each watcher
+    /// owning one shares the same token machinery rather than duplicating it.
+    pub fn host_clients(&self) -> Vec<(String, Client)> {
+        self.clients
+            .iter()
+            .map(|(name, c)| (name.clone(), c.clone()))
+            .collect()
+    }
+
     // -- lifecycle --------------------------------------------------------
 
     pub async fn start(&self, host: Option<&str>, name: &str) -> Result<(), ShedError> {
