@@ -184,6 +184,131 @@ impl HubClient {
         Ok(())
     }
 
+    // -----------------------------------------------------------------
+    // The CONTROL verbs (contract v2)
+    // -----------------------------------------------------------------
+    //
+    // These go over the SAME loopback connection the feed does — a client that
+    // can read a machine's hub can steer it, with no second transport and no
+    // SSH exec. That matters most on a phone, where spawning a process is not
+    // an option at all.
+    //
+    // **Every one of these is capability-gated on the far side**, and a client
+    // must gate its UI the same way from `kind_features` rather than from the
+    // kind: a `409 not_supported` reaching a user as an error means the button
+    // should not have been offered. See `docs/extensions/rc-helper.md`.
+
+    /// Start a turn (`POST /v1/sessions/{slug}/turn`), returning its id.
+    ///
+    /// Only for a kind whose `input` is `turn`; anything else answers `409
+    /// not_supported`, which surfaces here as [`HubError::Failed`].
+    pub async fn turn(&self, slug: &str, text: &str) -> Result<String, HubError> {
+        #[derive(serde::Deserialize)]
+        struct Resp {
+            turn_id: String,
+        }
+        let resp: Resp = self
+            .post_json(
+                &format!("/v1/sessions/{slug}/turn"),
+                &serde_json::json!({ "text": text }),
+            )
+            .await?;
+        Ok(resp.turn_id)
+    }
+
+    /// Interrupt the running turn (`POST /v1/sessions/{slug}/interrupt`).
+    ///
+    /// Returns whether the far side actually began interrupting — `false` is a
+    /// legitimate answer (nothing was running), not a failure.
+    pub async fn interrupt(&self, slug: &str) -> Result<bool, HubError> {
+        #[derive(serde::Deserialize)]
+        struct Resp {
+            interrupting: bool,
+        }
+        let resp: Resp = self
+            .post_json(
+                &format!("/v1/sessions/{slug}/interrupt"),
+                &serde_json::json!({}),
+            )
+            .await?;
+        Ok(resp.interrupting)
+    }
+
+    /// Send a line of input to a TUI-laned session
+    /// (`POST /v1/sessions/{slug}/input`) — the keystroke path, as opposed to
+    /// [`turn`](Self::turn)'s structured one.
+    pub async fn input(&self, slug: &str, text: &str) -> Result<(), HubError> {
+        let _: serde_json::Value = self
+            .post_json(
+                &format!("/v1/sessions/{slug}/input"),
+                &serde_json::json!({ "text": text }),
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// Answer a pending approval (`POST /v1/sessions/{slug}/approvals/{id}`).
+    ///
+    /// `decision` is one of `allow` / `allow_always` / `deny`. Only a kind whose
+    /// `approvals` capability is `"remote"` can be answered this way; a `"tui"`
+    /// kind reports approvals for INFORMATION only and must be answered in its
+    /// terminal — offering a button for one is the mistake this contract exists
+    /// to prevent.
+    pub async fn approve(&self, slug: &str, id: &str, decision: &str) -> Result<String, HubError> {
+        #[derive(serde::Deserialize)]
+        struct Resp {
+            decision: String,
+        }
+        let resp: Resp = self
+            .post_json(
+                &format!("/v1/sessions/{slug}/approvals/{id}"),
+                &serde_json::json!({ "decision": decision }),
+            )
+            .await?;
+        Ok(resp.decision)
+    }
+
+    /// POST a JSON body and decode the reply.
+    ///
+    /// A non-2xx carries the hub's own error text through verbatim rather than
+    /// being flattened to a status code: the contract's `not_supported` /
+    /// `not_accepting` distinction is the whole reason a client can tell "this
+    /// kind can never do that" from "not right now".
+    async fn post_json<T: serde::de::DeserializeOwned>(
+        &self,
+        path: &str,
+        body: &serde_json::Value,
+    ) -> Result<T, HubError> {
+        let resp = self
+            .http
+            .post(format!("{}{path}", self.base))
+            .json(body)
+            .timeout(SNAPSHOT_TIMEOUT)
+            .send()
+            .await
+            .map_err(|e| HubError::Unavailable(format!("hub {path}: {e}")))?;
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        if !status.is_success() {
+            return Err(HubError::Failed(format!(
+                "hub {path}: HTTP {status}{}",
+                if text.is_empty() {
+                    String::new()
+                } else {
+                    format!(" — {}", text.trim())
+                }
+            )));
+        }
+        // An empty 2xx body is legitimate for a verb with nothing to report;
+        // decode it as null so a `Value` target succeeds.
+        let raw = if text.trim().is_empty() {
+            "null"
+        } else {
+            &text
+        };
+        serde_json::from_str(raw).map_err(|e| HubError::Failed(format!("hub {path}: {e}")))
+    }
+
     async fn get_json<T: serde::de::DeserializeOwned>(&self, path: &str) -> Result<T, HubError> {
         let resp = self
             .http
@@ -257,6 +382,119 @@ mod tests {
             err.to_string().contains(&server.port().to_string()),
             "{err}"
         );
+    }
+
+    #[tokio::test]
+    async fn turn_posts_the_text_and_returns_the_turn_id() {
+        let server = MockServer::start();
+        let m = server.mock(|when, then| {
+            when.method(POST)
+                .path("/v1/sessions/abc123/turn")
+                .json_body(serde_json::json!({"text": "do the thing"}));
+            then.status(202)
+                .json_body(serde_json::json!({"turn_id": "t-7"}));
+        });
+        let id = HubClient::loopback(server.port())
+            .expect("client")
+            .turn("abc123", "do the thing")
+            .await
+            .expect("turn accepted");
+        assert_eq!(id, "t-7");
+        m.assert();
+    }
+
+    /// **A capability refusal must carry the hub's REASON through.**
+    ///
+    /// The contract distinguishes `not_supported` ("this kind can never do
+    /// that") from `not_accepting` ("not right now"), and a client cannot tell
+    /// them apart — or explain itself to a user — if the transport flattens
+    /// both to "HTTP 409".
+    #[tokio::test]
+    async fn a_409_carries_the_contract_reason_not_just_a_status() {
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(POST).path("/v1/sessions/abc123/turn");
+            then.status(409).json_body(serde_json::json!({
+                "error": "not_supported",
+                "message": "this session's kind does not accept turns"
+            }));
+        });
+        let err = HubClient::loopback(server.port())
+            .expect("client")
+            .turn("abc123", "hi")
+            .await
+            .expect_err("a tui-laned kind refuses turns");
+        let msg = err.to_string();
+        assert!(matches!(err, HubError::Failed(_)), "{msg}");
+        assert!(
+            msg.contains("not_supported"),
+            "the reason must survive: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn interrupt_reports_whether_anything_was_running() {
+        let server = MockServer::start();
+        let mut m = server.mock(|when, then| {
+            when.method(POST).path("/v1/sessions/abc123/interrupt");
+            then.status(202)
+                .json_body(serde_json::json!({"interrupting": true}));
+        });
+        assert!(HubClient::loopback(server.port())
+            .expect("client")
+            .interrupt("abc123")
+            .await
+            .expect("accepted"));
+        m.delete();
+
+        // `false` is a legitimate ANSWER (nothing was running), not a failure —
+        // a client that treated it as an error would show a spurious problem
+        // every time a user interrupted an idle session.
+        server.mock(|when, then| {
+            when.method(POST).path("/v1/sessions/abc123/interrupt");
+            then.status(202)
+                .json_body(serde_json::json!({"interrupting": false}));
+        });
+        assert!(!HubClient::loopback(server.port())
+            .expect("client")
+            .interrupt("abc123")
+            .await
+            .expect("still a success"));
+    }
+
+    #[tokio::test]
+    async fn approve_sends_the_decision_and_echoes_the_resolved_one() {
+        let server = MockServer::start();
+        let m = server.mock(|when, then| {
+            when.method(POST)
+                .path("/v1/sessions/abc123/approvals/ap-1")
+                .json_body(serde_json::json!({"decision": "allow"}));
+            then.status(200)
+                .json_body(serde_json::json!({"resolved": true, "decision": "allow"}));
+        });
+        let decided = HubClient::loopback(server.port())
+            .expect("client")
+            .approve("abc123", "ap-1", "allow")
+            .await
+            .expect("resolved");
+        assert_eq!(decided, "allow");
+        m.assert();
+    }
+
+    /// A verb whose success body is empty must still succeed — several answer
+    /// 202 with nothing at all.
+    #[tokio::test]
+    async fn an_empty_success_body_is_not_a_decode_failure() {
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(POST).path("/v1/sessions/abc123/input");
+            then.status(202);
+        });
+        HubClient::loopback(server.port())
+            .expect("client")
+            .input("abc123", "hello")
+            .await
+            .expect("an empty 202 is a success");
     }
 
     /// A reachable hub that answers badly is `Failed`, not `Unavailable` — the
