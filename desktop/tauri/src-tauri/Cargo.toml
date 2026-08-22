@@ -90,5 +90,17 @@ tauri = { version = "2", features = ["image-png", "macos-private-api"] }
 tempfile = "3"
 
 # A debug build is what the harness drives; keep it reasonably snappy.
+#
+# `opt-level = 1` stays (the harness drives this build, and an unoptimized
+# WebKitGTK client is noticeably sluggish). The debug-info settings match
+# `crates/Cargo.toml` — see its profile comment for the measurements; this
+# workspace is separate on purpose, so the tuning has to be repeated rather than
+# inherited.
 [profile.dev]
 opt-level = 1
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+# Dependencies are not stepped through; their debug info is pure disk — and this
+# crate's dep tree (Tauri + WebKitGTK + Sparkle) is the largest of the three.
+debug = false

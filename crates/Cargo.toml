@@ -59,6 +59,34 @@ base64 = "0.22"
 # Test-only TLS listener for the in-process mtls server tests.
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
 
+# **The dev profile is TUNED** (plan 012), because the default is expensive here
+# in a way that shows up as failed builds rather than slow ones: a full debug
+# build of this workspace ran to 18G, and a machine at 98% disk cannot link.
+#
+# Measured on a clean `cargo build -p shed-core --tests`, default vs this:
+#
+#   clean build   20.0s -> 15.5s   (-22%)
+#   target size    965M ->  645M   (-33%)
+#   test wall      5.17s -> 3.31s  (-36%, smaller binaries link and load faster)
+#   incremental    1.09s -> 1.09s  (unchanged — the dev loop is not affected)
+#
+# Better on every axis, so there is no trade being made. What is GIVEN UP is
+# variable inspection in a debugger; `line-tables-only` keeps function names and
+# `file:line` in panics and backtraces, which is what this repo actually debugs
+# with (verified: a failing assert still reports `machine.rs:350:9` with a
+# symbolized backtrace).
+#
+# Deliberately NOT `opt-level = 2` for dependencies: it saves a further 55M but
+# costs ~35s on every clean build, `cargo update`, and toolchain bump. The
+# test-runtime win above is link/load, not compute — in-test time was identical
+# — so optimizing deps buys nothing here.
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+# Dependencies are not stepped through; their debug info is pure disk.
+debug = false
+
 [profile.release]
 lto = "thin"
 codegen-units = 1
