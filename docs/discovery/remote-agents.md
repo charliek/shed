@@ -368,12 +368,30 @@ claims `**Ships:** host-agent, sx`).
 
 **That trigger is HELD, deliberately** (2026-08-22): the e2e bar being met is
 necessary, not sufficient. The owner wants to drive the machine story locally
-and polish the UX before anything ships. First finding out of that: a machine
-session was reachable and steerable but had no way to READ it — the rich
-per-session view (feed + input, TUI fallback) existed only for sheds, so the
-phone offered blind Steer/Interrupt buttons on a list card. Nobody steers an
-agent without looking at its output first. Treat "the acceptance criteria pass"
-as the start of the polish pass, not the end of the block.
+and polish the UX before anything ships — which proved to be the right call,
+because the polish pass turned up more than polish:
+
+- a machine session was reachable and steerable but had no way to READ it. The
+  rich per-session view existed only for sheds, so the phone offered blind
+  Steer/Interrupt buttons on a list card. Nobody steers an agent without seeing
+  its output. The view is now transport-agnostic and serves both;
+- **shed sessions reported no activity at all** in the desktop app while the
+  machine beside them said `needs input`. Activity is a hub-layer overlay the
+  one-shot listing never sets, and Tauri had never mounted the watcher built for
+  exactly that. Same list, two amounts of truth, decided by how each row was
+  fetched;
+- the phone's capability probe had never worked against a real machine, so every
+  machine session was silently observe-only.
+
+None of those were visible to a green test suite. **The general lesson for this
+roadmap: a client-facing block is not done when its acceptance criteria pass —
+it is done when someone has driven it.** Budget for the pass after the pass.
+
+A platform split also settled here, and is worth carrying forward: the DESKTOP
+leads with the terminal (it has a real one) and a rendered feed view is only
+warranted for a kind that cannot be attached — of which there are none today.
+The PHONE leads with the rendered view, because its terminal is an in-app
+xterm. Parity is per-client, between machines and sheds; it is not cross-client.
 
 **R3** is independent and can slot in whenever the lane bet is due — though
 R4 sharpened its case: a phone can now steer an opencode turn, and the one
