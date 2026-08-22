@@ -156,6 +156,48 @@ function SidebarRow({ name, tone, note, title, onClick }:
   );
 }
 
+/** The activity chip for a session, honouring "lifecycle trumps activity".
+ *
+ *  A needs-auth or dead row shows NO activity: whatever it was doing stopped
+ *  being true when it stopped being able to run, and a stale `working` badge on
+ *  a dead session is a lie the card would be telling on its own initiative. */
+function rcActivityLabel(s: RcSession): { tone: Tone; label: string } | null {
+  if (s.state !== "ready" && s.state !== "reconnecting") return null;
+  switch (s.activity) {
+    case "needs_input":
+      return { tone: "attention", label: "needs input" };
+    case "needs_approval":
+      return { tone: "attention", label: "needs approval" };
+    case "working":
+      return { tone: "ok", label: "working" };
+    case "idle":
+      return { tone: "muted", label: "idle" };
+    default:
+      return null;
+  }
+}
+
+/** The card's left edge — what most wants your attention.
+ *
+ *  Deliberately NOT the badges' precedence: a bad LIFECYCLE outranks any
+ *  activity, because a dead session is not merely idle. Below that, asking for
+ *  a person outranks merely being busy. Anything not worth saying gets no edge
+ *  at all, so the coloured ones carry weight — a full column of stripes would
+ *  say nothing.
+ *
+ *  A stale row gets none either: its machine is unreachable, so colouring it
+ *  would assert something present about a box we cannot see. Same rule as
+ *  shed-mobile's `sessionRailColor`, because a shed row and a machine row must
+ *  read as one column. */
+function sessionRail(s: RcSession): string | undefined {
+  if (s.stale) return undefined;
+  if (s.state === "dead") return "var(--shed-danger)";
+  if (s.state === "needs-auth" || s.state === "needs-trust") return "var(--shed-attention)";
+  if (s.activity === "needs_input" || s.activity === "needs_approval") return "var(--shed-attention)";
+  if (s.activity === "working") return "var(--shed-ok)";
+  return undefined;
+}
+
 /** Is this session WAITING ON A PERSON?
  *
  *  The two activities that mean "it stopped and wants you" — as opposed to
@@ -619,9 +661,14 @@ function SessionCard({ session: s, onKilled, onError }: { session: RcSession; on
   const [busy, setBusy] = useState(false);
   const claude = s.kind === "claude-rc" || s.kind === "claude-broker";
   const machine = s.origin_kind === "machine";
+  // WORKDIR FIRST: on a narrow pane this truncates, and the working directory
+  // is what tells two sessions on the same box apart. The origin is not here at
+  // all — the pane is grouped by it.
   const sub = s.state === "needs-auth"
     ? rcAuthHint(s.kind)
-    : [`tmux ${s.tmux_session}`, s.workdir, s.created_by].filter(Boolean).join(" · ");
+    : [s.workdir, s.tmux_session, s.created_by].filter(Boolean).join(" · ");
+  const act = rcActivityLabel(s);
+  const rail = sessionRail(s);
   const kill = async () => {
     setBusy(true);
     // Routes by origin — a machine session is addressed by (machine, slug), a
@@ -636,13 +683,22 @@ function SessionCard({ session: s, onKilled, onError }: { session: RcSession; on
       // A stale row is the last KNOWN state of a machine that is currently
       // unreachable — dimmed rather than hidden, because "mini3 is asleep and
       // these were its sessions" is more useful than an empty list.
-      style={{ animation: "shed-in .25s ease", opacity: s.stale ? 0.55 : 1 }}
+      style={{
+        animation: "shed-in .25s ease",
+        opacity: s.stale ? 0.55 : 1,
+        // The rail as a left border. Only the left side is coloured, so the
+        // padding compensates to keep the text where it was.
+        borderLeft: rail ? `4px solid ${rail}` : undefined,
+        paddingLeft: rail ? 15 : undefined,
+      }}
     >
-      <StatusChip tone={rcStateTone(s.state)} label={s.state} />
       <div className="min-w-0 flex-1">
         <div className="mb-1 flex flex-wrap items-center gap-2.5">
           <span className="text-[16px] font-semibold text-shed-text">{s.display_name}</span>
           <KindBadge kind={s.kind} />
+          {/* Both badges together, read in one glance. */}
+          <StatusChip tone={rcStateTone(s.state)} label={s.state} />
+          {act && <StatusChip tone={act.tone} label={act.label} />}
           {!s.managed && <span className="rounded bg-shed-inset px-1.5 py-0.5 font-mono text-[10px] font-semibold text-shed-text-muted">legacy</span>}
         </div>
         <div className="truncate font-mono text-[12px] text-shed-text-muted">
