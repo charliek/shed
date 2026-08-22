@@ -34,6 +34,7 @@ component ships.
 | Dashboard + IPC spine | Read-only dashboard across hosts; the drivability socket + screenshots | ✅ |
 | Lifecycle + create | start/stop/reset/delete, create with live SSE progress, terminal launch | ✅ |
 | Agents | Remote-control launcher (RC classifier), Agents pane | ✅ |
+| Machines | Native SSH hosts running the RC hub, listed and controlled beside sheds (Tauri) | ✅ |
 | Approval gate | Multi-server SSH approval over UDS, policy engine, notifications, merged audit feed | ✅ |
 | System | Per-host disk usage (`/api/system/df`) | ✅ |
 | Packaging | Launch-at-login, preferences, DMG + Sparkle EdDSA auto-update (mac); nfpm `.deb` (Linux) | ✅ |
