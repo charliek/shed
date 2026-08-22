@@ -8,11 +8,11 @@
 
 pub mod audit_store;
 pub mod auth_modes;
+pub mod backend;
 /// The reconnect schedule shared by the long-lived feed watchers
 /// ([`rc_events_watcher`] and [`machine`]), so their "deliberately identical"
 /// cadences are identical by construction rather than by convention.
 mod backoff;
-pub mod backend;
 #[cfg(feature = "broker")]
 pub mod broker_bridge;
 pub mod coordinator;

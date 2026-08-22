@@ -126,6 +126,11 @@ pub struct SshForward {
     /// would spawn onto the same local port and the loser (killed by
     /// `ExitOnForwardFailure`) could be the one we keep.
     ensuring: tokio::sync::Mutex<()>,
+    /// **Test seam** (see [`SshForward::reserve_faked`]): an argv prefix exec'd
+    /// in place of `ssh`, with the real ssh argv handed to it as ignored
+    /// trailing arguments. Compiled away outside `cfg(test)`.
+    #[cfg(test)]
+    exec_prefix: Option<Vec<String>>,
 }
 
 impl SshForward {
@@ -146,12 +151,45 @@ impl SshForward {
             label,
             child: Arc::new(Mutex::new(None)),
             ensuring: tokio::sync::Mutex::new(()),
+            #[cfg(test)]
+            exec_prefix: None,
         })
+    }
+
+    /// **Test-only:** a forward that execs `exec_prefix` (plus the real ssh
+    /// argv, ignored) instead of `ssh`.
+    ///
+    /// The child LIFECYCLE — recorded the instant it exists, killed on drop,
+    /// never spawned twice onto one port — is the part of this type that has
+    /// actually had bugs, and real `ssh` cannot exercise it without a live
+    /// machine (which would make the tests both slow and conditional). A
+    /// scriptable stand-in is spawned, recorded, waited on, and killed through
+    /// exactly the same code, so the lifecycle claims are testable hermetically.
+    #[cfg(test)]
+    fn reserve_faked(
+        entry: shed_core::config::MachineEntry,
+        exec_prefix: Vec<String>,
+    ) -> Result<Self, ForwardError> {
+        let mut f = Self::reserve(entry)?;
+        f.exec_prefix = Some(exec_prefix);
+        Ok(f)
     }
 
     /// The ssh argv this forward spawns — exposed so a caller can print it.
     pub fn argv(&self) -> Vec<String> {
         machine::forward_argv(&self.entry, self.port, HUB_PORT)
+    }
+
+    /// What is actually exec'd: [`argv`](Self::argv), unless a test seam has
+    /// substituted a stand-in for the `ssh` binary.
+    fn spawn_argv(&self) -> Vec<String> {
+        #[cfg(test)]
+        if let Some(prefix) = &self.exec_prefix {
+            let mut argv = prefix.clone();
+            argv.extend(self.argv());
+            return argv;
+        }
+        self.argv()
     }
 
     /// Is the child gone (exited, reaped elsewhere, or never spawned)?
@@ -184,7 +222,7 @@ impl MachineForward for SshForward {
         // `ExitOnForwardFailure`.
         kill_child(&self.child);
 
-        let argv = self.argv();
+        let argv = self.spawn_argv();
         let port = self.port;
         let label = self.label.clone();
         let slot = Arc::clone(&self.child);
@@ -197,9 +235,10 @@ impl MachineForward for SshForward {
         // routine), the task still runs to completion, and storing the child
         // only after `.await` would orphan an `ssh -N -L` process that nothing
         // can ever kill: `std::process::Child`'s `Drop` does not kill.
-        let outcome = tokio::task::spawn_blocking(move || spawn_and_wait(&slot, &argv, port, &label))
-            .await
-            .map_err(|e| ForwardError(format!("forward task failed: {e}")))?;
+        let outcome =
+            tokio::task::spawn_blocking(move || spawn_and_wait(&slot, &argv, port, &label))
+                .await
+                .map_err(|e| ForwardError(format!("forward task failed: {e}")))?;
         if outcome.is_err() {
             // A failed attempt must not leave a half-established tunnel behind.
             kill_child(&self.child);
@@ -355,8 +394,19 @@ impl MachineHubWatcher {
         forward: Arc<dyn MachineForward>,
         machine: String,
     ) -> (MachineHubWatcher, mpsc::UnboundedReceiver<MachineHubUpdate>) {
+        Self::spawn_inner(handle, forward, machine, BackoffSleeper::default())
+    }
+
+    /// [`spawn`](Self::spawn) with the backoff-sleep seam supplied — the real
+    /// clock (`BackoffSleeper::default()`) everywhere but the schedule test.
+    fn spawn_inner(
+        handle: &tokio::runtime::Handle,
+        forward: Arc<dyn MachineForward>,
+        machine: String,
+        sleeper: BackoffSleeper,
+    ) -> (MachineHubWatcher, mpsc::UnboundedReceiver<MachineHubUpdate>) {
         let (tx, rx) = mpsc::unbounded_channel();
-        let task = handle.spawn(run_loop(forward, tx));
+        let task = handle.spawn(run_loop(forward, tx, sleeper));
         (MachineHubWatcher { machine, task }, rx)
     }
 
@@ -379,7 +429,41 @@ impl Drop for MachineHubWatcher {
     }
 }
 
-async fn run_loop(forward: Arc<dyn MachineForward>, tx: mpsc::UnboundedSender<MachineHubUpdate>) {
+/// **Where the loop's backoff sleep goes — a `cfg(test)` seam that is an EMPTY
+/// struct in a normal build**, its `sleep` a plain `tokio::time::sleep`.
+///
+/// The reset rule below is only observable from outside as *when* the next
+/// attempt happens, and the schedule is deliberately long (500 ms → 30 s), so
+/// asserting it against the real clock would mean sleeping through it. The
+/// sibling watcher ([`crate::rc_events_watcher`]) carries the same seam as a
+/// full `Sleeper` trait; here nothing outside this file's own tests injects it,
+/// so the injectable half is `#[cfg(test)]` and a release build carries a
+/// zero-sized value.
+#[derive(Default)]
+struct BackoffSleeper {
+    /// Absent in a normal build: the struct is empty and [`sleep`] is
+    /// `tokio::time::sleep`, verbatim.
+    ///
+    /// [`sleep`]: BackoffSleeper::sleep
+    #[cfg(test)]
+    scripted: Option<Arc<tests::ScriptedSleeper>>,
+}
+
+impl BackoffSleeper {
+    async fn sleep(&self, wait: Duration) {
+        #[cfg(test)]
+        if let Some(scripted) = &self.scripted {
+            return scripted.sleep(wait).await;
+        }
+        tokio::time::sleep(wait).await;
+    }
+}
+
+async fn run_loop(
+    forward: Arc<dyn MachineForward>,
+    tx: mpsc::UnboundedSender<MachineHubUpdate>,
+    sleeper: BackoffSleeper,
+) {
     let mut backoff = backoff::INITIAL;
     loop {
         if tx.is_closed() {
@@ -410,7 +494,7 @@ async fn run_loop(forward: Arc<dyn MachineForward>, tx: mpsc::UnboundedSender<Ma
         // down delivers no events, so a send failure alone would never be
         // observed here and an abandoned receiver would leak the task.
         tokio::select! {
-            _ = tokio::time::sleep(wait) => {}
+            () = sleeper.sleep(wait) => {}
             _ = tx.closed() => break,
         }
     }
@@ -471,6 +555,135 @@ async fn connect_once(
 mod tests {
     use super::*;
 
+    use std::path::Path;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    // ---- doubles ----
+
+    /// The backoff-sleep seam's test half: record the wait the loop is ABOUT to
+    /// take, and return immediately rather than spend it.
+    ///
+    /// After `park_after` waits it pends forever, which parks the loop at a
+    /// known point instead of letting it spin against the mock hub while the
+    /// test finishes its assertions.
+    pub(super) struct ScriptedSleeper {
+        waits: mpsc::UnboundedSender<Duration>,
+        taken: AtomicUsize,
+        park_after: usize,
+    }
+
+    impl ScriptedSleeper {
+        fn new(park_after: usize) -> (Arc<ScriptedSleeper>, mpsc::UnboundedReceiver<Duration>) {
+            let (waits, rx) = mpsc::unbounded_channel();
+            (
+                Arc::new(ScriptedSleeper {
+                    waits,
+                    taken: AtomicUsize::new(0),
+                    park_after,
+                }),
+                rx,
+            )
+        }
+
+        pub(super) async fn sleep(&self, wait: Duration) {
+            let _ = self.waits.send(wait);
+            if self.taken.fetch_add(1, Ordering::SeqCst) + 1 >= self.park_after {
+                std::future::pending::<()>().await;
+            }
+        }
+    }
+
+    /// A forward that refuses its first `failures_left` `ensure`s and then hands
+    /// over a port that works — the "machine is asleep, then wakes up" shape.
+    /// The refusals cost no I/O at all, so a whole failing ladder runs in the
+    /// test's own time.
+    struct FlakyForward {
+        port: u16,
+        failures_left: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl MachineForward for FlakyForward {
+        fn port(&self) -> u16 {
+            self.port
+        }
+
+        async fn ensure(&self) -> Result<(), ForwardError> {
+            if self.failures_left.load(Ordering::SeqCst) > 0 {
+                self.failures_left.fetch_sub(1, Ordering::SeqCst);
+                return Err(ForwardError("the machine is asleep".to_string()));
+            }
+            Ok(())
+        }
+    }
+
+    /// The stand-in for the `ssh` child: it appends its own pid to `log` — the
+    /// side-effect a test can wait on WITHOUT consulting the slot that is under
+    /// test — and then runs `body`. `exec` keeps the pid it logged.
+    fn fake_ssh(log: &Path, body: &str) -> Vec<String> {
+        vec![
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            format!("printf '%s\\n' $$ >> '{}'; {body}", log.display()),
+        ]
+    }
+
+    /// Every pid the fake ssh has been started as, in spawn order — i.e. how
+    /// many forward processes this test has created.
+    fn spawned_pids(log: &Path) -> Vec<i32> {
+        std::fs::read_to_string(log)
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|line| line.trim().parse().ok())
+            .collect()
+    }
+
+    /// Does `pid` still exist? `kill(pid, 0)` signals nothing and fails with
+    /// `ESRCH` once the process is gone AND reaped — which is exactly the
+    /// question "did the forward clean up after itself".
+    fn pid_is_alive(pid: i32) -> bool {
+        // SAFETY: `kill` with signal 0 performs only an existence/permission
+        // check; it touches no memory we own.
+        unsafe { libc::kill(pid, 0) == 0 }
+    }
+
+    /// Bring the forward's local port up once the fake ssh has actually
+    /// started — the tunnel a real `ssh -L` opens after it connects.
+    ///
+    /// Deliberately NOT bound up front: the readiness poll must become true as a
+    /// CONSEQUENCE of a child having started, or `ensure` can return before its
+    /// child has run at all and every "how many were spawned" assertion below
+    /// races the log. The listener lives in the task's output, so awaiting the
+    /// handle hands the test something to hold the port with.
+    fn tunnel_once_started(
+        port: u16,
+        log: &Path,
+        spawns: usize,
+    ) -> tokio::task::JoinHandle<std::net::TcpListener> {
+        let log = log.to_path_buf();
+        tokio::spawn(async move {
+            wait_for("the forward process to start", || {
+                spawned_pids(&log).len() >= spawns
+            })
+            .await;
+            std::net::TcpListener::bind(("127.0.0.1", port)).expect("bind the forward's local port")
+        })
+    }
+
+    /// Poll until `cond` holds. A condition wait, not a fixed sleep: the
+    /// expected path returns in microseconds and only a genuine regression pays
+    /// the deadline.
+    async fn wait_for(what: &str, mut cond: impl FnMut() -> bool) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while std::time::Instant::now() < deadline {
+            if cond() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        panic!("timed out waiting for {what}");
+    }
+
     fn entry() -> shed_core::config::MachineEntry {
         shed_core::config::MachineEntry {
             name: "mini3".into(),
@@ -498,9 +711,11 @@ mod tests {
         let argv = f.argv();
         // The concrete thing that matters: this local port maps to the hub's
         // fixed loopback port on the far side, and a lost race is loud.
-        assert!(argv
-            .windows(2)
-            .any(|w| w == ["-L", &format!("{}:127.0.0.1:{HUB_PORT}", f.port())]));
+        assert!(argv.windows(2).any(|w| w
+            == [
+                "-L",
+                &format!("127.0.0.1:{}:127.0.0.1:{HUB_PORT}", f.port())
+            ]));
         assert!(argv.contains(&"ExitOnForwardFailure=yes".to_string()));
         assert!(argv.contains(&"-N".to_string()), "runs no remote command");
         assert!(f.child_is_dead(), "nothing is spawned until ensure()");
@@ -617,11 +832,8 @@ mod tests {
         // snapshot above would still have passed while the feed stayed
         // permanently, invisibly silent.
         let forward = Arc::new(SshForward::reserve(entry.clone()).expect("reserve"));
-        let (watcher, mut rx) = MachineHubWatcher::spawn(
-            &tokio::runtime::Handle::current(),
-            forward,
-            name.clone(),
-        );
+        let (watcher, mut rx) =
+            MachineHubWatcher::spawn(&tokio::runtime::Handle::current(), forward, name.clone());
         let first = tokio::time::timeout(Duration::from_secs(30), rx.recv())
             .await
             .expect("a snapshot should arrive")
@@ -782,5 +994,263 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
         panic!("the loop should stop once the consumer is gone");
+    }
+
+    // ---- the reconnect schedule ----
+
+    /// **The reset is keyed on the connection having WORKED, not on how it
+    /// ended.** Almost every real disconnect is an `Err` — a stream chunk error,
+    /// the hub restarting, the forward dropping — so a reset that fired only on
+    /// a clean end of stream would ratchet the delay up across *successful*
+    /// connections and pin a healthy feed at the 30 s ceiling forever.
+    ///
+    /// Driven through the real loop: two dead attempts to ratchet the delay,
+    /// then one that reaches the hub, emits the snapshot, and dies on the feed —
+    /// the shape a hub restart has. The wait after THAT must be the initial
+    /// delay again, not the doubled one. (`backoff::step`'s own test pins the
+    /// numbers; only this one can see which value the loop feeds it.)
+    #[tokio::test]
+    async fn a_connection_that_worked_resets_the_delay_however_it_later_ended() {
+        let server = httpmock::MockServer::start();
+        server.mock(|when, then| {
+            when.method(httpmock::Method::GET).path("/v1/health");
+            then.status(200).json_body(serde_json::json!({
+                "app": shed_core::hub_client::HUB_APP_ID
+            }));
+        });
+        server.mock(|when, then| {
+            when.method(httpmock::Method::GET).path("/v1/sessions");
+            then.status(200)
+                .json_body(serde_json::json!({"sessions": []}));
+        });
+        // The feed refuses: a connection that reached the hub and then FAILED,
+        // which is what a hub restart looks like from here.
+        server.mock(|when, then| {
+            when.method(httpmock::Method::GET).path("/v1/events");
+            then.status(503);
+        });
+
+        let (sleeper, mut waits) = ScriptedSleeper::new(3);
+        let forward = Arc::new(FlakyForward {
+            port: server.port(),
+            failures_left: AtomicUsize::new(2),
+        });
+        let (watcher, mut rx) = MachineHubWatcher::spawn_inner(
+            &tokio::runtime::Handle::current(),
+            forward,
+            "mini3".to_string(),
+            BackoffSleeper {
+                scripted: Some(sleeper),
+            },
+        );
+
+        async fn next_wait(waits: &mut mpsc::UnboundedReceiver<Duration>) -> Duration {
+            tokio::time::timeout(Duration::from_secs(5), waits.recv())
+                .await
+                .expect("the loop should reach its backoff")
+                .expect("the sleeper outlives the loop")
+        }
+
+        assert_eq!(
+            next_wait(&mut waits).await,
+            backoff::INITIAL,
+            "a first dead attempt waits the initial delay"
+        );
+        assert_eq!(
+            next_wait(&mut waits).await,
+            backoff::INITIAL * 2,
+            "a second dead attempt ratchets"
+        );
+        assert_eq!(
+            next_wait(&mut waits).await,
+            backoff::INITIAL,
+            "the third attempt reached the hub and sent its snapshot, so the \
+             schedule must start over — resetting only on a clean end of stream \
+             would leave a healthy feed reconnecting at the ceiling"
+        );
+
+        // Everything the loop emitted is already queued (each `Down` precedes
+        // the wait we just read), so this needs no further synchronisation.
+        let updates: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        assert!(
+            matches!(
+                updates.as_slice(),
+                [
+                    MachineHubUpdate::Down { .. },
+                    MachineHubUpdate::Down { .. },
+                    MachineHubUpdate::Snapshot { .. },
+                    MachineHubUpdate::Down { .. }
+                ]
+            ),
+            "expected two dead attempts, then a snapshot and a lost feed: {updates:?}"
+        );
+        watcher.stop();
+    }
+
+    // ---- the ssh child's lifecycle ----
+    //
+    // Against a scriptable stand-in for `ssh` (see `SshForward::reserve_faked`)
+    // and the test's own listener standing in for a live tunnel, so nothing
+    // here needs a real machine.
+
+    /// **An `ensure` that is dropped mid-flight must still leave a killable
+    /// child.** Dropping it is routine, not exotic: `MachineHubWatcher::stop`
+    /// (and therefore its `Drop`) aborts the loop task, which drops whatever
+    /// `ensure` was in flight.
+    ///
+    /// The spawn runs inside `spawn_blocking`, and those tasks CANNOT be
+    /// aborted — dropping the join handle merely detaches them — so the child
+    /// gets created no matter what. If it is recorded only after the `.await`,
+    /// the abort loses the handle to a live `ssh -N -L` process that nothing can
+    /// ever kill: `std::process::Child`'s `Drop` does not kill.
+    #[tokio::test]
+    async fn an_ensure_aborted_mid_flight_still_leaves_its_child_killable() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log = dir.path().join("spawns");
+        // Nothing is listening on the reserved port, so the readiness poll
+        // never succeeds and the abort lands while `ensure` is still in flight.
+        let forward = Arc::new(
+            SshForward::reserve_faked(entry(), fake_ssh(&log, "exec sleep 30")).expect("reserve"),
+        );
+        let slot = Arc::clone(&forward.child);
+
+        let ensuring = Arc::clone(&forward);
+        let task = tokio::spawn(async move { ensuring.ensure().await });
+        // Wait on the CHILD's own side effect: the slot is the thing under test
+        // and must not be part of the synchronisation.
+        wait_for("the forward process to start", || {
+            !spawned_pids(&log).is_empty()
+        })
+        .await;
+        task.abort();
+        let _ = task.await;
+
+        let pids = spawned_pids(&log);
+        assert_eq!(pids.len(), 1, "exactly one forward process was started");
+        wait_for("the child to be recorded", || !forward.child_is_dead()).await;
+        assert_eq!(
+            slot.lock().unwrap().as_ref().map(std::process::Child::id),
+            Some(pids[0] as u32),
+            "the recorded child must be the process that was actually spawned"
+        );
+
+        drop(forward);
+        assert!(
+            slot.lock().unwrap().is_none(),
+            "dropping the forward reaps and clears the child"
+        );
+        assert!(
+            !pid_is_alive(pids[0]),
+            "pid {} outlived the forward — an orphaned ssh tunnel",
+            pids[0]
+        );
+    }
+
+    /// **Two racing `ensure`s must leave one child, not two.** Consumers hold an
+    /// `Arc<dyn MachineForward>` and the trait is `Send + Sync`, so this race is
+    /// available to any two callers; unserialized, both would spawn onto the
+    /// same local port and the second would overwrite — and thereby orphan — the
+    /// first, since assigning over a `std::process::Child` does not kill it.
+    #[tokio::test]
+    async fn two_racing_ensures_leave_exactly_one_child() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log = dir.path().join("spawns");
+        let forward =
+            SshForward::reserve_faked(entry(), fake_ssh(&log, "exec sleep 30")).expect("reserve");
+        let tunnel = tunnel_once_started(forward.port(), &log, 1);
+
+        let (first, second) = tokio::join!(forward.ensure(), forward.ensure());
+        first.expect("the first ensure");
+        second.expect("the second ensure");
+        let _tunnel = tunnel.await.expect("the tunnel task");
+
+        let pids = spawned_pids(&log);
+        assert_eq!(
+            pids.len(),
+            1,
+            "a second ensure raced onto the same local port: pids {pids:?}"
+        );
+        assert!(!forward.child_is_dead(), "the surviving child is live");
+
+        drop(forward);
+        for pid in pids {
+            assert!(!pid_is_alive(pid), "pid {pid} outlived the forward");
+        }
+    }
+
+    /// **Re-establishing over an UNRESPONSIVE predecessor kills it first.** The
+    /// child that is merely wedged — still running, no longer forwarding — is
+    /// the case that separates "respawn" from "leak": it still holds the local
+    /// port, so leaving it running both orphans it and dooms the replacement to
+    /// `ExitOnForwardFailure`. Assigning over a `std::process::Child` does not
+    /// kill it, so the kill has to be explicit.
+    #[tokio::test]
+    async fn re_establishing_kills_the_unresponsive_predecessor() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log = dir.path().join("spawns");
+        let forward =
+            SshForward::reserve_faked(entry(), fake_ssh(&log, "exec sleep 30")).expect("reserve");
+
+        let tunnel = tunnel_once_started(forward.port(), &log, 1);
+        forward.ensure().await.expect("the first ensure");
+        let tunnel = tunnel.await.expect("the tunnel task");
+        let wedged = spawned_pids(&log);
+        assert_eq!(wedged.len(), 1);
+
+        // The tunnel stops forwarding while its process lives on — from here
+        // the local port refuses, but the child is still very much running.
+        drop(tunnel);
+        assert!(
+            !forward.child_is_dead(),
+            "the wedged child is still running"
+        );
+
+        let tunnel = tunnel_once_started(forward.port(), &log, 2);
+        forward.ensure().await.expect("the re-establish");
+        let _tunnel = tunnel.await.expect("the tunnel task");
+
+        let pids = spawned_pids(&log);
+        assert_eq!(pids.len(), 2, "a replacement was spawned");
+        assert!(
+            !pid_is_alive(wedged[0]),
+            "pid {} was replaced without being killed — an orphaned tunnel \
+             still holding the local port",
+            wedged[0]
+        );
+
+        drop(forward);
+        assert!(
+            !pid_is_alive(pids[1]),
+            "the replacement outlived the forward"
+        );
+    }
+
+    /// `ensure` is idempotent: on a forward whose tunnel is up it is a no-op,
+    /// not a kill-and-respawn. A reconnecting watcher calls it on every attempt,
+    /// so a needless respawn would tear down a working tunnel on each pass.
+    #[tokio::test]
+    async fn a_second_ensure_on_a_healthy_forward_is_a_no_op() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log = dir.path().join("spawns");
+        let forward =
+            SshForward::reserve_faked(entry(), fake_ssh(&log, "exec sleep 30")).expect("reserve");
+        let tunnel = tunnel_once_started(forward.port(), &log, 1);
+
+        let port = forward.port();
+        forward.ensure().await.expect("the first ensure");
+        let _tunnel = tunnel.await.expect("the tunnel task");
+        let pids = spawned_pids(&log);
+        assert_eq!(pids.len(), 1);
+
+        forward.ensure().await.expect("the second ensure");
+        assert_eq!(
+            spawned_pids(&log),
+            pids,
+            "a healthy forward must not be respawned"
+        );
+        assert_eq!(forward.port(), port, "ensure must never change the port");
+
+        drop(forward);
+        assert!(!pid_is_alive(pids[0]));
     }
 }

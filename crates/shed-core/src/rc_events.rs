@@ -643,7 +643,10 @@ mod tests {
         .expect("a machine hub's session.updated must decode");
         match updated {
             RcEvent::SessionUpdated {
-                shed, slug, removed, ..
+                shed,
+                slug,
+                removed,
+                ..
             } => {
                 assert_eq!(shed, "", "no shed to name when the hub is read directly");
                 assert_eq!(slug, "evtprb");
@@ -672,17 +675,20 @@ mod tests {
         }
 
         // A kill on a directly-read hub, likewise.
-        let gone = parse("session.updated", r#"{"shed":"","slug":"s2","session":null}"#)
-            .expect("must decode");
-        assert!(matches!(gone, RcEvent::SessionUpdated { removed: true, .. }));
+        let gone = parse(
+            "session.updated",
+            r#"{"shed":"","slug":"s2","session":null}"#,
+        )
+        .expect("must decode");
+        assert!(matches!(
+            gone,
+            RcEvent::SessionUpdated { removed: true, .. }
+        ));
 
         // …and the message notification.
-        let appended = parse("message.appended", r#"{"shed":"","slug":"s3","seq":7}"#)
-            .expect("must decode");
-        assert!(matches!(
-            appended,
-            RcEvent::MessageAppended { seq: 7, .. }
-        ));
+        let appended =
+            parse("message.appended", r#"{"shed":"","slug":"s3","seq":7}"#).expect("must decode");
+        assert!(matches!(appended, RcEvent::MessageAppended { seq: 7, .. }));
     }
 
     /// The two SYNTHETIC events keep requiring a shed: only the server's
@@ -694,6 +700,134 @@ mod tests {
         assert_eq!(parse("shed.stopped", r#"{"shed":""}"#), None);
         assert!(parse("hub.unavailable", r#"{"shed":"web"}"#).is_some());
         assert!(parse("shed.stopped", r#"{"shed":"web"}"#).is_some());
+    }
+
+    /// **The whole `shed`/`slug` presence contract, in one grid.**
+    ///
+    /// Every event name × every presence class of `shed` × every presence class
+    /// of `slug`, asserting decode-or-drop for each cell. The rule the grid
+    /// pins is deliberately asymmetric and was, until plan 012, only half
+    /// right (see [`parse_rc_event`]'s comment):
+    ///
+    /// * the three HUB-EMITTED events need a `slug` and DON'T need a `shed` —
+    ///   a directly-read hub has no shed to name and sends `""`;
+    /// * the two SERVER-SYNTHESIZED events need a `shed` and never read `slug`.
+    ///
+    /// Written as a table on purpose: with the contract spread over a dozen
+    /// hand-picked cases, the empty-shed rule was only covered where someone
+    /// happened to think of it, and the hole cost two plans. Any future change
+    /// to the rule now has to be a deliberate edit of this table.
+    #[test]
+    fn the_shed_and_slug_presence_grid_for_every_event() {
+        /// A field's presence class. `Blank` is whitespace-only, which
+        /// `opt_trimmed` collapses to absent — the same class as `Empty`, but
+        /// worth its own row because the collapse is a helper's behaviour, not
+        /// this decoder's, and could move underneath it.
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        enum Presence {
+            Absent,
+            Empty,
+            Blank,
+            Present,
+        }
+        use Presence::*;
+
+        impl Presence {
+            /// The JSON value to insert, or `None` to omit the key entirely.
+            fn wire(self, real: &str) -> Option<Value> {
+                match self {
+                    Absent => None,
+                    Empty => Some(Value::String(String::new())),
+                    Blank => Some(Value::String("   ".to_string())),
+                    Present => Some(Value::String(real.to_string())),
+                }
+            }
+        }
+
+        /// The variant an event decoded to, so a cell proves it got the RIGHT
+        /// event and not merely *an* event.
+        fn variant_of(ev: &RcEvent) -> &'static str {
+            match ev {
+                RcEvent::ActivityChanged { .. } => "activity.changed",
+                RcEvent::SessionUpdated { .. } => "session.updated",
+                RcEvent::MessageAppended { .. } => "message.appended",
+                RcEvent::HubUnavailable { .. } => "hub.unavailable",
+                RcEvent::ShedStopped { .. } => "shed.stopped",
+            }
+        }
+
+        /// The slug an event carries; the two synthetic events name a shed and
+        /// nothing finer.
+        fn slug_of(ev: &RcEvent) -> Option<&str> {
+            match ev {
+                RcEvent::ActivityChanged { slug, .. }
+                | RcEvent::SessionUpdated { slug, .. }
+                | RcEvent::MessageAppended { slug, .. } => Some(slug),
+                RcEvent::HubUnavailable { .. } | RcEvent::ShedStopped { .. } => None,
+            }
+        }
+
+        const SHED: &str = "web";
+        const SLUG: &str = "cdx777";
+        // The hub-emitted three, then the two the aggregate proxy mints.
+        const HUB_EMITTED: [&str; 3] = ["activity.changed", "session.updated", "message.appended"];
+        const SYNTHETIC: [&str; 2] = ["hub.unavailable", "shed.stopped"];
+
+        let mut decoded = 0usize;
+        for event in HUB_EMITTED.iter().chain(SYNTHETIC.iter()).copied() {
+            for shed in [Absent, Empty, Blank, Present] {
+                for slug in [Absent, Empty, Blank, Present] {
+                    // Every OTHER required key is supplied, so a cell can only
+                    // fail on the two fields under test.
+                    let mut body = serde_json::Map::new();
+                    if let Some(v) = shed.wire(SHED) {
+                        body.insert("shed".to_string(), v);
+                    }
+                    if let Some(v) = slug.wire(SLUG) {
+                        body.insert("slug".to_string(), v);
+                    }
+                    if event == "message.appended" {
+                        body.insert("seq".to_string(), Value::from(9u64));
+                    }
+                    if event == "session.updated" {
+                        body.insert(
+                            "session".to_string(),
+                            serde_json::json!({"state": "ready", "activity": "working"}),
+                        );
+                    }
+                    let data = Value::Object(body).to_string();
+                    let cell = format!("{event} shed={shed:?} slug={slug:?} data={data}");
+
+                    let want = if HUB_EMITTED.contains(&event) {
+                        slug == Present // shed is irrelevant to a hub-emitted event
+                    } else {
+                        shed == Present // slug is never read on a synthetic one
+                    };
+                    let got = parse(event, &data);
+                    assert_eq!(got.is_some(), want, "{cell}");
+
+                    let Some(ev) = got else { continue };
+                    decoded += 1;
+                    assert_eq!(variant_of(&ev), event, "{cell}");
+                    if HUB_EMITTED.contains(&event) {
+                        assert_eq!(slug_of(&ev), Some(SLUG), "{cell}");
+                        // The defaulted field: a real shed rides through, and
+                        // every not-really-there class flattens to `""` — the
+                        // value a directly-read hub's frames carry.
+                        let want_shed = if shed == Present { SHED } else { "" };
+                        assert_eq!(ev.shed(), want_shed, "{cell}");
+                    } else {
+                        assert_eq!(slug_of(&ev), None, "{cell}");
+                        assert_eq!(ev.shed(), SHED, "{cell}");
+                    }
+                }
+            }
+        }
+        // 3 hub events × 4 shed classes (all decode) + 2 synthetic × 4 slug
+        // classes — a guard on the loop itself, so a cell silently skipped
+        // (a `continue` moved, a list edited) fails here rather than passing
+        // by never running.
+        assert_eq!(decoded, 3 * 4 + 2 * 4);
     }
 
     #[test]
@@ -885,6 +1019,85 @@ mod tests {
         assert!(o.lookup("p", "z").is_none());
         assert!(o.lookup("q", "a").is_none()); // shed is part of the key
         assert_eq!(o.len(), 1);
+    }
+
+    /// **Empty-shed events COLLIDE in the overlay — this is why one overlay
+    /// must not span two feeds.**
+    ///
+    /// The overlay keys by `(shed, slug)`, and a directly-read hub sends
+    /// `shed: ""` on every frame (pinned above). So two sessions on two
+    /// DIFFERENT machines that happen to share a slug land on the same key
+    /// `("", slug)` and overwrite each other — mini2's `working` badge would
+    /// render on mini3's row, or vanish.
+    ///
+    /// The shared layer does not have this bug today: `MachineHubWatcher`
+    /// emits raw events and folds nothing, so there is one feed per machine
+    /// and never a shared overlay. This test PINS the present behaviour rather
+    /// than changing it, so the hazard is written down where the next client
+    /// to build a unified sessions view will find it: keep **one overlay per
+    /// feed**, and key rendered rows by `(origin, slug)` — the origin being
+    /// the client's own `local` / `machine:<name>` / `shed:<name>` handle, not
+    /// the event's `shed` field, which is empty for everything but the shed
+    /// transport.
+    #[test]
+    fn two_machines_empty_shed_events_collide_on_one_overlay_key() {
+        // Logically two machines (mini2, mini3), each running a session that
+        // happens to have drawn the same slug. Off the wire the frames are
+        // indistinguishable — nothing in the payload names the machine.
+        let from_mini2 = parse(
+            "activity.changed",
+            r#"{"shed":"","slug":"cdx777","activity":"working","state":"ready"}"#,
+        )
+        .expect("mini2's frame decodes");
+        let from_mini3 = parse(
+            "activity.changed",
+            r#"{"shed":"","slug":"cdx777","activity":"idle","state":"ready"}"#,
+        )
+        .expect("mini3's frame decodes");
+
+        let o = ActivityOverlay::empty()
+            .apply(&from_mini2)
+            .apply(&from_mini3);
+        assert_eq!(o.len(), 1, "the two machines share one key: {o:?}");
+        // Last write wins — mini2's activity is simply gone.
+        assert_eq!(
+            o.lookup("", "cdx777").unwrap().activity,
+            Some(RcActivity::Idle)
+        );
+
+        // And a degrading event on the empty shed clears BOTH machines'
+        // patches, because `drop_shed("")` matches every directly-read row.
+        // Constructed, not decoded — the wire can't carry an empty-shed
+        // `hub.unavailable` — but a client that MINTS one locally to mean "my
+        // machine's hub dropped" would wipe every machine's rows at once.
+        let cleared = o.apply(&RcEvent::HubUnavailable {
+            shed: String::new(),
+        });
+        assert!(cleared.is_empty());
+
+        // Contrast: on the shed transport the server fills `shed` in, so the
+        // same slug on two sheds stays two rows. The collision is a property of
+        // the empty shed, not of the overlay's keying.
+        let named = ActivityOverlay::empty()
+            .apply(&activity_changed(
+                "alpha",
+                "cdx777",
+                Some(RcActivity::Working),
+                Some(RcState::Ready),
+                None,
+            ))
+            .apply(&activity_changed(
+                "beta",
+                "cdx777",
+                Some(RcActivity::Idle),
+                Some(RcState::Ready),
+                None,
+            ));
+        assert_eq!(named.len(), 2);
+        assert_eq!(
+            named.lookup("alpha", "cdx777").unwrap().activity,
+            Some(RcActivity::Working)
+        );
     }
 
     #[test]

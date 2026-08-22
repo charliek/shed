@@ -253,7 +253,10 @@ mod tests {
             .expect_err("a squatter is not a hub");
         assert!(matches!(err, HubError::Unavailable(_)), "got {err:?}");
         // The message names the address, so the operator can find the squatter.
-        assert!(err.to_string().contains(&server.port().to_string()), "{err}");
+        assert!(
+            err.to_string().contains(&server.port().to_string()),
+            "{err}"
+        );
     }
 
     /// A reachable hub that answers badly is `Failed`, not `Unavailable` — the
@@ -313,6 +316,85 @@ mod tests {
         assert!(sessions.is_empty());
     }
 
+    /// A body that isn't JSON at all is `Failed`, not `Unavailable`: something
+    /// answered, so a caller must surface it rather than quietly retrying
+    /// forever as it would for an absent hub. (A proxy error page or an HTML
+    /// login interstitial on the port is the realistic shape of this.)
+    #[tokio::test]
+    async fn a_body_that_is_not_json_is_a_failure_not_an_absence() {
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(GET).path("/v1/sessions");
+            then.status(200)
+                .header("content-type", "text/html")
+                .body("<html>not a hub</html>");
+        });
+        let err = HubClient::loopback(server.port())
+            .expect("client")
+            .sessions()
+            .await
+            .expect_err("HTML is not a snapshot");
+        assert!(matches!(err, HubError::Failed(_)), "got {err:?}");
+        // The message names the route, so a log line says WHICH read broke.
+        assert!(err.to_string().contains("/v1/sessions"), "{err}");
+    }
+
+    /// `messages()` — the fetch behind every `message.appended` notification.
+    /// Pins the ROUTE (the `since` cursor has to reach the query string, or the
+    /// client silently refetches the whole feed on every append) and the
+    /// decoded body.
+    #[tokio::test]
+    async fn messages_carries_the_since_cursor_and_decodes_a_page() {
+        let server = MockServer::start();
+        let mut m = server.mock(|when, then| {
+            when.method(GET)
+                .path("/v1/sessions/hkn4vd/messages")
+                .query_param("since", "12");
+            then.status(200).json_body(serde_json::json!({
+                "messages": [
+                    {"seq": 13, "ts": "2026-08-22T02:05:30Z", "role": "assistant",
+                     "type": "text", "text": "running the suite"},
+                    {"seq": 14, "role": "tool", "type": "tool_use",
+                     "tool": {"name": "shell", "detail": "cargo test"}}
+                ],
+                "truncated": true
+            }));
+        });
+        let page = HubClient::loopback(server.port())
+            .expect("client")
+            .messages("hkn4vd", 12)
+            .await
+            .expect("page");
+        m.assert(); // the mock only matches if `since=12` was on the wire
+        m.delete();
+
+        assert_eq!(page.messages.len(), 2);
+        assert_eq!(page.messages[0].seq, 13);
+        assert_eq!(page.messages[0].role, "assistant");
+        assert_eq!(page.messages[0].text.as_deref(), Some("running the suite"));
+        assert_eq!(page.messages[1].seq, 14);
+        let tool = page.messages[1].tool.as_ref().expect("tool block");
+        assert_eq!(tool.name.as_deref(), Some("shell"));
+        assert_eq!(tool.detail.as_deref(), Some("cargo test"));
+        assert!(page.truncated);
+
+        // A shapeless body degrades to an EMPTY page rather than failing the
+        // read — `RcMessagesPage::from_value` is deliberately tolerant, unlike
+        // the serde-strict `sessions()` above, because a feed page is display
+        // text and a caller that got no rows simply renders none.
+        server.mock(|when, then| {
+            when.method(GET).path("/v1/sessions/hkn4vd/messages");
+            then.status(200)
+                .json_body(serde_json::json!({"messages": "nope"}));
+        });
+        let page = HubClient::loopback(server.port())
+            .expect("client")
+            .messages("hkn4vd", 0)
+            .await
+            .expect("a shapeless page is not an error");
+        assert_eq!(page, crate::rc::RcMessagesPage::default());
+    }
+
     /// The SSE feed decodes, and — the case the byte-stream loop gets wrong if
     /// `parser.finish()` is dropped — a final record with no trailing blank
     /// line is still delivered when the stream ends.
@@ -325,12 +407,13 @@ mod tests {
                 .header("content-type", "text/event-stream")
                 // Two records: the first properly terminated, the second left
                 // hanging as a stream that ends mid-frame would leave it.
+                // Both carry the empty `shed` a directly-read hub sends.
                 .body(concat!(
                     "event: activity.changed\n",
-                    "data: {\"shed\":\"\",\"slug\":\"hkn4vd\",\"activity\":\"working\"}\n",
+                    "data: {\"shed\":\"\",\"slug\":\"hkn4vd\",\"activity\":\"working\",\"state\":\"ready\"}\n",
                     "\n",
                     "event: session.updated\n",
-                    "data: {\"shed\":\"\",\"slug\":\"hkn4vd\",\"removed\":true}\n",
+                    "data: {\"shed\":\"\",\"slug\":\"hkn4vd\",\"session\":null}\n",
                 ));
         });
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
@@ -346,9 +429,126 @@ mod tests {
             seen.push(ev);
         }
         assert_eq!(
-            seen.len(),
-            2,
-            "the unterminated tail must still be flushed: {seen:?}"
+            seen,
+            vec![
+                RcEvent::ActivityChanged {
+                    shed: String::new(),
+                    slug: "hkn4vd".to_string(),
+                    activity: Some(crate::rc::RcActivity::Working),
+                    activity_at: None,
+                    state: Some(crate::rc::RcState::Ready),
+                    last_message: None,
+                },
+                RcEvent::SessionUpdated {
+                    shed: String::new(),
+                    slug: "hkn4vd".to_string(),
+                    activity: None,
+                    state: None,
+                    last_message: None,
+                    lane: None,
+                    removed: true,
+                },
+            ],
+            "the unterminated tail must still be flushed"
         );
+    }
+
+    /// The events route keeps the same absence/failure split as the snapshot
+    /// routes — a watcher retries an `Unavailable` hub and surfaces a `Failed`
+    /// one, so conflating them either spams a dead port or hides a real 503.
+    #[tokio::test]
+    async fn events_separates_an_absent_hub_from_one_that_refuses() {
+        let ln = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let dead = ln.local_addr().expect("addr").port();
+        drop(ln);
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let err = HubClient::loopback(dead)
+            .expect("client")
+            .events(&tx)
+            .await
+            .expect_err("nothing is listening");
+        assert!(matches!(err, HubError::Unavailable(_)), "got {err:?}");
+
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(GET).path("/v1/events");
+            then.status(503);
+        });
+        let err = HubClient::loopback(server.port())
+            .expect("client")
+            .events(&tx)
+            .await
+            .expect_err("503 is not a stream");
+        assert!(matches!(err, HubError::Failed(_)), "got {err:?}");
+        assert!(err.to_string().contains("503"), "{err}");
+    }
+
+    /// **A stream that dies mid-body must ERROR, not look like a clean EOF.**
+    ///
+    /// This is the failure the watcher's reconnect loop hangs off: a hub that
+    /// is killed, or a forward (`ssh -L`) that drops, cuts the body without
+    /// closing the response. If `events()` swallowed that as `Ok(())` the
+    /// caller could not tell a finished stream from a severed one, and a live
+    /// feed would go permanently silent while reporting success — the same
+    /// silent-but-healthy failure mode as the empty-shed decode bug.
+    ///
+    /// httpmock can't cut a body, so this is a raw socket: promise a
+    /// Content-Length, deliver one complete SSE record, then hang up.
+    #[tokio::test]
+    async fn events_surfaces_a_mid_stream_break_after_delivering_what_arrived() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.expect("accept");
+            let mut head = [0u8; 1024];
+            let _ = sock.read(&mut head).await;
+            sock.write_all(
+                concat!(
+                    "HTTP/1.1 200 OK\r\n",
+                    "Content-Type: text/event-stream\r\n",
+                    // Far more body than will ever be sent.
+                    "Content-Length: 4096\r\n",
+                    "\r\n",
+                    "event: activity.changed\n",
+                    "data: {\"shed\":\"\",\"slug\":\"hkn4vd\",\"activity\":\"working\"}\n",
+                    "\n",
+                )
+                .as_bytes(),
+            )
+            .await
+            .expect("write");
+            sock.shutdown().await.expect("half-close");
+        });
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let err = HubClient::loopback(port)
+            .expect("client")
+            .events(&tx)
+            .await
+            .expect_err("a severed body is not a clean end of stream");
+        assert!(matches!(err, HubError::Failed(_)), "got {err:?}");
+        drop(tx);
+
+        // …and the record that DID arrive before the break was delivered, not
+        // discarded with the error.
+        let ev = rx
+            .try_recv()
+            .expect("the pre-break record reached the sink");
+        assert_eq!(
+            ev,
+            RcEvent::ActivityChanged {
+                shed: String::new(),
+                slug: "hkn4vd".to_string(),
+                activity: Some(crate::rc::RcActivity::Working),
+                activity_at: None,
+                state: None,
+                last_message: None,
+            }
+        );
+        assert!(rx.try_recv().is_err(), "nothing else was sent");
     }
 }
