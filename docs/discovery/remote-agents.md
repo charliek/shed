@@ -366,6 +366,15 @@ apt-charliek's `sx` to `optional: false`, prune `sx` from the recommender's
 `NEVER_SHIPPED`, and SPLIT the `## Unreleased` changelog entry, which still
 claims `**Ships:** host-agent, sx`).
 
+**That trigger is HELD, deliberately** (2026-08-22): the e2e bar being met is
+necessary, not sufficient. The owner wants to drive the machine story locally
+and polish the UX before anything ships. First finding out of that: a machine
+session was reachable and steerable but had no way to READ it — the rich
+per-session view (feed + input, TUI fallback) existed only for sheds, so the
+phone offered blind Steer/Interrupt buttons on a list card. Nobody steers an
+agent without looking at its output first. Treat "the acceptance criteria pass"
+as the start of the polish pass, not the end of the block.
+
 **R3** is independent and can slot in whenever the lane bet is due — though
 R4 sharpened its case: a phone can now steer an opencode turn, and the one
 thing standing between that and "approve a tool call from the phone" is R3's
