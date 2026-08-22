@@ -1045,13 +1045,37 @@ mod tests {
                 };
                 let asks = Arc::clone(&server_asks);
                 tokio::spawn(async move {
+                    // Read until the END OF HEADERS, not once. A single `read`
+                    // can return a partial request when the kernel splits it
+                    // across segments (which happens under a loaded test
+                    // runner, not in isolation) — the route match then fails,
+                    // this handler answers nothing, and the client correctly
+                    // reports the connection dropped. That is a flaky mock, not
+                    // a flaky client, and it cost a 1-in-6 failure.
+                    let mut req = String::new();
                     let mut buf = vec![0u8; 1024];
-                    let n = sock.read(&mut buf).await.unwrap_or(0);
-                    let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                    loop {
+                        let n = sock.read(&mut buf).await.unwrap_or(0);
+                        if n == 0 {
+                            return; // peer went away mid-request
+                        }
+                        req.push_str(&String::from_utf8_lossy(&buf[..n]));
+                        if req.contains("\r\n\r\n") {
+                            break;
+                        }
+                    }
 
+                    // `Connection: close` is load-bearing, not decoration.
+                    // This mock serves ONE request per connection and then
+                    // drops it; without the header the client pools the socket
+                    // and reuses it for the next request, racing the close —
+                    // which surfaced as a 1-in-2 "error sending request" on the
+                    // very first snapshot. A real hub keeps the connection
+                    // alive properly; a mock that does not must say so.
                     let json = |body: &str| {
                         format!(
                             "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                             Connection: close\r\n\
                              Content-Length: {}\r\n\r\n{body}",
                             body.len()
                         )
