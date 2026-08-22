@@ -65,6 +65,11 @@
 //!   (`hub_verbs.go`); [`events`] the SSE streaming handler; [`ingest`] the
 //!   cursor hook route. The identity-probe client (`queryHubHealth` /
 //!   `probeHubIdentity`) lands with H11's bind-retry FSM.
+//! - [`role`] (plan 012) — **hosting** the above inside a long-lived process:
+//!   bind-as-lock, the bind-retry FSM, the reconcile-thread lifecycle, and the
+//!   foreground diagnostic. Landed in plan 010 as `shed-host-agent`'s
+//!   bin-local `rc_hub_role.rs` and graduated here at its second consumer (the
+//!   desktop app hosts the hub in-process).
 
 pub mod events;
 pub mod hub;
@@ -75,6 +80,7 @@ pub(crate) mod hub_test_support;
 pub mod ingest;
 pub mod messages;
 pub mod reconcile;
+pub mod role;
 pub mod stability;
 pub mod tail;
 pub mod verbs;

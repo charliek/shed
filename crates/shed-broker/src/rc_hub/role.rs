@@ -1,21 +1,32 @@
-//! The machine rc-hub role (plan 010 §2.6): the daemon-hosted
-//! `shed_broker::rc_hub` — bind-as-lock on the loopback port, the mixed-fleet
-//! bind-retry FSM (a Go machine hub may hold the port during the transition
-//! window; the agent takes it over whenever that hub idle-exits), the
-//! reconcile-thread lifecycle, and the `shed-host-agent rc-hub` foreground
-//! debug subcommand (the rc-parity harness's Rust leg). Both entrypoints share
-//! ONE HubConfig builder so they cannot drift.
+//! The machine rc-hub **role**: hosting [`super::hub`] inside a long-lived
+//! process — bind-as-lock on the loopback port, the mixed-fleet bind-retry FSM
+//! (a foreign hub may hold the port; the role takes it over whenever that
+//! holder exits), the reconcile-thread lifecycle, and the foreground
+//! diagnostic. Both entrypoints share ONE `HubConfig` builder so they cannot
+//! drift.
+//!
+//! Landed in plan 010 §2.6 as `shed-host-agent`'s bin-local `rc_hub_role.rs`
+//! and **graduated here in plan 012 (roadmap R4)** at its second consumer: the
+//! desktop app hosts the hub in-process through `shed-app`'s broker bridge, so
+//! the role can no longer live in the daemon bin. Nothing about the behaviour
+//! moved with it — `tests/rc-parity`'s hub family is the proof (the wire is
+//! frozen; a diff there means the graduation changed something).
+//!
+//! What stayed in the daemon: its CLI/arg parsing, its signal handling, and the
+//! `main.rs` task mount. Both entrypoints here take their shutdown signal from
+//! the caller rather than installing one.
 
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
-use shed_broker::bus::{BusLog, FileBusLog};
-use shed_broker::rc_hub::hub::{
+use shed_rc_engine::tmux::ExecRunner;
+
+use crate::bus::{BusLog, FileBusLog};
+use crate::rc_hub::hub::{
     self as hub, apply_hub_env_overrides, run_reconcile_loop, spawn_fs_nudger, Hub, HubConfig,
     LoopSignal, HUB_ADDR,
 };
-use shed_broker::status::RcHubStatus;
-use shed_rc_engine::tmux::ExecRunner;
+use crate::status::RcHubStatus;
 
 /// The role's log prefix (§2.6 observability).
 const LABEL: &str = "rc-hub";
@@ -33,9 +44,9 @@ fn env_get(key: &str) -> String {
 /// The ONE HubConfig builder both entrypoints share (§2.6): production seams
 /// (real tmux, process env, wall clock) + the §2.5 env-seam overrides, with
 /// every rejected override reported through `note`.
-pub(crate) fn build_hub_config(
+fn build_hub_config(
     version: &str,
-    logf: shed_broker::rc_hub::watch::LogFn,
+    logf: crate::rc_hub::watch::LogFn,
     note: &mut dyn FnMut(&str),
 ) -> HubConfig {
     let mut cfg = HubConfig {
@@ -77,7 +88,7 @@ enum BindOutcome {
     /// EADDRINUSE — a hub (or a squatter) holds the port.
     AlreadyBound,
     /// Any other bind error: retried like AlreadyBound, because a transient
-    /// EACCES/ENOBUFS must not kill the role for the daemon's lifetime.
+    /// EACCES/ENOBUFS must not kill the role for the process's lifetime.
     Failed(std::io::Error),
 }
 
@@ -92,8 +103,8 @@ fn bind_hub(addr: &str) -> BindOutcome {
 /// What one AlreadyBound probe concluded.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ProbeVerdict {
-    /// A verified hub answered /v1/health (the Go machine hub during the
-    /// mixed window) — expected, log at info.
+    /// A verified hub answered /v1/health (another hub during the mixed
+    /// window) — expected, log at info.
     Hub,
     /// Something else is listening — log at warn.
     Squatter,
@@ -153,14 +164,17 @@ enum ServeEnd {
 }
 
 // ---------------------------------------------------------------------------
-// The daemon role task
+// The hosted role task
 // ---------------------------------------------------------------------------
 
-/// Host the hub inside the daemon: bind (retrying per the FSM), serve + run
-/// the reconcile thread, and on shutdown stop in the §2.6 order — reconcile
-/// stops (its Stop arm closes subscribers + watchers, `closeAllWatchers`
-/// parity) → THEN the listener is released.
-pub(crate) async fn run_rc_hub_role(
+/// Host the hub inside a supervising process: bind (retrying per the FSM),
+/// serve + run the reconcile thread, and on shutdown stop in the §2.6 order —
+/// reconcile stops (its Stop arm closes subscribers + watchers,
+/// `closeAllWatchers` parity) → THEN the listener is released.
+///
+/// Returns only when `shutdown` flips; a lost or held port is a state the role
+/// sits in (reported through `status`), never a reason to return.
+pub async fn run_rc_hub_role(
     version: String,
     enabled: bool,
     status: Arc<Mutex<RcHubStatus>>,
@@ -178,11 +192,11 @@ pub(crate) async fn run_rc_hub_role(
             return;
         }
         // Env overrides are read at role start / each retry (§2.6); rejected
-        // values are warned through the agent log.
+        // values are warned through the host's log.
         let cfg = {
             let note_log = log.clone();
             let hub_log = log.clone();
-            let logf: shed_broker::rc_hub::watch::LogFn = Arc::new(move |line| hub_log.info(line));
+            let logf: crate::rc_hub::watch::LogFn = Arc::new(move |line| hub_log.info(line));
             build_hub_config(&version, logf, &mut |n| {
                 note_log.warn(&format!("{LABEL}: {n}"));
             })
@@ -202,7 +216,7 @@ pub(crate) async fn run_rc_hub_role(
             }
             BindOutcome::AlreadyBound => {
                 // The identity probe is bounded (1s) but still raced against
-                // shutdown: a wedged holder must never delay daemon exit.
+                // shutdown: a wedged holder must never delay process exit.
                 let probe_addr = addr.clone();
                 let mut sd = shutdown.clone();
                 let verdict = tokio::select! {
@@ -254,7 +268,7 @@ async fn serve_until_shutdown(
     // cycle's reconcile receiver going away on the NEXT filesystem event —
     // one parked thread (and its watcher) per SERVE CYCLE until then, released
     // on the first event after. Serve cycles are rare (see `ServeEnd`), and
-    // the daemon exits with the process.
+    // the host exits with the process.
     let _nudger = spawn_fs_nudger(&hub, sig_tx.clone());
     let reconcile_hub = Arc::clone(&hub);
     let reconcile = std::thread::spawn(move || run_reconcile_loop(&reconcile_hub, &sig_rx));
@@ -294,7 +308,7 @@ async fn serve_until_shutdown(
 /// Signal the reconcile loop to stop and wait for it. UNBOUNDED on purpose:
 /// the loop runs the shutdown cleanup (subscribers + watchers) on its way out,
 /// and a reconcile in flight is shelling out to `tmux`, which `ExecRunner`
-/// runs without a timeout (same posture as the Go hub) — so daemon exit can be
+/// runs without a timeout (same posture as the Go hub) — so process exit can be
 /// held up by an unresponsive tmux server.
 async fn stop_reconcile(
     sig_tx: std::sync::mpsc::Sender<LoopSignal>,
@@ -305,20 +319,28 @@ async fn stop_reconcile(
 }
 
 // ---------------------------------------------------------------------------
-// The foreground debug subcommand (`shed-host-agent rc-hub`)
+// The foreground diagnostic (`shed-host-agent rc-hub`)
 // ---------------------------------------------------------------------------
 
-/// `shed-host-agent rc-hub`: foreground, no broker config/socket ceremony,
-/// honors the §2.5 env vars, logs to stderr, exits cleanly on SIGTERM/SIGINT.
+/// Run the hub in the FOREGROUND until `shutdown` resolves: no broker
+/// config/socket ceremony, honoring the §2.5 env vars, logging to stderr.
 /// Bind-as-lock keeps Go `RunHub`'s meaning: an existing verified hub → exit
-/// 0; a foreign holder → error, exit 1. The harness's Rust leg + a diagnostic
-/// surface — documented as such, not user surface.
+/// 0; a foreign holder → error, exit 1. Backs the `shed-host-agent rc-hub`
+/// subcommand — the rc-parity harness's Rust leg and a diagnostic surface,
+/// documented as such, not user surface.
 ///
 /// It reads NO broker config: `-config` / `-log-file` are ignored, and so is
-/// `rc_hub.enabled` — that knob gates the daemon ROLE, and a diagnostic you
+/// `rc_hub.enabled` — that knob gates the hosted ROLE, and a diagnostic you
 /// typed by hand should run on the machine that opted the daemon out.
-pub(crate) fn run_rc_hub_foreground(version: &str) -> i32 {
-    let logf: shed_broker::rc_hub::watch::LogFn = Arc::new(|line| eprintln!("{line}"));
+///
+/// `shutdown` is supplied by the caller (the daemon hands it its SIGTERM/SIGINT
+/// wait) because installing signal handlers is a process-shell concern, not a
+/// broker one.
+pub fn run_rc_hub_foreground<F>(version: &str, shutdown: F) -> i32
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    let logf: crate::rc_hub::watch::LogFn = Arc::new(|line| eprintln!("{line}"));
     let cfg = build_hub_config(version, logf, &mut |n| {
         eprintln!("shed-host-agent: {n}");
     });
@@ -361,7 +383,7 @@ pub(crate) fn run_rc_hub_foreground(version: &str) -> i32 {
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     let end = runtime.block_on(async move {
         tokio::spawn(async move {
-            crate::wait_for_shutdown().await;
+            shutdown.await;
             let _ = shutdown_tx.send(true);
         });
         // The bus log's empty path IS stderr (`FileBusLog::new`), which is
@@ -380,7 +402,7 @@ pub(crate) fn run_rc_hub_foreground(version: &str) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use shed_broker::rc_hub::hub::ENV_HUB_ADDR;
+    use crate::rc_hub::hub::ENV_HUB_ADDR;
 
     fn test_log() -> Arc<dyn BusLog> {
         Arc::new(FileBusLog::new(""))
@@ -426,7 +448,7 @@ mod tests {
 
     // The local half of the AlreadyBound probe: `query_hub_health`'s three-way
     // answer mapped onto the FSM's verdicts. (The handshake itself — including
-    // the real-hub arm — is pinned in shed-broker's hub tests.)
+    // the real-hub arm — is pinned in the hub's own tests.)
     #[test]
     fn probe_holder_maps_the_three_way_answer() {
         let (_held, addr) = held_port();
@@ -436,13 +458,24 @@ mod tests {
             "listening but not answering /v1/health"
         );
 
-        let (free, free_addr) = held_port();
-        drop(free);
-        assert_eq!(
-            probe_holder(&free_addr),
-            ProbeVerdict::Nothing,
-            "nothing listening at all"
-        );
+        // "Nothing listening at all" is asserted over a just-RELEASED ephemeral
+        // port, which another test in this crate can legitimately claim in the
+        // gap between the drop and the probe (there are ~670 tests here now,
+        // several of which bind loopback ports — a real hazard the bin crate's
+        // ~30 tests did not have). Retry on fresh ports rather than asserting
+        // once: a genuinely broken mapping never yields `Nothing` on any
+        // attempt, so this hardens against the race without weakening the
+        // assertion.
+        let mut last = ProbeVerdict::Hub;
+        for _ in 0..5 {
+            let (free, free_addr) = held_port();
+            drop(free);
+            last = probe_holder(&free_addr);
+            if last == ProbeVerdict::Nothing {
+                return;
+            }
+        }
+        panic!("nothing listening at all should probe as Nothing, got {last:?}");
     }
 
     // `rc_hub.enabled: false` → the role reports and returns immediately,

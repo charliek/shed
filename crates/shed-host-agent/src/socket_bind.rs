@@ -103,7 +103,7 @@ fn prepare_socket_path(path: &Path) -> io::Result<()> {
 // The rc-hub's loopback TCP bind is NOT here: it needs no ceremony (no path to
 // prepare, no perms to set — the loopback interface is the trust boundary) and
 // its EADDRINUSE is a bind-as-lock *signal* rather than a failure, so it lives
-// with the FSM that acts on it, in `rc_hub_role`.
+// with the FSM that acts on it, in `shed_broker::rc_hub::role`.
 
 #[cfg(test)]
 mod tests {

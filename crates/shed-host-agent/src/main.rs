@@ -26,7 +26,6 @@ mod desktop_protocol;
 // The socket bind ceremony (touches `Log`) + the status UDS server / `status` CLI
 // client (only the daemon serves that socket). Path resolution + liveness probes +
 // the LiveStatus snapshot builder live in `shed_broker::{sockets,status}`.
-mod rc_hub_role;
 mod socket_bind;
 mod status_server;
 mod version;
@@ -68,7 +67,11 @@ fn run(args: &[String]) -> i32 {
             0
         }
         Ok(Command::Status { json_out }) => run_status(json_out, &mut io::stdout().lock()),
-        Ok(Command::RcHub) => rc_hub_role::run_rc_hub_foreground(&full_info()),
+        // The role itself lives in `shed_broker::rc_hub::role` (graduated in
+        // plan 012); the daemon supplies only its own signal wait.
+        Ok(Command::RcHub) => {
+            shed_broker::rc_hub::role::run_rc_hub_foreground(&full_info(), wait_for_shutdown())
+        }
         Ok(Command::Daemon {
             config_path,
             log_file,
@@ -550,7 +553,14 @@ fn run_daemon(config_path: &str, log_file: &str) -> i32 {
             let role_version = version.clone();
             let enabled = cfg.rc_hub_enabled;
             tasks.push(tokio::spawn(async move {
-                rc_hub_role::run_rc_hub_role(role_version, enabled, status, rx, role_log).await;
+                shed_broker::rc_hub::role::run_rc_hub_role(
+                    role_version,
+                    enabled,
+                    status,
+                    rx,
+                    role_log,
+                )
+                .await;
             }));
         }
 
