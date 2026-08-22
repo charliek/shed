@@ -8,12 +8,20 @@
 
 pub mod audit_store;
 pub mod auth_modes;
+/// The reconnect schedule shared by the long-lived feed watchers
+/// ([`rc_events_watcher`] and [`machine`]), so their "deliberately identical"
+/// cadences are identical by construction rather than by convention.
+mod backoff;
 pub mod backend;
 #[cfg(feature = "broker")]
 pub mod broker_bridge;
 pub mod coordinator;
 pub mod fakes;
 pub mod host_agent;
+/// The machine transport seam + the reconnecting hub watcher (plan 012).
+/// Deliberately NOT behind the `rc` feature: shed-mobile links this crate with
+/// default features and the machine feed is exactly what it needs.
+pub mod machine;
 #[cfg(feature = "rc")]
 pub mod rc;
 /// The ported one-shot RC **engine** (plan 009 C3) — the local, synchronous
@@ -45,6 +53,9 @@ pub use fakes::{AlwaysApprovedGate, FakeNotifier, NoopEventSink};
 pub use host_agent::{
     AgentCapabilityState, CapabilitySnapshot, HelloClientInfo, HostAgentClient,
     HostAgentClientError, HostAgentEvent,
+};
+pub use machine::{
+    FixedPort, ForwardError, MachineForward, MachineHubUpdate, MachineHubWatcher, SshForward,
 };
 #[cfg(feature = "rc")]
 pub use rc::{RcRunner, RcRunnerRef, RcService, RunOutput, TokioProcessRunner};

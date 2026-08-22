@@ -107,9 +107,27 @@ pub fn parse_rc_event(e: &SseEvent) -> Option<RcEvent> {
     let data = data.as_object()?;
     let shed = opt_trimmed(data.get("shed"));
     let slug = opt_trimmed(data.get("slug"));
+    // **`shed` is EMPTY when a hub is read directly** — on a machine or locally
+    // there is no shed, and the hub says so (`{"shed":"","slug":…}`, verified
+    // against a live machine hub and pinned below). Only the shed path has a
+    // name to carry, because the server's aggregate proxy injects it while
+    // fanning several guests' hubs into one stream.
+    //
+    // So `shed` is defaulted, not required, for the three HUB-EMITTED events.
+    // Requiring it silently dropped every frame from a machine or local hub —
+    // the feed decoded to nothing at all — which went unnoticed for two plans
+    // because `sx` was the only reader and the shed transport (where the server
+    // fills `shed` in) was the only path anyone watched. Plan 012 makes the
+    // desktop and mobile clients read machine hubs directly, so this had to be
+    // right before AC4/AC5 could pass.
+    //
+    // The two SYNTHETIC events below keep requiring it: they are produced only
+    // by the server's aggregate stream, and both are meaningless without the
+    // shed they pertain to.
+    let hub_shed = shed.clone().unwrap_or_default();
     match e.event.as_str() {
         "activity.changed" => Some(RcEvent::ActivityChanged {
-            shed: shed?,
+            shed: hub_shed,
             slug: slug?,
             activity: activity_of(data.get("activity")),
             activity_at: opt_trimmed(data.get("activity_at")),
@@ -122,7 +140,7 @@ pub fn parse_rc_event(e: &SseEvent) -> Option<RcEvent> {
             // instead of retaining every stale field.
             let sess = data.get("session").and_then(Value::as_object);
             Some(RcEvent::SessionUpdated {
-                shed: shed?,
+                shed: hub_shed,
                 slug: slug?,
                 activity: sess.and_then(|s| activity_of(s.get("activity"))),
                 state: sess.and_then(|s| state_of(s.get("state"))),
@@ -132,7 +150,7 @@ pub fn parse_rc_event(e: &SseEvent) -> Option<RcEvent> {
             })
         }
         "message.appended" => {
-            let (shed, slug) = (shed?, slug?);
+            let (shed, slug) = (hub_shed, slug?);
             let seq = seq_of(data.get("seq")?)?;
             Some(RcEvent::MessageAppended { shed, slug, seq })
         }
@@ -603,6 +621,79 @@ mod tests {
             parse("shed.stopped", r#"{"shed":"p"}"#),
             Some(RcEvent::ShedStopped { shed: "p".into() })
         );
+    }
+
+    /// **A hub read DIRECTLY sends `"shed":""` — those frames must decode.**
+    ///
+    /// The payloads below are the literal bytes captured off a live machine
+    /// hub (`shed-host-agent rc-hub` on mini3, read through an `ssh -L` tunnel,
+    /// plan 012 S2). Before the fix, `shed` was required non-empty and every
+    /// one of these decoded to `None`, so `sx watch --on machine:<m>` and
+    /// `--on local` rendered a permanently silent feed while looking healthy.
+    ///
+    /// Keep these verbatim: they are the contract with the Rust hub, and the
+    /// whole point is that they came off the wire rather than out of a fixture
+    /// someone wrote to match the parser.
+    #[test]
+    fn a_directly_read_hub_sends_an_empty_shed_and_still_decodes() {
+        let updated = parse(
+            "session.updated",
+            r#"{"shed":"","slug":"evtprb","session":{"slug":"evtprb","tmux_session":"rc-evtprb","kind":"shell","state":"ready","managed":true,"lane":"tui","display_name":"evtprobe","workdir":"/home/charliek","created_by":"probe","target_label":"local"}}"#,
+        )
+        .expect("a machine hub's session.updated must decode");
+        match updated {
+            RcEvent::SessionUpdated {
+                shed, slug, removed, ..
+            } => {
+                assert_eq!(shed, "", "no shed to name when the hub is read directly");
+                assert_eq!(slug, "evtprb");
+                assert!(!removed, "a session body present means it is not gone");
+            }
+            other => panic!("expected SessionUpdated, got {other:?}"),
+        }
+
+        let activity = parse(
+            "activity.changed",
+            r#"{"shed":"","slug":"evtprb","activity":"working","activity_at":"2026-08-22T02:05:30Z","state":"ready"}"#,
+        )
+        .expect("a machine hub's activity.changed must decode");
+        match activity {
+            RcEvent::ActivityChanged {
+                shed,
+                slug,
+                activity,
+                ..
+            } => {
+                assert_eq!(shed, "");
+                assert_eq!(slug, "evtprb");
+                assert_eq!(activity, Some(RcActivity::Working));
+            }
+            other => panic!("expected ActivityChanged, got {other:?}"),
+        }
+
+        // A kill on a directly-read hub, likewise.
+        let gone = parse("session.updated", r#"{"shed":"","slug":"s2","session":null}"#)
+            .expect("must decode");
+        assert!(matches!(gone, RcEvent::SessionUpdated { removed: true, .. }));
+
+        // …and the message notification.
+        let appended = parse("message.appended", r#"{"shed":"","slug":"s3","seq":7}"#)
+            .expect("must decode");
+        assert!(matches!(
+            appended,
+            RcEvent::MessageAppended { seq: 7, .. }
+        ));
+    }
+
+    /// The two SYNTHETIC events keep requiring a shed: only the server's
+    /// aggregate stream produces them, and neither means anything without the
+    /// shed it refers to.
+    #[test]
+    fn the_server_synthesized_events_still_require_a_shed() {
+        assert_eq!(parse("hub.unavailable", r#"{"shed":""}"#), None);
+        assert_eq!(parse("shed.stopped", r#"{"shed":""}"#), None);
+        assert!(parse("hub.unavailable", r#"{"shed":"web"}"#).is_some());
+        assert!(parse("shed.stopped", r#"{"shed":"web"}"#).is_some());
     }
 
     #[test]

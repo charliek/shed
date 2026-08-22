@@ -14,13 +14,7 @@
 //! no config file, and the config lookup is unit-testable with no argv.
 
 use shed_core::config::{MachineEntry, ShedConfig};
-
-/// The `sx` binary a `machine:` target invokes when its entry names none —
-/// resolved on the machine's non-login SSH `PATH`.
-pub const DEFAULT_MACHINE_SX_BIN: &str = "sx";
-
-/// The `sx` namespace carrying the one-shot engine verbs.
-const RC_NAMESPACE: &str = "rc";
+use shed_core::machine;
 
 /// The guest RC helper inside a shed. Baked into the `extensions`/`full` images
 /// and on the shed user's login PATH.
@@ -157,23 +151,23 @@ impl Resolved {
 pub fn resolve(target: &Target, config: &ShedConfig) -> Result<Resolved, String> {
     match target {
         Target::Local => Ok(Resolved::Local),
-        Target::Machine(name) => match config.machine(name) {
-            Some(entry) => Ok(Resolved::Machine(entry.clone())),
-            None => {
-                let known: Vec<&str> = config.machines.iter().map(|m| m.name.as_str()).collect();
-                Err(if known.is_empty() {
-                    format!(
-                        "no machine {name:?} in the config: add a `machines:` section to \
-                         ~/.shed/config.yaml (see `sx help`)"
-                    )
+        // Machine lookup + its "have: …" error are shared (plan 012); only the
+        // `sx help` pointer is porcelain, appended here.
+        //
+        // The condition is the CONFIG's shape, not a substring of the shared
+        // error: sniffing the message for "machines:" would silently start (or
+        // stop) appending the hint if shed-core ever rewords it, and would also
+        // fire on a machine literally named "machines:". This tests the same
+        // fact shed-core tests to pick its wording.
+        Target::Machine(name) => machine::resolve(config, name)
+            .map(|entry| Resolved::Machine(entry.clone()))
+            .map_err(|e| {
+                if config.machines.is_empty() {
+                    format!("{e} (see `sx help`)")
                 } else {
-                    format!(
-                        "no machine {name:?} in the config (have: {})",
-                        known.join(", ")
-                    )
-                })
-            }
-        },
+                    e
+                }
+            }),
         Target::Shed { name, server } => Ok(Resolved::Shed {
             name: name.clone(),
             server: server.clone(),
@@ -181,19 +175,11 @@ pub fn resolve(target: &Target, config: &ShedConfig) -> Result<Resolved, String>
     }
 }
 
-/// The RC argv prefix to invoke on a machine target: `<sx> rc`.
-/// `machines[].rc_bin` names WHERE SX LIVES on that machine — an absolute path
-/// when it is not on the non-login `PATH` an SSH exec sees — and the `rc`
-/// namespace is always appended.
+/// The RC argv prefix to invoke on a machine target: `<sx> rc` —
+/// [`shed_core::machine::rc_prefix`], re-exported so the porcelain's call sites
+/// read against the target model they already use.
 pub fn machine_rc_prefix(entry: &MachineEntry) -> Vec<String> {
-    vec![
-        entry
-            .rc_bin
-            .as_deref()
-            .unwrap_or(DEFAULT_MACHINE_SX_BIN)
-            .to_string(),
-        RC_NAMESPACE.to_string(),
-    ]
+    machine::rc_prefix(entry)
 }
 
 /// `~/.shed/config.yaml` — the same path the Go CLI computes
@@ -330,15 +316,25 @@ machines:
         );
     }
 
+    /// The shared lookup's message reaches the porcelain intact, and the
+    /// porcelain-only `sx help` pointer is appended ONLY in the no-machines
+    /// case — keyed on the config's shape, never on the shared text (see
+    /// [`resolve`]). A machine that merely FAILS to match must not get the
+    /// hint, or every typo would tell the user to go read the help.
     #[test]
     fn an_unknown_machine_names_the_configured_ones() {
         let err = resolve(&parse("machine:ghost"), &config()).unwrap_err();
         assert!(err.contains("ghost"), "{err}");
         assert!(err.contains("mini2") && err.contains("plain"), "{err}");
+        assert!(
+            !err.contains("sx help"),
+            "a typo with machines configured points at the names, not the help: {err}"
+        );
 
         // With no machines at all the error points at the fix instead.
         let err = resolve(&parse("machine:ghost"), &ShedConfig::default()).unwrap_err();
         assert!(err.contains("machines:"), "{err}");
+        assert!(err.contains("sx help"), "{err}");
     }
 
     #[test]

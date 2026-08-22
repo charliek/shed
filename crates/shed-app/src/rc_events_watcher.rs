@@ -64,12 +64,12 @@ use tokio::sync::mpsc;
 use shed_core::http::{Client, RcEventSink, ShedError};
 use shed_core::rc_events::{ActivityOverlay, RcEvent};
 
-/// First reconnect delay (`providers.dart:238`): small so a transient blip
-/// resyncs quickly.
-const INITIAL_BACKOFF: Duration = Duration::from_millis(500);
-/// Reconnect-delay ceiling (`providers.dart:239`): a hub that stays down (or
-/// an old server without rc-events) can't retry-storm.
-const MAX_BACKOFF: Duration = Duration::from_secs(30);
+/// The reconnect schedule (`providers.dart:238-239`) — small first delay so a
+/// transient blip resyncs quickly, capped so a server that stays down can't
+/// retry-storm. Shared with [`crate::machine`]'s hub watcher so a shed row and
+/// a machine row in one sessions view go stale at the same rate; see
+/// [`crate::backoff`].
+use crate::backoff::{step as backoff_step, INITIAL as INITIAL_BACKOFF};
 
 /// One update from the watcher loop (pinned shape, plan 001 §3.3).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -179,15 +179,6 @@ impl Drop for RcEventsWatcher {
     fn drop(&mut self) {
         self.stop();
     }
-}
-
-/// The pure per-disconnect backoff transition: `(wait_now, next_backoff)` —
-/// wait the CURRENT backoff, then double it up to [`MAX_BACKOFF`]. Mirrors
-/// mobile's retry timer (`providers.dart:325-332`: waits `backoff`, then
-/// doubles). The reset-to-initial on first data lives in the fold
-/// ([`FoldState::on_event`]), not here.
-fn backoff_step(prev: Duration) -> (Duration, Duration) {
-    (prev, (prev * 2).min(MAX_BACKOFF))
 }
 
 /// One SSE connection attempt, running until the stream ends. The prod impl
