@@ -1,0 +1,25 @@
+# Seed shed config for the machine-targets E2E (plan 012 S4). Same single mock
+# host as config.yaml, plus a `machines:` section.
+#
+# In test mode the app reaches every machine's hub on SHED_TAURI_MACHINE_HUB_PORT
+# directly (a `FixedPort`), so `host`/`user` here are never dialled — no ssh is
+# spawned. What matters is the SHAPE: two machines, so the suite covers both the
+# reachable and the unreachable case in one launch.
+#
+# `sleepy` exists to prove the unreachable posture. It is not special in any way
+# — both entries are identical to the app; the difference is that the harness
+# only serves a hub for one of them.
+servers:
+    mock:
+        host: 127.0.0.1
+        http_port: 8080
+        ssh_port: 2222
+default_server: mock
+sheds: {}
+machines:
+    mini3:
+        host: 127.0.0.1
+        user: nobody
+    sleepy:
+        host: 127.0.0.1
+        user: nobody

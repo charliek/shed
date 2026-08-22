@@ -23,13 +23,13 @@ import {
   fetchApprovals, decideApproval, fetchActivity, fetchGateNamespaces,
   fetchEgressProfiles, reportEgress, inTauri,
   openPreferences, setAppearanceState,
-  rcLaunch, rcKill, reportAgents, useRcSessions,
+  rcLaunch, killSession, sessionKey, reportAgents, useRcSessions,
   useCoordinatorData, useNowTick, shedsEmptyState,
   type Pane, type Shed, type HostDiskUsage, type HostFailure,
   type Modal, type CreateProgress, type Approval, type AuditEntry,
   type EgressProfile, type EgressProfileInfo, type HostEgressProfiles, type EgressReport,
   type RcSession, type RcKind, type RcState,
-  type RcCapabilities, offeredKinds, rcAuthHint,
+  type RcCapabilities, type MachineStatus, offeredKinds, rcAuthHint,
 } from "@/lib/bridge";
 
 /** "server/shed" when multi-server, else the shed name. */
@@ -257,8 +257,8 @@ function rcStateTone(state: RcState): Tone {
   return "attention";
 }
 
-function AgentsPane({ sessions, onLaunch, refresh }:
-  { sessions: RcSession[]; onLaunch: () => void; refresh: () => void }) {
+function AgentsPane({ sessions, machines, onLaunch, refresh }:
+  { sessions: RcSession[]; machines: MachineStatus[]; onLaunch: () => void; refresh: () => void }) {
   const [error, setError] = useState<string | null>(null);
 
   // Refresh the shared RC state on mount so navigating to the pane re-lists (the
@@ -286,12 +286,21 @@ function AgentsPane({ sessions, onLaunch, refresh }:
           <X size={16} className="mt-px flex-none" /> <span className="min-w-0 break-words">{error}</span>
         </div>
       )}
-      {sessions.length === 0 ? (
+      {sessions.length === 0 && machines.length === 0 ? (
         <Empty icon={Sparkles} title="No agents running" body="Launch an agent — a REPL, a shell, or a coding agent — inside a shed. Sessions keep running after you disconnect." />
       ) : (
         <div className="flex flex-col gap-3">
           {sessions.map((s) => (
-            <SessionCard key={`${s.host}/${s.shed}/${s.slug}`} session={s} onKilled={refresh} onError={setError} />
+            // Keyed by ORIGIN, not host/shed: a machine session's shed is empty
+            // by construction, so two machines sharing a slug would otherwise
+            // collide into one React key.
+            <SessionCard key={sessionKey(s)} session={s} onKilled={refresh} onError={setError} />
+          ))}
+          {/* A configured machine that is unreachable gets a row even with no
+              sessions — that row IS the information ("mini3 is asleep"), and it
+              is a normal state rather than an error. */}
+          {machines.filter((m) => !m.reachable).map((m) => (
+            <MachineDownCard key={m.origin} machine={m} />
           ))}
         </div>
       )}
@@ -299,27 +308,77 @@ function AgentsPane({ sessions, onLaunch, refresh }:
   );
 }
 
+/** A configured machine that is not currently reachable.
+ *
+ *  Rendered as an informational row, NOT an error: a machine that is asleep,
+ *  off-network, or simply not running a hub is the normal case. The `detail`
+ *  is shown verbatim because "no route to host" and "nothing is listening on
+ *  1029" are different problems with different fixes, and flattening them to
+ *  "offline" would throw away the only actionable part. */
+function MachineDownCard({ machine: m }: { machine: MachineStatus }) {
+  return (
+    <div
+      className={cn(cardCls, "flex items-center gap-4 px-[18px] py-4")}
+      style={{ opacity: 0.7 }}
+      data-machine={m.name}
+    >
+      <StatusChip tone="attention" label={m.connected_once ? "unreachable" : "connecting"} />
+      <div className="min-w-0 flex-1">
+        <div className="mb-1 flex flex-wrap items-center gap-2.5">
+          <span className="text-[16px] font-semibold text-shed-text">{m.name}</span>
+          <span className="rounded bg-shed-inset px-1.5 py-0.5 font-mono text-[10px] font-semibold text-shed-text-muted">
+            {m.origin}
+          </span>
+        </div>
+        <div className="truncate font-mono text-[12px] text-shed-text-muted">
+          {m.detail ?? "waiting for the machine's activity hub"}
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function SessionCard({ session: s, onKilled, onError }: { session: RcSession; onKilled: () => void; onError: (e: string) => void }) {
   const [busy, setBusy] = useState(false);
   const claude = s.kind === "claude-rc" || s.kind === "claude-broker";
+  const machine = s.origin_kind === "machine";
   const sub = s.state === "needs-auth"
     ? rcAuthHint(s.kind)
     : [`tmux ${s.tmux_session}`, s.workdir, s.created_by].filter(Boolean).join(" · ");
   const kill = async () => {
     setBusy(true);
-    try { await rcKill(s.shed, s.slug, s.host); onKilled(); }
+    // Routes by origin — a machine session is addressed by (machine, slug), a
+    // shed session by (host, shed, slug). One entry point so the distinction
+    // lives in the bridge rather than at every call site.
+    try { await killSession(s); onKilled(); }
     catch (e) { onError(String(e)); setBusy(false); }
   };
   return (
-    <div className={cn(cardCls, "flex items-center gap-4 px-[18px] py-4")} style={{ animation: "shed-in .25s ease" }}>
+    <div
+      className={cn(cardCls, "flex items-center gap-4 px-[18px] py-4")}
+      // A stale row is the last KNOWN state of a machine that is currently
+      // unreachable — dimmed rather than hidden, because "mini3 is asleep and
+      // these were its sessions" is more useful than an empty list.
+      style={{ animation: "shed-in .25s ease", opacity: s.stale ? 0.55 : 1 }}
+    >
       <StatusChip tone={rcStateTone(s.state)} label={s.state} />
       <div className="min-w-0 flex-1">
         <div className="mb-1 flex flex-wrap items-center gap-2.5">
           <span className="text-[16px] font-semibold text-shed-text">{s.display_name}</span>
           <KindBadge kind={s.kind} />
+          {machine && (
+            <span
+              className="rounded bg-shed-inset px-1.5 py-0.5 font-mono text-[10px] font-semibold text-shed-text-muted"
+              title={`Reached over SSH to ${s.machine}, not through a shed server`}
+            >
+              {s.origin}
+            </span>
+          )}
           {!s.managed && <span className="rounded bg-shed-inset px-1.5 py-0.5 font-mono text-[10px] font-semibold text-shed-text-muted">legacy</span>}
         </div>
-        <div className="truncate font-mono text-[12px] text-shed-text-muted">{sub}</div>
+        <div className="truncate font-mono text-[12px] text-shed-text-muted">
+          {s.stale ? `${sub} · last known` : sub}
+        </div>
       </div>
       <div className="flex flex-none items-center gap-2">
         {s.url && (
@@ -327,14 +386,19 @@ function SessionCard({ session: s, onKilled, onError }: { session: RcSession; on
             <ExternalLink size={14} /> Open in Claude
           </a>
         )}
-        <button
-          onClick={() => void openTerminal(s.shed, s.host, s.tmux_session)}
-          title={claude ? "Open the session in a terminal" : "Open in Terminal"}
-          className="hbtn inline-flex items-center rounded-[9px] px-[18px] py-2.5 font-mono text-[13px] font-medium"
-          style={{ background: "var(--shed-btn-dark)", color: "var(--shed-btn-dark-fg)", border: "none" }}
-        >
-          {">_ open"}
-        </button>
+        {/* The terminal opener resolves a SHED's ssh endpoint through the
+            server; a machine session has no shed, so it is not offered rather
+            than offered-and-broken. */}
+        {!machine && (
+          <button
+            onClick={() => void openTerminal(s.shed, s.host, s.tmux_session)}
+            title={claude ? "Open the session in a terminal" : "Open in Terminal"}
+            className="hbtn inline-flex items-center rounded-[9px] px-[18px] py-2.5 font-mono text-[13px] font-medium"
+            style={{ background: "var(--shed-btn-dark)", color: "var(--shed-btn-dark-fg)", border: "none" }}
+          >
+            {">_ open"}
+          </button>
+        )}
         <ActBtn icon={Trash2} tone="danger" title="End session" onClick={() => void kill()} disabled={busy} spin={busy} />
       </div>
     </div>
@@ -1031,7 +1095,7 @@ export default function App() {
   // the Agents pane, and the launch dialog all read this one `rc.list` state, so
   // they can't diverge. `refreshRc` reloads on the pane Refresh button, a
   // launch/kill, and pane/dialog open; the hook itself reloads on mount + `refresh`.
-  const { sessions: rcSessions, capabilities: rcCapabilities, refresh: refreshRc } = useRcSessions();
+  const { sessions: rcSessions, capabilities: rcCapabilities, machines: rcMachines, refresh: refreshRc } = useRcSessions();
   // Live approval queue (drives the badge + the pane) + the delegated namespaces
   // (a non-empty set = the host agent handshook, so it's connected).
   const approvals = useCoordinatorData<Approval[]>("approvals-changed", fetchApprovals, []);
@@ -1206,7 +1270,7 @@ export default function App() {
           <div data-pane={pane} className="mx-auto max-w-[880px]">
             {pane === "sheds" && <ShedsPane sheds={sheds} hostErrors={hostErrors} refresh={refresh} onNew={() => setModal("create")} />}
             {pane === "approvals" && <ApprovalsPane approvals={approvals} />}
-            {pane === "agents" && <AgentsPane sessions={rcSessions} onLaunch={() => setModal("launch")} refresh={refreshRc} />}
+            {pane === "agents" && <AgentsPane sessions={rcSessions} machines={rcMachines} onLaunch={() => setModal("launch")} refresh={refreshRc} />}
             {pane === "activity" && <ActivityPane />}
             {pane === "egress" && <EgressPane />}
             {pane === "system" && <SystemPane sheds={sheds} />}

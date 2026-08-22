@@ -324,6 +324,116 @@ fn spawn_and_wait(
     }
 }
 
+// ---------------------------------------------------------------------------
+// one-shot exec (the control verbs)
+// ---------------------------------------------------------------------------
+
+/// How long a one-shot machine command may take end to end. Generous because
+/// the far side may poll a pane; ssh's own `ConnectTimeout` is what bounds an
+/// unreachable host.
+const EXEC_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Spawn `argv`, wait for it, and KILL it if it overruns `timeout`.
+///
+/// **A `spawn_blocking` task cannot be aborted** — dropping its handle detaches
+/// it — so a bare `timeout(spawn_blocking(… .output()))` leaves BOTH the child
+/// process and the blocked thread running after the timeout fires, with nothing
+/// able to reach either. (The same leak class [`SshForward::ensure`] had.) The
+/// child is therefore spawned HERE, where its pid stays reachable; signalling
+/// that pid unblocks the waiter, which reaps the child and lets the thread end.
+///
+/// `wait_with_output` is kept for the wait itself because it drains stdout and
+/// stderr concurrently; polling `try_wait` instead would deadlock against a
+/// child that fills a pipe buffer before exiting.
+///
+/// [`SshForward::ensure`]: MachineForward::ensure
+async fn run_with_deadline(
+    argv: &[String],
+    timeout: Duration,
+    label: &str,
+) -> Result<std::process::Output, String> {
+    let (bin, rest) = argv.split_first().expect("argv is never empty");
+    let child = std::process::Command::new(bin)
+        .args(rest)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("{label}: running ssh: {e}"))?;
+    let pid = child.id();
+
+    match tokio::time::timeout(
+        timeout,
+        tokio::task::spawn_blocking(move || child.wait_with_output()),
+    )
+    .await
+    {
+        Ok(joined) => joined
+            .map_err(|e| format!("{label}: {e}"))?
+            .map_err(|e| format!("{label}: running ssh: {e}")),
+        Err(_) => {
+            // SIGKILL rather than SIGTERM: ssh with a wedged remote can ignore a
+            // polite signal, and by here the caller has already given up. The
+            // detached blocking thread reaps the child and exits on its own.
+            //
+            // The pid cannot have been recycled: the child is un-reaped (the
+            // waiter still holds it), so it is a zombie at worst, and a zombie's
+            // pid is not reassigned.
+            // SAFETY: `kill` has no preconditions beyond a valid signal number.
+            unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
+            Err(format!("{label}: the command timed out"))
+        }
+    }
+}
+
+/// Run one RC verb on a machine over SSH and return its stdout.
+///
+/// This is the CONTROL half of machine reach — the watcher above is the observe
+/// half. Kept here rather than in a client so `sx`, the desktop app and (via the
+/// pure builders) mobile all address a machine identically.
+///
+/// Deliberately NOT on `crate::rc`'s `RcRunner` seam: that lives behind the `rc`
+/// feature and this module must stay ungated for shed-mobile. The cost is a
+/// small duplicate spawn; the alternative is gating machine control out of the
+/// one client that most needs it.
+///
+/// A non-zero exit is mapped through the engine's exit-code classes, so a
+/// missing session reads the same as it does locally.
+pub async fn exec(
+    entry: &shed_core::config::MachineEntry,
+    remote_argv: &[String],
+) -> Result<String, String> {
+    let argv = machine::ssh_argv(entry, remote_argv);
+    let label = format!("machine:{}", entry.name);
+    let out = run_with_deadline(&argv, EXEC_TIMEOUT, &label).await?;
+
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let bin = remote_argv.first().map(String::as_str).unwrap_or_default();
+        let err = shed_core::rc::error_from_exit_with_bin(
+            bin,
+            out.status.code().unwrap_or(-1),
+            &stderr,
+            &stdout,
+        );
+        return Err(format!("{label}: {err}"));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// Kill a session on a machine (idempotent — the engine exits 0 for a session
+/// that is already gone).
+pub async fn kill(entry: &shed_core::config::MachineEntry, slug: &str) -> Result<(), String> {
+    let prefix = machine::rc_prefix(entry);
+    let mut argv = shed_core::rc::kill_argv(prefix.last().expect("prefix is never empty"), slug);
+    // The shed-core builders take a single `bin` for argv[0]; splice the full
+    // `<bin> rc` prefix back over it so a multi-token prefix stays separate argv
+    // words under the one quoter.
+    argv.splice(0..1, prefix.iter().cloned());
+    exec(entry, &argv).await.map(|_| ())
+}
+
 fn port_answers(port: u16) -> bool {
     std::net::TcpStream::connect(("127.0.0.1", port)).is_ok()
 }
@@ -500,6 +610,17 @@ async fn run_loop(
     }
 }
 
+/// The slug an event pertains to (`""` for the shed-scoped synthetic events,
+/// which a machine hub never emits).
+fn event_slug(event: &RcEvent) -> &str {
+    match event {
+        RcEvent::ActivityChanged { slug, .. }
+        | RcEvent::SessionUpdated { slug, .. }
+        | RcEvent::MessageAppended { slug, .. } => slug,
+        RcEvent::HubUnavailable { .. } | RcEvent::ShedStopped { .. } => "",
+    }
+}
+
 /// One full attempt: establish the forward, confirm a hub is there, send the
 /// authoritative snapshot, then stream the feed until it ends.
 ///
@@ -524,6 +645,10 @@ async fn connect_once(
         .await
         .map_err(|e: HubError| format!("the hub snapshot failed ({e})"))?;
     *connected = true;
+    // Track which slugs the snapshot covered. An event for anything else means
+    // the client's picture is INCOMPLETE — see the unknown-slug rule below.
+    let mut known: std::collections::HashSet<String> =
+        sessions.iter().map(|s| s.slug.clone()).collect();
     if tx.send(MachineHubUpdate::Snapshot { sessions }).is_err() {
         return Ok(());
     }
@@ -543,6 +668,34 @@ async fn connect_once(
                 return result.map_err(|e: HubError| format!("the hub feed stopped ({e})"));
             }
             Some(event) = ev_rx.recv() => {
+                // **An event for an unknown slug triggers a re-snapshot.**
+                //
+                // The feed is a PATCH stream over the snapshot, and its payloads
+                // carry a display subset rather than a full session — so a
+                // session created after the snapshot cannot be reconstructed
+                // from its event alone. Without this, a client that connected
+                // while a machine was idle would never show anything launched
+                // afterwards: the connection stays healthy, so no reconnect (and
+                // therefore no new snapshot) ever happens.
+                //
+                // The slug is marked known BEFORE the refetch, so a slug the hub
+                // keeps mentioning but never lists cannot drive a refetch loop.
+                let slug = event_slug(&event);
+                if !slug.is_empty() && known.insert(slug.to_string()) {
+                    match client.sessions().await {
+                        Ok(sessions) => {
+                            known.extend(sessions.iter().map(|s| s.slug.clone()));
+                            if tx.send(MachineHubUpdate::Snapshot { sessions }).is_err() {
+                                return Ok(());
+                            }
+                        }
+                        // A failed refetch is not fatal: the event still goes
+                        // out, and the next reconnect re-snapshots anyway.
+                        Err(e) => {
+                            let _ = e;
+                        }
+                    }
+                }
                 if tx.send(MachineHubUpdate::Event { event }).is_err() {
                     return Ok(());
                 }
@@ -784,6 +937,206 @@ mod tests {
         }
         assert_eq!(watcher.machine(), "mini3");
         watcher.stop();
+    }
+
+    /// **The timeout must KILL the child, not orphan it.**
+    ///
+    /// `spawn_blocking` cannot be aborted, so the naive
+    /// `timeout(spawn_blocking(… .output()))` leaves a live process and a stuck
+    /// thread behind when it fires — invisible in normal runs because the child
+    /// eventually exits on its own, and fatal when it does not (a wedged ssh to
+    /// an unresponsive machine is exactly that case).
+    ///
+    /// The child writes its OWN pid to a file before sleeping, and liveness is
+    /// then checked with `kill(pid, 0)`. Deterministic, unlike matching a `pgrep`
+    /// pattern — which can both miss (escaping) and collide with another test's
+    /// process, and would make this assertion vacuous either way.
+    #[tokio::test]
+    async fn an_overrunning_command_is_killed_not_orphaned() {
+        let dir = std::env::temp_dir().join(format!("shed-exec-kill-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let pidfile = dir.join("pid");
+        let argv = vec![
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            // `exec` so the pid recorded IS the sleeping process, not a parent
+            // shell that might exit independently.
+            format!("echo $$ > {}; exec sleep 30", pidfile.display()),
+        ];
+
+        let started = std::time::Instant::now();
+        let err = run_with_deadline(&argv, Duration::from_millis(300), "machine:test")
+            .await
+            .expect_err("a 30s sleep must overrun a 300ms deadline");
+        assert!(err.contains("timed out"), "{err}");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the deadline must not wait out the child: {:?}",
+            started.elapsed()
+        );
+
+        let pid: i32 = std::fs::read_to_string(&pidfile)
+            .expect("the child recorded its pid")
+            .trim()
+            .parse()
+            .expect("a numeric pid");
+        // Give the signal a moment to land, then require the process to be gone.
+        // `kill(pid, 0)` reports whether it is still signalable — 0 means alive.
+        let mut alive = true;
+        for _ in 0..50 {
+            // SAFETY: signal 0 performs no action; it only probes deliverability.
+            if unsafe { libc::kill(pid, 0) } != 0 {
+                alive = false;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(!alive, "the child (pid {pid}) survived the timeout");
+    }
+
+    /// The ordinary path still returns the child's output.
+    #[tokio::test]
+    async fn a_command_that_finishes_returns_its_output() {
+        let argv = vec![
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            "printf hello; printf oops >&2; exit 0".to_string(),
+        ];
+        let out = run_with_deadline(&argv, Duration::from_secs(10), "machine:test")
+            .await
+            .expect("it exits well inside the deadline");
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "hello");
+        assert_eq!(String::from_utf8_lossy(&out.stderr), "oops");
+        assert!(out.status.success());
+    }
+
+    /// **A session created AFTER the snapshot must still appear.**
+    ///
+    /// The feed is a patch stream whose payloads carry a display subset, not a
+    /// full session — so a slug the snapshot never mentioned cannot be
+    /// reconstructed from its event. Without a re-snapshot on an unknown slug, a
+    /// client that connected while a machine was idle would never see anything
+    /// launched afterwards.
+    ///
+    /// **The SSE stream is deliberately held OPEN** by a hand-rolled server. A
+    /// mock that closes it produces a disconnect, and the reconnect's snapshot
+    /// would deliver the session anyway — making the test pass with the fix
+    /// removed. (It did, on the first attempt.) The whole bug is that a HEALTHY
+    /// connection never re-snapshots, so the connection has to stay healthy.
+    #[tokio::test]
+    async fn a_session_created_after_the_snapshot_triggers_a_resnapshot() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        // How many times /v1/sessions has been asked. The first answer is empty;
+        // every later one carries the session the event announced.
+        let asks = Arc::new(AtomicUsize::new(0));
+        let server_asks = Arc::clone(&asks);
+
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    return;
+                };
+                let asks = Arc::clone(&server_asks);
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 1024];
+                    let n = sock.read(&mut buf).await.unwrap_or(0);
+                    let req = String::from_utf8_lossy(&buf[..n]).to_string();
+
+                    let json = |body: &str| {
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                             Content-Length: {}\r\n\r\n{body}",
+                            body.len()
+                        )
+                    };
+
+                    if req.contains("/v1/health") {
+                        let body = format!("{{\"app\":\"{}\"}}", shed_core::hub_client::HUB_APP_ID);
+                        let _ = sock.write_all(json(&body).as_bytes()).await;
+                    } else if req.contains("/v1/sessions") {
+                        let nth = asks.fetch_add(1, Ordering::SeqCst);
+                        let body = if nth == 0 {
+                            "{\"sessions\":[]}".to_string()
+                        } else {
+                            "{\"sessions\":[{\"slug\":\"late01\",\"tmux_session\":\"rc-late01\",\
+                             \"kind\":\"shell\",\"state\":\"ready\",\"managed\":true,\
+                             \"display_name\":\"launched later\"}]}"
+                                .to_string()
+                        };
+                        let _ = sock.write_all(json(&body).as_bytes()).await;
+                    } else if req.contains("/v1/events") {
+                        // Chunked, and never terminated: the stream stays open
+                        // exactly as a real hub's does.
+                        let head = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\
+                                    Transfer-Encoding: chunked\r\n\r\n";
+                        let _ = sock.write_all(head.as_bytes()).await;
+                        let frame = "event: session.updated\n\
+                                     data: {\"shed\":\"\",\"slug\":\"late01\",\"session\":\
+                                     {\"slug\":\"late01\",\"tmux_session\":\"rc-late01\",\
+                                     \"kind\":\"shell\",\"state\":\"ready\",\"managed\":true,\
+                                     \"display_name\":\"launched later\"}}\n\n";
+                        let _ = sock
+                            .write_all(format!("{:x}\r\n{frame}\r\n", frame.len()).as_bytes())
+                            .await;
+                        let _ = sock.flush().await;
+                        // Hold it open with heartbeats, like the real hub.
+                        loop {
+                            tokio::time::sleep(Duration::from_millis(200)).await;
+                            if sock
+                                .write_all(format!("{:x}\r\n: ok\n\n\r\n", 6).as_bytes())
+                                .await
+                                .is_err()
+                            {
+                                return;
+                            }
+                        }
+                    }
+                });
+            }
+        });
+
+        let (watcher, mut rx) = MachineHubWatcher::spawn(
+            &tokio::runtime::Handle::current(),
+            Arc::new(FixedPort(port)),
+            "mini3".to_string(),
+        );
+
+        let first = tokio::time::timeout(Duration::from_secs(10), rx.recv())
+            .await
+            .expect("a snapshot arrives")
+            .expect("channel open");
+        match first {
+            MachineHubUpdate::Snapshot { sessions } => assert!(sessions.is_empty()),
+            other => panic!("expected the opening snapshot, got {other:?}"),
+        }
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        while std::time::Instant::now() < deadline {
+            match tokio::time::timeout(Duration::from_secs(5), rx.recv()).await {
+                Ok(Some(MachineHubUpdate::Snapshot { sessions })) => {
+                    if sessions.iter().any(|s| s.slug == "late01") {
+                        watcher.stop();
+                        return;
+                    }
+                }
+                Ok(Some(MachineHubUpdate::Down { reason })) => {
+                    watcher.stop();
+                    panic!("the connection dropped — this test needs it healthy: {reason}");
+                }
+                Ok(Some(_)) => {}
+                Ok(None) => break,
+                Err(_) => break,
+            }
+        }
+        watcher.stop();
+        panic!("the late session never reached the client");
     }
 
     /// **Live check against a real machine.** `#[ignore]`d, so CI and a normal

@@ -11,6 +11,7 @@ mod approval;
 mod broker;
 mod env;
 mod ipc;
+mod machines;
 mod prefs;
 mod screenshot;
 mod single_instance;
@@ -241,15 +242,14 @@ fn open_terminal(
 async fn rc_list(
     backend: tauri::State<'_, Arc<Backend>>,
     rc: tauri::State<'_, Arc<RcService>>,
+    machines: tauri::State<'_, Arc<machines::Machines>>,
     host: Option<String>,
     shed: Option<String>,
 ) -> Result<serde_json::Value, String> {
-    let targets = backend.rc_targets(host.as_deref(), shed.as_deref()).await;
-    let sessions = rc.list(targets, host.as_deref(), shed.as_deref()).await;
-    // Same shape as the socket IPC `rc.list`: the per-shed capabilities captured
-    // during the probe (keyed by `host/shed`) gate the launch form's kind toggle.
-    let capabilities = rc.capabilities(host.as_deref(), shed.as_deref());
-    Ok(serde_json::json!({ "sessions": sessions, "capabilities": capabilities }))
+    // The SAME shaper the socket IPC `rc.list` uses — not a parallel build with
+    // a comment claiming they match (which is how machine sessions reached the
+    // IPC op but never the pane).
+    Ok(ipc::rc_list_payload(&backend, &rc, &machines, host.as_deref(), shed.as_deref()).await)
 }
 
 #[tauri::command]
@@ -288,7 +288,29 @@ async fn rc_kill(
     let target = backend
         .resolve_rc_target(host.as_deref())
         .map_err(|e| e.to_string())?;
-    rc.kill(target, &shed, &slug).await.map_err(|e| e.to_string())
+    rc.kill(target, &shed, &slug)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Kill a session on a MACHINE (plan 012 R4) — addressed by `(machine, slug)`
+/// over that machine's own SSH, not by `(host, shed, slug)` through a server.
+/// The frontend routes to this via `killSession` in `lib/bridge.ts`.
+#[tauri::command]
+async fn machine_kill(
+    machines: tauri::State<'_, Arc<machines::Machines>>,
+    machine: String,
+    slug: String,
+) -> Result<(), String> {
+    machines.kill(&machine, &slug).await
+}
+
+/// The configured machines' live health — the sessions view's machine group
+/// rows. A machine with no sessions and no reachability still gets a row; that
+/// row IS the information.
+#[tauri::command]
+fn machines_list(machines: tauri::State<'_, Arc<machines::Machines>>) -> serde_json::Value {
+    serde_json::json!({ "machines": machines.status() })
 }
 
 /// re-fetches on the `approvals-changed` event (see TauriEventSink).
@@ -337,13 +359,17 @@ async fn activity_list(
     coordinator: tauri::State<'_, Coordinator>,
     limit: Option<usize>,
 ) -> Result<serde_json::Value, String> {
-    Ok(serde_json::json!(coordinator.activity_list(limit.unwrap_or(200)).await))
+    Ok(serde_json::json!(
+        coordinator.activity_list(limit.unwrap_or(200)).await
+    ))
 }
 
 /// The namespaces the host agent delegates to us (drives which approval-prefs
 /// sections show + the "host agent · connected" indicator).
 #[tauri::command]
-async fn gate_namespaces(coordinator: tauri::State<'_, Coordinator>) -> Result<Vec<String>, String> {
+async fn gate_namespaces(
+    coordinator: tauri::State<'_, Coordinator>,
+) -> Result<Vec<String>, String> {
     Ok(coordinator.gate_namespaces().await)
 }
 
@@ -352,7 +378,12 @@ async fn gate_namespaces(coordinator: tauri::State<'_, Coordinator>) -> Result<V
 /// through serde rather than a hand-maintained enum→string match.
 pub(crate) fn ssh_prefs_wire(p: &SshPrefs) -> (String, String, String) {
     let v = serde_json::to_value(p).unwrap_or_default();
-    let field = |k: &str| v.get(k).and_then(|x| x.as_str()).unwrap_or_default().to_string();
+    let field = |k: &str| {
+        v.get(k)
+            .and_then(|x| x.as_str())
+            .unwrap_or_default()
+            .to_string()
+    };
     (field("method"), field("policy"), field("ttl"))
 }
 
@@ -362,7 +393,11 @@ pub(crate) fn ssh_prefs_wire(p: &SshPrefs) -> (String, String, String) {
 fn ssh_prefs_from_store(store: &prefs::PrefsStore) -> SshPrefs {
     let stored = store.get();
     let mut ssh = SshPrefs::default();
-    if let Some(m) = stored.ssh_method.as_deref().and_then(parse_wire::<ApprovalMethod>) {
+    if let Some(m) = stored
+        .ssh_method
+        .as_deref()
+        .and_then(parse_wire::<ApprovalMethod>)
+    {
         ssh.method = m;
     }
     if let Some(p) = stored
@@ -690,7 +725,9 @@ fn broker_set_mode(
         .try_state::<broker::BrokerRuntime>()
         .map(|rt| (rt.effective_mode_str().to_string(), rt.restart_required()))
         .unwrap_or_default();
-    Ok(serde_json::json!({ "pref": mode, "effective": effective, "restart_required": restart_required }))
+    Ok(
+        serde_json::json!({ "pref": mode, "effective": effective, "restart_required": restart_required }),
+    )
 }
 
 // -- menu-bar popover footer commands (B1b) — a 2nd webview can't call the IPC ops
@@ -797,7 +834,10 @@ pub fn run() {
     // The Agents / Remote-Control service (session store + process seam). Same
     // test-mode flag as the coordinator fakes — test mode synthesizes sessions;
     // the real path shells out `shed-ext-rc` over SSH.
-    let rc_service = Arc::new(RcService::new_default(env.test_mode, env!("CARGO_PKG_VERSION")));
+    let rc_service = Arc::new(RcService::new_default(
+        env.test_mode,
+        env!("CARGO_PKG_VERSION"),
+    ));
 
     #[allow(unused_mut)] // only the macOS+non-test arm re-binds it (the sparkle plugin)
     let mut builder = tauri::Builder::default()
@@ -849,6 +889,8 @@ pub fn run() {
             rc_list,
             rc_launch,
             rc_kill,
+            machine_kill,
+            machines_list,
             open_terminal,
             approvals_list,
             approval_decide,
@@ -999,6 +1041,50 @@ pub fn run() {
             app.manage(coordinator.clone());
             app.manage(auth_modes);
 
+            // Machine targets (plan 012 R4): one hub watcher per `machines:`
+            // entry. Started here rather than lazily so a machine's rows are
+            // already live when the Agents pane first renders — and so an
+            // unreachable machine has had a chance to say WHY by then.
+            //
+            // Reads the same config the Backend does. With no `machines:`
+            // section this is empty and costs nothing, which is the state of
+            // every existing install.
+            // **The machine RC activity hub, hosted by the app** (plan 012 R4).
+            // Started regardless of broker mode: the role binds AS A LOCK, so a
+            // daemon that already serves the port simply wins and this reports
+            // `deferred`. Gating it on embedded mode would leave nobody hosting
+            // the hub whenever a daemon is present but predates it (0.8.1 does).
+            //
+            // Held in app state so it lives as long as the app and releases the
+            // port on drop.
+            // `spawn` needs a reactor (it starts a task), so enter Tauri's
+            // runtime — the same reason the IPC bind below uses `block_on`.
+            let rc_hub = tauri::async_runtime::block_on(async {
+                shed_app::RcHubHost::spawn(
+                    format!("shed-desktop {}", env!("CARGO_PKG_VERSION")),
+                    true,
+                )
+            });
+            app.manage(Arc::new(rc_hub));
+
+            let machine_config_path = env.config_path.to_string_lossy().into_owned();
+            // A machine coming up (or dropping) is asynchronous — nothing the UI
+            // is already watching changes — so the layer pushes the SAME
+            // `refresh` event the lifecycle path uses, and the frontend's
+            // existing listener re-reads. Without this a machine that connects a
+            // second after mount stays invisible until a manual Refresh.
+            let refresh_handle = app.handle().clone();
+            let on_machine_change: machines::OnChange = Arc::new(move || {
+                let _ = refresh_handle.emit("refresh", serde_json::json!({}));
+            });
+            let machines = Arc::new(machines::Machines::start(
+                &tauri::async_runtime::handle().inner().clone(),
+                &shed_core::config::ShedConfig::load(&machine_config_path),
+                &env.machine_hub_ports,
+                on_machine_change,
+            ));
+            app.manage(machines.clone());
+
             // The terminal ops (preset resolution, launch, detection, the pref), shared
             // by the IPC handler + the frontend invoke commands (needs the Backend above).
             let terminal: termctl::SharedTerminal = Arc::new(termctl::TerminalCtl::new(
@@ -1017,6 +1103,7 @@ pub fn run() {
                 coordinator,
                 rc_service.clone(),
                 prefs,
+                machines,
             );
             // block_on enters Tauri's tokio runtime so tokio's UnixListener can
             // register with the reactor; then serve on the same runtime.

@@ -834,17 +834,65 @@ export type RcSession = {
   activity_at?: string | null;
   last_message?: string | null;
   pending_approvals?: RcFeedApproval[] | null;
+  /** Where this session was reached FROM — `machine:<name>` or `<host>/<shed>`.
+   *  Injected client-side by the backend (like `host`/`shed` already are), never
+   *  a wire field, so the hub contract and shed-mobile's DTOs are untouched.
+   *
+   *  **This is the row's identity.** Do NOT key on `shed`: a hub read directly
+   *  reports `shed: ""` on every session, so two machines sharing a slug would
+   *  collide (see `ActivityOverlay`'s `(shed, slug)` keying). Optional so a
+   *  payload from an older backend still type-checks. */
+  origin?: string | null;
+  origin_kind?: "shed" | "machine" | null;
+  /** The machine name for a machine session; absent for a shed session. */
+  machine?: string | null;
+  /** The feed behind this row is not currently live — the last known state is
+   *  being shown. A machine that is asleep or off-network is NORMAL, not an
+   *  error, so its rows stay visible and dimmed rather than vanishing. */
+  stale?: boolean | null;
 };
 
-/** The `rc.list` result: live sessions plus the per-shed capabilities captured
- *  during the probe (keyed by `host/shed`). */
-export type RcListResult = { sessions: RcSession[]; capabilities: Record<string, RcCapabilities> };
+/** A configured machine's health, for the sessions view's group rows. A machine
+ *  with no sessions AND no reachability is still worth a row — that row IS the
+ *  information ("mini3 is asleep"). */
+export type MachineStatus = {
+  name: string;
+  origin: string;
+  reachable: boolean;
+  /** Whether a snapshot has EVER arrived — distinguishes "still connecting"
+   *  from "connected, and genuinely has no sessions". */
+  connected_once: boolean;
+  sessions: number;
+  /** Why it is unreachable, verbatim from the watcher: "no route to host" and
+   *  "nothing is listening on 1029" are different problems. */
+  detail?: string | null;
+};
+
+/** The `rc.list` result: live sessions (shed AND machine), the per-shed
+ *  capabilities captured during the probe (keyed by `host/shed`), and each
+ *  configured machine's health. */
+export type RcListResult = {
+  sessions: RcSession[];
+  capabilities: Record<string, RcCapabilities>;
+  machines: MachineStatus[];
+};
+
+/** A session's stable row identity. Uses `origin` where the backend supplied it
+ *  and falls back to the legacy `host/shed` composite, so a mixed payload (or an
+ *  older backend) still produces unique keys. */
+export function sessionKey(s: RcSession): string {
+  return `${s.origin ?? `${s.host}/${s.shed}`}/${s.slug}`;
+}
 
 /** The live RC sessions + capabilities across running sheds (the same data the
  *  `rc.list` op serves the harness). Best-effort — empty in a browser / on error. */
 export async function fetchRcList(host?: string, shed?: string): Promise<RcListResult> {
   const r = await invoke<RcListResult>("rc_list", { host, shed });
-  return { sessions: r?.sessions ?? [], capabilities: r?.capabilities ?? {} };
+  return {
+    sessions: r?.sessions ?? [],
+    capabilities: r?.capabilities ?? {},
+    machines: r?.machines ?? [],
+  };
 }
 
 export type RcLaunchFields = {
@@ -870,6 +918,27 @@ export async function rcKill(shed: string, slug: string, host?: string): Promise
   await core.invoke("rc_kill", { shed, slug, host });
 }
 
+/** Kill a session on a MACHINE. THROWS on error, like `rcKill`.
+ *
+ *  Separate from `rcKill` because the two reach paths genuinely differ here and
+ *  nowhere else: a shed session is addressed by `(host, shed, slug)` through the
+ *  server's SSH endpoint, a machine session by `(machine, slug)` over the
+ *  machine's own SSH. Collapsing them behind one signature would mean passing an
+ *  empty `shed` and letting the backend guess. */
+export async function rcKillMachine(machine: string, slug: string): Promise<void> {
+  const core = await import("@tauri-apps/api/core");
+  await core.invoke("machine_kill", { machine, slug });
+}
+
+/** Kill a session, routing by its origin. The single entry point a card uses, so
+ *  the machine/shed distinction lives in ONE place instead of at every call. */
+export async function killSession(s: RcSession): Promise<void> {
+  if (s.origin_kind === "machine" && s.machine) {
+    return rcKillMachine(s.machine, s.slug);
+  }
+  return rcKill(s.shed, s.slug, s.host);
+}
+
 /** Report the rendered RC sessions so the `agents.dump` op can observe them — the
  *  drivable truth of the Agents pane, like `dashboard.dump` reads the sheds.
  *  (`ui_report` merges this `agents` key with the shell's snapshot.) */
@@ -887,9 +956,14 @@ export function reportAgents(sessions: RcSession[]): void {
 export function useRcSessions(): {
   sessions: RcSession[];
   capabilities: Record<string, RcCapabilities>;
+  machines: MachineStatus[];
   refresh: () => void;
 } {
-  const [state, setState] = useState<RcListResult>({ sessions: [], capabilities: {} });
+  const [state, setState] = useState<RcListResult>({
+    sessions: [],
+    capabilities: {},
+    machines: [],
+  });
   // A generation guard shared across the mount-, event-, and caller-driven reloads,
   // so a slower older fetch can't overwrite a newer one (the pane's superseded-fetch
   // guard, now owned here for the shared state).
@@ -917,7 +991,12 @@ export function useRcSessions(): {
       unlisten?.();
     };
   }, [refresh]);
-  return { sessions: state.sessions, capabilities: state.capabilities, refresh };
+  return {
+    sessions: state.sessions,
+    capabilities: state.capabilities,
+    machines: state.machines,
+    refresh,
+  };
 }
 
 /* ---- menu-bar popover (B1b) ------------------------------------------------ */

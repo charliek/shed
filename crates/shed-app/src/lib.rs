@@ -46,7 +46,8 @@ pub use backend::{
 #[cfg(feature = "broker")]
 pub use broker_bridge::{
     detect_mode, load_or_synthesize, probe_sockets, probe_sockets_at, resolve_mode, BrokerConfig,
-    BrokerError, DetectedMode, EffectiveMode, EmbeddedHostAgent, ModePref, ModeProbe, ResolvedMode,
+    BrokerError, DetectedMode, EffectiveMode, EmbeddedHostAgent, ModePref, ModeProbe, RcHubHost,
+    ResolvedMode,
 };
 pub use coordinator::{Coordinator, CoordinatorDeps, SshPrefs};
 pub use fakes::{AlwaysApprovedGate, FakeNotifier, NoopEventSink};

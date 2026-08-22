@@ -960,7 +960,68 @@ impl EmbeddedHostAgent {
             accepted: true,
         };
         let _ = self.inner.event_tx.send(HostAgentEvent::Connected(ack));
+
         Ok(())
+    }
+}
+
+/// **The machine RC activity hub, hosted in-process** (plan 012 R4).
+///
+/// The role graduated out of the `shed-host-agent` bin at its second consumer —
+/// the desktop app — and this is that consumer's handle on it.
+///
+/// **Deliberately independent of the credential broker.** The two merely share a
+/// process: the hub serves machine RC activity on loopback, the broker vends
+/// credentials over a UDS. Tying the hub's lifetime to the broker's MODE would
+/// leave nobody hosting it whenever a daemon is present but too old to serve it
+/// (an 0.8.1 install predates the hub entirely), and tying it to the broker's
+/// SUCCESS would take the hub down over an unrelated ssh-resolve failure.
+///
+/// Contention is handled by the role itself, which binds AS A LOCK: if a daemon
+/// already serves the port, the bind-retry FSM reports `deferred` and waits for
+/// it to go away. Starting this unconditionally is therefore safe even where a
+/// current daemon IS running.
+///
+/// Dropping the host stops the role and releases the port.
+#[cfg(feature = "broker")]
+pub struct RcHubHost {
+    status: Arc<Mutex<shed_broker::status::RcHubStatus>>,
+    shutdown: watch::Sender<bool>,
+}
+
+#[cfg(feature = "broker")]
+impl RcHubHost {
+    /// Start the role. `version` is served from `/v1/health`; `enabled` mirrors
+    /// the daemon's `rc_hub.enabled` knob (a disabled role reports itself and
+    /// touches no port).
+    ///
+    /// Must be called from within a tokio runtime.
+    pub fn spawn(version: String, enabled: bool) -> RcHubHost {
+        let status = Arc::new(Mutex::new(shed_broker::status::RcHubStatus::default()));
+        let (shutdown, rx) = watch::channel(false);
+        let log: Arc<dyn bus::BusLog> = Arc::new(bus::FileBusLog::new(""));
+        let role_status = Arc::clone(&status);
+        tokio::spawn(async move {
+            shed_broker::rc_hub::role::run_rc_hub_role(version, enabled, role_status, rx, log)
+                .await;
+        });
+        RcHubHost { status, shutdown }
+    }
+
+    /// The role's live state (`listening` / `deferred` / `disabled`, plus the
+    /// address it claimed) — for the app's status surface.
+    pub fn status(&self) -> shed_broker::status::RcHubStatus {
+        self.status
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+}
+
+#[cfg(feature = "broker")]
+impl Drop for RcHubHost {
+    fn drop(&mut self) {
+        let _ = self.shutdown.send(true);
     }
 }
 

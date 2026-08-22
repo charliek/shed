@@ -224,7 +224,8 @@ def _quit_subproc(target: str) -> None:
 
 def launch(target: str = "mac", *, mock_base_url: str, config_path: Path, state_dir: Path,
            host_agent_socket: str | None = None, unreachable_hosts: tuple[str, ...] = (),
-           credential_hosts: tuple[str, ...] = ()) -> None:
+           credential_hosts: tuple[str, ...] = (),
+           machine_hub_ports: dict[str, int] | None = None) -> None:
     """Launch the UI hermetically and block until it answers `identify`.
 
     `state_dir` is the throwaway per-session dir: on mac SHED_DESKTOP_STATE_DIR;
@@ -234,6 +235,14 @@ def launch(target: str = "mac", *, mock_base_url: str, config_path: Path, state_
     config server NAMES the backend points at a closed port instead of the mock
     (the `<PREFIX>_MOCK_UNREACHABLE_HOSTS` down-host override) so the per-host error
     row is exercisable e2e; wired for both targets, though only tauri drives it now.
+    `machine_hub_ports` maps machine NAME -> loopback port, replacing the
+    `ssh -N -L` forward with a direct connection — the test-mode-only
+    `<PREFIX>_MACHINE_HUB_PORTS` seam. Per-machine so a suite can serve a hub for
+    one and leave another unmapped (which reads as unreachable, covering the
+    everyday asleep/off-network state). That is what makes the machine path
+    testable hermetically: the harness serves a fake `/v1` hub there and the app
+    reaches it through the REAL hub client + watcher, with no ssh and no remote
+    host anywhere. Tauri-only (the mac app has no machine layer).
     `credential_hosts` are server NAMES that keep their REAL control-credential
     wiring against the mock (host agent + the config's auth_mode) instead of the
     tokenless open-mode shortcut — the agent-upgrade scenario's override, mac-only
@@ -247,7 +256,8 @@ def launch(target: str = "mac", *, mock_base_url: str, config_path: Path, state_
     elif target in _SUBPROC:
         _launch_subproc(target, mock_base_url=mock_base_url, config_path=config_path,
                         runtime_dir=state_dir, host_agent_socket=host_agent_socket,
-                        unreachable_hosts=unreachable_hosts)
+                        unreachable_hosts=unreachable_hosts,
+                        machine_hub_ports=machine_hub_ports)
     else:
         raise ValueError(f"unknown target {target!r} (want {'|'.join(TARGETS)})")
 
@@ -288,7 +298,8 @@ def _launch_mac(*, mock_base_url: str, config_path: Path, state_dir: Path,
 
 def subproc_env(cfg: _Subproc, *, runtime_dir: Path, mock_base_url: str,
                 config_path: Path, host_agent_socket: str | None = None,
-                unreachable_hosts: tuple[str, ...] = ()) -> dict[str, str]:
+                unreachable_hosts: tuple[str, ...] = (),
+                machine_hub_ports: dict[str, int] | None = None) -> dict[str, str]:
     """The launch env for a subprocess UI — the single source of the subprocess
     env-var contract, shared by the session launcher and a self-managed instance
     (down-host). HOME/XDG_RUNTIME_DIR/XDG_CONFIG_HOME are redirected to the
@@ -313,13 +324,22 @@ def subproc_env(cfg: _Subproc, *, runtime_dir: Path, mock_base_url: str,
         env[unreachable_key] = ",".join(unreachable_hosts)
     else:
         env.pop(unreachable_key, None)
+    # The machine-hub seam: every `machines:` entry is reached on this loopback
+    # port directly, instead of through an `ssh -N -L` forward. Set-or-clear for
+    # the same reason as the key above.
+    hub_key = f"{cfg.env_prefix}_MACHINE_HUB_PORTS"
+    if machine_hub_ports:
+        env[hub_key] = ",".join(f"{n}={p}" for n, p in machine_hub_ports.items())
+    else:
+        env.pop(hub_key, None)
     env.pop(f"{cfg.env_prefix}_SOCKET", None)
     return env
 
 
 def _launch_subproc(target: str, *, mock_base_url: str, config_path: Path,
                     runtime_dir: Path, host_agent_socket: str | None = None,
-                    unreachable_hosts: tuple[str, ...] = ()) -> None:
+                    unreachable_hosts: tuple[str, ...] = (),
+                    machine_hub_ports: dict[str, int] | None = None) -> None:
     cfg = _SUBPROC[target]
     if not cfg.binary.exists():
         raise RuntimeError(
@@ -327,7 +347,8 @@ def _launch_subproc(target: str, *, mock_base_url: str, config_path: Path,
             f"(tauri: `make tauri-build`).")
     env = subproc_env(cfg, runtime_dir=runtime_dir, mock_base_url=mock_base_url,
                       config_path=config_path, host_agent_socket=host_agent_socket,
-                      unreachable_hosts=unreachable_hosts)
+                      unreachable_hosts=unreachable_hosts,
+                      machine_hub_ports=machine_hub_ports)
     st = _state[target]
     st.env = env
     st.runtime_dir = runtime_dir
