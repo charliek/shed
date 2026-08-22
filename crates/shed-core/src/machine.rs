@@ -142,7 +142,16 @@ pub fn forward_argv(entry: &MachineEntry, local_port: u16, remote_port: u16) -> 
     argv.push(format!("ConnectTimeout={CONNECT_TIMEOUT_SECS}"));
     argv.extend(port_opts(entry));
     argv.push("-L".to_string());
-    argv.push(format!("{local_port}:127.0.0.1:{remote_port}"));
+    // **The bind address is explicit**, and must stay that way: with no bind
+    // address ssh binds whatever `localhost` resolves to, which on a dual-stack
+    // host is `::1` AND `127.0.0.1` — but [`crate::hub_client::HubClient`] dials
+    // `127.0.0.1` specifically. An `AddressFamily inet6` in the operator's
+    // ssh_config would then produce a forward that looks perfectly healthy on
+    // `::1` while every hub read fails on `127.0.0.1`. Pinning it makes the bind
+    // and the dial the same address by construction, and has the side benefit
+    // that a taken v4 port trips `ExitOnForwardFailure` instead of quietly
+    // succeeding on v6.
+    argv.push(format!("127.0.0.1:{local_port}:127.0.0.1:{remote_port}"));
     argv.push(user_at_host(entry));
     argv
 }
@@ -271,7 +280,12 @@ mod tests {
         let argv = forward_argv(&full(), 40123, crate::hub_client::HUB_PORT);
         assert!(argv.contains(&"-N".to_string()));
         assert!(argv.contains(&"ExitOnForwardFailure=yes".to_string()));
-        assert!(argv.windows(2).any(|w| w == ["-L", "40123:127.0.0.1:1029"]));
+        // The BIND ADDRESS is pinned, not left to `localhost` resolution — the
+        // hub client dials 127.0.0.1 specifically, so the forward must bind
+        // exactly that (see the builder's comment).
+        assert!(argv
+            .windows(2)
+            .any(|w| w == ["-L", "127.0.0.1:40123:127.0.0.1:1029"]));
         // The destination is last — nothing to run remotely.
         assert_eq!(argv.last().unwrap(), "charliek@mini2.local");
     }

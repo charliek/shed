@@ -1,0 +1,26 @@
+[project]
+name = "machine-transport"
+version = "0.1.0"
+description = "The machine-transport differential (plan 012 AC2): one shared scenario set asserted against every transport that reaches a machine over SSH — the `ssh` binary (sx + the Tauri app) here, and shed-mobile's dartssh2 in its own repo — plus the forwarded-hub family, which asserts DELIVERED FRAMES rather than mere tunnel liveness."
+requires-python = ">=3.11"
+# pytest only. The sshd is the system's, driven as a black-box subprocess; the
+# fake hub is stdlib `http.server`; the wire comparison is stdlib `json`. No
+# client library, no crypto, and never a network beyond 127.0.0.1.
+dependencies = [
+    "pytest>=8.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["."]
+addopts = "-ra --strict-markers"
+markers = [
+    "live: needs the hermetic sshd (spawned per session on 127.0.0.1)",
+]
+# Hermetic by construction: a throwaway sshd with fresh host/client keys under a
+# per-session temp dir, a loopback-only fake hub, and no contact with the
+# developer's ~/.ssh, ssh-agent, or any remote host. Warnings are errors so a
+# leaked subprocess pipe or an unreaped child cannot slip past silently.
+filterwarnings = [
+    "error",
+    "default::DeprecationWarning",
+]
