@@ -23,7 +23,7 @@ import {
   fetchApprovals, decideApproval, fetchActivity, fetchGateNamespaces,
   fetchEgressProfiles, reportEgress, inTauri,
   openPreferences, setAppearanceState,
-  rcLaunch, killSession, sessionKey, reportAgents, reportMachinesPane, useRcSessions,
+  rcLaunch, killSession, sessionKey, reportAgents, reportMachinesPane, useRcSessions, openMachineTerminal, addMachine,
   useCoordinatorData, useNowTick, shedsEmptyState, hostFailureFor,
   type Pane, type Shed, type HostDiskUsage, type HostFailure,
   type Modal, type CreateProgress, type Approval, type AuditEntry,
@@ -68,16 +68,34 @@ const NAV: [Pane, string, typeof Box][] = [
 ];
 
 /* ---- live sheds ----------------------------------------------------------- */
-/** Group sheds by host, each group + its rows in first-seen order. */
-function groupByHost(sheds: Shed[]): [string, Shed[]][] {
-  const groups: [string, Shed[]][] = [];
-  for (const s of sheds) {
-    const g = groups.find(([h]) => h === s.host);
-    if (g) g[1].push(s);
-    else groups.push([s.host, [s]]);
+/** Group rows under a key, each group + its rows in first-seen order.
+ *
+ *  First-seen rather than sorted: the order a server reports its rows in is
+ *  stable, and re-sorting would make a list reshuffle as items come and go. */
+function groupBy<T>(rows: T[], key: (row: T) => string): [string, T[]][] {
+  const groups: [string, T[]][] = [];
+  for (const r of rows) {
+    const k = key(r);
+    const g = groups.find(([gk]) => gk === k);
+    if (g) g[1].push(r);
+    else groups.push([k, [r]]);
   }
   return groups;
 }
+
+const groupByHost = (sheds: Shed[]) => groupBy(sheds, (s) => s.host);
+
+/** Where a session runs, as its group heading: `machine:<name>` for a machine,
+ *  `<host>/<shed>` for a shed. The SAME string the card used to carry as a
+ *  chip — hoisted to the heading, so it is said once per group instead of once
+ *  per row. */
+const sessionOrigin = (s: RcSession): string =>
+  // `origin` is optional on the wire; for a machine it is the only thing that
+  // names the box, so fall back to the machine name rather than grouping every
+  // machine session under one blank heading.
+  s.origin_kind === "machine"
+    ? (s.origin ?? `machine:${s.machine ?? "?"}`)
+    : `${s.host}/${s.shed}`;
 
 /** A one-line spec summary (falls back to just the status when specs are absent). */
 function metaLine(s: Shed): string {
@@ -136,6 +154,20 @@ function SidebarRow({ name, tone, note, title, onClick }:
   ) : (
     <div title={title} className={cls}>{body}</div>
   );
+}
+
+/** Is this session WAITING ON A PERSON?
+ *
+ *  The two activities that mean "it stopped and wants you" — as opposed to
+ *  `working` (busy, leave it alone) or `idle` (done, nothing owed). This is the
+ *  one distinction worth rolling up to a machine, because it is the only one
+ *  that answers "do I need to go look".
+ *
+ *  Unknown activity is NOT waiting: a session whose activity never arrived is
+ *  a session we know nothing about, and guessing "needs you" would cry wolf on
+ *  every list. */
+export function needsYou(s: RcSession): boolean {
+  return s.activity === "needs_input" || s.activity === "needs_approval";
 }
 
 /* ---- sidebar status vocabulary -------------------------------------------- */
@@ -224,6 +256,102 @@ function ShedsPane({ sheds, hostErrors, refresh, onNew }: { sheds: Shed[]; hostE
         ))
       )}
     </div>
+  );
+}
+
+/** Add a machine — a native host reached over SSH that runs the RC hub.
+ *
+ *  Mirrors the New Shed dialog because it is the same kind of act: naming a
+ *  place your sessions can run. The fields are exactly `MachineEntry`, and the
+ *  one that trips people is `sx path` — an `ssh <host> <cmd>` exec sees the
+ *  NON-login PATH, which routinely omits `~/.local/bin` and `/opt/homebrew/bin`,
+ *  so an absolute path there is the normal case rather than an exotic override.
+ */
+function NewMachineDialog({ onClose, onAdded }: { onClose: () => void; onAdded: () => void }) {
+  const fid = useId();
+  const [name, setName] = useState("");
+  const [host, setHost] = useState("");
+  const [user, setUser] = useState("");
+  const [sshPort, setSshPort] = useState("22");
+  const [rcBin, setRcBin] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const canAdd = name.trim().length > 0 && !busy;
+
+  const submit = async () => {
+    if (!canAdd) return;
+    setBusy(true);
+    setError(null);
+    try {
+      await addMachine({
+        name: name.trim(),
+        // Empty host means "same as the name", the rule the config reader
+        // already applies — so an entry for `mini3` needs one field, not two.
+        host: host.trim() || undefined,
+        user: user.trim() || undefined,
+        ssh_port: sshPort.trim() ? Number(sshPort) : undefined,
+        rc_bin: rcBin.trim() || undefined,
+      });
+      onAdded();
+      onClose();
+    } catch (e) {
+      setError(String(e));
+      setBusy(false);
+    }
+  };
+
+  return (
+    <DialogShell
+      icon={Server}
+      title="New machine"
+      sub="A computer you reach over SSH that runs the shed activity hub."
+      onClose={onClose}
+      width={540}
+      footer={
+        <>
+          <button onClick={onClose} className={dialogBtnSecondary}>Cancel</button>
+          <button
+            onClick={() => void submit()}
+            disabled={!canAdd}
+            className="hbtn inline-flex items-center gap-2 rounded-[9px] px-[22px] py-2.5 text-[14px] font-semibold"
+            style={{
+              background: canAdd ? "var(--shed-accent)" : "var(--shed-inset)",
+              color: canAdd ? "var(--shed-accent-fg)" : "var(--shed-text-muted)",
+              border: "none",
+              cursor: canAdd ? "pointer" : "default",
+            }}
+          >
+            <Plus size={16} /> {busy ? "Adding…" : "Add machine"}
+          </button>
+        </>
+      }
+    >
+      <Field label="Name" help="How it is labelled, and the handle you pass to sx as machine:<name>.">
+        <input id={`${fid}-name`} className={dialogInput} value={name} placeholder="mini3"
+          onChange={(e) => setName(e.target.value)} autoFocus />
+      </Field>
+      <Field label="Address" hint="optional" help="Hostname or IP. Defaults to the name.">
+        <input id={`${fid}-host`} className={dialogInput} value={host} placeholder="mini3"
+          onChange={(e) => setHost(e.target.value)} />
+      </Field>
+      <Field label="SSH user" hint="optional" help="Leave empty to let ssh decide (your ssh_config, then the local user).">
+        <input id={`${fid}-user`} className={dialogInput} value={user} placeholder="charliek"
+          onChange={(e) => setUser(e.target.value)} />
+      </Field>
+      <Field label="SSH port">
+        <input id={`${fid}-port`} className={dialogInput} value={sshPort} inputMode="numeric"
+          onChange={(e) => setSshPort(e.target.value)} />
+      </Field>
+      <Field label="sx path" hint="optional"
+        help="Where sx lives on that machine. An ssh exec sees the NON-login PATH, which usually omits ~/.local/bin and /opt/homebrew/bin — so an absolute path here is the normal case.">
+        <input id={`${fid}-bin`} className={dialogInput} value={rcBin} placeholder="/home/charliek/.local/bin/sx"
+          onChange={(e) => setRcBin(e.target.value)} />
+      </Field>
+      {error && (
+        <div className="text-[13px] leading-snug" style={{ color: "var(--shed-danger)" }}>{error}</div>
+      )}
+    </DialogShell>
   );
 }
 
@@ -337,14 +465,22 @@ function AgentsPane({ sessions, machines, onLaunch, refresh }:
       {sessions.length === 0 ? (
         <Empty icon={Sparkles} title="No agents running" body={emptyBody} />
       ) : (
-        <div className="flex flex-col gap-3">
-          {sessions.map((s) => (
-            // Keyed by ORIGIN, not host/shed: a machine session's shed is empty
-            // by construction, so two machines sharing a slug would otherwise
-            // collide into one React key.
-            <SessionCard key={sessionKey(s)} session={s} onKilled={refresh} onError={setError} />
-          ))}
-        </div>
+        // Grouped by where they run, the same treatment the Sheds pane gives
+        // hosts. The heading carries the origin, so a row no longer has to:
+        // said once per group instead of once per card.
+        groupBy(sessions, sessionOrigin).map(([origin, rows]) => (
+          <div key={origin} className="mb-[22px] last:mb-0">
+            <HostLabel host={origin} />
+            <div className="flex flex-col gap-3">
+              {rows.map((s) => (
+                // Keyed by ORIGIN, not host/shed: a machine session's shed is
+                // empty by construction, so two machines sharing a slug would
+                // otherwise collide into one React key.
+                <SessionCard key={sessionKey(s)} session={s} onKilled={refresh} onError={setError} />
+              ))}
+            </div>
+          </div>
+        ))
       )}
     </div>
   );
@@ -373,7 +509,8 @@ function machineDetailLine(m: MachineStatus, sessions: number): string {
  *  `detail` is shown verbatim because "no route to host" and "nothing is
  *  listening on 1029" are different problems with different fixes, and
  *  flattening them to "offline" would throw away the only actionable part. */
-function MachineCard({ machine: m, sessions }: { machine: MachineStatus; sessions: number }) {
+function MachineCard({ machine: m, sessions, waiting }:
+  { machine: MachineStatus; sessions: number; waiting: number }) {
   return (
     <div
       className={cn(cardCls, "flex items-center gap-4 px-[18px] py-4")}
@@ -381,6 +518,9 @@ function MachineCard({ machine: m, sessions }: { machine: MachineStatus; session
       data-machine={m.name}
     >
       <StatusChip tone={m.reachable ? "ok" : "attention"} label={machineStatusLabel(m)} />
+      {/* The one thing a machine can tell you that a count cannot: something on
+          it stopped and wants a person. */}
+      {waiting > 0 && <StatusChip tone="attention" label={`${waiting} waiting`} />}
       <div className="min-w-0 flex-1">
         <div className="mb-1 flex flex-wrap items-center gap-2.5">
           <span className="text-[16px] font-semibold text-shed-text">{m.name}</span>
@@ -405,23 +545,30 @@ function MachineCard({ machine: m, sessions }: { machine: MachineStatus; session
  *  `sx` reads) and are read ONCE at startup, so there is deliberately no add/edit
  *  affordance here — an in-app editor that silently needed a relaunch would be
  *  worse than the file. */
-function MachinesPane({ machines, sessions, refresh }:
-  { machines: MachineStatus[]; sessions: RcSession[]; refresh: () => void }) {
-  const [error, setError] = useState<string | null>(null);
+function MachinesPane({ machines, sessions, refresh, onNew }:
+  { machines: MachineStatus[]; sessions: RcSession[]; refresh: () => void; onNew: () => void }) {
   useEffect(() => { refresh(); }, [refresh]);
   const reachable = machines.filter((m) => m.reachable).length;
 
   // Grouped by ORIGIN, never by shed: a hub reports an EMPTY shed on every
   // machine session, so two machines sharing a slug would collide into one row.
-  const grouped = machines.map((m) => ({ machine: m, rows: sessions.filter((s) => s.origin === m.origin) }));
+  //
+  // This pane is about the MACHINES, not what runs on them — sessions live in
+  // Agents, grouped by origin. What a machine owes you here is a count, and
+  // whether any of its sessions is waiting on you.
+  const grouped = machines.map((m) => {
+    const rows = sessions.filter((s) => s.origin === m.origin);
+    return { machine: m, rows, waiting: rows.filter(needsYou).length };
+  });
 
-  const reported = grouped.map(({ machine: m, rows }) => ({
+  const reported = grouped.map(({ machine: m, rows, waiting }) => ({
     name: m.name,
     origin: m.origin,
     reachable: m.reachable,
     status: machineStatusLabel(m),
     detail: machineDetailLine(m, rows.length),
     sessions: rows.map((s) => s.slug),
+    waiting,
   }));
   // Publish what this pane rendered — keyed on the VALUE, so an unrelated parent
   // re-render (the 5s shed poll, an approval, an appearance flip) does not
@@ -444,13 +591,13 @@ function MachinesPane({ machines, sessions, refresh }:
             {reachable} of {machines.length} reachable
           </span>
         }
-        right={<RefreshHeadButton onClick={refresh} />}
+        right={
+          <div className="flex items-center gap-[18px]">
+            <RefreshHeadButton onClick={refresh} />
+            <HeadAction icon={Plus} label="New machine" color="var(--shed-accent)" onClick={onNew} />
+          </div>
+        }
       />
-      {error && (
-        <div className={cn(cardCls, "mb-3 flex items-start gap-2 p-3.5 text-[13px]")} style={{ borderColor: "var(--shed-danger)", color: "var(--shed-danger)" }}>
-          <X size={16} className="mt-px flex-none" /> <span className="min-w-0 break-words">{error}</span>
-        </div>
-      )}
       {machines.length === 0 ? (
         <Empty
           icon={Server}
@@ -458,16 +605,11 @@ function MachinesPane({ machines, sessions, refresh }:
           body="A machine is a computer you reach over SSH that runs the shed activity hub. Add one under machines: in ~/.shed/config.yaml."
         />
       ) : (
-        grouped.map(({ machine: m, rows }) => (
-          <div key={m.origin} className="mb-[22px] flex flex-col gap-3 last:mb-0">
-            <MachineCard machine={m} sessions={rows.length} />
-            {rows.map((s) => (
-              <div key={sessionKey(s)} className="pl-[18px]">
-                <SessionCard session={s} onKilled={refresh} onError={setError} />
-              </div>
-            ))}
-          </div>
-        ))
+        <div className="flex flex-col gap-3">
+          {grouped.map(({ machine: m, rows, waiting }) => (
+            <MachineCard key={m.origin} machine={m} sessions={rows.length} waiting={waiting} />
+          ))}
+        </div>
       )}
     </div>
   );
@@ -501,14 +643,6 @@ function SessionCard({ session: s, onKilled, onError }: { session: RcSession; on
         <div className="mb-1 flex flex-wrap items-center gap-2.5">
           <span className="text-[16px] font-semibold text-shed-text">{s.display_name}</span>
           <KindBadge kind={s.kind} />
-          {machine && (
-            <span
-              className="rounded bg-shed-inset px-1.5 py-0.5 font-mono text-[10px] font-semibold text-shed-text-muted"
-              title={`Reached over SSH to ${s.machine}, not through a shed server`}
-            >
-              {s.origin}
-            </span>
-          )}
           {!s.managed && <span className="rounded bg-shed-inset px-1.5 py-0.5 font-mono text-[10px] font-semibold text-shed-text-muted">legacy</span>}
         </div>
         <div className="truncate font-mono text-[12px] text-shed-text-muted">
@@ -521,12 +655,17 @@ function SessionCard({ session: s, onKilled, onError }: { session: RcSession; on
             <ExternalLink size={14} /> Open in Claude
           </a>
         )}
-        {/* The terminal opener resolves a SHED's ssh endpoint through the
-            server; a machine session has no shed, so it is not offered rather
-            than offered-and-broken. */}
-        {!machine && (
+        {/* Every session opens in a terminal, whichever kind of place it runs
+            in. A shed resolves through its server's ssh endpoint; a machine
+            through its own config entry — the difference is the address, and a
+            person opening a session should not have to care which they have. */}
+        {(
           <button
-            onClick={() => void openTerminal(s.shed, s.host, s.tmux_session)}
+            onClick={() =>
+              void (machine
+                ? openMachineTerminal(s.machine ?? "", s.slug)
+                : openTerminal(s.shed, s.host, s.tmux_session))
+            }
             title={claude ? "Open the session in a terminal" : "Open in Terminal"}
             className="hbtn inline-flex items-center rounded-[9px] px-[18px] py-2.5 font-mono text-[13px] font-medium"
             style={{ background: "var(--shed-btn-dark)", color: "var(--shed-btn-dark-fg)", border: "none" }}
@@ -1432,7 +1571,7 @@ export default function App() {
         <main className="flex-1 overflow-auto bg-shed-bg px-[38px] pb-6 pt-7">
           <div data-pane={pane} className="mx-auto max-w-[880px]">
             {pane === "sheds" && <ShedsPane sheds={sheds} hostErrors={hostErrors} refresh={refresh} onNew={() => setModal("create")} />}
-            {pane === "machines" && <MachinesPane machines={rcMachines} sessions={rcSessions} refresh={refreshRc} />}
+            {pane === "machines" && <MachinesPane machines={rcMachines} sessions={rcSessions} refresh={refreshRc} onNew={() => setModal("machine")} />}
             {pane === "approvals" && <ApprovalsPane approvals={approvals} />}
             {pane === "agents" && <AgentsPane sessions={rcSessions} machines={rcMachines} onLaunch={() => setModal("launch")} refresh={refreshRc} />}
             {pane === "activity" && <ActivityPane />}
@@ -1442,6 +1581,7 @@ export default function App() {
         </main>
       </div>
       {modal === "create" && <NewShedDialog refresh={refresh} onClose={() => setModal(null)} />}
+      {modal === "machine" && <NewMachineDialog onClose={() => setModal(null)} onAdded={refreshRc} />}
       {modal === "launch" && <LaunchAgentDialog sheds={sheds} capabilities={rcCapabilities} refresh={refreshRc} onClose={() => setModal(null)} onLaunched={onLaunched} />}
     </div>
   );

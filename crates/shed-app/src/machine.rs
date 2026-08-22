@@ -422,6 +422,35 @@ pub async fn exec(
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
+/// The interactive `ssh -t … tmux attach` command that opens a machine session
+/// in a terminal — the machine counterpart of `Backend::terminal_preview`.
+///
+/// Returned as a [`TerminalCommand`] (argv PLUS the re-parseable quoted line)
+/// because a terminal opener is handed one string: a preset drops `command`
+/// into an AppleScript/`-e` invocation, so the quoting has to survive that trip
+/// intact. Same shape the shed path returns, so the caller above needs no idea
+/// which kind of target it is holding — which is the point.
+pub fn terminal_command(
+    entry: &shed_core::config::MachineEntry,
+    slug: &str,
+) -> shed_core::terminal::TerminalCommand {
+    let argv = machine::tty_argv(
+        entry,
+        &[
+            "tmux".to_string(),
+            "attach".to_string(),
+            "-t".to_string(),
+            shed_core::rc::tmux_name(slug),
+        ],
+    );
+    // The MINIMAL quoter for the outer line — `tty_argv` has already quoted the
+    // remote command internally (that is its safety property), and quoting the
+    // result again would be correct but unreadable. The shed path's line is
+    // built the same way, so a preview reads alike whichever kind it is.
+    let command = shed_core::terminal::quote_argv(&argv);
+    shed_core::terminal::TerminalCommand { argv, command }
+}
+
 /// Kill a session on a machine (idempotent — the engine exits 0 for a session
 /// that is already gone).
 pub async fn kill(entry: &shed_core::config::MachineEntry, slug: &str) -> Result<(), String> {

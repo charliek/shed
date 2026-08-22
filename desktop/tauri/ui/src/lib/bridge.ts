@@ -4,7 +4,7 @@ export type Pane = "sheds" | "machines" | "approvals" | "agents" | "activity" | 
 
 /** Which modal (if any) is open — reported so the harness can drive + assert it.
  *  (Preferences is a dedicated window, not a modal — see `reportPrefs`.) */
-export type Modal = null | "create" | "launch";
+export type Modal = null | "create" | "launch" | "machine";
 
 const PANES: readonly Pane[] = ["sheds", "machines", "approvals", "agents", "activity", "egress", "system"];
 
@@ -543,6 +543,37 @@ export async function setBrokerMode(
 export async function openTerminal(shed: string, host: string, session?: string): Promise<void> {
   if (!inTauri()) return;
   await invoke("open_terminal", { shed, host, session });
+}
+
+/** The fields a new machine needs — exactly `shed_core::config::MachineEntry`.
+ *  Everything but `name` is optional and falls back to the config reader's own
+ *  defaults, so adding `mini3` really is one field. */
+export type NewMachine = {
+  name: string;
+  host?: string;
+  user?: string;
+  ssh_port?: number;
+  rc_bin?: string;
+};
+
+/** Append a machine to `~/.shed/config.yaml` and start watching it.
+ *
+ *  Throws with the backend's message on a duplicate name or an unwritable
+ *  config — the dialog shows it rather than closing on a failure. */
+export async function addMachine(m: NewMachine): Promise<void> {
+  if (!inTauri()) return;
+  const core = await import("@tauri-apps/api/core");
+  await core.invoke("add_machine", { machine: m });
+}
+
+/** Open a MACHINE session in a terminal (`ssh -t … tmux attach`).
+ *
+ *  Takes the SLUG, not the tmux name the shed path passes: a machine's pane
+ *  name is derived host-side from the slug, so handing over the derived name
+ *  would mean two places agreeing about the `rc-` prefix instead of one. */
+export async function openMachineTerminal(machine: string, slug: string): Promise<void> {
+  if (!inTauri()) return;
+  await invoke("open_terminal", { machine, session: slug, shed: "", host: null });
 }
 
 /* ---- create (the New-Shed dialog) ----------------------------------------- */

@@ -10,7 +10,7 @@ use std::sync::Arc;
 use serde_json::{json, Value};
 
 use shed_app::Backend;
-use shed_core::terminal::{self, TerminalPreset};
+use shed_core::terminal::{self, TerminalCommand, TerminalPreset};
 
 use crate::prefs::SharedPrefs;
 
@@ -86,15 +86,56 @@ impl TerminalCtl {
             .backend
             .terminal_preview(host, shed, session)
             .map_err(|e| err("action_failed", e.to_string()))?;
+        self.preview_resolved(&cmd, shed, preset, template)
+    }
+
+    /// Preview an ALREADY-BUILT command — the seam a machine session enters by.
+    ///
+    /// Everything from here down (preset resolution, the opener invocation) is
+    /// identical for a shed and a machine, and must stay that way: the user's
+    /// chosen terminal is a property of the user, not of what they are opening.
+    /// `title` labels the window.
+    pub fn preview_command(
+        &self,
+        cmd: &TerminalCommand,
+        title: &str,
+        params: &Value,
+    ) -> Result<Value, TermError> {
+        let (preset, template) = pref_params(params);
+        self.preview_resolved(cmd, title, preset.as_deref(), template)
+    }
+
+    fn preview_resolved(
+        &self,
+        cmd: &TerminalCommand,
+        title: &str,
+        preset: Option<&str>,
+        template: Option<String>,
+    ) -> Result<Value, TermError> {
         let (preset, template) = self.resolve_pref(preset, template)?;
         let inv =
-            terminal::resolve_launch(preset, &cmd, shed, template.as_deref(), self.scripts_dir.as_deref());
+            terminal::resolve_launch(preset, cmd, title, template.as_deref(), self.scripts_dir.as_deref());
         Ok(json!({
             "argv": cmd.argv,
             "command": cmd.command,
             "preset": preset,
             "invocation": inv,
         }))
+    }
+
+    /// Spawn an ALREADY-BUILT command (the machine path's `open`).
+    pub fn spawn_command(
+        &self,
+        cmd: &TerminalCommand,
+        title: &str,
+        params: &Value,
+    ) -> Result<Value, TermError> {
+        let (preset, template) = pref_params(params);
+        let (preset, template) = self.resolve_pref(preset.as_deref(), template)?;
+        let inv =
+            terminal::resolve_launch(preset, cmd, title, template.as_deref(), self.scripts_dir.as_deref());
+        self.spawn(&inv)?;
+        Ok(json!({ "command": cmd.command }))
     }
 
     /// Spawn the resolved opener. The CALLER enforces the test-mode gate (a spawn
@@ -114,16 +155,22 @@ impl TerminalCtl {
         let (preset, template) = self.resolve_pref(preset, template)?;
         let inv =
             terminal::resolve_launch(preset, &cmd, shed, template.as_deref(), self.scripts_dir.as_deref());
+        self.spawn(&inv)?;
+        Ok(json!({ "command": cmd.command }))
+    }
+
+    /// Launch the resolved opener and reap it, so a short-lived helper does not
+    /// linger as a zombie. Shared by the shed and machine spawn paths.
+    fn spawn(&self, inv: &terminal::LaunchInvocation) -> Result<(), TermError> {
         let child = Command::new(&inv.executable)
             .args(&inv.arguments)
             .spawn()
             .map_err(|e| err("action_failed", format!("spawn {}: {e}", inv.executable)))?;
-        // Reap the short-lived opener so it doesn't linger as a zombie.
         std::thread::spawn(move || {
             let mut child = child;
             let _ = child.wait();
         });
-        Ok(json!({ "command": cmd.command }))
+        Ok(())
     }
 
     /// The preset + template for an op: an explicit `preset` wins (with its
@@ -142,6 +189,20 @@ impl TerminalCtl {
             }
         }
     }
+}
+
+/// The `preset` / `template` overrides an op may carry.
+fn pref_params(params: &Value) -> (Option<String>, Option<String>) {
+    (
+        params
+            .get("preset")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        params
+            .get("template")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+    )
 }
 
 /// Parse an explicit preset string (kebab), or a `bad_request` naming it.

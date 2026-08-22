@@ -430,6 +430,7 @@ impl Handler {
             "machines.dump" => Ok(self.machines_dump()),
             "sidebar.dump" => Ok(self.sidebar_dump()),
             "machine.kill" => self.machine_kill(params).await,
+            "machine.add" => self.machine_add(params),
             "agents.dump" => Ok(self.agents_dump()),
             "prefs.get" => Ok(self.prefs_get()),
             "prefs.set_terminal" => self.prefs_set_terminal(params),
@@ -736,6 +737,9 @@ impl Handler {
     /// command + resolved preset/invocation, WITHOUT spawning. `shed` (not `name`)
     /// matches the mac contract; gtk has no terminal.
     fn terminal_preview(&self, params: &Value) -> Result<Value, (String, String)> {
+        if let Some(machine) = params.get("machine").and_then(Value::as_str) {
+            return self.machine_terminal(machine, params);
+        }
         let shed = req_str(params, "shed")?;
         self.terminal.preview(
             params.get("host").and_then(Value::as_str),
@@ -759,6 +763,10 @@ impl Handler {
                 "terminal.open is disabled in test mode (use terminal.preview)",
             ));
         }
+        if let Some(machine) = params.get("machine").and_then(Value::as_str) {
+            let cmd = self.machine_terminal_command(machine, params)?;
+            return self.terminal.spawn_command(&cmd, machine, params);
+        }
         let shed = req_str(params, "shed")?;
         self.terminal.open(
             params.get("host").and_then(Value::as_str),
@@ -770,6 +778,28 @@ impl Handler {
                 .and_then(Value::as_str)
                 .map(str::to_string),
         )
+    }
+
+    /// The `ssh -t … tmux attach` command for a MACHINE session, resolved
+    /// through the same watcher that owns the machine's config entry.
+    fn machine_terminal_command(
+        &self,
+        machine: &str,
+        params: &Value,
+    ) -> Result<shed_core::terminal::TerminalCommand, (String, String)> {
+        let slug = req_str(params, "slug")?;
+        self.machines
+            .terminal_command(machine, slug)
+            .map_err(|e| err("bad_request", e))
+    }
+
+    /// `terminal.preview {machine, slug}` → the resolved command WITHOUT
+    /// spawning, so the harness can assert the wire the opener would run.
+    fn machine_terminal(&self, machine: &str, params: &Value) -> Result<Value, (String, String)> {
+        let cmd = self.machine_terminal_command(machine, params)?;
+        self.terminal
+            .preview_command(&cmd, machine, params)
+            .map_err(|e| (e.0, e.1))
     }
 
     /// `terminal.presets` → the offerable presets + install detection.
@@ -822,6 +852,18 @@ impl Handler {
     /// ("mini3 is asleep"), and a sessions-only payload has nowhere to put it.
     fn machines_list(&self) -> Value {
         json!({ "machines": self.machines.status() })
+    }
+
+    /// `machine.add {name, host?, user?, ssh_port?, rc_bin?}` → append the
+    /// machine to the shed config and start watching it.
+    ///
+    /// The same implementation the Add dialog invokes — the harness drives the
+    /// op, the dialog drives the command, and both land in
+    /// `machines::add_from_json`, so what is tested is what ships.
+    fn machine_add(&self, params: &Value) -> Result<Value, (String, String)> {
+        crate::machines::add_from_json(&self.machines, &self.env.config_path, params)
+            .map(|()| json!({}))
+            .map_err(|e| err("bad_request", e))
     }
 
     /// `machines.dump` → what the MACHINES PANE actually rendered (UI truth, like

@@ -46,6 +46,22 @@ pub fn ssh_command(
     TerminalCommand { argv, command }
 }
 
+/// Join an argv into a re-parseable command line, quoting only what needs it.
+///
+/// The MINIMAL quoter — the same one `ssh_command` builds its line with — so a
+/// preview or an opener invocation reads like something you would type. Note it
+/// is deliberately not `machine::display_line`, which quotes every element
+/// always: that one exists to produce the single remote-command string ssh
+/// hands to a remote shell, where quoting everything is the safety property.
+/// Quoting an already-quoted element again is correct but unreadable, and this
+/// line is meant to be read.
+pub fn quote_argv(argv: &[String]) -> String {
+    argv.iter()
+        .map(|a| shell_quote(a))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 /// The shared `-o` host-key options: strict checking against the shed CLI's
 /// `known_hosts`. Used by both the interactive terminal ssh (`ssh_command`) and
 /// the non-interactive RC ssh (`rc::ssh_argv`), so the two never drift. Mirrors

@@ -80,18 +80,111 @@ impl MachineState {
 pub struct Machines {
     /// Keyed by machine NAME, which is also the origin handle (`machine:<name>`).
     state: Arc<Mutex<BTreeMap<String, MachineState>>>,
-    /// Held so the watchers (and their forwards) live as long as the app does.
-    /// Dropping a watcher aborts its loop and tears down its `ssh -N -L` child.
-    _watchers: Vec<MachineHubWatcher>,
+    /// The machines this app knows about, and the watchers keeping them live.
+    ///
+    /// Behind a lock because the set GROWS: adding a machine has to start
+    /// watching it now, not on the next launch. A relaunch-to-see-it would be a
+    /// worse affordance than editing the config by hand, which is what this
+    /// replaces.
+    reg: Mutex<Registry>,
+    /// Kept so a machine added later gets a watcher on the same runtime, with
+    /// the same test-mode forward substitution and the same change callback as
+    /// the ones started at boot — one code path, not two.
+    handle: tokio::runtime::Handle,
+    test_hub_ports: std::collections::HashMap<String, u16>,
+    on_change: OnChange,
+}
+
+/// Append a machine to the shed config, then start watching it.
+///
+/// Shared by the Tauri command (the dialog's path) and the IPC op (the
+/// harness's), so the thing under test is the thing that ships. Two steps, in
+/// this order, because they fail differently: the config write is the durable
+/// half and refuses a duplicate, while a watcher that cannot reach its machine
+/// is still a legitimate row. Writing first also means a failed start leaves a
+/// configured machine the next launch picks up, rather than a watcher with
+/// nothing behind it.
+///
+/// The write is INSERT-ONLY (see `shed_core::config_edit`) and takes a backup
+/// first: that file is hand-maintained, and this app is a guest in it.
+pub fn add_from_json(
+    machines: &Machines,
+    path: &std::path::Path,
+    machine: &Value,
+) -> Result<(), String> {
+    use shed_core::config_edit::{insert_machine, NewMachine};
+
+    let name = machine
+        .get("name")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    let field = |k: &str| {
+        machine
+            .get(k)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .map(str::to_string)
+    };
+    let (host, user, rc_bin) = (field("host"), field("user"), field("rc_bin"));
+    let ssh_port = machine
+        .get("ssh_port")
+        .and_then(Value::as_u64)
+        .and_then(|p| u16::try_from(p).ok());
+
+    let text = std::fs::read_to_string(path).unwrap_or_default();
+    let updated = insert_machine(
+        &text,
+        &NewMachine {
+            name: &name,
+            host: host.as_deref(),
+            user: user.as_deref(),
+            ssh_port,
+            rc_bin: rc_bin.as_deref(),
+        },
+    )
+    .map_err(|e| e.to_string())?;
+
+    if !text.is_empty() {
+        let backup = path.with_extension("yaml.bak");
+        std::fs::write(&backup, &text)
+            .map_err(|e| format!("could not back up {}: {e}", backup.display()))?;
+    }
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    }
+    std::fs::write(path, &updated).map_err(|e| format!("{}: {e}", path.display()))?;
+
+    // Re-read rather than trusting our own construction: whatever the READER
+    // makes of the file is what every other client sees, so the watcher should
+    // start from that and not from the form.
+    let entry = ShedConfig::parse(&updated)
+        .machine(&name)
+        .cloned()
+        .ok_or_else(|| format!("{name:?} was written but does not parse back"))?;
+    machines.add(entry)
+}
+
+/// The mutable half of [`Machines`]: the configured set and its live watchers.
+///
+/// `names` carries ORDER (config order, then arrival order) because the UI
+/// lists machines in it; `entries` is the lookup control verbs resolve through;
+/// `watchers` is held only so dropping it tears down the ssh children.
+struct Registry {
     names: Vec<String>,
     /// The entry each watcher was STARTED with, keyed by name.
     ///
-    /// Control verbs use this rather than re-reading the config, so a kill can
-    /// never address a different host than the row the user is looking at: if
-    /// `machines:` is edited to repoint `mini3` mid-session, the watcher (and
-    /// therefore the displayed rows) still belong to the old entry until the app
-    /// restarts, and the kill must follow the rows.
+    /// Control verbs resolve through this rather than re-reading the config, so
+    /// a kill can never address a different host than the row the user is
+    /// looking at: if `machines:` is edited to repoint `mini3` mid-session, the
+    /// watcher (and therefore the displayed rows) still belong to the old entry,
+    /// and the kill must follow the rows.
     entries: BTreeMap<String, MachineEntry>,
+    /// Held so the watchers (and their forwards) live as long as the app does.
+    /// Dropping one aborts its loop and tears down its `ssh -N -L` child.
+    watchers: Vec<MachineHubWatcher>,
 }
 
 impl Machines {
@@ -114,48 +207,85 @@ impl Machines {
         test_hub_ports: &std::collections::HashMap<String, u16>,
         on_change: OnChange,
     ) -> Machines {
-        let state = Arc::new(Mutex::new(BTreeMap::new()));
-        let mut watchers = Vec::new();
-        let mut names = Vec::new();
-        let mut entries = BTreeMap::new();
-
+        let machines = Machines {
+            state: Arc::new(Mutex::new(BTreeMap::new())),
+            reg: Mutex::new(Registry {
+                names: Vec::new(),
+                entries: BTreeMap::new(),
+                watchers: Vec::new(),
+            }),
+            handle: handle.clone(),
+            test_hub_ports: test_hub_ports.clone(),
+            on_change,
+        };
         for entry in &config.machines {
-            names.push(entry.name.clone());
-            entries.insert(entry.name.clone(), entry.clone());
-            state
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .insert(entry.name.clone(), MachineState::new());
+            machines.watch(entry.clone());
+        }
+        machines
+    }
 
-            let forward = match build_forward(entry, test_hub_ports) {
-                Ok(forward) => forward,
-                Err(e) => {
-                    // Reserving a local port failed — record it and move on. A
-                    // machine that cannot be reached is a row, not an error.
-                    let mut guard = state.lock().unwrap_or_else(|e| e.into_inner());
-                    if let Some(m) = guard.get_mut(&entry.name) {
-                        m.detail = Some(e);
-                    }
-                    continue;
+    /// Start watching one machine: register it, seed its row, and spawn its
+    /// watcher + consumer.
+    ///
+    /// The SINGLE path a machine enters by, whether it came from the config at
+    /// boot or from the Add dialog a minute ago — so a machine added later
+    /// behaves identically rather than nearly so.
+    fn watch(&self, entry: MachineEntry) {
+        {
+            let mut reg = self.reg.lock().unwrap_or_else(|e| e.into_inner());
+            reg.names.push(entry.name.clone());
+            reg.entries.insert(entry.name.clone(), entry.clone());
+        }
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(entry.name.clone(), MachineState::new());
+
+        let forward = match build_forward(&entry, &self.test_hub_ports) {
+            Ok(forward) => forward,
+            Err(e) => {
+                // Reserving a local port failed — record it and move on. A
+                // machine that cannot be reached is a row, not an error.
+                let mut guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
+                if let Some(m) = guard.get_mut(&entry.name) {
+                    m.detail = Some(e);
                 }
-            };
+                return;
+            }
+        };
 
-            let (watcher, rx) = MachineHubWatcher::spawn(handle, forward, entry.name.clone());
-            watchers.push(watcher);
-            handle.spawn(consume(
-                entry.name.clone(),
-                rx,
-                Arc::clone(&state),
-                on_change.clone(),
-            ));
-        }
+        let (watcher, rx) = MachineHubWatcher::spawn(&self.handle, forward, entry.name.clone());
+        self.reg
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .watchers
+            .push(watcher);
+        self.handle.spawn(consume(
+            entry.name,
+            rx,
+            Arc::clone(&self.state),
+            self.on_change.clone(),
+        ));
+    }
 
-        Machines {
-            state,
-            _watchers: watchers,
-            names,
-            entries,
+    /// Add a machine and start watching it now.
+    ///
+    /// Rejects a name already being watched rather than shadowing it: two rows
+    /// with one name is a UI that cannot be reasoned about, and the config write
+    /// upstream refuses the same case for the same reason.
+    pub fn add(&self, entry: MachineEntry) -> Result<(), String> {
+        if self
+            .reg
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entries
+            .contains_key(&entry.name)
+        {
+            return Err(format!("a machine named {:?} is already watched", entry.name));
         }
+        self.watch(entry);
+        (self.on_change)();
+        Ok(())
     }
 
     /// The sessions AND the per-machine health, read under ONE lock.
@@ -202,19 +332,41 @@ impl Machines {
     /// is authoritative and will restore the row if the kill somehow did not
     /// take.
     pub async fn kill(&self, machine: &str, slug: &str) -> Result<(), String> {
-        let entry = self.entries.get(machine).cloned().ok_or_else(|| {
-            let known: Vec<&str> = self.names.iter().map(String::as_str).collect();
-            format!(
-                "no machine {machine:?} is being watched (have: {})",
-                known.join(", ")
-            )
-        })?;
+        let entry = self.entry(machine)?;
         shed_app::machine::kill(&entry, slug).await?;
         let mut guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(m) = guard.get_mut(machine) {
             m.sessions.retain(|s| s.slug != slug);
         }
         Ok(())
+    }
+
+    /// The interactive `ssh -t … tmux attach` command for one of this machine's
+    /// sessions — what a terminal opener spawns.
+    ///
+    /// A shed session has had this since the beginning; a machine session did
+    /// not, which left it with no way in at all on the desktop. The command is
+    /// built from the SAME `MachineEntry` the watcher and `kill` use, so the
+    /// terminal lands on the host the rest of the app is talking about.
+    pub fn terminal_command(
+        &self,
+        machine: &str,
+        slug: &str,
+    ) -> Result<shed_core::terminal::TerminalCommand, String> {
+        let entry = self.entry(machine)?;
+        Ok(shed_app::machine::terminal_command(&entry, slug))
+    }
+
+    /// One watched machine's config entry, or an error naming the ones there are.
+    fn entry(&self, machine: &str) -> Result<MachineEntry, String> {
+        let reg = self.reg.lock().unwrap_or_else(|e| e.into_inner());
+        reg.entries.get(machine).cloned().ok_or_else(|| {
+            let known: Vec<&str> = reg.names.iter().map(String::as_str).collect();
+            format!(
+                "no machine {machine:?} is being watched (have: {})",
+                known.join(", ")
+            )
+        })
     }
 
     /// Per-machine health, for the UI's machine group headers.
@@ -224,7 +376,15 @@ impl Machines {
     }
 
     fn status_locked(&self, guard: &BTreeMap<String, MachineState>) -> Vec<Value> {
-        self.names
+        // Config order, then arrival order — a machine added mid-session appears
+        // at the end rather than reshuffling the list someone is looking at.
+        let names = self
+            .reg
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .names
+            .clone();
+        names
             .iter()
             .map(|name| {
                 let m = guard.get(name);
@@ -385,6 +545,24 @@ fn apply_event(m: &mut MachineState, event: &shed_core::rc_events::RcEvent) {
 
 #[cfg(test)]
 mod tests {
+    /// A `Machines` with no watchers, over a pre-seeded state map — for the
+    /// readers (snapshot/status), which are the part worth testing without a
+    /// runtime. One constructor rather than a struct literal per test, so the
+    /// fields can change without touching every case.
+    fn fixture(state: Arc<Mutex<BTreeMap<String, MachineState>>>, names: &[&str]) -> Machines {
+        Machines {
+            state,
+            reg: Mutex::new(Registry {
+                names: names.iter().map(|s| s.to_string()).collect(),
+                entries: BTreeMap::new(),
+                watchers: Vec::new(),
+            }),
+            handle: tokio::runtime::Handle::current(),
+            test_hub_ports: Default::default(),
+            on_change: std::sync::Arc::new(|| {}),
+        }
+    }
+
     use super::*;
 
     fn config_with(names: &[&str]) -> ShedConfig {
@@ -436,8 +614,9 @@ mod tests {
 
     /// Sessions carry their ORIGIN, and never a shed — the field the UI must not
     /// key on (§3b.1c: two machines' empty sheds would collide).
-    #[test]
-    fn sessions_are_stamped_with_their_origin_and_no_shed() {
+    // `#[tokio::test]` only for the reactor `fixture` needs; nothing here awaits.
+    #[tokio::test]
+    async fn sessions_are_stamped_with_their_origin_and_no_shed() {
         let state = Arc::new(Mutex::new(BTreeMap::new()));
         let mut m = MachineState::new();
         m.reachable = true;
@@ -449,12 +628,7 @@ mod tests {
         .expect("fixture decodes")];
         state.lock().unwrap().insert("mini3".to_string(), m);
 
-        let machines = Machines {
-            state,
-            _watchers: Vec::new(),
-            names: vec!["mini3".to_string()],
-            entries: BTreeMap::new(),
-        };
+        let machines = fixture(state, &["mini3"]);
         let rows = machines.snapshot().0;
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0]["origin"], json!("machine:mini3"));
@@ -467,8 +641,9 @@ mod tests {
 
     /// A disconnect marks rows STALE but keeps them on screen — blanking the
     /// machine on every blip is worse than showing a last-known view.
-    #[test]
-    fn a_disconnect_marks_rows_stale_without_dropping_them() {
+    // `#[tokio::test]` only for the reactor `fixture` needs; nothing here awaits.
+    #[tokio::test]
+    async fn a_disconnect_marks_rows_stale_without_dropping_them() {
         let state = Arc::new(Mutex::new(BTreeMap::new()));
         let mut m = MachineState::new();
         m.reachable = false;
@@ -481,12 +656,7 @@ mod tests {
         .expect("fixture decodes")];
         state.lock().unwrap().insert("mini2".to_string(), m);
 
-        let machines = Machines {
-            state,
-            _watchers: Vec::new(),
-            names: vec!["mini2".to_string()],
-            entries: BTreeMap::new(),
-        };
+        let machines = fixture(state, &["mini2"]);
         let rows = machines.snapshot().0;
         assert_eq!(rows.len(), 1, "rows survive a disconnect");
         assert_eq!(rows[0]["stale"], json!(true));

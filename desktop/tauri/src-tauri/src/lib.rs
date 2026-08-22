@@ -218,13 +218,29 @@ fn set_terminal_pref(
 #[tauri::command]
 fn open_terminal(
     terminal: tauri::State<'_, termctl::SharedTerminal>,
+    machines: tauri::State<'_, Arc<machines::Machines>>,
     env: tauri::State<'_, Env>,
     shed: String,
     host: Option<String>,
     session: Option<String>,
+    machine: Option<String>,
 ) -> Result<(), String> {
     if env.test_mode {
         return Err("terminal.open is disabled in test mode (use terminal.preview)".to_string());
+    }
+    // A MACHINE session resolves through the watcher that owns its config entry,
+    // not through a shed server — but from here down (preset, opener, spawn) the
+    // two are identical, because which terminal to open is a property of the
+    // user, not of what they are opening.
+    if let Some(machine) = machine.as_deref() {
+        let slug = session
+            .as_deref()
+            .ok_or_else(|| "a machine terminal needs the session slug".to_string())?;
+        let cmd = machines.terminal_command(machine, slug)?;
+        return terminal
+            .spawn_command(&cmd, machine, &serde_json::Value::Null)
+            .map(|_| ())
+            .map_err(|(_code, msg)| msg);
     }
     terminal
         .open(host.as_deref(), &shed, session.as_deref(), None, None)
@@ -303,6 +319,16 @@ async fn machine_kill(
     slug: String,
 ) -> Result<(), String> {
     machines.kill(&machine, &slug).await
+}
+
+/// `add_machine` — the dialog's path into [`machines::add_from_json`].
+#[tauri::command]
+fn add_machine(
+    machines: tauri::State<'_, Arc<machines::Machines>>,
+    env: tauri::State<'_, Env>,
+    machine: serde_json::Value,
+) -> Result<(), String> {
+    machines::add_from_json(&machines, &env.config_path, &machine)
 }
 
 /// The configured machines' live health — the sessions view's machine group
@@ -891,6 +917,7 @@ pub fn run() {
             rc_kill,
             machine_kill,
             machines_list,
+            add_machine,
             open_terminal,
             approvals_list,
             approval_decide,

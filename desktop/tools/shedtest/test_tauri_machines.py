@@ -221,6 +221,90 @@ def machine_app(fake_hub, flaky_hub, mock):
         ui.quit("tauri")
 
 
+@pytest.fixture(scope="module")
+def addable_app(mock):
+    """An app over a WRITABLE copy of the machine config.
+
+    Its own instance, and its own copy: the add path really writes, and a test
+    that mutated the committed fixture would poison every later run.
+
+    MODULE-scoped like `machine_app`, and for the same non-obvious reason: a
+    self-managed instance quits the app on teardown, and the autouse policy
+    fixture that runs before the NEXT test would then find nothing listening.
+    One launch per module keeps an app up for the whole run.
+    """
+    state_dir = Path(tempfile.mkdtemp(prefix="shed-e2e-add-"))
+    cfg = state_dir / "config.yaml"
+    cfg.write_text((FIXTURES / "config-machines.yaml").read_text())
+    ui.quit("tauri")
+    ui.launch(
+        "tauri",
+        mock_base_url=mock.base_url,
+        config_path=cfg,
+        state_dir=state_dir,
+    )
+    client = TauriClient(ui.socket_path("tauri"))
+    client.wait_until(
+        lambda: client.current_pane() is not None,
+        timeout=30,
+        what="tauri frontend ready",
+    )
+    try:
+        yield client, cfg
+    finally:
+        client.close()
+        ui.quit("tauri")
+
+
+def test_adding_a_machine_writes_the_config_and_starts_watching_it(addable_app):
+    """The whole point of the button: a machine added now is watched now.
+
+    A relaunch-to-see-it would be a worse affordance than editing the config by
+    hand, which is what this replaces.
+    """
+    app, cfg = addable_app
+    before = cfg.read_text()
+    assert "mini4" not in before
+
+    app.call("machine.add", {"name": "mini4", "user": "charliek", "rc_bin": "/opt/sx"})
+
+    # It is in the file …
+    after = cfg.read_text()
+    assert "mini4:" in after
+    assert "/opt/sx" in after
+    # … and INSERT-ONLY: every original line survives, in order. This file is
+    # hand-maintained, so an edit that reflowed it would be a bug even if the
+    # result parsed.
+    remaining = iter(before.splitlines())
+    peek = next(remaining, None)
+    for line in after.splitlines():
+        if line == peek:
+            peek = next(remaining, None)
+    assert peek is None, "an original config line was dropped or reordered"
+
+    # … and a backup of what was there before sits beside it.
+    assert (cfg.parent / "config.yaml.bak").read_text() == before
+
+    # … and it is being watched, without a relaunch.
+    app.wait_until(
+        lambda: any(m["name"] == "mini4" for m in app.call("machines.list")["machines"]),
+        timeout=20,
+        what="the new machine to be watched",
+    )
+
+
+def test_adding_a_duplicate_machine_is_refused_without_touching_the_file(addable_app):
+    """Refused, not shadowed: two rows with one name is a UI nobody can reason
+    about — and the config must be left exactly as it was."""
+    app, cfg = addable_app
+    before = cfg.read_text()
+
+    with pytest.raises(Exception) as excinfo:
+        app.call("machine.add", {"name": "mini3"})
+    assert "already" in str(excinfo.value).lower()
+    assert cfg.read_text() == before, "a refused add still wrote to the config"
+
+
 def test_a_machine_session_is_listed_beside_shed_sessions(machine_app):
     """AC4's core: a machine session appears in the SAME `rc.list` payload as
     shed sessions, stamped with its origin.
