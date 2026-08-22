@@ -1002,6 +1002,16 @@ impl Client {
             .map(|_| ())
     }
 
+    /// Decode a 2xx body as JSON, or report the wire as malformed.
+    ///
+    /// The distinction this keeps: a body that PARSES but omits an optional
+    /// field is an older server being terse, and the caller defaults it. A body
+    /// that does not parse is a proxy error page or a truncated response, and
+    /// defaulting THAT invents an answer.
+    fn decode_json_body(raw: &[u8]) -> Result<serde_json::Value, ShedError> {
+        serde_json::from_slice(raw).map_err(|e| ShedError::Decode(e.to_string()))
+    }
+
     /// `POST /api/sheds/{shed}/rc/v1/sessions/{slug}/turn` — start a
     /// structured turn, returning the turn id.
     ///
@@ -1018,7 +1028,11 @@ impl Client {
         let raw = self
             .request(reqwest::Method::POST, &url, WRITE_TIMEOUT, Some(&body))
             .await?;
-        let v: serde_json::Value = serde_json::from_slice(&raw).unwrap_or_default();
+        // A body that is not JSON is a PROTOCOL failure, not an empty turn id.
+        // Tolerating it would report a delivered turn for an HTML error page or
+        // a truncated response. A well-formed body missing the optional
+        // `turn_id` is a different matter — see below.
+        let v: serde_json::Value = Self::decode_json_body(&raw)?;
         Ok(v.get("turn_id")
             .and_then(|t| t.as_str())
             .unwrap_or_default()
@@ -1044,7 +1058,10 @@ impl Client {
                 Some(&serde_json::json!({})),
             )
             .await?;
-        let v: serde_json::Value = serde_json::from_slice(&raw).unwrap_or_default();
+        // Same reasoning as `rc_turn`, and it matters more here: silently
+        // decoding garbage to `false` reports "nothing was running" — a factual
+        // claim about the session — when the truth is that we do not know.
+        let v: serde_json::Value = Self::decode_json_body(&raw)?;
         Ok(v.get("interrupted").and_then(|b| b.as_bool()).unwrap_or(false))
     }
 
@@ -2747,6 +2764,31 @@ mod tests {
             );
         }
         drop(server);
+    }
+
+    /// codex review: a 200 whose body is not JSON is a proxy error page or a
+    /// truncated response — decoding it to a default INVENTS an answer. For
+    /// interrupt that answer is "nothing was running", which is a factual claim
+    /// about the session that nobody actually made.
+    #[tokio::test]
+    async fn a_malformed_success_body_is_a_decode_error_not_a_default() {
+        for body in ["<html>502 Bad Gateway</html>", "{\"interrupted\": tru", ""] {
+            let server = MockServer::start_async().await;
+            server
+                .mock_async(|w, t| {
+                    w.method(POST);
+                    t.status(200).body(body);
+                })
+                .await;
+            assert!(
+                matches!(client(&server).rc_interrupt("proj", "a").await, Err(ShedError::Decode(_))),
+                "body {body:?} was decoded rather than rejected"
+            );
+            assert!(matches!(
+                client(&server).rc_turn("proj", "a", "x").await,
+                Err(ShedError::Decode(_))
+            ));
+        }
     }
 
     #[tokio::test]

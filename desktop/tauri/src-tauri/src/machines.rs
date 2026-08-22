@@ -114,6 +114,17 @@ pub fn add_from_json(
 ) -> Result<(), String> {
     use shed_core::config_edit::{insert_machine, NewMachine};
 
+    // ONE add at a time. The IPC op and the Tauri command are separate entry
+    // points into this function, and the IPC server serves connections
+    // concurrently — so without this two adds can both read the original text
+    // and the second write silently drops the first's entry.
+    //
+    // In-process only. A concurrent `shed server add` from the CLI (which takes
+    // its own `%config.lock`) is still a lost-update window; closing that means
+    // adopting the same lock file, which is worth doing but is not this change.
+    static ADD_LOCK: Mutex<()> = Mutex::new(());
+    let _serialized = ADD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
     let name = machine
         .get("name")
         .and_then(Value::as_str)
@@ -129,12 +140,32 @@ pub fn add_from_json(
             .map(str::to_string)
     };
     let (host, user, rc_bin) = (field("host"), field("user"), field("rc_bin"));
-    let ssh_port = machine
-        .get("ssh_port")
-        .and_then(Value::as_u64)
-        .and_then(|p| u16::try_from(p).ok());
+    // A port that cannot be understood is REJECTED, not silently defaulted:
+    // "22" appearing where the user typed 2200 is worse than an error, because
+    // the dialog would report success and the machine would be unreachable for
+    // a reason nothing on screen explains. An absent field still means "use the
+    // default", which is what makes the field optional.
+    let ssh_port = match machine.get("ssh_port") {
+        None | Some(Value::Null) => None,
+        Some(v) => {
+            let n = v
+                .as_u64()
+                .or_else(|| v.as_str().and_then(|s| s.trim().parse::<u64>().ok()))
+                .filter(|n| (1..=65535).contains(n))
+                .ok_or_else(|| format!("{v} is not a usable SSH port (1-65535)"))?;
+            Some(n as u16)
+        }
+    };
 
-    let text = std::fs::read_to_string(path).unwrap_or_default();
+    // ONLY a missing file means "start from empty". Any other read error — a
+    // permission problem, non-UTF-8 bytes, a directory in the way — must abort:
+    // treating it as absent would skip the backup and then replace the whole
+    // config with just this one block.
+    let text = match std::fs::read_to_string(path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(format!("could not read {}: {e}", path.display())),
+    };
     let updated = insert_machine(
         &text,
         &NewMachine {
@@ -147,15 +178,15 @@ pub fn add_from_json(
     )
     .map_err(|e| e.to_string())?;
 
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    }
     if !text.is_empty() {
         let backup = path.with_extension("yaml.bak");
         std::fs::write(&backup, &text)
             .map_err(|e| format!("could not back up {}: {e}", backup.display()))?;
     }
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
-    }
-    std::fs::write(path, &updated).map_err(|e| format!("{}: {e}", path.display()))?;
+    write_atomically(path, &updated)?;
 
     // Re-read rather than trusting our own construction: whatever the READER
     // makes of the file is what every other client sees, so the watcher should
@@ -165,6 +196,22 @@ pub fn add_from_json(
         .cloned()
         .ok_or_else(|| format!("{name:?} was written but does not parse back"))?;
     machines.add(entry)
+}
+
+/// Write `text` to `path` without ever leaving a half-written file there.
+///
+/// `fs::write` truncates in place, so a failure partway (a full disk, a crash)
+/// leaves the config corrupt — and the backup only helps someone who knows to
+/// look for it. A temp file in the same directory plus a rename is atomic on
+/// every platform this runs on: the config is either the old bytes or the new
+/// ones, never half of each.
+fn write_atomically(path: &std::path::Path, text: &str) -> Result<(), String> {
+    let tmp = path.with_extension("yaml.tmp");
+    std::fs::write(&tmp, text).map_err(|e| format!("{}: {e}", tmp.display()))?;
+    std::fs::rename(&tmp, path).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        format!("{}: {e}", path.display())
+    })
 }
 
 /// The mutable half of [`Machines`]: the configured set and its live watchers.
@@ -236,6 +283,15 @@ impl Machines {
             reg.names.push(entry.name.clone());
             reg.entries.insert(entry.name.clone(), entry.clone());
         }
+        self.spawn_watcher(entry);
+    }
+
+    /// Seed the row and start the watcher for an ALREADY-REGISTERED machine.
+    ///
+    /// Split from registration so `add` can claim the name and register it in
+    /// one lock acquisition — a check-then-register across two would let two
+    /// concurrent adds both win.
+    fn spawn_watcher(&self, entry: MachineEntry) {
         self.state
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -274,16 +330,19 @@ impl Machines {
     /// with one name is a UI that cannot be reasoned about, and the config write
     /// upstream refuses the same case for the same reason.
     pub fn add(&self, entry: MachineEntry) -> Result<(), String> {
-        if self
-            .reg
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .entries
-            .contains_key(&entry.name)
+        // Claim the name under the SAME lock acquisition that registers it.
+        // Checking and then registering through two acquisitions lets two adds
+        // both pass the check and both register, leaving one name with two
+        // watchers and two rows.
         {
-            return Err(format!("a machine named {:?} is already watched", entry.name));
+            let mut reg = self.reg.lock().unwrap_or_else(|e| e.into_inner());
+            if reg.entries.contains_key(&entry.name) {
+                return Err(format!("a machine named {:?} is already watched", entry.name));
+            }
+            reg.names.push(entry.name.clone());
+            reg.entries.insert(entry.name.clone(), entry.clone());
         }
-        self.watch(entry);
+        self.spawn_watcher(entry);
         (self.on_change)();
         Ok(())
     }

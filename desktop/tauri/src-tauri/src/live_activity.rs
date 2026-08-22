@@ -60,11 +60,16 @@ impl LiveActivityLayer {
         let mut watchers = Vec::new();
 
         for (name, client) in backend.host_clients() {
+            // The watcher takes one; the loop keeps another to re-seed with
+            // after a resync. `Client` clones cheaply (Arc-backed transport and
+            // token cache), so this shares machinery rather than duplicating it.
+            let reseed_client = client.clone();
             let (watcher, mut rx) = RcEventsWatcher::spawn(handle, client, name.clone());
             watchers.push(watcher);
 
             let overlays = Arc::clone(&overlays);
             let on_change = on_change.clone();
+            let client = reseed_client;
             handle.spawn(async move {
                 while let Some(update) = rx.recv().await {
                     match update {
@@ -77,16 +82,21 @@ impl LiveActivityLayer {
                                 .insert(name.clone(), overlay);
                             on_change();
                         }
-                        // A reconnect cleared the held overlay: drop ours too,
-                        // so a stale badge cannot outlive the connection that
-                        // justified it. The rows fall back to their base
-                        // snapshot, which is the honest thing to show.
+                        // A reconnect cleared the watcher's overlay, and the
+                        // contract says the consumer must REFETCH its base —
+                        // clearing alone would leave every unchanged session
+                        // with no activity until it happens to move, which for
+                        // an idle box is never.
+                        //
+                        // So: drop ours, then re-seed from the snapshot, the
+                        // same way startup does.
                         RcWatcherUpdate::Resynced => {
                             overlays
                                 .lock()
                                 .unwrap_or_else(|e| e.into_inner())
                                 .remove(&name);
                             on_change();
+                            seed_one(&name, &client, &overlays, &on_change).await;
                         }
                         // A disconnect does NOT clear: the last snapshot stays
                         // on screen until the reconnect replaces it, matching
@@ -130,36 +140,7 @@ impl LiveActivityLayer {
         for (name, client) in backend.host_clients() {
             let overlays = Arc::clone(&overlays);
             let on_change = on_change.clone();
-            handle.spawn(async move {
-                let Ok(overview) = client.overview().await else {
-                    return;
-                };
-                let mut seeded = ActivityOverlay::empty();
-                for shed in &overview.sheds {
-                    for s in &shed.sessions {
-                        let Some(activity) = s.activity else { continue };
-                        seeded = seeded.apply(&shed_core::rc_events::RcEvent::ActivityChanged {
-                            shed: shed.shed.name.clone(),
-                            slug: s.slug.clone(),
-                            activity: Some(activity),
-                            activity_at: s.activity_at.clone(),
-                            state: Some(s.state),
-                            last_message: s.last_message.clone(),
-                        });
-                    }
-                }
-                if seeded.is_empty() {
-                    return;
-                }
-                {
-                    let mut guard = overlays.lock().unwrap_or_else(|e| e.into_inner());
-                    // Only if the stream has not already spoken for this host: a
-                    // live fold is newer than a startup snapshot, and a seed
-                    // landing late must not undo it.
-                    guard.entry(name).or_insert(seeded);
-                }
-                on_change();
-            });
+            handle.spawn(async move { seed_one(&name, &client, &overlays, &on_change).await });
         }
     }
 
@@ -187,9 +168,15 @@ impl LiveActivityLayer {
         if let Some(a) = patch.activity {
             obj.insert("activity".into(), Value::String(a.as_str().to_string()));
         }
-        if let Some(s) = patch.state {
-            obj.insert("state".into(), Value::String(s.as_str().to_string()));
-        }
+        // **`state` is deliberately NOT taken from the overlay.** The base row
+        // was listed just now; the overlay may be minutes old, because a `Down`
+        // keeps the last snapshot on screen rather than blanking it. Letting a
+        // stale `ready` overwrite a freshly-listed `needs-auth` would hide the
+        // one thing the user could act on, and show activity beside it.
+        //
+        // Activity is different, and is the whole reason this layer exists: the
+        // one-shot listing cannot report it AT ALL, so anything here is strictly
+        // more information than the row had.
         if let Some(m) = patch.last_message.as_deref() {
             obj.insert("last_message".into(), Value::String(m.to_string()));
         }
@@ -197,6 +184,48 @@ impl LiveActivityLayer {
             obj.insert("last_seq".into(), Value::from(seq));
         }
     }
+}
+
+/// Fetch one host's enriched snapshot and install it as that host's overlay.
+///
+/// `or_insert`, never `insert`: a live fold that landed while this request was
+/// in flight is NEWER than the snapshot, so a late seed must not resurrect what
+/// the stream has already moved past.
+async fn seed_one(
+    name: &str,
+    client: &shed_core::http::Client,
+    overlays: &Mutex<BTreeMap<String, ActivityOverlay>>,
+    on_change: &OnChange,
+) {
+    let Ok(overview) = client.overview().await else {
+        return;
+    };
+    let mut seeded = ActivityOverlay::empty();
+    for shed in &overview.sheds {
+        for s in &shed.sessions {
+            let Some(activity) = s.activity else { continue };
+            seeded = seeded.apply(&shed_core::rc_events::RcEvent::ActivityChanged {
+                shed: shed.shed.name.clone(),
+                slug: s.slug.clone(),
+                activity: Some(activity),
+                activity_at: s.activity_at.clone(),
+                // Lifecycle is NOT carried. `apply` never reads it (see there —
+                // a stale state must not overwrite a freshly-listed one), and
+                // storing it would only invite someone to start.
+                state: None,
+                last_message: s.last_message.clone(),
+            });
+        }
+    }
+    if seeded.is_empty() {
+        return;
+    }
+    overlays
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .entry(name.to_string())
+        .or_insert(seeded);
+    on_change();
 }
 
 #[cfg(test)]
@@ -264,6 +293,32 @@ mod tests {
         let mut theirs = json!({"slug": "same"});
         layer.apply(&mut theirs, "mac-mini", "b", "same");
         assert_eq!(theirs.get("activity"), None, "shed b read shed a's activity");
+    }
+
+    /// codex review: the overlay must never write `state`. The base row was
+    /// listed a moment ago; the overlay survives a disconnect deliberately, so
+    /// it can be minutes old. A stale `ready` overwriting a fresh `needs-auth`
+    /// hides the only thing the user could act on.
+    #[test]
+    fn the_overlay_never_overwrites_a_freshly_listed_state() {
+        let overlay = ActivityOverlay::empty().apply(&RcEvent::ActivityChanged {
+            shed: "prox".to_string(),
+            slug: "abc123".to_string(),
+            activity: Some(RcActivity::Working),
+            activity_at: None,
+            state: Some(shed_core::rc::RcState::Ready),
+            last_message: None,
+        });
+        let layer = layer_with("mac-mini", overlay);
+
+        // The one-shot has just reported the session cannot authenticate.
+        let mut row = json!({"slug": "abc123", "state": "needs-auth"});
+        layer.apply(&mut row, "mac-mini", "prox", "abc123");
+
+        assert_eq!(row["state"], json!("needs-auth"), "a stale state won");
+        // Activity still lands — that is the dimension the listing cannot carry
+        // at all, so anything here is strictly more than the row had.
+        assert_eq!(row["activity"], json!("working"));
     }
 
     #[test]

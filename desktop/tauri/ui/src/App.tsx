@@ -209,6 +209,13 @@ function sessionRail(s: RcSession): string | undefined {
  *  a session we know nothing about, and guessing "needs you" would cry wolf on
  *  every list. */
 export function needsYou(s: RcSession): boolean {
+  // Lifecycle trumps activity, the same rule the badges follow. A session that
+  // moved to needs-auth or dead keeps whatever activity it last had — the hub's
+  // `session.updated` carries the new state, not a cleared activity — so
+  // counting on activity alone reports "1 waiting" for a machine whose session
+  // is actually blocked on something else entirely, and whose card correctly
+  // shows no activity at all. The pane and the card would then disagree.
+  if (s.state !== "ready" && s.state !== "reconnecting") return false;
   return s.activity === "needs_input" || s.activity === "needs_approval";
 }
 
