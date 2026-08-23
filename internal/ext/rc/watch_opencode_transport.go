@@ -59,10 +59,25 @@ import (
 type opencodeWatcher struct {
 	baseURL string // http://127.0.0.1:<port>
 	workdir string // canonical (EvalSymlinks'd) session workdir, for the dir-match pin
-	priorID string // a prior back-written SHED_RC_AGENT_SESSION ("" if none) — a trusted pin
-	client  *http.Client
-	nowFn   func() time.Time
-	logf    func(string, ...any)
+	// claimed holds the ids pinned by OTHER rc sessions — never adopted.
+	claimed []string
+	// notBefore is when the RC SESSION was created; a conversation older than this
+	// belongs to somebody else.
+	//
+	// opencode servers are per-RC-session (own port) but read a SHARED per-project
+	// store, so /session lists every conversation in the directory — including other
+	// RC sessions'. Directory alone therefore cannot tell two agents in one repo
+	// apart, and the newest-match rule adopted a neighbour's conversation and seeded
+	// its whole history into this session's feed. Observed live: two opencode
+	// sessions in /home/shed/prox, one showing the other's exchange.
+	//
+	// A zero time disables the check (an RC session with no readable creation time
+	// keeps the old behaviour rather than losing correlation).
+	notBefore time.Time
+	priorID   string // a prior back-written SHED_RC_AGENT_SESSION ("" if none) — a trusted pin
+	client    *http.Client
+	nowFn     func() time.Time
+	logf      func(string, ...any)
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -125,6 +140,22 @@ var (
 // exactly. Only opencodeWatcher implements it — the fileWatchers correlate off-line.
 type confirmedAgentIDDrainer interface {
 	drainConfirmedAgentID() string
+}
+
+// claimHolder is how the hub enforces ONE CONVERSATION, ONE OWNER.
+//
+// opencode servers are per-rc-session but read a SHARED per-project store, so every
+// watcher in a repository can see — and adopt — every other rc session's
+// conversation. Age alone cannot settle it: a session that starts FIRST and stays
+// idle will happily adopt the conversation a session started later is actively
+// using, because that conversation is newer than the adopter.
+//
+// Only the hub sees every session, so the hub tells each watcher which ids are
+// already spoken for. Pushed every tick rather than at construction: the
+// neighbour's pin usually does not exist yet when this watcher is built.
+type claimHolder interface {
+	pinnedAgentID() string
+	setClaimed(ids []string)
 }
 
 // approvalPublisher is the third such interface: a watcher whose lane knows which approvals
@@ -215,7 +246,7 @@ var (
 // SHED_RC_AGENT_SESSION ("" if none): when set it is the trusted pin and no SSE discovery
 // is needed. now/logf may be nil (defaulted). The watcher is runner-free — it does no tmux
 // I/O; the discovered id is surfaced via drainConfirmedAgentID for reconcile to back-write.
-func newOpencodeWatcher(port int, workdir, agentID string, now func() time.Time, logf func(string, ...any)) *opencodeWatcher {
+func newOpencodeWatcher(port int, workdir, agentID string, notBefore time.Time, now func() time.Time, logf func(string, ...any)) *opencodeWatcher {
 	if now == nil {
 		now = time.Now
 	}
@@ -231,6 +262,7 @@ func newOpencodeWatcher(port int, workdir, agentID string, now func() time.Time,
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	w := &opencodeWatcher{
+		notBefore: notBefore,
 		baseURL:   fmt.Sprintf("http://127.0.0.1:%d", port),
 		workdir:   canonicalDir(workdir),
 		priorID:   agentID,
@@ -1207,6 +1239,11 @@ func (w *opencodeWatcher) rootPinFromCreated(pk *ocPeek) (string, bool) {
 	if !dirMatchCanon(info.Directory, w.workdir) {
 		return "", false
 	}
+	// session.updated fires for a NEIGHBOUR's conversation too — same store, same
+	// directory — so both ownership checks apply here as well, not only on REST.
+	if w.isClaimed(info.ID) || !w.createdLateEnough(info.Time.Created) {
+		return "", false
+	}
 	return info.ID, true
 }
 
@@ -1310,6 +1347,9 @@ func (w *opencodeWatcher) restFindCandidate() (string, bool) {
 		ID        string `json:"id"`
 		Directory string `json:"directory"`
 		ParentID  string `json:"parentID"`
+		Time      struct {
+			Created int64 `json:"created"` // epoch MILLISECONDS
+		} `json:"time"`
 	}
 	if err := w.getJSON("/session", &sessions); err != nil {
 		return "", false
@@ -1317,6 +1357,12 @@ func (w *opencodeWatcher) restFindCandidate() (string, bool) {
 	for _, s := range sessions {
 		if !validOpencodeSessionID(s.ID) || s.ParentID != "" {
 			continue // same rule as the SSE pin: an unaddressable id is never followed
+		}
+		if w.isClaimed(s.ID) {
+			continue // another rc session already owns this conversation
+		}
+		if !w.createdLateEnough(s.Time.Created) {
+			continue // predates this RC session: another session's conversation
 		}
 		if dirMatchCanon(s.Directory, w.workdir) {
 			return s.ID, true
@@ -1490,11 +1536,51 @@ type ocPeek struct {
 			ID        string `json:"id"`
 			ParentID  string `json:"parentID"`
 			Directory string `json:"directory"`
+			Time      struct {
+				Created int64 `json:"created"` // epoch MILLISECONDS; 0 = frame carries none
+			} `json:"time"`
 		} `json:"info"`
 	} `json:"properties"`
 }
 
 func (p *ocPeek) sessionID() string { return p.Properties.SessionID }
+
+// pinnedAgentID and setClaimed implement claimHolder. pinnedAgentID reuses the
+// existing accessor so there is one lock discipline for the pin, not two.
+func (w *opencodeWatcher) pinnedAgentID() string { return w.getPinned() }
+
+func (w *opencodeWatcher) setClaimed(ids []string) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.claimed = ids
+}
+
+// isClaimed reports whether another rc session has already pinned id.
+func (w *opencodeWatcher) isClaimed(id string) bool {
+	if id == "" {
+		return false
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	for _, c := range w.claimed {
+		if c == id {
+			return true
+		}
+	}
+	return false
+}
+
+// createdLateEnough reports whether a conversation stamped createdMS (epoch
+// milliseconds) is new enough to belong to this RC session. See notBefore.
+func (w *opencodeWatcher) createdLateEnough(createdMS int64) bool {
+	if w.notBefore.IsZero() || w.notBefore.UnixMilli() <= 0 || createdMS <= 0 {
+		return true // nothing to compare against — do not lose correlation
+	}
+	// A second of slack: the RC session's stamp and opencode's are taken by
+	// different processes, and the conversation of a session created with a kickoff
+	// prompt is stamped within moments of the session itself.
+	return createdMS >= w.notBefore.UnixMilli()-1000
+}
 
 // peekEnvelope decodes a payload for routing (never nil; an unparseable payload yields an
 // empty-Type peek, which routes as "ignore").

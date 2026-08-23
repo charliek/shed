@@ -536,7 +536,20 @@ fn classify_claude(kind: &RcKind, pane: &str) -> RcClassification {
 /// codex's empty-composer placeholder — shared by the ready regex (banner OR
 /// composer ⇒ ready) and the prompt anchor (composer only ⇒ needs_input), so the
 /// two cannot drift if codex rewords the hint (`agents.go:741`).
-const CODEX_COMPOSER_PLACEHOLDER: &str = r"Find and fix a bug in @filename";
+///
+/// An ALTERNATION, because codex has already reworded it once: builds through
+/// mid-2026 print "Find and fix a bug in @filename", newer ones print "Ask
+/// Codex to do anything". Both stay — the anchor is a vendor string this code
+/// does not control, and an old build must keep classifying after a new one is
+/// recognized.
+///
+/// Observed failure when the live wording drifted past the anchor: the startup
+/// BANNER (the other ready alternative) scrolls out of the capture window after
+/// the first turn, so the session classified `starting` forever — which reads
+/// as a blocking lifecycle, so the hub refused typed input and rendered no
+/// activity, on a session sitting visibly at its composer.
+const CODEX_COMPOSER_PLACEHOLDER: &str =
+    r"Find and fix a bug in @filename|Ask Codex to do anything";
 
 static RE_CODEX_READY: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(&format!(
@@ -544,6 +557,11 @@ static RE_CODEX_READY: LazyLock<Regex> = LazyLock::new(|| {
     ))
     .unwrap()
 });
+/// codex's in-turn chrome: the interrupt hint it prints while a turn runs.
+/// Proof the TUI is up, independent of any composer wording.
+static RE_CODEX_WORKING: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"esc to interrupt").unwrap());
+
 static RE_CODEX_TRUST: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?i)Do you trust the contents of this directory\?").unwrap());
 static RE_CODEX_AUTH: LazyLock<Regex> = LazyLock::new(|| {
@@ -564,6 +582,20 @@ fn classify_codex(pane: &str) -> RcClassification {
     }
     if RE_CODEX_AUTH.is_match(pane) {
         return result(RcState::NeedsAuth, None);
+    }
+    // The in-turn hint is checked AFTER trust/auth, not before: it is an
+    // unanchored phrase, so a transcript that quotes it (or a codex relaunched
+    // by hand in the same pane, leaving the old text in scrollback) could
+    // otherwise mask a sign-in screen that is on the display RIGHT NOW.
+    if RE_CODEX_WORKING.is_match(pane) {
+        return result(RcState::Ready, None);
+    }
+    // Same rule as cursor's, and checked AFTER trust/auth so those keep their
+    // precedence: codex's approval overlay replaces the composer, so without
+    // this a session waiting on an approval reads `starting` — blocking — once
+    // the startup banner has scrolled away.
+    if RE_CODEX_APPROVAL_ANCHOR.is_match(pane) {
+        return result(RcState::Ready, None);
     }
     result(RcState::Starting, None)
 }
@@ -614,10 +646,45 @@ static RE_CURSOR_AUTH: LazyLock<Regex> = LazyLock::new(|| {
 /// follow-up`); both are the same ready chrome (`agents.go:876`).
 static RE_CURSOR_READY: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(&format!(
+        r"(?m)^{GO_SPACE}*→ (?:Plan, search, build anything|Add a follow-up)(?:{GO_SPACE}{{2,}}\S[^\n]*)?{GO_SPACE}*$"
+    ))
+    .unwrap()
+});
+
+/// cursor's in-turn chrome: the hint it right-aligns on the composer line while
+/// a turn is running. Proof the TUI is up, and the ONLY such proof for a pane
+/// whose composer is otherwise covered.
+static RE_CURSOR_WORKING: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"ctrl\+c to stop").unwrap());
+
+/// cursor's WAITING anchor, deliberately STRICTER than [`RE_CURSOR_READY`]: the
+/// bare composer line, nothing trailing.
+///
+/// The two answer different questions and must not share a regex. "Is this agent
+/// up?" wants every scrap of chrome it can get (which is why the ready regex
+/// tolerates the right-aligned hint). "Is it waiting for me?" is what the INPUT
+/// GATE reads, and there a false yes delivers a keystroke into a running turn —
+/// so it takes the composer's resting form only, and the working anchor vetoes
+/// even that.
+static RE_CURSOR_PROMPT_ANCHOR: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(&format!(
         r"(?m)^{GO_SPACE}*→ (?:Plan, search, build anything|Add a follow-up){GO_SPACE}*$"
     ))
     .unwrap()
 });
+
+/// cursor's STATUS BAR — `Cursor <model> · <pct>%` — the one piece of chrome
+/// that survives everything the composer does not.
+///
+/// The composer line is CONTENT, and content changes: its placeholder differs
+/// fresh vs mid-conversation, it grows a right-aligned hint while working, and
+/// the moment anyone TYPES the placeholder is replaced by their words. Each of
+/// those dropped a live session back to `starting` — a blocking lifecycle —
+/// while it sat plainly alive on screen. The status bar is drawn by the TUI
+/// itself and says nothing about what the user or the agent is doing, which is
+/// exactly why it is the right thing to anchor "is this up?" on.
+static RE_CURSOR_STATUS: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?m)^[ \t]*Cursor .+ · [0-9]+(?:\.[0-9]+)?%[ \t]*$").unwrap());
 
 /// `classifyCursor` (`agents.go:881`). The auth screens and the authed composer
 /// are disjoint, so auth is checked first and ready second.
@@ -625,7 +692,20 @@ fn classify_cursor(pane: &str) -> RcClassification {
     if RE_CURSOR_AUTH.is_match(pane) {
         return result(RcState::NeedsAuth, None);
     }
-    if RE_CURSOR_READY.is_match(pane) {
+    if RE_CURSOR_READY.is_match(pane)
+        || RE_CURSOR_WORKING.is_match(pane)
+        || RE_CURSOR_STATUS.is_match(pane)
+    {
+        return result(RcState::Ready, None);
+    }
+    // An approval dialog PROVES the agent is up: it only exists because a turn
+    // ran far enough to ask for something. cursor's modal covers the composer,
+    // so the ready anchor alone reported `starting` for a session that was
+    // running and waiting on a person — and `starting` is a BLOCKING lifecycle,
+    // which suppresses the activity dimension entirely, so clients could
+    // neither show "needs approval" nor accept a keystroke. Lifecycle answers
+    // "is it up"; the activity dimension answers "what is it doing".
+    if RE_CURSOR_APPROVAL_ANCHOR.is_match(pane) {
         return result(RcState::Ready, None);
     }
     result(RcState::Starting, None)
@@ -733,9 +813,24 @@ pub fn prompt_anchor_for(kind: &RcKind) -> Option<&'static Regex> {
         AgentTool::Claude => Some(&RE_CLAUDE_PROMPT_ANCHOR),
         AgentTool::Codex => Some(&RE_CODEX_PROMPT_ANCHOR),
         AgentTool::Opencode => Some(&RE_OPENCODE_PROMPT_ANCHOR),
-        // cursor reuses its ready regex as the prompt anchor.
-        AgentTool::Cursor => Some(&RE_CURSOR_READY),
+        AgentTool::Cursor => Some(&RE_CURSOR_PROMPT_ANCHOR),
         AgentTool::Shell => Some(&RE_SHELL_PROMPT_ANCHOR),
+    }
+}
+
+/// The kind's IN-TURN chrome — the hint it draws while a turn is running
+/// (`workingAnchorFor`, `agents.go`). A pane matching it is mid-turn, which
+/// VETOES "waiting for input" however quiet the pane has gone.
+///
+/// It exists because the composer is not proof of waiting: codex draws its
+/// composer WHILE WORKING (captured live), so a pane that merely stopped
+/// changing for a few seconds could be read as `needs_input` and accept a
+/// posted line into a running turn. `None` for kinds that draw no such hint.
+pub fn working_anchor_for(kind: &RcKind) -> Option<&'static Regex> {
+    match tool_for(kind)? {
+        AgentTool::Codex => Some(&RE_CODEX_WORKING),
+        AgentTool::Cursor => Some(&RE_CURSOR_WORKING),
+        AgentTool::Claude | AgentTool::Opencode | AgentTool::Shell => None,
     }
 }
 
@@ -2408,6 +2503,143 @@ mod tests {
         for v in ["1", "0", "", "1.0", "1e3", "0x1", " 2", "+2", "abc"] {
             assert!(!is_managed_version(v), "{v} should be unmanaged");
         }
+    }
+
+    /// Panes captured from LIVE sessions on 2026-08-23, in the states a
+    /// long-running agent actually passes through. Every one of them
+    /// classified `starting` before these anchors were widened — and
+    /// `starting` is a BLOCKING lifecycle, so each was a session that could
+    /// not be typed at, watched, or steered while being plainly alive on
+    /// screen.
+    ///
+    /// The lesson they encode: anchor on the TUI's own CHROME (an interrupt
+    /// hint, a dialog frame), not on placeholder prose. Placeholder text is
+    /// the part vendors reword between releases, and the part that disappears
+    /// mid-session.
+    ///
+    /// codex, mid-turn. The composer line is STILL DRAWN while it works —
+    /// which is why the composer cannot be read as "waiting for input".
+    const CODEX_PANE_WORKING: &str = "\
+• Working (2s • esc to interrupt)
+
+› Ask Codex to do anything
+
+  gpt-5.6-sol default · ~/prox
+";
+
+    /// cursor, mid-turn: the composer line carries a RIGHT-ALIGNED hint, so a
+    /// bare-line anchor no longer matches it.
+    const CURSOR_PANE_WORKING: &str = "\
+  → Add a follow-up                                             ctrl+c to stop
+
+
+  Cursor Grok 4.6 High Fast · 13.6%
+  ~/prox · main
+";
+
+    /// cursor, after somebody TYPED into it: the placeholder is replaced by
+    /// their words, so nothing about the composer's CONTENT can be anchored on.
+    const CURSOR_PANE_TYPED: &str = "\
+  → queued cursor follow-up
+
+
+  Cursor Grok 4.6 High Fast · 14.2%
+  ~/prox · main
+";
+
+    /// cursor, settled after a turn.
+    const CURSOR_PANE_IDLE: &str = "\
+  → Add a follow-up
+
+
+  Cursor Grok 4.6 High Fast · 14.1%
+  ~/prox · main
+";
+
+    /// cursor, blocked on a command approval: the modal covers the composer
+    /// entirely, so the ready anchor cannot see it.
+    const CURSOR_PANE_APPROVAL: &str = "\
+ $  ls -1 /home/shed/prox && echo \"---\" && git -C /home/shed/prox log -5
+
+ Run this command?
+ Not in allowlist: echo, git -C
+  → Run (once) (y)
+    Add Shell(echo), Shell(git -C) to allowlist? (tab)
+    Run Everything (shift+tab)
+    Skip & tell the agent what to do instead (esc or n)
+";
+
+    /// Every captured state is READY: the lifecycle question is "is this agent
+    /// up", not "is it idle" — what it is doing is the activity dimension's
+    /// job, derived separately.
+    #[test]
+    fn every_live_pane_classifies_as_up() {
+        for (name, state) in [
+            ("codex idle", classify_codex(CODEX_PANE_AFTER_A_TURN).state),
+            ("codex working", classify_codex(CODEX_PANE_WORKING).state),
+            ("cursor working", classify_cursor(CURSOR_PANE_WORKING).state),
+            ("cursor idle", classify_cursor(CURSOR_PANE_IDLE).state),
+            (
+                "cursor with typed text",
+                classify_cursor(CURSOR_PANE_TYPED).state,
+            ),
+            (
+                "cursor at an approval",
+                classify_cursor(CURSOR_PANE_APPROVAL).state,
+            ),
+        ] {
+            assert_eq!(state, RcState::Ready, "{name}");
+        }
+    }
+
+    /// The approval pane now classifies READY, so the only thing standing
+    /// between a remote keystroke and that dialog is the approval anchor.
+    #[test]
+    fn the_live_approval_pane_still_anchors() {
+        let anchor = approval_anchor_for(&RcKind::Cursor).expect("cursor declares one");
+        assert!(anchor.is_match(CURSOR_PANE_APPROVAL));
+        assert!(!anchor.is_match(CURSOR_PANE_WORKING), "working");
+        assert!(!anchor.is_match(CURSOR_PANE_IDLE), "idle");
+    }
+
+    /// The REAL pane of a codex session that had run one turn, captured from a
+    /// shed in August 2026 — the banner long since scrolled out of the capture
+    /// window, the composer showing codex's current wording.
+    const CODEX_PANE_AFTER_A_TURN: &str = "\
+  The best contributor overview is docs/development/
+  architecture.md.
+
+─ Worked for 1m 02s ────────────────────────────────
+
+
+› Ask Codex to do anything
+
+  gpt-5.6-sol default · ~/prox
+";
+
+    #[test]
+    fn a_codex_session_at_its_composer_is_ready_whatever_the_wording() {
+        // The lived failure: the anchor knew only the OLD placeholder, so once
+        // the startup banner scrolled away this pane classified `starting` —
+        // a blocking lifecycle, which made the hub refuse typed input and show
+        // no activity for a session plainly waiting for a person.
+        assert_eq!(
+            classify_codex(CODEX_PANE_AFTER_A_TURN).state,
+            RcState::Ready,
+        );
+        // The older wording keeps working: an anchor is a vendor string, and
+        // recognizing a new build must not stop recognizing an old one.
+        assert_eq!(
+            classify_codex("  › Find and fix a bug in @filename").state,
+            RcState::Ready,
+        );
+        // And the same pane is what the INPUT gate reads, so a session that is
+        // ready to be typed at must also present its prompt anchor.
+        assert!(
+            prompt_anchor_for(&RcKind::Codex)
+                .expect("codex has a prompt anchor")
+                .is_match(CODEX_PANE_AFTER_A_TURN)
+        );
     }
 
     // ---- prompt anchors (registry data) ----

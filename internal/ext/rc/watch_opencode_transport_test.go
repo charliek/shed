@@ -454,7 +454,7 @@ func TestOpencodeWatcherPinFromSessionCreated(t *testing.T) {
 	}
 
 	clk := opencodeClock()
-	w := newOpencodeWatcher(f.port(t), ocFixtureDir, "", clk.now, nil)
+	w := newOpencodeWatcher(f.port(t), ocFixtureDir, "", time.Time{}, clk.now, nil)
 	t.Cleanup(w.close)
 
 	var rows []feedMessage
@@ -505,7 +505,7 @@ func TestOpencodeWatcherPinViaPriorAgentID(t *testing.T) {
 	}
 
 	clk := opencodeClock()
-	w := newOpencodeWatcher(f.port(t), ocFixtureDir, ocFixtureSID, clk.now, nil)
+	w := newOpencodeWatcher(f.port(t), ocFixtureDir, ocFixtureSID, time.Time{}, clk.now, nil)
 	t.Cleanup(w.close)
 
 	var rows []feedMessage
@@ -539,7 +539,7 @@ func TestOpencodeWatcherRESTCandidateFollowOnly(t *testing.T) {
 	}
 
 	clk := opencodeClock()
-	w := newOpencodeWatcher(f.port(t), ocFixtureDir, "", clk.now, nil)
+	w := newOpencodeWatcher(f.port(t), ocFixtureDir, "", time.Time{}, clk.now, nil)
 	t.Cleanup(w.close)
 
 	// The candidate is established from GET /session, but NOT confirmed: no back-write yet.
@@ -584,7 +584,7 @@ func TestOpencodeWatcherFiltersChildSibling(t *testing.T) {
 	}
 
 	clk := opencodeClock()
-	w := newOpencodeWatcher(f.port(t), ocFixtureDir, "", clk.now, nil)
+	w := newOpencodeWatcher(f.port(t), ocFixtureDir, "", time.Time{}, clk.now, nil)
 	t.Cleanup(w.close)
 
 	var rows []feedMessage
@@ -616,7 +616,7 @@ func TestOpencodeWatcherSeedBeforeSubscribe(t *testing.T) {
 	}
 
 	clk := opencodeClock()
-	w := newOpencodeWatcher(f.port(t), ocFixtureDir, ocFixtureSID, clk.now, nil)
+	w := newOpencodeWatcher(f.port(t), ocFixtureDir, ocFixtureSID, time.Time{}, clk.now, nil)
 	t.Cleanup(w.close)
 
 	var rows []feedMessage
@@ -641,7 +641,7 @@ func TestOpencodeWatcherIdleReseed(t *testing.T) {
 	}
 
 	clk := opencodeClock()
-	w := newOpencodeWatcher(f.port(t), ocFixtureDir, ocFixtureSID, clk.now, nil)
+	w := newOpencodeWatcher(f.port(t), ocFixtureDir, ocFixtureSID, time.Time{}, clk.now, nil)
 	t.Cleanup(w.close)
 
 	refreshUntil(t, w, clk, nil, "synthesized idle → needs_input", func() bool {
@@ -670,7 +670,7 @@ func TestOpencodeWatcherReconnectReseedIdempotent(t *testing.T) {
 	}
 
 	clk := opencodeClock()
-	w := newOpencodeWatcher(f.port(t), ocFixtureDir, "", clk.now, nil)
+	w := newOpencodeWatcher(f.port(t), ocFixtureDir, "", time.Time{}, clk.now, nil)
 	t.Cleanup(w.close)
 
 	var rows []feedMessage
@@ -703,7 +703,7 @@ func TestOpencodeWatcherStaleFallsToStability(t *testing.T) {
 	}
 
 	clk := opencodeClock()
-	w := newOpencodeWatcher(f.port(t), ocFixtureDir, ocFixtureSID, clk.now, nil)
+	w := newOpencodeWatcher(f.port(t), ocFixtureDir, ocFixtureSID, time.Time{}, clk.now, nil)
 	t.Cleanup(w.close)
 
 	refreshUntil(t, w, clk, nil, "seed → working, healthy", func() bool {
@@ -738,7 +738,7 @@ func TestOpencodeWatcherCloseDuringBlockedRead(t *testing.T) {
 	}
 
 	clk := opencodeClock()
-	w := newOpencodeWatcher(f.port(t), ocFixtureDir, ocFixtureSID, clk.now, nil)
+	w := newOpencodeWatcher(f.port(t), ocFixtureDir, ocFixtureSID, time.Time{}, clk.now, nil)
 	pollUntil(t, "SSE connection established", func() bool { return f.eventConns.Load() >= 1 })
 
 	done := make(chan struct{})
@@ -769,7 +769,7 @@ func TestOpencodeWatcherUnreachablePort(t *testing.T) {
 	_ = ln.Close()
 
 	clk := opencodeClock()
-	w := newOpencodeWatcher(port, ocFixtureDir, ocFixtureSID, clk.now, nil)
+	w := newOpencodeWatcher(port, ocFixtureDir, ocFixtureSID, time.Time{}, clk.now, nil)
 
 	// Refresh a few times; the verdict must stay unknown/not-fresh (nothing ever seeded).
 	for i := 0; i < 20; i++ {
@@ -803,7 +803,7 @@ func TestOpencodeWatcher401(t *testing.T) {
 	f.onEvent = func(conn int64, w io.Writer, flush func(), ctx context.Context) {}
 
 	clk := opencodeClock()
-	w := newOpencodeWatcher(f.port(t), ocFixtureDir, ocFixtureSID, clk.now, nil)
+	w := newOpencodeWatcher(f.port(t), ocFixtureDir, ocFixtureSID, time.Time{}, clk.now, nil)
 	t.Cleanup(w.close)
 
 	pollUntil(t, "at least one 401 attempt", func() bool { return f.eventConns.Load() >= 1 })
@@ -833,7 +833,7 @@ func TestOpencodeWatcherMalformedFrame(t *testing.T) {
 	}
 
 	clk := opencodeClock()
-	w := newOpencodeWatcher(f.port(t), ocFixtureDir, "", clk.now, nil)
+	w := newOpencodeWatcher(f.port(t), ocFixtureDir, "", time.Time{}, clk.now, nil)
 	t.Cleanup(w.close)
 
 	refreshUntil(t, w, clk, nil, "arc folds despite garbage frames", func() bool {
@@ -861,7 +861,7 @@ func TestOpencodeWatcherOversizedFrame(t *testing.T) {
 	}
 
 	clk := opencodeClock()
-	w := newOpencodeWatcher(f.port(t), ocFixtureDir, ocFixtureSID, clk.now, nil)
+	w := newOpencodeWatcher(f.port(t), ocFixtureDir, ocFixtureSID, time.Time{}, clk.now, nil)
 	t.Cleanup(w.close)
 
 	pollUntil(t, "watcher reconnects past the oversized frame", func() bool {
@@ -891,7 +891,7 @@ func TestOpencodeWatcherInboxOverflow(t *testing.T) {
 	}
 
 	clk := opencodeClock()
-	w := newOpencodeWatcher(f.port(t), ocFixtureDir, ocFixtureSID, clk.now, nil)
+	w := newOpencodeWatcher(f.port(t), ocFixtureDir, ocFixtureSID, time.Time{}, clk.now, nil)
 	t.Cleanup(w.close)
 
 	// The overflow must force a reconnect (a second /event connection).
@@ -933,7 +933,7 @@ func TestOpencodeWatcherStaleSeedCompleteIgnored(t *testing.T) {
 	}
 
 	clk := opencodeClock()
-	w := newOpencodeWatcher(f.port(t), ocFixtureDir, ocFixtureSID, clk.now, nil)
+	w := newOpencodeWatcher(f.port(t), ocFixtureDir, ocFixtureSID, time.Time{}, clk.now, nil)
 	t.Cleanup(w.close)
 
 	// messagesHits>=2 guarantees B's connectAndStream has advanced its generation (beginGeneration
@@ -974,7 +974,7 @@ func TestOpencodeWatcherLiveStatusWinsOverRESTFallback(t *testing.T) {
 	}
 
 	clk := opencodeClock()
-	w := newOpencodeWatcher(f.port(t), ocFixtureDir, ocFixtureSID, clk.now, nil)
+	w := newOpencodeWatcher(f.port(t), ocFixtureDir, ocFixtureSID, time.Time{}, clk.now, nil)
 	t.Cleanup(w.close)
 
 	refreshUntil(t, w, clk, nil, "live busy wins over REST idle", func() bool {
@@ -1004,7 +1004,7 @@ func TestOpencodeWatcherRESTIdleFallbackWhenNoLiveStatus(t *testing.T) {
 	}
 
 	clk := opencodeClock()
-	w := newOpencodeWatcher(f.port(t), ocFixtureDir, ocFixtureSID, clk.now, nil)
+	w := newOpencodeWatcher(f.port(t), ocFixtureDir, ocFixtureSID, time.Time{}, clk.now, nil)
 	t.Cleanup(w.close)
 
 	refreshUntil(t, w, clk, nil, "REST idle fallback → needs_input", func() bool {
@@ -1027,7 +1027,7 @@ func TestOpencodeWatcherStatusSeedFailureReconnects(t *testing.T) {
 	}
 
 	clk := opencodeClock()
-	w := newOpencodeWatcher(f.port(t), ocFixtureDir, ocFixtureSID, clk.now, nil)
+	w := newOpencodeWatcher(f.port(t), ocFixtureDir, ocFixtureSID, time.Time{}, clk.now, nil)
 	t.Cleanup(w.close)
 
 	pollUntil(t, "status-seed failure forces reconnect", func() bool { return f.eventConns.Load() >= 2 })
@@ -1055,7 +1055,7 @@ func TestOpencodeWatcherCandidateSeedFailureReconnects(t *testing.T) {
 	}
 
 	clk := opencodeClock()
-	w := newOpencodeWatcher(f.port(t), ocFixtureDir, "", clk.now, nil) // no priorID → candidate path
+	w := newOpencodeWatcher(f.port(t), ocFixtureDir, "", time.Time{}, clk.now, nil) // no priorID → candidate path
 	t.Cleanup(w.close)
 
 	pollUntil(t, "candidate seed failure forces reconnect", func() bool { return f.eventConns.Load() >= 2 })
@@ -1084,7 +1084,7 @@ func TestOpencodeWatcherClosedNotFresh(t *testing.T) {
 	}
 
 	clk := opencodeClock()
-	w := newOpencodeWatcher(f.port(t), ocFixtureDir, ocFixtureSID, clk.now, nil)
+	w := newOpencodeWatcher(f.port(t), ocFixtureDir, ocFixtureSID, time.Time{}, clk.now, nil)
 
 	refreshUntil(t, w, clk, nil, "seed → working, fresh", func() bool {
 		act, _, fresh, _ := w.snapshot(clk.now())
@@ -1127,7 +1127,7 @@ func TestOpencodeWatcherOverflowRevokesAuthorityImmediately(t *testing.T) {
 	}
 
 	clk := opencodeClock()
-	w := newOpencodeWatcher(f.port(t), ocFixtureDir, ocFixtureSID, clk.now, nil)
+	w := newOpencodeWatcher(f.port(t), ocFixtureDir, ocFixtureSID, time.Time{}, clk.now, nil)
 	t.Cleanup(w.close)
 
 	refreshUntil(t, w, clk, nil, "seed → working, fresh", func() bool {
@@ -1180,7 +1180,7 @@ func TestOpencodeWatcherSeedFailGrowsBackoff(t *testing.T) {
 	}
 
 	clk := opencodeClock()
-	w := newOpencodeWatcher(f.port(t), ocFixtureDir, ocFixtureSID, clk.now, nil)
+	w := newOpencodeWatcher(f.port(t), ocFixtureDir, ocFixtureSID, time.Time{}, clk.now, nil)
 	t.Cleanup(w.close)
 
 	pollUntil(t, "multiple connect-then-seed-fail attempts", func() bool { return f.eventConns.Load() >= 2 })
@@ -1212,7 +1212,7 @@ func TestOpencodeWatcherHeartbeatKeepsFresh(t *testing.T) {
 	}
 
 	clk := opencodeClock()
-	w := newOpencodeWatcher(f.port(t), ocFixtureDir, ocFixtureSID, clk.now, nil)
+	w := newOpencodeWatcher(f.port(t), ocFixtureDir, ocFixtureSID, time.Time{}, clk.now, nil)
 	t.Cleanup(w.close)
 
 	lastFrame := func() time.Time {
@@ -1262,7 +1262,7 @@ func TestOpencodeWatcherCloseDuringRESTSeed(t *testing.T) {
 	}
 
 	clk := opencodeClock()
-	w := newOpencodeWatcher(f.port(t), ocFixtureDir, ocFixtureSID, clk.now, nil)
+	w := newOpencodeWatcher(f.port(t), ocFixtureDir, ocFixtureSID, time.Time{}, clk.now, nil)
 
 	select {
 	case <-entered:
@@ -1309,7 +1309,7 @@ func askThenReply(t *testing.T) (*opencodeWatcher, *hubClock, chan struct{}) {
 		<-ctx.Done()
 	}
 	clk := opencodeClock()
-	w := newOpencodeWatcher(f.port(t), ocFixtureDir, ocFixtureSID, clk.now, nil)
+	w := newOpencodeWatcher(f.port(t), ocFixtureDir, ocFixtureSID, time.Time{}, clk.now, nil)
 	t.Cleanup(w.close)
 	return w, clk, release
 }
@@ -1374,7 +1374,7 @@ func TestOpencodeWatcherNeedsApprovalDemotedOnDeadStream(t *testing.T) {
 	}
 
 	clk := opencodeClock()
-	w := newOpencodeWatcher(f.port(t), ocFixtureDir, ocFixtureSID, clk.now, nil)
+	w := newOpencodeWatcher(f.port(t), ocFixtureDir, ocFixtureSID, time.Time{}, clk.now, nil)
 	t.Cleanup(w.close)
 
 	refreshUntil(t, w, clk, nil, "needs_approval, healthy", func() bool {
@@ -1415,7 +1415,7 @@ func TestOpencodeWatcherSeedRebuildsApprovals(t *testing.T) {
 	}
 
 	clk := opencodeClock()
-	w := newOpencodeWatcher(f.port(t), ocFixtureDir, ocFixtureSID, clk.now, nil)
+	w := newOpencodeWatcher(f.port(t), ocFixtureDir, ocFixtureSID, time.Time{}, clk.now, nil)
 	t.Cleanup(w.close)
 
 	var rows []feedMessage
@@ -1471,7 +1471,7 @@ func TestOpencodeWatcherSeedRetiresAnsweredApproval(t *testing.T) {
 	}
 
 	clk := opencodeClock()
-	w := newOpencodeWatcher(f.port(t), ocFixtureDir, ocFixtureSID, clk.now, nil)
+	w := newOpencodeWatcher(f.port(t), ocFixtureDir, ocFixtureSID, time.Time{}, clk.now, nil)
 	t.Cleanup(w.close)
 
 	refreshUntil(t, w, clk, nil, "the seeded ask blocks the session", func() bool {
@@ -1570,7 +1570,7 @@ func TestOpencodeWatcherApprovalsConcurrentAccess(t *testing.T) {
 	}
 
 	clk := opencodeClock()
-	w := newOpencodeWatcher(f.port(t), ocFixtureDir, ocFixtureSID, clk.now, nil)
+	w := newOpencodeWatcher(f.port(t), ocFixtureDir, ocFixtureSID, time.Time{}, clk.now, nil)
 	t.Cleanup(w.close)
 
 	refreshUntil(t, w, clk, nil, "the asks are folded", func() bool {
@@ -1630,7 +1630,7 @@ func TestOpencodeWatcherSeedHealsPermissionsWithQuestionReadFailing(t *testing.T
 	}
 
 	clk := opencodeClock()
-	w := newOpencodeWatcher(f.port(t), ocFixtureDir, ocFixtureSID, clk.now, nil)
+	w := newOpencodeWatcher(f.port(t), ocFixtureDir, ocFixtureSID, time.Time{}, clk.now, nil)
 	t.Cleanup(w.close)
 
 	refreshUntil(t, w, clk, nil, "the seeded ask blocks the session", func() bool {
@@ -1672,7 +1672,7 @@ func pinnedVerbWatcher(t *testing.T, f *fakeOpencode, sid string) (*opencodeWatc
 	f.setPinGuard(sid)
 	f.holdOpenSSE()
 	clk := opencodeClock()
-	w := newOpencodeWatcher(f.port(t), ocFixtureDir, sid, clk.now, nil)
+	w := newOpencodeWatcher(f.port(t), ocFixtureDir, sid, time.Time{}, clk.now, nil)
 	t.Cleanup(w.close)
 	return w, clk
 }
@@ -1755,9 +1755,9 @@ func TestOpencodeVerbsLeaveOtherSessionUntouched(t *testing.T) {
 	f.holdOpenSSE()
 	clk := opencodeClock()
 	// Both watchers speak to the same embedded server; each is pinned to its own session.
-	a := newOpencodeWatcher(f.port(t), ocFixtureDir, ocFixtureSID, clk.now, nil)
+	a := newOpencodeWatcher(f.port(t), ocFixtureDir, ocFixtureSID, time.Time{}, clk.now, nil)
 	t.Cleanup(a.close)
-	b := newOpencodeWatcher(f.port(t), ocOtherDir, ocOtherSID, clk.now, nil)
+	b := newOpencodeWatcher(f.port(t), ocOtherDir, ocOtherSID, time.Time{}, clk.now, nil)
 	t.Cleanup(b.close)
 	// No pinGuard here (both ids are legitimate for SOME watcher) — the assertion is that
 	// A's verbs produced no traffic addressed to B.
@@ -1935,7 +1935,7 @@ func TestOpencodeWatcherRejectsMalformedPriorPin(t *testing.T) {
 				<-ctx.Done()
 			}
 			clk := opencodeClock()
-			w := newOpencodeWatcher(f.port(t), ocFixtureDir, bad, clk.now, nil)
+			w := newOpencodeWatcher(f.port(t), ocFixtureDir, bad, time.Time{}, clk.now, nil)
 			t.Cleanup(w.close)
 
 			if got := w.getPinned(); got != "" {
@@ -1973,7 +1973,7 @@ func TestOpencodeWatcherRejectsMalformedDiscoveredPin(t *testing.T) {
 		<-ctx.Done()
 	}
 	clk := opencodeClock()
-	w := newOpencodeWatcher(f.port(t), ocFixtureDir, "", clk.now, nil)
+	w := newOpencodeWatcher(f.port(t), ocFixtureDir, "", time.Time{}, clk.now, nil)
 	t.Cleanup(w.close)
 
 	for i := 0; i < 20; i++ {

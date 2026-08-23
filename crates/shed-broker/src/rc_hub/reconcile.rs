@@ -661,12 +661,64 @@ impl Hub {
             }
         }
 
+        // Publish conversation ownership, after the track lock is released.
+        //
+        // Age alone cannot settle who owns a conversation in a shared opencode
+        // store: a session that started FIRST and then sat idle will happily
+        // adopt the conversation a later session is actively using, because
+        // that conversation is newer than the adopter. Only the hub sees every
+        // session, so the hub is what tells each watcher which ids are already
+        // spoken for — every tick, because a neighbour's pin usually does not
+        // exist yet when the watcher is built.
+        self.publish_claims();
+
         // Janitor for the cursor ingest queues: runs after the track release —
         // it takes its own lock and the two are never held together.
         self.ingest.prune(now, &present);
 
         for e in &events {
             self.broadcast(e);
+        }
+    }
+
+    /// Tell every claim-holding watcher which agent-session ids belong to the
+    /// OTHER tracked sessions. See [`crate::rc_hub::watch::ClaimHolder`].
+    ///
+    /// Snapshot the (slug, watcher) pairs under the lock, then do the pushing
+    /// with the lock released: `set_claimed` takes the watcher's own mutex, and
+    /// holding two locks in one order here and the other order anywhere else is
+    /// how a deadlock is written.
+    fn publish_claims(&self) {
+        let holders: Vec<(String, Arc<dyn SessionWatcher + Send + Sync>)> = {
+            let ts = self.lock_track();
+            ts.tracked
+                .iter()
+                .filter_map(|(slug, tr)| {
+                    let w = tr.watcher.clone()?;
+                    w.as_claim_holder()?;
+                    Some((slug.clone(), w))
+                })
+                .collect()
+        };
+        if holders.len() < 2 {
+            return; // nothing can be contested
+        }
+        let pins: Vec<(String, String)> = holders
+            .iter()
+            .filter_map(|(slug, w)| {
+                let id = w.as_claim_holder()?.pinned_agent_id();
+                (!id.is_empty()).then(|| (slug.clone(), id))
+            })
+            .collect();
+        for (slug, w) in &holders {
+            let others: Vec<String> = pins
+                .iter()
+                .filter(|(owner, _)| owner != slug)
+                .map(|(_, id)| id.clone())
+                .collect();
+            if let Some(h) = w.as_claim_holder() {
+                h.set_claimed(others);
+            }
         }
     }
 
@@ -706,10 +758,22 @@ impl Hub {
             // A prior back-written SHED_RC_AGENT_SESSION is the trusted pin;
             // "" means the watcher searches its SSE stream for the id.
             let agent_id = agent_session_env(&tmux, &s.tmux_session);
+            // When this RC session was created. opencode's store is shared per
+            // PROJECT, so `/session` lists a neighbouring RC session's
+            // conversations too and the directory alone cannot tell them
+            // apart — the watcher refuses to adopt one older than the session
+            // itself. Unparseable/absent → the epoch, which disables the check.
+            let not_before = s
+                .created_at
+                .as_deref()
+                .and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok())
+                .map(|t| t.with_timezone(&chrono::Utc))
+                .unwrap_or_else(|| chrono::DateTime::<chrono::Utc>::UNIX_EPOCH);
             return Some(OpencodeWatcher::new(
                 port,
                 workdir,
                 &agent_id,
+                not_before,
                 Arc::clone(&self.cfg.now),
                 Some(Arc::clone(&self.cfg.logf)),
             ));

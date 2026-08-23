@@ -105,6 +105,12 @@ pub trait SessionWatcher: Send + Sync {
         None
     }
     /// Go's `approvalBlocker` type-assert (`watch_opencode_transport.go:143`).
+    /// The claim seam ([`ClaimHolder`]) — opencode only; every other lane
+    /// owns its conversation by construction.
+    fn as_claim_holder(&self) -> Option<&dyn ClaimHolder> {
+        None
+    }
+
     fn as_approval_blocker(&self) -> Option<&dyn ApprovalBlocker> {
         None
     }
@@ -162,6 +168,25 @@ pub trait CursorIngester {
 pub trait ConfirmedAgentIdDrainer {
     /// Returns and clears a newly confirmed id ("" when none/already drained).
     fn drain_confirmed_agent_id(&self) -> String;
+}
+
+/// **One conversation, one owner.**
+///
+/// opencode servers are per-RC-session but read a SHARED per-project store, so
+/// every watcher in a repository can see — and adopt — every other RC session's
+/// conversation. Age alone cannot settle it: a session that starts FIRST and
+/// stays idle will happily adopt the conversation a session started later is
+/// actively using, because that conversation is newer than the adopter.
+///
+/// So the hub, which is the only party that can see all of them, tells each
+/// watcher which ids are already spoken for. Pushed every tick rather than at
+/// construction: the neighbour's pin usually does not exist yet when this
+/// watcher is built.
+pub trait ClaimHolder {
+    /// The id this watcher has pinned, or "" while it is still searching.
+    fn pinned_agent_id(&self) -> String;
+    /// Ids pinned by OTHER sessions, which this watcher must never adopt.
+    fn set_claimed(&self, ids: Vec<String>);
 }
 
 /// The hub's logger seam (Go's `func(string, ...any)`): pre-formatted lines,

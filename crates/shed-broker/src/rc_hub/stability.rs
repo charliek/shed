@@ -24,7 +24,7 @@ use std::time::Duration;
 use chrono::{DateTime, Utc};
 use regex::Regex;
 use shed_core::rc::{RcActivity, RcKind};
-use shed_core::rc_agents::prompt_anchor_for;
+use shed_core::rc_agents::{prompt_anchor_for, working_anchor_for};
 
 /// Returns the current pane text for the tracked session; the error (e.g. the
 /// tmux session vanished) is surfaced by [`StabilityTracker::tick`] unchanged
@@ -62,6 +62,8 @@ pub struct StabilityTracker {
     quiet: Duration,
     /// The kind's prompt anchor; `None` ⇒ stable always reads idle.
     anchor: Option<&'static Regex>,
+    /// The kind's in-turn chrome; a match VETOES `needs_input`.
+    working: Option<&'static Regex>,
 
     has_prev: bool,
     prev_norm: String,
@@ -92,6 +94,7 @@ impl StabilityTracker {
             now,
             quiet,
             anchor: prompt_anchor_for(kind),
+            working: working_anchor_for(kind),
             has_prev: false,
             prev_norm: String::new(),
             stable_since: DateTime::<Utc>::MIN_UTC,
@@ -136,8 +139,12 @@ impl StabilityTracker {
             .to_std()
             .unwrap_or(Duration::ZERO);
         if held >= self.quiet {
+            // The composer alone is not proof of waiting — codex draws it while
+            // it works — so in-turn chrome on the SAME pane wins over the prompt
+            // anchor. A quiet-but-working pane reads idle, never needs_input.
+            let mid_turn = self.working.is_some_and(|w| w.is_match(&pane));
             self.activity = match self.anchor {
-                Some(anchor) if anchor.is_match(&pane) => RcActivity::NeedsInput,
+                Some(anchor) if !mid_turn && anchor.is_match(&pane) => RcActivity::NeedsInput,
                 _ => RcActivity::Idle,
             };
         }

@@ -74,6 +74,15 @@ type AgentSpec struct {
 	// pane-derived and that expose no anchor. Matched against the RAW captured pane
 	// (not the normalized snapshot) so composer chrome survives.
 	PromptAnchor *regexp.Regexp
+	// WorkingAnchor matches this tool's IN-TURN chrome — the hint it draws while a
+	// turn is running ("esc to interrupt", "ctrl+c to stop"). A pane matching it is
+	// mid-turn, which VETOES "waiting for input" however quiet the pane has gone.
+	//
+	// It exists because the composer is not proof of waiting: codex draws its
+	// composer WHILE WORKING (captured live), so a pane that merely stopped changing
+	// for a few seconds could be read as needs_input and accept a posted line into a
+	// running turn. nil for kinds that draw no such hint.
+	WorkingAnchor *regexp.Regexp
 	// ApprovalAnchor matches a pane showing this tool's APPROVAL dialog — the chrome a
 	// TUI puts up when it is blocked on the operator's yes/no. It is the pane-side
 	// counterpart to a lane's native approval events: kinds whose approvals never reach
@@ -454,8 +463,9 @@ var agentRegistry = []*AgentSpec{
 			PermModeAuto: {"--ask-for-approval", "on-request", "--sandbox", "workspace-write"},
 			PermModeSkip: {"--dangerously-bypass-approvals-and-sandbox"},
 		},
-		AuthHint:     "run `codex` and complete login (`codex login`)",
-		PromptAnchor: codexPromptAnchorRe,
+		AuthHint:      "run `codex` and complete login (`codex login`)",
+		PromptAnchor:  codexPromptAnchorRe,
+		WorkingAnchor: codexWorkingRe,
 		// codex's approvals never reach a protocol — its rollout JSONL filters every
 		// approval record out (see plan 008 §2), so a session blocked on the overlay is
 		// byte-identical in the log to a long-running tool call. The pane is the only
@@ -509,7 +519,8 @@ var agentRegistry = []*AgentSpec{
 		AuthHint: "run `cursor-agent login`",
 		// cursorReadyRe is the authed composer placeholder ("→ Plan, search, build
 		// anything", testdata/panes/cursor-ready.txt) — reused as the prompt anchor.
-		PromptAnchor: cursorReadyRe,
+		PromptAnchor:  cursorPromptAnchorRe,
+		WorkingAnchor: cursorWorkingRe,
 		// cursor emits NO approval hook event (verified in the spike): a session blocked on
 		// the allowlist prompt looks, on the hook stream, exactly like a long tool call. So
 		// — as for codex — the pane is the only evidence, and it is what drives both the
@@ -541,6 +552,21 @@ var agentRegistry = []*AgentSpec{
 func promptAnchorFor(k Kind) *regexp.Regexp {
 	if spec, ok := specForKind(k); ok {
 		return spec.PromptAnchor
+	}
+	return nil
+}
+
+// workingAnchorFor returns the kind's IN-TURN chrome regex, or nil when the kind
+// declares none. A pane matching it is mid-turn, which vetoes "waiting for input"
+// however quiet the pane has gone.
+//
+// codex draws its composer WHILE WORKING — captured live — so the composer alone
+// was never proof of waiting, and a pane that merely stopped changing for a few
+// seconds could be read as needs_input and accept a posted line into a running
+// turn. cursor is the same once its right-aligned hint is on screen.
+func workingAnchorFor(k Kind) *regexp.Regexp {
+	if spec, ok := specForKind(k); ok {
+		return spec.WorkingAnchor
 	}
 	return nil
 }
@@ -749,11 +775,22 @@ func classifyClaude(kind Kind, pane string) PaneResult {
 }
 
 // codexComposerPlaceholder is the regex source for codex's empty-composer
-// placeholder line ("› Find and fix a bug in @filename",
-// testdata/panes/codex-ready.txt line 40). Hoisted so codexReadyRe (banner OR
-// composer ⇒ ready) and codexPromptAnchorRe (composer only ⇒ needs_input anchor)
-// share one literal and can't silently drift apart if codex rewords the hint.
-const codexComposerPlaceholder = `Find and fix a bug in @filename`
+// placeholder line. Hoisted so codexReadyRe (banner OR composer ⇒ ready) and
+// codexPromptAnchorRe (composer only ⇒ needs_input anchor) share one literal
+// and can't silently drift apart if codex rewords the hint.
+//
+// An ALTERNATION, because codex has already reworded it once: builds through
+// mid-2026 print "Find and fix a bug in @filename"
+// (testdata/panes/codex-ready.txt line 40), newer ones print "Ask Codex to do
+// anything". Both stay — recognizing a new build must not stop recognizing an
+// old one.
+//
+// Observed when the live wording drifted past the anchor: the startup BANNER
+// (the other ready alternative) scrolls out of the capture window after the
+// first turn, so a codex session sitting visibly at its composer classified
+// `starting` forever — a blocking lifecycle, which made the hub refuse typed
+// input and render no activity for it.
+const codexComposerPlaceholder = `Find and fix a bug in @filename|Ask Codex to do anything`
 
 var (
 	// codex: the composer banner means codex is usable — it wins even over the MCP
@@ -781,6 +818,20 @@ func classifyCodex(_ Kind, pane string) PaneResult {
 	}
 	if codexAuthRe.MatchString(pane) {
 		return PaneResult{State: StateNeedsAuth}
+	}
+	// The in-turn hint is checked AFTER trust/auth, not before: it is an unanchored
+	// phrase, so a transcript that quotes it (or a codex relaunched by hand in the
+	// same pane, leaving the old text in scrollback) could otherwise mask a sign-in
+	// screen that is on the display RIGHT NOW.
+	if codexWorkingRe.MatchString(pane) {
+		return PaneResult{State: StateReady}
+	}
+	// Same rule as cursor's, and checked AFTER trust/auth so those keep their
+	// precedence: codex's approval overlay replaces the composer, so without this
+	// a session waiting on an approval reads starting — blocking — once the
+	// startup banner has scrolled away.
+	if codexApprovalAnchorRe.MatchString(pane) {
+		return PaneResult{State: StateReady}
 	}
 	return PaneResult{State: StateStarting}
 }
@@ -888,7 +939,42 @@ var cursorAuthRe = regexp.MustCompile(`(?i)Press any key to log in\.\.\.|Authent
 // input" chrome, so both must classify ready (a live capture proved the follow-up
 // form dropped the session back to starting). Also reused as cursor's stability
 // PromptAnchor, so needs_input fires at either composer.
-var cursorReadyRe = regexp.MustCompile(`(?m)^\s*→ (?:Plan, search, build anything|Add a follow-up)\s*$`)
+// The trailing group accommodates the hint cursor RIGHT-ALIGNS on the composer
+// line while a turn runs ("ctrl+c to stop"): a bare-line anchor classified a
+// working session as starting — a blocking lifecycle — for as long as it worked.
+// Two or more spaces plus non-space keeps it a right-aligned hint rather than
+// prose that happens to contain the label.
+var cursorReadyRe = regexp.MustCompile(`(?m)^\s*→ (?:Plan, search, build anything|Add a follow-up)(?:[ \t]{2,}\S[^\n]*)?\s*$`)
+
+// cursorPromptAnchorRe is cursor's WAITING anchor, and it is deliberately STRICTER
+// than cursorReadyRe: the bare composer line, nothing trailing.
+//
+// The two answer different questions and must not share a regex. "Is this agent
+// up?" wants every scrap of chrome it can get (that is why cursorReadyRe tolerates
+// the right-aligned hint). "Is it waiting for me?" is the one the INPUT GATE reads,
+// and there a false yes delivers a keystroke into a running turn — so it takes the
+// composer's resting form only, and the working anchor below vetoes even that.
+var cursorPromptAnchorRe = regexp.MustCompile(`(?m)^\s*→ (?:Plan, search, build anything|Add a follow-up)\s*$`)
+
+// cursorWorkingRe is cursor's in-turn chrome: proof the TUI is up, and the only
+// such proof for a pane whose composer is otherwise covered.
+var cursorWorkingRe = regexp.MustCompile(`ctrl\+c to stop`)
+
+// cursorStatusRe is cursor's STATUS BAR — "Cursor <model> · <pct>%" — the one piece
+// of chrome that survives everything the composer does not.
+//
+// The composer line is content, and content changes: its placeholder differs fresh
+// vs mid-conversation, it grows a right-aligned hint while working, and the moment
+// anyone TYPES the placeholder is replaced by their words. Each of those dropped a
+// live session back to starting — a blocking lifecycle — while it sat plainly
+// alive on screen. The status bar is drawn by the TUI itself and says nothing
+// about what the user or the agent is doing, which is exactly why it is the right
+// thing to anchor "is this up?" on.
+var cursorStatusRe = regexp.MustCompile(`(?m)^[ \t]*Cursor .+ · [0-9]+(?:\.[0-9]+)?%[ \t]*$`)
+
+// codexWorkingRe is codex's in-turn chrome — the interrupt hint it prints while a
+// turn runs. Proof the TUI is up, independent of any composer wording.
+var codexWorkingRe = regexp.MustCompile(`esc to interrupt`)
 
 // classifyCursor derives a cursor-agent pane's lifecycle state. The auth screens and
 // the authed composer are disjoint, so auth is checked first and ready second;
@@ -897,7 +983,18 @@ func classifyCursor(_ Kind, pane string) PaneResult {
 	if cursorAuthRe.MatchString(pane) {
 		return PaneResult{State: StateNeedsAuth}
 	}
-	if cursorReadyRe.MatchString(pane) {
+	if cursorReadyRe.MatchString(pane) || cursorWorkingRe.MatchString(pane) ||
+		cursorStatusRe.MatchString(pane) {
+		return PaneResult{State: StateReady}
+	}
+	// An approval dialog PROVES the agent is up: it only exists because a turn ran
+	// far enough to ask for something. cursor's modal covers the composer, so the
+	// ready anchor alone reported starting for a session that was running and
+	// waiting on a person — and starting is a BLOCKING lifecycle, which suppresses
+	// the activity dimension entirely, so clients could neither show "needs
+	// approval" nor accept a keystroke. Lifecycle answers "is it up"; the activity
+	// dimension answers "what is it doing".
+	if cursorApprovalAnchorRe.MatchString(pane) {
 		return PaneResult{State: StateReady}
 	}
 	return PaneResult{State: StateStarting}

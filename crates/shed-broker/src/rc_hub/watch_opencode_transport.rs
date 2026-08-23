@@ -193,6 +193,20 @@ pub struct OpencodeWatcher {
     port: u16,
     /// Canonical (symlink-resolved) session workdir, for the dir-match pin.
     workdir: String,
+    /// When the RC SESSION was created. A conversation older than this belongs
+    /// to somebody else.
+    ///
+    /// opencode servers are per-RC-session (own port) but read a SHARED
+    /// per-project store, so `/session` lists every conversation in the
+    /// directory — including other RC sessions'. Directory alone therefore
+    /// cannot tell two agents in one repo apart, and the newest-match rule
+    /// adopted a neighbour's conversation and seeded its whole history into
+    /// this session's feed. Observed live: two opencode sessions in
+    /// `/home/shed/prox`, one showing the other's exchange.
+    ///
+    /// A zero timestamp disables the check (an RC session with no readable
+    /// creation time keeps the old behaviour rather than losing correlation).
+    not_before: DateTime<Utc>,
     /// A prior back-written SHED_RC_AGENT_SESSION ("" if none) — a trusted pin.
     prior_id: String,
     now_fn: Arc<dyn Fn() -> DateTime<Utc> + Send + Sync>,
@@ -248,6 +262,8 @@ struct WatcherState {
     // correlation
     /// The session id we filter/seed on ("" while still searching).
     pinned_id: String,
+    /// Ids pinned by OTHER rc sessions — never adopted. See `ClaimHolder`.
+    claimed: Vec<String>,
     /// An SSE-discovered pin awaiting drain ("" = none/drained).
     confirmed_id: String,
     /// A discovered pin was enqueued once (do not re-enqueue on reconnect).
@@ -350,6 +366,7 @@ impl OpencodeWatcher {
         port: u16,
         workdir: &str,
         agent_id: &str,
+        not_before: DateTime<Utc>,
         now_fn: Arc<dyn Fn() -> DateTime<Utc> + Send + Sync>,
         logf: Option<LogFn>,
     ) -> Arc<OpencodeWatcher> {
@@ -368,6 +385,7 @@ impl OpencodeWatcher {
         let w = Arc::new(OpencodeWatcher {
             port,
             workdir: canonical_dir(workdir),
+            not_before,
             prior_id: agent_id.clone(),
             now_fn,
             logf,
@@ -386,6 +404,7 @@ impl OpencodeWatcher {
                 inbox: Vec::new(),
                 inbox_bytes: 0,
                 resolving: HashMap::new(),
+                claimed: Vec::new(),
                 pinned_id: agent_id, // a prior back-write is the pin; "" = "search the SSE stream"
                 confirmed_id: String::new(),
                 confirmed_once: false,
@@ -669,6 +688,10 @@ pub(crate) fn dir_match_canon(event_dir: &str, canon_workdir: &str) -> bool {
 // ---------------------------------------------------------------------------
 
 impl SessionWatcher for OpencodeWatcher {
+    fn as_claim_holder(&self) -> Option<&dyn super::watch::ClaimHolder> {
+        Some(self)
+    }
+
     /// Drains the inbox under the mutex and folds each payload into the
     /// (single-writer) fold (`refresh`), mirroring the file watcher's refresh
     /// but sourced from the inbox rather than a tailer. A seed-complete
@@ -868,6 +891,16 @@ impl super::verbs::ApprovalResolver for OpencodeWatcher {
         decision: &'a str,
     ) -> super::verbs::LaneFuture<'a, ()> {
         Box::pin(OpencodeWatcher::resolve_approval(self, id, decision))
+    }
+}
+
+impl super::watch::ClaimHolder for OpencodeWatcher {
+    fn pinned_agent_id(&self) -> String {
+        self.lock().pinned_id.clone()
+    }
+
+    fn set_claimed(&self, ids: Vec<String>) {
+        self.lock().claimed = ids;
     }
 }
 
@@ -1618,6 +1651,17 @@ struct OcPeekInfo {
     parent_id: String,
     #[serde(default, deserialize_with = "null_default")]
     directory: String,
+    #[serde(default, deserialize_with = "null_default")]
+    time: RestSessionTime,
+}
+
+impl OcPeekInfo {
+    /// The conversation's creation stamp in epoch milliseconds, or 0 when the
+    /// frame carries none (older opencode builds) — which the age check reads
+    /// as "cannot tell", not as "ancient".
+    fn time_created(&self) -> i64 {
+        self.time.created
+    }
 }
 
 impl OcPeek {
@@ -1709,6 +1753,18 @@ struct RestSessionEntry {
     directory: String,
     #[serde(default, rename = "parentID", deserialize_with = "null_default")]
     parent_id: String,
+    /// `null_default`, not a bare `#[serde(default)]`: Go decodes a literal
+    /// `"time": null` to the zero value and carries on, and a differential pair
+    /// cannot have one side reject a payload the other accepts.
+    #[serde(default, deserialize_with = "null_default")]
+    time: RestSessionTime,
+}
+
+/// opencode stamps its sessions in epoch MILLISECONDS.
+#[derive(Debug, Default, serde::Deserialize)]
+struct RestSessionTime {
+    #[serde(default)]
+    created: i64,
 }
 
 // ---- synthesized-envelope emission (transport.go:1359-1398) ----
@@ -2131,11 +2187,34 @@ impl OpencodeWatcher {
             if !valid_opencode_session_id(&s.id) || !s.parent_id.is_empty() {
                 continue; // same rule as the SSE pin: an unaddressable id is never followed
             }
+            if self.is_claimed(&s.id) {
+                continue; // another rc session already owns this conversation
+            }
+            if !self.created_late_enough(s.time.created) {
+                continue; // predates this RC session: another session's conversation
+            }
             if dir_match_canon(&s.directory, &self.workdir) {
                 return Some(s.id);
             }
         }
         None
+    }
+
+    /// Whether another rc session has already pinned `id`.
+    fn is_claimed(&self, id: &str) -> bool {
+        !id.is_empty() && self.lock().claimed.iter().any(|c| c == id)
+    }
+
+    /// Whether a conversation stamped `created_ms` (epoch milliseconds) is new
+    /// enough to belong to this RC session. See [`Self::not_before`].
+    fn created_late_enough(&self, created_ms: i64) -> bool {
+        if self.not_before.timestamp_millis() <= 0 || created_ms <= 0 {
+            return true; // nothing to compare against — do not lose correlation
+        }
+        // A second of slack: the RC session's stamp and opencode's are taken by
+        // different processes, and the conversation of a session created with a
+        // kickoff prompt is stamped within moments of the session itself.
+        created_ms >= self.not_before.timestamp_millis() - 1_000
     }
 
     /// A trusted pin from a session.created/session.updated frame on our own
@@ -2151,6 +2230,12 @@ impl OpencodeWatcher {
             return None; // a malformed id is not addressable, so it is not a pin
         }
         if !dir_match_canon(&info.directory, &self.workdir) {
+            return None;
+        }
+        // `session.updated` fires for a NEIGHBOUR's conversation too — same
+        // store, same directory — so both ownership checks apply on this path
+        // as well, not only on the REST one.
+        if self.is_claimed(&info.id) || !self.created_late_enough(info.time_created()) {
             return None;
         }
         Some(info.id.clone())
@@ -2791,7 +2876,14 @@ mod tests {
         agent_id: &str,
         clk: &TestClock,
     ) -> Arc<OpencodeWatcher> {
-        OpencodeWatcher::new(f.port(), workdir, agent_id, clk.now_fn(), None)
+        OpencodeWatcher::new(
+            f.port(),
+            workdir,
+            agent_id,
+            DateTime::<Utc>::UNIX_EPOCH,
+            clk.now_fn(),
+            None,
+        )
     }
 
     fn fixture_frames() -> Vec<String> {
@@ -3000,6 +3092,135 @@ mod tests {
             w.drain_confirmed_agent_id(),
             "",
             "a prior back-write is not re-confirmed"
+        );
+        w.close();
+    }
+
+    /// A bug seen live, on a setup the product actively encourages: two
+    /// opencode RC sessions running in the SAME repository.
+    ///
+    /// Each gets its own opencode server on its own port, and those servers
+    /// read a SHARED per-project session store — so `GET /session` lists the
+    /// neighbour's conversations too, and the directory cannot tell them
+    /// apart. The newest-match rule therefore adopted whatever conversation
+    /// was most recent in that directory and seeded its entire history into
+    /// this session's feed: two agents, one transcript, and no way for a
+    /// reader to know whose words they were looking at.
+    ///
+    /// The discriminator is time. A conversation that existed BEFORE this RC
+    /// session did cannot be its own.
+    #[test]
+    fn a_neighbours_conversation_is_not_adopted() {
+        // 2026-08-23T18:27:42Z, the session in the live report.
+        let session_start = DateTime::<Utc>::from_timestamp_millis(1_787_509_662_000).unwrap();
+        let neighbour = session_start.timestamp_millis() - 7 * 60 * 1000;
+        let mine = session_start.timestamp_millis() + 30 * 1000;
+        let entry = |id: &str, at: i64| {
+            format!(r#"{{"id":"{id}","directory":"{DIR}","parentID":"","time":{{"created":{at}}}}}"#)
+        };
+
+        // (a) a conversation older than the session is not adopted.
+        let f = FakeOpencode::new();
+        f.set(|s| s.session_body(&format!("[{}]", entry(OTHER_SID, neighbour))));
+        let clk = TestClock::new();
+        let w = OpencodeWatcher::new(f.port(), DIR, "", session_start, clk.now_fn(), None);
+        assert_eq!(
+            w.rest_find_candidate(),
+            None,
+            "adopted a conversation that predates this session"
+        );
+        w.close();
+
+        // (b) its own conversation still correlates — and the neighbour's is
+        // listed FIRST, newest-updated, exactly as opencode returns them.
+        let f = FakeOpencode::new();
+        f.set(|s| {
+            s.session_body(&format!(
+                "[{},{}]",
+                entry(OTHER_SID, neighbour),
+                entry(SID, mine)
+            ))
+        });
+        let w = OpencodeWatcher::new(f.port(), DIR, "", session_start, clk.now_fn(), None);
+        assert_eq!(w.rest_find_candidate().as_deref(), Some(SID));
+        w.close();
+
+        // (c) losing correlation entirely would be a worse failure than the
+        // one being fixed, so a session that cannot say when it started, and
+        // an opencode too old to stamp its sessions, both still adopt.
+        let f = FakeOpencode::new();
+        f.set(|s| s.session_body(&format!("[{}]", entry(OTHER_SID, neighbour))));
+        let w = OpencodeWatcher::new(
+            f.port(),
+            DIR,
+            "",
+            DateTime::<Utc>::UNIX_EPOCH,
+            clk.now_fn(),
+            None,
+        );
+        assert_eq!(w.rest_find_candidate().as_deref(), Some(OTHER_SID));
+        w.close();
+
+        let f = FakeOpencode::new();
+        f.set(|s| {
+            s.session_body(&format!(
+                r#"[{{"id":"{OTHER_SID}","directory":"{DIR}","parentID":""}}]"#
+            ))
+        });
+        let w = OpencodeWatcher::new(f.port(), DIR, "", session_start, clk.now_fn(), None);
+        assert_eq!(
+            w.rest_find_candidate().as_deref(),
+            Some(OTHER_SID),
+            "a missing stamp means 'cannot tell', not 'ancient'"
+        );
+        w.close();
+
+        // (d) THE ORDERING AGE CANNOT SETTLE, and the reason claims exist: a
+        // session that started FIRST and then sat idle must not adopt the
+        // conversation a LATER session is actively using. That conversation is
+        // newer than the adopter, so every age rule says yes; only ownership
+        // says no.
+        let later = session_start.timestamp_millis() + 5 * 60 * 1000;
+        let f = FakeOpencode::new();
+        f.set(|s| s.session_body(&format!("[{}]", entry(OTHER_SID, later))));
+        let w = OpencodeWatcher::new(f.port(), DIR, "", session_start, clk.now_fn(), None);
+        assert_eq!(
+            w.rest_find_candidate().as_deref(),
+            Some(OTHER_SID),
+            "unclaimed, it is a legitimate candidate"
+        );
+        {
+            use super::super::watch::ClaimHolder as _;
+            w.set_claimed(vec![OTHER_SID.to_string()]);
+        }
+        assert_eq!(
+            w.rest_find_candidate(),
+            None,
+            "a conversation another session owns is never adopted, however new"
+        );
+        // The same on the SSE path.
+        assert_eq!(w.root_pin_from_created(&{
+            let e = entry(OTHER_SID, later);
+            peek_envelope(
+                format!(r#"{{"type":"session.updated","properties":{{"info":{e}}}}}"#).as_bytes(),
+            )
+        }), None);
+        w.close();
+
+        // (e) the REST path is not the only way in: session.updated fires for
+        // every conversation in the shared store, so the age rule applies
+        // there too.
+        let w = OpencodeWatcher::new(f.port(), DIR, "", session_start, clk.now_fn(), None);
+        let frame = |id: &str, at: i64| {
+            peek_envelope(
+                format!(r#"{{"type":"session.updated","properties":{{"info":{}}}}}"#, entry(id, at))
+                    .as_bytes(),
+            )
+        };
+        assert_eq!(w.root_pin_from_created(&frame(OTHER_SID, neighbour)), None);
+        assert_eq!(
+            w.root_pin_from_created(&frame(SID, mine)).as_deref(),
+            Some(SID)
         );
         w.close();
     }
@@ -3233,7 +3454,7 @@ mod tests {
         drop(listener);
 
         let clk = TestClock::new();
-        let w = OpencodeWatcher::new(port, DIR, SID, clk.now_fn(), None);
+        let w = OpencodeWatcher::new(port, DIR, SID, DateTime::<Utc>::UNIX_EPOCH, clk.now_fn(), None);
         for _ in 0..20 {
             w.refresh(clk.now());
             let (_, _, fresh, exp) = w.snapshot(clk.now());

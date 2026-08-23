@@ -522,6 +522,16 @@ func (h *Hub) reconcile() {
 
 	h.trackMu.Unlock()
 
+	// Publish conversation ownership, after the trackMu release.
+	//
+	// Age alone cannot settle who owns a conversation in a shared opencode store: a
+	// session that started FIRST and then sat idle will happily adopt the
+	// conversation a later session is actively using, because that conversation is
+	// newer than the adopter. Only the hub sees every session, so the hub is what
+	// tells each watcher which ids are already spoken for — every tick, because a
+	// neighbour's pin usually does not exist yet when the watcher is built.
+	h.publishClaims()
+
 	// Janitor for the cursor ingest queues: drop anything held for a slug that is gone or
 	// that never grew a watcher within the TTL (hub_ingest.go). Runs after the trackMu
 	// release — it takes its own lock and the two are never held together.
@@ -529,6 +539,46 @@ func (h *Hub) reconcile() {
 
 	for _, e := range events {
 		h.broadcast(e)
+	}
+}
+
+// publishClaims tells every claim-holding watcher which agent-session ids belong to
+// the OTHER tracked sessions (see claimHolder).
+//
+// The (slug, watcher) pairs are snapshotted under trackMu and the pushing happens
+// with it released: setClaimed takes the watcher's own mutex, and holding two locks
+// in one order here and the other order anywhere else is how a deadlock is written.
+func (h *Hub) publishClaims() {
+	type holder struct {
+		slug string
+		c    claimHolder
+	}
+	var holders []holder
+	h.trackMu.Lock()
+	for slug, tr := range h.tracked {
+		if c, ok := tr.watcher.(claimHolder); ok && tr.watcher != nil {
+			holders = append(holders, holder{slug: slug, c: c})
+		}
+	}
+	h.trackMu.Unlock()
+	if len(holders) < 2 {
+		return // nothing can be contested
+	}
+	type pin struct{ owner, id string }
+	var pins []pin
+	for _, hd := range holders {
+		if id := hd.c.pinnedAgentID(); id != "" {
+			pins = append(pins, pin{owner: hd.slug, id: id})
+		}
+	}
+	for _, hd := range holders {
+		others := make([]string, 0, len(pins))
+		for _, p := range pins {
+			if p.owner != hd.slug {
+				others = append(others, p.id)
+			}
+		}
+		hd.c.setClaimed(others)
 	}
 }
 
@@ -581,7 +631,13 @@ func (h *Hub) ensureWatcher(tr *trackedSession, s Session) sessionWatcher {
 		// A prior back-written SHED_RC_AGENT_SESSION (from an earlier hub lifetime) is the
 		// trusted pin; "" means the watcher searches its SSE stream for the session id.
 		agentID := agentSessionEnv(h.cfg.runner, s.TmuxSession)
-		return newOpencodeWatcher(port, s.Workdir, agentID, h.cfg.now, h.cfg.logf)
+		// When this RC session was created. opencode's store is shared per PROJECT,
+		// so /session lists a neighbouring RC session's conversations too and the
+		// directory alone cannot tell them apart — the watcher refuses to adopt one
+		// older than the session itself. Unparseable/absent → zero, which disables
+		// the check.
+		notBefore, _ := time.Parse(time.RFC3339, s.CreatedAt)
+		return newOpencodeWatcher(port, s.Workdir, agentID, notBefore, h.cfg.now, h.cfg.logf)
 	}
 
 	// cursor diverges from BOTH paths: its watcher is PUSH-fed by the agent's own hook
