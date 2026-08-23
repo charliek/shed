@@ -558,6 +558,50 @@ def test_killing_a_machine_session_routes_over_the_machine_not_a_server(machine_
     assert [r["slug"] for r in rows] == ["mch001"], "a failed kill must not drop the row"
 
 
+def test_launching_on_a_machine_routes_over_the_machine_not_a_server(machine_app):
+    """**Starting a session on a machine is a first-class create** (plan 012 R4).
+
+    Hermetically the create cannot succeed — it shells `ssh` to a host that does
+    not exist — and that is the assertion: the op must REACH the machine
+    transport and fail there, naming the machine. A wrong route would fail as a
+    bad shed/host lookup instead, which is exactly the bug this shape catches:
+    a machine is addressed by name over its own SSH, never by (host, shed)
+    through a server.
+    """
+    with pytest.raises(ShedError) as excinfo:
+        machine_app.call(
+            "machine.launch",
+            {"machine": "mini3", "kind": "claude-rc", "workdir": "/tmp"},
+        )
+    message = str(excinfo.value)
+    assert "machine:mini3" in message, (
+        f"the failure must name the machine it tried to reach: {message!r}"
+    )
+
+
+def test_launching_an_unknown_kind_on_a_machine_is_refused(machine_app):
+    """The same known-kind gate `rc.launch` applies. Serde preserves an unknown
+    kind verbatim (the unknown-kind READ policy), but starting one would ask the
+    far side to run something this build has never heard of — so the write path
+    refuses before any SSH happens."""
+    with pytest.raises(ShedError) as excinfo:
+        machine_app.call("machine.launch", {"machine": "mini3", "kind": "wat"})
+    message = str(excinfo.value)
+    assert "machine:mini3" not in message, (
+        f"an unknown kind must be refused BEFORE the transport: {message!r}"
+    )
+
+
+def test_probing_an_unknown_machine_is_rejected(machine_app):
+    """A capability probe for a machine that is not configured names the ones
+    that are, rather than failing as a transport error."""
+    with pytest.raises(ShedError) as excinfo:
+        machine_app.call("machine.capabilities", {"machine": "ghost"})
+    message = str(excinfo.value)
+    assert "ghost" in message
+    assert "mini3" in message or "sleepy" in message
+
+
 def test_killing_an_unknown_machine_is_rejected(machine_app):
     """A slug on a machine that is not configured fails with the configured
     names, rather than a confusing transport error."""

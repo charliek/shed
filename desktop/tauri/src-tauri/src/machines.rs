@@ -365,19 +365,7 @@ impl Machines {
         let mut out = Vec::new();
         for (name, m) in guard.iter() {
             for dto in &m.sessions {
-                let mut row = serde_json::to_value(dto).unwrap_or_else(|_| json!({}));
-                if let Some(obj) = row.as_object_mut() {
-                    obj.insert("origin".into(), json!(format!("machine:{name}")));
-                    obj.insert("origin_kind".into(), json!("machine"));
-                    obj.insert("machine".into(), json!(name));
-                    // A machine session belongs to no shed and no server. Spell
-                    // that explicitly rather than leaving the UI to infer it
-                    // from an empty string.
-                    obj.insert("host".into(), json!(format!("machine:{name}")));
-                    obj.insert("shed".into(), json!(""));
-                    obj.insert("stale".into(), json!(!m.reachable));
-                }
-                out.push(row);
+                out.push(machine_row(name, dto, !m.reachable));
             }
         }
         out
@@ -398,6 +386,88 @@ impl Machines {
             m.sessions.retain(|s| s.slug != slug);
         }
         Ok(())
+    }
+
+    /// This machine's RC capabilities — what a create form may offer.
+    ///
+    /// Probed on demand rather than cached with the watcher's snapshot: the
+    /// answer only matters when someone is about to start something, and a
+    /// machine that was asleep when the app launched would otherwise be stuck
+    /// with whatever the first probe said.
+    pub async fn capabilities(&self, machine: &str) -> Result<Option<Value>, String> {
+        let entry = self.entry(machine)?;
+        let caps = shed_app::machine::capabilities(&entry).await?;
+        Ok(caps.map(|c| serde_json::json!(c)))
+    }
+
+    /// Create a session ON this machine, and fold it into the local snapshot so
+    /// the row appears immediately rather than at the next reconcile.
+    pub async fn create(
+        &self,
+        machine: &str,
+        spec: shed_app::machine::MachineCreate<'_>,
+    ) -> Result<Value, String> {
+        let entry = self.entry(machine)?;
+        let session = shed_app::machine::create(&entry, spec).await?;
+        let value = machine_row(machine, &session, false);
+        {
+            let mut guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            // Only if the hub has not already delivered it. A create takes
+            // seconds (`--wait`), which is ample time for the watcher to
+            // observe the new slug and install an authoritative snapshot — an
+            // unconditional push would then show the same session twice, both
+            // rows under the same key, until some later snapshot happened to
+            // replace them. `get_mut` also means a machine dropped from the
+            // registry mid-create is not resurrected by its own result.
+            if let Some(m) = guard.get_mut(machine) {
+                if !m.sessions.iter().any(|s| s.slug == session.slug) {
+                    m.sessions.push(session);
+                }
+            }
+        }
+        // Outside the lock (it re-enters the app), and unconditional: a caller
+        // that is not the dialog — socket IPC, say — has nothing else that
+        // would tell the open UI the row exists.
+        (self.on_change)();
+        Ok(value)
+    }
+
+    /// Create a session from CALLER-SUPPLIED, un-normalized fields.
+    ///
+    /// The one place blank-vs-absent is decided, shared by the `machine.launch`
+    /// IPC op and the `machine_launch` Tauri command: the same request must not
+    /// mean two things depending on which door it came through. A field that is
+    /// blank or all whitespace is ABSENT — `"   "` as a working directory is
+    /// someone leaving the box empty, not a directory named three spaces.
+    pub async fn launch(
+        &self,
+        machine: &str,
+        kind: &shed_core::rc::RcKind,
+        display_name: Option<&str>,
+        workdir: Option<&str>,
+        permission_mode: Option<&str>,
+        initial_prompt: Option<&str>,
+    ) -> Result<Value, String> {
+        fn present(v: Option<&str>) -> Option<&str> {
+            v.map(str::trim).filter(|s| !s.is_empty())
+        }
+        let slug = shed_core::rc_agents::gen_slug();
+        let name = present(display_name)
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("{machine}/{slug}"));
+        self.create(
+            machine,
+            shed_app::machine::MachineCreate {
+                kind,
+                name: &name,
+                slug: &slug,
+                workdir: present(workdir),
+                created_by: "shed-desktop",
+                permission_mode: present(permission_mode),
+                prompt: present(initial_prompt),
+            },
+        )
+        .await
     }
 
     /// The interactive `ssh -t … tmux attach` command for one of this machine's
@@ -548,6 +618,28 @@ async fn consume(
         // event), and holding a std mutex across that is how a deadlock starts.
         on_change();
     }
+}
+
+/// One machine session as the UI reads it: the engine's DTO stamped with where
+/// it lives.
+///
+/// Shared by the list and by `create`'s return value — a caller that keys off
+/// `origin`/`machine` (or calls `sessionKey()`) must get the same shape from
+/// both, or the one place they differ becomes the one place a caller breaks.
+fn machine_row(name: &str, dto: &shed_core::rc::RcSessionDto, stale: bool) -> Value {
+    let mut row = serde_json::to_value(dto).unwrap_or_else(|_| json!({}));
+    if let Some(obj) = row.as_object_mut() {
+        obj.insert("origin".into(), json!(format!("machine:{name}")));
+        obj.insert("origin_kind".into(), json!("machine"));
+        obj.insert("machine".into(), json!(name));
+        // A machine session belongs to no shed and no server. Spell that
+        // explicitly rather than leaving the UI to infer it from an empty
+        // string.
+        obj.insert("host".into(), json!(format!("machine:{name}")));
+        obj.insert("shed".into(), json!(""));
+        obj.insert("stale".into(), json!(stale));
+    }
+    row
 }
 
 /// Patch a machine's held snapshot from one feed event.

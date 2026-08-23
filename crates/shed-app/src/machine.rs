@@ -352,25 +352,72 @@ async fn run_with_deadline(
     timeout: Duration,
     label: &str,
 ) -> Result<std::process::Output, String> {
+    run_with_deadline_stdin(argv, timeout, label, None).await
+}
+
+/// [`run_with_deadline`], plus a payload written to the child's stdin.
+///
+/// Only `create` needs this: a kickoff prompt rides stdin rather than argv so it
+/// can contain anything at all. The write happens on the SAME blocking task that
+/// waits, because a payload larger than the pipe buffer would otherwise block a
+/// writer nobody is draining.
+async fn run_with_deadline_stdin(
+    argv: &[String],
+    timeout: Duration,
+    label: &str,
+    stdin: Option<String>,
+) -> Result<std::process::Output, String> {
     let (bin, rest) = argv.split_first().expect("argv is never empty");
-    let child = std::process::Command::new(bin)
+    let mut child = std::process::Command::new(bin)
         .args(rest)
-        .stdin(std::process::Stdio::null())
+        .stdin(match stdin {
+            Some(_) => std::process::Stdio::piped(),
+            None => std::process::Stdio::null(),
+        })
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
         .map_err(|e| format!("{label}: running ssh: {e}"))?;
     let pid = child.id();
-
+    // The write runs on its OWN thread, concurrent with the wait below. Doing
+    // it inline before `wait_with_output` deadlocks in a real case: a payload
+    // larger than the stdin pipe buffer, against a child that fills stdout
+    // before draining stdin — neither side can progress and only the deadline
+    // breaks it. The join handle carries the write's own error, which is NOT
+    // discarded: a partially-written prompt that the far side still exits 0 on
+    // would otherwise be reported as a successful create of a session whose
+    // kickoff was truncated.
+    let writer = child.stdin.take().zip(stdin).map(|(mut w, payload)| {
+        std::thread::spawn(move || {
+            use std::io::Write as _;
+            let res = w.write_all(payload.as_bytes());
+            // Dropping the handle closes the pipe — the EOF a reader waits for.
+            drop(w);
+            res
+        })
+    });
     match tokio::time::timeout(
         timeout,
         tokio::task::spawn_blocking(move || child.wait_with_output()),
     )
     .await
     {
-        Ok(joined) => joined
-            .map_err(|e| format!("{label}: {e}"))?
-            .map_err(|e| format!("{label}: running ssh: {e}")),
+        Ok(joined) => {
+            let out = joined
+                .map_err(|e| format!("{label}: {e}"))?
+                .map_err(|e| format!("{label}: running ssh: {e}"))?;
+            // Consulted only on an otherwise-successful run: when the command
+            // itself failed, its own exit tells a better story than a broken
+            // pipe caused by that failure.
+            if out.status.success() {
+                if let Some(w) = writer {
+                    if matches!(w.join(), Ok(Err(_)) | Err(_)) {
+                        return Err(format!("{label}: writing the payload to ssh failed"));
+                    }
+                }
+            }
+            Ok(out)
+        }
         Err(_) => {
             // SIGKILL rather than SIGTERM: ssh with a wedged remote can ignore a
             // polite signal, and by here the caller has already given up. The
@@ -449,6 +496,93 @@ pub fn terminal_command(
     // built the same way, so a preview reads alike whichever kind it is.
     let command = shed_core::terminal::quote_argv(&argv);
     shed_core::terminal::TerminalCommand { argv, command }
+}
+
+/// Read a machine's RC capabilities: which kinds its engine advertises, which
+/// backing agents are actually installed, and the per-kind feature rows the UI
+/// renders controls from.
+///
+/// The one honest source for "what can I start here?" — a machine's answer
+/// differs from a shed's and from this Mac's, and guessing from the kind name is
+/// exactly the mistake the capability wire exists to prevent.
+/// Capabilities ride on the LIST envelope, so this is one `rc list` — the same
+/// call the watcher makes. An engine too old to advertise them answers with a
+/// list and no capabilities block, which is `None` rather than an error.
+pub async fn capabilities(
+    entry: &shed_core::config::MachineEntry,
+) -> Result<Option<shed_core::rc::RcCapabilities>, String> {
+    let prefix = shed_core::machine::rc_prefix(entry);
+    let mut argv = shed_core::rc::list_argv(prefix.last().expect("prefix is never empty"));
+    argv.splice(0..1, prefix.iter().cloned());
+    let out = exec(entry, &argv).await?;
+    Ok(shed_core::rc::decode_list_response(&out)
+        .map_err(|e| e.to_string())?
+        .capabilities)
+}
+
+/// Create a session on a machine, returning the created session.
+///
+/// `interactive_shell` is TRUE here and must be: the pane command is wrapped in
+/// `bash -ic` so a tool installed by a shell rc-file (mise, nvm, bun,
+/// `~/.local/bin`) is on PATH. Without it the pane inherits the bare ssh-exec
+/// PATH, the agent is not found, and the session comes up `dead` while the
+/// create still exits 0. A SHED must leave it off — there the sshd's own
+/// `bash -lc` wrap already supplies a login PATH. Same rule `sx` applies.
+pub async fn create(
+    entry: &shed_core::config::MachineEntry,
+    spec: MachineCreate<'_>,
+) -> Result<shed_core::rc::RcSessionDto, String> {
+    let prefix = shed_core::machine::rc_prefix(entry);
+    let (mut argv, stdin) = shed_core::rc::create_invocation_v2(&shed_core::rc::CreateSpec {
+        bin: prefix.last().expect("prefix is never empty"),
+        kind: spec.kind,
+        name: spec.name,
+        slug: spec.slug,
+        workdir: spec.workdir,
+        created_by: spec.created_by,
+        target: &format!("machine:{}", entry.name),
+        permission_mode: spec.permission_mode,
+        wait: true,
+        interactive_shell: true,
+        payload: match spec.prompt {
+            Some(p) => shed_core::rc::CreatePayload::Prompt(p),
+            None => shed_core::rc::CreatePayload::None,
+        },
+    })
+    .map_err(|e| e.to_string())?;
+    argv.splice(0..1, prefix.iter().cloned());
+
+    let ssh = shed_core::machine::ssh_argv(entry, &argv);
+    let label = format!("machine:{}", entry.name);
+    // `--wait` blocks on the far side while the agent comes up; the shared
+    // EXEC_TIMEOUT already has headroom over it.
+    let out = run_with_deadline_stdin(&ssh, EXEC_TIMEOUT, &label, stdin).await?;
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let err = shed_core::rc::error_from_exit_with_bin(
+            prefix.last().map(String::as_str).unwrap_or_default(),
+            out.status.code().unwrap_or(-1),
+            &stderr,
+            &stdout,
+        );
+        return Err(format!("{label}: {err}"));
+    }
+    shed_core::rc::decode_session(&String::from_utf8_lossy(&out.stdout))
+        .map_err(|e| format!("{label}: {e}"))
+}
+
+/// What a machine create needs beyond the machine itself. A borrowed spec
+/// rather than eight positional arguments, so a caller cannot transpose two
+/// strings that happen to have the same type.
+pub struct MachineCreate<'a> {
+    pub kind: &'a shed_core::rc::RcKind,
+    pub name: &'a str,
+    pub slug: &'a str,
+    pub workdir: Option<&'a str>,
+    pub created_by: &'a str,
+    pub permission_mode: Option<&'a str>,
+    pub prompt: Option<&'a str>,
 }
 
 /// Kill a session on a machine (idempotent — the engine exits 0 for a session

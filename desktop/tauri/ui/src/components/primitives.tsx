@@ -141,6 +141,40 @@ export function ActBtn({
   );
 }
 
+/** A bare-glyph action button — no fill, no border, 36px tap target.
+
+    For an action a card should not advertise. Deleting a session is the case
+    that matters: a tinted red box makes it the loudest thing on a row you are
+    usually only reading, and every session card has one. It stays unmistakable
+    (the trash glyph, in the danger colour) without being prominent. */
+export function GhostBtn({
+  icon: Icon,
+  onClick,
+  title,
+  spin,
+  disabled,
+  color = "var(--shed-err-fg)",
+}: {
+  icon: LucideIcon;
+  onClick?: () => void;
+  title?: string;
+  spin?: boolean;
+  disabled?: boolean;
+  color?: string;
+}) {
+  return (
+    <button
+      onClick={onClick}
+      title={title}
+      disabled={disabled}
+      className="hbtn inline-flex h-9 w-9 flex-none items-center justify-center rounded-[9px] bg-transparent"
+      style={{ border: "none", color, opacity: disabled ? 0.5 : 1, cursor: disabled ? "default" : "pointer" }}
+    >
+      <Icon size={16} className={spin ? "animate-spin" : undefined} />
+    </button>
+  );
+}
+
 /** The big page heading: title + optional accessory (inline), sub, and right slot. */
 export function PageHead({
   title,

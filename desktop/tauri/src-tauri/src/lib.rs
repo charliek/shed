@@ -323,6 +323,47 @@ async fn machine_kill(
     machines.kill(&machine, &slug).await
 }
 
+/// `machine_capabilities` — what the launch dialog may offer for a machine.
+#[tauri::command]
+async fn machine_capabilities(
+    machines: tauri::State<'_, Arc<machines::Machines>>,
+    machine: String,
+) -> Result<serde_json::Value, String> {
+    Ok(serde_json::json!({
+        "capabilities": machines.capabilities(&machine).await?,
+    }))
+}
+
+/// `machine_launch` — start a session on a MACHINE (plan 012 R4), the machine
+/// counterpart of [`rc_launch`]. Addressed by `(machine, …)` over that
+/// machine's own SSH rather than by `(host, shed, …)` through a server.
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+async fn machine_launch(
+    machines: tauri::State<'_, Arc<machines::Machines>>,
+    machine: String,
+    kind: RcKind,
+    display_name: Option<String>,
+    workdir: Option<String>,
+    permission_mode: Option<String>,
+    initial_prompt: Option<String>,
+) -> Result<serde_json::Value, String> {
+    // The same known-kind gate the shed launch applies: serde preserves an
+    // unknown kind as `Other(raw)`, and starting one would ask the far side to
+    // run something this build has never heard of.
+    ipc::ensure_known_kind(&kind)?;
+    machines
+        .launch(
+            &machine,
+            &kind,
+            display_name.as_deref(),
+            workdir.as_deref(),
+            permission_mode.as_deref(),
+            initial_prompt.as_deref(),
+        )
+        .await
+}
+
 /// `add_machine` — the dialog's path into [`machines::add_from_json`].
 #[tauri::command]
 fn add_machine(
@@ -918,6 +959,8 @@ pub fn run() {
             rc_launch,
             rc_kill,
             machine_kill,
+            machine_capabilities,
+            machine_launch,
             machines_list,
             add_machine,
             open_terminal,

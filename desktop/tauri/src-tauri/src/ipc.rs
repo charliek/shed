@@ -442,6 +442,8 @@ impl Handler {
             "machines.dump" => Ok(self.machines_dump()),
             "sidebar.dump" => Ok(self.sidebar_dump()),
             "machine.kill" => self.machine_kill(params).await,
+            "machine.launch" => self.machine_launch(params).await,
+            "machine.capabilities" => self.machine_capabilities(params).await,
             "machine.add" => self.machine_add(params),
             "agents.dump" => Ok(self.agents_dump()),
             "prefs.get" => Ok(self.prefs_get()),
@@ -932,6 +934,39 @@ impl Handler {
             .await
             .map_err(|e| err("action_failed", e))?;
         Ok(json!({}))
+    }
+
+    /// `machine.launch {machine, kind, display_name?, workdir?, permission_mode?,
+    /// initial_prompt?}` → the created `RcSession`. The machine counterpart of
+    /// [`Self::rc_launch`], addressed by machine name over that machine's own
+    /// SSH rather than by `(host, shed)` through a server.
+    async fn machine_launch(&self, params: &Value) -> Result<Value, (String, String)> {
+        let machine = req_str(params, "machine")?.to_string();
+        let kind = rc_kind(params)?;
+        let opt = |k: &str| params.get(k).and_then(Value::as_str);
+        self.machines
+            .launch(
+                &machine,
+                &kind,
+                opt("display_name"),
+                opt("workdir"),
+                opt("permission_mode"),
+                opt("initial_prompt"),
+            )
+            .await
+            .map_err(|e| err("action_failed", e))
+    }
+
+    /// `machine.capabilities {machine}` → `{capabilities}` — what a create form
+    /// may offer for that machine, or `null` from an engine too old to say.
+    async fn machine_capabilities(&self, params: &Value) -> Result<Value, (String, String)> {
+        let machine = req_str(params, "machine")?.to_string();
+        let caps = self
+            .machines
+            .capabilities(&machine)
+            .await
+            .map_err(|e| err("action_failed", e))?;
+        Ok(json!({ "capabilities": caps }))
     }
 
     /// `rc.launch {shed, kind, host?, display_name?, workdir?, initial_prompt?}` →

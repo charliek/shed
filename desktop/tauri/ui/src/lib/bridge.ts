@@ -1001,6 +1001,40 @@ export async function rcLaunch(fields: RcLaunchFields): Promise<RcSession> {
   return core.invoke<RcSession>("rc_launch", fields);
 }
 
+export type MachineLaunchFields = {
+  machine: string;
+  kind: RcKind;
+  displayName?: string;
+  workdir?: string;
+  permissionMode?: string;
+  initialPrompt?: string;
+};
+
+/** Launch a session ON a machine. THROWS on error, like [rcLaunch].
+ *
+ *  Separate from `rcLaunch` for the same reason `machineKill` is separate from
+ *  `rcKill`: a machine is addressed by name over its own SSH, not by
+ *  `(host, shed)` through a server. Everything downstream — the flag set, the
+ *  permission-mode gate, how a kickoff prompt is delivered — is the SAME shared
+ *  builder, so the two creates differ in where they land and nothing else. */
+export async function machineLaunch(fields: MachineLaunchFields): Promise<RcSession> {
+  const core = await import("@tauri-apps/api/core");
+  return core.invoke<RcSession>("machine_launch", fields);
+}
+
+/** One machine's RC capabilities, or null when its engine is too old to say.
+ *  Probed on demand by the launch dialog — a machine that was asleep at startup
+ *  must not be stuck with whatever the first probe found. THROWS if the machine
+ *  cannot be reached, which is what the dialog reports. */
+export async function machineCapabilities(machine: string): Promise<RcCapabilities | null> {
+  const core = await import("@tauri-apps/api/core");
+  const out = await core.invoke<{ capabilities: RcCapabilities | null }>(
+    "machine_capabilities",
+    { machine },
+  );
+  return out?.capabilities ?? null;
+}
+
 /** Kill an RC session. THROWS on error (the pane surfaces it). */
 export async function rcKill(shed: string, slug: string, host?: string): Promise<void> {
   const core = await import("@tauri-apps/api/core");
