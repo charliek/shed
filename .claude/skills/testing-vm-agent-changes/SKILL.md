@@ -106,6 +106,17 @@ OUTPUT_DIR="$HOME/Library/Application Support/shed-dev/vz" \
   ./scripts/build-vz-rootfs.sh --variant base --build-tools-version <BT_TAG>
 ```
 
+> **Gotcha (shed#317): the erofs mint uses `$TMPDIR`, not `OUTPUT_DIR`.** If your
+> image store is on an external volume but `$TMPDIR` is on the internal disk, the
+> build dies AFTER the whole Docker build with `no space left on device` writing
+> `.../shed-mint-erofs-*/rootfs.tar`. The flattened rootfs is multi-GB. Set it
+> explicitly:
+>
+> ```bash
+> TMPDIR=/Volumes/<vol>/tmp SHED_SOURCE_REF=... OUTPUT_DIR=... \
+>   ./scripts/build-vz-rootfs.sh --variant full --build-tools-version <BT_TAG>
+> ```
+
 ### 3. Resolution is automatic (since #227)
 
 The rebuild "just works" now — **no `docker buildx prune`, no hand-edited

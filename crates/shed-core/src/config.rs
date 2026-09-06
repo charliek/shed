@@ -159,10 +159,11 @@ fn is_http_url_with_host(s: &str) -> bool {
 ///
 /// Absent optionals mean "defer to ssh": no `user` → whatever `~/.ssh/config` (or
 /// the current login) resolves, no `known_hosts` → the user's normal file with
-/// the user's normal strictness, no `rc_bin` → `shed-machine-rc` on the remote
-/// login PATH. That deliberately differs from a shed target, whose host key is
-/// always pinned in `~/.shed/known_hosts` — a machine is an ordinary SSH host the
-/// operator already manages.
+/// the user's normal strictness, no `rc_bin` →
+/// [`crate::machine::DEFAULT_MACHINE_BIN`] on the remote's SSH-exec PATH. That
+/// deliberately differs from a shed target, whose host key is always pinned in
+/// `~/.shed/known_hosts` — a machine is an ordinary SSH host the operator
+/// already manages.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct MachineEntry {
     pub name: String,
@@ -172,8 +173,14 @@ pub struct MachineEntry {
     pub user: Option<String>,
     /// Defaults to 22.
     pub ssh_port: u16,
-    /// Absolute path (or bare name) of the RC helper on the remote. `None` →
-    /// `shed-machine-rc`, resolved on the remote's login PATH.
+    /// Where the RC binary lives on the remote. `None` →
+    /// [`crate::machine::DEFAULT_MACHINE_BIN`] (`sx`), resolved on the PATH an
+    /// `ssh <host> <cmd>` exec sees.
+    ///
+    /// That PATH is the NON-login one, which routinely omits `~/.local/bin` and
+    /// `/opt/homebrew/bin` — so an absolute path here is the normal case for
+    /// anything not installed under `/usr/bin`, not an exotic override.
+    /// (Pre-plan-010 this defaulted to the retired `shed-machine-rc`.)
     pub rc_bin: Option<String>,
     /// `UserKnownHostsFile` to pin against; `None` → ssh's own default.
     pub known_hosts: Option<String>,

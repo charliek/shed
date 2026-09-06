@@ -597,63 +597,44 @@ func (h *Hub) handleInput(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]bool{"delivered": true})
 }
 
-// inputAccepted re-derives, from a FRESH pane capture, whether the session is waiting
-// for typed input — running the SAME watcher+stability merge the reconcile loop uses
-// (mergedActivity, working-grace included), so the handler can never be more
-// permissive than the hub's own displayed activity:
+// inputAccepted decides whether a posted line may be delivered to the pane.
 //
-//   - merged working → reject. This covers a fresh working verdict AND the
-//     expired-working case (a >120s-quiet tool call whose stability is not settled) —
-//     delivering mid-turn would interleave input into an active turn.
-//   - merged needs_approval → reject. An approval dialog OWNS the keyboard: the pane
-//     is quiet and may even still match the composer anchor, so without this arm a
-//     posted line would be typed straight into the dialog and answer it by accident.
-//     This arm covers the kinds whose approval state is lane-derived (opencode).
-//   - the watcher reports ANY open approval (approvalBlocker) → reject, DELIBERATELY
-//     IGNORING transport health and freshness. The arm above rides the merge, and the
-//     merge demotes an unhealthy watcher to pane stability — so a wedged SSE stream
-//     would re-open exactly the hole the merge arm closes, with a real dialog still on
-//     the pane. The asymmetry is intentional: a stale reject costs the caller a retry
-//     once the reseed clears the ask, a stale accept costs an approval nobody meant to
+// THE RULE: deliver unless the agent is blocked on a DECISION.
+//
+// It used to be "deliver only while the session sits at its empty composer", which
+// was stricter than the program being typed into. Captured live: text sent to codex
+// mid-turn lands in its composer, the footer offers "tab to queue message", and the
+// line is answered as soon as the current turn ends. cursor behaves the same. So a
+// working agent is not a reason to refuse — refusing it was the single biggest reason
+// a phone could not answer a question it could already see.
+//
+// The hazard the gate exists for is narrower than the rule it used to implement.
+// While an approval MODAL is up, keystrokes ANSWER THE MODAL — cursor's options are
+// literally y / tab / shift+tab / esc-or-n, and Enter takes the highlighted "Run
+// (once)". A sentence delivered there can run a command nobody approved. That is what
+// the three rejections below are for, and each rests on different evidence:
+//
+//   - merged activity needs_approval — the derived/structured verdict.
+//   - the watcher reports ANY open approval (approvalBlocker), DELIBERATELY IGNORING
+//     transport health and freshness: the merge demotes an unhealthy watcher to pane
+//     stability, which would re-open exactly this hole with a real dialog on screen.
+//     A stale reject costs a retry; a stale accept costs an approval nobody meant to
 //     give. It also catches opencode QUESTIONS, which block the keyboard but never
 //     appear in pending_approvals.
-//   - the kind's ApprovalAnchor visible on the FRESH pane → reject. Same hole, other
-//     evidence: for kinds whose approval state is derived from the pane rather than
-//     from a lane, the anchor is the only signal, and it must be consulted against the
-//     pane captured for THIS delivery. Live for codex and cursor. It reads visiblePane,
-//     NOT pane — an anchor must only ever see the visible frame, because a
-//     dialog sitting in scrollback was answered long ago and gating on it would wedge the
-//     session's input forever (see captureVisiblePane). visiblePane is captured only for
-//     anchor-declaring kinds and is "" otherwise, which no anchor matches. Note the arm is
-//     deliberately UNDEBOUNCED, unlike reconcile's needs_approval derivation: a single
-//     frame showing the dialog is enough to refuse a keystroke, because a wrongly-refused
-//     post costs a retry while a wrongly-accepted one answers an approval nobody meant to
-//     give.
-//   - an EXPIRED-WORKING verdict on a kind whose composer survives a modal
-//     (AgentSpec.ComposerUnderModal — cursor) → a GUARDED recovery, not a blanket
-//     reject. cursor's `stop` hook (its settled boundary) only fires reliably on a
-//     session's FIRST turn on current builds; later turns leave the fold stuck
-//     expired-working, so a blanket reject makes gated input (the phone-steering path)
-//     work only once — even while the pane sits at a clean, idle "Add a follow-up"
-//     composer with no dialog. Recover input, but ONLY when the pane is provably not a
-//     dialog: (a) the kind's ApprovalAnchor — EXHAUSTIVE over cursor's decision surfaces
-//     (TestCursorApprovalAnchorCoversEveryDecisionSurface), so no-match means no approval
-//     surface — does NOT match the FRESH visible pane, AND (b) pane-stability has
-//     independently SETTLED on needs_input (a quiet, anchor-matching composer confirmed by
-//     the reconcile-side engine over its full quiet period — the same `lastStability`
-//     verdict reconcile merges). Either failing rejects: a matching anchor means a real
-//     dialog owns the keyboard (a "y" in a posted line would answer it — the exhaustive
-//     anchor, not a blanket guess, is what keeps typing-into-a-dialog impossible), and an
-//     unsettled stability means the turn may still be live. codex is UNAFFECTED — its
-//     overlay REPLACES the composer (ComposerUnderModal=false), so this arm never runs for
-//     it and a codex pane showing a dialog simply cannot match its prompt anchor.
-//   - a FRESH watcher needs_input → accept outright (the structured signal is settled
-//     and authoritative; the pane may legitimately not match the anchor).
-//   - anything else (merged idle/unknown, or a stability-derived needs_input whose
-//     evidence is a previous tick's pane) → the degraded-path policy: accept only if
-//     the kind's prompt anchor is visible on the FRESH pane. Requiring the fresh
-//     anchor here is what closes the lookup→lock race — a pane that flipped back to
-//     churning no longer shows the composer and is rejected.
+//   - the kind's ApprovalAnchor on the FRESH VISIBLE frame — the only evidence for
+//     kinds whose approvals reach no protocol (codex, cursor). visiblePane, never the
+//     scrollback: an answered dialog stays in history verbatim and gating on it would
+//     wedge the session's input forever. UNDEBOUNCED: one frame showing a dialog is
+//     enough to refuse a keystroke.
+//
+// RESIDUAL, accepted and named: a transient widget that is not an approval — a model
+// picker, a file browser — also eats keystrokes, and no anchor covers those. They only
+// appear because a HUMAN opened them at the TUI, which is a different situation from a
+// line arriving from a phone; and the approval anchors ARE exhaustive over the decision
+// surfaces that can appear on their own (TestCursorApprovalAnchorCoversEveryDecisionSurface).
+//
+// A blocking LIFECYCLE (needs-auth / needs-trust / dead) is rejected by the caller
+// before this is reached.
 func (h *Hub) inputAccepted(watcher sessionWatcher, stability Activity, kind Kind, pane, visiblePane string) bool {
 	var (
 		watcherAct                   Activity
@@ -664,7 +645,7 @@ func (h *Hub) inputAccepted(watcher sessionWatcher, stability Activity, kind Kin
 		watcherAct, _, watcherFresh, expiredWorking = watcher.snapshot(h.cfg.now())
 	}
 	merged, _ := mergedActivity(watcherAct, "", watcherFresh, expiredWorking, stability)
-	if merged == ActivityWorking || merged == ActivityNeedsApproval {
+	if merged == ActivityNeedsApproval {
 		return false
 	}
 	if blocker, ok := watcher.(approvalBlocker); ok && blocker.hasOpenApprovals() {
@@ -673,21 +654,7 @@ func (h *Hub) inputAccepted(watcher sessionWatcher, stability Activity, kind Kin
 	if anchor := approvalAnchorFor(kind); anchor != nil && anchor.MatchString(visiblePane) {
 		return false
 	}
-	if expiredWorking && composerUnderModal(kind) {
-		// Guarded recovery (see the doc comment's ComposerUnderModal bullet). Accept
-		// ONLY when the fresh visible pane shows no known approval surface AND stability
-		// has settled on needs_input. The anchor arm above already rejected on a matching
-		// visible pane; re-checking it here keeps this arm self-evidently safe under any
-		// future re-ordering, so the F1 hole stays closed on the arm's own terms.
-		anchor := approvalAnchorFor(kind)
-		modalOnScreen := anchor != nil && anchor.MatchString(visiblePane)
-		return !modalOnScreen && stability == ActivityNeedsInput
-	}
-	if watcherFresh && watcherAct == ActivityNeedsInput {
-		return true
-	}
-	anchor := promptAnchorFor(kind)
-	return anchor != nil && anchor.MatchString(pane)
+	return true
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {

@@ -1,0 +1,20 @@
+{
+  "absolute-bin": "'/home/charliek/.local/bin/sx' 'rc' 'list'",
+  "backslash": "'sx' 'rc' 'create' '--name' 'a\\b\\\\c'",
+  "command-substitution": "'sx' 'rc' 'create' '--name' '`id` and $(id)'",
+  "dollar-var": "'sx' 'rc' 'create' '--name' '$HOME and ${PATH}'",
+  "double-quote": "'sx' 'rc' 'create' '--name' 'say \"hi\"'",
+  "empty-string": "'sx' 'rc' 'create' '--name' ''",
+  "flag-with-value": "'sx' 'rc' 'create' '--kind' 'shell' '--slug' 'abc123'",
+  "leading-dash": "'sx' 'rc' 'create' '--name' '--not-a-flag'",
+  "many-args": "'/home/charliek/.local/bin/sx' 'rc' 'create' '--kind' 'shell' '--name' 'plan 012 probe' '--slug' 'hkn4vd' '--target' 'local' '--created-by' 'sx'",
+  "newline": "'sx' 'rc' 'create' '--name' 'line one\nline two'",
+  "plain": "'sx' 'rc' 'list'",
+  "redirection-and-glob": "'sx' 'rc' 'create' '--name' '> out < in *.txt ?[a-z]'",
+  "shell-metacharacters": "'sx' 'rc' 'kill' '--slug' 'abc; touch /tmp/pwn && echo no | cat'",
+  "single-quote": "'sx' 'rc' 'create' '--name' 'it'\\''s mine'",
+  "space-in-value": "'sx' 'rc' 'create' '--name' 'my session'",
+  "tab-and-spaces": "'sx' 'rc' 'create' '--name' 'a\tb   c'",
+  "tilde": "'sx' 'rc' 'create' '--workdir' '~/projects'",
+  "unicode": "'sx' 'rc' 'create' '--name' 'café 日本語 🦉'"
+}

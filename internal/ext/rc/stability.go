@@ -42,6 +42,7 @@ type StabilityTracker struct {
 	now     func() time.Time
 	quiet   time.Duration
 	anchor  *regexp.Regexp // kind's prompt anchor; nil ⇒ stable always reads idle
+	working *regexp.Regexp // kind's in-turn chrome; a match VETOES needs_input
 
 	hasPrev     bool
 	prevNorm    string
@@ -65,6 +66,7 @@ func NewStabilityTracker(kind Kind, capture CapturePaneFunc, now func() time.Tim
 		now:     now,
 		quiet:   quiet,
 		anchor:  promptAnchorFor(kind),
+		working: workingAnchorFor(kind),
 	}
 }
 
@@ -99,7 +101,12 @@ func (t *StabilityTracker) Tick() (Activity, error) {
 	// Unchanged since last capture. Downgrade only once the pane has been quiet for
 	// the full period; before that, hold the prior activity (typically working).
 	if now.Sub(t.stableSince) >= t.quiet {
-		if t.anchor != nil && t.anchor.MatchString(pane) {
+		// The composer alone is not proof of waiting — codex draws it while it
+		// works — so in-turn chrome on the SAME pane wins over the prompt anchor.
+		// A quiet-but-working pane reads idle, never needs_input.
+		if t.working != nil && t.working.MatchString(pane) {
+			t.activity = ActivityIdle
+		} else if t.anchor != nil && t.anchor.MatchString(pane) {
 			t.activity = ActivityNeedsInput
 		} else {
 			t.activity = ActivityIdle

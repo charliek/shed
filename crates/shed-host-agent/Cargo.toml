@@ -27,9 +27,10 @@ desktop-forwarding = []
 # discovery + approval/audit seams + socket paths/liveness + the LiveStatus snapshot
 # builder. The daemon shell drives it; the desktop app (later) embeds the same crate.
 shed-broker = { path = "../shed-broker" }
-# The rc-hub role's production tmux runner (`ExecRunner`) — the same engine
-# shed-broker's rc_hub already sits on (plan 010 §2.6); no new graph node.
-shed-rc-engine = { path = "../shed-rc-engine" }
+# NOTE: shed-rc-engine is deliberately NOT a direct dep any more. It was here for
+# the rc-hub role's production tmux runner (`ExecRunner`); the role graduated into
+# `shed_broker::rc_hub::role` in plan 012, so the engine now reaches this bin only
+# transitively through shed-broker — which is what the daemon shell should link.
 serde = { workspace = true }
 serde_json = { workspace = true }
 # net (UnixListener/UnixStream) + io-util (AsyncWriteExt/BufReader) + sync

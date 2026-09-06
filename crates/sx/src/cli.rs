@@ -625,16 +625,21 @@ fn read_plan_stdin(deps: &Deps) -> Result<String, EngineError> {
         .map_err(|_| EngineError::bad_args("plan is not valid UTF-8 (is stdin a binary file?)"))
 }
 
-/// The hub's fixed loopback address + byte-frozen health identity token —
-/// local mirrors of `shed_broker::rc_hub::hub::{HUB_ADDR, HUB_APP_ID}` (sx
-/// deliberately does not link shed-broker; its axum/notify/aws leaf deps
-/// belong to the daemon, not the porcelain).
+/// The hub's fixed loopback address. The health identity token itself now comes
+/// from [`shed_core::hub_client::HUB_APP_ID`] — the client half of the wire —
+/// rather than a third local copy: plan 012 put the hub client in shed-core, so
+/// the porcelain can share the constant without ever linking shed-broker (whose
+/// axum/notify/aws leaf deps belong to the daemon, not here).
+///
+/// The address stays local because shed-broker's is a bind-ADDRESS shape that
+/// does not map onto the bare port a client dials.
+///
 /// The probe targets the PRODUCTION port only, by design: the
 /// `SHED_RC_HUB_ADDR` env seam is a test seam (honored by the daemons, set by
 /// the parity harness — which also sets `SHED_RC_NO_HUB`, so sx's ensure
 /// never runs there), and sx's whole surface consistently ignores it.
 const HUB_ADDR: &str = "127.0.0.1:1029";
-const HUB_APP_ID: &str = "shed-rc-hub";
+use shed_core::hub_client::HUB_APP_ID;
 
 /// The best-effort hub ensure, PROBE-ONLY (plan 010 §2.7; the spawn fallback
 /// died at H15 with the `shed-machine-rc` binary): a healthy hub answering on

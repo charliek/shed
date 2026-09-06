@@ -1,0 +1,116 @@
+{
+  "absolute-bin": [
+    "rc",
+    "list"
+  ],
+  "backslash": [
+    "rc",
+    "create",
+    "--name",
+    "a\\b\\\\c"
+  ],
+  "command-substitution": [
+    "rc",
+    "create",
+    "--name",
+    "`id` and $(id)"
+  ],
+  "dollar-var": [
+    "rc",
+    "create",
+    "--name",
+    "$HOME and ${PATH}"
+  ],
+  "double-quote": [
+    "rc",
+    "create",
+    "--name",
+    "say \"hi\""
+  ],
+  "empty-string": [
+    "rc",
+    "create",
+    "--name",
+    ""
+  ],
+  "flag-with-value": [
+    "rc",
+    "create",
+    "--kind",
+    "shell",
+    "--slug",
+    "abc123"
+  ],
+  "leading-dash": [
+    "rc",
+    "create",
+    "--name",
+    "--not-a-flag"
+  ],
+  "many-args": [
+    "rc",
+    "create",
+    "--kind",
+    "shell",
+    "--name",
+    "plan 012 probe",
+    "--slug",
+    "hkn4vd",
+    "--target",
+    "local",
+    "--created-by",
+    "sx"
+  ],
+  "newline": [
+    "rc",
+    "create",
+    "--name",
+    "line one\nline two"
+  ],
+  "plain": [
+    "rc",
+    "list"
+  ],
+  "redirection-and-glob": [
+    "rc",
+    "create",
+    "--name",
+    "> out < in *.txt ?[a-z]"
+  ],
+  "shell-metacharacters": [
+    "rc",
+    "kill",
+    "--slug",
+    "abc; touch /tmp/pwn && echo no | cat"
+  ],
+  "single-quote": [
+    "rc",
+    "create",
+    "--name",
+    "it's mine"
+  ],
+  "space-in-value": [
+    "rc",
+    "create",
+    "--name",
+    "my session"
+  ],
+  "tab-and-spaces": [
+    "rc",
+    "create",
+    "--name",
+    "a\tb   c"
+  ],
+  "tilde": [
+    "rc",
+    "create",
+    "--workdir",
+    "~/projects"
+  ],
+  "unicode": [
+    "rc",
+    "create",
+    "--name",
+    "café 日本語 🦉"
+  ]
+}

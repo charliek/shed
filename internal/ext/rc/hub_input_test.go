@@ -223,23 +223,27 @@ func TestHubInputErrorStatuses(t *testing.T) {
 }
 
 // 409 when the session is not waiting for input (a churning, non-anchor pane).
-func TestHubInputNotAcceptingIs409(t *testing.T) {
+// TestHubInputUnderADialogIs409 was TestHubInputNotAcceptingIs409, which posted
+// into a churning pane. Under the current rule a churning pane is fine — the TUI
+// queues the line — so the end-to-end 409 is exercised where it still belongs: a
+// pane showing an approval dialog, where a delivered sentence would ANSWER it.
+func TestHubInputUnderADialogIs409(t *testing.T) {
 	f := newHubTmux()
 	clk := &hubClock{t: time.Unix(1_700_000_000, 0).UTC()}
-	// Ready codex (boot banner classifies ready) but NOT parked at the composer anchor.
-	f.set("rc-na111", "boot >_ OpenAI Codex (v1.0)\nworking...", managedEnv("id-na", KindCodex))
+	f.set("rc-na111", paneFixture(t, "codex-ready-approval-exec"), managedEnv("id-na", KindCodex))
 	_, srv := newInputHub(t, f, clk)
 
 	resp := postInput(t, srv.URL+"/v1/sessions/na111/input", `{"text":"hi"}`)
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusConflict {
-		t.Fatalf("non-waiting session status = %d, want 409", resp.StatusCode)
+		t.Fatalf("posting under a dialog status = %d, want 409", resp.StatusCode)
 	}
 }
 
-// 409 when the pane state FLIPS between the tracked snapshot and the locked re-check:
-// tracked while parked at the anchor, but the fresh capture (under the input mutex)
-// sees a churning pane → rejected.
+// 409 when the pane state FLIPS between the tracked snapshot and the locked
+// re-check: tracked at a clean composer, but the capture taken under the input
+// mutex — as late as possible before delivery — sees a dialog that went up in
+// between. Delivering against the FIRST capture would answer it.
 func TestHubInputRaceStateFlipIs409(t *testing.T) {
 	f := newHubTmux()
 	clk := &hubClock{t: time.Unix(1_700_000_000, 0).UTC()}
@@ -247,7 +251,7 @@ func TestHubInputRaceStateFlipIs409(t *testing.T) {
 	_, srv := newInputHub(t, f, clk) // reconcile tracked it parked at the anchor
 
 	// The pane flips to a churning, non-anchor state before the POST's locked re-check.
-	f.setPane("rc-race22", "boot >_ OpenAI Codex (v1.0)\nnow working")
+	f.setPane("rc-race22", paneFixture(t, "codex-ready-approval-exec"))
 
 	resp := postInput(t, srv.URL+"/v1/sessions/race22/input", `{"text":"hi"}`)
 	defer resp.Body.Close()
@@ -447,15 +451,16 @@ func TestHubInputAcceptedWatcherBranch(t *testing.T) {
 		t.Error("a fresh needs_input watcher must accept regardless of the pane anchor")
 	}
 
-	// An open tool call (no output) → working; must reject even when the pane shows the
-	// composer anchor.
+	// An open tool call (no output) → working, and that is DELIVERED: the pane queues
+	// it. (The assertion was inverted with the rule; the fold behaviour it exercises —
+	// a real codex JSONL producing a working verdict — is unchanged.)
 	working := dir + "/working.jsonl"
 	writeFile(t, working, `{"type":"event_msg","payload":{"type":"task_started"}}`+"\n"+
 		`{"type":"response_item","payload":{"type":"custom_tool_call","call_id":"c1","name":"exec"}}`+"\n")
 	wWorking := newFileWatcher(working, true, newCodexFold())
 	wWorking.refresh(clk.now())
-	if h.inputAccepted(wWorking, ActivityWorking, KindCodex, codexReadyPane(), codexReadyPane()) {
-		t.Error("a fresh working watcher must reject even with the composer anchor present")
+	if !h.inputAccepted(wWorking, ActivityWorking, KindCodex, codexReadyPane(), codexReadyPane()) {
+		t.Error("a fresh working watcher still takes the line — its TUI queues it")
 	}
 }
 
@@ -465,7 +470,11 @@ func TestHubInputAcceptedWatcherBranch(t *testing.T) {
 // reject even with the composer anchor on the pane (a >120s tool call is still a
 // live turn). Only a SETTLED quiet stability (the pane genuinely stopped) releases
 // it to the anchor path.
-func TestHubInputLongQuietWorkingRejected(t *testing.T) {
+// TestHubInputDuringALongToolCallIsDelivered: a >120s tool call is a live turn,
+// and the old rule refused to type into one. That is exactly the case a person
+// most wants — the agent is grinding and you have a correction — and the TUI
+// itself takes it. What still refuses is a dialog, tested elsewhere.
+func TestHubInputDuringALongToolCallIsDelivered(t *testing.T) {
 	f := newHubTmux()
 	start := time.Unix(1_700_000_000, 0).UTC()
 	clk := &hubClock{t: start}
@@ -481,13 +490,13 @@ func TestHubInputLongQuietWorkingRejected(t *testing.T) {
 	clk.advance(watcherWorkingGrace + time.Second) // file quiet past the working grace
 
 	// Stability unsettled (working) → merged stays working → reject despite the anchor.
-	if h.inputAccepted(w, ActivityWorking, KindCodex, codexReadyPane(), codexReadyPane()) {
-		t.Error("expired-working with unsettled stability must reject (still mid-turn)")
+	if !h.inputAccepted(w, ActivityWorking, KindCodex, codexReadyPane(), codexReadyPane()) {
+		t.Error("mid-tool-call with a churning stability: the TUI queues it")
 	}
 	// Stability settled (idle: the pane genuinely stopped) → the merge releases to
 	// stability and the anchor path may accept.
 	if !h.inputAccepted(w, ActivityIdle, KindCodex, codexReadyPane(), codexReadyPane()) {
-		t.Error("expired-working with settled-idle stability + anchor should accept")
+		t.Error("mid-tool-call with a settled-idle stability: the TUI queues it")
 	}
 }
 

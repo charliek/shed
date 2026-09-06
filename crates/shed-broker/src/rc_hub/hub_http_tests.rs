@@ -569,14 +569,17 @@ async fn invalid_utf8_in_a_string_is_replaced_not_rejected() {
     assert_eq!(f.recorded(), vec!["a\u{fffd}b".to_string()]);
 }
 
-// Mirrors TestHubInputNotAcceptingIs409 (a churning, non-anchor pane).
+// Was TestHubInputNotAcceptingIs409, which posted into a churning pane. Under
+// the current rule a churning pane is fine — the TUI queues the line — so the
+// end-to-end 409 is exercised where it still belongs: a pane showing an
+// approval dialog, where a delivered sentence would ANSWER it.
 #[tokio::test(flavor = "multi_thread")]
-async fn input_not_accepting_is_409() {
+async fn input_under_a_dialog_is_409() {
     let f = HubTmux::new();
     let clk = HubClock::new();
     f.set(
         "rc-na111",
-        "boot >_ OpenAI Codex (v1.0)\nworking...",
+        &pane_fixture("codex-ready-approval-exec"),
         &managed_env("id-na", &RcKind::Codex),
     );
     let (_h, url) = new_input_hub(&f, &clk).await;
@@ -590,8 +593,10 @@ async fn input_not_accepting_is_409() {
     assert_eq!(resp.status().as_u16(), 409);
 }
 
-// Mirrors TestHubInputRaceStateFlipIs409: tracked at the anchor, but the
-// fresh capture under the input mutex sees a churning pane.
+// Mirrors TestHubInputRaceStateFlipIs409, and the race it guards is unchanged:
+// the session was tracked at a clean composer, but the capture taken under the
+// input mutex — as late as possible before delivery — sees a dialog that went up
+// in between. Delivering against the FIRST capture would answer it.
 #[tokio::test(flavor = "multi_thread")]
 async fn input_race_state_flip_is_409() {
     let f = HubTmux::new();
@@ -603,7 +608,7 @@ async fn input_race_state_flip_is_409() {
     );
     let (_h, url) = new_input_hub(&f, &clk).await;
 
-    f.set_pane("rc-race22", "boot >_ OpenAI Codex (v1.0)\nnow working");
+    f.set_pane("rc-race22", &pane_fixture("codex-ready-approval-exec"));
     let resp = do_request(
         &http_client(),
         Method::POST,

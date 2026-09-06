@@ -21,7 +21,7 @@ Request structs reject unknown fields. Errors use stable codes: `unknown-op`,
 |----|--------|--------|
 | `identify` | — | `socket_path`, `pid`, `app_label`, `app_id`, `ui_version`, `protocol_version`, `test_mode`, `mock_base_url?` |
 | `ui.state` | — | `pane`, `hosts[]`, `sheds[]`, `host_agent_connected`, `last_error?`, `sheds_empty_state` |
-| `ui.navigate` | `pane` (sheds\|approvals\|agents\|activity\|egress\|system) | `pane` |
+| `ui.navigate` | `pane` (sheds\|machines\|approvals\|agents\|activity\|egress\|system) | `pane` |
 | `ui.set_ssh_approval` | `method?`, `scope?`, `ttl?` | `{}` (applies SSH approval prefs + resets live SSH grants) |
 | `ui.show_window` | — | `{}` |
 | `ui.hide_window` | — | `{}` (closes the dashboard → menu-bar-only accessory) |
@@ -39,13 +39,19 @@ The screenshot renders the target window's content view to a PNG in-process — 
 capture permission, works even when the window is occluded or off-screen. Capturing the
 menu requires it to be open first (`ui.open_menu {open:true}`).
 
-**Per-host failures (Tauri).** A host whose sheds can't be listed is reported beside the
-rows rather than dropped: `host_errors[]` carries `{server, kind, summary, detail}` per
-failed host, where `kind` is `agent_upgrade_required` or `other`, `summary` is the
-one-line text the pane shows (remedy first), and `detail` is the hover/log body. It is
-always present — `[]` when every host is healthy. The Tauri UI-truth op `dashboard.dump`
-returns `{rows, host_errors, empty}`: the rendered shed rows, the rendered host-error
-strip, and the rendered empty state (`{title, body}`, `null` when the list rendered).
+**Per-host failures (Tauri).** A host whose sheds can't be listed is reported rather than
+dropped: `host_errors[]` carries `{server, kind, summary, detail}` per failed host, where
+`kind` is `agent_upgrade_required` or `other`, `summary` is the one-line remedy-first text,
+and `detail` is the hover/log body. It is always present — `[]` when every host is healthy.
+The Tauri UI-truth op `dashboard.dump` returns `{rows, host_errors, empty}`: the rendered
+shed rows, the failures the shell holds, and the rendered empty state (`{title, body}`,
+`null` when the list rendered).
+
+The Sheds pane renders no error rows of its own. An unreachable server is a *status*, and
+status lives in the sidebar's **SHED SERVERS** section (the row's dot, with the reason on
+hover) and the System pane. The pane's only duty when it cannot list is to not claim "No
+sheds yet" — its empty state names the unreachable servers and points at the sidebar,
+carrying no transport error text.
 
 **Per-host failures (mac).** The same shape rides on the host itself. Each entry in
 `hosts[]` carries `name`, `host`, `http_port`, `ssh_port`, `reachable`, `backend?`,
@@ -80,6 +86,8 @@ strip, and the rendered empty state (`{title, body}`, `null` when the list rende
 | `rc.list` | `host?`, `shed?` | `sessions[]` |
 | `rc.launch` | `host?`, `shed`, `kind?`, `display_name?`, `workdir?`, `initial_prompt?` | the launched `RcSession` |
 | `rc.kill` | `host?`, `shed`, `slug` | `{}` |
+| `machines.list` | — | `machines[]` — every configured machine's health, name-ordered |
+| `machine.kill` | `machine`, `slug` | `{}` (addressed by machine + slug, not host/shed) |
 | `rc.inject_test` | `shed`, `slug`, `kind?`, `state?`, `managed?`, `display_name?`, `created_by?`, … | `{}` — **test mode only**; injects a session (e.g. a legacy row) into the table |
 
 `initial_prompt` is an optional one-line kickoff delivered once the session is ready (an
@@ -92,6 +100,48 @@ create-request normalization.)
 Each `RcSession` carries the [RC Session Convention v2](rc-sessions.md) metadata:
 `managed`, and (when managed) `rc_id`, `created_by`, `created_at`, `target_label`.
 A legacy/unmanaged `rc-*` session decodes with `managed: false` and no metadata.
+
+### Machines (Tauri)
+
+A **machine** is a native host you reach over SSH that runs the RC activity hub on its
+loopback `1029` — no shed server in the path, no TLS pin, no control token. Machines come
+from the `machines:` section of `~/.shed/config.yaml` (the same section `sx` reads) and are
+read ONCE at startup, so there is no in-app add/edit; an editor that silently needed a
+relaunch would be worse than the file.
+
+Machine sessions appear in `rc.list` beside shed sessions, each stamped with
+`origin_kind: "machine"` and `origin: "machine:<name>"`. **Row keys and grouping must use
+`origin`, never `shed`** — a hub reports an EMPTY shed on every session it serves, so two
+machines sharing a slug would collide into one row. `machines.list` is separate from
+`rc.list` because a machine is worth showing even when it has no sessions and cannot be
+reached: that row IS the information ("mini3 is asleep"), and a sessions-only payload has
+nowhere to put it. Each entry carries `{name, origin, reachable, connected_once, sessions,
+detail?}`, where `detail` is why it is unreachable — verbatim, because "no route to host"
+and "nothing is listening on 1029" need different fixes.
+
+Unreachable is a first-class state, not an error: a machine that is asleep, off-network, or
+simply not running a hub is the everyday case, and it must never fail the sessions view.
+
+### UI-truth ops (Tauri)
+
+These report what the frontend RENDERED, so a test can assert the window rather than the
+backend's view — the two can disagree, and have.
+
+| op | answers | result |
+|----|---------|--------|
+| `dashboard.dump` | on the Sheds pane | `{rows, host_errors, empty}` |
+| `agents.dump` | on the Agents pane | `{sessions}` |
+| `egress.profiles` | on the Egress pane | `{egress}` |
+| `machines.dump` | on the Machines pane | `{machines}` — a row per machine with its `status` word, `detail` line, and grouped session slugs |
+| `sidebar.dump` | **always** | `{servers, machines}` — the sidebar's status foot |
+
+A pane dump answers `null` off its pane; reporting copy nobody is reading would let a test
+assert a surface that isn't on screen. `sidebar.dump` is the exception because the sidebar
+is always mounted — which is precisely why it is where an unreachable server's reason
+lives now that the Sheds pane carries no error strip. Its `servers[].detail` is the host
+failure's `summary` (empty for a healthy host); its `machines[].note` is the clean word a
+person reads in the list (`offline`, `connecting`, `N sessions`), never the raw transport
+error, which stays on hover.
 
 ## Approval ops
 

@@ -7,9 +7,12 @@
 pub mod approval;
 pub mod authfail;
 pub mod config;
+pub mod config_edit;
 pub mod create;
 pub mod csr;
 pub mod http;
+pub mod hub_client;
+pub mod machine;
 pub mod models;
 pub mod rc;
 pub mod rc_agents;

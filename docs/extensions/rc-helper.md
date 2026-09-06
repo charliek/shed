@@ -174,7 +174,7 @@ today's client behavior for those two kinds.
 | `post_input` | A typed line can be delivered to the session's pane (the prompt/attach kickoff path). **Not deprecated** — nothing in contract v2 supersedes it, opencode included (the create/prompt kickoff path still uses it for a session's first prompt). |
 | `approvals` | Where approvals are answered: `tui` (in the terminal — claude-rc, codex, cursor) or `remote` (through the hub's `POST /approvals/{id}` verb — opencode, live since this block). |
 | `watch` | **Deprecated** by `feed` (superseded, not removed): retained until clients migrate. The producer holds `watch == (feed == "messages")` in lockstep, so a v1 client reading `watch` and a v2 client reading `feed` see the same thing. Absent-field fallback: a client that only knows `watch` should keep using it. |
-| `input` | Feed-input posting mode, **single-valued**: `gated` (`POST …/input` accepted only while the session is waiting — codex, cursor), `turn` (the lane takes whole turns through `POST …/turn`, and `POST …/input` no longer applies — opencode), or `""` (no feed input at all — claude-rc; the TUI-only `post_input` path still applies). `turn` supersedes `gated` for a kind that has it: the two are mutually exclusive spellings of "how a client steers this kind's feed", not layered capabilities. |
+| `input` | Feed-input posting mode, **single-valued**: `gated` (`POST …/input` accepted unless the agent is blocked on a DECISION — codex, cursor; see [What `gated` gates](#what-gated-gates)), `turn` (the lane takes whole turns through `POST …/turn`, and `POST …/input` no longer applies — opencode), or `""` (no feed input at all — claude-rc; the TUI-only `post_input` path still applies). `turn` supersedes `gated` for a kind that has it: the two are mutually exclusive spellings of "how a client steers this kind's feed", not layered capabilities. |
 | `feed` | What the hub can stream for the kind: `messages` (a normalized conversation feed — `GET …/messages` + `message.appended`), `activity` (the activity dimension only — no message feed), or `none` (no hub signal at all). Supersedes `watch`. |
 | `interrupt` | The `interrupt` verb is supported. `true` for opencode only; `false` elsewhere. |
 | `attach` | How a terminal reaches the session: `tmux` (attach to the rc-tmux session), `native-remote` (the agent's own remote surface), or `none`. |
@@ -200,6 +200,49 @@ everywhere.
 **Client fallbacks for absent fields** (a v3 payload, or a re-emitted older guest's
 capabilities): absent `feed` → fall back to `watch`; absent `attach` → treat as `tmux`;
 absent `lane` on the session DTO → treat as `"tui"`.
+
+### What `gated` gates
+
+A `gated` kind takes a posted line **whenever the agent is not blocked on a
+decision** — including while it is working.
+
+That is not a relaxation of a safety rule; it is the rule finally matching the
+program it types into. codex and cursor are TUIs, and both accept typing at any
+time: text sent to codex mid-turn lands in its composer (the footer offers `tab
+to queue message`) and is answered as soon as the running turn ends. cursor
+behaves the same. A hub that refused those lines was stricter than the keyboard
+sitting in front of the same session, and that strictness was the single biggest
+reason a phone could not answer a question it could already see.
+
+The hazard is narrower than "the agent is busy". While an approval **modal** is
+up, keystrokes do not queue — they ANSWER. cursor's options are literally `y` /
+`tab` / `shift+tab` / `esc or n`, and Enter takes the highlighted *Run (once)*;
+codex's are numbered with `Press enter to confirm`. A sentence delivered there
+can run a command nobody approved. So `POST …/input` answers **409
+`not_accepting`** on exactly three signals, each resting on different evidence:
+
+1. the session's merged activity is `needs_approval`;
+2. the lane reports an open approval (this ignores transport health on purpose —
+   a wedged stream must not re-open the hole with a real dialog on screen, and it
+   also catches opencode QUESTIONS, which block the keyboard but never appear in
+   `pending_approvals`);
+3. the kind's approval-dialog chrome is on the **visible frame** — not the
+   scrollback, where an answered dialog lives forever, and undebounced, because
+   one frame showing a dialog is enough to refuse a keystroke.
+
+A blocking lifecycle (`needs-trust`, `needs-auth`, `dead`) is refused before any
+of that.
+
+**Named residual:** a transient widget that is not an approval — a model picker,
+a file browser — also eats keystrokes, and no anchor covers those. They appear
+because a person opened them at the TUI, which is a different situation from a
+line arriving from a phone; and the approval anchors are exhaustive over the
+decision surfaces each kind raises on its own.
+
+**For clients:** enable the input affordance for a `gated` kind whenever the
+session is not `needs_approval` and not in a blocking lifecycle. Gating the UI on
+`needs_input` alone is safe but needlessly narrow — it hides the box during
+exactly the turn a person most wants to correct.
 
 ## JSON output
 

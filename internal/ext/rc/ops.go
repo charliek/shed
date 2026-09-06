@@ -155,6 +155,19 @@ func Create(r Runner, env Getenv, opts CreateOptions, sleep func(time.Duration))
 	if workdir == "" {
 		return Session{}, fmt.Errorf("%w: no --workdir and SHED_WORKSPACE/HOME unset", ErrBadArgs)
 	}
+	// A leading ~ is expanded HERE, on the target, where HOME is the right home.
+	// Nothing else on the path would do it: the CLI quotes every argv element
+	// (that is its safety property) and tmux takes -c as a literal path, so
+	// `--workdir ~/prox` silently started the agent in HOME instead — and then
+	// the hub could not correlate its feed, because the pane's real directory did
+	// not match the workdir it had been told. Two symptoms, one unexpanded tilde.
+	if home := env("HOME"); home == "" && (workdir == "~" || strings.HasPrefix(workdir, "~/")) {
+		// Handing tmux a literal ~ would put the agent somewhere other than where the
+		// session says it is — the exact silent mismatch this expansion exists to
+		// prevent. Say so instead.
+		return Session{}, fmt.Errorf("%w: --workdir starts with ~ but HOME is unset", ErrBadArgs)
+	}
+	workdir = expandTilde(workdir, env("HOME"))
 
 	displayName := opts.DisplayName
 	if displayName == "" {
@@ -475,6 +488,22 @@ func ToolFor(k Kind) string {
 		return spec.Tool
 	}
 	return "the agent"
+}
+
+// expandTilde expands a leading ~ against home: "~" -> home, "~/x" -> home/x.
+// Anything else — including ~user (this is not a shell and has no passwd lookup)
+// and a bare relative path — is returned unchanged.
+func expandTilde(dir, home string) string {
+	if home == "" {
+		return dir
+	}
+	if dir == "~" {
+		return home
+	}
+	if strings.HasPrefix(dir, "~/") {
+		return strings.TrimSuffix(home, "/") + "/" + dir[2:]
+	}
+	return dir
 }
 
 func firstNonEmpty(vals ...string) string {

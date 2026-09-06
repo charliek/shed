@@ -405,6 +405,16 @@ fn decode_json_head<T: DeserializeOwned + Default>(
 
 /// `decodeHubBody` — read + decode under the shared 16 KiB cap; `Err` is the
 /// already-built rejection response.
+///
+/// `result_large_err` is allowed here and below deliberately: the `Err` IS an
+/// `axum::Response`, which is the idiomatic way an extractor rejects — it
+/// carries the status and body the caller returns verbatim. Boxing it to
+/// satisfy the lint would put an allocation on the rejection path and force
+/// every call site to unbox, to save moving a value that is only constructed
+/// when a request is already being refused. (Fires only on clippy ≥ 1.98; the
+/// toolchain is `channel = "stable"`, so CI picks up new lints before a
+/// developer on an older stable does.)
+#[allow(clippy::result_large_err)]
 pub(crate) async fn decode_hub_body<T: DeserializeOwned + Default>(
     body: axum::body::Body,
 ) -> Result<T, Response> {
@@ -418,6 +428,7 @@ pub(crate) async fn decode_hub_body<T: DeserializeOwned + Default>(
 /// (`discardHubBody`, `hub_verbs.go:548`): an oversized body is a 413 even
 /// when its content is irrelevant. Any OTHER read error is ignored — the body
 /// is not part of the verb's contract.
+#[allow(clippy::result_large_err)]
 pub(crate) async fn discard_hub_body(body: axum::body::Body) -> Result<(), Response> {
     match read_body_capped(body, HUB_MAX_BODY_BYTES).await {
         Ok((_, true)) => Err(BodyError::TooLarge.respond()),

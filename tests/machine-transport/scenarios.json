@@ -1,0 +1,126 @@
+{
+  "//": "THE SHARED MACHINE-TRANSPORT CONTRACT. Read tests/machine-transport/README.md before editing.",
+  "//contract": [
+    "Each scenario is an argv a client wants to run on a MACHINE over SSH.",
+    "SSH has no argv API: a command is sent as ONE string the remote shell re-parses.",
+    "So every transport must compose that string identically, and every transport",
+    "must end up delivering the SAME argv to the remote process.",
+    "",
+    "Three legs consume this file, and all three must agree:",
+    "  1. Rust  (crates/shed-core, `machine::display_line`)  -> goldens/wire.json",
+    "  2. live  (tests/machine-transport, a hermetic sshd)   -> goldens/received.json",
+    "  3. Dart  (shed-mobile, via the FRB bridge)            -> both goldens",
+    "",
+    "Adding a scenario means re-recording BOTH goldens (UPDATE_GOLDEN=1) and",
+    "re-running the Dart leg in shed-mobile. A scenario is never removed to make",
+    "a leg pass."
+  ],
+  "//version": "The contract revision. Bump on any change to `scenarios`; the Dart leg pins it so a silent divergence between the two repos is impossible.",
+  "version": 1,
+  "scenarios": [
+    {
+      "id": "plain",
+      "why": "the ordinary case: bare-safe tokens only",
+      "argv": ["sx", "rc", "list"]
+    },
+    {
+      "id": "absolute-bin",
+      "why": "rc_bin is routinely an absolute path — ~/.local/bin is not on the non-login SSH PATH",
+      "argv": ["/home/charliek/.local/bin/sx", "rc", "list"]
+    },
+    {
+      "id": "flag-with-value",
+      "why": "the shape every real create takes",
+      "argv": ["sx", "rc", "create", "--kind", "shell", "--slug", "abc123"]
+    },
+    {
+      "id": "space-in-value",
+      "why": "a display name with a space — the most common non-trivial case",
+      "argv": ["sx", "rc", "create", "--name", "my session"]
+    },
+    {
+      "id": "empty-string",
+      "why": "an empty argv element must survive as an explicit empty argument, not vanish",
+      "argv": ["sx", "rc", "create", "--name", ""]
+    },
+    {
+      "id": "single-quote",
+      "why": "the quoter's own escape character; the classic off-by-one in hand-rolled quoting",
+      "argv": ["sx", "rc", "create", "--name", "it's mine"]
+    },
+    {
+      "id": "double-quote",
+      "why": "must not be treated as a quoting character by either side",
+      "argv": ["sx", "rc", "create", "--name", "say \"hi\""]
+    },
+    {
+      "id": "backslash",
+      "why": "backslash is literal inside single quotes; a double-quoting transport would mangle it",
+      "argv": ["sx", "rc", "create", "--name", "a\\b\\\\c"]
+    },
+    {
+      "id": "dollar-var",
+      "why": "must NOT be expanded by the remote shell — the whole point of quoting",
+      "argv": ["sx", "rc", "create", "--name", "$HOME and ${PATH}"]
+    },
+    {
+      "id": "command-substitution",
+      "why": "an injection attempt via backticks and $() must reach the process as literal text",
+      "argv": ["sx", "rc", "create", "--name", "`id` and $(id)"]
+    },
+    {
+      "id": "shell-metacharacters",
+      "why": "the injection case the always-quoter exists to close",
+      "argv": ["sx", "rc", "kill", "--slug", "abc; touch /tmp/pwn && echo no | cat"]
+    },
+    {
+      "id": "redirection-and-glob",
+      "why": "> < * ? [ ] must not be interpreted",
+      "argv": ["sx", "rc", "create", "--name", "> out < in *.txt ?[a-z]"]
+    },
+    {
+      "id": "newline",
+      "why": "a newline inside a quoted argument must survive as one argument, not split into two",
+      "argv": ["sx", "rc", "create", "--name", "line one\nline two"]
+    },
+    {
+      "id": "tab-and-spaces",
+      "why": "internal whitespace must not re-split the argument",
+      "argv": ["sx", "rc", "create", "--name", "a\tb   c"]
+    },
+    {
+      "id": "leading-dash",
+      "why": "a value that looks like a flag must stay a value",
+      "argv": ["sx", "rc", "create", "--name", "--not-a-flag"]
+    },
+    {
+      "id": "unicode",
+      "why": "non-ASCII must round-trip byte-for-byte through both transports",
+      "argv": ["sx", "rc", "create", "--name", "café 日本語 🦉"]
+    },
+    {
+      "id": "tilde",
+      "why": "tilde expansion must NOT happen — a literal ~ is a legitimate name",
+      "argv": ["sx", "rc", "create", "--workdir", "~/projects"]
+    },
+    {
+      "id": "many-args",
+      "why": "a full realistic create, end to end",
+      "argv": [
+        "/home/charliek/.local/bin/sx",
+        "rc",
+        "create",
+        "--kind",
+        "shell",
+        "--name",
+        "plan 012 probe",
+        "--slug",
+        "hkn4vd",
+        "--target",
+        "local",
+        "--created-by",
+        "sx"
+      ]
+    }
+  ]
+}

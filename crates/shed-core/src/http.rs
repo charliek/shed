@@ -1002,6 +1002,69 @@ impl Client {
             .map(|_| ())
     }
 
+    /// Decode a 2xx body as JSON, or report the wire as malformed.
+    ///
+    /// The distinction this keeps: a body that PARSES but omits an optional
+    /// field is an older server being terse, and the caller defaults it. A body
+    /// that does not parse is a proxy error page or a truncated response, and
+    /// defaulting THAT invents an answer.
+    fn decode_json_body(raw: &[u8]) -> Result<serde_json::Value, ShedError> {
+        serde_json::from_slice(raw).map_err(|e| ShedError::Decode(e.to_string()))
+    }
+
+    /// `POST /api/sheds/{shed}/rc/v1/sessions/{slug}/turn` — start a
+    /// structured turn, returning the turn id.
+    ///
+    /// The counterpart to [`Self::rc_input`], and which one applies is the
+    /// KIND's business, not the caller's guess: a `kind_features.input` of
+    /// `"turn"` takes this, `"gated"` takes `rc_input`. Offering the wrong one
+    /// earns a `409 not_supported` the user cannot act on.
+    pub async fn rc_turn(&self, shed: &str, slug: &str, text: &str) -> Result<String, ShedError> {
+        let body = serde_json::json!({ "text": text });
+        let url = self.build_url(
+            &["api", "sheds", shed, "rc", "v1", "sessions", slug, "turn"],
+            &[],
+        )?;
+        let raw = self
+            .request(reqwest::Method::POST, &url, WRITE_TIMEOUT, Some(&body))
+            .await?;
+        // A body that is not JSON is a PROTOCOL failure, not an empty turn id.
+        // Tolerating it would report a delivered turn for an HTML error page or
+        // a truncated response. A well-formed body missing the optional
+        // `turn_id` is a different matter — see below.
+        let v: serde_json::Value = Self::decode_json_body(&raw)?;
+        Ok(v.get("turn_id")
+            .and_then(|t| t.as_str())
+            .unwrap_or_default()
+            .to_string())
+    }
+
+    /// `POST /api/sheds/{shed}/rc/v1/sessions/{slug}/interrupt` — stop the
+    /// running turn.
+    ///
+    /// `false` means nothing was running. That is an ANSWER, not a failure:
+    /// interrupting an idle session is a no-op the caller asked for, and
+    /// surfacing it as an error would train people to ignore the error path.
+    pub async fn rc_interrupt(&self, shed: &str, slug: &str) -> Result<bool, ShedError> {
+        let url = self.build_url(
+            &["api", "sheds", shed, "rc", "v1", "sessions", slug, "interrupt"],
+            &[],
+        )?;
+        let raw = self
+            .request(
+                reqwest::Method::POST,
+                &url,
+                WRITE_TIMEOUT,
+                Some(&serde_json::json!({})),
+            )
+            .await?;
+        // Same reasoning as `rc_turn`, and it matters more here: silently
+        // decoding garbage to `false` reports "nothing was running" — a factual
+        // claim about the session — when the truth is that we do not know.
+        let v: serde_json::Value = Self::decode_json_body(&raw)?;
+        Ok(v.get("interrupted").and_then(|b| b.as_bool()).unwrap_or(false))
+    }
+
     /// `GET /api/rc/events` with `Accept: text/event-stream` — the host-wide
     /// aggregate rc live-activity stream (Go `internal/api/rcevents.go:170-208`:
     /// the server opens with a `: ok` comment preamble, heartbeats every 25s
@@ -2637,6 +2700,115 @@ mod tests {
             .await
             .unwrap();
         m.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn rc_turn_posts_the_text_and_returns_the_turn_id() {
+        let server = MockServer::start_async().await;
+        let m = server
+            .mock_async(|w, t| {
+                w.method(POST)
+                    .path("/api/sheds/proj/rc/v1/sessions/abc234/turn")
+                    .header("content-type", "application/json")
+                    .json_body(serde_json::json!({"text": "describe this project"}));
+                t.status(200).body(r#"{"turn_id":"t-7"}"#);
+            })
+            .await;
+        assert_eq!(
+            client(&server)
+                .rc_turn("proj", "abc234", "describe this project")
+                .await
+                .unwrap(),
+            "t-7"
+        );
+        m.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn rc_turn_tolerates_a_body_without_a_turn_id() {
+        // The id is a convenience, not a contract the caller depends on — an
+        // older hub that acks without one must not turn a delivered turn into
+        // an error the user sees.
+        let server = MockServer::start_async().await;
+        server
+            .mock_async(|w, t| {
+                w.method(POST).path_contains("/turn");
+                t.status(200).body("{}");
+            })
+            .await;
+        assert_eq!(client(&server).rc_turn("proj", "a", "x").await.unwrap(), "");
+    }
+
+    #[tokio::test]
+    async fn rc_interrupt_reports_whether_anything_was_running() {
+        // `false` is an ANSWER — interrupting an idle session is a no-op the
+        // caller asked for, not a failure. A body missing the key reads as
+        // false rather than erroring, for the same reason.
+        let server = MockServer::start_async().await;
+        for (slug, body, want) in [
+            ("busy", r#"{"interrupted":true}"#, true),
+            ("idle", r#"{"interrupted":false}"#, false),
+            ("terse", "{}", false),
+        ] {
+            let s2 = MockServer::start_async().await;
+            s2.mock_async(|w, t| {
+                w.method(POST)
+                    .path(format!("/api/sheds/proj/rc/v1/sessions/{slug}/interrupt"));
+                t.status(200).body(body);
+            })
+            .await;
+            assert_eq!(
+                client(&s2).rc_interrupt("proj", slug).await.unwrap(),
+                want,
+                "slug {slug}"
+            );
+        }
+        drop(server);
+    }
+
+    /// codex review: a 200 whose body is not JSON is a proxy error page or a
+    /// truncated response — decoding it to a default INVENTS an answer. For
+    /// interrupt that answer is "nothing was running", which is a factual claim
+    /// about the session that nobody actually made.
+    #[tokio::test]
+    async fn a_malformed_success_body_is_a_decode_error_not_a_default() {
+        for body in ["<html>502 Bad Gateway</html>", "{\"interrupted\": tru", ""] {
+            let server = MockServer::start_async().await;
+            server
+                .mock_async(|w, t| {
+                    w.method(POST);
+                    t.status(200).body(body);
+                })
+                .await;
+            assert!(
+                matches!(client(&server).rc_interrupt("proj", "a").await, Err(ShedError::Decode(_))),
+                "body {body:?} was decoded rather than rejected"
+            );
+            assert!(matches!(
+                client(&server).rc_turn("proj", "a", "x").await,
+                Err(ShedError::Decode(_))
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn rc_turn_status_code_errors_are_bad_status() {
+        // The two 409s the contract distinguishes: `not_supported` means this
+        // kind never can (the client should not have offered the button), and
+        // `not_accepting` means not right now. Both must reach the caller as a
+        // status it can key off, not a swallowed default.
+        let server = MockServer::start_async().await;
+        server
+            .mock_async(|w, t| {
+                w.method(POST).path_contains("/turn");
+                t.status(409)
+                    .body(r#"{"error":"not_supported","message":"kind has no turn"}"#);
+            })
+            .await;
+        assert!(matches!(
+            client(&server).rc_turn("proj", "a", "x").await,
+            Err(ShedError::BadStatus(409))
+        ));
     }
 
     #[tokio::test]

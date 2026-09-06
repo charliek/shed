@@ -180,6 +180,22 @@ type MonotonicFn<'a> = Box<dyn Fn() -> Instant + 'a>;
 type WarnFn<'a> = Box<dyn Fn(&str) + 'a>;
 type BinProbeFn<'a> = Box<dyn Fn(&str) -> bool + 'a>;
 type HookFn<'a> = Box<dyn Fn() + 'a>;
+/// Expand a leading `~` against `home`: `~` → home, `~/x` → home/x. Anything
+/// else — including `~user` (this is not a shell and has no passwd lookup) and
+/// a bare relative path — is returned unchanged.
+fn expand_tilde(dir: &str, home: &str) -> String {
+    if home.is_empty() {
+        return dir.to_string();
+    }
+    match dir {
+        "~" => home.to_string(),
+        // ONE trailing slash, matching Go's TrimSuffix — with HOME="//" the two
+        // engines must agree on the answer, absurd as the input is.
+        d if d.starts_with("~/") => format!("{}/{}", home.strip_suffix('/').unwrap_or(home), &d[2..]),
+        d => d.to_string(),
+    }
+}
+
 /// `(kind, workdir, getenv) -> Result<(), reason>` — the per-tool preseed
 /// dispatch (`AgentSpec.Preseed`, called at `ops.go:202`). C5 supplies the claude
 /// and cursor implementations; until then the engine simply has none wired.
@@ -511,6 +527,23 @@ impl<'a> Engine<'a> {
                 "no --workdir and SHED_WORKSPACE/HOME unset",
             ));
         }
+        // A leading `~` is expanded HERE, on the target, where HOME is the
+        // right home. Nothing else on the path would do it: the CLI quotes
+        // every argv element (that is its safety property) and tmux takes `-c`
+        // as a literal path, so `--workdir ~/prox` silently started the agent
+        // in HOME instead — and then the hub could not correlate its feed,
+        // because the pane's real directory did not match the workdir it was
+        // told. Two symptoms, one unexpanded tilde.
+        let home = (self.env)("HOME");
+        if home.is_empty() && (workdir == "~" || workdir.starts_with("~/")) {
+            // Handing tmux a literal `~` would put the agent somewhere other
+            // than where the session says it is — the exact silent mismatch
+            // this expansion exists to prevent. Say so instead.
+            return Err(EngineError::bad_args(
+                "--workdir starts with ~ but HOME is unset",
+            ));
+        }
+        let workdir = expand_tilde(&workdir, &home);
 
         // 8. Names (`ops.go:159`).
         let display_name = if opts.display_name.is_empty() {

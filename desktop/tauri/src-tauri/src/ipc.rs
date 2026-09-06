@@ -24,7 +24,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::runtime::Handle;
 
-use shed_app::{Backend, Coordinator, Reachability, RcService};
+use shed_app::{Backend, Coordinator, RcService, Reachability};
 use shed_core::approval::{
     ApprovalChoice, ApprovalDecision, ApprovalMethod, ApprovalScope, PolicyRule, SshApprovalPolicy,
 };
@@ -62,6 +62,77 @@ fn err(code: &str, message: impl Into<String>) -> (String, String) {
 /// failures that [`Backend::list_sheds`] drops on the floor are carried beside it
 /// — plural, because one failed host is not the only case. Healthy = `[]`, never
 /// absent, so a consumer can read it unconditionally.
+/// **The single shaper for `rc.list`** — shed sessions, machine sessions, the
+/// per-shed capabilities, and each machine's health.
+///
+/// Shared by the socket IPC op and the frontend's `rc_list` Tauri command, the
+/// same way [`sheds_payload`] is shared. Those two used to build this payload
+/// independently, with a comment claiming they matched; adding machine sessions
+/// to one and not the other made the pane render nothing while the IPC op was
+/// correct — exactly the divergence a single shaper prevents.
+pub(crate) async fn rc_list_payload(
+    backend: &Backend,
+    rc_service: &RcService,
+    machines: &crate::machines::Machines,
+    live: &crate::live_activity::LiveActivityLayer,
+    host: Option<&str>,
+    shed: Option<&str>,
+) -> Value {
+    let targets = backend.rc_targets(host, shed).await;
+    let sessions = rc_service.list(targets, host, shed).await;
+    // The per-shed capabilities captured during the probe, keyed by `host/shed`,
+    // let the launch form gate which kinds it offers (unknown/uninstalled agents
+    // are excluded; a shed with an old binary is simply absent → the UI degrades
+    // to claude+shell).
+    let capabilities = rc_service.capabilities(host, shed);
+
+    // **Machine sessions join the SAME payload** (plan 012 R4). A separate op
+    // would force the UI to merge two async sources and reintroduce exactly the
+    // split the unified view exists to remove; the two reach paths already
+    // produce the same session type, so the only real difference is provenance,
+    // which each row carries as `origin`.
+    //
+    // A host/shed filter is a SHED filter — it never narrows machines, because a
+    // machine belongs to no server. When one is given the caller is asking about
+    // a specific shed, so machines are omitted entirely.
+    // ONE lock acquisition for both halves — see `Machines::snapshot`: reading
+    // them separately can produce a frame where a row is `stale: false` while
+    // its machine is `reachable: false`.
+    let (machine_sessions, machine_status) = if host.is_none() && shed.is_none() {
+        machines.snapshot()
+    } else {
+        (Vec::new(), Vec::new())
+    };
+    // Shed rows are stamped with their origin too, so the UI has ONE rule for
+    // identity and labelling instead of a machine special-case. `origin` is
+    // injected client-side (like `host`/`shed` already are) — the hub wire is
+    // untouched, which keeps the Swift parity fixtures and shed-mobile's FRB DTOs
+    // valid.
+    let mut all: Vec<Value> = sessions
+        .iter()
+        .map(|s| {
+            let mut row = serde_json::to_value(s).unwrap_or_else(|_| json!({}));
+            if let Some(obj) = row.as_object_mut() {
+                obj.insert("origin".into(), json!(format!("{}/{}", s.host, s.shed)));
+                obj.insert("origin_kind".into(), json!("shed"));
+                obj.insert("stale".into(), json!(false));
+            }
+            // The live overlay LAST, so the stream's view wins over the
+            // one-shot's — the one-shot cannot know activity at all, so anything
+            // the stream has to say about it is strictly newer. Additive: a
+            // session the stream has not mentioned is left exactly as listed.
+            live.apply(&mut row, &s.host, &s.shed, &s.slug);
+            row
+        })
+        .collect();
+    all.extend(machine_sessions);
+    json!({
+        "sessions": all,
+        "capabilities": capabilities,
+        "machines": machine_status,
+    })
+}
+
 pub(crate) fn sheds_payload(r: &Reachability) -> Value {
     json!({ "sheds": r.sheds, "host_errors": r.host_errors })
 }
@@ -229,6 +300,14 @@ pub struct Handler {
     /// The persisted prefs store, so `ui.set_ssh_approval` persists the chosen SSH
     /// prefs through the same path as the frontend command (both survive a restart).
     prefs: SharedPrefs,
+    /// Machine targets (plan 012 R4): one hub watcher per `machines:` entry, and
+    /// the sessions each reports. Reached over an SSH-forwarded hub rather than a
+    /// shed server's HTTP proxy — the second reach path the sessions view merges.
+    machines: Arc<crate::machines::Machines>,
+    /// Live activity for SHED rows, folded from each host's `/api/rc/events`.
+    /// Machine rows need no equivalent — they are read from their hub, which
+    /// knows activity already.
+    live: Arc<crate::live_activity::LiveActivityLayer>,
     /// Monotonic token stamped onto each `sheds.refresh` so it can wait for the
     /// frontend to echo it back (a synchronous refresh — see [`Self::sheds_refresh`]).
     refresh_seq: AtomicU64,
@@ -246,6 +325,8 @@ impl Handler {
         coordinator: Coordinator,
         rc_service: Arc<RcService>,
         prefs: SharedPrefs,
+        machines: Arc<crate::machines::Machines>,
+        live: Arc<crate::live_activity::LiveActivityLayer>,
     ) -> Self {
         Self {
             env,
@@ -256,6 +337,8 @@ impl Handler {
             coordinator,
             rc_service,
             prefs,
+            machines,
+            live,
             refresh_seq: AtomicU64::new(0),
             pid: std::process::id(),
         }
@@ -355,6 +438,13 @@ impl Handler {
             "rc.launch" => self.rc_launch(params).await,
             "rc.kill" => self.rc_kill(params).await,
             "rc.inject_test" => self.rc_inject_test(params),
+            "machines.list" => Ok(self.machines_list()),
+            "machines.dump" => Ok(self.machines_dump()),
+            "sidebar.dump" => Ok(self.sidebar_dump()),
+            "machine.kill" => self.machine_kill(params).await,
+            "machine.launch" => self.machine_launch(params).await,
+            "machine.capabilities" => self.machine_capabilities(params).await,
+            "machine.add" => self.machine_add(params),
             "agents.dump" => Ok(self.agents_dump()),
             "prefs.get" => Ok(self.prefs_get()),
             "prefs.set_terminal" => self.prefs_set_terminal(params),
@@ -479,7 +569,11 @@ impl Handler {
     /// visibility must come from Rust. `visible` is false + `prefs` null before the
     /// first open (the window is created lazily).
     fn prefs_dump(&self) -> Value {
-        let snapshot = self.ui.lock().ok().and_then(|s| s.get(PREFERENCES_ID, "prefs"));
+        let snapshot = self
+            .ui
+            .lock()
+            .ok()
+            .and_then(|s| s.get(PREFERENCES_ID, "prefs"));
         let win = self.app.get_webview_window(PREFERENCES_ID);
         let visible = win
             .as_ref()
@@ -519,7 +613,7 @@ impl Handler {
         let pane = params.get("pane").and_then(Value::as_str).unwrap_or("");
         if !matches!(
             pane,
-            "sheds" | "approvals" | "agents" | "activity" | "egress" | "system"
+            "sheds" | "machines" | "approvals" | "agents" | "activity" | "egress" | "system"
         ) {
             return Err(err("bad_request", format!("unknown pane: {pane:?}")));
         }
@@ -657,6 +751,9 @@ impl Handler {
     /// command + resolved preset/invocation, WITHOUT spawning. `shed` (not `name`)
     /// matches the mac contract; gtk has no terminal.
     fn terminal_preview(&self, params: &Value) -> Result<Value, (String, String)> {
+        if let Some(machine) = params.get("machine").and_then(Value::as_str) {
+            return self.machine_terminal(machine, params);
+        }
         let shed = req_str(params, "shed")?;
         self.terminal.preview(
             params.get("host").and_then(Value::as_str),
@@ -680,6 +777,10 @@ impl Handler {
                 "terminal.open is disabled in test mode (use terminal.preview)",
             ));
         }
+        if let Some(machine) = params.get("machine").and_then(Value::as_str) {
+            let cmd = self.machine_terminal_command(machine, params)?;
+            return self.terminal.spawn_command(&cmd, machine, params);
+        }
         let shed = req_str(params, "shed")?;
         self.terminal.open(
             params.get("host").and_then(Value::as_str),
@@ -691,6 +792,28 @@ impl Handler {
                 .and_then(Value::as_str)
                 .map(str::to_string),
         )
+    }
+
+    /// The `ssh -t … tmux attach` command for a MACHINE session, resolved
+    /// through the same watcher that owns the machine's config entry.
+    fn machine_terminal_command(
+        &self,
+        machine: &str,
+        params: &Value,
+    ) -> Result<shed_core::terminal::TerminalCommand, (String, String)> {
+        let slug = req_str(params, "slug")?;
+        self.machines
+            .terminal_command(machine, slug)
+            .map_err(|e| err("bad_request", e))
+    }
+
+    /// `terminal.preview {machine, slug}` → the resolved command WITHOUT
+    /// spawning, so the harness can assert the wire the opener would run.
+    fn machine_terminal(&self, machine: &str, params: &Value) -> Result<Value, (String, String)> {
+        let cmd = self.machine_terminal_command(machine, params)?;
+        self.terminal
+            .preview_command(&cmd, machine, params)
+            .map_err(|e| (e.0, e.1))
     }
 
     /// `terminal.presets` → the offerable presets + install detection.
@@ -721,7 +844,9 @@ impl Handler {
     /// `rc.classify {kind, pane}` → the pure pane classifier `{state, url?}`.
     fn rc_classify(&self, params: &Value) -> Result<Value, (String, String)> {
         let kind = rc_kind(params)?;
-        Ok(json!(self.rc_service.classify(&kind, req_str(params, "pane")?)))
+        Ok(json!(self
+            .rc_service
+            .classify(&kind, req_str(params, "pane")?)))
     }
 
     /// `rc.list {host?, shed?}` → `{sessions}`. The running sheds + their ssh
@@ -730,14 +855,118 @@ impl Handler {
     async fn rc_list(&self, params: &Value) -> Result<Value, (String, String)> {
         let host = params.get("host").and_then(Value::as_str);
         let shed = params.get("shed").and_then(Value::as_str);
-        let targets = self.backend.rc_targets(host, shed).await;
-        let sessions = self.rc_service.list(targets, host, shed).await;
-        // The per-shed capabilities captured during the probe, keyed by `host/shed`,
-        // let the launch form gate which kinds it offers (unknown/uninstalled
-        // agents are excluded; a shed with an old binary is simply absent → the UI
-        // degrades to claude+shell).
-        let capabilities = self.rc_service.capabilities(host, shed);
-        Ok(json!({ "sessions": sessions, "capabilities": capabilities }))
+        Ok(rc_list_payload(
+            &self.backend,
+            &self.rc_service,
+            &self.machines,
+            &self.live,
+            host,
+            shed,
+        )
+        .await)
+    }
+
+    /// `machines.list` → `{machines}`: per-machine reachability for the sessions
+    /// view's group headers, without the sessions themselves.
+    ///
+    /// Separate from `rc.list` because a machine is worth showing even when it
+    /// has no sessions AND cannot be reached — that row IS the information
+    /// ("mini3 is asleep"), and a sessions-only payload has nowhere to put it.
+    fn machines_list(&self) -> Value {
+        json!({ "machines": self.machines.status() })
+    }
+
+    /// `machine.add {name, host?, user?, ssh_port?, rc_bin?}` → append the
+    /// machine to the shed config and start watching it.
+    ///
+    /// The same implementation the Add dialog invokes — the harness drives the
+    /// op, the dialog drives the command, and both land in
+    /// `machines::add_from_json`, so what is tested is what ships.
+    fn machine_add(&self, params: &Value) -> Result<Value, (String, String)> {
+        crate::machines::add_from_json(&self.machines, &self.env.config_path, params)
+            .map(|()| json!({}))
+            .map_err(|e| err("bad_request", e))
+    }
+
+    /// `machines.dump` → what the MACHINES PANE actually rendered (UI truth, like
+    /// `agents.dump`/`egress.profiles`), as opposed to `machines.list`, which is
+    /// the backend's view and answers off-pane.
+    ///
+    /// The distinction is the whole point: `machines.list` can be perfect while
+    /// nothing reaches the pane — exactly the bug that shipped machine state to
+    /// the IPC op but never to the window. Off-pane this is `null`, not a stale
+    /// snapshot from the last mount.
+    fn machines_dump(&self) -> Value {
+        let on_pane = self
+            .ui_get("pane")
+            .and_then(|p| p.as_str().map(|s| s == "machines"))
+            .unwrap_or(false);
+        let machines = if on_pane {
+            self.ui_get("machines_pane").unwrap_or(Value::Null)
+        } else {
+            Value::Null
+        };
+        json!({ "machines": machines })
+    }
+
+    /// `sidebar.dump` → the sidebar's status foot as rendered: `{servers,
+    /// machines}`.
+    ///
+    /// Unlike the pane dumps this answers from ANY pane — the sidebar is always
+    /// mounted, and that is exactly why it is where "is that box up" lives now
+    /// that the Sheds pane carries no error strip.
+    fn sidebar_dump(&self) -> Value {
+        self.ui_get("sidebar").unwrap_or(Value::Null)
+    }
+
+    /// `machine.kill {machine, slug}` → kill a session on a machine.
+    ///
+    /// Distinct from `rc.kill` because the addressing genuinely differs: a shed
+    /// session is `(host, shed, slug)` through the server's SSH endpoint, a
+    /// machine session is `(machine, slug)` over the machine's own SSH. Folding
+    /// them into one op would mean passing an empty `shed` and having the
+    /// backend guess which path was meant.
+    async fn machine_kill(&self, params: &Value) -> Result<Value, (String, String)> {
+        let machine = req_str(params, "machine")?.to_string();
+        let slug = req_str(params, "slug")?.to_string();
+        self.machines
+            .kill(&machine, &slug)
+            .await
+            .map_err(|e| err("action_failed", e))?;
+        Ok(json!({}))
+    }
+
+    /// `machine.launch {machine, kind, display_name?, workdir?, permission_mode?,
+    /// initial_prompt?}` → the created `RcSession`. The machine counterpart of
+    /// [`Self::rc_launch`], addressed by machine name over that machine's own
+    /// SSH rather than by `(host, shed)` through a server.
+    async fn machine_launch(&self, params: &Value) -> Result<Value, (String, String)> {
+        let machine = req_str(params, "machine")?.to_string();
+        let kind = rc_kind(params)?;
+        let opt = |k: &str| params.get(k).and_then(Value::as_str);
+        self.machines
+            .launch(
+                &machine,
+                &kind,
+                opt("display_name"),
+                opt("workdir"),
+                opt("permission_mode"),
+                opt("initial_prompt"),
+            )
+            .await
+            .map_err(|e| err("action_failed", e))
+    }
+
+    /// `machine.capabilities {machine}` → `{capabilities}` — what a create form
+    /// may offer for that machine, or `null` from an engine too old to say.
+    async fn machine_capabilities(&self, params: &Value) -> Result<Value, (String, String)> {
+        let machine = req_str(params, "machine")?.to_string();
+        let caps = self
+            .machines
+            .capabilities(&machine)
+            .await
+            .map_err(|e| err("action_failed", e))?;
+        Ok(json!({ "capabilities": caps }))
     }
 
     /// `rc.launch {shed, kind, host?, display_name?, workdir?, initial_prompt?}` →
@@ -773,7 +1002,10 @@ impl Handler {
             .backend
             .resolve_rc_target(params.get("host").and_then(Value::as_str))
             .map_err(|e| err("bad_request", e.to_string()))?;
-        self.rc_service.kill(target, shed, slug).await.map_err(rc_err)?;
+        self.rc_service
+            .kill(target, shed, slug)
+            .await
+            .map_err(rc_err)?;
         Ok(json!({}))
     }
 
@@ -805,7 +1037,10 @@ impl Handler {
             }
         };
         let opt = |k: &str| params.get(k).and_then(Value::as_str).map(str::to_string);
-        let managed = params.get("managed").and_then(Value::as_bool).unwrap_or(false);
+        let managed = params
+            .get("managed")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
         Ok(RcSession {
             host,
             shed: shed.to_string(),
@@ -1100,7 +1335,8 @@ impl Handler {
             .get("enabled")
             .and_then(Value::as_bool)
             .ok_or_else(|| err("bad_request", "missing 'enabled' (bool)"))?;
-        crate::login_item_set(&self.app, &self.env, enabled).map_err(|e| err("action_failed", e))?;
+        crate::login_item_set(&self.app, &self.env, enabled)
+            .map_err(|e| err("action_failed", e))?;
         self.emit_prefs_changed();
         Ok(json!({}))
     }
@@ -1385,7 +1621,9 @@ mod tests {
         assert_eq!(sheds[0]["name"], "alpha");
         assert_eq!(sheds[0]["host"], "mock");
 
-        let errs = p["host_errors"].as_array().expect("host_errors is an array");
+        let errs = p["host_errors"]
+            .as_array()
+            .expect("host_errors is an array");
         assert_eq!(errs.len(), 2, "both failed hosts survive: {p}");
         assert_eq!(errs[0]["server"], "mini2");
         assert_eq!(errs[0]["kind"], "agent_upgrade_required");
@@ -1397,7 +1635,10 @@ mod tests {
             "the summary must lead with the remedy: {}",
             errs[0]["summary"]
         );
-        assert!(errs[0]["detail"].as_str().unwrap().contains("credential.get"));
+        assert!(errs[0]["detail"]
+            .as_str()
+            .unwrap()
+            .contains("credential.get"));
         assert_eq!(errs[1]["server"], "mini3");
         assert_eq!(errs[1]["kind"], "other");
         assert!(!errs[1]["summary"].as_str().unwrap().is_empty());
@@ -1414,9 +1655,15 @@ mod tests {
 
     #[test]
     fn rc_kind_parses_wire_value_or_rejects() {
-        assert_eq!(rc_kind(&json!({"kind": "claude-rc"})).unwrap(), RcKind::ClaudeRc);
+        assert_eq!(
+            rc_kind(&json!({"kind": "claude-rc"})).unwrap(),
+            RcKind::ClaudeRc
+        );
         assert_eq!(rc_kind(&json!({"kind": "shell"})).unwrap(), RcKind::Shell);
-        assert_eq!(rc_kind(&json!({"kind": "bogus"})).unwrap_err().0, "bad_request");
+        assert_eq!(
+            rc_kind(&json!({"kind": "bogus"})).unwrap_err().0,
+            "bad_request"
+        );
         assert_eq!(rc_kind(&json!({})).unwrap_err().0, "bad_request");
     }
 
@@ -1444,6 +1691,7 @@ mod tests {
             test_mode: true,
             mock_base_url: mock.map(str::to_string),
             mock_unreachable_hosts: std::collections::HashSet::new(),
+            machine_hub_ports: std::collections::HashMap::new(),
             config_path: PathBuf::new(),
             socket_path: PathBuf::from("/run/user/0/shed-tauri/shed-tauri.sock"),
             host_agent_socket: PathBuf::from("/run/user/0/shed/host-agent.sock"),

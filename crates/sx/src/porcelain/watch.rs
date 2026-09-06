@@ -40,13 +40,11 @@ use crate::porcelain::hub::{HubClient, HubError, HUB_PORT};
 use crate::porcelain::{
     load_config, remote_exec, remote_prefix, resolve_target, VerbError, VerbResult,
 };
-use crate::ssh;
 use crate::target::Resolved;
+use shed_app::machine::MachineForward as _;
 
 /// How often probe polling re-reads the session when there is no feed.
 const POLL_EVERY: Duration = Duration::from_secs(2);
-/// How long to wait for an `ssh -L` tunnel's local end to answer.
-const TUNNEL_READY_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Which feed `sx watch` should open.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -198,15 +196,15 @@ pub fn shed_event_keep(event: &RcEvent, shed: &str, slug: &str) -> bool {
 // the hub transports (local + machine)
 // ---------------------------------------------------------------------------
 
-/// Stream a hub reachable on `127.0.0.1:<port>`. `_tunnel` (when present) is the
-/// `ssh -L` child held alive for the duration of this call; dropping it kills the
-/// forward.
+/// Stream a hub reachable on `127.0.0.1:<port>`. `_forward` (when present) is
+/// the machine forward held alive for the duration of this call; dropping it
+/// tears the tunnel down.
 fn stream_hub(
     deps: &Deps,
     resolved: &Resolved,
     slug: &str,
     port: u16,
-    _tunnel: Option<Child>,
+    _forward: Option<shed_app::machine::SshForward>,
 ) -> VerbResult {
     let client = match HubClient::loopback(port).and_then(|c| {
         deps.block_on(async {
@@ -276,72 +274,28 @@ fn stream_hub(
 }
 
 /// Open an `ssh -L` tunnel to a machine's hub, then stream through it.
+///
+/// The tunnel itself is [`shed_app::machine::SshForward`] — the shared transport
+/// seam (plan 012). Port reservation, the spawn, the deadline-poll that watches
+/// the child (both common failures are instant: a taken local port via
+/// `ExitOnForwardFailure`, and an unreachable host) and the kill-on-drop guard
+/// all live there now, so `sx` and the desktop open a machine's hub the same way
+/// and a phone can substitute its own forward without reimplementing any of it.
 fn stream_machine(deps: &Deps, resolved: &Resolved, slug: &str) -> VerbResult {
     let Resolved::Machine(entry) = resolved else {
         return Err(VerbError::failed("internal: not a machine target"));
     };
-    // The port is grabbed the same way the engine allocates opencode's: bind
-    // :0, read the assignment, release. Racy in principle; `ExitOnForwardFailure`
-    // turns a lost race into an immediate, visible tunnel failure.
-    let port = shed_app::rc_engine::free_loopback_port()
-        .map_err(|e| VerbError::failed(format!("allocating a local forward port: {e}")))?;
-    let argv = ssh::machine_forward_argv(entry, port, HUB_PORT);
-    let (bin, rest) = argv.split_first().expect("ssh argv is never empty");
-    let child = std::process::Command::new(bin)
-        .args(rest)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .spawn()
-        .map_err(|e| VerbError::failed(format!("opening the hub tunnel: {e}")))?;
-    let mut tunnel = Child(child);
-
-    // Deadline-poll the local end rather than sleeping a fixed amount — AND watch
-    // the ssh child, because the two common failures are instant: a taken local
-    // port (`ExitOnForwardFailure`) and an unreachable/refused host both exit ssh
-    // in well under a second. Waiting out the full timeout for a process that is
-    // already gone is 10s of a stopped terminal for no information.
-    let deadline = std::time::Instant::now() + TUNNEL_READY_TIMEOUT;
-    while std::net::TcpStream::connect(("127.0.0.1", port)).is_err() {
-        let reason = match tunnel.exited() {
-            Some(status) => format!(
-                "the hub tunnel to {} exited immediately ({status})",
-                resolved.display()
-            ),
-            None if std::time::Instant::now() >= deadline => {
-                format!("the hub tunnel to {} did not come up", resolved.display())
-            }
-            None => {
-                std::thread::sleep(Duration::from_millis(100));
-                continue;
-            }
-        };
-        return degrade(deps, resolved, slug, RcState::Starting, &reason);
+    let forward = match shed_app::machine::SshForward::reserve(entry.clone()) {
+        Ok(forward) => forward,
+        Err(e) => return degrade(deps, resolved, slug, RcState::Starting, &e.to_string()),
+    };
+    if let Err(e) = deps.block_on(forward.ensure()) {
+        // An unreachable machine is a DEGRADED feed, not a failed command —
+        // the same posture every other "no feed" reason gets.
+        return degrade(deps, resolved, slug, RcState::Starting, &e.to_string());
     }
-    stream_hub(deps, resolved, slug, port, Some(tunnel))
-}
-
-/// An owned child process that is killed and reaped when dropped — so a Ctrl-C
-/// or an early return can never leave an `ssh -L` forward running.
-struct Child(std::process::Child);
-
-impl Child {
-    /// The child's exit status if it has ALREADY exited, without blocking. A
-    /// probe error (the child was reaped elsewhere) counts as exited: either way
-    /// there is no tunnel to wait for.
-    fn exited(&mut self) -> Option<String> {
-        match self.0.try_wait() {
-            Ok(Some(status)) => Some(status.to_string()),
-            Ok(None) => None,
-            Err(err) => Some(err.to_string()),
-        }
-    }
-}
-
-impl Drop for Child {
-    fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
-    }
+    let port = forward.port();
+    stream_hub(deps, resolved, slug, port, Some(forward))
 }
 
 // ---------------------------------------------------------------------------

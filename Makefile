@@ -97,6 +97,29 @@ test-rc-parity:
 	}
 	cd tests/rc-parity && uv sync && PATH="$$HOME/.cargo/bin:$$PATH" uv run pytest -v
 
+# The machine-transport differential (plan 012 AC2). The FIFTH pytest suite,
+# and — like the other four — never merged with them. SSH has no argv API, so a
+# remote command is one string the far side re-parses; `sx`/Tauri compose it in
+# Rust and shed-mobile composes it in Dart, and two implementations of one wire
+# contract drift silently. This suite owns the shared contract
+# (tests/machine-transport/scenarios.json + goldens/) and runs the LIVE leg:
+# every wire line through a throwaway sshd on 127.0.0.1, asserting the remote
+# process received exactly the intended argv. It also covers the forwarded-hub
+# family, which asserts DELIVERED FRAMES rather than tunnel liveness (a
+# liveness-only check passes with a completely dead feed — that was a real bug).
+#
+# The other two legs live where their implementations do: Rust in
+# `cargo test -p shed-core --test machine_transport_contract`, Dart in
+# shed-mobile. Needs uv and an sshd (skips cleanly without one).
+# See tests/machine-transport/README.md.
+test-machine-transport:
+	@command -v uv >/dev/null 2>&1 || { \
+	  echo "uv is required for the machine-transport harness."; \
+	  echo "Install: brew install uv  (or https://docs.astral.sh/uv/getting-started/installation/)"; \
+	  exit 1; \
+	}
+	cd tests/machine-transport && uv sync && uv run pytest -v
+
 # Parallel dev shed-server lifecycle (Mac VZ).
 #
 # Runs the just-built bin/shed-server ALONGSIDE the brew-installed

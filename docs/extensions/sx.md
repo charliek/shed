@@ -223,6 +223,34 @@ otherwise it prints a one-line stderr hint naming the agent as the hub's
 owner. It never starts a hub. Sessions work without one; only live activity
 is missing.
 
+### The hub's `PATH` is the hub's, not yours
+
+The hub **spawns agent binaries** (`opencode`, `codex`, `cursor-agent`,
+`claude`), so it can only launch what is on the PATH of the process that hosts
+it — and a supervised daemon does not inherit your shell's. A systemd **user**
+unit in particular starts with a minimal PATH: an agent installed into
+`~/.local/bin`, `~/.bun/bin`, or a version manager's shim directory is
+invisible to it.
+
+The symptom is quiet and easy to misread: `sx rc capabilities` reports the
+agent as `"installed": false`, and a kickoff for that kind fails, with nothing
+pointing at PATH as the cause. The tool is plainly there in your own shell.
+
+Set the PATH explicitly on the unit that hosts the hub:
+
+```bash
+systemd-run --user --unit=shed-rc-hub --property=Restart=always \
+  --setenv=PATH="$HOME/.local/bin:$HOME/.bun/bin:/usr/local/bin:/usr/bin:/bin" \
+  shed-host-agent rc-hub
+```
+
+For a packaged unit, the equivalent is an `Environment=PATH=…` line (or a
+drop-in). On macOS under brew services, the launchd job has the same property:
+its `PATH` is launchd's, not your login shell's.
+
+Confirm with `sx rc capabilities` — every agent you expect should report
+`"installed": true` with a version.
+
 **The trust model is the machine's own.** There is no server proxy on a
 machine: the hub binds loopback only and does no authorization — the loopback
 bind plus your SSH tunnel (`ssh -L`) IS the boundary. Never widen the bind.

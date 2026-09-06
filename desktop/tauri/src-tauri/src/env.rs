@@ -2,7 +2,7 @@
 //! Swift `ShedBackend` hermeticity hooks so the pytest harness can point the Tauri
 //! app at an in-process mock + a fixture config without touching real hosts.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 #[derive(Debug, Clone)]
@@ -30,6 +30,28 @@ pub struct Env {
     /// macOS `~/Library/Application Support/shed`, Linux `$XDG_RUNTIME_DIR/shed` or
     /// `~/.local/share/shed`, both under `$SHED_HOST_AGENT_SOCKET_DIR` if set).
     pub host_agent_socket: PathBuf,
+    /// TEST-ONLY machine-hub override: `SHED_TAURI_MACHINE_HUB_PORTS`, a
+    /// comma-separated `<machine>=<port>` map. A listed machine's hub is reached
+    /// on that loopback port directly instead of through an `ssh -N -L` forward.
+    ///
+    /// This is what makes the machine path testable HERMETICALLY: the harness
+    /// stands up a fake `/v1` hub and the app reaches it through
+    /// `shed_app::machine::FixedPort`, so the REAL `HubClient` and
+    /// `MachineHubWatcher` run with no ssh, no remote host, and no network. The
+    /// seam exists for shed-mobile (which supplies its own Dart-side forward),
+    /// and it turns out a hermetic harness needs exactly the same thing.
+    ///
+    /// **Per-machine, not one port for all**, so a suite can serve a hub for one
+    /// machine and point another at a dead port — which is how the everyday
+    /// "asleep / off-network" state gets covered without any real machine.
+    ///
+    /// Non-empty in test mode means NO machine ever spawns ssh: an unlisted
+    /// entry is treated as permanently unreachable rather than falling back to a
+    /// real forward, so a hermetic run cannot leak an ssh child.
+    ///
+    /// Parsed only in test mode, like [`Self::mock_unreachable_hosts`] — a stray
+    /// env var must never redirect a real machine's hub in production.
+    pub machine_hub_ports: HashMap<String, u16>,
     /// The host-agent `extensions.yaml` the EMBEDDED broker loads (`SHED_TAURI_EXTENSIONS_CONFIG`,
     /// else the daemon default `~/.config/shed/extensions.yaml`). Only read in embedded /
     /// headless-coexist mode; external mode never touches it. The harness overrides it to
@@ -67,10 +89,29 @@ impl Env {
         } else {
             HashSet::new()
         };
+        // Same rule as the unreachable-hosts seam: test mode only, so a stray env
+        // var can never point a real machine's hub somewhere else. A malformed
+        // pair is dropped rather than failing the launch — the machine then reads
+        // as unreachable, which is a visible, debuggable state.
+        let machine_hub_ports = if test_mode {
+            var("SHED_TAURI_MACHINE_HUB_PORTS")
+                .map(|v| {
+                    v.split(',')
+                        .filter_map(|pair| {
+                            let (name, port) = pair.split_once('=')?;
+                            Some((name.trim().to_string(), port.trim().parse::<u16>().ok()?))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default()
+        } else {
+            HashMap::new()
+        };
         Self {
             test_mode,
             mock_base_url: var("SHED_TAURI_MOCK_BASE_URL"),
             mock_unreachable_hosts,
+            machine_hub_ports,
             config_path,
             socket_path: var("SHED_TAURI_SOCKET")
                 .map(PathBuf::from)

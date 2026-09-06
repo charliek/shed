@@ -1514,3 +1514,29 @@ fn checked_captures_map_gone_vs_transient() {
         Err(EngineError::Other(_))
     ));
 }
+
+/// The lived failure: `--workdir ~/prox` started the agent in HOME, because the
+/// CLI quotes every argv element and tmux takes `-c` as a literal path — so
+/// nothing on the way expanded it. The session then reported a workdir the pane
+/// was not actually in, which is also why the hub could not correlate its
+/// message feed.
+#[test]
+fn a_leading_tilde_expands_against_the_targets_home() {
+    const HOME: &str = "/home/shed";
+    for (input, want) in [
+        ("~/prox", "/home/shed/prox"),
+        ("~", "/home/shed"),
+        ("~/", "/home/shed/"),
+        ("/abs/path", "/abs/path"),
+        ("relative/path", "relative/path"),
+        // Not a shell: no passwd lookup, so `~user` is left alone rather than
+        // guessed at.
+        ("~root/x", "~root/x"),
+        ("", ""),
+    ] {
+        assert_eq!(super::expand_tilde(input, HOME), want, "{input}");
+    }
+    // With no HOME there is nothing to expand against; leave the value alone
+    // rather than inventing a path.
+    assert_eq!(super::expand_tilde("~/prox", ""), "~/prox");
+}

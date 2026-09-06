@@ -1,12 +1,12 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 
-export type Pane = "sheds" | "approvals" | "agents" | "activity" | "egress" | "system";
+export type Pane = "sheds" | "machines" | "approvals" | "agents" | "activity" | "egress" | "system";
 
 /** Which modal (if any) is open — reported so the harness can drive + assert it.
  *  (Preferences is a dedicated window, not a modal — see `reportPrefs`.) */
-export type Modal = null | "create" | "launch";
+export type Modal = null | "create" | "launch" | "machine";
 
-const PANES: readonly Pane[] = ["sheds", "approvals", "agents", "activity", "egress", "system"];
+const PANES: readonly Pane[] = ["sheds", "machines", "approvals", "agents", "activity", "egress", "system"];
 
 /** Narrow an untrusted value (an IPC payload) to a known pane. */
 export function isPane(x: unknown): x is Pane {
@@ -53,15 +53,22 @@ export type EmptyState = { title: string; body: string };
 
 /** The Sheds empty state, deferring to a per-host failure when there is one: with
  *  no sheds AND a failed host, leading with "No sheds yet" would imply everything
- *  is fine (shed#300). The single source for both the render and the reported
- *  UI truth. */
+ *  is fine and blame the user's config (shed#300). The single source for both the
+ *  render and the reported UI truth.
+ *
+ *  It NAMES the unreachable servers but carries no transport error text — the
+ *  reason belongs to the sidebar's SHED SERVERS section (and the System pane),
+ *  which is where a person looks for "is that box up". A pane that cannot list
+ *  anything should say so once and point, not reprint a stack of `connect:`
+ *  strings. */
 export function shedsEmptyState(sheds: Shed[], hostErrors: HostFailure[]): EmptyState | null {
   if (sheds.length > 0) return null; // the list renders instead
-  if (hostErrors.length === 1) {
-    return { title: hostErrors[0].summary, body: `No sheds could be listed from ${hostErrors[0].server}.` };
-  }
-  if (hostErrors.length > 1) {
-    return { title: "Some hosts are unreachable", body: hostErrors.map((e) => e.summary).join(" · ") };
+  if (hostErrors.length > 0) {
+    const names = hostErrors.map((e) => e.server).join(", ");
+    return {
+      title: hostErrors.length === 1 ? `${names} is unreachable` : "Some shed servers are unreachable",
+      body: `No sheds could be listed from ${names}. Check SHED SERVERS in the sidebar for status.`,
+    };
   }
   return {
     title: "No sheds yet",
@@ -102,6 +109,37 @@ async function invoke<T>(cmd: string, args?: Record<string, unknown>): Promise<T
  *  rendered counts as UI truth via `ui.badges` — not pixels. */
 export type Badges = { sheds: number; agents: number; hosts: number; pending: number };
 
+/** One machine as the sidebar's status foot renders it: the WORD a person reads,
+ *  never the raw transport error (which stays on hover). */
+export type SidebarMachineRow = { name: string; origin: string; status: string; note: string };
+
+/** What the shell knows about the sidebar's two sections before the host
+ *  failures are folded in (which `report` does, since it holds them). */
+export type SidebarInput = {
+  servers: { name: string; reachable: boolean }[];
+  machines: SidebarMachineRow[];
+};
+
+/** The sidebar's status foot as rendered — UI truth for the surface that took
+ *  over from the Sheds pane's error strip, so "an unreachable server is still
+ *  visible somewhere, with its reason reachable" stays a test rather than a hope.
+ *
+ *  It rides the shell's ONE full report rather than a `reportSidebar` of its own:
+ *  the sidebar paints on the FIRST render, before `useUiBridge` has attached its
+ *  navigate/refresh listeners, so a partial report from here would create the
+ *  `main` slot early and false-signal readiness (see `report`). */
+export type SidebarReport = {
+  servers: { name: string; reachable: boolean; detail: string }[];
+  machines: SidebarMachineRow[];
+};
+
+/** The failure for one host, if any — the SINGLE lookup shared by the sidebar's
+ *  rendered tooltip and the reported `detail`, so the two cannot drift into
+ *  disagreeing about whether a host has a reason attached. */
+export function hostFailureFor(hostErrors: HostFailure[], host: string): HostFailure | undefined {
+  return hostErrors.find((e) => e.server === host);
+}
+
 /** Report the rendered snapshot Rust relays to the harness (`ui.current_pane` /
  *  `ui.computed_style` / `dashboard.dump` / `ui.badges`). ALWAYS a FULL blob — every
  *  key present — so no partial report can (a) create the `main` slot before the shell
@@ -114,6 +152,7 @@ function report(
   refreshToken: number,
   modal: Modal,
   badges: Badges,
+  sidebar: SidebarInput,
   mode?: string,
   hostErrors: HostFailure[] = [],
 ) {
@@ -125,6 +164,16 @@ function report(
       refresh_token: refreshToken,
       modal,
       badges,
+      // The sidebar's status foot. `detail` is the host's failure summary — the
+      // hover text — so a test can prove the reason is threaded to the row and
+      // not merely that the row exists.
+      sidebar: {
+        servers: sidebar.servers.map((sv) => ({
+          ...sv,
+          detail: hostFailureFor(hostErrors, sv.name)?.summary ?? "",
+        })),
+        machines: sidebar.machines,
+      },
       // The Sheds pane's failure surface (`dashboard.dump.host_errors` / `.empty`):
       // the strip rows, and the empty state ONLY while that pane is rendered — an
       // off-pane `empty` would report copy nobody is reading (the `agents.dump`
@@ -161,6 +210,7 @@ export function useUiBridge(
   agentCount: number,
   hostCount: number,
   pending: number,
+  sidebar: SidebarInput,
 ): { sheds: Shed[]; hostErrors: HostFailure[]; refresh: () => void } {
   const [sheds, setSheds] = useState<Shed[]>([]);
   const [hostErrors, setHostErrors] = useState<HostFailure[]>([]);
@@ -229,7 +279,11 @@ export function useUiBridge(
       // Fresh sheds + real badges arrive via the report effect on the next render;
       // this initial report just publishes the pane, so `current_pane != null` =
       // "listeners live". No modal is open at mount; badges seed at zero.
-      report(paneRef.current, [], 0, null, { sheds: 0, agents: 0, hosts: 0, pending: 0 });
+      report(
+        paneRef.current, [], 0, null,
+        { sheds: 0, agents: 0, hosts: 0, pending: 0 },
+        { servers: [], machines: [] },
+      );
     })();
     return () => {
       cancelled = true;
@@ -315,8 +369,12 @@ export function useUiBridge(
     // `hosts` = the configured-host count (with reachability) the shell supplies —
     // covers zero-shed hosts, unlike a sheds-derived distinct-host count.
     const badges: Badges = { sheds: sheds.length, agents: agentCount, hosts: hostCount, pending };
-    report(pane, sheds, refreshToken, modal, badges, mode, hostErrors);
-  }, [pane, sheds, hostErrors, refreshToken, modal, mode, agentCount, hostCount, pending]);
+    report(pane, sheds, refreshToken, modal, badges, sidebar, mode, hostErrors);
+    // `sidebar` is rebuilt by the caller each render, so it is compared by VALUE
+    // (a reference dep would re-report on every render — the flap this whole
+    // shape exists to avoid).
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [pane, sheds, hostErrors, refreshToken, modal, mode, agentCount, hostCount, pending, JSON.stringify(sidebar)]);
 
   const refresh = useCallback(() => void fetchSheds(0), [fetchSheds]);
   return { sheds, hostErrors, refresh };
@@ -485,6 +543,37 @@ export async function setBrokerMode(
 export async function openTerminal(shed: string, host: string, session?: string): Promise<void> {
   if (!inTauri()) return;
   await invoke("open_terminal", { shed, host, session });
+}
+
+/** The fields a new machine needs — exactly `shed_core::config::MachineEntry`.
+ *  Everything but `name` is optional and falls back to the config reader's own
+ *  defaults, so adding `mini3` really is one field. */
+export type NewMachine = {
+  name: string;
+  host?: string;
+  user?: string;
+  ssh_port?: number;
+  rc_bin?: string;
+};
+
+/** Append a machine to `~/.shed/config.yaml` and start watching it.
+ *
+ *  Throws with the backend's message on a duplicate name or an unwritable
+ *  config — the dialog shows it rather than closing on a failure. */
+export async function addMachine(m: NewMachine): Promise<void> {
+  if (!inTauri()) return;
+  const core = await import("@tauri-apps/api/core");
+  await core.invoke("add_machine", { machine: m });
+}
+
+/** Open a MACHINE session in a terminal (`ssh -t … tmux attach`).
+ *
+ *  Takes the SLUG, not the tmux name the shed path passes: a machine's pane
+ *  name is derived host-side from the slug, so handing over the derived name
+ *  would mean two places agreeing about the `rc-` prefix instead of one. */
+export async function openMachineTerminal(machine: string, slug: string): Promise<void> {
+  if (!inTauri()) return;
+  await invoke("open_terminal", { machine, session: slug, shed: "", host: null });
 }
 
 /* ---- create (the New-Shed dialog) ----------------------------------------- */
@@ -834,17 +923,65 @@ export type RcSession = {
   activity_at?: string | null;
   last_message?: string | null;
   pending_approvals?: RcFeedApproval[] | null;
+  /** Where this session was reached FROM — `machine:<name>` or `<host>/<shed>`.
+   *  Injected client-side by the backend (like `host`/`shed` already are), never
+   *  a wire field, so the hub contract and shed-mobile's DTOs are untouched.
+   *
+   *  **This is the row's identity.** Do NOT key on `shed`: a hub read directly
+   *  reports `shed: ""` on every session, so two machines sharing a slug would
+   *  collide (see `ActivityOverlay`'s `(shed, slug)` keying). Optional so a
+   *  payload from an older backend still type-checks. */
+  origin?: string | null;
+  origin_kind?: "shed" | "machine" | null;
+  /** The machine name for a machine session; absent for a shed session. */
+  machine?: string | null;
+  /** The feed behind this row is not currently live — the last known state is
+   *  being shown. A machine that is asleep or off-network is NORMAL, not an
+   *  error, so its rows stay visible and dimmed rather than vanishing. */
+  stale?: boolean | null;
 };
 
-/** The `rc.list` result: live sessions plus the per-shed capabilities captured
- *  during the probe (keyed by `host/shed`). */
-export type RcListResult = { sessions: RcSession[]; capabilities: Record<string, RcCapabilities> };
+/** A configured machine's health, for the sessions view's group rows. A machine
+ *  with no sessions AND no reachability is still worth a row — that row IS the
+ *  information ("mini3 is asleep"). */
+export type MachineStatus = {
+  name: string;
+  origin: string;
+  reachable: boolean;
+  /** Whether a snapshot has EVER arrived — distinguishes "still connecting"
+   *  from "connected, and genuinely has no sessions". */
+  connected_once: boolean;
+  sessions: number;
+  /** Why it is unreachable, verbatim from the watcher: "no route to host" and
+   *  "nothing is listening on 1029" are different problems. */
+  detail?: string | null;
+};
+
+/** The `rc.list` result: live sessions (shed AND machine), the per-shed
+ *  capabilities captured during the probe (keyed by `host/shed`), and each
+ *  configured machine's health. */
+export type RcListResult = {
+  sessions: RcSession[];
+  capabilities: Record<string, RcCapabilities>;
+  machines: MachineStatus[];
+};
+
+/** A session's stable row identity. Uses `origin` where the backend supplied it
+ *  and falls back to the legacy `host/shed` composite, so a mixed payload (or an
+ *  older backend) still produces unique keys. */
+export function sessionKey(s: RcSession): string {
+  return `${s.origin ?? `${s.host}/${s.shed}`}/${s.slug}`;
+}
 
 /** The live RC sessions + capabilities across running sheds (the same data the
  *  `rc.list` op serves the harness). Best-effort — empty in a browser / on error. */
 export async function fetchRcList(host?: string, shed?: string): Promise<RcListResult> {
   const r = await invoke<RcListResult>("rc_list", { host, shed });
-  return { sessions: r?.sessions ?? [], capabilities: r?.capabilities ?? {} };
+  return {
+    sessions: r?.sessions ?? [],
+    capabilities: r?.capabilities ?? {},
+    machines: r?.machines ?? [],
+  };
 }
 
 export type RcLaunchFields = {
@@ -864,10 +1001,65 @@ export async function rcLaunch(fields: RcLaunchFields): Promise<RcSession> {
   return core.invoke<RcSession>("rc_launch", fields);
 }
 
+export type MachineLaunchFields = {
+  machine: string;
+  kind: RcKind;
+  displayName?: string;
+  workdir?: string;
+  permissionMode?: string;
+  initialPrompt?: string;
+};
+
+/** Launch a session ON a machine. THROWS on error, like [rcLaunch].
+ *
+ *  Separate from `rcLaunch` for the same reason `machineKill` is separate from
+ *  `rcKill`: a machine is addressed by name over its own SSH, not by
+ *  `(host, shed)` through a server. Everything downstream — the flag set, the
+ *  permission-mode gate, how a kickoff prompt is delivered — is the SAME shared
+ *  builder, so the two creates differ in where they land and nothing else. */
+export async function machineLaunch(fields: MachineLaunchFields): Promise<RcSession> {
+  const core = await import("@tauri-apps/api/core");
+  return core.invoke<RcSession>("machine_launch", fields);
+}
+
+/** One machine's RC capabilities, or null when its engine is too old to say.
+ *  Probed on demand by the launch dialog — a machine that was asleep at startup
+ *  must not be stuck with whatever the first probe found. THROWS if the machine
+ *  cannot be reached, which is what the dialog reports. */
+export async function machineCapabilities(machine: string): Promise<RcCapabilities | null> {
+  const core = await import("@tauri-apps/api/core");
+  const out = await core.invoke<{ capabilities: RcCapabilities | null }>(
+    "machine_capabilities",
+    { machine },
+  );
+  return out?.capabilities ?? null;
+}
+
 /** Kill an RC session. THROWS on error (the pane surfaces it). */
 export async function rcKill(shed: string, slug: string, host?: string): Promise<void> {
   const core = await import("@tauri-apps/api/core");
   await core.invoke("rc_kill", { shed, slug, host });
+}
+
+/** Kill a session on a MACHINE. THROWS on error, like `rcKill`.
+ *
+ *  Separate from `rcKill` because the two reach paths genuinely differ here and
+ *  nowhere else: a shed session is addressed by `(host, shed, slug)` through the
+ *  server's SSH endpoint, a machine session by `(machine, slug)` over the
+ *  machine's own SSH. Collapsing them behind one signature would mean passing an
+ *  empty `shed` and letting the backend guess. */
+export async function rcKillMachine(machine: string, slug: string): Promise<void> {
+  const core = await import("@tauri-apps/api/core");
+  await core.invoke("machine_kill", { machine, slug });
+}
+
+/** Kill a session, routing by its origin. The single entry point a card uses, so
+ *  the machine/shed distinction lives in ONE place instead of at every call. */
+export async function killSession(s: RcSession): Promise<void> {
+  if (s.origin_kind === "machine" && s.machine) {
+    return rcKillMachine(s.machine, s.slug);
+  }
+  return rcKill(s.shed, s.slug, s.host);
 }
 
 /** Report the rendered RC sessions so the `agents.dump` op can observe them — the
@@ -875,6 +1067,28 @@ export async function rcKill(shed: string, slug: string, host?: string): Promise
  *  (`ui_report` merges this `agents` key with the shell's snapshot.) */
 export function reportAgents(sessions: RcSession[]): void {
   void invoke("ui_report", { snapshot: { agents: sessions } });
+}
+
+/** One machine as the Machines pane renders it: the health line a person reads,
+ *  plus the slugs grouped beneath it. `status` is the CHIP TEXT, not the raw
+ *  boolean — "connecting" and "unreachable" are different claims and a test that
+ *  asserts the boolean cannot tell them apart. */
+export type MachinePaneRow = {
+  name: string;
+  origin: string;
+  reachable: boolean;
+  status: string;
+  detail: string;
+  sessions: string[];
+};
+
+/** Report the rendered Machines pane (mounted-only, like `reportEgress` — pass
+ *  `null` on unmount to CLEAR the key rather than leave a stale snapshot). Read
+ *  by the `machines.dump` op, which is deliberately distinct from
+ *  `machines.list`: the latter is the backend's view and can be perfect while
+ *  nothing reaches the window. */
+export function reportMachinesPane(rows: MachinePaneRow[] | null): void {
+  void invoke("ui_report", { snapshot: { machines_pane: rows } });
 }
 
 /** The SINGLE source of truth for RC sessions + per-shed capabilities, lifted to the
@@ -887,9 +1101,14 @@ export function reportAgents(sessions: RcSession[]): void {
 export function useRcSessions(): {
   sessions: RcSession[];
   capabilities: Record<string, RcCapabilities>;
+  machines: MachineStatus[];
   refresh: () => void;
 } {
-  const [state, setState] = useState<RcListResult>({ sessions: [], capabilities: {} });
+  const [state, setState] = useState<RcListResult>({
+    sessions: [],
+    capabilities: {},
+    machines: [],
+  });
   // A generation guard shared across the mount-, event-, and caller-driven reloads,
   // so a slower older fetch can't overwrite a newer one (the pane's superseded-fetch
   // guard, now owned here for the shared state).
@@ -917,7 +1136,12 @@ export function useRcSessions(): {
       unlisten?.();
     };
   }, [refresh]);
-  return { sessions: state.sessions, capabilities: state.capabilities, refresh };
+  return {
+    sessions: state.sessions,
+    capabilities: state.capabilities,
+    machines: state.machines,
+    refresh,
+  };
 }
 
 /* ---- menu-bar popover (B1b) ------------------------------------------------ */
