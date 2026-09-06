@@ -37,11 +37,12 @@ gh issue list -R charliek/shed --state open --search "in:title [A"
 | A4 | [#320](https://github.com/charliek/shed/issues/320) | RP/M3 | the opencode lane as a standalone crate: transcript, prompt, interrupt, permission |
 | S4 | [#326](https://github.com/charliek/shed/issues/326) | RP/M5 | the `shed` roost provider script — the `sx` replacement for kickoff |
 | S5 | [#327](https://github.com/charliek/shed/issues/327) | RP/M5 | `roost-session` inside sheds and on machines, via roost's bootstrap ladder |
-| S6 | [#328](https://github.com/charliek/shed/issues/328) | RP/M6 | retire the RC hub, tmux driver, `shed-ext-rc`, Go engine, rc-parity oracle |
+| S6 | [#328](https://github.com/charliek/shed/issues/328) | RP/M6 | retire the RC hub, tmux driver, `shed-ext-rc`, Go engine, rc-parity oracle — **after S5** |
 | S7 | [#329](https://github.com/charliek/shed/issues/329) | RP/M6 | strip `sx` to an unreleased hello-world stub; keep the release wiring |
 
-S3's mobile twin is **S3m** in `shed-mobile` (#15) — mobile is the
-priority client; both change.
+S3's mobile twin is **S3m** in `shed-mobile`
+([charliek/shed-mobile#15](https://github.com/charliek/shed-mobile/issues/15))
+— mobile is the priority client; both change.
 
 **Order:** S1 → S3 is the only hard chain to M1 (opencode-only, both
 clients). S2 only after S3 reads real status. S6 last, once nothing
@@ -80,6 +81,7 @@ consumes the hub. Ready now with no blockers: S7.
 - **A4 → shed-mobile.** The opencode crate is FRB-exposed for the phone.
 - **S5 ↔ roost HS-3 bootstrap.** The ladder installs `roost-session` over
   SSH with verify-before-commit; decide rootfs-baked vs provisioned in S5.
-- **S6 waits on S3m, A4, A5, A6** — everything off the hub first.
-- Until S5 lands, `prox-test` and mini3 still run the old hub/tmux stack;
-  do not break them mid-epic.
+- **S6 waits on S3m, A4, A5, A6, and S5** — everything off the hub first,
+  *including* the live consumers: until S5 moves `prox-test` and mini3
+  onto `roost-session`, they still run the hub/tmux stack, and retiring
+  it would break them. Do not break them mid-epic.
