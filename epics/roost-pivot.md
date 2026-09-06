@@ -8,6 +8,8 @@
 
 **Why this exists — read first:**
 https://claude.ai/code/artifact/add27f67-3d15-4541-bd3f-eda3f34fcc48
+(Private — opens with the owner's claude.ai login. A 404 from anywhere
+else is expected, not a broken link.)
 Sections that matter here: §01 (what discovery measured — the coupling is
 narrower than it looks), §03 (the layering rule), §05 (what dies, what
 survives), §06 Tracks A and S, §08 (the release call).
