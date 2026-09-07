@@ -518,11 +518,22 @@ mod tests {
             Ok(_) => panic!("dialing a socket that does not exist must not succeed"),
         }
 
-        // Same for a port with nothing behind it. Port 1 is privileged and
-        // unbindable, so nothing can be listening there.
-        match Conn::tcp_loopback(1).await {
+        // Same for a port with nothing behind it. Bind an ephemeral port,
+        // take its number, then drop the listener before dialing it — that
+        // guarantees nothing is listening, unlike a fixed port number which
+        // could have something bound to it depending on the host.
+        let port = {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind ephemeral port");
+            listener.local_addr().expect("local_addr").port()
+        };
+        match Conn::tcp_loopback(port).await {
             Err(err @ RoostError::Unavailable(_)) => {
-                assert!(err.to_string().contains("127.0.0.1:1"), "{err}");
+                assert!(
+                    err.to_string().contains(&format!("127.0.0.1:{port}")),
+                    "{err}"
+                );
             }
             Err(other) => panic!("expected Unavailable, got {other:?}"),
             Ok(_) => panic!("dialing a port with nothing behind it must not succeed"),

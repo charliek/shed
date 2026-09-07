@@ -687,8 +687,16 @@ function SessionCard({ session: s, capabilities, onKilled, onError }:
   // roost set keyed by its origin, and until that entry is in the payload
   // there is no tmux pane to offer (CodeRabbit review finding on C6).
   const caps = capabilitiesFor({ capabilities }, s);
+  // `attachKind` itself falls back to `"tmux"` when `caps.kind_features` has no
+  // entry for this row's kind (the pre-v2 assumption, kept for shed rows). A
+  // machine row must NOT inherit that fallback: roost reports kinds (e.g.
+  // `grok`) outside the synthesized `kind_features` set, and a synthesized-but-
+  // unlisted kind has no tmux pane behind it either — so a machine row with no
+  // explicit entry gets no terminal action at all (CodeRabbit review finding).
   const canAttach = caps !== undefined
-    ? attachKind(caps, s.kind) === "tmux"
+    ? (machine && caps.kind_features?.[s.kind] === undefined
+        ? false
+        : attachKind(caps, s.kind) === "tmux")
     : s.origin_kind !== "machine";
   const kill = async () => {
     setBusy(true);
