@@ -1,0 +1,274 @@
+{
+  "_comment": "PIN. Recorded from the rc hub's OpencodeFold over crates/fixtures/jsonl/opencode_turn.jsonl. See README.md.",
+  "final": {
+    "activity": "needs_input",
+    "last_message": "3 .txt files.",
+    "open_approvals": 0,
+    "pending_approvals": []
+  },
+  "fixture": "crates/fixtures/jsonl/opencode_turn.jsonl",
+  "steps": [
+    {
+      "activity": "unknown",
+      "applied": false,
+      "line": 0,
+      "rows": []
+    },
+    {
+      "activity": "unknown",
+      "applied": true,
+      "line": 1,
+      "rows": []
+    },
+    {
+      "activity": "unknown",
+      "applied": true,
+      "line": 2,
+      "rows": [
+        {
+          "approval_decision": "",
+          "approval_decisions": [],
+          "approval_id": "",
+          "approval_status": "",
+          "role": "user",
+          "seq": 0,
+          "text": "Use the bash tool to run ls in the current directory, then tell me how many .txt files there are. Be brief.",
+          "tool_detail": "",
+          "tool_name": "",
+          "ts": "2026-07-21T06:00:16Z",
+          "type": "text"
+        }
+      ]
+    },
+    {
+      "activity": "working",
+      "applied": true,
+      "line": 3,
+      "rows": []
+    },
+    {
+      "activity": "working",
+      "applied": true,
+      "line": 4,
+      "rows": []
+    },
+    {
+      "activity": "working",
+      "applied": false,
+      "line": 5,
+      "rows": []
+    },
+    {
+      "activity": "working",
+      "applied": true,
+      "line": 6,
+      "rows": []
+    },
+    {
+      "activity": "working",
+      "applied": false,
+      "line": 7,
+      "rows": []
+    },
+    {
+      "activity": "working",
+      "applied": true,
+      "line": 8,
+      "rows": []
+    },
+    {
+      "activity": "working",
+      "applied": true,
+      "line": 9,
+      "rows": [
+        {
+          "approval_decision": "",
+          "approval_decisions": [],
+          "approval_id": "",
+          "approval_status": "",
+          "role": "assistant",
+          "seq": 0,
+          "text": "The user wants me to run ls in the current directory and tell them how many .txt files there are.",
+          "tool_detail": "",
+          "tool_name": "",
+          "ts": "2026-07-21T06:00:21Z",
+          "type": "reasoning"
+        }
+      ]
+    },
+    {
+      "activity": "working",
+      "applied": true,
+      "line": 10,
+      "rows": []
+    },
+    {
+      "activity": "working",
+      "applied": true,
+      "line": 11,
+      "rows": [
+        {
+          "approval_decision": "",
+          "approval_decisions": [],
+          "approval_id": "",
+          "approval_status": "",
+          "role": "tool",
+          "seq": 0,
+          "text": "",
+          "tool_detail": "{\"command\":\"ls\"}",
+          "tool_name": "bash",
+          "ts": "2026-07-21T06:00:21Z",
+          "type": "tool_use"
+        }
+      ]
+    },
+    {
+      "activity": "working",
+      "applied": true,
+      "line": 12,
+      "rows": []
+    },
+    {
+      "activity": "working",
+      "applied": true,
+      "line": 13,
+      "rows": []
+    },
+    {
+      "activity": "working",
+      "applied": true,
+      "line": 14,
+      "rows": [
+        {
+          "approval_decision": "",
+          "approval_decisions": [],
+          "approval_id": "",
+          "approval_status": "",
+          "role": "tool",
+          "seq": 0,
+          "text": "",
+          "tool_detail": "a.txt\nb.txt\nc.txt\n",
+          "tool_name": "bash",
+          "ts": "2026-07-21T06:00:21Z",
+          "type": "tool_result"
+        }
+      ]
+    },
+    {
+      "activity": "working",
+      "applied": false,
+      "line": 15,
+      "rows": []
+    },
+    {
+      "activity": "working",
+      "applied": true,
+      "line": 16,
+      "rows": []
+    },
+    {
+      "activity": "working",
+      "applied": false,
+      "line": 17,
+      "rows": []
+    },
+    {
+      "activity": "working",
+      "applied": true,
+      "line": 18,
+      "rows": []
+    },
+    {
+      "activity": "working",
+      "applied": true,
+      "line": 19,
+      "rows": []
+    },
+    {
+      "activity": "working",
+      "applied": false,
+      "line": 20,
+      "rows": []
+    },
+    {
+      "activity": "working",
+      "applied": true,
+      "line": 21,
+      "rows": []
+    },
+    {
+      "activity": "working",
+      "applied": false,
+      "line": 22,
+      "rows": []
+    },
+    {
+      "activity": "working",
+      "applied": true,
+      "line": 23,
+      "rows": []
+    },
+    {
+      "activity": "working",
+      "applied": true,
+      "line": 24,
+      "rows": [
+        {
+          "approval_decision": "",
+          "approval_decisions": [],
+          "approval_id": "",
+          "approval_status": "",
+          "role": "assistant",
+          "seq": 0,
+          "text": "3 .txt files.",
+          "tool_detail": "",
+          "tool_name": "",
+          "ts": "2026-07-21T06:00:27Z",
+          "type": "text"
+        }
+      ]
+    },
+    {
+      "activity": "working",
+      "applied": false,
+      "line": 25,
+      "rows": []
+    },
+    {
+      "activity": "working",
+      "applied": true,
+      "line": 26,
+      "rows": []
+    },
+    {
+      "activity": "working",
+      "applied": false,
+      "line": 27,
+      "rows": []
+    },
+    {
+      "activity": "working",
+      "applied": true,
+      "line": 28,
+      "rows": []
+    },
+    {
+      "activity": "needs_input",
+      "applied": true,
+      "line": 29,
+      "rows": []
+    },
+    {
+      "activity": "needs_input",
+      "applied": true,
+      "line": 30,
+      "rows": []
+    },
+    {
+      "activity": "needs_input",
+      "applied": false,
+      "line": 31,
+      "rows": []
+    }
+  ]
+}

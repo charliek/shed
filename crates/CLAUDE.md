@@ -59,6 +59,16 @@ re-implemented per language. The root `CLAUDE.md` owns the monorepo layout + rel
   builder. Consumed today by the **`shed-host-agent` bin** (the daemon shell — CLI,
   signals, socket bind, the Surface-A desktop UDS server) and, from leg 3a.2, embedded
   in-process by the desktop app. Carries no daemon-only or WebKitGTK concern.
+- **`shed-opencode`** — the **opencode adapter** for `shed_core::lane` (plan 015): the
+  one implementation of `AgentLane` that talks to an opencode server's local HTTP API.
+  `fold.rs` is a **port** of the rc hub's `OpencodeFold`, and it is pinned as one —
+  `fixtures/opencode_turn.golden.json` records what the HUB's fold produced on
+  `fixtures/jsonl/opencode_turn.jsonl`, and the test replays the port against it (that
+  test must NEVER take a `shed-broker` dep; the golden file is the pin). The helpers the
+  fold needs are **copied** into `helpers.rs` rather than linked, because
+  `rc_hub::watch` imports `shed_rc_engine::tmux::Tmux` — linking would drag the RC
+  engine into an HTTP adapter. The duplication ends when S6 deletes the hub's watcher.
+  In `default-members`.
 
 `fixtures/` holds the real-shaped JSON/YAML samples (server info, `shed list`, `system df`,
 egress profiles, enriched image, config) that both the Rust decoders and the Swift
@@ -189,6 +199,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo clippy -p shed-app --features rc --all-targets -- -D warnings
 cargo clippy -p shed-app --features broker --all-targets -- -D warnings
 cargo clippy -p shed-app --features broker,rc --all-targets -- -D warnings
+cargo test -p shed-opencode                          # the opencode agent-lane adapter
 ```
 
 Note: `sx` (the crate that used to be a default member enabling shed-app's `rc` feature

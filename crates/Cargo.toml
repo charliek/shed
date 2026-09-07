@@ -4,7 +4,7 @@
 # standalone workspace in ../tauri/src-tauri) linking shed-core + shed-app directly.
 [workspace]
 resolver = "2"
-members = ["shed-core", "shed-core-ffi", "shed-app", "shed-rc-engine", "shedctl", "shed-broker", "shed-host-agent"]
+members = ["shed-core", "shed-core-ffi", "shed-app", "shed-rc-engine", "shedctl", "shed-broker", "shed-host-agent", "shed-opencode"]
 # All members are default members: a plain `cargo build` / `cargo test` (and
 # `make core-test`) build shed-core + shed-core-ffi + shed-app + shedctl. shedctl
 # (the headless Linux CLI driver for the shed-desktop IPC socket) has no GUI-toolkit
@@ -16,7 +16,11 @@ members = ["shed-core", "shed-core-ffi", "shed-app", "shed-rc-engine", "shedctl"
 # longer a member. Nothing in this workspace enables shed-app's non-default `rc`
 # feature by default any more — coverage is the explicit `-p shed-app --features
 # rc` leg (see the note below).
-default-members = ["shed-core", "shed-core-ffi", "shed-app", "shed-rc-engine", "shedctl", "shed-broker", "shed-host-agent"]
+#
+# `shed-opencode` (the opencode agent-lane adapter, plan 015) is a member AND a
+# default member: a pure lib on shed-core with no GUI-toolkit and no daemon
+# dependency, so a plain `cargo test`/`clippy --workspace` covers it.
+default-members = ["shed-core", "shed-core-ffi", "shed-app", "shed-rc-engine", "shedctl", "shed-broker", "shed-host-agent", "shed-opencode"]
 
 [workspace.package]
 version = "0.8.1"

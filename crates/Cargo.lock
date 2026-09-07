@@ -3378,6 +3378,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "shed-opencode"
+version = "0.8.1"
+dependencies = [
+ "async-trait",
+ "base64 0.22.1",
+ "chrono",
+ "futures-util",
+ "regex",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "shed-core",
+ "thiserror 1.0.69",
+ "tokio",
+]
+
+[[package]]
 name = "shed-rc-engine"
 version = "0.8.1"
 dependencies = [
