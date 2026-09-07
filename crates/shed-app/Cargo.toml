@@ -30,6 +30,10 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 uuid = { workspace = true }
 async-trait = { workspace = true }
+# roost's SSH client-bridge transport + the `messages` params/results the roost
+# one-shots take and return (`roost.rs`). Rev-pinned in the workspace manifest —
+# see the long comment there.
+roost-ipc = { workspace = true }
 # Concurrent per-host list_sheds via futures::future::join_all.
 futures = "0.3"
 # Flexible ISO-8601 parse/format for approval expiry + wire `ts` (Swift's
@@ -65,5 +69,11 @@ broker = ["dep:shed-broker"]
 [dev-dependencies]
 httpmock = { workspace = true }
 # Temp dirs/sockets for the `broker` bridge tests (config synthesis + the mode-detect
-# UDS matrix). Dev-only — never in the default lib dep graph.
+# UDS matrix) and the roost reach tests (the fake-`ssh` scratch dir). Dev-only —
+# never in the default lib dep graph.
 tempfile = "3"
+# shed-core's in-process fake roost-session (`roost::testing::FakeRoost`), exposed
+# by its test-only `test-support` feature. A dev-dependency (resolver v2) so the
+# feature is enabled for `cargo test -p shed-app` and NEVER for a shipped build —
+# the same shape `sx` uses for `rc_engine::fake`.
+shed-core = { path = "../shed-core", features = ["test-support"] }

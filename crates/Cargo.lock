@@ -3268,6 +3268,7 @@ dependencies = [
  "futures",
  "httpmock",
  "libc",
+ "roost-ipc",
  "serde",
  "serde_json",
  "shed-broker",
