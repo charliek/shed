@@ -15,9 +15,12 @@ re-implemented per language. The root `CLAUDE.md` owns the monorepo layout + rel
   `RcRunner` portability seam (`rc.rs`) behind the non-default `rc` feature — which also
   pulls in and re-exports `shed-rc-engine` as `shed_app::rc_engine` — and the embedded
   broker bridge (`broker_bridge.rs`, behind the non-default `broker = ["dep:shed-broker"]`
-  feature — leg 3a.2). A bare `cargo test`/`clippy` skips both modules — cover them with
-  `-p shed-app --features rc` and `-p shed-app --features broker` (or `broker,rc`
-  together).
+  feature — leg 3a.2). `roost.rs` (plan 013, ungated like `machine.rs` so mobile's
+  default-features build links it) is the reach + watcher layer over `shed_core::roost` —
+  `RoostReach`/`RoostWatcher`/`RoostPeek` — that both clients read a machine's or the local
+  `roost-session` through. A bare `cargo test`/`clippy` skips only the `rc`/`broker`
+  modules — cover them with `-p shed-app --features rc` and `-p shed-app --features
+  broker` (or `broker,rc` together).
 - **`shed-rc-engine`** — the one-shot Remote-Control engine ported from the Go guest
   binary (plan 009), graduated out of shed-app at its second consumer (plan 010:
   shed-broker's `rc_hub` — a broker→shed-app dep would cycle through shed-app's `broker`

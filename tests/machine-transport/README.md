@@ -21,7 +21,7 @@ not share an SSH implementation (that was a deliberate decision — see the plan
 | transport | used by | composes the wire line in |
 |---|---|---|
 | the `ssh` binary as a child process | `sx`, the Tauri desktop app | Rust (`shed_core::machine::display_line`) |
-| `dartssh2` | shed-mobile | Dart, via the FRB bridge |
+| `dartssh2` | shed-mobile | nothing, as of plan 013 — the roost-session reach it drives execs a Rust-composed string wholesale rather than an `sx`-style argv (see "The Dart leg" below) |
 
 Two implementations of one wire contract drift silently, and the drift is
 invisible in ordinary testing because both usually *work*. This suite is the
@@ -30,7 +30,7 @@ quoted **conditionally** (bare-safe tokens unquoted) while Rust quotes
 **always**. Post-`bash` the argv matched, so nothing failed — but the bytes on
 the wire differed, and "these two transports agree" was simply untrue.
 
-## The three legs
+## The two legs
 
 The contract lives in **`scenarios.json`** + **`goldens/`**, deliberately in
 neither implementation's source tree, because a contract that lived inside one
@@ -40,7 +40,13 @@ leg would not be a contract.
 |---|---|---|---|
 | **Rust** | `crates/shed-core/tests/machine_transport_contract.rs` | `cargo test -p shed-core` | Rust composes `goldens/wire.json` — the BYTE-level pin |
 | **live** | here | `make test-machine-transport` | that quoting really delivers `scenarios.json`'s argv through a real sshd |
-| **Dart** | `shed-mobile` | its own `make check` | Dart composes the SAME `goldens/wire.json` |
+
+**There is no third, Dart-side leg, and never has been.** An earlier revision
+of this README claimed one — shed-mobile composing the same
+`goldens/wire.json` under its own `make check` — but shed-mobile only ever
+had a hand-written `shellQuote` table (`test/core/shell_quote_test.dart`), not
+a leg that reads this contract. See "The Dart leg" below for where that
+composing actually lives, and where it's going.
 
 **The two layers are covered by different legs, deliberately.** The live leg
 cannot see a drift from always-quoting to conditional quoting, because after
@@ -69,6 +75,21 @@ double quotes, backslashes, `$VAR`, `$(…)` and backticks, `;`/`&&`/`|`,
 redirection and globs, newlines, tabs, leading dashes, unicode, and the empty
 argument. One test asserts the security property directly: a payload that would
 `touch` a marker file must arrive as inert text and the marker must not exist.
+
+## The Dart leg
+
+There isn't one, and plan 013 (the Roost Pivot's S1/S3m) is the reason there
+won't be. shed-mobile composes no `sx`/`shed-ext-rc` wire of its own for
+reaching a machine's `roost-session` — since that plan it execs the string
+`roost_ipc::ssh::remote_command()` hands it through the bridge
+(`roost_remote_command()` over FRB), the same composer every other client
+uses, so there is nothing left for a Dart-side leg to independently verify.
+
+The `shed_core::machine::*` argv builders this contract still pins — the ones
+`sx rc` sends over the `ssh` binary — are on the S6 deletion path (see
+`epics/roost-pivot.md`, S7): once the RC hub, `shed-ext-rc`, and the Go
+engine retire and `sx` is stripped to a stub, this contract goes with them.
+Until then, the Rust and live legs above are the whole of it.
 
 ## The forwarded-hub family
 
@@ -129,11 +150,12 @@ bless whatever the code does today.
 2. Re-record both goldens (`UPDATE_GOLDEN=1`).
 3. Update the pinned version in
    `crates/shed-core/tests/machine_transport_contract.rs`.
-4. **Re-run the Dart leg in `shed-mobile`** and update its pinned version.
 
-The version exists precisely so step 4 cannot be skipped silently: shed-mobile
-pins the revision it was last validated against, so an edit here that never
-reached the other repo fails loudly there instead of leaving both repos green and
-disagreeing.
+The version exists so the Rust leg cannot silently drift from what's checked
+in: `machine_transport_contract.rs` pins the revision it was last validated
+against, so an edit here that skips step 3 fails loudly in `cargo test
+-p shed-core` instead of leaving the Rust byte pin and the live leg's fresh
+read of `scenarios.json` quietly disagreeing about which contract is current.
+There is no third repo to keep in step (see "The Dart leg" above).
 
 A scenario is never deleted to make a leg pass.

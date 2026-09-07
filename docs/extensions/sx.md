@@ -94,6 +94,13 @@ machines:
 | `rc_bin` | `sx` | Where `sx` lives on that machine — the remote invocation is always `<rc_bin> rc <verb>`. Set an absolute path when `sx` is not on the **non-login** `PATH` an SSH exec sees (Homebrew's `/opt/homebrew/bin` typically is not). |
 | `known_hosts` | ssh's own default | `UserKnownHostsFile` to pin against; same semantics as a server entry. |
 
+Since plan 013 (the Roost Pivot), the desktop and mobile clients no longer reach a
+machine's sessions through the SSH-forwarded [machine hub](#the-machine-hub) below —
+they read the machine's `roost-session` instead, the desktop over roost's own SSH
+bridge, which honors this same `known_hosts` field via a per-machine pinned ssh config
+(`StrictHostKeyChecking yes`). `sx` itself is unaffected and still uses the
+port-forward described in [The machine hub](#the-machine-hub).
+
 !!! warning "Older `shed` CLIs delete this section"
     The Go `shed` CLI rewrites the whole config document whenever it updates it (`shed
     server add`, a shed-cache refresh, a token mint, even `shed delete`). A release that

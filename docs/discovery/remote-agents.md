@@ -297,6 +297,11 @@ sx watch <slug> / attach <slug> / plan <file> --on ... / kill <slug>
 Each phase names its mobile checkpoint — the phone-facing behavior that proves
 the phase (even when the mobile UI itself lands a phase later).
 
+> **From R4 onward the roadmap lives in `epics/roost-pivot.md`** (the Roost
+> Pivot); plan 013 (S1/S3/S3m) replaced the hub-over-SSH-forward machine path
+> in both clients with roost-session reads. This table stays as the history
+> of R0–R4; it is not rewritten to match.
+
 > **R0 status: SHIPPED** — PR #308 (`feature/plan-007-rc-contract-v2`,
 > 2026-08-16). The landed contract is `docs/extensions/rc-helper.md` (the
 > panel-corrected version — `409 not_supported`/`not_accepting`, no `501`s —
