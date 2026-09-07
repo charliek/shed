@@ -1,0 +1,19 @@
+{
+  "event": "agent_report.changed",
+  "data": {
+    "tab_id": "5",
+    "shell_state": "foreground_process",
+    "agent_lifecycle": "failed",
+    "ownership": {
+      "source": "claude",
+      "session_id": "abc123",
+      "last_event_at": 1700000060,
+      "detail": "api_error",
+      "metadata": {
+        "model": "claude-opus-5"
+      }
+    },
+    "state": "needs_input",
+    "hook_active": true
+  }
+}

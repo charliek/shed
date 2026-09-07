@@ -1,0 +1,7 @@
+{
+  "event": "tab.state_changed",
+  "data": {
+    "tab_id": "5",
+    "state": "running"
+  }
+}

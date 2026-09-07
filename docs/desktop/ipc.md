@@ -122,6 +122,25 @@ and "nothing is listening on 1029" need different fixes.
 Unreachable is a first-class state, not an error: a machine that is asleep, off-network, or
 simply not running a hub is the everyday case, and it must never fail the sessions view.
 
+### Sessions from roost
+
+Plan 013 (the Roost Pivot) re-points the section above: a machine row's sessions come
+from that machine's `roost-session` daemon, not the RC hub — polled every 2 s until
+roost's own live push (roost R1) lands. A configured machine reaches it over roost's SSH
+bridge; an implicit **`localhost`** host is also listed once a local `roost-session`
+socket has existed in this process (release path
+`$XDG_RUNTIME_DIR/roost-session/roost.sock`, macOS
+`~/Library/Caches/RoostSession/roost.sock`, override with `SHED_ROOST_SOCKET`) — a machine
+with no `roost-session` lists nothing until one is running.
+
+Only **agent-owned tabs** are sessions; a plain shell tab in roost is not one. A sticky
+**attention dot** on the card mirrors roost's own notification bit (shed never clears it
+itself). There is **no terminal action** on a roost row yet — roost's `vt` attach hasn't
+landed (`kind_features.attach = "native-remote"` gates it off) — so `kill` maps to
+`tab.close` and `launch` to `tab.open` with the chosen agent binary in the chosen working
+directory; typed prompts and permission modes arrive later with the `shed` roost provider
+script. See the roost project's own docs for the daemon and its IPC contract.
+
 ### UI-truth ops (Tauri)
 
 These report what the frontend RENDERED, so a test can assert the window rather than the

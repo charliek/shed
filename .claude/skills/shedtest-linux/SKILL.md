@@ -88,6 +88,79 @@ make -C desktop e2e-tauri       # shared suite + test_tauri at --target tauri (n
   down host OUT of the shared `fixtures/config.yaml` (it would break the m0 golden gate + put an
   error banner in every "healthy" screenshot).
 
+## Driving against a roost-session (machine rows)
+
+Since plan 013 the Tauri app's **machine** rows come from a `roost-session`, not from the RC
+hub — one `RoostWatcher` per `machines:` entry, plus an implicit `localhost` host for the
+machine the app is running on. Two env vars steer it:
+
+| Variable | Where it is read | Effect |
+|---|---|---|
+| `SHED_TAURI_ROOST_SOCKETS` | `src-tauri/src/env.rs`, **test mode only** | Comma-separated `<machine>=<socket path>`. A named machine (including `localhost`) is dialled on that Unix socket instead of through roost's SSH client-bridge. Non-empty ⇒ **no** machine ever spawns ssh; an unmapped entry is a permanently-unreachable row. This is the app-level var — `ui.py`'s `subproc_env` sets or CLEARS it on every hermetic launch (never inherited from the parent shell), so nothing downstream of the harness can leak a stray value in. |
+| `SHEDTEST_ROOST_SOCKETS` | `conftest.py`'s `_env_roost_sockets`, harness-level | Same `<machine>=<socket path>` shape, read once and passed explicitly as `roost_sockets` to the SESSION app fixture (`_app_session`) — the harness-level opt-in for pointing the pytest session app at a real daemon instead of `fake_roost.py`. A custom driver script (not going through `conftest.py`) must do the equivalent itself: read this var, parse it into a `{name: path}` map, and pass it as `ui.launch(..., roost_sockets=...)` — since the launch no longer inherits, nothing shows up unless the caller supplies the map explicitly. |
+| `SHED_ROOST_POLL_MS` | `shed_app::roost`, read **once per watcher at spawn** | The `tab.list` poll cadence in ms (default 2000, floor 10). Set it to `50` so "within one poll interval" assertions are fast — it must be in the environment **before** the app starts. |
+
+`localhost` is listed only once its socket has answered at least once (connect-if-present in
+both directions), so an app with no session running shows no `localhost` row at all — that is
+correct, not a bug. A configured machine named `localhost` wins over the implicit one, and
+`machine.add {"name":"localhost"}` is refused.
+
+### Against a REAL local daemon
+
+The render-gate container can drive the roost-session running on the **host**. Mount its
+socket *directory* — a bind-mounted socket must be **writable**, `:ro` makes it unconnectable
+— and map it:
+
+```bash
+make -C desktop tauri-ui-build
+docker build -t shed-tauri-linux:latest - < desktop/Dockerfile.tauri-linux
+ROOT="$PWD"; HOST_OUT=/tmp/shed-shots; mkdir -p "$HOST_OUT"
+docker run --rm -v "$ROOT:/repo:ro" -v "$HOST_OUT:/out" \
+  -v /run/user/1000/roost-session:/roost \
+  -v shed-tauri-linux-cargo:/usr/local/cargo/registry \
+  -v shed-tauri-linux-cargo-git:/usr/local/cargo/git \
+  -v shed-tauri-linux-target:/target -e CARGO_TARGET_DIR=/target \
+  -e UV_PROJECT_ENVIRONMENT=/tmp/uv-venv \
+  -e SHED_TAURI_BIN=/target/debug/shed-desktop-tauri \
+  -e SHEDTEST_ROOST_SOCKETS=localhost=/roost/roost.sock \
+  -e SHED_ROOST_POLL_MS=200 \
+  --cap-add SYS_ADMIN --security-opt seccomp=unconfined --shm-size=1g \
+  shed-tauri-linux:latest bash -c '…build + driver, as in the screenshot recipe below…'
+```
+
+- Export `SHEDTEST_ROOST_SOCKETS`, not the app-level `SHED_TAURI_ROOST_SOCKETS` — a hermetic
+  launch always sets-or-clears the app-level var itself (`ui.py`'s `subproc_env`), so an
+  inherited value from the container's own env never reaches the app; it must be supplied
+  explicitly instead. Driving through pytest, `conftest.py`'s `_app_session` fixture reads
+  `SHEDTEST_ROOST_SOCKETS` and passes it to `ui.launch(roost_sockets=...)`. A bespoke driver
+  script (the screenshot recipe below) must do the same itself.
+- `SHED_ROOST_POLL_MS` has no harness-level indirection — it stays a plain env var the driver
+  passes straight through to the app it launches.
+- Then `rc.list` carries the roost rows (`origin: "machine:localhost"`, `tab_id`, `attention`)
+  and `capabilities["machine:localhost"]` — synthesized, `attach: "native-remote"`, so the card
+  offers **no** terminal action and `terminal.preview {machine: …}` answers
+  `not_enabled: terminal unavailable: attach is native-remote`.
+- The container's uid is root (0) while the socket is owned by uid 1000; roost's socket is
+  mode 0600, so either run with `--user 1000` or loosen the socket's mode for the run. If
+  `rc.list` shows `localhost` absent, that is the first thing to check — an unconnectable
+  socket is indistinguishable from "no session" by design.
+
+### The `real_roost` pytest smoke (no host socket to mount)
+
+`test_tauri_machines.py::test_a_real_roost_session_answers_the_client` is a simpler
+alternative to the mount-the-host-socket recipe above: it spawns its OWN jailed
+`roost-session` daemon inside the container and discovers its socket by globbing the
+daemon's runtime dir, so nothing needs mounting except the binary itself. Mount a built
+`roost-session`'s directory read-only and point `SHED_TAURI_ROOST_SESSION_BIN` at it, then
+run pytest with `-m real_roost` (the test is skipped, not failed, when the var is unset —
+that's how CI stays roost-binary-free):
+
+```bash
+-v /path/to/roost/target/debug:/roost-bin:ro \
+-e SHED_TAURI_ROOST_SESSION_BIN=/roost-bin/roost-session \
+… uv run --group test pytest tools/shedtest/test_tauri_machines.py -m real_roost
+```
+
 ## How the Docker legs are wired (so failures make sense)
 
 The `deb`, `tauri-build-linux`, and `tauri-test-linux` targets `tar` a **repo-root-relative**
@@ -95,7 +168,9 @@ layout (`crates desktop/tauri desktop/tools desktop/Resources …`) into `/work`
 container, so the Tauri crate's `../../../crates` path-deps resolve in the recreated layout
 exactly as in the repo. The source is copied into a writable `/work` (not a read-only mount)
 because Tauri's `build.rs` writes `gen/` next to `Cargo.toml`. Rust builds to a `/target`
-volume so it never clobbers the mac target dir.
+volume so it never clobbers the mac target dir. **Two** cargo caches are volumes — the
+registry AND `shed-tauri-linux-cargo-git:/usr/local/cargo/git`, because `shed-core` takes
+`roost-ipc` as a **git** dependency and without the second volume every run re-clones roost.
 
 ## Capturing deterministic screenshots (the render gate, repurposed)
 

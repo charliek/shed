@@ -1,0 +1,61 @@
+{
+  "id": "1",
+  "ok": true,
+  "result": {
+    "projects": [
+      {
+        "created_at": 1788769854,
+        "cwd": "/home/shed",
+        "id": "2",
+        "name": "Roost",
+        "position": 0,
+        "tabs": [
+          {
+            "agent_lifecycle": "inactive",
+            "created_at": 1788769854,
+            "cwd": "/home/shed",
+            "has_notification": false,
+            "hook_active": false,
+            "id": "3",
+            "is_active": false,
+            "last_active": 1788769854,
+            "position": 0,
+            "project_id": "2",
+            "shell_state": "at_prompt",
+            "state": "none",
+            "title": "/home/shed",
+            "user_titled": false
+          },
+          {
+            "agent_lifecycle": "finished",
+            "created_at": 1788769906,
+            "cwd": "/home/shed/oc-work",
+            "has_notification": false,
+            "hook_active": true,
+            "id": "4",
+            "is_active": true,
+            "last_active": 1788769906,
+            "ownership": {
+              "detail": "session_idle",
+              "last_event_at": 1788769939,
+              "metadata": {
+                "agent": "build",
+                "model": "big-pickle",
+                "version": "1.18.18"
+              },
+              "session_id": "ses_f85010d7effexVvTJ1mRHZkDqL",
+              "source": "opencode"
+            },
+            "position": 1,
+            "project_id": "2",
+            "shell_state": "unknown",
+            "state": "idle",
+            "title": "OC | Pong reply request",
+            "user_titled": false
+          }
+        ]
+      }
+    ],
+    "revision": 17
+  }
+}

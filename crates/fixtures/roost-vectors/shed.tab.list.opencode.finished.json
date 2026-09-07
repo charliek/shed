@@ -1,0 +1,61 @@
+{
+  "id": "1",
+  "ok": true,
+  "result": {
+    "projects": [
+      {
+        "created_at": 1788768856,
+        "cwd": "/home/charliek/projects/roost",
+        "id": "2",
+        "name": "Roost",
+        "position": 0,
+        "tabs": [
+          {
+            "agent_lifecycle": "inactive",
+            "created_at": 1788768856,
+            "cwd": "/home/charliek/projects/roost",
+            "has_notification": false,
+            "hook_active": false,
+            "id": "3",
+            "is_active": false,
+            "last_active": 1788768856,
+            "position": 0,
+            "project_id": "2",
+            "shell_state": "at_prompt",
+            "state": "none",
+            "title": "charliek@popos: ~/projects/roost",
+            "user_titled": false
+          },
+          {
+            "agent_lifecycle": "finished",
+            "created_at": 1788768867,
+            "cwd": "/tmp/claude-1000/-home-charliek-projects-shed/43aeecdb-e298-458d-90ab-2445a361d63b/scratchpad/oc-work",
+            "has_notification": false,
+            "hook_active": true,
+            "id": "4",
+            "is_active": true,
+            "last_active": 1788768867,
+            "ownership": {
+              "detail": "session_idle",
+              "last_event_at": 1788768899,
+              "metadata": {
+                "agent": "build",
+                "model": "accounts/fireworks/models/kimi-k3",
+                "version": "1.18.25"
+              },
+              "session_id": "ses_f8510bbf0ffePFCHCY6iyzAieq",
+              "source": "opencode"
+            },
+            "position": 1,
+            "project_id": "2",
+            "shell_state": "unknown",
+            "state": "idle",
+            "title": "OC | Exact pong reply",
+            "user_titled": false
+          }
+        ]
+      }
+    ],
+    "revision": 18
+  }
+}

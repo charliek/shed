@@ -28,6 +28,13 @@ tauri = { version = "2", features = ["tray-icon"] }
 # them; it does not make this crate a member of core's workspace).
 shed-core = { path = "../../../crates/shed-core" }
 shed-app = { path = "../../../crates/shed-app", features = ["rc", "broker"] }
+# roost's own wire types (plan 013 S3). Only for the two structs this crate has to
+# NAME to drive `shed_app::roost` — `TabOpenParams` for a launch, `Tab`/`Ownership`
+# for the row a fresh `tab.open` answers with. Same git `rev` as
+# `crates/Cargo.toml`'s workspace pin, and it MUST stay in lockstep with it: two
+# revs would put two copies of the crate in this tree and `shed_app::roost`'s
+# signatures would stop accepting these types. Bump both together.
+roost-ipc = { git = "https://github.com/charliek/roost", rev = "61d8713bcd0378971ad8490fe89b8dbef4e49fac" }
 # "process" backs the Linux AuthGate (the pkcheck subprocess; the notifier is zbus).
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "net", "io-util", "time", "process"] }
 serde = { version = "1", features = ["derive"] }
@@ -88,6 +95,13 @@ tauri = { version = "2", features = ["image-png", "macos-private-api"] }
 
 [dev-dependencies]
 tempfile = "3"
+# `shed_core::roost::testing::FakeRoost` — an in-process `roost-session` stand-in
+# replying from the vendored roost vectors. Behind the non-default `test-support`
+# feature so it never compiles into a shipped binary; declared here rather than in
+# `[dependencies]` so enabling it is a TEST decision. (Same path as the normal dep
+# above: cargo unifies them, which is exactly what turns the feature on for the
+# test profile only.)
+shed-core = { path = "../../../crates/shed-core", features = ["test-support"] }
 
 # A debug build is what the harness drives; keep it reasonably snappy.
 #

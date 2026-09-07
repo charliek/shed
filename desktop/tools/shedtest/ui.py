@@ -225,7 +225,7 @@ def _quit_subproc(target: str) -> None:
 def launch(target: str = "mac", *, mock_base_url: str, config_path: Path, state_dir: Path,
            host_agent_socket: str | None = None, unreachable_hosts: tuple[str, ...] = (),
            credential_hosts: tuple[str, ...] = (),
-           machine_hub_ports: dict[str, int] | None = None) -> None:
+           roost_sockets: dict[str, object] | None = None) -> None:
     """Launch the UI hermetically and block until it answers `identify`.
 
     `state_dir` is the throwaway per-session dir: on mac SHED_DESKTOP_STATE_DIR;
@@ -235,14 +235,22 @@ def launch(target: str = "mac", *, mock_base_url: str, config_path: Path, state_
     config server NAMES the backend points at a closed port instead of the mock
     (the `<PREFIX>_MOCK_UNREACHABLE_HOSTS` down-host override) so the per-host error
     row is exercisable e2e; wired for both targets, though only tauri drives it now.
-    `machine_hub_ports` maps machine NAME -> loopback port, replacing the
-    `ssh -N -L` forward with a direct connection — the test-mode-only
-    `<PREFIX>_MACHINE_HUB_PORTS` seam. Per-machine so a suite can serve a hub for
-    one and leave another unmapped (which reads as unreachable, covering the
-    everyday asleep/off-network state). That is what makes the machine path
-    testable hermetically: the harness serves a fake `/v1` hub there and the app
-    reaches it through the REAL hub client + watcher, with no ssh and no remote
-    host anywhere. Tauri-only (the mac app has no machine layer).
+    `roost_sockets` maps machine NAME -> the Unix socket its `roost-session`
+    answers on, replacing roost's SSH client-bridge with a direct `LocalSession`
+    — the test-mode-only `<PREFIX>_ROOST_SOCKETS` seam. Per-machine so a suite
+    can serve a session for one and leave another unmapped (which reads as
+    unreachable, covering the everyday asleep/off-network state); the implicit
+    `localhost` host goes through the same map, so a hermetic run never reads the
+    developer's own session. That is what makes the machine path testable
+    hermetically: the harness serves a fake `roost-session` there
+    (`fake_roost.py`) and the app reaches it through the REAL roost client +
+    watcher, with no ssh and no remote host anywhere. Tauri-only (the mac app has
+    no machine layer). Set-or-clear like `unreachable_hosts`: `None` (not given)
+    or `{}` clears the env var so a hermetic launch never inherits a value from
+    the parent shell; a non-empty map sets it. Driving against a real
+    roost-session daemon is a separate, explicit opt-in — see the
+    `SHEDTEST_ROOST_SOCKETS` harness var read by conftest.py's `_app_session`
+    fixture.
     `credential_hosts` are server NAMES that keep their REAL control-credential
     wiring against the mock (host agent + the config's auth_mode) instead of the
     tokenless open-mode shortcut — the agent-upgrade scenario's override, mac-only
@@ -257,7 +265,7 @@ def launch(target: str = "mac", *, mock_base_url: str, config_path: Path, state_
         _launch_subproc(target, mock_base_url=mock_base_url, config_path=config_path,
                         runtime_dir=state_dir, host_agent_socket=host_agent_socket,
                         unreachable_hosts=unreachable_hosts,
-                        machine_hub_ports=machine_hub_ports)
+                        roost_sockets=roost_sockets)
     else:
         raise ValueError(f"unknown target {target!r} (want {'|'.join(TARGETS)})")
 
@@ -299,7 +307,7 @@ def _launch_mac(*, mock_base_url: str, config_path: Path, state_dir: Path,
 def subproc_env(cfg: _Subproc, *, runtime_dir: Path, mock_base_url: str,
                 config_path: Path, host_agent_socket: str | None = None,
                 unreachable_hosts: tuple[str, ...] = (),
-                machine_hub_ports: dict[str, int] | None = None) -> dict[str, str]:
+                roost_sockets: dict[str, object] | None = None) -> dict[str, str]:
     """The launch env for a subprocess UI — the single source of the subprocess
     env-var contract, shared by the session launcher and a self-managed instance
     (down-host). HOME/XDG_RUNTIME_DIR/XDG_CONFIG_HOME are redirected to the
@@ -324,14 +332,23 @@ def subproc_env(cfg: _Subproc, *, runtime_dir: Path, mock_base_url: str,
         env[unreachable_key] = ",".join(unreachable_hosts)
     else:
         env.pop(unreachable_key, None)
-    # The machine-hub seam: every `machines:` entry is reached on this loopback
-    # port directly, instead of through an `ssh -N -L` forward. Set-or-clear for
-    # the same reason as the key above.
-    hub_key = f"{cfg.env_prefix}_MACHINE_HUB_PORTS"
-    if machine_hub_ports:
-        env[hub_key] = ",".join(f"{n}={p}" for n, p in machine_hub_ports.items())
+    # The roost seam: every `machines:` entry (and the implicit `localhost`) is
+    # reached on the named Unix socket directly, instead of through roost's SSH
+    # client-bridge. Set-or-clear like the key above: an inherited value from
+    # the parent shell must never leak into a hermetic launch. Driving the
+    # session app against a real roost-session daemon is an explicit harness
+    # opt-in via SHEDTEST_ROOST_SOCKETS (see conftest.py's `_app_session` fixture and
+    # `.claude/skills/shedtest-linux`), not env inheritance here.
+    roost_key = f"{cfg.env_prefix}_ROOST_SOCKETS"
+    if roost_sockets:
+        env[roost_key] = ",".join(f"{n}={p}" for n, p in roost_sockets.items())
     else:
-        env.pop(hub_key, None)
+        env.pop(roost_key, None)
+    # "Within one poll interval" has to be fast to be assertable: the shipped
+    # cadence is 2 s, and the watcher reads this ONCE when it is spawned — so it
+    # must be in the environment before the app starts. `setdefault`, so a driver
+    # (or the render-gate container) that pinned its own value keeps it.
+    env.setdefault("SHED_ROOST_POLL_MS", "50")
     env.pop(f"{cfg.env_prefix}_SOCKET", None)
     return env
 
@@ -339,7 +356,7 @@ def subproc_env(cfg: _Subproc, *, runtime_dir: Path, mock_base_url: str,
 def _launch_subproc(target: str, *, mock_base_url: str, config_path: Path,
                     runtime_dir: Path, host_agent_socket: str | None = None,
                     unreachable_hosts: tuple[str, ...] = (),
-                    machine_hub_ports: dict[str, int] | None = None) -> None:
+                    roost_sockets: dict[str, object] | None = None) -> None:
     cfg = _SUBPROC[target]
     if not cfg.binary.exists():
         raise RuntimeError(
@@ -348,7 +365,7 @@ def _launch_subproc(target: str, *, mock_base_url: str, config_path: Path,
     env = subproc_env(cfg, runtime_dir=runtime_dir, mock_base_url=mock_base_url,
                       config_path=config_path, host_agent_socket=host_agent_socket,
                       unreachable_hosts=unreachable_hosts,
-                      machine_hub_ports=machine_hub_ports)
+                      roost_sockets=roost_sockets)
     st = _state[target]
     st.env = env
     st.runtime_dir = runtime_dir

@@ -33,6 +33,11 @@ pub mod rc;
 #[cfg(feature = "rc")]
 pub use shed_rc_engine as rc_engine;
 pub mod rc_events_watcher;
+/// The roost reach seam + the polling roost-session inventory watcher (plan
+/// 013). Ungated for the same reason [`machine`] is: shed-mobile links this
+/// crate with default features, and reading a roost-session is exactly what it
+/// needs.
+pub mod roost;
 pub mod timefmt;
 pub mod token_minter;
 pub mod traits;
@@ -66,6 +71,11 @@ pub use rc_engine::{
     PromptOptions as RcPromptOptions, TmuxResult, TmuxRunner,
 };
 pub use rc_events_watcher::{RcEventsWatcher, RcWatcherUpdate};
+pub use roost::{
+    launch_argv, roost_capabilities, tab_close, tab_dump, tab_open, tab_write, LabelledPort,
+    LocalSession, RoostEndpoint, RoostPeek, RoostReach, RoostUpdate, RoostWatcher, SshBridge,
+    SshBridgeOptions, SystemSshTunnels, Tunnel, TunnelOpener, UnreachableReach,
+};
 pub use token_minter::HostAgentTokenMinter;
 pub use traits::{
     AuthGate, AuthGateRef, AuthOutcome, AuthPrompt, Clock, ClockRef, CoordinatorEvent, EventSink,

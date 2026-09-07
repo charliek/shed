@@ -1,8 +1,8 @@
 //! **Live activity for SHED sessions.**
 //!
 //! A machine session arrives with its activity already on it, because the app
-//! reads that machine's hub directly (`/v1/sessions`) and activity is something
-//! the hub knows. A SHED session does not: the app lists sheds by running the
+//! reads that machine's `roost-session` directly (plan 013) and roost's agent
+//! axes carry it. A SHED session does not: the app lists sheds by running the
 //! one-shot `shed-ext-rc list` over ssh, and activity is a **hub-layer
 //! overlay** that the one-shot deliberately never sets —
 //! `internal/ext/rc/hub.go` says so outright ("the one-shot List above never

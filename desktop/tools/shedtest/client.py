@@ -422,6 +422,47 @@ class TauriClient(_ApprovalOps, _RcOps, _RustCoreClient):
         answers from anywhere; this proves the state reached the window."""
         return self.call("machines.dump")["machines"]
 
+    # -- machines (plan 013: each machine's roost-session) -----------------
+    def machines_list(self) -> list[dict]:
+        """The BACKEND's view of every watched machine: `{name, origin,
+        reachable, connected_once, sessions, detail}`, in config-then-arrival
+        order. Answers from any pane (unlike `machines_dump`)."""
+        return self.call("machines.list")["machines"]
+
+    def machine_kill(self, machine: str, slug: str) -> None:
+        """Close a session on a machine — a roost `tab.close`; the slug IS the
+        tab id. Addressed by (machine, slug), never by (host, shed, slug)."""
+        self.call("machine.kill", {"machine": machine, "slug": slug})
+
+    def machine_launch(self, machine: str, kind: str = "opencode",
+                       workdir: str | None = None, display_name: str | None = None,
+                       initial_prompt: str | None = None) -> dict:
+        """Open a session ON a machine — a roost `tab.open` of the kind's argv in
+        `workdir`. `display_name`/`initial_prompt` are accepted and unused in M1
+        (kickoff is argv + cwd until the provider script lands)."""
+        params: dict = {"machine": machine, "kind": kind}
+        for k, v in (("workdir", workdir), ("display_name", display_name),
+                     ("initial_prompt", initial_prompt)):
+            if v is not None:
+                params[k] = v
+        return self.call("machine.launch", params)
+
+    def machine_capabilities(self, machine: str) -> dict:
+        """A machine's RC capabilities — the SYNTHESIZED roost contract (no SSH
+        probe), the same set `rc.list` stamps under `machine:<name>`."""
+        return self.call("machine.capabilities", {"machine": machine})["capabilities"]
+
+    def machine_add(self, name: str, host: str | None = None, user: str | None = None,
+                    ssh_port: object | None = None, rc_bin: str | None = None) -> None:
+        """Append a machine to the shed config and start watching it now — the
+        same path the Add dialog drives."""
+        params: dict = {"name": name}
+        for k, v in (("host", host), ("user", user), ("ssh_port", ssh_port),
+                     ("rc_bin", rc_bin)):
+            if v is not None:
+                params[k] = v
+        self.call("machine.add", params)
+
     def sidebar_dump(self) -> dict:
         """The sidebar's status foot as rendered: `{servers, machines}`. Answers
         from any pane (the sidebar is always mounted), which is why it is where
@@ -532,25 +573,34 @@ class TauriClient(_ApprovalOps, _RcOps, _RustCoreClient):
                     raise
                 time.sleep(0.1)
 
-    def terminal_preview(self, shed: str, host: str | None = None, session: str | None = None,
-                         preset: str | None = None, template: str | None = None) -> dict:
+    def terminal_preview(self, shed: str | None = None, host: str | None = None,
+                         session: str | None = None, preset: str | None = None,
+                         template: str | None = None, machine: str | None = None) -> dict:
         """The ssh command + resolved preset/invocation that would open the shed —
-        no spawn. Same `terminal.preview` contract as the mac app (param key `shed`)."""
-        return self.call("terminal.preview", self._terminal_params(shed, host, session, preset, template))
+        no spawn. Same `terminal.preview` contract as the mac app (param key `shed`).
 
-    def terminal_open(self, shed: str, host: str | None = None, session: str | None = None,
-                      preset: str | None = None, template: str | None = None) -> dict:
-        """Spawn the terminal opener (disabled under test mode → `not_enabled`)."""
-        return self.call("terminal.open", self._terminal_params(shed, host, session, preset, template))
+        `machine` is the roost row's ask, and it is REFUSED server-side (plan 013:
+        a machine row's attach is `native-remote`, so there is no tmux to attach)."""
+        return self.call("terminal.preview",
+                         self._terminal_params(shed, host, session, preset, template, machine))
+
+    def terminal_open(self, shed: str | None = None, host: str | None = None,
+                      session: str | None = None, preset: str | None = None,
+                      template: str | None = None, machine: str | None = None) -> dict:
+        """Spawn the terminal opener (disabled under test mode → `not_enabled`;
+        a `machine` is refused in every mode — see `terminal_preview`)."""
+        return self.call("terminal.open",
+                         self._terminal_params(shed, host, session, preset, template, machine))
 
     def terminal_presets(self) -> list[dict]:
         """The offerable terminal presets + whether each is installed."""
         return self.call("terminal.presets")["presets"]
 
     @staticmethod
-    def _terminal_params(shed, host, session, preset, template) -> dict:
-        params: dict = {"shed": shed}
-        for k, v in (("host", host), ("session", session), ("preset", preset), ("template", template)):
+    def _terminal_params(shed, host, session, preset, template, machine=None) -> dict:
+        params: dict = {}
+        for k, v in (("shed", shed), ("host", host), ("session", session),
+                     ("preset", preset), ("template", template), ("machine", machine)):
             if v is not None:
                 params[k] = v
         return params
