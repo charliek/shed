@@ -398,13 +398,27 @@ fn refuse(code: &str, message: impl Into<String>) -> Refusal {
     (code.to_string(), message.into())
 }
 
-/// roost's own `client_label` normalization: trim, strip control characters, cap
-/// at 128 UTF-8-safe bytes, empty after that → absent.
+/// Characters roost refuses in a `client_label`, beyond [`char::is_control`].
+///
+/// `is_control` alone is not enough and the difference is visible: the line and
+/// paragraph separators break the takeover banner onto a second line, and the
+/// bidi overrides reorder everything after them — and Unicode classifies none of
+/// them as control characters, so they sail straight through a
+/// `filter(!is_control)` into a string the session renders. roost's own
+/// `is_layout_hostile` (`roost-engine/src/ipc.rs` at the pinned rev) is this
+/// exact set.
+fn is_layout_hostile(c: char) -> bool {
+    c.is_control()
+        || matches!(c, '\u{2028}' | '\u{2029}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
+}
+
+/// roost's own `client_label` normalization: trim, drop the layout-hostile
+/// characters, cap at 128 UTF-8-safe bytes, empty after that → absent.
 fn normalize_label(raw: &str) -> Option<String> {
     let cleaned: String = raw
         .trim()
         .chars()
-        .filter(|c| !c.is_control())
+        .filter(|c| !is_layout_hostile(*c))
         .collect::<String>();
     let mut capped = cleaned.trim().to_string();
     while capped.len() > 128 {
@@ -1116,14 +1130,12 @@ fn dispatch(
             Ok(json!({}))
         }
         "tab.write" => {
+            // **The order is roost's and it is load-bearing.** roost decodes the
+            // params, then runs `require_lease`, then hands the bytes to the
+            // supervisor — so a write to a tab that does not exist, presented
+            // WITHOUT authority, answers `connect-required` and never leaks the
+            // fact that the tab is missing. Decode, gate, then look for the tab.
             let id = params_tab_id(params)?;
-            let presented = params.get("lease").and_then(Value::as_str);
-            // On a UI socket the key is accepted and ignored — that socket mints
-            // no leases, and refusing it would make one client unable to talk to
-            // both kinds of socket.
-            if !state.ui_socket {
-                state.check_write_lease(presented)?;
-            }
             let encoded = params
                 .get("data")
                 .and_then(Value::as_str)
@@ -1131,6 +1143,23 @@ fn dispatch(
             let bytes = base64::engine::general_purpose::STANDARD
                 .decode(encoded)
                 .map_err(|e| refuse("invalid-param", format!("tab.write data: {e}")))?;
+            let presented = params.get("lease").and_then(Value::as_str);
+            // On a UI socket the key is accepted and ignored — that socket mints
+            // no leases, and refusing it would make one client unable to talk to
+            // both kinds of socket.
+            if !state.ui_socket {
+                state.check_write_lease(presented)?;
+                // **Presenting the live lease REGISTERS this connection under
+                // it**, exactly as roost's `present()` does for every
+                // lease-carrying op — not just for `session.connect`. A takeover
+                // closes everything on that list, so a connection that only ever
+                // wrote would otherwise survive one and keep writing at a
+                // session it no longer drives.
+                *held_lease = presented.map(str::to_string);
+            }
+            if state.tab(id).is_none() {
+                return Err(refuse("not-found", format!("no such tab: {id}")));
+            }
             state
                 .writes
                 .entry(id)
@@ -1287,6 +1316,120 @@ mod tests {
             normalize_label(&"x".repeat(200)).map(|l| l.len()),
             Some(128)
         );
+
+        // **The half `is_control` does not cover.** Unicode calls none of these
+        // control characters, so a `filter(!is_control)` passes them through
+        // into the takeover banner — the separators break it onto a second line
+        // and the overrides reorder everything after them. A test that only fed
+        // ASCII would certify a parity with roost that does not exist.
+        assert_eq!(
+            normalize_label("work\u{202e}box"),
+            Some("workbox".to_string()),
+            "a right-to-left override"
+        );
+        assert_eq!(
+            normalize_label("work\u{2066}box\u{2069}"),
+            Some("workbox".to_string()),
+            "the isolate family"
+        );
+        assert_eq!(
+            normalize_label("work\u{2028}box"),
+            Some("workbox".to_string()),
+            "a line separator"
+        );
+        assert_eq!(
+            normalize_label("work\u{2029}box"),
+            Some("workbox".to_string()),
+            "a paragraph separator"
+        );
+        assert_eq!(normalize_label("\u{202e}\u{2028}"), None, "hostile-only");
+    }
+
+    /// **A lease-bearing write registers its connection under the lease**, not
+    /// just `session.connect` does.
+    ///
+    /// roost's `present()` is what every lease-carrying op runs, and on the live
+    /// lease it pushes the connection onto the holder's list — which is the list
+    /// a takeover closes. A fake that registered only the connecting one would
+    /// let a second connection keep writing straight through a takeover, which
+    /// is precisely the authority the lease exists to move.
+    #[tokio::test]
+    async fn a_write_with_the_live_lease_registers_that_connection_too() {
+        let fake = FakeRoost::start().await;
+        let mut owner = Conn::unix(fake.socket_path()).await.expect("dial");
+        let lease = owner
+            .session_connect(false, Some("owner"))
+            .await
+            .expect("mints")
+            .lease;
+
+        // A SECOND connection that never connected, only wrote.
+        let mut writer = Conn::unix(fake.socket_path()).await.expect("dial");
+        writer
+            .tab_write(5, b"ok", Some(&lease))
+            .await
+            .expect("the live lease authorizes it");
+
+        // A stream, to prove the takeover's reach stops at control connections.
+        let observer = Conn::unix(fake.socket_path()).await.expect("dial");
+        let mut stream = observer.subscribe("").await.expect("subscribe");
+
+        fake.take_over("usurper");
+
+        assert!(
+            owner
+                .tab_list()
+                .await
+                .expect_err("the holder is closed")
+                .is_unavailable(),
+            "the connecting holder must be closed"
+        );
+        assert!(
+            writer
+                .tab_list()
+                .await
+                .expect_err("the writer is closed too")
+                .is_unavailable(),
+            "a connection registered by its WRITE must be closed by a takeover"
+        );
+
+        // The stream survived, and still delivers.
+        match stream.next().await.expect("a frame") {
+            Some(EventFrame::DriverChanged(changed)) => assert_eq!(changed.taken_by, "usurper"),
+            other => panic!("expected driver_changed, got {other:?}"),
+        }
+        fake.bump_revision();
+        match stream.next().await.expect("a frame") {
+            Some(EventFrame::Batch(_)) => {}
+            other => panic!("expected the stream to keep delivering, got {other:?}"),
+        }
+    }
+
+    /// **The lease is checked before the tab.** roost decodes, runs
+    /// `require_lease`, and only then writes — so an unknown tab presented
+    /// without authority answers `connect-required` and never confirms whether
+    /// that tab exists.
+    #[tokio::test]
+    async fn the_write_gate_runs_before_the_tab_lookup() {
+        let fake = FakeRoost::start().await;
+        let mut conn = Conn::unix(fake.socket_path()).await.expect("dial");
+
+        let blind = conn
+            .tab_write(4242, b"x", None)
+            .await
+            .expect_err("no lease, no answer about the tab");
+        assert_eq!(blind.server_code(), Some(ServerCode::ConnectRequired));
+
+        let lease = conn
+            .session_connect(false, None)
+            .await
+            .expect("mints")
+            .lease;
+        let missing = conn
+            .tab_write(4242, b"x", Some(&lease))
+            .await
+            .expect_err("authorized, and the tab really is gone");
+        assert_eq!(missing.server_code(), Some(ServerCode::NotFound));
     }
 
     /// The takeover table, and the **one** tombstone behind it.

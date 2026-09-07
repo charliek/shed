@@ -92,13 +92,16 @@ make -C desktop e2e-tauri       # shared suite + test_tauri at --target tauri (n
 
 Since plan 013 the Tauri app's **machine** rows come from a `roost-session`, not from the RC
 hub — one `RoostWatcher` per `machines:` entry, plus an implicit `localhost` host for the
-machine the app is running on. Two env vars steer it:
+machine the app is running on. Since plan 014 that watcher **does not poll**: it subscribes to
+roost's leaseless observer event stream (session protocol 4) and emits a snapshot only when a
+row actually changed, so there is **no poll knob any more** — the env var that used to turn the
+cadence down was deleted from the app, from `shed_app::roost` and from `ui.py`, and a recipe
+that still exports it is exporting nothing. Two env vars steer it:
 
 | Variable | Where it is read | Effect |
 |---|---|---|
 | `SHED_TAURI_ROOST_SOCKETS` | `src-tauri/src/env.rs`, **test mode only** | Comma-separated `<machine>=<socket path>`. A named machine (including `localhost`) is dialled on that Unix socket instead of through roost's SSH client-bridge. Non-empty ⇒ **no** machine ever spawns ssh; an unmapped entry is a permanently-unreachable row. This is the app-level var — `ui.py`'s `subproc_env` sets or CLEARS it on every hermetic launch (never inherited from the parent shell), so nothing downstream of the harness can leak a stray value in. |
 | `SHEDTEST_ROOST_SOCKETS` | `conftest.py`'s `_env_roost_sockets`, harness-level | Same `<machine>=<socket path>` shape, read once and passed explicitly as `roost_sockets` to the SESSION app fixture (`_app_session`) — the harness-level opt-in for pointing the pytest session app at a real daemon instead of `fake_roost.py`. A custom driver script (not going through `conftest.py`) must do the equivalent itself: read this var, parse it into a `{name: path}` map, and pass it as `ui.launch(..., roost_sockets=...)` — since the launch no longer inherits, nothing shows up unless the caller supplies the map explicitly. |
-| `SHED_ROOST_POLL_MS` | `shed_app::roost`, read **once per watcher at spawn** | The `tab.list` poll cadence in ms (default 2000, floor 10). Set it to `50` so "within one poll interval" assertions are fast — it must be in the environment **before** the app starts. |
 
 `localhost` is listed only once its socket has answered at least once (connect-if-present in
 both directions), so an app with no session running shows no `localhost` row at all — that is
@@ -123,7 +126,6 @@ docker run --rm -v "$ROOT:/repo:ro" -v "$HOST_OUT:/out" \
   -e UV_PROJECT_ENVIRONMENT=/tmp/uv-venv \
   -e SHED_TAURI_BIN=/target/debug/shed-desktop-tauri \
   -e SHEDTEST_ROOST_SOCKETS=localhost=/roost/roost.sock \
-  -e SHED_ROOST_POLL_MS=200 \
   --cap-add SYS_ADMIN --security-opt seccomp=unconfined --shm-size=1g \
   shed-tauri-linux:latest bash -c '…build + driver, as in the screenshot recipe below…'
 ```
@@ -134,8 +136,6 @@ docker run --rm -v "$ROOT:/repo:ro" -v "$HOST_OUT:/out" \
   explicitly instead. Driving through pytest, `conftest.py`'s `_app_session` fixture reads
   `SHEDTEST_ROOST_SOCKETS` and passes it to `ui.launch(roost_sockets=...)`. A bespoke driver
   script (the screenshot recipe below) must do the same itself.
-- `SHED_ROOST_POLL_MS` has no harness-level indirection — it stays a plain env var the driver
-  passes straight through to the app it launches.
 - Then `rc.list` carries the roost rows (`origin: "machine:localhost"`, `tab_id`, `attention`)
   and `capabilities["machine:localhost"]` — synthesized, `attach: "native-remote"`, so the card
   offers **no** terminal action and `terminal.preview {machine: …}` answers
@@ -144,6 +144,33 @@ docker run --rm -v "$ROOT:/repo:ro" -v "$HOST_OUT:/out" \
   mode 0600, so either run with `--user 1000` or loosen the socket's mode for the run. If
   `rc.list` shows `localhost` absent, that is the first thing to check — an unconnectable
   socket is indistinguishable from "no session" by design.
+
+### The daemon must speak session protocol 4
+
+Since plan 014 shed pins `roost-ipc` at `c67ac27b6a85dbee0871f32d49c1566cc068d1c8` and
+`Conn::session_identify` **refuses a mismatch by name** rather than limping — a protocol-2
+daemon (anything before roost's R1) reads as an unreachable machine row whose detail is
+`ProtocolMismatch { theirs: 2, ours: 4 }`. That is correct, not a bug: the lease semantics
+changed in both directions (`events.subscribe` stopped taking a lease, `tab.write` started
+requiring one), so limping would mean guessing.
+
+Build one from roost's tree at the pinned sha into a scratch checkout of its own — a **release**
+build, so the daemon's socket lands under the non-`-dev` `roost-session` directory (the `-dev`
+trap in `crates/CLAUDE.md`), and outside roost's own working tree so it survives whatever branch
+that is on:
+
+```bash
+git -C ~/projects/roost archive c67ac27b6a85dbee0871f32d49c1566cc068d1c8 \
+  | (mkdir -p ~/.cache/shed-plan014/roost-c67ac27 && tar -x -C ~/.cache/shed-plan014/roost-c67ac27)
+cd ~/.cache/shed-plan014/roost-c67ac27
+cargo build --release -p roost-session -p roost-cli   # roost-cli's binary is `roostctl`
+# → target/release/{roost-session,roostctl}
+```
+
+(roost's build needs libghostty-vt; follow its own README if the link step complains.) Both
+`SHED_TAURI_ROOST_SESSION_BIN` (the `real_roost` smoke below) and the mount-the-host-socket
+recipe above want that binary. If a machine row comes up unreachable with a protocol mismatch,
+the daemon is the old one — rebuild rather than un-pinning shed.
 
 ### The `real_roost` pytest smoke (no host socket to mount)
 
@@ -273,6 +300,24 @@ assertions, the pixels are the eyeball.
   this reason. Building the crate by hand? build the UI bundle first.
 - **In-container paths** → everything runs under `/work/desktop`; `uv` uses
   `UV_PROJECT_ENVIRONMENT=/tmp/uv-venv` (the repo mount is read-only). Don't assume host paths.
+- **A rev bump of `roost-ipc` has TWO manifests** → `crates/Cargo.toml` (the workspace pin) and
+  `desktop/tauri/src-tauri/Cargo.toml` (the Tauri crate names `TabOpenParams`/`Tab`/`Ownership`
+  directly, so it takes its own git dep). They must stay in lockstep or the tree gets two copies
+  of the crate and `shed_app::roost`'s signatures stop accepting the Tauri crate's types. The
+  Tauri lock is regenerated **without** WebKitGTK — `cargo metadata --manifest-path
+  desktop/tauri/src-tauri/Cargo.toml --offline >/dev/null` resolves and rewrites it in a second;
+  a full `cargo build` there only works in Docker.
+- **A module fixture named `fake` breaks the whole pytest session** → `conftest.py` owns a
+  SESSION-scoped `fake` (the fake host-agent) that the autouse `_app_session` requests by name.
+  A module-level `fake` shadows it and every test in the run dies with
+  `ScopeMismatch: You tried to access the function scoped fixture fake with a session scoped
+  request object` — but ONLY when that module is collected before the session fixture is first
+  resolved, so it can pass in a full run and fail when the file is run alone. Name a per-module
+  double something else (`fake_roost`, `roost`, …).
+- **`FakeRoost.stop()` is roost's `session.stopping`, not the teardown** (plan 014, mirroring the
+  Rust fake) → it tells every stream why, hangs up, and latches the fake *unavailable* until
+  `restart()`. Tearing the fake down — stop listening, remove the socket file, produce the
+  durable "no roost-session at <path>" state — is **`shutdown()`**.
 - **`cargo: command not found` in a fresh shell** → the host Rust toolchain is
   mise-managed and isn't on a non-login shell's PATH. `export PATH="$HOME/.cargo/bin:$PATH"`
   before running `cargo`/`make tauri-*` by hand (the Docker legs carry their own in-image

@@ -3947,7 +3947,7 @@ dependencies = [
 [[package]]
 name = "roost-ipc"
 version = "0.0.19"
-source = "git+https://github.com/charliek/roost?rev=61d8713bcd0378971ad8490fe89b8dbef4e49fac#61d8713bcd0378971ad8490fe89b8dbef4e49fac"
+source = "git+https://github.com/charliek/roost?rev=c67ac27b6a85dbee0871f32d49c1566cc068d1c8#c67ac27b6a85dbee0871f32d49c1566cc068d1c8"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -4448,6 +4448,7 @@ dependencies = [
  "shed-core",
  "shed-rc-engine",
  "tokio",
+ "tracing",
  "uuid",
 ]
 

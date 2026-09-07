@@ -16,8 +16,8 @@ supplies a Dart one). It turning out to be exactly what a hermetic harness needs
 is a good sign the cut landed in the right place.
 
 The alternative — injecting rendered rows like `rc.inject_test` does — would test
-the renderer and nothing else, leaving the roost client, the watcher, the poll
-loop and the unreachable posture uncovered. Those are where the bugs were.
+the renderer and nothing else, leaving the roost client, the watcher, the event
+fold and the unreachable posture uncovered. Those are where the bugs were.
 
 **Ordering is load-bearing.** Each app instance here is module-scoped (the
 `machines:` config and the socket map are read at LAUNCH, as in production), and
@@ -105,12 +105,12 @@ def fake_roost():
     try:
         yield fake
     finally:
-        fake.stop()
+        fake.shutdown()
 
 
 @pytest.fixture(scope="module")
 def flaky_roost():
-    """A session that answers, and that a test can then STOP.
+    """A session that answers, and that a test can then TEAR DOWN.
 
     This is the only way to produce the third health band: a machine that
     `connected_once` and is now unreachable — "offline", as opposed to "never
@@ -120,22 +120,24 @@ def flaky_roost():
     It runs NO tabs, so it is also the "up, and nothing running on it" case —
     reachable with an empty row set.
 
-    Yields `(fake, stop)`; `stop` is idempotent so the teardown is safe after a
-    test has already called it.
+    Yields `(fake, shutdown)`; `shutdown` is idempotent so the teardown is safe
+    after a test has already called it. It is the fake's TEARDOWN (the socket
+    goes away), not roost's `session.stopping` — `FakeRoost.stop()` is that, and
+    it leaves the daemon there to be restarted.
     """
     fake = FakeRoost().start()
-    stopped = False
+    gone = False
 
-    def stop() -> None:
-        nonlocal stopped
-        if not stopped:
-            stopped = True
-            fake.stop()
+    def shutdown() -> None:
+        nonlocal gone
+        if not gone:
+            gone = True
+            fake.shutdown()
 
     try:
-        yield fake, stop
+        yield fake, shutdown
     finally:
-        stop()
+        shutdown()
 
 
 @pytest.fixture(scope="module")
@@ -380,7 +382,7 @@ def test_the_localhost_row_appears_once_its_socket_exists(localhost_app):
         assert session["origin"] == "machine:localhost"
         assert session["activity"] == "working"
     finally:
-        fake.stop()
+        fake.shutdown()
 
 
 # ---------------------------------------------------------------------------
@@ -641,13 +643,13 @@ def test_the_sidebar_lists_machines_under_the_shed_servers(machine_app, flaky_ro
     app records `connected_once`, and then this test STOPS it. Without that, a
     regression that ordered offline above connecting would pass unnoticed.
     """
-    _, stop_flaky = flaky_roost
+    _, shutdown_flaky = flaky_roost
     machine_app.wait_until(
         lambda: any(m["name"] == "flaky" and m["status"] == "reachable"
                     for m in machine_app.sidebar_dump().get("machines") or []),
         timeout=30, what="flaky to connect before it is stopped",
     )
-    stop_flaky()
+    shutdown_flaky()
     machine_app.wait_until(
         lambda: any(m["name"] == "flaky" and m["status"] == "unreachable"
                     for m in machine_app.sidebar_dump().get("machines") or []),
@@ -691,15 +693,22 @@ def test_the_sidebar_lists_machines_under_the_shed_servers(machine_app, flaky_ro
 # ---------------------------------------------------------------------------
 
 
-def test_a_lifecycle_flip_reaches_rc_list_within_one_poll(machine_app, fake_roost):
-    """**S3's acceptance cell.** An agent's turn changing on the machine reaches
-    the sessions view by itself, with no refresh and no relaunch.
+def test_a_lifecycle_flip_is_pushed_to_rc_list(machine_app, fake_roost):
+    """**S3's acceptance cell, on the push feed.** An agent's turn changing on the
+    machine reaches the sessions view by itself, with no refresh, no relaunch —
+    and, since plan 014, no cadence to wait for.
 
     The path is the whole point of the pivot: roost's adapter writes the axes,
-    `tab.list` carries them, the watcher polls, the row's `activity` follows. The
-    harness turns the cadence down with `SHED_ROOST_POLL_MS=50` (read once, at
-    watcher spawn — which is why `ui.launch` sets it), so "within one poll" is
-    fast; the wait budget is generous because the render gate runs under Xvfb.
+    roost commits them as one event batch, the watcher's observer stream carries
+    it, the row's `activity` follows. There is **no poll knob anywhere** any more —
+    the cadence env var the harness used to set is deleted from the app, from the
+    shared core and from `ui.py` — so the latency floor is the push itself; the
+    budget below is loose enough to survive a loaded Xvfb runner and still far
+    under the 2 s the retired cadence used to cost.
+
+    `tab.list` is the load-bearing half: it must NOT be re-read. One list per
+    watcher cycle is the contract, so a count that moved here would mean the flip
+    was found by re-listing rather than delivered.
 
     `has_notification` rides along as `attention` and NOT as activity: roost
     clears it on UI focus and shed never clears it, so folding it into "needs
@@ -710,6 +719,7 @@ def test_a_lifecycle_flip_reaches_rc_list_within_one_poll(machine_app, fake_roos
         lambda: [r["activity"] for r in _machine_rows(machine_app, "mini3")] == ["working"],
         timeout=10, what="the working flip to reach rc.list",
     )
+    lists = fake_roost.tab_list_calls
 
     started = time.monotonic()
     fake_roost.set_axes(AGENT_TAB, lifecycle="waiting", detail="question_asked",
@@ -726,11 +736,103 @@ def test_a_lifecycle_flip_reaches_rc_list_within_one_poll(machine_app, fake_roos
     # claude's `permission_prompt`) are approvals, matched by equality so a
     # `permission_replied` is never read as a new one.
     assert row["activity"] != "needs_approval"
-    # A floor, not a stopwatch: the SHIPPED cadence is 2 s, so on an unscaled
-    # local run this only passes when `SHED_ROOST_POLL_MS` actually took. Under
-    # the render gate's timeout scale the budget widens with everything else,
-    # which is the price of never flaking on a loaded runner.
-    assert elapsed < scaled_timeout(1.5), f"the flip took {elapsed:.1f}s"
+    assert elapsed < scaled_timeout(1.0), f"the flip took {elapsed:.1f}s"
+    assert fake_roost.tab_list_calls == lists, (
+        "the flip was re-LISTED rather than pushed — the watcher is polling again"
+    )
+
+
+def test_shed_watches_as_an_observer_and_takes_no_lease(machine_app, fake_roost):
+    """**Watching somebody's machine must not take their roost UI's driver seat.**
+
+    At session protocol 4 `events.subscribe` no longer takes a lease, it
+    CLASSIFIES on one: an empty lease is an *observer* stream. Shed sends an empty
+    one, so the fake must record an observer, no driver, and no lease held at all.
+    Asserting all three is the point — an observer count alone would still pass
+    against a client that also minted a lease on the side.
+    """
+    machine_app.wait_until(
+        lambda: fake_roost.observer_count() == 1 and fake_roost.driver_count() == 0,
+        timeout=30, what="shed's stream to be registered as an observer",
+    )
+    assert fake_roost.lease is None, "shed took the interactive lease"
+
+
+def test_a_driver_change_leaves_the_machine_rows_alone(machine_app, fake_roost):
+    """**Somebody else taking the interactive lease changes nothing here.**
+
+    R1's re-cut: a takeover no longer ends an event stream, it reclassifies it and
+    says so once with a non-terminal `session.driver_changed`. Shed never held the
+    lease, so the rows must not move and the machine must not go down — and the
+    flip afterwards is what proves the SAME stream is still delivering (a
+    reconnect would have cost a `tab.list`).
+
+    Two takeovers, because only a real displacement announces itself: the first
+    mints into an unheld session and deposes nobody, so roost sends nothing.
+    """
+    machine_app.wait_until(
+        lambda: bool(_machine_rows(machine_app, "mini3")),
+        timeout=30, what="mini3's row",
+    )
+    lists = fake_roost.tab_list_calls
+
+    fake_roost.take_over("roost ui")
+    assert fake_roost.lease is not None, "the first claim mints"
+    fake_roost.take_over("somebody else")
+    assert fake_roost.lease_label == "somebody else"
+
+    fake_roost.set_axes(AGENT_TAB, lifecycle="working", detail="session_status")
+    machine_app.wait_until(
+        lambda: [r["activity"] for r in _machine_rows(machine_app, "mini3")] == ["working"],
+        timeout=20, what="the stream to keep delivering after the takeover",
+    )
+    assert fake_roost.tab_list_calls == lists, (
+        "the takeover cost a re-list — the client treated it as terminal"
+    )
+    live = _named(machine_app.machines_list(), "mini3")
+    assert live["reachable"] is True, live
+    assert live["detail"] is None, live
+
+
+def test_a_lost_commit_is_resynced_end_to_end(machine_app, fake_roost):
+    """**A gap is a resync, not a `Down`** — end to end, through the real app.
+
+    `skip_revision` is the only way to manufacture the loss a resync exists for
+    (roost itself closes the stream instead). The client's own event stream
+    detects the hole, the watcher starts a fresh cycle — exactly one more
+    `tab.list` — and the user sees a row that simply updates.
+
+    **This is a smoke, not the no-flicker proof.** The reachable/stale checks
+    below run once per poll, so a spurious `Down` that is repaired between two
+    samples slips through them unseen. The assertion that actually holds is the
+    Rust unit test `machines::tests::a_resync_never_publishes_an_unreachable_state`,
+    which records every transition the consumer publishes rather than sampling
+    the result. What this cell adds is that the whole stack — real watcher, real
+    fold, real IPC, real render path — gets from a lost commit to an updated row
+    at all.
+    """
+    machine_app.wait_until(
+        lambda: [r["activity"] for r in _machine_rows(machine_app, "mini3")] == ["working"],
+        timeout=30, what="a known baseline before the gap",
+    )
+    lists = fake_roost.tab_list_calls
+
+    # A commit nobody was told about, then one they are: the batch arrives at
+    # `expected + 1` and the stream raises the gap.
+    fake_roost.skip_revision()
+    fake_roost.set_axes(AGENT_TAB, lifecycle="finished", detail="session_idle")
+
+    def resynced() -> bool:
+        live = _named(machine_app.machines_list(), "mini3")
+        assert live.get("reachable") is True, f"a resync rendered mini3 down: {live}"
+        rows = _machine_rows(machine_app, "mini3")
+        assert all(r["stale"] is False for r in rows), f"a resync marked a row stale: {rows}"
+        return [r["activity"] for r in rows] == ["idle"]
+
+    machine_app.wait_until(resynced, timeout=30, what="the resynced row")
+    assert fake_roost.tab_list_calls == lists + 1, (
+        "exactly one re-list — a resync is a fresh cycle, not a retry storm"
+    )
 
 
 def test_launching_on_a_machine_routes_over_the_machine_not_a_server(machine_app, fake_roost):
@@ -817,7 +919,7 @@ def test_killing_a_machine_session_routes_over_the_machine_not_a_server(machine_
 
     Asserting the far side, not just the payload, is the point — an optimistic
     drop that never reached the machine would look identical in `rc.list` until
-    the next poll put the row back.
+    the next snapshot put the row back.
     """
     assert AGENT_TAB in fake_roost.tab_ids(), "the tab to close is there to begin with"
 
@@ -828,8 +930,11 @@ def test_killing_a_machine_session_routes_over_the_machine_not_a_server(machine_
         roost_call(fake_roost.socket_path, "tab.dump", {"tab_id": str(AGENT_TAB)})
     assert wire.value.code == "not-found", wire.value
 
-    # …and the row is gone from the view, optimistically — the watcher polls, so
-    # waiting for the next snapshot would read as "the kill didn't work".
+    # …and the row is gone from the view, optimistically. The close's own
+    # `tab.closed` normally comes back off the stream within milliseconds, but
+    # waiting for it would leave the card on screen for a whole resync (or
+    # forever, if the machine dropped right after) and read as "the kill didn't
+    # work".
     assert str(AGENT_TAB) not in {r["slug"] for r in _machine_rows(machine_app, "mini3")}
 
     # A slug that is not a roost tab id is refused by name rather than sent to
@@ -880,6 +985,60 @@ def test_a_daemon_restart_replaces_the_row_set(machine_app, fake_roost):
     # Tab 6 is still IN the session (ids persist across a restart) — it is gone
     # from the view because nobody owns it, not because roost forgot it.
     assert 6 in fake_roost.tab_ids()
+
+
+def test_a_stopping_session_goes_stale_with_its_reason_and_then_recovers(
+    machine_app, fake_roost
+):
+    """**`session.stopping` is the one terminal envelope an event stream sees.**
+
+    A daemon shutting down says why, and that reason is what the user reads —
+    "session stopping: stop" is a different problem from "no route to host" and
+    the app must not flatten them into "offline". The last known rows stay on
+    screen, marked stale: a machine going away must never blank the view.
+
+    `FakeRoost.stop()` latches the fake unavailable (a stopped daemon accepts
+    nothing), so "further attempts fail" is real rather than assumed; `restart()`
+    lifts the latch and the row comes back with the tab ids roost persisted.
+
+    The reason is sampled tightly rather than through `wait_until`: the watcher
+    re-dials after its first 500 ms backoff step and that attempt's own failure
+    overwrites the detail, so a 100 ms poll could read the second reason and
+    never see the first. Everything the loop sees is collected, so a failure
+    reports what actually arrived.
+    """
+    machine_app.wait_until(
+        lambda: bool(_machine_rows(machine_app, "mini3")),
+        timeout=30, what="mini3's row before the stop",
+    )
+
+    fake_roost.stop()
+
+    seen: list[str] = []
+    deadline = time.monotonic() + scaled_timeout(30)
+    while time.monotonic() < deadline:
+        detail = _named(machine_app.machines_list(), "mini3").get("detail")
+        if detail and detail not in seen:
+            seen.append(detail)
+        if any("session stopping" in d for d in seen):
+            break
+        time.sleep(0.02)
+    assert any("session stopping: stop" in d for d in seen), (
+        f"the first reason after a stop must be roost's own goodbye; saw {seen}"
+    )
+
+    stale = _machine_rows(machine_app, "mini3")
+    assert stale, "the last known rows must survive the stop"
+    assert all(r["stale"] is True for r in stale), stale
+
+    fake_roost.restart()
+    machine_app.wait_until(
+        lambda: _named(machine_app.machines_list(), "mini3").get("reachable") is True,
+        timeout=60, what="mini3 to come back after the restart",
+    )
+    back = _machine_rows(machine_app, "mini3")
+    assert [r["slug"] for r in back] == ["7"], f"the re-listed row set: {back}"
+    assert back[0]["stale"] is False
 
 
 # ---------------------------------------------------------------------------
