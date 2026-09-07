@@ -13,6 +13,18 @@ re-implemented per language. The root `CLAUDE.md` owns the monorepo layout + rel
   wire types + argv builders; its pure pane classifier went with S2, charliek/shed#324 —
   a shed row's `state` is liveness off the wire, a machine row's status comes from
   roost). The Linux clients link it directly.
+  `lane.rs` (plan 015) is the **agent-lane contract** — the DTOs plus the `AgentLane`
+  async trait that normalizes "a coding agent with sessions, a transcript and approvals",
+  one adapter per agent (opencode over its local HTTP server; `gx` next). Pure types, **no
+  I/O** — the transport, fold, ring and reconnect loop belong to whatever crate implements
+  it. It lives here, not in `shed-app`, because shed-mobile links the DTOs through FRB.
+  **The FRB-mirror rule (load-bearing):** mobile HAND-mirrors every lane DTO into Dart, so
+  every field is an owned `String`/`Option`/`Vec`/scalar — **no `serde_json::Value`, no
+  `HashMap`, no borrowed lifetimes**; free-form payloads travel as a `String` of raw JSON
+  (`LaneApproval::request_json`, `LaneAnswer::Raw`). A fielded enum becomes a Dart sealed
+  class, a plain one a plain Dart enum. Same rule as `rc.rs`'s feed types, which `lane`
+  reuses (`RcFeedMessage` IS the transcript row) — which is why those gained `Serialize`
+  plus a tolerant `Deserialize` delegating to their existing `from_map` reader.
 - **`shed-app`** — the UI-free app-logic layer (`Backend`) the clients share; holds the
   `RcRunner` portability seam (`rc.rs`) behind the non-default `rc` feature — which also
   pulls in and re-exports `shed-rc-engine` as `shed_app::rc_engine` — and the embedded
