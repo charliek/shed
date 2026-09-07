@@ -2,31 +2,27 @@
 //! (`internal/ext/rc/agents.go:423,494`) and its best-effort invocation at
 //! `ops.go:201`.
 //!
-//! Two tools declare one: **claude** (both its kinds) seeds trust + onboarding in
-//! `~/.claude.json` ([`super::trust`]), and **cursor** installs the hub's hook
-//! relay ([`super::preseed_cursor`]). Every other kind has none. A preseed NEVER
-//! fails a create — [`Engine::create`](super::ops::Engine::create) reports the
-//! failure through its warn sink and carries on — which is why this returns the
-//! reason as a string for that one-line diagnostic.
+//! One tool declares one: **claude** (both its kinds) seeds trust + onboarding
+//! in `~/.claude.json` ([`super::trust`]). Every other kind has none — cursor's
+//! hook-relay preseed went with the hub's ingest lane in A6
+//! (`charliek/shed#322`). A preseed NEVER fails a create —
+//! [`Engine::create`](super::ops::Engine::create) reports the failure through
+//! its warn sink and carries on — which is why this returns the reason as a
+//! string for that one-line diagnostic.
 
 use shed_core::rc::RcKind;
 
 use super::ops::GetEnv;
-use super::preseed_cursor::preseed_cursor_hooks;
 use super::trust::preseed_claude_config;
 
 /// A preseed's diagnostic failure.
 ///
-/// The typed [`PreseedError::CursorForeignDevice`] variant exists because that
-/// case is not a failure at all but a deliberate DECLINE with a specific
-/// remediation (`ErrCursorHooksForeignDevice`, `preseed_cursor.go:92`) — Go's
-/// callers match it with `errors.Is`, and so do this crate's tests.
+/// It carried a second, typed variant (`CursorForeignDevice`) for cursor's
+/// hook-relay decline; that preseed went with the hub's ingest lane in A6
+/// (`charliek/shed#322`), leaving one message-carrying case.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PreseedError {
-    /// `~/.cursor` is on another filesystem than `$HOME` — an auth mount. The
-    /// `hooks.json` half is skipped; the (inert) hub script is still written.
-    CursorForeignDevice,
-    /// Anything else, carrying Go's message verbatim.
+    /// A failure, carrying Go's message verbatim.
     Failed(String),
 }
 
@@ -40,10 +36,6 @@ impl PreseedError {
 impl std::fmt::Display for PreseedError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            // Verbatim from `preseed_cursor.go:92`.
-            PreseedError::CursorForeignDevice => f.write_str(
-                "~/.cursor is on a different device than $HOME (an auth mount); skipping the hooks.json preseed",
-            ),
             PreseedError::Failed(msg) => f.write_str(msg),
         }
     }
@@ -152,11 +144,10 @@ fn run(kind: &RcKind, workdir: &str, env: GetEnv) -> Result<(), PreseedError> {
         // Both claude kinds share the claude spec, and so its preseed
         // (`agents.go:419-423`).
         RcKind::ClaudeRc | RcKind::ClaudeBroker => preseed_claude_config(workdir, env),
-        // workdir is unused by cursor's (its hooks are global), and is accepted
-        // only to satisfy the shared signature.
-        RcKind::Cursor => preseed_cursor_hooks(workdir, env),
-        // codex (its trust gate is a pane prompt the poller answers), opencode,
-        // shell and any unregistered kind: no preseed at all.
+        // codex (its trust gate is a pane prompt the poller answers), cursor
+        // (whose hook-relay preseed went with the ingest lane in A6,
+        // `charliek/shed#322`; `--trust` covers the one dialog it draws),
+        // opencode, shell and any unregistered kind: no preseed at all.
         _ => Ok(()),
     }
 }
@@ -181,20 +172,12 @@ mod tests {
     }
 
     #[test]
-    fn cursor_seeds_the_hook_relay() {
-        let home = tempfile::tempdir().unwrap();
-        let env = home_env(home.path().to_str().unwrap());
-        dispatch(&RcKind::Cursor, "/home/shed/proj", &env).unwrap();
-        assert!(home.path().join(".cursor/hooks.json").exists());
-        assert!(home.path().join(".shed-rc-hub/cursor-hook.sh").exists());
-    }
-
-    #[test]
     fn other_kinds_have_no_preseed() {
         let home = tempfile::tempdir().unwrap();
         let env = home_env(home.path().to_str().unwrap());
         for kind in [
             RcKind::Codex,
+            RcKind::Cursor,
             RcKind::Opencode,
             RcKind::Shell,
             RcKind::Other("future".to_string()),
@@ -210,8 +193,6 @@ mod tests {
         let env = env_from(&[]); // no HOME at all
         let err = dispatch(&RcKind::ClaudeRc, "/x", &env).unwrap_err();
         assert_eq!(err, "no CLAUDE_CONFIG_DIR or HOME; skipping trust preseed");
-        let err = dispatch(&RcKind::Cursor, "/x", &env).unwrap_err();
-        assert_eq!(err, "no HOME; skipping cursor hook preseed");
     }
 
     /// The whole point of [`PRESEED_STACK_BYTES`]: a `~/.claude.json` nested far
@@ -253,16 +234,8 @@ mod tests {
             ("HOME", home.path().to_str().unwrap()),
             ("CLAUDE_CONFIG_DIR", ""),
         ]);
-        for kind in [RcKind::ClaudeRc, RcKind::ClaudeBroker, RcKind::Cursor] {
+        for kind in [RcKind::ClaudeRc, RcKind::ClaudeBroker] {
             dispatch(&kind, "/home/shed/proj", &env).unwrap();
         }
-    }
-
-    #[test]
-    fn foreign_device_message_is_gos_verbatim() {
-        assert_eq!(
-            PreseedError::CursorForeignDevice.to_string(),
-            "~/.cursor is on a different device than $HOME (an auth mount); skipping the hooks.json preseed"
-        );
     }
 }

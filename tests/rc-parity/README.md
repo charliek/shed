@@ -73,7 +73,7 @@ failed differential cell.
 | stderr | only the contract classes' messages, masked. Everything else (usage dumps, third-party parser detail) is out of contract. |
 | `show-environment` | a sorted key→value mapping of the `SHED_RC_*`/`OPENCODE_*` keys. tmux's render ORDER is a tmux-version detail; `BuildEnvArgs` ordering is pinned by Rust unit tests instead (§3.6). |
 | inner-command argv | the exact argv the agent received, order-sensitive (recorded by the shim). |
-| preseed artifacts (`~/.claude.json`, `~/.cursor/hooks.json`), the cursor hook script, plan files | **raw bytes** — a mixed fleet rewrites these in place, so key order, indentation, HTML escaping and number fidelity are all contract. The only substitutions are the leg's `HOME` and the per-run pytest workdir. |
+| preseed artifacts (`~/.claude.json`), plan files | **raw bytes** — a mixed fleet rewrites these in place, so key order, indentation, HTML escaping and number fidelity are all contract. The only substitutions are the leg's `HOME` and the per-run pytest workdir. |
 | `capabilities` (standalone and embedded in `list`) | structural, with the agent **version values** masked after a `<major>.<minor>.<patch>` shape assert. `installed` booleans are diffed — the shims pin them, including the false case. |
 | `--wait` keystrokes | the exact bytes the agent received on stdin, in hex, in order (recorded by a reactive shim). |
 | `version` | fully masked after a `<prog> <version>` shape assert. |
@@ -130,7 +130,7 @@ discipline as `isolated` — every rig's server is killed and its `TMUX_TMPDIR` 
 ## Scope today and what is coming
 
 Two families share the goldens dir and the stale-sweep: the ONE-SHOT family
-(plan 009 — 52 cells) and the HUB family (plan 010 — `test_hub*.py`, marker
+(plan 009 — 46 cells) and the HUB family (plan 010 — `test_hub*.py`, marker
 `hub`): resident hub daemons on ephemeral loopback ports via the sanctioned
 `SHED_RC_HUB_ADDR`/`SHED_RC_HUB_*_MS` seams. Since H12 BOTH legs run —
 Go: `shed-machine-rc serve --foreground`, Rust: `shed-host-agent rc-hub` (the
@@ -139,25 +139,31 @@ equality-then-pin against the goldens the Go hub froze at H1½. Cell families:
 
 * **snapshot** (`test_hub.py`): health identity, the sessions overlay,
   messages paging, the 4xx/409 verb matrix (stream-cap 413-vs-400 pins
-  included), bare-mux status-only;
+  included, and `/input`'s surviving 409 `not_accepting`), bare-mux
+  status-only;
 * **SSE** (`test_hub_sse.py`): the appear→activity within-tick order via a
   registered-before-create subscription (the `: ok` opener is the
   registration proof), and the stalled-reader survivability cell (the
   connection-teardown half stays unit-level per side — the TCP close is
   legitimately different plumbing);
-* **side-effects** (`test_hub_effects.py`): the `SHED_RC_AGENT_SESSION`
-  correlation back-write and `/input` delivery onto the pane;
 * **lane** (`test_hub_lane.py`): the contract-v2 verbs against a live
   opencode lane — each leg drives its own `fake_opencode.py` instance
   (identical scripts) whose pinGuard fails the cell on any unscoped POST;
   turn/interrupt/approvals incl. the idempotent same-decision replay with no
-  second upstream POST;
-* **ingest** (`test_hub_ingest.py`): the cursor hook route by direct POST
-  (the preseeded script targets the fixed production port — one-shot-suite
-  territory), its precedence matrix, the no-lost-kickoff property, and the
-  fold smoke.
+  second upstream POST. It also carries the surviving SIDE-EFFECT proof: the
+  `SHED_RC_AGENT_SESSION` back-write is what `hub_opencode.lane_session`
+  waits for.
 
-The one-shot family — 52 differential cells, one golden each:
+A6 (`charliek/shed#322`) retired two of these families and re-based a third.
+The **ingest** family (`test_hub_ingest.py`, 9 cells) went with the cursor hook
+route it drove, and the **side-effect** family (`test_hub_effects.py`, 2 cells)
+with the codex correlation back-write and the gated `/input` delivery it
+pinned. opencode is the only watchable kind left, so the lane-agnostic cells
+that merely happened to ride a codex or cursor session — `/messages` paging and
+both SSE cells — moved onto it through the shared
+`hub_opencode.lane_session` setup.
+
+The one-shot family — 46 differential cells, one golden each:
 
 * `version`; `create` (DTO + session environment + inner-command argv, `shell` and
   `opencode`); `probe`; `kill` (including its idempotence); `list`; the exit-code
@@ -167,10 +173,10 @@ The one-shot family — 52 differential cells, one golden each:
   matrix — absent, empty, `null`, unknown keys with nested objects/arrays, the
   number-fidelity set (`>2^53`, `1e10`, `0.10`, `-0`), HTML/`U+2028`/non-ASCII
   escaping, the trailing-garbage refusal (file untouched, create still exit 0, the
-  reason on stderr), and merge idempotence — plus `~/.cursor/hooks.json` (fresh,
-  idempotent, user hooks preserved), the hub hook script's bytes and mode, and a
-  plan file's bytes and mode (with `--prompt-b64` framing riding alongside without
-  touching the file).
+  reason on stderr), and merge idempotence — plus a plan file's bytes and mode
+  (with `--prompt-b64` framing riding alongside without touching the file). The
+  four `~/.cursor/hooks.json` + hook-script cells went with that preseed in A6
+  (`charliek/shed#322`).
 * **Capabilities** (`test_capabilities.py`): the payload with two agents
   deliberately off PATH, the full `list` envelope beside a live session, and the
   absence of the block on a bare session DTO.
@@ -185,9 +191,10 @@ The one-shot family — 52 differential cells, one golden each:
   `prompt` + `kill` with the other, then the creator's `probe` → exit 4) run both
   ways round and compared; `accept-trust` answered across the boundary on a
   reactive trust shim (the transcript proves the single Enter, and the creator
-  then reads `ready`); and the preseed files merged in place across the boundary
+  then reads `ready`); and `~/.claude.json` merged in place across the boundary
   — Go→Rust and Rust→Go compared byte for byte against the pure-Go reference
-  sequence, for `~/.claude.json` and `~/.cursor/hooks.json`.
+  sequence. (The `~/.cursor/hooks.json` pair went with that preseed in A6,
+  `charliek/shed#322`.)
 
 The C4 carve-out that stripped `capabilities` from the `list` differential is
 **gone** — both implementations embed the block, so the full envelope is compared

@@ -47,10 +47,8 @@ use super::messages::{
 use super::stability::StabilityTracker;
 use super::watch::{
     agent_session_env, back_write_agent_session, merged_activity, opencode_port_env,
-    parse_jsonl_time, watchable_kind, FileWatcher, SessionWatcher,
+    watchable_kind, SessionWatcher,
 };
-use super::watch_codex::{correlate_codex, CodexFold};
-use super::watch_cursor::CursorWatcher;
 use super::watch_opencode_transport::OpencodeWatcher;
 
 /// How many CONSECUTIVE ticks the anchor must agree before the hub changes its
@@ -189,17 +187,15 @@ pub(crate) struct TrackedSession {
     pub last_message: String,
     pub last_state: RcState,
 
-    /// The session's structured-signal watcher (JSONL tail / opencode SSE /
-    /// cursor push), lazily created (`ensureWatcher`). `None` for kinds with
-    /// no structured signal, or before correlation succeeds.
+    /// The session's structured-signal watcher (the opencode SSE transport),
+    /// lazily created (`ensureWatcher`). `None` for kinds with no structured
+    /// signal — every kind but opencode since A6 (`charliek/shed#322`) — or
+    /// before correlation succeeds.
     pub watcher: Option<Arc<dyn SessionWatcher + Send + Sync>>,
     /// An AMBIGUOUS correlation's agent session id, held back until the
-    /// watcher's first in-file event confirms the pick — only then back-
+    /// watcher's first confirming event settles the pick — only then back-
     /// written to SHED_RC_AGENT_SESSION (a wrong pin would be permanent).
     pub pending_agent_id: String,
-    /// Correlation attempts, so a session whose file never appears stops
-    /// re-scanning the filesystem.
-    pub correlate_tried: u32,
 
     /// The session's message feed. Every tracked session has one so /messages
     /// returns 200-empty for a known slug. Self-synchronized.
@@ -265,11 +261,10 @@ pub(crate) fn copy_approvals(approvals: &[FeedApproval]) -> Vec<FeedApproval> {
     approvals.to_vec()
 }
 
-/// Bounds how many reconcile ticks a session's correlation is re-attempted
-/// (`maxCorrelateTries`, `hub_reconcile.go:540`): ~40 ticks at the active
-/// cadence is >1min of retry, comfortably longer than the file-appears
-/// latency, while a never-appearing file stops re-scanning forever.
-pub const MAX_CORRELATE_TRIES: u32 = 40;
+// `MAX_CORRELATE_TRIES` bounded the file-correlation retry budget. Only the
+// codex rollout lane ever spent it, so it went with that lane in A6
+// (`charliek/shed#322`) — opencode's watcher correlates asynchronously over its
+// own SSE stream and is built on the first eligible tick.
 
 /// The session DTOs for the given tmux session names (`sessionsForNames`,
 /// `ops.go:355`) — the shared enumeration loop behind the /v1/sessions
@@ -293,7 +288,6 @@ struct HeavySnapshot {
     ring: Arc<MessageRing>,
     pane_approval: PaneApprovalState,
     pending_agent_id: String,
-    correlate_tried: u32,
 }
 
 impl Hub {
@@ -327,23 +321,11 @@ impl Hub {
             last_state: s.state,
             watcher: None,
             pending_agent_id: String::new(),
-            correlate_tried: 0,
             ring: Arc::new(MessageRing::new()),
             last_stability: RcActivity::Unknown,
             pending_approvals: Vec::new(),
             pane_approval: PaneApprovalState::default(),
         }
-    }
-
-    /// Hands a freshly built watcher every event queued for its slug
-    /// (`drainPreWatcher`, `hub_ingest.go:185` — the Hub-level wrapper: the
-    /// cursorIngester type-assert lives here; a non-ingesting watcher leaves
-    /// the queue untouched for the TTL janitor).
-    pub(crate) fn drain_pre_watcher(&self, slug: &str, watcher: &dyn SessionWatcher) {
-        let Some(ing) = watcher.as_cursor_ingester() else {
-            return;
-        };
-        self.ingest.drain(slug, ing);
     }
 
     /// One enumeration+tick pass; broadcasts the resulting events
@@ -408,7 +390,6 @@ impl Hub {
                     ring: Arc::clone(&tr.ring),
                     pane_approval: tr.pane_approval.clone(),
                     pending_agent_id: tr.pending_agent_id.clone(),
-                    correlate_tried: tr.correlate_tried,
                 }
             };
 
@@ -418,13 +399,7 @@ impl Hub {
             // self-synchronized (tracker, ring, watcher) or reconcile-only
             // (the counters, committed back below). ---
             let mut pending_agent_id = snap.pending_agent_id;
-            let mut correlate_tried = snap.correlate_tried;
-            let new_w = self.ensure_watcher(
-                snap.watcher.is_some(),
-                &mut correlate_tried,
-                &mut pending_agent_id,
-                s,
-            );
+            let new_w = self.ensure_watcher(snap.watcher.is_some(), s);
             let watcher = new_w.clone().or(snap.watcher);
 
             // Derive activity. The pane-stability tracker is the universal
@@ -450,13 +425,13 @@ impl Hub {
             if let Some(w) = &watcher {
                 w.refresh(now);
                 // A deferred (ambiguous-correlation) back-write happens only
-                // once the first in-file event confirms the pick.
+                // once the first confirming event settles the pick.
                 if !pending_agent_id.is_empty() && w.had_event() {
                     back_write_agent_session(&tmux, &s.tmux_session, &pending_agent_id);
                     pending_agent_id.clear();
                 }
-                // The opencode/cursor watchers correlate ASYNC: once they pin
-                // the session id they surface it here for back-write into
+                // The opencode watcher correlates ASYNC: once it pins the
+                // session id it surfaces it here for back-write into
                 // SHED_RC_AGENT_SESSION, so a hub restart re-correlates
                 // exactly. A non-empty drain is always a fresh id to stamp.
                 if let Some(d) = w.as_confirmed_agent_id_drainer() {
@@ -540,15 +515,6 @@ impl Hub {
                     .expect("sole writer: the entry cannot vanish mid-pass");
                 if let Some(w) = &new_w {
                     tr.watcher = Some(Arc::clone(w));
-                    // SECOND drain of the cursor pre-watcher queue, the
-                    // load-bearing one: until the assignment above, the
-                    // ingest handler still saw watcher == None and kept
-                    // queueing; those events would land in a fresh queue
-                    // nothing ever drains (ensureWatcher no-ops once the
-                    // watcher is set). Draining HERE, immediately after the
-                    // publish, closes the window. Lock order: track → ingest
-                    // → watcher.mu.
-                    self.drain_pre_watcher(&s.slug, &**w);
                 }
                 // Only a publishing watcher owns this field: a kind whose
                 // approvals are not lane-derived must keep what it holds
@@ -562,7 +528,6 @@ impl Hub {
                 let episode_text = pane_approval.pending.then(|| pane_approval.text.clone());
                 tr.pane_approval = pane_approval;
                 tr.pending_agent_id = pending_agent_id;
-                tr.correlate_tried = correlate_tried;
                 if !cap_err {
                     // Remember the raw stability verdict for the input
                     // handler's acceptance re-check.
@@ -637,15 +602,12 @@ impl Hub {
                 .collect();
             for slug in gone {
                 if let Some(tr) = ts.tracked.remove(&slug) {
-                    // Release the watcher (its tail/SSE now points at a dead
-                    // session) and prune the slug's input lock (a recreate
-                    // later gets a fresh one; a request already holding the
-                    // old lock finishes against a gone pane harmlessly).
+                    // Release the watcher (its SSE connection now points at a
+                    // dead session).
                     if let Some(w) = tr.watcher {
                         w.close();
                     }
                 }
-                self.prune_input_lock(&slug);
                 events.push(session_gone_event(&slug));
             }
 
@@ -670,10 +632,6 @@ impl Hub {
         // spoken for — every tick, because a neighbour's pin usually does not
         // exist yet when the watcher is built.
         self.publish_claims();
-
-        // Janitor for the cursor ingest queues: runs after the track release —
-        // it takes its own lock and the two are never held together.
-        self.ingest.prune(now, &present);
 
         for e in &events {
             self.broadcast(e);
@@ -722,17 +680,18 @@ impl Hub {
     }
 
     /// Lazily builds a watchable session's structured-signal watcher,
-    /// RETURNING it (`ensureWatcher`, `hub_reconcile.go:557`; `None` when none
-    /// was created this call). Runs UNLOCKED from reconcile, so it must NOT
-    /// publish the watcher — the caller commits it under the track lock. It
-    /// DOES mutate the correlate/pending counters, which are reconcile-only
-    /// (passed by `&mut` here, committed back by the caller — the Rust shape
-    /// of Go mutating `tr` fields handlers never read).
+    /// RETURNING it (`ensureWatcher`, `hub_reconcile.go`; `None` when none was
+    /// created this call). Runs UNLOCKED from reconcile, so it must NOT publish
+    /// the watcher — the caller commits it under the track lock.
+    ///
+    /// opencode is the only watchable kind since A6 (`charliek/shed#322`)
+    /// removed the codex JSONL tail and the cursor hook-ingest lane. Its
+    /// watcher owns its OWN async correlation over SSE/REST (non-blocking
+    /// construction), so none of the file-correlation machinery the other two
+    /// needed survives here.
     fn ensure_watcher(
         &self,
         watcher_exists: bool,
-        correlate_tried: &mut u32,
-        pending_agent_id: &mut String,
         s: &RcSessionDto,
     ) -> Option<Arc<dyn SessionWatcher + Send + Sync>> {
         if watcher_exists || !watchable_kind(&s.kind) {
@@ -740,104 +699,38 @@ impl Hub {
         }
         match s.state {
             RcState::NeedsTrust | RcState::NeedsAuth | RcState::Dead => {
-                return None; // no live activity to tail; retry once usable
+                return None; // no live activity to watch; retry once usable
             }
             _ => {}
         }
         let tmux = Tmux::new(&*self.cfg.runner);
         let workdir = s.workdir.as_deref().unwrap_or("");
 
-        // opencode diverges from the file-correlation path: its watcher owns
-        // its OWN async correlation over SSE/REST (non-blocking construction)
-        // and needs none of the retry-budget machinery. A session with no
-        // valid recorded port is unwatchable over this transport → pane
-        // stability drives.
-        if s.kind == RcKind::Opencode {
-            let port = opencode_port_env(&tmux, &s.tmux_session)?;
-            // A prior back-written SHED_RC_AGENT_SESSION is the trusted pin;
-            // "" means the watcher searches its SSE stream for the id.
-            let agent_id = agent_session_env(&tmux, &s.tmux_session);
-            // When this RC session was created. opencode's store is shared per
-            // PROJECT, so `/session` lists a neighbouring RC session's
-            // conversations too and the directory alone cannot tell them
-            // apart — the watcher refuses to adopt one older than the session
-            // itself. Unparseable/absent → the epoch, which disables the check.
-            let not_before = s
-                .created_at
-                .as_deref()
-                .and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok())
-                .map(|t| t.with_timezone(&chrono::Utc))
-                .unwrap_or_else(|| chrono::DateTime::<chrono::Utc>::UNIX_EPOCH);
-            return Some(OpencodeWatcher::new(
-                port,
-                workdir,
-                &agent_id,
-                not_before,
-                Arc::clone(&self.cfg.now),
-                Some(Arc::clone(&self.cfg.logf)),
-            ));
-        }
-
-        // cursor diverges from BOTH paths: push-fed by the agent's own hook
-        // scripts — nothing to correlate, nothing to connect. Built on the
-        // first eligible tick, immediately usable; the pin arrives inside the
-        // hook payloads. The one construction-time step is draining the
-        // pre-watcher queue into it (the kickoff prompt above all), so those
-        // events fold on this very tick.
-        if s.kind == RcKind::Cursor {
-            let w = Arc::new(CursorWatcher::new(
-                &agent_session_env(&tmux, &s.tmux_session),
-                Some(Arc::clone(&self.cfg.logf)),
-            ));
-            self.drain_pre_watcher(&s.slug, &*w);
-            // Restart backfill: a VALIDATED prior pin (a hub restart
-            // mid-session) means there is a transcript worth reading once. A
-            // fresh session attempts no read at all. Best-effort.
-            let prior = w.prior_id();
-            if !prior.is_empty() {
-                w.seed_from_transcript(&(self.cfg.getenv)("HOME"), workdir, &prior);
-            }
-            return Some(w);
-        }
-
-        if *correlate_tried >= MAX_CORRELATE_TRIES {
-            return None;
-        }
-        *correlate_tried += 1;
-
-        let created_at = parse_jsonl_time(s.created_at.as_deref().unwrap_or(""));
+        // A session with no valid recorded port is unwatchable over this
+        // transport → pane stability drives.
+        let port = opencode_port_env(&tmux, &s.tmux_session)?;
+        // A prior back-written SHED_RC_AGENT_SESSION is the trusted pin;
+        // "" means the watcher searches its SSE stream for the id.
         let agent_id = agent_session_env(&tmux, &s.tmux_session);
-        let getenv: &dyn Fn(&str) -> String = &*self.cfg.getenv;
-
-        let (corr, fold): (_, Box<dyn super::watch::ActivityFold + Send>) =
-            if s.kind == RcKind::Codex {
-                (
-                    correlate_codex(getenv, workdir, &agent_id, created_at),
-                    Box::new(CodexFold::new()),
-                )
-            } else {
-                return None;
-            };
-        let corr = corr?;
-
-        // Unambiguous match → a bounded catch-up read so the current activity
-        // is known immediately. Ambiguous → follow only new appends (unknown
-        // until an event confirms which file is really this session's).
-        let w: Arc<dyn SessionWatcher + Send + Sync> =
-            Arc::new(FileWatcher::new(&corr.path, !corr.ambiguous, fold));
-        if !agent_id.is_empty() || corr.session_id.is_empty() {
-            return Some(w);
-        }
-        if corr.ambiguous {
-            // NEVER back-write an ambiguous pick immediately: a wrong id
-            // stamped into the tmux env would be trusted by the exact-id path
-            // on every future hub restart, making the mistake permanent. Held
-            // until the watcher's first in-file event confirms the pick.
-            *pending_agent_id = corr.session_id;
-            return Some(w);
-        }
-        back_write_agent_session(&tmux, &s.tmux_session, &corr.session_id);
-        Some(w)
+        // When this RC session was created. opencode's store is shared per
+        // PROJECT, so `/session` lists a neighbouring RC session's
+        // conversations too and the directory alone cannot tell them
+        // apart — the watcher refuses to adopt one older than the session
+        // itself. Unparseable/absent → the epoch, which disables the check.
+        let not_before = s
+            .created_at
+            .as_deref()
+            .and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok())
+            .map(|t| t.with_timezone(&chrono::Utc))
+            .unwrap_or_else(|| chrono::DateTime::<chrono::Utc>::UNIX_EPOCH);
+        Some(OpencodeWatcher::new(
+            port,
+            workdir,
+            &agent_id,
+            not_before,
+            Arc::clone(&self.cfg.now),
+            Some(Arc::clone(&self.cfg.logf)),
+        ))
     }
 }
 

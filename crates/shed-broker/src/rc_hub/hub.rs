@@ -18,15 +18,13 @@ use std::time::Duration;
 
 use axum::extract::{Path, State};
 use chrono::{DateTime, Utc};
-use shed_core::rc::{RcActivity, RcKind, RcSessionDto, RcState};
-use shed_core::rc_agents::approval_anchor_for;
+use shed_core::rc::{RcActivity, RcSessionDto, RcState};
 use shed_rc_engine::tmux::Tmux;
 use shed_rc_engine::tmux::TmuxRunner;
 
 use super::events::Subscriber;
-use super::ingest::PreWatcherQueues;
 use super::reconcile::TrackedSession;
-use super::watch::{merged_activity, LogFn, SessionWatcher};
+use super::watch::LogFn;
 
 /// The fixed loopback TCP port the rc hub listens on (`HubPort`, `hub.go:55`).
 /// 1029 sits just past the guest agent's 1028 TCP-proxy port; on a machine the
@@ -174,24 +172,19 @@ pub(crate) struct TrackState {
 
 /// A running rc hub (`Hub`, `hub.go:220`). Construct with [`Hub::new`].
 ///
-/// FOUR independent locks, with Go's documented order preserved
-/// (`hub.go:243-251`): `track` guards the reconcile state; `subs` is kept
-/// separate so broadcast can never deadlock against reconcile; `input_locks`
-/// holds the per-SLUG input mutexes (hub-keyed, NOT per tracked entry, so
-/// input serialization survives a tracked-entry replacement); `ingest` (inside
-/// [`PreWatcherQueues`]) guards the cursor pre-watcher queues. **Lock order:
-/// track → ingest → watcher.mu, never reversed** — reconcile is the one path
-/// holding track and ingest together (`drainPreWatcher` under the commit
-/// lock), and no path takes ingest first. `input_locks` ALSO nests inside
-/// track (never the reverse): reconcile's disappearance sweep calls
-/// [`Hub::prune_input_lock`] while still holding the track lock, exactly as Go
-/// does (`hub_reconcile.go:508`).
+/// TWO independent locks, with Go's documented order preserved
+/// (`hub.go:243-251`): `track` guards the reconcile state, and `subs` is kept
+/// separate so broadcast can never deadlock against reconcile. **Lock order:
+/// track → watcher.mu, never reversed.**
+///
+/// It held two more until A6 (`charliek/shed#322`): `input_locks` (the
+/// per-SLUG input-delivery mutexes) and `ingest` (the cursor pre-watcher
+/// queues). Both belonged to lanes that commit removed — `POST /input` answers
+/// 409 without touching a pane, and the ingest route is gone.
 pub struct Hub {
     pub(crate) cfg: HubResolved,
     pub(crate) track: Mutex<TrackState>,
     pub(crate) subs: Mutex<Vec<Arc<Subscriber>>>,
-    input_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
-    pub(crate) ingest: PreWatcherQueues,
 }
 
 impl Hub {
@@ -204,8 +197,6 @@ impl Hub {
                 idle_since: None,
             }),
             subs: Mutex::new(Vec::new()),
-            input_locks: Mutex::new(HashMap::new()),
-            ingest: PreWatcherQueues::new(),
         }
     }
 
@@ -218,30 +209,6 @@ impl Hub {
     /// reconcile.
     pub(crate) fn lock_subs(&self) -> std::sync::MutexGuard<'_, Vec<Arc<Subscriber>>> {
         self.subs.lock().unwrap_or_else(PoisonError::into_inner)
-    }
-
-    /// The slug's input-delivery mutex, created on first use (`inputLock`,
-    /// `hub.go:268`). The same slug always yields the same mutex until the
-    /// session disappears (pruned), so input serialization survives a
-    /// tracked-entry replacement (kill+recreate keeps the slug present →
-    /// keeps the lock).
-    pub(crate) fn input_lock(&self, slug: &str) -> Arc<Mutex<()>> {
-        let mut locks = self
-            .input_locks
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        Arc::clone(locks.entry(slug.to_string()).or_default())
-    }
-
-    /// Drops a disappeared slug's input mutex (`pruneInputLock`,
-    /// `hub.go:282`). A request still holding the old mutex finishes against a
-    /// gone pane (its delivery 404s); a later recreate at the same slug gets a
-    /// fresh lock.
-    pub(crate) fn prune_input_lock(&self, slug: &str) {
-        self.input_locks
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .remove(slug);
     }
 
     /// Whether the hub has held zero rc sessions for at least the idle
@@ -269,81 +236,11 @@ impl Hub {
             }
         }
     }
-    /// Whether a posted line may be delivered to the pane.
-    ///
-    /// **THE RULE: deliver unless the agent is blocked on a DECISION.**
-    ///
-    /// It used to be "deliver only while the session sits at its empty
-    /// composer", which was stricter than the program being typed into.
-    /// Captured live: text sent to codex mid-turn lands in its composer, the
-    /// footer offers "tab to queue message", and the line is answered as soon
-    /// as the current turn ends. cursor behaves the same. So a working agent is
-    /// not a reason to refuse — refusing it was the single biggest reason a
-    /// phone could not answer a question it could already see.
-    ///
-    /// The hazard the gate exists for is narrower than the rule it used to
-    /// implement. While an approval MODAL is up, keystrokes ANSWER THE MODAL —
-    /// cursor's options are literally y / tab / shift+tab / esc-or-n, and Enter
-    /// takes the highlighted "Run (once)". A sentence delivered there can run a
-    /// command nobody approved. That is what the three rejections are for, and
-    /// each rests on different evidence:
-    ///
-    /// 1. merged activity `needs_approval` — the derived/structured verdict.
-    /// 2. the watcher reports ANY open approval, DELIBERATELY ignoring
-    ///    transport health and freshness: the merge demotes an unhealthy
-    ///    watcher to pane stability, which would re-open exactly this hole with
-    ///    a real dialog on screen. A stale reject costs a retry; a stale accept
-    ///    costs an approval nobody meant to give. Also catches opencode
-    ///    QUESTIONS, which block the keyboard but never reach
-    ///    `pending_approvals`.
-    /// 3. the kind's approval anchor on the FRESH VISIBLE frame — the only
-    ///    evidence for kinds whose approvals reach no protocol (codex, cursor).
-    ///    The visible frame, never scrollback: an answered dialog stays in
-    ///    history verbatim and gating on it would wedge input forever.
-    ///    UNDEBOUNCED — one frame showing a dialog is enough to refuse.
-    ///
-    /// RESIDUAL, accepted and named: a transient widget that is not an approval
-    /// — a model picker, a file browser — also eats keystrokes, and no anchor
-    /// covers those. They appear because a HUMAN opened them at the TUI, which
-    /// is a different situation from a line arriving from a phone; and the
-    /// approval anchors ARE exhaustive over the decision surfaces that appear
-    /// on their own. This residual predates the rule change (the old design
-    /// recorded it too) — it is simply no longer masked by the composer
-    /// requirement.
-    ///
-    /// A blocking LIFECYCLE (needs-auth / needs-trust / dead) is rejected by
-    /// the caller before this is reached.
-    pub(crate) fn input_accepted(
-        &self,
-        watcher: Option<&dyn SessionWatcher>,
-        stability: RcActivity,
-        kind: &RcKind,
-        _pane: &str,
-        visible_pane: &str,
-    ) -> bool {
-        let mut watcher_act = RcActivity::Unknown;
-        let (mut watcher_fresh, mut expired_working) = (false, false);
-        if let Some(w) = watcher {
-            w.refresh((self.cfg.now)());
-            let (a, _msg, fresh, expired) = w.snapshot((self.cfg.now)());
-            (watcher_act, watcher_fresh, expired_working) = (a, fresh, expired);
-        }
-        let (merged, _) =
-            merged_activity(watcher_act, "", watcher_fresh, expired_working, stability);
-        if merged == RcActivity::NeedsApproval {
-            return false;
-        }
-        if watcher
-            .and_then(SessionWatcher::as_approval_blocker)
-            .is_some_and(|b| b.has_open_approvals())
-        {
-            return false;
-        }
-        if approval_anchor_for(kind).is_some_and(|a| a.is_match(visible_pane)) {
-            return false;
-        }
-        true
-    }
+    // `input_accepted` — the gated-input acceptance merge (merged
+    // needs_approval, the watcher's open-approval blocker, the kind's approval
+    // anchor on the fresh visible frame) — lived here. `POST /input` answers
+    // 409 `not_accepting` for every kind since A6 (`charliek/shed#322`), so
+    // nothing calls it.
 }
 
 /// The lifecycle-trumps-activity precedence rule (`DisplayActivity`,
@@ -438,11 +335,6 @@ pub struct HubSessionsResponse {
 pub(crate) struct InputRequest {
     #[serde(default, deserialize_with = "super::messages::null_default")]
     pub text: String,
-}
-
-#[derive(serde::Serialize)]
-struct Delivered {
-    delivered: bool,
 }
 
 /// `handleHealth` (`hub.go:388`).
@@ -608,10 +500,18 @@ async fn handle_messages(
     )
 }
 
-/// `handleInput` (`hub.go:455`): validate + re-derive live state under the
-/// per-session mutex, then deliver through the bracketed-paste path. 400
-/// invalid/unsafe text, 404 unknown/gone slug, 409 not accepting (wrong
-/// activity, recreated identity, or a non-input-gated kind), 413 too large.
+/// `handleInput` (`hub.go:455`). The route and its request validation survive
+/// A6 (`charliek/shed#322`); its DELIVERY does not. The gated lane — the
+/// per-slug delivery mutex, the pane re-verify, the approval-anchor/watcher
+/// acceptance merge — existed only for codex and cursor, whose derived lanes
+/// are gone, and `kind_features.input` is now "" for every TUI kind and "turn"
+/// for opencode. So no kind is `gated` any more and a well-formed request for a
+/// live session ends in 409 `not_accepting` rather than a keystroke.
+///
+/// Statuses (unchanged in every other respect): 400 invalid/unsafe text, 404
+/// unknown slug, 409 not accepting, 413 too large. Clients read
+/// `kind_features.input` to know which surface a kind takes (opencode:
+/// `POST /turn`).
 async fn handle_input(
     State(hub): State<Arc<Hub>>,
     Path(slug): Path<String>,
@@ -637,182 +537,30 @@ async fn handle_input(
         );
     }
 
-    // Look up the tracked session and snapshot the identity the re-check pins
-    // against (under the track lock — reconcile mutates tracked under it).
-    let (want_id, want_created_at) = {
+    // An unknown slug is still a 404 — the body validation above runs first so
+    // a malformed request is reported as malformed regardless of which slug it
+    // names. The read runs under the track lock; reconcile mutates tracked
+    // under the same lock.
+    {
         let ts = hub.lock_track();
-        match ts.tracked.get(&slug) {
-            Some(tr) => (tr.id.clone(), tr.created_at.clone()),
-            None => {
-                drop(ts);
-                return write_error(
-                    http::StatusCode::NOT_FOUND,
-                    "unknown_slug",
-                    "no such rc session",
-                );
-            }
+        if !ts.tracked.contains_key(&slug) {
+            drop(ts);
+            return write_error(
+                http::StatusCode::NOT_FOUND,
+                "unknown_slug",
+                "no such rc session",
+            );
         }
-    };
+    }
 
-    // The rest is sync tmux work under the per-slug input mutex — off the
-    // async runtime (§2.3: the input gate's fresh pane captures run under
-    // spawn_blocking).
-    let deliver_hub = Arc::clone(&hub);
-    tokio::task::spawn_blocking(move || {
-        deliver_hub.deliver_input(&slug, &text, &want_id, &want_created_at)
-    })
-    .await
-    .unwrap_or_else(|_| {
-        write_error(
-            http::StatusCode::INTERNAL_SERVER_ERROR,
-            "delivery_failed",
-            "input delivery failed",
-        )
-    })
+    write_error(
+        http::StatusCode::CONFLICT,
+        super::verbs::ERR_NOT_ACCEPTING,
+        "this kind does not accept feed input",
+    )
 }
 
 impl Hub {
-    /// The locked half of `handleInput` (`hub.go:489-597`): the per-SLUG
-    /// mutex (hub-keyed, not on the tracked entry) makes the acceptance
-    /// re-check + delivery one critical section — two concurrent posts can
-    /// never interleave keystrokes into one pane, even across a tracked-entry
-    /// replacement.
-    fn deliver_input(
-        &self,
-        slug: &str,
-        text: &str,
-        want_id: &str,
-        want_created_at: &str,
-    ) -> axum::response::Response {
-        use shed_rc_engine::ops::{
-            capture_pane_checked, capture_visible_pane_checked, EngineError,
-        };
-
-        let mu = self.input_lock(slug);
-        let _guard = mu.lock().unwrap_or_else(PoisonError::into_inner);
-
-        let name = shed_core::rc::tmux_name(slug);
-        let tmux = Tmux::new(&*self.cfg.runner).with_settle(self.cfg.send_settle);
-        // Maps a checked-capture failure: the session vanishing between the
-        // lookup and this re-capture is a 404; a transient tmux failure is a
-        // server error so the client retries rather than dropping the session.
-        fn capture_err(e: &EngineError) -> axum::response::Response {
-            if matches!(e, EngineError::SessionNotFound(_)) {
-                return write_error(
-                    http::StatusCode::NOT_FOUND,
-                    "unknown_slug",
-                    "rc session is gone",
-                );
-            }
-            write_error(
-                http::StatusCode::INTERNAL_SERVER_ERROR,
-                "capture_failed",
-                "pane re-capture failed",
-            )
-        }
-        let pane = match capture_pane_checked(&tmux, &name) {
-            Ok(p) => p,
-            Err(e) => return capture_err(&e),
-        };
-        let fresh =
-            shed_core::rc_agents::parse_session(&name, &tmux.show_environment(&name), &pane, None);
-
-        // Identity guard: the slug must still be the same incarnation.
-        if fresh.id.as_deref().unwrap_or("") != want_id
-            || fresh.created_at.as_deref().unwrap_or("") != want_created_at
-        {
-            return write_error(
-                http::StatusCode::CONFLICT,
-                super::verbs::ERR_NOT_ACCEPTING,
-                "session was recreated",
-            );
-        }
-        // The gated feed-input surface is DERIVED from the kind's advertised
-        // row: kind_features.input is single-valued, so a kind that graduates
-        // to a whole-turn lane stops accepting /input in the same edit that
-        // flips its row.
-        if super::verbs::kind_feature_row(&fresh.kind).input != super::verbs::INPUT_MODE_GATED {
-            return write_error(
-                http::StatusCode::CONFLICT,
-                super::verbs::ERR_NOT_ACCEPTING,
-                "this kind does not accept feed input",
-            );
-        }
-        // A blocking lifecycle state suppresses the activity dimension
-        // entirely — nothing is accepting typed input.
-        if display_activity(fresh.state, RcActivity::Working).is_none() {
-            return write_error(
-                http::StatusCode::CONFLICT,
-                super::verbs::ERR_NOT_ACCEPTING,
-                "session is not in an input-accepting state",
-            );
-        }
-
-        // Re-read the CURRENT watcher + stability under the track lock (they
-        // may have been replaced since the pre-lock lookup; identity was just
-        // re-verified above).
-        let (watcher, stability) = {
-            let ts = self.lock_track();
-            match ts.tracked.get(slug) {
-                Some(tr) => (tr.watcher.clone(), tr.last_stability),
-                None => (None, RcActivity::Unknown),
-            }
-        };
-
-        // Acceptance→delivery gap: re-capture HERE, as late as possible, and
-        // run the acceptance merge on THAT fresh pane. Residual (accepted):
-        // the few calls between this capture and send_line remain un-gated —
-        // tmux offers no atomic capture-and-send.
-        let deliver_pane = match capture_pane_checked(&tmux, &name) {
-            Ok(p) => p,
-            Err(e) => return capture_err(&e),
-        };
-        // The ApprovalAnchor arm needs the VISIBLE frame, not scrollback: an
-        // answered dialog stays in the history verbatim, and gating on that
-        // would wedge the session's input permanently. Captured only for
-        // anchor-declaring kinds; a capture failure is fail-CLOSED.
-        let mut visible_pane = String::new();
-        if approval_anchor_for(&fresh.kind).is_some() {
-            visible_pane = match capture_visible_pane_checked(&tmux, &name) {
-                Ok(p) => p,
-                Err(e) => return capture_err(&e),
-            };
-        }
-        if !self.input_accepted(
-            watcher.as_deref().map(|w| w as &dyn SessionWatcher),
-            stability,
-            &fresh.kind,
-            &deliver_pane,
-            &visible_pane,
-        ) {
-            return write_error(
-                http::StatusCode::CONFLICT,
-                super::verbs::ERR_NOT_ACCEPTING,
-                "session is not waiting for input",
-            );
-        }
-
-        // Deliver via the shared bracketed-paste path (single line →
-        // send-keys -l + Enter; multi-line → set-buffer + paste-buffer +
-        // Enter).
-        let res = tmux.send_line(&name, text);
-        if res.code != 0 {
-            if shed_rc_engine::tmux::is_missing_session(&res.stderr) {
-                return write_error(
-                    http::StatusCode::NOT_FOUND,
-                    "unknown_slug",
-                    "rc session is gone",
-                );
-            }
-            return write_error(
-                http::StatusCode::INTERNAL_SERVER_ERROR,
-                "delivery_failed",
-                "input delivery failed",
-            );
-        }
-        write_json(http::StatusCode::OK, &Delivered { delivered: true })
-    }
-
     /// The hub's HTTP routes (`handler`, `hub.go:296`). axum answers a wrong
     /// method on a known path 405 and an unknown path 404 automatically, like
     /// Go's method+wildcard ServeMux — rc-helper.md forbids clients from
@@ -842,13 +590,6 @@ impl Hub {
             .route(
                 "/v1/sessions/{slug}/approvals/{id}",
                 post(super::verbs::handle_approval),
-            )
-            // The cursor hook ingest route: called by a process INSIDE the
-            // shed (the preseeded hook script), never by the server proxy —
-            // which deliberately does not allowlist it.
-            .route(
-                "/v1/ingest/cursor",
-                post(super::ingest::handle_ingest_cursor),
             )
             .with_state(Arc::clone(self))
     }
@@ -1284,21 +1025,21 @@ fn shutdown(hub: &Arc<Hub>) {
     hub.close_all_watchers();
 }
 
-/// Starts the best-effort fsnotify layer over the codex JSONL root,
+/// Starts the best-effort fsnotify layer over the file-backed lanes' roots,
 /// forwarding each nudge into the reconcile loop's channel (`startFSNudger`,
 /// `hub.go:826`). `None` (no roots / fsnotify unavailable) leaves the tick as
 /// the sole driver — correctness unchanged, latency only. The forwarder
 /// thread (and its watcher) stops when the loop's receiver is dropped.
+///
+/// The one root this ever had was codex's `~/.codex/sessions`, removed with A6
+/// (`charliek/shed#322`): opencode's SSE stream is its own arrival signal, so
+/// the set is empty today and this returns `None`. The seam stays for the next
+/// file-backed lane.
 pub fn spawn_fs_nudger(
     hub: &Arc<Hub>,
     tx: std::sync::mpsc::Sender<LoopSignal>,
 ) -> Option<std::thread::JoinHandle<()>> {
-    let getenv: &dyn Fn(&str) -> String = &*hub.cfg.getenv;
-    let mut roots = Vec::new();
-    let codex_root = super::watch_codex::codex_sessions_root(getenv);
-    if !codex_root.is_empty() {
-        roots.push(codex_root);
-    }
+    let roots: Vec<String> = Vec::new();
     if roots.is_empty() {
         return None;
     }
@@ -1322,747 +1063,22 @@ pub fn spawn_fs_nudger(
 
 #[cfg(test)]
 mod tests {
-    use shed_core::rc_agents::{composer_under_modal, prompt_anchor_for};
+    use shed_core::rc::RcKind;
 
     use std::sync::Arc;
     use std::time::Duration;
 
-    use super::super::hub_test_support::{
-        codex_ready_pane, hook_ev, pane_fixture, rig, test_hub, StubApprovalWatcher, StubWatcher,
-        CURSOR_SID,
-    };
-    use super::super::watch::{CursorIngester, WATCHER_WORKING_GRACE};
-    use super::super::watch_cursor::CursorWatcher;
+    use super::super::hub_test_support::rig;
     use super::*;
 
-    fn settled_stub() -> StubWatcher {
-        StubWatcher {
-            activity: RcActivity::NeedsInput,
-            fresh: true,
-            ..StubWatcher::default()
-        }
-    }
-
-    /// `expiredCursorWatcher` (`cursor_approval_test.go:323`): an
-    /// expired-working verdict — the state a stuck cursor fold is in.
-    fn expired_stub() -> StubWatcher {
-        StubWatcher {
-            activity: RcActivity::Working,
-            expired_working: true,
-            ..StubWatcher::default()
-        }
-    }
-
-    // The per-slug input mutex is HUB-keyed: the same slug yields the same
-    // mutex until pruned, so input serialization survives a tracked-entry
-    // replacement (the unit half of TestHubInputLockSurvivesEntryReplacement
-    // — the HTTP half is `input_lock_survives_entry_replacement`).
-    #[test]
-    fn input_lock_survives_replacement_and_prunes() {
-        let h = test_hub();
-        let l1 = h.input_lock("abc123");
-        let l2 = h.input_lock("abc123");
-        assert!(Arc::ptr_eq(&l1, &l2), "same slug → same mutex");
-        h.prune_input_lock("abc123");
-        let l3 = h.input_lock("abc123");
-        assert!(!Arc::ptr_eq(&l1, &l3), "a pruned slug gets a fresh lock");
-    }
-
-    // Mirrors TestCursorInputGateAcceptsReadyRejectsApproval
-    // (cursor_approval_test.go:159).
-    #[test]
-    fn cursor_input_gate_accepts_ready_rejects_approval() {
-        let h = test_hub();
-        let settled = settled_stub();
-        let ready = pane_fixture("cursor-ready");
-        let approval = pane_fixture("cursor-ready-approval-shell");
-
-        assert!(
-            h.input_accepted(
-                Some(&settled),
-                RcActivity::NeedsInput,
-                &RcKind::Cursor,
-                &ready,
-                &ready
-            ),
-            "a ready cursor composer must accept feed input"
-        );
-        assert!(
-            !h.input_accepted(
-                Some(&settled),
-                RcActivity::NeedsInput,
-                &RcKind::Cursor,
-                &approval,
-                &approval
-            ),
-            "an approval prompt on the visible frame must reject input"
-        );
-        // The approval fixture still matches the READY/prompt anchor (cursor
-        // keeps its composer drawn, disabled, under the decision surface) —
-        // exactly why the approval arm has to exist.
-        assert!(
-            prompt_anchor_for(&RcKind::Cursor)
-                .expect("cursor prompt anchor")
-                .is_match(&approval),
-            "premise: the approval fixture still shows the composer anchor"
-        );
-        // Scrollback is not evidence about the present.
-        assert!(
-            h.input_accepted(
-                Some(&settled),
-                RcActivity::NeedsInput,
-                &RcKind::Cursor,
-                &approval,
-                &ready
-            ),
-            "an approval prompt only in the scrollback must not gate input"
-        );
-        // Post-resolution and quoted prose both flow again.
-        for fx in [
-            "cursor-ready-approval-resolved",
-            "cursor-ready-approval-quoted",
-        ] {
-            let pane = pane_fixture(fx);
-            assert!(
-                h.input_accepted(
-                    Some(&settled),
-                    RcActivity::NeedsInput,
-                    &RcKind::Cursor,
-                    &pane,
-                    &pane
-                ),
-                "{fx}: input must be accepted"
-            );
-        }
-    }
-
-    // Mirrors TestCursorInputGateRejectsExpiredWorkingUnderAnUnknownModal
-    // (cursor_approval_test.go:235).
-    #[test]
-    fn an_unanchored_widget_is_the_named_residual() {
-        let (h, _, clk) = rig();
-
-        // A cursor turn in flight, then the operator walks away: no `stop`
-        // ever arrives, so the verdict expires.
-        let w = CursorWatcher::new("", None);
-        w.push_hook_event(hook_ev(
-            "preToolUse",
-            &format!(
-                r#"{{"session_id":"{CURSOR_SID}","tool_name":"Delete","tool_input":{{"file_path":"/home/shed/proj/build.json"}}}}"#
-            ),
-        ));
-        w.refresh(clk.now());
-        clk.advance(WATCHER_WORKING_GRACE + Duration::from_secs(1));
-        let (_, _, fresh, expired) = w.snapshot(clk.now());
-        assert!(
-            !fresh && expired,
-            "premise: the verdict must be expired-working"
-        );
-
-        // A widget the anchor does not know, cursor's composer still drawn
-        // beneath it. THIS PINS THE NAMED RESIDUAL, not a protection: a
-        // decision surface no anchor covers is delivered into, and it always
-        // was — the old rule only ever refused this pane because a stuck
-        // verdict happened to fail an unrelated recovery condition, which the
-        // old test said in as many words.
-        //
-        // What keeps the residual small is that the anchors ARE exhaustive over
-        // the surfaces cursor raises on its own
-        // (cursor_approval_anchor_covers_every_decision_surface); a widget
-        // outside that set is one a person opened at the keyboard.
-        let unknown_modal =
-            pane_fixture("cursor-ready") + "\n Some future approval widget?\n   → Yes, do it (y)\n";
-        assert!(
-            !approval_anchor_for(&RcKind::Cursor)
-                .expect("anchor")
-                .is_match(&unknown_modal),
-            "premise: must NOT match the approval anchor"
-        );
-        assert!(
-            h.input_accepted(
-                Some(&w),
-                RcActivity::Idle,
-                &RcKind::Cursor,
-                &unknown_modal,
-                &unknown_modal
-            ),
-            "the residual: an unanchored widget is not detected"
-        );
-
-        // The legitimate case is unaffected: when `stop` DOES fire it settles
-        // the fold, and a settled verdict accepts however long it's been quiet.
-        w.push_hook_event(hook_ev(
-            "stop",
-            &format!(r#"{{"session_id":"{CURSOR_SID}","status":"completed"}}"#),
-        ));
-        w.refresh(clk.now());
-        clk.advance(Duration::from_secs(24 * 3600));
-        let ready = pane_fixture("cursor-ready");
-        assert!(
-            h.input_accepted(Some(&w), RcActivity::Idle, &RcKind::Cursor, &ready, &ready),
-            "a settled cursor verdict must still accept input"
-        );
-
-        // And a cursor session with NO watcher verdict at all keeps the
-        // degraded anchor path.
-        assert!(
-            h.input_accepted(None, RcActivity::Idle, &RcKind::Cursor, &ready, &ready),
-            "with no watcher verdict the composer anchor must still accept"
-        );
-    }
-
-    // Was TestCursorInputGateRejectsWhileWorking, and it is the assertion the
-    // rule change INVERTS: a working agent queues the line rather than losing
-    // it, so refusing was never protecting anything.
-    #[test]
-    fn cursor_input_gate_accepts_while_working() {
-        let (h, _, clk) = rig();
-
-        let w = CursorWatcher::new("", None);
-        w.push_hook_event(hook_ev(
-            "beforeSubmitPrompt",
-            &format!(r#"{{"session_id":"{CURSOR_SID}","prompt":"go"}}"#),
-        ));
-        w.refresh(clk.now());
-        let ready = pane_fixture("cursor-ready");
-        assert!(
-            h.input_accepted(
-                Some(&w),
-                RcActivity::NeedsInput,
-                &RcKind::Cursor,
-                &ready,
-                &ready
-            ),
-            "a working hook verdict is not a blocked one: the TUI queues the line"
-        );
-
-        w.push_hook_event(hook_ev(
-            "stop",
-            &format!(r#"{{"session_id":"{CURSOR_SID}","status":"completed"}}"#),
-        ));
-        w.refresh(clk.now());
-        assert!(
-            h.input_accepted(Some(&w), RcActivity::Idle, &RcKind::Cursor, &ready, &ready),
-            "a settled hook verdict must accept input"
-        );
-    }
-
-    // Mirrors TestCursorInputGateExpiredWorkingRealDialogRejected — THE
-    // F1-SAFETY PIN (cursor_approval_test.go:333): stability=needs_input is
-    // the worst case (the composer under the dialog settles, so recovery
-    // condition (b) holds) — only the exhaustive anchor stands between a
-    // posted line and the widget.
-    #[test]
-    fn cursor_input_gate_expired_working_real_dialog_rejected() {
-        let h = test_hub();
-        assert!(
-            approval_anchor_for(&RcKind::Cursor)
-                .expect("anchor")
-                .is_match(&pane_fixture("cursor-ready-approval-shell")),
-            "premise: the approval fixture matches the anchor on the visible frame"
-        );
-        for fx in [
-            "cursor-ready-approval-shell",
-            "cursor-ready-approval-delete",
-            "cursor-ready-approval-write",
-        ] {
-            let dialog = pane_fixture(fx);
-            assert!(
-                !h.input_accepted(
-                    Some(&expired_stub()),
-                    RcActivity::NeedsInput,
-                    &RcKind::Cursor,
-                    &dialog,
-                    &dialog
-                ),
-                "{fx}: an expired-working cursor with a real dialog on the visible frame must REJECT"
-            );
-        }
-    }
-
-    // Mirrors TestCursorInputGateExpiredWorkingIdleComposerRecovers — THE
-    // RECOVERY (cursor_approval_test.go:356).
-    #[test]
-    fn cursor_input_gate_expired_working_idle_composer_recovers() {
-        let h = test_hub();
-        let ready = pane_fixture("cursor-ready");
-        assert!(
-            !approval_anchor_for(&RcKind::Cursor)
-                .expect("anchor")
-                .is_match(&ready),
-            "premise: the clean composer must NOT match the ApprovalAnchor"
-        );
-        assert!(
-            h.input_accepted(
-                Some(&expired_stub()),
-                RcActivity::NeedsInput,
-                &RcKind::Cursor,
-                &ready,
-                &ready
-            ),
-            "expired-working + clean idle composer + settled needs_input must ACCEPT"
-        );
-        // A dialog answered long ago sits in the 200-line history (`pane`)
-        // while the visible frame is clean — still a recovery.
-        let stale = pane_fixture("cursor-ready-approval-shell");
-        assert!(
-            h.input_accepted(
-                Some(&expired_stub()),
-                RcActivity::NeedsInput,
-                &RcKind::Cursor,
-                &stale,
-                &ready
-            ),
-            "a dialog only in scrollback must not block the recovery"
-        );
-    }
-
-    // Was TestCursorInputGateExpiredWorkingUnsettledStabilityRejected. cursor's
-    // `stop` hook fires reliably only on a session's FIRST turn, so its verdict
-    // sits stuck at expired-working forever after — which under the old rule
-    // meant phone steering worked exactly once per session, and needed a
-    // guarded recovery arm to claw back. With working no longer a rejection,
-    // the whole stuck-verdict problem stops mattering: there is nothing to
-    // recover, because nothing was taken away.
-    #[test]
-    fn cursor_input_gate_accepts_on_a_stuck_expired_verdict() {
-        let h = test_hub();
-        let ready = pane_fixture("cursor-ready");
-        for stability in [
-            RcActivity::Working,
-            RcActivity::Idle,
-            RcActivity::NeedsInput,
-        ] {
-            assert!(
-                h.input_accepted(
-                    Some(&expired_stub()),
-                    stability,
-                    &RcKind::Cursor,
-                    &ready,
-                    &ready
-                ),
-                "stuck expired-working + {stability:?} stability: no dialog, so deliver"
-            );
-        }
-        // And the dialog still stops it — the recovery arm's real job.
-        let dialog = pane_fixture("cursor-ready-approval-shell");
-        assert!(
-            !h.input_accepted(
-                Some(&expired_stub()),
-                RcActivity::NeedsInput,
-                &RcKind::Cursor,
-                &dialog,
-                &dialog
-            ),
-            "a dialog on the visible frame still refuses"
-        );
-    }
-
-    // Mirrors TestCursorInputGateFreshFirstTurnAccepts
-    // (cursor_approval_test.go:400).
-    #[test]
-    fn cursor_input_gate_fresh_first_turn_accepts() {
-        let (h, _, clk) = rig();
-
-        let w = CursorWatcher::new("", None);
-        w.push_hook_event(hook_ev(
-            "beforeSubmitPrompt",
-            &format!(r#"{{"session_id":"{CURSOR_SID}","prompt":"go"}}"#),
-        ));
-        w.refresh(clk.now());
-        w.push_hook_event(hook_ev(
-            "stop",
-            &format!(r#"{{"session_id":"{CURSOR_SID}","status":"completed"}}"#),
-        ));
-        w.refresh(clk.now());
-        let (_, _, fresh, expired) = w.snapshot(clk.now());
-        assert!(
-            fresh && !expired,
-            "premise: a just-settled fold must be fresh, not expired"
-        );
-        let ready = pane_fixture("cursor-ready");
-        assert!(
-            h.input_accepted(
-                Some(&w),
-                RcActivity::NeedsInput,
-                &RcKind::Cursor,
-                &ready,
-                &ready
-            ),
-            "a fresh settled cursor fold (turn 1) must accept /input"
-        );
-    }
-
-    // Mirrors TestCursorInputGateCodexExpiredWorkingUnchanged
-    // (cursor_approval_test.go:424): the guarded arm is gated on
-    // ComposerUnderModal, FALSE for codex.
-    #[test]
-    fn cursor_input_gate_codex_expired_working_unchanged() {
-        let h = test_hub();
-        assert!(
-            !composer_under_modal(&RcKind::Codex),
-            "premise: codex must NOT declare ComposerUnderModal"
-        );
-        let ready = codex_ready_pane();
-        assert!(
-            h.input_accepted(
-                Some(&expired_stub()),
-                RcActivity::NeedsInput,
-                &RcKind::Codex,
-                &ready,
-                &ready
-            ),
-            "codex expired-working + settled needs_input + clean composer must accept"
-        );
-        let dialog = pane_fixture("codex-ready-approval-exec");
-        assert!(
-            !h.input_accepted(
-                Some(&expired_stub()),
-                RcActivity::NeedsInput,
-                &RcKind::Codex,
-                &dialog,
-                &dialog
-            ),
-            "codex expired-working + a dialog on the visible frame must reject via codex's own anchor"
-        );
-    }
-
-    // The open-approval blocker arm DELIBERATELY ignores transport
-    // health/freshness (the unit half of
-    // TestHubInputOpenApprovalRejectsWhenTransportUnhealthy): an UNFRESH
-    // watcher's merge falls to stability (needs_input — would accept), but an
-    // open ask still owns the keyboard. Also covers opencode QUESTIONS
-    // (blocked without a snapshot entry).
-    #[test]
-    fn input_gate_open_approval_rejects_when_transport_unhealthy() {
-        let h = test_hub();
-        let pane = "opencode\n> Ask anything...";
-        let blocked = StubApprovalWatcher {
-            stub: StubWatcher {
-                activity: RcActivity::Idle,
-                ..StubWatcher::default()
-            },
-            blocked: true,
-            ..StubApprovalWatcher::default()
-        };
-        assert!(
-            !h.input_accepted(
-                Some(&blocked),
-                RcActivity::NeedsInput,
-                &RcKind::Opencode,
-                pane,
-                ""
-            ),
-            "an open approval must reject even with the watcher unfresh"
-        );
-        let clear = StubApprovalWatcher {
-            stub: StubWatcher {
-                activity: RcActivity::Idle,
-                ..StubWatcher::default()
-            },
-            ..StubApprovalWatcher::default()
-        };
-        assert!(
-            h.input_accepted(
-                Some(&clear),
-                RcActivity::NeedsInput,
-                &RcKind::Opencode,
-                pane,
-                ""
-            ),
-            "no open approvals + settled stability at the composer must accept"
-        );
-    }
-
-    // The SEVEN-ARM table, pinned by ARM IDENTITY (plan 010 AC2): each row
-    // names the arm that decides it, with inputs that make every EARLIER arm
-    // pass through — so a precedence reorder fails the table even where the
-    // outcome would coincide.
-    #[test]
-    fn the_three_rejections_and_nothing_else() {
-        // THE CONTRACT: a posted line is delivered unless the agent is blocked
-        // on a decision. Working is not blocked — codex and cursor both accept
-        // text mid-turn and queue it (captured live), so refusing it only ever
-        // meant a person could not answer a question they could already see.
-        let h = test_hub();
-        let cursor_ready = pane_fixture("cursor-ready");
-        let cursor_dialog = pane_fixture("cursor-ready-approval-shell");
-        let codex_ready = codex_ready_pane();
-        let codex_dialog = pane_fixture("codex-ready-approval-exec");
-
-        // REJECTION 1 — merged needs_approval (the lane-derived verdict).
-        let fresh_approval = StubWatcher {
-            activity: RcActivity::NeedsApproval,
-            fresh: true,
-            ..StubWatcher::default()
-        };
-        assert!(
-            !h.input_accepted(
-                Some(&fresh_approval),
-                RcActivity::NeedsInput,
-                &RcKind::Opencode,
-                "opencode\n> Ask anything...",
-                ""
-            ),
-            "rejection 1: merged needs_approval"
-        );
-
-        // REJECTION 2 — an open approval on the watcher, even with merged idle
-        // and a clean pane. Freshness is deliberately NOT consulted: a wedged
-        // stream must not re-open the hole with a real dialog on screen.
-        let blocked = StubApprovalWatcher {
-            stub: StubWatcher {
-                activity: RcActivity::Idle,
-                fresh: true,
-                ..StubWatcher::default()
-            },
-            blocked: true,
-            ..StubApprovalWatcher::default()
-        };
-        assert!(
-            !h.input_accepted(
-                Some(&blocked),
-                RcActivity::Idle,
-                &RcKind::Opencode,
-                "opencode\n> Ask anything...",
-                ""
-            ),
-            "rejection 2: an open approval blocks the keyboard"
-        );
-
-        // REJECTION 3 — the kind's approval anchor on the VISIBLE frame, for
-        // both anchor-declaring kinds. This is the one that matters most: a
-        // sentence delivered under these dialogs would answer them.
-        for (kind, dialog) in [
-            (RcKind::Cursor, &cursor_dialog),
-            (RcKind::Codex, &codex_dialog),
-        ] {
-            assert!(
-                !h.input_accepted(None, RcActivity::NeedsInput, &kind, dialog, dialog),
-                "rejection 3: {} dialog on the visible frame",
-                kind.as_str()
-            );
-        }
-
-        // ACCEPTED — everything else, including the cases the old composer-only
-        // rule refused.
-        let fresh_working = StubWatcher {
-            activity: RcActivity::Working,
-            fresh: true,
-            ..StubWatcher::default()
-        };
-        assert!(
-            h.input_accepted(
-                Some(&fresh_working),
-                RcActivity::Working,
-                &RcKind::Codex,
-                &codex_ready,
-                &codex_ready
-            ),
-            "a working agent QUEUES the line — that is what its own TUI does"
-        );
-        assert!(
-            h.input_accepted(None, RcActivity::Idle, &RcKind::Cursor, &cursor_ready, &cursor_ready),
-            "no watcher, no dialog: deliver"
-        );
-        // A dialog in SCROLLBACK is history, not the present tense: gating on
-        // it would wedge the session's input forever.
-        assert!(
-            h.input_accepted(
-                None,
-                RcActivity::Idle,
-                &RcKind::Cursor,
-                &cursor_dialog,
-                &cursor_ready
-            ),
-            "an answered dialog still in scrollback must not block anything"
-        );
-    }
-
-    // Mirrors TestHubInputNeedsApprovalRejected (`hub_input_test.go:339`):
-    // the gate is driven by the MERGE — a fresh needs_approval rejects, a
-    // stale one yields to the settled stability verdict.
-    #[test]
-    fn input_needs_approval_rejected_via_merge() {
-        let h = test_hub();
-        let ready = "opencode\n> Ask anything...";
-        let blocked = StubWatcher {
-            activity: RcActivity::NeedsApproval,
-            fresh: true,
-            ..StubWatcher::default()
-        };
-        assert!(
-            !h.input_accepted(
-                Some(&blocked),
-                RcActivity::NeedsInput,
-                &RcKind::Opencode,
-                ready,
-                ready
-            ),
-            "a fresh needs_approval watcher must reject even on an anchored pane"
-        );
-        let stale = StubWatcher {
-            activity: RcActivity::NeedsApproval,
-            ..StubWatcher::default()
-        };
-        assert!(
-            h.input_accepted(
-                Some(&stale),
-                RcActivity::NeedsInput,
-                &RcKind::Opencode,
-                ready,
-                ready
-            ),
-            "a stale needs_approval watcher must yield to the settled stability verdict"
-        );
-    }
-
-    // Mirrors TestHubInputApprovalAnchorRejected (`hub_input_test.go:396`):
-    // codex's real anchor against the committed fixtures, with a FRESH
-    // settled watcher (the verdict that otherwise short-circuits to accept).
-    #[test]
-    fn input_approval_anchor_rejected_codex_fixtures() {
-        let h = test_hub();
-        assert!(approval_anchor_for(&RcKind::Codex).is_some());
-        let settled = settled_stub();
-        for fx in ["codex-ready-approval-exec", "codex-ready-approval-network"] {
-            let pane = pane_fixture(fx);
-            assert!(
-                !h.input_accepted(
-                    Some(&settled),
-                    RcActivity::NeedsInput,
-                    &RcKind::Codex,
-                    &pane,
-                    &pane
-                ),
-                "{fx}: an approval dialog on the fresh pane must reject input"
-            );
-        }
-        for fx in [
-            "codex-ready-approval-resolved",
-            "codex-ready-approval-quoted",
-        ] {
-            let pane = pane_fixture(fx);
-            assert!(
-                h.input_accepted(
-                    Some(&settled),
-                    RcActivity::NeedsInput,
-                    &RcKind::Codex,
-                    &pane,
-                    &pane
-                ),
-                "{fx}: input must flow again"
-            );
-        }
-        let ready = codex_ready_pane();
-        assert!(h.input_accepted(
-            Some(&settled),
-            RcActivity::NeedsInput,
-            &RcKind::Codex,
-            &ready,
-            &ready
-        ));
-        // The arm reads the VISIBLE frame, never the scrollback.
-        assert!(
-            h.input_accepted(
-                Some(&settled),
-                RcActivity::NeedsInput,
-                &RcKind::Codex,
-                &pane_fixture("codex-ready-approval-exec"),
-                &ready
-            ),
-            "a dialog present ONLY in the scrollback must not gate input"
-        );
-    }
-
-    // Mirrors TestHubInputAcceptedWatcherBranch (`hub_input_test.go:434`): a
-    // FRESH JSONL verdict (a real FileWatcher over a real codex fold) wins
-    // over the pane anchor in both directions.
-    #[test]
-    fn input_accepted_watcher_branch_with_real_fold() {
-        use super::super::watch::FileWatcher;
-        use super::super::watch_codex::CodexFold;
-        let (h, _f, clk) = rig();
-        let dir = std::env::temp_dir().join(format!("rc-hub-gate-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-
-        // A settled turn → needs_input, authoritative even with no anchor.
-        let settled = dir.join("settled.jsonl");
-        std::fs::write(
-            &settled,
-            "{\"type\":\"event_msg\",\"payload\":{\"type\":\"task_complete\",\"last_agent_message\":\"done\"}}\n",
-        )
-        .unwrap();
-        let w = FileWatcher::new(settled.to_str().unwrap(), true, Box::new(CodexFold::new()));
-        w.refresh(clk.now());
-        assert!(
-            h.input_accepted(
-                Some(&w),
-                RcActivity::Working,
-                &RcKind::Codex,
-                "no anchor here",
-                "no anchor here"
-            ),
-            "a fresh needs_input watcher must accept regardless of the pane anchor"
-        );
-
-        // An open tool call → working, and that is DELIVERED: the pane queues
-        // it. (This assertion was inverted with the rule; the fold behaviour it
-        // exercises — a real codex JSONL producing a working verdict — is
-        // unchanged.)
-        let working = dir.join("working.jsonl");
-        std::fs::write(
-            &working,
-            "{\"type\":\"event_msg\",\"payload\":{\"type\":\"task_started\"}}\n{\"type\":\"response_item\",\"payload\":{\"type\":\"custom_tool_call\",\"call_id\":\"c1\",\"name\":\"exec\"}}\n",
-        )
-        .unwrap();
-        let ready = codex_ready_pane();
-        let w2 = FileWatcher::new(working.to_str().unwrap(), true, Box::new(CodexFold::new()));
-        w2.refresh(clk.now());
-        assert!(
-            h.input_accepted(
-                Some(&w2),
-                RcActivity::Working,
-                &RcKind::Codex,
-                &ready,
-                &ready
-            ),
-            "a fresh working watcher must reject even with the composer anchor present"
-        );
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    // Was TestHubInputLongQuietWorkingRejected: a >120s tool call is a live
-    // turn, and the old rule refused to type into one. That is exactly the case
-    // a person most wants — the agent is grinding on something and you have a
-    // correction — and the TUI itself takes it. Both stability verdicts now
-    // deliver; what still refuses is a dialog, tested elsewhere.
-    #[test]
-    fn input_during_a_long_tool_call_is_delivered() {
-        use super::super::watch::FileWatcher;
-        use super::super::watch_codex::CodexFold;
-        let (h, _f, clk) = rig();
-        let dir = std::env::temp_dir().join(format!("rc-hub-lqw-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let long = dir.join("long.jsonl");
-        std::fs::write(
-            &long,
-            "{\"type\":\"event_msg\",\"payload\":{\"type\":\"task_started\"}}\n{\"type\":\"response_item\",\"payload\":{\"type\":\"custom_tool_call\",\"call_id\":\"c1\",\"name\":\"exec\"}}\n",
-        )
-        .unwrap();
-        let w = FileWatcher::new(long.to_str().unwrap(), true, Box::new(CodexFold::new()));
-        w.refresh(clk.now());
-        clk.advance(WATCHER_WORKING_GRACE + Duration::from_secs(1));
-
-        let ready = codex_ready_pane();
-        for stability in [RcActivity::Working, RcActivity::Idle] {
-            assert!(
-                h.input_accepted(Some(&w), stability, &RcKind::Codex, &ready, &ready),
-                "mid-tool-call with {stability:?} stability: the TUI queues it"
-            );
-        }
-        let _ = std::fs::remove_dir_all(&dir);
-    }
+    // The gated-input unit suite lived here: the per-slug mutex identity/prune
+    // cell, the cursor and codex input-gate arms (ready/approval/working/
+    // expired-working/stuck-verdict), the three-rejections matrix, the
+    // approval-anchor and needs-approval merge arms, and the real-fold
+    // acceptance branch. All of it belonged to `input_accepted` and the
+    // per-slug delivery lock, which went with the gated lane in A6
+    // (`charliek/shed#322`); `POST /input` answers 409 `not_accepting` for
+    // every kind now (`hub_http_tests.rs`).
 
     // The reconcile-loop driver (`serveOn`'s loop half): nudges reconcile
     // sub-tick, Stop ends the loop, and the idle-exit decision closes

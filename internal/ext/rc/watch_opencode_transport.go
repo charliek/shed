@@ -131,13 +131,12 @@ var (
 	_ sessionWatcher          = (*opencodeWatcher)(nil)
 	_ confirmedAgentIDDrainer = (*opencodeWatcher)(nil)
 	_ approvalPublisher       = (*opencodeWatcher)(nil)
-	_ approvalBlocker         = (*opencodeWatcher)(nil)
 )
 
 // confirmedAgentIDDrainer is the second, small interface reconcile type-asserts on a
 // watcher (parallel to messageProducer on the fold): a stream-discovered agent session id
 // the transport back-writes into SHED_RC_AGENT_SESSION so a hub restart re-correlates
-// exactly. Only opencodeWatcher implements it — the fileWatchers correlate off-line.
+// exactly. Only opencodeWatcher implements it.
 type confirmedAgentIDDrainer interface {
 	drainConfirmedAgentID() string
 }
@@ -165,14 +164,6 @@ type claimHolder interface {
 // opencodeWatcher implements it today; a watcher that does not leaves the snapshot untouched.
 type approvalPublisher interface {
 	pendingApprovals() []FeedApproval
-}
-
-// approvalBlocker is the input gate's counterpart to approvalPublisher: "is this session
-// currently blocked on an approval it would type an answer into?". Separate because it is a
-// STRICTLY WIDER question than the snapshot — it counts open questions too, which are never
-// addressable and so never appear in pending_approvals, yet own the keyboard exactly the same.
-type approvalBlocker interface {
-	hasOpenApprovals() bool
 }
 
 // inboxKind discriminates the records the goroutine pushes onto the inbox.
@@ -301,7 +292,7 @@ func newLoopbackClient() *http.Client {
 // ---- sessionWatcher surface ----
 
 // refresh drains the inbox under the mutex and folds each payload into the (single-writer)
-// fold, mirroring fileWatcher.refresh but sourced from the inbox rather than a lineTailer.
+// fold.
 // A seedComplete marker flips the transport authoritative (seedApplied); an overflowGap
 // marker drops record-exact state (noteGap). A CLOSED watcher no-ops.
 func (w *opencodeWatcher) refresh(now time.Time) {
@@ -400,7 +391,7 @@ func (w *opencodeWatcher) drainPending() []feedMessage {
 }
 
 // hadEvent reports whether the fold has consumed at least one activity-relevant event
-// since attach (used to confirm an ambiguous correlation). Mirrors fileWatcher.hadEvent.
+// since attach (used to confirm an ambiguous correlation).
 func (w *opencodeWatcher) hadEvent() bool {
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -718,13 +709,12 @@ func (w *opencodeWatcher) pendingApprovals() []FeedApproval {
 	return w.fold.pendingApprovals()
 }
 
-// hasOpenApprovals reports whether ANY ask (permission or question) is still open, for the
-// input gate (approvalBlocker). Deliberately independent of transport health and freshness:
-// when the stream wedges, the activity verdict is demoted to pane stability and the gate's
-// merged-needs_approval arm stops firing — but a dialog the operator has not answered is still
-// on the pane, and a posted line would answer it by accident. The asymmetry is intentional:
-// a stale reject costs a retry after the next reseed, a stale accept costs an unintended
-// approval. A CLOSED watcher blocks nothing (its session is gone).
+// hasOpenApprovals reports whether ANY ask (permission or question) is still open — a
+// STRICTLY WIDER question than pendingApprovals, because it counts questions too, which
+// are never addressable and so never appear in pending_approvals. It fed the gated-input
+// blocker until A6 (charliek/shed#322) retired that lane; it stays as the fold's
+// open-ask predicate. Deliberately independent of transport health and freshness. A
+// CLOSED watcher reports nothing open (its session is gone).
 func (w *opencodeWatcher) hasOpenApprovals() bool {
 	w.mu.Lock()
 	defer w.mu.Unlock()

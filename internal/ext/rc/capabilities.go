@@ -217,10 +217,10 @@ func BuildCapabilities(probe AgentProbe, installed InstalledProbe) Capabilities 
 // The emitted matrix (pinned exhaustively by capabilities_test.go):
 //
 //	kind      | post_input | approvals | watch | input | feed     | interrupt | attach
-//	claude-rc | true       | tui       | false | ""    | activity | false     | tmux
-//	codex     | true       | tui       | true  | gated | messages | false     | tmux
+//	claude-rc | true       | tui       | false | ""    | none     | false     | tmux
+//	codex     | true       | tui       | false | ""    | none     | false     | tmux
 //	opencode  | true       | remote    | true  | turn  | messages | true      | tmux
-//	cursor    | true       | tui       | true  | gated | messages | false     | tmux
+//	cursor    | true       | tui       | false | ""    | none     | false     | tmux
 func kindFeatures() map[Kind]KindFeatures {
 	out := map[Kind]KindFeatures{}
 	for _, k := range allKinds {
@@ -228,41 +228,32 @@ func kindFeatures() map[Kind]KindFeatures {
 			continue
 		}
 		// The BASE row is a TUI-lane session: approvals answered on the pane, a terminal
-		// reaching it by attaching to tmux, no turn/interrupt verb, no feed input.
-		// "activity" is the feed floor — the hub's stability/transcript engines derive the
-		// activity dimension for every watched kind even where no message feed exists.
-		// Each divergent kind then states its WHOLE row once (no layered overrides), so a
-		// field's value is readable without simulating the assignments above it.
+		// reaching it by attaching to tmux, no turn/interrupt verb, no feed input, and —
+		// since A6 (charliek/shed#322) retired the claude transcript tail, the codex
+		// rollout tail and the cursor hook-ingest lane — NO HUB SIGNAL AT ALL. `feed` is
+		// therefore "none", not "activity": `activity` claims the hub can stream the
+		// activity dimension, and with no producer left that would be a false claim under
+		// the contract's own definition (docs/extensions/rc-helper.md). roost is the status
+		// authority for these kinds now. Each divergent kind then states its WHOLE row once
+		// (no layered overrides), so a field's value is readable without simulating the
+		// assignments above it.
 		kf := KindFeatures{
 			PostInput: AcceptsTypedInput(k),
 			Approvals: "tui",
-			Feed:      "activity",
+			Feed:      "none",
 			Attach:    "tmux",
 		}
 		switch k {
-		case KindCodex:
-			// codex's rollout JSONL is folded into a normalized message feed, and its
-			// composer anchor gates POST /input acceptance.
-			kf.Feed, kf.Input = "messages", inputModeGated
 		case KindOpencode:
-			// opencode is the first LIVE lane: its TUI runs an embedded HTTP+SSE server
+			// opencode is the ONLY live lane: its TUI runs an embedded HTTP+SSE server
 			// the hub steers through (watch_opencode_transport.go's verb lane), so whole
 			// turns, interrupts and approvals all go through the hub rather than the pane.
-			// `input` is single-valued, so "turn" REPLACES the "gated" codex spelling:
-			// POST /input no longer applies to opencode (a behavior break for hub clients
-			// — the turn verb is the steering surface, and the create/prompt kickoff path
-			// still delivers the first prompt via post_input). The divergence from codex
-			// is deliberate; the two rows are no longer asserted equal.
+			// `input` is single-valued and "turn" is the only value left on the wire:
+			// POST /input applies to no kind at all now (the turn verb is the steering
+			// surface, and the create/prompt kickoff path still delivers the first prompt
+			// via post_input).
 			kf.Feed, kf.Input = "messages", inputModeTurn
 			kf.Approvals, kf.Interrupt = approvalsRemote, true
-		case KindCursor:
-			// cursor's own hook scripts push its turn boundaries, tool calls and messages
-			// into the hub (watch_cursor.go), which is a normalized message feed — and its
-			// composer anchor gates POST /input exactly as codex's does. `gated` (not
-			// `turn`) because the delivery is still the pane: cursor has no protocol to
-			// take a whole turn through. approvals stays "tui": there is nothing the hub
-			// can honor remotely, only the pane-anchor signal that the TUI is asking.
-			kf.Feed, kf.Input = "messages", inputModeGated
 		}
 		// watch is the deprecated spelling of feed == "messages"; derived here rather
 		// than set by hand so the two cannot drift (invariant-tested besides).

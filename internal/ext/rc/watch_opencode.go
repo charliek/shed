@@ -8,9 +8,9 @@ import (
 )
 
 // opencodeFold folds an opencode session's /event envelope stream into an activity
-// verdict AND a normalized message feed (drainMessages), mirroring codexFold's shape.
-// Unlike codex (a tailed append-only JSONL file) opencode is a client/server model: the
-// hub subscribes to the embedded HTTP+SSE server's /event endpoint as a second client.
+// verdict AND a normalized message feed (drainMessages). opencode is a client/server
+// model: the hub subscribes to the embedded HTTP+SSE server's /event endpoint as a
+// second client, rather than tailing a file on disk.
 // This file is the PURE fold only — no network/transport (that is the opencodeWatcher in
 // watch_opencode_transport.go) and no correlation (that is correlateOpencode). The fold
 // is SESSION-SCOPED: it assumes every envelope it is handed already belongs to its

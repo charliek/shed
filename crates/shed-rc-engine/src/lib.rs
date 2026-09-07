@@ -64,7 +64,6 @@ pub mod netutil;
 pub mod ops;
 pub mod plan;
 pub mod preseed;
-pub mod preseed_cursor;
 pub mod text;
 pub mod tmux;
 pub mod trust;

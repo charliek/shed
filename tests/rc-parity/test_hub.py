@@ -7,24 +7,31 @@ H1½ Go-only phase) — the frozen `/v1` wire — and since H12 both legs answer
 them equality-then-pin under this canonicalization.
 
 Every cell that needs a session uses a pinned slug and polls the hub until the
-reconcile loop has tracked it; nothing here sleeps. The codex kind is the
-snapshot workhorse: watchable (so the tracked path is exercised), the three
-contract-v2 verbs deterministically rejected (`not_supported` — codex
-advertises none), and its static shim pane settles to a stable activity under
-the fast-tick tuning. `input` is NOT in this family's tracked-session cells on
-purpose: codex input is `gated` (it would type into the live shim pane) — the
-delivery path is the side-effect family's territory (`test_hub_effects.py`).
+reconcile loop has tracked it; nothing here sleeps.
+
+Two kinds carry this family, for two different reasons:
+
+* **codex** is the CAPABILITY workhorse: it advertises none of the contract-v2
+  verbs, and since A6 (charliek/shed#322) no `feed`/`input` either — so its
+  matrix cells pin the kind-based 409s, `input` now among them.
+* **opencode** is the only WATCHABLE kind left (A6 retired the codex rollout
+  tail and the cursor hook-ingest lane), so the `/messages` cells — which are
+  lane-agnostic hub contracts that merely happened to ride a codex session —
+  moved onto it, through the shared `hub_opencode.lane_session` setup that
+  `test_hub_lane.py` already used.
 """
 
 import json
 
 import pytest
 
+from hub_opencode import lane_session
 from normalize import mask_hub_health, mask_hub_sessions
 
 pytestmark = pytest.mark.hub
 
 CODEX_SLUG = "hub111"
+OC_SLUG = "hubmsg1"
 
 # A slug no cell ever creates — the unknown-session arm of every matrix.
 MISSING_SLUG = "nosuch"
@@ -121,17 +128,24 @@ def test_sessions_overlay_codex_settled(hub_differential, hub_leg):
 
 
 def test_messages_empty_ring(hub_differential, hub_leg):
-    """`GET /messages` on a tracked codex session with an empty ring (no JSONL
-    was ever correlated — the hermetic HOME has no rollout files)."""
+    """`GET /messages` on a tracked, WATCHED opencode session whose lane has
+    produced nothing yet — the empty page a live feed answers before its first
+    row. (It rode a codex session until A6 — charliek/shed#322 — retired that
+    kind's tail; opencode is the only watchable kind left, and the contract
+    under test was never codex-specific.)"""
+
+    fakes = []
 
     def scenario(impl):
         leg = hub_leg(impl)
-        _tracked_codex(leg)
-        return _status_body(
-            leg.hub_request("GET", f"/v1/sessions/{CODEX_SLUG}/messages")
-        )
+        lane_session(leg, fakes, OC_SLUG, "hub-msg")
+        return _status_body(leg.hub_request("GET", f"/v1/sessions/{OC_SLUG}/messages"))
 
-    hub_differential(scenario)
+    try:
+        hub_differential(scenario)
+    finally:
+        for fake in fakes:
+            fake.stop()
 
 
 # Explicit `pytest.param` ids on every cell below: the golden filename is the
@@ -153,17 +167,25 @@ BEYOND_TAIL = pytest.param("?since=1", id="beyond_tail_truncated")
 
 @pytest.mark.parametrize("query", PAGING_CELLS + [BEYOND_TAIL])
 def test_messages_paging_rejections(hub_differential, hub_leg, query):
-    """The `since`/`limit` validation matrix on a REAL tracked session (so the
-    rejection is provably about the query, not the slug)."""
+    """The `since`/`limit` validation matrix on a REAL tracked, WATCHED session
+    (so the rejection is provably about the query, not the slug — and reaches a
+    handler a feed-bearing kind actually uses). On opencode since A6
+    (charliek/shed#322); the validation itself is lane-agnostic."""
+
+    fakes = []
 
     def scenario(impl):
         leg = hub_leg(impl)
-        _tracked_codex(leg)
+        lane_session(leg, fakes, OC_SLUG, "hub-msg")
         return _status_body(
-            leg.hub_request("GET", f"/v1/sessions/{CODEX_SLUG}/messages{query}")
+            leg.hub_request("GET", f"/v1/sessions/{OC_SLUG}/messages{query}")
         )
 
-    hub_differential(scenario)
+    try:
+        hub_differential(scenario)
+    finally:
+        for fake in fakes:
+            fake.stop()
 
 
 def test_messages_unknown_slug(hub_differential, hub_leg):
@@ -205,6 +227,14 @@ VERB_CELLS = [
     # 409 not_supported — codex advertises none of the three verbs.
     pytest.param("turn", json.dumps({"text": "hi"}), True, id="turn_codex_not_supported"),
     pytest.param("interrupt", "", True, id="interrupt_codex_not_supported"),
+    # 409 not_accepting — the behavior A6 (charliek/shed#322) left on /input.
+    # No kind is `gated` any more, so a VALID body on a LIVE, tracked session
+    # is refused by the kind gate rather than delivered to the pane; the 400/
+    # 404/413 arms above are untouched. This cell is what keeps the surviving
+    # `/input` contract pinned now that the delivery cell is gone.
+    pytest.param(
+        "input", json.dumps({"text": "hi"}), True, id="input_codex_not_accepting"
+    ),
 ]
 
 

@@ -360,37 +360,8 @@ def test_claude_config_merge_survives_go_on_top_of_a_rust_writer(
     assert '"fullscreenUpsellSeenCount": 999' in differential(scenario)
 
 
-def test_cursor_hooks_merge_survives_a_rust_writer_on_top_of_go(
-    differential, shared, tmp_path
-):
-    """`~/.cursor/hooks.json` across the boundary: the idempotent entry match is
-    keyed on `shellQuote(scriptPath)`, so a quoting drift between the two writers
-    would show up here as a DUPLICATED hook entry (ten entries become twenty) —
-    which is why the always-quote form was ported verbatim rather than reusing a
-    conditional quoter."""
-
-    def scenario(impl):
-        rig = shared(f"hooks-second-{impl}")
-        return mask_file_bytes(
-            _second_writer_bytes(rig, "go", impl, ".cursor/hooks.json", "cursor", tmp_path),
-            str(rig.home),
-        )
-
-    document = differential(scenario)
-    assert document.count("cursor-hook.sh") == 10, document
-
-
-def test_cursor_hooks_merge_survives_go_on_top_of_a_rust_writer(
-    differential, shared, tmp_path
-):
-    """The mirror: Rust writes the hooks file first, Go merges on top."""
-
-    def scenario(impl):
-        rig = shared(f"hooks-first-{impl}")
-        return mask_file_bytes(
-            _second_writer_bytes(rig, impl, "go", ".cursor/hooks.json", "cursor", tmp_path),
-            str(rig.home),
-        )
-
-    document = differential(scenario)
-    assert document.count("cursor-hook.sh") == 10, document
+# The two `~/.cursor/hooks.json` cross-writer cells lived here — the mixed-fleet
+# proof that a quoting drift between the Go and Rust hook writers would show up
+# as duplicated entries. They went with the cursor hook-relay preseed in A6
+# (charliek/shed#322): neither implementation writes that file any more. The
+# `~/.claude.json` pair above is the surviving mixed-fleet byte guard.

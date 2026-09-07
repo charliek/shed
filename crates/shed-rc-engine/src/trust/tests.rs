@@ -44,22 +44,15 @@ fn fresh_document(workdir: &str) -> String {
 
 // --- the literals other implementations depend on ---------------------------
 
-/// `lockSibling` (`trust.go:122`) and the `os.CreateTemp` patterns
-/// (`trust.go:112`, `preseed_cursor.go:163,283`) are CROSS-IMPLEMENTATION
-/// literals: a Rust engine that spelled the lock file differently would not
-/// exclude a concurrent Go create at all, and the file would be merged twice.
+/// `lockSibling` (`trust.go:122`) and the `os.CreateTemp` pattern
+/// (`trust.go:112`) are CROSS-IMPLEMENTATION literals: a Rust engine that
+/// spelled the lock file differently would not exclude a concurrent Go create
+/// at all, and the file would be merged twice. (The cursor hook-relay patterns
+/// asserted here too until A6 — `charliek/shed#322` — removed that preseed.)
 #[test]
 fn cross_impl_literals_match_the_go_strings() {
     assert_eq!(LOCK_SUFFIX, ".shed-ext-rc.lock");
     assert_eq!(CLAUDE_TMP_PATTERN, ".claude.json.*.tmp");
-    assert_eq!(
-        crate::preseed_cursor::HOOKS_TMP_PATTERN,
-        ".hooks.json.*.tmp"
-    );
-    assert_eq!(
-        crate::preseed_cursor::SCRIPT_TMP_PATTERN,
-        ".cursor-hook.sh.*.tmp"
-    );
 }
 
 #[test]

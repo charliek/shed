@@ -230,59 +230,14 @@ type Hub struct {
 	// then broadcasts after unlocking).
 	subMu sync.Mutex
 	subs  map[*subscriber]struct{}
-
-	// inputLockMu guards inputLocks: per-SLUG input-delivery mutexes. Keyed on the
-	// hub rather than the trackedSession so a tracked-entry replacement mid-request
-	// (a recreate reconciled between a handler's lookup and its lock acquisition)
-	// cannot yield two live locks for one pane. Entries are pruned when a session
-	// disappears (see reconcile).
-	inputLockMu sync.Mutex
-	inputLocks  map[string]*sync.Mutex
-
-	// ingestMu guards preWatcher: the per-slug queues of cursor hook events that arrived
-	// before reconcile built the session's watcher (see hub_ingest.go). Its OWN lock, not
-	// trackMu, so the ingest handler never contends with reconcile while it only needs
-	// ingestMu — the handler takes trackMu, releases it, and only THEN takes ingestMu (or the
-	// watcher's own mutex), never nesting the two. Reconcile is the one path that holds both
-	// at once, and always in the same order: trackMu outer, ingestMu (via drainPreWatcher)
-	// nested inside it (see hub_reconcile.go). No path ever takes ingestMu first and trackMu
-	// second.
-	ingestMu   sync.Mutex
-	preWatcher map[string]*preWatcherQueue
 }
 
 func newHub(cfg HubConfig) *Hub {
 	return &Hub{
-		cfg:        cfg.resolve(),
-		tracked:    map[string]*trackedSession{},
-		subs:       map[*subscriber]struct{}{},
-		inputLocks: map[string]*sync.Mutex{},
-		preWatcher: map[string]*preWatcherQueue{},
+		cfg:     cfg.resolve(),
+		tracked: map[string]*trackedSession{},
+		subs:    map[*subscriber]struct{}{},
 	}
-}
-
-// inputLock returns the slug's input-delivery mutex, creating it on first use. The
-// same slug always yields the same mutex until the session disappears (pruned), so
-// input serialization survives a tracked-entry replacement (kill+recreate keeps the
-// slug present → keeps the lock).
-func (h *Hub) inputLock(slug string) *sync.Mutex {
-	h.inputLockMu.Lock()
-	defer h.inputLockMu.Unlock()
-	mu, ok := h.inputLocks[slug]
-	if !ok {
-		mu = &sync.Mutex{}
-		h.inputLocks[slug] = mu
-	}
-	return mu
-}
-
-// pruneInputLock drops a disappeared slug's input mutex. A request still holding the
-// old mutex finishes against a gone pane (its delivery 404s); a later recreate at the
-// same slug gets a fresh lock.
-func (h *Hub) pruneInputLock(slug string) {
-	h.inputLockMu.Lock()
-	defer h.inputLockMu.Unlock()
-	delete(h.inputLocks, slug)
 }
 
 // handler builds the hub's HTTP routes. Go's method+wildcard ServeMux patterns
@@ -303,10 +258,6 @@ func (h *Hub) handler() http.Handler {
 	mux.HandleFunc("POST /v1/sessions/{slug}/turn", h.handleTurn)
 	mux.HandleFunc("POST /v1/sessions/{slug}/interrupt", h.handleInterrupt)
 	mux.HandleFunc("POST /v1/sessions/{slug}/approvals/{id}", h.handleApproval)
-	// The cursor hook ingest route (hub_ingest.go). Unlike every route above it is called
-	// by a process INSIDE the shed (the preseeded hook script), never by the server proxy —
-	// which deliberately does not allowlist it — and it carries its own 256 KiB body cap.
-	mux.HandleFunc("POST /v1/ingest/cursor", h.handleIngestCursor)
 	return mux
 }
 
@@ -448,10 +399,17 @@ type inputRequest struct {
 	Text string `json:"text"`
 }
 
-// handleInput serves POST /v1/sessions/{slug}/input: validate + re-derive live state
-// under the per-session mutex, then deliver the text through the bracketed-paste path.
-// Statuses: 400 invalid/unsafe text, 404 unknown/gone slug, 409 not accepting (wrong
-// activity, recreated identity, or a non-input-gated kind), 413 body too large.
+// handleInput serves POST /v1/sessions/{slug}/input. The route and its request
+// validation survive A6 (charliek/shed#322); its DELIVERY does not. The gated lane —
+// the per-slug delivery mutex, the pane re-verify, the approval-anchor/watcher
+// acceptance merge — existed only for codex and cursor, whose derived lanes are gone,
+// and `kind_features.input` is now "" for every TUI kind and "turn" for opencode. So no
+// kind is `gated` any more and a well-formed request for a live session ends in 409
+// not_accepting rather than a keystroke.
+//
+// Statuses (unchanged in every other respect): 400 invalid/unsafe text, 404 unknown
+// slug, 409 not accepting, 413 body too large. Clients read `kind_features.input` to
+// know which surface a kind takes (opencode: POST /turn).
 func (h *Hub) handleInput(w http.ResponseWriter, r *http.Request) {
 	slug := r.PathValue("slug")
 
@@ -472,189 +430,18 @@ func (h *Hub) handleInput(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Look up the tracked session and snapshot the identity the re-check pins against.
-	// The read runs under trackMu — reconcile mutates tracked under the same lock.
+	// An unknown slug is still a 404 — the body validation above runs first so a
+	// malformed request is reported as malformed regardless of which slug it names.
+	// The read runs under trackMu; reconcile mutates tracked under the same lock.
 	h.trackMu.Lock()
-	tr, ok := h.tracked[slug]
-	var wantID, wantCreatedAt string
-	if ok {
-		wantID, wantCreatedAt = tr.id, tr.createdAt
-	}
+	_, ok := h.tracked[slug]
 	h.trackMu.Unlock()
 	if !ok {
 		writeError(w, http.StatusNotFound, "unknown_slug", "no such rc session")
 		return
 	}
 
-	// Per-SLUG mutex (hub-keyed, not on the tracked entry): the acceptance re-check +
-	// delivery are one critical section, and the same slug maps to the same mutex even
-	// if reconcile replaces the tracked entry between our lookup and this lock — two
-	// concurrent posts can never interleave keystrokes into one pane.
-	mu := h.inputLock(slug)
-	mu.Lock()
-	defer mu.Unlock()
-
-	name := TmuxName(slug)
-	pane, err := capturePaneChecked(h.cfg.runner, name)
-	if err != nil {
-		if errors.Is(err, ErrSessionNotFound) {
-			// The session vanished between the lookup and this re-capture.
-			writeError(w, http.StatusNotFound, "unknown_slug", "rc session is gone")
-			return
-		}
-		// A transient tmux failure is not evidence the session is gone — surface it as
-		// a server error so the client retries rather than dropping the session.
-		writeError(w, http.StatusInternalServerError, "capture_failed", "pane re-capture failed")
-		return
-	}
-	fresh := ParseSession(name, showEnvironment(h.cfg.runner, name), pane, nil)
-
-	// Identity guard: the slug must still be the same incarnation we looked up.
-	if fresh.ID != wantID || fresh.CreatedAt != wantCreatedAt {
-		writeError(w, http.StatusConflict, "not_accepting", "session was recreated")
-		return
-	}
-	// The gated feed-input surface is DERIVED from the kind's advertised row rather
-	// than from a second hardcoded list: kind_features.input is single-valued, so a
-	// kind that graduates to a whole-turn lane ("turn" — opencode) stops accepting
-	// /input in the same edit that flips its row, and the capability a client reads can
-	// never disagree with the gate it hits.
-	if kindFeatureRow(fresh.Kind).Input != inputModeGated {
-		writeError(w, http.StatusConflict, "not_accepting", "this kind does not accept feed input")
-		return
-	}
-	// A blocking lifecycle state suppresses the activity dimension entirely — nothing
-	// is accepting typed input.
-	if DisplayActivity(fresh.State, ActivityWorking) == "" {
-		writeError(w, http.StatusConflict, "not_accepting", "session is not in an input-accepting state")
-		return
-	}
-
-	// Re-read the CURRENT watcher + stability under trackMu (they may have been
-	// replaced since the pre-lock lookup; identity was just re-verified above).
-	h.trackMu.Lock()
-	var (
-		watcher   sessionWatcher
-		stability Activity
-	)
-	if cur, ok := h.tracked[slug]; ok {
-		watcher, stability = cur.watcher, cur.lastStability
-	}
-	h.trackMu.Unlock()
-
-	// Acceptance→delivery gap: the per-slug mutex serializes concurrent POSTs, but
-	// reconcile or the agent can still flip the session to working between the pane
-	// capture above (used for identity/state) and delivery. Re-capture the pane HERE,
-	// as late as possible, and run the acceptance merge on THAT fresh pane so the gate
-	// reflects the pane immediately before sendLine — a session that resumed working
-	// no longer shows the composer anchor and is rejected. Residual (accepted): the
-	// few syscalls between this capture and sendLine below remain un-gated (tmux offers
-	// no atomic capture-and-send), so a flip landing in that sliver can still deliver
-	// mid-turn; the window is now a couple of calls rather than the whole handler body.
-	deliverPane, err := capturePaneChecked(h.cfg.runner, name)
-	if err != nil {
-		if errors.Is(err, ErrSessionNotFound) {
-			writeError(w, http.StatusNotFound, "unknown_slug", "rc session is gone")
-			return
-		}
-		writeError(w, http.StatusInternalServerError, "capture_failed", "pane re-capture failed")
-		return
-	}
-	// The ApprovalAnchor arm needs the VISIBLE frame, not deliverPane's 200 lines of
-	// scrollback: an approval dialog that was already answered stays in the history
-	// verbatim, and gating on that would wedge the session's input permanently. Captured
-	// only for kinds that declare an anchor, and a failure to capture it is fail-CLOSED
-	// (the same posture as every other unresolved question on this path) rather than a
-	// silent "no dialog".
-	var visiblePane string
-	if approvalAnchorFor(fresh.Kind) != nil {
-		visiblePane, err = captureVisiblePaneChecked(h.cfg.runner, name)
-		if err != nil {
-			if errors.Is(err, ErrSessionNotFound) {
-				writeError(w, http.StatusNotFound, "unknown_slug", "rc session is gone")
-				return
-			}
-			writeError(w, http.StatusInternalServerError, "capture_failed", "pane re-capture failed")
-			return
-		}
-	}
-	if !h.inputAccepted(watcher, stability, fresh.Kind, deliverPane, visiblePane) {
-		writeError(w, http.StatusConflict, "not_accepting", "session is not waiting for input")
-		return
-	}
-
-	// Deliver via the shared bracketed-paste path (single line → send-keys -l + Enter;
-	// multi-line → set-buffer + paste-buffer + Enter). AcceptsTypedInput holds for the
-	// gated kinds.
-	if res := sendLine(h.cfg.runner, name, text); res.Code != 0 {
-		if isMissingSession(res.Stderr) {
-			writeError(w, http.StatusNotFound, "unknown_slug", "rc session is gone")
-			return
-		}
-		writeError(w, http.StatusInternalServerError, "delivery_failed", "input delivery failed")
-		return
-	}
-	writeJSON(w, http.StatusOK, map[string]bool{"delivered": true})
-}
-
-// inputAccepted decides whether a posted line may be delivered to the pane.
-//
-// THE RULE: deliver unless the agent is blocked on a DECISION.
-//
-// It used to be "deliver only while the session sits at its empty composer", which
-// was stricter than the program being typed into. Captured live: text sent to codex
-// mid-turn lands in its composer, the footer offers "tab to queue message", and the
-// line is answered as soon as the current turn ends. cursor behaves the same. So a
-// working agent is not a reason to refuse — refusing it was the single biggest reason
-// a phone could not answer a question it could already see.
-//
-// The hazard the gate exists for is narrower than the rule it used to implement.
-// While an approval MODAL is up, keystrokes ANSWER THE MODAL — cursor's options are
-// literally y / tab / shift+tab / esc-or-n, and Enter takes the highlighted "Run
-// (once)". A sentence delivered there can run a command nobody approved. That is what
-// the three rejections below are for, and each rests on different evidence:
-//
-//   - merged activity needs_approval — the derived/structured verdict.
-//   - the watcher reports ANY open approval (approvalBlocker), DELIBERATELY IGNORING
-//     transport health and freshness: the merge demotes an unhealthy watcher to pane
-//     stability, which would re-open exactly this hole with a real dialog on screen.
-//     A stale reject costs a retry; a stale accept costs an approval nobody meant to
-//     give. It also catches opencode QUESTIONS, which block the keyboard but never
-//     appear in pending_approvals.
-//   - the kind's ApprovalAnchor on the FRESH VISIBLE frame — the only evidence for
-//     kinds whose approvals reach no protocol (codex, cursor). visiblePane, never the
-//     scrollback: an answered dialog stays in history verbatim and gating on it would
-//     wedge the session's input forever. UNDEBOUNCED: one frame showing a dialog is
-//     enough to refuse a keystroke.
-//
-// RESIDUAL, accepted and named: a transient widget that is not an approval — a model
-// picker, a file browser — also eats keystrokes, and no anchor covers those. They only
-// appear because a HUMAN opened them at the TUI, which is a different situation from a
-// line arriving from a phone; and the approval anchors ARE exhaustive over the decision
-// surfaces that can appear on their own (TestCursorApprovalAnchorCoversEveryDecisionSurface).
-//
-// A blocking LIFECYCLE (needs-auth / needs-trust / dead) is rejected by the caller
-// before this is reached.
-func (h *Hub) inputAccepted(watcher sessionWatcher, stability Activity, kind Kind, pane, visiblePane string) bool {
-	var (
-		watcherAct                   Activity
-		watcherFresh, expiredWorking bool
-	)
-	if watcher != nil {
-		watcher.refresh(h.cfg.now())
-		watcherAct, _, watcherFresh, expiredWorking = watcher.snapshot(h.cfg.now())
-	}
-	merged, _ := mergedActivity(watcherAct, "", watcherFresh, expiredWorking, stability)
-	if merged == ActivityNeedsApproval {
-		return false
-	}
-	if blocker, ok := watcher.(approvalBlocker); ok && blocker.hasOpenApprovals() {
-		return false
-	}
-	if anchor := approvalAnchorFor(kind); anchor != nil && anchor.MatchString(visiblePane) {
-		return false
-	}
-	return true
+	writeError(w, http.StatusConflict, "not_accepting", "this kind does not accept feed input")
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {
@@ -786,15 +573,16 @@ func (h *Hub) idleExitHandoff(ln net.Listener) {
 	}
 }
 
-// startFSNudger starts the best-effort fsnotify layer over the codex JSONL
-// root and returns the channel it nudges on a watched-file change. A nil channel
-// (fsnotify unavailable / HOME unset) is a valid select arm that simply never fires,
-// leaving the reconcile tick as the sole driver. The nudger goroutine stops with ctx.
+// startFSNudger starts the best-effort fsnotify layer over the file-backed lanes'
+// roots and returns the channel it nudges on a watched-file change. A nil channel (no
+// roots, fsnotify unavailable) is a valid select arm that simply never fires, leaving
+// the reconcile tick as the sole driver. The nudger goroutine stops with ctx.
+//
+// The one root this ever had was codex's ~/.codex/sessions, removed with A6
+// (charliek/shed#322): opencode's SSE stream is its own arrival signal, so the set is
+// empty today and this returns nil. The seam stays for the next file-backed lane.
 func (h *Hub) startFSNudger(ctx context.Context) <-chan struct{} {
 	var roots []string
-	if r := codexSessionsRoot(h.cfg.getenv); r != "" {
-		roots = append(roots, r)
-	}
 	if len(roots) == 0 {
 		return nil
 	}
@@ -807,8 +595,8 @@ func (h *Hub) startFSNudger(ctx context.Context) <-chan struct{} {
 	return n.nudge
 }
 
-// shutdown closes all SSE subscribers + session watchers (codex JSONL tails,
-// opencode SSE clients) and gracefully stops the HTTP server.
+// shutdown closes all SSE subscribers + session watchers (opencode SSE clients) and
+// gracefully stops the HTTP server.
 func (h *Hub) shutdown(srv *http.Server) error {
 	h.closeAllSubscribers()
 	h.closeAllWatchers()

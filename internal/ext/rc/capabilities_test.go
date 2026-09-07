@@ -12,14 +12,17 @@ import (
 
 // TestKindFeatures pins the NORMATIVE per-kind matrix exhaustively — every field of
 // every kind kindFeatures() carries an entry for, plus the deliberate omission of
-// claude-broker and shell. codex, opencode and cursor light up the message feed (their
-// watchers — watch_codex.go / watch_opencode.go / watch_cursor.go — fold a normalized
-// feed, the last of them from hook events pushed into the hub); claude-rc carries the
-// activity feed only (the transcript engine derives activity for it, but no message feed
-// exists). OPENCODE is the live lane: its embedded HTTP+SSE server takes whole turns,
-// interrupts and approvals through the hub, so its row alone reads
-// input "turn" / approvals "remote" / interrupt true. Every other kind
-// is TUI-lane: approvals on the pane, no interrupt verb, gated line input at most.
+// claude-broker and shell. OPENCODE is the only live lane: its embedded HTTP+SSE server
+// takes whole turns, interrupts and approvals through the hub, so its row alone reads
+// watch true / input "turn" / feed "messages" / approvals "remote" / interrupt true.
+//
+// Every other kind reads feed "none" and input "": A5/A6 (charliek/shed#321, #322)
+// retired the claude transcript tail, the codex rollout tail and the cursor hook-ingest
+// lane, so the hub derives NO signal for them at all. `none` rather than `activity` is
+// deliberate and is a departure from #322's acceptance box: under the contract's own
+// definition (docs/extensions/rc-helper.md) `activity` claims the hub can stream the
+// activity dimension, and with no producer that would be a false claim. They stay
+// launchable, attachable TUI kinds; roost is their status authority now.
 func TestKindFeatures(t *testing.T) {
 	kf := kindFeatures()
 
@@ -27,10 +30,10 @@ func TestKindFeatures(t *testing.T) {
 		kind Kind
 		want KindFeatures
 	}{
-		{KindClaudeRC, KindFeatures{PostInput: true, Approvals: "tui", Watch: false, Input: "", Feed: "activity", Interrupt: false, Attach: "tmux"}},
-		{KindCodex, KindFeatures{PostInput: true, Approvals: "tui", Watch: true, Input: "gated", Feed: "messages", Interrupt: false, Attach: "tmux"}},
+		{KindClaudeRC, KindFeatures{PostInput: true, Approvals: "tui", Watch: false, Input: "", Feed: "none", Interrupt: false, Attach: "tmux"}},
+		{KindCodex, KindFeatures{PostInput: true, Approvals: "tui", Watch: false, Input: "", Feed: "none", Interrupt: false, Attach: "tmux"}},
 		{KindOpencode, KindFeatures{PostInput: true, Approvals: "remote", Watch: true, Input: "turn", Feed: "messages", Interrupt: true, Attach: "tmux"}},
-		{KindCursor, KindFeatures{PostInput: true, Approvals: "tui", Watch: true, Input: "gated", Feed: "messages", Interrupt: false, Attach: "tmux"}},
+		{KindCursor, KindFeatures{PostInput: true, Approvals: "tui", Watch: false, Input: "", Feed: "none", Interrupt: false, Attach: "tmux"}},
 	}
 	for _, c := range cases {
 		t.Run(string(c.kind), func(t *testing.T) {
@@ -61,10 +64,10 @@ func TestKindFeatures(t *testing.T) {
 
 	// There was a codex==opencode PARITY assertion here through plan 007: while both
 	// kinds were feed+gated-input TUI sessions, drift between them was a bug. The
-	// divergence is now INTENTIONAL — opencode's embedded server makes it the first
-	// live lane (turn/interrupt/remote approvals) and codex has no equivalent surface —
-	// so the parity guard is deliberately gone. The exhaustive rows above are the
-	// guard: either kind's row moving is a visible edit here.
+	// divergence is now total — opencode's embedded server makes it the only live lane
+	// (turn/interrupt/remote approvals) and codex has no lane at all — so the parity
+	// guard is deliberately gone. The exhaustive rows above are the guard: either
+	// kind's row moving is a visible edit here.
 }
 
 // TestKindFeaturesWatchFeedLockstep is the deprecation invariant: `watch` is the

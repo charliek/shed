@@ -52,12 +52,11 @@ use super::watch_opencode_transport::{ApprovalClaim, OcWatcherError};
 pub const HUB_MAX_BODY_BYTES: usize = 16 << 10;
 
 /// kind_features.input value for a lane accepting whole TURNS
-/// (`inputModeTurn`, `hub_verbs.go:76`) — opencode.
+/// (`inputModeTurn`, `hub_verbs.go:76`) — opencode, the only kind that carries
+/// it. The other spelling this field ever had — "gated", pane-gated line
+/// delivery through `POST /input` — went with A6 (`charliek/shed#322`): every
+/// remaining kind advertises "", and `POST /input` answers 409 `not_accepting`.
 pub const INPUT_MODE_TURN: &str = "turn";
-/// kind_features.input value for pane-gated line delivery (`inputModeGated`,
-/// `hub_verbs.go:82`). Single-valued: a kind that moves to "turn" LEAVES
-/// "gated" behind — handleInput derives its gate from this value alone.
-pub const INPUT_MODE_GATED: &str = "gated";
 /// kind_features.approvals value for a lane answered THROUGH the hub
 /// (`approvalsRemote`, `hub_verbs.go:86`).
 pub const APPROVALS_REMOTE: &str = "remote";

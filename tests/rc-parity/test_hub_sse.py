@@ -4,18 +4,27 @@ stalled-reader survivability cell.
 
 Every read is deadline-bounded (`HubLeg.hub_events_until`); comments (`: ok`,
 heartbeats) are liveness, not wire, and are dropped before compare.
+
+Both cells ride an **opencode** session since A6 (charliek/shed#322): the
+frame ordering and the fan-out survivability are lane-agnostic hub contracts
+that merely happened to be driven by codex and cursor, whose lanes A6 retired.
+opencode is the only watchable kind left, so its fake is what drives them now —
+the appear/activity ordering through the same pane-stability engine as before,
+and the fan-out load through a burst of scripted feed events rather than 300
+cursor ingest POSTs.
 """
 
-import json
 import time
 
 import pytest
 
+from hub_opencode import OC_SID, lane_session, user_text_frames
 from normalize import MASK_TS, assert_rfc3339, mask_hub_session
 
 pytestmark = pytest.mark.hub
 
 SSE_SLUG = "sse111"
+STALL_SLUG = "stall11"
 
 
 VALID_STATES = ("starting", "ready", "reconnecting", "needs-trust", "needs-auth", "dead")
@@ -53,6 +62,14 @@ def test_sse_appear_then_activity_order(hub_differential, hub_leg):
     - the activity sequence is exactly working → needs_input (a fresh session
       always ticks working first; the quiet period then settles the anchor);
     - every frame carries the session's slug.
+
+    The session is opencode (A6, charliek/shed#322 — codex has no watcher any
+    more). Deliberately a BARE create, not the full `lane_session` setup: the
+    trigger runs inside the subscription's read loop, so anything slower than a
+    create leaves frames queueing unread and a subscriber buffer can drop the
+    opening `working` tick this cell exists to observe. No fake is bound, so the
+    watcher never connects and the activity comes from the pane-stability
+    engine — the same mechanism this cell always pinned.
     """
 
     def scenario(impl):
@@ -60,7 +77,7 @@ def test_sse_appear_then_activity_order(hub_differential, hub_leg):
 
         def create():
             res = leg.run(
-                "create", "--kind", "codex", "--slug", SSE_SLUG, "--name", "hub-sse"
+                "create", "--kind", "opencode", "--slug", SSE_SLUG, "--name", "hub-sse"
             )
             assert res.returncode == 0, f"{leg.impl}: create: {res.stderr}"
 
@@ -102,6 +119,13 @@ def test_sse_stalled_reader_hub_survives(hub_differential, hub_leg):
     peer attached and a flood of feed events fanning out, the hub keeps
     answering health and a FRESH subscriber still receives frames promptly.
 
+    The load generator is a burst of scripted opencode feed events (A6,
+    charliek/shed#322 — it was 300 cursor ingest POSTs, and that route is
+    gone). Each user text part is a terminal fold row, so the burst becomes
+    `message.appended` frames fanning out to every subscriber. The cell asserts
+    the rows ACTUALLY LANDED in the ring before drawing conclusions: a
+    liveness-only check would pass against a completely dead feed.
+
     The connection-teardown half (frames dropped on the slow path, the stalled
     stream ENDED once the write deadline fires) is pinned at UNIT level on
     both sides — Go's TestHubEventsWedgedClientUnsubscribes and Rust's
@@ -112,37 +136,37 @@ def test_sse_stalled_reader_hub_survives(hub_differential, hub_leg):
     — the differential's contract stops at "the hub survives, nobody else is
     affected"."""
 
+    FLOOD = 300
+    fakes = []
+
     def scenario(impl):
         leg = hub_leg(impl)
-        res = leg.run(
-            "create", "--kind", "cursor", "--slug", "stall11", "--name", "hub-stall"
-        )
-        assert res.returncode == 0, f"{leg.impl}: create: {res.stderr}"
-        leg.wait_tracked("stall11")
+        fake = lane_session(leg, fakes, STALL_SLUG, "hub-stall")
 
         stalled = leg.hub_events_socket()
         try:
             time.sleep(0.3)  # let the subscriber register + first frames queue
 
-            accepted = 0
             for burst in range(3):
-                for i in range(100):
-                    payload = json.dumps(
-                        {
-                            "session_id": "4113a71f-0a42-4a6d-89b9-483e44b74103",
-                            "prompt": f"flood {burst}-{i}",
-                        }
-                    )
-                    got = leg.hub_request(
-                        "POST",
-                        "/v1/ingest/cursor?slug=stall11&event=beforeSubmitPrompt",
-                        body=payload,
-                    )
-                    accepted += 1 if got["status"] == 202 else 0
+                for frame in user_text_frames(OC_SID, FLOOD // 3, f"flood{burst}"):
+                    fake.stream(frame)
                 time.sleep(0.4)  # a few reconcile ticks fan the burst out
-            assert accepted == 300, (
-                f"{leg.impl}: the ingest route rejected flood events "
-                f"({accepted}/300 accepted)"
+
+            # The flood REACHED the ring — without this the whole cell would
+            # pass against a feed that produced nothing at all.
+            # A page STARTING AFTER seq FLOOD-1: a row there proves at least
+            # FLOOD rows landed. (`limit` is capped at 200 by the wire, so the
+            # whole ring cannot be asked for in one page.)
+            def flooded():
+                got = leg.hub_request(
+                    "GET",
+                    f"/v1/sessions/{STALL_SLUG}/messages?since={FLOOD - 1}&limit=1",
+                )
+                rows = (got["json"] or {}).get("messages", [])
+                return rows[0]["seq"] if rows else None
+
+            delivered = leg.wait_hub(
+                "the scripted flood never reached the feed", flooded, timeout=25
             )
 
             # The hub survived the wedged peer:
@@ -150,30 +174,26 @@ def test_sse_stalled_reader_hub_survives(hub_differential, hub_leg):
             assert health["status"] == 200, f"{leg.impl}: health {health}"
 
             # …and a fresh subscriber receives a NEW event promptly.
-            def post_one():
-                got = leg.hub_request(
-                    "POST",
-                    "/v1/ingest/cursor?slug=stall11&event=beforeSubmitPrompt",
-                    body=json.dumps(
-                        {
-                            "session_id": "4113a71f-0a42-4a6d-89b9-483e44b74103",
-                            "prompt": "after the stall",
-                        }
-                    ),
-                )
-                assert got["status"] == 202, f"{leg.impl}: post-stall ingest {got}"
+            def stream_one():
+                for frame in user_text_frames(OC_SID, 1, "after"):
+                    fake.stream(frame)
 
             fresh = leg.hub_events_until(
                 "a fresh subscriber never received an event",
                 lambda evs: len(evs) >= 1,
-                timeout=15,
-                on_subscribed=post_one,
+                timeout=20,
+                on_subscribed=stream_one,
             )
             return {
                 "hub_healthy": True,
+                "flood_delivered": delivered >= FLOOD,
                 "fresh_subscriber_receives": len(fresh) >= 1,
             }
         finally:
             stalled.close()
 
-    hub_differential(scenario)
+    try:
+        hub_differential(scenario)
+    finally:
+        for fake in fakes:
+            fake.stop()

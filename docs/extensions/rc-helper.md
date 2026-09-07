@@ -138,10 +138,10 @@ version (currently **4**), decoupled from `SHED_RC_V` (metadata schema, still **
   },
   "features": ["generic-perm", "plan-stdin", "prompt-b64", "serve", "activity", "messages", "contract-v2"],
   "kind_features": {
-    "claude-rc": { "post_input": true, "approvals": "tui", "feed": "activity", "interrupt": false, "attach": "tmux" },
-    "codex": { "post_input": true, "approvals": "tui", "watch": true, "input": "gated", "feed": "messages", "interrupt": false, "attach": "tmux" },
+    "claude-rc": { "post_input": true, "approvals": "tui", "feed": "none", "interrupt": false, "attach": "tmux" },
+    "codex": { "post_input": true, "approvals": "tui", "feed": "none", "interrupt": false, "attach": "tmux" },
     "opencode": { "post_input": true, "approvals": "remote", "watch": true, "input": "turn", "feed": "messages", "interrupt": true, "attach": "tmux" },
-    "cursor": { "post_input": true, "approvals": "tui", "watch": true, "input": "gated", "feed": "messages", "interrupt": false, "attach": "tmux" }
+    "cursor": { "post_input": true, "approvals": "tui", "feed": "none", "interrupt": false, "attach": "tmux" }
   }
 }
 ```
@@ -174,7 +174,7 @@ today's client behavior for those two kinds.
 | `post_input` | A typed line can be delivered to the session's pane (the prompt/attach kickoff path). **Not deprecated** — nothing in contract v2 supersedes it, opencode included (the create/prompt kickoff path still uses it for a session's first prompt). |
 | `approvals` | Where approvals are answered: `tui` (in the terminal — claude-rc, codex, cursor) or `remote` (through the hub's `POST /approvals/{id}` verb — opencode, live since this block). |
 | `watch` | **Deprecated** by `feed` (superseded, not removed): retained until clients migrate. The producer holds `watch == (feed == "messages")` in lockstep, so a v1 client reading `watch` and a v2 client reading `feed` see the same thing. Absent-field fallback: a client that only knows `watch` should keep using it. |
-| `input` | Feed-input posting mode, **single-valued**: `gated` (`POST …/input` accepted unless the agent is blocked on a DECISION — codex, cursor; see [What `gated` gates](#what-gated-gates)), `turn` (the lane takes whole turns through `POST …/turn`, and `POST …/input` no longer applies — opencode), or `""` (no feed input at all — claude-rc; the TUI-only `post_input` path still applies). `turn` supersedes `gated` for a kind that has it: the two are mutually exclusive spellings of "how a client steers this kind's feed", not layered capabilities. |
+| `input` | Feed-input posting mode, **single-valued**: `turn` (the lane takes whole turns through `POST …/turn` — opencode) or `""` (no feed input at all — every other kind; the TUI-only `post_input` path still applies). A third value, `gated`, meant "`POST …/input` accepted unless the agent is blocked on a decision"; it was retired with the codex and cursor lanes (`charliek/shed#322`) and **no kind carries it any more** — `POST …/input` answers `409 not_accepting` for every kind. Clients that decode `gated` should keep doing so (an older guest may still send it) but will not see it from this binary. |
 | `feed` | What the hub can stream for the kind: `messages` (a normalized conversation feed — `GET …/messages` + `message.appended`), `activity` (the activity dimension only — no message feed), or `none` (no hub signal at all). Supersedes `watch`. |
 | `interrupt` | The `interrupt` verb is supported. `true` for opencode only; `false` elsewhere. |
 | `attach` | How a terminal reaches the session: `tmux` (attach to the rc-tmux session), `native-remote` (the agent's own remote surface), or `none`. |
@@ -183,12 +183,23 @@ Normative matrix (exhaustive — pinned by `capabilities_test.go`):
 
 | kind | post_input | approvals | watch | input | feed | interrupt | attach |
 |---|---|---|---|---|---|---|---|
-| claude-rc | true | tui | false | "" | activity | false | tmux |
-| codex | true | tui | true | gated | messages | false | tmux |
+| claude-rc | true | tui | false | "" | none | false | tmux |
+| codex | true | tui | false | "" | none | false | tmux |
 | opencode | true | remote | true | turn | messages | true | tmux |
-| cursor | true | tui | true | gated | messages | false | tmux |
+| cursor | true | tui | false | "" | none | false | tmux |
 
-opencode is the first **live** lane (§ [Contract-v2 verbs](#contract-v2-verbs-turn-interrupt-approvalsid) below): its TUI runs an embedded HTTP+SSE server the hub steers through, so whole turns, interrupts, and approvals all go through the hub instead of the pane. cursor gained a normalized `messages` feed (its own hook scripts push turn boundaries, tool calls and messages into the hub — see [Cursor hook ingestion](#cursor-hook-ingestion)) and `gated` input (its composer-anchor gate, identical in shape to codex's), but its approvals stay `tui`: cursor's hooks carry no approval-pending event, so nothing the hub receives is remotely answerable — see [`needs_approval` producers](#needs_approval-producers-per-kind) below. `"none"` is reserved for a kind with no hub signal at all (none exists yet).
+opencode is the only **live** lane (§ [Contract-v2 verbs](#contract-v2-verbs-turn-interrupt-approvalsid) below): its TUI runs an embedded HTTP+SSE server the hub steers through, so whole turns, interrupts, and approvals all go through the hub instead of the pane.
+
+Every other kind reads `feed: "none"` and `input: ""`. The claude transcript tail (`charliek/shed#321`), the codex rollout tail and the cursor hook-ingest lane (`charliek/shed#322`) were all retired: the hub derives **no signal at all** for those kinds now, so `none` — not `activity` — is the truthful value under this table's own definition of the two. They remain launchable, attachable TUI kinds; their status comes from roost rather than from the hub. Both clients branch on `feed == "messages"` only, so the change is invisible to them, and the value flips back to a real one when roost becomes the guest's source.
+
+!!! note "Sections below this one still describe the retired lanes"
+
+    The activity-dimension, correlation, message-feed, cursor hook-ingestion,
+    gated-input and per-kind `needs_approval` sections still describe the codex
+    and cursor lanes as live; they are rewritten in the docs commit of this same
+    change (`charliek/shed#322`). The matrix above is normative where they
+    disagree: only opencode has a hub-derived feed, and `POST …/input` answers
+    `409 not_accepting` for every kind.
 
 `feed` and `attach` carry `omitempty` but are **never** empty in this binary's own
 output (the strict golden pins them present) — the `omitempty` exists so a newer server

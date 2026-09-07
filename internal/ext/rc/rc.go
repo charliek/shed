@@ -122,15 +122,15 @@ const (
 	// EVERY kind, unlike the opencode-only port key below. It is deliberately redundant
 	// with the tmux session NAME (rc-<slug>, which is what ParseSession derives the slug
 	// from — this key is never the reader's source of truth): its purpose is DELIVERY.
-	// A child process launched inside the session inherits the tmux session env, so an
-	// agent's hook script — cursor's, which the hub preseeds (PreseedCursorHooks) — can
-	// read $SHED_RC_SLUG and address its own session on the hub's ingest route without
-	// the agent knowing anything about shed. Rides the SHED_RC_ prefix like every other
-	// key here, so parseEnv/showEnvironment already surface it.
+	// A child process launched inside the session inherits the tmux session env, so a
+	// helper running there can read $SHED_RC_SLUG and address its own session without
+	// knowing anything else about shed. (Its original consumer, cursor's preseeded hook
+	// relay, went with the ingest lane in A6 — charliek/shed#322.) Rides the SHED_RC_
+	// prefix like every other key here, so parseEnv/showEnvironment already surface it.
 	envSlug = "SHED_RC_SLUG"
 	// envAgentSession is the ADDITIVE, write-once-on-correlate key the hub back-writes
-	// once it has pinned a session to its agent JSONL file (codex rollout id / claude
-	// transcript session id). It is NOT part of the create-time BuildEnvArgs set — the
+	// once it has pinned a session to its agent-side conversation (opencode's session
+	// id). It is NOT part of the create-time BuildEnvArgs set — the
 	// hub stamps it later via `tmux set-environment` so a hub restart re-correlates
 	// exactly instead of re-running the cwd+window heuristic. It rides the SHED_RC_
 	// prefix so parseEnv/showEnvironment already surface it.

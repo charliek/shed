@@ -1,7 +1,0 @@
-{
-  "body": {
-    "error": "invalid_event",
-    "message": "event is missing or malformed"
-  },
-  "status": 400
-}

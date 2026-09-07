@@ -181,10 +181,10 @@ pub fn build_capabilities(
 ///
 /// ```text
 /// kind      | post_input | approvals | watch | input | feed     | interrupt | attach
-/// claude-rc | true       | tui       | false | ""    | activity | false     | tmux
-/// codex     | true       | tui       | true  | gated | messages | false     | tmux
+/// claude-rc | true       | tui       | false | ""    | none     | false     | tmux
+/// codex     | true       | tui       | false | ""    | none     | false     | tmux
 /// opencode  | true       | remote    | true  | turn  | messages | true      | tmux
-/// cursor    | true       | tui       | true  | gated | messages | false     | tmux
+/// cursor    | true       | tui       | false | ""    | none     | false     | tmux
 /// ```
 pub fn kind_features() -> HashMap<String, RcKindFeatures> {
     let mut out = HashMap::new();
@@ -193,44 +193,32 @@ pub fn kind_features() -> HashMap<String, RcKindFeatures> {
             continue;
         }
         // The BASE row is a TUI-lane session: approvals answered on the pane, a
-        // terminal reaching it over tmux, no turn/interrupt verb, no feed input.
-        // "activity" is the feed FLOOR — the hub derives the activity dimension
-        // for every watched kind even where no message feed exists.
+        // terminal reaching it over tmux, no turn/interrupt verb, no feed input,
+        // and — since A6 (`charliek/shed#322`) retired the claude transcript
+        // tail, the codex rollout tail and the cursor hook-ingest lane — NO HUB
+        // SIGNAL AT ALL. `feed` is therefore "none", not "activity": `activity`
+        // claims the hub can stream the activity dimension, and with no producer
+        // left that would be a false claim under the contract's own definition
+        // (`docs/extensions/rc-helper.md`). roost is the status authority for
+        // those kinds now.
         let mut kf = RcKindFeatures {
             post_input: kind.accepts_typed_input(),
             approvals: "tui".to_string(),
             watch: false,
             input: String::new(),
-            feed: "activity".to_string(),
+            feed: "none".to_string(),
             interrupt: false,
             attach: "tmux".to_string(),
         };
-        match kind {
-            // codex's rollout JSONL folds into a normalized message feed, and its
-            // composer anchor gates POST /input acceptance.
-            RcKind::Codex => {
-                kf.feed = "messages".to_string();
-                kf.input = "gated".to_string();
-            }
-            // opencode is the first LIVE lane: its TUI runs an embedded HTTP+SSE
-            // server the hub steers through, so whole turns, interrupts and
-            // approvals all go through the hub rather than the pane. `input` is
-            // single-valued, so "turn" REPLACES codex's "gated" spelling.
-            RcKind::Opencode => {
-                kf.feed = "messages".to_string();
-                kf.input = "turn".to_string();
-                kf.approvals = "remote".to_string();
-                kf.interrupt = true;
-            }
-            // cursor's hook scripts push its turn boundaries, tool calls and
-            // messages into the hub — a message feed — and its composer anchor
-            // gates POST /input exactly as codex's does. approvals stays "tui":
-            // there is nothing the hub can honor remotely.
-            RcKind::Cursor => {
-                kf.feed = "messages".to_string();
-                kf.input = "gated".to_string();
-            }
-            _ => {}
+        // opencode is the ONLY live lane: its TUI runs an embedded HTTP+SSE
+        // server the hub steers through, so whole turns, interrupts and
+        // approvals all go through the hub rather than the pane. `input` is
+        // single-valued and "turn" is the only value left on the wire.
+        if kind == RcKind::Opencode {
+            kf.feed = "messages".to_string();
+            kf.input = "turn".to_string();
+            kf.approvals = "remote".to_string();
+            kf.interrupt = true;
         }
         // watch is the deprecated spelling of feed == "messages"; DERIVED here so
         // the two cannot drift.

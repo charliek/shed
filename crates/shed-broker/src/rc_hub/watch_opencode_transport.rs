@@ -839,10 +839,6 @@ impl SessionWatcher for OpencodeWatcher {
         Some(self)
     }
 
-    fn as_approval_blocker(&self) -> Option<&dyn super::watch::ApprovalBlocker> {
-        Some(self)
-    }
-
     fn as_turn_starter(&self) -> Option<&dyn super::verbs::TurnStarter> {
         Some(self)
     }
@@ -907,12 +903,6 @@ impl super::watch::ClaimHolder for OpencodeWatcher {
 impl super::watch::ApprovalPublisher for OpencodeWatcher {
     fn pending_approvals(&self) -> Vec<FeedApproval> {
         OpencodeWatcher::pending_approvals(self)
-    }
-}
-
-impl super::watch::ApprovalBlocker for OpencodeWatcher {
-    fn has_open_approvals(&self) -> bool {
-        OpencodeWatcher::has_open_approvals(self)
     }
 }
 
@@ -1045,14 +1035,12 @@ impl OpencodeWatcher {
         w.fold.pending_approvals()
     }
 
-    /// Whether ANY ask (permission or question) is still open, for the input
-    /// gate (`hasOpenApprovals` — the approvalBlocker surface). Deliberately
-    /// independent of transport health and freshness: when the stream wedges
-    /// the activity verdict is demoted to pane stability — but a dialog the
-    /// operator has not answered is still on the pane, and a posted line
-    /// would answer it by accident. The asymmetry is intentional: a stale
-    /// reject costs a retry, a stale accept costs an unintended approval. A
-    /// CLOSED watcher blocks nothing.
+    /// Whether ANY ask (permission or question) is still open — a STRICTLY
+    /// WIDER question than `pending_approvals`, because it counts questions
+    /// too, which are never addressable and so never appear there. It fed the
+    /// gated-input blocker until A6 (`charliek/shed#322`) retired that lane; it
+    /// stays as the fold's open-ask predicate. Deliberately independent of
+    /// transport health and freshness. A CLOSED watcher reports nothing open.
     pub fn has_open_approvals(&self) -> bool {
         let w = self.lock();
         if w.closed {

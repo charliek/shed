@@ -48,9 +48,10 @@ type AgentSpec struct {
 	// runs, so a spec's Classify only handles its live states.
 	Classify func(kind Kind, pane string) PaneResult
 	// Preseed prepares on-disk tool config before the session launches: claude's trust +
-	// onboarding gates (so a fresh session reaches ready unattended), cursor's hook relay
-	// (so the hub gets a signal at all — see PreseedCursorHooks). nil when the tool needs
-	// none, or when its trust gate is auto-accepted from the pane instead (codex).
+	// onboarding gates (so a fresh session reaches ready unattended). nil when the tool
+	// needs none, or when its trust gate is auto-accepted from the pane instead (codex).
+	// cursor's hook-relay preseed was removed with A6 (charliek/shed#322) along with the
+	// ingest lane it fed.
 	// Best-effort by contract: Create reports a failure through CreateOptions.Warnf and
 	// carries on.
 	Preseed func(workdir string, getenv func(string) string) error
@@ -505,11 +506,10 @@ var agentRegistry = []*AgentSpec{
 		// the composer is immediately ready.
 		InnerCommand: innerCommandTUI("cursor-agent", "--trust"),
 		Classify:     classifyCursor,
-		// cursor's preseed is not a trust/onboarding gate (it has none) — it installs the
-		// hub's hook relay into ~/.cursor/hooks.json, which is the ONLY live signal a cursor
-		// session produces (see preseed_cursor.go and watch_cursor.go). Best-effort like
-		// every Preseed: a failure costs the session its feed, never its create.
-		Preseed: PreseedCursorHooks,
+		// cursor has no trust/onboarding gate to preseed (--trust above covers the one
+		// dialog it draws); the hook relay that used to live here went with A6
+		// (charliek/shed#322).
+		Preseed: nil,
 		PermMap: map[string][]string{
 			PermModeDefault: nil,
 			// cursor has no mid-tier posture; auto stays default until one exists.

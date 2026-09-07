@@ -1,8 +1,7 @@
 """The create-time preseeds as a **RAW-BYTES** surface (plan 009 §3.5).
 
-`~/.claude.json`, `~/.cursor/hooks.json`, the hub's cursor hook script and a
-plan file are all merged/rewritten IN PLACE by whichever implementation happens
-to run a create — a mixed fleet, on one machine, against one file. Semantic
+`~/.claude.json` and a plan file are both written IN PLACE by whichever
+implementation happens to run a create — a mixed fleet, on one machine, against one file. Semantic
 equality is not enough there: if the two writers disagree on key order,
 indentation, HTML escaping or number fidelity, each create rewrites the other's
 file and churns content the user never touched. So these cells compare the bytes,
@@ -19,11 +18,8 @@ import base64
 from normalize import mask_file_bytes, mask_stderr
 
 CLAUDE_KIND = ["--kind", "claude-rc"]
-CURSOR_KIND = ["--kind", "cursor"]
 
 CLAUDE_JSON = ".claude.json"
-HOOKS_JSON = ".cursor/hooks.json"
-HOOK_SCRIPT = ".shed-rc-hub/cursor-hook.sh"
 
 # The refusal both implementations must produce for a file they cannot account
 # for. Everything past this marker is the JSON parser's own wording (Go's
@@ -190,95 +186,12 @@ def test_claude_json_merge_is_idempotent(differential, isolated, tmp_path):
 
 
 # --- ~/.cursor/hooks.json + the hub script ----------------------------------
-
-
-def test_cursor_hook_script_bytes(differential, isolated, tmp_path):
-    """The hub-owned script: byte-identical (it is rewritten on EVERY create by
-    whichever binary runs it) and 0755, because cursor execs it directly."""
-
-    def scenario(impl):
-        leg = isolated(impl)
-        res = _create(leg, CURSOR_KIND, "cu1111", tmp_path)
-        assert res.returncode == 0, f"{impl}: exit {res.returncode}: {res.stderr}"
-        leg.wait_for_session("rc-cu1111")
-        path = leg.home / HOOK_SCRIPT
-        return {
-            "script": mask_file_bytes(path.read_bytes(), str(leg.home)),
-            "mode": oct(path.stat().st_mode & 0o777),
-        }
-
-    cell = differential(scenario)
-    assert cell["mode"] == "0o755"
-    # The confinement controls the script's doc calls load-bearing.
-    assert "--noproxy '*'" in cell["script"]
-    assert "127.0.0.1:1029/v1/ingest/cursor" in cell["script"]
-
-
-def test_cursor_hooks_fresh_write(differential, isolated, tmp_path):
-    """A fresh `hooks.json`: every wired event gets exactly our entry, the schema
-    `version` is supplied, and the command is `shellQuote(script) + " " + event` —
-    the ALWAYS-quoted form, which is what a Go-written entry looks like and what
-    the idempotent match keys on."""
-
-    def scenario(impl):
-        leg = isolated(impl)
-        res = _create(leg, CURSOR_KIND, "cu2222", tmp_path)
-        assert res.returncode == 0, f"{impl}: exit {res.returncode}: {res.stderr}"
-        leg.wait_for_session("rc-cu2222")
-        return mask_file_bytes(leg.read_bytes(HOOKS_JSON), str(leg.home))
-
-    document = differential(scenario)
-    assert '"version": 1' in document
-    assert "'<home>/.shed-rc-hub/cursor-hook.sh' sessionStart" in document
-    # Deliberately unwired events must not appear at all.
-    assert "afterAgentThought" not in document
-
-
-def test_cursor_hooks_merge_is_idempotent(differential, isolated, tmp_path):
-    """Two creates leave the file byte-identical — no duplicated entries."""
-
-    def scenario(impl):
-        leg = isolated(impl)
-        for slug in ("cu3333", "cu4444"):
-            res = _create(leg, CURSOR_KIND, slug, tmp_path)
-            assert res.returncode == 0, f"{impl}: exit {res.returncode}: {res.stderr}"
-            leg.wait_for_session(f"rc-{slug}")
-        return mask_file_bytes(leg.read_bytes(HOOKS_JSON), str(leg.home))
-
-    document = differential(scenario)
-    assert document.count("cursor-hook.sh") == 10, document
-
-
-def test_cursor_hooks_preserve_a_users_own_hooks(differential, isolated, tmp_path):
-    """A user's existing entries keep their position and their own unknown fields,
-    their declared `version` is never overwritten, an unknown top-level key
-    survives, and an event we do not wire gains nothing."""
-    seed = (
-        b'{"version":2,'
-        b'"hooks":{"beforeSubmitPrompt":[{"command":"/usr/local/bin/audit.sh","failClosed":true}],'
-        b'"afterAgentThought":[{"command":"/usr/local/bin/thoughts.sh"}]},'
-        b'"somethingElse":{"keep":"me"}}'
-    )
-
-    def scenario(impl):
-        leg = isolated(impl)
-        (leg.home / ".cursor").mkdir(parents=True, exist_ok=True)
-        (leg.home / HOOKS_JSON).write_bytes(seed)
-        res = _create(leg, CURSOR_KIND, "cu5555", tmp_path)
-        assert res.returncode == 0, f"{impl}: exit {res.returncode}: {res.stderr}"
-        leg.wait_for_session("rc-cu5555")
-        return mask_file_bytes(leg.read_bytes(HOOKS_JSON), str(leg.home))
-
-    document = differential(scenario)
-    assert '"version": 2' in document
-    assert '"failClosed": true' in document
-    assert "thoughts.sh" in document
-    # Ours is APPENDED after the user's — within that event's array (the events
-    # themselves come out in Go's sorted-key order, so the comparison has to be
-    # scoped to the array, not to the whole document).
-    submit = document.split('"beforeSubmitPrompt": [')[1].split("]")[0]
-    assert submit.index("audit.sh") < submit.index("cursor-hook.sh"), submit
-
+#
+# The four cells that lived here (the hub script's bytes + 0755 mode, a fresh
+# hooks.json, the idempotent merge, and a user's own hooks preserved) went with
+# the cursor hook-relay preseed itself in A6 (charliek/shed#322): the hub has no
+# ingest route for the script to POST into, so neither implementation writes
+# either file any more. The claude preseed above is unaffected.
 
 # --- plan files -------------------------------------------------------------
 

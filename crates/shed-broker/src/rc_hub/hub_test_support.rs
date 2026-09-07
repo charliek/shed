@@ -21,19 +21,6 @@ use shed_rc_engine::tmux::{TmuxResult, TmuxRunner};
 
 use super::events::Subscriber;
 use super::hub::{Hub, HubConfig};
-use super::watch_cursor::CursorHookEvent;
-
-/// The cursor spike capture's own conversation id (`cursorTestSessionID`,
-/// `watch_cursor_test.go:20`).
-pub(crate) const CURSOR_SID: &str = "4113a71f-0a42-4a6d-89b9-483e44b74103";
-
-/// One pushed cursor hook event (`hookEv`, `watch_cursor_test.go:23`).
-pub(crate) fn hook_ev(event: &str, payload: &str) -> CursorHookEvent {
-    CursorHookEvent {
-        event: event.to_string(),
-        payload: payload.as_bytes().to_vec(),
-    }
-}
 
 /// A programmable clock (`hubClock`, `hub_test.go:21`).
 pub(crate) struct HubClock {
@@ -130,24 +117,8 @@ impl HubTmux {
         self.lock().ls_fail = stderr.to_string();
     }
 
-    /// Makes a session's capture-pane fail transiently (a hiccup, NOT gone).
-    pub fn set_flaky(&self, name: &str, flaky: bool) {
-        let mut st = self.lock();
-        if flaky {
-            st.flaky.insert(name.to_string());
-        } else {
-            st.flaky.remove(name);
-        }
-    }
-
     pub fn recorded(&self) -> Vec<String> {
         self.lock().sent.clone()
-    }
-
-    /// The recorded set-environment "KEY=VALUE" pairs (asserts the
-    /// SHED_RC_AGENT_SESSION back-write).
-    pub fn set_env_calls(&self) -> Vec<String> {
-        self.lock().set_envs.clone()
     }
 }
 
@@ -318,36 +289,6 @@ pub(crate) fn rig() -> (Hub, Arc<HubTmux>, Arc<HubClock>) {
     (h, f, clk)
 }
 
-/// A hub over throwaway doubles, for the tests that drive it purely through
-/// arguments (the input gate) and never script tmux or time.
-pub(crate) fn test_hub() -> Hub {
-    rig().0
-}
-
-/// A Go-minimal config over an arbitrary runner (the `hookedTmux` wrapper
-/// tests need a runner that is not a bare `HubTmux`).
-pub(crate) fn hub_config_with_runner(
-    runner: Arc<dyn shed_rc_engine::tmux::TmuxRunner + Send + Sync>,
-    now: impl Fn() -> DateTime<Utc> + Send + Sync + 'static,
-) -> HubConfig {
-    HubConfig {
-        runner,
-        getenv: Arc::new(|_| String::new()),
-        now: Some(Arc::new(now)),
-        logf: Some(Arc::new(|_| {})),
-        addr: String::new(),
-        version: String::new(),
-        active_interval: Duration::ZERO,
-        idle_interval: Duration::ZERO,
-        quiet_period: Duration::ZERO,
-        idle_timeout: Duration::ZERO,
-        heartbeat: Duration::ZERO,
-        write_timeout: Duration::ZERO,
-        subscriber_buffer: 0,
-        send_line_settle: Some(Duration::ZERO),
-    }
-}
-
 /// A decoded SSE frame (`drainedEvent`, `hub_test.go:253`).
 #[derive(Debug)]
 pub(crate) struct DrainedEvent {
@@ -392,15 +333,14 @@ pub(crate) fn pane_fixture(name: &str) -> String {
 
 // ---------------------------------------------------------------------------
 // Shared scripted watchers (`stubWatcher`/`stubApprovalWatcher`,
-// hub_input_test.go:302-332) — used by the input-gate unit tests (hub.rs) and
-// the HTTP mirrors (hub_http_tests.rs).
+// hub_input_test.go:302-332) — used by the HTTP tests (hub_http_tests.rs).
 // ---------------------------------------------------------------------------
 
 use chrono::DateTime as ChronoDateTime;
 use shed_core::rc::RcActivity;
 
 use super::messages::{FeedApproval, FeedMessage};
-use super::watch::{ApprovalBlocker, ApprovalPublisher, SessionWatcher};
+use super::watch::{ApprovalPublisher, SessionWatcher};
 
 /// A scripted watcher verdict (`stubWatcher`, `hub_input_test.go:302`).
 pub(crate) struct StubWatcher {
@@ -442,14 +382,11 @@ impl SessionWatcher for StubWatcher {
 }
 
 /// `stubApprovalWatcher` (`hub_input_test.go:322`): adds the snapshot
-/// reconcile publishes and the blocked-on-a-dialog question the input gate
-/// asks. `blocked` models an open ask NOT in the snapshot — an opencode
-/// question — so the two can be driven apart.
+/// reconcile publishes.
 #[derive(Default)]
 pub(crate) struct StubApprovalWatcher {
     pub stub: StubWatcher,
     pub approvals: Vec<FeedApproval>,
-    pub blocked: bool,
 }
 
 impl SessionWatcher for StubApprovalWatcher {
@@ -469,19 +406,11 @@ impl SessionWatcher for StubApprovalWatcher {
     fn as_approval_publisher(&self) -> Option<&dyn ApprovalPublisher> {
         Some(self)
     }
-    fn as_approval_blocker(&self) -> Option<&dyn ApprovalBlocker> {
-        Some(self)
-    }
 }
 
 impl ApprovalPublisher for StubApprovalWatcher {
     fn pending_approvals(&self) -> Vec<FeedApproval> {
         self.approvals.clone()
-    }
-}
-impl ApprovalBlocker for StubApprovalWatcher {
-    fn has_open_approvals(&self) -> bool {
-        self.blocked || !self.approvals.is_empty()
     }
 }
 

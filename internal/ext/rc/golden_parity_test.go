@@ -96,12 +96,11 @@ func TestPaneFixtureCopiesAreByteIdentical(t *testing.T) {
 }
 
 // The JSONL turn-stream fixtures under testdata/jsonl/ are the folds' SHARED tables
-// (plan 010 H4): this package's fold tests drive them through
-// codexFold/opencodeFold and the cursor transcript backfill, and the Rust
-// hub's fold mirrors (crates/shed-broker/src/rc_hub/) consume the crates-local copy.
-// The copies land with the sweep at H4 so the guard exists BEFORE their Rust
-// consumers arrive with the folds (H5/H6). Same directory-derived sweep as the panes
-// above, same rationale.
+// (plan 010 H4): this package's fold tests drive them through the opencode fold, and
+// the Rust hub's fold mirror (crates/shed-broker/src/rc_hub/) consumes the crates-local
+// copy. (The codex and cursor tables were dropped from both copies together with their
+// lanes in A6, charliek/shed#322 — the sweep is what makes "together" enforceable.)
+// Same directory-derived sweep as the panes above, same rationale.
 func TestJSONLFixtureCopiesAreByteIdentical(t *testing.T) {
 	assertFixtureDirCopyByteIdentical(t,
 		"internal/ext/rc/testdata/jsonl",
