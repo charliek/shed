@@ -2153,12 +2153,19 @@ except Exception:
     /// /tmp would meet other tests' leftovers. The empty [`SshConfigPaths`] is
     /// the same isolation for the config — a developer's own `~/.ssh/config`
     /// must not reach the fake ssh.
-    fn faked_bridge(name: &str, ssh: PathBuf, dir: &Path) -> SshBridge {
+    fn faked_bridge(name: &str, ssh: PathBuf) -> SshBridge {
         SshBridge::new(
             &entry(name),
             SshBridgeOptions {
                 ssh_bin: Some(ssh),
-                scratch_parents: vec![dir.to_path_buf()],
+                // NOT the per-test tempdir: on macOS that is
+                // `/var/folders/<..>/T/.tmpXXXX`, and roost refuses a scratch
+                // parent that leaves no room for its `<dir>/ctl.<16 hex>` under
+                // the 103-byte AF_UNIX limit (the CI Swift job runs this suite
+                // there). `/tmp` is short on every platform, and roost's own
+                // per-attempt `roost-ssh-<host>-<pid>-<seq>` naming keeps two
+                // processes apart under it.
+                scratch_parents: vec![PathBuf::from("/tmp")],
                 config_paths: Some(SshConfigPaths {
                     user: None,
                     system: None,
@@ -2178,7 +2185,7 @@ except Exception:
         let dir = tempfile::tempdir().expect("tempdir");
         let log = dir.path().join("ssh.log");
         let ssh = write_fake_ssh(dir.path(), fake.socket_path(), &log);
-        let bridge = faked_bridge("mini3", ssh, dir.path());
+        let bridge = faked_bridge("mini3", ssh);
 
         let first = bridge.ensure().await.expect("the tunnel establishes");
         let RoostEndpoint::Unix(first_socket) = first.clone() else {
@@ -2227,7 +2234,7 @@ except Exception:
     async fn an_ssh_bridge_that_cannot_connect_names_the_machine() {
         let dir = tempfile::tempdir().expect("tempdir");
         let ssh = dir.path().join("no-such-ssh");
-        let bridge = faked_bridge("mini9", ssh, dir.path());
+        let bridge = faked_bridge("mini9", ssh);
         let err = bridge.ensure().await.expect_err("there is no ssh to spawn");
         assert!(err.to_string().contains("machine:mini9"), "{err}");
     }
@@ -2241,7 +2248,7 @@ except Exception:
         let ssh = write_fake_ssh(dir.path(), fake.socket_path(), &log);
         fake.set_tab_axes(TAB, "working", Some(owned("session_status")), false);
 
-        let bridge = faked_bridge("mini3", ssh, dir.path());
+        let bridge = faked_bridge("mini3", ssh);
         let (watcher, mut rx) = watch(Arc::new(bridge));
         let inventory = next_snapshot(&mut rx).await;
         assert_eq!(inventory.host_label, "roost-host");
