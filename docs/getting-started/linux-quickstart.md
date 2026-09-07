@@ -64,11 +64,20 @@ The default config at `/etc/shed/server.yaml` binds **loopback only**
 reachable only on the box itself. Since you reach this host from a workstation,
 edit the config so it faces the network.
 
+!!! warning "Edit the generated file — don't replace it"
+    The snippets below show only the keys to **add or change** in the
+    generated `/etc/shed/server.yaml`. Keep everything else — in particular
+    the generated `firecracker:` block: its path and sizing fields
+    (`instance_dir`, `socket_dir`, `default_cpus`, `default_memory_mb`,
+    `default_disk_gb`, `console_port`, `vsock_base_cid`) are **required**,
+    and a config without them refuses to start, one
+    `firecracker config: <field> is required` error at a time.
+
 **Recommended — token mode** (pinned TLS + minted bearer tokens + an SSH key
 allowlist; the preferred posture for anything networked):
 
 ```yaml
-# /etc/shed/server.yaml
+# Merge into /etc/shed/server.yaml (keep the generated firecracker: block).
 # Full reference: https://charliek.github.io/shed/reference/configuration/
 name: my-linux-host
 ssh_port: 2222
@@ -80,17 +89,17 @@ auth:
     github_users: [your-github-username]   # only these keys may SSH in (and mint tokens)
 bind_address: 0.0.0.0            # face the network (or a specific tailnet/LAN IP)
 # https_port defaults to 8443; http_port is optional in token mode.
-
-firecracker:
-  pull_policy: missing
-  # default_image / image_aliases omitted -> synthesized from the server version.
 ```
+
+Prefer a client certificate over bearer tokens? `auth.mode: mtls` is the same
+hardened posture with the token replaced by an enrolled client cert — see
+[Case 3b in the Security Configuration guide](../guides/security-configuration.md).
 
 **Alternative — open on a trusted private network** (plaintext; Tailscale / LAN
 only, where the network is the trust boundary):
 
 ```yaml
-# /etc/shed/server.yaml
+# Merge into /etc/shed/server.yaml (keep the generated firecracker: block).
 name: my-linux-host
 http_port: 8080
 ssh_port: 2222
@@ -98,9 +107,6 @@ default_backend: firecracker
 
 bind_address: 0.0.0.0            # or a specific tailnet/LAN IP
 allow_insecure_exposure: true    # required: acknowledge a non-loopback bind with no TLS
-
-firecracker:
-  pull_policy: missing
 ```
 
 See the [Security Configuration guide](../guides/security-configuration.md) for
