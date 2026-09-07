@@ -73,74 +73,6 @@ func TestCodexFoldFixtureArc(t *testing.T) {
 	}
 }
 
-func TestClaudeFoldFixtureArc(t *testing.T) {
-	lines := readJSONL(t, "testdata/jsonl/claude_turn.jsonl")
-	f := newClaudeFold()
-
-	if got := f.activity(); got != ActivityUnknown {
-		t.Fatalf("initial activity = %q, want unknown", got)
-	}
-
-	// Step the arc; the mid-turn tool_use must never leave a stale needs_input verdict.
-	var seq []Activity
-	for _, ln := range lines {
-		if f.applyLine(ln) {
-			seq = append(seq, f.activity())
-		}
-	}
-	// Working must appear (prompt / tool_use / tool_result) before the final tail.
-	working := false
-	for _, a := range seq {
-		if a == ActivityWorking {
-			working = true
-		}
-	}
-	if !working {
-		t.Errorf("expected working during the turn, got %v", seq)
-	}
-	// The tool_use block (before its result) must be a working verdict, never a flapped
-	// needs_input — the stop_reason refinement guards the split text/tool_use lines.
-	if got := f.activity(); got != ActivityNeedsInput {
-		t.Fatalf("final activity = %q, want needs_input", got)
-	}
-	if !f.settled() {
-		t.Error("final verdict should be settled")
-	}
-	if got := f.lastMessage(); got != "Done — the command printed `hello-from-claude`." {
-		t.Fatalf("last_message = %q", got)
-	}
-}
-
-// The mid-turn split (assistant text with stop_reason:"tool_use", then a tool_use
-// line) must read working the whole way — no transient needs_input flap.
-func TestClaudeFoldNoMidTurnFlap(t *testing.T) {
-	f := newClaudeFold()
-	f.applyLine([]byte(`{"type":"user","message":{"role":"user","content":"hi"}}`))
-	if got := f.activity(); got != ActivityWorking {
-		t.Fatalf("after prompt = %q, want working", got)
-	}
-	// Text block carrying stop_reason tool_use (more of the turn follows).
-	f.applyLine([]byte(`{"type":"assistant","message":{"role":"assistant","stop_reason":"tool_use","content":[{"type":"text","text":"working on it"}]}}`))
-	if got := f.activity(); got != ActivityWorking {
-		t.Fatalf("mid-turn text = %q, want working (no flap)", got)
-	}
-	f.applyLine([]byte(`{"type":"assistant","message":{"role":"assistant","stop_reason":"tool_use","content":[{"type":"tool_use","id":"t1","name":"Bash","input":{}}]}}`))
-	if got := f.activity(); got != ActivityWorking {
-		t.Fatalf("tool_use = %q, want working", got)
-	}
-	f.applyLine([]byte(`{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1"}]}}`))
-	if got := f.activity(); got != ActivityWorking {
-		t.Fatalf("tool_result = %q, want working (turn continues)", got)
-	}
-	f.applyLine([]byte(`{"type":"assistant","message":{"role":"assistant","stop_reason":"end_turn","content":[{"type":"text","text":"all done"}]}}`))
-	if got := f.activity(); got != ActivityNeedsInput {
-		t.Fatalf("end_turn text = %q, want needs_input", got)
-	}
-	if got := f.lastMessage(); got != "all done" {
-		t.Fatalf("last_message = %q, want %q", got, "all done")
-	}
-}
-
 // ---- opencode fold: the sanitized live /event capture folds to the expected arc ----
 
 // opencodeFeedRow is one expected drained feed row (only the fields the tests assert).
@@ -771,7 +703,6 @@ func TestFoldsToleratePathologicalLines(t *testing.T) {
 		fold activityFold
 	}{
 		{"codex", newCodexFold()},
-		{"claude", newClaudeFold()},
 		{"opencode", newOpencodeFold()},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -1027,22 +958,7 @@ func TestMergedActivityPrecedence(t *testing.T) {
 	}
 }
 
-// ---- cwd encoding ----
-
-func TestEncodeClaudeProject(t *testing.T) {
-	cases := map[string]string{
-		"/home/shed":            "-home-shed",
-		"/home/shed/my.project": "-home-shed-my-project",
-		"/Users/dev/code_2":     "-Users-dev-code-2",
-	}
-	for in, want := range cases {
-		if got := encodeClaudeProject(in); got != want {
-			t.Errorf("encodeClaudeProject(%q) = %q, want %q", in, got, want)
-		}
-	}
-}
-
-// ---- correlation: two sessions, one workdir (codex + claude) ----
+// ---- correlation: two sessions, one workdir (codex) ----
 
 func writeCodexRollout(t *testing.T, root, sessionID, cwd string, createdAt time.Time) string {
 	t.Helper()
@@ -1118,48 +1034,6 @@ func TestCorrelateCodexByBackWrittenID(t *testing.T) {
 	corr, ok := correlateCodex(getenv, "/home/shed", "pinned-id", base, true)
 	if !ok || corr.path != old {
 		t.Fatalf("id match = (%v,%q), want %q", ok, corr.path, old)
-	}
-}
-
-func writeClaudeTranscript(t *testing.T, projectDir, sessionID, cwd string, createdAt time.Time) string {
-	t.Helper()
-	if err := os.MkdirAll(projectDir, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	path := filepath.Join(projectDir, sessionID+".jsonl")
-	first := fmt.Sprintf(`{"type":"system","cwd":%q,"timestamp":%q,"sessionId":%q}`,
-		cwd, createdAt.Format(time.RFC3339Nano), sessionID)
-	writeFile(t, path, first+"\n")
-	return path
-}
-
-func TestCorrelateClaudeWindowAndID(t *testing.T) {
-	home := t.TempDir()
-	getenv := func(k string) string {
-		if k == "HOME" {
-			return home
-		}
-		return ""
-	}
-	cwd := "/home/shed"
-	projectDir := filepath.Join(home, ".claude", "projects", encodeClaudeProject(cwd))
-	base := time.Date(2026, 7, 11, 17, 0, 0, 0, time.UTC)
-
-	inWindow := writeClaudeTranscript(t, projectDir, "aaaa-a", cwd, base)
-	writeClaudeTranscript(t, projectDir, "bbbb-b", cwd, base.Add(-10*time.Minute))
-
-	corr, ok := correlateClaude(getenv, cwd, "", base.Add(3*time.Second), true)
-	if !ok || corr.path != inWindow {
-		t.Fatalf("window match = (%v,%q), want %q", ok, corr.path, inWindow)
-	}
-	if corr.ambiguous {
-		t.Error("single window match must not be ambiguous")
-	}
-	// Exact id match ignores the window.
-	corr, ok = correlateClaude(getenv, cwd, "bbbb-b", base, true)
-	want := filepath.Join(projectDir, "bbbb-b.jsonl")
-	if !ok || corr.path != want {
-		t.Fatalf("id match = (%v,%q), want %q", ok, corr.path, want)
 	}
 }
 
@@ -1358,37 +1232,6 @@ func TestCodexFoldGapClearsPendingThenTaskCompleteSettles(t *testing.T) {
 	}
 }
 
-// ---- claude cwd equality (the encoded dir name is lossy) ----
-
-func TestCorrelateClaudeCwdCollisionRejected(t *testing.T) {
-	home := t.TempDir()
-	getenv := func(k string) string {
-		if k == "HOME" {
-			return home
-		}
-		return ""
-	}
-	// "/home/shed/a-b" and "/home/shed/a_b" encode to the SAME project dir.
-	cwdA, cwdB := "/home/shed/a-b", "/home/shed/a_b"
-	if encodeClaudeProject(cwdA) != encodeClaudeProject(cwdB) {
-		t.Fatal("precondition: the two cwds must collide in the encoding")
-	}
-	projectDir := filepath.Join(home, ".claude", "projects", encodeClaudeProject(cwdA))
-	base := time.Date(2026, 7, 11, 17, 0, 0, 0, time.UTC)
-
-	// Only a transcript whose PEEKED cwd is the other path exists: no match for cwdA.
-	writeClaudeTranscript(t, projectDir, "bbbb-b", cwdB, base)
-	if _, ok := correlateClaude(getenv, cwdA, "", base, true); ok {
-		t.Fatal("a transcript with a colliding-but-different cwd must not correlate")
-	}
-	// The exact-cwd transcript does match.
-	want := writeClaudeTranscript(t, projectDir, "aaaa-a", cwdA, base)
-	corr, ok := correlateClaude(getenv, cwdA, "", base, true)
-	if !ok || corr.path != want {
-		t.Fatalf("exact-cwd match = (%v,%q), want %q", ok, corr.path, want)
-	}
-}
-
 // ---- candidates without a peeked timestamp are excluded from window matching ----
 
 func TestCorrelateExcludesNoTimestampCandidates(t *testing.T) {
@@ -1415,22 +1258,6 @@ func TestCorrelateExcludesNoTimestampCandidates(t *testing.T) {
 	corr, ok := correlateCodex(getenv, "/home/shed", "notime", base, true)
 	if !ok || !strings.Contains(corr.path, "notime") {
 		t.Fatalf("codex: exact-id match should still work, got (%v,%q)", ok, corr.path)
-	}
-
-	// claude: a transcript with rows carrying no timestamp.
-	projectDir := filepath.Join(home, ".claude", "projects", encodeClaudeProject("/home/shed"))
-	if err := os.MkdirAll(projectDir, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	writeFile(t, filepath.Join(projectDir, "nt-2.jsonl"),
-		`{"type":"system","cwd":"/home/shed","sessionId":"nt-2"}`+"\n")
-	if _, ok := correlateClaude(getenv, "/home/shed", "", base, true); ok {
-		t.Fatal("claude: a no-timestamp candidate must not window-match")
-	}
-	// Exact-id still resolves it by filename.
-	corr, ok = correlateClaude(getenv, "/home/shed", "nt-2", base, true)
-	if !ok || filepath.Base(corr.path) != "nt-2.jsonl" {
-		t.Fatalf("claude: exact-id match should still work, got (%v,%q)", ok, corr.path)
 	}
 }
 

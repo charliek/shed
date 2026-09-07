@@ -725,8 +725,8 @@ func (h *Hub) serveOn(ctx context.Context, ln net.Listener) error {
 	errCh := make(chan error, 1)
 	go func() { errCh <- srv.Serve(ln) }()
 
-	// A best-effort fsnotify layer over the codex + claude JSONL trees nudges the loop
-	// to reconcile sub-tick when a watched transcript is appended, so an activity
+	// A best-effort fsnotify layer over the codex JSONL tree nudges the loop
+	// to reconcile sub-tick when a watched rollout is appended, so an activity
 	// transition surfaces promptly instead of waiting for the next tick. If it cannot
 	// start (fsnotify unavailable), the tick alone drives — correctness is unchanged.
 	nudge := h.startFSNudger(ctx)
@@ -786,16 +786,13 @@ func (h *Hub) idleExitHandoff(ln net.Listener) {
 	}
 }
 
-// startFSNudger starts the best-effort fsnotify layer over the codex + claude JSONL
-// roots and returns the channel it nudges on a watched-file change. A nil channel
+// startFSNudger starts the best-effort fsnotify layer over the codex JSONL
+// root and returns the channel it nudges on a watched-file change. A nil channel
 // (fsnotify unavailable / HOME unset) is a valid select arm that simply never fires,
 // leaving the reconcile tick as the sole driver. The nudger goroutine stops with ctx.
 func (h *Hub) startFSNudger(ctx context.Context) <-chan struct{} {
 	var roots []string
 	if r := codexSessionsRoot(h.cfg.getenv); r != "" {
-		roots = append(roots, r)
-	}
-	if r := claudeProjectsRoot(h.cfg.getenv); r != "" {
 		roots = append(roots, r)
 	}
 	if len(roots) == 0 {
@@ -810,7 +807,7 @@ func (h *Hub) startFSNudger(ctx context.Context) <-chan struct{} {
 	return n.nudge
 }
 
-// shutdown closes all SSE subscribers + session watchers (codex/claude JSONL tails,
+// shutdown closes all SSE subscribers + session watchers (codex JSONL tails,
 // opencode SSE clients) and gracefully stops the HTTP server.
 func (h *Hub) shutdown(srv *http.Server) error {
 	h.closeAllSubscribers()
@@ -821,8 +818,8 @@ func (h *Hub) shutdown(srv *http.Server) error {
 	return nil
 }
 
-// closeAllWatchers releases every tracked session's watcher — a JSONL tail (codex/
-// claude) or an opencode SSE client (hub shutdown).
+// closeAllWatchers releases every tracked session's watcher — a JSONL tail (codex)
+// or an opencode SSE client (hub shutdown).
 func (h *Hub) closeAllWatchers() {
 	h.trackMu.Lock()
 	defer h.trackMu.Unlock()

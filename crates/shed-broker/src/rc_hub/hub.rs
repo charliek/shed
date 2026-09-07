@@ -1284,7 +1284,7 @@ fn shutdown(hub: &Arc<Hub>) {
     hub.close_all_watchers();
 }
 
-/// Starts the best-effort fsnotify layer over the codex + claude JSONL roots,
+/// Starts the best-effort fsnotify layer over the codex JSONL root,
 /// forwarding each nudge into the reconcile loop's channel (`startFSNudger`,
 /// `hub.go:826`). `None` (no roots / fsnotify unavailable) leaves the tick as
 /// the sole driver — correctness unchanged, latency only. The forwarder
@@ -1295,13 +1295,9 @@ pub fn spawn_fs_nudger(
 ) -> Option<std::thread::JoinHandle<()>> {
     let getenv: &dyn Fn(&str) -> String = &*hub.cfg.getenv;
     let mut roots = Vec::new();
-    for r in [
-        super::watch_codex::codex_sessions_root(getenv),
-        super::watch_claude::claude_projects_root(getenv),
-    ] {
-        if !r.is_empty() {
-            roots.push(r);
-        }
+    let codex_root = super::watch_codex::codex_sessions_root(getenv);
+    if !codex_root.is_empty() {
+        roots.push(codex_root);
     }
     if roots.is_empty() {
         return None;

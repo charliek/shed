@@ -30,8 +30,10 @@
 //!   seams (`watch.go`'s pure parts; the `fileWatcher`/`fsNudger` transports
 //!   follow in H7).
 //! - [`tail`] — the resilient JSONL line tailer (`watch_tail.go`).
-//! - [`watch_claude`] / [`watch_codex`] — the claude/codex folds + their
-//!   JSONL correlation (`watch_claude.go`, `watch_codex.go`).
+//! - [`watch_codex`] — the codex fold + its JSONL correlation
+//!   (`watch_codex.go`; the claude fold/correlation this once paired with
+//!   was removed — `charliek/shed#321` — once roost's own Claude Code hooks
+//!   took over reporting that activity).
 //! - [`watch_cursor`] — the cursor hook-event fold + transcript
 //!   restart-backfill (`watch_cursor.go`'s pure half; the push-fed watcher
 //!   wrapper follows in H7).
@@ -85,7 +87,6 @@ pub mod stability;
 pub mod tail;
 pub mod verbs;
 pub mod watch;
-pub mod watch_claude;
 pub mod watch_codex;
 pub mod watch_cursor;
 pub mod watch_opencode;

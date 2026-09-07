@@ -52,8 +52,8 @@ type trackedSession struct {
 	lastMessage string // sanitized preview from the watcher (JSONL tail or opencode SSE; "" from stability)
 	lastState   State
 
-	// watcher is the session's structured-signal watcher: a JSONL tail (codex rollout /
-	// claude transcript), lazily created once the session is pinned to a file, OR an
+	// watcher is the session's structured-signal watcher: a JSONL tail (codex rollout),
+	// lazily created once the session is pinned to a file, OR an
 	// opencode SSE client, lazily created against its recorded port and correlating
 	// asynchronously in its own goroutine (see ensureWatcher). nil for kinds with no
 	// structured signal, or before correlation succeeds. When present and FRESH, its
@@ -312,9 +312,9 @@ func (h *Hub) reconcile() {
 		// committed under the lock below, never published unlocked.
 		h.trackMu.Unlock()
 
-		// Lazily correlate the session to its structured signal — codex rollout / claude
-		// transcript JSONL for those kinds, or an opencode session's SSE stream (async,
-		// its own goroutine). Once correlated, the watcher tails/subscribes and — when
+		// Lazily correlate the session to its structured signal — codex rollout JSONL,
+		// or an opencode session's SSE stream (async, its own goroutine). Once
+		// correlated, the watcher tails/subscribes and — when
 		// FRESH — overrides the pane-stability tracker below. newW is any watcher freshly
 		// created this pass.
 		newW := h.ensureWatcher(tr, s)
@@ -598,10 +598,10 @@ const maxCorrelateTries = 40
 // returned watcher under the lock. It DOES mutate tr.correlateTried / tr.pendingAgentID,
 // which are reconcile-only (never read by handlers) and thus safe to touch unlocked.
 //
-// codex/claude correlate a JSONL file (rollout / transcript) and build a tailing
-// fileWatcher here; on an unambiguous match it back-writes the discovered agent session
-// id into the tmux env so a hub restart re-correlates exactly, while an ambiguous window
-// match follows only new appends (activity stays unknown until an in-file event confirms).
+// codex correlates a JSONL file (its rollout log) and builds a tailing fileWatcher
+// here; on an unambiguous match it back-writes the discovered agent session id into the
+// tmux env so a hub restart re-correlates exactly, while an ambiguous window match
+// follows only new appends (activity stays unknown until an in-file event confirms).
 // opencode instead returns a NON-BLOCKING SSE/REST watcher that correlates itself on its
 // own goroutine (see the opencode arm below and drainConfirmedAgentID in reconcile).
 func (h *Hub) ensureWatcher(tr *trackedSession, s Session) sessionWatcher {
@@ -613,7 +613,7 @@ func (h *Hub) ensureWatcher(tr *trackedSession, s Session) sessionWatcher {
 		return nil // no live activity to tail; retry once the session becomes usable
 	}
 
-	// opencode diverges from the codex/claude file-correlation path below: its watcher
+	// opencode diverges from the codex file-correlation path below: its watcher
 	// owns its OWN async correlation over SSE/REST (constructed NON-BLOCKING; it pins the
 	// session id from its own /event stream and surfaces it via drainConfirmedAgentID —
 	// see watch_opencode_transport.go). So it needs none of the file-correlation +
@@ -670,22 +670,14 @@ func (h *Hub) ensureWatcher(tr *trackedSession, s Session) sessionWatcher {
 	createdAt, hasCreatedAt := parseJSONLTime(s.CreatedAt)
 	agentID := agentSessionEnv(h.cfg.runner, s.TmuxSession)
 
-	var corr correlation
-	var ok bool
-	var fold activityFold
-	switch {
-	case s.Kind == KindCodex:
-		corr, ok = correlateCodex(h.cfg.getenv, s.Workdir, agentID, createdAt, hasCreatedAt)
-		fold = newCodexFold()
-	case IsClaudeKind(s.Kind):
-		corr, ok = correlateClaude(h.cfg.getenv, s.Workdir, agentID, createdAt, hasCreatedAt)
-		fold = newClaudeFold()
-	default:
+	if s.Kind != KindCodex {
 		return nil
 	}
+	corr, ok := correlateCodex(h.cfg.getenv, s.Workdir, agentID, createdAt, hasCreatedAt)
 	if !ok {
 		return nil
 	}
+	fold := newCodexFold()
 
 	// Unambiguous match → do a bounded catch-up read so the current activity is known
 	// immediately. Ambiguous → follow only new appends (unknown until an event confirms

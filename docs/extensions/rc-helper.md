@@ -588,8 +588,8 @@ that log:
   `working`. A pane that holds still for the quiet period (4 s) downgrades `working` →
   `idle`, or → `needs_input` **only** when the kind declares a prompt anchor the stable
   pane matches (an anchorless kind's stable pane is always `idle`).
-- **codex** tails the rollout JSONL; **claude** tails the transcript JSONL (claude feeds
-  *activity* only in this phase — messages are deferred). **opencode** has no JSONL to
+- **codex** tails the rollout JSONL. (claude no longer tails a transcript — `charliek/shed#321`;
+  roost's own Claude Code hooks report that activity now.) **opencode** has no JSONL to
   tail — the bare `opencode` TUI runs an embedded HTTP+SSE server on a per-session
   loopback port (recorded at `create` time), and the hub subscribes to its `/event`
   stream (plus a REST seed) as a second client, folding the same shape of
@@ -819,8 +819,8 @@ session's first prompt; the `turn` verb covers every steer after that.
 The hub pins each watchable session to its agent's JSONL file by **cwd + a created-at
 window (±60 s)**, pinned by **inode**:
 
-- **codex** matches rollout files under `~/.codex/sessions`; **claude** derives the
-  transcript dir from the cwd encoding. On a unique match the hub does a bounded
+- **codex** matches rollout files under `~/.codex/sessions`. (claude no longer
+  correlates a transcript — `charliek/shed#321`.) On a unique match the hub does a bounded
   catch-up read (so current activity is known immediately) and **back-writes**
   `SHED_RC_AGENT_SESSION=<id>` into the tmux env (an additive key; `SHED_RC_V` stays 2)
   so a hub restart re-correlates exactly.

@@ -3,7 +3,7 @@
 //! parts of `internal/ext/rc/watch.go` (plan 010 H4).
 //!
 //! The JSONL watchers are the structured-signal source that OVERRIDES the pane
-//! stability engine for codex and claude sessions: instead of inferring
+//! stability engine for codex sessions: instead of inferring
 //! activity from whether the tmux pane keeps redrawing, they tail the agent's
 //! own append-only log and read the turn/tool structure directly. opencode has
 //! no log to tail — its watcher subscribes to the agent's embedded HTTP+SSE
@@ -15,7 +15,7 @@
 //! From H5 it also carries the fold contracts ([`ActivityFold`] /
 //! [`MessageProducer`] — Go's `activityFold`/`messageProducer` interfaces,
 //! `watch.go:73`/`107`) and `listJSONLUnder`, consumed by the per-kind folds in
-//! [`super::watch_claude`] / [`super::watch_codex`] / [`super::watch_cursor`] /
+//! [`super::watch_codex`] / [`super::watch_cursor`] /
 //! [`super::watch_opencode`]. Still Go-only until their commits: `fileWatcher`
 //! + `fsNudger` (H7 — transports) and the opencode SSE transport (H8).
 
@@ -57,7 +57,7 @@ pub trait ActivityFold {
     /// Go's runtime `messageProducer` type-assert on a fold
     /// (`(*fileWatcher).refresh`, `watch.go:195`), statically: a fold that
     /// also produces a feed overrides this to forward to
-    /// [`MessageProducer::drain_messages`]; an activity-only fold (claude)
+    /// [`MessageProducer::drain_messages`]; an activity-only fold with no feed
     /// inherits the empty default and contributes no feed rows.
     fn drain_fold_messages(&mut self) -> Vec<FeedMessage> {
         Vec::new()
@@ -68,7 +68,7 @@ pub trait ActivityFold {
 /// per-session watcher (`sessionWatcher`, `watch.go:120`): refresh it, read
 /// its current verdict, drain any feed messages it produced, and check
 /// whether it has ever folded an event. Implemented by [`FileWatcher`]
-/// (codex/claude), the cursor watcher, and (H8) the opencode watcher, so
+/// (codex), the cursor watcher, and (H8) the opencode watcher, so
 /// reconcile is transport-agnostic between a tailed JSONL file, a hook-push
 /// inbox, and a live SSE feed.
 ///
@@ -199,8 +199,8 @@ pub fn noop_logf() -> LogFn {
 }
 
 /// A fold that ALSO produces a normalized message feed (`messageProducer`,
-/// `watch.go:107`) — codex, opencode and cursor; claude feeds activity only in
-/// this phase. Every watcher drains it on each refresh. It is a separate trait
+/// `watch.go:107`) — codex, opencode and cursor. Every watcher drains it on
+/// each refresh. It is a separate trait
 /// from [`ActivityFold`] because the cursor fold produces a feed without being
 /// an `ActivityFold` at all (its unit is a hook EVENT, not a JSONL line).
 pub trait MessageProducer {
@@ -417,7 +417,7 @@ pub(crate) fn first_non_empty<'a>(a: &'a str, b: &'a str) -> &'a str {
 }
 
 // ---------------------------------------------------------------------------
-// fileWatcher (watch.go:137-271) — the tailer+fold transport for codex/claude
+// fileWatcher (watch.go:137-271) — the tailer+fold transport for codex
 // ---------------------------------------------------------------------------
 
 use std::sync::Mutex;
@@ -578,7 +578,7 @@ impl SessionWatcher for FileWatcher {
 // fsnotify nudge layer (watch.go:438-564) over the `notify` crate
 // ---------------------------------------------------------------------------
 
-/// Watches the codex + claude root trees and pings a channel whenever a file
+/// Watches the codex root tree and pings a channel whenever a file
 /// changes, so the hub can run a reconcile sub-tick (`fsNudger`,
 /// `watch.go:447`) — activity surfaces promptly instead of waiting up to the
 /// active interval. It is a best-effort LATENCY optimization: the reconcile
@@ -918,12 +918,12 @@ pub fn merged_activity(
 }
 
 /// Whether a kind has a structured-signal watcher (`watchableKind`,
-/// `watch.go:303`): codex/claude tail a JSONL file, opencode subscribes to its
+/// `watch.go:303`): codex tails a JSONL file, opencode subscribes to its
 /// embedded HTTP+SSE server, and cursor is fed by its own hook scripts pushing
 /// into the hub's ingest route. Other kinds derive activity from pane
 /// stability alone.
 pub fn watchable_kind(k: &RcKind) -> bool {
-    matches!(k, RcKind::Codex | RcKind::Opencode | RcKind::Cursor) || k.runs_claude()
+    matches!(k, RcKind::Codex | RcKind::Opencode | RcKind::Cursor)
 }
 
 /// The outcome of mapping a tmux session to its agent JSONL file
@@ -940,8 +940,8 @@ pub struct Correlation {
 }
 
 /// The correlation metadata read from an agent JSONL file's early lines
-/// (codex rollout `session_meta` / claude transcript header) — `jsonlPeek`,
-/// `watch.go:317`. Both per-kind peek parsers return it so the newest-pick +
+/// (codex rollout `session_meta`) — `jsonlPeek`,
+/// `watch.go:317`. The per-kind peek parser returns it so the newest-pick +
 /// ambiguity logic below is shared. Go's `createdAt`+`hasTime` pair is an
 /// `Option` here.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -962,10 +962,10 @@ pub struct PeekCandidate {
 /// Whether candidate `a` is newer than `b` by peeked created-at (`peekNewer`,
 /// `watch.go:336`). Window candidates always carry a created-at (no-timestamp
 /// files are excluded from window matching by the correlate functions).
-/// `name_tiebreak` breaks an exact created-at tie by filename; only codex
+/// `name_tiebreak` breaks an exact created-at tie by filename; codex
 /// passes true (rollout names are timestamp-prefixed, so lexical order is
-/// chronological) — claude transcript names are bare UUIDs, where a filename
-/// comparison would be meaningless.
+/// chronological) — a kind whose file names carry no chronology would pass
+/// false, leaving an exact tie to slice order.
 pub fn peek_newer(a: &PeekCandidate, b: &PeekCandidate, name_tiebreak: bool) -> bool {
     if a.peek.created_at != b.peek.created_at {
         return a.peek.created_at > b.peek.created_at;
@@ -1001,6 +1001,15 @@ pub fn pick_correlation(matches: &[PeekCandidate], name_tiebreak: bool) -> Corre
     }
 }
 
+/// A path's basename (`filepath.Base`) — used by `correlate_codex`'s
+/// exact-id scan and its fold test mod's path assertions.
+pub(crate) fn base_of(path: &str) -> &str {
+    std::path::Path::new(path)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(path)
+}
+
 /// Whether `a` and `b` are within `w` of each other (`withinWindow`,
 /// `watch.go:364`).
 ///
@@ -1022,9 +1031,9 @@ pub fn within_window(a: DateTime<Utc>, b: DateTime<Utc>, w: Duration) -> bool {
 /// separator, leap-second `:60`, and a U+2212 minus in the offset; Go
 /// additionally accepts a comma fraction, a 1-digit hour, and `+24:00`
 /// offsets. No real producer emits any of these shapes (codex stamps via
-/// chrono, claude via JS `toISOString()`), so the delta is left undocumented
-/// in behavior rather than papered over with pre-filters; the H5 correlate
-/// differential cells are the tripwire if a producer ever changes.
+/// chrono), so the delta is left undocumented in behavior rather than
+/// papered over with pre-filters; the H5 correlate differential cells are
+/// the tripwire if a producer ever changes.
 pub fn parse_jsonl_time(s: &str) -> Option<DateTime<Utc>> {
     if s.is_empty() {
         return None;
@@ -1214,10 +1223,13 @@ mod tests {
     #[test]
     fn watchable_kinds() {
         assert!(watchable_kind(&RcKind::Codex));
-        assert!(watchable_kind(&RcKind::ClaudeRc));
-        assert!(watchable_kind(&RcKind::ClaudeBroker));
         assert!(watchable_kind(&RcKind::Opencode));
         assert!(watchable_kind(&RcKind::Cursor));
+        assert!(
+            !watchable_kind(&RcKind::ClaudeRc),
+            "claude no longer tails a transcript (shed#321)"
+        );
+        assert!(!watchable_kind(&RcKind::ClaudeBroker));
         assert!(!watchable_kind(&RcKind::Shell), "shell is stability only");
         assert!(!watchable_kind(&RcKind::Other("mystery".into())));
     }
@@ -1270,8 +1282,8 @@ mod tests {
     }
 
     // peekNewer's created-at ordering + the codex-only filename tiebreak
-    // (rollout names are timestamp-prefixed; claude UUID names must NOT
-    // tiebreak).
+    // (rollout names are timestamp-prefixed; a kind with no chronological
+    // filenames must NOT tiebreak).
     #[test]
     fn peek_newer_tiebreak() {
         let base = t0();
@@ -1632,14 +1644,6 @@ mod tests {
             oc.drain_fold_messages().len(),
             1,
             "opencode feed reaches the trait object"
-        );
-        // claude is activity-only: the default empty drain is correct.
-        let mut claude: Box<dyn ActivityFold + Send> =
-            Box::new(super::super::watch_claude::ClaudeFold::new());
-        claude.apply_line(br#"{"type":"user","message":{"role":"user","content":"hi"}}"#);
-        assert!(
-            claude.drain_fold_messages().is_empty(),
-            "claude contributes no feed rows"
         );
     }
 

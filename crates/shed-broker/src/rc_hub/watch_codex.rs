@@ -39,15 +39,14 @@ use super::messages::{
     FEED_TYPE_TOOL_RESULT, FEED_TYPE_TOOL_USE,
 };
 use super::watch::{
-    first_non_empty, json_first_byte, list_jsonl_under, parse_jsonl_time, pick_correlation,
-    value_opt, within_window, ActivityFold, Correlation, JsonlPeek, MessageProducer, PeekCandidate,
-    CORRELATE_WINDOW,
+    base_of, first_non_empty, json_first_byte, list_jsonl_under, parse_jsonl_time,
+    pick_correlation, value_opt, within_window, ActivityFold, Correlation, JsonlPeek,
+    MessageProducer, PeekCandidate, CORRELATE_WINDOW,
 };
-use super::watch_claude::base_of;
 
 /// The generic envelope every rollout line shares (`codexLine`,
-/// `watch_codex.go:32`). (Accepted delta, as on `ClaudeLine`: duplicate JSON
-/// keys error here where Go last-wins — no real producer emits them.)
+/// `watch_codex.go:32`). (Accepted delta: duplicate JSON keys error here
+/// where Go last-wins — no real producer emits them.)
 #[derive(Debug, Default, Deserialize)]
 struct CodexLine {
     #[serde(default, deserialize_with = "null_default")]

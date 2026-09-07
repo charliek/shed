@@ -49,7 +49,6 @@ use super::watch::{
     agent_session_env, back_write_agent_session, merged_activity, opencode_port_env,
     parse_jsonl_time, watchable_kind, FileWatcher, SessionWatcher,
 };
-use super::watch_claude::{correlate_claude, ClaudeFold};
 use super::watch_codex::{correlate_codex, CodexFold};
 use super::watch_cursor::CursorWatcher;
 use super::watch_opencode_transport::OpencodeWatcher;
@@ -815,11 +814,6 @@ impl Hub {
                 (
                     correlate_codex(getenv, workdir, &agent_id, created_at),
                     Box::new(CodexFold::new()),
-                )
-            } else if s.kind.runs_claude() {
-                (
-                    correlate_claude(getenv, workdir, &agent_id, created_at),
-                    Box::new(ClaudeFold::new()),
                 )
             } else {
                 return None;

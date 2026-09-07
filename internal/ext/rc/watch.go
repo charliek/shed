@@ -14,9 +14,9 @@ import (
 )
 
 // The JSONL watchers are the structured-signal source that OVERRIDES the pane
-// stability engine for codex and claude sessions: instead of inferring activity from
+// stability engine for codex sessions: instead of inferring activity from
 // whether the tmux pane keeps redrawing, they tail the agent's own append-only log
-// (codex rollout / claude transcript) and read the turn/tool structure directly.
+// (its rollout) and read the turn/tool structure directly.
 // opencode has no append-only log to tail — its sessionWatcher (opencodeWatcher,
 // watch_opencode_transport.go) is a structurally parallel but transport-different
 // sibling that subscribes to the agent's embedded HTTP+SSE server instead of tailing a
@@ -31,19 +31,19 @@ import (
 // arrives.
 //
 // Layout of the watcher stack:
-//   - lineTailer (watch_tail.go): resilient byte-level tailing (codex/claude only).
+//   - lineTailer (watch_tail.go): resilient byte-level tailing (codex only).
 //   - activityFold (below): a per-kind fold of the parsed line/event stream into an
-//     activity verdict + last-message preview (codexFold, claudeFold, opencodeFold; the
+//     activity verdict + last-message preview (codexFold, opencodeFold; the
 //     cursor fold takes hook EVENTS rather than lines, so it implements messageProducer
 //     but not this interface — see watch_cursor.go).
-//   - fileWatcher (below): tailer + fold + a freshness-annotated snapshot (codex/claude).
+//   - fileWatcher (below): tailer + fold + a freshness-annotated snapshot (codex).
 //   - opencodeWatcher (watch_opencode_transport.go): SSE/REST client + fold + a
 //     freshness-annotated snapshot (opencode's sessionWatcher).
 //   - cursorWatcher (watch_cursor.go): bounded push inbox + fold + a freshness-annotated
 //     snapshot, fed by the hub's ingest handler (cursor's sessionWatcher).
 //   - correlation (below + the per-kind files): mapping a tmux session to its file.
 //   - fsNudger (below): the fsnotify layer that wakes reconcile sub-tick on a write
-//     (codex/claude only; opencode's SSE stream and cursor's hook POSTs are their own
+//     (codex only; opencode's SSE stream and cursor's hook POSTs are their own
 //     arrival signals — both land between ticks and are folded on the next one).
 
 // watcherFreshWindow bounds how long a correlated watcher's non-settled, non-working
@@ -92,8 +92,8 @@ type activityFold interface {
 }
 
 // messageProducer is a fold that ALSO produces a normalized message feed (codex,
-// opencode and cursor; claude feeds activity only in this phase). Every watcher drains it
-// on each refresh; a fold that does not implement it contributes no feed messages. It is
+// opencode and cursor). Every watcher drains it on each refresh; a fold that does not
+// implement it contributes no feed messages. It is
 // declared separately from activityFold, and asserted separately, because the cursor fold
 // produces a feed without being an activityFold at all (its unit is a hook EVENT, not a
 // JSONL line).
@@ -295,13 +295,13 @@ func mergedActivity(watcherActivity Activity, watcherMessage string, watcherFres
 	return stability, ""
 }
 
-// watchableKind reports whether a kind has a structured-signal watcher: codex/claude
-// tail a JSONL file (rollout / transcript), opencode subscribes to its embedded
+// watchableKind reports whether a kind has a structured-signal watcher: codex tails a
+// JSONL file (its rollout), opencode subscribes to its embedded
 // HTTP+SSE server (watch_opencode_transport.go), and cursor is fed by its own hook
 // scripts pushing into the hub's ingest route (watch_cursor.go). Other kinds derive
 // activity from pane stability alone.
 func watchableKind(k Kind) bool {
-	return k == KindCodex || IsClaudeKind(k) || k == KindOpencode || k == KindCursor
+	return k == KindCodex || k == KindOpencode || k == KindCursor
 }
 
 // correlation is the outcome of mapping a tmux session to its agent JSONL file.
@@ -312,8 +312,8 @@ type correlation struct {
 }
 
 // jsonlPeek is the correlation metadata read from an agent JSONL file's early lines
-// (codex rollout session_meta / claude transcript header). Both per-kind peek parsers
-// return it so the newest-pick + ambiguity logic below is shared.
+// (codex rollout session_meta). The per-kind peek parser returns it so the
+// newest-pick + ambiguity logic below is shared.
 type jsonlPeek struct {
 	sessionID string
 	cwd       string
@@ -330,9 +330,9 @@ type peekCandidate struct {
 // peekNewer reports whether candidate a is newer than b by peeked created-at (window
 // candidates always carry one — no-timestamp files are excluded from window matching
 // by the correlate functions). nameTiebreak breaks an exact created-at tie by
-// filename; only codex passes true (rollout names are timestamp-prefixed, so lexical
-// order is chronological) — claude transcript names are bare UUIDs, where a filename
-// comparison would be meaningless.
+// filename; codex passes true (rollout names are timestamp-prefixed, so lexical
+// order is chronological) — a kind whose file names carry no chronology would pass
+// false, leaving an exact tie to slice order.
 func peekNewer(a peekCandidate, b peekCandidate, nameTiebreak bool) bool {
 	if !a.peek.createdAt.Equal(b.peek.createdAt) {
 		return a.peek.createdAt.After(b.peek.createdAt)
@@ -437,7 +437,7 @@ func listJSONLUnder(root string, match func(base string) bool) []string {
 
 // ---- fsnotify nudge layer ----
 
-// fsNudger watches the codex + claude root trees and pings a channel whenever a file
+// fsNudger watches the codex root tree and pings a channel whenever a file
 // changes, so the hub can run a reconcile sub-tick (activity surfaces promptly instead
 // of waiting up to the active interval). It is a best-effort LATENCY optimization: the
 // reconcile tick already refreshes every watcher, so a missed notification only delays
