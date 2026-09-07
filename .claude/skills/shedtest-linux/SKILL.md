@@ -96,7 +96,8 @@ machine the app is running on. Two env vars steer it:
 
 | Variable | Where it is read | Effect |
 |---|---|---|
-| `SHED_TAURI_ROOST_SOCKETS` | `src-tauri/src/env.rs`, **test mode only** | Comma-separated `<machine>=<socket path>`. A named machine (including `localhost`) is dialled on that Unix socket instead of through roost's SSH client-bridge. Non-empty ⇒ **no** machine ever spawns ssh; an unmapped entry is a permanently-unreachable row. |
+| `SHED_TAURI_ROOST_SOCKETS` | `src-tauri/src/env.rs`, **test mode only** | Comma-separated `<machine>=<socket path>`. A named machine (including `localhost`) is dialled on that Unix socket instead of through roost's SSH client-bridge. Non-empty ⇒ **no** machine ever spawns ssh; an unmapped entry is a permanently-unreachable row. This is the app-level var — `ui.py`'s `subproc_env` sets or CLEARS it on every hermetic launch (never inherited from the parent shell), so nothing downstream of the harness can leak a stray value in. |
+| `SHEDTEST_ROOST_SOCKETS` | `conftest.py`'s `_env_roost_sockets`, harness-level | Same `<machine>=<socket path>` shape, read once and passed explicitly as `roost_sockets` to the SESSION app fixture (`_app_session`) — the harness-level opt-in for pointing the pytest session app at a real daemon instead of `fake_roost.py`. A custom driver script (not going through `conftest.py`) must do the equivalent itself: read this var, parse it into a `{name: path}` map, and pass it as `ui.launch(..., roost_sockets=...)` — since the launch no longer inherits, nothing shows up unless the caller supplies the map explicitly. |
 | `SHED_ROOST_POLL_MS` | `shed_app::roost`, read **once per watcher at spawn** | The `tab.list` poll cadence in ms (default 2000, floor 10). Set it to `50` so "within one poll interval" assertions are fast — it must be in the environment **before** the app starts. |
 
 `localhost` is listed only once its socket has answered at least once (connect-if-present in
@@ -121,14 +122,20 @@ docker run --rm -v "$ROOT:/repo:ro" -v "$HOST_OUT:/out" \
   -v shed-tauri-linux-target:/target -e CARGO_TARGET_DIR=/target \
   -e UV_PROJECT_ENVIRONMENT=/tmp/uv-venv \
   -e SHED_TAURI_BIN=/target/debug/shed-desktop-tauri \
-  -e SHED_TAURI_ROOST_SOCKETS=localhost=/roost/roost.sock \
+  -e SHEDTEST_ROOST_SOCKETS=localhost=/roost/roost.sock \
   -e SHED_ROOST_POLL_MS=200 \
   --cap-add SYS_ADMIN --security-opt seccomp=unconfined --shm-size=1g \
   shed-tauri-linux:latest bash -c '…build + driver, as in the screenshot recipe below…'
 ```
 
-- The driver must pass `SHED_TAURI_ROOST_SOCKETS` / `SHED_ROOST_POLL_MS` through to the app it
-  launches (`ui.launch` builds a scrubbed environment).
+- Export `SHEDTEST_ROOST_SOCKETS`, not the app-level `SHED_TAURI_ROOST_SOCKETS` — a hermetic
+  launch always sets-or-clears the app-level var itself (`ui.py`'s `subproc_env`), so an
+  inherited value from the container's own env never reaches the app; it must be supplied
+  explicitly instead. Driving through pytest, `conftest.py`'s `_app_session` fixture reads
+  `SHEDTEST_ROOST_SOCKETS` and passes it to `ui.launch(roost_sockets=...)`. A bespoke driver
+  script (the screenshot recipe below) must do the same itself.
+- `SHED_ROOST_POLL_MS` has no harness-level indirection — it stays a plain env var the driver
+  passes straight through to the app it launches.
 - Then `rc.list` carries the roost rows (`origin: "machine:localhost"`, `tab_id`, `attention`)
   and `capabilities["machine:localhost"]` — synthesized, `attach: "native-remote"`, so the card
   offers **no** terminal action and `terminal.preview {machine: …}` answers
@@ -137,6 +144,22 @@ docker run --rm -v "$ROOT:/repo:ro" -v "$HOST_OUT:/out" \
   mode 0600, so either run with `--user 1000` or loosen the socket's mode for the run. If
   `rc.list` shows `localhost` absent, that is the first thing to check — an unconnectable
   socket is indistinguishable from "no session" by design.
+
+### The `real_roost` pytest smoke (no host socket to mount)
+
+`test_tauri_machines.py::test_a_real_roost_session_answers_the_client` is a simpler
+alternative to the mount-the-host-socket recipe above: it spawns its OWN jailed
+`roost-session` daemon inside the container and discovers its socket by globbing the
+daemon's runtime dir, so nothing needs mounting except the binary itself. Mount a built
+`roost-session`'s directory read-only and point `SHED_TAURI_ROOST_SESSION_BIN` at it, then
+run pytest with `-m real_roost` (the test is skipped, not failed, when the var is unset —
+that's how CI stays roost-binary-free):
+
+```bash
+-v /path/to/roost/target/debug:/roost-bin:ro \
+-e SHED_TAURI_ROOST_SESSION_BIN=/roost-bin/roost-session \
+… uv run --group test pytest tools/shedtest/test_tauri_machines.py -m real_roost
+```
 
 ## How the Docker legs are wired (so failures make sense)
 

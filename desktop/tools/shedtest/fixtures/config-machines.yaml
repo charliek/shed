@@ -1,20 +1,24 @@
-# Seed shed config for the machine-targets E2E (plan 012 S4). Same single mock
-# host as config.yaml, plus a `machines:` section.
+# Seed shed config for the machine-targets E2E (plan 012 S4; re-pointed at
+# roost-sessions by plan 013 S3). Same single mock host as config.yaml, plus a
+# `machines:` section.
 #
-# In test mode the app reaches every machine's hub on SHED_TAURI_MACHINE_HUB_PORT
-# directly (a `FixedPort`), so `host`/`user` here are never dialled — no ssh is
-# spawned. What matters is the SHAPE: two machines, so the suite covers both the
-# reachable and the unreachable case in one launch.
+# In test mode the app reaches every machine's `roost-session` on the Unix socket
+# SHED_TAURI_ROOST_SOCKETS names (a `LocalSession`), so `host`/`user` here are
+# never dialled — no ssh is spawned. What matters is the SHAPE.
 #
 # THREE machines, one per health band, because the sidebar and the pane both
 # claim an ordering (reachable → connecting → offline) that two bands cannot
 # prove:
-#   * `mini3`  — a hub that answers        → reachable
-#   * `sleepy` — no hub at all             → connecting (never reached)
-#   * `flaky`  — a hub that answers, then  → offline (reached once, gone now)
-#                the harness stops it
+#   * `mini3`  — a session that answers      → reachable
+#   * `sleepy` — no session mapped at all    → connecting (never reached)
+#   * `flaky`  — a session that answers, and → offline (reached once, gone now)
+#                that the harness then stops
 # None of them is special to the app; all three entries are identical, and the
 # difference is entirely in what the harness serves.
+#
+# `rc_bin` is deliberately absent: roost needs no `sx` on the far side. The field
+# is still tolerated by the config reader (and by `machine.add`), which is what
+# the add test writes.
 servers:
     mock:
         host: 127.0.0.1
