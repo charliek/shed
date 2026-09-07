@@ -75,7 +75,7 @@ tokio-rustls = { version = "0.26", default-features = false, features = ["ring",
 # file and `Cargo.lock`. Re-read roost's `ipc-compatibility.md` on any bump that
 # crosses a `SESSION_PROTOCOL_VERSION` change — `Conn::session_identify` refuses a
 # mismatch by name rather than limping.
-roost-ipc = { git = "https://github.com/charliek/roost", rev = "61d8713bcd0378971ad8490fe89b8dbef4e49fac" }
+roost-ipc = { git = "https://github.com/charliek/roost", rev = "c67ac27b6a85dbee0871f32d49c1566cc068d1c8" }
 
 # **The dev profile is TUNED** (plan 012), because the default is expensive here
 # in a way that shows up as failed builds rather than slow ones: a full debug

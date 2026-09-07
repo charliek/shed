@@ -72,9 +72,9 @@ pub use rc_engine::{
 };
 pub use rc_events_watcher::{RcEventsWatcher, RcWatcherUpdate};
 pub use roost::{
-    launch_argv, roost_capabilities, tab_close, tab_dump, tab_open, tab_write, LabelledPort,
-    LocalSession, RoostEndpoint, RoostPeek, RoostReach, RoostUpdate, RoostWatcher, SshBridge,
-    SshBridgeOptions, SystemSshTunnels, Tunnel, TunnelOpener, UnreachableReach,
+    launch_argv, roost_capabilities, tab_close, tab_dump, tab_open, LabelledPort, LocalSession,
+    RoostEndpoint, RoostPeek, RoostReach, RoostUpdate, RoostWatcher, SshBridge, SshBridgeOptions,
+    SystemSshTunnels, Tunnel, TunnelOpener, UnreachableReach,
 };
 pub use token_minter::HostAgentTokenMinter;
 pub use traits::{

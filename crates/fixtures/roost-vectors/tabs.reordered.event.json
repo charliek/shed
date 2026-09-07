@@ -1,0 +1,11 @@
+{
+  "event": "tabs.reordered",
+  "data": {
+    "project_id": "1",
+    "tab_ids": [
+      "7",
+      "5",
+      "9007199254740993"
+    ]
+  }
+}

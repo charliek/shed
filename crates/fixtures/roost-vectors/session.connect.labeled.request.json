@@ -1,0 +1,8 @@
+{
+  "id": "3",
+  "op": "session.connect",
+  "params": {
+    "takeover": true,
+    "client_label": "kestrel.local"
+  }
+}

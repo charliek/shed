@@ -1,0 +1,9 @@
+{
+  "event": "projects.reordered",
+  "data": {
+    "project_ids": [
+      "2",
+      "1"
+    ]
+  }
+}

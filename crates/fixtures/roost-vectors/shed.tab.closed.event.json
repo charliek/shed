@@ -1,0 +1,6 @@
+{
+  "event": "tab.closed",
+  "data": {
+    "tab_id": "8"
+  }
+}

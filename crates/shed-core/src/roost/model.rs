@@ -832,11 +832,15 @@ failed   foreground_process question_asked    -> needs_input";
         assert_eq!(dto.created_at.as_deref(), Some("2026-09-07T08:14:27Z"));
 
         assert_eq!(inventory.revision, Some(18));
+        // The identify half is the **re-recorded** protocol-4 reply — that one
+        // embeds the generation integer, so unlike the `tab.list` recordings
+        // beside it (whose shapes are byte-identical across the R1 re-cut) it
+        // had to be taken again from a `c67ac27` daemon.
         assert_eq!(
             inventory.daemon_session_id,
-            "7771e18e3aa8102c9b60c50bc959f3c4"
+            "05124e114e2f57de4d0336f7761e7bb9"
         );
-        assert_eq!(inventory.started_at, "2026-09-07T08:14:16Z");
+        assert_eq!(inventory.started_at, "2026-09-07T17:08:49Z");
         assert_eq!(inventory.to_rc_dtos(), vec![dto]);
     }
 
