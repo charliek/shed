@@ -48,8 +48,6 @@ impl HubClock {
 struct HubTmuxState {
     names: Vec<String>,
     panes: HashMap<String, String>,
-    /// tmux name → visible-frame capture (no -S); unset ⇒ same as panes.
-    visible: HashMap<String, String>,
     envs: HashMap<String, String>,
     gone: HashSet<String>,
     /// capture-pane fails TRANSIENTLY (not gone).
@@ -100,17 +98,10 @@ impl HubTmux {
         self.lock().panes.insert(name.to_string(), pane.to_string());
     }
 
-    /// Pins what a VISIBLE-frame capture (no -S) answers, leaving the
-    /// scrollback capture untouched. Clearing (`""`) restores
-    /// "visible == scrollback".
-    pub fn set_visible(&self, name: &str, vis: &str) {
-        let mut st = self.lock();
-        if vis.is_empty() {
-            st.visible.remove(name);
-        } else {
-            st.visible.insert(name.to_string(), vis.to_string());
-        }
-    }
+    // `set_visible` — which pinned what a VISIBLE-frame capture (no -S)
+    // answered, separately from the scrollback one — went with the pane-anchor
+    // approval scan in S2 (`charliek/shed#324`). Nothing in the hub asks the
+    // "is a modal on screen right now?" question any more.
 
     /// Makes `ls` fail transiently (stderr must not read as "no server").
     pub fn set_ls_fail(&self, stderr: &str) {
@@ -164,14 +155,6 @@ impl TmuxRunner for HubTmux {
                         stderr: "lost server connection (transient)".to_string(),
                         code: 1,
                     };
-                }
-                // Real tmux answers a VISIBLE-frame capture (no -S)
-                // differently from a scrollback one — the seam the
-                // ApprovalAnchor path depends on.
-                if !args.contains(&"-S") {
-                    if let Some(vis) = st.visible.get(&name) {
-                        return ok(vis.clone());
-                    }
                 }
                 ok(st.panes.get(&name).cloned().unwrap_or_default())
             }
@@ -256,7 +239,6 @@ pub(crate) fn hub_config(f: &Arc<HubTmux>, clk: &Arc<HubClock>) -> HubConfig {
         version: String::new(),
         active_interval: Duration::ZERO,
         idle_interval: Duration::ZERO,
-        quiet_period: Duration::ZERO,
         idle_timeout: Duration::ZERO,
         heartbeat: Duration::ZERO,
         write_timeout: Duration::ZERO,
@@ -268,11 +250,11 @@ pub(crate) fn hub_config(f: &Arc<HubTmux>, clk: &Arc<HubClock>) -> HubConfig {
 }
 
 /// A hub wired to the fake tmux + clock and small intervals (`newTestHub`,
-/// `hub_test.go:240`) — the three tuning overrides Go pins, on top of
-/// [`hub_config`]'s defaults.
+/// `hub_test.go`) — the two tuning overrides Go pins, on top of
+/// [`hub_config`]'s defaults. (The quiet period was a third; it went with the
+/// pane-stability tracker in S2, `charliek/shed#324`.)
 pub(crate) fn new_test_hub(f: &Arc<HubTmux>, clk: &Arc<HubClock>) -> Hub {
     Hub::new(HubConfig {
-        quiet_period: Duration::from_secs(4),
         heartbeat: Duration::from_millis(20),
         write_timeout: Duration::from_secs(1),
         ..hub_config(f, clk)
@@ -321,15 +303,9 @@ pub(crate) fn count_events(evs: &[DrainedEvent], name: &str) -> usize {
     evs.iter().filter(|e| e.name == name).count()
 }
 
-/// A pane fixture by basename, from the byte-parity-swept copies under
-/// `crates/fixtures/panes/` (`paneFixture`, `hub_pane_approvals_test.go:20`).
-pub(crate) fn pane_fixture(name: &str) -> String {
-    let path = format!(
-        "{}/../fixtures/panes/{name}.txt",
-        env!("CARGO_MANIFEST_DIR")
-    );
-    std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("fixture {path}: {e}"))
-}
+// `pane_fixture` read the byte-parity-swept pane captures under
+// `crates/fixtures/panes/`. Both corpora were deleted with the classifiers and
+// anchors they pinned (S2, `charliek/shed#324`).
 
 // ---------------------------------------------------------------------------
 // Shared scripted watchers (`stubWatcher`/`stubApprovalWatcher`,

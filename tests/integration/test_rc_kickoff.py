@@ -1,6 +1,6 @@
 """CLI-driven Remote Control kickoff: `shed attach --kind shell -d` (plan 008, C7).
 
-Every existing rc integration test (`test_rc_enrichment.py`, `test_rc_hub_activity.py`)
+Every existing rc integration test (`test_rc_enrichment.py`)
 drives the in-shed `shed-ext-rc` binary directly via `server.exec(...)` over the guest
 agent channel — none of them ever invoke the `shed` CLIENT CLI's own `attach --kind` /
 `plan` path (WS-E in plan 008). That path has its own argv-building
@@ -10,12 +10,17 @@ validateAttachFlags`), and plain-text (NOT `--json`) output rendering
 This module is the first CLI-path coverage.
 
 A `shell`-kind session is the deliberate choice, same as the existing rc tests: it
-needs no agent auth/login, so `ClassifyPane(KindShell, ...)` can only land on
-`StateStarting` (blank pane) or `StateReady` (any pane content) — never
-`needs-auth`/`needs-trust`/`dead` (see `internal/ext/rc/agents.go:887-892`,
-`rc.go:406-417`). That makes the CLI's `--wait` round-trip deterministic in CI, and
-keeps this smoke test out of agent-auth territory (--kind cursor/codex/opencode need
-real login and are out of scope here).
+needs no agent auth/login. Since S2 (charliek/shed#324) a shed row's `state` is
+LIVENESS — `--wait` polls `capture-pane` and reports `ready` on the first
+successful capture, `dead` only when the tmux session is gone, and `starting`
+only if nothing ever captured inside the 20 s deadline; `needs-auth`/
+`needs-trust`/`reconnecting` are no longer emitted by the guest at all. With a
+`--prompt`, the wait additionally settles `kickoffSettle` (5 s) from
+max(first capture, last successful control accept) before typing the line, then
+one more `promptDeliverSettle` (1 s) — so a kickoff lands ≥ 6 s after liveness.
+That makes the CLI's `--wait` round-trip deterministic in CI, and keeps this smoke
+test out of agent-auth territory (--kind cursor/codex/opencode need real login and
+are out of scope here).
 
 This is effectively a **CLI-side** feature (the server surface it rides on —
 `shed exec`-equivalent SSH delivery of `shed-ext-rc create` — predates this plan), but
@@ -32,7 +37,7 @@ import time
 
 import pytest
 
-# Same image-compatibility signatures as test_rc_enrichment.py / test_rc_hub_activity.py,
+# Same image-compatibility signatures as test_rc_enrichment.py,
 # plus one CLI-specific rewrap: `createRCSession`'s old-binary detection
 # (`cmd/shed/rc.go:isOldBinaryRCErr`) turns the raw "unknown kind"/"flag provided but
 # not defined" guest errors into a friendlier "predates multi-agent RC" message before
@@ -49,9 +54,10 @@ _RC_INCOMPAT_SIGNS = (
 )
 
 # `printRCSummary` (cmd/shed/attach.go): `Started %s session rc-%s (%s)\n` with
-# dto.Kind / dto.Slug / dto.State. Only printed on the success path (state reached one
-# of shell's two reachable terminal-ish states); needs-auth/needs-trust/dead print a
-# different message and are structurally unreachable for shell (see module docstring).
+# dto.Kind / dto.Slug / dto.State. Only printed on the success path (a live session,
+# i.e. `ready`, or the `starting` a wait that never captured reports); the
+# needs-auth/needs-trust/dead branches print a different message and the guest no
+# longer emits those states at all (see module docstring).
 _STARTED_RE = re.compile(r"^Started (\S+) session (rc-[a-z0-9-]+) \(([a-z-]+)\)\s*$", re.MULTILINE)
 
 
@@ -135,14 +141,14 @@ def test_attach_kind_shell_detach_probe_kill(shed_server_dev, test_shed_name_dev
 
         assert kind == "shell", f"unexpected rc kind in attach summary: {kind!r} (full stdout={r.stdout!r})"
         assert state in ("ready", "starting"), (
-            f"unexpected rc state in attach summary: {state!r} (shell can only reach "
-            f"starting/ready — see internal/ext/rc/agents.go classifyShell; "
-            f"full stdout={r.stdout!r})"
+            f"unexpected rc state in attach summary: {state!r} (liveness reaches only "
+            f"ready, or starting when nothing ever captured — see "
+            f"internal/ext/rc/ops.go waitUntilLive; full stdout={r.stdout!r})"
         )
 
         # Probe: the session must be discoverable via the CLI's own listing surface
-        # (not a guest exec), and — since `--wait` can in rare cases return while the
-        # pane's first prompt is still drawing (see classifyShell) — poll briefly for
+        # (not a guest exec), and — since a `--wait` whose captures all failed
+        # transiently reports `starting` (see waitUntilLive) — poll briefly for
         # rc.state to settle at "ready" rather than trusting the single attach-time
         # observation.
         row = _poll_session_ready(server, shed, name)

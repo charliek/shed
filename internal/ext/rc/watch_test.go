@@ -710,29 +710,33 @@ func writeFile(t *testing.T, path, content string) {
 // watcherFreshness itself survives — it is the shared rule the opencode watcher applies
 // (watch_opencode_transport_test.go covers it on that transport).
 
+// S2 (charliek/shed#324) reduced mergedActivity to two arms: a FRESH watcher verdict,
+// and "" for everything else. The stability argument and the expired-working arm went
+// with the pane-stability engine (the arm's expiry clock WAS that engine's quiet
+// period), so an opencode row whose SSE feed dies mid-turn goes to *unknown* rather
+// than sitting at `working` forever.
 func TestMergedActivityPrecedence(t *testing.T) {
-	// Fresh watcher wins (activity + message).
-	if a, m := mergedActivity(ActivityWorking, "hello", true, false, ActivityIdle); a != ActivityWorking || m != "hello" {
+	// Arm 1 — a fresh watcher verdict wins, message and all.
+	if a, m := mergedActivity(ActivityWorking, "hello", true); a != ActivityWorking || m != "hello" {
 		t.Fatalf("fresh watcher merge = (%q,%q), want (working,hello)", a, m)
 	}
-	// Stale (non-working) watcher → stability drives and the message is dropped.
-	if a, m := mergedActivity(ActivityUnknown, "hello", false, false, ActivityIdle); a != ActivityIdle || m != "" {
-		t.Fatalf("stale merge = (%q,%q), want (idle,\"\")", a, m)
+	if a, m := mergedActivity(ActivityNeedsApproval, "tool", true); a != ActivityNeedsApproval || m != "tool" {
+		t.Fatalf("fresh needs_approval merge = (%q,%q), want (needs_approval,tool)", a, m)
 	}
-	// Expired working + stability SETTLED quiet (idle/needs_input) → stability wins.
-	if a, m := mergedActivity(ActivityWorking, "hello", false, true, ActivityNeedsInput); a != ActivityNeedsInput || m != "" {
-		t.Fatalf("expired-working vs settled stability = (%q,%q), want (needs_input,\"\")", a, m)
-	}
-	if a, _ := mergedActivity(ActivityWorking, "hello", false, true, ActivityIdle); a != ActivityIdle {
-		t.Fatalf("expired-working vs idle stability = %q, want idle", a)
-	}
-	// Expired working + stability still churning (working) → keep working (no flap).
-	if a, m := mergedActivity(ActivityWorking, "hello", false, true, ActivityWorking); a != ActivityWorking || m != "hello" {
-		t.Fatalf("expired-working vs churning stability = (%q,%q), want (working,hello)", a, m)
-	}
-	// Expired working + stability has no verdict → keep working too.
-	if a, _ := mergedActivity(ActivityWorking, "hello", false, true, ActivityUnknown); a != ActivityWorking {
-		t.Fatalf("expired-working vs unknown stability = %q, want working", a)
+	// Arm 2 — everything else is no activity at all, and the message goes with it:
+	// a stale verdict, an expired-working one, and no watcher (unknown) alike.
+	for _, c := range []struct {
+		name     string
+		activity Activity
+	}{
+		{"stale non-working verdict", ActivityUnknown},
+		{"expired-working verdict", ActivityWorking},
+		{"stale needs_input verdict", ActivityNeedsInput},
+		{"no watcher at all", ""},
+	} {
+		if a, m := mergedActivity(c.activity, "hello", false); a != "" || m != "" {
+			t.Fatalf("%s merge = (%q,%q), want (\"\",\"\")", c.name, a, m)
+		}
 	}
 }
 
@@ -899,15 +903,16 @@ func TestWatchableKindOpencodeOnly(t *testing.T) {
 	}
 	for _, k := range []Kind{KindCodex, KindCursor, KindClaudeRC, KindClaudeBroker, KindShell} {
 		if watchableKind(k) {
-			t.Errorf("watchableKind(%q) = true, want false (stability only)", k)
+			t.Errorf("watchableKind(%q) = true, want false (no activity source)", k)
 		}
 	}
 }
 
 // A pre-upgrade opencode session (created before the port plumbing shipped, so no
 // SHED_RC_OPENCODE_PORT is stamped) is unwatchable over the SSE transport: ensureWatcher
-// returns no watcher and pane-stability drives its activity.
-func TestReconcileOpencodeNoPortStabilityOnly(t *testing.T) {
+// returns no watcher, and since S2 (charliek/shed#324) there is no fallback behind it —
+// the row is tracked (so /messages answers 200-empty) but carries no activity.
+func TestReconcileOpencodeNoPortIsTrackedWithNoActivity(t *testing.T) {
 	tm := newHubTmux()
 	env := strings.Join([]string{
 		envV + "=2",
@@ -930,15 +935,14 @@ func TestReconcileOpencodeNoPortStabilityOnly(t *testing.T) {
 		t.Fatal("opencode session not tracked")
 	}
 	if tr.watcher != nil {
-		t.Fatal("a session with no recorded port must get NO watcher (stability only)")
+		t.Fatal("a session with no recorded port must get NO watcher")
 	}
-	// Pane-stability drives: a ready, just-appeared session reports working on tick 1.
-	if tr.activity != ActivityWorking {
-		t.Fatalf("activity = %q, want working (pane-stability)", tr.activity)
+	if tr.activity != "" {
+		t.Fatalf("activity = %q, want none (no watcher, no fallback)", tr.activity)
 	}
 }
 
-// End-to-end: a correlated opencode SSE watcher overrides pane stability, populates the
+// End-to-end: a correlated opencode SSE watcher supplies the activity, populates the
 // message ring, and its discovered session id is back-written into the tmux env. Mirrors
 // TestReconcileCodexWatcherOverridesStability but drives the fake opencode HTTP+SSE server
 // (from watch_opencode_transport_test.go) over the hub's real reconcile loop.
@@ -957,11 +961,10 @@ func TestReconcileOpencodeWatcherOverridesStability(t *testing.T) {
 	}
 
 	tm := newHubTmux()
-	// A ready opencode session whose workdir matches the fixture directory (so the SSE
-	// transport pins on the fixture's session.created) and whose recorded port targets the
-	// fake server. The pane classifies ready ("Ask anything...") and — because the hub
-	// clock never advances below — pane-stability can only ever report working (it never
-	// reaches the quiet period), so a needs_input verdict MUST come from the SSE watcher.
+	// A live opencode session whose workdir matches the fixture directory (so the SSE
+	// transport pins on the fixture's session.created) and whose recorded port targets
+	// the fake server. Since S2 (charliek/shed#324) there is no other activity source
+	// at all, so a needs_input verdict can only have come from the SSE watcher.
 	env := strings.Join([]string{
 		envV + "=2",
 		envID + "=id-oc",
@@ -1009,7 +1012,6 @@ func TestReconcileOpencodeWatcherOverridesStability(t *testing.T) {
 
 	h.trackMu.Lock()
 	activity := tr.activity
-	lastStability := tr.lastStability
 	lastMessage := tr.lastMessage
 	watcher := tr.watcher
 	h.trackMu.Unlock()
@@ -1019,11 +1021,6 @@ func TestReconcileOpencodeWatcherOverridesStability(t *testing.T) {
 	}
 	if _, ok := watcher.(*opencodeWatcher); !ok {
 		t.Fatalf("watcher = %T, want *opencodeWatcher", watcher)
-	}
-	// The override is real: pane-stability, with the clock frozen, held working the whole
-	// time — the needs_input verdict came from the watcher, not the anchor/quiet fallback.
-	if lastStability != ActivityWorking {
-		t.Fatalf("lastStability = %q, want working (frozen clock never reaches quiet)", lastStability)
 	}
 	if lastMessage != "3 .txt files." {
 		t.Fatalf("last_message = %q, want %q", lastMessage, "3 .txt files.")

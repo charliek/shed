@@ -82,7 +82,6 @@ carrying no transport error text.
 
 | op | params | result |
 |----|--------|--------|
-| `rc.classify` | `kind`, `pane` | `state`, `url?` (pure pane classifier) |
 | `rc.list` | `host?`, `shed?` | `sessions[]` |
 | `rc.launch` | `host?`, `shed`, `kind?`, `display_name?`, `workdir?`, `initial_prompt?` | the launched `RcSession` |
 | `rc.kill` | `host?`, `shed`, `slug` | `{}` |

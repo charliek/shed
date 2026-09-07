@@ -25,11 +25,13 @@ import (
 // serve` subcommand runs. It exposes a small loopback HTTP API (session list +
 // SSE activity stream in this commit; message feed + input in a later one) over
 // which the server's rc proxy and the mobile client read live session activity.
-// It drives the SAME tmux/pane-stability machinery the one-shot subcommands use
-// (List + StabilityTracker), so it lives inside package rc rather than a nested
-// package: the reconcile loop needs the unexported capture/list plumbing and the
-// tracker, and keeping it here avoids exporting that surface just to feed a
-// daemon that is conceptually another consumer of ops.go.
+// It drives the SAME tmux enumeration machinery the one-shot subcommands use
+// (List), so it lives inside package rc rather than a nested package: the
+// reconcile loop needs the unexported capture/list plumbing, and keeping it here
+// avoids exporting that surface just to feed a daemon that is conceptually
+// another consumer of ops.go. (It also drove a pane-stability engine, until S2 —
+// charliek/shed#324 — deleted it; opencode's lane watcher is the only activity
+// source left.)
 //
 // Lifecycle overview (see RunHub / DetachHub / EnsureHub):
 //   - `serve` (or `serve --foreground`) binds the port and runs in this process.
@@ -133,7 +135,6 @@ type HubConfig struct {
 	// Tuning overrides (zero → the matching default constant).
 	ActiveInterval   time.Duration
 	IdleInterval     time.Duration
-	QuietPeriod      time.Duration
 	IdleTimeout      time.Duration
 	Heartbeat        time.Duration
 	WriteTimeout     time.Duration
@@ -151,7 +152,6 @@ type hubResolved struct {
 	respawn        func() error
 	activeInterval time.Duration
 	idleInterval   time.Duration
-	quiet          time.Duration
 	idleTimeout    time.Duration
 	heartbeat      time.Duration
 	writeTimeout   time.Duration
@@ -168,7 +168,6 @@ func (c HubConfig) resolve() hubResolved {
 		respawn:        c.Respawn,
 		activeInterval: c.ActiveInterval,
 		idleInterval:   c.IdleInterval,
-		quiet:          c.QuietPeriod,
 		idleTimeout:    c.IdleTimeout,
 		heartbeat:      c.Heartbeat,
 		writeTimeout:   c.WriteTimeout,
@@ -197,9 +196,6 @@ func (c HubConfig) resolve() hubResolved {
 	}
 	if r.idleInterval <= 0 {
 		r.idleInterval = defaultIdleInterval
-	}
-	if r.quiet <= 0 {
-		r.quiet = DefaultQuietPeriod
 	}
 	if r.idleTimeout <= 0 {
 		r.idleTimeout = defaultIdleTimeout
@@ -512,10 +508,9 @@ func (h *Hub) serveOn(ctx context.Context, ln net.Listener) error {
 	errCh := make(chan error, 1)
 	go func() { errCh <- srv.Serve(ln) }()
 
-	// A best-effort fsnotify layer over the codex JSONL tree nudges the loop
-	// to reconcile sub-tick when a watched rollout is appended, so an activity
-	// transition surfaces promptly instead of waiting for the next tick. If it cannot
-	// start (fsnotify unavailable), the tick alone drives — correctness is unchanged.
+	// The best-effort fsnotify layer that woke the loop sub-tick on a watched
+	// file write. It is DORMANT, not broken: no lane is file-backed any more, so
+	// this returns a nil channel and the tick alone drives (see startFSNudger).
 	nudge := h.startFSNudger(ctx)
 
 	h.reconcile() // seed the session list + fire appear events before the first tick
@@ -578,9 +573,14 @@ func (h *Hub) idleExitHandoff(ln net.Listener) {
 // roots, fsnotify unavailable) is a valid select arm that simply never fires, leaving
 // the reconcile tick as the sole driver. The nudger goroutine stops with ctx.
 //
-// The one root this ever had was codex's ~/.codex/sessions, removed with A6
-// (charliek/shed#322): opencode's SSE stream is its own arrival signal, so the set is
-// empty today and this returns nil. The seam stays for the next file-backed lane.
+// DORMANT BY DESIGN, NOT AN OVERSIGHT. The one root this ever had was codex's
+// ~/.codex/sessions, removed with A6 (charliek/shed#322); opencode's SSE stream is
+// its own arrival signal and needs no filesystem wake-up, so the root set is empty,
+// this returns nil, and fsNudger's implementation and tests are exercised only by
+// those tests. It is kept — with its fsnotify dependency — because the seam is
+// exactly what the next file-backed lane would need and re-deriving it is real work;
+// it retires with the hub itself in S6 if none arrives first. Delete the two
+// together, not this alone.
 func (h *Hub) startFSNudger(ctx context.Context) <-chan struct{} {
 	var roots []string
 	if len(roots) == 0 {

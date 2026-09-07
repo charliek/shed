@@ -76,25 +76,6 @@ func TestGoldenCopiesAreByteIdentical(t *testing.T) {
 	}
 }
 
-// The pane fixtures under testdata/panes/ are the classifier's drift guard, and from
-// plan 009 (the Rust rc-engine port) they are consumed by BOTH implementations: this
-// package's TestPaneFixturesClassify and the Rust registry's fixture sweep
-// (crates/shed-core/src/rc_agents.rs). The Rust copy is crates-LOCAL for the same
-// reason as the wire goldens above — `make -C desktop core-linux` mounts only crates/,
-// so a Rust test reading across the tree could not find them there.
-//
-// This sweep is DIRECTORY-DERIVED, not count-pinned: it enumerates the canonical
-// directory and the copy and requires the two file SETS to be equal and every file to
-// be byte-identical. That is deliberate — a new fixture added to prove a classifier
-// anchor is exactly the case where forgetting to mirror it would let the two
-// implementations diverge silently, so an uncopied (or orphaned) fixture fails here.
-func TestPaneFixtureCopiesAreByteIdentical(t *testing.T) {
-	assertFixtureDirCopyByteIdentical(t,
-		"internal/ext/rc/testdata/panes",
-		"crates/fixtures/panes",
-		"`go test ./internal/ext/rc/` and `cd crates && cargo test -p shed-core rc_agents`")
-}
-
 // The JSONL turn-stream fixtures under testdata/jsonl/ are the folds' SHARED tables
 // (plan 010 H4): this package's fold tests drive them through the opencode fold, and
 // the Rust hub's fold mirror (crates/shed-broker/src/rc_hub/) consumes the crates-local

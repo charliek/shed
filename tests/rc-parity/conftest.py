@@ -870,13 +870,14 @@ def differential(request):
 HUB_RUST_LIVE = True
 
 # Fast ticks for the differential (both legs ALWAYS get the same values):
-# active/idle drive reconcile latency, quiet drives stability settle, idle-exit
-# is pinned LARGE-FINITE because the Go seam cannot express "never" (resolve()
-# maps <=0 back to the 15m default — plan 010 §2.5).
+# active/idle drive reconcile latency; idle-exit is pinned LARGE-FINITE because
+# the Go seam cannot express "never" (resolve() maps <=0 back to the 15m default
+# — plan 010 §2.5). A sixth knob drove the pane-stability settle; it went with
+# that engine in S2 (charliek/shed#324), on both sides — a knob the two hubs read
+# differently would be a silent drift point on a differential-gated wire.
 HUB_TUNING = {
     "SHED_RC_HUB_ACTIVE_MS": "100",
     "SHED_RC_HUB_IDLE_MS": "250",
-    "SHED_RC_HUB_QUIET_MS": "500",
     "SHED_RC_HUB_IDLE_EXIT_MS": "86400000",
     "SHED_RC_HUB_HEARTBEAT_MS": "1000",
     "SHED_RC_HUB_WRITE_TIMEOUT_MS": "2000",
@@ -1074,7 +1075,12 @@ class HubLeg(Leg):
         the reconcile-built tracked map — a verb fired in the gap earns a 404
         `unknown_slug` instead of its kind-based 409 (observed live while
         recording the first goldens). The ACTIVITY OVERLAY is the observable
-        proof the tracked session exists: only a tracked entry carries it."""
+        proof the tracked session exists: only a tracked entry carries it.
+
+        OPENCODE ONLY, since S2 (charliek/shed#324) removed the pane-stability
+        fallback that gave every kind an overlay — a feedless kind now carries
+        no activity at all. The codex-tracked cells use the `/messages` 404→200
+        flip instead (`test_hub.py::_tracked_codex`)."""
 
         def tracked():
             got = self.hub_request("GET", "/v1/sessions")

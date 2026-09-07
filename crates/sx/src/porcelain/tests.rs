@@ -768,7 +768,11 @@ fn session(slug: &str, kind: RcKind, state: RcState) -> RcSessionDto {
     }
 }
 
-fn caps(rows: &[(&str, bool)], features: &[&str]) -> RcCapabilities {
+/// `rows` are `(kind, feed)` where feed is the wire value — `"messages"`,
+/// `"activity"` or `"none"` — so a test can model the row S2 (`charliek/shed#324`)
+/// produces for a kind with no activity producer, not just the messages/activity
+/// split. `watch` (the deprecated bit `feed` supersedes) stays in lockstep.
+fn caps(rows: &[(&str, &str)], features: &[&str]) -> RcCapabilities {
     RcCapabilities {
         rc_version: 4,
         kinds: vec![RcKind::ClaudeRc, RcKind::Codex, RcKind::Shell],
@@ -782,9 +786,9 @@ fn caps(rows: &[(&str, bool)], features: &[&str]) -> RcCapabilities {
                     RcKindFeatures {
                         post_input: true,
                         approvals: "tui".to_string(),
-                        watch: *feed,
+                        watch: *feed == "messages",
                         input: String::new(),
-                        feed: if *feed { "messages" } else { "activity" }.to_string(),
+                        feed: (*feed).to_string(),
                         interrupt: false,
                         attach: "tmux".to_string(),
                     },
@@ -796,10 +800,28 @@ fn caps(rows: &[(&str, bool)], features: &[&str]) -> RcCapabilities {
 
 #[test]
 fn watch_cell_follows_the_capability_rules() {
-    let block = caps(&[("codex", true), ("claude-rc", false)], &["contract-v2"]);
-    // A kind with a message feed, a kind without one, and a kind with NO row.
-    assert_eq!(ls::watch_cell("codex", Some(&block)), "feed");
-    assert_eq!(ls::watch_cell("claude-rc", Some(&block)), "activity");
+    let block = caps(
+        &[
+            ("opencode", "messages"),
+            ("claude-broker", "activity"),
+            // What A6/S2 leaves for the kinds whose producers are gone: an
+            // EXPLICIT `none`, which must not read as `activity`.
+            ("codex", "none"),
+            ("claude-rc", "none"),
+            ("cursor", "none"),
+        ],
+        &["contract-v2"],
+    );
+    assert_eq!(ls::watch_cell("opencode", Some(&block)), "feed");
+    assert_eq!(ls::watch_cell("claude-broker", Some(&block)), "activity");
+    for kind in ["codex", "claude-rc", "cursor"] {
+        assert_eq!(
+            ls::watch_cell(kind, Some(&block)),
+            "-",
+            "{kind}: feed \"none\" has nothing to watch"
+        );
+    }
+    // A kind with NO row at all.
     assert_eq!(ls::watch_cell("shell", Some(&block)), "-");
     // No capability block at all → unknown, and (below) a note.
     assert_eq!(ls::watch_cell("codex", None), "?");
@@ -826,7 +848,7 @@ fn a_missing_capability_block_becomes_a_note_not_a_silent_blank() {
         "local",
         &RcSessionListDto {
             rc_sessions: vec![],
-            capabilities: Some(caps(&[("codex", true)], &["messages"])),
+            capabilities: Some(caps(&[("codex", "messages")], &["messages"])),
         },
     );
     assert!(listing.notes[0].contains("pre-contract-v2"));
@@ -841,7 +863,7 @@ fn ls_render_shows_activity_beside_state_and_annotates_errors() {
         "local",
         &RcSessionListDto {
             rc_sessions: vec![working, session("bb2222", RcKind::Shell, RcState::Dead)],
-            capabilities: Some(caps(&[("codex", true)], &["contract-v2"])),
+            capabilities: Some(caps(&[("codex", "messages")], &["contract-v2"])),
         },
     );
     listing.add_error("machine:asleep", "ssh failed: no route to host");
@@ -893,7 +915,7 @@ fn ls_rows_fall_back_to_the_slug_when_a_session_has_no_display_name() {
 #[test]
 fn transport_selection_follows_the_contract_v2_client_rules() {
     let block = caps(
-        &[("codex", true), ("claude-rc", false)],
+        &[("codex", "messages"), ("claude-rc", "none")],
         &["contract-v2", "messages"],
     );
     // A kind with a message feed streams.
@@ -911,7 +933,7 @@ fn transport_selection_follows_the_contract_v2_client_rules() {
         }
     }
     // A binary that advertises no `messages` feature at all degrades too.
-    let old = caps(&[("codex", true)], &["contract-v2"]);
+    let old = caps(&[("codex", "messages")], &["contract-v2"]);
     assert!(matches!(
         select_transport("codex", Some(&old)),
         Transport::ProbePolling(_)

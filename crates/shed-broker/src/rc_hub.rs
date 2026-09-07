@@ -76,7 +76,6 @@ pub(crate) mod hub_test_support;
 pub mod messages;
 pub mod reconcile;
 pub mod role;
-pub mod stability;
 pub mod verbs;
 pub mod watch;
 pub mod watch_opencode;

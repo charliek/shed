@@ -351,9 +351,11 @@ pub(crate) fn first_non_empty<'a>(a: &'a str, b: &'a str) -> &'a str {
 /// watcher, so a missed notification only delays a transition to the next tick.
 /// Watching is non-recursive, so directories are added as they appear.
 ///
-/// No kind tails a file since A6 (`charliek/shed#322`), so the hub builds it
-/// over an EMPTY root set today and the tick is the sole driver; the seam stays
-/// for the next file-backed lane, and the tests below drive it directly.
+/// DORMANT BY DESIGN, NOT AN OVERSIGHT: no kind tails a file since A6
+/// (`charliek/shed#322`), so the hub builds it over an EMPTY root set and the
+/// tick is the sole driver — the tests below are its only live exercise. It is
+/// kept for the next file-backed lane and retires with the hub in S6 if none
+/// arrives first (see `spawn_fs_nudger`).
 ///
 /// Shape delta vs Go (documented, not parity debt): Go runs a goroutine
 /// selecting over fsnotify's channels until ctx cancellation; `notify`
@@ -595,8 +597,11 @@ pub const WATCHER_WORKING_GRACE: Duration = Duration::from_secs(120);
 ///   indefinitely), recent (last event within [`WATCHER_FRESH_WINDOW`]), or
 ///   working within [`WATCHER_WORKING_GRACE`].
 /// - `expired_working`: a working verdict whose source has been quiet past the
-///   grace — not discarded, but demoted to conditional: the merge lets
-///   stability take over only if stability holds a settled quiet verdict.
+///   grace. Since S2 (`charliek/shed#324`) the merge treats it exactly like any
+///   other non-fresh verdict — there is no pane-stability fallback left for it
+///   to be weighed against — so it is reported for the watchers' own
+///   bookkeeping and asserted by their tests, not consulted by
+///   [`merged_activity`].
 ///
 /// An unknown verdict is never fresh (Go's empty Activity folds into
 /// [`RcActivity::Unknown`] here — the two behave identically in every arm). A
@@ -627,16 +632,25 @@ pub fn watcher_freshness(
     (fresh, expired_working)
 }
 
-/// Resolves the reconcile precedence (`mergedActivity`, `watch.go:285`):
+/// Resolves the reconcile precedence (`mergedActivity`, `watch.go`), which S2
+/// (`charliek/shed#324`) reduced to two arms:
 ///
-/// - a FRESH watcher verdict (and its last-message) wins outright;
-/// - an EXPIRED-WORKING verdict (working, file quiet past the grace) yields to
-///   stability only when stability holds a settled quiet verdict
-///   (idle/needs_input — the pane genuinely stopped); if the pane still churns
-///   (stability=working) or stability has no verdict, working is KEPT — a long
-///   silent turn must not flap;
-/// - otherwise the pane-stability activity drives and last-message is dropped
-///   (stability has no message signal).
+/// - a FRESH watcher verdict (and its last-message) wins;
+/// - EVERYTHING ELSE — no watcher, a closed or unhealthy transport, a stale
+///   verdict, an EXPIRED-WORKING one — yields `None`: NO activity dimension at
+///   all, which the DTO omits.
+///
+/// `None` is Go's empty `Activity`, which is NOT [`RcActivity::Unknown`]:
+/// `unknown` is a wire value meaning "live, but we cannot say what it is
+/// doing", and emitting it here would put an `activity.changed` frame on every
+/// watcherless row. Go's enum carries the empty string as a distinct value;
+/// Rust's does not, so the absence is spelled `Option`.
+///
+/// The expired-working arm went with the pane-stability engine it consulted
+/// (its expiry clock WAS that engine's quiet period). The consequence is
+/// deliberate: an opencode row whose SSE feed dies mid-turn goes to *unknown*
+/// rather than sitting at `working` forever, because nothing is left that can
+/// observe the turn end.
 ///
 /// Returned activity is still subject to the lifecycle-trumps display rule by
 /// the caller.
@@ -644,27 +658,20 @@ pub fn merged_activity(
     watcher_activity: RcActivity,
     watcher_message: &str,
     watcher_fresh: bool,
-    watcher_expired_working: bool,
-    stability: RcActivity,
-) -> (RcActivity, String) {
+) -> (Option<RcActivity>, String) {
     if watcher_fresh {
-        return (watcher_activity, watcher_message.to_string());
+        return (Some(watcher_activity), watcher_message.to_string());
     }
-    if watcher_expired_working {
-        if stability == RcActivity::Idle || stability == RcActivity::NeedsInput {
-            return (stability, String::new());
-        }
-        return (watcher_activity, watcher_message.to_string());
-    }
-    (stability, String::new())
+    (None, String::new())
 }
 
 /// Whether a kind has a structured-signal watcher (`watchableKind`,
-/// `watch.go:303`). opencode is the only one: it subscribes to its embedded
-/// HTTP+SSE server. Every other kind derives activity from pane stability alone
-/// — A6 (`charliek/shed#322`) retired the codex rollout tail and the cursor
-/// hook-ingest lane, and A5 (`charliek/shed#321`) the claude transcript tail
-/// before them.
+/// `watch.go`). opencode is the only one: it subscribes to its embedded
+/// HTTP+SSE server. Every other kind has NO activity source at all — A6
+/// (`charliek/shed#322`) retired the codex rollout tail and the cursor
+/// hook-ingest lane, A5 (`charliek/shed#321`) the claude transcript tail before
+/// them, and S2 (`charliek/shed#324`) the pane-stability fallback beneath all
+/// three.
 pub fn watchable_kind(k: &RcKind) -> bool {
     matches!(k, RcKind::Opencode)
 }
@@ -793,60 +800,37 @@ mod tests {
         );
     }
 
-    // Mirrors TestMergedActivityPrecedence.
+    // Mirrors TestMergedActivityPrecedence: S2 (`charliek/shed#324`) reduced
+    // `merged_activity` to two arms — a FRESH watcher verdict, and no activity
+    // for everything else. The stability argument and the expired-working arm
+    // went with the pane-stability engine (the arm's expiry clock WAS that
+    // engine's quiet period), so an opencode row whose SSE feed dies mid-turn
+    // goes to *unknown* rather than sitting at `working` forever.
     #[test]
     fn merged_activity_precedence() {
-        // Fresh watcher wins (activity + message).
+        // Arm 1 — a fresh watcher verdict wins, message and all.
         assert_eq!(
-            merged_activity(RcActivity::Working, "hello", true, false, RcActivity::Idle),
-            (RcActivity::Working, "hello".to_string())
-        );
-        // Stale (non-working) watcher → stability drives and the message is
-        // dropped.
-        assert_eq!(
-            merged_activity(RcActivity::Unknown, "hello", false, false, RcActivity::Idle),
-            (RcActivity::Idle, String::new())
-        );
-        // Expired working + stability SETTLED quiet (idle/needs_input) →
-        // stability wins.
-        assert_eq!(
-            merged_activity(
-                RcActivity::Working,
-                "hello",
-                false,
-                true,
-                RcActivity::NeedsInput
-            ),
-            (RcActivity::NeedsInput, String::new())
+            merged_activity(RcActivity::Working, "hello", true),
+            (Some(RcActivity::Working), "hello".to_string())
         );
         assert_eq!(
-            merged_activity(RcActivity::Working, "hello", false, true, RcActivity::Idle).0,
-            RcActivity::Idle
+            merged_activity(RcActivity::NeedsApproval, "tool", true),
+            (Some(RcActivity::NeedsApproval), "tool".to_string())
         );
-        // Expired working + stability still churning (working) → keep working
-        // (no flap).
-        assert_eq!(
-            merged_activity(
-                RcActivity::Working,
-                "hello",
-                false,
-                true,
-                RcActivity::Working
-            ),
-            (RcActivity::Working, "hello".to_string())
-        );
-        // Expired working + stability has no verdict → keep working too.
-        assert_eq!(
-            merged_activity(
-                RcActivity::Working,
-                "hello",
-                false,
-                true,
-                RcActivity::Unknown
-            )
-            .0,
-            RcActivity::Working
-        );
+        // Arm 2 — everything else is no activity at all, and the message goes
+        // with it: a stale verdict, an expired-working one, and no watcher.
+        for (name, activity) in [
+            ("stale non-working verdict", RcActivity::Idle),
+            ("expired-working verdict", RcActivity::Working),
+            ("stale needs_input verdict", RcActivity::NeedsInput),
+            ("no watcher at all", RcActivity::Unknown),
+        ] {
+            assert_eq!(
+                merged_activity(activity, "hello", false),
+                (None, String::new()),
+                "{name}"
+            );
+        }
     }
 
     // Mirrors TestWatchableKindOpencode (extended over the full kind axis —

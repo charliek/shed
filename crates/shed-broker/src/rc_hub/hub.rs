@@ -79,7 +79,6 @@ pub struct HubConfig {
     // Tuning overrides (zero → the matching default).
     pub active_interval: Duration,
     pub idle_interval: Duration,
-    pub quiet_period: Duration,
     /// Zero → the 15 m default, mirroring Go's `resolve()`. "Never" is
     /// expressed by the embedder passing a huge value (the host-agent role
     /// does) — the Go seam cannot express "never" either (§2.5).
@@ -104,7 +103,6 @@ pub struct HubResolved {
     pub version: String,
     pub active_interval: Duration,
     pub idle_interval: Duration,
-    pub quiet: Duration,
     pub idle_timeout: Duration,
     pub heartbeat: Duration,
     pub write_timeout: Duration,
@@ -113,11 +111,7 @@ pub struct HubResolved {
 }
 
 impl HubConfig {
-    /// Applies the defaults (`resolve`, `hub.go:161`). The stability quiet
-    /// period's own default lives in the tracker
-    /// ([`super::stability::DEFAULT_QUIET_PERIOD`] — a zero `quiet` passes
-    /// through and the tracker applies it, same net effect as Go resolving it
-    /// here).
+    /// Applies the defaults (`resolve`, `hub.go`).
     fn resolve(self) -> HubResolved {
         fn dur(v: Duration, def: Duration) -> Duration {
             if v.is_zero() {
@@ -145,7 +139,6 @@ impl HubConfig {
             version: self.version,
             active_interval: dur(self.active_interval, DEFAULT_ACTIVE_INTERVAL),
             idle_interval: dur(self.idle_interval, DEFAULT_IDLE_INTERVAL),
-            quiet: self.quiet_period,
             idle_timeout: dur(self.idle_timeout, DEFAULT_IDLE_TIMEOUT),
             heartbeat: dur(self.heartbeat, DEFAULT_HEARTBEAT),
             write_timeout: dur(self.write_timeout, DEFAULT_WRITE_TIMEOUT),
@@ -890,7 +883,9 @@ pub fn probe_hub_identity(addr: &str, budget: Duration) -> Result<(), String> {
 pub const ENV_HUB_ADDR: &str = "SHED_RC_HUB_ADDR";
 pub const ENV_HUB_ACTIVE_MS: &str = "SHED_RC_HUB_ACTIVE_MS";
 pub const ENV_HUB_IDLE_MS: &str = "SHED_RC_HUB_IDLE_MS";
-pub const ENV_HUB_QUIET_MS: &str = "SHED_RC_HUB_QUIET_MS";
+// A sixth seam set the pane-stability tracker's settle window. It went with that
+// tracker in S2 (`charliek/shed#324`) — on BOTH sides, so the differential harness
+// has no knob the two hubs could read differently.
 pub const ENV_HUB_IDLE_EXIT_MS: &str = "SHED_RC_HUB_IDLE_EXIT_MS";
 pub const ENV_HUB_HEARTBEAT_MS: &str = "SHED_RC_HUB_HEARTBEAT_MS";
 pub const ENV_HUB_WRITE_TIMEOUT_MS: &str = "SHED_RC_HUB_WRITE_TIMEOUT_MS";
@@ -954,7 +949,6 @@ pub fn apply_hub_env_overrides(
     };
     apply(ENV_HUB_ACTIVE_MS, &mut cfg.active_interval);
     apply(ENV_HUB_IDLE_MS, &mut cfg.idle_interval);
-    apply(ENV_HUB_QUIET_MS, &mut cfg.quiet_period);
     apply(ENV_HUB_IDLE_EXIT_MS, &mut cfg.idle_timeout);
     apply(ENV_HUB_HEARTBEAT_MS, &mut cfg.heartbeat);
     apply(ENV_HUB_WRITE_TIMEOUT_MS, &mut cfg.write_timeout);
@@ -1031,10 +1025,14 @@ fn shutdown(hub: &Arc<Hub>) {
 /// the sole driver — correctness unchanged, latency only. The forwarder
 /// thread (and its watcher) stops when the loop's receiver is dropped.
 ///
-/// The one root this ever had was codex's `~/.codex/sessions`, removed with A6
-/// (`charliek/shed#322`): opencode's SSE stream is its own arrival signal, so
-/// the set is empty today and this returns `None`. The seam stays for the next
-/// file-backed lane.
+/// DORMANT BY DESIGN, NOT AN OVERSIGHT. The one root this ever had was codex's
+/// `~/.codex/sessions`, removed with A6 (`charliek/shed#322`); opencode's SSE
+/// stream is its own arrival signal and needs no filesystem wake-up, so the root
+/// set is empty, this returns `None`, and [`super::watch::FsNudger`]'s
+/// implementation is exercised only by its own tests. It is kept — with its
+/// `notify` dependency — because the seam is exactly what the next file-backed
+/// lane would need and re-deriving it is real work; it retires with the hub
+/// itself in S6 if none arrives first. Delete the two together, not this alone.
 pub fn spawn_fs_nudger(
     hub: &Arc<Hub>,
     tx: std::sync::mpsc::Sender<LoopSignal>,

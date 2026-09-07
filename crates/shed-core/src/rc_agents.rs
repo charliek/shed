@@ -3,20 +3,18 @@
 //! registry is inseparable from).
 //!
 //! This is the ENGINE half of the RC logic: the per-kind inner-command builders
-//! that become the tmux `new-session` command, the complete pane classifiers
-//! (trust / auth / ready / dead, with every anchor regex), permission-flag
-//! resolution, the `SHED_RC_*` metadata writer/reader, and slug generation.
-//! Since plan 010 (the hub port) it also carries the hub's pane-derived
-//! approval machinery: [`approval_anchor_for`] and [`composer_under_modal`],
-//! consumed by shed-broker's `rc_hub`. cursor's approval anchor is
-//! SAFETY-critical there — the sole guard against typing into a modal
-//! (`agents.go:347-358`) — and its exhaustiveness over cursor's decision
-//! surfaces is pinned by a test mirroring the Go one.
-//! `rc.rs`'s [`crate::rc::classify_pane`] is a DIFFERENT, deliberately narrower
-//! thing — a claude-only best-effort CLIENT classifier pinned to Swift parity —
-//! and stays untouched. Engine callers (the Rust rc engine in `shed-app`, the
-//! `sx` porcelain) use [`classify_pane`] from THIS module, which is authoritative
-//! and covers every agent.
+//! that become the tmux `new-session` command, permission-flag resolution, the
+//! `SHED_RC_*` metadata writer/reader, and slug generation.
+//!
+//! **There are no pane classifiers here any more.** S2 (charliek/shed#324)
+//! deleted them on both sides: a shed row's `state` is LIVENESS (a session that
+//! enumerates is live; one whose tmux session is gone is not enumerated), and
+//! roost is the status authority for machine rows. What survived the pane is
+//! CONTROL, not status — [`is_trust_prompt`], [`is_codex_trust_prompt`] and
+//! [`is_bypass_accept_prompt`], which keep a kickoff out of a one-time dialog,
+//! and [`extract_url`], the claude.ai remote-control address. The prompt /
+//! working / approval anchors, the pane-stability engine they fed, and the
+//! claude-only client classifier in `rc.rs` all went with them.
 //!
 //! **Why a port and not a binding:** the Go one-shot engine
 //! (`shed-machine-rc` / `shed-ext-rc`) stays alive as the parity oracle while the
@@ -45,9 +43,7 @@ use std::sync::LazyLock;
 use regex::Regex;
 use uuid::Uuid;
 
-use crate::rc::{
-    RcClassification, RcKind, RcSessionDto, RcState, CLAUDE_EXTRA_MODES, LANE_TUI, TMUX_PREFIX,
-};
+use crate::rc::{RcKind, RcSessionDto, RcState, CLAUDE_EXTRA_MODES, LANE_TUI, TMUX_PREFIX};
 
 // ---------------------------------------------------------------------------
 // constants (rc.go)
@@ -449,6 +445,23 @@ static RE_BYPASS_WARN: LazyLock<Regex> =
 static RE_BYPASS_ACCEPT: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(&format!(r"(?i)Yes,{GO_SPACE}*I accept")).unwrap());
 
+static RE_CODEX_TRUST: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)Do you trust the contents of this directory\?").unwrap());
+
+/// Whether the pane is showing codex's first-run directory-trust dialog
+/// (`IsCodexTrustPrompt`, `rc.go`), whose "1. Yes, continue · Press enter to
+/// continue" row is pre-selected.
+///
+/// A CONTROL matcher, the same category as [`is_trust_prompt`] above. S2
+/// (charliek/shed#324) deleted the pane classifiers this regex used to live in,
+/// but it survives because a kickoff must never be typed into a modal: without
+/// it `create --wait --prompt` on an untrusted workdir would send the prompt
+/// line into the dialog instead of the composer. The same gate refuses a
+/// one-shot `prompt` while the dialog is up.
+pub fn is_codex_trust_prompt(pane: &str) -> bool {
+    RE_CODEX_TRUST.is_match(pane)
+}
+
 /// Whether the pane is showing claude's one-time "Bypass Permissions mode"
 /// acceptance dialog (`IsBypassAcceptPrompt`, `rc.go:396`). Requires **both**
 /// halves — the warning headline AND the accept option — because either alone
@@ -459,462 +472,20 @@ pub fn is_bypass_accept_prompt(pane: &str) -> bool {
 }
 
 // ---------------------------------------------------------------------------
-// pane classifiers (agents.go:673-925)
+// the claude control URL (agents.go)
 // ---------------------------------------------------------------------------
-
-static RE_CLAUDE_NEEDS_AUTH: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)requires a claude\.ai subscription|not logged in|claude auth login").unwrap()
-});
-static RE_RECONNECTING: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"\bReconnecting\b").unwrap());
-static RE_CONNECTED: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\bConnected\b").unwrap());
-static RE_RC_CONNECTING: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(?i)Remote Control connecting").unwrap());
-static RE_RC_ACTIVE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(?i)Remote Control active").unwrap());
 
 /// The claude.ai remote-control URL for a claude kind (broker and rc use
 /// different URL shapes); `None` for every other kind (`extractURL`,
 /// `agents.go:686`).
 ///
 /// Re-exported from [`crate::rc::extract_url`], which is already a character-for-
-/// character match for Go's — the URL grammar is claude.ai's, so unlike the
-/// classifier ANCHORS below (whose Go and Swift oracles can word things
-/// differently) there is nothing here for the two sides to diverge on.
+/// character match for Go's — the URL grammar is claude.ai's.
+///
+/// It is the one thing [`parse_session`] still reads a pane for after S2
+/// (charliek/shed#324): the address a person opens to drive a claude session is
+/// CONTROL, not status.
 pub use crate::rc::extract_url;
-
-fn result(state: RcState, url: Option<String>) -> RcClassification {
-    RcClassification { state, url }
-}
-
-/// `classifyClaude` (`agents.go:699`) — the trust/auth gates precede the per-kind
-/// ready logic because either can appear for either claude kind.
-///
-/// The banner-word arms (`Connected`, `Remote Control active`, `Remote Control
-/// connecting`) are OUTCOME-NEUTRAL by construction: each is immediately followed
-/// by the same-verdict url-presence arm that subsumes it. They are kept because
-/// Go has them in exactly this order, and this file mirrors structure rather than
-/// outcome — do not read them as precedence-critical.
-fn classify_claude(kind: &RcKind, pane: &str) -> RcClassification {
-    if is_trust_prompt(pane) {
-        return result(RcState::NeedsTrust, extract_url(kind, pane));
-    }
-    if RE_CLAUDE_NEEDS_AUTH.is_match(pane) {
-        return result(RcState::NeedsAuth, extract_url(kind, pane));
-    }
-    match kind {
-        RcKind::ClaudeBroker => {
-            let url = extract_url(&RcKind::ClaudeBroker, pane);
-            if RE_RECONNECTING.is_match(pane) {
-                return result(RcState::Reconnecting, url);
-            }
-            if RE_CONNECTED.is_match(pane) && url.is_some() {
-                return result(RcState::Ready, url);
-            }
-            if url.is_some() {
-                return result(RcState::Ready, url);
-            }
-            result(RcState::Starting, None)
-        }
-        RcKind::ClaudeRc => {
-            let url = extract_url(&RcKind::ClaudeRc, pane);
-            if RE_RC_CONNECTING.is_match(pane) && url.is_none() {
-                return result(RcState::Starting, None);
-            }
-            if RE_RC_ACTIVE.is_match(pane) && url.is_some() {
-                return result(RcState::Ready, url);
-            }
-            if url.is_some() {
-                return result(RcState::Ready, url);
-            }
-            result(RcState::Starting, None)
-        }
-        _ => result(RcState::Starting, None),
-    }
-}
-
-/// codex's empty-composer placeholder — shared by the ready regex (banner OR
-/// composer ⇒ ready) and the prompt anchor (composer only ⇒ needs_input), so the
-/// two cannot drift if codex rewords the hint (`agents.go:741`).
-///
-/// An ALTERNATION, because codex has already reworded it once: builds through
-/// mid-2026 print "Find and fix a bug in @filename", newer ones print "Ask
-/// Codex to do anything". Both stay — the anchor is a vendor string this code
-/// does not control, and an old build must keep classifying after a new one is
-/// recognized.
-///
-/// Observed failure when the live wording drifted past the anchor: the startup
-/// BANNER (the other ready alternative) scrolls out of the capture window after
-/// the first turn, so the session classified `starting` forever — which reads
-/// as a blocking lifecycle, so the hub refused typed input and rendered no
-/// activity, on a session sitting visibly at its composer.
-const CODEX_COMPOSER_PLACEHOLDER: &str =
-    r"Find and fix a bug in @filename|Ask Codex to do anything";
-
-static RE_CODEX_READY: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(&format!(
-        r">_ OpenAI Codex \(v|{CODEX_COMPOSER_PLACEHOLDER}"
-    ))
-    .unwrap()
-});
-/// codex's in-turn chrome: the interrupt hint it prints while a turn runs.
-/// Proof the TUI is up, independent of any composer wording.
-static RE_CODEX_WORKING: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"esc to interrupt").unwrap());
-
-static RE_CODEX_TRUST: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(?i)Do you trust the contents of this directory\?").unwrap());
-static RE_CODEX_AUTH: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"Provided authentication token is expired|token_expired|Sign in with ChatGPT")
-        .unwrap()
-});
-
-/// `classifyCodex` (`agents.go:760`). **READY IS CHECKED FIRST**, deliberately:
-/// the composer banner means codex is usable and must win even over the inline
-/// MCP `token_expired` warning, which is a sub-service failure printed ON the
-/// working ready screen, not a core-auth failure.
-fn classify_codex(pane: &str) -> RcClassification {
-    if RE_CODEX_READY.is_match(pane) {
-        return result(RcState::Ready, None);
-    }
-    if RE_CODEX_TRUST.is_match(pane) {
-        return result(RcState::NeedsTrust, None);
-    }
-    if RE_CODEX_AUTH.is_match(pane) {
-        return result(RcState::NeedsAuth, None);
-    }
-    // The in-turn hint is checked AFTER trust/auth, not before: it is an
-    // unanchored phrase, so a transcript that quotes it (or a codex relaunched
-    // by hand in the same pane, leaving the old text in scrollback) could
-    // otherwise mask a sign-in screen that is on the display RIGHT NOW.
-    if RE_CODEX_WORKING.is_match(pane) {
-        return result(RcState::Ready, None);
-    }
-    // Same rule as cursor's, and checked AFTER trust/auth so those keep their
-    // precedence: codex's approval overlay replaces the composer, so without
-    // this a session waiting on an approval reads `starting` — blocking — once
-    // the startup banner has scrolled away.
-    if RE_CODEX_APPROVAL_ANCHOR.is_match(pane) {
-        return result(RcState::Ready, None);
-    }
-    result(RcState::Starting, None)
-}
-
-static RE_OPENCODE_PLACEHOLDER: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"Ask anything\.\.\.").unwrap());
-static RE_OPENCODE_FOOTER: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"ctrl\+p commands").unwrap());
-static RE_OPENCODE_AUTH_SCREEN: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)\bsign in\b|\blog ?in to\b|\bauthenticate\b|\bopencode auth\b").unwrap()
-});
-/// opencode's auto-opened "Connect a provider" dialog — a CONJUNCTION of the
-/// headline and the `Popular` category header that appears alone on its own line
-/// a few rows below, because the headline alone is ordinary English an agent
-/// could quote back (`agents.go:836`).
-static RE_OPENCODE_AUTH_DIALOG: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?m)^[ \t]*Connect a provider\b(?:[^\n]*\n){0,10}[ \t]*Popular[ \t]*$").unwrap()
-});
-
-/// `classifyOpencode` (`agents.go:849`). The auth dialog is checked FIRST — it is
-/// a full-screen overlay that replaces the composer/footer, so it never races the
-/// ready checks. The composer placeholder is UNCONDITIONAL ready; the persistent
-/// footer alone means ready only when the pane does not otherwise look like an
-/// auth/onboarding screen (a wrong ready would deliver a prompt into a login
-/// screen, whereas a wrong starting self-corrects on the next poll).
-fn classify_opencode(pane: &str) -> RcClassification {
-    if RE_OPENCODE_AUTH_DIALOG.is_match(pane) {
-        return result(RcState::NeedsAuth, None);
-    }
-    if RE_OPENCODE_PLACEHOLDER.is_match(pane) {
-        return result(RcState::Ready, None);
-    }
-    if RE_OPENCODE_FOOTER.is_match(pane) && !RE_OPENCODE_AUTH_SCREEN.is_match(pane) {
-        return result(RcState::Ready, None);
-    }
-    result(RcState::Starting, None)
-}
-
-static RE_CURSOR_AUTH: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(
-        r"(?i)Press any key to log in\.\.\.|Authentication required to use Cursor Agent|click this link to log in",
-    )
-    .unwrap()
-});
-/// cursor's authed composer placeholder, line-anchored with its arrow prefix so
-/// the phrase quoted inside agent output can't read as ready. cursor swaps the
-/// text after the first exchange (`Plan, search, build anything` → `Add a
-/// follow-up`); both are the same ready chrome (`agents.go:876`).
-static RE_CURSOR_READY: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(&format!(
-        r"(?m)^{GO_SPACE}*→ (?:Plan, search, build anything|Add a follow-up)(?:{GO_SPACE}{{2,}}\S[^\n]*)?{GO_SPACE}*$"
-    ))
-    .unwrap()
-});
-
-/// cursor's in-turn chrome: the hint it right-aligns on the composer line while
-/// a turn is running. Proof the TUI is up, and the ONLY such proof for a pane
-/// whose composer is otherwise covered.
-static RE_CURSOR_WORKING: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"ctrl\+c to stop").unwrap());
-
-/// cursor's WAITING anchor, deliberately STRICTER than [`RE_CURSOR_READY`]: the
-/// bare composer line, nothing trailing.
-///
-/// The two answer different questions and must not share a regex. "Is this agent
-/// up?" wants every scrap of chrome it can get (which is why the ready regex
-/// tolerates the right-aligned hint). "Is it waiting for me?" is what the INPUT
-/// GATE reads, and there a false yes delivers a keystroke into a running turn —
-/// so it takes the composer's resting form only, and the working anchor vetoes
-/// even that.
-static RE_CURSOR_PROMPT_ANCHOR: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(&format!(
-        r"(?m)^{GO_SPACE}*→ (?:Plan, search, build anything|Add a follow-up){GO_SPACE}*$"
-    ))
-    .unwrap()
-});
-
-/// cursor's STATUS BAR — `Cursor <model> · <pct>%` — the one piece of chrome
-/// that survives everything the composer does not.
-///
-/// The composer line is CONTENT, and content changes: its placeholder differs
-/// fresh vs mid-conversation, it grows a right-aligned hint while working, and
-/// the moment anyone TYPES the placeholder is replaced by their words. Each of
-/// those dropped a live session back to `starting` — a blocking lifecycle —
-/// while it sat plainly alive on screen. The status bar is drawn by the TUI
-/// itself and says nothing about what the user or the agent is doing, which is
-/// exactly why it is the right thing to anchor "is this up?" on.
-static RE_CURSOR_STATUS: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(?m)^[ \t]*Cursor .+ · [0-9]+(?:\.[0-9]+)?%[ \t]*$").unwrap());
-
-/// `classifyCursor` (`agents.go:881`). The auth screens and the authed composer
-/// are disjoint, so auth is checked first and ready second.
-fn classify_cursor(pane: &str) -> RcClassification {
-    if RE_CURSOR_AUTH.is_match(pane) {
-        return result(RcState::NeedsAuth, None);
-    }
-    if RE_CURSOR_READY.is_match(pane)
-        || RE_CURSOR_WORKING.is_match(pane)
-        || RE_CURSOR_STATUS.is_match(pane)
-    {
-        return result(RcState::Ready, None);
-    }
-    // An approval dialog PROVES the agent is up: it only exists because a turn
-    // ran far enough to ask for something. cursor's modal covers the composer,
-    // so the ready anchor alone reported `starting` for a session that was
-    // running and waiting on a person — and `starting` is a BLOCKING lifecycle,
-    // which suppresses the activity dimension entirely, so clients could
-    // neither show "needs approval" nor accept a keystroke. Lifecycle answers
-    // "is it up"; the activity dimension answers "what is it doing".
-    if RE_CURSOR_APPROVAL_ANCHOR.is_match(pane) {
-        return result(RcState::Ready, None);
-    }
-    result(RcState::Starting, None)
-}
-
-/// `classifyShell` (`agents.go:895`) — ready as soon as the pane has drawn
-/// anything (a prompt), starting while blank. A shell has no trust/auth/url
-/// states and its prompt is the ready signal, never a death.
-fn classify_shell(pane: &str) -> RcClassification {
-    if pane.trim().is_empty() {
-        result(RcState::Starting, None)
-    } else {
-        result(RcState::Ready, None)
-    }
-}
-
-/// A line that IS a bare shed guest login-shell prompt (`[shed:<name>] <cwd> $`)
-/// and nothing else — fully anchored, applied to the TRIMMED line
-/// (`shedShellPromptRe`, `agents.go:909`). The anchoring matters twice over: a
-/// launch-line command echo (`[shed:x] ~ $ codex`) has text after the `$`, and a
-/// running agent merely PRINTING a prompt-shaped line must not read as a death.
-static RE_SHED_SHELL_PROMPT: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^\[shed:[^\]]+\][^$]*\$$").unwrap());
-
-/// Whether the pane's last non-empty line is a bare shed shell prompt — the agent
-/// returned to the login shell (`exitedToShell`, `agents.go:915`).
-///
-/// **An EMPTY pane is NOT dead.** A blank pane is a just-started/ambiguous
-/// session; the real death of a whole session surfaces as a capture failure at
-/// the ops layer, not here.
-pub fn exited_to_shell(pane: &str) -> bool {
-    for line in pane.split('\n').rev() {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        return RE_SHED_SHELL_PROMPT.is_match(line);
-    }
-    false
-}
-
-/// **The engine pane classifier** — derive `(state, url)` from a captured pane
-/// for a kind (`ClassifyPane`, `rc.go:406`).
-///
-/// An unregistered (unknown) kind renders neutrally as a plain shell pane: a
-/// state, never a claude URL affordance (the unknown-kind policy). For every
-/// agent kind a shared shed-guest DEAD check runs FIRST — if the agent has exited
-/// back to the login shell the session is dead regardless of any auth/trust text
-/// still sitting in scrollback. `shell` is exempt (its prompt is the ready state).
-///
-/// This is the authoritative classifier and covers every agent, unlike
-/// [`crate::rc::classify_pane`], the claude-only best-effort CLIENT utility.
-pub fn classify_pane(kind: &RcKind, pane: &str) -> RcClassification {
-    let Some(tool) = tool_for(kind) else {
-        return classify_shell(pane);
-    };
-    if tool != AgentTool::Shell && exited_to_shell(pane) {
-        return result(RcState::Dead, None);
-    }
-    match tool {
-        AgentTool::Claude => classify_claude(kind, pane),
-        AgentTool::Codex => classify_codex(pane),
-        AgentTool::Opencode => classify_opencode(pane),
-        AgentTool::Cursor => classify_cursor(pane),
-        AgentTool::Shell => classify_shell(pane),
-    }
-}
-
-// ---------------------------------------------------------------------------
-// prompt anchors (agents.go:193-222) — registry data, hub consumers stay Go
-// ---------------------------------------------------------------------------
-
-static RE_CLAUDE_PROMPT_ANCHOR: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(&format!(
-        r#"(?m)^{GO_SPACE}*>{GO_SPACE}+Try "|\? for shortcuts"#
-    ))
-    .unwrap()
-});
-static RE_CODEX_PROMPT_ANCHOR: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(CODEX_COMPOSER_PLACEHOLDER).unwrap());
-static RE_OPENCODE_PROMPT_ANCHOR: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(&format!(
-        r"{}|{}",
-        RE_OPENCODE_PLACEHOLDER.as_str(),
-        RE_OPENCODE_FOOTER.as_str()
-    ))
-    .unwrap()
-});
-static RE_SHELL_PROMPT_ANCHOR: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(&format!(
-        r"(?m)^{GO_SPACE}*\[shed:[^\]]+\][^$]*\${GO_SPACE}*$"
-    ))
-    .unwrap()
-});
-
-/// The kind's PROMPT ANCHOR — the empty-composer / waiting-for-input chrome the
-/// pane-stability engine uses to split `needs_input` from plain `idle` on a quiet
-/// pane (`promptAnchorFor`, `agents.go:533`). `None` for an unregistered kind.
-///
-/// Consumed by the hub's stability engine (shed-broker's `rc_hub`, plan 010) to
-/// split `needs_input` from `idle` on a settled pane, and read against the
-/// approval fixtures by the `composer_under_modal` pin below.
-pub fn prompt_anchor_for(kind: &RcKind) -> Option<&'static Regex> {
-    match tool_for(kind)? {
-        AgentTool::Claude => Some(&RE_CLAUDE_PROMPT_ANCHOR),
-        AgentTool::Codex => Some(&RE_CODEX_PROMPT_ANCHOR),
-        AgentTool::Opencode => Some(&RE_OPENCODE_PROMPT_ANCHOR),
-        AgentTool::Cursor => Some(&RE_CURSOR_PROMPT_ANCHOR),
-        AgentTool::Shell => Some(&RE_SHELL_PROMPT_ANCHOR),
-    }
-}
-
-/// The kind's IN-TURN chrome — the hint it draws while a turn is running
-/// (`workingAnchorFor`, `agents.go`). A pane matching it is mid-turn, which
-/// VETOES "waiting for input" however quiet the pane has gone.
-///
-/// It exists because the composer is not proof of waiting: codex draws its
-/// composer WHILE WORKING (captured live), so a pane that merely stopped
-/// changing for a few seconds could be read as `needs_input` and accept a
-/// posted line into a running turn. `None` for kinds that draw no such hint.
-pub fn working_anchor_for(kind: &RcKind) -> Option<&'static Regex> {
-    match tool_for(kind)? {
-        AgentTool::Codex => Some(&RE_CODEX_WORKING),
-        AgentTool::Cursor => Some(&RE_CURSOR_WORKING),
-        AgentTool::Claude | AgentTool::Opencode | AgentTool::Shell => None,
-    }
-}
-
-// ---------------------------------------------------------------------------
-// approval anchors (agents.go:225-403) — the hub's pane-derived approval signal
-// ---------------------------------------------------------------------------
-//
-// Ported for the plan-010 hub port (shed-broker's rc_hub is the consumer).
-// Structural, whole-line expressions in the ready-anchor tradition: what makes a
-// match trustworthy is the WIDGET SHAPE around the words, not the words. Each
-// regex's full rationale — why option rows and not headlines, why the cursor
-// anchor is a headline+option CONJUNCTION, the verbatim-reproduction limitation —
-// lives with the Go originals (`agents.go:228-370`); the Rust side pins the same
-// fixtures and the same exhaustiveness table rather than restating the essay.
-
-/// One rendered OPTION ROW of codex's approval overlay, conjoined with the
-/// overlay's own footer within the next few lines (`codexApprovalAnchorRe`,
-/// `agents.go:294`). The footer wording belongs to the approval overlay alone
-/// (other codex list views end "esc to go back"); the row half requires the
-/// column-0 selection gutter (`›` or its replacing space) so assistant prose
-/// bullets — which land at the same column with a `• ` gutter — never match.
-static RE_CODEX_APPROVAL_ANCHOR: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(
-        r"(?m)^[› ] [0-9]+\. (?:Yes, proceed|Yes, just this once|No, and tell Codex what to do differently)(?: \([^()\n]{1,16}\))? *\n(?:[^\n]*\n){0,12} *Press enter to confirm or esc to cancel",
-    )
-    .unwrap()
-});
-
-/// The decision surface's bold headline, one alternative per operation type,
-/// plus the hook-approval reason line (`cursorApprovalHeadline`, `agents.go:383`).
-const CURSOR_APPROVAL_HEADLINE: &str = "(?:Run this command\\?|Run this command outside the sandbox\\?|Run this MCP tool\\?|Delete this file\\?|Write to this file\\?|Allow this web search\\?|Allow this web fetch\\?|Proceed with this edit\\?|Hook requested approval:[^\n]*)";
-
-/// One option row's LABEL — every label decision-logic.ts can push, across all
-/// eight decision surfaces (`cursorApprovalOption`, `agents.go:398`). Two
-/// families: FIXED labels owning their whole line up to an optional " (hint)",
-/// and PREFIX labels ("Add Write(", "Add Shell(", "Always allow ") that
-/// interpolate a path/command/domain and consume the rest of the line.
-///
-/// EXHAUSTIVENESS over the surfaces is a SAFETY property, not a nicety
-/// (`agents.go:330-358`): cursor keeps its composer drawn — disabled — UNDER the
-/// dialog, so for a [`composer_under_modal`] kind this regex against the fresh
-/// visible pane is the SOLE guard between the input gate's guarded-recovery arm
-/// and typing into the widget (where a "y" answers it). A cursor upgrade that
-/// adds a surface MUST teach this label set in the same change — the
-/// exhaustiveness test mirrors Go's `TestCursorApprovalAnchorCoversEveryDecisionSurface`.
-const CURSOR_APPROVAL_OPTION: &str = "(?:(?:Run \\(once\\)|Run outside sandbox \\(once\\)|Run Everything|Run in Sandbox|Checking Run Everything availability|Skip & tell the agent what to do instead|Reject & propose changes|Allowlist MCP Tool|Add to allowlist|Allow search|Delete|Keep|Proceed|Fetch|Skip)(?: \\([^()\n]{1,16}\\))?|(?:Always allow |Add Write\\(|Add Shell\\()[^\n]*)";
-
-/// cursor-agent's approval prompt: a whole-line HEADLINE, then within a few
-/// lines a whole-line OPTION ROW (`cursorApprovalAnchorRe`, `agents.go:372`).
-/// Neither half is trusted alone — a headline is quotable prose that survives
-/// the answer in the transcript; an option label can end a line of prose. The
-/// row's accepted gutter is indent plus an optional "→ " marker; markdown
-/// bullets (`- `, `* `) are deliberately NOT accepted (that is how an assistant
-/// lists the same labels).
-static RE_CURSOR_APPROVAL_ANCHOR: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(&format!(
-        "(?m)^[ \t]*{CURSOR_APPROVAL_HEADLINE}[ \t]*\n(?:[^\n]*\n){{0,8}}[ \t]*(?:→ )?{CURSOR_APPROVAL_OPTION}[ \t]*$"
-    ))
-    .unwrap()
-});
-
-/// The kind's APPROVAL-DIALOG anchor (`approvalAnchorFor`, `agents.go:550`) —
-/// the chrome the hub's pane-anchor mechanism matches against the VISIBLE frame
-/// only. `None` means "this kind has no pane-derived approval signal", which
-/// callers must treat as "no evidence", never as "not blocked". codex and
-/// cursor declare one; opencode's approvals ride its protocol lane and claude's
-/// remote-control surface has no dialog to anchor.
-pub fn approval_anchor_for(kind: &RcKind) -> Option<&'static Regex> {
-    match tool_for(kind)? {
-        AgentTool::Codex => Some(&RE_CODEX_APPROVAL_ANCHOR),
-        AgentTool::Cursor => Some(&RE_CURSOR_APPROVAL_ANCHOR),
-        AgentTool::Claude | AgentTool::Opencode | AgentTool::Shell => None,
-    }
-}
-
-/// Whether the kind KEEPS ITS INPUT COMPOSER DRAWN while a modal owns the
-/// keyboard (`composerUnderModal`, `agents.go:561`; `AgentSpec.ComposerUnderModal`).
-/// A RENDERING FACT pinned against the pane fixtures: codex's overlay replaces
-/// the composer (false), cursor draws its composer disabled underneath (true).
-/// The hub input gate's expired-working guarded-recovery arm is derived from
-/// this flag — a wrong value is a silent auto-approval hole, not a cosmetic bug.
-pub fn composer_under_modal(kind: &RcKind) -> bool {
-    matches!(tool_for(kind), Some(AgentTool::Cursor))
-}
 
 // ---------------------------------------------------------------------------
 // slugs (rc.go:231-250)
@@ -1159,8 +730,13 @@ fn none_if_empty(s: String) -> Option<String> {
 ///
 /// - The **slug comes from the tmux session NAME** (`rc-` stripped) — the name is
 ///   the source of truth, never the redundant `SHED_RC_SLUG` value.
-/// - `state`/`url` are derived from the pane (never stored) and `lane` from the
-///   kind, which is why `lane` is present on legacy and unknown-kind rows too.
+/// - `state` is LIVENESS, not a pane reading (S2, charliek/shed#324): a session
+///   that is ENUMERATED is live, so it is [`RcState::Ready`] unconditionally. One
+///   whose tmux session is gone is simply not enumerated by `list`, and `probe`
+///   reports it missing. `pane` survives as a parameter for exactly one reason —
+///   [`extract_url`] on the claude kinds.
+/// - `lane` comes from the kind, which is why it is present on legacy and
+///   unknown-kind rows too.
 /// - A session with no valid `SHED_RC_V` is **legacy/unmanaged**: kind is forced
 ///   to `claude-broker`, `managed` is false, and every stray `SHED_RC_*` value is
 ///   IGNORED (an unmanaged session's env is not trusted metadata — it could have
@@ -1192,7 +768,6 @@ pub fn parse_session(
     } else {
         RcKind::ClaudeBroker
     };
-    let c = classify_pane(&kind, pane);
     // The one mechanism behind "an unmanaged session's env is not trusted": every
     // stored value reads as absent unless the session is managed.
     let stored = |k: &str| if managed { none_if_empty(val(k)) } else { None };
@@ -1201,12 +776,12 @@ pub fn parse_session(
         slug,
         tmux_session: tmux_session.to_string(),
         lane: Some(lane_for_kind(&kind).to_string()),
+        state: RcState::Ready,
+        url: extract_url(&kind, pane),
         kind,
-        state: c.state,
         managed,
         display_name: none_if_empty(name),
         workdir: stored(ENV_WORKDIR),
-        url: c.url,
         id: stored(ENV_ID),
         created_by: stored(ENV_CREATED_BY),
         created_at: stored(ENV_CREATED_AT)
@@ -1224,7 +799,6 @@ mod tests {
     use super::*;
     use crate::rc::GENERIC_PERMISSION_MODES;
     use std::collections::HashSet;
-    use std::path::{Path, PathBuf};
 
     // ---- shellQuote (mirrors Go TestShellQuote, rc_test.go:57) ----
 
@@ -1692,493 +1266,28 @@ mod tests {
         }
     }
 
-    // ---- classifier (mirrors Go TestClassifyPane, rc_test.go:219) ----
+    // S2 (charliek/shed#324) removed every classifier, anchor and fixture-sweep
+    // cell that lived here — the classifiers themselves are gone. What the pane is
+    // still read for is CONTROL, pinned by the two matcher cells above plus the
+    // codex one below, and by `rc.rs`'s URL cells.
 
     #[test]
-    fn classify_pane_table() {
-        let cases: &[(&str, RcKind, &str, RcState, &str)] = &[
-            ("broker ready+url", RcKind::ClaudeBroker,
-             "·✔︎· Connected · my-shed\nhttps://claude.ai/code?environment=env_01ABC",
-             RcState::Ready, "https://claude.ai/code?environment=env_01ABC"),
-            ("broker reconnecting", RcKind::ClaudeBroker, "·|· Reconnecting · retrying", RcState::Reconnecting, ""),
-            ("broker needs-trust", RcKind::ClaudeBroker, "Error: Workspace not trusted. run claude", RcState::NeedsTrust, ""),
-            ("broker needs-auth", RcKind::ClaudeBroker, "Remote Control requires a claude.ai subscription.", RcState::NeedsAuth, ""),
-            ("broker starting", RcKind::ClaudeBroker, "booting...", RcState::Starting, ""),
-            ("rc ready", RcKind::ClaudeRc,
-             "/remote-control is active · https://claude.ai/code/session_01RC\nRemote Control active",
-             RcState::Ready, "https://claude.ai/code/session_01RC"),
-            ("rc connecting", RcKind::ClaudeRc, "❯ /remote-control\n  ⎿  Remote Control connecting…", RcState::Starting, ""),
-            ("rc needs-trust quick-check", RcKind::ClaudeRc, "Quick safety check: is this a project", RcState::NeedsTrust, ""),
-            ("rc starting", RcKind::ClaudeRc, "❯ Try \"fix typecheck errors\"", RcState::Starting, ""),
-            ("rc ignores broker url", RcKind::ClaudeRc, "banner https://claude.ai/code?environment=env_01ABC", RcState::Starting, ""),
-            ("shell ready", RcKind::Shell, "charliek@shed:~$ ", RcState::Ready, ""),
-            ("shell starting", RcKind::Shell, "   \n  ", RcState::Starting, ""),
-        ];
-        for (name, kind, pane, want_state, want_url) in cases {
-            let c = classify_pane(kind, pane);
-            assert_eq!(c.state, *want_state, "case {name}");
-            assert_eq!(c.url.as_deref().unwrap_or(""), *want_url, "case {name}");
-        }
-    }
-
-    // ---- classifier false positives (mirrors Go TestClassifyFalsePositives) ----
-
-    const SHED_PROMPT: &str = "[shed:agent-fixtures] ~ $ ";
-
-    #[test]
-    fn shell_prompt_is_ready_for_shell_and_dead_for_agents() {
-        assert_eq!(
-            classify_pane(&RcKind::Shell, SHED_PROMPT).state,
-            RcState::Ready
-        );
-        for kind in [
-            RcKind::Codex,
-            RcKind::Opencode,
-            RcKind::Cursor,
-            RcKind::ClaudeRc,
+    fn codex_trust_prompt_matcher() {
+        for pane in [
+            "Do you trust the contents of this directory?",
+            "  do you TRUST the contents of this directory?  ",
+            "codex\n\n  Do you trust the contents of this directory?\n  1. Yes, continue",
         ] {
-            assert_eq!(
-                classify_pane(&kind, &format!("some agent output\n{SHED_PROMPT}")).state,
-                RcState::Dead,
-                "{}",
-                kind.as_str()
-            );
+            assert!(is_codex_trust_prompt(pane), "missed: {pane:?}");
         }
-    }
-
-    #[test]
-    fn empty_pane_is_starting_not_dead() {
-        for kind in [
-            RcKind::Codex,
-            RcKind::Opencode,
-            RcKind::Cursor,
-            RcKind::ClaudeRc,
-            RcKind::Shell,
+        for pane in [
+            "",
+            // claude's dialog, not codex's.
+            "Yes, I trust this folder",
+            // Truncated: no question mark.
+            "Do you trust the contents of this dir",
         ] {
-            assert_eq!(
-                classify_pane(&kind, "   \n\n").state,
-                RcState::Starting,
-                "{}",
-                kind.as_str()
-            );
-        }
-    }
-
-    #[test]
-    fn launch_echo_and_prompt_shaped_output_are_not_deaths() {
-        let pane = format!(
-            "{SHED_PROMPT}codex\nDo you trust the contents of this directory?\n1. Yes, continue\nPress enter to continue"
-        );
-        assert_eq!(
-            classify_pane(&RcKind::Codex, &pane).state,
-            RcState::NeedsTrust
-        );
-
-        let pane = ">_ OpenAI Codex (v0.142.4)\nI'll run the tests now:\n[shed:x] ~ $ make test";
-        assert_eq!(classify_pane(&RcKind::Codex, pane).state, RcState::Ready);
-        assert!(!exited_to_shell("agent output\n[shed:x] ~ $ make test"));
-        assert!(exited_to_shell("agent output\n[shed:x] ~ $ "));
-    }
-
-    #[test]
-    fn codex_ready_wins_over_inline_token_expired() {
-        let pane = "MCP startup failed\n\"code\": \"token_expired\"\nProvided authentication token is expired.";
-        assert_eq!(
-            classify_pane(&RcKind::Codex, pane).state,
-            RcState::NeedsAuth
-        );
-        let pane =
-            ">_ OpenAI Codex (v0.142.4)\n\"code\": \"token_expired\"\nMCP startup incomplete";
-        assert_eq!(classify_pane(&RcKind::Codex, pane).state, RcState::Ready);
-    }
-
-    #[test]
-    fn opencode_footer_only_ready_is_auth_guarded() {
-        let auth = "  Sign in to opencode to continue\n\n  ctrl+p commands";
-        assert_eq!(
-            classify_pane(&RcKind::Opencode, auth).state,
-            RcState::Starting
-        );
-        let chat = "  Hello! How can I help you today?\n\n  8.4K (4%)  ctrl+p commands";
-        assert_eq!(classify_pane(&RcKind::Opencode, chat).state, RcState::Ready);
-        let fresh = "  Ask anything... \"Fix broken tests\"\n  sign in tips\n  ctrl+p commands";
-        assert_eq!(
-            classify_pane(&RcKind::Opencode, fresh).state,
-            RcState::Ready
-        );
-    }
-
-    #[test]
-    fn opencode_connect_a_provider_needs_the_popular_header() {
-        let quoted = "  Ask anything... \"Fix broken tests\"\n  I can help you Connect a provider if you'd like.\n  ctrl+p commands";
-        assert_eq!(
-            classify_pane(&RcKind::Opencode, quoted).state,
-            RcState::Ready
-        );
-        let headline_only =
-            "  Some assistant text that happens to say Connect a provider mid-sentence.\n";
-        assert_ne!(
-            classify_pane(&RcKind::Opencode, headline_only).state,
-            RcState::NeedsAuth
-        );
-        // The conjunction (headline + the lone "Popular" category header) fires.
-        let dialog =
-            "Connect a provider                    esc\n\n  Popular\n  opencode\n  anthropic\n";
-        assert_eq!(
-            classify_pane(&RcKind::Opencode, dialog).state,
-            RcState::NeedsAuth
-        );
-    }
-
-    #[test]
-    fn cursor_login_splash_is_needs_auth() {
-        assert_eq!(
-            classify_pane(&RcKind::Cursor, "Cursor Agent\nPress any key to log in...").state,
-            RcState::NeedsAuth
-        );
-    }
-
-    #[test]
-    fn unknown_kind_renders_neutrally() {
-        let c = classify_pane(
-            &RcKind::Other("opencode-hub".into()),
-            "banner https://claude.ai/code/session_01RC",
-        );
-        assert_eq!(c.url, None);
-        assert_ne!(c.state, RcState::Dead);
-    }
-
-    // ---- fixture-driven classifier sweep (mirrors classify_fixtures_test.go) ----
-
-    /// The pane fixtures live at `crates/fixtures/panes/` — a byte-identical copy
-    /// of `internal/ext/rc/testdata/panes/`, kept in lockstep by the Go sweep in
-    /// `golden_parity_test.go`. The path is resolved from `CARGO_MANIFEST_DIR` and
-    /// stays INSIDE `crates/`, because `make -C desktop core-linux` mounts only
-    /// `crates/` — a fixture read from the Go tree could not be found there.
-    fn panes_dir() -> PathBuf {
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("../fixtures/panes")
-    }
-
-    /// The kind a fixture's `<agent>` prefix classifies under. Non-claude agents
-    /// are the bare-tool kinds; claude fixtures use `claude-rc` (the classifier is
-    /// shared across claude kinds). Mirrors `fixtureAgentKind`
-    /// (`classify_fixtures_test.go:13`).
-    fn fixture_agent_kind(agent: &str) -> Option<RcKind> {
-        match agent {
-            "claude" => Some(RcKind::ClaudeRc),
-            "codex" => Some(RcKind::Codex),
-            "opencode" => Some(RcKind::Opencode),
-            "cursor" => Some(RcKind::Cursor),
-            _ => None,
-        }
-    }
-
-    /// Split `<agent>-<state>[-variant]` into the agent prefix and the state its
-    /// content must classify to. States are matched longest-first so
-    /// `needs-auth`/`needs-trust` win over the bare tokens, and so a `-login`
-    /// variant of a state still resolves to that state. Mirrors
-    /// `parseFixtureName` (`classify_fixtures_test.go:30`).
-    fn parse_fixture_name(name: &str) -> Option<(&str, RcState)> {
-        let dash = name.find('-')?;
-        let agent = &name[..dash];
-        let rest = &name[dash + 1..];
-        for (token, state) in [
-            ("needs-trust", RcState::NeedsTrust),
-            ("needs-auth", RcState::NeedsAuth),
-            ("reconnecting", RcState::Reconnecting),
-            ("starting", RcState::Starting),
-            ("ready", RcState::Ready),
-            ("dead", RcState::Dead),
-        ] {
-            if rest == token || rest.starts_with(&format!("{token}-")) {
-                return Some((agent, state));
-            }
-        }
-        None
-    }
-
-    #[test]
-    fn every_pane_fixture_classifies_to_its_filename_state() {
-        let dir = panes_dir();
-        let mut seen = 0usize;
-        let mut entries: Vec<_> = std::fs::read_dir(&dir)
-            .unwrap_or_else(|e| panic!("reading {}: {e}", dir.display()))
-            .map(|e| e.unwrap().path())
-            .filter(|p| p.extension().is_some_and(|x| x == "txt"))
-            .collect();
-        entries.sort();
-        assert!(
-            !entries.is_empty(),
-            "no pane fixtures found in {}",
-            dir.display()
-        );
-
-        for path in entries {
-            let base = path.file_name().unwrap().to_string_lossy().to_string();
-            if base == "SUMMARY.txt" {
-                continue;
-            }
-            let name = base.trim_end_matches(".txt");
-            let (agent, want) = parse_fixture_name(name).unwrap_or_else(|| {
-                panic!("{base}: filename does not encode a known <agent>-<state>")
-            });
-            let kind = fixture_agent_kind(agent)
-                .unwrap_or_else(|| panic!("{base}: unknown agent prefix {agent:?}"));
-            let data = std::fs::read_to_string(&path).unwrap();
-            let c = classify_pane(&kind, &data);
-            // The drift this guards: a fixture falling through to the `starting`
-            // default is what a broken anchor looks like after a TUI
-            // redraw/rebrand.
-            assert_eq!(
-                c.state, want,
-                "{base}: classified wrong (a `starting` result means a broken anchor)"
-            );
-            // url/id stay claude-remote-control-specific — never leak for other agents.
-            if agent != "claude" {
-                assert_eq!(c.url, None, "{base}: non-claude fixture leaked a url");
-            }
-            seen += 1;
-        }
-        assert!(seen > 0, "no state fixtures were exercised");
-    }
-
-    // ---- approval anchors (plan 010 H3; mirrors hub_pane_approvals_test.go +
-    //      cursor_approval_test.go's anchor-level tests — the hub-gate tests ride
-    //      the rc_hub port) ----
-
-    fn pane_fixture(name: &str) -> String {
-        let path = panes_dir().join(format!("{name}.txt"));
-        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()))
-    }
-
-    /// The whole pane line containing the anchor's first match — what
-    /// `firstAnchorLine` (`hub_reconcile.go:196`) reports as the row's text,
-    /// minus its sanitize step (the fixtures are clean text).
-    fn first_anchor_line<'p>(anchor: &Regex, pane: &'p str) -> &'p str {
-        let Some(m) = anchor.find(pane) else {
-            return "";
-        };
-        let start = pane[..m.start()].rfind('\n').map_or(0, |i| i + 1);
-        pane[start..].split('\n').next().unwrap_or("")
-    }
-
-    #[test]
-    fn approval_anchors_declared_for_exactly_codex_and_cursor() {
-        for kind in all_kinds() {
-            let want = matches!(kind, RcKind::Codex | RcKind::Cursor);
-            assert_eq!(
-                approval_anchor_for(&kind).is_some(),
-                want,
-                "{}",
-                kind.as_str()
-            );
-        }
-        assert!(composer_under_modal(&RcKind::Cursor));
-        assert!(!composer_under_modal(&RcKind::Codex));
-    }
-
-    /// Mirrors `TestCodexApprovalAnchorFixtures` (`hub_pane_approvals_test.go:33`).
-    #[test]
-    fn codex_approval_anchor_fixtures() {
-        let anchor = approval_anchor_for(&RcKind::Codex).unwrap();
-        for (fixture, want) in [
-            ("codex-ready-approval-exec", true),
-            ("codex-ready-approval-network", true), // selection arrowed onto row 4
-            ("codex-ready-approval-resolved", false),
-            ("codex-ready-approval-quoted", false),
-            ("codex-ready-tool-running", false),
-            ("codex-ready", false),
-            ("codex-needs-trust", false), // "1. Yes, continue" is a DIFFERENT widget
-        ] {
-            let pane = pane_fixture(fixture);
-            assert_eq!(anchor.is_match(&pane), want, "{fixture}");
-            if want {
-                // The row's text must be the option row itself, not the whole span.
-                let line = first_anchor_line(anchor, &pane);
-                assert!(
-                    !line.contains("Press enter") && line.contains(". "),
-                    "{fixture}: first_anchor_line = {line:?}, want the single option row"
-                );
-            }
-        }
-    }
-
-    /// Mirrors `TestCodexApprovalAnchorIgnoresHeadline` (`hub_pane_approvals_test.go:69`).
-    #[test]
-    fn codex_approval_anchor_ignores_headline() {
-        let anchor = approval_anchor_for(&RcKind::Codex).unwrap();
-        let headline = "  Would you like to run the following command?";
-        assert!(
-            pane_fixture("codex-ready-approval-resolved").contains(headline),
-            "test premise: the post-resolution fixture must still carry the headline"
-        );
-        assert!(
-            !anchor.is_match(headline),
-            "the headline alone must never match the anchor"
-        );
-    }
-
-    /// Mirrors `TestCursorApprovalAnchorFixtures` (`cursor_approval_test.go:17`).
-    #[test]
-    fn cursor_approval_anchor_fixtures() {
-        let anchor = approval_anchor_for(&RcKind::Cursor).unwrap();
-        for (fixture, want) in [
-            ("cursor-ready-approval-shell", true),
-            ("cursor-ready-approval-hook", true), // selection arrowed onto the LAST row
-            ("cursor-ready-approval-delete", true), // the one-word label set (Delete/Keep)
-            ("cursor-ready-approval-write", true), // no auto-run row; a dynamic Add Write(…)
-            ("cursor-ready-approval-fetch", true), // a dynamic Always allow <domain>
-            ("cursor-ready-approval-resolved", false),
-            ("cursor-ready-approval-quoted", false),
-            ("cursor-ready", false),
-            ("cursor-ready-active", false),
-            ("cursor-needs-auth", false),
-        ] {
-            let pane = pane_fixture(fixture);
-            assert_eq!(anchor.is_match(&pane), want, "{fixture}");
-            if want {
-                // The match starts on the widget's headline line — what the
-                // operator is being asked.
-                let line = first_anchor_line(anchor, &pane).trim();
-                assert!(
-                    line.ends_with('?') || line.starts_with("Hook requested approval:"),
-                    "{fixture}: first_anchor_line = {line:?}, want the headline line"
-                );
-            }
-        }
-    }
-
-    /// Mirrors `TestCursorApprovalAnchorCoversEveryDecisionSurface`
-    /// (`cursor_approval_test.go:60`). EXHAUSTIVENESS is a SAFETY property: a
-    /// surface whose rows do not match opens no episode, and the input gate is
-    /// then one expired-working verdict away from typing into the widget (a
-    /// posted "y" answers it). A cursor release that adds a surface fails HERE.
-    #[test]
-    fn cursor_approval_anchor_covers_every_decision_surface() {
-        let anchor = approval_anchor_for(&RcKind::Cursor).unwrap();
-        for (name, headline, option) in [
-            ("shell", "Run this command?", "   → Run (once) (y)"),
-            (
-                "shell/sandbox",
-                "Run this command outside the sandbox?",
-                "   → Run outside sandbox (once) (y)",
-            ),
-            (
-                "shell/allowlist",
-                "Run this command?",
-                "     Add Shell(npm test) to allowlist? (tab)",
-            ),
-            (
-                "shell/autorun",
-                "Run this command?",
-                "     Run Everything (shift+tab)",
-            ),
-            (
-                "shell/sandbox-autorun",
-                "Run this command?",
-                "     Run in Sandbox (shift+tab)",
-            ),
-            (
-                "shell/autorun-loading",
-                "Run this command?",
-                "     Checking Run Everything availability (loading)",
-            ),
-            ("mcp", "Run this MCP tool?", "     Allowlist MCP Tool (tab)"),
-            ("mcp/skip", "Run this MCP tool?", "     Skip (esc or n)"),
-            ("delete", "Delete this file?", "   → Delete (y)"),
-            ("delete/keep", "Delete this file?", "     Keep (n)"),
-            ("write", "Write to this file?", "   → Proceed (y)"),
-            (
-                "write/reject",
-                "Write to this file?",
-                "     Reject & propose changes (esc or n or p)",
-            ),
-            (
-                "write/allowlist",
-                "Write to this file?",
-                "     Add Write(/tmp/x.toml) to allowlist? (tab)",
-            ),
-            (
-                "write/allowlist-generic",
-                "Write to this file?",
-                "     Add to allowlist (tab)",
-            ),
-            ("search", "Allow this web search?", "   → Allow search (y)"),
-            ("fetch", "Allow this web fetch?", "   → Fetch (y)"),
-            (
-                "fetch/always",
-                "Allow this web fetch?",
-                "     Always allow example.com (tab)",
-            ),
-            ("edit", "Proceed with this edit?", "   → Proceed (y)"),
-            (
-                "hook",
-                "Hook requested approval: policy said no",
-                "   → Run (once) (y)",
-            ),
-        ] {
-            let pane = format!(" {headline}\n\n{option}\n");
-            assert!(
-                anchor.is_match(&pane),
-                "the {name} surface does not match the anchor:\n{pane}"
-            );
-        }
-    }
-
-    /// Mirrors `TestCursorApprovalAnchorNeedsBothHalves` (`cursor_approval_test.go:95`).
-    #[test]
-    fn cursor_approval_anchor_needs_both_halves() {
-        let anchor = approval_anchor_for(&RcKind::Cursor).unwrap();
-        let headline = " Run this command?";
-        let option_row = "   → Run (once) (y)";
-        assert!(
-            pane_fixture("cursor-ready-approval-resolved").contains("Run this command?"),
-            "test premise: the post-resolution fixture must still carry the headline"
-        );
-        assert!(
-            !anchor.is_match(&format!("{headline}\nsome unrelated line\n")),
-            "the headline alone must never match"
-        );
-        assert!(
-            !anchor.is_match(&format!("blah\n{option_row}\n")),
-            "an option row alone must never match"
-        );
-        // Markdown bullets are how an assistant lists the labels — never an
-        // accepted gutter.
-        assert!(
-            !anchor.is_match(" Run this command?\n - Run (once)\n"),
-            "a bulleted label must not satisfy the option-row half"
-        );
-        // The real widget: both halves, in order.
-        assert!(
-            anchor.is_match(&format!(
-                "{headline}\n Not in allowlist: ls\n\n{option_row}\n"
-            )),
-            "headline + option row must match"
-        );
-    }
-
-    /// Mirrors `TestComposerUnderModalMatchesTheFixtures` (`cursor_approval_test.go:201`):
-    /// the flag is a rendering FACT — codex's overlay replaces the composer (its
-    /// prompt anchor cannot match a dialog pane), cursor's is drawn disabled
-    /// underneath (its prompt anchor still matches).
-    #[test]
-    fn composer_under_modal_matches_the_fixtures() {
-        for (kind, fixture) in [
-            (RcKind::Codex, "codex-ready-approval-exec"),
-            (RcKind::Codex, "codex-ready-approval-network"),
-            (RcKind::Cursor, "cursor-ready-approval-shell"),
-            (RcKind::Cursor, "cursor-ready-approval-delete"),
-            (RcKind::Cursor, "cursor-ready-approval-write"),
-        ] {
-            let anchor = prompt_anchor_for(&kind)
-                .unwrap_or_else(|| panic!("{} must declare a PromptAnchor", kind.as_str()));
-            let composer_visible = anchor.is_match(&pane_fixture(fixture));
-            assert_eq!(
-                composer_visible,
-                composer_under_modal(&kind),
-                "{fixture}: composer visibility vs ComposerUnderModal"
-            );
+            assert!(!is_codex_trust_prompt(pane), "false positive: {pane:?}");
         }
     }
 
@@ -2505,161 +1614,9 @@ mod tests {
         }
     }
 
-    /// Panes captured from LIVE sessions on 2026-08-23, in the states a
-    /// long-running agent actually passes through. Every one of them
-    /// classified `starting` before these anchors were widened — and
-    /// `starting` is a BLOCKING lifecycle, so each was a session that could
-    /// not be typed at, watched, or steered while being plainly alive on
-    /// screen.
-    ///
-    /// The lesson they encode: anchor on the TUI's own CHROME (an interrupt
-    /// hint, a dialog frame), not on placeholder prose. Placeholder text is
-    /// the part vendors reword between releases, and the part that disappears
-    /// mid-session.
-    ///
-    /// codex, mid-turn. The composer line is STILL DRAWN while it works —
-    /// which is why the composer cannot be read as "waiting for input".
-    const CODEX_PANE_WORKING: &str = "\
-• Working (2s • esc to interrupt)
-
-› Ask Codex to do anything
-
-  gpt-5.6-sol default · ~/prox
-";
-
-    /// cursor, mid-turn: the composer line carries a RIGHT-ALIGNED hint, so a
-    /// bare-line anchor no longer matches it.
-    const CURSOR_PANE_WORKING: &str = "\
-  → Add a follow-up                                             ctrl+c to stop
-
-
-  Cursor Grok 4.6 High Fast · 13.6%
-  ~/prox · main
-";
-
-    /// cursor, after somebody TYPED into it: the placeholder is replaced by
-    /// their words, so nothing about the composer's CONTENT can be anchored on.
-    const CURSOR_PANE_TYPED: &str = "\
-  → queued cursor follow-up
-
-
-  Cursor Grok 4.6 High Fast · 14.2%
-  ~/prox · main
-";
-
-    /// cursor, settled after a turn.
-    const CURSOR_PANE_IDLE: &str = "\
-  → Add a follow-up
-
-
-  Cursor Grok 4.6 High Fast · 14.1%
-  ~/prox · main
-";
-
-    /// cursor, blocked on a command approval: the modal covers the composer
-    /// entirely, so the ready anchor cannot see it.
-    const CURSOR_PANE_APPROVAL: &str = "\
- $  ls -1 /home/shed/prox && echo \"---\" && git -C /home/shed/prox log -5
-
- Run this command?
- Not in allowlist: echo, git -C
-  → Run (once) (y)
-    Add Shell(echo), Shell(git -C) to allowlist? (tab)
-    Run Everything (shift+tab)
-    Skip & tell the agent what to do instead (esc or n)
-";
-
-    /// Every captured state is READY: the lifecycle question is "is this agent
-    /// up", not "is it idle" — what it is doing is the activity dimension's
-    /// job, derived separately.
-    #[test]
-    fn every_live_pane_classifies_as_up() {
-        for (name, state) in [
-            ("codex idle", classify_codex(CODEX_PANE_AFTER_A_TURN).state),
-            ("codex working", classify_codex(CODEX_PANE_WORKING).state),
-            ("cursor working", classify_cursor(CURSOR_PANE_WORKING).state),
-            ("cursor idle", classify_cursor(CURSOR_PANE_IDLE).state),
-            (
-                "cursor with typed text",
-                classify_cursor(CURSOR_PANE_TYPED).state,
-            ),
-            (
-                "cursor at an approval",
-                classify_cursor(CURSOR_PANE_APPROVAL).state,
-            ),
-        ] {
-            assert_eq!(state, RcState::Ready, "{name}");
-        }
-    }
-
-    /// The approval pane now classifies READY, so the only thing standing
-    /// between a remote keystroke and that dialog is the approval anchor.
-    #[test]
-    fn the_live_approval_pane_still_anchors() {
-        let anchor = approval_anchor_for(&RcKind::Cursor).expect("cursor declares one");
-        assert!(anchor.is_match(CURSOR_PANE_APPROVAL));
-        assert!(!anchor.is_match(CURSOR_PANE_WORKING), "working");
-        assert!(!anchor.is_match(CURSOR_PANE_IDLE), "idle");
-    }
-
-    /// The REAL pane of a codex session that had run one turn, captured from a
-    /// shed in August 2026 — the banner long since scrolled out of the capture
-    /// window, the composer showing codex's current wording.
-    const CODEX_PANE_AFTER_A_TURN: &str = "\
-  The best contributor overview is docs/development/
-  architecture.md.
-
-─ Worked for 1m 02s ────────────────────────────────
-
-
-› Ask Codex to do anything
-
-  gpt-5.6-sol default · ~/prox
-";
-
-    #[test]
-    fn a_codex_session_at_its_composer_is_ready_whatever_the_wording() {
-        // The lived failure: the anchor knew only the OLD placeholder, so once
-        // the startup banner scrolled away this pane classified `starting` —
-        // a blocking lifecycle, which made the hub refuse typed input and show
-        // no activity for a session plainly waiting for a person.
-        assert_eq!(
-            classify_codex(CODEX_PANE_AFTER_A_TURN).state,
-            RcState::Ready,
-        );
-        // The older wording keeps working: an anchor is a vendor string, and
-        // recognizing a new build must not stop recognizing an old one.
-        assert_eq!(
-            classify_codex("  › Find and fix a bug in @filename").state,
-            RcState::Ready,
-        );
-        // And the same pane is what the INPUT gate reads, so a session that is
-        // ready to be typed at must also present its prompt anchor.
-        assert!(
-            prompt_anchor_for(&RcKind::Codex)
-                .expect("codex has a prompt anchor")
-                .is_match(CODEX_PANE_AFTER_A_TURN)
-        );
-    }
-
-    // ---- prompt anchors (registry data) ----
-
-    #[test]
-    fn prompt_anchors_are_declared_for_every_registered_kind() {
-        for kind in all_kinds() {
-            assert!(prompt_anchor_for(&kind).is_some(), "{}", kind.as_str());
-        }
-        assert!(prompt_anchor_for(&RcKind::Other("future".into())).is_none());
-        assert!(prompt_anchor_for(&RcKind::Codex)
-            .unwrap()
-            .is_match("  › Find and fix a bug in @filename"));
-        assert!(prompt_anchor_for(&RcKind::Shell)
-            .unwrap()
-            .is_match("banner\n[shed:x] ~ $ \n"));
-        assert!(prompt_anchor_for(&RcKind::ClaudeRc)
-            .unwrap()
-            .is_match("? for shortcuts · <- for agents"));
-    }
+    // The live-pane suite and the prompt-anchor cells that closed this module went
+    // with S2 (charliek/shed#324): both existed to pin classifier anchors against
+    // real captures, and there are no anchors left to pin.
 
     #[test]
     fn tool_binaries_match_the_registry() {

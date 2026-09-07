@@ -8,10 +8,11 @@ heartbeats) are liveness, not wire, and are dropped before compare.
 Both cells ride an **opencode** session since A6 (charliek/shed#322): the
 frame ordering and the fan-out survivability are lane-agnostic hub contracts
 that merely happened to be driven by codex and cursor, whose lanes A6 retired.
-opencode is the only watchable kind left, so its fake is what drives them now —
-the appear/activity ordering through the same pane-stability engine as before,
-and the fan-out load through a burst of scripted feed events rather than 300
-cursor ingest POSTs.
+opencode is the only watchable kind left, so its fake is what drives them now:
+the appear/activity ordering through the fake's own `session.idle` boundary
+(C4 left it on a bare create whose activity came from pane stability — the
+mechanism S2, charliek/shed#324, deleted), and the fan-out load through a burst
+of scripted feed events rather than 300 cursor ingest POSTs.
 """
 
 import time
@@ -52,46 +53,71 @@ def _mask_frame(frame: dict, home: str, race_state: bool = False) -> dict:
 
 
 def test_sse_appear_then_activity_order(hub_differential, hub_leg):
-    """Subscribe FIRST, then create, and read until the activity settles. The
-    frame COUNT races real pane transitions (the shim's starting→ready may
-    land on the appear tick or its own later tick, emitting an extra
-    session.updated), so the cell pins the timing-INVARIANT wire properties:
+    """Subscribe FIRST, then create + drive the lane, and read until the
+    activity settles. The frame COUNT races real tick boundaries, so the cell
+    pins the timing-INVARIANT wire properties:
 
     - the very first frame is the appear `session.updated` (before any
       activity frame — the within-tick order the aggregator depends on);
-    - the activity sequence is exactly working → needs_input (a fresh session
-      always ticks working first; the quiet period then settles the anchor);
+    - the activity sequence walks the lane's own boundaries and ENDS on
+      needs_input;
     - every frame carries the session's slug.
 
-    The session is opencode (A6, charliek/shed#322 — codex has no watcher any
-    more). Deliberately a BARE create, not the full `lane_session` setup: the
-    trigger runs inside the subscription's read loop, so anything slower than a
-    create leaves frames queueing unread and a subscriber buffer can drop the
-    opening `working` tick this cell exists to observe. No fake is bound, so the
-    watcher never connects and the activity comes from the pane-stability
-    engine — the same mechanism this cell always pinned.
+    The arc is driven by the OPENCODE LANE, not by pane stability: S2
+    (charliek/shed#324) deleted the stability engine C4 left this cell riding.
+    The watcher's REST seed publishes the first verdict, a scripted
+    `session.status {busy}` drives it to `working`, and a scripted
+    `session.idle` settles it back.
+
+    EVERY PHASE IS HTTP-CONFIRMED BEFORE THE NEXT IS TRIGGERED — `lane_session`
+    returns only after the hub has published an overlay, and the busy phase is
+    polled to `working` before the idle event is streamed. Those polls run
+    against `/v1/sessions`, independent of this subscription's read loop, so
+    the frames queue in order while the setup runs. Streaming both boundaries
+    at once would fold them into ONE reconcile tick and emit the last verdict
+    alone, losing the ordering the cell exists to pin.
     """
+
+    fakes = []
 
     def scenario(impl):
         leg = hub_leg(impl)
 
-        def create():
-            res = leg.run(
-                "create", "--kind", "opencode", "--slug", SSE_SLUG, "--name", "hub-sse"
+        def create_then_drive():
+            fake = lane_session(leg, fakes, SSE_SLUG, "hub-sse")
+
+            def overlay_is(want):
+                def check():
+                    got = leg.hub_request("GET", "/v1/sessions")
+                    for entry in (got["json"] or {}).get("sessions", []):
+                        if entry.get("slug") == SSE_SLUG and entry.get("activity") == want:
+                            return entry
+                    return None
+
+                return check
+
+            fake.stream(
+                {
+                    "type": "session.status",
+                    "properties": {"sessionID": OC_SID, "status": {"type": "busy"}},
+                }
             )
-            assert res.returncode == 0, f"{leg.impl}: create: {res.stderr}"
+            leg.wait_hub("the lane never went working", overlay_is("working"), timeout=20)
+            fake.stream({"type": "session.idle", "properties": {"sessionID": OC_SID}})
 
         def settled(events):
-            return any(
-                f["event"] == "activity.changed"
-                and f["data"].get("activity") == "needs_input"
+            """working, then a LATER needs_input — the arc the drive scripts."""
+            seq = [
+                f["data"].get("activity")
                 for f in events
-            )
+                if f["event"] == "activity.changed"
+            ]
+            return "working" in seq and "needs_input" in seq[seq.index("working") :]
 
         # Subscribe (confirmed by the `: ok` opener) BEFORE the session exists
         # — the appear frames land in THIS subscription by construction.
         frames = leg.hub_events_until(
-            "activity never settled", settled, timeout=25, on_subscribed=create
+            "activity never settled", settled, timeout=40, on_subscribed=create_then_drive
         )
 
         activity_seq = [
@@ -110,7 +136,11 @@ def test_sse_appear_then_activity_order(hub_differential, hub_leg):
             "slugs": sorted({f["data"].get("slug") for f in frames}),
         }
 
-    hub_differential(scenario)
+    try:
+        hub_differential(scenario)
+    finally:
+        for fake in fakes:
+            fake.stop()
 
 
 def test_sse_stalled_reader_hub_survives(hub_differential, hub_leg):

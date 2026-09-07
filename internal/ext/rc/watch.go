@@ -44,13 +44,12 @@ import (
 const watcherFreshWindow = 30 * time.Second
 
 // watcherWorkingGrace is the DELIBERATELY LONGER quiet tolerance for a working
-// verdict: a long tool call or model turn can legitimately write nothing to the JSONL
-// for tens of seconds, and flipping to stability at 30s would flap a mid-turn session.
-// The asymmetry with watcherFreshWindow is intentional: needs_input/idle keep the 30s
-// rule (they are settled anyway), working gets 120s — and even past 120s, working only
-// yields to stability when stability itself holds a SETTLED quiet verdict (idle/
-// needs_input after its quiet period); if the pane still churns, working is kept (see
-// mergedActivity).
+// verdict: a long tool call or model turn can legitimately produce no event for tens
+// of seconds, and dropping the verdict at 30s would flap a mid-turn session. The
+// asymmetry with watcherFreshWindow is intentional: needs_input/idle keep the 30s rule
+// (they are settled anyway), working gets 120s. Past 120s the verdict simply stops
+// being fresh and the session's activity goes to *unknown* — S2 (charliek/shed#324)
+// removed the pane-stability fallback that used to catch it (see mergedActivity).
 const watcherWorkingGrace = 120 * time.Second
 
 // activityFold folds a kind's parsed line stream into a live activity verdict.
@@ -116,9 +115,11 @@ type sessionWatcher interface {
 //   - fresh: authoritative outright — settled (needs_input/idle; trusted indefinitely,
 //     the 30s/quiet rule is theirs by construction), recent (last event within
 //     watcherFreshWindow), or working within watcherWorkingGrace.
-//   - expiredWorking: a working verdict whose source has been quiet past the grace —
-//     not discarded, but demoted to conditional: the merge lets stability take over
-//     only if stability holds a settled quiet verdict (see mergedActivity).
+//   - expiredWorking: a working verdict whose source has been quiet past the grace.
+//     Since S2 (charliek/shed#324) the merge treats it exactly like any other
+//     non-fresh verdict — there is no pane-stability fallback left for it to be
+//     weighed against — so it is reported for the watchers' own bookkeeping and
+//     asserted by their tests, not consulted by mergedActivity.
 //
 // An empty/unknown verdict is never fresh. A zero lastEventAt means "nothing folded
 // yet", which is neither recent nor within the grace.
@@ -137,29 +138,25 @@ func watcherFreshness(activity Activity, settled bool, lastEventAt, now time.Tim
 	return fresh, expiredWorking
 }
 
-// mergedActivity resolves the reconcile precedence:
+// mergedActivity resolves the reconcile precedence, which S2 (charliek/shed#324)
+// reduced to two arms:
 //
-//   - a FRESH watcher verdict (and its last-message) wins outright;
-//   - an EXPIRED-WORKING verdict (working, file quiet past the grace) yields to
-//     stability only when stability holds a settled quiet verdict (idle/needs_input —
-//     the pane genuinely stopped); if the pane still churns (stability=working) or
-//     stability has no verdict, working is KEPT — a long silent turn must not flap;
-//   - otherwise the pane-stability activity drives and last-message is dropped
-//     (stability has no message signal).
+//   - a FRESH watcher verdict (and its last-message) wins;
+//   - EVERYTHING ELSE — no watcher, a closed or unhealthy transport, a stale verdict,
+//     an EXPIRED-WORKING one — yields ("", ""), i.e. NO activity, which the DTO omits.
+//
+// The expired-working arm went with the pane-stability engine it consulted (its
+// expiry clock WAS that engine's quiet period). The consequence is deliberate: an
+// opencode row whose SSE feed dies mid-turn goes to *unknown* rather than sitting at
+// `working` forever, because nothing is left that can observe the turn end.
 //
 // Returned activity is still subject to DisplayActivity (lifecycle-trumps) by the
 // caller.
-func mergedActivity(watcherActivity Activity, watcherMessage string, watcherFresh, watcherExpiredWorking bool, stability Activity) (activity Activity, message string) {
+func mergedActivity(watcherActivity Activity, watcherMessage string, watcherFresh bool) (activity Activity, message string) {
 	if watcherFresh {
 		return watcherActivity, watcherMessage
 	}
-	if watcherExpiredWorking {
-		if stability == ActivityIdle || stability == ActivityNeedsInput {
-			return stability, ""
-		}
-		return watcherActivity, watcherMessage
-	}
-	return stability, ""
+	return "", ""
 }
 
 // watchableKind reports whether a kind has a structured-signal watcher. opencode is the
@@ -213,9 +210,13 @@ func backWriteAgentSession(r Runner, tmuxName, id string) {
 // up to the active interval). It is a best-effort LATENCY optimization: the reconcile
 // tick already refreshes every watcher, so a missed notification only delays a
 // transition to the next tick. fsnotify is non-recursive, so directories are added as
-// they appear. No kind tails a file since A6 (charliek/shed#322), so the hub builds it
-// over an EMPTY root set today and the tick is the sole driver; the seam stays for the
-// next file-backed lane.
+// they appear.
+//
+// DORMANT BY DESIGN, NOT AN OVERSIGHT: no kind tails a file since A6
+// (charliek/shed#322), so the hub builds it over an EMPTY root set and the tick is the
+// sole driver — the tests are its only live exercise. It is kept for the next
+// file-backed lane and retires with the hub in S6 if none arrives first (see
+// startFSNudger).
 type fsNudger struct {
 	w     *fsnotify.Watcher
 	nudge chan struct{}

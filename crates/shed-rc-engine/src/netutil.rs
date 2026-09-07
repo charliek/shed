@@ -15,7 +15,8 @@ use std::net::TcpListener;
 /// (opencode is exec'd by the `tmux new-session` call create issues right after
 /// allocating) and the failure mode is benign and visible, not silent: a lost race
 /// makes opencode's embedded HTTP server fail to bind, so opencode exits, which
-/// surfaces as a dead RC session (the `exited_to_shell` classifier catches it) —
+/// surfaces as a dead RC session (the tmux session ends, so it drops out of
+/// `list` and `probe` reports it gone) —
 /// not a hang, and not a watcher silently attached to the wrong port.
 ///
 /// A failure is **non-fatal** to create (Go: `ops.go:175-180` leaves the port at

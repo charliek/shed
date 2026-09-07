@@ -721,10 +721,11 @@ func TestOpencodeWatcherStaleFallsToStability(t *testing.T) {
 	if fresh || expWorking {
 		t.Fatalf("heartbeat-stale snapshot = fresh:%v expiredWorking:%v, want both false", fresh, expWorking)
 	}
-	// mergedActivity must let stability drive (both flags false → stability branch).
-	merged, _ := mergedActivity(act, "", fresh, expWorking, ActivityIdle)
-	if merged != ActivityIdle {
-		t.Fatalf("mergedActivity = %q, want idle (stability drives a stale watcher)", merged)
+	// mergedActivity drops an untrusted verdict entirely — S2 (charliek/shed#324)
+	// removed the pane-stability fallback that used to take over here.
+	merged, msg := mergedActivity(act, "preview", fresh)
+	if merged != "" || msg != "" {
+		t.Fatalf("mergedActivity = (%q,%q), want no activity for a stale watcher", merged, msg)
 	}
 }
 
@@ -1391,8 +1392,8 @@ func TestOpencodeWatcherNeedsApprovalDemotedOnDeadStream(t *testing.T) {
 	if fresh || expWorking {
 		t.Fatalf("heartbeat-stale needs_approval = fresh:%v expiredWorking:%v, want both false", fresh, expWorking)
 	}
-	if merged, _ := mergedActivity(act, "", fresh, expWorking, ActivityIdle); merged != ActivityIdle {
-		t.Fatalf("mergedActivity = %q, want idle (stability drives a dead stream)", merged)
+	if merged, _ := mergedActivity(act, "", fresh); merged != "" {
+		t.Fatalf("mergedActivity = %q, want no activity for a dead stream", merged)
 	}
 }
 

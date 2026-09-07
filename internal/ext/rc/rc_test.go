@@ -216,38 +216,29 @@ func TestIsBypassAcceptPrompt(t *testing.T) {
 	}
 }
 
-func TestClassifyPane(t *testing.T) {
-	cases := []struct {
-		name      string
-		kind      Kind
-		pane      string
-		wantState State
-		wantURL   string
-	}{
-		{"broker ready+url", KindClaudeBroker,
-			"·✔︎· Connected · my-shed\nhttps://claude.ai/code?environment=env_01ABC", StateReady,
-			"https://claude.ai/code?environment=env_01ABC"},
-		{"broker reconnecting", KindClaudeBroker, "·|· Reconnecting · retrying", StateReconnecting, ""},
-		{"broker needs-trust", KindClaudeBroker, "Error: Workspace not trusted. run claude", StateNeedsTrust, ""},
-		{"broker needs-auth", KindClaudeBroker, "Remote Control requires a claude.ai subscription.", StateNeedsAuth, ""},
-		{"broker starting", KindClaudeBroker, "booting...", StateStarting, ""},
-		{"rc ready", KindClaudeRC,
-			"/remote-control is active · https://claude.ai/code/session_01RC\nRemote Control active", StateReady,
-			"https://claude.ai/code/session_01RC"},
-		{"rc connecting", KindClaudeRC, "❯ /remote-control\n  ⎿  Remote Control connecting…", StateStarting, ""},
-		{"rc needs-trust quick-check", KindClaudeRC, "Quick safety check: is this a project", StateNeedsTrust, ""},
-		{"rc starting", KindClaudeRC, `❯ Try "fix typecheck errors"`, StateStarting, ""},
-		{"rc ignores broker url", KindClaudeRC, "banner https://claude.ai/code?environment=env_01ABC", StateStarting, ""},
-		{"shell ready", KindShell, "charliek@shed:~$ ", StateReady, ""},
-		{"shell starting", KindShell, "   \n  ", StateStarting, ""},
+// S2 (charliek/shed#324) removed the pane-classifier suite with the classifier
+// itself: a shed row's `state` is liveness, so nothing is derived from a pane but the
+// claude.ai control URL (TestExtractURL) and the one-time control dialogs
+// (TestIsTrustPrompt / TestIsBypassAcceptPrompt / TestIsCodexTrustPrompt).
+
+func TestIsCodexTrustPrompt(t *testing.T) {
+	for _, pane := range []string{
+		"Do you trust the contents of this directory?",
+		"  do you TRUST the contents of this directory?  ",
+		"codex\n\n  Do you trust the contents of this directory?\n  1. Yes, continue",
+	} {
+		if !IsCodexTrustPrompt(pane) {
+			t.Errorf("missed codex trust dialog in %q", pane)
+		}
 	}
-	for _, c := range cases {
-		t.Run(c.name, func(t *testing.T) {
-			state, url := ClassifyPane(c.kind, c.pane)
-			if state != c.wantState || url != c.wantURL {
-				t.Errorf("ClassifyPane = (%s,%q), want (%s,%q)", state, url, c.wantState, c.wantURL)
-			}
-		})
+	for _, pane := range []string{
+		"",
+		"Yes, I trust this folder",              // claude's dialog, not codex's
+		"Do you trust the contents of this dir", // truncated, no question mark
+	} {
+		if IsCodexTrustPrompt(pane) {
+			t.Errorf("false positive on %q", pane)
+		}
 	}
 }
 
@@ -826,9 +817,21 @@ func TestPromptGuards(t *testing.T) {
 		t.Fatalf("want ErrBadArgs on broker, got %v", err)
 	}
 
-	// Not ready → bad args.
-	if err := Prompt(mk(ready, "starting up"), PromptOptions{Slug: "abc", Text: "x"}); !errors.Is(err, ErrBadArgs) {
-		t.Fatalf("want ErrBadArgs on not-ready, got %v", err)
+	// A pane with nothing on it but boot chatter is DELIVERED to now: `state` is
+	// liveness (S2, charliek/shed#324), so the verb's gate is control, not status.
+	if err := Prompt(mk(ready, "starting up"), PromptOptions{Slug: "abc", Text: "x"}); err != nil {
+		t.Fatalf("a live session with no dialog on screen must accept a prompt: %v", err)
+	}
+
+	// The CONTROL gate: each kept matcher refuses, with the ErrBadArgs exit class.
+	for _, c := range []struct{ name, pane string }{
+		{"claude trust dialog", "Do you trust the files in this folder?\nYes, I trust this folder"},
+		{"codex trust dialog", "Do you trust the contents of this directory?\n1. Yes, continue"},
+		{"claude bypass dialog", "Bypass Permissions mode\n2. Yes, I accept"},
+	} {
+		if err := Prompt(mk(ready, c.pane), PromptOptions{Slug: "abc", Text: "x"}); !errors.Is(err, ErrBadArgs) {
+			t.Fatalf("%s: want ErrBadArgs, got %v", c.name, err)
+		}
 	}
 
 	// Control chars → bad args (no tmux touched).

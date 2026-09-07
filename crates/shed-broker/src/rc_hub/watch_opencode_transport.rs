@@ -3104,7 +3104,9 @@ mod tests {
         let neighbour = session_start.timestamp_millis() - 7 * 60 * 1000;
         let mine = session_start.timestamp_millis() + 30 * 1000;
         let entry = |id: &str, at: i64| {
-            format!(r#"{{"id":"{id}","directory":"{DIR}","parentID":"","time":{{"created":{at}}}}}"#)
+            format!(
+                r#"{{"id":"{id}","directory":"{DIR}","parentID":"","time":{{"created":{at}}}}}"#
+            )
         };
 
         // (a) a conversation older than the session is not adopted.
@@ -3187,12 +3189,16 @@ mod tests {
             "a conversation another session owns is never adopted, however new"
         );
         // The same on the SSE path.
-        assert_eq!(w.root_pin_from_created(&{
-            let e = entry(OTHER_SID, later);
-            peek_envelope(
-                format!(r#"{{"type":"session.updated","properties":{{"info":{e}}}}}"#).as_bytes(),
-            )
-        }), None);
+        assert_eq!(
+            w.root_pin_from_created(&{
+                let e = entry(OTHER_SID, later);
+                peek_envelope(
+                    format!(r#"{{"type":"session.updated","properties":{{"info":{e}}}}}"#)
+                        .as_bytes(),
+                )
+            }),
+            None
+        );
         w.close();
 
         // (e) the REST path is not the only way in: session.updated fires for
@@ -3201,8 +3207,11 @@ mod tests {
         let w = OpencodeWatcher::new(f.port(), DIR, "", session_start, clk.now_fn(), None);
         let frame = |id: &str, at: i64| {
             peek_envelope(
-                format!(r#"{{"type":"session.updated","properties":{{"info":{}}}}}"#, entry(id, at))
-                    .as_bytes(),
+                format!(
+                    r#"{{"type":"session.updated","properties":{{"info":{}}}}}"#,
+                    entry(id, at)
+                )
+                .as_bytes(),
             )
         };
         assert_eq!(w.root_pin_from_created(&frame(OTHER_SID, neighbour)), None);
@@ -3405,8 +3414,14 @@ mod tests {
         let (act, _, fresh, exp) = w.snapshot(clk.now());
         assert_eq!(act, RcActivity::Working, "verdict retained, just untrusted");
         assert!(!fresh && !exp, "heartbeat-stale: both flags false");
-        let (merged, _) = merged_activity(act, "", fresh, exp, RcActivity::Idle);
-        assert_eq!(merged, RcActivity::Idle, "stability drives a stale watcher");
+        // S2 (`charliek/shed#324`): an untrusted verdict is dropped entirely —
+        // there is no pane-stability fallback left to take over.
+        let merged = merged_activity(act, "preview", fresh);
+        assert_eq!(
+            merged,
+            (None, String::new()),
+            "a stale watcher contributes no activity"
+        );
         w.close();
     }
 
@@ -3442,7 +3457,14 @@ mod tests {
         drop(listener);
 
         let clk = TestClock::new();
-        let w = OpencodeWatcher::new(port, DIR, SID, DateTime::<Utc>::UNIX_EPOCH, clk.now_fn(), None);
+        let w = OpencodeWatcher::new(
+            port,
+            DIR,
+            SID,
+            DateTime::<Utc>::UNIX_EPOCH,
+            clk.now_fn(),
+            None,
+        );
         for _ in 0..20 {
             w.refresh(clk.now());
             let (_, _, fresh, exp) = w.snapshot(clk.now());
@@ -3639,8 +3661,8 @@ mod tests {
             "verdict retained, just untrusted"
         );
         assert!(!fresh && !exp, "heartbeat-stale: both flags false");
-        let (merged, _) = merged_activity(act, "", fresh, exp, RcActivity::Idle);
-        assert_eq!(merged, RcActivity::Idle, "stability drives a dead stream");
+        let (merged, _) = merged_activity(act, "", fresh);
+        assert_eq!(merged, None, "a dead stream contributes no activity");
         w.close();
     }
 

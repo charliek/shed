@@ -243,7 +243,6 @@ func newTestHub(f Runner, clk *hubClock) *Hub {
 		Getenv:       func(string) string { return "" },
 		Now:          clk.now,
 		Logf:         func(string, ...any) {},
-		QuietPeriod:  4 * time.Second,
 		Heartbeat:    20 * time.Millisecond,
 		WriteTimeout: time.Second,
 	})
@@ -291,12 +290,16 @@ func countEvents(evs []drainedEvent, name string) int {
 
 // ---- reconcile-loop transitions ----
 
-func TestHubReconcileSessionAppearAndActivity(t *testing.T) {
+// A session that appears is announced with session.updated. It carries NO activity:
+// since S2 (charliek/shed#324) the only activity source is a correlated watcher, and
+// a codex row has none — the pane-stability engine that used to manufacture a
+// working→idle/needs_input verdict for every kind is gone (the quiet-anchor and
+// quiet-no-anchor cells went with it).
+func TestHubReconcileSessionAppearCarriesNoActivity(t *testing.T) {
 	f := newHubTmux()
 	clk := &hubClock{t: time.Unix(1_700_000_000, 0).UTC()}
 	h := newTestHub(f, clk)
 
-	// A codex session appears, its composer churning (working).
 	f.set("rc-aaa111", "boot >_ OpenAI Codex (v1.0)\nline", managedEnv("id-1", KindCodex))
 	sub := h.subscribe() // attach so we can observe broadcast frames
 
@@ -305,54 +308,11 @@ func TestHubReconcileSessionAppearAndActivity(t *testing.T) {
 	if countEvents(evs, "session.updated") == 0 {
 		t.Fatalf("expected session.updated on appear, got %+v", evs)
 	}
-	if countEvents(evs, "activity.changed") == 0 {
-		t.Fatalf("expected activity.changed (working) on first tick, got %+v", evs)
+	if n := countEvents(evs, "activity.changed"); n != 0 {
+		t.Fatalf("a watcherless session must announce no activity (got %d): %+v", n, evs)
 	}
-	// First activity is working.
-	if got := hubActivityOf(t, h, "aaa111"); got != ActivityWorking {
-		t.Fatalf("activity = %q, want working", got)
-	}
-}
-
-func TestHubReconcileQuietAnchorNeedsInput(t *testing.T) {
-	f := newHubTmux()
-	clk := &hubClock{t: time.Unix(1_700_000_000, 0).UTC()}
-	h := newTestHub(f, clk)
-
-	// codex parked at its composer placeholder (the prompt anchor) — a stable pane.
-	pane := "> " + codexComposerPlaceholder + "\nother"
-	f.set("rc-bbb222", pane, managedEnv("id-2", KindCodex))
-
-	h.reconcile() // first tick: working (fresh session "just changed")
-	if got := hubActivityOf(t, h, "bbb222"); got != ActivityWorking {
-		t.Fatalf("tick1 activity = %q, want working", got)
-	}
-
-	// Pane unchanged; advance past the quiet period → needs_input (anchor matches).
-	clk.advance(5 * time.Second)
-	sub := h.subscribe()
-	h.reconcile()
-	if got := hubActivityOf(t, h, "bbb222"); got != ActivityNeedsInput {
-		t.Fatalf("tick2 activity = %q, want needs_input", got)
-	}
-	evs := drainEvents(sub)
-	if countEvents(evs, "activity.changed") == 0 {
-		t.Fatalf("expected activity.changed on working→needs_input, got %+v", evs)
-	}
-}
-
-func TestHubReconcileQuietNoAnchorIdle(t *testing.T) {
-	f := newHubTmux()
-	clk := &hubClock{t: time.Unix(1_700_000_000, 0).UTC()}
-	h := newTestHub(f, clk)
-
-	// A shell session with a non-prompt line (no anchor match) that holds still.
-	f.set("rc-ccc333", "some output line", managedEnv("id-3", KindShell))
-	h.reconcile() // working
-	clk.advance(5 * time.Second)
-	h.reconcile() // quiet, no anchor → idle
-	if got := hubActivityOf(t, h, "ccc333"); got != ActivityIdle {
-		t.Fatalf("activity = %q, want idle", got)
+	if got := hubActivityOf(t, h, "aaa111"); got != "" {
+		t.Fatalf("activity = %q, want none", got)
 	}
 }
 
@@ -447,23 +407,10 @@ func TestHubReconcileSkipsOnTransientListFailure(t *testing.T) {
 	}
 }
 
-func TestHubReconcileStateChangeEmitsSessionUpdated(t *testing.T) {
-	f := newHubTmux()
-	clk := &hubClock{t: time.Unix(1_700_000_000, 0).UTC()}
-	h := newTestHub(f, clk)
-
-	// Starts "starting" (blank-ish codex boot), then reaches ready.
-	f.set("rc-eee555", "booting", managedEnv("id-5", KindCodex))
-	h.reconcile()
-	sub := h.subscribe()
-
-	f.setPane("rc-eee555", "boot >_ OpenAI Codex (v1.0)")
-	h.reconcile()
-	evs := drainEvents(sub)
-	if countEvents(evs, "session.updated") == 0 {
-		t.Fatalf("expected session.updated on lifecycle state change, got %+v", evs)
-	}
-}
+// S2 (charliek/shed#324) removed TestHubReconcileStateChangeEmitsSessionUpdated: a
+// shed row's `state` is liveness, so no pane edit can move a live session between
+// lifecycle states any more. session.updated on appear/recreate/disappear is covered
+// by the cells above and below.
 
 // hubActivityOf reads the tracked (displayed) activity for a slug.
 func hubActivityOf(t *testing.T, h *Hub, slug string) Activity {
@@ -477,43 +424,11 @@ func hubActivityOf(t *testing.T, h *Hub, slug string) Activity {
 	return tr.activity
 }
 
-// Contract: activity.changed carries only valid non-empty activity values. A
-// transition INTO suppression (ready → needs-auth) must emit session.updated (the
-// state change) and NO activity.changed — never one with activity:"" (a strict
-// decoder would reject it).
-func TestHubNoActivityChangedOnSuppression(t *testing.T) {
-	f := newHubTmux()
-	clk := &hubClock{t: time.Unix(1_700_000_000, 0).UTC()}
-	h := newTestHub(f, clk)
-
-	// Ready codex session → first tick reports working.
-	f.set("rc-sup111", "boot >_ OpenAI Codex (v1.0)", managedEnv("id-sup", KindCodex))
-	h.reconcile()
-	if got := hubActivityOf(t, h, "sup111"); got != ActivityWorking {
-		t.Fatalf("precondition: activity = %q, want working", got)
-	}
-
-	// The session drops to needs-auth (blocking lifecycle) → activity suppressed.
-	sub := h.subscribe()
-	f.setPane("rc-sup111", "Sign in with ChatGPT")
-	h.reconcile()
-
-	if got := hubActivityOf(t, h, "sup111"); got != "" {
-		t.Fatalf("activity = %q, want suppressed", got)
-	}
-	evs := drainEvents(sub)
-	if countEvents(evs, "session.updated") == 0 {
-		t.Fatalf("expected session.updated for the ready→needs-auth transition, got %+v", evs)
-	}
-	if n := countEvents(evs, "activity.changed"); n != 0 {
-		t.Fatalf("suppression must not emit activity.changed (got %d): %+v", n, evs)
-	}
-	for _, e := range evs {
-		if strings.Contains(e.raw, `"activity":""`) {
-			t.Fatalf("an event carried the empty activity value: %+v", e)
-		}
-	}
-}
+// S2 (charliek/shed#324) removed TestHubNoActivityChangedOnSuppression and
+// TestHubReconcileLifecycleTrumpsActivity: both drove a live session into a BLOCKING
+// lifecycle state by editing its pane, which liveness no longer allows. The
+// lifecycle-trumps-activity precedence itself survives untouched in DisplayActivity
+// and is pinned by activity_test.go.
 
 // Recreate detection must not depend on SHED_RC_ID alone: a legacy/partial session
 // with no id but a created_at is re-pinned by created_at — a change means the slug
@@ -583,22 +498,6 @@ func TestHubReconcileKindChangeIsARecreate(t *testing.T) {
 	h.trackMu.Unlock()
 	if tr == nil || tr.kind != KindCodex {
 		t.Fatalf("tracker kept the stale kind: %+v", tr)
-	}
-}
-
-// ---- lifecycle-trumps-activity precedence ----
-
-func TestHubReconcileLifecycleTrumpsActivity(t *testing.T) {
-	f := newHubTmux()
-	clk := &hubClock{t: time.Unix(1_700_000_000, 0).UTC()}
-	h := newTestHub(f, clk)
-
-	// A codex session that is not-signed-in → needs-auth lifecycle; activity must be
-	// suppressed ("") even though the pane churns.
-	f.set("rc-fff666", "Sign in with ChatGPT", managedEnv("id-6", KindCodex))
-	h.reconcile()
-	if got := hubActivityOf(t, h, "fff666"); got != "" {
-		t.Fatalf("needs-auth session activity = %q, want suppressed", got)
 	}
 }
 
@@ -710,7 +609,7 @@ func TestHubHTTPSessions(t *testing.T) {
 	f := newHubTmux()
 	clk := &hubClock{t: time.Unix(1_700_000_000, 0).UTC()}
 	h := newTestHub(f, clk)
-	f.set("rc-hhh888", "> "+codexComposerPlaceholder, managedEnv("id-8", KindCodex))
+	f.set("rc-hhh888", "> Ask Codex to do anything", managedEnv("id-8", KindCodex))
 	h.reconcile()
 
 	srv := httptest.NewServer(h.handler())
@@ -731,8 +630,11 @@ func TestHubHTTPSessions(t *testing.T) {
 	if len(body.Sessions) != 1 || body.Sessions[0].Slug != "hhh888" {
 		t.Fatalf("unexpected sessions: %+v", body.Sessions)
 	}
-	if body.Sessions[0].Activity != ActivityWorking {
-		t.Fatalf("session activity = %q, want working overlaid", body.Sessions[0].Activity)
+	// No watcher ⇒ no activity dimension, and the DTO OMITS it (S2,
+	// charliek/shed#324 — the pane-stability fallback that used to overlay `working`
+	// on every row is gone).
+	if body.Sessions[0].Activity != "" {
+		t.Fatalf("session activity = %q, want none for a watcherless row", body.Sessions[0].Activity)
 	}
 }
 

@@ -1,7 +1,7 @@
 """Resolve a dev-server API endpoint for the rc integration tests, honoring
 both an OPEN-mode and a SECURE-mode `~/.shed/config.yaml` entry.
 
-The rc hub tests (`test_rc_enrichment.py`, `test_rc_hub_activity.py`) drive the
+The rc hub tests (`test_rc_enrichment.py`) drive the
 parallel dev server's HTTP surfaces directly, resolving host+port from the
 client config the same way the CLI reaches the server. Historically their
 endpoint helpers assumed the dev entry was OPEN mode — plain HTTP on

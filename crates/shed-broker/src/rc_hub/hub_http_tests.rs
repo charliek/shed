@@ -64,7 +64,7 @@ async fn http_sessions() {
     let h = Arc::new(new_test_hub(&f, &clk));
     f.set(
         "rc-hhh888",
-        "> Find and fix a bug in @filename",
+        "> Ask Codex to do anything",
         &managed_env("id-8", &RcKind::Codex),
     );
     h.reconcile();
@@ -79,10 +79,12 @@ async fn http_sessions() {
     let body: HubSessionsResponse = resp.json().await.unwrap();
     assert_eq!(body.sessions.len(), 1);
     assert_eq!(body.sessions[0].slug, "hhh888");
+    // No watcher ⇒ no activity dimension, and the DTO OMITS it (S2,
+    // `charliek/shed#324` — the pane-stability fallback that used to overlay
+    // `working` on every row is gone).
     assert_eq!(
-        body.sessions[0].activity,
-        Some(RcActivity::Working),
-        "want working overlaid"
+        body.sessions[0].activity, None,
+        "a watcherless row carries no activity"
     );
 }
 

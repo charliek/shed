@@ -62,7 +62,6 @@ fn build_hub_config(
         version: version.to_string(),
         active_interval: Duration::ZERO,
         idle_interval: Duration::ZERO,
-        quiet_period: Duration::ZERO,
         // "Never" for the supervised resident role (§2.4): the Go seam cannot
         // express it, so the effectively-infinite value is the daemon-role
         // default — an env override (the harness pins a large finite value on

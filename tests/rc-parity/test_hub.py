@@ -13,7 +13,10 @@ Two kinds carry this family, for two different reasons:
 
 * **codex** is the CAPABILITY workhorse: it advertises none of the contract-v2
   verbs, and since A6 (charliek/shed#322) no `feed`/`input` either — so its
-  matrix cells pin the kind-based 409s, `input` now among them.
+  matrix cells pin the kind-based 409s, `input` now among them. Their
+  tracked-ness precondition is the `/messages` 404→200 flip (see
+  `_tracked_codex`), the one observable that survives S2's removal of the
+  activity fallback (charliek/shed#324).
 * **opencode** is the only WATCHABLE kind left (A6 retired the codex rollout
   tail and the cursor hook-ingest lane), so the `/messages` cells — which are
   lane-agnostic hub contracts that merely happened to ride a codex session —
@@ -56,12 +59,27 @@ def _status_body(got: dict) -> dict:
 
 
 def _tracked_codex(leg):
-    """Create the pinned codex session and wait until the hub tracks it."""
+    """Create the pinned codex session and wait until the hub tracks it.
+
+    Tracked-ness is proved by the MESSAGES 404→200 FLIP, not by the activity
+    overlay `wait_tracked` uses. Merely appearing in `GET /v1/sessions` is not
+    tracked-ness (that endpoint lists from tmux one-shot, while the verbs read
+    the reconcile-built tracked map — a verb fired in the gap earns 404
+    `unknown_slug` instead of its kind-based 409), and codex's overlay used to
+    come from the pane-stability engine S2 (charliek/shed#324) deleted. The
+    reconcile loop tracks EVERY enumerated session, watcher or not, and
+    `handleMessages` answers a tracked feedless kind with 200 and an empty page
+    — so the flip off 404 IS the tracked-map insertion."""
     res = leg.run(
         "create", "--kind", "codex", "--slug", CODEX_SLUG, "--name", "hub-codex"
     )
     assert res.returncode == 0, f"{leg.impl}: exit {res.returncode}: {res.stderr}"
-    return leg.wait_tracked(CODEX_SLUG)
+
+    def tracked():
+        got = leg.hub_request("GET", f"/v1/sessions/{CODEX_SLUG}/messages")
+        return got if got["status"] == 200 else None
+
+    return leg.wait_hub(f"hub never tracked slug {CODEX_SLUG}", tracked)
 
 
 def _matrix_slug(leg, needs_session: bool) -> str:
@@ -95,36 +113,11 @@ def test_sessions_empty(hub_differential, hub_leg):
     hub_differential(scenario)
 
 
-def test_sessions_overlay_codex_settled(hub_differential, hub_leg):
-    """A tracked codex session's list entry once its activity has SETTLED.
-
-    The static shim pane never changes, so under the fast ticks the stability
-    engine settles within ~1s: `working` on first capture, then the quiet
-    period expires and the verdict lands on the kind's anchor answer. The cell
-    polls for a settled value and pins WHICH one the Go hub derives — that
-    choice (needs_input vs idle for this pane) is part of the frozen wire."""
-
-    def scenario(impl):
-        leg = hub_leg(impl)
-        _tracked_codex(leg)
-
-        def settled():
-            got = leg.hub_request("GET", "/v1/sessions")
-            for entry in (got["json"] or {}).get("sessions", []):
-                if entry.get("slug") == CODEX_SLUG and entry.get("activity") in (
-                    "idle",
-                    "needs_input",
-                ):
-                    return got
-            return None
-
-        got = leg.wait_hub("codex activity never settled", settled)
-        return {
-            "status": got["status"],
-            "body": mask_hub_sessions(got["json"], str(leg.home)),
-        }
-
-    hub_differential(scenario)
+# `test_sessions_overlay_codex_settled` pinned the pane-stability engine's SETTLE
+# — a codex row whose static shim pane went quiet past the hub's quiet period and
+# landed on the kind's anchor answer. Both the engine and the anchor were deleted
+# in S2 (charliek/shed#324): a shed row's activity now comes from a lane watcher
+# or not at all, and codex has none. Removed with its golden.
 
 
 def test_messages_empty_ring(hub_differential, hub_leg):

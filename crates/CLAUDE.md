@@ -9,8 +9,10 @@ re-implemented per language. The root `CLAUDE.md` owns the monorepo layout + rel
 
 - **`shed-core`** — a *pure* Rust lib (no UI, no UniFFI): the reqwest(rustls) HTTP client, the
   SSE parser, defensive wire decoders, leaf-cert TLS pinning, the control-token FSM, a `config`
-  parser, the pull-based `create` orchestration store, and `rc.rs` (the pure Remote-Control
-  classifier + argv builders). The Linux clients link it directly.
+  parser, the pull-based `create` orchestration store, and `rc.rs` (the Remote-Control
+  wire types + argv builders; its pure pane classifier went with S2, charliek/shed#324 —
+  a shed row's `state` is liveness off the wire, a machine row's status comes from
+  roost). The Linux clients link it directly.
 - **`shed-app`** — the UI-free app-logic layer (`Backend`) the clients share; holds the
   `RcRunner` portability seam (`rc.rs`) behind the non-default `rc` feature — which also
   pulls in and re-exports `shed-rc-engine` as `shed_app::rc_engine` — and the embedded

@@ -1,5 +1,5 @@
-"""B2: the RC classifier + launch/list/kill/inject drive the Agents pane, in test
-mode against an in-memory session store.
+"""B2: RC launch/list/kill/inject drive the Agents pane, in test mode against an
+in-memory session store.
 
 The behavioral tests run cross-target (mac + tauri, `needs_agents`) on the shared
 `client` fixture. The mac-only tail (the launch *sheet* — the Tauri pane uses an
@@ -20,24 +20,10 @@ from _marks import mac_only, needs_agents
 pytestmark = needs_agents
 
 
-# ---- classifier (the pure rc.classify utility) ---------------------------
-
-def test_classify_agent_ready(client):
-    pane = "·✔︎· Connected\nContinue at https://claude.ai/code?environment=env_01ABC"
-    r = client.rc_classify("claude-broker", pane)
-    assert r["state"] == "ready"
-    assert r["url"] == "https://claude.ai/code?environment=env_01ABC"
-
-
-def test_classify_repl_needs_trust(client):
-    r = client.rc_classify("claude-rc", "Quick safety check: Is this a project you trust?")
-    assert r["state"] == "needs-trust"
-
-
-def test_classify_agent_reconnecting(client):
-    r = client.rc_classify("claude-broker", "·|· Reconnecting · retrying in 2.5s")
-    assert r["state"] == "reconnecting"
-    assert "url" not in r
+# The three pane-classifier cells that opened this module went with the op itself
+# in S2 (charliek/shed#324): a shed row's `state` comes off the wire from the guest
+# (where it is liveness now) and a machine row's from roost — no client re-derives
+# one from a pane.
 
 
 # ---- launch / list / kill ------------------------------------------------

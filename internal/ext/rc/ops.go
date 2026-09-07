@@ -25,8 +25,27 @@ var (
 const (
 	defaultWaitTimeout = 20 * time.Second
 	defaultPollEvery   = 750 * time.Millisecond
-	// promptDeliverSettle lets a just-ready REPL finish wiring up its input before
-	// the kickoff line is typed (driven through the injected sleep, so tests skip it).
+	// kickoffSettle is how long a LIVE session must have been settling before a
+	// kickoff line is typed into it. It exists because liveness (S2,
+	// charliek/shed#324) says nothing about whether the agent's TUI has finished
+	// drawing its composer — the pane classifier used to be that (bad) proxy.
+	//
+	// The origin the window is measured from is max(first successful capture, last
+	// SUCCESSFUL control keystroke): a trust/bypass dialog accepted at 4.9 s must not
+	// get the kickoff typed into its repaint, and a send-keys that FAILED did not
+	// change the screen, so it must not push the origin out either. Bounded by
+	// defaultWaitTimeout — a session whose settle would cross the deadline is
+	// delivered at the deadline rather than not at all.
+	//
+	// Paid only when there IS a kickoff: a --wait with nothing to deliver has nothing
+	// to settle for and returns on the first successful capture. A fixed delay is not
+	// a heuristic about screen content; it is the honest interim until the roost
+	// provider script owns kickoff (S4).
+	kickoffSettle = 5 * time.Second
+	// promptDeliverSettle lets a just-live REPL finish wiring up its input before the
+	// kickoff line is typed (driven through the injected sleep, so tests skip it). It
+	// inspects nothing — it is a plain sleep on top of kickoffSettle, so a kickoff
+	// lands at least 6 s after liveness.
 	promptDeliverSettle = 1 * time.Second
 )
 
@@ -228,7 +247,7 @@ func Create(r Runner, env Getenv, opts CreateOptions, sleep func(time.Duration))
 	}
 
 	// Plan delivery: write the plan to its per-kind HOME-rooted file (0600) and
-	// compose the kickoff that waitUntilReady types once the session is ready. This
+	// compose the kickoff that waitUntilLive types once the session is live. This
 	// happens AFTER the tmux create so a duplicate --slug never clobbers the live
 	// session's plan file (delivery only occurs below, so the ordering is safe). A
 	// write failure is fatal (unlike the best-effort preseed) — the whole point of a
@@ -274,7 +293,7 @@ func Create(r Runner, env Getenv, opts CreateOptions, sleep func(time.Duration))
 		// "bypassPermissions" (claude-historical), since both map to the same flag.
 		flags, _ := permFlagsFor(opts.Kind, opts.PermissionMode)
 		bypass := slices.Contains(flags, PermissionModeBypass)
-		state, url, derr := waitUntilReady(r, name, opts.Kind, opts.Prompt, bypass, sleep)
+		state, url, derr := waitUntilLive(r, name, opts.Kind, opts.Prompt, bypass, sleep, nil)
 		session.State, session.URL = state, url
 		if derr != nil {
 			// The session reached ready but the kickoff could not be delivered. A
@@ -287,19 +306,91 @@ func Create(r Runner, env Getenv, opts CreateOptions, sleep func(time.Duration))
 	return session, nil
 }
 
-// waitUntilReady polls the pane until a terminal state (or timeout), auto-accepting
-// the trust prompt once, then delivers prompt if the session reached ready. The
-// returned error is non-nil only for a kickoff-delivery failure after ready — a
-// classified non-ready state is a result, not an error.
-func waitUntilReady(r Runner, name string, kind Kind, prompt string, bypass bool, sleep func(time.Duration)) (State, string, error) {
+// hasControlDialog reports whether the pane is showing ANY of the one-time control
+// dialogs the kept matchers know: claude's workspace-trust prompt, codex's
+// directory-trust prompt, or claude's bypass acceptance.
+//
+// NOT kind-gated, unlike isTrustDialog: this is the DELIVERY REFUSAL's question, and
+// refusing is the safe direction — a look-alike phrase costs a caller one retry,
+// whereas typing a kickoff into a modal answers it by accident.
+func hasControlDialog(pane string) bool {
+	return IsTrustPrompt(pane) || IsCodexTrustPrompt(pane) || IsBypassAcceptPrompt(pane)
+}
+
+// errControlDialogUp is the refusal BOTH delivery paths make — the one-shot `prompt`
+// verb and the `--wait` kickoff — spelled once so the two cannot diverge in message
+// or exit class (ErrBadArgs → exit 2).
+func errControlDialogUp() error {
+	return fmt.Errorf("%w: session is showing a one-time trust/bypass dialog; accept it first", ErrBadArgs)
+}
+
+// pollDelay is defaultPollEvery CLAMPED to what is left before the deadline, so the
+// wait loop leaves AT the deadline instead of up to a full poll past it (and then
+// adding promptDeliverSettle on top of the overshoot).
+func pollDelay(now func() time.Time, deadline time.Time) time.Duration {
+	left := deadline.Sub(now())
+	switch {
+	case left <= 0:
+		return 0
+	case left < defaultPollEvery:
+		return left
+	default:
+		return defaultPollEvery
+	}
+}
+
+// isTrustDialog reports whether the pane is showing this kind's one-time
+// directory/workspace-trust dialog — claude's (IsTrustPrompt) or codex's
+// (IsCodexTrustPrompt). Both are CONTROL matchers, the last pane-reading left in the
+// wait path after S2 (charliek/shed#324) deleted the classifiers, and both dialogs
+// pre-select "yes", so a single Enter accepts either.
+//
+// KIND-GATED, deliberately: this decides whether to SEND A KEYSTROKE, and a
+// look-alike phrase in a cursor/opencode transcript must never draw one. cursor
+// launches with --trust and has no dialog at all.
+func isTrustDialog(kind Kind, pane string) bool {
+	switch {
+	case IsClaudeKind(kind):
+		return IsTrustPrompt(pane)
+	case kind == KindCodex:
+		return IsCodexTrustPrompt(pane)
+	default:
+		return false
+	}
+}
+
+// waitUntilLive polls the pane until the session is LIVE (a capture succeeds) or the
+// deadline passes, accepting the one-time control dialogs on the way, then delivers
+// prompt. The returned error is non-nil only for a kickoff-delivery failure — a
+// session that never came up is a result, not an error.
+//
+// Since S2 (charliek/shed#324) there is no classifier here: a successful capture IS
+// the ready signal, and a missing tmux session is the only dead one. What the pane is
+// still read for is CONTROL — claude's bypass-acceptance dialog, claude's and codex's
+// trust dialogs, and the claude.ai remote-control URL.
+//
+// WITHOUT a prompt the loop returns on the first successful capture (after examining
+// that capture for the control dialogs) — there is nothing to settle for. WITH a
+// prompt it returns once kickoffSettle has elapsed since the origin (see the
+// constant), bounded by the deadline.
+//
+// now is injected beside sleep so the settle arithmetic is unit-testable on a fake
+// clock (nil → time.Now / time.Sleep).
+func waitUntilLive(r Runner, name string, kind Kind, prompt string, bypass bool, sleep func(time.Duration), now func() time.Time) (State, string, error) {
 	if sleep == nil {
 		sleep = time.Sleep
 	}
-	deadline := time.Now().Add(defaultWaitTimeout)
+	if now == nil {
+		now = time.Now
+	}
+	deadline := now().Add(defaultWaitTimeout)
 	state, url := StateStarting, ""
 	trustAccepted := false
 	bypassAccepted := false
-	for time.Now().Before(deadline) {
+	// origin is the settle window's start: the first successful capture, pushed
+	// forward by each SUCCESSFUL control keystroke. Zero until the first capture.
+	var origin time.Time
+	for now().Before(deadline) {
 		capRes := capturePane(r, name)
 		if capRes.Code != 0 {
 			// The session is gone (the inner command exited immediately) — report
@@ -307,8 +398,15 @@ func waitUntilReady(r Runner, name string, kind Kind, prompt string, bypass bool
 			if isMissingSession(capRes.Stderr) {
 				return StateDead, "", nil
 			}
-			sleep(defaultPollEvery) // transient capture error; keep polling
+			sleep(pollDelay(now, deadline)) // transient capture error; keep polling
 			continue
+		}
+		// A capture succeeded: the session exists and is drawing. That is liveness,
+		// and liveness is the whole of `ready` now.
+		state = StateReady
+		url = extractURL(kind, capRes.Stdout)
+		if origin.IsZero() {
+			origin = now()
 		}
 		// A bypassPermissions session shows a one-time acceptance dialog before
 		// anything else; accept it once so the session can proceed unattended. Gated
@@ -316,37 +414,61 @@ func waitUntilReady(r Runner, name string, kind Kind, prompt string, bypass bool
 		if bypass && IsClaudeKind(kind) && !bypassAccepted && IsBypassAcceptPrompt(capRes.Stdout) {
 			// Only latch accepted on a successful send; a transient send-keys failure
 			// must remain retryable rather than stalling the session until timeout.
+			// The settle origin moves only on that same success — a failed keystroke
+			// changed nothing on screen.
 			if res := acceptBypassPrompt(r, name); res.Code == 0 {
 				bypassAccepted = true
+				origin = now()
 			}
-			sleep(defaultPollEvery)
+			sleep(pollDelay(now, deadline))
 			continue
 		}
-		state, url = ClassifyPane(kind, capRes.Stdout)
-		if state == StateNeedsTrust && !trustAccepted {
-			// Every agent's directory-trust gate captured so far pre-selects "yes" and
-			// is accepted with Enter (claude's "Yes, I trust this folder"; codex's
-			// "1. Yes, continue · Press enter to continue"). The classified needs-trust
-			// state is the gate, so a single Enter accepts it for any kind.
-			trustAccepted = true
-			sendEnter(r, name)
-			sleep(defaultPollEvery)
+		if !trustAccepted && isTrustDialog(kind, capRes.Stdout) {
+			// Both captured trust gates pre-select "yes", so a single Enter accepts
+			// either. Latched ONLY on a successful send, exactly like the bypass arm
+			// above: a transient send-keys failure that left the dialog up must stay
+			// retryable, because a latch there would make every later capture ignore
+			// a modal that still owns the keyboard. The settle origin moves on that
+			// same success — a failed keystroke changed nothing on screen.
+			if res := sendEnter(r, name); res.Code == 0 {
+				trustAccepted = true
+				origin = now()
+			}
+			sleep(pollDelay(now, deadline))
 			continue
 		}
-		if state != StateStarting {
-			break
+		if prompt == "" {
+			break // nothing to settle for
 		}
-		sleep(defaultPollEvery)
+		if !now().Before(origin.Add(kickoffSettle)) {
+			break // the settle window has elapsed
+		}
+		sleep(pollDelay(now, deadline))
 	}
 	if state == StateReady && prompt != "" {
-		// A session can report ready (URL present) a beat before its REPL accepts
-		// input; settle once more before typing the kickoff line. A delivery failure
-		// is surfaced — otherwise a create --wait would report ready with the kickoff
-		// never typed (and a plan run would exit 0 with the plan unstarted).
+		// One more plain settle (it inspects nothing) before the kickoff line is
+		// typed. A delivery failure is surfaced — otherwise a create --wait would
+		// report ready with the kickoff never typed (and a plan run would exit 0 with
+		// the plan unstarted).
 		sleep(promptDeliverSettle)
+		// THE DELIVERY GATE. Liveness is not permission to type: the loop above can
+		// exit with a modal still on screen — an accept whose keystroke failed every
+		// time, a bypass dialog the deadline ran out under, a dialog that reappeared
+		// after the settle — and a kickoff typed there answers it by accident. So
+		// delivery re-checks the pane itself, with the same matchers and the same
+		// refusal the one-shot `prompt` verb makes, rather than trusting the loop's
+		// bookkeeping. A transient capture failure is NO EVIDENCE, not proof of a
+		// dialog, so it falls through to the send (whose own failure is surfaced).
+		if capRes := capturePane(r, name); capRes.Code != 0 {
+			if isMissingSession(capRes.Stderr) {
+				return StateDead, "", nil
+			}
+		} else if hasControlDialog(capRes.Stdout) {
+			return state, url, errControlDialogUp()
+		}
 		if res := sendLine(r, name, prompt); res.Code != 0 {
 			if isMissingSession(res.Stderr) {
-				// Killed between classification and delivery: that's a dead session,
+				// Killed between the last poll and delivery: that's a dead session,
 				// not a transport failure.
 				return StateDead, "", nil
 			}
@@ -431,29 +553,43 @@ type PromptOptions struct {
 	SessionID string // optional; must match SHED_RC_ID if set (guards a recreated slug)
 }
 
-// Prompt delivers a single line to a ready session (re-captures and verifies kind +
-// state + optional session-id before sending).
+// Prompt delivers a single line to a live session (re-captures and verifies kind +
+// the control gate + optional session-id before sending).
+//
+// THE GATE IS CONTROL, NOT STATUS (S2, charliek/shed#324). It used to refuse anything
+// the classifier did not call `ready`; with `state` reduced to liveness that check
+// would always pass and the verb would type blind. What it refuses instead is a pane
+// with a one-time dialog on it — claude's or codex's trust dialog, claude's bypass
+// acceptance — because a line typed there answers the dialog by accident. Unlike
+// waitUntilLive's accept path this is NOT kind-gated: refusing is the safe direction,
+// so every kept matcher is consulted for every kind.
+//
+// Everything else is DELIVERY OF TERMINAL INPUT INTO A LIVE SESSION — the same thing
+// a person typing at the attached terminal does. The hub cannot tell an auth screen
+// or an approval modal from a composer any more, and that hazard is accepted (and
+// documented in docs/extensions/rc-helper.md) until roost owns the guest's kickoff.
 func Prompt(r Runner, opts PromptOptions) error {
 	opts.Text = NormalizeNewlines(opts.Text)
 	if HasUnsafePromptChars(opts.Text) {
 		return fmt.Errorf("%w: text contains an unsupported control character", ErrBadArgs)
 	}
-	session, err := loadSession(r, opts.Slug, nil)
+	name := TmuxName(opts.Slug)
+	pane, err := capturePaneChecked(r, name)
 	if err != nil {
 		return err
 	}
+	session := ParseSession(name, showEnvironment(r, name), pane, nil)
 	if opts.SessionID != "" && session.ID != opts.SessionID {
 		return fmt.Errorf("%w: session id mismatch (recreated?)", ErrSessionNotFound)
 	}
 	if !AcceptsTypedInput(session.Kind) {
 		return fmt.Errorf("%w: kind %q does not accept a prompt", ErrBadArgs, session.Kind)
 	}
-	if session.State != StateReady {
-		return fmt.Errorf("%w: session not ready (state=%s)", ErrBadArgs, session.State)
+	if hasControlDialog(pane) {
+		return errControlDialogUp()
 	}
 	// Surface a delivery failure (e.g. the session was killed between the check and
 	// the send) instead of reporting a false success.
-	name := TmuxName(opts.Slug)
 	if res := sendLine(r, name, opts.Text); res.Code != 0 {
 		if isMissingSession(res.Stderr) {
 			return fmt.Errorf("%w: %s", ErrSessionNotFound, name)

@@ -10,12 +10,12 @@ import (
 	"time"
 )
 
-// codexReadyPane is a codex pane parked at its composer placeholder — classifies ready
-// AND matches the codex prompt anchor (so the degraded idle+anchor input policy accepts).
-func codexReadyPane() string { return "codex\n> " + codexComposerPlaceholder }
+// codexReadyPane is a codex pane parked at its composer. Since S2 (charliek/shed#324)
+// the hub reads nothing out of it — a session that ENUMERATES is live — so this is
+// just plausible pane text for a live codex row.
+func codexReadyPane() string { return "codex\n> Ask Codex to do anything" }
 
-// opencodeReadyPane is an opencode pane parked at its composer placeholder — it matches the
-// opencode prompt anchor, so a gate rejection on it can only come from an activity arm.
+// opencodeReadyPane is the same for an opencode row.
 func opencodeReadyPane() string { return "opencode\n> Ask anything..." }
 
 // ---- GET /v1/sessions/{slug}/messages ----
@@ -106,15 +106,13 @@ func TestHubHTTPMessagesEmptyForKnownSlug(t *testing.T) {
 
 // ---- POST /v1/sessions/{slug}/input ----
 
-// newInputHub builds a hub whose stability verdict has SETTLED (two reconciles across
-// the quiet period) and serves it over HTTP. The settle is no longer load-bearing for
-// /input (the lane is gone), but it keeps these cells posting against a hub in the same
-// steady state the rest of the suite uses.
+// newInputHub reconciles once (which is what puts a session in the tracked map) and
+// serves the hub over HTTP. There is nothing left to settle: A6 removed the gated lane
+// and S2 (charliek/shed#324) the pane-stability engine whose quiet period the second
+// reconcile used to cross.
 func newInputHub(t *testing.T, f *hubTmux, clk *hubClock) (*Hub, *httptest.Server) {
 	t.Helper()
 	h := newTestHub(f, clk)
-	h.reconcile()
-	clk.advance(5 * time.Second) // past newTestHub's 4s quiet period
 	h.reconcile()
 	srv := httptest.NewServer(h.handler())
 	t.Cleanup(srv.Close)

@@ -177,7 +177,7 @@ fn req_str<'a>(params: &'a Value, key: &str) -> Result<&'a str, (String, String)
         .ok_or_else(|| err("bad_request", format!("missing '{key}'")))
 }
 
-/// Reject an unknown (preserved-raw) `RcKind` on a launch/classify path. The
+/// Reject an unknown (preserved-raw) `RcKind` on a launch path. The
 /// unknown-kind policy preserves such a value on READ (list/decode), but you cannot
 /// LAUNCH a kind this build does not understand. Shared by the socket IPC handler
 /// and the `#[tauri::command]` invoke path (`lib.rs::rc_launch`) so the two entry
@@ -465,7 +465,6 @@ impl Handler {
             "terminal.preview" => self.terminal_preview(params),
             "terminal.open" => self.terminal_open(params),
             "terminal.presets" => Ok(self.terminal_presets()),
-            "rc.classify" => self.rc_classify(params),
             "rc.list" => self.rc_list(params).await,
             "rc.launch" => self.rc_launch(params).await,
             "rc.kill" => self.rc_kill(params).await,
@@ -857,13 +856,10 @@ impl Handler {
 
     // -- RC / Agents (B2.3) — the launcher + session table -------------------
 
-    /// `rc.classify {kind, pane}` → the pure pane classifier `{state, url?}`.
-    fn rc_classify(&self, params: &Value) -> Result<Value, (String, String)> {
-        let kind = rc_kind(params)?;
-        Ok(json!(self
-            .rc_service
-            .classify(&kind, req_str(params, "pane")?)))
-    }
+    // The pure pane-classifier op that lived here — `{kind, pane}` → `{state,
+    // url?}` — went with S2 (`charliek/shed#324`). A shed row's `state` comes off
+    // the wire from the guest (where it is liveness now) and a machine row's from
+    // roost; no client re-derives one from a pane.
 
     /// `rc.list {host?, shed?}` → `{sessions}`. The running sheds + their ssh
     /// targets come from `Backend` (resolution stays in shed-app); `RcService`

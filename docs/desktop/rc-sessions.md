@@ -20,11 +20,11 @@ shed-desktop is a conformant client of the tool-neutral **RC Session Convention
 v2** (published by `shed-remote-agent`; spec:
 `docs/reference/rc-session-convention.md` there). The tmux session is the single
 source of truth — all durable metadata lives in its session environment, and
-`state`/`url` are always derived fresh from the pane, never stored. This lets
+`state`/`url` are always derived fresh, never stored. This lets
 shed-remote-agent, shed-desktop, the `shed` CLI, and future clients discover,
-classify, attach to, and tear down each other's sessions without a registry.
+attach to, and tear down each other's sessions without a registry.
 
-The SSH+tmux choreography (bootstrap, classification, the `SHED_RC_*` metadata,
+The SSH+tmux choreography (bootstrap, the `SHED_RC_*` metadata,
 workspace-trust pre-seeding) lives in the **`shed-ext-rc`** guest binary baked into
 the shed image; shed-desktop invokes it over SSH (`shed-ext-rc create --wait` /
 `list` / `kill`) and decodes its neutral JSON DTO. So every tool produces
@@ -64,17 +64,22 @@ still listed and killable, but rendered with defaults (`kind = claude-broker`, a
 
 ## Derived state
 
-`state` and `url` are computed from a `tmux capture-pane` by the pure classifier
-(`rc.classify` over IPC), never stored:
+`state` is **liveness**, derived fresh by the guest binary and never stored: a
+session that is enumerated is live, and one whose tmux session is gone is simply
+not enumerated (`list`) or reported missing (`probe`). Clients read it off the
+wire; there is no client-side pane classifier (the classifier IPC op was removed
+in `charliek/shed#324` — a machine row's status comes from roost).
+
+`url` is the claude.ai remote-control address, still lifted out of a claude
+session's pane because it is **control** (the address a person opens to drive the
+session), not status.
 
 | `state` | Meaning |
 |---------|---------|
-| `starting` | No URL / status line yet (incl. `claude` still in first-run setup). |
-| `ready` | Terminal-good for the kind (a URL for `claude-broker`/`claude-rc`; any output for `shell`). |
-| `reconnecting` | `claude remote-control` is reconnecting (`claude-broker`). |
-| `needs-trust` | `claude` refused — workspace not trusted (attach via the console button to trust). |
-| `needs-auth` | `claude` needs a `claude.ai` login (attach + `claude auth login`). |
-| `dead` | The tmux session is gone. |
+| `starting` | The create-time placeholder, before the first successful capture. |
+| `ready` | The session is live. |
+| `dead` | The tmux session is gone (the `--wait` path's liveness verdict). |
+| `reconnecting`, `needs-trust`, `needs-auth` | Retained in the wire enum so clients keep decoding older guests; the current guest never emits them. |
 
 ## Transport
 
