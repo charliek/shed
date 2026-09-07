@@ -24,7 +24,7 @@ import {
   fetchEgressProfiles, reportEgress, inTauri,
   openPreferences, setAppearanceState,
   rcLaunch, machineLaunch, machineCapabilities, killSession, sessionKey, reportAgents, reportMachinesPane, useRcSessions, openMachineTerminal, addMachine,
-  useCoordinatorData, useNowTick, shedsEmptyState, hostFailureFor,
+  useCoordinatorData, useNowTick, shedsEmptyState, hostFailureFor, attachKind, capabilitiesFor,
   type Pane, type Shed, type HostDiskUsage, type HostFailure,
   type Modal, type CreateProgress, type Approval, type AuditEntry,
   type EgressProfile, type EgressProfileInfo, type HostEgressProfiles, type EgressReport,
@@ -474,8 +474,8 @@ function rcStateTone(state: RcState): Tone {
   return "attention";
 }
 
-function AgentsPane({ sessions, machines, onLaunch, refresh }:
-  { sessions: RcSession[]; machines: MachineStatus[]; onLaunch: () => void; refresh: () => void }) {
+function AgentsPane({ sessions, machines, capabilities, onLaunch, refresh }:
+  { sessions: RcSession[]; machines: MachineStatus[]; capabilities: Record<string, RcCapabilities>; onLaunch: () => void; refresh: () => void }) {
   const [error, setError] = useState<string | null>(null);
   // With machines configured but none reachable, "no agents running" is a claim
   // this pane cannot actually make — it has not been able to look. Say so, and
@@ -525,7 +525,7 @@ function AgentsPane({ sessions, machines, onLaunch, refresh }:
                 // Keyed by ORIGIN, not host/shed: a machine session's shed is
                 // empty by construction, so two machines sharing a slug would
                 // otherwise collide into one React key.
-                <SessionCard key={sessionKey(s)} session={s} onKilled={refresh} onError={setError} />
+                <SessionCard key={sessionKey(s)} session={s} capabilities={capabilities} onKilled={refresh} onError={setError} />
               ))}
             </div>
           </div>
@@ -664,18 +664,32 @@ function MachinesPane({ machines, sessions, refresh, onNew }:
   );
 }
 
-function SessionCard({ session: s, onKilled, onError }: { session: RcSession; onKilled: () => void; onError: (e: string) => void }) {
+function SessionCard({ session: s, capabilities, onKilled, onError }:
+  { session: RcSession; capabilities: Record<string, RcCapabilities>; onKilled: () => void; onError: (e: string) => void }) {
   const [busy, setBusy] = useState(false);
   const claude = s.kind === "claude-rc" || s.kind === "claude-broker";
   const machine = s.origin_kind === "machine";
   // WORKDIR FIRST: on a narrow pane this truncates, and the working directory
   // is what tells two sessions on the same box apart. The origin is not here at
-  // all — the pane is grouped by it.
+  // all — the pane is grouped by it. `tmux_session` is dropped: a roost row
+  // carries "" for it, and a plain shed session's tmux name is not something a
+  // person reads a card for.
   const sub = s.state === "needs-auth"
     ? rcAuthHint(s.kind)
-    : [s.workdir, s.tmux_session, s.created_by].filter(Boolean).join(" · ");
+    : [s.workdir, s.created_by].filter(Boolean).join(" · ");
   const act = rcActivityLabel(s);
   const rail = sessionRail(s);
+  // `>_ open` only makes sense for a tmux-attach row — a roost session (or any
+  // future `native-remote`/`none` kind) has no tmux pane behind it to attach to.
+  // Absent/empty capabilities fall back to `"tmux"` for a SHED row (the pre-v2
+  // assumption every terminal path made before roost rows existed) but fail
+  // CLOSED for a machine row: a machine's capabilities are the synthesized
+  // roost set keyed by its origin, and until that entry is in the payload
+  // there is no tmux pane to offer (CodeRabbit review finding on C6).
+  const caps = capabilitiesFor({ capabilities }, s);
+  const canAttach = caps !== undefined
+    ? attachKind(caps, s.kind) === "tmux"
+    : s.origin_kind !== "machine";
   const kill = async () => {
     setBusy(true);
     // Routes by origin — a machine session is addressed by (machine, slug), a
@@ -708,6 +722,16 @@ function SessionCard({ session: s, onKilled, onError }: { session: RcSession; on
       <div className="flex items-start gap-4">
         <span className="min-w-0 flex-1 truncate text-[16px] font-semibold text-shed-text">{s.display_name}</span>
         <span className="flex flex-none items-center gap-2">
+          {/* roost's `has_notification` bit, sticky until the user focuses the
+              tab THERE — shed never clears it, so it is deliberately not folded
+              into `needsYou`/activity: a dot, not a claim that this needs you
+              right now. */}
+          {s.attention && (
+            <span
+              title="roost notification"
+              style={{ width: 8, height: 8, borderRadius: 9999, background: "var(--shed-attention)", flex: "none" }}
+            />
+          )}
           <StatusChip tone={rcStateTone(s.state)} label={s.state} />
           {act && <StatusChip tone={act.tone} label={act.label} />}
         </span>
@@ -727,19 +751,24 @@ function SessionCard({ session: s, onKilled, onError }: { session: RcSession; on
               a person opening a session should not have to care which they
               have. It LEADS, because on the desktop the terminal is how you
               read a session, not a fallback for when something else is
-              missing. */}
-          <button
-            onClick={() =>
-              void (machine
-                ? openMachineTerminal(s.machine ?? "", s.slug)
-                : openTerminal(s.shed, s.host, s.tmux_session))
-            }
-            title={claude ? "Open the session in a terminal" : "Open in Terminal"}
-            className="hbtn inline-flex items-center rounded-[9px] px-[18px] py-2.5 font-mono text-[13px] font-medium"
-            style={{ background: "var(--shed-btn-dark)", color: "var(--shed-btn-dark-fg)", border: "none" }}
-          >
-            {">_ open"}
-          </button>
+              missing.
+              A roost row (attach !== "tmux") has no tmux pane behind it — R3
+              lands attach for those; until then the button is simply absent
+              rather than opening onto nothing. */}
+          {canAttach && (
+            <button
+              onClick={() =>
+                void (machine
+                  ? openMachineTerminal(s.machine ?? "", s.slug)
+                  : openTerminal(s.shed, s.host, s.tmux_session))
+              }
+              title={claude ? "Open the session in a terminal" : "Open in Terminal"}
+              className="hbtn inline-flex items-center rounded-[9px] px-[18px] py-2.5 font-mono text-[13px] font-medium"
+              style={{ background: "var(--shed-btn-dark)", color: "var(--shed-btn-dark-fg)", border: "none" }}
+            >
+              {">_ open"}
+            </button>
+          )}
           {/* claude.ai is a second way in, not a better one — a quiet square
               beside the terminal rather than a labelled pill competing with
               it. */}
@@ -1259,7 +1288,9 @@ function LaunchAgentDialog({ sheds, machines, capabilities, refresh, onClose, on
           kind,
           displayName: displayName.trim() || undefined,
           workdir: workdir.trim() || undefined,
-          initialPrompt: prompt.trim() || undefined,
+          // The field is hidden for a machine target (roost's `tab.open` takes
+          // argv + cwd only) — never forward a stale `prompt` left over from a
+          // shed selection.
         });
       } else {
         await rcLaunch({
@@ -1329,14 +1360,22 @@ function LaunchAgentDialog({ sheds, machines, capabilities, refresh, onClose, on
             <Segmented options={kinds.map((k) => [k, rcKindLabel(k), agentColor(k)] as [string, string, string])} value={kind} set={(v) => setKind(v as RcKind)} />
           )}
         </Field>
-        <Field
-          label={shell ? "Initial command" : "Initial prompt"}
-          hint="optional"
-          htmlFor={`${fid}-prompt`}
-          help={shell ? "Run in the shell once it's ready." : "Typed into the agent once it's ready."}
-        >
-          <textarea id={`${fid}-prompt`} value={prompt} onChange={(e) => setPrompt(e.target.value)} rows={2} placeholder={shell ? "npm install && npm test" : "summarize this repo"} className={cn(dialogInput, "resize-none")} />
-        </Field>
+        {/* roost's `tab.open` takes argv + cwd only — a machine target's launch
+            command ignores a prompt silently. Hiding the field (rather than
+            showing it and dropping what's typed) is the only honest option
+            until S4 gives roost kickoff its own delivery path. Permission mode
+            has no field in this dialog to begin with, so there's nothing else
+            to hide for a machine target. */}
+        {selected?.kind !== "machine" && (
+          <Field
+            label={shell ? "Initial command" : "Initial prompt"}
+            hint="optional"
+            htmlFor={`${fid}-prompt`}
+            help={shell ? "Run in the shell once it's ready." : "Typed into the agent once it's ready."}
+          >
+            <textarea id={`${fid}-prompt`} value={prompt} onChange={(e) => setPrompt(e.target.value)} rows={2} placeholder={shell ? "npm install && npm test" : "summarize this repo"} className={cn(dialogInput, "resize-none")} />
+          </Field>
+        )}
         {error && (
           <div className="rounded-md px-3 py-2 font-mono text-[12px]" style={{ background: "var(--shed-deny-bg)", color: "var(--shed-danger)" }}>{error}</div>
         )}
@@ -1734,7 +1773,7 @@ export default function App() {
             {pane === "sheds" && <ShedsPane sheds={sheds} hostErrors={hostErrors} refresh={refresh} onNew={() => setModal("create")} />}
             {pane === "machines" && <MachinesPane machines={rcMachines} sessions={rcSessions} refresh={refreshRc} onNew={() => setModal("machine")} />}
             {pane === "approvals" && <ApprovalsPane approvals={approvals} />}
-            {pane === "agents" && <AgentsPane sessions={rcSessions} machines={rcMachines} onLaunch={() => setModal("launch")} refresh={refreshRc} />}
+            {pane === "agents" && <AgentsPane sessions={rcSessions} machines={rcMachines} capabilities={rcCapabilities} onLaunch={() => setModal("launch")} refresh={refreshRc} />}
             {pane === "activity" && <ActivityPane />}
             {pane === "egress" && <EgressPane />}
             {pane === "system" && <SystemPane sheds={sheds} />}

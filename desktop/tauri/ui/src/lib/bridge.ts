@@ -856,6 +856,27 @@ export type RcCapabilities = {
   kind_features: Record<string, RcKindFeatures>;
 };
 
+/** How a kind's terminal affordance is reached — mirrors
+ *  `RcKindFeatures::attach_kind()` on the Rust side, the single discriminator a
+ *  client uses to decide whether `>_ open` (tmux attach) makes sense for a row.
+ *  Absent/empty `attach` (an old binary, or capabilities that predate contract
+ *  v2) falls back to `"tmux"` — the pre-v2 assumption every terminal path made
+ *  before roost rows existed. An unrecognized non-empty value passes through
+ *  verbatim rather than being coerced, so a future kind doesn't silently regain
+ *  an attach button it never earned. */
+export function attachKind(caps: RcCapabilities | undefined, kind: string): "tmux" | "native-remote" | "none" | string {
+  return caps?.kind_features?.[kind]?.attach || "tmux";
+}
+
+/** Look up the capabilities behind a session row, keyed the same way
+ *  `rc_list_payload` keys `RcListResult.capabilities`: a shed row by
+ *  `host/shed`, a machine row by its `origin` (`machine:<name>`). Falls back to
+ *  the `host/shed` composite when `origin` is absent (an older payload), the
+ *  same fallback `sessionKey` uses. */
+export function capabilitiesFor(list: Pick<RcListResult, "capabilities">, s: RcSession): RcCapabilities | undefined {
+  return list.capabilities[s.origin ?? `${s.host}/${s.shed}`];
+}
+
 /** The kinds a create form can offer (broker is URL-driven; unknown never creatable). */
 export const RC_CREATABLE_KINDS: RcKind[] = ["claude-rc", "codex", "opencode", "cursor", "shell"];
 
@@ -907,7 +928,10 @@ export type RcSession = {
   host: string;
   shed: string;
   slug: string;
-  tmux_session: string;
+  /** Optional because a roost-sourced machine row carries `""` here rather than
+   *  omitting the field, but a stricter type would still be wrong to assume for
+   *  every future payload — mirrors the DTO's evolution, not a real absence. */
+  tmux_session?: string;
   display_name: string;
   workdir: string;
   kind: RcKind;
@@ -939,6 +963,15 @@ export type RcSession = {
    *  being shown. A machine that is asleep or off-network is NORMAL, not an
    *  error, so its rows stay visible and dimmed rather than vanishing. */
   stale?: boolean | null;
+  /** roost's sticky `has_notification` bit (plan 013 §3.2/§3.4), stamped
+   *  client-side like `origin`/`machine` — never present on a shed row. It is
+   *  its OWN affordance (a dot), not folded into `needsYou`: roost only clears
+   *  it on UI focus and shed never clears it, so treating it as "needs you"
+   *  would leave a card stuck demanding attention forever. */
+  attention?: boolean;
+  /** The roost tab id backing a machine row (a string — roost's own ids are
+   *  strings on the wire); absent for a shed session. */
+  tab_id?: string;
 };
 
 /** A configured machine's health, for the sessions view's group rows. A machine
