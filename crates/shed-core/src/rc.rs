@@ -32,6 +32,15 @@ pub const LANE_TUI: &str = "tui";
 /// session. The fallback an absent/empty `kind_features.attach` decodes to
 /// ([`RcKindFeatures::attach_kind`]).
 pub const ATTACH_TMUX: &str = "tmux";
+/// Terminal-attach mode (contract v2) for a session whose terminal is owned by a
+/// remote multiplexer that shed does not attach to — a `roost-session` tab. A
+/// client offers a native affordance (mobile's read-only `tab.dump` peek) or no
+/// terminal action at all, never a tmux attach.
+pub const ATTACH_NATIVE_REMOTE: &str = "native-remote";
+/// Terminal-attach mode (contract v2) for a session with no terminal affordance
+/// at all — the explicit "hide the attach button" value, distinct from an ABSENT
+/// `attach` (which means `tmux` by [`RcKindFeatures::attach_kind`]'s fallback).
+pub const ATTACH_NONE: &str = "none";
 
 /// RC session kind (Convention v2). `<tool>-<mode>` so the model can grow to
 /// other agents later; `shell` is tool-agnostic. Mirrors the guest's `rc.Kind`

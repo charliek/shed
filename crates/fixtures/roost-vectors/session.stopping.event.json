@@ -1,0 +1,6 @@
+{
+  "event": "session.stopping",
+  "data": {
+    "reason": "stop"
+  }
+}

@@ -1,0 +1,19 @@
+{
+  "event": "tab.opened",
+  "data": {
+    "tab": {
+      "id": "7",
+      "project_id": "1",
+      "title": "zsh",
+      "cwd": "/Users/me",
+      "state": "none",
+      "has_notification": false,
+      "is_active": false,
+      "user_titled": false,
+      "position": 1,
+      "created_at": 1700001000,
+      "last_active": 1700001000,
+      "hook_active": false
+    }
+  }
+}

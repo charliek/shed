@@ -27,18 +27,42 @@
 //!   rather than calling `roost_ipc::paths::BundleProfile::session()`, because
 //!   that resolver appends `-dev` based on the **consuming** crate's build
 //!   profile: a debug build of shed would go looking for a dev roost.
+//! * [`model`] — what a roost tab IS to shed: [`RoostSession`] (roost's four
+//!   agent axes, flattened out of the project tree), [`RoostInventory`] (one
+//!   `tab.list` + `session.identify`), and the mapping onto the
+//!   [`RcSessionDto`](crate::rc::RcSessionDto) every client already renders —
+//!   which gains no field for roost. Rows are **agent-owned tabs only**: a
+//!   roost-session is somebody's terminal multiplexer, and fifteen shells must
+//!   not be fifteen cards. It also synthesizes the capabilities a roost host
+//!   advertises ([`roost_capabilities`]), since roost has no `shed-ext-rc` to
+//!   probe.
+//! * [`fence`] — the revision fence ([`Fence`], [`Admit`]) and the event fold
+//!   ([`RoostInventory::apply`]). Pure, so it is implemented exactly once for
+//!   every client shed ships and testable against roost's own golden vectors.
 //! * [`testing`] — an in-process fake `roost-session`, for this crate's tests
 //!   and (under the non-default `test-support` feature) for `shed-app`'s.
-//!
-//! `model.rs` (the session model + row mapping) and `fence.rs` (the revision
-//! fence) land in C2 of plan 013.
 
 pub mod conn;
 mod error;
+pub mod fence;
+pub mod model;
 pub mod paths;
 #[cfg(any(test, feature = "test-support"))]
 pub mod testing;
 
 pub use conn::{Conn, RoostEndpoint, RoostEventStream};
 pub use error::RoostError;
+pub use fence::{Admit, Fence};
+pub use model::{
+    launch_argv, rfc3339_z, roost_capabilities, RoostInventory, RoostSession, APPROVAL_DETAILS,
+};
 pub use paths::{local_session_socket, ResolvedSocket};
+
+/// Decode the `result` of a recorded roost response vector — the shape every
+/// vector under `crates/fixtures/roost-vectors/` has (a full JSON-RPC reply,
+/// never a bare payload). Shared by this module's test suites.
+#[cfg(test)]
+fn result_of<T: serde::de::DeserializeOwned>(vector: &str) -> T {
+    let envelope: serde_json::Value = serde_json::from_str(vector).expect("a vector is valid JSON");
+    serde_json::from_value(envelope["result"].clone()).expect("the vector's result decodes")
+}

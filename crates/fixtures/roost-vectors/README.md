@@ -33,11 +33,28 @@ When the pinned `rev` in `crates/Cargo.toml` moves:
 
 | file | read by |
 |---|---|
-| `session.identify.response.json` | the fake's `session.identify` template (the protocol gate's input) |
+| `session.identify.response.json` | the fake's `session.identify` template (the protocol gate's input); the fence tests' `daemon_session_id` / `started_at` |
 | `identify.response.json` | the fake's `identify` template |
-| `tab.list.session.response.json` | the fake's initial project/tab set — the **session** variant, i.e. the one that carries `revision` |
+| `tab.list.session.response.json` | the fake's initial project/tab set — the **session** variant, i.e. the one that carries `revision` (42); the fence replay's snapshot |
 | `tab.open.response.json` | the fake's template for a tab it opens |
 | `response.error.json` | the fake's error-envelope shape (`unknown-op`) |
+| `events.batch.json` | the fence replay's batch shape (`{revision, events: […]}`) and its revision-42 replay |
+| `tab.opened.event.json` | the fence fold's unowned-tab-opens case |
+| `tab.state_changed.event.json` | the fence fold's ignored-derived-projection case |
+| `agent_report.changed.event.json` | the fence fold's claim/release case (a `claude` adapter taking tab 5) |
+| `session.stopping.event.json` | the fence fold's "an envelope that is not a workspace fact" case |
 
-Shed-recorded vectors from the opencode spikes (`shed.tab.list.opencode.*.json`)
-land here in C2, alongside these.
+## Shed-recorded vectors
+
+`shed.tab.list.opencode.finished.json`, `shed.tab.list.opencode.over-ssh.json`,
+`shed.tab.dump.opencode.json` and `shed.session.identify.json` were **recorded by
+shed** from a real `roost-session` (release build of rev `61d8713…`, protocol 2)
+on 2026-09-07; never edited; they pin the row mapping against real adapter
+output.
+
+`shed.tab.list.opencode.finished.json` is the local spike and is the shape the
+row mapping is really about: a **plain shell tab** (id 3, unowned) sits beside
+the opencode tab (id 4, owned, `finished`, `detail: "session_idle"`, with the
+adapter's `agent`/`model`/`version` metadata). One of those two is a session row;
+the other is somebody's terminal. `shed.tab.list.opencode.over-ssh.json` is the
+same pair read from inside a shed VM over roost's SSH client-bridge.
