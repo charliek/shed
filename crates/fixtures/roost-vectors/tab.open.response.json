@@ -1,0 +1,20 @@
+{
+  "id": "2",
+  "ok": true,
+  "result": {
+    "tab": {
+      "id": "5",
+      "project_id": "1",
+      "title": "zsh",
+      "cwd": "/Users/me",
+      "state": "none",
+      "has_notification": false,
+      "is_active": true,
+      "user_titled": false,
+      "position": 0,
+      "created_at": 1700000000,
+      "last_active": 1700000000,
+      "hook_active": false
+    }
+  }
+}

@@ -21,7 +21,9 @@ default-members = ["shed-core", "shed-core-ffi", "shed-app", "shed-rc-engine", "
 [workspace.package]
 version = "0.8.1"
 edition = "2021"
-rust-version = "1.85"
+# 1.97 is `roost-ipc`'s own MSRV (roost's `[workspace.package] rust-version`);
+# this workspace cannot claim to build on less than what its dependency needs.
+rust-version = "1.97"
 license = "MIT"
 publish = false
 
@@ -58,6 +60,22 @@ rcgen = { version = "0.13", default-features = false, features = ["ring"] }
 base64 = "0.22"
 # Test-only TLS listener for the in-process mtls server tests.
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+# The roost IPC wire (plan 013 / the Roost Pivot): `IpcClient`, `EventStream`, the
+# `messages` structs, and the `ssh` transport. The ONE git dependency in this
+# workspace, and it is **rev-pinned in the manifest on purpose**: shed-mobile
+# consumes `shed-core` as a git dependency, and cargo does not inherit a
+# dependency's lockfile — a `branch = "main"` pin here would let mobile resolve
+# whatever `main` happened to be on the day its own lock was regenerated, against
+# a crate that publishes NO Rust-API stability promise (roost
+# `docs/reference/ipc-compatibility.md`; the pin is what absorbs that). With the
+# rev in the manifest, mobile's lock cannot disagree, so
+# `shed-mobile/scripts/check-lock-rev.sh` needs no change.
+#
+# Bump recipe: edit `rev` here, run `cargo update -p roost-ipc`, commit both this
+# file and `Cargo.lock`. Re-read roost's `ipc-compatibility.md` on any bump that
+# crosses a `SESSION_PROTOCOL_VERSION` change — `Conn::session_identify` refuses a
+# mismatch by name rather than limping.
+roost-ipc = { git = "https://github.com/charliek/roost", rev = "61d8713bcd0378971ad8490fe89b8dbef4e49fac" }
 
 # **The dev profile is TUNED** (plan 012), because the default is expensive here
 # in a way that shows up as failed builds rather than slow ones: a full debug

@@ -1,0 +1,14 @@
+{
+  "id": "1",
+  "ok": true,
+  "result": {
+    "socket_path": "/Users/me/Library/Caches/Roost/roost.sock",
+    "pid": 12345,
+    "active_project_id": "1",
+    "active_tab_id": "3",
+    "app_label": "Roost",
+    "app_id": "ai.stridelabs.Roost",
+    "ui_version": "0.7.0",
+    "protocol_version": 1
+  }
+}

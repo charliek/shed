@@ -9,7 +9,11 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
-tokio = { workspace = true }
+# `net` (UnixStream/TcpStream) + `io-util` (`copy_bidirectional` for the loopback-TCP
+# pump in `roost::conn`) on top of the workspace's rt/macros/sync/time. These are
+# BUILD-time features now, not just dev-time: `roost::conn` needs them in the shipped
+# lib. Feature unification with `roost-ipc` adds `fs`, `process` and `signal` on top.
+tokio = { workspace = true, features = ["net", "io-util"] }
 reqwest = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -24,6 +28,20 @@ uuid = { workspace = true }
 # Pane classifier + claude.ai URL extraction for the RC module (rc.rs). Already
 # in the workspace lock tree (via httpmock), so no new crates are pulled.
 regex = "1"
+# The roost IPC wire (`roost` module). Git, rev-pinned — see the long comment on
+# the workspace dependency in ../Cargo.toml for why the rev lives in a manifest.
+roost-ipc = { workspace = true }
+# `getuid(2)` for the `/tmp/roost-session-<uid>` socket fallback (`roost::paths`).
+# Already in the tree via roost-ipc; named here because we call it directly.
+libc = "0.2"
+
+[features]
+# The in-process fake roost-session (`roost::testing`) exported for ANOTHER crate's
+# tests — `shed-app`'s roost watcher/reach tests. NON-default and named
+# `test-support` so it is unmistakable: the module is `#[cfg]`'d in only under
+# `test` or this feature, so a shipped binary never carries it. Mirrors the same
+# feature on `shed-app` / `shed-rc-engine`.
+test-support = []
 
 [dev-dependencies]
 httpmock = { workspace = true }

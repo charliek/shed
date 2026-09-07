@@ -60,6 +60,57 @@ re-implemented per language. The root `CLAUDE.md` owns the monorepo layout + rel
 `fixtures/` holds the real-shaped JSON/YAML samples (server info, `shed list`, `system df`,
 egress profiles, enriched image, config) that both the Rust decoders and the Swift
 `ConfigParityTests` assert against — keep them byte-real, not hand-trimmed.
+`fixtures/roost-vectors/` is a **vendored copy** of roost's own golden IPC vectors at the
+pinned rev (see below); its README carries the source sha and roost's never-semantically-edit
+rule.
+
+## The one git dependency: `roost-ipc`
+
+`shed-core` depends on `roost-ipc` (the Roost Pivot, plan 013) — the only git dependency in
+this workspace, and it is **rev-pinned in `Cargo.toml`, not just in `Cargo.lock`**:
+
+```toml
+roost-ipc = { git = "https://github.com/charliek/roost", rev = "<sha>" }
+```
+
+shed-mobile consumes `shed-core` **as a git dependency**, and cargo does not inherit a
+dependency's lockfile — a `branch = "main"` pin here would let mobile resolve whatever `main`
+was on the day its own lock was regenerated, against a crate that publishes **no Rust-API
+stability promise** (the pin is what absorbs that). With the rev in the manifest, mobile's
+lock cannot disagree, so `shed-mobile/scripts/check-lock-rev.sh` needs no change.
+
+**Bump recipe:** edit the `rev` in `crates/Cargo.toml`, run `cargo update -p roost-ipc`, re-copy
+`fixtures/roost-vectors/` from the new rev's `tests/ipc-vectors/` (updating that README's sha),
+commit all of it. Re-read roost's `docs/reference/ipc-compatibility.md` on any bump crossing a
+`SESSION_PROTOCOL_VERSION` change — `shed_core::roost::Conn::session_identify` refuses a
+mismatch by name rather than limping.
+
+**What it drags in.** `roost-ipc`'s own leaf deps — **`anyhow`**, the **`tracing` facade** (a
+facade only: no subscriber, no `tracing-subscriber`) and **`libc`** — are new to `shed-core`'s
+dependency set but were *already* in this workspace's lock and already reached `shed-core-ffi`
+through `uniffi`, `reqwest`/`hyper-util` and `tokio` respectively. So the Swift staticlib's
+crate graph gains exactly one crate: `roost-ipc` itself. What it does gain is tokio features:
+the workspace asks for `rt-multi-thread, macros, sync, time`, `shed-core` adds `net, io-util`
+(the roost connection and its loopback pump — build-time now, not just dev-time), and roost-ipc
+unifies in `fs, process, signal, rt`. Measured at `shed-core-ffi`, the delta from before this
+dep is **+`process`, +`signal`, +`signal-hook-registry`** (`fs`/`net`/`io-util` already arrived
+via reqwest). Nothing FFI-exported changes; `cargo tree -e features -p shed-core-ffi` prints the
+resulting set. The workspace `rust-version` is **1.97**, which is roost-ipc's MSRV.
+
+**Android.** `cargo check -p shed-core --target aarch64-linux-android` is the early gate for
+mobile (`roost-ipc` compiles for it cleanly — its `peer.rs` has a fail-closed non-linux/macOS
+fallback). It needs the NDK's clang on the env for `ring`'s build script
+(`CC_aarch64_linux_android`, `AR_aarch64_linux_android`,
+`CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER`), the way `cargo-ndk` sets it in shed-mobile's
+CI — that requirement predates roost-ipc.
+
+**The `-dev` trap.** `roost_ipc::paths::BundleProfile::session()` (and `ssh::classify`) append
+`-dev` when the **consuming** crate is a debug build, so a debug shed would look for a dev
+roost and find nothing — which is why `shed_core::roost::paths` resolves the session socket
+itself (release path first, `-dev` sibling only as a fallback) and shed never calls roost's
+resolver. Related: `roost_ipc::ssh` reads `ROOST_SSH_BIN` / `TMPDIR` / `ROOST_TEST_MODE` from
+the shed process env, so build `SshTunnelOptions` explicitly rather than with `from_env()`
+outside tests.
 
 ## The workspace-boundary rule (load-bearing)
 
@@ -99,6 +150,7 @@ cargo test -p shed-app --features rc                 # the non-default rc module
 cargo test -p shed-app --features broker             # the embedded broker bridge (3a.2)
 cargo test -p shed-app --features broker,rc          # both non-default features together
 cargo test -p shed-rc-engine --features test-support # the graduated engine + its doubles
+cargo test -p shed-core --features test-support      # exports `roost::testing::FakeRoost`
 cargo clippy --workspace --all-targets -- -D warnings
 cargo clippy -p shed-app --features rc --all-targets -- -D warnings
 cargo clippy -p shed-app --features broker --all-targets -- -D warnings

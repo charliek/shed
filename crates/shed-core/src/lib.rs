@@ -17,6 +17,7 @@ pub mod models;
 pub mod rc;
 pub mod rc_agents;
 pub mod rc_events;
+pub mod roost;
 pub mod sse;
 pub mod terminal;
 #[cfg(test)]
