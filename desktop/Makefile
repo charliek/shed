@@ -86,6 +86,7 @@ deb: tauri-ui-build  ## Build the shed-desktop Tauri .deb in Docker (ubuntu:24.0
 	  -v "$(REPO_ROOT):/repo:ro" \
 	  -v "$(CURDIR)/out:/out" \
 	  -v shed-tauri-linux-cargo:/usr/local/cargo/registry \
+	  -v shed-tauri-linux-cargo-git:/usr/local/cargo/git \
 	  -v shed-tauri-linux-target:/target \
 	  -e CARGO_TARGET_DIR=/target \
 	  -w /repo shed-tauri-linux:latest \
@@ -160,15 +161,19 @@ tauri-test: tauri-ui-build  ## cargo test the Tauri client locally (its standalo
 # with the bundled terminal openers that build.rs validates) is copied into a
 # writable /work because Tauri's build.rs writes gen/ next to Cargo.toml (a
 # read-only mount fails there); the Rust builds to a /target volume
-# so it never clobbers the mac target dir. --cap-add SYS_ADMIN + seccomp=unconfined
-# let WebKitGTK's web-process bubblewrap sandbox create the user namespaces Docker's
-# default seccomp blocks (else the content process dies and JS never runs).
+# so it never clobbers the mac target dir. Both cargo caches are volumes — the
+# registry AND `git`, because shed-core takes `roost-ipc` as a git dependency
+# (plan 013) and an uncached /usr/local/cargo/git re-clones roost on every run.
+# --cap-add SYS_ADMIN + seccomp=unconfined let WebKitGTK's web-process bubblewrap
+# sandbox create the user namespaces Docker's default seccomp blocks (else the
+# content process dies and JS never runs).
 tauri-build-linux: tauri-ui-build  ## Render gate: Tauri e2e on ubuntu:24.04 + WebKitGTK 2.44 under Xvfb
 	docker build -t shed-tauri-linux:latest - < Dockerfile.tauri-linux
 	docker run --rm \
 	  --cap-add SYS_ADMIN --security-opt seccomp=unconfined --shm-size=1g \
 	  -v "$(REPO_ROOT):/repo:ro" \
 	  -v shed-tauri-linux-cargo:/usr/local/cargo/registry \
+	  -v shed-tauri-linux-cargo-git:/usr/local/cargo/git \
 	  -v shed-tauri-linux-target:/target \
 	  -w /repo \
 	  -e CARGO_TARGET_DIR=/target \
@@ -194,6 +199,7 @@ tauri-test-linux: tauri-ui-build  ## Tauri crate cargo test on ubuntu:24.04 (Lin
 	docker run --rm \
 	  -v "$(REPO_ROOT):/repo:ro" \
 	  -v shed-tauri-linux-cargo:/usr/local/cargo/registry \
+	  -v shed-tauri-linux-cargo-git:/usr/local/cargo/git \
 	  -v shed-tauri-linux-target:/target \
 	  -w /repo \
 	  -e CARGO_TARGET_DIR=/target \

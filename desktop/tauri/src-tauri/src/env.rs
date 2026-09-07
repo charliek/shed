@@ -30,28 +30,28 @@ pub struct Env {
     /// macOS `~/Library/Application Support/shed`, Linux `$XDG_RUNTIME_DIR/shed` or
     /// `~/.local/share/shed`, both under `$SHED_HOST_AGENT_SOCKET_DIR` if set).
     pub host_agent_socket: PathBuf,
-    /// TEST-ONLY machine-hub override: `SHED_TAURI_MACHINE_HUB_PORTS`, a
-    /// comma-separated `<machine>=<port>` map. A listed machine's hub is reached
-    /// on that loopback port directly instead of through an `ssh -N -L` forward.
+    /// TEST-ONLY roost-session override: `SHED_TAURI_ROOST_SOCKETS`, a
+    /// comma-separated `<machine>=<socket path>` map. A named machine's
+    /// `roost-session` is dialled on that Unix socket directly instead of through
+    /// roost's SSH client-bridge. `localhost` (the implicit local host) goes
+    /// through the same map.
     ///
     /// This is what makes the machine path testable HERMETICALLY: the harness
-    /// stands up a fake `/v1` hub and the app reaches it through
-    /// `shed_app::machine::FixedPort`, so the REAL `HubClient` and
-    /// `MachineHubWatcher` run with no ssh, no remote host, and no network. The
-    /// seam exists for shed-mobile (which supplies its own Dart-side forward),
-    /// and it turns out a hermetic harness needs exactly the same thing.
+    /// stands up a fake `roost-session` on a socket and the app reaches it through
+    /// `shed_app::roost::LocalSession`, so the REAL roost client and
+    /// `RoostWatcher` run with no ssh, no remote host, and no network.
     ///
-    /// **Per-machine, not one port for all**, so a suite can serve a hub for one
-    /// machine and point another at a dead port — which is how the everyday
-    /// "asleep / off-network" state gets covered without any real machine.
+    /// **Per-machine, not one socket for all**, so a suite can serve a session for
+    /// one machine and leave another unmapped — which is how the everyday "asleep
+    /// / off-network" state gets covered without any real machine.
     ///
-    /// Non-empty in test mode means NO machine ever spawns ssh: an unlisted
-    /// entry is treated as permanently unreachable rather than falling back to a
-    /// real forward, so a hermetic run cannot leak an ssh child.
+    /// Non-empty in test mode means NO machine ever spawns ssh: an unmapped entry
+    /// is treated as permanently unreachable rather than falling back to a real
+    /// bridge, so a hermetic run cannot leak an ssh child.
     ///
     /// Parsed only in test mode, like [`Self::mock_unreachable_hosts`] — a stray
-    /// env var must never redirect a real machine's hub in production.
-    pub machine_hub_ports: HashMap<String, u16>,
+    /// env var must never redirect a real machine's session in production.
+    pub roost_sockets: HashMap<String, PathBuf>,
     /// The host-agent `extensions.yaml` the EMBEDDED broker loads (`SHED_TAURI_EXTENSIONS_CONFIG`,
     /// else the daemon default `~/.config/shed/extensions.yaml`). Only read in embedded /
     /// headless-coexist mode; external mode never touches it. The harness overrides it to
@@ -90,16 +90,20 @@ impl Env {
             HashSet::new()
         };
         // Same rule as the unreachable-hosts seam: test mode only, so a stray env
-        // var can never point a real machine's hub somewhere else. A malformed
+        // var can never point a real machine's session somewhere else. A malformed
         // pair is dropped rather than failing the launch — the machine then reads
         // as unreachable, which is a visible, debuggable state.
-        let machine_hub_ports = if test_mode {
-            var("SHED_TAURI_MACHINE_HUB_PORTS")
+        let roost_sockets = if test_mode {
+            var("SHED_TAURI_ROOST_SOCKETS")
                 .map(|v| {
                     v.split(',')
                         .filter_map(|pair| {
-                            let (name, port) = pair.split_once('=')?;
-                            Some((name.trim().to_string(), port.trim().parse::<u16>().ok()?))
+                            let (name, socket) = pair.split_once('=')?;
+                            let (name, socket) = (name.trim(), socket.trim());
+                            if name.is_empty() || socket.is_empty() {
+                                return None;
+                            }
+                            Some((name.to_string(), PathBuf::from(socket)))
                         })
                         .collect()
                 })
@@ -111,7 +115,7 @@ impl Env {
             test_mode,
             mock_base_url: var("SHED_TAURI_MOCK_BASE_URL"),
             mock_unreachable_hosts,
-            machine_hub_ports,
+            roost_sockets,
             config_path,
             socket_path: var("SHED_TAURI_SOCKET")
                 .map(PathBuf::from)

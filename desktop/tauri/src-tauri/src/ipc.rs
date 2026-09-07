@@ -51,6 +51,19 @@ fn err(code: &str, message: impl Into<String>) -> (String, String) {
     (code.to_string(), message.into())
 }
 
+/// A machine row has NO terminal (plan 013 S3).
+///
+/// Its sessions come from a `roost-session`, whose synthesized capabilities
+/// advertise `attach: "native-remote"` — the terminal belongs to roost, and shed
+/// attaches to nothing (roost R3 is where attach lands; mobile gets a read-only
+/// `tab.dump` peek in the meantime, the desktop gets no terminal action). The
+/// card hides `>_ open` off the same capability; this is the server-side half, so
+/// a caller that asks anyway is told why instead of being handed a `tmux attach`
+/// for a session that has no tmux.
+fn machine_terminal_refusal() -> (String, String) {
+    err("not_enabled", crate::machines::NO_TERMINAL)
+}
+
 /// The sheds listing payload — `{sheds, host_errors}` — the one shape every
 /// listing answer takes: the `sheds.list` IPC op, the frontend's `list_sheds`
 /// command, and (from the frontend's committed snapshot rather than a fresh
@@ -84,7 +97,7 @@ pub(crate) async fn rc_list_payload(
     // let the launch form gate which kinds it offers (unknown/uninstalled agents
     // are excluded; a shed with an old binary is simply absent → the UI degrades
     // to claude+shell).
-    let capabilities = rc_service.capabilities(host, shed);
+    let mut capabilities = rc_service.capabilities(host, shed);
 
     // **Machine sessions join the SAME payload** (plan 012 R4). A separate op
     // would force the UI to merge two async sources and reintroduce exactly the
@@ -103,6 +116,24 @@ pub(crate) async fn rc_list_payload(
     } else {
         (Vec::new(), Vec::new())
     };
+    // **Capabilities keyed by ORIGIN** (plan 013 §3.4). Shed capabilities are
+    // keyed `host/shed`, and until this a machine row's origin — `machine:<name>`
+    // — matched nothing in the map, so the UI had no data path from a row to the
+    // contract behind it. That is what gates the attach affordance: roost rows
+    // advertise `attach: "native-remote"` and the card must NOT offer a terminal.
+    //
+    // Synthesized, never probed: roost has no `shed-ext-rc capabilities` to ask,
+    // so the answer is the constant contract this client implements against it.
+    // Stamped from the STATUS rows rather than a second read of the registry, so
+    // the keys can never disagree with the machines the same payload lists.
+    for m in &machine_status {
+        if let Some(name) = m.get("name").and_then(Value::as_str) {
+            capabilities.insert(
+                format!("machine:{name}"),
+                shed_app::roost::roost_capabilities(),
+            );
+        }
+    }
     // Shed rows are stamped with their origin too, so the UI has ONE rule for
     // identity and labelling instead of a machine special-case. `origin` is
     // injected client-side (like `host`/`shed` already are) — the hub wire is
@@ -300,13 +331,14 @@ pub struct Handler {
     /// The persisted prefs store, so `ui.set_ssh_approval` persists the chosen SSH
     /// prefs through the same path as the frontend command (both survive a restart).
     prefs: SharedPrefs,
-    /// Machine targets (plan 012 R4): one hub watcher per `machines:` entry, and
-    /// the sessions each reports. Reached over an SSH-forwarded hub rather than a
-    /// shed server's HTTP proxy — the second reach path the sessions view merges.
+    /// Machine targets (plan 013 S3): one roost watcher per `machines:` entry
+    /// (plus the implicit `localhost`), and the sessions each reports. Reached
+    /// through that machine's own `roost-session` rather than a shed server's
+    /// HTTP proxy — the second reach path the sessions view merges.
     machines: Arc<crate::machines::Machines>,
     /// Live activity for SHED rows, folded from each host's `/api/rc/events`.
-    /// Machine rows need no equivalent — they are read from their hub, which
-    /// knows activity already.
+    /// Machine rows need no equivalent — roost reports the agent axes on every
+    /// poll.
     live: Arc<crate::live_activity::LiveActivityLayer>,
     /// Monotonic token stamped onto each `sheds.refresh` so it can wait for the
     /// frontend to echo it back (a synchronous refresh — see [`Self::sheds_refresh`]).
@@ -443,7 +475,7 @@ impl Handler {
             "sidebar.dump" => Ok(self.sidebar_dump()),
             "machine.kill" => self.machine_kill(params).await,
             "machine.launch" => self.machine_launch(params).await,
-            "machine.capabilities" => self.machine_capabilities(params).await,
+            "machine.capabilities" => self.machine_capabilities(params),
             "machine.add" => self.machine_add(params),
             "agents.dump" => Ok(self.agents_dump()),
             "prefs.get" => Ok(self.prefs_get()),
@@ -751,8 +783,10 @@ impl Handler {
     /// command + resolved preset/invocation, WITHOUT spawning. `shed` (not `name`)
     /// matches the mac contract; gtk has no terminal.
     fn terminal_preview(&self, params: &Value) -> Result<Value, (String, String)> {
-        if let Some(machine) = params.get("machine").and_then(Value::as_str) {
-            return self.machine_terminal(machine, params);
+        // Any `machine` at all refuses — a non-string value is still a machine
+        // row asking for a terminal it cannot have (CodeRabbit review finding).
+        if params.get("machine").is_some_and(|m| !m.is_null()) {
+            return Err(machine_terminal_refusal());
         }
         let shed = req_str(params, "shed")?;
         self.terminal.preview(
@@ -771,15 +805,19 @@ impl Handler {
     /// resolved opener. DISABLED under test mode (spawning a terminal isn't
     /// hermetic — the harness drives terminal.preview instead).
     fn terminal_open(&self, params: &Value) -> Result<Value, (String, String)> {
+        // The machine refusal comes FIRST: it is true in every mode, and a
+        // "disabled in test mode" answer would tell a harness to retry the
+        // preview, which is refused for the same reason.
+        // Any `machine` at all refuses — a non-string value is still a machine
+        // row asking for a terminal it cannot have (CodeRabbit review finding).
+        if params.get("machine").is_some_and(|m| !m.is_null()) {
+            return Err(machine_terminal_refusal());
+        }
         if self.env.test_mode {
             return Err(err(
                 "not_enabled",
                 "terminal.open is disabled in test mode (use terminal.preview)",
             ));
-        }
-        if let Some(machine) = params.get("machine").and_then(Value::as_str) {
-            let cmd = self.machine_terminal_command(machine, params)?;
-            return self.terminal.spawn_command(&cmd, machine, params);
         }
         let shed = req_str(params, "shed")?;
         self.terminal.open(
@@ -792,28 +830,6 @@ impl Handler {
                 .and_then(Value::as_str)
                 .map(str::to_string),
         )
-    }
-
-    /// The `ssh -t … tmux attach` command for a MACHINE session, resolved
-    /// through the same watcher that owns the machine's config entry.
-    fn machine_terminal_command(
-        &self,
-        machine: &str,
-        params: &Value,
-    ) -> Result<shed_core::terminal::TerminalCommand, (String, String)> {
-        let slug = req_str(params, "slug")?;
-        self.machines
-            .terminal_command(machine, slug)
-            .map_err(|e| err("bad_request", e))
-    }
-
-    /// `terminal.preview {machine, slug}` → the resolved command WITHOUT
-    /// spawning, so the harness can assert the wire the opener would run.
-    fn machine_terminal(&self, machine: &str, params: &Value) -> Result<Value, (String, String)> {
-        let cmd = self.machine_terminal_command(machine, params)?;
-        self.terminal
-            .preview_command(&cmd, machine, params)
-            .map_err(|e| (e.0, e.1))
     }
 
     /// `terminal.presets` → the offerable presets + install detection.
@@ -919,12 +935,13 @@ impl Handler {
         self.ui_get("sidebar").unwrap_or(Value::Null)
     }
 
-    /// `machine.kill {machine, slug}` → kill a session on a machine.
+    /// `machine.kill {machine, slug}` → close a session on a machine (a roost
+    /// `tab.close`; the slug IS the tab id).
     ///
     /// Distinct from `rc.kill` because the addressing genuinely differs: a shed
     /// session is `(host, shed, slug)` through the server's SSH endpoint, a
-    /// machine session is `(machine, slug)` over the machine's own SSH. Folding
-    /// them into one op would mean passing an empty `shed` and having the
+    /// machine session is `(machine, slug)` over the machine's own roost reach.
+    /// Folding them into one op would mean passing an empty `shed` and having the
     /// backend guess which path was meant.
     async fn machine_kill(&self, params: &Value) -> Result<Value, (String, String)> {
         let machine = req_str(params, "machine")?.to_string();
@@ -937,9 +954,12 @@ impl Handler {
     }
 
     /// `machine.launch {machine, kind, display_name?, workdir?, permission_mode?,
-    /// initial_prompt?}` → the created `RcSession`. The machine counterpart of
+    /// initial_prompt?}` → the opened row. The machine counterpart of
     /// [`Self::rc_launch`], addressed by machine name over that machine's own
-    /// SSH rather than by `(host, shed)` through a server.
+    /// roost reach rather than by `(host, shed)` through a server.
+    ///
+    /// The full param set is still accepted; only `kind` and `workdir` reach
+    /// roost in M1 (see [`crate::machines::Machines::launch`]).
     async fn machine_launch(&self, params: &Value) -> Result<Value, (String, String)> {
         let machine = req_str(params, "machine")?.to_string();
         let kind = rc_kind(params)?;
@@ -958,13 +978,16 @@ impl Handler {
     }
 
     /// `machine.capabilities {machine}` → `{capabilities}` — what a create form
-    /// may offer for that machine, or `null` from an engine too old to say.
-    async fn machine_capabilities(&self, params: &Value) -> Result<Value, (String, String)> {
+    /// may offer for that machine.
+    ///
+    /// The SAME synthesized roost contract `rc.list` stamps under
+    /// `capabilities["machine:<name>"]`, not a second, probed answer that could
+    /// disagree with it. No SSH round-trip: roost has none to make.
+    fn machine_capabilities(&self, params: &Value) -> Result<Value, (String, String)> {
         let machine = req_str(params, "machine")?.to_string();
         let caps = self
             .machines
             .capabilities(&machine)
-            .await
             .map_err(|e| err("action_failed", e))?;
         Ok(json!({ "capabilities": caps }))
     }
@@ -1691,7 +1714,7 @@ mod tests {
             test_mode: true,
             mock_base_url: mock.map(str::to_string),
             mock_unreachable_hosts: std::collections::HashSet::new(),
-            machine_hub_ports: std::collections::HashMap::new(),
+            roost_sockets: std::collections::HashMap::new(),
             config_path: PathBuf::new(),
             socket_path: PathBuf::from("/run/user/0/shed-tauri/shed-tauri.sock"),
             host_agent_socket: PathBuf::from("/run/user/0/shed/host-agent.sock"),

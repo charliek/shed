@@ -219,29 +219,27 @@ fn set_terminal_pref(
 #[tauri::command]
 fn open_terminal(
     terminal: tauri::State<'_, termctl::SharedTerminal>,
-    machines: tauri::State<'_, Arc<machines::Machines>>,
     env: tauri::State<'_, Env>,
     shed: String,
     host: Option<String>,
     session: Option<String>,
     machine: Option<String>,
 ) -> Result<(), String> {
+    // A MACHINE session has NO terminal (plan 013 S3). Its rows come from a
+    // `roost-session`, whose capabilities advertise `attach: "native-remote"` —
+    // the terminal belongs to roost, and shed does not attach to it. The card
+    // hides the action; this is the server-side half of the same rule, so a
+    // caller that asks anyway is told why rather than being handed a tmux command
+    // for a session that has no tmux.
+    //
+    // Before the test-mode gate, and in the same order as the IPC op's: the
+    // refusal is true in every mode, and "use terminal.preview instead" would
+    // point at an op that refuses this for the same reason.
+    if machine.is_some() {
+        return Err(machines::NO_TERMINAL.to_string());
+    }
     if env.test_mode {
         return Err("terminal.open is disabled in test mode (use terminal.preview)".to_string());
-    }
-    // A MACHINE session resolves through the watcher that owns its config entry,
-    // not through a shed server — but from here down (preset, opener, spawn) the
-    // two are identical, because which terminal to open is a property of the
-    // user, not of what they are opening.
-    if let Some(machine) = machine.as_deref() {
-        let slug = session
-            .as_deref()
-            .ok_or_else(|| "a machine terminal needs the session slug".to_string())?;
-        let cmd = machines.terminal_command(machine, slug)?;
-        return terminal
-            .spawn_command(&cmd, machine, &serde_json::Value::Null)
-            .map(|_| ())
-            .map_err(|(_code, msg)| msg);
     }
     terminal
         .open(host.as_deref(), &shed, session.as_deref(), None, None)
@@ -311,9 +309,10 @@ async fn rc_kill(
         .map_err(|e| e.to_string())
 }
 
-/// Kill a session on a MACHINE (plan 012 R4) — addressed by `(machine, slug)`
-/// over that machine's own SSH, not by `(host, shed, slug)` through a server.
-/// The frontend routes to this via `killSession` in `lib/bridge.ts`.
+/// Kill a session on a MACHINE — a roost `tab.close` addressed by
+/// `(machine, slug)` over that machine's own reach, not by `(host, shed, slug)`
+/// through a server. The frontend routes to this via `killSession` in
+/// `lib/bridge.ts`.
 #[tauri::command]
 async fn machine_kill(
     machines: tauri::State<'_, Arc<machines::Machines>>,
@@ -324,19 +323,22 @@ async fn machine_kill(
 }
 
 /// `machine_capabilities` — what the launch dialog may offer for a machine.
+///
+/// Synthesized from the roost contract, not probed over SSH (plan 013 §3.2), so
+/// it answers instantly and for a machine that is currently asleep.
 #[tauri::command]
-async fn machine_capabilities(
+fn machine_capabilities(
     machines: tauri::State<'_, Arc<machines::Machines>>,
     machine: String,
 ) -> Result<serde_json::Value, String> {
     Ok(serde_json::json!({
-        "capabilities": machines.capabilities(&machine).await?,
+        "capabilities": machines.capabilities(&machine)?,
     }))
 }
 
-/// `machine_launch` — start a session on a MACHINE (plan 012 R4), the machine
-/// counterpart of [`rc_launch`]. Addressed by `(machine, …)` over that
-/// machine's own SSH rather than by `(host, shed, …)` through a server.
+/// `machine_launch` — start a session on a MACHINE, the machine counterpart of
+/// [`rc_launch`]: a roost `tab.open` running the kind's agent, addressed by
+/// `(machine, …)` rather than by `(host, shed, …)` through a server.
 #[tauri::command]
 #[allow(clippy::too_many_arguments)]
 async fn machine_launch(
@@ -1113,14 +1115,6 @@ pub fn run() {
             app.manage(coordinator.clone());
             app.manage(auth_modes);
 
-            // Machine targets (plan 012 R4): one hub watcher per `machines:`
-            // entry. Started here rather than lazily so a machine's rows are
-            // already live when the Agents pane first renders — and so an
-            // unreachable machine has had a chance to say WHY by then.
-            //
-            // Reads the same config the Backend does. With no `machines:`
-            // section this is empty and costs nothing, which is the state of
-            // every existing install.
             // **The machine RC activity hub, hosted by the app** (plan 012 R4).
             // Started regardless of broker mode: the role binds AS A LOCK, so a
             // daemon that already serves the port simply wins and this reports
@@ -1139,6 +1133,15 @@ pub fn run() {
             });
             app.manage(Arc::new(rc_hub));
 
+            // Machine targets (plan 013 S3): one roost watcher per `machines:`
+            // entry, plus the implicit `localhost` host. Started here rather than
+            // lazily so a machine's rows are already live when the Agents pane
+            // first renders — and so an unreachable machine has had a chance to
+            // say WHY by then.
+            //
+            // Reads the same config the Backend does. With no `machines:`
+            // section only the local session is watched, which costs nothing on
+            // an install that runs none.
             let machine_config_path = env.config_path.to_string_lossy().into_owned();
             // A machine coming up (or dropping) is asynchronous — nothing the UI
             // is already watching changes — so the layer pushes the SAME
@@ -1152,17 +1155,17 @@ pub fn run() {
             let machines = Arc::new(machines::Machines::start(
                 &tauri::async_runtime::handle().inner().clone(),
                 &shed_core::config::ShedConfig::load(&machine_config_path),
-                &env.machine_hub_ports,
+                &env.roost_sockets,
                 on_machine_change,
             ));
             app.manage(machines.clone());
 
             // Live activity for SHED sessions. Machine rows carry theirs already
-            // (the app reads those hubs directly); shed rows are listed by the
-            // one-shot, which by design never sets it — so without this the same
-            // list shows two different amounts of truth depending on how each row
-            // was fetched. Same `refresh` event, so both layers converge on one
-            // repaint path.
+            // (roost reports the agent axes on every poll); shed rows are listed
+            // by the one-shot, which by design never sets it — so without this
+            // the same list shows two different amounts of truth depending on
+            // how each row was fetched. Same `refresh` event, so both layers
+            // converge on one repaint path.
             let live_refresh = app.handle().clone();
             let live_activity = Arc::new(live_activity::LiveActivityLayer::start(
                 &tauri::async_runtime::handle().inner().clone(),
