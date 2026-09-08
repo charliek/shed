@@ -2,13 +2,15 @@
 //! merge, and the tmux env seams — the pure parts of
 //! `internal/ext/rc/watch.go` (plan 010 H4).
 //!
-//! A structured-signal watcher OVERRIDES the pane stability engine for the
-//! kinds that have one: instead of inferring activity from whether the tmux
-//! pane keeps redrawing, it reads the agent's own turn/tool structure directly.
-//! opencode is the one such kind — its watcher subscribes to the agent's
-//! embedded HTTP+SSE server. The hub merges a session's watcher with pane
-//! stability per session: a fresh, correlated watcher wins; a broken/absent one
-//! falls back to stability so activity never goes dark.
+//! A structured-signal watcher is the ONLY producer of activity left: instead
+//! of inferring activity from whether the tmux pane keeps redrawing (the
+//! pane-stability engine S2, `charliek/shed#324`, deleted), it reads the
+//! agent's own turn/tool structure directly. opencode is the one such kind —
+//! its watcher subscribes to the agent's embedded HTTP+SSE server. The hub's
+//! merge (see [`merged_activity`] below) has exactly two arms since S2: a
+//! fresh, correlated watcher wins; everything else — no watcher, a
+//! closed/unhealthy transport, a stale verdict — yields NO activity at all.
+//! There is no fallback engine left to hand off to.
 //!
 //! The codex JSONL tail, the cursor hook-ingest push lane and the shared line
 //! tailer they both sat on were removed with A6 (`charliek/shed#322`); the

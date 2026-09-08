@@ -352,15 +352,16 @@ func (w *opencodeWatcher) refresh(now time.Time) {
 // tail, a network watcher's settled verdict is authoritative ONLY while the transport is
 // healthy: the seed is applied, the stream is connected, and a frame (or heartbeat) landed
 // within ocFrameStaleWindow. When UNHEALTHY it returns BOTH fresh=false AND
-// expiredWorking=false — returning only fresh=false would let mergedActivity keep a stale
-// working verdict against a churning pane (watch.go:252-263); forcing expiredWorking=false
-// routes to the stability-drives branch (§3.6).
+// expiredWorking=false — returning only fresh=false would be equivalent (mergedActivity,
+// watch.go, has consulted only `fresh` since S2, charliek/shed#324, deleted the
+// pane-stability fallback `expiredWorking` used to be weighed against); both flags false
+// keeps the two together so a reader never has to check which one mergedActivity reads.
 func (w *opencodeWatcher) snapshot(now time.Time) (activity Activity, message string, fresh, expiredWorking bool) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	if w.closed {
 		// A closed watcher has revoked its authority (close() cleared connected/seedApplied):
-		// never report fresh, and force expiredWorking=false so pane-stability drives (fix #6).
+		// never report fresh, so mergedActivity reports NO activity at all (fix #6).
 		return w.curActivity, w.curMessage, false, false
 	}
 	healthy := w.seedApplied && w.connected
@@ -368,8 +369,9 @@ func (w *opencodeWatcher) snapshot(now time.Time) (activity Activity, message st
 		healthy = false // heartbeat-stale: the stream is wedged even if the socket has not errored
 	}
 	if !healthy {
-		// Disconnected / heartbeat-stale / seed-not-yet-applied: hand the verdict to
-		// pane-stability (both flags false — see the doc above).
+		// Disconnected / heartbeat-stale / seed-not-yet-applied: not fresh, so
+		// mergedActivity's not-fresh arm applies — no activity at all, not a fallback
+		// engine (both flags false — see the doc above).
 		return w.curActivity, w.curMessage, false, false
 	}
 	// Transport healthy: from here the ordinary quiet-source rule applies (watch.go).

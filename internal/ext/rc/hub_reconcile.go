@@ -239,8 +239,9 @@ func (h *Hub) reconcile() {
 			tr.watcher = newW
 		}
 		// Only a publishing watcher owns this field: a kind whose approvals are not lane-
-		// derived must keep whatever it holds (nothing — the pane-anchor kinds live in the
-		// separate field below) rather than be blanked by an unrelated tick.
+		// derived (claude-rc, codex, cursor — none has had one since S2, charliek/shed#324,
+		// deleted the pane-anchor episode) simply never populates it, rather than having it
+		// blanked by an unrelated tick.
 		if publishesApprovals {
 			tr.pendingApprovals = pendingApprovals
 		}
@@ -374,7 +375,8 @@ func (h *Hub) ensureWatcher(tr *trackedSession, s Session) sessionWatcher {
 
 	// A session with no valid recorded port — a pre-upgrade session created before the
 	// port plumbing shipped, or an out-of-range value — is unwatchable over this
-	// transport, so it falls back to pane stability (see opencodePortEnv).
+	// transport: no watcher is built, so the session simply carries no activity at all
+	// (there is no fallback engine to drive it instead; see opencodePortEnv).
 	port, ok := opencodePortEnv(h.cfg.runner, s.TmuxSession)
 	if !ok {
 		return nil

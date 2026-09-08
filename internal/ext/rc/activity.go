@@ -7,42 +7,46 @@ import (
 
 // Activity is a session's live work dimension, orthogonal to the lifecycle State.
 // State answers "is the session usable?" (starting/ready/needs-*/dead); Activity
-// answers "what is a usable session doing right now?" (working/idle/waiting). It is
-// derived live by the rc hub (Phase C) from JSONL tails and the pane-stability
-// engine, and rendered only when lifecycle permits (see DisplayActivity). Absent /
-// empty when the hub is not running or the kind is unsupported.
+// answers "what is a usable session doing right now?" (working/idle/waiting).
+// opencode's watcher is the ONLY producer left: A5 (charliek/shed#321) deleted the
+// claude transcript tail, A6 (charliek/shed#322) the codex JSONL tail, and S2
+// (charliek/shed#324) the pane-stability engine that used to fall back for every
+// kind. Every other kind's activity is simply absent, rendered only when lifecycle
+// permits (see DisplayActivity). Absent/empty when the hub is not running, the kind
+// has no producer, or the kind is unsupported.
 type Activity string
 
 const (
-	// ActivityWorking — the session is actively producing output (a JSONL turn is
-	// streaming, or the pane changed since the last capture).
+	// ActivityWorking — a turn or tool call is in flight, from opencode's own event
+	// stream (the JSONL-turn and pane-diff producers this once described are gone).
 	ActivityWorking Activity = "working"
-	// ActivityNeedsInput — the session is idle at a prompt anchor, waiting for the
-	// operator to type (a stable pane matching the kind's PromptAnchor).
+	// ActivityNeedsInput — opencode's last turn boundary was idle: the agent is
+	// waiting for the operator's next prompt (there is no prompt-anchor pane match
+	// any more — that mechanism went with the pane classifier in S2).
 	ActivityNeedsInput Activity = "needs_input"
-	// ActivityIdle — the session is quiescent with no prompt anchor visible
-	// (finished, or a kind with no anchor sitting still).
+	// ActivityIdle — reserved in the wire vocabulary for a settled "nothing
+	// pending" verdict. No current producer emits it: opencode's fold goes
+	// straight from ActivityWorking to ActivityNeedsInput.
 	ActivityIdle Activity = "idle"
-	// ActivityUnknown — a live session whose activity could not be determined yet
-	// (e.g. correlation to a JSONL file is still ambiguous). Distinct from empty,
-	// which means "no activity dimension at all" (hub absent / lifecycle trumps).
+	// ActivityUnknown — a live opencode session whose watcher has not yet
+	// confirmed which agent session belongs to this pane (see the SSE-only
+	// correlation in watch_opencode.go). Distinct from empty, which means "no
+	// activity dimension at all" (hub absent, no producer for this kind, or
+	// lifecycle trumps).
 	ActivityUnknown Activity = "unknown"
 
 	// ActivityNeedsApproval — the session is blocked on an approval the operator
-	// must answer. Two producers, one meaning (an open ask outranks the tool call it
-	// suspended: the model is not working, the operator is):
-	//   - the opencode watcher's fold, from that lane's native permission/question
-	//     events;
-	//   - reconcile's debounced ApprovalAnchor match on the pane, for the kinds whose
-	//     approvals never reach a protocol at all (codex, cursor) — it OVERRIDES the
-	//     watcher/stability merge, because for those kinds every other signal
-	//     describes the suspended work rather than the dialog on top of it.
+	// must answer. opencode is the ONLY producer: its watcher's fold, from that
+	// lane's native permission/question events (an open ask outranks the tool call
+	// it suspended — the model is not working, the operator is). Every other kind
+	// (claude-rc, codex, cursor) has no approvals producer at all since S2
+	// (charliek/shed#324) deleted the pane-anchor mechanism that used to derive an
+	// informational episode for them; they never report this activity.
 	//
 	// A needs_approval session does NOT necessarily carry pending_approvals: an
 	// opencode QUESTION blocks the session but is not addressable by the approvals
 	// verb, so the snapshot is legitimately empty and the client's affordance is
-	// "open the TUI". A pane-derived episode DOES carry an entry, but a decisionless
-	// one (approvals:"tui") — same affordance.
+	// "open the TUI".
 	ActivityNeedsApproval Activity = "needs_approval"
 )
 

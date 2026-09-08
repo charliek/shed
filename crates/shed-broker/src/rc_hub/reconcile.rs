@@ -474,7 +474,8 @@ impl Hub {
         let workdir = s.workdir.as_deref().unwrap_or("");
 
         // A session with no valid recorded port is unwatchable over this
-        // transport → pane stability drives.
+        // transport — no watcher is built, so the session simply carries no
+        // activity at all (there is no fallback engine to drive it instead).
         let port = opencode_port_env(&tmux, &s.tmux_session)?;
         // A prior back-written SHED_RC_AGENT_SESSION is the trusted pin;
         // "" means the watcher searches its SSE stream for the id.

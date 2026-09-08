@@ -977,8 +977,9 @@ pub enum LoopSignal {
 ///
 /// EVERY exit runs the same cleanup: Go reaches `h.shutdown` (`hub.go:848`)
 /// from the signal arm, the server-error arm, AND the idle-exit arm, and it
-/// closes the SSE subscribers + the session watchers (JSONL tails, opencode
-/// SSE clients) before returning. Only the graceful `srv.Shutdown` half is
+/// closes the SSE subscribers + the session watchers (opencode SSE clients —
+/// the only kind of watcher left since A6, `charliek/shed#322`, retired the
+/// codex JSONL tail) before returning. Only the graceful `srv.Shutdown` half is
 /// unported — the HTTP server's lifecycle belongs to [`serve`]'s embedder.
 pub fn run_reconcile_loop(hub: &Arc<Hub>, signals: &std::sync::mpsc::Receiver<LoopSignal>) {
     hub.reconcile(); // seed the list + fire appear events before the first tick

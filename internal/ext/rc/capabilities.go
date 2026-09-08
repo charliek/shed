@@ -26,11 +26,17 @@ const CapabilityVersion = 4
 //   - serve — `shed-ext-rc serve` runs the resident rc activity hub (loopback HTTP:
 //     GET /v1/sessions + SSE /v1/events), spawned on demand and self-exiting.
 //   - activity — sessions carry the live activity dimension (activity/activity_at/
-//     last_message inside the rc block) derived by the hub.
-//   - messages — the hub serves the codex message feed (GET /v1/sessions/{slug}/
-//     messages + the message.appended SSE event) and gated feed input (POST
-//     /v1/sessions/{slug}/input). Per-kind availability is in kind_features
-//     (watch / input); this token says the endpoints exist on this binary.
+//     last_message inside the rc block), derived by the hub for opencode's lane only
+//     — the only kind with an activity producer since S2 (charliek/shed#324) deleted
+//     the pane-stability engine and the claude/codex tails that fed it; every other
+//     kind's session simply omits these fields.
+//   - messages — the hub serves a normalized message feed (GET /v1/sessions/{slug}/
+//     messages + the message.appended SSE event) and the turn/interrupt/approvals
+//     verbs, live for opencode's lane only today. Per-kind availability is in
+//     kind_features (watch / input / feed); this token says the endpoints exist on
+//     this binary. POST /v1/sessions/{slug}/input predates this token and now
+//     answers 409 not_accepting for every kind — no kind is "gated" any more
+//     (A6/S2, charliek/shed#322 / #324).
 //   - contract-v2 — the v2 wire contract: `lane` on every session DTO, the
 //     feed/interrupt/attach hints in kind_features, the turn/interrupt/approvals hub
 //     verbs (routed and fully specified — live for a kind whose kind_features row
@@ -64,15 +70,18 @@ type AgentInfo struct {
 //     `watch == (feed == "messages")` in lockstep (invariant-tested in
 //     capabilities_test.go), so a v1 client reading watch and a v2 client reading
 //     feed see the same thing. Removed once no client reads it.
-//   - input — the feed-input posting mode, SINGLE-VALUED: "gated" means POST /input is
-//     accepted only while the session is waiting (the hub's acceptance re-check),
-//     "turn" means the lane takes whole turns through POST /turn (and POST /input no
-//     longer applies — opencode today), "" means no feed input at all (the TUI-only
-//     post_input path still applies).
+//   - input — the feed-input posting mode, SINGLE-VALUED: "turn" means the lane takes
+//     whole turns through POST /turn (opencode today; POST /input does not apply to
+//     it), "" means no feed input at all (every other kind; the TUI-only post_input
+//     path still applies). A third value, "gated", meant POST /input was accepted
+//     unless the agent was blocked on a decision; it was retired with the codex and
+//     cursor lanes (A6, charliek/shed#322) and no kind carries it any more — POST
+//     /input answers 409 not_accepting for every kind.
 //   - feed — what the hub can stream for the kind: "messages" (a normalized
 //     conversation feed: GET /messages + message.appended), "activity" (the activity
-//     dimension only — the stability/transcript engines derive it, but there is no
-//     message feed), or "none" (no hub signal at all).
+//     dimension only, no message feed — reserved for a kind with an activity producer
+//     but no message feed; none does today), or "none" (no hub signal at all —
+//     claude-rc/codex/cursor, since A6/S2 retired their producers).
 //   - interrupt — the interrupt verb is supported (opencode today; false elsewhere).
 //   - attach — how a terminal reaches the session: "tmux" (attach to the rc-tmux
 //     session), "native-remote" (the agent's own remote surface), or "none".

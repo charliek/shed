@@ -80,6 +80,37 @@ is retired and rejected by release-plan.sh). release-plan.sh never reads an
   unconditionally, instead of tripping the "no historical basis" hard error a
   brand-new component would otherwise hit on its first run. Components not on
   that list keep the hard error.
+- **shed speaks roost's session protocol 4 and stops polling** (plan 014).
+  `roost-ipc` bumps to roost's R1 daemon; `RoostWatcher` swaps `tab.list`
+  polling for roost's leaseless **observer event stream** — subscribing takes
+  no lease, so watching a session never contests it, and a takeover
+  reclassifies the stream in place (`session.driver_changed`) instead of
+  ending it. `SHED_ROOST_POLL_MS` and the poll cadence are gone; a snapshot is
+  pushed only when a row actually changes.
+- **The claude, codex, and cursor RC lanes are demolished**
+  (`charliek/shed#321`, `#322`, `#324`). shed's own claude transcript tail,
+  codex JSONL tail, the cursor hook-ingest endpoint
+  (`POST /v1/ingest/cursor`) and its hook preseeding, and the pane-anchor
+  classifier + stability engine are all deleted — in both the Go guest hub and
+  the Rust broker/machine hub — because roost now derives status for these
+  kinds instead of a second, independently buggy shed-side derivation of the
+  same thing. `kind_features` for `claude-rc`/`codex`/`cursor` becomes
+  `{post_input: true, approvals: "tui", watch: false, input: "", feed: "none",
+  interrupt: false, attach: "tmux"}`; `POST /v1/sessions/{slug}/input` answers
+  `409 not_accepting` for every kind — no kind is `gated` any more, and
+  opencode steers through the `turn` verb instead. A shed row's `state` is now
+  pure **liveness** (`ready` while its tmux session exists); `activity`
+  survives only for opencode's lane.
+- **`create --wait` and `prompt` wait for liveness, then settle, before
+  delivering a kickoff.** With no classifier left to confirm a composer is
+  actually drawn, `--wait` treats a successful pane capture as live and then
+  holds for a further settle window (plus a short delivery pause) before
+  typing, and both `--wait` and the one-shot `prompt` verb refuse to deliver
+  while a claude or codex trust/bypass dialog is on the pane. This is a real
+  behavior change: delivery confirms only that no *known* one-time dialog is
+  showing, not that the target is genuinely a live composer — an auth screen
+  or an agent's own approval modal is no longer detected. Accepted as an
+  interim hazard until the roost provider script (S4) owns kickoff end to end.
 
 ## v0.8.2 — 2026-08-17
 

@@ -235,10 +235,15 @@ impl RcState {
 /// A session's live *work* dimension, orthogonal to the lifecycle [`RcState`].
 /// Derived live by the rc hub and reported additively inside a session's `rc`
 /// block. Mirrors the guest's `rc.Activity` (`internal/ext/rc/activity.go`) and
-/// mobile's `RcActivity` (`rc_models.dart:125-147`): `working` (producing
-/// output), `needs_input` (idle at a prompt anchor), `needs_approval` (blocked
-/// on an approval the user must answer), `idle` (quiescent), and `unknown` (live
-/// but indeterminate).
+/// mobile's `RcActivity` (`rc_models.dart:125-147`): `working` (a turn or tool
+/// call in flight), `needs_input` (opencode's last turn boundary was idle,
+/// waiting for the next prompt — there is no prompt-anchor pane match any
+/// more), `needs_approval` (blocked on an approval the user must answer),
+/// `idle` (a settled "nothing pending" verdict, reserved in the vocabulary —
+/// no current producer emits it), and `unknown` (live but indeterminate).
+/// opencode is the only producer since A5/A6/S2
+/// (`charliek/shed#321`/`#322`/`#324`) retired the claude/codex tails and the
+/// pane-stability engine that used to fill this dimension for every kind.
 ///
 /// Deliberately NO `Other(String)` case (unlike [`RcKind`]'s unknown-kind
 /// policy): an UNRECOGNIZED token — any future value — maps to
@@ -456,23 +461,30 @@ pub struct RcAgentInfo {
 /// where approvals surface (`"tui"` — answered in the terminal; `"remote"` —
 /// answered through the hub's `POST /approvals/{id}` verb, opencode today).
 ///
-/// `watch` and `input` are additive hub hints (the feed kinds — codex and
-/// opencode — carry them; absent → `false` / `""`): `watch` reports whether the
-/// hub produces a live message feed for the kind (`GET /messages` +
-/// `message.appended`), and `input` is the feed-input posting **mode string**,
-/// single-valued — `"gated"` means `POST /input` is accepted only while the
-/// session is waiting, `"turn"` means the lane takes whole turns through `POST
-/// /turn` (and `/input` no longer applies — opencode today), `""` means no feed
-/// input at all. Note
-/// the distinction from the adjacent `post_input`: `post_input` is the
-/// typed-input *capability* bool (a typed line reaches the pane over the
-/// TUI-only path), while `input` is the *gating mode* of the separate feed-input
-/// channel — a kind can have `post_input: true` with no feed input at all.
+/// `watch` and `input` are additive hub hints (opencode's lane carries them;
+/// absent → `false` / `""` for every other kind — claude-rc, codex and cursor
+/// have had no hub-derived feed since A6/S2, `charliek/shed#322`/`#324`
+/// retired their producers): `watch` reports whether the hub produces a live
+/// message feed for the kind (`GET /messages` + `message.appended`), and
+/// `input` is the feed-input posting **mode string**, single-valued —
+/// `"turn"` means the lane takes whole turns through `POST /turn` (opencode;
+/// `/input` does not apply to it), `""` means no feed input at all (every
+/// other kind). A third value, `"gated"`, meant `POST /input` was accepted
+/// only while the session was waiting; it was retired with the codex and
+/// cursor lanes (A6) and no kind carries it any more — `POST /input` answers
+/// `409 not_accepting` for every kind. Note the distinction from the adjacent
+/// `post_input`: `post_input` is the typed-input *capability* bool (a typed
+/// line reaches the pane over the TUI-only path), while `input` is the
+/// *gating mode* of the separate feed-input channel — a kind can have
+/// `post_input: true` with no feed input at all.
 ///
 /// Contract v2 adds three more (again serde-default, so a v1/v3 payload decodes
 /// unchanged): `feed` is what the hub can stream for the kind (`"messages"` — a
-/// normalized conversation feed; `"activity"` — the activity dimension only;
-/// `"none"`), `interrupt` reports the `turn/interrupt` verb (true for opencode,
+/// normalized conversation feed, opencode only today; `"activity"` — the
+/// activity dimension only, no message feed, reserved for a kind with an
+/// activity producer and no feed — none does today; `"none"` — no hub signal
+/// at all, claude-rc/codex/cursor since A6/S2 retired their producers),
+/// `interrupt` reports the `turn/interrupt` verb (true for opencode,
 /// false elsewhere), and `attach` is how a terminal reaches the session (`"tmux"`,
 /// `"native-remote"`, `"none"`). **`watch` is DEPRECATED by `feed`** — the guest
 /// holds `watch == (feed == "messages")` in lockstep (invariant-tested on the
@@ -519,9 +531,12 @@ fn is_false(b: &bool) -> bool {
 }
 
 impl RcKindFeatures {
-    /// Whether feed input is gated (`input == "gated"`) — a watch view's input
-    /// bar is only ever enabled for a gated kind waiting for input. Mirrors
-    /// mobile's `KindFeatures.inputGated` (`rc_capabilities.dart:136`).
+    /// Whether feed input is gated (`input == "gated"`). No kind advertises
+    /// `"gated"` any more — it was retired with the codex and cursor lanes
+    /// (A6, `charliek/shed#322`); this decoder stays only because the wire may
+    /// still carry the value from an older guest, and a client must decode it
+    /// without erroring. Mirrors mobile's `KindFeatures.inputGated`
+    /// (`rc_capabilities.dart:136`).
     pub fn input_gated(&self) -> bool {
         self.input == "gated"
     }
@@ -1204,9 +1219,11 @@ pub fn decode_list_response(stdout: &str) -> Result<RcSessionListDto, RcError> {
 
 // ---- rc hub messages feed ----
 //
-// The codex message feed served by the rc hub through the server proxy
+// The message feed served by the rc hub through the server proxy
 // (`GET /api/sheds/{name}/rc/v1/sessions/{slug}/messages`,
-// `internal/api/rchub.go:280-375`). Mirrors the guest's `feedMessage` /
+// `internal/api/rchub.go:280-375`) — opencode's lane only since A6/S2
+// (`charliek/shed#322`/`#324`) retired the codex and claude tails that used to
+// share this route. Mirrors the guest's `feedMessage` /
 // `hubMessagesResponse` (`internal/ext/rc/hub_messages.go:44-201`,
 // handler `hub.go:332-385`) and mobile's decoder (`rc_feed.dart`): each
 // message is already hub-sanitized (ANSI/control-stripped, per-field capped),

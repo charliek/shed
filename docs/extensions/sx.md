@@ -174,8 +174,9 @@ The `WATCH` column is capability-aware (see
 
 | What the `list` envelope carried | `WATCH` |
 |---|---|
-| A `kind_features` row with a message feed | `feed` |
-| A `kind_features` row without one | `activity` |
+| A `kind_features` row with `feed: "messages"` | `feed` |
+| A `kind_features` row with `feed: "none"` (claude-rc, codex, cursor today — no hub signal at all) | `-` |
+| A `kind_features` row with any other `feed` value (e.g. an older guest's `"activity"`) | `activity` |
 | No row for that kind (`shell`, `claude-broker`) | `-` |
 | No `capabilities` block at all (an older RC binary) | `?`, plus a note naming the target |
 

@@ -124,8 +124,12 @@ simply not running a hub is the everyday case, and it must never fail the sessio
 ### Sessions from roost
 
 Plan 013 (the Roost Pivot) re-points the section above: a machine row's sessions come
-from that machine's `roost-session` daemon, not the RC hub — polled every 2 s until
-roost's own live push (roost R1) lands. A configured machine reaches it over roost's SSH
+from that machine's `roost-session` daemon, not the RC hub. Plan 014 replaced the
+2 s poll with roost's leaseless **observer event stream** (session protocol 4, roost
+R1): the watcher holds one subscription per cycle and pushes a snapshot only when a
+row actually changes, so there is no polling cadence left (`SHED_ROOST_POLL_MS` no
+longer exists) — a takeover reclassifies the stream (`session.driver_changed`) rather
+than ending it. A configured machine reaches it over roost's SSH
 bridge; an implicit **`localhost`** host is also listed once a local `roost-session`
 socket has existed in this process (release path
 `$XDG_RUNTIME_DIR/roost-session/roost.sock`, macOS

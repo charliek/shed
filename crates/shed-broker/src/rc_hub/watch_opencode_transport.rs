@@ -2,8 +2,9 @@
 //! `internal/ext/rc/watch_opencode_transport.go`.
 //!
 //! [`OpencodeWatcher`] is the SSE/REST-backed [`SessionWatcher`] for an
-//! opencode session. Unlike the codex/claude file watchers — which tail a
-//! durable append-only JSONL file — opencode is client/server: the bare TUI
+//! opencode session — the only one left since A5/A6 (`charliek/shed#321`/
+//! `#322`) retired the codex and claude file watchers, which tailed a durable
+//! append-only JSONL file. opencode is client/server instead: the bare TUI
 //! runs an embedded HTTP+SSE server on a per-session port
 //! (`SHED_RC_OPENCODE_PORT`, stamped at create), and this watcher subscribes
 //! to that server's `/event` stream (plus a REST seed) as a SECOND client.
@@ -761,15 +762,17 @@ impl SessionWatcher for OpencodeWatcher {
     /// applied, the stream is connected, and a frame (or heartbeat) landed
     /// within [`OC_FRAME_STALE_WINDOW`]. When UNHEALTHY it returns BOTH
     /// fresh=false AND expired_working=false — returning only fresh=false
-    /// would let mergedActivity keep a stale working verdict against a
-    /// churning pane; forcing expired_working=false routes to the
-    /// stability-drives branch (§3.6).
+    /// would be equivalent (`merged_activity` has consulted only `fresh`
+    /// since S2, `charliek/shed#324`, deleted the pane-stability fallback
+    /// `expired_working` used to be weighed against); both flags false keeps
+    /// the two together so a reader never has to check which one
+    /// `merged_activity` reads.
     fn snapshot(&self, now: DateTime<Utc>) -> (RcActivity, String, bool, bool) {
         let w = self.lock();
         if w.closed {
             // A closed watcher has revoked its authority (close() cleared
-            // connected/seed_applied): never report fresh, and force
-            // expired_working=false so pane-stability drives (fix #6).
+            // connected/seed_applied): never report fresh, so merged_activity
+            // reports NO activity at all (fix #6).
             return (w.cur_activity, w.cur_message.clone(), false, false);
         }
         let mut healthy = w.seed_applied && w.connected;
@@ -782,6 +785,9 @@ impl SessionWatcher for OpencodeWatcher {
             }
         }
         if !healthy {
+            // Disconnected / heartbeat-stale / seed-not-yet-applied: not
+            // fresh, so merged_activity's not-fresh arm applies — no activity
+            // at all, not a fallback engine.
             return (w.cur_activity, w.cur_message.clone(), false, false);
         }
         // Transport healthy: from here the ordinary quiet-source rule applies.

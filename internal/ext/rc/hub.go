@@ -280,12 +280,13 @@ func (h *Hub) handleSessions(w http.ResponseWriter, _ *http.Request) {
 		// pending_approvals is a HUB-LAYER overlay (the one-shot List above never
 		// sets it): the open-approval snapshot that keeps a session actionable after
 		// the feed ring evicted the rows announcing them. Reconcile republishes
-		// tr.pendingApprovals each tick from the lane that knows its approvals
-		// (opencode today) and tracks the pane-anchor kinds' episode separately;
-		// approvalSnapshot unions the two. For a kind with neither it stays empty and
-		// omitempty drops the field. Copied, never aliased: the response row must not
-		// share a slice with live hub state. An empty snapshot copies to nil, which
-		// omitempty drops — hence no guard.
+		// tr.pendingApprovals each tick from the lane that knows its approvals —
+		// opencode, the only one since S2 (charliek/shed#324) deleted the pane-anchor
+		// episode the other kinds used to carry — and approvalSnapshot is just that
+		// published slice now. For a kind with none it stays empty and omitempty
+		// drops the field. Copied, never aliased: the response row must not share a
+		// slice with live hub state. An empty snapshot copies to nil, which omitempty
+		// drops — hence no guard.
 		sessions[i].PendingApprovals = copyApprovals(tr.approvalSnapshot())
 	}
 	h.trackMu.Unlock()
@@ -606,8 +607,9 @@ func (h *Hub) shutdown(srv *http.Server) error {
 	return nil
 }
 
-// closeAllWatchers releases every tracked session's watcher — a JSONL tail (codex)
-// or an opencode SSE client (hub shutdown).
+// closeAllWatchers releases every tracked session's watcher — an opencode SSE client,
+// the only kind of watcher left since A6 (charliek/shed#322) retired the codex JSONL
+// tail (hub shutdown).
 func (h *Hub) closeAllWatchers() {
 	h.trackMu.Lock()
 	defer h.trackMu.Unlock()

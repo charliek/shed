@@ -13,15 +13,17 @@ import (
 	"github.com/fsnotify/fsnotify"
 )
 
-// The structured-signal watchers are the source that OVERRIDES the pane stability engine
-// for the kinds that have one: instead of inferring activity from whether the tmux pane
-// keeps redrawing, they read the agent's own turn/tool structure directly.
+// The structured-signal watcher is the ONLY producer of activity left: instead of
+// inferring activity from whether the tmux pane keeps redrawing (the pane-stability
+// engine S2, charliek/shed#324, deleted), it reads the agent's own turn/tool structure
+// directly.
 //
 // opencode is the one such kind today: its sessionWatcher (opencodeWatcher,
 // watch_opencode_transport.go) subscribes to the agent's embedded HTTP+SSE server (see
-// watchableKind below). The hub merges a session's watcher with pane stability per
-// session (see hub_reconcile.go): a fresh, correlated watcher wins; a broken/absent one
-// falls back to stability so activity never goes dark.
+// watchableKind below). The hub's merge (see hub_reconcile.go, mergedActivity below)
+// has exactly two arms since S2: a fresh, correlated watcher wins; everything else — no
+// watcher, a closed/unhealthy transport, a stale verdict — yields NO activity at all.
+// There is no fallback engine left to hand off to.
 //
 // The codex JSONL tail, the cursor hook-ingest push lane and the shared line tailer they
 // both sat on were removed with A6 (charliek/shed#322) — roost is the status authority
@@ -96,7 +98,9 @@ type sessionWatcher interface {
 	// stamps the last-event time used by the freshness decision (see snapshot).
 	refresh(now time.Time)
 	// snapshot reports the watcher's activity + message and its authority at now; see
-	// watcherFreshness for the fresh/expiredWorking contract reconcile relies on.
+	// watcherFreshness for the fresh/expiredWorking contract. reconcile only consults
+	// fresh (see mergedActivity) — expiredWorking survives for the watchers' own
+	// bookkeeping and is asserted by their tests, not by reconcile.
 	snapshot(now time.Time) (activity Activity, message string, fresh, expiredWorking bool)
 	// drainPending returns and clears the feed messages produced since the last drain.
 	drainPending() []feedMessage
@@ -161,9 +165,10 @@ func mergedActivity(watcherActivity Activity, watcherMessage string, watcherFres
 
 // watchableKind reports whether a kind has a structured-signal watcher. opencode is the
 // only one: it subscribes to its embedded HTTP+SSE server
-// (watch_opencode_transport.go). Every other kind derives activity from pane stability
-// alone — A6 (charliek/shed#322) retired the codex rollout tail and the cursor
-// hook-ingest lane, and A5 (charliek/shed#321) the claude transcript tail before it.
+// (watch_opencode_transport.go). Every other kind has NO activity source at all — A6
+// (charliek/shed#322) retired the codex rollout tail and the cursor hook-ingest lane,
+// A5 (charliek/shed#321) the claude transcript tail before them, and S2
+// (charliek/shed#324) the pane-stability fallback beneath all three.
 func watchableKind(k Kind) bool {
 	return k == KindOpencode
 }

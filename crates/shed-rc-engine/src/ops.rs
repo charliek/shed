@@ -187,9 +187,11 @@ pub fn capture_pane_checked(tmux: &Tmux, name: &str) -> Result<String, EngineErr
     checked_capture(tmux.capture_pane(name), name)
 }
 
-/// The VISIBLE-FRAME twin (`captureVisiblePaneChecked`, `ops.go:373`), same
-/// error mapping — used wherever scrollback would be a lie about the present
-/// (the ApprovalAnchor evaluations).
+/// The VISIBLE-FRAME twin, same error mapping — used wherever scrollback
+/// would be a lie about the present (the ApprovalAnchor evaluations, before
+/// S2, `charliek/shed#324`, deleted them). Go's `captureVisiblePaneChecked`
+/// (`ops.go:373`) went with its last caller; this one is kept as a transport
+/// primitive alongside [`Tmux::capture_visible_pane`].
 pub fn capture_visible_pane_checked(tmux: &Tmux, name: &str) -> Result<String, EngineError> {
     checked_capture(tmux.capture_visible_pane(name), name)
 }

@@ -24,7 +24,10 @@
 //!
 //! - [`messages`] — the per-session feed ring + wire vocabulary
 //!   (`hub_messages.go`) and the `activity.go` text-hygiene helpers.
-//! - [`stability`] — the pane-stability engine + normalizers (`stability.go`).
+//! - `stability` — the pane-stability engine + normalizers (`stability.go`) that used
+//!   to derive a baseline activity for every kind lacking a structured watcher;
+//!   deleted in S2 (`charliek/shed#324`) along with the pane classifier it fed and
+//!   consulted. opencode's watcher is the only activity producer left.
 //! - [`watch`] — the watcher freshness rule, the `mergedActivity` precedence
 //!   merge, the fold contracts, and the tmux env seams (`watch.go`'s pure
 //!   parts). The JSONL line tailer (`tail`), the codex fold + correlation
@@ -47,9 +50,10 @@
 //! - Hub core I (H9): [`hub`] — config resolution, the four-lock `Hub` state,
 //!   the per-slug input locks, the `inputAccepted` seven-arm gate, and the
 //!   idle-exit decision (`hub.go`'s core); [`reconcile`] — the heartbeat:
-//!   `trackedSession`, the pane-anchor debounce, `approvalSnapshot`,
-//!   `ensureWatcher` (`hub_reconcile.go`); [`events`] — event payloads +
-//!   frame encoding + the subscriber fan-out (`hub_events.go`).
+//!   `trackedSession`, `approvalSnapshot`, `ensureWatcher` (`hub_reconcile.go`;
+//!   the pane-anchor debounce it also carried went with S2, `charliek/shed#324`);
+//!   [`events`] — event payloads + frame encoding + the subscriber fan-out
+//!   (`hub_events.go`).
 //! - Hub core II (H10): the **axum 0.8 HTTP shell** per plan 010 s2.2 — the
 //!   Router is served from a hand-rolled accept loop over hyper's http1
 //!   connection with the Go per-connection posture, and contract-shaped body

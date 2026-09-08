@@ -294,8 +294,9 @@ func (h *Hub) handleInterrupt(w http.ResponseWriter, r *http.Request) {
 
 // handleApproval serves POST /v1/sessions/{slug}/approvals/{id}. A kind that answers
 // approvals on the pane (kind_features.approvals == "tui") is rejected 409
-// not_supported before any lookup — including for the informational `pane-*` ids the
-// pane-anchor kinds publish, which are deliberately not remotely resolvable.
+// not_supported before any lookup — claude-rc, codex, and cursor never publish an
+// approval row at all since S2 (charliek/shed#324) deleted the pane-anchor mechanism
+// that used to mint their informational, never-remotely-resolvable `pane-*` ids.
 func (h *Hub) handleApproval(w http.ResponseWriter, r *http.Request) {
 	var req approvalRequest
 	if !decodeHubBody(w, r, &req) {

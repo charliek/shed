@@ -217,8 +217,11 @@ impl<'a> Tmux<'a> {
     /// scrollback is history — an approval dialog that was answered (or crashed
     /// past, or reflowed away) stays there verbatim, so an anchor evaluated
     /// against [`Self::capture_pane`] could report a dialog forever. The visible
-    /// frame IS the present tense. Consumers: the hub's approval anchors + the
-    /// pane-anchor episodes (plan 010).
+    /// frame IS the present tense. S2 (`charliek/shed#324`) removed its
+    /// consumers — the hub's approval anchors and the pane-anchor episodes —
+    /// and nothing calls this today; the Go twin (`tmux.go:81-84`) deleted
+    /// `captureVisiblePane` outright for the same reason, but the Rust one is
+    /// kept as a transport primitive (no unused-`pub`-fn lint pressure here).
     pub fn capture_visible_pane(&self, name: &str) -> TmuxResult {
         self.run(&["capture-pane", "-t", name, "-p"])
     }
