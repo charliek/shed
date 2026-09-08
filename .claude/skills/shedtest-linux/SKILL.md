@@ -145,6 +145,37 @@ docker run --rm -v "$ROOT:/repo:ro" -v "$HOST_OUT:/out" \
   `rc.list` shows `localhost` absent, that is the first thing to check — an unconnectable
   socket is indistinguishable from "no session" by design.
 
+### `tauri-test-linux` does not lint — CI does, on a Mac
+
+`make tauri-test-linux` runs the Tauri crate's `cargo test`; it does **not** run
+`cargo clippy`. CI's clippy for that crate lives in the **`tauri-mac`** job
+(`make tauri-lint`), so a platform-independent lint — `type_complexity` on a test
+helper, say — passes every Linux gate here and fails CI on macOS. Plan 014 lost a
+round trip to exactly that.
+
+Linux clippy on this crate cannot stand in for it: `src/tray.rs` and the
+`zbus::proxy` macro in `src/approval.rs` carry three pre-existing Linux-only
+findings, so `-D warnings` is red there before you change anything. Use it as a
+*filter* rather than a gate — run it and check your own file is absent from the
+output:
+
+```bash
+docker run --rm -v "$PWD:/repo:ro" \
+  -v shed-tauri-linux-cargo:/usr/local/cargo/registry \
+  -v shed-tauri-linux-cargo-git:/usr/local/cargo/git \
+  -v shed-tauri-linux-target:/target -w /repo -e CARGO_TARGET_DIR=/target \
+  shed-tauri-linux:latest bash -lc 'set -e; mkdir -p /work; \
+    tar -C /repo --exclude=.git --exclude=target --exclude=node_modules \
+      -cf - crates desktop/tauri desktop/tools desktop/Resources \
+      desktop/pyproject.toml desktop/uv.lock | tar -C /work -xf -; \
+    cd /work/desktop/tauri/src-tauri && cargo clippy --locked --all-targets 2>&1 \
+      | grep -E "^ *--> " '
+```
+
+The definitive check is `make -C desktop tauri-lint` on a Mac (see the
+`mac-mini` recipe in the mac skill); it needs `make sparkle-framework` staged
+first.
+
 ### The daemon must speak session protocol 4
 
 Since plan 014 shed pins `roost-ipc` at `c67ac27b6a85dbee0871f32d49c1566cc068d1c8` and

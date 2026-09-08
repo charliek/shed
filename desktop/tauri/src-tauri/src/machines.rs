@@ -1240,6 +1240,13 @@ mod tests {
         );
     }
 
+    /// Every `(reachable, detail)` pair the machine layer published, in order.
+    ///
+    /// Named because clippy asks, but the name earns its place: this is a
+    /// history, not a sample, and that distinction is the whole point of the
+    /// test below.
+    type PublishedStates = Arc<Mutex<Vec<(bool, Option<String>)>>>;
+
     /// **No unreachable state is ever PUBLISHED across a resync** — the claim a
     /// periodically-sampled test can only approximate.
     ///
@@ -1264,7 +1271,7 @@ mod tests {
         let state: Arc<Mutex<BTreeMap<String, MachineState>>> = Arc::new(Mutex::new(
             BTreeMap::from([("mini3".to_string(), MachineState::new(true))]),
         ));
-        let history: Arc<Mutex<Vec<(bool, Option<String>)>>> = Arc::new(Mutex::new(Vec::new()));
+        let history: PublishedStates = Arc::new(Mutex::new(Vec::new()));
         let on_change: OnChange = {
             let state = Arc::clone(&state);
             let history = Arc::clone(&history);
