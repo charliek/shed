@@ -41,8 +41,9 @@ use super::ops::GetEnv;
 use super::preseed::PreseedError;
 
 /// The sibling-lock suffix. **A cross-implementation literal** (`trust.go:122`):
-/// mutual exclusion between a Go `shed-machine-rc` and a Rust `sx` merging the
-/// same file depends on both opening the same lock path.
+/// mutual exclusion between the guest `shed-ext-rc` and this engine (embedded
+/// in the hub) merging the same file depends on both opening the same lock
+/// path.
 pub const LOCK_SUFFIX: &str = ".shed-ext-rc.lock";
 
 /// `os.CreateTemp` pattern for the claude config rewrite (`trust.go:112`) — the

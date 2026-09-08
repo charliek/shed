@@ -129,7 +129,7 @@ impl GoValue {
 /// The cap is load-bearing rather than cosmetic. The parser below is plain
 /// recursive descent, so an uncapped hostile (or merely corrupt)
 /// `~/.claude.json` runs it off the end of the thread stack — and a Rust stack
-/// overflow is not a catchable error but a SIGABRT, killing the whole `sx`
+/// overflow is not a catchable error but a SIGABRT, killing the whole engine
 /// process where Go merely declines the preseed and lets the create carry on.
 /// Capping alone is not sufficient, though: 10000 accepted frames still need a
 /// stack far larger than any default, which is why every preseed runs on the

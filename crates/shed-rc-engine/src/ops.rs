@@ -87,7 +87,7 @@ pub const ENV_NO_HUB: &str = "SHED_RC_NO_HUB";
 /// Deliberately the Go guest binary's token even here, because it is a pure
 /// port-fidelity value: every real CLI supplies its own provenance
 /// (`clirc.go:307` always passes `cfg.DefaultCreatedBy` — the bare prog name, so
-/// `shed-ext-rc` / `shed-machine-rc` / `sx`), so this fallback is only ever seen
+/// `shed-ext-rc` / `shed-machine-rc`), so this fallback is only ever seen
 /// by a library caller that forgot one, and a differential harness must see the
 /// same string on both sides if it ever is. NOT to be confused with
 /// [`shed_core::rc::TOOL_NAME`], which is the CLIENT's (`shed-desktop`) token.

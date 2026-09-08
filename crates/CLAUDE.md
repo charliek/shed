@@ -23,15 +23,15 @@ re-implemented per language. The root `CLAUDE.md` owns the monorepo layout + rel
   `roost-session` through. A bare `cargo test`/`clippy` run against `shed-app` **alone**
   (`-p shed-app`, no `--features`) skips the `rc`/`broker` modules — cover them with
   `-p shed-app --features rc` and `-p shed-app --features broker` (or `broker,rc`
-  together). A workspace-level `cargo test`/`clippy --workspace` already pulls `rc` in
-  via `sx`'s feature unification (see the note below) — `broker` still needs the explicit
-  leg either way.
+  together). Since `sx` was sunset in plan 016 (S7, #329), nothing in this workspace
+  enables `rc` by default any more — the explicit `-p shed-app --features rc` leg
+  (see the note below) is the ONLY coverage for it, same as `broker`.
 - **`shed-rc-engine`** — the one-shot Remote-Control engine ported from the Go guest
   binary (plan 009), graduated out of shed-app at its second consumer (plan 010:
   shed-broker's `rc_hub` — a broker→shed-app dep would cycle through shed-app's `broker`
   feature). Synchronous by design, on the pure `shed_core::rc_agents` kernel; carries its
   own minimal `clock` seam (shed-app's `traits::Clock` stays in shed-app). The
-  `test-support` feature exports `fake` (the fake tmux runner) for sx's and the hub's
+  `test-support` feature exports `fake` (the fake tmux runner) for the hub's
   tests. In `default-members`.
 - **`shed-core-ffi`** — a thin UniFFI wrapper (`crate-type = ["staticlib", "lib"]`)
   exposing a `ShedCore` object to Swift. The `.a` is what the app links (signing/notarization
@@ -39,23 +39,6 @@ re-implemented per language. The root `CLAUDE.md` owns the monorepo layout + rel
   in `desktop/scripts/build-core.sh`.
 - **`shedctl`** — a headless UDS/IPC client on `shed-core` (no GUI-toolkit dep), shipped in the
   Linux `.deb` and drives the Tauri app's socket. In `default-members`.
-- **`sx`** — the RC **porcelain** binary (plan 009), on `shed-core` + `shed-app` (with the
-  non-default `rc` feature enabled by its own manifest, so `cargo build -p sx` needs no
-  flags). Today it exposes one namespace, `sx rc <verb>` — the ported one-shot engine,
-  wire-compatible with the Go oracle (`tests/rc-parity/oracle`, the retired
-  `shed-machine-rc`'s main) under the comparison model
-  `tests/rc-parity` enforces (`make test-rc-parity` builds BOTH binaries and diffs them) — and
-  the **porcelain verbs** on top of it: `sx agent <tool>` / `sx plan <file>` (kickoff) and
-  `sx ls` / `sx watch` / `sx attach` / `sx kill` (observe), each taking
-  `--on local | machine:<name> | shed:<name>[@<server>]`. `machine:` entries come from the
-  `machines:` section of `~/.shed/config.yaml` (Rust-defined, Go-passthrough); a shed's SSH
-  endpoint comes from `shed-app`'s `Backend`. Hand-rolled arg parsing, like `shedctl`, with the
-  house subject-first grammar (`sx watch <slug> --on …`). In `default-members`. Its
-  dev-dependencies enable shed-app's **`test-support`** feature, which exports
-  `rc_engine::fake` (the fake tmux runner) across the crate boundary — test-only by
-  construction (`#[cfg(any(test, feature = "test-support"))]`).
-  Since plan 011 `sx` is also its **own release component** (brew + apt) — see the
-  version-lockstep section below.
 - **`shed-broker`** — the embeddable host-agent broker core: the shed-server plugin bus,
   the multi-server supervisor + discovery watcher, the SSH/AWS/Docker/egress credential
   backends, the SSH-bootstrap minter + control-token provider, the approval/audit seams
@@ -194,13 +177,13 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo clippy -p shed-app --features rc --all-targets -- -D warnings
 cargo clippy -p shed-app --features broker --all-targets -- -D warnings
 cargo clippy -p shed-app --features broker,rc --all-targets -- -D warnings
-cargo test -p sx                                     # the RC porcelain CLI
 ```
 
-Note: because `sx` is a default member that enables shed-app's `rc` feature, a bare
-`cargo test`/`clippy --workspace` now also compiles (and runs) the `rc` modules through
-feature unification. The explicit `-p shed-app --features rc` legs above stay — they are
-what covers the crate when it is built ALONE (and what CI runs).
+Note: `sx` (the crate that used to be a default member enabling shed-app's `rc` feature
+via workspace-wide feature unification) was sunset in plan 016 (S7, #329). A bare
+`cargo test`/`clippy --workspace` no longer compiles the `rc` modules at all — the
+explicit `-p shed-app --features rc` legs above are now the ONLY coverage for them
+(and what CI runs).
 
 `shed-core` also builds/tests on Linux — `make -C desktop core-linux` runs it in Docker.
 
@@ -216,12 +199,11 @@ At **release**, this workspace's `Cargo.toml` version is bumped in **lockstep** 
 --components desktop`; `scripts/release/release-plan.sh` hard-verifies the lockstep before the
 desktop leg ships. Don't hand-edit the version out of step.
 
-**Two crates here ship on their own selectors, deliberately OUT of that lockstep:**
-`crates/shed-host-agent/VERSION` (the `host-agent` component) and `crates/sx/VERSION`
-(the `sx` component, plan 011). Those files are ship-**selectors** only — the shipped
-binary's version is the tag, injected at build time by the component's goreleaser
-config (`SHED_HOST_AGENT_VERSION` / `SX_VERSION`) and read via `option_env!` in each
-crate's `version.rs`. So `sx version` on a released build reports the release tag, NOT
-`CARGO_PKG_VERSION` (which follows the desktop selector and is not bumped on an
-sx-only tag). Expect all three versions to differ in normal operation; that is the
-design, not drift. See the root `RELEASING.md` "Component selection".
+**One crate here ships on its own selector, deliberately OUT of that lockstep:**
+`crates/shed-host-agent/VERSION` (the `host-agent` component). That file is a ship-
+**selector** only — the shipped binary's version is the tag, injected at build time by
+the component's goreleaser config (`SHED_HOST_AGENT_VERSION`) and read via
+`option_env!` in `version.rs`. So `shed-host-agent version` on a released build reports
+the release tag, NOT `CARGO_PKG_VERSION` (which follows the desktop selector and is not
+bumped on a host-agent-only tag). Expect the two versions to differ in normal operation;
+that is the design, not drift. See the root `RELEASING.md` "Component selection".

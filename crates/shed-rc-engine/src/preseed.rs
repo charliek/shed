@@ -51,7 +51,7 @@ impl std::error::Error for PreseedError {}
 /// and a full-depth parse overflows every default there is — the 8 MiB main
 /// thread as readily as the 2 MiB a cargo-test or async-runtime worker gets. The
 /// asymmetry matters because a Rust stack overflow is not a catchable error: it
-/// is a SIGABRT that takes the whole `sx` process down, where Go would merely
+/// is a SIGABRT that takes the whole engine process down, where Go would merely
 /// decline the preseed and let the create carry on. A preseed is best-effort by
 /// contract, so it must not be able to abort its caller — and the only way to
 /// keep that promise over a bounded-but-deep recursion is to give it a stack

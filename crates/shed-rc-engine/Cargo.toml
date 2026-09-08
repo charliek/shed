@@ -26,11 +26,17 @@ libc = "0.2"
 chrono = { version = "0.4", default-features = false, features = ["std"] }
 
 [features]
-# The engine's test doubles (`fake` — the fake tmux runner + the env table)
-# exported for ANOTHER crate's tests (sx's dispatch tests; shed-broker's hub
-# tests). NON-default and named `test-support` so a `[dependencies]` enablement
-# is unmistakably wrong — the module is `#[cfg]`'d in only under `test` or this
-# feature, so a shipped binary never carries it.
+# The engine's test doubles (`fake` — the fake tmux runner + the env table).
+# It existed to export them to ANOTHER crate's tests — `sx`'s dispatch tests,
+# which went with the sunset in plan 016 — so today it has NO cross-crate
+# consumer: what still exercises it is this crate's own dedicated CI leg
+# (`cargo test -p shed-rc-engine --features test-support`). Kept rather than
+# folded into plain `#[cfg(test)]` because the whole engine is scheduled for
+# demolition with the RC hub (S6, charliek/shed#328) — churning it first buys
+# nothing. NON-default and named `test-support` so a `[dependencies]`
+# enablement is unmistakably wrong —
+# the module is `#[cfg]`'d in only under `test` or this feature, so a shipped
+# binary never carries it.
 test-support = []
 
 [dev-dependencies]

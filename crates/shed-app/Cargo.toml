@@ -20,8 +20,8 @@ shed-core = { path = "../shed-core" }
 # means a default `shed-app` (and the mac FFI build) never links them.
 shed-broker = { path = "../shed-broker", optional = true }
 # The graduated one-shot RC engine (plan 010 H2) — ONLY under the non-default `rc`
-# feature; `lib.rs` re-exports it as `shed_app::rc_engine` so sx and the desktop
-# keep their pre-graduation paths.
+# feature; `lib.rs` re-exports it as `shed_app::rc_engine` so the desktop keeps
+# its pre-graduation paths.
 shed-rc-engine = { path = "../shed-rc-engine", optional = true }
 # `net` (UnixStream) + `io-util` (buffered line reader) for the host-agent UDS
 # client, on top of the workspace's rt/macros/sync/time.
@@ -59,8 +59,11 @@ libc = "0.2"
 # pass `--features rc` or the rc unit tests are cfg'd out.
 rc = ["dep:shed-rc-engine", "tokio/process"]
 # The engine's test doubles (`rc_engine::fake` — the fake tmux runner + the env
-# table) exported for ANOTHER crate's tests, today `sx`'s dispatch tests, which
-# must assert against the same recorded-argv shape the engine's own tables do.
+# table), reachable through this crate's re-export for a consumer of
+# `shed_app::rc_engine`. Its one consumer was `sx`'s dispatch tests, so since
+# the plan 016 sunset NOTHING enables this feature; it is left in place because
+# the `rc` surface it belongs to is S6's to demolish (charliek/shed#328), and
+# removing a feature nobody enables is churn either way.
 # Forwards to the graduated crate's feature (the `?` keeps the dep optional —
 # enabling test-support alone must not drag the engine in without `rc`).
 # NON-default and named `test-support` so it is unmistakable: a consumer enabling
@@ -82,5 +85,6 @@ tempfile = "3"
 # shed-core's in-process fake roost-session (`roost::testing::FakeRoost`), exposed
 # by its test-only `test-support` feature. A dev-dependency (resolver v2) so the
 # feature is enabled for `cargo test -p shed-app` and NEVER for a shipped build —
-# the same shape `sx` uses for `rc_engine::fake`.
+# the same resolver-v2 dev-dependency-only pattern this crate's own `test-support`
+# forwarding above uses for `rc_engine::fake`.
 shed-core = { path = "../shed-core", features = ["test-support"] }
