@@ -34,6 +34,13 @@ async-trait = { workspace = true }
 # one-shots take and return (`roost.rs`). Rev-pinned in the workspace manifest —
 # see the long comment there.
 roost-ipc = { workspace = true }
+# The `tracing` FACADE only — no subscriber, no `tracing-subscriber`. The roost
+# observer loop has two things worth saying that are neither an `Err` nor an
+# update (a resync, and somebody else taking the interactive lease), and a
+# `println!` from a library the desktop and mobile both link is not an option.
+# Adds no crate to the lock: `roost-ipc` already brings the same facade into
+# this crate's graph, so a client that installs no subscriber pays nothing.
+tracing = { version = "0.1", default-features = false, features = ["std"] }
 # Concurrent per-host list_sheds via futures::future::join_all.
 futures = "0.3"
 # Flexible ISO-8601 parse/format for approval expiry + wire `ts` (Swift's

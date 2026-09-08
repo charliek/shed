@@ -2,8 +2,9 @@
 //! `internal/ext/rc/watch_opencode_transport.go`.
 //!
 //! [`OpencodeWatcher`] is the SSE/REST-backed [`SessionWatcher`] for an
-//! opencode session. Unlike the codex/claude file watchers — which tail a
-//! durable append-only JSONL file — opencode is client/server: the bare TUI
+//! opencode session — the only one left since A5/A6 (`charliek/shed#321`/
+//! `#322`) retired the codex and claude file watchers, which tailed a durable
+//! append-only JSONL file. opencode is client/server instead: the bare TUI
 //! runs an embedded HTTP+SSE server on a per-session port
 //! (`SHED_RC_OPENCODE_PORT`, stamped at create), and this watcher subscribes
 //! to that server's `/event` stream (plus a REST seed) as a SECOND client.
@@ -761,15 +762,17 @@ impl SessionWatcher for OpencodeWatcher {
     /// applied, the stream is connected, and a frame (or heartbeat) landed
     /// within [`OC_FRAME_STALE_WINDOW`]. When UNHEALTHY it returns BOTH
     /// fresh=false AND expired_working=false — returning only fresh=false
-    /// would let mergedActivity keep a stale working verdict against a
-    /// churning pane; forcing expired_working=false routes to the
-    /// stability-drives branch (§3.6).
+    /// would be equivalent (`merged_activity` has consulted only `fresh`
+    /// since S2, `charliek/shed#324`, deleted the pane-stability fallback
+    /// `expired_working` used to be weighed against); both flags false keeps
+    /// the two together so a reader never has to check which one
+    /// `merged_activity` reads.
     fn snapshot(&self, now: DateTime<Utc>) -> (RcActivity, String, bool, bool) {
         let w = self.lock();
         if w.closed {
             // A closed watcher has revoked its authority (close() cleared
-            // connected/seed_applied): never report fresh, and force
-            // expired_working=false so pane-stability drives (fix #6).
+            // connected/seed_applied): never report fresh, so merged_activity
+            // reports NO activity at all (fix #6).
             return (w.cur_activity, w.cur_message.clone(), false, false);
         }
         let mut healthy = w.seed_applied && w.connected;
@@ -782,6 +785,9 @@ impl SessionWatcher for OpencodeWatcher {
             }
         }
         if !healthy {
+            // Disconnected / heartbeat-stale / seed-not-yet-applied: not
+            // fresh, so merged_activity's not-fresh arm applies — no activity
+            // at all, not a fallback engine.
             return (w.cur_activity, w.cur_message.clone(), false, false);
         }
         // Transport healthy: from here the ordinary quiet-source rule applies.
@@ -836,10 +842,6 @@ impl SessionWatcher for OpencodeWatcher {
     }
 
     fn as_approval_publisher(&self) -> Option<&dyn super::watch::ApprovalPublisher> {
-        Some(self)
-    }
-
-    fn as_approval_blocker(&self) -> Option<&dyn super::watch::ApprovalBlocker> {
         Some(self)
     }
 
@@ -907,12 +909,6 @@ impl super::watch::ClaimHolder for OpencodeWatcher {
 impl super::watch::ApprovalPublisher for OpencodeWatcher {
     fn pending_approvals(&self) -> Vec<FeedApproval> {
         OpencodeWatcher::pending_approvals(self)
-    }
-}
-
-impl super::watch::ApprovalBlocker for OpencodeWatcher {
-    fn has_open_approvals(&self) -> bool {
-        OpencodeWatcher::has_open_approvals(self)
     }
 }
 
@@ -1045,14 +1041,12 @@ impl OpencodeWatcher {
         w.fold.pending_approvals()
     }
 
-    /// Whether ANY ask (permission or question) is still open, for the input
-    /// gate (`hasOpenApprovals` — the approvalBlocker surface). Deliberately
-    /// independent of transport health and freshness: when the stream wedges
-    /// the activity verdict is demoted to pane stability — but a dialog the
-    /// operator has not answered is still on the pane, and a posted line
-    /// would answer it by accident. The asymmetry is intentional: a stale
-    /// reject costs a retry, a stale accept costs an unintended approval. A
-    /// CLOSED watcher blocks nothing.
+    /// Whether ANY ask (permission or question) is still open — a STRICTLY
+    /// WIDER question than `pending_approvals`, because it counts questions
+    /// too, which are never addressable and so never appear there. It fed the
+    /// gated-input blocker until A6 (`charliek/shed#322`) retired that lane; it
+    /// stays as the fold's open-ask predicate. Deliberately independent of
+    /// transport health and freshness. A CLOSED watcher reports nothing open.
     pub fn has_open_approvals(&self) -> bool {
         let w = self.lock();
         if w.closed {
@@ -3116,7 +3110,9 @@ mod tests {
         let neighbour = session_start.timestamp_millis() - 7 * 60 * 1000;
         let mine = session_start.timestamp_millis() + 30 * 1000;
         let entry = |id: &str, at: i64| {
-            format!(r#"{{"id":"{id}","directory":"{DIR}","parentID":"","time":{{"created":{at}}}}}"#)
+            format!(
+                r#"{{"id":"{id}","directory":"{DIR}","parentID":"","time":{{"created":{at}}}}}"#
+            )
         };
 
         // (a) a conversation older than the session is not adopted.
@@ -3199,12 +3195,16 @@ mod tests {
             "a conversation another session owns is never adopted, however new"
         );
         // The same on the SSE path.
-        assert_eq!(w.root_pin_from_created(&{
-            let e = entry(OTHER_SID, later);
-            peek_envelope(
-                format!(r#"{{"type":"session.updated","properties":{{"info":{e}}}}}"#).as_bytes(),
-            )
-        }), None);
+        assert_eq!(
+            w.root_pin_from_created(&{
+                let e = entry(OTHER_SID, later);
+                peek_envelope(
+                    format!(r#"{{"type":"session.updated","properties":{{"info":{e}}}}}"#)
+                        .as_bytes(),
+                )
+            }),
+            None
+        );
         w.close();
 
         // (e) the REST path is not the only way in: session.updated fires for
@@ -3213,8 +3213,11 @@ mod tests {
         let w = OpencodeWatcher::new(f.port(), DIR, "", session_start, clk.now_fn(), None);
         let frame = |id: &str, at: i64| {
             peek_envelope(
-                format!(r#"{{"type":"session.updated","properties":{{"info":{}}}}}"#, entry(id, at))
-                    .as_bytes(),
+                format!(
+                    r#"{{"type":"session.updated","properties":{{"info":{}}}}}"#,
+                    entry(id, at)
+                )
+                .as_bytes(),
             )
         };
         assert_eq!(w.root_pin_from_created(&frame(OTHER_SID, neighbour)), None);
@@ -3417,8 +3420,14 @@ mod tests {
         let (act, _, fresh, exp) = w.snapshot(clk.now());
         assert_eq!(act, RcActivity::Working, "verdict retained, just untrusted");
         assert!(!fresh && !exp, "heartbeat-stale: both flags false");
-        let (merged, _) = merged_activity(act, "", fresh, exp, RcActivity::Idle);
-        assert_eq!(merged, RcActivity::Idle, "stability drives a stale watcher");
+        // S2 (`charliek/shed#324`): an untrusted verdict is dropped entirely —
+        // there is no pane-stability fallback left to take over.
+        let merged = merged_activity(act, "preview", fresh);
+        assert_eq!(
+            merged,
+            (None, String::new()),
+            "a stale watcher contributes no activity"
+        );
         w.close();
     }
 
@@ -3454,7 +3463,14 @@ mod tests {
         drop(listener);
 
         let clk = TestClock::new();
-        let w = OpencodeWatcher::new(port, DIR, SID, DateTime::<Utc>::UNIX_EPOCH, clk.now_fn(), None);
+        let w = OpencodeWatcher::new(
+            port,
+            DIR,
+            SID,
+            DateTime::<Utc>::UNIX_EPOCH,
+            clk.now_fn(),
+            None,
+        );
         for _ in 0..20 {
             w.refresh(clk.now());
             let (_, _, fresh, exp) = w.snapshot(clk.now());
@@ -3651,8 +3667,8 @@ mod tests {
             "verdict retained, just untrusted"
         );
         assert!(!fresh && !exp, "heartbeat-stale: both flags false");
-        let (merged, _) = merged_activity(act, "", fresh, exp, RcActivity::Idle);
-        assert_eq!(merged, RcActivity::Idle, "stability drives a dead stream");
+        let (merged, _) = merged_activity(act, "", fresh);
+        assert_eq!(merged, None, "a dead stream contributes no activity");
         w.close();
     }
 

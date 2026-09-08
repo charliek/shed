@@ -34,11 +34,11 @@
 //! probe / prompt / kill / accept-trust + the `--wait` poller, `ops.go`),
 //! [`plan`] (`plan.go`), [`netutil`] (`netutil.go`), [`text`] (the two prompt
 //! helpers from `rc.go` that C1 did not carry over), the create-time
-//! **preseeds** ([`trust`] = `trust.go`, [`preseed_cursor`] =
-//! `preseed_cursor.go`, dispatched per kind by [`preseed`] the way
-//! `AgentSpec.Preseed` is), the byte-exact Go-`encoding/json` writer they rewrite
-//! their files with ([`go_json`]), and **capability discovery**
-//! ([`capabilities`] = `capabilities.go`).
+//! **preseed** ([`trust`] = `trust.go`, dispatched per kind by [`preseed`] the
+//! way `AgentSpec.Preseed` is — cursor's hook-relay preseed was the second one
+//! until A6, `charliek/shed#322`, retired the lane it fed), the byte-exact
+//! Go-`encoding/json` writer it rewrites its file with ([`go_json`]), and
+//! **capability discovery** ([`capabilities`] = `capabilities.go`).
 //!
 //! Never here: the activity **hub** (`serve`). Its Rust home is shed-broker's
 //! `rc_hub` (plan 010), which CONSUMES this crate; the engine only carries the
@@ -64,7 +64,6 @@ pub mod netutil;
 pub mod ops;
 pub mod plan;
 pub mod preseed;
-pub mod preseed_cursor;
 pub mod text;
 pub mod tmux;
 pub mod trust;
@@ -84,7 +83,7 @@ pub use netutil::free_loopback_port;
 pub use ops::{
     capture_pane_checked, capture_visible_pane_checked, real_bin_probe, CreateOptions, Engine,
     EngineError, GetEnv, PromptOptions, DEFAULT_CREATED_BY, DEFAULT_POLL_EVERY,
-    DEFAULT_WAIT_TIMEOUT, ENV_NO_HUB, PROMPT_DELIVER_SETTLE,
+    DEFAULT_WAIT_TIMEOUT, ENV_NO_HUB, KICKOFF_SETTLE, PROMPT_DELIVER_SETTLE,
 };
 pub use plan::{compose_plan_kickoff, plan_from_bytes, plan_path, PLAN_MAX_BYTES};
 pub use preseed::{dispatch as preseed_for_kind, PreseedError};

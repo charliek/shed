@@ -9,8 +9,10 @@ re-implemented per language. The root `CLAUDE.md` owns the monorepo layout + rel
 
 - **`shed-core`** — a *pure* Rust lib (no UI, no UniFFI): the reqwest(rustls) HTTP client, the
   SSE parser, defensive wire decoders, leaf-cert TLS pinning, the control-token FSM, a `config`
-  parser, the pull-based `create` orchestration store, and `rc.rs` (the pure Remote-Control
-  classifier + argv builders). The Linux clients link it directly.
+  parser, the pull-based `create` orchestration store, and `rc.rs` (the Remote-Control
+  wire types + argv builders; its pure pane classifier went with S2, charliek/shed#324 —
+  a shed row's `state` is liveness off the wire, a machine row's status comes from
+  roost). The Linux clients link it directly.
 - **`shed-app`** — the UI-free app-logic layer (`Backend`) the clients share; holds the
   `RcRunner` portability seam (`rc.rs`) behind the non-default `rc` feature — which also
   pulls in and re-exports `shed-rc-engine` as `shed_app::rc_engine` — and the embedded
@@ -89,7 +91,32 @@ lock cannot disagree, so `shed-mobile/scripts/check-lock-rev.sh` needs no change
 `fixtures/roost-vectors/` from the new rev's `tests/ipc-vectors/` (updating that README's sha),
 commit all of it. Re-read roost's `docs/reference/ipc-compatibility.md` on any bump crossing a
 `SESSION_PROTOCOL_VERSION` change — `shed_core::roost::Conn::session_identify` refuses a
-mismatch by name rather than limping.
+mismatch by name rather than limping. roost keeps **one `session.identify` vector per
+generation** (`session.identify.response.v<N>.json`); shed vendors only the current one, so a
+generation bump renames the vendored file and both fakes' `include_str!`/`_vector()` paths move
+with it. An older shape is a fake *control* (`set_session_protocol`, `serve_without_features`),
+never a second vector to keep in step.
+
+**What session protocol 4 gave us (roost R1, plan 014).** The pin is at `c67ac27…` and shed
+speaks generation **4**:
+
+- **Reads are free.** `events.subscribe` takes no lease; it *classifies*. An empty lease is an
+  **observer** stream — every workspace batch plus `notification.fired`, never `tab.effect` —
+  which is what `shed_app::roost::RoostWatcher` subscribes as, so watching somebody's machine
+  never takes the interactive lease from the roost UI they are looking at.
+- **Writes are owned.** `Conn::tab_write` takes `lease: Option<&str>` — required on a session
+  socket (`connect-required` without one, `taken-over` on a displaced one), accepted and ignored
+  on a UI socket. `Conn::session_connect(takeover, client_label)` is what mints one; nothing in
+  shed calls it outside tests yet.
+- **A takeover no longer ends a stream.** It reclassifies in place and says so once with a
+  non-terminal `session.driver_changed`. The only terminal envelope an event stream sees is
+  `session.stopping`.
+- **The watcher does not poll.** `RoostWatcher` runs one *observe cycle* — identify on conn A,
+  `subscribe("")` on conn B, `tab.list` on conn A, then fold batches through
+  `shed_core::roost::Fence` — and emits a `Snapshot` only when a row actually changed. A bare
+  EOF and a revision gap are **resyncs** (a new cycle at once, no `Down`), bounded by
+  `MAX_CONSECUTIVE_RESYNCS`. **`SHED_ROOST_POLL_MS` is gone**, with `POLL_INTERVAL` and the rest
+  of the cadence: latency is the push, and the only sleep left is the failure backoff.
 
 **What it drags in.** `roost-ipc`'s own leaf deps — **`anyhow`**, the **`tracing` facade** (a
 facade only: no subscriber, no `tracing-subscriber`) and **`libc`** — are new to `shed-core`'s
@@ -102,6 +129,12 @@ unifies in `fs, process, signal, rt`. Measured at `shed-core-ffi`, the delta fro
 dep is **+`process`, +`signal`, +`signal-hook-registry`** (`fs`/`net`/`io-util` already arrived
 via reqwest). Nothing FFI-exported changes; `cargo tree -e features -p shed-core-ffi` prints the
 resulting set. The workspace `rust-version` is **1.97**, which is roost-ipc's MSRV.
+
+`shed-app` also takes the **`tracing` facade** directly (plan 014): the roost observer loop has
+two things worth saying that are neither an error nor an update — a resync, and somebody else
+taking the interactive lease. It adds no crate to the lock (roost-ipc already brings the same
+facade into that graph), there is still **no subscriber** anywhere in this workspace, and a
+client that installs none pays nothing.
 
 **Android.** `cargo check -p shed-core --target aarch64-linux-android` is the early gate for
 mobile (`roost-ipc` compiles for it cleanly — its `peer.rs` has a fail-closed non-linux/macOS

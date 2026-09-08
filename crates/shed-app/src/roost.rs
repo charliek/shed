@@ -1,5 +1,5 @@
-//! **The roost reach seam** and the polling inventory watcher on top of it
-//! (plan 013 S1, the Roost Pivot's first milestone).
+//! **The roost reach seam** and the observing inventory watcher on top of it
+//! (plan 013 S1, re-cut onto roost's push feed by plan 014).
 //!
 //! [`shed_core::roost`] knows how to *talk* to a `roost-session` — one
 //! [`Conn`][shed_core::roost::Conn], typed ops, the compatibility gate, the row
@@ -43,6 +43,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use roost_ipc::client::EventFrame;
 use roost_ipc::messages::{Tab, TabDumpResult, TabOpenParams};
 use roost_ipc::ssh::{
     classify, ResolvedTransport, SshConfigPaths, SshTarget, SshTunnel, SshTunnelOptions,
@@ -50,7 +51,7 @@ use roost_ipc::ssh::{
 use tokio::sync::mpsc;
 
 use shed_core::config::MachineEntry;
-use shed_core::roost::{local_session_socket, Conn, RoostError, RoostInventory};
+use shed_core::roost::{local_session_socket, Admit, Conn, Fence, RoostError, RoostInventory};
 
 use crate::backoff;
 use crate::machine::{FixedPort, ForwardError};
@@ -721,43 +722,38 @@ fn write_private(path: &Path, contents: &[u8]) -> std::io::Result<()> {
 // the watcher
 // ---------------------------------------------------------------------------
 
-/// How often a held connection re-reads `tab.list`.
+/// How many consecutive resyncs are tolerated before the row is called down.
 ///
-/// **Polling is pinned for M1.** roost's push feed (`events.subscribe`) is
-/// lease-gated, and the lease is singular: a shed subscription would take it
-/// from the roost UI the user is looking at. roost R1 re-cuts that, and the
-/// migration is a swap of this loop's body onto `Conn::subscribe` + `Fence` —
-/// [`RoostUpdate`] does not change.
-pub const POLL_INTERVAL: Duration = Duration::from_secs(2);
-
-/// Override for [`POLL_INTERVAL`], in milliseconds. Read **once**, when a
-/// watcher is spawned — the harness sets it, a shipped client does not.
-pub const POLL_MS_ENV: &str = "SHED_ROOST_POLL_MS";
-
-/// The floor the override is clamped to. A zero or one-millisecond poll is a
-/// busy loop against somebody's session, over SSH.
-const MIN_POLL: Duration = Duration::from_millis(10);
-
-fn poll_interval() -> Duration {
-    std::env::var(POLL_MS_ENV)
-        .ok()
-        .and_then(|raw| raw.trim().parse::<u64>().ok())
-        .map(|ms| Duration::from_millis(ms).max(MIN_POLL))
-        .unwrap_or(POLL_INTERVAL)
-}
+/// A resync is cheap and expected — a daemon restart, a stream the server
+/// closed because we fell behind, a lost commit — and it costs no `Down`, no
+/// backoff and no stale row. What it must not do is spin: a daemon that skips a
+/// revision every time, or a bridge that EOFs the stream on every subscribe,
+/// would otherwise reconnect as fast as the loop can run, forever. Three in a
+/// row without a single applied batch between them is the point at which "we
+/// are behind" stops being a better explanation than "this is broken".
+///
+/// A constant, not an env var: it is a correctness bound, and a knob would make
+/// two clients disagree about when a session is down.
+pub const MAX_CONSECUTIVE_RESYNCS: u32 = 3;
 
 /// One update from a [`RoostWatcher`].
 ///
-/// Two members, not three: roost's inventory is read whole on every poll, so
-/// there is no patch stream to fold and no partial update to reconcile. When R1
-/// lands the event feed, batches are folded into the inventory behind this same
-/// enum ([`shed_core::roost::fence`] is the fold) rather than published as their
-/// own variant — the consumer does not change.
+/// Two members, not three: roost's event batches are folded into the inventory
+/// behind this same enum ([`shed_core::roost::fence`] is the fold) rather than
+/// published as their own variant, so a consumer renders whole inventories and
+/// never reconciles a patch stream. Unchanged across the R1 migration by
+/// design — `machines.rs::consume` and shed-mobile's bridge did not move.
 #[derive(Debug, Clone, PartialEq)]
 pub enum RoostUpdate {
-    /// A complete inventory. Emitted on the first `tab.list` of every
-    /// connection, and afterwards only when `(daemon_session_id, revision)`
-    /// changed.
+    /// A complete inventory. Emitted once at the head of every cycle (the
+    /// `tab.list` the stream is fenced against), and afterwards only when a
+    /// folded batch actually **changed a row, or retired a tab** — an empty
+    /// commit, a hidden tab's churn, or a project rename that touches no session
+    /// emits nothing, though the inventory's `revision` advances all the same and
+    /// rides out with the next snapshot that does. A tab the inventory KNEW
+    /// about disappearing is published even when it was hidden the whole time,
+    /// because a client may be holding an optimistic row for it (the reason is
+    /// on `observe_once`, this module's fold loop).
     Snapshot(RoostInventory),
     /// The session is not readable: no socket, the tunnel would not build, the
     /// thing on the other end is not a roost-session, or a request failed.
@@ -768,13 +764,19 @@ pub enum RoostUpdate {
     Down { reason: String },
 }
 
-/// A reconnecting, polling watcher over one roost-session's inventory.
+/// A reconnecting **observer** over one roost-session's inventory.
 ///
 /// Deliberately the same shape as [`crate::machine::MachineHubWatcher`]:
 /// [`spawn`] starts the loop and hands back the receiver, [`stop`] (and `Drop`)
 /// aborts it, and it is not restartable. The backoff is the same shared
 /// schedule with the same reset-on-worked rule, so a roost row and a hub row in
 /// one sessions view go stale at the same rate.
+///
+/// **Nothing here has a cadence.** Since roost R1 (session protocol 4) a
+/// subscribe takes no lease and classifies instead: shed subscribes with an
+/// empty one, which is an *observer* stream by construction, and every workspace
+/// commit arrives as a batch. Latency is the push; the only sleep in this module
+/// is the failure backoff.
 ///
 /// [`spawn`]: RoostWatcher::spawn
 /// [`stop`]: RoostWatcher::stop
@@ -796,27 +798,19 @@ impl RoostWatcher {
         reach: Arc<dyn RoostReach>,
         label: String,
     ) -> (RoostWatcher, mpsc::UnboundedReceiver<RoostUpdate>) {
-        Self::spawn_inner(
-            handle,
-            reach,
-            label,
-            poll_interval(),
-            BackoffSleeper::default(),
-        )
+        Self::spawn_inner(handle, reach, label, BackoffSleeper::default())
     }
 
-    /// [`spawn`](Self::spawn) with the poll cadence and the backoff-sleep seam
-    /// supplied — the real clock and the resolved interval everywhere but this
-    /// module's own tests.
+    /// [`spawn`](Self::spawn) with the backoff-sleep seam supplied — the real
+    /// clock everywhere but this module's own tests.
     fn spawn_inner(
         handle: &tokio::runtime::Handle,
         reach: Arc<dyn RoostReach>,
         label: String,
-        poll: Duration,
         sleeper: BackoffSleeper,
     ) -> (RoostWatcher, mpsc::UnboundedReceiver<RoostUpdate>) {
         let (tx, rx) = mpsc::unbounded_channel();
-        let task = handle.spawn(run_loop(reach, tx, label.clone(), poll, sleeper));
+        let task = handle.spawn(run_loop(reach, tx, label.clone(), sleeper));
         (RoostWatcher { label, task }, rx)
     }
 
@@ -860,14 +854,46 @@ impl BackoffSleeper {
     }
 }
 
+/// Whether a batch reordered something, i.e. whether the snapshot's *order* is
+/// now stale even though every row in it is current.
+///
+/// The two events name the SET that was reordered rather than a member of it
+/// (`tabs.reordered` carries the project, `projects.reordered` the sidebar), so
+/// neither is foldable into a row without shed keeping an ordering model of its
+/// own. See the caller for why re-listing is the answer instead.
+fn is_reorder(batch: &roost_ipc::messages::EventBatch) -> bool {
+    batch.events.iter().any(|envelope| {
+        matches!(
+            envelope.event.as_str(),
+            roost_ipc::messages::ops::EVENT_TABS_REORDERED
+                | roost_ipc::messages::ops::EVENT_PROJECTS_REORDERED
+        )
+    })
+}
+
+/// How a cycle ended, when it did not end in an error.
+enum Cycle {
+    /// The consumer went away. There is nothing left to do.
+    Done,
+    /// Start over at once: re-identify, re-subscribe, re-list.
+    ///
+    /// **Not a failure.** The daemon is alive and we are behind it — a lost
+    /// commit, a stream the server closed, a restart. No `Down`, no
+    /// `invalidate`, no backoff sleep; only [`MAX_CONSECUTIVE_RESYNCS`] bounds
+    /// it.
+    Resync,
+}
+
 async fn run_loop(
     reach: Arc<dyn RoostReach>,
     tx: mpsc::UnboundedSender<RoostUpdate>,
     label: String,
-    poll: Duration,
     sleeper: BackoffSleeper,
 ) {
     let mut backoff = backoff::INITIAL;
+    // Consecutive resyncs with no applied batch between them. See
+    // [`MAX_CONSECUTIVE_RESYNCS`].
+    let mut resyncs: u32 = 0;
     loop {
         if tx.is_closed() {
             break;
@@ -878,13 +904,34 @@ async fn run_loop(
         // died, the phone changed networks), so resetting only on a clean end
         // would ratchet a healthy feed up to the 30 s ceiling and keep it there.
         let mut worked = false;
-        let outcome = poll_once(&reach, &tx, &label, poll, &mut worked).await;
+        // Set by an *applied* batch, which is the only evidence the stream is
+        // actually carrying commits. A cycle's own `tab.list` is NOT progress:
+        // a daemon that EOFs before every first batch would otherwise reset the
+        // bound on every attempt and spin forever.
+        let mut applied = false;
+        let outcome = observe_once(&reach, &tx, &label, &mut worked, &mut applied).await;
         if worked {
             backoff = backoff::INITIAL;
         }
-        // `Ok` means only one thing here: the consumer went away. There is no
-        // clean end to a poll loop.
-        let Err(reason) = outcome else { break };
+        if applied {
+            resyncs = 0;
+        }
+        let reason = match outcome {
+            Ok(Cycle::Done) => break,
+            Ok(Cycle::Resync) => {
+                resyncs += 1;
+                if resyncs <= MAX_CONSECUTIVE_RESYNCS {
+                    tracing::warn!(
+                        label = %label,
+                        attempt = resyncs,
+                        "roost stream resync"
+                    );
+                    continue;
+                }
+                format!("resyncing too often ({resyncs} in a row without a commit)")
+            }
+            Err(reason) => reason,
+        };
         // After ANY error, unconditionally — a bridge socket that accepts while
         // its `ssh` is gone would pass any liveness probe this could run
         // instead.
@@ -892,6 +939,10 @@ async fn run_loop(
         if tx.send(RoostUpdate::Down { reason }).is_err() {
             break;
         }
+        // Entering backoff is itself a reset: the next attempt starts a fresh
+        // run, and carrying the count across a `Down` would make the second
+        // failure after a recovery trip the bound.
+        resyncs = 0;
         let (wait, next) = backoff::step(backoff);
         backoff = next;
         // Race the sleep against the consumer going away: a session that stays
@@ -904,61 +955,175 @@ async fn run_loop(
     }
 }
 
-/// One connection, held for as many polls as it survives.
+/// One observe cycle: identify, subscribe, snapshot, then fold the push feed
+/// for as long as it lasts.
 ///
-/// `worked` is set once a snapshot has actually gone out — the caller's signal
-/// that this attempt was good, whatever happens to it afterwards.
+/// **Subscribe before listing, on a second connection.** The ack's `revision`
+/// `s` is a fence — the first batch delivered is exactly `s + 1` — so a snapshot
+/// taken *after* the ack (at some `r0 >= s`) can never be ahead of the stream:
+/// batches `s+1..=r0` are discarded, `r0+1` applies, and a busy daemon produces
+/// no spurious gap. List-then-subscribe on one connection would make every
+/// commit landing between the two calls a `Gap` and cost a resync for nothing.
+/// The price is two connections per (re)sync — over an [`SshBridge`] two remote
+/// execs on a shared `ControlMaster` — paid on connect, gap, EOF and stopping,
+/// never per event.
 ///
-/// Returns `Ok(())` only when the consumer has gone; every other exit is an
-/// `Err` carrying the reason to publish.
-async fn poll_once(
+/// **The gate runs once per cycle**, not per event. `poll_once` re-identified on
+/// every poll because a restart need not drop a polled socket; a *held stream*
+/// cannot outlive its daemon, so a restart is an EOF and the next cycle
+/// re-identifies. The one edge is a restart landing between conn A's identify
+/// and conn B's subscribe: that snapshot carries the old `daemon_session_id`,
+/// the stream EOFs immediately, and the next cycle fixes both.
+///
+/// `worked` is set once the cycle's first snapshot has gone out; `applied` once
+/// a batch has actually been folded in. Returns `Err` only for something the
+/// consumer should see as [`RoostUpdate::Down`].
+async fn observe_once(
     reach: &Arc<dyn RoostReach>,
     tx: &mpsc::UnboundedSender<RoostUpdate>,
     label: &str,
-    poll: Duration,
     worked: &mut bool,
-) -> Result<(), String> {
+    applied: &mut bool,
+) -> Result<Cycle, String> {
     let endpoint = reach.ensure().await.map_err(|e| e.to_string())?;
-    let mut conn = Conn::endpoint(&endpoint).await.map_err(|e| e.to_string())?;
 
-    // **Per connection, and compared with `!=` rather than `>`.** roost's
-    // revision is an in-process counter that resets to 1 when the daemon
-    // restarts, so a number going DOWN is a real change and a `>` test would
-    // silently stop emitting for the rest of the session's life.
-    let mut last: Option<(String, Option<u64>)> = None;
+    // Conn A — the gate. `NotASession` and `ProtocolMismatch` are `Down` reasons
+    // that name themselves, so this is also what keeps a roost UI socket or an
+    // un-upgraded daemon from ever being read as machine inventory.
+    let mut conn = Conn::endpoint(&endpoint).await.map_err(|e| e.to_string())?;
+    let identify = conn.session_identify().await.map_err(|e| e.to_string())?;
+
+    // Conn B — the observer stream. **An empty lease is an observer by
+    // construction on roost's side**, not merely by serde default: it builds the
+    // presented lease with `(!lease.is_empty()).then(…)` and requires a
+    // non-empty one to classify a driver. So this takes nothing from whoever is
+    // driving the session, and a takeover reclassifies rather than ends it.
+    let subscriber = Conn::endpoint(&endpoint).await.map_err(|e| e.to_string())?;
+    let mut stream = subscriber.subscribe("").await.map_err(|e| e.to_string())?;
+
+    // Conn A again — the snapshot the stream is fenced against — and then conn A
+    // is done: everything after this comes off the push feed.
+    let list = conn.tab_list().await.map_err(|e| e.to_string())?;
+    drop(conn);
+
+    let mut inventory = RoostInventory::from_list(label, &list, &identify);
+    // A session socket always carries the revision; the ack's is the honest
+    // fallback rather than a panic, and the gate above has already refused the
+    // one socket (a UI socket) that omits it.
+    let mut fence = Fence::new(list.revision.unwrap_or_else(|| stream.revision()));
+    *worked = true;
+    if tx.send(RoostUpdate::Snapshot(inventory.clone())).is_err() {
+        return Ok(Cycle::Done);
+    }
+
     loop {
-        // **The gate, on every poll and not once per connection.** Two reasons,
-        // and it costs one small request on a connection that is already open:
-        //
-        // * `session_id` identifies the daemon INSTANCE, and a restart does not
-        //   have to drop this socket for us to be talking to a new one. Taking
-        //   the id once and re-stamping it forever means a restart whose
-        //   revision happens to land on the number we last emitted is invisible
-        //   — no snapshot, and every row afterwards carries the dead instance's
-        //   id, which is the field a client keys "is this still the same
-        //   daemon" off.
-        // * It re-applies the compatibility gate. `NotASession` and
-        //   `ProtocolMismatch` are `Down` reasons that name themselves, and a
-        //   session that was replaced by something else on the same socket has
-        //   to be caught the same way a fresh connection would catch it.
-        let identify = conn.session_identify().await.map_err(|e| e.to_string())?;
-        let list = conn.tab_list().await.map_err(|e| e.to_string())?;
-        let seen = (identify.session_id.clone(), list.revision);
-        // A list with no revision publishes no fence, so there is nothing to
-        // compare and every poll is news. (The gate above means this should not
-        // happen — only a UI socket omits it — but a silent stall would be the
-        // worst possible way to find out otherwise.)
-        if list.revision.is_none() || last.as_ref() != Some(&seen) {
-            last = Some(seen);
-            let inventory = RoostInventory::from_list(label, &list, &identify);
-            *worked = true;
-            if tx.send(RoostUpdate::Snapshot(inventory)).is_err() {
-                return Ok(());
+        let frame = tokio::select! {
+            frame = stream.next() => frame,
+            _ = tx.closed() => return Ok(Cycle::Done),
+        };
+        match frame {
+            // **A bare EOF is a resync, never a `Down`.** It is what roost
+            // produces when it drops a subscriber that fell behind ("the server
+            // closes rather than thins"), and what a daemon restart looks like.
+            // The cycle's first snapshot already went out, so there is no
+            // never-worked case to fall through to; a dead `ssh` behind it costs
+            // exactly one wasted attempt, whose `session_identify` then fails
+            // properly.
+            Ok(None) => return Ok(Cycle::Resync),
+            // **The gap surfaces here, not from the fence.** `EventStream::next`
+            // validates the revision sequence against its own ack before it
+            // yields, so a skipped commit is this error rather than an
+            // `Admit::Gap` below — which stays as a defensive second layer.
+            Err(RoostError::RevisionGap { expected, got }) => {
+                tracing::warn!(
+                    label = %label,
+                    expected,
+                    got,
+                    "roost event stream skipped a revision"
+                );
+                return Ok(Cycle::Resync);
             }
-        }
-        tokio::select! {
-            () = tokio::time::sleep(poll) => {}
-            _ = tx.closed() => return Ok(()),
+            Err(e) => return Err(e.to_string()),
+            Ok(Some(EventFrame::Batch(batch))) => match fence.admit(batch.revision) {
+                // Everything at or below the snapshot — the `s+1..=r0` the
+                // prologue's ordering deliberately produces.
+                Admit::Discard => {}
+                Admit::Apply => {
+                    *applied = true;
+                    let before = inventory.sessions.clone();
+                    let known_before = inventory.known_tab_ids();
+                    inventory.apply(&batch);
+                    // **A row change is news. So is a tab vanishing.** An empty
+                    // commit, a hidden tab's churn and a project rename nobody's
+                    // row carries all advance the revision inside the inventory
+                    // and publish nothing; the next snapshot that does go out
+                    // carries the moved number with it.
+                    //
+                    // The one hidden-half change that IS news is a tab we knew
+                    // about ceasing to exist. A client may hold an optimistic
+                    // row for a tab it opened itself, before any adapter has
+                    // claimed it (`machines.rs::create`); if the launched
+                    // process dies before it ever reports, BOTH the `tab.opened`
+                    // and the `tab.closed` touch the hidden half only, and
+                    // without this the client would never hear that the tab it
+                    // is showing a card for is gone. The poller repaired that on
+                    // its next list; an event-only watcher has to say it.
+                    // Deliberately narrow: a hidden tab appearing, or changing,
+                    // still emits nothing.
+                    let vanished = known_before.iter().any(|id| !inventory.knows(*id));
+                    if (inventory.sessions != before || vanished)
+                        && tx.send(RoostUpdate::Snapshot(inventory.clone())).is_err()
+                    {
+                        return Ok(Cycle::Done);
+                    }
+                    // **A reorder is a resync, deliberately the cheap way.**
+                    // `RoostInventory::apply` folds no ordering — rows are
+                    // keyed by tab id and carried in list order, and modelling
+                    // roost's two reorder events would mean re-deriving a
+                    // sequence shed does not otherwise own. In the poll era a
+                    // stale order fixed itself within one 2 s tick; an
+                    // event-only watcher would keep it until some unrelated
+                    // resync, which is a user dragging a tab and watching
+                    // nothing happen. A re-list is exactly what restores the
+                    // order, so take one. Reorders are rare and user-driven,
+                    // and the batch we just applied has already reset the
+                    // resync bound, so this cannot spin.
+                    if is_reorder(&batch) {
+                        tracing::debug!(
+                            label = %label,
+                            revision = batch.revision,
+                            "roost reordered; re-listing for the new order"
+                        );
+                        return Ok(Cycle::Resync);
+                    }
+                }
+                Admit::Gap { expected, got } => {
+                    tracing::warn!(
+                        label = %label,
+                        expected,
+                        got,
+                        "roost batch is past the fence"
+                    );
+                    return Ok(Cycle::Resync);
+                }
+            },
+            // Informational: somebody else took the interactive lease. The
+            // stream survives it (that is the whole R1 re-cut) and shed never
+            // held the lease in the first place, so there is nothing to do but
+            // say so.
+            Ok(Some(EventFrame::DriverChanged(changed))) => {
+                tracing::debug!(
+                    label = %label,
+                    taken_by = %changed.taken_by,
+                    "roost driver changed"
+                );
+            }
+            // The one terminal envelope an event stream can see at protocol 4.
+            // The daemon is going away, so this is a `Down` with a reason and
+            // not a resync.
+            Ok(Some(EventFrame::Stopping(stopping))) => {
+                return Err(format!("session stopping: {}", stopping.reason));
+            }
         }
     }
 }
@@ -1041,12 +1206,13 @@ pub async fn tab_dump(reach: &dyn RoostReach, tab_id: i64) -> Result<TabDumpResu
     finish(reach, conn.tab_dump(tab_id).await).await
 }
 
-/// `tab.write` — raw bytes into a tab's PTY. Byte-exact; this is how a prompt
-/// gets typed at an agent.
-pub async fn tab_write(reach: &dyn RoostReach, tab_id: i64, data: &[u8]) -> Result<(), String> {
-    let mut conn = dial(reach).await?;
-    finish(reach, conn.tab_write(tab_id, data).await).await
-}
+// There is no `tab_write` one-shot here. A write is lease-gated at session
+// protocol 4, so it is not a one-shot at all: a caller has to hold a lease
+// across the `session.connect` that minted it and the write it authorizes, and
+// a per-call dial would take the lease from whoever is driving on every
+// keystroke. `shed_core::roost::Conn::{session_connect, tab_write}` is the
+// surface for the code that will drive a tab (A4/S4); nothing in shed calls it
+// today.
 
 /// A held connection for repeatedly dumping one tab.
 ///
@@ -1214,16 +1380,25 @@ mod tests {
 
     // ---- helpers ----
 
-    /// A watcher on a fake, polling fast enough that a test never waits on the
-    /// real 2 s cadence.
+    /// A watcher on a fake. No cadence to shorten — an observer's latency is the
+    /// push, and the only sleep left is the failure backoff.
     fn watch(reach: Arc<dyn RoostReach>) -> (RoostWatcher, mpsc::UnboundedReceiver<RoostUpdate>) {
         RoostWatcher::spawn_inner(
             &tokio::runtime::Handle::current(),
             reach,
             "roost-host".to_string(),
-            Duration::from_millis(5),
             BackoffSleeper::default(),
         )
+    }
+
+    /// Assert nothing arrives for a beat. Paired with a control that then makes
+    /// something arrive — an "it stayed silent" assertion on its own passes just
+    /// as well against a watcher that died.
+    async fn stays_silent(rx: &mut mpsc::UnboundedReceiver<RoostUpdate>) {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        if let Ok(update) = rx.try_recv() {
+            panic!("expected silence, got {update:?}");
+        }
     }
 
     async fn next_update(rx: &mut mpsc::UnboundedReceiver<RoostUpdate>) -> RoostUpdate {
@@ -1255,6 +1430,31 @@ mod tests {
         match next_update(rx).await {
             RoostUpdate::Down { reason } => reason,
             other => panic!("expected Down, got {other:?}"),
+        }
+    }
+
+    /// The next snapshot whose rows are in `order`.
+    ///
+    /// A reorder commits one batch and the resync it triggers re-lists, so the
+    /// cycle's own head snapshot is the one that carries the new order — but the
+    /// batch's snapshot (rows unchanged, order not modelled) may legitimately go
+    /// out first. Skipping to the one under test removes that race without
+    /// weakening anything: under the bug this exists for the new order never
+    /// arrives and [`next_update`]'s timeout fails the test.
+    async fn snapshot_with_order(
+        rx: &mut mpsc::UnboundedReceiver<RoostUpdate>,
+        order: &[i64],
+    ) -> RoostInventory {
+        loop {
+            let inventory = next_snapshot(rx).await;
+            if inventory
+                .sessions
+                .iter()
+                .map(|s| s.tab_id)
+                .eq(order.iter().copied())
+            {
+                return inventory;
+            }
         }
     }
 
@@ -1366,7 +1566,7 @@ mod tests {
     /// Both transports, because the TCP one goes through a socketpair and a copy
     /// pump that a Unix-only test would never touch.
     #[tokio::test]
-    async fn the_first_list_of_a_connection_is_always_a_snapshot_over_both_transports() {
+    async fn the_first_snapshot_of_a_cycle_is_the_list_over_both_transports() {
         let fake = FakeRoost::start().await;
 
         let (unix_watcher, mut unix_rx) =
@@ -1388,9 +1588,26 @@ mod tests {
         );
     }
 
-    /// A committed change emits, and the emitted row carries it.
+    /// **shed watches; it never drives.** The subscribe carries an empty lease,
+    /// which is an observer stream by construction on roost's side — so a
+    /// watcher running against somebody's machine takes nothing away from the
+    /// roost UI they are looking at.
     #[tokio::test]
-    async fn an_axis_change_emits_a_snapshot_carrying_the_changed_row() {
+    async fn the_watcher_subscribes_as_an_observer() {
+        let fake = FakeRoost::start().await;
+        let (watcher, mut rx) = watch(Arc::new(LocalSession::new("localhost", fake.socket_path())));
+        next_snapshot(&mut rx).await;
+
+        assert_eq!(fake.observer_count(), 1);
+        assert_eq!(fake.driver_count(), 0, "shed holds no lease, ever");
+        watcher.stop();
+    }
+
+    /// **A pushed batch is the whole update path.** The change arrives on the
+    /// stream and is folded in; the inventory is re-read exactly once per cycle,
+    /// which is what the `tab.list` counter pins.
+    #[tokio::test]
+    async fn an_axis_change_arrives_as_a_batch_without_re_reading_the_list() {
         let fake = FakeRoost::start().await;
         fake.set_tab_axes(TAB, "working", Some(owned("session_status")), false);
 
@@ -1403,6 +1620,7 @@ mod tests {
             .expect("the owned tab is a row");
         assert_eq!(before.activity(), Some(RcActivity::Working));
         assert!(!before.attention);
+        assert_eq!(fake.tab_list_calls(), 1);
 
         fake.set_tab_axes(TAB, "waiting", Some(owned("permission_asked")), true);
         let second = next_snapshot(&mut rx).await;
@@ -1414,34 +1632,112 @@ mod tests {
         assert_eq!(after.activity(), Some(RcActivity::NeedsApproval));
         assert!(after.attention, "roost's sticky notification bit");
         assert!(second.revision > first.revision);
+        assert_eq!(
+            fake.tab_list_calls(),
+            1,
+            "a pushed change must not cost a snapshot re-read"
+        );
         watcher.stop();
     }
 
-    /// **The negative control is the second half.** An "it stayed silent"
-    /// assertion passes just as well against a watcher that died, a receiver
-    /// nobody feeds, or a poll interval of a week — so the same test then
-    /// commits a revision and requires the snapshot to arrive. Only the pair
-    /// says the silence was a decision.
+    /// **Only a row change is news.** An empty commit and a tab nobody's adapter
+    /// owns both advance the revision and publish nothing — and the control that
+    /// follows says the silence was a decision and not a dead watcher.
     #[tokio::test]
-    async fn an_unchanged_revision_is_silent_and_the_control_that_bumps_it_is_not() {
+    async fn an_empty_commit_and_a_hidden_tab_emit_nothing() {
         let fake = FakeRoost::start().await;
-        let (watcher, mut rx) = watch(Arc::new(LocalSession::new("localhost", fake.socket_path())));
+        fake.set_tab_axes(TAB, "working", Some(owned("session_status")), false);
+        let reach: Arc<dyn RoostReach> =
+            Arc::new(LocalSession::new("localhost", fake.socket_path()));
+
+        let (watcher, mut rx) = watch(Arc::clone(&reach));
         let first = next_snapshot(&mut rx).await;
+        assert_eq!(first.sessions.len(), 1);
 
-        // Five poll intervals' worth of quiet.
-        tokio::time::sleep(Duration::from_millis(25)).await;
-        assert!(
-            rx.try_recv().is_err(),
-            "an unchanged revision must not re-emit"
-        );
-
-        // The control: the ONLY thing that changed is the revision.
+        // A commit that produced no events. roost pushes it anyway, which is
+        // what makes a skipped revision mean loss — but it changes no row.
         fake.bump_revision();
+        stays_silent(&mut rx).await;
+
+        // A plain shell tab: it opens, the fold remembers it so a later claim can
+        // promote it, and it is not a session row.
+        let opened = tab_open(
+            reach.as_ref(),
+            TabOpenParams {
+                title: "zsh".to_string(),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("tab.open");
+        stays_silent(&mut rx).await;
+
+        // The control.
+        fake.set_tab_axes(TAB, "waiting", Some(owned("question_asked")), false);
         let second = next_snapshot(&mut rx).await;
-        assert_eq!(second.revision, Some(first.revision.expect("a fence") + 1));
+        assert_eq!(second.sessions.len(), 1);
+        assert!(
+            second.revision > first.revision,
+            "the quiet commits advanced the revision even though nothing emitted"
+        );
+        assert!(
+            !second.sessions.iter().any(|s| s.tab_id == opened.id),
+            "an unowned tab is somebody's terminal, not a session row"
+        );
+        assert_eq!(fake.tab_list_calls(), 1);
+        watcher.stop();
+    }
+
+    /// **A hidden tab VANISHING is news, even though its opening was not.**
+    ///
+    /// The asymmetry is the point. A client can be holding a row of its own for
+    /// a tab it opened and no adapter has claimed yet — the Tauri client inserts
+    /// one optimistically so a launch appears at once — and if the launched
+    /// process dies before it ever reports, every event about that tab lands in
+    /// the hidden half. Suppressing the close as "hidden churn" would leave that
+    /// client showing a card for a tab that no longer exists, with no next poll
+    /// to repair it.
+    #[tokio::test]
+    async fn a_vanished_hidden_tab_emits_a_snapshot() {
+        let fake = FakeRoost::start().await;
+        fake.set_tab_axes(TAB, "working", Some(owned("session_status")), false);
+        let reach: Arc<dyn RoostReach> =
+            Arc::new(LocalSession::new("localhost", fake.socket_path()));
+
+        let (watcher, mut rx) = watch(Arc::clone(&reach));
+        let first = next_snapshot(&mut rx).await;
+        assert_eq!(first.sessions.len(), 1);
+
+        // Opening it emits nothing — the suppression the test above pins.
+        let opened = tab_open(
+            reach.as_ref(),
+            TabOpenParams {
+                title: "zsh".to_string(),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("tab.open");
+        stays_silent(&mut rx).await;
+
+        tab_close(reach.as_ref(), opened.id)
+            .await
+            .expect("tab.close");
+        let second = next_snapshot(&mut rx).await;
+        assert!(
+            !second.knows(opened.id),
+            "the inventory published the tab as gone"
+        );
         assert_eq!(
-            second.sessions, first.sessions,
-            "an empty commit still emits — the rows are simply the same"
+            second.sessions.len(),
+            1,
+            "and the VISIBLE row set never moved"
+        );
+        assert!(second.revision > first.revision);
+        assert_eq!(
+            fake.tab_list_calls(),
+            1,
+            "a vanished tab is still a pushed change, not a re-read"
         );
         watcher.stop();
     }
@@ -1470,118 +1766,330 @@ mod tests {
         watcher.stop();
     }
 
-    /// **A restart makes the revision go DOWN.** roost persists tab ids and
-    /// keeps `revision` in process, so a restarted daemon reports 1 after having
-    /// reported 42. A `>` comparison would stop emitting for the rest of that
-    /// connection's life; `!=` is why this passes.
+    /// **A lost commit is a resync, not a `Down`.** The daemon is alive and we
+    /// are behind it, so the cycle starts over at once: one more `tab.list`, a
+    /// fresh fence, and the row that moved.
     #[tokio::test]
-    async fn a_daemon_restart_emits_even_though_the_revision_went_backwards() {
+    async fn a_revision_gap_resyncs_without_a_down() {
         let fake = FakeRoost::start().await;
+        fake.set_tab_axes(TAB, "working", Some(owned("session_status")), false);
+        let reach = FlakyReach::new(RoostEndpoint::Unix(fake.socket_path().to_path_buf()), 0);
+
+        let (watcher, mut rx) = watch(reach.clone());
+        next_snapshot(&mut rx).await;
+        assert_eq!(fake.tab_list_calls(), 1);
+
+        // The only way to manufacture loss: advance the counter without pushing,
+        // then commit. The client's own stream raises the gap before the batch
+        // is ever yielded.
+        fake.skip_revision();
+        fake.set_tab_axes(TAB, "waiting", Some(owned("permission_asked")), false);
+
+        // `next_snapshot` panics on a `Down`, so this asserts both halves.
+        let after = next_snapshot(&mut rx).await;
+        assert_eq!(
+            after
+                .sessions
+                .iter()
+                .find(|s| s.tab_id == TAB)
+                .expect("still a row")
+                .activity(),
+            Some(RcActivity::NeedsApproval),
+            "the resync's snapshot carries the state the lost batch would have"
+        );
+        assert_eq!(
+            fake.tab_list_calls(),
+            2,
+            "exactly one more list — a resync, not a poll"
+        );
+        assert_eq!(
+            reach.invalidations.load(Ordering::SeqCst),
+            0,
+            "a resync tears down no transport: the daemon is fine, we are behind"
+        );
+        watcher.stop();
+    }
+
+    /// **`session.driver_changed` asks for nothing.** Somebody else took the
+    /// interactive lease; shed never held it, the stream survives (that is the
+    /// whole R1 re-cut), and the next commit still arrives on the same
+    /// subscription.
+    #[tokio::test]
+    async fn a_driver_change_is_informational_and_the_stream_keeps_delivering() {
+        let fake = FakeRoost::start().await;
+        fake.set_tab_axes(TAB, "working", Some(owned("session_status")), false);
+        // Somebody has to be holding the lease for a takeover to depose them —
+        // roost announces a *change* of driver, not a first claim.
+        let mut driver = Conn::endpoint(&RoostEndpoint::Unix(fake.socket_path().to_path_buf()))
+            .await
+            .expect("dial");
+        driver
+            .session_connect(false, Some("the-roost-ui"))
+            .await
+            .expect("mints");
+
         let (watcher, mut rx) = watch(Arc::new(LocalSession::new("localhost", fake.socket_path())));
+        next_snapshot(&mut rx).await;
+
+        fake.take_over("workbox");
+        stays_silent(&mut rx).await;
+
+        fake.set_tab_axes(TAB, "waiting", Some(owned("permission_asked")), false);
+        let after = next_snapshot(&mut rx).await;
+        assert_eq!(
+            after
+                .sessions
+                .iter()
+                .find(|s| s.tab_id == TAB)
+                .expect("still a row")
+                .activity(),
+            Some(RcActivity::NeedsApproval)
+        );
+        assert_eq!(
+            fake.tab_list_calls(),
+            1,
+            "a takeover must not cost a resync — the subscription is still ours"
+        );
+        watcher.stop();
+    }
+
+    /// **The subscribe/list race, which the prologue's ordering exists for.** A
+    /// mutation commits between the ack and the `tab.list` reply: the batch it
+    /// pushed is already in the snapshot, so it is discarded by the fence rather
+    /// than mistaken for a gap, and the next commit applies normally.
+    ///
+    /// The fence assertions alone would **not** catch a list-first client: it
+    /// would list, take the hook's commit into its snapshot, and then subscribe
+    /// at that same revision, and every number below would still line up. What
+    /// makes the ordering observable is the hook reading the fake's subscriber
+    /// registry from *inside* the `tab.list` lock — a client that subscribed
+    /// first has a stream registered by then, and a list-first one has none.
+    #[tokio::test]
+    async fn a_commit_between_the_ack_and_the_list_is_discarded_not_a_gap() {
+        let fake = FakeRoost::start().await;
+        fake.set_tab_axes(TAB, "working", Some(owned("session_status")), false);
+        let acked = fake.revision();
+
+        // Recorded rather than asserted in the hook: a panic inside the fake's
+        // connection task would kill that task and time the test out, which
+        // reports the wrong thing.
+        let subscribed_by_list_time = Arc::new(AtomicUsize::new(usize::MAX));
+        let recorder = Arc::clone(&subscribed_by_list_time);
+        // Runs under the fake's state lock, once, just before the reply — the
+        // exact interleaving a busy daemon produces.
+        fake.before_tab_list(move |hook| {
+            recorder.store(hook.observer_count(), Ordering::SeqCst);
+            hook.bump_revision();
+        });
+
+        let (watcher, mut rx) = watch(Arc::new(LocalSession::new("localhost", fake.socket_path())));
+        let first = next_snapshot(&mut rx).await;
+        assert_eq!(
+            subscribed_by_list_time.load(Ordering::SeqCst),
+            1,
+            "the stream must already be registered when the list is served — \
+             a list-first prologue would read 0 here and turn every commit in \
+             the window into a spurious gap"
+        );
+        assert_eq!(
+            first.revision,
+            Some(acked + 1),
+            "the snapshot is already past the batch the stream is about to deliver"
+        );
+
+        // The queued `acked + 1` is discarded; `acked + 2` applies. A
+        // list-then-subscribe prologue would have called this a gap.
+        fake.set_tab_axes(TAB, "waiting", Some(owned("permission_asked")), false);
+        let second = next_snapshot(&mut rx).await;
+        assert_eq!(second.revision, Some(acked + 2));
+        assert_eq!(
+            fake.tab_list_calls(),
+            1,
+            "no resync happened, so the list was read exactly once"
+        );
+        watcher.stop();
+    }
+
+    /// **A reorder costs a re-list, on purpose.** `RoostInventory` folds no
+    /// ordering, so the only way the new order reaches a client is a fresh
+    /// `tab.list` — and under the old poll loop it arrived within one tick for
+    /// free. An event-only watcher that ignored the two reorder events would
+    /// leave a user who just dragged a tab looking at the old order until some
+    /// unrelated resync.
+    #[tokio::test]
+    async fn a_reorder_costs_exactly_one_re_list_and_no_down() {
+        let fake = FakeRoost::start().await;
+        // Two owned tabs, so an order is observable at all.
+        let second = {
+            let reach: Arc<dyn RoostReach> =
+                Arc::new(LocalSession::new("localhost", fake.socket_path()));
+            tab_open(
+                reach.as_ref(),
+                TabOpenParams {
+                    title: "second".to_string(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("tab.open")
+            .id
+        };
+        fake.set_tab_axes(TAB, "working", Some(owned("session_status")), false);
+        fake.set_tab_axes(second, "working", Some(owned("session_status")), false);
+
+        let (watcher, mut rx) = watch(Arc::new(LocalSession::new("localhost", fake.socket_path())));
+        let before = next_snapshot(&mut rx).await;
+        let order: Vec<i64> = before.sessions.iter().map(|s| s.tab_id).collect();
+        assert_eq!(order, vec![TAB, second]);
+        assert_eq!(fake.tab_list_calls(), 1);
+
+        fake.reorder_tabs();
+        // `next_snapshot` panics on a `Down`, so this pins "no Down" too.
+        let after = snapshot_with_order(&mut rx, &[second, TAB]).await;
+        assert_eq!(
+            after.sessions.iter().map(|s| s.tab_id).collect::<Vec<_>>(),
+            vec![second, TAB],
+            "the re-list is what carries the new order"
+        );
+        assert_eq!(
+            fake.tab_list_calls(),
+            2,
+            "exactly one re-list — the reorder is a resync, not a poll"
+        );
+
+        // And the bound is not spent: the applied batch reset it, so a reorder
+        // storm cannot ratchet a healthy session into `Down`.
+        for _ in 0..MAX_CONSECUTIVE_RESYNCS + 2 {
+            fake.reorder_tabs();
+            next_snapshot(&mut rx).await;
+        }
+        watcher.stop();
+    }
+
+    /// **A restart is an EOF, and an EOF is a resync.** No `Down`, no backoff:
+    /// the next cycle re-identifies and the snapshot carries the daemon that is
+    /// actually there now, with the tab ids roost persisted across it.
+    #[tokio::test]
+    async fn a_daemon_restart_is_a_resync_that_re_identifies() {
+        let fake = FakeRoost::start().await;
+        let reach = FlakyReach::new(RoostEndpoint::Unix(fake.socket_path().to_path_buf()), 0);
+        let (watcher, mut rx) = watch(reach.clone());
         let before = next_snapshot(&mut rx).await;
         assert!(before.revision > Some(1), "the vector starts well above 1");
 
         fake.restart();
-        // **The new instance's id, not the old one's.** `session.identify` is
-        // re-run on every poll precisely so this is fresh: a snapshot stamped
-        // with a dead daemon's id tells a client the daemon it is looking at is
-        // one it is not. Under the old once-per-connection identify this id
-        // never arrives and the wait below times the test out.
         let restarted = fake.session_id();
+        // `next_snapshot` panics on a `Down`, so the whole point — that a
+        // restart never renders the row stale-with-a-reason — is asserted by
+        // getting here at all.
         let after = snapshot_from_daemon(&mut rx, &restarted).await;
-        assert_eq!(after.revision, Some(1));
-        assert!(
-            after.revision < before.revision,
-            "the whole point: the number went down and it still emitted"
-        );
+        assert_eq!(after.revision, Some(1), "the counter is in-process");
         assert_ne!(
             after.daemon_session_id, before.daemon_session_id,
             "a restarted daemon is a new instance and the rows must say so"
         );
-        // Tab ids persist across a restart, which is why rows key off them.
         assert_eq!(
             after.sessions.iter().map(|s| s.tab_id).collect::<Vec<_>>(),
-            before.sessions.iter().map(|s| s.tab_id).collect::<Vec<_>>()
+            before.sessions.iter().map(|s| s.tab_id).collect::<Vec<_>>(),
+            "tab ids persist across a restart, which is why rows key off them"
+        );
+        assert_eq!(
+            reach.invalidations.load(Ordering::SeqCst),
+            0,
+            "the transport was never the problem"
         );
         watcher.stop();
     }
 
-    /// **The restart the revision cannot see.** roost's counter resets to 1, so
-    /// a daemon that restarts while the last emitted revision is *already* 1
-    /// moves nothing at all on the `tab.list` wire — and the socket does not
-    /// have to drop for that to happen (a session handed off, a fake's
-    /// `restart()`, any real restart racing the poll). If `session.identify`
-    /// were taken once per connection, this snapshot would never be sent and
-    /// every row afterwards would carry a dead instance's id.
+    /// A hang-up with nothing else wrong is the same story as a restart: the
+    /// stream ends, the cycle starts over, and the row never goes stale.
     #[tokio::test]
-    async fn a_restart_that_does_not_move_the_revision_still_emits() {
-        let fake = FakeRoost::start().await;
-        let (watcher, mut rx) = watch(Arc::new(LocalSession::new("localhost", fake.socket_path())));
-        next_snapshot(&mut rx).await;
-
-        // Get the last emitted revision down to 1, so the restart under test has
-        // no revision movement left to be noticed by.
-        fake.restart();
-        let first_restart = fake.session_id();
-        let at_one = snapshot_from_daemon(&mut rx, &first_restart).await;
-        assert_eq!(at_one.revision, Some(1));
-
-        // The ONLY thing that changes now is the daemon instance: same revision,
-        // same tabs, same socket, new `session_id`.
-        fake.restart();
-        let second_restart = fake.session_id();
-        let after = snapshot_from_daemon(&mut rx, &second_restart).await;
-        assert_eq!(
-            after.revision,
-            Some(1),
-            "the revision is the same number it already was"
-        );
-        assert_ne!(
-            after.daemon_session_id, at_one.daemon_session_id,
-            "the session id is the only signal there was, and it is what fired"
-        );
-        assert_eq!(
-            after.sessions, at_one.sessions,
-            "the rows are unchanged — the news is which daemon they came from"
-        );
-        watcher.stop();
-    }
-
-    /// A dropped connection is `Down`, then a reconnect with a fresh snapshot —
-    /// the reach is invalidated on the way through so the next `ensure` rebuilds.
-    #[tokio::test]
-    async fn a_hangup_is_a_down_then_a_reconnect_with_a_fresh_snapshot() {
+    async fn a_hangup_is_a_resync_with_a_fresh_snapshot_and_no_down() {
         let fake = FakeRoost::start().await;
         let reach = FlakyReach::new(RoostEndpoint::Unix(fake.socket_path().to_path_buf()), 0);
         let (watcher, mut rx) = watch(reach.clone());
         next_snapshot(&mut rx).await;
 
         fake.close_all();
-        let reason = next_down(&mut rx).await;
-        assert!(!reason.is_empty(), "a Down always says why");
-        assert!(
-            reach.invalidations.load(Ordering::SeqCst) >= 1,
-            "any error invalidates the reach"
-        );
-
         let again = next_snapshot(&mut rx).await;
         assert_eq!(again.daemon_session_id, fake.session_id());
+        assert_eq!(reach.invalidations.load(Ordering::SeqCst), 0);
+        watcher.stop();
+    }
+
+    /// **The resync bound, on EOFs.** A daemon that ends the stream before it
+    /// ever delivers a commit would otherwise be reconnected to as fast as the
+    /// loop can run, forever. Three in a row are silent; the fourth is a `Down`
+    /// that says so.
+    #[tokio::test]
+    async fn a_run_of_eofs_is_bounded_and_the_fourth_is_a_down() {
+        let fake = FakeRoost::start().await;
+        let (watcher, mut rx) = watch(Arc::new(LocalSession::new("localhost", fake.socket_path())));
+
+        for attempt in 0..=MAX_CONSECUTIVE_RESYNCS {
+            // `next_snapshot` panics on a `Down`, so the first
+            // MAX_CONSECUTIVE_RESYNCS rounds assert the silence too.
+            next_snapshot(&mut rx).await;
+            assert!(
+                fake.tab_list_calls() == attempt as usize + 1,
+                "one list per cycle"
+            );
+            fake.close_all();
+        }
+        let reason = next_down(&mut rx).await;
+        assert!(
+            reason.contains("resyncing too often"),
+            "the reason has to name the bound, not the last EOF: {reason}"
+        );
+        watcher.stop();
+    }
+
+    /// **An applied batch resets the bound.** A feed that is delivering commits
+    /// and merely reconnecting a lot is healthy; only a run with no progress in
+    /// it is not. Without the reset the fourth EOF below would be a `Down`.
+    #[tokio::test]
+    async fn an_applied_batch_resets_the_resync_bound() {
+        let fake = FakeRoost::start().await;
+        let (watcher, mut rx) = watch(Arc::new(LocalSession::new("localhost", fake.socket_path())));
+
+        for _ in 0..MAX_CONSECUTIVE_RESYNCS {
+            next_snapshot(&mut rx).await;
+            fake.close_all();
+        }
+
+        // The cycle that makes progress: an empty commit is *applied* (it moves
+        // the fence) even though it changes no row and emits nothing.
+        next_snapshot(&mut rx).await;
+        fake.bump_revision();
+        stays_silent(&mut rx).await;
+        fake.close_all();
+
+        // Two more bare EOFs. Counting from the reset these are 2 and 3; without
+        // it they would be 5 and 6, and the run would have died at 4.
+        for _ in 0..2 {
+            next_snapshot(&mut rx).await;
+            fake.close_all();
+        }
+        next_snapshot(&mut rx).await;
         watcher.stop();
     }
 
     /// Mirrors `machine.rs`'s `a_connection_that_worked_resets_the_delay…`: the
     /// reset is keyed on the connection having WORKED, not on how it ended.
+    ///
+    /// The terminal event is a `session.stopping` rather than a hang-up, because
+    /// a bare EOF is no longer a `Down` at all — it is a resync, and a resync
+    /// never reaches the backoff this test reads.
     #[tokio::test]
     async fn a_connection_that_worked_resets_the_delay_however_it_later_ended() {
         let fake = FakeRoost::start().await;
         let (sleeper, mut waits) = ScriptedSleeper::new(3);
-        // Two dead attempts, then a live one whose feed is killed under it.
+        // Two dead attempts, then a live one whose session then stops.
         let reach = FlakyReach::new(RoostEndpoint::Unix(fake.socket_path().to_path_buf()), 2);
         let (watcher, mut rx) = RoostWatcher::spawn_inner(
             &tokio::runtime::Handle::current(),
             reach,
             "roost-host".to_string(),
-            Duration::from_millis(5),
             BackoffSleeper {
                 scripted: Some(sleeper),
             },
@@ -1605,11 +2113,11 @@ mod tests {
             "a second dead attempt ratchets"
         );
 
-        // The third attempt reaches the fake and emits; then the fake hangs up.
+        // The third attempt reaches the fake and emits; then the session stops.
         // (The two dead attempts' `Down`s are queued ahead of it — each one is
         // sent before the wait that was just read.)
         snapshot_past_downs(&mut rx).await;
-        fake.close_all();
+        fake.stop();
         assert_eq!(
             next_wait(&mut waits).await,
             backoff::INITIAL,
@@ -1617,6 +2125,33 @@ mod tests {
              must start over — resetting only on a clean end would leave a \
              healthy feed reconnecting at the ceiling"
         );
+        watcher.stop();
+    }
+
+    /// **`session.stopping` is the one thing on a stream that IS a `Down`.** The
+    /// daemon is going away, so this is not a resync; the row goes
+    /// stale-with-a-reason, stays that way while nothing answers, and comes back
+    /// when the daemon does.
+    #[tokio::test]
+    async fn a_stopping_session_is_a_down_that_recovers_on_restart() {
+        let fake = FakeRoost::start().await;
+        let (watcher, mut rx) = watch(Arc::new(LocalSession::new("localhost", fake.socket_path())));
+        next_snapshot(&mut rx).await;
+
+        fake.stop();
+        assert_eq!(
+            next_down(&mut rx).await,
+            "session stopping: stop",
+            "the reason is roost's own, carried through"
+        );
+        // A stopped daemon accepts nothing, so the retry after the backoff fails
+        // too — the row does not flicker back to fresh on its own.
+        let while_stopped = next_down(&mut rx).await;
+        assert!(!while_stopped.is_empty(), "a Down always says why");
+
+        fake.restart();
+        let after = snapshot_past_downs(&mut rx).await;
+        assert_eq!(after.daemon_session_id, fake.session_id());
         watcher.stop();
     }
 
@@ -1650,6 +2185,18 @@ mod tests {
         watcher.stop();
     }
 
+    /// The un-upgraded machine on the network today: a protocol-2 daemon is
+    /// refused rather than limped through, and the row says so.
+    #[tokio::test]
+    async fn a_protocol_two_daemon_is_a_down_rather_than_a_degraded_row() {
+        let fake = FakeRoost::start().await;
+        fake.set_session_protocol(2);
+        let (watcher, mut rx) = watch(Arc::new(LocalSession::new("localhost", fake.socket_path())));
+        let reason = next_down(&mut rx).await;
+        assert!(reason.contains("session protocol 2"), "{reason}");
+        watcher.stop();
+    }
+
     #[tokio::test]
     async fn stopping_a_watcher_ends_its_loop() {
         let fake = FakeRoost::start().await;
@@ -1658,7 +2205,7 @@ mod tests {
         assert_eq!(watcher.label(), "roost-host");
 
         watcher.stop();
-        fake.bump_revision();
+        fake.set_tab_axes(TAB, "working", Some(owned("session_status")), true);
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert!(
             rx.try_recv().is_err(),
@@ -1672,7 +2219,7 @@ mod tests {
     ///
     /// Read off `ensure` calls rather than off the channel that was just
     /// dropped: one attempt is all a stopped loop ever makes, and a loop that
-    /// kept reconnecting against a session that keeps hanging up would climb.
+    /// kept resyncing against a session that keeps hanging up would climb.
     #[tokio::test]
     async fn dropping_the_receiver_ends_the_loop() {
         let fake = FakeRoost::start().await;
@@ -1718,11 +2265,9 @@ mod tests {
         .expect("tab.open");
         assert_eq!(tab.cwd, "/home/shed/app");
 
-        tab_write(reach.as_ref(), tab.id, b"hello\r")
-            .await
-            .expect("write");
-        assert_eq!(fake.written(tab.id), b"hello\r");
-
+        // No write here: a `tab.write` is lease-gated at session protocol 4 and
+        // therefore not a one-shot at all — it lives on `Conn`, beside the
+        // `session.connect` that authorizes it, and is tested there.
         let dump = tab_dump(reach.as_ref(), tab.id).await.expect("dump");
         assert!(dump.rows_text.iter().any(|line| line.contains("opencode")));
 
@@ -2248,7 +2793,11 @@ except Exception:
         let ssh = write_fake_ssh(dir.path(), fake.socket_path(), &log);
         fake.set_tab_axes(TAB, "working", Some(owned("session_status")), false);
 
-        let bridge = faked_bridge("mini3", ssh);
+        // A machine name of its own, and it is load-bearing: roost's `open`
+        // sweeps THIS PROCESS's older scratch directories for the same host id
+        // with no liveness probe, so two concurrent tests sharing a name have
+        // one of them delete the other's `bridge.sock` out from under it.
+        let bridge = faked_bridge("mini-watch", ssh);
         let (watcher, mut rx) = watch(Arc::new(bridge));
         let inventory = next_snapshot(&mut rx).await;
         assert_eq!(inventory.host_label, "roost-host");

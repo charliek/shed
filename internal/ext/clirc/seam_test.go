@@ -118,9 +118,11 @@ func TestCreateHonorsKillSwitchEndToEnd(t *testing.T) {
 }
 
 // TestHubConfigEnvOverrides pins the plan-010 oracle seams: SHED_RC_HUB_ADDR
-// (loopback-enforced) and the six *_MS interval overrides, wired only through
+// (loopback-enforced) and the five *_MS interval overrides, wired only through
 // hubConfig — inert unless set, ignored (with a prog-name-prefixed stderr note)
 // when malformed, and never able to widen the bind off 127.0.0.1.
+// A sixth seam set the pane-stability tracker's settle window; it went with that
+// tracker in S2 (charliek/shed#324).
 func TestHubConfigEnvOverrides(t *testing.T) {
 	mkGetenv := func(env map[string]string) rc.Getenv {
 		return func(k string) string { return env[k] }
@@ -130,7 +132,7 @@ func TestHubConfigEnvOverrides(t *testing.T) {
 		var errb bytes.Buffer
 		hc := hubConfig(machineCfg, deps{getenv: mkGetenv(nil), stderr: &errb})
 		if hc.Addr != "" || hc.ActiveInterval != 0 || hc.IdleInterval != 0 ||
-			hc.QuietPeriod != 0 || hc.IdleTimeout != 0 || hc.Heartbeat != 0 || hc.WriteTimeout != 0 {
+			hc.IdleTimeout != 0 || hc.Heartbeat != 0 || hc.WriteTimeout != 0 {
 			t.Fatalf("unset env mutated config: %+v", hc)
 		}
 		if errb.Len() != 0 {
@@ -181,7 +183,6 @@ func TestHubConfigEnvOverrides(t *testing.T) {
 		env := map[string]string{
 			"SHED_RC_HUB_ACTIVE_MS":        "100",
 			"SHED_RC_HUB_IDLE_MS":          "250",
-			"SHED_RC_HUB_QUIET_MS":         "500",
 			"SHED_RC_HUB_IDLE_EXIT_MS":     "86400000",
 			"SHED_RC_HUB_HEARTBEAT_MS":     "1000",
 			"SHED_RC_HUB_WRITE_TIMEOUT_MS": "2000",
@@ -195,7 +196,6 @@ func TestHubConfigEnvOverrides(t *testing.T) {
 		}{
 			{"ActiveInterval", hc.ActiveInterval, 100},
 			{"IdleInterval", hc.IdleInterval, 250},
-			{"QuietPeriod", hc.QuietPeriod, 500},
 			{"IdleTimeout", hc.IdleTimeout, 86400000},
 			{"Heartbeat", hc.Heartbeat, 1000},
 			{"WriteTimeout", hc.WriteTimeout, 2000},

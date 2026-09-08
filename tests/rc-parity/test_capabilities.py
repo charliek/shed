@@ -69,14 +69,24 @@ def test_capabilities_payload(differential, isolated):
         "attach": "tmux",
     }
     # claude-rc's row omits `watch` (false) and `input` ("") — Go's omitempty,
-    # which the client-side absent-field fallbacks depend on.
-    assert caps["kind_features"]["claude-rc"] == {
+    # which the client-side absent-field fallbacks depend on. `feed` is "none"
+    # since A5/A6 (charliek/shed#321, #322) retired the claude transcript tail,
+    # the codex rollout tail and the cursor hook-ingest lane: with no producer
+    # left, "activity" would be a false claim under the contract's own
+    # definition (docs/extensions/rc-helper.md). roost is the status authority
+    # for those kinds now.
+    tui_row = {
         "post_input": True,
         "approvals": "tui",
-        "feed": "activity",
+        "feed": "none",
         "interrupt": False,
         "attach": "tmux",
     }
+    assert caps["kind_features"]["claude-rc"] == tui_row
+    # …and codex and cursor now read IDENTICALLY to it: they stay launchable,
+    # attachable TUI kinds with no derived lane at all.
+    assert caps["kind_features"]["codex"] == tui_row
+    assert caps["kind_features"]["cursor"] == tui_row
 
 
 def test_list_embeds_capabilities_beside_a_live_session(differential, isolated):

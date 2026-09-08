@@ -477,16 +477,33 @@ class Rig:
 
         return self._poll(f"session {name} never appeared", listed, timeout)
 
-    def wait_for_pane(self, name: str, needle: str = "", timeout: float = 15) -> str:
+    def wait_for_pane(
+        self, name: str, needle: str = "", timeout: float = 15, count: int = 1
+    ) -> str:
         """Poll until the pane has drawn `needle` (or anything at all when it is
         empty). The engine's own settle constants are 750 ms, so a session that
-        has not drawn within the budget is a real failure, not a slow machine."""
+        has not drawn within the budget is a real failure, not a slow machine.
+
+        `count` is the same remedy `wait_for_agent_argv` documents below, for the
+        same observed flake: a caller that COUNTS occurrences must wait for all of
+        them, because a pane mid-render satisfies "the needle is present" while
+        still holding fewer copies than the finished screen. Polling for presence
+        and then counting is a race between the two legs, and it surfaces as a
+        spurious Go-vs-Rust diff (3 markers against 4) rather than as the render
+        lag it actually is."""
 
         def drawn():
             text = self.capture(name)
-            return text if (needle in text if needle else text.strip()) else None
+            if needle:
+                return text if text.count(needle) >= count else None
+            return text if text.strip() else None
 
-        return self._poll(f"pane of {name} never showed {needle!r}", drawn, timeout)
+        return self._poll(
+            f"pane of {name} never showed {needle!r}"
+            + (f" {count} times" if count > 1 else ""),
+            drawn,
+            timeout,
+        )
 
     def wait_for_agent_argv(self, count: int, timeout: float = 15) -> list:
         """Poll until the shim has recorded at least `count` argv elements.
@@ -870,13 +887,14 @@ def differential(request):
 HUB_RUST_LIVE = True
 
 # Fast ticks for the differential (both legs ALWAYS get the same values):
-# active/idle drive reconcile latency, quiet drives stability settle, idle-exit
-# is pinned LARGE-FINITE because the Go seam cannot express "never" (resolve()
-# maps <=0 back to the 15m default — plan 010 §2.5).
+# active/idle drive reconcile latency; idle-exit is pinned LARGE-FINITE because
+# the Go seam cannot express "never" (resolve() maps <=0 back to the 15m default
+# — plan 010 §2.5). A sixth knob drove the pane-stability settle; it went with
+# that engine in S2 (charliek/shed#324), on both sides — a knob the two hubs read
+# differently would be a silent drift point on a differential-gated wire.
 HUB_TUNING = {
     "SHED_RC_HUB_ACTIVE_MS": "100",
     "SHED_RC_HUB_IDLE_MS": "250",
-    "SHED_RC_HUB_QUIET_MS": "500",
     "SHED_RC_HUB_IDLE_EXIT_MS": "86400000",
     "SHED_RC_HUB_HEARTBEAT_MS": "1000",
     "SHED_RC_HUB_WRITE_TIMEOUT_MS": "2000",
@@ -1074,7 +1092,12 @@ class HubLeg(Leg):
         the reconcile-built tracked map — a verb fired in the gap earns a 404
         `unknown_slug` instead of its kind-based 409 (observed live while
         recording the first goldens). The ACTIVITY OVERLAY is the observable
-        proof the tracked session exists: only a tracked entry carries it."""
+        proof the tracked session exists: only a tracked entry carries it.
+
+        OPENCODE ONLY, since S2 (charliek/shed#324) removed the pane-stability
+        fallback that gave every kind an overlay — a feedless kind now carries
+        no activity at all. The codex-tracked cells use the `/messages` 404→200
+        flip instead (`test_hub.py::_tracked_codex`)."""
 
         def tracked():
             got = self.hub_request("GET", "/v1/sessions")

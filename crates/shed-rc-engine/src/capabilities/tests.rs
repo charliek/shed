@@ -45,6 +45,15 @@ fn info(version: &str) -> RcAgentInfo {
 
 /// The NORMATIVE per-kind matrix, exhaustively: every field of every kind that
 /// has a row, plus the deliberate omission of `claude-broker` and `shell`.
+///
+/// opencode is the only live lane. Every other kind reads feed "none" and
+/// input "": A5/A6 (`charliek/shed#321`, `#322`) retired the claude transcript
+/// tail, the codex rollout tail and the cursor hook-ingest lane, so the hub
+/// derives NO signal for them at all. `none` rather than `activity` is
+/// deliberate and departs from #322's acceptance box: under the contract's own
+/// definition (`docs/extensions/rc-helper.md`) `activity` claims the hub can
+/// stream the activity dimension, and with no producer that would be a false
+/// claim.
 #[test]
 fn kind_features_matrix_by_value() {
     let kf = kind_features();
@@ -63,20 +72,14 @@ fn kind_features_matrix_by_value() {
     let want = [
         (
             "claude-rc",
-            row(true, "tui", false, "", "activity", false, "tmux"),
+            row(true, "tui", false, "", "none", false, "tmux"),
         ),
-        (
-            "codex",
-            row(true, "tui", true, "gated", "messages", false, "tmux"),
-        ),
+        ("codex", row(true, "tui", false, "", "none", false, "tmux")),
         (
             "opencode",
             row(true, "remote", true, "turn", "messages", true, "tmux"),
         ),
-        (
-            "cursor",
-            row(true, "tui", true, "gated", "messages", false, "tmux"),
-        ),
+        ("cursor", row(true, "tui", false, "", "none", false, "tmux")),
     ];
     for (kind, want) in &want {
         assert_eq!(kf.get(*kind), Some(want), "kind_features[{kind}]");

@@ -528,6 +528,11 @@ const CLAUDE_TRUST: &str = "Quick safety check: Yes, I trust this folder";
 const CLAUDE_BYPASS: &str = "WARNING: Bypass Permissions mode\n1. No, exit\n2. Yes, I accept";
 const CLAUDE_NEEDS_AUTH: &str = "You are not logged in. Run /login to continue.";
 const CLAUDE_STARTING: &str = "Remote Control connecting";
+const CODEX_TRUST: &str = "codex\nDo you trust the contents of this directory?\n1. Yes, continue";
+/// The one-shot `prompt` verb's control-gate refusal, spelled once (Go's
+/// `ops.go` message, verbatim — the two implementations must agree on the wire).
+const TRUST_DIALOG_REFUSAL: &str =
+    "invalid arguments: session is showing a one-time trust/bypass dialog; accept it first";
 
 #[test]
 fn wait_reaches_ready_and_delivers_the_kickoff() {
@@ -548,8 +553,183 @@ fn wait_reaches_ready_and_delivers_the_kickoff() {
         f.call_with("send-keys").unwrap(),
         vec!["send-keys", "-t", "rc-abc123", "-l", "--", "do it"]
     );
-    // One poll tick + the post-ready settle.
-    assert_eq!(ticks.get(), DEFAULT_POLL_EVERY + PROMPT_DELIVER_SETTLE);
+    // A prompt means the loop settles KICKOFF_SETTLE from the first successful
+    // capture (breaking on the first poll at or past it) and then sleeps
+    // PROMPT_DELIVER_SETTLE — so the line lands at ~6 s, not on the first tick.
+    assert!(
+        ticks.get() >= KICKOFF_SETTLE + PROMPT_DELIVER_SETTLE
+            && ticks.get() <= KICKOFF_SETTLE + DEFAULT_POLL_EVERY + PROMPT_DELIVER_SETTLE,
+        "kickoff at {:?}, want ~{:?}",
+        ticks.get(),
+        KICKOFF_SETTLE + PROMPT_DELIVER_SETTLE
+    );
+}
+
+/// WITHOUT a prompt there is nothing to settle for: the FIRST successful capture
+/// returns live, on tick zero, with no keystroke drawn.
+#[test]
+fn wait_without_a_prompt_returns_on_the_first_capture() {
+    let f = scripted_panes(&[CLAUDE_READY]);
+    let ticks = Cell::new(Duration::ZERO);
+    let eng = engine_at_home(&f, &ticks);
+    let mut opts = CreateOptions::new(RcKind::ClaudeRc);
+    opts.slug = "abc123".to_string();
+    opts.wait = true;
+    let session = eng.create(opts).unwrap();
+
+    assert_eq!(session.state, RcState::Ready);
+    assert_eq!(f.count_with("capture-pane"), 1);
+    assert_eq!(ticks.get(), Duration::ZERO);
+    assert!(f.call_with("send-keys").is_none());
+}
+
+/// A control accept RESTARTS the settle window: the kickoff must not be typed
+/// into the dialog's repaint. codex's trust dialog shows up on the 7th poll
+/// (4.5 s), so the accept lands well inside the original window.
+#[test]
+fn wait_a_late_accept_restarts_the_settle() {
+    let mut panes: Vec<&str> = vec!["codex booting"; 6];
+    panes.push(CODEX_TRUST);
+    panes.push("codex composer");
+    let f = scripted_panes(&panes);
+    let ticks = Cell::new(Duration::ZERO);
+    let eng = engine_at_home(&f, &ticks);
+    let mut opts = CreateOptions::new(RcKind::Codex);
+    opts.slug = "abc123".to_string();
+    opts.prompt = "do it".to_string();
+    eng.create(opts).unwrap();
+
+    // The accept happened at 4.5 s, so the kickoff cannot be earlier than
+    // 4.5 s + KICKOFF_SETTLE + PROMPT_DELIVER_SETTLE — strictly later than the
+    // ~6 s it would have been off the first capture.
+    let accept_at = Duration::from_millis(4500);
+    assert!(
+        ticks.get() >= accept_at + KICKOFF_SETTLE + PROMPT_DELIVER_SETTLE,
+        "kickoff at {:?}: the accept must restart the settle",
+        ticks.get()
+    );
+    let enters = f
+        .calls()
+        .into_iter()
+        .filter(|c| c.len() == 4 && c[0] == "send-keys" && c[3] == "Enter")
+        .count();
+    // One accept Enter + send_line's own trailing Enter.
+    assert_eq!(enters, 2, "exactly one accept, latched: {:?}", f.calls());
+}
+
+/// THE DELIVERY GATE, and the reason the accept latches only on success: when every
+/// send-keys fails the dialog never clears, so the kickoff must be REFUSED rather
+/// than typed into the modal. A latch-before-send would have made the loop ignore
+/// the dialog from the second poll on, and the old post-loop `state == Ready` check
+/// would then have delivered straight into it.
+#[test]
+fn wait_refuses_to_deliver_into_a_dialog_that_never_cleared() {
+    let f = FakeTmux::new(|args| match args[0] {
+        "capture-pane" => TmuxResult {
+            stdout: CODEX_TRUST.to_string(),
+            ..Default::default()
+        },
+        "send-keys" => TmuxResult {
+            code: 1,
+            stderr: "server busy".to_string(),
+            ..Default::default()
+        },
+        _ => TmuxResult::default(),
+    });
+    let ticks = Cell::new(Duration::ZERO);
+    let eng = engine_at_home(&f, &ticks);
+    let mut opts = CreateOptions::new(RcKind::Codex);
+    opts.slug = "abc123".to_string();
+    opts.prompt = "do it".to_string();
+    let err = eng.create(opts).unwrap_err();
+
+    assert_eq!(err.exit_code(), 2, "the control-dialog refusal is exit 2");
+    assert_eq!(err.to_string(), TRUST_DIALOG_REFUSAL);
+    assert!(
+        !f.any_arg("-l"),
+        "the kickoff was typed into a live dialog: {:?}",
+        f.calls()
+    );
+    // The accept was RETRIED every poll (never latched on a failed send).
+    let enters = f
+        .calls()
+        .into_iter()
+        .filter(|c| c.len() == 4 && c[0] == "send-keys" && c[3] == "Enter")
+        .count();
+    assert!(enters >= 2, "want a retry on every poll, got {enters}");
+}
+
+/// The same refusal for claude's BYPASS dialog: a dialog the deadline ran out under
+/// must not receive the kickoff either. The accepts "succeed" but the pane never
+/// changes — a TUI that redraws the same dialog is indistinguishable from one that
+/// ignored the keypress.
+#[test]
+fn wait_refuses_to_deliver_into_a_bypass_dialog() {
+    let f = scripted_panes(&[CLAUDE_BYPASS]);
+    let ticks = Cell::new(Duration::ZERO);
+    let eng = engine_at_home(&f, &ticks);
+    let mut opts = CreateOptions::new(RcKind::ClaudeRc);
+    opts.slug = "abc123".to_string();
+    opts.permission_mode = "skip".to_string(); // resolves to bypassPermissions
+    opts.prompt = "do it".to_string();
+    let err = eng.create(opts).unwrap_err();
+
+    assert_eq!(err.exit_code(), 2);
+    assert_eq!(err.to_string(), TRUST_DIALOG_REFUSAL);
+    assert!(
+        !f.any_arg("-l"),
+        "the kickoff was typed into a live bypass dialog: {:?}",
+        f.calls()
+    );
+}
+
+/// The settle is bounded by the existing 20 s deadline: a session that only
+/// starts drawing at ~18 s has a window that would run past it, and still gets
+/// its kickoff — at the deadline, rather than never.
+#[test]
+fn wait_the_settle_is_deadline_bounded() {
+    // 24 transient failures × the 750 ms poll = the first successful capture at
+    // 18 s, so the 5 s settle would end at 23 s — past the 20 s deadline.
+    const TRANSIENT_POLLS: usize = 24;
+    let seen = Cell::new(0usize);
+    let f = FakeTmux::new(move |args| {
+        if args[0] == "capture-pane" {
+            let n = seen.get();
+            seen.set(n + 1);
+            if n < TRANSIENT_POLLS {
+                return TmuxResult {
+                    code: 1,
+                    stderr: "tmux: no output yet".to_string(),
+                    ..Default::default()
+                };
+            }
+            return TmuxResult {
+                stdout: CLAUDE_READY.to_string(),
+                ..Default::default()
+            };
+        }
+        TmuxResult::default()
+    });
+    let ticks = Cell::new(Duration::ZERO);
+    let eng = engine_at_home(&f, &ticks);
+    let mut opts = CreateOptions::new(RcKind::ClaudeRc);
+    opts.slug = "abc123".to_string();
+    opts.prompt = "do it".to_string();
+    let session = eng.create(opts).unwrap();
+
+    assert_eq!(session.state, RcState::Ready);
+    assert!(
+        f.call_with("send-keys").is_some(),
+        "the kickoff still lands"
+    );
+    // The loop left AT the deadline (the last poll sleep is clamped to what was
+    // left, so there is no overshoot to add PROMPT_DELIVER_SETTLE on top of) and
+    // delivered exactly one settle later.
+    assert_eq!(
+        ticks.get(),
+        DEFAULT_WAIT_TIMEOUT + PROMPT_DELIVER_SETTLE,
+        "the settle must be bounded by the {DEFAULT_WAIT_TIMEOUT:?} deadline"
+    );
 }
 
 #[test]
@@ -562,9 +742,10 @@ fn wait_auto_accepts_trust_with_exactly_one_enter() {
     opts.wait = true;
     let session = eng.create(opts).unwrap();
 
-    // The SECOND trust pane is not re-accepted (trust_accepted latches), so the
-    // poller reports needs-trust and stops rather than hammering Enter.
-    assert_eq!(session.state, RcState::NeedsTrust);
+    // The SECOND trust pane is not re-accepted (trust_accepted latches), so
+    // exactly one Enter is drawn. The session is LIVE throughout (S2,
+    // charliek/shed#324) — the dialog is control, not a lifecycle state.
+    assert_eq!(session.state, RcState::Ready);
     let enters: Vec<_> = f
         .calls()
         .into_iter()
@@ -633,7 +814,9 @@ fn wait_bypass_accept_failure_stays_retryable() {
     opts.permission_mode = "skip".to_string();
     opts.wait = true;
     let session = eng.create(opts).unwrap();
-    assert_eq!(session.state, RcState::Starting, "never classified");
+    // Live from the first capture (the dialog is control, not a lifecycle state),
+    // but the accept keeps being retried because it never succeeded.
+    assert_eq!(session.state, RcState::Ready);
     assert!(
         f.count_with("send-keys") > 2,
         "the Down retry must repeat every tick, got {} sends",
@@ -665,11 +848,11 @@ fn wait_reports_dead_when_the_session_vanishes_mid_poll() {
     assert_eq!(ticks.get(), Duration::ZERO);
 }
 
+/// A transient (non-missing) capture failure keeps polling, and the FIRST
+/// capture that succeeds is liveness — the loop returns there rather than
+/// waiting for a pane to say something.
 #[test]
-fn wait_times_out_on_a_never_ready_pane() {
-    // A transient (non-missing) capture failure keeps polling, and a pane that
-    // stays `starting` exhausts the deadline — the injected clock makes both
-    // observable without burning 20 real seconds.
+fn wait_returns_live_on_the_first_capture_after_a_transient_failure() {
     let flip = Cell::new(false);
     let f = FakeTmux::new(move |args| {
         if args[0] == "capture-pane" {
@@ -696,17 +879,54 @@ fn wait_times_out_on_a_never_ready_pane() {
     opts.wait = true;
     let session = eng.create(opts).unwrap();
 
+    assert_eq!(session.state, RcState::Ready);
+    assert_eq!(f.count_with("capture-pane"), 2);
+    assert_eq!(ticks.get(), DEFAULT_POLL_EVERY);
+    assert!(!f.any_arg("Enter"), "a promptless wait gets no keystrokes");
+}
+
+/// A session whose pane NEVER captures is not live: the loop exhausts the
+/// deadline and reports `starting` with nothing typed.
+#[test]
+fn wait_times_out_when_the_pane_never_captures() {
+    let f = FakeTmux::new(|args| {
+        if args[0] == "capture-pane" {
+            return TmuxResult {
+                code: 1,
+                stderr: "server not responding".to_string(),
+                ..Default::default()
+            };
+        }
+        TmuxResult::default()
+    });
+    let ticks = Cell::new(Duration::ZERO);
+    let eng = engine_at_home(&f, &ticks);
+    let mut opts = CreateOptions::new(RcKind::ClaudeRc);
+    opts.slug = "abc123".to_string();
+    opts.wait = true;
+    let session = eng.create(opts).unwrap();
+
     assert_eq!(session.state, RcState::Starting);
-    assert!(ticks.get() >= DEFAULT_WAIT_TIMEOUT, "deadline exhausted");
+    // The loop leaves AT the deadline, not a poll past it.
+    assert_eq!(
+        ticks.get(),
+        DEFAULT_WAIT_TIMEOUT,
+        "deadline exhausted exactly"
+    );
     assert_eq!(
         f.count_with("capture-pane"),
         (DEFAULT_WAIT_TIMEOUT.as_millis() / DEFAULT_POLL_EVERY.as_millis() + 1) as usize
     );
-    assert!(!f.any_arg("Enter"), "a never-ready pane gets no keystrokes");
+    assert!(!f.any_arg("Enter"), "nothing is typed into a dead pane");
 }
 
+/// THE ACCEPTED HAZARD, pinned so it is a decision rather than a surprise: with
+/// `state` reduced to liveness (S2, charliek/shed#324), a session sitting on an
+/// AUTH screen is live, so `--wait --prompt` delivers the kickoff into it. Only
+/// the one-time trust/bypass dialogs are still recognized (as control), and
+/// `docs/extensions/rc-helper.md` says so. Roost owning kickoff (S4) is the fix.
 #[test]
-fn wait_stops_on_needs_auth_without_delivering() {
+fn wait_delivers_into_a_live_session_whatever_the_screen_says() {
     let f = scripted_panes(&[CLAUDE_NEEDS_AUTH]);
     let ticks = Cell::new(Duration::ZERO);
     let eng = engine_at_home(&f, &ticks);
@@ -714,10 +934,10 @@ fn wait_stops_on_needs_auth_without_delivering() {
     opts.slug = "abc123".to_string();
     opts.prompt = "do it".to_string();
     let session = eng.create(opts).unwrap();
-    assert_eq!(session.state, RcState::NeedsAuth);
-    assert!(
-        f.call_with("send-keys").is_none(),
-        "a kickoff is delivered ONLY to a ready session"
+    assert_eq!(session.state, RcState::Ready);
+    assert_eq!(
+        f.call_with("send-keys").unwrap(),
+        vec!["send-keys", "-t", "rc-abc123", "-l", "--", "do it"]
     );
 }
 
@@ -1226,32 +1446,35 @@ fn prompt_guards_table() {
             code: 2,
             message: "invalid arguments: kind \"claude-broker\" does not accept a prompt",
         },
+        // The CONTROL gate (S2, charliek/shed#324): the verb refuses a pane with
+        // a one-time dialog on it, because a line typed there answers the dialog
+        // by accident. Each kept matcher, same message, same exit class.
         Case {
-            name: "not ready",
-            env: READY_CLAUDE_ENV,
-            pane: CLAUDE_STARTING,
-            session_id: "",
-            text: "x",
-            code: 2,
-            message: "invalid arguments: session not ready (state=starting)",
-        },
-        Case {
-            name: "needs-auth is not ready either",
-            env: READY_CLAUDE_ENV,
-            pane: CLAUDE_NEEDS_AUTH,
-            session_id: "",
-            text: "x",
-            code: 2,
-            message: "invalid arguments: session not ready (state=needs-auth)",
-        },
-        Case {
-            name: "needs-trust is not ready either",
+            name: "claude trust dialog",
             env: READY_CLAUDE_ENV,
             pane: CLAUDE_TRUST,
             session_id: "",
             text: "x",
             code: 2,
-            message: "invalid arguments: session not ready (state=needs-trust)",
+            message: TRUST_DIALOG_REFUSAL,
+        },
+        Case {
+            name: "codex trust dialog",
+            env: READY_CLAUDE_ENV,
+            pane: CODEX_TRUST,
+            session_id: "",
+            text: "x",
+            code: 2,
+            message: TRUST_DIALOG_REFUSAL,
+        },
+        Case {
+            name: "claude bypass dialog",
+            env: READY_CLAUDE_ENV,
+            pane: CLAUDE_BYPASS,
+            session_id: "",
+            text: "x",
+            code: 2,
+            message: TRUST_DIALOG_REFUSAL,
         },
     ];
     for c in cases {
@@ -1444,23 +1667,6 @@ fn exit_code_classes_and_message_prefixes() {
     ] {
         assert_eq!(err.exit_code(), code);
         assert_eq!(err.to_string(), text);
-    }
-}
-
-#[test]
-fn state_wire_matches_the_dto_serialization() {
-    // `state_wire` hand-writes the tokens Go's State string type prints; keep it
-    // honest against the serde derive that produces the same values on the wire.
-    for state in [
-        RcState::Starting,
-        RcState::Ready,
-        RcState::Reconnecting,
-        RcState::NeedsTrust,
-        RcState::NeedsAuth,
-        RcState::Dead,
-    ] {
-        let json = serde_json::to_string(&state).unwrap();
-        assert_eq!(json, format!("\"{}\"", state_wire(state)));
     }
 }
 

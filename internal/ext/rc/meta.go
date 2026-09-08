@@ -110,13 +110,24 @@ func normalizeCreatedAt(raw string) string {
 	return ""
 }
 
-// ParseSession reconstructs one session's DTO from its tmux env dump + pane. State
-// and url are derived from the pane (never stored), and lane from the kind's AgentSpec
-// (laneForKind) — which is why lane is present on legacy/unmanaged and unknown-kind
-// rows too. A session with no valid SHED_RC_V (>= MinManagedVersion) is
-// legacy/unmanaged: kind defaults to
-// claude-broker, display name to the fallback, stray SHED_RC_* values ignored.
-// displayFallback receives the slug (e.g. "<shed>/<slug>").
+// ParseSession reconstructs one session's DTO from its tmux env dump + pane.
+//
+// STATE IS LIVENESS, not a pane reading (S2, charliek/shed#324): a session that is
+// ENUMERATED is live, so state is StateReady unconditionally. One whose tmux session
+// is gone is simply not enumerated by List, and Probe reports ErrSessionNotFound —
+// there is no pane text that turns a live session into needs-trust / needs-auth /
+// reconnecting / dead any more. StateStarting remains the create-time placeholder,
+// and the wait path still has its own liveness "dead" (the tmux session vanished).
+//
+// pane survives as a parameter for exactly ONE reason: extractURL on the claude
+// kinds. The claude.ai remote-control URL is CONTROL (the address a person opens to
+// drive the session), not status, so it is still lifted out of the capture.
+//
+// lane comes from the kind's AgentSpec (laneForKind) — which is why lane is present
+// on legacy/unmanaged and unknown-kind rows too. A session with no valid SHED_RC_V
+// (>= MinManagedVersion) is legacy/unmanaged: kind defaults to claude-broker,
+// display name to the fallback, stray SHED_RC_* values ignored. displayFallback
+// receives the slug (e.g. "<shed>/<slug>").
 func ParseSession(tmuxSession, envDump, pane string, displayFallback func(slug string) string) Session {
 	env := parseEnv(envDump)
 	slug := strings.TrimPrefix(tmuxSession, TmuxPrefix)
@@ -132,21 +143,19 @@ func ParseSession(tmuxSession, envDump, pane string, displayFallback func(slug s
 
 	if !isManagedVersion(val(envV)) {
 		kind := KindClaudeBroker
-		state, url := ClassifyPane(kind, pane)
 		return Session{
 			Slug:        slug,
 			TmuxSession: tmuxSession,
 			Kind:        kind,
-			State:       state,
+			State:       StateReady,
 			Lane:        laneForKind(kind),
-			URL:         url,
+			URL:         extractURL(kind, pane),
 			DisplayName: fallbackName,
 			Managed:     false,
 		}
 	}
 
 	kind := parseKind(val(envKind))
-	state, url := ClassifyPane(kind, pane)
 	name := val(envDisplayName)
 	if name == "" {
 		name = fallbackName
@@ -155,9 +164,9 @@ func ParseSession(tmuxSession, envDump, pane string, displayFallback func(slug s
 		Slug:        slug,
 		TmuxSession: tmuxSession,
 		Kind:        kind,
-		State:       state,
+		State:       StateReady,
 		Lane:        laneForKind(kind),
-		URL:         url,
+		URL:         extractURL(kind, pane),
 		DisplayName: name,
 		Workdir:     val(envWorkdir),
 		ID:          val(envID),

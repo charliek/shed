@@ -1,14 +1,21 @@
-// RC tests — the pure pane classifier (backing the rc.classify IPC) plus the
-// shed-ext-rc binary client: argv shapes, exit-code mapping, and the neutral DTO
-// (whose golden fixture is byte-identical to shed-remote-agent's, asserted to
-// decode in both repos as the cross-tool contract guard).
+// RC tests — the claude.ai control URL, slug generation, and the shed-ext-rc
+// binary client: argv shapes, exit-code mapping, and the neutral DTO (whose
+// golden fixture is byte-identical to shed-remote-agent's, asserted to decode in
+// both repos as the cross-tool contract guard).
+//
+// The pure pane classifier that opened this file went with S2
+// (charliek/shed#324): a shed row's `state` comes off the wire from the guest
+// (where it is liveness now) and a machine row's from roost. What the classifier
+// cells were really pinning about the claude kinds — that a broker pane yields an
+// `?environment=env_…` URL and a claude-rc pane a `/session_…` one, and that
+// neither leaks into the other — is what RCURLTests keeps.
 
 import Foundation
 import XCTest
 @testable import ShedKit
 
-final class RCClassifierTests: XCTestCase {
-    func testBrokerReadyWithURL() {
+final class RCURLTests: XCTestCase {
+    func testBrokerURLExtracted() {
         let pane = """
         ·✔︎· Connected · my-shed · main
             Capacity: 0/32 · New sessions will be created in the current directory
@@ -16,32 +23,16 @@ final class RCClassifierTests: XCTestCase {
         Continue coding in the Claude app or https://claude.ai/code?environment=env_01ABC
         space to show QR code · w to toggle spawn mode
         """
-        let c = RemoteControl.classifyPane(kind: .claudeBroker, pane: pane)
-        XCTAssertEqual(c.state, .ready)
-        XCTAssertEqual(c.url, "https://claude.ai/code?environment=env_01ABC")
+        XCTAssertEqual(
+            RemoteControl.extractURL(kind: .claudeBroker, pane: pane),
+            "https://claude.ai/code?environment=env_01ABC")
+        // The broker never picks up a claude-rc session URL.
+        XCTAssertNil(
+            RemoteControl.extractURL(
+                kind: .claudeBroker, pane: "https://claude.ai/code/session_01RCkTDrdZ2Rr12sD5dfMjgr"))
     }
 
-    func testBrokerReconnecting() {
-        let c = RemoteControl.classifyPane(kind: .claudeBroker, pane: "·|· Reconnecting · retrying in 2.5s · disconnected 0s")
-        XCTAssertEqual(c.state, .reconnecting)
-    }
-
-    func testBrokerNeedsTrust() {
-        let c = RemoteControl.classifyPane(kind: .claudeBroker, pane: "Error: Workspace not trusted. Please run `claude` ...")
-        XCTAssertEqual(c.state, .needsTrust)
-    }
-
-    func testBrokerNeedsAuthSubscription() {
-        let c = RemoteControl.classifyPane(kind: .claudeBroker, pane: "Remote Control requires a claude.ai subscription.")
-        XCTAssertEqual(c.state, .needsAuth)
-    }
-
-    func testBrokerNeedsAuthLogin() {
-        let c = RemoteControl.classifyPane(kind: .claudeBroker, pane: "You are not logged in. Run claude auth login.")
-        XCTAssertEqual(c.state, .needsAuth)
-    }
-
-    func testClaudeRcReadyWithURL() {
+    func testClaudeRcURLExtracted() {
         let pane = """
         ❯ /remote-control
           ⎿  Remote Control connecting…
@@ -52,35 +43,25 @@ final class RCClassifierTests: XCTestCase {
         ❯
           ? for shortcuts                                                  Remote Control active
         """
-        let c = RemoteControl.classifyPane(kind: .claudeRc, pane: pane)
-        XCTAssertEqual(c.state, .ready)
-        XCTAssertEqual(c.url, "https://claude.ai/code/session_01RCkTDrdZ2Rr12sD5dfMjgr")
+        XCTAssertEqual(
+            RemoteControl.extractURL(kind: .claudeRc, pane: pane),
+            "https://claude.ai/code/session_01RCkTDrdZ2Rr12sD5dfMjgr")
+        // …and never the broker's environment URL.
+        XCTAssertNil(
+            RemoteControl.extractURL(
+                kind: .claudeRc, pane: "https://claude.ai/code?environment=env_01ABC"))
     }
 
-    func testClaudeRcStartingConnecting() {
-        let c = RemoteControl.classifyPane(kind: .claudeRc, pane: "❯ /remote-control\n  ⎿  Remote Control connecting…")
-        XCTAssertEqual(c.state, .starting)
-        XCTAssertNil(c.url)
+    func testNoURLForNonClaudeKinds() {
+        let pane = "https://claude.ai/code/session_X https://claude.ai/code?environment=env_1"
+        for kind: RcKind in [.codex, .opencode, .cursor, .shell, .other("borg")] {
+            XCTAssertNil(RemoteControl.extractURL(kind: kind, pane: pane), "kind \(kind)")
+        }
     }
 
-    func testClaudeRcFirstTimeTrustPrompt() {
-        let pane = """
-        Accessing workspace:
-
-         /home/charliek/projects
-
-         Quick safety check: Is this a project you created or one you trust?
-
-         ❯ 1. Yes, I trust this folder
-           2. No, exit
-        """
-        let c = RemoteControl.classifyPane(kind: .claudeRc, pane: pane)
-        XCTAssertEqual(c.state, .needsTrust)
-    }
-
-    func testShellReadyAndStarting() {
-        XCTAssertEqual(RemoteControl.classifyPane(kind: .shell, pane: "charliek@shed:/workspace$ ").state, .ready)
-        XCTAssertEqual(RemoteControl.classifyPane(kind: .shell, pane: "   \n  \n").state, .starting)
+    func testNoURLWhenThePaneHasNone() {
+        XCTAssertNil(RemoteControl.extractURL(kind: .claudeRc, pane: "Remote Control connecting…"))
+        XCTAssertNil(RemoteControl.extractURL(kind: .claudeBroker, pane: ""))
     }
 
     func testSlugIsConfusableFreeAndCorrectLength() {
@@ -153,9 +134,7 @@ final class RCBinaryTests: XCTestCase {
         let obj = try JSONSerialization.jsonObject(with: data) as! [String: Any]
         XCTAssertEqual(obj["kind"] as? String, "borg")
         // A pane never yields a claude URL for an unknown kind.
-        let c = RemoteControl.classifyPane(kind: .other("borg"), pane: "https://claude.ai/code/session_X")
-        XCTAssertEqual(c.state, .ready)
-        XCTAssertNil(c.url)
+        XCTAssertNil(RemoteControl.extractURL(kind: .other("borg"), pane: "https://claude.ai/code/session_X"))
     }
 
     func testAuthHintPerKind() {

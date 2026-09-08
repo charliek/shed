@@ -1,23 +1,26 @@
 //! Watcher contracts: the freshness rule, the `mergedActivity` precedence
-//! merge, the shared correlation helpers, and the tmux env seams — the pure
-//! parts of `internal/ext/rc/watch.go` (plan 010 H4).
+//! merge, and the tmux env seams — the pure parts of
+//! `internal/ext/rc/watch.go` (plan 010 H4).
 //!
-//! The JSONL watchers are the structured-signal source that OVERRIDES the pane
-//! stability engine for codex and claude sessions: instead of inferring
-//! activity from whether the tmux pane keeps redrawing, they tail the agent's
-//! own append-only log and read the turn/tool structure directly. opencode has
-//! no log to tail — its watcher subscribes to the agent's embedded HTTP+SSE
-//! server; cursor is push-fed by its own hook scripts POSTing into the hub's
-//! ingest route. The hub merges a session's watcher with pane stability per
-//! session: a fresh, correlated watcher wins; a broken/absent one falls back
-//! to stability so activity never goes dark.
+//! A structured-signal watcher is the ONLY producer of activity left: instead
+//! of inferring activity from whether the tmux pane keeps redrawing (the
+//! pane-stability engine S2, `charliek/shed#324`, deleted), it reads the
+//! agent's own turn/tool structure directly. opencode is the one such kind —
+//! its watcher subscribes to the agent's embedded HTTP+SSE server. The hub's
+//! merge (see [`merged_activity`] below) has exactly two arms since S2: a
+//! fresh, correlated watcher wins; everything else — no watcher, a
+//! closed/unhealthy transport, a stale verdict — yields NO activity at all.
+//! There is no fallback engine left to hand off to.
 //!
-//! From H5 it also carries the fold contracts ([`ActivityFold`] /
-//! [`MessageProducer`] — Go's `activityFold`/`messageProducer` interfaces,
-//! `watch.go:73`/`107`) and `listJSONLUnder`, consumed by the per-kind folds in
-//! [`super::watch_claude`] / [`super::watch_codex`] / [`super::watch_cursor`] /
-//! [`super::watch_opencode`]. Still Go-only until their commits: `fileWatcher`
-//! + `fsNudger` (H7 — transports) and the opencode SSE transport (H8).
+//! The codex JSONL tail, the cursor hook-ingest push lane and the shared line
+//! tailer they both sat on were removed with A6 (`charliek/shed#322`); the
+//! correlation helpers (`Correlation`/`JsonlPeek`/`pick_correlation`/…) and
+//! `list_jsonl_under` went with them, since only those two lanes ever mapped a
+//! tmux session to a file on disk.
+//!
+//! It also carries the fold contracts ([`ActivityFold`] / [`MessageProducer`] —
+//! Go's `activityFold`/`messageProducer` interfaces, `watch.go`), consumed by
+//! [`super::watch_opencode`], and the `notify`-backed [`FsNudger`].
 
 use std::path::Path;
 use std::time::Duration;
@@ -29,8 +32,8 @@ use shed_rc_engine::tmux::Tmux;
 
 use super::messages::FeedMessage;
 
-/// Folds a kind's parsed JSONL line stream into a live activity verdict
-/// (`activityFold`, `watch.go:73`). Implementations hold cumulative state
+/// Folds a kind's parsed line stream into a live activity verdict
+/// (`activityFold`, `watch.go`). Implementations hold cumulative state
 /// across `apply_line` calls (turn boundaries, pending tool calls, the last
 /// message) and are NOT safe for concurrent use — the owning watcher
 /// serializes access.
@@ -57,7 +60,7 @@ pub trait ActivityFold {
     /// Go's runtime `messageProducer` type-assert on a fold
     /// (`(*fileWatcher).refresh`, `watch.go:195`), statically: a fold that
     /// also produces a feed overrides this to forward to
-    /// [`MessageProducer::drain_messages`]; an activity-only fold (claude)
+    /// [`MessageProducer::drain_messages`]; an activity-only fold with no feed
     /// inherits the empty default and contributes no feed rows.
     fn drain_fold_messages(&mut self) -> Vec<FeedMessage> {
         Vec::new()
@@ -68,7 +71,7 @@ pub trait ActivityFold {
 /// per-session watcher (`sessionWatcher`, `watch.go:120`): refresh it, read
 /// its current verdict, drain any feed messages it produced, and check
 /// whether it has ever folded an event. Implemented by [`FileWatcher`]
-/// (codex/claude), the cursor watcher, and (H8) the opencode watcher, so
+/// (codex), the cursor watcher, and (H8) the opencode watcher, so
 /// reconcile is transport-agnostic between a tailed JSONL file, a hook-push
 /// inbox, and a live SSE feed.
 ///
@@ -91,10 +94,6 @@ pub trait SessionWatcher: Send + Sync {
     fn had_event(&self) -> bool;
     /// Releases the watcher's resources and marks it terminally closed.
     fn close(&self);
-    /// Go's `cursorIngester` type-assert (`hub_ingest.go:140`).
-    fn as_cursor_ingester(&self) -> Option<&dyn CursorIngester> {
-        None
-    }
     /// Go's `confirmedAgentIDDrainer` type-assert
     /// (`watch_opencode_transport.go:126`).
     fn as_confirmed_agent_id_drainer(&self) -> Option<&dyn ConfirmedAgentIdDrainer> {
@@ -104,14 +103,9 @@ pub trait SessionWatcher: Send + Sync {
     fn as_approval_publisher(&self) -> Option<&dyn ApprovalPublisher> {
         None
     }
-    /// Go's `approvalBlocker` type-assert (`watch_opencode_transport.go:143`).
     /// The claim seam ([`ClaimHolder`]) — opencode only; every other lane
     /// owns its conversation by construction.
     fn as_claim_holder(&self) -> Option<&dyn ClaimHolder> {
-        None
-    }
-
-    fn as_approval_blocker(&self) -> Option<&dyn ApprovalBlocker> {
         None
     }
     /// Go's `turnStarter` type-assert (`hub_verbs.go:97`).
@@ -139,32 +133,10 @@ pub trait ApprovalPublisher {
     fn pending_approvals(&self) -> Vec<super::messages::FeedApproval>;
 }
 
-/// The input gate's counterpart to [`ApprovalPublisher`]: "is this session
-/// currently blocked on an approval it would type an answer into?"
-/// (`approvalBlocker`, `watch_opencode_transport.go:143`). Separate because it
-/// is a STRICTLY WIDER question than the snapshot — it counts open questions
-/// too, which are never addressable and so never appear in pending_approvals,
-/// yet own the keyboard exactly the same.
-pub trait ApprovalBlocker {
-    fn has_open_approvals(&self) -> bool;
-}
-
-/// The narrow interface the hub's ingest handler pushes through
-/// (`cursorIngester`, `watch_cursor.go:102`), so the handler holds a
-/// [`SessionWatcher`] (as reconcile does) and asserts exactly this one
-/// capability.
-pub trait CursorIngester {
-    /// Enqueues one hook event for the next refresh to fold, reporting
-    /// whether it was accepted (false = the watcher is closed, or the inbox
-    /// is full and the event was dropped).
-    fn push_hook_event(&self, ev: super::watch_cursor::CursorHookEvent) -> bool;
-}
-
 /// A stream-discovered agent session id awaiting reconcile's
 /// `SHED_RC_AGENT_SESSION` back-write (`confirmedAgentIDDrainer`,
 /// `watch_opencode_transport.go:126`) — so a hub restart re-correlates
-/// exactly. Implemented by the cursor watcher (hook-carried pins) and, at H8,
-/// the opencode watcher; the file watchers correlate off-line.
+/// exactly. Implemented by the opencode watcher.
 pub trait ConfirmedAgentIdDrainer {
     /// Returns and clears a newly confirmed id ("" when none/already drained).
     fn drain_confirmed_agent_id(&self) -> String;
@@ -199,56 +171,12 @@ pub fn noop_logf() -> LogFn {
 }
 
 /// A fold that ALSO produces a normalized message feed (`messageProducer`,
-/// `watch.go:107`) — codex, opencode and cursor; claude feeds activity only in
-/// this phase. Every watcher drains it on each refresh. It is a separate trait
-/// from [`ActivityFold`] because the cursor fold produces a feed without being
-/// an `ActivityFold` at all (its unit is a hook EVENT, not a JSONL line).
+/// `watch.go`) — opencode today. Every watcher drains it on each refresh. It is
+/// a separate trait from [`ActivityFold`] so a fold can produce a feed without
+/// being an `ActivityFold` at all.
 pub trait MessageProducer {
     /// Returns and clears the feed messages produced since the last drain.
     fn drain_messages(&mut self) -> Vec<FeedMessage>;
-}
-
-/// Walks `root` and returns every `*.jsonl` path, tolerating per-directory
-/// permission errors (a skipped subdir does not abort the walk) —
-/// `listJSONLUnder`, `watch.go:420`. `matches` filters basenames.
-pub fn list_jsonl_under(root: &str, matches: impl Fn(&str) -> bool) -> Vec<String> {
-    let mut out = Vec::new();
-    // Go's filepath.WalkDir LSTATs the root: a symlinked root is not a
-    // directory and yields nothing (fs::read_dir would happily follow it).
-    if !std::fs::symlink_metadata(root).is_ok_and(|m| m.is_dir()) {
-        return out;
-    }
-    walk_jsonl(Path::new(root), &matches, &mut out);
-    out
-}
-
-fn walk_jsonl(dir: &Path, matches: &impl Fn(&str) -> bool, out: &mut Vec<String>) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return; // permission/transient on this dir → skip it, keep walking
-    };
-    // Sorted per directory, like Go's WalkDir: the result order feeds
-    // correlate_codex's exact-id scan (first match wins), so iteration order
-    // is contract — fs::read_dir alone is platform-arbitrary (H5 review).
-    let mut entries: Vec<_> = entries.flatten().collect();
-    entries.sort_by_key(std::fs::DirEntry::file_name);
-    for entry in entries {
-        let path = entry.path();
-        let Ok(ft) = entry.file_type() else { continue };
-        if ft.is_dir() {
-            walk_jsonl(&path, matches, out);
-            continue;
-        }
-        let Some(base) = path.file_name().and_then(|n| n.to_str()) else {
-            continue;
-        };
-        // ends_with mirrors Go's filepath.Ext check, dotfiles included
-        // (`filepath.Ext(".jsonl") == ".jsonl"`; Path::extension() sees none).
-        if base.ends_with(".jsonl") && matches(base) {
-            if let Some(p) = path.to_str() {
-                out.push(p.to_string());
-            }
-        }
-    }
 }
 
 /// Renders a raw JSON value as compact (whitespace-stripped) text — used for a
@@ -297,16 +225,6 @@ pub(crate) fn compact_json(raw: &str) -> String {
 /// four bytes `null` and `compactJSON` renders them — a tool_input of `null`
 /// must produce the detail `"null"`, not `""`; H5 review finding).
 pub(crate) fn raw_opt<'de, D>(d: D) -> Result<Option<Box<serde_json::value::RawValue>>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    serde::Deserialize::deserialize(d).map(Some)
-}
-
-/// Captures any JSON value — `null` included — as `Some` (a stock
-/// `Option<Value>` maps an explicit `null` to `None`, re-conflating it with an
-/// absent field; Go's RawMessage keeps the two distinct).
-pub(crate) fn value_opt<'de, D>(d: D) -> Result<Option<serde_json::Value>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
@@ -416,176 +334,30 @@ pub(crate) fn first_non_empty<'a>(a: &'a str, b: &'a str) -> &'a str {
     }
 }
 
-// ---------------------------------------------------------------------------
-// fileWatcher (watch.go:137-271) — the tailer+fold transport for codex/claude
-// ---------------------------------------------------------------------------
-
-use std::sync::Mutex;
-
-use super::tail::LineTailer;
-
-/// Pairs a tailer with a fold and tracks freshness for the reconcile merge
-/// (`fileWatcher`, `watch.go:137`). `&self` methods over an internal mutex
-/// mirror Go's `mu`-guarded pointer receivers.
-pub struct FileWatcher {
-    inner: Mutex<FileWatcherInner>,
-}
-
-struct FileWatcherInner {
-    tailer: LineTailer,
-    fold: Box<dyn ActivityFold + Send>,
-    last_event_at: Option<DateTime<Utc>>,
-    cur_activity: RcActivity,
-    cur_message: String,
-    cur_settled: bool,
-    /// Feed messages produced since the last drain_pending.
-    pending: Vec<FeedMessage>,
-    /// Terminal: refresh no-ops after close (see [`SessionWatcher::close`]).
-    closed: bool,
-}
-
-impl FileWatcher {
-    /// `newFileWatcher`, `watch.go:154`.
-    pub fn new(path: &str, catch_up: bool, fold: Box<dyn ActivityFold + Send>) -> FileWatcher {
-        FileWatcher {
-            inner: Mutex::new(FileWatcherInner {
-                tailer: LineTailer::new(path, catch_up),
-                fold,
-                last_event_at: None,
-                cur_activity: RcActivity::Unknown,
-                cur_message: String::new(),
-                cur_settled: false,
-                pending: Vec::new(),
-                closed: false,
-            }),
-        }
-    }
-
-    /// Whether the tailer currently holds an open handle (the closed-refresh
-    /// no-op pin reads it; Go tests reach `w.tailer.f` directly).
-    #[cfg(test)]
-    pub(crate) fn tailer_is_open(&self) -> bool {
-        self.inner
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .tailer
-            .is_open()
-    }
-}
-
-impl SessionWatcher for FileWatcher {
-    /// Polls the file and folds any new lines (`(*fileWatcher).refresh`,
-    /// `watch.go:167`). A reset from the tailer clears the fold; a poll error
-    /// (permission/transient) is swallowed so the prior verdict is retained.
-    /// `now` stamps the last-event time used by the freshness decision. A
-    /// CLOSED watcher no-ops: the tailer released its file handle on close,
-    /// and a poll would silently reopen the path from offset 0 — a full
-    /// re-read (and a leaked handle) that refolds a dead incarnation's
-    /// history into a watcher that is already discarded.
-    fn refresh(&self, now: DateTime<Utc>) {
-        let w = &mut *self
-            .inner
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if w.closed {
-            return;
-        }
-        let poll = w.tailer.poll();
-        if poll.did_reset {
-            w.fold.reset();
-        }
-        if poll.gapped {
-            // A record was lost (oversized skip): drop record-exact state
-            // (pending tool calls) so a swallowed *_output line can't pin the
-            // verdict at working forever.
-            w.fold.note_gap();
-        }
-        if poll.err.is_some() {
-            return;
-        }
-        for ln in &poll.lines {
-            if w.fold.apply_line(ln) {
-                w.last_event_at = Some(now);
-            }
-        }
-        w.cur_activity = w.fold.activity();
-        w.cur_message = w.fold.last_message();
-        w.cur_settled = w.fold.settled();
-        // Drain any feed messages the fold produced this poll into the
-        // watcher's pending queue; reconcile empties it into the session ring.
-        let msgs = w.fold.drain_fold_messages();
-        w.pending.extend(msgs);
-    }
-
-    /// The watcher's activity + message and its authority at `now` (the
-    /// shared [`watcher_freshness`] rule — a tailed file is quiet or it is
-    /// not; there is no transport-health dimension here) —
-    /// `(*fileWatcher).snapshot`, `watch.go:245`.
-    fn snapshot(&self, now: DateTime<Utc>) -> (RcActivity, String, bool, bool) {
-        let w = self
-            .inner
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let (fresh, expired_working) =
-            watcher_freshness(w.cur_activity, w.cur_settled, w.last_event_at, now);
-        (
-            w.cur_activity,
-            w.cur_message.clone(),
-            fresh,
-            expired_working,
-        )
-    }
-
-    /// Returns and clears the feed messages produced since the last drain, in
-    /// stream order (`drainPending`, `watch.go:202`).
-    fn drain_pending(&self) -> Vec<FeedMessage> {
-        let mut w = self
-            .inner
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        std::mem::take(&mut w.pending)
-    }
-
-    /// Whether the fold has consumed at least one activity-relevant event
-    /// since attach (`hadEvent`, `watch.go:257`). Used to confirm an
-    /// AMBIGUOUS correlation before its session id is back-written: an
-    /// in-file event after attach is the "first in-file event confirms"
-    /// signal (the watcher is follow-only on the ambiguous path, so any
-    /// folded event necessarily happened after this session was created).
-    fn had_event(&self) -> bool {
-        self.inner
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .last_event_at
-            .is_some()
-    }
-
-    /// Releases the tailer's file handle and marks the watcher terminally
-    /// closed (`close`, `watch.go:266`) — any later refresh (e.g. an input
-    /// handler holding a stale pointer) is a no-op rather than a from-zero
-    /// reopen. Idempotent.
-    fn close(&self) {
-        let mut w = self
-            .inner
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        w.closed = true;
-        w.tailer.close();
-    }
-}
+// The file-watcher transport (`fileWatcher`, watch.go) lived here: the
+// resilient JSONL line tailer paired with an [`ActivityFold`] behind the
+// [`SessionWatcher`] contract. Both it and the tailer it wrapped served only
+// the codex rollout lane, and went with that lane in A6 (`charliek/shed#322`).
+// The contract survives — the opencode transport implements it.
 
 // ---------------------------------------------------------------------------
 // fsnotify nudge layer (watch.go:438-564) over the `notify` crate
+// ---------------------------------------------------------------------------// ---------------------------------------------------------------------------
+// fsnotify nudge layer (watch.go:438-564) over the `notify` crate
 // ---------------------------------------------------------------------------
 
-/// Watches the codex + claude root trees and pings a channel whenever a file
-/// changes, so the hub can run a reconcile sub-tick (`fsNudger`,
-/// `watch.go:447`) — activity surfaces promptly instead of waiting up to the
-/// active interval. It is a best-effort LATENCY optimization: the reconcile
-/// tick already refreshes every watcher, so a missed notification only delays
-/// a transition to the next tick. Watching is non-recursive, so directories
-/// are added as they appear (codex's dated YYYY/MM/DD subdirs, or the whole
-/// ~/.codex tree on a fresh machine).
+/// Watches a set of root trees and pings a channel whenever a file changes, so
+/// the hub can run a reconcile sub-tick (`fsNudger`, `watch.go:447`) — activity
+/// surfaces promptly instead of waiting up to the active interval. It is a
+/// best-effort LATENCY optimization: the reconcile tick already refreshes every
+/// watcher, so a missed notification only delays a transition to the next tick.
+/// Watching is non-recursive, so directories are added as they appear.
+///
+/// DORMANT BY DESIGN, NOT AN OVERSIGHT: no kind tails a file since A6
+/// (`charliek/shed#322`), so the hub builds it over an EMPTY root set and the
+/// tick is the sole driver — the tests below are its only live exercise. It is
+/// kept for the next file-backed lane and retires with the hub in S6 if none
+/// arrives first (see `spawn_fs_nudger`).
 ///
 /// Shape delta vs Go (documented, not parity debt): Go runs a goroutine
 /// selecting over fsnotify's channels until ctx cancellation; `notify`
@@ -775,20 +547,7 @@ impl Drop for FsNudger {
 /// test mods stay pure scenario code).
 #[cfg(test)]
 pub(crate) mod test_support {
-    use chrono::{DateTime, TimeZone, Utc};
-
-    /// A `GetEnv` answering HOME from a tempdir and `""` for everything else —
-    /// the Go suite's `t.Setenv("HOME", dir)` fixture.
-    pub(crate) fn home_getenv(home: &std::path::Path) -> impl Fn(&str) -> String {
-        let home = home.to_str().expect("utf-8 tempdir").to_string();
-        move |k: &str| {
-            if k == "HOME" {
-                home.clone()
-            } else {
-                String::new()
-            }
-        }
-    }
+    use chrono::{DateTime, Utc};
 
     /// The non-blank lines of a shared JSONL fixture (`crates/fixtures/jsonl`).
     pub(crate) fn fixture_lines(name: &str) -> Vec<Vec<u8>> {
@@ -800,16 +559,8 @@ pub(crate) mod test_support {
             .collect()
     }
 
-    /// The correlation fixtures' reference created-at (`watch_test.go`'s
-    /// `base`). Also the pre-watcher queue suite's clock origin — the ingest
-    /// tests share it rather than restating the timestamp.
-    pub(crate) fn base_time() -> DateTime<Utc> {
-        Utc.with_ymd_and_hms(2026, 7, 11, 17, 0, 0).unwrap()
-    }
-
-    /// The WATCHER suites' clock origin (distinct from [`base_time`], which is
-    /// pinned to the correlation fixtures' created-at): any fixed instant
-    /// works, since every watcher assertion is relative to it.
+    /// The WATCHER suites' clock origin: any fixed instant works, since every
+    /// watcher assertion is relative to it.
     pub(crate) fn t0() -> DateTime<Utc> {
         DateTime::from_timestamp(1_700_000_000, 0).expect("valid epoch")
     }
@@ -838,23 +589,21 @@ pub const WATCHER_FRESH_WINDOW: Duration = Duration::from_secs(30);
 /// verdict (see [`merged_activity`]).
 pub const WATCHER_WORKING_GRACE: Duration = Duration::from_secs(120);
 
-/// The ±tolerance around a session's created-at within which a candidate JSONL
-/// file's own creation time must fall to be a match (`correlateWindow`,
-/// `watch.go:67`).
-pub const CORRELATE_WINDOW: Duration = Duration::from_secs(60);
-
 /// THE quiet-source freshness rule (`watcherFreshness`, `watch.go:227`),
-/// shared verbatim by every watcher that has one (the file watcher, the
-/// opencode watcher once its transport is healthy, the cursor watcher on its
-/// pushes). Given a verdict, whether it is settled, and when the source last
-/// produced an event, it reports the verdict's authority at `now`:
+/// shared verbatim by every watcher that has one (the opencode watcher once
+/// its transport is healthy). Given a verdict, whether it is settled, and when
+/// the source last produced an event, it reports the verdict's authority at
+/// `now`:
 ///
 /// - `fresh`: authoritative outright — settled (needs_input/idle; trusted
 ///   indefinitely), recent (last event within [`WATCHER_FRESH_WINDOW`]), or
 ///   working within [`WATCHER_WORKING_GRACE`].
 /// - `expired_working`: a working verdict whose source has been quiet past the
-///   grace — not discarded, but demoted to conditional: the merge lets
-///   stability take over only if stability holds a settled quiet verdict.
+///   grace. Since S2 (`charliek/shed#324`) the merge treats it exactly like any
+///   other non-fresh verdict — there is no pane-stability fallback left for it
+///   to be weighed against — so it is reported for the watchers' own
+///   bookkeeping and asserted by their tests, not consulted by
+///   [`merged_activity`].
 ///
 /// An unknown verdict is never fresh (Go's empty Activity folds into
 /// [`RcActivity::Unknown`] here — the two behave identically in every arm). A
@@ -885,16 +634,25 @@ pub fn watcher_freshness(
     (fresh, expired_working)
 }
 
-/// Resolves the reconcile precedence (`mergedActivity`, `watch.go:285`):
+/// Resolves the reconcile precedence (`mergedActivity`, `watch.go`), which S2
+/// (`charliek/shed#324`) reduced to two arms:
 ///
-/// - a FRESH watcher verdict (and its last-message) wins outright;
-/// - an EXPIRED-WORKING verdict (working, file quiet past the grace) yields to
-///   stability only when stability holds a settled quiet verdict
-///   (idle/needs_input — the pane genuinely stopped); if the pane still churns
-///   (stability=working) or stability has no verdict, working is KEPT — a long
-///   silent turn must not flap;
-/// - otherwise the pane-stability activity drives and last-message is dropped
-///   (stability has no message signal).
+/// - a FRESH watcher verdict (and its last-message) wins;
+/// - EVERYTHING ELSE — no watcher, a closed or unhealthy transport, a stale
+///   verdict, an EXPIRED-WORKING one — yields `None`: NO activity dimension at
+///   all, which the DTO omits.
+///
+/// `None` is Go's empty `Activity`, which is NOT [`RcActivity::Unknown`]:
+/// `unknown` is a wire value meaning "live, but we cannot say what it is
+/// doing", and emitting it here would put an `activity.changed` frame on every
+/// watcherless row. Go's enum carries the empty string as a distinct value;
+/// Rust's does not, so the absence is spelled `Option`.
+///
+/// The expired-working arm went with the pane-stability engine it consulted
+/// (its expiry clock WAS that engine's quiet period). The consequence is
+/// deliberate: an opencode row whose SSE feed dies mid-turn goes to *unknown*
+/// rather than sitting at `working` forever, because nothing is left that can
+/// observe the turn end.
 ///
 /// Returned activity is still subject to the lifecycle-trumps display rule by
 /// the caller.
@@ -902,137 +660,29 @@ pub fn merged_activity(
     watcher_activity: RcActivity,
     watcher_message: &str,
     watcher_fresh: bool,
-    watcher_expired_working: bool,
-    stability: RcActivity,
-) -> (RcActivity, String) {
+) -> (Option<RcActivity>, String) {
     if watcher_fresh {
-        return (watcher_activity, watcher_message.to_string());
+        return (Some(watcher_activity), watcher_message.to_string());
     }
-    if watcher_expired_working {
-        if stability == RcActivity::Idle || stability == RcActivity::NeedsInput {
-            return (stability, String::new());
-        }
-        return (watcher_activity, watcher_message.to_string());
-    }
-    (stability, String::new())
+    (None, String::new())
 }
 
 /// Whether a kind has a structured-signal watcher (`watchableKind`,
-/// `watch.go:303`): codex/claude tail a JSONL file, opencode subscribes to its
-/// embedded HTTP+SSE server, and cursor is fed by its own hook scripts pushing
-/// into the hub's ingest route. Other kinds derive activity from pane
-/// stability alone.
+/// `watch.go`). opencode is the only one: it subscribes to its embedded
+/// HTTP+SSE server. Every other kind has NO activity source at all — A6
+/// (`charliek/shed#322`) retired the codex rollout tail and the cursor
+/// hook-ingest lane, A5 (`charliek/shed#321`) the claude transcript tail before
+/// them, and S2 (`charliek/shed#324`) the pane-stability fallback beneath all
+/// three.
 pub fn watchable_kind(k: &RcKind) -> bool {
-    matches!(k, RcKind::Codex | RcKind::Opencode | RcKind::Cursor) || k.runs_claude()
+    matches!(k, RcKind::Opencode)
 }
 
-/// The outcome of mapping a tmux session to its agent JSONL file
-/// (`correlation`, `watch.go:308`).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Correlation {
-    /// The chosen file.
-    pub path: String,
-    /// The agent's own session id (back-written into the tmux env).
-    pub session_id: String,
-    /// More than one candidate in the window → newest chosen, treat history as
-    /// untrusted.
-    pub ambiguous: bool,
-}
-
-/// The correlation metadata read from an agent JSONL file's early lines
-/// (codex rollout `session_meta` / claude transcript header) — `jsonlPeek`,
-/// `watch.go:317`. Both per-kind peek parsers return it so the newest-pick +
-/// ambiguity logic below is shared. Go's `createdAt`+`hasTime` pair is an
-/// `Option` here.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct JsonlPeek {
-    pub session_id: String,
-    pub cwd: String,
-    pub created_at: Option<DateTime<Utc>>,
-}
-
-/// A JSONL file paired with its peeked correlation metadata (`peekCandidate`,
-/// `watch.go:325`).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PeekCandidate {
-    pub path: String,
-    pub peek: JsonlPeek,
-}
-
-/// Whether candidate `a` is newer than `b` by peeked created-at (`peekNewer`,
-/// `watch.go:336`). Window candidates always carry a created-at (no-timestamp
-/// files are excluded from window matching by the correlate functions).
-/// `name_tiebreak` breaks an exact created-at tie by filename; only codex
-/// passes true (rollout names are timestamp-prefixed, so lexical order is
-/// chronological) — claude transcript names are bare UUIDs, where a filename
-/// comparison would be meaningless.
-pub fn peek_newer(a: &PeekCandidate, b: &PeekCandidate, name_tiebreak: bool) -> bool {
-    if a.peek.created_at != b.peek.created_at {
-        return a.peek.created_at > b.peek.created_at;
-    }
-    if name_tiebreak {
-        return base_name(&a.path) > base_name(&b.path);
-    }
-    false
-}
-
-fn base_name(path: &str) -> &str {
-    Path::new(path)
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or(path)
-}
-
-/// The correlation for the newest of `matches`, flagging ambiguity when more
-/// than one candidate survived the caller's window filter (history untrusted)
-/// — `pickCorrelation`, `watch.go:349`. `matches` must be non-empty, exactly
-/// as in Go.
-pub fn pick_correlation(matches: &[PeekCandidate], name_tiebreak: bool) -> Correlation {
-    let mut best = 0;
-    for i in 1..matches.len() {
-        if peek_newer(&matches[i], &matches[best], name_tiebreak) {
-            best = i;
-        }
-    }
-    Correlation {
-        path: matches[best].path.clone(),
-        session_id: matches[best].peek.session_id.clone(),
-        ambiguous: matches.len() > 1,
-    }
-}
-
-/// Whether `a` and `b` are within `w` of each other (`withinWindow`,
-/// `watch.go:364`).
-///
-/// One unreachable divergence, recorded for the differential: Go's `a.Sub(b)`
-/// saturates at ±292 years and its `d = -d` negation of `MinInt64` stays
-/// negative, so Go answers `true` for a zero-time vs modern-time pair where
-/// this (correctly) answers `false`. Every Go caller guards with `hasTime`
-/// first, so only a fixture stamped year 0001/9999 could ever observe it.
-pub fn within_window(a: DateTime<Utc>, b: DateTime<Utc>, w: Duration) -> bool {
-    let d = a.signed_duration_since(b).abs();
-    d.to_std().is_ok_and(|d| d <= w)
-}
-
-/// Parses an RFC3339(nano) timestamp; `None` on empty/invalid
-/// (`parseJSONLTime`, `watch.go:373`).
-///
-/// KNOWN acceptance deltas vs Go `time.Parse(time.RFC3339Nano)` (H4 review,
-/// 42-shape probe): chrono additionally accepts lowercase `t`/`z`, a space
-/// separator, leap-second `:60`, and a U+2212 minus in the offset; Go
-/// additionally accepts a comma fraction, a 1-digit hour, and `+24:00`
-/// offsets. No real producer emits any of these shapes (codex stamps via
-/// chrono, claude via JS `toISOString()`), so the delta is left undocumented
-/// in behavior rather than papered over with pre-filters; the H5 correlate
-/// differential cells are the tripwire if a producer ever changes.
-pub fn parse_jsonl_time(s: &str) -> Option<DateTime<Utc>> {
-    if s.is_empty() {
-        return None;
-    }
-    DateTime::parse_from_rfc3339(s)
-        .ok()
-        .map(|t| t.with_timezone(&Utc))
-}
+// The file-correlation helpers (`Correlation`, `JsonlPeek`, `PeekCandidate`,
+// `peek_newer`, `pick_correlation`, `within_window`, `parse_jsonl_time`) lived
+// here. Only the codex rollout lane ever mapped a tmux session to a file on
+// disk, so they went with that lane in A6 (`charliek/shed#322`). opencode
+// correlates over its own SSE stream and needs none of it.
 
 /// Reads the back-written `SHED_RC_AGENT_SESSION` for a tmux session (`""`
 /// when absent) — `agentSessionEnv`, `watch.go:385`. It rides
@@ -1075,7 +725,6 @@ pub fn back_write_agent_session(tmux: &Tmux<'_>, tmux_name: &str, id: &str) {
 mod tests {
     use super::test_support::{plus, t0};
     use super::*;
-    use chrono::TimeZone;
     use shed_rc_engine::tmux::{TmuxResult, TmuxRunner};
     use std::collections::HashMap;
     use std::sync::Mutex;
@@ -1153,177 +802,65 @@ mod tests {
         );
     }
 
-    // Mirrors TestMergedActivityPrecedence.
+    // Mirrors TestMergedActivityPrecedence: S2 (`charliek/shed#324`) reduced
+    // `merged_activity` to two arms — a FRESH watcher verdict, and no activity
+    // for everything else. The stability argument and the expired-working arm
+    // went with the pane-stability engine (the arm's expiry clock WAS that
+    // engine's quiet period), so an opencode row whose SSE feed dies mid-turn
+    // goes to *unknown* rather than sitting at `working` forever.
     #[test]
     fn merged_activity_precedence() {
-        // Fresh watcher wins (activity + message).
+        // Arm 1 — a fresh watcher verdict wins, message and all.
         assert_eq!(
-            merged_activity(RcActivity::Working, "hello", true, false, RcActivity::Idle),
-            (RcActivity::Working, "hello".to_string())
-        );
-        // Stale (non-working) watcher → stability drives and the message is
-        // dropped.
-        assert_eq!(
-            merged_activity(RcActivity::Unknown, "hello", false, false, RcActivity::Idle),
-            (RcActivity::Idle, String::new())
-        );
-        // Expired working + stability SETTLED quiet (idle/needs_input) →
-        // stability wins.
-        assert_eq!(
-            merged_activity(
-                RcActivity::Working,
-                "hello",
-                false,
-                true,
-                RcActivity::NeedsInput
-            ),
-            (RcActivity::NeedsInput, String::new())
+            merged_activity(RcActivity::Working, "hello", true),
+            (Some(RcActivity::Working), "hello".to_string())
         );
         assert_eq!(
-            merged_activity(RcActivity::Working, "hello", false, true, RcActivity::Idle).0,
-            RcActivity::Idle
+            merged_activity(RcActivity::NeedsApproval, "tool", true),
+            (Some(RcActivity::NeedsApproval), "tool".to_string())
         );
-        // Expired working + stability still churning (working) → keep working
-        // (no flap).
-        assert_eq!(
-            merged_activity(
-                RcActivity::Working,
-                "hello",
-                false,
-                true,
-                RcActivity::Working
-            ),
-            (RcActivity::Working, "hello".to_string())
-        );
-        // Expired working + stability has no verdict → keep working too.
-        assert_eq!(
-            merged_activity(
-                RcActivity::Working,
-                "hello",
-                false,
-                true,
-                RcActivity::Unknown
-            )
-            .0,
-            RcActivity::Working
-        );
+        // Arm 2 — everything else is no activity at all, and the message goes
+        // with it: a stale verdict, an expired-working one, and no watcher.
+        for (name, activity) in [
+            ("stale non-working verdict", RcActivity::Idle),
+            ("expired-working verdict", RcActivity::Working),
+            ("stale needs_input verdict", RcActivity::NeedsInput),
+            ("no watcher at all", RcActivity::Unknown),
+        ] {
+            assert_eq!(
+                merged_activity(activity, "hello", false),
+                (None, String::new()),
+                "{name}"
+            );
+        }
     }
 
     // Mirrors TestWatchableKindOpencode (extended over the full kind axis —
     // the Go arm asserts opencode in and shell out).
     #[test]
     fn watchable_kinds() {
-        assert!(watchable_kind(&RcKind::Codex));
-        assert!(watchable_kind(&RcKind::ClaudeRc));
-        assert!(watchable_kind(&RcKind::ClaudeBroker));
         assert!(watchable_kind(&RcKind::Opencode));
-        assert!(watchable_kind(&RcKind::Cursor));
+        assert!(
+            !watchable_kind(&RcKind::Codex),
+            "codex no longer tails a rollout (shed#322)"
+        );
+        assert!(
+            !watchable_kind(&RcKind::Cursor),
+            "cursor no longer has a hook-ingest lane (shed#322)"
+        );
+        assert!(
+            !watchable_kind(&RcKind::ClaudeRc),
+            "claude no longer tails a transcript (shed#321)"
+        );
+        assert!(!watchable_kind(&RcKind::ClaudeBroker));
         assert!(!watchable_kind(&RcKind::Shell), "shell is stability only");
         assert!(!watchable_kind(&RcKind::Other("mystery".into())));
     }
 
-    fn cand(path: &str, session_id: &str, created_at: Option<DateTime<Utc>>) -> PeekCandidate {
-        PeekCandidate {
-            path: path.to_string(),
-            peek: JsonlPeek {
-                session_id: session_id.to_string(),
-                cwd: "/home/shed".to_string(),
-                created_at,
-            },
-        }
-    }
-
-    // The shared newest-pick + ambiguity logic the per-kind correlate
-    // functions (H5) sit on — the helper half of the Go correlation suite
-    // (TestCorrelateCodexTwoSessionsOneWorkdir's pick semantics, fold-free).
-    #[test]
-    fn pick_correlation_newest_and_ambiguity() {
-        let base = t0();
-        let older = cand("/r/rollout-a.jsonl", "aaaa-a", Some(base));
-        let newer = cand(
-            "/r/rollout-b.jsonl",
-            "bbbb-b",
-            Some(plus(base, Duration::from_secs(20))),
-        );
-
-        // A single candidate is unambiguous.
-        let corr = pick_correlation(std::slice::from_ref(&older), true);
-        assert_eq!(
-            corr,
-            Correlation {
-                path: "/r/rollout-a.jsonl".into(),
-                session_id: "aaaa-a".into(),
-                ambiguous: false,
-            }
-        );
-
-        // Two in-window candidates → the newest wins and the pick is flagged
-        // ambiguous, regardless of slice order.
-        for matches in [
-            vec![older.clone(), newer.clone()],
-            vec![newer.clone(), older.clone()],
-        ] {
-            let corr = pick_correlation(&matches, true);
-            assert_eq!(corr.session_id, "bbbb-b", "newest chosen");
-            assert!(corr.ambiguous, ">1 in-window candidate is ambiguous");
-        }
-    }
-
-    // peekNewer's created-at ordering + the codex-only filename tiebreak
-    // (rollout names are timestamp-prefixed; claude UUID names must NOT
-    // tiebreak).
-    #[test]
-    fn peek_newer_tiebreak() {
-        let base = t0();
-        let a = cand("/r/rollout-2026-07-11T17-00-05-aaa.jsonl", "a", Some(base));
-        let b = cand("/r/rollout-2026-07-11T17-00-01-bbb.jsonl", "b", Some(base));
-
-        // Distinct created-at: time decides, tiebreak irrelevant.
-        let newer = cand("/r/x.jsonl", "x", Some(plus(base, Duration::from_secs(1))));
-        assert!(peek_newer(&newer, &a, false));
-        assert!(!peek_newer(&a, &newer, true));
-
-        // Equal created-at: only the codex flavor breaks the tie by basename.
-        assert!(
-            peek_newer(&a, &b, true),
-            "lexically-later rollout name wins"
-        );
-        assert!(!peek_newer(&b, &a, true));
-        assert!(!peek_newer(&a, &b, false), "no tiebreak without the flag");
-        assert!(!peek_newer(&b, &a, false));
-    }
-
-    #[test]
-    fn within_window_edges() {
-        let base = t0();
-        let w = CORRELATE_WINDOW;
-        assert!(within_window(base, base, w));
-        assert!(
-            within_window(base, plus(base, w), w),
-            "inclusive at the edge"
-        );
-        assert!(within_window(plus(base, w), base, w), "symmetric");
-        assert!(!within_window(
-            base,
-            plus(base, w + Duration::from_secs(1)),
-            w
-        ));
-    }
-
-    #[test]
-    fn parse_jsonl_time_cases() {
-        assert_eq!(parse_jsonl_time(""), None);
-        assert_eq!(parse_jsonl_time("not a time"), None);
-        assert_eq!(parse_jsonl_time("2026-07-11"), None, "date-only is invalid");
-        let want = Utc.with_ymd_and_hms(2026, 7, 11, 17, 17, 35).unwrap();
-        assert_eq!(parse_jsonl_time("2026-07-11T17:17:35Z"), Some(want));
-        // Nano fraction + offset both accepted (Go RFC3339Nano).
-        assert_eq!(
-            parse_jsonl_time("2026-07-11T17:17:35.123456789Z").map(|t| t.timestamp()),
-            Some(want.timestamp())
-        );
-        assert_eq!(parse_jsonl_time("2026-07-11T19:17:35+02:00"), Some(want));
-    }
+    // The correlation-helper cells (`pick_correlation` newest/ambiguity,
+    // `peek_newer` tiebreak, `within_window` edges, `parse_jsonl_time` cases)
+    // went with the codex rollout lane in A6 (`charliek/shed#322`), together
+    // with the helpers themselves.
 
     /// Records `set-environment` and answers `show-environment` from a map —
     /// the Go suite's `envRecRunner` (`watch_test.go:1169`).
@@ -1376,167 +913,11 @@ mod tests {
         assert_eq!(agent_session_env(&tmux, "rc-x"), "sess-123");
     }
 
-    // ---- fileWatcher (H7) ----
-
-    use super::super::watch_codex::CodexFold;
-
-    fn write_file(path: &Path, content: &str) {
-        std::fs::write(path, content).expect("write");
-    }
-
-    /// Appends to an existing JSONL fixture — the "new content lands after X"
-    /// half of the watcher scenarios.
-    fn append_file(path: &Path, content: &str) {
-        let mut f = std::fs::OpenOptions::new()
-            .append(true)
-            .open(path)
-            .expect("open");
-        std::io::Write::write_all(&mut f, content.as_bytes()).expect("append");
-    }
-
-    // Mirrors TestFileWatcherFreshnessSettledVsWorkingGrace
-    // (watch_test.go:968): settled stays authoritative; working keeps its
-    // authority through the LONG grace and only past it demotes to
-    // expired_working.
-    #[test]
-    fn file_watcher_freshness_settled_vs_working_grace() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let now = t0();
-
-        let settled_path = dir.path().join("settled.jsonl");
-        write_file(
-            &settled_path,
-            concat!(
-                r#"{"type":"event_msg","payload":{"type":"task_complete","last_agent_message":"done"}}"#,
-                "\n"
-            ),
-        );
-        let sw = FileWatcher::new(
-            settled_path.to_str().unwrap(),
-            true,
-            Box::new(CodexFold::new()),
-        );
-        sw.refresh(now);
-        let (a, msg, fresh, _) = sw.snapshot(now);
-        assert_eq!(
-            (a, msg.as_str(), fresh),
-            (RcActivity::NeedsInput, "done", true)
-        );
-        let (_, _, fresh, _) = sw.snapshot(plus(now, Duration::from_secs(600)));
-        assert!(
-            fresh,
-            "a settled verdict stays fresh while the file is quiet"
-        );
-
-        let work_path = dir.path().join("work.jsonl");
-        write_file(
-            &work_path,
-            concat!(
-                r#"{"type":"event_msg","payload":{"type":"task_started"}}"#,
-                "\n"
-            ),
-        );
-        let ww = FileWatcher::new(
-            work_path.to_str().unwrap(),
-            true,
-            Box::new(CodexFold::new()),
-        );
-        ww.refresh(now);
-        let (a, _, fresh, expired) = ww.snapshot(now);
-        assert_eq!((a, fresh, expired), (RcActivity::Working, true, false));
-        let (_, _, fresh, expired) =
-            ww.snapshot(plus(now, WATCHER_FRESH_WINDOW + Duration::from_secs(1)));
-        assert!(fresh && !expired, "working inside the grace stays fresh");
-        let (_, _, fresh, expired) =
-            ww.snapshot(plus(now, WATCHER_WORKING_GRACE + Duration::from_secs(1)));
-        assert!(
-            !fresh && expired,
-            "working past the grace is expired_working"
-        );
-    }
-
-    // Mirrors TestFileWatcherClosedRefreshNoop (hub_messages_test.go:455): a
-    // closed watcher's refresh must not reopen the file, refold history, or
-    // produce feed messages.
-    #[test]
-    fn file_watcher_closed_refresh_noop() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("rollout.jsonl");
-        write_file(
-            &path,
-            concat!(
-                r#"{"type":"event_msg","payload":{"type":"task_started"}}"#,
-                "\n"
-            ),
-        );
-        let w = FileWatcher::new(path.to_str().unwrap(), true, Box::new(CodexFold::new()));
-        let now = t0();
-        w.refresh(now);
-        assert_eq!(w.snapshot(now).0, RcActivity::Working, "precondition");
-
-        w.close();
-
-        // New content lands after close; a refresh must ignore it entirely.
-        append_file(
-            &path,
-            concat!(
-                r#"{"type":"event_msg","payload":{"type":"task_complete","last_agent_message":"done"}}"#,
-                "\n"
-            ),
-        );
-        let later = plus(now, Duration::from_secs(1));
-        w.refresh(later);
-        assert_eq!(
-            w.snapshot(later).0,
-            RcActivity::Working,
-            "closed watcher folded new lines"
-        );
-        assert!(
-            !w.tailer_is_open(),
-            "closed watcher reopened its file handle"
-        );
-        assert!(w.drain_pending().is_empty(), "no feed messages after close");
-        w.close(); // idempotent
-    }
-
-    // Mirrors TestCodexFoldGapClearsPendingThenTaskCompleteSettles
-    // (watch_test.go:1335), driven through the REAL file watcher: the tool's
-    // oversized output line is skipped, the gap clears the pending call, and
-    // task_complete settles.
-    #[test]
-    fn file_watcher_gap_clears_pending_then_settles() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("rollout.jsonl");
-        write_file(
-            &path,
-            concat!(
-                r#"{"type":"event_msg","payload":{"type":"task_started"}}"#,
-                "\n",
-                r#"{"type":"response_item","payload":{"type":"custom_tool_call","call_id":"c1","name":"exec"}}"#,
-                "\n"
-            ),
-        );
-        let w = FileWatcher::new(path.to_str().unwrap(), true, Box::new(CodexFold::new()));
-        let now = t0();
-        w.refresh(now);
-        assert_eq!(w.snapshot(now).0, RcActivity::Working, "open tool call");
-
-        let oversized = format!(
-            "{}{}{}\n{}\n",
-            r#"{"type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"c1","output":""#,
-            "x".repeat(super::super::tail::TAIL_MAX_LINE + 16),
-            r#""}}"#,
-            r#"{"type":"event_msg","payload":{"type":"task_complete","last_agent_message":"done"}}"#,
-        );
-        append_file(&path, &oversized);
-        let later = plus(now, Duration::from_secs(1));
-        w.refresh(later);
-        assert_eq!(
-            w.snapshot(later).0,
-            RcActivity::NeedsInput,
-            "the gap cleared the pending call"
-        );
-    }
+    // The `FileWatcher` cells (settled-vs-working-grace freshness, the
+    // closed-refresh no-op, the gap-clears-pending fold) went with the codex
+    // rollout lane and its tailer in A6 (`charliek/shed#322`). The freshness
+    // rule they drove through that transport survives above
+    // (`freshness_settled_vs_working_grace`) and on the opencode transport.
 
     // ---- fsNudger (H7) ----
 
@@ -1611,17 +992,6 @@ mod tests {
     // trait object (Go's runtime assert cannot be forgotten).
     #[test]
     fn message_producer_folds_forward_through_the_trait_object() {
-        // codex
-        let mut codex: Box<dyn ActivityFold + Send> =
-            Box::new(super::super::watch_codex::CodexFold::new());
-        codex.apply_line(
-            br#"{"type":"event_msg","payload":{"type":"user_message","message":"hi"}}"#,
-        );
-        assert_eq!(
-            codex.drain_fold_messages().len(),
-            1,
-            "codex feed reaches the trait object"
-        );
         // opencode
         let mut oc: Box<dyn ActivityFold + Send> =
             Box::new(super::super::watch_opencode::OpencodeFold::new());
@@ -1632,14 +1002,6 @@ mod tests {
             oc.drain_fold_messages().len(),
             1,
             "opencode feed reaches the trait object"
-        );
-        // claude is activity-only: the default empty drain is correct.
-        let mut claude: Box<dyn ActivityFold + Send> =
-            Box::new(super::super::watch_claude::ClaudeFold::new());
-        claude.apply_line(br#"{"type":"user","message":{"role":"user","content":"hi"}}"#);
-        assert!(
-            claude.drain_fold_messages().is_empty(),
-            "claude contributes no feed rows"
         );
     }
 

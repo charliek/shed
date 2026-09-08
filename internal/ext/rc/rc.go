@@ -81,13 +81,23 @@ func AcceptsTypedInput(k Kind) bool {
 	return ok && k != KindClaudeBroker
 }
 
-// State is the pane-derived liveness of a session. Never stored — always classified
-// from a capture-pane on demand.
+// State is a session's LIVENESS. Never stored — derived on demand, and since S2
+// (charliek/shed#324) derived from whether the session is there at all rather than
+// from what its pane says: an ENUMERATED session is live (StateReady); one whose
+// tmux session is gone is not enumerated by List and is ErrSessionNotFound from
+// Probe. StateStarting is the create-time placeholder, and StateDead is the wait
+// path's verdict when the inner command exited immediately.
+//
+// The wire enum is CLOSED, so the three the guest no longer emits stay: a client
+// still decodes them off an older guest's DTO, and dropping a value would make
+// that decode fail rather than degrade.
 type State string
 
 const (
-	StateStarting     State = "starting"
-	StateReady        State = "ready"
+	StateStarting State = "starting"
+	StateReady    State = "ready"
+	// Reconnecting / NeedsTrust / NeedsAuth were pane-classifier verdicts. The
+	// current guest never emits them; they remain decodable (see the type doc).
 	StateReconnecting State = "reconnecting"
 	StateNeedsTrust   State = "needs-trust"
 	StateNeedsAuth    State = "needs-auth"
@@ -122,15 +132,15 @@ const (
 	// EVERY kind, unlike the opencode-only port key below. It is deliberately redundant
 	// with the tmux session NAME (rc-<slug>, which is what ParseSession derives the slug
 	// from — this key is never the reader's source of truth): its purpose is DELIVERY.
-	// A child process launched inside the session inherits the tmux session env, so an
-	// agent's hook script — cursor's, which the hub preseeds (PreseedCursorHooks) — can
-	// read $SHED_RC_SLUG and address its own session on the hub's ingest route without
-	// the agent knowing anything about shed. Rides the SHED_RC_ prefix like every other
-	// key here, so parseEnv/showEnvironment already surface it.
+	// A child process launched inside the session inherits the tmux session env, so a
+	// helper running there can read $SHED_RC_SLUG and address its own session without
+	// knowing anything else about shed. (Its original consumer, cursor's preseeded hook
+	// relay, went with the ingest lane in A6 — charliek/shed#322.) Rides the SHED_RC_
+	// prefix like every other key here, so parseEnv/showEnvironment already surface it.
 	envSlug = "SHED_RC_SLUG"
 	// envAgentSession is the ADDITIVE, write-once-on-correlate key the hub back-writes
-	// once it has pinned a session to its agent JSONL file (codex rollout id / claude
-	// transcript session id). It is NOT part of the create-time BuildEnvArgs set — the
+	// once it has pinned a session to its agent-side conversation (opencode's session
+	// id). It is NOT part of the create-time BuildEnvArgs set — the
 	// hub stamps it later via `tmux set-environment` so a hub restart re-correlates
 	// exactly instead of re-running the cwd+window heuristic. It rides the SHED_RC_
 	// prefix so parseEnv/showEnvironment already surface it.
@@ -397,23 +407,20 @@ func IsBypassAcceptPrompt(pane string) bool {
 	return bypassWarnRe.MatchString(pane) && bypassAcceptRe.MatchString(pane)
 }
 
-// ClassifyPane derives (state, url) from a captured pane for a kind. Mirrors
-// shed-remote-agent's classifyPane. An unregistered (unknown) kind renders neutrally
-// as a plain shell pane — no kind-specific affordances or claude URL (the unknown-kind
-// policy). For agent kinds a shared shed-guest dead check runs first: if the agent has
-// exited back to the login shell, the session is dead regardless of any auth/trust
-// text still in scrollback. Shell is exempt (its prompt is the ready state).
-func ClassifyPane(kind Kind, pane string) (State, string) {
-	spec, ok := specForKind(kind)
-	if !ok {
-		r := classifyShell(kind, pane)
-		return r.State, r.URL
-	}
-	if spec.Tool != toolShell && exitedToShell(pane) {
-		return StateDead, ""
-	}
-	r := spec.Classify(kind, pane)
-	return r.State, r.URL
+var codexTrustRe = regexp.MustCompile(`(?i)Do you trust the contents of this directory\?`)
+
+// IsCodexTrustPrompt reports whether the pane is showing codex's first-run
+// directory-trust dialog ("Do you trust the contents of this directory?", whose
+// "1. Yes, continue · Press enter to continue" row is pre-selected).
+//
+// A CONTROL matcher, not a status one — the same category as IsTrustPrompt and
+// IsBypassAcceptPrompt. S2 (charliek/shed#324) deleted the pane classifiers, but
+// this one survives because a kickoff must never be typed into a modal: without it
+// `create --wait --prompt` on an untrusted workdir would send the prompt line into
+// the trust dialog instead of the composer. The same gate refuses a one-shot
+// `prompt` while the dialog is up.
+func IsCodexTrustPrompt(pane string) bool {
+	return codexTrustRe.MatchString(pane)
 }
 
 var canonicalIntRe = regexp.MustCompile(`^\d+$`)
@@ -432,8 +439,7 @@ func isManagedVersion(raw string) bool {
 // parseKind maps a managed session's SHED_RC_KIND to a Kind. An unrecognized value is
 // PRESERVED verbatim (the unknown-kind policy): a reader that doesn't know the kind
 // keeps the raw string and renders it neutrally (name + state only, no claude URL
-// affordances) rather than inheriting claude-broker behavior. ClassifyPane falls back
-// to a neutral shell-style classification for such kinds.
+// affordances) rather than inheriting claude-broker behavior.
 func parseKind(raw string) Kind {
 	return Kind(raw)
 }

@@ -34,7 +34,7 @@ shed-app = { path = "../../../crates/shed-app", features = ["rc", "broker"] }
 # `crates/Cargo.toml`'s workspace pin, and it MUST stay in lockstep with it: two
 # revs would put two copies of the crate in this tree and `shed_app::roost`'s
 # signatures would stop accepting these types. Bump both together.
-roost-ipc = { git = "https://github.com/charliek/roost", rev = "61d8713bcd0378971ad8490fe89b8dbef4e49fac" }
+roost-ipc = { git = "https://github.com/charliek/roost", rev = "c67ac27b6a85dbee0871f32d49c1566cc068d1c8" }
 # "process" backs the Linux AuthGate (the pkcheck subprocess; the notifier is zbus).
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "net", "io-util", "time", "process"] }
 serde = { version = "1", features = ["derive"] }

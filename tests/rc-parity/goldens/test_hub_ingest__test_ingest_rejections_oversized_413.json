@@ -1,7 +1,0 @@
-{
-  "body": {
-    "error": "too_large",
-    "message": "hook payload exceeds 256 KiB"
-  },
-  "status": 413
-}

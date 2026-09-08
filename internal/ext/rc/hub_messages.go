@@ -7,16 +7,15 @@ import (
 	"unicode/utf8"
 )
 
-// The message feed is the non-TUI view's data source: as the codex rollout watcher
-// folds the JSONL turn stream (see watch_codex.go's codexFold), the opencode watcher
-// folds its HTTP/SSE event stream (watch_opencode.go's opencodeFold), and the cursor
-// watcher folds the hook events its preseeded scripts push into the hub
-// (watch_cursor.go's cursorFold), each also emits normalized conversation messages,
-// which the reconcile loop drains into a per-session ring buffer here.
-// GET /v1/sessions/{slug}/messages pages that ring;
-// message.appended SSE events notify subscribers a new message landed (the body is
-// fetched from /messages — the notification stays tiny). claude feeds activity only
-// in this phase, so its sessions have a ring that simply never fills.
+// The message feed is the non-TUI view's data source: as the opencode watcher folds its
+// HTTP/SSE event stream (watch_opencode.go's opencodeFold) it also emits normalized
+// conversation messages, which the reconcile loop drains into a per-session ring buffer
+// here. GET /v1/sessions/{slug}/messages pages that ring; message.appended SSE events
+// notify subscribers a new message landed (the body is fetched from /messages — the
+// notification stays tiny). opencode is the only producer since A5/A6
+// (charliek/shed#321, #322) retired the claude and codex transcript tails and the cursor
+// hook-ingest lane; every other kind has a ring that simply never fills, and /messages
+// answers a tracked feedless session with 200 and an empty page.
 //
 // Bounds (the wire contract): each message's text (and a tool block's detail) is
 // sanitized and capped at 8 KiB; the per-session ring holds at most 500 messages AND
@@ -59,7 +58,7 @@ const (
 
 // Feed message role/type tokens (the wire contract's message shape). role ∈
 // {user, assistant, tool, system}; type ∈ {text, tool_use, tool_result, reasoning,
-// status, approval_request}. The producers (codexFold) map their native events onto
+// status, approval_request}. The producers (opencodeFold) map their native events onto
 // these.
 const (
 	feedRoleUser      = "user"

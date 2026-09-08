@@ -1,0 +1,7 @@
+{
+  "event": "tab.notification",
+  "data": {
+    "has_pending": false,
+    "tab_id": "8"
+  }
+}

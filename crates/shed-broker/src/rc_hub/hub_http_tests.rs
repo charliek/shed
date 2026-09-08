@@ -19,8 +19,7 @@ use super::hub::{
 };
 use super::hub_test_support::{
     codex_ready_pane, do_request, http_client, hub_config, managed_env, new_test_hub,
-    opencode_ready_pane, pane_fixture, raw_post, serve_hub, wait_for, want_envelope, HubClock,
-    HubTmux, CURSOR_SID,
+    opencode_ready_pane, raw_post, serve_hub, wait_for, want_envelope, HubClock, HubTmux,
 };
 use super::messages::{FeedMessage, MAX_RING_MESSAGES};
 
@@ -65,7 +64,7 @@ async fn http_sessions() {
     let h = Arc::new(new_test_hub(&f, &clk));
     f.set(
         "rc-hhh888",
-        "> Find and fix a bug in @filename",
+        "> Ask Codex to do anything",
         &managed_env("id-8", &RcKind::Codex),
     );
     h.reconcile();
@@ -80,10 +79,12 @@ async fn http_sessions() {
     let body: HubSessionsResponse = resp.json().await.unwrap();
     assert_eq!(body.sessions.len(), 1);
     assert_eq!(body.sessions[0].slug, "hhh888");
+    // No watcher ⇒ no activity dimension, and the DTO OMITS it (S2,
+    // `charliek/shed#324` — the pane-stability fallback that used to overlay
+    // `working` on every row is gone).
     assert_eq!(
-        body.sessions[0].activity,
-        Some(RcActivity::Working),
-        "want working overlaid"
+        body.sessions[0].activity, None,
+        "a watcherless row carries no activity"
     );
 }
 
@@ -338,85 +339,64 @@ async fn http_messages_empty_for_known_slug() {
 
 // ---- POST /v1/sessions/{slug}/input ----
 
-// Mirrors TestHubInputHappyPathReachesPane.
+// A6 (`charliek/shed#322`) removed the gated-input lane: `kind_features.input`
+// is "" for every TUI kind and "turn" for opencode, so NO kind is `gated` and a
+// well-formed POST for a live session is 409 `not_accepting` whatever the pane
+// shows. The gated-lane cells this replaces — happy path, bracketed paste,
+// degraded-anchor accept, the under-a-dialog / state-flip / identity 409s, the
+// transient-capture 500 and the per-slug delivery mutex — went with the lane.
 #[tokio::test(flavor = "multi_thread")]
-async fn input_happy_path_reaches_pane() {
+async fn input_not_accepting_for_every_kind() {
     let f = HubTmux::new();
     let clk = HubClock::new();
     f.set(
-        "rc-inp111",
+        "rc-nac001",
         &codex_ready_pane(),
-        &managed_env("id-i", &RcKind::Codex),
+        &managed_env("id-c", &RcKind::Codex),
     );
-    let (_h, url) = new_input_hub(&f, &clk).await;
-
-    let resp = do_request(
-        &http_client(),
-        Method::POST,
-        &format!("{url}/v1/sessions/inp111/input"),
-        r#"{"text":"hello there"}"#,
-    )
-    .await;
-    assert_eq!(
-        resp.status().as_u16(),
-        200,
-        "{}",
-        resp.text().await.unwrap()
-    );
-    assert_eq!(f.recorded(), vec!["hello there".to_string()]);
-}
-
-// Mirrors TestHubInputMultilineUsesBracketedPaste.
-#[tokio::test(flavor = "multi_thread")]
-async fn input_multiline_uses_bracketed_paste() {
-    let f = HubTmux::new();
-    let clk = HubClock::new();
     f.set(
-        "rc-inp222",
-        &codex_ready_pane(),
-        &managed_env("id-i2", &RcKind::Codex),
+        "rc-nac002",
+        &opencode_ready_pane(),
+        &managed_env("id-o", &RcKind::Opencode),
     );
-    let (_h, url) = new_input_hub(&f, &clk).await;
-
-    let resp = do_request(
-        &http_client(),
-        Method::POST,
-        &format!("{url}/v1/sessions/inp222/input"),
-        r#"{"text":"line one\nline two"}"#,
-    )
-    .await;
-    assert_eq!(resp.status().as_u16(), 200);
-    assert_eq!(f.recorded(), vec!["line one\nline two".to_string()]);
-}
-
-// Mirrors TestHubInputDegradedIdleAnchorAccepts: no watcher correlated
-// (getenv answers "") — the only acceptance signal is the composer anchor.
-#[tokio::test(flavor = "multi_thread")]
-async fn input_degraded_idle_anchor_accepts() {
-    let f = HubTmux::new();
-    let clk = HubClock::new();
     f.set(
-        "rc-deg111",
-        &codex_ready_pane(),
-        &managed_env("id-d", &RcKind::Codex),
+        "rc-nac003",
+        "cursor\n> ",
+        &managed_env("id-u", &RcKind::Cursor),
+    );
+    f.set(
+        "rc-nac004",
+        "claude\n> ",
+        &managed_env("id-r", &RcKind::ClaudeRc),
     );
     let (_h, url) = new_input_hub(&f, &clk).await;
 
-    let resp = do_request(
-        &http_client(),
-        Method::POST,
-        &format!("{url}/v1/sessions/deg111/input"),
-        r#"{"text":"go"}"#,
-    )
-    .await;
-    assert_eq!(
-        resp.status().as_u16(),
-        200,
-        "degraded idle+anchor must accept"
+    for slug in ["nac001", "nac002", "nac003", "nac004"] {
+        let resp = do_request(
+            &http_client(),
+            Method::POST,
+            &format!("{url}/v1/sessions/{slug}/input"),
+            r#"{"text":"hi"}"#,
+        )
+        .await;
+        assert_eq!(
+            resp.status().as_u16(),
+            409,
+            "{slug}: no kind accepts feed input"
+        );
+        let body = resp.text().await.unwrap();
+        assert!(
+            body.contains("not_accepting") && body.contains("does not accept feed input"),
+            "{slug}: want the kind-gate not_accepting envelope, got {body}"
+        );
+    }
+    assert!(
+        f.recorded().is_empty(),
+        "nothing may reach a pane through /input"
     );
 }
 
-// Mirrors TestHubInputErrorStatuses.
+// Mirrors TestHubInputErrorStatuses.// Mirrors TestHubInputErrorStatuses.
 #[tokio::test(flavor = "multi_thread")]
 async fn input_error_statuses() {
     let f = HubTmux::new();
@@ -536,9 +516,14 @@ async fn null_string_fields_are_a_go_no_op() {
 }
 
 // The wire-differential's raw-invalid-UTF-8 cell (F3): Go's decoder
-// substitutes U+FFFD per bad byte and the request PROCEEDS, so the pane
-// receives the replacement character. serde rejects the slice outright, hence
-// decode_json_capped's lossy retry.
+// substitutes U+FFFD per bad byte and the request PROCEEDS past decoding.
+// serde rejects the slice outright, hence decode_json_capped's lossy retry —
+// without it this would be 400 `invalid_json`, which Go never answers here.
+//
+// A6 (`charliek/shed#322`) took the delivery half of the assertion with the
+// gated lane: /input no longer reaches a pane, so "got past decoding" is now
+// observed as the kind gate's 409 rather than a 200 plus the pane recording
+// "a\u{fffd}b". The decode behavior under test is unchanged.
 #[tokio::test(flavor = "multi_thread")]
 async fn invalid_utf8_in_a_string_is_replaced_not_rejected() {
     let f = HubTmux::new();
@@ -562,213 +547,11 @@ async fn invalid_utf8_in_a_string_is_replaced_not_rejected() {
         .expect("post");
     assert_eq!(
         resp.status().as_u16(),
-        200,
-        "{}",
+        409,
+        "the lossy retry must carry the body PAST decoding (400 = rejected): {}",
         resp.text().await.unwrap_or_default()
     );
-    assert_eq!(f.recorded(), vec!["a\u{fffd}b".to_string()]);
-}
-
-// Was TestHubInputNotAcceptingIs409, which posted into a churning pane. Under
-// the current rule a churning pane is fine — the TUI queues the line — so the
-// end-to-end 409 is exercised where it still belongs: a pane showing an
-// approval dialog, where a delivered sentence would ANSWER it.
-#[tokio::test(flavor = "multi_thread")]
-async fn input_under_a_dialog_is_409() {
-    let f = HubTmux::new();
-    let clk = HubClock::new();
-    f.set(
-        "rc-na111",
-        &pane_fixture("codex-ready-approval-exec"),
-        &managed_env("id-na", &RcKind::Codex),
-    );
-    let (_h, url) = new_input_hub(&f, &clk).await;
-    let resp = do_request(
-        &http_client(),
-        Method::POST,
-        &format!("{url}/v1/sessions/na111/input"),
-        r#"{"text":"hi"}"#,
-    )
-    .await;
-    assert_eq!(resp.status().as_u16(), 409);
-}
-
-// Mirrors TestHubInputRaceStateFlipIs409, and the race it guards is unchanged:
-// the session was tracked at a clean composer, but the capture taken under the
-// input mutex — as late as possible before delivery — sees a dialog that went up
-// in between. Delivering against the FIRST capture would answer it.
-#[tokio::test(flavor = "multi_thread")]
-async fn input_race_state_flip_is_409() {
-    let f = HubTmux::new();
-    let clk = HubClock::new();
-    f.set(
-        "rc-race22",
-        &codex_ready_pane(),
-        &managed_env("id-r", &RcKind::Codex),
-    );
-    let (_h, url) = new_input_hub(&f, &clk).await;
-
-    f.set_pane("rc-race22", &pane_fixture("codex-ready-approval-exec"));
-    let resp = do_request(
-        &http_client(),
-        Method::POST,
-        &format!("{url}/v1/sessions/race22/input"),
-        r#"{"text":"hi"}"#,
-    )
-    .await;
-    assert_eq!(resp.status().as_u16(), 409);
-}
-
-// Mirrors TestHubInputIdentityGuardIs409: recreated (new SHED_RC_ID) without
-// a reconcile — the locked re-check must reject.
-#[tokio::test(flavor = "multi_thread")]
-async fn input_identity_guard_is_409() {
-    let f = HubTmux::new();
-    let clk = HubClock::new();
-    f.set(
-        "rc-idg111",
-        &codex_ready_pane(),
-        &managed_env("id-old", &RcKind::Codex),
-    );
-    let (_h, url) = new_input_hub(&f, &clk).await;
-
-    f.set(
-        "rc-idg111",
-        &codex_ready_pane(),
-        &managed_env("id-new", &RcKind::Codex),
-    );
-    let resp = do_request(
-        &http_client(),
-        Method::POST,
-        &format!("{url}/v1/sessions/idg111/input"),
-        r#"{"text":"hi"}"#,
-    )
-    .await;
-    assert_eq!(resp.status().as_u16(), 409);
-}
-
-// Mirrors TestHubInputOpencodeNotGatedAfterTurnFlip — the /input BEHAVIOR
-// BREAK, pinned: opencode's row moved to input "turn", so /input 409s on a
-// pane that DOES match its composer anchor, finally, regardless of activity.
-#[tokio::test(flavor = "multi_thread")]
-async fn input_opencode_not_gated_after_turn_flip() {
-    let f = HubTmux::new();
-    let clk = HubClock::new();
-    f.set(
-        "rc-ng111",
-        &opencode_ready_pane(),
-        &managed_env("id-ng", &RcKind::Opencode),
-    );
-    let (_h, url) = new_input_hub(&f, &clk).await;
-
-    let resp = do_request(
-        &http_client(),
-        Method::POST,
-        &format!("{url}/v1/sessions/ng111/input"),
-        r#"{"text":"hi"}"#,
-    )
-    .await;
-    assert_eq!(resp.status().as_u16(), 409);
-    let body = resp.text().await.unwrap();
-    assert!(
-        body.contains("does not accept feed input"),
-        "want the kind-gate message, got {body}"
-    );
-}
-
-// Mirrors TestHubInputTransientCaptureErrorIs500: a transient tmux hiccup at
-// the locked re-check is a 500 (retryable), not a 404.
-#[tokio::test(flavor = "multi_thread")]
-async fn input_transient_capture_error_is_500() {
-    let f = HubTmux::new();
-    let clk = HubClock::new();
-    f.set(
-        "rc-tra111",
-        &codex_ready_pane(),
-        &managed_env("id-t", &RcKind::Codex),
-    );
-    let (_h, url) = new_input_hub(&f, &clk).await;
-
-    f.set_flaky("rc-tra111", true);
-    let resp = do_request(
-        &http_client(),
-        Method::POST,
-        &format!("{url}/v1/sessions/tra111/input"),
-        r#"{"text":"hi"}"#,
-    )
-    .await;
-    assert_eq!(resp.status().as_u16(), 500);
-}
-
-// Mirrors TestHubInputLockSurvivesEntryReplacement: input serialization is
-// keyed by SLUG on the hub — a tracked-entry replacement yields the SAME
-// mutex, and a held mutex blocks a live POST across the replacement.
-#[tokio::test(flavor = "multi_thread")]
-async fn input_lock_survives_entry_replacement() {
-    let f = HubTmux::new();
-    let clk = HubClock::new();
-    let (h, url) = new_input_hub(&f, &clk).await;
-    f.set(
-        "rc-lok111",
-        &codex_ready_pane(),
-        &managed_env("id-a", &RcKind::Codex),
-    );
-    h.reconcile();
-
-    let mu = h.input_lock("lok111");
-    f.set(
-        "rc-lok111",
-        &codex_ready_pane(),
-        &managed_env("id-b", &RcKind::Codex),
-    );
-    h.reconcile();
-    assert!(
-        Arc::ptr_eq(&mu, &h.input_lock("lok111")),
-        "entry replacement must not mint a new input mutex for the slug"
-    );
-
-    // Hold the mutex on a helper thread; the live POST must block until it is
-    // released (the handler resolves the lock by slug, not via the entry).
-    let held = Arc::new(std::sync::Barrier::new(2));
-    let release = Arc::new(AtomicBool::new(false));
-    let (tmu, theld, trel) = (Arc::clone(&mu), Arc::clone(&held), Arc::clone(&release));
-    let holder = std::thread::spawn(move || {
-        let _g = tmu.lock().unwrap();
-        theld.wait();
-        while !trel.load(Ordering::Relaxed) {
-            std::thread::sleep(Duration::from_millis(5));
-        }
-    });
-    held.wait();
-
-    let post_url = format!("{url}/v1/sessions/lok111/input");
-    let post = tokio::spawn(async move {
-        do_request(&http_client(), Method::POST, &post_url, r#"{"text":"hi"}"#)
-            .await
-            .status()
-            .as_u16()
-    });
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    assert!(
-        !post.is_finished(),
-        "the POST must block on the held slug mutex"
-    );
-    release.store(true, Ordering::Relaxed);
-    holder.join().unwrap();
-    // Completion is the contract (Go asserts only that it finishes — the
-    // fresh session's first-tick stability legitimately answers 409 here).
-    tokio::time::timeout(Duration::from_secs(2), post)
-        .await
-        .expect("POST did not complete after the mutex was released")
-        .unwrap();
-
-    // Disappear → the lock is pruned; a later recreate gets a fresh mutex.
-    f.remove("rc-lok111");
-    h.reconcile();
-    assert!(
-        !Arc::ptr_eq(&mu, &h.input_lock("lok111")),
-        "disappeared slug's input lock must be pruned"
-    );
+    assert!(f.recorded().is_empty(), "/input reaches no pane");
 }
 
 // ---- the sanctioned env seams (§2.5 — clirc.applyHubEnvOverrides) ----
@@ -1398,7 +1181,6 @@ async fn reconcile_publishes_pending_approvals() {
             ],
             ..FeedApproval::default()
         }],
-        blocked: false,
     });
     {
         let mut ts = h.lock_track();
@@ -1996,462 +1778,17 @@ async fn republish_approvals_skips_a_replaced_entry() {
     }
 }
 
-// ---- POST /v1/ingest/cursor (hub_ingest_test.go) ----
-
-use super::ingest::{HUB_INGEST_MAX_BODY_BYTES, MAX_PRE_WATCHER_EVENTS, PRE_WATCHER_TTL};
-use super::messages::MAX_MESSAGES_LIMIT;
-use shed_rc_engine::tmux::{TmuxResult, TmuxRunner};
-
-/// `ingestHub` (`hub_ingest_test.go:18`): one session of the given kind,
-/// optionally reconciled, plus the served router.
-async fn ingest_hub(
-    kind: &RcKind,
-    reconcile: bool,
-) -> (Arc<Hub>, Arc<HubTmux>, String, Arc<HubClock>) {
-    let f = HubTmux::new();
-    let clk = HubClock::new();
-    let h = Arc::new(new_test_hub(&f, &clk));
-    let pane = if *kind == RcKind::Codex {
-        codex_ready_pane()
-    } else {
-        pane_fixture("cursor-ready")
-    };
-    f.set("rc-ing001", &pane, &managed_env("id-ing", kind));
-    if reconcile {
-        h.reconcile();
-    }
-    let (url, _s) = serve_hub(&h).await;
-    (h, f, url, clk)
-}
-
-/// `postHook` — one hook payload the way the preseeded script posts it.
-async fn post_hook(url: &str, slug: &str, event: &str, payload: &str) -> reqwest::Response {
-    http_client()
-        .post(format!("{url}/v1/ingest/cursor"))
-        .query(&[("slug", slug), ("event", event)])
-        .header("Content-Type", "application/json")
-        .body(payload.to_string())
-        .send()
-        .await
-        .expect("post hook")
-}
-
-/// `feedRowsOf` — every feed row in a tracked session's ring, oldest first.
-fn feed_rows_of(h: &Arc<Hub>, slug: &str) -> Vec<FeedMessage> {
-    let ring = {
-        let ts = h.lock_track();
-        Arc::clone(&ts.tracked.get(slug).expect("tracked").ring)
-    };
-    ring.since(0, MAX_MESSAGES_LIMIT as i64).0
-}
-
-fn drop_watcher(h: &Arc<Hub>, slug: &str) {
-    let mut ts = h.lock_track();
-    ts.tracked.get_mut(slug).unwrap().watcher = None;
-}
-
-// Mirrors TestHubIngestCursorReachesWatcherAndFeed.
-#[tokio::test(flavor = "multi_thread")]
-async fn ingest_cursor_reaches_watcher_and_feed() {
-    let (h, _f, url, _clk) = ingest_hub(&RcKind::Cursor, true).await;
-
-    let resp = post_hook(
-        &url,
-        "ing001",
-        "beforeSubmitPrompt",
-        &format!(r#"{{"session_id":"{CURSOR_SID}","prompt":"build the thing"}}"#),
-    )
-    .await;
-    assert_eq!(resp.status().as_u16(), 202);
-    h.reconcile();
-
-    let rows = feed_rows_of(&h, "ing001");
-    assert_eq!(rows.len(), 1, "{rows:?}");
-    assert_eq!(rows[0].role, "user");
-    assert_eq!(rows[0].text, "build the thing");
-    let ts = h.lock_track();
-    assert_eq!(
-        ts.tracked.get("ing001").unwrap().activity,
-        Some(RcActivity::Working),
-        "want working after a submitted prompt"
-    );
-}
-
-// Mirrors TestHubIngestCursorOversizeIs413: the ingest cap is its OWN 256 KiB
-// — a 200 KiB payload is accepted (the whole reason for the larger cap), one
-// past the cap is a 413 with the event dropped.
-#[tokio::test(flavor = "multi_thread")]
-async fn ingest_cursor_oversize_is_413() {
-    let (h, _f, url, _clk) = ingest_hub(&RcKind::Cursor, true).await;
-
-    let big = format!(
-        r#"{{"session_id":"{CURSOR_SID}","command":"make","output":"{}"}}"#,
-        "x".repeat(200 << 10)
-    );
-    let resp = post_hook(&url, "ing001", "afterShellExecution", &big).await;
-    assert_eq!(
-        resp.status().as_u16(),
-        202,
-        "a 200 KiB payload must not hit the 16 KiB verb cap"
-    );
-
-    let over = format!(
-        r#"{{"session_id":"{CURSOR_SID}","output":"{}"}}"#,
-        "x".repeat(HUB_INGEST_MAX_BODY_BYTES + 1024)
-    );
-    let resp = post_hook(&url, "ing001", "afterShellExecution", &over).await;
-    assert_eq!(resp.status().as_u16(), 413);
-
-    h.reconcile();
-    let rows = feed_rows_of(&h, "ing001");
-    assert_eq!(
-        rows.len(),
-        1,
-        "exactly the accepted event (the oversized one dropped): {}",
-        rows.len()
-    );
-}
-
-// Mirrors TestHubIngestCursorRejections — the pinned precedence.
-#[tokio::test(flavor = "multi_thread")]
-async fn ingest_cursor_rejections() {
-    let (_h, _f, url, _clk) = ingest_hub(&RcKind::Cursor, true).await;
-
-    for (name, slug, event, want) in [
-        ("unknown slug", "nosuch", "stop", 404),
-        ("malformed slug", "not_a_slug!", "stop", 400),
-        ("missing slug", "", "stop", 400),
-        ("malformed event", "ing001", "st op!", 400),
-        ("missing event", "ing001", "", 400),
-    ] {
-        let resp = post_hook(&url, slug, event, "{}").await;
-        assert_eq!(resp.status().as_u16(), want, "{name}");
-    }
-
-    // A tracked session of ANOTHER kind: 409 not_supported.
-    let (_h2, _f2, codex_url, _clk2) = ingest_hub(&RcKind::Codex, true).await;
-    let resp = post_hook(&codex_url, "ing001", "stop", "{}").await;
-    want_envelope(resp, 409, ERR_NOT_SUPPORTED).await;
-}
-
-// Mirrors TestHubIngestCursorPreWatcherQueueDrains: events landing before the
-// watcher exists are held and drained the moment it is constructed.
-#[tokio::test(flavor = "multi_thread")]
-async fn ingest_cursor_pre_watcher_queue_drains() {
-    let (h, _f, url, _clk) = ingest_hub(&RcKind::Cursor, false).await;
-    h.reconcile();
-    drop_watcher(&h, "ing001"); // the create→first-tick window shape
-
-    for (event, payload) in [
-        (
-            "sessionStart",
-            format!(r#"{{"session_id":"{CURSOR_SID}"}}"#),
-        ),
-        (
-            "beforeSubmitPrompt",
-            format!(r#"{{"session_id":"{CURSOR_SID}","prompt":"the kickoff prompt"}}"#),
-        ),
-    ] {
-        let resp = post_hook(&url, "ing001", event, &payload).await;
-        assert_eq!(resp.status().as_u16(), 202, "{event}");
-    }
-    assert_eq!(
-        h.ingest.queued_events("ing001"),
-        2,
-        "both events held for the not-yet-built watcher"
-    );
-
-    // The next tick builds the watcher, drains the queue into it, folds it.
-    h.reconcile();
-    assert_eq!(
-        h.ingest.len(),
-        0,
-        "the queue clears once the watcher takes it"
-    );
-    let rows = feed_rows_of(&h, "ing001");
-    assert_eq!(rows.len(), 2, "{rows:?}");
-    assert_eq!(rows[1].text, "the kickoff prompt");
-}
-
-/// `hookedTmux` (`hub_ingest_test.go:213`): wraps the fake runner so a test
-/// can act at a precise point INSIDE reconcile's unlocked section.
-type RunHook = Box<dyn Fn(&[&str]) + Send>;
-
-struct HookedTmux {
-    inner: Arc<HubTmux>,
-    on_run: std::sync::Mutex<Option<RunHook>>,
-}
-
-impl TmuxRunner for HookedTmux {
-    fn run(&self, args: &[&str]) -> TmuxResult {
-        let res = self.inner.run(args);
-        if let Some(hook) = &*self.on_run.lock().unwrap() {
-            hook(args); // called with the fake's lock RELEASED; may re-enter
-        }
-        res
-    }
-}
-
-// Mirrors TestHubIngestCursorPreWatcherDrainsAfterCommit — THE
-// CONSTRUCT→COMMIT WINDOW: a hook arriving between ensureWatcher's
-// construction-time drain and the commit-phase publish queues into a queue
-// the first drain already passed; the post-commit drain must take it.
-#[tokio::test(flavor = "multi_thread")]
-async fn ingest_cursor_pre_watcher_drains_after_commit() {
-    let f = HubTmux::new();
-    let clk = HubClock::new();
-    let hooked = Arc::new(HookedTmux {
-        inner: Arc::clone(&f),
-        on_run: std::sync::Mutex::new(None),
-    });
-    let h = {
-        let clk2 = Arc::clone(&clk);
-        Arc::new(Hub::new(HubConfig {
-            quiet_period: Duration::from_secs(4),
-            send_line_settle: Some(Duration::ZERO),
-            ..super::hub_test_support::hub_config_with_runner(hooked.clone() as _, move || {
-                clk2.now()
-            })
-        }))
-    };
-    f.set(
-        "rc-win001",
-        &pane_fixture("cursor-ready"),
-        &managed_env("id-win", &RcKind::Cursor),
-    );
-    let (url, _s) = serve_hub(&h).await;
-    let authority = url.strip_prefix("http://").unwrap().to_string();
-
-    let captures = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let fired = Arc::new(AtomicBool::new(false));
-    let in_window = Arc::new(AtomicBool::new(false));
-    {
-        let (captures, fired, in_window) = (
-            Arc::clone(&captures),
-            Arc::clone(&fired),
-            Arc::clone(&in_window),
-        );
-        let hub_for_hook = Arc::clone(&h);
-        let payload = format!(r#"{{"session_id":"{CURSOR_SID}","prompt":"the kickoff prompt"}}"#);
-        *hooked.on_run.lock().unwrap() = Some(Box::new(move |args| {
-            // The FIRST capture-pane of a tick is the enumeration one (before
-            // ensureWatcher); the second is the stability tracker's, by which
-            // point the watcher exists but is not yet published. Fire once.
-            if args.first() != Some(&"capture-pane") {
-                return;
-            }
-            let n = captures.fetch_add(1, Ordering::SeqCst) + 1;
-            if n != 2 || fired.swap(true, Ordering::SeqCst) {
-                return;
-            }
-            // Self-verification: the window is only interesting while
-            // tr.watcher is still None.
-            {
-                let ts = hub_for_hook.lock_track();
-                in_window.store(
-                    ts.tracked
-                        .get("win001")
-                        .is_some_and(|tr| tr.watcher.is_none()),
-                    Ordering::SeqCst,
-                );
-            }
-            raw_post(
-                &authority,
-                "/v1/ingest/cursor?slug=win001&event=beforeSubmitPrompt",
-                &payload,
-            );
-        }));
-    }
-
-    let hh = Arc::clone(&h);
-    tokio::task::spawn_blocking(move || hh.reconcile())
-        .await
-        .unwrap();
-    assert!(
-        fired.load(Ordering::SeqCst) && in_window.load(Ordering::SeqCst),
-        "test premise: the hook must fire inside the construct→commit window"
-    );
-
-    // The post-commit drain took it: nothing stranded…
-    assert_eq!(
-        h.ingest.len(),
-        0,
-        "an event queued during the construct→commit window was left stranded"
-    );
-    // …and it folds on the next tick rather than waiting out the 60s TTL.
-    h.reconcile();
-    let rows = feed_rows_of(&h, "win001");
-    assert_eq!(rows.len(), 1, "{rows:?}");
-    assert_eq!(rows[0].text, "the kickoff prompt");
-}
-
-// Mirrors TestHubIngestCursorRefusedPushIsDroppedNotQueued: once a watcher
-// EXISTS the queue is never used again — a refused push (closed watcher) is
-// DROPPED.
-#[tokio::test(flavor = "multi_thread")]
-async fn ingest_cursor_refused_push_is_dropped_not_queued() {
-    let (h, _f, url, _clk) = ingest_hub(&RcKind::Cursor, true).await;
-
-    {
-        let ts = h.lock_track();
-        ts.tracked
-            .get("ing001")
-            .unwrap()
-            .watcher
-            .as_ref()
-            .expect("cursor watcher built")
-            .close();
-    }
-    let resp = post_hook(
-        &url,
-        "ing001",
-        "beforeSubmitPrompt",
-        &format!(r#"{{"session_id":"{CURSOR_SID}","prompt":"into the void"}}"#),
-    )
-    .await;
-    assert_eq!(
-        resp.status().as_u16(),
-        202,
-        "the hook script cannot act on anything else"
-    );
-    assert_eq!(
-        h.ingest.len(),
-        0,
-        "an event refused by an existing watcher must be dropped, never queued"
-    );
-}
-
-// Mirrors TestHubIngestCursorPreWatcherBoundsAndTTL.
-#[tokio::test(flavor = "multi_thread")]
-async fn ingest_cursor_pre_watcher_bounds_and_ttl() {
-    let (h, f, url, clk) = ingest_hub(&RcKind::Cursor, false).await;
-    h.reconcile();
-    drop_watcher(&h, "ing001");
-
-    for _ in 0..MAX_PRE_WATCHER_EVENTS + 10 {
-        post_hook(&url, "ing001", "stop", r#"{"status":"completed"}"#).await;
-    }
-    assert_eq!(
-        h.ingest.queued_events("ing001"),
-        MAX_PRE_WATCHER_EVENTS,
-        "the count bound"
-    );
-
-    // TTL: still no watcher after 60s → the whole queue drops.
-    drop_watcher(&h, "ing001");
-    clk.advance(PRE_WATCHER_TTL + Duration::from_secs(1));
-    h.ingest
-        .prune(clk.now(), &std::iter::once("ing001".to_string()).collect());
-    assert_eq!(h.ingest.len(), 0, "a queue past the TTL drops wholesale");
-
-    // A queue for a vanished slug drops on the next tick regardless of age.
-    post_hook(&url, "ing001", "stop", r#"{"status":"completed"}"#).await;
-    // (the watcher was dropped above, so the event queues again)
-    f.remove("rc-ing001");
-    h.reconcile();
-    assert_eq!(h.ingest.len(), 0, "a queue for a vanished slug drops");
-}
-
-// Mirrors TestHubIngestCursorBackWritesAgentSession: reconcile back-writes
-// SHED_RC_AGENT_SESSION from the hook stream; the same pin is not re-stamped;
-// a re-pin stamps the new id and announces the switch in the feed.
-#[tokio::test(flavor = "multi_thread")]
-async fn ingest_cursor_back_writes_agent_session() {
-    let (h, f, url, _clk) = ingest_hub(&RcKind::Cursor, true).await;
-    let env_key = shed_core::rc_agents::ENV_AGENT_SESSION;
-
-    post_hook(
-        &url,
-        "ing001",
-        "sessionStart",
-        &format!(r#"{{"session_id":"{CURSOR_SID}"}}"#),
-    )
-    .await;
-    h.reconcile();
-    assert_eq!(
-        f.set_env_calls(),
-        vec![format!("{env_key}={CURSOR_SID}")],
-        "one back-write"
-    );
-
-    // The same id again is not re-stamped.
-    post_hook(
-        &url,
-        "ing001",
-        "stop",
-        &format!(r#"{{"session_id":"{CURSOR_SID}","status":"completed"}}"#),
-    )
-    .await;
-    h.reconcile();
-    assert_eq!(
-        f.set_env_calls().len(),
-        1,
-        "the repeated pin is not re-stamped"
-    );
-
-    // A different chat: re-pin, re-stamp, and a status row announcing it.
-    const OTHER: &str = "9129668a-885b-48ef-b61b-d80f981d4d68";
-    post_hook(
-        &url,
-        "ing001",
-        "beforeSubmitPrompt",
-        &format!(r#"{{"session_id":"{OTHER}","prompt":"new chat"}}"#),
-    )
-    .await;
-    h.reconcile();
-    let calls = f.set_env_calls();
-    assert_eq!(calls.len(), 2, "{calls:?}");
-    assert_eq!(calls[1], format!("{env_key}={OTHER}"));
-    assert!(
-        feed_rows_of(&h, "ing001")
-            .iter()
-            .any(|m| m.typ == "status" && m.text.contains("switched to another chat")),
-        "a chat switch must be announced in the feed"
-    );
-}
-
-// Mirrors TestHubIngestCursorMethodGate: a GET is a 405 from the mux, never a
-// silent success.
-#[tokio::test(flavor = "multi_thread")]
-async fn ingest_cursor_method_gate() {
-    let (_h, _f, url, _clk) = ingest_hub(&RcKind::Cursor, true).await;
-    let status = get_status(&format!("{url}/v1/ingest/cursor?slug=ing001&event=stop")).await;
-    assert_eq!(status, 405);
-}
+// The `POST /v1/ingest/cursor` suite (delivery to the watcher + feed, the
+// 413/rejection/method gates, the pre-watcher queue's drain/bounds/TTL arms and
+// the agent-session back-write) lived here. The route, its handler and the
+// queues all went with the cursor hook lane in A6 (`charliek/shed#322`).
 
 // H10 review MEDIUM pin: query params follow Go's url.Values.Get — the FIRST
 // occurrence wins on duplicates (axum's Query<HashMap> was last-wins, which
-// re-addressed a hook event and flipped precedence rows).
+// flipped paging outcomes). The ingest half of this cell went with the cursor
+// hook lane in A6 (`charliek/shed#322`); /messages still pins the rule.
 #[tokio::test(flavor = "multi_thread")]
 async fn query_params_first_occurrence_wins() {
-    // Ingest: ?slug=&slug=b → Go reads "" → 400 invalid_slug (never a lookup
-    // on "b").
-    let (_h, _f, url, _clk) = ingest_hub(&RcKind::Cursor, true).await;
-    let resp = http_client()
-        .post(format!(
-            "{url}/v1/ingest/cursor?slug=&slug=ing001&event=stop"
-        ))
-        .body("{}")
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status().as_u16(), 400, "first (empty) slug must win");
-    // …and the first NON-empty one addresses the session.
-    let resp = http_client()
-        .post(format!(
-            "{url}/v1/ingest/cursor?slug=ing001&slug=ghost&event=stop"
-        ))
-        .body("{}")
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(
-        resp.status().as_u16(),
-        202,
-        "the first slug addresses the session"
-    );
-
-    // Messages: ?since=1&since=2 pages from seq 1.
     let f = HubTmux::new();
     let clk = HubClock::new();
     let h = Arc::new(new_test_hub(&f, &clk));

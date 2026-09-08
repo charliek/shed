@@ -1,5 +1,6 @@
 {
   "activity_sequence": [
+    "needs_input",
     "working",
     "needs_input"
   ],
@@ -10,7 +11,7 @@
         "created_by": "<prog>",
         "display_name": "hub-sse",
         "id": "<id>",
-        "kind": "codex",
+        "kind": "opencode",
         "lane": "tui",
         "managed": true,
         "slug": "sse111",

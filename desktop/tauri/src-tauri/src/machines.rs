@@ -8,7 +8,7 @@
 //!
 //! * the roost wire (`session.identify`, `tab.list`, `tab.open/close`) →
 //!   [`shed_core::roost`]
-//! * the transport seam + the polling watcher → [`shed_app::roost`]
+//! * the transport seam + the observer watcher → [`shed_app::roost`]
 //!
 //! What is left here is what a desktop app actually owns: which machines exist,
 //! one watcher per machine, the last inventory each one reported, and whether it
@@ -482,10 +482,19 @@ impl Machines {
     /// Close a session on a machine — `tab.close` on its roost tab — then drop
     /// the row optimistically.
     ///
-    /// The optimistic drop matters because the watcher polls on a 2 s cadence:
-    /// without it a killed session lingers in the UI for up to two seconds, which
-    /// reads as "the kill didn't work". The next snapshot is authoritative and
-    /// will restore the row if the close somehow did not take.
+    /// **The optimistic drop is still worth keeping, for a different reason than
+    /// it was written for.** It used to cover a 2 s poll cadence; since plan 014
+    /// the watcher observes a push feed, so the `tab.closed` this very call
+    /// commits normally comes back within milliseconds and the row would leave on
+    /// its own. What is *not* bounded is the unhappy path: if the stream is
+    /// mid-resync (a gap, an EOF, a daemon restart) the close is only seen by the
+    /// next cycle's `tab.list`, and if the machine drops right after the close
+    /// lands there is no next snapshot at all — [`consume`] deliberately keeps
+    /// the last row set across a `Down`, so a session the user just killed would
+    /// sit there greyed out until the machine came back. Dropping it here makes
+    /// the answer immediate in every case, and matches [`Self::create`]'s
+    /// optimistic insert on the other side. The next snapshot is authoritative
+    /// and will restore the row if the close somehow did not take.
     ///
     /// The slug IS the tab id (`RoostSession::to_rc_dto` stringifies it), so a
     /// slug that is not an integer is a row from somewhere else and is refused by
@@ -494,10 +503,19 @@ impl Machines {
         let reach = self.reach(machine)?;
         let tab_id = parse_tab_id(slug)?;
         tab_close(reach.as_ref(), tab_id).await?;
-        let mut guard = lock(&self.state);
-        if let Some(m) = guard.get_mut(machine) {
-            m.sessions.retain(|s| s.tab_id != tab_id);
+        {
+            let mut guard = lock(&self.state);
+            if let Some(m) = guard.get_mut(machine) {
+                m.sessions.retain(|s| s.tab_id != tab_id);
+            }
         }
+        // Outside the lock (the callback re-enters the app) and unconditional,
+        // exactly as [`Self::create`] does it. A Tauri caller happens to refresh
+        // afterwards, but the `machine.kill` socket op does not — so without this
+        // the one case the optimistic drop exists FOR (the stream is mid-resync,
+        // or the machine drops right after the close) is the one case an open UI
+        // never hears about.
+        (self.on_change)();
         Ok(())
     }
 
@@ -519,7 +537,8 @@ impl Machines {
 
     /// Open a session ON this machine — a roost `tab.open` running the kind's
     /// agent — and fold it into the local snapshot so the row appears immediately
-    /// rather than at the next poll.
+    /// rather than whenever the push feed next catches up (see [`Self::kill`] for
+    /// why "normally milliseconds" is not the same as "always").
     async fn create(
         &self,
         machine: &str,
@@ -875,6 +894,7 @@ fn machine_row(name: &str, session: &RoostSession, stale: bool) -> Value {
 mod tests {
     use super::*;
 
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
     use shed_core::roost::testing::{ownership, FakeRoost};
@@ -884,26 +904,31 @@ mod tests {
     const VECTOR_TAB: i64 = 5;
     const VECTOR_CWD: &str = "/Users/me/projects/roost";
 
-    /// The watcher reads `SHED_ROOST_POLL_MS` ONCE, when it is spawned, so it has
-    /// to be set before the first `Machines::start` in this process. A `Once`
-    /// rather than a per-test `set_var`: cargo runs these on parallel threads,
-    /// they all want the same value, and a write racing another test's read is
-    /// still a race worth not having.
-    fn fast_polling() {
-        static ONCE: std::sync::Once = std::sync::Once::new();
-        ONCE.call_once(|| std::env::set_var(shed_app::roost::POLL_MS_ENV, "25"));
-    }
-
-    /// Poll `f` until it answers, or fail naming what never happened. Every timing
-    /// assertion here is "within a poll or two", never a fixed sleep.
+    /// Poll `f` until it answers, or fail naming what never happened.
+    ///
+    /// **Polling the ASSERTION, not the watcher.** Since plan 014 nothing here
+    /// has a cadence — a change arrives on roost's push feed — so this is only
+    /// how a test observes an in-process snapshot that another task writes, and
+    /// it is never a fixed sleep.
     async fn wait_for<T>(what: &str, mut f: impl FnMut() -> Option<T>) -> T {
-        for _ in 0..400 {
+        // Ten seconds, sampled every 5 ms. The sampling rate is deliberately
+        // finer than the watcher's 500 ms first backoff step, so a test that
+        // wants the FIRST `Down`'s reason (the stopping one, before a later
+        // re-dial overwrites it) is reading a window it cannot plausibly miss.
+        for _ in 0..2_000 {
             if let Some(value) = f() {
                 return value;
             }
-            tokio::time::sleep(Duration::from_millis(25)).await;
+            tokio::time::sleep(Duration::from_millis(5)).await;
         }
         panic!("timed out waiting for {what}");
+    }
+
+    /// One machine's health, read straight out of the in-process state.
+    fn machine_health(machines: &Machines, name: &str) -> (bool, Option<String>) {
+        let guard = machines.state.lock().unwrap();
+        let m = guard.get(name).expect("a registered machine");
+        (m.reachable, m.detail.clone())
     }
 
     fn config_with(names: &[&str]) -> ShedConfig {
@@ -929,13 +954,31 @@ mod tests {
     }
 
     fn start(config: &ShedConfig, sockets: &HashMap<String, PathBuf>) -> Machines {
-        fast_polling();
         Machines::start(
             &tokio::runtime::Handle::current(),
             config,
             sockets,
             Arc::new(|| {}),
         )
+    }
+
+    /// Like [`start`], plus the count of `on_change` calls the layer has made —
+    /// what an open UI would have been told to re-read.
+    fn start_counting(
+        config: &ShedConfig,
+        sockets: &HashMap<String, PathBuf>,
+    ) -> (Machines, Arc<AtomicUsize>) {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&calls);
+        let machines = Machines::start(
+            &tokio::runtime::Handle::current(),
+            config,
+            sockets,
+            Arc::new(move || {
+                counter.fetch_add(1, Ordering::SeqCst);
+            }),
+        );
+        (machines, calls)
     }
 
     /// The vector's shell tab, claimed by an opencode adapter.
@@ -1035,11 +1078,15 @@ mod tests {
         );
     }
 
-    /// A lifecycle flip (and roost's sticky notification bit) reaches `snapshot()`
-    /// within one poll interval — the S3 acceptance cell, with the poll cadence
-    /// turned down by `SHED_ROOST_POLL_MS`.
+    /// A lifecycle flip (and roost's sticky notification bit) reaches
+    /// `snapshot()` off the **push feed** — the S3 acceptance cell, with no
+    /// cadence anywhere to turn down.
+    ///
+    /// The `tab.list` count is the load-bearing half: exactly one per cycle
+    /// means the flip arrived as a pushed batch that the inventory folded, not
+    /// as a re-read that a poll happened to catch.
     #[tokio::test]
-    async fn a_lifecycle_flip_reaches_the_snapshot_within_one_poll() {
+    async fn a_lifecycle_flip_is_pushed_into_the_snapshot() {
         let fake = FakeRoost::start().await;
         claim_opencode(&fake, "working", "session_status", false);
         let machines = start(
@@ -1052,6 +1099,7 @@ mod tests {
                 .find(|r| r["activity"] == "working")
         })
         .await;
+        assert_eq!(fake.tab_list_calls(), 1, "one list for the first cycle");
 
         // opencode's approval spelling, exactly — `permission_asked` is an
         // approval, `question_asked` would be plain input.
@@ -1065,6 +1113,257 @@ mod tests {
         .await;
         assert_eq!(row["attention"], json!(true), "the sticky notification bit");
         assert_eq!(row["slug"], json!("5"), "the same tab, not a new row");
+        assert_eq!(
+            fake.tab_list_calls(),
+            1,
+            "the flip rode the event stream — a re-list would mean the watcher \
+             still polls"
+        );
+    }
+
+    /// **Somebody else taking the interactive lease changes nothing here.**
+    ///
+    /// At protocol 4 a takeover no longer ends an event stream; it reclassifies
+    /// it and says so once with a non-terminal `session.driver_changed`. Shed
+    /// never held the lease to begin with, so the rows must not move — and the
+    /// stream must still be delivering, which the flip afterwards is what
+    /// proves. (Two takeovers: the first mints into an unheld session and
+    /// deposes nobody, so roost announces nothing; the second is the real one.)
+    #[tokio::test]
+    async fn a_driver_change_leaves_the_rows_alone_and_the_stream_alive() {
+        let fake = FakeRoost::start().await;
+        claim_opencode(&fake, "working", "session_status", false);
+        let machines = start(
+            &config_with(&["mini3"]),
+            &sockets(&[("mini3", fake.socket_path())]),
+        );
+        let before = wait_for("the first row", || rows(&machines).into_iter().next()).await;
+        let lists_before = fake.tab_list_calls();
+
+        fake.take_over("roost ui");
+        fake.take_over("somebody else");
+
+        // Nothing to wait FOR — the assertion is that nothing happens — so give
+        // the frame time to be delivered and mishandled before reading.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(rows(&machines), vec![before], "a takeover moved a row");
+        assert_eq!(
+            machine_health(&machines, "mini3"),
+            (true, None),
+            "a takeover is not a reason to call a machine down"
+        );
+        assert_eq!(
+            fake.tab_list_calls(),
+            lists_before,
+            "a takeover is informational — it must not cost a resync"
+        );
+
+        // The stream survived it: the next commit still arrives.
+        claim_opencode(&fake, "finished", "session_idle", false);
+        let after = wait_for("the flip after the takeover", || {
+            rows(&machines)
+                .into_iter()
+                .find(|r| r["activity"] == "idle")
+        })
+        .await;
+        assert_eq!(after["slug"], json!("5"));
+        assert_eq!(
+            fake.tab_list_calls(),
+            lists_before,
+            "and it was still the SAME stream, not a reconnect"
+        );
+    }
+
+    /// **A daemon that stops says why, and the row recovers when it comes back.**
+    ///
+    /// `session.stopping` is the one terminal envelope an event stream sees at
+    /// protocol 4, and it is the reason the user reads. The last known rows stay
+    /// on screen, marked stale — a machine going away must never blank the view.
+    #[tokio::test]
+    async fn a_stopping_session_goes_stale_with_its_reason_and_then_recovers() {
+        let fake = FakeRoost::start().await;
+        claim_opencode(&fake, "working", "session_status", false);
+        let machines = start(
+            &config_with(&["mini3"]),
+            &sockets(&[("mini3", fake.socket_path())]),
+        );
+        wait_for("the first row", || rows(&machines).into_iter().next()).await;
+
+        // Latches the fake unavailable, so "further attempts fail" is real.
+        fake.stop();
+
+        let reason = wait_for("mini3 to report why it went down", || {
+            machine_health(&machines, "mini3").1
+        })
+        .await;
+        assert!(
+            reason.contains("session stopping: stop"),
+            "the FIRST reason after a stop is roost's own, not a dial failure: {reason}"
+        );
+        let stale = rows(&machines);
+        assert_eq!(stale.len(), 1, "the last known rows survive the stop");
+        assert_eq!(stale[0]["stale"], json!(true));
+
+        fake.restart();
+        wait_for("mini3 to come back", || {
+            machine_health(&machines, "mini3").0.then_some(())
+        })
+        .await;
+        let back = rows(&machines);
+        assert_eq!(back.len(), 1, "the row set is re-listed, not replayed");
+        assert_eq!(
+            back[0]["slug"],
+            json!("5"),
+            "tab ids persist across a restart"
+        );
+        assert_eq!(back[0]["stale"], json!(false));
+    }
+
+    /// **A lost commit resyncs, and the row never flickers stale.**
+    ///
+    /// `skip_revision` is the only way to manufacture the loss a resync exists
+    /// for (roost itself closes the stream instead). The watcher answers with a
+    /// whole new cycle — one more `tab.list` — and NO `Down`, so the UI sees a
+    /// row that simply updates.
+    #[tokio::test]
+    async fn a_revision_gap_resyncs_without_a_stale_flicker() {
+        let fake = FakeRoost::start().await;
+        claim_opencode(&fake, "working", "session_status", false);
+        let machines = start(
+            &config_with(&["mini3"]),
+            &sockets(&[("mini3", fake.socket_path())]),
+        );
+        wait_for("the first row", || {
+            rows(&machines)
+                .into_iter()
+                .find(|r| r["activity"] == "working")
+        })
+        .await;
+        let lists_before = fake.tab_list_calls();
+
+        // A commit nobody was told about, then one they are: the batch arrives
+        // at `expected + 1` and the client's own stream raises the gap.
+        fake.skip_revision();
+        claim_opencode(&fake, "finished", "session_idle", false);
+
+        let row = wait_for("the resynced row", || {
+            // Checked on every sample, not once at the end: a `Down` between
+            // the gap and the recovery is exactly the flicker this rules out,
+            // and it would be gone again by the time the loop finished.
+            assert_eq!(
+                machine_health(&machines, "mini3"),
+                (true, None),
+                "a resync must never render the machine down"
+            );
+            rows(&machines)
+                .into_iter()
+                .find(|r| r["activity"] == "idle")
+        })
+        .await;
+        assert_eq!(row["slug"], json!("5"));
+        assert_eq!(row["stale"], json!(false));
+        assert_eq!(
+            fake.tab_list_calls(),
+            lists_before + 1,
+            "exactly one re-list — a resync is a fresh cycle, not a retry storm"
+        );
+    }
+
+    /// Every `(reachable, detail)` pair the machine layer published, in order.
+    ///
+    /// Named because clippy asks, but the name earns its place: this is a
+    /// history, not a sample, and that distinction is the whole point of the
+    /// test below.
+    type PublishedStates = Arc<Mutex<Vec<(bool, Option<String>)>>>;
+
+    /// **No unreachable state is ever PUBLISHED across a resync** — the claim a
+    /// periodically-sampled test can only approximate.
+    ///
+    /// [`consume`] calls `on_change` after every update it applies, so a
+    /// callback that reads the row back sees EVERY transition the UI would have
+    /// been told about — including one a poll-and-compare test cannot see at
+    /// all, because a spurious `Down` followed microseconds later by a fresh
+    /// snapshot looks exactly like no `Down` at any sampling rate. The harness's
+    /// end-to-end cell samples; this one is the actual assertion.
+    ///
+    /// Both resyncs a healthy daemon produces are exercised: a revision gap
+    /// (a commit the stream never carried) and a reorder (which
+    /// `shed_app::roost` answers with a deliberate re-list). Neither may render
+    /// the machine unreachable, because the daemon was never down.
+    #[tokio::test]
+    async fn a_resync_never_publishes_an_unreachable_state() {
+        let fake = FakeRoost::start().await;
+        claim_opencode(&fake, "working", "session_status", false);
+
+        // The consumer under test, wired by hand so the callback can be one that
+        // RECORDS rather than one that repaints.
+        let state: Arc<Mutex<BTreeMap<String, MachineState>>> = Arc::new(Mutex::new(
+            BTreeMap::from([("mini3".to_string(), MachineState::new(true))]),
+        ));
+        let history: PublishedStates = Arc::new(Mutex::new(Vec::new()));
+        let on_change: OnChange = {
+            let state = Arc::clone(&state);
+            let history = Arc::clone(&history);
+            Arc::new(move || {
+                let guard = lock(&state);
+                if let Some(m) = guard.get("mini3") {
+                    history
+                        .lock()
+                        .unwrap()
+                        .push((m.reachable, m.detail.clone()));
+                }
+            })
+        };
+        let reach: Arc<dyn RoostReach> = Arc::new(LocalSession::new("mini3", fake.socket_path()));
+        let (watcher, rx) = RoostWatcher::spawn(
+            &tokio::runtime::Handle::current(),
+            reach,
+            "mini3".to_string(),
+        );
+        tokio::spawn(consume(
+            "mini3".to_string(),
+            rx,
+            Arc::clone(&state),
+            on_change,
+        ));
+
+        fn activity(state: &Arc<Mutex<BTreeMap<String, MachineState>>>) -> Option<Value> {
+            let guard = lock(state);
+            let m = guard.get("mini3")?;
+            let session = m.sessions.first()?;
+            Some(machine_row("mini3", session, !m.reachable)["activity"].clone())
+        }
+
+        wait_for("the first snapshot", || {
+            activity(&state).filter(|a| a == &json!("working"))
+        })
+        .await;
+
+        // A commit the stream never carried: the client's own event stream
+        // raises the gap and the watcher answers with a whole new cycle.
+        let lists = fake.tab_list_calls();
+        fake.skip_revision();
+        claim_opencode(&fake, "finished", "session_idle", false);
+        wait_for("the gap to resync", || {
+            activity(&state).filter(|a| a == &json!("idle"))
+        })
+        .await;
+        assert_eq!(fake.tab_list_calls(), lists + 1, "one re-list per resync");
+
+        // A reorder: applied, and then deliberately re-listed for the new order.
+        fake.reorder_tabs();
+        wait_for("the reorder to re-list", || {
+            (fake.tab_list_calls() > lists + 1).then_some(())
+        })
+        .await;
+
+        let published = history.lock().unwrap().clone();
+        assert!(!published.is_empty(), "nothing was ever published");
+        assert!(
+            published.iter().all(|(reachable, _)| *reachable),
+            "a resync published an unreachable state: {published:?}"
+        );
+        watcher.stop();
     }
 
     /// The implicit `localhost` host is INVISIBLE until a session has answered —
@@ -1188,7 +1487,8 @@ mod tests {
 
     /// `kill` is a roost `tab.close`: the tab really leaves the session (a second
     /// close of the same id is refused by the daemon), and the row is dropped
-    /// optimistically rather than waiting for the next poll.
+    /// optimistically rather than waiting for the close's own `tab.closed` to
+    /// come back off the stream.
     #[tokio::test]
     async fn kill_routes_to_tab_close() {
         let fake = FakeRoost::start().await;
@@ -1218,6 +1518,35 @@ mod tests {
             .await
             .expect_err("a non-roost slug is refused");
         assert!(bad.contains("not a roost tab id"), "{bad}");
+    }
+
+    /// **An optimistic drop that nobody is told about is not optimistic.**
+    ///
+    /// The Tauri commands happen to re-read afterwards; the `machine.kill`
+    /// socket op does not. So `kill` publishes the change itself, the way
+    /// [`Machines::create`] does — otherwise the exact case the optimistic drop
+    /// exists for (no snapshot is coming, because the stream is resyncing or the
+    /// machine just dropped) is the case an open UI never hears about.
+    #[tokio::test]
+    async fn kill_publishes_the_drop_it_made() {
+        let fake = FakeRoost::start().await;
+        claim_opencode(&fake, "working", "session_status", false);
+        let (machines, calls) = start_counting(
+            &config_with(&["mini3"]),
+            &sockets(&[("mini3", fake.socket_path())]),
+        );
+        wait_for("the row to kill", || rows(&machines).into_iter().next()).await;
+
+        // Read the count the instant `kill` returns: the watcher's own snapshot
+        // for this same `tab.closed` publishes too, but it arrives later and is
+        // exactly the delivery the unhappy path does not get.
+        let before = calls.load(Ordering::SeqCst);
+        machines.kill("mini3", "5").await.expect("the close lands");
+        assert!(rows(&machines).is_empty());
+        assert!(
+            calls.load(Ordering::SeqCst) > before,
+            "kill returned without publishing the drop it made"
+        );
     }
 
     /// The `tab.open` request for a kind: the agent's argv and the cwd, and
@@ -1279,8 +1608,61 @@ mod tests {
         assert_eq!(row["workdir"], json!("/tmp/x"), "trimmed");
         assert_eq!(row["origin"], json!("machine:mini3"));
         assert_eq!(row["slug"], json!("6"), "the id the fake's next tab gets");
-        // And it is in the snapshot immediately, not at the next poll.
+        // And it is in the snapshot immediately, rather than when the stream
+        // delivers the `tab.opened` this call just caused.
         assert!(rows(&machines).iter().any(|r| r["slug"] == "6"));
+    }
+
+    /// **A failed launch must not leave a ghost row.**
+    ///
+    /// [`Machines::create`] shows a provisional row the moment the tab opens,
+    /// before any adapter has claimed it — so the watcher's inventory carries
+    /// that tab in its HIDDEN half. If the launched process dies before it ever
+    /// reports (a missing binary, an immediate crash), the `tab.closed` is a
+    /// hidden-half event too. The 2 s poller repaired this on its next
+    /// `tab.list`; the observer-only watcher publishes the vanished tab instead
+    /// (`shed_app::roost::observe_once`), and the authoritative snapshot then
+    /// replaces the provisional row set. Without either, the card is permanent.
+    #[tokio::test]
+    async fn a_launched_tab_that_dies_unclaimed_takes_its_row_with_it() {
+        let fake = FakeRoost::start().await;
+        let machines = start(
+            &config_with(&["mini3"]),
+            &sockets(&[("mini3", fake.socket_path())]),
+        );
+        wait_for("the first snapshot", || {
+            machines
+                .state
+                .lock()
+                .unwrap()
+                .get("mini3")
+                .filter(|m| m.seen)
+                .map(|_| ())
+        })
+        .await;
+
+        machines
+            .launch("mini3", &RcKind::Opencode, None, None, None, None)
+            .await
+            .expect("the open lands");
+        assert!(
+            rows(&machines).iter().any(|r| r["slug"] == "6"),
+            "the optimistic row is showing"
+        );
+
+        // The launched process dies without ever claiming the tab, and roost
+        // closes it. Out of band — through a second reach, NOT through
+        // `Machines::kill`, whose own optimistic drop would hide the bug.
+        let reach: Arc<dyn RoostReach> = Arc::new(LocalSession::new("mini3", fake.socket_path()));
+        tab_close(reach.as_ref(), 6).await.expect("the tab closes");
+
+        wait_for("the provisional row to retire", || {
+            rows(&machines)
+                .iter()
+                .all(|r| r["slug"] != "6")
+                .then_some(())
+        })
+        .await;
     }
 
     /// A kind roost has no recipe for is refused BEFORE anything is opened — the

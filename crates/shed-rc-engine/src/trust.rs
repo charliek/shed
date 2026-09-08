@@ -21,11 +21,12 @@
 //! and carries on (the `--wait` poller's send-Enter fallback covers the trust
 //! dialog anyway).
 //!
-//! This file also HOSTS the machinery both preseeds merge through —
+//! This file also HOSTS the machinery a preseed merges through —
 //! [`lock_sibling`], [`read_json_object`], [`atomic_write`] — because `trust.go`
-//! does (`preseed_cursor.go` calls them across the file boundary the same way
-//! [`super::preseed_cursor`] does here). Keeping the split where Go put it is
-//! what lets every doc comment cite a `trust.go:NNN` line that still matches.
+//! does. It had a second caller across the file boundary (`preseed_cursor.go`)
+//! until A6 (`charliek/shed#322`) retired the cursor hook-relay preseed; keeping
+//! the split where Go put it is what lets every doc comment cite a
+//! `trust.go:NNN` line that still matches.
 
 use std::ffi::OsString;
 use std::fs;

@@ -93,22 +93,24 @@ func TestGoldenFixtureDecodes(t *testing.T) {
 	if info, ok := caps.Agents["cursor"]; !ok || info.Installed || info.Version != "" {
 		t.Errorf("uninstalled cursor should have no version: %+v", info)
 	}
-	// The golden's kind_features rows must be exactly what kindFeatures() produces.
-	// Chained with capabilities_test.go's TestKindFeatures (which pins the same rows
-	// against literal values), this pins the fixture to the normative matrix by value
-	// without restating it here; strict decoding above pins the JSON key names.
+	// The golden's kind_features rows must cover exactly the kinds kindFeatures()
+	// emits a row for. Their VALUES are deliberately NOT compared against the live
+	// matrix any more: A6 (charliek/shed#322) moved codex/cursor/claude-rc to
+	// feed "none" + input "" without changing a single wire FIELD, and this fixture is
+	// a DECODING sample — byte-identical across four copies (Go, crates/, cmd/shed,
+	// the Swift tests) and deliberately frozen, precisely so it keeps exercising the
+	// decoders against a payload that carries every value the wire may still carry
+	// (`input: gated` among them; RcKindFeatures::input_gated() and Swift's inputGated
+	// are still live decoders). Values are pinned against literals by
+	// capabilities_test.go's TestKindFeatures; strict decoding above pins the JSON key
+	// names, which is what this fixture is for.
 	live := kindFeatures()
 	if len(caps.KindFeatures) != len(live) {
 		t.Errorf("golden kind_features has %d rows, kindFeatures() produces %d", len(caps.KindFeatures), len(live))
 	}
-	for kind, want := range live {
-		got, ok := caps.KindFeatures[kind]
-		if !ok {
+	for kind := range live {
+		if _, ok := caps.KindFeatures[kind]; !ok {
 			t.Errorf("golden kind_features missing %q", kind)
-			continue
-		}
-		if got != want {
-			t.Errorf("golden kind_features[%q] = %+v, want %+v", kind, got, want)
 		}
 	}
 }

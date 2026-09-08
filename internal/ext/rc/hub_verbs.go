@@ -70,16 +70,12 @@ const (
 	hubMaxBodyBytes = 16 << 10
 
 	// inputModeTurn is the kind_features.input value denoting a lane that accepts
-	// whole TURNS (the POST /turn verb) rather than the pane-gated line delivery
-	// "gated" describes. It is the predicate the turn handler tests; opencode is the
-	// first kind to carry it, which is exactly what lights the verb up for that kind.
+	// whole TURNS (the POST /turn verb). It is the predicate the turn handler tests;
+	// opencode is the only kind that carries it, which is exactly what lights the verb
+	// up for that kind. The other spelling this field ever had — "gated", pane-gated
+	// line delivery through POST /input — went with A6 (charliek/shed#322): every
+	// remaining kind advertises "", and POST /input answers 409 not_accepting.
 	inputModeTurn = "turn"
-	// inputModeGated is the kind_features.input value denoting pane-gated line
-	// delivery (POST /input accepted only while the session is waiting). The single
-	// input field is one-of, so a kind that moves to "turn" LEAVES "gated" behind —
-	// the gated feed-input surface is derived from this value alone (see handleInput),
-	// never from a second hardcoded kind list.
-	inputModeGated = "gated"
 	// approvalsRemote is the kind_features.approvals value denoting a lane whose
 	// approvals are answered THROUGH the hub (the POST /approvals/{id} verb) rather
 	// than on the pane ("tui"). It is the predicate the approval handler tests.
@@ -298,8 +294,9 @@ func (h *Hub) handleInterrupt(w http.ResponseWriter, r *http.Request) {
 
 // handleApproval serves POST /v1/sessions/{slug}/approvals/{id}. A kind that answers
 // approvals on the pane (kind_features.approvals == "tui") is rejected 409
-// not_supported before any lookup — including for the informational `pane-*` ids the
-// pane-anchor kinds publish, which are deliberately not remotely resolvable.
+// not_supported before any lookup — claude-rc, codex, and cursor never publish an
+// approval row at all since S2 (charliek/shed#324) deleted the pane-anchor mechanism
+// that used to mint their informational, never-remotely-resolvable `pane-*` ids.
 func (h *Hub) handleApproval(w http.ResponseWriter, r *http.Request) {
 	var req approvalRequest
 	if !decodeHubBody(w, r, &req) {

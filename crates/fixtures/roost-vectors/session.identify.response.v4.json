@@ -1,0 +1,13 @@
+{
+  "id": "1",
+  "ok": true,
+  "result": {
+    "app_version": "0.0.18",
+    "session_protocol": 4,
+    "payload_kinds": ["ghostty-snapshot", "vt"],
+    "features": ["put_file"],
+    "libghostty_build": "ghostty-3f6b1c9a4d2e5f80+snapshot.v1",
+    "session_id": "01K3S8TQ4F0Q9YB2K6WZ5D7XN",
+    "started_at": "2026-08-27T14:03:11Z"
+  }
+}

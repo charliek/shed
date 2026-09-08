@@ -1,10 +1,11 @@
 //! The opencode pure fold — a port of `internal/ext/rc/watch_opencode.go`.
 //!
 //! [`OpencodeFold`] folds an opencode session's `/event` envelope stream into
-//! an activity verdict AND a normalized message feed, mirroring the codex
-//! fold's shape. Unlike codex (a tailed append-only JSONL file) opencode is a
-//! client/server model: the hub subscribes to the embedded HTTP+SSE server's
-//! `/event` endpoint as a second client. This file is the PURE fold only — no
+//! an activity verdict AND a normalized message feed, mirroring the shape of
+//! the codex fold that A6 (`charliek/shed#322`) retired (codex tailed an
+//! append-only JSONL file; opencode is a client/server model instead): the
+//! hub subscribes to the embedded HTTP+SSE server's `/event` endpoint as a
+//! second client. This file is the PURE fold only — no
 //! network/transport (that is the opencode watcher, H8) and no correlation.
 //! The fold is SESSION-SCOPED: it assumes every envelope it is handed already
 //! belongs to its session (the transport filters by sessionID before calling
@@ -520,9 +521,10 @@ impl ActivityFold for OpencodeFold {
     /// the 30s window. needs_approval qualifies alongside needs_input: an
     /// open ask is cleared only by a replied/rejected event or a reseed,
     /// never by the passage of time. (A DEAD stream is the deliberate
-    /// exception — an unhealthy transport reports not-fresh and pane
-    /// stability drives, so a needs_approval derived from a wedged
-    /// connection cannot outlive the evidence for it.)
+    /// exception — an unhealthy transport reports not-fresh, and since S2
+    /// (`charliek/shed#324`) deleted the pane-stability fallback, not-fresh
+    /// now means NO activity at all — so a needs_approval derived from a
+    /// wedged connection cannot outlive the evidence for it.)
     fn settled(&self) -> bool {
         matches!(
             self.activity(),

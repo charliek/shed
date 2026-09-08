@@ -10,9 +10,10 @@ use std::time::{Duration, Instant};
 
 use shed_core::rc::{tmux_name, RcKind, RcSessionDto, RcSessionListDto, RcState};
 use shed_core::rc_agents::{
-    build_env_args, classify_pane, gen_slug, inner_command, is_bypass_accept_prompt,
-    is_trust_prompt, lane_for_kind, parse_session, perm_flags, shell_quote_always, tool_for,
-    valid_caller_slug, validate_engine_permission_mode, RcMetadata, PERMISSION_MODE_BYPASS,
+    build_env_args, extract_url, gen_slug, inner_command, is_bypass_accept_prompt,
+    is_codex_trust_prompt, is_trust_prompt, lane_for_kind, parse_session, perm_flags,
+    shell_quote_always, tool_for, valid_caller_slug, validate_engine_permission_mode, RcMetadata,
+    PERMISSION_MODE_BYPASS,
 };
 
 use super::plan::{compose_plan_kickoff, validate_plan_inputs, write_plan};
@@ -24,17 +25,45 @@ use crate::clock::{system_clock, ClockRef};
 // tunables (ops.go:25-31, clirc.go:403)
 // ---------------------------------------------------------------------------
 
-/// How long `--wait` polls for a terminal state (`defaultWaitTimeout`,
-/// `ops.go:26`).
+/// How long `--wait` polls for liveness (`defaultWaitTimeout`, `ops.go`).
 pub const DEFAULT_WAIT_TIMEOUT: Duration = Duration::from_secs(20);
 
-/// The poll cadence inside that window (`defaultPollEvery`, `ops.go:27`).
+/// The poll cadence inside that window (`defaultPollEvery`, `ops.go`).
 pub const DEFAULT_POLL_EVERY: Duration = Duration::from_millis(750);
 
-/// The extra settle between "the pane says ready" and typing the kickoff
-/// (`promptDeliverSettle`, `ops.go:30`). A session can report ready — URL
-/// present — a beat before its REPL accepts input.
+/// How long a LIVE session must have been settling before a kickoff line is typed
+/// into it (`kickoffSettle`, `ops.go`).
+///
+/// It exists because liveness (S2, charliek/shed#324) says nothing about whether
+/// the agent's TUI has finished drawing its composer — the pane classifier used
+/// to be that (bad) proxy. The origin the window is measured from is
+/// `max(first successful capture, last SUCCESSFUL control keystroke)`: a dialog
+/// accepted at 4.9 s must not get the kickoff typed into its repaint, and a
+/// `send-keys` that FAILED did not change the screen. Bounded by
+/// [`DEFAULT_WAIT_TIMEOUT`], and paid only when there IS a kickoff.
+pub const KICKOFF_SETTLE: Duration = Duration::from_secs(5);
+
+/// One more plain settle before the kickoff line is typed (`promptDeliverSettle`,
+/// `ops.go`). It inspects nothing, so a kickoff lands at least 6 s after liveness.
 pub const PROMPT_DELIVER_SETTLE: Duration = Duration::from_secs(1);
+
+/// The refusal BOTH delivery paths make — the one-shot `prompt` verb and the
+/// `--wait` kickoff — spelled once so the two cannot diverge in message or exit
+/// class (`errControlDialogUp`, `ops.go`; [`EngineError::bad_args`] → exit 2).
+pub const CONTROL_DIALOG_REFUSAL: &str =
+    "session is showing a one-time trust/bypass dialog; accept it first";
+
+/// Whether the pane is showing ANY of the one-time control dialogs the kept
+/// matchers know: claude's workspace-trust prompt, codex's directory-trust prompt,
+/// or claude's bypass acceptance (`hasControlDialog`, `ops.go`).
+///
+/// NOT kind-gated, unlike `Engine::is_trust_dialog`: this is the DELIVERY
+/// REFUSAL's question, and refusing is the safe direction — a look-alike phrase
+/// costs a caller one retry, whereas typing a kickoff into a modal answers it by
+/// accident.
+fn has_control_dialog(pane: &str) -> bool {
+    is_trust_prompt(pane) || is_codex_trust_prompt(pane) || is_bypass_accept_prompt(pane)
+}
 
 /// Per-probe budget for the installed-agent gate (`agentProbeTimeout`,
 /// `clirc.go:403`), so an unresponsive agent binary cannot stall a create.
@@ -158,9 +187,11 @@ pub fn capture_pane_checked(tmux: &Tmux, name: &str) -> Result<String, EngineErr
     checked_capture(tmux.capture_pane(name), name)
 }
 
-/// The VISIBLE-FRAME twin (`captureVisiblePaneChecked`, `ops.go:373`), same
-/// error mapping — used wherever scrollback would be a lie about the present
-/// (the ApprovalAnchor evaluations).
+/// The VISIBLE-FRAME twin, same error mapping — used wherever scrollback
+/// would be a lie about the present (the ApprovalAnchor evaluations, before
+/// S2, `charliek/shed#324`, deleted them). Go's `captureVisiblePaneChecked`
+/// (`ops.go:373`) went with its last caller; this one is kept as a transport
+/// primitive alongside [`Tmux::capture_visible_pane`].
 pub fn capture_visible_pane_checked(tmux: &Tmux, name: &str) -> Result<String, EngineError> {
     checked_capture(tmux.capture_visible_pane(name), name)
 }
@@ -191,7 +222,9 @@ fn expand_tilde(dir: &str, home: &str) -> String {
         "~" => home.to_string(),
         // ONE trailing slash, matching Go's TrimSuffix — with HOME="//" the two
         // engines must agree on the answer, absurd as the input is.
-        d if d.starts_with("~/") => format!("{}/{}", home.strip_suffix('/').unwrap_or(home), &d[2..]),
+        d if d.starts_with("~/") => {
+            format!("{}/{}", home.strip_suffix('/').unwrap_or(home), &d[2..])
+        }
         d => d.to_string(),
     }
 }
@@ -300,7 +333,7 @@ pub struct PromptOptions {
 /// |---|---|---|
 /// | env | `std::env::var` | `d.getenv` |
 /// | sleep | `thread::sleep` | the `sleep` parameter (`ops.go:99`) |
-/// | monotonic clock | `Instant::now` | `time.Now` in `waitUntilReady` |
+/// | monotonic clock | `Instant::now` | the injected `now` in `waitUntilLive` |
 /// | wall clock | [`system_clock`] | `time.Now().UTC()` for `created_at` |
 /// | settle | 750 ms | `sendLineSettle` (`tmux.go:150`) |
 /// | warn | discard | `CreateOptions.Warnf` |
@@ -671,7 +704,7 @@ impl<'a> Engine<'a> {
                 .unwrap_or_default()
                 .contains(&PERMISSION_MODE_BYPASS);
             let (state, url, outcome) =
-                self.wait_until_ready(&name, &opts.kind, &opts.prompt, bypass);
+                self.wait_until_live(&name, &opts.kind, &opts.prompt, bypass);
             session.state = state;
             session.url = url;
             // A delivery failure after ready IS the create's outcome: reporting
@@ -682,13 +715,54 @@ impl<'a> Engine<'a> {
         Ok(session)
     }
 
-    /// Poll the pane until a terminal state (or timeout), auto-accepting the
-    /// bypass and trust dialogs once each, then deliver `prompt` if the session
-    /// reached ready (`waitUntilReady`, `ops.go:281`).
+    /// Whether the pane is showing this kind's one-time directory/workspace-trust
+    /// dialog — claude's ([`is_trust_prompt`]) or codex's
+    /// ([`is_codex_trust_prompt`]). Both are CONTROL matchers, the last pane
+    /// reading left in the wait path after S2 (charliek/shed#324) deleted the
+    /// classifiers, and both dialogs pre-select "yes", so a single Enter accepts
+    /// either.
     ///
-    /// The returned error is non-`Ok` ONLY for a kickoff-delivery failure after
-    /// ready — a classified non-ready state is a RESULT, not an error.
-    fn wait_until_ready(
+    /// KIND-GATED, deliberately: this decides whether to SEND A KEYSTROKE, and a
+    /// look-alike phrase in a cursor/opencode transcript must never draw one.
+    /// cursor launches with `--trust` and has no dialog at all.
+    fn is_trust_dialog(kind: &RcKind, pane: &str) -> bool {
+        if kind.runs_claude() {
+            is_trust_prompt(pane)
+        } else if matches!(kind, RcKind::Codex) {
+            is_codex_trust_prompt(pane)
+        } else {
+            false
+        }
+    }
+
+    /// The poll delay CLAMPED to what is left before the deadline (`pollDelay`,
+    /// `ops.go`), so the wait loop leaves AT the deadline instead of up to a full
+    /// poll past it (and then adding [`PROMPT_DELIVER_SETTLE`] on the overshoot).
+    fn poll_delay(&self, start: Instant) -> Duration {
+        let elapsed = (self.monotonic)().duration_since(start);
+        DEFAULT_WAIT_TIMEOUT
+            .saturating_sub(elapsed)
+            .min(DEFAULT_POLL_EVERY)
+    }
+
+    /// Poll the pane until the session is LIVE (a capture succeeds) or the deadline
+    /// passes, accepting the one-time control dialogs on the way, then deliver
+    /// `prompt` (`waitUntilLive`, `ops.go`).
+    ///
+    /// Since S2 (charliek/shed#324) there is no classifier here: a successful
+    /// capture IS the ready signal, and a missing tmux session the only dead one.
+    /// What the pane is still read for is CONTROL — claude's bypass-acceptance
+    /// dialog, claude's and codex's trust dialogs, and the claude.ai
+    /// remote-control URL.
+    ///
+    /// WITHOUT a prompt the loop returns on the first successful capture (after
+    /// examining that capture for the control dialogs) — there is nothing to
+    /// settle for. WITH a prompt it returns once [`KICKOFF_SETTLE`] has elapsed
+    /// since the origin, bounded by the deadline.
+    ///
+    /// The returned error is non-`Ok` ONLY for a kickoff-delivery failure — a
+    /// session that never came up is a RESULT, not an error.
+    fn wait_until_live(
         &self,
         name: &str,
         kind: &RcKind,
@@ -700,6 +774,9 @@ impl<'a> Engine<'a> {
         let mut url = None;
         let mut trust_accepted = false;
         let mut bypass_accepted = false;
+        // The settle window's start: the first successful capture, pushed forward
+        // by each SUCCESSFUL control keystroke. `None` until the first capture.
+        let mut origin: Option<Instant> = None;
         while (self.monotonic)().duration_since(start) < DEFAULT_WAIT_TIMEOUT {
             let cap = self.tmux.capture_pane(name);
             if cap.code != 0 {
@@ -709,8 +786,16 @@ impl<'a> Engine<'a> {
                     // the deadline.
                     return (RcState::Dead, None, Ok(()));
                 }
-                (self.sleep)(DEFAULT_POLL_EVERY); // transient; keep polling
+                (self.sleep)(self.poll_delay(start)); // transient; keep polling
                 continue;
+            }
+            // A capture succeeded: the session exists and is drawing. That is
+            // liveness, and liveness is the whole of `ready` now.
+            state = RcState::Ready;
+            url = extract_url(kind, &cap.stdout);
+            let now = (self.monotonic)();
+            if origin.is_none() {
+                origin = Some(now);
             }
             // A bypassPermissions session shows a one-time acceptance dialog
             // before anything else; accept it once so the session can proceed
@@ -722,37 +807,69 @@ impl<'a> Engine<'a> {
                 && is_bypass_accept_prompt(&cap.stdout)
             {
                 // Only latch on a SUCCESSFUL send: a transient send-keys failure
-                // must stay retryable rather than stalling until timeout.
+                // must stay retryable rather than stalling until timeout. The
+                // settle origin moves only on that same success — a failed
+                // keystroke changed nothing on screen.
                 if self.tmux.accept_bypass_prompt(name).code == 0 {
                     bypass_accepted = true;
+                    origin = Some((self.monotonic)());
                 }
-                (self.sleep)(DEFAULT_POLL_EVERY);
+                (self.sleep)(self.poll_delay(start));
                 continue;
             }
-            let classified = classify_pane(kind, &cap.stdout);
-            state = classified.state;
-            url = classified.url;
-            if state == RcState::NeedsTrust && !trust_accepted {
-                // Every agent's directory-trust gate captured so far pre-selects
-                // "yes" and is accepted with Enter (claude's "Yes, I trust this
-                // folder"; codex's "1. Yes, continue · Press enter to continue"),
-                // so a single Enter accepts it for any kind.
-                trust_accepted = true;
-                self.tmux.send_enter(name);
-                (self.sleep)(DEFAULT_POLL_EVERY);
+            if !trust_accepted && Self::is_trust_dialog(kind, &cap.stdout) {
+                // Both captured trust gates pre-select "yes", so a single Enter
+                // accepts either. Latched ONLY on a successful send, exactly like
+                // the bypass arm above: a transient send-keys failure that left the
+                // dialog up must stay retryable, because a latch there would make
+                // every later capture ignore a modal that still owns the keyboard.
+                // The settle origin moves on that same success — a failed keystroke
+                // changed nothing on screen.
+                if self.tmux.send_enter(name).code == 0 {
+                    trust_accepted = true;
+                    origin = Some((self.monotonic)());
+                }
+                (self.sleep)(self.poll_delay(start));
                 continue;
             }
-            if state != RcState::Starting {
-                break;
+            if prompt.is_empty() {
+                break; // nothing to settle for
             }
-            (self.sleep)(DEFAULT_POLL_EVERY);
+            let settled = origin
+                .map(|o| (self.monotonic)().duration_since(o) >= KICKOFF_SETTLE)
+                .unwrap_or(false);
+            if settled {
+                break; // the settle window has elapsed
+            }
+            (self.sleep)(self.poll_delay(start));
         }
         if state == RcState::Ready && !prompt.is_empty() {
             (self.sleep)(PROMPT_DELIVER_SETTLE);
+            // THE DELIVERY GATE. Liveness is not permission to type: the loop above
+            // can exit with a modal still on screen — an accept whose keystroke
+            // failed every time, a bypass dialog the deadline ran out under, a
+            // dialog that reappeared after the settle — and a kickoff typed there
+            // answers it by accident. So delivery re-checks the pane itself, with
+            // the same matchers and the same refusal the one-shot `prompt` verb
+            // makes, rather than trusting the loop's bookkeeping. A transient
+            // capture failure is NO EVIDENCE, not proof of a dialog, so it falls
+            // through to the send (whose own failure is surfaced).
+            let recheck = self.tmux.capture_pane(name);
+            if recheck.code != 0 {
+                if is_missing_session(&recheck.stderr) {
+                    return (RcState::Dead, None, Ok(()));
+                }
+            } else if has_control_dialog(&recheck.stdout) {
+                return (
+                    state,
+                    url,
+                    Err(EngineError::bad_args(CONTROL_DIALOG_REFUSAL)),
+                );
+            }
             let res = self.tmux.send_line(name, prompt);
             if res.code != 0 {
                 if is_missing_session(&res.stderr) {
-                    // Killed between classification and delivery: that is a dead
+                    // Killed between the last poll and delivery: that is a dead
                     // session, not a transport failure.
                     return (RcState::Dead, None, Ok(()));
                 }
@@ -820,9 +937,24 @@ impl<'a> Engine<'a> {
         Ok(())
     }
 
-    /// Deliver a line to a READY session (`Prompt`, `ops.go:430`), re-verifying
-    /// kind + state + the optional session id before sending. Prints nothing on
-    /// success.
+    /// Deliver a line to a LIVE session (`Prompt`, `ops.go`), re-verifying kind +
+    /// the control gate + the optional session id before sending. Prints nothing
+    /// on success.
+    ///
+    /// THE GATE IS CONTROL, NOT STATUS (S2, charliek/shed#324). It used to refuse
+    /// anything the classifier did not call `ready`; with `state` reduced to
+    /// liveness that check would always pass and the verb would type blind. What
+    /// it refuses instead is a pane with a one-time dialog on it — claude's or
+    /// codex's trust dialog, claude's bypass acceptance — because a line typed
+    /// there answers the dialog by accident. Unlike [`Self::wait_until_live`]'s
+    /// accept path this is NOT kind-gated: refusing is the safe direction, so
+    /// every kept matcher is consulted for every kind.
+    ///
+    /// Everything else is DELIVERY OF TERMINAL INPUT INTO A LIVE SESSION — the
+    /// same thing a person typing at the attached terminal does. The hub cannot
+    /// tell an auth screen or an approval modal from a composer any more, and that
+    /// hazard is accepted (and documented in `docs/extensions/rc-helper.md`) until
+    /// roost owns the guest's kickoff.
     pub fn prompt(&self, opts: &PromptOptions) -> Result<(), EngineError> {
         let text = normalize_newlines(&opts.text);
         if has_unsafe_prompt_chars(&text) {
@@ -830,7 +962,10 @@ impl<'a> Engine<'a> {
                 "text contains an unsupported control character",
             ));
         }
-        let session = self.load_session(&opts.slug, None)?;
+        let name = tmux_name(&opts.slug);
+        let pane = self.capture_pane_checked(&name)?;
+        let env = self.tmux.show_environment(&name);
+        let session = parse_session(&name, &env, &pane, None);
         if !opts.session_id.is_empty() && session.id.as_deref() != Some(opts.session_id.as_str()) {
             return Err(EngineError::SessionNotFound(
                 "session id mismatch (recreated?)".to_string(),
@@ -842,15 +977,11 @@ impl<'a> Engine<'a> {
                 quote_go(session.kind.as_str())
             )));
         }
-        if session.state != RcState::Ready {
-            return Err(EngineError::bad_args(format!(
-                "session not ready (state={})",
-                state_wire(session.state)
-            )));
+        if has_control_dialog(&pane) {
+            return Err(EngineError::bad_args(CONTROL_DIALOG_REFUSAL));
         }
         // Surface a delivery failure (e.g. the session was killed between the
         // check and the send) instead of reporting a false success.
-        let name = tmux_name(&opts.slug);
         let res = self.tmux.send_line(&name, &text);
         if res.code != 0 {
             if is_missing_session(&res.stderr) {
@@ -978,19 +1109,10 @@ fn none_if_empty(s: String) -> Option<String> {
     }
 }
 
-/// The wire token for a state — what Go's `State` string type prints in
-/// `state=%s`. Mirrors [`RcState`]'s kebab-case serde derive (pinned by a test
-/// below so the two cannot drift).
-fn state_wire(state: RcState) -> &'static str {
-    match state {
-        RcState::Starting => "starting",
-        RcState::Ready => "ready",
-        RcState::Reconnecting => "reconnecting",
-        RcState::NeedsTrust => "needs-trust",
-        RcState::NeedsAuth => "needs-auth",
-        RcState::Dead => "dead",
-    }
-}
+// S2 (charliek/shed#324) removed `state_wire`: its only caller was `prompt`'s
+// "session not ready (state=…)" refusal, and the verb's gate is control now, not
+// status. `RcState`'s kebab-case serde derive is the one remaining spelling of
+// those tokens.
 
 #[cfg(test)]
 mod tests;

@@ -10,12 +10,12 @@ import (
 	"time"
 )
 
-// codexReadyPane is a codex pane parked at its composer placeholder — classifies ready
-// AND matches the codex prompt anchor (so the degraded idle+anchor input policy accepts).
-func codexReadyPane() string { return "codex\n> " + codexComposerPlaceholder }
+// codexReadyPane is a codex pane parked at its composer. Since S2 (charliek/shed#324)
+// the hub reads nothing out of it — a session that ENUMERATES is live — so this is
+// just plausible pane text for a live codex row.
+func codexReadyPane() string { return "codex\n> Ask Codex to do anything" }
 
-// opencodeReadyPane is an opencode pane parked at its composer placeholder — it matches the
-// opencode prompt anchor, so a gate rejection on it can only come from an activity arm.
+// opencodeReadyPane is the same for an opencode row.
 func opencodeReadyPane() string { return "opencode\n> Ask anything..." }
 
 // ---- GET /v1/sessions/{slug}/messages ----
@@ -28,7 +28,7 @@ func TestHubHTTPMessagesPagingTruncatedAnd404(t *testing.T) {
 	h.reconcile()
 
 	// White-box: seed the tracked session's ring (the HTTP layer's job is paging, not
-	// production — the codex-fold→ring path is covered by TestCodexFoldMessageMapping).
+	// production — the fold→ring path is covered by the opencode fold's own tests).
 	h.trackMu.Lock()
 	ring := h.tracked["msg111"].ring
 	h.trackMu.Unlock()
@@ -106,15 +106,13 @@ func TestHubHTTPMessagesEmptyForKnownSlug(t *testing.T) {
 
 // ---- POST /v1/sessions/{slug}/input ----
 
-// newInputHub builds a hub whose stability verdict has SETTLED (two reconciles across
-// the quiet period): the input acceptance re-check runs the same watcher+stability
-// merge as reconcile, and a first-tick stability is always `working` (a fresh session
-// has "just changed"), which would 409 every post.
+// newInputHub reconciles once (which is what puts a session in the tracked map) and
+// serves the hub over HTTP. There is nothing left to settle: A6 removed the gated lane
+// and S2 (charliek/shed#324) the pane-stability engine whose quiet period the second
+// reconcile used to cross.
 func newInputHub(t *testing.T, f *hubTmux, clk *hubClock) (*Hub, *httptest.Server) {
 	t.Helper()
 	h := newTestHub(f, clk)
-	h.reconcile()
-	clk.advance(5 * time.Second) // past newTestHub's 4s quiet period
 	h.reconcile()
 	srv := httptest.NewServer(h.handler())
 	t.Cleanup(srv.Close)
@@ -128,70 +126,6 @@ func postInput(t *testing.T, url, body string) *http.Response {
 		t.Fatal(err)
 	}
 	return resp
-}
-
-func TestHubInputHappyPathReachesPane(t *testing.T) {
-	prev := sendLineSettle
-	sendLineSettle = 0
-	t.Cleanup(func() { sendLineSettle = prev })
-
-	f := newHubTmux()
-	clk := &hubClock{t: time.Unix(1_700_000_000, 0).UTC()}
-	f.set("rc-inp111", codexReadyPane(), managedEnv("id-i", KindCodex))
-	_, srv := newInputHub(t, f, clk)
-
-	resp := postInput(t, srv.URL+"/v1/sessions/inp111/input", `{"text":"hello there"}`)
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("status = %d, want 200: %s", resp.StatusCode, readAll(t, resp))
-	}
-	sent := f.recorded()
-	if len(sent) != 1 || sent[0] != "hello there" {
-		t.Fatalf("delivered payloads = %v, want [\"hello there\"]", sent)
-	}
-}
-
-func TestHubInputMultilineUsesBracketedPaste(t *testing.T) {
-	prev := sendLineSettle
-	sendLineSettle = 0
-	t.Cleanup(func() { sendLineSettle = prev })
-
-	f := newHubTmux()
-	clk := &hubClock{t: time.Unix(1_700_000_000, 0).UTC()}
-	f.set("rc-inp222", codexReadyPane(), managedEnv("id-i2", KindCodex))
-	_, srv := newInputHub(t, f, clk)
-
-	resp := postInput(t, srv.URL+"/v1/sessions/inp222/input", `{"text":"line one\nline two"}`)
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("status = %d, want 200", resp.StatusCode)
-	}
-	// The multi-line block is delivered as one buffered bracketed paste.
-	sent := f.recorded()
-	if len(sent) != 1 || sent[0] != "line one\nline two" {
-		t.Fatalf("bracketed-paste payload = %v, want the multi-line block", sent)
-	}
-}
-
-// The degraded idle+anchor policy: with no JSONL watcher (the tail is absent/broken),
-// a fresh pane showing the composer anchor is accepted — the documented degraded path.
-func TestHubInputDegradedIdleAnchorAccepts(t *testing.T) {
-	prev := sendLineSettle
-	sendLineSettle = 0
-	t.Cleanup(func() { sendLineSettle = prev })
-
-	f := newHubTmux()
-	clk := &hubClock{t: time.Unix(1_700_000_000, 0).UTC()}
-	f.set("rc-deg111", codexReadyPane(), managedEnv("id-d", KindCodex))
-	_, srv := newInputHub(t, f, clk)
-
-	// The hub's getenv returns "" → no ~/.codex root → no watcher correlated: the only
-	// acceptance signal is the composer anchor on the fresh pane.
-	resp := postInput(t, srv.URL+"/v1/sessions/deg111/input", `{"text":"go"}`)
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("degraded idle+anchor must accept, got %d", resp.StatusCode)
-	}
 }
 
 func TestHubInputErrorStatuses(t *testing.T) {
@@ -222,87 +156,39 @@ func TestHubInputErrorStatuses(t *testing.T) {
 	}
 }
 
-// 409 when the session is not waiting for input (a churning, non-anchor pane).
-// TestHubInputUnderADialogIs409 was TestHubInputNotAcceptingIs409, which posted
-// into a churning pane. Under the current rule a churning pane is fine — the TUI
-// queues the line — so the end-to-end 409 is exercised where it still belongs: a
-// pane showing an approval dialog, where a delivered sentence would ANSWER it.
-func TestHubInputUnderADialogIs409(t *testing.T) {
+// A6 (charliek/shed#322) removed the gated-input lane: `kind_features.input` is "" for
+// every TUI kind and "turn" for opencode, so NO kind is `gated` and a well-formed POST
+// for a live session is 409 not_accepting whatever the pane shows. The gated-lane cells
+// this replaces — happy path, bracketed paste, degraded-anchor accept, the under-a-dialog
+// / state-flip / identity 409s, the acceptance-merge branches and the per-slug delivery
+// mutex — went with the lane.
+func TestHubInputNotAcceptingForEveryKind(t *testing.T) {
 	f := newHubTmux()
 	clk := &hubClock{t: time.Unix(1_700_000_000, 0).UTC()}
-	f.set("rc-na111", paneFixture(t, "codex-ready-approval-exec"), managedEnv("id-na", KindCodex))
+	f.set("rc-nac001", codexReadyPane(), managedEnv("id-c", KindCodex))
+	f.set("rc-nac002", opencodeReadyPane(), managedEnv("id-o", KindOpencode))
+	f.set("rc-nac003", "cursor\n> ", managedEnv("id-u", KindCursor))
+	f.set("rc-nac004", "claude\n> ", managedEnv("id-r", KindClaudeRC))
 	_, srv := newInputHub(t, f, clk)
 
-	resp := postInput(t, srv.URL+"/v1/sessions/na111/input", `{"text":"hi"}`)
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusConflict {
-		t.Fatalf("posting under a dialog status = %d, want 409", resp.StatusCode)
+	for _, slug := range []string{"nac001", "nac002", "nac003", "nac004"} {
+		t.Run(slug, func(t *testing.T) {
+			resp := postInput(t, srv.URL+"/v1/sessions/"+slug+"/input", `{"text":"hi"}`)
+			defer resp.Body.Close()
+			if resp.StatusCode != http.StatusConflict {
+				t.Fatalf("status = %d, want 409 (no kind accepts feed input)", resp.StatusCode)
+			}
+			body := readAll(t, resp)
+			if !strings.Contains(body, "not_accepting") || !strings.Contains(body, "does not accept feed input") {
+				t.Errorf("rejection = %s, want the kind-gate not_accepting envelope", body)
+			}
+		})
 	}
 }
 
-// 409 when the pane state FLIPS between the tracked snapshot and the locked
-// re-check: tracked at a clean composer, but the capture taken under the input
-// mutex — as late as possible before delivery — sees a dialog that went up in
-// between. Delivering against the FIRST capture would answer it.
-func TestHubInputRaceStateFlipIs409(t *testing.T) {
-	f := newHubTmux()
-	clk := &hubClock{t: time.Unix(1_700_000_000, 0).UTC()}
-	f.set("rc-race22", codexReadyPane(), managedEnv("id-r", KindCodex))
-	_, srv := newInputHub(t, f, clk) // reconcile tracked it parked at the anchor
-
-	// The pane flips to a churning, non-anchor state before the POST's locked re-check.
-	f.setPane("rc-race22", paneFixture(t, "codex-ready-approval-exec"))
-
-	resp := postInput(t, srv.URL+"/v1/sessions/race22/input", `{"text":"hi"}`)
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusConflict {
-		t.Fatalf("state-flip status = %d, want 409", resp.StatusCode)
-	}
-}
-
-// 409 when the slug was recreated (identity changed) since it was tracked.
-func TestHubInputIdentityGuardIs409(t *testing.T) {
-	f := newHubTmux()
-	clk := &hubClock{t: time.Unix(1_700_000_000, 0).UTC()}
-	f.set("rc-idg111", codexReadyPane(), managedEnv("id-old", KindCodex))
-	_, srv := newInputHub(t, f, clk) // tracked with id-old
-
-	// A new incarnation takes the same slug (different SHED_RC_ID) without a reconcile,
-	// so the tracked identity is stale — the locked re-check must reject.
-	f.set("rc-idg111", codexReadyPane(), managedEnv("id-new", KindCodex))
-
-	resp := postInput(t, srv.URL+"/v1/sessions/idg111/input", `{"text":"hi"}`)
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusConflict {
-		t.Fatalf("identity-guard status = %d, want 409", resp.StatusCode)
-	}
-}
-
-// The opencode /input BEHAVIOR BREAK, pinned: opencode's row moved to input "turn"
-// (whole turns through POST /v1/sessions/{slug}/turn), and `input` is single-valued —
-// so /input no longer applies to the kind at all. It 409s on a pane that DOES match the
-// opencode composer anchor, i.e. the rejection can only be the kind gate itself, and it
-// is final for every opencode session regardless of activity. codex stays gated (its
-// happy path above is the counterpart pin).
-func TestHubInputOpencodeNotGatedAfterTurnFlip(t *testing.T) {
-	f := newHubTmux()
-	clk := &hubClock{t: time.Unix(1_700_000_000, 0).UTC()}
-	f.set("rc-ng111", opencodeReadyPane(), managedEnv("id-ng", KindOpencode))
-	_, srv := newInputHub(t, f, clk)
-
-	resp := postInput(t, srv.URL+"/v1/sessions/ng111/input", `{"text":"hi"}`)
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusConflict {
-		t.Fatalf("opencode /input status = %d, want 409 (the kind is no longer gated)", resp.StatusCode)
-	}
-	if body := readAll(t, resp); !strings.Contains(body, "does not accept feed input") {
-		t.Errorf("rejection = %s, want the kind-gate message (not an activity rejection)", body)
-	}
-}
-
-// stubWatcher is a scripted sessionWatcher for the gate tests: it reports a fixed verdict
-// with fixed authority, so a merge case (needs_approval, expired-working, …) can be exercised
-// without standing up a real tail or SSE transport.
+// stubWatcher is a scripted sessionWatcher: it reports a fixed verdict with fixed
+// authority, so a merge case (needs_approval, expired-working, …) can be exercised
+// without standing up a real SSE transport.
 type stubWatcher struct {
 	activity       Activity
 	message        string
@@ -319,10 +205,9 @@ func (s *stubWatcher) drainPending() []feedMessage { return nil }
 func (s *stubWatcher) hadEvent() bool              { return true }
 func (s *stubWatcher) close()                      {}
 
-// stubApprovalWatcher adds the two approval surfaces: the snapshot reconcile publishes
-// (approvalPublisher) and the blocked-on-a-dialog question the input gate asks
-// (approvalBlocker). blocked models an open ask that is NOT in the snapshot — an opencode
-// question — so the two can be driven apart.
+// stubApprovalWatcher adds the approval snapshot reconcile publishes
+// (approvalPublisher). blocked models an open ask that is NOT in the snapshot — an
+// opencode question — so the two can be driven apart.
 type stubApprovalWatcher struct {
 	stubWatcher
 	blocked bool
@@ -334,241 +219,7 @@ func (s *stubApprovalWatcher) hasOpenApprovals() bool           { return s.block
 var (
 	_ sessionWatcher    = (*stubWatcher)(nil)
 	_ approvalPublisher = (*stubApprovalWatcher)(nil)
-	_ approvalBlocker   = (*stubApprovalWatcher)(nil)
 )
-
-// An approval dialog owns the keyboard: a merged needs_approval verdict rejects typed input
-// even though the pane is quiet and still matches the kind's composer anchor — without the
-// arm the posted line would answer the dialog by accident.
-func TestHubInputNeedsApprovalRejected(t *testing.T) {
-	f := newHubTmux()
-	clk := &hubClock{t: time.Unix(1_700_000_000, 0).UTC()}
-	h := newTestHub(f, clk)
-
-	blocked := &stubWatcher{activity: ActivityNeedsApproval, fresh: true}
-	if h.inputAccepted(blocked, ActivityNeedsInput, KindOpencode, opencodeReadyPane(), opencodeReadyPane()) {
-		t.Error("a fresh needs_approval watcher must reject input even on an anchored pane")
-	}
-	// The same watcher without authority falls through to stability, which is the settled
-	// pane verdict — the gate is driven by the MERGE, not by the raw watcher value.
-	stale := &stubWatcher{activity: ActivityNeedsApproval}
-	if !h.inputAccepted(stale, ActivityNeedsInput, KindOpencode, opencodeReadyPane(), opencodeReadyPane()) {
-		t.Error("a stale needs_approval watcher must yield to the settled stability verdict")
-	}
-}
-
-// The CONSERVATIVE arm: when the transport is unhealthy the merge demotes the watcher to pane
-// stability, so the merged-needs_approval arm cannot fire — but the dialog is still on the pane.
-// A watcher reporting any open ask therefore rejects regardless of freshness, and it covers
-// opencode QUESTIONS, which block the keyboard without ever entering pending_approvals.
-func TestHubInputOpenApprovalRejectsWhenTransportUnhealthy(t *testing.T) {
-	f := newHubTmux()
-	clk := &hubClock{t: time.Unix(1_700_000_000, 0).UTC()}
-	h := newTestHub(f, clk)
-
-	// Unhealthy watcher: fresh=false → the merge hands the verdict to stability (needs_input),
-	// which on an anchored pane would otherwise accept.
-	stale := &stubApprovalWatcher{stubWatcher: stubWatcher{activity: ActivityNeedsApproval}}
-	stale.approvals = []FeedApproval{{ID: "per_1", Status: approvalStatusPending}}
-	if merged, _ := mergedActivity(ActivityNeedsApproval, "", false, false, ActivityNeedsInput); merged != ActivityNeedsInput {
-		t.Fatalf("test premise: an unhealthy watcher must merge to stability, got %q", merged)
-	}
-	if h.inputAccepted(stale, ActivityNeedsInput, KindOpencode, opencodeReadyPane(), opencodeReadyPane()) {
-		t.Error("an open approval must reject even when the transport went unhealthy")
-	}
-
-	// A question: nothing in the snapshot, still blocking.
-	question := &stubApprovalWatcher{stubWatcher: stubWatcher{activity: ActivityNeedsInput, fresh: true}, blocked: true}
-	if h.inputAccepted(question, ActivityNeedsInput, KindOpencode, opencodeReadyPane(), opencodeReadyPane()) {
-		t.Error("an open question must reject even though pending_approvals is empty")
-	}
-
-	// Once nothing is open, the same (fresh, settled) watcher accepts again.
-	clear := &stubApprovalWatcher{stubWatcher: stubWatcher{activity: ActivityNeedsInput, fresh: true}}
-	if !h.inputAccepted(clear, ActivityNeedsInput, KindOpencode, opencodeReadyPane(), opencodeReadyPane()) {
-		t.Error("with no open ask the gate must accept a settled session")
-	}
-}
-
-// The second arm: a kind whose approvals are pane-derived rejects while its ApprovalAnchor
-// matches the FRESH pane — now live, driven by codex's real anchor against the committed
-// approval fixtures. The watcher is deliberately FRESH and settled (needs_input), the one
-// verdict that otherwise short-circuits to accept: that is what makes this arm bite, and
-// it is not hypothetical for codex, whose rollout cannot see the dialog at all.
-// UNDEBOUNCED on purpose (unlike reconcile's needs_approval derivation): one frame showing
-// the dialog is enough to refuse a keystroke that would otherwise answer it.
-func TestHubInputApprovalAnchorRejected(t *testing.T) {
-	f := newHubTmux()
-	clk := &hubClock{t: time.Unix(1_700_000_000, 0).UTC()}
-	h := newTestHub(f, clk)
-
-	if approvalAnchorFor(KindCodex) == nil {
-		t.Fatal("test premise: codex must declare an ApprovalAnchor")
-	}
-	settled := &stubWatcher{activity: ActivityNeedsInput, fresh: true}
-
-	for _, fx := range []string{"codex-ready-approval-exec", "codex-ready-approval-network"} {
-		if h.inputAccepted(settled, ActivityNeedsInput, KindCodex, paneFixture(t, fx), paneFixture(t, fx)) {
-			t.Errorf("%s: an approval dialog on the fresh pane must reject input", fx)
-		}
-	}
-	// The same session once the dialog is answered: the overlay is gone (the headline is
-	// still in the transcript) and the composer is back — input flows again.
-	if !h.inputAccepted(settled, ActivityNeedsInput, KindCodex, paneFixture(t, "codex-ready-approval-resolved"), paneFixture(t, "codex-ready-approval-resolved")) {
-		t.Error("the post-resolution pane must accept input again")
-	}
-	// Agent prose quoting the dialog must not lock the keyboard either.
-	if !h.inputAccepted(settled, ActivityNeedsInput, KindCodex, paneFixture(t, "codex-ready-approval-quoted"), paneFixture(t, "codex-ready-approval-quoted")) {
-		t.Error("quoted prose must not gate input")
-	}
-	if !h.inputAccepted(settled, ActivityNeedsInput, KindCodex, codexReadyPane(), codexReadyPane()) {
-		t.Error("without the anchor on the pane the gate must still accept")
-	}
-	// The arm reads the VISIBLE frame, never the scrollback: a dialog answered ten
-	// minutes ago is still in the 200-line history, and gating on that would wedge the
-	// session's input for as long as it stayed there.
-	if !h.inputAccepted(settled, ActivityNeedsInput, KindCodex, paneFixture(t, "codex-ready-approval-exec"), codexReadyPane()) {
-		t.Error("an approval dialog present ONLY in the scrollback must not gate input")
-	}
-}
-
-// inputAccepted's watcher branch: a FRESH JSONL verdict wins over the pane anchor —
-// needs_input accepts even on a non-anchor pane; working rejects even on an anchor pane
-// (delivering mid-turn would interleave input).
-func TestHubInputAcceptedWatcherBranch(t *testing.T) {
-	f := newHubTmux()
-	clk := &hubClock{t: time.Unix(1_700_000_000, 0).UTC()}
-	h := newTestHub(f, clk)
-	dir := t.TempDir()
-
-	// A settled turn (task_complete) → the fold reports needs_input, authoritative even
-	// on a pane with no composer anchor (stability's verdict is irrelevant).
-	settled := dir + "/settled.jsonl"
-	writeFile(t, settled, `{"type":"event_msg","payload":{"type":"task_complete","last_agent_message":"done"}}`+"\n")
-	wSettled := newFileWatcher(settled, true, newCodexFold())
-	wSettled.refresh(clk.now())
-	if !h.inputAccepted(wSettled, ActivityWorking, KindCodex, "no anchor here", "no anchor here") {
-		t.Error("a fresh needs_input watcher must accept regardless of the pane anchor")
-	}
-
-	// An open tool call (no output) → working, and that is DELIVERED: the pane queues
-	// it. (The assertion was inverted with the rule; the fold behaviour it exercises —
-	// a real codex JSONL producing a working verdict — is unchanged.)
-	working := dir + "/working.jsonl"
-	writeFile(t, working, `{"type":"event_msg","payload":{"type":"task_started"}}`+"\n"+
-		`{"type":"response_item","payload":{"type":"custom_tool_call","call_id":"c1","name":"exec"}}`+"\n")
-	wWorking := newFileWatcher(working, true, newCodexFold())
-	wWorking.refresh(clk.now())
-	if !h.inputAccepted(wWorking, ActivityWorking, KindCodex, codexReadyPane(), codexReadyPane()) {
-		t.Error("a fresh working watcher still takes the line — its TUI queues it")
-	}
-}
-
-// The long-quiet-working case (the handler must not be weaker than the reconcile
-// merge): a working verdict whose file has been quiet past the 120s grace is
-// EXPIRED-working — with an unsettled stability it still merges to working and must
-// reject even with the composer anchor on the pane (a >120s tool call is still a
-// live turn). Only a SETTLED quiet stability (the pane genuinely stopped) releases
-// it to the anchor path.
-// TestHubInputDuringALongToolCallIsDelivered: a >120s tool call is a live turn,
-// and the old rule refused to type into one. That is exactly the case a person
-// most wants — the agent is grinding and you have a correction — and the TUI
-// itself takes it. What still refuses is a dialog, tested elsewhere.
-func TestHubInputDuringALongToolCallIsDelivered(t *testing.T) {
-	f := newHubTmux()
-	start := time.Unix(1_700_000_000, 0).UTC()
-	clk := &hubClock{t: start}
-	h := newTestHub(f, clk)
-	dir := t.TempDir()
-
-	working := dir + "/long.jsonl"
-	writeFile(t, working, `{"type":"event_msg","payload":{"type":"task_started"}}`+"\n"+
-		`{"type":"response_item","payload":{"type":"custom_tool_call","call_id":"c1","name":"exec"}}`+"\n")
-	w := newFileWatcher(working, true, newCodexFold())
-	w.refresh(clk.now()) // folds the events at t0
-
-	clk.advance(watcherWorkingGrace + time.Second) // file quiet past the working grace
-
-	// Stability unsettled (working) → merged stays working → reject despite the anchor.
-	if !h.inputAccepted(w, ActivityWorking, KindCodex, codexReadyPane(), codexReadyPane()) {
-		t.Error("mid-tool-call with a churning stability: the TUI queues it")
-	}
-	// Stability settled (idle: the pane genuinely stopped) → the merge releases to
-	// stability and the anchor path may accept.
-	if !h.inputAccepted(w, ActivityIdle, KindCodex, codexReadyPane(), codexReadyPane()) {
-		t.Error("mid-tool-call with a settled-idle stability: the TUI queues it")
-	}
-}
-
-// A transient tmux capture failure at the locked re-check is a 500 (retryable), not a
-// 404 — only a genuinely-gone session ("can't find pane") maps to 404.
-func TestHubInputTransientCaptureErrorIs500(t *testing.T) {
-	f := newHubTmux()
-	clk := &hubClock{t: time.Unix(1_700_000_000, 0).UTC()}
-	f.set("rc-tra111", codexReadyPane(), managedEnv("id-t", KindCodex))
-	_, srv := newInputHub(t, f, clk)
-
-	f.setFlaky("rc-tra111", true)
-	resp := postInput(t, srv.URL+"/v1/sessions/tra111/input", `{"text":"hi"}`)
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusInternalServerError {
-		t.Fatalf("transient capture error status = %d, want 500", resp.StatusCode)
-	}
-}
-
-// Input serialization is keyed by SLUG on the hub, not on the tracked entry: a
-// tracked-entry replacement (recreate reconciled mid-request) yields the SAME mutex,
-// so a post that raced the replacement still serializes against a concurrent post.
-// The lock is pruned only when the slug disappears.
-func TestHubInputLockSurvivesEntryReplacement(t *testing.T) {
-	f := newHubTmux()
-	clk := &hubClock{t: time.Unix(1_700_000_000, 0).UTC()}
-	h, srv := newInputHub(t, f, clk)
-	f.set("rc-lok111", codexReadyPane(), managedEnv("id-a", KindCodex))
-	h.reconcile()
-
-	mu := h.inputLock("lok111")
-
-	// Replace the tracked entry (recreate: new SHED_RC_ID) — the slug's mutex must be
-	// the same object afterward.
-	f.set("rc-lok111", codexReadyPane(), managedEnv("id-b", KindCodex))
-	h.reconcile()
-	if h.inputLock("lok111") != mu {
-		t.Fatal("entry replacement must not mint a new input mutex for the slug")
-	}
-
-	// Holding the mutex blocks a live POST even across the replacement (the handler
-	// resolves the lock by slug, not via the entry it looked up).
-	mu.Lock()
-	done := make(chan int, 1)
-	go func() {
-		resp := postInput(t, srv.URL+"/v1/sessions/lok111/input", `{"text":"hi"}`)
-		resp.Body.Close()
-		done <- resp.StatusCode
-	}()
-	select {
-	case code := <-done:
-		t.Fatalf("POST completed (status %d) while the slug's input mutex was held", code)
-	case <-time.After(150 * time.Millisecond):
-		// still blocked — serialized, as required
-	}
-	mu.Unlock()
-	select {
-	case <-done:
-	case <-time.After(2 * time.Second):
-		t.Fatal("POST did not complete after the mutex was released")
-	}
-
-	// Disappear → the lock is pruned; a later recreate gets a fresh mutex.
-	f.remove("rc-lok111")
-	h.reconcile()
-	h.inputLockMu.Lock()
-	_, still := h.inputLocks["lok111"]
-	h.inputLockMu.Unlock()
-	if still {
-		t.Fatal("disappeared slug's input lock must be pruned")
-	}
-}
 
 // ---- small HTTP helpers ----
 

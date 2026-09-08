@@ -26,11 +26,17 @@ const CapabilityVersion = 4
 //   - serve — `shed-ext-rc serve` runs the resident rc activity hub (loopback HTTP:
 //     GET /v1/sessions + SSE /v1/events), spawned on demand and self-exiting.
 //   - activity — sessions carry the live activity dimension (activity/activity_at/
-//     last_message inside the rc block) derived by the hub.
-//   - messages — the hub serves the codex message feed (GET /v1/sessions/{slug}/
-//     messages + the message.appended SSE event) and gated feed input (POST
-//     /v1/sessions/{slug}/input). Per-kind availability is in kind_features
-//     (watch / input); this token says the endpoints exist on this binary.
+//     last_message inside the rc block), derived by the hub for opencode's lane only
+//     — the only kind with an activity producer since S2 (charliek/shed#324) deleted
+//     the pane-stability engine and the claude/codex tails that fed it; every other
+//     kind's session simply omits these fields.
+//   - messages — the hub serves a normalized message feed (GET /v1/sessions/{slug}/
+//     messages + the message.appended SSE event) and the turn/interrupt/approvals
+//     verbs, live for opencode's lane only today. Per-kind availability is in
+//     kind_features (watch / input / feed); this token says the endpoints exist on
+//     this binary. POST /v1/sessions/{slug}/input predates this token and now
+//     answers 409 not_accepting for every kind — no kind is "gated" any more
+//     (A6/S2, charliek/shed#322 / #324).
 //   - contract-v2 — the v2 wire contract: `lane` on every session DTO, the
 //     feed/interrupt/attach hints in kind_features, the turn/interrupt/approvals hub
 //     verbs (routed and fully specified — live for a kind whose kind_features row
@@ -64,15 +70,18 @@ type AgentInfo struct {
 //     `watch == (feed == "messages")` in lockstep (invariant-tested in
 //     capabilities_test.go), so a v1 client reading watch and a v2 client reading
 //     feed see the same thing. Removed once no client reads it.
-//   - input — the feed-input posting mode, SINGLE-VALUED: "gated" means POST /input is
-//     accepted only while the session is waiting (the hub's acceptance re-check),
-//     "turn" means the lane takes whole turns through POST /turn (and POST /input no
-//     longer applies — opencode today), "" means no feed input at all (the TUI-only
-//     post_input path still applies).
+//   - input — the feed-input posting mode, SINGLE-VALUED: "turn" means the lane takes
+//     whole turns through POST /turn (opencode today; POST /input does not apply to
+//     it), "" means no feed input at all (every other kind; the TUI-only post_input
+//     path still applies). A third value, "gated", meant POST /input was accepted
+//     unless the agent was blocked on a decision; it was retired with the codex and
+//     cursor lanes (A6, charliek/shed#322) and no kind carries it any more — POST
+//     /input answers 409 not_accepting for every kind.
 //   - feed — what the hub can stream for the kind: "messages" (a normalized
 //     conversation feed: GET /messages + message.appended), "activity" (the activity
-//     dimension only — the stability/transcript engines derive it, but there is no
-//     message feed), or "none" (no hub signal at all).
+//     dimension only, no message feed — reserved for a kind with an activity producer
+//     but no message feed; none does today), or "none" (no hub signal at all —
+//     claude-rc/codex/cursor, since A6/S2 retired their producers).
 //   - interrupt — the interrupt verb is supported (opencode today; false elsewhere).
 //   - attach — how a terminal reaches the session: "tmux" (attach to the rc-tmux
 //     session), "native-remote" (the agent's own remote surface), or "none".
@@ -217,10 +226,10 @@ func BuildCapabilities(probe AgentProbe, installed InstalledProbe) Capabilities 
 // The emitted matrix (pinned exhaustively by capabilities_test.go):
 //
 //	kind      | post_input | approvals | watch | input | feed     | interrupt | attach
-//	claude-rc | true       | tui       | false | ""    | activity | false     | tmux
-//	codex     | true       | tui       | true  | gated | messages | false     | tmux
+//	claude-rc | true       | tui       | false | ""    | none     | false     | tmux
+//	codex     | true       | tui       | false | ""    | none     | false     | tmux
 //	opencode  | true       | remote    | true  | turn  | messages | true      | tmux
-//	cursor    | true       | tui       | true  | gated | messages | false     | tmux
+//	cursor    | true       | tui       | false | ""    | none     | false     | tmux
 func kindFeatures() map[Kind]KindFeatures {
 	out := map[Kind]KindFeatures{}
 	for _, k := range allKinds {
@@ -228,41 +237,32 @@ func kindFeatures() map[Kind]KindFeatures {
 			continue
 		}
 		// The BASE row is a TUI-lane session: approvals answered on the pane, a terminal
-		// reaching it by attaching to tmux, no turn/interrupt verb, no feed input.
-		// "activity" is the feed floor — the hub's stability/transcript engines derive the
-		// activity dimension for every watched kind even where no message feed exists.
-		// Each divergent kind then states its WHOLE row once (no layered overrides), so a
-		// field's value is readable without simulating the assignments above it.
+		// reaching it by attaching to tmux, no turn/interrupt verb, no feed input, and —
+		// since A6 (charliek/shed#322) retired the claude transcript tail, the codex
+		// rollout tail and the cursor hook-ingest lane — NO HUB SIGNAL AT ALL. `feed` is
+		// therefore "none", not "activity": `activity` claims the hub can stream the
+		// activity dimension, and with no producer left that would be a false claim under
+		// the contract's own definition (docs/extensions/rc-helper.md). roost is the status
+		// authority for these kinds now. Each divergent kind then states its WHOLE row once
+		// (no layered overrides), so a field's value is readable without simulating the
+		// assignments above it.
 		kf := KindFeatures{
 			PostInput: AcceptsTypedInput(k),
 			Approvals: "tui",
-			Feed:      "activity",
+			Feed:      "none",
 			Attach:    "tmux",
 		}
 		switch k {
-		case KindCodex:
-			// codex's rollout JSONL is folded into a normalized message feed, and its
-			// composer anchor gates POST /input acceptance.
-			kf.Feed, kf.Input = "messages", inputModeGated
 		case KindOpencode:
-			// opencode is the first LIVE lane: its TUI runs an embedded HTTP+SSE server
+			// opencode is the ONLY live lane: its TUI runs an embedded HTTP+SSE server
 			// the hub steers through (watch_opencode_transport.go's verb lane), so whole
 			// turns, interrupts and approvals all go through the hub rather than the pane.
-			// `input` is single-valued, so "turn" REPLACES the "gated" codex spelling:
-			// POST /input no longer applies to opencode (a behavior break for hub clients
-			// — the turn verb is the steering surface, and the create/prompt kickoff path
-			// still delivers the first prompt via post_input). The divergence from codex
-			// is deliberate; the two rows are no longer asserted equal.
+			// `input` is single-valued and "turn" is the only value left on the wire:
+			// POST /input applies to no kind at all now (the turn verb is the steering
+			// surface, and the create/prompt kickoff path still delivers the first prompt
+			// via post_input).
 			kf.Feed, kf.Input = "messages", inputModeTurn
 			kf.Approvals, kf.Interrupt = approvalsRemote, true
-		case KindCursor:
-			// cursor's own hook scripts push its turn boundaries, tool calls and messages
-			// into the hub (watch_cursor.go), which is a normalized message feed — and its
-			// composer anchor gates POST /input exactly as codex's does. `gated` (not
-			// `turn`) because the delivery is still the pane: cursor has no protocol to
-			// take a whole turn through. approvals stays "tui": there is nothing the hub
-			// can honor remotely, only the pane-anchor signal that the TUI is asking.
-			kf.Feed, kf.Input = "messages", inputModeGated
 		}
 		// watch is the deprecated spelling of feed == "messages"; derived here rather
 		// than set by hand so the two cannot drift (invariant-tested besides).

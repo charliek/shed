@@ -109,10 +109,6 @@ actor IPCHandlerImpl: IPCHandler {
         case "terminal.open":
             let p = try decodeParams(params, as: TerminalParams.self, expected: ["host", "shed", "session"])
             return try await encodeResult(terminalOpenOp(p))
-        case "rc.classify":
-            let p = try decodeParams(params, as: RcClassifyParams.self, expected: ["kind", "pane"])
-            let cls = RemoteControl.classifyPane(kind: p.kind, pane: p.pane)
-            return try encodeResult(RcClassifyResult(state: cls.state, url: cls.url))
         case "rc.list":
             let p = try decodeParams(params, as: RcListParams.self, expected: ["host", "shed"])
             return try await encodeResult(rcListOp(p))
@@ -406,7 +402,6 @@ private struct TerminalPreviewResult: Encodable, Sendable {
     let invocation: LaunchInvocation
 }
 
-private struct RcClassifyParams: Decodable { let kind: RcKind; let pane: String }
 private struct RcListParams: Decodable { let host: String?; let shed: String? }
 private struct RcKillParams: Decodable { let host: String?; let shed: String; let slug: String }
 
@@ -436,7 +431,6 @@ private struct RcLaunchParams: Decodable {
 }
 
 private struct RcListResult: Encodable, Sendable { let sessions: [RcSession] }
-private struct RcClassifyResult: Encodable, Sendable { let state: RcState; let url: String? }
 
 /// Test-only: inject a session (managed or legacy) into the table for an e2e
 /// screenshot. Only `shed` + `slug` are required; the rest default (applied in

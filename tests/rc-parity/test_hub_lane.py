@@ -8,42 +8,20 @@ import json
 
 import pytest
 
-from fake_opencode import FakeOpencode
+from hub_opencode import OC_SID, lane_session
 from normalize import masked_feed_rows
 
 pytestmark = pytest.mark.hub
 
 OC_SLUG = "lane11"
-OC_SID = "ses_hubparity0000000000000001"
 JSON_HEADERS = {"Content-Type": "application/json"}
 
 
 def _lane(leg, fakes):
-    """Create the opencode session, bind the fake on the engine-allocated
-    port, pin via a directory-matched session.created, and wait for the pin's
-    back-write — the proof the watcher is attached and addressable."""
-    res = leg.run(
-        "create", "--kind", "opencode", "--slug", OC_SLUG, "--name", "hub-lane"
-    )
-    assert res.returncode == 0, f"{leg.impl}: create: {res.stderr}"
-    env = leg.session_env(f"rc-{OC_SLUG}")
-    port = int(env["SHED_RC_OPENCODE_PORT"])
-    workdir = env["SHED_RC_WORKDIR"]
-
-    fake = FakeOpencode(port)
-    # Registered BEFORE any polling: a pin-wait timeout must not leak the
-    # bound server (and its port) for the rest of the session.
-    fakes.append(fake)
-    fake.pin = OC_SID
-    fake.stream_session_created(OC_SID, workdir)
-
-    def pinned():
-        got = leg.session_env(f"rc-{OC_SLUG}").get("SHED_RC_AGENT_SESSION")
-        return got if got == OC_SID else None
-
-    leg.wait_hub("the opencode pin was never back-written", pinned, timeout=20)
-    leg.wait_tracked(OC_SLUG)
-    return fake
+    """This family's spelling of the shared opencode-lane setup
+    (`hub_opencode.lane_session`), which the snapshot and SSE families now
+    share."""
+    return lane_session(leg, fakes, OC_SLUG, "hub-lane")
 
 
 def test_lane_verbs_round_trip(hub_differential, hub_leg, request):

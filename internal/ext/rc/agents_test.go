@@ -16,9 +16,6 @@ func TestSpecForKindResolvesEveryKind(t *testing.T) {
 		if spec.InnerCommand == nil {
 			t.Errorf("spec for %q has nil InnerCommand", k)
 		}
-		if spec.Classify == nil {
-			t.Errorf("spec for %q has nil Classify", k)
-		}
 		if spec.Tool == "" {
 			t.Errorf("spec for %q has empty Tool", k)
 		}

@@ -300,103 +300,9 @@ func TestMessageRingConcurrentAppendRead(t *testing.T) {
 	wg.Wait()
 }
 
-// ---- codex fold → normalized message sequence (golden-ish against the fixture) ----
-
-func TestCodexFoldMessageMapping(t *testing.T) {
-	lines := readJSONL(t, "testdata/jsonl/codex_turn.jsonl")
-	f := newCodexFold()
-	var msgs []feedMessage
-	for _, ln := range lines {
-		f.applyLine(ln)
-		msgs = append(msgs, f.drainMessages()...)
-	}
-
-	type want struct {
-		role, typ, toolName string
-		textHas             string
-	}
-	// The turn in stream order: user prompt → assistant commentary (emitted — an
-	// interim message must never be lost) → tool_use(exec) → tool_result(exec). The
-	// final_answer's text is identical to the already-emitted commentary, so the
-	// text de-dup skips it; the response_item mirrors and the encrypted reasoning
-	// (no summary text) emit nothing.
-	wants := []want{
-		{feedRoleUser, feedTypeText, "", "what is 2+2"},
-		{feedRoleAssistant, feedTypeText, "", "2+2 equals 4."},
-		{feedRoleTool, feedTypeToolUse, "exec", ""},
-		{feedRoleTool, feedTypeToolResult, "exec", ""},
-	}
-	if len(msgs) != len(wants) {
-		t.Fatalf("produced %d messages, want %d: %s", len(msgs), len(wants), describeMsgs(msgs))
-	}
-	for i, w := range wants {
-		m := msgs[i]
-		if m.Role != w.role || m.Type != w.typ {
-			t.Errorf("msg[%d] role/type = %s/%s, want %s/%s", i, m.Role, m.Type, w.role, w.typ)
-		}
-		if w.toolName != "" && (m.Tool == nil || m.Tool.Name != w.toolName) {
-			t.Errorf("msg[%d] tool = %+v, want name %q", i, m.Tool, w.toolName)
-		}
-		if w.textHas != "" && !strings.Contains(m.Text, w.textHas) {
-			t.Errorf("msg[%d] text = %q, want to contain %q", i, m.Text, w.textHas)
-		}
-	}
-	// The tool_use detail carries the invocation body; the tool_result detail the output.
-	if m := msgs[2]; m.Tool == nil || !strings.Contains(m.Tool.Detail, "echo hello-from-codex") {
-		t.Errorf("tool_use detail missing the command: %+v", m.Tool)
-	}
-	if m := msgs[3]; m.Tool == nil || !strings.Contains(m.Tool.Detail, "hello-from-codex") {
-		t.Errorf("tool_result detail missing the output: %+v", m.Tool)
-	}
-	// ts flows through from the rollout line (not stamped by the clock here).
-	if !strings.HasPrefix(msgs[0].TS, "2026-07-11T") {
-		t.Errorf("message ts = %q, want the rollout line timestamp", msgs[0].TS)
-	}
-}
-
-// Assistant-message de-dup is by TEXT, not by phase: a commentary whose text differs
-// from the final_answer is a real interim message (a preamble between tool calls, or
-// the only assistant output of an interrupted turn) and BOTH rows are emitted; a
-// final_answer identical to the immediately-preceding emitted commentary is codex's
-// settled-text mirror and is skipped.
-func TestCodexFoldAssistantTextDedup(t *testing.T) {
-	line := func(phase, msg string) []byte {
-		return []byte(`{"type":"event_msg","payload":{"type":"agent_message","phase":"` +
-			phase + `","message":"` + msg + `"}}`)
-	}
-
-	// commentary ≠ final: both emitted, in order.
-	f := newCodexFold()
-	f.applyLine(line("commentary", "Let me check the tests first."))
-	f.applyLine(line("final_answer", "All tests pass."))
-	msgs := f.drainMessages()
-	if len(msgs) != 2 || msgs[0].Text != "Let me check the tests first." || msgs[1].Text != "All tests pass." {
-		t.Fatalf("distinct commentary+final must both emit, got %s", describeTexts(msgs))
-	}
-
-	// commentary == final: one message.
-	f2 := newCodexFold()
-	f2.applyLine(line("commentary", "4."))
-	f2.applyLine(line("final_answer", "4."))
-	if msgs := f2.drainMessages(); len(msgs) != 1 || msgs[0].Text != "4." {
-		t.Fatalf("identical commentary+final must emit once, got %s", describeTexts(msgs))
-	}
-
-	// An interrupted turn (commentary only, no final_answer) still has its message.
-	f3 := newCodexFold()
-	f3.applyLine(line("commentary", "Starting the refactor now."))
-	if msgs := f3.drainMessages(); len(msgs) != 1 {
-		t.Fatalf("a commentary-only turn must emit its message, got %s", describeTexts(msgs))
-	}
-}
-
-func describeTexts(msgs []feedMessage) string {
-	var parts []string
-	for _, m := range msgs {
-		parts = append(parts, m.Text)
-	}
-	return strings.Join(parts, " | ")
-}
+// The codex fold section that lived here (its message-mapping and assistant-text-dedup
+// cells, driven off testdata/jsonl/codex_turn.jsonl) went with the codex rollout tail
+// in A6 (charliek/shed#322).
 
 // A since cursor beyond the ring's latest seq (a previous incarnation's cursor — the
 // hub restarted or the session was recreated, restarting seq at 1) must report
@@ -430,55 +336,25 @@ func TestMessageRingSinceBeyondTailTruncated(t *testing.T) {
 	}
 }
 
-// The gated feed-input surface is DERIVED from kind_features (input == "gated"), not
-// from a hardcoded kind list — the drift hazard the derivation removed. TWO kinds qualify
-// now: codex and cursor (whose hook feed made it steerable from a phone — the whole point
-// of gating it). opencode moved to the whole-turn lane (input == "turn"), which supersedes
-// gating, and every other kind advertises no feed input at all.
-func TestInputGatedKindDerivedFromCapabilities(t *testing.T) {
+// A6 (charliek/shed#322) removed the `gated` input mode entirely: no kind advertises
+// it, so the derivation this used to pin has one live value left. opencode carries the
+// whole-turn lane (input == "turn"); every other kind advertises no feed input at all,
+// and POST /input answers 409 not_accepting for all of them (hub_input_test.go).
+func TestNoKindAdvertisesGatedInput(t *testing.T) {
 	kf := kindFeatures()
-	for _, k := range allKinds {
-		want := k == KindCodex || k == KindCursor
-		t.Run(string(k), func(t *testing.T) {
-			if got := kf[k].Input == inputModeGated; got != want {
-				t.Errorf("kind_features[%q].Input = %q, gated = %v, want gated = %v", k, kf[k].Input, got, want)
-			}
-		})
+	for k, row := range kf {
+		if row.Input == "gated" {
+			t.Errorf("kind_features[%q].input = \"gated\"; the gated lane is gone", k)
+		}
 	}
 	if kf[KindOpencode].Input != inputModeTurn {
-		t.Errorf("opencode input = %q, want %q (the turn lane supersedes gating)", kf[KindOpencode].Input, inputModeTurn)
+		t.Errorf("opencode input = %q, want %q (the turn lane is the only input surface left)", kf[KindOpencode].Input, inputModeTurn)
 	}
-}
-
-// A closed watcher's refresh is a terminal no-op: it must not reopen the file from
-// offset 0 (full re-read + leaked handle) or refold a dead incarnation's history.
-func TestFileWatcherClosedRefreshNoop(t *testing.T) {
-	dir := t.TempDir()
-	path := dir + "/rollout.jsonl"
-	writeFile(t, path, `{"type":"event_msg","payload":{"type":"task_started"}}`+"\n")
-
-	w := newFileWatcher(path, true, newCodexFold())
-	now := ringClock
-	w.refresh(now)
-	if act, _, _, _ := w.snapshot(now); act != ActivityWorking {
-		t.Fatalf("precondition: activity = %q, want working", act)
+	for _, k := range []Kind{KindCodex, KindCursor, KindClaudeRC} {
+		if got := kf[k].Input; got != "" {
+			t.Errorf("kind_features[%q].input = %q, want \"\"", k, got)
+		}
 	}
-
-	w.close()
-
-	// New content lands after close; a refresh must ignore it entirely.
-	appendFile(t, path, `{"type":"event_msg","payload":{"type":"task_complete","last_agent_message":"done"}}`+"\n")
-	w.refresh(now.Add(time.Second))
-	if act, _, _, _ := w.snapshot(now.Add(time.Second)); act != ActivityWorking {
-		t.Fatalf("closed watcher folded new lines: activity = %q", act)
-	}
-	if w.tailer.f != nil {
-		t.Fatal("closed watcher reopened its file handle")
-	}
-	if msgs := w.drainPending(); len(msgs) != 0 {
-		t.Fatalf("closed watcher produced feed messages: %v", msgs)
-	}
-	w.close() // idempotent
 }
 
 func seqsOf(msgs []feedMessage) []uint64 {
@@ -487,16 +363,4 @@ func seqsOf(msgs []feedMessage) []uint64 {
 		out[i] = m.Seq
 	}
 	return out
-}
-
-func describeMsgs(msgs []feedMessage) string {
-	var b strings.Builder
-	for _, m := range msgs {
-		b.WriteString(m.Role + "/" + m.Type)
-		if m.Tool != nil {
-			b.WriteString("(" + m.Tool.Name + ")")
-		}
-		b.WriteString("  ")
-	}
-	return b.String()
 }

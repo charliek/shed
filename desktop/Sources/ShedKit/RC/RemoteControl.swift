@@ -119,17 +119,6 @@ public enum RcState: String, Codable, Sendable, Equatable {
     case dead
 }
 
-/// A pane-derived (state, url). The live RC path takes state/url from the binary's
-/// DTO; this type backs the pure `rc.classify` IPC utility.
-public struct RcClassification: Sendable, Equatable {
-    public let state: RcState
-    public let url: String?
-    public init(state: RcState, url: String? = nil) {
-        self.state = state
-        self.url = url
-    }
-}
-
 /// The machine-readable state of an approval request (contract v2), carried by an
 /// `approval_request` feed row and — once a lane produces approvals — by a
 /// session's `pendingApprovals` snapshot. Mirrors the guest's `rc.FeedApproval`
@@ -660,55 +649,11 @@ public enum RemoteControl {
         } catch { throw RcError.failed("shed-ext-rc returned an invalid session list") }
     }
 
-    // MARK: - Pure pane classifier (backs the `rc.classify` IPC utility)
-
-    public static func classifyPane(kind: RcKind, pane: String) -> RcClassification {
-        // Trust + auth heuristics use claude-specific pane text, so they gate ONLY
-        // the claude kinds. The per-agent pane classifiers for codex/opencode/cursor
-        // are owned by the guest binary (authoritative); the client consumes the
-        // DTO's `state`, so this pure utility renders every non-claude/unknown kind
-        // neutrally.
-        let isClaude = (kind == .claudeRc || kind == .claudeBroker)
-        if isClaude {
-            if pane.contains(/Workspace not trusted/.ignoresCase()) {
-                return RcClassification(state: .needsTrust, url: extractURL(kind: kind, pane: pane))
-            }
-            if pane.contains(/Quick safety check/.ignoresCase())
-                || pane.contains(/Yes,\s*I trust this folder/.ignoresCase()) {
-                return RcClassification(state: .needsTrust, url: extractURL(kind: kind, pane: pane))
-            }
-            if pane.contains(/requires a claude\.ai subscription/.ignoresCase())
-                || pane.contains(/not logged in/.ignoresCase())
-                || pane.contains(/claude auth login/.ignoresCase()) {
-                return RcClassification(state: .needsAuth, url: extractURL(kind: kind, pane: pane))
-            }
-        }
-
-        switch kind {
-        case .claudeBroker:
-            let url = extractURL(kind: .claudeBroker, pane: pane)
-            if pane.contains(/\bReconnecting\b/) { return RcClassification(state: .reconnecting, url: url) }
-            if pane.contains(/\bConnected\b/), url != nil { return RcClassification(state: .ready, url: url) }
-            if url != nil { return RcClassification(state: .ready, url: url) }
-            return RcClassification(state: .starting)
-        case .claudeRc:
-            let url = extractURL(kind: .claudeRc, pane: pane)
-            if pane.contains(/Remote Control connecting/.ignoresCase()), url == nil {
-                return RcClassification(state: .starting)
-            }
-            if pane.contains(/Remote Control active/.ignoresCase()), url != nil {
-                return RcClassification(state: .ready, url: url)
-            }
-            if url != nil { return RcClassification(state: .ready, url: url) }
-            return RcClassification(state: .starting)
-        // Shell, the non-claude agent kinds (codex/opencode/cursor), and unknown
-        // kinds: neutral — blank is starting, anything drawn reads ready, no URL.
-        case .codex, .opencode, .cursor, .shell, .other:
-            return pane.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-                ? RcClassification(state: .starting)
-                : RcClassification(state: .ready)
-        }
-    }
+    // `RcClassification` and `classifyPane` — the pure pane classifier behind the
+    // client's pane-classifier IPC op — went with S2 (charliek/shed#324). A shed row's
+    // `state` comes off the wire from the guest (where it is liveness now) and a
+    // machine row's from roost; no client re-derives one from a pane. `extractURL`
+    // below survives: the claude.ai address is CONTROL, not status.
 
     /// Extract the claude.ai URL for the given kind (claude-broker uses
     /// `?environment=env_…`, claude-rc uses `/session_…`); no URL for other kinds.

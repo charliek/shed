@@ -235,10 +235,15 @@ impl RcState {
 /// A session's live *work* dimension, orthogonal to the lifecycle [`RcState`].
 /// Derived live by the rc hub and reported additively inside a session's `rc`
 /// block. Mirrors the guest's `rc.Activity` (`internal/ext/rc/activity.go`) and
-/// mobile's `RcActivity` (`rc_models.dart:125-147`): `working` (producing
-/// output), `needs_input` (idle at a prompt anchor), `needs_approval` (blocked
-/// on an approval the user must answer), `idle` (quiescent), and `unknown` (live
-/// but indeterminate).
+/// mobile's `RcActivity` (`rc_models.dart:125-147`): `working` (a turn or tool
+/// call in flight), `needs_input` (opencode's last turn boundary was idle,
+/// waiting for the next prompt — there is no prompt-anchor pane match any
+/// more), `needs_approval` (blocked on an approval the user must answer),
+/// `idle` (a settled "nothing pending" verdict, reserved in the vocabulary —
+/// no current producer emits it), and `unknown` (live but indeterminate).
+/// opencode is the only producer since A5/A6/S2
+/// (`charliek/shed#321`/`#322`/`#324`) retired the claude/codex tails and the
+/// pane-stability engine that used to fill this dimension for every kind.
 ///
 /// Deliberately NO `Other(String)` case (unlike [`RcKind`]'s unknown-kind
 /// policy): an UNRECOGNIZED token — any future value — maps to
@@ -292,14 +297,6 @@ impl<'de> Deserialize<'de> for RcActivity {
     fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
         Ok(RcActivity::from_wire(&String::deserialize(d)?))
     }
-}
-
-/// A pane-derived `(state, url)` — backs the pure `rc.classify` IPC utility.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct RcClassification {
-    pub state: RcState,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub url: Option<String>,
 }
 
 /// A binary-domain outcome, distinguished from an SSH transport failure by the
@@ -462,25 +459,34 @@ pub struct RcAgentInfo {
 /// `rc.KindFeatures` and mobile's `KindFeatures` (`rc_capabilities.dart:116-144`):
 /// `post_input` reports whether a typed line reaches the pane, `approvals` is
 /// where approvals surface (`"tui"` — answered in the terminal; `"remote"` —
-/// answered through the hub's `POST /approvals/{id}` verb, opencode today).
+/// answered through the hub's `POST /approvals/{id}` verb, opencode today;
+/// `"none"` — nowhere a client can reach, which no guest emits and shed's
+/// synthesized roost capabilities do, see [`crate::roost::roost_capabilities`]).
 ///
-/// `watch` and `input` are additive hub hints (the feed kinds — codex and
-/// opencode — carry them; absent → `false` / `""`): `watch` reports whether the
-/// hub produces a live message feed for the kind (`GET /messages` +
-/// `message.appended`), and `input` is the feed-input posting **mode string**,
-/// single-valued — `"gated"` means `POST /input` is accepted only while the
-/// session is waiting, `"turn"` means the lane takes whole turns through `POST
-/// /turn` (and `/input` no longer applies — opencode today), `""` means no feed
-/// input at all. Note
-/// the distinction from the adjacent `post_input`: `post_input` is the
-/// typed-input *capability* bool (a typed line reaches the pane over the
-/// TUI-only path), while `input` is the *gating mode* of the separate feed-input
-/// channel — a kind can have `post_input: true` with no feed input at all.
+/// `watch` and `input` are additive hub hints (opencode's lane carries them;
+/// absent → `false` / `""` for every other kind — claude-rc, codex and cursor
+/// have had no hub-derived feed since A6/S2, `charliek/shed#322`/`#324`
+/// retired their producers): `watch` reports whether the hub produces a live
+/// message feed for the kind (`GET /messages` + `message.appended`), and
+/// `input` is the feed-input posting **mode string**, single-valued —
+/// `"turn"` means the lane takes whole turns through `POST /turn` (opencode;
+/// `/input` does not apply to it), `""` means no feed input at all (every
+/// other kind). A third value, `"gated"`, meant `POST /input` was accepted
+/// only while the session was waiting; it was retired with the codex and
+/// cursor lanes (A6) and no kind carries it any more — `POST /input` answers
+/// `409 not_accepting` for every kind. Note the distinction from the adjacent
+/// `post_input`: `post_input` is the typed-input *capability* bool (a typed
+/// line reaches the pane over the TUI-only path), while `input` is the
+/// *gating mode* of the separate feed-input channel — a kind can have
+/// `post_input: true` with no feed input at all.
 ///
 /// Contract v2 adds three more (again serde-default, so a v1/v3 payload decodes
 /// unchanged): `feed` is what the hub can stream for the kind (`"messages"` — a
-/// normalized conversation feed; `"activity"` — the activity dimension only;
-/// `"none"`), `interrupt` reports the `turn/interrupt` verb (true for opencode,
+/// normalized conversation feed, opencode only today; `"activity"` — the
+/// activity dimension only, no message feed, reserved for a kind with an
+/// activity producer and no feed — none does today; `"none"` — no hub signal
+/// at all, claude-rc/codex/cursor since A6/S2 retired their producers),
+/// `interrupt` reports the `turn/interrupt` verb (true for opencode,
 /// false elsewhere), and `attach` is how a terminal reaches the session (`"tmux"`,
 /// `"native-remote"`, `"none"`). **`watch` is DEPRECATED by `feed`** — the guest
 /// holds `watch == (feed == "messages")` in lockstep (invariant-tested on the
@@ -527,9 +533,12 @@ fn is_false(b: &bool) -> bool {
 }
 
 impl RcKindFeatures {
-    /// Whether feed input is gated (`input == "gated"`) — a watch view's input
-    /// bar is only ever enabled for a gated kind waiting for input. Mirrors
-    /// mobile's `KindFeatures.inputGated` (`rc_capabilities.dart:136`).
+    /// Whether feed input is gated (`input == "gated"`). No kind advertises
+    /// `"gated"` any more — it was retired with the codex and cursor lanes
+    /// (A6, `charliek/shed#322`); this decoder stays only because the wire may
+    /// still carry the value from an older guest, and a client must decode it
+    /// without erroring. Mirrors mobile's `KindFeatures.inputGated`
+    /// (`rc_capabilities.dart:136`).
     pub fn input_gated(&self) -> bool {
         self.input == "gated"
     }
@@ -1212,9 +1221,11 @@ pub fn decode_list_response(stdout: &str) -> Result<RcSessionListDto, RcError> {
 
 // ---- rc hub messages feed ----
 //
-// The codex message feed served by the rc hub through the server proxy
+// The message feed served by the rc hub through the server proxy
 // (`GET /api/sheds/{name}/rc/v1/sessions/{slug}/messages`,
-// `internal/api/rchub.go:280-375`). Mirrors the guest's `feedMessage` /
+// `internal/api/rchub.go:280-375`) — opencode's lane only since A6/S2
+// (`charliek/shed#322`/`#324`) retired the codex and claude tails that used to
+// share this route. Mirrors the guest's `feedMessage` /
 // `hubMessagesResponse` (`internal/ext/rc/hub_messages.go:44-201`,
 // handler `hub.go:332-385`) and mobile's decoder (`rc_feed.dart`): each
 // message is already hub-sanitized (ANSI/control-stripped, per-field capped),
@@ -1470,94 +1481,20 @@ pub fn ssh_argv(
     argv
 }
 
-// ---- pure pane classifier ----
+// ---- the claude.ai remote-control URL ----
+//
+// S2 (charliek/shed#324) deleted this file's claude-only pane classifier and the
+// client-side classifier IPC op it backed. A shed row's `state` comes off the
+// wire from the guest (where it is now liveness) and a machine row's from roost;
+// no client re-derives one from a pane. The URL regexes survive because the
+// claude.ai address IS control — `rc_agents::parse_session` re-exports
+// [`extract_url`] and reads it out of every claude capture.
 
-static RE_TRUST_FOLDER: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(?i)Yes,\s*I trust this folder").unwrap());
-static RE_RECONNECTING: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"\bReconnecting\b").unwrap());
 static RE_URL_BROKER: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"https?://claude\.ai/code\?environment=env_[A-Za-z0-9_-]+").unwrap()
 });
 static RE_URL_SESSION: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"https?://claude\.ai/code/session_[A-Za-z0-9_-]+").unwrap());
-
-/// Classify a tmux pane capture into a session state (+ url). Mirrors Swift's
-/// `RemoteControl.classifyPane`. The pane's status words (`connecting`/`active`/
-/// `Connected`) are informational: the extracted claude.ai URL is the actual
-/// "ready" signal (as in Swift, where a bare URL already means ready regardless
-/// of the banner text), so only the trust/auth heuristics + the broker
-/// `Reconnecting` state gate the outcome. The pane is lowercased once for the
-/// case-insensitive substring checks.
-pub fn classify_pane(kind: &RcKind, pane: &str) -> RcClassification {
-    let is_claude = matches!(kind, RcKind::ClaudeRc | RcKind::ClaudeBroker);
-    // Trust + auth heuristics use claude-specific pane text, so they gate ONLY the
-    // claude kinds. The per-agent pane classifiers for codex/opencode/cursor are
-    // owned by the guest binary (`internal/ext/rc/agents.go`), authoritative over
-    // the client — clients consume the DTO's `state`; this pure classifier stays a
-    // best-effort utility and renders every non-claude/unknown kind neutrally.
-    if is_claude {
-        let lower = pane.to_lowercase();
-        if lower.contains("workspace not trusted")
-            || lower.contains("quick safety check")
-            || RE_TRUST_FOLDER.is_match(pane)
-        {
-            return RcClassification {
-                state: RcState::NeedsTrust,
-                url: extract_url(kind, pane),
-            };
-        }
-        if lower.contains("requires a claude.ai subscription")
-            || lower.contains("not logged in")
-            || lower.contains("claude auth login")
-        {
-            return RcClassification {
-                state: RcState::NeedsAuth,
-                url: extract_url(kind, pane),
-            };
-        }
-    }
-
-    match kind {
-        RcKind::ClaudeBroker => {
-            let url = extract_url(&RcKind::ClaudeBroker, pane);
-            // Reconnecting takes precedence over a (possibly stale) url — Swift parity.
-            if RE_RECONNECTING.is_match(pane) {
-                return RcClassification {
-                    state: RcState::Reconnecting,
-                    url,
-                };
-            }
-            classify_by_url(url)
-        }
-        RcKind::ClaudeRc => classify_by_url(extract_url(&RcKind::ClaudeRc, pane)),
-        // Shell, the non-claude agent kinds (codex/opencode/cursor), and unknown
-        // kinds: neutral — blank pane is still starting, anything drawn reads ready,
-        // and no claude URL is attached (the guest owns the real per-agent states).
-        _ => RcClassification {
-            state: if pane.trim().is_empty() {
-                RcState::Starting
-            } else {
-                RcState::Ready
-            },
-            url: None,
-        },
-    }
-}
-
-/// A present url means ready; its absence means still starting.
-fn classify_by_url(url: Option<String>) -> RcClassification {
-    match url {
-        Some(u) => RcClassification {
-            state: RcState::Ready,
-            url: Some(u),
-        },
-        None => RcClassification {
-            state: RcState::Starting,
-            url: None,
-        },
-    }
-}
 
 /// Extract the claude.ai URL for the given kind (broker uses `?environment=env_…`,
 /// claude-rc uses `/session_…`).
@@ -1574,96 +1511,52 @@ pub fn extract_url(kind: &RcKind, pane: &str) -> Option<String> {
 mod tests {
     use super::*;
 
-    // ---- classifier (mirrors test_agents.py) ----
+    // ---- the claude.ai control URL ----
+    //
+    // S2 (charliek/shed#324) removed the `classify_*` cells that lived here with
+    // the classifier itself. What they were really pinning about the CLAUDE kinds
+    // — that a broker pane yields an `?environment=env_…` URL and a claude-rc pane
+    // a `/session_…` one, and that neither leaks into the other — is exactly what
+    // these keep.
 
     #[test]
-    fn classify_broker_ready_with_environment_url() {
-        let pane = "·✔︎· Connected\nContinue at https://claude.ai/code?environment=env_01ABC";
-        let c = classify_pane(&RcKind::ClaudeBroker, pane);
-        assert_eq!(c.state, RcState::Ready);
+    fn extract_url_is_kind_specific() {
+        let broker_pane = "·✔︎· Connected\nContinue at https://claude.ai/code?environment=env_01ABC";
+        let rc_pane = "Remote Control active\nhttps://claude.ai/code/session_XYZ789";
         assert_eq!(
-            c.url.as_deref(),
+            extract_url(&RcKind::ClaudeBroker, broker_pane).as_deref(),
             Some("https://claude.ai/code?environment=env_01ABC")
         );
-    }
-
-    #[test]
-    fn classify_repl_needs_trust() {
-        let c = classify_pane(
-            &RcKind::ClaudeRc,
-            "Quick safety check: Is this a project you trust?",
+        assert_eq!(
+            extract_url(&RcKind::ClaudeRc, rc_pane).as_deref(),
+            Some("https://claude.ai/code/session_XYZ789")
         );
-        assert_eq!(c.state, RcState::NeedsTrust);
+        // Neither kind picks up the other's URL shape.
+        assert_eq!(extract_url(&RcKind::ClaudeBroker, rc_pane), None);
+        assert_eq!(extract_url(&RcKind::ClaudeRc, broker_pane), None);
     }
 
     #[test]
-    fn classify_trust_folder_button_needs_trust() {
-        let c = classify_pane(&RcKind::ClaudeRc, "  Yes,  I trust this folder  ");
-        assert_eq!(c.state, RcState::NeedsTrust);
-    }
-
-    #[test]
-    fn classify_needs_auth() {
-        for pane in [
-            "not logged in",
-            "run claude auth login",
-            "requires a claude.ai subscription",
+    fn extract_url_is_none_for_every_other_kind() {
+        let pane = "https://claude.ai/code/session_XYZ789 https://claude.ai/code?environment=env_1";
+        for kind in [
+            RcKind::Codex,
+            RcKind::Opencode,
+            RcKind::Cursor,
+            RcKind::Shell,
+            RcKind::Other("borg".into()),
         ] {
-            assert_eq!(
-                classify_pane(&RcKind::ClaudeRc, pane).state,
-                RcState::NeedsAuth
-            );
+            assert_eq!(extract_url(&kind, pane), None, "kind {kind:?}");
         }
     }
 
     #[test]
-    fn classify_broker_reconnecting_no_url() {
-        let c = classify_pane(&RcKind::ClaudeBroker, "·|· Reconnecting · retrying in 2.5s");
-        assert_eq!(c.state, RcState::Reconnecting);
-        assert!(c.url.is_none());
-    }
-
-    #[test]
-    fn classify_rc_ready_with_session_url() {
-        let pane = "Remote Control active\nhttps://claude.ai/code/session_XYZ789";
-        let c = classify_pane(&RcKind::ClaudeRc, pane);
-        assert_eq!(c.state, RcState::Ready);
+    fn extract_url_is_none_without_one() {
         assert_eq!(
-            c.url.as_deref(),
-            Some("https://claude.ai/code/session_XYZ789")
+            extract_url(&RcKind::ClaudeRc, "Remote Control connecting…"),
+            None
         );
-    }
-
-    #[test]
-    fn classify_rc_connecting_is_starting() {
-        let c = classify_pane(&RcKind::ClaudeRc, "Remote Control connecting…");
-        assert_eq!(c.state, RcState::Starting);
-        assert!(c.url.is_none());
-    }
-
-    #[test]
-    fn classify_shell_empty_vs_content() {
-        assert_eq!(
-            classify_pane(&RcKind::Shell, "   \n ").state,
-            RcState::Starting
-        );
-        assert_eq!(classify_pane(&RcKind::Shell, "$ ls").state, RcState::Ready);
-        // A shell never runs the trust/auth heuristics.
-        assert_eq!(
-            classify_pane(&RcKind::Shell, "not logged in").state,
-            RcState::Ready
-        );
-    }
-
-    #[test]
-    fn classification_serializes_state_kebab_and_omits_none_url() {
-        let j = serde_json::to_value(RcClassification {
-            state: RcState::NeedsTrust,
-            url: None,
-        })
-        .unwrap();
-        assert_eq!(j["state"], "needs-trust");
-        assert!(j.get("url").is_none());
+        assert_eq!(extract_url(&RcKind::ClaudeBroker, ""), None);
     }
 
     // ---- guest-text sanitization ----
@@ -2853,10 +2746,8 @@ mod tests {
         // Round-trips as its raw string, and gets no synthetic claude URL.
         assert_eq!(serde_json::to_value(&k).unwrap(), "borg");
         assert_eq!(synthetic_url(&k, "abc"), None);
-        // A pane classifies neutrally — no claude URL even if the pane contains one.
-        let c = classify_pane(&k, "https://claude.ai/code/session_X");
-        assert_eq!(c.state, RcState::Ready);
-        assert!(c.url.is_none());
+        // A pane yields it no claude URL either, even one containing one.
+        assert_eq!(extract_url(&k, "https://claude.ai/code/session_X"), None);
     }
 
     #[test]

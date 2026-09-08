@@ -23,7 +23,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
 
 use shed_core::models::Shed;
-use shed_core::rc::{self, RcCapabilities, RcClassification, RcError, RcKind, RcSession, RcState};
+use shed_core::rc::{self, RcCapabilities, RcError, RcKind, RcSession, RcState};
 
 use crate::backend::RcTarget;
 use crate::traits::{system_clock, ClockRef};
@@ -203,10 +203,10 @@ impl RcService {
         }
     }
 
-    /// The pure pane classifier (backs the `rc.classify` IPC utility).
-    pub fn classify(&self, kind: &RcKind, pane: &str) -> RcClassification {
-        rc::classify_pane(kind, pane)
-    }
+    // `RcService::classify` — the pure pane classifier behind the client's
+    // pane-classifier IPC op — went with S2 (charliek/shed#324). A shed row's
+    // `state` comes off the wire from the guest (where it is liveness now) and a
+    // machine row's from roost; no client re-derives one from a pane.
 
     /// Launch an RC session in `shed` on `target`. Validates the name/workdir/prompt
     /// (before the test-mode branch, so the hermetic harness exercises it), then

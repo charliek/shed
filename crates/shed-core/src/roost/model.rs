@@ -26,7 +26,7 @@
 //! write. Nothing in this file looks at terminal output. That is the whole point
 //! of the pivot.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use roost_ipc::agent::{AgentLifecycle, Ownership, ShellState};
 use roost_ipc::messages::{Project, SessionIdentify, Tab, TabListResult};
@@ -194,12 +194,17 @@ impl RoostSession {
     /// not-live member, and a tab that stops existing leaves the list rather than
     /// turning into a dead row.
     ///
-    /// `activity_at` follows `ownership.last_event_at` alone — it is present
-    /// whenever roost has stamped one, including in the single case where
-    /// `activity` itself is absent (`inactive` mid-process): the timestamp is
-    /// still a true fact about the last accepted report.
+    /// `activity_at` is `ownership.last_event_at`, **paired with `activity`**:
+    /// the shared DTO defines it as "when the activity was last derived" and
+    /// requires it absent when the activity is ([`RcSessionDto::activity_at`]),
+    /// and rc-parity's normalizer enforces that pairing on hub rows. The one
+    /// case that would otherwise emit a lone timestamp is `inactive`
+    /// mid-foreground-process, where roost has stamped a `last_event_at` but
+    /// shed deliberately claims no activity — so the timestamp goes with the
+    /// claim it dates rather than standing on its own.
     pub fn to_rc_dto(&self) -> RcSessionDto {
         let ownership = self.ownership.as_ref();
+        let activity = self.activity();
         RcSessionDto {
             slug: self.tab_id.to_string(),
             tmux_session: String::new(),
@@ -219,8 +224,9 @@ impl RoostSession {
             created_by: None,
             created_at: Some(rfc3339_z(self.created_at)),
             target_label: None,
-            activity: self.activity(),
+            activity,
             activity_at: ownership
+                .filter(|_| activity.is_some())
                 .filter(|o| o.last_event_at > 0)
                 .map(|o| rfc3339_z(o.last_event_at)),
             last_message: None,
@@ -306,6 +312,32 @@ impl RoostInventory {
     pub fn to_rc_dtos(&self) -> Vec<RcSessionDto> {
         self.sessions.iter().map(RoostSession::to_rc_dto).collect()
     }
+
+    /// Every tab id this inventory knows about — the listed rows **and** the
+    /// hidden tabs.
+    ///
+    /// The hidden half is otherwise private, and deliberately so: it is a fold
+    /// implementation detail, not a row set. What a client legitimately needs
+    /// from it is EXISTENCE — "does this daemon still have a tab with this id" —
+    /// because a client may be carrying a row of its own for a tab it just
+    /// opened, before any adapter has claimed it (the Tauri client's optimistic
+    /// insert). This pair answers that and nothing else.
+    pub fn known_tab_ids(&self) -> BTreeSet<i64> {
+        self.sessions
+            .iter()
+            .chain(self.hidden.iter())
+            .map(|s| s.tab_id)
+            .collect()
+    }
+
+    /// Whether this inventory still knows `tab_id` at all — as a row or as a
+    /// hidden tab. See [`RoostInventory::known_tab_ids`].
+    pub fn knows(&self, tab_id: i64) -> bool {
+        self.sessions
+            .iter()
+            .chain(self.hidden.iter())
+            .any(|s| s.tab_id == tab_id)
+    }
 }
 
 /// The capabilities shed **synthesizes** for a roost-backed host.
@@ -314,9 +346,9 @@ impl RoostInventory {
 /// agent, it is a terminal multiplexer with agent adapters. So the client states
 /// the contract itself, and states it honestly — for M1 a roost row can be
 /// listed, launched and closed, and nothing else. Everything the RC hub used to
-/// offer for a machine (feed, typed input, approvals, interrupt) is `false`/empty
-/// here, which is exactly what makes the existing per-feature gates in both
-/// clients hide those controls with no new UI conditionals.
+/// offer for a machine (feed, typed input, approvals, interrupt) is off here,
+/// which is exactly what makes the existing per-feature gates in both clients
+/// hide those controls with no new UI conditionals.
 ///
 /// `attach` is [`ATTACH_NATIVE_REMOTE`]: the terminal belongs to roost, and a
 /// client reaches it with its own affordance (mobile's read-only `tab.dump`
@@ -364,13 +396,28 @@ pub fn roost_capabilities() -> RcCapabilities {
 
 /// The one per-kind feature set every roost kind gets. See
 /// [`roost_capabilities`].
+///
+/// **`feed` is `"none"`, not `""`.** The two are different words in the shared
+/// vocabulary ([`RcKindFeatures::feed`], `docs/extensions/rc-helper.md` § feed):
+/// an EMPTY `feed` means the field is absent because the producer predates v2,
+/// and a client falls back to `watch` and treats the row as activity-capable; a
+/// v2 producer's "no hub signal at all" value is the literal `"none"`, which
+/// `sx ls` renders as `-`. shed synthesizes these as a v2 producer
+/// (`rc_version: 2`, `contract-v2` in `features`), so it must speak v2's word.
+///
+/// `approvals` is `"none"`, a third value beside the documented `tui` | `remote`
+/// pair (recorded in rc-helper.md's field table): roost answers approvals in the
+/// tab, but shed cannot reach that tab at all, so claiming `tui` would promise an
+/// affordance no shed client has. Clients branch on `== "remote"` only, so the
+/// value is inert on the wire — it is stated here because the alternatives are
+/// both lies.
 fn roost_kind_features() -> RcKindFeatures {
     RcKindFeatures {
         post_input: false,
         approvals: "none".to_string(),
         watch: false,
         input: String::new(),
-        feed: String::new(),
+        feed: "none".to_string(),
         interrupt: false,
         attach: ATTACH_NATIVE_REMOTE.to_string(),
     }
@@ -701,6 +748,39 @@ failed   foreground_process question_asked    -> needs_input";
         assert_eq!(dto.pending_approvals, None);
     }
 
+    /// `activity_at` NEVER travels alone. The DTO defines it as the time the
+    /// activity was derived, so a row carrying a timestamp and no activity is
+    /// out of contract — and rc-parity's normalizer rejects that pairing on hub
+    /// rows. `inactive` with a foreground process is the one cell that produces
+    /// it: roost has stamped `last_event_at`, and shed still claims nothing.
+    #[test]
+    fn activity_at_is_omitted_when_there_is_no_activity() {
+        let t = tab(
+            4,
+            AgentLifecycle::Inactive,
+            ShellState::ForegroundProcess,
+            "session_idle",
+        );
+        assert!(
+            t.ownership.as_ref().unwrap().last_event_at > 0,
+            "the case is only interesting with a timestamp to suppress"
+        );
+        let dto = session_of(&t).to_rc_dto();
+        assert_eq!(dto.activity, None, "inactive mid-process claims nothing");
+        assert_eq!(dto.activity_at, None, "so its timestamp dates nothing");
+
+        // The control: the same tab at a prompt IS idle, and keeps the stamp.
+        let at_prompt = tab(
+            4,
+            AgentLifecycle::Inactive,
+            ShellState::AtPrompt,
+            "session_idle",
+        );
+        let dto = session_of(&at_prompt).to_rc_dto();
+        assert_eq!(dto.activity, Some(RcActivity::Idle));
+        assert_eq!(dto.activity_at.as_deref(), Some("2026-09-07T08:14:59Z"));
+    }
+
     #[test]
     fn activity_at_is_omitted_when_last_event_at_is_zero() {
         let mut t = tab(
@@ -832,11 +912,15 @@ failed   foreground_process question_asked    -> needs_input";
         assert_eq!(dto.created_at.as_deref(), Some("2026-09-07T08:14:27Z"));
 
         assert_eq!(inventory.revision, Some(18));
+        // The identify half is the **re-recorded** protocol-4 reply — that one
+        // embeds the generation integer, so unlike the `tab.list` recordings
+        // beside it (whose shapes are byte-identical across the R1 re-cut) it
+        // had to be taken again from a `c67ac27` daemon.
         assert_eq!(
             inventory.daemon_session_id,
-            "7771e18e3aa8102c9b60c50bc959f3c4"
+            "05124e114e2f57de4d0336f7761e7bb9"
         );
-        assert_eq!(inventory.started_at, "2026-09-07T08:14:16Z");
+        assert_eq!(inventory.started_at, "2026-09-07T17:08:49Z");
         assert_eq!(inventory.to_rc_dtos(), vec![dto]);
     }
 
@@ -925,12 +1009,18 @@ failed   foreground_process question_asked    -> needs_input";
             // The gated read every client uses — no tmux fallback must apply.
             assert_eq!(features.attach_kind(), "native-remote");
             assert!(!features.post_input);
+            // Outside the documented `tui` | `remote` pair on purpose, and
+            // recorded as such in rc-helper.md's field table — see
+            // `roost_kind_features`.
             assert_eq!(features.approvals, "none");
             assert!(!features.watch);
             assert!(!features.feed_messages());
             assert_eq!(features.input, "");
             assert!(!features.input_gated());
-            assert_eq!(features.feed, "");
+            // The v2 word for "no hub signal at all". An EMPTY feed would mean
+            // "field absent, fall back to `watch`" and would make `sx ls` render
+            // the row as activity-capable.
+            assert_eq!(features.feed, "none");
             assert!(!features.interrupt);
         }
 

@@ -8,9 +8,9 @@ import (
 )
 
 // opencodeFold folds an opencode session's /event envelope stream into an activity
-// verdict AND a normalized message feed (drainMessages), mirroring codexFold's shape.
-// Unlike codex (a tailed append-only JSONL file) opencode is a client/server model: the
-// hub subscribes to the embedded HTTP+SSE server's /event endpoint as a second client.
+// verdict AND a normalized message feed (drainMessages). opencode is a client/server
+// model: the hub subscribes to the embedded HTTP+SSE server's /event endpoint as a
+// second client, rather than tailing a file on disk.
 // This file is the PURE fold only — no network/transport (that is the opencodeWatcher in
 // watch_opencode_transport.go) and no correlation (that is correlateOpencode). The fold
 // is SESSION-SCOPED: it assumes every envelope it is handed already belongs to its
@@ -840,7 +840,8 @@ func (f *opencodeFold) activity() Activity {
 // rule) instead of expiring it after the 30 s window. needs_approval qualifies alongside
 // needs_input: an open ask is cleared only by a replied/rejected event or a reseed, never by
 // the passage of time. (A DEAD stream is the deliberate exception — see snapshot: an unhealthy
-// transport reports not-fresh and pane stability drives, so a needs_approval derived from a
+// transport reports not-fresh, and since S2 (charliek/shed#324) deleted the pane-stability
+// fallback, not-fresh now means NO activity at all — so a needs_approval derived from a
 // wedged connection cannot outlive the evidence for it.)
 func (f *opencodeFold) settled() bool {
 	switch f.activity() {

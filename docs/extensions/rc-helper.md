@@ -18,7 +18,7 @@ purpose**:
 
 Orchestrators — shed-remote-agent, shed-desktop, the `shed` CLI — invoke it over SSH
 instead of hand-building tmux commands, so every tool creates byte-compatible sessions
-and classifies them identically:
+and reads them back identically:
 
 ```bash
 ssh <shed>@<host> shed-ext-rc <command> [flags]
@@ -35,12 +35,12 @@ interactive terminal **attach** is *not* routed through it (it stays a direct
 
 | Command | Behaviour |
 |---------|-----------|
-| `create --kind <k> --name <display> [--slug s] [--workdir d] [--created-by t/v] [--target label] [--wait] [--interactive-shell] [--prompt-stdin \| --plan-stdin [--prompt-b64 <b64>]] [--permission-mode <m> \| --skip]` | Resolve the workdir (`$SHED_WORKSPACE` default), pre-seed claude trust + onboarding for `claude-*` kinds, and `tmux new-session` with the `SHED_RC_*` env. Non-blocking by default. With `--wait`, poll to `ready`, auto-accept trust (and the bypass-mode dialog for `--skip`), and deliver the kickoff. `--permission-mode`/`--skip` set the autonomy posture — see [Permission modes](#permission-modes). Prints the [session DTO](#json-output). |
+| `create --kind <k> --name <display> [--slug s] [--workdir d] [--created-by t/v] [--target label] [--wait] [--interactive-shell] [--prompt-stdin \| --plan-stdin [--prompt-b64 <b64>]] [--permission-mode <m> \| --skip]` | Resolve the workdir (`$SHED_WORKSPACE` default), pre-seed claude trust + onboarding for `claude-*` kinds, and `tmux new-session` with the `SHED_RC_*` env. Non-blocking by default. With `--wait`, poll to live, auto-accept trust (and the bypass-mode dialog for `--skip`), settle, and deliver the kickoff — see [Delivering a kickoff](#delivering-a-kickoff-liveness-settle-and-the-control-gate). `--permission-mode`/`--skip` set the autonomy posture — see [Permission modes](#permission-modes). Prints the [session DTO](#json-output). |
 | `list` | Print `{"rc_sessions":[…],"capabilities":{…}}` — every `rc-*` session's DTO plus the embedded [capabilities](#capabilities) block (one exec feeds both). |
 | `capabilities` | Print the [capabilities](#capabilities) payload standalone (kinds, per-agent install/version, features, per-kind hints). |
 | `probe --slug <s>` | Print one session DTO (state + url). Read-only. |
 | `accept-trust --slug <s>` | Re-capture the pane; if claude's workspace-trust dialog is showing, send `Enter`. |
-| `prompt --slug <s> [--session-id <uuid>]` | Deliver a single line (read from **stdin**) to a `ready` session. `--session-id` guards against a killed-and-recreated `rc-<slug>`. |
+| `prompt --slug <s> [--session-id <uuid>]` | Deliver a single line (read from **stdin**) to a live session, refusing if a trust/bypass dialog is up — see [Delivering a kickoff](#delivering-a-kickoff-liveness-settle-and-the-control-gate). `--session-id` guards against a killed-and-recreated `rc-<slug>`. |
 | `kill --slug <s>` | Kill the session (idempotent). |
 | `serve [--detach \| --foreground]` | Run the resident [RC activity hub](#the-rc-activity-hub-serve). `--detach` double-forks a background daemon and returns once its port is up; `--foreground` runs it in this process (the default when neither flag is given). Spawned on demand, self-exiting when idle. |
 | `version` | Print version. |
@@ -58,14 +58,24 @@ interactive terminal **attach** is *not* routed through it (it stays a direct
 
 `claude-rc`, `codex`, `cursor`, and `opencode` accept a typed kickoff (a prompt/plan);
 `claude-broker`'s input is its remote URL, and `shell` takes a command. Each kind's
-per-agent permission mapping, classifier, and trust/preseed behavior live in one
-registry table (`internal/ext/rc/agents.go`).
+per-agent permission mapping and trust/preseed behavior live in one registry table
+(`internal/ext/rc/agents.go`).
+
+**Status.** `claude-rc`, `codex`, and `cursor` no longer have a lifecycle classifier or
+a derived activity signal in this binary (`charliek/shed#321`, `#322`, `#324`): every
+session this binary reports carries **liveness only** (see [`state`](#json-output)
+below). A **machine** session of the same kind — a native host running
+`roost-session`, not a shed — gets its status from **roost** instead, over roost's own
+protocol, never through `shed-ext-rc`; a shed row gets the same treatment once roost
+reaches the guest (S5). The claude.ai remote-control URL is unaffected: `url` is still
+lifted out of the pane for `claude-rc`/`claude-broker` because it is **control** (the
+address a person opens to drive the session), not status.
 
 **Unknown-kind policy.** A reader that sees a `SHED_RC_KIND` it doesn't recognize
 (e.g. a session created by a newer client) **preserves the raw string** and renders it
 neutrally — name + state only, no kind-specific affordances and no synthetic claude URL.
-It does not fall back to `claude-broker`. An unknown pane classifies as a plain shell
-pane; an unknown `state` maps to `starting`.
+It does not fall back to `claude-broker`. A client decoding an unrecognized `state`
+string (forward compatibility with a future value) treats it as `starting`.
 
 ### Permission modes
 
@@ -121,6 +131,43 @@ shed-ext-rc create --kind claude-rc --name demo --wait --plan-stdin \
   --prompt-b64 "$(printf 'focus on the API layer' | base64)" < plan.md
 ```
 
+### Delivering a kickoff: liveness, settle, and the control gate
+
+`create --wait` and the one-shot `prompt` verb both write directly into a live
+session's pane — there is no classifier standing between "the session exists" and
+"type here" any more (S2, `charliek/shed#324`).
+
+**`--wait` waits for liveness, then settles.** The poller returns as soon as a pane
+capture succeeds (that is the whole of `ready` now — see [`state`](#json-output)) and,
+when there is a kickoff to deliver, keeps polling for a further **settle window (5 s)**
+measured from the later of the first successful capture and the last *successful*
+control keystroke — a trust/bypass dialog accepted late pushes the window out, but a
+keystroke that failed does not, since nothing changed on screen. One more short,
+content-blind sleep (1 s) follows before the line is typed, so a kickoff lands **at
+least 6 s** after liveness, bounded by the overall 20 s `--wait` timeout — a session
+whose settle would cross the deadline is delivered at the deadline rather than not at
+all. This is a fixed delay, not a heuristic about screen content: the honest interim
+until roost's provider script owns kickoff end-to-end (S4).
+
+**The delivery gate is control, not status.** Immediately before typing, both
+`--wait` and `prompt` re-capture the pane and refuse if claude's workspace-trust
+prompt, claude's one-time bypass-acceptance dialog, or codex's directory-trust prompt
+is still showing — a line typed into one of those answers it by accident. The check is
+**not** kind-gated (every matcher is consulted for every kind, since a look-alike
+phrase costs one retry and a missed dialog costs a run) and is the **same** helper both
+delivery paths call, so the two can never diverge on what counts as "still showing a
+dialog."
+
+**Named residual hazard, accepted until S4/A4.** Past that control gate, delivery is
+**terminal input into a live session** — the same thing typing at the attached
+terminal does. With `state` reduced to liveness, nothing here can tell a claude.ai
+login screen, a codex `auth` prompt, or an agent's own approval modal from an ordinary
+composer: only the three dialogs named above are checked. A kickoff or a `prompt`
+delivered while one of those *other* screens is up is typed into it. This is a known,
+documented trade-off, not an oversight — accepted for as long as shed derives no richer
+status than liveness. S4 (the roost provider script owning kickoff) and A4 (the
+opencode crate) are what eventually give this verb real state to gate on again.
+
 ## Capabilities
 
 `capabilities` (and the block embedded in the `list` envelope) is the discovery
@@ -138,10 +185,10 @@ version (currently **4**), decoupled from `SHED_RC_V` (metadata schema, still **
   },
   "features": ["generic-perm", "plan-stdin", "prompt-b64", "serve", "activity", "messages", "contract-v2"],
   "kind_features": {
-    "claude-rc": { "post_input": true, "approvals": "tui", "feed": "activity", "interrupt": false, "attach": "tmux" },
-    "codex": { "post_input": true, "approvals": "tui", "watch": true, "input": "gated", "feed": "messages", "interrupt": false, "attach": "tmux" },
+    "claude-rc": { "post_input": true, "approvals": "tui", "feed": "none", "interrupt": false, "attach": "tmux" },
+    "codex": { "post_input": true, "approvals": "tui", "feed": "none", "interrupt": false, "attach": "tmux" },
     "opencode": { "post_input": true, "approvals": "remote", "watch": true, "input": "turn", "feed": "messages", "interrupt": true, "attach": "tmux" },
-    "cursor": { "post_input": true, "approvals": "tui", "watch": true, "input": "gated", "feed": "messages", "interrupt": false, "attach": "tmux" }
+    "cursor": { "post_input": true, "approvals": "tui", "feed": "none", "interrupt": false, "attach": "tmux" }
   }
 }
 ```
@@ -151,7 +198,7 @@ version (currently **4**), decoupled from `SHED_RC_V` (metadata schema, still **
 | `rc_version` | Capability/protocol version. Bumped when the capability shape or a feature contract changes; **not** tied to `SHED_RC_V`. |
 | `kinds` | Every kind this binary offers (order matches the pinned wire contract). |
 | `agents` | Per-tool install probe (`command -v` + `--version`, 2 s budget). `version` omitted when not installed. |
-| `features` | Stable feature tokens — `generic-perm` (the `default`/`auto`/`skip` tri-state), `plan-stdin`, `prompt-b64`, `serve` (the on-demand rc activity hub), `activity` (the live activity dimension), `messages` (the codex/opencode/cursor message feed + gated input endpoints — per-kind availability is in `kind_features`), `contract-v2` (the v2 wire contract: `lane` on every session DTO, the `feed`/`interrupt`/`attach` hints in `kind_features`, the `turn`/`interrupt`/`approvals` hub verbs — routed and fully specified, live for opencode, `409 not_supported` for every other kind — the `approval_request` feed row, and `pending_approvals` on the session). A token is appended in the same change that ships its feature; `contract-v2` is a client's **route-existence** check — a server without it may 404 the new verbs at the mux, so a client reads the token instead of interpreting a bare 404. |
+| `features` | Stable feature tokens — `generic-perm` (the `default`/`auto`/`skip` tri-state), `plan-stdin`, `prompt-b64`, `serve` (the on-demand rc activity hub), `activity` (the live activity dimension), `messages` (the message-feed and turn/interrupt/approvals endpoints exist on this binary — per-kind availability, opencode only today, is in `kind_features`), `contract-v2` (the v2 wire contract: `lane` on every session DTO, the `feed`/`interrupt`/`attach` hints in `kind_features`, the `turn`/`interrupt`/`approvals` hub verbs — routed and fully specified, live for opencode, `409 not_supported` for every other kind — the `approval_request` feed row, and `pending_approvals` on the session). A token is appended in the same change that ships its feature; `contract-v2` is a client's **route-existence** check — a server without it may 404 the new verbs at the mux, so a client reads the token instead of interpreting a bare 404. |
 | `kind_features` | Per-kind UI hints — see [`kind_features` matrix](#kind_features-matrix) below. |
 
 The `list` envelope embeds this block as `capabilities`. It is a pointer with
@@ -172,9 +219,9 @@ today's client behavior for those two kinds.
 | Field | Meaning |
 |-------|---------|
 | `post_input` | A typed line can be delivered to the session's pane (the prompt/attach kickoff path). **Not deprecated** — nothing in contract v2 supersedes it, opencode included (the create/prompt kickoff path still uses it for a session's first prompt). |
-| `approvals` | Where approvals are answered: `tui` (in the terminal — claude-rc, codex, cursor) or `remote` (through the hub's `POST /approvals/{id}` verb — opencode, live since this block). |
+| `approvals` | Where approvals are answered: `tui` (in the terminal — claude-rc, codex, cursor), `remote` (through the hub's `POST /approvals/{id}` verb — opencode, live since this block), or `none` (nowhere a client can reach). This binary never emits `none`; the value exists for a **non-guest producer** of the same block — shed's roost-backed machine capabilities, synthesized client-side (`shed_core::roost::roost_capabilities`), where the terminal belongs to roost and no shed client can reach the tab to answer in it, so claiming `tui` would promise an affordance that does not exist. Clients branch on `== "remote"` only, so `none` and `tui` are the same non-decision to every one of them. |
 | `watch` | **Deprecated** by `feed` (superseded, not removed): retained until clients migrate. The producer holds `watch == (feed == "messages")` in lockstep, so a v1 client reading `watch` and a v2 client reading `feed` see the same thing. Absent-field fallback: a client that only knows `watch` should keep using it. |
-| `input` | Feed-input posting mode, **single-valued**: `gated` (`POST …/input` accepted unless the agent is blocked on a DECISION — codex, cursor; see [What `gated` gates](#what-gated-gates)), `turn` (the lane takes whole turns through `POST …/turn`, and `POST …/input` no longer applies — opencode), or `""` (no feed input at all — claude-rc; the TUI-only `post_input` path still applies). `turn` supersedes `gated` for a kind that has it: the two are mutually exclusive spellings of "how a client steers this kind's feed", not layered capabilities. |
+| `input` | Feed-input posting mode, **single-valued**: `turn` (the lane takes whole turns through `POST …/turn` — opencode) or `""` (no feed input at all — every other kind; the TUI-only `post_input` path still applies). A third value, `gated`, meant "`POST …/input` accepted unless the agent is blocked on a decision"; it was retired with the codex and cursor lanes (`charliek/shed#322`) and **no kind carries it any more** — `POST …/input` answers `409 not_accepting` for every kind. Clients that decode `gated` should keep doing so (an older guest may still send it) but will not see it from this binary. |
 | `feed` | What the hub can stream for the kind: `messages` (a normalized conversation feed — `GET …/messages` + `message.appended`), `activity` (the activity dimension only — no message feed), or `none` (no hub signal at all). Supersedes `watch`. |
 | `interrupt` | The `interrupt` verb is supported. `true` for opencode only; `false` elsewhere. |
 | `attach` | How a terminal reaches the session: `tmux` (attach to the rc-tmux session), `native-remote` (the agent's own remote surface), or `none`. |
@@ -183,12 +230,14 @@ Normative matrix (exhaustive — pinned by `capabilities_test.go`):
 
 | kind | post_input | approvals | watch | input | feed | interrupt | attach |
 |---|---|---|---|---|---|---|---|
-| claude-rc | true | tui | false | "" | activity | false | tmux |
-| codex | true | tui | true | gated | messages | false | tmux |
+| claude-rc | true | tui | false | "" | none | false | tmux |
+| codex | true | tui | false | "" | none | false | tmux |
 | opencode | true | remote | true | turn | messages | true | tmux |
-| cursor | true | tui | true | gated | messages | false | tmux |
+| cursor | true | tui | false | "" | none | false | tmux |
 
-opencode is the first **live** lane (§ [Contract-v2 verbs](#contract-v2-verbs-turn-interrupt-approvalsid) below): its TUI runs an embedded HTTP+SSE server the hub steers through, so whole turns, interrupts, and approvals all go through the hub instead of the pane. cursor gained a normalized `messages` feed (its own hook scripts push turn boundaries, tool calls and messages into the hub — see [Cursor hook ingestion](#cursor-hook-ingestion)) and `gated` input (its composer-anchor gate, identical in shape to codex's), but its approvals stay `tui`: cursor's hooks carry no approval-pending event, so nothing the hub receives is remotely answerable — see [`needs_approval` producers](#needs_approval-producers-per-kind) below. `"none"` is reserved for a kind with no hub signal at all (none exists yet).
+opencode is the only **live** lane (§ [Contract-v2 verbs](#contract-v2-verbs-turn-interrupt-approvalsid) below): its TUI runs an embedded HTTP+SSE server the hub steers through, so whole turns, interrupts, and approvals all go through the hub instead of the pane.
+
+Every other kind reads `feed: "none"` and `input: ""`. The claude transcript tail (`charliek/shed#321`), the codex rollout tail and the cursor hook-ingest lane (`charliek/shed#322`) were all retired, and S2 (`charliek/shed#324`) then deleted the pane-anchor mechanism that gave codex/cursor their `needs_approval` signal too: the hub derives **no signal at all** for those kinds now, so `none` — not `activity` — is the truthful value under this table's own definition of the two. They remain launchable, attachable TUI kinds; their status comes from roost rather than from the hub for a machine session, and from liveness alone for a shed session until S5. Both clients branch on `feed == "messages"` only, so the change is invisible to them, and the value flips back to a real one when roost becomes the guest's source.
 
 `feed` and `attach` carry `omitempty` but are **never** empty in this binary's own
 output (the strict golden pins them present) — the `omitempty` exists so a newer server
@@ -200,49 +249,6 @@ everywhere.
 **Client fallbacks for absent fields** (a v3 payload, or a re-emitted older guest's
 capabilities): absent `feed` → fall back to `watch`; absent `attach` → treat as `tmux`;
 absent `lane` on the session DTO → treat as `"tui"`.
-
-### What `gated` gates
-
-A `gated` kind takes a posted line **whenever the agent is not blocked on a
-decision** — including while it is working.
-
-That is not a relaxation of a safety rule; it is the rule finally matching the
-program it types into. codex and cursor are TUIs, and both accept typing at any
-time: text sent to codex mid-turn lands in its composer (the footer offers `tab
-to queue message`) and is answered as soon as the running turn ends. cursor
-behaves the same. A hub that refused those lines was stricter than the keyboard
-sitting in front of the same session, and that strictness was the single biggest
-reason a phone could not answer a question it could already see.
-
-The hazard is narrower than "the agent is busy". While an approval **modal** is
-up, keystrokes do not queue — they ANSWER. cursor's options are literally `y` /
-`tab` / `shift+tab` / `esc or n`, and Enter takes the highlighted *Run (once)*;
-codex's are numbered with `Press enter to confirm`. A sentence delivered there
-can run a command nobody approved. So `POST …/input` answers **409
-`not_accepting`** on exactly three signals, each resting on different evidence:
-
-1. the session's merged activity is `needs_approval`;
-2. the lane reports an open approval (this ignores transport health on purpose —
-   a wedged stream must not re-open the hole with a real dialog on screen, and it
-   also catches opencode QUESTIONS, which block the keyboard but never appear in
-   `pending_approvals`);
-3. the kind's approval-dialog chrome is on the **visible frame** — not the
-   scrollback, where an answered dialog lives forever, and undebounced, because
-   one frame showing a dialog is enough to refuse a keystroke.
-
-A blocking lifecycle (`needs-trust`, `needs-auth`, `dead`) is refused before any
-of that.
-
-**Named residual:** a transient widget that is not an approval — a model picker,
-a file browser — also eats keystrokes, and no anchor covers those. They appear
-because a person opened them at the TUI, which is a different situation from a
-line arriving from a phone; and the approval anchors are exhaustive over the
-decision surfaces each kind raises on its own.
-
-**For clients:** enable the input affordance for a `gated` kind whenever the
-session is not `needs_approval` and not in a blocking lifecycle. Gating the UI on
-`needs_input` alone is safe but needlessly narrow — it hides the box during
-exactly the turn a person most wants to correct.
 
 ## JSON output
 
@@ -278,8 +284,15 @@ does not discover it, cannot verify it, and it carries **no routing or
 authorization authority**. It is a label for the creator's own bookkeeping, not a
 guest-attested route; clients must never treat it as an authoritative target.
 
-`state` is one of `starting | ready | reconnecting | needs-trust | needs-auth | dead`,
-derived live from the pane (never stored). A golden fixture of this shape
+`state` is one of `starting | ready | reconnecting | needs-trust | needs-auth | dead`.
+Since S2 (`charliek/shed#324`) it is **liveness**, not a pane reading: an enumerated
+session is `ready` unconditionally, one whose tmux session is gone is simply not
+enumerated (`list`) or reported missing (`probe`), and `starting` is only the
+create-time placeholder before the first successful capture. `reconnecting` /
+`needs-trust` / `needs-auth` remain in the wire enum purely so a client can keep
+decoding an older guest's DTO — the current guest never emits them — and `dead`
+survives only as the `--wait` path's own liveness verdict (a tmux session that never
+came up). A golden fixture of this shape
 (`internal/ext/rc/testdata/rcSessionDto.golden.json`) is byte-identical to the consuming
 repos' copies and asserted to decode in each — the guard against contract drift.
 
@@ -297,9 +310,10 @@ payloads (pre-v2 binaries) omit `lane`; a client reading one treats absent as `"
 requests — the snapshot that keeps a session actionable after the feed ring evicted (or
 a hub restart lost) the `approval_request` rows that announced them. It is a
 **hub-layer** field only: the one-shot `list` path never sets it (no hub running, no
-approval state to report). Populated for opencode (lane-published, pending-only) and for
-codex/cursor while a pane-anchor episode is open; empty otherwise. `omitempty`, so its
-absence carries no meaning beyond "nothing to report." See [`needs_approval`
+approval state to report). Populated for opencode (lane-published, pending-only) only —
+every other kind has no approvals producer since A6/S2 and its `pending_approvals` is
+always empty. `omitempty`, so its absence carries no meaning beyond "nothing to
+report." See [`needs_approval`
 producers](#needs_approval-producers-per-kind) for the per-kind derivation and the
 "empty `pending_approvals` is legal" note.
 
@@ -314,20 +328,21 @@ absent when no hub is running or the kind is unsupported:
 | `last_message` | Sanitized preview of the most recent message — ANSI/control-stripped, whitespace-collapsed, truncated to ≤200 runes. |
 
 These fields are **derived and served by the RC activity hub**, documented in full
-below — including the codex/opencode message feed those previews summarize.
+below — including the opencode message feed those previews summarize.
 
 ## The RC activity hub (`serve`)
 
 `shed-ext-rc serve` runs the **RC activity hub**: a small, resident, per-shed daemon
-that tails each rc session and exposes a loopback HTTP API. It answers the question the
-lifecycle `state` cannot — *what is a usable session doing right now?* — by deriving a
-live `activity` dimension (and, for codex and opencode, a normalized message feed and
-gated input). Clients never reach it directly; the server's rc proxy and aggregate SSE
-stream are the only paths in (see [Server surfaces](#server-surfaces)).
+that watches each rc session and exposes a loopback HTTP API. It answers the question
+the lifecycle `state` cannot — *what is a usable session doing right now?* — by
+deriving a live `activity` dimension (and, for opencode only, a normalized message
+feed and remotely-answerable turns/interrupts/approvals). Clients never reach it
+directly; the server's rc proxy and aggregate SSE stream are the only paths in (see
+[Server surfaces](#server-surfaces)).
 
-The hub drives the **same** tmux/pane machinery the one-shot subcommands use, so its
-session list and classification are byte-identical to `list`; it only *overlays* the
-live activity a one-shot exec cannot observe.
+The hub enumerates the **same** tmux sessions the one-shot subcommands see, so its
+session list is byte-identical to `list`; it only *overlays* the live activity a
+one-shot exec cannot observe.
 
 > **Loopback-only — a security invariant, not a default.** The hub binds
 > `127.0.0.1:1029` and **only** `127.0.0.1`. It is unauthenticated and trusts the
@@ -364,9 +379,12 @@ live activity a one-shot exec cannot observe.
   when sessions reappear). A last-chance re-check on the way out respawns the hub if a
   `create` raced the exit, so a new session is never left unmonitored.
 - **Reconcile cadence.** The watch loop ticks every **2 s while ≥1 SSE subscriber is
-  attached**, **10 s otherwise** (plus a best-effort `fsnotify` nudge that surfaces a
-  transcript append sub-tick). So an activity transition surfaces within a couple of
-  seconds while someone is watching, at low idle cost otherwise.
+  attached**, **10 s otherwise**. A best-effort `fsnotify` nudge seam still exists for a
+  future file-backed lane, but it is dormant today — its one root (codex's rollout
+  directory) went with A6 (`charliek/shed#322`), and opencode's SSE stream is its own
+  arrival signal, so there is nothing left for it to watch. So an activity transition
+  surfaces within a couple of seconds while someone is watching, at low idle cost
+  otherwise.
 
 ### API (`/v1`)
 
@@ -382,7 +400,7 @@ All endpoints are loopback-only and reached through the server proxy at
 | `POST /v1/sessions/{slug}/input` | body `{"text":"…"}` (≤16 KiB) | `{"delivered":true}` | `400` invalid/unsafe/empty text; `404` unknown/gone slug; `409` not accepting; `413` body too large |
 | `POST /v1/sessions/{slug}/turn` | body `{"text": string, "options": object?}` (≤16 KiB) | **live for opencode**, `409` elsewhere: `202 {"turn_id": "<opaque>"}` | `400` empty/whitespace text or malformed JSON; `404` unknown slug; `409` `not_supported` (non-opencode kinds) or `not_accepting` (no lane yet, unpinned session, or upstream failure — opencode never rejects for "busy") ; `413` body too large |
 | `POST /v1/sessions/{slug}/interrupt` | body ignored (still size-capped) | **live for opencode**, `409` elsewhere: `202 {"interrupting": true}` | `404` unknown slug; `409` `not_supported` (non-opencode kinds) or `not_accepting` (no lane yet, unpinned session, or upstream failure — opencode passes through even an idle abort as success); `413` body too large |
-| `POST /v1/sessions/{slug}/approvals/{id}` | body `{"decision": "allow"\|"allow_always"\|"deny"}` (≤16 KiB) | **live for opencode**, `409` elsewhere: `200 {"resolved": true, "decision": "<decision>"}` | `400` invalid decision, malformed JSON, or an `{id}` that fails the approval-id grammar (below); `404` unknown slug, or `unknown_approval` for a well-formed but unrecognized id; `409` `not_supported` (`approvals != "remote"` — every kind but opencode, including a pane-anchor `pane-*` id) or `already_resolved` for a different decision on an already-resolved id (same-decision replay is idempotent, `200`, with no second upstream POST); `413` body too large |
+| `POST /v1/sessions/{slug}/approvals/{id}` | body `{"decision": "allow"\|"allow_always"\|"deny"}` (≤16 KiB) | **live for opencode**, `409` elsewhere: `200 {"resolved": true, "decision": "<decision>"}` | `400` invalid decision, malformed JSON, or an `{id}` that fails the approval-id grammar (below); `404` unknown slug, or `unknown_approval` for a well-formed but unrecognized id; `409` `not_supported` (`approvals != "remote"` — every kind but opencode) or `already_resolved` for a different decision on an already-resolved id (same-decision replay is idempotent, `200`, with no second upstream POST); `413` body too large |
 
 Errors carry a JSON envelope `{"error":"<code>","message":"…"}`. A hub-down condition is
 surfaced by the proxy, not the hub — see [Hub-down degrade](#hub-down-degrade).
@@ -448,7 +466,7 @@ rule `GET /messages` does (`404` for an unknown slug, no re-derivation from tmux
 | Code | Meaning |
 |---|---|
 | `not_supported` | This session's kind/lane **never** supports the verb — capabilities said so, and retrying or waiting changes nothing. Every kind but opencode returns this for all three verbs. |
-| `not_accepting` | The verb **is** supported but not right now — the existing `/input` vocabulary (wrong activity, recreated identity) plus the lane-specific reasons above (no lane attached yet, an unpinned opencode session, an upstream failure). `turn`-while-busy and `interrupt`-with-no-active-turn stay **reserved** codes for a lane whose native surface actually refuses in that state — opencode's does not (see above), so it never emits them. Retryable in principle. |
+| `not_accepting` | The verb **is** supported but not right now — for `turn`/`interrupt`/`approvals` this covers the lane-specific reasons above (no lane attached yet, an unpinned opencode session, an upstream failure); `POST /input` also answers `not_accepting`, unconditionally, for every kind (§ [Input](#input-post-input) below — no kind is `gated` any more). `turn`-while-busy and `interrupt`-with-no-active-turn stay **reserved** codes for a lane whose native surface actually refuses in that state — opencode's does not (see above), so it never emits them. Retryable in principle. |
 
 There are deliberately no `501`s — one envelope, one vocabulary, for every rejection. A
 client that must distinguish "this server is too old to have the route at all" reads
@@ -478,15 +496,15 @@ the `contract-v2` capability feature token rather than interpreting the mux's ba
 **Approval-id grammar** (a contract decision, not an inherited regex):
 `^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$` — starts alphanumeric (so `.`/`..`/`...` can
 never match; path traversal is excluded by the grammar itself), allows the `.`/`:`/
-`_`/`-` seen in native ids (codex call ids, ACP/opencode request ids, the pane-anchor
-`pane-<n>` ids), capped at 128 characters. The same expression gates both the hub
-handler and the server-side proxy path classifier — a malformed id 404s at the proxy
-before it ever reaches the guest; a syntactically invalid id sent **directly** to the
-hub (bypassing the proxy) is a `400 invalid_approval_id`, not a `404` — a `404` here
-would wrongly imply the id was well-formed but unknown. A well-formed `pane-*` id (a
-codex/cursor informational approval row) is never remotely resolvable — the kind's
-`approvals` row says `tui`, so the capability check rejects it with `409 not_supported`
-before any id lookup.
+`_`/`-` seen in native tool-call-shaped ids (e.g. ACP/opencode request ids like
+`call_01HQ8Z3K.tool:2`), capped at 128 characters. The same expression gates both the
+hub handler and the server-side proxy path classifier — a malformed id 404s at the
+proxy before it ever reaches the guest; a syntactically invalid id sent **directly** to
+the hub (bypassing the proxy) is a `400 invalid_approval_id`, not a `404` — a `404`
+here would wrongly imply the id was well-formed but unknown. `claude-rc`, `codex`, and
+`cursor` have no approvals producer at all (A6/S2), so any well-formed id sent for one
+of them is rejected with `409 not_supported` before any lookup — their `approvals` row
+says `tui`.
 
 ### Session-scoping invariant (hub-initiated mutations)
 
@@ -546,7 +564,7 @@ filled in server-side):
 
 | `event:` | `data:` | Fires when |
 |---|---|---|
-| `activity.changed` | `{shed, slug, activity, activity_at, state, last_message?}` | a session's *displayed* activity changes to a valid non-empty value; `last_message` is the sanitized preview at the transition (omitted for stability-only kinds) |
+| `activity.changed` | `{shed, slug, activity, activity_at, state, last_message?}` | a session's *displayed* activity changes to a valid non-empty value (opencode only — no other kind has an activity dimension); `last_message` is the sanitized preview at the transition |
 | `session.updated` | `{shed, slug, session}` (`session:null` on kill) | a session appears, is recreated, or its lifecycle `state` changes |
 | `message.appended` | `{shed, slug, seq}` | a new feed message lands (notification only — the body comes from `/messages`, keeping fan-out tiny and drop-safe) |
 
@@ -565,122 +583,99 @@ cannot spoof them.
 
 | Value | Meaning |
 |---|---|
-| `working` | actively producing output (a JSONL turn is streaming, or the pane changed since the last capture) |
-| `needs_input` | idle at the kind's prompt anchor, waiting for the operator to type |
-| `idle` | quiescent with no prompt anchor visible (finished, or an anchorless kind sitting still) |
-| `unknown` | a live session whose activity can't be determined yet (e.g. correlation to a JSONL file is still ambiguous) — distinct from *absent*, which means no activity dimension at all |
-| `needs_approval` | the session is blocked on the operator's yes/no — see [`needs_approval` producers](#needs_approval-producers-per-kind) below for how each kind derives it, and how a client should render it (`remote` for opencode: render decision buttons; `tui` for codex/cursor: render "open the TUI") |
+| `working` | a turn or tool call is in flight (from opencode's own event stream) |
+| `needs_input` | opencode's last turn boundary was idle — waiting for the operator's next prompt |
+| `idle` | reserved in the wire vocabulary for a settled "nothing pending" verdict; **no current producer emits it** — opencode's fold goes straight from `working` to `needs_input` |
+| `unknown` | a live opencode session whose watcher hasn't yet confirmed which agent session belongs to this pane — distinct from *absent*, which means no activity dimension at all |
+| `needs_approval` | opencode is blocked on the operator's yes/no — see [`needs_approval` producers](#needs_approval-producers-per-kind) below. No other kind ever reports this (or any) activity: `claude-rc`/`codex`/`cursor` have had no approvals producer since A6/S2 |
 
-**Precedence rule (lifecycle trumps activity).** When the pane-derived `state` is a
-blocking lifecycle state — `needs-trust`, `needs-auth`, `dead` — the *whole* activity
-dimension is suppressed: `activity`, `activity_at`, **and** `last_message` are dropped
-together (a bare timestamp is meaningless without its activity, and a stale
-`last_message` would present pre-death context as current). Activity renders only for the
-non-blocking states (`starting`/`ready`/`reconnecting`).
+**Precedence rule (lifecycle trumps activity).** When `state` is a blocking lifecycle
+value — `needs-trust`, `needs-auth`, `dead` — the *whole* activity dimension is
+suppressed: `activity`, `activity_at`, **and** `last_message` are dropped together (a
+bare timestamp is meaningless without its activity, and a stale `last_message` would
+present pre-death context as current). The rule is retained for wire compatibility with
+an older guest; since S2 (`charliek/shed#324`) `state` is liveness, so a session the hub
+enumerates at all is always `ready` — a blocking-lifecycle row never appears in
+`/v1/sessions` today, and in practice this rule never fires.
 
-**Per-kind derivation.** The pane-stability engine is the **universal fallback** (every
-kind gets baseline `working`/`idle`); structured JSONL tails refine it for the agents
-that log:
+**Per-kind derivation.** There is exactly **one** producer left: **opencode**'s watcher,
+which subscribes to the bare `opencode` TUI's embedded HTTP+SSE server on a per-session
+loopback port (recorded at `create` time) and folds its `/event` stream (plus a REST
+seed) into an activity verdict and a message feed. Every other kind —
+`claude-rc`, `codex`, `cursor`, `shell` — has **no activity producer at all** and no
+fallback to reach for one: the pane-stability engine that used to supply a universal
+`working`/`idle` baseline, and the codex JSONL tail and claude transcript tail that used
+to refine it for those two kinds, are all deleted (A5 `charliek/shed#321`, A6
+`charliek/shed#322`, S2 `charliek/shed#324`). Their sessions simply carry no `activity`
+field. **roost is the status authority for those kinds instead** — directly, over its
+own protocol, for a machine session; for a shed session, only once roost reaches the
+guest (S5). Until then, a shed's `claude-rc`/`codex`/`cursor` row is liveness-only, with
+nothing standing in for the activity dimension it no longer has.
 
-- **Stability engine** (opencode/cursor/shell, and any kind's fallback): diffs
-  consecutive pane captures, first **normalizing** each snapshot (stripping spinner
-  glyphs, timers, and counter lines) so that spinner-only churn reads `idle`, not
-  `working`. A pane that holds still for the quiet period (4 s) downgrades `working` →
-  `idle`, or → `needs_input` **only** when the kind declares a prompt anchor the stable
-  pane matches (an anchorless kind's stable pane is always `idle`).
-- **codex** tails the rollout JSONL; **claude** tails the transcript JSONL (claude feeds
-  *activity* only in this phase — messages are deferred). **opencode** has no JSONL to
-  tail — the bare `opencode` TUI runs an embedded HTTP+SSE server on a per-session
-  loopback port (recorded at `create` time), and the hub subscribes to its `/event`
-  stream (plus a REST seed) as a second client, folding the same shape of
-  activity-verdict + message feed as codex's JSONL fold. A correlated watcher's verdict
-  **overrides** stability while it is *fresh*; for opencode, freshness also depends on
-  the SSE connection's transport health (a disconnected stream is not trusted the way a
-  merely-quiet file is — see [Message feed](#message-feed-codex-opencode-cursor)).
-
-**Freshness / grace.** A settled watcher verdict (`needs_input`/`idle`) is trusted
-indefinitely; a transitional verdict is fresh for 30 s since the last in-file event; a
-`working` verdict gets a longer **120 s grace** (a long silent tool call must not flap to
-idle). Past the grace, `working` is *demoted to conditional* — it yields to stability
-**only** if stability holds a settled quiet verdict (`idle`/`needs_input`); if the pane
-still churns, `working` is kept. This merge is `mergedActivity`; the input handler
-re-runs the exact same merge so it can never be more permissive than the displayed
-activity.
+**Freshness / grace.** A settled watcher verdict (`needs_input`/`needs_approval`) is
+trusted indefinitely — an event-bounded state stays true until a reply or a reseed
+changes it. A transitional verdict (`working`/`unknown`) is fresh for 30 s since the
+last SSE event; `working` additionally gets a longer **120 s grace** so a long tool call
+doesn't flap. Past whichever window applies, the verdict is simply **stale**, and a
+stale verdict yields **no activity at all** — not a fallback value, not `idle` — because
+there is no other engine left to hand off to: the DTO omits the field entirely. So an
+opencode row whose SSE stream dies mid-turn eventually loses its `activity` field rather
+than sitting at `working` forever. This merge is `mergedActivity`, run once per
+reconcile tick to produce the DTO's own `activity` field; no verb re-runs it to decide
+whether to accept a request any more — `POST /input` no longer gates on activity at
+all (§ [Input](#input-post-input) below).
 
 `last_message` is a sanitized one-line preview (ANSI/control-stripped,
-whitespace-collapsed, ≤200 runes) extracted by the watcher; stability has no message
-signal, so a stability-only session carries none.
+whitespace-collapsed, ≤200 runes) extracted by opencode's watcher; every other kind
+carries none, since it has no activity producer to extract one from.
 
 ### `needs_approval` producers per kind
 
-Each kind's approvals surface reaches the wire through a different mechanism, matched
-to what that agent actually exposes:
+**opencode** is the only kind with an approvals surface — from live events on its own
+protocol: `permission.asked`/`question.asked` open an ask (an open permission or an
+open question both count toward `needs_approval`; only permissions are addressable —
+see [`pending_approvals` is legal with a question open](#pending_approvals-may-be-empty)
+below), `permission.replied`/`question.replied`/`question.rejected` close it. This is
+an **event-bounded** verdict: `settled()` (the freshness contract) trusts it
+indefinitely while the SSE transport is healthy, exactly like `needs_input`. On a dead
+stream — the SSE connection disconnected or heartbeat-stale — the watcher reports
+not-fresh and the [freshness/grace rule](#activity-dimension) applies: past its window
+a `needs_approval` derived from a wedged connection yields no activity at all rather
+than outliving the evidence for it; it comes back the moment the stream reconnects and
+reseeds.
 
-- **opencode** — from live events on its own protocol: `permission.asked`/
-  `question.asked` open an ask (an open permission or an open question both count
-  toward `needs_approval`; only permissions are addressable — see
-  [`pending_approvals` is legal with a question open](#pending_approvals-may-be-empty)
-  below), `permission.replied`/`question.replied`/`question.rejected` close it. This is
-  an **event-bounded** verdict: `settled()` (the freshness contract) trusts it
-  indefinitely while the SSE transport is healthy, exactly like `needs_input`. **Demoted
-  to stability on a dead stream**: when the SSE connection is disconnected or
-  heartbeat-stale, the watcher reports not-fresh and pane stability drives instead — a
-  `needs_approval` derived from a wedged connection cannot outlive the evidence for it;
-  it comes back the moment the stream reconnects and reseeds.
-- **codex and cursor** — from a **visible-frame pane anchor**: neither agent's live
-  signal carries an approval-pending event (codex's rollout JSONL persistence policy
-  filters every approval-shaped record before it is ever written — the tool-call record
-  itself is written *before* the approval gate, so a session blocked on approval is
-  byte-identical in the log to a long-running tool call; cursor's hooks fire no
-  approval-pending event at all, and a hook `allow` cannot bypass cursor's own allowlist
-  prompt). The hub instead pattern-matches the tool's approval-dialog chrome — the
-  option-row widget shape, never a headline alone (a headline is ordinary English an
-  agent can quote back in its own prose, and it survives in the transcript after the
-  dialog is answered; option rows exist only while the widget is mounted) — against the
-  session's **visible terminal frame only** (`tmux capture-pane -p`, no scrollback):
-  scrollback would let an answered or historical dialog wedge a false episode open
-  forever. A match is debounced **two consecutive ticks** to open an episode and **two
-  consecutive ticks** of no match to close it (roughly 4 s at the hub's active 2 s
-  cadence), so a single missed/mid-redraw capture cannot flip the verdict. These rows
-  are **informational only**: `approvals` stays `"tui"` for both kinds — the pane shows
-  chrome, not a structured, remotely-answerable request, so `pending_approvals` entries
-  for these ids carry no `decisions`, and `POST /approvals/{pane-id}` still 409s
-  `not_supported` (the capability check rejects it before any lookup, same as any other
-  `tui`-approvals kind). A resolved row may **omit `decision`** — the operator answered
-  in the TUI and the hub has no way to know which way (see [the loosened `decision`
-  field](#approval_request-contract-v2) below). **Known limitation, inherent to a
-  pane-derived signal**: a verbatim on-screen reproduction of the dialog's exact chrome
-  (e.g. `cat`ing a fixture file, or a pasted transcript that preserves the gutter and
-  footer) reads as a real dialog and false-positives — no regex can tell "the widget is
-  mounted" from "a perfect picture of the widget is on screen" from the pane alone. The
-  blast radius is bounded: the anchor only ever sees the current visible frame, so a
-  false episode clears the moment the text scrolls away, and the row is informational —
-  nothing is ever auto-approved or auto-denied by either false direction.
+**Every other kind never reports `needs_approval`.** `claude-rc`, `codex`, and `cursor`
+used to derive an informational (never remotely resolvable) approval episode by
+pattern-matching each tool's approval-dialog chrome on the visible pane frame; S2
+(`charliek/shed#324`) deleted that pane-anchor mechanism along with the rest of the
+classifier. `approvals` stays `"tui"` for these kinds — an operator answers in the
+terminal, and neither the activity dimension nor `pending_approvals` reflects that an
+approval is pending. `POST /approvals/{id}` still 409s `not_supported` for them,
+unconditionally (the capability check rejects it before any id lookup).
 
 <a id="pending_approvals-may-be-empty"></a>**`needs_approval` with an empty
 `pending_approvals` is legal.** An open opencode *question* (no decision vocabulary fits
 `allow`/`allow_always`/`deny`, so it is never addressable by the approvals verb — remote
 question-answering is a future contract extension) drives `needs_approval` without
-adding a `pending_approvals` entry. A pane-anchor kind's open episode is also **not**
-guaranteed to appear there for a client reading an older snapshot — see the union rule
-below. Either way, a client must not assume a non-empty `pending_approvals` accompanies
-every `needs_approval` session; the correct fallback affordance is always "open the
-TUI".
+adding a `pending_approvals` entry. A client must not assume a non-empty
+`pending_approvals` accompanies every `needs_approval` session; the correct fallback
+affordance is always "open the TUI".
 
-`pending_approvals` (the session-level snapshot) is the **union** of the lane-published
-entries (opencode's addressable, pending permission asks) and the open pane-derived
-episode (codex/cursor), when one is open. The two sources are disjoint in practice — a
-kind's approvals are either lane-derived or pane-derived, never both — but they are
-unioned rather than switched so a kind that someday has both keeps every open ask
-visible.
+`pending_approvals` (the session-level snapshot) is opencode's lane-published,
+addressable, pending permission asks — the only source there is, now that the
+pane-derived episode (codex/cursor) is gone. Every other kind's `pending_approvals` is
+always empty.
 
-### Message feed (codex, opencode, cursor)
+### Message feed (opencode)
 
-The codex rollout watcher folds the JSONL turn stream, the opencode watcher folds its
-HTTP/SSE `/event` stream, and the cursor watcher folds its hook-event stream (see
-[Cursor hook ingestion](#cursor-hook-ingestion) below), into normalized conversation
-messages, drained each tick into a per-session **ring buffer** that `GET /messages`
-pages. claude sessions have a ring that simply never fills (messages deferred).
+The opencode watcher folds its HTTP/SSE `/event` stream (plus a REST seed) into
+normalized conversation messages, drained each tick into a per-session **ring buffer**
+that `GET /messages` pages. Every other kind (`claude-rc`, `codex`, `cursor`, `shell`)
+has a ring that simply never fills — none of them has had a message producer since A6
+(`charliek/shed#322`) retired the codex JSONL tail and the cursor hook-ingest lane, and
+claude never had one — so `GET /messages` for a tracked session of one of those kinds
+returns `200` with an empty page forever, never a `404`: every enumerated session is
+tracked, feed or not.
 
 opencode's fold additionally turns a pending `question.asked` event (one with no
 addressable permission id) into a display-only `status` feed row (role `system`) — e.g.
@@ -697,8 +692,8 @@ being dropped).
 <a id="approval_request-contract-v2"></a>**`approval_request` (contract v2).** An
 approval row: an agent asked for permission to do something. It rides `role: "tool"`
 with `text` carrying a sanitized human-readable summary, `tool{name, detail}` the call
-being approved (omitted on a pane-anchor row — the hub never learns which call the
-dialog guards), and `approval` the machine-readable state:
+being approved, and `approval` the machine-readable state. opencode is the only
+producer of this row today — every other kind's ring never carries one:
 
 ```json
 {
@@ -718,10 +713,10 @@ dialog guards), and `approval` the machine-readable state:
 
 | `approval` field | Meaning |
 |---|---|
-| `id` | The lane-assigned approval id — the address the `approvals/{id}` hub verb resolves for a `remote`-approvals kind. A `tui`-approvals kind's pane-anchor id (`pane-<n>`, monotonic per session) is **not** remotely resolvable — `POST /approvals/{id}` on it 409s `not_supported`. Grammar: `^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$` (starts alphanumeric, `.`/`:`/`_`/`-` allowed, max 128 chars — same grammar as the `approvals/{id}` route above). |
+| `id` | The lane-assigned approval id — the address the `approvals/{id}` hub verb resolves. Grammar: `^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$` (starts alphanumeric, `.`/`:`/`_`/`-` allowed, max 128 chars — same grammar as the `approvals/{id}` route above). A `tui`-approvals kind (`claude-rc`, `codex`, `cursor`) never publishes a row at all, so there is no id to resolve — `POST /approvals/{id}` 409s `not_supported` for them regardless of what `{id}` names. |
 | `status` | `pending` or `resolved`. |
-| `decision` | The decision that resolved it (`allow`/`allow_always`/`deny`); empty/omitted while pending. **Also omitted on a `resolved` row when the resolution happened outside the hub** — a pane-anchor kind's dialog answered in the TUI (the hub sees only that the chrome cleared, never which button was pressed), or an opencode ask closed by a reseed after a reply the hub never observed live. A client must not assume every `resolved` row carries a `decision`. |
-| `decisions` | The decisions this request accepts, advertised per request so a client renders exactly the buttons the lane will honor (a subset of `allow`/`allow_always`/`deny`). **Omitted entirely** on a pane-anchor (`tui`-approvals) row — there is nothing the hub can honor remotely, so a capability-driven client renders zero decision buttons ("open the TUI") rather than a set that would silently fail. |
+| `decision` | The decision that resolved it (`allow`/`allow_always`/`deny`); empty/omitted while pending, and also omitted on a `resolved` row closed by a reseed after a reply the hub never observed live. A client must not assume every `resolved` row carries a `decision`. |
+| `decisions` | The decisions this request accepts, advertised per request so a client renders exactly the buttons the lane will honor (a subset of `allow`/`allow_always`/`deny`). |
 
 A resolution is a **second** appended row with the same `id` and `status: "resolved"` —
 never an edit of the first:
@@ -744,8 +739,7 @@ eviction (or a hub restart) can drop the earlier row entirely — and the sessio
 still open," independent of what the ring happens to retain.
 
 opencode emits real, addressable `approval_request` rows from `permission.asked`/
-`permission.replied`; codex and cursor emit **informational** ones from the pane-anchor
-mechanism (no `tool`, no `decisions`, `decision` may be absent even resolved — see
+`permission.replied`; no other kind has an approvals producer any more (see
 [`needs_approval` producers](#needs_approval-producers-per-kind) above). `size()`
 accounting for the ring's byte budget counts the approval's `id` + `status` + `decision`
 + every advertised `decisions` entry, alongside `text`/`tool`, so an approval-heavy feed
@@ -780,63 +774,37 @@ treat them as untrusted.
 this is a loopback-only surface behind the server's authz boundary; and suppressing it
 would only hide the context a client needs to render the "session died mid-conversation"
 view. So `GET /messages` returns content for a `dead`/`needs-auth` session even though
-that session reports no `activity`.
+that session reports no `activity`. (In practice this rule is provable rather than
+exercised today: since S2 reduced `state` to liveness, a hub-tracked session's `state`
+is always `ready` — the rule stands ready for an older guest, or a future lifecycle
+producer, that makes the blocking states real again.)
 
 ### Input (`POST /input`)
 
-Gated feed input is **codex- and cursor-only** now (`kind_features.input == "gated"`;
-claude-rc keeps TUI-only `post_input` with no feed input at all). Delivery reuses the
-shared prompt path (validation + bracketed paste), never a duplicate tmux path.
+No kind is `gated` any more. The codex/cursor lanes `gated` depended on were retired in
+A6 (`charliek/shed#322`), and S2 (`charliek/shed#324`) then deleted the acceptance
+machinery itself — the per-slug delivery mutex, the pane re-verify, the
+approval-anchor/watcher merge — along with the pane classifier it read. `POST
+/v1/sessions/{slug}/input` keeps its route and its request validation, but answers
+**409 `not_accepting`** for every kind once the body is well-formed and the slug is
+tracked (pinned by the `input_codex_not_accepting` rc-parity golden). opencode steers
+through the `turn` verb instead (§ [Contract-v2 verbs](#contract-v2-verbs-turn-interrupt-approvalsid)
+above); every other kind carries `kind_features.input == ""` (no feed input at all —
+the TUI-only `post_input` kickoff path is unaffected).
 
-**Gating.** Under a per-slug mutex, immediately before sending the hub **re-captures the
-pane and re-derives state**, and accepts only when the session is genuinely waiting: a
-fresh watcher `needs_input` is accepted outright; otherwise the **degraded-path policy**
-applies — accept only if the kind's prompt anchor is visible on the *fresh* pane (this is
-what keeps input possible when a JSONL tail breaks, and what closes the lookup→lock
-race). A merged `working` verdict (including an expired-working turn) is always rejected,
-as is a session an open approval (lane-derived `needs_approval`, or a matching pane
-approval anchor on the *fresh* pane) currently owns — typed input must never land on an
-approval dialog by accident. A killed-and-recreated slug is caught by an identity guard
-(`id`/`created_at` must still match).
-
-**Statuses:** `400` invalid/unsafe/empty text · `404` unknown or gone slug · `409` not
-accepting (wrong activity, an open approval, recreated identity, or a non-gated kind) ·
+**Statuses:** `400` invalid/unsafe/empty text · `404` unknown or gone slug · `409`
+`not_accepting` (unconditional, once past validation and the tracked-slug lookup) ·
 `413` body over 16 KiB.
-
-**opencode's `/input` now 409s.** `input` moved from `gated` to `turn` for opencode (§
-[`kind_features` matrix](#kind_features-matrix) above): `input` is single-valued, so
-`turn` **replaces** `gated` rather than layering on top of it. `POST
-/v1/sessions/{slug}/input` on an opencode session now falls through to the non-gated
-"this kind has no feed input" `409` — the same rejection a claude-rc session already
-gets — because the lane's steering surface is the `turn` verb, not `/input`. **This is a
-deliberate wire behavior break** for any hub client that was posting to `/input` for
-opencode; no shipped client did (first-party consumers move in lockstep). The
-create/prompt kickoff path (`post_input`) is unaffected — it still delivers a fresh
-session's first prompt; the `turn` verb covers every steer after that.
-
-### Correlation (session → JSONL)
-
-The hub pins each watchable session to its agent's JSONL file by **cwd + a created-at
-window (±60 s)**, pinned by **inode**:
-
-- **codex** matches rollout files under `~/.codex/sessions`; **claude** derives the
-  transcript dir from the cwd encoding. On a unique match the hub does a bounded
-  catch-up read (so current activity is known immediately) and **back-writes**
-  `SHED_RC_AGENT_SESSION=<id>` into the tmux env (an additive key; `SHED_RC_V` stays 2)
-  so a hub restart re-correlates exactly.
-- **Ambiguity** within the window (>1 candidate) → the newest is followed *append-only*,
-  activity stays `unknown`, and the id is **not** back-written until the first in-file
-  event confirms the pick (a wrong pin would otherwise become permanent).
-- Watchers stop when the tmux session disappears; a file truncation / inode swap resets
-  and re-reads; new dated subdirs are handled (fsnotify is non-recursive). A session
-  whose file never appears stops re-scanning after a bounded retry budget.
 
 ### Correlation (opencode: session → SSE)
 
-opencode has no JSONL file to correlate against — it creates its conversation session
-only on the **first prompt** (not at TUI start), so a create-time window match would
-routinely expire before anything exists to match. Instead, the opencode watcher
-correlates asynchronously, entirely from its own `/event` stream:
+opencode has no external session file the hub could correlate against by watching a
+directory — it creates its conversation session only on the **first prompt** (not at
+TUI start), so a create-time window match would routinely expire before anything
+exists to match. Instead, the opencode watcher correlates asynchronously, entirely
+from its own `/event` stream — the only correlation mechanism left in the hub, now
+that A6 (`charliek/shed#322`) retired codex's rollout-file pin and A5
+(`charliek/shed#321`) retired claude's transcript pin:
 
 - It subscribes to the session's per-port `/event` stream first, then seeds via REST —
   so no event is lost in the gap between subscribe and seed.
@@ -844,92 +812,13 @@ correlates asynchronously, entirely from its own `/event` stream:
   (never from `GET /session`, which reads the shared opencode DB and can return other
   sessions/servers' history): the first **root** session (no parent) whose canonical
   directory matches the rc session's workdir. Once pinned, the id is back-written to
-  `SHED_RC_AGENT_SESSION` (same as the JSONL path) so a hub restart re-correlates
-  exactly.
+  `SHED_RC_AGENT_SESSION` so a hub restart re-correlates exactly.
 - A fresh, prompt-less opencode TUI has no session yet and stays watchable indefinitely
   — correlation does not consume a retry budget waiting for the first prompt.
 - On reconnect (SSE drop, hub restart) the watcher re-subscribes, re-seeds
   (`/session/{id}/message`, `/session/status`, `/permission`, `/question`), and replays
   buffered live events; feed emission is deduped so a reseed never double-emits a
   message.
-
-### Correlation (cursor: hooks, not a JSONL pin)
-
-cursor-agent has no protocol the hub can subscribe to and no server-computed identity to
-correlate against ahead of time — the pin instead arrives *inside* the hook payloads
-themselves (a hook's `session_id`), so there is nothing to search for and no retry
-budget to spend: the cursor watcher is push-fed, not pulled. The **first** hook event's
-`session_id` pins the session (back-written to `SHED_RC_AGENT_SESSION`, same as the
-JSONL/SSE paths); a *different* `session_id` arriving later re-pins (the operator
-switched chats inside the same TUI — a status row notes the switch, since the session is
-scoped to whatever conversation the TUI currently shows). `sessionStart` is not required
-to establish the pin (it does not fire on `cursor-agent --resume`).
-
-### Cursor hook ingestion
-
-cursor-agent's own [user-configured
-hooks](https://docs.cursor.com/cli/hooks) are the **only** live signal cursor produces
-at all — its transcript JSONL carries user/assistant lines only (no tool results, no
-ids, no timestamps, and it lags mid-turn), so tool output exists nowhere else. The hub
-makes itself a hook consumer instead of tailing anything:
-
-- **Preseed** (best-effort, like every agent's preseed — a failure costs the session its
-  feed, never its create): `~/.shed-rc-hub/cursor-hook.sh` (hub-owned, 0755, rewritten on
-  every create) relays one hook event's raw stdin payload to the hub; `~/.cursor/hooks.json`
-  is **merged, never clobbered** (existing entries preserved; the hub's entry appended once
-  per event, matched by script path) to wire it to `sessionStart`, `beforeSubmitPrompt`,
-  `preToolUse`, `afterShellExecution`, `afterFileEdit`, `postToolUse`, `postToolUseFailure`,
-  `afterAgentResponse`, `stop`, `sessionEnd`. **Foreign-device guard**: if `~/.cursor` sits
-  on a different filesystem than `$HOME` (a VirtioFS/9P host auth mount), the `hooks.json`
-  half is **skipped** (with a hub-log note) — writing hook config into a mounted-through host
-  cursor setup would reference a script that does not exist there and fire on every local
-  `cursor-agent` run forever. The paired guidance: mount cursor auth at **`~/.config/cursor`
-  only** (see [Configuration reference](../reference/configuration.md#mounts)) and
-  leave `~/.cursor` guest-local so hooks work.
-- **The hook script is deliberately mute.** cursor-agent reads a hook's stdout as a
-  **verdict** (permission decisions, prompt rewrites), so the script always exits `0`
-  with **empty** stdout regardless of the hub's reachability — a hub that is down, slow,
-  or absent must change nothing about how the agent runs (verified live: even a hook
-  `allow` cannot bypass cursor's own allowlist prompt, so there was never a bypass to
-  accidentally grant). `curl --connect-timeout 1 --max-time 2 --noproxy '*'` bounds the
-  cost per event and refuses any `http_proxy` in the environment (the hub is loopback-only
-  — honoring a proxy would exfiltrate prompts and command output off-box).
-- **`POST /v1/ingest/cursor?slug=<slug>&event=<hookEvent>`** (loopback only) is the
-  receiving route. It is a **guest-internal** surface — the caller is a process *inside*
-  the shed (the hook script), not the server's proxy — and is deliberately **not** on the
-  server proxy's allowlist (`internal/api/rchub.go`): nothing outside the shed has any
-  business injecting a session's feed. A proxy test pins that `/rc/v1/ingest/…` is
-  rejected before any dial. It carries its **own 256 KiB body cap** (not the 16 KiB cap
-  every other hub POST shares) because `afterShellExecution.output` routinely exceeds
-  16 KiB for build-style commands and is the feed's only source of tool output; the
-  ring's existing per-field 8 KiB cap still applies once the event is folded, so the
-  larger ingest cap buys fidelity only at the ingest hop. An oversized payload is a `413`
-  and the event is simply dropped — the session is otherwise unaffected.
-- **What it mutates.** A hook event, once accepted, can update three things in the same
-  request: the session's **feed/activity** (folded into a normalized message + the
-  activity verdict — see the fold mapping below), the tmux session's **environment** (the
-  `SHED_RC_AGENT_SESSION` pin back-write on first correlation), and — for `beforeSubmitPrompt`
-  when the session is otherwise idle — it can **relax the input gate** the same way a
-  fresh `needs_input` watcher verdict would. None of this is a privilege escalation: a
-  guest process that can fire a cursor-agent hook already has full tmux control over the
-  session (it could `send-keys` directly), so ingest is a convenience channel within
-  existing guest trust, not a new trust boundary.
-- **Fold mapping**: `beforeSubmitPrompt` → user feed row + `working` · `preToolUse` →
-  `tool_use` row + `working` · `afterShellExecution` → `tool_result` row (the command's
-  actual output) · `afterFileEdit` → `tool_result` row (path + edit count) ·
-  `postToolUseFailure` → `status` row · `afterAgentResponse` → assistant feed row
-  (sanitized/capped) + `last_message` · `stop` → settled `needs_input`. `postToolUse` is
-  wired for its **counter**, not its payload — it is what brings the open-tool-call count
-  back down for a Read/Grep/Glob-class tool that fires no `afterShellExecution`/
-  `afterFileEdit`. `needs_approval` for cursor is **not** derived from hooks (no
-  approval-pending hook event exists) — see [`needs_approval`
-  producers](#needs_approval-producers-per-kind) above.
-- **Pre-watcher window.** A hook can fire before the hub's first reconcile tick builds the
-  session's watcher (`shed attach --kind cursor --prompt …` delivers its kickoff prompt
-  within about a second of create). The ingest handler holds a **bounded per-slug
-  pre-watcher queue** (32 events / 256 KiB total) that the watcher drains on construction,
-  so the kickoff prompt's `beforeSubmitPrompt` is never lost to the create→first-tick gap;
-  a queue for a slug that never grows a watcher within 60 s is dropped wholesale.
 
 ### Server surfaces
 

@@ -16,8 +16,9 @@
 //!
 //! | what came back | `WATCH` column |
 //! |---|---|
-//! | a `kind_features` row with a message feed | `feed` |
-//! | a `kind_features` row without one | `activity` |
+//! | a `kind_features` row with a message feed (`feed: "messages"`) | `feed` |
+//! | a row with `feed: "activity"` | `activity` |
+//! | a row with `feed: "none"` (claude-rc/codex/cursor since `charliek/shed#324`) | `-` — the hub has no signal for it |
 //! | NO row for that kind (`shell`, `claude-broker`) | `-` — no feed/steer affordances |
 //! | no `capabilities` block at all (an old binary) | `?` + a note naming the target |
 
@@ -77,12 +78,22 @@ impl Listing {
     }
 }
 
+/// The contract's "no hub signal at all" feed value (`rc-helper.md` § feed). It is
+/// what claude-rc/codex/cursor advertise since their activity producers were
+/// retired (A6 `charliek/shed#322`, S2 `charliek/shed#324`), and it is NOT
+/// `activity`: rendering it as one would promise a dimension no producer fills.
+const FEED_NONE: &str = "none";
+
 /// The capability-aware affordance cell for one session (the table above).
 pub fn watch_cell(kind: &str, caps: Option<&RcCapabilities>) -> &'static str {
     let Some(caps) = caps else { return "?" };
     match caps.kind_features.get(kind) {
         None => "-",
         Some(features) if features.feed_messages() => "feed",
+        // An explicit `none` is the same affordance as no row at all: nothing to
+        // watch. Checked BEFORE the activity fallback, which is otherwise a
+        // catch-all over "present but not messages".
+        Some(features) if features.feed.trim() == FEED_NONE => "-",
         Some(_) => "activity",
     }
 }

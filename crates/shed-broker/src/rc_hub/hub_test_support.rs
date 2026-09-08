@@ -21,19 +21,6 @@ use shed_rc_engine::tmux::{TmuxResult, TmuxRunner};
 
 use super::events::Subscriber;
 use super::hub::{Hub, HubConfig};
-use super::watch_cursor::CursorHookEvent;
-
-/// The cursor spike capture's own conversation id (`cursorTestSessionID`,
-/// `watch_cursor_test.go:20`).
-pub(crate) const CURSOR_SID: &str = "4113a71f-0a42-4a6d-89b9-483e44b74103";
-
-/// One pushed cursor hook event (`hookEv`, `watch_cursor_test.go:23`).
-pub(crate) fn hook_ev(event: &str, payload: &str) -> CursorHookEvent {
-    CursorHookEvent {
-        event: event.to_string(),
-        payload: payload.as_bytes().to_vec(),
-    }
-}
 
 /// A programmable clock (`hubClock`, `hub_test.go:21`).
 pub(crate) struct HubClock {
@@ -61,8 +48,6 @@ impl HubClock {
 struct HubTmuxState {
     names: Vec<String>,
     panes: HashMap<String, String>,
-    /// tmux name → visible-frame capture (no -S); unset ⇒ same as panes.
-    visible: HashMap<String, String>,
     envs: HashMap<String, String>,
     gone: HashSet<String>,
     /// capture-pane fails TRANSIENTLY (not gone).
@@ -113,41 +98,18 @@ impl HubTmux {
         self.lock().panes.insert(name.to_string(), pane.to_string());
     }
 
-    /// Pins what a VISIBLE-frame capture (no -S) answers, leaving the
-    /// scrollback capture untouched. Clearing (`""`) restores
-    /// "visible == scrollback".
-    pub fn set_visible(&self, name: &str, vis: &str) {
-        let mut st = self.lock();
-        if vis.is_empty() {
-            st.visible.remove(name);
-        } else {
-            st.visible.insert(name.to_string(), vis.to_string());
-        }
-    }
+    // `set_visible` — which pinned what a VISIBLE-frame capture (no -S)
+    // answered, separately from the scrollback one — went with the pane-anchor
+    // approval scan in S2 (`charliek/shed#324`). Nothing in the hub asks the
+    // "is a modal on screen right now?" question any more.
 
     /// Makes `ls` fail transiently (stderr must not read as "no server").
     pub fn set_ls_fail(&self, stderr: &str) {
         self.lock().ls_fail = stderr.to_string();
     }
 
-    /// Makes a session's capture-pane fail transiently (a hiccup, NOT gone).
-    pub fn set_flaky(&self, name: &str, flaky: bool) {
-        let mut st = self.lock();
-        if flaky {
-            st.flaky.insert(name.to_string());
-        } else {
-            st.flaky.remove(name);
-        }
-    }
-
     pub fn recorded(&self) -> Vec<String> {
         self.lock().sent.clone()
-    }
-
-    /// The recorded set-environment "KEY=VALUE" pairs (asserts the
-    /// SHED_RC_AGENT_SESSION back-write).
-    pub fn set_env_calls(&self) -> Vec<String> {
-        self.lock().set_envs.clone()
     }
 }
 
@@ -193,14 +155,6 @@ impl TmuxRunner for HubTmux {
                         stderr: "lost server connection (transient)".to_string(),
                         code: 1,
                     };
-                }
-                // Real tmux answers a VISIBLE-frame capture (no -S)
-                // differently from a scrollback one — the seam the
-                // ApprovalAnchor path depends on.
-                if !args.contains(&"-S") {
-                    if let Some(vis) = st.visible.get(&name) {
-                        return ok(vis.clone());
-                    }
                 }
                 ok(st.panes.get(&name).cloned().unwrap_or_default())
             }
@@ -285,23 +239,19 @@ pub(crate) fn hub_config(f: &Arc<HubTmux>, clk: &Arc<HubClock>) -> HubConfig {
         version: String::new(),
         active_interval: Duration::ZERO,
         idle_interval: Duration::ZERO,
-        quiet_period: Duration::ZERO,
         idle_timeout: Duration::ZERO,
         heartbeat: Duration::ZERO,
         write_timeout: Duration::ZERO,
         subscriber_buffer: 0,
-        // Go's tests zero the sendLineSettle global; the config seam is the
-        // Rust spelling.
-        send_line_settle: Some(Duration::ZERO),
     }
 }
 
 /// A hub wired to the fake tmux + clock and small intervals (`newTestHub`,
-/// `hub_test.go:240`) — the three tuning overrides Go pins, on top of
-/// [`hub_config`]'s defaults.
+/// `hub_test.go`) — the two tuning overrides Go pins, on top of
+/// [`hub_config`]'s defaults. (The quiet period was a third; it went with the
+/// pane-stability tracker in S2, `charliek/shed#324`.)
 pub(crate) fn new_test_hub(f: &Arc<HubTmux>, clk: &Arc<HubClock>) -> Hub {
     Hub::new(HubConfig {
-        quiet_period: Duration::from_secs(4),
         heartbeat: Duration::from_millis(20),
         write_timeout: Duration::from_secs(1),
         ..hub_config(f, clk)
@@ -316,36 +266,6 @@ pub(crate) fn rig() -> (Hub, Arc<HubTmux>, Arc<HubClock>) {
     let clk = HubClock::new();
     let h = new_test_hub(&f, &clk);
     (h, f, clk)
-}
-
-/// A hub over throwaway doubles, for the tests that drive it purely through
-/// arguments (the input gate) and never script tmux or time.
-pub(crate) fn test_hub() -> Hub {
-    rig().0
-}
-
-/// A Go-minimal config over an arbitrary runner (the `hookedTmux` wrapper
-/// tests need a runner that is not a bare `HubTmux`).
-pub(crate) fn hub_config_with_runner(
-    runner: Arc<dyn shed_rc_engine::tmux::TmuxRunner + Send + Sync>,
-    now: impl Fn() -> DateTime<Utc> + Send + Sync + 'static,
-) -> HubConfig {
-    HubConfig {
-        runner,
-        getenv: Arc::new(|_| String::new()),
-        now: Some(Arc::new(now)),
-        logf: Some(Arc::new(|_| {})),
-        addr: String::new(),
-        version: String::new(),
-        active_interval: Duration::ZERO,
-        idle_interval: Duration::ZERO,
-        quiet_period: Duration::ZERO,
-        idle_timeout: Duration::ZERO,
-        heartbeat: Duration::ZERO,
-        write_timeout: Duration::ZERO,
-        subscriber_buffer: 0,
-        send_line_settle: Some(Duration::ZERO),
-    }
 }
 
 /// A decoded SSE frame (`drainedEvent`, `hub_test.go:253`).
@@ -380,27 +300,20 @@ pub(crate) fn count_events(evs: &[DrainedEvent], name: &str) -> usize {
     evs.iter().filter(|e| e.name == name).count()
 }
 
-/// A pane fixture by basename, from the byte-parity-swept copies under
-/// `crates/fixtures/panes/` (`paneFixture`, `hub_pane_approvals_test.go:20`).
-pub(crate) fn pane_fixture(name: &str) -> String {
-    let path = format!(
-        "{}/../fixtures/panes/{name}.txt",
-        env!("CARGO_MANIFEST_DIR")
-    );
-    std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("fixture {path}: {e}"))
-}
+// `pane_fixture` read the byte-parity-swept pane captures under
+// `crates/fixtures/panes/`. Both corpora were deleted with the classifiers and
+// anchors they pinned (S2, `charliek/shed#324`).
 
 // ---------------------------------------------------------------------------
 // Shared scripted watchers (`stubWatcher`/`stubApprovalWatcher`,
-// hub_input_test.go:302-332) — used by the input-gate unit tests (hub.rs) and
-// the HTTP mirrors (hub_http_tests.rs).
+// hub_input_test.go:302-332) — used by the HTTP tests (hub_http_tests.rs).
 // ---------------------------------------------------------------------------
 
 use chrono::DateTime as ChronoDateTime;
 use shed_core::rc::RcActivity;
 
 use super::messages::{FeedApproval, FeedMessage};
-use super::watch::{ApprovalBlocker, ApprovalPublisher, SessionWatcher};
+use super::watch::{ApprovalPublisher, SessionWatcher};
 
 /// A scripted watcher verdict (`stubWatcher`, `hub_input_test.go:302`).
 pub(crate) struct StubWatcher {
@@ -442,14 +355,11 @@ impl SessionWatcher for StubWatcher {
 }
 
 /// `stubApprovalWatcher` (`hub_input_test.go:322`): adds the snapshot
-/// reconcile publishes and the blocked-on-a-dialog question the input gate
-/// asks. `blocked` models an open ask NOT in the snapshot — an opencode
-/// question — so the two can be driven apart.
+/// reconcile publishes.
 #[derive(Default)]
 pub(crate) struct StubApprovalWatcher {
     pub stub: StubWatcher,
     pub approvals: Vec<FeedApproval>,
-    pub blocked: bool,
 }
 
 impl SessionWatcher for StubApprovalWatcher {
@@ -469,19 +379,11 @@ impl SessionWatcher for StubApprovalWatcher {
     fn as_approval_publisher(&self) -> Option<&dyn ApprovalPublisher> {
         Some(self)
     }
-    fn as_approval_blocker(&self) -> Option<&dyn ApprovalBlocker> {
-        Some(self)
-    }
 }
 
 impl ApprovalPublisher for StubApprovalWatcher {
     fn pending_approvals(&self) -> Vec<FeedApproval> {
         self.approvals.clone()
-    }
-}
-impl ApprovalBlocker for StubApprovalWatcher {
-    fn has_open_approvals(&self) -> bool {
-        self.blocked || !self.approvals.is_empty()
     }
 }
 

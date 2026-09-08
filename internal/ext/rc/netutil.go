@@ -13,9 +13,9 @@ import "net"
 // (opencode is exec'd within the same tmux new-session call Create issues right after
 // allocating the port) and the failure mode is benign, not silent: a lost race makes
 // opencode's embedded HTTP server fail to bind, so opencode itself exits — which
-// surfaces as a visible dead RC session (ClassifyPane's shed-guest "exited to shell"
-// signal catches it), not a hard-to-diagnose hang or a watcher silently attached to
-// the wrong port. See the design doc's R9 risk note.
+// surfaces as a visible dead RC session (the tmux session ends, so it drops out of
+// `list` and `probe` reports it gone), not a hard-to-diagnose hang or a watcher
+// silently attached to the wrong port. See the design doc's R9 risk note.
 func freeLoopbackPort() (int, error) {
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {

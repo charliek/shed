@@ -24,17 +24,19 @@
 //!
 //! - [`messages`] — the per-session feed ring + wire vocabulary
 //!   (`hub_messages.go`) and the `activity.go` text-hygiene helpers.
-//! - [`stability`] — the pane-stability engine + normalizers (`stability.go`).
+//! - `stability` — the pane-stability engine + normalizers (`stability.go`) that used
+//!   to derive a baseline activity for every kind lacking a structured watcher;
+//!   deleted in S2 (`charliek/shed#324`) along with the pane classifier it fed and
+//!   consulted. opencode's watcher is the only activity producer left.
 //! - [`watch`] — the watcher freshness rule, the `mergedActivity` precedence
-//!   merge, the correlation helpers, the fold contracts, and the tmux env
-//!   seams (`watch.go`'s pure parts; the `fileWatcher`/`fsNudger` transports
-//!   follow in H7).
-//! - [`tail`] — the resilient JSONL line tailer (`watch_tail.go`).
-//! - [`watch_claude`] / [`watch_codex`] — the claude/codex folds + their
-//!   JSONL correlation (`watch_claude.go`, `watch_codex.go`).
-//! - [`watch_cursor`] — the cursor hook-event fold + transcript
-//!   restart-backfill (`watch_cursor.go`'s pure half; the push-fed watcher
-//!   wrapper follows in H7).
+//!   merge, the fold contracts, and the tmux env seams (`watch.go`'s pure
+//!   parts). The JSONL line tailer (`tail`), the codex fold + correlation
+//!   (`watch_codex`) and the cursor hook-event fold + push-fed watcher
+//!   (`watch_cursor`, with `ingest`'s pre-watcher queue and HTTP route) all
+//!   lived here until `charliek/shed#322` (A6) retired those lanes — roost is
+//!   the status authority for codex and cursor now, and they remain launchable,
+//!   attachable TUI kinds with no derived lane. `charliek/shed#321` (A5) had
+//!   removed the claude fold before them.
 //! - [`watch_opencode`] — the opencode pure fold: approval seed halves,
 //!   reopen rule, tombstones, question rows (`watch_opencode.go`; its
 //!   SSE/REST transport follows in H8).
@@ -44,16 +46,14 @@
 //!   HTTP client (the plan's sanctioned TcpStream fallback — close() must
 //!   unblock a blocked read), and the private SSE scanner.
 //! - Transports I (H7): the [`watch`] module additionally carries the
-//!   `SessionWatcher` contract + `FileWatcher` + the `notify`-backed
-//!   `FsNudger`; [`watch_cursor`] the push-fed `CursorWatcher`; [`ingest`]
-//!   the pre-watcher queue half of `hub_ingest.go` (its HTTP handler came
-//!   with H10, below).
+//!   `SessionWatcher` contract and the `notify`-backed `FsNudger`.
 //! - Hub core I (H9): [`hub`] — config resolution, the four-lock `Hub` state,
 //!   the per-slug input locks, the `inputAccepted` seven-arm gate, and the
 //!   idle-exit decision (`hub.go`'s core); [`reconcile`] — the heartbeat:
-//!   `trackedSession`, the pane-anchor debounce, `approvalSnapshot`,
-//!   `ensureWatcher` (`hub_reconcile.go`); [`events`] — event payloads +
-//!   frame encoding + the subscriber fan-out (`hub_events.go`).
+//!   `trackedSession`, `approvalSnapshot`, `ensureWatcher` (`hub_reconcile.go`;
+//!   the pane-anchor debounce it also carried went with S2, `charliek/shed#324`);
+//!   [`events`] — event payloads + frame encoding + the subscriber fan-out
+//!   (`hub_events.go`).
 //! - Hub core II (H10): the **axum 0.8 HTTP shell** per plan 010 s2.2 — the
 //!   Router is served from a hand-rolled accept loop over hyper's http1
 //!   connection with the Go per-connection posture, and contract-shaped body
@@ -62,8 +62,8 @@
 //!   handlers, `serve`, `bind_hub_listener` (bind-as-lock), the s2.5
 //!   env-seam config, and the reconcile-loop driver; [`verbs`] the
 //!   contract-v2 verb handlers + claim FSM + `APPROVAL_ID_RE`
-//!   (`hub_verbs.go`); [`events`] the SSE streaming handler; [`ingest`] the
-//!   cursor hook route. The identity-probe client (`queryHubHealth` /
+//!   (`hub_verbs.go`); [`events`] the SSE streaming handler. The
+//!   identity-probe client (`queryHubHealth` /
 //!   `probeHubIdentity`) lands with H11's bind-retry FSM.
 //! - [`role`] (plan 012) — **hosting** the above inside a long-lived process:
 //!   bind-as-lock, the bind-retry FSM, the reconcile-thread lifecycle, and the
@@ -77,16 +77,10 @@ pub mod hub;
 mod hub_http_tests;
 #[cfg(test)]
 pub(crate) mod hub_test_support;
-pub mod ingest;
 pub mod messages;
 pub mod reconcile;
 pub mod role;
-pub mod stability;
-pub mod tail;
 pub mod verbs;
 pub mod watch;
-pub mod watch_claude;
-pub mod watch_codex;
-pub mod watch_cursor;
 pub mod watch_opencode;
 pub mod watch_opencode_transport;

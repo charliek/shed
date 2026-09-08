@@ -1,0 +1,7 @@
+{
+  "body": {
+    "error": "not_accepting",
+    "message": "this kind does not accept feed input"
+  },
+  "status": 409
+}

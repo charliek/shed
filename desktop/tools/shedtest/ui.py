@@ -344,11 +344,10 @@ def subproc_env(cfg: _Subproc, *, runtime_dir: Path, mock_base_url: str,
         env[roost_key] = ",".join(f"{n}={p}" for n, p in roost_sockets.items())
     else:
         env.pop(roost_key, None)
-    # "Within one poll interval" has to be fast to be assertable: the shipped
-    # cadence is 2 s, and the watcher reads this ONCE when it is spawned — so it
-    # must be in the environment before the app starts. `setdefault`, so a driver
-    # (or the render-gate container) that pinned its own value keeps it.
-    env.setdefault("SHED_ROOST_POLL_MS", "50")
+    # NOTE: there is no roost poll knob to set. Since plan 014 the watcher
+    # observes roost's push feed (`events.subscribe`) instead of polling
+    # `tab.list`, so a machine-row change arrives when roost commits it — the
+    # cadence env var this used to seed was deleted on both sides.
     env.pop(f"{cfg.env_prefix}_SOCKET", None)
     return env
 

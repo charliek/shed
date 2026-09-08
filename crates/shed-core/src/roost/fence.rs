@@ -108,6 +108,16 @@ impl Fence {
     }
 }
 
+/// Where a tab sits in an inventory: which half, and at what index.
+///
+/// The index is what keeps roost's order: a fold that knows only "it is in the
+/// listed half" can put a row back only by appending it.
+#[derive(Debug, Clone, Copy)]
+enum Slot {
+    Listed(usize),
+    Hidden(usize),
+}
+
 impl RoostInventory {
     /// Fold one admitted batch into the inventory.
     ///
@@ -170,15 +180,15 @@ impl RoostInventory {
             }
             ops::EVENT_AGENT_REPORT_CHANGED => {
                 if let Some(report) = decode::<AgentReportChangedEvent>(data) {
-                    // Take it out and put it back: ownership may have appeared
-                    // (a shell tab becomes a session row) or gone (the adapter
-                    // released it), so which half it belongs in is re-decided.
-                    if let Some(mut session) = self.take(report.tab_id) {
+                    // Ownership may have appeared (a shell tab becomes a session
+                    // row) or gone (the adapter released it), so which half the
+                    // row belongs in is re-decided — but the row only MOVES when
+                    // that answer actually changed.
+                    self.reclassify(report.tab_id, |session| {
                         session.shell_state = report.shell_state;
                         session.lifecycle = report.agent_lifecycle;
                         session.ownership = report.ownership;
-                        self.upsert(session);
-                    }
+                    });
                 }
             }
             ops::EVENT_PROJECT_CREATED => {
@@ -228,12 +238,55 @@ impl RoostInventory {
 
     /// Insert or replace by tab id, filing the row into the listed or the hidden
     /// half according to ownership.
+    ///
+    /// A row that is already in the half it belongs in is replaced **in place**.
+    /// Order is roost's, not ours: the rows are carried in `tab.list` order and
+    /// both clients render them in it, so re-appending a row that merely changed
+    /// would shuffle a session to the bottom of the user's list for no reason
+    /// they can see. Only a row that crosses the listed/hidden line — or one that
+    /// is genuinely new — is appended.
     fn upsert(&mut self, session: RoostSession) {
-        self.remove(session.tab_id);
-        if session.is_agent_owned() {
-            self.sessions.push(session);
+        let listed = session.is_agent_owned();
+        match (self.locate(session.tab_id), listed) {
+            (Some(Slot::Listed(at)), true) => self.sessions[at] = session,
+            (Some(Slot::Hidden(at)), false) => self.hidden[at] = session,
+            (slot, _) => {
+                if let Some(slot) = slot {
+                    self.take_at(slot);
+                }
+                if listed {
+                    self.sessions.push(session);
+                } else {
+                    self.hidden.push(session);
+                }
+            }
+        }
+    }
+
+    /// Apply `change` to a tab wherever it sits, **keeping its index**, and move
+    /// it between the halves only if the change flipped its ownership.
+    ///
+    /// The alternative — take the row out, mutate, put it back — is what makes an
+    /// ordinary `agent_report.changed` (a lifecycle tick, several a minute on a
+    /// busy agent) re-append the row and reorder the whole session list.
+    fn reclassify(&mut self, tab_id: i64, change: impl FnOnce(&mut RoostSession)) {
+        let Some(slot) = self.locate(tab_id) else {
+            return;
+        };
+        let session = match slot {
+            Slot::Listed(at) => &mut self.sessions[at],
+            Slot::Hidden(at) => &mut self.hidden[at],
+        };
+        change(session);
+        let listed = session.is_agent_owned();
+        if listed == matches!(slot, Slot::Listed(_)) {
+            return;
+        }
+        let moved = self.take_at(slot);
+        if listed {
+            self.sessions.push(moved);
         } else {
-            self.hidden.push(session);
+            self.hidden.push(moved);
         }
     }
 
@@ -242,13 +295,23 @@ impl RoostInventory {
         self.hidden.retain(|s| s.tab_id != tab_id);
     }
 
-    /// Pull a row out of whichever half holds it.
-    fn take(&mut self, tab_id: i64) -> Option<RoostSession> {
+    /// Which half holds a tab, and where in it.
+    fn locate(&self, tab_id: i64) -> Option<Slot> {
         if let Some(at) = self.sessions.iter().position(|s| s.tab_id == tab_id) {
-            return Some(self.sessions.remove(at));
+            return Some(Slot::Listed(at));
         }
-        let at = self.hidden.iter().position(|s| s.tab_id == tab_id)?;
-        Some(self.hidden.remove(at))
+        self.hidden
+            .iter()
+            .position(|s| s.tab_id == tab_id)
+            .map(Slot::Hidden)
+    }
+
+    /// Pull the row at a slot [`Self::locate`] just returned out of its half.
+    fn take_at(&mut self, slot: Slot) -> RoostSession {
+        match slot {
+            Slot::Listed(at) => self.sessions.remove(at),
+            Slot::Hidden(at) => self.hidden.remove(at),
+        }
     }
 
     /// A tab by id, listed or hidden.
@@ -273,7 +336,7 @@ mod tests {
     const VECTOR_TAB_LIST: &str =
         include_str!("../../../fixtures/roost-vectors/tab.list.session.response.json");
     const VECTOR_SESSION_IDENTIFY: &str =
-        include_str!("../../../fixtures/roost-vectors/session.identify.response.json");
+        include_str!("../../../fixtures/roost-vectors/session.identify.response.v4.json");
     const VECTOR_EVENTS_BATCH: &str =
         include_str!("../../../fixtures/roost-vectors/events.batch.json");
     const VECTOR_TAB_OPENED: &str =
@@ -502,6 +565,120 @@ mod tests {
         inventory.apply(&batch(45, &[VECTOR_AGENT_REPORT_CHANGED]));
         assert_eq!(inventory.sessions.len(), 1);
         assert_eq!(inventory.sessions[0].title, "zsh");
+    }
+
+    /// A `tab.opened` envelope for a plain shell tab.
+    fn opened(tab_id: i64) -> EventEnvelope {
+        EventEnvelope {
+            event: ops::EVENT_TAB_OPENED.to_string(),
+            data: serde_json::json!({
+                "tab": {
+                    "id": tab_id.to_string(),
+                    "project_id": "1",
+                    "title": format!("tab {tab_id}"),
+                    "cwd": "/Users/me",
+                    "state": "none",
+                    "has_notification": false,
+                    "is_active": false,
+                    "user_titled": false,
+                    "position": tab_id,
+                    "created_at": 1_700_001_000i64,
+                    "last_active": 1_700_001_000i64,
+                    "hook_active": false
+                }
+            }),
+        }
+    }
+
+    /// An `agent_report.changed` envelope claiming `tab_id` for opencode at
+    /// `lifecycle` — the ordinary lifecycle tick a live agent emits over and over.
+    fn reported(tab_id: i64, lifecycle: &str) -> EventEnvelope {
+        EventEnvelope {
+            event: ops::EVENT_AGENT_REPORT_CHANGED.to_string(),
+            data: serde_json::json!({
+                "tab_id": tab_id.to_string(),
+                "shell_state": "foreground_process",
+                "agent_lifecycle": lifecycle,
+                "ownership": {
+                    "source": "opencode",
+                    "session_id": format!("ses_{tab_id}"),
+                    "last_event_at": 1_700_001_100i64,
+                    "detail": "session_status",
+                    "metadata": {}
+                },
+                "state": "running",
+                "hook_active": true
+            }),
+        }
+    }
+
+    fn tab_ids(rows: &[RoostSession]) -> Vec<i64> {
+        rows.iter().map(|s| s.tab_id).collect()
+    }
+
+    /// **An ordinary status change must not reshuffle the list.** roost owns the
+    /// order — the rows are carried in `tab.list` order and both clients render
+    /// them in it — and a lifecycle tick is not a reorder. Folding one by taking
+    /// the row out and putting it back sent that session to the bottom of the
+    /// user's list several times a minute, which the poller used to paper over by
+    /// re-deriving the order from every `tab.list`.
+    #[test]
+    fn an_agent_report_keeps_the_rows_order() {
+        let (_, mut inventory) = seeded();
+        // Three claimed rows, in the order they arrived.
+        inventory.apply(&EventBatch {
+            revision: 43,
+            events: vec![
+                opened(7),
+                opened(8),
+                reported(5, "working"),
+                reported(7, "working"),
+                reported(8, "working"),
+            ],
+        });
+        assert_eq!(tab_ids(&inventory.sessions), vec![5, 7, 8]);
+
+        // The middle row ticks through a whole lifecycle. It stays put, and it
+        // still carries the new axes.
+        for lifecycle in ["waiting", "working", "finished"] {
+            inventory.apply(&EventBatch {
+                revision: inventory.revision.unwrap_or(43) + 1,
+                events: vec![reported(7, lifecycle)],
+            });
+            assert_eq!(
+                tab_ids(&inventory.sessions),
+                vec![5, 7, 8],
+                "a {lifecycle} report moved the row"
+            );
+        }
+        assert_eq!(inventory.sessions[1].lifecycle, AgentLifecycle::Finished);
+
+        // The control: crossing the listed/hidden line DOES re-file the row —
+        // there is no index to keep in the other half.
+        inventory.apply(&EventBatch {
+            revision: inventory.revision.unwrap_or(43) + 1,
+            events: vec![EventEnvelope {
+                event: ops::EVENT_AGENT_REPORT_CHANGED.to_string(),
+                data: serde_json::json!({
+                    "tab_id": "5",
+                    "shell_state": "at_prompt",
+                    "agent_lifecycle": "inactive",
+                    "state": "none",
+                    "hook_active": false
+                }),
+            }],
+        });
+        assert_eq!(tab_ids(&inventory.sessions), vec![7, 8]);
+        inventory.apply(&EventBatch {
+            revision: inventory.revision.unwrap_or(43) + 1,
+            events: vec![reported(5, "working")],
+        });
+        assert_eq!(
+            tab_ids(&inventory.sessions),
+            vec![7, 8, 5],
+            "a re-promoted row lands where the fold learned of it, until the \
+             next tab.list re-derives roost's own order"
+        );
     }
 
     #[test]

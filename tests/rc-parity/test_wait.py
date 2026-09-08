@@ -150,6 +150,9 @@ def test_single_line_kickoff_is_delivered_once(differential, isolated):
     assert MARKER in cell["tail"]
 
 
+MULTILINE_MARKERS = 4
+
+
 def test_multiline_kickoff_is_delivered(differential, isolated):
     """A MULTI-line kickoff takes the other delivery path: `set-buffer` +
     `paste-buffer -p -d` (bracketed paste) instead of `send-keys -l`. The
@@ -179,7 +182,10 @@ def test_multiline_kickoff_is_delivered(differential, isolated):
             stdin="# parity plan\n\n- do the thing\n",
         )
         assert res.returncode == 0, f"{impl}: exit {res.returncode}: {res.stderr}"
-        pane = leg.wait_for_pane(f"rc-{slug}", MARKER)
+        # All four copies, not merely the first: this cell PINS the count, so
+        # sampling a pane that is still drawing is what makes one leg report 3
+        # against the other's 4 (`wait_for_pane`'s own note).
+        pane = leg.wait_for_pane(f"rc-{slug}", MARKER, count=MULTILINE_MARKERS)
         return {
             "dto": mask_session(res.json(), str(leg.home)),
             "marker_count": pane.count(MARKER),

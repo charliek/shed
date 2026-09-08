@@ -32,27 +32,23 @@
         "claude-rc": {
           "approvals": "tui",
           "attach": "tmux",
-          "feed": "activity",
+          "feed": "none",
           "interrupt": false,
           "post_input": true
         },
         "codex": {
           "approvals": "tui",
           "attach": "tmux",
-          "feed": "messages",
-          "input": "gated",
+          "feed": "none",
           "interrupt": false,
-          "post_input": true,
-          "watch": true
+          "post_input": true
         },
         "cursor": {
           "approvals": "tui",
           "attach": "tmux",
-          "feed": "messages",
-          "input": "gated",
+          "feed": "none",
           "interrupt": false,
-          "post_input": true,
-          "watch": true
+          "post_input": true
         },
         "opencode": {
           "approvals": "remote",

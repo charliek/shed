@@ -573,7 +573,6 @@ const (
 	// values instead (plan 010 §2.5).
 	envHubActiveMS       = "SHED_RC_HUB_ACTIVE_MS"
 	envHubIdleMS         = "SHED_RC_HUB_IDLE_MS"
-	envHubQuietMS        = "SHED_RC_HUB_QUIET_MS"
 	envHubIdleExitMS     = "SHED_RC_HUB_IDLE_EXIT_MS"
 	envHubHeartbeatMS    = "SHED_RC_HUB_HEARTBEAT_MS"
 	envHubWriteTimeoutMS = "SHED_RC_HUB_WRITE_TIMEOUT_MS"
@@ -620,7 +619,6 @@ func applyHubEnvOverrides(hc *rc.HubConfig, cfg Config, d deps) {
 	}{
 		{envHubActiveMS, &hc.ActiveInterval},
 		{envHubIdleMS, &hc.IdleInterval},
-		{envHubQuietMS, &hc.QuietPeriod},
 		{envHubIdleExitMS, &hc.IdleTimeout},
 		{envHubHeartbeatMS, &hc.Heartbeat},
 		{envHubWriteTimeoutMS, &hc.WriteTimeout},
@@ -796,18 +794,19 @@ func doClaude(cfg Config, d deps, args []string) int {
 	fmt.Fprintf(d.stdout, "Started %s session %q — permission-mode=%s (tools run UNATTENDED).\n",
 		session.Kind, session.Slug, mode)
 	// Exit non-zero when the session didn't reach a usable URL, so a script that
-	// runs `shed-machine-rc claude` can tell "ready" from "needs auth / still
-	// starting" — the tmux session is left running either way.
+	// runs `shed-machine-rc claude` can tell a steerable session from one that isn't
+	// — the tmux session is left running either way.
+	//
+	// The URL IS the test. S2 (charliek/shed#324) reduced `state` to liveness, so it
+	// can no longer tell "logged out" from "still drawing"; the claude.ai
+	// remote-control URL survived precisely because it is control, and its presence
+	// is exactly the "can I steer this from my phone?" question this summary answers.
 	exit := 0
-	switch session.State {
-	case rc.StateReady:
+	if session.URL != "" {
 		fmt.Fprintf(d.stdout, "  Watch/steer from your phone or browser: %s\n", session.URL)
-	case rc.StateNeedsAuth:
-		fmt.Fprintf(d.stdout, "  Claude is not logged in on this machine — run `claude` once to authenticate, then retry.\n")
-		exit = 1
-	default:
-		fmt.Fprintf(d.stdout, "  State: %s (no URL yet — `%s probe --slug %s` to recheck).\n",
-			session.State, cfg.ProgName, session.Slug)
+	} else {
+		fmt.Fprintf(d.stdout, "  No claude.ai URL yet — claude may still be starting, or is not logged in on this machine (run `claude` once to authenticate). `%s probe --slug %s` to recheck.\n",
+			cfg.ProgName, session.Slug)
 		exit = 1
 	}
 	fmt.Fprintf(d.stdout, "  Attach locally:  tmux attach -t %s\n", session.TmuxSession)

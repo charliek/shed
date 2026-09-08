@@ -225,13 +225,14 @@ class _ApprovalOps:
 
 
 class _RcOps:
-    """The remote-control (Agents) op surface — classify / list / launch / kill /
+    """The remote-control (Agents) op surface — list / launch / kill /
     inject_test — shared by the mac app and the Tauri client (both wire the same
     shed-core/shed-app RC spine with identical op names + shapes). `self.call`
-    comes from the `IPCClient` base each mixes in with."""
+    comes from the `IPCClient` base each mixes in with.
 
-    def rc_classify(self, kind: str, pane: str) -> dict:
-        return self.call("rc.classify", {"kind": kind, "pane": pane})
+    The pure pane-classifier op and its `rc_classify` helper went with S2
+    (charliek/shed#324): a shed row's `state` comes off the wire from the guest,
+    where it is liveness now."""
 
     def rc_list(self, host: str | None = None, shed: str | None = None) -> list[dict]:
         params: dict = {}

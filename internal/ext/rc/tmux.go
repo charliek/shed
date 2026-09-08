@@ -69,25 +69,20 @@ func createSession(r Runner, name, workdir string, envArgs []string, inner strin
 }
 
 // capturePane returns the last 200 lines of a session's pane — the VISIBLE frame plus
-// up to 200 lines of scrollback. Scrollback is what makes lifecycle classification work:
-// a boot banner, a login URL, or the shell prompt an agent exited to has usually
-// scrolled off by the time anyone looks, and the classifiers need to see it.
+// up to 200 lines of scrollback. Scrollback is what makes the surviving pane readers
+// work: claude's remote-control URL is printed once, at launch, and has usually
+// scrolled off by the time anyone looks.
+//
+// A successful capture is also the LIVENESS signal (S2, charliek/shed#324): a session
+// whose tmux session is gone fails here, and that is the only "dead" left.
 func capturePane(r Runner, name string) Result {
 	return r.Run("capture-pane", "-t", name, "-p", "-S", "-200")
 }
 
-// captureVisiblePane returns ONLY what is on screen right now (no -S, so no scrollback).
-//
-// This is the capture that ANY "is a modal on screen?" question must use. Scrollback is
-// history: a TUI's approval dialog that was answered — or that was on screen when the
-// agent crashed out to a shell, or that a resize reflowed out of view — stays in the
-// scrollback verbatim, so an anchor evaluated against `capturePane` can keep reporting a
-// dialog that no longer exists and has no way to ever clear. The visible frame IS the
-// present tense, and a modal that is not in it is not up. Callers that classify
-// lifecycle or diff for stability must keep using capturePane.
-func captureVisiblePane(r Runner, name string) Result {
-	return r.Run("capture-pane", "-t", name, "-p")
-}
+// S2 (charliek/shed#324) removed captureVisiblePane. It existed for exactly one
+// question — "is a modal on screen RIGHT NOW?" — which the pane-anchor approval scan
+// asked and nothing asks any more. The Rust twin keeps its Tmux::capture_visible_pane
+// as a transport primitive; Go's linter does not tolerate an unused one.
 
 // listSessionNames returns the rc-* tmux session names (empty if no server/sessions).
 // Any listing failure reads as empty — fine for the one-shot subcommands; the hub's
