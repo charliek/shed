@@ -53,6 +53,24 @@ consumes the hub. Ready now with no blockers: S7.
 - **Never reintroduce pane scraping.** No new anchor regexes, no
   stability heuristics, no classifier fallbacks. Status is read from
   roost, never derived. One status authority per session.
+- **`kind_features.feed` must say what that producer can actually
+  stream, and the two producers differ.** Settled in M2 (plan 014),
+  against #322's own wording, because accuracy beats the ticket text:
+  - the **guest hub** says `feed: "none"` for claude-rc, codex and
+    cursor. A5/A6 deleted their activity producers, so it has no signal
+    at all for them. `""` would be wrong too — that means "field absent,
+    producer predates v2" and sends a client back to `watch`.
+  - shed's **roost-backed machine capabilities** say `feed: "activity"`
+    for the same kinds, because roost reports lifecycle for them and the
+    client folds it into a live activity dimension.
+
+  So the same kind gets different answers depending on **where the
+  session lives**. `feed` describes the *message* feed; no client gates
+  its activity chip on it. The practical consequence, until S5 puts a
+  roost-session inside sheds: **a codex or cursor session on a machine
+  shows roost-sourced activity; the same kind on a shed shows liveness
+  only, with no activity at all.** That is accepted, it is visible in
+  the payload rather than hidden, and S5 is what closes it.
 - **The hub is retired, not adapted.** Do not add roost as a provider
   *behind* the `/v1` hub; clients read roost directly through
   `shed-core`. Every hub route already has a home (§04 Q6).
