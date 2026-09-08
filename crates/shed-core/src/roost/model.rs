@@ -397,13 +397,23 @@ pub fn roost_capabilities() -> RcCapabilities {
 /// The one per-kind feature set every roost kind gets. See
 /// [`roost_capabilities`].
 ///
-/// **`feed` is `"none"`, not `""`.** The two are different words in the shared
-/// vocabulary ([`RcKindFeatures::feed`], `docs/extensions/rc-helper.md` § feed):
-/// an EMPTY `feed` means the field is absent because the producer predates v2,
-/// and a client falls back to `watch` and treats the row as activity-capable; a
-/// v2 producer's "no hub signal at all" value is the literal `"none"`, which
-/// `sx ls` renders as `-`. shed synthesizes these as a v2 producer
-/// (`rc_version: 2`, `contract-v2` in `features`), so it must speak v2's word.
+/// **`feed` is `"activity"`.** Three words are in play and only one is true here.
+/// An EMPTY `feed` means the field is absent because the producer predates v2 —
+/// wrong, since shed synthesizes this block as a v2 producer (`rc_version: 2`,
+/// `contract-v2` in `features`). `"none"` means "no signal at all" — also wrong,
+/// and the value this briefly carried: a roost row DOES carry a live activity
+/// dimension, folded out of `agent_lifecycle` and the adapter's `detail` by
+/// [`RoostSession::activity`] and refreshed by every batch the observer stream
+/// delivers. `"activity"` is the vocabulary's word for exactly that — the
+/// activity dimension and no message feed — so it is the honest one.
+///
+/// The distinction that makes this easy to get backwards: `feed` describes the
+/// **message** feed, and no client gates its activity chip on it (the chip reads
+/// the row's own `activity` field). So the guest hub, whose codex and cursor
+/// rows have had no activity producer since A6, correctly says `"none"`, while
+/// roost — which reports activity for those same kinds — says `"activity"`.
+/// Same two kinds, different answer, because the answer is about where the
+/// session lives, not what it is.
 ///
 /// `approvals` is `"none"`, a third value beside the documented `tui` | `remote`
 /// pair (recorded in rc-helper.md's field table): roost answers approvals in the
@@ -417,7 +427,7 @@ fn roost_kind_features() -> RcKindFeatures {
         approvals: "none".to_string(),
         watch: false,
         input: String::new(),
-        feed: "none".to_string(),
+        feed: "activity".to_string(),
         interrupt: false,
         attach: ATTACH_NATIVE_REMOTE.to_string(),
     }
@@ -1017,10 +1027,16 @@ failed   foreground_process question_asked    -> needs_input";
             assert!(!features.feed_messages());
             assert_eq!(features.input, "");
             assert!(!features.input_gated());
-            // The v2 word for "no hub signal at all". An EMPTY feed would mean
-            // "field absent, fall back to `watch`" and would make `sx ls` render
-            // the row as activity-capable.
-            assert_eq!(features.feed, "none");
+            // A roost row carries a live activity dimension (see the matrix in
+            // `activity_matrix_pins_every_cell`), so the honest word is
+            // `"activity"` — the vocabulary's "activity dimension, no message
+            // feed". NOT `""` (which means "pre-v2, fall back to `watch`") and
+            // not `"none"` (which would deny the status this whole pivot
+            // exists to deliver). The guest hub says `"none"` for these same
+            // kinds because ITS producer is gone; the answer depends on where
+            // the session lives.
+            assert_eq!(features.feed, "activity");
+            assert!(!features.feed_messages(), "activity is not a message feed");
             assert!(!features.interrupt);
         }
 
