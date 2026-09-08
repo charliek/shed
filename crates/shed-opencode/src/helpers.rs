@@ -295,6 +295,80 @@ pub(crate) fn trim_feed_text(s: &str) -> &str {
     s.trim_matches([' ', '\t', '\n', '\r'])
 }
 
+// ---- ring hygiene (rc_hub::messages; used by [`crate::ring`]) ----
+
+/// Caps one message's text (and one tool block's name/detail) after
+/// sanitization. 8 KiB preserves far more than the 200-rune last_message
+/// preview while keeping a single row bounded; a longer value is truncated with
+/// [`FEED_TRUNC_MARKER`] appended.
+pub(crate) const MAX_FEED_MESSAGE_BYTES: usize = 8 << 10;
+
+/// Appended to a text (or tool detail) truncated at the byte cap, so a client
+/// can tell a preview from a complete message.
+pub(crate) const FEED_TRUNC_MARKER: &str = "…[truncated]";
+
+/// Caps each identifier-shaped approval field (the id, the status, and every
+/// advertised decision token) at the length of the id's wire grammar
+/// (`^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$`). The grammar itself is the
+/// producing layer's business; the ring only BOUNDS what it is handed, so a
+/// misbehaving producer cannot inflate the byte budget.
+pub(crate) const MAX_APPROVAL_TOKEN_BYTES: usize = 128;
+
+/// Caps how many advertised decisions one approval row may carry. The decision
+/// vocabulary is a fixed, tiny enum; the cap exists so the slice cannot be used
+/// as unbounded payload.
+pub(crate) const MAX_APPROVAL_DECISIONS: usize = 8;
+
+/// Strips ANSI escape sequences and non-whitespace control characters from raw
+/// agent text, then caps it at [`MAX_FEED_MESSAGE_BYTES`] on a char boundary
+/// (appending [`FEED_TRUNC_MARKER`] when it truncates). Unlike
+/// [`sanitize_last_message`] it PRESERVES newlines and internal whitespace — a
+/// feed row keeps its structure (a code block, multi-line tool output) rather
+/// than collapsing to a one-line preview.
+pub(crate) fn sanitize_feed_text(s: &str) -> String {
+    if s.is_empty() {
+        return String::new();
+    }
+    let s = ANSI_ESCAPE_RE.replace_all(s, "");
+    let s = strip_non_whitespace_controls(&s);
+    if s.len() <= MAX_FEED_MESSAGE_BYTES {
+        return s;
+    }
+    let mut out = truncate_bytes(&s, MAX_FEED_MESSAGE_BYTES).to_string();
+    out.push_str(FEED_TRUNC_MARKER);
+    out
+}
+
+/// Strips ANSI escapes plus EVERY control and whitespace rune from a
+/// single-token approval field (id/status/decision). Feed text keeps newlines
+/// and tabs (multi-line prose is content there); a token that contains them is
+/// malformed, and preserving them would let a crafted value smuggle separators
+/// into a field the contract defines as one token.
+pub(crate) fn sanitize_feed_token(s: &str) -> String {
+    if s.is_empty() {
+        return String::new();
+    }
+    ANSI_ESCAPE_RE
+        .replace_all(s, "")
+        .chars()
+        .filter(|&r| !(r <= '\x20' || r == '\x7f' || ('\u{80}'..='\u{9f}').contains(&r)))
+        .collect()
+}
+
+/// Caps `s` at `n` bytes on a char boundary (never mid-codepoint). It appends
+/// no marker of its own: [`sanitize_feed_text`] adds one for prose, while the
+/// identifier fields it also guards would only be muddied by a marker inside
+/// the value.
+pub(crate) fn truncate_bytes(s: &str, mut n: usize) -> &str {
+    if s.len() <= n {
+        return s;
+    }
+    while n > 0 && !s.is_char_boundary(n) {
+        n -= 1; // back up to a char boundary so a multi-byte codepoint is never split
+    }
+    &s[..n]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

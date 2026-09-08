@@ -26,9 +26,12 @@ serde = { workspace = true }
 # `Value` would re-sort object keys and diverge from the hub's feed rows.
 serde_json = { workspace = true, features = ["raw_value"] }
 thiserror = { workspace = true }
-# `net` on top of the workspace's rt-multi-thread/macros/sync/time: C3's
-# `FakeOpencode` binds a loopback `TcpListener`.
-tokio = { workspace = true, features = ["net"] }
+# `net` + `io-util` on top of the workspace's rt-multi-thread/macros/sync/time:
+# `FakeOpencode` binds a loopback `TcpListener` and speaks HTTP/1.1 over it with
+# `BufReader`/`AsyncWriteExt`. Both are already enabled by shed-core, so this
+# adds no feature to the workspace's tokio build — it just stops this crate from
+# depending on a sibling's feature list.
+tokio = { workspace = true, features = ["net", "io-util"] }
 reqwest = { workspace = true }
 futures-util = { workspace = true }
 async-trait = { workspace = true }
@@ -44,7 +47,30 @@ chrono = { version = "0.4", default-features = false, features = ["std"] }
 # already reaches this crate transitively through shed-core.
 regex = "1"
 
+[features]
+# Exports `testing::FakeOpencode` — the in-process opencode double — across the
+# crate boundary, the `shed_core::roost::testing::FakeRoost` pattern. Integration
+# tests (`tests/*.rs`) reach the fake THROUGH this feature; `cfg(test)` would not
+# cross the boundary. Test-only by construction: the module is
+# `#[cfg(any(test, feature = "test-support"))]`, so a shipped binary never
+# carries it.
+test-support = []
+
 [dev-dependencies]
-# `rt` (the current-thread runtime) for the async tests; the lib itself only
-# needs the workspace features plus `net`.
-tokio = { workspace = true, features = ["rt"] }
+# `rt` (the current-thread runtime) for the async tests. `test-util` is what
+# `#[tokio::test(start_paused = true)]` needs: the watcher's 30 s stall window
+# is asserted against a PAUSED clock, so the test proves the real constant in
+# milliseconds instead of sleeping for half a minute. Both are tokio's own
+# features — no package joins the lock — and `test-util` changes nothing unless
+# a test explicitly pauses time.
+tokio = { workspace = true, features = ["rt", "test-util"] }
+# The integration tests drive the fake, which lives behind the feature.
+shed-opencode = { path = ".", features = ["test-support"] }
+
+# The manual verification tool (plan 015 §8) and the smallest proof the contract
+# is usable from OUTSIDE this crate: it calls nothing but `AgentLane`. Named
+# explicitly so `cargo run --example shed-opencode-lane` matches the name the
+# plan and the docs use.
+[[example]]
+name = "shed-opencode-lane"
+path = "examples/lane.rs"

@@ -200,6 +200,7 @@ cargo clippy -p shed-app --features rc --all-targets -- -D warnings
 cargo clippy -p shed-app --features broker --all-targets -- -D warnings
 cargo clippy -p shed-app --features broker,rc --all-targets -- -D warnings
 cargo test -p shed-opencode                          # the opencode agent-lane adapter
+cargo test -p shed-opencode --features test-support  # exports `testing::FakeOpencode`
 ```
 
 Note: `sx` (the crate that used to be a default member enabling shed-app's `rc` feature
