@@ -713,7 +713,7 @@ release:
 
 # Local goreleaser snapshot of ONE release component — the pre-CI proof that
 # .goreleaser.<component>.yaml still builds its targets and renders its deb /
-# brew formula. `make snapshot-sx`, `snapshot-server`, `snapshot-host-agent`.
+# brew formula. `make snapshot-server`, `snapshot-host-agent`.
 # Mirrors what ci.yml's release-snapshot job runs.
 #
 # goreleaser comes from .mise.toml pinned to CI's exact version (a local
@@ -726,7 +726,7 @@ release:
 #                     aarch64-unknown-linux-gnu x86_64-unknown-linux-gnu
 #
 # `check` alone (config validation, no build) is the cheap subset:
-#   mise exec -- goreleaser check -f .goreleaser.sx.yaml
+#   mise exec -- goreleaser check -f .goreleaser.host-agent.yaml
 #
 # A pattern rule, so it needs no .PHONY entry (pattern rules never match a
 # real file here — there is no `snapshot-*` on disk).

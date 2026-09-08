@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 # Recommend which release components a NEXT stable tag should ship.
 #
-# The monorepo carries four release components on ONE vX.Y.Z tag family
-# (see RELEASING.md "Component selection"): server, host-agent, sx, desktop.
+# The monorepo carries three release components on ONE vX.Y.Z tag family
+# (see RELEASING.md "Component selection"): server, host-agent, desktop.
 # (machine-rc was retired in plan 010 — the shed-host-agent daemon hosts the
-# machine RC hub and `sx` carries the one-shot verbs.)
+# machine RC hub. sx was sunset in plan 016 — the RC porcelain never shipped
+# and its whole release wiring was removed.)
 #
 # This script inspects committed history and prints a RECOMMENDATION; it never
 # bumps a manifest, never writes a file, never mutates git. The human
@@ -119,21 +120,6 @@ PATHS_HOST_AGENT=(
   .goreleaser.host-agent.yaml
 )
 
-# sx: the RC porcelain binary + every crate it links. Same exclusion rationale
-# as host-agent: crates/Cargo.toml + crates/Cargo.lock are DELIBERATELY absent
-# (every desktop bump rewrites them, which would flag sx after every desktop
-# release). Accepted gap: a [workspace.dependencies]-only bump won't auto-flag
-# sx either — the human confirm is the backstop.
-# shellcheck disable=SC2034  # read via get_paths()
-PATHS_SX=(
-  crates/sx
-  crates/shed-app
-  crates/shed-rc-engine
-  crates/shed-core
-  crates/rust-toolchain.toml
-  .goreleaser.sx.yaml
-)
-
 # desktop: the app + every crate it links + the shared cargo manifests/locks
 # (which the desktop bump owns).
 # shellcheck disable=SC2034  # read via get_paths()
@@ -153,7 +139,7 @@ PATHS_DESKTOP=(
 )
 
 # Canonical component order (drives every output list).
-COMPONENTS=(server host-agent sx desktop)
+COMPONENTS=(server host-agent desktop)
 
 # Components that have NEVER shipped in any tag — the first-ship bootstrap.
 #
@@ -173,10 +159,12 @@ COMPONENTS=(server host-agent sx desktop)
 # Self-healing: once a tag ships the component, loop (a) of find_lastship finds
 # it and this list is never consulted again. PRUNE the entry then.
 #
-# sx (plan 011) is listed because it ships for the first time on whatever tag
-# next carries crates/sx/VERSION; the file is seeded at 0.0.0, a version no tag
-# will ever carry, so the walk correctly finds nothing.
-NEVER_SHIPPED=(sx)
+# EMPTY since plan 016 (S7, #329): the only entry was `sx`, and that component
+# was sunset before it ever shipped. The mechanism stays for THE NEXT BRAND-NEW
+# COMPONENT — add its name here (alongside its COMPONENTS / manifest_path() /
+# get_paths() entries) so its first-ship bootstrap reports "(never shipped)"
+# instead of hard-erroring, and prune it again once a tag has shipped it.
+NEVER_SHIPPED=()
 
 # True (exit 0) iff $1 is in NEVER_SHIPPED. Index-loop the scan (rather than
 # `for c in "${NEVER_SHIPPED[@]}"`) so that pruning the LAST entry — which the
@@ -270,7 +258,6 @@ manifest_path() {
   case "$1" in
     server) echo ".claude-plugin/plugin.json" ;;
     host-agent) echo "crates/shed-host-agent/VERSION" ;;
-    sx) echo "crates/sx/VERSION" ;;
     desktop) echo "desktop/VERSION" ;;
   esac
 }
@@ -282,7 +269,6 @@ get_paths() {
   case "$1" in
     server)     paths=("${PATHS_SERVER[@]}") ;;
     host-agent) paths=("${PATHS_HOST_AGENT[@]}") ;;
-    sx)         paths=("${PATHS_SX[@]}") ;;
     desktop)    paths=("${PATHS_DESKTOP[@]}") ;;
   esac
 }
@@ -552,7 +538,7 @@ done
   else
     echo "  ${LEVEL} → recommending ALL components (a version-line bump ships the fleet)."
   fi
-  echo "  CAVEAT (host-agent, sx): a [workspace.dependencies]-only bump in crates/Cargo.toml is"
+  echo "  CAVEAT (host-agent): a [workspace.dependencies]-only bump in crates/Cargo.toml is"
   echo "         NOT auto-detected (that file is excluded to avoid desktop-bump false positives)."
   if [ "${FIRST_SHIP}" = "true" ]; then
     echo "  NOTE (first ship): a component shown as '(never shipped)' has no diff basis — it is"
