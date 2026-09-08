@@ -15,17 +15,28 @@ OpencodeClient  — the transport (two reqwest clients), the verbs, AgentLane
 
 `OpencodeFold` is a port of the rc hub's fold
 (`crates/shed-broker/src/rc_hub/watch_opencode.rs`), which is itself a port of
-the Go guest's `internal/ext/rc/watch_opencode.go`. Two things keep the port
-honest:
+the Go guest's `internal/ext/rc/watch_opencode.go`. Three things keep the port
+honest, and they carry **different claims** — `fixtures/README.md` is the one
+place that spells the difference out:
 
-- **`fixtures/opencode_turn.golden.json`** — a recording of what the HUB's fold
-  produces on `crates/fixtures/jsonl/opencode_turn.jsonl`, reduced to the
-  projection the two folds share. `tests/fold_fixtures.rs` replays the fixture
-  through THIS fold and asserts it still equals that. See the fixture README for
-  how it was recorded and why the test does not depend on `shed-broker`.
-- **Hand-authored unit inputs** (`src/fold.rs`'s test module) for everything the
-  fixture cannot reach — it was recorded from opencode 1.17.15 and contains no
-  `permission.asked` and no `question.asked`.
+- **`fixtures/opencode_turn.golden.json` — FIDELITY.** A recording of what the
+  HUB's fold produces on `crates/fixtures/jsonl/opencode_turn.jsonl` (opencode
+  1.17.15), reduced to the projection the two folds share.
+  `tests/fold_fixtures.rs` replays the fixture through THIS fold and asserts it
+  still equals that. It is **not** regenerable from this crate — regenerating a
+  hub recording from the port would assert the port against itself.
+- **`fixtures/1.18.29/fold.golden.json` — REGRESSION DETECTION.** What THIS fold
+  produces from the committed 155-frame opencode 1.18.29 recording: rows,
+  verdicts and the full `LaneApproval` DTOs, so the approval and question paths
+  are pinned against real wire rather than only hand-authored inputs. Re-derive
+  it offline with `SHED_OPENCODE_REGOLD=1 cargo test -p shed-opencode --test
+  fold_fixtures`. Its transcript subset was separately proven byte-identical to
+  the hub's fold (plan 015 C3b, throwaway harness, deleted with its dev-dep) —
+  that subset is fidelity; its approval DTOs and its `session.error` row are the
+  port's alone.
+- **Hand-authored unit inputs** (`src/fold.rs`'s test module) for the rules no
+  recording exercises deterministically — `note_gap`, `reset`, `seed_approvals`,
+  a re-ask reopening a resolved entry.
 
 The helpers in `src/helpers.rs` are **copied** from `shed-broker::rc_hub`, not
 linked: `rc_hub::watch` imports `shed_rc_engine::tmux::Tmux`, so linking would
@@ -155,3 +166,14 @@ SHED_OPENCODE_LIVE=1 cargo test -p shed-opencode --test live -- --nocapture
 SHED_OPENCODE_LIVE=1 SHED_OPENCODE_RECORD=1 \
   cargo test -p shed-opencode --test live -- --nocapture   # → fixtures/1.18.29/
 ```
+
+Re-recording the wire and re-deriving the goldens are **two independent steps**:
+the command above needs a live opencode, network and money; re-deriving is
+offline, free and deterministic:
+
+```bash
+SHED_OPENCODE_REGOLD=1 cargo test -p shed-opencode --test fold_fixtures
+```
+
+An opencode version bump is: re-record → re-derive → **review the golden diff as
+the substantive change**. `fixtures/README.md` has the full recipe.

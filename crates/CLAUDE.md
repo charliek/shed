@@ -64,7 +64,15 @@ re-implemented per language. The root `CLAUDE.md` owns the monorepo layout + rel
   `fold.rs` is a **port** of the rc hub's `OpencodeFold`, and it is pinned as one —
   `fixtures/opencode_turn.golden.json` records what the HUB's fold produced on
   `fixtures/jsonl/opencode_turn.jsonl`, and the test replays the port against it (that
-  test must NEVER take a `shed-broker` dep; the golden file is the pin). The helpers the
+  test must NEVER take a `shed-broker` dep; the golden file is the pin). A **second**
+  golden, `fixtures/1.18.29/fold.golden.json`, pins the port's OWN behavior (rows,
+  verdicts and `LaneApproval` DTOs) over a committed 155-frame opencode 1.18.29
+  recording — regression detection, not fidelity, except for the transcript subset that
+  was separately proven identical to the hub's fold. **The two claims must never be
+  blurred**; `shed-opencode/fixtures/README.md` is the one place that spells them out,
+  and it carries the two-step regeneration recipe (re-record the wire live with
+  `SHED_OPENCODE_LIVE=1 SHED_OPENCODE_RECORD=1 … --test live`; re-derive the golden
+  OFFLINE with `SHED_OPENCODE_REGOLD=1 … --test fold_fixtures`). The helpers the
   fold needs are **copied** into `helpers.rs` rather than linked, because
   `rc_hub::watch` imports `shed_rc_engine::tmux::Tmux` — linking would drag the RC
   engine into an HTTP adapter. The duplication ends when S6 deletes the hub's watcher.

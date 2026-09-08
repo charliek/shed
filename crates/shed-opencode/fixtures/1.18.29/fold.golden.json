@@ -1,0 +1,1678 @@
+{
+  "_comment": "REGRESSION PIN on shed-opencode's OWN fold, replayed over the committed opencode 1.18.29 recording. Unlike fixtures/opencode_turn.golden.json this is NOT a hub recording and NOT a fidelity proof: nothing but this crate minted it, so a diff here is a behavior change to review, never evidence of agreement with the rc hub. (The transcript subset WAS separately proven identical to the hub's fold — see fixtures/README.md.) Regenerate offline with SHED_OPENCODE_REGOLD=1 cargo test -p shed-opencode --test fold_fixtures.",
+  "approvals": [
+    {
+      "asked": {
+        "detail": "echo shed-lane-live",
+        "id": "per_07ed2c2b4001b0mPhLsW2d6HRO",
+        "kind": "permission",
+        "options": [
+          {
+            "id": "allow_once",
+            "label": "Allow once"
+          },
+          {
+            "id": "allow_always",
+            "label": "Always"
+          },
+          {
+            "id": "reject",
+            "label": "Reject"
+          }
+        ],
+        "questions": [],
+        "request_json": "{\"id\":\"per_07ed2c2b4001b0mPhLsW2d6HRO\",\"sessionID\":\"ses_f812d4751ffe9mqLuI0o1z56fn\",\"permission\":\"bash\",\"patterns\":[\"echo shed-lane-live\"],\"metadata\":{\"command\":\"echo shed-lane-live\"},\"always\":[\"echo *\"],\"tool\":{\"messageID\":\"msg_07ed2be1b001vDHIHd74dj68eG\",\"callID\":\"call_01a07ed2c1987950b920458abc81906f\"}}",
+        "session_id": "ses_f812d4751ffe9mqLuI0o1z56fn",
+        "status": "pending",
+        "title": "awaiting approval: bash — echo shed-lane-live"
+      },
+      "asked_at_line": 94,
+      "final": {
+        "detail": "echo shed-lane-live",
+        "id": "per_07ed2c2b4001b0mPhLsW2d6HRO",
+        "kind": "permission",
+        "options": [
+          {
+            "id": "allow_once",
+            "label": "Allow once"
+          },
+          {
+            "id": "allow_always",
+            "label": "Always"
+          },
+          {
+            "id": "reject",
+            "label": "Reject"
+          }
+        ],
+        "questions": [],
+        "request_json": "{}",
+        "session_id": "ses_f812d4751ffe9mqLuI0o1z56fn",
+        "status": "resolved",
+        "title": "awaiting approval: bash — echo shed-lane-live"
+      },
+      "id": "per_07ed2c2b4001b0mPhLsW2d6HRO",
+      "kind": "permission"
+    },
+    {
+      "asked": {
+        "id": "que_07ed2daca001EXvpiCTv628uRQ",
+        "kind": "question",
+        "options": [],
+        "questions": [
+          {
+            "custom": false,
+            "header": "Proceed?",
+            "multiple": false,
+            "options": [
+              {
+                "description": "Proceed",
+                "id": "yes",
+                "label": "yes"
+              },
+              {
+                "description": "Do not proceed",
+                "id": "no",
+                "label": "no"
+              }
+            ],
+            "question": "Whether to proceed?"
+          }
+        ],
+        "request_json": "{\"id\":\"que_07ed2daca001EXvpiCTv628uRQ\",\"sessionID\":\"ses_f812d4751ffe9mqLuI0o1z56fn\",\"questions\":[{\"question\":\"Whether to proceed?\",\"header\":\"Proceed?\",\"options\":[{\"label\":\"yes\",\"description\":\"Proceed\"},{\"label\":\"no\",\"description\":\"Do not proceed\"}]}],\"tool\":{\"messageID\":\"msg_07ed2d354001aT0qFsOdB8gGnT\",\"callID\":\"call_01a07ed2d94972d39de30ea982472c74\"}}",
+        "session_id": "ses_f812d4751ffe9mqLuI0o1z56fn",
+        "status": "pending",
+        "title": "awaiting answer: Proceed?"
+      },
+      "asked_at_line": 141,
+      "final": {
+        "id": "que_07ed2daca001EXvpiCTv628uRQ",
+        "kind": "question",
+        "options": [],
+        "questions": [],
+        "request_json": "{}",
+        "session_id": "ses_f812d4751ffe9mqLuI0o1z56fn",
+        "status": "resolved",
+        "title": "awaiting answer: Proceed?"
+      },
+      "id": "que_07ed2daca001EXvpiCTv628uRQ",
+      "kind": "question"
+    }
+  ],
+  "final": {
+    "activity": "needs_input",
+    "last_message": "Asking for confirmation to proceed.",
+    "open_approvals": 0,
+    "pending_approvals": []
+  },
+  "fixture": "fixtures/1.18.29/event-frames.jsonl",
+  "steps": [
+    {
+      "activity": "unknown",
+      "applied": false,
+      "event": "server.connected",
+      "line": 0,
+      "open_approvals": 0,
+      "pending": [],
+      "rows": []
+    },
+    {
+      "activity": "unknown",
+      "applied": false,
+      "event": "session.created",
+      "line": 1,
+      "open_approvals": 0,
+      "pending": [],
+      "rows": []
+    },
+    {
+      "activity": "unknown",
+      "applied": false,
+      "event": "session.updated",
+      "line": 2,
+      "open_approvals": 0,
+      "pending": [],
+      "rows": []
+    },
+    {
+      "activity": "unknown",
+      "applied": true,
+      "event": "message.updated",
+      "line": 3,
+      "open_approvals": 0,
+      "pending": [],
+      "rows": []
+    },
+    {
+      "activity": "unknown",
+      "applied": true,
+      "event": "message.part.updated",
+      "line": 4,
+      "open_approvals": 0,
+      "pending": [],
+      "rows": [
+        {
+          "role": "user",
+          "seq": 0,
+          "text": "Reply with the single word: pong",
+          "ts": "2026-09-08T02:22:14Z",
+          "type": "text"
+        }
+      ]
+    },
+    {
+      "activity": "unknown",
+      "applied": false,
+      "event": "session.updated",
+      "line": 5,
+      "open_approvals": 0,
+      "pending": [],
+      "rows": []
+    },
+    {
+      "activity": "working",
+      "applied": true,
+      "event": "session.status",
+      "line": 6,
+      "open_approvals": 0,
+      "pending": [],
+      "rows": []
+    },
+    {
+      "activity": "working",
+      "applied": true,
+      "event": "message.updated",
+      "line": 7,
+      "open_approvals": 0,
+      "pending": [],
+      "rows": []
+    },
+    {
+      "activity": "working",
+      "applied": false,
+      "event": "session.updated",
+      "line": 8,
+      "open_approvals": 0,
+      "pending": [],
+      "rows": []
+    },
+    {
+      "activity": "working",
+      "applied": false,
+      "event": "session.diff",
+      "line": 9,
+      "open_approvals": 0,
+      "pending": [],
+      "rows": []
+    },
+    {
+      "activity": "working",
+      "applied": false,
+      "event": "message.updated",
+      "line": 10,
+      "open_approvals": 0,
+      "pending": [],
+      "rows": []
+    },
+    {
+      "activity": "working",
+      "applied": false,
+      "event": "plugin.added",
+      "line": 11,
+      "open_approvals": 0,
+      "pending": [],
+      "rows": []
+    },
+    {
+      "activity": "working",
+      "applied": false,
+      "event": "plugin.added",
+      "line": 12,
+      "open_approvals": 0,
+      "pending": [],
+      "rows": []
+    },
+    {
+      "activity": "working",
+      "applied": false,
+      "event": "plugin.added",
+      "line": 13,
+      "open_approvals": 0,
+      "pending": [],
+      "rows": []
+    },
+    {
+      "activity": "working",
+      "applied": false,
+      "event": "plugin.added",
+      "line": 14,
+      "open_approvals": 0,
+      "pending": [],
+      "rows": []
+    },
+    {
+      "activity": "working",
+      "applied": false,
+      "event": "plugin.added",
+      "line": 15,
+      "open_approvals": 0,
+      "pending": [],
+      "rows": []
+    },
+    {
+      "activity": "working",
+      "applied": false,
+      "event": "plugin.added",
+      "line": 16,
+      "open_approvals": 0,
+      "pending": [],
+      "rows": []
+    },
+    {
+      "activity": "working",
+      "applied": false,
+      "event": "plugin.added",
+      "line": 17,
+      "open_approvals": 0,
+      "pending": [],
+      "rows": []
+    },
+    {
+      "activity": "working",
+      "applied": false,
+      "event": "plugin.added",
+      "line": 18,
+      "open_approvals": 0,
+      "pending": [],
+      "rows": []
+    },
+    {
+      "activity": "working",
+      "applied": false,
+      "event": "plugin.added",
+      "line": 19,
+      "open_approvals": 0,
+      "pending": [],
+      "rows": []
+    },
+    {
+      "activity": "working",
+      "applied": false,
+      "event": "plugin.added",
+      "line": 20,
+      "open_approvals": 0,
+      "pending": [],
+      "rows": []
+    },
+    {
+      "activity": "working",
+      "applied": false,
+      "event": "plugin.added",
+      "line": 21,
+      "open_approvals": 0,
+      "pending": [],
+      "rows": []
+    },
+    {
+      "activity": "working",
+      "applied": false,
+      "event": "plugin.added",
+      "line": 22,
+      "open_approvals": 0,
+      "pending": [],
+      "rows": []
+    },
+    {
+      "activity": "working",
+      "applied": false,
+      "event": "plugin.added",
+      "line": 23,
+      "open_approvals": 0,
+      "pending": [],
+      "rows": []
+    },
+    {
+      "activity": "working",
+      "applied": false,
+      "event": "plugin.added",
+      "line": 24,
+      "open_approvals": 0,
+      "pending": [],
+      "rows": []
+    },
+    {
+      "activity": "working",
+      "applied": false,
+      "event": "plugin.added",
+      "line": 25,
+      "open_approvals": 0,
+      "pending": [],
+      "rows": []
+    },
+    {
+      "activity": "working",
+      "applied": false,
+      "event": "plugin.added",
+      "line": 26,
+      "open_approvals": 0,
+      "pending": [],
+      "rows": []
+    },
+    {
+      "activity": "working",
+      "applied": false,
+      "event": "plugin.added",
+      "line": 27,
+      "open_approvals": 0,
+      "pending": [],
+      "rows": []
+    },
+    {
+      "activity": "working",
+      "applied": false,
+      "event": "plugin.added",
+      "line": 28,
+      "open_approvals": 0,
+      "pending": [],
+      "rows": []
+    },
+    {
+      "activity": "working",
+      "applied": false,
+      "event": "plugin.added",
+      "line": 29,
+      "open_approvals": 0,
+      "pending": [],
+      "rows": []
+    },
+    {
+      "activity": "working",
+      "applied": false,
+      "event": "plugin.added",
+      "line": 30,
+      "open_approvals": 0,
+      "pending": [],
+      "rows": []
+    },
+    {
+      "activity": "working",
+      "applied": false,
+      "event": "plugin.added",
+      "line": 31,
+      "open_approvals": 0,
+      "pending": [],
+      "rows": []
+    },
+    {
+      "activity": "working",
+      "applied": false,
+      "event": "plugin.added",
+      "line": 32,
+      "open_approvals": 0,
+      "pending": [],
+      "rows": []
+    },
+    {
+      "activity": "working",
+      "applied": false,
+      "event": "plugin.added",
+      "line": 33,
+      "open_approvals": 0,
+      "pending": [],
+      "rows": []
+    },
+    {
+      "activity": "working",
+      "applied": false,
+      "event": "plugin.added",
+      "line": 34,
+      "open_approvals": 0,
+      "pending": [],
+      "rows": []
+    },
+    {
+      "activity": "working",
+      "applied": false,
+      "event": "plugin.added",
+      "line": 35,
+      "open_approvals": 0,
+      "pending": [],
+      "rows": []
+    },
+    {
+      "activity": "working",
+      "applied": false,
+      "event": "plugin.added",
+      "line": 36,
+      "open_approvals": 0,
+      "pending": [],
+      "rows": []
+    },
+    {
+      "activity": "working",
+      "applied": false,
+      "event": "plugin.added",
+      "line": 37,
+      "open_approvals": 0,
+      "pending": [],
+      "rows": []
+    },
+    {
+      "activity": "working",
+      "applied": false,
+      "event": "plugin.added",
+      "line": 38,
+      "open_approvals": 0,
+      "pending": [],
+      "rows": []
+    },
+    {
+      "activity": "working",
+      "applied": false,
+      "event": "plugin.added",
+      "line": 39,
+      "open_approvals": 0,
+      "pending": [],
+      "rows": []
+    },
+    {
+      "activity": "working",
+      "applied": false,
+      "event": "plugin.added",
+      "line": 40,
+      "open_approvals": 0,
+      "pending": [],
+      "rows": []
+    },
+    {
+      "activity": "working",
+      "applied": false,
+      "event": "plugin.added",
+      "line": 41,
+      "open_approvals": 0,
+      "pending": [],
+      "rows": []
+    },
+    {
+      "activity": "working",
+      "applied": false,
+      "event": "plugin.added",
+      "line": 42,
+      "open_approvals": 0,
+      "pending": [],
+      "rows": []
+    },
+    {
+      "activity": "working",
+      "applied": false,
+      "event": "plugin.added",
+      "line": 43,
+      "open_approvals": 0,
+      "pending": [],
+      "rows": []
+    },
+    {
+      "activity": "working",
+      "applied": false,
+      "event": "plugin.added",
+      "line": 44,
+      "open_approvals": 0,
+      "pending": [],
+      "rows": []
+    },
+    {
+      "activity": "working",
+      "applied": false,
+      "event": "plugin.added",
+      "line": 45,
+      "open_approvals": 0,
+      "pending": [],
+      "rows": []
+    },
+    {
+      "activity": "working",
+      "applied": false,
+      "event": "plugin.added",
+      "line": 46,
+      "open_approvals": 0,
+      "pending": [],
+      "rows": []
+    },
+    {
+      "activity": "working",
+      "applied": false,
+      "event": "catalog.updated",
+      "line": 47,
+      "open_approvals": 0,
+      "pending": [],
+      "rows": []
+    },
+    {
+      "activity": "working",
+      "applied": false,
+      "event": "plugin.added",
+      "line": 48,
+      "open_approvals": 0,
+      "pending": [],
+      "rows": []
+    },
+    {
+      "activity": "working",
+      "applied": false,
+      "event": "plugin.added",
+      "line": 49,
+      "open_approvals": 0,
+      "pending": [],
+      "rows": []
+    },
+    {
+      "activity": "working",
+      "applied": false,
+      "event": "plugin.added",
+      "line": 50,
+      "open_approvals": 0,
+      "pending": [],
+      "rows": []
+    },
+    {
+      "activity": "working",
+      "applied": false,
+      "event": "plugin.added",
+      "line": 51,
+      "open_approvals": 0,
+      "pending": [],
+      "rows": []
+    },
+    {
+      "activity": "working",
+      "applied": false,
+      "event": "plugin.added",
+      "line": 52,
+      "open_approvals": 0,
+      "pending": [],
+      "rows": []
+    },
+    {
+      "activity": "working",
+      "applied": false,
+      "event": "plugin.added",
+      "line": 53,
+      "open_approvals": 0,
+      "pending": [],
+      "rows": []
+    },
+    {
+      "activity": "working",
+      "applied": false,
+      "event": "plugin.added",
+      "line": 54,
+      "open_approvals": 0,
+      "pending": [],
+      "rows": []
+    },
+    {
+      "activity": "working",
+      "applied": false,
+      "event": "plugin.added",
+      "line": 55,
+      "open_approvals": 0,
+      "pending": [],
+      "rows": []
+    },
+    {
+      "activity": "working",
+      "applied": false,
+      "event": "plugin.added",
+      "line": 56,
+      "open_approvals": 0,
+      "pending": [],
+      "rows": []
+    },
+    {
+      "activity": "working",
+      "applied": false,
+      "event": "reference.updated",
+      "line": 57,
+      "open_approvals": 0,
+      "pending": [],
+      "rows": []
+    },
+    {
+      "activity": "working",
+      "applied": false,
+      "event": "integration.updated",
+      "line": 58,
+      "open_approvals": 0,
+      "pending": [],
+      "rows": []
+    },
+    {
+      "activity": "working",
+      "applied": false,
+      "event": "catalog.updated",
+      "line": 59,
+      "open_approvals": 0,
+      "pending": [],
+      "rows": []
+    },
+    {
+      "activity": "working",
+      "applied": true,
+      "event": "session.status",
+      "line": 60,
+      "open_approvals": 0,
+      "pending": [],
+      "rows": []
+    },
+    {
+      "activity": "working",
+      "applied": false,
+      "event": "message.part.updated",
+      "line": 61,
+      "open_approvals": 0,
+      "pending": [],
+      "rows": []
+    },
+    {
+      "activity": "working",
+      "applied": true,
+      "event": "message.part.updated",
+      "line": 62,
+      "open_approvals": 0,
+      "pending": [],
+      "rows": []
+    },
+    {
+      "activity": "working",
+      "applied": true,
+      "event": "message.part.updated",
+      "line": 63,
+      "open_approvals": 0,
+      "pending": [],
+      "rows": []
+    },
+    {
+      "activity": "working",
+      "applied": true,
+      "event": "message.part.updated",
+      "line": 64,
+      "open_approvals": 0,
+      "pending": [],
+      "rows": []
+    },
+    {
+      "activity": "working",
+      "applied": false,
+      "event": "message.part.delta",
+      "line": 65,
+      "open_approvals": 0,
+      "pending": [],
+      "rows": []
+    },
+    {
+      "activity": "working",
+      "applied": true,
+      "event": "message.part.updated",
+      "line": 66,
+      "open_approvals": 0,
+      "pending": [],
+      "rows": [
+        {
+          "role": "assistant",
+          "seq": 0,
+          "text": "pong",
+          "ts": "2026-09-08T02:22:15Z",
+          "type": "text"
+        }
+      ]
+    },
+    {
+      "activity": "working",
+      "applied": false,
+      "event": "message.part.updated",
+      "line": 67,
+      "open_approvals": 0,
+      "pending": [],
+      "rows": []
+    },
+    {
+      "activity": "working",
+      "applied": true,
+      "event": "message.updated",
+      "line": 68,
+      "open_approvals": 0,
+      "pending": [],
+      "rows": []
+    },
+    {
+      "activity": "working",
+      "applied": false,
+      "event": "message.updated",
+      "line": 69,
+      "open_approvals": 0,
+      "pending": [],
+      "rows": []
+    },
+    {
+      "activity": "working",
+      "applied": true,
+      "event": "session.status",
+      "line": 70,
+      "open_approvals": 0,
+      "pending": [],
+      "rows": []
+    },
+    {
+      "activity": "needs_input",
+      "applied": true,
+      "event": "session.status",
+      "line": 71,
+      "open_approvals": 0,
+      "pending": [],
+      "rows": []
+    },
+    {
+      "activity": "needs_input",
+      "applied": true,
+      "event": "session.idle",
+      "line": 72,
+      "open_approvals": 0,
+      "pending": [],
+      "rows": []
+    },
+    {
+      "activity": "needs_input",
+      "applied": false,
+      "event": "session.updated",
+      "line": 73,
+      "open_approvals": 0,
+      "pending": [],
+      "rows": []
+    },
+    {
+      "activity": "needs_input",
+      "applied": false,
+      "event": "session.diff",
+      "line": 74,
+      "open_approvals": 0,
+      "pending": [],
+      "rows": []
+    },
+    {
+      "activity": "needs_input",
+      "applied": false,
+      "event": "message.updated",
+      "line": 75,
+      "open_approvals": 0,
+      "pending": [],
+      "rows": []
+    },
+    {
+      "activity": "needs_input",
+      "applied": true,
+      "event": "message.updated",
+      "line": 76,
+      "open_approvals": 0,
+      "pending": [],
+      "rows": []
+    },
+    {
+      "activity": "needs_input",
+      "applied": true,
+      "event": "message.part.updated",
+      "line": 77,
+      "open_approvals": 0,
+      "pending": [],
+      "rows": [
+        {
+          "role": "user",
+          "seq": 0,
+          "text": "Use the bash tool to run exactly: echo shed-lane-live",
+          "ts": "2026-09-08T02:22:15Z",
+          "type": "text"
+        }
+      ]
+    },
+    {
+      "activity": "needs_input",
+      "applied": false,
+      "event": "session.updated",
+      "line": 78,
+      "open_approvals": 0,
+      "pending": [],
+      "rows": []
+    },
+    {
+      "activity": "working",
+      "applied": true,
+      "event": "session.status",
+      "line": 79,
+      "open_approvals": 0,
+      "pending": [],
+      "rows": []
+    },
+    {
+      "activity": "working",
+      "applied": true,
+      "event": "message.updated",
+      "line": 80,
+      "open_approvals": 0,
+      "pending": [],
+      "rows": []
+    },
+    {
+      "activity": "working",
+      "applied": false,
+      "event": "session.updated",
+      "line": 81,
+      "open_approvals": 0,
+      "pending": [],
+      "rows": []
+    },
+    {
+      "activity": "working",
+      "applied": false,
+      "event": "session.diff",
+      "line": 82,
+      "open_approvals": 0,
+      "pending": [],
+      "rows": []
+    },
+    {
+      "activity": "working",
+      "applied": false,
+      "event": "message.updated",
+      "line": 83,
+      "open_approvals": 0,
+      "pending": [],
+      "rows": []
+    },
+    {
+      "activity": "working",
+      "applied": true,
+      "event": "session.status",
+      "line": 84,
+      "open_approvals": 0,
+      "pending": [],
+      "rows": []
+    },
+    {
+      "activity": "working",
+      "applied": false,
+      "event": "session.updated",
+      "line": 85,
+      "open_approvals": 0,
+      "pending": [],
+      "rows": []
+    },
+    {
+      "activity": "working",
+      "applied": false,
+      "event": "message.part.updated",
+      "line": 86,
+      "open_approvals": 0,
+      "pending": [],
+      "rows": []
+    },
+    {
+      "activity": "working",
+      "applied": true,
+      "event": "message.part.updated",
+      "line": 87,
+      "open_approvals": 0,
+      "pending": [],
+      "rows": []
+    },
+    {
+      "activity": "working",
+      "applied": true,
+      "event": "message.part.updated",
+      "line": 88,
+      "open_approvals": 0,
+      "pending": [],
+      "rows": []
+    },
+    {
+      "activity": "working",
+      "applied": true,
+      "event": "message.part.updated",
+      "line": 89,
+      "open_approvals": 0,
+      "pending": [],
+      "rows": []
+    },
+    {
+      "activity": "working",
+      "applied": false,
+      "event": "message.part.delta",
+      "line": 90,
+      "open_approvals": 0,
+      "pending": [],
+      "rows": []
+    },
+    {
+      "activity": "working",
+      "applied": true,
+      "event": "message.part.updated",
+      "line": 91,
+      "open_approvals": 0,
+      "pending": [],
+      "rows": [
+        {
+          "role": "assistant",
+          "seq": 0,
+          "text": "Running the requested echo command.",
+          "ts": "2026-09-08T02:22:16Z",
+          "type": "text"
+        }
+      ]
+    },
+    {
+      "activity": "working",
+      "applied": true,
+      "event": "message.part.updated",
+      "line": 92,
+      "open_approvals": 0,
+      "pending": [],
+      "rows": []
+    },
+    {
+      "activity": "working",
+      "applied": true,
+      "event": "message.part.updated",
+      "line": 93,
+      "open_approvals": 0,
+      "pending": [],
+      "rows": [
+        {
+          "role": "tool",
+          "seq": 0,
+          "tool": {
+            "detail": "{\"command\":\"echo shed-lane-live\"}",
+            "name": "bash"
+          },
+          "ts": "2026-09-08T02:22:16Z",
+          "type": "tool_use"
+        }
+      ]
+    },
+    {
+      "activity": "needs_approval",
+      "applied": true,
+      "event": "permission.asked",
+      "line": 94,
+      "open_approvals": 1,
+      "pending": [
+        {
+          "id": "per_07ed2c2b4001b0mPhLsW2d6HRO",
+          "kind": "permission",
+          "status": "pending"
+        }
+      ],
+      "rows": [
+        {
+          "approval": {
+            "decisions": [
+              "allow",
+              "allow_always",
+              "deny"
+            ],
+            "id": "per_07ed2c2b4001b0mPhLsW2d6HRO",
+            "status": "pending"
+          },
+          "role": "tool",
+          "seq": 0,
+          "text": "awaiting approval: bash — echo shed-lane-live",
+          "tool": {
+            "detail": "echo shed-lane-live",
+            "name": "bash"
+          },
+          "type": "approval_request"
+        }
+      ]
+    },
+    {
+      "activity": "working",
+      "applied": true,
+      "event": "permission.replied",
+      "line": 95,
+      "open_approvals": 0,
+      "pending": [],
+      "rows": [
+        {
+          "approval": {
+            "decision": "allow",
+            "id": "per_07ed2c2b4001b0mPhLsW2d6HRO",
+            "status": "resolved"
+          },
+          "role": "tool",
+          "seq": 0,
+          "text": "awaiting approval: bash — echo shed-lane-live",
+          "type": "approval_request"
+        }
+      ]
+    },
+    {
+      "activity": "working",
+      "applied": true,
+      "event": "message.part.updated",
+      "line": 96,
+      "open_approvals": 0,
+      "pending": [],
+      "rows": []
+    },
+    {
+      "activity": "working",
+      "applied": true,
+      "event": "message.part.updated",
+      "line": 97,
+      "open_approvals": 0,
+      "pending": [],
+      "rows": []
+    },
+    {
+      "activity": "working",
+      "applied": true,
+      "event": "message.part.updated",
+      "line": 98,
+      "open_approvals": 0,
+      "pending": [],
+      "rows": [
+        {
+          "role": "tool",
+          "seq": 0,
+          "tool": {
+            "detail": "shed-lane-live\n",
+            "name": "bash"
+          },
+          "ts": "2026-09-08T02:22:16Z",
+          "type": "tool_result"
+        }
+      ]
+    },
+    {
+      "activity": "working",
+      "applied": false,
+      "event": "message.part.updated",
+      "line": 99,
+      "open_approvals": 0,
+      "pending": [],
+      "rows": []
+    },
+    {
+      "activity": "working",
+      "applied": true,
+      "event": "message.updated",
+      "line": 100,
+      "open_approvals": 0,
+      "pending": [],
+      "rows": []
+    },
+    {
+      "activity": "working",
+      "applied": false,
+      "event": "message.updated",
+      "line": 101,
+      "open_approvals": 0,
+      "pending": [],
+      "rows": []
+    },
+    {
+      "activity": "working",
+      "applied": true,
+      "event": "session.status",
+      "line": 102,
+      "open_approvals": 0,
+      "pending": [],
+      "rows": []
+    },
+    {
+      "activity": "working",
+      "applied": true,
+      "event": "message.updated",
+      "line": 103,
+      "open_approvals": 0,
+      "pending": [],
+      "rows": []
+    },
+    {
+      "activity": "working",
+      "applied": false,
+      "event": "session.updated",
+      "line": 104,
+      "open_approvals": 0,
+      "pending": [],
+      "rows": []
+    },
+    {
+      "activity": "working",
+      "applied": false,
+      "event": "session.diff",
+      "line": 105,
+      "open_approvals": 0,
+      "pending": [],
+      "rows": []
+    },
+    {
+      "activity": "working",
+      "applied": false,
+      "event": "message.updated",
+      "line": 106,
+      "open_approvals": 0,
+      "pending": [],
+      "rows": []
+    },
+    {
+      "activity": "working",
+      "applied": true,
+      "event": "session.status",
+      "line": 107,
+      "open_approvals": 0,
+      "pending": [],
+      "rows": []
+    },
+    {
+      "activity": "working",
+      "applied": true,
+      "event": "session.status",
+      "line": 108,
+      "open_approvals": 0,
+      "pending": [],
+      "rows": []
+    },
+    {
+      "activity": "working",
+      "applied": true,
+      "event": "session.status",
+      "line": 109,
+      "open_approvals": 0,
+      "pending": [],
+      "rows": []
+    },
+    {
+      "activity": "working",
+      "applied": false,
+      "event": "message.part.updated",
+      "line": 110,
+      "open_approvals": 0,
+      "pending": [],
+      "rows": []
+    },
+    {
+      "activity": "working",
+      "applied": true,
+      "event": "message.part.updated",
+      "line": 111,
+      "open_approvals": 0,
+      "pending": [],
+      "rows": []
+    },
+    {
+      "activity": "working",
+      "applied": true,
+      "event": "message.part.updated",
+      "line": 112,
+      "open_approvals": 0,
+      "pending": [],
+      "rows": []
+    },
+    {
+      "activity": "working",
+      "applied": true,
+      "event": "message.part.updated",
+      "line": 113,
+      "open_approvals": 0,
+      "pending": [],
+      "rows": []
+    },
+    {
+      "activity": "working",
+      "applied": false,
+      "event": "message.part.delta",
+      "line": 114,
+      "open_approvals": 0,
+      "pending": [],
+      "rows": []
+    },
+    {
+      "activity": "working",
+      "applied": true,
+      "event": "message.part.updated",
+      "line": 115,
+      "open_approvals": 0,
+      "pending": [],
+      "rows": [
+        {
+          "role": "assistant",
+          "seq": 0,
+          "text": "shed-lane-live",
+          "ts": "2026-09-08T02:22:20Z",
+          "type": "text"
+        }
+      ]
+    },
+    {
+      "activity": "working",
+      "applied": false,
+      "event": "message.part.updated",
+      "line": 116,
+      "open_approvals": 0,
+      "pending": [],
+      "rows": []
+    },
+    {
+      "activity": "working",
+      "applied": true,
+      "event": "message.updated",
+      "line": 117,
+      "open_approvals": 0,
+      "pending": [],
+      "rows": []
+    },
+    {
+      "activity": "working",
+      "applied": false,
+      "event": "message.updated",
+      "line": 118,
+      "open_approvals": 0,
+      "pending": [],
+      "rows": []
+    },
+    {
+      "activity": "working",
+      "applied": true,
+      "event": "session.status",
+      "line": 119,
+      "open_approvals": 0,
+      "pending": [],
+      "rows": []
+    },
+    {
+      "activity": "needs_input",
+      "applied": true,
+      "event": "session.status",
+      "line": 120,
+      "open_approvals": 0,
+      "pending": [],
+      "rows": []
+    },
+    {
+      "activity": "needs_input",
+      "applied": true,
+      "event": "session.idle",
+      "line": 121,
+      "open_approvals": 0,
+      "pending": [],
+      "rows": []
+    },
+    {
+      "activity": "needs_input",
+      "applied": false,
+      "event": "session.updated",
+      "line": 122,
+      "open_approvals": 0,
+      "pending": [],
+      "rows": []
+    },
+    {
+      "activity": "needs_input",
+      "applied": false,
+      "event": "session.diff",
+      "line": 123,
+      "open_approvals": 0,
+      "pending": [],
+      "rows": []
+    },
+    {
+      "activity": "needs_input",
+      "applied": false,
+      "event": "message.updated",
+      "line": 124,
+      "open_approvals": 0,
+      "pending": [],
+      "rows": []
+    },
+    {
+      "activity": "needs_input",
+      "applied": true,
+      "event": "message.updated",
+      "line": 125,
+      "open_approvals": 0,
+      "pending": [],
+      "rows": []
+    },
+    {
+      "activity": "needs_input",
+      "applied": true,
+      "event": "message.part.updated",
+      "line": 126,
+      "open_approvals": 0,
+      "pending": [],
+      "rows": [
+        {
+          "role": "user",
+          "seq": 0,
+          "text": "Use your question tool to ask me whether to proceed, offering exactly two options: yes and no.",
+          "ts": "2026-09-08T02:22:21Z",
+          "type": "text"
+        }
+      ]
+    },
+    {
+      "activity": "needs_input",
+      "applied": false,
+      "event": "session.updated",
+      "line": 127,
+      "open_approvals": 0,
+      "pending": [],
+      "rows": []
+    },
+    {
+      "activity": "working",
+      "applied": true,
+      "event": "session.status",
+      "line": 128,
+      "open_approvals": 0,
+      "pending": [],
+      "rows": []
+    },
+    {
+      "activity": "working",
+      "applied": true,
+      "event": "message.updated",
+      "line": 129,
+      "open_approvals": 0,
+      "pending": [],
+      "rows": []
+    },
+    {
+      "activity": "working",
+      "applied": false,
+      "event": "session.updated",
+      "line": 130,
+      "open_approvals": 0,
+      "pending": [],
+      "rows": []
+    },
+    {
+      "activity": "working",
+      "applied": false,
+      "event": "session.diff",
+      "line": 131,
+      "open_approvals": 0,
+      "pending": [],
+      "rows": []
+    },
+    {
+      "activity": "working",
+      "applied": false,
+      "event": "message.updated",
+      "line": 132,
+      "open_approvals": 0,
+      "pending": [],
+      "rows": []
+    },
+    {
+      "activity": "working",
+      "applied": true,
+      "event": "session.status",
+      "line": 133,
+      "open_approvals": 0,
+      "pending": [],
+      "rows": []
+    },
+    {
+      "activity": "working",
+      "applied": false,
+      "event": "message.part.updated",
+      "line": 134,
+      "open_approvals": 0,
+      "pending": [],
+      "rows": []
+    },
+    {
+      "activity": "working",
+      "applied": true,
+      "event": "message.part.updated",
+      "line": 135,
+      "open_approvals": 0,
+      "pending": [],
+      "rows": []
+    },
+    {
+      "activity": "working",
+      "applied": true,
+      "event": "message.part.updated",
+      "line": 136,
+      "open_approvals": 0,
+      "pending": [],
+      "rows": []
+    },
+    {
+      "activity": "working",
+      "applied": true,
+      "event": "message.part.updated",
+      "line": 137,
+      "open_approvals": 0,
+      "pending": [],
+      "rows": []
+    },
+    {
+      "activity": "working",
+      "applied": false,
+      "event": "message.part.delta",
+      "line": 138,
+      "open_approvals": 0,
+      "pending": [],
+      "rows": []
+    },
+    {
+      "activity": "working",
+      "applied": true,
+      "event": "message.part.updated",
+      "line": 139,
+      "open_approvals": 0,
+      "pending": [],
+      "rows": [
+        {
+          "role": "assistant",
+          "seq": 0,
+          "text": "Asking for confirmation to proceed.",
+          "ts": "2026-09-08T02:22:22Z",
+          "type": "text"
+        }
+      ]
+    },
+    {
+      "activity": "working",
+      "applied": true,
+      "event": "message.part.updated",
+      "line": 140,
+      "open_approvals": 0,
+      "pending": [],
+      "rows": []
+    },
+    {
+      "activity": "needs_approval",
+      "applied": true,
+      "event": "question.asked",
+      "line": 141,
+      "open_approvals": 1,
+      "pending": [
+        {
+          "id": "que_07ed2daca001EXvpiCTv628uRQ",
+          "kind": "question",
+          "status": "pending"
+        }
+      ],
+      "rows": [
+        {
+          "role": "system",
+          "seq": 0,
+          "text": "awaiting answer: Proceed?",
+          "type": "status"
+        }
+      ]
+    },
+    {
+      "activity": "needs_approval",
+      "applied": true,
+      "event": "message.part.updated",
+      "line": 142,
+      "open_approvals": 1,
+      "pending": [
+        {
+          "id": "que_07ed2daca001EXvpiCTv628uRQ",
+          "kind": "question",
+          "status": "pending"
+        }
+      ],
+      "rows": [
+        {
+          "role": "tool",
+          "seq": 0,
+          "tool": {
+            "detail": "{\"questions\":[{\"header\":\"Proceed?\",\"options\":[{\"description\":\"Proceed\",\"label\":\"yes\"},{\"description\":\"Do not proceed\",\"label\":\"no\"}],\"question\":\"Whether to proceed?\"}]}",
+            "name": "question"
+          },
+          "ts": "2026-09-08T02:22:22Z",
+          "type": "tool_use"
+        }
+      ]
+    },
+    {
+      "activity": "working",
+      "applied": true,
+      "event": "question.replied",
+      "line": 143,
+      "open_approvals": 0,
+      "pending": [],
+      "rows": []
+    },
+    {
+      "activity": "working",
+      "applied": true,
+      "event": "message.part.updated",
+      "line": 144,
+      "open_approvals": 0,
+      "pending": [],
+      "rows": [
+        {
+          "role": "tool",
+          "seq": 0,
+          "tool": {
+            "detail": "User has answered your questions: \"Whether to proceed?\"=\"yes\". You can now continue with the user's answers in mind.",
+            "name": "question"
+          },
+          "ts": "2026-09-08T02:22:22Z",
+          "type": "tool_result"
+        }
+      ]
+    },
+    {
+      "activity": "working",
+      "applied": true,
+      "event": "message.updated",
+      "line": 145,
+      "open_approvals": 0,
+      "pending": [],
+      "rows": []
+    },
+    {
+      "activity": "working",
+      "applied": true,
+      "event": "message.part.updated",
+      "line": 146,
+      "open_approvals": 0,
+      "pending": [],
+      "rows": [
+        {
+          "role": "user",
+          "seq": 0,
+          "text": "Count slowly from one to five hundred, one number per line.",
+          "ts": "2026-09-08T02:22:22Z",
+          "type": "text"
+        }
+      ]
+    },
+    {
+      "activity": "working",
+      "applied": false,
+      "event": "session.updated",
+      "line": 147,
+      "open_approvals": 0,
+      "pending": [],
+      "rows": []
+    },
+    {
+      "activity": "working",
+      "applied": true,
+      "event": "session.error",
+      "line": 148,
+      "open_approvals": 0,
+      "pending": [],
+      "rows": [
+        {
+          "role": "system",
+          "seq": 0,
+          "text": "session error: Aborted",
+          "type": "status"
+        }
+      ]
+    },
+    {
+      "activity": "needs_input",
+      "applied": true,
+      "event": "session.status",
+      "line": 149,
+      "open_approvals": 0,
+      "pending": [],
+      "rows": []
+    },
+    {
+      "activity": "needs_input",
+      "applied": true,
+      "event": "session.idle",
+      "line": 150,
+      "open_approvals": 0,
+      "pending": [],
+      "rows": []
+    },
+    {
+      "activity": "needs_input",
+      "applied": true,
+      "event": "message.updated",
+      "line": 151,
+      "open_approvals": 0,
+      "pending": [],
+      "rows": []
+    },
+    {
+      "activity": "needs_input",
+      "applied": true,
+      "event": "session.status",
+      "line": 152,
+      "open_approvals": 0,
+      "pending": [],
+      "rows": []
+    },
+    {
+      "activity": "needs_input",
+      "applied": true,
+      "event": "session.idle",
+      "line": 153,
+      "open_approvals": 0,
+      "pending": [],
+      "rows": []
+    },
+    {
+      "activity": "needs_input",
+      "applied": false,
+      "event": "session.deleted",
+      "line": 154,
+      "open_approvals": 0,
+      "pending": [],
+      "rows": []
+    }
+  ]
+}
