@@ -94,6 +94,23 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 /// frontend is watching, and the rows sit stale until a manual Refresh.
 pub type OnChange = Arc<dyn Fn() + Send + Sync>;
 
+/// Called with one machine's CURRENT set of opencode lanes (`session_id` →
+/// `server_url`) every time a fresh roost snapshot replaces its row set.
+///
+/// This is the eviction signal for [`crate::lane::Lanes`] (plan 015 §3.4: an
+/// entry is dropped "when the tab disappears from the roost snapshot, or when a
+/// row's `server_url` changes"). It hangs off a SNAPSHOT and not off a `Down`
+/// on purpose: a snapshot is authoritative and replaces the row set outright, so
+/// "absent from this map" genuinely means the tab is gone, whereas a `Down` is a
+/// machine that went quiet with its last rows still on screen.
+///
+/// **A tab that dies before any adapter claims it reaches here too.** roost
+/// publishes a snapshot when a tab the inventory knew about stops existing, even
+/// if nothing else about it changed (plan 014's ghost-row fix) — without that,
+/// a launched process that died young would leave a lane entry, and its `ssh -N`
+/// child, behind a row nobody can see.
+pub type OnLanes = Arc<dyn Fn(&str, &BTreeMap<String, String>) + Send + Sync>;
+
 /// One machine's live view, as the UI reads it.
 struct MachineState {
     /// The last inventory the session reported — agent-owned tabs only
@@ -153,6 +170,14 @@ pub struct Machines {
     handle: tokio::runtime::Handle,
     test_roost_sockets: HashMap<String, PathBuf>,
     on_change: OnChange,
+    /// The lane layer's reconcile hook, installed after construction (plan 015
+    /// §3.4).
+    ///
+    /// Late-bound rather than a constructor argument because the lane layer
+    /// holds an `Arc<Machines>` of its own: the two would otherwise have to be
+    /// built at the same instant. `None` in every context that has no lanes —
+    /// the unit tests, and any embedder that never opens one.
+    on_lanes: Arc<Mutex<Option<OnLanes>>>,
 }
 
 /// The reserved-name gate, shared by both doors into [`Machines::add`].
@@ -292,6 +317,37 @@ fn write_atomically(path: &std::path::Path, text: &str) -> Result<(), String> {
     })
 }
 
+/// **How a machine is reached** — kept beside its reach so a consumer that needs
+/// a TRANSPORT of its own can pick one (plan 015 §3.4).
+///
+/// [`RoostReach`] deliberately answers only "give me a roost connection": the
+/// production [`SshBridge`] runs `roost-session client-bridge` over ssh and hands
+/// back a `RoostEndpoint::Unix`, exactly as the test-mode [`LocalSession`] does,
+/// so nothing on that trait says whether the far side is this machine or a host
+/// three hops away. The opencode lane has to know: a LOCAL machine's agent
+/// server is dialable at the loopback address it reported, and a REMOTE one's is
+/// only reachable through an `ssh -N -L` tunnel to that same port.
+///
+/// It is derived from the reach that was BUILT, not from the machine's name. A
+/// configured entry named `localhost` is an ssh target here (see the module
+/// doc's "implicit `localhost` host": the user spelling it in `machines:` means
+/// an ssh target they chose, and its roost reach is an [`SshBridge`] like any
+/// other) — so the lane tunnels to it rather than assuming it is this host.
+#[derive(Debug, Clone)]
+pub enum ReachKind {
+    /// This machine: the implicit [`LOCALHOST`] host, or a test-mode socket map
+    /// entry. Its loopback ports are OUR loopback ports.
+    Local,
+    /// An ssh target, carrying the config entry a forward is composed from.
+    Ssh(MachineEntry),
+}
+
+/// A started reach and how it gets there.
+struct Registered {
+    reach: Arc<dyn RoostReach>,
+    kind: ReachKind,
+}
+
 /// The mutable half of [`Machines`]: the registered set and its live watchers.
 ///
 /// `names` carries ORDER (config order, then arrival order) because the UI lists
@@ -310,7 +366,7 @@ struct Registry {
     ///
     /// A machine whose reach could not even be BUILT is absent here but present
     /// in `names` — it is a listed, permanently-unreachable row.
-    reaches: BTreeMap<String, Arc<dyn RoostReach>>,
+    reaches: BTreeMap<String, Registered>,
     /// Held so the watchers (and the SSH bridges behind them) live as long as the
     /// app does. Dropping one aborts its loop.
     watchers: Vec<RoostWatcher>,
@@ -349,6 +405,7 @@ impl Machines {
             handle: handle.clone(),
             test_roost_sockets: test_roost_sockets.clone(),
             on_change,
+            on_lanes: Arc::new(Mutex::new(None)),
         };
         for entry in &config.machines {
             machines.watch(entry.clone());
@@ -388,12 +445,7 @@ impl Machines {
     /// Split from registration so `add` can claim the name and register it in
     /// one lock acquisition — a check-then-register across two would let two
     /// concurrent adds both win.
-    fn start_watching(
-        &self,
-        name: String,
-        reach: Result<Arc<dyn RoostReach>, String>,
-        listed: bool,
-    ) {
+    fn start_watching(&self, name: String, reach: Result<Registered, String>, listed: bool) {
         lock(&self.state).insert(name.clone(), MachineState::new(listed));
 
         let reach = match reach {
@@ -410,7 +462,8 @@ impl Machines {
             }
         };
 
-        let (watcher, rx) = RoostWatcher::spawn(&self.handle, Arc::clone(&reach), name.clone());
+        let (watcher, rx) =
+            RoostWatcher::spawn(&self.handle, Arc::clone(&reach.reach), name.clone());
         {
             let mut reg = lock(&self.reg);
             reg.reaches.insert(name.clone(), reach);
@@ -421,6 +474,7 @@ impl Machines {
             rx,
             Arc::clone(&self.state),
             self.on_change.clone(),
+            Arc::clone(&self.on_lanes),
         ));
     }
 
@@ -509,6 +563,11 @@ impl Machines {
                 m.sessions.retain(|s| s.tab_id != tab_id);
             }
         }
+        // The row is gone from this app's view, so the lane on it is too — the
+        // same optimism, for the same reason: waiting for the confirming
+        // snapshot would leave a subscription (and, on a remote machine, an
+        // `ssh -N` child) open against a tab the user just closed.
+        self.publish_lanes(machine);
         // Outside the lock (the callback re-enters the app) and unconditional,
         // exactly as [`Self::create`] does it. A Tauri caller happens to refresh
         // afterwards, but the `machine.kill` socket op does not — so without this
@@ -605,7 +664,7 @@ impl Machines {
     fn reach(&self, machine: &str) -> Result<Arc<dyn RoostReach>, String> {
         let reg = lock(&self.reg);
         if let Some(reach) = reg.reaches.get(machine) {
-            return Ok(Arc::clone(reach));
+            return Ok(Arc::clone(&reach.reach));
         }
         if reg.names.iter().any(|n| n == machine) {
             return Err(format!(
@@ -623,6 +682,52 @@ impl Machines {
             return Ok(());
         }
         Err(unknown_machine(machine, &reg.names))
+    }
+
+    /// Install the lane layer's reconcile hook. See [`OnLanes`].
+    ///
+    /// Idempotent by replacement: the last caller wins. Called once, from
+    /// `lib.rs`'s setup, right after the lane layer is built.
+    pub fn set_lane_observer(&self, observer: OnLanes) {
+        *lock(&self.on_lanes) = Some(observer);
+    }
+
+    /// Every opencode lane `machine` currently exposes: agent session id →
+    /// `server_url`, exactly as [`machine_row`] stamps it.
+    ///
+    /// The one reader is the lane layer, which needs both halves: the URL to
+    /// dial, and (through [`Self::reach_kind`]) how to get to it. A machine with
+    /// no rows, no opencode rows, or no `server_url` on them answers empty —
+    /// which is also how `lane.open` decides a row has `no_lane`.
+    pub fn agent_lanes(&self, machine: &str) -> BTreeMap<String, String> {
+        let guard = lock(&self.state);
+        let Some(m) = guard.get(machine) else {
+            return BTreeMap::new();
+        };
+        lanes_of(&m.sessions)
+    }
+
+    /// How `machine` is reached — the lane's transport choice. See
+    /// [`ReachKind`].
+    pub fn reach_kind(&self, machine: &str) -> Result<ReachKind, String> {
+        let reg = lock(&self.reg);
+        if let Some(reg_entry) = reg.reaches.get(machine) {
+            return Ok(reg_entry.kind.clone());
+        }
+        if reg.names.iter().any(|n| n == machine) {
+            return Err(format!(
+                "machine {machine:?} has no usable transport (its reach could not be built)"
+            ));
+        }
+        Err(unknown_machine(machine, &reg.names))
+    }
+
+    /// Tell the lane layer what `machine` now exposes. Call OUTSIDE the state
+    /// lock — the hook tears lane entries (and their `ssh -N` children) down.
+    fn publish_lanes(&self, machine: &str) {
+        let observer = lock(&self.on_lanes).clone();
+        let Some(observer) = observer else { return };
+        observer(machine, &self.agent_lanes(machine));
     }
 
     /// Per-machine health, for the UI's machine group headers.
@@ -765,10 +870,13 @@ fn roost_source(kind: &RcKind) -> Option<&'static str> {
 fn build_reach(
     entry: &MachineEntry,
     test_roost_sockets: &HashMap<String, PathBuf>,
-) -> Result<Arc<dyn RoostReach>, String> {
+) -> Result<Registered, String> {
     if test_roost_sockets.is_empty() {
         return SshBridge::new(entry, SshBridgeOptions::default())
-            .map(|b| Arc::new(b) as Arc<dyn RoostReach>)
+            .map(|b| Registered {
+                reach: Arc::new(b) as Arc<dyn RoostReach>,
+                kind: ReachKind::Ssh(entry.clone()),
+            })
             .map_err(|e| e.to_string());
     }
     // Test mode with a map present: reach the harness's fake session on its own
@@ -778,7 +886,11 @@ fn build_reach(
     // An UNMAPPED machine gets a reach that simply REFUSES — that is how the
     // suite exercises an unreachable machine, and it guarantees a hermetic run
     // never spawns ssh for a machine the harness forgot to map.
-    Ok(mapped_reach(&entry.name, test_roost_sockets))
+    Ok(mapped_reach(
+        &entry.name,
+        test_roost_sockets,
+        ReachKind::Ssh(entry.clone()),
+    ))
 }
 
 /// The implicit [`LOCALHOST`] host's reach: this machine's own session socket,
@@ -788,20 +900,42 @@ fn build_reach(
 ///
 /// It goes through the same test-mode map as a configured machine, so a hermetic
 /// run reads the harness's fake session rather than the developer's real one.
-fn build_local_reach(test_roost_sockets: &HashMap<String, PathBuf>) -> Arc<dyn RoostReach> {
+fn build_local_reach(test_roost_sockets: &HashMap<String, PathBuf>) -> Registered {
     if test_roost_sockets.is_empty() {
-        return Arc::new(LocalSession::default_local());
+        return Registered {
+            reach: Arc::new(LocalSession::default_local()),
+            kind: ReachKind::Local,
+        };
     }
-    mapped_reach(LOCALHOST, test_roost_sockets)
+    mapped_reach(LOCALHOST, test_roost_sockets, ReachKind::Local)
 }
 
-fn mapped_reach(name: &str, test_roost_sockets: &HashMap<String, PathBuf>) -> Arc<dyn RoostReach> {
+/// The test-mode reach for `name`, and the kind that goes with it.
+///
+/// A MAPPED machine is [`ReachKind::Local`] — the harness's fakes (roost's and
+/// opencode's) both live in this process's loopback space, which is precisely
+/// what the map declares, and it is how the lane's cells reach an opencode
+/// server with no ssh anywhere. An UNMAPPED one keeps `unmapped`, the kind it
+/// would have had in production: it is permanently unreachable, reports no
+/// sessions and so never reaches the lane at all, and claiming it was local
+/// would be a lie about a machine nobody described.
+fn mapped_reach(
+    name: &str,
+    test_roost_sockets: &HashMap<String, PathBuf>,
+    unmapped: ReachKind,
+) -> Registered {
     match test_roost_sockets.get(name) {
-        Some(socket) => Arc::new(LocalSession::new(name, socket.clone())),
-        None => Arc::new(UnreachableReach::new(
-            name,
-            "no roost-session mapped for this machine in test mode",
-        )),
+        Some(socket) => Registered {
+            reach: Arc::new(LocalSession::new(name, socket.clone())),
+            kind: ReachKind::Local,
+        },
+        None => Registered {
+            reach: Arc::new(UnreachableReach::new(
+                name,
+                "no roost-session mapped for this machine in test mode",
+            )),
+            kind: unmapped,
+        },
     }
 }
 
@@ -811,8 +945,13 @@ async fn consume(
     mut rx: tokio::sync::mpsc::UnboundedReceiver<RoostUpdate>,
     state: Arc<Mutex<BTreeMap<String, MachineState>>>,
     on_change: OnChange,
+    on_lanes: Arc<Mutex<Option<OnLanes>>>,
 ) {
     while let Some(update) = rx.recv().await {
+        // Set by the SNAPSHOT arm only. A `Down` deliberately keeps the last
+        // rows on screen, so it says nothing about which tabs still exist and
+        // must not evict a lane — see [`OnLanes`].
+        let mut lanes: Option<BTreeMap<String, String>> = None;
         let visible = {
             let mut guard = lock(&state);
             let Some(m) = guard.get_mut(&name) else {
@@ -831,6 +970,7 @@ async fn consume(
                     // A session answered here at least once, so this host is real
                     // and stays listed from now on.
                     m.listed = true;
+                    lanes = Some(lanes_of(&m.sessions));
                 }
                 RoostUpdate::Down { reason } => {
                     // Sessions are deliberately NOT cleared: the last snapshot
@@ -842,6 +982,19 @@ async fn consume(
             }
             m.listed
         };
+        // Outside the lock, and BEFORE the repaint: the hook tears down lane
+        // entries whose tab has gone, and a UI that repainted first would offer
+        // a Transcript affordance for a row that is about to vanish.
+        //
+        // Unconditional on `visible`, unlike the repaint below: an unlisted host
+        // still has state a lane could be holding, and skipping it would leak a
+        // subscription for exactly the host nobody is looking at.
+        if let Some(lanes) = lanes {
+            let observer = lock(&on_lanes).clone();
+            if let Some(observer) = observer {
+                observer(&name, &lanes);
+            }
+        }
         // Outside the lock: the callback re-enters the app (it emits a Tauri
         // event), and holding a std mutex across that is how a deadlock starts.
         //
@@ -886,8 +1039,72 @@ fn machine_row(name: &str, session: &RoostSession, stale: bool) -> Value {
         // A STRING, like every other id on roost's wire: a JavaScript client
         // cannot round an i64 through a `Number` without losing it.
         obj.insert("tab_id".into(), json!(session.tab_id.to_string()));
+        // The agent-lane capability signal (plan 015 §3.4). Absent unless the
+        // tab's adapter reported a server this app can actually talk to.
+        if let Some(lane) = agent_lane(session) {
+            obj.insert("agent_lane".into(), lane);
+        }
     }
     row
+}
+
+/// The `agent_lane` stamp for one row, or `None`.
+///
+/// **Its PRESENCE is the capability signal** — the UI offers a Transcript
+/// affordance for a row that has it and nothing for a row that does not, and
+/// `lane.open` answers `no_lane` for the latter. So it is minted only when all
+/// three facts a lane needs are actually on the row:
+///
+/// * the tab is owned by opencode (this build has exactly one adapter),
+/// * the tab reported a `server_url` — roost's own plugin stamping the loopback
+///   URL of the server that session is running on (roost R10, plan 015 §3.3),
+/// * and it reported the agent's own `session_id`, which is the address every
+///   lane verb takes. A stamp without one would advertise a panel that could
+///   never open.
+///
+/// The key is **`agent_lane`, not `lane`**: `lane` is taken on the session DTO
+/// (`RcSession.lane` is the RC hub's lane token) and a second meaning on the
+/// same row would be read by the wrong consumer.
+///
+/// `ownership.metadata` reaches here because [`shed_core::roost::RoostSession`]
+/// keeps roost's `Ownership` whole; `to_rc_dto()` drops it, which is why this is
+/// stamped beside the DTO rather than carried on it.
+fn agent_lane(session: &RoostSession) -> Option<Value> {
+    let ownership = session.ownership.as_ref()?;
+    if ownership.source != "opencode" {
+        return None;
+    }
+    let server_url = non_empty(ownership.metadata.get("server_url")?)?;
+    let session_id = non_empty(&ownership.session_id)?;
+    Some(json!({
+        "kind": "opencode",
+        "session_id": session_id,
+        "server_url": server_url,
+    }))
+}
+
+/// A trimmed copy of `s`, or `None` when there is nothing left.
+fn non_empty(s: &str) -> Option<String> {
+    let s = s.trim();
+    (!s.is_empty()).then(|| s.to_string())
+}
+
+/// The `session_id → server_url` map for a row set — [`agent_lane`]'s two
+/// load-bearing fields, for the lane layer's reconcile.
+///
+/// Deliberately derived from the SAME function the row is stamped from: a lane
+/// the UI can see and a lane the backend will keep alive have to be the same
+/// set, or an entry survives a row it no longer belongs to.
+fn lanes_of(sessions: &[RoostSession]) -> BTreeMap<String, String> {
+    sessions
+        .iter()
+        .filter_map(|s| {
+            let lane = agent_lane(s)?;
+            let id = lane.get("session_id")?.as_str()?.to_string();
+            let url = lane.get("server_url")?.as_str()?.to_string();
+            Some((id, url))
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -993,6 +1210,105 @@ mod tests {
 
     fn rows(machines: &Machines) -> Vec<Value> {
         machines.snapshot().0
+    }
+
+    /// A bare roost row, with whatever ownership a lane test needs on it.
+    fn owned(source: Option<&str>, session_id: &str, metadata: &[(&str, &str)]) -> RoostSession {
+        RoostSession {
+            host_label: "mini3".to_string(),
+            tab_id: 4,
+            project_id: 1,
+            project_name: String::new(),
+            title: "oc".to_string(),
+            user_titled: false,
+            cwd: "/home/shed/work".to_string(),
+            shell_state: roost_ipc::agent::ShellState::Unknown,
+            lifecycle: roost_ipc::agent::AgentLifecycle::Working,
+            attention: false,
+            ownership: source.map(|source| Ownership {
+                source: source.to_string(),
+                session_id: session_id.to_string(),
+                metadata: metadata
+                    .iter()
+                    .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+                    .collect(),
+                ..Ownership::default()
+            }),
+            created_at: 0,
+        }
+    }
+
+    /// **`agent_lane` is the lane capability signal, and it is stamped from the
+    /// tab's own report** (plan 015 §3.4).
+    ///
+    /// Its PRESENCE is what makes the UI offer a transcript, so every case that
+    /// cannot actually be opened must leave it off: a different agent, a tab that
+    /// reported no server, a blank one, and a server with no session id to
+    /// address. The key is `agent_lane` and NOT `lane` — `lane` is already taken
+    /// on this DTO by the RC hub's lane token.
+    #[test]
+    fn the_lane_stamp_needs_an_opencode_tab_that_reported_a_server_and_a_session() {
+        let url = "http://127.0.0.1:41234";
+        let row = machine_row(
+            "mini3",
+            &owned(Some("opencode"), "ses_abc", &[("server_url", url)]),
+            false,
+        );
+        assert_eq!(
+            row["agent_lane"],
+            json!({"kind": "opencode", "session_id": "ses_abc", "server_url": url})
+        );
+        assert!(row.get("lane").is_none() || row["lane"].is_null(), "{row}");
+
+        // Everything that must NOT carry one.
+        for (what, session) in [
+            ("a plain shell tab", owned(None, "", &[])),
+            (
+                "another agent",
+                owned(Some("claude"), "ses_abc", &[("server_url", url)]),
+            ),
+            (
+                "opencode with no server reported",
+                owned(Some("opencode"), "ses_abc", &[("model", "sonnet")]),
+            ),
+            (
+                "opencode with a blank server",
+                owned(Some("opencode"), "ses_abc", &[("server_url", "   ")]),
+            ),
+            (
+                "opencode with no session id to address",
+                owned(Some("opencode"), "", &[("server_url", url)]),
+            ),
+        ] {
+            let row = machine_row("mini3", &session, false);
+            assert!(
+                row.get("agent_lane").is_none(),
+                "{what} was stamped with a lane: {row}"
+            );
+        }
+    }
+
+    /// The reconcile map and the row stamp are the SAME fact, derived from the
+    /// same place — an entry that outlived the row it belongs to would hold a
+    /// subscription (and an `ssh -N` child) nobody can see.
+    #[test]
+    fn the_reconcile_map_is_exactly_the_stamped_rows() {
+        let url = "http://127.0.0.1:41234";
+        let mut second = owned(Some("opencode"), "ses_two", &[("server_url", url)]);
+        second.tab_id = 7;
+        let sessions = vec![
+            owned(Some("opencode"), "ses_abc", &[("server_url", url)]),
+            owned(Some("claude"), "ses_zzz", &[("server_url", url)]),
+            owned(Some("opencode"), "ses_bare", &[]),
+            second,
+        ];
+        assert_eq!(
+            lanes_of(&sessions),
+            BTreeMap::from([
+                ("ses_abc".to_string(), url.to_string()),
+                ("ses_two".to_string(), url.to_string()),
+            ])
+        );
     }
 
     fn status_named<'a>(status: &'a [Value], name: &str) -> Option<&'a Value> {
@@ -1325,6 +1641,7 @@ mod tests {
             rx,
             Arc::clone(&state),
             on_change,
+            Arc::new(Mutex::new(None)),
         ));
 
         fn activity(state: &Arc<Mutex<BTreeMap<String, MachineState>>>) -> Option<Value> {
@@ -1663,6 +1980,81 @@ mod tests {
                 .then_some(())
         })
         .await;
+    }
+
+    /// **Eviction's signal, at the layer that delivers it** (plan 015 §3.4).
+    ///
+    /// A lane entry holds a live subscription and, on a remote machine, an
+    /// `ssh -N` child. What retires it is the roost SNAPSHOT: the observer is
+    /// handed the machine's current lane set every time a fresh inventory
+    /// replaces the row set, and an entry absent from that set is dropped. So
+    /// this asserts the two ways a lane-carrying tab can stop existing, both of
+    /// which reach the observer as an EMPTY map:
+    ///
+    /// * the agent exits and its adapter releases the tab (roost's wire removes
+    ///   `ownership`, which drops the row from the agent-owned inventory), and
+    /// * the tab itself closes.
+    ///
+    /// Both matter, because after a release the tab is in the inventory's HIDDEN
+    /// half and its eventual close publishes nothing on its own account — the
+    /// case plan 014's ghost-row fix exists for. An entry that survived either
+    /// would sit behind a row nobody can see.
+    #[tokio::test]
+    async fn a_lane_carrying_tab_that_goes_away_publishes_an_empty_lane_set() {
+        let url = "http://127.0.0.1:41234";
+        let fake = FakeRoost::start().await;
+        let mut owned = ownership("opencode", "ses_abc", "session_status", 1_700_000_100);
+        owned["metadata"] = json!({ "server_url": url });
+        fake.set_tab_axes(VECTOR_TAB, "working", Some(owned), false);
+
+        let machines = start(
+            &config_with(&["mini3"]),
+            &sockets(&[("mini3", fake.socket_path())]),
+        );
+        // Record every lane set published, in order — a history, not a sample:
+        // an entry evicted and re-created between two polls looks like nothing
+        // happened.
+        type Published = Arc<Mutex<Vec<BTreeMap<String, String>>>>;
+        let history: Published = Arc::new(Mutex::new(Vec::new()));
+        {
+            let history = Arc::clone(&history);
+            machines.set_lane_observer(Arc::new(move |machine, lanes| {
+                assert_eq!(machine, "mini3");
+                history.lock().unwrap().push(lanes.clone());
+            }));
+        }
+
+        let last = || history.lock().unwrap().last().cloned();
+        wait_for("the lane to be published", || {
+            last().filter(|l| l.get("ses_abc").map(String::as_str) == Some(url))
+        })
+        .await;
+
+        // The agent exits: its adapter releases the tab, so the row leaves the
+        // agent-owned inventory even though the tab is still open.
+        fake.set_tab_axes(VECTOR_TAB, "inactive", None, false);
+        wait_for("the released tab's lane to retire", || {
+            last().filter(|l| l.is_empty())
+        })
+        .await;
+
+        // And the now-hidden tab closes — out of band, the way a dead process's
+        // shell does. It must not resurrect anything.
+        let reach: Arc<dyn RoostReach> = Arc::new(LocalSession::new("mini3", fake.socket_path()));
+        tab_close(reach.as_ref(), VECTOR_TAB).await.expect("close");
+        wait_for("the closed tab to be seen", || {
+            rows(&machines).is_empty().then_some(())
+        })
+        .await;
+        assert!(
+            history
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|l| l.is_empty() || l.get("ses_abc").map(String::as_str) == Some(url)),
+            "a lane set was published that named a server nobody reported"
+        );
+        assert_eq!(last(), Some(BTreeMap::new()), "the last word is: no lanes");
     }
 
     /// A kind roost has no recipe for is refused BEFORE anything is opened — the

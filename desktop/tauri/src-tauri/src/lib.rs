@@ -11,6 +11,7 @@ mod approval;
 mod broker;
 mod env;
 mod ipc;
+mod lane;
 mod live_activity;
 mod machines;
 mod prefs;
@@ -364,6 +365,107 @@ async fn machine_launch(
             initial_prompt.as_deref(),
         )
         .await
+}
+
+// -- agent lanes (plan 015 §3.4) ------------------------------------------
+//
+// The frontend twins of the `lane.*` IPC ops. Both doors land in the SAME
+// [`lane::Lanes`] — the harness drives the socket, the panel drives these, and
+// what is tested is what ships (the `machine_*` pair's rule).
+//
+// A failure crosses as its `error.code` and message joined, because a Tauri
+// command's error channel is a bare string: `bridge.ts` splits on the first ": "
+// to recover the code. The socket ops keep the structured envelope.
+
+/// One lane failure as a string a `#[tauri::command]` can return.
+fn lane_error(failure: lane::LaneFailure) -> String {
+    format!("{}: {}", failure.code(), failure.message())
+}
+
+/// `lane_open` — start (or re-answer) a live transcript for one agent session.
+#[tauri::command]
+async fn lane_open(
+    lanes: tauri::State<'_, Arc<lane::Lanes>>,
+    machine: String,
+    session_id: String,
+) -> Result<serde_json::Value, String> {
+    lanes.open(&machine, &session_id).await.map_err(lane_error)
+}
+
+/// `lane_messages` — the staged-then-swapped transcript view.
+#[tauri::command]
+fn lane_messages(
+    lanes: tauri::State<'_, Arc<lane::Lanes>>,
+    machine: String,
+    session_id: String,
+) -> Result<serde_json::Value, String> {
+    lanes.messages(&machine, &session_id).map_err(lane_error)
+}
+
+/// `lane_approvals` — what the session (or a descendant) is blocked on.
+#[tauri::command]
+fn lane_approvals(
+    lanes: tauri::State<'_, Arc<lane::Lanes>>,
+    machine: String,
+    session_id: String,
+) -> Result<serde_json::Value, String> {
+    lanes.approvals(&machine, &session_id).map_err(lane_error)
+}
+
+/// `lane_send` — a prompt. `mode` defaults to `queue`.
+#[tauri::command]
+async fn lane_send(
+    lanes: tauri::State<'_, Arc<lane::Lanes>>,
+    machine: String,
+    session_id: String,
+    text: String,
+    mode: Option<String>,
+) -> Result<serde_json::Value, String> {
+    let mode = lane::parse_mode(mode.as_deref())?;
+    lanes
+        .send(&machine, &session_id, &text, mode)
+        .await
+        .map_err(lane_error)
+}
+
+/// `lane_cancel` — stop the turn in flight.
+#[tauri::command]
+async fn lane_cancel(
+    lanes: tauri::State<'_, Arc<lane::Lanes>>,
+    machine: String,
+    session_id: String,
+) -> Result<serde_json::Value, String> {
+    lanes
+        .cancel(&machine, &session_id)
+        .await
+        .map_err(lane_error)
+}
+
+/// `lane_answer` — resolve one approval. See [`lane::parse_answer`] for the
+/// three shapes `answer` takes.
+#[tauri::command]
+async fn lane_answer(
+    lanes: tauri::State<'_, Arc<lane::Lanes>>,
+    machine: String,
+    session_id: String,
+    approval_id: String,
+    answer: serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    let answer = lane::parse_answer(&answer)?;
+    lanes
+        .answer(&machine, &session_id, &approval_id, answer)
+        .await
+        .map_err(lane_error)
+}
+
+/// `lane_close` — the panel's unmount. Idempotent.
+#[tauri::command]
+fn lane_close(
+    lanes: tauri::State<'_, Arc<lane::Lanes>>,
+    machine: String,
+    session_id: String,
+) -> serde_json::Value {
+    lanes.close(&machine, &session_id)
 }
 
 /// `add_machine` — the dialog's path into [`machines::add_from_json`].
@@ -963,6 +1065,13 @@ pub fn run() {
             machine_kill,
             machine_capabilities,
             machine_launch,
+            lane_open,
+            lane_messages,
+            lane_approvals,
+            lane_send,
+            lane_cancel,
+            lane_answer,
+            lane_close,
             machines_list,
             add_machine,
             open_terminal,
@@ -1160,6 +1269,27 @@ pub fn run() {
             ));
             app.manage(machines.clone());
 
+            // Agent lanes on machine rows (plan 015 §3.4). Built AFTER the
+            // machine layer because it reads from it (which row exposes which
+            // agent server, and how that machine is reached), and wired back
+            // into it with a WEAK reference so the two do not keep each other
+            // alive: `Machines` publishes each fresh roost snapshot's lane set,
+            // which is how an entry whose tab has gone — including one whose
+            // process died before any adapter claimed it — is evicted along with
+            // the `ssh -N` child behind it.
+            let lanes = Arc::new(lane::Lanes::new(
+                tauri::async_runtime::handle().inner().clone(),
+                app.handle().clone(),
+                machines.clone(),
+            ));
+            let lanes_hook = Arc::downgrade(&lanes);
+            machines.set_lane_observer(Arc::new(move |machine: &str, open: &_| {
+                if let Some(lanes) = lanes_hook.upgrade() {
+                    lanes.reconcile(machine, open);
+                }
+            }));
+            app.manage(lanes.clone());
+
             // Live activity for SHED sessions. Machine rows carry theirs already
             // (roost reports the agent axes on every poll); shed rows are listed
             // by the one-shot, which by design never sets it — so without this
@@ -1196,6 +1326,7 @@ pub fn run() {
                 prefs,
                 machines,
                 live_activity,
+                lanes,
             );
             // block_on enters Tauri's tokio runtime so tokio's UnixListener can
             // register with the reactor; then serve on the same runtime.

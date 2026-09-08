@@ -103,17 +103,28 @@ impl MachineForward for FixedPort {
     }
 }
 
-/// An `ssh -N -L <port>:127.0.0.1:1029 <machine>` child process — the desktop
-/// implementation, shared by `sx` and the Tauri app.
+/// An `ssh -N -L <port>:127.0.0.1:<remote> <machine>` child process — the
+/// desktop implementation, shared by `sx` and the Tauri app.
 ///
 /// The child is killed and reaped on drop, so an early return or a Ctrl-C can
 /// never leave a forward running. `ensure` respawns onto the SAME local port
 /// when the child has exited; `ExitOnForwardFailure=yes` in the argv means a
 /// lost race for that port is an immediate visible failure rather than a tunnel
 /// that silently forwards nothing.
+///
+/// The REMOTE port is per-forward rather than a constant. It was
+/// [`shed_core::hub_client::HUB_PORT`] for as long as the hub was the only thing
+/// on the far side; plan 015's opencode lane forwards a loopback port an agent
+/// chose and roost reported, which is a different number per session and cannot
+/// be known at compile time. [`SshForward::reserve`] keeps the hub's meaning;
+/// [`SshForward::reserve_for`] takes the port.
 pub struct SshForward {
     entry: shed_core::config::MachineEntry,
     port: u16,
+    /// The far-side loopback port this tunnel lands on. Fixed for the life of
+    /// the value, like [`SshForward::port`] — a forward that re-pointed itself
+    /// would break the stable-address invariant the module doc pins.
+    remote_port: u16,
     /// The label the tunnel is described by in errors — the machine's NAME,
     /// not its `user@host`, so a message reads in the same vocabulary as the
     /// `--on machine:<name>` the user typed.
@@ -142,12 +153,28 @@ impl SshForward {
     /// because the alternative (holding the socket) is what would prevent ssh
     /// from binding it at all.
     pub fn reserve(entry: shed_core::config::MachineEntry) -> Result<Self, ForwardError> {
+        Self::reserve_for(entry, HUB_PORT)
+    }
+
+    /// Reserve a local port forwarding to an ARBITRARY loopback port on the
+    /// machine — [`SshForward::reserve`] with the far side named.
+    ///
+    /// This is the opencode lane's door (plan 015 §3.4): the agent's HTTP server
+    /// binds an ephemeral loopback port, roost reports it as `server_url`, and
+    /// the desktop needs a local socket that lands on exactly that one. Nothing
+    /// else changes — same reservation, same child lifecycle, same stable local
+    /// port.
+    pub fn reserve_for(
+        entry: shed_core::config::MachineEntry,
+        remote_port: u16,
+    ) -> Result<Self, ForwardError> {
         let port = free_loopback_port()
             .map_err(|e| ForwardError(format!("allocating a local forward port: {e}")))?;
         let label = format!("machine:{}", entry.name);
         Ok(Self {
             entry,
             port,
+            remote_port,
             label,
             child: Arc::new(Mutex::new(None)),
             ensuring: tokio::sync::Mutex::new(()),
@@ -170,14 +197,25 @@ impl SshForward {
         entry: shed_core::config::MachineEntry,
         exec_prefix: Vec<String>,
     ) -> Result<Self, ForwardError> {
-        let mut f = Self::reserve(entry)?;
+        Self::reserve_faked_for(entry, HUB_PORT, exec_prefix)
+    }
+
+    /// [`SshForward::reserve_faked`] against an arbitrary far-side port — the
+    /// lane's shape ([`SshForward::reserve_for`]) under the same stand-in.
+    #[cfg(test)]
+    fn reserve_faked_for(
+        entry: shed_core::config::MachineEntry,
+        remote_port: u16,
+        exec_prefix: Vec<String>,
+    ) -> Result<Self, ForwardError> {
+        let mut f = Self::reserve_for(entry, remote_port)?;
         f.exec_prefix = Some(exec_prefix);
         Ok(f)
     }
 
     /// The ssh argv this forward spawns — exposed so a caller can print it.
     pub fn argv(&self) -> Vec<String> {
-        machine::forward_argv(&self.entry, self.port, HUB_PORT)
+        machine::forward_argv(&self.entry, self.port, self.remote_port)
     }
 
     /// What is actually exec'd: [`argv`](Self::argv), unless a test seam has
@@ -1035,6 +1073,84 @@ mod tests {
         assert!(argv.contains(&"ExitOnForwardFailure=yes".to_string()));
         assert!(argv.contains(&"-N".to_string()), "runs no remote command");
         assert!(f.child_is_dead(), "nothing is spawned until ensure()");
+    }
+
+    /// **The lane's forward names its own far side** (plan 015 §3.4).
+    ///
+    /// `reserve_for` is what an opencode lane reserves with: the agent's HTTP
+    /// server binds an ephemeral loopback port, roost reports it, and the tunnel
+    /// has to land on THAT port rather than on the hub's fixed 1029. The `-L`
+    /// spec is the only place the number appears, so this asserts it there.
+    #[test]
+    fn a_forward_reserved_for_a_port_tunnels_to_that_port() {
+        let remote = 41_811;
+        assert_ne!(remote, HUB_PORT, "the point is that it is NOT the hub port");
+        let f = SshForward::reserve_for(entry(), remote).expect("reserve_for");
+        let argv = f.argv();
+        assert!(
+            argv.windows(2)
+                .any(|w| w == ["-L", &format!("127.0.0.1:{}:127.0.0.1:{remote}", f.port())]),
+            "argv does not forward to the reported port: {argv:?}"
+        );
+        // The rest of the tunnel is unchanged — a lane forward is an ssh -N
+        // tunnel like any other, and a lost local port is still loud.
+        assert!(argv.contains(&"-N".to_string()), "runs no remote command");
+        assert!(argv.contains(&"ExitOnForwardFailure=yes".to_string()));
+        assert!(
+            !argv.iter().any(|a| a.contains(&HUB_PORT.to_string())),
+            "the hub port leaked into a lane forward: {argv:?}"
+        );
+        // `reserve` still means the hub, unchanged: the shape (and the existing
+        // tests) survive the new parameter.
+        let hub = SshForward::reserve(entry()).expect("reserve");
+        assert!(hub.argv().windows(2).any(|w| w
+            == [
+                "-L",
+                &format!("127.0.0.1:{}:127.0.0.1:{HUB_PORT}", hub.port())
+            ]));
+    }
+
+    /// **The local port survives a re-`ensure`, far-side port included.**
+    ///
+    /// The module's central invariant, asserted on the lane's constructor: the
+    /// lane's reconnect path re-`ensure`s the forward inside its backoff loop
+    /// (§3.4), and a forward that moved its local port there would leave the
+    /// `OpencodeClient` holding a base URL that points at nothing — with no
+    /// error, because something else may well have taken the port.
+    #[tokio::test]
+    async fn a_lane_forward_keeps_its_local_port_across_a_re_ensure() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log = dir.path().join("spawns");
+        let remote = 41_812;
+        let forward =
+            SshForward::reserve_faked_for(entry(), remote, fake_ssh(&log, "exec sleep 30"))
+                .expect("reserve_faked_for");
+        let port = forward.port();
+        let argv_before = forward.argv();
+
+        let tunnel = tunnel_once_started(port, &log, 1);
+        forward.ensure().await.expect("the first ensure");
+        let tunnel = tunnel.await.expect("the tunnel task");
+        assert_eq!(forward.port(), port, "ensure moved the local port");
+
+        // Kill the tunnel so the next ensure genuinely re-establishes rather
+        // than short-circuiting on a healthy child.
+        drop(tunnel);
+        let tunnel = tunnel_once_started(port, &log, 2);
+        forward.ensure().await.expect("the re-establish");
+        let _tunnel = tunnel.await.expect("the tunnel task");
+
+        assert_eq!(spawned_pids(&log).len(), 2, "a replacement was spawned");
+        assert_eq!(
+            forward.port(),
+            port,
+            "the re-establish moved the local port"
+        );
+        assert_eq!(
+            forward.argv(),
+            argv_before,
+            "the re-established tunnel forwards somewhere else"
+        );
     }
 
     /// A forward whose destination refuses must fail via the WATCH-THE-CHILD

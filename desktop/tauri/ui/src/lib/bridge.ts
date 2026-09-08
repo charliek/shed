@@ -972,6 +972,32 @@ export type RcSession = {
   /** The roost tab id backing a machine row (a string — roost's own ids are
    *  strings on the wire); absent for a shed session. */
   tab_id?: string;
+  /** The agent lane behind this row, if it has one (plan 015 §3.4). Stamped
+   *  client-side like `origin`/`machine`, from what the tab's adapter reported.
+   *
+   *  **Its PRESENCE is the capability signal** — a row that has it can open a
+   *  live transcript (`lane.*`), a row that does not is status-only, and the
+   *  Transcript affordance is gated on exactly this. Absent on every shed row
+   *  and on any machine row whose agent reported no server.
+   *
+   *  Note the name: `agent_lane`, NOT `lane`. `lane` above is the RC hub's lane
+   *  token and means something else entirely on the same object. */
+  agent_lane?: AgentLane | null;
+};
+
+/** What `RcSession.agent_lane` carries: which agent, which session of it, and
+ *  the loopback URL of the server that session is running on (validated
+ *  loopback-only by roost's own plugin before it is reported). The URL is the
+ *  MACHINE's loopback, not this host's — the backend forwards to it when the
+ *  machine is remote, so nothing in the UI should ever dial it directly. */
+export type AgentLane = {
+  /** The agent's token, the same vocabulary `RcKind` speaks. `"opencode"` is
+   *  the only adapter that exists today. */
+  kind: string;
+  /** The AGENT's own session id — the address every `lane.*` op takes, and not
+   *  the roost tab id (`tab_id` / `slug`). */
+  session_id: string;
+  server_url: string;
 };
 
 /** A configured machine's health, for the sessions view's group rows. A machine

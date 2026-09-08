@@ -926,6 +926,30 @@ fn serve_mutation(state: &Arc<Mutex<FakeState>>, method: &str, path: &str) -> (u
         } else if !pin.is_empty() && id != pin {
             violation = Some(format!("addressed session {id}, not the pinned {pin}"));
             false
+        } else if let Some(rid) = tail.strip_prefix("permissions/") {
+            // The DEPRECATED session-scoped answer route. Naming the right
+            // session is not enough: it answers an approval, so it owes the
+            // same ledger check the live `/permission/{id}/reply` arm below
+            // makes. Without this a test could answer a request the fake never
+            // issued and the guard would record nothing — the hole the Python
+            // fake had at `fake_opencode.py`'s legacy route.
+            let rid = percent_decode(rid);
+            match st.issued.get(&rid) {
+                None => {
+                    violation = Some(format!("answered {rid}, which the fake never issued"));
+                    false
+                }
+                Some(owner) if !scope.iter().any(|s| s == owner) => {
+                    violation = Some(format!(
+                        "answered {rid}, issued for {owner}, outside the pinned {pin}'s scope"
+                    ));
+                    false
+                }
+                Some(_) => {
+                    unknown_session = !st.sessions.contains_key(&id);
+                    true
+                }
+            }
         } else {
             unknown_session = !st.sessions.contains_key(&id);
             true

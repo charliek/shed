@@ -620,6 +620,46 @@ async fn the_pin_guard_catches_an_off_pin_mutation() {
     assert!(violations[1].contains("per_nobody"));
 }
 
+/// The DEPRECATED session-scoped answer route owes the same ledger check as the
+/// live one. Naming the pinned session is not enough — it still answers an
+/// approval, and answering one the fake never issued is exactly the
+/// cross-contamination the guard exists to catch. Without the ledger check this
+/// returns 200 and records nothing, which is how a bypass hides: the suite stays
+/// green while the guard silently stops guarding half the surface.
+#[tokio::test]
+async fn the_pin_guard_catches_an_unissued_answer_on_the_deprecated_route() {
+    let fake = three_sessions().await;
+    let raw = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("a raw client");
+    let base = fake.base_url();
+
+    // The pinned session, but a request id the fake never issued.
+    let resp = raw
+        .post(
+            base.join("session/ses_a/permissions/per_nobody")
+                .expect("url"),
+        )
+        .json(&json!({ "response": "once" }))
+        .send()
+        .await
+        .expect("the fake answers");
+    assert_eq!(
+        resp.status(),
+        500,
+        "an unissued answer can never look successful, even on the legacy route"
+    );
+
+    let violations = fake.violations();
+    assert_eq!(violations.len(), 1, "recorded: {violations:#?}");
+    assert!(
+        violations[0].contains("per_nobody") && violations[0].contains("never issued"),
+        "names the offending request: {}",
+        violations[0]
+    );
+}
+
 #[tokio::test]
 async fn an_id_with_a_slash_cannot_re_address_the_request() {
     let fake = FakeOpencode::start().await;

@@ -576,13 +576,21 @@ class FakeRoost:
 
     def add_tab(self, tab_id: int, *, cwd: str, title: str, source: str | None = None,
                 session_id: str = "", lifecycle: str = "inactive", detail: str = "",
-                has_notification: bool = False, shell_state: str = "at_prompt") -> dict:
+                has_notification: bool = False, shell_state: str = "at_prompt",
+                metadata: dict | None = None) -> dict:
         """Add a tab and commit it as roost does: one `tab.opened` batch.
 
         `source` is roost's open `ownership.source` string (`opencode`, `claude`,
         …). **`None` means a plain shell tab** — no `ownership` key at all, which
         is what roost's wire carries for somebody's terminal, and what makes it
         NOT a session row.
+
+        `metadata` is roost's open extension channel on the ownership
+        (`TabAgentReportParams.metadata`) — the adapter's own key/value bag,
+        carried verbatim and validated by nobody. It is how an opencode tab
+        reports `server_url` (roost R10, plan 015 §3.3), which is what makes the
+        row's `agent_lane` stamp appear. Ignored without a `source`, because
+        there is no ownership to hang it on.
         """
         with self._lock:
             tab = copy.deepcopy(_AGENT_TAB if source else _SHELL_TAB)
@@ -597,7 +605,7 @@ class FakeRoost:
             tab["position"] = len(tabs)
             if source:
                 tab["ownership"] = _ownership(source, session_id, detail,
-                                              tab.get("last_active", 0))
+                                              tab.get("last_active", 0), metadata)
             else:
                 tab.pop("ownership", None)
             tabs.append(tab)
@@ -1103,14 +1111,20 @@ class FakeRoost:
         return result
 
 
-def _ownership(source: str, session_id: str, detail: str, last_event_at: int) -> dict:
-    """A minimal roost `Ownership`, so a test never hand-writes the shape."""
+def _ownership(source: str, session_id: str, detail: str, last_event_at: int,
+               metadata: dict | None = None) -> dict:
+    """A minimal roost `Ownership`, so a test never hand-writes the shape.
+
+    `metadata` is roost's open extension channel — an opaque string map the
+    daemon carries verbatim (it validates only `source` and the attention bits).
+    Defaults to empty, which is what every adapter that stamps nothing sends.
+    """
     return {
         "source": source,
         "session_id": session_id,
         "last_event_at": last_event_at,
         "detail": detail,
-        "metadata": {},
+        "metadata": dict(metadata or {}),
     }
 
 

@@ -29,6 +29,34 @@ make -C desktop core-linux          # shed-core cargo test + clippy on Linux (Do
   libnotify `Notifier` compile) and asserts the gate is fail-closed. No display needed.
 - Both reuse the `shed-tauri-linux` image (built from `desktop/Dockerfile.tauri-linux`).
 
+### The native inner loop (a Linux host with the WebKitGTK dev stack)
+
+Docker is the **gate**; it is a poor iteration loop (image build + tar + cold cargo cache per
+run). On a Linux box that can already build the crate natively, drive the suite directly and
+keep Docker for the final check:
+
+```bash
+cd desktop/tauri/ui && npm ci && npm run build      # ONCE, and after any tauri/ui change
+cd ../src-tauri && cargo build                      # AFTER EVERY Rust change — see below
+cd ../..                                            # desktop/
+SHED_TAURI_BIN=$PWD/tauri/src-tauri/target/debug/shed-desktop-tauri \
+WEBKIT_DISABLE_DMABUF_RENDERER=1 \
+xvfb-run -a --server-args="-screen 0 1400x900x24" \
+  uv run --group test pytest tools/shedtest --target tauri -q -p no:cacheprovider
+```
+
+Two traps, both of which cost real time and neither of which produces a useful error:
+
+- **The harness runs `SHED_TAURI_BIN`, not `cargo`.** A Rust change you did not `cargo build`
+  is simply not under test, and the run passes (or fails) on the OLD binary. `cargo test --lib`
+  builds a *different* artifact and does not refresh it. Rebuild before every pytest run.
+- **A `tauri/ui/dist` that exists is not a `dist` that works.** `generate_context!` only needs
+  the directory, so a placeholder `index.html` (a one-line `probe` stub is a real thing to find
+  there) compiles and links fine — and then the WebView mounts nothing, `ui.current_pane()`
+  stays `None`, and EVERY tauri cell dies at `timed out … waiting for tauri frontend ready`
+  with nothing in the app log. `ls tauri/ui/dist` should show `assets/`, `index.html`,
+  `popover.html`, `preferences.html`; if it does not, `npm ci && npm run build`.
+
 ## The .deb
 
 ```bash
@@ -107,6 +135,17 @@ that still exports it is exporting nothing. Two env vars steer it:
 both directions), so an app with no session running shows no `localhost` row at all — that is
 correct, not a bug. A configured machine named `localhost` wins over the implicit one, and
 `machine.add {"name":"localhost"}` is refused.
+
+### Agent lanes ride the same seam (plan 015)
+
+`test_tauri_lane.py` drives the `lane.*` ops — an opencode transcript on a machine row — and
+needs **no extra setup**: `fake_roost` serves a tab whose `ownership.metadata` carries
+`server_url`, and `fake_opencode.py` (a port of the rc-parity fake, pin guard and all) answers
+on a loopback port in the pytest process. The mapping in `SHED_TAURI_ROOST_SOCKETS` is what
+makes the machine count as LOCAL, so the lane dials that URL directly and the suite spawns no
+ssh. Against a real remote machine the same code takes the other branch — an
+`ssh -N -L <local>:127.0.0.1:<reported>` child per session-port — which nothing hermetic can
+exercise.
 
 ### Against a REAL local daemon
 
