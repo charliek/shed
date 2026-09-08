@@ -16,7 +16,12 @@ What this port adds, because the lane speaks routes the RC hub never did:
   on opencode's wire. The guard maps each request id back to the session it was
   ISSUED for and refuses one outside the pinned session's scope (the pin plus its
   descendants), which is how a child session's approval can legitimately be
-  answered from the root's panel while a sibling root's cannot.
+  answered from the root's panel while a sibling root's cannot. The LEGACY
+  session-scoped form `_SCOPED_RE` also matches
+  (`POST /session/{id}/permissions/{requestID}`) carries a request id too and
+  goes through exactly the same ledger check (`_issuance_violation`) — naming
+  the pinned session in the path is not on its own a licence to answer a request
+  the fake never issued.
 * the REST routes the adapter's seed reads: `/session/{id}`,
   `/session/{id}/message`, `/session/{id}/children`, `/session/status`,
   `/permission`, `/question` — the last three `?directory=`-scoped, as opencode
@@ -550,6 +555,25 @@ class FakeOpencode:
                 return scope
             scope |= grown
 
+    def _issuance_violation(self, request_id: str) -> str | None:
+        """The ANSWER guard, by request id: an answer may only ever name a
+        request the fake actually issued, for a session inside the pin's scope.
+
+        Shared by both answer shapes, which is the point. The lane's global
+        `/permission/{id}/reply` always went through it; the legacy
+        session-scoped `/session/{id}/permissions/{id}` was checked on its
+        SESSION alone, so with the pin set, answering a request the fake had
+        never issued returned `200 true` and recorded no violation as long as
+        the path named the pinned session. Called with the lock held.
+        """
+        owner = self.issued.get(request_id)
+        if owner is None:
+            return f"answered {request_id}, which the fake never issued"
+        if self.pin and owner not in self._pin_scope():
+            return (f"answered {request_id}, issued for {owner}, "
+                    f"outside the pinned {self.pin}'s scope")
+        return None
+
     def _serve_mutation(self, path: str, body: str) -> tuple[int, str]:
         with self._lock:
             self.post_paths.append(path)
@@ -567,18 +591,20 @@ class FakeOpencode:
                                  f"not the pinned {self.pin}")
                 else:
                     unknown_session = scoped.group(1) not in self.sessions
+                    verb = scoped.group(2)
+                    # `permissions/{id}` is the LEGACY answer form: it carries a
+                    # request id, so it gets the same ledger check the global
+                    # answer routes below get. Naming the pinned session is not
+                    # on its own a licence to answer anything.
+                    if not unknown_session and verb.startswith("permissions/"):
+                        violation = self._issuance_violation(
+                            verb.split("/", 1)[1])
             elif answer:
                 # The lane's answer routes are id-addressed and GLOBAL, so the
                 # guard resolves the request id back to the session it was
                 # issued for. A descendant's is in scope (its approval blocks
                 # the same agent); a sibling root's is not.
-                request_id = answer.group(2)
-                owner = self.issued.get(request_id)
-                if owner is None:
-                    violation = f"answered {request_id}, which the fake never issued"
-                elif self.pin and owner not in self._pin_scope():
-                    violation = (f"answered {request_id}, issued for {owner}, "
-                                 f"outside the pinned {self.pin}'s scope")
+                violation = self._issuance_violation(answer.group(2))
             else:
                 violation = f"not a session-scoped mutation route: POST {path}"
 

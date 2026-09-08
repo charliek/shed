@@ -808,3 +808,68 @@ def test_a_tab_that_goes_away_takes_its_lane_with_it(app, roost, spare_oc):
     )
     assert spare_oc.stream_count() == 0, "a closed tab resurrected its lane"
     assert _error(lambda: _open(app)).code == "no_lane"
+
+
+# ---------------------------------------------------------------------------
+# the guard itself
+# ---------------------------------------------------------------------------
+
+
+def test_the_pin_guard_catches_an_unissued_answer_on_either_route():
+    """**The guard is non-vacuous** — `shed-opencode`'s
+    `the_pin_guard_catches_an_off_pin_mutation`, in Python and one route wider.
+
+    Every cell above asserts `violations == []`, which is only worth anything if
+    a wrong mutation would actually be recorded. It would not be, on one route:
+    the legacy session-scoped answer form (`/session/{id}/permissions/{rid}`)
+    checked its SESSION alone, so with the pin set, answering a request the fake
+    had never issued returned `200 true` and recorded nothing.
+
+    Its own fake, and `_serve_mutation` directly: this is about the guard, not
+    about anything the app does — and the module's shared fake must not end up
+    carrying deliberate violations that another cell then reads.
+    """
+    fake = FakeOpencode()
+    try:
+        fake.add_session("ses_root", title="the pin", directory=DIRECTORY)
+        fake.add_session("ses_sib", title="a sibling root", directory=DIRECTORY)
+        fake.add_permission("ses_root", "per_real")
+        fake.add_permission("ses_sib", "per_sibling")
+        fake.pin = "ses_root"
+
+        # The legacy route, naming the PINNED session, answering a request id
+        # the fake never issued — the bypass.
+        assert fake._serve_mutation(
+            "/session/ses_root/permissions/per_ghost", '{"response":"once"}',
+        )[0] == 500
+        # …and one that exists but was issued for a sibling root, which the
+        # pin's scope does not cover.
+        assert fake._serve_mutation(
+            "/session/ses_root/permissions/per_sibling", '{"response":"once"}',
+        )[0] == 500
+        # The global answer route, which always had the check.
+        assert fake._serve_mutation(
+            "/permission/per_ghost/reply", '{"reply":"once"}',
+        )[0] == 500
+        # And the original grammar: a mutation addressing another session.
+        assert fake._serve_mutation("/session/ses_sib/abort", "")[0] == 500
+
+        assert len(fake.violations) == 4, fake.violations
+        assert "per_ghost" in fake.violations[0], fake.violations
+        assert "per_sibling" in fake.violations[1], fake.violations
+        assert "per_ghost" in fake.violations[2], fake.violations
+        assert "ses_sib" in fake.violations[3], fake.violations
+
+        # Non-vacuous the OTHER way too: the answers a pinned panel is entitled
+        # to make still succeed, on both shapes, and record nothing.
+        fake.violations.clear()
+        assert fake._serve_mutation(
+            "/session/ses_root/permissions/per_real", '{"response":"once"}',
+        ) == (200, "true")
+        assert fake._serve_mutation(
+            "/permission/per_real/reply", '{"reply":"once"}',
+        ) == (200, "true")
+        assert fake._serve_mutation("/session/ses_root/abort", "") == (200, "true")
+        assert fake.violations == []
+    finally:
+        fake.stop()
