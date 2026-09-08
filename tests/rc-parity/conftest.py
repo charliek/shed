@@ -477,16 +477,33 @@ class Rig:
 
         return self._poll(f"session {name} never appeared", listed, timeout)
 
-    def wait_for_pane(self, name: str, needle: str = "", timeout: float = 15) -> str:
+    def wait_for_pane(
+        self, name: str, needle: str = "", timeout: float = 15, count: int = 1
+    ) -> str:
         """Poll until the pane has drawn `needle` (or anything at all when it is
         empty). The engine's own settle constants are 750 ms, so a session that
-        has not drawn within the budget is a real failure, not a slow machine."""
+        has not drawn within the budget is a real failure, not a slow machine.
+
+        `count` is the same remedy `wait_for_agent_argv` documents below, for the
+        same observed flake: a caller that COUNTS occurrences must wait for all of
+        them, because a pane mid-render satisfies "the needle is present" while
+        still holding fewer copies than the finished screen. Polling for presence
+        and then counting is a race between the two legs, and it surfaces as a
+        spurious Go-vs-Rust diff (3 markers against 4) rather than as the render
+        lag it actually is."""
 
         def drawn():
             text = self.capture(name)
-            return text if (needle in text if needle else text.strip()) else None
+            if needle:
+                return text if text.count(needle) >= count else None
+            return text if text.strip() else None
 
-        return self._poll(f"pane of {name} never showed {needle!r}", drawn, timeout)
+        return self._poll(
+            f"pane of {name} never showed {needle!r}"
+            + (f" {count} times" if count > 1 else ""),
+            drawn,
+            timeout,
+        )
 
     def wait_for_agent_argv(self, count: int, timeout: float = 15) -> list:
         """Poll until the shim has recorded at least `count` argv elements.
