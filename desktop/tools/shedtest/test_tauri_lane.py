@@ -1,5 +1,5 @@
-"""The opencode **agent lane** in the Tauri app — the `lane.*` backend ops
-(plan 015 §3.4 C5). `--target tauri`.
+"""The opencode **agent lane** in the Tauri app — the `lane.*` ops and the
+transcript panel over them (plan 015 §3.4, C5 + C6). `--target tauri`.
 
 **Hermetic, and every layer under test is the shipped one.** Two fakes and no
 network beyond loopback:
@@ -19,10 +19,14 @@ Everything between them is production code: the real `RoostWatcher`, the real
 `machine_row` stamp, the real `shed_opencode` client/fold/ring/watcher, the real
 `lane.rs` staging. Nothing here injects a rendered row.
 
-**C5 is the BACKEND cut.** These cells drive `lane.*` over the IPC socket. The
-panel, its `useUiBridge` report and the screenshots are C6 — `lane.dump` is
-asserted here only to the extent C5 owns it (the op exists and answers `null`
-with no panel mounted).
+**Two halves, one file.** The `lane.*` ops are the backend cut (C5); the
+transcript PANEL over them is C6, and the cells that carry both say both — a
+`lane.messages` assertion is what the backend staged, the `lane.dump` beside it
+is what a person is actually looking at, and those are different claims. The
+panel is mounted the only way a caller can mount one (`ui.show_lane`, the
+show-create/show-launch pattern — a card's Transcript affordance is a click, and
+the harness has none) and closed again inside the same cell, so no cell inherits
+someone else's open panel.
 
 **Every cell opens its own lane** (`_ready`, which is `lane.open` plus a wait for
 the seed — `lane.open` is idempotent precisely so a caller never has to know
@@ -36,6 +40,7 @@ from __future__ import annotations
 
 import json
 import os
+import platform
 import shutil
 import subprocess
 import tempfile
@@ -56,6 +61,14 @@ pytestmark = pytest.mark.skipif(
 )
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
+
+PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
+
+#: Where the panel screenshots are KEPT, when a runner asks for them
+#: (`SHED_LANE_SHOTS=<dir>`). Unset by default on purpose: the render gate runs
+#: in a container with nowhere to put them, and every cell asserts the PNG it
+#: captured either way — writing the file is archiving, not the assertion.
+SHOTS = os.environ.get("SHED_LANE_SHOTS")
 
 MACHINE = "mini3"
 #: The workspace every session in this suite lives in. ONE directory on purpose:
@@ -309,6 +322,86 @@ def _error(fn) -> ShedError:
 
 
 # ---------------------------------------------------------------------------
+# the panel (C6): mounting it, reading what it rendered, screenshotting it
+# ---------------------------------------------------------------------------
+
+
+def _dump(app: TauriClient) -> dict | None:
+    """What the transcript PANEL rendered, or `None` when none is mounted.
+
+    Deliberately a different question from `lane.messages`: that is the backend's
+    staged view and answers whether or not anything is on screen. This is the
+    screen.
+    """
+    return app.call("lane.dump")["lane"]
+
+
+def _mounted(app: TauriClient, session_id: str) -> bool:
+    """Is the panel mounted on this session AND past its first read?
+
+    A panel reports from its FIRST render — before `lane.open` has answered —
+    on purpose: `lane.dump` going non-null is how a caller learns a panel
+    exists, and a panel that reports only once it succeeded would be invisible
+    in exactly the case worth seeing (an open that failed). So "mounted" is not
+    the same question as "showing something", and this asks the second: a
+    generation it can render, or an error saying why it cannot.
+    """
+    d = _dump(app)
+    return bool(d and d["session_id"] == session_id
+                and (d["generation"] >= 1 or d["error"]))
+
+
+def _panel(app: TauriClient, session_id: str = LANE_SESSION) -> dict:
+    """Mount the transcript panel on a session and wait for its first read.
+
+    `ui.show_lane` is the drivable half of the card's Transcript affordance —
+    the panel itself calls `lane.open` on mount and `lane.close` on unmount, so
+    this is a UI action, not a second door into the lane layer.
+    """
+    app.call("ui.show_lane", {"machine": MACHINE, "session_id": session_id})
+    app.wait_until(lambda: _mounted(app, session_id), timeout=20,
+                   what="the transcript panel to mount and report")
+    return _dump(app)
+
+
+def _panel_approvals(app: TauriClient) -> list[dict]:
+    """The approval CARDS on screen — not `lane.approvals`, which is what the
+    backend holds. A card carries what was rendered for it: the decision buttons
+    by label, and a question's option buttons + free-text flag."""
+    return (_dump(app) or {}).get("approvals", [])
+
+
+def _unmount(app: TauriClient) -> None:
+    """Close the panel and prove `lane.dump` goes back to `null`.
+
+    Every cell that mounts one ends here, for two reasons: the module's app and
+    fakes are shared, so an inherited panel would hold a lane open behind a cell
+    that thinks it closed one — and "null once it unmounts" is itself the pinned
+    behavior (§3.4), which is only worth anything if a panel was mounted first.
+    """
+    app.call("ui.close_lane")
+    app.wait_until(lambda: _dump(app) is None, timeout=20,
+                   what="the panel to unmount and clear its report")
+
+
+def _shot(app: TauriClient, name: str) -> None:
+    """Capture the window and keep it under `$SHED_LANE_SHOTS` when set.
+
+    macOS screenshots are Screen-Recording-TCC-gated (the tauri app can run
+    there too), so the capture is skipped rather than failed — Linux/Xvfb is
+    where this is the gate, and where the plan's artifacts are recorded.
+    """
+    if platform.system() == "Darwin":
+        return
+    png, w, h = app.screenshot(scale=1)
+    assert png[:8] == PNG_MAGIC and w > 0 and h > 0
+    if SHOTS:
+        out = Path(SHOTS).expanduser()
+        out.mkdir(parents=True, exist_ok=True)
+        (out / name).write_bytes(png)
+
+
+# ---------------------------------------------------------------------------
 # (1) the capability signal
 # ---------------------------------------------------------------------------
 
@@ -365,12 +458,18 @@ def test_only_a_tab_that_reported_a_server_carries_a_lane(app, oc):
 
 
 def test_the_history_seeds_into_the_lane_view(app):
-    """The REST seed reaches `lane.messages` as ordered, seq'd feed rows.
+    """The REST seed reaches `lane.messages` as ordered, seq'd feed rows — and
+    the PANEL renders those same rows.
 
-    `lane.dump` is the PANEL's copy of the same truth and is `null` until C6
-    mounts one — asserted here so the op is proven to exist and to answer the
-    no-panel case honestly, rather than being discovered missing in C6.
+    Both halves, because they are different claims. `lane.messages` is what the
+    backend staged; `lane.dump` is what a person is looking at, and a panel that
+    opened its lane and then rendered nothing would satisfy the first and fail
+    the second.
     """
+    # The Agents pane first, so the card carrying the Transcript affordance has
+    # long finished painting by the time the panel opens beside it — the artifact
+    # this cell writes is meant to show both.
+    app.navigate("agents")
     _ready(app)
     texts = _texts(app)
     assert texts[:2] == ["seeded question", "seeded answer"]
@@ -388,7 +487,34 @@ def test_the_history_seeds_into_the_lane_view(app):
     # waiting on the human.
     assert view["activity"] == "needs_input"
 
-    assert app.call("lane.dump") == {"lane": None}, "no panel is mounted in C5"
+    # --- the panel over it (C6) ---
+    assert _dump(app) is None, "no panel until one is opened"
+    panel = _panel(app)
+    assert panel["machine"] == MACHINE
+    assert panel["title"] == "the lane", "the header names the SESSION, not the tab"
+    # The rendered row, field by field — the treatments the panel applies (a
+    # `status` row muted, reasoning collapsed) are part of the row, not of the
+    # wire, so this is where they are pinned.
+    assert [{k: r[k] for k in ("role", "type", "text", "tool", "muted", "collapsed")}
+            for r in panel["rows"][:2]] == [
+        {"role": "user", "type": "text", "text": "seeded question",
+         "tool": None, "muted": False, "collapsed": False},
+        {"role": "assistant", "type": "text", "text": "seeded answer",
+         "tool": None, "muted": False, "collapsed": False},
+    ], panel["rows"][:2]
+    # …and the SAME rows, in the same order, as the view it renders — the panel
+    # re-reads the staged view rather than folding frames of its own, which is
+    # what makes those two able to disagree impossible.
+    assert [r["seq"] for r in panel["rows"]] == [m["seq"] for m in _messages(app)["messages"]]
+    assert panel["activity"] == "needs_input", "the badge says what the view says"
+    assert panel["stale"] is None, "no stale banner on a live lane"
+    assert panel["generation"] >= view["generation"]
+    assert panel["approvals"] == [], "nothing is blocking on the human"
+    assert panel["can_cancel"] is False, "Cancel is enabled only while Working"
+    assert panel["error"] is None
+
+    _shot(app, "tauri-lane-transcript.png")
+    _unmount(app)
 
 
 # ---------------------------------------------------------------------------
@@ -471,6 +597,22 @@ def test_a_permission_ask_surfaces_and_is_answered_on_its_own_route(app, oc):
     app.wait_until(lambda: _messages(app)["activity"] == "needs_approval",
                    timeout=5, what="the blocked verdict")
 
+    # --- and ON SCREEN (C6): a card with the three fixed decisions ---
+    panel = _panel(app)
+    app.wait_until(lambda: any(c["id"] == ask for c in _panel_approvals(app)),
+                   timeout=10, what="the permission to reach the panel")
+    card = next(c for c in _panel_approvals(app) if c["id"] == ask)
+    assert card["kind"] == "permission"
+    assert card["session_id"] == LANE_SESSION
+    # The three fixed choices, in order. Branched off `kind` — a permission
+    # leaves `questions` empty, and a panel that keyed off "whichever list is
+    # non-empty" would render an approval with no buttons at all (§11.4).
+    assert card["buttons"] == ["Allow once", "Always", "Reject"]
+    assert card["questions"] == []
+    assert "rm -rf /tmp/x" in card["title"] + card["detail"], card
+    assert panel["error"] is None
+    _shot(app, "tauri-lane-approval.png")
+
     app.call("lane.answer", {"machine": MACHINE, "session_id": LANE_SESSION,
                              "approval_id": ask,
                              "answer": {"permission": "allow-once"}})
@@ -485,10 +627,15 @@ def test_a_permission_ask_surfaces_and_is_answered_on_its_own_route(app, oc):
     assert again.code == "already_resolved", again
     assert oc.post_paths.count(f"/permission/{ask}/reply") == 1
 
-    # The agent confirms; the ask retires and the session is unblocked again.
+    # The agent confirms; the ask retires — from the view AND from the panel,
+    # which follows the stream rather than its own optimistic guess about what
+    # answering did.
     oc.stream_permission_replied(LANE_SESSION, ask, "once")
     app.wait_until(lambda: all(a["id"] != ask for a in _approvals(app)),
                    timeout=5, what="the permission to retire")
+    app.wait_until(lambda: all(c["id"] != ask for c in _panel_approvals(app)),
+                   timeout=10, what="the card to leave the panel")
+    _unmount(app)
 
 
 # ---------------------------------------------------------------------------
@@ -520,6 +667,24 @@ def test_a_question_surfaces_with_its_options_and_answers_on_the_question_route(
     assert [o["id"] for o in options] == ["main", "develop"]
     assert [o["label"] for o in options] == ["main", "develop"]
 
+    # --- and ON SCREEN (C6): the option buttons, off `kind` again ---
+    panel = _panel(app)
+    app.wait_until(lambda: any(c["id"] == ask for c in _panel_approvals(app)),
+                   timeout=10, what="the question to reach the panel")
+    card = next(c for c in _panel_approvals(app) if c["id"] == ask)
+    assert card["kind"] == "question"
+    assert card["questions"] == [{
+        "header": "Which branch?",
+        "question": "Pick a branch to work on",
+        "options": ["main", "develop"],
+        "custom": False,
+    }]
+    # A question fills `questions` and leaves the permission trio empty — the
+    # mirror image of the permission card, and the reason branching on "which
+    # list is non-empty" would render one of the two with nothing to click.
+    assert card["buttons"] == [], "one question, one choice, no free text: a click IS the answer"
+    _shot(app, "tauri-lane-question.png")
+
     app.call("lane.answer", {"machine": MACHINE, "session_id": LANE_SESSION,
                              "approval_id": ask,
                              "answer": {"question": [["develop"]]}})
@@ -532,6 +697,34 @@ def test_a_question_surfaces_with_its_options_and_answers_on_the_question_route(
                "properties": {"sessionID": LANE_SESSION, "requestID": ask}})
     app.wait_until(lambda: all(a["id"] != ask for a in _approvals(app)),
                    timeout=5, what="the question to retire")
+
+    # A `custom` question is the other shape: free text is accepted, so a click
+    # is no longer the whole answer and the card stages a selection behind an
+    # explicit submit. `custom` DEFAULTS TO FALSE in the contract precisely so a
+    # panel never invites typing the agent would reject — this proves the panel
+    # reads the flag rather than always offering the box.
+    free = "que_free_1"
+    oc.stream_question_asked(LANE_SESSION, free, header="Anything else?",
+                             question="Name the branch", options=["main"],
+                             custom=True)
+    app.wait_until(lambda: any(c["id"] == free for c in _panel_approvals(app)),
+                   timeout=10, what="the custom question to reach the panel")
+    typed = next(c for c in _panel_approvals(app) if c["id"] == free)
+    assert typed["questions"][0]["custom"] is True, typed
+    assert typed["buttons"] == ["Send answer"], "a staged answer needs a submit"
+
+    app.call("lane.answer", {"machine": MACHINE, "session_id": LANE_SESSION,
+                             "approval_id": free,
+                             "answer": {"question": [["a-branch-i-typed"]]}})
+    assert json.loads(oc.post_body(f"/question/{free}/reply")) == {
+        "answers": [["a-branch-i-typed"]]
+    }
+    assert oc.violations == []
+    oc.stream({"type": "question.replied",
+               "properties": {"sessionID": LANE_SESSION, "requestID": free}})
+    app.wait_until(lambda: all(c["id"] != free for c in _panel_approvals(app)),
+                   timeout=10, what="the custom question to retire")
+    _unmount(app)
 
 
 # ---------------------------------------------------------------------------
@@ -721,6 +914,19 @@ def test_close_ends_the_subscription_and_two_opens_make_one(app, oc):
     app.wait_until(lambda: oc.stream_count() == 1, timeout=15,
                    what="exactly one subscription")
     assert oc.stream_count() == 1, "a second lane.open opened a second stream"
+
+    # And the panel's own lifecycle, which is the same lifecycle: it opens the
+    # lane on mount and closes it on unmount, so an unmounted panel leaves NO
+    # subscription behind and `lane.dump` answers `null` — the honest answer to
+    # "is anyone looking at this", not a stale copy of the last thing rendered.
+    assert _dump(app) is None, "no panel is mounted yet"
+    _close(app)
+    _panel(app)
+    app.wait_until(lambda: oc.stream_count() == 1, timeout=15,
+                   what="the panel's own subscription")
+    _unmount(app)
+    app.wait_until(lambda: oc.stream_count() == 0, timeout=15,
+                   what="the unmounted panel to take its lane with it")
     assert app.call("lane.dump") == {"lane": None}
 
 

@@ -17,6 +17,7 @@ import {
   PageHead, HeadAction, RefreshHeadButton, Empty, agentColor, type Tone,
 } from "@/components/primitives";
 import { Scrim, DialogShell, Field, Select, Segmented, dialogInput, dialogBtnSecondary, useEscClose } from "@/components/dialog";
+import { LanePanel } from "@/components/LanePanel";
 import {
   useUiBridge, shedAction, fetchSystemDf, openTerminal,
   createStart, createStatus, createCancel, fetchHosts,
@@ -474,8 +475,8 @@ function rcStateTone(state: RcState): Tone {
   return "attention";
 }
 
-function AgentsPane({ sessions, machines, capabilities, onLaunch, refresh }:
-  { sessions: RcSession[]; machines: MachineStatus[]; capabilities: Record<string, RcCapabilities>; onLaunch: () => void; refresh: () => void }) {
+function AgentsPane({ sessions, machines, capabilities, onLaunch, refresh, onTranscript }:
+  { sessions: RcSession[]; machines: MachineStatus[]; capabilities: Record<string, RcCapabilities>; onLaunch: () => void; refresh: () => void; onTranscript: (s: RcSession) => void }) {
   const [error, setError] = useState<string | null>(null);
   // With machines configured but none reachable, "no agents running" is a claim
   // this pane cannot actually make — it has not been able to look. Say so, and
@@ -525,7 +526,7 @@ function AgentsPane({ sessions, machines, capabilities, onLaunch, refresh }:
                 // Keyed by ORIGIN, not host/shed: a machine session's shed is
                 // empty by construction, so two machines sharing a slug would
                 // otherwise collide into one React key.
-                <SessionCard key={sessionKey(s)} session={s} capabilities={capabilities} onKilled={refresh} onError={setError} />
+                <SessionCard key={sessionKey(s)} session={s} capabilities={capabilities} onKilled={refresh} onError={setError} onTranscript={onTranscript} />
               ))}
             </div>
           </div>
@@ -664,8 +665,8 @@ function MachinesPane({ machines, sessions, refresh, onNew }:
   );
 }
 
-function SessionCard({ session: s, capabilities, onKilled, onError }:
-  { session: RcSession; capabilities: Record<string, RcCapabilities>; onKilled: () => void; onError: (e: string) => void }) {
+function SessionCard({ session: s, capabilities, onKilled, onError, onTranscript }:
+  { session: RcSession; capabilities: Record<string, RcCapabilities>; onKilled: () => void; onError: (e: string) => void; onTranscript: (s: RcSession) => void }) {
   const [busy, setBusy] = useState(false);
   const claude = s.kind === "claude-rc" || s.kind === "claude-broker";
   const machine = s.origin_kind === "machine";
@@ -753,6 +754,22 @@ function SessionCard({ session: s, capabilities, onKilled, onError }:
           </span>
         </div>
         <div className="flex flex-none items-center gap-1.5">
+          {/* The agent lane (plan 015 §3.4). `agent_lane`'s PRESENCE is the whole
+              capability signal — a row that has it can open a live transcript,
+              one that does not is status-only — so the affordance is gated on
+              exactly that and on nothing about the kind. It LEADS on the rows
+              that have it: a machine row has no tmux pane to attach to, so this
+              is how you read the session at all. */}
+          {s.agent_lane && s.machine && (
+            <button
+              onClick={() => onTranscript(s)}
+              title="Open the live transcript"
+              className="hbtn inline-flex items-center gap-[7px] rounded-[9px] px-[14px] py-2.5 text-[13px] font-medium"
+              style={{ background: "var(--shed-surface)", border: "1px solid var(--shed-border)", color: "var(--shed-text-secondary)" }}
+            >
+              <ScrollText size={15} /> Transcript
+            </button>
+          )}
           {/* Every session opens in a terminal, whichever kind of place it runs
               in. A shed resolves through its server's ssh endpoint; a machine
               through its own config entry — the difference is the address, and
@@ -1573,6 +1590,11 @@ export default function App() {
   const [pane, setPane] = useState<Pane>("sheds");
   const [mode, setMode] = useState<"light" | "dark">("light");
   const [modal, setModal] = useState<Modal>(null);
+  // The open agent-lane transcript, if any (plan 015 §3.4). Not a pane: it
+  // belongs to a ROW, so it lives beside the panes rather than replacing one —
+  // and it stays put when you navigate, because a transcript you opened is
+  // something you are reading, not somewhere you went.
+  const [lane, setLane] = useState<{ machine: string; sessionId: string } | null>(null);
   // The SINGLE source of truth for RC sessions + capabilities: the sidebar badge,
   // the Agents pane, and the launch dialog all read this one `rc.list` state, so
   // they can't diverge. `refreshRc` reloads on the pane Refresh button, a
@@ -1650,6 +1672,20 @@ export default function App() {
     void import("@tauri-apps/api/event").then(async ({ listen }) => {
       uns.push(await listen("show-create", () => setModal("create")));
       uns.push(await listen("show-launch", () => setModal("launch")));
+      // The transcript panel's drivable door (`ui.show_lane` / `ui.close_lane`),
+      // the show-create/show-launch pattern: the panel opens from a card CLICK,
+      // and the harness has no click — while `lane.dump` (the panel's own truth,
+      // and the whole point of C6) is only observable once one is mounted.
+      uns.push(
+        await listen<{ machine?: unknown; session_id?: unknown }>("show-lane", (e) => {
+          const machine = e.payload?.machine;
+          const sessionId = e.payload?.session_id;
+          if (typeof machine === "string" && typeof sessionId === "string") {
+            setLane({ machine, sessionId });
+          }
+        }),
+      );
+      uns.push(await listen("close-lane", () => setLane(null)));
       uns.push(
         await listen<{ mode?: unknown }>("set-appearance", (e) => {
           if (e.payload?.mode === "light" || e.payload?.mode === "dark") setMode(e.payload.mode);
@@ -1781,13 +1817,40 @@ export default function App() {
             {pane === "sheds" && <ShedsPane sheds={sheds} hostErrors={hostErrors} refresh={refresh} onNew={() => setModal("create")} />}
             {pane === "machines" && <MachinesPane machines={rcMachines} sessions={rcSessions} refresh={refreshRc} onNew={() => setModal("machine")} />}
             {pane === "approvals" && <ApprovalsPane approvals={approvals} />}
-            {pane === "agents" && <AgentsPane sessions={rcSessions} machines={rcMachines} capabilities={rcCapabilities} onLaunch={() => setModal("launch")} refresh={refreshRc} />}
+            {pane === "agents" && (
+              <AgentsPane
+                sessions={rcSessions}
+                machines={rcMachines}
+                capabilities={rcCapabilities}
+                onLaunch={() => setModal("launch")}
+                refresh={refreshRc}
+                onTranscript={(s) => {
+                  // Both are guaranteed together (the stamp is machine-only) —
+                  // and the card gates its affordance on the same pair, so this
+                  // never silently does nothing.
+                  if (s.agent_lane && s.machine) {
+                    setLane({ machine: s.machine, sessionId: s.agent_lane.session_id });
+                  }
+                }}
+              />
+            )}
             {pane === "activity" && <ActivityPane />}
             {pane === "egress" && <EgressPane />}
             {pane === "system" && <SystemPane sheds={sheds} />}
           </div>
         </main>
       </div>
+      {/* Keyed by the lane's address so switching rows REMOUNTS the panel: the
+          subscription, the batch and the report all hang off that mount, and
+          reusing one would leave them pinned to the session you left. */}
+      {lane && (
+        <LanePanel
+          key={`${lane.machine}/${lane.sessionId}`}
+          machine={lane.machine}
+          sessionId={lane.sessionId}
+          onClose={() => setLane(null)}
+        />
+      )}
       {modal === "create" && <NewShedDialog refresh={refresh} onClose={() => setModal(null)} />}
       {modal === "machine" && <NewMachineDialog onClose={() => setModal(null)} onAdded={refreshRc} />}
       {modal === "launch" && <LaunchAgentDialog sheds={sheds} machines={rcMachines} capabilities={rcCapabilities} refresh={refreshRc} onClose={() => setModal(null)} onLaunched={onLaunched} />}

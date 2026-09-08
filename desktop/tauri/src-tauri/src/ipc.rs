@@ -459,6 +459,29 @@ impl Handler {
                 let _ = self.app.emit("show-launch", json!({}));
                 Ok(json!({}))
             }
+            // The agent-lane transcript panel (plan 015 §3.4), on the
+            // show-create/show-launch pattern. The panel opens from a card's
+            // Transcript affordance — a CLICK, which no caller here has — and
+            // `lane.dump` (the panel's own rendered truth) only means anything
+            // once one is mounted, so open and close are drivable ops.
+            //
+            // Deliberately no lane bookkeeping: this only asks the frontend to
+            // mount a panel, and the panel's own mount/unmount is what opens and
+            // closes the lane. Two doors into one `Lanes` (`lib.rs`'s commands
+            // and this module's `lane.*`), not three.
+            "ui.show_lane" => {
+                let (machine, session_id) = lane_target(params)?;
+                present_main_window(&self.app);
+                let _ = self.app.emit(
+                    "show-lane",
+                    json!({ "machine": machine, "session_id": session_id }),
+                );
+                Ok(json!({}))
+            }
+            "ui.close_lane" => {
+                let _ = self.app.emit("close-lane", json!({}));
+                Ok(json!({}))
+            }
             "app.screenshot" => self.screenshot().await,
             "sheds.list" => Ok(sheds_payload(&self.backend.refresh().await)),
             "sheds.refresh" => self.sheds_refresh().await,

@@ -37,7 +37,7 @@ keep Docker for the final check:
 
 ```bash
 cd desktop/tauri/ui && npm ci && npm run build      # ONCE, and after any tauri/ui change
-cd ../src-tauri && cargo build                      # AFTER EVERY Rust change — see below
+cd ../src-tauri && cargo build                      # AFTER EVERY change, Rust OR UI — see below
 cd ../..                                            # desktop/
 SHED_TAURI_BIN=$PWD/tauri/src-tauri/target/debug/shed-desktop-tauri \
 WEBKIT_DISABLE_DMABUF_RENDERER=1 \
@@ -45,11 +45,20 @@ xvfb-run -a --server-args="-screen 0 1400x900x24" \
   uv run --group test pytest tools/shedtest --target tauri -q -p no:cacheprovider
 ```
 
-Two traps, both of which cost real time and neither of which produces a useful error:
+Three traps, all of which cost real time and none of which produces a useful error:
 
 - **The harness runs `SHED_TAURI_BIN`, not `cargo`.** A Rust change you did not `cargo build`
   is simply not under test, and the run passes (or fails) on the OLD binary. `cargo test --lib`
   builds a *different* artifact and does not refresh it. Rebuild before every pytest run.
+- **`cargo build` is also how a UI change reaches the app.** `generate_context!` **embeds**
+  `tauri/ui/dist` INTO the binary, so `npm run build` (or `make tauri-ui-build`) alone changes
+  nothing the harness runs — the app keeps serving whatever bundle was embedded at the last
+  `cargo build`. There is no error and no warning; the app renders the old UI perfectly, which
+  is exactly what makes it expensive. Symptom to recognise: an assertion about the new UI fails
+  against markup you can see is no longer in the source, or a screenshot shows the previous
+  layout. **After ANY `tauri/ui/**` edit: `npm run build` THEN `cargo build`, in that order.**
+  (The `make` targets get this right — `tauri-build` depends on `tauri-ui-build` — so the trap
+  is specific to driving the pytest run against a hand-built binary.)
 - **A `tauri/ui/dist` that exists is not a `dist` that works.** `generate_context!` only needs
   the directory, so a placeholder `index.html` (a one-line `probe` stub is a real thing to find
   there) compiles and links fine — and then the WebView mounts nothing, `ui.current_pane()`
@@ -146,6 +155,17 @@ makes the machine count as LOCAL, so the lane dials that URL directly and the su
 ssh. Against a real remote machine the same code takes the other branch — an
 `ssh -N -L <local>:127.0.0.1:<reported>` child per session-port — which nothing hermetic can
 exercise.
+
+**Driving the transcript PANEL.** The panel opens from a card's Transcript affordance — a
+click, which the harness does not have — so it has drivable ops on the `ui.show_create` /
+`ui.show_launch` pattern: `ui.show_lane {machine, session_id}` mounts it (and raises the
+window), `ui.close_lane` unmounts it, and `lane.dump` answers what it RENDERED (`null` once
+no panel is mounted, which is deliberately not pane-gated — the panel can be open over any
+pane). The panel itself calls `lane.open` on mount and `lane.close` on unmount, so mounting
+one opens a lane and unmounting one closes it: a cell that leaves a panel up leaves a
+subscription up. `lane.messages` (what the backend staged) and `lane.dump` (what is on
+screen) are different questions — assert the one you mean. `SHED_LANE_SHOTS=<dir>` makes the
+panel cells keep their `app.screenshot` PNGs there; unset, they still capture and assert one.
 
 ### Against a REAL local daemon
 
