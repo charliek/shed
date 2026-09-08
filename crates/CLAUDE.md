@@ -60,8 +60,12 @@ re-implemented per language. The root `CLAUDE.md` owns the monorepo layout + rel
   signals, socket bind, the Surface-A desktop UDS server) and, from leg 3a.2, embedded
   in-process by the desktop app. Carries no daemon-only or WebKitGTK concern.
 - **`shed-opencode`** — the **opencode adapter** for `shed_core::lane` (plan 015): the
-  one implementation of `AgentLane` that talks to an opencode server's local HTTP API.
-  `fold.rs` is a **port** of the rc hub's `OpencodeFold`, and it is pinned as one —
+  one implementation of `AgentLane` that talks to an opencode server's local HTTP API —
+  the same server the TUI is already running, never a sidecar it launches itself. The
+  Tauri client consumes it as a plain path-dep (a machine row's `agent_lane` stamp,
+  fed by roost's `server_url` report on the tab; see `docs/desktop/agent-lanes.md` for
+  the end-to-end contract and its current limits). `fold.rs` is a **port** of the rc
+  hub's `OpencodeFold`, and it is pinned as one —
   `fixtures/opencode_turn.golden.json` records what the HUB's fold produced on
   `fixtures/jsonl/opencode_turn.jsonl`, and the test replays the port against it (that
   test must NEVER take a `shed-broker` dep; the golden file is the pin). A **second**

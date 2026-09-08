@@ -231,9 +231,29 @@ docker run --rm -v "$PWD:/repo:ro" \
       | grep -E "^ *--> " '
 ```
 
-The definitive check is `make -C desktop tauri-lint` on a Mac (see the
-`mac-mini` recipe in the mac skill); it needs `make sparkle-framework` staged
-first.
+### The definitive check runs on a Mac, and its baseline is CLEAN
+
+`make -C desktop tauri-lint` is the real gate (`desktop/Makefile` already makes it depend on
+both `sparkle-framework` and `tauri-ui-build`, so a bare `make -C desktop tauri-lint` stages
+Sparkle and rebuilds the UI bundle for you). If you instead invoke `cargo clippy` directly on
+the Tauri crate — e.g. over SSH to a Mac worktree for a faster inner loop while iterating on one
+file — both prerequisites are on you:
+
+```bash
+ssh mac-mini   # or whatever your macOS box is
+cd ~/projects.bak/shed   # a worktree checked out to the branch under review
+make -C desktop sparkle-framework          # build.rs panics without it (macOS-only dep)
+make -C desktop tauri-ui-build             # generate_context! panics at macro expansion
+                                            #   without a non-empty tauri/ui/dist — same
+                                            #   trap as the Linux gate above, just fatal
+                                            #   here instead of "serves stale content"
+cd desktop/tauri/src-tauri
+cargo clippy --locked --all-targets -- -D warnings
+```
+
+**Unlike Linux, this baseline is CLEAN at `origin/main`** — there is no `tray.rs`/`zbus::proxy`
+pre-existing-findings exemption on macOS (those are Linux-only code paths). So on a Mac, run
+clippy with `-D warnings` as a real gate, not a filter: if it is red, the finding is yours.
 
 ### The daemon must speak session protocol 4
 

@@ -107,6 +107,26 @@ reads an `## Unreleased` heading._
   showing, not that the target is genuinely a live composer — an auth screen
   or an agent's own approval modal is no longer detected. Accepted as an
   interim hazard until the roost provider script (S4) owns kickoff end to end.
+- **Agent lanes: a live opencode transcript from a machine row** (plan 015,
+  `charliek/shed#320`). `shed_core::lane` is the new agent-lane contract — DTOs
+  plus an `AgentLane` trait for "a coding agent with sessions, a transcript and
+  approvals," one adapter per agent. `crates/shed-opencode` is the first
+  adapter: it drives the same local HTTP server opencode's own TUI is already
+  running (never a sidecar), replaying and streaming its transcript over the
+  legacy `GET /event` feed, and answering permission/question approvals.
+  Reconnects are bracketed by `Reset` … `Ready` so a client's view never shows
+  a half-seeded transcript. The Tauri desktop client consumes it: a machine
+  row whose roost tab reports a `server_url` (roost R10) gets an `agent_lane`
+  stamp and a Transcript panel — reached directly when the machine is local,
+  or through a shared `ssh -N -L` forward otherwise. Two sessions in one
+  directory never see each other's rows; a child session's approvals surface
+  (attributed to it) while its own transcript never renders — only the parent
+  session's does. **Limits, stated rather than hidden:** no interject (every send
+  joins the session's own runner, it does not preempt a turn in flight); no
+  resume-from-cursor (every reconnect refolds history from the top); no
+  credential source for a password-protected opencode server — it answers
+  `401`, which surfaces as an inline "unauthorized" error, status-only. See
+  [Agent lanes](https://charliek.github.io/shed/desktop/agent-lanes/).
 
 ## v0.8.2 — 2026-08-17
 

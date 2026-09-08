@@ -34,7 +34,8 @@ gh issue list -R charliek/shed --state open --search "in:title [A"
 | S2 | [#324](https://github.com/charliek/shed/issues/324) | RP/M2 | delete the pane anchors, stability engine, fixture corpora and their tests — after S3, never before |
 | A5 | [#321](https://github.com/charliek/shed/issues/321) | RP/M2 | claude → status from roost; delete the transcript tail; claude.ai keeps control |
 | A6 | [#322](https://github.com/charliek/shed/issues/322) | RP/M2 | codex + cursor → status from roost; delete the lanes, ingest, and gated input |
-| A4 | [#320](https://github.com/charliek/shed/issues/320) | RP/M3 | the opencode lane as a standalone crate: transcript, prompt, interrupt, permission |
+| A4 | [#320](https://github.com/charliek/shed/issues/320) | RP/M3 | the opencode lane crate + the lane contract; Tauri consumes it; mobile next |
+| R10 | roost#439 | RP/M3 | the opencode plugin exposes the TUI's own server on loopback and reports `server_url` |
 | A7 | [#340](https://github.com/charliek/shed/issues/340) | RP/M3 | the `gx` lane adapter — the SECOND implementation of `shed_core::lane`, which is what turns the contract from a design into a contract |
 | S4m | [shed-mobile#19](https://github.com/charliek/shed-mobile/issues/19) | RP/M3 | the phone mirrors the lane DTOs through FRB and forwards `server_url` over dartssh2 — opencode AND gx |
 | S4 | [#326](https://github.com/charliek/shed/issues/326) | RP/M5 | the `shed` roost provider script — the kickoff path that replaced `sx` |
@@ -80,6 +81,11 @@ consumes the hub. S7 is done (plan 016) — it had no blockers.
   means the `--port` the TUI was launched with — a separate server does
   not update a running TUI. Use legacy `GET /event`, not `/api/event`
   (which drops `session.idle`); `?after=` for gap-fill.
+- **Roost stays local-only: UDS + SSH. No network listener, no auth
+  layer** (roost's own transport; an agent's loopback server exposed by
+  its plugin is the agent's, and stays on 127.0.0.1). R10's opencode
+  plugin listener is the agent's server, not roost's — roost's own
+  sockets are unchanged and nothing binds off-loopback.
 - **Keep what survives.** `kind_features` (its `attach` enum already has
   `native-remote`), the watcher stack (becomes the lanes), the transport
   and machine registry, the broker outside `rc_hub`, all client UI. Do not
