@@ -1,5 +1,0 @@
-{
-  "code": 2,
-  "stderr": "<prog>: invalid arguments: kind \"claude-broker\" does not accept a prompt",
-  "stdout": ""
-}

@@ -6,7 +6,6 @@
 //!   shed_core::rc_agents   pure data + classifiers + BuildEnvArgs + parse_session
 //!   shed-rc-engine         tmux process I/O, the create order, the wait poller,
 //!                          plan files, port allocation   <- YOU ARE HERE
-//!   sx (crates/sx)         argv parsing, stdin framing, JSON stdout, exit codes
 //!   shed-broker rc_hub     the resident activity hub (plan 010) — the engine's
 //!                          second consumer, and why it graduated out of
 //!                          shed-app's `rc` feature into this crate (a
@@ -15,7 +14,7 @@
 //! ```
 //!
 //! shed-app re-exports this crate as `shed_app::rc_engine` under its `rc`
-//! feature, so sx and the desktop consume the same paths as before graduation.
+//! feature, so the desktop app consumes the same paths as before graduation.
 //!
 //! **This crate is SYNCHRONOUS on purpose.** The engine is a short-lived,
 //! strictly-ordered sequence of `tmux` invocations with sleeps between them; the
@@ -70,7 +69,8 @@ pub mod trust;
 
 /// The engine's test doubles. Compiled only for this crate's own tests or when a
 /// consumer enables the `test-support` feature from its `[dev-dependencies]`
-/// (`sx`'s dispatch tests do) — never in a production build.
+/// — never in a production build. No consumer does today: the one that did was
+/// `sx`, sunset in plan 016.
 #[cfg(any(test, feature = "test-support"))]
 pub mod fake;
 

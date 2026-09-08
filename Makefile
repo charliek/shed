@@ -76,13 +76,17 @@ test-host-agent-diff:
 	# filter scoped to the bin alone silently ran ZERO of them.
 	cd crates && PATH="$$HOME/.cargo/bin:$$PATH" cargo test -p shed-host-agent -p shed-broker golden
 
-# Go↔Rust RC-engine parity harness (the FOURTH pytest suite — never merged with
-# tests/integration, tests/host-agent-diff or desktop/tools/shedtest). It builds
-# BOTH one-shot implementations — the Go oracle (tests/rc-parity/oracle, the
-# retired shed-machine-rc's main, kept test-only) and `sx` (Rust) — runs each
-# scenario against both against a hermetic tmux server, asserts
-# the two agree under tests/rc-parity/normalize.py, and pins the agreed value to a
-# committed golden. Needs Go, Rust (cargo on PATH), uv, and tmux >= 3.2.
+# Go↔Rust RC-hub parity harness (one of the five pytest suites — never merged
+# with tests/integration, tests/host-agent-diff, desktop/tools/shedtest or
+# tests/machine-transport). It runs
+# BOTH resident hub daemons — the Go oracle (tests/rc-parity/oracle, the retired
+# shed-machine-rc's main, kept test-only) via `serve --foreground`, and
+# `shed-host-agent rc-hub` (Rust) — on ephemeral loopback ports over identical
+# hermetic tmux sessions, asserts the two /v1 wires agree under
+# tests/rc-parity/normalize.py, and pins the agreed value to a committed golden.
+# Both legs are stimulated by the oracle CLI (plan 016 sunset `sx`), so the
+# daemon is the only controlled variable — asserted, not assumed, by
+# test_hub_wiring.py. Needs Go, Rust (cargo on PATH), uv, and tmux >= 3.2.
 # See tests/rc-parity/README.md.
 test-rc-parity:
 	@command -v uv >/dev/null 2>&1 || { \
@@ -99,9 +103,9 @@ test-rc-parity:
 
 # The machine-transport differential (plan 012 AC2). The FIFTH pytest suite,
 # and — like the other four — never merged with them. SSH has no argv API, so a
-# remote command is one string the far side re-parses; `sx`/Tauri compose it in
-# Rust and shed-mobile composes it in Dart, and two implementations of one wire
-# contract drift silently. This suite owns the shared contract
+# remote command is one string the far side re-parses; `shed-core`/the Tauri app
+# compose it in Rust and shed-mobile composes it in Dart, and two implementations
+# of one wire contract drift silently. This suite owns the shared contract
 # (tests/machine-transport/scenarios.json + goldens/) and runs the LIVE leg:
 # every wire line through a throwaway sshd on 127.0.0.1, asserting the remote
 # process received exactly the intended argv. It also covers the forwarded-hub
@@ -713,7 +717,7 @@ release:
 
 # Local goreleaser snapshot of ONE release component — the pre-CI proof that
 # .goreleaser.<component>.yaml still builds its targets and renders its deb /
-# brew formula. `make snapshot-sx`, `snapshot-server`, `snapshot-host-agent`.
+# brew formula. `make snapshot-server`, `snapshot-host-agent`.
 # Mirrors what ci.yml's release-snapshot job runs.
 #
 # goreleaser comes from .mise.toml pinned to CI's exact version (a local
@@ -726,7 +730,7 @@ release:
 #                     aarch64-unknown-linux-gnu x86_64-unknown-linux-gnu
 #
 # `check` alone (config validation, no build) is the cheap subset:
-#   mise exec -- goreleaser check -f .goreleaser.sx.yaml
+#   mise exec -- goreleaser check -f .goreleaser.host-agent.yaml
 #
 # A pattern rule, so it needs no .PHONY entry (pattern rules never match a
 # real file here — there is no `snapshot-*` on disk).

@@ -5,13 +5,14 @@ All notable changes to this project will be documented in this file.
 <!--
   `**Ships:**` convention: each release entry opens with a `**Ships:** …`
   line naming the components that tag actually shipped, using the
-  canonical tokens `server`, `host-agent`, `sx`, `desktop`
+  canonical tokens `server`, `host-agent`, `desktop`
   (comma-separated; legacy `server/CLI` is accepted as an alias for
-  `server`, for entries written before the rename; `machine-rc` appears in
-  historical entries but is REJECTED on new ones — the component was
-  retired in plan 010). A component ships iff
+  `server`, for entries written before the rename; `machine-rc` and `sx`
+  appear in historical entries but are REJECTED on new ones — machine-rc
+  was retired in plan 010, and sx was sunset, unreleased, in plan 016).
+  A component ships iff
   its version manifest equals the tag (server: .claude-plugin/plugin.json;
-  host-agent: crates/shed-host-agent/VERSION; sx: crates/sx/VERSION;
+  host-agent: crates/shed-host-agent/VERSION;
   desktop: desktop/VERSION) — see
   RELEASING.md "Component selection". ENFORCED by
   scripts/release/release-plan.sh on stable tags (a mismatched, missing,
@@ -22,12 +23,12 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
-_Staged by plans 010 (the machine-hub port + retirement) and 011 (shipping
-`sx`); at release time fold this body into the new `## vX.Y.Z` section and
-replace this note with a real `**Ships:**` line — **host-agent, sx** (the hub
-lands in host-agent; `sx` is now its own component, and the `machine-rc` token
-is retired and rejected by release-plan.sh). release-plan.sh never reads an
-`## Unreleased` heading._
+_Staged by plans 010 (the machine-hub port + retirement), 011 (shipping `sx`)
+and 016 (sunsetting it again, unreleased); at release time fold this body into
+the new `## vX.Y.Z` section and replace this note with a real `**Ships:**` line
+— **host-agent** (the hub lands in host-agent; both the `machine-rc` and `sx`
+tokens are retired and rejected by release-plan.sh). release-plan.sh never
+reads an `## Unreleased` heading._
 
 - **The machine RC hub moves into `shed-host-agent`.** The daemon hosts the
   activity hub (`127.0.0.1:1029`) as a supervised resident role: bind-as-lock
@@ -39,10 +40,9 @@ is retired and rejected by release-plan.sh). release-plan.sh never reads an
   `/v1` under the `tests/rc-parity` hub differential family (snapshot, SSE,
   side-effect, opencode-lane, and cursor-ingest cells — both daemons run side
   by side in CI).
-- **`sx` create's hub ensure is probe-first** (now probe-only, below): a
-  healthy hub of either provider short-circuits.
-- Machine-posture docs: `docs/extensions/sx.md` gains "The machine hub"
-  (trust model: loopback + SSH tunnel is the boundary; no proxy on machines),
+- Machine-posture docs: "The machine hub" (trust model: loopback + SSH tunnel
+  is the boundary; no proxy on machines) — written for `docs/extensions/sx.md`
+  in plan 010 and moved to `rc-helper.md` by the plan 016 sunset;
   `shed-machine-rc.md` carries the retirement note.
 - **The `machine-rc` component is retired** (plan 010 H15, evidence-gated on
   live e2e on this Mac + mini3). `cmd/shed-machine-rc`,
@@ -52,34 +52,30 @@ is retired and rejected by release-plan.sh). release-plan.sh never reads an
   `publish-images.yaml` fails loudly if a re-dispatched pre-retirement tag
   plans `ship_machine_rc=true`. The parity harness's Go oracle relocated to
   `tests/rc-parity/oracle/` (byte-identical main, test-only, same
-  `shed-machine-rc` identity the goldens pin). `sx --on machine:` targets now
-  default to the remote `sx rc <verb>` argv (wire-identical; the
-  `machines[].rc_bin` override now names WHERE `sx` LIVES on that machine),
-  and `sx`'s create-time hub ensure no longer spawns anything — it probes,
-  and hints at `shed-host-agent` when nothing answers. Artifacts published
-  before the retirement are not withdrawn but are unsupported; the intended
-  move is `sx` + `shed-host-agent`.
-- **`sx` becomes its own release component** (plan 011), taking the brew + apt
-  channel pair `machine-rc` vacated: selector `crates/sx/VERSION`, its own
-  `.goreleaser.sx.yaml` (`builder: rust`/`cargo zigbuild`, all four
-  darwin/linux targets, a minimal one-binary deb and a `bin.install`-only
-  formula), and a `ship_sx` output threaded through `release-plan.sh`,
-  `update-version.sh`, `recommend-components.sh`, the CI snapshot leg and the
-  publish workflow's goreleaser + apt-dispatch steps. Machines can now
-  `apt install sx` / `brew install charliek/tap/sx` instead of needing a Rust
-  toolchain. The published linux binaries carry a **glibc ≥ 2.30** floor
-  (Ubuntu 20.04+ / RHEL 9+) — see RELEASING.md "sx: Rust binary".
-- **`sx version` reports the release tag**, not `CARGO_PKG_VERSION` (which
-  tracks the *desktop* selector and is not bumped on an sx-only tag):
-  `crates/sx/src/version.rs` mirrors the host-agent's `pick_version` +
-  `option_env!("SX_VERSION")` shape. The RC wire is unaffected — the parity
-  harness masks the version value.
+  `shed-machine-rc` identity the goldens pin). Artifacts published before the
+  retirement are not withdrawn but are unsupported; the surviving machine-side
+  daemon is `shed-host-agent`.
+- **`sx` was made its own release component, then sunset unreleased.**
+  Plan 011 gave it the brew + apt channel pair `machine-rc` vacated — selector
+  `crates/sx/VERSION`, its own `.goreleaser.sx.yaml`, a `ship_sx` output
+  threaded through the release scripts, the CI snapshot leg and the publish
+  workflow — so machines could install it without a Rust toolchain. No tag
+  ever matched that selector, and plan 016 (S7,
+  [#329](https://github.com/charliek/shed/issues/329)) removed the component
+  and the crate instead: its verbs were the hub/tmux verbs the Roost Pivot
+  replaces. **Nothing is withdrawn — no `sx` artifact was ever published.**
+  `sx` is now rejected as a `--components` token and as a `**Ships:**` token,
+  each naming the sunset, the way `machine-rc` is. `crates/sx` (5,719 lines)
+  and the `tests/rc-parity` ONE-SHOT differential family (46 cells) are
+  deleted with it; the hub family survives with both legs stimulated by the Go
+  oracle. `docs/extensions/sx.md` is a tombstone.
 - **The component recommender bootstraps a never-shipped component.**
-  `recommend-components.sh` carries a `NEVER_SHIPPED` list (today: `sx`) whose
-  members report the basis `(never shipped)` and are recommended
-  unconditionally, instead of tripping the "no historical basis" hard error a
-  brand-new component would otherwise hit on its first run. Components not on
-  that list keep the hard error.
+  `recommend-components.sh` carries a `NEVER_SHIPPED` list whose members report
+  the basis `(never shipped)` and are recommended unconditionally, instead of
+  tripping the "no historical basis" hard error a brand-new component would
+  otherwise hit on its first run. Components not on that list keep the hard
+  error. The list is **empty** since the plan 016 sunset removed its only
+  member (`sx`); a synthetic test proves the mechanism still works.
 - **shed speaks roost's session protocol 4 and stops polling** (plan 014).
   `roost-ipc` bumps to roost's R1 daemon; `RoostWatcher` swaps `tab.list`
   polling for roost's leaseless **observer event stream** — subscribing takes

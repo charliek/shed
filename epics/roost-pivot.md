@@ -35,10 +35,10 @@ gh issue list -R charliek/shed --state open --search "in:title [A"
 | A5 | [#321](https://github.com/charliek/shed/issues/321) | RP/M2 | claude → status from roost; delete the transcript tail; claude.ai keeps control |
 | A6 | [#322](https://github.com/charliek/shed/issues/322) | RP/M2 | codex + cursor → status from roost; delete the lanes, ingest, and gated input |
 | A4 | [#320](https://github.com/charliek/shed/issues/320) | RP/M3 | the opencode lane as a standalone crate: transcript, prompt, interrupt, permission |
-| S4 | [#326](https://github.com/charliek/shed/issues/326) | RP/M5 | the `shed` roost provider script — the `sx` replacement for kickoff |
+| S4 | [#326](https://github.com/charliek/shed/issues/326) | RP/M5 | the `shed` roost provider script — the kickoff path that replaced `sx` |
 | S5 | [#327](https://github.com/charliek/shed/issues/327) | RP/M5 | `roost-session` inside sheds and on machines, via roost's bootstrap ladder |
 | S6 | [#328](https://github.com/charliek/shed/issues/328) | RP/M6 | retire the RC hub, tmux driver, `shed-ext-rc`, Go engine, rc-parity oracle — **after S5** |
-| S7 | [#329](https://github.com/charliek/shed/issues/329) | RP/M6 | strip `sx` to an unreleased hello-world stub; keep the release wiring |
+| S7 | [#329](https://github.com/charliek/shed/issues/329) | RP/M6 | ✅ **done (plan 016)** — `sx` sunset entirely: crate, release wiring and the rc-parity one-shot family deleted |
 
 S3's mobile twin is **S3m** in `shed-mobile`
 ([charliek/shed-mobile#15](https://github.com/charliek/shed-mobile/issues/15))
@@ -46,7 +46,7 @@ S3's mobile twin is **S3m** in `shed-mobile`
 
 **Order:** S1 → S3 is the only hard chain to M1 (opencode-only, both
 clients). S2 only after S3 reads real status. S6 last, once nothing
-consumes the hub. Ready now with no blockers: S7.
+consumes the hub. S7 is done (plan 016) — it had no blockers.
 
 ## Rules that apply in this repo
 
@@ -85,8 +85,10 @@ consumes the hub. Ready now with no blockers: S7.
 - **`tests/machine-transport`'s README overstates coverage** — the Dart
   leg it describes does not exist. Adopting `roost-ipc` dissolves the need;
   correct the README in S1 either way.
-- **Release held to M6.** `sx` stays untagged. Do not cut a tag inside
-  this epic; the trigger is demolition done, not features done.
+- **Release held to M6.** Do not cut a tag inside this epic; the trigger
+  is demolition done, not features done. `sx` — the component this rule
+  was originally written to hold back — was sunset unreleased in plan 016
+  rather than shipped, so there is nothing left to keep untagged.
 - **Mobile first.** Where a change lands in both clients, `shed-mobile`
   leads.
 

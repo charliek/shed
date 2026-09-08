@@ -1,5 +1,0 @@
-{
-  "code": 2,
-  "stderr": "<prog>: invalid arguments: --prompt-b64 is not valid base64: <detail>",
-  "stdout": ""
-}

@@ -2,7 +2,7 @@
 go = "1.25"
 golangci-lint = "2.10.1"
 # Release tooling, for running a goreleaser snapshot LOCALLY before trusting CI
-# (`make snapshot-sx`). goreleaser is pinned to the exact version the
+# (`make snapshot-server`). goreleaser is pinned to the exact version the
 # goreleaser-action pins in ci.yml / publish-images.yaml — the point of a local
 # snapshot is to predict CI, so a patch drift defeats it. zig backs
 # `cargo zigbuild`, which goreleaser's `builder: rust` shells out to for the

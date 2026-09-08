@@ -82,30 +82,8 @@ shed sessions [<shed>] [--all] [--json]   # list (rc-* rows show KIND + RC-STATE
 shed sessions kill <shed> rc-<slug>       # stop the session
 ```
 
-## Machine targets (`sx`)
+## Native machines
 
-`shed plan` only targets sheds. For a **native machine**, the porcelain is `sx`
-(install with `brew install charliek/tap/sx` or `sudo apt install sx`; when it may
-not be present, resolve it per the SKILL's guarded order: `PATH`, then
-`cargo run -q -p sx --` from a shed checkout, then the remote engine over SSH).
-
-```bash
-sx plan <file> [--on <target>] [--tool <t>] [-p "<framing>"] \
-  [--permission-mode <m> | --skip] [--workdir <dir>] [--name <n>] [--slug <s>] [--json]
-```
-
-| Flag | Purpose |
-|------|---------|
-| `<file>` | Plan file, read **locally** and shipped over stdin (non-empty, UTF-8, ≤ 1 MiB). |
-| `--on <target>` | `local` (default), `machine:<name>`, `shed:<name>`, `shed:<name>@<server>`. |
-| `--tool <t>` | `claude` (default), `codex`, `cursor`, `opencode`. |
-| `-p, --prompt <framing>` | Framing prepended to the composed plan kickoff. |
-| `--permission-mode <m>` \| `--skip` | Same vocabulary and default (`auto`) as `shed plan`. |
-| `--workdir <dir>` | Session working directory on the target (default `$SHED_WORKSPACE`/`$HOME`). |
-| `--name <n>` / `--slug <s>` | Display name (default `<shorthost>/<slug>`, bare slug in a shed) / caller-supplied slug. |
-| `--json` | Print the raw session DTO instead of the prose summary. |
-
-Machine entries come from the `machines:` section of `~/.shed/config.yaml`. Exit is
-non-zero when a waiting create did not reach `ready` — the same contract as `shed plan`.
-Observe with `sx ls`, `sx watch <slug> --on <target>`, `sx attach <slug> --on <target>`,
-`sx kill <slug> --on <target>`. Full reference: `docs/extensions/sx.md`.
+`shed plan` targets sheds only; native-machine kickoff is moving to roost's palette
+(S4, [`charliek/shed#326`](https://github.com/charliek/shed/issues/326)), with nothing
+to run today.

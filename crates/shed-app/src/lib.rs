@@ -27,8 +27,8 @@ pub mod rc;
 /// The ported one-shot RC **engine** (plan 009 C3) — the local, synchronous
 /// producer of RC sessions, as opposed to [`rc`]'s async client of a REMOTE one.
 /// Graduated into its own crate at its second consumer (plan 010 H2:
-/// shed-broker's `rc_hub`); re-exported here so sx and the desktop keep the
-/// `shed_app::rc_engine::…` paths. Behind the same `rc` feature: a consumer
+/// shed-broker's `rc_hub`); re-exported here so the desktop keeps the
+/// `shed_app::rc_engine::…` path. Behind the same `rc` feature: a consumer
 /// that has no RC pane wants neither.
 #[cfg(feature = "rc")]
 pub use shed_rc_engine as rc_engine;

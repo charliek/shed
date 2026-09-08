@@ -88,56 +88,11 @@ running, and prints the per-agent remediation. Relay it to the user, then retry:
    - Status across sheds: `shed sessions` (shows KIND + RC-STATE for `rc-*` sessions)
    - Stop it: `shed sessions kill <shed> rc-<slug>`
 
-## Target a native machine instead of a shed (`sx`)
+## Native machines
 
-When the user wants the plan run on a **machine** rather than a shed ("run it on my
-mac-mini", "kick this off on mini2 itself"), the tool is `sx` — the RC porcelain
-(`docs/extensions/sx.md`). It ships as its own release component (brew `sx` / apt
-`sx`) but is **not guaranteed present** on a given machine, so resolve it in this
-order and stop at the first that works:
-
-1. `sx` on `PATH` (`command -v sx`).
-2. A shed checkout on this machine: `cd <shed-repo>/crates && cargo run -q -p sx -- <args>`
-   (or `<shed-repo>/crates/target/{debug,release}/sx` if it is already built).
-3. **Fallback — the engine over SSH**, when this machine has no `sx` but the
-   target machine has one (or a still-installed, retired `shed-machine-rc` —
-   the two are wire-identical):
-   ```bash
-   ssh <machine> sx rc create --kind claude-rc --name "<machine>/plan" \
-     --wait --interactive-shell --permission-mode auto --plan-stdin < ./plan.md
-   # (swap `sx rc` for `shed-machine-rc` on a machine still running the retired binary)
-   ```
-4. **Neither available** — say so and stop. Do not improvise a raw `tmux`/`ssh`
-   kickoff; the posture flags, installed-agent gate, and trust/onboarding pre-seed are
-   exactly what these tools exist to apply.
-
-Live activity for machine sessions comes from the machine RC hub on the target,
-hosted by the `shed-host-agent` daemon as a resident role — install and start the
-agent to get it. `sx` probes and hints; it never starts a hub. A machine without one
-still runs sessions fine; it just reports no live activity in `sx ls`/`sx watch`.
-
-With `sx` the flow is one command, and the plan file stays local (it is read here and
-shipped over stdin):
-
-```bash
-sx plan ./plan.md --on machine:<name>          # a machines: entry in ~/.shed/config.yaml
-sx plan ./plan.md                              # this machine
-sx plan ./plan.md --on shed:<name>@<server>    # a shed, same porcelain
-sx plan ./plan.md --on machine:<name> --tool codex
-```
-
-Same posture rules as `shed plan`: `auto` by default, `--skip` only on explicit user
-request. Report back with `sx watch <slug> --on machine:<name>` (activity stream),
-`sx attach <slug> --on machine:<name>` (terminal), `sx kill <slug> --on machine:<name>`.
-
-Prerequisite for a machine target: a `machines:` entry in `~/.shed/config.yaml` (name,
-`host`, optional `user`/`ssh_port`/`rc_bin`). If the section is missing, ask the user
-before writing one — and warn that a `shed` CLI older than the `machines:` passthrough
-deletes the section on its next config rewrite.
-
-**Sheds remain the default.** Use `shed plan` for shed targets unless the user
-specifically wants the porcelain; a machine is not an isolated VM, so the blast radius
-of an autonomous run is the user's real machine.
+`shed plan` targets sheds only; native-machine kickoff is moving to roost's palette
+(S4, [`charliek/shed#326`](https://github.com/charliek/shed/issues/326)), with nothing
+to run today.
 
 ## Exit contract (what the non-zero cases mean)
 
