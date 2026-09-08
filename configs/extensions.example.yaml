@@ -156,10 +156,11 @@ logging:
 # ---------------------------------------------------------------------------
 # Machine RC hub
 # ---------------------------------------------------------------------------
-# The agent hosts the machine RC activity hub (the loopback service `sx ls` /
-# `sx watch` read live session activity from) on 127.0.0.1:1029. Binding the
-# port is the lock: while an older standalone hub holds it the agent defers
-# and retries, taking the port over when that hub exits. Set `enabled: false`
-# to opt this machine out of hosting the hub entirely.
+# The agent hosts the machine RC activity hub (the loopback service the
+# desktop and mobile clients read live session activity from) on
+# 127.0.0.1:1029. Binding the port is the lock: while an older standalone hub
+# holds it the agent defers and retries, taking the port over when that hub
+# exits. Set `enabled: false` to opt this machine out of hosting the hub
+# entirely.
 # rc_hub:
 #   enabled: false

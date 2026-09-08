@@ -103,9 +103,9 @@ test-rc-parity:
 
 # The machine-transport differential (plan 012 AC2). The FIFTH pytest suite,
 # and — like the other four — never merged with them. SSH has no argv API, so a
-# remote command is one string the far side re-parses; `sx`/Tauri compose it in
-# Rust and shed-mobile composes it in Dart, and two implementations of one wire
-# contract drift silently. This suite owns the shared contract
+# remote command is one string the far side re-parses; `shed-core`/the Tauri app
+# compose it in Rust and shed-mobile composes it in Dart, and two implementations
+# of one wire contract drift silently. This suite owns the shared contract
 # (tests/machine-transport/scenarios.json + goldens/) and runs the LIVE leg:
 # every wire line through a throwaway sshd on 127.0.0.1, asserting the remote
 # process received exactly the intended argv. It also covers the forwarded-hub

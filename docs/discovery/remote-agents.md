@@ -177,6 +177,8 @@ per-agent native lanes behind one contract, not a single-protocol bet.
 
 ## The Rust porcelain
 
+> **Sunset in plan 016 (S7, #329), unreleased.**
+
 > **Status: SHIPPED (R2, plan 009, Aug 2026)** — the binary is **`sx`**
 > (`crates/sx`), documented end-user-style in
 > [`docs/extensions/sx.md`](../extensions/sx.md). What the block settled, beyond the

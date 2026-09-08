@@ -26,8 +26,8 @@ type ClientConfig struct {
 	Sheds         map[string]ShedCache   `yaml:"sheds"`
 	CreateTimeout time.Duration          `yaml:"create_timeout,omitempty"`
 
-	// Machines is an OPAQUE passthrough of the `machines:` section owned by the
-	// Rust porcelain (sx) — remote-machine targets for rc-session kickoff. Go
+	// Machines is an OPAQUE passthrough of the `machines:` section owned by
+	// shed-core's config parser — remote-machine targets for rc-session kickoff. Go
 	// neither reads nor validates it (the schema is defined Rust-side); the field
 	// exists ONLY so SaveToPath's whole-document rewrite round-trips the subtree
 	// instead of silently deleting user data on the next `shed` command that

@@ -351,7 +351,7 @@ one-shot exec cannot observe.
 > surface on a shed's shared bridge — never widen it. **The server-side proxy is the
 > authorization boundary**; the hub itself does no authz. (On native **machines**
 > there is no proxy — the loopback bind plus the operator's SSH tunnel is the
-> boundary; see [the machine hub](sx.md#the-machine-hub).) The proxy also strips the
+> boundary; see [the machine hub](#the-machine-hub-shed-host-agent).) The proxy also strips the
 > client's `Authorization`/`Cookie` before forwarding, so the guest-local hub never sees
 > server-API credentials.
 
@@ -857,6 +857,64 @@ answering: the hub hasn't started yet, it crashed, or the image predates the hub
 In that case listings carry no activity fields and clients hide watch/activity
 affordances (a clean feature-degrade). Clients key feature-degrade off the
 `RC_HUB_UNAVAILABLE` code.
+
+## The machine hub (shed-host-agent)
+
+Live activity on a **machine** (as read by the desktop and mobile clients) comes from
+the **machine RC hub** — the same loopback HTTP service a shed runs, bound to
+`127.0.0.1:1029`. **`shed-host-agent` hosts it**, as a supervised resident role: the
+daemon binds the port at startup and keeps the hub up for as long as it runs. Opt out
+with `rc_hub.enabled: false` in the agent's config.
+
+Because the daemon is supervised (brew services / systemd), the hub does not come and
+go with session activity — unlike the retired `shed-machine-rc serve`, which exited
+after 15 idle minutes. If some other process already holds the port, the agent logs
+it, retries with backoff, and takes over when the port frees.
+
+### The hub's `PATH` is the hub's, not yours
+
+The hub **spawns agent binaries** (`opencode`, `codex`, `cursor-agent`, `claude`), so
+it can only launch what is on the PATH of the process that hosts it — and a supervised
+daemon does not inherit your shell's. A systemd **user** unit in particular starts with
+a minimal PATH: an agent installed into `~/.local/bin`, `~/.bun/bin`, or a version
+manager's shim directory is invisible to it.
+
+The symptom is quiet and easy to misread: `curl 127.0.0.1:1029/v1/health` (or
+`shed-host-agent status`) reports the agent as not installed, and a kickoff for that
+kind fails, with nothing pointing at PATH as the cause. The tool is plainly there in
+your own shell.
+
+Set the PATH explicitly on the unit that hosts the hub:
+
+```bash
+systemd-run --user --unit=shed-rc-hub --property=Restart=always \
+  --setenv=PATH="$HOME/.local/bin:$HOME/.bun/bin:/usr/local/bin:/usr/bin:/bin" \
+  shed-host-agent rc-hub
+```
+
+For a packaged unit, the equivalent is an `Environment=PATH=…` line (or a drop-in). On
+macOS under brew services, the launchd job has the same property: its `PATH` is
+launchd's, not your login shell's.
+
+Confirm with `curl 127.0.0.1:1029/v1/health` and `shed-host-agent status` — every agent
+you expect should report as installed with a version.
+
+**The trust model is the machine's own.** There is no server proxy on a machine: the
+hub binds loopback only and does no authorization — the loopback bind plus your SSH
+tunnel (`ssh -L`) IS the boundary. Never widen the bind. Note what "local" means here:
+every process of every app running under any uid that can reach loopback on the
+machine — not a sandboxed VM. That is still the machine's existing trust boundary (a
+local process that could POST to the hub could already drive the same tmux session
+directly with `send-keys`), so the hub adds a convenience channel within local trust,
+not a new boundary — but the scope of "local" is the whole machine, and it is worth
+saying plainly.
+
+**Machine-posture deltas from the guest hub** (deliberate, not drift): inside the agent
+the hub is a supervised resident role — no 15-minute idle exit, no detach double-fork,
+no pidfile; at zero sessions the watchers quiesce and the recurring cost is one
+`tmux ls` per idle tick. The agent's bind loop retries rather than exits, so a
+permanently held port shows up as `RC hub: deferred` in `shed-host-agent status`, not a
+dead daemon.
 
 ## Exit codes
 

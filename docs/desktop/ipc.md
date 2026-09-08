@@ -104,7 +104,7 @@ A legacy/unmanaged `rc-*` session decodes with `managed: false` and no metadata.
 
 A **machine** is a native host you reach over SSH that runs the RC activity hub on its
 loopback `1029` — no shed server in the path, no TLS pin, no control token. Machines come
-from the `machines:` section of `~/.shed/config.yaml` (the same section `sx` reads) and are
+from the `machines:` section of `~/.shed/config.yaml` and are
 read ONCE at startup, so there is no in-app add/edit; an editor that silently needed a
 relaunch would be worse than the file.
 

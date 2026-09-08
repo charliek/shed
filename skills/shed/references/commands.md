@@ -75,12 +75,9 @@ shed exec codelens bash -lc "cd /workspace && npm test"   # shell features need 
 shed sessions --all
 ```
 
-**RC sessions beyond sheds (`sx`).** The same `rc-<slug>` agent sessions can be started
-and observed on this machine and on native machines — not just in sheds — with `sx`, the
-RC porcelain (`sx agent <tool> --on local|machine:<m>|shed:<s>`, `sx plan`, `sx ls`,
-`sx watch/attach/kill <slug>`). It is **unreleased** and built from `crates/sx`, so check
-`command -v sx` before suggesting it, and it never manages sheds themselves — shed
-lifecycle stays with the commands above. Reference: `docs/extensions/sx.md`.
+**Native machines.** `shed` targets sheds only; native-machine kickoff is moving to
+roost's palette (S4, [`charliek/shed#326`](https://github.com/charliek/shed/issues/326)),
+with nothing to run today.
 
 ## Port forwarding (tunnels)
 
