@@ -86,11 +86,6 @@ pub struct HubConfig {
     pub heartbeat: Duration,
     pub write_timeout: Duration,
     pub subscriber_buffer: usize,
-    /// The settle before the Enter keypress in the input handler's delivery
-    /// (`sendLineSettle` — a package global in Go, mutated by tests; a config
-    /// seam here). `None` → the engine default (750 ms); tests pass
-    /// `Some(Duration::ZERO)`.
-    pub send_line_settle: Option<Duration>,
 }
 
 /// HubConfig with every default applied (`hubResolved`, `hub.go:145`).
@@ -107,7 +102,6 @@ pub struct HubResolved {
     pub heartbeat: Duration,
     pub write_timeout: Duration,
     pub sub_buffer: usize,
-    pub send_settle: Duration,
 }
 
 impl HubConfig {
@@ -147,9 +141,6 @@ impl HubConfig {
             } else {
                 self.subscriber_buffer
             },
-            send_settle: self
-                .send_line_settle
-                .unwrap_or(shed_rc_engine::tmux::DEFAULT_SEND_LINE_SETTLE),
         }
     }
 }

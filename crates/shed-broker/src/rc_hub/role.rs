@@ -70,7 +70,6 @@ fn build_hub_config(
         heartbeat: Duration::ZERO,
         write_timeout: Duration::ZERO,
         subscriber_buffer: 0,
-        send_line_settle: None,
     };
     apply_hub_env_overrides(&mut cfg, &env_get, note);
     cfg

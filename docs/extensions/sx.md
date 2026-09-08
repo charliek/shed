@@ -206,10 +206,15 @@ The hub's `serve` verb is **not** ported and has no `sx rc` equivalent.
 
 That compatibility is enforced, not asserted: `tests/rc-parity/` runs each scenario
 against both binaries side by side, requires the normalized results to match, and pins
-the agreed value to a committed golden. Preseed artifacts (`~/.claude.json`,
-`~/.cursor/hooks.json`, the cursor hook script, plan files) are compared as **raw bytes**
-— a mixed fleet rewrites those files in place, so merge idempotence only survives if both
-implementations write identical bytes. Run it with `make test-rc-parity`.
+the agreed value to a committed golden. Preseed artifacts (`~/.claude.json` and plan
+files) are compared as **raw bytes** — a mixed fleet rewrites those files in place, so
+merge idempotence only survives if both implementations write identical bytes. Run it
+with `make test-rc-parity`.
+
+The cursor hook preseed (`~/.cursor/hooks.json` and its relay script) was part of that
+raw-bytes surface until the cursor hook-ingest lane was retired
+([`charliek/shed#322`](https://github.com/charliek/shed/issues/322)): neither
+implementation writes those files any more, so there is nothing left to compare.
 
 ## The machine hub
 
@@ -265,10 +270,10 @@ bind plus your SSH tunnel (`ssh -L`) IS the boundary. Never widen the bind.
 Note what "local" means here: every process of every app running under any
 uid that can reach loopback on the machine — not a sandboxed VM. That is
 still the machine's existing trust boundary (a local process that could POST
-to the hub's cursor-hook ingest could already drive the same tmux session
-directly with `send-keys`), so the hub adds a convenience channel within
-local trust, not a new boundary — but the scope of "local" is the whole
-machine, and it is worth saying plainly.
+to the hub could already drive the same tmux session directly with
+`send-keys`), so the hub adds a convenience channel within local trust, not a
+new boundary — but the scope of "local" is the whole machine, and it is worth
+saying plainly.
 
 **Machine-posture deltas from the guest hub** (deliberate, not drift): inside
 the agent the hub is a supervised resident role — no 15-minute idle exit, no

@@ -34,11 +34,11 @@
 //! probe / prompt / kill / accept-trust + the `--wait` poller, `ops.go`),
 //! [`plan`] (`plan.go`), [`netutil`] (`netutil.go`), [`text`] (the two prompt
 //! helpers from `rc.go` that C1 did not carry over), the create-time
-//! **preseeds** ([`trust`] = `trust.go`, [`preseed_cursor`] =
-//! `preseed_cursor.go`, dispatched per kind by [`preseed`] the way
-//! `AgentSpec.Preseed` is), the byte-exact Go-`encoding/json` writer they rewrite
-//! their files with ([`go_json`]), and **capability discovery**
-//! ([`capabilities`] = `capabilities.go`).
+//! **preseed** ([`trust`] = `trust.go`, dispatched per kind by [`preseed`] the
+//! way `AgentSpec.Preseed` is — cursor's hook-relay preseed was the second one
+//! until A6, `charliek/shed#322`, retired the lane it fed), the byte-exact
+//! Go-`encoding/json` writer it rewrites its file with ([`go_json`]), and
+//! **capability discovery** ([`capabilities`] = `capabilities.go`).
 //!
 //! Never here: the activity **hub** (`serve`). Its Rust home is shed-broker's
 //! `rc_hub` (plan 010), which CONSUMES this crate; the engine only carries the

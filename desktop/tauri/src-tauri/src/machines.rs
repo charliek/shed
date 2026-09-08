@@ -503,10 +503,19 @@ impl Machines {
         let reach = self.reach(machine)?;
         let tab_id = parse_tab_id(slug)?;
         tab_close(reach.as_ref(), tab_id).await?;
-        let mut guard = lock(&self.state);
-        if let Some(m) = guard.get_mut(machine) {
-            m.sessions.retain(|s| s.tab_id != tab_id);
+        {
+            let mut guard = lock(&self.state);
+            if let Some(m) = guard.get_mut(machine) {
+                m.sessions.retain(|s| s.tab_id != tab_id);
+            }
         }
+        // Outside the lock (the callback re-enters the app) and unconditional,
+        // exactly as [`Self::create`] does it. A Tauri caller happens to refresh
+        // afterwards, but the `machine.kill` socket op does not — so without this
+        // the one case the optimistic drop exists FOR (the stream is mid-resync,
+        // or the machine drops right after the close) is the one case an open UI
+        // never hears about.
+        (self.on_change)();
         Ok(())
     }
 
@@ -885,6 +894,7 @@ fn machine_row(name: &str, session: &RoostSession, stale: bool) -> Value {
 mod tests {
     use super::*;
 
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
     use shed_core::roost::testing::{ownership, FakeRoost};
@@ -950,6 +960,25 @@ mod tests {
             sockets,
             Arc::new(|| {}),
         )
+    }
+
+    /// Like [`start`], plus the count of `on_change` calls the layer has made —
+    /// what an open UI would have been told to re-read.
+    fn start_counting(
+        config: &ShedConfig,
+        sockets: &HashMap<String, PathBuf>,
+    ) -> (Machines, Arc<AtomicUsize>) {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&calls);
+        let machines = Machines::start(
+            &tokio::runtime::Handle::current(),
+            config,
+            sockets,
+            Arc::new(move || {
+                counter.fetch_add(1, Ordering::SeqCst);
+            }),
+        );
+        (machines, calls)
     }
 
     /// The vector's shell tab, claimed by an opencode adapter.
@@ -1491,6 +1520,35 @@ mod tests {
         assert!(bad.contains("not a roost tab id"), "{bad}");
     }
 
+    /// **An optimistic drop that nobody is told about is not optimistic.**
+    ///
+    /// The Tauri commands happen to re-read afterwards; the `machine.kill`
+    /// socket op does not. So `kill` publishes the change itself, the way
+    /// [`Machines::create`] does — otherwise the exact case the optimistic drop
+    /// exists for (no snapshot is coming, because the stream is resyncing or the
+    /// machine just dropped) is the case an open UI never hears about.
+    #[tokio::test]
+    async fn kill_publishes_the_drop_it_made() {
+        let fake = FakeRoost::start().await;
+        claim_opencode(&fake, "working", "session_status", false);
+        let (machines, calls) = start_counting(
+            &config_with(&["mini3"]),
+            &sockets(&[("mini3", fake.socket_path())]),
+        );
+        wait_for("the row to kill", || rows(&machines).into_iter().next()).await;
+
+        // Read the count the instant `kill` returns: the watcher's own snapshot
+        // for this same `tab.closed` publishes too, but it arrives later and is
+        // exactly the delivery the unhappy path does not get.
+        let before = calls.load(Ordering::SeqCst);
+        machines.kill("mini3", "5").await.expect("the close lands");
+        assert!(rows(&machines).is_empty());
+        assert!(
+            calls.load(Ordering::SeqCst) > before,
+            "kill returned without publishing the drop it made"
+        );
+    }
+
     /// The `tab.open` request for a kind: the agent's argv and the cwd, and
     /// nothing else invented.
     #[test]
@@ -1553,6 +1611,58 @@ mod tests {
         // And it is in the snapshot immediately, rather than when the stream
         // delivers the `tab.opened` this call just caused.
         assert!(rows(&machines).iter().any(|r| r["slug"] == "6"));
+    }
+
+    /// **A failed launch must not leave a ghost row.**
+    ///
+    /// [`Machines::create`] shows a provisional row the moment the tab opens,
+    /// before any adapter has claimed it — so the watcher's inventory carries
+    /// that tab in its HIDDEN half. If the launched process dies before it ever
+    /// reports (a missing binary, an immediate crash), the `tab.closed` is a
+    /// hidden-half event too. The 2 s poller repaired this on its next
+    /// `tab.list`; the observer-only watcher publishes the vanished tab instead
+    /// (`shed_app::roost::observe_once`), and the authoritative snapshot then
+    /// replaces the provisional row set. Without either, the card is permanent.
+    #[tokio::test]
+    async fn a_launched_tab_that_dies_unclaimed_takes_its_row_with_it() {
+        let fake = FakeRoost::start().await;
+        let machines = start(
+            &config_with(&["mini3"]),
+            &sockets(&[("mini3", fake.socket_path())]),
+        );
+        wait_for("the first snapshot", || {
+            machines
+                .state
+                .lock()
+                .unwrap()
+                .get("mini3")
+                .filter(|m| m.seen)
+                .map(|_| ())
+        })
+        .await;
+
+        machines
+            .launch("mini3", &RcKind::Opencode, None, None, None, None)
+            .await
+            .expect("the open lands");
+        assert!(
+            rows(&machines).iter().any(|r| r["slug"] == "6"),
+            "the optimistic row is showing"
+        );
+
+        // The launched process dies without ever claiming the tab, and roost
+        // closes it. Out of band — through a second reach, NOT through
+        // `Machines::kill`, whose own optimistic drop would hide the bug.
+        let reach: Arc<dyn RoostReach> = Arc::new(LocalSession::new("mini3", fake.socket_path()));
+        tab_close(reach.as_ref(), 6).await.expect("the tab closes");
+
+        wait_for("the provisional row to retire", || {
+            rows(&machines)
+                .iter()
+                .all(|r| r["slug"] != "6")
+                .then_some(())
+        })
+        .await;
     }
 
     /// A kind roost has no recipe for is refused BEFORE anything is opened — the

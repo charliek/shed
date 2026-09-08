@@ -63,7 +63,8 @@ impl std::error::Error for PreseedError {}
 const PRESEED_STACK_BYTES: usize = 64 << 20;
 
 /// Every environment key a preseed reads — `trust` looks at `CLAUDE_CONFIG_DIR`
-/// then `HOME`, `preseed_cursor` at `HOME`.
+/// then `HOME`. (`HOME` alone was the retired cursor preseed's read; it stays
+/// because `trust` falls back to it.)
 ///
 /// [`dispatch`] SNAPSHOTS these before handing work to the worker thread:
 /// [`GetEnv`] is a bare `&dyn Fn`, so it is not `Send`, and copying two strings

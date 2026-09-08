@@ -747,10 +747,13 @@ pub const MAX_CONSECUTIVE_RESYNCS: u32 = 3;
 pub enum RoostUpdate {
     /// A complete inventory. Emitted once at the head of every cycle (the
     /// `tab.list` the stream is fenced against), and afterwards only when a
-    /// folded batch actually **changed a row** — an empty commit, a hidden
-    /// tab's churn, or a project rename that touches no session emits nothing,
-    /// though the inventory's `revision` advances all the same and rides out
-    /// with the next snapshot that does.
+    /// folded batch actually **changed a row, or retired a tab** — an empty
+    /// commit, a hidden tab's churn, or a project rename that touches no session
+    /// emits nothing, though the inventory's `revision` advances all the same and
+    /// rides out with the next snapshot that does. A tab the inventory KNEW
+    /// about disappearing is published even when it was hidden the whole time,
+    /// because a client may be holding an optimistic row for it (the reason is
+    /// on `observe_once`, this module's fold loop).
     Snapshot(RoostInventory),
     /// The session is not readable: no socket, the tunnel would not build, the
     /// thing on the other end is not a roost-session, or a request failed.
@@ -1048,13 +1051,27 @@ async fn observe_once(
                 Admit::Apply => {
                     *applied = true;
                     let before = inventory.sessions.clone();
+                    let known_before = inventory.known_tab_ids();
                     inventory.apply(&batch);
-                    // **Only a row change is news.** An empty commit, a hidden
-                    // tab's churn and a project rename nobody's row carries all
-                    // advance the revision inside the inventory and publish
-                    // nothing; the next snapshot that does go out carries the
-                    // moved number with it.
-                    if inventory.sessions != before
+                    // **A row change is news. So is a tab vanishing.** An empty
+                    // commit, a hidden tab's churn and a project rename nobody's
+                    // row carries all advance the revision inside the inventory
+                    // and publish nothing; the next snapshot that does go out
+                    // carries the moved number with it.
+                    //
+                    // The one hidden-half change that IS news is a tab we knew
+                    // about ceasing to exist. A client may hold an optimistic
+                    // row for a tab it opened itself, before any adapter has
+                    // claimed it (`machines.rs::create`); if the launched
+                    // process dies before it ever reports, BOTH the `tab.opened`
+                    // and the `tab.closed` touch the hidden half only, and
+                    // without this the client would never hear that the tab it
+                    // is showing a card for is gone. The poller repaired that on
+                    // its next list; an event-only watcher has to say it.
+                    // Deliberately narrow: a hidden tab appearing, or changing,
+                    // still emits nothing.
+                    let vanished = known_before.iter().any(|id| !inventory.knows(*id));
+                    if (inventory.sessions != before || vanished)
                         && tx.send(RoostUpdate::Snapshot(inventory.clone())).is_err()
                     {
                         return Ok(Cycle::Done);
@@ -1668,6 +1685,60 @@ mod tests {
             "an unowned tab is somebody's terminal, not a session row"
         );
         assert_eq!(fake.tab_list_calls(), 1);
+        watcher.stop();
+    }
+
+    /// **A hidden tab VANISHING is news, even though its opening was not.**
+    ///
+    /// The asymmetry is the point. A client can be holding a row of its own for
+    /// a tab it opened and no adapter has claimed yet — the Tauri client inserts
+    /// one optimistically so a launch appears at once — and if the launched
+    /// process dies before it ever reports, every event about that tab lands in
+    /// the hidden half. Suppressing the close as "hidden churn" would leave that
+    /// client showing a card for a tab that no longer exists, with no next poll
+    /// to repair it.
+    #[tokio::test]
+    async fn a_vanished_hidden_tab_emits_a_snapshot() {
+        let fake = FakeRoost::start().await;
+        fake.set_tab_axes(TAB, "working", Some(owned("session_status")), false);
+        let reach: Arc<dyn RoostReach> =
+            Arc::new(LocalSession::new("localhost", fake.socket_path()));
+
+        let (watcher, mut rx) = watch(Arc::clone(&reach));
+        let first = next_snapshot(&mut rx).await;
+        assert_eq!(first.sessions.len(), 1);
+
+        // Opening it emits nothing — the suppression the test above pins.
+        let opened = tab_open(
+            reach.as_ref(),
+            TabOpenParams {
+                title: "zsh".to_string(),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("tab.open");
+        stays_silent(&mut rx).await;
+
+        tab_close(reach.as_ref(), opened.id)
+            .await
+            .expect("tab.close");
+        let second = next_snapshot(&mut rx).await;
+        assert!(
+            !second.knows(opened.id),
+            "the inventory published the tab as gone"
+        );
+        assert_eq!(
+            second.sessions.len(),
+            1,
+            "and the VISIBLE row set never moved"
+        );
+        assert!(second.revision > first.revision);
+        assert_eq!(
+            fake.tab_list_calls(),
+            1,
+            "a vanished tab is still a pushed change, not a re-read"
+        );
         watcher.stop();
     }
 

@@ -243,9 +243,6 @@ pub(crate) fn hub_config(f: &Arc<HubTmux>, clk: &Arc<HubClock>) -> HubConfig {
         heartbeat: Duration::ZERO,
         write_timeout: Duration::ZERO,
         subscriber_buffer: 0,
-        // Go's tests zero the sendLineSettle global; the config seam is the
-        // Rust spelling.
-        send_line_settle: Some(Duration::ZERO),
     }
 }
 

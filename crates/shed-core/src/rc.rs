@@ -459,7 +459,9 @@ pub struct RcAgentInfo {
 /// `rc.KindFeatures` and mobile's `KindFeatures` (`rc_capabilities.dart:116-144`):
 /// `post_input` reports whether a typed line reaches the pane, `approvals` is
 /// where approvals surface (`"tui"` — answered in the terminal; `"remote"` —
-/// answered through the hub's `POST /approvals/{id}` verb, opencode today).
+/// answered through the hub's `POST /approvals/{id}` verb, opencode today;
+/// `"none"` — nowhere a client can reach, which no guest emits and shed's
+/// synthesized roost capabilities do, see [`crate::roost::roost_capabilities`]).
 ///
 /// `watch` and `input` are additive hub hints (opencode's lane carries them;
 /// absent → `false` / `""` for every other kind — claude-rc, codex and cursor

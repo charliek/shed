@@ -117,7 +117,44 @@ def test_sessions_empty(hub_differential, hub_leg):
 # — a codex row whose static shim pane went quiet past the hub's quiet period and
 # landed on the kind's anchor answer. Both the engine and the anchor were deleted
 # in S2 (charliek/shed#324): a shed row's activity now comes from a lane watcher
-# or not at all, and codex has none. Removed with its golden.
+# or not at all, and codex has none. Removed with its golden, and replaced by the
+# cell below, which keeps the differential it also carried.
+
+
+def test_sessions_tracked_feedless_row(hub_differential, hub_leg):
+    """`GET /v1/sessions` for a TRACKED session of a kind with no feed.
+
+    **What this replaces, and why.** `test_sessions_overlay_codex_settled` pinned
+    the pane-stability SETTLE, and went with the engine in S2
+    (charliek/shed#324) — correctly. But it was also the only cell that compared
+    the two hubs' `/v1/sessions` for a *tracked* session of a feedless kind:
+    `_tracked_codex` now reads `/messages` purely as a readiness probe, so
+    nothing else in this family looks at what such a row actually says. Without
+    this, Go and Rust could drift on whether a tracked feedless row omits
+    `activity`, `activity_at`, `last_message` and `pending_approvals` — or on any
+    other field of it — and every remaining cell in the gate would still pass.
+
+    It pins the row's SHAPE and its OMISSIONS, and deliberately pins no derived
+    verdict: there is no producer left to derive one for codex, and re-pinning a
+    value here would restore exactly what S2 deleted.
+    """
+
+    def scenario(impl):
+        leg = hub_leg(impl)
+        _tracked_codex(leg)
+        got = leg.hub_request("GET", "/v1/sessions")
+        body = mask_hub_sessions(got["json"], str(leg.home))
+        rows = [s for s in body["sessions"] if s.get("slug") == CODEX_SLUG]
+        assert len(rows) == 1, f"{impl}: expected one {CODEX_SLUG} row: {body!r}"
+        # The claim, asserted before it is pinned (the D3 discipline): a tracked
+        # row of a kind with no producer carries no derived status at all.
+        for absent in ("activity", "activity_at", "last_message", "pending_approvals"):
+            assert absent not in rows[0], (
+                f"{impl}: a feedless kind's row carries {absent}: {rows[0]!r}"
+            )
+        return {"status": got["status"], "body": body}
+
+    hub_differential(scenario)
 
 
 def test_messages_empty_ring(hub_differential, hub_leg):
