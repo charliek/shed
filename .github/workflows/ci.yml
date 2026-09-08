@@ -122,19 +122,20 @@ jobs:
               - 'go.mod'
               - 'go.sum'
             rcparity:
-              # The Go-vs-Rust RC-engine differential leg (plan 009): BOTH one-shot
-              # implementations, the harness that runs them side by side, and the
-              # shared build manifests a dependency bump would ride in on.
+              # The Go-vs-Rust RC differential leg (plan 009/010): BOTH hub
+              # implementations, the engines under them, the harness that runs
+              # them side by side, and the shared build manifests a dependency
+              # bump would ride in on.
               #
               # Rust side: the graduated engine crate (`shed-rc-engine`,
               # re-exported through `shed-app`'s `rc` feature) over the pure
-              # kernel (`shed-core::rc_agents`), plus the `sx` CLI that is the
-              # binary under test. Go side: the engine (`internal/ext/rc`), its CLI
-              # shell (`internal/ext/clirc`) and BOTH binaries built from them — the
-              # test-only oracle (tests/rc-parity/oracle — the retired
-              # shed-machine-rc's main, covered by the tests/rc-parity/** entry
-              # below) and the guest `shed-ext-rc`, which share the same wire
-              # surface.
+              # kernel (`shed-core::rc_agents`). Go side: the engine
+              # (`internal/ext/rc`), its CLI shell (`internal/ext/clirc`) and BOTH
+              # binaries built from them — the test-only oracle
+              # (tests/rc-parity/oracle — the retired shed-machine-rc's main,
+              # covered by the tests/rc-parity/** entry below, and since plan 016
+              # the session-creation stimulus for BOTH legs) and the guest
+              # `shed-ext-rc`, which share the same wire surface.
               - 'crates/shed-core/**'
               - 'crates/shed-app/**'
               - 'crates/shed-rc-engine/**'
@@ -146,7 +147,6 @@ jobs:
               # debug subcommand is the harness's Rust leg from H12), so a
               # bin-only change must run the wire gate too.
               - 'crates/shed-host-agent/**'
-              - 'crates/sx/**'
               - 'crates/Cargo.toml'
               - 'crates/Cargo.lock'
               - 'crates/rust-toolchain.toml'
@@ -596,13 +596,14 @@ jobs:
         # against the recorded goldens + the Rust golden-fixture runners.
         run: make test-host-agent-diff
 
-  # The Go↔Rust RC-engine parity leg (plan 009 §3.6) — the FOURTH pytest suite.
-  # Same organization as host-agent-diff above: one Linux job covers BOTH the
-  # Rust crates' own build/test/clippy AND the differential harness that drives
-  # the two binaries side by side. The cargo legs here are what close the §2.2
-  # gap — no other job compiles `shed-app --features rc` or `sx` at all, so
-  # without them the ported engine and the porcelain would only ever be built as
-  # a side effect of the harness (no tests, no clippy).
+  # The Go↔Rust RC parity leg (plan 009 §3.6, plan 010) — one of the five
+  # pytest suites. Same organization as host-agent-diff above: one Linux job covers BOTH
+  # the Rust crates' own build/test/clippy AND the differential harness that
+  # drives the two hub daemons side by side. The cargo legs here are what close
+  # the §2.2 gap — no other job compiles `shed-app --features rc` at all, so
+  # without them the ported engine would only ever be built as a side effect of
+  # the harness (no tests, no clippy). Since plan 016 sunset `sx` they are the
+  # feature's ONLY coverage: do not drop them.
   rc-parity:
     name: rc-parity (Go↔Rust wire goldens)
     needs: changes
@@ -665,20 +666,18 @@ jobs:
             exit 1
           fi
       - uses: astral-sh/setup-uv@v6
-      # The ported engine lives behind shed-app's non-default `rc` feature and the
-      # porcelain is `sx` — neither is reached by core-linux (`-p shed-core`) or by
+      # The ported engine lives behind shed-app's non-default `rc` feature and in
+      # `shed-rc-engine` — neither is reached by core-linux (`-p shed-core`) or by
       # host-agent-diff (`-p shed-broker -p shed-host-agent`). Both are named
       # explicitly: a filter that matched nothing would run ZERO tests silently
       # (the lesson recorded on `test-host-agent-diff` in the Makefile).
-      - name: Rust engine + porcelain — test + clippy (Linux)
+      - name: Rust RC engine — test + clippy (Linux)
         working-directory: crates
         run: |
           cargo test -p shed-rc-engine --features test-support --all-targets --locked
           cargo clippy -p shed-rc-engine --features test-support --all-targets --locked -- -D warnings
           cargo test -p shed-app --features rc --all-targets --locked
           cargo clippy -p shed-app --features rc --all-targets --locked -- -D warnings
-          cargo test -p sx --all-targets --locked
-          cargo clippy -p sx --all-targets --locked -- -D warnings
       - name: Fixture-copy byte-parity guard
         # The crates-local fixture copies (crates/fixtures/{panes,jsonl} + the
         # wire goldens) are guarded by Go sweeps in internal/ext/rc — but the

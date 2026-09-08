@@ -76,13 +76,17 @@ test-host-agent-diff:
 	# filter scoped to the bin alone silently ran ZERO of them.
 	cd crates && PATH="$$HOME/.cargo/bin:$$PATH" cargo test -p shed-host-agent -p shed-broker golden
 
-# Go↔Rust RC-engine parity harness (the FOURTH pytest suite — never merged with
-# tests/integration, tests/host-agent-diff or desktop/tools/shedtest). It builds
-# BOTH one-shot implementations — the Go oracle (tests/rc-parity/oracle, the
-# retired shed-machine-rc's main, kept test-only) and `sx` (Rust) — runs each
-# scenario against both against a hermetic tmux server, asserts
-# the two agree under tests/rc-parity/normalize.py, and pins the agreed value to a
-# committed golden. Needs Go, Rust (cargo on PATH), uv, and tmux >= 3.2.
+# Go↔Rust RC-hub parity harness (one of the five pytest suites — never merged
+# with tests/integration, tests/host-agent-diff, desktop/tools/shedtest or
+# tests/machine-transport). It runs
+# BOTH resident hub daemons — the Go oracle (tests/rc-parity/oracle, the retired
+# shed-machine-rc's main, kept test-only) via `serve --foreground`, and
+# `shed-host-agent rc-hub` (Rust) — on ephemeral loopback ports over identical
+# hermetic tmux sessions, asserts the two /v1 wires agree under
+# tests/rc-parity/normalize.py, and pins the agreed value to a committed golden.
+# Both legs are stimulated by the oracle CLI (plan 016 sunset `sx`), so the
+# daemon is the only controlled variable — asserted, not assumed, by
+# test_hub_wiring.py. Needs Go, Rust (cargo on PATH), uv, and tmux >= 3.2.
 # See tests/rc-parity/README.md.
 test-rc-parity:
 	@command -v uv >/dev/null 2>&1 || { \

@@ -1,12 +1,21 @@
-"""Fixtures for the Go↔Rust RC one-shot parity harness (plan 009 §3.6).
+"""Fixtures for the Go↔Rust RC HUB differential harness (plan 010).
 
-Builds BOTH implementations once per session — the Go oracle
-(`tests/rc-parity/oracle`, the retired shed-machine-rc's main, still running
-under the `shed-machine-rc` identity the goldens were recorded with) and `sx`
-(Rust) — and drives them as black-box subprocesses against a hermetic
-tmux server, asserting their wire-visible output is identical under
-`normalize.py`'s canonicalization, then pinning it to a committed golden recorded
-from the Go side.
+Each cell runs one scenario against TWO resident hub daemons — Go:
+`shed-machine-rc serve --foreground` (the test-only oracle built from
+`tests/rc-parity/oracle`, the retired binary's main, still running under the
+`shed-machine-rc` identity the goldens were recorded with); Rust:
+`shed-host-agent rc-hub` — asserts their wire-visible `/v1` output is identical
+under `normalize.py`'s canonicalization, then pins it to a committed golden
+recorded from the Go side.
+
+**BOTH legs are stimulated by the Go oracle CLI** since plan 016 (S7) sunset
+`sx`: `Leg.cli` is an explicit argv prefix and `hub_leg` hands the oracle to
+both legs, so the differential's only controlled variable is the DAEMON. That is
+deliberate, not a wiring bug — see `tests/rc-parity/README.md` § Purpose. It is
+also asserted rather than assumed: `start_hub` checks the daemon's own basename
+per leg and records the argv in `$HOME/hub.log`, and
+`test_hub_wiring.py::test_legs_run_distinct_daemons` pins that the two legs run
+different binaries.
 
 Hermeticity, in the order the traps bite:
 
@@ -15,22 +24,21 @@ Hermeticity, in the order the traps bite:
   contaminate cells and poke the developer's real hub. `SHED_RC_NO_HUB=1` (the C2
   oracle seam, honored identically by the Rust engine) neutralizes it on both
   sides; a session-scoped guard asserts no test-spawned process ended up holding
-  the port.
-* **tmux.** Each CONTEXT gets its own `TMUX_TMPDIR` — a shallow `mkdtemp`,
-  because an AF_UNIX path caps at ~104 bytes and pytest's tmp tree blows past
-  that. In the `isolated` flavor a context is one implementation LEG, so the two
-  legs run on separate tmux servers, cannot see each other's sessions, and use
-  the SAME pinned `--slug`/`--name` — which is what lets the DTOs compare with no
-  slug masking. In the `shared` flavor one context serves BOTH implementations
-  (interop + preseed-in-place), so coexisting sessions take distinct slugs.
+  the port. It gates create-time ensure ONLY, never the explicit `serve` each
+  hub leg starts on its own ephemeral port.
+* **tmux.** Each LEG gets its own `TMUX_TMPDIR` — a shallow `mkdtemp`, because
+  an AF_UNIX path caps at ~104 bytes and pytest's tmp tree blows past that. So
+  the two legs run on separate tmux servers, cannot see each other's sessions,
+  and use the SAME pinned `--slug`/`--name` — which is what lets the DTOs
+  compare with no slug masking.
 * **PATH.** `bash -lc` (the installed-agent gate) and `bash -l` (the shell kind)
   REBUILD PATH from `/etc/profile` + macOS `path_helper`, so prepending onto the
   pytest process's PATH vanishes. `_clean_env` therefore writes `.bash_profile`,
   `.bashrc` AND `.profile` into the leg's fresh HOME prepending the shim dir, and
   constructs a MINIMAL PATH rather than inheriting the developer's — which also
   keeps a brew-installed agent (or `shed-machine-rc`) from outranking a shim.
-* **Agents.** The four agent binaries are `sh` shims that record their argv to
-  `$HOME/agent-argv.txt`, print a fixed pane, then `exec cat` (so the pane stays
+* **Agents.** The four agent binaries are `sh` shims that answer the capability
+  probe's `--version`, print a fixed pane, then `exec cat` (so the pane stays
   alive and a delivered prompt echoes into it). Nothing real is ever launched.
 
 No sleeps anywhere: every wait is a deadline poll that reports its last snapshot.
@@ -70,8 +78,8 @@ HUB_PORT = 1029
 #   claude                -> neutral text        -> state "starting"
 #
 # claude stays neutral on purpose: its ready state needs a URL, so a static claude
-# shim can only ever be `starting`. The REACTIVE variants below (a dialog that
-# redraws after the engine's keystroke) are what exercise its ready path.
+# shim can only ever be `starting`. (The REACTIVE shim variants that drove its
+# ready path retired with the one-shot `--wait` family in plan 016.)
 SHIM_PANES = {
     "claude": ["claude fixture pane (rc-parity)"],
     "codex": ["Find and fix a bug in @filename"],
@@ -86,88 +94,25 @@ SHIM_PANES = {
 # of the parse. The value is masked in the differential (shape-asserted only).
 SHIM_VERSION = "rc-parity fake agent 1.2.3"
 
-# The preamble every shim shares: answer the capability probe, then record the argv
-# the engine actually launched us with.
-SHIM_PREAMBLE = """\
+# The shim: answer the capability probe, draw a fixed pane, then hold the pane
+# open on stdin so a delivered prompt echoes back into it. (A second, REACTIVE
+# variant recorded stdin bytes and redrew on a keystroke; it retired with the
+# one-shot `--wait` family in plan 016.)
+SHIM_TEMPLATE = """\
 #!/bin/sh
 # rc-parity fake agent — nothing real is ever launched.
 case "$1" in
   --version) printf '%s\\n' '{version}'; exit 0 ;;
 esac
-for a in "$@"; do printf '%s\\n' "$a" >> "$HOME/agent-argv.txt"; done
-"""
-
-# The STATIC shim: draw a fixed pane, then hold the pane open on stdin so a
-# delivered prompt echoes back for capture-pane assertions.
-SHIM_TEMPLATE = (
-    SHIM_PREAMBLE
-    + """\
 {pane}
 exec cat
 """
-)
-
-# The REACTIVE shim (plan 009 §3.6): draw a dialog, block until the engine sends a
-# line-terminating keystroke — recording EVERY byte that arrives, in hex — then
-# redraw as ready. It is what proves the `--wait` poller's keystrokes: a static
-# pane would eat the whole 20 s timeout and prove nothing.
-#
-# Two mechanics worth knowing before reading a recorded transcript:
-#
-#   * the pane's tty is in CANONICAL mode (the shim never puts it in raw mode), so
-#     the CR that `tmux send-keys Enter` writes is delivered to the process as LF
-#     (ICRNL) and nothing is readable until that line terminator arrives. A `Down`
-#     (ESC [ B) therefore shows up in the SAME read burst as the Enter that
-#     follows it — which is exactly the ordering assertion we want.
-#   * the redraw pushes the dialog out of the engine's CAPTURE WINDOW with blank
-#     lines rather than an escape sequence (portable across dash and bash, whose
-#     `printf` disagree about `\033`). That window is `capture-pane -S -200` —
-#     the visible frame PLUS 200 lines of scrollback (`tmux.go:76`) — so scrolling
-#     the dialog off the visible pane is NOT enough: a trust dialog still inside
-#     the window keeps classifying as needs-trust, and the poller (whose accept is
-#     latched once) would then return needs-trust instead of ready. Hence 220
-#     lines. A real TUI redraws on the alternate screen and leaves no scrollback
-#     at all; this is the line-oriented equivalent.
-REACTIVE_TEMPLATE = (
-    SHIM_PREAMBLE
-    + """\
-{dialog}
-while :; do
-  b=$(dd bs=1 count=1 2>/dev/null | od -An -tx1 | tr -d ' \\n')
-  [ -n "$b" ] || break
-  printf '%s\\n' "$b" >> "$HOME/agent-stdin.hex"
-  [ "$b" = "0a" ] && break
-done
-i=0
-while [ $i -lt 220 ]; do printf '\\n'; i=$((i+1)); done
-{ready}
-exec cat
-"""
-)
-
-# claude's dialogs and its ready screen, anchored on the real classifier's regexes
-# (`internal/ext/rc/rc.go:374-398`, `agents.go:674-681`) — short lines, because a
-# detached tmux pane is 80 columns.
-TRUST_DIALOG = ["Quick safety check", "Yes, I trust this folder"]
-BYPASS_DIALOG = ["WARNING: Bypass Permissions mode", "2. Yes, I accept"]
-CLAUDE_READY = ["Remote Control active", "https://claude.ai/code/session_TESTTEST"]
-
-
-def _printf(lines) -> str:
-    return "printf '%s\\n' " + " ".join(f"'{line}'" for line in lines)
 
 
 def static_shim(pane) -> str:
     """A shim that draws `pane` once and holds it open."""
-    return SHIM_TEMPLATE.format(version=SHIM_VERSION, pane=_printf(pane))
-
-
-def reactive_shim(dialog, ready=CLAUDE_READY) -> str:
-    """A shim that draws `dialog`, records the engine's keystrokes, then redraws
-    `ready` — the seam the `--wait` trust/bypass scenarios drive."""
-    return REACTIVE_TEMPLATE.format(
-        version=SHIM_VERSION, dialog=_printf(dialog), ready=_printf(ready)
-    )
+    printf = "printf '%s\\n' " + " ".join(f"'{line}'" for line in pane)
+    return SHIM_TEMPLATE.format(version=SHIM_VERSION, pane=printf)
 
 
 @dataclasses.dataclass
@@ -178,16 +123,6 @@ class RunResult:
     returncode: int
     stdout: str
     stderr: str
-
-    def json(self) -> dict:
-        assert self.returncode == 0, f"{self.argv}: exit {self.returncode}: {self.stderr}"
-        try:
-            return json.loads(self.stdout)
-        except ValueError as exc:  # pragma: no cover - a failure prints both streams
-            raise AssertionError(
-                f"{self.argv}: stdout is not JSON ({exc})\n"
-                f"--- stdout ---\n{self.stdout}\n--- stderr ---\n{self.stderr}"
-            ) from exc
 
 
 def _build(cmd, cwd, env=None) -> None:
@@ -201,11 +136,15 @@ def _build(cmd, cwd, env=None) -> None:
 
 @pytest.fixture(scope="session")
 def binaries(tmp_path_factory) -> dict:
-    """Build both implementations once and return `{"go": path, "rust": path}`.
+    """Build both daemons' binaries once and return `{"go": …, "rust_hub": …}`.
 
-    Go's binary is built into a session tmp dir (the repo's `bin/` is the
-    developer's, and must not be clobbered by a test run); the Rust binary is
-    cargo's usual `debug/sx`, honoring `CARGO_TARGET_DIR` the way
+    `go` is the oracle: the Go hub daemon (`serve --foreground`) AND — since
+    plan 016 sunset `sx` — the session-creation CLI for BOTH legs. It is built
+    into a session tmp dir (the repo's `bin/` is the developer's, and must not be
+    clobbered by a test run).
+
+    `rust_hub` is the Rust hub daemon (`shed-host-agent rc-hub`) at cargo's usual
+    `debug/shed-host-agent`, honoring `CARGO_TARGET_DIR` the way
     `tests/host-agent-diff` does (a RELATIVE value resolves against `crates/`,
     cargo's cwd here — not pytest's)."""
     out_dir = tmp_path_factory.mktemp("bin")
@@ -221,7 +160,7 @@ def binaries(tmp_path_factory) -> dict:
         str(Path.home() / ".cargo" / "bin") + os.pathsep + cargo_env.get("PATH", "")
     )
     _build(
-        ["cargo", "build", "-p", "sx", "-p", "shed-host-agent", "--locked"],
+        ["cargo", "build", "-p", "shed-host-agent", "--locked"],
         cwd=CRATES_ROOT,
         env=cargo_env,
     )
@@ -232,15 +171,13 @@ def binaries(tmp_path_factory) -> dict:
             target_dir = CRATES_ROOT / target_dir
     else:
         target_dir = CRATES_ROOT / "target"
-    rust_bin = target_dir / "debug" / "sx"
-    assert rust_bin.exists(), f"rust binary missing: {rust_bin}"
     # The hub family's Rust daemon (plan 010 H12): the host-agent binary whose
     # `rc-hub` subcommand is the harness leg. The Go hub daemon needs no extra
     # build — it IS shed-machine-rc (`serve --foreground`).
     rust_hub_bin = target_dir / "debug" / "shed-host-agent"
     assert rust_hub_bin.exists(), f"rust hub binary missing: {rust_hub_bin}"
 
-    return {"go": str(go_bin), "rust": str(rust_bin), "rust_hub": str(rust_hub_bin)}
+    return {"go": str(go_bin), "rust_hub": str(rust_hub_bin)}
 
 
 @pytest.fixture(scope="session")
@@ -283,8 +220,8 @@ def hub_port_guard():
 
 def _write_shims(shim_dir: Path, overrides: dict | None = None) -> None:
     """Install the four fake agents. `overrides` replaces a named agent's script
-    wholesale (the reactive `--wait` variants) — both legs of a differential must
-    always be given the SAME overrides, or the two are not running one scenario."""
+    wholesale — both legs of a differential must always be given the SAME
+    overrides, or the two are not running one scenario."""
     scripts = {name: static_shim(pane) for name, pane in SHIM_PANES.items()}
     scripts.update(overrides or {})
     for name, script in scripts.items():
@@ -332,34 +269,29 @@ def _clean_env(home: Path, tmux_tmpdir: Path, shim_dir: Path, tmux_path: str) ->
     return env
 
 
-def argv_prefix(impl: str, binary: str) -> list:
-    """The implementation's argv prefix: the Go binary takes the verb directly,
-    `sx` namespaces it under `rc` (plan 009 §3.2)."""
-    assert impl in ("go", "rust"), f"unknown implementation {impl!r}"
-    return [binary] if impl == "go" else [binary, "rc"]
+class Leg:
+    """One leg of the differential: a fresh HOME, a private tmux server, a shim
+    PATH, and the CLI argv prefix that drives them.
 
-
-class Rig:
-    """One hermetic CONTEXT: a fresh HOME, a private tmux server, a shim PATH.
-
-    Everything below the CLI invocation — the environment, the tmux observation
-    helpers, the deadline polls, the teardown — is context-level, not
-    implementation-level, which is exactly why the two flavors can share it:
-
-    * `Leg` binds the context to ONE implementation (the isolated flavor: two
-      contexts, one per impl).
-    * `SharedRig` binds ONE context to BOTH implementations (the shared flavor:
-      each call names the impl that should run the verb)."""
+    `cli` is that prefix, complete and explicit: `[binary]` for a CLI whose verbs
+    are top-level, `[binary, "sub"]` for one that namespaces them. It is passed
+    in rather than derived from `impl`, because since plan 016 the impl label and
+    the CLI are deliberately decoupled — both legs are stimulated by the Go
+    oracle while only the DAEMON differs (see the module docstring). `HubLeg`
+    adds that resident daemon.
+    """
 
     def __init__(
         self,
-        label: str,
+        impl: str,
+        cli: list,
         home: Path,
         tmux_tmpdir: Path,
         tmux_bin: str,
         shims: dict | None = None,
     ):
-        self.label = label
+        self.impl = impl
+        self.cli = list(cli)
         self.home = home
         self.tmux_tmpdir = tmux_tmpdir
         self.tmux_bin = tmux_bin
@@ -368,22 +300,14 @@ class Rig:
         _write_shims(self.shim_dir, shims)
         self.env = _clean_env(home, tmux_tmpdir, self.shim_dir, tmux_bin)
 
-    def uninstall_agents(self, *names: str) -> None:
-        """Take agent binaries OFF this context's PATH — how a capability
-        differential proves an `installed: false` row rather than asserting only
-        the true one."""
-        for name in names:
-            (self.shim_dir / name).unlink(missing_ok=True)
-
     # -- the CLI under test -------------------------------------------------
 
-    def _invoke(
-        self, argv: list, stdin: str | None = None, timeout: float = 60
-    ) -> RunResult:
+    def run(self, sub: str, *args, timeout: float = 60) -> RunResult:
+        argv = self.cli + [sub] + list(args)
         proc = subprocess.run(
             argv,
             env=self.env,
-            input=(stdin or "").encode(),
+            input=b"",
             capture_output=True,
             timeout=timeout,
         )
@@ -405,12 +329,6 @@ class Rig:
             timeout=timeout,
         )
 
-    def sessions(self) -> list:
-        res = self.tmux("ls", "-F", "#{session_name}")
-        if res.returncode != 0:
-            return []
-        return sorted(line for line in res.stdout.split("\n") if line.strip())
-
     def session_env(self, name: str) -> dict:
         """The session's `SHED_RC_*` / `OPENCODE_*` environment as a mapping.
 
@@ -428,36 +346,6 @@ class Rig:
                 out[key] = value
         return out
 
-    def capture(self, name: str) -> str:
-        res = self.tmux("capture-pane", "-p", "-t", name)
-        return res.stdout if res.returncode == 0 else ""
-
-    def read_bytes(self, relative: str) -> bytes:
-        """A file under this context's HOME, as RAW BYTES — the preseed
-        artifacts' comparison model (plan 009 §3.5)."""
-        return (self.home / relative).read_bytes()
-
-    def _shim_log(self, relative: str) -> str:
-        """A file a shim appends to, or `""` when it does not exist yet — every
-        reader below is polled while the shim may not have written anything."""
-        try:
-            return (self.home / relative).read_text()
-        except OSError:
-            return ""
-
-    def agent_stdin_hex(self) -> list:
-        """The bytes the reactive shim received on stdin, one lowercase hex pair
-        per element, in arrival order — the proof of WHICH keystrokes the `--wait`
-        poller sent (a single Enter for trust; Down then Enter for bypass)."""
-        raw = self._shim_log("agent-stdin.hex")
-        return [line for line in raw.split("\n") if line.strip()]
-
-    def agent_argv(self) -> list:
-        """The argv the PATH-shim agent recorded (one element per line)."""
-        lines = self._shim_log("agent-argv.txt").split("\n")
-        # A complete capture ends with the trailing newline of its last element.
-        return lines[:-1] if lines and lines[-1] == "" else []
-
     # -- deadline polls (never a sleep) -------------------------------------
 
     def _poll(self, what: str, predicate, timeout: float):
@@ -468,71 +356,7 @@ class Rig:
             if last:
                 return last
             time.sleep(0.02)
-        raise AssertionError(f"{self.label}: {what} within {timeout}s; last={last!r}")
-
-    def wait_for_session(self, name: str, timeout: float = 10) -> list:
-        def listed():
-            names = self.sessions()
-            return names if name in names else None
-
-        return self._poll(f"session {name} never appeared", listed, timeout)
-
-    def wait_for_pane(
-        self, name: str, needle: str = "", timeout: float = 15, count: int = 1
-    ) -> str:
-        """Poll until the pane has drawn `needle` (or anything at all when it is
-        empty). The engine's own settle constants are 750 ms, so a session that
-        has not drawn within the budget is a real failure, not a slow machine.
-
-        `count` is the same remedy `wait_for_agent_argv` documents below, for the
-        same observed flake: a caller that COUNTS occurrences must wait for all of
-        them, because a pane mid-render satisfies "the needle is present" while
-        still holding fewer copies than the finished screen. Polling for presence
-        and then counting is a race between the two legs, and it surfaces as a
-        spurious Go-vs-Rust diff (3 markers against 4) rather than as the render
-        lag it actually is."""
-
-        def drawn():
-            text = self.capture(name)
-            if needle:
-                return text if text.count(needle) >= count else None
-            return text if text.strip() else None
-
-        return self._poll(
-            f"pane of {name} never showed {needle!r}"
-            + (f" {count} times" if count > 1 else ""),
-            drawn,
-            timeout,
-        )
-
-    def wait_for_agent_argv(self, count: int, timeout: float = 15) -> list:
-        """Poll until the shim has recorded at least `count` argv elements.
-
-        The count is REQUIRED, mirroring `wait_for_stdin_hex`, because the shim
-        writes its argv file element by element: polling for "non-empty" can read
-        a half-written file and hand back a short list. That is not theoretical —
-        it was observed live, one leg seeing 3 elements where the other saw 4,
-        which surfaces as a spurious cross-implementation diff rather than as an
-        honest failure. Waiting for the expected LENGTH makes the read
-        deterministic.
-        """
-
-        def recorded():
-            got = self.agent_argv()
-            return got if len(got) >= count else None
-
-        return self._poll(
-            f"the shim agent never recorded {count} argv element(s)", recorded, timeout
-        )
-
-    def wait_for_stdin_hex(self, count: int, timeout: float = 15) -> list:
-        """Poll until the reactive shim has recorded at least `count` bytes."""
-
-        def recorded():
-            got = self.agent_stdin_hex()
-            return got if len(got) >= count else None
-
-        return self._poll(f"the shim never received {count} stdin byte(s)", recorded, timeout)
+        raise AssertionError(f"{self.impl}: {what} within {timeout}s; last={last!r}")
 
     # -- teardown -----------------------------------------------------------
 
@@ -540,76 +364,11 @@ class Rig:
         # kill-server IS the session cleanup: each test gets its own private
         # server, so nothing can leak across tests, and cells may legitimately
         # leave sessions for this reaper. (An earlier "stray rc-*" assert here
-        # was dead code — it ran after kill-server, when sessions() can only read
-        # [] — and arming it would wrongly fail those cells, so it was removed
-        # rather than falsely advertised; C4 review finding.)
+        # was dead code — it ran after kill-server, when the server can only
+        # report no sessions — and arming it would wrongly fail those cells, so
+        # it was removed rather than falsely advertised; C4 review finding.)
         self.tmux("kill-server")
         shutil.rmtree(self.tmux_tmpdir, ignore_errors=True)
-
-
-class Leg(Rig):
-    """One implementation running in its own HOME + tmux server (the ISOLATED
-    flavor). `run()` needs no impl argument — the leg IS the implementation."""
-
-    def __init__(
-        self,
-        impl: str,
-        binary: str,
-        home: Path,
-        tmux_tmpdir: Path,
-        tmux_bin: str,
-        shims: dict | None = None,
-    ):
-        super().__init__(impl, home, tmux_tmpdir, tmux_bin, shims)
-        self.impl = impl
-        self.binary = binary
-
-    def argv_for(self, sub: str, args) -> list:
-        return argv_prefix(self.impl, self.binary) + [sub] + list(args)
-
-    def run(self, sub: str, *args, stdin: str | None = None, timeout: float = 60) -> RunResult:
-        return self._invoke(self.argv_for(sub, args), stdin=stdin, timeout=timeout)
-
-
-class SharedRig(Rig):
-    """BOTH implementations against ONE tmux server and ONE HOME (the SHARED
-    flavor). `run(impl, verb, …)` picks which binary executes the verb.
-
-    Why sharing is not an optional convenience here:
-
-    * **Interop** is the mixed-fleet property itself — a session one binary
-      created is a session the other must be able to read, prompt and kill. Two
-      isolated servers cannot express it: each implementation would only ever see
-      its own sessions, and the cell would prove nothing beyond what the isolated
-      differentials already prove.
-    * **Preseed-in-place** is about ONE file on ONE machine that both binaries
-      merge into, in sequence. The byte-exactness that matters is what the SECOND
-      writer does to the FIRST writer's document, which only exists when the two
-      share a HOME.
-
-    Because both implementations see one server, coexisting sessions must carry
-    DISTINCT pinned slugs (a shared server is exactly where a duplicate slug is
-    an error — see `test_exit_classes.test_duplicate_slug_is_exit_3`)."""
-
-    def __init__(
-        self,
-        label: str,
-        binaries: dict,
-        home: Path,
-        tmux_tmpdir: Path,
-        tmux_bin: str,
-        shims: dict | None = None,
-    ):
-        super().__init__(label, home, tmux_tmpdir, tmux_bin, shims)
-        self.binaries = dict(binaries)
-
-    def argv_for(self, impl: str, sub: str, args) -> list:
-        return argv_prefix(impl, self.binaries[impl]) + [sub] + list(args)
-
-    def run(
-        self, impl: str, sub: str, *args, stdin: str | None = None, timeout: float = 60
-    ) -> RunResult:
-        return self._invoke(self.argv_for(impl, sub, args), stdin=stdin, timeout=timeout)
 
 
 def _fresh_context(tmp_path_factory, name: str) -> tuple:
@@ -618,64 +377,13 @@ def _fresh_context(tmp_path_factory, name: str) -> tuple:
     return home, Path(tempfile.mkdtemp(prefix="rcp-"))
 
 
-@pytest.fixture
-def isolated(binaries, tmux_bin, tmp_path_factory):
-    """The ISOLATED flavor (plan 009 §3.6): `make(impl) -> Leg`, where each
-    implementation gets its OWN tmux server and HOME.
-
-    Independent differentials use this — both legs pass the SAME pinned
-    `--slug`/`--name`, so the two DTOs compare with no slug masking at all. The
-    cross-impl interop and preseed-in-place cells use the `shared` flavor below
-    instead, where one server + one HOME serve both implementations.
-
-    `shims` (the reactive `--wait` variants) applies when the leg is first built;
-    a scenario must pass the same value on both legs, which it does by
-    construction when it is a constant in the test body."""
-    made: dict = {}
-
-    def _leg(impl: str, shims: dict | None = None) -> Leg:
-        if impl not in made:
-            home, tmux_tmpdir = _fresh_context(tmp_path_factory, impl)
-            made[impl] = Leg(impl, binaries[impl], home, tmux_tmpdir, tmux_bin, shims)
-        return made[impl]
-
-    yield _leg
-    for leg in made.values():
-        leg.teardown()
-
-
-@pytest.fixture
-def shared(binaries, tmux_bin, tmp_path_factory):
-    """The SHARED flavor (plan 009 §3.6): `make(name, shims=None) -> SharedRig`
-    — ONE tmux server + ONE HOME that BOTH implementations drive.
-
-    `name` identifies the context, not the implementation: a test that needs two
-    independent shared worlds (a cross-impl chain compared against its mirror; a
-    Go→Rust preseed compared against the pure-Go reference) asks for two names
-    and gets two servers + two HOMEs. Asking for the same name twice returns the
-    same rig, so a scenario can be written straight-line.
-
-    Teardown is the same discipline as `isolated`: every rig built here gets its
-    server killed and its `TMUX_TMPDIR` removed, whatever the test did."""
-    made: dict = {}
-
-    def _rig(name: str = "shared", shims: dict | None = None) -> SharedRig:
-        if name not in made:
-            home, tmux_tmpdir = _fresh_context(tmp_path_factory, name)
-            made[name] = SharedRig(name, binaries, home, tmux_tmpdir, tmux_bin, shims)
-        return made[name]
-
-    yield _rig
-    for rig in made.values():
-        rig.teardown()
-
-
 # --- Goldens ---------------------------------------------------------------
 #
 # Bookkeeping copied from `tests/host-agent-diff/conftest.py` (the template this
-# harness restores the TWO-implementation shape of): a golden per `differential()`
-# call, keyed by the sanitized nodeid, recorded with `UPDATE_GOLDEN=1`, with the
-# one-call-per-test, case-insensitive-collision and stale-sweep guards.
+# harness restores the TWO-implementation shape of): a golden per
+# `hub_differential()` call, keyed by the sanitized nodeid, recorded with
+# `UPDATE_GOLDEN=1`, with the one-call-per-test, case-insensitive-collision and
+# stale-sweep guards.
 
 GOLDENS_DIR = Path(__file__).resolve().parent / "goldens"
 
@@ -750,13 +458,14 @@ def _check_golden(nodeid: str, value) -> None:
 
 
 def pytest_collection_modifyitems(config, items) -> None:
-    # Both golden-pinning fixtures participate in the staleness accounting —
-    # `fixturenames` membership is an exact-name test, so the hub family must be
-    # named explicitly.
+    # `hub_differential` is the ONE golden-pinning fixture left (the one-shot
+    # family's `differential` retired with it in plan 016), and `fixturenames`
+    # membership is an exact-name test — a cell that pins no golden (the wiring
+    # cell) is deliberately not in this set.
     _GOLDEN_SESSION["expected"] = {
         item.nodeid
         for item in items
-        if {"differential", "hub_differential"} & set(getattr(item, "fixturenames", ()))
+        if "hub_differential" in set(getattr(item, "fixturenames", ()))
     }
     opt = config.option
     filtered = bool(
@@ -802,8 +511,8 @@ def pytest_sessionfinish(session, exitstatus) -> None:
         _fail(
             "differential fixture never called",
             [
-                f"{len(uncalled)} test(s) request `differential` but never invoked "
-                "it — no golden was checked:"
+                f"{len(uncalled)} test(s) request `hub_differential` but never "
+                "invoked it — no golden was checked:"
             ]
             + [f"  {n}" for n in uncalled],
         )
@@ -828,46 +537,6 @@ def _dump(value) -> str:
     return json.dumps(value, indent=2, sort_keys=True)
 
 
-def _differential_runner(request, go_label: str, rust_label: str | None):
-    """The body BOTH differential fixtures return: run the scenario against the Go
-    oracle, assert the Rust leg agrees (with a readable diff), then pin the GO
-    value to this test's golden — so a golden always records "the wire shape the
-    implementations agreed on", exactly as `tests/host-agent-diff`'s did before
-    its Go twin was retired.
-
-    `rust_label` is None for a family whose Rust leg does not exist YET: the Go
-    value is still pinned, freezing the wire before any Rust is written. The
-    labels name the binaries in the divergence report."""
-    calls = {"n": 0}
-
-    def _run(scenario):
-        calls["n"] += 1
-        assert calls["n"] == 1, (
-            f"{request.node.nodeid}: differential() called twice in one test. The "
-            "golden key is the nodeid, so the second call would overwrite the "
-            "first's golden — split (or parametrize) the test."
-        )
-        go = canonical(scenario("go"))
-        if rust_label is not None:
-            rust = canonical(scenario("rust"))
-            assert _dump(go) == _dump(rust), (
-                f"Go↔Rust divergence in {request.node.nodeid}:\n"
-                f"--- go ({go_label}) ---\n{_dump(go)}\n"
-                f"--- rust ({rust_label}) ---\n{_dump(rust)}"
-            )
-        _check_golden(request.node.nodeid, go)
-        return go
-
-    return _run
-
-
-@pytest.fixture
-def differential(request):
-    """The one-shot family's differential: `run(scenario) -> value`, where
-    `scenario(impl) -> normalized value`. Both implementations always run."""
-    return _differential_runner(request, "shed-machine-rc", "sx rc")
-
-
 # --- The hub family (plan 010) ---------------------------------------------
 #
 # Resident-daemon differential: each leg runs a REAL hub daemon — Go:
@@ -875,16 +544,15 @@ def differential(request):
 # rc-hub` — on its OWN ephemeral loopback port via the sanctioned
 # `SHED_RC_HUB_ADDR` seam, with IDENTICAL fast-tick tuning overrides so no cell
 # ever settle-and-compares. The overrides go on the DAEMON subprocess env only,
-# never `os.environ`, so the one-shot cells cannot inherit them. `_clean_env`'s
-# `SHED_RC_NO_HUB=1` is correct here and kept: it gates create-time ensure only,
-# never an explicit `serve`, and the `hub_port_guard` stays green because every
-# hub binds an ephemeral port, not 1029.
+# never `os.environ`. `_clean_env`'s `SHED_RC_NO_HUB=1` is correct here and kept:
+# it gates create-time ensure only, never an explicit `serve`, and the
+# `hub_port_guard` stays green because every hub binds an ephemeral port, not
+# 1029.
 #
-# PHASING: from H12 both legs run and every cell is equality-then-pin — the
-# H1½..H11 goldens (recorded from the Go hub alone) are the frozen wire the
-# Rust hub now has to match before anything is (re)pinned.
-
-HUB_RUST_LIVE = True
+# Since plan 016 the two legs share ONE stimulus (the Go oracle CLI), so the
+# daemon is the differential's only controlled variable — which is why the leg's
+# CLI argv and its DAEMON argv are two independent values, and why the daemon
+# identity is asserted in `start_hub` rather than inferred from `impl`.
 
 # Fast ticks for the differential (both legs ALWAYS get the same values):
 # active/idle drive reconcile latency; idle-exit is pinned LARGE-FINITE because
@@ -907,37 +575,55 @@ def _free_loopback_port() -> int:
         return sock.getsockname()[1]
 
 
+# The daemon each leg MUST be running, by binary basename. This is the wiring
+# assertion's ground truth: since both legs share one CLI stimulus, a Rust leg
+# that silently started the Go daemon would still pass all 38 goldens.
+HUB_DAEMON_NAMES = {"go": "shed-machine-rc", "rust": "shed-host-agent"}
+
+
 class HubLeg(Leg):
     """A `Leg` plus a resident hub daemon bound to an ephemeral loopback port.
 
+    The leg carries TWO complete, independent argv values: the inherited `cli`
+    prefix (the session-creation stimulus — the Go oracle on BOTH legs since plan
+    016) and `hub_argv` (the daemon this leg's `/v1` answers come from, which is
+    what the differential actually varies). Neither is derived from the other or
+    from `impl` — `impl` names the leg (in messages and its context dir) and is
+    the key `start_hub` CHECKS `hub_argv` against, never a value it builds from.
+
     The daemon shares the leg's hermetic env (HOME, TMUX_TMPDIR, constructed
     PATH) so it observes exactly the sessions this leg's CLI creates. Its
-    stdout/stderr go to `$HOME/hub.log` for post-mortems."""
+    stdout/stderr go to `$HOME/hub.log` for post-mortems, under a first line
+    recording the argv it was actually launched with."""
 
-    def __init__(self, *args, hub_binary: str | None = None, **kwargs):
+    def __init__(self, *args, hub_argv: list, **kwargs):
         super().__init__(*args, **kwargs)
         self.hub_port = _free_loopback_port()
         self.hub_addr = f"127.0.0.1:{self.hub_port}"
-        # The DAEMON binary. Go's hub lives inside the CLI binary
-        # (`shed-machine-rc serve`); the Rust hub lives in the host-agent
-        # (`shed-host-agent rc-hub`) while the CLI half of this leg stays sx.
-        self.hub_binary = hub_binary or self.binary
+        self.hub_argv = list(hub_argv)
         self._hub_proc: subprocess.Popen | None = None
         self._hub_log = None
 
-    def _hub_argv(self) -> list:
-        if self.impl == "go":
-            return [self.hub_binary, "serve", "--foreground"]
-        return [self.hub_binary, "rc-hub"]
-
     def start_hub(self) -> None:
-        assert self._hub_proc is None, f"{self.label}: hub already started"
+        assert self._hub_proc is None, f"{self.impl}: hub already started"
+        # ASSERT the wiring, never infer it. The goldens cannot see which daemon
+        # answered — both legs are stimulated by the same CLI — so this is the
+        # only place a mis-wired leg is caught at the source.
+        expected = HUB_DAEMON_NAMES[self.impl]
+        assert Path(self.hub_argv[0]).name == expected, (
+            f"{self.impl}: the {self.impl} leg must run the {expected} daemon, "
+            f"not {self.hub_argv!r}"
+        )
         env = dict(self.env)
         env["SHED_RC_HUB_ADDR"] = self.hub_addr
         env.update(HUB_TUNING)
         self._hub_log = open(self.home / "hub.log", "wb")
+        # The argv header: a saved run log then shows WHICH daemon each leg ran,
+        # which pass output never prints (labels appear only on divergence).
+        self._hub_log.write(f"# daemon argv: {self.hub_argv}\n".encode())
+        self._hub_log.flush()
         self._hub_proc = subprocess.Popen(
-            self._hub_argv(),
+            self.hub_argv,
             env=env,
             stdout=self._hub_log,
             stderr=self._hub_log,
@@ -948,7 +634,7 @@ class HubLeg(Leg):
         def healthy():
             if self._hub_proc.poll() is not None:
                 raise AssertionError(
-                    f"{self.label}: hub exited {self._hub_proc.returncode} before "
+                    f"{self.impl}: hub exited {self._hub_proc.returncode} before "
                     f"ready — see {self.home / 'hub.log'}:\n"
                     f"{(self.home / 'hub.log').read_text()}"
                 )
@@ -1009,14 +695,14 @@ class HubLeg(Leg):
         try:
             conn.request("GET", "/v1/events")
             resp = conn.getresponse()
-            assert resp.status == 200, f"{self.label}: /v1/events status {resp.status}"
+            assert resp.status == 200, f"{self.impl}: /v1/events status {resp.status}"
             deadline = time.monotonic() + timeout
 
             def read_line() -> str:
                 nonlocal buf
                 while b"\n" not in buf:
                     assert time.monotonic() < deadline, (
-                        f"{self.label}: {what} — read {len(events)} events before "
+                        f"{self.impl}: {what} — read {len(events)} events before "
                         f"the deadline: {events!r}"
                     )
                     try:
@@ -1026,7 +712,7 @@ class HubLeg(Leg):
                         # the deadline assert above be the one that speaks.
                         continue
                     if not chunk:
-                        raise AssertionError(f"{self.label}: SSE stream ended early")
+                        raise AssertionError(f"{self.impl}: SSE stream ended early")
                     buf += chunk
                 line, _, buf = buf.partition(b"\n")
                 return line.decode().rstrip("\r")
@@ -1034,7 +720,7 @@ class HubLeg(Leg):
             if on_subscribed is not None:
                 opener = read_line()
                 assert opener == ": ok", (
-                    f"{self.label}: the stream must open with the literal "
+                    f"{self.impl}: the stream must open with the literal "
                     f"`: ok` comment, got {opener!r}"
                 )
                 read_line()  # its trailing blank line
@@ -1047,7 +733,7 @@ class HubLeg(Leg):
             name, data_lines = None, []
             while not predicate(events):
                 assert time.monotonic() < deadline, (
-                    f"{self.label}: {what} — read {len(events)} events before the "
+                    f"{self.impl}: {what} — read {len(events)} events before the "
                     f"deadline: {events!r}"
                 )
                 text = read_line()
@@ -1127,7 +813,7 @@ class HubLeg(Leg):
                 self._hub_log.close()
                 self._hub_log = None
         # The port must actually be free — a lingering holder would poison the
-        # next cell's bind (and mirrors the one-shot suite's 1029 guard).
+        # next cell's bind (and mirrors the session-scoped 1029 guard).
         self._poll(
             f"nothing released {self.hub_addr} after the hub stopped",
             lambda: not _port_in_use(self.hub_port),
@@ -1144,9 +830,24 @@ class HubLeg(Leg):
 
 @pytest.fixture
 def hub_leg(binaries, tmux_bin, tmp_path_factory):
-    """`make(impl, shims=None) -> HubLeg` — an isolated leg with its resident hub
-    already healthy. Mirrors the `isolated` flavor: one context per impl."""
+    """`make(impl, shims=None) -> HubLeg` — one leg (its own HOME + tmux server)
+    with its resident hub already healthy. At most one leg per impl.
+
+    The two legs' argvs, spelled out in full rather than derived:
+
+    * **cli** — the Go oracle on BOTH legs. `sx rc` was the Rust leg's stimulus
+      until plan 016 (S7) sunset the crate; the surviving hub cells only ever
+      invoke `create`, and the one-shot family proved the two engines wire-
+      identical there, so a single stimulus costs the hub differential nothing
+      and isolates it on the daemon.
+    * **hub** — the daemon under test: `shed-machine-rc serve --foreground` vs
+      `shed-host-agent rc-hub`. `start_hub` asserts each leg got the right one."""
     made: dict = {}
+    oracle = binaries["go"]
+    hub_argvs = {
+        "go": [oracle, "serve", "--foreground"],
+        "rust": [binaries["rust_hub"], "rc-hub"],
+    }
 
     def _leg(impl: str, shims: dict | None = None) -> HubLeg:
         if impl not in made:
@@ -1156,12 +857,12 @@ def hub_leg(binaries, tmux_bin, tmp_path_factory):
             # outlive the pytest process on its port, log handle open.
             leg = HubLeg(
                 impl,
-                binaries[impl],
+                [oracle],
                 home,
                 tmux_tmpdir,
                 tmux_bin,
                 shims,
-                hub_binary=binaries["rust_hub"] if impl == "rust" else None,
+                hub_argv=hub_argvs[impl],
             )
             made[impl] = leg
             leg.start_hub()
@@ -1174,18 +875,43 @@ def hub_leg(binaries, tmux_bin, tmp_path_factory):
         try:
             leg.teardown()
         except Exception as exc:  # noqa: BLE001 - reported below, never swallowed
-            errors.append(f"{leg.label}: {exc}")
+            errors.append(f"{leg.impl}: {exc}")
     assert not errors, "hub leg teardown failed: " + "; ".join(errors)
 
 
 @pytest.fixture
 def hub_differential(request):
     """The hub family's differential (see the section comment above):
-    `run(scenario) -> value` where `scenario(impl) -> normalized value`. Both
-    legs run (equality-then-pin) since H12; the golden always records the Go
-    oracle — the wire the H1½ Go-only phase froze."""
-    return _differential_runner(
-        request,
-        "shed-machine-rc serve",
-        "shed-host-agent rc-hub" if HUB_RUST_LIVE else None,
-    )
+    `run(scenario) -> value` where `scenario(impl) -> normalized value`.
+
+    Run the scenario against the Go oracle's hub, assert the Rust hub agrees
+    (with a readable diff naming both DAEMONS — what differs), then pin the GO
+    value to this test's golden, so a golden always records "the wire shape the
+    implementations agreed on", exactly as `tests/host-agent-diff`'s did before
+    its Go twin was retired.
+
+    BOTH legs ALWAYS run (equality-then-pin) since H12, and there is deliberately
+    no switch back to the Go-only mode the H1½ phase froze the wire under: with
+    one shared stimulus, a suite that can silently drop the Rust comparison is a
+    suite that stays green while proving nothing (plan 016 §3.4)."""
+    go_label, rust_label = "shed-machine-rc serve", "shed-host-agent rc-hub"
+    calls = {"n": 0}
+
+    def run(scenario):
+        calls["n"] += 1
+        assert calls["n"] == 1, (
+            f"{request.node.nodeid}: hub_differential() called twice in one test. "
+            "The golden key is the nodeid, so the second call would overwrite the "
+            "first's golden — split (or parametrize) the test."
+        )
+        go = canonical(scenario("go"))
+        rust = canonical(scenario("rust"))
+        assert _dump(go) == _dump(rust), (
+            f"Go↔Rust divergence in {request.node.nodeid}:\n"
+            f"--- go ({go_label}) ---\n{_dump(go)}\n"
+            f"--- rust ({rust_label}) ---\n{_dump(rust)}"
+        )
+        _check_golden(request.node.nodeid, go)
+        return go
+
+    return run
