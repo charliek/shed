@@ -5,7 +5,8 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "build": "tsc --noEmit && vite build",
+    "test": "tsc src/lib/newest.ts --outDir dist-test --target ES2020 --module ES2020 --moduleResolution bundler --strict --removeComments && node --test test/newest.test.mjs",
+    "build": "tsc --noEmit && npm run test && vite build",
     "preview": "vite preview"
   },
   "dependencies": {

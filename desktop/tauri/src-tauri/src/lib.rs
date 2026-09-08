@@ -376,9 +376,16 @@ async fn machine_launch(
 // A failure crosses as its `error.code` and message joined, because a Tauri
 // command's error channel is a bare string: `bridge.ts` splits on the first ": "
 // to recover the code. The socket ops keep the structured envelope.
+//
+// EVERY failure, including the ones the grammar raises before a `Lanes` op is
+// reached. `lane::parse_mode`/`parse_answer` answer with a typed
+// [`lane::LaneFailure`] precisely so this door cannot `?` a bare string through
+// and lose the `bad_request` code that the socket door supplies for the same
+// input — `bridge.ts` would then be splitting a code out of whatever the parse
+// message happened to contain.
 
 /// One lane failure as a string a `#[tauri::command]` can return.
-fn lane_error(failure: lane::LaneFailure) -> String {
+pub(crate) fn lane_error(failure: lane::LaneFailure) -> String {
     format!("{}: {}", failure.code(), failure.message())
 }
 
@@ -421,7 +428,7 @@ async fn lane_send(
     text: String,
     mode: Option<String>,
 ) -> Result<serde_json::Value, String> {
-    let mode = lane::parse_mode(mode.as_deref())?;
+    let mode = lane::parse_mode(mode.as_deref()).map_err(lane_error)?;
     lanes
         .send(&machine, &session_id, &text, mode)
         .await
@@ -451,7 +458,7 @@ async fn lane_answer(
     approval_id: String,
     answer: serde_json::Value,
 ) -> Result<serde_json::Value, String> {
-    let answer = lane::parse_answer(&answer)?;
+    let answer = lane::parse_answer(&answer).map_err(lane_error)?;
     lanes
         .answer(&machine, &session_id, &approval_id, answer)
         .await

@@ -134,7 +134,12 @@ tauri-bundle-mac: sparkle-framework  ## Build + sign the Tauri mac app -> build/
 tauri-dmg-mac: tauri-bundle-mac  ## Tauri mac bundle + drag-install DMG (reuses make-dmg.sh; clobbers the Swift `dmg` outputs)
 	./scripts/make-dmg.sh
 
-tauri-ui-build:  ## Build the Vite/React frontend bundle (tauri/ui/dist)
+tauri-ui-build:  ## Type-check + unit-test + build the Vite/React frontend bundle (tauri/ui/dist)
+	# `npm run build` is tsc --noEmit, then `npm run test` (node's own runner over
+	# the frontend's pure helpers — no framework, nothing new in the lock), then
+	# vite. The test leg rides here rather than in a target of its own so every
+	# path that produces the bundle (this, the Docker legs, `make deb`, CI's
+	# direct `npm run build`) runs it.
 	cd tauri/ui && npm run build
 
 tauri-build: tauri-ui-build  ## Build the Tauri client: the frontend bundle + the standalone Rust workspace

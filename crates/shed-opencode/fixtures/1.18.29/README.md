@@ -2,8 +2,13 @@
 
 > **The regeneration recipe lives one directory up, in `fixtures/README.md`** —
 > it is the single place that says which golden carries which claim, which step
-> needs a live server and which is offline. This file is only the provenance card
-> for the raw wire recording.
+> needs a live server and which is offline. This file describes the raw wire
+> recording.
+>
+> **Hand-maintained.** A re-record writes its generated card to `PROVENANCE.md`
+> beside this file and leaves this one alone — most of what is below (the frame
+> count, the event inventory, what `fold.golden.json` is) is not something a
+> recording run can know.
 
 Recorded by `crates/shed-opencode/tests/live.rs` on 2026-09-08 with:
 

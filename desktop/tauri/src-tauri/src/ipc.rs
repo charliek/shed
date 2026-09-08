@@ -1085,7 +1085,7 @@ impl Handler {
         let (machine, session_id) = lane_target(params)?;
         let text = req_str(params, "text")?.to_string();
         let mode = crate::lane::parse_mode(params.get("mode").and_then(Value::as_str))
-            .map_err(|e| err("bad_request", e))?;
+            .map_err(lane_err)?;
         self.lanes
             .send(&machine, &session_id, &text, mode)
             .await
@@ -1111,7 +1111,7 @@ impl Handler {
         let answer = params
             .get("answer")
             .ok_or_else(|| err("bad_request", "missing 'answer'"))?;
-        let answer = crate::lane::parse_answer(answer).map_err(|e| err("bad_request", e))?;
+        let answer = crate::lane::parse_answer(answer).map_err(lane_err)?;
         self.lanes
             .answer(&machine, &session_id, &approval_id, answer)
             .await
@@ -1733,6 +1733,90 @@ mod tests {
     use shed_app::HostFailure;
     use shed_core::http::ShedError;
     use std::path::PathBuf;
+
+    // -- the two lane doors ---------------------------------------------------
+
+    /// `bridge.ts`'s `laneFailure`, transcribed: split on the FIRST `": "`, and
+    /// take the prefix as the code only if it looks like one (`LANE_CODE`,
+    /// `^[a-z][a-z_]*$`); anything else means the whole string is the message.
+    ///
+    /// It is duplicated here rather than described, because what these cells are
+    /// about is whether the two doors survive THIS rule — a rule the frontend
+    /// applies to the command door's bare string and the socket door never needs.
+    fn recover(raw: &str) -> (String, String) {
+        match raw.split_once(": ") {
+            Some((code, message))
+                if code.starts_with(|c: char| c.is_ascii_lowercase())
+                    && code.chars().all(|c| c.is_ascii_lowercase() || c == '_') =>
+            {
+                (code.to_string(), message.to_string())
+            }
+            _ => ("failed".to_string(), raw.to_string()),
+        }
+    }
+
+    /// **Review finding: the two IPC doors disagreed on the same input.** A
+    /// `lane.*` refusal reaches the socket as `{code, message}` and reaches the
+    /// `#[tauri::command]` twin as `code + ": " + message`. The grammar refusals
+    /// (`parse_mode`, `parse_answer`) used to skip that join on the command door
+    /// — the same malformed answer was `bad_request` through the socket and an
+    /// uncoded `failed` through the command.
+    #[test]
+    fn both_lane_doors_answer_a_malformed_input_with_the_same_code() {
+        let bad_answers = [
+            json!({"question": "yes"}),
+            json!({"question": [["yes"], "no"]}),
+            json!({"permission": "maybe"}),
+            json!({"permission": 3}),
+            json!({"reject": false}),
+            json!({}),
+            json!({"permission": "reject", "question": [["yes"]]}),
+        ];
+        for bad in bad_answers {
+            let socket =
+                lane_err(crate::lane::parse_answer(&bad).expect_err("this answer is malformed"));
+            let command = recover(&crate::lane_error(
+                crate::lane::parse_answer(&bad).expect_err("this answer is malformed"),
+            ));
+            assert_eq!(
+                socket.0, "bad_request",
+                "the socket door lost the code on {bad}"
+            );
+            assert_eq!(
+                command, socket,
+                "the two doors disagree on {bad}: command={command:?} socket={socket:?}"
+            );
+        }
+
+        for bad in ["later", "  interject please", "QUEUE"] {
+            let socket = lane_err(crate::lane::parse_mode(Some(bad)).expect_err("a bad mode"));
+            let command = recover(&crate::lane_error(
+                crate::lane::parse_mode(Some(bad)).expect_err("a bad mode"),
+            ));
+            assert_eq!(socket.0, "bad_request");
+            assert_eq!(command, socket, "the two doors disagree on mode {bad:?}");
+        }
+    }
+
+    /// The other half of the same finding: the code the frontend recovers is
+    /// always OURS. A refusal whose MESSAGE happens to be shaped like a coded
+    /// failure — `parse_answer`'s `question` refusal embeds a serde error and
+    /// therefore a `": "` — must not have a code read out of it.
+    #[test]
+    fn a_lane_message_that_looks_coded_does_not_mint_a_code() {
+        for message in [
+            "already_resolved: someone else answered it",
+            "`question` must be a list of lists of option ids: invalid type:              string \"yes\", expected a sequence",
+            "no colon here at all",
+        ] {
+            let raw = crate::lane_error(crate::lane::LaneFailure::bad_request(message.to_string()));
+            assert_eq!(
+                recover(&raw),
+                ("bad_request".to_string(), message.to_string()),
+                "a parse message minted its own code out of {message:?}"
+            );
+        }
+    }
 
     /// A `Reachability` as `Backend::refresh()` would return it, without needing a
     /// live backend: `sheds` decoded from the wire shape, `host_errors` built

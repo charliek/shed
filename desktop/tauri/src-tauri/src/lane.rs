@@ -191,6 +191,19 @@ pub enum LaneFailure {
 }
 
 impl LaneFailure {
+    /// A refusal from [`parse_answer`] / [`parse_mode`], as the failure BOTH IPC
+    /// doors carry it.
+    ///
+    /// It exists so the two doors cannot drift: the socket answers with the
+    /// envelope's `code` field and the `#[tauri::command]` twin answers with
+    /// `code + ": " + message` in a bare string, and both get the code from
+    /// here. A parse refusal that crossed as a bare message lost `bad_request`
+    /// on the command door and left `bridge.ts` to guess a code out of the
+    /// message's own punctuation.
+    pub fn bad_request(message: String) -> LaneFailure {
+        LaneFailure::Lane(LaneError::BadRequest(message))
+    }
+
     /// The IPC envelope's `error.code`.
     pub fn code(&self) -> &'static str {
         match self {
@@ -297,9 +310,27 @@ impl LaneView {
             LaneEvent::Message { message, .. } => self.target().push(message.clone()),
             LaneEvent::Session { session } => self.target().session = Some(session.clone()),
             LaneEvent::Approval { approval } => {
-                self.target()
+                let target = self.target();
+                // Last-write-wins, then DROP what is no longer waiting on the
+                // human. A generation can run for days, and every ask that ever
+                // resolved inside it used to stay in this map with its whole
+                // payload and `request_json` — nothing reads a non-pending entry
+                // (`approvals()` filters to `is_pending`), so keeping one buys
+                // nothing and costs the transcript of every tool call the agent
+                // ever asked about.
+                //
+                // Written as insert-then-drop rather than "only insert pending"
+                // because the two differ on the case that matters: a `resolved`
+                // for an id this view holds as `pending` must REPLACE it, not be
+                // ignored. A later `pending` for the same id re-inserts it — an
+                // id the agent re-opens is a new ask, and this is the same
+                // last-write-wins rule it always was.
+                target
                     .approvals
                     .insert(approval.id.clone(), approval.clone());
+                if !approval.status.is_pending() {
+                    target.approvals.remove(&approval.id);
+                }
             }
             LaneEvent::Ready { .. } => {
                 if let Some(staged) = self.staged.take() {
@@ -528,6 +559,48 @@ impl Drop for PendingGuard {
     }
 }
 
+/// The per-key open gate ([`Lanes::gates`]), held for as long as one `open`
+/// needs it and REMOVED from the map when the last holder lets go.
+///
+/// The map is keyed by two caller-supplied strings that arrive over IPC, so
+/// "created on first use, never removed" is a leak anyone who can call
+/// `lane.open` can drive: junk keys, or the real ones of a machine whose tabs
+/// churn, retain an entry for the life of the process. It is RAII instead, and
+/// the removal rule is exactly "nobody else wants this gate" — the map's own
+/// reference plus this guard's and no other.
+struct GateGuard {
+    gates: Arc<Mutex<Gates>>,
+    key: Key,
+    gate: Arc<tokio::sync::Mutex<()>>,
+}
+
+impl GateGuard {
+    /// Serialize against every other open for this key.
+    async fn lock(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.gate.lock().await
+    }
+}
+
+impl Drop for GateGuard {
+    fn drop(&mut self) {
+        let mut gates = lock(&self.gates);
+        // Two references — the map's and ours — means no other open holds or is
+        // waiting on this gate, so removing it cannot let a later open past a
+        // gate someone is still standing behind. Any other count means a waiter
+        // exists and the entry stays; that waiter's own guard does the removal.
+        //
+        // Checked under the same lock `gate()` clones under, so a `gate()` that
+        // is about to bump the count cannot slip between the check and the
+        // removal.
+        if gates
+            .get(&self.key)
+            .is_some_and(|g| Arc::strong_count(g) == 2)
+        {
+            gates.remove(&self.key);
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // one open lane
 // ---------------------------------------------------------------------------
@@ -589,6 +662,9 @@ struct Inner {
     pending: HashMap<Key, Pending>,
 }
 
+/// The open gates, by key. See [`Lanes::gates`] and [`GateGuard`].
+type Gates = HashMap<Key, Arc<tokio::sync::Mutex<()>>>;
+
 /// Where a lane frame goes on its way to the UI.
 ///
 /// A closure rather than the [`AppHandle`] itself so the ownership rules below
@@ -611,7 +687,12 @@ pub struct Lanes {
     ///
     /// It serialises opens against each OTHER; it says nothing about `close` and
     /// `reconcile`, which is what [`Pending`] is for.
-    gates: Mutex<HashMap<Key, Arc<tokio::sync::Mutex<()>>>>,
+    ///
+    /// **Transient.** An entry lives only while an open holds or waits on it
+    /// ([`GateGuard`]) — the keys are caller-supplied strings off an IPC socket,
+    /// and a map that only grows is a leak reachable by anyone who can name a
+    /// machine and a session.
+    gates: Arc<Mutex<Gates>>,
 }
 
 impl Lanes {
@@ -636,7 +717,7 @@ impl Lanes {
             sink,
             machines,
             inner: Arc::new(Mutex::new(Inner::default())),
-            gates: Mutex::new(HashMap::new()),
+            gates: Arc::new(Mutex::new(Gates::new())),
         }
     }
 
@@ -656,9 +737,20 @@ impl Lanes {
     /// that was closed or evicted while it was in flight.
     pub async fn open(&self, machine: &str, session_id: &str) -> Result<Value, LaneFailure> {
         let key = (machine.to_string(), session_id.to_string());
+        // The row is resolved BEFORE a gate is registered for the key. Both IPC
+        // doors take `machine` and `session_id` as free strings, so a call that
+        // names nothing real must not be able to make this app remember it:
+        // `lane.open` with junk (or with the session ids of a machine whose tabs
+        // churn) used to mint a gate per call and keep it for the life of the
+        // process.
+        self.lane_url(machine, session_id)?;
         let gate = self.gate(&key);
         let _serialized = gate.lock().await;
 
+        // Re-resolved under the gate, and this is the value everything below
+        // uses: the pre-gate one was read before waiting, and waiting is exactly
+        // when a tab restarts onto a new port or goes away. Using it would open
+        // a lane against a socket the snapshot has already retired.
         let server_url = self.lane_url(machine, session_id)?;
         if let Some(entry) = self.entry(&key) {
             if entry.server_url == server_url {
@@ -840,16 +932,20 @@ impl Lanes {
         }
     }
 
-    /// The per-key open gate, created on first use.
-    fn gate(&self, key: &Key) -> Arc<tokio::sync::Mutex<()>> {
+    /// The per-key open gate, created on first use and dropped by the last
+    /// holder. See [`GateGuard`].
+    fn gate(&self, key: &Key) -> GateGuard {
         let mut gates = lock(&self.gates);
-        // The map is bounded by the number of (machine, session) pairs this app
-        // has ever opened a panel on, which is the same order as the row set.
-        Arc::clone(
+        let gate = Arc::clone(
             gates
                 .entry(key.clone())
                 .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))),
-        )
+        );
+        GateGuard {
+            gates: Arc::clone(&self.gates),
+            key: key.clone(),
+            gate,
+        }
     }
 
     fn entry(&self, key: &Key) -> Option<Arc<LaneEntry>> {
@@ -1169,44 +1265,85 @@ fn remote_port(server_url: &str) -> Result<u16, LaneFailure> {
 /// STRICT, like the contract's own [`LaneAnswer`]: an answer is a command, and a
 /// shape this build cannot name must be refused rather than degraded into
 /// something the user did not ask for.
-pub fn parse_answer(value: &Value) -> Result<LaneAnswer, String> {
+///
+/// The refusal is a [`LaneFailure`] rather than a bare string ON PURPOSE: a bare
+/// string is exactly what a `#[tauri::command]`'s error channel is, so `?` on it
+/// compiled and silently dropped the `bad_request` code that the socket door
+/// supplies for the identical input. With a typed refusal neither door can lose
+/// it — the command one will not compile without saying how it is spelled.
+///
+/// **Exactly one form.** The keys are counted before any of them is read, so a
+/// payload naming two — `{"permission": "reject", "question": [["yes"]]}` — is
+/// refused instead of resolving as whichever the code happened to check first
+/// and silently discarding the other half. An answer RESOLVES an approval; a
+/// client that sent two of them has to be told which one did not happen.
+pub fn parse_answer(value: &Value) -> Result<LaneAnswer, LaneFailure> {
+    /// The answer forms, and the whole vocabulary this refusal counts.
+    const FORMS: [&str; 3] = ["permission", "question", "reject"];
+    let named: Vec<&str> = FORMS
+        .into_iter()
+        .filter(|form| value.get(form).is_some())
+        .collect();
+    match named.as_slice() {
+        [_one] => {}
+        [] => {
+            return Err(LaneFailure::bad_request(
+                "answer must be {permission: …}, {question: [[…]]} or {reject: true}".to_string(),
+            ))
+        }
+        several => {
+            return Err(LaneFailure::bad_request(format!(
+                "an answer names exactly one of permission, question or reject; \
+                 this one names {}",
+                several.join(" and ")
+            )))
+        }
+    }
+
     if let Some(decision) = value.get("permission") {
         let decision = decision
             .as_str()
-            .ok_or("`permission` must be a string")?
+            .ok_or_else(|| LaneFailure::bad_request("`permission` must be a string".to_string()))?
             .trim();
         let decision = match decision {
             "allow-once" => LaneDecision::AllowOnce,
             "allow-always" => LaneDecision::AllowAlways,
             "reject" => LaneDecision::Reject,
             other => {
-                return Err(format!(
+                return Err(LaneFailure::bad_request(format!(
                     "unknown permission decision {other:?} \
                      (want allow-once, allow-always or reject)"
-                ))
+                )))
             }
         };
         return Ok(LaneAnswer::Permission { decision });
     }
     if let Some(answers) = value.get("question") {
-        let answers: Vec<Vec<String>> = serde_json::from_value(answers.clone())
-            .map_err(|e| format!("`question` must be a list of lists of option ids: {e}"))?;
+        let answers: Vec<Vec<String>> = serde_json::from_value(answers.clone()).map_err(|e| {
+            LaneFailure::bad_request(format!(
+                "`question` must be a list of lists of option ids: {e}"
+            ))
+        })?;
         return Ok(LaneAnswer::Question { answers });
     }
-    if value.get("reject").and_then(Value::as_bool) == Some(true) {
-        return Ok(LaneAnswer::Reject);
+    match value.get("reject").and_then(Value::as_bool) {
+        Some(true) => Ok(LaneAnswer::Reject),
+        // `{"reject": false}` is not "do nothing", it is a client that meant
+        // something this grammar cannot express.
+        _ => Err(LaneFailure::bad_request(
+            "`reject` must be the literal true".to_string(),
+        )),
     }
-    Err("answer must be {permission: …}, {question: [[…]]} or {reject: true}".to_string())
 }
 
 /// Decode the optional `mode` of `lane.send`.
-pub fn parse_mode(value: Option<&str>) -> Result<SendMode, String> {
+pub fn parse_mode(value: Option<&str>) -> Result<SendMode, LaneFailure> {
     match value.map(str::trim).unwrap_or("queue") {
         "queue" | "" => Ok(SendMode::Queue),
         "interject" => Ok(SendMode::Interject),
-        other => Err(format!(
+        other => Err(LaneFailure::bad_request(format!(
             "unknown send mode {other:?} (want queue or interject)"
-        )),
+        ))),
     }
 }
 
@@ -1409,6 +1546,60 @@ mod tests {
         assert_eq!(ids, ["per_2"]);
     }
 
+    /// **Review finding: resolved approvals accumulated without bound.** A
+    /// generation ends only at a `Reset`, and a healthy
+    /// lane can run for days without one — so every approval that RESOLVED
+    /// inside it used to stay in the snapshot forever, whole payload and
+    /// `request_json` included, invisible to every reader.
+    #[test]
+    fn a_resolved_approval_is_dropped_and_a_reopened_one_comes_back() {
+        let mut view = LaneView::default();
+        let resolutions = [
+            LaneApprovalStatus::Resolved,
+            LaneApprovalStatus::Submitted,
+            LaneApprovalStatus::Other("cancelled".into()),
+        ];
+        for i in 0..300 {
+            let id = format!("per_{i}");
+            view.apply(&LaneEvent::Approval {
+                approval: approval(&id, LaneApprovalStatus::Pending),
+            });
+            assert_eq!(
+                view.live.approvals.len(),
+                1,
+                "an ask the agent is waiting on must be held"
+            );
+            view.apply(&LaneEvent::Approval {
+                approval: approval(&id, resolutions[i % resolutions.len()].clone()),
+            });
+            assert_eq!(
+                view.live.approvals.len(),
+                0,
+                "{id} was still held after it stopped waiting on anyone"
+            );
+        }
+
+        // A resolution for an id this view never saw pending is not a way to
+        // plant one either.
+        view.apply(&LaneEvent::Approval {
+            approval: approval("never_asked", LaneApprovalStatus::Resolved),
+        });
+        assert!(view.live.approvals.is_empty());
+
+        // Dropping is not forgetting: the agent re-opening an id it already
+        // resolved is a NEW ask, and it has to render.
+        view.apply(&LaneEvent::Approval {
+            approval: approval("per_7", LaneApprovalStatus::Pending),
+        });
+        let ids: Vec<String> = view.approvals()["approvals"]
+            .as_array()
+            .expect("approvals is a list")
+            .iter()
+            .map(|a| a["id"].as_str().unwrap_or_default().to_string())
+            .collect();
+        assert_eq!(ids, ["per_7"]);
+    }
+
     /// Every [`LaneError`] variant has a distinct snake_case code, and `no_lane`
     /// is ours.
     #[test]
@@ -1469,6 +1660,39 @@ mod tests {
         assert!(parse_answer(&json!({"question": "yes"})).is_err());
         assert!(parse_answer(&json!({"reject": false})).is_err());
         assert!(parse_answer(&json!({})).is_err());
+    }
+
+    /// **Review finding: an answer naming two forms was guessed at, not
+    /// refused.** The forms used to be TRIED in order, so a payload
+    /// naming two resolved as whichever was checked first and threw the other
+    /// half away — the one thing the function's own doc says it must not do. An
+    /// answer resolves an approval; a client that sent two has to be told.
+    #[test]
+    fn an_answer_that_names_two_forms_is_refused_not_guessed() {
+        for ambiguous in [
+            json!({"permission": "reject", "question": [["yes"]]}),
+            json!({"question": [["yes"]], "permission": "reject"}),
+            json!({"permission": "allow-once", "reject": true}),
+            json!({"question": [["yes"]], "reject": true}),
+            json!({"permission": "allow-once", "question": [["yes"]], "reject": true}),
+        ] {
+            let failure = parse_answer(&ambiguous)
+                .err()
+                .unwrap_or_else(|| panic!("{ambiguous} names two answers and must be refused"));
+            assert_eq!(failure.code(), "bad_request");
+            assert!(
+                failure.message().contains("exactly one"),
+                "the refusal must say what is wrong: {}",
+                failure.message()
+            );
+        }
+        // …and each single form still parses, so the count did not become a
+        // blanket refusal. A key that is NOT one of the three is not counted:
+        // `{permission, note}` is still one answer.
+        assert!(parse_answer(&json!({"permission": "reject"})).is_ok());
+        assert!(parse_answer(&json!({"question": [["yes"]]})).is_ok());
+        assert!(parse_answer(&json!({"reject": true})).is_ok());
+        assert!(parse_answer(&json!({"permission": "reject", "note": "hi"})).is_ok());
     }
 
     #[test]
@@ -1745,6 +1969,77 @@ mod tests {
                 .then_some(())
         })
         .await;
+    }
+
+    /// **Review finding: the gate map was an IPC-reachable leak.** The per-key
+    /// open gate used to be created on first use and never removed, and its keys
+    /// are two caller-supplied strings: `lane.open` on either IPC door with junk
+    /// — or with the real session ids of a machine whose tabs churn — retained an
+    /// entry for the life of the process.
+    ///
+    /// The rule the fix pins: a gate exists only while an open holds or waits on
+    /// it. A row that resolves to nothing never mints one at all (the row is
+    /// resolved BEFORE the key is registered), and a real open gives its own
+    /// back on the way out.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn opens_leave_no_gate_behind() {
+        let fake = one_session("ses_a").await;
+        let (lanes, _log, _events) = lanes_for(&fake, &["ses_a"]);
+
+        for i in 0..64 {
+            // A machine this app has never heard of …
+            let failure = lanes
+                .open("no-such-machine", &format!("ses_{i}"))
+                .await
+                .expect_err("a machine with no rows has no lane");
+            assert_eq!(failure.code(), "no_lane", "{}", failure.message());
+            // … and a real one whose rows do not name this session (the churn
+            // case: yesterday's tab ids, replayed).
+            let failure = lanes
+                .open(MACHINE, &format!("churned_{i}"))
+                .await
+                .expect_err("a session with no row has no lane");
+            assert_eq!(failure.code(), "no_lane", "{}", failure.message());
+        }
+        assert!(
+            lock(&lanes.gates).is_empty(),
+            "{} gates were retained for lanes that never existed",
+            lock(&lanes.gates).len()
+        );
+
+        // A REAL open, and its close, likewise.
+        lanes.open(MACHINE, "ses_a").await.expect("the lane opens");
+        assert!(
+            lock(&lanes.gates).is_empty(),
+            "a committed open kept its gate"
+        );
+        lanes.close(MACHINE, "ses_a");
+        assert!(lock(&lanes.gates).is_empty());
+
+        // And the gate still DOES its job: two concurrent opens on one key are
+        // serialized into one entry, and the gate they shared is gone once both
+        // are done.
+        fake.hold_get("/session/ses_a");
+        let first = open_parked(&lanes, "ses_a");
+        let second = open_parked(&lanes, "ses_a");
+        parked_on(&fake, "ses_a").await;
+        wait_for("both opens to be waiting on the one gate", || {
+            (lock(&lanes.gates).len() == 1).then_some(())
+        })
+        .await;
+        fake.release_get("/session/ses_a");
+        first.await.expect("the first task").expect("it opens");
+        second.await.expect("the second task").expect("it opens");
+        assert_eq!(
+            lock(&lanes.inner).entries.len(),
+            1,
+            "two opens on one key built two entries"
+        );
+        assert!(
+            lock(&lanes.gates).is_empty(),
+            "the gate two opens shared outlived both of them"
+        );
+        lanes.close(MACHINE, "ses_a");
     }
 
     /// **Review finding 1.** `close` used to look for an entry, find none

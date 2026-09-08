@@ -37,6 +37,19 @@ with a message when `SHED_OPENCODE_LIVE` is unset. **On an opencode upgrade,
 record into a directory named for the NEW version — do not overwrite an existing
 one**, and point the replay test at it.
 
+**Two files per recording directory, and only one of them is written by a run:**
+
+| file | who writes it | what it holds |
+|---|---|---|
+| `<version>/PROVENANCE.md` | the recording run, every time | the generated card: the opencode version, the date, the command, the scratch config and the model |
+| `<version>/README.md` | a HUMAN | everything a run cannot know — the pointer back to this page, the frame count and the event-type inventory the replay test depends on, and what `fold.golden.json` is |
+
+The run used to write its card as `README.md`, which meant a re-record deleted
+the page describing the regeneration path it is part of. It writes
+`PROVENANCE.md` instead and touches nothing else; `README.md` is edited by hand
+(`live.rs::a_re_record_writes_a_provenance_card_and_leaves_the_readme_alone`
+pins that, offline).
+
 ### Step 2 — re-derive the golden from the committed recording (OFFLINE, free)
 
 ```bash

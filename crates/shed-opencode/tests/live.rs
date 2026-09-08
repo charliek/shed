@@ -352,6 +352,51 @@ async fn choose_model(base: reqwest::Url) -> Option<String> {
     offered.into_iter().next()
 }
 
+/// **A re-record must not clobber the curated fixture README.** OFFLINE — no
+/// `SHED_OPENCODE_LIVE`, no opencode, no network: it runs the recorder's writer
+/// against a scratch copy of the COMMITTED `README.md` and asserts the bytes are
+/// untouched.
+///
+/// The writer used to emit its template as `README.md`, which would have deleted
+/// the one page that says how these fixtures are regenerated — on the very run
+/// that regenerates them.
+#[test]
+fn a_re_record_writes_a_provenance_card_and_leaves_the_readme_alone() {
+    let curated = fixtures_dir().join("README.md");
+    // Read as text so a failure prints the two READMEs rather than two byte
+    // vectors; markdown that is not UTF-8 fails here just as loudly.
+    let committed = std::fs::read_to_string(&curated)
+        .unwrap_or_else(|e| panic!("reading the committed {}: {e}", curated.display()));
+
+    let scratch = Scratch::new("shed-opencode-provenance");
+    std::fs::write(scratch.path().join("README.md"), &committed).expect("seeding the scratch copy");
+
+    write_provenance(scratch.path(), "9.9.9", "vendor/some-model");
+
+    let after = std::fs::read_to_string(scratch.path().join("README.md"))
+        .expect("the scratch README survives");
+    assert!(
+        after == committed,
+        "a re-record rewrote the hand-maintained {}; it now starts:\n{}",
+        curated.display(),
+        after.lines().take(4).collect::<Vec<_>>().join("\n")
+    );
+
+    let card = std::fs::read_to_string(scratch.path().join(PROVENANCE))
+        .expect("the provenance card is written");
+    for want in [
+        "9.9.9",
+        "vendor/some-model",
+        "SHED_OPENCODE_RECORD=1",
+        "README.md",
+    ] {
+        assert!(
+            card.contains(want),
+            "the provenance card says nothing about {want:?}:\n{card}"
+        );
+    }
+}
+
 // ---- the wire recorder ---------------------------------------------------
 
 /// Appends every raw `/event` `data:` payload to a file, so
@@ -417,43 +462,63 @@ impl Recorder {
             .ok()
             .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
             .unwrap_or_else(|| RECORDED_VERSION.to_string());
-        let readme = format!(
-            "# opencode {version} wire fixtures\n\
-             \n\
-             Recorded by `crates/shed-opencode/tests/live.rs` on {date} with:\n\
-             \n\
-             ```bash\n\
-             SHED_OPENCODE_LIVE=1 SHED_OPENCODE_RECORD=1 \\\n\
-             \x20 cargo test -p shed-opencode --test live -- --nocapture\n\
-             ```\n\
-             \n\
-             - `opencode --version`: `{version}`\n\
-             - server: `opencode serve --port 0 --hostname 127.0.0.1` in a scratch project whose\n\
-             \x20 `opencode.json` sets `permission.bash = \"ask\"` and `model = \"{model}\"`.\n\
-             - `event-frames.jsonl`: one line per `/event` SSE `data:` payload, in arrival order,\n\
-             \x20 verbatim.\n\
-             \n\
-             ## The keep-alive\n\
-             \n\
-             opencode's `/event` has **no `server.heartbeat` variant**. The stream opens with\n\
-             `server.connected` and its only idle traffic is whatever the effect encoder emits —\n\
-             comment lines (`: …`), which carry no event and therefore appear NOWHERE in this\n\
-             file. That is why `shed-opencode`'s stall timer counts BYTES received rather than\n\
-             events decoded: a healthy but quiet stream produces zero lines here.\n\
-             \n\
-             Re-record on an opencode upgrade into a directory named for the new version; do not\n\
-             overwrite this one.\n",
-            version = version,
-            date = today(),
-            model = model,
-        );
-        std::fs::write(self.path.join("README.md"), readme).expect("writing the fixtures README");
+        write_provenance(&self.path, &version, model);
         eprintln!(
             "live_smoke: recorded {} into {}",
             self.frames.display(),
             self.path.display()
         );
     }
+}
+
+/// The machine-written provenance card a re-record leaves beside the frames.
+///
+/// **Deliberately NOT `README.md`.** That file is hand-maintained: it carries
+/// the pointer to `fixtures/README.md` as the single regeneration recipe, the
+/// frame count and the event-type inventory the replay test depends on, and the
+/// paragraph about `fold.golden.json` and `SHED_OPENCODE_REGOLD=1`. None of that
+/// is derivable from a recording run, so a run that wrote its template over it
+/// would delete the documentation the regeneration path is described in — and
+/// the fixture's whole purpose (C3b) is that it cannot rot.
+const PROVENANCE: &str = "PROVENANCE.md";
+
+/// Write [`PROVENANCE`] into `dir`. Never touches anything else in it.
+fn write_provenance(dir: &Path, version: &str, model: &str) {
+    let card = format!(
+        "# opencode {version} — recording provenance\n\
+         \n\
+         Written by `crates/shed-opencode/tests/live.rs` on each re-record. It is\n\
+         GENERATED: edit `README.md` (hand-maintained, beside this file) for anything\n\
+         a run cannot know, and `../README.md` for the regeneration recipe.\n\
+         \n\
+         Recorded on {date} with:\n\
+         \n\
+         ```bash\n\
+         SHED_OPENCODE_LIVE=1 SHED_OPENCODE_RECORD=1 \\\n\
+         \x20 cargo test -p shed-opencode --test live -- --nocapture\n\
+         ```\n\
+         \n\
+         - `opencode --version`: `{version}`\n\
+         - server: `opencode serve --port 0 --hostname 127.0.0.1` in a scratch project whose\n\
+         \x20 `opencode.json` sets `permission.bash = \"ask\"` and `model = \"{model}\"`.\n\
+         - `event-frames.jsonl`: one line per `/event` SSE `data:` payload, in arrival order,\n\
+         \x20 verbatim.\n\
+         \n\
+         ## The keep-alive\n\
+         \n\
+         opencode's `/event` has **no `server.heartbeat` variant**. The stream opens with\n\
+         `server.connected` and its only idle traffic is whatever the effect encoder emits —\n\
+         comment lines (`: …`), which carry no event and therefore appear NOWHERE in the\n\
+         frame log. That is why `shed-opencode`'s stall timer counts BYTES received rather\n\
+         than events decoded: a healthy but quiet stream produces zero lines.\n\
+         \n\
+         Re-record on an opencode upgrade into a directory named for the new version; do not\n\
+         overwrite this one.\n",
+        version = version,
+        date = today(),
+        model = model,
+    );
+    std::fs::write(dir.join(PROVENANCE), card).expect("writing the fixtures provenance card");
 }
 
 /// Today, as `YYYY-MM-DD`. `chrono`'s `clock` feature is deliberately not

@@ -24,6 +24,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { ChevronDown, ChevronRight, ScrollText, Send, Square, X } from "lucide-react";
 import { cn } from "@/lib/utils";
+import { newestWins } from "@/lib/newest";
 import { cardCls, StatusChip, type Tone } from "@/components/primitives";
 import {
   LANE_EVENT, laneAnswer, laneApprovals, laneCancel, laneClose, laneFailure,
@@ -156,22 +157,26 @@ export function LanePanel({ machine, sessionId, onClose }: {
     let timer: number | null = null;
     const unlisten: Array<() => void> = [];
 
-    const pull = async () => {
-      try {
+    // Newest-wins across OVERLAPPING pulls. `schedule()` below coalesces the
+    // callbacks that ask for a read; it does nothing about a read already in
+    // flight when the next one starts, and two IPC round-trips can answer in
+    // either order — so an earlier pull landing second used to overwrite a fresh
+    // transcript with a stale one, on a panel that never polls and would
+    // therefore stay wrong until the next unrelated frame.
+    const reads = newestWins();
+    const pull = () =>
+      reads.run(
         // ONE round-trip pair, in parallel: the two reads are independent
-        // projections of the same locked view, so there is nothing to order.
-        const [v, a] = await Promise.all([
-          laneMessages(machine, sessionId),
-          laneApprovals(machine, sessionId),
-        ]);
-        if (cancelled) return;
-        setView(v);
-        setApprovals(a);
-        setReadError(null);
-      } catch (e) {
-        if (!cancelled) setReadError(laneFailure(e).message);
-      }
-    };
+        // projections of the same locked view, so there is nothing to order
+        // BETWEEN them — only between one pull and the next.
+        () => Promise.all([laneMessages(machine, sessionId), laneApprovals(machine, sessionId)]),
+        ([v, a]) => {
+          setView(v);
+          setApprovals(a);
+          setReadError(null);
+        },
+        (e) => setReadError(laneFailure(e).message),
+      );
     const run = () => {
       if (frame !== null) cancelAnimationFrame(frame);
       if (timer !== null) clearTimeout(timer);
@@ -214,6 +219,7 @@ export function LanePanel({ machine, sessionId, onClose }: {
 
     return () => {
       cancelled = true;
+      reads.cancel();
       if (frame !== null) cancelAnimationFrame(frame);
       if (timer !== null) clearTimeout(timer);
       unlisten.forEach((u) => u());
