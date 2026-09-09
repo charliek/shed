@@ -40,11 +40,19 @@ base64 = { workspace = true }
 # RFC3339 (`opencode_ts`). Same minimal pin (and same reason) as shed-app's and
 # shed-broker's — `std` only, no `clock`/`oldtime`, so no iana-time-zone pull.
 chrono = { version = "0.4", default-features = false, features = ["std"] }
-# NOT in plan 015 §3.2's dependency list, and required by it: the copied
-# `sanitize_last_message` helper IS the hub's ANSI-escape stripper
-# (`messages.rs:376`'s `ANSI_ESCAPE_RE`), which is a `regex`. Same pin as
-# shed-core's and shed-broker's, and already in this workspace's lock — it
-# already reaches this crate transitively through shed-core.
+# UNUSED as of plan 017 C1, and deliberately still here. This crate took `regex`
+# for one thing — the ANSI-escape stripper behind `sanitize_last_message` — and
+# that stripper moved to `shed_core::lane::feed` when the second lane adapter
+# needed it, so nothing under `src/`, `tests/` or `examples/` names `regex` any
+# more (`grep -rn regex shed-opencode/` finds only this comment).
+#
+# Dropping the line is a lockfile change, and this workspace's `Cargo.lock` is
+# not the only one that would move: the Tauri client is a SEPARATE workspace
+# (`desktop/tauri/src-tauri/Cargo.lock`) that path-depends on this crate, and the
+# two locks are verified in lockstep at release. So the removal belongs to the
+# commit that is already regenerating both — C4 — rather than to one whose
+# `cargo tree` invariants are its evidence. `regex` still reaches this crate
+# transitively through shed-core either way, so nothing builds differently.
 regex = "1"
 
 [features]

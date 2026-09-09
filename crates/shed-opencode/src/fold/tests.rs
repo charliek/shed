@@ -192,15 +192,19 @@ fn expected_permission(id: &str, session: &str) -> LaneApproval {
         title: "awaiting approval: bash — ls *, cat *".into(),
         detail: Some("ls -la".into()),
         options: [
-            ("allow_once", "Allow once"),
-            ("allow_always", "Always"),
-            ("reject", "Reject"),
+            ("allow_once", "Allow once", "allow_once"),
+            ("allow_always", "Always", "allow_always"),
+            // The id is opencode's opaque `reject`; the KIND is the ACP
+            // `reject_once`. Spelled out here rather than derived, so a future
+            // edit that collapses the two fails this test.
+            ("reject", "Reject", "reject_once"),
         ]
         .into_iter()
-        .map(|(oid, label)| LaneApprovalOption {
+        .map(|(oid, label, kind)| LaneApprovalOption {
             id: oid.into(),
             label: label.into(),
             description: None,
+            kind: Some(kind.into()),
         })
         .collect(),
         questions: Vec::new(),
@@ -220,6 +224,9 @@ fn expected_question(id: &str, session: &str) -> LaneApproval {
         detail: None,
         options: Vec::new(),
         questions: vec![LaneQuestion {
+            // Positional on opencode — the reply route takes a vec-of-vecs in
+            // question order, so there is no key to publish.
+            id: None,
             header: "Pick a branch".into(),
             question: "Which branch should I target?".into(),
             options: vec![
@@ -227,11 +234,13 @@ fn expected_question(id: &str, session: &str) -> LaneApproval {
                     id: "main".into(),
                     label: "main".into(),
                     description: Some("the trunk".into()),
+                    kind: None,
                 },
                 LaneApprovalOption {
                     id: "dev".into(),
                     label: "dev".into(),
                     description: None,
+                    kind: None,
                 },
             ],
             multiple: false,
@@ -1098,4 +1107,76 @@ fn a_malformed_or_unknown_line_leaves_state_untouched() {
     }
     assert!(rows(&mut f).is_empty());
     assert_eq!(f.activity(), before);
+}
+
+/// opencode's three permission options, pinned by NAME on both axes.
+///
+/// The point of the pin is that the two axes are independent and one of them
+/// has already been dropped once. `id` is opencode's own opaque token — it is
+/// what `LaneAnswer::Choice` hands straight back and what the reply route
+/// resolves — and `kind` is the ACP semantics a client styles a destructive
+/// button from and a by-kind resolver matches `LaneAnswer::Permission` on.
+///
+/// The third row is the one that matters: `id: "reject"` with
+/// `kind: "reject_once"`. If a future edit ever "tidies" these into one field,
+/// or derives the kind from the id, this fails — and so does every client that
+/// sniffed the id expecting to find `reject_once` there.
+#[test]
+fn opencode_permission_options_carry_both_the_opaque_id_and_the_acp_kind() {
+    let got: Vec<(String, String, Option<String>)> = permission_options()
+        .into_iter()
+        .map(|o| (o.id, o.label, o.kind))
+        .collect();
+    assert_eq!(
+        got,
+        vec![
+            (
+                "allow_once".to_string(),
+                "Allow once".to_string(),
+                Some("allow_once".to_string())
+            ),
+            (
+                "allow_always".to_string(),
+                "Always".to_string(),
+                Some("allow_always".to_string())
+            ),
+            (
+                "reject".to_string(),
+                "Reject".to_string(),
+                Some("reject_once".to_string())
+            ),
+        ],
+    );
+
+    // Every option states a kind — an absent one is what the contract reads as
+    // "this agent offers no semantics", which is false for a permission here.
+    assert!(permission_options().iter().all(|o| o.kind.is_some()));
+
+    // The kinds are the contract's constants, not strings that merely look like
+    // them, and they are the ACP vocabulary the panel branches on.
+    let kinds: Vec<String> = permission_options()
+        .into_iter()
+        .filter_map(|o| o.kind)
+        .collect();
+    assert_eq!(
+        kinds,
+        vec![
+            option_kind::ALLOW_ONCE,
+            option_kind::ALLOW_ALWAYS,
+            option_kind::REJECT_ONCE
+        ],
+    );
+    // opencode offers no reject-always, which is exactly why the contract's
+    // `Reject` mapping falls back to "the first option whose kind starts
+    // `reject`" instead of demanding an exact `reject_once`.
+    assert!(!kinds.iter().any(|k| k == option_kind::REJECT_ALWAYS));
+    assert!(kinds
+        .iter()
+        .any(|k| k.starts_with("reject") && k == option_kind::REJECT_ONCE));
+
+    // A FRESH vec per call — every copy lands on a DTO that must not alias
+    // another's.
+    let mut a = permission_options();
+    a[0].label = "mutated".into();
+    assert_eq!(permission_options()[0].label, "Allow once");
 }

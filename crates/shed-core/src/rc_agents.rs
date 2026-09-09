@@ -170,6 +170,17 @@ impl AgentTool {
 /// [`AgentTool::bin`] is `None`. The client's answer is therefore
 /// `tool_for(k).filter(|t| t.bin().is_some())` — pinned by a test below so the
 /// two tables cannot drift apart.
+///
+/// **[`RcKind::Gx`] and [`RcKind::Grok`] answer `None`, and that is not drift.**
+/// This registry is the GUEST's: it says which spec the `shed-ext-rc` engine
+/// launches a tmux session from, and there is no gx/grok producer in the guest
+/// (their rows come from roost, in somebody's own terminal). So the drift guard
+/// below runs over [`all_kinds`] — the guest registry — and the two roost-only
+/// kinds sit outside it by construction: [`RcKind::tool`] names the capabilities
+/// key roost SYNTHESIZES for them
+/// ([`crate::roost::roost_capabilities`]), while this function says the engine
+/// has no spec to launch. Adding a guest spec for either one later means adding
+/// it to [`all_kinds`] too, and the guard picks it up from there.
 pub fn tool_for(kind: &RcKind) -> Option<AgentTool> {
     match kind {
         RcKind::ClaudeRc | RcKind::ClaudeBroker => Some(AgentTool::Claude),
@@ -177,12 +188,16 @@ pub fn tool_for(kind: &RcKind) -> Option<AgentTool> {
         RcKind::Opencode => Some(AgentTool::Opencode),
         RcKind::Cursor => Some(AgentTool::Cursor),
         RcKind::Shell => Some(AgentTool::Shell),
-        RcKind::Other(_) => None,
+        RcKind::Gx | RcKind::Grok | RcKind::Other(_) => None,
     }
 }
 
-/// Every recognized kind, in the order pinned by the capabilities wire contract
-/// (`allKinds`, `rc.go:49`).
+/// Every kind in the GUEST registry, in the order pinned by the capabilities
+/// wire contract (`allKinds`, `rc.go:49`).
+///
+/// Not "every [`RcKind`]": the roost-only row kinds ([`RcKind::Gx`],
+/// [`RcKind::Grok`]) are deliberately absent — nothing in the guest launches or
+/// probes them. See [`tool_for`].
 pub fn all_kinds() -> [RcKind; 6] {
     [
         RcKind::ClaudeBroker,
@@ -1634,6 +1649,32 @@ mod tests {
     /// with nothing to probe. A kind added to only one of them would gate the
     /// create form on a different agent set than the engine launches from — this
     /// is the drift guard that makes the two tables' co-existence safe.
+    /// The GUEST registry has no row for the roost-only kinds, and that is the
+    /// design rather than a gap: nothing in the guest launches or probes a gx.
+    ///
+    /// It is also why the drift guard below runs over [`all_kinds`] — with these
+    /// two in it, `tool_for(Gx) == None` and `RcKind::Gx.tool() == Some("gx")`
+    /// would read as drift, when what they actually say is "roost synthesizes a
+    /// capabilities key for it; the engine has no spec to launch it".
+    #[test]
+    fn the_roost_only_kinds_have_no_guest_registry_row() {
+        for kind in [RcKind::Gx, RcKind::Grok] {
+            assert_eq!(tool_for(&kind), None, "{}", kind.as_str());
+            assert!(
+                !all_kinds().contains(&kind),
+                "{} is not in the guest registry",
+                kind.as_str()
+            );
+            // The client-side capabilities key exists all the same — that is the
+            // key `roost_capabilities` claims installed.
+            assert_eq!(kind.tool(), Some(kind.as_str()));
+            // With no spec, the engine's launch command degrades to a shell —
+            // the same total answer an unknown kind gets.
+            assert_eq!(inner_command(&kind, "x", "auto", false, 0), "bash -l");
+        }
+        assert_eq!(all_kinds().len(), 6, "the guest registry did not grow");
+    }
+
     #[test]
     fn client_tool_axis_is_the_registry_minus_unprobeable_rows() {
         for kind in all_kinds()

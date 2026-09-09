@@ -83,7 +83,8 @@ use std::collections::{HashMap, HashSet};
 use serde::Deserialize;
 use serde_json::value::RawValue;
 use shed_core::lane::{
-    LaneApproval, LaneApprovalKind, LaneApprovalOption, LaneApprovalStatus, LaneQuestion,
+    option_kind, LaneApproval, LaneApprovalKind, LaneApprovalOption, LaneApprovalStatus,
+    LaneQuestion,
 };
 use shed_core::rc::{RcActivity, RcFeedApproval, RcFeedMessage, RcFeedTool};
 
@@ -1461,6 +1462,11 @@ impl OpencodeFold {
 /// convention for id-less options AND the literal wire value.
 fn lane_question(q: &OcQuestion) -> LaneQuestion {
     LaneQuestion {
+        // `None`: opencode files a question's answers POSITIONALLY
+        // (`QuestionReply.answers` is a vec-of-vecs in question order), so
+        // there is no key to publish. `LaneQuestion::id` exists for agents like
+        // gx that key by the question's text.
+        id: None,
         header: q.header.clone(),
         question: first_non_empty(&q.question, &q.text).to_string(),
         options: q
@@ -1470,6 +1476,9 @@ fn lane_question(q: &OcQuestion) -> LaneQuestion {
                 id: o.label.clone(),
                 label: o.label.clone(),
                 description: (!o.description.is_empty()).then(|| o.description.clone()),
+                // A question's answer labels carry no ACP permission semantics —
+                // `kind` is for "allow once"/"reject always", not for "yes"/"no".
+                kind: None,
             })
             .collect(),
         multiple: q.multiple,
@@ -1482,17 +1491,34 @@ fn lane_question(q: &OcQuestion) -> LaneQuestion {
 /// `LaneAnswer::Permission` carries back), the label is what the panel shows.
 /// A FRESH vec per call — every copy ends up on a DTO that must not alias
 /// another's.
+///
+/// **`kind` is the semantics; the id stays opaque.** The third option is the
+/// clearest case and the reason the contract split the two
+/// ([`shed_core::lane::LaneApprovalOption`], and the module doc's correction
+/// 3): its id is `reject` — opencode's own spelling, which
+/// [`shed_core::lane::LaneAnswer::Permission`] and
+/// [`shed_core::lane::LaneAnswer::Choice`] both hand back verbatim — while its
+/// KIND is [`option_kind::REJECT_ONCE`], the ACP vocabulary a client styles a
+/// destructive button from and a by-kind resolver matches on. The two must not
+/// be conflated: a client that sniffed the id would look for `reject_once` here
+/// and find nothing.
+///
+/// opencode offers no reject-always, so [`option_kind::REJECT_ALWAYS`] is
+/// absent — which is exactly why the contract's `Reject` mapping falls back to
+/// "the first option whose kind starts `reject`" rather than demanding an exact
+/// `reject_once`.
 fn permission_options() -> Vec<LaneApprovalOption> {
     [
-        ("allow_once", "Allow once"),
-        ("allow_always", "Always"),
-        ("reject", "Reject"),
+        ("allow_once", "Allow once", option_kind::ALLOW_ONCE),
+        ("allow_always", "Always", option_kind::ALLOW_ALWAYS),
+        ("reject", "Reject", option_kind::REJECT_ONCE),
     ]
     .into_iter()
-    .map(|(id, label)| LaneApprovalOption {
+    .map(|(id, label, kind)| LaneApprovalOption {
         id: id.to_string(),
         label: label.to_string(),
         description: None,
+        kind: Some(kind.to_string()),
     })
     .collect()
 }

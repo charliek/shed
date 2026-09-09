@@ -36,11 +36,16 @@ fn sample_session() -> LaneSession {
     }
 }
 
+/// One offered option, with an id deliberately UNRELATED to its kind — the
+/// contract's rule (module doc, correction 3) is that ids are opaque and `kind`
+/// carries the semantics, and a sample whose id spells its own kind would let an
+/// id-sniffing bug pass every test in this file.
 fn sample_option() -> LaneApprovalOption {
     LaneApprovalOption {
-        id: "allow-once".into(),
+        id: "p-1".into(),
         label: "Allow once".into(),
         description: Some("Just this invocation".into()),
+        kind: Some(option_kind::ALLOW_ONCE.into()),
     }
 }
 
@@ -54,6 +59,7 @@ fn sample_approval() -> LaneApproval {
         detail: Some("in /home/shed/shed".into()),
         options: vec![sample_option()],
         questions: vec![LaneQuestion {
+            id: Some("Which directories?".into()),
             header: "Scope".into(),
             question: "Which directories?".into(),
             options: vec![sample_option()],
@@ -121,8 +127,99 @@ fn approval_and_its_parts_round_trip() {
         id: "Yes".into(),
         label: "Yes".into(),
         description: None,
+        kind: None,
     });
     round_trip(&LaneQuestion::default());
+}
+
+/// The two fields the second adapter added ([`LaneApprovalOption::kind`] and
+/// [`LaneQuestion::id`]) survive a round trip, are OMITTED when absent — the
+/// wire an older mirror decodes is byte-unchanged — and carry the ACP
+/// vocabulary verbatim when present.
+#[test]
+fn option_kind_and_question_id_round_trip_and_are_omitted_when_absent() {
+    let encoded = round_trip(&sample_option());
+    assert_eq!(encoded["id"], "p-1", "the id is opaque and untouched");
+    assert_eq!(encoded["kind"], "allow_once");
+
+    // Absent on both: the object is exactly what it was before the fields
+    // existed, which is what keeps a lagging shed-mobile decoding.
+    let bare = LaneApprovalOption {
+        id: "Yes".into(),
+        label: "Yes".into(),
+        description: None,
+        kind: None,
+    };
+    assert_eq!(
+        round_trip(&bare),
+        serde_json::json!({"id": "Yes", "label": "Yes"}),
+    );
+    let q = round_trip(&LaneQuestion::default());
+    assert_eq!(
+        q,
+        serde_json::json!({
+            "header": "", "question": "", "options": [],
+            "multiple": false, "custom": false,
+        }),
+    );
+
+    // And absent DECODES, on both, from an object that never had the key.
+    let decoded: LaneApprovalOption =
+        serde_json::from_value(serde_json::json!({"id": "x", "label": "X"}))
+            .expect("an option with no kind decodes");
+    assert_eq!(decoded.kind, None);
+    let decoded: LaneQuestion =
+        serde_json::from_value(serde_json::json!({"header": "h", "question": "q"}))
+            .expect("a question with no id decodes");
+    assert_eq!(decoded.id, None);
+
+    // The four ACP kinds are the wire spellings the panel and both adapters
+    // agree on.
+    assert_eq!(
+        [
+            option_kind::ALLOW_ONCE,
+            option_kind::ALLOW_ALWAYS,
+            option_kind::REJECT_ONCE,
+            option_kind::REJECT_ALWAYS,
+        ],
+        ["allow_once", "allow_always", "reject_once", "reject_always"],
+    );
+    // Unrecognized kinds are TOLERATED, not refused: `kind` is a stream value,
+    // and a fifth kind from a newer agent must not take its approval with it.
+    let decoded: LaneApprovalOption = serde_json::from_value(
+        serde_json::json!({"id": "x", "label": "X", "kind": "ask_the_operator"}),
+    )
+    .expect("an unknown option kind decodes");
+    assert_eq!(decoded.kind.as_deref(), Some("ask_the_operator"));
+}
+
+/// [`LaneAnswer::Choice`] is tagged like its siblings, round-trips, and is
+/// **strict**: an unknown `kind` on an answer is a command this build cannot
+/// honor, and refusing it at decode is the module doc's asymmetric rule.
+#[test]
+fn lane_answer_choice_round_trips_and_stays_strict() {
+    let encoded = round_trip(&LaneAnswer::Choice {
+        option_id: "p-2".into(),
+    });
+    assert_eq!(
+        encoded,
+        serde_json::json!({"kind": "choice", "option_id": "p-2"}),
+    );
+
+    // An unknown answer kind is REFUSED (no `#[serde(other)]` here, unlike
+    // `LaneEvent`) — including one that looks like a near-miss for this variant.
+    for bad in [
+        serde_json::json!({"kind": "option", "option_id": "p-2"}),
+        serde_json::json!({"kind": "choose", "option_id": "p-2"}),
+        serde_json::json!({"kind": "unknown"}),
+    ] {
+        assert!(
+            serde_json::from_value::<LaneAnswer>(bad.clone()).is_err(),
+            "{bad} must not decode as a LaneAnswer",
+        );
+    }
+    // And the payload is required: a `choice` with no id is not an answer.
+    assert!(serde_json::from_value::<LaneAnswer>(serde_json::json!({"kind": "choice"})).is_err());
 }
 
 #[test]
@@ -661,4 +758,300 @@ fn unknown_command_values_are_rejected() {
     // `LaneError` stays strict too — a caller branches on these.
     serde_json::from_value::<LaneError>(json!("rate_limited"))
         .expect_err("an unknown error code must be rejected, not filed under a live variant");
+}
+
+// ---- the by-kind permission resolver ----
+
+/// An option whose id is deliberately UNRELATED to its kind.
+///
+/// Every case below uses ids an id-matching implementation could not resolve
+/// from (`p-1`…`p-4`, `x`, `"7"`), so a regression that reads `option.id` and
+/// compares it against the decision's wire spelling fails here rather than
+/// passing by coincidence — which is exactly what it would do against
+/// opencode's real ids.
+fn opt(id: &str, kind: Option<&str>) -> LaneApprovalOption {
+    LaneApprovalOption {
+        id: id.into(),
+        label: format!("label for {id}"),
+        description: None,
+        kind: kind.map(str::to_string),
+    }
+}
+
+fn approval_offering(options: Vec<LaneApprovalOption>) -> LaneApproval {
+    LaneApproval {
+        options,
+        ..sample_approval()
+    }
+}
+
+/// The table the whole correction rests on: a decision picks an option by
+/// KIND, in offered order, and never by id.
+#[test]
+fn option_for_resolves_every_decision_by_kind_never_by_id() {
+    // A full four-option set, ids scrambled against their kinds.
+    let full = approval_offering(vec![
+        opt("p-1", Some(option_kind::ALLOW_ONCE)),
+        opt("p-2", Some(option_kind::ALLOW_ALWAYS)),
+        opt("p-3", Some(option_kind::REJECT_ONCE)),
+        opt("p-4", Some(option_kind::REJECT_ALWAYS)),
+    ]);
+    // `Reject`-with-both-present resolves to the EXACT `reject_once`, not to the
+    // fallback's first-reject — the exact match is tried first.
+    let cases = [
+        (LaneDecision::AllowOnce, Some("p-1")),
+        (LaneDecision::AllowAlways, Some("p-2")),
+        (LaneDecision::Reject, Some("p-3")),
+    ];
+    for (decision, want) in cases {
+        assert_eq!(
+            full.option_for(decision).map(|o| o.id.as_str()),
+            want,
+            "{decision:?} on the full set",
+        );
+    }
+
+    // The `Reject` FALLBACK: no `reject_once` offered, only `reject_always`.
+    // An agent that offers one flavour of refusal must still be refusable.
+    let only_always = approval_offering(vec![
+        opt("x", Some(option_kind::ALLOW_ONCE)),
+        opt("7", Some(option_kind::REJECT_ALWAYS)),
+    ]);
+    assert_eq!(
+        only_always
+            .option_for(LaneDecision::Reject)
+            .map(|o| o.id.as_str()),
+        Some("7"),
+    );
+
+    // The fallback takes the FIRST reject-kind in OFFERED order. Two reject
+    // kinds, neither an exact `reject_once`, so ordering is what decides — and
+    // the answer is the earlier one, not the last and not the alphabetically
+    // smaller (`reject_always` < `reject_something_else`, so both orderings
+    // would agree; the pair below is chosen so they do NOT).
+    let fallback_order = approval_offering(vec![
+        opt("p-9", Some("reject_something_else")),
+        opt("p-4", Some(option_kind::REJECT_ALWAYS)),
+    ]);
+    assert_eq!(
+        fallback_order
+            .option_for(LaneDecision::Reject)
+            .map(|o| o.id.as_str()),
+        Some("p-9"),
+        "first in offered order, not last and not alphabetical",
+    );
+
+    // Both reject kinds present, offered in REVERSE (`reject_always` first):
+    // the EXACT `reject_once` still wins, because step 1 runs before the
+    // fallback. Offered order only breaks ties the fallback has to break.
+    let reversed = approval_offering(vec![
+        opt("p-4", Some(option_kind::REJECT_ALWAYS)),
+        opt("p-3", Some(option_kind::REJECT_ONCE)),
+    ]);
+    assert_eq!(
+        reversed
+            .option_for(LaneDecision::Reject)
+            .map(|o| o.id.as_str()),
+        Some("p-3"),
+        "an exact reject_once beats an earlier-offered reject_always",
+    );
+
+    // There is NO fallback for the allow decisions, deliberately: broadening a
+    // refusal is safe, broadening an ALLOW is the bug this contract prevents.
+    // `allow_always` offered, `allow_once` asked for → no match.
+    let only_allow_always = approval_offering(vec![
+        opt("p-2", Some(option_kind::ALLOW_ALWAYS)),
+        opt("p-3", Some(option_kind::REJECT_ONCE)),
+    ]);
+    assert_eq!(only_allow_always.option_for(LaneDecision::AllowOnce), None);
+    // …and the converse.
+    let only_allow_once = approval_offering(vec![opt("p-1", Some(option_kind::ALLOW_ONCE))]);
+    assert_eq!(only_allow_once.option_for(LaneDecision::AllowAlways), None);
+
+    // An option with NO kind never matches — not even one whose ID spells the
+    // decision. This is the id-sniffing regression, caught.
+    let kindless = approval_offering(vec![
+        opt("allow_once", None),
+        opt("allow_always", None),
+        opt("reject", None),
+    ]);
+    for decision in [
+        LaneDecision::AllowOnce,
+        LaneDecision::AllowAlways,
+        LaneDecision::Reject,
+    ] {
+        assert_eq!(
+            kindless.option_for(decision),
+            None,
+            "{decision:?} must not match an id",
+        );
+    }
+
+    // No options at all: `None`, not a panic.
+    let empty = approval_offering(vec![]);
+    assert_eq!(empty.option_for(LaneDecision::Reject), None);
+
+    // An unrecognized kind is inert for the allow decisions and, because it does
+    // not start with `reject`, for the fallback too.
+    let alien = approval_offering(vec![opt("p-5", Some("ask_the_operator"))]);
+    for decision in [
+        LaneDecision::AllowOnce,
+        LaneDecision::AllowAlways,
+        LaneDecision::Reject,
+    ] {
+        assert_eq!(
+            alien.option_for(decision),
+            None,
+            "{decision:?} on an alien kind"
+        );
+    }
+}
+
+/// opencode's REAL three, resolved through the shared rule.
+///
+/// This is the case that would silently pass under an id-matching
+/// implementation for two of the three decisions and fail for the third — its
+/// reject option's id is `reject` while its kind is `reject_once`. Pinning it
+/// here means the contract's resolver is proven against a live adapter's actual
+/// option set, not only against synthetic ids.
+#[test]
+fn option_for_resolves_opencodes_real_three() {
+    let oc = approval_offering(vec![
+        opt("allow_once", Some(option_kind::ALLOW_ONCE)),
+        opt("allow_always", Some(option_kind::ALLOW_ALWAYS)),
+        opt("reject", Some(option_kind::REJECT_ONCE)),
+    ]);
+    assert_eq!(
+        oc.option_for(LaneDecision::AllowOnce)
+            .map(|o| o.id.as_str()),
+        Some("allow_once"),
+    );
+    assert_eq!(
+        oc.option_for(LaneDecision::AllowAlways)
+            .map(|o| o.id.as_str()),
+        Some("allow_always"),
+    );
+    // id `reject`, kind `reject_once` — the two are not the same string, and the
+    // resolver reads the kind.
+    let rejected = oc
+        .option_for(LaneDecision::Reject)
+        .expect("a reject option");
+    assert_eq!(rejected.id, "reject");
+    assert_eq!(rejected.kind.as_deref(), Some(option_kind::REJECT_ONCE));
+}
+
+/// [`LaneAnswer`] enforces the strictness its doc claims: unknown FIELDS inside
+/// a variant are refused, not silently dropped.
+///
+/// The bug this pins: `{"kind":"permission","decision":"allow_always",
+/// "option_id":"reject"}` used to decode as `Permission{AllowAlways}` with the
+/// `option_id` thrown away — a payload that reads as "refuse" to a human and
+/// executes as "allow always". It is not hypothetical: shed-mobile
+/// hand-mirrors this enum, and a Dart encoder that emits both fields (a
+/// half-finished migration from one answer shape to the other) would get
+/// permission semantics and no error to tell it otherwise.
+///
+/// `deny_unknown_fields` on an INTERNALLY-tagged enum is the subtle part — the
+/// tag key must still be accepted while every other unknown key is refused —
+/// so both halves are asserted here rather than assumed.
+#[test]
+fn lane_answer_refuses_unknown_fields_inside_a_variant() {
+    // The ambiguous payload: two answers in one object. Refused.
+    let ambiguous = json!({
+        "kind": "permission",
+        "decision": "allow_always",
+        "option_id": "reject",
+    });
+    assert!(
+        serde_json::from_value::<LaneAnswer>(ambiguous).is_err(),
+        "a permission carrying an option_id must not decode as a bare permission",
+    );
+
+    // …and the mirror image, so neither variant absorbs the other's field.
+    assert!(serde_json::from_value::<LaneAnswer>(json!({
+        "kind": "choice",
+        "option_id": "p-2",
+        "decision": "allow_once",
+    }))
+    .is_err());
+
+    // A junk field on any STRUCT variant.
+    for bad in [
+        json!({"kind": "permission", "decision": "allow_once", "nonsense": 1}),
+        json!({"kind": "choice", "option_id": "p-1", "nonsense": 1}),
+        json!({"kind": "question", "answers": [["a"]], "nonsense": 1}),
+        json!({"kind": "raw", "json": "{}", "nonsense": 1}),
+    ] {
+        assert!(
+            serde_json::from_value::<LaneAnswer>(bad.clone()).is_err(),
+            "{bad} must be refused",
+        );
+    }
+
+    // **The one carve-out, pinned because it is a serde limitation and not a
+    // choice.** `deny_unknown_fields` binds the STRUCT variants; an internally
+    // tagged UNIT variant is deserialized from the tag alone and ignores
+    // whatever else the object carries. So this decodes, and there is no
+    // attribute that would stop it short of turning `Reject` into a struct
+    // variant — which would change the Rust API at every construction site
+    // (including the Tauri crate, a separate workspace) for no wire change.
+    //
+    // It is left alone because the direction is safe: extra keys on a `reject`
+    // are ignored in favour of REFUSING, the conservative answer. The dangerous
+    // direction — a reject-shaped field silently ignored on an ALLOW — is what
+    // the struct-variant cases above now refuse.
+    assert_eq!(
+        serde_json::from_value::<LaneAnswer>(json!({"kind": "reject", "nonsense": 1})).unwrap(),
+        LaneAnswer::Reject,
+        "documented: a unit variant ignores extra keys, and refusing is the safe direction",
+    );
+
+    // The OTHER half: the `kind` tag itself is not an unknown field, and every
+    // legitimate payload still decodes — `deny_unknown_fields` on an internally
+    // tagged enum would be useless if it broke these.
+    let legit = [
+        (
+            json!({"kind": "permission", "decision": "allow_once"}),
+            LaneAnswer::Permission {
+                decision: LaneDecision::AllowOnce,
+            },
+        ),
+        (
+            json!({"kind": "choice", "option_id": "p-2"}),
+            LaneAnswer::Choice {
+                option_id: "p-2".into(),
+            },
+        ),
+        (
+            json!({"kind": "question", "answers": [["yes"], ["a", "b"]]}),
+            LaneAnswer::Question {
+                answers: vec![vec!["yes".into()], vec!["a".into(), "b".into()]],
+            },
+        ),
+        // `answers` is `#[serde(default)]`, so an omitted field is still fine —
+        // deny_unknown_fields refuses EXTRA keys, never missing optional ones.
+        (
+            json!({"kind": "question"}),
+            LaneAnswer::Question { answers: vec![] },
+        ),
+        (json!({"kind": "reject"}), LaneAnswer::Reject),
+        (
+            json!({"kind": "raw", "json": "{\"a\":1}"}),
+            LaneAnswer::Raw {
+                json: "{\"a\":1}".into(),
+            },
+        ),
+    ];
+    for (payload, want) in legit {
+        let got: LaneAnswer = serde_json::from_value(payload.clone())
+            .unwrap_or_else(|e| panic!("{payload} must decode: {e}"));
+        assert_eq!(got, want, "{payload}");
+        // And it still round-trips as itself — the encoder emits the tag, and
+        // the stricter decoder accepts what the encoder produced.
+        round_trip(&want);
+    }
+
+    // An unknown variant tag stays refused too (the strictness that already
+    // existed, re-pinned so a future `#[serde(other)]` cannot creep in).
+    assert!(serde_json::from_value::<LaneAnswer>(json!({"kind": "nope"})).is_err());
 }

@@ -25,11 +25,17 @@
 //!
 //! # Semantics pinned for every adapter
 //!
-//! A (re)connect is bracketed by **[`LaneEvent::Reset`] … [`LaneEvent::Ready`]**:
+//! A **reseed** is bracketed by **[`LaneEvent::Reset`] … [`LaneEvent::Ready`]**:
 //! between them the adapter replays the full seed (messages, then the session
 //! row, then approvals); a client **stages** everything it receives after
-//! `Reset` and swaps its view atomically on `Ready` (so a reconnect never
-//! flickers), and discards anything stamped with an older `generation`. `seq` is
+//! `Reset` and swaps its view atomically on `Ready` (so a reseed never
+//! flickers), and discards anything stamped with an older `generation`.
+//!
+//! Not every reconnect is a reseed. An adapter advertising
+//! [`LaneCapabilities::history_cursor`] may resume from its cursor SILENTLY —
+//! no `Reset`, same generation, the client's view untouched — within the bound
+//! correction 1 below states. What survives a silent resume is the whole point:
+//! a client must not assume a reconnect announces itself. `seq` is
 //! assigned by the adapter's bounded ring (not the fold) and is monotonic across
 //! `Reset`s within one subscription — a client that sees a `seq` lower than one
 //! it holds refetches, the rule [`crate::rc::RcFeedMessage`] already carries.
@@ -83,28 +89,159 @@
 //!
 //! # The opencode ↔ gx mapping
 //!
-//! Two adapters are planned; this is what each contract verb costs on each side,
-//! and it is the reason the contract is shaped the way it is (session-scoped,
-//! cursor-optional, approvals as first-class rows).
+//! Two adapters; this is what each contract verb costs on each side, and it is
+//! the reason the contract is shaped the way it is (session-scoped,
+//! cursor-optional, approvals as first-class rows). The gx column is written
+//! from gx's own `gx-remote-api` routes (`routes/mod.rs`), not from a guess.
 //!
 //! | contract | opencode | gx |
 //! |---|---|---|
-//! | `sessions` | `GET /session` → every root on that server (the global store); activity from `/session/status`: `busy|retry → Working`, `idle → Idle` | `GET /v1/sessions` |
-//! | `history` | `GET /session/{sessionID}/message` through a fresh fold (seq from 1); `cursor` ignored (`history_cursor: false`), `truncated` from the page cap | `GET …/history`; cursor = `lastEventId` |
-//! | `send(Queue)` | `POST /session/{sessionID}/prompt_async` | `POST …/messages mode=queue` |
-//! | `send(Interject)` | [`LaneError::NotAccepting`] | `mode=interject` |
-//! | `cancel` | `POST /session/{sessionID}/abort` | `POST …/cancel` |
-//! | `approvals` | fold state seeded from `GET /permission` + `GET /question` (`?directory=` of the session) filtered to the root id **and its descendants** (`GET /session/{sessionID}/children`, refreshed on a `session.created` whose `parentID` is in the set) | `GET …/approvals` |
-//! | `answer(Permission)` | `POST /permission/{requestID}/reply {reply}` (the live route; the deprecated session-scoped route is the recorded fallback) | `POST …/approvals/{id}` `optionId` |
-//! | `answer(Question)` | `POST /question/{requestID}/reply {answers}`; [`LaneAnswer::Reject`] → `…/reject` | `{outcome: accepted, answers}` |
-//! | `subscribe` | `GET /event?directory=<session dir>` opened **first**, then the REST seed while live frames buffer; `Reset` … `Ready` brackets every (re)connect; transcript frames filtered to the root id, approval frames to root + descendants; empty-id frames count as liveness | `GET …/events` with `Last-Event-ID` |
-//! | `create` | `POST /session?directory=<cwd>` then `prompt_async` | `POST /v1/sessions` |
-//! | errors | 401 → [`LaneError::Unauthorized`]; 404 on a session route → [`LaneError::UnknownSession`], on a permission/question route → [`LaneError::UnknownApproval`]; 409/4xx with an opencode error body → `NotAccepting`/`BadRequest(message)` by body; other non-2xx → [`LaneError::Failed`]; dial failure → [`LaneError::Unavailable`] | the error table verbatim |
+//! | `sessions` | `GET /session` → every root on that server (the global store); activity from `/session/status`: `busy|retry → Working`, `idle → Idle` | `GET /v1/sessions`; activity per the six-state mapping below |
+//! | `history` | `GET /session/{sessionID}/message` through a fresh fold (seq from 1); `cursor` ignored (`history_cursor: false`), `truncated` from the page cap | `GET …/history?offset&limit` (`offset=-{limit}` for the tail); `cursor` = `lastEventId`, honored (`history_cursor: true`), cut POSITIONALLY at the cursor's envelope |
+//! | `send(Queue)` | `POST /session/{sessionID}/prompt_async` | `POST …/messages {text, mode: "queue"}` — always accepted |
+//! | `send(Interject)` | [`LaneError::NotAccepting`] | `mode: "interject"`; `409 not_accepting` unless the session is `working` |
+//! | `cancel` | `POST /session/{sessionID}/abort` | `POST …/cancel`; `409 not_accepting` unless `working` (see correction 8) |
+//! | `approvals` | fold state seeded from `GET /permission` + `GET /question` (`?directory=` of the session) filtered to the root id **and its descendants** (`GET /session/{sessionID}/children`, refreshed on a `session.created` whose `parentID` is in the set) | `GET …/approvals` — addressable state, `pending|submitted|resolved`, re-fetched after EVERY reconnect (approval frames are not resumable) |
+//! | `answer(Permission)` | `POST /permission/{requestID}/reply {reply}` (the live route; the deprecated session-scoped route is the recorded fallback) | `GET …/approvals/{id}` to re-read the authoritative request, then `POST …/approvals/{id} {"response":{"outcome":{"outcome":"selected","optionId":…}}}` — the option chosen by its `kind` (correction 3), never by id |
+//! | `answer(Question)` | `POST /question/{requestID}/reply {answers}`; [`LaneAnswer::Reject`] → `…/reject` | `{"outcome":"accepted","answers":{<question TEXT>: [labels…]}}` — keyed by the question's text (correction 4) |
+//! | `answer(Choice)` | the offered option id, which for opencode IS one of its three | the offered `optionId` verbatim; on a plan approval, `approved`/`cancelled` |
+//! | `subscribe` | `GET /event?directory=<session dir>` opened **first**, then the REST seed while live frames buffer; `Reset` … `Ready` brackets every (re)connect; transcript frames filtered to the root id, approval frames to root + descendants; empty-id frames count as liveness | `GET …/events` (SSE) opened **first** and buffered, then the REST seed, then the buffer drained through the seen-set, then `Ready`; a reconnect carries `Last-Event-ID` and is SILENT within the bound (correction 1) |
+//! | `create` | `POST /session?directory=<cwd>` then `prompt_async` | `POST /v1/sessions {cwd, text}` |
+//! | errors | 401 → [`LaneError::Unauthorized`]; 404 on a session route → [`LaneError::UnknownSession`], on a permission/question route → [`LaneError::UnknownApproval`]; 409/4xx with an opencode error body → `NotAccepting`/`BadRequest(message)` by body; other non-2xx → [`LaneError::Failed`]; dial failure → [`LaneError::Unavailable`] | the table below |
+//!
+//! gx's error envelope is `{error, message}` with eight codes, and each maps to
+//! exactly one variant — a caller branches on the variant, never on the text:
+//!
+//! | gx code | status | [`LaneError`] |
+//! |---|---|---|
+//! | `unauthorized` | 401 | [`LaneError::Unauthorized`] |
+//! | `bad_request` | 400 | [`LaneError::BadRequest`] (gx's message, whole) |
+//! | `unknown_session` | 404 | [`LaneError::UnknownSession`] |
+//! | `unknown_approval` | 404 | [`LaneError::UnknownApproval`] |
+//! | `already_submitted` | 409 | [`LaneError::AlreadySubmitted`] |
+//! | `already_resolved` | 409 | [`LaneError::AlreadyResolved`] |
+//! | `not_accepting` | 409 | [`LaneError::NotAccepting`] |
+//! | `leader_unavailable` | 503 | [`LaneError::Unavailable`] |
+//! | dial failure / timeout | — | [`LaneError::Unavailable`] (naming what was tried) |
+//! | other non-2xx / unparseable | — | [`LaneError::Failed`] (status + body head) |
+//!
+//! # What the gx adapter changed
+//!
+//! A contract validated against ONE implementation is a design. gx is the second
+//! adapter, and these twelve corrections are what it forced. They are recorded
+//! here because the next adapter — and shed-mobile's hand-written mirror — read
+//! this doc as the contract.
+//!
+//! 1. **A silent resume is allowed, and [`LaneEvent::Reset`] … [`LaneEvent::Ready`]
+//!    is the *reseed* bracket only.** On an adapter advertising
+//!    [`LaneCapabilities::history_cursor`], a reconnect the server accepts FROM
+//!    THE CURSOR emits no `Reset` at all: the ring, the open streak, the
+//!    generation and the client's view all survive. It is bounded — at most 3
+//!    attempts within 30 s of the first loss; past that, on a server-sent reset,
+//!    or on a cursor the server will not honor, the adapter reseeds with the full
+//!    `Reset` … `Ready` bracket and rebuilds. **Every reconnect, silent or not,
+//!    re-fetches what the stream does not replay** (the approvals, the session
+//!    row) and emits last-write-wins [`LaneEvent::Approval`]/[`LaneEvent::Session`]
+//!    frames — including a [`LaneApprovalStatus::Resolved`] tombstone for an
+//!    approval the client is holding as pending that the fetch no longer lists.
+//!    `Reset::reason` stays free text (`connect`, `cursor_lost`,
+//!    `server_reset:<r>`, `stall`) and nothing switches on it. **Transport repair
+//!    is not a `LaneEvent`**: an adapter that reconnects calls a client-supplied
+//!    hook before every connect attempt, so a client can re-establish an SSH
+//!    forward without the contract growing a frame for it. opencode is
+//!    unchanged — it advertises `history_cursor: false` and every reconnect is a
+//!    reseed.
+//! 2. **[`LaneAnswer::Choice`]** — "the option with this id, exactly as offered".
+//!    Strict in both directions: serde refuses an unknown `kind`, and an adapter
+//!    answers [`LaneError::BadRequest`] for an id the approval did not offer. It
+//!    is named `Choice` and not `Option` for the obvious Rust reason.
+//! 3. **[`LaneApprovalOption::kind`]** carries the option's SEMANTIC kind when
+//!    the agent states one (`allow_once`, `allow_always`, `reject_once`,
+//!    `reject_always` — the ACP vocabulary, snake_case, spelled once in
+//!    [`option_kind`]). gx fills it from the request; opencode fills
+//!    `allow_once`/`allow_always`/`reject_once` for its three — and its third
+//!    option is the case that proves the split, since its id stays opencode's
+//!    own `reject` while its kind is `reject_once`.
+//!    **[`LaneAnswer::Permission`] maps by `kind`, never by id**, and
+//!    [`LaneApproval::option_for`] IS that mapping — one implementation, so gx,
+//!    opencode and shed-mobile's Dart mirror cannot each re-derive the fallback
+//!    clause differently: [`LaneDecision::AllowOnce`] → the option whose kind is
+//!    `allow_once`, [`LaneDecision::AllowAlways`] → `allow_always`,
+//!    [`LaneDecision::Reject`] → `reject_once`, falling back (for `Reject`
+//!    alone) to the first option whose kind starts `reject`; no match is
+//!    [`LaneError::BadRequest`], which the ADAPTER raises because only it can
+//!    name the agent. **Ids are opaque.** gx's
+//!    own fixtures pair `optionId: "allow-once"` with `kind: "allow_once"`, which
+//!    is exactly the coincidence that makes id-matching look like it works until
+//!    an agent numbers its options.
+//! 4. **[`LaneQuestion::id`]** is the key an answer is filed under. gx uses the
+//!    question's TEXT (what its own TUI keys by); opencode has no key and leaves
+//!    it `None` (positional). [`LaneAnswer::Question::answers`] stays POSITIONAL
+//!    — the adapter maps position → key — so a client never has to know which
+//!    agent it is talking to. `custom` stays `false` on gx: free text there is an
+//!    "Other" answer plus a separate annotations channel this contract cannot
+//!    carry yet, and inviting typing the agent will reject is worse than not
+//!    offering it.
+//! 5. **Credentials are the client's job.** There is no credential type in this
+//!    contract and there will not be one: an adapter takes its credentials at
+//!    construction, from a source the client supplies; roost carries only WHERE
+//!    the agent is, never HOW to be let in. gx needs a bearer token on every
+//!    route but its health check, and that token lives on the host that runs gx —
+//!    so the adapter's crate defines the source, and the client (desktop today,
+//!    the phone next) decides how to read it.
+//! 6. **[`crate::rc::RcActivity`] from gx's six states:** `working` → `Working`;
+//!    `needs_input` → `NeedsApproval` when the session has a pending approval,
+//!    else `NeedsInput`; `idle`, `completed` and `dormant` → `Idle`; `dead` and
+//!    anything unrecognized → `Unknown`. **A lane-held unanswered approval
+//!    overrides both `activity` (→ `NeedsApproval`) and
+//!    [`LaneSession::pending_approvals`]** on every session row the adapter
+//!    emits: the adapter's fold knows about an approval the roster poll does not.
+//! 7. **[`LaneSession::approximate`] is corrected, not changed.** opencode reports
+//!    `true` on every row it emits — its activity comes from a cheap status poll.
+//!    gx is the first producer to report `false`. No opencode code changes; the
+//!    doc simply stops implying the flag is ever situational there.
+//! 8. **Cancel may be refused.** An adapter whose agent rejects a no-op cancel
+//!    surfaces [`LaneError::NotAccepting`] rather than swallowing it as `Ok(())`;
+//!    clients gate the affordance on [`crate::rc::RcActivity::Working`]. Hiding
+//!    the refusal would make a real "the session moved on" indistinguishable
+//!    from success.
+//! 9. **The feed vocabulary and the sanitizers live in [`feed`]** —
+//!    `FEED_ROLE_*`, `FEED_TYPE_*`, [`feed::sanitize_feed_text`],
+//!    [`feed::bound_token`], [`feed::truncate_bytes`], the caps and the ANSI
+//!    stripper. They were `shed-opencode`'s; a second adapter reaching into the
+//!    first one for a sanitizer is a dependency no release schedule survives.
+//!    `shed-opencode` re-exports every one of them.
+//! 10. **[`ring::MessageRing`] and [`backoff`] moved down here too, WITHOUT
+//!     `chrono`.** [`ring::MessageRing::append`] takes `now_unix_ms: i64` and
+//!     defaults a missing `ts` through [`crate::roost::rfc3339_z`]; callers that
+//!     hold a `DateTime<Utc>` pass `…timestamp_millis()`. The invariant this
+//!     protects is mechanical: `cargo tree -p shed-core-ffi` and
+//!     `cargo tree -p shed-core --target aarch64-linux-android` must list no crate
+//!     they did not list before. `regex` was already a shed-core dependency, which
+//!     is the only reason the ANSI stripper could come along.
+//! 11. **[`crate::roost::loopback_base_url`]** is roost's own rule, ported
+//!     verbatim: `http`, a host of `127.0.0.1`/`localhost`/`[::1]`, an explicit
+//!     decimal port in `1..=65535`, and nothing after it. It is what promotes a
+//!     grok tab to [`crate::rc::RcKind::Gx`] and what a discovery record's URL is
+//!     matched under, so shed judges an agent-supplied URL by exactly the rule
+//!     roost judged it by.
+//! 12. **The mapping table above is rewritten from gx as built**, and the error
+//!     table is explicit rather than "the error table verbatim" — a row-by-row
+//!     table is a test, and a prose promise is not.
+//!
+//! One thing these corrections deliberately did NOT do: add
+//! `LaneDecision::RejectAlways`, put a `LaneCredentials` type in the contract, or
+//! grow an in-place row-update event. Rows stay append-only; an adapter that
+//! wants to revise a row emits a new one.
 
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
 use crate::rc::{RcActivity, RcFeedMessage};
+
+pub mod backoff;
+pub mod feed;
+pub mod ring;
 
 // ---- sessions ----
 
@@ -138,6 +275,12 @@ pub struct LaneSession {
     /// `true` when the adapter derived `activity`/`pending_approvals` from a
     /// cheap or stale source (a roster poll rather than a live fold), so a client
     /// can render the row without claiming precision it does not have.
+    ///
+    /// **opencode reports `true` on every row it emits** — its activity comes
+    /// from a status poll, on the seeded row as much as on a live one. gx is the
+    /// first producer to report `false`. The flag is per-producer in practice,
+    /// not per-row; a client that treats a `false` as "trust this one more" is
+    /// reading it right, and one that expects opencode to vary it is not.
     pub approximate: bool,
     /// Set on a child session; `None` on a root. Descendants exist because an
     /// agent can spawn sub-sessions whose approvals still block the parent.
@@ -331,12 +474,55 @@ impl<'de> Deserialize<'de> for LaneApprovalStatus {
 /// own (opencode's `QuestionOption` is `label` + `description`), in which case
 /// the adapter sets `id = label` — the contract keeps an id so a client never has
 /// to send display text back as an identifier by accident.
+///
+/// **`id` is OPAQUE and `kind` is the semantics.** An agent numbers, hashes or
+/// names its option ids however it likes; the only safe use of one is to hand it
+/// straight back ([`LaneAnswer::Choice`]). Anything that needs to know what an
+/// option MEANS — a client styling a destructive button, an adapter translating
+/// [`LaneAnswer::Permission`] — reads `kind`. gx's own fixtures happen to pair
+/// `optionId: "allow-once"` with `kind: "allow_once"`, which is exactly the
+/// coincidence that makes id-sniffing look correct right up until an agent
+/// numbers its options `p-1…p-4`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LaneApprovalOption {
+    /// Opaque. Round-trip it; never parse it.
     pub id: String,
     pub label: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+    /// The option's semantic kind when the agent states one — the ACP
+    /// vocabulary in snake_case, spelled once in [`option_kind`]. `None` when
+    /// the agent offers no semantics: a question's answer labels have none
+    /// ("yes"/"no" is not a permission posture), and an agent that simply does
+    /// not state one leaves it absent rather than having one guessed for it.
+    /// Both permission adapters DO state one.
+    ///
+    /// A `String` rather than an enum on purpose. It is a STREAM value, and the
+    /// module doc's asymmetric rule says an inbound value this build has never
+    /// heard of must degrade rather than fail the decode of the whole enclosing
+    /// [`LaneEvent`] — an approval that vanishes because a newer agent grew a
+    /// fifth option kind is the failure mode [`LaneApprovalStatus`] documents at
+    /// length. Clients match the four known values and render anything else as a
+    /// plain button.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+}
+
+/// The four ACP option kinds an adapter fills [`LaneApprovalOption::kind`] with,
+/// as the wire spells them.
+///
+/// Constants rather than an enum, for the reason on the field itself: the wire
+/// value is tolerated open, and these exist so the three producers and the two
+/// clients spell the same four strings.
+pub mod option_kind {
+    /// Allow this one invocation.
+    pub const ALLOW_ONCE: &str = "allow_once";
+    /// Allow this and every matching future invocation.
+    pub const ALLOW_ALWAYS: &str = "allow_always";
+    /// Refuse this one invocation.
+    pub const REJECT_ONCE: &str = "reject_once";
+    /// Refuse this and every matching future invocation.
+    pub const REJECT_ALWAYS: &str = "reject_always";
 }
 
 /// A structured question inside an approval: a header, the question itself, and
@@ -347,6 +533,19 @@ pub struct LaneApprovalOption {
 /// cannot tell must not invite typing the agent will reject.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct LaneQuestion {
+    /// The key this question's answer is filed under, when the agent files
+    /// answers by key rather than by position.
+    ///
+    /// gx sets it to the question's own TEXT — that is literally what its TUI
+    /// keys the answer map by — so an adapter that guessed an index would post
+    /// an answer the agent never reads. opencode files positionally and leaves
+    /// this `None`.
+    ///
+    /// It is here so the KEY is visible to a client that wants to echo it, not
+    /// so a client has to use it: [`LaneAnswer::Question::answers`] stays
+    /// positional and the adapter does the mapping.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
     pub header: String,
     pub question: String,
     #[serde(default)]
@@ -367,8 +566,9 @@ pub struct LaneQuestion {
 /// A permission and a question are the same row shape on purpose: a client
 /// renders ONE approval panel, and `kind` picks which affordance it attaches.
 /// **[`LaneApproval::kind`] selects which field a client renders — the two are
-/// never both populated.** A [`LaneApprovalKind::Permission`] puts its fixed
-/// choices in `options` (`allow-once`, `allow-always`, `reject`) and leaves
+/// never both populated.** A [`LaneApprovalKind::Permission`] puts the options
+/// THE AGENT OFFERED in `options` — however many, in offered order, each with an
+/// opaque id and an optional semantic [`LaneApprovalOption::kind`] — and leaves
 /// `questions` empty; a [`LaneApprovalKind::Question`] puts the structured form in
 /// `questions` — each [`LaneQuestion`] carrying its OWN `options` plus a `custom`
 /// flag for free text — and leaves the top-level `options` empty. Rendering the
@@ -410,7 +610,78 @@ pub struct LaneApproval {
     pub created_at_unix_ms: Option<i64>,
 }
 
-/// The three fixed decisions a permission approval accepts.
+impl LaneApproval {
+    /// The offered option a [`LaneDecision`] selects — **by
+    /// [`LaneApprovalOption::kind`], never by id**.
+    ///
+    /// This is the one implementation of the module doc's correction 3. It is
+    /// here, and not in each adapter, because the rule has a clause subtle
+    /// enough that independent readings would not agree: the `Reject` fallback.
+    /// Every adapter that answers a [`LaneAnswer::Permission`] resolves it
+    /// through this, and shed-mobile mirrors THIS behaviour rather than
+    /// re-deriving it from the prose.
+    ///
+    /// The rule, in order:
+    ///
+    /// 1. **Exact kind.** [`LaneDecision::AllowOnce`] →
+    ///    [`option_kind::ALLOW_ONCE`], [`LaneDecision::AllowAlways`] →
+    ///    [`option_kind::ALLOW_ALWAYS`], [`LaneDecision::Reject`] →
+    ///    [`option_kind::REJECT_ONCE`].
+    /// 2. **The `Reject` fallback, and only `Reject`:** the FIRST option — first
+    ///    in OFFERED order — whose kind starts with `reject`. An agent that
+    ///    offers only [`option_kind::REJECT_ALWAYS`] must still be refusable,
+    ///    and a refusal that is broader than asked for is safe in a way that a
+    ///    broader ALLOW would not be. That asymmetry is why there is no matching
+    ///    fallback for the two allow decisions: silently upgrading an
+    ///    "allow once" into an "allow always" is precisely the bug this contract
+    ///    exists to prevent.
+    /// 3. Otherwise `None`.
+    ///
+    /// An option with no `kind` never matches — the contract reads an absent
+    /// kind as "this agent states no semantics", and guessing one from the id is
+    /// the id-sniffing this method exists to replace.
+    ///
+    /// `None` is not an error here: the caller turns it into
+    /// [`LaneError::BadRequest`], because the message that helps ("gx offered
+    /// no allow_always option") names the agent, and this module does not know
+    /// which agent it is looking at.
+    pub fn option_for(&self, decision: LaneDecision) -> Option<&LaneApprovalOption> {
+        let wanted = match decision {
+            LaneDecision::AllowOnce => option_kind::ALLOW_ONCE,
+            LaneDecision::AllowAlways => option_kind::ALLOW_ALWAYS,
+            LaneDecision::Reject => option_kind::REJECT_ONCE,
+        };
+        // `find` walks in offered order, so "first" is always the agent's first.
+        if let Some(exact) = self
+            .options
+            .iter()
+            .find(|o| o.kind.as_deref() == Some(wanted))
+        {
+            return Some(exact);
+        }
+        if matches!(decision, LaneDecision::Reject) {
+            return self
+                .options
+                .iter()
+                .find(|o| o.kind.as_deref().is_some_and(|k| k.starts_with("reject")));
+        }
+        None
+    }
+}
+
+/// The three SEMANTIC decisions a permission approval accepts, independent of
+/// what the agent named its options.
+///
+/// An adapter resolves one of these against [`LaneApproval::options`] **by
+/// [`LaneApprovalOption::kind`], never by id** — through
+/// [`LaneApproval::option_for`], which is the single implementation of the
+/// rule: `AllowOnce` → the option whose kind is `allow_once`, `AllowAlways` →
+/// `allow_always`, `Reject` → `reject_once` (falling back to the first option
+/// whose kind starts `reject`, so an agent offering only `reject_always` is
+/// still refusable). No match is
+/// [`LaneError::BadRequest`] — silently picking the nearest option would post a
+/// decision the human did not make. A client that wants a specific offered
+/// option sends [`LaneAnswer::Choice`] instead.
 ///
 /// **Strict** under the module doc's asymmetric rule — this is a client→adapter
 /// COMMAND, and an unrecognized decision must be rejected at decode rather than
@@ -438,11 +709,48 @@ pub enum LaneDecision {
 /// its mirror-image [`LaneEvent`]) — an answer travels client→adapter, so an
 /// unrecognized `kind` is a command this build cannot honor and must be refused,
 /// not degraded into a silent no-op.
+///
+/// Strictness runs to the FIELDS, not just the variant tag: `deny_unknown_fields`
+/// means `{"kind":"permission","decision":"allow_always","option_id":"reject"}`
+/// is REFUSED rather than decoding as a bare `AllowAlways` with the `option_id`
+/// dropped. That payload reads as "refuse" and would have executed as "allow
+/// always" — and it is reachable, because shed-mobile hand-mirrors this enum and
+/// a Dart encoder mid-migration between the two answer shapes can emit both keys.
+/// Being refused with an error is the only outcome that tells it so.
+///
+/// **One carve-out, forced by serde:** [`LaneAnswer::Reject`] is a UNIT variant,
+/// and an internally tagged unit variant is built from the tag alone — it ignores
+/// any other keys, and no attribute changes that. It is left as-is because the
+/// direction is safe: extra keys on a `reject` are ignored in favour of refusing,
+/// which is the conservative answer. Making it strict would mean turning it into
+/// a struct variant, changing the Rust API at every construction site (the Tauri
+/// crate included) for no wire change at all.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum LaneAnswer {
     Permission {
         decision: LaneDecision,
+    },
+    /// "The option with this id, exactly as it was offered."
+    ///
+    /// The generic answer, and the one a capability-driven panel sends: it
+    /// renders [`LaneApproval::options`] as buttons in offered order and posts
+    /// back whichever id the human pressed, without a table mapping this
+    /// agent's option vocabulary onto three fixed decisions. That is what lets
+    /// an agent offer four options (or two, or six) and a client render them
+    /// without a code change.
+    ///
+    /// **Strict on both ends.** An id the approval did not offer is
+    /// [`LaneError::BadRequest`] from the adapter — never a guess at the
+    /// closest match, because the guess would be an unintended "allow". Named
+    /// `Choice` and not `Option` for the obvious Rust reason.
+    ///
+    /// [`LaneAnswer::Permission`] survives beside it as the SEMANTIC answer
+    /// ("allow this once", whatever the agent calls it) and is what a scripted
+    /// caller or a keyboard shortcut sends; the adapter resolves it by
+    /// [`LaneApprovalOption::kind`].
+    Choice {
+        option_id: String,
     },
     Question {
         #[serde(default)]
@@ -492,8 +800,13 @@ pub enum LaneEvent {
     /// LAST-WRITE-WINS, exactly like [`crate::rc::RcFeedApproval`]: a client must
     /// not require having seen the `pending` frame before the `resolved` one.
     Approval { approval: LaneApproval },
-    /// A (re)connect started: DISCARD nothing yet, but stage every frame that
+    /// A **reseed** started: DISCARD nothing yet, but stage every frame that
     /// follows until the matching [`LaneEvent::Ready`], then swap atomically.
+    ///
+    /// `reason` is FREE TEXT for a human and a log line — `connect`,
+    /// `cursor_lost`, `server_reset:<r>`, `stall` — and nothing branches on it.
+    /// A reconnect that resumed from a cursor emits no `Reset` at all (module
+    /// doc, correction 1).
     Reset { reason: String, generation: u64 },
     /// The seed for `generation` is complete — swap the staged view in.
     Ready { generation: u64 },
@@ -650,7 +963,11 @@ pub enum SendMode {
 /// affordance instead of discovering the refusal on a tap.
 ///
 /// Opencode's row is
-/// `{ kind: "opencode", interject: false, create: true, cancel: true, approvals: true, history_cursor: false }`.
+/// `{ kind: "opencode", interject: false, create: true, cancel: true, approvals: true, history_cursor: false }`;
+/// gx's is
+/// `{ kind: "gx", interject: true, create: true, cancel: true, approvals: true, history_cursor: true }`.
+/// The two differ on exactly the two flags a client's UI branches on, which is
+/// why the flags exist.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LaneCapabilities {
     /// The adapter's agent token (`"opencode"`, `"gx"`, …) — the same vocabulary
@@ -667,6 +984,10 @@ pub struct LaneCapabilities {
     /// [`AgentLane::history`] honors a cursor. When `false` the adapter refolds
     /// from the top and IGNORES the cursor argument, so a client must not treat
     /// a page as splice-able onto what it holds.
+    ///
+    /// It is also the flag that says a **silent resume** is possible on this
+    /// adapter's stream (module doc, correction 1): a `true` here means a
+    /// reconnect may leave no trace in the event stream at all.
     pub history_cursor: bool,
 }
 
@@ -777,7 +1098,15 @@ pub trait AgentLane: Send + Sync {
     /// Send `text` to a session. See [`SendMode`] for what each mode promises.
     async fn send(&self, id: &str, text: &str, mode: SendMode) -> Result<(), LaneError>;
 
-    /// Stop the turn in flight. A no-op turn is not an error.
+    /// Stop the turn in flight.
+    ///
+    /// An adapter whose agent REFUSES a cancel with nothing to cancel surfaces
+    /// that as [`LaneError::NotAccepting`] rather than swallowing it as
+    /// `Ok(())` (module doc, correction 8) — a hidden refusal is
+    /// indistinguishable from a cancel that worked. Clients gate the affordance
+    /// on [`crate::rc::RcActivity::Working`] so the refusal is rare and
+    /// explicable when it happens (the turn ended between the render and the
+    /// tap).
     async fn cancel(&self, id: &str) -> Result<(), LaneError>;
 
     /// Everything open on this session — INCLUDING its descendants' approvals,
@@ -788,6 +1117,11 @@ pub trait AgentLane: Send + Sync {
     /// Answer one approval. `id` is the session, `approval_id` the approval on
     /// it. A second answer to the same approval is refused with
     /// [`LaneError::AlreadySubmitted`] or [`LaneError::AlreadyResolved`].
+    ///
+    /// A [`LaneAnswer::Choice`] naming an id the approval did not offer, and a
+    /// [`LaneAnswer::Permission`] whose decision matches no offered
+    /// [`LaneApprovalOption::kind`], are both [`LaneError::BadRequest`] — an
+    /// adapter never picks the nearest option.
     async fn answer(
         &self,
         id: &str,
@@ -800,10 +1134,13 @@ pub trait AgentLane: Send + Sync {
     /// The adapter spawns its own pump and hands back the receiver plus the stop
     /// handle. The stream opens with a [`LaneEvent::Reset`] and reaches steady
     /// state at the matching [`LaneEvent::Ready`]; it ENDS at a
-    /// [`LaneEvent::Down`]. `cursor` is a resume hint, honored under the same
-    /// [`LaneCapabilities::history_cursor`] rule as [`AgentLane::history`]. Two
-    /// subscriptions to one session are two independent streams (and, on
-    /// opencode, two connections).
+    /// [`LaneEvent::Down`]. LATER reconnects may be silent — on an adapter
+    /// advertising [`LaneCapabilities::history_cursor`] a bounded cursor resume
+    /// emits no `Reset` at all (module doc, correction 1) — so a client must not
+    /// count brackets to count connections. `cursor` is a resume hint, honored
+    /// under the same [`LaneCapabilities::history_cursor`] rule as
+    /// [`AgentLane::history`]. Two subscriptions to one session are two
+    /// independent streams (and, on opencode, two connections).
     ///
     /// Take the result apart with [`LaneSubscription::into_parts`] and keep BOTH
     /// halves — `…await?.rx` compiles, drops the stop handle, and hands back a
