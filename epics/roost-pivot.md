@@ -99,13 +99,14 @@ consumes the hub. S7 is done (plan 016) — it had no blockers.
   transcript, send a prompt, cancel, answer a permission or a question — from
   the clients, per the artifact linked at the top of this file. Two agents, not
   one: a single adapter proves the plumbing, a second proves the *contract*.
-  **This is a requirement for the next release**, so A4, A7 and S4m are
+  **This is a requirement for the next release**, so A4 (done), A7 and S4m are
   release-blocking, not nice-to-have follow-ups.
 - **Validation is automated on Flutter desktop.** Both agents' lanes are driven
   by the Flutter desktop build rather than by hand or on a device — it is the
   same Dart code the phone runs, launches from a dev machine, and can be scripted.
   Hardware testing on a real phone comes after that is green, and is the owner's
-  own pass, not a gate.
+  own pass, not a gate. (Desktop-side, the Tauri app has its own harness cells;
+  see `desktop/tools/shedtest/test_tauri_lane.py`.)
 - **Release held to M6.** Do not cut a tag inside this epic; the trigger
   is demolition done, not features done. `sx` — the component this rule
   was originally written to hold back — was sunset unreleased in plan 016
