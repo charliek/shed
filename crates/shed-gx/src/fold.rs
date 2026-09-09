@@ -465,7 +465,7 @@ impl GxFold {
             // named list rather than folded into the catch-all so the module
             // doc's claim is true — the fold CONSULTS `is_ignored_kind` — and
             // so "deliberately ignored" stays distinguishable from "a kind this
-            // build has never heard of", which is the distinction C3's watcher
+            // build has never heard of", which is the distinction the watcher
             // wants for a counter.
             k if is_ignored_kind(k) => {}
             _ => {}
@@ -475,6 +475,16 @@ impl GxFold {
     // ---- chunks ----
 
     fn chunk(&mut self, env: &GxEnvelope, role: &'static str, feed_type: &'static str) {
+        // §3.4's activity rule is "chunks / `tool_call*` → `Working`", and the
+        // chunk half of it is not decoration: a user prompt or the first token
+        // of an answer is the earliest evidence a turn has started, and it
+        // arrives BEFORE gx's roster frame says so. A fold that only moved on
+        // `tool_call` left a turn without tools looking idle for its whole
+        // length — the spinner that never starts.
+        //
+        // `turn_completed` is what ends it, and an open approval overrides both
+        // (see `GxFold::activity`).
+        self.activity = RcActivity::Working;
         let text = content_text(env.params.update.get("content"));
         let prompt_id = env.prompt_id();
 
@@ -570,7 +580,7 @@ impl GxFold {
 
     /// Emit the open streak as a row, if there is one with anything in it.
     ///
-    /// Public because the watcher (C3) flushes on silence and on `Down` — an
+    /// Public because the watcher flushes on silence and on `Down` — an
     /// open streak survives a silent resume and is flushed as a PARTIAL row
     /// when the subscription ends, so a half-finished turn is shown rather than
     /// lost. A reseed discards it instead ([`GxFold::reset`]).
@@ -600,6 +610,26 @@ impl GxFold {
     /// after `flush_after` of silence" question.
     pub fn has_open_streak(&self) -> bool {
         self.open.is_some()
+    }
+
+    /// How much text the open streak has accumulated, or `None` when there is
+    /// none.
+    ///
+    /// **This is the watcher's flush CLOCK**, and it is a length rather than a
+    /// timestamp because the fold deliberately has no clock (see the module
+    /// doc). The watcher notices this value changing and stamps the moment
+    /// itself.
+    ///
+    /// Why it cannot be "when did a byte last arrive on the connection": an
+    /// IGNORED kind is transparent to a streak by design, and `hook_execution`
+    /// is 15 of every 40 frames on real gx wire, interleaving chunk streaks
+    /// constantly. A timer reset by arriving bytes is therefore reset by frames
+    /// that produce nothing a user can see — so a turn that stopped generating
+    /// text would sit behind that trickle and never flush its partial row. The
+    /// streak's own growth is the only signal that tracks what the reader is
+    /// actually waiting for.
+    pub fn open_streak_bytes(&self) -> Option<usize> {
+        self.open.as_ref().map(|o| o.text.len())
     }
 
     // ---- tools ----
@@ -808,6 +838,25 @@ impl GxFold {
     ///
     /// Returns `true` when this was the first sight (i.e. a row was emitted).
     pub fn note_approval(&mut self, approval: LaneApproval) -> bool {
+        // **An approval never moves BACKWARDS.** gx's lifecycle is monotonic —
+        // `pending → submitted → resolved`, and a re-ask is a new
+        // `toolCallId` — so a lower-ranked status for an id already held is
+        // always a STALE view arriving late, never news.
+        //
+        // This is what makes the contract's "id-keyed, last-write-wins" rule
+        // true in practice rather than merely in arrival order. A pending
+        // `approval` frame buffered during a reconnect can easily land after
+        // the refetch that already resolved it; applying it would resurrect an
+        // approval nobody can answer any more and leave the panel blocked on
+        // it indefinitely. Ordering alone cannot fix that — draining buffered
+        // frames first breaks the mirror case, where a live frame that arrived
+        // DURING the fetch is newer than the fetch — so the ordering is not
+        // what is relied on: the rank is.
+        if let Some(held) = self.approvals.get(&approval.id) {
+            if status_rank(&approval.status) < status_rank(&held.status) {
+                return false;
+            }
+        }
         let first = !self.approvals.contains_key(&approval.id);
         let emit = first && approval.status.is_pending();
         if emit {
@@ -918,6 +967,21 @@ impl GxFold {
 // ---------------------------------------------------------------------------
 // history cutting
 // ---------------------------------------------------------------------------
+
+/// How far along gx's approval lifecycle a status is.
+///
+/// Only the ORDER matters, and only for refusing a stale write (see
+/// [`GxFold::note_approval`]). An unrecognized status ranks lowest: this build
+/// cannot place it in the lifecycle, and letting an unknown value displace a
+/// `resolved` one would be exactly the regression the rank exists to stop.
+fn status_rank(status: &LaneApprovalStatus) -> u8 {
+    match status {
+        LaneApprovalStatus::Other(_) => 0,
+        LaneApprovalStatus::Pending => 1,
+        LaneApprovalStatus::Submitted => 2,
+        LaneApprovalStatus::Resolved => 3,
+    }
+}
 
 /// Which `sessionUpdate` kinds the fold deliberately ignores.
 ///

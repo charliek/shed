@@ -13,7 +13,7 @@
 //!   ├─ transport.rs — GxTransport, FixedDial
 //!   ├─ fold.rs      — pure: envelopes → rows + activity; approvals → LaneApproval
 //!   ├─ (ring / backoff / feed from shed_core::lane)
-//!   └─ watcher.rs   — the pump (plan 017 C3)
+//!   └─ watcher.rs   — the pump: seed, bounded silent resume, reconcile, Down
 //! ```
 //!
 //! # What is different about gx, in one place
@@ -38,18 +38,18 @@
 //! - **Its question answers are keyed by the question's TEXT**, which is what
 //!   its own TUI files them under.
 //!
-//! # What C2 does not have yet
+//! # Where to start reading
 //!
-//! The watcher (`watcher.rs`), the fake's SSE stream and resume rules, the live
-//! smoke and the fold golden are plan 017 C3.
-//! [`shed_core::lane::AgentLane::subscribe`] answers
-//! [`shed_core::lane::LaneError::Failed`] until then — loudly, so a missing
-//! implementation cannot be mistaken for a lane that is merely unreachable.
+//! [`watcher`] is the interesting half. It is the only place the two-URL rule,
+//! the credential pin, the fold's cursor and the contract's reconnect bracket
+//! all meet, and its module doc is the one-page description of what a gx
+//! subscription actually does.
 
 pub mod client;
 pub mod discovery;
 pub mod fold;
 pub mod transport;
+pub mod watcher;
 
 #[cfg(any(test, feature = "test-support"))]
 pub mod testing;
@@ -65,3 +65,7 @@ pub use discovery::{
 };
 pub use fold::{EventId, GxEnvelope, GxFold};
 pub use transport::{FixedDial, GxTransport};
+// The watcher's buffer bounds are deliberately NOT re-exported here. They are
+// `pub` in their module so the doc links resolve, but they are the pump's
+// internal sizing — not contract — and hoisting them to the crate root is how a
+// consumer comes to read them as one. (`shed-opencode` draws the same line.)

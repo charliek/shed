@@ -1,9 +1,9 @@
 //! The fold's tests — every **pure-fold** case plan 017 §3.4 names by hand, so
 //! an implementer cannot skip one.
 //!
-//! The cases that need the watcher (the escalation ladder, a partial streak
-//! across an EOF, the seed/live overlap) are C3's; everything here runs against
-//! the fold alone, with no wire and no clock.
+//! The cases that need a wire — the escalation ladder, a partial streak across
+//! an EOF, the seed/live overlap — live in `tests/watcher.rs`; everything here
+//! runs against the fold alone, with no transport and no clock.
 
 use serde_json::json;
 use shed_core::lane::feed::{FEED_TRUNC_MARKER, MAX_FEED_MESSAGE_BYTES};
@@ -664,6 +664,37 @@ fn a_tool_call_ends_an_open_streak() {
 // turns and timestamps
 // ---------------------------------------------------------------------------
 
+/// §3.4's activity rule is "chunks / `tool_call*` → `Working`", and the CHUNK
+/// half of it is what makes a turn without tools visible.
+///
+/// A prompt, or the first token of an answer, is the earliest evidence that a
+/// turn has started — earlier than gx's own roster frame. A fold that moved
+/// only on `tool_call` left a plain question-and-answer turn reading `unknown`
+/// from beginning to end, which a client renders as a spinner that never
+/// starts.
+#[test]
+fn a_chunk_starts_the_turn_and_turn_completed_ends_it() {
+    let mut fold = GxFold::new(SID);
+    assert_eq!(fold.activity(), RcActivity::Unknown, "nothing seen yet");
+
+    fold.apply(&chunk(1, "user_message_chunk", "hello", Some("p1")));
+    assert_eq!(
+        fold.activity(),
+        RcActivity::Working,
+        "the prompt itself starts the turn"
+    );
+
+    fold.apply(&chunk(2, "agent_message_chunk", "hi", Some("p1")));
+    assert_eq!(fold.activity(), RcActivity::Working);
+    // An ignored kind is transparent to the verdict, exactly as it is to a
+    // streak.
+    fold.apply(&hook(3));
+    assert_eq!(fold.activity(), RcActivity::Working);
+
+    fold.apply(&turn(4, "end_turn"));
+    assert_eq!(fold.activity(), RcActivity::Idle, "and only this ends it");
+}
+
 #[test]
 fn turn_completed_closes_the_streak_and_only_an_unusual_stop_reason_gets_a_row() {
     let mut fold = GxFold::new(SID);
@@ -791,6 +822,84 @@ fn the_first_sight_of_a_pending_approval_leaves_one_trace_row() {
     fold.note_approval(resolved);
     assert!(fold.drain_messages().is_empty());
     assert_eq!(fold.open_approvals(), 0);
+}
+
+/// **An approval never moves backwards**, which is what makes the contract's
+/// "id-keyed, last-write-wins" rule true in practice rather than merely in
+/// arrival order.
+///
+/// The interleaving this exists for is ordinary reconnect traffic: a `pending`
+/// approval frame is buffered while the seed's GETs run, the approval is
+/// answered in the meantime, the refetch no longer lists it and the watcher
+/// emits a `Resolved` tombstone — and only THEN is the buffered frame drained.
+/// Applied naively it would resurrect an approval nobody can answer any more,
+/// and the panel would sit blocked on it indefinitely on a perfectly healthy
+/// connection.
+///
+/// Ordering alone cannot fix it: draining buffered frames first breaks the
+/// mirror case, where a live frame that arrived DURING the fetch is genuinely
+/// newer than the fetch. So the rank is what is relied on, in both directions.
+#[test]
+fn a_stale_approval_frame_cannot_resurrect_a_resolved_one() {
+    let pending = lane_approval(&permission_resource("call_x"));
+    let mut resolved = pending.clone();
+    resolved.status = LaneApprovalStatus::Resolved;
+    let mut submitted = pending.clone();
+    submitted.status = LaneApprovalStatus::Submitted;
+
+    let mut fold = GxFold::new(SID);
+    assert!(
+        fold.note_approval(pending.clone()),
+        "first sight is a trace row"
+    );
+    assert_eq!(drain_rows(&mut fold).len(), 1, "…and it is taken here");
+    // The refetch says it is gone; the watcher tombstones it.
+    fold.note_approval(resolved.clone());
+    assert_eq!(fold.open_approvals(), 0);
+
+    // …and now the stale buffered frame lands.
+    assert!(
+        !fold.note_approval(pending.clone()),
+        "a stale pending frame is refused outright"
+    );
+    assert_eq!(
+        fold.held_approvals().first().map(|a| a.status.clone()),
+        Some(LaneApprovalStatus::Resolved),
+        "the tombstone stands; the approval is not resurrected"
+    );
+    assert_eq!(
+        fold.open_approvals(),
+        0,
+        "and nothing is waiting on the human"
+    );
+    // Append-only: neither the tombstone nor the refused write mints a row.
+    assert!(drain_rows(&mut fold).is_empty());
+
+    // The mirror case, which an ordering fix would have broken: a NEWER frame
+    // still wins over an older refetch.
+    let mut fold = GxFold::new(SID);
+    fold.note_approval(pending.clone());
+    fold.note_approval(resolved.clone());
+    assert!(
+        !fold.note_approval(submitted),
+        "submitted is behind resolved and is refused too"
+    );
+
+    // Forwards always applies, including same-rank refreshes — which is how
+    // gx's option-less placeholder is upgraded to the real request.
+    let mut fold = GxFold::new(SID);
+    let mut placeholder = pending.clone();
+    placeholder.options = Vec::new();
+    fold.note_approval(placeholder);
+    assert!(
+        fold.held_approvals()[0].options.is_empty(),
+        "the placeholder is what a client sees first"
+    );
+    fold.note_approval(pending);
+    assert!(
+        !fold.held_approvals()[0].options.is_empty(),
+        "a same-status refresh carrying the real options is NOT a downgrade"
+    );
 }
 
 #[test]
@@ -1106,7 +1215,7 @@ fn an_unrecognized_status_is_preserved_and_is_not_pending() {
 /// This is a regression test for a real bug: the fold used to pre-truncate at
 /// exactly that cap first, so the capping layer then saw a string that no longer
 /// EXCEEDED the cap and appended no marker — a truncated detail was
-/// indistinguishable from a complete one. Catching it before C3's golden froze
+/// indistinguishable from a complete one. Catching it before the replay golden froze
 /// the unmarked shape is the point.
 #[test]
 fn a_truncated_detail_is_always_marked_as_truncated() {

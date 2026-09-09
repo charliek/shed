@@ -7,10 +7,10 @@ use std::sync::Mutex;
 
 use serde_json::json;
 
-use shed_core::lane::{LaneApprovalOption, LaneDecision, LaneQuestion};
+use shed_core::lane::{LaneApprovalOption, LaneDecision, LaneEvent, LaneQuestion};
 
 use crate::discovery::{GxDiscovery, StaticCredentials};
-use crate::testing::{FakeGx, SENTINEL_TOKEN};
+use crate::testing::{CountingDial, FakeGx, SENTINEL_TOKEN};
 use crate::transport::FixedDial;
 
 use super::*;
@@ -20,39 +20,6 @@ const SID: &str = "01a0fa1e-0000-7000-8000-0000000000ab";
 // ---------------------------------------------------------------------------
 // counting doubles
 // ---------------------------------------------------------------------------
-
-/// A transport that counts its calls and can be pointed somewhere else — a
-/// forward that moved.
-#[derive(Debug)]
-struct CountingDial {
-    url: Mutex<reqwest::Url>,
-    calls: AtomicUsize,
-}
-
-impl CountingDial {
-    fn new(url: reqwest::Url) -> Arc<CountingDial> {
-        Arc::new(CountingDial {
-            url: Mutex::new(url),
-            calls: AtomicUsize::new(0),
-        })
-    }
-
-    fn calls(&self) -> usize {
-        self.calls.load(Ordering::SeqCst)
-    }
-
-    fn point_at(&self, url: reqwest::Url) {
-        *self.url.lock().expect("the dial lock") = url;
-    }
-}
-
-#[async_trait::async_trait]
-impl GxTransport for CountingDial {
-    async fn dial(&self) -> Result<reqwest::Url, LaneError> {
-        self.calls.fetch_add(1, Ordering::SeqCst);
-        Ok(self.url.lock().expect("the dial lock").clone())
-    }
-}
 
 /// A credential source that answers a scripted sequence, keeping the last
 /// answer once the script runs out, and counts how many times it was asked.
@@ -1665,21 +1632,43 @@ async fn the_token_never_appears_in_a_debug_string_or_on_any_error_path() {
     );
 }
 
+/// `subscribe` NEVER fails, and it does not have to be reachable to say so.
+///
+/// Everything that can go wrong — the dial, the pin, the connect, the seed —
+/// happens inside the pump and reaches the client as a `Reset` that never
+/// resolves and finally a `Down`. An `Err` here would give a client a second
+/// spelling of "the agent is not up" and therefore a second code path; the
+/// whole point of `Down` is that there is only one.
+///
+/// The pump's own behaviour is `tests/watcher.rs`; this pins the SIGNATURE's
+/// promise, against a session that does not even exist.
 #[tokio::test]
-async fn subscribe_is_a_loud_placeholder_until_c3() {
-    let (_fake, client) = wired().await;
-    // `LaneSubscription` has no `Debug` (it holds a JoinHandle), so the
-    // result is matched rather than unwrapped.
-    let Err(err) = client.subscribe(SID, None).await else {
-        panic!("subscribe must not pretend to work before C3");
+async fn subscribe_never_fails_even_for_a_session_that_is_not_there() {
+    // A bare fake: no sessions, and no pin — the pin guard answers `500` to a
+    // session it does not recognize, and this test is about the `404` that
+    // means "gx does not have this session", which is the one that is terminal.
+    let fake = FakeGx::start().await;
+    let client = client_for(&fake);
+    // `LaneSubscription` has no `Debug` (it holds a JoinHandle), so the result
+    // is matched rather than unwrapped.
+    let Ok(sub) = client.subscribe("no-such-session-1", None).await else {
+        panic!("subscribe must answer Ok and let the stream say Down");
     };
-    match &err {
-        // `Failed` and not `Unavailable`: the quiet variant is what a client
-        // renders as "the agent is not running", and a missing implementation
-        // must not be able to look like one.
-        LaneError::Failed(m) => assert!(m.contains("C3"), "{m}"),
-        other => panic!("expected a loud Failed, got {other:?}"),
+    let (mut rx, _stop) = sub.into_parts();
+    let mut saw_down = false;
+    while let Some(ev) = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+        .await
+        .expect("the pump answers within five seconds")
+    {
+        if let LaneEvent::Down { reason } = ev {
+            assert_eq!(reason, "unknown_session");
+            saw_down = true;
+            break;
+        }
     }
+    assert!(saw_down, "the subscription ends by SAYING so");
+    // And the pin guard never saw a verb addressed at the wrong session.
+    assert!(fake.violations().is_empty(), "{:?}", fake.violations());
 }
 
 // ---------------------------------------------------------------------------

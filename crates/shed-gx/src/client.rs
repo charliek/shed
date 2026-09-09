@@ -74,7 +74,7 @@ use crate::transport::GxTransport;
 /// in 15 s is not going to, but 5 s would turn an ordinary slow link into a
 /// stream of spurious `Unavailable`s.
 pub const REST_TIMEOUT: Duration = Duration::from_secs(15);
-/// The SSE client's CONNECT bound — the WATCHER's (plan 017 C3), spelled here
+/// The SSE client's CONNECT bound — the [`crate::watcher`]'s, spelled here
 /// so the adapter's whole timing surface reads in one place.
 ///
 /// There is deliberately no request timeout beside it: the SSE body is
@@ -178,7 +178,17 @@ pub struct GxClient {
     credentials: Arc<dyn GxCredentialSource>,
     timings: GxTimings,
     rest: reqwest::Client,
+    /// The SSE client. Separate from [`GxClient::rest`] for ONE reason, and it
+    /// is not tuning: `rest` carries a whole-request [`REST_TIMEOUT`], which on
+    /// a long-lived body would cut the stream every fifteen seconds. The
+    /// symptom would be invisible — the stream just ends, the watcher
+    /// reconnects, and the transcript resets forever — so the two clients are
+    /// kept apart rather than one client being reconfigured per call.
+    stream: reqwest::Client,
     pin: Arc<tokio::sync::Mutex<PinState>>,
+    /// Set by [`GxClient::request_unpin`] and consumed inside the pin gate. See
+    /// that method for why the unpin cannot simply be awaited.
+    unpin_requested: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// Hand-written so a token can never reach a log through a derived `Debug`.
@@ -220,13 +230,24 @@ impl GxClient {
             .timeout(REST_TIMEOUT)
             .build()
             .map_err(|e| failed(format!("building the gx REST client: {e}")))?;
+        // No `.timeout()`: see the field doc. Liveness on the SSE body is
+        // `GxTimings::stall`, and the two things on that connection that are
+        // NOT the body (the head, and a non-2xx's error body) are bounded by
+        // `STREAM_HEAD_TIMEOUT` at their call sites.
+        let stream = reqwest::Client::builder()
+            .no_proxy()
+            .connect_timeout(STREAM_CONNECT_TIMEOUT)
+            .build()
+            .map_err(|e| failed(format!("building the gx stream client: {e}")))?;
         Ok(GxClient {
             reported_url: reported_url.into(),
             transport,
             credentials,
             timings,
             rest,
+            stream,
             pin: Arc::new(tokio::sync::Mutex::new(PinState::default())),
+            unpin_requested: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         })
     }
 
@@ -282,6 +303,15 @@ impl GxClient {
     /// finds the epoch already established and sends no health check of its own.
     async fn ensure_pinned(&self) -> Result<Epoch, LaneError> {
         let mut st = self.pin.lock().await;
+        // A pending `request_unpin` is honoured HERE, under the lock and before
+        // any decision is taken, so an aborted pump's epoch cannot be inherited
+        // by the next connect.
+        if self
+            .unpin_requested
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            st.epoch = None;
+        }
         let dial = match self.transport.dial().await {
             Ok(dial) => dial,
             Err(e) => {
@@ -307,6 +337,41 @@ impl GxClient {
         let epoch = self.pin_epoch(dial, generation).await?;
         st.epoch = Some(epoch.clone());
         Ok(epoch)
+    }
+
+    /// Ask for the pin to be dropped, **synchronously and from anywhere** —
+    /// including a `Drop`, where nothing can be awaited.
+    ///
+    /// [`GxClient::unpin`] needs the async lock, and the lock is deliberately
+    /// held across `healthz` (that is what makes concurrent first callers share
+    /// one pin), so it cannot become a `std::sync::Mutex` and `Drop` cannot
+    /// call it. A task ABORTED mid-stream therefore had no way to honour §0's
+    /// invariant 2, and left the epoch pinned to a connection that no longer
+    /// exists — the state `Epoch::generation`'s doc warns about.
+    ///
+    /// So the request is a flag, and [`GxClient::ensure_pinned`] consumes it
+    /// under the lock before deciding anything. That makes the unpin
+    /// unconditional on every exit path — normal, error, or cancellation —
+    /// without a spawn and without a runtime handle.
+    pub(crate) fn request_unpin(&self) {
+        self.unpin_requested
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Drop the pin unconditionally — the NEXT request re-dials, re-discovers
+    /// and re-health-checks.
+    ///
+    /// The watcher calls this at the end of every generation, which is §0's
+    /// invariant 2 taken literally: *every transport (re)connect opens a new
+    /// epoch*. A stream that EOFs does not go through
+    /// [`GxClient::bearer_request`] — the failure is in the BODY, long after the
+    /// response head — so without this the reconnect would inherit a pin
+    /// established against whatever was listening before the break. Over a
+    /// forwarded `127.0.0.1:<local>`, where a leader restart or a re-pointed
+    /// tunnel changes what answers while the URL string stays identical, the
+    /// `instanceId` check is the only thing that would ever notice.
+    pub(crate) async fn unpin(&self) {
+        self.pin.lock().await.epoch = None;
     }
 
     /// Drop the pin **if it is still the one `generation` names**.
@@ -427,10 +492,7 @@ impl GxClient {
         // A dial failure here has already invalidated inside the gate.
         let epoch = self.ensure_pinned().await?;
         let out = self.send_under(&epoch, method, path, query, body).await;
-        if matches!(
-            out,
-            Err(LaneError::Unavailable(_)) | Err(LaneError::Unauthorized)
-        ) {
+        if out.as_ref().err().is_some_and(stales_the_pin) {
             self.invalidate(epoch.generation).await;
         }
         out
@@ -508,7 +570,7 @@ impl GxClient {
         Ok(page.sessions)
     }
 
-    async fn rest_session(&self, id: &str) -> Result<GxSessionRow, LaneError> {
+    pub(crate) async fn rest_session(&self, id: &str) -> Result<GxSessionRow, LaneError> {
         let path = session_path(id, &[]);
         let body = self.rest_get(&path, &[]).await?;
         serde_json::from_str(&body).map_err(|e| failed(format!("decoding {path}: {e}")))
@@ -593,6 +655,214 @@ impl GxClient {
         }
         Ok(lane_approval(&res))
     }
+
+    // ---- the stream ----
+
+    /// `GET …/events` — the SSE body, opened under the pin, with `cursor` as
+    /// `Last-Event-ID` when the watcher is resuming.
+    ///
+    /// It goes through the same dial → pin → invalidate-on-failure shape as
+    /// every bearer REST call ([`GxClient::bearer_request`]), because the
+    /// invariant is identical: no bearer leaves the adapter before `healthz`
+    /// has said WHO is answering, and a transport failure must not leave a
+    /// stale epoch pinned for the next attempt.
+    ///
+    /// What is different is the timeouts. The body is long-lived, so the client
+    /// has no request timeout at all; the two things on the connection that are
+    /// NOT the body are bounded here instead:
+    ///
+    /// - the response HEAD, because a peer that completes the TCP handshake and
+    ///   then says nothing satisfies `connect_timeout` and would otherwise park
+    ///   the watcher forever — after its `Reset` and before there is any body
+    ///   for the stall timer to watch;
+    /// - the ERROR body of a non-2xx, for the same reason: the error table
+    ///   needs the body, and waiting for one that never comes is the same hang
+    ///   wearing a status code.
+    pub(crate) async fn open_events(
+        &self,
+        id: &str,
+        cursor: Option<&str>,
+    ) -> Result<reqwest::Response, LaneError> {
+        let epoch = self.ensure_pinned().await?;
+        let out = self.open_events_under(&epoch, id, cursor).await;
+        if out.as_ref().err().is_some_and(stales_the_pin) {
+            self.invalidate(epoch.generation).await;
+        }
+        out
+    }
+
+    async fn open_events_under(
+        &self,
+        epoch: &Epoch,
+        id: &str,
+        cursor: Option<&str>,
+    ) -> Result<reqwest::Response, LaneError> {
+        let path = session_path(id, &["events"]);
+        let url = join(&epoch.dial, &path)?;
+        let mut rb = self
+            .bearer(self.stream.request(reqwest::Method::GET, url), &epoch.token)?
+            .header(reqwest::header::ACCEPT, "text/event-stream");
+        if let Some(cursor) = cursor {
+            // An unusable cursor is a LOST cursor, and it has to be loud.
+            //
+            // Dropping it and connecting anyway is the tempting quiet option
+            // and it is the worst of the three: gx would stream live-only, the
+            // watcher would still be in a silent resume, no `Reset` would be
+            // emitted, and every frame between the cursor and now would be gone
+            // from the client's transcript with nothing to say so. That is
+            // exactly the invisible gap the escalation ladder exists to
+            // prevent.
+            if !is_header_safe(cursor) {
+                return Err(bad_request(format!(
+                    "the resume cursor for {path} cannot be sent as a header value"
+                )));
+            }
+            rb = rb.header("last-event-id", cursor);
+        }
+        let sent = match tokio::time::timeout(STREAM_HEAD_TIMEOUT, rb.send()).await {
+            Err(_) => return Err(head_timeout(&path, "a response head")),
+            Ok(sent) => sent,
+        };
+        let resp = sent.map_err(|e| dial_error(&path, &e))?;
+        let status = resp.status();
+        if status.is_success() {
+            return Ok(resp);
+        }
+        let read = read_body_capped(&path, resp, self.timings.rest_cap);
+        match tokio::time::timeout(STREAM_HEAD_TIMEOUT, read).await {
+            Err(_) => Err(head_timeout(&path, "the error body of a non-2xx")),
+            Ok(Ok(body)) => Err(map_gx_error(status, &path, &body)),
+            // A body that could not be read is a transport failure and is
+            // preserved as one — the same rule `check_status` states.
+            Ok(Err(e)) => Err(e),
+        }
+    }
+}
+
+/// **Verbatim** reads, for the fixture recorder — the `test-support` build
+/// only, exactly like [`crate::testing`].
+///
+/// The contract verbs answer DTOs, and a DTO has already lost the two things a
+/// committed fixture is FOR: gx's own object-key order, and the frames' arrival
+/// order on the wire. So the recorder needs the bytes, and it gets them through
+/// the same dial → pin → epoch path as everything else rather than opening a
+/// second, unpinned client beside the first.
+#[cfg(any(test, feature = "test-support"))]
+impl GxClient {
+    /// One `GET …/history` page's body, exactly as gx wrote it.
+    pub async fn raw_history(
+        &self,
+        id: &str,
+        offset: i64,
+        limit: u32,
+    ) -> Result<String, LaneError> {
+        self.rest_get(
+            &session_path(id, &["history"]),
+            &[("offset", offset.to_string()), ("limit", limit.to_string())],
+        )
+        .await
+    }
+
+    /// `GET …/approvals`'s body, exactly as gx wrote it.
+    pub async fn raw_approvals(&self, id: &str) -> Result<String, LaneError> {
+        self.rest_get(&session_path(id, &["approvals"]), &[]).await
+    }
+
+    /// Open `GET …/events`, read for `window`, and hand back every complete SSE
+    /// frame as `(event, data)`.
+    ///
+    /// `window` is a read budget rather than a deadline on a request: the body
+    /// is long-lived by design, so "how long to listen" is the only thing a
+    /// caller can usefully bound.
+    pub async fn raw_events(
+        &self,
+        id: &str,
+        cursor: Option<&str>,
+        window: Duration,
+    ) -> Result<Vec<(String, String)>, LaneError> {
+        use futures_util::StreamExt as _;
+
+        let resp = self.open_events(id, cursor).await?;
+        let mut stream = Box::pin(resp.bytes_stream());
+        let mut parser = shed_core::sse::SseParser::new();
+        let mut out: Vec<(String, String)> = Vec::new();
+        let mut failure: Option<LaneError> = None;
+        let deadline = tokio::time::Instant::now() + window;
+        loop {
+            let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if left.is_zero() {
+                break;
+            }
+            match tokio::time::timeout(left, stream.next()).await {
+                // The budget ran out, or the server closed: both are "that is
+                // everything there was", which is what a replay capture wants.
+                Err(_) | Ok(None) => break,
+                // A mid-body failure. It is CARRIED to the single exit rather
+                // than returned from here — see the unpin below.
+                Ok(Some(Err(e))) => {
+                    failure = Some(dial_error("/events", &e));
+                    break;
+                }
+                Ok(Some(Ok(chunk))) => {
+                    for ev in parser.feed(&chunk) {
+                        if !ev.data.is_empty() {
+                            out.push((ev.event, ev.data));
+                        }
+                    }
+                }
+            }
+        }
+        // §0's invariant 2 is "every transport (re)connect opens a new epoch",
+        // and the watcher honours it by calling `unpin` at the end of every
+        // generation. This is the OTHER holder of a long-lived stream, and the
+        // invariant is enforced by caller discipline rather than by the type
+        // system — so it complies here rather than leaving the recorder as the
+        // one known violator, pinned to a connection that is already gone.
+        //
+        // ONE exit, deliberately. An early `return` on the error arm left the
+        // epoch pinned to a connection that had just failed mid-body — the
+        // exact state `Epoch::generation`'s doc warns about, where the client
+        // "would health-check forever". Carrying the failure to a single exit
+        // makes the unpin structural instead of something four arms have to
+        // remember.
+        self.unpin().await;
+        match failure {
+            Some(e) => Err(e),
+            None => Ok(out),
+        }
+    }
+}
+
+/// Whether a cursor can be sent as a header value at all.
+///
+/// A `Last-Event-ID` is built from a session id that arrived on a roost tab, so
+/// it is untrusted input, and `RequestBuilder::header` defers an invalid value
+/// all the way to `send()`, where it surfaces as an opaque builder error.
+/// Checking here is what lets the caller say something precise instead.
+///
+/// **A cursor that fails this is treated as LOST, not as absent.** The
+/// difference is the whole point: connecting without it would leave the watcher
+/// in a silent resume against a live-only stream, so every frame between the
+/// cursor and now would vanish from the transcript with no `Reset` to say so.
+/// [`GxClient::open_events_under`] therefore refuses, and the watcher turns
+/// that refusal into a `cursor_lost` reseed.
+fn is_header_safe(s: &str) -> bool {
+    !s.is_empty() && s.bytes().all(|b| (0x20..=0x7E).contains(&b))
+}
+
+/// Whether an error means the pin may no longer describe what is answering —
+/// the rule [`GxClient::bearer_request`]'s doc states, in ONE place so a future
+/// `LaneError` variant is classified once rather than in every wrapper that
+/// issues a request under an epoch.
+fn stales_the_pin(e: &LaneError) -> bool {
+    matches!(e, LaneError::Unavailable(_) | LaneError::Unauthorized)
+}
+
+fn head_timeout(path: &str, what: &str) -> LaneError {
+    unavailable(format!(
+        "gx {path}: no {what} within {}s",
+        STREAM_HEAD_TIMEOUT.as_secs()
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -1252,19 +1522,40 @@ impl AgentLane for GxClient {
         Ok(())
     }
 
-    /// **Not yet wired** — the watcher is plan 017 C3.
+    /// Spawn the watcher ([`crate::watcher`]) and hand back its frames.
     ///
-    /// `Failed` and not `Unavailable` on purpose: `Unavailable` is the quiet
-    /// "the agent is not running" a client renders as a stale row, and a missing
-    /// implementation must not be able to look like one.
+    /// **Returns immediately and never fails.** Everything that could fail — the
+    /// dial, the pin, the connect, the seed — happens inside the pump, where it
+    /// is a `Reset` that has not resolved yet and finally a
+    /// [`LaneEvent::Down`](shed_core::lane::LaneEvent::Down). A client that got
+    /// an `Err` here would have to decide whether to retry; the contract's whole
+    /// answer to "the agent is not up" is a subscription that says `Down`, and
+    /// two spellings of it would be two code paths in every client.
+    ///
+    /// # The `cursor` argument, and why the first generation ignores it
+    ///
+    /// gx advertises `history_cursor: true`, and that flag is about two things
+    /// this method is not: [`AgentLane::history`] paging backwards from a
+    /// cursor, and the watcher's own bounded SILENT resume across a reconnect
+    /// (`shed_core::lane`'s correction 1).
+    ///
+    /// A `subscribe` is neither. Its first frame is `Reset { "connect" }`, which
+    /// tells the client to stage from scratch and swap at `Ready` — so a cursor
+    /// could only save the client a re-render it is going to do anyway, at the
+    /// cost of a seed that starts mid-transcript. Worse, gx answers a cursor it
+    /// cannot place with `reset { cursor_unresolvable }`, so honoring one here
+    /// would sometimes turn the first connect into two.
+    ///
+    /// It is recorded on the subscription and reported in the first `Reset`'s
+    /// reason (`connect` / `connect:cursor-ignored`), because silently
+    /// discarding a caller's argument is how a client comes to believe it
+    /// resumed.
     async fn subscribe(
         &self,
-        _id: &str,
-        _cursor: Option<String>,
+        id: &str,
+        cursor: Option<String>,
     ) -> Result<LaneSubscription, LaneError> {
-        Err(failed(
-            "the gx lane watcher is not implemented yet (plan 017 C3)",
-        ))
+        Ok(crate::watcher::spawn(self.clone(), id, cursor))
     }
 }
 
