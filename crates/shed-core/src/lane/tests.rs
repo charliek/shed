@@ -907,6 +907,139 @@ fn option_for_resolves_every_decision_by_kind_never_by_id() {
     }
 }
 
+/// gx's REAL five, and the escalation the by-kind rule used to pick.
+///
+/// Recorded off a live gx leader: one `session/request_permission` for
+/// `id -un`. Two of the five options declare `allow_once` — the ordinary "Yes,
+/// proceed" AND an "always-approve mode" switch that stops the agent asking
+/// about ANYTHING for the rest of the session — and the escalating one is
+/// offered FIRST.
+///
+/// Under the original rule ("the first option in offered order whose kind
+/// matches"), [`LaneDecision::AllowOnce`] resolved to `enable-always-approve`:
+/// a human tapping "Allow once" would silently have disabled permission
+/// prompting. That is the exact failure the by-kind design exists to prevent,
+/// and only a real agent exposes it — the plan assumed `kind` disambiguates,
+/// and against gx it does not.
+///
+/// So the rule is now "exactly one, or nothing". This test fails on the gx case
+/// under the old first-match implementation, which is what makes it
+/// load-bearing rather than decorative.
+///
+/// The option set is gx's own generic vocabulary — no user data, no paths, no
+/// session content — which is why it is safe to pin here verbatim.
+#[test]
+fn real_gx_offers_two_allow_once_options_so_a_decision_cannot_choose() {
+    let gx = approval_offering(vec![
+        // "Yes, and don't ask again for anything (always-approve mode)"
+        opt("enable-always-approve", Some(option_kind::ALLOW_ONCE)),
+        // "Always allow: id -un"
+        opt("allow-always-command", Some(option_kind::ALLOW_ALWAYS)),
+        // "Yes, proceed"
+        opt("allow-once", Some(option_kind::ALLOW_ONCE)),
+        // "No, and tell Grok what to do differently"
+        opt("reject-once", Some(option_kind::REJECT_ONCE)),
+        // "Never allow: id -un"
+        opt("reject-always-command", Some(option_kind::REJECT_ALWAYS)),
+    ]);
+
+    assert_eq!(
+        gx.option_for(LaneDecision::AllowOnce),
+        None,
+        "two options declare allow_once — one of them turns prompting OFF for \
+         the session — so the decision alone cannot say which the human meant, \
+         and picking either would be a guess at a privilege escalation",
+    );
+    // The unambiguous kinds on the SAME set still resolve: refusing is scoped
+    // to the ambiguity, not to the approval.
+    assert_eq!(
+        gx.option_for(LaneDecision::AllowAlways)
+            .map(|o| o.id.as_str()),
+        Some("allow-always-command"),
+    );
+    assert_eq!(
+        gx.option_for(LaneDecision::Reject).map(|o| o.id.as_str()),
+        Some("reject-once"),
+    );
+}
+
+/// The ambiguity rule, over every decision — and the fallback's boundary.
+#[test]
+fn option_for_refuses_an_ambiguous_kind_and_still_resolves_a_unique_one() {
+    // One of a kind still resolves: opencode's whole set is like this, and it
+    // must keep working.
+    let unique = approval_offering(vec![
+        opt("a", Some(option_kind::ALLOW_ONCE)),
+        opt("b", Some(option_kind::ALLOW_ALWAYS)),
+        opt("c", Some(option_kind::REJECT_ONCE)),
+    ]);
+    for (decision, want) in [
+        (LaneDecision::AllowOnce, "a"),
+        (LaneDecision::AllowAlways, "b"),
+        (LaneDecision::Reject, "c"),
+    ] {
+        assert_eq!(
+            unique.option_for(decision).map(|o| o.id.as_str()),
+            Some(want),
+            "{decision:?}",
+        );
+    }
+
+    // Two of a kind refuses — for EVERY decision, allow and reject alike. Two
+    // `reject_once` options can differ materially ("refuse" vs "refuse and tell
+    // the agent why"), so a refusal is not automatically interchangeable
+    // either.
+    for (kind, decision) in [
+        (option_kind::ALLOW_ONCE, LaneDecision::AllowOnce),
+        (option_kind::ALLOW_ALWAYS, LaneDecision::AllowAlways),
+        (option_kind::REJECT_ONCE, LaneDecision::Reject),
+    ] {
+        let ambiguous =
+            approval_offering(vec![opt("first", Some(kind)), opt("second", Some(kind))]);
+        assert_eq!(
+            ambiguous.option_for(decision),
+            None,
+            "two options carry {kind}; {decision:?} must refuse rather than \
+             break the tie by order",
+        );
+    }
+
+    // The `Reject` fallback survives, and its boundary is "no `reject_once` AT
+    // ALL": with none offered, the first reject-kind still answers, so an agent
+    // offering only `reject_always` stays refusable.
+    let no_reject_once = approval_offering(vec![
+        opt("a", Some(option_kind::ALLOW_ONCE)),
+        opt("far", Some(option_kind::REJECT_ALWAYS)),
+    ]);
+    assert_eq!(
+        no_reject_once
+            .option_for(LaneDecision::Reject)
+            .map(|o| o.id.as_str()),
+        Some("far"),
+    );
+    // …and it may still break a tie by offered order, because every candidate
+    // it can reach is a refusal. Broadening a refusal is safe; that asymmetry
+    // is the whole reason the allow decisions have no fallback.
+    let two_always = approval_offering(vec![
+        opt("far-1", Some(option_kind::REJECT_ALWAYS)),
+        opt("far-2", Some(option_kind::REJECT_ALWAYS)),
+    ]);
+    assert_eq!(
+        two_always
+            .option_for(LaneDecision::Reject)
+            .map(|o| o.id.as_str()),
+        Some("far-1"),
+    );
+    // But an ambiguous EXACT `reject_once` short-circuits before the fallback:
+    // the fallback is for "none offered", not for "too many offered".
+    let two_once_one_always = approval_offering(vec![
+        opt("once-1", Some(option_kind::REJECT_ONCE)),
+        opt("once-2", Some(option_kind::REJECT_ONCE)),
+        opt("far", Some(option_kind::REJECT_ALWAYS)),
+    ]);
+    assert_eq!(two_once_one_always.option_for(LaneDecision::Reject), None);
+}
+
 /// opencode's REAL three, resolved through the shared rule.
 ///
 /// This is the case that would silently pass under an id-matching

@@ -4,7 +4,7 @@
 # standalone workspace in ../tauri/src-tauri) linking shed-core + shed-app directly.
 [workspace]
 resolver = "2"
-members = ["shed-core", "shed-core-ffi", "shed-app", "shed-rc-engine", "shedctl", "shed-broker", "shed-host-agent", "shed-opencode"]
+members = ["shed-core", "shed-core-ffi", "shed-app", "shed-rc-engine", "shedctl", "shed-broker", "shed-host-agent", "shed-opencode", "shed-gx"]
 # All members are default members: a plain `cargo build` / `cargo test` (and
 # `make core-test`) build shed-core + shed-core-ffi + shed-app + shedctl. shedctl
 # (the headless Linux CLI driver for the shed-desktop IPC socket) has no GUI-toolkit
@@ -20,7 +20,14 @@ members = ["shed-core", "shed-core-ffi", "shed-app", "shed-rc-engine", "shedctl"
 # `shed-opencode` (the opencode agent-lane adapter, plan 015) is a member AND a
 # default member: a pure lib on shed-core with no GUI-toolkit and no daemon
 # dependency, so a plain `cargo test`/`clippy --workspace` covers it.
-default-members = ["shed-core", "shed-core-ffi", "shed-app", "shed-rc-engine", "shedctl", "shed-broker", "shed-host-agent", "shed-opencode"]
+#
+# `shed-gx` (the gx agent-lane adapter, plan 017) is a member and a default
+# member for exactly the same reasons, and it takes a NARROWER dependency set
+# than shed-opencode does — no `chrono` (the ring is chrono-free since plan 017
+# C1), no `regex`, no `base64`. Neither adapter is reachable from
+# `shed-core-ffi` or from shed-core's Android target, which is what keeps the
+# two `cargo tree` invariants true.
+default-members = ["shed-core", "shed-core-ffi", "shed-app", "shed-rc-engine", "shedctl", "shed-broker", "shed-host-agent", "shed-opencode", "shed-gx"]
 
 [workspace.package]
 version = "0.8.1"

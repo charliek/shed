@@ -164,16 +164,32 @@
 //!    own `reject` while its kind is `reject_once`.
 //!    **[`LaneAnswer::Permission`] maps by `kind`, never by id**, and
 //!    [`LaneApproval::option_for`] IS that mapping — one implementation, so gx,
-//!    opencode and shed-mobile's Dart mirror cannot each re-derive the fallback
-//!    clause differently: [`LaneDecision::AllowOnce`] → the option whose kind is
+//!    opencode and shed-mobile's Dart mirror cannot each re-derive the clauses
+//!    differently: [`LaneDecision::AllowOnce`] → the option whose kind is
 //!    `allow_once`, [`LaneDecision::AllowAlways`] → `allow_always`,
 //!    [`LaneDecision::Reject`] → `reject_once`, falling back (for `Reject`
-//!    alone) to the first option whose kind starts `reject`; no match is
+//!    alone, and only when no `reject_once` is offered at all) to the first
+//!    option whose kind starts `reject`; no match is
 //!    [`LaneError::BadRequest`], which the ADAPTER raises because only it can
 //!    name the agent. **Ids are opaque.** gx's
 //!    own fixtures pair `optionId: "allow-once"` with `kind: "allow_once"`, which
 //!    is exactly the coincidence that makes id-matching look like it works until
 //!    an agent numbers its options.
+//!
+//!    **The kind must be UNAMBIGUOUS, and a live gx leader is what proved it.**
+//!    A real `session/request_permission` offers five options of which TWO
+//!    declare `allow_once` — `allow-once` ("Yes, proceed") and
+//!    `enable-always-approve` ("Yes, and don't ask again for anything"). Under
+//!    the original "first in offered order wins" rule, a human tapping "Allow
+//!    once" would have silently turned permission prompts off for the session.
+//!    So [`LaneApproval::option_for`] answers `None` whenever MORE THAN ONE
+//!    offered option carries the requested kind, rather than picking. An agent
+//!    may offer several options of a kind; a three-valued [`LaneDecision`]
+//!    cannot say which one the human meant, and guessing is the escalation this
+//!    correction exists to stop. It costs a capability-driven client nothing —
+//!    the panel already posts [`LaneAnswer::Choice`] with the exact offered id —
+//!    and it makes the scripted three-decision form fail loudly instead of
+//!    surprisingly.
 //! 4. **[`LaneQuestion::id`]** is the key an answer is filed under. gx uses the
 //!    question's TEXT (what its own TUI keys by); opencode has no key and leaves
 //!    it `None` (positional). [`LaneAnswer::Question::answers`] stays POSITIONAL
@@ -623,23 +639,57 @@ impl LaneApproval {
     ///
     /// The rule, in order:
     ///
-    /// 1. **Exact kind.** [`LaneDecision::AllowOnce`] →
-    ///    [`option_kind::ALLOW_ONCE`], [`LaneDecision::AllowAlways`] →
-    ///    [`option_kind::ALLOW_ALWAYS`], [`LaneDecision::Reject`] →
-    ///    [`option_kind::REJECT_ONCE`].
-    /// 2. **The `Reject` fallback, and only `Reject`:** the FIRST option — first
-    ///    in OFFERED order — whose kind starts with `reject`. An agent that
-    ///    offers only [`option_kind::REJECT_ALWAYS`] must still be refusable,
-    ///    and a refusal that is broader than asked for is safe in a way that a
-    ///    broader ALLOW would not be. That asymmetry is why there is no matching
-    ///    fallback for the two allow decisions: silently upgrading an
-    ///    "allow once" into an "allow always" is precisely the bug this contract
-    ///    exists to prevent.
+    /// 1. **Exact kind, and it must be UNAMBIGUOUS.**
+    ///    [`LaneDecision::AllowOnce`] → [`option_kind::ALLOW_ONCE`],
+    ///    [`LaneDecision::AllowAlways`] → [`option_kind::ALLOW_ALWAYS`],
+    ///    [`LaneDecision::Reject`] → [`option_kind::REJECT_ONCE`]. If **exactly
+    ///    one** offered option carries that kind, it is the answer. If **more
+    ///    than one** does, the answer is `None` — see "Why ambiguity refuses"
+    ///    below.
+    /// 2. **The `Reject` fallback, and only `Reject`**, and only when NO option
+    ///    carries `reject_once` at all: the FIRST option — first in OFFERED
+    ///    order — whose kind starts with `reject`. An agent that offers only
+    ///    [`option_kind::REJECT_ALWAYS`] must still be refusable, and a refusal
+    ///    that is broader than asked for is safe in a way that a broader ALLOW
+    ///    would not be. That asymmetry is why there is no matching fallback for
+    ///    the two allow decisions: silently upgrading an "allow once" into an
+    ///    "allow always" is precisely the bug this contract exists to prevent.
+    ///    It is also why the fallback may still break a tie by order — every
+    ///    candidate it can pick is a refusal.
     /// 3. Otherwise `None`.
     ///
     /// An option with no `kind` never matches — the contract reads an absent
     /// kind as "this agent states no semantics", and guessing one from the id is
     /// the id-sniffing this method exists to replace.
+    ///
+    /// # Why ambiguity refuses
+    ///
+    /// This was found against a **live gx leader**, and it overturned the
+    /// original rule ("first in offered order wins"). A real
+    /// `session/request_permission` offers FIVE options, of which **two declare
+    /// `allow_once`**:
+    ///
+    /// | optionId | kind | name |
+    /// |---|---|---|
+    /// | `enable-always-approve` | `allow_once` | "Yes, and don't ask again for anything (always-approve mode)" |
+    /// | `allow-always-command` | `allow_always` | "Always allow: id -un" |
+    /// | `allow-once` | `allow_once` | "Yes, proceed" |
+    /// | `reject-once` | `reject_once` | "No, and tell Grok what to do differently" |
+    /// | `reject-always-command` | `reject_always` | "Never allow: id -un" |
+    ///
+    /// Under first-in-offered-order, a human tapping **"Allow once"** would have
+    /// selected `enable-always-approve` and silently turned off permission
+    /// prompts for the whole session. The semantic kind simply does not
+    /// disambiguate on a real agent: an agent may offer several options of one
+    /// kind, and a three-valued [`LaneDecision`] cannot say which of them the
+    /// human meant.
+    ///
+    /// Refusing costs a capability-driven client nothing — the panel renders the
+    /// options the agent offered and posts back
+    /// [`LaneAnswer::Choice`] with the exact offered id, which is unambiguous by
+    /// construction. All that fails is the scripted three-decision shorthand,
+    /// against an agent for which it is genuinely undecidable, and it fails
+    /// LOUDLY as [`LaneError::BadRequest`] rather than by picking.
     ///
     /// `None` is not an error here: the caller turns it into
     /// [`LaneError::BadRequest`], because the message that helps ("gx offered
@@ -651,15 +701,23 @@ impl LaneApproval {
             LaneDecision::AllowAlways => option_kind::ALLOW_ALWAYS,
             LaneDecision::Reject => option_kind::REJECT_ONCE,
         };
-        // `find` walks in offered order, so "first" is always the agent's first.
-        if let Some(exact) = self
+        let mut exact = self
             .options
             .iter()
-            .find(|o| o.kind.as_deref() == Some(wanted))
-        {
-            return Some(exact);
+            .filter(|o| o.kind.as_deref() == Some(wanted));
+        match (exact.next(), exact.next()) {
+            // Exactly one option carries the kind: unambiguous.
+            (Some(only), None) => return Some(only),
+            // Several do. The decision cannot say which, so nothing is
+            // selected — including for `Reject`, whose two candidates may
+            // differ materially ("refuse" vs "refuse and tell the agent why").
+            (Some(_), Some(_)) => return None,
+            (None, _) => {}
         }
         if matches!(decision, LaneDecision::Reject) {
+            // Reached only when NO option carries `reject_once`. Every
+            // candidate here is a refusal, so breaking the tie by offered order
+            // cannot broaden an allow.
             return self
                 .options
                 .iter()
@@ -680,8 +738,15 @@ impl LaneApproval {
 /// whose kind starts `reject`, so an agent offering only `reject_always` is
 /// still refusable). No match is
 /// [`LaneError::BadRequest`] — silently picking the nearest option would post a
-/// decision the human did not make. A client that wants a specific offered
-/// option sends [`LaneAnswer::Choice`] instead.
+/// decision the human did not make.
+///
+/// **Neither is an AMBIGUOUS match.** A real gx permission offers two options
+/// declaring `allow_once`, one of which disables prompting for the whole
+/// session; a three-valued decision cannot say which the human meant, so
+/// `option_for` answers `None` and the adapter refuses. A client that wants a
+/// specific offered option sends [`LaneAnswer::Choice`] instead — which is what
+/// a capability-driven panel already does, and why refusing here costs it
+/// nothing.
 ///
 /// **Strict** under the module doc's asymmetric rule — this is a client→adapter
 /// COMMAND, and an unrecognized decision must be rejected at decode rather than
@@ -1120,8 +1185,9 @@ pub trait AgentLane: Send + Sync {
     ///
     /// A [`LaneAnswer::Choice`] naming an id the approval did not offer, and a
     /// [`LaneAnswer::Permission`] whose decision matches no offered
-    /// [`LaneApprovalOption::kind`], are both [`LaneError::BadRequest`] — an
-    /// adapter never picks the nearest option.
+    /// [`LaneApprovalOption::kind`] — or matches SEVERAL of them — are all
+    /// [`LaneError::BadRequest`] — an adapter never picks the nearest option,
+    /// and never breaks a tie the human is the only one who can break.
     async fn answer(
         &self,
         id: &str,
