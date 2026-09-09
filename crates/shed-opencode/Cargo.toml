@@ -40,20 +40,15 @@ base64 = { workspace = true }
 # RFC3339 (`opencode_ts`). Same minimal pin (and same reason) as shed-app's and
 # shed-broker's — `std` only, no `clock`/`oldtime`, so no iana-time-zone pull.
 chrono = { version = "0.4", default-features = false, features = ["std"] }
-# UNUSED as of plan 017 C1, and deliberately still here. This crate took `regex`
-# for one thing — the ANSI-escape stripper behind `sanitize_last_message` — and
-# that stripper moved to `shed_core::lane::feed` when the second lane adapter
-# needed it, so nothing under `src/`, `tests/` or `examples/` names `regex` any
-# more (`grep -rn regex shed-opencode/` finds only this comment).
-#
-# Dropping the line is a lockfile change, and this workspace's `Cargo.lock` is
-# not the only one that would move: the Tauri client is a SEPARATE workspace
-# (`desktop/tauri/src-tauri/Cargo.lock`) that path-depends on this crate, and the
-# two locks are verified in lockstep at release. So the removal belongs to the
-# commit that is already regenerating both — C4 — rather than to one whose
-# `cargo tree` invariants are its evidence. `regex` still reaches this crate
-# transitively through shed-core either way, so nothing builds differently.
-regex = "1"
+# NO `regex`. This crate took it for one thing — the ANSI-escape stripper behind
+# `sanitize_last_message` — and that stripper moved to `shed_core::lane::feed` in
+# plan 017 C1, when the second lane adapter needed it. C1 left the declaration in
+# place because dropping it moves TWO lockfiles (this workspace's, and the Tauri
+# client's separate `desktop/tauri/src-tauri/Cargo.lock`, which path-depends on
+# this crate and is verified in lockstep with it at release), and C1's evidence
+# was its `cargo tree` invariants. C4 regenerates both locks anyway, so the
+# removal landed there. `regex` still reaches this crate transitively through
+# shed-core, so nothing builds differently.
 
 [features]
 # Exports `testing::FakeOpencode` — the in-process opencode double — across the

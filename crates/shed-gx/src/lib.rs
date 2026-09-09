@@ -55,14 +55,14 @@ pub mod watcher;
 pub mod testing;
 
 pub use client::{GxClient, GxTimings};
+pub use discovery::{
+    gx_home, parse_probe, records_for, redact_hex64, GxCredentialSource, GxDiscovery, GxRecord,
+    GxToken, Probe, ProbeError, StaticCredentials, PROBE_SCRIPT,
+};
 /// The local reader's assembly (C4's `ReachKind::Local` path). Unix-only: the
 /// mode and owner its checks are about do not exist elsewhere.
 #[cfg(unix)]
 pub use discovery::{local_discovery, read_token_file, token_file_refusal};
-pub use discovery::{
-    parse_probe, GxCredentialSource, GxDiscovery, GxRecord, GxToken, Probe, ProbeError,
-    StaticCredentials, PROBE_SCRIPT,
-};
 pub use fold::{EventId, GxEnvelope, GxFold};
 pub use transport::{FixedDial, GxTransport};
 // The watcher's buffer bounds are deliberately NOT re-exported here. They are

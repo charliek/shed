@@ -79,6 +79,31 @@ pub trait MachineForward: Send + Sync {
 
     /// Make the forward usable, rebuilding it if necessary.
     async fn ensure(&self) -> Result<(), ForwardError>;
+
+    /// A CHEAP "is this still up?" — no network, no blocking syscall, safe to
+    /// call on an async worker as often as a caller likes.
+    ///
+    /// It exists because [`ensure`] is NOT that. `ensure` is the authoritative
+    /// answer and it pays for one: it serializes on a lock and probes the local
+    /// port. A caller that only wants to know whether it needs to ask — plan
+    /// 017's `TauriTransport`, which is invoked before **every** gx request —
+    /// would otherwise turn a per-verb hook into a per-verb connect.
+    ///
+    /// **`false` means "definitely ask `ensure`"; `true` means "probably fine".**
+    /// It is a proxy, not a proof: [`SshForward`] answers it from whether the
+    /// `ssh` child is still running, which `ExitOnForwardFailure=yes` makes a
+    /// good one (a forward that breaks takes the child with it) but not a
+    /// complete one (a child that lives on without listening reads as `true`).
+    /// A caller must therefore still have SOME path that calls `ensure`; this
+    /// only spares it from calling it every time.
+    ///
+    /// The default is `true`, which is right for a forward this side does not
+    /// own ([`FixedPort`]): there is nothing here to check.
+    ///
+    /// [`ensure`]: MachineForward::ensure
+    fn looks_alive(&self) -> bool {
+        true
+    }
 }
 
 /// A forward someone else owns — the caller has already arranged that `port`
@@ -131,7 +156,7 @@ pub struct SshForward {
     label: String,
     /// The live child. An `Arc` because the blocking spawn task stores the
     /// child itself the instant it exists (see [`MachineForward::ensure`]).
-    child: Arc<Mutex<Option<std::process::Child>>>,
+    child: Arc<ChildSlot>,
     /// Serializes `ensure()`. The trait is `Send + Sync` and consumers hold an
     /// `Arc<dyn MachineForward>`, so two callers can race; without this both
     /// would spawn onto the same local port and the loser (killed by
@@ -176,7 +201,7 @@ impl SshForward {
             port,
             remote_port,
             label,
-            child: Arc::new(Mutex::new(None)),
+            child: Arc::new(ChildSlot::default()),
             ensuring: tokio::sync::Mutex::new(()),
             #[cfg(test)]
             exec_prefix: None,
@@ -230,9 +255,24 @@ impl SshForward {
         self.argv()
     }
 
+    /// Does the local end accept a connection?
+    ///
+    /// **On a blocking thread**, for the same reason the spawn below is: this is
+    /// `TcpStream::connect`, and a syscall that can block belongs off the async
+    /// worker even when the address is loopback and the answer is usually
+    /// instant. It used to run inline on the fast path — the one path taken on
+    /// every healthy call — while holding `ensuring`, which is the shape the
+    /// slow path's own comment already warns against.
+    async fn port_answers(&self) -> Result<bool, ForwardError> {
+        let port = self.port;
+        tokio::task::spawn_blocking(move || port_answers(port))
+            .await
+            .map_err(|e| ForwardError(format!("forward probe failed: {e}")))
+    }
+
     /// Is the child gone (exited, reaped elsewhere, or never spawned)?
     fn child_is_dead(&self) -> bool {
-        let mut guard = self.child.lock().unwrap_or_else(|e| e.into_inner());
+        let mut guard = self.child.lock();
         match guard.as_mut() {
             None => true,
             // A probe error means it was reaped elsewhere — either way there is
@@ -248,10 +288,17 @@ impl MachineForward for SshForward {
         self.port
     }
 
+    fn looks_alive(&self) -> bool {
+        // Just the `try_wait` — deliberately NOT `port_answers`, which is the
+        // blocking half. See the trait method's doc for what that costs in
+        // precision and why it is the right trade for a per-request caller.
+        !self.child_is_dead()
+    }
+
     async fn ensure(&self) -> Result<(), ForwardError> {
         // One ensure at a time (see the `ensuring` field).
         let _serialized = self.ensuring.lock().await;
-        if !self.child_is_dead() && port_answers(self.port) {
+        if !self.child_is_dead() && self.port_answers().await? {
             return Ok(());
         }
         // Kill any predecessor BEFORE spawning: a child that is merely
@@ -294,10 +341,55 @@ impl Drop for SshForward {
 /// Kill + reap whatever child is in `slot`, and empty it. Idempotent, and safe
 /// on an already-reaped child (`try_wait` caches the status and `kill` refuses
 /// to signal a reaped process, so no recycled PID can be hit).
-fn kill_child(slot: &Mutex<Option<std::process::Child>>) {
-    if let Some(mut child) = slot.lock().unwrap_or_else(|e| e.into_inner()).take() {
+fn kill_child(slot: &ChildSlot) {
+    if let Some(mut child) = slot.lock().take() {
         let _ = child.kill();
         let _ = child.wait();
+    }
+}
+
+/// The live `ssh -N -L` child — in a slot that **kills whatever it is still
+/// holding when its last reference goes**.
+///
+/// The killing `Drop` is not belt-and-braces; it closes an orphan this module
+/// could otherwise still produce, from the opposite direction to the one
+/// [`MachineForward::ensure`]'s comment already guards.
+///
+/// The sequence: a tunnel is dead, so `ensure` queues a repair on the blocking
+/// pool — and before that task is scheduled, the lane is evicted. The
+/// [`SshForward`] drops, its `Drop` calls [`kill_child`] on a slot that is
+/// EMPTY (the child does not exist yet), so it kills nothing and returns
+/// happily. The queued task then runs anyway (`spawn_blocking` cannot be
+/// aborted), spawns `ssh`, and stores it in what is now its own last surviving
+/// reference to this slot. Nothing is left that could ever kill it, and
+/// `std::process::Child`'s own `Drop` does not: an `ssh -N -L` process outlives
+/// the app.
+///
+/// Making the SLOT responsible removes the interleaving question entirely. The
+/// task ends, its `Arc` drops, this runs, and the child dies — whichever order
+/// the eviction and the spawn happened in, and without any storer having to
+/// remember a check. It is the natural completion of the "hand the slot INTO
+/// the task" design: the slot owns the child, so the slot owns killing it.
+#[derive(Default)]
+struct ChildSlot(Mutex<Option<std::process::Child>>);
+
+impl ChildSlot {
+    /// The guard, ignoring poisoning — this module's rule, for the reason
+    /// [`crate::machine`]'s peers give: the data behind it is one `Option`, and
+    /// a panic elsewhere must not turn a tunnel into an un-killable one.
+    fn lock(&self) -> std::sync::MutexGuard<'_, Option<std::process::Child>> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+impl Drop for ChildSlot {
+    fn drop(&mut self) {
+        // `get_mut` rather than `lock`: we hold `&mut self`, so there is no
+        // contention to wait on and no way to deadlock against a poisoned lock.
+        if let Some(mut child) = self.0.get_mut().unwrap_or_else(|e| e.into_inner()).take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
     }
 }
 
@@ -314,7 +406,7 @@ fn kill_child(slot: &Mutex<Option<std::process::Child>>) {
 /// forward would otherwise make `port_answers` true on the first evaluation and
 /// a doomed child would be reported ready without its exit ever being consulted.
 fn spawn_and_wait(
-    slot: &Mutex<Option<std::process::Child>>,
+    slot: &ChildSlot,
     argv: &[String],
     port: u16,
     label: &str,
@@ -328,13 +420,13 @@ fn spawn_and_wait(
         .map_err(|e| ForwardError(format!("opening the hub tunnel to {label}: {e}")))?;
     // Recorded before anything can fail or be cancelled — this is the only
     // window in which the process is untracked, and it is now just `spawn`.
-    *slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(child);
+    *slot.lock() = Some(child);
 
     let deadline = std::time::Instant::now() + FORWARD_READY_TIMEOUT;
     loop {
         // Exit status first, then readiness (see the doc above).
         let exited = {
-            let mut guard = slot.lock().unwrap_or_else(|e| e.into_inner());
+            let mut guard = slot.lock();
             match guard.as_mut() {
                 Some(child) => match child.try_wait() {
                     Ok(Some(status)) => Some(status.to_string()),
@@ -1749,6 +1841,59 @@ mod tests {
     // and the test's own listener standing in for a live tunnel, so nothing
     // here needs a real machine.
 
+    /// **An eviction that lands before a queued repair still must not orphan
+    /// that repair's child.**
+    ///
+    /// The interleaving is the one [`ChildSlot`]'s doc names, and it is the
+    /// mirror image of the case the test below covers: there the child exists
+    /// and the owner tears it down; HERE the owner tears down FIRST, finds an
+    /// empty slot, kills nothing — and the repair it thought it had cancelled
+    /// goes on to spawn `ssh` anyway, because a `spawn_blocking` task cannot be
+    /// aborted.
+    ///
+    /// Modelled at the slot rather than through a saturated blocking pool: the
+    /// property under test is "the last reference to a slot kills what the slot
+    /// holds", and asserting it directly is both deterministic and the thing a
+    /// future storer of a child actually relies on. Against the previous
+    /// `Mutex<Option<Child>>` this fails — `std::process::Child`'s `Drop` does
+    /// not kill, which is the whole reason the orphan was reachable.
+    #[test]
+    fn a_child_stored_after_its_forward_was_evicted_is_still_killed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log = dir.path().join("spawns");
+
+        let slot = Arc::new(ChildSlot::default());
+        // The queued repair's reference — the one that outlives the forward.
+        let queued = Arc::clone(&slot);
+
+        // The eviction. The owner lets go BEFORE the child exists, so its own
+        // teardown finds an empty slot and has nothing to kill.
+        kill_child(&slot);
+        drop(slot);
+
+        // The repair runs anyway and records its child in the only reference
+        // left, exactly as `spawn_and_wait` does.
+        let argv = fake_ssh(&log, "exec sleep 30");
+        let (bin, rest) = argv.split_first().expect("argv is never empty");
+        let child = std::process::Command::new(bin)
+            .args(rest)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .expect("the fake forward starts");
+        let pid = child.id() as i32;
+        *queued.lock() = Some(child);
+        assert!(pid_is_alive(pid), "the fake forward really started");
+
+        // The task ends, releasing the last reference.
+        drop(queued);
+        assert!(
+            !pid_is_alive(pid),
+            "pid {pid} outlived every reference to its slot — an orphaned ssh \
+             tunnel that nothing can ever kill"
+        );
+    }
+
     /// **An `ensure` that is dropped mid-flight must still leave a killable
     /// child.** Dropping it is routine, not exotic: `MachineHubWatcher::stop`
     /// (and therefore its `Drop`) aborts the loop task, which drops whatever
@@ -1785,14 +1930,14 @@ mod tests {
         assert_eq!(pids.len(), 1, "exactly one forward process was started");
         wait_for("the child to be recorded", || !forward.child_is_dead()).await;
         assert_eq!(
-            slot.lock().unwrap().as_ref().map(std::process::Child::id),
+            slot.lock().as_ref().map(std::process::Child::id),
             Some(pids[0] as u32),
             "the recorded child must be the process that was actually spawned"
         );
 
         drop(forward);
         assert!(
-            slot.lock().unwrap().is_none(),
+            slot.lock().is_none(),
             "dropping the forward reaps and clears the child"
         );
         assert!(

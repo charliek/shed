@@ -417,6 +417,27 @@ assertions, the pixels are the eyeball.
   Tauri lock is regenerated **without** WebKitGTK — `cargo metadata --manifest-path
   desktop/tauri/src-tauri/Cargo.toml --offline >/dev/null` resolves and rewrites it in a second;
   a full `cargo build` there only works in Docker.
+- **`cargo fmt --check` is not a gate on the Tauri crate, but your own files still are** —
+  unlike `crates/`, `desktop/tauri/src-tauri` is NOT rustfmt-clean at `origin/main` (about
+  twenty-six hunks across `approval.rs`, `broker.rs`, `lib.rs`, `live_activity.rs`,
+  `screenshot.rs`, `termctl.rs`, `tray.rs`, `updater.rs`), so a whole-crate `cargo fmt --check`
+  is red before you touch anything and a whole-crate `cargo fmt -- --emit files` would bury your
+  diff in unrelated reflows. Check only the files you edited, against their own baseline:
+  `git show HEAD:desktop/tauri/src-tauri/src/<f>.rs > /tmp/base.rs && rustfmt --check --edition
+  2021 /tmp/base.rs` — if that is silent the file was clean, so format just yours with
+  `rustfmt --edition 2021 src/<f>.rs`.
+- **Adding or dropping a `crates/` dependency moves TWO lockfiles** — the same trap as the
+  `roost-ipc` rev bump above, for a different reason. The Tauri crate path-depends on
+  `crates/*`, so a dep added to (or removed from) any of those crates changes
+  `crates/Cargo.lock` **and** `desktop/tauri/src-tauri/Cargo.lock`, and
+  `scripts/release/release-plan.sh` verifies the two in lockstep before the desktop leg ships
+  (it greps the Tauri lock for a `version` entry per workspace path-dep, so a NEW member crate
+  must be added to that loop in all three `scripts/release/*.sh` too). Regenerate both without
+  a WebKitGTK toolchain:
+  `(cd crates && cargo update -w --offline)` and
+  `(cd desktop/tauri/src-tauri && cargo update -w --offline)` — each rewrites its lock in a
+  second. Review the diff: a path-dep change should add/remove exactly the `[[package]]` block
+  and its `dependencies` lines, and nothing third-party.
 - **A module fixture named `fake` breaks the whole pytest session** → `conftest.py` owns a
   SESSION-scoped `fake` (the fake host-agent) that the autouse `_app_session` requests by name.
   A module-level `fake` shadows it and every test in the run dies with

@@ -97,7 +97,7 @@ fn the_contract_version_is_explicit() {
     let scenarios = read_json("scenarios.json");
     let version = scenarios["version"].as_u64().expect("scenarios.version");
     assert_eq!(
-        version, 1,
+        version, 2,
         "the machine-transport contract changed version — re-run the Dart leg in \
          shed-mobile and update its pinned version, then update this assertion"
     );

@@ -1288,6 +1288,10 @@ pub fn run() {
                 tauri::async_runtime::handle().inner().clone(),
                 app.handle().clone(),
                 machines.clone(),
+                lane::GxConfig {
+                    home: env.gx_home.clone(),
+                    timings: env.gx_timings.clone(),
+                },
             ));
             let lanes_hook = Arc::downgrade(&lanes);
             machines.set_lane_observer(Arc::new(move |machine: &str, open: &_| {

@@ -138,6 +138,26 @@ pub const PROBE_TOKEN_SENTINEL: &str = "===token===";
 ///
 /// The `[ -f "$f" ]` guard is what makes an unmatched glob (which POSIX sh
 /// leaves as the literal pattern) print nothing instead of a `cat` error.
+///
+/// # It reads the DEFAULT token path, not the record's `tokenFile`
+///
+/// [`local_discovery`] resolves the token from the record, through
+/// [`token_path_for`], which bounds the result inside `$GROK_HOME`. This script
+/// always reads `$GROK_HOME/gx-remote.token` and never looks at
+/// [`GxRecord::token_file`]. The two agree today because gx writes exactly that
+/// path — including for a leader on a non-default socket, whose RECORD filename
+/// is suffixed while its token file is not.
+///
+/// **Deliberate, not an oversight.** A remote reader that took a path out of a
+/// file it had just read on the far side could be aimed at any readable file by
+/// whatever wrote that record, and re-implementing `token_path_for`'s
+/// containment in POSIX `sh` is not a trade worth making for a field that is
+/// always the default. Being un-redirectable by record contents is the stronger
+/// property.
+///
+/// **If gx ever writes a non-default `tokenFile`, this script has to change with
+/// it.** The symptom would be a lane that works on a local machine and answers
+/// `unavailable` over SSH.
 pub const PROBE_SCRIPT: &str = r#"h=${GROK_HOME:-$HOME/.grok}
 for f in "$h"/gx-remote*.json; do
   [ -f "$f" ] || continue

@@ -3400,7 +3400,6 @@ dependencies = [
  "base64 0.22.1",
  "chrono",
  "futures-util",
- "regex",
  "reqwest",
  "serde",
  "serde_json",
