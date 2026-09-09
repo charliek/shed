@@ -4531,11 +4531,13 @@ dependencies = [
  "objc2-app-kit",
  "objc2-foundation",
  "objc2-local-authentication",
+ "reqwest 0.12.28",
  "roost-ipc",
  "serde",
  "serde_json",
  "shed-app",
  "shed-core",
+ "shed-opencode",
  "tauri",
  "tauri-build",
  "tauri-plugin-autostart",
@@ -4544,6 +4546,23 @@ dependencies = [
  "tempfile",
  "tokio",
  "zbus",
+]
+
+[[package]]
+name = "shed-opencode"
+version = "0.8.1"
+dependencies = [
+ "async-trait",
+ "base64 0.22.1",
+ "chrono",
+ "futures-util",
+ "regex",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "shed-core",
+ "thiserror 1.0.69",
+ "tokio",
 ]
 
 [[package]]

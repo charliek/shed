@@ -13,6 +13,18 @@ re-implemented per language. The root `CLAUDE.md` owns the monorepo layout + rel
   wire types + argv builders; its pure pane classifier went with S2, charliek/shed#324 —
   a shed row's `state` is liveness off the wire, a machine row's status comes from
   roost). The Linux clients link it directly.
+  `lane.rs` (plan 015) is the **agent-lane contract** — the DTOs plus the `AgentLane`
+  async trait that normalizes "a coding agent with sessions, a transcript and approvals",
+  one adapter per agent (opencode over its local HTTP server; `gx` next). Pure types, **no
+  I/O** — the transport, fold, ring and reconnect loop belong to whatever crate implements
+  it. It lives here, not in `shed-app`, because shed-mobile links the DTOs through FRB.
+  **The FRB-mirror rule (load-bearing):** mobile HAND-mirrors every lane DTO into Dart, so
+  every field is an owned `String`/`Option`/`Vec`/scalar — **no `serde_json::Value`, no
+  `HashMap`, no borrowed lifetimes**; free-form payloads travel as a `String` of raw JSON
+  (`LaneApproval::request_json`, `LaneAnswer::Raw`). A fielded enum becomes a Dart sealed
+  class, a plain one a plain Dart enum. Same rule as `rc.rs`'s feed types, which `lane`
+  reuses (`RcFeedMessage` IS the transcript row) — which is why those gained `Serialize`
+  plus a tolerant `Deserialize` delegating to their existing `from_map` reader.
 - **`shed-app`** — the UI-free app-logic layer (`Backend`) the clients share; holds the
   `RcRunner` portability seam (`rc.rs`) behind the non-default `rc` feature — which also
   pulls in and re-exports `shed-rc-engine` as `shed_app::rc_engine` — and the embedded
@@ -47,6 +59,28 @@ re-implemented per language. The root `CLAUDE.md` owns the monorepo layout + rel
   builder. Consumed today by the **`shed-host-agent` bin** (the daemon shell — CLI,
   signals, socket bind, the Surface-A desktop UDS server) and, from leg 3a.2, embedded
   in-process by the desktop app. Carries no daemon-only or WebKitGTK concern.
+- **`shed-opencode`** — the **opencode adapter** for `shed_core::lane` (plan 015): the
+  one implementation of `AgentLane` that talks to an opencode server's local HTTP API —
+  the same server the TUI is already running, never a sidecar it launches itself. The
+  Tauri client consumes it as a plain path-dep (a machine row's `agent_lane` stamp,
+  fed by roost's `server_url` report on the tab; see `docs/desktop/agent-lanes.md` for
+  the end-to-end contract and its current limits). `fold.rs` is a **port** of the rc
+  hub's `OpencodeFold`, and it is pinned as one —
+  `fixtures/opencode_turn.golden.json` records what the HUB's fold produced on
+  `fixtures/jsonl/opencode_turn.jsonl`, and the test replays the port against it (that
+  test must NEVER take a `shed-broker` dep; the golden file is the pin). A **second**
+  golden, `fixtures/1.18.29/fold.golden.json`, pins the port's OWN behavior (rows,
+  verdicts and `LaneApproval` DTOs) over a committed 155-frame opencode 1.18.29
+  recording — regression detection, not fidelity, except for the transcript subset that
+  was separately proven identical to the hub's fold. **The two claims must never be
+  blurred**; `shed-opencode/fixtures/README.md` is the one place that spells them out,
+  and it carries the two-step regeneration recipe (re-record the wire live with
+  `SHED_OPENCODE_LIVE=1 SHED_OPENCODE_RECORD=1 … --test live`; re-derive the golden
+  OFFLINE with `SHED_OPENCODE_REGOLD=1 … --test fold_fixtures`). The helpers the
+  fold needs are **copied** into `helpers.rs` rather than linked, because
+  `rc_hub::watch` imports `shed_rc_engine::tmux::Tmux` — linking would drag the RC
+  engine into an HTTP adapter. The duplication ends when S6 deletes the hub's watcher.
+  In `default-members`.
 
 `fixtures/` holds the real-shaped JSON/YAML samples (server info, `shed list`, `system df`,
 egress profiles, enriched image, config) that both the Rust decoders and the Swift
@@ -177,6 +211,8 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo clippy -p shed-app --features rc --all-targets -- -D warnings
 cargo clippy -p shed-app --features broker --all-targets -- -D warnings
 cargo clippy -p shed-app --features broker,rc --all-targets -- -D warnings
+cargo test -p shed-opencode                          # the opencode agent-lane adapter
+cargo test -p shed-opencode --features test-support  # exports `testing::FakeOpencode`
 ```
 
 Note: `sx` (the crate that used to be a default member enabling shed-app's `rc` feature

@@ -1,0 +1,23 @@
+# Seed shed config for the agent-lane E2E (plan 015 §3.4).
+#
+# ONE machine, deliberately. The lane suite is about what happens on a row that
+# carries an `agent_lane` stamp, and a second unreachable machine would only add
+# watchers whose rows every assertion then has to filter out. The health bands
+# are `test_tauri_machines.py`'s subject, not this file's.
+#
+# In test mode the app reaches `mini3`'s `roost-session` on the Unix socket
+# SHED_TAURI_ROOST_SOCKETS names (a `LocalSession`), so `host`/`user` are never
+# dialled and no ssh is spawned. That mapping is ALSO what makes the machine
+# `ReachKind::Local`, so the lane dials the reported `server_url` directly — the
+# fake opencode is on this host's loopback, which is exactly what the map says.
+servers:
+    mock:
+        host: 127.0.0.1
+        http_port: 8080
+        ssh_port: 2222
+default_server: mock
+sheds: {}
+machines:
+    mini3:
+        host: 127.0.0.1
+        user: nobody

@@ -12,6 +12,7 @@ pub mod create;
 pub mod csr;
 pub mod http;
 pub mod hub_client;
+pub mod lane;
 pub mod machine;
 pub mod models;
 pub mod rc;

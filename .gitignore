@@ -1,6 +1,8 @@
 # Binaries
 bin/
 dist/
+# the UI unit tests' tsc output (npm run test, desktop/tauri/ui)
+dist-test/
 /shed
 /shed-server
 /shed-agent

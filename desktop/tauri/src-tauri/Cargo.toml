@@ -28,6 +28,20 @@ tauri = { version = "2", features = ["tray-icon"] }
 # them; it does not make this crate a member of core's workspace).
 shed-core = { path = "../../../crates/shed-core" }
 shed-app = { path = "../../../crates/shed-app", features = ["rc", "broker"] }
+# The opencode agent-lane adapter (plan 015 §3.4). A path dep like the two above
+# — it implements `shed_core::lane::AgentLane` over an opencode server's local
+# HTTP API, and `lane.rs` is the client that drives it. Its `test-support`
+# feature (the in-process fake) is NOT enabled here: the harness drives the
+# shipped path against a Python fake over a real socket. The Rust fake is a
+# dev-dependency instead (below), so it reaches `cargo test` and nothing else.
+shed-opencode = { path = "../../../crates/shed-opencode" }
+# ONLY for `reqwest::Url` — `OpencodeClient::new` takes a parsed base URL, and
+# this crate has to name the type to build one. `default-features = false` and no
+# features of its own: the version and the feature set are whatever shed-core
+# already resolved (`rustls-tls, stream, json`), so this adds nothing to the lock
+# and no second copy of the crate. No HTTP is issued from here — the lane's wire
+# is entirely inside `shed-opencode`.
+reqwest = { version = "0.12", default-features = false }
 # roost's own wire types (plan 013 S3). Only for the two structs this crate has to
 # NAME to drive `shed_app::roost` — `TabOpenParams` for a launch, `Tab`/`Ownership`
 # for the row a fresh `tab.open` answers with. Same git `rev` as
@@ -102,6 +116,13 @@ tempfile = "3"
 # above: cargo unifies them, which is exactly what turns the feature on for the
 # test profile only.)
 shed-core = { path = "../../../crates/shed-core", features = ["test-support"] }
+# `shed_opencode::testing::FakeOpencode` — an in-process opencode server, for the
+# lane-ownership tests (a `close` racing an in-flight `open`, a roster GET that
+# 401s, two opens sharing one tunnel). Same feature-only switch as shed-core's
+# above: `test-support = []` declares no dependency of its own, so this adds no
+# package to the lock and nothing to the shipped binary, which still links the
+# crate without it (see the `[dependencies]` entry).
+shed-opencode = { path = "../../../crates/shed-opencode", features = ["test-support"] }
 
 # A debug build is what the harness drives; keep it reasonably snappy.
 #

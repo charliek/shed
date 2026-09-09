@@ -95,6 +95,7 @@ nav = [
     { "Configuration" = "desktop/configuration.md" },
     { "Approvals" = "desktop/approvals.md" },
     { "RC sessions" = "desktop/rc-sessions.md" },
+    { "Agent lanes" = "desktop/agent-lanes.md" },
     { "IPC" = "desktop/ipc.md" },
     { "shedctl CLI" = "desktop/cli.md" },
     { "Development setup" = "desktop/development-setup.md" },

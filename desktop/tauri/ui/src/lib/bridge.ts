@@ -972,6 +972,32 @@ export type RcSession = {
   /** The roost tab id backing a machine row (a string — roost's own ids are
    *  strings on the wire); absent for a shed session. */
   tab_id?: string;
+  /** The agent lane behind this row, if it has one (plan 015 §3.4). Stamped
+   *  client-side like `origin`/`machine`, from what the tab's adapter reported.
+   *
+   *  **Its PRESENCE is the capability signal** — a row that has it can open a
+   *  live transcript (`lane.*`), a row that does not is status-only, and the
+   *  Transcript affordance is gated on exactly this. Absent on every shed row
+   *  and on any machine row whose agent reported no server.
+   *
+   *  Note the name: `agent_lane`, NOT `lane`. `lane` above is the RC hub's lane
+   *  token and means something else entirely on the same object. */
+  agent_lane?: AgentLane | null;
+};
+
+/** What `RcSession.agent_lane` carries: which agent, which session of it, and
+ *  the loopback URL of the server that session is running on (validated
+ *  loopback-only by roost's own plugin before it is reported). The URL is the
+ *  MACHINE's loopback, not this host's — the backend forwards to it when the
+ *  machine is remote, so nothing in the UI should ever dial it directly. */
+export type AgentLane = {
+  /** The agent's token, the same vocabulary `RcKind` speaks. `"opencode"` is
+   *  the only adapter that exists today. */
+  kind: string;
+  /** The AGENT's own session id — the address every `lane.*` op takes, and not
+   *  the roost tab id (`tab_id` / `slug`). */
+  session_id: string;
+  server_url: string;
 };
 
 /** A configured machine's health, for the sessions view's group rows. A machine
@@ -1175,6 +1201,259 @@ export function useRcSessions(): {
     machines: state.machines,
     refresh,
   };
+}
+
+/* ---- agent lanes (plan 015 §3.4) ------------------------------------------ */
+
+/** One transcript row, as `lane.messages` serializes `shed_core::rc::RcFeedMessage`
+ *  — the SAME rows the RC feed renders, so a lane transcript and an RC transcript
+ *  are one widget. `type` is the wire spelling (`text` | `reasoning` | `tool_use` |
+ *  `tool_result` | `status` | `approval_request`). */
+export type LaneMessage = {
+  seq: number;
+  ts?: string;
+  role: string;
+  type: string;
+  text?: string;
+  tool?: { name?: string; detail?: string } | null;
+  approval?: RcFeedApproval | null;
+};
+
+/** The staged-then-swapped view `lane.messages` answers with. `generation` is
+ *  the generation of the rows being handed back (it moves when a reseed
+ *  COMPLETES), and `stale` is the reason a `Down` gave — non-null means the last
+ *  good generation is still on screen and the feed behind it is not live. That is
+ *  the contract's "consume" posture: keep rendering, say so, don't blank. */
+export type LaneView = {
+  messages: LaneMessage[];
+  activity: string;
+  generation: number;
+  stale: string | null;
+};
+
+export type LaneOption = { id: string; label: string; description?: string | null };
+
+/** One structured question inside a `question` approval: its own options, plus
+ *  `multiple` (several ids in one answer) and `custom` (free text alongside). */
+export type LaneQuestion = {
+  header: string;
+  question: string;
+  options: LaneOption[];
+  multiple: boolean;
+  custom: boolean;
+};
+
+/** One thing waiting on the human.
+ *
+ *  **`kind` selects which field renders, and the two are never both populated**
+ *  (pinned in `shed_core::lane::LaneApproval`'s doc): a `permission` fills
+ *  `options` with the three fixed choices and leaves `questions` empty; a
+ *  `question` fills `questions` and leaves `options` empty. Branch on `kind`,
+ *  never on which list happens to be non-empty — rendering the wrong one yields
+ *  an approval card with no buttons. */
+export type LaneApproval = {
+  id: string;
+  /** May be a DESCENDANT of the subscribed session — a child's approval still
+   *  blocks the same agent, so it surfaces on the root's panel. */
+  session_id: string;
+  kind: string;
+  status: string;
+  title: string;
+  detail?: string | null;
+  options: LaneOption[];
+  questions: LaneQuestion[];
+  request_json: string;
+  created_at_unix_ms?: number | null;
+};
+
+/** The agent session behind a lane (`shed_core::lane::LaneSession`). */
+export type LaneSessionRow = {
+  id: string;
+  title: string;
+  cwd: string;
+  activity: string;
+  pending_approvals: number;
+  approximate: boolean;
+  parent_id?: string | null;
+  last_change_unix_ms?: number | null;
+};
+
+/** What the adapter behind a lane can do (`lane.open`'s second half). */
+export type LaneCapabilities = {
+  kind: string;
+  interject: boolean;
+  create: boolean;
+  cancel: boolean;
+  approvals: boolean;
+  history_cursor: boolean;
+};
+
+export type LaneOpened = { session: LaneSessionRow; capabilities: LaneCapabilities };
+
+/** The three forms `lane.answer` accepts (`lane::parse_answer`). Note the KEBAB
+ *  decision spellings — the IPC grammar's, not the option ids' (`allow_once`). */
+export type LaneAnswer =
+  | { permission: "allow-once" | "allow-always" | "reject" }
+  | { question: string[][] }
+  | { reject: true };
+
+/** `{machine, session_id, event}` — the Tauri `lane-event` payload. The panel
+ *  only reads the address (it re-reads the staged view rather than folding
+ *  frames itself, so what it renders is the same truth `lane.messages` answers
+ *  with), which is why `event` stays `unknown`. */
+export type LaneEventEnvelope = { machine?: unknown; session_id?: unknown; event?: unknown };
+
+/** The Tauri event every lane frame arrives on (`lane::LANE_EVENT`). */
+export const LANE_EVENT = "lane-event";
+
+/** A `lane.*` failure with the contract's snake_case code recovered.
+ *
+ *  A `#[tauri::command]`'s error channel is a bare string, so `lib.rs` sends
+ *  `"<code>: <message>"` and this is the other half of that agreement (the IPC
+ *  socket keeps the structured envelope; both doors land in the same `Lanes`). */
+export class LaneFailure extends Error {
+  readonly code: string;
+  constructor(code: string, message: string) {
+    super(message);
+    this.name = "LaneFailure";
+    this.code = code;
+  }
+}
+
+/** A lane error code as `LaneFailure::code` spells them — snake_case, no spaces.
+ *  Anything else means the string is not a coded failure (a failed `invoke`, a
+ *  browser with no Tauri) and the whole text is the message. */
+const LANE_CODE = /^[a-z][a-z_]*$/;
+
+export function laneFailure(e: unknown): LaneFailure {
+  const raw = typeof e === "string" ? e : e instanceof Error ? e.message : String(e);
+  const cut = raw.indexOf(": ");
+  const code = cut > 0 ? raw.slice(0, cut) : "";
+  return LANE_CODE.test(code)
+    ? new LaneFailure(code, raw.slice(cut + 2))
+    : new LaneFailure("failed", raw);
+}
+
+/** Invoke a lane command, THROWING a coded [LaneFailure] (unlike the swallowing
+ *  `invoke` the shell uses): every lane verb is a user action whose refusal —
+ *  `already_resolved`, `not_accepting`, `unauthorized` — is exactly what the
+ *  panel has to show. */
+async function laneInvoke<T>(cmd: string, args: Record<string, unknown>): Promise<T> {
+  const core = await import("@tauri-apps/api/core");
+  try {
+    return await core.invoke<T>(cmd, args);
+  } catch (e) {
+    throw laneFailure(e);
+  }
+}
+
+// NB Tauri v2 looks invoke args up in camelCase (the Rust `session_id` param →
+// the key `sessionId`), so these must be sent camelCase — the `createId` rule.
+
+/** Start (or re-answer) a live transcript. Idempotent: a second call for an
+ *  already-open lane re-answers from the entry, it does not open a second
+ *  subscription. */
+export async function laneOpen(machine: string, sessionId: string): Promise<LaneOpened> {
+  return laneInvoke<LaneOpened>("lane_open", { machine, sessionId });
+}
+
+export async function laneMessages(machine: string, sessionId: string): Promise<LaneView> {
+  return laneInvoke<LaneView>("lane_messages", { machine, sessionId });
+}
+
+export async function laneApprovals(machine: string, sessionId: string): Promise<LaneApproval[]> {
+  const r = await laneInvoke<{ approvals?: LaneApproval[] }>("lane_approvals", { machine, sessionId });
+  return r.approvals ?? [];
+}
+
+/** Send a prompt. `mode` defaults to `queue`; `interject` is REFUSED by the
+ *  opencode adapter (`capabilities.interject` is false) rather than silently
+ *  downgraded, so a caller that passes it gets `not_accepting`. */
+export async function laneSend(machine: string, sessionId: string, text: string, mode?: string): Promise<void> {
+  await laneInvoke("lane_send", { machine, sessionId, text, mode });
+}
+
+export async function laneCancel(machine: string, sessionId: string): Promise<void> {
+  await laneInvoke("lane_cancel", { machine, sessionId });
+}
+
+export async function laneAnswer(
+  machine: string,
+  sessionId: string,
+  approvalId: string,
+  answer: LaneAnswer,
+): Promise<void> {
+  await laneInvoke("lane_answer", { machine, sessionId, approvalId, answer });
+}
+
+/** End the subscription and release the transport. Idempotent, and deliberately
+ *  BEST-EFFORT: this runs from the panel's unmount cleanup, where a throw would
+ *  escape into React and where an unmount racing an eviction (the tab went away)
+ *  is normal, not an error. */
+export async function laneClose(machine: string, sessionId: string): Promise<void> {
+  try {
+    await laneInvoke("lane_close", { machine, sessionId });
+  } catch {
+    /* the lane is already gone — which is what close asked for */
+  }
+}
+
+/** One transcript row AS RENDERED — not the wire row. `text` is the string on
+ *  screen, `tool` the `name · detail` line a tool row shows, and the two flags
+ *  are the treatments the plan pins (a `status` row is muted, reasoning is
+ *  collapsed). */
+export type LaneRow = {
+  seq: number;
+  role: string;
+  type: string;
+  text: string;
+  tool: string | null;
+  muted: boolean;
+  collapsed: boolean;
+};
+
+/** One approval card as rendered: `buttons` are the decision buttons' LABELS in
+ *  render order (a permission's three), and `questions` the structured form a
+ *  question renders instead — `options` being the option buttons' labels and
+ *  `custom` whether a free-text field sits beside them. Which of the two is
+ *  populated follows `kind`, exactly as the render does. */
+export type LaneApprovalCard = {
+  id: string;
+  session_id: string;
+  kind: string;
+  title: string;
+  detail: string;
+  buttons: string[];
+  questions: { header: string; question: string; options: string[]; custom: boolean }[];
+};
+
+/** The transcript panel's rendered state — the UI truth `lane.dump` reads.
+ *
+ *  `lane.messages` is the BACKEND's staged view; this is what a person is
+ *  actually looking at, which is a different claim and the one a screenshot
+ *  would otherwise be the only evidence for. */
+export type LaneReport = {
+  machine: string;
+  session_id: string;
+  title: string;
+  cwd: string;
+  activity: string;
+  generation: number;
+  /** The stale banner's reason, or null while the lane is live. */
+  stale: string | null;
+  rows: LaneRow[];
+  approvals: LaneApprovalCard[];
+  /** The Cancel button is enabled — i.e. the session is Working. */
+  can_cancel: boolean;
+  error: string | null;
+};
+
+/** Report the transcript panel's rendered state (mounted-only, like
+ *  `reportEgress`). Pass `null` on unmount to CLEAR the key — the merge
+ *  overwrites `lane` with null rather than skipping it, so `lane.dump` answers
+ *  `null` for "no panel" instead of the previous mount's stale snapshot. */
+export function reportLane(snapshot: LaneReport | null): void {
+  void invoke("ui_report", { snapshot: { lane: snapshot } });
 }
 
 /* ---- menu-bar popover (B1b) ------------------------------------------------ */

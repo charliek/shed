@@ -29,6 +29,43 @@ make -C desktop core-linux          # shed-core cargo test + clippy on Linux (Do
   libnotify `Notifier` compile) and asserts the gate is fail-closed. No display needed.
 - Both reuse the `shed-tauri-linux` image (built from `desktop/Dockerfile.tauri-linux`).
 
+### The native inner loop (a Linux host with the WebKitGTK dev stack)
+
+Docker is the **gate**; it is a poor iteration loop (image build + tar + cold cargo cache per
+run). On a Linux box that can already build the crate natively, drive the suite directly and
+keep Docker for the final check:
+
+```bash
+cd desktop/tauri/ui && npm ci && npm run build      # ONCE, and after any tauri/ui change
+cd ../src-tauri && cargo build                      # AFTER EVERY change, Rust OR UI — see below
+cd ../..                                            # desktop/
+SHED_TAURI_BIN=$PWD/tauri/src-tauri/target/debug/shed-desktop-tauri \
+WEBKIT_DISABLE_DMABUF_RENDERER=1 \
+xvfb-run -a --server-args="-screen 0 1400x900x24" \
+  uv run --group test pytest tools/shedtest --target tauri -q -p no:cacheprovider
+```
+
+Three traps, all of which cost real time and none of which produces a useful error:
+
+- **The harness runs `SHED_TAURI_BIN`, not `cargo`.** A Rust change you did not `cargo build`
+  is simply not under test, and the run passes (or fails) on the OLD binary. `cargo test --lib`
+  builds a *different* artifact and does not refresh it. Rebuild before every pytest run.
+- **`cargo build` is also how a UI change reaches the app.** `generate_context!` **embeds**
+  `tauri/ui/dist` INTO the binary, so `npm run build` (or `make tauri-ui-build`) alone changes
+  nothing the harness runs — the app keeps serving whatever bundle was embedded at the last
+  `cargo build`. There is no error and no warning; the app renders the old UI perfectly, which
+  is exactly what makes it expensive. Symptom to recognise: an assertion about the new UI fails
+  against markup you can see is no longer in the source, or a screenshot shows the previous
+  layout. **After ANY `tauri/ui/**` edit: `npm run build` THEN `cargo build`, in that order.**
+  (The `make` targets get this right — `tauri-build` depends on `tauri-ui-build` — so the trap
+  is specific to driving the pytest run against a hand-built binary.)
+- **A `tauri/ui/dist` that exists is not a `dist` that works.** `generate_context!` only needs
+  the directory, so a placeholder `index.html` (a one-line `probe` stub is a real thing to find
+  there) compiles and links fine — and then the WebView mounts nothing, `ui.current_pane()`
+  stays `None`, and EVERY tauri cell dies at `timed out … waiting for tauri frontend ready`
+  with nothing in the app log. `ls tauri/ui/dist` should show `assets/`, `index.html`,
+  `popover.html`, `preferences.html`; if it does not, `npm ci && npm run build`.
+
 ## The .deb
 
 ```bash
@@ -108,6 +145,28 @@ both directions), so an app with no session running shows no `localhost` row at 
 correct, not a bug. A configured machine named `localhost` wins over the implicit one, and
 `machine.add {"name":"localhost"}` is refused.
 
+### Agent lanes ride the same seam (plan 015)
+
+`test_tauri_lane.py` drives the `lane.*` ops — an opencode transcript on a machine row — and
+needs **no extra setup**: `fake_roost` serves a tab whose `ownership.metadata` carries
+`server_url`, and `fake_opencode.py` (a port of the rc-parity fake, pin guard and all) answers
+on a loopback port in the pytest process. The mapping in `SHED_TAURI_ROOST_SOCKETS` is what
+makes the machine count as LOCAL, so the lane dials that URL directly and the suite spawns no
+ssh. Against a real remote machine the same code takes the other branch — an
+`ssh -N -L <local>:127.0.0.1:<reported>` child per session-port — which nothing hermetic can
+exercise.
+
+**Driving the transcript PANEL.** The panel opens from a card's Transcript affordance — a
+click, which the harness does not have — so it has drivable ops on the `ui.show_create` /
+`ui.show_launch` pattern: `ui.show_lane {machine, session_id}` mounts it (and raises the
+window), `ui.close_lane` unmounts it, and `lane.dump` answers what it RENDERED (`null` once
+no panel is mounted, which is deliberately not pane-gated — the panel can be open over any
+pane). The panel itself calls `lane.open` on mount and `lane.close` on unmount, so mounting
+one opens a lane and unmounting one closes it: a cell that leaves a panel up leaves a
+subscription up. `lane.messages` (what the backend staged) and `lane.dump` (what is on
+screen) are different questions — assert the one you mean. `SHED_LANE_SHOTS=<dir>` makes the
+panel cells keep their `app.screenshot` PNGs there; unset, they still capture and assert one.
+
 ### Against a REAL local daemon
 
 The render-gate container can drive the roost-session running on the **host**. Mount its
@@ -172,9 +231,29 @@ docker run --rm -v "$PWD:/repo:ro" \
       | grep -E "^ *--> " '
 ```
 
-The definitive check is `make -C desktop tauri-lint` on a Mac (see the
-`mac-mini` recipe in the mac skill); it needs `make sparkle-framework` staged
-first.
+### The definitive check runs on a Mac, and its baseline is CLEAN
+
+`make -C desktop tauri-lint` is the real gate (`desktop/Makefile` already makes it depend on
+both `sparkle-framework` and `tauri-ui-build`, so a bare `make -C desktop tauri-lint` stages
+Sparkle and rebuilds the UI bundle for you). If you instead invoke `cargo clippy` directly on
+the Tauri crate — e.g. over SSH to a Mac worktree for a faster inner loop while iterating on one
+file — both prerequisites are on you:
+
+```bash
+ssh mac-mini   # or whatever your macOS box is
+cd ~/projects.bak/shed   # a worktree checked out to the branch under review
+make -C desktop sparkle-framework          # build.rs panics without it (macOS-only dep)
+make -C desktop tauri-ui-build             # generate_context! panics at macro expansion
+                                            #   without a non-empty tauri/ui/dist — same
+                                            #   trap as the Linux gate above, just fatal
+                                            #   here instead of "serves stale content"
+cd desktop/tauri/src-tauri
+cargo clippy --locked --all-targets -- -D warnings
+```
+
+**Unlike Linux, this baseline is CLEAN at `origin/main`** — there is no `tray.rs`/`zbus::proxy`
+pre-existing-findings exemption on macOS (those are Linux-only code paths). So on a Mac, run
+clippy with `-D warnings` as a real gate, not a filter: if it is red, the finding is yours.
 
 ### The daemon must speak session protocol 4
 

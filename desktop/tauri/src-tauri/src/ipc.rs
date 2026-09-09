@@ -51,6 +51,20 @@ fn err(code: &str, message: impl Into<String>) -> (String, String) {
     (code.to_string(), message.into())
 }
 
+/// `(machine, session_id)` — the address every `lane.*` op takes.
+fn lane_target(params: &Value) -> Result<(String, String), (String, String)> {
+    Ok((
+        req_str(params, "machine")?.to_string(),
+        req_str(params, "session_id")?.to_string(),
+    ))
+}
+
+/// A lane failure as the IPC error envelope. The codes are the lane contract's
+/// own, so a client branches on the same vocabulary the DTOs speak.
+fn lane_err(failure: crate::lane::LaneFailure) -> (String, String) {
+    err(failure.code(), failure.message())
+}
+
 /// A machine row has NO terminal (plan 013 S3).
 ///
 /// Its sessions come from a `roost-session`, whose synthesized capabilities
@@ -340,6 +354,9 @@ pub struct Handler {
     /// Machine rows need no equivalent — roost reports the agent axes on every
     /// poll.
     live: Arc<crate::live_activity::LiveActivityLayer>,
+    /// The agent lanes open on machine rows (plan 015 §3.4) — one live opencode
+    /// transcript per `(machine, session)`.
+    lanes: Arc<crate::lane::Lanes>,
     /// Monotonic token stamped onto each `sheds.refresh` so it can wait for the
     /// frontend to echo it back (a synchronous refresh — see [`Self::sheds_refresh`]).
     refresh_seq: AtomicU64,
@@ -359,6 +376,7 @@ impl Handler {
         prefs: SharedPrefs,
         machines: Arc<crate::machines::Machines>,
         live: Arc<crate::live_activity::LiveActivityLayer>,
+        lanes: Arc<crate::lane::Lanes>,
     ) -> Self {
         Self {
             env,
@@ -371,6 +389,7 @@ impl Handler {
             prefs,
             machines,
             live,
+            lanes,
             refresh_seq: AtomicU64::new(0),
             pid: std::process::id(),
         }
@@ -440,6 +459,29 @@ impl Handler {
                 let _ = self.app.emit("show-launch", json!({}));
                 Ok(json!({}))
             }
+            // The agent-lane transcript panel (plan 015 §3.4), on the
+            // show-create/show-launch pattern. The panel opens from a card's
+            // Transcript affordance — a CLICK, which no caller here has — and
+            // `lane.dump` (the panel's own rendered truth) only means anything
+            // once one is mounted, so open and close are drivable ops.
+            //
+            // Deliberately no lane bookkeeping: this only asks the frontend to
+            // mount a panel, and the panel's own mount/unmount is what opens and
+            // closes the lane. Two doors into one `Lanes` (`lib.rs`'s commands
+            // and this module's `lane.*`), not three.
+            "ui.show_lane" => {
+                let (machine, session_id) = lane_target(params)?;
+                present_main_window(&self.app);
+                let _ = self.app.emit(
+                    "show-lane",
+                    json!({ "machine": machine, "session_id": session_id }),
+                );
+                Ok(json!({}))
+            }
+            "ui.close_lane" => {
+                let _ = self.app.emit("close-lane", json!({}));
+                Ok(json!({}))
+            }
             "app.screenshot" => self.screenshot().await,
             "sheds.list" => Ok(sheds_payload(&self.backend.refresh().await)),
             "sheds.refresh" => self.sheds_refresh().await,
@@ -476,6 +518,15 @@ impl Handler {
             "machine.launch" => self.machine_launch(params).await,
             "machine.capabilities" => self.machine_capabilities(params),
             "machine.add" => self.machine_add(params),
+            // -- agent lanes (plan 015 §3.4) --
+            "lane.open" => self.lane_open(params).await,
+            "lane.messages" => self.lane_messages(params),
+            "lane.approvals" => self.lane_approvals(params),
+            "lane.send" => self.lane_send(params).await,
+            "lane.cancel" => self.lane_cancel(params).await,
+            "lane.answer" => self.lane_answer(params).await,
+            "lane.close" => self.lane_close(params),
+            "lane.dump" => Ok(self.lane_dump()),
             "agents.dump" => Ok(self.agents_dump()),
             "prefs.get" => Ok(self.prefs_get()),
             "prefs.set_terminal" => self.prefs_set_terminal(params),
@@ -986,6 +1037,102 @@ impl Handler {
             .capabilities(&machine)
             .map_err(|e| err("action_failed", e))?;
         Ok(json!({ "capabilities": caps }))
+    }
+
+    // -- agent lanes (plan 015 §3.4) ------------------------------------------
+    //
+    // Every op is addressed by `(machine, session_id)` — the machine name the
+    // row is stamped with, and the AGENT's own session id from its `agent_lane`
+    // stamp. That id is not the roost tab id (`slug`): a lane talks to the
+    // agent's HTTP server, which has never heard of roost.
+    //
+    // Failures answer the same `{code, message}` envelope everything else does,
+    // with the lane contract's own snake_case codes (`unknown_session`,
+    // `already_resolved`, `unauthorized`, …) plus `no_lane` for a row that has
+    // no transcript to show. See [`crate::lane::LaneFailure`].
+
+    /// `lane.open {machine, session_id}` → `{session, capabilities}`.
+    ///
+    /// Idempotent: a second call for an already-open lane re-answers from the
+    /// entry rather than opening a second subscription, and two concurrent calls
+    /// build ONE.
+    async fn lane_open(&self, params: &Value) -> Result<Value, (String, String)> {
+        let (machine, session_id) = lane_target(params)?;
+        self.lanes
+            .open(&machine, &session_id)
+            .await
+            .map_err(lane_err)
+    }
+
+    /// `lane.messages {machine, session_id}` → `{messages, activity, generation,
+    /// stale}` — the staged-then-swapped view, never a half-seeded one.
+    fn lane_messages(&self, params: &Value) -> Result<Value, (String, String)> {
+        let (machine, session_id) = lane_target(params)?;
+        self.lanes.messages(&machine, &session_id).map_err(lane_err)
+    }
+
+    /// `lane.approvals {machine, session_id}` → `{approvals}` — what is blocking
+    /// on the human, this session's and its descendants'.
+    fn lane_approvals(&self, params: &Value) -> Result<Value, (String, String)> {
+        let (machine, session_id) = lane_target(params)?;
+        self.lanes
+            .approvals(&machine, &session_id)
+            .map_err(lane_err)
+    }
+
+    /// `lane.send {machine, session_id, text, mode?}` → `{}`.
+    async fn lane_send(&self, params: &Value) -> Result<Value, (String, String)> {
+        let (machine, session_id) = lane_target(params)?;
+        let text = req_str(params, "text")?.to_string();
+        let mode = crate::lane::parse_mode(params.get("mode").and_then(Value::as_str))
+            .map_err(lane_err)?;
+        self.lanes
+            .send(&machine, &session_id, &text, mode)
+            .await
+            .map_err(lane_err)
+    }
+
+    /// `lane.cancel {machine, session_id}` → `{}`.
+    async fn lane_cancel(&self, params: &Value) -> Result<Value, (String, String)> {
+        let (machine, session_id) = lane_target(params)?;
+        self.lanes
+            .cancel(&machine, &session_id)
+            .await
+            .map_err(lane_err)
+    }
+
+    /// `lane.answer {machine, session_id, approval_id, answer}` → `{}`.
+    ///
+    /// `answer` is one of `{permission: "allow-once"|"allow-always"|"reject"}`,
+    /// `{question: [[…]]}` or `{reject: true}`.
+    async fn lane_answer(&self, params: &Value) -> Result<Value, (String, String)> {
+        let (machine, session_id) = lane_target(params)?;
+        let approval_id = req_str(params, "approval_id")?.to_string();
+        let answer = params
+            .get("answer")
+            .ok_or_else(|| err("bad_request", "missing 'answer'"))?;
+        let answer = crate::lane::parse_answer(answer).map_err(lane_err)?;
+        self.lanes
+            .answer(&machine, &session_id, &approval_id, answer)
+            .await
+            .map_err(lane_err)
+    }
+
+    /// `lane.close {machine, session_id}` → `{}`. Idempotent.
+    fn lane_close(&self, params: &Value) -> Result<Value, (String, String)> {
+        let (machine, session_id) = lane_target(params)?;
+        Ok(self.lanes.close(&machine, &session_id))
+    }
+
+    /// `lane.dump` → what the transcript PANEL rendered (UI truth, like
+    /// `agents.dump`), `null` once it unmounts.
+    ///
+    /// Deliberately not gated on the current pane, unlike `agents.dump`: the
+    /// panel is an overlay that can be open on top of any pane, and the frontend
+    /// clears the key on unmount — so absence here means "no panel", which is
+    /// exactly the question a caller is asking.
+    fn lane_dump(&self) -> Value {
+        json!({ "lane": self.ui_get("lane").unwrap_or(Value::Null) })
     }
 
     /// `rc.launch {shed, kind, host?, display_name?, workdir?, initial_prompt?}` →
@@ -1586,6 +1733,90 @@ mod tests {
     use shed_app::HostFailure;
     use shed_core::http::ShedError;
     use std::path::PathBuf;
+
+    // -- the two lane doors ---------------------------------------------------
+
+    /// `bridge.ts`'s `laneFailure`, transcribed: split on the FIRST `": "`, and
+    /// take the prefix as the code only if it looks like one (`LANE_CODE`,
+    /// `^[a-z][a-z_]*$`); anything else means the whole string is the message.
+    ///
+    /// It is duplicated here rather than described, because what these cells are
+    /// about is whether the two doors survive THIS rule — a rule the frontend
+    /// applies to the command door's bare string and the socket door never needs.
+    fn recover(raw: &str) -> (String, String) {
+        match raw.split_once(": ") {
+            Some((code, message))
+                if code.starts_with(|c: char| c.is_ascii_lowercase())
+                    && code.chars().all(|c| c.is_ascii_lowercase() || c == '_') =>
+            {
+                (code.to_string(), message.to_string())
+            }
+            _ => ("failed".to_string(), raw.to_string()),
+        }
+    }
+
+    /// **Review finding: the two IPC doors disagreed on the same input.** A
+    /// `lane.*` refusal reaches the socket as `{code, message}` and reaches the
+    /// `#[tauri::command]` twin as `code + ": " + message`. The grammar refusals
+    /// (`parse_mode`, `parse_answer`) used to skip that join on the command door
+    /// — the same malformed answer was `bad_request` through the socket and an
+    /// uncoded `failed` through the command.
+    #[test]
+    fn both_lane_doors_answer_a_malformed_input_with_the_same_code() {
+        let bad_answers = [
+            json!({"question": "yes"}),
+            json!({"question": [["yes"], "no"]}),
+            json!({"permission": "maybe"}),
+            json!({"permission": 3}),
+            json!({"reject": false}),
+            json!({}),
+            json!({"permission": "reject", "question": [["yes"]]}),
+        ];
+        for bad in bad_answers {
+            let socket =
+                lane_err(crate::lane::parse_answer(&bad).expect_err("this answer is malformed"));
+            let command = recover(&crate::lane_error(
+                crate::lane::parse_answer(&bad).expect_err("this answer is malformed"),
+            ));
+            assert_eq!(
+                socket.0, "bad_request",
+                "the socket door lost the code on {bad}"
+            );
+            assert_eq!(
+                command, socket,
+                "the two doors disagree on {bad}: command={command:?} socket={socket:?}"
+            );
+        }
+
+        for bad in ["later", "  interject please", "QUEUE"] {
+            let socket = lane_err(crate::lane::parse_mode(Some(bad)).expect_err("a bad mode"));
+            let command = recover(&crate::lane_error(
+                crate::lane::parse_mode(Some(bad)).expect_err("a bad mode"),
+            ));
+            assert_eq!(socket.0, "bad_request");
+            assert_eq!(command, socket, "the two doors disagree on mode {bad:?}");
+        }
+    }
+
+    /// The other half of the same finding: the code the frontend recovers is
+    /// always OURS. A refusal whose MESSAGE happens to be shaped like a coded
+    /// failure — `parse_answer`'s `question` refusal embeds a serde error and
+    /// therefore a `": "` — must not have a code read out of it.
+    #[test]
+    fn a_lane_message_that_looks_coded_does_not_mint_a_code() {
+        for message in [
+            "already_resolved: someone else answered it",
+            "`question` must be a list of lists of option ids: invalid type:              string \"yes\", expected a sequence",
+            "no colon here at all",
+        ] {
+            let raw = crate::lane_error(crate::lane::LaneFailure::bad_request(message.to_string()));
+            assert_eq!(
+                recover(&raw),
+                ("bad_request".to_string(), message.to_string()),
+                "a parse message minted its own code out of {message:?}"
+            );
+        }
+    }
 
     /// A `Reachability` as `Backend::refresh()` would return it, without needing a
     /// live backend: `sheds` decoded from the wire shape, `host_errors` built

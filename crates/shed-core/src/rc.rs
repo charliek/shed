@@ -1252,9 +1252,15 @@ fn feed_u64(v: Option<&serde_json::Value>) -> u64 {
 /// (invocation args for a `tool_use`, output for a `tool_result`). Both are
 /// hub-sanitized AND Cf-stripped here; either may be absent. Mirrors mobile's
 /// `RcFeedTool` (`rc_feed.dart:16-23`).
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+///
+/// Serialization matches Go's `omitempty` posture (`internal/ext/rc/
+/// hub_messages.go`): a `None` field is ABSENT, never `null` — so a re-encoded
+/// block is byte-shaped like a hub-minted one and mobile's mirror is unaffected.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize)]
 pub struct RcFeedTool {
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
 }
 
@@ -1264,6 +1270,17 @@ impl RcFeedTool {
             name: clean_display(o.get("name")),
             detail: clean_display(o.get("detail")),
         }
+    }
+}
+
+impl<'de> Deserialize<'de> for RcFeedTool {
+    /// Tolerant, and deliberately the SAME reader the page decode uses: it
+    /// delegates to the private `from_map`, so a serde-driven decode is
+    /// exactly as lenient as [`RcMessagesPage::from_value`]'s (a non-object —
+    /// including `null` — is no tool block at all, i.e. the default).
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let v = serde_json::Value::deserialize(d)?;
+        Ok(v.as_object().map(RcFeedTool::from_map).unwrap_or_default())
     }
 }
 
@@ -1346,19 +1363,31 @@ impl<'de> Deserialize<'de> for RcFeedApproval {
 /// from 1 on hub restart — a client that sees a seq lower than one it holds does a
 /// full refetch). Mirrors mobile's `RcFeedMessage` (`rc_feed.dart:29-58`); every
 /// field decodes tolerantly (wrong-typed → default/`None`, never an error).
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+///
+/// **Serialization** (added for the agent-lane contract, [`crate::lane`], whose
+/// `LaneEvent`/`LaneHistory` carry these rows over an IPC wire): `msg_type` goes
+/// back out under its wire key `type`, and every `Option` follows Go's
+/// `omitempty` posture — absent when `None`, never `null`, exactly as
+/// [`RcFeedApproval`] already did. The wire shape is unchanged; this type only
+/// gained the ability to re-encode it, so mobile's mirror needs no edit.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize)]
 pub struct RcFeedMessage {
     pub seq: u64,
     /// RFC3339, verbatim (crate convention: timestamps are never parsed here).
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub ts: Option<String>,
     pub role: String,
     /// The wire's `type` field (renamed: `type` is a Rust keyword).
+    #[serde(rename = "type")]
     pub msg_type: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub text: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub tool: Option<RcFeedTool>,
     /// The approval block of an `approval_request` row (contract v2) — `None` on
     /// every other message type. `text`/`tool` still carry the human-readable
     /// summary of what is being approved.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub approval: Option<RcFeedApproval>,
 }
 
@@ -1395,6 +1424,20 @@ impl RcFeedMessage {
         } else {
             None
         }
+    }
+}
+
+impl<'de> Deserialize<'de> for RcFeedMessage {
+    /// Tolerant, delegating to the SAME private `from_map` the page
+    /// decode uses — so a serde-driven decode is exactly as lenient as
+    /// [`RcMessagesPage::from_value`]'s (never-throw, wrong-typed → default) and
+    /// there is no second, stricter reader for this row to drift against. A
+    /// non-object — including `null` — decodes to the default message.
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let v = serde_json::Value::deserialize(d)?;
+        Ok(v.as_object()
+            .map(RcFeedMessage::from_map)
+            .unwrap_or_default())
     }
 }
 
@@ -1667,6 +1710,119 @@ mod tests {
         // Cf-only text degrades to None.
         let p = page("{\"messages\":[{\"seq\":1,\"role\":\"assistant\",\"type\":\"text\",\"text\":\"\u{202E}\"}]}");
         assert_eq!(p.messages[0].text, None);
+    }
+
+    // ---- feed row serde round-trips (the `lane` contract's prerequisite) ----
+
+    /// Serialize, deserialize, assert identity — and hand back the encoded JSON
+    /// so a caller can also pin the exact bytes. Deliberately returns the
+    /// STRING, not a `Value`: half the assertions here are about key order and
+    /// about which keys are absent, which a `Value` would erase.
+    fn round_trip_json<T>(v: &T) -> String
+    where
+        T: Serialize + serde::de::DeserializeOwned + PartialEq + std::fmt::Debug,
+    {
+        let json = serde_json::to_string(v).expect("serialize");
+        assert_eq!(&serde_json::from_str::<T>(&json).expect("deserialize"), v);
+        json
+    }
+
+    /// A fully-populated row survives serialize → deserialize unchanged. The
+    /// values are already sanitized (no ANSI, no Cf, no untrimmed edges), which
+    /// is what makes identity the right assertion: `from_map` cleans, so only a
+    /// clean value is a fixed point of the round trip.
+    #[test]
+    fn feed_message_round_trips_through_serde() {
+        let msg = RcFeedMessage {
+            seq: 7,
+            ts: Some("2026-09-07T12:00:00Z".into()),
+            role: "tool".into(),
+            msg_type: "approval_request".into(),
+            text: Some("run `rm -rf build`?".into()),
+            tool: Some(RcFeedTool {
+                name: Some("bash".into()),
+                detail: Some("rm -rf build".into()),
+            }),
+            approval: Some(RcFeedApproval {
+                id: "ap-1".into(),
+                status: "pending".into(),
+                decision: None,
+                decisions: vec!["allow".into(), "deny".into()],
+            }),
+        };
+        let json = round_trip_json(&msg);
+        // The wire key is `type`, not `msg_type` — mobile's mirror reads that.
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["type"], "approval_request");
+        assert!(v.get("msg_type").is_none());
+    }
+
+    /// `None`/empty fields are ABSENT, not `null`/`[]` — Go's `omitempty`
+    /// posture — and the sparse row still round-trips.
+    #[test]
+    fn feed_message_omits_absent_fields_and_round_trips() {
+        let msg = RcFeedMessage {
+            seq: 1,
+            role: "assistant".into(),
+            msg_type: "text".into(),
+            text: Some("hi".into()),
+            ..RcFeedMessage::default()
+        };
+        assert_eq!(
+            round_trip_json(&msg),
+            r#"{"seq":1,"role":"assistant","type":"text","text":"hi"}"#
+        );
+    }
+
+    #[test]
+    fn feed_tool_and_approval_round_trip_through_serde() {
+        let tool = RcFeedTool {
+            name: Some("bash".into()),
+            detail: Some("ls -l".into()),
+        };
+        assert_eq!(
+            round_trip_json(&tool),
+            r#"{"name":"bash","detail":"ls -l"}"#
+        );
+        // Both absent → an empty object, and back to the default.
+        assert_eq!(round_trip_json(&RcFeedTool::default()), "{}");
+
+        let resolved = RcFeedApproval {
+            id: "ap-1".into(),
+            status: "resolved".into(),
+            decision: Some("allow".into()),
+            decisions: vec!["allow".into(), "allow_always".into(), "deny".into()],
+        };
+        round_trip_json(&resolved);
+        // `None` decision and empty `decisions` are absent, not `null`/`[]`.
+        let pending = RcFeedApproval {
+            id: "ap-2".into(),
+            status: "pending".into(),
+            decision: None,
+            decisions: Vec::new(),
+        };
+        assert_eq!(
+            round_trip_json(&pending),
+            r#"{"id":"ap-2","status":"pending"}"#
+        );
+    }
+
+    /// The new `Deserialize` impls are the tolerant reader, not a strict one:
+    /// a non-object and a wrong-typed field degrade exactly as the page decode
+    /// does, so `RcMessagesPage`'s never-throw posture is not undercut by a
+    /// caller that happens to reach a row through serde instead.
+    #[test]
+    fn feed_row_serde_decode_is_as_tolerant_as_the_page_decode() {
+        let m: RcFeedMessage = serde_json::from_str("null").unwrap();
+        assert_eq!(m, RcFeedMessage::default());
+        let t: RcFeedTool = serde_json::from_str("[1,2]").unwrap();
+        assert_eq!(t, RcFeedTool::default());
+        let m: RcFeedMessage =
+            serde_json::from_str(r#"{"seq":"nope","role":5,"type":"text","tool":7}"#).unwrap();
+        assert_eq!(m.seq, 0);
+        assert_eq!(m.role, "");
+        assert_eq!(m.msg_type, "text");
+        assert!(m.tool.is_none());
     }
 
     // ---- prompt normalization ----

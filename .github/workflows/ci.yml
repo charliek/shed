@@ -531,14 +531,23 @@ jobs:
             exit 1
           fi
           sudo timeout 300 apt-get install -y build-essential
-      - name: shed-core — test + clippy (Linux)
-        # Scoped to -p shed-core so the macOS-only shed-core-ffi (uniffi) is never
-        # dragged in. --all-targets runs the pinned-TLS verifier + redirect/
-        # non-https fail-closed tests here; the e2e's plain-HTTP mock never
-        # exercises the pin/token paths, so they stay cargo-only on Linux.
+      - name: shed-core + shed-opencode — test + clippy (Linux)
+        # Scoped to -p so the macOS-only shed-core-ffi (uniffi) is never dragged
+        # in. --all-targets runs the pinned-TLS verifier + redirect/non-https
+        # fail-closed tests here; the e2e's plain-HTTP mock never exercises the
+        # pin/token paths, so they stay cargo-only on Linux.
+        #
+        # shed-opencode (plan 015) rides along rather than getting a job of its
+        # own: it is a pure client of shed-core's lane contract with the same
+        # dependency surface, its whole suite is hermetic (the loopback
+        # `FakeOpencode` behind the `test-support` feature — the env-gated live
+        # smoke skips without `SHED_OPENCODE_LIVE`), and it is the crate the
+        # Tauri app now links, so a break here must not first surface as a
+        # desktop build failure. Named EXPLICITLY, like the engine leg below: a
+        # filter that matched nothing would run zero tests silently.
         run: |
-          cargo test -p shed-core --all-targets --locked
-          cargo clippy -p shed-core --all-targets --locked -- -D warnings
+          cargo test -p shed-core -p shed-opencode --all-targets --locked
+          cargo clippy -p shed-core -p shed-opencode --all-targets --locked -- -D warnings
 
   # The host-agent wire-goldens leg (Phase 3 leg 3a.1; the Go twin sunset by
   # plan 006-mtls-cleanup-hostagent-sunset.md). One Linux job covers BOTH the
