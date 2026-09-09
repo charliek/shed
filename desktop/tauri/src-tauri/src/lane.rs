@@ -1012,46 +1012,39 @@ impl Lanes {
     }
 
     /// A share of the tunnel for `key`, joining the existing one or building it.
+    ///
+    /// **Look and build under ONE acquisition.** This used to look first,
+    /// release the lock to build a candidate, and insert-if-absent — so two
+    /// opens for two sessions on ONE agent server could both look into an empty
+    /// map and both call [`LaneMachines::forward`]. Only the winner's was ever
+    /// registered or `ensure`d, so the loser's was a reservation thrown away
+    /// rather than a second `ssh -N` child; but "one server, one tunnel" then
+    /// held by interleaving rather than by construction, and the next thing to
+    /// grow inside `forward()` would have made the difference matter.
+    ///
+    /// The lock is a plain `Mutex` and this is a synchronous fn, so nothing is
+    /// held across an await. `forward()` RESERVES (see its doc): it binds
+    /// `127.0.0.1:0`, reads the assignment back and closes — no spawn, no
+    /// network, no path back into this map. Holding the map across that is
+    /// cheaper than the discarded reservations were.
     fn reserve(&self, key: ForwardKey, entry: &MachineEntry) -> Result<ForwardShare, LaneFailure> {
-        if let Some(share) = self.join(&key) {
-            return Ok(share);
-        }
-        // Build OUTSIDE the lock: the reservation binds a socket to read the
-        // port assignment back, and a second reserve for a key another task just
-        // inserted would leak a port. Insert-if-absent under one acquisition
-        // settles the race in favour of whoever got there first; the loser's
-        // unspawned forward is simply dropped.
-        let fresh = Arc::new(OwnedForward::new(
-            self.machines
-                .forward(entry, key.1)
-                .map_err(LaneError::Unavailable)?,
-        ));
         let mut inner = lock(&self.inner);
-        let slot = inner
-            .forwards
-            .entry(key.clone())
-            .or_insert_with(|| ForwardSlot {
-                forward: fresh,
+        let slot = match inner.forwards.entry(key.clone()) {
+            std::collections::hash_map::Entry::Occupied(slot) => slot.into_mut(),
+            std::collections::hash_map::Entry::Vacant(vacant) => vacant.insert(ForwardSlot {
+                forward: Arc::new(OwnedForward::new(
+                    self.machines
+                        .forward(entry, key.1)
+                        .map_err(LaneError::Unavailable)?,
+                )),
                 users: 0,
-            });
+            }),
+        };
         slot.users += 1;
         Ok(ForwardShare {
             inner: Arc::clone(&self.inner),
             key,
             forward: Arc::clone(&slot.forward),
-        })
-    }
-
-    /// Take a share of an EXISTING tunnel, if there is one.
-    fn join(&self, key: &ForwardKey) -> Option<ForwardShare> {
-        let mut inner = lock(&self.inner);
-        let slot = inner.forwards.get_mut(key)?;
-        slot.users += 1;
-        let forward = Arc::clone(&slot.forward);
-        Some(ForwardShare {
-            inner: Arc::clone(&self.inner),
-            key: key.clone(),
-            forward,
         })
     }
 
