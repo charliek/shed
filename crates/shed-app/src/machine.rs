@@ -1118,9 +1118,18 @@ mod tests {
 
     /// Poll until `cond` holds. A condition wait, not a fixed sleep: the
     /// expected path returns in microseconds and only a genuine regression pays
-    /// the deadline.
+    /// the deadline. The deadline bounds a HANG, not a latency — the poll is
+    /// already a consequence of a real event (the fake ssh's pid landing in
+    /// the spawn log), so the happy path returns in microseconds and pays
+    /// nothing for however large this number is; only a genuine deadlock
+    /// spends it. 60s, not a smaller "should be plenty" guess: a 15s bound
+    /// was watched fail here, once, under a full workspace `cargo test` run
+    /// concurrent with a sustained `cargo build --release` load (the exact
+    /// CI-shaped contention this bound exists to survive) — so the number is
+    /// sized against OBSERVED contention on a loaded box, not against
+    /// expected scheduling latency.
     async fn wait_for(what: &str, mut cond: impl FnMut() -> bool) {
-        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
         while std::time::Instant::now() < deadline {
             if cond() {
                 return;
