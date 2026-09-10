@@ -1848,7 +1848,15 @@ fn remote_port(server_url: &str) -> Result<u16, LaneFailure> {
 ///   kind, resolved by the adapter against the offered options' `kind` fields,
 ///   never by id. Kept because it is what a script can write without first
 ///   fetching the approval, and it is what every existing caller sends.
-/// * `{"question": [["<option id>", …], …]}` — one inner list per question
+/// * `{"question": [["<option id>", …], …]}` — one inner list per question,
+///   optionally beside `{"custom_text": ["<typed>", null, …]}` — the free text
+///   per question, positional like `question`, `null` where nothing was typed.
+///   `custom_text` is a MODIFIER of `question` and of nothing else: beside
+///   `choice`, `permission` or `reject` it is a `bad_request`, because a client
+///   that typed something and named the wrong form has to be told the text did
+///   not travel. The adapter refuses text aimed at a question whose `custom` is
+///   false (`shed_core::lane::normalize_question_answer`), so this door only
+///   checks the shape.
 /// * `{"reject": true}` — decline the whole request
 ///
 /// STRICT, like the contract's own [`LaneAnswer`]: an answer is a command, and a
@@ -1889,6 +1897,19 @@ pub fn parse_answer(value: &Value) -> Result<LaneAnswer, LaneFailure> {
                 several.join(" and ")
             )))
         }
+    }
+    // `custom_text` is not a FORM — it modifies exactly one of them. Checked
+    // here, against the single form just established, so that every other arm
+    // below can be written as if the key did not exist: a `custom_text` beside
+    // `choice` is refused at this door rather than ignored on the way past it,
+    // which is the difference between "your text did not travel" and a silent
+    // drop of something a human typed.
+    if value.get("custom_text").is_some() && named[0] != "question" {
+        return Err(LaneFailure::bad_request(format!(
+            "`custom_text` answers a question's free-text field; \
+             it has no meaning beside `{}`",
+            named[0]
+        )));
     }
 
     if let Some(option_id) = value.get("choice") {
@@ -1938,7 +1959,21 @@ pub fn parse_answer(value: &Value) -> Result<LaneAnswer, LaneFailure> {
                 "`question` must be a list of lists of option ids: {e}"
             ))
         })?;
-        return Ok(LaneAnswer::Question { answers });
+        // Absent is an empty vec, NOT a vec of nulls: the contract skips the
+        // field when it is empty, so an answer with no free text stays exactly
+        // the payload this build sent before the field existed.
+        let custom_text: Vec<Option<String>> = match value.get("custom_text") {
+            None => Vec::new(),
+            Some(v) => serde_json::from_value(v.clone()).map_err(|e| {
+                LaneFailure::bad_request(format!(
+                    "`custom_text` must be a list of strings or nulls, one per question: {e}"
+                ))
+            })?,
+        };
+        return Ok(LaneAnswer::Question {
+            answers,
+            custom_text,
+        });
     }
     match value.get("reject").and_then(Value::as_bool) {
         Some(true) => Ok(LaneAnswer::Reject),
@@ -2292,7 +2327,11 @@ mod tests {
         assert_eq!(
             parse_answer(&json!({"question": [["yes"], ["a", "b"]]})).expect("question"),
             LaneAnswer::Question {
-                answers: vec![vec!["yes".into()], vec!["a".into(), "b".into()]]
+                answers: vec![vec!["yes".into()], vec!["a".into(), "b".into()]],
+                // Absent `custom_text` is EMPTY, not a vec of nulls — the
+                // contract skips the field when it is empty, so this build's
+                // ordinary answer is byte-identical to the previous build's.
+                custom_text: vec![],
             }
         );
         assert_eq!(
@@ -2304,6 +2343,80 @@ mod tests {
         assert!(parse_answer(&json!({"question": "yes"})).is_err());
         assert!(parse_answer(&json!({"reject": false})).is_err());
         assert!(parse_answer(&json!({})).is_err());
+    }
+
+    /// **`custom_text` is a modifier of `question` and of nothing else**
+    /// (plan 018 §3.2).
+    ///
+    /// It is not a fifth FORM — it does not resolve an approval on its own —
+    /// so the form count is unchanged and this door only decides where the key
+    /// is allowed to appear. Beside `choice`, `permission` or `reject` it is
+    /// refused: a client that typed something and named the wrong form has to
+    /// be told the text did not travel, and the alternative (ignoring the key)
+    /// is a silent drop of the one part of the answer a human wrote by hand.
+    #[test]
+    fn custom_text_rides_beside_question_and_nowhere_else() {
+        assert_eq!(
+            parse_answer(&json!({
+                "question": [["yes"], []],
+                "custom_text": [null, "  a branch I typed  "],
+            }))
+            .expect("free text beside a question"),
+            LaneAnswer::Question {
+                answers: vec![vec!["yes".into()], vec![]],
+                // NOT trimmed here: `normalize_question_answer` is the one
+                // place that trims, so both adapters trim identically.
+                custom_text: vec![None, Some("  a branch I typed  ".into())],
+            }
+        );
+        // All-null is still a legal vector — the panel sends one entry per
+        // question and the adapter reads them all as "nothing typed".
+        assert_eq!(
+            parse_answer(&json!({"question": [["yes"]], "custom_text": [null]}))
+                .expect("all-null free text"),
+            LaneAnswer::Question {
+                answers: vec![vec!["yes".into()]],
+                custom_text: vec![None],
+            }
+        );
+
+        // Beside every other form: refused, and the refusal NAMES the form it
+        // was found beside.
+        for (payload, form) in [
+            (json!({"choice": "p-2", "custom_text": ["typed"]}), "choice"),
+            (
+                json!({"permission": "allow-once", "custom_text": ["typed"]}),
+                "permission",
+            ),
+            (json!({"reject": true, "custom_text": ["typed"]}), "reject"),
+            // …including when it carries nothing: the KEY is the mistake, not
+            // its contents, and a client that sends `[]` beside `choice` still
+            // believes free text is a thing this form takes.
+            (json!({"choice": "p-2", "custom_text": []}), "choice"),
+            (json!({"choice": "p-2", "custom_text": [null]}), "choice"),
+        ] {
+            let err = parse_answer(&payload).expect_err("custom_text needs a question");
+            assert_eq!(err.code(), "bad_request", "{payload}");
+            assert!(
+                err.message().contains(form) && err.message().contains("custom_text"),
+                "the refusal names the form it was found beside: {}",
+                err.message()
+            );
+        }
+
+        // Shape, not just placement: `custom_text` is a list of strings-or-null.
+        assert!(parse_answer(&json!({"question": [["yes"]], "custom_text": "typed"})).is_err());
+        assert!(parse_answer(&json!({"question": [["yes"]], "custom_text": [3]})).is_err());
+        assert!(parse_answer(&json!({"question": [["yes"]], "custom_text": {"0": "t"}})).is_err());
+
+        // And it never becomes a form of its own: alone it is still "name a
+        // form", because free text answers nothing by itself.
+        assert_eq!(
+            parse_answer(&json!({"custom_text": ["typed"]}))
+                .expect_err("free text is not an answer")
+                .code(),
+            "bad_request"
+        );
     }
 
     /// **Review finding: an answer naming two forms was guessed at, not

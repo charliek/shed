@@ -303,14 +303,45 @@ unambiguous on the approval being answered.
 ordinary status-only row, same as any RC kind before agent lanes existed: no
 Transcript affordance, because there is no lane to open.
 
-### Deferred: free-text question answers
+### Free-text answers
 
-gx keys a question's answer set by the question's own text and accepts a list
-of chosen labels; a free-text reply is really the label `"Other"` plus an
-annotation the label list has nowhere to carry. The contract has no field for
-that annotation yet, so free-text answers are not supported against gx in
-this cut — `custom` stays `false`. Filed as a follow-up alongside the phone's
-DTO mirror.
+A question can accept typed prose beside its options. The contract carries it
+as its own **positional** field on the answer — `custom_text`, one entry per
+question, `null` where nothing was typed — never appended to the list of chosen
+option ids, because an adapter that cannot tell a chosen label from something a
+human wrote cannot map it onto the agent's own shape.
+
+Over IPC it rides beside `question` and nowhere else:
+
+```json
+{"question": [["release"], []], "custom_text": [null, "ship it on Friday"]}
+```
+
+`custom_text` beside `choice`, `permission` or `reject` is a `bad_request` — a
+client that typed something and named the wrong form is told the text did not
+travel. The text is trimmed once, in `shed_core::lane::normalize_question_answer`
+(the one reader both adapters share), and text aimed at a question whose `custom`
+is `false` is refused **before** anything reaches the wire.
+
+| | how the answer reaches the agent |
+|---|---|
+| **gx** | The answer map is keyed by the question's TEXT and holds labels, so a typed answer is the label `"Other"` plus the prose in a parallel `annotations[<key>].notes` map. With a label picked too, the labels stand and the note rides beside them. A question answered with neither is omitted from the map — gx's own pager's rule for "unanswered". `annotations` is omitted when empty. |
+| **opencode** | `QuestionReply.answers` is "an array of selected labels", and a custom answer is a label the ask did not offer — so the text is appended as one more entry on that question's list, which is exactly what opencode's own TUI posts. A question answered with neither stays `[]` (opencode reads that as unanswered). |
+
+**Which questions accept it.** `custom` is `true` on every gx question: its pager
+always draws a freeform row and the request carries no flag that could say
+otherwise. On opencode the flag's documented default is `true` as well ("Allow
+typing a custom answer (default: true)"), so an ask that omits it — the ordinary
+wire shape — accepts free text; only an explicit `custom: false` does not.
+
+The cost, on purpose: a lone single-choice gx question no longer takes the
+panel's one-click path (one question, one choice, no free text), because a click
+can no longer mean "I am done typing". It goes through **Send answer** like any
+other staged form.
+
+The one residual is a gx pager launched with `no_freeform`. The request does not
+advertise that, so the answer is refused by gx and surfaces as a `bad_request` on
+an inline error card — told, never silently dropped.
 
 ## Driving a lane
 
@@ -324,7 +355,7 @@ Once a row carries `agent_lane`, opening its Transcript affordance calls
 | `lane.approvals` | Pending permissions and questions, root session plus its children. |
 | `lane.send` | Queues a prompt (`mode: queue`), or preempts the turn in flight (`mode: interject`) when the lane advertises `interject` — the panel shows the toggle only then, and only enables it while the turn is `Working`. |
 | `lane.cancel` | Aborts the turn in flight. |
-| `lane.answer` | Answers one approval. The scripted three-decision form (`{permission: "allow-once" \| "allow-always" \| "reject"}`) or a question's options plus optional free text still works when it is unambiguous; the panel itself always sends `{choice: "<id>"}` — the exact option id the approval offered — because an agent can offer several options of the same decision kind (see [gx's `option_for` refusal](#the-option_for-ambiguity-refusal)). |
+| `lane.answer` | Answers one approval. Four forms, exactly one per answer: `{choice: "<id>"}` — the exact option id the approval offered, which is what the panel always sends, because an agent can offer several options of the same decision kind (see [gx's `option_for` refusal](#the-option_for-ambiguity-refusal)); the scripted `{permission: "allow-once" \| "allow-always" \| "reject"}`, which resolves by semantic kind and refuses an ambiguous one; `{question: [[…]]}`, optionally with `custom_text` beside it (see [Free-text answers](#free-text-answers)); and `{reject: true}`. |
 | `lane.close` | Ends the subscription; the last close on a shared SSH forward tears it down. |
 
 A failure comes back as `{code, message}` with the contract's own snake_case

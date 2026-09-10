@@ -68,9 +68,9 @@ use serde::Deserialize;
 use serde_json::json;
 use serde_json::value::RawValue;
 use shed_core::lane::{
-    option_kind, AgentLane, LaneAnswer, LaneApproval, LaneApprovalKind, LaneApprovalOption,
-    LaneCapabilities, LaneDecision, LaneError, LaneHistory, LaneSession, LaneSubscription,
-    SendMode,
+    normalize_question_answer, option_kind, AgentLane, LaneAnswer, LaneApproval, LaneApprovalKind,
+    LaneApprovalOption, LaneCapabilities, LaneDecision, LaneError, LaneHistory, LaneSession,
+    LaneSubscription, SendMode,
 };
 use shed_core::rc::RcActivity;
 
@@ -1137,13 +1137,39 @@ impl OpencodeClient {
                     })?;
                 self.reply_permission(&seg, decision_of(offered)?).await?;
             }
-            LaneAnswer::Question { answers } => {
+            // Positional in, positional out — opencode files a question's
+            // answers by index and has no key. Free text is one MORE entry in
+            // that question's list, which is exactly what opencode's own TUI
+            // posts for a typed answer: `QuestionReply.answers` is "an array of
+            // selected labels" and a custom answer is a label the ask did not
+            // offer. So the smuggle the panel used to do lives here, where the
+            // agent's shape is known, and the wire is unchanged.
+            LaneAnswer::Question {
+                answers,
+                custom_text,
+            } => {
                 if !is_question {
                     return Err(wrong_kind(
                         &approval,
                         "answer it with `permission` or `choice`",
                     ));
                 }
+                // Against the RESOLVED approval's questions, before anything
+                // reaches the wire: an over-long vector, or text aimed at a
+                // question that does not take it, is refused here.
+                let replies =
+                    normalize_question_answer(&approval.questions, &answers, &custom_text)?;
+                let answers: Vec<Vec<String>> = replies
+                    .into_iter()
+                    .map(|r| {
+                        let mut labels = r.labels;
+                        // A question with neither stays `[]` — opencode reads an
+                        // empty list as unanswered, and inventing an entry would
+                        // answer a question the human skipped.
+                        labels.extend(r.text);
+                        labels
+                    })
+                    .collect();
                 self.post_json(
                     &format!("/question/{seg}/reply"),
                     None,

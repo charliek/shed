@@ -196,10 +196,14 @@
 //!    question's TEXT (what its own TUI keys by); opencode has no key and leaves
 //!    it `None` (positional). [`LaneAnswer::Question::answers`] stays POSITIONAL
 //!    — the adapter maps position → key — so a client never has to know which
-//!    agent it is talking to. `custom` stays `false` on gx: free text there is an
-//!    "Other" answer plus a separate annotations channel this contract cannot
-//!    carry yet, and inviting typing the agent will reject is worse than not
-//!    offering it.
+//!    agent it is talking to. **Free text is its own positional field**
+//!    ([`LaneAnswer::Question::custom_text`]), read against the questions by
+//!    [`normalize_question_answer`], and both adapters carry it: gx turns it
+//!    into an `"Other"` label plus an `annotations[key].notes` entry, opencode
+//!    appends it to that question's answer list (which is what its own TUI
+//!    posts). `custom` is now `true` on gx — its freeform row is on by default
+//!    — and on opencode it defaults to TRUE off the wire, which is what
+//!    opencode's schema says and what its TUI does with an absent flag.
 //! 5. **Credentials are the client's job.** There is no credential type in this
 //!    contract and there will not be one: an adapter takes its credentials at
 //!    construction, from a source the client supplies; roost carries only WHERE
@@ -605,8 +609,10 @@ pub mod option_kind {
 /// how it may be answered.
 ///
 /// `multiple` allows several options in one answer; `custom` allows free text
-/// alongside (or instead of) the options, and DEFAULTS TO FALSE — an adapter that
-/// cannot tell must not invite typing the agent will reject.
+/// alongside (or instead of) the options — carried back in
+/// [`LaneAnswer::Question::custom_text`] and read by
+/// [`normalize_question_answer`], which REFUSES text aimed at a question whose
+/// `custom` is false rather than dropping it.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct LaneQuestion {
     /// The key this question's answer is filed under, when the agent files
@@ -633,6 +639,16 @@ pub struct LaneQuestion {
     /// render conservatively.
     #[serde(default)]
     pub multiple: bool,
+    /// Whether this question accepts free text beside its options.
+    ///
+    /// **On THIS DTO an absent value is `false`** — the conservative reading for
+    /// a producer one version behind, and the one a panel can act on without
+    /// inviting typing that will be refused. That is not the same as the
+    /// AGENT's default: opencode's own schema documents `custom` as "Allow
+    /// typing a custom answer (default: true)" and its TUI treats an absent
+    /// flag as on, so the opencode adapter's wire reader defaults it TRUE
+    /// before it ever builds one of these. gx sets it `true` unconditionally —
+    /// its ask always carries a freeform row.
     #[serde(default)]
     pub custom: bool,
 }
@@ -825,8 +841,12 @@ pub enum LaneDecision {
 ///
 /// [`LaneAnswer::Question::answers`] is a vec-of-vecs: one inner vec per question
 /// in [`LaneApproval::questions`], each holding the option ids chosen for it (one
-/// entry unless that question is `multiple`, and a free-text string when it is
-/// `custom`). [`LaneAnswer::Raw`] carries a body the contract does not model, as
+/// entry unless that question is `multiple`). Free text rides BESIDE it in
+/// [`LaneAnswer::Question::custom_text`], positionally — never smuggled into
+/// `answers` as one more "id", which is what a client used to have to do and
+/// what left an adapter unable to tell a chosen label from something typed.
+/// [`normalize_question_answer`] is the one reader of the pair.
+/// [`LaneAnswer::Raw`] carries a body the contract does not model, as
 /// raw JSON in a `String` — the escape hatch for an unknown
 /// [`LaneApprovalKind`].
 ///
@@ -880,6 +900,22 @@ pub enum LaneAnswer {
     Question {
         #[serde(default)]
         answers: Vec<Vec<String>>,
+        /// Free text per question, positional like `answers`; `None` where the
+        /// human typed nothing. Empty vec = no free text anywhere.
+        ///
+        /// **Additive, and the compatibility is PRODUCER-side.** A newer
+        /// decoder accepts an older client that never sends the field
+        /// (`#[serde(default)]`), which is the direction a two-PR lockstep
+        /// needs; an older decoder — this enum is `deny_unknown_fields` —
+        /// REFUSES a payload carrying it. So the decoding side ships first.
+        /// It is skipped when empty so an answer that carries no free text is
+        /// byte-identical to what the previous build emitted.
+        ///
+        /// Named after [`LaneQuestion::custom`], the flag that permits it: a
+        /// `Some` at a position whose question is not `custom` is a
+        /// [`LaneError::BadRequest`], not a value to drop.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        custom_text: Vec<Option<String>>,
     },
     /// Decline the whole request — distinct from a permission's
     /// [`LaneDecision::Reject`], which is one option among three.
@@ -887,6 +923,95 @@ pub enum LaneAnswer {
     Raw {
         json: String,
     },
+}
+
+/// One question's answer after [`normalize_question_answer`] has read the
+/// positional pair: the labels chosen for it, and the free text typed beside
+/// them.
+///
+/// One per question in [`LaneApproval::questions`], in question order — a
+/// question the client said nothing about is present with an empty `labels` and
+/// no `text`, because "unanswered" is a thing each adapter renders its own way
+/// (gx omits the key, opencode posts an empty list) and a hole in the vec would
+/// make position stop meaning question.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct QuestionReply {
+    /// The option ids chosen for this question, in the order the client sent
+    /// them. Empty when nothing was picked.
+    pub labels: Vec<String>,
+    /// The free text typed for this question, TRIMMED — and `None` rather than
+    /// `Some("")` when the trim emptied it, so an adapter never has to decide
+    /// whether whitespace was an answer.
+    pub text: Option<String>,
+}
+
+/// Read a [`LaneAnswer::Question`]'s positional pair against the approval's own
+/// questions — **the one implementation, shared by every adapter**.
+///
+/// It is here and not in each adapter for the reason correction 3 put
+/// [`LaneApproval::option_for`] here: two adapters reading the same two vectors
+/// would not stay agreed about the edges, and every edge below is a place where
+/// disagreeing means silently dropping something a human typed.
+///
+/// The rules, in order:
+///
+/// 1. `answers` or `custom_text` LONGER than `questions` is
+///    [`LaneError::BadRequest`]. Shorter is fine — the tail is unanswered.
+/// 2. Both are extended to `questions.len()` with `[]` / `None`, so the result
+///    is one reply per question and position keeps meaning question. This is
+///    what makes a free-text-only answer to question 2 survive a `custom_text`
+///    LONGER than `answers`; a `zip` of the two would drop it.
+/// 3. Every `Some(t)` is trimmed, and an empty result becomes `None`. The
+///    trimmed text is what is TRANSMITTED — an adapter never sees the padding,
+///    so it cannot post one agent a trimmed answer and another a padded one.
+/// 4. A `Some` at a position whose [`LaneQuestion::custom`] is `false` is
+///    [`LaneError::BadRequest`]. The agent would refuse it (or, worse, file it
+///    as a label it never offered), and refusing here happens BEFORE anything
+///    reaches the wire.
+///
+/// The index in the refusal is the POSITION the client sent, 0-based — the same
+/// index it addressed `custom_text` by.
+pub fn normalize_question_answer(
+    questions: &[LaneQuestion],
+    answers: &[Vec<String>],
+    custom_text: &[Option<String>],
+) -> Result<Vec<QuestionReply>, LaneError> {
+    if answers.len() > questions.len() {
+        return Err(LaneError::BadRequest(format!(
+            "the approval has {} questions; {} answers were given",
+            questions.len(),
+            answers.len()
+        )));
+    }
+    if custom_text.len() > questions.len() {
+        return Err(LaneError::BadRequest(format!(
+            "the approval has {} questions; free text was given for {}",
+            questions.len(),
+            custom_text.len()
+        )));
+    }
+    let mut out = Vec::with_capacity(questions.len());
+    for (i, q) in questions.iter().enumerate() {
+        let text = match custom_text.get(i).and_then(Option::as_deref) {
+            None => None,
+            Some(t) => match t.trim() {
+                "" => None,
+                trimmed => {
+                    if !q.custom {
+                        return Err(LaneError::BadRequest(format!(
+                            "question {i} does not accept free text"
+                        )));
+                    }
+                    Some(trimmed.to_string())
+                }
+            },
+        };
+        out.push(QuestionReply {
+            labels: answers.get(i).cloned().unwrap_or_default(),
+            text,
+        });
+    }
+    Ok(out)
 }
 
 // ---- the event stream ----

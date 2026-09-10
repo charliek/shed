@@ -189,6 +189,7 @@ async fn live_smoke() {
                 &question.id,
                 LaneAnswer::Question {
                     answers: vec![vec![answer]],
+                    custom_text: vec![],
                 },
             )
             .await

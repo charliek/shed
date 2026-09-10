@@ -452,24 +452,33 @@ class FakeOpencode:
 
     def stream_question_asked(self, session_id: str, request_id: str, *, header: str,
                               question: str, options: list[str],
-                              custom: bool = False, multiple: bool = False) -> None:
+                              custom: bool | None = None, multiple: bool = False) -> None:
         """A live `question.asked` with its options. Same two side effects as
         `stream_permission_asked`: the ledger entry, and `GET /question` listing
-        it while it is open."""
+        it while it is open.
+
+        **`custom=None` OMITS the key**, which is opencode's ordinary wire shape
+        — its own schema documents the field as "Allow typing a custom answer
+        (default: true)" and its TUI draws the freeform row when the ask says
+        nothing. So an omitted flag means free text IS accepted, and a cell that
+        wants the other answer has to say `custom=False` out loud.
+        """
         with self._lock:
             self.issued[request_id] = session_id
+        q = {
+            "header": header,
+            "question": question,
+            "options": [{"label": o, "description": ""} for o in options],
+            "multiple": multiple,
+        }
+        if custom is not None:
+            q["custom"] = custom
         self.stream({
             "type": "question.asked",
             "properties": {
                 "id": request_id,
                 "sessionID": session_id,
-                "questions": [{
-                    "header": header,
-                    "question": question,
-                    "options": [{"label": o, "description": ""} for o in options],
-                    "multiple": multiple,
-                    "custom": custom,
-                }],
+                "questions": [q],
             },
         })
 

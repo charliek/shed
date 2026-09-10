@@ -329,7 +329,10 @@ impl FakeOpencode {
         st.issued.insert(id.to_string(), session.to_string());
     }
 
-    /// Add an open question request, single-choice over `options`.
+    /// Add an open question request, single-choice over `options`, with the
+    /// `custom` flag **OMITTED** — which is opencode's ordinary wire shape, and
+    /// (since the flag's documented default is `true`) a question that DOES
+    /// take free text. Use [`FakeOpencode::add_question_flagged`] to state it.
     pub fn add_question(
         &self,
         session: &str,
@@ -338,15 +341,34 @@ impl FakeOpencode {
         question: &str,
         options: &[&str],
     ) {
+        self.add_question_flagged(session, id, header, question, options, None);
+    }
+
+    /// [`FakeOpencode::add_question`] with the `custom` flag stated: `None`
+    /// omits the key (the ordinary shape), `Some(false)` is the ask that
+    /// REFUSES free text, `Some(true)` states the default out loud.
+    pub fn add_question_flagged(
+        &self,
+        session: &str,
+        id: &str,
+        header: &str,
+        question: &str,
+        options: &[&str],
+        custom: Option<bool>,
+    ) {
+        let mut q = json!({
+            "header": header,
+            "question": question,
+            "options": options.iter().map(|o| json!({"label": o, "description": ""})).collect::<Vec<_>>(),
+        });
+        if let Some(custom) = custom {
+            q["custom"] = json!(custom);
+        }
         let mut st = self.lock();
         st.questions.push(json!({
             "id": id,
             "sessionID": session,
-            "questions": [ {
-                "header": header,
-                "question": question,
-                "options": options.iter().map(|o| json!({"label": o, "description": ""})).collect::<Vec<_>>(),
-            } ],
+            "questions": [q],
         }));
         st.issued.insert(id.to_string(), session.to_string());
     }

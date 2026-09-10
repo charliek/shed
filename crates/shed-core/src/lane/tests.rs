@@ -348,11 +348,26 @@ fn lane_answer_is_tagged_on_kind_in_snake_case() {
         }),
         json!({"kind": "permission", "decision": "allow_always"})
     );
+    // `custom_text` is SKIPPED when empty, so an answer with no free text is
+    // byte-for-byte the payload this enum emitted before the field existed —
+    // which is what lets a client that has not been rebuilt keep decoding it.
     assert_eq!(
         round_trip(&LaneAnswer::Question {
-            answers: vec![vec!["a".into(), "b".into()], vec!["c".into()]]
+            answers: vec![vec!["a".into(), "b".into()], vec!["c".into()]],
+            custom_text: vec![],
         }),
         json!({"kind": "question", "answers": [["a", "b"], ["c"]]})
+    );
+    assert_eq!(
+        round_trip(&LaneAnswer::Question {
+            answers: vec![vec!["a".into()], vec![]],
+            custom_text: vec![None, Some("typed".into())],
+        }),
+        json!({
+            "kind": "question",
+            "answers": [["a"], []],
+            "custom_text": [null, "typed"],
+        })
     );
     assert_eq!(round_trip(&LaneAnswer::Reject), json!({"kind": "reject"}));
     assert_eq!(
@@ -1296,13 +1311,35 @@ fn lane_answer_refuses_unknown_fields_inside_a_variant() {
             json!({"kind": "question", "answers": [["yes"], ["a", "b"]]}),
             LaneAnswer::Question {
                 answers: vec![vec!["yes".into()], vec!["a".into(), "b".into()]],
+                custom_text: vec![],
+            },
+        ),
+        // `custom_text` is `#[serde(default)]` too — the PRODUCER-side half of
+        // the compatibility claim: this decoder accepts an older client that
+        // never learned the field. (The other direction does not hold, and is
+        // asserted below: `deny_unknown_fields` means an older decoder REFUSES
+        // a payload carrying it, which is why the decoding side ships first.)
+        (
+            json!({
+                "kind": "question",
+                "answers": [["yes"], []],
+                "custom_text": [null, " a branch "],
+            }),
+            LaneAnswer::Question {
+                answers: vec![vec!["yes".into()], vec![]],
+                // NOT trimmed at decode — `normalize_question_answer` is the
+                // one place that trims, so both adapters trim identically.
+                custom_text: vec![None, Some(" a branch ".into())],
             },
         ),
         // `answers` is `#[serde(default)]`, so an omitted field is still fine —
         // deny_unknown_fields refuses EXTRA keys, never missing optional ones.
         (
             json!({"kind": "question"}),
-            LaneAnswer::Question { answers: vec![] },
+            LaneAnswer::Question {
+                answers: vec![],
+                custom_text: vec![],
+            },
         ),
         (json!({"kind": "reject"}), LaneAnswer::Reject),
         (
@@ -1324,4 +1361,98 @@ fn lane_answer_refuses_unknown_fields_inside_a_variant() {
     // An unknown variant tag stays refused too (the strictness that already
     // existed, re-pinned so a future `#[serde(other)]` cannot creep in).
     assert!(serde_json::from_value::<LaneAnswer>(json!({"kind": "nope"})).is_err());
+}
+
+// ---- the shared question-answer reader (§3.2) ----
+
+/// A question with `custom` set as asked, options irrelevant to the reader.
+fn question(id: &str, custom: bool) -> LaneQuestion {
+    LaneQuestion {
+        id: Some(id.into()),
+        header: String::new(),
+        question: id.into(),
+        options: vec![],
+        multiple: false,
+        custom,
+    }
+}
+
+/// The whole normalisation table, in one place, because BOTH adapters read the
+/// positional pair through it and a per-adapter reading is exactly what would
+/// drift.
+#[test]
+fn normalize_pads_both_vectors_to_the_questions() {
+    let qs = [question("q0", true), question("q1", true)];
+
+    // Nothing at all: one reply per QUESTION, not per answer.
+    let out = normalize_question_answer(&qs, &[], &[]).expect("empty is legal");
+    assert_eq!(out.len(), 2);
+    assert!(out.iter().all(|r| r.labels.is_empty() && r.text.is_none()));
+
+    // `custom_text` LONGER than `answers` — the shape a `zip` drops. Position 1
+    // survives with its text and no labels.
+    let out = normalize_question_answer(&qs, &[], &[None, Some("typed".into())])
+        .expect("free text alone is an answer");
+    assert_eq!(out[0], QuestionReply::default());
+    assert_eq!(out[1].labels, Vec::<String>::new());
+    assert_eq!(out[1].text.as_deref(), Some("typed"));
+
+    // `answers` longer than `custom_text` — the mirror image.
+    let out = normalize_question_answer(&qs, &[vec!["a".into()], vec!["b".into()]], &[])
+        .expect("no free text anywhere");
+    assert_eq!(out[0].labels, vec!["a".to_string()]);
+    assert_eq!(out[1].labels, vec!["b".to_string()]);
+    assert!(out.iter().all(|r| r.text.is_none()));
+}
+
+#[test]
+fn normalize_refuses_a_vector_longer_than_the_questions() {
+    let qs = [question("q0", true)];
+    assert!(matches!(
+        normalize_question_answer(&qs, &[vec![], vec![]], &[]),
+        Err(LaneError::BadRequest(_))
+    ));
+    assert!(matches!(
+        normalize_question_answer(&qs, &[], &[None, None]),
+        Err(LaneError::BadRequest(_))
+    ));
+}
+
+/// The text an adapter posts is the TRIMMED text — decided here, so gx and
+/// opencode cannot send an agent different bytes for the same keystrokes.
+#[test]
+fn normalize_trims_and_empties_become_none() {
+    let qs = [question("q0", true)];
+    let out = normalize_question_answer(&qs, &[], &[Some("  a branch  ".into())]).expect("trims");
+    assert_eq!(out[0].text.as_deref(), Some("a branch"));
+
+    for blank in ["", "   ", "\n\t "] {
+        let out = normalize_question_answer(&qs, &[], &[Some(blank.into())])
+            .unwrap_or_else(|e| panic!("{blank:?} is not an answer, not an error: {e}"));
+        assert_eq!(out[0].text, None, "{blank:?}");
+    }
+}
+
+/// Text aimed at a question that does not take it is REFUSED, not dropped —
+/// the human typed it, and an agent that would reject it is worth saying so
+/// before the wire, not after.
+#[test]
+fn normalize_refuses_free_text_on_a_question_that_does_not_take_it() {
+    let qs = [question("q0", true), question("q1", false)];
+    let err = normalize_question_answer(&qs, &[], &[None, Some("typed".into())])
+        .expect_err("q1 does not accept free text");
+    match err {
+        LaneError::BadRequest(m) => assert!(
+            m.contains("question 1"),
+            "the refusal names the position the client addressed: {m}"
+        ),
+        other => panic!("{other:?}"),
+    }
+
+    // …but whitespace on that same question is not "text": it trims away
+    // BEFORE the check, so a panel that keeps an empty box per question can
+    // send the whole vector without tripping over the questions that refuse.
+    let out = normalize_question_answer(&qs, &[], &[None, Some("   ".into())])
+        .expect("blank is not text");
+    assert_eq!(out[1].text, None);
 }

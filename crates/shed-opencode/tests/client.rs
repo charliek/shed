@@ -357,6 +357,7 @@ async fn a_question_answer_and_a_reject_take_their_own_routes() {
         "que_1",
         LaneAnswer::Question {
             answers: vec![vec!["left".to_string()]],
+            custom_text: vec![],
         },
     )
     .await
@@ -372,6 +373,119 @@ async fn a_question_answer_and_a_reject_take_their_own_routes() {
         fake.post_body("/question/que_1/reply").as_deref(),
         Some(r#"{"answers":[["left"]]}"#)
     );
+    assert_clean(&fake);
+}
+
+/// **Free text is one MORE label on that question's list** — which is what
+/// opencode's own TUI posts for a typed answer, so the wire shape is unchanged.
+///
+/// The ask here OMITS `custom`, which is the ordinary opencode wire shape and
+/// (per its schema's documented default) means free text IS accepted. Decoding
+/// that omission as `false` — what the fold did before plan 018 §3.2 — hid the
+/// panel's text box on the common case.
+#[tokio::test]
+async fn free_text_is_appended_to_its_questions_answer_list() {
+    let fake = three_sessions().await;
+    // No `custom` key at all.
+    fake.add_question("ses_a", "que_1", "Pick", "Which branch?", &["left"]);
+    let lane = client(&fake);
+
+    let approvals = lane.approvals("ses_a").await.expect("approvals");
+    let asked = approvals
+        .iter()
+        .find(|a| a.id == "que_1")
+        .expect("the question");
+    assert!(
+        asked.questions[0].custom,
+        "an omitted `custom` is opencode's documented default of TRUE"
+    );
+
+    lane.answer(
+        "ses_a",
+        "que_1",
+        LaneAnswer::Question {
+            answers: vec![vec!["left".to_string()]],
+            // Padded on purpose — the trimmed text is what travels.
+            custom_text: vec![Some("  or a branch I typed  ".to_string())],
+        },
+    )
+    .await
+    .expect("question answer with free text");
+    assert_eq!(
+        fake.post_body("/question/que_1/reply").as_deref(),
+        Some(r#"{"answers":[["left","or a branch I typed"]]}"#),
+        "the text is one more entry on that question's list, trimmed"
+    );
+    assert_clean(&fake);
+}
+
+/// A question that says `custom: false` refuses free text — **before anything
+/// reaches the wire**.
+///
+/// The no-traffic half is the point: the adapter resolves the approval (GETs),
+/// normalises against ITS questions, and returns `bad_request` without POSTing.
+/// A refusal that posted first would have filed the typed string as a label the
+/// ask never offered.
+#[tokio::test]
+async fn free_text_on_a_question_that_refuses_it_never_reaches_the_wire() {
+    let fake = three_sessions().await;
+    fake.add_question_flagged(
+        "ses_a",
+        "que_1",
+        "Pick",
+        "Which branch?",
+        &["left"],
+        Some(false),
+    );
+    let lane = client(&fake);
+
+    let approvals = lane.approvals("ses_a").await.expect("approvals");
+    let asked = approvals
+        .iter()
+        .find(|a| a.id == "que_1")
+        .expect("the question");
+    assert!(!asked.questions[0].custom, "an explicit false is honoured");
+
+    let err = lane
+        .answer(
+            "ses_a",
+            "que_1",
+            LaneAnswer::Question {
+                answers: vec![vec![]],
+                custom_text: vec![Some("something I typed".to_string())],
+            },
+        )
+        .await
+        .expect_err("the ask does not take free text");
+    assert!(matches!(err, LaneError::BadRequest(_)), "{err:?}");
+    assert_eq!(
+        fake.post_paths(),
+        Vec::<String>::new(),
+        "NOTHING was posted — the refusal is decided against the resolved approval"
+    );
+    assert_clean(&fake);
+}
+
+/// An over-long `custom_text` is refused the same way `answers` is, and also
+/// posts nothing — the two vectors are read by one function, so they cannot
+/// disagree about the bound.
+#[tokio::test]
+async fn more_free_text_than_questions_is_refused_before_the_wire() {
+    let fake = three_sessions().await;
+    fake.add_question("ses_a", "que_1", "Pick", "Which branch?", &["left"]);
+    let err = client(&fake)
+        .answer(
+            "ses_a",
+            "que_1",
+            LaneAnswer::Question {
+                answers: vec![],
+                custom_text: vec![None, Some("second".to_string())],
+            },
+        )
+        .await
+        .expect_err("one question, two texts");
+    assert!(matches!(err, LaneError::BadRequest(_)), "{err:?}");
+    assert_eq!(fake.post_paths(), Vec::<String>::new());
     assert_clean(&fake);
 }
 
@@ -1007,6 +1121,7 @@ fn shapes() -> Vec<Shape> {
             for_kind: LaneApprovalKind::Question,
             answer: LaneAnswer::Question {
                 answers: vec![vec!["left".to_string()]],
+                custom_text: vec![],
             },
             posts: Posts::QuestionReply,
             body: r#"{"answers":[["left"]]}"#,

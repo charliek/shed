@@ -310,8 +310,30 @@ struct OcQuestion {
     options: Vec<OcQuestionOption>,
     #[serde(default, deserialize_with = "null_default")]
     multiple: bool,
-    #[serde(default, deserialize_with = "null_default")]
-    custom: bool,
+    /// **`Option<bool>`, and an absent flag means TRUE** — not the `bool`
+    /// default this used to be.
+    ///
+    /// opencode's own schema documents the field as "Allow typing a custom
+    /// answer (default: true)", and its TUI renders the freeform row when the
+    /// ask omits it — which the committed 1.18.29 recording does, because that
+    /// is the ordinary wire shape. Decoding the omission as `false` meant the
+    /// panel hid the text box on the common case and a human could not type an
+    /// answer the agent was waiting for. Read through [`OcQuestion::custom`].
+    ///
+    /// Plain `#[serde(default)]` rather than `null_default`: on an `Option` the
+    /// two are the same decode (absent → `None`, `null` → `None`), and the
+    /// helper's double-`Option` would only obscure that.
+    #[serde(default)]
+    custom: Option<bool>,
+}
+
+impl OcQuestion {
+    /// `custom`, with opencode's OWN default (`true`) applied to an absent or
+    /// null flag. The one reader — so the default lives beside the field and
+    /// not at each use.
+    fn custom(&self) -> bool {
+        self.custom.unwrap_or(true)
+    }
 }
 
 /// One `QuestionInfo.options[]` entry: display text plus an explanation. It
@@ -1482,7 +1504,9 @@ fn lane_question(q: &OcQuestion) -> LaneQuestion {
             })
             .collect(),
         multiple: q.multiple,
-        custom: q.custom,
+        // opencode's own default, not the DTO's: an ask that omits the flag
+        // accepts free text (`OcQuestion::custom`).
+        custom: q.custom(),
     }
 }
 

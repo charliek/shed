@@ -1210,9 +1210,18 @@ pub fn lane_approval(res: &GxApprovalResource) -> LaneApproval {
 /// so an answer filed under `q1` is an answer the agent never reads. The
 /// contract carries the key so a client can see it; the adapter is what uses it.
 ///
-/// `custom` stays `false`: free text on gx is an "Other" answer plus a separate
-/// annotations channel the contract cannot carry yet, and inviting typing the
-/// agent will reject is worse than not offering it.
+/// **`custom` is `true`, unconditionally.** gx's pager always draws a freeform
+/// row beside the options, and the ask carries no flag that could say otherwise
+/// — so the honest answer to "does this question take free text" is yes, and the
+/// adapter says so rather than hiding a field the agent is waiting on. The
+/// residual is a pager launched with `no_freeform`: the request does not
+/// advertise it, so the answer is refused by gx and surfaces as
+/// [`shed_core::lane::LaneError::BadRequest`] on an inline error card — told,
+/// never silently dropped.
+///
+/// What it costs: a lone single-choice gx question is no longer "one click is
+/// the whole answer" in the panel, because a click can no longer mean the
+/// human is done typing. That is deliberate, and pinned by a render cell.
 fn lane_question(q: &Value) -> LaneQuestion {
     let text = str_at(q, "question");
     LaneQuestion {
@@ -1244,7 +1253,7 @@ fn lane_question(q: &Value) -> LaneQuestion {
             .get("multiSelect")
             .and_then(Value::as_bool)
             .unwrap_or(false),
-        custom: false,
+        custom: true,
     }
 }
 
