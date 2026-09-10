@@ -284,6 +284,19 @@ async fn a_seed_past_the_bound_is_abandoned_before_ready_and_the_next_one_comple
 fn no_flush() -> GxTimings {
     GxTimings {
         flush_after: Duration::from_secs(30),
+        // The stall timer is pushed out of reach ON PURPOSE. These cells assert
+        // that a generation ends ON the frame the channel dropped, and the
+        // tempting way to say that is "it ended sooner than the stall would
+        // have" — a wall-clock discriminator, which is exactly the class of
+        // assertion this same branch removes from three other tests because it
+        // fails under parallel compile load rather than because anything broke.
+        //
+        // Making the stall unreachable turns it into a HANG bound instead: a
+        // swallowed lag cannot end the generation by any other route inside
+        // `until`'s own timeout, so the test fails by timing out with its own
+        // message rather than by passing slowly. Same reasoning as the 60 s
+        // bound in shed-app's `wait_for`.
+        stall: Duration::from_secs(600),
         ..fast()
     }
 }
@@ -395,7 +408,6 @@ async fn a_lag_on_the_session_row_ends_the_generation() {
         "pendingApprovals": 0,
         "approximate": false,
     });
-    let pushed_at = Instant::now();
     fake.push_session_frame(SID, &row);
     until(
         || fake.stream_count() == 0,
@@ -403,16 +415,6 @@ async fn a_lag_on_the_session_row_ends_the_generation() {
          keeps reading instead)",
     )
     .await;
-    // ON the dropped frame — not two seconds later when the stall timer
-    // notices the fake has gone quiet, which is how a swallowed lag ends up
-    // looking like a slow pass.
-    assert!(
-        pushed_at.elapsed() < no_flush().stall / 2,
-        "the generation must end on the dropped session row, not on a later \
-         stall: {:?}",
-        pushed_at.elapsed()
-    );
-
     fake.set_history(SID, transcript(3));
     drain_now(&mut rx);
     let second = until_ready(&mut rx).await;
@@ -471,7 +473,6 @@ async fn a_lag_on_an_approval_frame_ends_the_generation() {
     fill_queue(&fake, &rx, LANE_CHANNEL_CAPACITY).await;
     assert_eq!(fake.stream_count(), 1);
 
-    let pushed_at = Instant::now();
     fake.push_approval_frame(SID, &approval_at(&fake, "resolved"));
     until(
         || fake.stream_count() == 0,
@@ -479,14 +480,6 @@ async fn a_lag_on_an_approval_frame_ends_the_generation() {
          keeps reading instead)",
     )
     .await;
-    // ON the dropped frame — see the session cell.
-    assert!(
-        pushed_at.elapsed() < no_flush().stall / 2,
-        "the generation must end on the dropped approval frame, not on a later \
-         stall: {:?}",
-        pushed_at.elapsed()
-    );
-
     fake.set_history(SID, transcript(3));
     drain_now(&mut rx);
     let second = until_ready(&mut rx).await;

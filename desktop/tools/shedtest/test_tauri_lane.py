@@ -762,6 +762,17 @@ def test_a_question_surfaces_with_its_options_and_answers_on_the_question_route(
     assert err.code == "bad_request", err
     assert "custom_text" in err.message and "choice" in err.message, err
     assert oc.post_paths[before:] == [], "refused at the door, no wire traffic"
+
+    # Retire it, like the two asks above. `oc` is module-scoped and
+    # `_approvals()` returns everything still pending, so a question this cell
+    # left open would be visible to every cell that runs after it — and
+    # `_unmount()` only closes the panel, it does not answer anything. The two
+    # refusals above are the point of the cell and neither of them retires the
+    # ask, so this is the only place it can happen.
+    oc.stream({"type": "question.replied",
+               "properties": {"sessionID": LANE_SESSION, "requestID": strict}})
+    app.wait_until(lambda: all(c["id"] != strict for c in _panel_approvals(app)),
+                   timeout=10, what="the strict question to retire")
     _unmount(app)
 
 
