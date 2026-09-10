@@ -142,7 +142,14 @@ async fn run() -> Result<(), String> {
             lane.send(session()?, text, mode)
                 .await
                 .map_err(|e| e.to_string())?;
-            println!("{verb}ed");
+            println!(
+                "{}",
+                if verb == "send" {
+                    "sent"
+                } else {
+                    "interjected"
+                }
+            );
         }
         "cancel" => {
             lane.cancel(session()?).await.map_err(|e| e.to_string())?;

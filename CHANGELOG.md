@@ -127,6 +127,37 @@ reads an `## Unreleased` heading._
   credential source for a password-protected opencode server — it answers
   `401`, which surfaces as an inline "unauthorized" error, status-only. See
   [Agent lanes](https://charliek.github.io/shed/desktop/agent-lanes/).
+- **Agent lanes: the gx lane, the SECOND adapter** (plan 017, `charliek/shed#340`).
+  `crates/shed-gx` implements `AgentLane` over gx's remote lane
+  (`gx-remote-api`) — a bearer-token HTTP API with a resumable
+  `Last-Event-ID` cursor, unlike opencode's unauthenticated, cursor-less
+  server — and validating the contract against a second real agent forced
+  twelve corrections into `shed_core::lane` itself. **The credential rule:**
+  roost reports only where an agent is, never how to be let in, so an
+  adapter takes its credentials at construction from a source the client
+  supplies — read locally under `$GROK_HOME`, or over SSH through one POSIX
+  probe, both checking the same file permissions gx's own reader does. A
+  reported URL (matched against discovery) and a dial URL (where HTTP
+  actually goes) are never conflated, and no bearer request leaves the
+  adapter until a token-free `healthz` call confirms its `instanceId`
+  against discovery. **The reconnect story changes:** a cursor-capable
+  adapter resumes silently within bounds (three attempts in thirty seconds);
+  past that, `Reset` … `Ready` reseeds exactly as it always meant for
+  opencode. **The headline contract change:** an agent can offer several
+  permission options of the same semantic kind — a real gx permission
+  offered five options, two of them `allow_once` — so a bare decision is
+  refused as ambiguous (`BadRequest`) rather than guessed; the panel now
+  renders every offered option under the agent's own label and answers with
+  its exact id (`LaneAnswer::Choice`), for both adapters. A roost tab is
+  promoted to the `gx` kind only when its metadata carries a valid loopback
+  `gx.remote` URL — a hint, not liveness: a dead lane stays `gx` until roost
+  says otherwise, and `lane.open` answers `unavailable`. A `gx` session with
+  no bound lane (`--no-leader`, or metadata not yet arrived) is the new
+  lane-less `grok` kind — creatable, status-only. The Tauri backend now
+  dispatches by kind rather than binding to opencode's concrete type
+  (`Arc<dyn AgentLane>`, keyed by `(kind, server_url)`; an unrecognized kind
+  answers `unsupported_lane`). See
+  [Agent lanes](https://charliek.github.io/shed/desktop/agent-lanes/).
 
 ## v0.8.2 — 2026-08-17
 
