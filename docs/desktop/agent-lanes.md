@@ -62,6 +62,27 @@ transcript on screen with a banner explaining why, rather than clearing it.
 | `interject` | `false` | See [Limits](#limits) below. |
 | `history_cursor` | `false` | See [Limits](#limits) below. |
 
+### Answering: scoped, and not free
+
+opencode has no by-id GET for a permission or a question — the only lookup it
+offers is two directory-wide lists, and an instance is per **directory**, so
+those lists carry every root session's approvals, not just the one the panel
+is looking at. `answer` resolves the addressed approval inside **its own
+session's scope** first — the root session plus its transitive descendants,
+the same scope `approvals` already computes — before touching either list, so
+one panel can never answer a sibling session's request. An id outside that
+scope is `unknown_approval`; an id open in both lists at once is refused as
+ambiguous rather than routed by a guess. A failed list read propagates rather
+than reading as "not found," because a half-read directory cannot say an id
+is absent. Answering an approval whose session has since been deleted is
+`unknown_session` rather than reaching the wire.
+
+This costs **four GETs per answer** on a childless session (the root session,
+its `/children` read, and the two lists) where gx pays one, because gx has a
+by-id route. What it buys is the same thing gx's own re-read buys: the answer
+is translated against the options the agent actually offered, on an approval
+this session owns.
+
 ## The roost `server_url` handshake
 
 The desktop app never scans for opencode servers and never launches one
@@ -259,8 +280,11 @@ first loss — past which, or on an explicit server `reset`, or on a cursor the
 server no longer recognizes, the adapter **reseeds**: the open streak is
 discarded, history is rebuilt from scratch, and the rebuild is bracketed with
 `Reset … Ready` exactly as opencode's reconnect always is. `Reset.reason`
-(`connect`, `cursor_lost`, `server_reset:<r>`, `stall`) is free text for a log
-line — nothing switches on it.
+(`connect`, `cursor_lost`, `server_reset:<r>`, `stall`, `lagged`) is free text
+for a log line — nothing switches on it. `lagged` is not a transport loss at
+all; it is what a stalled client's own channel overflow forces — see [A
+stalled client and the channel bound](#a-stalled-client-and-the-channel-bound)
+below.
 
 Either way, **every** reconnect — silent or not — re-fetches what the SSE
 stream itself never replays (approvals, the session row), because a resumed
@@ -345,6 +369,21 @@ an inline error card — told, never silently dropped.
 
 ## Driving a lane
 
+The view these ops answer from is `shed_app::lane_view::LaneView` — one per
+open subscription, **client-shared Rust, not Tauri-specific**. It folds a
+`shed_core::lane` subscription's frames in arrival order behind the same
+`Reset … Ready` staging the contract promises, and exposes them through a
+typed `LaneView::snapshot(since_seq)` (`LaneViewSnapshot { messages, full,
+activity, generation, stale, approvals }`); `None` returns everything, `Some`
+a delta honored only when the cursor still lands inside the live
+generation's `seq` window. It lives in `shed-app`, ungated, for the same
+reason `machine.rs` and `roost.rs` are — mobile links `shed-app` with default
+features and needs the identical fold, so "the phone shows the same view the
+desktop shows" is a property of one implementation rather than two that have
+to agree. The Tauri crate's own `lane.rs` is now just the IPC layer: it
+serialises the snapshot's fields into the `lane.messages`/`lane.approvals`
+payload and folds nothing itself.
+
 Once a row carries `agent_lane`, opening its Transcript affordance calls
 `lane.open {machine, session_id}` and mounts the panel:
 
@@ -352,7 +391,7 @@ Once a row carries `agent_lane`, opening its Transcript affordance calls
 |---|---|
 | `lane.open` | Ensures a subscription (idempotent — a second call for an already-open lane re-answers from the existing entry). |
 | `lane.messages` | The staged transcript: up to the last 500 rows, current activity, generation, and a `stale` reason when the lane is `Down`. |
-| `lane.approvals` | Pending permissions and questions, root session plus its children. |
+| `lane.approvals` | Pending permissions and questions, root session plus its children, sorted `created_at` then `id`. |
 | `lane.send` | Queues a prompt (`mode: queue`), or preempts the turn in flight (`mode: interject`) when the lane advertises `interject` — the panel shows the toggle only then, and only enables it while the turn is `Working`. |
 | `lane.cancel` | Aborts the turn in flight. |
 | `lane.answer` | Answers one approval. Four forms, exactly one per answer: `{choice: "<id>"}` — the exact option id the approval offered, which is what the panel always sends, because an agent can offer several options of the same decision kind (see [gx's `option_for` refusal](#the-option_for-ambiguity-refusal)); the scripted `{permission: "allow-once" \| "allow-always" \| "reject"}`, which resolves by semantic kind and refuses an ambiguous one; `{question: [[…]]}`, optionally with `custom_text` beside it (see [Free-text answers](#free-text-answers)); and `{reject: true}`. |
@@ -364,6 +403,36 @@ codes (`unauthorized`, `unknown_session`, `unknown_approval`,
 `failed`), plus `no_lane` for a row with no `agent_lane` stamp at all and
 `unsupported_lane` for a row whose `agent_lane.kind` names no adapter this
 build has.
+
+## A stalled client and the channel bound
+
+The channel each subscription streams over is bounded — `LANE_CHANNEL_CAPACITY`
+(1024 frames) — so a client that stops draining (a backgrounded phone
+mid-session is the canonical case) cannot grow a watcher's backlog without
+limit; before this, it was unbounded. `shed_core::lane::LanePublisher` is the
+one place the overflow policy lives, shared by both adapters: `publish` is a
+`try_send`, and a full channel answers `Publish::Lagged` rather than blocking
+or dropping the frame unnoticed. Every emitting helper in both adapters
+propagates that, so a generation ends at the **first** dropped frame —
+mid-stream, mid-seed, or mid-reseed alike — and is retried rather than left
+half-staged.
+
+A lagged generation is never resumed silently, even on gx: the adapter drops
+its transport first (gx also unpins its epoch), waits for the channel to
+drain completely with no transport held, takes the ordinary failure backoff,
+and reseeds with a fresh `Reset { reason: "lagged" } … Ready` — because the
+dropped frames may already have been folded at or before the client's cursor,
+and resuming from it would leave the hole permanent. The one frame that is
+never dropped is the terminal `Down`: it goes through
+`LanePublisher::publish_final`, which awaits room rather than trying and
+giving up, so a client can never be left holding a stale `Ready` view with no
+`stale` reason to explain it.
+
+`lagged` and `overflow` name different things and neither substitutes for the
+other: `overflow` is the adapter's own inbox falling behind its source before
+folding; `lagged` is this client channel falling behind the fold. A lagged
+reconnect also clears gx's `down_after` clock rather than skipping it, since
+"is the agent there" and "is the client keeping up" are different questions.
 
 ## The password / status-only rule
 
