@@ -16,7 +16,7 @@
     "a leg pass."
   ],
   "//version": "The contract revision. Bump on any change to `scenarios`; the Dart leg pins it so a silent divergence between the two repos is impossible.",
-  "version": 1,
+  "version": 2,
   "scenarios": [
     {
       "id": "plain",
@@ -120,6 +120,15 @@
         "local",
         "--created-by",
         "sx"
+      ]
+    },
+    {
+      "id": "gx-probe",
+      "why": "shed-gx's discovery probe (plan 017): a whole multi-line POSIX sh script as ONE argv element - newlines, $-expansions, a command substitution and a backslash-semicolon. It is the string the gx lane's credential seam sends over the reach, so a transport that mangles it reads no discovery record at all.",
+      "argv": [
+        "sh",
+        "-c",
+        "h=${GROK_HOME:-$HOME/.grok}\nfor f in \"$h\"/gx-remote*.json; do\n  [ -f \"$f\" ] || continue\n  cat \"$f\" 2>/dev/null\n  printf \"\\n---\\n\"\ndone\nprintf \"===token===\\n\"\nt=\"$h/gx-remote.token\"\nfind \"$t\" -prune -type f -perm 0600 -user \"$(id -un)\" -exec cat {} \\; 2>/dev/null\nexit 0\n"
       ]
     }
   ]

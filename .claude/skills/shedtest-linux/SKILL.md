@@ -167,6 +167,64 @@ subscription up. `lane.messages` (what the backend staged) and `lane.dump` (what
 screen) are different questions — assert the one you mean. `SHED_LANE_SHOTS=<dir>` makes the
 panel cells keep their `app.screenshot` PNGs there; unset, they still capture and assert one.
 
+### The gx lane (plan 017), and the four traps it cost
+
+`test_tauri_gx_lane.py` + `fake_gx.py` are the second adapter, driven the same way but with a
+**credential seam**: gx wants a bearer on every route but `healthz`, and the app reads it off
+the filesystem. Two test-mode envs (`ui.subproc_env` set-or-clears both):
+
+| env | what it does |
+|---|---|
+| `SHED_TAURI_GX_HOME` | the `$GROK_HOME` the LOCAL reader reads — `FakeGx.write_home(dir)` lays out a `gx-remote*.json` record naming the fake's URL plus a `0600` `gx-remote.token`. Write it **before** the app launches. |
+| `SHED_TAURI_GX_TIMINGS_MS` | `stall=,resume_window=,flush_after=,down_after=` in ms. Durations only — `resume_tries` is not settable, and a malformed pair is silently dropped (the symptom is a cell waiting out a REAL 30 s window). |
+
+Four things cost real time here. All four are properties of the lane layer, not of gx, so they
+bite the next adapter too:
+
+1. **The seed's last streak is still open when the subscription reaches `Ready`.** `lane.open`
+   returning and `generation >= 1` do NOT mean the transcript is complete — a trailing chunk
+   streak becomes a row only when the watcher's `flush_after` timer fires. A cell that reads
+   rows at `Ready` sees the prompt and no answer. Wait for the transcript to STOP GROWING
+   (`_settled` in that file: same row count across a window longer than `flush_after`) before
+   counting anything.
+2. **Unmounting the panel closes the lane, and the failure surfaces somewhere else.** The panel
+   calls `lane.close` on unmount, so a cell that keeps using the lane after `ui.close_lane` gets
+   `no_lane` — and because `wait_until` swallows `ShedError`, that arrives as a **timeout in a
+   later cell naming an unrelated condition**. Re-open with `lane.open` after every unmount, or
+   keep the panel mounted for the whole cell (which is also what you want when comparing
+   generations: a close/open resets the counter rather than advancing it).
+3. **Cutting the SSE stream and then scripting the gap is a race you lose.** The app reconnects
+   on its own ~100 ms backoff, so frames pushed "after" a `close_streams()` often arrive LIVE
+   and the cell passes without ever exercising a replay. `FakeGx.stage_update()` writes the
+   leader's history+ring **without broadcasting**: script the gap first, then cut, and the
+   resume is the only path the frame has. Same for "wait until `stream_count() == 0`" — the
+   reconnect can beat the next poll; assert on what arrived, not on the socket.
+4. **A held-pending approval overrides the session's activity** (`→ needs_approval`). An
+   approval cell that fails before answering leaves every later "wait for a working turn"
+   timing out for a reason that has nothing to do with the cell you are reading. Answer and
+   `resolve_approval` at the end of each approval cell.
+
+5. **A backend wait does not license a panel assertion — they are two clocks.**
+   `lane.messages` is the backend's staged view and changes the instant the adapter commits;
+   `lane.dump` is what the panel last REPORTED, and the panel re-reads on its own
+   frame/40 ms timer. So `wait_until(lane.messages …)` followed immediately by
+   `assert lane.dump[…]` has a real window in it, and it is wide enough to fail about one run
+   in three under Xvfb. Wait on the surface you are asserting about. The tell when it bites is
+   a dump that already agrees with the backend everywhere EXCEPT the field asserted (an
+   `activity: "working"` sitting next to a stale banner that has not cleared yet).
+
+   The same rule shapes the "is the panel ready" predicate: a panel reports from its first
+   render, and its rows and its `capabilities` arrive on two different awaits — a lane-event
+   can trigger the read that fills `generation` before `lane.open`'s promise resolves. So
+   "mounted" for a cell that reads `kind`/`interject` means *generation ≥ 1 **and** kind
+   non-empty*, not generation alone.
+
+And one that is not a trap but reads like one: **a row count is not stable across a reseed.**
+`approval_request` rows are emitted on FIRST SIGHT of a pending approval, so a rebuilt
+generation whose approvals are all resolved is legitimately shorter. Assert the staging
+property (the old generation is unchanged until the new one swaps in), never a floor on the
+count.
+
 ### Against a REAL local daemon
 
 The render-gate container can drive the roost-session running on the **host**. Mount its
@@ -417,6 +475,27 @@ assertions, the pixels are the eyeball.
   Tauri lock is regenerated **without** WebKitGTK — `cargo metadata --manifest-path
   desktop/tauri/src-tauri/Cargo.toml --offline >/dev/null` resolves and rewrites it in a second;
   a full `cargo build` there only works in Docker.
+- **`cargo fmt --check` is not a gate on the Tauri crate, but your own files still are** —
+  unlike `crates/`, `desktop/tauri/src-tauri` is NOT rustfmt-clean at `origin/main` (about
+  twenty-six hunks across `approval.rs`, `broker.rs`, `lib.rs`, `live_activity.rs`,
+  `screenshot.rs`, `termctl.rs`, `tray.rs`, `updater.rs`), so a whole-crate `cargo fmt --check`
+  is red before you touch anything and a whole-crate `cargo fmt -- --emit files` would bury your
+  diff in unrelated reflows. Check only the files you edited, against their own baseline:
+  `git show HEAD:desktop/tauri/src-tauri/src/<f>.rs > /tmp/base.rs && rustfmt --check --edition
+  2021 /tmp/base.rs` — if that is silent the file was clean, so format just yours with
+  `rustfmt --edition 2021 src/<f>.rs`.
+- **Adding or dropping a `crates/` dependency moves TWO lockfiles** — the same trap as the
+  `roost-ipc` rev bump above, for a different reason. The Tauri crate path-depends on
+  `crates/*`, so a dep added to (or removed from) any of those crates changes
+  `crates/Cargo.lock` **and** `desktop/tauri/src-tauri/Cargo.lock`, and
+  `scripts/release/release-plan.sh` verifies the two in lockstep before the desktop leg ships
+  (it greps the Tauri lock for a `version` entry per workspace path-dep, so a NEW member crate
+  must be added to that loop in all three `scripts/release/*.sh` too). Regenerate both without
+  a WebKitGTK toolchain:
+  `(cd crates && cargo update -w --offline)` and
+  `(cd desktop/tauri/src-tauri && cargo update -w --offline)` — each rewrites its lock in a
+  second. Review the diff: a path-dep change should add/remove exactly the `[[package]]` block
+  and its `dependencies` lines, and nothing third-party.
 - **A module fixture named `fake` breaks the whole pytest session** → `conftest.py` owns a
   SESSION-scoped `fake` (the fake host-agent) that the autouse `_app_session` requests by name.
   A module-level `fake` shadows it and every test in the run dies with

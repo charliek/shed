@@ -81,6 +81,41 @@ re-implemented per language. The root `CLAUDE.md` owns the monorepo layout + rel
   `rc_hub::watch` imports `shed_rc_engine::tmux::Tmux` — linking would drag the RC
   engine into an HTTP adapter. The duplication ends when S6 deletes the hub's watcher.
   In `default-members`.
+- **`shed-gx`** — the **gx adapter** for `shed_core::lane`: the second
+  implementation of `AgentLane`, against gx's remote lane (`gx-remote-api`) —
+  a bearer-token HTTP API with a resumable `Last-Event-ID` cursor, unlike
+  opencode's unauthenticated, cursor-less local server. Building it forced the
+  twelve contract corrections recorded in `shed_core::lane`'s own module doc
+  ("what the gx adapter changed"); see `docs/desktop/agent-lanes.md` for the
+  end-to-end contract, including the two-URL split (reported vs. dial), the
+  `healthz`/`instanceId` credential pin, bounded silent resume vs. reseed, and
+  the `option_for` ambiguity refusal a real five-option gx permission forced.
+  Shaped like `shed-opencode`: `discovery.rs` (the probe script + parser +
+  `GxCredentialSource`), `transport.rs` (`GxTransport::dial`, called before
+  every connect attempt so a moved forward is never dialled blind), `fold.rs`
+  (pure: envelopes → rows + activity; gx's event-id counters are **not**
+  monotonic in transcript order, so the cursor is the maximum counter seen,
+  not the last applied one, and history is cut positionally), `watcher.rs`
+  (the pump: seed, bounded silent resume, reconcile, reset → reseed, stall,
+  `Down`), `testing.rs::FakeGx`, `examples/lane.rs` (the same manual-drive CLI
+  shape as opencode's). Ring/backoff/feed are **not** duplicated here — they
+  live in `shed_core::lane` (moved there by this same change) and this crate
+  re-exports them, same as `shed-opencode` does. Its own dependency set is
+  `shed-opencode`'s minus `regex`/`chrono`; not FFI-exported.
+  **`fixtures/`** carries one recording from a real gx leader
+  (`1.0.16+gx.12/{history.json, event-frames.jsonl, approvals.jsonl}`) and one
+  golden derived from it (`fold.golden.json`) — but **unlike** `shed-opencode`'s
+  two-golden split, there is no second implementation to port against: nothing
+  else folds gx's wire, so the golden is **regression detection only**
+  ("this is what the fold does today"), never a fidelity claim against some
+  other producer. `crates/shed-gx/fixtures/README.md` is the one place that
+  spells out that distinction, the two-step regeneration recipe (re-record
+  live with `SHED_GX_LIVE=1 SHED_GX_RECORD=1 …`, re-derive offline with
+  `SHED_GX_REGOLD=1 …`), and what the recording deliberately proves that a
+  hand-written fixture would not think to (non-monotonic counters, gx's
+  double-announced approval — a null-`method`/`request` placeholder followed
+  by the real request on the same id — and its own by-counter resume edge,
+  filed against gx as a known residual). In `default-members`.
 
 `fixtures/` holds the real-shaped JSON/YAML samples (server info, `shed list`, `system df`,
 egress profiles, enriched image, config) that both the Rust decoders and the Swift
@@ -213,6 +248,8 @@ cargo clippy -p shed-app --features broker --all-targets -- -D warnings
 cargo clippy -p shed-app --features broker,rc --all-targets -- -D warnings
 cargo test -p shed-opencode                          # the opencode agent-lane adapter
 cargo test -p shed-opencode --features test-support  # exports `testing::FakeOpencode`
+cargo test -p shed-gx                                 # the gx agent-lane adapter
+cargo test -p shed-gx --features test-support        # exports `testing::FakeGx`; live/regold tests still skip cleanly
 ```
 
 Note: `sx` (the crate that used to be a default member enabling shed-app's `rc` feature

@@ -41,6 +41,10 @@
     "--slug",
     "abc123"
   ],
+  "gx-probe": [
+    "-c",
+    "h=${GROK_HOME:-$HOME/.grok}\nfor f in \"$h\"/gx-remote*.json; do\n  [ -f \"$f\" ] || continue\n  cat \"$f\" 2>/dev/null\n  printf \"\\n---\\n\"\ndone\nprintf \"===token===\\n\"\nt=\"$h/gx-remote.token\"\nfind \"$t\" -prune -type f -perm 0600 -user \"$(id -un)\" -exec cat {} \\; 2>/dev/null\nexit 0\n"
+  ],
   "leading-dash": [
     "rc",
     "create",

@@ -1,12 +1,30 @@
-//! The fold's decode + text-hygiene helpers, **copied** out of the rc hub.
+//! The fold's decode helpers, **copied** out of the rc hub — plus the feed
+//! vocabulary and sanitizers, now **re-exported** from `shed_core::lane::feed`.
 //!
 //! Every item here is a verbatim port of a `shed-broker::rc_hub` helper the
 //! opencode fold leans on: the Go-`encoding/json`-shaped serde readers from
 //! `rc_hub::watch` (`compact_json`, `first_non_empty`, `json_first_byte`,
-//! `null_string_vec`, `object_default`, `object_opt`, `raw_opt`, `vec_objects`)
-//! and the feed vocabulary + sanitizers from `rc_hub::messages` (`null_default`,
-//! `sanitize_last_message`, `trim_feed_text`, the `FEED_*`/`APPROVAL_*`
-//! constants).
+//! `null_default`, `null_string_vec`, `object_default`, `object_opt`, `raw_opt`,
+//! `vec_objects`).
+//!
+//! # The feed vocabulary and the sanitizers moved down a layer
+//!
+//! `FEED_*`/`APPROVAL_*`, `sanitize_feed_text`, `sanitize_feed_token`,
+//! `sanitize_last_message`, `trim_feed_text`, `truncate_bytes`, `bound_token`
+//! and their caps now live in [`shed_core::lane::feed`]. They moved when the
+//! SECOND lane adapter needed them: an adapter-to-adapter dependency
+//! (`shed-gx` reaching into `shed-opencode` for a sanitizer) makes one
+//! adapter's release schedule the other's. Behaviour is unchanged across the
+//! move — every golden under `fixtures/` is byte-identical to what it was
+//! before it.
+//!
+//! **Only the ones this crate still names directly are re-exported here**
+//! (`sanitize_last_message`, `trim_feed_text`, and the `FEED_*`/`APPROVAL_*`
+//! constants — see the `use` below). The rest — `sanitize_feed_text`,
+//! `sanitize_feed_token`, `truncate_bytes`, `bound_token` and the caps — are
+//! reached at [`shed_core::lane::feed`] by their remaining callers (the ring,
+//! which is shed-core's own now) and are deliberately NOT re-listed here: a
+//! re-export nothing uses is a name that goes stale silently.
 //!
 //! **Copied, not linked, on purpose.** `rc_hub::watch` imports
 //! `shed_rc_engine::tmux::Tmux` at its module head (`watch.rs:28`), so a `use
@@ -23,43 +41,26 @@
 //! real producer line that carries `"patterns":null` fold instead of killing the
 //! whole envelope.
 
-use std::sync::LazyLock;
-
-use regex::Regex;
 use serde::Deserialize;
 
-// ---- feed vocabulary (rc_hub::messages) ----
+// ---- feed vocabulary + sanitizers (now `shed_core::lane::feed`) ----
 
-// Feed message role/type tokens (the wire contract's message shape). role ∈
-// {user, assistant, tool, system}; type ∈ {text, tool_use, tool_result,
-// reasoning, status, approval_request}.
-pub(crate) const FEED_ROLE_USER: &str = "user";
-pub(crate) const FEED_ROLE_ASSISTANT: &str = "assistant";
-pub(crate) const FEED_ROLE_TOOL: &str = "tool";
-pub(crate) const FEED_ROLE_SYSTEM: &str = "system";
-
-pub(crate) const FEED_TYPE_TEXT: &str = "text";
-pub(crate) const FEED_TYPE_TOOL_USE: &str = "tool_use";
-pub(crate) const FEED_TYPE_TOOL_RESULT: &str = "tool_result";
-pub(crate) const FEED_TYPE_REASONING: &str = "reasoning";
-pub(crate) const FEED_TYPE_STATUS: &str = "status";
-/// An approval row: an agent asked for permission to do something. It rides
-/// role `tool` with `text` carrying the sanitized human-readable summary,
-/// `tool{name,detail}` the call being approved, and `approval` the
-/// machine-readable state. A resolution is a SECOND row with the same id and
-/// status "resolved" — never an edit of the first.
-pub(crate) const FEED_TYPE_APPROVAL_REQUEST: &str = "approval_request";
-
-// Approval status / decision tokens (the wire contract's approval vocabulary).
-// These are the FEED row's spelling — `shed_core::lane::LaneApprovalStatus` and
-// `LaneDecision` are the contract's, and the fold speaks both (a feed row
-// carries the former, an approval row the latter).
-pub(crate) const APPROVAL_STATUS_PENDING: &str = "pending";
-pub(crate) const APPROVAL_STATUS_RESOLVED: &str = "resolved";
-
-pub(crate) const APPROVAL_DECISION_ALLOW: &str = "allow";
-pub(crate) const APPROVAL_DECISION_ALLOW_ALWAYS: &str = "allow_always";
-pub(crate) const APPROVAL_DECISION_DENY: &str = "deny";
+// Re-exported, not redefined: `shed_core::lane::feed` is the one copy, and the
+// `pub(crate)` here keeps `fold.rs`'s call sites spelled exactly as they were
+// before the move. (`ring.rs` re-exports the ring straight from shed-core and
+// needs none of these; `client.rs` reaches the ring, not the sanitizers.)
+//
+// Deliberately NOT blanket-`#[allow(unused_imports)]`: this list is the one
+// place a name can go dead unnoticed after a move, and the compiler is a better
+// guard against that than a test can be — an item reimplemented locally would
+// shadow its import and be reported here.
+pub(crate) use shed_core::lane::feed::{
+    sanitize_last_message, trim_feed_text, APPROVAL_DECISION_ALLOW, APPROVAL_DECISION_ALLOW_ALWAYS,
+    APPROVAL_DECISION_DENY, APPROVAL_STATUS_PENDING, APPROVAL_STATUS_RESOLVED, FEED_ROLE_ASSISTANT,
+    FEED_ROLE_SYSTEM, FEED_ROLE_TOOL, FEED_ROLE_USER, FEED_TYPE_APPROVAL_REQUEST,
+    FEED_TYPE_REASONING, FEED_TYPE_STATUS, FEED_TYPE_TEXT, FEED_TYPE_TOOL_RESULT,
+    FEED_TYPE_TOOL_USE,
+};
 
 // ---- serde readers with Go `encoding/json` semantics (rc_hub::watch) ----
 
@@ -238,137 +239,6 @@ pub(crate) fn compact_json(raw: &str) -> String {
     out
 }
 
-// ---- text hygiene (rc_hub::messages) ----
-
-/// Strips terminal escape sequences from captured text: CSI sequences
-/// (`ESC [ … final`), OSC sequences (`ESC ] … BEL|ST`) — including an
-/// UNTERMINATED OSC that runs to the end of the string (a chunk-cut capture can
-/// truncate the sequence mid-payload) — and the standalone two-byte escapes
-/// (`ESC` + a single Fe byte). Applied before control-char stripping so an
-/// escape's intermediate bytes are consumed as a unit rather than left as stray
-/// punctuation.
-static ANSI_ESCAPE_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\|\z)|\x1b[@-Z\\-_]")
-        .expect("ANSI escape regex compiles")
-});
-
-/// Removes control characters that are NOT whitespace, leaving whitespace
-/// controls (tab/newline/CR/VT/FF) in place. Dropped: C0 (< 0x20) other than
-/// whitespace, DEL (0x7f), and C1 (0x80–0x9f, e.g. the 8-bit CSI 0x9b a terminal
-/// would honor).
-fn strip_non_whitespace_controls(s: &str) -> String {
-    s.chars()
-        .filter(|&r| {
-            matches!(r, '\t' | '\n' | '\x0b' | '\x0c' | '\r')
-                || !(r < '\x20' || r == '\x7f' || ('\u{80}'..='\u{9f}').contains(&r))
-        })
-        .collect()
-}
-
-/// Bounds a sanitized last-message preview. 200 runes is a one-to-two-line
-/// preview on a phone — enough to recognize the message, small enough to keep
-/// listing/SSE payloads tiny.
-const MAX_LAST_MESSAGE_RUNES: usize = 200;
-
-/// Turns raw agent text into a safe, compact one-line preview: strip ANSI escape
-/// sequences, drop remaining control characters (C0 except whitespace, DEL, and
-/// the C1 range — so a smuggled CSI can't survive), collapse every run of
-/// whitespace to a single space, trim, and truncate to
-/// [`MAX_LAST_MESSAGE_RUNES`] on a char boundary (never mid-codepoint). The
-/// result is plain, single-line, bounded.
-pub(crate) fn sanitize_last_message(s: &str) -> String {
-    let s = ANSI_ESCAPE_RE.replace_all(s, "");
-    let s = strip_non_whitespace_controls(&s);
-    // Go's strings.Fields splits on Unicode whitespace and rejoins with a single
-    // ASCII space — split_whitespace is the same set (char::is_whitespace ==
-    // unicode.IsSpace); collapse + trim in one step.
-    let s = s.split_whitespace().collect::<Vec<_>>().join(" ");
-    match s.char_indices().nth(MAX_LAST_MESSAGE_RUNES) {
-        Some((byte_idx, _)) => s[..byte_idx].to_string(),
-        None => s,
-    }
-}
-
-/// Drops leading/trailing whitespace on a captured message before it enters the
-/// ring — the sanitizer keeps internal newlines; producers just tidy the ends.
-pub(crate) fn trim_feed_text(s: &str) -> &str {
-    s.trim_matches([' ', '\t', '\n', '\r'])
-}
-
-// ---- ring hygiene (rc_hub::messages; used by [`crate::ring`]) ----
-
-/// Caps one message's text (and one tool block's name/detail) after
-/// sanitization. 8 KiB preserves far more than the 200-rune last_message
-/// preview while keeping a single row bounded; a longer value is truncated with
-/// [`FEED_TRUNC_MARKER`] appended.
-pub(crate) const MAX_FEED_MESSAGE_BYTES: usize = 8 << 10;
-
-/// Appended to a text (or tool detail) truncated at the byte cap, so a client
-/// can tell a preview from a complete message.
-pub(crate) const FEED_TRUNC_MARKER: &str = "…[truncated]";
-
-/// Caps each identifier-shaped approval field (the id, the status, and every
-/// advertised decision token) at the length of the id's wire grammar
-/// (`^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$`). The grammar itself is the
-/// producing layer's business; the ring only BOUNDS what it is handed, so a
-/// misbehaving producer cannot inflate the byte budget.
-pub(crate) const MAX_APPROVAL_TOKEN_BYTES: usize = 128;
-
-/// Caps how many advertised decisions one approval row may carry. The decision
-/// vocabulary is a fixed, tiny enum; the cap exists so the slice cannot be used
-/// as unbounded payload.
-pub(crate) const MAX_APPROVAL_DECISIONS: usize = 8;
-
-/// Strips ANSI escape sequences and non-whitespace control characters from raw
-/// agent text, then caps it at [`MAX_FEED_MESSAGE_BYTES`] on a char boundary
-/// (appending [`FEED_TRUNC_MARKER`] when it truncates). Unlike
-/// [`sanitize_last_message`] it PRESERVES newlines and internal whitespace — a
-/// feed row keeps its structure (a code block, multi-line tool output) rather
-/// than collapsing to a one-line preview.
-pub(crate) fn sanitize_feed_text(s: &str) -> String {
-    if s.is_empty() {
-        return String::new();
-    }
-    let s = ANSI_ESCAPE_RE.replace_all(s, "");
-    let s = strip_non_whitespace_controls(&s);
-    if s.len() <= MAX_FEED_MESSAGE_BYTES {
-        return s;
-    }
-    let mut out = truncate_bytes(&s, MAX_FEED_MESSAGE_BYTES).to_string();
-    out.push_str(FEED_TRUNC_MARKER);
-    out
-}
-
-/// Strips ANSI escapes plus EVERY control and whitespace rune from a
-/// single-token approval field (id/status/decision). Feed text keeps newlines
-/// and tabs (multi-line prose is content there); a token that contains them is
-/// malformed, and preserving them would let a crafted value smuggle separators
-/// into a field the contract defines as one token.
-pub(crate) fn sanitize_feed_token(s: &str) -> String {
-    if s.is_empty() {
-        return String::new();
-    }
-    ANSI_ESCAPE_RE
-        .replace_all(s, "")
-        .chars()
-        .filter(|&r| !(r <= '\x20' || r == '\x7f' || ('\u{80}'..='\u{9f}').contains(&r)))
-        .collect()
-}
-
-/// Caps `s` at `n` bytes on a char boundary (never mid-codepoint). It appends
-/// no marker of its own: [`sanitize_feed_text`] adds one for prose, while the
-/// identifier fields it also guards would only be muddied by a marker inside
-/// the value.
-pub(crate) fn truncate_bytes(s: &str, mut n: usize) -> &str {
-    if s.len() <= n {
-        return s;
-    }
-    while n > 0 && !s.is_char_boundary(n) {
-        n -= 1; // back up to a char boundary so a multi-byte codepoint is never split
-    }
-    &s[..n]
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -391,23 +261,5 @@ mod tests {
         assert_eq!(json_first_byte(b"  \t\r\n{\"a\":1}"), Some(b'{'));
         assert_eq!(json_first_byte(b"[1]"), Some(b'['));
         assert_eq!(json_first_byte(b"   "), None);
-    }
-
-    #[test]
-    fn sanitize_last_message_strips_ansi_and_collapses_whitespace() {
-        assert_eq!(
-            sanitize_last_message("\u{1b}[31mred\u{1b}[0m\n  text\t\there"),
-            "red text here"
-        );
-        // C1 CSI (0x9b) is dropped along with the C0 controls.
-        assert_eq!(sanitize_last_message("a\u{9b}31mb"), "a31mb");
-        // Bounded at 200 runes, on a char boundary.
-        let long = "é".repeat(300);
-        assert_eq!(sanitize_last_message(&long).chars().count(), 200);
-    }
-
-    #[test]
-    fn trim_feed_text_trims_ends_only() {
-        assert_eq!(trim_feed_text("  a\n b  \n"), "a\n b");
     }
 }

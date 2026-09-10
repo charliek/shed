@@ -54,7 +54,8 @@ pub use conn::{Conn, RoostEndpoint, RoostEventStream};
 pub use error::RoostError;
 pub use fence::{Admit, Fence};
 pub use model::{
-    launch_argv, rfc3339_z, roost_capabilities, RoostInventory, RoostSession, APPROVAL_DETAILS,
+    launch_argv, loopback_base_url, rfc3339_z, roost_capabilities, AgentLaneStamp, RoostInventory,
+    RoostSession, APPROVAL_DETAILS, GX_REMOTE_KEY, OPENCODE_SERVER_URL_KEY,
 };
 pub use paths::{local_session_socket, ResolvedSocket};
 

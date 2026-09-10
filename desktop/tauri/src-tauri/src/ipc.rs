@@ -1103,8 +1103,10 @@ impl Handler {
 
     /// `lane.answer {machine, session_id, approval_id, answer}` → `{}`.
     ///
-    /// `answer` is one of `{permission: "allow-once"|"allow-always"|"reject"}`,
-    /// `{question: [[…]]}` or `{reject: true}`.
+    /// `answer` is one of `{choice: "<option id>"}` (the offered option, by its
+    /// own id — what the panel sends), `{permission:
+    /// "allow-once"|"allow-always"|"reject"}` (by semantic kind),
+    /// `{question: [[…]]}` or `{reject: true}`. See [`crate::lane::parse_answer`].
     async fn lane_answer(&self, params: &Value) -> Result<Value, (String, String)> {
         let (machine, session_id) = lane_target(params)?;
         let approval_id = req_str(params, "approval_id")?.to_string();
@@ -1764,6 +1766,9 @@ mod tests {
     #[test]
     fn both_lane_doors_answer_a_malformed_input_with_the_same_code() {
         let bad_answers = [
+            json!({"choice": ""}),
+            json!({"choice": 3}),
+            json!({"choice": "p-1", "permission": "allow-once"}),
             json!({"question": "yes"}),
             json!({"question": [["yes"], "no"]}),
             json!({"permission": "maybe"}),
@@ -1942,6 +1947,8 @@ mod tests {
             mock_base_url: mock.map(str::to_string),
             mock_unreachable_hosts: std::collections::HashSet::new(),
             roost_sockets: std::collections::HashMap::new(),
+            gx_home: PathBuf::new(),
+            gx_timings: shed_gx::GxTimings::default(),
             config_path: PathBuf::new(),
             socket_path: PathBuf::from("/run/user/0/shed-tauri/shed-tauri.sock"),
             host_agent_socket: PathBuf::from("/run/user/0/shed/host-agent.sock"),

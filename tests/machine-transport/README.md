@@ -144,6 +144,43 @@ Recording is idempotent by content, so an unchanged golden leaves a clean
 existing cell it means the file was deleted, and re-recording would silently
 bless whatever the code does today.
 
+### Recording `received.json` on a box with no sshd
+
+`wire.json` is composed in-process, so it records anywhere. `received.json`
+comes from the LIVE leg, which skips without an sshd — and a skip records
+nothing, so a new scenario would land with half a golden. Many Linux dev boxes
+have `openssh-client` only.
+
+Record it in a throwaway container instead of installing a server on the host
+(the run needs a **non-root** user — sshd refuses a root publickey login under
+its default `PermitRootLogin prohibit-password` — and `/run/sshd`, its privilege
+separation directory, which the package does not create):
+
+```bash
+docker run --rm -v "$PWD/tests/machine-transport:/work" ubuntu:24.04 bash -c '
+  set -e
+  export DEBIAN_FRONTEND=noninteractive
+  apt-get update -qq && apt-get install -y -qq openssh-server openssh-client python3 python3-pytest
+  mkdir -p /run/sshd
+  useradd -m -s /bin/bash probe
+  cp -r /work /home/probe/mt && chown -R probe:probe /home/probe/mt
+  su probe -c "cd /home/probe/mt && UPDATE_GOLDEN=1 python3 -m pytest -q"
+  cp /home/probe/mt/goldens/*.json /work/goldens/
+  chown --reference=/work/scenarios.json /work/goldens/*.json'
+```
+
+It copies the suite OUT of the mount and the goldens back, so a failed run
+cannot leave the checkout half-written. `python3 -m pytest` rather than `uv run`
+because the only dependency is pytest and the container needs no network beyond
+apt.
+
+The `chown` matters the day the contract gains a **new** golden filename: the
+`cp` runs as root in the container, and `cp` onto an EXISTING file keeps that
+file's owner — so overwriting today's two tracked goldens is invisible, while
+creating a third would leave a root-owned file in the checkout that the
+developer then cannot rewrite. `--reference` copies the ownership of a file that
+is certainly the developer's, so the recipe needs no uid passed in.
+
 ## Changing the contract
 
 1. Edit `scenarios.json` and **bump its `version`**.

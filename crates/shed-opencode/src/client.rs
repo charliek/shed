@@ -847,7 +847,7 @@ impl AgentLane for OpencodeClient {
             fold.apply_line(&raw);
         }
         let mut ring = MessageRing::new();
-        let now = now_utc();
+        let now = now_utc().timestamp_millis();
         for m in fold.drain_messages() {
             ring.append(m, now);
         }
@@ -992,23 +992,78 @@ impl OpencodeClient {
         })
     }
 
+    /// POST one permission decision to the live reply route.
+    ///
+    /// The `once|always|reject` table lives here and nowhere else: both
+    /// [`LaneAnswer::Permission`] (the semantic answer) and
+    /// [`LaneAnswer::Choice`] (an offered option id) resolve to a
+    /// [`LaneDecision`] and land on this one call, so the two can never drift
+    /// into sending different bodies for the same decision.
+    async fn reply_permission(&self, seg: &str, decision: LaneDecision) -> Result<(), LaneError> {
+        let reply = match decision {
+            LaneDecision::AllowOnce => "once",
+            LaneDecision::AllowAlways => "always",
+            LaneDecision::Reject => "reject",
+        };
+        self.post_json(
+            &format!("/permission/{seg}/reply"),
+            None,
+            Route::Approval,
+            json!({ "reply": reply }),
+        )
+        .await?;
+        Ok(())
+    }
+
     /// The wire half of [`AgentLane::answer`], past the double-tap gate.
+    ///
+    /// **Known limitation: this resolves against a fixed id list, not against
+    /// the addressed approval's own offered options.** It never fetches the
+    /// approval, so a [`LaneAnswer::Choice`] naming one of the three permission
+    /// ids is routed to the permission route even when `approval_id` addresses a
+    /// QUESTION — where the contract says the answer should be
+    /// [`LaneError::BadRequest`] ("that approval did not offer this option").
+    ///
+    /// The consequence is a less precise error, not a wrong action: opencode's
+    /// permission route refuses an id that is not a live permission, so the
+    /// caller still fails. And the panel never produces the input — it renders a
+    /// question approval as a question and sends [`LaneAnswer::Question`]. It is
+    /// left as-is because checking properly costs a round trip this adapter does
+    /// not otherwise need, and this crate's wire behaviour is pinned by its
+    /// goldens.
+    ///
+    /// The pattern an adapter should follow WHEN it can afford it is gx's: re-read
+    /// `GET …/approvals/{id}` immediately before translating, and resolve the
+    /// answer against the options that request actually offers. That also makes
+    /// the answer race-safe against the agent's own TUI.
     async fn answer_inner(&self, approval_id: &str, answer: LaneAnswer) -> Result<(), LaneError> {
         let seg = encode_segment(approval_id);
         match answer {
             LaneAnswer::Permission { decision } => {
-                let reply = match decision {
-                    LaneDecision::AllowOnce => "once",
-                    LaneDecision::AllowAlways => "always",
-                    LaneDecision::Reject => "reject",
+                self.reply_permission(&seg, decision).await?;
+            }
+            // `Choice` names an OFFERED option id. On opencode a permission's
+            // three ids are the decision spellings themselves
+            // (`permission_options`), so the choice resolves to exactly the
+            // decision the arm above sends — which is why it maps onto
+            // `LaneDecision` and shares that arm's route rather than carrying a
+            // second copy of the reply table. A question's options are its
+            // LABELS, and answering one needs the positional vec-of-vecs the
+            // reply route takes — so it arrives as `LaneAnswer::Question`, not
+            // here. Anything else is an id this approval did not offer, which
+            // the contract makes `BadRequest` rather than a guess.
+            LaneAnswer::Choice { option_id } => {
+                let decision = match option_id.as_str() {
+                    "allow_once" => LaneDecision::AllowOnce,
+                    "allow_always" => LaneDecision::AllowAlways,
+                    "reject" => LaneDecision::Reject,
+                    other => {
+                        return Err(LaneError::BadRequest(format!(
+                            "opencode did not offer the option {other:?}"
+                        )))
+                    }
                 };
-                self.post_json(
-                    &format!("/permission/{seg}/reply"),
-                    None,
-                    Route::Approval,
-                    json!({ "reply": reply }),
-                )
-                .await?;
+                self.reply_permission(&seg, decision).await?;
             }
             LaneAnswer::Question { answers } => {
                 self.post_json(

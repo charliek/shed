@@ -58,7 +58,7 @@ use shed_app::roost::{
 };
 use shed_core::config::{MachineEntry, ShedConfig};
 use shed_core::rc::RcKind;
-use shed_core::roost::RoostSession;
+use shed_core::roost::{AgentLaneStamp, RoostSession};
 
 /// The name the machine the app is running on is always known by — never a
 /// configured entry's name unless the user wrote one, and never an ssh target.
@@ -94,8 +94,8 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 /// frontend is watching, and the rows sit stale until a manual Refresh.
 pub type OnChange = Arc<dyn Fn() + Send + Sync>;
 
-/// Called with one machine's CURRENT set of opencode lanes (`session_id` →
-/// `server_url`) every time a fresh roost snapshot replaces its row set.
+/// Called with one machine's CURRENT set of agent lanes (`session_id` →
+/// [`AgentLaneStamp`]) every time a fresh roost snapshot replaces its row set.
 ///
 /// This is the eviction signal for [`crate::lane::Lanes`] (plan 015 §3.4: an
 /// entry is dropped "when the tab disappears from the roost snapshot, or when a
@@ -109,7 +109,7 @@ pub type OnChange = Arc<dyn Fn() + Send + Sync>;
 /// if nothing else about it changed (plan 014's ghost-row fix) — without that,
 /// a launched process that died young would leave a lane entry, and its `ssh -N`
 /// child, behind a row nobody can see.
-pub type OnLanes = Arc<dyn Fn(&str, &BTreeMap<String, String>) + Send + Sync>;
+pub type OnLanes = Arc<dyn Fn(&str, &BTreeMap<String, AgentLaneStamp>) + Send + Sync>;
 
 /// One machine's live view, as the UI reads it.
 struct MachineState {
@@ -692,14 +692,15 @@ impl Machines {
         *lock(&self.on_lanes) = Some(observer);
     }
 
-    /// Every opencode lane `machine` currently exposes: agent session id →
-    /// `server_url`, exactly as [`machine_row`] stamps it.
+    /// Every agent lane `machine` currently exposes: agent session id → the
+    /// [`AgentLaneStamp`] [`machine_row`] stamps the row with.
     ///
-    /// The one reader is the lane layer, which needs both halves: the URL to
-    /// dial, and (through [`Self::reach_kind`]) how to get to it. A machine with
-    /// no rows, no opencode rows, or no `server_url` on them answers empty —
-    /// which is also how `lane.open` decides a row has `no_lane`.
-    pub fn agent_lanes(&self, machine: &str) -> BTreeMap<String, String> {
+    /// The one reader is the lane layer, which needs all three parts: the
+    /// `kind` to pick an adapter, the reported URL, and (through
+    /// [`Self::reach_kind`]) how to get to it. A machine with no rows, no rows
+    /// an adapter exists for, or no usable URL on them answers empty — which is
+    /// also how `lane.open` decides a row has `no_lane`.
+    pub fn agent_lanes(&self, machine: &str) -> BTreeMap<String, AgentLaneStamp> {
         let guard = lock(&self.state);
         let Some(m) = guard.get(machine) else {
             return BTreeMap::new();
@@ -857,6 +858,14 @@ fn roost_source(kind: &RcKind) -> Option<&'static str> {
         RcKind::Codex => Some("codex"),
         RcKind::Opencode => Some("opencode"),
         RcKind::Cursor => Some("cursor"),
+        // BOTH map to roost's `grok`, because roost has ONE adapter for the two
+        // (plan 017 §3.2): `gx` is not a source roost ever writes. Which of the
+        // two a tab reads as is decided on the way BACK, by
+        // [`RoostSession::agent_kind`], from whether the tab carries a usable
+        // `gx.remote` — so predicting `grok` here is right for a launch of
+        // either, and a `gx` launch that binds its lane promotes itself on the
+        // next snapshot.
+        RcKind::Gx | RcKind::Grok => Some("grok"),
         RcKind::ClaudeBroker | RcKind::Shell | RcKind::Other(_) => None,
     }
 }
@@ -951,7 +960,7 @@ async fn consume(
         // Set by the SNAPSHOT arm only. A `Down` deliberately keeps the last
         // rows on screen, so it says nothing about which tabs still exist and
         // must not evict a lane — see [`OnLanes`].
-        let mut lanes: Option<BTreeMap<String, String>> = None;
+        let mut lanes: Option<BTreeMap<String, AgentLaneStamp>> = None;
         let visible = {
             let mut guard = lock(&state);
             let Some(m) = guard.get_mut(&name) else {
@@ -1052,57 +1061,47 @@ fn machine_row(name: &str, session: &RoostSession, stale: bool) -> Value {
 ///
 /// **Its PRESENCE is the capability signal** — the UI offers a Transcript
 /// affordance for a row that has it and nothing for a row that does not, and
-/// `lane.open` answers `no_lane` for the latter. So it is minted only when all
-/// three facts a lane needs are actually on the row:
+/// `lane.open` answers `no_lane` for the latter.
 ///
-/// * the tab is owned by opencode (this build has exactly one adapter),
-/// * the tab reported a `server_url` — roost's own plugin stamping the loopback
-///   URL of the server that session is running on (roost R10, plan 015 §3.3),
-/// * and it reported the agent's own `session_id`, which is the address every
-///   lane verb takes. A stamp without one would advertise a panel that could
-///   never open.
+/// **The derivation is [`RoostSession::agent_lane`]'s, not this module's.** It
+/// used to be spelled here: `source != "opencode"` and a hardcoded
+/// `"kind": "opencode"`, from the cut where opencode was the only adapter (plan
+/// 015). Plan 017 §3.5 retired that, because the phone mirrors these rows too
+/// and two hand-written copies of "which tabs have a lane" is exactly how the
+/// desktop and shed-mobile come to offer a transcript on different sets of
+/// rows. shed-core owns the rule; this function is the JSON it rides on.
 ///
 /// The key is **`agent_lane`, not `lane`**: `lane` is taken on the session DTO
 /// (`RcSession.lane` is the RC hub's lane token) and a second meaning on the
-/// same row would be read by the wrong consumer.
+/// same row would be read by the wrong consumer. The stamp's own field names
+/// ([`AgentLaneStamp`]) are the wire — `server_url` keeps that name for gx too,
+/// whose roost key is `gx.remote`.
 ///
-/// `ownership.metadata` reaches here because [`shed_core::roost::RoostSession`]
-/// keeps roost's `Ownership` whole; `to_rc_dto()` drops it, which is why this is
-/// stamped beside the DTO rather than carried on it.
+/// `ownership.metadata` reaches [`RoostSession::agent_lane`] because
+/// [`shed_core::roost::RoostSession`] keeps roost's `Ownership` whole;
+/// `to_rc_dto()` drops it, which is why this is stamped beside the DTO rather
+/// than carried on it.
 fn agent_lane(session: &RoostSession) -> Option<Value> {
-    let ownership = session.ownership.as_ref()?;
-    if ownership.source != "opencode" {
-        return None;
-    }
-    let server_url = non_empty(ownership.metadata.get("server_url")?)?;
-    let session_id = non_empty(&ownership.session_id)?;
-    Some(json!({
-        "kind": "opencode",
-        "session_id": session_id,
-        "server_url": server_url,
-    }))
+    session.agent_lane().map(|stamp| json!(stamp))
 }
 
-/// A trimmed copy of `s`, or `None` when there is nothing left.
-fn non_empty(s: &str) -> Option<String> {
-    let s = s.trim();
-    (!s.is_empty()).then(|| s.to_string())
-}
-
-/// The `session_id → server_url` map for a row set — [`agent_lane`]'s two
-/// load-bearing fields, for the lane layer's reconcile.
+/// The `session_id → stamp` map for a row set, for the lane layer's reconcile.
 ///
-/// Deliberately derived from the SAME function the row is stamped from: a lane
-/// the UI can see and a lane the backend will keep alive have to be the same
-/// set, or an entry survives a row it no longer belongs to.
-fn lanes_of(sessions: &[RoostSession]) -> BTreeMap<String, String> {
+/// **The whole stamp, not just the URL.** The lane layer keys a live entry by
+/// `(kind, server_url)` (plan 017 §3.5) — a tab that restarts as a different
+/// agent on the same loopback port is a different lane, and an entry compared on
+/// the URL alone would survive it and keep pumping the wrong adapter.
+///
+/// Deliberately derived from the SAME rule the row is stamped from
+/// ([`RoostSession::agent_lane`]): a lane the UI can see and a lane the backend
+/// will keep alive have to be the same set, or an entry survives a row it no
+/// longer belongs to.
+fn lanes_of(sessions: &[RoostSession]) -> BTreeMap<String, AgentLaneStamp> {
     sessions
         .iter()
         .filter_map(|s| {
-            let lane = agent_lane(s)?;
-            let id = lane.get("session_id")?.as_str()?.to_string();
-            let url = lane.get("server_url")?.as_str()?.to_string();
-            Some((id, url))
+            let stamp = s.agent_lane()?;
+            Some((stamp.session_id.clone(), stamp))
         })
         .collect()
 }
@@ -1302,13 +1301,97 @@ mod tests {
             owned(Some("opencode"), "ses_bare", &[]),
             second,
         ];
+        let stamp = |id: &str| AgentLaneStamp {
+            kind: "opencode".to_string(),
+            session_id: id.to_string(),
+            server_url: url.to_string(),
+        };
         assert_eq!(
             lanes_of(&sessions),
             BTreeMap::from([
-                ("ses_abc".to_string(), url.to_string()),
-                ("ses_two".to_string(), url.to_string()),
+                ("ses_abc".to_string(), stamp("ses_abc")),
+                ("ses_two".to_string(), stamp("ses_two")),
             ])
         );
+    }
+
+    /// **Stamping is stricter than it was, and that is deliberate.**
+    ///
+    /// Until plan 017 this module minted the stamp itself and validated nothing
+    /// beyond "non-empty". It now defers to `RoostSession::agent_lane`, which
+    /// applies `loopback_base_url` on BOTH paths — so a `server_url` roost could
+    /// once have published and this app would once have dialled is now refused,
+    /// silently, as `no_lane`.
+    ///
+    /// That is the right posture (the desktop DIALS this value, and it should
+    /// not depend on an upstream process's filtering staying correct), but it is
+    /// a behaviour change with a quiet failure mode, so it is pinned here rather
+    /// than left to be rediscovered. Every shape below is one roost's own rule
+    /// already rejects; if this test ever starts failing on a shape a real
+    /// daemon emits, the bug is upstream and the symptom will be a Transcript
+    /// affordance that vanished.
+    #[test]
+    fn a_server_url_that_is_not_a_bare_loopback_base_carries_no_lane() {
+        let ok = owned(
+            Some("opencode"),
+            "ses_ok",
+            &[("server_url", "http://127.0.0.1:41234")],
+        );
+        assert!(agent_lane(&ok).is_some(), "the shape roost actually stamps");
+
+        for bad in [
+            // A trailing slash: `loopback_base_url` rejects it, and it is the
+            // shape a hand-written config or a helpful URL-joiner produces.
+            "http://127.0.0.1:41234/",
+            // No port — nothing to forward to.
+            "http://127.0.0.1",
+            // Not loopback: a lane URL is the MACHINE's own loopback, never an
+            // address this host could route to.
+            "http://0.0.0.0:41234",
+            "http://10.0.0.7:41234",
+            // Not http, and not a bare base.
+            "https://127.0.0.1:41234",
+            "http://127.0.0.1:41234/v1",
+            "http://user@127.0.0.1:41234",
+            "",
+            "   ",
+        ] {
+            let session = owned(Some("opencode"), "ses_bad", &[("server_url", bad)]);
+            assert!(
+                agent_lane(&session).is_none(),
+                "{bad:?} is not a loopback base URL and must not be stamped"
+            );
+        }
+
+        // A gx tab is stamped from `gx.remote`, and is refused for the same
+        // reasons — including the one that makes it read as plain `grok`.
+        let gx = owned(
+            Some("grok"),
+            "ses_gx",
+            &[("gx.remote", "http://127.0.0.1:2431")],
+        );
+        assert_eq!(
+            agent_lane(&gx).and_then(|v| v["kind"].as_str().map(str::to_string)),
+            Some("gx".to_string())
+        );
+        let demoted = owned(
+            Some("grok"),
+            "ses_gx",
+            &[("gx.remote", "http://127.0.0.1:2431/")],
+        );
+        assert!(
+            agent_lane(&demoted).is_none(),
+            "a gx.remote that fails the rule leaves the tab as plain grok, lane-less"
+        );
+
+        // And the session id is the other half: a tab with a usable URL but no
+        // id would advertise a panel that can never open.
+        let idless = owned(
+            Some("opencode"),
+            "",
+            &[("server_url", "http://127.0.0.1:41234")],
+        );
+        assert!(agent_lane(&idless).is_none());
     }
 
     fn status_named<'a>(status: &'a [Value], name: &str) -> Option<&'a Value> {
@@ -2014,7 +2097,7 @@ mod tests {
         // Record every lane set published, in order — a history, not a sample:
         // an entry evicted and re-created between two polls looks like nothing
         // happened.
-        type Published = Arc<Mutex<Vec<BTreeMap<String, String>>>>;
+        type Published = Arc<Mutex<Vec<BTreeMap<String, AgentLaneStamp>>>>;
         let history: Published = Arc::new(Mutex::new(Vec::new()));
         {
             let history = Arc::clone(&history);
@@ -2026,7 +2109,7 @@ mod tests {
 
         let last = || history.lock().unwrap().last().cloned();
         wait_for("the lane to be published", || {
-            last().filter(|l| l.get("ses_abc").map(String::as_str) == Some(url))
+            last().filter(|l| l.get("ses_abc").map(|s| s.server_url.as_str()) == Some(url))
         })
         .await;
 
@@ -2051,7 +2134,8 @@ mod tests {
                 .lock()
                 .unwrap()
                 .iter()
-                .all(|l| l.is_empty() || l.get("ses_abc").map(String::as_str) == Some(url)),
+                .all(|l| l.is_empty()
+                    || l.get("ses_abc").map(|s| s.server_url.as_str()) == Some(url)),
             "a lane set was published that named a server nobody reported"
         );
         assert_eq!(last(), Some(BTreeMap::new()), "the last word is: no lanes");

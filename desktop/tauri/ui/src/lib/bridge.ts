@@ -826,8 +826,14 @@ export function useNowTick(intervalMs = 1000): number {
 // The known kinds, plus `(string & {})` so an UNKNOWN kind from a newer/other tool
 // keeps its raw string (the unknown-kind policy) instead of failing the type — it
 // renders neutrally and is never offered for creation.
+/** The agent kinds this build names. The first six mirror the guest's tmux/RC
+ *  registry; `gx` and `grok` are roost-only row kinds (plan 017 §3.2) — an agent
+ *  shed can SEE in somebody's roost tab, with no guest producer. `gx` is `grok`
+ *  with a live remote lane behind it, which is a promotion roost never makes and
+ *  `RoostSession::agent_kind` does. */
 export type RcKind =
   | "claude-rc" | "claude-broker" | "codex" | "opencode" | "cursor" | "shell"
+  | "gx" | "grok"
   | (string & {});
 export type RcState =
   | "starting" | "ready" | "reconnecting" | "needs-trust" | "needs-auth" | "dead";
@@ -877,14 +883,21 @@ export function capabilitiesFor(list: Pick<RcListResult, "capabilities">, s: RcS
   return list.capabilities[s.origin ?? `${s.host}/${s.shed}`];
 }
 
-/** The kinds a create form can offer (broker is URL-driven; unknown never creatable). */
-export const RC_CREATABLE_KINDS: RcKind[] = ["claude-rc", "codex", "opencode", "cursor", "shell"];
+/** The kinds a create form can offer (broker is URL-driven; unknown never creatable).
+ *  Mirrors `RcKind::creatable`. `grok` is creatable and LANE-LESS by design — it
+ *  gets a status row and no transcript; a `grok` tab that binds its remote lane
+ *  is reported as `gx` on the next snapshot and gains one. */
+export const RC_CREATABLE_KINDS: RcKind[] =
+  ["claude-rc", "codex", "opencode", "cursor", "gx", "grok", "shell"];
 
 /** The tool token a kind's agent maps to under capabilities.agents (undefined = no
  *  agent, e.g. shell). Mirrors `RcKind::tool`. */
 const RC_KIND_TOOL: Record<string, string | undefined> = {
   "claude-rc": "claude", "claude-broker": "claude",
   codex: "codex", opencode: "opencode", cursor: "cursor", shell: undefined,
+  // Both roost-only kinds carry their own tool token, and `roost_capabilities`
+  // reports both installed — the same trade-off it already makes for the four.
+  gx: "gx", grok: "grok",
 };
 
 /** The launch UI's gated kind list: with capabilities, the creatable kinds whose
@@ -908,6 +921,8 @@ export function rcAuthHint(kind: RcKind): string {
     case "codex": return "run `codex` and complete login (`codex login`)";
     case "opencode": return "run `opencode auth login`";
     case "cursor": return "run `cursor-agent login`";
+    case "gx": return "run `gx` and complete login";
+    case "grok": return "run `grok` and complete login";
     default: return "log in to the agent in a terminal";
   }
 }
@@ -987,12 +1002,17 @@ export type RcSession = {
 
 /** What `RcSession.agent_lane` carries: which agent, which session of it, and
  *  the loopback URL of the server that session is running on (validated
- *  loopback-only by roost's own plugin before it is reported). The URL is the
+ *  loopback-only, on both paths, by `RoostSession::agent_lane`). The URL is the
  *  MACHINE's loopback, not this host's — the backend forwards to it when the
- *  machine is remote, so nothing in the UI should ever dial it directly. */
+ *  machine is remote, so nothing in the UI should ever dial it directly.
+ *
+ *  Its PRESENCE is the capability signal: a row that has it gets a Transcript
+ *  affordance, a row that does not gets none. */
 export type AgentLane = {
-  /** The agent's token, the same vocabulary `RcKind` speaks. `"opencode"` is
-   *  the only adapter that exists today. */
+  /** Which adapter speaks to it — `"opencode"` or `"gx"` today. The backend
+   *  dispatches on this string and refuses one it has no adapter for by name
+   *  (`unsupported_lane`), so a kind stamped by a newer core than the binary
+   *  reading it is a visible refusal rather than a silent blank panel. */
   kind: string;
   /** The AGENT's own session id — the address every `lane.*` op takes, and not
    *  the roost tab id (`tab_id` / `slug`). */
@@ -1231,7 +1251,21 @@ export type LaneView = {
   stale: string | null;
 };
 
-export type LaneOption = { id: string; label: string; description?: string | null };
+/** One button an approval offers, exactly as the agent offered it.
+ *
+ *  `id` is OPAQUE — whatever the agent called it — and is what `{choice}` hands
+ *  back. `kind` is the separate, semantic half (the ACP vocabulary:
+ *  `allow_once` | `allow_always` | `reject_once` | `reject_always`), absent when
+ *  the agent states none. The two are independent, which is the whole reason
+ *  both exist: gx's own permission offers `optionId: "enable-always-approve"`
+ *  with `kind: "allow_once"`, so a client that styled buttons by sniffing the id
+ *  would paint that one wrong. Style by `kind`, post by `id`. */
+export type LaneOption = {
+  id: string;
+  label: string;
+  description?: string | null;
+  kind?: string | null;
+};
 
 /** One structured question inside a `question` approval: its own options, plus
  *  `multiple` (several ids in one answer) and `custom` (free text alongside). */
@@ -1246,11 +1280,17 @@ export type LaneQuestion = {
 /** One thing waiting on the human.
  *
  *  **`kind` selects which field renders, and the two are never both populated**
- *  (pinned in `shed_core::lane::LaneApproval`'s doc): a `permission` fills
- *  `options` with the three fixed choices and leaves `questions` empty; a
- *  `question` fills `questions` and leaves `options` empty. Branch on `kind`,
- *  never on which list happens to be non-empty — rendering the wrong one yields
- *  an approval card with no buttons. */
+ *  (pinned in `shed_core::lane::LaneApproval`'s doc): a `permission` and a
+ *  `plan_approval` fill `options` and leave `questions` empty; a `question`
+ *  fills `questions` and leaves `options` empty. Branch on `kind`, never on
+ *  which list happens to be non-empty — rendering the wrong one yields an
+ *  approval card with no buttons.
+ *
+ *  `options` is the AGENT's own menu, in its own order, and its length is not
+ *  fixed: opencode offers three, gx offers whatever the request carried (five,
+ *  live, two of them `allow_once`). A kind this build cannot name — including
+ *  gx's `pending_interaction` placeholder, whose `method` and `request` are both
+ *  null and which therefore offers nothing — renders `request_json` instead. */
 export type LaneApproval = {
   id: string;
   /** May be a DESCENDANT of the subscribed session — a child's approval still
@@ -1290,9 +1330,17 @@ export type LaneCapabilities = {
 
 export type LaneOpened = { session: LaneSessionRow; capabilities: LaneCapabilities };
 
-/** The three forms `lane.answer` accepts (`lane::parse_answer`). Note the KEBAB
- *  decision spellings — the IPC grammar's, not the option ids' (`allow_once`). */
+/** The four forms `lane.answer` accepts (`lane::parse_answer`). Exactly one key
+ *  per answer — naming two is a `bad_request`.
+ *
+ *  `choice` names the offered option by its OWN id, verbatim: ids are opaque and
+ *  the backend neither trims nor interprets them. It is the only form that can
+ *  express a real menu — gx offers five permission options with two of kind
+ *  `allow_once`, so `permission` cannot say which one was pressed. `permission`
+ *  resolves by SEMANTIC kind instead, and note its KEBAB spellings — the IPC
+ *  grammar's, not the option ids' (`allow_once`). */
 export type LaneAnswer =
+  | { choice: string }
   | { permission: "allow-once" | "allow-always" | "reject" }
   | { question: string[][] }
   | { reject: true };
@@ -1413,10 +1461,17 @@ export type LaneRow = {
 };
 
 /** One approval card as rendered: `buttons` are the decision buttons' LABELS in
- *  render order (a permission's three), and `questions` the structured form a
- *  question renders instead — `options` being the option buttons' labels and
- *  `custom` whether a free-text field sits beside them. Which of the two is
- *  populated follows `kind`, exactly as the render does. */
+ *  render order (the agent's own options, however many it offered), `options`
+ *  the same buttons with the id each one POSTS and the kind each is styled from,
+ *  and `questions` the structured form a question renders instead — its
+ *  `options` being the option buttons' labels and `custom` whether a free-text
+ *  field sits beside them. Which is populated follows `kind`, exactly as the
+ *  render does.
+ *
+ *  `options` beside `buttons` is not redundant. A label is what a person reads;
+ *  an id is what the click sends, and gx proves they can disagree (two options
+ *  of kind `allow_once`, distinguishable only by id). A dump that reported only
+ *  labels could not tell a right button from a wrong one. */
 export type LaneApprovalCard = {
   id: string;
   session_id: string;
@@ -1424,6 +1479,7 @@ export type LaneApprovalCard = {
   title: string;
   detail: string;
   buttons: string[];
+  options: { id: string; label: string; kind: string | null }[];
   questions: { header: string; question: string; options: string[]; custom: boolean }[];
 };
 
@@ -1435,6 +1491,9 @@ export type LaneApprovalCard = {
 export type LaneReport = {
   machine: string;
   session_id: string;
+  /** Which adapter is behind this panel (`opened.capabilities.kind`), and what
+   *  the header badge says. `""` until `lane.open` answers. */
+  kind: string;
   title: string;
   cwd: string;
   activity: string;
@@ -1445,6 +1504,15 @@ export type LaneReport = {
   approvals: LaneApprovalCard[];
   /** The Cancel button is enabled — i.e. the session is Working. */
   can_cancel: boolean;
+  /** The Interject toggle, or `null` when the adapter does not advertise the
+   *  capability and no toggle is rendered at all.
+   *
+   *  Three states rather than a bool because "absent" and "present but
+   *  disabled" are different claims and both are pinned: opencode advertises no
+   *  `interject`, so its panel has no toggle; gx advertises it, so its panel
+   *  has one — enabled only while the session is Working, because that is the
+   *  only time the agent accepts one. */
+  interject: { on: boolean; enabled: boolean } | null;
   error: string | null;
 };
 

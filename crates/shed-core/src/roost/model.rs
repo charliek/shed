@@ -30,6 +30,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use roost_ipc::agent::{AgentLifecycle, Ownership, ShellState};
 use roost_ipc::messages::{Project, SessionIdentify, Tab, TabListResult};
+use serde::{Deserialize, Serialize};
 
 use crate::rc::{
     RcActivity, RcAgentInfo, RcCapabilities, RcKind, RcKindFeatures, RcSessionDto, RcState,
@@ -45,6 +46,93 @@ use crate::rc::{
 /// Anything else under `waiting` is input, not approval — a `question_asked` is
 /// a question.
 pub const APPROVAL_DETAILS: [&str; 2] = ["permission_prompt", "permission_asked"];
+
+/// The `ownership.metadata` key roost's grok adapter stamps gx's remote-lane
+/// base URL under (roost R8). Present only once the lane binds, and it is a
+/// discovery HINT — roost keeps it on the tab until its adapter says otherwise,
+/// so it never means "the lane is up".
+pub const GX_REMOTE_KEY: &str = "gx.remote";
+
+/// The `ownership.metadata` key roost's opencode adapter stamps the opencode
+/// server's base URL under (roost R10).
+pub const OPENCODE_SERVER_URL_KEY: &str = "server_url";
+
+/// `true` for a `http://` URL whose host is `127.0.0.1`, `localhost` or `[::1]`,
+/// followed by `:` and a decimal port in `1..=65535` and **nothing else** — no
+/// userinfo, path, query or fragment.
+///
+/// A port of roost's own `roost_agent::common::loopback_base_url`, kept
+/// character-for-character rather than reimplemented with a URL parser. Two
+/// things ride on it and both need the SAME answer roost gave:
+///
+/// * [`RoostSession::agent_kind`] promotes a `grok` tab to [`RcKind::Gx`] on it,
+///   so a shape roost accepted and shed rejected would be a row that renders as
+///   lane-less while roost thinks it published a lane;
+/// * a gx discovery record's `url` is matched against the reported URL under it,
+///   so a normalisation difference would make a live leader look like no record
+///   at all.
+///
+/// The value being judged is **agent-supplied** — the agent tells roost where it
+/// listens and roost re-publishes it verbatim — which is why the rule is a
+/// whitelist of three hosts and refuses everything after the port, rather than
+/// "parse it and check the host". A caller filters an absent/empty value first;
+/// this only judges the shape of a non-empty string.
+pub fn loopback_base_url(value: &str) -> bool {
+    let Some(rest) = value.strip_prefix("http://") else {
+        return false;
+    };
+    for host in ["127.0.0.1", "localhost", "[::1]"] {
+        let Some(after_host) = rest.strip_prefix(host) else {
+            continue;
+        };
+        let Some(port) = after_host.strip_prefix(':') else {
+            continue;
+        };
+        if port.is_empty() || !port.bytes().all(|b| b.is_ascii_digit()) {
+            continue;
+        }
+        return matches!(port.parse::<u32>(), Ok(p) if (1..=65535).contains(&p));
+    }
+    false
+}
+
+/// A trimmed copy of `s`, or `None` when there is nothing left.
+fn non_empty(s: &str) -> Option<String> {
+    let s = s.trim();
+    (!s.is_empty()).then(|| s.to_string())
+}
+
+/// Where a row's agent lane is, and which adapter speaks to it — the whole of
+/// what a client needs to open one.
+///
+/// Stamped beside the session DTO rather than on it: [`RcSessionDto`] is pinned
+/// byte-for-byte by the Go↔Rust parity harness and gains no field for roost
+/// (plan 013 §3.2), so this rides the client's own row payload under the key
+/// **`agent_lane`** — not `lane`, which already means the RC hub's lane token on
+/// that DTO and would be read by the wrong consumer.
+///
+/// `kind` is the wire token ([`RcKind::as_str`]), not the enum: a client
+/// dispatches on it to pick an adapter, and one it has never heard of is a lane
+/// it must refuse by name rather than silently not render. `server_url` keeps
+/// that name for both adapters even though gx's own key is `gx.remote` — it is
+/// "the base URL of the thing this adapter talks to", and renaming the wire
+/// field per agent would push the difference into every client.
+///
+/// **This is the REPORTED URL.** On a remote machine a client dials somewhere
+/// else entirely (a forwarded `127.0.0.1:<local>`); the two are never conflated,
+/// and matching a discovery record is done against this one.
+///
+/// FRB-mirror clean (the rule in [`crate::lane`]'s module doc): three owned
+/// `String`s, no map, no `Value`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentLaneStamp {
+    /// The adapter token — `"opencode"` or `"gx"` today.
+    pub kind: String,
+    /// The AGENT's own session id, the address every lane verb takes.
+    pub session_id: String,
+    /// The reported loopback base URL of the agent's control surface.
+    pub server_url: String,
+}
 
 /// One agent-owned roost tab, with the project it lives in and the host it was
 /// read from.
@@ -126,10 +214,25 @@ impl RoostSession {
     /// `ownership.source` is an **open string** on roost's wire (adding an agent
     /// must not be an enum change there), so the tail is
     /// [`RcKind::Other`] — the unknown-kind policy, which renders the raw kind
-    /// with no affordances. `grok` lands there deliberately: a real
-    /// `RcKind::Grok` is a cross-client wire change, and a grok tab renders
-    /// neutrally until someone makes it. `manual` and `legacy` (roost's own
-    /// non-agent sources) land there too.
+    /// with no affordances. `manual` and `legacy` (roost's own non-agent
+    /// sources) land there.
+    ///
+    /// ## `grok` is two kinds, and shed decides which
+    ///
+    /// **roost never says `gx`.** Its adapter reports `source: "grok"` for
+    /// grok's `gx` agent whether or not gx's remote lane is up, and stamps
+    /// `metadata["gx.remote"]` with the lane's base URL once it binds (roost
+    /// R8). So the promotion happens HERE: a `grok` tab carrying a
+    /// `gx.remote` that passes [`loopback_base_url`] is [`RcKind::Gx`] — a row
+    /// with a transcript — and every other `grok` tab is [`RcKind::Grok`], a
+    /// row with a status chip and nothing to open. `gx --no-leader` and
+    /// `GX_REMOTE_DISABLE=1` therefore stay `grok`, with no special case.
+    ///
+    /// **The promotion is a HINT, not liveness.** roost keeps the key on the tab
+    /// until its adapter reports otherwise, so a row can read `gx` with a dead
+    /// leader behind it; opening the lane is what discovers that, and it answers
+    /// `unavailable`. Deriving liveness from metadata is exactly what the epic
+    /// forbids, and the shape check is the only judgement made here.
     ///
     /// A tab with no ownership is [`RcKind::Shell`]. Unreachable from an
     /// inventory — which lists owned tabs only — but the function is total.
@@ -142,8 +245,57 @@ impl RoostSession {
             "codex" => RcKind::Codex,
             "opencode" => RcKind::Opencode,
             "cursor" => RcKind::Cursor,
+            "grok" => match ownership.metadata.get(GX_REMOTE_KEY) {
+                Some(url) if loopback_base_url(url) => RcKind::Gx,
+                _ => RcKind::Grok,
+            },
             other => RcKind::Other(other.to_string()),
         }
+    }
+
+    /// The agent-lane stamp for this tab, or `None` when there is no lane to
+    /// open.
+    ///
+    /// Three things must hold, and each absence is a lane that would fail on the
+    /// first tap rather than one that is merely unreachable:
+    ///
+    /// * the kind is one an adapter exists for — [`RcKind::Opencode`] or
+    ///   [`RcKind::Gx`]. `Gx` already implies the URL passed
+    ///   [`loopback_base_url`] ([`RoostSession::agent_kind`]);
+    /// * the agent announced where its control surface listens — opencode's
+    ///   `server_url`, gx's `gx.remote`, both under the same loopback rule;
+    /// * the agent reported its OWN session id, which is the address every lane
+    ///   verb takes. A stamp without one advertises a panel that can never open.
+    ///
+    /// This is the SHED-CORE half of the stamp: the derivation, so the desktop,
+    /// the phone and any later client all promote the same rows. What a client
+    /// then does with it — build the adapter, key a live entry by
+    /// `(kind, server_url)` — is the client's.
+    pub fn agent_lane(&self) -> Option<AgentLaneStamp> {
+        let ownership = self.ownership.as_ref()?;
+        let kind = self.agent_kind();
+        let url_key = match kind {
+            RcKind::Opencode => OPENCODE_SERVER_URL_KEY,
+            RcKind::Gx => GX_REMOTE_KEY,
+            _ => return None,
+        };
+        // Validated on BOTH paths, so the stamp carries ONE contract — "a
+        // stamped `server_url` passed the loopback rule" — rather than a
+        // per-kind one. roost's own adapters already apply the same rule before
+        // publishing either key, so this refuses nothing roost can produce; the
+        // point is that the desktop and the phone DIAL this value, and a URL we
+        // dial must not depend on an upstream process's filtering staying
+        // correct. That is exactly the coupling the `Gx` path already refuses to
+        // accept — there is no reason opencode's should accept it.
+        let server_url = non_empty(ownership.metadata.get(url_key)?)?;
+        if !loopback_base_url(&server_url) {
+            return None;
+        }
+        Some(AgentLaneStamp {
+            kind: kind.as_str().to_string(),
+            session_id: non_empty(&ownership.session_id)?,
+            server_url,
+        })
     }
 
     /// The live-activity dimension, from the three agent axes.
@@ -359,6 +511,8 @@ pub fn roost_capabilities() -> RcCapabilities {
         RcKind::Codex,
         RcKind::Opencode,
         RcKind::Cursor,
+        RcKind::Gx,
+        RcKind::Grok,
     ];
     let kind_features: HashMap<String, RcKindFeatures> = kinds
         .iter()
@@ -437,15 +591,26 @@ fn roost_kind_features() -> RcKindFeatures {
 ///
 /// Minimal by design (plan 013 §4): the binary and nothing else. Prompts,
 /// permission modes and the `shed` provider script are a later slice, and a kind
-/// with no launch recipe — `shell`, `claude-broker`, or any unknown kind
-/// including `grok` — returns `None` so the caller rejects the launch by name
-/// instead of opening an empty tab.
+/// with no launch recipe — `shell`, `claude-broker`, or any unknown kind —
+/// returns `None` so the caller rejects the launch by name instead of opening an
+/// empty tab.
+///
+/// [`RcKind::Gx`] and [`RcKind::Grok`] each launch their OWN binary — `gx` and
+/// `grok`, two programs in one family sharing a `$GROK_HOME`. roost reports
+/// either tab as `source: "grok"`, so which kind the resulting ROW reads as is
+/// decided afterwards by whether a lane binds
+/// ([`RoostSession::agent_kind`]): a `grok` tab has no remote lane and stays
+/// [`RcKind::Grok`], and a `gx` tab is promoted once `gx.remote` arrives. The
+/// launch argv is therefore the kind the user asked for, not the kind the row
+/// will settle on.
 pub fn launch_argv(kind: &RcKind) -> Option<Vec<String>> {
     let bin = match kind {
         RcKind::ClaudeRc => "claude",
         RcKind::Codex => "codex",
         RcKind::Opencode => "opencode",
         RcKind::Cursor => "cursor-agent",
+        RcKind::Gx => "gx",
+        RcKind::Grok => "grok",
         RcKind::ClaudeBroker | RcKind::Shell | RcKind::Other(_) => return None,
     };
     Some(vec![bin.to_string()])
@@ -460,6 +625,14 @@ pub fn launch_argv(kind: &RcKind) -> Option<Vec<String>> {
 /// the alternative is a date-time crate in the FFI tree for a `format!`.
 /// `shed-app` keeps `timefmt` (which *parses* the many shapes shed-server emits,
 /// and does need a real library); this is the one-way, one-shape half.
+///
+/// **Byte-equivalent to chrono's `to_rfc3339_opts(Secs, true)` only inside
+/// `0000..=9999`.** RFC 3339's expanded-year form prefixes a `+` on years past
+/// 9999 (and chrono zero-pads negative ones); this emits a bare
+/// `10000-01-01T00:00:00Z`. Reaching that needs a timestamp about eight
+/// thousand years out, so the divergence is stated rather than fixed — this is
+/// shared code with several call sites, and widening it for an unreachable case
+/// would be the worse trade.
 pub fn rfc3339_z(unix: i64) -> String {
     // Euclidean so a pre-epoch instant floors instead of truncating toward zero.
     let days = unix.div_euclid(86_400);
@@ -845,6 +1018,19 @@ failed   foreground_process question_asked    -> needs_input";
         assert_eq!(rfc3339_z(-1), "1969-12-31T23:59:59Z");
     }
 
+    /// A session on `source` with `metadata` — the two axes `agent_kind`
+    /// reads, and nothing else.
+    fn session_with(source: &str, metadata: &[(&str, &str)]) -> RoostSession {
+        let mut t = tab(4, AgentLifecycle::Finished, ShellState::Unknown, "");
+        let own = t.ownership.as_mut().expect("the sample tab is owned");
+        own.source = source.to_string();
+        own.metadata = metadata
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        session_of(&t)
+    }
+
     #[test]
     fn agent_kind_maps_every_source() {
         let cases = [
@@ -852,17 +1038,21 @@ failed   foreground_process question_asked    -> needs_input";
             ("codex", RcKind::Codex),
             ("opencode", RcKind::Opencode),
             ("cursor", RcKind::Cursor),
-            // A row kind, not a launchable one: renders with the raw string and
-            // no affordances (unknown-kind policy).
-            ("grok", RcKind::Other("grok".to_string())),
+            // A bare grok tab: gx with no lane bound. A real kind now, not the
+            // raw-string `Other` it used to be — creatable, lane-less, and it
+            // renders a status chip with no Transcript affordance.
+            ("grok", RcKind::Grok),
+            // roost's own non-agent sources stay unknown-kind.
             ("manual", RcKind::Other("manual".to_string())),
             ("legacy", RcKind::Other("legacy".to_string())),
             ("something-new", RcKind::Other("something-new".to_string())),
+            // roost NEVER says `gx` — if it somehow did, that is an unrecognized
+            // source and the unknown-kind policy applies. The promotion is
+            // shed's, off the metadata, and only off the metadata.
+            ("gx", RcKind::Other("gx".to_string())),
         ];
         for (source, expected) in cases {
-            let mut t = tab(4, AgentLifecycle::Finished, ShellState::Unknown, "");
-            t.ownership.as_mut().unwrap().source = source.to_string();
-            let s = session_of(&t);
+            let s = session_with(source, &[]);
             assert_eq!(s.agent_kind(), expected, "source {source}");
             assert_eq!(s.to_rc_dto().kind, expected, "source {source} on the DTO");
         }
@@ -872,6 +1062,220 @@ failed   foreground_process question_asked    -> needs_input";
         t.ownership = None;
         let s = session_of(&t);
         assert_eq!(s.agent_kind(), RcKind::Shell);
+    }
+
+    /// The `grok` → `gx` promotion, over EVERY axis `loopback_base_url` judges.
+    ///
+    /// The table is the same one [`loopback_base_url_accepts_only_roosts_shape`]
+    /// runs directly, driven through the derivation instead — so a shape the
+    /// rule rejects can never reach a client as a lane-bearing row, and a shape
+    /// it accepts always does. `grok` is the only source this applies to; a
+    /// stray `gx.remote` on any other tab is inert.
+    #[test]
+    fn a_grok_tab_is_promoted_to_gx_on_every_loopback_axis() {
+        for &(url, promoted) in LOOPBACK_CASES {
+            let s = session_with("grok", &[(GX_REMOTE_KEY, url)]);
+            let want = if promoted { RcKind::Gx } else { RcKind::Grok };
+            assert_eq!(s.agent_kind(), want, "gx.remote {url:?}");
+            assert_eq!(s.to_rc_dto().kind, want, "gx.remote {url:?} on the DTO");
+        }
+
+        // Absent, and present-but-empty, are both "no lane".
+        assert_eq!(session_with("grok", &[]).agent_kind(), RcKind::Grok);
+        assert_eq!(
+            session_with("grok", &[(GX_REMOTE_KEY, "")]).agent_kind(),
+            RcKind::Grok
+        );
+        // Another agent's metadata does not promote anything, and neither does
+        // the key on a tab that is not grok's.
+        assert_eq!(
+            session_with("grok", &[("server_url", "http://127.0.0.1:2421")]).agent_kind(),
+            RcKind::Grok
+        );
+        assert_eq!(
+            session_with("codex", &[(GX_REMOTE_KEY, "http://127.0.0.1:2421")]).agent_kind(),
+            RcKind::Codex
+        );
+    }
+
+    /// Every axis of roost's rule: the scheme, the three hosts, the required
+    /// explicit port, the port's grammar and range, and "nothing after it".
+    ///
+    /// This is a PORT of `roost_agent::common::loopback_base_url` and the whole
+    /// point is that it answers identically, so the table is written from the
+    /// rule's clauses rather than from the cases shed happens to see.
+    /// A slice, not a sized array: adding a case must not also mean editing a
+    /// count that has nothing to do with it.
+    const LOOPBACK_CASES: &[(&str, bool)] = &[
+        // the three accepted hosts, with an explicit port and nothing after
+        ("http://127.0.0.1:2421", true),
+        ("http://localhost:2421", true),
+        ("http://[::1]:2421", true),
+        // port range boundaries
+        ("http://127.0.0.1:1", true),
+        ("http://127.0.0.1:65535", true),
+        ("http://127.0.0.1:0", false),
+        ("http://127.0.0.1:65536", false),
+        ("http://127.0.0.1:99999999999", false),
+        // the port must be present, decimal, and nothing but digits
+        ("http://127.0.0.1", false),
+        ("http://127.0.0.1:", false),
+        ("http://127.0.0.1:24a1", false),
+        ("http://127.0.0.1:+2421", false),
+        ("http://127.0.0.1: 2421", false),
+        // nothing after the port — no path, query, fragment or trailing slash
+        ("http://127.0.0.1:2421/", false),
+        ("http://127.0.0.1:2421/v1", false),
+        ("http://127.0.0.1:2421?t=1", false),
+        ("http://127.0.0.1:2421#x", false),
+        // scheme: http only, and spelled exactly
+        ("https://127.0.0.1:2421", false),
+        ("HTTP://127.0.0.1:2421", false),
+        ("ws://127.0.0.1:2421", false),
+        ("127.0.0.1:2421", false),
+        // no userinfo, and no host that merely starts with a loopback one
+        ("http://user@127.0.0.1:2421", false),
+        ("http://127.0.0.1.evil.com:2421", false),
+        ("http://localhost.evil.com:2421", false),
+        // a non-loopback host, and the empty string
+        ("http://10.0.0.5:2421", false),
+        ("", false),
+    ];
+
+    #[test]
+    fn loopback_base_url_accepts_only_roosts_shape() {
+        for &(url, want) in LOOPBACK_CASES {
+            assert_eq!(loopback_base_url(url), want, "{url:?}");
+        }
+    }
+
+    /// The lane stamp: which rows carry one, and what it says.
+    ///
+    /// Three things gate it — an adapter exists for the kind, the agent
+    /// announced a URL, and it reported its own session id — and each absence
+    /// is a panel that could never open rather than one that is merely
+    /// unreachable.
+    #[test]
+    fn agent_lane_stamps_opencode_and_gx_only() {
+        let oc = session_with("opencode", &[("server_url", "http://127.0.0.1:4096")]);
+        assert_eq!(
+            oc.agent_lane(),
+            Some(AgentLaneStamp {
+                kind: "opencode".to_string(),
+                session_id: "ses_f8510bbf0ffePFCHCY6iyzAieq".to_string(),
+                server_url: "http://127.0.0.1:4096".to_string(),
+            })
+        );
+
+        // gx: the SAME stamp shape, off `gx.remote`. The wire field stays
+        // `server_url` — it means "where this adapter talks to", not "opencode's
+        // key".
+        let gx = session_with("grok", &[(GX_REMOTE_KEY, "http://127.0.0.1:2421")]);
+        assert_eq!(
+            gx.agent_lane(),
+            Some(AgentLaneStamp {
+                kind: "gx".to_string(),
+                session_id: "ses_f8510bbf0ffePFCHCY6iyzAieq".to_string(),
+                server_url: "http://127.0.0.1:2421".to_string(),
+            })
+        );
+
+        // Every other kind: no stamp, whatever metadata it carries.
+        for (source, meta) in [
+            ("grok", &[][..]),
+            ("claude", &[("server_url", "http://127.0.0.1:4096")][..]),
+            ("codex", &[("server_url", "http://127.0.0.1:4096")][..]),
+            ("cursor", &[(GX_REMOTE_KEY, "http://127.0.0.1:2421")][..]),
+            ("manual", &[("server_url", "http://127.0.0.1:4096")][..]),
+        ] {
+            assert!(
+                session_with(source, meta).agent_lane().is_none(),
+                "source {source} must not stamp a lane",
+            );
+        }
+
+        // A gx tab whose URL fails the shape check is never `Gx` in the first
+        // place, so it cannot stamp one either.
+        assert!(
+            session_with("grok", &[(GX_REMOTE_KEY, "http://127.0.0.1:2421/v1")])
+                .agent_lane()
+                .is_none()
+        );
+
+        // The SAME rule on the opencode path. The stamp carries one contract —
+        // a stamped `server_url` passed the loopback rule — so a client that
+        // dials it never depends on roost's filtering having stayed correct.
+        // An off-loopback `server_url` is the case that matters: without this,
+        // `source="opencode"` + `http://evil.com:80` would hand a client a URL
+        // it would go and dial.
+        for bad in [
+            "http://evil.com:80",
+            "http://10.0.0.5:4096",
+            "https://127.0.0.1:4096",
+            "http://127.0.0.1:4096/v1",
+            "http://127.0.0.1",
+        ] {
+            assert!(
+                session_with("opencode", &[("server_url", bad)])
+                    .agent_lane()
+                    .is_none(),
+                "opencode server_url {bad:?} must not stamp a lane",
+            );
+        }
+        // …and the kind is untouched by that refusal: the row is still an
+        // opencode row, it just has no lane to open (the promotion axis and the
+        // stamp axis are independent).
+        assert_eq!(
+            session_with("opencode", &[("server_url", "http://evil.com:80")]).agent_kind(),
+            RcKind::Opencode,
+        );
+
+        // No URL, and a whitespace-only URL, are both "no lane".
+        assert!(session_with("opencode", &[]).agent_lane().is_none());
+        assert!(session_with("opencode", &[("server_url", "   ")])
+            .agent_lane()
+            .is_none());
+
+        // No session id: the address every lane verb takes is missing, so the
+        // stamp would advertise a panel that can never open.
+        let mut t = tab(4, AgentLifecycle::Finished, ShellState::Unknown, "");
+        {
+            let own = t.ownership.as_mut().expect("owned");
+            own.session_id = String::new();
+            own.metadata = [(
+                "server_url".to_string(),
+                "http://127.0.0.1:4096".to_string(),
+            )]
+            .into_iter()
+            .collect();
+        }
+        assert!(session_of(&t).agent_lane().is_none());
+
+        // An unowned tab is total, like every other accessor here.
+        let mut t = tab(3, AgentLifecycle::Inactive, ShellState::AtPrompt, "");
+        t.ownership = None;
+        assert!(session_of(&t).agent_lane().is_none());
+    }
+
+    /// The stamp is FRB-mirror shaped and round-trips through the JSON a client
+    /// puts on its own row payload — three owned strings, no map, no `Value`.
+    #[test]
+    fn agent_lane_stamp_round_trips_on_the_wire() {
+        let stamp = session_with("grok", &[(GX_REMOTE_KEY, "http://127.0.0.1:2421")])
+            .agent_lane()
+            .expect("a gx tab stamps a lane");
+        let encoded = serde_json::to_value(&stamp).expect("the stamp serializes");
+        assert_eq!(
+            encoded,
+            serde_json::json!({
+                "kind": "gx",
+                "session_id": "ses_f8510bbf0ffePFCHCY6iyzAieq",
+                "server_url": "http://127.0.0.1:2421",
+            })
+        );
+        let decoded: AgentLaneStamp =
+            serde_json::from_value(encoded).expect("the stamp decodes back");
+        assert_eq!(decoded, stamp);
     }
 
     // ---- the shed-recorded vectors ------------------------------------------
@@ -995,20 +1399,25 @@ failed   foreground_process question_asked    -> needs_input";
                 RcKind::ClaudeRc,
                 RcKind::Codex,
                 RcKind::Opencode,
-                RcKind::Cursor
+                RcKind::Cursor,
+                RcKind::Gx,
+                RcKind::Grok,
             ]
         );
         // roost publishes no agent inventory, so each launchable kind's tool is
         // claimed installed — that is what lets `offers` say yes below.
         let mut tools: Vec<&str> = caps.agents.keys().map(String::as_str).collect();
         tools.sort_unstable();
-        assert_eq!(tools, vec!["claude", "codex", "cursor", "opencode"]);
+        assert_eq!(
+            tools,
+            vec!["claude", "codex", "cursor", "grok", "gx", "opencode"]
+        );
         assert!(caps
             .agents
             .values()
             .all(|a| a.installed && a.version.is_none()));
 
-        let wire_names = ["claude-rc", "codex", "opencode", "cursor"];
+        let wire_names = ["claude-rc", "codex", "opencode", "cursor", "gx", "grok"];
         assert_eq!(caps.kind_features.len(), wire_names.len());
         for name in wire_names {
             let features = caps
@@ -1050,9 +1459,16 @@ failed   foreground_process question_asked    -> needs_input";
                 RcKind::ClaudeRc,
                 RcKind::Codex,
                 RcKind::Opencode,
-                RcKind::Cursor
+                RcKind::Cursor,
+                RcKind::Gx,
+                RcKind::Grok,
             ]
         );
+        // Both new kinds are OFFERED, which needs the kind advertised AND its
+        // tool claimed installed — the two halves `roost_capabilities` builds
+        // from the same list.
+        assert!(caps.offers(&RcKind::Gx));
+        assert!(caps.offers(&RcKind::Grok));
         assert!(!caps.offers(&RcKind::Shell));
         assert!(!caps.offers(&RcKind::ClaudeBroker));
     }
@@ -1072,10 +1488,18 @@ failed   foreground_process question_asked    -> needs_input";
             launch_argv(&RcKind::Cursor),
             Some(vec!["cursor-agent".to_string()])
         );
+        // Each launches its OWN binary — two programs in one family. roost
+        // reports either tab as `source: "grok"`, and which kind the ROW settles
+        // on is decided later by whether a lane binds.
+        assert_eq!(launch_argv(&RcKind::Gx), Some(vec!["gx".to_string()]));
+        assert_eq!(launch_argv(&RcKind::Grok), Some(vec!["grok".to_string()]));
         assert_eq!(launch_argv(&RcKind::ClaudeBroker), None);
         assert_eq!(launch_argv(&RcKind::Shell), None);
-        // grok is a row kind, not a launchable one (plan 013 §4).
+        // An unknown kind still has no launch recipe — including the raw string
+        // `grok`, which is no longer how a grok tab is spelled but is still an
+        // unknown kind if it arrives as one.
         assert_eq!(launch_argv(&RcKind::Other("grok".to_string())), None);
+        assert_eq!(launch_argv(&RcKind::Other("borg".to_string())), None);
         // Every advertised kind IS launchable — the two tables must not drift.
         for kind in roost_capabilities().kinds {
             assert!(

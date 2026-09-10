@@ -9,14 +9,17 @@
         "options": [
           {
             "id": "allow_once",
+            "kind": "allow_once",
             "label": "Allow once"
           },
           {
             "id": "allow_always",
+            "kind": "allow_always",
             "label": "Always"
           },
           {
             "id": "reject",
+            "kind": "reject_once",
             "label": "Reject"
           }
         ],
@@ -34,14 +37,17 @@
         "options": [
           {
             "id": "allow_once",
+            "kind": "allow_once",
             "label": "Allow once"
           },
           {
             "id": "allow_always",
+            "kind": "allow_always",
             "label": "Always"
           },
           {
             "id": "reject",
+            "kind": "reject_once",
             "label": "Reject"
           }
         ],

@@ -1,0 +1,78 @@
+[package]
+name = "shed-gx"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "shed-gx — the gx adapter for the shed_core::lane agent-lane contract (plan 017): discovery, the transport hook, the client verbs, the pure fold, and the reconnecting watcher with its bounded silent resume."
+
+[lib]
+name = "shed_gx"
+path = "src/lib.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+# The contract this crate implements (`shed_core::lane`), the transcript row it
+# emits (`shed_core::rc::RcFeedMessage`), and the three things C1 moved down for
+# a SECOND adapter to share rather than copy: `lane::feed` (the vocabulary and
+# the sanitizers), `lane::ring` (the bounded ring that owns `seq`) and
+# `roost::{loopback_base_url, rfc3339_z}`.
+shed-core = { path = "../shed-core" }
+serde = { workspace = true }
+# `raw_value`, for the same reason `shed-opencode` takes it: an approval's
+# `request` is kept as raw bytes so `LaneApproval::request_json` preserves gx's
+# own key order instead of serde's re-sorted one.
+serde_json = { workspace = true, features = ["raw_value"] }
+thiserror = { workspace = true }
+# `net` + `io-util` on top of the workspace's rt-multi-thread/macros/sync/time:
+# `FakeGx` binds a loopback `TcpListener` and speaks HTTP/1.1 over it. Both are
+# already enabled by shed-core, so this adds no feature to the workspace's tokio
+# build — it just stops this crate from depending on a sibling's feature list.
+tokio = { workspace = true, features = ["net", "io-util"] }
+reqwest = { workspace = true }
+async-trait = { workspace = true }
+# The ONE dependency C3 adds, and C2's comment below predicted it by name: the
+# watcher reads the SSE body as a `bytes_stream()`, which is a `futures_core`
+# `Stream`, and `StreamExt::next` is how you pull an item off one. `reqwest`
+# already depends on it, so no package joins `crates/Cargo.lock`.
+futures-util = { workspace = true }
+
+# NOT taken, and each omission is deliberate — the dependency set is
+# `shed-opencode`'s minus `regex` and `chrono` (plan 017 §3.4), minus two more
+# this adapter genuinely cannot use:
+#
+# - `chrono`: the fold's time currency is `shed_core::roost::rfc3339_z`, which is
+#   why C1 made the ring chrono-free. Taking chrono back would undo that.
+# - `regex`: the ANSI stripper is `shed_core::lane::feed`'s now.
+# - `base64`: opencode needs it for HTTP Basic. gx authenticates with a bearer
+#   token, so there is nothing to encode.
+#
+# (`futures-util` was on this list in C2 — "nothing here reads a streaming body
+# yet; C3's watcher is where it arrives" — and C3 took it, above.)
+#
+# The invariant those omissions serve: NO crate enters `crates/Cargo.lock` that
+# was not already in it, and `cargo tree -p shed-core-ffi` /
+# `cargo tree -p shed-core --target aarch64-linux-android` are byte-unchanged —
+# shed-gx is reachable from neither.
+
+[features]
+# Exports `testing::FakeGx` — the in-process gx double — across the crate
+# boundary, the `shed_opencode::testing::FakeOpencode` pattern. Integration
+# tests (`tests/*.rs`, C3) reach the fake THROUGH this feature; `cfg(test)`
+# would not cross the boundary. Test-only by construction: the module is
+# `#[cfg(any(test, feature = "test-support"))]`, so a shipped binary never
+# carries it.
+test-support = []
+
+[dev-dependencies]
+# `rt` (the current-thread runtime) for the async tests; `test-util` is what
+# `#[tokio::test(start_paused = true)]` needs. Both are tokio's own features —
+# no package joins the lock — and `test-util` changes nothing unless a test
+# explicitly pauses time.
+tokio = { workspace = true, features = ["rt", "test-util"] }
+# The integration tests and the example drive the fake, which lives behind the
+# feature — and a self-dev-dep is what makes `cargo clippy --all-targets` (with
+# no `--features`) compile those targets instead of failing on a missing module.
+shed-gx = { path = ".", features = ["test-support"] }

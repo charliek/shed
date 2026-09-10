@@ -16,10 +16,22 @@ agent the same way. The contract carries no I/O of its own; each agent gets
 its own adapter crate that supplies the transport, the reconnect loop, and
 the translation from that agent's wire format into the contract's DTOs.
 
-Today there is exactly one adapter, `crates/shed-opencode`, for
-[opencode](https://opencode.ai). A `gx` adapter is planned as a follow-up;
-nothing in the Tauri app assumes opencode is the only agent — the capability
-signal described below is what turns the affordance on or off per row.
+There are two adapters today: `crates/shed-opencode` for
+[opencode](https://opencode.ai), and `crates/shed-gx` for
+[gx](https://github.com/charliek/grok-build)'s remote lane (`gx-remote-api`).
+Nothing in the Tauri app assumes either is the only agent — the capability
+signal described below is what turns the affordance on or off per row, and
+`Lanes::open` picks a concrete client by the row's own `kind`, never by
+assuming one.
+
+gx is the *second* adapter, and that matters beyond feature count: a contract
+validated against one implementation is a design, not yet a contract. Building
+`shed-gx` forced real corrections into `shed_core::lane` itself — recorded in
+the module's own doc as "what the gx adapter changed" — because gx's remote
+lane has things opencode's local server never needed: a bearer token, a
+resumable cursor, and permission options whose semantic `kind` is separate
+from their id and not always unique. Those corrections are what the [gx's
+lane](#gxs-lane) section below is mostly about.
 
 ## opencode's lane
 
@@ -134,6 +146,172 @@ cargo run -p shed-opencode --example lane -- \
 app's `lane.*` ops drive. `OPENCODE_SERVER_PASSWORD` is honored if opencode's
 own password gate is set.
 
+## gx's lane
+
+`shed-gx`'s capabilities, as reported by `AgentLane::capabilities()`:
+
+| Field | Value | Meaning |
+|---|---|---|
+| `kind` | `"gx"` | The adapter identity. |
+| `create` | `true` | `POST /v1/sessions` mints a new session. |
+| `cancel` | `true` | A turn in flight can be aborted. Refused with `not_accepting` on an idle session — the panel gates the affordance on `Working` so no human sees the refusal. |
+| `approvals` | `true` | Permissions, questions, plan approvals and MCP elicitations all surface and can be answered. |
+| `interject` | `true` | `lane.send` with `mode: interject` preempts the turn in flight — opencode's lane has no equivalent verb, so its capability stays `false`. |
+| `history_cursor` | `true` | gx's `lastEventId` lets a reconnect resume from a cursor instead of refolding history from the top — see [Reconnects](#bounded-silent-resume-reset-ready-is-the-reseed-bracket-only) below. |
+
+### Discovery and the `healthz` / `instanceId` pin
+
+A gx leader writes a discovery record next to its home: `$GROK_HOME/gx-remote.json`
+on the default socket, `gx-remote-<16hex>.json` on any other —
+`{url, pid, instanceId, socketPath, tokenFile, version, startedAt}`. The token
+itself is one file, `$GROK_HOME/gx-remote.token` — **never** suffixed, even
+when the record is, because gx keeps **one token per `$GROK_HOME`**, shared by
+every leader on it; a leader restart changes `instanceId`, never the token.
+
+Before the adapter sends its first bearer request — and again at the start of
+every transport epoch (every reconnect, every failure) — it calls the
+token-free `GET /v1/healthz` and compares the `instanceId` it returns against
+the discovery record. Only on a match does the token go out. A mismatch
+triggers one re-discovery attempt; still mismatched, or no live record at all,
+answers `Unavailable` and leaves the epoch unpinned — no bearer request is
+ever sent on a lane the adapter cannot prove is the one discovery described.
+This gate (`ensure_pinned`) is one serialized async lock per client, so
+concurrent first callers share a single pin instead of racing separate ones.
+
+### Two URLs, never conflated
+
+Same invariant as opencode's SSH forward (above), stated explicitly here
+because gx's credential pin depends on it: a gx lane has a **reported** URL
+(what a discovery record's `url` is matched against, and what roost stamps as
+`gx.remote`) and a **dial** URL (where HTTP actually goes — the same address
+on a local machine, `http://127.0.0.1:<local>` over a forwarded SSH tunnel).
+`GxClient` is constructed with both, and a `GxTransport::dial()` hook is
+called before **every** connect attempt — the first verb, every SSE
+(re)connect, every verb after a failure — so a forward that moved is noticed
+rather than dialled blind. Discovery matches the reported URL; `healthz` and
+every bearer request ride the dial URL.
+
+One consequence worth stating plainly, because it is easy to get backwards:
+`gx.remote`'s value is **slash-free** (`http://127.0.0.1:2431`), and
+`loopback_base_url` — the same validator roost itself uses to decide whether
+to publish the key at all — rejects a trailing slash. A trailing slash
+anywhere in the reported URL means **no lane at all**, not a degraded one.
+
+### The credential rule
+
+The lane contract carries **no credential type**. roost's job stops at
+reporting *where* an agent is; *how* a client is let in is the client's own
+problem, deliberately kept out of `shed_core::lane` so a third adapter never
+inherits a credential shape gx happens to need. Concretely: an adapter takes
+its credentials at construction, from a source the client supplies —
+`GxClient::new` takes a `credentials: Arc<dyn GxCredentialSource>`. The Tauri
+app's implementation reads a local `$GROK_HOME` directly (never by shelling
+out) when the machine is local, or runs one POSIX `sh -c` probe over the
+machine's SSH reach otherwise — checking the same things gx's own reader
+checks (a regular file, mode `0600`, owned by the caller) before it will hand
+a token back, and refusing a symlinked or wrongly-permissioned token exactly
+as gx does. `StaticCredentials` is the fixed-value implementation the crate's
+tests, its `examples/lane.rs` CLI, and the phone's first cut use.
+
+### Kind promotion is a hint, not liveness
+
+A gx tab reports `source: "grok"` in roost whether or not a lane is up.
+`RcKind::Gx` is derived, not reported: `source == "grok"` **and**
+`metadata["gx.remote"]` passing `loopback_base_url` promotes the row to `Gx`;
+`source == "grok"` with no such key (or one that fails validation) leaves it
+`Grok` — creatable, but lane-less by design (see below). Promotion is one-way
+per report, and **a dead lane does not un-stamp the row**: a tab stays `gx`
+for as long as roost keeps the metadata key on it, even after the leader
+behind that key has died. `lane.open` is what surfaces the difference — it
+answers `unavailable` rather than the Transcript affordance silently failing
+to appear.
+
+### `unsupported_lane`
+
+`LaneEntry.client` is `Arc<dyn AgentLane>`, keyed by the full stamp
+`(kind, server_url)`; no concrete adapter type is named anywhere outside
+`Lanes::open`'s own match on the stamp's `kind`. A kind that is neither
+`"opencode"` nor `"gx"` answers `LaneFailure::UnsupportedLane(kind)` — IPC
+code `unsupported_lane` — instead of the app guessing at a client to
+construct.
+
+### Segments, not tokens — and lossless
+
+gx's chunks stream token by token; the transcript panel does not render at
+that granularity. A chunk streak closes and emits a row when a
+transcript-bearing update of a different kind arrives, when the prompt
+changes, when `turn_completed` fires, or when the streak passes **8 KiB** —
+whichever comes first — and a streak that has gone silent for **2 seconds**
+flushes on its own rather than waiting indefinitely for a reason to close.
+Segmentation is **lossless**: text is split only on character boundaries,
+never truncated to fit a cap, and the chunk after a cut opens a fresh streak
+rather than losing the tail of the one before it.
+
+### Bounded silent resume; `Reset … Ready` is the *reseed* bracket only
+
+opencode has no cursor, so every reconnect refolds its whole transcript from
+the top, and `Reset … Ready` exists purely to make that invisible to the
+panel. gx has `Last-Event-ID`, so a reconnect the server accepts from the
+client's cursor resumes **silently** — no `Reset` at all: the ring, the open
+streak, the generation and the panel's view all survive untouched. That
+silent path is bounded — at most three attempts within thirty seconds of the
+first loss — past which, or on an explicit server `reset`, or on a cursor the
+server no longer recognizes, the adapter **reseeds**: the open streak is
+discarded, history is rebuilt from scratch, and the rebuild is bracketed with
+`Reset … Ready` exactly as opencode's reconnect always is. `Reset.reason`
+(`connect`, `cursor_lost`, `server_reset:<r>`, `stall`) is free text for a log
+line — nothing switches on it.
+
+Either way, **every** reconnect — silent or not — re-fetches what the SSE
+stream itself never replays (approvals, the session row), because a resumed
+stream is not a complete one; a held-pending approval the re-fetch no longer
+lists comes back as a `Resolved` tombstone rather than staying stuck on
+screen forever. Repairing the transport (re-establishing an SSH forward) is
+not a `LaneEvent` either — it rides the `GxTransport::dial()` hook described
+above, called before every connect attempt, so a forward that needed
+re-ensuring never forces a visible reseed on its own.
+
+### The `option_for` ambiguity refusal
+
+This is the headline contract change, and it exists because of a real gx
+permission recorded live, not a hypothetical one: asked to run `id -un`, a
+live gx leader offered **five** options, and **two of them** declared
+`kind: "allow_once"` — "Yes, proceed" and "Yes, and don't ask again for
+anything (always-approve mode)". `LaneApprovalOption.kind` is the option's
+*semantic* kind (`allow_once` / `allow_always` / `reject_once` /
+`reject_always`); `id` is opaque and independent of it — an agent can offer
+several options of the same kind, so a bare decision
+(`AllowOnce` / `AllowAlways` / `Reject`) is not always enough to pick one.
+When it is ambiguous, `LaneApproval::option_for` **refuses to guess** — it
+returns `None`, and the adapter answers `BadRequest` — rather than resolving
+the tie by offered order, which on gx's own five-option set would have
+silently selected the option that turns off every future permission prompt.
+
+The panel's answer is capability-driven, not a fixed three-decision form: it
+renders every option an approval offers, under the agent's own label, in the
+agent's own order, and posts back `LaneAnswer::Choice { option_id }` — the
+exact id the human pressed — for every adapter. Clients send
+`{choice: "<id>"}` over IPC. opencode's three options carry the same labels
+either way, so nothing visibly changes there, and the scripted
+`{permission: "allow-once"}` form still works when the kind it names is
+unambiguous on the approval being answered.
+
+### Lane-less grok
+
+`RcKind::Grok` — a `gx` session with no bound lane, or one started
+`--no-leader` / under `GX_REMOTE_DISABLE=1` — is creatable and renders as an
+ordinary status-only row, same as any RC kind before agent lanes existed: no
+Transcript affordance, because there is no lane to open.
+
+### Deferred: free-text question answers
+
+gx keys a question's answer set by the question's own text and accepts a list
+of chosen labels; a free-text reply is really the label `"Other"` plus an
+annotation the label list has nowhere to carry. The contract has no field for
+that annotation yet, so free-text answers are not supported against gx in
+this cut — `custom` stays `false`. Filed as a follow-up alongside the phone's
+DTO mirror.
+
 ## Driving a lane
 
 Once a row carries `agent_lane`, opening its Transcript affordance calls
@@ -144,15 +322,17 @@ Once a row carries `agent_lane`, opening its Transcript affordance calls
 | `lane.open` | Ensures a subscription (idempotent — a second call for an already-open lane re-answers from the existing entry). |
 | `lane.messages` | The staged transcript: up to the last 500 rows, current activity, generation, and a `stale` reason when the lane is `Down`. |
 | `lane.approvals` | Pending permissions and questions, root session plus its children. |
-| `lane.send` | Queues a prompt. |
+| `lane.send` | Queues a prompt (`mode: queue`), or preempts the turn in flight (`mode: interject`) when the lane advertises `interject` — the panel shows the toggle only then, and only enables it while the turn is `Working`. |
 | `lane.cancel` | Aborts the turn in flight. |
-| `lane.answer` | Answers one approval — a permission decision (`allow-once` / `allow-always` / `reject`) or a question's options plus optional free text. |
+| `lane.answer` | Answers one approval. The scripted three-decision form (`{permission: "allow-once" \| "allow-always" \| "reject"}`) or a question's options plus optional free text still works when it is unambiguous; the panel itself always sends `{choice: "<id>"}` — the exact option id the approval offered — because an agent can offer several options of the same decision kind (see [gx's `option_for` refusal](#the-option_for-ambiguity-refusal)). |
 | `lane.close` | Ends the subscription; the last close on a shared SSH forward tears it down. |
 
 A failure comes back as `{code, message}` with the contract's own snake_case
 codes (`unauthorized`, `unknown_session`, `unknown_approval`,
 `already_submitted`, `already_resolved`, `not_accepting`, `unavailable`,
-`failed`), plus `no_lane` for a row with no `agent_lane` stamp at all.
+`failed`), plus `no_lane` for a row with no `agent_lane` stamp at all and
+`unsupported_lane` for a row whose `agent_lane.kind` names no adapter this
+build has.
 
 ## The password / status-only rule
 

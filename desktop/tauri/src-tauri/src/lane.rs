@@ -1,25 +1,47 @@
 //! **Agent lanes in the desktop app** — the client half of
-//! [`shed_core::lane`] (plan 015 §3.4).
+//! [`shed_core::lane`] (plan 015 §3.4, plan 017 §3.5).
 //!
-//! A machine row whose roost tab reported an opencode server carries an
-//! `agent_lane` stamp ([`crate::machines::machine_row`]). This module is what
-//! that stamp makes possible: open a live transcript for one agent session, send
-//! it a prompt, cancel its turn, and answer the permissions and questions it is
-//! blocked on — over [`shed_opencode`], which implements
-//! [`shed_core::lane::AgentLane`] against the session's OWN HTTP server.
+//! A machine row whose roost tab reported an agent's control surface carries an
+//! `agent_lane` stamp ([`crate::machines::machine_row`], derived by
+//! [`shed_core::roost::RoostSession::agent_lane`]). This module is what that
+//! stamp makes possible: open a live transcript for one agent session, send it a
+//! prompt, cancel its turn, and answer the permissions and questions it is
+//! blocked on.
 //!
 //! ```text
-//! machine row  --agent_lane{session_id, server_url}-->  Lanes::open
+//! machine row  --agent_lane{kind, session_id, server_url}-->  Lanes::open
 //!                                                          |
 //!            ReachKind::Local   -> dial server_url          |
 //!            ReachKind::Ssh(e)  -> SshForward::reserve_for  |
 //!                                                          v
-//!                                              OpencodeClient (AgentLane)
+//!                              match stamp.kind {  "opencode" => OpencodeClient,
+//!                                                  "gx"       => GxClient,
+//!                                                  other      => UnsupportedLane }
+//!                                                          |
+//!                                              Arc<dyn AgentLane>
 //!                                                          |
 //!                                       subscribe() -> Reset … Ready … frames
 //!                                                          |
 //!                                     LaneView (staged, then swapped) + `lane-event`
 //! ```
+//!
+//! # One trait, two adapters — and the line the dispatch draws
+//!
+//! [`LaneEntry`] holds an `Arc<dyn AgentLane>`, and the ONLY place in this app
+//! that names a concrete client type is the `match` in [`Lanes::open`]. That is
+//! the whole point of plan 017: everything below the match — the pump, the view,
+//! the tunnel bookkeeping, the six IPC verbs — is written against the contract,
+//! so the third adapter is a `match` arm rather than a refactor.
+//!
+//! An entry is keyed and evicted by the FULL stamp, `(kind, server_url)`. A tab
+//! that restarts as a different agent on the same loopback port is a different
+//! lane, and an entry compared on the URL alone would survive it and keep
+//! pumping the wrong adapter at it.
+//!
+//! A `kind` this build has no adapter for is [`LaneFailure::UnsupportedLane`] —
+//! refused BY NAME rather than silently rendered as no lane at all, because the
+//! stamp's own doc makes that the client's obligation: shed-core may learn to
+//! stamp a kind before a given desktop binary learns to speak it.
 //!
 //! # Two transports, one seam
 //!
@@ -103,14 +125,43 @@
 //! generation restarts at 1, and a number that went backwards would tell a
 //! client to discard current frames as stale.
 //!
-//! # Credentials
+//! # Credentials — the client's job, deliberately
 //!
-//! There are none in this cut. A password-protected opencode answers 401, which
-//! surfaces as [`LaneError::Unauthorized`] and a status-only panel.
-//! [`shed_opencode::BasicAuth`] exists for the follow-up that adds a config
-//! field; nothing here can supply one, and no test claims otherwise.
+//! The contract has no seat for a credential (plan 017 §3.1 #5): roost carries
+//! only WHERE an agent is, never how to be let in. So an adapter that needs one
+//! takes it at construction from a source the client supplies, and this module
+//! is that client.
+//!
+//! * **opencode** needs none. A password-protected server answers 401, which
+//!   surfaces as [`LaneError::Unauthorized`] and a status-only panel.
+//!   [`shed_opencode::BasicAuth`] exists for the follow-up that adds a config
+//!   field; nothing here can supply one, and no test claims otherwise.
+//! * **gx** needs a bearer on every route but `healthz`, and both the token and
+//!   the discovery record live on the host that RUNS gx. [`TauriGxCredentials`]
+//!   reads them the way that host allows: directly off the filesystem when the
+//!   machine is local, and over the reach with
+//!   [`shed_gx::PROBE_SCRIPT`] when it is not. The token is a
+//!   [`shed_gx::GxToken`] from the moment it exists, so nothing here can print
+//!   it; see that type and [`TauriGxCredentials`]'s own doc for the rules.
+//!
+//! # Transport repair, and why gx does not need a `Reset` for it
+//!
+//! [`Lanes::spawn_pump`] re-`ensure`s the forward on every `Reset` after the
+//! first, which is how a dead `ssh -N` child under an ESTABLISHED opencode lane
+//! gets respawned — the adapter announces each reconnect attempt with a `Reset`,
+//! and that announcement is the cadence.
+//!
+//! gx reconnects SILENTLY when its cursor resume is accepted: no `Reset`, same
+//! generation, the panel untouched (plan 017 §3.1 #1). There is therefore no
+//! frame for the pump to hang a repair on, and inventing one would defeat the
+//! feature. Instead the repair rides [`shed_gx::GxTransport`]:
+//! [`TauriTransport::dial`] re-`ensure`s the forward and answers the local end,
+//! and `GxClient` calls it before every connect. The pump's `Reset` handler
+//! stays exactly as it was — harmless for gx (a reseed ensures twice), essential
+//! for opencode.
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::time::Duration;
 
@@ -124,6 +175,8 @@ use shed_core::lane::{
     LaneSession, SendMode,
 };
 use shed_core::rc::{RcActivity, RcFeedMessage};
+use shed_core::roost::AgentLaneStamp;
+use shed_gx::{FixedDial, GxClient, GxCredentialSource, GxDiscovery, GxTimings, GxTransport};
 use shed_opencode::OpencodeClient;
 
 use crate::machines::{Machines, ReachKind};
@@ -174,6 +227,17 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// The `agent_lane` kinds THIS BUILD has an adapter for.
+///
+/// One list, two readers: [`Lanes::open`]'s pre-reserve guard and
+/// [`LaneFailure::message`]'s refusal. The `match` in `Lanes::open` is
+/// deliberately NOT a third — it is where a kind binds to a constructor, which
+/// is the one place a concrete client type may be named — but the guard and the
+/// human message are the same fact twice, and the message is the copy that rots
+/// silently: a third adapter that forgot it would go on claiming this build
+/// speaks two.
+const LANE_KINDS: [&str; 2] = ["opencode", "gx"];
+
 /// What a `lane.*` op can fail with.
 ///
 /// [`LaneError`]'s variants map straight onto the IPC error envelope with the
@@ -186,6 +250,20 @@ pub enum LaneFailure {
     /// which is what a caller does something different about; the message says
     /// which.
     NoLane(String),
+    /// The row DOES carry a lane, and this build has no adapter for its kind.
+    ///
+    /// Distinct from [`LaneFailure::NoLane`] on purpose, and the distinction is
+    /// the point: `no_lane` means "there is nothing to open here", which is a
+    /// permanent property of the row, and a client renders no affordance for it.
+    /// `unsupported_lane` means "there IS something here and I cannot speak to
+    /// it" — a client can say so, and a NEWER build of this app may well be able
+    /// to. [`shed_core::roost::AgentLaneStamp`]'s doc makes refusing by name the
+    /// client's obligation for exactly this reason: shed-core can learn to stamp
+    /// a kind before every binary that reads the stamp learns to speak it.
+    ///
+    /// Carries the kind verbatim, because the whole value of the variant is
+    /// naming what was refused.
+    UnsupportedLane(String),
     /// The adapter (or the transport under it) said no.
     Lane(LaneError),
 }
@@ -208,6 +286,7 @@ impl LaneFailure {
     pub fn code(&self) -> &'static str {
         match self {
             LaneFailure::NoLane(_) => "no_lane",
+            LaneFailure::UnsupportedLane(_) => "unsupported_lane",
             LaneFailure::Lane(e) => match e {
                 LaneError::Unauthorized => "unauthorized",
                 LaneError::BadRequest(_) => "bad_request",
@@ -226,6 +305,11 @@ impl LaneFailure {
     pub fn message(&self) -> String {
         match self {
             LaneFailure::NoLane(m) => m.clone(),
+            LaneFailure::UnsupportedLane(kind) => format!(
+                "this build has no adapter for agent lanes of kind {kind:?} \
+                 (it speaks {})",
+                LANE_KINDS.join(" and ")
+            ),
             LaneFailure::Lane(e) => e.to_string(),
         }
     }
@@ -398,8 +482,10 @@ impl LaneView {
 /// open is still in flight — is unreachable in a test that has to stand up a
 /// roost snapshot and spawn a real `ssh -N` child first.
 pub trait LaneMachines: Send + Sync {
-    /// Agent session id → `server_url`, for every lane this machine exposes.
-    fn agent_lanes(&self, machine: &str) -> BTreeMap<String, String>;
+    /// Agent session id → its [`AgentLaneStamp`], for every lane this machine
+    /// exposes. The WHOLE stamp: `kind` picks the adapter, `server_url` is the
+    /// reported URL, and the pair of them is the eviction key.
+    fn agent_lanes(&self, machine: &str) -> BTreeMap<String, AgentLaneStamp>;
 
     /// How this machine is reached — the lane's transport choice.
     fn reach_kind(&self, machine: &str) -> Result<ReachKind, String>;
@@ -418,7 +504,7 @@ pub trait LaneMachines: Send + Sync {
 }
 
 impl LaneMachines for Machines {
-    fn agent_lanes(&self, machine: &str) -> BTreeMap<String, String> {
+    fn agent_lanes(&self, machine: &str) -> BTreeMap<String, AgentLaneStamp> {
         Machines::agent_lanes(self, machine)
     }
 
@@ -470,6 +556,12 @@ impl OwnedForward {
     /// caller here turns it into anyway.
     async fn ensure(&self) -> Result<(), String> {
         self.get().ensure().await.map_err(|e| e.to_string())
+    }
+
+    /// [`MachineForward::looks_alive`] — the cheap check
+    /// [`TauriTransport::dial`] gates on.
+    fn looks_alive(&self) -> bool {
+        self.get().looks_alive()
     }
 }
 
@@ -536,11 +628,11 @@ impl Drop for ForwardShare {
 /// nothing — after which the open committed anyway, leaving a live subscription
 /// (and possibly an `ssh` child) behind a panel the user had already closed.
 struct Pending {
-    /// The `server_url` this open is building against. `reconcile` compares it
-    /// to the fresh snapshot by exactly the same rule it judges a committed
-    /// entry by: a row that now reports a different port makes this open
-    /// obsolete before it ever commits.
-    server_url: String,
+    /// The stamp this open is building against. `reconcile` compares it to the
+    /// fresh snapshot by exactly the same rule it judges a committed entry by: a
+    /// row that now reports a different port — or a different AGENT on the same
+    /// port — makes this open obsolete before it ever commits.
+    stamp: AgentLaneStamp,
     /// Set by `close`/`reconcile` when the key stopped being wanted. Read under
     /// the same lock acquisition that inserts the entry, so the decision cannot
     /// be raced.
@@ -606,9 +698,11 @@ impl Drop for GateGuard {
 // ---------------------------------------------------------------------------
 
 struct LaneEntry {
-    /// The `server_url` this entry was opened against. The eviction key for a
-    /// restarted tab: a new port means a different server, not a reconnect.
-    server_url: String,
+    /// The stamp this entry was opened against — the eviction key for a
+    /// restarted tab. A new port means a different server, not a reconnect; and
+    /// a new KIND on the same port means a different agent, which is the half
+    /// the URL alone used to miss.
+    stamp: AgentLaneStamp,
     /// This entry's share of the tunnel it rides, if any. `None` for a local
     /// lane. Taken by [`LaneEntry::retire`] rather than waited for: an op
     /// holding a clone of the `Arc<LaneEntry>` across an await must not be able
@@ -618,7 +712,10 @@ struct LaneEntry {
     /// idempotent rather than a second round trip.
     session: LaneSession,
     capabilities: LaneCapabilities,
-    client: Arc<OpencodeClient>,
+    /// The adapter, as the CONTRACT. Every verb below reaches the agent through
+    /// this trait object; the concrete type was chosen once, in
+    /// [`Lanes::open`]'s match, and is deliberately not knowable from here.
+    client: Arc<dyn AgentLane>,
     view: Arc<Mutex<LaneView>>,
     /// The supervision loop. Shares nothing with this struct but the view, so
     /// there is no reference cycle and dropping the entry really does end it.
@@ -665,6 +762,42 @@ struct Inner {
 /// The open gates, by key. See [`Lanes::gates`] and [`GateGuard`].
 type Gates = HashMap<Key, Arc<tokio::sync::Mutex<()>>>;
 
+/// What the gx adapter needs from the process environment, in one value.
+///
+/// A struct rather than two arguments so a third gx knob does not change every
+/// construction site, and `Default` so a test that is not about gx says nothing
+/// about it.
+#[derive(Debug, Clone, Default)]
+pub struct GxConfig {
+    /// [`crate::env::Env::gx_home`] — the RESOLVED directory the LOCAL reader
+    /// looks in. Which of the three candidates won is `env.rs`'s decision and
+    /// only `env.rs`'s: this layer reads no environment of its own, which is
+    /// what keeps the test-mode gate in one place.
+    ///
+    /// `Default` is the empty path, which no reader can find a record under —
+    /// the right answer for a test that is not about gx, and a loud one for a
+    /// test that is and forgot to say so.
+    pub home: PathBuf,
+    /// [`crate::env::Env::gx_timings`] — the adapter's windows, shrunk by the
+    /// harness so a cell does not wait out a thirty-second stall.
+    pub timings: GxTimings,
+}
+
+/// The gx discovery cache: `(machine, reported_url)` → what the last successful
+/// read found there. See [`TauriGxCredentials`] for the rule that governs it.
+type GxCache = Arc<Mutex<HashMap<(String, String), GxDiscovery>>>;
+
+/// How many `(machine, reported_url)` pairs [`GxCache`] keeps before it is
+/// cleared wholesale.
+///
+/// Bounded for two reasons. It is a map that would otherwise only grow — the
+/// [`Lanes::gates`] lesson — and, unlike the gates map, every value in it is a
+/// BEARER TOKEN. Keys turn over whenever a gx leader restarts onto a new
+/// ephemeral port, so a long-lived app would otherwise accumulate the tokens of
+/// every leader it had ever seen. Sixteen is far more than the number of gx
+/// lanes a person has open and small enough that the tokens do not linger.
+const MAX_GX_CACHE: usize = 16;
+
 /// Where a lane frame goes on its way to the UI.
 ///
 /// A closure rather than the [`AppHandle`] itself so the ownership rules below
@@ -693,10 +826,19 @@ pub struct Lanes {
     /// and a map that only grows is a leak reachable by anyone who can name a
     /// machine and a session.
     gates: Arc<Mutex<Gates>>,
+    /// The gx adapter's environment — see [`GxConfig`].
+    gx: GxConfig,
+    /// Discovery, cached across opens. See [`TauriGxCredentials`].
+    gx_cache: GxCache,
 }
 
 impl Lanes {
-    pub fn new(handle: tokio::runtime::Handle, app: AppHandle, machines: Arc<Machines>) -> Lanes {
+    pub fn new(
+        handle: tokio::runtime::Handle,
+        app: AppHandle,
+        machines: Arc<Machines>,
+        gx: GxConfig,
+    ) -> Lanes {
         let sink: EventSink =
             Arc::new(move |machine: &str, session_id: &str, event: &LaneEvent| {
                 let _ = app.emit(
@@ -704,13 +846,14 @@ impl Lanes {
                     json!({ "machine": machine, "session_id": session_id, "event": event }),
                 );
             });
-        Lanes::with_sink(handle, sink, machines)
+        Lanes::with_sink(handle, sink, machines, gx)
     }
 
     fn with_sink(
         handle: tokio::runtime::Handle,
         sink: EventSink,
         machines: Arc<dyn LaneMachines>,
+        gx: GxConfig,
     ) -> Lanes {
         Lanes {
             handle,
@@ -718,6 +861,8 @@ impl Lanes {
             machines,
             inner: Arc::new(Mutex::new(Inner::default())),
             gates: Arc::new(Mutex::new(Gates::new())),
+            gx,
+            gx_cache: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -727,8 +872,9 @@ impl Lanes {
     ///
     /// **Idempotent.** A second call for a key that is already open re-answers
     /// from the entry; it does not open a second subscription. A call for a key
-    /// whose row now reports a DIFFERENT `server_url` evicts the stale entry and
-    /// opens against the new one — that is a restarted tab, not a reconnect.
+    /// whose row now reports a DIFFERENT stamp — another port, or another agent
+    /// on the same port — evicts the stale entry and opens against the new one:
+    /// that is a restarted tab, not a reconnect.
     ///
     /// **Transactional.** See the module doc: everything it builds is owned
     /// while it builds it, and it commits under the same lock acquisition that
@@ -743,7 +889,7 @@ impl Lanes {
         // `lane.open` with junk (or with the session ids of a machine whose tabs
         // churn) used to mint a gate per call and keep it for the life of the
         // process.
-        self.lane_url(machine, session_id)?;
+        self.lane_stamp(machine, session_id)?;
         let gate = self.gate(&key);
         let _serialized = gate.lock().await;
 
@@ -751,39 +897,96 @@ impl Lanes {
         // uses: the pre-gate one was read before waiting, and waiting is exactly
         // when a tab restarts onto a new port or goes away. Using it would open
         // a lane against a socket the snapshot has already retired.
-        let server_url = self.lane_url(machine, session_id)?;
+        let stamp = self.lane_stamp(machine, session_id)?;
         if let Some(entry) = self.entry(&key) {
-            if entry.server_url == server_url {
+            if entry.stamp == stamp {
                 return Ok(entry.opened());
             }
             self.evict(&key);
         }
 
+        // Refused BEFORE anything is reserved. A kind with no adapter is a
+        // permanent property of the row, so there is no reason to spend an ssh
+        // child and a readiness poll discovering it.
+        if !LANE_KINDS.contains(&stamp.kind.as_str()) {
+            return Err(LaneFailure::UnsupportedLane(stamp.kind.clone()));
+        }
+
         // Declared BEFORE the first await, so a `close` or a `reconcile` landing
         // anywhere below has something to cancel.
-        let _pending = self.declare(&key, &server_url);
+        let _pending = self.declare(&key, &stamp);
 
-        let kind = self
+        let reach = self
             .machines
             .reach_kind(machine)
             .map_err(|e| LaneFailure::Lane(LaneError::Unavailable(e)))?;
         // Reserved, not merely created: from here every `?` gives the share back
         // (and with it the `ssh` child, if this open was its only user).
-        let (base_url, forward) = self.transport(machine, &kind, &server_url).await?;
+        let (base_url, forward) = self.transport(machine, &reach, &stamp.server_url).await?;
 
-        let url = reqwest::Url::parse(&base_url).map_err(|e| {
-            LaneFailure::Lane(LaneError::BadRequest(format!(
-                "the reported agent server {server_url:?} is not a usable URL: {e}"
-            )))
-        })?;
-        // No credential source in this cut — see the module doc.
-        let client = Arc::new(OpencodeClient::new(url, None)?);
+        // **The one place this app names a concrete adapter.** Everything after
+        // it is written against `dyn AgentLane`; see the module doc.
+        let client: Arc<dyn AgentLane> = match stamp.kind.as_str() {
+            "opencode" => {
+                let url = reqwest::Url::parse(&base_url).map_err(|e| {
+                    LaneFailure::Lane(LaneError::BadRequest(format!(
+                        "the reported agent server {:?} is not a usable URL: {e}",
+                        stamp.server_url
+                    )))
+                })?;
+                // No credential source — see the module doc.
+                Arc::new(OpencodeClient::new(url, None)?)
+            }
+            "gx" => {
+                // The REPORTED url goes to the client (it is what a discovery
+                // record is matched against); the DIAL url is the transport's
+                // business, resolved fresh before every connect.
+                //
+                // Local is shed-gx's own `FixedDial` — its loopback is ours, so
+                // there is nothing to ensure. Forwarded is the one that has to
+                // re-`ensure` a tunnel, which is all `TauriTransport` is for.
+                let transport: Arc<dyn GxTransport> = match forward.as_ref() {
+                    None => Arc::new(FixedDial::parse(&base_url).map_err(LaneFailure::Lane)?),
+                    Some(share) => Arc::new(TauriTransport::new(share)),
+                };
+                let credentials = TauriGxCredentials::new(
+                    machine,
+                    &stamp.server_url,
+                    &reach,
+                    &self.gx,
+                    Arc::clone(&self.gx_cache),
+                );
+                Arc::new(GxClient::new(
+                    stamp.server_url.clone(),
+                    transport,
+                    Arc::new(credentials),
+                    self.gx.timings.clone(),
+                )?)
+            }
+            // Unreachable: the guard above ran before anything was reserved.
+            // Restated rather than `unreachable!()` so that adding a kind to one
+            // list and forgetting the other is a refusal, not a panic.
+            other => return Err(LaneFailure::UnsupportedLane(other.to_string())),
+        };
         // The roster row is fetched BEFORE the subscription starts: a 404 here
         // is an honest `unknown_session` the caller can render, where the same
         // failure inside the pump would be a `Down` the panel has to wait for.
         // It is also the last await, and the one that fails on a
-        // password-protected agent — hence the share above.
-        let session = client.session(session_id).await?;
+        // password-protected agent (and, on gx, the one that discovers and pins
+        // the credential) — hence the share above.
+        let session = match client.session(session_id).await {
+            Ok(session) => session,
+            Err(e) => {
+                // A credential the cache handed out and the agent then refused
+                // must not be handed out again — otherwise a rotated token
+                // wedges every future open on this lane. See
+                // [`TauriGxCredentials`].
+                if matches!(e, LaneError::Unauthorized) {
+                    self.forget_gx_credentials(machine, &stamp.server_url);
+                }
+                return Err(e.into());
+            }
+        };
         let capabilities = client.capabilities();
 
         let view = Arc::new(Mutex::new(LaneView::default()));
@@ -806,7 +1009,7 @@ impl Lanes {
             forward.as_ref().map(ForwardShare::weak),
         );
         let entry = Arc::new(LaneEntry {
-            server_url,
+            stamp,
             forward: Mutex::new(forward),
             session,
             capabilities,
@@ -880,17 +1083,17 @@ impl Lanes {
     }
 
     /// Reconcile one machine's open lanes against a fresh roost snapshot: evict
-    /// every entry whose tab is gone or whose `server_url` moved.
+    /// every entry whose tab is gone or whose STAMP moved.
     ///
     /// See [`crate::machines::OnLanes`] for why the snapshot is the signal.
-    pub fn reconcile(&self, machine: &str, lanes: &BTreeMap<String, String>) {
+    pub fn reconcile(&self, machine: &str, lanes: &BTreeMap<String, AgentLaneStamp>) {
         let gone: Vec<Arc<LaneEntry>> = {
             let mut inner = lock(&self.inner);
             // Opens still in flight are judged by the SAME rule as committed
             // entries. Without this a tab that went away mid-open would be
             // resurrected by the open that was already past the check.
             for (key, pending) in inner.pending.iter_mut() {
-                if key.0 == machine && lanes.get(&key.1) != Some(&pending.server_url) {
+                if key.0 == machine && lanes.get(&key.1) != Some(&pending.stamp) {
                     pending.cancelled = true;
                 }
             }
@@ -901,7 +1104,7 @@ impl Lanes {
                 }
                 let keep = lanes
                     .get(session_id)
-                    .is_some_and(|url| url == &entry.server_url);
+                    .is_some_and(|stamp| stamp == &entry.stamp);
                 if !keep {
                     gone.push(Arc::clone(entry));
                 }
@@ -918,11 +1121,11 @@ impl Lanes {
     // ---- internals ----
 
     /// Declare an open in flight for `key`. See [`Pending`].
-    fn declare(&self, key: &Key, server_url: &str) -> PendingGuard {
+    fn declare(&self, key: &Key, stamp: &AgentLaneStamp) -> PendingGuard {
         lock(&self.inner).pending.insert(
             key.clone(),
             Pending {
-                server_url: server_url.to_string(),
+                stamp: stamp.clone(),
                 cancelled: false,
             },
         );
@@ -948,6 +1151,17 @@ impl Lanes {
         }
     }
 
+    /// Drop the cached gx credential for a lane, so the next open re-reads it.
+    ///
+    /// Called when the agent REFUSED what the cache handed out — see
+    /// [`TauriGxCredentials`]. A no-op for a kind with no cache entry
+    /// (opencode), and for a key that was a miss anyway, which is why it is not
+    /// gated on the stamp's kind: "forget any credential we cached for this
+    /// lane" is true and cheap to say for every adapter.
+    fn forget_gx_credentials(&self, machine: &str, reported_url: &str) {
+        lock(&self.gx_cache).remove(&(machine.to_string(), reported_url.to_string()));
+    }
+
     fn entry(&self, key: &Key) -> Option<Arc<LaneEntry>> {
         lock(&self.inner).entries.get(key).map(Arc::clone)
     }
@@ -962,7 +1176,7 @@ impl Lanes {
         // a caller does the same thing about both (there is no transcript here),
         // and a second code would be one more thing for a client to branch on
         // for no behavioural difference.
-        match self.lane_url(machine, session_id) {
+        match self.lane_stamp(machine, session_id) {
             Err(e) => Err(e),
             Ok(_) => Err(LaneFailure::NoLane(format!(
                 "no lane is open for session {session_id:?} on machine {machine:?} — \
@@ -971,8 +1185,8 @@ impl Lanes {
         }
     }
 
-    /// The `server_url` this row reports, or `no_lane`.
-    fn lane_url(&self, machine: &str, session_id: &str) -> Result<String, LaneFailure> {
+    /// The [`AgentLaneStamp`] this row reports, or `no_lane`.
+    fn lane_stamp(&self, machine: &str, session_id: &str) -> Result<AgentLaneStamp, LaneFailure> {
         self.machines
             .agent_lanes(machine)
             .remove(session_id)
@@ -992,10 +1206,13 @@ impl Lanes {
     async fn transport(
         &self,
         machine: &str,
-        kind: &ReachKind,
+        // `reach`, not `kind`: since plan 017 a lane has TWO kinds, and the one
+        // that decides the transport is the machine's reach, not the row's
+        // adapter token.
+        reach: &ReachKind,
         server_url: &str,
     ) -> Result<(String, Option<ForwardShare>), LaneFailure> {
-        let entry = match kind {
+        let entry = match reach {
             // Its loopback is ours.
             ReachKind::Local => return Ok((server_url.to_string(), None)),
             ReachKind::Ssh(entry) => entry,
@@ -1077,6 +1294,19 @@ impl Lanes {
     /// away. On a remote machine, re-`ensure`ing the forward is what respawns a
     /// dead `ssh -N` child before redialing.
     ///
+    /// **gx does not depend on the second of those for the common case, and must
+    /// not have to.** Its bounded silent resume emits no `Reset` at all, so a
+    /// dead `ssh` child is caught by [`TauriTransport::dial`] instead — see the
+    /// module doc.
+    ///
+    /// It is still load-bearing for gx, though, and for the one case `dial`
+    /// cannot see: a child that is ALIVE but no longer listening. `dial`'s cheap
+    /// check calls that healthy, so requests fail, the watcher exhausts its
+    /// silent resumes and reseeds — and the reseed's `Reset` lands here, where
+    /// the full `ensure` (port probe included) repairs it. The two mechanisms
+    /// are the fast path and the backstop, and this loop needs no knowledge of
+    /// which adapter it is pumping to run either.
+    ///
     /// **Two places re-`ensure`, and the second one is the one that matters.**
     /// Before subscribing is the obvious one. But once a subscription has
     /// connected, the adapter retries transport failures INTERNALLY and
@@ -1094,7 +1324,7 @@ impl Lanes {
         &self,
         machine: String,
         session_id: String,
-        client: Arc<OpencodeClient>,
+        client: Arc<dyn AgentLane>,
         view: Arc<Mutex<LaneView>>,
         forward: Option<Weak<OwnedForward>>,
     ) -> tokio::task::JoinHandle<()> {
@@ -1228,6 +1458,362 @@ fn next_backoff(current: Duration) -> Duration {
     std::cmp::min(current.saturating_mul(2), RESUBSCRIBE_MAX)
 }
 
+// ---------------------------------------------------------------------------
+// gx: the transport hook and the credential source
+// ---------------------------------------------------------------------------
+
+/// **The desktop's [`GxTransport`] for a FORWARDED lane** — re-`ensure` the
+/// tunnel, answer its local end.
+///
+/// gx calls this before every connect, which is what lets a forward be repaired
+/// without the contract growing an event for it (module doc, "Transport repair").
+///
+/// # It is called per REQUEST, so the healthy path has to be free
+///
+/// [`shed_gx::GxTransport`]'s own doc states the requirement: *"The desktop's is
+/// a cache read behind a lock when nothing is wrong … a hook that did real work
+/// per call would make every verb pay for a tunnel that is fine."* So this gates
+/// on [`MachineForward::looks_alive`] — a `try_wait` on the `ssh` child, no
+/// network — and only calls [`MachineForward::ensure`] when that says the child
+/// is gone. Calling `ensure` unconditionally meant a blocking loopback connect,
+/// under a lock, before every gx verb; on a reconnect ladder with a 100 ms floor
+/// that is about ten of them a second per down lane.
+///
+/// The port is read AFTER any ensure, not cached at construction: `ensure` is
+/// what makes the port mean something, and reading it afterwards is what keeps
+/// this correct if a forward ever re-reserves.
+///
+/// **The residual, and what covers it.** `looks_alive` is a proxy: a child that
+/// is alive but has stopped listening reads as healthy, so this returns a URL
+/// that will not answer. `ExitOnForwardFailure=yes` makes that a state `ssh`
+/// does not reach on its own (a broken forward takes the child with it), and
+/// when it does happen the requests fail, the watcher exhausts its silent
+/// resumes and reseeds, and the reseed's `Reset` drives
+/// [`Lanes::spawn_pump`]'s re-`ensure` — the authoritative check, port probe and
+/// all. That is why the pump's `Reset` handler is load-bearing for gx too, not
+/// merely harmless.
+///
+/// **A LOCAL lane does not use this type at all** — it is [`shed_gx::FixedDial`],
+/// which that crate wrote for exactly this case ("a lane on this machine") and
+/// already re-exports. Its loopback is ours: there is nothing to ensure and
+/// nothing to move, so a second hand-rolled "hold one parsed URL and answer it"
+/// here would only be a copy that can drift.
+///
+/// The handle is **weak**, exactly like the pump's. A transport is owned by the
+/// `GxClient`, which is owned by the [`LaneEntry`] — so a strong reference would
+/// keep an `ssh` child alive past the eviction that took the entry's share away,
+/// which is the one thing [`LaneEntry::retire`] exists to prevent. A failed
+/// upgrade is how a dial learns its lane is gone, and it reads as `Unavailable`
+/// like every other "this transcript is not live".
+struct TauriTransport(Weak<OwnedForward>);
+
+impl TauriTransport {
+    fn new(share: &ForwardShare) -> TauriTransport {
+        TauriTransport(share.weak())
+    }
+}
+
+#[async_trait::async_trait]
+impl GxTransport for TauriTransport {
+    async fn dial(&self) -> Result<reqwest::Url, LaneError> {
+        let forward = self
+            .0
+            .upgrade()
+            .ok_or_else(|| LaneError::Unavailable("this lane's tunnel was released".to_string()))?;
+        // The cheap check first; `ensure` only when it says there is something
+        // to fix. See the type doc.
+        if !forward.looks_alive() {
+            forward.ensure().await.map_err(LaneError::Unavailable)?;
+        }
+        let port = forward.port();
+        reqwest::Url::parse(&format!("http://127.0.0.1:{port}/"))
+            .map_err(|e| LaneError::Unavailable(format!("the tunnel's local url: {e}")))
+    }
+}
+
+/// How the SSH half of gx discovery runs its probe.
+///
+/// A boxed async closure rather than a direct call to
+/// [`shed_app::machine::exec`], so the ONE rule this path has — **`exec`'s error
+/// string is never forwarded** — can be asserted against an error that really
+/// does carry a token, without an sshd and without a real machine.
+type ProbeFuture =
+    std::pin::Pin<Box<dyn std::future::Future<Output = Result<String, String>> + Send>>;
+/// See [`ProbeFuture`].
+type ProbeRunner = Arc<dyn Fn() -> ProbeFuture + Send + Sync>;
+
+/// The two ways to read gx's credentials, one per reach.
+enum GxSource {
+    /// `ReachKind::Local` — read the files. **Never shells out**: the reader is
+    /// [`shed_gx::local_discovery`], which makes the same checks gx's own reader
+    /// makes (regular file, mode `0600`, owned by us) and resolves the token's
+    /// path from the RECORD rather than by guessing a filename.
+    Local { home: PathBuf, uid: u32 },
+    /// `ReachKind::Ssh` — run [`shed_gx::PROBE_SCRIPT`] over the reach and parse
+    /// what it printed. The trust boundary on the far side is *the same UID on
+    /// that host*, which is precisely the boundary roost's own socket has.
+    Ssh(ProbeRunner),
+}
+
+/// **Where the gx lane's bearer token comes from**, and the app's implementation
+/// of the seam the contract deliberately does not have (plan 017 §3.3).
+///
+/// # The caching rule, and why it is "once"
+///
+/// Discovery is cached per `(machine, reported_url)` in a map shared by every
+/// lane ([`Lanes::gx_cache`]), because a probe over SSH is a whole round trip
+/// and a machine's second open should not pay for it again.
+///
+/// But `GxClient::ensure_pinned` asks TWICE when it has to: it compares the
+/// discovered `instanceId` against `healthz`, and on a mismatch it calls
+/// `discover` once more before giving up. That second ask exists precisely
+/// because the first answer was wrong — a leader restarted, and its
+/// `instanceId` moved while its token did not — so answering it from the same
+/// cache entry would turn a recoverable restart into a permanent `unavailable`.
+///
+/// So the rule is: **one source serves the cache at most once**, on its first
+/// `discover`, and reads fresh every time after that (refreshing the shared
+/// entry, which is what "cleared on a pin mismatch" means in practice). The
+/// benefit the cache is for — a second lane on a machine that is already known —
+/// is kept; the hazard it would create is not. The cost is that a RECONNECT
+/// re-reads the record, which is the right posture anyway: the connection the
+/// last credential was pinned on is the one that just broke.
+///
+/// # A refused credential is EVICTED, not merely bypassed
+///
+/// Serving once per source is not enough on its own, and the gap is not a
+/// degraded state that heals — it is a permanent loop. The pin catches a moved
+/// `instanceId`; nothing catches a moved TOKEN under a stable one. gx documents
+/// that combination as impossible (one token per `$GROK_HOME`, and a leader
+/// restart changes the instance, never the token), but if it happened: the cache
+/// holds `(token A, instance I)`, the token rotates to B, `healthz` still says
+/// I — so the pin SUCCEEDS on the stale token and the first bearer request 401s.
+/// Every fresh `lane.open` builds a new source with `answered = false`, reads the
+/// same cached A, and 401s again. For ever, until the app restarts.
+///
+/// So [`Lanes::open`] removes the entry when the agent refuses the credential
+/// (`Unauthorized`), and the next open re-probes and picks up B. The mismatch
+/// path needs no eviction of its own: `pin_epoch` asks a second time, this
+/// source reads fresh for it, and `store` overwrites the entry on the way past.
+///
+/// **The residual that remains, deliberately:** two concurrent COLD opens on one
+/// `(machine, url)` both miss and both probe, last writer winning. It is benign
+/// and left alone — the key includes the machine and the URL, so neither
+/// answer can be used against the wrong target, and both are reads of the same
+/// file. Deduping reads in flight would buy one saved round trip in a race a
+/// panel does not produce (it opens lanes sequentially) at the cost of a second
+/// piece of shared state.
+///
+/// # What never leaves
+///
+/// The token is a [`shed_gx::GxToken`] from the moment it is parsed, so it has
+/// no `Display`, no `Serialize`, and a `Debug` that prints `<redacted>`. On top
+/// of that this type never forwards a probe FAILURE: `shed_app::machine::exec`
+/// builds its error string from the remote's **stdout** when stderr is empty,
+/// and the remote's stdout is one `cat` away from being the token. The raw error
+/// goes to `tracing::debug` and the caller gets a fixed sentence.
+struct TauriGxCredentials {
+    /// For the message and the cache key. The reported URL is the other half.
+    machine: String,
+    reported_url: String,
+    source: GxSource,
+    cache: GxCache,
+    /// Whether this source has answered at all yet. See the caching rule above.
+    answered: std::sync::atomic::AtomicBool,
+}
+
+impl TauriGxCredentials {
+    fn new(
+        machine: &str,
+        reported_url: &str,
+        reach: &ReachKind,
+        gx: &GxConfig,
+        cache: GxCache,
+    ) -> TauriGxCredentials {
+        let source = match reach {
+            ReachKind::Local => GxSource::Local {
+                // ALREADY resolved, in `env.rs`, because whether a var is
+                // honoured at all is a test-mode question and that is where
+                // every other one of those is decided. This function reads no
+                // environment: reading `GROK_HOME` (or `HOME`) here is what let
+                // an inherited value reach a hermetic run — `$HOME` is
+                // redirected to the harness runtime dir, but nothing clears
+                // `$GROK_HOME`, so a developer who exports it would have had the
+                // app read their real token.
+                home: gx.home.clone(),
+                uid: crate::env::current_uid(),
+            },
+            ReachKind::Ssh(entry) => GxSource::Ssh(probe_over_ssh(entry.clone())),
+        };
+        TauriGxCredentials {
+            machine: machine.to_string(),
+            reported_url: reported_url.to_string(),
+            source,
+            cache,
+            answered: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    fn key(&self) -> (String, String) {
+        (self.machine.clone(), self.reported_url.clone())
+    }
+
+    /// The cached entry, if this source has not answered yet. See the type doc.
+    fn cached(&self) -> Option<GxDiscovery> {
+        if self
+            .answered
+            .swap(true, std::sync::atomic::Ordering::SeqCst)
+        {
+            return None;
+        }
+        lock(&self.cache).get(&self.key()).cloned()
+    }
+
+    fn store(&self, discovery: &GxDiscovery) {
+        // Built once, and BEFORE the lock: the key is two owned `String`s, and
+        // there is no reason to allocate them (twice) with the cache held.
+        let key = self.key();
+        let mut cache = lock(&self.cache);
+        // Wholesale rather than LRU: the map is a cache of a cheap-to-rebuild
+        // fact, and the thing being bounded is how many bearer tokens this
+        // process is holding. See [`MAX_GX_CACHE`].
+        if cache.len() >= MAX_GX_CACHE && !cache.contains_key(&key) {
+            cache.clear();
+        }
+        cache.insert(key, discovery.clone());
+    }
+
+    /// Read the credential for real — files locally, the probe over ssh.
+    async fn read(&self) -> Result<GxDiscovery, LaneError> {
+        match &self.source {
+            GxSource::Local { home, uid } => {
+                shed_gx::local_discovery(home, &self.reported_url, *uid)
+            }
+            GxSource::Ssh(run) => self.read_over_ssh(run).await,
+        }
+    }
+
+    async fn read_over_ssh(&self, run: &ProbeRunner) -> Result<GxDiscovery, LaneError> {
+        let machine = &self.machine;
+        let stdout = match run().await {
+            Ok(stdout) => stdout,
+            Err(raw) => {
+                // NOT forwarded — see the type doc. `raw` can contain the
+                // remote's stdout, and the remote's stdout is where the token
+                // is. TWO independent defences, because one of them is a
+                // property of the whole tree rather than of this line: the
+                // caller gets a fixed sentence, and what reaches `tracing` goes
+                // through `redact_hex64` first. No subscriber is installed
+                // anywhere in this repo today, so the macro is a no-op — but
+                // that is somebody else's decision to change, and the day it
+                // changes an un-redacted token would land in the app log, which
+                // is exactly what the harness greps.
+                tracing::debug!(
+                    machine = %machine,
+                    error = %shed_gx::redact_hex64(&raw),
+                    "the gx discovery probe failed"
+                );
+                return Err(LaneError::Unavailable(format!(
+                    "gx discovery failed on {machine}"
+                )));
+            }
+        };
+        // `ProbeError`'s variants are fixed strings by construction (its own doc
+        // is explicit that it never carries probe output), so THIS one is safe
+        // to show: it is the difference between "the probe never ran" and "the
+        // token file is not eligible", which is the whole of what a user can act
+        // on.
+        let probe = shed_gx::parse_probe(&stdout)
+            .map_err(|e| LaneError::Unavailable(format!("gx discovery on {machine}: {e}")))?;
+        if probe.unreadable_records > 0 {
+            tracing::debug!(
+                machine = %machine,
+                unreadable = probe.unreadable_records,
+                "some gx discovery records did not parse"
+            );
+        }
+        // The FIRST record naming this URL wins, which is `local_discovery`'s
+        // rule restated so the two readers agree about WHICH RECORD: a URL is a
+        // port, two leaders cannot bind one, so a second record for it is stale
+        // — and the client's `instanceId` pin is what catches a wrong pick
+        // anyway.
+        //
+        // **They agree about the record and NOT about the token's path, and
+        // that asymmetry is deliberate.** `local_discovery` resolves the token
+        // from the record's own `tokenFile` (through `token_path_for`, which
+        // bounds it inside `$GROK_HOME`); `PROBE_SCRIPT` always reads
+        // `$GROK_HOME/gx-remote.token` and ignores the field. It is invisible
+        // today because gx writes exactly that path — verified against two
+        // independent leaders, one of them on a non-default socket whose RECORD
+        // filename is suffixed while its `tokenFile` is not. If gx ever starts
+        // writing a non-default `tokenFile`, the local reader follows it and
+        // this one silently keeps reading the default, so **the probe has to
+        // change with it**; the mismatch would show up as a lane that works
+        // locally and answers `unavailable` over SSH.
+        //
+        // The probe is NOT widened to follow `tokenFile` on purpose. A remote
+        // reader that took a path out of a file it just read on the far side
+        // could be pointed at any readable file by whatever wrote that record;
+        // `token_path_for`'s `$GROK_HOME` containment is what makes that safe
+        // locally, and re-implementing containment in POSIX `sh` across an SSH
+        // boundary is not a trade worth making for a field that is always the
+        // default. A remote reader that cannot be redirected by record contents
+        // is the stronger property.
+        let record = shed_gx::records_for(&probe.records, &self.reported_url)
+            .into_iter()
+            .next()
+            .ok_or_else(|| {
+                LaneError::Unavailable(format!(
+                    "no gx discovery record for {} on {machine}",
+                    self.reported_url
+                ))
+            })?;
+        let token = probe.token.ok_or_else(|| {
+            LaneError::Unavailable(format!("the gx token could not be read on {machine}"))
+        })?;
+        Ok(GxDiscovery {
+            token,
+            instance_id: record.instance_id.clone(),
+        })
+    }
+}
+
+/// The production [`ProbeRunner`]: one `sh -c <PROBE_SCRIPT>` over the machine's
+/// reach.
+///
+/// The argv is pinned by `tests/machine-transport`'s `gx-probe` scenario — SSH
+/// has no argv API, so this multi-line script crosses as ONE re-parsed string
+/// and every transport that composes it (here, and shed-mobile's Dart one) has
+/// to compose it identically.
+fn probe_over_ssh(entry: MachineEntry) -> ProbeRunner {
+    Arc::new(move || {
+        let entry = entry.clone();
+        Box::pin(async move {
+            let argv = [
+                "sh".to_string(),
+                "-c".to_string(),
+                shed_gx::PROBE_SCRIPT.to_string(),
+            ];
+            shed_app::machine::exec(&entry, &argv).await
+        })
+    })
+}
+
+#[async_trait::async_trait]
+impl GxCredentialSource for TauriGxCredentials {
+    async fn discover(&self, _reported_url: &str) -> Result<GxDiscovery, LaneError> {
+        // The argument is ignored on purpose: this source was BUILT for one
+        // reported URL (it is half of its cache key), and a client that asked it
+        // about another would be asking the wrong source.
+        if let Some(hit) = self.cached() {
+            return Ok(hit);
+        }
+        let fresh = self.read().await?;
+        self.store(&fresh);
+        Ok(fresh)
+    }
+}
+
 /// The loopback port a `server_url` names.
 ///
 /// Explicit rather than `Url::port_or_known_default()`: roost validates that the
@@ -1249,9 +1835,19 @@ fn remote_port(server_url: &str) -> Result<u16, LaneFailure> {
 
 /// Decode the `answer` object the `lane.answer` op takes.
 ///
-/// Three forms, one per thing a client can actually do (plan 015 §3.4):
+/// Four forms, one per thing a client can actually do (plan 015 §3.4, plan 017
+/// §3.5):
 ///
-/// * `{"permission": "allow-once" | "allow-always" | "reject"}`
+/// * `{"choice": "<option id>"}` — **the offered option with this id, exactly as
+///   offered.** The form the panel uses, and the only one that can express a
+///   real agent's real menu: gx offers FIVE permission options with TWO of kind
+///   `allow_once`, so `{"permission": …}` cannot name which one the user
+///   pressed. Ids are opaque (they are whatever the agent called them) and this
+///   never parses one.
+/// * `{"permission": "allow-once" | "allow-always" | "reject"}` — by SEMANTIC
+///   kind, resolved by the adapter against the offered options' `kind` fields,
+///   never by id. Kept because it is what a script can write without first
+///   fetching the approval, and it is what every existing caller sends.
 /// * `{"question": [["<option id>", …], …]}` — one inner list per question
 /// * `{"reject": true}` — decline the whole request
 ///
@@ -1272,7 +1868,7 @@ fn remote_port(server_url: &str) -> Result<u16, LaneFailure> {
 /// client that sent two of them has to be told which one did not happen.
 pub fn parse_answer(value: &Value) -> Result<LaneAnswer, LaneFailure> {
     /// The answer forms, and the whole vocabulary this refusal counts.
-    const FORMS: [&str; 3] = ["permission", "question", "reject"];
+    const FORMS: [&str; 4] = ["choice", "permission", "question", "reject"];
     let named: Vec<&str> = FORMS
         .into_iter()
         .filter(|form| value.get(form).is_some())
@@ -1281,18 +1877,43 @@ pub fn parse_answer(value: &Value) -> Result<LaneAnswer, LaneFailure> {
         [_one] => {}
         [] => {
             return Err(LaneFailure::bad_request(
-                "answer must be {permission: …}, {question: [[…]]} or {reject: true}".to_string(),
+                "answer must be {choice: \"<option id>\"}, {permission: …}, \
+                 {question: [[…]]} or {reject: true}"
+                    .to_string(),
             ))
         }
         several => {
             return Err(LaneFailure::bad_request(format!(
-                "an answer names exactly one of permission, question or reject; \
+                "an answer names exactly one of choice, permission, question or reject; \
                  this one names {}",
                 several.join(" and ")
             )))
         }
     }
 
+    if let Some(option_id) = value.get("choice") {
+        let option_id = option_id
+            .as_str()
+            .ok_or_else(|| LaneFailure::bad_request("`choice` must be a string".to_string()))?;
+        // **Not trimmed**, unlike `permission` below. That one names a value out
+        // of a closed vocabulary this code owns, so tidying whitespace is safe.
+        // An option id is OPAQUE — whatever the agent called it, and gx's own
+        // fixtures prove ids and semantics are independent — so trimming would
+        // be this layer silently rewriting a caller's identifier and then
+        // matching it against an approval that never offered the rewritten form.
+        // The only judgement made is that the empty string is not an id any
+        // approval can have offered, which saves a round trip; anything else
+        // goes through untouched and the adapter refuses what it does not
+        // recognise.
+        if option_id.is_empty() {
+            return Err(LaneFailure::bad_request(
+                "`choice` must name an option id offered by the approval".to_string(),
+            ));
+        }
+        return Ok(LaneAnswer::Choice {
+            option_id: option_id.to_string(),
+        });
+    }
     if let Some(decision) = value.get("permission") {
         let decision = decision
             .as_str()
@@ -1616,10 +2237,40 @@ mod tests {
         }
         assert_eq!(LaneFailure::NoLane("nope".into()).code(), "no_lane");
         assert_eq!(LaneFailure::NoLane("nope".into()).message(), "nope");
+        // The kind-dispatch refusal (plan 017 §3.5). A code of its own, and it
+        // NAMES the kind — that is the whole reason it is not `no_lane`.
+        let unsupported = LaneFailure::UnsupportedLane("claude".into());
+        assert_eq!(unsupported.code(), "unsupported_lane");
+        assert!(
+            unsupported.message().contains("\"claude\""),
+            "the refusal must name the kind it refused: {}",
+            unsupported.message()
+        );
     }
 
     #[test]
-    fn the_answer_forms_are_the_three_the_plan_names() {
+    fn the_answer_forms_are_the_four_the_plan_names() {
+        // The form the panel sends: the offered option, BY ITS OWN ID. Ids are
+        // opaque — a real gx permission offers five options with two of kind
+        // `allow_once`, so nothing here may infer a semantic from the string.
+        assert_eq!(
+            parse_answer(&json!({"choice": "p-2"})).expect("choice"),
+            LaneAnswer::Choice {
+                option_id: "p-2".into()
+            }
+        );
+        // An id is opaque, so it crosses VERBATIM — no trimming, no casing, no
+        // interpretation. A layer that tidied it would be rewriting a caller's
+        // identifier and then failing to match the approval that offered it.
+        assert_eq!(
+            parse_answer(&json!({"choice": "  p 2  "})).expect("an id is opaque"),
+            LaneAnswer::Choice {
+                option_id: "  p 2  ".into()
+            }
+        );
+        // The one judgement: the empty string is not an id any approval offered.
+        assert!(parse_answer(&json!({"choice": ""})).is_err());
+        assert!(parse_answer(&json!({"choice": 3})).is_err());
         assert_eq!(
             parse_answer(&json!({"permission": "allow-once"})).expect("allow-once"),
             LaneAnswer::Permission {
@@ -1668,6 +2319,11 @@ mod tests {
             json!({"permission": "allow-once", "reject": true}),
             json!({"question": [["yes"]], "reject": true}),
             json!({"permission": "allow-once", "question": [["yes"]], "reject": true}),
+            // The fourth form counts too: `{choice}` and `{permission}` resolve
+            // the same approval by two different rules (by id, by kind), and a
+            // caller that sent both has to be told which one did not happen.
+            json!({"choice": "p-1", "permission": "allow-once"}),
+            json!({"choice": "p-1", "reject": true}),
         ] {
             let failure = parse_answer(&ambiguous)
                 .err()
@@ -1682,6 +2338,7 @@ mod tests {
         // …and each single form still parses, so the count did not become a
         // blanket refusal. A key that is NOT one of the three is not counted:
         // `{permission, note}` is still one answer.
+        assert!(parse_answer(&json!({"choice": "p-1"})).is_ok());
         assert!(parse_answer(&json!({"permission": "reject"})).is_ok());
         assert!(parse_answer(&json!({"question": [["yes"]]})).is_ok());
         assert!(parse_answer(&json!({"reject": true})).is_ok());
@@ -1789,6 +2446,12 @@ mod tests {
             self.log.alive.store(true, SeqCst);
             Ok(())
         }
+
+        /// `alive` IS the fake's child: the real one answers this from a
+        /// `try_wait`, and a cell kills it by clearing the flag.
+        fn looks_alive(&self) -> bool {
+            self.log.alive.load(SeqCst)
+        }
     }
 
     impl Drop for FakeForward {
@@ -1806,13 +2469,17 @@ mod tests {
 
     /// One ssh machine, whose rows a cell can rewrite.
     struct FakeMachines {
-        lanes: Mutex<BTreeMap<String, String>>,
+        lanes: Mutex<BTreeMap<String, AgentLaneStamp>>,
         port: u16,
         log: Arc<ForwardLog>,
+        /// How this machine is reached. `Ssh` for every cell about tunnels;
+        /// `Local` for the ones about the LOCAL credential reader, which is the
+        /// path that reads files instead of shelling out.
+        reach: ReachKind,
     }
 
     impl LaneMachines for FakeMachines {
-        fn agent_lanes(&self, machine: &str) -> BTreeMap<String, String> {
+        fn agent_lanes(&self, machine: &str) -> BTreeMap<String, AgentLaneStamp> {
             if machine == MACHINE {
                 lock(&self.lanes).clone()
             } else {
@@ -1821,12 +2488,7 @@ mod tests {
         }
 
         fn reach_kind(&self, _machine: &str) -> Result<ReachKind, String> {
-            Ok(ReachKind::Ssh(MachineEntry {
-                name: MACHINE.to_string(),
-                host: MACHINE.to_string(),
-                ssh_port: 22,
-                ..MachineEntry::default()
-            }))
+            Ok(self.reach.clone())
         }
 
         fn forward(
@@ -1866,12 +2528,26 @@ mod tests {
         }
     }
 
-    /// The rows a machine reports: every session on ONE server.
-    fn lane_rows(sessions: &[&str]) -> BTreeMap<String, String> {
+    /// The rows a machine reports: every session on ONE server, all one kind.
+    fn lane_rows_of(kind: &str, sessions: &[&str]) -> BTreeMap<String, AgentLaneStamp> {
         sessions
             .iter()
-            .map(|s| ((*s).to_string(), format!("http://127.0.0.1:{REMOTE_PORT}/")))
+            .map(|s| {
+                (
+                    (*s).to_string(),
+                    AgentLaneStamp {
+                        kind: kind.to_string(),
+                        session_id: (*s).to_string(),
+                        server_url: format!("http://127.0.0.1:{REMOTE_PORT}/"),
+                    },
+                )
+            })
             .collect()
+    }
+
+    /// [`lane_rows_of`] for the adapter most cells are about.
+    fn lane_rows(sessions: &[&str]) -> BTreeMap<String, AgentLaneStamp> {
+        lane_rows_of("opencode", sessions)
     }
 
     /// A `Lanes` on the two doubles: `MACHINE` is an SSH target exposing
@@ -1880,12 +2556,72 @@ mod tests {
         fake: &FakeOpencode,
         sessions: &[&str],
     ) -> (Arc<Lanes>, Arc<ForwardLog>, Arc<Recorder>) {
+        lanes_on(fake.addr().port(), lane_rows(sessions))
+    }
+
+    // -----------------------------------------------------------------------
+    // the gx half: kind dispatch, the transport hook, the credential source
+    // -----------------------------------------------------------------------
+
+    /// A gx session id shaped like a real one (a UUIDv7): the fold splits an
+    /// event id at the LAST hyphen, so a toy id would not exercise that.
+    const GX_SID: &str = "01a0fa1e-0000-7000-8000-0000000000ab";
+
+    /// The gx adapter's windows, scaled the way `shed-gx`'s own suite scales
+    /// them — no cell here waits out a real one.
+    fn gx_fast() -> GxTimings {
+        GxTimings {
+            stall: Duration::from_millis(2_000),
+            resume_window: Duration::from_millis(2_000),
+            resume_tries: 3,
+            flush_after: Duration::from_millis(300),
+            seed_limit: 500,
+            rest_cap: 8 << 20,
+            down_after: Duration::from_millis(4_000),
+        }
+    }
+
+    /// gx's own `turn_completed` extension — the frame that CLOSES an open
+    /// streak, so a seeded transcript does not leave one hanging.
+    fn gx_turn_completed(n: u64) -> Value {
+        json!({
+            "eventId": format!("{GX_SID}-{n}"),
+            "method": "_x.ai/session/update",
+            "params": {
+                "sessionId": GX_SID,
+                "update": { "sessionUpdate": "turn_completed", "stop_reason": "end_turn" },
+                "_meta": { "agentTimestampMs": 1_788_931_000_000i64 + (n as i64) * 1_000 },
+            },
+        })
+    }
+
+    /// One `session/update` envelope carrying `text`.
+    fn gx_chunk(n: u64, text: &str) -> Value {
+        json!({
+            "eventId": format!("{GX_SID}-{n}"),
+            "method": "session/update",
+            "params": {
+                "sessionId": GX_SID,
+                "update": { "sessionUpdate": "agent_message_chunk",
+                            "content": { "type": "text", "text": text } },
+                "_meta": { "agentTimestampMs": 1_788_931_000_000i64 + (n as i64) * 1_000 },
+            },
+        })
+    }
+
+    /// A `Lanes` on the doubles, with `rows` as the machine's stamped lanes and
+    /// tunnels landing on `port`.
+    fn lanes_on(
+        port: u16,
+        rows: BTreeMap<String, AgentLaneStamp>,
+    ) -> (Arc<Lanes>, Arc<ForwardLog>, Arc<Recorder>) {
         let log = Arc::new(ForwardLog::default());
         let recorder = Arc::new(Recorder::default());
         let machines = Arc::new(FakeMachines {
-            lanes: Mutex::new(lane_rows(sessions)),
-            port: fake.addr().port(),
+            lanes: Mutex::new(rows),
+            port,
             log: Arc::clone(&log),
+            reach: ReachKind::Ssh(fake_entry()),
         });
         let sink: EventSink = {
             let recorder = Arc::clone(&recorder);
@@ -1897,8 +2633,680 @@ mod tests {
             tokio::runtime::Handle::current(),
             sink,
             machines,
+            GxConfig::default(),
         ));
         (lanes, log, recorder)
+    }
+
+    /// A `Lanes` whose machine is reached LOCALLY — no tunnel, and the gx
+    /// credential source reads files under `gx.home` instead of probing over
+    /// ssh. The path a hermetic harness cell takes.
+    fn lanes_local(rows: BTreeMap<String, AgentLaneStamp>, gx: GxConfig) -> Arc<Lanes> {
+        let machines = Arc::new(FakeMachines {
+            lanes: Mutex::new(rows),
+            port: 0,
+            log: Arc::new(ForwardLog::default()),
+            reach: ReachKind::Local,
+        });
+        Arc::new(Lanes::with_sink(
+            tokio::runtime::Handle::current(),
+            Arc::new(|_: &str, _: &str, _: &LaneEvent| {}),
+            machines,
+            gx,
+        ))
+    }
+
+    /// The `MachineEntry` [`FakeMachines`] hands out — what a forward is
+    /// reserved against.
+    fn fake_entry() -> MachineEntry {
+        MachineEntry {
+            name: MACHINE.to_string(),
+            host: MACHINE.to_string(),
+            ssh_port: 22,
+            ..MachineEntry::default()
+        }
+    }
+
+    /// **A kind this build has no adapter for is refused BY NAME, and nothing is
+    /// reserved on the way to finding that out.**
+    ///
+    /// `no_lane` would have been the easy answer and it is the wrong one: the
+    /// row DOES carry a lane, a newer build may well speak it, and a client that
+    /// cannot tell the two apart cannot say anything useful about either. The
+    /// second half of the assertion is the one that would rot silently — the
+    /// refusal must happen before the tunnel, or an unopenable row would cost an
+    /// `ssh -N` child and a readiness poll every time a panel touched it.
+    #[tokio::test]
+    async fn a_kind_with_no_adapter_is_unsupported_lane_and_reserves_no_tunnel() {
+        let (lanes, log, _recorder) = lanes_on(1, lane_rows_of("claude", &["ses_x"]));
+
+        let failure = lanes
+            .open(MACHINE, "ses_x")
+            .await
+            .expect_err("this build speaks opencode and gx, not claude");
+        assert_eq!(failure.code(), "unsupported_lane");
+        assert!(
+            failure.message().contains("\"claude\""),
+            "the refusal names the kind: {}",
+            failure.message()
+        );
+
+        assert_eq!(log.built.load(SeqCst), 0, "no tunnel was reserved");
+        assert!(forward_users(&lanes).is_none(), "no tunnel was registered");
+        // And the row is still there to be refused again the same way — the
+        // refusal is stateless, not a poisoned entry.
+        assert_eq!(
+            lanes
+                .open(MACHINE, "ses_x")
+                .await
+                .expect_err("still refused")
+                .code(),
+            "unsupported_lane"
+        );
+    }
+
+    /// **A row that changes AGENT on the same port is a different lane.**
+    ///
+    /// The entry used to be keyed on `server_url` alone, which cannot see this:
+    /// a tab that restarts as gx on the port opencode had would have kept the
+    /// old entry, and the panel would have gone on pumping an opencode client at
+    /// a gx server. The stamp is compared whole.
+    #[tokio::test]
+    async fn an_entry_is_evicted_when_the_kind_changes_under_a_stable_url() {
+        let fake = one_session("ses_a").await;
+        let (lanes, log, _recorder) = lanes_for(&fake, &["ses_a"]);
+        lanes.open(MACHINE, "ses_a").await.expect("opens");
+        assert_eq!(forward_users(&lanes), Some(1));
+
+        // Same session, same URL, different agent.
+        lanes.reconcile(MACHINE, &lane_rows_of("gx", &["ses_a"]));
+        assert!(
+            forward_users(&lanes).is_none(),
+            "the opencode entry (and its tunnel) did not survive the kind change"
+        );
+        wait_for("the tunnel's child to be reaped", || {
+            (!log.alive.load(SeqCst)).then_some(())
+        })
+        .await;
+    }
+
+    /// **The forwarded transport hook.**
+    ///
+    /// It answers the tunnel's local end and `ensure`s it EVERY time — which is
+    /// the whole mechanism behind "a gx lane repairs its forward without a
+    /// `Reset`". And a dial after the last share is gone is `Unavailable`, not a
+    /// resurrected `ssh` child behind a lane nobody has open.
+    ///
+    /// The LOCAL shape is not this type: it is [`shed_gx::FixedDial`], whose own
+    /// suite pins both the URL it answers and the trailing-slash normalisation
+    /// (`transport.rs::fixed_dial_answers_the_url_it_was_built_on`). Nothing is
+    /// left here to restate about it.
+    #[tokio::test]
+    async fn the_transport_hook_is_a_cache_read_until_the_tunnel_dies() {
+        let (lanes, log, _recorder) = lanes_on(45_999, BTreeMap::new());
+
+        let share = lanes
+            .reserve((MACHINE.to_string(), REMOTE_PORT), &fake_entry())
+            .expect("reserves");
+        let forwarded = TauriTransport::new(&share);
+        assert_eq!(log.ensures.load(SeqCst), 0, "reserving is not ensuring");
+
+        // A reserved-but-never-ensured forward is not alive, so the FIRST dial
+        // establishes it — and every dial after that is free.
+        for _ in 0..4 {
+            assert_eq!(
+                forwarded.dial().await.expect("dials").as_str(),
+                "http://127.0.0.1:45999/"
+            );
+        }
+        assert_eq!(
+            log.ensures.load(SeqCst),
+            1,
+            "gx dials before EVERY request; a healthy tunnel must cost nothing \
+             but a `try_wait` (shed_gx::GxTransport's own contract)"
+        );
+
+        // The child dies — a killed `ssh -N -L`, the case §8.5 stages by hand.
+        // The very next dial repairs it, with no `LaneEvent` and nothing waiting
+        // on a human.
+        log.alive.store(false, SeqCst);
+        assert_eq!(
+            forwarded.dial().await.expect("dials").as_str(),
+            "http://127.0.0.1:45999/"
+        );
+        assert_eq!(
+            log.ensures.load(SeqCst),
+            2,
+            "a dead tunnel is re-established"
+        );
+        assert!(log.alive.load(SeqCst), "…and is alive again afterwards");
+
+        // …and back to free.
+        forwarded.dial().await.expect("dials");
+        assert_eq!(log.ensures.load(SeqCst), 2);
+
+        drop(share);
+        let failure = forwarded
+            .dial()
+            .await
+            .expect_err("the tunnel is gone with its last share");
+        assert!(matches!(failure, LaneError::Unavailable(_)), "{failure:?}");
+        assert_eq!(
+            log.ensures.load(SeqCst),
+            2,
+            "a dial with no tunnel left does not build one"
+        );
+    }
+
+    /// A `$GROK_HOME` with one record and an eligible token, as gx writes them.
+    fn gx_home_fixture(url: &str, instance: &str, token: &str) -> tempfile::TempDir {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().expect("a scratch grok home");
+        let token_path = dir.path().join("gx-remote.token");
+        // Real gx writes a trailing newline; the reader has to tolerate it.
+        std::fs::write(&token_path, format!("{token}\n")).expect("the token");
+        std::fs::set_permissions(&token_path, std::fs::Permissions::from_mode(0o600))
+            .expect("0600");
+        // The suffixed filename is the shape gx uses when its leader is on a
+        // non-default socket — and the token file is NOT suffixed with it, which
+        // is exactly why the token's path comes off the record.
+        std::fs::write(
+            dir.path().join("gx-remote-0123456789abcdef.json"),
+            json!({
+                "url": url,
+                "pid": std::process::id(),
+                "instanceId": instance,
+                "socketPath": "/tmp/leader.sock",
+                "tokenFile": token_path.to_string_lossy(),
+                "version": "1.0.16+gx.12",
+                "startedAt": 1_788_931_000i64,
+            })
+            .to_string(),
+        )
+        .expect("the record");
+        dir
+    }
+
+    const FIXTURE_TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    /// **The LOCAL reader reads files, and only eligible ones.**
+    ///
+    /// It never shells out (the harness proves that from outside with a
+    /// process-tree check; here the point is that the shipped path IS
+    /// `shed_gx::local_discovery`, checks included). The `0644` half is what
+    /// makes the checks load-bearing rather than decorative: gx's own reader
+    /// refuses a world-readable token and shed must not be the weaker reader.
+    #[tokio::test]
+    async fn the_local_reader_finds_an_eligible_token_and_refuses_an_ineligible_one() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let url = "http://127.0.0.1:2431";
+        let home = gx_home_fixture(url, "inst-local", FIXTURE_TOKEN);
+        let cache: GxCache = cold_cache();
+
+        let creds = reading(url, home.path(), Arc::clone(&cache));
+        let found = creds
+            .discover(url)
+            .await
+            .expect("the fixture home is readable");
+        assert_eq!(found.instance_id, "inst-local");
+        assert_eq!(
+            found.token.expose(),
+            FIXTURE_TOKEN,
+            "the newline is trimmed"
+        );
+        // Nothing about the token is printable.
+        assert!(
+            !format!("{found:?}").contains(FIXTURE_TOKEN),
+            "Debug leaked the token: {found:?}"
+        );
+
+        // Now make the token world-readable and read it with a FRESH source (the
+        // one above has answered, and the cache holds its answer).
+        std::fs::set_permissions(
+            home.path().join("gx-remote.token"),
+            std::fs::Permissions::from_mode(0o644),
+        )
+        .expect("0644");
+        let refused = reading(url, home.path(), cold_cache())
+            .discover(url)
+            .await
+            .expect_err("a 0644 token is not eligible");
+        assert!(matches!(refused, LaneError::Unavailable(_)), "{refused:?}");
+
+        // A record for a DIFFERENT url is not this lane's record.
+        let elsewhere = reading("http://127.0.0.1:2999", home.path(), cold_cache())
+            .discover("http://127.0.0.1:2999")
+            .await
+            .expect_err("no record names that url");
+        assert!(
+            matches!(elsewhere, LaneError::Unavailable(_)),
+            "{elsewhere:?}"
+        );
+    }
+
+    /// A credential source on the LOCAL reach, reading `home`. `probing`'s twin.
+    fn reading(url: &str, home: &std::path::Path, cache: GxCache) -> TauriGxCredentials {
+        TauriGxCredentials::new(
+            MACHINE,
+            url,
+            &ReachKind::Local,
+            &GxConfig {
+                home: home.to_path_buf(),
+                timings: GxTimings::default(),
+            },
+            cache,
+        )
+    }
+
+    /// A fresh, empty [`GxCache`] — for a cell that is about the READ, not the
+    /// cache.
+    fn cold_cache() -> GxCache {
+        Arc::new(Mutex::new(HashMap::new()))
+    }
+
+    /// A [`ProbeRunner`] that always answers `out`.
+    fn responds(out: &str) -> ProbeRunner {
+        let out = out.to_string();
+        Arc::new(move || {
+            let out = out.clone();
+            Box::pin(async move { Ok(out) })
+        })
+    }
+
+    /// A [`ProbeRunner`] that always fails with `error`.
+    fn fails(error: &str) -> ProbeRunner {
+        let error = error.to_string();
+        Arc::new(move || {
+            let error = error.clone();
+            Box::pin(async move { Err(error) })
+        })
+    }
+
+    /// **A credential the agent refused is evicted, so a rotated token does not
+    /// wedge the lane for ever.**
+    ///
+    /// Serving the shared cache once per source is not enough on its own. If the
+    /// token moves while `instanceId` does NOT, the pin still succeeds — it only
+    /// checks the instance — and the stale token 401s. Every fresh `lane.open`
+    /// builds a source with `answered = false`, reads the same cached token, and
+    /// 401s again; there is no path back, because nothing in the pin sequence
+    /// ever disagrees. Not a degraded-but-recovering state: a permanent loop
+    /// until the app restarts.
+    ///
+    /// The cell stages exactly that, in the direction a hermetic test can drive:
+    /// the home starts with the WRONG token, which poisons the cache on the
+    /// first open, and then the file is rewritten with the right one — a token
+    /// rotation from the reader's point of view, with the leader's instance id
+    /// never moving.
+    #[tokio::test]
+    async fn a_refused_credential_is_evicted_so_a_rotated_token_recovers() {
+        use shed_gx::testing::FakeGx;
+
+        let fake = FakeGx::start().await;
+        fake.add_session(GX_SID, Some("the lane"), "/w", "idle", 0, false);
+        fake.set_history(GX_SID, vec![gx_chunk(10, "seeded"), gx_turn_completed(11)]);
+        fake.pin(GX_SID);
+
+        // A home whose record names the leader correctly and whose TOKEN is
+        // stale. `instanceId` matches, so the pin will succeed and the bearer
+        // request is what fails — which is the whole point.
+        let home = gx_home_fixture(&fake.reported_url(), &fake.instance_id(), FIXTURE_TOKEN);
+        assert_ne!(
+            fake.token(),
+            FIXTURE_TOKEN,
+            "the fixture token must be the WRONG one for this cell to mean anything"
+        );
+
+        let rows = BTreeMap::from([(
+            GX_SID.to_string(),
+            AgentLaneStamp {
+                kind: "gx".to_string(),
+                session_id: GX_SID.to_string(),
+                server_url: fake.reported_url(),
+            },
+        )]);
+        let lanes = lanes_local(
+            rows,
+            GxConfig {
+                home: home.path().to_path_buf(),
+                timings: gx_fast(),
+            },
+        );
+
+        // Open #1: the stale token is read, the pin succeeds on the matching
+        // instance id, and the roster GET is refused.
+        let refused = lanes
+            .open(MACHINE, GX_SID)
+            .await
+            .expect_err("a stale token is refused");
+        assert_eq!(refused.code(), "unauthorized", "{}", refused.message());
+
+        // **The eviction.** Without it the entry still holds the stale token and
+        // every later open reads it back.
+        assert!(
+            lock(&lanes.gx_cache).is_empty(),
+            "a credential the agent refused must not stay in the cache — it is \
+             what every future open would read"
+        );
+
+        // The token rotates to the one the leader actually wants. The record,
+        // and so the instance id, is untouched: nothing in the pin sequence has
+        // any reason to disagree.
+        std::fs::write(
+            home.path().join("gx-remote.token"),
+            format!("{}\n", fake.token()),
+        )
+        .expect("rotate the token");
+
+        // Open #2 re-reads, and the lane comes up. THIS is the user-visible
+        // property: without the eviction it would 401 on the cached token
+        // again, and so would every open after it, for ever.
+        let opened = lanes.open(MACHINE, GX_SID).await.unwrap_or_else(|e| {
+            panic!(
+                "the rotated token was not picked up ({}: {}) — the lane is \
+                 wedged on a cached credential the agent already refused",
+                e.code(),
+                e.message()
+            )
+        });
+        assert_eq!(opened["session"]["id"], json!(GX_SID));
+        assert_eq!(opened["capabilities"]["kind"], json!("gx"));
+
+        // …and the cache is warm again with the credential that WORKS, so the
+        // eviction cost one re-read rather than the benefit the cache is for.
+        assert_eq!(
+            lock(&lanes.gx_cache).len(),
+            1,
+            "the fresh credential is cached for the next open"
+        );
+        lanes.close(MACHINE, GX_SID);
+    }
+
+    /// A credential source whose probe is a closure, so the SSH half can be
+    /// driven without an sshd.
+    fn probing(url: &str, cache: GxCache, run: ProbeRunner) -> TauriGxCredentials {
+        TauriGxCredentials {
+            machine: MACHINE.to_string(),
+            reported_url: url.to_string(),
+            source: GxSource::Ssh(run),
+            cache,
+            answered: AtomicBool::new(false),
+        }
+    }
+
+    /// What [`shed_gx::PROBE_SCRIPT`] prints on a healthy host.
+    fn probe_output(url: &str, instance: &str, token: &str) -> String {
+        format!(
+            "{}\n---\n===token===\n{token}\n",
+            json!({
+                "url": url,
+                "pid": 4242,
+                "instanceId": instance,
+                "socketPath": "/tmp/leader.sock",
+                "tokenFile": "/home/u/.grok/gx-remote.token",
+                "version": "1.0.16+gx.12",
+                "startedAt": 1_788_931_000i64,
+            })
+        )
+    }
+
+    /// **A failing probe never forwards what the remote printed.**
+    ///
+    /// `shed_app::machine::exec` builds its error from the remote's **stdout**
+    /// when stderr is empty, and the remote's stdout is one `cat` away from
+    /// being the token. So the error this cell plants is the realistic one — a
+    /// 64-hex run inside `exec`'s own message — and the assertion is that none
+    /// of it reaches the caller.
+    #[tokio::test]
+    async fn a_failing_probe_is_a_fixed_message_and_never_the_raw_error() {
+        let url = "http://127.0.0.1:2431";
+        let leaky = format!("machine:{MACHINE}: rc failed (exit 1): {FIXTURE_TOKEN}");
+        let creds = probing(url, cold_cache(), fails(&leaky));
+
+        let failure = creds.discover(url).await.expect_err("the probe failed");
+        let LaneError::Unavailable(message) = &failure else {
+            panic!("a failed probe is the quiet variant, not {failure:?}");
+        };
+        assert_eq!(message, &format!("gx discovery failed on {MACHINE}"));
+        assert!(
+            !format!("{failure:?}").contains(FIXTURE_TOKEN),
+            "the raw error reached the caller: {failure:?}"
+        );
+    }
+
+    /// **The SSH reader parses the probe, and refuses what it cannot use.**
+    #[tokio::test]
+    async fn the_ssh_reader_pins_the_record_for_its_url_and_needs_a_token() {
+        let url = "http://127.0.0.1:2431";
+        let cache: GxCache = cold_cache();
+
+        let out = probe_output(url, "inst-ssh", FIXTURE_TOKEN);
+        let found = probing(url, Arc::clone(&cache), responds(&out))
+            .discover(url)
+            .await
+            .expect("a healthy probe");
+        assert_eq!(found.instance_id, "inst-ssh");
+        assert_eq!(found.token.expose(), FIXTURE_TOKEN);
+
+        // The sentinel with nothing after it: the file was there and INELIGIBLE
+        // (a symlink, `0644`, or somebody else's), which the script reports by
+        // printing no token rather than by failing.
+        let withheld = probing(url, cold_cache(), responds("===token===\n"))
+            .discover(url)
+            .await
+            .expect_err("no record and no token");
+        assert!(
+            matches!(withheld, LaneError::Unavailable(_)),
+            "{withheld:?}"
+        );
+
+        // Output that never reached the sentinel: the probe did not run to
+        // completion. `ProbeError`'s messages are fixed strings by construction,
+        // so THIS one is safe to show — it is the difference a user can act on.
+        let truncated = probing(url, cold_cache(), responds("sh: not found"))
+            .discover(url)
+            .await
+            .expect_err("truncated");
+        assert!(
+            truncated.to_string().contains("did not run to completion"),
+            "{truncated:?}"
+        );
+    }
+
+    /// **The cache serves once per source, and a re-ask always reads fresh.**
+    ///
+    /// This is the rule that makes `ensure_pinned`'s retry work. It asks a
+    /// second time PRECISELY because the first answer did not match `healthz` —
+    /// a leader restarted, its `instanceId` moved, its token did not — and
+    /// answering that from the same cache entry would turn a recoverable restart
+    /// into a permanent `unavailable`. The benefit the cache exists for (a
+    /// second lane on a machine already known costs no round trip) is kept.
+    #[tokio::test]
+    async fn a_source_serves_the_cache_once_and_re_reads_after_that() {
+        let url = "http://127.0.0.1:2431";
+        let cache: GxCache = cold_cache();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let runner: ProbeRunner = {
+            let calls = Arc::clone(&calls);
+            let url = url.to_string();
+            Arc::new(move || {
+                let n = calls.fetch_add(1, SeqCst);
+                let out = probe_output(&url, &format!("inst-{n}"), FIXTURE_TOKEN);
+                Box::pin(async move { Ok(out) })
+            })
+        };
+
+        // A cold source: a miss, then a fresh read for the retry.
+        let first = probing(url, Arc::clone(&cache), Arc::clone(&runner));
+        assert_eq!(
+            first.discover(url).await.expect("cold").instance_id,
+            "inst-0"
+        );
+        assert_eq!(
+            first.discover(url).await.expect("retry").instance_id,
+            "inst-1"
+        );
+        assert_eq!(
+            calls.load(SeqCst),
+            2,
+            "the retry did NOT come from the cache"
+        );
+
+        // A second lane on the same (machine, url): warm, and free.
+        let second = probing(url, Arc::clone(&cache), Arc::clone(&runner));
+        assert_eq!(
+            second.discover(url).await.expect("warm").instance_id,
+            "inst-1",
+            "the second lane reused what the first one left"
+        );
+        assert_eq!(calls.load(SeqCst), 2, "no probe ran for the warm open");
+        // …and its own retry still reads fresh, refreshing the shared entry.
+        assert_eq!(
+            second.discover(url).await.expect("retry").instance_id,
+            "inst-2"
+        );
+        assert_eq!(calls.load(SeqCst), 3);
+
+        let third = probing(url, Arc::clone(&cache), Arc::clone(&runner));
+        assert_eq!(
+            third.discover(url).await.expect("warm").instance_id,
+            "inst-2",
+            "a pin mismatch left the FRESH record behind, not the stale one"
+        );
+
+        // A different url is a different key, so it is a miss.
+        let other = "http://127.0.0.1:2999";
+        let elsewhere = probing(other, Arc::clone(&cache), Arc::clone(&runner));
+        assert!(
+            elsewhere.discover(other).await.is_err(),
+            "the probe's record names 2431, not 2999"
+        );
+        assert_eq!(calls.load(SeqCst), 4, "a different url probes for itself");
+    }
+
+    /// A transport that counts its dials — the production [`TauriTransport`]
+    /// underneath, so what is counted is the real hook.
+    struct CountingTransport {
+        inner: TauriTransport,
+        dials: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl GxTransport for CountingTransport {
+        async fn dial(&self) -> Result<reqwest::Url, LaneError> {
+            self.dials.fetch_add(1, SeqCst);
+            self.inner.dial().await
+        }
+    }
+
+    /// **Forward repair rides the transport hook, not a `LaneEvent`** (plan 017
+    /// §3.1 #1, §3.5).
+    ///
+    /// A gx stream that ends and resumes from its cursor emits NO `Reset` — that
+    /// is the feature — so [`Lanes::spawn_pump`]'s `Reset`-driven re-`ensure`,
+    /// which is what respawns a dead `ssh -N` child under an opencode lane, has
+    /// nothing to fire on. This cell is the proof that the forward is
+    /// nevertheless re-ensured: cut the stream, watch the frame that arrives
+    /// afterwards, and assert the tunnel was ensured again across the gap with
+    /// the client's view never restaged.
+    #[tokio::test]
+    async fn a_gx_lane_re_ensures_its_tunnel_across_a_silent_resume_with_no_reset() {
+        use shed_gx::discovery::StaticCredentials;
+        use shed_gx::testing::FakeGx;
+
+        let fake = FakeGx::start().await;
+        // `idle`, because the seeded transcript ends in `turn_completed` — a
+        // roster that disagreed with its own transcript would be a fixture, not
+        // a gx.
+        fake.add_session(GX_SID, Some("the lane"), "/w", "idle", 0, false);
+        fake.set_history(GX_SID, vec![gx_chunk(10, "seeded"), gx_turn_completed(11)]);
+        fake.pin(GX_SID);
+
+        // A real tunnel share, whose `ensure` count is the assertion.
+        let (lanes, log, _recorder) = lanes_on(fake.addr().port(), BTreeMap::new());
+        let share = lanes
+            .reserve((MACHINE.to_string(), REMOTE_PORT), &fake_entry())
+            .expect("reserves");
+        let transport = Arc::new(CountingTransport {
+            inner: TauriTransport::new(&share),
+            dials: AtomicUsize::new(0),
+        });
+        let client = GxClient::new(
+            fake.reported_url(),
+            Arc::clone(&transport) as Arc<dyn GxTransport>,
+            Arc::new(
+                StaticCredentials::from_parts(&fake.token(), &fake.instance_id())
+                    .expect("the fake's token parses"),
+            ),
+            gx_fast(),
+        )
+        .expect("the gx client builds");
+
+        let (mut rx, _stop) = client
+            .subscribe(GX_SID, None)
+            .await
+            .expect("subscribe never fails")
+            .into_parts();
+        // Drain the seed.
+        loop {
+            match rx.recv().await.expect("the seed") {
+                LaneEvent::Ready { .. } => break,
+                LaneEvent::Down { reason } => panic!("the seed went down: {reason}"),
+                _ => {}
+            }
+        }
+        let dials_at_ready = transport.dials.load(SeqCst);
+        let ensures_at_ready = log.ensures.load(SeqCst);
+        assert!(
+            ensures_at_ready > 0,
+            "the seed dialled through the hook, so the tunnel was ensured"
+        );
+
+        // **The `ssh -N -L` child dies**, which is what killed the stream — the
+        // failure §8.5 stages by hand, modelled here in the order it really
+        // happens: the tunnel goes, and the stream ends BECAUSE it went.
+        log.alive.store(false, SeqCst);
+        fake.close_streams();
+        wait_for("the fake to release the stream", || {
+            (fake.stream_count() == 0).then_some(())
+        })
+        .await;
+        // …and something happened on the far side while the lane was gone.
+        fake.push_update(GX_SID, &gx_chunk(20, "GAP"));
+
+        // The gap frame arriving IS the silent resume completing.
+        let mut seen = Vec::new();
+        loop {
+            let event = tokio::time::timeout(Duration::from_secs(10), rx.recv())
+                .await
+                .expect("the resumed stream delivered nothing")
+                .expect("the lane stream ended");
+            let hit = matches!(&event, LaneEvent::Message { message, .. }
+                if message.text.as_deref().is_some_and(|t| t.contains("GAP")));
+            seen.push(event);
+            if hit {
+                break;
+            }
+        }
+
+        assert!(
+            !seen.iter().any(|e| matches!(e, LaneEvent::Reset { .. })),
+            "a resume the server accepted is SILENT — the panel is never restaged"
+        );
+        assert!(
+            transport.dials.load(SeqCst) > dials_at_ready,
+            "the reconnect went through the transport hook"
+        );
+        assert!(
+            log.ensures.load(SeqCst) > ensures_at_ready,
+            "and the hook re-established the tunnel — which is the ONLY thing \
+             that respawns a dead `ssh -N` child under a lane that never emits \
+             a Reset"
+        );
+        assert!(
+            log.alive.load(SeqCst),
+            "the tunnel is up again, and nothing waited on a human for it"
+        );
     }
 
     /// A fake with one root session, seeded so its transcript is non-empty.

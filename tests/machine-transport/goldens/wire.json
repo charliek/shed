@@ -6,6 +6,7 @@
   "double-quote": "'sx' 'rc' 'create' '--name' 'say \"hi\"'",
   "empty-string": "'sx' 'rc' 'create' '--name' ''",
   "flag-with-value": "'sx' 'rc' 'create' '--kind' 'shell' '--slug' 'abc123'",
+  "gx-probe": "'sh' '-c' 'h=${GROK_HOME:-$HOME/.grok}\nfor f in \"$h\"/gx-remote*.json; do\n  [ -f \"$f\" ] || continue\n  cat \"$f\" 2>/dev/null\n  printf \"\\n---\\n\"\ndone\nprintf \"===token===\\n\"\nt=\"$h/gx-remote.token\"\nfind \"$t\" -prune -type f -perm 0600 -user \"$(id -un)\" -exec cat {} \\; 2>/dev/null\nexit 0\n'",
   "leading-dash": "'sx' 'rc' 'create' '--name' '--not-a-flag'",
   "many-args": "'/home/charliek/.local/bin/sx' 'rc' 'create' '--kind' 'shell' '--name' 'plan 012 probe' '--slug' 'hkn4vd' '--target' 'local' '--created-by' 'sx'",
   "newline": "'sx' 'rc' 'create' '--name' 'line one\nline two'",

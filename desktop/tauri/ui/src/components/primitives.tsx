@@ -83,6 +83,11 @@ const AGENT_COLOR: Record<string, string> = {
   "codex-rc": "#10A37F",
   cursor: "#6E56CF",
   opencode: "#3B82F6",
+  // One colour for both, because they are one agent: `gx` is a grok tab whose
+  // remote lane is up, `grok` the same tab before (or without) it. A rail that
+  // changed colour when the lane bound would read as the agent being replaced.
+  gx: "#E5484D",
+  grok: "#E5484D",
   shell: "var(--shed-text-muted)",
 };
 export function agentColor(kind: string): string {

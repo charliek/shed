@@ -291,7 +291,7 @@ if $DO_DESKTOP; then
   # must have refreshed to $V. The generic check above only proves the member
   # (shed-desktop-tauri) is $V; a future cargo change that stopped refreshing
   # path deps would slip past it.
-  for dep in shed-core shed-app shed-rc-engine shed-broker shed-opencode; do
+  for dep in shed-core shed-app shed-rc-engine shed-broker shed-opencode shed-gx; do
     if ! grep -A1 "^name = \"${dep}\"$" Cargo.lock | grep -q "^version = \"$V\""; then
       echo "error: desktop/tauri/src-tauri/Cargo.lock still pins ${dep} at the old version (expected $V)." >&2
       exit 1

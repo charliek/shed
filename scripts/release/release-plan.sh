@@ -174,7 +174,7 @@ if [ "${SHIP_DESKTOP}" = "true" ]; then
   # The Tauri lock's path-dep entries: build-deb.sh's `cargo build --locked`
   # pins the workspace path-dep crates by version — a stale entry fails the .deb build
   # mid-release. `[[package]]` blocks put `version` on the line after `name`.
-  for dep in shed-core shed-app shed-rc-engine shed-broker shed-opencode; do
+  for dep in shed-core shed-app shed-rc-engine shed-broker shed-opencode shed-gx; do
     LOCK_V="$(grep -A1 "^name = \"${dep}\"$" "${REPO_ROOT}/desktop/tauri/src-tauri/Cargo.lock" | grep -m1 '^version = ' | sed -E 's/.*"([^"]+)".*/\1/' || true)"
     [ "${LOCK_V}" = "${DESKTOP_V}" ] || fail_lockstep "desktop/tauri/src-tauri/Cargo.lock entry for ${dep}" "${LOCK_V:-<missing>}"
   done

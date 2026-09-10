@@ -225,7 +225,9 @@ def _quit_subproc(target: str) -> None:
 def launch(target: str = "mac", *, mock_base_url: str, config_path: Path, state_dir: Path,
            host_agent_socket: str | None = None, unreachable_hosts: tuple[str, ...] = (),
            credential_hosts: tuple[str, ...] = (),
-           roost_sockets: dict[str, object] | None = None) -> None:
+           roost_sockets: dict[str, object] | None = None,
+           gx_home: object | None = None,
+           gx_timings_ms: str | None = None) -> None:
     """Launch the UI hermetically and block until it answers `identify`.
 
     `state_dir` is the throwaway per-session dir: on mac SHED_DESKTOP_STATE_DIR;
@@ -251,6 +253,16 @@ def launch(target: str = "mac", *, mock_base_url: str, config_path: Path, state_
     roost-session daemon is a separate, explicit opt-in — see the
     `SHEDTEST_ROOST_SOCKETS` harness var read by conftest.py's `_app_session`
     fixture.
+    `gx_home` is the fixture `$GROK_HOME` the gx lane's LOCAL credential reader
+    looks in (`<PREFIX>_GX_HOME`) — a directory holding a fake `gx-remote*.json`
+    record and a `0600` `gx-remote.token`, so the SHIPPED reader (checks and all)
+    finds them without the run touching the developer's real `~/.grok`.
+    `gx_timings_ms` shrinks the gx adapter's windows
+    (`<PREFIX>_GX_TIMINGS_MS`, e.g. `stall=2000,flush_after=300,down_after=6000`)
+    so a cell exercises the reconnect ladder in seconds instead of minutes. Both
+    are test-mode-only on the app side and set-or-clear here, for the same reason
+    `roost_sockets` is: an inherited `GX_HOME` reaching a hermetic launch would
+    point the app at a REAL token. Tauri-only.
     `credential_hosts` are server NAMES that keep their REAL control-credential
     wiring against the mock (host agent + the config's auth_mode) instead of the
     tokenless open-mode shortcut — the agent-upgrade scenario's override, mac-only
@@ -265,7 +277,8 @@ def launch(target: str = "mac", *, mock_base_url: str, config_path: Path, state_
         _launch_subproc(target, mock_base_url=mock_base_url, config_path=config_path,
                         runtime_dir=state_dir, host_agent_socket=host_agent_socket,
                         unreachable_hosts=unreachable_hosts,
-                        roost_sockets=roost_sockets)
+                        roost_sockets=roost_sockets,
+                        gx_home=gx_home, gx_timings_ms=gx_timings_ms)
     else:
         raise ValueError(f"unknown target {target!r} (want {'|'.join(TARGETS)})")
 
@@ -307,7 +320,9 @@ def _launch_mac(*, mock_base_url: str, config_path: Path, state_dir: Path,
 def subproc_env(cfg: _Subproc, *, runtime_dir: Path, mock_base_url: str,
                 config_path: Path, host_agent_socket: str | None = None,
                 unreachable_hosts: tuple[str, ...] = (),
-                roost_sockets: dict[str, object] | None = None) -> dict[str, str]:
+                roost_sockets: dict[str, object] | None = None,
+                gx_home: object | None = None,
+                gx_timings_ms: str | None = None) -> dict[str, str]:
     """The launch env for a subprocess UI — the single source of the subprocess
     env-var contract, shared by the session launcher and a self-managed instance
     (down-host). HOME/XDG_RUNTIME_DIR/XDG_CONFIG_HOME are redirected to the
@@ -324,38 +339,56 @@ def subproc_env(cfg: _Subproc, *, runtime_dir: Path, mock_base_url: str,
     # The approval gate's host-agent socket (the fake, in tests).
     if host_agent_socket:
         env[f"{cfg.env_prefix}_HOST_AGENT_SOCKET"] = str(host_agent_socket)
-    # Down-host override: server NAMES the backend redirects to a closed port.
-    # Always set-or-clear (like the socket below) so an inherited value from the
-    # parent shell never leaks into a normal (empty) session.
-    unreachable_key = f"{cfg.env_prefix}_MOCK_UNREACHABLE_HOSTS"
-    if unreachable_hosts:
-        env[unreachable_key] = ",".join(unreachable_hosts)
-    else:
-        env.pop(unreachable_key, None)
-    # The roost seam: every `machines:` entry (and the implicit `localhost`) is
-    # reached on the named Unix socket directly, instead of through roost's SSH
-    # client-bridge. Set-or-clear like the key above: an inherited value from
-    # the parent shell must never leak into a hermetic launch. Driving the
-    # session app against a real roost-session daemon is an explicit harness
-    # opt-in via SHEDTEST_ROOST_SOCKETS (see conftest.py's `_app_session` fixture and
-    # `.claude/skills/shedtest-linux`), not env inheritance here.
-    roost_key = f"{cfg.env_prefix}_ROOST_SOCKETS"
-    if roost_sockets:
-        env[roost_key] = ",".join(f"{n}={p}" for n, p in roost_sockets.items())
-    else:
-        env.pop(roost_key, None)
+    # **Every app-level knob below is SET-OR-CLEARED**, never merely set: an
+    # inherited value from the parent shell must not reach a hermetic launch.
+    # One loop rather than a stanza each, so the rule is structural — a knob
+    # added to this table cannot forget to clear itself.
+    #
+    #  * MOCK_UNREACHABLE_HOSTS — down-host override: server NAMES the backend
+    #    redirects to a closed port.
+    #  * ROOST_SOCKETS — the roost seam: every `machines:` entry (and the
+    #    implicit `localhost`) is reached on the named Unix socket directly,
+    #    instead of through roost's SSH client-bridge. Driving the session app
+    #    against a REAL roost-session daemon is an explicit harness opt-in via
+    #    SHEDTEST_ROOST_SOCKETS (see conftest.py's `_app_session` fixture and
+    #    `.claude/skills/shedtest-linux`), not env inheritance here.
+    #  * GX_HOME — points the gx lane's LOCAL credential reader at a fixture
+    #    $GROK_HOME (a fake record + a 0600 token) instead of the developer's
+    #    real ~/.grok. This is the one where the rule is load-bearing rather
+    #    than tidy: an inherited value would point the app at a REAL token.
+    #  * GX_TIMINGS_MS — shrinks the gx adapter's windows
+    #    (`stall=…,resume_window=…,flush_after=…,down_after=…`, in ms) so a cell
+    #    does not wait out a thirty-second stall.
+    #  * SOCKET — cleared unconditionally so the XDG default (under
+    #    runtime_dir) is used.
+    #
     # NOTE: there is no roost poll knob to set. Since plan 014 the watcher
     # observes roost's push feed (`events.subscribe`) instead of polling
     # `tab.list`, so a machine-row change arrives when roost commits it — the
     # cadence env var this used to seed was deleted on both sides.
-    env.pop(f"{cfg.env_prefix}_SOCKET", None)
+    managed = {
+        "MOCK_UNREACHABLE_HOSTS": ",".join(unreachable_hosts) if unreachable_hosts else None,
+        "ROOST_SOCKETS": (",".join(f"{n}={p}" for n, p in roost_sockets.items())
+                          if roost_sockets else None),
+        "GX_HOME": str(gx_home) if gx_home else None,
+        "GX_TIMINGS_MS": gx_timings_ms or None,
+        "SOCKET": None,
+    }
+    for suffix, value in managed.items():
+        key = f"{cfg.env_prefix}_{suffix}"
+        if value:
+            env[key] = value
+        else:
+            env.pop(key, None)
     return env
 
 
 def _launch_subproc(target: str, *, mock_base_url: str, config_path: Path,
                     runtime_dir: Path, host_agent_socket: str | None = None,
                     unreachable_hosts: tuple[str, ...] = (),
-                    roost_sockets: dict[str, object] | None = None) -> None:
+                    roost_sockets: dict[str, object] | None = None,
+                    gx_home: object | None = None,
+                    gx_timings_ms: str | None = None) -> None:
     cfg = _SUBPROC[target]
     if not cfg.binary.exists():
         raise RuntimeError(
@@ -364,7 +397,8 @@ def _launch_subproc(target: str, *, mock_base_url: str, config_path: Path,
     env = subproc_env(cfg, runtime_dir=runtime_dir, mock_base_url=mock_base_url,
                       config_path=config_path, host_agent_socket=host_agent_socket,
                       unreachable_hosts=unreachable_hosts,
-                      roost_sockets=roost_sockets)
+                      roost_sockets=roost_sockets,
+                      gx_home=gx_home, gx_timings_ms=gx_timings_ms)
     st = _state[target]
     st.env = env
     st.runtime_dir = runtime_dir

@@ -531,23 +531,24 @@ jobs:
             exit 1
           fi
           sudo timeout 300 apt-get install -y build-essential
-      - name: shed-core + shed-opencode — test + clippy (Linux)
+      - name: shed-core + shed-opencode + shed-gx — test + clippy (Linux)
         # Scoped to -p so the macOS-only shed-core-ffi (uniffi) is never dragged
         # in. --all-targets runs the pinned-TLS verifier + redirect/non-https
         # fail-closed tests here; the e2e's plain-HTTP mock never exercises the
         # pin/token paths, so they stay cargo-only on Linux.
         #
-        # shed-opencode (plan 015) rides along rather than getting a job of its
-        # own: it is a pure client of shed-core's lane contract with the same
-        # dependency surface, its whole suite is hermetic (the loopback
-        # `FakeOpencode` behind the `test-support` feature — the env-gated live
-        # smoke skips without `SHED_OPENCODE_LIVE`), and it is the crate the
-        # Tauri app now links, so a break here must not first surface as a
-        # desktop build failure. Named EXPLICITLY, like the engine leg below: a
-        # filter that matched nothing would run zero tests silently.
+        # shed-opencode (plan 015) and shed-gx (plan 017) ride along rather than
+        # getting jobs of their own: each is a pure client of shed-core's lane
+        # contract with the same dependency surface, each suite is hermetic (the
+        # loopback `FakeOpencode`/`FakeGx` behind the `test-support` feature —
+        # the env-gated live smokes skip without `SHED_OPENCODE_LIVE` /
+        # `SHED_GX_LIVE`), and both are crates the Tauri app links, so a break
+        # here must not first surface as a desktop build failure. Named
+        # EXPLICITLY, like the engine leg below: a filter that matched nothing
+        # would run zero tests silently.
         run: |
-          cargo test -p shed-core -p shed-opencode --all-targets --locked
-          cargo clippy -p shed-core -p shed-opencode --all-targets --locked -- -D warnings
+          cargo test -p shed-core -p shed-opencode -p shed-gx --all-targets --locked
+          cargo clippy -p shed-core -p shed-opencode -p shed-gx --all-targets --locked -- -D warnings
 
   # The host-agent wire-goldens leg (Phase 3 leg 3a.1; the Go twin sunset by
   # plan 006-mtls-cleanup-hostagent-sunset.md). One Linux job covers BOTH the

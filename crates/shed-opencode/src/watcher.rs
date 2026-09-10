@@ -491,7 +491,7 @@ impl Watcher {
         if !emit {
             return;
         }
-        let now = now_utc();
+        let now = now_utc().timestamp_millis();
         for row in rows {
             let message = self.ring.append(row, now);
             self.emit(LaneEvent::Message {
@@ -873,29 +873,15 @@ where
 
 // ---- backoff ----
 
-fn next_backoff(current: Duration, worked: bool) -> Duration {
-    if worked {
-        return OC_BACKOFF_BASE;
-    }
-    let doubled = current.saturating_mul(2);
-    if doubled > OC_BACKOFF_MAX {
-        OC_BACKOFF_MAX
-    } else {
-        doubled
-    }
-}
+// The curve itself is `shed_core::lane::backoff` — the second lane adapter needs
+// the identical one, and its floor/ceiling differ, which is why the shared half
+// takes them as arguments. `jittered` is re-exported unchanged; `next_backoff`
+// keeps this crate's two-argument spelling by binding opencode's own bounds, so
+// every call site (and every test) below is untouched.
+pub(crate) use shed_core::lane::backoff::jittered;
 
-/// A duration in `[d/2, d]`. Spreading matters when several subscriptions lose
-/// the same server at once; the precision does not, so the wall clock's
-/// sub-second component is entropy enough and no `rand` dependency is taken.
-fn jittered(d: Duration) -> Duration {
-    let half = d / 2;
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| u64::from(d.subsec_nanos()))
-        .unwrap_or(0);
-    let span = half.as_nanos() as u64 + 1;
-    half + Duration::from_nanos(nanos % span)
+fn next_backoff(current: Duration, worked: bool) -> Duration {
+    shed_core::lane::backoff::next_backoff(current, worked, OC_BACKOFF_BASE, OC_BACKOFF_MAX)
 }
 
 // ---- the frame peek ----
@@ -1005,6 +991,29 @@ mod tests {
         assert_eq!(d, OC_BACKOFF_MAX);
         assert_eq!(next_backoff(d, true), OC_BACKOFF_BASE);
         assert_eq!(next_backoff(OC_BACKOFF_BASE, false), OC_BACKOFF_BASE * 2);
+
+        // The curve itself now lives in `shed_core::lane::backoff`, and this
+        // crate's two-argument spelling is that function bound to opencode's own
+        // floor and ceiling — asserted, so the binding cannot quietly acquire a
+        // second set of bounds.
+        for current in [OC_BACKOFF_BASE, OC_BACKOFF_MAX, Duration::from_secs(3)] {
+            for worked in [true, false] {
+                assert_eq!(
+                    next_backoff(current, worked),
+                    shed_core::lane::backoff::next_backoff(
+                        current,
+                        worked,
+                        OC_BACKOFF_BASE,
+                        OC_BACKOFF_MAX
+                    ),
+                    "{current:?} worked={worked}",
+                );
+            }
+        }
+        assert!(std::ptr::fn_addr_eq(
+            jittered as fn(Duration) -> Duration,
+            shed_core::lane::backoff::jittered as fn(Duration) -> Duration,
+        ));
     }
 
     #[test]

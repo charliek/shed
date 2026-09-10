@@ -926,3 +926,55 @@ async fn a_cancelled_answer_releases_its_claim_so_a_retry_is_accepted() {
     );
     assert_clean(&fake);
 }
+
+/// The moved shared pieces resolve at BOTH paths, from OUTSIDE the crate.
+///
+/// `MessageRing`, the feed vocabulary and the sanitizers now live in
+/// `shed_core::lane::{ring,feed}`; every one of them is still reachable at the
+/// `shed_opencode::*` path a consumer (or a lagging call site) already spells,
+/// and each is the SAME item rather than a second copy — a ring built through
+/// this crate's re-export is accepted where the contract crate's type is asked
+/// for, which would not compile if the two had forked.
+#[test]
+fn the_shared_ring_and_feed_helpers_resolve_at_both_paths() {
+    fn core_seq(r: &mut shed_core::lane::ring::MessageRing) -> u64 {
+        r.append(shed_core::rc::RcFeedMessage::default(), 1_700_000_000_000)
+            .seq
+    }
+
+    // The crate-root re-export (`shed_opencode::MessageRing`) and the module
+    // one (`shed_opencode::ring::MessageRing`) are both shed-core's type.
+    let mut root: shed_opencode::MessageRing = shed_opencode::MessageRing::new();
+    let mut module: shed_opencode::ring::MessageRing = shed_opencode::ring::MessageRing::new();
+    assert_eq!(core_seq(&mut root), 1);
+    assert_eq!(core_seq(&mut module), 1);
+
+    // The ring's caps came along unchanged, at both paths.
+    assert_eq!(
+        shed_opencode::ring::MAX_RING_MESSAGES,
+        shed_core::lane::ring::MAX_RING_MESSAGES
+    );
+    assert_eq!(
+        shed_opencode::ring::MAX_MESSAGES_LIMIT,
+        shed_core::lane::ring::MAX_MESSAGES_LIMIT
+    );
+
+    // And the feed half is reachable from the contract crate by any consumer —
+    // which is the whole reason it moved: `shed-gx` must never `use
+    // shed_opencode::…` for a sanitizer.
+    assert_eq!(shed_core::lane::feed::FEED_ROLE_ASSISTANT, "assistant");
+    assert_eq!(
+        shed_core::lane::feed::sanitize_feed_text("\u{1b}[31mred\u{1b}[0m\nkept"),
+        "red\nkept"
+    );
+    assert_eq!(shed_core::lane::feed::bound_token("pend\ning"), "pending");
+    assert_eq!(
+        shed_core::lane::backoff::next_backoff(
+            Duration::from_millis(500),
+            false,
+            Duration::from_millis(500),
+            Duration::from_secs(30)
+        ),
+        Duration::from_secs(1)
+    );
+}

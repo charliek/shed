@@ -464,6 +464,11 @@ function ApprovalsPane({ approvals }: { approvals: Approval[] }) {
 const RC_KIND_LABELS: Record<string, string> = {
   "claude-rc": "Claude", codex: "Codex", opencode: "opencode",
   cursor: "Cursor", shell: "Shell",
+  // Two kinds, one binary family. `gx` is the lane-bearing one — a grok tab
+  // that bound its remote lane — and `grok` is the same agent without one:
+  // status only, no transcript. The labels keep them apart on purpose, because
+  // whether a row has a Transcript affordance is exactly the difference.
+  gx: "gx", grok: "Grok",
 };
 const rcKindLabel = (k: RcKind): string => RC_KIND_LABELS[k] ?? k;
 
