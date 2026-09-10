@@ -1338,11 +1338,18 @@ export type LaneOpened = { session: LaneSessionRow; capabilities: LaneCapabiliti
  *  express a real menu — gx offers five permission options with two of kind
  *  `allow_once`, so `permission` cannot say which one was pressed. `permission`
  *  resolves by SEMANTIC kind instead, and note its KEBAB spellings — the IPC
- *  grammar's, not the option ids' (`allow_once`). */
+ *  grammar's, not the option ids' (`allow_once`).
+ *
+ *  `custom_text` is a MODIFIER of `question`, not a fifth form: one entry per
+ *  question, positional like `question`, `null` where nothing was typed. Beside
+ *  any other form it is a `bad_request` — which is why the union spells it only
+ *  on that member, so a panel cannot type-check its way into a silent drop. The
+ *  backend trims it and refuses text aimed at a question whose `custom` is
+ *  false. */
 export type LaneAnswer =
   | { choice: string }
   | { permission: "allow-once" | "allow-always" | "reject" }
-  | { question: string[][] }
+  | { question: string[][]; custom_text?: (string | null)[] }
   | { reject: true };
 
 /** `{machine, session_id, event}` — the Tauri `lane-event` payload. The panel

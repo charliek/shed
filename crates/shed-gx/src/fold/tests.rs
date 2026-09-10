@@ -1118,9 +1118,11 @@ fn a_question_is_keyed_by_its_text_and_its_options_carry_no_posture() {
     assert_eq!(a.questions[0].header, "");
     assert!(!a.questions[0].multiple);
     assert!(a.questions[1].multiple);
-    // Free text on gx is an "Other" answer plus an annotations channel the
-    // contract cannot carry yet, so typing is never invited.
-    assert!(!a.questions[0].custom && !a.questions[1].custom);
+    // gx's pager ALWAYS draws a freeform row beside the options and the ask
+    // carries no flag that could say otherwise, so every question takes free
+    // text. The answer carries it as an `Other` label plus an
+    // `annotations[key].notes` entry (`client::answer_body`).
+    assert!(a.questions[0].custom && a.questions[1].custom);
 
     // A question's answer labels ARE its option ids, and they carry no
     // permission posture — "Postgres" is not `allow_once`.

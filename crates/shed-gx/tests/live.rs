@@ -44,7 +44,7 @@ use shed_core::rc::RcActivity;
 use shed_gx::discovery::{record_files, GxRecord, StaticCredentials, DEFAULT_GROK_HOME};
 use shed_gx::transport::FixedDial;
 use shed_gx::{GxClient, GxTimings};
-use tokio::sync::mpsc::UnboundedReceiver;
+use tokio::sync::mpsc::Receiver;
 
 /// The gx this smoke was written against. It names the fixtures directory, so a
 /// later run on a newer gx records BESIDE it rather than over it.
@@ -277,7 +277,7 @@ async fn live_smoke() {
 async fn settle_an_approval(
     lane: &GxClient,
     session: &str,
-    rx: &mut UnboundedReceiver<LaneEvent>,
+    rx: &mut Receiver<LaneEvent>,
     recorder: &mut Recorder,
     raise_it: bool,
 ) -> bool {
@@ -517,7 +517,7 @@ fn caller_uid() -> u32 {
 // waiting
 // ---------------------------------------------------------------------------
 
-async fn until_ready(rx: &mut UnboundedReceiver<LaneEvent>) -> Vec<LaneEvent> {
+async fn until_ready(rx: &mut Receiver<LaneEvent>) -> Vec<LaneEvent> {
     let mut out = Vec::new();
     loop {
         let ev = match tokio::time::timeout(TURN_DEADLINE, rx.recv()).await {

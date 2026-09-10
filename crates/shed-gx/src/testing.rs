@@ -183,6 +183,9 @@ struct FakeState {
     hangups: Vec<String>,
     /// Path suffix → a status whose head promises a body that never arrives.
     truncations: Vec<(String, u16)>,
+    /// Path suffixes whose request is PARKED until released. See
+    /// [`FakeGx::hold_get`].
+    held: Vec<String>,
     next_id: u64,
 }
 
@@ -199,6 +202,8 @@ pub struct FakeGx {
     streams: Arc<AtomicUsize>,
     /// Wakes the accept loop so it can drop the listener and exit.
     stop: Arc<Notify>,
+    /// Wakes every parked request handler ([`FakeGx::release_get`]).
+    release: Arc<Notify>,
     /// `None` while the port is deliberately closed
     /// ([`FakeGx::stop_listening`]).
     accept: Mutex<Option<JoinHandle<()>>>,
@@ -229,6 +234,7 @@ impl FakeGx {
         let (hangup, _) = broadcast::channel(8);
         let streams = Arc::new(AtomicUsize::new(0));
         let stop = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
         let accept = tokio::spawn(accept_loop(
             listener,
             Arc::clone(&state),
@@ -236,6 +242,7 @@ impl FakeGx {
             hangup.clone(),
             Arc::clone(&streams),
             Arc::clone(&stop),
+            Arc::clone(&release),
         ));
         FakeGx {
             state,
@@ -244,6 +251,7 @@ impl FakeGx {
             hangup,
             streams,
             stop,
+            release,
             accept: Mutex::new(Some(accept)),
         }
     }
@@ -445,6 +453,24 @@ impl FakeGx {
         self.lock().delays.push((suffix.to_string(), millis));
     }
 
+    /// PARK every request whose path ends with `suffix` until
+    /// [`FakeGx::release_get`] — [`FakeGx::delay_get`] with the clock taken out
+    /// of it, so "while the seed is in flight" is a condition a test can stand
+    /// on rather than a race it has to widen a window to win.
+    ///
+    /// The request is already in [`FakeGx::requests`] (and
+    /// [`FakeGx::paths`]) while it is parked, which is how a test waits for the
+    /// hold to take effect.
+    pub fn hold_get(&self, suffix: &str) {
+        self.lock().held.push(suffix.to_string());
+    }
+
+    /// Release everything [`FakeGx::hold_get`] parked for `suffix`.
+    pub fn release_get(&self, suffix: &str) {
+        self.lock().held.retain(|h| h != suffix);
+        self.release.notify_waiters();
+    }
+
     fn broadcast(&self, session: &str, wire: String) {
         let _ = self.frames.send(Frame {
             wire,
@@ -498,6 +524,7 @@ impl FakeGx {
             self.hangup.clone(),
             Arc::clone(&self.streams),
             Arc::clone(&self.stop),
+            Arc::clone(&self.release),
         ));
         *self.lock_accept() = Some(task);
     }
@@ -740,6 +767,7 @@ async fn accept_loop(
     hangup: broadcast::Sender<()>,
     streams: Arc<AtomicUsize>,
     stop: Arc<Notify>,
+    release: Arc<Notify>,
 ) {
     loop {
         tokio::select! {
@@ -752,6 +780,7 @@ async fn accept_loop(
                     frames.clone(),
                     hangup.subscribe(),
                     Arc::clone(&streams),
+                    Arc::clone(&release),
                 ));
             }
         }
@@ -766,6 +795,7 @@ async fn serve(
     frames: broadcast::Sender<Frame>,
     hangup: broadcast::Receiver<()>,
     streams: Arc<AtomicUsize>,
+    release: Arc<Notify>,
 ) {
     let (read, mut write) = sock.into_split();
     let mut reader = BufReader::new(read);
@@ -887,6 +917,21 @@ async fn serve(
 
     for frame in injected {
         let _ = frames.send(frame);
+    }
+    loop {
+        // The `notified()` future is created BEFORE the condition is re-read,
+        // so a release that lands in between is not missed.
+        let notified = release.notified();
+        let held = {
+            let st = state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            st.held.iter().any(|h| path.ends_with(h.as_str()))
+        };
+        if !held {
+            break;
+        }
+        notified.await;
     }
     if delay > 0 {
         tokio::time::sleep(std::time::Duration::from_millis(delay)).await;

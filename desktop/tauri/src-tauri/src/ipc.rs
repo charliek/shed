@@ -1106,7 +1106,9 @@ impl Handler {
     /// `answer` is one of `{choice: "<option id>"}` (the offered option, by its
     /// own id — what the panel sends), `{permission:
     /// "allow-once"|"allow-always"|"reject"}` (by semantic kind),
-    /// `{question: [[…]]}` or `{reject: true}`. See [`crate::lane::parse_answer`].
+    /// `{question: [[…]]}` — optionally with `custom_text: [string|null]`, the
+    /// free text per question — or `{reject: true}`. See
+    /// [`crate::lane::parse_answer`].
     async fn lane_answer(&self, params: &Value) -> Result<Value, (String, String)> {
         let (machine, session_id) = lane_target(params)?;
         let approval_id = req_str(params, "approval_id")?.to_string();
@@ -1776,6 +1778,15 @@ mod tests {
             json!({"reject": false}),
             json!({}),
             json!({"permission": "reject", "question": [["yes"]]}),
+            // `custom_text` in every invalid combination (plan 018 §3.2): the
+            // three forms it does not modify, a shape that is not a list of
+            // strings-or-null, and the key on its own.
+            json!({"choice": "p-1", "custom_text": ["typed"]}),
+            json!({"permission": "allow-once", "custom_text": ["typed"]}),
+            json!({"reject": true, "custom_text": ["typed"]}),
+            json!({"custom_text": ["typed"]}),
+            json!({"question": [["yes"]], "custom_text": "typed"}),
+            json!({"question": [["yes"]], "custom_text": [3]}),
         ];
         for bad in bad_answers {
             let socket =

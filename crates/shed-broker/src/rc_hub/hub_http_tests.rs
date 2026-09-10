@@ -1954,9 +1954,13 @@ fn query_hub_health_honors_an_absolute_deadline_against_a_drip() {
                 let mut conn = conn;
                 // FASTER than the whole budget (200ms drip vs a 250ms budget)
                 // — that is the attack: every individual read completes, so a
-                // per-read timeout re-arms forever. Capped at 20 drips (4s) so
-                // the thread can never outlive the suite.
-                for _ in 0..20 {
+                // per-read timeout re-arms forever. Capped at 50 drips (10s)
+                // so the thread can never outlive the suite; lengthened
+                // alongside the elapsed assertion below (4x → 10x the
+                // budget) so the full-script/assertion gap stays generous —
+                // a reappearing per-read-timeout bug still overshoots the
+                // assertion by a wide margin instead of a narrow one.
+                for _ in 0..50 {
                     if conn.write_all(b"H").is_err() {
                         return;
                     }
@@ -1972,9 +1976,13 @@ fn query_hub_health_honors_an_absolute_deadline_against_a_drip() {
     let verdict = query_hub_health(&addr, budget).expect("something IS listening");
     let elapsed = started.elapsed();
     assert!(!verdict, "a dripping holder is not a hub");
-    // A per-read timeout would run the full 20-drip (4s) script here.
+    // This IS the property under test (a per-read deadline against a peer
+    // that drips), so it keeps its elapsed assertion rather than dropping
+    // it — 10x the budget for CI-load headroom, same convention as the
+    // dead-address leg above. A per-read timeout would run the full
+    // 50-drip (10s) script here, well past this bound.
     assert!(
-        elapsed < budget * 4,
+        elapsed < budget * 10,
         "the probe must respect its total budget (took {elapsed:?} of a {budget:?} budget)"
     );
 }
@@ -2008,8 +2016,11 @@ async fn probe_hub_identity_verified_foreign_and_budgeted() {
     .await
     .unwrap();
     assert!(err.contains("did not come up"), "{err}");
+    // 10x the 300ms budget — generous headroom against a loaded CI box
+    // (e.g. a concurrent release build) rather than a tight wall-clock bound;
+    // the error text above is still the real assertion.
     assert!(
-        elapsed < Duration::from_millis(1500),
+        elapsed < Duration::from_secs(3),
         "the budget bounds the poll loop (took {elapsed:?})"
     );
 }

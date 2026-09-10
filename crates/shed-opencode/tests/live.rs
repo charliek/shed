@@ -37,7 +37,7 @@ use shed_core::lane::{
 use shed_core::rc::RcActivity;
 use shed_opencode::OpencodeClient;
 use tokio::io::{AsyncBufReadExt as _, BufReader};
-use tokio::sync::mpsc::UnboundedReceiver;
+use tokio::sync::mpsc::Receiver;
 
 /// The model the plan names as the cheapest known free option. If the host does
 /// not offer it, the first model `GET /config/providers` lists is used instead;
@@ -189,6 +189,7 @@ async fn live_smoke() {
                 &question.id,
                 LaneAnswer::Question {
                     answers: vec![vec![answer]],
+                    custom_text: vec![],
                 },
             )
             .await
@@ -541,7 +542,7 @@ fn fixtures_dir() -> PathBuf {
 
 // ---- bounded waits -------------------------------------------------------
 
-async fn next_event(rx: &mut UnboundedReceiver<LaneEvent>, what: &str) -> LaneEvent {
+async fn next_event(rx: &mut Receiver<LaneEvent>, what: &str) -> LaneEvent {
     match tokio::time::timeout(TURN_DEADLINE, rx.recv()).await {
         Err(_) => panic!("timed out after {TURN_DEADLINE:?} waiting for {what}"),
         Ok(None) => panic!("the lane stream ENDED while waiting for {what}"),
@@ -549,7 +550,7 @@ async fn next_event(rx: &mut UnboundedReceiver<LaneEvent>, what: &str) -> LaneEv
     }
 }
 
-async fn until_ready(rx: &mut UnboundedReceiver<LaneEvent>) -> Vec<LaneEvent> {
+async fn until_ready(rx: &mut Receiver<LaneEvent>) -> Vec<LaneEvent> {
     let mut out = Vec::new();
     loop {
         let ev = next_event(rx, "the seed's Ready").await;
@@ -562,7 +563,7 @@ async fn until_ready(rx: &mut UnboundedReceiver<LaneEvent>) -> Vec<LaneEvent> {
 }
 
 async fn wait_for_message(
-    rx: &mut UnboundedReceiver<LaneEvent>,
+    rx: &mut Receiver<LaneEvent>,
     want: impl Fn(&shed_core::rc::RcFeedMessage) -> bool,
 ) -> shed_core::rc::RcFeedMessage {
     loop {
@@ -575,7 +576,7 @@ async fn wait_for_message(
 }
 
 async fn wait_for_session(
-    rx: &mut UnboundedReceiver<LaneEvent>,
+    rx: &mut Receiver<LaneEvent>,
     want: impl Fn(&shed_core::lane::LaneSession) -> bool,
 ) -> shed_core::lane::LaneSession {
     loop {
@@ -588,7 +589,7 @@ async fn wait_for_session(
 }
 
 async fn wait_for_approval(
-    rx: &mut UnboundedReceiver<LaneEvent>,
+    rx: &mut Receiver<LaneEvent>,
     want: impl Fn(&shed_core::lane::LaneApproval) -> bool,
 ) -> shed_core::lane::LaneApproval {
     try_wait_for_approval(rx, TURN_DEADLINE, want)
@@ -599,7 +600,7 @@ async fn wait_for_approval(
 /// `None` when nothing matching arrived inside `deadline` — the question leg
 /// tolerates that, the permission leg does not.
 async fn try_wait_for_approval(
-    rx: &mut UnboundedReceiver<LaneEvent>,
+    rx: &mut Receiver<LaneEvent>,
     deadline: Duration,
     want: impl Fn(&shed_core::lane::LaneApproval) -> bool,
 ) -> Option<shed_core::lane::LaneApproval> {

@@ -961,8 +961,8 @@ def test_a_two_question_form_posts_answers_keyed_by_the_question_text(app, gx, f
     assert [q["id"] for q in live["questions"]] == [first, second], (
         "the key an answer is filed under rides on the DTO")
     assert [q["multiple"] for q in live["questions"]] == [False, True]
-    assert all(q["custom"] is False for q in live["questions"]), (
-        "free text on gx needs an annotations channel the contract cannot carry")
+    assert all(q["custom"] is True for q in live["questions"]), (
+        "gx's pager always draws a freeform row, so every question takes free text")
 
     panel = _panel(app)
     card = _card(app, approval_id)
@@ -977,7 +977,150 @@ def test_a_two_question_form_posts_answers_keyed_by_the_question_text(app, gx, f
     assert gx.answered_with(GX_SESSION, approval_id) == {
         "outcome": "accepted",
         "answers": {first: ["release"], second: ["lint", "docs"]},
+    }, "no free text anywhere: no `annotations` key at all"
+    gx.resolve_approval(GX_SESSION, approval_id)
+    feed.working("carrying on")
+
+
+# ---------------------------------------------------------------------------
+# (8b) free text: an `Other` label plus the annotations channel
+# ---------------------------------------------------------------------------
+
+
+def test_free_text_becomes_an_other_label_and_an_annotation(app, gx, feed):
+    """**Free text is a positional field of its own** (plan 018 §3.2).
+
+    gx's answer map holds LABELS, so a typed answer needs one — its own pager
+    spells that `Other` and carries the prose in a parallel `annotations` map
+    keyed the same way. The panel used to have to smuggle the string into the
+    vec-of-vecs as a fake option id, which gx would have filed as a label it
+    never offered; `custom_text` is the channel that makes it expressible.
+
+    Three claims, on ONE ask, because they are the same mapping:
+
+    * a label picked on question 1 stands, and its note rides beside it;
+    * text with NO label on question 2 is `["Other"]` plus the note;
+    * and the second answer proves the **index, not zip** rule: question 1
+      unanswered with question 2 answered by text alone means `custom_text` is
+      LONGER than `answers`, and a `zip` drops the typed answer without a word.
+    """
+    _ready(app)
+    approval_id = "call_free_text"
+    first, second = "Which branch?", "Anything else?"
+    gx.push_approval_frame(GX_SESSION, gx.add_approval(
+        GX_SESSION, approval_id, "question", "session/ask_user_question",
+        question_request(GX_SESSION, [
+            {"question": first, "options": [{"label": "main"}, {"label": "release"}]},
+            {"question": second, "options": [{"label": "no"}]},
+        ])))
+    _wait_approval(app, approval_id, lambda a: len(a["questions"]) == 2,
+                   "the free-text form")
+
+    # A label on one, free text on the other. The text is sent PADDED and
+    # arrives trimmed — the trim happens once, in the shared normaliser, so gx
+    # and opencode cannot post an agent different bytes for one keystroke.
+    _answer(app, approval_id, {
+        "question": [["release"], []],
+        "custom_text": ["  rebase first  ", "ship it on friday"],
+    })
+    assert gx.answered_with(GX_SESSION, approval_id) == {
+        "outcome": "accepted",
+        "answers": {first: ["release"], second: ["Other"]},
+        "annotations": {
+            first: {"notes": "rebase first"},
+            second: {"notes": "ship it on friday"},
+        },
+    }, "a picked label stands; text with no label is `Other`; both annotate"
+    gx.resolve_approval(GX_SESSION, approval_id)
+
+    # **The zip-vs-index proof.** `answers` is EMPTY and `custom_text` names
+    # position 1 only: question 1 is unanswered and omitted from the map
+    # entirely (gx's pager's own rule), question 2 answers with text alone.
+    second_id = "call_free_text_2"
+    gx.push_approval_frame(GX_SESSION, gx.add_approval(
+        GX_SESSION, second_id, "question", "session/ask_user_question",
+        question_request(GX_SESSION, [
+            {"question": first, "options": [{"label": "main"}]},
+            {"question": second, "options": [{"label": "no"}]},
+        ])))
+    _wait_approval(app, second_id, lambda a: len(a["questions"]) == 2,
+                   "the second free-text form")
+    _answer(app, second_id, {"question": [], "custom_text": [None, "bump the changelog"]})
+    assert gx.answered_with(GX_SESSION, second_id) == {
+        "outcome": "accepted",
+        "answers": {second: ["Other"]},
+        "annotations": {second: {"notes": "bump the changelog"}},
+    }, "question 1 is OMITTED, and question 2's typed answer survived the length gap"
+    gx.resolve_approval(GX_SESSION, second_id)
+
+    # `custom_text` beside a form that does not take it never reaches the
+    # adapter: the IPC grammar refuses it, and nothing is posted.
+    third = "call_free_text_3"
+    gx.push_approval_frame(GX_SESSION, gx.add_approval(
+        GX_SESSION, third, "question", "session/ask_user_question",
+        question_request(GX_SESSION, [{"question": first, "options": [{"label": "main"}]}])))
+    _wait_approval(app, third, lambda a: a["questions"], "the third form")
+    before = len(gx.paths())
+    err = _error(lambda: _answer(app, third, {"choice": "main", "custom_text": ["typed"]}))
+    assert err.code == "bad_request", err
+    assert "custom_text" in err.message and "choice" in err.message, err
+    assert [p for p in gx.paths()[before:] if p.endswith("/respond")] == [], \
+        "refused at the IPC door — no wire traffic at all"
+    assert gx.answered_with(GX_SESSION, third) is None
+    _answer(app, third, {"question": [[]], "custom_text": ["fine, Other then"]})
+    assert gx.answered_with(GX_SESSION, third) == {
+        "outcome": "accepted",
+        "answers": {first: ["Other"]},
+        "annotations": {first: {"notes": "fine, Other then"}},
     }
+    gx.resolve_approval(GX_SESSION, third)
+    feed.working("carrying on")
+
+
+# ---------------------------------------------------------------------------
+# (8c) the cost of `custom: true`: gx questions lose the one-click path
+# ---------------------------------------------------------------------------
+
+
+def test_a_lone_gx_question_stages_its_answer_instead_of_one_click(app, gx, feed):
+    """**A single-choice gx question is no longer one click** (plan 018 §3.2).
+
+    One question, one choice, no free text is the panel's one-click shape: a
+    click IS the whole answer, and staging it behind a submit would be pure
+    ceremony. gx's `custom` is now `true` on every question, so that shape can
+    no longer occur on gx — a click can no longer mean "I am done typing".
+
+    This is a deliberate cost, pinned here so it cannot be lost or re-paid by
+    accident. The opencode suite still covers the one-click shape, against an
+    ask that says `custom: false` out loud.
+    """
+    _ready(app)
+    approval_id = "call_one_question"
+    only = "Which branch?"
+    gx.push_approval_frame(GX_SESSION, gx.add_approval(
+        GX_SESSION, approval_id, "question", "session/ask_user_question",
+        question_request(GX_SESSION, [
+            {"question": only, "options": [{"label": "main"}, {"label": "release"}]},
+        ])))
+    live = _wait_approval(app, approval_id, lambda a: a["questions"], "the lone question")
+    assert len(live["questions"]) == 1
+    assert live["questions"][0]["multiple"] is False
+    assert live["questions"][0]["custom"] is True
+
+    panel = _panel(app)
+    card = _card(app, approval_id)
+    assert card is not None, panel
+    assert card["questions"][0]["custom"] is True, (
+        "the panel renders the free-text box off this flag")
+    assert card["buttons"] == ["Send answer"], (
+        "single + non-multiple + CUSTOM is not the one-click shape")
+    _shot(app, "tauri-gx-question-custom.png")
+    _unmount(app)
+    _ready(app)
+
+    _answer(app, approval_id, {"question": [["main"]]})
+    assert gx.answered_with(GX_SESSION, approval_id) == {
+        "outcome": "accepted", "answers": {only: ["main"]}}
     gx.resolve_approval(GX_SESSION, approval_id)
     feed.working("carrying on")
 

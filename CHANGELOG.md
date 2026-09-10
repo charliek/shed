@@ -158,6 +158,59 @@ reads an `## Unreleased` heading._
   (`Arc<dyn AgentLane>`, keyed by `(kind, server_url)`; an unrecognized kind
   answers `unsupported_lane`). See
   [Agent lanes](https://charliek.github.io/shed/desktop/agent-lanes/).
+- **Agent lanes: the client channel gets a bound, and overflow becomes a
+  reseed** (plan 018, `charliek/shed#342`). A lane subscription's frame
+  channel was unbounded, so a client that stopped draining — a phone
+  backgrounded mid-session is the canonical case — let a watcher's backlog
+  grow for as long as the lane stayed connected. It is now bounded at 1,024
+  frames, with the overflow policy in one place, `shed_core::lane::LanePublisher`
+  (deliberately not `Clone` — one publisher per subscription): a full channel
+  drops the frame and answers `Lagged`, which both adapters propagate out of
+  every emitting helper so a generation ends at the first dropped frame —
+  mid-stream, mid-seed, or mid-reseed alike — and reseeds with a fresh
+  `Reset { reason: "lagged" } … Ready` rather than resuming, even on gx,
+  because the dropped frames may already sit behind the client's cursor. The
+  terminal `Down` is the one frame that is never dropped.
+- **Agent lanes: a question's free-text answer reaches either agent**
+  (plan 018, `charliek/shed#341`). `LaneAnswer::Question` gains a positional
+  `custom_text` field, one entry per question, `null` where nothing was
+  typed. gx maps it to the label `"Other"` plus prose in a parallel
+  `annotations[...].notes` map — and because gx's questions now always
+  advertise `custom: true`, they lose the panel's one-click answer path;
+  opencode appends the text as one more entry in that question's `answers`
+  array, matching what its own TUI posts. Text aimed at a question whose
+  `custom` is `false` is refused before anything reaches the wire.
+- **Agent lanes: opencode answers the approval its own panel addressed, in
+  that session's own scope** (plan 018, `charliek/shed#345`). opencode has no
+  by-id GET for a permission or question, so an unscoped lookup across its
+  two directory-wide lists could let one panel answer a sibling session's
+  request. `answer` now resolves the addressed approval inside the root
+  session plus its transitive descendants first; an id outside that scope is
+  `unknown_approval`, an id open in both lists is refused as ambiguous, and
+  answering an approval whose session has since been deleted is now
+  `unknown_session` rather than reaching the wire. Costs four GETs per answer
+  on a childless session, where gx — which has a by-id route — pays one.
+- **Agent lanes: the staged transcript/approvals view moves into
+  `shed_app::lane_view`** (plan 018 §3.5). `LaneView`, `apply`, and the
+  500-row cap move out of the Tauri client into the ungated `shed-app` crate,
+  so the phone will fold the same subscription into the same view instead of
+  a second implementation of it. `LaneView::snapshot(since_seq)` returns a
+  typed `LaneViewSnapshot`; pending approvals are now sorted `created_at`
+  then `id` (previously unsorted — the old builder iterated a `HashMap`).
+- Three tests stop asserting wall-clock budgets that only failed under
+  parallel compile load (plan 018, `charliek/shed#343`, covering
+  `charliek/shed#335`): `shed-app`'s `wait_for` deadline is now a 60s hang
+  bound rather than a latency assertion, `shed-broker`'s dead-address leg
+  gets a 10x margin over its 300ms budget, and `shed-core`'s TLS-rejection
+  test classifies a typed `Stage` (`Connect`/`SendRequest`/`Canceled`)
+  instead of matching error substrings, behind a 200-attempt retry ladder
+  sized off measurement.
+- shedtest: `desktop/tools/shedtest/fake_lane_server.py` hosts the `gx`/
+  opencode lane fakes over a control HTTP port (a startup JSON line, a
+  per-agent method allowlist, wire-envelope builders, `/_/info`, `/_/stop`)
+  so shed-mobile's Dart harness can drive them without re-deriving either
+  agent's wire format. Both fakes also gain `hold_seed`/`release_seed` so
+  "no partial view before `Ready`" is observable rather than vacuous.
 
 ## v0.8.2 — 2026-08-17
 

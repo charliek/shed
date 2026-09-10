@@ -10,7 +10,7 @@ use std::time::Duration;
 use serde_json::{json, Value};
 use shed_core::lane::LaneEvent;
 use shed_opencode::testing::FakeOpencode;
-use tokio::sync::mpsc::UnboundedReceiver;
+use tokio::sync::mpsc::Receiver;
 
 /// How long any single wait may take. Generous next to a loopback round trip
 /// and the watcher's 100 ms backoff floor; short enough that a wedged test
@@ -18,7 +18,7 @@ use tokio::sync::mpsc::UnboundedReceiver;
 pub const DEADLINE: Duration = Duration::from_secs(5);
 
 /// The next frame, or a failure naming what was being waited for.
-pub async fn next_event(rx: &mut UnboundedReceiver<LaneEvent>, what: &str) -> LaneEvent {
+pub async fn next_event(rx: &mut Receiver<LaneEvent>, what: &str) -> LaneEvent {
     match tokio::time::timeout(DEADLINE, rx.recv()).await {
         Err(_) => panic!("timed out after {DEADLINE:?} waiting for {what}"),
         Ok(None) => panic!("the lane stream ENDED while waiting for {what}"),
@@ -27,7 +27,7 @@ pub async fn next_event(rx: &mut UnboundedReceiver<LaneEvent>, what: &str) -> La
 }
 
 /// Every frame up to and including the next `Ready` (or a terminal `Down`).
-pub async fn until_ready(rx: &mut UnboundedReceiver<LaneEvent>) -> Vec<LaneEvent> {
+pub async fn until_ready(rx: &mut Receiver<LaneEvent>) -> Vec<LaneEvent> {
     let mut out = Vec::new();
     loop {
         let ev = next_event(rx, "the seed's Ready").await;
@@ -39,10 +39,71 @@ pub async fn until_ready(rx: &mut UnboundedReceiver<LaneEvent>) -> Vec<LaneEvent
     }
 }
 
+/// Everything the adapter has ALREADY queued, without waiting for a frame that
+/// may never come.
+///
+/// The overflow tests need exactly this. A lagged generation is abandoned with
+/// no `Ready`, so [`until_ready`] would sit there until its deadline — and the
+/// assertion under test is about what the client is holding BEFORE it drains,
+/// which is a snapshot, not a wait.
+pub fn drain_now(rx: &mut Receiver<LaneEvent>) -> Vec<LaneEvent> {
+    let mut out = Vec::new();
+    while let Ok(ev) = rx.try_recv() {
+        out.push(ev);
+    }
+    out
+}
+
+/// Everything already queued, PLUS everything up to the next `Ready`.
+///
+/// After a lag the queue still holds the abandoned generation's frames, and a
+/// bare [`until_ready`] would read them as a seed that never finished. This is
+/// the shape a client actually sees: the leftovers, then the reseed's bracket.
+pub async fn drain_until_ready(rx: &mut Receiver<LaneEvent>) -> Vec<LaneEvent> {
+    let mut out = drain_now(rx);
+    out.extend(until_ready(rx).await);
+    out
+}
+
+/// A one-word label per frame, so a failure prints the ORDER rather than a page
+/// of DTOs.
+pub fn shape(events: &[LaneEvent]) -> Vec<&'static str> {
+    events
+        .iter()
+        .map(|e| match e {
+            LaneEvent::Reset { .. } => "reset",
+            LaneEvent::Ready { .. } => "ready",
+            LaneEvent::Message { .. } => "message",
+            LaneEvent::Session { .. } => "session",
+            LaneEvent::Approval { .. } => "approval",
+            LaneEvent::Down { .. } => "down",
+            LaneEvent::Unknown => "unknown",
+        })
+        .collect()
+}
+
+/// The first 8 labels from [`shape`] — enough for a failure message to show
+/// the order without dumping a whole abandoned/staged generation into it.
+pub fn shape_head(events: &[LaneEvent]) -> Vec<&'static str> {
+    let full = shape(events);
+    full[..8.min(full.len())].to_vec()
+}
+
+/// Every `Reset`'s `(reason, generation)`, in order.
+pub fn resets(events: &[LaneEvent]) -> Vec<(String, u64)> {
+    events
+        .iter()
+        .filter_map(|e| match e {
+            LaneEvent::Reset { reason, generation } => Some((reason.clone(), *generation)),
+            _ => None,
+        })
+        .collect()
+}
+
 /// Every frame up to and including the one whose transcript text contains
 /// `sentinel` — the way a test says "everything the adapter had to say, in
 /// order, up to here".
-pub async fn until_text(rx: &mut UnboundedReceiver<LaneEvent>, sentinel: &str) -> Vec<LaneEvent> {
+pub async fn until_text(rx: &mut Receiver<LaneEvent>, sentinel: &str) -> Vec<LaneEvent> {
     let mut out = Vec::new();
     loop {
         let ev = next_event(rx, &format!("the sentinel row {sentinel:?}")).await;

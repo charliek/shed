@@ -653,9 +653,12 @@ def test_a_question_surfaces_with_its_options_and_answers_on_the_question_route(
     """
     _ready(app)
     ask = "que_pick_1"
+    # `custom=False` OUT LOUD: an omitted flag is opencode's documented default
+    # of TRUE (see the free-text cell below), and this cell is the one-click
+    # shape — one question, one choice, NO free text.
     oc.stream_question_asked(LANE_SESSION, ask, header="Which branch?",
                              question="Pick a branch to work on",
-                             options=["main", "develop"])
+                             options=["main", "develop"], custom=False)
     app.wait_until(lambda: any(a["id"] == ask for a in _approvals(app)),
                    timeout=5, what="the question to surface")
 
@@ -700,30 +703,76 @@ def test_a_question_surfaces_with_its_options_and_answers_on_the_question_route(
 
     # A `custom` question is the other shape: free text is accepted, so a click
     # is no longer the whole answer and the card stages a selection behind an
-    # explicit submit. `custom` DEFAULTS TO FALSE in the contract precisely so a
-    # panel never invites typing the agent would reject — this proves the panel
-    # reads the flag rather than always offering the box.
+    # explicit submit. The ask here OMITS the flag, which is opencode's ORDINARY
+    # wire shape — its schema documents `custom` as "Allow typing a custom
+    # answer (default: true)" and its TUI draws the freeform row when the ask
+    # says nothing. Reading an omitted flag as `false` (what the fold did before
+    # plan 018 §3.2) hid the text box on the common case.
     free = "que_free_1"
     oc.stream_question_asked(LANE_SESSION, free, header="Anything else?",
-                             question="Name the branch", options=["main"],
-                             custom=True)
+                             question="Name the branch", options=["main"])
     app.wait_until(lambda: any(c["id"] == free for c in _panel_approvals(app)),
                    timeout=10, what="the custom question to reach the panel")
     typed = next(c for c in _panel_approvals(app) if c["id"] == free)
     assert typed["questions"][0]["custom"] is True, typed
     assert typed["buttons"] == ["Send answer"], "a staged answer needs a submit"
 
+    # Free text rides in `custom_text`, positionally — NOT smuggled into the
+    # vec-of-vecs. The adapter appends it to that question's answer list because
+    # that is opencode's own shape (a custom answer is a label the ask did not
+    # offer), so the wire is unchanged while the contract is now able to say
+    # which entry the human typed.
     app.call("lane.answer", {"machine": MACHINE, "session_id": LANE_SESSION,
                              "approval_id": free,
-                             "answer": {"question": [["a-branch-i-typed"]]}})
+                             "answer": {"question": [["main"]],
+                                        "custom_text": ["  a-branch-i-typed  "]}})
     assert json.loads(oc.post_body(f"/question/{free}/reply")) == {
-        "answers": [["a-branch-i-typed"]]
-    }
+        "answers": [["main", "a-branch-i-typed"]]
+    }, "the typed text is one more entry on that question's list, TRIMMED"
     assert oc.violations == []
     oc.stream({"type": "question.replied",
                "properties": {"sessionID": LANE_SESSION, "requestID": free}})
     app.wait_until(lambda: all(c["id"] != free for c in _panel_approvals(app)),
                    timeout=10, what="the custom question to retire")
+
+    # …and a question that says `custom: false` REFUSES free text, before
+    # anything reaches the wire. The no-traffic half is the point: a refusal
+    # that posted first would have filed the typed string as a label the ask
+    # never offered.
+    strict = "que_strict_1"
+    oc.stream_question_asked(LANE_SESSION, strict, header="Which branch?",
+                             question="Pick one", options=["main"], custom=False)
+    app.wait_until(lambda: any(c["id"] == strict for c in _panel_approvals(app)),
+                   timeout=10, what="the strict question to reach the panel")
+    before = len(oc.post_paths)
+    err = _error(lambda: app.call("lane.answer", {
+        "machine": MACHINE, "session_id": LANE_SESSION, "approval_id": strict,
+        "answer": {"question": [[]], "custom_text": ["something I typed"]}}))
+    assert err.code == "bad_request", err
+    assert oc.post_paths[before:] == [], \
+        "the refusal is decided against the resolved approval — nothing was posted"
+    assert oc.violations == []
+
+    # The other door: `custom_text` beside a form that does not take it never
+    # reaches an adapter at all — the IPC grammar refuses it.
+    before = len(oc.post_paths)
+    err = _error(lambda: app.call("lane.answer", {
+        "machine": MACHINE, "session_id": LANE_SESSION, "approval_id": strict,
+        "answer": {"choice": "main", "custom_text": ["typed"]}}))
+    assert err.code == "bad_request", err
+    assert "custom_text" in err.message and "choice" in err.message, err
+    assert oc.post_paths[before:] == [], "refused at the door, no wire traffic"
+
+    # Retire it, like the two asks above. `oc` is module-scoped and
+    # `_approvals()` returns everything still pending, so a question this cell
+    # left open would be visible to every cell that runs after it — and
+    # `_unmount()` only closes the panel, it does not answer anything. The two
+    # refusals above are the point of the cell and neither of them retires the
+    # ask, so this is the only place it can happen.
+    oc.stream({"type": "question.replied",
+               "properties": {"sessionID": LANE_SESSION, "requestID": strict}})
+    app.wait_until(lambda: all(c["id"] != strict for c in _panel_approvals(app)),
+                   timeout=10, what="the strict question to retire")
     _unmount(app)
 
 

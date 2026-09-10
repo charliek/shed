@@ -1462,6 +1462,7 @@ fn a_question_answer_is_positional_in_and_keyed_by_text_out() {
                 vec!["Postgres".to_string()],
                 vec!["None".to_string(), "Redis".to_string()],
             ],
+            custom_text: vec![],
         },
     )
     .expect("translates");
@@ -1474,26 +1475,184 @@ fn a_question_answer_is_positional_in_and_keyed_by_text_out() {
                 "Which caches?": ["None", "Redis"],
             },
         }),
-        "keyed by the question's TEXT — what gx's own TUI files answers under"
+        "keyed by the question's TEXT — what gx's own TUI files answers under; \
+         no free text, so no `annotations` key at all"
     );
 
     // Fewer answers than questions is allowed (the rest are unanswered); more
     // is a mistake worth refusing.
-    assert!(answer_body(
+    let short = answer_body(
         &a,
         &LaneAnswer::Question {
-            answers: vec![vec!["Postgres".to_string()]]
-        }
+            answers: vec![vec!["Postgres".to_string()]],
+            custom_text: vec![],
+        },
     )
-    .is_ok());
+    .expect("a short answer is allowed");
+    assert_eq!(
+        short,
+        json!({
+            "outcome": "accepted",
+            "answers": { "Which database?": ["Postgres"] },
+        }),
+        "the unanswered question is OMITTED, not filed as an empty list"
+    );
     let err = answer_body(
         &a,
         &LaneAnswer::Question {
             answers: vec![vec![], vec![], vec![]],
+            custom_text: vec![],
         },
     )
     .expect_err("too many");
     assert!(matches!(err, LaneError::BadRequest(_)), "{err:?}");
+    let err = answer_body(
+        &a,
+        &LaneAnswer::Question {
+            answers: vec![],
+            custom_text: vec![None, None, None],
+        },
+    )
+    .expect_err("too much free text");
+    assert!(matches!(err, LaneError::BadRequest(_)), "{err:?}");
+}
+
+#[test]
+fn free_text_becomes_an_other_label_and_an_annotation() {
+    let mut a = approval(LaneApprovalKind::Question, Vec::new());
+    a.questions = vec![
+        LaneQuestion {
+            id: Some("Which branch?".to_string()),
+            header: String::new(),
+            question: "Which branch?".to_string(),
+            options: vec![opt("main", None), opt("release", None)],
+            multiple: false,
+            custom: true,
+        },
+        LaneQuestion {
+            id: Some("Anything else?".to_string()),
+            header: String::new(),
+            question: "Anything else?".to_string(),
+            options: vec![opt("no", None)],
+            multiple: false,
+            custom: true,
+        },
+    ];
+
+    // A label on one, free text on the other — and the text is TRIMMED on the
+    // way out, so the agent never sees the panel's padding.
+    let body = answer_body(
+        &a,
+        &LaneAnswer::Question {
+            answers: vec![vec!["release".to_string()], vec![]],
+            custom_text: vec![None, Some("  ship it on friday  ".to_string())],
+        },
+    )
+    .expect("translates");
+    assert_eq!(
+        body,
+        json!({
+            "outcome": "accepted",
+            "answers": {
+                "Which branch?": ["release"],
+                "Anything else?": ["Other"],
+            },
+            "annotations": {
+                "Anything else?": { "notes": "ship it on friday" },
+            },
+        }),
+        "text with no label is the `Other` label plus the note; the note is trimmed"
+    );
+
+    // Both on the same question: the labels STAND and the note rides beside
+    // them — the text is never a label the agent did not offer.
+    let body = answer_body(
+        &a,
+        &LaneAnswer::Question {
+            answers: vec![vec!["main".to_string()], vec![]],
+            custom_text: vec![Some("but rebase first".to_string()), None],
+        },
+    )
+    .expect("translates");
+    assert_eq!(
+        body,
+        json!({
+            "outcome": "accepted",
+            "answers": { "Which branch?": ["main"] },
+            "annotations": { "Which branch?": { "notes": "but rebase first" } },
+        })
+    );
+
+    // **The zip-vs-index proof.** Question 1 unanswered, question 2 answered
+    // with free text ALONE — so `custom_text` is longer than `answers`. A `zip`
+    // of questions and answers stops after zero elements here and the typed
+    // answer vanishes with no error at all.
+    let body = answer_body(
+        &a,
+        &LaneAnswer::Question {
+            answers: vec![],
+            custom_text: vec![None, Some("yes: bump the changelog".to_string())],
+        },
+    )
+    .expect("translates");
+    assert_eq!(
+        body,
+        json!({
+            "outcome": "accepted",
+            "answers": { "Anything else?": ["Other"] },
+            "annotations": { "Anything else?": { "notes": "yes: bump the changelog" } },
+        }),
+        "a free-text-only answer to question 2 survives, and question 1 is omitted"
+    );
+
+    // Whitespace alone is not an answer: it trims to nothing, so the question
+    // stays unanswered rather than being filed as `Other` with an empty note.
+    let body = answer_body(
+        &a,
+        &LaneAnswer::Question {
+            answers: vec![vec!["main".to_string()]],
+            custom_text: vec![None, Some("   ".to_string())],
+        },
+    )
+    .expect("translates");
+    assert_eq!(
+        body,
+        json!({
+            "outcome": "accepted",
+            "answers": { "Which branch?": ["main"] },
+        })
+    );
+}
+
+#[test]
+fn free_text_aimed_at_a_question_that_refuses_it_is_a_bad_request() {
+    let mut a = approval(LaneApprovalKind::Question, Vec::new());
+    a.questions = vec![LaneQuestion {
+        id: Some("Which branch?".to_string()),
+        header: String::new(),
+        question: "Which branch?".to_string(),
+        options: vec![opt("main", None)],
+        multiple: false,
+        // gx's fold sets this `true` on every question; a client can still
+        // reach this through a hand-built approval, and the phone's mirror
+        // will reach it against an agent that says no.
+        custom: false,
+    }];
+    let err = answer_body(
+        &a,
+        &LaneAnswer::Question {
+            answers: vec![vec![]],
+            custom_text: vec![Some("something I typed".to_string())],
+        },
+    )
+    .expect_err("free text is not accepted here");
+    match err {
+        LaneError::BadRequest(m) => assert!(
+            m.contains("question 0") && m.contains("free text"),
+            "the refusal names the POSITION the client addressed: {m}"
+        ),
+        other => panic!("{other:?}"),
+    }
 }
 
 #[test]

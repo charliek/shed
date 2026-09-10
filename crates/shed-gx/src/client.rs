@@ -53,9 +53,9 @@ use serde_json::{json, Value};
 
 use shed_core::lane::ring::MessageRing;
 use shed_core::lane::{
-    option_kind, AgentLane, LaneAnswer, LaneApproval, LaneApprovalKind, LaneApprovalStatus,
-    LaneCapabilities, LaneDecision, LaneError, LaneHistory, LaneSession, LaneSubscription,
-    SendMode,
+    normalize_question_answer, option_kind, AgentLane, LaneAnswer, LaneApproval, LaneApprovalKind,
+    LaneApprovalStatus, LaneCapabilities, LaneDecision, LaneError, LaneHistory, LaneSession,
+    LaneSubscription, SendMode,
 };
 use shed_core::rc::RcActivity;
 
@@ -97,6 +97,14 @@ pub const HISTORY_PAGE_SIZE: u32 = 200;
 /// Ten pages is 2,000 envelopes — gx's own per-session ring — so a cursor older
 /// than this is one the server could not have replayed either.
 pub const MAX_HISTORY_PAGES: usize = 10;
+
+/// The label gx files a free-text answer under when the human picked no option.
+///
+/// gx's answer map holds LABELS, so a typed answer needs one; its own pager
+/// spells that label `Other` and carries the text in a parallel `annotations`
+/// map. Public because the harness asserts against the exact string the wire
+/// carries, and a second spelling of it would be a second contract.
+pub const OTHER_LABEL: &str = "Other";
 
 /// The tunable windows, as constructor options so a test never waits out a real
 /// one.
@@ -1051,7 +1059,12 @@ fn unresolvable_decision(approval: &LaneApproval, decision: LaneDecision) -> Lan
 /// - [`LaneAnswer::Choice`] must name an id the approval OFFERED. Never the
 ///   nearest match.
 /// - [`LaneAnswer::Question`] is positional on the way in and keyed on the way
-///   out, by the question's TEXT.
+///   out, by the question's TEXT. **Free text is carried**, through
+///   [`normalize_question_answer`]: a question answered with text alone is filed
+///   under [`OTHER_LABEL`] and the text lands in `annotations[key].notes`; with
+///   a label picked too the labels stand and the note rides beside them; with
+///   neither the question is OMITTED, which is gx's own pager's rule for an
+///   unanswered question. `annotations` is omitted when empty.
 /// - [`LaneAnswer::Raw`] is verbatim, and must be JSON.
 pub fn answer_body(approval: &LaneApproval, answer: &LaneAnswer) -> Result<Value, LaneError> {
     match answer {
@@ -1085,16 +1098,32 @@ pub fn answer_body(approval: &LaneApproval, answer: &LaneAnswer) -> Result<Value
                 approval.kind.as_str()
             ))),
         },
-        LaneAnswer::Question { answers } => {
-            if answers.len() > approval.questions.len() {
-                return Err(bad_request(format!(
-                    "the approval has {} questions; {} answers were given",
-                    approval.questions.len(),
-                    answers.len()
-                )));
-            }
+        LaneAnswer::Question {
+            answers,
+            custom_text,
+        } => {
+            // The contract's ONE reader of the positional pair: it refuses an
+            // over-long vector and text aimed at a question that does not take
+            // it, and it pads BOTH to `questions.len()` so what follows can
+            // index. Indexing, not zipping: a `zip` of questions and `answers`
+            // stops at the shorter one, so free text typed for question 2 with
+            // question 1 left alone would have been dropped without a word.
+            let replies = normalize_question_answer(&approval.questions, answers, custom_text)?;
             let mut map = serde_json::Map::new();
-            for (q, chosen) in approval.questions.iter().zip(answers.iter()) {
+            let mut notes = serde_json::Map::new();
+            // Zipped, not indexed: `normalize_question_answer` always returns
+            // exactly one reply per question (it pads/refuses to make that
+            // true), so this is a plain 1:1 walk — and zipping the OWNED
+            // `replies` (rather than indexing a `&replies[i]`) lets `labels`
+            // move into the JSON body below instead of cloning data the
+            // normalizer already handed us ownership of.
+            for (q, reply) in approval.questions.iter().zip(replies) {
+                // A question with no labels AND no text is UNANSWERED, and gx's
+                // own pager omits it from the map rather than filing an empty
+                // list against it.
+                if reply.labels.is_empty() && reply.text.is_none() {
+                    continue;
+                }
                 // `id` is the question's text — see `fold::lane_question`.
                 let key = q.id.clone().unwrap_or_else(|| q.question.clone());
                 if key.is_empty() {
@@ -1103,9 +1132,29 @@ pub fn answer_body(approval: &LaneApproval, answer: &LaneAnswer) -> Result<Value
                             .to_string(),
                     ));
                 }
-                map.insert(key, json!(chosen));
+                // Free text with nothing picked is the label `"Other"` — gx's
+                // own spelling for "the answer is the note, not one of these".
+                // With a label picked too, the labels stand and the note rides
+                // beside them.
+                let labels = if reply.labels.is_empty() {
+                    vec![OTHER_LABEL.to_string()]
+                } else {
+                    reply.labels
+                };
+                if let Some(text) = &reply.text {
+                    notes.insert(key.clone(), json!({ "notes": text }));
+                }
+                map.insert(key, json!(labels));
             }
-            Ok(json!({ "outcome": "accepted", "answers": Value::Object(map) }))
+            let mut body = serde_json::Map::new();
+            body.insert("outcome".to_string(), json!("accepted"));
+            body.insert("answers".to_string(), Value::Object(map));
+            // Omitted when empty: an answer with no free text is byte-identical
+            // to what this adapter posted before the field existed.
+            if !notes.is_empty() {
+                body.insert("annotations".to_string(), Value::Object(notes));
+            }
+            Ok(Value::Object(body))
         }
         LaneAnswer::Reject => Ok(match &approval.kind {
             LaneApprovalKind::Permission => json!({ "outcome": { "outcome": "cancelled" } }),

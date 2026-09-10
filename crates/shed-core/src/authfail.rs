@@ -54,17 +54,30 @@
 //!    a pin mismatch is a LOCAL verifier rejection
 //!    (`unexpected error: leaf certificate does not match pin …`) and a dead port
 //!    is `tcp connect error` → `Connection refused`.
-//! 6. **The ambiguous shape.** Under TLS 1.3 the rejection sometimes races the
-//!    pool checkout and reqwest reports
-//!    `client error (Canceled): operation was canceled: connection was not ready`
-//!    with the alert nowhere in the chain — observed once in ~100 handshakes here,
-//!    never on TLS 1.2. It is NOT classified as an auth failure: it is equally
-//!    what a server restart or a network blip produces, and a false positive costs
-//!    a real SSH mint (which, on desktop, can raise a Touch ID prompt). It is
-//!    instead recognized by [`is_connection_lost_message`] as "the request was
-//!    never dispatched", which `http.rs` answers with ONE plain re-send on a fresh
-//!    connection — where the rejection then surfaces as the deterministic alert
-//!    and the normal re-mint path takes over.
+//! 6. **The ambiguous shape — and its asymmetry.** Under TLS 1.3 the rejection
+//!    sometimes races the pool checkout — hyper's dispatch cancelling the
+//!    request rather than handing it to the connection — and reqwest reports
+//!    `client error (Canceled): operation was canceled: connection was not ready`,
+//!    with the alert nowhere in the chain — observed once in ~100 handshakes
+//!    on an idle box, never on TLS 1.2, but MUCH more often on a CPU-starved
+//!    one (a concurrent `cargo build --release`, e.g.: see `load-run.txt`).
+//!    It is NOT classified as an auth failure: it is equally what a server
+//!    restart or a network blip produces, and a false positive costs a real
+//!    SSH mint (which, on desktop, can raise a Touch ID prompt). It is
+//!    instead recognized by [`is_connection_lost_message`] as "the request
+//!    was never dispatched", which `http.rs` (and `shed-broker`'s bus)
+//!    answer with ONE plain re-send on a fresh connection — safe because
+//!    this rendering specifically proves the request never reached the wire.
+//!    **The same hyper `Kind::Canceled` category also renders as**
+//!    `operation was canceled: connection closed` (`client/dispatch.rs`,
+//!    raised when the connection task had ALREADY taken the request before
+//!    being cancelled) — the same race, one step later, where a re-send
+//!    could duplicate a write. [`is_connection_lost_message`] deliberately
+//!    does NOT match this second rendering — see [`CONNECTION_LOST`]'s own
+//!    doc — so production callers keep their "nothing was written" guarantee.
+//!    Only a test that can independently prove nothing it sends ever reaches
+//!    a real peer (this module's own live-handshake tests, rejected before
+//!    the server does anything with the request) may retry on both.
 //!
 //! # The alert-40 exclusion (same call as Go, same reasoning)
 //!
@@ -177,8 +190,24 @@ fn matches_auth_alert(tail: &str) -> bool {
     false
 }
 
-/// The hyper/reqwest rendering of "the connection died before this request could
-/// be dispatched" — see finding 6 in the module docs.
+/// The hyper/reqwest rendering of "the connection died before this request
+/// COULD be dispatched" — see finding 6 in the module docs. Deliberately
+/// narrow: hyper's `Kind::Canceled` category (`Display` "operation was
+/// canceled") covers TWO renderings of the same dispatch-cancellation race,
+/// and only this one — `client/conn/http{1,2}.rs`'s "connection was not
+/// ready", raised when the connection task had not yet taken the request —
+/// proves the request was never handed to the wire. The other rendering,
+/// `client/dispatch.rs`'s "connection closed", is raised when the connection
+/// task ALREADY HAD the request, so the write may have happened; matching on
+/// the bare "operation was canceled" description (as an earlier version of
+/// this constant did) would make [`is_connection_lost_message`]'s callers
+/// re-send a request that could have reached the peer — for
+/// `shed-broker/src/bus.rs`'s POST of a plugin-listener response, a real
+/// duplicate-delivery bug, not a cosmetic one. Do not widen this past what a
+/// caller may safely act on twice; a test that needs to recognize BOTH
+/// renderings (because IT can prove neither ever reached its own server —
+/// see `tests::is_ambiguous_canceled`) has its own, test-local predicate for
+/// that.
 const CONNECTION_LOST: &str = "connection was not ready";
 
 /// Was the request never actually sent, because the connection it was queued on
@@ -221,28 +250,214 @@ mod tests {
     use crate::testtls::*;
     use std::sync::Arc;
 
-    /// [`probe_once`], re-sending once on the ambiguous "connection was not
-    /// ready" shape — exactly what `http.rs` does with it (module docs, finding 6).
-    async fn probe(pin: &str, url: &str, cert: Option<(&str, &[u8])>) -> Result<u16, String> {
-        // Up to three attempts rather than the one `http.rs` makes: production
-        // hands the ambiguity back to the caller, but a TEST that hits it twice in
-        // a row under parallel load would report a false regression in the alert
-        // shapes it is actually pinning.
-        let mut outcome = probe_once(pin, url, cert).await;
-        for _ in 0..2 {
+    /// The client-error stage a flattened transport error names, classified
+    /// from the text rather than re-derived by every call site. `Connect` is a
+    /// TLS-handshake-time rejection, `SendRequest` a post-handshake one, and
+    /// `Canceled` is hyper's dispatch being cancelled when a TLS 1.3
+    /// post-handshake alert lands after the request was already handed to the
+    /// connection task (module docs, finding 6) — a legitimate rendering of
+    /// the SAME rejection, not a different failure. `None` for a message that
+    /// names none of the three: the alert/negative-control tests below only
+    /// ever read `.message`, so they never have to care.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Stage {
+        Connect,
+        SendRequest,
+        Canceled,
+    }
+
+    impl Stage {
+        fn classify(msg: &str) -> Option<Stage> {
+            if msg.contains("(Connect)") {
+                Some(Stage::Connect)
+            } else if msg.contains("(SendRequest)") {
+                Some(Stage::SendRequest)
+            } else if msg.contains("Canceled") {
+                Some(Stage::Canceled)
+            } else {
+                None
+            }
+        }
+    }
+
+    /// [`probe_once`]'s error: the flattened message every assertion below
+    /// pattern-matches, plus the [`Stage`] classified from it — computed once
+    /// alongside the message instead of re-derived per caller.
+    struct ProbeError {
+        message: String,
+        stage: Option<Stage>,
+    }
+
+    impl ProbeError {
+        fn new(message: String) -> Self {
+            let stage = Stage::classify(&message);
+            ProbeError { message, stage }
+        }
+    }
+
+    /// Recognizes EITHER rendering of hyper's `Kind::Canceled` dispatch race
+    /// (module docs, finding 6) — [`is_connection_lost_message`]'s
+    /// "connection was not ready", plus its sibling "connection closed"
+    /// that [`is_connection_lost_message`] deliberately excludes (see
+    /// [`CONNECTION_LOST`]'s own doc). Test-local and NOT a relaxation of
+    /// that production function: production cannot tell whether a real peer
+    /// received the write before the cancellation landed, so it only
+    /// retries the rendering that proves it didn't. This module's own
+    /// live-handshake tests have a guarantee production lacks — the TLS
+    /// handshake itself is what the server rejected, so no request body was
+    /// ever accepted regardless of which rendering comes back — which is
+    /// what makes retrying on both safe HERE without proving anything about
+    /// `http.rs` or `shed-broker`'s bus.
+    fn is_ambiguous_canceled(msg: &str) -> bool {
+        // Exactly the two renderings finding 6 documents, and no wider. A bare
+        // `contains("operation was canceled")` would swallow every future
+        // `Kind::Canceled` reason hyper invents, and this ladder retries 200
+        // times — so an unrelated cancellation would be retried into silence
+        // instead of failing loudly. Same discipline as `CONNECTION_LOST`
+        // itself: match what was measured, not the whole category.
+        is_connection_lost_message(msg) || msg.contains("operation was canceled: connection closed")
+    }
+
+    /// Retry `attempt` while `is_retryable` holds on its error, up to
+    /// `extra_attempts` more times. The one ladder every retry in this module
+    /// shares, replacing what used to be two near-identical copies of it
+    /// (`probe`'s own retry over [`probe_once`], and a second one inlined in
+    /// `reqwest_display_hides_the_alert_and_flatten_recovers_it` over a raw
+    /// `reqwest::Client`): under TLS 1.3 the rejection occasionally races the
+    /// pool checkout and reqwest reports an ambiguous `Kind::Canceled`
+    /// rendering (module docs, finding 6) instead of the deterministic
+    /// alert. `is_retryable` is supplied per call site rather than fixed
+    /// here — production (`http.rs`) and this module's own tests are NOT
+    /// allowed the same predicate; see [`is_ambiguous_canceled`]'s doc for
+    /// why. It cannot manufacture a false pass: the retried attempt still
+    /// has to land on one of the shapes this module actually claims to
+    /// know, or the final assertion fails same as ever.
+    async fn retry_while<T, E, F, Fut>(
+        extra_attempts: usize,
+        is_retryable: impl Fn(&E) -> bool,
+        mut attempt: F,
+    ) -> Result<T, E>
+    where
+        F: FnMut() -> Fut,
+        Fut: std::future::Future<Output = Result<T, E>>,
+    {
+        let mut outcome = attempt().await;
+        for _ in 0..extra_attempts {
             match &outcome {
-                Err(msg) if is_connection_lost_message(msg) => {
-                    outcome = probe_once(pin, url, cert).await;
-                }
+                Err(e) if is_retryable(e) => outcome = attempt().await,
                 _ => break,
             }
         }
         outcome
     }
 
+    /// [`probe_once`] via [`retry_while`], re-sending on EITHER ambiguous
+    /// `Kind::Canceled` rendering — [`is_ambiguous_canceled`], not the
+    /// narrower production [`is_connection_lost_message`] — because this
+    /// probe drives a handshake the SERVER rejects, so no request body is
+    /// ever accepted regardless of which rendering comes back (see
+    /// [`is_ambiguous_canceled`]'s own doc for why that guarantee doesn't
+    /// extend to `http.rs`, which retries only the rendering that proves
+    /// nothing was written). Returns the flattened message alone; a caller
+    /// that also needs the classified [`Stage`] (only the TLS-version
+    /// assertions below) calls [`probe_with_stage`] instead of re-parsing the
+    /// string a second time.
+    async fn probe(pin: &str, url: &str, cert: Option<(&str, &[u8])>) -> Result<u16, String> {
+        probe_with_stage(pin, url, cert)
+            .await
+            .map_err(|e| e.message)
+    }
+
+    /// Extra attempts a ladder takes past its first on an ambiguous
+    /// `Kind::Canceled` rendering (module docs, finding 6) — many more than
+    /// the one plain re-send `http.rs` makes in production: a real client
+    /// hands the ambiguity back to its caller after one try, but a TEST
+    /// asserting on the deterministic alert needs to actually reach it, and
+    /// (unlike production) is free to keep retrying because nothing it sends
+    /// here is ever accepted by a peer.
+    ///
+    /// **This is a bound on a pathological environment, not a latency
+    /// budget** — same reasoning as `shed-app::machine`'s 15s `wait_for`
+    /// deadline: the ladder stops on the FIRST deterministic attempt in the
+    /// common case (a fraction of a millisecond), so a large `N` costs
+    /// nothing there; it only spends time getting exhausted, and exhaustion
+    /// is exactly the pathological case this constant exists to make
+    /// vanishingly unlikely rather than merely rare.
+    ///
+    /// Sized off a MEASURED rate, not a guess (`measure_ambiguity_rate_under_
+    /// load`, `load-run.txt`): under the same sustained `cargo build
+    /// --release -p shed-gx` load this module's own tests run against, 500
+    /// consecutive `probe_once` calls (V13, no-cert) came back ambiguous
+    /// 80-85% of the time across four runs (423, 405, 401, 399 / 500) — FAR
+    /// above the ~1-in-100 unloaded rate the module docs record (finding 6),
+    /// because back-to-back loopback handshakes under CPU starvation give
+    /// the dispatch-cancellation race far more opportunities to land inside
+    /// the request-handoff window. Treating attempts as independent
+    /// (borne out by every real test run recovering within `N = 20` far more
+    /// often than not — a genuine cluster that never resolved would fail
+    /// every run, not ~1.3% of them) and rounding the worst measured rate UP
+    /// to `p = 0.85` for margin: the probability of exhausting a ladder of
+    /// `N` extra attempts (`N + 1` total) is `p^(N+1)`. The previous `N = 20`
+    /// (21 total) gives `0.85^21 ≈ 3.2%` — matching the observed ~1.3-2%
+    /// empirical failure rate (each real test iteration runs several such
+    /// ladders back to back, compounding a per-ladder chance in the low
+    /// single digits into a noticeably worse per-run chance) — nowhere near
+    /// enough. `N = 200` (201 total) gives `0.85^201 ≈ 6.5×10⁻¹⁵`, comfortably
+    /// past a 1e-12 target with room to spare even if the true rate on some
+    /// future box is worse than anything measured here (`0.90^201 ≈
+    /// 6.3×10⁻¹⁰` — still negligible). At ~1ms per loopback attempt (500
+    /// attempts measured in 0.50s), the worst case — full exhaustion — costs
+    /// about 200ms; the common case costs a fraction of that.
+    const AMBIGUOUS_RETRY_ATTEMPTS: usize = 200;
+
+    /// Same ladder as [`probe`], keeping the classified [`Stage`] alongside
+    /// the message.
+    async fn probe_with_stage(
+        pin: &str,
+        url: &str,
+        cert: Option<(&str, &[u8])>,
+    ) -> Result<u16, ProbeError> {
+        let outcome = retry_while(
+            AMBIGUOUS_RETRY_ATTEMPTS,
+            |e: &ProbeError| is_ambiguous_canceled(&e.message),
+            || probe_once(pin, url, cert),
+        )
+        .await;
+        // `retry_while` only stops early on a NON-ambiguous error (or success),
+        // so an ambiguous final error here means every one of
+        // `AMBIGUOUS_RETRY_ATTEMPTS + 1` attempts landed on the ambiguous shape —
+        // ladder exhaustion, not a classification miss. Say so plainly: a bare
+        // "connection was not ready" panic reads like the alert classifier is
+        // broken, when the real story is "no alert was ever observable to
+        // classify" (see [`AMBIGUOUS_RETRY_ATTEMPTS`]'s doc for how unlikely
+        // this is meant to be).
+        outcome.map_err(|e| {
+            if is_ambiguous_canceled(&e.message) {
+                ProbeError {
+                    message: format!(
+                        "retry ladder exhausted: all {} attempts came back as the \
+                         ambiguous Kind::Canceled shape (module docs, finding 6) — no \
+                         alert ever appeared in the chain to classify, which is NOT a \
+                         regression in alert classification, just an astronomically \
+                         unlucky run (see AMBIGUOUS_RETRY_ATTEMPTS's doc). Last message: {}",
+                        AMBIGUOUS_RETRY_ATTEMPTS + 1,
+                        e.message
+                    ),
+                    stage: e.stage,
+                }
+            } else {
+                e
+            }
+        })
+    }
+
     /// Drive a real handshake and return the flattened transport error (or the
-    /// HTTP status on success).
-    async fn probe_once(pin: &str, url: &str, cert: Option<(&str, &[u8])>) -> Result<u16, String> {
+    /// HTTP status on success), classified into a [`ProbeError`].
+    async fn probe_once(
+        pin: &str,
+        url: &str,
+        cert: Option<(&str, &[u8])>,
+    ) -> Result<u16, ProbeError> {
         let resolver = Arc::new(crate::tls::ClientCertResolver::new());
         if let Some((pem, key)) = cert {
             resolver.set(Some(Arc::new(
@@ -256,8 +471,49 @@ mod tests {
             .unwrap();
         match client.get(url).send().await {
             Ok(r) => Ok(r.status().as_u16()),
-            Err(e) => Err(flatten(&e)),
+            Err(e) => Err(ProbeError::new(flatten(&e))),
         }
+    }
+
+    /// Manual calibration for [`AMBIGUOUS_RETRY_ATTEMPTS`] — NOT part of the regular
+    /// gate (`#[ignore]`d): its result is only meaningful under the SAME sustained
+    /// parallel-compile load the retry ladder is sized against, and doing hundreds of
+    /// live TLS handshakes on every `cargo test` would be needless cost for a number
+    /// that changes only when hyper/tokio/rustls internals do. Re-run it with
+    ///
+    ///     cargo test -p shed-core -- --ignored measure_ambiguity_rate_under_load --nocapture
+    ///
+    /// alongside a concurrent `cargo build --release -p shed-gx` loop (see
+    /// `load-run.txt` for the exact loop) whenever this module's dependencies bump
+    /// enough that the measured rate might have moved, and update
+    /// [`AMBIGUOUS_RETRY_ATTEMPTS`]'s doc with the new numbers. Every attempt is
+    /// classified into exactly one of "ambiguous" (the [`Stage`] this module cannot
+    /// see an alert on) or "deterministic" (carries `CertificateRequired`); anything
+    /// else is a real bug in this test's own setup, not data, so it panics rather
+    /// than being silently counted.
+    #[ignore]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn measure_ambiguity_rate_under_load() {
+        let ca = TestCa::new("shed-ca");
+        let srv = spawn_mtls_server(&ca, TlsVersion::V13, false).await;
+        let url = format!("{}/api/info", srv.base_url());
+        const ATTEMPTS: usize = 500;
+        let mut ambiguous = 0usize;
+        let mut deterministic = 0usize;
+        for _ in 0..ATTEMPTS {
+            match probe_once(&srv.pin, &url, None).await {
+                Err(e) if is_ambiguous_canceled(&e.message) => ambiguous += 1,
+                Err(e) if e.message.contains("CertificateRequired") => deterministic += 1,
+                Err(e) => panic!("neither ambiguous nor the expected alert: {}", e.message),
+                Ok(status) => panic!("expected a TLS rejection, got HTTP {status}"),
+            }
+        }
+        assert_eq!(ambiguous + deterministic, ATTEMPTS);
+        eprintln!(
+            "measure_ambiguity_rate_under_load: {ambiguous}/{ATTEMPTS} ambiguous \
+             ({:.4}), {deterministic}/{ATTEMPTS} deterministic",
+            ambiguous as f64 / ATTEMPTS as f64
+        );
     }
 
     // The finding recorded in the module docs, asserted rather than remembered:
@@ -276,17 +532,32 @@ mod tests {
             .use_preconfigured_tls(cfg)
             .build()
             .unwrap();
-        // Re-send on the ambiguous "connection was not ready" shape, exactly as
-        // `probe` (and `http.rs`) do — finding 6: under TLS 1.3 the rejection
-        // occasionally races the pool checkout and reports no alert at all, which
-        // would flake this assertion rather than falsify it.
-        let mut err = client.get(&url).send().await.unwrap_err();
-        for _ in 0..3 {
-            if !is_connection_lost_message(&flatten(&err)) {
-                break;
-            }
-            err = client.get(&url).send().await.unwrap_err();
-        }
+        // Re-send on EITHER ambiguous `Kind::Canceled` rendering via the same
+        // `retry_while` ladder `probe` uses (module docs, finding 6) — safe
+        // here for the same reason it's safe in `probe`: the server rejects
+        // the handshake itself, so nothing this client sends is ever
+        // accepted (see `is_ambiguous_canceled`'s doc). Retrying is what
+        // keeps this from flaking under load rather than falsifying the
+        // assertion below.
+        let err = retry_while(
+            AMBIGUOUS_RETRY_ATTEMPTS,
+            |e: &reqwest::Error| is_ambiguous_canceled(&flatten(e)),
+            || client.get(&url).send(),
+        )
+        .await
+        .unwrap_err();
+        // Same diagnostic as `probe_with_stage`'s exhaustion wrap: a bare
+        // assertion failure below would read like flatten()/the alert prefix
+        // regressed, when exhausting `AMBIGUOUS_RETRY_ATTEMPTS + 1` attempts
+        // means no alert was ever observable in the first place.
+        assert!(
+            !is_ambiguous_canceled(&flatten(&err)),
+            "retry ladder exhausted: all {} attempts came back as the ambiguous \
+             Kind::Canceled shape (module docs, finding 6) — no alert ever appeared \
+             to classify, which is NOT a regression here, just an astronomically \
+             unlucky run (see AMBIGUOUS_RETRY_ATTEMPTS's doc). Last error: {err}",
+            AMBIGUOUS_RETRY_ATTEMPTS + 1,
+        );
         assert!(
             !err.to_string().contains("alert"),
             "reqwest Display unexpectedly carries the alert: {err}"
@@ -348,17 +619,31 @@ mod tests {
 
             // TLS 1.3 rejects AFTER the client's handshake completes (SendRequest
             // stage), TLS 1.2 during connect — the shape difference the plan
-            // predicted, pinned here so a regression is visible.
-            let msg = probe(&srv.pin, &url, None).await.unwrap_err();
+            // predicted, pinned here as a typed Stage rather than a second
+            // substring match. The alert CONTENT was already asserted above by
+            // (a) (deterministic — CertificateRequired both ways); this only
+            // pins WHEN the rejection was reported.
+            let outcome = probe_with_stage(&srv.pin, &url, None).await.unwrap_err();
             match version {
-                TlsVersion::V12 => assert!(msg.contains("Connect"), "{msg}"),
+                TlsVersion::V12 => {
+                    assert_eq!(outcome.stage, Some(Stage::Connect), "{}", outcome.message)
+                }
                 // TLS 1.3 rejects post-handshake, so the failure is reported by
-                // the request rather than the connect — either as SendRequest or,
-                // when it races the pool checkout, as the ambiguous Canceled shape
-                // this probe already re-sent once for (finding 6).
+                // the request rather than the connect — either as SendRequest,
+                // or, when it races the pool checkout, hyper's dispatch
+                // Canceled (module docs, finding 6). This is a DOCUMENTED
+                // two-valued outcome, not an under-specified assertion:
+                // `probe_with_stage`'s own retry ladder already re-sent once
+                // on the ambiguous shape, so a Canceled surviving that retry
+                // is a legitimate second rendering of the same rejection, not
+                // a flake.
                 TlsVersion::V13 => assert!(
-                    msg.contains("SendRequest") || msg.contains("Canceled"),
-                    "{msg}"
+                    matches!(
+                        outcome.stage,
+                        Some(Stage::SendRequest) | Some(Stage::Canceled)
+                    ),
+                    "{}",
+                    outcome.message
                 ),
                 TlsVersion::Any => unreachable!(),
             }
@@ -467,11 +752,41 @@ mod tests {
 
     #[test]
     fn connection_lost_is_recognized_but_never_auth_shaped() {
-        let msg = "error sending request for url (https://h/api/info): client error (Canceled): \
+        let not_ready =
+            "error sending request for url (https://h/api/info): client error (Canceled): \
                    operation was canceled: connection was not ready";
-        assert!(is_connection_lost_message(msg));
-        assert!(!is_auth_shaped_message(msg));
+        assert!(is_connection_lost_message(not_ready));
+        assert!(!is_auth_shaped_message(not_ready));
         assert!(!is_connection_lost_message("tcp connect error"));
+    }
+
+    // The SAME hyper `Kind::Canceled` category as the case above, but observed
+    // via `client/dispatch.rs`'s "already had the request" path rather than
+    // `client/conn/http{1,2}.rs`'s "hadn't yet" one (module docs, finding 6;
+    // load-run.txt is what surfaced this rendering under load). The two
+    // renderings are NOT interchangeable: `is_connection_lost_message` — the
+    // production, safe-to-blindly-resend predicate — must reject this one,
+    // because it does NOT prove the request was never written; only the
+    // test-local `is_ambiguous_canceled` (used by handshakes THIS module
+    // itself rejects, where nothing is ever accepted regardless) recognizes
+    // both.
+    #[test]
+    fn connection_closed_is_the_unsafe_canceled_rendering_production_must_not_retry() {
+        let closed =
+            "error sending request for url (https://h/api/info): client error (Canceled): \
+                   operation was canceled: connection closed";
+        assert!(
+            !is_connection_lost_message(closed),
+            "production must not treat this as provably-undispatched: {closed}"
+        );
+        assert!(!is_auth_shaped_message(closed));
+        assert!(is_ambiguous_canceled(closed));
+        // And the production shape is still one `is_ambiguous_canceled` too —
+        // it is a superset, not a disjoint check.
+        let not_ready =
+            "error sending request for url (https://h/api/info): client error (Canceled): \
+                   operation was canceled: connection was not ready";
+        assert!(is_ambiguous_canceled(not_ready));
     }
 
     #[test]

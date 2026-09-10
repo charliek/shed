@@ -67,7 +67,7 @@
         "options": [],
         "questions": [
           {
-            "custom": false,
+            "custom": true,
             "header": "Proceed?",
             "multiple": false,
             "options": [

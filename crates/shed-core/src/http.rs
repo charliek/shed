@@ -4005,40 +4005,90 @@ mod mtls_tests {
         (srv, minter, provider)
     }
 
+    /// Extra whole-fixture attempts these two cells take on the ambiguous
+    /// "connection was not ready" shape (`authfail.rs`, finding 6).
+    ///
+    /// Both assert that a TLS-alert rejection is recovered with EXACTLY one
+    /// re-mint, and both drive a real TLS 1.3 handshake to get there. When the
+    /// post-handshake alert races hyper's dispatch, the transport error carries
+    /// no alert at all, so `is_auth_failure` correctly declines to re-mint —
+    /// production is right to hand that back rather than spend a mint (on
+    /// desktop a needless mint can raise a Touch ID prompt), and `send_authed`
+    /// already re-sends once before giving up. A second occurrence in a row
+    /// then fails the cell without anything being wrong with it.
+    ///
+    /// The whole fixture is rebuilt per attempt, not just the request, because
+    /// the minter's call count is what these cells assert on: retrying the call
+    /// alone would accumulate mints across attempts and break the assertion the
+    /// retry exists to protect.
+    ///
+    /// Sized like the other ambiguous-shape ladders in this workspace: a bound
+    /// on a pathological environment, not a latency budget. Measured on this
+    /// branch and on `main` at roughly one run in twenty, so twenty attempts
+    /// puts an exhausted ladder far below anything that would be noticed.
+    const TLS_ALERT_ATTEMPTS: usize = 20;
+
+    /// Did this outcome carry the ambiguous shape rather than the alert the
+    /// cell is pinning?
+    fn is_ambiguous(e: &ShedError) -> bool {
+        matches!(e, ShedError::Transport(m) if crate::authfail::is_connection_lost_message(m))
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn rc_events_recovers_from_a_tls_alert_rejection_exactly_once() {
-        let (srv, minter, provider) = tls_alert_setup().await;
-        let c = client_for(&srv, provider.clone());
-        // The re-mint issues a VALID certificate, so the retry authenticates.
-        let sink = RcSink::default();
-        c.rc_events(&sink).await.expect("the stream must recover");
-        assert_eq!(
-            sink.0.lock().unwrap().len(),
-            1,
-            "the retried stream delivered"
-        );
-        assert_eq!(minter.calls(), 2, "exactly one re-mint");
-        assert_eq!(
-            provider.credential().await.unwrap().cert_serial,
-            "2",
-            "the refused certificate must not still be cached"
-        );
+        for attempt in 0..=TLS_ALERT_ATTEMPTS {
+            let (srv, minter, provider) = tls_alert_setup().await;
+            let c = client_for(&srv, provider.clone());
+            // The re-mint issues a VALID certificate, so the retry authenticates.
+            let sink = RcSink::default();
+            match c.rc_events(&sink).await {
+                Err(ref e) if is_ambiguous(e) && attempt < TLS_ALERT_ATTEMPTS => continue,
+                other => other.expect("the stream must recover"),
+            }
+            assert_eq!(
+                sink.0.lock().unwrap().len(),
+                1,
+                "the retried stream delivered"
+            );
+            assert_eq!(minter.calls(), 2, "exactly one re-mint");
+            assert_eq!(
+                provider.credential().await.unwrap().cert_serial,
+                "2",
+                "the refused certificate must not still be cached"
+            );
+            return;
+        }
+        unreachable!("the loop returns or exhausts into expect()");
     }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn create_recovers_from_a_tls_alert_rejection_exactly_once() {
-        let (srv, minter, provider) = tls_alert_setup().await;
-        let c = client_for(&srv, provider.clone());
-        let sink = CreateLog::default();
-        let req = crate::models::CreateShedRequest {
-            name: "folio".into(),
-            ..Default::default()
-        };
-        c.create_shed(&req, &sink).await;
-        assert_eq!(*sink.error.lock().unwrap(), None, "create must recover");
-        assert_eq!(sink.shed.lock().unwrap().as_deref(), Some("folio"));
-        assert_eq!(*sink.progress.lock().unwrap(), vec!["building".to_string()]);
-        assert_eq!(minter.calls(), 2, "exactly one re-mint");
+        for attempt in 0..=TLS_ALERT_ATTEMPTS {
+            let (srv, minter, provider) = tls_alert_setup().await;
+            let c = client_for(&srv, provider.clone());
+            let sink = CreateLog::default();
+            let req = crate::models::CreateShedRequest {
+                name: "folio".into(),
+                ..Default::default()
+            };
+            c.create_shed(&req, &sink).await;
+            // `create_shed` reports through the sink rather than returning, so
+            // the ambiguous shape shows up as the error string it logged.
+            let logged = sink.error.lock().unwrap().clone();
+            if attempt < TLS_ALERT_ATTEMPTS
+                && logged
+                    .as_deref()
+                    .is_some_and(crate::authfail::is_connection_lost_message)
+            {
+                continue;
+            }
+            assert_eq!(logged, None, "create must recover");
+            assert_eq!(sink.shed.lock().unwrap().as_deref(), Some("folio"));
+            assert_eq!(*sink.progress.lock().unwrap(), vec!["building".to_string()]);
+            assert_eq!(minter.calls(), 2, "exactly one re-mint");
+            return;
+        }
+        unreachable!("the loop returns or exhausts into the assertions");
     }
 
     /// A keep-alive listener that authorizes only the LATEST identity, so the

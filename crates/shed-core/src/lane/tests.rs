@@ -348,11 +348,26 @@ fn lane_answer_is_tagged_on_kind_in_snake_case() {
         }),
         json!({"kind": "permission", "decision": "allow_always"})
     );
+    // `custom_text` is SKIPPED when empty, so an answer with no free text is
+    // byte-for-byte the payload this enum emitted before the field existed —
+    // which is what lets a client that has not been rebuilt keep decoding it.
     assert_eq!(
         round_trip(&LaneAnswer::Question {
-            answers: vec![vec!["a".into(), "b".into()], vec!["c".into()]]
+            answers: vec![vec!["a".into(), "b".into()], vec!["c".into()]],
+            custom_text: vec![],
         }),
         json!({"kind": "question", "answers": [["a", "b"], ["c"]]})
+    );
+    assert_eq!(
+        round_trip(&LaneAnswer::Question {
+            answers: vec![vec!["a".into()], vec![]],
+            custom_text: vec![None, Some("typed".into())],
+        }),
+        json!({
+            "kind": "question",
+            "answers": [["a"], []],
+            "custom_text": [null, "typed"],
+        })
     );
     assert_eq!(round_trip(&LaneAnswer::Reject), json!({"kind": "reject"}));
     assert_eq!(
@@ -440,7 +455,7 @@ const RECV_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 /// task holding a transport open.
 #[tokio::test]
 async fn lane_stop_aborts_the_pump_on_stop_and_on_drop() {
-    let (tx, rx) = mpsc::unbounded_channel::<LaneEvent>();
+    let (tx, rx) = LanePublisher::channel();
     let task = tokio::spawn(async move {
         let _held = tx;
         std::future::pending::<()>().await;
@@ -459,7 +474,7 @@ async fn lane_stop_aborts_the_pump_on_stop_and_on_drop() {
     assert!(closed.is_none(), "an aborted pump yields a closed channel");
 
     // And again with no explicit stop: `Drop` does it.
-    let (tx, mut rx) = mpsc::unbounded_channel::<LaneEvent>();
+    let (tx, mut rx) = LanePublisher::channel();
     let task = tokio::spawn(async move {
         let _held = tx;
         std::future::pending::<()>().await;
@@ -484,17 +499,17 @@ async fn a_helper_returning_only_the_receiver_kills_the_pump() {
     /// The broken idiom, in the smallest shape that reproduces it: the
     /// subscription is owned HERE, so the `stop` left behind by the partial move
     /// drops when this returns.
-    fn broken_open(sub: LaneSubscription) -> mpsc::UnboundedReceiver<LaneEvent> {
+    fn broken_open(sub: LaneSubscription) -> mpsc::Receiver<LaneEvent> {
         sub.rx
     }
 
-    let (tx, rx) = mpsc::unbounded_channel::<LaneEvent>();
+    let (tx, rx) = LanePublisher::channel();
     let task = tokio::spawn(async move {
         // A pump that would keep sending forever, if it were allowed to live.
         let mut generation = 0u64;
         loop {
             generation += 1;
-            if tx.send(LaneEvent::Ready { generation }).is_err() {
+            if tx.publish(LaneEvent::Ready { generation }) == Publish::Closed {
                 return;
             }
             tokio::task::yield_now().await;
@@ -521,10 +536,10 @@ async fn a_helper_returning_only_the_receiver_kills_the_pump() {
 /// keeps the pump alive and the frames flowing.
 #[tokio::test]
 async fn into_parts_keeps_frames_flowing_while_both_halves_live() {
-    let (tx, rx) = mpsc::unbounded_channel::<LaneEvent>();
+    let (tx, rx) = LanePublisher::channel();
     let task = tokio::spawn(async move {
         for generation in 1..=3u64 {
-            if tx.send(LaneEvent::Ready { generation }).is_err() {
+            if tx.publish(LaneEvent::Ready { generation }) == Publish::Closed {
                 return;
             }
             tokio::task::yield_now().await;
@@ -556,6 +571,143 @@ async fn into_parts_keeps_frames_flowing_while_both_halves_live() {
         .await
         .expect("dropping the stop half must still abort the pump");
     assert!(closed.is_none());
+}
+
+// ---- the bounded channel (module doc, correction 13) ----
+
+/// [`LanePublisher::publish`]'s three outcomes, and the one that matters: a full
+/// queue DROPS the frame rather than queueing it behind, which is why the caller
+/// has to end its generation instead of carrying on.
+#[tokio::test]
+async fn publish_answers_sent_until_it_is_full_then_lagged() {
+    let (tx, mut rx) = LanePublisher::channel();
+    for generation in 0..LANE_CHANNEL_CAPACITY as u64 {
+        assert_eq!(
+            tx.publish(LaneEvent::Ready { generation }),
+            Publish::Sent,
+            "frame {generation} is inside LANE_CHANNEL_CAPACITY and must fit"
+        );
+    }
+    assert_eq!(
+        tx.publish(LaneEvent::Ready { generation: 9_999 }),
+        Publish::Lagged,
+        "the frame past the bound is refused, not queued"
+    );
+
+    // And it is GONE — the queue holds exactly what fit, in order.
+    for generation in 0..LANE_CHANNEL_CAPACITY as u64 {
+        assert_eq!(rx.recv().await, Some(LaneEvent::Ready { generation }));
+    }
+    assert!(
+        rx.try_recv().is_err(),
+        "the lagged frame was dropped; nothing may arrive behind the bound"
+    );
+}
+
+/// The terminal `Down` is the one frame that is never dropped:
+/// [`LanePublisher::publish_final`] WAITS for room and lands after everything
+/// the client had queued.
+#[tokio::test]
+async fn publish_final_waits_for_room_and_the_down_still_lands() {
+    let (tx, mut rx) = LanePublisher::channel();
+    for generation in 0..LANE_CHANNEL_CAPACITY as u64 {
+        assert_eq!(tx.publish(LaneEvent::Ready { generation }), Publish::Sent);
+    }
+    let sending = tokio::spawn(async move {
+        tx.publish_final(LaneEvent::Down {
+            reason: "lagged-then-gone".to_string(),
+        })
+        .await;
+    });
+    // Nothing can move while the queue is full, and `publish_final` must be
+    // waiting rather than having quietly dropped the frame.
+    tokio::task::yield_now().await;
+    assert!(
+        !sending.is_finished(),
+        "publish_final must await room for the Down, not drop it"
+    );
+
+    let mut frames = 0usize;
+    let mut last = None;
+    while let Some(ev) = tokio::time::timeout(RECV_TIMEOUT, rx.recv())
+        .await
+        .expect("the Down must arrive once the queue drains")
+    {
+        frames += 1;
+        last = Some(ev);
+    }
+    assert_eq!(
+        frames,
+        LANE_CHANNEL_CAPACITY + 1,
+        "everything, plus the Down"
+    );
+    assert_eq!(
+        last,
+        Some(LaneEvent::Down {
+            reason: "lagged-then-gone".to_string()
+        }),
+        "the Down is the last thing a subscription says"
+    );
+    sending.await.expect("the sender task finishes");
+}
+
+/// [`LanePublisher::wait_drained`] is "the client has caught up ENTIRELY", not
+/// "there is room again". A reseed republishes a whole seed, so starting one
+/// against a merely-not-full queue would lag again a few frames in.
+#[tokio::test]
+async fn wait_drained_resolves_only_when_every_slot_is_free() {
+    let (tx, mut rx) = LanePublisher::channel();
+    for generation in 0..3u64 {
+        assert_eq!(tx.publish(LaneEvent::Ready { generation }), Publish::Sent);
+    }
+    rx.recv().await.expect("the first frame");
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(50), tx.wait_drained())
+            .await
+            .is_err(),
+        "two frames are still queued: wait_drained must not resolve"
+    );
+
+    rx.recv().await.expect("the second frame");
+    rx.recv().await.expect("the third frame");
+    tokio::time::timeout(RECV_TIMEOUT, tx.wait_drained())
+        .await
+        .expect("an empty queue must resolve wait_drained")
+        .expect("the receiver is still alive");
+}
+
+/// A subscriber that went away ends BOTH awaits — the adapter then stops
+/// silently, with no `Down` and no reseed, exactly as its `is_closed` checks
+/// already do.
+#[tokio::test]
+async fn a_dropped_receiver_ends_publish_and_both_awaits() {
+    let (tx, rx) = LanePublisher::channel();
+    assert_eq!(
+        tx.publish(LaneEvent::Ready { generation: 1 }),
+        Publish::Sent
+    );
+    drop(rx);
+
+    assert!(tx.is_closed());
+    assert_eq!(
+        tx.publish(LaneEvent::Ready { generation: 2 }),
+        Publish::Closed,
+        "a closed channel is Closed, never Lagged — the two mean different things"
+    );
+    assert_eq!(
+        tokio::time::timeout(RECV_TIMEOUT, tx.wait_drained())
+            .await
+            .expect("wait_drained must not hang on a closed channel"),
+        Err(Closed),
+    );
+    tokio::time::timeout(
+        RECV_TIMEOUT,
+        tx.publish_final(LaneEvent::Down {
+            reason: "nobody is listening".to_string(),
+        }),
+    )
+    .await
+    .expect("publish_final must return on a closed channel rather than hang");
 }
 
 // ---- the trait ----
@@ -1159,13 +1311,35 @@ fn lane_answer_refuses_unknown_fields_inside_a_variant() {
             json!({"kind": "question", "answers": [["yes"], ["a", "b"]]}),
             LaneAnswer::Question {
                 answers: vec![vec!["yes".into()], vec!["a".into(), "b".into()]],
+                custom_text: vec![],
+            },
+        ),
+        // `custom_text` is `#[serde(default)]` too — the PRODUCER-side half of
+        // the compatibility claim: this decoder accepts an older client that
+        // never learned the field. (The other direction does not hold, and is
+        // asserted below: `deny_unknown_fields` means an older decoder REFUSES
+        // a payload carrying it, which is why the decoding side ships first.)
+        (
+            json!({
+                "kind": "question",
+                "answers": [["yes"], []],
+                "custom_text": [null, " a branch "],
+            }),
+            LaneAnswer::Question {
+                answers: vec![vec!["yes".into()], vec![]],
+                // NOT trimmed at decode — `normalize_question_answer` is the
+                // one place that trims, so both adapters trim identically.
+                custom_text: vec![None, Some(" a branch ".into())],
             },
         ),
         // `answers` is `#[serde(default)]`, so an omitted field is still fine —
         // deny_unknown_fields refuses EXTRA keys, never missing optional ones.
         (
             json!({"kind": "question"}),
-            LaneAnswer::Question { answers: vec![] },
+            LaneAnswer::Question {
+                answers: vec![],
+                custom_text: vec![],
+            },
         ),
         (json!({"kind": "reject"}), LaneAnswer::Reject),
         (
@@ -1187,4 +1361,98 @@ fn lane_answer_refuses_unknown_fields_inside_a_variant() {
     // An unknown variant tag stays refused too (the strictness that already
     // existed, re-pinned so a future `#[serde(other)]` cannot creep in).
     assert!(serde_json::from_value::<LaneAnswer>(json!({"kind": "nope"})).is_err());
+}
+
+// ---- the shared question-answer reader (§3.2) ----
+
+/// A question with `custom` set as asked, options irrelevant to the reader.
+fn question(id: &str, custom: bool) -> LaneQuestion {
+    LaneQuestion {
+        id: Some(id.into()),
+        header: String::new(),
+        question: id.into(),
+        options: vec![],
+        multiple: false,
+        custom,
+    }
+}
+
+/// The whole normalisation table, in one place, because BOTH adapters read the
+/// positional pair through it and a per-adapter reading is exactly what would
+/// drift.
+#[test]
+fn normalize_pads_both_vectors_to_the_questions() {
+    let qs = [question("q0", true), question("q1", true)];
+
+    // Nothing at all: one reply per QUESTION, not per answer.
+    let out = normalize_question_answer(&qs, &[], &[]).expect("empty is legal");
+    assert_eq!(out.len(), 2);
+    assert!(out.iter().all(|r| r.labels.is_empty() && r.text.is_none()));
+
+    // `custom_text` LONGER than `answers` — the shape a `zip` drops. Position 1
+    // survives with its text and no labels.
+    let out = normalize_question_answer(&qs, &[], &[None, Some("typed".into())])
+        .expect("free text alone is an answer");
+    assert_eq!(out[0], QuestionReply::default());
+    assert_eq!(out[1].labels, Vec::<String>::new());
+    assert_eq!(out[1].text.as_deref(), Some("typed"));
+
+    // `answers` longer than `custom_text` — the mirror image.
+    let out = normalize_question_answer(&qs, &[vec!["a".into()], vec!["b".into()]], &[])
+        .expect("no free text anywhere");
+    assert_eq!(out[0].labels, vec!["a".to_string()]);
+    assert_eq!(out[1].labels, vec!["b".to_string()]);
+    assert!(out.iter().all(|r| r.text.is_none()));
+}
+
+#[test]
+fn normalize_refuses_a_vector_longer_than_the_questions() {
+    let qs = [question("q0", true)];
+    assert!(matches!(
+        normalize_question_answer(&qs, &[vec![], vec![]], &[]),
+        Err(LaneError::BadRequest(_))
+    ));
+    assert!(matches!(
+        normalize_question_answer(&qs, &[], &[None, None]),
+        Err(LaneError::BadRequest(_))
+    ));
+}
+
+/// The text an adapter posts is the TRIMMED text — decided here, so gx and
+/// opencode cannot send an agent different bytes for the same keystrokes.
+#[test]
+fn normalize_trims_and_empties_become_none() {
+    let qs = [question("q0", true)];
+    let out = normalize_question_answer(&qs, &[], &[Some("  a branch  ".into())]).expect("trims");
+    assert_eq!(out[0].text.as_deref(), Some("a branch"));
+
+    for blank in ["", "   ", "\n\t "] {
+        let out = normalize_question_answer(&qs, &[], &[Some(blank.into())])
+            .unwrap_or_else(|e| panic!("{blank:?} is not an answer, not an error: {e}"));
+        assert_eq!(out[0].text, None, "{blank:?}");
+    }
+}
+
+/// Text aimed at a question that does not take it is REFUSED, not dropped —
+/// the human typed it, and an agent that would reject it is worth saying so
+/// before the wire, not after.
+#[test]
+fn normalize_refuses_free_text_on_a_question_that_does_not_take_it() {
+    let qs = [question("q0", true), question("q1", false)];
+    let err = normalize_question_answer(&qs, &[], &[None, Some("typed".into())])
+        .expect_err("q1 does not accept free text");
+    match err {
+        LaneError::BadRequest(m) => assert!(
+            m.contains("question 1"),
+            "the refusal names the position the client addressed: {m}"
+        ),
+        other => panic!("{other:?}"),
+    }
+
+    // …but whitespace on that same question is not "text": it trims away
+    // BEFORE the check, so a panel that keeps an empty box per question can
+    // send the whole vector without tripping over the questions that refuse.
+    let out = normalize_question_answer(&qs, &[], &[None, Some("   ".into())])
+        .expect("blank is not text");
+    assert_eq!(out[1].text, None);
 }

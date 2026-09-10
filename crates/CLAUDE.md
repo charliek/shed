@@ -18,6 +18,15 @@ re-implemented per language. The root `CLAUDE.md` owns the monorepo layout + rel
   one adapter per agent (opencode over its local HTTP server; `gx` next). Pure types, **no
   I/O** — the transport, fold, ring and reconnect loop belong to whatever crate implements
   it. It lives here, not in `shed-app`, because shed-mobile links the DTOs through FRB.
+  It also owns the one shared overflow policy (plan 018, module doc correction 13):
+  `LaneSubscription`'s frame channel is bounded at `LANE_CHANNEL_CAPACITY` (1024 frames),
+  and `LanePublisher` — deliberately **not** `Clone`, one per subscription — is the only
+  way onto it: `publish` (`try_send`; a full channel answers `Publish::Lagged` and drops
+  the frame), `publish_final` (consumes self and awaits; the terminal `Down` is the one
+  frame that can never be the dropped one), and `wait_drained` (resolves only once every
+  slot is free). Both adapters propagate a `Lagged` out of every emitting helper and
+  reseed rather than silently resume, even on gx — the dropped frames may already be
+  behind the client's cursor.
   **The FRB-mirror rule (load-bearing):** mobile HAND-mirrors every lane DTO into Dart, so
   every field is an owned `String`/`Option`/`Vec`/scalar — **no `serde_json::Value`, no
   `HashMap`, no borrowed lifetimes**; free-form payloads travel as a `String` of raw JSON
@@ -38,6 +47,15 @@ re-implemented per language. The root `CLAUDE.md` owns the monorepo layout + rel
   together). Since `sx` was sunset in plan 016 (S7, #329), nothing in this workspace
   enables `rc` by default any more — the explicit `-p shed-app --features rc` leg
   (see the note below) is the ONLY coverage for it, same as `broker`.
+  `lane_view.rs` (plan 018 §3.5, ungated for the same reason `machine.rs` and
+  `roost.rs` are) is the **staged agent-lane view** — `LaneView`/`LaneViewSnapshot`,
+  moved down out of the Tauri crate — that folds a `shed_core::lane` subscription
+  (messages, activity, generation, approvals) into what `lane.messages`/`lane.approvals`
+  return, behind the same `Reset … Ready` staging the contract promises;
+  `LaneView::snapshot(since_seq)` is the typed projection both a full read and a delta
+  poll go through. It is ungated because mobile links `shed-app` with default features
+  and needs the identical fold — the phone showing the same view the desktop shows is
+  a property of one implementation, not two that have to agree.
 - **`shed-rc-engine`** — the one-shot Remote-Control engine ported from the Go guest
   binary (plan 009), graduated out of shed-app at its second consumer (plan 010:
   shed-broker's `rc_hub` — a broker→shed-app dep would cycle through shed-app's `broker`

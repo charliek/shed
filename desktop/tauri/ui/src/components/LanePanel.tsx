@@ -315,17 +315,29 @@ export function LanePanel({ machine, sessionId, onClose }: {
     picks[a.id] ?? a.questions.map(() => []);
   const typedFor = (a: LaneApproval): string[] => typed[a.id] ?? a.questions.map(() => "");
 
-  /** Submit a question form: one inner list per question, its picked ids plus
-   *  the free text when the reader typed some (the contract's vec-of-vecs). */
+  /** Submit a question form: one inner list of picked ids per question, and the
+   *  free text BESIDE it in `custom_text` — never appended to the ids.
+   *
+   *  The panel used to smuggle the typed string into the vec-of-vecs as one
+   *  more "option id", which left the adapter unable to tell a chosen label
+   *  from something a human wrote — so gx, whose answer is a label map with a
+   *  separate annotations channel, could not carry it at all. The smuggle now
+   *  lives in the opencode adapter, where appending IS the agent's own shape.
+   *
+   *  `custom_text` is omitted entirely when nothing was typed, so the ordinary
+   *  answer is the same payload this panel sent before the field existed. */
   const submitQuestion = (a: LaneApproval) => {
     const chosen = pickedFor(a);
     const free = typedFor(a);
-    const answers = a.questions.map((q, i) => {
-      const ids = chosen[i] ?? [];
-      const text = q.custom ? (free[i] ?? "").trim() : "";
-      return text ? [...ids, text] : [...ids];
-    });
-    void answer(a.id, { question: answers });
+    const answers = a.questions.map((_, i) => [...(chosen[i] ?? [])]);
+    // `null` where nothing was typed AND on any question that does not take
+    // free text — the backend refuses text aimed at one of those, and the box
+    // is not rendered there either.
+    const texts = a.questions.map((q, i) => (q.custom ? (free[i] ?? "").trim() || null : null));
+    void answer(
+      a.id,
+      texts.some((t) => t !== null) ? { question: answers, custom_text: texts } : { question: answers },
+    );
   };
 
   const pick = (a: LaneApproval, index: number, id: string) => {

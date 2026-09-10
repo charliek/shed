@@ -128,9 +128,11 @@
 //! # What the gx adapter changed
 //!
 //! A contract validated against ONE implementation is a design. gx is the second
-//! adapter, and these twelve corrections are what it forced. They are recorded
-//! here because the next adapter — and shed-mobile's hand-written mirror — read
-//! this doc as the contract.
+//! adapter, and corrections 1–12 are what it forced. (13 came later and is not
+//! gx's: it is the CLIENT CHANNEL's bound. It lives in the same numbered list
+//! because the same readers — the next adapter, and shed-mobile's hand-written
+//! mirror — read this list as the contract.) They are recorded here because that
+//! is what those readers read.
 //!
 //! 1. **A silent resume is allowed, and [`LaneEvent::Reset`] … [`LaneEvent::Ready`]
 //!    is the *reseed* bracket only.** On an adapter advertising
@@ -194,10 +196,14 @@
 //!    question's TEXT (what its own TUI keys by); opencode has no key and leaves
 //!    it `None` (positional). [`LaneAnswer::Question::answers`] stays POSITIONAL
 //!    — the adapter maps position → key — so a client never has to know which
-//!    agent it is talking to. `custom` stays `false` on gx: free text there is an
-//!    "Other" answer plus a separate annotations channel this contract cannot
-//!    carry yet, and inviting typing the agent will reject is worse than not
-//!    offering it.
+//!    agent it is talking to. **Free text is its own positional field**
+//!    ([`LaneAnswer::Question::custom_text`]), read against the questions by
+//!    [`normalize_question_answer`], and both adapters carry it: gx turns it
+//!    into an `"Other"` label plus an `annotations[key].notes` entry, opencode
+//!    appends it to that question's answer list (which is what its own TUI
+//!    posts). `custom` is now `true` on gx — its freeform row is on by default
+//!    — and on opencode it defaults to TRUE off the wire, which is what
+//!    opencode's schema says and what its TUI does with an absent flag.
 //! 5. **Credentials are the client's job.** There is no credential type in this
 //!    contract and there will not be one: an adapter takes its credentials at
 //!    construction, from a source the client supplies; roost carries only WHERE
@@ -212,10 +218,18 @@
 //!    overrides both `activity` (→ `NeedsApproval`) and
 //!    [`LaneSession::pending_approvals`]** on every session row the adapter
 //!    emits: the adapter's fold knows about an approval the roster poll does not.
-//! 7. **[`LaneSession::approximate`] is corrected, not changed.** opencode reports
-//!    `true` on every row it emits — its activity comes from a cheap status poll.
-//!    gx is the first producer to report `false`. No opencode code changes; the
-//!    doc simply stops implying the flag is ever situational there.
+//! 7. **[`LaneSession::approximate`] is per-ROW, not per-producer.** This
+//!    correction originally said opencode reports `true` on every row it emits.
+//!    That is not what the adapter does, and the flag is better for it:
+//!    opencode's ROSTER rows ([`AgentLane::sessions`]/[`AgentLane::session`],
+//!    derived from its `/session/status` poll) report `true`, and its LIVE
+//!    WATCHER rows report `false`, because that row's activity is read off the
+//!    fold — the event stream itself, not a poll. gx reports `false` from its
+//!    roster as well. So the flag describes THE ROW's provenance, which is what
+//!    it was always for; a client that expects one producer to answer the same
+//!    way on every row is reading it wrong. Nothing about the two producers
+//!    changes here — the doc stops implying the flag is a property of the
+//!    adapter.
 //! 8. **Cancel may be refused.** An adapter whose agent rejects a no-op cancel
 //!    surfaces [`LaneError::NotAccepting`] rather than swallowing it as `Ok(())`;
 //!    clients gate the affordance on [`crate::rc::RcActivity::Working`]. Hiding
@@ -244,6 +258,53 @@
 //! 12. **The mapping table above is rewritten from gx as built**, and the error
 //!     table is explicit rather than "the error table verbatim" — a row-by-row
 //!     table is a test, and a prose promise is not.
+//!
+//! 13. **The frame channel is BOUNDED at [`LANE_CHANNEL_CAPACITY`], and an
+//!     overflow is a RESEED.** [`LaneSubscription::rx`] is a bounded
+//!     `mpsc::Receiver`; the producing half is [`LanePublisher`], which is
+//!     deliberately **not `Clone`** — one publisher owns one subscription, which
+//!     is what makes [`LanePublisher::wait_drained`] mean anything. An adapter
+//!     publishes with [`LanePublisher::publish`], a `try_send`: a full channel
+//!     answers [`Publish::Lagged`] and the frame is DROPPED. Every emitting
+//!     helper propagates that, so the generation ends at the FIRST dropped
+//!     frame — in steady streaming, during the REST seed, and during a reseed's
+//!     own `Reset` … `Ready`, which is why a lagged reseed is abandoned and
+//!     retried with a fresh `Reset` rather than left staged with no `Ready`. The
+//!     adapter then ends the generation exactly as it ends one on a stream loss
+//!     (opencode drops its `/event` stream; gx drops its SSE stream and unpins
+//!     the epoch), waits for the channel to drain **with no transport held**, and
+//!     reseeds as `Reset { reason: "lagged" } … Ready`. Consecutive lagged
+//!     generations go through the adapter's ordinary failure backoff, so a
+//!     consumer draining one frame at a time cannot turn itself into a
+//!     seed-per-frame load on the live agent. A client that honours the bracket
+//!     never observes the dropped frames: it holds the last `Ready` view until
+//!     the next `Ready` swaps it, and `lagged` is one more free-text
+//!     `Reset::reason` that nothing branches on. The terminal
+//!     [`LaneEvent::Down`] is the ONE frame that is never dropped — it goes
+//!     through [`LanePublisher::publish_final`], which awaits, so a client can
+//!     never hold a stale `Ready` view with no stale reason.
+//!
+//!     **`lagged` and `overflow` are different overflows and both names stay.**
+//!     `overflow` is an ADAPTER-INTERNAL one — the bounded inbox that buffers
+//!     live frames while the REST seed runs — and it says the adapter lost
+//!     frames it had not folded yet. `lagged` is the CLIENT channel: the
+//!     adapter folded and published them, and the consumer was not reading.
+//!     Neither is a substitute for the other, and nothing branches on either.
+//!
+//!     **What the bound is and is not.** It bounds the COUNT of queued frames,
+//!     not their bytes. Frame size is bounded separately by each adapter's own
+//!     caps ([`feed::truncate_bytes`] on message text, the 4 MiB SSE frame
+//!     limit; [`LaneApproval::request_json`] is the agent's raw request and is
+//!     not capped here), so the worst case a stalled consumer retains is
+//!     [`LANE_CHANNEL_CAPACITY`] × the largest frame its adapter admits — finite,
+//!     which is the whole gain, since the count was previously unbounded. A byte
+//!     budget is deliberately not added. Backpressure was rejected because the
+//!     publishing task is the one reading the agent's SSE stream, and a
+//!     `send().await` mid-generation would stall that read and let the agent's
+//!     server close or buffer it — a less controlled reconnect than this one.
+//!     Drop-oldest was rejected because the contract promises order and the
+//!     exact set within a generation, and a client cannot tell that rows went
+//!     missing.
 //!
 //! One thing these corrections deliberately did NOT do: add
 //! `LaneDecision::RejectAlways`, put a `LaneCredentials` type in the contract, or
@@ -292,11 +353,14 @@ pub struct LaneSession {
     /// cheap or stale source (a roster poll rather than a live fold), so a client
     /// can render the row without claiming precision it does not have.
     ///
-    /// **opencode reports `true` on every row it emits** — its activity comes
-    /// from a status poll, on the seeded row as much as on a live one. gx is the
-    /// first producer to report `false`. The flag is per-producer in practice,
-    /// not per-row; a client that treats a `false` as "trust this one more" is
-    /// reading it right, and one that expects opencode to vary it is not.
+    /// **It is per-ROW, not per-producer** (module doc, correction 7). opencode
+    /// reports `true` on the rows it derives from its `/session/status` poll —
+    /// [`AgentLane::sessions`] and [`AgentLane::session`] — and `false` on the
+    /// [`LaneEvent::Session`] rows its watcher emits, whose activity comes off
+    /// the live fold rather than a poll. gx reports `false`. So a client treats
+    /// a `false` as "trust this one more" and reads the flag on each row it
+    /// gets; one that expects a given adapter to answer the same way everywhere
+    /// is reading it wrong.
     pub approximate: bool,
     /// Set on a child session; `None` on a root. Descendants exist because an
     /// agent can spawn sub-sessions whose approvals still block the parent.
@@ -545,8 +609,10 @@ pub mod option_kind {
 /// how it may be answered.
 ///
 /// `multiple` allows several options in one answer; `custom` allows free text
-/// alongside (or instead of) the options, and DEFAULTS TO FALSE — an adapter that
-/// cannot tell must not invite typing the agent will reject.
+/// alongside (or instead of) the options — carried back in
+/// [`LaneAnswer::Question::custom_text`] and read by
+/// [`normalize_question_answer`], which REFUSES text aimed at a question whose
+/// `custom` is false rather than dropping it.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct LaneQuestion {
     /// The key this question's answer is filed under, when the agent files
@@ -573,6 +639,16 @@ pub struct LaneQuestion {
     /// render conservatively.
     #[serde(default)]
     pub multiple: bool,
+    /// Whether this question accepts free text beside its options.
+    ///
+    /// **On THIS DTO an absent value is `false`** — the conservative reading for
+    /// a producer one version behind, and the one a panel can act on without
+    /// inviting typing that will be refused. That is not the same as the
+    /// AGENT's default: opencode's own schema documents `custom` as "Allow
+    /// typing a custom answer (default: true)" and its TUI treats an absent
+    /// flag as on, so the opencode adapter's wire reader defaults it TRUE
+    /// before it ever builds one of these. gx sets it `true` unconditionally —
+    /// its ask always carries a freeform row.
     #[serde(default)]
     pub custom: bool,
 }
@@ -765,8 +841,12 @@ pub enum LaneDecision {
 ///
 /// [`LaneAnswer::Question::answers`] is a vec-of-vecs: one inner vec per question
 /// in [`LaneApproval::questions`], each holding the option ids chosen for it (one
-/// entry unless that question is `multiple`, and a free-text string when it is
-/// `custom`). [`LaneAnswer::Raw`] carries a body the contract does not model, as
+/// entry unless that question is `multiple`). Free text rides BESIDE it in
+/// [`LaneAnswer::Question::custom_text`], positionally — never smuggled into
+/// `answers` as one more "id", which is what a client used to have to do and
+/// what left an adapter unable to tell a chosen label from something typed.
+/// [`normalize_question_answer`] is the one reader of the pair.
+/// [`LaneAnswer::Raw`] carries a body the contract does not model, as
 /// raw JSON in a `String` — the escape hatch for an unknown
 /// [`LaneApprovalKind`].
 ///
@@ -820,6 +900,22 @@ pub enum LaneAnswer {
     Question {
         #[serde(default)]
         answers: Vec<Vec<String>>,
+        /// Free text per question, positional like `answers`; `None` where the
+        /// human typed nothing. Empty vec = no free text anywhere.
+        ///
+        /// **Additive, and the compatibility is PRODUCER-side.** A newer
+        /// decoder accepts an older client that never sends the field
+        /// (`#[serde(default)]`), which is the direction a two-PR lockstep
+        /// needs; an older decoder — this enum is `deny_unknown_fields` —
+        /// REFUSES a payload carrying it. So the decoding side ships first.
+        /// It is skipped when empty so an answer that carries no free text is
+        /// byte-identical to what the previous build emitted.
+        ///
+        /// Named after [`LaneQuestion::custom`], the flag that permits it: a
+        /// `Some` at a position whose question is not `custom` is a
+        /// [`LaneError::BadRequest`], not a value to drop.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        custom_text: Vec<Option<String>>,
     },
     /// Decline the whole request — distinct from a permission's
     /// [`LaneDecision::Reject`], which is one option among three.
@@ -827,6 +923,95 @@ pub enum LaneAnswer {
     Raw {
         json: String,
     },
+}
+
+/// One question's answer after [`normalize_question_answer`] has read the
+/// positional pair: the labels chosen for it, and the free text typed beside
+/// them.
+///
+/// One per question in [`LaneApproval::questions`], in question order — a
+/// question the client said nothing about is present with an empty `labels` and
+/// no `text`, because "unanswered" is a thing each adapter renders its own way
+/// (gx omits the key, opencode posts an empty list) and a hole in the vec would
+/// make position stop meaning question.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct QuestionReply {
+    /// The option ids chosen for this question, in the order the client sent
+    /// them. Empty when nothing was picked.
+    pub labels: Vec<String>,
+    /// The free text typed for this question, TRIMMED — and `None` rather than
+    /// `Some("")` when the trim emptied it, so an adapter never has to decide
+    /// whether whitespace was an answer.
+    pub text: Option<String>,
+}
+
+/// Read a [`LaneAnswer::Question`]'s positional pair against the approval's own
+/// questions — **the one implementation, shared by every adapter**.
+///
+/// It is here and not in each adapter for the reason correction 3 put
+/// [`LaneApproval::option_for`] here: two adapters reading the same two vectors
+/// would not stay agreed about the edges, and every edge below is a place where
+/// disagreeing means silently dropping something a human typed.
+///
+/// The rules, in order:
+///
+/// 1. `answers` or `custom_text` LONGER than `questions` is
+///    [`LaneError::BadRequest`]. Shorter is fine — the tail is unanswered.
+/// 2. Both are extended to `questions.len()` with `[]` / `None`, so the result
+///    is one reply per question and position keeps meaning question. This is
+///    what makes a free-text-only answer to question 2 survive a `custom_text`
+///    LONGER than `answers`; a `zip` of the two would drop it.
+/// 3. Every `Some(t)` is trimmed, and an empty result becomes `None`. The
+///    trimmed text is what is TRANSMITTED — an adapter never sees the padding,
+///    so it cannot post one agent a trimmed answer and another a padded one.
+/// 4. A `Some` at a position whose [`LaneQuestion::custom`] is `false` is
+///    [`LaneError::BadRequest`]. The agent would refuse it (or, worse, file it
+///    as a label it never offered), and refusing here happens BEFORE anything
+///    reaches the wire.
+///
+/// The index in the refusal is the POSITION the client sent, 0-based — the same
+/// index it addressed `custom_text` by.
+pub fn normalize_question_answer(
+    questions: &[LaneQuestion],
+    answers: &[Vec<String>],
+    custom_text: &[Option<String>],
+) -> Result<Vec<QuestionReply>, LaneError> {
+    if answers.len() > questions.len() {
+        return Err(LaneError::BadRequest(format!(
+            "the approval has {} questions; {} answers were given",
+            questions.len(),
+            answers.len()
+        )));
+    }
+    if custom_text.len() > questions.len() {
+        return Err(LaneError::BadRequest(format!(
+            "the approval has {} questions; free text was given for {}",
+            questions.len(),
+            custom_text.len()
+        )));
+    }
+    let mut out = Vec::with_capacity(questions.len());
+    for (i, q) in questions.iter().enumerate() {
+        let text = match custom_text.get(i).and_then(Option::as_deref) {
+            None => None,
+            Some(t) => match t.trim() {
+                "" => None,
+                trimmed => {
+                    if !q.custom {
+                        return Err(LaneError::BadRequest(format!(
+                            "question {i} does not accept free text"
+                        )));
+                    }
+                    Some(trimmed.to_string())
+                }
+            },
+        };
+        out.push(QuestionReply {
+            labels: answers.get(i).cloned().unwrap_or_default(),
+            text,
+        });
+    }
+    Ok(out)
 }
 
 // ---- the event stream ----
@@ -902,12 +1087,138 @@ pub enum LaneEvent {
     Unknown,
 }
 
+// ---- the frame channel ----
+
+/// How many frames a subscription may have queued for a client before the
+/// adapter's next publish is dropped and the generation reseeds (module doc,
+/// correction 13).
+///
+/// **Frames, not bytes.** A seed of 500 transcript rows plus a session row and
+/// its approvals fits inside this with room to spare, so a client that drains
+/// promptly never sees the bound at all; what it catches is the client that
+/// stops draining entirely, whose queue used to grow without limit.
+pub const LANE_CHANNEL_CAPACITY: usize = 1024;
+
+/// How often [`LanePublisher::wait_drained`] re-reads the queue.
+///
+/// Short enough that a consumer which catches up is not made to wait for its
+/// reseed, long enough that a lane parked behind a consumer that never drains
+/// costs a timer wakeup rather than a spin.
+const DRAIN_POLL: std::time::Duration = std::time::Duration::from_millis(5);
+
+/// What one [`LanePublisher::publish`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Publish {
+    /// Queued for the client.
+    Sent,
+    /// The receiver is gone — the subscription is over. An adapter may keep
+    /// going and let its run loop notice; nothing it publishes will be read.
+    Closed,
+    /// The queue was FULL and this frame was **dropped**. The generation must
+    /// end here (module doc, correction 13): a client that saw the frames
+    /// either side of a hole has no way to know there was one.
+    Lagged,
+}
+
+/// The subscriber is gone: [`LanePublisher::wait_drained`]'s error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Closed;
+
+impl std::fmt::Display for Closed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the lane subscriber is gone")
+    }
+}
+
+impl std::error::Error for Closed {}
+
+/// The producing half of a [`LaneSubscription`] — and the one place the
+/// overflow policy of module-doc correction 13 is written down.
+///
+/// **Not `Clone`, on purpose.** One publisher owns one subscription. It is what
+/// makes [`LanePublisher::wait_drained`] meaningful: a second producer on the
+/// same channel could refill the slots the first one just waited for, and the
+/// "wait until the consumer has caught up" the reseed depends on would be a
+/// wait for nothing.
+pub struct LanePublisher {
+    tx: mpsc::Sender<LaneEvent>,
+}
+
+impl LanePublisher {
+    /// The channel one subscription runs on: this publisher, and the receiver
+    /// that goes into [`LaneSubscription::rx`].
+    pub fn channel() -> (LanePublisher, mpsc::Receiver<LaneEvent>) {
+        let (tx, rx) = mpsc::channel(LANE_CHANNEL_CAPACITY);
+        (LanePublisher { tx }, rx)
+    }
+
+    /// Queue one frame, **without ever awaiting**.
+    ///
+    /// The publishing task is the one reading the agent's own event stream, so
+    /// it must not block on a slow consumer: a full queue answers
+    /// [`Publish::Lagged`] and the frame is dropped. Every caller propagates
+    /// that rather than absorbing it — the generation ends at the first dropped
+    /// frame and reseeds.
+    pub fn publish(&self, ev: LaneEvent) -> Publish {
+        match self.tx.try_send(ev) {
+            Ok(()) => Publish::Sent,
+            Err(mpsc::error::TrySendError::Full(_)) => Publish::Lagged,
+            Err(mpsc::error::TrySendError::Closed(_)) => Publish::Closed,
+        }
+    }
+
+    /// Deliver the terminal [`LaneEvent::Down`], **waiting for room if there is
+    /// none**. Consumes the publisher, because there is nothing after it.
+    ///
+    /// This is the one frame that is never dropped. It is sent after the
+    /// transport is gone, so the await can stall nothing that matters — and it
+    /// is what stops a client holding a `Ready` view forever with no stale
+    /// reason, because the one frame that would have told it was the one that
+    /// hit a full queue.
+    pub async fn publish_final(self, ev: LaneEvent) {
+        // `Err` only means the subscriber is already gone, which is the state
+        // this was going to tell it about.
+        let _ = self.tx.send(ev).await;
+    }
+
+    /// Whether the subscriber has dropped its receiver.
+    pub fn is_closed(&self) -> bool {
+        self.tx.is_closed()
+    }
+
+    /// Resolve once the client has drained **every** queued frame.
+    ///
+    /// Not "there is room again": all of it. A reseed republishes a whole seed,
+    /// and starting it against a queue that is merely no longer full would lag
+    /// again a few frames in — which is how a slow consumer turns into a
+    /// reseed loop against a live agent. [`Closed`] means the subscriber went
+    /// away while we waited; the adapter then stops silently, with no `Down`
+    /// and no reseed, exactly as it does for the `is_closed` checks it already
+    /// makes.
+    pub async fn wait_drained(&self) -> Result<(), Closed> {
+        loop {
+            if self.tx.is_closed() {
+                return Err(Closed);
+            }
+            if self.tx.capacity() == LANE_CHANNEL_CAPACITY {
+                return Ok(());
+            }
+            tokio::time::sleep(DRAIN_POLL).await;
+        }
+    }
+}
+
 /// A live subscription: the frames, and the handle that ends it.
 ///
-/// Deliberately the shape of `shed_app::roost::RoostWatcher` — a spawned task, an
-/// unbounded channel, [`LaneStop::stop`] aborts, `Drop` stops — so a lane
-/// subscription and a roost watcher are torn down the same way in a client that
-/// holds both. Not restartable: call [`AgentLane::subscribe`] again.
+/// Deliberately the shape of `shed_app::roost::RoostWatcher` — a spawned task, a
+/// channel, [`LaneStop::stop`] aborts, `Drop` stops — so a lane subscription and
+/// a roost watcher are torn down the same way in a client that holds both. Not
+/// restartable: call [`AgentLane::subscribe`] again.
+///
+/// The channel is **bounded** at [`LANE_CHANNEL_CAPACITY`] frames (module doc,
+/// correction 13). `recv().await` is unchanged by that; what changes is what a
+/// client that stops reading costs — a reseed on its own lane, rather than an
+/// adapter queueing frames for it forever.
 ///
 /// # Keep BOTH halves alive — the partial move that silently kills the pump
 ///
@@ -951,7 +1262,7 @@ pub enum LaneEvent {
 /// keep the [`LaneStop`] next to it (or somewhere that outlives it), which is the
 /// reason the two are split at all.
 pub struct LaneSubscription {
-    pub rx: mpsc::UnboundedReceiver<LaneEvent>,
+    pub rx: mpsc::Receiver<LaneEvent>,
     pub stop: LaneStop,
 }
 
@@ -964,7 +1275,7 @@ impl LaneSubscription {
     /// returned [`LaneStop`] still aborts the pump when it drops, so bind it —
     /// `let (rx, _) = ….into_parts();` reintroduces the exact bug this exists to
     /// prevent.
-    pub fn into_parts(self) -> (mpsc::UnboundedReceiver<LaneEvent>, LaneStop) {
+    pub fn into_parts(self) -> (mpsc::Receiver<LaneEvent>, LaneStop) {
         (self.rx, self.stop)
     }
 }

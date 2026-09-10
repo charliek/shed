@@ -160,7 +160,7 @@
 //! stays exactly as it was — harmless for gx (a reseed ensures twice), essential
 //! for opencode.
 
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::time::Duration;
@@ -168,13 +168,13 @@ use std::time::Duration;
 use serde_json::{json, Value};
 use tauri::{AppHandle, Emitter};
 
+use shed_app::lane_view::LaneView;
 use shed_app::machine::{MachineForward, SshForward};
 use shed_core::config::MachineEntry;
 use shed_core::lane::{
-    AgentLane, LaneAnswer, LaneApproval, LaneCapabilities, LaneDecision, LaneError, LaneEvent,
-    LaneSession, SendMode,
+    AgentLane, LaneAnswer, LaneCapabilities, LaneDecision, LaneError, LaneEvent, LaneSession,
+    SendMode,
 };
-use shed_core::rc::{RcActivity, RcFeedMessage};
 use shed_core::roost::AgentLaneStamp;
 use shed_gx::{FixedDial, GxClient, GxCredentialSource, GxDiscovery, GxTimings, GxTransport};
 use shed_opencode::OpencodeClient;
@@ -188,13 +188,6 @@ use crate::machines::{Machines, ReachKind};
 /// Kebab-case like every other event this app emits (`refresh`,
 /// `show-launch`, `prefs-changed`).
 pub const LANE_EVENT: &str = "lane-event";
-
-/// How many transcript rows one lane keeps for the CURRENT generation.
-///
-/// The same 500 the adapter's own ring holds ([`shed_opencode::MessageRing`]'s
-/// `MAX_RING_MESSAGES`), so a view that has replayed a whole generation holds
-/// exactly what the adapter would hand back and no more.
-const MAX_VIEW_MESSAGES: usize = 500;
 
 /// The re-subscribe backoff, floor and ceiling.
 ///
@@ -318,154 +311,6 @@ impl LaneFailure {
 impl From<LaneError> for LaneFailure {
     fn from(e: LaneError) -> Self {
         LaneFailure::Lane(e)
-    }
-}
-
-// ---------------------------------------------------------------------------
-// the staged view
-// ---------------------------------------------------------------------------
-
-/// One generation's accumulated truth: the transcript, the approvals, the row.
-#[derive(Default)]
-struct Snapshot {
-    /// Which generation these rows belong to. It rides on the SNAPSHOT rather
-    /// than on the view so that what `lane.messages` reports is the generation
-    /// of the rows it is handing back — a client discards frames stamped older
-    /// than what it HOLDS, and a number that moved at `Reset` would tell it to
-    /// discard the very generation still on its screen.
-    generation: u64,
-    messages: VecDeque<RcFeedMessage>,
-    /// Id-keyed and LAST-WRITE-WINS, exactly as the contract requires: an
-    /// `Approval` frame may arrive `resolved` without its `pending` predecessor
-    /// ever having been seen.
-    approvals: BTreeMap<String, LaneApproval>,
-    session: Option<LaneSession>,
-}
-
-impl Snapshot {
-    fn push(&mut self, m: RcFeedMessage) {
-        self.messages.push_back(m);
-        while self.messages.len() > MAX_VIEW_MESSAGES {
-            self.messages.pop_front();
-        }
-    }
-}
-
-/// What `lane.messages` / `lane.approvals` answer from.
-#[derive(Default)]
-struct LaneView {
-    /// Generations STARTED — bumped on every [`LaneEvent::Reset`], and stamped
-    /// onto the snapshot that connect is seeding. See the module doc for why the
-    /// counter is ours and not the adapter's.
-    ///
-    /// Not what a reader is told: that is `live.generation`, which only moves
-    /// when a seed completes.
-    started: u64,
-    /// Set by [`LaneEvent::Down`], cleared by the next `Ready`.
-    stale: Option<String>,
-    /// What a reader sees.
-    live: Snapshot,
-    /// Where frames go between `Reset` and `Ready`. `None` in steady state.
-    staged: Option<Snapshot>,
-}
-
-impl LaneView {
-    /// The buffer the next frame belongs in: the staging one mid-seed, the live
-    /// one otherwise.
-    fn target(&mut self) -> &mut Snapshot {
-        match self.staged.as_mut() {
-            Some(staged) => staged,
-            None => &mut self.live,
-        }
-    }
-
-    fn apply(&mut self, event: &LaneEvent) {
-        match event {
-            LaneEvent::Reset { .. } => {
-                self.started += 1;
-                // The live view is deliberately UNTOUCHED: it keeps rendering
-                // the last complete generation — and reporting ITS generation
-                // number — until this one is whole.
-                self.staged = Some(Snapshot {
-                    generation: self.started,
-                    ..Snapshot::default()
-                });
-            }
-            LaneEvent::Message { message, .. } => self.target().push(message.clone()),
-            LaneEvent::Session { session } => self.target().session = Some(session.clone()),
-            LaneEvent::Approval { approval } => {
-                let target = self.target();
-                // Last-write-wins, then DROP what is no longer waiting on the
-                // human. A generation can run for days, and every ask that ever
-                // resolved inside it used to stay in this map with its whole
-                // payload and `request_json` — nothing reads a non-pending entry
-                // (`approvals()` filters to `is_pending`), so keeping one buys
-                // nothing and costs the transcript of every tool call the agent
-                // ever asked about.
-                //
-                // Written as insert-then-drop rather than "only insert pending"
-                // because the two differ on the case that matters: a `resolved`
-                // for an id this view holds as `pending` must REPLACE it, not be
-                // ignored. A later `pending` for the same id re-inserts it — an
-                // id the agent re-opens is a new ask, and this is the same
-                // last-write-wins rule it always was.
-                target
-                    .approvals
-                    .insert(approval.id.clone(), approval.clone());
-                if !approval.status.is_pending() {
-                    target.approvals.remove(&approval.id);
-                }
-            }
-            LaneEvent::Ready { .. } => {
-                if let Some(staged) = self.staged.take() {
-                    self.live = staged;
-                }
-                self.stale = None;
-            }
-            LaneEvent::Down { reason } => self.stale = Some(reason.clone()),
-            // A frame this build cannot name. The contract is explicit: ignore
-            // it — not an error, not a gap, not a reason to resubscribe.
-            LaneEvent::Unknown => {}
-        }
-    }
-
-    /// `lane.messages`' payload.
-    fn messages(&self) -> Value {
-        json!({
-            "messages": self.live.messages.iter().collect::<Vec<_>>(),
-            "activity": self
-                .live
-                .session
-                .as_ref()
-                .map(|s| s.activity)
-                .unwrap_or(RcActivity::Unknown),
-            "generation": self.live.generation,
-            "stale": self.stale,
-        })
-    }
-
-    /// `lane.approvals`' payload: the ones still waiting on the human.
-    ///
-    /// `is_pending()` rather than `!= Resolved` — the contract's rule. An
-    /// unrecognized status is at least as likely to be terminal (`cancelled`,
-    /// `expired`) as live, and offering answer buttons for it would post an
-    /// answer the agent stopped listening for.
-    fn approvals(&self) -> Value {
-        let mut open: Vec<&LaneApproval> = self
-            .live
-            .approvals
-            .values()
-            .filter(|a| a.status.is_pending())
-            .collect();
-        // Oldest first, id as the tiebreak so the order is total and stable
-        // across reads (a BTreeMap already orders by id; this puts the ones the
-        // agent has been waiting on longest at the top).
-        open.sort_by(|a, b| {
-            a.created_at_unix_ms
-                .cmp(&b.created_at_unix_ms)
-                .then_with(|| a.id.cmp(&b.id))
-        });
-        json!({ "approvals": open })
     }
 }
 
@@ -1022,19 +867,34 @@ impl Lanes {
         Ok(opened)
     }
 
-    /// `lane.messages` — the staged-then-swapped view.
+    /// `lane.messages` — the staged-then-swapped view, as this app's IPC
+    /// payload.
+    ///
+    /// The fold and the projection are [`shed_app::lane_view`]'s; the only thing
+    /// that belongs here is the envelope's SHAPE, which is Tauri's and not a
+    /// client-neutral API (the phone converts the same
+    /// [`shed_app::lane_view::LaneViewSnapshot`] into its own DTOs).
     pub fn messages(&self, machine: &str, session_id: &str) -> Result<Value, LaneFailure> {
         let entry = self.open_entry(machine, session_id)?;
-        let view = lock(&entry.view);
-        Ok(view.messages())
+        let snap = lock(&entry.view).snapshot(None);
+        Ok(json!({
+            "messages": snap.messages,
+            "activity": snap.activity,
+            "generation": snap.generation,
+            "stale": snap.stale,
+        }))
     }
 
     /// `lane.approvals` — what is blocking on the human, this session's and its
     /// descendants'.
+    ///
+    /// Pending only, oldest first: the snapshot already filtered and sorted
+    /// them ([`shed_app::lane_view::LaneView::snapshot`] owns that rule), so
+    /// this is the envelope and nothing else.
     pub fn approvals(&self, machine: &str, session_id: &str) -> Result<Value, LaneFailure> {
         let entry = self.open_entry(machine, session_id)?;
-        let view = lock(&entry.view);
-        Ok(view.approvals())
+        let snap = lock(&entry.view).snapshot(None);
+        Ok(json!({ "approvals": snap.approvals }))
     }
 
     /// `lane.send` — a prompt. `mode` defaults to `queue`; `interject` is
@@ -1848,7 +1708,15 @@ fn remote_port(server_url: &str) -> Result<u16, LaneFailure> {
 ///   kind, resolved by the adapter against the offered options' `kind` fields,
 ///   never by id. Kept because it is what a script can write without first
 ///   fetching the approval, and it is what every existing caller sends.
-/// * `{"question": [["<option id>", …], …]}` — one inner list per question
+/// * `{"question": [["<option id>", …], …]}` — one inner list per question,
+///   optionally beside `{"custom_text": ["<typed>", null, …]}` — the free text
+///   per question, positional like `question`, `null` where nothing was typed.
+///   `custom_text` is a MODIFIER of `question` and of nothing else: beside
+///   `choice`, `permission` or `reject` it is a `bad_request`, because a client
+///   that typed something and named the wrong form has to be told the text did
+///   not travel. The adapter refuses text aimed at a question whose `custom` is
+///   false (`shed_core::lane::normalize_question_answer`), so this door only
+///   checks the shape.
 /// * `{"reject": true}` — decline the whole request
 ///
 /// STRICT, like the contract's own [`LaneAnswer`]: an answer is a command, and a
@@ -1889,6 +1757,19 @@ pub fn parse_answer(value: &Value) -> Result<LaneAnswer, LaneFailure> {
                 several.join(" and ")
             )))
         }
+    }
+    // `custom_text` is not a FORM — it modifies exactly one of them. Checked
+    // here, against the single form just established, so that every other arm
+    // below can be written as if the key did not exist: a `custom_text` beside
+    // `choice` is refused at this door rather than ignored on the way past it,
+    // which is the difference between "your text did not travel" and a silent
+    // drop of something a human typed.
+    if value.get("custom_text").is_some() && named[0] != "question" {
+        return Err(LaneFailure::bad_request(format!(
+            "`custom_text` answers a question's free-text field; \
+             it has no meaning beside `{}`",
+            named[0]
+        )));
     }
 
     if let Some(option_id) = value.get("choice") {
@@ -1938,7 +1819,21 @@ pub fn parse_answer(value: &Value) -> Result<LaneAnswer, LaneFailure> {
                 "`question` must be a list of lists of option ids: {e}"
             ))
         })?;
-        return Ok(LaneAnswer::Question { answers });
+        // Absent is an empty vec, NOT a vec of nulls: the contract skips the
+        // field when it is empty, so an answer with no free text stays exactly
+        // the payload this build sent before the field existed.
+        let custom_text: Vec<Option<String>> = match value.get("custom_text") {
+            None => Vec::new(),
+            Some(v) => serde_json::from_value(v.clone()).map_err(|e| {
+                LaneFailure::bad_request(format!(
+                    "`custom_text` must be a list of strings or nulls, one per question: {e}"
+                ))
+            })?,
+        };
+        return Ok(LaneAnswer::Question {
+            answers,
+            custom_text,
+        });
     }
     match value.get("reject").and_then(Value::as_bool) {
         Some(true) => Ok(LaneAnswer::Reject),
@@ -1966,253 +1861,6 @@ mod tests {
     use super::*;
 
     use std::collections::HashSet;
-
-    use shed_core::lane::{LaneApprovalKind, LaneApprovalStatus};
-
-    /// A transcript row. `text` is the identity in these tests — the feed row
-    /// has no id of its own, `seq` is the transport's, and the text is what a
-    /// reader would actually see.
-    fn message(text: &str, seq: u64) -> RcFeedMessage {
-        RcFeedMessage {
-            seq,
-            role: "assistant".to_string(),
-            msg_type: "text".to_string(),
-            text: Some(text.to_string()),
-            ..RcFeedMessage::default()
-        }
-    }
-
-    fn approval(id: &str, status: LaneApprovalStatus) -> LaneApproval {
-        LaneApproval {
-            id: id.to_string(),
-            session_id: "ses_a".to_string(),
-            kind: LaneApprovalKind::Permission,
-            status,
-            title: id.to_string(),
-            detail: None,
-            options: Vec::new(),
-            questions: Vec::new(),
-            request_json: "{}".to_string(),
-            created_at_unix_ms: None,
-        }
-    }
-
-    fn rows(view: &LaneView) -> Vec<String> {
-        view.live
-            .messages
-            .iter()
-            .map(|m| m.text.clone().unwrap_or_default())
-            .collect::<Vec<_>>()
-    }
-
-    /// **The whole point of staging**: between `Reset` and `Ready` a reader sees
-    /// the PREVIOUS generation whole, never an empty or half-seeded one.
-    #[test]
-    fn a_reseed_never_shows_a_partial_view() {
-        let mut view = LaneView::default();
-        for event in [
-            LaneEvent::Reset {
-                reason: "seed".into(),
-                generation: 1,
-            },
-            LaneEvent::Message {
-                message: message("m1", 1),
-                cursor: None,
-            },
-            LaneEvent::Ready { generation: 1 },
-        ] {
-            view.apply(&event);
-        }
-        assert_eq!(rows(&view), ["m1"]);
-        assert_eq!(view.live.generation, 1);
-
-        // A reconnect starts over. Mid-seed the live view is untouched …
-        view.apply(&LaneEvent::Reset {
-            reason: "reconnect".into(),
-            generation: 1,
-        });
-        assert_eq!(rows(&view), ["m1"], "the live view was cleared mid-seed");
-        assert_eq!(
-            view.messages()["generation"],
-            json!(1),
-            "the reported generation moved before the rows it names did"
-        );
-        view.apply(&LaneEvent::Message {
-            message: message("m1", 2),
-            cursor: None,
-        });
-        assert_eq!(
-            rows(&view),
-            ["m1"],
-            "a staged row leaked into the live view"
-        );
-        view.apply(&LaneEvent::Message {
-            message: message("m2", 3),
-            cursor: None,
-        });
-        assert_eq!(rows(&view), ["m1"]);
-
-        // … and swaps in whole at Ready, with a HIGHER generation.
-        view.apply(&LaneEvent::Ready { generation: 1 });
-        assert_eq!(rows(&view), ["m1", "m2"]);
-        assert_eq!(
-            view.messages()["generation"],
-            json!(2),
-            "generation must be ours, monotonic, and move only on the swap"
-        );
-        assert_eq!(
-            view.live.messages.back().map(|m| m.seq),
-            Some(3),
-            "the re-seeded rows keep the adapter's higher seqs"
-        );
-    }
-
-    /// `Down` is stale-with-a-reason, not a wipe; the next `Ready` clears it.
-    #[test]
-    fn down_marks_stale_and_keeps_the_rows() {
-        let mut view = LaneView::default();
-        view.apply(&LaneEvent::Reset {
-            reason: "seed".into(),
-            generation: 1,
-        });
-        view.apply(&LaneEvent::Message {
-            message: message("m1", 1),
-            cursor: None,
-        });
-        view.apply(&LaneEvent::Ready { generation: 1 });
-
-        view.apply(&LaneEvent::Down {
-            reason: "unknown_session".into(),
-        });
-        assert_eq!(rows(&view), ["m1"], "Down cleared the transcript");
-        let payload = view.messages();
-        assert_eq!(payload["stale"], json!("unknown_session"));
-        assert_eq!(payload["generation"], json!(1));
-        assert_eq!(payload["activity"], json!("unknown"));
-
-        view.apply(&LaneEvent::Reset {
-            reason: "reconnect".into(),
-            generation: 1,
-        });
-        view.apply(&LaneEvent::Ready { generation: 1 });
-        assert_eq!(view.messages()["stale"], Value::Null);
-    }
-
-    /// An `Unknown` frame is IGNORED — not a gap, not a reason to resubscribe,
-    /// and above all not something that disturbs a staging swap in progress.
-    #[test]
-    fn an_unknown_frame_changes_nothing() {
-        let mut view = LaneView::default();
-        view.apply(&LaneEvent::Reset {
-            reason: "seed".into(),
-            generation: 1,
-        });
-        view.apply(&LaneEvent::Unknown);
-        view.apply(&LaneEvent::Message {
-            message: message("m1", 1),
-            cursor: None,
-        });
-        view.apply(&LaneEvent::Unknown);
-        view.apply(&LaneEvent::Ready { generation: 1 });
-        assert_eq!(rows(&view), ["m1"]);
-        assert_eq!(view.live.generation, 1);
-    }
-
-    /// The ring is bounded, oldest-first, at the adapter's own 500.
-    #[test]
-    fn the_view_keeps_the_last_500_rows() {
-        let mut view = LaneView::default();
-        for i in 0..(MAX_VIEW_MESSAGES + 25) {
-            view.apply(&LaneEvent::Message {
-                message: message(&format!("m{i}"), i as u64 + 1),
-                cursor: None,
-            });
-        }
-        assert_eq!(view.live.messages.len(), MAX_VIEW_MESSAGES);
-        assert_eq!(
-            view.live.messages.front().and_then(|m| m.text.clone()),
-            Some("m25".into())
-        );
-    }
-
-    /// Approvals are id-keyed and last-write-wins, and only PENDING ones are
-    /// offered — an unknown status is not an affordance.
-    #[test]
-    fn approvals_are_last_write_wins_and_only_pending_surface() {
-        let mut view = LaneView::default();
-        for a in [
-            approval("per_1", LaneApprovalStatus::Pending),
-            approval("per_2", LaneApprovalStatus::Pending),
-            approval("per_3", LaneApprovalStatus::Other("cancelled".into())),
-            // The resolution of per_1, arriving without its own `pending`
-            // predecessor having been re-sent.
-            approval("per_1", LaneApprovalStatus::Resolved),
-        ] {
-            view.apply(&LaneEvent::Approval { approval: a });
-        }
-        let open = view.approvals();
-        let ids: Vec<&str> = open["approvals"]
-            .as_array()
-            .expect("approvals is a list")
-            .iter()
-            .map(|a| a["id"].as_str().unwrap_or_default())
-            .collect();
-        assert_eq!(ids, ["per_2"]);
-    }
-
-    /// **Review finding: resolved approvals accumulated without bound.** A
-    /// generation ends only at a `Reset`, and a healthy
-    /// lane can run for days without one — so every approval that RESOLVED
-    /// inside it used to stay in the snapshot forever, whole payload and
-    /// `request_json` included, invisible to every reader.
-    #[test]
-    fn a_resolved_approval_is_dropped_and_a_reopened_one_comes_back() {
-        let mut view = LaneView::default();
-        let resolutions = [
-            LaneApprovalStatus::Resolved,
-            LaneApprovalStatus::Submitted,
-            LaneApprovalStatus::Other("cancelled".into()),
-        ];
-        for i in 0..300 {
-            let id = format!("per_{i}");
-            view.apply(&LaneEvent::Approval {
-                approval: approval(&id, LaneApprovalStatus::Pending),
-            });
-            assert_eq!(
-                view.live.approvals.len(),
-                1,
-                "an ask the agent is waiting on must be held"
-            );
-            view.apply(&LaneEvent::Approval {
-                approval: approval(&id, resolutions[i % resolutions.len()].clone()),
-            });
-            assert_eq!(
-                view.live.approvals.len(),
-                0,
-                "{id} was still held after it stopped waiting on anyone"
-            );
-        }
-
-        // A resolution for an id this view never saw pending is not a way to
-        // plant one either.
-        view.apply(&LaneEvent::Approval {
-            approval: approval("never_asked", LaneApprovalStatus::Resolved),
-        });
-        assert!(view.live.approvals.is_empty());
-
-        // Dropping is not forgetting: the agent re-opening an id it already
-        // resolved is a NEW ask, and it has to render.
-        view.apply(&LaneEvent::Approval {
-            approval: approval("per_7", LaneApprovalStatus::Pending),
-        });
-        let ids: Vec<String> = view.approvals()["approvals"]
-            .as_array()
-            .expect("approvals is a list")
-            .iter()
-            .map(|a| a["id"].as_str().unwrap_or_default().to_string())
-            .collect();
-        assert_eq!(ids, ["per_7"]);
-    }
 
     /// Every [`LaneError`] variant has a distinct snake_case code, and `no_lane`
     /// is ours.
@@ -2292,7 +1940,11 @@ mod tests {
         assert_eq!(
             parse_answer(&json!({"question": [["yes"], ["a", "b"]]})).expect("question"),
             LaneAnswer::Question {
-                answers: vec![vec!["yes".into()], vec!["a".into(), "b".into()]]
+                answers: vec![vec!["yes".into()], vec!["a".into(), "b".into()]],
+                // Absent `custom_text` is EMPTY, not a vec of nulls — the
+                // contract skips the field when it is empty, so this build's
+                // ordinary answer is byte-identical to the previous build's.
+                custom_text: vec![],
             }
         );
         assert_eq!(
@@ -2304,6 +1956,80 @@ mod tests {
         assert!(parse_answer(&json!({"question": "yes"})).is_err());
         assert!(parse_answer(&json!({"reject": false})).is_err());
         assert!(parse_answer(&json!({})).is_err());
+    }
+
+    /// **`custom_text` is a modifier of `question` and of nothing else**
+    /// (plan 018 §3.2).
+    ///
+    /// It is not a fifth FORM — it does not resolve an approval on its own —
+    /// so the form count is unchanged and this door only decides where the key
+    /// is allowed to appear. Beside `choice`, `permission` or `reject` it is
+    /// refused: a client that typed something and named the wrong form has to
+    /// be told the text did not travel, and the alternative (ignoring the key)
+    /// is a silent drop of the one part of the answer a human wrote by hand.
+    #[test]
+    fn custom_text_rides_beside_question_and_nowhere_else() {
+        assert_eq!(
+            parse_answer(&json!({
+                "question": [["yes"], []],
+                "custom_text": [null, "  a branch I typed  "],
+            }))
+            .expect("free text beside a question"),
+            LaneAnswer::Question {
+                answers: vec![vec!["yes".into()], vec![]],
+                // NOT trimmed here: `normalize_question_answer` is the one
+                // place that trims, so both adapters trim identically.
+                custom_text: vec![None, Some("  a branch I typed  ".into())],
+            }
+        );
+        // All-null is still a legal vector — the panel sends one entry per
+        // question and the adapter reads them all as "nothing typed".
+        assert_eq!(
+            parse_answer(&json!({"question": [["yes"]], "custom_text": [null]}))
+                .expect("all-null free text"),
+            LaneAnswer::Question {
+                answers: vec![vec!["yes".into()]],
+                custom_text: vec![None],
+            }
+        );
+
+        // Beside every other form: refused, and the refusal NAMES the form it
+        // was found beside.
+        for (payload, form) in [
+            (json!({"choice": "p-2", "custom_text": ["typed"]}), "choice"),
+            (
+                json!({"permission": "allow-once", "custom_text": ["typed"]}),
+                "permission",
+            ),
+            (json!({"reject": true, "custom_text": ["typed"]}), "reject"),
+            // …including when it carries nothing: the KEY is the mistake, not
+            // its contents, and a client that sends `[]` beside `choice` still
+            // believes free text is a thing this form takes.
+            (json!({"choice": "p-2", "custom_text": []}), "choice"),
+            (json!({"choice": "p-2", "custom_text": [null]}), "choice"),
+        ] {
+            let err = parse_answer(&payload).expect_err("custom_text needs a question");
+            assert_eq!(err.code(), "bad_request", "{payload}");
+            assert!(
+                err.message().contains(form) && err.message().contains("custom_text"),
+                "the refusal names the form it was found beside: {}",
+                err.message()
+            );
+        }
+
+        // Shape, not just placement: `custom_text` is a list of strings-or-null.
+        assert!(parse_answer(&json!({"question": [["yes"]], "custom_text": "typed"})).is_err());
+        assert!(parse_answer(&json!({"question": [["yes"]], "custom_text": [3]})).is_err());
+        assert!(parse_answer(&json!({"question": [["yes"]], "custom_text": {"0": "t"}})).is_err());
+
+        // And it never becomes a form of its own: alone it is still "name a
+        // form", because free text answers nothing by itself.
+        assert_eq!(
+            parse_answer(&json!({"custom_text": ["typed"]}))
+                .expect_err("free text is not an answer")
+                .code(),
+            "bad_request"
+        );
     }
 
     /// **Review finding: an answer naming two forms was guessed at, not
