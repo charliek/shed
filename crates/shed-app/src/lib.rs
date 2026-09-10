@@ -18,6 +18,12 @@ pub mod broker_bridge;
 pub mod coordinator;
 pub mod fakes;
 pub mod host_agent;
+/// The staged agent-lane view (plan 018 §3.5) — the client-side fold of a
+/// [`shed_core::lane`] subscription into a renderable, TYPED snapshot.
+/// Ungated for the same reason [`machine`] and [`roost`] are: shed-mobile links
+/// this crate with default features and folds the same subscription the desktop
+/// does, so the fold has to be one implementation rather than two.
+pub mod lane_view;
 /// The machine transport seam + the reconnecting hub watcher (plan 012).
 /// Deliberately NOT behind the `rc` feature: shed-mobile links this crate with
 /// default features and the machine feed is exactly what it needs.
@@ -60,6 +66,7 @@ pub use host_agent::{
     AgentCapabilityState, CapabilitySnapshot, HelloClientInfo, HostAgentClient,
     HostAgentClientError, HostAgentEvent,
 };
+pub use lane_view::{LaneView, LaneViewSnapshot, MAX_VIEW_MESSAGES};
 pub use machine::{
     FixedPort, ForwardError, MachineForward, MachineHubUpdate, MachineHubWatcher, SshForward,
 };
