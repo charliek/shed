@@ -1251,7 +1251,21 @@ export type LaneView = {
   stale: string | null;
 };
 
-export type LaneOption = { id: string; label: string; description?: string | null };
+/** One button an approval offers, exactly as the agent offered it.
+ *
+ *  `id` is OPAQUE — whatever the agent called it — and is what `{choice}` hands
+ *  back. `kind` is the separate, semantic half (the ACP vocabulary:
+ *  `allow_once` | `allow_always` | `reject_once` | `reject_always`), absent when
+ *  the agent states none. The two are independent, which is the whole reason
+ *  both exist: gx's own permission offers `optionId: "enable-always-approve"`
+ *  with `kind: "allow_once"`, so a client that styled buttons by sniffing the id
+ *  would paint that one wrong. Style by `kind`, post by `id`. */
+export type LaneOption = {
+  id: string;
+  label: string;
+  description?: string | null;
+  kind?: string | null;
+};
 
 /** One structured question inside a `question` approval: its own options, plus
  *  `multiple` (several ids in one answer) and `custom` (free text alongside). */
@@ -1266,11 +1280,17 @@ export type LaneQuestion = {
 /** One thing waiting on the human.
  *
  *  **`kind` selects which field renders, and the two are never both populated**
- *  (pinned in `shed_core::lane::LaneApproval`'s doc): a `permission` fills
- *  `options` with the three fixed choices and leaves `questions` empty; a
- *  `question` fills `questions` and leaves `options` empty. Branch on `kind`,
- *  never on which list happens to be non-empty — rendering the wrong one yields
- *  an approval card with no buttons. */
+ *  (pinned in `shed_core::lane::LaneApproval`'s doc): a `permission` and a
+ *  `plan_approval` fill `options` and leave `questions` empty; a `question`
+ *  fills `questions` and leaves `options` empty. Branch on `kind`, never on
+ *  which list happens to be non-empty — rendering the wrong one yields an
+ *  approval card with no buttons.
+ *
+ *  `options` is the AGENT's own menu, in its own order, and its length is not
+ *  fixed: opencode offers three, gx offers whatever the request carried (five,
+ *  live, two of them `allow_once`). A kind this build cannot name — including
+ *  gx's `pending_interaction` placeholder, whose `method` and `request` are both
+ *  null and which therefore offers nothing — renders `request_json` instead. */
 export type LaneApproval = {
   id: string;
   /** May be a DESCENDANT of the subscribed session — a child's approval still
@@ -1441,10 +1461,17 @@ export type LaneRow = {
 };
 
 /** One approval card as rendered: `buttons` are the decision buttons' LABELS in
- *  render order (a permission's three), and `questions` the structured form a
- *  question renders instead — `options` being the option buttons' labels and
- *  `custom` whether a free-text field sits beside them. Which of the two is
- *  populated follows `kind`, exactly as the render does. */
+ *  render order (the agent's own options, however many it offered), `options`
+ *  the same buttons with the id each one POSTS and the kind each is styled from,
+ *  and `questions` the structured form a question renders instead — its
+ *  `options` being the option buttons' labels and `custom` whether a free-text
+ *  field sits beside them. Which is populated follows `kind`, exactly as the
+ *  render does.
+ *
+ *  `options` beside `buttons` is not redundant. A label is what a person reads;
+ *  an id is what the click sends, and gx proves they can disagree (two options
+ *  of kind `allow_once`, distinguishable only by id). A dump that reported only
+ *  labels could not tell a right button from a wrong one. */
 export type LaneApprovalCard = {
   id: string;
   session_id: string;
@@ -1452,6 +1479,7 @@ export type LaneApprovalCard = {
   title: string;
   detail: string;
   buttons: string[];
+  options: { id: string; label: string; kind: string | null }[];
   questions: { header: string; question: string; options: string[]; custom: boolean }[];
 };
 
@@ -1463,6 +1491,9 @@ export type LaneApprovalCard = {
 export type LaneReport = {
   machine: string;
   session_id: string;
+  /** Which adapter is behind this panel (`opened.capabilities.kind`), and what
+   *  the header badge says. `""` until `lane.open` answers. */
+  kind: string;
   title: string;
   cwd: string;
   activity: string;
@@ -1473,6 +1504,15 @@ export type LaneReport = {
   approvals: LaneApprovalCard[];
   /** The Cancel button is enabled — i.e. the session is Working. */
   can_cancel: boolean;
+  /** The Interject toggle, or `null` when the adapter does not advertise the
+   *  capability and no toggle is rendered at all.
+   *
+   *  Three states rather than a bool because "absent" and "present but
+   *  disabled" are different claims and both are pinned: opencode advertises no
+   *  `interject`, so its panel has no toggle; gx advertises it, so its panel
+   *  has one — enabled only while the session is Working, because that is the
+   *  only time the agent accepts one. */
+  interject: { on: boolean; enabled: boolean } | null;
   error: string | null;
 };
 

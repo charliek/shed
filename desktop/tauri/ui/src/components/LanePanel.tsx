@@ -1,10 +1,20 @@
-/* shed desktop — the agent-lane transcript panel (plan 015 §3.4, C6).
+/* shed desktop — the agent-lane transcript panel (plan 015 §3.4 C6, plan 017 §3.5).
 
-   A machine row whose roost tab reported an opencode server carries an
-   `agent_lane` stamp, and that stamp is the whole capability signal: the card
-   gets a "Transcript" affordance, and this is what it opens. A right-hand panel
-   over whatever pane is showing — the transcript, what the session is blocked
-   on, and the two things you can do about it (send, cancel).
+   A machine row whose roost tab reported an agent server carries an `agent_lane`
+   stamp, and that stamp is the whole capability signal: the card gets a
+   "Transcript" affordance, and this is what it opens. A right-hand panel over
+   whatever pane is showing — the transcript, what the session is blocked on, and
+   what you can do about it (send, interject, cancel, answer).
+
+   **It renders one panel for every adapter, and takes the differences from
+   `capabilities` rather than from a branch on the kind.** Plan 015 shipped this
+   with `capabilities` stored and never read, which was invisible while opencode
+   was the only adapter: what it can do and what the panel offered happened to
+   agree. gx does not agree — it interjects, and its permissions offer whatever
+   the agent asked, not a fixed three — so the panel now reads the flags (the
+   Interject toggle) and the approval's own `options` (the buttons). The kind
+   itself appears exactly once, as a badge in the header, so a person can see
+   which agent they are talking to.
 
    Three things about it are load-bearing rather than stylistic:
 
@@ -22,15 +32,16 @@
 
    `lane.open` on mount, `lane.close` on unmount, and no polling anywhere. */
 import { useCallback, useEffect, useRef, useState } from "react";
-import { ChevronDown, ChevronRight, ScrollText, Send, Square, X } from "lucide-react";
+import { ChevronDown, ChevronRight, ScrollText, Send, Square, X, Zap } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { newestWins } from "@/lib/newest";
-import { cardCls, StatusChip, type Tone } from "@/components/primitives";
+import { cardCls, KindBadge, StatusChip, type Tone } from "@/components/primitives";
 import {
   LANE_EVENT, laneAnswer, laneApprovals, laneCancel, laneClose, laneFailure,
   laneMessages, laneOpen, laneSend, reportLane,
   type LaneAnswer, type LaneApproval, type LaneApprovalCard, type LaneEventEnvelope,
-  type LaneMessage, type LaneOpened, type LaneReport, type LaneRow, type LaneView,
+  type LaneMessage, type LaneOpened, type LaneOption, type LaneReport, type LaneRow,
+  type LaneView,
 } from "@/lib/bridge";
 
 /** The batching fallback, in ms.
@@ -65,24 +76,37 @@ function activityBadge(activity: string): { tone: Tone; label: string } {
   }
 }
 
-/** The three fixed decisions a permission accepts, in render order.
+/** The approval kinds whose buttons are the agent's OWN offered options —
+ *  rendered generically, in the order offered, answering `{choice: "<id>"}`.
  *
- *  The decision spellings are the IPC answer grammar's (`lane::parse_answer`,
- *  kebab) and are deliberately NOT the option ids the adapter mints
- *  (`allow_once`, snake) — so the decision is always ours, and only the LABEL is
- *  taken from the adapter's matching option when it sent one. An adapter that
- *  renames its buttons changes the words; it cannot change what gets posted. */
-const PERMISSION_CHOICES: { decision: "allow-once" | "allow-always" | "reject"; label: string }[] = [
-  { decision: "allow-once", label: "Allow once" },
-  { decision: "allow-always", label: "Always" },
-  { decision: "reject", label: "Reject" },
-];
+ *  This used to be three fixed decisions with the adapter's labels borrowed over
+ *  them, which worked only because opencode happens to offer exactly three. gx
+ *  does not: a real permission there offers FIVE options, **two of them of kind
+ *  `allow_once`** ("Yes, proceed" and "Yes, and don't ask again for anything"),
+ *  so `{permission: "allow-once"}` is genuinely ambiguous and the adapter
+ *  refuses it. The only thing that can name which button a person pressed is the
+ *  button's own id.
+ *
+ *  Nothing visible changes for opencode: its three options carry these exact
+ *  labels in this exact order, so the same three buttons render — they now post
+ *  `{choice: "allow_once"}` instead of `{permission: "allow-once"}`, which the
+ *  adapter resolves to the same option. The `{permission: …}` IPC form is
+ *  untouched and still works for scripts.
+ *
+ *  `plan_approval` is here too: its two options are synthesized by the adapter
+ *  (`approved`/`cancelled`) but are offered the same way and answer the same
+ *  way, so there is no second renderer for it. */
+const OPTION_KINDS = new Set(["permission", "plan_approval"]);
 
-function permissionChoices(a: LaneApproval) {
-  return PERMISSION_CHOICES.map((c) => ({
-    decision: c.decision,
-    label: a.options.find((o) => o.id.replace(/_/g, "-") === c.decision)?.label ?? c.label,
-  }));
+/** Is this option a refusal? Off `kind` — the ACP vocabulary — and never off
+ *  `id`, which is opaque. opencode calls its refusal `reject`; a live gx offers
+ *  two, `reject-once` and `reject-always-command`; a third agent will call its
+ *  own something else again. Matching any one of those spellings mis-styles the
+ *  others, and mis-styling here means a destructive button that does not look
+ *  like one. `reject_once` and `reject_always` both start `reject`, which is the
+ *  same prefix rule the contract's own `Reject` mapping uses. */
+function isReject(o: LaneOption): boolean {
+  return (o.kind ?? "").startsWith("reject");
 }
 
 /** Can this question form be answered by ONE click?
@@ -133,6 +157,14 @@ export function LanePanel({ machine, sessionId, onClose }: {
   const [actionError, setActionError] = useState<string | null>(null);
   const [prompt, setPrompt] = useState("");
   const [busy, setBusy] = useState(false);
+  /** Does the next Send interrupt the turn in flight, or queue behind it?
+   *
+   *  Sticky across sends on purpose — a reader steering a long turn interjects
+   *  repeatedly — but only ever ARMED, never acted on by itself: the mode is
+   *  recomputed at send time against what the session is doing right now, so a
+   *  toggle left on while the agent goes idle sends a queue rather than a
+   *  refusal. */
+  const [interject, setInterject] = useState(false);
   /** Which reasoning rows the reader opened, by seq. Reasoning is collapsed by
    *  default — it is the agent thinking out loud, and it buries the answer. */
   const [shown, setShown] = useState<Record<number, boolean>>({});
@@ -234,6 +266,15 @@ export function LanePanel({ machine, sessionId, onClose }: {
 
   const act = activityBadge(view?.activity ?? "unknown");
   const working = (view?.activity ?? "") === "working";
+  /** The capability half of the Interject affordance: is there a toggle at all?
+   *
+   *  `lane.open`'s `capabilities` were stored and never read until now — the
+   *  panel offered whatever it felt like and let the adapter refuse. That is the
+   *  wrong way round for an affordance: an adapter that cannot interject (every
+   *  opencode lane) should not show a button whose only outcome is an error. */
+  const canInterject = opened?.capabilities?.interject === true;
+  /** …and the state half: armed only while the agent would accept one. */
+  const interjecting = canInterject && working && interject;
   // What the reader just tried outranks what the lane is doing: a refusal is
   // about them, a read failure is about the machine.
   const error = actionError ?? readError;
@@ -260,7 +301,10 @@ export function LanePanel({ machine, sessionId, onClose }: {
     const text = prompt.trim();
     if (!text) return;
     await act1(async () => {
-      await laneSend(machine, sessionId, text);
+      // `undefined` rather than `"queue"` for the ordinary case: queue is the
+      // op's own default, and a client that always spelled the mode out would
+      // make every adapter's default this component's business.
+      await laneSend(machine, sessionId, text, interjecting ? "interject" : undefined);
       setPrompt("");
     });
   };
@@ -308,32 +352,43 @@ export function LanePanel({ machine, sessionId, onClose }: {
     muted: m.type === "status",
     collapsed: m.type === "reasoning" && !shown[m.seq],
   }));
-  const cards: LaneApprovalCard[] = approvals.map((a) => ({
-    id: a.id,
-    session_id: a.session_id,
-    kind: a.kind,
-    title: a.title,
-    detail: a.detail ?? "",
-    // `kind` selects — never which list happens to be non-empty (§11.4).
-    buttons:
-      a.kind === "permission"
-        ? permissionChoices(a).map((c) => c.label)
-        : a.kind === "question" && !oneClick(a)
-          ? ["Send answer"]
-          : [],
-    questions:
-      a.kind === "question"
-        ? a.questions.map((q) => ({
-            header: q.header,
-            question: q.question,
-            options: q.options.map((o) => o.label),
-            custom: q.custom,
-          }))
+  const cards: LaneApprovalCard[] = approvals.map((a) => {
+    // `kind` selects — never which list happens to be non-empty (§11.4). The
+    // one addition gx forces: a kind that DOES take options can still arrive
+    // with none (the `pending_interaction` placeholder, whose `method` and
+    // `request` are both null), and rendering that as "a permission with no
+    // buttons" is the exact thing a human cannot act on. It falls through to
+    // the raw-request card, which at least offers Reject.
+    const generic = OPTION_KINDS.has(a.kind) && a.options.length > 0;
+    return {
+      id: a.id,
+      session_id: a.session_id,
+      kind: a.kind,
+      title: a.title,
+      detail: a.detail ?? "",
+      buttons: generic
+        ? a.options.map((o) => o.label)
+        : a.kind === "question"
+          ? (oneClick(a) ? [] : ["Send answer"])
+          : ["Reject"],
+      options: generic
+        ? a.options.map((o) => ({ id: o.id, label: o.label, kind: o.kind ?? null }))
         : [],
-  }));
+      questions:
+        a.kind === "question"
+          ? a.questions.map((q) => ({
+              header: q.header,
+              question: q.question,
+              options: q.options.map((o) => o.label),
+              custom: q.custom,
+            }))
+          : [],
+    };
+  });
   const report: LaneReport = {
     machine,
     session_id: sessionId,
+    kind: opened?.capabilities?.kind ?? "",
     title: opened?.session.title ?? "",
     cwd: opened?.session.cwd ?? "",
     activity: view?.activity ?? "unknown",
@@ -342,6 +397,7 @@ export function LanePanel({ machine, sessionId, onClose }: {
     rows,
     approvals: cards,
     can_cancel: working,
+    interject: canInterject ? { on: interjecting, enabled: working } : null,
     error,
   };
   // Compared BY VALUE, not by reference: the report is rebuilt every render, so
@@ -378,6 +434,12 @@ export function LanePanel({ machine, sessionId, onClose }: {
             {machine} · {sessionId}
           </div>
         </div>
+        {/* WHICH agent this transcript belongs to. Two adapters in one app made
+            it worth saying out loud: the panels differ in what they offer
+            (interject, the shape of a permission's buttons), and the kind is the
+            reason. Empty until `lane.open` answers, and no placeholder for it —
+            a badge that said "…" would be noise on every mount. */}
+        {opened?.capabilities?.kind && <KindBadge kind={opened.capabilities.kind} />}
         <StatusChip tone={act.tone} label={act.label} />
         <button
           onClick={onClose}
@@ -463,8 +525,17 @@ export function LanePanel({ machine, sessionId, onClose }: {
 
       {approvals.length > 0 && (
         <div className="flex max-h-[45%] flex-none flex-col gap-2.5 overflow-y-auto border-t border-shed-border bg-shed-bg-sidebar px-4 py-3">
-          {approvals.map((a) => {
-            const card = cards.find((c) => c.id === a.id);
+          {approvals.map((a, i) => {
+            // BY INDEX. `cards` is `approvals.map(…)`, so `cards[i]` is this
+            // approval's card by construction, while a `find` on the id would
+            // take the first match — and the list can hold a descendant
+            // sub-session's approval beside the root's (see the `sub-session`
+            // line below), so ids are not this component's to assume unique.
+            // The clicked option is posted off `a` either way, so the id lookup
+            // was never a wrong-answer hazard; it could only have read one
+            // card's BRANCH off another's, which is still a rendering nobody
+            // could explain.
+            const card = cards[i];
             const chosen = pickedFor(a);
             const free = typedFor(a);
             return (
@@ -484,23 +555,34 @@ export function LanePanel({ machine, sessionId, onClose }: {
                     sub-session {a.session_id}
                   </div>
                 )}
-                {a.kind === "permission" ? (
+                {card && card.options.length > 0 ? (
+                  // The agent's own menu, in the agent's own order, posting the
+                  // agent's own ids. Keyed by id (they are unique within a
+                  // request) rather than by index, so a card refreshed in place
+                  // — which is exactly what gx's placeholder-then-request pair
+                  // does — re-uses the buttons that did not change.
+                  //
+                  // Gated on the CARD's options and rendered from the
+                  // APPROVAL's: the same list, but the card's went through the
+                  // kind rule above (so the branch cannot disagree with what
+                  // `lane.dump` reports) while the approval's still carry the
+                  // `description` this button hangs its tooltip on.
                   <div className="mt-2.5 flex flex-wrap gap-2">
-                    {permissionChoices(a).map((c) => (
+                    {a.options.map((o) => (
                       <button
-                        key={c.decision}
+                        key={o.id}
                         disabled={busy}
-                        onClick={() => void answer(a.id, { permission: c.decision })}
+                        title={o.description ?? undefined}
+                        onClick={() => void answer(a.id, { choice: o.id })}
                         className="hbtn rounded-[9px] px-3 py-2 text-[13px] font-semibold"
                         style={{
-                          background:
-                            c.decision === "reject" ? "var(--shed-deny-bg)" : "var(--shed-accent-subtle)",
-                          color: c.decision === "reject" ? "var(--shed-danger)" : "var(--shed-accent)",
+                          background: isReject(o) ? "var(--shed-deny-bg)" : "var(--shed-accent-subtle)",
+                          color: isReject(o) ? "var(--shed-danger)" : "var(--shed-accent)",
                           border: "none",
                           opacity: busy ? 0.5 : 1,
                         }}
                       >
-                        {c.label}
+                        {o.label}
                       </button>
                     ))}
                   </div>
@@ -571,11 +653,33 @@ export function LanePanel({ machine, sessionId, onClose }: {
                     ) : null}
                   </div>
                 ) : (
-                  // An approval kind this build cannot name: show the agent's own
-                  // request rather than inventing buttons for it.
-                  <pre className="mt-2 max-h-32 overflow-auto rounded-[9px] bg-shed-inset p-2 font-mono text-[11px] text-shed-text-secondary">
-                    {a.request_json}
-                  </pre>
+                  // An approval this build cannot render buttons FOR — an
+                  // `mcp_elicitation` whose schema it cannot read, a kind it has
+                  // never heard of, or gx's placeholder before the real request
+                  // lands. Show the agent's own request rather than inventing
+                  // buttons for it, and offer the one answer that is always
+                  // meaningful: declining. Without it these cards were a dead
+                  // end — the agent stays blocked and the panel offers nothing.
+                  <>
+                    <pre className="mt-2 max-h-32 overflow-auto rounded-[9px] bg-shed-inset p-2 font-mono text-[11px] text-shed-text-secondary">
+                      {a.request_json}
+                    </pre>
+                    <div className="mt-2 flex flex-wrap gap-2">
+                      <button
+                        disabled={busy}
+                        onClick={() => void answer(a.id, { reject: true })}
+                        className="hbtn rounded-[9px] px-3 py-2 text-[13px] font-semibold"
+                        style={{
+                          background: "var(--shed-deny-bg)",
+                          color: "var(--shed-danger)",
+                          border: "none",
+                          opacity: busy ? 0.5 : 1,
+                        }}
+                      >
+                        Reject
+                      </button>
+                    </div>
+                  </>
                 )}
               </div>
             );
@@ -598,10 +702,39 @@ export function LanePanel({ machine, sessionId, onClose }: {
           className="min-w-0 flex-1 resize-none rounded-[9px] border border-shed-border bg-shed-inset px-3 py-2 text-[13px] text-shed-text outline-none focus:border-shed-accent"
         />
         <div className="flex flex-none flex-col gap-2">
+          {/* Present only when the adapter says it can interject, enabled only
+              while the agent would accept one. Both halves are the capability
+              read the panel used to skip: opencode advertises no `interject`,
+              so its composer has no toggle at all, and gx refuses one outside a
+              working turn — so an always-on button would be an affordance whose
+              only outcome is `not_accepting` in the banner above. */}
+          {canInterject && (
+            <button
+              onClick={() => setInterject(!interject)}
+              disabled={busy || !working}
+              title={
+                working
+                  ? interjecting
+                    ? "Interject: the next prompt interrupts the turn in flight"
+                    : "Queue: the next prompt waits for the turn in flight"
+                  : "Interject — only while the agent is working"
+              }
+              aria-pressed={interjecting}
+              className="hbtn inline-flex h-9 w-9 items-center justify-center rounded-[9px]"
+              style={{
+                background: interjecting ? "var(--shed-accent)" : "var(--shed-surface)",
+                color: interjecting ? "var(--shed-accent-fg)" : "var(--shed-text-secondary)",
+                border: "1px solid var(--shed-border)",
+                opacity: busy || !working ? 0.5 : 1,
+              }}
+            >
+              <Zap size={15} />
+            </button>
+          )}
           <button
             onClick={() => void send()}
             disabled={busy || !prompt.trim()}
-            title="Send"
+            title={interjecting ? "Send (interject)" : "Send"}
             className="hbtn inline-flex h-9 w-9 items-center justify-center rounded-[9px]"
             style={{
               background: "var(--shed-accent)",
