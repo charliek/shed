@@ -1366,6 +1366,29 @@ fn extreme_timestamps_neither_panic_nor_format_an_absurd_year() {
     assert_eq!(ts_of(0), rfc3339_z(0), "zero is the epoch, not absent");
     // Negative-but-ordinary (pre-epoch) still works rather than clamping.
     assert_eq!(ts_of(-1), rfc3339_z(-1));
+
+    // `_meta.agentTimestampMs` is the OTHER agent-supplied path into `ts()`, and
+    // it wins when present — so it needs the same clamp. It did not have one
+    // (coderabbit, PR #344): the `timestamp` arm clamped and this one did not,
+    // so an out-of-range value here formatted the absurd year the clamp exists
+    // to prevent, on the branch that takes priority.
+    fn ts_of_meta(ms: i64) -> String {
+        envelope(json!({
+            "eventId": eid(1),
+            "method": "session/update",
+            "params": {
+                "sessionId": SID,
+                "update": { "sessionUpdate": "agent_message_chunk" },
+                "_meta": { "agentTimestampMs": ms },
+            },
+        }))
+        .ts()
+        .expect("a timestamp")
+    }
+    assert_eq!(ts_of_meta(i64::MIN), "0001-01-01T00:00:00Z");
+    assert_eq!(ts_of_meta(i64::MAX), "9999-12-31T23:59:59Z");
+    // An ordinary millisecond stamp is untouched by the clamp.
+    assert_eq!(ts_of_meta(1_788_931_000_123), rfc3339_z(1_788_931_000));
 }
 
 /// The fold's maps are bounded, and the bound never drops something live.

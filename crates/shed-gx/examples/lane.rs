@@ -351,8 +351,15 @@ fn default_grok_home() -> String {
 fn caller_uid() -> Result<u32, String> {
     use std::os::unix::fs::MetadataExt as _;
     let probe = std::env::temp_dir().join(format!("shed-gx-lane-uid-{}", std::process::id()));
-    let uid = std::fs::write(&probe, b"")
-        .and_then(|()| std::fs::metadata(&probe))
+    // `create_new`, not `write`: the probe must be a file THIS process made, so
+    // a pre-existing path — a symlink someone else planted in a shared temp dir
+    // — cannot be followed and have its owner read back as ours (coderabbit,
+    // PR #344).
+    let uid = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&probe)
+        .and_then(|_| std::fs::metadata(&probe))
         .map(|m| m.uid())
         .map_err(|e| {
             format!(

@@ -216,7 +216,11 @@ impl GxEnvelope {
             .get("agentTimestampMs")
             .and_then(Value::as_i64)
         {
-            return Some(rfc3339_z(ms.div_euclid(1_000)));
+            // Clamped like the `timestamp` path below: both values are
+            // agent-supplied, so an out-of-range `agentTimestampMs` would
+            // otherwise format the absurd year `clamp_epoch_secs` exists to
+            // prevent (coderabbit, PR #344).
+            return Some(rfc3339_z(clamp_epoch_secs(ms.div_euclid(1_000))));
         }
         let t = self.timestamp?;
         // `unsigned_abs`, not `abs`: `i64::MIN.abs()` PANICS in a checked build,
