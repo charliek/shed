@@ -25,7 +25,10 @@ What this port adds, because the lane speaks routes the RC hub never did:
 * the REST routes the adapter's seed reads: `/session/{id}`,
   `/session/{id}/message`, `/session/{id}/children`, `/session/status`,
   `/permission`, `/question` — the last three `?directory=`-scoped, as opencode
-  serves them.
+  serves them. The last two list exactly what is **open**: a streamed
+  `permission.asked` / `question.asked` joins the list and its resolution leaves
+  it, because that is the invariant the adapter's reseed-and-retire and its
+  answer lookup both rest on (`_track_open_requests`).
 * stream injectors with names that say what they mean (`stream_part`,
   `stream_permission_asked`/`_replied`, `stream_question_asked`, `stream_idle`),
   `close_streams()` (what makes a watcher reconnect), a live `stream_count()`,
@@ -316,10 +319,56 @@ class FakeOpencode:
 
     def stream(self, payload: dict) -> None:
         """Broadcast one `/event` payload to every current AND future
-        connection — the replay is what makes a reconnect's reseed observable."""
+        connection — the replay is what makes a reconnect's reseed observable.
+
+        It also keeps the REST lists in step: an `*.asked` frame LISTS the
+        request in `GET /permission` / `GET /question`, and a `*.replied` /
+        `*.rejected` frame unlists it. See `_track_open_requests`.
+        """
         session_id = ((payload.get("properties") or {}).get("sessionID")) or None
         with self._lock:
+            self._track_open_requests(payload)
             self._frames.append((json.dumps(payload), session_id))
+
+    def _track_open_requests(self, payload: dict) -> None:
+        """Mirror an approval frame into the REST lists. Caller holds the lock.
+
+        **A real opencode server lists exactly what is OPEN**: an ask announced
+        on `/event` is simultaneously in `GET /permission` / `GET /question`, and
+        it leaves that list when it is answered — by this client, by another, or
+        in the agent's own TUI. The adapter DEPENDS on that in two places, so a
+        fake that streamed an ask without listing it would be modelling a state
+        the real server cannot be in:
+
+        * every reconnect reseeds and RETIRES anything the fold holds open that
+          the list no longer carries (`OpencodeFold::seed_approvals`) — an
+          unlisted-but-open ask would silently vanish on the next reconnect;
+        * `answer` resolves the addressed approval THROUGH those lists, inside
+          the pinned session's scope, so that one panel cannot answer a sibling
+          session's request (charliek/shed#345) — an unlisted ask is not
+          answerable at all.
+
+        This is the fake's REST visibility only. The `issued` ledger is
+        untouched and stays the guard's own record of who a request belongs to:
+        `remove_request` deliberately unlists WITHOUT forgetting the issue, so a
+        late answer to a retired ask is a 200 rather than a guard violation, and
+        that asymmetry is the point of keeping the two separate.
+        """
+        props = payload.get("properties") or {}
+        kind = payload.get("type")
+        if kind in ("permission.asked", "question.asked"):
+            request_id = props.get("id") or ""
+            target = self.permissions if kind == "permission.asked" else self.questions
+            # Re-announcing an open ask is not a second ask. (opencode does not
+            # do this; a cell replaying a frame might.)
+            if request_id and all(r["id"] != request_id for r in target):
+                target.append(dict(props))
+        elif kind in ("permission.replied", "question.replied", "question.rejected"):
+            # `requestID` on the resolution frames, `id` on the asks — opencode's
+            # own asymmetry, not ours.
+            request_id = props.get("requestID") or props.get("id") or ""
+            if request_id:
+                self.remove_request(request_id)
 
     def stream_part(self, session_id: str, *, message_id: str, part_id: str,
                     text: str, role: str = "assistant") -> None:
@@ -360,8 +409,15 @@ class FakeOpencode:
     def stream_permission_asked(self, session_id: str, request_id: str, *,
                                 permission: str = "bash",
                                 command: str = "ls -la") -> None:
-        """A live `permission.asked`. Also records the issue, so ANSWERING it is
-        in scope even though it never went through `/permission`."""
+        """A live `permission.asked`.
+
+        Two side effects, and both are what a real server does. The issue is
+        recorded in the guard's ledger, so answering it is IN SCOPE; and the
+        request joins `GET /permission` until it is replied to, because opencode
+        lists what is open (`_track_open_requests`) — which is what makes it
+        answerable at all, since `answer` resolves the addressed approval
+        through that list.
+        """
         with self._lock:
             self.issued[request_id] = session_id
         self.stream({
@@ -378,7 +434,13 @@ class FakeOpencode:
     def stream_permission_replied(self, session_id: str, request_id: str,
                                   reply: str = "once") -> None:
         """The resolution of an ask — by this client, by another, or by the
-        agent's own TUI. The fold cannot tell, which is the point."""
+        agent's own TUI. The fold cannot tell, which is the point.
+
+        It also unlists the request from `GET /permission`, because a server
+        that has replied no longer lists it. A raw
+        `stream({"type": "question.replied", …})` gets the same treatment —
+        the bookkeeping is in `stream`, not in this helper.
+        """
         self.stream({
             "type": "permission.replied",
             "properties": {
@@ -391,7 +453,9 @@ class FakeOpencode:
     def stream_question_asked(self, session_id: str, request_id: str, *, header: str,
                               question: str, options: list[str],
                               custom: bool = False, multiple: bool = False) -> None:
-        """A live `question.asked` with its options."""
+        """A live `question.asked` with its options. Same two side effects as
+        `stream_permission_asked`: the ledger entry, and `GET /question` listing
+        it while it is open."""
         with self._lock:
             self.issued[request_id] = session_id
         self.stream({

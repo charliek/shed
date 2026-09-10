@@ -68,8 +68,9 @@ use serde::Deserialize;
 use serde_json::json;
 use serde_json::value::RawValue;
 use shed_core::lane::{
-    AgentLane, LaneAnswer, LaneApproval, LaneCapabilities, LaneDecision, LaneError, LaneHistory,
-    LaneSession, LaneSubscription, SendMode,
+    option_kind, AgentLane, LaneAnswer, LaneApproval, LaneApprovalKind, LaneApprovalOption,
+    LaneCapabilities, LaneDecision, LaneError, LaneHistory, LaneSession, LaneSubscription,
+    SendMode,
 };
 use shed_core::rc::RcActivity;
 
@@ -916,18 +917,13 @@ impl AgentLane for OpencodeClient {
     async fn approvals(&self, id: &str) -> Result<Vec<LaneApproval>, LaneError> {
         let root = self.rest_session(id).await?;
         let scope = self.approval_scope(id).await;
-        let mut fold = OpencodeFold::new();
 
         let perms = self.rest_permissions(&root.directory).await;
         let questions = self.rest_questions(&root.directory).await;
         if let (Err(pe), Err(_)) = (&perms, &questions) {
             return Err(pe.clone());
         }
-        let seed =
-            watcher::seed_approvals(&scope, perms.as_deref().ok(), questions.as_deref().ok());
-        for (_session_id, raw) in seed.envelopes {
-            fold.apply_line(&raw);
-        }
+        let fold = seeded_fold(&scope, perms.as_deref().ok(), questions.as_deref().ok());
         Ok(fold.pending_approvals())
     }
 
@@ -937,11 +933,14 @@ impl AgentLane for OpencodeClient {
     /// id-addressed and global — `requestID` is unique across sessions, which is
     /// what lets a DESCENDANT's approval be answered from the root's panel.
     ///
-    /// `id` (the session) is not on the wire; it is the pin the caller asserts
-    /// and the fake's guard checks.
+    /// `id` (the session) never reaches the wire, but it is not decoration
+    /// either: it is the SCOPE the addressed approval is resolved inside
+    /// ([`OpencodeClient::resolve_approval`]), which is what keeps this
+    /// session's panel from answering a SIBLING session's request. It is also
+    /// the pin the caller asserts and the fake's guard checks.
     async fn answer(
         &self,
-        _id: &str,
+        id: &str,
         approval_id: &str,
         answer: LaneAnswer,
     ) -> Result<(), LaneError> {
@@ -949,7 +948,7 @@ impl AgentLane for OpencodeClient {
         // [`AnswerLedger`]. The claim is an RAII guard so that dropping THIS
         // future mid-request releases it — see [`AnswerClaim`].
         let claim = self.claim_answer(approval_id)?;
-        let result = self.answer_inner(approval_id, answer).await;
+        let result = self.answer_inner(id, approval_id, answer).await;
         claim.settle(result.is_ok());
         result
     }
@@ -1015,57 +1014,136 @@ impl OpencodeClient {
         Ok(())
     }
 
+    /// The ADDRESSED approval, resolved **inside `id`'s own scope** — the root
+    /// session plus its transitive descendants, computed exactly the way
+    /// [`AgentLane::approvals`] computes it (one helper,
+    /// [`OpencodeClient::approval_scope`], for both).
+    ///
+    /// **Why the scope, and not the whole directory.** opencode has no by-id GET
+    /// for a request, so the only lookup available is the two directory-wide
+    /// lists — and those carry SIBLING sessions' approvals, since an instance is
+    /// per DIRECTORY and a directory holds many unrelated roots. An unscoped
+    /// lookup would therefore let this session's panel answer a sibling's
+    /// request: it would resolve, translate against the sibling's options, and
+    /// POST to a global id-addressed route that has no idea whose panel asked.
+    /// The scope filter is what refuses that, and [`crate::testing`]'s pin guard
+    /// records it as a violation if it ever regresses.
+    ///
+    /// **A failed list PROPAGATES.** A half-read directory cannot say "unknown":
+    /// the id it did not see may simply live in the half that failed, and
+    /// [`LaneError::UnknownApproval`] reads to a client as "somebody already
+    /// answered it". This is the one place the two lists' independent authority
+    /// (which is what [`AgentLane::approvals`] wants — see `seed_approvals`)
+    /// would be actively wrong.
+    ///
+    /// An id in NEITHER list is [`LaneError::UnknownApproval`]. An id in BOTH is
+    /// refused as ambiguous rather than routed by a guess — the fold tracks an
+    /// approval by (kind, id) precisely because an id alone does not identify
+    /// one, and guessing the kind is how a permission reply ends up resolving a
+    /// question.
+    ///
+    /// **Cost: four GETs per answer** on a childless session — the root session,
+    /// its `/children` read (one more per descendant level), and the two lists.
+    /// gx pays a single GET here, because gx HAS a by-id route. What it buys is
+    /// what gx's re-read buys: the answer is translated against the options the
+    /// agent ACTUALLY offered, on an approval this session owns.
+    ///
+    /// **TOCTOU**: between this read and the POST the agent's own TUI may answer
+    /// the same request. That is the same window gx accepts, and it closes the
+    /// same way — the reply route refuses a request that is no longer live (404
+    /// → [`LaneError::UnknownApproval`]), so the loser of the race is told and
+    /// nothing is decided twice.
+    pub(crate) async fn resolve_approval(
+        &self,
+        id: &str,
+        approval_id: &str,
+    ) -> Result<LaneApproval, LaneError> {
+        let root = self.rest_session(id).await?;
+        let scope = self.approval_scope(id).await;
+        // `?` on each, in order: either half failing is the whole lookup's
+        // error.
+        let perms = self.rest_permissions(&root.directory).await?;
+        let questions = self.rest_questions(&root.directory).await?;
+
+        let fold = seeded_fold(&scope, Some(&perms), Some(&questions));
+        // Kind-agnostic on purpose: the ANSWER names a shape and the approval
+        // names a kind, and this is the one place the two are compared.
+        let mut found = fold.approvals_for_id(approval_id);
+        match found.len() {
+            0 => Err(LaneError::UnknownApproval),
+            1 => Ok(found.remove(0)),
+            _ => Err(LaneError::BadRequest(format!(
+                "ambiguous approval id: {approval_id} is open as {}",
+                found
+                    .iter()
+                    .map(|a| a.kind.as_str())
+                    .collect::<Vec<_>>()
+                    .join(" and ")
+            ))),
+        }
+    }
+
     /// The wire half of [`AgentLane::answer`], past the double-tap gate.
     ///
-    /// **Known limitation: this resolves against a fixed id list, not against
-    /// the addressed approval's own offered options.** It never fetches the
-    /// approval, so a [`LaneAnswer::Choice`] naming one of the three permission
-    /// ids is routed to the permission route even when `approval_id` addresses a
-    /// QUESTION — where the contract says the answer should be
-    /// [`LaneError::BadRequest`] ("that approval did not offer this option").
-    ///
-    /// The consequence is a less precise error, not a wrong action: opencode's
-    /// permission route refuses an id that is not a live permission, so the
-    /// caller still fails. And the panel never produces the input — it renders a
-    /// question approval as a question and sends [`LaneAnswer::Question`]. It is
-    /// left as-is because checking properly costs a round trip this adapter does
-    /// not otherwise need, and this crate's wire behaviour is pinned by its
-    /// goldens.
-    ///
-    /// The pattern an adapter should follow WHEN it can afford it is gx's: re-read
-    /// `GET …/approvals/{id}` immediately before translating, and resolve the
-    /// answer against the options that request actually offers. That also makes
-    /// the answer race-safe against the agent's own TUI.
-    async fn answer_inner(&self, approval_id: &str, answer: LaneAnswer) -> Result<(), LaneError> {
+    /// The addressed approval is resolved FIRST
+    /// ([`OpencodeClient::resolve_approval`]), and every refusal below is
+    /// decided against THAT — before anything reaches the wire. An answer whose
+    /// shape does not match the approval it names is a
+    /// [`LaneError::BadRequest`], never a POST to whichever route happens to
+    /// accept that body: opencode's two answer routes are id-addressed and
+    /// global, so a mis-routed answer is not a type error the server catches,
+    /// it is a decision recorded against the wrong request.
+    async fn answer_inner(
+        &self,
+        id: &str,
+        approval_id: &str,
+        answer: LaneAnswer,
+    ) -> Result<(), LaneError> {
+        let approval = self.resolve_approval(id, approval_id).await?;
+        let is_permission = approval.kind == LaneApprovalKind::Permission;
+        let is_question = approval.kind == LaneApprovalKind::Question;
         let seg = encode_segment(approval_id);
         match answer {
+            // The SEMANTIC answer, resolved through the contract's ONE
+            // implementation of the by-kind rule (`option_for`, correction 3)
+            // against the options THIS approval offered. That is also what
+            // refuses a decision aimed at a question, with no kind check of its
+            // own: `LaneApproval::kind` selects which list is populated, so a
+            // question's top-level options are empty and no decision can match.
             LaneAnswer::Permission { decision } => {
+                approval
+                    .option_for(decision)
+                    .ok_or_else(|| unresolvable_decision(&approval, decision))?;
                 self.reply_permission(&seg, decision).await?;
             }
-            // `Choice` names an OFFERED option id. On opencode a permission's
-            // three ids are the decision spellings themselves
-            // (`permission_options`), so the choice resolves to exactly the
-            // decision the arm above sends — which is why it maps onto
-            // `LaneDecision` and shares that arm's route rather than carrying a
-            // second copy of the reply table. A question's options are its
-            // LABELS, and answering one needs the positional vec-of-vecs the
-            // reply route takes — so it arrives as `LaneAnswer::Question`, not
-            // here. Anything else is an id this approval did not offer, which
-            // the contract makes `BadRequest` rather than a guess.
+            // `Choice` names an OFFERED option id, matched against what this
+            // approval actually offered rather than against opencode's fixed
+            // three — which is what used to let one of those three ids, posted
+            // at a QUESTION, reach the permission route. A question's options
+            // are its answer LABELS and are chosen positionally, so they arrive
+            // as `LaneAnswer::Question`, never here.
             LaneAnswer::Choice { option_id } => {
-                let decision = match option_id.as_str() {
-                    "allow_once" => LaneDecision::AllowOnce,
-                    "allow_always" => LaneDecision::AllowAlways,
-                    "reject" => LaneDecision::Reject,
-                    other => {
-                        return Err(LaneError::BadRequest(format!(
-                            "opencode did not offer the option {other:?}"
-                        )))
-                    }
-                };
-                self.reply_permission(&seg, decision).await?;
+                if !is_permission {
+                    return Err(wrong_kind(&approval, "answer it with `question`"));
+                }
+                let offered = approval
+                    .options
+                    .iter()
+                    .find(|o| o.id == option_id)
+                    .ok_or_else(|| {
+                        LaneError::BadRequest(format!(
+                            "opencode did not offer the option {option_id:?} on {approval_id}"
+                        ))
+                    })?;
+                self.reply_permission(&seg, decision_of(offered)?).await?;
             }
             LaneAnswer::Question { answers } => {
+                if !is_question {
+                    return Err(wrong_kind(
+                        &approval,
+                        "answer it with `permission` or `choice`",
+                    ));
+                }
                 self.post_json(
                     &format!("/question/{seg}/reply"),
                     None,
@@ -1074,10 +1152,18 @@ impl OpencodeClient {
                 )
                 .await?;
             }
-            // A bare reject names no kind, so the route is the question one —
-            // a permission's "no" is `LaneDecision::Reject`, one of its three
-            // options, and arrives on the arm above.
+            // A bare reject names no kind, so it is the QUESTION route's "no
+            // thanks". A permission's "no" is one of its three offered
+            // options and arrives as `Permission { Reject }` or as the
+            // equivalent `Choice`, which is why a permission is refused here
+            // rather than silently posted to `/question/{id}/reject`.
             LaneAnswer::Reject => {
+                if !is_question {
+                    return Err(wrong_kind(
+                        &approval,
+                        "refuse it with `permission` (decision `reject`) or `choice`",
+                    ));
+                }
                 self.post_json(
                     &format!("/question/{seg}/reject"),
                     None,
@@ -1088,8 +1174,18 @@ impl OpencodeClient {
             }
             // The escape hatch for an approval kind this build cannot name: the
             // body is the caller's, verbatim, on the permission reply route
-            // (the only one that takes a free-form object).
+            // (the only one that takes a free-form object). It is pinned to a
+            // resolved PERMISSION — opencode has no unnameable kind, so a `Raw`
+            // aimed at anything else is a caller mistake, and honoring one on a
+            // question would post an arbitrary body to the permission route
+            // under a question's id.
             LaneAnswer::Raw { json } => {
+                if !is_permission {
+                    return Err(wrong_kind(
+                        &approval,
+                        "`raw` answers only an approval kind this build cannot name, and opencode has none",
+                    ));
+                }
                 let body: serde_json::Value = serde_json::from_str(&json)
                     .map_err(|e| LaneError::BadRequest(format!("raw answer is not JSON: {e}")))?;
                 self.post_json(
@@ -1154,6 +1250,85 @@ impl OpencodeClient {
             frontier = next;
         }
         scope
+    }
+}
+
+// ---- the approval lookup's pure half ----
+
+/// A FRESH fold holding everything the two lists say is open **inside `scope`**
+/// — the one place a REST approval snapshot is turned into
+/// [`LaneApproval`]s, so [`AgentLane::approvals`] (which lists them) and
+/// [`OpencodeClient::resolve_approval`] (which addresses one) cannot decode the
+/// same request into two different DTOs.
+///
+/// `None` for a half means "that read failed and this half says nothing"; the
+/// two callers differ only in whether they tolerate one
+/// ([`OpencodeClient::resolve_approval`] does not — see its doc).
+fn seeded_fold(
+    scope: &HashSet<String>,
+    permissions: Option<&[RestPermission]>,
+    questions: Option<&[RestQuestion]>,
+) -> OpencodeFold {
+    let mut fold = OpencodeFold::new();
+    let seed = watcher::seed_approvals(scope, permissions, questions);
+    for (_session_id, raw) in seed.envelopes {
+        fold.apply_line(&raw);
+    }
+    fold
+}
+
+/// "That approval is not the shape this answer is for." One spelling for all
+/// four kind refusals, so each names the id AND the kind that was actually
+/// resolved — a client that sent the wrong variant needs both to fix it.
+fn wrong_kind(approval: &LaneApproval, remedy: &str) -> LaneError {
+    LaneError::BadRequest(format!(
+        "{} is a {}; {remedy}",
+        approval.id,
+        approval.kind.as_str()
+    ))
+}
+
+/// [`LaneAnswer::Permission`]'s refusal: the decision names a semantic option
+/// kind, and this approval offers none of it.
+///
+/// It names opencode because the contract's [`LaneApproval::option_for`]
+/// deliberately does not — it answers `None` and leaves the message to whoever
+/// knows which agent is being talked to. Unlike gx, opencode cannot offer the
+/// AMBIGUOUS case (its three options carry three distinct kinds), so there is
+/// no second sentence for it here.
+fn unresolvable_decision(approval: &LaneApproval, decision: LaneDecision) -> LaneError {
+    let wanted = match decision {
+        LaneDecision::AllowOnce => option_kind::ALLOW_ONCE,
+        LaneDecision::AllowAlways => option_kind::ALLOW_ALWAYS,
+        LaneDecision::Reject => option_kind::REJECT_ONCE,
+    };
+    LaneError::BadRequest(format!(
+        "opencode offered no option of kind {wanted} on {} (a {})",
+        approval.id,
+        approval.kind.as_str()
+    ))
+}
+
+/// The [`LaneDecision`] an OFFERED option resolves to — **by its ACP
+/// [`LaneApprovalOption::kind`], never by its id** (the module doc's correction
+/// 3, in the direction `option_for` does not cover).
+///
+/// This is what a [`LaneAnswer::Choice`] goes through, so the two answer shapes
+/// reach [`OpencodeClient::reply_permission`] via the same table. `reject*`
+/// collapses to `reject` because opencode has one refusal and no
+/// reject-always; an option whose kind is absent or unknown is refused rather
+/// than guessed — unreachable for opencode's own three options, and not this
+/// function's job to assume.
+fn decision_of(option: &LaneApprovalOption) -> Result<LaneDecision, LaneError> {
+    match option.kind.as_deref() {
+        Some(option_kind::ALLOW_ONCE) => Ok(LaneDecision::AllowOnce),
+        Some(option_kind::ALLOW_ALWAYS) => Ok(LaneDecision::AllowAlways),
+        Some(k) if k.starts_with("reject") => Ok(LaneDecision::Reject),
+        other => Err(LaneError::BadRequest(format!(
+            "opencode cannot reply the option {} (kind {}) to a permission",
+            option.id,
+            other.unwrap_or("<none>")
+        ))),
     }
 }
 

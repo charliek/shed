@@ -927,6 +927,388 @@ async fn a_cancelled_answer_releases_its_claim_so_a_retry_is_accepted() {
     assert_clean(&fake);
 }
 
+// ---------------------------------------------------------------------------
+// The answer lookup: every LaneAnswer shape × the addressed kind × where the
+// addressed request actually lives.
+// ---------------------------------------------------------------------------
+
+/// Which of opencode's two answer routes an answer shape lands on when it is
+/// pointed at an approval of the kind it is FOR.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Posts {
+    PermissionReply,
+    QuestionReply,
+    QuestionReject,
+}
+
+impl Posts {
+    fn path(self, id: &str) -> String {
+        match self {
+            Posts::PermissionReply => format!("/permission/{id}/reply"),
+            Posts::QuestionReply => format!("/question/{id}/reply"),
+            Posts::QuestionReject => format!("/question/{id}/reject"),
+        }
+    }
+}
+
+/// One answer shape: the [`LaneAnswer`] a client sends, the approval KIND it can
+/// legitimately answer, and the exact wire call it makes when it is pointed at
+/// one of that kind.
+struct Shape {
+    label: &'static str,
+    for_kind: LaneApprovalKind,
+    answer: LaneAnswer,
+    posts: Posts,
+    body: &'static str,
+}
+
+/// Every variant of [`LaneAnswer`], with the three permission decisions and both
+/// `Choice` directions spelled out — the rows of the matrix.
+fn shapes() -> Vec<Shape> {
+    let permission = |label, decision, body| Shape {
+        label,
+        for_kind: LaneApprovalKind::Permission,
+        answer: LaneAnswer::Permission { decision },
+        posts: Posts::PermissionReply,
+        body,
+    };
+    let choice = |label, id: &str, body| Shape {
+        label,
+        for_kind: LaneApprovalKind::Permission,
+        answer: LaneAnswer::Choice {
+            option_id: id.to_string(),
+        },
+        posts: Posts::PermissionReply,
+        body,
+    };
+    vec![
+        permission(
+            "permission{allow_once}",
+            LaneDecision::AllowOnce,
+            r#"{"reply":"once"}"#,
+        ),
+        permission(
+            "permission{allow_always}",
+            LaneDecision::AllowAlways,
+            r#"{"reply":"always"}"#,
+        ),
+        permission(
+            "permission{reject}",
+            LaneDecision::Reject,
+            r#"{"reply":"reject"}"#,
+        ),
+        // The option ids are opencode's own (`permission_options`), and the
+        // decision comes from each option's ACP `kind` — `reject`'s kind is
+        // `reject_once`, so an id-sniffing resolver would miss it.
+        choice("choice{allow_once}", "allow_once", r#"{"reply":"once"}"#),
+        choice("choice{reject}", "reject", r#"{"reply":"reject"}"#),
+        Shape {
+            label: "question",
+            for_kind: LaneApprovalKind::Question,
+            answer: LaneAnswer::Question {
+                answers: vec![vec!["left".to_string()]],
+            },
+            posts: Posts::QuestionReply,
+            body: r#"{"answers":[["left"]]}"#,
+        },
+        Shape {
+            label: "reject",
+            for_kind: LaneApprovalKind::Question,
+            answer: LaneAnswer::Reject,
+            posts: Posts::QuestionReject,
+            body: "{}",
+        },
+        Shape {
+            label: "raw",
+            for_kind: LaneApprovalKind::Permission,
+            answer: LaneAnswer::Raw {
+                json: r#"{"reply":"always"}"#.to_string(),
+            },
+            posts: Posts::PermissionReply,
+            body: r#"{"reply":"always"}"#,
+        },
+    ]
+}
+
+/// Where the addressed request lives, as far as the two DIRECTORY-WIDE lists the
+/// lookup reads are concerned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Placement {
+    /// Open on the subscribed root.
+    Root,
+    /// Open on a DESCENDANT of the root — a child's approval blocks the same
+    /// agent, so it is answerable from the root's panel.
+    Child,
+    /// Open on a SIBLING root in the same directory. It IS in the lists, and it
+    /// must not be answerable from this session's panel.
+    Sibling,
+    /// In neither list.
+    Absent,
+    /// In BOTH lists, under one id.
+    Both,
+    /// Open on the root, but the `/permission` read fails.
+    PermissionListDown,
+    /// Open on the root, but the `/question` read fails.
+    QuestionListDown,
+}
+
+/// What the answer must do.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Expect {
+    /// One POST, on this path, with this body.
+    Posted(String, &'static str),
+    /// [`LaneError::UnknownApproval`], and NO POST.
+    Unknown,
+    /// A [`LaneError::BadRequest`] whose message contains ALL of these, and NO
+    /// POST.
+    Refused(Vec<String>),
+    /// The failed list read's OWN error, naming that route, and NO POST.
+    Propagated(&'static str),
+}
+
+/// The lookup's world: a root, a DESCENDANT of it, and a SIBLING root — all in
+/// ONE directory, which is what puts the sibling's requests in the very lists
+/// the lookup has to read. Both lists always carry a decoy, so resolving is
+/// never "the only entry there is".
+///
+/// Returns the fake and the id the answer will address.
+async fn placed(placement: Placement, kind: &LaneApprovalKind) -> (FakeOpencode, String) {
+    let fake = three_sessions().await;
+    fake.add_permission("ses_a", "per_decoy", "bash", "ls");
+    fake.add_question("ses_a", "que_decoy", "Pick", "Which?", &["left"]);
+    fake.add_permission("ses_sib", "per_sib_decoy", "bash", "rm -rf /");
+    fake.add_question("ses_sib", "que_sib_decoy", "Pick", "Which?", &["left"]);
+
+    let question = *kind == LaneApprovalKind::Question;
+    let id = if question { "que_target" } else { "per_target" };
+    let add = |session: &str, id: &str| {
+        if question {
+            fake.add_question(session, id, "Pick", "Which?", &["left", "right"]);
+        } else {
+            fake.add_permission(session, id, "bash", "ls");
+        }
+    };
+    match placement {
+        Placement::Root => add("ses_a", id),
+        Placement::Child => add("ses_child", id),
+        Placement::Sibling => add("ses_sib", id),
+        // Nothing added: the id is in neither list. The decoys are, so the
+        // lookup is reading a populated directory and still not finding it.
+        Placement::Absent => {}
+        // One id, tracked under BOTH kinds. opencode prefixes its request ids
+        // `per_`/`que_` so this does not arise in practice, but it is
+        // representable and the fold refuses to guess a kind for it.
+        Placement::Both => {
+            fake.add_permission("ses_a", "amb_target", "bash", "ls");
+            fake.add_question("ses_a", "amb_target", "Pick", "Which?", &["left"]);
+        }
+        Placement::PermissionListDown => {
+            add("ses_a", id);
+            fake.fail_get("/permission", 500);
+        }
+        Placement::QuestionListDown => {
+            add("ses_a", id);
+            fake.fail_get("/question", 500);
+        }
+    }
+    let addressed = match placement {
+        Placement::Both => "amb_target".to_string(),
+        _ => id.to_string(),
+    };
+    (fake, addressed)
+}
+
+/// Assert one cell: the RESULT, and whether a POST happened.
+fn check(case: &str, got: Result<(), LaneError>, expect: &Expect, fake: &FakeOpencode) {
+    match expect {
+        Expect::Posted(path, body) => {
+            got.unwrap_or_else(|e| panic!("{case}: expected the answer to land, got {e:?}"));
+            assert_eq!(
+                fake.post_paths(),
+                vec![path.clone()],
+                "{case}: the ONE post"
+            );
+            assert_eq!(fake.post_body(path).as_deref(), Some(*body), "{case}: body");
+        }
+        Expect::Unknown => {
+            assert_eq!(
+                got.expect_err(&format!("{case}: expected a refusal")),
+                LaneError::UnknownApproval,
+                "{case}"
+            );
+            assert!(
+                fake.post_paths().is_empty(),
+                "{case}: NOTHING may reach the wire, got {:?}",
+                fake.post_paths()
+            );
+        }
+        Expect::Refused(needles) => {
+            let err = got.expect_err(&format!("{case}: expected a refusal"));
+            match &err {
+                LaneError::BadRequest(msg) => {
+                    for needle in needles {
+                        assert!(
+                            msg.contains(needle.as_str()),
+                            "{case}: {msg:?} does not say {needle:?}"
+                        );
+                    }
+                }
+                other => panic!("{case}: expected a BadRequest, got {other:?}"),
+            }
+            assert!(
+                fake.post_paths().is_empty(),
+                "{case}: NOTHING may reach the wire, got {:?}",
+                fake.post_paths()
+            );
+        }
+        Expect::Propagated(route) => {
+            let err = got.expect_err(&format!("{case}: expected the read's error"));
+            match &err {
+                LaneError::Failed(msg) => assert!(
+                    msg.contains(route),
+                    "{case}: {msg:?} does not name the failed {route} read"
+                ),
+                other => panic!("{case}: expected the list read's Failed, got {other:?}"),
+            }
+            assert!(
+                fake.post_paths().is_empty(),
+                "{case}: a half-read directory decides NOTHING, got {:?}",
+                fake.post_paths()
+            );
+        }
+    }
+    assert_clean(fake);
+}
+
+/// The whole answer contract as one table: every [`LaneAnswer`] shape × the kind
+/// of the approval it is pointed at × where that approval lives.
+///
+/// The load-bearing rows are the SIBLING ones. opencode has no by-id GET, so the
+/// lookup is the two directory-wide lists — and a directory holds unrelated
+/// roots, whose approvals are in those same lists. Every sibling row addresses a
+/// request that IS open and IS listed, and every one of them must refuse with no
+/// POST at all: an unscoped lookup would resolve it, translate the answer
+/// against the sibling's options, and post it to a global id-addressed route
+/// that has no idea whose panel asked.
+#[tokio::test]
+async fn the_answer_matrix_resolves_the_approval_it_was_addressed_to() {
+    for shape in shapes() {
+        for kind in [LaneApprovalKind::Permission, LaneApprovalKind::Question] {
+            let right_kind = shape.for_kind == kind;
+            for placement in [
+                Placement::Root,
+                Placement::Child,
+                Placement::Sibling,
+                Placement::Absent,
+                Placement::Both,
+                Placement::PermissionListDown,
+                Placement::QuestionListDown,
+            ] {
+                // The sibling row is only meaningful for the shape's OWN kind:
+                // pointed at the other kind it would be refused on the shape
+                // alone, which is not what that row is proving.
+                if placement == Placement::Sibling && !right_kind {
+                    continue;
+                }
+                // The ambiguous id has no kind of its own — it is BOTH — so the
+                // second pass would be the identical case. It is swept once per
+                // shape rather than twice for nothing. The two list-down rows
+                // ARE run for both kinds on purpose: with the addressed request
+                // in the SURVIVING half, a tolerant lookup would answer it, and
+                // that is the row that catches one.
+                if matches!(placement, Placement::Both) && kind == LaneApprovalKind::Question {
+                    continue;
+                }
+                let (fake, id) = placed(placement, &kind).await;
+                let expect = match placement {
+                    Placement::Absent | Placement::Sibling => Expect::Unknown,
+                    Placement::Both => Expect::Refused(vec!["ambiguous approval id".to_string()]),
+                    Placement::PermissionListDown => Expect::Propagated("/permission"),
+                    Placement::QuestionListDown => Expect::Propagated("/question"),
+                    Placement::Root | Placement::Child if right_kind => {
+                        Expect::Posted(shape.posts.path(&id), shape.body)
+                    }
+                    // The mismatch refusal names the id AND the kind that was
+                    // actually resolved — both, because a client that sent the
+                    // wrong variant needs both to fix it.
+                    Placement::Root | Placement::Child => {
+                        Expect::Refused(vec![id.clone(), kind.as_str().to_string()])
+                    }
+                };
+                let case = format!("{} × {} × {placement:?}", shape.label, kind.as_str());
+                let got = client(&fake)
+                    .answer("ses_a", &id, shape.answer.clone())
+                    .await;
+                check(&case, got, &expect, &fake);
+            }
+        }
+    }
+}
+
+/// The rows the matrix cannot express: an answer of the RIGHT shape for the
+/// resolved kind that is still not answerable — an option this approval never
+/// offered, and a `raw` body that is not JSON. Both are refused before the wire,
+/// like every other mismatch.
+#[tokio::test]
+async fn an_answer_of_the_right_shape_can_still_name_something_that_was_not_offered() {
+    // An id opencode's permissions never offer.
+    let (fake, id) = placed(Placement::Root, &LaneApprovalKind::Permission).await;
+    check(
+        "choice{nope} × permission",
+        client(&fake)
+            .answer(
+                "ses_a",
+                &id,
+                LaneAnswer::Choice {
+                    option_id: "nope".to_string(),
+                },
+            )
+            .await,
+        &Expect::Refused(vec![format!("did not offer the option \"nope\" on {id}")]),
+        &fake,
+    );
+
+    // A QUESTION's own option label, sent as a `Choice`. It is a real offered
+    // id — on the question's inner form, which is answered positionally through
+    // `LaneAnswer::Question` — so the refusal is about the KIND, not the id.
+    let (fake, id) = placed(Placement::Root, &LaneApprovalKind::Question).await;
+    check(
+        "choice{left} × question",
+        client(&fake)
+            .answer(
+                "ses_a",
+                &id,
+                LaneAnswer::Choice {
+                    option_id: "left".to_string(),
+                },
+            )
+            .await,
+        &Expect::Refused(vec![format!(
+            "{id} is a question; answer it with `question`"
+        )]),
+        &fake,
+    );
+
+    // `Raw` on a resolved permission is allowed — but the body still has to be
+    // JSON, and that check stays where it was: after the lookup, before the
+    // POST.
+    let (fake, id) = placed(Placement::Root, &LaneApprovalKind::Permission).await;
+    check(
+        "raw{not json} × permission",
+        client(&fake)
+            .answer(
+                "ses_a",
+                &id,
+                LaneAnswer::Raw {
+                    json: "not json".to_string(),
+                },
+            )
+            .await,
+        &Expect::Refused(vec!["raw answer is not JSON".to_string()]),
+        &fake,
+    );
+}
+
 /// The moved shared pieces resolve at BOTH paths, from OUTSIDE the crate.
 ///
 /// `MessageRing`, the feed vocabulary and the sanitizers now live in
