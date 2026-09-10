@@ -56,6 +56,21 @@
 //! SUBSCRIPTION, and each is a state no amount of reconnecting improves:
 //! `unknown_session`, `unauthorized`, a `session` frame saying the row was
 //! removed, and [`GxTimings::down_after`] of failing reseeds.
+//!
+//! **A client that stops reading ends a generation too**, and it is NOT one of
+//! the four. The frame channel is bounded
+//! ([`shed_core::lane::LANE_CHANNEL_CAPACITY`]); a full one drops the frame, and
+//! every emitting helper here propagates that as [`GenEnd::Lagged`], so the
+//! generation ends at the FIRST dropped frame — in steady state, mid-seed, or
+//! inside a reseed's own `Reset` … `Ready`. The run loop then unpins the epoch
+//! (as it does after every generation), waits for the client to drain **holding
+//! no stream**, takes the ordinary failure backoff, and reseeds as
+//! `Plan::Reseed("lagged")` — never `Plan::Resume`, because the dropped frames
+//! were folded at or before the cursor and a by-counter resume would ask for
+//! everything AFTER them, leaving the hole permanent. **`"overflow"` and
+//! `"lagged"` are different overflows and both names stay:** `"overflow"` is
+//! THIS crate's seed inbox (frames it had not folded yet), `"lagged"` is the
+//! client's channel (frames it had published).
 
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
@@ -66,12 +81,11 @@ use serde_json::Value;
 use shed_core::lane::backoff::{jittered, next_backoff};
 use shed_core::lane::ring::MessageRing;
 use shed_core::lane::{
-    AgentLane, LaneApproval, LaneApprovalStatus, LaneError, LaneEvent, LaneSession, LaneStop,
-    LaneSubscription,
+    AgentLane, LaneApproval, LaneApprovalStatus, LaneError, LaneEvent, LanePublisher, LaneSession,
+    LaneStop, LaneSubscription, Publish,
 };
 use shed_core::rc::RcActivity;
 use shed_core::sse::{SseEvent, SseParser};
-use tokio::sync::mpsc;
 
 use crate::client::{lane_session, GxClient, GxSessionRow, GxTimings};
 use crate::discovery::redact_hex64;
@@ -123,27 +137,20 @@ fn backoff_bounds(timings: &GxTimings) -> (Duration, Duration) {
 /// Spawn the pump for one subscription and hand back the contract's receiver +
 /// stop handle.
 pub(crate) fn spawn(client: GxClient, session: &str, cursor: Option<String>) -> LaneSubscription {
-    // **The channel is unbounded because the CONTRACT's is.**
-    // `LaneSubscription.rx` is a `mpsc::UnboundedReceiver<LaneEvent>`
-    // (`shed_core::lane`), shared with `shed-opencode` and hand-mirrored by
-    // shed-mobile, so bounding it is a contract change and not an adapter's
-    // call to make.
+    // **The channel is BOUNDED, and the bound is the contract's**
+    // (`shed_core::lane::LANE_CHANNEL_CAPACITY`, module-doc correction 13) —
+    // shared with `shed-opencode` and hand-mirrored by shed-mobile, so neither
+    // the number nor the policy is an adapter's call to make. What this adapter
+    // owes it is propagation: a dropped frame ends the generation, here as
+    // everywhere else.
     //
-    // Nor can this side fake one: tokio exposes `len()` on the RECEIVER only,
-    // and the receiver belongs to the client the moment `subscribe` returns, so
-    // the pump has no way to observe the queue it is filling. Capping what the
-    // pump *produces* instead would be a different rule wearing the same name —
-    // it would kill a healthy long-running session whose consumer is keeping up
-    // perfectly.
-    //
-    // What IS bounded is everything this crate owns: the fold's `seen`, tools
-    // and approvals maps, the seed inbox (`MAX_INBOX_ITEMS`/`_BYTES`), one SSE
-    // frame (`MAX_SSE_FRAME_BYTES`), the ring, and each row's text. The residual
-    // is a client that holds a subscription open and never polls it — a client
-    // bug, for which `LaneStop` makes the correct teardown one line, and which
-    // `tx.is_closed()` already ends the moment the receiver is dropped. Closing
-    // it properly needs a bounded receiver in `shed_core::lane`; filed for C6.
-    let (tx, rx) = mpsc::unbounded_channel();
+    // Everything else this crate owns was already bounded — the fold's `seen`,
+    // tools and approvals maps, the seed inbox
+    // (`MAX_INBOX_ITEMS`/`MAX_INBOX_BYTES`), one SSE frame
+    // (`MAX_SSE_FRAME_BYTES`), the ring, and each row's text. The client queue
+    // was the one thing that was not, and a client that held a subscription open
+    // and never polled it grew it without limit.
+    let (tx, rx) = LanePublisher::channel();
     let timings = client.timings().clone();
     let watcher = Watcher {
         client,
@@ -199,7 +206,7 @@ struct Watcher {
     /// The subscribed session. Every route this watcher touches names it, and
     /// the fold refuses an event id that does not carry it as a prefix.
     session: String,
-    tx: mpsc::UnboundedSender<LaneEvent>,
+    tx: LanePublisher,
     fold: GxFold,
     /// One ring for the life of the subscription: `seq` is monotonic ACROSS
     /// generations, so a client that keeps its rows across a reseed can still
@@ -237,6 +244,10 @@ enum Plan {
     Resume(String),
 }
 
+/// `Ok` while the client is keeping up; `Err(GenEnd::Lagged)` the instant a
+/// frame is dropped, which every caller propagates.
+type Emitted = Result<(), GenEnd>;
+
 /// Whether a frame's SESSION and APPROVAL effects reach the client as it is
 /// applied. Transcript rows are unaffected — they are first in the pinned
 /// order, so they emit either way.
@@ -252,9 +263,22 @@ enum Emit {
 }
 
 /// How a generation ended.
+#[derive(Debug)]
 enum GenEnd {
     /// Terminal: emit `Down` with this reason and stop.
     Down(String),
+    /// The CLIENT stopped reading and a frame was dropped
+    /// (`shed_core::lane::Publish::Lagged`).
+    ///
+    /// Its own variant rather than an [`GenEnd::Ended`] with
+    /// `force_reseed: Some("lagged")`, because the run loop owes it two things
+    /// an ordinary end does not. It **waits for the client to drain** before
+    /// reseeding, and it does **not** advance the `down_after` clock: that clock
+    /// spends the subscription on an agent that cannot be reached, and a
+    /// consumer that is merely slow is not one. A lagged generation still takes
+    /// the failure backoff, so consecutive lags cannot become a seed-per-frame
+    /// load on a live leader.
+    Lagged,
     Ended {
         /// Did this generation get as far as being USEFUL — a reseed that
         /// reached `Ready`, or a resume that reconciled? It resets the backoff.
@@ -314,8 +338,43 @@ impl Watcher {
             self.client.unpin().await;
             let (worked, long_lived, detail, force_reseed) = match end {
                 GenEnd::Down(reason) => {
-                    self.go_down(reason);
+                    self.go_down(reason).await;
                     return;
+                }
+                // The generation already dropped its SSE stream and the `unpin`
+                // above already ended its transport epoch, so this wait holds
+                // nothing: a client that never drains stalls its own lane and
+                // no one else's. When it does drain, the backoff still runs —
+                // a consumer taking one frame at a time must not turn into a
+                // reseed per frame against a live leader. And the reseed is a
+                // reseed, never a `Plan::Resume`: the frames the channel
+                // dropped were folded at or before the cursor, so resuming
+                // from it would ask gx for everything AFTER them and leave the
+                // hole permanent.
+                GenEnd::Lagged => {
+                    if self.tx.wait_drained().await.is_err() {
+                        return; // the subscriber went away while we waited
+                    }
+                    // **The `down_after` clock is CLEARED, not merely skipped.**
+                    // That clock spends the subscription on a leader that
+                    // cannot be reached, and a lag is positive evidence of the
+                    // opposite: this adapter only filled 1024 slots because gx
+                    // served the seed and kept streaming. Leaving a stale
+                    // `failing_since` running across the drain wait is how a
+                    // slow consumer earns an "unreachable" verdict — stall past
+                    // `down_after`, and the next brief reseed failure trips it
+                    // on the spot. True mid-seed too: the seed was served.
+                    //
+                    // The BACKOFF is deliberately not reset with it. The two
+                    // are different questions — "is the agent there" and "how
+                    // hard am I hammering it" — and only the first one is
+                    // answered by a lag.
+                    failing_since = None;
+                    streak = None;
+                    plan = Plan::Reseed("lagged".to_string());
+                    backoff = next_backoff(backoff, false, base, max);
+                    tokio::time::sleep(jittered(backoff)).await;
+                    continue;
                 }
                 GenEnd::Ended {
                     worked,
@@ -341,7 +400,7 @@ impl Watcher {
             } else if was_reseed {
                 let since = failing_since.get_or_insert_with(Instant::now);
                 if since.elapsed() >= self.timings.down_after {
-                    self.go_down(format!("unreachable: {detail}"));
+                    self.go_down(format!("unreachable: {detail}")).await;
                     return;
                 }
             }
@@ -401,12 +460,22 @@ impl Watcher {
         }
     }
 
+    /// The generation, with the client-lag exit split out into the `Err` half
+    /// so every emitting helper can propagate it with `?` instead of each caller
+    /// remembering to check. `Ok` and `Err` are both ends; only the reason
+    /// differs.
     async fn run_generation(&mut self, plan: &Plan) -> GenEnd {
+        match self.generation_body(plan).await {
+            Ok(end) | Err(end) => end,
+        }
+    }
+
+    async fn generation_body(&mut self, plan: &Plan) -> Result<GenEnd, GenEnd> {
         // ---- step 1: a reseed announces itself; a resume says nothing ----
         let cursor = match plan {
             Plan::Reseed(reason) => {
                 self.generation += 1;
-                self.emit(LaneEvent::Reset {
+                let sent = self.emit(LaneEvent::Reset {
                     reason: reason.clone(),
                     generation: self.generation,
                 });
@@ -425,6 +494,9 @@ impl Watcher {
                 self.emitted_approvals.clear();
                 self.last_session = None;
                 self.session_row = None;
+                // Checked AFTER the state reset, so a lagged `Reset` still
+                // leaves this watcher in the shape the next generation needs.
+                sent?;
                 None
             }
             Plan::Resume(cursor) => Some(cursor.as_str()),
@@ -434,7 +506,7 @@ impl Watcher {
         // ---- step 2: the stream FIRST ----
         let resp = match self.client.open_events(&self.session, cursor).await {
             Ok(resp) => resp,
-            Err(e) => return self.connect_failure(e),
+            Err(e) => return Ok(self.connect_failure(e)),
         };
         let up = Instant::now();
         let mut stream = Box::pin(resp.bytes_stream());
@@ -459,18 +531,18 @@ impl Watcher {
                         Read::Frames(events) => {
                             for ev in events {
                                 if !inbox.push(ev) {
-                                    return overflow(up, window);
+                                    return Ok(overflow(up, window));
                                 }
                             }
                         }
-                        other => return other.into_end(up, window, false),
+                        other => return Ok(other.into_end(up, window, false)),
                     },
                 }
             }
         };
         let fetched = match fetched {
             Ok(f) => f,
-            Err(e) => return self.connect_failure(e),
+            Err(e) => return Ok(self.connect_failure(e)),
         };
 
         // ---- step 4: fold the seed, then reconcile ----
@@ -480,44 +552,48 @@ impl Watcher {
             }
             self.fold_at = Instant::now();
             self.note_streak();
-            self.drain_rows();
+            // A seed BIGGER than the client channel lags right here, and the
+            // generation ends without a `Ready` — deliberately, because a staged
+            // generation with no `Ready` leaves a client holding a view it was
+            // told to replace and given nothing to replace it with.
+            self.drain_rows()?;
         }
-        self.reconcile(fetched.approvals, fetched.row);
+        self.reconcile(fetched.approvals, fetched.row)?;
 
         // ---- step 5: the frames that arrived while the fetch ran ----
         for ev in inbox.take() {
-            if let Some(end) = self.apply_frame(&ev, Emit::Defer) {
-                return end;
+            if let Some(end) = self.apply_frame(&ev, Emit::Defer)? {
+                return Ok(end);
             }
         }
 
         // ---- step 6: publish ----
-        self.emit_session();
-        self.emit_approvals();
+        self.emit_session()?;
+        self.emit_approvals()?;
         if reseed {
             self.emit(LaneEvent::Ready {
                 generation: self.generation,
-            });
+            })?;
         }
 
         // ---- steady state ----
         let mut last_byte = Instant::now();
         loop {
             if self.tx.is_closed() {
-                return GenEnd::Down("closed".to_string());
+                return Ok(GenEnd::Down("closed".to_string()));
             }
             match self
                 .read_live(&mut stream, &mut parser, &mut last_byte)
-                .await
+                .await?
             {
                 Read::Frames(events) => {
                     for ev in events {
-                        if let Some(end) = self.apply_frame(&ev, Emit::Now) {
-                            return end;
+                        if let Some(end) = self.apply_frame(&ev, Emit::Now)? {
+                            return Ok(end);
                         }
                     }
                 }
-                other => return other.into_end(up, window, true),
+                other => return Ok(other.into_end(up, window, true)),
             }
         }
     }
@@ -533,10 +609,14 @@ impl Watcher {
     ///
     /// Every terminal path goes through here, so "flush on the way down" is one
     /// place rather than a rule five call sites have to remember.
-    fn go_down(&mut self, reason: String) {
+    async fn go_down(mut self, reason: String) {
         self.fold.flush_open();
-        self.drain_rows();
-        self.emit(LaneEvent::Down { reason });
+        // A full channel drops the flushed partial row — there is nothing to
+        // reseed into, so there is nothing to be done about it. The `Down`
+        // below is the frame that must NOT be dropped, and `publish_final`
+        // waits for room rather than losing it.
+        let _ = self.drain_rows();
+        self.tx.publish_final(LaneEvent::Down { reason }).await;
     }
 
     /// A dial, pin, connect or fetch failure, mapped to what it means for the
@@ -608,7 +688,7 @@ impl Watcher {
     ///
     /// The tombstones are computed BEFORE the fetched set is noted, so an
     /// approval that is in both lists is refreshed rather than buried.
-    fn reconcile(&mut self, approvals: Vec<LaneApproval>, row: GxSessionRow) {
+    fn reconcile(&mut self, approvals: Vec<LaneApproval>, row: GxSessionRow) -> Emitted {
         let fetched: HashSet<&str> = approvals.iter().map(|a| a.id.as_str()).collect();
         let gone: Vec<LaneApproval> = self
             .fold
@@ -634,29 +714,31 @@ impl Watcher {
         // `note_approval` mints an `approval_request` row on first sight, and a
         // reconcile is where a client first learns about an approval raised
         // while the stream was down.
-        self.drain_rows();
+        let sent = self.drain_rows();
         self.session_row = Some(row);
         self.row_at = Instant::now();
+        sent
     }
 
-    /// One SSE frame. `Some(end)` when the frame ENDS the generation.
+    /// One SSE frame. `Ok(Some(end))` when the frame ENDS the generation;
+    /// `Err` when publishing what it produced hit a full client channel.
     ///
     /// A frame this build cannot decode is dropped, never fatal: the stream has
     /// to survive a gx that grew a field, and an `update` that will not parse is
     /// one lost row rather than a lost subscription.
-    fn apply_frame(&mut self, ev: &SseEvent, emit: Emit) -> Option<GenEnd> {
+    fn apply_frame(&mut self, ev: &SseEvent, emit: Emit) -> Result<Option<GenEnd>, GenEnd> {
         match ev.event.as_str() {
             "update" => {
                 if let Ok(env) = serde_json::from_str::<GxEnvelope>(&ev.data) {
                     self.fold.apply(&env);
                     self.fold_at = Instant::now();
                     self.note_streak();
-                    self.drain_rows();
+                    self.drain_rows()?;
                 }
                 if emit == Emit::Now {
-                    self.emit_session();
+                    self.emit_session()?;
                 }
-                None
+                Ok(None)
             }
             "session" => {
                 // Either the summary row or `{sessionId, removed: true}`. The
@@ -670,7 +752,7 @@ impl Watcher {
                 // same bytes.
                 match serde_json::from_str::<Value>(&ev.data) {
                     Ok(v) if v.get("removed").and_then(Value::as_bool) == Some(true) => {
-                        return Some(GenEnd::Down("session_removed".to_string()));
+                        return Ok(Some(GenEnd::Down("session_removed".to_string())));
                     }
                     Ok(v) => {
                         if let Ok(row) = serde_json::from_value::<GxSessionRow>(v) {
@@ -681,20 +763,20 @@ impl Watcher {
                     Err(_) => {}
                 }
                 if emit == Emit::Now {
-                    self.emit_session();
+                    self.emit_session()?;
                 }
-                None
+                Ok(None)
             }
             "approval" => {
                 if let Ok(res) = serde_json::from_str::<GxApprovalResource>(&ev.data) {
                     self.fold.note_approval(lane_approval(&res));
-                    self.drain_rows();
+                    self.drain_rows()?;
                 }
                 if emit == Emit::Now {
-                    self.emit_approvals();
-                    self.emit_session();
+                    self.emit_approvals()?;
+                    self.emit_session()?;
                 }
-                None
+                Ok(None)
             }
             "reset" => {
                 let reason = serde_json::from_str::<Value>(&ev.data)
@@ -712,7 +794,7 @@ impl Watcher {
                 // token in a reset reason already knows it; what must not
                 // happen is shed writing it somewhere it outlives the frame.
                 let reason = redact_hex64(&reason);
-                Some(GenEnd::Ended {
+                Ok(Some(GenEnd::Ended {
                     // The connection worked — the server is telling us our VIEW
                     // is stale, which is a different thing from a dead lane and
                     // must not push the backoff up.
@@ -720,20 +802,29 @@ impl Watcher {
                     long_lived: false,
                     detail: format!("the gx stream asked for a reseed: {reason}"),
                     force_reseed: Some(format!("server_reset:{reason}")),
-                })
+                }))
             }
             // A frame kind this build has never heard of, or a keepalive that
             // somehow arrived as a named event: liveness, nothing more.
-            _ => None,
+            _ => Ok(None),
         }
     }
 
     // ---- emitting ----
 
-    fn emit(&self, ev: LaneEvent) {
-        // A closed receiver means the subscription is gone; the run loop
-        // notices at its next check.
-        let _ = self.tx.send(ev);
+    /// Publish one frame, and hand the caller the ONE outcome it must not
+    /// absorb.
+    ///
+    /// A CLOSED receiver stays what it always was — the subscription is gone and
+    /// the run loop notices at its next check, so there is nothing to unwind. A
+    /// LAGGED one is different in kind: the frame was dropped, the client cannot
+    /// tell, and every caller ends the generation on it (`shed_core::lane`'s
+    /// module doc, correction 13).
+    fn emit(&self, ev: LaneEvent) -> Emitted {
+        match self.tx.publish(ev) {
+            Publish::Sent | Publish::Closed => Ok(()),
+            Publish::Lagged => Err(GenEnd::Lagged),
+        }
     }
 
     /// Take the fold's queued rows through the ring (which assigns `seq`) and
@@ -745,10 +836,10 @@ impl Watcher {
     /// applied one: gx's counters are not monotonic in transcript order, and a
     /// resume from anything but the maximum would ask for frames it already
     /// has.
-    fn drain_rows(&mut self) {
+    fn drain_rows(&mut self) -> Emitted {
         let rows = self.fold.drain_messages();
         if rows.is_empty() {
-            return;
+            return Ok(());
         }
         let now = now_unix_ms();
         let cursor = self.fold.resume_cursor().map(str::to_string);
@@ -757,8 +848,9 @@ impl Watcher {
             self.emit(LaneEvent::Message {
                 message,
                 cursor: cursor.clone(),
-            });
+            })?;
         }
+        Ok(())
     }
 
     /// Emit the session row when it actually changed.
@@ -773,12 +865,12 @@ impl Watcher {
     /// `turn_completed` folded just after a roster frame would be overwritten by
     /// a row that predates it (a spinner that never stops), and the mirror image
     /// is just as wrong.
-    fn emit_session(&mut self) {
+    fn emit_session(&mut self) -> Emitted {
         // BORROWED, not cloned: this runs on every `update` frame — one per
         // message chunk — and a clone here would allocate the row's four
         // strings only to drop them again at the unchanged check below.
         let Some(base) = self.session_row.as_ref() else {
-            return;
+            return Ok(());
         };
         let mut row = lane_session(base, self.fold.open_approvals());
         // The id is contract: a row gx served without one must still be
@@ -791,10 +883,10 @@ impl Watcher {
             }
         }
         if self.last_session.as_ref() == Some(&row) {
-            return;
+            return Ok(());
         }
         self.last_session = Some(row.clone());
-        self.emit(LaneEvent::Session { session: row });
+        self.emit(LaneEvent::Session { session: row })
     }
 
     /// Emit an `Approval` for every approval whose DTO changed, tombstones
@@ -803,7 +895,7 @@ impl Watcher {
     /// Id-keyed and last-write-wins, exactly as the contract says a client must
     /// read them: nothing here requires a client to have seen the `pending`
     /// frame before the `resolved` one.
-    fn emit_approvals(&mut self) {
+    fn emit_approvals(&mut self) -> Emitted {
         let held = self.fold.held_approvals();
         let mut changed: Vec<LaneApproval> = held
             .iter()
@@ -813,9 +905,13 @@ impl Watcher {
         // Deterministic order: two approvals changing in one frame must not
         // reach a client in hash order.
         changed.sort_by(|a, b| a.id.cmp(&b.id));
+        let mut sent = Ok(());
         for a in changed {
             self.emitted_approvals.insert(a.id.clone(), a.clone());
-            self.emit(LaneEvent::Approval { approval: a });
+            sent = self.emit(LaneEvent::Approval { approval: a });
+            if sent.is_err() {
+                break;
+            }
         }
         // The fold's own approval map is bounded and evicts settled entries;
         // this map follows it, so a re-ask of an evicted id is seen as a change
@@ -823,6 +919,7 @@ impl Watcher {
         let ids: HashSet<&str> = held.iter().map(|a| a.id.as_str()).collect();
         self.emitted_approvals
             .retain(|k, _| ids.contains(k.as_str()));
+        sent
     }
 
     // ---- reading ----
@@ -844,7 +941,7 @@ impl Watcher {
         stream: &mut S,
         parser: &mut SseParser,
         last_byte: &mut Instant,
-    ) -> Read
+    ) -> Result<Read, GenEnd>
     where
         S: Stream<Item = reqwest::Result<B>> + Unpin,
         B: AsRef<[u8]>,
@@ -852,7 +949,7 @@ impl Watcher {
         loop {
             let since = last_byte.elapsed();
             if since >= self.timings.stall {
-                return Read::Timeout;
+                return Ok(Read::Timeout);
             }
             // TWO clocks, and they measure different things. The STALL runs on
             // bytes-on-the-connection, because any byte proves the far side is
@@ -874,7 +971,7 @@ impl Watcher {
                         .is_some_and(|at| at.elapsed() >= self.timings.flush_after)
                     {
                         self.fold.flush_open();
-                        self.drain_rows();
+                        self.drain_rows()?;
                         self.note_streak();
                     }
                     continue;
@@ -886,9 +983,9 @@ impl Watcher {
                     if events.is_empty() {
                         continue;
                     }
-                    return Read::Frames(events);
+                    return Ok(Read::Frames(events));
                 }
-                other => return other,
+                other => return Ok(other),
             }
         }
     }

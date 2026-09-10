@@ -11,7 +11,9 @@
 //!   escalation ladder with it. A suite that slept out the real 30-second resume
 //!   window would take half an hour and nobody would run it.
 
-#![allow(dead_code)] // each test file uses a subset
+// Each test file uses a SUBSET of this module, including of its re-exports, so
+// both an unused item and an unused `pub use` are ordinary here.
+#![allow(dead_code, unused_imports)]
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -23,7 +25,7 @@ use shed_gx::discovery::{GxCredentialSource, GxDiscovery, GxToken, StaticCredent
 use shed_gx::testing::{FakeGx, DEFAULT_INSTANCE_ID, SENTINEL_TOKEN};
 use shed_gx::transport::{FixedDial, GxTransport};
 use shed_gx::{GxClient, GxTimings};
-use tokio::sync::mpsc::UnboundedReceiver;
+use tokio::sync::mpsc::Receiver;
 
 /// The dial counter lives in `shed_gx::testing` — the unit tests need it too —
 /// and is re-exported here so a test file names it the same way as everything
@@ -139,7 +141,7 @@ pub async fn subscribed(
     lane: &GxClient,
     id: &str,
     cursor: Option<String>,
-) -> (UnboundedReceiver<LaneEvent>, LaneStop) {
+) -> (Receiver<LaneEvent>, LaneStop) {
     lane.subscribe(id, cursor)
         .await
         .expect("subscribe never fails")
@@ -161,7 +163,7 @@ pub async fn drop_streams(fake: &FakeGx) {
 // ---------------------------------------------------------------------------
 
 /// The next frame, or a failure naming what was being waited for.
-pub async fn next_event(rx: &mut UnboundedReceiver<LaneEvent>, what: &str) -> LaneEvent {
+pub async fn next_event(rx: &mut Receiver<LaneEvent>, what: &str) -> LaneEvent {
     match tokio::time::timeout(DEADLINE, rx.recv()).await {
         Err(_) => panic!("timed out after {DEADLINE:?} waiting for {what}"),
         Ok(None) => panic!("the lane stream ENDED while waiting for {what}"),
@@ -174,7 +176,7 @@ pub async fn next_event(rx: &mut UnboundedReceiver<LaneEvent>, what: &str) -> La
 /// The four `until_*` waits below are this loop under four names — the names are
 /// what a call site reads, the loop is written once.
 pub async fn until_frame<F: FnMut(&LaneEvent) -> bool>(
-    rx: &mut UnboundedReceiver<LaneEvent>,
+    rx: &mut Receiver<LaneEvent>,
     what: &str,
     mut done: F,
 ) -> Vec<LaneEvent> {
@@ -190,15 +192,41 @@ pub async fn until_frame<F: FnMut(&LaneEvent) -> bool>(
 }
 
 /// Every frame up to and including the next `Ready` (or a terminal `Down`).
-pub async fn until_ready(rx: &mut UnboundedReceiver<LaneEvent>) -> Vec<LaneEvent> {
+pub async fn until_ready(rx: &mut Receiver<LaneEvent>) -> Vec<LaneEvent> {
     until_frame(rx, "the seed's Ready", |ev| {
         matches!(ev, LaneEvent::Ready { .. } | LaneEvent::Down { .. })
     })
     .await
 }
 
+/// Everything the adapter has ALREADY queued, without waiting for a frame that
+/// may never come.
+///
+/// The overflow tests need exactly this. A lagged generation is abandoned with
+/// no `Ready`, so [`until_ready`] would sit there until its deadline — and the
+/// assertion under test is about what the client is holding BEFORE it drains,
+/// which is a snapshot, not a wait.
+pub fn drain_now(rx: &mut Receiver<LaneEvent>) -> Vec<LaneEvent> {
+    let mut out = Vec::new();
+    while let Ok(ev) = rx.try_recv() {
+        out.push(ev);
+    }
+    out
+}
+
+/// Everything already queued, PLUS everything up to the next `Ready`.
+///
+/// After a lag the queue still holds the abandoned generation's frames, and a
+/// bare [`until_ready`] would read them as a seed that never finished. This is
+/// the shape a client actually sees: the leftovers, then the reseed's bracket.
+pub async fn drain_until_ready(rx: &mut Receiver<LaneEvent>) -> Vec<LaneEvent> {
+    let mut out = drain_now(rx);
+    out.extend(until_ready(rx).await);
+    out
+}
+
 /// Every frame up to and including the terminal `Down`.
-pub async fn until_down(rx: &mut UnboundedReceiver<LaneEvent>) -> Vec<LaneEvent> {
+pub async fn until_down(rx: &mut Receiver<LaneEvent>) -> Vec<LaneEvent> {
     until_frame(rx, "the terminal Down", |ev| {
         matches!(ev, LaneEvent::Down { .. })
     })
@@ -207,7 +235,7 @@ pub async fn until_down(rx: &mut UnboundedReceiver<LaneEvent>) -> Vec<LaneEvent>
 
 /// Every frame up to and including the one whose transcript text contains
 /// `sentinel` — "everything the adapter had to say, in order, up to here".
-pub async fn until_text(rx: &mut UnboundedReceiver<LaneEvent>, sentinel: &str) -> Vec<LaneEvent> {
+pub async fn until_text(rx: &mut Receiver<LaneEvent>, sentinel: &str) -> Vec<LaneEvent> {
     until_frame(rx, &format!("the sentinel row {sentinel:?}"), |ev| {
         text_of(ev).is_some_and(|t| t.contains(sentinel))
     })
@@ -215,7 +243,7 @@ pub async fn until_text(rx: &mut UnboundedReceiver<LaneEvent>, sentinel: &str) -
 }
 
 /// Every frame up to and including the first `Approval` for `id`.
-pub async fn until_approval(rx: &mut UnboundedReceiver<LaneEvent>, id: &str) -> Vec<LaneEvent> {
+pub async fn until_approval(rx: &mut Receiver<LaneEvent>, id: &str) -> Vec<LaneEvent> {
     until_frame(
         rx,
         &format!("an Approval frame for {id}"),
@@ -326,6 +354,13 @@ pub fn shape(events: &[LaneEvent]) -> Vec<&'static str> {
             LaneEvent::Unknown => "unknown",
         })
         .collect()
+}
+
+/// The first 8 labels from [`shape`] — enough for a failure message to show
+/// the order without dumping a whole abandoned/staged generation into it.
+pub fn shape_head(events: &[LaneEvent]) -> Vec<&'static str> {
+    let full = shape(events);
+    full[..8.min(full.len())].to_vec()
 }
 
 // ---------------------------------------------------------------------------

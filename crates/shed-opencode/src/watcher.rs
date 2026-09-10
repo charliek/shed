@@ -10,7 +10,7 @@
 //! 1. Emit [`LaneEvent::Reset`] and [`OpencodeFold::reset`]. The reason is
 //!    `"seed"` on the first connect (`"cursor_unresolvable"` when the caller
 //!    supplied a cursor this adapter cannot honor — `history_cursor: false`),
-//!    then `"reconnect"`, `"stall"` or `"overflow"` by cause.
+//!    then `"reconnect"`, `"stall"`, `"overflow"` or `"lagged"` by cause.
 //! 2. **Open `GET /event?directory=` FIRST** and wait for `server.connected`,
 //!    buffering every later frame into a bounded inbox
 //!    ([`MAX_INBOX_ITEMS`] / [`MAX_INBOX_BYTES`]).
@@ -56,6 +56,17 @@
 //! after a crate-local jittered backoff ([`OC_BACKOFF_BASE`] →
 //! [`OC_BACKOFF_MAX`], reset once a generation reaches its `Ready`).
 //!
+//! **A client that stops reading ends one too.** The frame channel is bounded
+//! ([`shed_core::lane::LANE_CHANNEL_CAPACITY`]), a full one drops the frame, and
+//! every emitting helper here propagates that as [`GenEnd::Lagged`] — so the
+//! generation ends at the FIRST dropped frame, in steady state, mid-seed, or
+//! mid-reseed. The run loop then waits for the client to drain (holding no
+//! stream: this generation already dropped it), takes the ordinary failure
+//! backoff, and reseeds as `"lagged"`. **`"overflow"` and `"lagged"` are
+//! different overflows and both names stay:** `"overflow"` is THIS crate's inbox
+//! (frames it had not folded yet), `"lagged"` is the client's channel (frames it
+//! had published).
+//!
 //! The backoff is crate-local on purpose: `shed_app::backoff` is `pub(crate)`
 //! and unreachable from here, and its 30 s ceiling is wrong for a feed that is a
 //! loopback socket away.
@@ -72,9 +83,10 @@ use std::time::Duration;
 use futures_util::{Stream, StreamExt as _};
 use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
-use shed_core::lane::{LaneApproval, LaneEvent, LaneSession, LaneStop, LaneSubscription};
+use shed_core::lane::{
+    LaneApproval, LaneEvent, LanePublisher, LaneSession, LaneStop, LaneSubscription, Publish,
+};
 use shed_core::sse::SseParser;
-use tokio::sync::mpsc;
 
 use crate::client::{
     lane_session, OpencodeClient, RestMessage, RestPermission, RestQuestion, RestSession,
@@ -141,7 +153,7 @@ pub(crate) fn spawn(
     directory: String,
     cursor: Option<String>,
 ) -> LaneSubscription {
-    let (tx, rx) = mpsc::unbounded_channel();
+    let (tx, rx) = LanePublisher::channel();
     let watcher = Watcher {
         client,
         root: root.clone(),
@@ -172,7 +184,7 @@ struct Watcher {
     /// `/event`, `/session/status`, `/permission` and `/question` are
     /// instance-scoped and answer for the wrong workspace without it.
     directory: String,
-    tx: mpsc::UnboundedSender<LaneEvent>,
+    tx: LanePublisher,
     fold: OpencodeFold,
     /// One ring for the life of the subscription — see [`crate::ring`] for why
     /// `seq` outlives the fold's per-generation reset.
@@ -208,6 +220,7 @@ enum Emit {
 }
 
 /// How a generation ended.
+#[derive(Debug)]
 enum GenEnd {
     /// Terminal: emit [`LaneEvent::Down`] with this reason and stop.
     Down(String),
@@ -220,7 +233,24 @@ enum GenEnd {
         worked: bool,
         detail: String,
     },
+    /// The CLIENT stopped reading and a frame was dropped
+    /// ([`shed_core::lane::Publish::Lagged`]). Its own variant rather than a
+    /// [`GenEnd::Retry`] because the run loop owes it two things a retry does
+    /// not: it waits for the client to drain before reseeding, and it does NOT
+    /// count towards "the agent is unreachable" — a slow consumer is not a dead
+    /// lane, and must never be spent as one.
+    Lagged,
 }
+
+/// The end a dropped frame produces. Named once so every emitting helper says
+/// the same thing.
+fn lagged() -> GenEnd {
+    GenEnd::Lagged
+}
+
+/// `Ok` while the client is keeping up; `Err(GenEnd::Lagged)` the instant a
+/// frame is dropped, which every caller propagates.
+type Emitted = Result<(), GenEnd>;
 
 impl Watcher {
     async fn run(mut self, cursor: Option<String>) {
@@ -241,11 +271,28 @@ impl Watcher {
                 return; // the subscription was dropped
             }
             self.generation += 1;
-            self.begin_generation(reason);
-            match self.run_generation(&mut ever_connected).await {
+            let end = match self.begin_generation(reason) {
+                Ok(()) => self.run_generation(&mut ever_connected).await,
+                Err(end) => end,
+            };
+            match end {
                 GenEnd::Down(r) => {
-                    self.emit(LaneEvent::Down { reason: r });
+                    self.tx.publish_final(LaneEvent::Down { reason: r }).await;
                     return;
+                }
+                // The generation already dropped its `/event` stream on the way
+                // out, so this wait holds no transport: a client that never
+                // drains stalls its own lane and nothing else. When it does
+                // drain, the backoff still runs before the reseed — a consumer
+                // taking one frame at a time must not become a seed-per-frame
+                // load on the agent.
+                GenEnd::Lagged => {
+                    if self.tx.wait_drained().await.is_err() {
+                        return; // the subscriber went away while we waited
+                    }
+                    backoff = next_backoff(backoff, false);
+                    tokio::time::sleep(jittered(backoff)).await;
+                    reason = "lagged";
                 }
                 GenEnd::Retry {
                     reason: next,
@@ -256,7 +303,9 @@ impl Watcher {
                         // The caller's FIRST connect never came up. Retrying
                         // silently would leave a client staring at a Reset that
                         // never resolves; `Down` is the honest answer.
-                        self.emit(LaneEvent::Down { reason: detail });
+                        self.tx
+                            .publish_final(LaneEvent::Down { reason: detail })
+                            .await;
                         return;
                     }
                     backoff = next_backoff(backoff, worked);
@@ -270,8 +319,8 @@ impl Watcher {
     /// Step 1 of every generation: the `Reset` frame, then the state it
     /// promises. The RING is deliberately NOT reset — `seq` is monotonic across
     /// resets within one subscription.
-    fn begin_generation(&mut self, reason: &str) {
-        self.emit(LaneEvent::Reset {
+    fn begin_generation(&mut self, reason: &str) -> Emitted {
+        let sent = self.emit(LaneEvent::Reset {
             reason: reason.to_string(),
             generation: self.generation,
         });
@@ -279,18 +328,30 @@ impl Watcher {
         self.emitted_approvals.clear();
         self.last_session = None;
         self.scope = HashSet::from([self.root.clone()]);
+        sent
     }
 
+    /// The generation, with the client-lag exit split out into the `Err` half so
+    /// every emitting helper can propagate it with `?` instead of each caller
+    /// remembering to check.
+    ///
+    /// `Ok` and `Err` are both ends; only the reason differs.
     async fn run_generation(&mut self, ever_connected: &mut bool) -> GenEnd {
+        match self.generation_body(ever_connected).await {
+            Ok(end) | Err(end) => end,
+        }
+    }
+
+    async fn generation_body(&mut self, ever_connected: &mut bool) -> Result<GenEnd, GenEnd> {
         // Step 2: the stream FIRST.
         let resp = match self.client.open_event_stream(&self.directory).await {
             Ok(r) => r,
             Err(e) => {
-                return GenEnd::Retry {
+                return Ok(GenEnd::Retry {
                     reason: "reconnect",
                     worked: false,
                     detail: e.to_string(),
-                }
+                })
             }
         };
         let mut stream = Box::pin(resp.bytes_stream());
@@ -308,14 +369,14 @@ impl Watcher {
                         if peek(&raw).typ == "server.connected" {
                             connected = true;
                         } else if !inbox.push(raw) {
-                            return retry_overflow();
+                            return Ok(retry_overflow());
                         }
                     }
                     if connected {
                         break;
                     }
                 }
-                other => return other.into_retry(false),
+                other => return Ok(other.into_retry(false)),
             }
         }
         *ever_connected = true;
@@ -337,11 +398,11 @@ impl Watcher {
                         Read::Frames(frames) => {
                             for raw in frames {
                                 if !inbox.push(raw) {
-                                    return retry_overflow();
+                                    return Ok(retry_overflow());
                                 }
                             }
                         }
-                        other => return other.into_retry(false),
+                        other => return Ok(other.into_retry(false)),
                     },
                 }
             }
@@ -350,17 +411,17 @@ impl Watcher {
             Ok(s) => s,
             // The one 404 that ends a subscription: the session is gone.
             Err(shed_core::lane::LaneError::UnknownSession) => {
-                return GenEnd::Down("unknown_session".to_string())
+                return Ok(GenEnd::Down("unknown_session".to_string()))
             }
             Err(e) => {
-                return GenEnd::Retry {
+                return Ok(GenEnd::Retry {
                     reason: "reconnect",
                     worked: false,
                     detail: e.to_string(),
-                }
+                })
             }
         };
-        self.apply_seed(seed);
+        self.apply_seed(seed)?;
 
         // Step 4: the frames that arrived while the seed ran, in order. Their
         // TRANSCRIPT rows emit as they fold (messages come first in the pinned
@@ -369,36 +430,36 @@ impl Watcher {
         // `Session` — and emission is deduplicated, so step 5 could not repair
         // it.
         for raw in inbox.take() {
-            self.apply_frame(&raw, Emit::Defer);
+            self.apply_frame(&raw, Emit::Defer)?;
         }
 
         // Step 5: the seed's closing frames. Session first, then approvals —
         // the order `shed_core::lane`'s module doc pins — then `Ready`.
-        self.emit_session();
-        self.emit_approvals();
+        self.emit_session()?;
+        self.emit_approvals()?;
         self.emit(LaneEvent::Ready {
             generation: self.generation,
-        });
+        })?;
 
         // Steady state.
         loop {
             if self.tx.is_closed() {
-                return GenEnd::Down("closed".to_string());
+                return Ok(GenEnd::Down("closed".to_string()));
             }
             match read_step(&mut stream, &mut parser).await {
                 Read::Frames(frames) => {
                     for raw in frames {
-                        self.apply_frame(&raw, Emit::Now);
+                        self.apply_frame(&raw, Emit::Now)?;
                     }
                 }
-                other => return other.into_retry(true),
+                other => return Ok(other.into_retry(true)),
             }
         }
     }
 
     // ---- applying ----
 
-    fn apply_seed(&mut self, seed: Seed) {
+    fn apply_seed(&mut self, seed: Seed) -> Emitted {
         self.scope = seed.scope;
         // The root is the scope's floor whatever `/children` said.
         self.scope.insert(self.root.clone());
@@ -407,7 +468,11 @@ impl Watcher {
         for raw in seed_message_envelopes(&self.root, &seed.messages) {
             self.fold.apply_line(&raw);
         }
-        self.drain_rows(true);
+        // A seed BIGGER than the client channel lags right here, and the
+        // generation ends without a `Ready` — deliberately, because a staged
+        // generation with no `Ready` is a client stuck on its previous view
+        // with nothing to swap in.
+        self.drain_rows(true)?;
 
         // The REST status is a FALLBACK: it establishes the boundary only if no
         // live `session.status`/`session.idle` has been folded. A live one
@@ -424,7 +489,7 @@ impl Watcher {
             self.fold.apply_line(&raw);
             // A descendant's approval updates approval state but contributes
             // nothing to the ROOT's transcript.
-            self.drain_rows(session_id == self.root);
+            self.drain_rows(session_id == self.root)?;
         }
         // Retire anything the fold still holds open that the server no longer
         // lists. On a freshly-reset fold this retires nothing; it is here
@@ -434,14 +499,14 @@ impl Watcher {
             approvals.permission_ids.as_deref(),
             approvals.question_ids.as_deref(),
         );
-        self.drain_rows(true);
+        self.drain_rows(true)
     }
 
     /// One live frame: scope it, fold it, emit what it changed.
     ///
     /// `emit` is [`Emit::Defer`] for the seed's buffered replay (step 4) and
     /// [`Emit::Now`] in steady state. See [`Emit`].
-    fn apply_frame(&mut self, raw: &[u8], emit: Emit) {
+    fn apply_frame(&mut self, raw: &[u8], emit: Emit) -> Emitted {
         let pk = peek(raw);
 
         // `session.created` carries no `sessionID` — the new session's id is in
@@ -455,41 +520,51 @@ impl Watcher {
             {
                 self.scope.insert(info.id.clone());
             }
-            return;
+            return Ok(());
         }
 
         let sid = &pk.properties.session_id;
         // Empty id: liveness only. `read_step` already counted the bytes.
         if sid.is_empty() {
-            return;
+            return Ok(());
         }
         let is_root = *sid == self.root;
         if !is_root && !(self.scope.contains(sid) && is_approval_type(&pk.typ)) {
-            return; // a sibling root, or a child's conversation
+            return Ok(()); // a sibling root, or a child's conversation
         }
 
         self.fold.apply_line(raw);
-        self.drain_rows(is_root);
+        self.drain_rows(is_root)?;
         if emit == Emit::Now {
-            self.emit_approvals();
-            self.emit_session();
+            self.emit_approvals()?;
+            self.emit_session()?;
         }
+        Ok(())
     }
 
     // ---- emitting ----
 
-    fn emit(&self, ev: LaneEvent) {
-        // A closed receiver means the subscription is gone; the run loop
-        // notices at its next check.
-        let _ = self.tx.send(ev);
+    /// Publish one frame, and hand the caller the ONE outcome it must not
+    /// absorb.
+    ///
+    /// A CLOSED receiver stays what it always was — the subscription is gone and
+    /// the run loop notices at its next check, so there is nothing to unwind. A
+    /// LAGGED one is different in kind: the frame was dropped, the client cannot
+    /// tell, and every caller ends the generation on it (`shed_core::lane`'s
+    /// module doc, correction 13).
+    fn emit(&self, ev: LaneEvent) -> Emitted {
+        match self.tx.publish(ev) {
+            Publish::Sent | Publish::Closed => Ok(()),
+            Publish::Lagged => Err(lagged()),
+        }
     }
 
     /// Takes the fold's queued rows and either emits them (through the ring,
     /// which assigns `seq`) or discards them.
-    fn drain_rows(&mut self, emit: bool) {
+    fn drain_rows(&mut self, emit: bool) -> Emitted {
         let rows = self.fold.drain_messages();
         if !emit {
-            return;
+            return Ok(());
         }
         let now = now_utc().timestamp_millis();
         for row in rows {
@@ -497,14 +572,15 @@ impl Watcher {
             self.emit(LaneEvent::Message {
                 message,
                 cursor: None,
-            });
+            })?;
         }
+        Ok(())
     }
 
     /// Emits an [`LaneEvent::Approval`] for every approval whose DTO changed,
     /// including one that just resolved (which leaves the fold's pending
     /// snapshot and is re-read from the fold by kind + id).
-    fn emit_approvals(&mut self) {
+    fn emit_approvals(&mut self) -> Emitted {
         let pending = self.fold.pending_approvals();
         let mut now: HashMap<(String, String), LaneApproval> = HashMap::new();
         for a in pending {
@@ -535,19 +611,28 @@ impl Watcher {
         // Deterministic order: two approvals resolving in one frame must not
         // reach a client in hash order.
         changed.sort_by(|a, b| (a.kind.as_str(), &a.id).cmp(&(b.kind.as_str(), &b.id)));
+        let mut sent = Ok(());
         for a in changed {
             self.emitted_approvals
                 .insert((a.kind.as_str().to_string(), a.id.clone()), a.clone());
-            self.emit(LaneEvent::Approval { approval: a });
+            sent = self.emit(LaneEvent::Approval { approval: a });
+            if sent.is_err() {
+                break;
+            }
         }
         // Drop the resolved entries so a later re-ask of the same id is seen as
-        // a change again.
+        // a change again. Done even on a lagged exit: this generation is over
+        // either way, and the next one clears the map wholesale.
         self.emitted_approvals.retain(|k, _| now.contains_key(k));
+        sent
     }
 
     /// Emits [`LaneEvent::Session`] when the row actually changed. `approximate`
-    /// is FALSE here: this row comes from the live fold, not a poll.
-    fn emit_session(&mut self) {
+    /// is FALSE here, and that is not an oversight: this row's activity comes
+    /// from the live fold, not from the `/session/status` poll the roster rows
+    /// ([`crate::OpencodeClient`]'s `sessions`/`session`) are built from, which
+    /// report `true`. The flag is per-ROW — `shed_core::lane`'s correction 7.
+    fn emit_session(&mut self) -> Emitted {
         let base = self.session_row.clone().unwrap_or_default();
         let mut row = lane_session(
             &base,
@@ -559,10 +644,10 @@ impl Watcher {
         // an empty id — the id is contract, so it is asserted here.
         row.id = self.root.clone();
         if self.last_session.as_ref() == Some(&row) {
-            return;
+            return Ok(());
         }
         self.last_session = Some(row.clone());
-        self.emit(LaneEvent::Session { session: row });
+        self.emit(LaneEvent::Session { session: row })
     }
 }
 
@@ -1063,16 +1148,45 @@ mod tests {
                 assert_eq!(reason, "stall");
                 assert!(worked, "a generation that reached Ready resets the backoff");
             }
-            GenEnd::Down(_) => panic!("a stall reconnects, it does not end the subscription"),
+            other => panic!("a stall reconnects, it does not end the subscription: {other:?}"),
         }
         match Read::Eof.into_retry(false) {
             GenEnd::Retry { reason, .. } => assert_eq!(reason, "reconnect"),
-            GenEnd::Down(_) => panic!("an EOF reconnects"),
+            other => panic!("an EOF reconnects, not {other:?}"),
         }
         match retry_overflow() {
             GenEnd::Retry { reason, .. } => assert_eq!(reason, "overflow"),
-            GenEnd::Down(_) => panic!("an overflow reconnects"),
+            other => panic!("an overflow reconnects, it is not {other:?}"),
         }
+    }
+
+    /// The INBOX overflow and the CLIENT lag are different ends with different
+    /// names, and neither may be spelled as the other: `"overflow"` says this
+    /// crate lost frames it had not folded, `"lagged"` says the client lost
+    /// frames it had been sent.
+    #[test]
+    fn a_dropped_frame_ends_the_generation_as_lagged_not_as_overflow() {
+        assert!(matches!(lagged(), GenEnd::Lagged));
+        let (tx, rx) = LanePublisher::channel();
+        let w = offline_watcher(tx);
+        for generation in 0..shed_core::lane::LANE_CHANNEL_CAPACITY as u64 {
+            w.emit(LaneEvent::Ready { generation })
+                .expect("everything inside the bound is published");
+        }
+        assert!(
+            matches!(
+                w.emit(LaneEvent::Ready { generation: 9_999 }),
+                Err(GenEnd::Lagged)
+            ),
+            "the frame past the bound ends the generation"
+        );
+        // A CLOSED receiver is the other half of the rule: it is NOT a lag, and
+        // the run loop's own `is_closed` check is what ends the subscription.
+        drop(rx);
+        assert!(
+            w.emit(LaneEvent::Ready { generation: 1 }).is_ok(),
+            "a closed channel is not a lag"
+        );
     }
 
     /// An SSE event past the frame cap is a read ERROR, not a giant frame: the
@@ -1094,7 +1208,7 @@ mod tests {
 
     /// A watcher wired to a client that will never be called — every step this
     /// test drives is pure.
-    fn offline_watcher(tx: mpsc::UnboundedSender<LaneEvent>) -> Watcher {
+    fn offline_watcher(tx: LanePublisher) -> Watcher {
         Watcher {
             client: OpencodeClient::new("http://127.0.0.1:1/".parse().expect("a base url"), None)
                 .expect("the client builds"),
@@ -1160,21 +1274,25 @@ mod tests {
     /// step 1, step 3, step 4's replay, step 5's closing sequence.
     #[test]
     fn a_frame_replayed_during_the_seed_never_jumps_ahead_of_the_session_row() {
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = LanePublisher::channel();
         let mut w = offline_watcher(tx);
 
-        w.begin_generation("seed");
-        w.apply_seed(seed_with_a_pending_permission());
+        w.begin_generation("seed")
+            .expect("an empty channel takes the Reset");
+        w.apply_seed(seed_with_a_pending_permission())
+            .expect("the seed fits");
         // Step 4: a root `session.status` that landed in the inbox while the
         // REST seed was in flight.
         w.apply_frame(
             br#"{"type":"session.status","properties":{"sessionID":"ses_a","status":{"type":"busy"}}}"#,
             Emit::Defer,
-        );
+        )
+        .expect("the replay fits");
         // Step 5.
-        w.emit_session();
-        w.emit_approvals();
-        w.emit(LaneEvent::Ready { generation: 1 });
+        w.emit_session().expect("the session row fits");
+        w.emit_approvals().expect("the approval fits");
+        w.emit(LaneEvent::Ready { generation: 1 })
+            .expect("the Ready fits");
 
         let mut kinds: Vec<&str> = Vec::new();
         while let Ok(ev) = rx.try_recv() {
@@ -1204,20 +1322,23 @@ mod tests {
     /// order to protect, and a frame's effects reach the client as it lands.
     #[test]
     fn a_frame_applied_in_steady_state_emits_its_effects_immediately() {
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = LanePublisher::channel();
         let mut w = offline_watcher(tx);
-        w.begin_generation("seed");
-        w.apply_seed(seed_with_a_pending_permission());
+        w.begin_generation("seed")
+            .expect("an empty channel takes the Reset");
+        w.apply_seed(seed_with_a_pending_permission())
+            .expect("the seed fits");
         // Drain the seed's own frames, then emit the closing sequence so the
         // dedup state matches a live subscription's.
-        w.emit_session();
-        w.emit_approvals();
+        w.emit_session().expect("the session row fits");
+        w.emit_approvals().expect("the approval fits");
         while rx.try_recv().is_ok() {}
 
         w.apply_frame(
             br#"{"type":"permission.replied","properties":{"sessionID":"ses_a","requestID":"per_1","reply":"once"}}"#,
             Emit::Now,
-        );
+        )
+        .expect("the reply fits");
         let mut kinds: Vec<&str> = Vec::new();
         while let Ok(ev) = rx.try_recv() {
             kinds.push(kind_of(&ev));
