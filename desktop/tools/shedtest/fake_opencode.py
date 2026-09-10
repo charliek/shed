@@ -72,6 +72,11 @@ _TICK = 0.02
 #: really closed the stream" would hang on a number that can no longer move.
 _PING_EVERY = 5
 
+#: How long a parked seed GET waits on `release_seed()` before giving up. Long
+#: enough that no real test hits it; short enough that a leaked `hold_seed()`
+#: fails fast instead of hanging a suite.
+_SEED_TIMEOUT = 5.0
+
 
 def _epoch_ms(offset: int = 0) -> int:
     """A fixed epoch-millis base, so a fold's timestamps are deterministic."""
@@ -119,6 +124,11 @@ class FakeOpencode:
         #: GET status overrides keyed by route suffix.
         self.get_status: dict[str, int] = {}
 
+        #: Parks the messages-seed GET (`/session/{id}/message`) until
+        #: `release_seed()` — set (open) by default.
+        self._seed_gate = threading.Event()
+        self._seed_gate.set()
+
         outer = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -152,6 +162,20 @@ class FakeOpencode:
                     return self._json(override, '{"message":"injected failure"}')
                 if path == "/event":
                     return self._event(directory)
+                if outer._is_seed_route(path):
+                    # Parked OUTSIDE the lock: `release_seed()` (called from the
+                    # control port's own thread) needs the lock to set the
+                    # event, and a wait held under it would deadlock the two.
+                    #
+                    # A timed-out wait must FAIL the read, not fall through and
+                    # serve the seed anyway: a test that parks the seed and then
+                    # forgets to release it would otherwise get an ordinary 200
+                    # five seconds late and pass, which is exactly the vacuous
+                    # green this barrier exists to prevent.
+                    if not outer._seed_gate.wait(_SEED_TIMEOUT):
+                        return self._json(504, json.dumps({
+                            "message": "the seed route was parked by hold_seed"
+                                       " and never released"}))
                 status, body = outer._serve_get(path, directory)
                 return self._json(status, body)
 
@@ -523,6 +547,25 @@ class FakeOpencode:
     def fail_get(self, suffix: str, status: int) -> None:
         with self._lock:
             self.get_status[suffix] = status
+
+    # -- the seed barrier ----------------------------------------------------
+
+    def hold_seed(self) -> None:
+        """Park the messages-seed GET (`/session/{id}/message`) until
+        `release_seed()`. Makes "no partial transcript before the seed read
+        completes" an assertion a cell can make, rather than a timing hope."""
+        self._seed_gate.clear()
+
+    def release_seed(self) -> None:
+        """Let every GET parked by `hold_seed()` proceed."""
+        self._seed_gate.set()
+
+    @staticmethod
+    def _is_seed_route(path: str) -> bool:
+        if not path.startswith("/session/"):
+            return False
+        _, _, tail = path[len("/session/"):].partition("/")
+        return tail == "message"
 
     # -- reading back ------------------------------------------------------
 

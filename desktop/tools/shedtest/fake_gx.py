@@ -57,6 +57,11 @@ FAKE_VERSION = "1.0.16+gx.12"
 #: A latency bound on delivery, never a test's timing assumption.
 _TICK = 0.02
 
+#: How long a parked seed GET waits on `release_seed()` before giving up. Long
+#: enough that no real test hits it; short enough that a leaked `hold_seed()`
+#: (a test that forgot to release) fails fast instead of hanging a suite.
+_SEED_TIMEOUT = 5.0
+
 #: How many recent update envelopes one session's ring holds. gx's own is 2,000.
 DEFAULT_RING_CAP = 2000
 
@@ -365,6 +370,13 @@ class FakeGx:
         self.violations: list[str] = []
         self._next_id = 0
 
+        #: Parks the history-seed GET (`/v1/sessions/{id}/history`) until
+        #: `release_seed()` is called — set (open) by default. Lets a cell make
+        #: "no partial view before Ready" an observed fact rather than an
+        #: assumption about scheduling.
+        self._seed_gate = threading.Event()
+        self._seed_gate.set()
+
         outer = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -403,6 +415,20 @@ class FakeGx:
                 _had, ok = self._record("GET", path, split.query, "")
                 if path.endswith("/events"):
                     return self._events(path, ok)
+                if outer._is_seed_route(path):
+                    # Parked OUTSIDE the lock: `release_seed()` (called from the
+                    # control port's own thread) needs the lock to set the
+                    # event, and a wait held under it would deadlock the two.
+                    #
+                    # A timed-out wait must FAIL the read, not fall through and
+                    # serve the seed anyway: a test that parks the seed and then
+                    # forgets to release it would otherwise get an ordinary 200
+                    # five seconds late and pass, which is exactly the vacuous
+                    # green this barrier exists to prevent.
+                    if not outer._seed_gate.wait(_SEED_TIMEOUT):
+                        return self._json(*_error(
+                            504, "seed_timeout",
+                            "the seed route was parked by hold_seed and never released"))
                 with outer._lock:
                     status, body = outer._route("GET", path, split.query, "", ok)
                 return self._json(status, body)
@@ -852,6 +878,26 @@ class FakeGx:
     def clear_requests(self) -> None:
         with self._lock:
             self._requests.clear()
+
+    # -- the seed barrier ----------------------------------------------------
+
+    def hold_seed(self) -> None:
+        """Park the history-seed GET (`/v1/sessions/{id}/history`) until
+        `release_seed()`. Makes "a client shows no partial transcript before
+        its seed read completes" an assertion a cell can make, rather than a
+        timing hope."""
+        self._seed_gate.clear()
+
+    def release_seed(self) -> None:
+        """Let every GET parked by `hold_seed()` proceed."""
+        self._seed_gate.set()
+
+    @staticmethod
+    def _is_seed_route(path: str) -> bool:
+        if not path.startswith("/v1/sessions/"):
+            return False
+        parts = [p for p in path[len("/v1/sessions/"):].split("/") if p]
+        return len(parts) == 2 and parts[1] == "history"
 
     # -- internals: the gates ----------------------------------------------
 
