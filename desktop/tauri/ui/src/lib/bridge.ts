@@ -547,7 +547,12 @@ export async function openTerminal(shed: string, host: string, session?: string)
 
 /** The fields a new machine needs — exactly `shed_core::config::MachineEntry`.
  *  Everything but `name` is optional and falls back to the config reader's own
- *  defaults, so adding `mini3` really is one field. */
+ *  defaults, so adding `mini3` really is one field.
+ *
+ *  `rc_bin` is still on the wire (`machine.add` accepts it, and a hand-written
+ *  config entry that sets it is still honoured) but the New Machine dialog no
+ *  longer asks for it: it named a path to `sx`, which was sunset, unreleased,
+ *  in plan 016. */
 export type NewMachine = {
   name: string;
   host?: string;
