@@ -1190,6 +1190,73 @@ shed ssh-config --all --install       # Apply changes
 shed ssh-config --uninstall           # Remove managed block
 ```
 
+## Roost Integration
+
+### shed roost-provider
+
+Implements [roost's](https://github.com/charliek/roost) provider contract so
+roost's own command palette can start an agent — `claude`, `codex`, `cursor`,
+`opencode`, `gx`, or `grok` — on a running shed or a `machines:` entry in
+`~/.shed/config.yaml`, opened as a tab in that host's own `roost-session`. See
+`docs/extensions/roost-provider.md` for the full walkthrough; this is the
+reference for the flags and phases.
+
+```bash
+shed roost-provider [list|activate] [flags]
+```
+
+roost invokes the `list` and `activate` phases itself — through the launcher
+`--install` writes — so these are not commands a person types day to day.
+`list` prints the top-level menu (running sheds and `machines:` entries) with
+no ssh, staying inside roost's 5-second default provider timeout. `activate`
+acts on `$ROOST_SELECTED_ID` (or the same key on roost's stdin JSON): probing
+the chosen host, then walking agent selection, workdir selection, and opening
+a tab — each step is a fresh `activate` call, since roost re-execs the
+provider per drill-down.
+
+| Flag | Short | Default | Description |
+|------|-------|---------|-------------|
+| `--install` | | `false` | Write the provider launcher script |
+| `--dry-run` | | `false` | Preview `--install`/`--uninstall` without writing |
+| `--uninstall` | | `false` | Remove the launcher (only if shed wrote it) |
+
+`--install` writes `<dir>/providers/shed`, mode `0755`, where `<dir>` is the
+parent directory of a non-empty `$ROOST_CONFIG` (a file path), else
+`$HOME/.config/roost` — roost does not consult `$XDG_CONFIG_HOME`, so this
+does not either. The launcher pins the running `shed` binary's resolved
+absolute path; re-run `--install` whenever that binary moves (a Homebrew
+upgrade, a rebuild elsewhere). The write is atomic (a temporary file in the
+same directory, renamed into place), so an interrupted install never leaves a
+half-written launcher behind.
+
+`--uninstall` only ever removes a launcher carrying shed's own header comment —
+a file at that path shed did not write is left alone, and `--install` refuses
+to overwrite one for the same reason. Both refuse outright, without reading or
+writing anything, if `providers/shed` is a **symlink** or is not a regular
+file: shed never writes a symlink there, so one is always somebody else's, and
+following it would land the write on whatever it points at. A `$ROOST_CONFIG`
+that names a directory, or that sits at the filesystem root, is refused for the
+same reason — neither describes a roost config file.
+
+**Timeouts.** Both phases run inside roost's own provider timeout, which
+defaults to 5 seconds and which roost enforces by killing the provider, so
+shed's internal budget for each phase is 4 seconds — under roost's, with room
+to print. If you raised `timeout=` for this provider in roost's config form
+(for a slow link, or a far side that takes its time), raise shed's to match
+with `SHED_ROOST_PROVIDER_TIMEOUT`, a Go duration:
+
+| Variable | Default | Effect |
+|---|---|---|
+| `SHED_ROOST_PROVIDER_TIMEOUT` | `4s` | Internal budget for a `list` or `activate` phase. Must stay below roost's own `timeout=` for the provider, or roost kills the phase before it can answer. An unparseable or non-positive value is ignored, with a note on stderr. |
+
+**Examples:**
+
+```bash
+shed roost-provider --install              # Write the launcher
+shed roost-provider --install --dry-run    # Preview without writing
+shed roost-provider --uninstall            # Remove it
+```
+
 ## Server Commands
 
 These commands are part of `shed-server`, the server daemon binary.

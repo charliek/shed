@@ -352,6 +352,19 @@ func (r *rig) writeReplies(dir string, protocol int, projects []Project) {
 	mustWrite(t, filepath.Join(dir, "event.ndjson"), compactLine(t, event), 0o644)
 }
 
+// replaceReply overwrites the NDJSON the fake bridge answers one op with
+// (`identify`, `tablist`, `tabopen` — writeReplies' own file names).
+//
+// For the replies a fixture cannot express: a well-formed envelope whose
+// `result` is empty. That shape has to come from a literal, because every
+// vendored vector is by construction a WELL-FORMED answer, and the thing under
+// test is what this side does with an answer that is structurally valid and
+// semantically nothing.
+func (r *rig) replaceReply(op, line string) {
+	r.t.Helper()
+	mustWrite(r.t, filepath.Join(filepath.Dir(r.requests), "reply."+op+".ndjson"), line+"\n", 0o644)
+}
+
 // requestLines returns every request line the fake bridge recorded, in order.
 func (r *rig) requestLines() []string {
 	r.t.Helper()

@@ -673,10 +673,20 @@ func (r *Remote) call(ctx context.Context, t Target, op string, params any, out 
 
 // Identify runs `session.identify` and applies the protocol gate (pin P6:
 // a mismatch is reported, never repaired).
+//
+// A MISSING protocol is checked before the gate, and is a different answer
+// from a mismatched one: a reply of `result:{}` decodes to 0, and 0 is not a
+// protocol any roost has ever spoken — reporting it as a mismatch would print
+// "speaks protocol 0; this shed speaks 4" and send the user off to upgrade
+// something. That is malformed far-side output, which §3.2 makes a provider
+// failure rather than a row (see MalformedReplyError).
 func (r *Remote) Identify(ctx context.Context, t Target) (IdentifyResult, error) {
 	var res IdentifyResult
 	if err := r.call(ctx, t, opSessionIdentify, emptyParams{}, &res); err != nil {
 		return IdentifyResult{}, err
+	}
+	if res.SessionProtocol == 0 {
+		return IdentifyResult{}, &MalformedReplyError{Op: opSessionIdentify, Reason: "no session_protocol"}
 	}
 	if res.SessionProtocol != SpokenProtocol {
 		return res, &ProtocolMismatchError{Spoken: res.SessionProtocol}
@@ -696,10 +706,19 @@ func (r *Remote) TabList(ctx context.Context, t Target) ([]Project, error) {
 
 // TabOpen runs `tab.open` and returns the new tab's id for the confirmation
 // line.
+//
+// The id is REQUIRED. An `ok:true` answer of `result:{}` is structurally valid
+// JSON and semantically nothing: without this check it printed `opened tab  on
+// <host>` and exited zero — a success sentence, with a hole in it, for a tab
+// this side has no evidence exists. Malformed far-side output is a provider
+// failure (see MalformedReplyError), not a row and certainly not a success.
 func (r *Remote) TabOpen(ctx context.Context, t Target, params TabOpenParams) (string, error) {
 	var res TabOpenResult
 	if err := r.call(ctx, t, opTabOpen, params, &res); err != nil {
 		return "", err
+	}
+	if res.Tab.ID == "" {
+		return "", &MalformedReplyError{Op: opTabOpen, Reason: "no tab id"}
 	}
 	return res.Tab.ID, nil
 }

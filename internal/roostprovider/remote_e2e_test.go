@@ -608,3 +608,82 @@ func TestPromptnessWithRealSSH(t *testing.T) {
 		_ = exec.Command(sshBin, "-o", "ControlPath="+ctlPath, "-O", "exit", target.Dest).Run()
 	})
 }
+
+// TestEmptyResultIsAProviderFailure covers the two replies that are valid JSON
+// and not answers: `{"ok":true,"result":{}}` to `session.identify` and to
+// `tab.open`.
+//
+// Both used to be ACCEPTED. An empty identify decoded to `session_protocol: 0`
+// and became a mismatch row claiming the far side "speaks protocol 0" — a
+// number no roost has ever spoken, under a subtitle telling the user to
+// upgrade whichever side is older. An empty tab.open decoded to an empty id and
+// printed `opened tab  on <host>` with exit 0 — a success line for a tab
+// nothing proved exists. §3.2 makes malformed far-side output the one case that
+// is a PROVIDER FAILURE rather than a row, and that is what both must be now:
+// a MalformedReplyError, and RowForError declining to make a row of it.
+func TestEmptyResultIsAProviderFailure(t *testing.T) {
+	host := Token{Shed: "dev", Server: "my-server"}
+
+	assertMalformed := func(t *testing.T, op string, err error) {
+		t.Helper()
+		var malformed *MalformedReplyError
+		if !errors.As(err, &malformed) {
+			t.Fatalf("err = %v (%T), want a MalformedReplyError", err, err)
+		}
+		if malformed.Op != op {
+			t.Errorf("op = %q, want %q", malformed.Op, op)
+		}
+		if row, ok := RowForError(host, err); ok {
+			t.Errorf("malformed far-side output became a row: %+v", row)
+		}
+	}
+
+	t.Run("session.identify without a session_protocol", func(t *testing.T) {
+		r := newRig(t, rigOpts{})
+		r.replaceReply("identify", `{"id":"1","ok":true,"result":{}}`)
+
+		_, err := r.remote.Identify(e2eContext(t), r.target())
+		assertMalformed(t, "session.identify", err)
+
+		// The specific wrong answer this replaced: a protocol-0 mismatch.
+		var mismatch *ProtocolMismatchError
+		if errors.As(err, &mismatch) {
+			t.Errorf("an empty identify became a protocol-%d mismatch", mismatch.Spoken)
+		}
+	})
+
+	t.Run("tab.open without a tab id", func(t *testing.T) {
+		r := newRig(t, rigOpts{})
+		r.replaceReply("tabopen", `{"id":"1","ok":true,"result":{}}`)
+
+		params, err := TabOpenFor(Token{
+			Machine: "mini2", Agent: "codex", Home: "/home/shed", Cwd: "/home/shed",
+		})
+		if err != nil {
+			t.Fatalf("TabOpenFor: %v", err)
+		}
+		id, err := r.remote.TabOpen(e2eContext(t), r.target(), params)
+		assertMalformed(t, "tab.open", err)
+		if id != "" {
+			t.Errorf("tab id = %q, want the empty string alongside the error", id)
+		}
+	})
+
+	// The control for both: the rig's ordinary (vendored) replies still pass
+	// the new checks, so this is a rejection of empty results and not of
+	// results.
+	t.Run("roost's own replies still pass", func(t *testing.T) {
+		r := newRig(t, rigOpts{})
+		ctx := e2eContext(t)
+		if _, err := r.remote.Identify(ctx, r.target()); err != nil {
+			t.Errorf("Identify against roost's own vector: %v", err)
+		}
+		params, err := TabOpenFor(Token{Machine: "mini2", Agent: "codex", Cwd: "/home/shed"})
+		if err != nil {
+			t.Fatalf("TabOpenFor: %v", err)
+		}
+		if _, err := r.remote.TabOpen(ctx, r.target(), params); err != nil {
+			t.Errorf("TabOpen against roost's own vector: %v", err)
+		}
+	})
+}

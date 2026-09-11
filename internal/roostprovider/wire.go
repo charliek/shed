@@ -194,10 +194,45 @@ func (r *wireResponse) result() (json.RawMessage, error) {
 	return nil, fmt.Errorf("ok=false with no error body (internal)")
 }
 
+// MalformedReplyError is an `ok:true` answer whose SHAPE parsed and whose
+// CONTENTS are not an answer: `result:{}` where a tab id or a protocol number
+// was required.
+//
+// Its own type, and deliberately neither a ReachError nor a
+// ProtocolMismatchError, because it must not become a row. §3.2 pins six
+// non-actionable rows, every one of which claims something about the far side;
+// malformed far-side output is the one case §3.2 calls a PROVIDER FAILURE
+// instead, precisely because this side did not learn any of those things.
+// RowForError returns ok=false for it (it matches neither of the two types it
+// unwraps), the provider exits non-zero, and roost surfaces the message.
+//
+// Concretely, the two shapes this exists to refuse: a `tab.open` answering
+// `result:{}` used to print `opened tab  on <host>` and exit zero — a success
+// line for a tab nobody can prove exists — and a `session.identify` answering
+// `result:{}` used to become "speaks protocol 0", a mismatch row naming a
+// version number no roost has ever spoken and telling the user to "upgrade
+// whichever is older".
+type MalformedReplyError struct {
+	// Op is the op whose reply was malformed.
+	Op string
+	// Reason says what was missing, in the reply's own vocabulary.
+	Reason string
+}
+
+func (e *MalformedReplyError) Error() string {
+	return fmt.Sprintf("the far side answered %s with %s", e.Op, e.Reason)
+}
+
 // IdentifyResult is the subset of `session.identify`'s reply this package
 // reads. roost's reply carries app_version, payload_kinds, features, a
 // libghostty build string, a session id and a start time as well; the provider
 // gates on exactly one number and has no use for the rest.
+//
+// `session_protocol` is REQUIRED, and its absence is not the same thing as a
+// zero: roost's own `SESSION_PROTOCOL_VERSION` has never been 0 and never can
+// be (it started at 1), so 0 here only ever means "the key was missing" — see
+// MalformedReplyError. Go's decoder cannot tell the two apart in an `int`, and
+// nothing needs it to: both are malformed.
 type IdentifyResult struct {
 	SessionProtocol int `json:"session_protocol"`
 }
