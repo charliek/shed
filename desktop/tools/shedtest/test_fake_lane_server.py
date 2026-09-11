@@ -183,6 +183,45 @@ def test_gx_unknown_method_is_400(gx_fake):
     assert "error" in body
 
 
+def test_gx_add_approval_is_answerable_over_the_control_door(gx_fake):
+    """An approval a client can ANSWER, not merely render.
+
+    `add_placeholder_approval` writes `method: null, request: null`, and
+    `push_approval_frame` is broadcast-only by design (its docstring: the store
+    is scripted separately so a cell can make the frame and the store disagree
+    on purpose). So with neither `add_approval` nor this cell, a harness in
+    another language could deliver a five-option permission, watch it render,
+    and then have the answer 404 on the re-read every gx adapter does before it
+    translates a decision — which looks like a client bug and is not one.
+    """
+    token = _gx_token(gx_fake)
+    auth = {"Authorization": f"Bearer {token}"}
+    session = "s-approve"
+    gx_fake.call("add_session", args=[session], kwargs={"activity": "working"})
+    request = gx_fake.envelope("permission_request", session=session, command="ls")
+    resource = gx_fake.call(
+        "add_approval",
+        args=[session, "call_fixture", "permission",
+              "session/request_permission", request])
+    assert resource["status"] == "pending"
+    assert resource["method"] == "session/request_permission"
+
+    # The re-read, which is the step a frame-only approval cannot survive.
+    url = f"{gx_fake.info['reported_url']}/v1/sessions/{session}/approvals/call_fixture"
+    status, raw = _get(url, headers=auth)
+    assert status == 200, raw
+    options = json.loads(raw)["request"]["options"]
+    assert len(options) == 5
+    # The load-bearing wire fact: TWO options declare `allow_once`, so a
+    # by-kind answer cannot say which the human meant.
+    assert sum(1 for o in options if o["kind"] == "allow_once") == 2
+
+    chosen = {"outcome": {"outcome": "selected", "optionId": "allow-once"}}
+    status, body = _post(url, {"response": chosen}, headers=auth)
+    assert status == 202, body
+    assert gx_fake.call("answered_with", args=[session, "call_fixture"]) == chosen
+
+
 def test_gx_requests_ledger_is_serialised_per_spec(gx_fake):
     token = _gx_token(gx_fake)
     _get(f"{gx_fake.info['reported_url']}/v1/healthz")
@@ -198,6 +237,35 @@ def test_gx_requests_ledger_is_serialised_per_spec(gx_fake):
 
     gx_fake.call("clear_requests")
     assert gx_fake.call("requests") == []
+
+
+def test_gx_bodies_to_returns_every_matching_body_in_order(gx_fake):
+    """`bodies_to` is a LIST, not `FakeGx.body_of`'s first match.
+
+    The cell that proves `mode: "interject"` posts to `…/messages` twice — a
+    queued send first, then the interject — so asserting the first body there
+    would assert the wrong one and pass.
+    """
+    token = _gx_token(gx_fake)
+    auth = {"Authorization": f"Bearer {token}"}
+    session = "s-bodies"
+    gx_fake.call("add_session", args=[session], kwargs={"activity": "working"})
+    url = f"{gx_fake.info['reported_url']}/v1/sessions/{session}/messages"
+    assert _post(url, {"text": "one", "mode": "queue"}, headers=auth)[0] == 202
+    assert _post(url, {"text": "two", "mode": "interject"}, headers=auth)[0] == 202
+
+    bodies = [json.loads(b) for b in gx_fake.call("bodies_to", args=["/messages"])]
+    assert [b["mode"] for b in bodies] == ["queue", "interject"]
+    assert [b["text"] for b in bodies] == ["one", "two"]
+
+    assert gx_fake.call("bodies_to", args=["/cancel"]) == []
+
+    # A missing suffix is a 400 rather than "every body in the ledger" — and so
+    # is an empty one, which `str.endswith` would otherwise match on every path.
+    for sent in (None, {"args": [""]}, {"args": [0]}):
+        status, body = _post(f"{gx_fake.info['control']}/_/bodies_to", sent)
+        assert status == 400, f"{sent!r} -> {status} {body}"
+        assert "suffix" in body["error"]
 
 
 def test_gx_restart_leader_and_rewrite_home_composite(gx_fake):

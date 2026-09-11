@@ -25,10 +25,11 @@ positional-only envelope builders, so the ambiguity doesn't arise there).
 Lifecycle (`stop`) is never in the allowlist; it is its own route.
 
 Every result is made JSON-serialisable by construction: allowlisted functions
-either return plain dicts/lists/scalars already, or (for the two cases that
-don't — gx's `requests()` list of `RequestRecord`, and opencode's `post_paths`
-attribute) are given a small adapter here that shapes the result before it
-hits `json.dumps`. A `Path` or a dataclass instance reaching the encoder is
+either return plain dicts/lists/scalars already, or (for the three cases
+that don't — gx's `requests()`, which shapes `RequestRecord` to a dict, gx's
+`bodies_to()`, which projects one `RequestRecord` field to a list of strings,
+and opencode's `post_paths` attribute) are given a small adapter here that
+shapes the result before it hits `json.dumps`. A `Path` or a dataclass instance reaching the encoder is
 still handled (`_Encoder` below), for any future knob that returns one
 directly, but nothing shipped today relies on that fallback.
 
@@ -122,7 +123,12 @@ def _gx_requests(state: ServerState, _args: list, _kwargs: dict) -> list[dict]:
     """`requests()` returns `RequestRecord` (a `__slots__` class, not a
     dataclass) — shaped here into the wire the plan pins: `{method, path,
     query, had_bearer, bearer_ok}`. `last_event_id`/`body` are dropped, and the
-    token itself was never in the ledger to begin with."""
+    token itself was never in the ledger to begin with.
+
+    Bodies are reachable through `bodies_to` rather than here: this shape is
+    pinned (a cell asserts the key set exactly), and widening it to carry every
+    request's body would put a posted token-bearing body into the one ledger a
+    test prints on failure."""
     return [
         {
             "method": r.method,
@@ -133,6 +139,25 @@ def _gx_requests(state: ServerState, _args: list, _kwargs: dict) -> list[dict]:
         }
         for r in state.fake.requests()
     ]
+
+
+def _gx_bodies_to(state: ServerState, args: list, kwargs: dict) -> list[str]:
+    """Every recorded body whose path ends with `suffix`, in order served.
+
+    A list, not `FakeGx.body_of`'s first match: the cell that proves
+    `mode: "interject"` posts to `…/messages` twice — a queued send first, then
+    the interject — and asserting the FIRST body there would assert the wrong
+    one and pass.
+    """
+    suffix = kwargs.get("suffix")
+    if suffix is None and len(args) > 0:
+        suffix = args[0]
+    # A nonempty STRING, not merely "not None": `"".endswith` is true of every
+    # path, so an empty suffix would quietly hand back the whole ledger — the
+    # one answer a body assertion must never silently receive.
+    if not isinstance(suffix, str) or not suffix:
+        raise ValueError("bodies_to requires a nonempty string suffix")
+    return [r.body for r in state.fake.requests_to(suffix)]
 
 
 def _restart_leader_and_rewrite_home(state: ServerState, args: list, kwargs: dict) -> dict:
@@ -180,6 +205,7 @@ GX_METHODS: dict[str, Callable[[ServerState, list, dict], Any]] = {
     "push_keepalive": _call("push_keepalive"),
     "close_streams": _call("close_streams"),
     "stream_count": _call("stream_count"),
+    "add_approval": _call("add_approval"),
     "add_placeholder_approval": _call("add_placeholder_approval"),
     "resolve_approval": _call("resolve_approval"),
     "answered_with": _call("answered_with"),
@@ -188,6 +214,7 @@ GX_METHODS: dict[str, Callable[[ServerState, list, dict], Any]] = {
     "set_instance_id": _call("set_instance_id"),
     "restart_leader_and_rewrite_home": _restart_leader_and_rewrite_home,
     "requests": _gx_requests,
+    "bodies_to": _gx_bodies_to,
     "clear_requests": _call("clear_requests"),
     "hold_seed": _call("hold_seed"),
     "release_seed": _call("release_seed"),

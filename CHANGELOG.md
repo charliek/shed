@@ -210,7 +210,10 @@ reads an `## Unreleased` heading._
   per-agent method allowlist, wire-envelope builders, `/_/info`, `/_/stop`)
   so shed-mobile's Dart harness can drive them without re-deriving either
   agent's wire format. Both fakes also gain `hold_seed`/`release_seed` so
-  "no partial view before `Ready`" is observable rather than vacuous.
+  "no partial view before `Ready`" is observable rather than vacuous. The gx
+  allowlist carries `add_approval` (an approval a client can answer, not only
+  render) and `bodies_to` (every recorded body for a path suffix), so a cell in
+  another language can assert the bytes a decision actually posted.
 
 ## v0.8.2 — 2026-08-17
 
