@@ -26,9 +26,10 @@ Lifecycle (`stop`) is never in the allowlist; it is its own route.
 
 Every result is made JSON-serialisable by construction: allowlisted functions
 either return plain dicts/lists/scalars already, or (for the three cases
-that don't — gx's `requests()` and `bodies_to()` lists of `RequestRecord`, and
-opencode's `post_paths` attribute) are given a small adapter here that shapes
-the result before it hits `json.dumps`. A `Path` or a dataclass instance reaching the encoder is
+that don't — gx's `requests()`, which shapes `RequestRecord` to a dict, gx's
+`bodies_to()`, which projects one `RequestRecord` field to a list of strings,
+and opencode's `post_paths` attribute) are given a small adapter here that
+shapes the result before it hits `json.dumps`. A `Path` or a dataclass instance reaching the encoder is
 still handled (`_Encoder` below), for any future knob that returns one
 directly, but nothing shipped today relies on that fallback.
 
