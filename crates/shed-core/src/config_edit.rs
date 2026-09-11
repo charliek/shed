@@ -172,7 +172,11 @@ fn verify(
 fn expected_entry(m: &NewMachine<'_>) -> crate::config::MachineEntry {
     crate::config::MachineEntry {
         name: m.name.to_string(),
-        host: m.host.filter(|h| !h.is_empty()).unwrap_or(m.name).to_string(),
+        host: m
+            .host
+            .filter(|h| !h.is_empty())
+            .unwrap_or(m.name)
+            .to_string(),
         user: m.user.filter(|u| !u.is_empty()).map(str::to_string),
         ssh_port: m.ssh_port.unwrap_or(22),
         rc_bin: m.rc_bin.filter(|b| !b.is_empty()).map(str::to_string),
@@ -226,7 +230,10 @@ fn entry_lines(m: &NewMachine<'_>, indent: usize) -> Vec<String> {
     let field = |k: &str, v: &str| format!("{inner}{k}: {}", scalar(v));
     // `host` is written even when it equals the name: the reader defaults it,
     // but a person reading the file should not have to know that rule.
-    out.push(field("host", m.host.filter(|h| !h.is_empty()).unwrap_or(m.name)));
+    out.push(field(
+        "host",
+        m.host.filter(|h| !h.is_empty()).unwrap_or(m.name),
+    ));
     if let Some(u) = m.user.filter(|u| !u.is_empty()) {
         out.push(field("user", u));
     }
@@ -279,7 +286,13 @@ mod tests {
     use super::*;
 
     fn m(name: &str) -> NewMachine<'_> {
-        NewMachine { name, host: None, user: None, ssh_port: None, rc_bin: None }
+        NewMachine {
+            name,
+            host: None,
+            user: None,
+            ssh_port: None,
+            rc_bin: None,
+        }
     }
 
     /// The property the whole module exists for: every original line survives,
@@ -311,10 +324,16 @@ some_key_this_crate_does_not_model:
                 }
             }
         }
-        assert_eq!(before.next(), None, "an original line was dropped or reordered");
+        assert_eq!(
+            before.next(),
+            None,
+            "an original line was dropped or reordered"
+        );
         // …and the insert actually happened, so "survives" is not satisfied by
         // returning the input untouched.
-        assert!(crate::config::ShedConfig::parse(&out).machine("mini4").is_some());
+        assert!(crate::config::ShedConfig::parse(&out)
+            .machine("mini4")
+            .is_some());
         assert_eq!(
             out.lines().count(),
             orig.lines().count() + 2,
@@ -341,9 +360,14 @@ some_key_this_crate_does_not_model:
     fn creates_the_block_when_there_is_none() {
         let orig = "servers:\n    mac-mini:\n        host: localhost\n";
         let out = insert_machine(orig, &m("mini3")).unwrap();
-        assert!(out.starts_with(orig), "the original must be a prefix: {out}");
+        assert!(
+            out.starts_with(orig),
+            "the original must be a prefix: {out}"
+        );
         assert!(out.contains("\nmachines:\n"));
-        assert!(crate::config::ShedConfig::parse(&out).machine("mini3").is_some());
+        assert!(crate::config::ShedConfig::parse(&out)
+            .machine("mini3")
+            .is_some());
     }
 
     #[test]
@@ -367,7 +391,13 @@ some_key_this_crate_does_not_model:
         // fill with values that only restate the default.
         let bare = insert_machine("", &m("mini4")).unwrap();
         assert!(!bare.contains("ssh_port"), "{bare}");
-        assert_eq!(crate::config::ShedConfig::parse(&bare).machine("mini4").unwrap().ssh_port, 22);
+        assert_eq!(
+            crate::config::ShedConfig::parse(&bare)
+                .machine("mini4")
+                .unwrap()
+                .ssh_port,
+            22
+        );
     }
 
     #[test]
@@ -398,8 +428,12 @@ some_key_this_crate_does_not_model:
         let out = insert_machine(orig, &m("mini3")).unwrap();
         assert!(out.starts_with(orig));
         assert!(out.contains("\nmachines:\n"));
-        assert!(crate::config::ShedConfig::parse(&out).machine("mini3").is_some());
-        assert!(crate::config::ShedConfig::parse(&out).machine("not-ours").is_none());
+        assert!(crate::config::ShedConfig::parse(&out)
+            .machine("mini3")
+            .is_some());
+        assert!(crate::config::ShedConfig::parse(&out)
+            .machine("not-ours")
+            .is_none());
     }
 
     #[test]
@@ -428,7 +462,9 @@ some_key_this_crate_does_not_model:
             // Precondition: the reader really does see a machine here, which is
             // what makes appending dangerous.
             assert!(
-                crate::config::ShedConfig::parse(weird).machine("mini3").is_some(),
+                crate::config::ShedConfig::parse(weird)
+                    .machine("mini3")
+                    .is_some(),
                 "precondition: reader sees mini3 in {weird:?}"
             );
             let out = insert_machine(weird, &m("mini4"));
@@ -471,14 +507,19 @@ some_key_this_crate_does_not_model:
     fn a_crlf_file_stays_crlf() {
         let orig = "servers:\r\n    mac-mini:\r\n        host: localhost\r\n";
         let out = insert_machine(orig, &m("mini3")).unwrap();
-        assert!(out.starts_with(orig), "original bytes not preserved: {out:?}");
+        assert!(
+            out.starts_with(orig),
+            "original bytes not preserved: {out:?}"
+        );
         assert!(!out.contains("\n\n"), "a bare LF crept in: {out:?}");
         assert_eq!(
             out.matches("\r\n").count(),
             out.matches('\n').count(),
             "every newline should still be a CRLF: {out:?}"
         );
-        assert!(crate::config::ShedConfig::parse(&out).machine("mini3").is_some());
+        assert!(crate::config::ShedConfig::parse(&out)
+            .machine("mini3")
+            .is_some());
     }
 
     /// The whole entry must read back, not merely the name — otherwise a value
@@ -495,7 +536,9 @@ some_key_this_crate_does_not_model:
         };
         let out = insert_machine("", &entry).unwrap();
         assert_eq!(
-            *crate::config::ShedConfig::parse(&out).machine("mini3").unwrap(),
+            *crate::config::ShedConfig::parse(&out)
+                .machine("mini3")
+                .unwrap(),
             expected_entry(&entry)
         );
     }
