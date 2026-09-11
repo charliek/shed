@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"sort"
+	"strings"
 
 	"gopkg.in/yaml.v3"
 )
@@ -99,6 +100,24 @@ func decodeMachines(node *yaml.Node) []MachineEntry {
 		host := raw.Host
 		if host == "" {
 			host = keyNode.Value
+		}
+		// An ssh destination that begins with a dash is not a host. OpenSSH
+		// parses options BEFORE the destination word, so a `host:` of
+		// `-oProxyCommand=…` is consumed as an option and that command runs
+		// on THIS machine — verified against the local ssh:
+		// `ssh -G -oPort=7777 -- echo hi` reports `port 7777` and
+		// `hostname echo`. A trailing `--` cannot save it; option parsing has
+		// already happened by then. roost refuses the same shape in its own
+		// target classifier (roost-ipc/src/ssh.rs: "target starts with '-';
+		// that looks like an option, not a host"), and so does the provider's
+		// Target validation — this is the decoder half of the same rule, so a
+		// config carrying one is dropped at the door rather than carried
+		// around as an unusable entry.
+		if strings.HasPrefix(host, "-") || strings.HasPrefix(raw.User, "-") {
+			fmt.Fprintf(os.Stderr,
+				"shed: skipping machines entry %q: its host or user begins with a dash, which ssh reads as an option rather than a destination\n",
+				keyNode.Value)
+			continue
 		}
 		// Match the Rust decoder's range check (shed-core's MachineEntry
 		// holds ssh_port as a u16 and falls back to 22 for anything that

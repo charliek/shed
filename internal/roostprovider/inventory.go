@@ -9,7 +9,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"net/http"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -36,7 +38,7 @@ const maxShedsResponseBody = 8 << 20 // 8 MiB
 
 // DefaultPerServerTimeout bounds ONE server's whole list round trip —
 // connect, TLS handshake, response headers, and body decode, not just the
-// dial — inside List's fan-out. roost budgets a provider's `list` phase at
+// dial — inside Inventory's fan-out. roost budgets a provider's `list` phase at
 // 5s by default (plan 019 §"Provider contract"); this keeps a single
 // unreachable or slow server from eating that budget on its own, however
 // many servers are configured.
@@ -53,9 +55,9 @@ type RunningShed struct {
 	Server string
 	// ServerHost / ServerSSHPort are copied out of the config.ServerEntry
 	// this shed was found on, rather than holding a pointer to the entry
-	// itself — List fans out over a map the caller owns, and copying is what
-	// lets that map be read (or reloaded) concurrently with an in-flight
-	// List call without a data race.
+	// itself — Inventory fans out over a map the caller owns, and copying is
+	// what lets that map be read (or reloaded) concurrently with an in-flight
+	// Inventory call without a data race.
 	//
 	// A shed's ssh identity is always `<shed>@<ServerHost> -p
 	// <ServerSSHPort>` against `~/.shed/known_hosts` (never a per-server
@@ -81,9 +83,36 @@ type RunningShed struct {
 // custom type needed.
 var errNoStoredCredential = errors.New("no usable stored credential")
 
-// List enumerates every RUNNING shed across servers, using ONLY each
+// ShedInventory is one Inventory call's whole answer: the running sheds, and
+// which servers were reachable at all.
+//
+// The menu needs that second part and it is the reason this is a struct rather
+// than a bare slice: plan 019 §3.2 pins two DIFFERENT empty-menu rows, and
+// telling them apart is exactly the question "did any server answer at all" —
+// a fleet that answered and is simply idle gets "No running sheds or
+// machines", while a fleet nothing could be reached on gets "no shed-server
+// answered" and the list of names it tried. Collapsing those two would tell a
+// user with a dead VPN that they have no sheds.
+type ShedInventory struct {
+	// Sheds is every RUNNING shed found, sorted by (server, shed name).
+	Sheds []RunningShed
+	// Tried names every server in the input map, sorted — including the ones
+	// skipped for holding no usable stored credential, which were still
+	// "tried" from the user's point of view.
+	Tried []string
+	// Answered names the servers that returned a decodable /api/sheds
+	// response, sorted. A server here with no rows in Sheds is running no
+	// sheds; a server in Tried but not here could not be reached.
+	//
+	// A server whose worker had not finished when ctx expired appears in
+	// neither — unreachable is the honest reading of "we never heard back".
+	Answered []string
+}
+
+// Inventory enumerates every RUNNING shed across servers, using ONLY each
 // server's already-stored credential (never minting or persisting one —
-// see stashedCredential) and never writing to config.yaml.
+// see stashedCredential) and never writing to config.yaml, and records which
+// servers answered at all.
 //
 // Every server is queried concurrently, each bounded independently by
 // timeout (DefaultPerServerTimeout when timeout <= 0); ctx bounds the whole
@@ -91,13 +120,15 @@ var errNoStoredCredential = errors.New("no usable stored credential")
 // credential is skipped SILENTLY — this runs inside roost's `list` phase,
 // which has no stderr a human is watching, and a provider that spammed one
 // line per unreachable server on every keystroke of roost's palette would be
-// worse than saying nothing.
+// worse than saying nothing. (Skipped is not the same as invisible: the
+// server still appears in Tried and not in Answered, which is what the menu
+// reads.)
 //
-// The result is sorted by (server, shed name) for a stable menu across
-// calls with the same input.
+// Sheds is sorted by (server, shed name) for a stable menu across calls with
+// the same input.
 //
-// List returns the moment ctx is done, with whatever results have arrived by
-// then — it does NOT wait for every worker to finish. That matters because a
+// Inventory returns the moment ctx is done, with whatever results have arrived
+// by then — it does NOT wait for every worker to finish. That matters because a
 // worker can block before its own per-server timeout even exists:
 // stashedCredential's config.LoadClientCredentials reads two files
 // synchronously, with no context at all, so a ClientCertFile/ClientKeyFile
@@ -107,53 +138,65 @@ var errNoStoredCredential = errors.New("no usable stored credential")
 // this whole call past roost's 5s `list`-phase budget with no way out.
 //
 // Each worker's result channel is buffered to exactly len(servers), so a
-// worker that finishes (or unblocks) after List has already returned on
+// worker that finishes (or unblocks) after Inventory has already returned on
 // ctx.Done() can still send without blocking — it simply leaks until it
 // completes, at which point the goroutine exits and the channel becomes
 // unreferenced. That buffering is also what removes the need for the mutex
 // the old shape used to guard the shared output slice: out is local to this
 // call and is only ever touched by the goroutine that owns it, never by a
-// worker after List has returned.
-func List(ctx context.Context, servers map[string]config.ServerEntry, timeout time.Duration) []RunningShed {
+// worker after Inventory has returned.
+func Inventory(ctx context.Context, servers map[string]config.ServerEntry, timeout time.Duration) ShedInventory {
 	if timeout <= 0 {
 		timeout = DefaultPerServerTimeout
 	}
 
-	results := make(chan []RunningShed, len(servers))
+	type serverResult struct {
+		name     string
+		rows     []RunningShed
+		answered bool
+	}
+	results := make(chan serverResult, len(servers))
 	for name, entry := range servers {
 		go func(name string, entry config.ServerEntry) {
-			results <- listServer(ctx, name, entry, timeout)
+			rows, answered := listServer(ctx, name, entry, timeout)
+			results <- serverResult{name: name, rows: rows, answered: answered}
 		}(name, entry)
 	}
 
-	var out []RunningShed
+	out := ShedInventory{Tried: slices.Sorted(maps.Keys(servers))}
 collect:
 	for range servers {
 		select {
-		case rows := <-results:
-			out = append(out, rows...)
+		case res := <-results:
+			out.Sheds = append(out.Sheds, res.rows...)
+			if res.answered {
+				out.Answered = append(out.Answered, res.name)
+			}
 		case <-ctx.Done():
 			break collect
 		}
 	}
 
-	sort.Slice(out, func(i, j int) bool {
-		if out[i].Server != out[j].Server {
-			return out[i].Server < out[j].Server
+	sort.Slice(out.Sheds, func(i, j int) bool {
+		if out.Sheds[i].Server != out.Sheds[j].Server {
+			return out.Sheds[i].Server < out.Sheds[j].Server
 		}
-		return out[i].Name < out[j].Name
+		return out.Sheds[i].Name < out.Sheds[j].Name
 	})
+	sort.Strings(out.Answered)
 	return out
 }
 
-// listServer queries one server for its running sheds. Any failure —
-// no usable credential, connection refused, timeout, non-200, a body that
-// doesn't decode — returns nil: from List's point of view, an erroring
-// server and a server with nothing running look identical.
-func listServer(ctx context.Context, name string, entry config.ServerEntry, timeout time.Duration) []RunningShed {
+// listServer queries one server for its running sheds, and reports whether the
+// server answered at all. Any failure — no usable credential, connection
+// refused, timeout, non-200, a body that doesn't decode — returns
+// (nil, false): in the shed list an erroring server and a server with nothing
+// running look identical, and the second return value is the only thing that
+// tells them apart.
+func listServer(ctx context.Context, name string, entry config.ServerEntry, timeout time.Duration) ([]RunningShed, bool) {
 	resp, err := fetchSheds(ctx, entry, timeout)
 	if err != nil {
-		return nil
+		return nil, false
 	}
 
 	var rows []RunningShed
@@ -169,7 +212,7 @@ func listServer(ctx context.Context, name string, entry config.ServerEntry, time
 			LandingDir:    shed.LandingDir,
 		})
 	}
-	return rows
+	return rows, true
 }
 
 // fetchSheds performs the one bounded GET /api/sheds call for entry.

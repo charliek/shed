@@ -1,0 +1,171 @@
+{
+  "_comment": [
+    "How a failed ssh exec's stderr + exit code classify (plan 019 §3.3).",
+    "",
+    "NOT a roost vector — see this directory's README, section 'shed's own",
+    "two-language goldens'. This file is shed's, and it may be edited.",
+    "",
+    "`classes` pins roost's OWN classifier, `roost_ipc::ssh::classify_ssh_failure`,",
+    "asserted from:",
+    "  - Rust: crates/shed-core/tests/roost_provider_vectors.rs, against the live",
+    "    function at the pinned roost-ipc rev.",
+    "  - Go: internal/roostprovider/goldens_test.go, against ClassifySSHFailure,",
+    "    which is a verbatim port of it.",
+    "",
+    "THE ORDER OF THE RULES IS LOAD-BEARING and is what the `precedence-*` cases",
+    "exist to pin: several of these blobs match two rules, and the answer is",
+    "whichever rule comes first. The order is:",
+    "  1. stderr contains REMOTE HOST IDENTIFICATION HAS CHANGED -> changed-host-key",
+    "  2. stderr contains 'Host key verification failed'         -> host-key-unknown",
+    "  3. stderr contains 'Permission denied'                    -> auth",
+    "  4. stderr contains 'client-bridge: no session'            -> no-session",
+    "  5. stderr contains 'command not found' OR exit code 127   -> not-found",
+    "  6. otherwise                                              -> transport",
+    "",
+    "`detail` is only ever set for `transport` — the other five classes ARE the",
+    "diagnosis — and is the last non-empty TRIMMED line of the stderr tail.",
+    "",
+    "roost does NOT special-case exit 255 (ssh's own 'the transport failed' code):",
+    "255 with unrecognized stderr is `transport`, like any other code. See",
+    "`provider_rows` below for where 255 does mean something.",
+    "",
+    "`provider_rows` is a SEPARATE, shed-only mapping — which of plan 019 §3.2's",
+    "pinned non-actionable rows a class becomes. It is asserted from Go only",
+    "(nothing in Rust has a provider menu). It is in this file rather than a file",
+    "of its own precisely so the two concepts sit side by side and stay visibly",
+    "distinct: §3.2's 'unreachable' row is the PROVIDER's reading of transport +",
+    "255-or-timeout, not a roost class, and three roost classes collapse into it."
+  ],
+  "classes": [
+    {
+      "name": "changed-host-key",
+      "exit_code": 255,
+      "stderr": "@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@\n@    WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED!     @\n@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@\nIT IS POSSIBLE THAT SOMEONE IS DOING SOMETHING NASTY!\n",
+      "class": "changed-host-key",
+      "detail": null
+    },
+    {
+      "name": "precedence-changed-host-key-beats-verification-failed",
+      "exit_code": 255,
+      "stderr": "@    WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED!     @\nHost key verification failed.\n",
+      "class": "changed-host-key",
+      "detail": null
+    },
+    {
+      "name": "host-key-unknown",
+      "exit_code": 255,
+      "stderr": "No ED25519 host key is known for mini3 and you have requested strict checking.\nHost key verification failed.\n",
+      "class": "host-key-unknown",
+      "detail": null
+    },
+    {
+      "name": "auth",
+      "exit_code": 255,
+      "stderr": "shed@mini3: Permission denied (publickey).\n",
+      "class": "auth",
+      "detail": null
+    },
+    {
+      "name": "precedence-auth-beats-no-session",
+      "exit_code": 255,
+      "stderr": "Permission denied (publickey).\nclient-bridge: no session is listening at /run/user/1000/roost/session.sock\n",
+      "class": "auth",
+      "detail": null
+    },
+    {
+      "name": "no-session",
+      "exit_code": 1,
+      "stderr": "client-bridge: no session is listening at /run/user/1000/roost/session.sock; run 'roostctl session start' on this machine\n",
+      "class": "no-session",
+      "detail": null
+    },
+    {
+      "name": "precedence-no-session-beats-exit-127",
+      "exit_code": 127,
+      "stderr": "client-bridge: no session is listening at /run/user/1000/roost/session.sock\n",
+      "class": "no-session",
+      "detail": null
+    },
+    {
+      "name": "not-found-by-stderr",
+      "exit_code": 127,
+      "stderr": "roost-session: command not found\n",
+      "class": "not-found",
+      "detail": null
+    },
+    {
+      "name": "not-found-by-exit-code-alone",
+      "exit_code": 127,
+      "stderr": "",
+      "class": "not-found",
+      "detail": null
+    },
+    {
+      "name": "not-found-by-stderr-without-exit-code",
+      "exit_code": null,
+      "stderr": "bash: line 1: roost-session: command not found\n",
+      "class": "not-found",
+      "detail": null
+    },
+    {
+      "name": "transport-connection-refused-at-255",
+      "exit_code": 255,
+      "stderr": "ssh: connect to host mini3 port 22: Connection refused\n",
+      "class": "transport",
+      "detail": "ssh: connect to host mini3 port 22: Connection refused"
+    },
+    {
+      "name": "transport-detail-is-the-last-non-empty-trimmed-line",
+      "exit_code": 255,
+      "stderr": "Welcome to mini3\n\n  kex_exchange_identification: read: Connection reset by peer   \n\n\n",
+      "class": "transport",
+      "detail": "kex_exchange_identification: read: Connection reset by peer"
+    },
+    {
+      "name": "transport-timeout-has-no-exit-code-and-no-detail",
+      "exit_code": null,
+      "stderr": "",
+      "class": "transport",
+      "detail": null
+    },
+    {
+      "name": "transport-clean-exit-one-with-an-unrecognized-message",
+      "exit_code": 1,
+      "stderr": "client-bridge: write stdout: Broken pipe\n",
+      "class": "transport",
+      "detail": "client-bridge: write stdout: Broken pipe"
+    }
+  ],
+  "provider_rows": [
+    {
+      "name": "not-found-is-the-install-offer",
+      "class": "not-found",
+      "row": "not-installed"
+    },
+    {
+      "name": "no-session-is-the-start-offer",
+      "class": "no-session",
+      "row": "not-running"
+    },
+    {
+      "name": "transport-is-unreachable-this-is-the-255-and-timeout-family",
+      "class": "transport",
+      "row": "unreachable"
+    },
+    {
+      "name": "changed-host-key-folds-into-unreachable-its-own-stderr-line-is-the-subtitle",
+      "class": "changed-host-key",
+      "row": "unreachable"
+    },
+    {
+      "name": "host-key-unknown-folds-into-unreachable",
+      "class": "host-key-unknown",
+      "row": "unreachable"
+    },
+    {
+      "name": "auth-folds-into-unreachable",
+      "class": "auth",
+      "row": "unreachable"
+    }
+  ]
+}

@@ -93,3 +93,30 @@ the opencode tab (id 4, owned, `finished`, `detail: "session_idle"`, with the
 adapter's `agent`/`model`/`version` metadata). One of those two is a session row;
 the other is somebody's terminal. `shed.tab.list.opencode.over-ssh.json` is the
 same pair read from inside a shed VM over roost's SSH client-bridge.
+
+## shed's own two-language goldens
+
+Three files here are **not** roost vectors and are **not** copies of anything:
+they are shed's own, written by shed, and they may be edited. The
+no-semantic-edits rule above governs the vendored vectors, not these.
+
+| file | what it pins | asserted by |
+|---|---|---|
+| `bootstrap/exec-chain-command.txt` | roost's candidate-ladder remote command, `roost_ipc::bootstrap::exec_chain_command(false)` | Rust (`shed-core/tests/roost_provider_vectors.rs`, against the LIVE function) and Go (`internal/roostprovider`'s `ExecChainCommand` constant) |
+| `agent-table.json` | kind → binary → title for the six agents the roost provider can start | Rust (`launch_argv` + `roost_capabilities().kinds`) and Go (`internal/roostprovider`'s `agentTable`) |
+| `stderr-classes.json` | how a failed `ssh` exec classifies (`roost_ipc::ssh::classify_ssh_failure`), plus shed's own class → provider-row mapping | Rust (the live classifier, `classes` only) and Go (`ClassifySSHFailure` + `ProviderRow`) |
+
+They exist because one behaviour is implemented on both sides of a language
+boundary — the Go `shed roost-provider` subcommand and the Rust client core —
+and a golden asserted from both is the only thing that makes the two provably
+the same rather than the same today.
+
+**`bootstrap/exec-chain-command.txt` is GENERATED, never hand-written.** It was
+produced by calling `exec_chain_command(false)` and writing the result; the Rust
+test then asserts the file still equals that call, so a `roost-ipc` bump that
+changes the ladder fails loudly instead of leaving the hand-copied Go constant
+quietly wrong. To refresh it after a bump, re-run the generator described in that
+test's comment and re-copy the string into Go.
+
+The file carries a trailing newline that the command itself does not; both tests
+trim exactly one.

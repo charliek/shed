@@ -112,7 +112,7 @@ func openEntry(ts *httptest.Server) config.ServerEntry {
 	}
 }
 
-func TestList_RunningShedsOnly(t *testing.T) {
+func TestInventory_RunningShedsOnly(t *testing.T) {
 	handler, _ := shedsHandler(t,
 		config.Shed{Name: "a", Status: config.StatusRunning, LandingDir: "/home/shed/proj"},
 		config.Shed{Name: "b", Status: "stopped"},
@@ -120,7 +120,7 @@ func TestList_RunningShedsOnly(t *testing.T) {
 	ts := httptest.NewServer(handler)
 	defer ts.Close()
 
-	got := List(context.Background(), map[string]config.ServerEntry{"srv": openEntry(ts)}, 0)
+	got := Inventory(context.Background(), map[string]config.ServerEntry{"srv": openEntry(ts)}, 0).Sheds
 	if len(got) != 1 {
 		t.Fatalf("want 1 running shed, got %#v", got)
 	}
@@ -130,7 +130,7 @@ func TestList_RunningShedsOnly(t *testing.T) {
 	}
 }
 
-func TestList_BearerTokenIsSent(t *testing.T) {
+func TestInventory_BearerTokenIsSent(t *testing.T) {
 	var gotAuth string
 	handler, _ := shedsHandler(t, config.Shed{Name: "a", Status: config.StatusRunning})
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -142,7 +142,7 @@ func TestList_BearerTokenIsSent(t *testing.T) {
 	entry := openEntry(ts)
 	entry.ControlToken = "shed_control_abc123"
 
-	got := List(context.Background(), map[string]config.ServerEntry{"srv": entry}, 0)
+	got := Inventory(context.Background(), map[string]config.ServerEntry{"srv": entry}, 0).Sheds
 	if len(got) != 1 {
 		t.Fatalf("want 1 running shed, got %#v", got)
 	}
@@ -151,13 +151,13 @@ func TestList_BearerTokenIsSent(t *testing.T) {
 	}
 }
 
-// TestList_ServerErrorIsSkippedSilently pins BOTH halves of "skipped
+// TestInventory_ServerErrorIsSkippedSilently pins BOTH halves of "skipped
 // silently": the row is dropped, AND nothing is written to stderr. A version
 // of this test that only checked the former would keep passing if the code
 // started logging one line per unreachable server — exactly the noise the
 // doc comment on List says roost's palette (no stderr a human is watching)
 // can't afford.
-func TestList_ServerErrorIsSkippedSilently(t *testing.T) {
+func TestInventory_ServerErrorIsSkippedSilently(t *testing.T) {
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusInternalServerError)
 	}))
@@ -165,7 +165,7 @@ func TestList_ServerErrorIsSkippedSilently(t *testing.T) {
 
 	var got []RunningShed
 	stderr := captureStderr(t, func() {
-		got = List(context.Background(), map[string]config.ServerEntry{"srv": openEntry(ts)}, 0)
+		got = Inventory(context.Background(), map[string]config.ServerEntry{"srv": openEntry(ts)}, 0).Sheds
 	})
 	if len(got) != 0 {
 		t.Fatalf("a 500 must be skipped, got %#v", got)
@@ -175,11 +175,11 @@ func TestList_ServerErrorIsSkippedSilently(t *testing.T) {
 	}
 }
 
-// TestList_HangingServerIsBoundedByTimeout is the injectable-timeout seam
+// TestInventory_HangingServerIsBoundedByTimeout is the injectable-timeout seam
 // the plan calls for: rather than sleeping the production 2s default, it
 // passes a tiny timeout so the hanging-server cases stay fast while still
 // proving the bound is enforced end-to-end.
-func TestList_HangingServerIsBoundedByTimeout(t *testing.T) {
+func TestInventory_HangingServerIsBoundedByTimeout(t *testing.T) {
 	t.Run("before headers", func(t *testing.T) {
 		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			<-r.Context().Done()
@@ -187,7 +187,7 @@ func TestList_HangingServerIsBoundedByTimeout(t *testing.T) {
 		defer ts.Close()
 
 		start := time.Now()
-		got := List(context.Background(), map[string]config.ServerEntry{"srv": openEntry(ts)}, 30*time.Millisecond)
+		got := Inventory(context.Background(), map[string]config.ServerEntry{"srv": openEntry(ts)}, 30*time.Millisecond).Sheds
 		elapsed := time.Since(start)
 
 		if len(got) != 0 {
@@ -217,7 +217,7 @@ func TestList_HangingServerIsBoundedByTimeout(t *testing.T) {
 		defer ts.Close()
 
 		start := time.Now()
-		got := List(context.Background(), map[string]config.ServerEntry{"srv": openEntry(ts)}, 30*time.Millisecond)
+		got := Inventory(context.Background(), map[string]config.ServerEntry{"srv": openEntry(ts)}, 30*time.Millisecond).Sheds
 		elapsed := time.Since(start)
 
 		if len(got) != 0 {
@@ -229,7 +229,7 @@ func TestList_HangingServerIsBoundedByTimeout(t *testing.T) {
 	})
 }
 
-// TestList_ReturnsPromptlyWhenParentContextIsCancelled covers fix 1: List
+// TestInventory_ReturnsPromptlyWhenParentContextIsCancelled covers fix 1: List
 // must return the moment its parent ctx is done, not wait on every worker.
 // stashedCredential's file reads (config.LoadClientCredentials) are not
 // context-aware at all, so a ClientCertFile/ClientKeyFile pointing at
@@ -239,7 +239,7 @@ func TestList_HangingServerIsBoundedByTimeout(t *testing.T) {
 // to apply. Paired with an HTTP-handler-blocks entry too (belt and braces:
 // the ordinary hung-server case must also not stall the return), and a
 // parent ctx cancelled shortly after the call starts.
-func TestList_ReturnsPromptlyWhenParentContextIsCancelled(t *testing.T) {
+func TestInventory_ReturnsPromptlyWhenParentContextIsCancelled(t *testing.T) {
 	dir := t.TempDir()
 	fifoPath := filepath.Join(dir, "cert.fifo")
 	if err := syscall.Mkfifo(fifoPath, 0o600); err != nil {
@@ -276,10 +276,10 @@ func TestList_ReturnsPromptlyWhenParentContextIsCancelled(t *testing.T) {
 	}()
 
 	start := time.Now()
-	got := List(ctx, map[string]config.ServerEntry{
+	got := Inventory(ctx, map[string]config.ServerEntry{
 		"stuck-credential": fifoEntry,
 		"stuck-http":       openEntry(blocked),
-	}, 5*time.Second)
+	}, 5*time.Second).Sheds
 	elapsed := time.Since(start)
 
 	if len(got) != 0 {
@@ -323,12 +323,12 @@ func (zeroReader) Read(p []byte) (int, error) {
 	return len(p), nil
 }
 
-// TestList_FingerprintOverPlaintextIsSkipped covers fix 3: an entry with a
+// TestInventory_FingerprintOverPlaintextIsSkipped covers fix 3: an entry with a
 // stored TLS fingerprint (and therefore a stored, real credential) but a
 // plaintext (http://) base URL must never be dialed — sending that
 // credential would leak it in cleartext, and the pinned transport's
 // certificate check never even runs against an http:// URL.
-func TestList_FingerprintOverPlaintextIsSkipped(t *testing.T) {
+func TestInventory_FingerprintOverPlaintextIsSkipped(t *testing.T) {
 	handler, hits := shedsHandler(t, config.Shed{Name: "a", Status: config.StatusRunning})
 	ts := httptest.NewServer(http.HandlerFunc(handler))
 	defer ts.Close()
@@ -341,7 +341,7 @@ func TestList_FingerprintOverPlaintextIsSkipped(t *testing.T) {
 		TLSCertFingerprint: "sha256:deadbeef",
 	}
 
-	got := List(context.Background(), map[string]config.ServerEntry{"srv": entry}, 0)
+	got := Inventory(context.Background(), map[string]config.ServerEntry{"srv": entry}, 0).Sheds
 	if len(got) != 0 {
 		t.Fatalf("a fingerprinted entry over plaintext must be skipped, got %#v", got)
 	}
@@ -350,7 +350,7 @@ func TestList_FingerprintOverPlaintextIsSkipped(t *testing.T) {
 	}
 }
 
-// TestList_MTLSEntrySendsClientCertificateAndSucceeds is the real mtls
+// TestInventory_MTLSEntrySendsClientCertificateAndSucceeds is the real mtls
 // success test the package was missing entirely: every other mtls-shaped
 // test here stops before ever dialing (no cert files recorded), so a
 // regression that made src.CertificateFor a no-op (returning nil, e.g. a
@@ -358,7 +358,7 @@ func TestList_FingerprintOverPlaintextIsSkipped(t *testing.T) {
 // prior test green. This one runs a TLS server that REQUIRES a client
 // certificate and asserts the server actually saw one, on the security-
 // critical path.
-func TestList_MTLSEntrySendsClientCertificateAndSucceeds(t *testing.T) {
+func TestInventory_MTLSEntrySendsClientCertificateAndSucceeds(t *testing.T) {
 	var sawClientCert atomic.Bool
 	handler, hits := shedsHandler(t, config.Shed{Name: "a", Status: config.StatusRunning})
 	ts := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -392,7 +392,7 @@ func TestList_MTLSEntrySendsClientCertificateAndSucceeds(t *testing.T) {
 		ClientKeyFile:      keyPath,
 	}
 
-	got := List(context.Background(), map[string]config.ServerEntry{"srv": entry}, 0)
+	got := Inventory(context.Background(), map[string]config.ServerEntry{"srv": entry}, 0).Sheds
 	if len(got) != 1 {
 		t.Fatalf("want 1 running shed over mtls, got %#v", got)
 	}
@@ -404,7 +404,7 @@ func TestList_MTLSEntrySendsClientCertificateAndSucceeds(t *testing.T) {
 	}
 }
 
-// TestList_NoStoredCredentialIsSkippedWithoutDialing pins the "never mint,
+// TestInventory_NoStoredCredentialIsSkippedWithoutDialing pins the "never mint,
 // never enroll" contract: a secure entry with no token recorded at all is a
 // server that WOULD need an SSH round trip to become usable, and this
 // package must never trigger one — so it must not even attempt the HTTP
@@ -415,7 +415,7 @@ func TestList_MTLSEntrySendsClientCertificateAndSucceeds(t *testing.T) {
 // attempted to enroll. The on-disk-config-unchanged and entry-unmutated
 // assertions below prove the stronger claim: List truly never persists or
 // touches anything, not just that this one request never landed.
-func TestList_NoStoredCredentialIsSkippedWithoutDialing(t *testing.T) {
+func TestInventory_NoStoredCredentialIsSkippedWithoutDialing(t *testing.T) {
 	handler, hits := shedsHandler(t, config.Shed{Name: "a", Status: config.StatusRunning})
 	ts := httptest.NewServer(http.HandlerFunc(handler))
 	defer ts.Close()
@@ -438,7 +438,7 @@ func TestList_NoStoredCredentialIsSkippedWithoutDialing(t *testing.T) {
 		t.Fatalf("read fixture config: %v", err)
 	}
 
-	got := List(context.Background(), map[string]config.ServerEntry{"srv": entry}, 0)
+	got := Inventory(context.Background(), map[string]config.ServerEntry{"srv": entry}, 0).Sheds
 	if len(got) != 0 {
 		t.Fatalf("no stored credential must be skipped, got %#v", got)
 	}
@@ -458,12 +458,12 @@ func TestList_NoStoredCredentialIsSkippedWithoutDialing(t *testing.T) {
 	}
 }
 
-// TestList_MTLSEntryWithNoCertFilesIsSkipped is the mtls twin of the above:
+// TestInventory_MTLSEntryWithNoCertFilesIsSkipped is the mtls twin of the above:
 // AuthMode mtls but no cert/key path recorded (or an unreadable pair) is
 // also a "would need to enroll" shape, never dialed — and, as above,
 // strengthened to prove no persistence and no mutation rather than only
 // "the handler was never hit".
-func TestList_MTLSEntryWithNoCertFilesIsSkipped(t *testing.T) {
+func TestInventory_MTLSEntryWithNoCertFilesIsSkipped(t *testing.T) {
 	handler, hits := shedsHandler(t, config.Shed{Name: "a", Status: config.StatusRunning})
 	ts := httptest.NewServer(http.HandlerFunc(handler))
 	defer ts.Close()
@@ -487,7 +487,7 @@ func TestList_MTLSEntryWithNoCertFilesIsSkipped(t *testing.T) {
 		t.Fatalf("read fixture config: %v", err)
 	}
 
-	got := List(context.Background(), map[string]config.ServerEntry{"srv": entry}, 0)
+	got := Inventory(context.Background(), map[string]config.ServerEntry{"srv": entry}, 0).Sheds
 	if len(got) != 0 {
 		t.Fatalf("an mtls entry with no cert files must be skipped, got %#v", got)
 	}
@@ -507,7 +507,7 @@ func TestList_MTLSEntryWithNoCertFilesIsSkipped(t *testing.T) {
 	}
 }
 
-func TestList_ConcurrentAcrossServers(t *testing.T) {
+func TestInventory_ConcurrentAcrossServers(t *testing.T) {
 	const delay = 150 * time.Millisecond
 	slow := func(name string) *httptest.Server {
 		return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -523,10 +523,10 @@ func TestList_ConcurrentAcrossServers(t *testing.T) {
 	defer ts2.Close()
 
 	start := time.Now()
-	got := List(context.Background(), map[string]config.ServerEntry{
+	got := Inventory(context.Background(), map[string]config.ServerEntry{
 		"srv1": openEntry(ts1),
 		"srv2": openEntry(ts2),
-	}, 0)
+	}, 0).Sheds
 	elapsed := time.Since(start)
 
 	if len(got) != 2 {
@@ -539,7 +539,7 @@ func TestList_ConcurrentAcrossServers(t *testing.T) {
 	}
 }
 
-func TestList_OrderedByServerThenShedName(t *testing.T) {
+func TestInventory_OrderedByServerThenShedName(t *testing.T) {
 	handlerA, _ := shedsHandler(t,
 		config.Shed{Name: "zeta", Status: config.StatusRunning},
 		config.Shed{Name: "alpha", Status: config.StatusRunning},
@@ -550,10 +550,10 @@ func TestList_OrderedByServerThenShedName(t *testing.T) {
 	tsB := httptest.NewServer(handlerB)
 	defer tsB.Close()
 
-	got := List(context.Background(), map[string]config.ServerEntry{
+	got := Inventory(context.Background(), map[string]config.ServerEntry{
 		"bserver": openEntry(tsB),
 		"aserver": openEntry(tsA),
-	}, 0)
+	}, 0).Sheds
 
 	var order [][2]string
 	for _, r := range got {
@@ -568,4 +568,48 @@ func TestList_OrderedByServerThenShedName(t *testing.T) {
 			t.Fatalf("got %#v, want %#v", order, want)
 		}
 	}
+}
+
+// TestInventory_TracksWhichServersAnswered covers the one bit Inventory adds
+// over List, and the only thing it is for: telling "the fleet is idle" apart
+// from "the fleet is unreachable", which is the difference between plan 019
+// §3.2's two pinned empty-menu rows. Collapsing them would tell a user with a
+// dead VPN that they have no sheds.
+func TestInventory_TracksWhichServersAnswered(t *testing.T) {
+	handler, _ := shedsHandler(t, config.Shed{Name: "a", Status: config.StatusRunning})
+	up := httptest.NewServer(handler)
+	defer up.Close()
+
+	// A server that answers with no running sheds: reachable, just idle.
+	idleHandler, _ := shedsHandler(t)
+	idle := httptest.NewServer(idleHandler)
+	defer idle.Close()
+
+	// A server that is configured but not listening: httptest hands out a real
+	// address and then it is closed, so the dial is refused rather than
+	// hanging.
+	down := httptest.NewServer(handler)
+	downEntry := openEntry(down)
+	down.Close()
+
+	inv := Inventory(context.Background(), map[string]config.ServerEntry{
+		"up":   openEntry(up),
+		"idle": openEntry(idle),
+		"down": downEntry,
+	}, 2*time.Second)
+
+	if got := len(inv.Sheds); got != 1 {
+		t.Fatalf("sheds = %+v", inv.Sheds)
+	}
+	assertSeq(t, "Tried", inv.Tried, []string{"down", "idle", "up"})
+	// `idle` answered with nothing running; `down` never answered. Both
+	// contribute no sheds, and only one of them is a problem.
+	assertSeq(t, "Answered", inv.Answered, []string{"idle", "up"})
+
+	// And the row that falls out of a fleet where NOTHING answered.
+	allDown := Inventory(context.Background(), map[string]config.ServerEntry{
+		"down": downEntry,
+	}, 2*time.Second)
+	m := ListMenu(allDown, nil)
+	assertNoneRow(t, m.Items[0], "no shed-server answered", "down")
 }

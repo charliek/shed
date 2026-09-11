@@ -131,6 +131,93 @@ func TestDecodeMachines_MalformedEntrySkippedNotFatal(t *testing.T) {
 	}
 }
 
+// TestDecodeMachines_OptionShapedHostOrUserSkipped: an ssh destination that
+// begins with a dash is not a host.
+//
+// OpenSSH parses options BEFORE the destination word, so `host:
+// "-oProxyCommand=…"` reaches ssh as an option and runs that command on the
+// USER'S OWN machine — verified against the local ssh: `ssh -G -oPort=7777 --
+// echo hi` reports `port 7777` and `hostname echo`, so even a trailing `--`
+// cannot save it. roost refuses the same shape in its own target classifier.
+// Skipped with a note, like every other malformed entry, and — as with those —
+// the entries around it must still decode.
+func TestDecodeMachines_OptionShapedHostOrUserSkipped(t *testing.T) {
+	tests := []struct {
+		name    string
+		yamlDoc string
+		skipped string
+	}{
+		{
+			"an option-shaped host",
+			`machines:
+    ok:
+        host: fine.example.com
+    evil:
+        host: -oProxyCommand=touch /tmp/pwned
+`,
+			"evil",
+		},
+		{
+			"an option-shaped user",
+			`machines:
+    ok:
+        host: fine.example.com
+    evil:
+        host: mini2
+        user: -oProxyCommand=id
+`,
+			"evil",
+		},
+		{
+			// No explicit `host:`, so the KEY becomes the host — the same
+			// injection by another route.
+			"an option-shaped entry name with no host of its own",
+			`machines:
+    ok:
+        host: fine.example.com
+    -oProxyCommand=id: {}
+`,
+			"-oProxyCommand=id",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var entries []MachineEntry
+			stderr := captureStderr(t, func() { entries = mustParseMachines(t, tt.yamlDoc) })
+
+			if got := byName(entries, tt.skipped); got != nil {
+				t.Fatalf("an option-shaped entry must be skipped, got %#v", *got)
+			}
+			if got := byName(entries, "ok"); got == nil || got.Host != "fine.example.com" {
+				t.Fatalf("the entry beside it must still decode: %#v", entries)
+			}
+			if !bytes.Contains([]byte(stderr), []byte(tt.skipped)) {
+				t.Fatalf("expected a stderr note naming the skipped entry, got %q", stderr)
+			}
+			if !bytes.Contains([]byte(stderr), []byte("begins with a dash")) {
+				t.Fatalf("expected the note to say why, got %q", stderr)
+			}
+		})
+	}
+
+	// A dash elsewhere is ordinary and must not be touched — `mini-3` is a
+	// perfectly good hostname and `build-bot` a perfectly good user.
+	t.Run("a dash that is not the first character is fine", func(t *testing.T) {
+		entries := mustParseMachines(t, `machines:
+    mini-3:
+        host: mini-3.local
+        user: build-bot
+`)
+		got := byName(entries, "mini-3")
+		if got == nil {
+			t.Fatalf("mini-3 missing: %#v", entries)
+		}
+		if got.Host != "mini-3.local" || got.User != "build-bot" {
+			t.Fatalf("got %#v", *got)
+		}
+	})
+}
+
 // TestDecodeMachines_SSHPortOutOfRangeFallsBackTo22 pins the Go decoder's
 // range check against the Rust decoder's: shed-core's MachineEntry holds
 // ssh_port as a u16, so a value that doesn't parse into 1..65535 falls back
