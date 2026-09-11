@@ -60,6 +60,8 @@ const VECTOR_TAB_OPEN: &str =
 const VECTOR_ERROR: &str = include_str!("../../../fixtures/roost-vectors/response.error.json");
 const VECTOR_SESSION_CONNECT: &str =
     include_str!("../../../fixtures/roost-vectors/session.connect.response.json");
+const VECTOR_SET_AGENT_HOOKS: &str =
+    include_str!("../../../fixtures/roost-vectors/session.set_agent_hooks.response.json");
 const VECTOR_EVENTS_SUBSCRIBE: &str =
     include_str!("../../../fixtures/roost-vectors/events.subscribe.response.json");
 const VECTOR_EVENTS_BATCH: &str = include_str!("../../../fixtures/roost-vectors/events.batch.json");
@@ -102,20 +104,28 @@ const STREAM_WRITE_DEADLINE: std::time::Duration = std::time::Duration::from_sec
 /// A scratch directory that removes itself. Hand-rolled rather than `tempfile`
 /// so this module — which compiles into the *library* under `test-support` —
 /// adds no non-dev dependency to `shed-core`.
-struct ScratchDir(PathBuf);
+///
+/// Shared with `roost::bootstrap`'s hermetic rig, which needs the same thing for
+/// the same reason; the prefix is what tells two scratch dirs apart in a `/tmp`
+/// listing when something goes wrong.
+pub(crate) struct ScratchDir(pub(crate) PathBuf);
 
 impl ScratchDir {
     fn new() -> ScratchDir {
+        ScratchDir::with_prefix("shed-fake-roost")
+    }
+
+    pub(crate) fn with_prefix(prefix: &str) -> ScratchDir {
         static NEXT: AtomicU64 = AtomicU64::new(0);
         // Short by design: a `sun_path` is 108 bytes, and a socket under a long
         // temp path fails to bind with a confusing error.
         let path = std::env::temp_dir().join(format!(
-            "shed-fake-roost-{}-{}",
+            "{prefix}-{}-{}",
             std::process::id(),
             NEXT.fetch_add(1, Ordering::Relaxed)
         ));
         let _ = std::fs::remove_dir_all(&path);
-        std::fs::create_dir_all(&path).expect("creating the fake roost scratch dir");
+        std::fs::create_dir_all(&path).expect("creating a scratch dir");
         ScratchDir(path)
     }
 }
@@ -176,6 +186,13 @@ struct FakeState {
     tombstone: Option<String>,
     /// Seeds the deterministic lease mint.
     lease_counter: u64,
+    /// Every `session.set_agent_hooks` this fake has served, params verbatim —
+    /// the assertion that shed sent `mode: auto`, `client: <label>` and an
+    /// empty skip list, and that it sent it exactly when it says it does.
+    agent_hooks_calls: Vec<Value>,
+    /// What the next `session.set_agent_hooks` answers with, on top of the
+    /// vendored vector's shape. `None` is the vector as recorded.
+    agent_hooks_result: Option<Value>,
     /// Registered event streams, by connection id. A takeover reclassifies these
     /// in place; it never closes them.
     streams: BTreeMap<u64, StreamKind>,
@@ -233,6 +250,8 @@ impl FakeState {
             lease_label: None,
             tombstone: None,
             lease_counter: 0,
+            agent_hooks_calls: Vec::new(),
+            agent_hooks_result: None,
             streams: BTreeMap::new(),
             tab_list_calls: 0,
             before_tab_list: None,
@@ -333,8 +352,14 @@ impl FakeState {
         minted
     }
 
-    /// How a `tab.write`'s `lease` key is judged on a **session** socket.
-    fn check_write_lease(&self, presented: Option<&str>) -> Result<(), Refusal> {
+    /// How a lease-carrying op's `lease` key is judged on a **session** socket
+    /// — roost's whole table, and the one every such op shares.
+    ///
+    /// `tab.write` was the first caller and `session.set_agent_hooks` (plan 019)
+    /// is the second; the `op` is in the `connect-required` message only,
+    /// because that is the one refusal whose text names what the caller was
+    /// trying to do.
+    fn check_lease(&self, op: &str, presented: Option<&str>) -> Result<(), Refusal> {
         match presented {
             Some(lease) if Some(lease) == self.lease.as_deref() => Ok(()),
             Some(lease) if Some(lease) == self.tombstone.as_deref() => Err(refuse(
@@ -344,7 +369,7 @@ impl FakeState {
             // Absent, unknown, or a lease displaced twice and forgotten.
             _ => Err(refuse(
                 "connect-required",
-                "tab.write on a session socket needs the interactive lease",
+                format!("{op} on a session socket needs the interactive lease"),
             )),
         }
     }
@@ -697,6 +722,26 @@ impl FakeRoost {
     /// The lease currently held, if any.
     pub fn lease(&self) -> Option<String> {
         self.lock().lease.clone()
+    }
+
+    /// Every `session.set_agent_hooks` this fake has served, params verbatim.
+    ///
+    /// The assertion that shed asked for what it says it asks for — `mode:
+    /// "auto"`, an empty `skip`, its own `client` label — and, just as
+    /// important, that it asked **only** where consent was given: an empty list
+    /// is what "no hook op happened without consent" looks like.
+    pub fn agent_hooks_calls(&self) -> Vec<Value> {
+        self.lock().agent_hooks_calls.clone()
+    }
+
+    /// Answer the next `session.set_agent_hooks` with this `result` instead of
+    /// the vendored vector's.
+    ///
+    /// For the partial-failure row: roost reports per-agent `errors` inside a
+    /// **successful** reply, and a client that treated a non-empty `errors` as a
+    /// failed call would throw away four wired agents over one that was not.
+    pub fn set_agent_hooks_result(&self, result: Value) {
+        self.lock().agent_hooks_result = Some(result);
     }
 
     /// The label the current lease holder reported on `session.connect`.
@@ -1148,7 +1193,7 @@ fn dispatch(
             // no leases, and refusing it would make one client unable to talk to
             // both kinds of socket.
             if !state.ui_socket {
-                state.check_write_lease(presented)?;
+                state.check_lease("tab.write", presented)?;
                 // **Presenting the live lease REGISTERS this connection under
                 // it**, exactly as roost's `present()` does for every
                 // lease-carrying op — not just for `session.connect`. A takeover
@@ -1202,6 +1247,41 @@ fn dispatch(
             result["revision"] = json!(state.revision);
             Ok(result)
         }
+        "session.set_agent_hooks" => {
+            // roost's own order: decode, then the lease gate, then act. This op
+            // WRITES FILES under the session user's home, which is the sharpest
+            // reason of any lease-gated op to check authority before doing
+            // anything with the params.
+            if state.ui_socket {
+                return Err(refuse("unknown-op", "no such op: session.set_agent_hooks"));
+            }
+            let presented = params.get("lease").and_then(Value::as_str);
+            state.check_lease("session.set_agent_hooks", presented)?;
+            // Presenting the live lease registers this connection under it,
+            // exactly as it does for `tab.write` — so a takeover closes this
+            // connection too.
+            *held_lease = presented.map(str::to_string);
+            match params.get("mode").and_then(Value::as_str) {
+                Some("auto") | Some("off") => {}
+                other => {
+                    return Err(refuse(
+                        "invalid-param",
+                        format!("session.set_agent_hooks mode: {other:?}"),
+                    ))
+                }
+            }
+            if params.get("client").and_then(Value::as_str).is_none() {
+                return Err(refuse(
+                    "invalid-param",
+                    "session.set_agent_hooks needs a `client`",
+                ));
+            }
+            state.agent_hooks_calls.push(params.clone());
+            Ok(match &state.agent_hooks_result {
+                Some(seeded) => seeded.clone(),
+                None => vector(VECTOR_SET_AGENT_HOOKS)["result"].clone(),
+            })
+        }
         // Everything else: the fake serves inventory, the lease ops and the
         // one-shots, and an op shed reaches for that roost does not serve here
         // should fail loudly in a test rather than pass.
@@ -1233,7 +1313,7 @@ mod tests {
     use super::*;
 
     use roost_ipc::client::{EventFrame, ServerCode};
-    use roost_ipc::messages::SESSION_PROTOCOL_VERSION;
+    use roost_ipc::messages::{AgentHooksMode, SESSION_PROTOCOL_VERSION};
 
     use crate::roost::{Conn, RoostError};
 
@@ -1251,6 +1331,12 @@ mod tests {
         assert!(vector(VECTOR_ERROR)["error"]["code"].is_string());
         assert!(vector(VECTOR_IDENTIFY)["result"]["app_label"].is_string());
         assert!(vector(VECTOR_SESSION_CONNECT)["result"]["lease"].is_string());
+        for key in ["wired", "refreshed", "removed", "skipped", "errors"] {
+            assert!(
+                vector(VECTOR_SET_AGENT_HOOKS)["result"][key].is_array(),
+                "the set_agent_hooks vector carries {key}"
+            );
+        }
         assert!(vector(VECTOR_EVENTS_SUBSCRIBE)["result"]["revision"].is_u64());
         assert_eq!(
             vector(VECTOR_SESSION_DRIVER_CHANGED)["event"],
@@ -1430,6 +1516,71 @@ mod tests {
             .await
             .expect_err("authorized, and the tab really is gone");
         assert_eq!(missing.server_code(), Some(ServerCode::NotFound));
+    }
+
+    /// `session.set_agent_hooks` is behind the **same** lease registry, with
+    /// roost's own three codes — which is the point of there being one
+    /// `check_lease` rather than one per op.
+    ///
+    /// It is also the sharpest case for the gate: this op makes the host write
+    /// files under its own `$HOME`.
+    #[tokio::test]
+    async fn the_agent_hooks_op_is_behind_the_same_lease_registry() {
+        let fake = FakeRoost::start().await;
+        let mut conn = Conn::unix(fake.socket_path()).await.expect("dial");
+
+        let blind = conn
+            .session_set_agent_hooks("nope", AgentHooksMode::Auto, &[], "shed-desktop")
+            .await
+            .expect_err("an unknown lease writes nothing");
+        assert_eq!(blind.server_code(), Some(ServerCode::ConnectRequired));
+        assert!(
+            fake.agent_hooks_calls().is_empty(),
+            "a refused call is not a served call"
+        );
+
+        let lease = conn
+            .session_connect(false, Some("shed-desktop"))
+            .await
+            .expect("mints")
+            .lease;
+        let result = conn
+            .session_set_agent_hooks(&lease, AgentHooksMode::Auto, &[], "shed-desktop")
+            .await
+            .expect("authorized");
+        assert_eq!(
+            result.wired,
+            vec!["claude".to_string(), "codex".to_string()]
+        );
+        let calls = fake.agent_hooks_calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0]["mode"], json!("auto"));
+
+        // Displaced: the deposed holder hears `taken-over`, not
+        // `connect-required`.
+        let mut other = Conn::unix(fake.socket_path()).await.expect("dial");
+        other
+            .session_connect(true, Some("usurper"))
+            .await
+            .expect("takes over");
+        let mut again = Conn::unix(fake.socket_path()).await.expect("dial");
+        let deposed = again
+            .session_set_agent_hooks(&lease, AgentHooksMode::Auto, &[], "shed-desktop")
+            .await
+            .expect_err("that lease was displaced");
+        assert_eq!(deposed.server_code(), Some(ServerCode::TakenOver));
+
+        // And a leaseless connect against a live lease is `already-connected` —
+        // the code shed reads as "somebody else drives; step back".
+        let mut third = Conn::unix(fake.socket_path()).await.expect("dial");
+        assert_eq!(
+            third
+                .session_connect(false, Some("shed-desktop"))
+                .await
+                .expect_err("somebody holds it")
+                .server_code(),
+            Some(ServerCode::AlreadyConnected)
+        );
     }
 
     /// The takeover table, and the **one** tombstone behind it.

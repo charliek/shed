@@ -1,0 +1,1 @@
+sh -c 'tee -- /home/shed/.local/bin/roost-session.tmp.4242 > /dev/null'

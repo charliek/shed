@@ -1,0 +1,1 @@
+sh -c 'exec /home/shed/.local/bin/roost-session start'

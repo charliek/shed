@@ -1,0 +1,14 @@
+{
+  "id": "11",
+  "ok": true,
+  "result": {
+    "wired": ["claude", "codex"],
+    "refreshed": [],
+    "removed": [],
+    "skipped": [
+      { "agent": "cursor", "reason": "skip-list" },
+      { "agent": "grok", "reason": "not installed" }
+    ],
+    "errors": []
+  }
+}
