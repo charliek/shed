@@ -312,10 +312,14 @@ function ShedsPane({ sheds, hostErrors, refresh, onNew }: { sheds: Shed[]; hostE
 /** Add a machine — a native host reached over SSH that runs the RC hub.
  *
  *  Mirrors the New Shed dialog because it is the same kind of act: naming a
- *  place your sessions can run. The fields are exactly `MachineEntry`, and the
- *  one that trips people is `sx path` — an `ssh <host> <cmd>` exec sees the
- *  NON-login PATH, which routinely omits `~/.local/bin` and `/opt/homebrew/bin`,
- *  so an absolute path there is the normal case rather than an exotic override.
+ *  place your sessions can run.
+ *
+ *  It does NOT collect `rc_bin` (it was labelled "sx path"). `sx` was sunset,
+ *  unreleased, in plan 016, so the field asked for a path to a binary that no
+ *  longer ships and that nobody filling in this dialog could usefully supply.
+ *  `machine.add` still ACCEPTS `rc_bin` and the config reader still honours an
+ *  entry that has one, so a hand-written config keeps working — this is the
+ *  form dropping a question, not the wire dropping a field.
  */
 function NewMachineDialog({ onClose, onAdded }: { onClose: () => void; onAdded: () => void }) {
   const fid = useId();
@@ -323,7 +327,6 @@ function NewMachineDialog({ onClose, onAdded }: { onClose: () => void; onAdded: 
   const [host, setHost] = useState("");
   const [user, setUser] = useState("");
   const [sshPort, setSshPort] = useState("22");
-  const [rcBin, setRcBin] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -341,7 +344,6 @@ function NewMachineDialog({ onClose, onAdded }: { onClose: () => void; onAdded: 
         host: host.trim() || undefined,
         user: user.trim() || undefined,
         ssh_port: sshPort.trim() ? Number(sshPort) : undefined,
-        rc_bin: rcBin.trim() || undefined,
       });
       onAdded();
       onClose();
@@ -392,11 +394,6 @@ function NewMachineDialog({ onClose, onAdded }: { onClose: () => void; onAdded: 
       <Field label="SSH port">
         <input id={`${fid}-port`} className={dialogInput} value={sshPort} inputMode="numeric"
           onChange={(e) => setSshPort(e.target.value)} />
-      </Field>
-      <Field label="sx path" hint="optional"
-        help="Where sx lives on that machine. An ssh exec sees the NON-login PATH, which usually omits ~/.local/bin and /opt/homebrew/bin — so an absolute path here is the normal case.">
-        <input id={`${fid}-bin`} className={dialogInput} value={rcBin} placeholder="/home/charliek/.local/bin/sx"
-          onChange={(e) => setRcBin(e.target.value)} />
       </Field>
       {error && (
         <div className="text-[13px] leading-snug" style={{ color: "var(--shed-danger)" }}>{error}</div>
