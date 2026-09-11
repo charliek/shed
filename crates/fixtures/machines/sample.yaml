@@ -1,0 +1,31 @@
+# Shared two-language fixture for the `machines:` section (plan 019 C1) — see
+# README.md in this directory. Both shed-core's config parser
+# (crates/shed-core/src/config.rs) and Go's tolerant decoder
+# (internal/config/machines.go) are asserted against this file and its
+# expected.json; update both tests together when you touch it.
+#
+# Four cases, one per entry:
+#   bare    — name only: host defaults to the entry name, ssh_port to 22,
+#             every optional absent.
+#   full    — every field Go models set explicitly.
+#   withrc  — carries `rc_bin` (Rust-owned, Go ignores it) and an unknown key
+#             (`color`) neither language models; must still decode cleanly.
+#   broken  — malformed: its value is a scalar, not a mapping. Both decoders
+#             must skip it (with a stderr note on the Go side) and keep
+#             decoding the entries around it.
+#
+# The entries are deliberately NOT in alphabetical document order: both
+# decoders sort by name, and an already-sorted sample would let a decoder
+# that merely preserved document order pass by coincidence.
+machines:
+    withrc:
+        host: side.example.com
+        rc_bin: /opt/homebrew/bin/shed-machine-rc
+        color: blue
+    broken: not-a-mapping-value
+    full:
+        host: builder.example.com
+        user: charliek
+        ssh_port: 2022
+        known_hosts: /Users/dev/.ssh/known_hosts
+    bare: {}

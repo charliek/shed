@@ -26,12 +26,18 @@ type ClientConfig struct {
 	Sheds         map[string]ShedCache   `yaml:"sheds"`
 	CreateTimeout time.Duration          `yaml:"create_timeout,omitempty"`
 
-	// Machines is an OPAQUE passthrough of the `machines:` section owned by
-	// shed-core's config parser — remote-machine targets for rc-session kickoff. Go
-	// neither reads nor validates it (the schema is defined Rust-side); the field
-	// exists ONLY so SaveToPath's whole-document rewrite round-trips the subtree
-	// instead of silently deleting user data on the next `shed` command that
-	// updates this file (cache refresh, `shed server add`, token mint…).
+	// Machines carries the `machines:` section — remote-machine targets for
+	// rc-session kickoff. The SCHEMA is Rust-owned (shed-core's config
+	// parser, crates/shed-core/src/config.rs's MachineEntry); Go reads a
+	// tolerant SUBSET of it (DecodeMachines, internal/config/machines.go —
+	// name/host/user/ssh_port/known_hosts, deliberately not rc_bin, plan 019
+	// pin P7) for the `shed roost-provider` menu, but never writes or
+	// validates it. Keeping the field itself typed as the raw yaml.Node,
+	// rather than replacing it with the decoded struct, is what makes
+	// SaveToPath's whole-document rewrite round-trip the subtree byte-for-byte
+	// instead of silently dropping any field Go's subset doesn't model on the
+	// next `shed` command that updates this file (cache refresh, `shed server
+	// add`, token mint…).
 	Machines yaml.Node `yaml:"machines,omitempty"`
 
 	// updateMu serializes Update against itself inside THIS process, so the

@@ -152,10 +152,16 @@ fn is_http_url_with_host(s: &str) -> bool {
 /// One `machines:` entry — a **native** host (not a shed) that runs the RC
 /// helper, reachable over plain SSH (plan 009 §3.3).
 ///
-/// The section is **Rust-defined and Rust-owned**: the Go `shed` CLI carries it
-/// as a schema-agnostic passthrough (`ClientConfig.Machines yaml.Node`, added in
-/// plan 009 C2) purely so a whole-document `SaveToPath` round-trip cannot delete
-/// it. Nothing in Go interprets these fields.
+/// The SCHEMA is **Rust-defined and Rust-owned**. The Go `shed` CLI still
+/// carries the raw section as a schema-agnostic passthrough
+/// (`ClientConfig.Machines yaml.Node`, added in plan 009 C2) so a
+/// whole-document `SaveToPath` round-trip cannot delete it — but as of plan
+/// 019 C1, Go additionally READS a tolerant SUBSET of these fields through
+/// its own decoder, `internal/config/machines.go` (`DecodeMachines`):
+/// `name`/`host`/`user`/`ssh_port`/`known_hosts`, deliberately never
+/// `rc_bin` (plan 019 pin P7). That decoder never writes this section and
+/// never validates it beyond skip-on-malformed — Rust remains the schema's
+/// sole owner and the only place `rc_bin` is modeled.
 ///
 /// Absent optionals mean "defer to ssh": no `user` → whatever `~/.ssh/config` (or
 /// the current login) resolves, no `known_hosts` → the user's normal file with
@@ -637,6 +643,69 @@ default_server: mini2
         );
         assert!(config.machines.is_empty());
         assert_eq!(config.servers.len(), 1);
+    }
+
+    /// Plan 019 C1's shared two-language fixture: asserts the FULL
+    /// `MachineEntry` shape — including `rc_bin`, which Go's decoder
+    /// (`internal/config/machines.go`) deliberately does not model (pin P7) —
+    /// against `crates/fixtures/machines/expected.json`. See that directory's
+    /// README for the asymmetry this test and its Go twin split between them.
+    #[test]
+    fn machines_fixture_matches_expected_json() {
+        #[derive(serde::Deserialize)]
+        struct ExpectedEntry {
+            name: String,
+            host: String,
+            user: Option<String>,
+            ssh_port: u16,
+            rc_bin: Option<String>,
+            known_hosts: Option<String>,
+        }
+        #[derive(serde::Deserialize)]
+        struct Expected {
+            entries: Vec<ExpectedEntry>,
+        }
+
+        let config = ShedConfig::parse(include_str!("../../fixtures/machines/sample.yaml"));
+        let expected: Expected =
+            serde_json::from_str(include_str!("../../fixtures/machines/expected.json"))
+                .expect("valid expected.json");
+
+        // `broken` must be skipped, not merely absent from the expectation —
+        // pin the count so a decoder that silently drops a THIRD entry can't
+        // pass by accident.
+        assert_eq!(config.machines.len(), expected.entries.len());
+
+        for want in &expected.entries {
+            let got = config
+                .machine(&want.name)
+                .unwrap_or_else(|| panic!("fixture entry {:?} missing from decode", want.name));
+            assert_eq!(got.host, want.host, "host for {}", want.name);
+            assert_eq!(got.user, want.user, "user for {}", want.name);
+            assert_eq!(got.ssh_port, want.ssh_port, "ssh_port for {}", want.name);
+            assert_eq!(got.rc_bin, want.rc_bin, "rc_bin for {}", want.name);
+            assert_eq!(
+                got.known_hosts, want.known_hosts,
+                "known_hosts for {}",
+                want.name
+            );
+        }
+        assert!(
+            config.machine("broken").is_none(),
+            "the malformed entry must be skipped, not decoded"
+        );
+
+        // ORDER, not just membership. expected.json is written sorted by name
+        // and the fixture's document order deliberately is not, so this is the
+        // assertion that proves the sort rather than assuming it — the lookups
+        // above are by name and would pass on any permutation. Its Go twin
+        // (internal/config/machines_test.go) asserts the same sequence.
+        let got_names: Vec<&str> = config.machines.iter().map(|m| m.name.as_str()).collect();
+        let want_names: Vec<&str> = expected.entries.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(
+            got_names, want_names,
+            "machines: entries must be sorted by name"
+        );
     }
 
     /// The mtls half of the same fixture (plan 001 D6). Swift does not model
