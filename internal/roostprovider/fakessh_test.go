@@ -321,7 +321,7 @@ func (r *rig) writeReplies(dir string, protocol int, projects []Project) {
 	mustWrite(t, filepath.Join(dir, "identify.json"),
 		fmt.Sprintf("roost-session 0.0.19 protocol %d\n", protocol), 0o644)
 
-	identify := readVectorMap(t, "session.identify.response.v4.json")
+	identify := readVectorMap(t, "session.identify.response.v5.json")
 	identify["id"] = wireRequestID
 	identify["result"].(map[string]any)["session_protocol"] = protocol
 	mustWrite(t, filepath.Join(dir, "reply.identify.ndjson"), compactLine(t, identify), 0o644)

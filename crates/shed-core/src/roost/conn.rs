@@ -28,10 +28,10 @@ use std::path::{Path, PathBuf};
 
 use roost_ipc::client::{EventFrame, EventStream, ServerCode};
 use roost_ipc::messages::{
-    ops, AgentHooksMode, IdentifyParams, IdentifyResult, SessionConnectParams,
-    SessionConnectResult, SessionIdentify, SessionIdentifyParams, SessionSetAgentHooksParams,
-    SessionSetAgentHooksResult, Tab, TabCloseParams, TabDumpParams, TabDumpResult, TabListResult,
-    TabOpenParams, TabOpenResult, TabWriteParams, WireTabRef, SESSION_PROTOCOL_VERSION,
+    ops, AgentHooksMode, IdentifyParams, IdentifyResult, SessionIdentify, SessionIdentifyParams,
+    SessionSetAgentHooksParams, SessionSetAgentHooksResult, Tab, TabCloseParams, TabDumpParams,
+    TabDumpResult, TabListResult, TabOpenParams, TabOpenResult, TabWriteParams, WireTabRef,
+    SESSION_PROTOCOL_VERSION,
 };
 use roost_ipc::{ClientError, IpcClient};
 use tokio::net::{TcpStream, UnixStream};
@@ -154,17 +154,18 @@ impl Conn {
     ///   roost's documented way of telling the two apart. Shed must never read a
     ///   UI socket as inventory.
     /// * `session_protocol` ≠ [`SESSION_PROTOCOL_VERSION`] →
-    ///   [`RoostError::ProtocolMismatch`]. The number covers the lease semantics
-    ///   and the lease-gated op set; a client that ignores it does not fail
-    ///   until it tries to write.
+    ///   [`RoostError::ProtocolMismatch`]. The number covers the whole op set
+    ///   and its parameter shapes; a client that ignores it does not fail until
+    ///   it sends a request the peer's generation refuses to decode.
+    ///
+    /// **At generation 5 the integer is the whole negotiation.** roost's
+    /// `features` list retired with the lease — there is no additive-op channel
+    /// beside the number any more, so equality here is the only compatibility
+    /// question there is to ask.
     ///
     /// The returned [`SessionIdentify`] identifies the **daemon instance**:
     /// `session_id` changes on restart and `revision` resets with it, which is
-    /// why a watcher fences per connection rather than globally. Its `features`
-    /// list is roost's channel for an *additive* session op — one that does not
-    /// spend a whole generation — and is carried through as an open list:
-    /// preserved, never interpreted here, and empty when the peer sends no such
-    /// key at all.
+    /// why a watcher fences per connection rather than globally.
     pub async fn session_identify(&mut self) -> Result<SessionIdentify, RoostError> {
         let identify: SessionIdentify = match self
             .client
@@ -223,6 +224,13 @@ impl Conn {
 
     /// `tab.dump` — one tab's live viewport as text. Read-only; this is the
     /// whole of the "peek" affordance until roost R3 lands attach.
+    ///
+    /// `scrollback: 0` is deliberate and stays deliberate: a peek is a viewport
+    /// read, and history above it is a different affordance with a different
+    /// cost (roost formats the rows on the thread that owns the terminal). The
+    /// key is omit-when-zero on roost's side, so a viewport-only request is
+    /// byte-identical to what shed sent before the field existed — which is
+    /// what `tab.dump.request.json` pins.
     pub async fn tab_dump(&mut self, tab_id: i64) -> Result<TabDumpResult, RoostError> {
         Ok(self
             .client
@@ -230,13 +238,13 @@ impl Conn {
                 ops::TAB_DUMP,
                 TabDumpParams {
                     tab_id: WireTabRef::Local(tab_id),
+                    scrollback: 0,
                 },
             )
             .await?)
     }
 
     /// `tab.open` — start a tab (an agent, given its argv) and get it back.
-    /// Lease-free, like every other op here except `events.subscribe`.
     pub async fn tab_open(&mut self, params: TabOpenParams) -> Result<Tab, RoostError> {
         let result: TabOpenResult = self.client.call(ops::TAB_OPEN, params).await?;
         Ok(result.tab)
@@ -245,29 +253,19 @@ impl Conn {
     /// `tab.write` — raw bytes into a tab's PTY, base64 on the wire. Byte-exact:
     /// this is how a prompt gets typed at an agent.
     ///
-    /// **On a session socket the lease is required** (roost R1, session protocol
-    /// 4): a write is an interactive act and belongs to whoever holds the driver
-    /// lease, so `None` earns `connect-required` and a lease a takeover has
-    /// displaced earns `taken-over`. Mint one with [`Self::session_connect`]. On
-    /// a **UI** socket the key is accepted and ignored, which is why this is an
-    /// `Option` rather than two methods — one caller talks to both sockets.
-    ///
-    /// `None` omits the key entirely rather than sending an empty string:
-    /// [`TabWriteParams`] is `deny_unknown_fields` on roost's side too, so a
-    /// lease-less request has to stay byte-identical to what it always was.
-    pub async fn tab_write(
-        &mut self,
-        tab_id: i64,
-        data: &[u8],
-        lease: Option<&str>,
-    ) -> Result<(), RoostError> {
+    /// **Unowned at session protocol 5.** Generation 4 gated a write behind the
+    /// single interactive lease — `connect-required` without one, `taken-over`
+    /// on a displaced one. roost retired that token, so a write is now open to
+    /// every same-UID client and the request carries nothing but the tab and the
+    /// bytes. The mediation that remains is the user's: one person owns every
+    /// client that can reach this socket.
+    pub async fn tab_write(&mut self, tab_id: i64, data: &[u8]) -> Result<(), RoostError> {
         self.client
             .call_raw(
                 ops::TAB_WRITE,
                 TabWriteParams {
                     tab_id,
                     data: data.to_vec(),
-                    lease: lease.map(str::to_string),
                 },
             )
             .await?;
@@ -283,41 +281,6 @@ impl Conn {
         Ok(())
     }
 
-    /// `session.connect` — take the session's single interactive lease.
-    ///
-    /// **A watcher must not call this.** Reading is free at session protocol 4
-    /// — [`Self::subscribe`] takes no lease — so nothing shed observes with
-    /// needs one. What the lease buys is the right to *drive*: attach input, and
-    /// [`Self::tab_write`] on a session socket. Taking it displaces whoever held
-    /// it (their next write answers `taken-over`, and every registered stream is
-    /// told once with `session.driver_changed`), so shed claims it only where a
-    /// user asked for exactly that.
-    ///
-    /// `client_label` is display metadata, never identity: it is what roost
-    /// echoes as `session.driver_changed.taken_by`, normalized server-side.
-    /// `None` omits the key — an omit-when-unset field, so an unlabeled connect
-    /// stays byte-identical to what a session that predates the field expects.
-    ///
-    /// `takeover: false` answers `already-connected` whenever a lease is live,
-    /// **including one this very connection holds**: a client that lost track of
-    /// its own lease is the one that has to re-establish it deliberately.
-    pub async fn session_connect(
-        &mut self,
-        takeover: bool,
-        client_label: Option<&str>,
-    ) -> Result<SessionConnectResult, RoostError> {
-        Ok(self
-            .client
-            .call(
-                ops::SESSION_CONNECT,
-                SessionConnectParams {
-                    takeover,
-                    client_label: client_label.map(str::to_string),
-                },
-            )
-            .await?)
-    }
-
     /// `session.set_agent_hooks` — ask the host session to bring its agent hook
     /// entries in line with this client's configuration.
     ///
@@ -327,20 +290,21 @@ impl Conn {
     /// what makes this op the right way to wire hooks and a hand-rolled `ssh`
     /// heredoc the wrong one.
     ///
-    /// Lease-gated, and for a sharper reason than most ops: it writes files. A
-    /// missing or stale lease answers `connect-required`; a displaced one
-    /// answers `taken-over`. Mint one with [`Self::session_connect`] — or, far
-    /// better, call
+    /// **Open to every same-UID client at session protocol 5.** Generation 4
+    /// gated this behind the interactive lease, so a second client had to take
+    /// the token away from the first before it could wire anything; roost
+    /// deleted that authority check outright. The op is declarative — the host
+    /// brings its entries in line with the request, writing nothing for an agent
+    /// whose config directory does not exist — so the last writer wins and
+    /// `client` is the record of who that was. One caller should be
     /// [`bootstrap::wire_agent_hooks`](crate::roost::bootstrap::wire_agent_hooks),
-    /// which is the one implementation of that dialogue and of what each refusal
-    /// means.
+    /// which is shed's one composition of it.
     ///
     /// `mode: Off` **removes** roost's entries rather than meaning "do nothing":
     /// a host has no config of its own to consult, so the client is the
     /// authority and `off` on the client means the host comes clean.
     pub async fn session_set_agent_hooks(
         &mut self,
-        lease: &str,
         mode: AgentHooksMode,
         skip: &[String],
         client: &str,
@@ -350,7 +314,6 @@ impl Conn {
             .call(
                 ops::SESSION_SET_AGENT_HOOKS,
                 SessionSetAgentHooksParams {
-                    lease: lease.to_string(),
                     mode,
                     skip: skip.to_vec(),
                     client: client.to_string(),
@@ -387,22 +350,22 @@ impl Conn {
     /// Consumes the `Conn` because that is `IpcClient`'s contract: the ack is
     /// the last request/response frame the connection will ever carry.
     ///
-    /// **`lease` classifies, it does not gate** (roost R1, session protocol 4).
-    /// An empty string is what shed sends: no lease is presented, so roost
-    /// registers an **observer** stream — every workspace batch plus
-    /// `notification.fired`, never `tab.effect`, and a takeover reclassifies a
-    /// driver stream in place rather than ending it. A lease-bearing subscribe
-    /// is the driver stream, which shed has no use for.
+    /// **A fresh subscribe takes no arguments at session protocol 5.** The lease
+    /// that used to classify a stream as driver or observer is gone, and with it
+    /// the classification: every subscriber now receives every frame, including
+    /// `tab.effect`. shed's fold ignores effects because a watcher views no tab
+    /// (see [`crate::roost::Fence`]) — the extra frames cost a match arm, not a
+    /// decision.
     ///
     /// The write half must stay open for as long as the stream is read: roost
     /// keeps reading this connection to notice a peer that went away, and a
     /// half-close is how a peer says it is gone.
-    pub async fn subscribe(self, lease: &str) -> Result<RoostEventStream, RoostError> {
+    pub async fn subscribe(self) -> Result<RoostEventStream, RoostError> {
         // Destructured rather than dropped: the pump has to outlive the
         // handover, or the stream reads from a socketpair with nobody feeding
         // it. (It is aborted on the error path too — `pump` is a local here.)
         let Conn { client, pump } = self;
-        let stream = client.subscribe_events(lease).await?;
+        let stream = client.subscribe_events().await?;
         Ok(RoostEventStream {
             stream,
             _pump: pump,
@@ -429,10 +392,10 @@ impl RoostEventStream {
         self.stream.revision()
     }
 
-    /// Why the stream ended, once the terminal envelope has arrived. On an event
-    /// stream at session protocol 4 the only reachable reason is `"stop"` — a
-    /// takeover no longer ends a stream, it demotes it and says so with a
-    /// non-terminal [`EventFrame::DriverChanged`].
+    /// Why the stream ended, once the terminal envelope has arrived. At session
+    /// protocol 5 the only reachable reason is `"stop"`, and now structurally so
+    /// rather than by convention: roost's `CloseReason` has exactly one variant,
+    /// so the session stopping is the only thing that ends a stream.
     pub fn stopping_reason(&self) -> Option<&str> {
         self.stream.stopping_reason()
     }
@@ -533,63 +496,23 @@ mod tests {
             .clone()
     }
 
-    const VECTOR_SESSION_CONNECT_REQUEST: &str =
-        include_str!("../../../fixtures/roost-vectors/session.connect.request.json");
-    const VECTOR_SESSION_CONNECT_LABELED_REQUEST: &str =
-        include_str!("../../../fixtures/roost-vectors/session.connect.labeled.request.json");
     const VECTOR_TAB_WRITE_REQUEST: &str =
         include_str!("../../../fixtures/roost-vectors/tab.write.request.json");
+    const VECTOR_TAB_DUMP_REQUEST: &str =
+        include_str!("../../../fixtures/roost-vectors/tab.dump.request.json");
+    const VECTOR_EVENTS_SUBSCRIBE_REQUEST: &str =
+        include_str!("../../../fixtures/roost-vectors/events.subscribe.request.json");
     const VECTOR_SET_AGENT_HOOKS_REQUEST: &str =
         include_str!("../../../fixtures/roost-vectors/session.set_agent_hooks.request.json");
 
-    /// **The omit-when-unset rule, on the wire.** roost's request structs are
-    /// `deny_unknown_fields`, so a key a session predates must be *absent*, not
-    /// `null` — otherwise a shed built against a newer roost cannot talk to an
-    /// older one at all, which is the whole failure mode the compatibility
-    /// matrix exists to prevent.
+    /// A `tab.write` goes out as roost's own request, key for key — **and with
+    /// no `lease`**, which is what generation 5 took away.
+    ///
+    /// [`TabWriteParams`] is `deny_unknown_fields` on roost's side, so a key
+    /// shed kept sending out of habit would be a session refusing every write
+    /// rather than ignoring an extra field.
     #[tokio::test]
-    async fn an_unlabeled_session_connect_matches_the_unlabeled_vector() {
-        let expected = vector_params(VECTOR_SESSION_CONNECT_REQUEST);
-        let server = OneShot::start(
-            serde_json::json!({ "lease": "9f2c1d7a4b6e08315c0d9a72e4f16b83", "revision": 42 }),
-        )
-        .await;
-        let mut conn = Conn::unix(&server.socket).await.expect("dial");
-        conn.session_connect(true, None).await.expect("connect");
-        drop(conn);
-
-        let sent = server.captured_params().await;
-        assert!(
-            sent.get("client_label").is_none(),
-            "an unlabeled connect must not emit the key at all, not even as null: {sent}"
-        );
-        assert_eq!(sent, expected, "the vendored unlabeled request vector");
-    }
-
-    #[tokio::test]
-    async fn a_labeled_session_connect_matches_the_labeled_vector() {
-        let expected = vector_params(VECTOR_SESSION_CONNECT_LABELED_REQUEST);
-        let label = expected["client_label"]
-            .as_str()
-            .expect("the vector's label");
-        let server = OneShot::start(
-            serde_json::json!({ "lease": "9f2c1d7a4b6e08315c0d9a72e4f16b83", "revision": 42 }),
-        )
-        .await;
-        let mut conn = Conn::unix(&server.socket).await.expect("dial");
-        conn.session_connect(true, Some(label))
-            .await
-            .expect("connect");
-        drop(conn);
-
-        assert_eq!(server.captured_params().await, expected);
-    }
-
-    /// A lease-less `tab.write` has to stay **byte-identical to what it always
-    /// sent**, so an old `roostctl` and a new shed degrade to the same
-    /// `connect-required` rather than to a `deny_unknown_fields` refusal.
-    #[tokio::test]
-    async fn a_leaseless_tab_write_matches_the_vector_and_omits_the_lease() {
+    async fn a_tab_write_matches_the_vector_and_carries_no_lease() {
         let expected = vector_params(VECTOR_TAB_WRITE_REQUEST);
         let tab_id: i64 = expected["tab_id"]
             .as_str()
@@ -605,28 +528,79 @@ mod tests {
 
         let server = OneShot::start(serde_json::json!({})).await;
         let mut conn = Conn::unix(&server.socket).await.expect("dial");
-        conn.tab_write(tab_id, &data, None).await.expect("write");
+        conn.tab_write(tab_id, &data).await.expect("write");
         drop(conn);
 
         let sent = server.captured_params().await;
         assert!(
             sent.get("lease").is_none(),
-            "a lease-less write omits the key entirely: {sent}"
+            "the lease retired at generation 5; the key must not be on the wire: {sent}"
         );
         assert_eq!(sent, expected, "the vendored tab.write request vector");
+    }
 
-        // The other direction of the same rule: a lease that IS held is sent,
-        // and it is sent under roost's own key name.
-        let server = OneShot::start(serde_json::json!({})).await;
-        let mut conn = Conn::unix(&server.socket).await.expect("dial");
-        conn.tab_write(tab_id, &data, Some("9f2c1d7a4b6e08315c0d9a72e4f16b83"))
-            .await
-            .expect("write");
-        drop(conn);
-        assert_eq!(
-            server.captured_params().await["lease"],
-            serde_json::json!("9f2c1d7a4b6e08315c0d9a72e4f16b83")
+    /// **The op shed calls on every single watcher cycle**, pinned against
+    /// roost's own request vector.
+    ///
+    /// A response fixture cannot prove what shed *sends*, and this is the one
+    /// place the retired lease key would survive unnoticed: a stray `lease` here
+    /// is a watcher that cannot subscribe to anything at all, on every host, for
+    /// as long as nobody looks.
+    #[tokio::test]
+    async fn a_fresh_events_subscribe_matches_the_vendored_request() {
+        let expected = vector_params(VECTOR_EVENTS_SUBSCRIBE_REQUEST);
+        let server = OneShot::start(serde_json::json!({
+            "revision": 42, "session_id": "01K3S8TQ4F0Q9YB2K6WZ5D7XN"
+        }))
+        .await;
+        let conn = Conn::unix(&server.socket).await.expect("dial");
+        let stream = conn.subscribe().await.expect("subscribe");
+        drop(stream);
+
+        let sent = server.captured_params().await;
+        assert!(
+            sent.get("lease").is_none(),
+            "a fresh subscribe carries no lease at generation 5: {sent}"
         );
+        assert!(
+            sent.get("from_revision").is_none() && sent.get("session_id").is_none(),
+            "a FRESH subscribe is not a resume — neither resume key is emitted: {sent}"
+        );
+        assert_eq!(
+            sent, expected,
+            "the vendored events.subscribe request vector"
+        );
+    }
+
+    /// **`scrollback: 0` and "no `scrollback` key" are different statements**,
+    /// and only the vector tells them apart: roost declares the field
+    /// `skip_serializing_if = "is_zero"`, so a struct literal proves nothing
+    /// about the bytes. A session that predates the field is
+    /// `deny_unknown_fields`, so emitting `"scrollback": 0` would be a peek that
+    /// fails outright against an older host rather than reading its viewport.
+    #[tokio::test]
+    async fn a_tab_dump_matches_the_vector_and_omits_scrollback() {
+        let expected = vector_params(VECTOR_TAB_DUMP_REQUEST);
+        let tab_id: i64 = expected["tab_id"]
+            .as_str()
+            .expect("a string-int64 tab id")
+            .parse()
+            .expect("numeric");
+
+        let server = OneShot::start(serde_json::json!({
+            "rows": 0, "cols": 80, "rows_text": [], "cursor": null
+        }))
+        .await;
+        let mut conn = Conn::unix(&server.socket).await.expect("dial");
+        conn.tab_dump(tab_id).await.expect("dump");
+        drop(conn);
+
+        let sent = server.captured_params().await;
+        assert!(
+            sent.get("scrollback").is_none(),
+            "a viewport read emits no scrollback key at all: {sent}"
+        );
+        assert_eq!(sent, expected, "the vendored tab.dump request vector");
     }
 
     /// `session.set_agent_hooks` goes out as roost's own request, key for key.
@@ -651,7 +625,6 @@ mod tests {
         .await;
         let mut conn = Conn::unix(&server.socket).await.expect("dial");
         conn.session_set_agent_hooks(
-            expected["lease"].as_str().expect("the vector's lease"),
             AgentHooksMode::Auto,
             &skip,
             expected["client"].as_str().expect("the vector's client"),
@@ -660,7 +633,12 @@ mod tests {
         .expect("set_agent_hooks");
         drop(conn);
 
-        assert_eq!(server.captured_params().await, expected);
+        let sent = server.captured_params().await;
+        assert!(
+            sent.get("lease").is_none(),
+            "the op is open to every same-UID client at generation 5; no lease is sent: {sent}"
+        );
+        assert_eq!(sent, expected);
     }
 
     /// Both reaches to one fake, labelled — dialed through [`Conn::endpoint`],
@@ -759,69 +737,26 @@ mod tests {
         let payload: Vec<u8> = (0..=u8::MAX).collect();
         for (via, mut conn) in conns(&fake).await {
             let tab = conn.tab_open(TabOpenParams::default()).await.expect(via).id;
-            // A write is lease-gated at protocol 4, so each transport takes the
-            // lease for its own turn — a takeover, since the previous
-            // transport's is still live.
-            let lease = conn
-                .session_connect(true, Some("shed-test"))
-                .await
-                .expect(via)
-                .lease;
-            conn.tab_write(tab, &payload, Some(&lease))
-                .await
-                .expect(via);
+            conn.tab_write(tab, &payload).await.expect(via);
             assert_eq!(fake.written(tab), payload, "via {via}");
         }
     }
 
-    /// **A write is an interactive act and belongs to the lease holder** (roost
-    /// R1, session protocol 4). Three states, all named by the wire: nobody
-    /// connected, this client connected, and this client displaced.
+    /// **A write needs nothing but the connection** at session protocol 5 — the
+    /// generation-4 lease that made `tab_write` a two-op dialogue is gone, and
+    /// two connections writing to the same tab both land.
+    ///
+    /// This is the shape the deleted `connect-required` / `taken-over` table was
+    /// standing in front of, and it is worth an assertion rather than an
+    /// absence: "shed no longer takes a lease" and "a second client can still
+    /// write" are different claims, and only the second one is the feature.
     #[tokio::test]
-    async fn a_write_needs_the_lease_and_says_which_way_it_lacks_it() {
+    async fn two_connections_both_write_without_taking_anything() {
         let fake = FakeRoost::start().await;
-        for (via, endpoint) in endpoints(&fake) {
-            let mut conn = Conn::endpoint(&endpoint).await.expect(via);
-            // No lease: `connect-required` — go get one.
-            let bare = conn
-                .tab_write(5, b"x", None)
-                .await
-                .expect_err("a lease-less write is refused");
-            assert_eq!(
-                bare.server_code(),
-                Some(ServerCode::ConnectRequired),
-                "via {via}: {bare}"
-            );
-
-            // `session.connect` mints one, and the write lands.
-            let lease = conn
-                .session_connect(true, Some("shed-test"))
-                .await
-                .expect(via)
-                .lease;
-            assert_eq!(
-                fake.lease_label().as_deref(),
-                Some("shed-test"),
-                "via {via}"
-            );
-            conn.tab_write(5, b"ok", Some(&lease)).await.expect(via);
-
-            // Somebody else takes it. That also **closes this connection** — a
-            // takeover closes the deposed holder's control connections — so the
-            // `taken-over` refusal is read where a displaced client would
-            // actually read it: on its retry, over a fresh connection.
-            fake.take_over("workbox");
-            let mut retry = Conn::endpoint(&endpoint).await.expect(via);
-            let displaced = retry
-                .tab_write(5, b"x", Some(&lease))
-                .await
-                .expect_err("the lease was displaced");
-            assert_eq!(
-                displaced.server_code(),
-                Some(ServerCode::TakenOver),
-                "via {via}: {displaced}"
-            );
-        }
+        let mut first = Conn::unix(fake.socket_path()).await.expect("dial");
+        let mut second = Conn::unix(fake.socket_path()).await.expect("dial");
+        first.tab_write(5, b"ok").await.expect("the first write");
+        second.tab_write(5, b"ok").await.expect("the second write");
         assert_eq!(fake.written(5), b"okok");
     }
 
@@ -877,21 +812,20 @@ mod tests {
         }
     }
 
-    /// A refusal the session minted keeps its typed code all the way out — and
-    /// `already-connected` is the one that says the wire is fine and the
-    /// *request* was wrong, which is the discrimination `is_transport_error`
-    /// upstream is built on.
+    /// A refusal the session minted keeps its typed code all the way out — the
+    /// discrimination `is_transport_error` upstream is built on is "the wire is
+    /// fine and the *request* was wrong", and it has to survive the trip.
+    ///
+    /// `unknown-op` is the surviving witness for that: generation 5 deleted
+    /// `already-connected`, `connect-required` and `taken-over` along with the
+    /// lease, and every roost socket answers this one.
     #[tokio::test]
     async fn a_server_refusal_keeps_its_typed_code() {
         let fake = FakeRoost::start().await;
         let mut conn = Conn::unix(fake.socket_path()).await.expect("dial");
-        conn.session_connect(false, None).await.expect("mints");
-        // Held — by this very connection — and `takeover` not set. roost refuses
-        // that on purpose: a client that lost track of its own lease has to
-        // re-establish it deliberately.
-        match conn.session_connect(false, None).await {
+        match conn.call_raw("no.such.op", serde_json::json!({})).await {
             Err(err @ RoostError::Server { .. }) => {
-                assert_eq!(err.server_code(), Some(ServerCode::AlreadyConnected));
+                assert_eq!(err.server_code(), Some(ServerCode::UnknownOp));
             }
             other => panic!("expected a server refusal, got {other:?}"),
         }
@@ -910,33 +844,34 @@ mod tests {
             Err(RoostError::ProtocolMismatch { theirs, ours }) => {
                 assert_eq!(theirs, 2);
                 assert_eq!(ours, SESSION_PROTOCOL_VERSION);
-                assert_eq!(ours, 4, "this build speaks roost R1's generation");
+                assert_eq!(ours, 5, "this build speaks roost's post-lease generation");
             }
             other => panic!("expected ProtocolMismatch, got {other:?}"),
         }
     }
 
-    /// `features` is an **open list**, carried through and never interpreted —
-    /// and absent on a session that predates the key, which must decode as an
-    /// empty list rather than fail.
+    /// **The newly interesting number.** Every host plan 019's desktop
+    /// bootstrapped is running a protocol-**4** `roost-session`, so 4 is no
+    /// longer history — it is the refusal case a real user meets the day this
+    /// build ships, and it has to come out named rather than as a limp.
+    ///
+    /// The `4` in this test is a negative-test datum on purpose and does not
+    /// move with the generation.
     #[tokio::test]
-    async fn features_are_carried_through_and_default_to_empty() {
+    async fn a_protocol_four_daemon_is_refused_by_name() {
         let fake = FakeRoost::start().await;
+        fake.set_session_protocol(4);
         let mut conn = Conn::unix(fake.socket_path()).await.expect("dial");
-        assert_eq!(
-            conn.session_identify().await.expect("identify").features,
-            vec!["put_file".to_string()],
-            "the vendored v4 reply's own list, preserved verbatim"
-        );
-
-        fake.serve_without_features();
-        let mut conn = Conn::unix(fake.socket_path()).await.expect("dial");
-        assert!(conn
-            .session_identify()
-            .await
-            .expect("a featureless reply still decodes")
-            .features
-            .is_empty());
+        match conn.session_identify().await {
+            Err(RoostError::ProtocolMismatch { theirs, ours }) => {
+                assert_eq!(
+                    theirs, 4,
+                    "what plan 019 installed on every host it touched"
+                );
+                assert_eq!(ours, SESSION_PROTOCOL_VERSION);
+            }
+            other => panic!("expected ProtocolMismatch, got {other:?}"),
+        }
     }
 
     #[tokio::test]

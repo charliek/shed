@@ -229,7 +229,7 @@ func TestPinnedNonActionableRows(t *testing.T) {
 	})
 	t.Run("protocol mismatch", func(t *testing.T) {
 		assertNoneRow(t, ProtocolMismatchRow(machine, 2),
-			"roost-session on mini2 speaks protocol 2; this shed speaks 4",
+			"roost-session on mini2 speaks protocol 2; this shed speaks 5",
 			"upgrade whichever is older")
 	})
 	t.Run("unreachable", func(t *testing.T) {

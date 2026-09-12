@@ -336,7 +336,7 @@ mod tests {
     const VECTOR_TAB_LIST: &str =
         include_str!("../../../fixtures/roost-vectors/tab.list.session.response.json");
     const VECTOR_SESSION_IDENTIFY: &str =
-        include_str!("../../../fixtures/roost-vectors/session.identify.response.v4.json");
+        include_str!("../../../fixtures/roost-vectors/session.identify.response.v5.json");
     const VECTOR_EVENTS_BATCH: &str =
         include_str!("../../../fixtures/roost-vectors/events.batch.json");
     const VECTOR_TAB_OPENED: &str =
@@ -879,6 +879,54 @@ mod tests {
 
         assert_eq!(inventory.sessions, before.sessions);
         assert_eq!(inventory.revision, Some(44), "the batch still advanced it");
+    }
+
+    /// **`tab.effect` reaches this fold for the first time at session protocol
+    /// 5**, and it must change nothing.
+    ///
+    /// Generation 4 classified an unleased stream as an *observer* and roost
+    /// filtered effects out of it, so shed's watcher never saw one. The
+    /// classification retired with the lease and `event_push` has no filter
+    /// left, so a bell and every OSC 52 clipboard write on that host now arrive
+    /// here. Nothing is wrong with that — a watcher views no tab, so an effect
+    /// is addressed to a client that does not exist — but "the catch-all absorbs
+    /// it" was an inference from reading a match arm, and a genuinely new shape
+    /// reaching the fold deserves an assertion instead.
+    ///
+    /// Both variants, because they are differently shaped: `bell` carries no
+    /// `data`, and a clipboard write carries base64 user data and a `target`.
+    #[test]
+    fn a_tab_effect_frame_leaves_the_inventory_untouched() {
+        let (_, mut inventory) = seeded();
+        inventory.apply(&batch(43, &[VECTOR_AGENT_REPORT_CHANGED]));
+        let before = inventory.clone();
+
+        inventory.apply(&EventBatch {
+            revision: 44,
+            events: vec![
+                EventEnvelope {
+                    event: ops::EVENT_TAB_EFFECT.to_string(),
+                    data: serde_json::json!({ "tab_id": "5", "effect": "bell" }),
+                },
+                EventEnvelope {
+                    event: ops::EVENT_TAB_EFFECT.to_string(),
+                    data: serde_json::json!({
+                        "tab_id": "5",
+                        "effect": "clipboard-write",
+                        "data": "aGVsbG8=",
+                        "target": "system",
+                    }),
+                },
+            ],
+        });
+
+        assert_eq!(inventory.sessions, before.sessions);
+        assert_eq!(inventory.hidden, before.hidden);
+        assert_eq!(
+            inventory.revision,
+            Some(44),
+            "an effect-only batch is still a commit, so the fence still moves"
+        );
     }
 
     /// An empty batch is roost's "this commit changed nothing" — it must still

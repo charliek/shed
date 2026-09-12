@@ -23,22 +23,28 @@ semantics, deliberately built from the same vectors so the Rust unit tests and
 this suite cannot disagree about what a roost-session says. **When you change one
 fake, change the other**, and pin the change in both `testing.rs`'s tests and
 `test_fake_roost.py` (the wire self-test that exists precisely because the Tauri
-app never calls `session.connect` or a lease-gated write, so nothing else here
-would catch this file drifting).
+app never asks for a filtered subscribe or drives two connections at
+`session.set_agent_hooks` concurrently, so nothing else here would catch this
+file drifting).
 
-At session protocol 4 it speaks the parts of the lease protocol shed's client can
-reach:
+At session protocol 5 the wire it speaks is unowned — the lease, its takeover
+table and its one tombstone retired with generation 4 (roost#477) — so what is
+left to be faithful about is the stream:
 
-* **`events.subscribe` is leaseless and classifies.** The ack's `revision` and
-  the subscriber's registration are taken under **one** lock, so no mutation can
-  commit between the number a client fences on and the first frame it is eligible
-  to receive — a fake that let one slip through would manufacture the very gap
-  the resync tests exist to distinguish from a real one.
+* **`events.subscribe` registers, it does not classify.** The ack's `revision`
+  and `session_id` and the subscriber's registration are taken under **one**
+  lock, so no mutation can commit between the number a client fences on and the
+  first frame it is eligible to receive — a fake that let one slip through
+  would manufacture the very gap the resync tests exist to distinguish from a
+  real one.
 * **Every mutation commits exactly one batch** at the new revision, built from
   the vendored envelope vectors. Empty commits are pushed too, because that is
   what makes a skipped revision mean loss and nothing else.
-* **`tab.write` on a session socket requires the lease**, with roost's own
-  takeover table and its *one* tombstone behind it.
+* **Every write op is open to every connection.** `tab.write` and
+  `session.set_agent_hooks` take no authority, two connections can both drive
+  the same tab, and the last writer wins — which is the one behaviour
+  generation 5 actually changed and the one the deleted refusal table was
+  standing in front of.
 
 Every id on this wire is a **string-int64** (a JavaScript client cannot round an
 i64 through a `Number`); the control surface here takes plain ints and does the
@@ -49,15 +55,15 @@ wire it is on.
 
 | op | answer |
 |---|---|
-| `session.identify` | the vendored `.v4` result, with `session_protocol` / `session_id` / `started_at` from this fake's state (the compatibility gate's input); `unknown-op` on a UI socket |
+| `session.identify` | the vendored `.v5` result, with `session_protocol` / `session_id` / `started_at` from this fake's state (the compatibility gate's input); `unknown-op` on a UI socket |
 | `identify` | the vendored UI-socket result, verbatim |
 | `tab.list` | `{projects, revision}` — the SESSION variant; a UI socket omits `revision` ENTIRELY (it serves no stream, so it publishes no fence) |
 | `tab.dump` | `{cols, rows, cursor, rows_text}` from this tab's text; `not-found` for an unknown id |
 | `tab.open` | appends a tab built from the `tab.open` vector, commits a `tab.opened` batch, answers `{tab}`; the params are recorded for the test |
 | `tab.close` | removes the tab and commits a `tab.closed` batch; `not-found` for an unknown id |
-| `tab.write` | decode, then the **lease gate on a session socket** (`connect-required` / `taken-over`, and a live lease REGISTERS the connection under it), then the tab (`not-found`); the lease key is accepted and ignored on a UI socket; records the base64-decoded bytes |
-| `session.connect` | roost's takeover table — mints a lease, `already-connected` when one is held (this very connection included) without `takeover`; `unknown-op` on a UI socket |
-| `events.subscribe` | the ack from the vendored vector with this fake's revision, then a one-way push stream; `invalid-param` for a non-zero `tab_id_filter`; `not-implemented` on a UI socket |
+| `tab.write` | decode, then the tab (`not-found`); open to every connection, no authority to check; records the base64-decoded bytes |
+| `session.set_agent_hooks` | open to every connection, last writer wins; `unknown-op` on a UI socket |
+| `events.subscribe` | the ack from the vendored vector with this fake's revision and `session_id`, then a one-way push stream; `invalid-param` for a non-zero `tab_id_filter`; `not-implemented` on a UI socket |
 | anything else | `unknown-op` |
 
 ## Lifecycle vs. the protocol
@@ -83,7 +89,6 @@ import socketserver
 import tempfile
 import threading
 import time
-import unicodedata
 from pathlib import Path
 
 # .../shed/desktop/tools/shedtest/fake_roost.py → the repo root. The render gate
@@ -122,14 +127,13 @@ def _vector(name: str) -> dict:
 
 
 # roost keeps ONE `session.identify` vector per generation and shed vendors only
-# the current one — a protocol-2 daemon is a CONTROL here
+# the current one — a protocol-2 or protocol-4 daemon is a CONTROL here
 # (`set_session_protocol`), not a second vector to keep in step.
-_SESSION_IDENTIFY = _vector("session.identify.response.v4.json")["result"]
+_SESSION_IDENTIFY = _vector("session.identify.response.v5.json")["result"]
 _IDENTIFY = _vector("identify.response.json")["result"]
 _TAB_LIST = _vector("tab.list.session.response.json")["result"]
 _TAB_OPEN = _vector("tab.open.response.json")["result"]["tab"]
 _ERROR = _vector("response.error.json")
-_SESSION_CONNECT = _vector("session.connect.response.json")["result"]
 _SET_AGENT_HOOKS = _vector("session.set_agent_hooks.response.json")["result"]
 _EVENTS_SUBSCRIBE = _vector("events.subscribe.response.json")["result"]
 _EVENTS_BATCH = _vector("events.batch.json")
@@ -138,7 +142,6 @@ _TAB_CLOSED = _vector("shed.tab.closed.event.json")
 _TAB_NOTIFICATION = _vector("shed.tab.notification.event.json")
 _AGENT_REPORT_CHANGED = _vector("agent_report.changed.event.json")
 _SESSION_STOPPING = _vector("session.stopping.event.json")
-_SESSION_DRIVER_CHANGED = _vector("session.driver_changed.event.json")
 _TABS_REORDERED = _vector("tabs.reordered.event.json")
 _PROJECTS_REORDERED = _vector("projects.reordered.event.json")
 _OPENCODE = _vector("shed.tab.list.opencode.finished.json")["result"]
@@ -172,11 +175,6 @@ _UNSET = object()
 #: before the connection goes — the Python answer to the Rust fake's `biased`
 #: select, and the reason a client can tell a stop from a backpressure close.
 _CLOSE = object()
-
-#: How a registered stream is classified — roost's own distinction, kept so a
-#: test can assert shed subscribed the way it claims to.
-_DRIVER = "driver"
-_OBSERVER = "observer"
 
 
 class RoostWireError(Exception):
@@ -217,56 +215,16 @@ def _wire_id(value) -> int | None:
     return None
 
 
-def _is_layout_hostile(c: str) -> bool:
-    """Characters roost refuses in a `client_label`, beyond "is a control char".
-
-    `is_control` alone is not enough and the difference is visible: the line and
-    paragraph separators break the takeover banner onto a second line, and the
-    bidi overrides reorder everything after them — and Unicode classifies none of
-    them as control characters, so they sail straight through a control-only
-    filter into a string the session renders. roost's own `is_layout_hostile`
-    (`roost-engine/src/ipc.rs` at the pinned rev) is this exact set.
-    """
-    return (
-        unicodedata.category(c) == "Cc"
-        or c in ("\u2028", "\u2029")
-        or "\u202a" <= c <= "\u202e"
-        or "\u2066" <= c <= "\u2069"
-    )
-
-
-def _normalize_label(raw: str) -> str | None:
-    """roost's own `client_label` normalization: trim, drop the layout-hostile
-    characters, cap at 128 UTF-8 bytes, empty after that → absent.
-
-    Byte-for-byte the rule `testing.rs::normalize_label` implements — a label is
-    echoed back as `session.driver_changed.taken_by`, so the two fakes agreeing
-    on it is the difference between a client being tested against roost's string
-    and against ours.
-    """
-    cleaned = "".join(c for c in raw.strip() if not _is_layout_hostile(c))
-    capped = cleaned.strip()
-    while len(capped.encode("utf-8")) > 128:
-        capped = capped[:-1]
-    return capped or None
-
-
 class _Conn:
     """One live connection, and what the fake knows about it."""
 
-    __slots__ = ("id", "sock", "lease", "stream", "kind", "hangup")
+    __slots__ = ("id", "sock", "stream", "hangup")
 
     def __init__(self, conn_id: int, sock: socket.socket):
         self.id = conn_id
         self.sock = sock
-        #: The live lease this connection has PRESENTED — on `session.connect`,
-        #: or on any lease-carrying op it was authorized for (roost's `present()`
-        #: registers the connection for every one of them, not just the connect).
-        #: This is what a takeover closes a deposed holder's connections by.
-        self.lease: str | None = None
         #: The frame queue, once `events.subscribe` flipped it into a stream.
         self.stream: queue.Queue | None = None
-        self.kind: str | None = None
         #: Set by a hang-up. Only a blocked `send` reads it — the queued `_CLOSE`
         #: is what ends an idle stream, in order behind any goodbye — so that a
         #: peer which has stopped reading cannot hold the handler for the whole
@@ -294,14 +252,14 @@ class TabListHook:
         """The revision this hook is about to let `tab.list` report."""
         return self._fake._revision
 
-    def observer_count(self) -> int:
-        """Registered observer streams, read from INSIDE the `tab.list` lock.
+    def stream_count(self) -> int:
+        """Registered streams, read from INSIDE the `tab.list` lock.
 
         This is how a test proves the ORDERING of a client's prologue rather than
         only its arithmetic: a client that subscribed before listing has a stream
         registered by the time this runs, and one that listed first has none.
         """
-        return self._fake._count_streams(_OBSERVER)
+        return self._fake._count_streams()
 
 
 class _Server(socketserver.ThreadingUnixStreamServer):
@@ -345,7 +303,7 @@ class _Handler(socketserver.StreamRequestHandler):
                     self._send({"id": request.get("id"), "ok": True, "result": ack})
                     self._push_frames(conn)
                     return
-                self._send(fake.dispatch(request, conn))
+                self._send(fake.dispatch(request))
         except OSError:
             # Any closed-socket read/write — a hang-up (`close_all`) or the app
             # going away mid-request. Both are normal ends to a connection.
@@ -450,9 +408,9 @@ class FakeRoost:
         else:
             self._socket_path = Path(socket_path)
             self._dir = self._socket_path.parent
-        # Re-entrant: a control (`take_over`, a `before_tab_list` hook) commits
-        # through the same `_commit`/`_push` helpers the op bodies use, and every
-        # one of them expects to already hold the lock.
+        # Re-entrant: a control (a `before_tab_list` hook) commits through the
+        # same `_commit`/`_push` helpers the op bodies use, and every one of them
+        # expects to already hold the lock.
         self._lock = threading.RLock()
         self._server: _Server | None = None
         self._thread: threading.Thread | None = None
@@ -464,9 +422,6 @@ class FakeRoost:
         #: Answer `unknown-op` to `session.identify` — roost's own tell for a UI
         #: socket rather than a session socket.
         self.ui_socket: bool = False
-        #: Omit `features` from `session.identify` entirely — a session from
-        #: before the key existed, which a current client must still decode.
-        self.strip_features: bool = False
         self._session_id: str = _SESSION_IDENTIFY["session_id"]
         self._started_at: str = _SESSION_IDENTIFY["started_at"]
         self._revision: int = _TAB_LIST["revision"]
@@ -477,14 +432,6 @@ class FakeRoost:
         self._tab_list_calls = 0
         self._before_tab_list = None
         self._stopped = False
-        # -- the lease ----------------------------------------------------
-        self._lease: str | None = None
-        self._lease_label: str | None = None
-        #: **Exactly one** tombstone, as roost keeps: the most recently displaced
-        #: lease, so its holder hears `taken-over` rather than
-        #: `connect-required`. A lease displaced twice is forgotten.
-        self._tombstone: str | None = None
-        self._lease_counter = 0
         #: Every `tab.open` this fake served, params verbatim, in order.
         self.opens: list[dict] = []
         #: Every `session.set_agent_hooks` this fake served, params verbatim, in
@@ -559,18 +506,6 @@ class FakeRoost:
         with self._lock:
             return self._tab_list_calls
 
-    @property
-    def lease(self) -> str | None:
-        """The interactive lease currently held, if any."""
-        with self._lock:
-            return self._lease
-
-    @property
-    def lease_label(self) -> str | None:
-        """The label the current lease holder reported on `session.connect`."""
-        with self._lock:
-            return self._lease_label
-
     def set_agent_hooks_result(self, result: dict) -> None:
         """Answer the next `session.set_agent_hooks` with this result.
 
@@ -580,15 +515,14 @@ class FakeRoost:
         with self._lock:
             self._agent_hooks_result = dict(result)
 
-    def observer_count(self) -> int:
-        """Registered streams that presented no live lease — what shed is."""
-        with self._lock:
-            return self._count_streams(_OBSERVER)
+    def stream_count(self) -> int:
+        """Registered event streams — one per subscribed connection.
 
-    def driver_count(self) -> int:
-        """Registered streams that presented the current lease."""
+        Unclassified at generation 5: the driver/observer split went with the
+        lease, so this is the whole of what a test can assert about who is
+        listening."""
         with self._lock:
-            return self._count_streams(_DRIVER)
+            return self._count_streams()
 
     def add_tab(self, tab_id: int, *, cwd: str, title: str, source: str | None = None,
                 session_id: str = "", lifecycle: str = "inactive", detail: str = "",
@@ -717,23 +651,6 @@ class FakeRoost:
             envelope["data"]["project_ids"] = [p["id"] for p in self._projects]
             self._commit([envelope])
 
-    def take_over(self, label: str) -> str:
-        """An external client takes the interactive lease.
-
-        Roost's takeover, whole: the old lease is tombstoned (exactly one), every
-        non-stream connection registered under it is closed, every registered
-        stream is reclassified to observer IN PLACE and told once with
-        `session.driver_changed{taken_by}` — and **no stream is closed**, which is
-        the R1 re-cut shed's watcher exists to prove it survives.
-
-        **Only an actual displacement announces itself.** Minting into an unheld
-        session deposes nobody and roost sends nothing; a fake that announced it
-        anyway would let a client be tested green against an envelope a real
-        daemon never emits there.
-        """
-        with self._lock:
-            return self._take_over(_normalize_label(label), exempt=None)
-
     def stop(self) -> None:
         """roost's `session.stopping`: every stream gets the terminal
         `session.stopping{reason: "stop"}`, every connection is hung up, and the
@@ -768,9 +685,6 @@ class FakeRoost:
             self._restarts += 1
             self._session_id = f"{_SESSION_IDENTIFY['session_id']}-restart-{self._restarts}"
             self._revision = 1
-            self._lease = None
-            self._lease_label = None
-            self._tombstone = None
             self._stopped = False
             self._hangup_all()
 
@@ -821,8 +735,8 @@ class FakeRoost:
         with self._lock:
             self._conns.pop(conn.id, None)
 
-    def _count_streams(self, kind: str) -> int:
-        return sum(1 for c in self._conns.values() if c.stream is not None and c.kind == kind)
+    def _count_streams(self) -> int:
+        return sum(1 for c in self._conns.values() if c.stream is not None)
 
     def _hangup(self, conn: _Conn) -> None:
         """End one connection. A stream is asked through its queue so anything
@@ -876,7 +790,11 @@ class FakeRoost:
         Splitting the two is this fake's most tempting bug: a mutation that
         commits between them is delivered to nobody and skipped in the sequence,
         so the client sees a gap the daemon never had — which would flake exactly
-        the resync cells this surface exists for."""
+        the resync cells this surface exists for.
+
+        The ack carries `session_id` as well as `revision` at generation 5, and it
+        is **required** on roost's side — a fake that omitted it would fail to
+        decode in every consumer rather than in one test."""
         with self._lock:
             if self.ui_socket:
                 raise _Refusal("not-implemented", "events.subscribe is not yet implemented")
@@ -885,71 +803,17 @@ class FakeRoost:
                 # Refused rather than ignored: a filter the server does not apply
                 # is a contract lie.
                 raise _Refusal("invalid-param", 'tab_id_filter is not implemented; pass "0"')
-            presented = params.get("lease") or None
-            # The classifier, not a gate: reading a session is not interactive
-            # authority, so a subscribe is never refused for want of a lease.
-            conn.kind = _DRIVER if presented is not None and presented == self._lease else _OBSERVER
             conn.stream = queue.Queue(maxsize=FRAME_CAPACITY)
             ack = copy.deepcopy(_EVENTS_SUBSCRIBE)
             ack["revision"] = self._revision
+            # The incarnation answering, echoed so a client that identified on
+            # one connection and subscribed on another can refuse a mismatched
+            # pair. It tracks `restart()`, which is the only thing that moves it.
+            ack["session_id"] = self._session_id
             return ack
 
-    # -- the lease (all under the lock) ------------------------------------
-    def _mint_lease(self) -> str:
-        """32 lowercase hex from a counter-seeded generator, so it is shaped
-        exactly like the wire's and is the same on every run — and identical to
-        what `testing.rs::mint_lease` produces from the same counter."""
-        mask = (1 << 64) - 1
-        self._lease_counter += 1
-        out = ""
-        x = (self._lease_counter * 0x9E3779B97F4A7C15) & mask
-        for _ in range(2):
-            # splitmix64's finalizer: a counter run through it still looks like
-            # 16 hex characters of nothing in particular.
-            z = x
-            z = ((z ^ (z >> 30)) * 0xBF58476D1CE4E5B9) & mask
-            z = ((z ^ (z >> 27)) * 0x94D049BB133111EB) & mask
-            z ^= z >> 31
-            out += f"{z:016x}"
-            x = z
-        return out
-
-    def _take_over(self, label: str | None, exempt: int | None) -> str:
-        displaced = self._lease
-        self._lease = None
-        if displaced is not None:
-            # Exactly one: a lease displaced twice is forgotten and falls back to
-            # `connect-required`.
-            self._tombstone = displaced
-            for conn in list(self._conns.values()):
-                # roost closes a deposed holder's CONTROL connections and spares
-                # its streams (and the connection that asked for the takeover).
-                if conn.lease == displaced and conn.id != exempt and conn.stream is None:
-                    self._hangup(conn)
-        minted = self._mint_lease()
-        self._lease = minted
-        self._lease_label = label
-        if displaced is not None:
-            for conn in self._conns.values():
-                if conn.stream is not None:
-                    conn.kind = _OBSERVER
-            envelope = copy.deepcopy(_SESSION_DRIVER_CHANGED)
-            envelope["data"]["taken_by"] = label or "unknown client"
-            self._push(envelope)
-        return minted
-
-    def _check_write_lease(self, presented: str | None) -> None:
-        """How a `tab.write`'s `lease` key is judged on a SESSION socket."""
-        if presented is not None and presented == self._lease:
-            return
-        if presented is not None and presented == self._tombstone:
-            raise _Refusal("taken-over", "another client took the interactive lease")
-        # Absent, unknown, or a lease displaced twice and forgotten.
-        raise _Refusal("connect-required",
-                       "tab.write on a session socket needs the interactive lease")
-
     # -- the wire ----------------------------------------------------------
-    def dispatch(self, request: dict, conn: _Conn | None = None) -> dict:
+    def dispatch(self, request: dict) -> dict:
         """One request → one reply envelope. The request `id` is echoed EXACTLY:
         a client matches replies by it, and a fake that normalized it would hide
         exactly the bug that matters."""
@@ -957,12 +821,12 @@ class FakeRoost:
         op = request.get("op") or ""
         params = request.get("params") or {}
         try:
-            result = self._op(op, params, conn)
+            result = self._op(op, params)
         except _Refusal as refusal:
             return _error(request_id, refusal.code, refusal.message)
         return {"id": request_id, "ok": True, "result": result}
 
-    def _op(self, op: str, params: dict, conn: _Conn | None) -> dict:
+    def _op(self, op: str, params: dict) -> dict:
         with self._lock:
             if op == "session.identify":
                 if self.ui_socket:
@@ -975,8 +839,6 @@ class FakeRoost:
                     "session_id": self._session_id,
                     "started_at": self._started_at,
                 }
-                if self.strip_features:
-                    result.pop("features", None)
                 return result
             if op == "identify":
                 return copy.deepcopy(_IDENTIFY)
@@ -1002,14 +864,12 @@ class FakeRoost:
             if op == "tab.close":
                 return self._close(_require_tab_id(params))
             if op == "tab.write":
-                return self._write(_require_tab_id(params), params, conn)
-            if op == "session.connect":
-                return self._connect(params, conn)
+                return self._write(_require_tab_id(params), params)
             if op == "session.set_agent_hooks":
-                return self._set_agent_hooks(params, conn)
-            # Everything else: the fake serves inventory, the lease ops and the
-            # one-shots, and an op shed reaches for that roost does not serve
-            # here should fail loudly in a test rather than pass.
+                return self._set_agent_hooks(params)
+            # Everything else: the fake serves inventory and the one-shots, and
+            # an op shed reaches for that roost does not serve here should fail
+            # loudly in a test rather than pass.
             raise _Refusal("unknown-op", f"no such op: {op}")
 
     # -- op bodies (all called under the lock) -----------------------------
@@ -1070,12 +930,12 @@ class FakeRoost:
         self._commit([closed])
         return {}
 
-    def _write(self, tab_id: int, params: dict, conn: _Conn | None) -> dict:
-        """**The order is roost's and it is load-bearing.** roost decodes the
-        params, then runs `require_lease`, then hands the bytes to the
-        supervisor — so a write to a tab that does not exist, presented WITHOUT
-        authority, answers `connect-required` and never leaks the fact that the
-        tab is missing. Decode, gate, then look for the tab.
+    def _write(self, tab_id: int, params: dict) -> dict:
+        """Decode, then look for the tab. Generation 4 ran roost's own
+        `require_lease` between the two — deliberately, so a write to a missing
+        tab without authority never leaked that the tab was missing. At 5 there
+        is no authority to check and nothing to leak it to: every same-UID
+        client may write.
         """
         data = params.get("data")
         if not isinstance(data, str):
@@ -1084,46 +944,20 @@ class FakeRoost:
             decoded = base64.b64decode(data, validate=True)
         except ValueError as e:
             raise _Refusal("invalid-param", f"tab.write data: {e}") from e
-        presented = params.get("lease")
-        presented = presented if isinstance(presented, str) else None
-        # On a UI socket the key is accepted and ignored — that socket mints no
-        # leases, and refusing it would make one client unable to talk to both
-        # kinds of socket.
-        if not self.ui_socket:
-            self._check_write_lease(presented)
-            # **Presenting the live lease REGISTERS this connection under it**,
-            # exactly as roost's `present()` does for every lease-carrying op —
-            # not just for `session.connect`. A takeover closes everything on
-            # that list, so a connection that only ever wrote would otherwise
-            # survive one and keep writing at a session it no longer drives.
-            # (roost prunes closed entries here; this fake drops a connection
-            # from `_conns` when its handler exits, which is the same thing.)
-            if conn is not None:
-                conn.lease = presented
         self._require(tab_id)
         self._writes[tab_id] = self._writes.get(tab_id, b"") + decoded
         return {}
 
-    def _set_agent_hooks(self, params: dict, conn: _Conn | None) -> dict:
-        """`session.set_agent_hooks {lease, mode, skip, client}` (plan 019 §3.4).
+    def _set_agent_hooks(self, params: dict) -> dict:
+        """`session.set_agent_hooks {mode, skip, client}` (plan 019 §3.4).
 
-        roost's own order: decode, then the LEASE GATE, then act. This op makes
-        the host session write dotfiles under its own `$HOME`, which is the
-        sharpest reason of any lease-gated op to check authority before touching
-        the params — so the gate runs first and a refusal records nothing.
-
-        The gate is the same `_check_write_lease` `tab.write` uses (roost keeps
-        ONE tombstone: a lease displaced twice is forgotten and reads as
-        `connect-required`, not `taken-over`). Presenting the live lease
-        registers this connection under it, so a later takeover hangs this
-        connection up too.
+        roost's own order at generation 5: decode, barrier, handle. The
+        `AgentHooksAuthority` check that sat between the first two was deleted
+        with the lease, so this op WRITES FILES under the session user's home
+        for whichever same-UID client asked last.
         """
         if self.ui_socket:
             raise _Refusal("unknown-op", "no such op: session.set_agent_hooks")
-        presented = params.get("lease") or None
-        self._check_write_lease(presented)
-        if conn is not None:
-            conn.lease = presented
         if params.get("mode") not in ("auto", "off"):
             raise _Refusal("invalid-param",
                            f"session.set_agent_hooks mode: {params.get('mode')!r}")
@@ -1132,30 +966,6 @@ class FakeRoost:
         self.agent_hooks_calls.append(copy.deepcopy(params))
         seeded, self._agent_hooks_result = self._agent_hooks_result, None
         return copy.deepcopy(seeded if seeded is not None else _SET_AGENT_HOOKS)
-
-    def _connect(self, params: dict, conn: _Conn | None) -> dict:
-        if self.ui_socket:
-            raise _Refusal("unknown-op", "no such op: session.connect")
-        takeover = bool(params.get("takeover"))
-        raw_label = params.get("client_label")
-        label = _normalize_label(raw_label) if isinstance(raw_label, str) else None
-        # roost's table, whole: no holder → mint; held by ANYONE (this very
-        # connection included) without `takeover` → `already-connected`; with
-        # `takeover` → displace and mint.
-        if self._lease is not None and not takeover:
-            raise _Refusal("already-connected", "a client already holds the interactive lease")
-        if self._lease is not None:
-            minted = self._take_over(label, exempt=None if conn is None else conn.id)
-        else:
-            minted = self._mint_lease()
-            self._lease = minted
-            self._lease_label = label
-        if conn is not None:
-            conn.lease = minted
-        result = copy.deepcopy(_SESSION_CONNECT)
-        result["lease"] = minted
-        result["revision"] = self._revision
-        return result
 
 
 def _ownership(source: str, session_id: str, detail: str, last_event_at: int,

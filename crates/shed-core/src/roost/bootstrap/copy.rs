@@ -67,7 +67,7 @@ pub enum Stage {
     Start,
     /// Asking the session that came up who it is.
     PostStart,
-    /// The lease dialogue. Never fatal — see [`super::hooks`].
+    /// Wiring the host's agent hooks. Never fatal — see [`super::hooks`].
     Hooks,
 }
 
@@ -281,7 +281,7 @@ pub fn session_appeared_mismatched(target: &str, theirs: u32) -> BootstrapFailur
 /// Plan 019 §3.4 pins that two concurrent installers are **last-writer-wins**
 /// and names the post-commit identify as the detector. It only *is* a detector
 /// if it compares what it should: a protocol-only check passes happily on
-/// somebody else's protocol-4 build, and shed would then discard its backup and
+/// somebody else's same-generation build, and shed would then discard its backup and
 /// report that it installed bytes it never installed.
 pub fn foreign_install(
     target: &str,
@@ -520,7 +520,7 @@ mod tests {
         );
         assert_eq!(
             protocol_report(TARGET, 2),
-            "roost-session on roost:popos/p019-a speaks protocol 2, this build speaks 4 — \
+            "roost-session on roost:popos/p019-a speaks protocol 2, this build speaks 5 — \
              upgrade whichever is older; stop it there with `roostctl session stop` and \
              reconnect once it is."
         );
@@ -665,12 +665,12 @@ mod tests {
     fn a_foreign_install_is_described_rather_than_claimed() {
         let staged = super::super::Identity {
             app_version: "0.0.19".into(),
-            session_protocol: 4,
+            session_protocol: 5,
             libghostty_build: "ghostty-ours".into(),
         };
         let found = super::super::Identity {
             app_version: "0.0.20".into(),
-            session_protocol: 4,
+            session_protocol: 5,
             libghostty_build: "ghostty-theirs".into(),
         };
         let failure = foreign_install(
@@ -685,8 +685,8 @@ mod tests {
             failure.message,
             "the roost-session now at /home/shed/.local/bin/roost-session on \
              roost:popos/p019-a is not the one shed just staged: it reports itself as \
-             roost-session 0.0.20 (session protocol 4), and shed staged roost-session 0.0.19 \
-             (session protocol 4). Another install landed there at the same moment. Shed left \
+             roost-session 0.0.20 (session protocol 5), and shed staged roost-session 0.0.19 \
+             (session protocol 5). Another install landed there at the same moment. Shed left \
              it alone rather than overwrite it, so its copy of the previous install is still \
              at /home/shed/.local/bin/roost-session.bak.4242."
         );
@@ -720,7 +720,7 @@ mod tests {
         };
         assert_eq!(
             session_identity_detail(&session),
-            "it speaks session protocol 2, and this shed speaks 4"
+            "it speaks session protocol 2, and this shed speaks 5"
         );
         assert!(
             identity_detail(Some(&binary)).starts_with(&session_identity_detail(&session)),

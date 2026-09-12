@@ -390,7 +390,7 @@ pub enum Step<T> {
         op: String,
         params: serde_json::Value,
     },
-    /// The lease dialogue, over that same connection. See [`hooks`].
+    /// `session.set_agent_hooks`, over that same connection. See [`hooks`].
     Hooks { client_label: String },
     /// There is nothing left to do.
     Done(T),
@@ -467,7 +467,7 @@ pub enum Outcome {
 
 /// A refused or unreachable [`Step::Call`].
 ///
-/// `code` is either a roost server code (`unknown-op`, `connect-required`, …)
+/// `code` is either a roost server code (`unknown-op`, `not-found`, …)
 /// or one of [`reach_code`]'s transport classifications. Owned strings, because
 /// this crosses no FRB boundary but its message does reach a user.
 #[derive(Debug, Clone, PartialEq, Eq)]

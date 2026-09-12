@@ -742,56 +742,19 @@ def test_a_lifecycle_flip_is_pushed_to_rc_list(machine_app, fake_roost):
     )
 
 
-def test_shed_watches_as_an_observer_and_takes_no_lease(machine_app, fake_roost):
-    """**Watching somebody's machine must not take their roost UI's driver seat.**
+def test_shed_watches_and_takes_nothing(machine_app, fake_roost):
+    """**Watching somebody's machine takes nothing from it.**
 
-    At session protocol 4 `events.subscribe` no longer takes a lease, it
-    CLASSIFIES on one: an empty lease is an *observer* stream. Shed sends an empty
-    one, so the fake must record an observer, no driver, and no lease held at all.
-    Asserting all three is the point — an observer count alone would still pass
-    against a client that also minted a lease on the side.
+    The lease, its takeover table and the driver/observer classification all
+    retired with session protocol 4 (plan 020) — `events.subscribe` REGISTERS at
+    generation 5, it does not classify. So the whole of what shed's watching a
+    machine can be observed to do is register one stream and hold no authority
+    over anything.
     """
     machine_app.wait_until(
-        lambda: fake_roost.observer_count() == 1 and fake_roost.driver_count() == 0,
-        timeout=30, what="shed's stream to be registered as an observer",
+        lambda: fake_roost.stream_count() == 1,
+        timeout=30, what="shed's stream to be registered",
     )
-    assert fake_roost.lease is None, "shed took the interactive lease"
-
-
-def test_a_driver_change_leaves_the_machine_rows_alone(machine_app, fake_roost):
-    """**Somebody else taking the interactive lease changes nothing here.**
-
-    R1's re-cut: a takeover no longer ends an event stream, it reclassifies it and
-    says so once with a non-terminal `session.driver_changed`. Shed never held the
-    lease, so the rows must not move and the machine must not go down — and the
-    flip afterwards is what proves the SAME stream is still delivering (a
-    reconnect would have cost a `tab.list`).
-
-    Two takeovers, because only a real displacement announces itself: the first
-    mints into an unheld session and deposes nobody, so roost sends nothing.
-    """
-    machine_app.wait_until(
-        lambda: bool(_machine_rows(machine_app, "mini3")),
-        timeout=30, what="mini3's row",
-    )
-    lists = fake_roost.tab_list_calls
-
-    fake_roost.take_over("roost ui")
-    assert fake_roost.lease is not None, "the first claim mints"
-    fake_roost.take_over("somebody else")
-    assert fake_roost.lease_label == "somebody else"
-
-    fake_roost.set_axes(AGENT_TAB, lifecycle="working", detail="session_status")
-    machine_app.wait_until(
-        lambda: [r["activity"] for r in _machine_rows(machine_app, "mini3")] == ["working"],
-        timeout=20, what="the stream to keep delivering after the takeover",
-    )
-    assert fake_roost.tab_list_calls == lists, (
-        "the takeover cost a re-list — the client treated it as terminal"
-    )
-    live = _named(machine_app.machines_list(), "mini3")
-    assert live["reachable"] is True, live
-    assert live["detail"] is None, live
 
 
 def test_a_lost_commit_is_resynced_end_to_end(machine_app, fake_roost):
@@ -810,7 +773,13 @@ def test_a_lost_commit_is_resynced_end_to_end(machine_app, fake_roost):
     the result. What this cell adds is that the whole stack — real watcher, real
     fold, real IPC, real render path — gets from a lost commit to an updated row
     at all.
+
+    The baseline is set explicitly here rather than inherited from whatever an
+    earlier test in this module left AGENT_TAB in — the driver/observer cells
+    that used to leave it at "working" as a side effect retired with the lease
+    (plan 020), and a resync test should not depend on file order to begin with.
     """
+    fake_roost.set_axes(AGENT_TAB, lifecycle="working", detail="session_status")
     machine_app.wait_until(
         lambda: [r["activity"] for r in _machine_rows(machine_app, "mini3")] == ["working"],
         timeout=30, what="a known baseline before the gap",

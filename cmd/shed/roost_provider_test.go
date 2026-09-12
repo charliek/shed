@@ -499,7 +499,7 @@ func buildFakeFarSide(t *testing.T, home string) {
 case "$1" in
   client-bridge)
     line=$(head -n 1)
-    proto=4
+    proto=5
     if [ -f "$HOME/` + farSideProtocolFile + `" ]; then proto=$(cat "$HOME/` + farSideProtocolFile + `"); fi
     case "$line" in
       *session.identify*)
@@ -660,7 +660,7 @@ func TestRoostProviderActivate_MachineEndToEnd(t *testing.T) {
 
 		out := runActivate(t, completed)
 
-		if !strings.Contains(out, "roost-session on mini2 speaks protocol 3; this shed speaks 4") {
+		if !strings.Contains(out, "roost-session on mini2 speaks protocol 3; this shed speaks 5") {
 			t.Errorf("activate output = %q, want the pinned protocol-mismatch row", out)
 		}
 		if strings.Contains(out, "opened tab") {

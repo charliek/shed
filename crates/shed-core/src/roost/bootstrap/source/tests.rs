@@ -445,7 +445,7 @@ fn sealed_env() -> SourceEnv {
 
 /// The external gate, asserted rather than described.
 #[test]
-fn nothing_is_pinned_until_a_protocol_4_release_ships() {
+fn nothing_is_pinned_until_a_current_protocol_release_ships() {
     assert!(
         RELEASE_PIN.is_none(),
         "plan 019 §3.5: the asset rung stays behind a pin until a roost release speaks \
@@ -464,9 +464,9 @@ fn nothing_is_pinned_until_a_protocol_4_release_ships() {
 fn the_no_source_copy_is_the_one_the_plan_pinned() {
     assert_eq!(
         unavailable(TARGET),
-        "no roost release speaking session protocol 4 is published yet (the latest, 0.0.19, \
-         speaks 2). On a Linux machine with a protocol-4 roost installed the desktop uses that \
-         roost-session; otherwise point ROOST_SESSION_INSTALL_BIN at a protocol-4 build. \
+        "no roost release speaking session protocol 5 is published yet (the latest, 0.0.19, \
+         speaks 2). On a Linux machine with a protocol-5 roost installed the desktop uses that \
+         roost-session; otherwise point ROOST_SESSION_INSTALL_BIN at a protocol-5 build. \
          roost:popos/p019-a was left untouched."
     );
 
@@ -551,7 +551,7 @@ async fn the_override_rung_wins_over_the_sibling() {
     };
     let (dir, scratch_path) = scratch();
     let app = dir.0.join("app");
-    write_exec(&app.join("roost-session"), &fake_session("0.0.19", 4));
+    write_exec(&app.join("roost-session"), &fake_session("0.0.19", 5));
     let override_bin = dir.0.join("chosen");
     let machine = match local {
         RemoteArch::Amd64 => EM_X86_64,
@@ -762,11 +762,11 @@ async fn the_override_rung_answers_a_fifo_a_directory_and_a_symlink() {
 /// compile-time fact, so a Mac cannot take this rung and the assertion below is
 /// that it says so rather than that it works.
 #[tokio::test]
-async fn the_sibling_rung_is_taken_when_it_speaks_protocol_4() {
+async fn the_sibling_rung_is_taken_when_it_speaks_the_current_protocol() {
     let (dir, scratch_path) = scratch();
     let app = dir.0.join("app");
     let session = app.join("roost-session");
-    write_exec(&session, &fake_session("0.0.19", 4));
+    write_exec(&session, &fake_session("0.0.19", 5));
     let env = SourceEnv {
         caller_exe: Some(app.join("shed-desktop")),
         ..sealed_env()
@@ -800,7 +800,7 @@ async fn the_sibling_rung_is_taken_when_it_speaks_protocol_4() {
         previewed.describe(TARGET),
         format!(
             "the roost-session beside this app ({}) — and nothing else, if it turns out not to \
-             speak session protocol 4",
+             speak session protocol 5",
             session.display()
         )
     );
@@ -813,7 +813,7 @@ async fn the_sibling_rung_is_taken_when_it_speaks_protocol_4() {
         format!("the roost-session beside this app ({})", session.display())
     );
     assert_eq!(handle.sha256(), None);
-    assert_eq!(drain(&handle), fake_session("0.0.19", 4).into_bytes());
+    assert_eq!(drain(&handle), fake_session("0.0.19", 5).into_bytes());
 }
 
 /// Pin P3's arch gate, and the copy that names the arch.
@@ -821,7 +821,7 @@ async fn the_sibling_rung_is_taken_when_it_speaks_protocol_4() {
 async fn a_sibling_for_another_architecture_is_skipped_and_the_copy_names_it() {
     let (dir, scratch_path) = scratch();
     let app = dir.0.join("app");
-    write_exec(&app.join("roost-session"), &fake_session("0.0.19", 4));
+    write_exec(&app.join("roost-session"), &fake_session("0.0.19", 5));
     let env = SourceEnv {
         caller_exe: Some(app.join("shed-desktop")),
         ..sealed_env()
@@ -1518,7 +1518,7 @@ async fn the_public_fetch_takes_roosts_arch_spellings() {
 /// **The one-line follow-up, proven to be one line.**
 ///
 /// Everything below runs the real ladder with a pin supplied, which is exactly
-/// what `RELEASE_PIN = Some(...)` will do — so the day a protocol-4 release
+/// what `RELEASE_PIN = Some(...)` will do — so the day a protocol-5 release
 /// ships, the change is the constant and nothing else. This is the closest an
 /// automated test can get to the live asset path while the external gate is
 /// shut, and it is deliberately not described as covering it.

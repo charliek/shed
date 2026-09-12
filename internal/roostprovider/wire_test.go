@@ -247,7 +247,7 @@ func TestResponseErrorEnvelope(t *testing.T) {
 func TestVendoredVectorsDecode(t *testing.T) {
 	t.Run("session.identify", func(t *testing.T) {
 		var identify IdentifyResult
-		decodeVectorResult(t, "session.identify.response.v4.json", &identify)
+		decodeVectorResult(t, "session.identify.response.v5.json", &identify)
 		if identify.SessionProtocol != SpokenProtocol {
 			t.Errorf("session_protocol = %d", identify.SessionProtocol)
 		}
@@ -295,7 +295,7 @@ func decodeVectorResult(t *testing.T, name string, into any) {
 // own bytes.
 func TestVendoredVectorIdsAreStrings(t *testing.T) {
 	for _, name := range []string{
-		"session.identify.response.v4.json",
+		"session.identify.response.v5.json",
 		"tab.list.session.response.json",
 		"tab.open.response.json",
 	} {

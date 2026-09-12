@@ -9,11 +9,11 @@ import (
 )
 
 // roost's op names (`roost_ipc::messages::ops`). Three, and no more: the
-// provider gates on identify, reads projects, and opens a tab. Everything
-// interactive on roost's wire is lease-gated (`session.connect` mints one, and
-// holding it would depose whoever already had it), and the provider deliberately
-// never takes a lease — `tab.open` is mutating but NOT lease-gated, which is
-// what makes a leaseless provider possible at all.
+// provider gates on identify, reads projects, and opens a tab. At session
+// protocol 5 nothing on this wire is lease-gated any more — the lease, its
+// takeover table and `session.connect` all retired with generation 4 — so
+// `tab.open` needs no authority to check either. The provider's cut was always
+// this leaseless shape; roost's bump only made it official.
 const (
 	opSessionIdentify = "session.identify"
 	opTabList         = "tab.list"
@@ -23,15 +23,15 @@ const (
 // SpokenProtocol is the roost session protocol this build speaks —
 // `roost_ipc::messages::SESSION_PROTOCOL_VERSION` at the rev crates/Cargo.toml
 // pins. It appears in the protocol-mismatch row's copy ("… this shed speaks
-// 4"), and it is the gate `Remote.Identify` applies.
+// 5"), and it is the gate `Remote.Identify` applies.
 //
 // Hand-carried into Go the same way the exec chain is, and pinned the same way:
 // the Rust twin test asserts this number against the real constant through
-// crates/fixtures/roost-vectors/session.identify.response.v4.json, whose
+// crates/fixtures/roost-vectors/session.identify.response.v5.json, whose
 // filename generation is the version. A roost-ipc bump that moves the protocol
 // renames that vector, which breaks the twin test, which is the signal to
 // change this.
-const SpokenProtocol = 4
+const SpokenProtocol = 5
 
 // wireRequestID is the correlation id every request carries.
 //

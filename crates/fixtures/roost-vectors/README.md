@@ -2,7 +2,7 @@
 
 Byte-for-byte copies of roost's own golden wire vectors, taken from
 
-    github.com/charliek/roost @ c67ac27b6a85dbee0871f32d49c1566cc068d1c8
+    github.com/charliek/roost @ c1bfe887bc843e35466a1dcc33fa2390909fd50e
     tests/ipc-vectors/<same filename>
 
 which is the **same rev** `crates/Cargo.toml` pins `roost-ipc` to. They travel with
@@ -31,17 +31,20 @@ When the pinned `rev` in `crates/Cargo.toml` moves:
 
 **Generation-suffixed names.** roost keeps one `session.identify` reply per
 `SESSION_PROTOCOL_VERSION` generation — `session.identify.response.v2.json`,
-`.v3.json`, `.v4.json`. shed vendors **only the current generation**: a client
-that gates on the number has nothing to do with an older shape, and a protocol-2
-daemon is exercised through the fake's `set_session_protocol` control rather than
-through a vector it would then have to keep in step. So a generation bump renames
-the vendored file, and the `include_str!` paths move with it.
+`.v3.json`, `.v4.json`, `.v5.json`. shed vendors **only the current generation**
+(`.v5.json` today, plan 020): a client that gates on the number has nothing to do
+with an older shape, and a protocol-2 daemon is exercised through the fake's
+`set_session_protocol` control rather than through a vector it would then have to
+keep in step. So a generation bump renames the vendored file, and the
+`include_str!` paths move with it — all three of them (`roost/testing.rs`,
+`roost/fence.rs`, and `shed-core/tests/roost_provider_vectors.rs` reads it by
+name), plus Go's `internal/roostprovider/goldens_test.go`.
 
 ## What is here, and who reads it
 
 | file | read by |
 |---|---|
-| `session.identify.response.v4.json` | the fake's `session.identify` template (the protocol gate's input, and the `features` list it preserves); the fence tests' `daemon_session_id` / `started_at` |
+| `session.identify.response.v5.json` | the fake's `session.identify` template (the protocol gate's input); the fence tests' `daemon_session_id` / `started_at` |
 | `identify.response.json` | the fake's `identify` template |
 | `tab.list.session.response.json` | the fake's initial project/tab set — the **session** variant, i.e. the one that carries `revision` (42); the fence replay's snapshot |
 | `tab.open.response.json` | the fake's template for a tab it opens |
@@ -51,14 +54,12 @@ the vendored file, and the `include_str!` paths move with it.
 | `tab.state_changed.event.json` | the fence fold's ignored-derived-projection case |
 | `agent_report.changed.event.json` | the fence fold's claim/release case (a `claude` adapter taking tab 5); the batch the fake pushes for `set_tab_axes` |
 | `session.stopping.event.json` | the fence fold's "an envelope that is not a workspace fact" case; the terminal envelope the fake pushes from `stop()` |
-| `session.driver_changed.event.json` | the non-terminal envelope the fake pushes to every stream on a takeover |
 | `tabs.reordered.event.json` | the batch the fake pushes for `reorder_tabs` — the event that costs the watcher a re-list, since shed models no ordering |
 | `projects.reordered.event.json` | the same for `reorder_projects` |
-| `events.subscribe.response.json` | the fake's `events.subscribe` ack (the fence `{revision}`) |
-| `session.connect.request.json` | the unlabeled `session.connect` shape `Conn::session_connect(_, None)` sends |
-| `session.connect.labeled.request.json` | the same request with `client_label` — the omit-when-unset key |
-| `session.connect.response.json` | the fake's `session.connect` reply (`{lease, revision}`) |
-| `tab.write.request.json` | the `tab.write` shape, whose `lease` is omit-when-unset |
+| `events.subscribe.request.json` | the fresh-subscribe shape `Conn::subscribe` sends — the op shed calls on every watcher cycle, and the only thing that proves the lease key is gone from it |
+| `events.subscribe.response.json` | the fake's `events.subscribe` ack (the fence `{revision}` plus the required `session_id`) |
+| `tab.dump.request.json` | the `tab.dump` shape `Conn::tab_dump` sends — `scrollback` is omit-when-zero, so this is what proves shed's viewport read emits no `scrollback` key at all |
+| `tab.write.request.json` | the `tab.write` shape — lease-free at generation 5 |
 | `session.set_agent_hooks.request.json` | the shape `Conn::session_set_agent_hooks` sends (plan 019 S5) — `deny_unknown_fields` on roost's side, so this is the contract |
 | `session.set_agent_hooks.response.json` | the fake's `session.set_agent_hooks` reply template (`wired`/`refreshed`/`removed`/`skipped`/`errors`) |
 
@@ -69,20 +70,27 @@ and `shed.tab.dump.opencode.json` were **recorded by shed** from a real
 `roost-session` (release build of rev `61d8713…`, protocol 2) on 2026-09-07;
 never edited; they pin the row mapping against real adapter output. They keep
 their protocol-2 provenance because the `Tab` / `Project` / `tab.dump` shapes are
-**byte-identical** between `61d8713` and `c67ac27` — the R1 re-cut moved the lease
-semantics, not the workspace shapes.
+**byte-identical** between `61d8713` and `c1bfe88` — the R1 re-cut moved the lease
+semantics and the protocol-5 bump retired it, and neither touched the workspace
+shapes.
 
-`shed.session.identify.json` was **re-recorded** on 2026-09-07 from the
-protocol-4 daemon (release build of rev `c67ac27…`, `roost-session` 0.0.19),
-because that reply embeds the generation integer and a protocol-2 recording would
-no longer be what shed's gate sees.
+`shed.session.identify.json` was **re-recorded** on 2026-09-12 from a live
+protocol-5 daemon (release build of rev `c1bfe88…`, `roost-session` 0.0.19,
+started and stopped for this capture), because that reply embeds the generation
+integer and a recording from an older generation is no longer what shed's gate
+sees. It was re-recorded rather than hand-edited for a reason the hand-edit would
+have hidden: a protocol-5 daemon answers `payload_kinds` as
+`["ghostty-snapshot", "vt"]`, and the protocol-4 recording carried only
+`["ghostty-snapshot"]`. An integer edited by hand would have left that field
+quietly wrong. The previous recording, for the record, was taken on 2026-09-07
+from the protocol-4 daemon at rev `c67ac27…`.
 
 `shed.tab.closed.event.json` and `shed.tab.notification.event.json` are recorded
 too, and they exist because roost publishes **no** vector for either envelope
 (its event vectors are `agent_report.changed`, `events.batch`,
-`projects.reordered`, `session.driver_changed`, `session.stopping`, `tab.effect`,
-`tab.opened`, `tab.state_changed`, `tabs.reordered`). Both were captured from the
-same protocol-4 daemon with a **leaseless observer stream** open — the close by
+`projects.reordered`, `session.stopping`, `tab.effect`, `tab.opened`,
+`tab.state_changed`, `tabs.reordered`). Both were captured from the
+protocol-4 daemon of the day with an observer stream open — the close by
 `roostctl tab open` followed by `roostctl tab close`, the notification envelope by
 the same stream's `tab.notification` frame — so the fakes build a close and a
 notification flip from roost's own bytes rather than from a shape remembered off

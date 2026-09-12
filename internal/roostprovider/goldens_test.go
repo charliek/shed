@@ -198,7 +198,7 @@ func TestProviderRowMatchesGolden(t *testing.T) {
 }
 
 // TestSpokenProtocolMatchesVendoredVector is the Go end of a three-link chain:
-// the vendored protocol-4 identify vector is asserted against roost's own
+// the vendored protocol-5 identify vector is asserted against roost's own
 // SESSION_PROTOCOL_VERSION by the Rust leg, and against this constant here. A
 // generation bump renames that vector file (shed vendors only the current
 // generation), so this test fails on the missing path rather than silently
@@ -209,9 +209,9 @@ func TestSpokenProtocolMatchesVendoredVector(t *testing.T) {
 			SessionProtocol int `json:"session_protocol"`
 		} `json:"result"`
 	}
-	readVectorJSON(t, "session.identify.response.v4.json", &vector)
+	readVectorJSON(t, "session.identify.response.v5.json", &vector)
 	if vector.Result.SessionProtocol != SpokenProtocol {
-		t.Errorf("SpokenProtocol = %d, the vendored v4 vector says %d",
+		t.Errorf("SpokenProtocol = %d, the vendored v5 vector says %d",
 			SpokenProtocol, vector.Result.SessionProtocol)
 	}
 }

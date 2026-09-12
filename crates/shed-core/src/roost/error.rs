@@ -22,8 +22,8 @@ pub enum RoostError {
     #[error("{0}")]
     Unavailable(String),
     /// The session speaks a different `session.identify` protocol than this
-    /// build. Refused by name rather than limped through: the lease semantics
-    /// and the lease-gated op set are exactly what the number covers.
+    /// build. Refused by name rather than limped through: the number covers the
+    /// whole op set and every parameter shape on it.
     #[error(
         "this roost-session speaks session protocol {theirs}, this build speaks {ours} \
          (upgrade whichever is older; shed pins roost-ipc by rev)"

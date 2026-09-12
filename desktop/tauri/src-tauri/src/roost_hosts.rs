@@ -72,7 +72,7 @@ use roost_ipc::agent::Ownership;
 use roost_ipc::messages::{Tab, TabOpenParams};
 use shed_app::roost::{
     launch_argv, roost_capabilities, shed_reach_entry, tab_close, tab_open, BootstrapRunner,
-    ReachKind as ReachFamily, RoostLeases, RoostReach, RoostUpdate, RoostWatcher, SshExec,
+    ReachKind as ReachFamily, RoostReach, RoostUpdate, RoostWatcher, SshExec,
 };
 use shed_core::config::{MachineEntry, ShedConfig};
 use shed_core::rc::RcKind;
@@ -93,9 +93,9 @@ use crate::machines::{
 /// drift and only one of them would be under the harness's eye.
 pub const NO_TERMINAL: &str = "terminal unavailable: attach is native-remote";
 
-/// Who shed says it is on roost's wire — the lease label and
-/// `session.set_agent_hooks`'s `client` (plan 019 §3.4). The phone's twin is
-/// `shed-mobile`.
+/// Who shed says it is on roost's wire — `session.set_agent_hooks`'s `client`,
+/// which roost files as the `by` of the host's state entry (plan 019 §3.4). The
+/// phone's twin is `shed-mobile`.
 pub const CLIENT_LABEL: &str = "shed-desktop";
 
 /// How long one shed's "is anything serving over there?" probe may take.
@@ -420,8 +420,6 @@ pub struct RoostHosts {
     /// [`RoostHosts::shutdown`] is the same teardown for app quit, which is the
     /// one path where `Drop` alone would be too late (plan 019 §3.6).
     execs: Mutex<BTreeMap<HostId, Arc<SshExec>>>,
-    /// The interactive leases shed holds, one per target, for the app run.
-    leases: Arc<RoostLeases>,
     /// Sheds a probe is in flight for, so a second refresh landing while the
     /// first is still dialling does not fork a second `ssh` for the same host.
     probing: Arc<Mutex<BTreeSet<HostId>>>,
@@ -573,7 +571,6 @@ impl RoostHosts {
             reach_options,
             jail_fs_root,
             execs: Mutex::new(BTreeMap::new()),
-            leases: Arc::new(RoostLeases::new()),
             probing: Arc::new(Mutex::new(BTreeSet::new())),
             listed_sheds: Arc::new(Mutex::new(BTreeSet::new())),
             bootstrapping: Arc::new(Mutex::new(BTreeSet::new())),
@@ -1224,7 +1221,6 @@ impl RoostHosts {
         // question, and making the user wait out a cooldown for an answer that
         // has certainly changed would be the wrong way round.
         lock(&self.probed).remove(id);
-        self.leases.forget(&id.token());
         let was_listed = lock(&self.state).remove(id).is_some_and(|m| m.listed);
         // The lane layer holds subscriptions (and `ssh -N` children) against
         // rows that have just gone. Publishing an empty set is how they are
@@ -1298,16 +1294,17 @@ impl RoostHosts {
     ///
     /// ## One bootstrap per target at a time
     ///
-    /// **Refused, not queued.** The lease mutex inside
-    /// [`BootstrapRunner`](shed_app::roost::BootstrapRunner) serializes the HOOKS
-    /// dialogue and nothing else, so without the gate below two calls naming the
-    /// same target — a double-clicked button, a socket driver beside a click —
-    /// would both re-probe, both resolve bytes, and then stream, commit and
-    /// `start` over each other inside roost's `.bak.<pid>` chain. Queueing the
-    /// second would be worse than refusing it: it was consented to against a
-    /// fingerprint the first call is in the middle of invalidating, so the honest
-    /// answer is to say a bootstrap is already running and let the user (or the
-    /// next preview) decide.
+    /// **Refused, not queued, and nothing below this gate serializes anything.**
+    /// [`BootstrapRunner`](shed_app::roost::BootstrapRunner) holds no lock of its
+    /// own — it drives a sans-IO machine over an `ssh` master and a roost
+    /// connection, both of which two calls would happily share. So without this
+    /// gate two calls naming the same target — a double-clicked button, a socket
+    /// driver beside a click — would both re-probe, both resolve bytes, and then
+    /// stream, commit and `start` over each other inside roost's `.bak.<pid>`
+    /// chain. Queueing the second would be worse than refusing it: it was
+    /// consented to against a fingerprint the first call is in the middle of
+    /// invalidating, so the honest answer is to say a bootstrap is already
+    /// running and let the user (or the next preview) decide.
     ///
     /// Plan 019 §3.4 pins that two DIFFERENT clients (this app and the phone) are
     /// last-writer-wins, detected by the post-commit identify. That is a
@@ -1395,7 +1392,6 @@ impl RoostHosts {
             let runner = BootstrapRunner {
                 exec: exec.as_ref(),
                 reach: reach.as_ref(),
-                leases: self.leases.as_ref(),
                 target: &token,
                 jail_fs_root: self.jail_fs_root,
             };
@@ -1445,7 +1441,6 @@ impl RoostHosts {
         let runner = BootstrapRunner {
             exec: exec.as_ref(),
             reach: reach.as_ref(),
-            leases: self.leases.as_ref(),
             target: &token,
             jail_fs_root: self.jail_fs_root,
         };
@@ -1762,12 +1757,6 @@ fn hooks_json(hooks: &HooksResult) -> Value {
         "client": hooks.client_label,
         "mode": "auto",
         "applied": hooks.applied(),
-        // The lease itself is NEVER published: it is a bearer token for the
-        // host's interactive session, and a client that logged it would put a
-        // usable credential in a test artifact. Whether shed still holds one is
-        // the part a UI needs.
-        "lease_held": hooks.lease.is_some(),
-        "skipped_code": hooks.skipped_code,
         "wired": hooks.wired,
         "refreshed": hooks.refreshed,
         "removed": hooks.removed,
@@ -2587,59 +2576,6 @@ mod tests {
             1,
             "the flip rode the event stream — a re-list would mean the watcher \
              still polls"
-        );
-    }
-
-    /// **Somebody else taking the interactive lease changes nothing here.**
-    ///
-    /// At protocol 4 a takeover no longer ends an event stream; it reclassifies
-    /// it and says so once with a non-terminal `session.driver_changed`. Shed
-    /// never held the lease to begin with, so the rows must not move — and the
-    /// stream must still be delivering, which the flip afterwards is what
-    /// proves. (Two takeovers: the first mints into an unheld session and
-    /// deposes nobody, so roost announces nothing; the second is the real one.)
-    #[tokio::test]
-    async fn a_driver_change_leaves_the_rows_alone_and_the_stream_alive() {
-        let fake = FakeRoost::start().await;
-        claim_opencode(&fake, "working", "session_status", false);
-        let machines = start(
-            &config_with(&["mini3"]),
-            &sockets(&[("mini3", fake.socket_path())]),
-        );
-        let before = wait_for("the first row", || rows(&machines).into_iter().next()).await;
-        let lists_before = fake.tab_list_calls();
-
-        fake.take_over("roost ui");
-        fake.take_over("somebody else");
-
-        // Nothing to wait FOR — the assertion is that nothing happens — so give
-        // the frame time to be delivered and mishandled before reading.
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        assert_eq!(rows(&machines), vec![before], "a takeover moved a row");
-        assert_eq!(
-            machine_health(&machines, "mini3"),
-            (true, None),
-            "a takeover is not a reason to call a machine down"
-        );
-        assert_eq!(
-            fake.tab_list_calls(),
-            lists_before,
-            "a takeover is informational — it must not cost a resync"
-        );
-
-        // The stream survived it: the next commit still arrives.
-        claim_opencode(&fake, "finished", "session_idle", false);
-        let after = wait_for("the flip after the takeover", || {
-            rows(&machines)
-                .into_iter()
-                .find(|r| r["activity"] == "idle")
-        })
-        .await;
-        assert_eq!(after["slug"], json!("5"));
-        assert_eq!(
-            fake.tab_list_calls(),
-            lists_before,
-            "and it was still the SAME stream, not a reconnect"
         );
     }
 
@@ -3628,12 +3564,13 @@ mod tests {
 
     /// **One bootstrap per target at a time** (plan 019 §3.6).
     ///
-    /// The lease mutex inside `BootstrapRunner` serializes the HOOKS dialogue and
-    /// nothing else, so without [`RoostHosts::begin_bootstrap`] two calls naming
-    /// one target would both re-probe, both resolve bytes, and then stream,
-    /// commit and `start` over each other. §3.4's last-writer-wins pin is about
-    /// two different CLIENTS that cannot see each other; it is not licence for one
-    /// app to race itself.
+    /// `BootstrapRunner` serializes nothing — it drives a sans-IO machine over a
+    /// shared `ssh` master and a shared roost connection — so without
+    /// [`RoostHosts::begin_bootstrap`] two calls naming one target would both
+    /// re-probe, both resolve bytes, and then stream, commit and `start` over
+    /// each other. §3.4's last-writer-wins pin is about two different CLIENTS
+    /// that cannot see each other; it is not licence for one app to race
+    /// itself.
     ///
     /// The first call's claim is taken explicitly rather than by racing two real
     /// bootstraps: both legs here fail fast (this config has no usable transport),

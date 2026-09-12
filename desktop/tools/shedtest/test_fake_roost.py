@@ -5,13 +5,13 @@
 and the two drifting apart is the failure mode this file exists to prevent.
 
 **Why it cannot be left to `test_tauri_machines.py`.** That suite drives the fake
-through the real app, and the app is an *observer*: it identifies, subscribes
-with an empty lease, lists, and folds batches. It never calls `session.connect`,
-never presents a lease on a `tab.write`, never asks for a filtered subscribe, and
-never holds two connections whose fates a takeover decides. So the entire lease
-half of protocol 4 — the half the Rust fake's own unit tests pin at length —
-would sit here unexercised, and a Python port that got roost's takeover table
-subtly wrong would pass every other test in the harness.
+through the real app, and the app is an *observer*: it identifies, subscribes,
+lists, and folds batches. It never asks for a filtered subscribe and never
+drives two connections against `session.set_agent_hooks` concurrently — the
+"open to every connection, last writer wins" behaviour that generation 5
+actually changed about that op, and the one the Rust fake's own unit tests pin
+at length. So a Python port that got that shape subtly wrong would pass every
+other test in the harness.
 
 So these cells speak the wire directly: raw newline-delimited JSON frames on the
 fake's socket, no app, no Tauri, no mock server. Each one has a named counterpart
@@ -33,13 +33,8 @@ from fake_roost import (
     STREAM_WRITE_DEADLINE,
     FakeRoost,
     RoostWireError,
-    _normalize_label,
     roost_call,
 )
-
-#: A well-formed lease this fake never minted (the mint is counter-seeded, so a
-#: run of `f`s cannot collide with one).
-UNKNOWN_LEASE = "f" * 32
 
 
 def _b64(text: str) -> str:
@@ -49,10 +44,9 @@ def _b64(text: str) -> str:
 class _Wire:
     """One connection that STAYS OPEN, unlike `roost_call`'s dial-per-request.
 
-    The lease protocol is per-connection in two places `roost_call` cannot reach:
-    `session.connect` refuses a second connect on the connection that already
-    holds the lease, and a takeover closes the deposed holder's connection. Both
-    need the same socket for two requests.
+    Needed by anything that drives more than one request on the same socket —
+    a subscribe followed by reads off the stream, or two connections whose
+    ordering with respect to each other matters.
     """
 
     def __init__(self, path, timeout: float = 10.0):
@@ -99,10 +93,10 @@ class _Wire:
             raise RoostWireError(err.get("code", "unknown"), err.get("message", ""))
         return reply.get("result") or {}
 
-    def subscribe(self, lease: str = "") -> dict:
-        """`events.subscribe` exactly as the real client sends it — a `lease`
-        (empty for an observer) and the string `"0"` filter."""
-        return self.call("events.subscribe", {"lease": lease, "tab_id_filter": "0"})
+    def subscribe(self) -> dict:
+        """`events.subscribe` exactly as the real client sends it — the string
+        `"0"` filter and nothing else; there is no lease key at generation 5."""
+        return self.call("events.subscribe", {"tab_id_filter": "0"})
 
 
 @pytest.fixture
@@ -143,208 +137,13 @@ def test_the_vendored_vectors_carry_what_the_fake_reads(roost):
     `fake_roost` — which is exactly what this module's import catches.
     """
     identified = roost_call(roost.socket_path, "session.identify")
-    assert identified["session_protocol"] == 4, identified
+    assert identified["session_protocol"] == 5, identified
     assert identified["session_id"], identified
-    assert identified["features"] == ["put_file"], "the .v4 vector's features survive"
+    assert "features" not in identified, "`features` retired at generation 5"
 
     listed = roost_call(roost.socket_path, "tab.list")
     assert isinstance(listed["revision"], int)
     assert [t["id"] for p in listed["projects"] for t in p["tabs"]] == ["5"]
-
-
-def test_a_client_label_is_normalized_the_way_roost_normalizes_it():
-    """Mirrors `testing.rs::a_client_label_is_normalized_the_way_roost_normalizes_it`.
-
-    The label is echoed back as `session.driver_changed.taken_by`, so the two
-    fakes agreeing on the normalization is the difference between a client being
-    tested against roost's string and against ours.
-    """
-    assert _normalize_label("  workbox  ") == "workbox"
-    assert _normalize_label("work\u0007box") == "workbox", "an ASCII control"
-    assert _normalize_label("   ") is None
-    assert len(_normalize_label("x" * 200)) == 128
-
-    # **The half "is a control character" does not cover.** Unicode classifies
-    # none of these as controls, so a control-only filter passes them into the
-    # takeover banner — the separators break it onto a second line and the
-    # overrides reorder everything after them. An ASCII-only test would certify a
-    # parity with roost that does not exist.
-    assert _normalize_label("work\u202ebox") == "workbox", "a right-to-left override"
-    assert _normalize_label("work\u2066box\u2069") == "workbox", "the isolate family"
-    assert _normalize_label("work\u2028box") == "workbox", "a line separator"
-    assert _normalize_label("work\u2029box") == "workbox", "a paragraph separator"
-    assert _normalize_label("\u202e\u2028") is None, "hostile-only"
-
-
-# ---------------------------------------------------------------------------
-# the lease
-# ---------------------------------------------------------------------------
-
-
-def test_tab_write_on_a_session_socket_is_lease_gated(roost):
-    """The four answers roost gives a `tab.write`'s `lease` key, in order:
-    absent, unknown, current, tombstoned.
-
-    Absent and unknown are deliberately the SAME answer (`connect-required`) —
-    roost does not tell a caller whether a token it invented ever existed.
-    """
-    with _Wire(roost.socket_path) as w:
-        with pytest.raises(RoostWireError) as absent:
-            w.call("tab.write", {"tab_id": "5", "data": _b64("no lease")})
-        assert absent.value.code == "connect-required", absent.value
-
-        with pytest.raises(RoostWireError) as unknown:
-            w.call("tab.write", {"tab_id": "5", "data": _b64("x"), "lease": UNKNOWN_LEASE})
-        assert unknown.value.code == "connect-required", unknown.value
-        assert roost.written(5) == b"", "a refused write must not land"
-
-        lease = w.call("session.connect", {"takeover": False, "client_label": "self-test"})["lease"]
-        assert len(lease) == 32, lease
-        assert all(c in "0123456789abcdef" for c in lease), lease
-        assert roost.lease == lease
-        assert roost.lease_label == "self-test"
-
-        w.call("tab.write", {"tab_id": "5", "data": _b64("hi"), "lease": lease})
-        assert roost.written(5) == b"hi"
-
-    # The tombstone is answered on a FRESH connection, because the takeover just
-    # closed the one that held the displaced lease (see the takeover cell below).
-    roost.take_over("workbox")
-    with _Wire(roost.socket_path) as after:
-        with pytest.raises(RoostWireError) as displaced:
-            after.call("tab.write", {"tab_id": "5", "data": _b64("x"), "lease": lease})
-        assert displaced.value.code == "taken-over", displaced.value
-
-
-def test_exactly_one_tombstone_survives_two_takeovers(roost):
-    """roost remembers only the MOST RECENTLY displaced lease, so a lease
-    displaced twice falls back to `connect-required` — it has already been told.
-
-    Mirrors `testing.rs::the_lease_follows_roosts_takeover_table_with_exactly_one_tombstone`.
-    A fake that kept every tombstone would let a client be written against a
-    `taken-over` roost stops sending.
-    """
-    with _Wire(roost.socket_path) as holder:
-        connected = holder.call("session.connect", {"takeover": False, "client_label": "first"})
-        first = connected["lease"]
-
-    roost.take_over("second")
-    with _Wire(roost.socket_path) as writer:
-        with pytest.raises(RoostWireError) as displaced:
-            writer.call("tab.write", {"tab_id": "5", "data": _b64("x"), "lease": first})
-        assert displaced.value.code == "taken-over", displaced.value
-
-        roost.take_over("third")
-        with pytest.raises(RoostWireError) as forgotten:
-            writer.call("tab.write", {"tab_id": "5", "data": _b64("x"), "lease": first})
-        assert forgotten.value.code == "connect-required", forgotten.value
-
-
-def test_a_write_with_the_live_lease_registers_that_connection_too(roost):
-    """**A lease-bearing write registers its connection under the lease**, not
-    just `session.connect` does.
-
-    roost's `present()` is what every lease-carrying op runs, and on the live
-    lease it pushes the connection onto the holder's list — which is the list a
-    takeover closes. A fake that registered only the connecting one would let a
-    second connection keep writing straight through a takeover, which is
-    precisely the authority the lease exists to move.
-
-    Mirrors `testing.rs::a_write_with_the_live_lease_registers_that_connection_too`.
-    """
-    owner = _Wire(roost.socket_path)
-    lease = owner.call("session.connect", {"takeover": False, "client_label": "owner"})["lease"]
-
-    # A SECOND connection that never connected, only wrote.
-    writer = _Wire(roost.socket_path)
-    writer.call("tab.write", {"tab_id": "5", "data": _b64("ok"), "lease": lease})
-    assert roost.written(5) == b"ok"
-
-    with _Wire(roost.socket_path) as observer:
-        observer.subscribe("")
-
-        roost.take_over("usurper")
-
-        with pytest.raises((RoostWireError, OSError)):
-            owner.call("tab.list")
-        with pytest.raises((RoostWireError, OSError)):
-            writer.call("tab.list")
-        owner.close()
-        writer.close()
-
-        # …and the stream is spared, and still delivering.
-        told = observer.readline()
-        assert told["event"] == "session.driver_changed", told
-        roost.bump_revision()
-        assert observer.readline()["revision"] == roost.revision
-
-
-def test_the_write_gate_runs_before_the_tab_lookup(roost):
-    """**The lease is checked before the tab.** roost decodes, runs
-    `require_lease`, and only then writes — so an unknown tab presented without
-    authority answers `connect-required` and never confirms whether that tab
-    exists. With the checks the other way round, an unauthorized caller could
-    enumerate a session's tabs by the error code alone."""
-    with _Wire(roost.socket_path) as w:
-        with pytest.raises(RoostWireError) as blind:
-            w.call("tab.write", {"tab_id": "4242", "data": _b64("x")})
-        assert blind.value.code == "connect-required", blind.value
-
-        lease = w.call("session.connect", {"takeover": False})["lease"]
-        with pytest.raises(RoostWireError) as missing:
-            w.call("tab.write", {"tab_id": "4242", "data": _b64("x"), "lease": lease})
-        assert missing.value.code == "not-found", missing.value
-
-
-def test_a_connect_on_a_held_session_is_already_connected_even_from_its_holder(roost):
-    """roost's table, whole: held by ANYONE — the caller's own connection
-    included — without `takeover` is `already-connected`.
-
-    A client that lost track of its own lease is the one that has to
-    re-establish it deliberately, and `takeover: true` from that same connection
-    is how: it mints, and roost spares the requester's connection.
-    """
-    with _Wire(roost.socket_path) as w:
-        w.call("session.connect", {"takeover": False})
-        with pytest.raises(RoostWireError) as held:
-            w.call("session.connect", {"takeover": False})
-        assert held.value.code == "already-connected", held.value
-
-        mine = w.call("session.connect", {"takeover": True, "client_label": "mine"})["lease"]
-        # The requester keeps its connection — this is the proof, since a closed
-        # one could not answer at all.
-        w.call("tab.write", {"tab_id": "5", "data": _b64("ok"), "lease": mine})
-        assert roost.written(5) == b"ok"
-
-
-def test_a_takeover_closes_the_deposed_holders_control_connection_but_not_streams(roost):
-    """The asymmetry R1 introduced, in one cell: a takeover **closes** the
-    deposed holder's control connection and **spares** every event stream,
-    telling them once with a non-terminal `session.driver_changed`.
-
-    Mirrors `testing.rs::a_takeover_closes_the_deposed_holders_control_connection`
-    plus `a_takeover_tells_every_stream_and_closes_none`.
-    """
-    holder = _Wire(roost.socket_path)
-    holder.call("session.connect", {"takeover": False, "client_label": "deposed"})
-    with _Wire(roost.socket_path) as watcher:
-        watcher.subscribe("")
-
-        roost.take_over("usurper")
-
-        with pytest.raises((RoostWireError, OSError)):
-            holder.call("tab.list")
-        holder.close()
-
-        told = watcher.readline()
-        assert told["event"] == "session.driver_changed", told
-        assert told["data"]["taken_by"] == "usurper", told
-
-        # Not terminal: the next commit still arrives on the same stream.
-        roost.bump_revision()
-        batch = watcher.readline()
-        assert batch["revision"] == roost.revision, batch
-        assert batch["events"] == [], batch
 
 
 # ---------------------------------------------------------------------------
@@ -352,35 +151,39 @@ def test_a_takeover_closes_the_deposed_holders_control_connection_but_not_stream
 # ---------------------------------------------------------------------------
 
 
-def test_an_empty_lease_is_an_observer_and_a_current_one_is_a_driver(roost):
-    """`events.subscribe` CLASSIFIES on the lease, it does not gate on one — which
-    is what makes shed's watcher able to read somebody's machine without taking
-    the driver seat from the roost UI they are looking at.
+def test_shed_subscribes_and_takes_nothing(roost):
+    """`events.subscribe` REGISTERS, it does not classify — the driver/observer
+    split retired with the lease, so a subscriber is just a subscriber.
 
-    The driver half is what gives "shed subscribes as an observer" any content:
-    without it, an observer count of one would also pass against a fake that
-    called every stream an observer.
-    """
-    with _Wire(roost.socket_path) as observer:
-        ack = observer.subscribe("")
+    Mirrors `testing.rs`'s stream-registration cells; there is nothing left on
+    this wire for a client to hold beyond the stream itself."""
+    with _Wire(roost.socket_path) as w:
+        ack = w.subscribe()
         assert ack["revision"] == roost.revision, ack
-        assert roost.observer_count() == 1
-        assert roost.driver_count() == 0
+        assert roost.stream_count() == 1
 
-        control = _Wire(roost.socket_path)
-        lease = control.call("session.connect", {"takeover": False})["lease"]
-        with _Wire(roost.socket_path) as driver:
-            driver.subscribe(lease)
-            assert roost.driver_count() == 1
-            assert roost.observer_count() == 1
 
-            # A takeover reclassifies it IN PLACE rather than closing it.
-            roost.take_over("someone else")
-            assert roost.driver_count() == 0
-            assert roost.observer_count() == 2
-            told = driver.readline()
-            assert told["event"] == "session.driver_changed", told
-        control.close()
+def test_the_subscribe_ack_echoes_the_session_id_and_follows_a_restart(roost):
+    """The ack names the incarnation answering, and it **tracks a restart** —
+    which is the whole reason roost made the field required at generation 5: a
+    client that identifies on one connection and subscribes on another has to be
+    able to tell that the two dials landed on different processes.
+
+    Mirrors `testing.rs::the_subscribe_ack_echoes_the_session_id_and_follows_a_restart`.
+    """
+    identified = roost_call(roost.socket_path, "session.identify")
+    with _Wire(roost.socket_path) as w:
+        ack = w.subscribe()
+    assert ack["session_id"] == identified["session_id"], ack
+
+    roost.restart()
+    identified_after = roost_call(roost.socket_path, "session.identify")
+    assert identified_after["session_id"] != identified["session_id"], (
+        "a restart is a new incarnation and identify has to say so"
+    )
+    with _Wire(roost.socket_path) as w:
+        ack_after = w.subscribe()
+    assert ack_after["session_id"] == identified_after["session_id"] == roost.session_id
 
 
 def test_a_filtered_subscribe_is_refused_rather_than_served_unfiltered(roost):
@@ -390,12 +193,12 @@ def test_a_filtered_subscribe_is_refused_rather_than_served_unfiltered(roost):
     instead."""
     with _Wire(roost.socket_path) as w:
         with pytest.raises(RoostWireError) as refused:
-            w.call("events.subscribe", {"lease": "", "tab_id_filter": "5"})
+            w.call("events.subscribe", {"tab_id_filter": "5"})
         assert refused.value.code == "invalid-param", refused.value
-        assert roost.observer_count() == 0, "a refused subscribe registered a stream"
+        assert roost.stream_count() == 0, "a refused subscribe registered a stream"
 
         # And the connection is still usable: a refusal is not a hang-up.
-        assert w.subscribe("")["revision"] == roost.revision
+        assert w.subscribe()["revision"] == roost.revision
 
 
 def test_every_mutation_commits_exactly_one_batch_from_the_vendored_envelopes(roost):
@@ -405,7 +208,7 @@ def test_every_mutation_commits_exactly_one_batch_from_the_vendored_envelopes(ro
     Mirrors `testing.rs::every_mutation_commits_exactly_one_batch`.
     """
     with _Wire(roost.socket_path) as w:
-        acked = w.subscribe("")["revision"]
+        acked = w.subscribe()["revision"]
 
         def names() -> list[str]:
             batch = w.readline()
@@ -439,7 +242,7 @@ def test_a_skipped_revision_leaves_a_hole_in_the_sequence(roost):
     """`skip_revision` is the only way to manufacture the loss a resync exists
     for; roost itself never does it (it closes the stream instead)."""
     with _Wire(roost.socket_path) as w:
-        acked = w.subscribe("")["revision"]
+        acked = w.subscribe()["revision"]
         roost.skip_revision()
         roost.bump_revision()
         batch = w.readline()
@@ -451,7 +254,7 @@ def test_a_lagging_subscriber_is_closed_rather_than_thinned(roost):
     fan-out is dropped, and the bare EOF is the client's resync signal — never a
     sequence with holes punched in it, which a client cannot tell from loss."""
     with _Wire(roost.socket_path) as w:
-        w.subscribe("")
+        w.subscribe()
         # Overrun the queue without reading a single frame. Generously past the
         # capacity so the drop cannot depend on how many the push thread drained.
         for _ in range(FRAME_CAPACITY * 3):
@@ -477,8 +280,8 @@ def test_a_stalled_write_is_bounded_by_the_deadline(roost):
     would be unhonourable; with it, the subscriber is simply gone.
     """
     with _Wire(roost.socket_path) as w:
-        w.subscribe("")
-        assert roost.observer_count() == 1
+        w.subscribe()
+        assert roost.stream_count() == 1
 
         # Bigger than any default AF_UNIX buffer (~200 KB), so the write cannot
         # complete into the kernel and be forgotten about.
@@ -486,10 +289,10 @@ def test_a_stalled_write_is_bounded_by_the_deadline(roost):
         roost.set_axes(5, detail="x" * 4_000_000)
 
         deadline = time.monotonic() + STREAM_WRITE_DEADLINE + 30
-        while roost.observer_count() and time.monotonic() < deadline:
+        while roost.stream_count() and time.monotonic() < deadline:
             time.sleep(0.02)
         elapsed = time.monotonic() - started
-        assert roost.observer_count() == 0, (
+        assert roost.stream_count() == 0, (
             "a peer that stopped reading held the stream past the write deadline"
         )
         assert elapsed >= STREAM_WRITE_DEADLINE / 2, (
@@ -503,7 +306,7 @@ def test_stop_says_why_and_then_serves_nothing_until_restart(roost):
     and a fake that kept answering would make "further attempts fail"
     untestable."""
     with _Wire(roost.socket_path) as w:
-        w.subscribe("")
+        w.subscribe()
         roost.stop()
 
         told = w.readline()
@@ -532,12 +335,12 @@ def test_the_tab_list_hook_commits_between_the_ack_and_the_reply(roost):
     arithmetic.
     """
     with _Wire(roost.socket_path) as w:
-        acked = w.subscribe("")["revision"]
+        acked = w.subscribe()["revision"]
 
         seen: dict = {}
 
         def race(hook) -> None:
-            seen["observers"] = hook.observer_count()
+            seen["streams"] = hook.stream_count()
             hook.bump_revision()
 
         roost.before_tab_list(race)
@@ -545,10 +348,62 @@ def test_the_tab_list_hook_commits_between_the_ack_and_the_reply(roost):
         assert listed["revision"] == acked + 1, (
             "the snapshot must already be past the batch the hook pushed"
         )
-        assert seen["observers"] == 1, "the client subscribed BEFORE it listed"
+        assert seen["streams"] == 1, "the client subscribed BEFORE it listed"
         # Once: the next list is not raced again.
         assert roost_call(roost.socket_path, "tab.list")["revision"] == acked + 1
         assert roost.tab_list_calls == 2
+
+
+# ---------------------------------------------------------------------------
+# session.set_agent_hooks: open to every connection at generation 5
+# ---------------------------------------------------------------------------
+
+
+def test_two_connections_both_wire_hooks_and_the_last_one_is_recorded(roost):
+    """`session.set_agent_hooks` is **open to every connection** at generation 5
+    and the last writer wins.
+
+    This is the one behaviour the bump actually changed about this op — roost
+    deleted `AgentHooksAuthority` and `AgentHooksError::Unauthorized` outright —
+    and it is the thing the deleted lease-registry tests were standing in front
+    of. Two connections, no coordination, both served.
+
+    Mirrors `testing.rs::two_connections_both_wire_hooks_and_the_last_one_is_recorded`.
+    """
+    with _Wire(roost.socket_path) as desktop, _Wire(roost.socket_path) as phone:
+        desktop.call(
+            "session.set_agent_hooks", {"mode": "auto", "skip": [], "client": "shed-desktop"}
+        )
+        phone.call(
+            "session.set_agent_hooks", {"mode": "auto", "skip": [], "client": "shed-mobile"}
+        )
+
+        calls = roost.agent_hooks_calls
+        assert len(calls) == 2, calls
+        assert calls[0]["client"] == "shed-desktop"
+        assert calls[1]["client"] == "shed-mobile", "`client` is the record of who wrote last"
+        for call in calls:
+            assert "lease" not in call, f"no authority travels with this op any more: {call}"
+
+
+def test_the_hooks_op_sent_twice_yields_an_identical_wired_set(roost):
+    """**Semantic idempotence, asserted rather than argued.** Sending the op
+    twice against the fake yields the same recorded call twice — which is the
+    whole of decision D1's safety argument: an unconditional re-send on every
+    watcher cycle is safe exactly because the second call says the same thing as
+    the first.
+
+    Mirrors `testing.rs::the_hooks_op_sent_twice_yields_an_identical_wired_set`.
+    """
+    with _Wire(roost.socket_path) as w:
+        params = {"mode": "auto", "skip": [], "client": "shed-desktop"}
+        first = w.call("session.set_agent_hooks", params)
+        second = w.call("session.set_agent_hooks", params)
+        assert first == second
+
+        calls = roost.agent_hooks_calls
+        assert len(calls) == 2
+        assert calls[0] == calls[1], "the same request, byte for byte"
 
 
 # ---------------------------------------------------------------------------
@@ -556,24 +411,22 @@ def test_the_tab_list_hook_commits_between_the_ack_and_the_reply(roost):
 # ---------------------------------------------------------------------------
 
 
-def test_a_ui_socket_mints_no_lease_and_publishes_no_fence(roost):
-    """roost's OTHER socket. It answers `unknown-op` to the session ops (which is
-    the only way a client can tell the two apart), serves no event stream, omits
-    `revision` from `tab.list` ENTIRELY rather than sending a number nothing
-    could be fenced against — and **accepts and ignores** a `tab.write` lease,
-    because it mints none and refusing would make one client unable to talk to
-    both kinds of socket.
+def test_a_ui_socket_publishes_no_fence_and_serves_no_stream(roost):
+    """roost's OTHER socket. It answers `unknown-op` to `session.identify` and
+    `session.set_agent_hooks` (which is the only way a client can tell the two
+    apart), serves no event stream, and omits `revision` from `tab.list`
+    ENTIRELY rather than sending a number nothing could be fenced against.
     """
     roost.ui_socket = True
 
-    for op in ("session.identify", "session.connect"):
+    for op in ("session.identify", "session.set_agent_hooks"):
         with pytest.raises(RoostWireError) as unknown:
             roost_call(roost.socket_path, op)
         assert unknown.value.code == "unknown-op", (op, unknown.value)
 
     with _Wire(roost.socket_path) as w:
         with pytest.raises(RoostWireError) as unimplemented:
-            w.subscribe("")
+            w.subscribe()
         assert unimplemented.value.code == "not-implemented", unimplemented.value
 
     listed = roost_call(roost.socket_path, "tab.list")
@@ -581,24 +434,22 @@ def test_a_ui_socket_mints_no_lease_and_publishes_no_fence(roost):
     assert listed["projects"], listed
 
     roost_call(roost.socket_path, "tab.write", {"tab_id": "5", "data": _b64("hi")})
-    roost_call(roost.socket_path, "tab.write",
-               {"tab_id": "5", "data": _b64("!"), "lease": UNKNOWN_LEASE})
-    assert roost.written(5) == b"hi!", "a UI socket ignores the lease key, both ways"
+    assert roost.written(5) == b"hi"
 
 
-def test_a_protocol_mismatch_and_a_featureless_reply_are_controls_not_vectors(roost):
+def test_a_protocol_mismatch_is_a_control_not_a_vector(roost):
     """shed vendors only the CURRENT `session.identify` generation, so an older
     daemon is a control on this fake rather than a second vector to keep in step
     (`crates/CLAUDE.md`, "The one git dependency").
 
-    Both controls exist on the Rust fake (`set_session_protocol`,
-    `serve_without_features`); this pins the Python ones answer the same way.
+    Mirrors the Rust fake's `set_session_protocol` control, exercised by
+    `conn.rs`'s `a_protocol_mismatch_is_refused_by_name` family — including the
+    protocol-4 case, which is now the interesting one: a session plan 019's
+    desktop installed everywhere is exactly what this build must refuse by name.
     """
     roost.session_protocol = 2
     assert roost_call(roost.socket_path, "session.identify")["session_protocol"] == 2
 
     roost.session_protocol = 4
-    roost.strip_features = True
     identified = roost_call(roost.socket_path, "session.identify")
-    assert "features" not in identified, identified
     assert identified["session_protocol"] == 4

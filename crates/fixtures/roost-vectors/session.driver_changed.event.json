@@ -1,6 +1,0 @@
-{
-  "event": "session.driver_changed",
-  "data": {
-    "taken_by": "kestrel.local"
-  }
-}
