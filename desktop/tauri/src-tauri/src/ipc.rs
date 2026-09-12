@@ -52,7 +52,10 @@ const REFRESH_POLL: Duration = Duration::from_millis(15);
 /// which wedges between them cannot hold an IPC connection open forever. Ten
 /// minutes is comfortably more than the sum of the steps on a slow link and far
 /// less than "until the app quits".
-const BOOTSTRAP_BUDGET: Duration = Duration::from_secs(600);
+// `pub(crate)`: the `roost_bootstrap` Tauri command in `lib.rs` (the frontend's
+// own door onto `RoostHosts::bootstrap`, beside this socket op) shares the same
+// outer guarantee rather than picking its own number.
+pub(crate) const BOOTSTRAP_BUDGET: Duration = Duration::from_secs(600);
 
 /// Build an `(code, message)` error pair for the IPC error envelope.
 fn err(code: &str, message: impl Into<String>) -> (String, String) {
@@ -258,6 +261,46 @@ fn req_str<'a>(params: &'a Value, key: &str) -> Result<&'a str, (String, String)
         .get(key)
         .and_then(Value::as_str)
         .ok_or_else(|| err("bad_request", format!("missing '{key}'")))
+}
+
+/// The one gate + router behind the three roost-consent driver ops
+/// (`ui.show_roost_consent` / `ui.confirm_roost_consent` /
+/// `ui.close_roost_consent`): the event name and payload to emit, or the refusal.
+///
+/// **TEST-MODE ONLY**, the `policy.set` / `rc.inject_test` rule. These exist so
+/// the harness can drive a dialog that only opens from a card's plan-matrix
+/// BUTTON — it has no click. But showing the card and confirming it are the two
+/// halves of a user's consent, and a socket client that can do both in
+/// succession can start a bootstrap nobody clicked: an install, a dotfile-mutating
+/// hook wiring, on a host of the user's. That is a privilege, so it is gated like
+/// the other privileged driver ops.
+///
+/// One function rather than a check per arm, so the gate cannot be true of two
+/// doors and forgotten on the third: the dispatch arm has no event to emit unless
+/// this answers `Ok`, and this is also what the unit test below drives.
+fn roost_consent_door(
+    env: &Env,
+    op: &str,
+    params: &Value,
+) -> Result<(&'static str, Value), (String, String)> {
+    if !env.test_mode {
+        return Err(err("not_enabled", format!("{op} requires test mode")));
+    }
+    match op {
+        // `target` rides the OPEN event rather than being inferred from whatever
+        // the frontend last previewed: `roost_consent.dump` (the dialog's own
+        // rendered copy) only means anything once one is mounted for a known host.
+        "ui.show_roost_consent" => Ok((
+            "show-roost-consent",
+            json!({ "target": req_str(params, "target")? }),
+        )),
+        // Drives the dialog's own Confirm button — the mounted dialog listens for
+        // this the same way it would a pointer event, and runs the identical
+        // handler.
+        "ui.confirm_roost_consent" => Ok(("confirm-roost-consent", json!({}))),
+        "ui.close_roost_consent" => Ok(("close-roost-consent", json!({}))),
+        other => Err(err("unknown_op", format!("{other} is not a consent door"))),
+    }
 }
 
 /// Reject an unknown (preserved-raw) `RcKind` on a launch path. The
@@ -528,6 +571,18 @@ impl Handler {
                 let _ = self.app.emit("show-launch", json!({}));
                 Ok(json!({}))
             }
+            // The roost bootstrap consent dialog's drivable doors (plan 019
+            // §3.6/C8) — TEST-MODE ONLY, see [`roost_consent_door`].
+            "ui.show_roost_consent" | "ui.confirm_roost_consent" | "ui.close_roost_consent" => {
+                let (event, payload) = roost_consent_door(&self.env, op, params)?;
+                // Opening raises the window, like `show-create`/`show-launch`;
+                // confirming and closing act on one that is already up.
+                if event == "show-roost-consent" {
+                    present_main_window(&self.app);
+                }
+                let _ = self.app.emit(event, payload);
+                Ok(json!({}))
+            }
             // The agent-lane transcript panel (plan 015 §3.4), on the
             // show-create/show-launch pattern. The panel opens from a card's
             // Transcript affordance — a CLICK, which no caller here has — and
@@ -587,6 +642,9 @@ impl Handler {
             "machines.list" => Ok(self.machines_list()),
             "machines.dump" => Ok(self.machines_dump()),
             "sidebar.dump" => Ok(self.sidebar_dump()),
+            "shed_roost.dump" => Ok(self.shed_roost_dump()),
+            "roost_consent.dump" => Ok(self.roost_consent_dump()),
+            "toast.dump" => Ok(self.toast_dump()),
             "machine.kill" => self.machine_kill(params).await,
             // `machine.launch` is `roost.launch` addressed by a bare machine
             // name — kept as an alias (plan 019 §3.6) because the dialog, the
@@ -1065,6 +1123,42 @@ impl Handler {
         self.ui_get("sidebar").unwrap_or(Value::Null)
     }
 
+    /// `shed_roost.dump` → what the SHEDS PANE rendered about each shed's own
+    /// roost-session (the status line + plan-matrix button), on the
+    /// `machines.dump` rule: UI truth, `null` off the Sheds pane rather than a
+    /// stale snapshot from the last time it was mounted.
+    fn shed_roost_dump(&self) -> Value {
+        let on_pane = self
+            .ui_get("pane")
+            .and_then(|p| p.as_str().map(|s| s == "sheds"))
+            .unwrap_or(false);
+        let rows = if on_pane {
+            self.ui_get("shed_roost").unwrap_or(Value::Null)
+        } else {
+            Value::Null
+        };
+        json!({ "sheds": rows })
+    }
+
+    /// `roost_consent.dump` → the bootstrap consent dialog's own rendered copy
+    /// (what/where/from-where/hooks/backup, the plan, the fingerprint), or
+    /// `null` while none is mounted. UI truth, same rule as `machines.dump`: the
+    /// dialog reports itself, this only relays the last report.
+    fn roost_consent_dump(&self) -> Value {
+        // Wrapped under a named key, like `machines.dump`/`lane.dump` — a bare
+        // `null` RESULT is indistinguishable from "no result" once the socket
+        // client's `resp.get("result") or {}` runs, which would turn a closed
+        // dialog into `{}` instead of the `None` a cell checks for.
+        json!({ "consent": self.ui_get("roost_consent").unwrap_or(Value::Null) })
+    }
+
+    /// `toast.dump` → the last (or currently shown) toast the shell reported —
+    /// the PATH warning / hook-wiring summary a bootstrap ends with, or an error.
+    /// `null` before any has been shown.
+    fn toast_dump(&self) -> Value {
+        json!({ "toast": self.ui_get("toast").unwrap_or(Value::Null) })
+    }
+
     /// `machine.kill {machine, slug}` → close a session on a machine (a roost
     /// `tab.close`; the slug IS the tab id).
     ///
@@ -1157,6 +1251,25 @@ impl Handler {
     /// do next — and flattening "the host moved" and "the commit failed after
     /// the backup was discarded" into one error string would lose exactly that.
     ///
+    /// ## What `consent: true` does and does not prove
+    ///
+    /// It is a CALLER-SUPPLIED boolean, and that is the pinned wire shape (plan
+    /// 019 §3.6 pins `roost.bootstrap {target, fingerprint, consent: true}`). So
+    /// read it for exactly what it is: the caller's assertion that it showed the
+    /// §3.5 consent card and a person confirmed it. The backend keeps no record
+    /// that a card was ever rendered, so nothing here can tell a confirmed card
+    /// from a `roost.preview` followed immediately by `consent: true` — and the
+    /// frontend twin (`roost_bootstrap` in `lib.rs`) is reachable from any code
+    /// running in the webview, which loads only bundled local assets. That
+    /// webview is the trust boundary, and it is where the claim is honoured.
+    ///
+    /// Making consent UNFORGEABLE would mean the backend minting a token at
+    /// preview time (beside the fingerprint, bound to it) that `bootstrap`
+    /// required and consumed — a deliberate follow-up with a wire change in it,
+    /// not a gap nobody noticed. What IS enforced here is the other half of the
+    /// promise: the fingerprint must still match, so a caller that skipped the
+    /// card still cannot act on a host that has changed since it looked.
+    ///
     /// The 10-minute budget is the op's, not a step's: the machines bound each
     /// remote step themselves (roost's own numbers), and this is the outer
     /// guarantee that a wedged transport cannot hold the socket open forever.
@@ -1183,7 +1296,13 @@ impl Handler {
         match outcome {
             Ok(Ok(installed)) => Ok(crate::roost_hosts::installed_json(&installed)),
             Ok(Err(failure)) => Ok(crate::roost_hosts::failure_json(&failure)),
-            Err(message) => Err(err("consent_required", message)),
+            // A [`Refusal`] is about the CALL, not the host: no consent, an
+            // unaddressable target, or a bootstrap for this target already
+            // running. Its own code, so a driver can tell them apart.
+            Err(refusal) => {
+                let code = refusal.code();
+                Err(err(code, refusal.message()))
+            }
         }
     }
 
@@ -2130,6 +2249,62 @@ mod tests {
             host_agent_socket: PathBuf::from("/run/user/0/shed/host-agent.sock"),
             broker_extensions_path: PathBuf::from("/run/user/0/shed/extensions.yaml"),
         }
+    }
+
+    /// **The consent-dialog driver doors are privileged, and gated like the
+    /// other privileged ones** (`policy.set`, `rc.inject_test`).
+    ///
+    /// They exist because the dialog only opens from a card's plan-matrix BUTTON
+    /// and the harness has no click. But SHOWING the card and CONFIRMING it are
+    /// the two halves of a user's consent, so a socket client that can do both in
+    /// succession can start a bootstrap nobody clicked — an install plus a
+    /// dotfile-mutating hook wiring, on one of the user's hosts. Outside test
+    /// mode all three answer `not_enabled` and emit nothing; the dispatch arm has
+    /// no event name unless this function hands it one, which is what keeps the
+    /// gate from being true of two doors and forgotten on the third.
+    #[test]
+    fn the_roost_consent_doors_are_test_mode_only() {
+        const DOORS: [&str; 3] = [
+            "ui.show_roost_consent",
+            "ui.confirm_roost_consent",
+            "ui.close_roost_consent",
+        ];
+        let params = json!({ "target": "roost:mock/alpha" });
+
+        let mut prod = env(None);
+        prod.test_mode = false;
+        for op in DOORS {
+            let (code, message) = roost_consent_door(&prod, op, &params)
+                .expect_err("a driver door must not be reachable in a shipped app");
+            assert_eq!(code, "not_enabled", "{op}");
+            assert!(message.contains(op), "the refusal names the op: {message}");
+        }
+
+        // In test mode each one routes to its own event, and the open door
+        // carries the target it was asked about.
+        let test = env(None);
+        assert_eq!(
+            roost_consent_door(&test, DOORS[0], &params).unwrap(),
+            (
+                "show-roost-consent",
+                json!({ "target": "roost:mock/alpha" })
+            )
+        );
+        assert_eq!(
+            roost_consent_door(&test, DOORS[1], &json!({})).unwrap(),
+            ("confirm-roost-consent", json!({}))
+        );
+        assert_eq!(
+            roost_consent_door(&test, DOORS[2], &json!({})).unwrap(),
+            ("close-roost-consent", json!({}))
+        );
+        // A missing `target` is still a bad request, after the gate.
+        assert_eq!(
+            roost_consent_door(&test, DOORS[0], &json!({}))
+                .expect_err("no target")
+                .0,
+            "bad_request"
+        );
     }
 
     #[test]

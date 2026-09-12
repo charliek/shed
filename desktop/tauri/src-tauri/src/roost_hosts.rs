@@ -343,6 +343,48 @@ impl HostState {
     }
 }
 
+/// A bootstrap this layer refused to **start** (plan 019 §3.6).
+///
+/// Deliberately not a [`BootstrapFailure`]: that type carries a [`Stage`], which
+/// answers "how far did this get, and what is on the host now?" — and for every
+/// case here the answer is "nowhere, and nothing", because the call never began.
+/// So these are the OUTER error of [`RoostHosts::bootstrap`] and both doors (the
+/// `roost.bootstrap` socket op and the `roost_bootstrap` Tauri command) answer
+/// them as an error envelope carrying [`Self::code`], never as an `ok` envelope
+/// with a stage.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Refusal {
+    /// No `consent: true`. A CALLER bug — the client is supposed to have shown
+    /// the consent card (plan 019 §3.5).
+    ConsentRequired(String),
+    /// The `target` is not a grammar token this build can address at all.
+    BadTarget(String),
+    /// A bootstrap for this target is already in flight. Refused rather than
+    /// queued — see [`RoostHosts::bootstrap`].
+    AlreadyBootstrapping(String),
+}
+
+impl Refusal {
+    /// The IPC error code, in the snake_case family every other code in
+    /// `ipc.rs` uses.
+    pub fn code(&self) -> &'static str {
+        match self {
+            Refusal::ConsentRequired(_) => "consent_required",
+            Refusal::BadTarget(_) => "bad_request",
+            Refusal::AlreadyBootstrapping(_) => "already_bootstrapping",
+        }
+    }
+
+    /// The sentence, moved out — every variant carries exactly one.
+    pub fn message(self) -> String {
+        match self {
+            Refusal::ConsentRequired(m)
+            | Refusal::BadTarget(m)
+            | Refusal::AlreadyBootstrapping(m) => m,
+        }
+    }
+}
+
 /// The app's roost-host layer: one watcher per live host, plus the state each
 /// reports, plus the bootstrap that puts a session on one that has none.
 pub struct RoostHosts {
@@ -383,6 +425,21 @@ pub struct RoostHosts {
     /// Sheds a probe is in flight for, so a second refresh landing while the
     /// first is still dialling does not fork a second `ssh` for the same host.
     probing: Arc<Mutex<BTreeSet<HostId>>>,
+    /// **The sheds a server actually LISTED** — written by
+    /// [`Self::observe_sheds`], read as a gate by [`Self::ssh_entry`].
+    ///
+    /// A `machines:` entry is the user's own declaration, so a machine id needs
+    /// no corroboration. A SHED id carries a server name and a shed name, and
+    /// only the first of those is something the user wrote down: the second is
+    /// discovered. Without this, `roost:<configured server>/<anything>` composed
+    /// an ssh identity from the server entry and whatever name the caller
+    /// invented, so a preview/bootstrap of a shed that has never existed would
+    /// `ssh <invented>@<server host>` — a host the user neither configured nor
+    /// discovered. See [`Self::ssh_entry`] for the refusal.
+    listed_sheds: Arc<Mutex<BTreeSet<HostId>>>,
+    /// Targets with a bootstrap in flight, for [`Self::bootstrap`]'s per-target
+    /// gate. See [`BootstrapGate`].
+    bootstrapping: Arc<Mutex<BTreeSet<HostId>>>,
     /// When each shed was last probed, for [`SHED_PROBE_COOLDOWN`].
     probed: Arc<Mutex<BTreeMap<HostId, Instant>>>,
     /// The shed-probe concurrency bound.
@@ -518,6 +575,8 @@ impl RoostHosts {
             execs: Mutex::new(BTreeMap::new()),
             leases: Arc::new(RoostLeases::new()),
             probing: Arc::new(Mutex::new(BTreeSet::new())),
+            listed_sheds: Arc::new(Mutex::new(BTreeSet::new())),
+            bootstrapping: Arc::new(Mutex::new(BTreeSet::new())),
             probed: Arc::new(Mutex::new(BTreeMap::new())),
             probe_slots: Arc::new(tokio::sync::Semaphore::new(SHED_PROBE_CONCURRENCY)),
             on_change,
@@ -977,6 +1036,23 @@ impl RoostHosts {
             })
             .collect();
 
+        // **What the servers actually listed**, recorded FIRST because the probe
+        // pass below registers hosts and registration goes through the gate this
+        // feeds ([`Self::ssh_entry`]).
+        //
+        // An ANSWERING server's running-shed list is the whole truth about that
+        // server — the same property the removal pass below relies on — so its
+        // entries are REPLACED rather than merged, and a shed that stopped stops
+        // being addressable. A narrowed refresh (`rc.list {host, shed}`) names no
+        // answering server and so can only add, exactly as it can only add
+        // watchers; a shed whose server failed to refresh keeps its entry for the
+        // same reason it keeps its watcher.
+        {
+            let mut listed = lock(&self.listed_sheds);
+            listed.retain(|id| !id.server().is_some_and(|server| answered.contains(server)));
+            listed.extend(live.iter().cloned());
+        }
+
         // Every shed host this layer holds anything for — watched or merely
         // registered by a probe — read once under the registry lock so the two
         // passes below decide on one view of it.
@@ -1219,19 +1295,46 @@ impl RoostHosts {
     /// answers as a [`Stage::Fingerprint`] failure. The machine re-probes before
     /// it touches anything, so the check below is not the only one — it is the
     /// one that happens before a single byte is resolved or fetched.
+    ///
+    /// ## One bootstrap per target at a time
+    ///
+    /// **Refused, not queued.** The lease mutex inside
+    /// [`BootstrapRunner`](shed_app::roost::BootstrapRunner) serializes the HOOKS
+    /// dialogue and nothing else, so without the gate below two calls naming the
+    /// same target — a double-clicked button, a socket driver beside a click —
+    /// would both re-probe, both resolve bytes, and then stream, commit and
+    /// `start` over each other inside roost's `.bak.<pid>` chain. Queueing the
+    /// second would be worse than refusing it: it was consented to against a
+    /// fingerprint the first call is in the middle of invalidating, so the honest
+    /// answer is to say a bootstrap is already running and let the user (or the
+    /// next preview) decide.
+    ///
+    /// Plan 019 §3.4 pins that two DIFFERENT clients (this app and the phone) are
+    /// last-writer-wins, detected by the post-commit identify. That is a
+    /// statement about two processes that cannot see each other — it is not
+    /// licence for one app to race itself, which it can see perfectly well.
     pub async fn bootstrap(
         &self,
         target: &str,
         fingerprint: &str,
         consent: bool,
-    ) -> Result<Result<Installed, BootstrapFailure>, String> {
+    ) -> Result<Result<Installed, BootstrapFailure>, Refusal> {
         if !consent {
-            return Err(format!(
+            return Err(Refusal::ConsentRequired(format!(
                 "{target}: roost.bootstrap needs consent: true — nothing was changed"
-            ));
+            )));
         }
-        let id = HostId::parse(target)?;
+        let id = HostId::parse(target).map_err(Refusal::BadTarget)?;
         let token = id.token();
+        // Held for the WHOLE call — the re-probe, the source resolution and every
+        // remote step — and released by its own drop, including on the early
+        // returns below and on the outer budget dropping this future.
+        let Some(_gate) = self.begin_bootstrap(&id) else {
+            return Err(Refusal::AlreadyBootstrapping(format!(
+                "{token} is already being bootstrapped — nothing was changed; \
+                 wait for that one to finish"
+            )));
+        };
         // The consent card's own probe, again: it is what decides the plan, the
         // architecture the source ladder resolves for, and whether the host is
         // still the one the user was asked about.
@@ -1278,8 +1381,17 @@ impl RoostHosts {
             client_label: CLIENT_LABEL.to_string(),
         };
         let outcome = {
-            let exec = self.exec_for(&id)?;
-            let reach = self.reach(&id)?;
+            // A transport that vanished between the re-probe and here is a fact
+            // about the HOST, not about the call, so it answers as a probe-stage
+            // failure rather than as a [`Refusal`] — nothing has been written yet
+            // either way.
+            let transports = self
+                .exec_for(&id)
+                .and_then(|exec| self.reach(&id).map(|reach| (exec, reach)));
+            let (exec, reach) = match transports {
+                Ok(pair) => pair,
+                Err(message) => return Ok(Err(BootstrapFailure::new(Stage::Probe, message))),
+            };
             let runner = BootstrapRunner {
                 exec: exec.as_ref(),
                 reach: reach.as_ref(),
@@ -1301,6 +1413,25 @@ impl RoostHosts {
             self.watch(&id);
         }
         Ok(outcome)
+    }
+
+    /// Claim the whole-bootstrap gate for `id`, or answer `None` because a
+    /// bootstrap for it is already in flight.
+    ///
+    /// RAII rather than a flag cleared at the end of [`Self::bootstrap`]: that
+    /// method has half a dozen early returns and runs under an outer
+    /// `tokio::time::timeout` that can drop its future mid-step, and a claim that
+    /// leaked on any of those paths would wedge that target's button for the rest
+    /// of the app run.
+    fn begin_bootstrap(&self, id: &HostId) -> Option<BootstrapGate> {
+        let mut running = lock(&self.bootstrapping);
+        if !running.insert(id.clone()) {
+            return None;
+        }
+        Some(BootstrapGate {
+            set: Arc::clone(&self.bootstrapping),
+            id: id.clone(),
+        })
     }
 
     /// Run a probe against `target`, resolving the id and the transports.
@@ -1347,6 +1478,11 @@ impl RoostHosts {
     ///
     /// Read from the config SNAPSHOT this layer took at launch, not a re-read —
     /// see [`RoostHosts::config`].
+    ///
+    /// **The one door** every `ssh` identity in this layer comes out of — the
+    /// bridge ([`Self::ensure_registered`]) and the exec runner
+    /// ([`Self::exec_for`]) both ask here — which is why the shed gate lives
+    /// here rather than in each of them.
     fn ssh_entry(&self, id: &HostId) -> Result<MachineEntry, String> {
         match id {
             HostId::Machine(name) => self
@@ -1361,6 +1497,23 @@ impl RoostHosts {
                     .iter()
                     .find(|s| &s.name == server)
                     .ok_or_else(|| format!("no server {server:?} in ~/.shed/config.yaml"))?;
+                // **A configured server is not a licence for every name on it.**
+                // A shed's ssh identity is `<shed>@<server host>`, and the shed
+                // half is DISCOVERED — so it has to have been discovered. Without
+                // this, `roost:<configured server>/<any name>` built an entry
+                // from the server plus whatever the caller invented, and a
+                // preview-then-bootstrap of a shed that never existed would reach
+                // out to a host the user neither configured nor saw listed.
+                //
+                // The refusal happens before a reach, an exec runner, a registry
+                // entry or a row exists for the id — nothing is contacted and
+                // nothing is remembered (see [`Self::listed_sheds`]).
+                if !lock(&self.listed_sheds).contains(id) {
+                    return Err(format!(
+                        "no shed {name:?} on server {server:?}: {server:?} has not listed a \
+                         running shed by that name, so nothing was contacted"
+                    ));
+                }
                 Ok(shed_reach_entry(entry, name))
             }
         }
@@ -1403,6 +1556,20 @@ impl RoostHosts {
             exec.shutdown().await;
         }
         lock(&self.execs).clear();
+    }
+}
+
+/// One target's claim on [`RoostHosts::bootstrap`], released by its own drop.
+///
+/// See [`RoostHosts::begin_bootstrap`] for why the gate is RAII and not a flag.
+struct BootstrapGate {
+    set: Arc<Mutex<BTreeSet<HostId>>>,
+    id: HostId,
+}
+
+impl Drop for BootstrapGate {
+    fn drop(&mut self) {
+        lock(&self.set).remove(&self.id);
     }
 }
 
@@ -2020,6 +2187,41 @@ mod tests {
                 .collect(),
             ..Default::default()
         }
+    }
+
+    /// A config with one `servers:` entry — what a shed id's ssh identity is
+    /// composed from ([`shed_reach_entry`]). `127.0.0.1` so a test that ever did
+    /// reach the wire would be refused by the loopback instantly rather than
+    /// dialling something real.
+    fn config_with_server(name: &str) -> ShedConfig {
+        ShedConfig {
+            servers: vec![shed_core::config::ShedServerEntry {
+                name: name.to_string(),
+                host: "127.0.0.1".to_string(),
+                ssh_port: 2222,
+                ..Default::default()
+            }],
+            ..Default::default()
+        }
+    }
+
+    fn shed_id(server: &str, name: &str) -> HostId {
+        HostId::Shed {
+            server: server.to_string(),
+            name: name.to_string(),
+        }
+    }
+
+    /// The authoritative refresh that says "these sheds, on these answering
+    /// servers, are running" — the one input [`RoostHosts::ssh_entry`]'s shed gate
+    /// reads, so every shed test has to perform it before the shed it minted is
+    /// addressable at all.
+    fn lists(hosts: &RoostHosts, server: &str, sheds: &[&str]) {
+        let running: Vec<(String, String)> = sheds
+            .iter()
+            .map(|name| (server.to_string(), (*name).to_string()))
+            .collect();
+        hosts.observe_sheds(&running, &[server.to_string()]);
     }
 
     /// The test-mode reach options for a socket map: every named host answers on
@@ -3251,20 +3453,15 @@ mod tests {
     #[tokio::test]
     async fn a_watcher_spawned_around_a_removal_is_dropped_instead_of_installed() {
         let fake = FakeRoost::start().await;
-        let id = HostId::Shed {
-            server: "popos".to_string(),
-            name: "p019-a".to_string(),
-        };
-        let config = ShedConfig {
-            servers: vec![shed_core::config::ShedServerEntry {
-                name: "popos".to_string(),
-                host: "127.0.0.1".to_string(),
-                ssh_port: 2222,
-                ..Default::default()
-            }],
-            ..Default::default()
-        };
-        let hosts = start(&config, &sockets(&[(&id.token(), fake.socket_path())]));
+        let id = shed_id("popos", "p019-a");
+        let hosts = start(
+            &config_with_server("popos"),
+            &sockets(&[(&id.token(), fake.socket_path())]),
+        );
+        // The refresh that makes the shed addressable at all — see
+        // [`RoostHosts::ssh_entry`]'s gate. It is also what a probe rides on in
+        // production, so starting from it is the realistic order.
+        lists(&hosts, "popos", &["p019-a"]);
 
         // Where a probe starts: the shed is registered, and not yet watched.
         hosts.ensure_registered(&id).expect("the shed registers");
@@ -3342,5 +3539,150 @@ mod tests {
             "a watcher spawned against a torn-down reach is refused"
         );
         assert!(!lock(&hosts.reg).watchers.contains_key(&id));
+    }
+
+    /// **A configured server is not a licence for every shed name on it.**
+    ///
+    /// A shed id is `roost:<server>/<name>`, and only the server half is
+    /// something the user wrote down — the name half is DISCOVERED. Before the
+    /// gate in [`RoostHosts::ssh_entry`], any name under a configured server
+    /// composed an ssh identity out of the server entry plus whatever the caller
+    /// invented, so previewing `roost:popos/never-existed` took a fingerprint off
+    /// a host nobody had ever seen and the bootstrap behind it would
+    /// `ssh never-existed@<that server's host>` — a host the user neither
+    /// configured nor discovered.
+    ///
+    /// Every door is checked, because they all resolve through that one function;
+    /// and the refusal has to leave NOTHING behind, since a registry entry for an
+    /// invented name is itself a row and a reach.
+    #[tokio::test]
+    async fn an_unlisted_shed_under_a_configured_server_is_refused_everywhere() {
+        let fake = FakeRoost::start().await;
+        let listed = shed_id("popos", "p019-a");
+        let invented = shed_id("popos", "never-existed");
+        let hosts = start(
+            &config_with_server("popos"),
+            &sockets(&[(&listed.token(), fake.socket_path())]),
+        );
+
+        // Nothing has been listed yet, so not even the real shed is addressable —
+        // the gate is "this server listed it", not "this name looks plausible".
+        let e = hosts
+            .ensure_registered(&listed)
+            .expect_err("an unlisted shed has no ssh identity");
+        assert!(e.contains("has not listed"), "{e}");
+
+        // One authoritative refresh, and it is.
+        lists(&hosts, "popos", &["p019-a"]);
+        hosts
+            .ensure_registered(&listed)
+            .expect("a listed shed registers");
+
+        // The invented name is still refused, by name, naming both halves.
+        let e = hosts
+            .ensure_registered(&invented)
+            .expect_err("an unlisted name under a listed server is refused");
+        assert!(
+            e.contains("never-existed") && e.contains("popos"),
+            "the refusal names the shed and the server: {e}"
+        );
+        // …and left nothing: no id, no reach, no state — so no row, and no
+        // transport for a later call to find waiting for it.
+        assert!(!lock(&hosts.reg).ids.contains(&invented), "no registry id");
+        assert!(
+            !lock(&hosts.reg).reaches.contains_key(&invented),
+            "no reach"
+        );
+        assert!(!lock(&hosts.state).contains_key(&invented), "no state");
+
+        // The three public doors agree, because each resolves through the same
+        // `ssh_entry`. None of them touches a transport, so none spawns an `ssh`.
+        let failure = hosts
+            .probe(&invented.token())
+            .await
+            .expect_err("probe refuses");
+        assert_eq!(failure.stage, Stage::Probe);
+        assert!(failure.message.contains("has not listed"), "{failure:?}");
+        let failure = hosts
+            .preview(&invented.token())
+            .await
+            .expect_err("preview refuses");
+        assert!(failure.message.contains("has not listed"), "{failure:?}");
+        let failure = hosts
+            .bootstrap(&invented.token(), "any-fingerprint", true)
+            .await
+            .expect("a refused host is not a refused CALL")
+            .expect_err("bootstrap refuses");
+        assert_eq!(failure.stage, Stage::Probe);
+        assert!(failure.message.contains("has not listed"), "{failure:?}");
+
+        // And a shed that STOPS stops being addressable again: the authoritative
+        // refresh that no longer lists it takes its entry with it, which is the
+        // same rule that takes its watcher.
+        lists(&hosts, "popos", &[]);
+        let e = hosts
+            .ensure_registered(&listed)
+            .expect_err("a stopped shed is no longer addressable");
+        assert!(e.contains("has not listed"), "{e}");
+    }
+
+    /// **One bootstrap per target at a time** (plan 019 §3.6).
+    ///
+    /// The lease mutex inside `BootstrapRunner` serializes the HOOKS dialogue and
+    /// nothing else, so without [`RoostHosts::begin_bootstrap`] two calls naming
+    /// one target would both re-probe, both resolve bytes, and then stream,
+    /// commit and `start` over each other. §3.4's last-writer-wins pin is about
+    /// two different CLIENTS that cannot see each other; it is not licence for one
+    /// app to race itself.
+    ///
+    /// The first call's claim is taken explicitly rather than by racing two real
+    /// bootstraps: both legs here fail fast (this config has no usable transport),
+    /// so a real pair would decide the winner by scheduling luck and the cell
+    /// would prove nothing on most runs.
+    #[tokio::test]
+    async fn a_second_bootstrap_of_one_target_is_refused_while_the_first_holds_it() {
+        let fake = FakeRoost::start().await;
+        let id = shed_id("popos", "p019-a");
+        let hosts = start(
+            &config_with_server("popos"),
+            &sockets(&[(&id.token(), fake.socket_path())]),
+        );
+        lists(&hosts, "popos", &["p019-a"]);
+
+        let claim = hosts
+            .begin_bootstrap(&id)
+            .expect("the first call claims the target");
+
+        let refusal = hosts
+            .bootstrap(&id.token(), "any-fingerprint", true)
+            .await
+            .expect_err("the second call is refused, not queued");
+        assert_eq!(refusal.code(), "already_bootstrapping");
+        let message = refusal.message();
+        assert!(
+            message.contains(&id.token()) && message.contains("already being bootstrapped"),
+            "the refusal names the target and says what is happening: {message}"
+        );
+        assert!(
+            message.contains("nothing was changed"),
+            "and that the host was left alone: {message}"
+        );
+
+        // Per-TARGET, not a global lock: a second host is claimable while the
+        // first is held.
+        let other = shed_id("popos", "p019-b");
+        lists(&hosts, "popos", &["p019-a", "p019-b"]);
+        let other_claim = hosts
+            .begin_bootstrap(&other)
+            .expect("a different target is unaffected");
+        drop(other_claim);
+
+        // Released by its own drop, on every exit path — including the early
+        // returns and the outer budget dropping the future.
+        drop(claim);
+        assert!(
+            hosts.begin_bootstrap(&id).is_some(),
+            "the gate is released when its claim drops"
+        );
     }
 }

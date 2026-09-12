@@ -1164,6 +1164,10 @@ export type MachinePaneRow = {
   status: string;
   detail: string;
   sessions: string[];
+  /** The card's roost sub-line, as rendered (plan 019 §3.6/C8) —
+   *  `RoostDumpRow` from `@/lib/roost`, kept as `unknown` here so this module
+   *  doesn't need to import roost's types just to describe its shape. */
+  roost?: unknown;
 };
 
 /** Report the rendered Machines pane (mounted-only, like `reportEgress` — pass

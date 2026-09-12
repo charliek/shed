@@ -18,6 +18,12 @@ import {
 } from "@/components/primitives";
 import { Scrim, DialogShell, Field, Select, Segmented, dialogInput, dialogBtnSecondary, useEscClose } from "@/components/dialog";
 import { LanePanel } from "@/components/LanePanel";
+import { RoostLine, RoostConsentDialog, Toast } from "@/components/RoostBootstrap";
+import {
+  roostBootstrap, roostPreview, roostProgressSteps, roostToastFor, roostDumpRow,
+  reportShedRoost, renderedText, useRoostBoard,
+  type RoostPreview, type RoostToast, type RoostCardState, type RoostDumpRow,
+} from "@/lib/roost";
 import {
   useUiBridge, shedAction, fetchSystemDf, openTerminal,
   createStart, createStatus, createCancel, fetchHosts,
@@ -240,11 +246,36 @@ function sortedMachines(machines: MachineStatus[]): MachineStatus[] {
 }
 
 /* ---- Sheds pane ----------------------------------------------------------- */
-function ShedsPane({ sheds, hostErrors, refresh, onNew }: { sheds: Shed[]; hostErrors: HostFailure[]; refresh: () => void; onNew: () => void }) {
+function ShedsPane({ sheds, hostErrors, refresh, onNew, roostTick, onOpenConsent, roostBusy }: {
+  sheds: Shed[]; hostErrors: HostFailure[]; refresh: () => void; onNew: () => void;
+  roostTick: number; onOpenConsent: (target: string, preview: RoostPreview) => void; roostBusy: Record<string, string>;
+}) {
   const act = (action: string, s: Shed) => void shedAction(action, s.name, s.host).then(refresh);
   // The empty state defers to a host failure when there is one — same helper the
   // bridge reports as UI truth, so the pane and `dashboard.dump.empty` agree.
   const empty = shedsEmptyState(sheds, hostErrors);
+  // A shed's own roost-session is only worth asking about while it is
+  // RUNNING — there is no sshd to reach on a stopped one, and probing it
+  // would just be a slow way to learn what `status` already says.
+  const runningTargets = sheds.filter((s) => s.status === "running").map((s) => `roost:${s.host}/${s.name}`);
+  const roostBoard = useRoostBoard(runningTargets, roostTick);
+  // Publish what this pane rendered — the `machines.dump`/`reportMachinesPane`
+  // rule, mounted-only, keyed on the VALUE so an unrelated re-render doesn't
+  // re-report. Each row's `rendered` is read back off its own `RoostLine` node
+  // IN THE EFFECT (after the commit), so the status/button fields beside it
+  // cannot pass as a parallel data structure with nothing on screen.
+  const reportedRoost = Object.fromEntries(
+    runningTargets.map((t) => [t, roostDumpRow(t, roostBoard[t], roostBusy[t])]),
+  );
+  const reportedRoostKey = JSON.stringify(reportedRoost);
+  useEffect(() => {
+    const rows: Record<string, RoostDumpRow> = JSON.parse(reportedRoostKey);
+    for (const [target, row] of Object.entries(rows)) {
+      row.rendered = renderedText(`[data-roost="${target}"]`);
+    }
+    reportShedRoost(rows);
+  }, [reportedRoostKey]);
+  useEffect(() => () => reportShedRoost(null), []);
   return (
     <div>
       <PageHead
@@ -281,6 +312,17 @@ function ShedsPane({ sheds, hostErrors, refresh, onNew }: { sheds: Shed[]; hostE
                         {s.image && <ImageChip>{s.image}</ImageChip>}
                       </div>
                       <div className="font-mono text-[12.5px] leading-tight text-shed-text-muted">{metaLine(s)}</div>
+                      {running && (() => {
+                        const target = `roost:${s.host}/${s.name}`;
+                        return (
+                          <RoostLine
+                            target={target}
+                            state={roostBoard[target]}
+                            busyDetail={roostBusy[target]}
+                            onOpenConsent={onOpenConsent}
+                          />
+                        );
+                      })()}
                     </div>
                     <div className="flex gap-2">
                       {running ? (
@@ -561,29 +603,36 @@ function machineDetailLine(m: MachineStatus, sessions: number): string {
  *  `detail` is shown verbatim because "no route to host" and "nothing is
  *  listening on 1029" are different problems with different fixes, and
  *  flattening them to "offline" would throw away the only actionable part. */
-function MachineCard({ machine: m, sessions, waiting }:
-  { machine: MachineStatus; sessions: number; waiting: number }) {
+function MachineCard({ machine: m, sessions, waiting, roostState, roostBusy, onOpenConsent }:
+  {
+    machine: MachineStatus; sessions: number; waiting: number;
+    roostState: RoostCardState | undefined; roostBusy: string | undefined;
+    onOpenConsent: (target: string, preview: RoostPreview) => void;
+  }) {
   return (
     <div
-      className={cn(cardCls, "flex items-center gap-4 px-[18px] py-4")}
+      className={cn(cardCls, "flex flex-col gap-1 px-[18px] py-4")}
       style={{ opacity: m.reachable ? 1 : 0.7 }}
       data-machine={m.name}
     >
-      <StatusChip tone={m.reachable ? "ok" : "attention"} label={machineStatusLabel(m)} />
-      {/* The one thing a machine can tell you that a count cannot: something on
-          it stopped and wants a person. */}
-      {waiting > 0 && <StatusChip tone="attention" label={`${waiting} waiting`} />}
-      <div className="min-w-0 flex-1">
-        <div className="mb-1 flex flex-wrap items-center gap-2.5">
-          <span className="text-[16px] font-semibold text-shed-text">{m.name}</span>
-          <span className="rounded bg-shed-inset px-1.5 py-0.5 font-mono text-[10px] font-semibold text-shed-text-muted">
-            {m.origin}
-          </span>
-        </div>
-        <div className="truncate font-mono text-[12px] text-shed-text-muted">
-          {machineDetailLine(m, sessions)}
+      <div className="flex items-center gap-4">
+        <StatusChip tone={m.reachable ? "ok" : "attention"} label={machineStatusLabel(m)} />
+        {/* The one thing a machine can tell you that a count cannot: something on
+            it stopped and wants a person. */}
+        {waiting > 0 && <StatusChip tone="attention" label={`${waiting} waiting`} />}
+        <div className="min-w-0 flex-1">
+          <div className="mb-1 flex flex-wrap items-center gap-2.5">
+            <span className="text-[16px] font-semibold text-shed-text">{m.name}</span>
+            <span className="rounded bg-shed-inset px-1.5 py-0.5 font-mono text-[10px] font-semibold text-shed-text-muted">
+              {m.origin}
+            </span>
+          </div>
+          <div className="truncate font-mono text-[12px] text-shed-text-muted">
+            {machineDetailLine(m, sessions)}
+          </div>
         </div>
       </div>
+      <RoostLine target={m.origin} state={roostState} busyDetail={roostBusy} onOpenConsent={onOpenConsent} />
     </div>
   );
 }
@@ -597,10 +646,13 @@ function MachineCard({ machine: m, sessions, waiting }:
  *  `sx` reads) and are read ONCE at startup, so there is deliberately no add/edit
  *  affordance here — an in-app editor that silently needed a relaunch would be
  *  worse than the file. */
-function MachinesPane({ machines, sessions, refresh, onNew }:
-  { machines: MachineStatus[]; sessions: RcSession[]; refresh: () => void; onNew: () => void }) {
+function MachinesPane({ machines, sessions, refresh, onNew, roostTick, onOpenConsent, roostBusy }: {
+  machines: MachineStatus[]; sessions: RcSession[]; refresh: () => void; onNew: () => void;
+  roostTick: number; onOpenConsent: (target: string, preview: RoostPreview) => void; roostBusy: Record<string, string>;
+}) {
   useEffect(() => { refresh(); }, [refresh]);
   const reachable = machines.filter((m) => m.reachable).length;
+  const roostBoard = useRoostBoard(machines.map((m) => m.origin), roostTick);
 
   // Grouped by ORIGIN, never by shed: a hub reports an EMPTY shed on every
   // machine session, so two machines sharing a slug would collide into one row.
@@ -621,6 +673,10 @@ function MachinesPane({ machines, sessions, refresh, onNew }:
     detail: machineDetailLine(m, rows.length),
     sessions: rows.map((s) => s.slug),
     waiting,
+    // The plan-matrix status line + button, as rendered — the SAME data
+    // `MachineCard`'s `RoostLine` reads, so `machines.dump` can never claim a
+    // word the card doesn't show (the pane's own rule, extended to roost).
+    roost: roostDumpRow(m.origin, roostBoard[m.origin], roostBusy[m.origin]),
   }));
   // Publish what this pane rendered — keyed on the VALUE, so an unrelated parent
   // re-render (the 5s shed poll, an approval, an appearance flip) does not
@@ -659,7 +715,15 @@ function MachinesPane({ machines, sessions, refresh, onNew }:
       ) : (
         <div className="flex flex-col gap-3">
           {grouped.map(({ machine: m, rows, waiting }) => (
-            <MachineCard key={m.origin} machine={m} sessions={rows.length} waiting={waiting} />
+            <MachineCard
+              key={m.origin}
+              machine={m}
+              sessions={rows.length}
+              waiting={waiting}
+              roostState={roostBoard[m.origin]}
+              roostBusy={roostBusy[m.origin]}
+              onOpenConsent={onOpenConsent}
+            />
           ))}
         </div>
       )}
@@ -1597,6 +1661,93 @@ export default function App() {
   // and it stays put when you navigate, because a transcript you opened is
   // something you are reading, not somewhere you went.
   const [lane, setLane] = useState<{ machine: string; sessionId: string } | null>(null);
+
+  // -- roost bootstrap (plan 019 §3.6, C8) ---------------------------------
+  // The open consent card, if any — one at a time, App-level like `lane`
+  // (opened from a card's plan-matrix button, or headlessly via
+  // `ui.show_roost_consent` for the harness, which has no click).
+  const [roostConsent, setRoostConsent] = useState<{ target: string; preview: RoostPreview } | null>(null);
+  // Per-target indeterminate-progress phrase, non-null exactly while THAT
+  // target's `roost.bootstrap` is in flight. A map (not one flag) because two
+  // cards can be mid-run at once — the lease dialogue is per-host, and
+  // nothing here serializes a click on one card behind another's.
+  const [roostBusy, setRoostBusy] = useState<Record<string, string>>({});
+  // Bumped after every settled bootstrap so `useRoostBoard` re-previews the
+  // host it just acted on (and every other row sharing the board) — a plain
+  // re-fetch, never a poll.
+  const [roostTick, setRoostTick] = useState(0);
+  const [toast, setToast] = useState<RoostToast | null>(null);
+
+  const openRoostConsent = useCallback((target: string, preview: RoostPreview) => {
+    setRoostConsent({ target, preview });
+  }, []);
+
+  // The open card, mirrored into a ref. The `confirm-roost-consent` listener is
+  // registered ONCE (its effect has `[]` deps), so the handler it captures must
+  // not close over a particular render's `roostConsent` — and the previous
+  // version read it out of a functional `setRoostConsent` updater instead, which
+  // is the bug this fixes: an updater must be PURE, and React StrictMode (on in
+  // `main.tsx`) calls it twice, so one Confirm click started two bootstraps.
+  const openCard = useRef<{ target: string; preview: RoostPreview } | null>(null);
+  useEffect(() => { openCard.current = roostConsent; }, [roostConsent]);
+  // Targets whose bootstrap this shell has already started and not yet settled.
+  // `roostBusy` says the same thing, but it is STATE — it lands a render later,
+  // and two Confirms in one tick would both read it empty. A ref is the only
+  // thing that is true immediately.
+  const roostRunning = useRef<Set<string>>(new Set());
+
+  // Confirm: close the card (there is nothing further to consent to) and run
+  // the bootstrap in the BACKGROUND, cycling the confirmed plan's progress
+  // phrases on the row itself — see `roost.ts`'s `roostProgressSteps` doc for
+  // why this is decorative rather than server-pushed. Shared by the dialog's
+  // own button and the headless `confirm-roost-consent` door.
+  //
+  // **One click is one bootstrap.** Every side effect happens right here, in an
+  // event handler, never inside a state updater; the claim on `roostRunning` is
+  // taken before the first `await`, so a doubled event (a double click, a
+  // re-delivered door) is dropped rather than installed over itself.
+  const confirmRoostBootstrap = useCallback(() => {
+    const current = openCard.current;
+    if (!current) return;
+    const { target, preview } = current;
+    if (roostRunning.current.has(target)) return;
+    roostRunning.current.add(target);
+    openCard.current = null;
+    setRoostConsent(null); // close the card
+    const steps = roostProgressSteps(preview.plan.kind);
+    let i = 0;
+    setRoostBusy((b) => ({ ...b, [target]: steps[0] }));
+    const timer = window.setInterval(() => {
+      i = Math.min(i + 1, steps.length - 1);
+      setRoostBusy((b) => (target in b ? { ...b, [target]: steps[i] } : b));
+    }, 2500);
+    void roostBootstrap(target, preview.probe.fingerprint)
+      .then(
+        (result) => setToast(roostToastFor(result)),
+        (e: unknown) => setToast({ tone: "error", lines: [String(e)] }),
+      )
+      .finally(() => {
+        window.clearInterval(timer);
+        roostRunning.current.delete(target);
+        setRoostBusy((b) => {
+          const { [target]: _drop, ...rest } = b;
+          return rest;
+        });
+        setRoostTick((t) => t + 1);
+      });
+  }, []);
+
+  // The consent card and the toast report THEMSELVES (`roost_consent.dump` /
+  // `toast.dump`, in `components/RoostBootstrap.tsx`) — including the DOM text
+  // they painted. Reporting them from here instead would keep answering about a
+  // card or a toast that had been deleted from the tree.
+  //
+  // Auto-dismiss, like a toast should — long enough to read the hook summary.
+  useEffect(() => {
+    if (!toast) return;
+    const t = window.setTimeout(() => setToast(null), 8000);
+    return () => window.clearTimeout(t);
+  }, [toast]);
   // The SINGLE source of truth for RC sessions + capabilities: the sidebar badge,
   // the Agents pane, and the launch dialog all read this one `rc.list` state, so
   // they can't diverge. `refreshRc` reloads on the pane Refresh button, a
@@ -1688,6 +1839,23 @@ export default function App() {
         }),
       );
       uns.push(await listen("close-lane", () => setLane(null)));
+      // The roost consent card's drivable doors (plan 019 §3.6/C8), same
+      // pattern: it opens from a card's plan-matrix BUTTON, a click the
+      // harness has none of. `show-roost-consent` re-previews `target` rather
+      // than trusting whatever a card last cached, so it works even when the
+      // harness drives it before any pane has mounted one.
+      uns.push(
+        await listen<{ target?: unknown }>("show-roost-consent", (e) => {
+          const target = e.payload?.target;
+          if (typeof target !== "string") return;
+          void roostPreview(target).then(
+            (preview) => setRoostConsent({ target, preview }),
+            (error: unknown) => setToast({ tone: "error", lines: [String(error)] }),
+          );
+        }),
+      );
+      uns.push(await listen("confirm-roost-consent", () => confirmRoostBootstrap()));
+      uns.push(await listen("close-roost-consent", () => setRoostConsent(null)));
       uns.push(
         await listen<{ mode?: unknown }>("set-appearance", (e) => {
           if (e.payload?.mode === "light" || e.payload?.mode === "dark") setMode(e.payload.mode);
@@ -1816,8 +1984,28 @@ export default function App() {
         </header>
         <main className="flex-1 overflow-auto bg-shed-bg px-[38px] pb-6 pt-7">
           <div data-pane={pane} className="mx-auto max-w-[880px]">
-            {pane === "sheds" && <ShedsPane sheds={sheds} hostErrors={hostErrors} refresh={refresh} onNew={() => setModal("create")} />}
-            {pane === "machines" && <MachinesPane machines={rcMachines} sessions={rcSessions} refresh={refreshRc} onNew={() => setModal("machine")} />}
+            {pane === "sheds" && (
+              <ShedsPane
+                sheds={sheds}
+                hostErrors={hostErrors}
+                refresh={refresh}
+                onNew={() => setModal("create")}
+                roostTick={roostTick}
+                roostBusy={roostBusy}
+                onOpenConsent={openRoostConsent}
+              />
+            )}
+            {pane === "machines" && (
+              <MachinesPane
+                machines={rcMachines}
+                sessions={rcSessions}
+                refresh={refreshRc}
+                onNew={() => setModal("machine")}
+                roostTick={roostTick}
+                roostBusy={roostBusy}
+                onOpenConsent={openRoostConsent}
+              />
+            )}
             {pane === "approvals" && <ApprovalsPane approvals={approvals} />}
             {pane === "agents" && (
               <AgentsPane
@@ -1856,6 +2044,14 @@ export default function App() {
       {modal === "create" && <NewShedDialog refresh={refresh} onClose={() => setModal(null)} />}
       {modal === "machine" && <NewMachineDialog onClose={() => setModal(null)} onAdded={refreshRc} />}
       {modal === "launch" && <LaunchAgentDialog sheds={sheds} machines={rcMachines} capabilities={rcCapabilities} refresh={refreshRc} onClose={() => setModal(null)} onLaunched={onLaunched} />}
+      {roostConsent && (
+        <RoostConsentDialog
+          preview={roostConsent.preview}
+          onCancel={() => setRoostConsent(null)}
+          onConfirm={confirmRoostBootstrap}
+        />
+      )}
+      {toast && <Toast toast={toast} onDismiss={() => setToast(null)} />}
     </div>
   );
 }

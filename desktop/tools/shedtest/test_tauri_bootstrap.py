@@ -65,6 +65,7 @@ import ui
 from client import ShedError, TauriClient, scaled_timeout
 from fake_host_agent import FakeHostAgent
 from fake_roost import FakeRoost
+from mockserver import MockShedServer
 
 pytestmark = pytest.mark.skipif(
     os.environ.get("SHED_TEST_TARGET", "mac") != "tauri",
@@ -320,6 +321,11 @@ class Rig:
         self.mock = mock
         self.hosts: list[str] = []
         self.extra: list[FakeRoost] = []
+        #: The app whose view of the world [`list_running`] refreshes. Set (and
+        #: restored) by `_boot_app` for whichever instance is driving the rig, so
+        #: a cell with its OWN app refreshes that one and hands the module-scoped
+        #: instance back on the way out.
+        self.app: TauriClient | None = None
 
     def roost(self, *, protocol: int = 4) -> FakeRoost:
         """A `roost-session` daemon of a cell's OWN.
@@ -404,16 +410,27 @@ class Rig:
         return f"roost:{SERVER}/{shed}"
 
     def list_running(self, *, stopped: str | None = None) -> None:
-        """Serve every minted shed as running, except `stopped`.
+        """Serve every minted shed as running, except `stopped`, and make the app
+        take one authoritative look at the result.
 
         The mock's payload is restored before every test (the autouse
         `_reset_mock`), so this is how a cell's sheds get back into the listing —
         and how one of them is taken OUT of it, which is what `shed stop` looks
         like to a client.
+
+        **The `sheds.list` is not optional.** A shed is only addressable once the
+        app has seen a server LIST it (`RoostHosts::ssh_entry`'s gate — a
+        configured server is not a licence for every shed name on it), and
+        `sheds.list` is the authoritative refresh that records that. Without it a
+        cell that mints a shed and immediately drives `roost.probe` would be
+        racing the frontend's own 5 s shed poll, the only other thing that tells
+        the app a new shed exists.
         """
         for shed in self.hosts:
             if shed != stopped:
                 self.mock.add_shed({"name": shed, "status": "running", "backend": "vz"})
+        if self.app is not None:
+            self.app.call("sheds.list")
 
     # -- per-shed state a cell reads or pokes ------------------------------
     def home(self, shed: str) -> Path:
@@ -533,6 +550,11 @@ def _boot_app(
                 "tauri", sock=sock, mock_base_url=mock_base_url, proc=proc, log=log
             )
             client = TauriClient(sock)
+            # This instance is the one `Rig.list_running` refreshes while it is
+            # up — restored on the way out, so a cell with its own app hands the
+            # module-scoped one back. See `Rig.app`.
+            previous_app = rig.app
+            rig.app = client
             try:
                 client.wait_until(
                     lambda: client.current_pane() is not None,
@@ -541,6 +563,7 @@ def _boot_app(
                 )
                 yield client
             finally:
+                rig.app = previous_app
                 client.close()
         finally:
             ui.terminate(proc)
@@ -733,6 +756,43 @@ def test_a_mismatched_running_session_is_reported_and_never_stopped(boot, rig):
     # is the one verb that would: `start`.
     assert "start" not in calls, f"P6: never restarted — {calls}"
     assert set(calls) <= {"identify", "client-bridge"}, f"P6: reads only — {calls}"
+
+
+def test_a_shed_the_server_never_listed_is_refused_and_never_contacted(boot, rig):
+    """**A configured server is not a licence for every shed name on it.**
+
+    `roost:<server>/<shed>` carries a server the user wrote down and a shed name
+    that is DISCOVERED, and only the first half used to be checked: any name under
+    a configured server composed an ssh identity out of the server entry plus
+    whatever the caller invented. So previewing `roost:mock/never-existed` took a
+    fingerprint off a host nobody had ever seen, and the bootstrap behind it would
+    have ssh'd to `never-existed@<that server's host>` — a host the user neither
+    configured nor discovered.
+
+    The refusal lands before any transport exists, which is why the `ssh` log is
+    the assertion that matters: every fake-`ssh` invocation is recorded with the
+    shed name as its ssh user, and there must be no line for this one.
+    """
+    rig.host("p19-unlisted-peer")  # the server IS configured, live, and listing
+    invented = f"roost:{SERVER}/p19-never-existed"
+    for op in ("roost.probe", "roost.preview"):
+        with pytest.raises(ShedError) as refused:
+            boot.call(op, {"target": invented})
+        assert refused.value.code == "probe", refused.value
+        assert "has not listed" in str(refused.value), refused.value
+        assert "p19-never-existed" in str(refused.value), refused.value
+
+    answer = boot.call(
+        "roost.bootstrap",
+        {"target": invented, "fingerprint": "anything", "consent": True},
+    )
+    assert answer["ok"] is False, answer
+    assert answer["error"]["stage"] == "probe", answer
+    assert "has not listed" in answer["error"]["message"], answer
+
+    reached = [line for line in rig.ssh_log() if line.startswith("p19-never-existed\t")]
+    assert not reached, f"nothing may be contacted for an unlisted shed: {reached}"
+    assert not (rig.root / "hosts" / "p19-never-existed").exists()
 
 
 # ---------------------------------------------------------------------------
@@ -1153,6 +1213,321 @@ def test_the_real_binary_is_installed_and_started_behind_the_fake_ssh(rig, mock,
             subprocess.run(["kill", pid], check=False)
             time.sleep(0.5)
             subprocess.run(["kill", "-9", pid], check=False)
+
+
+# ---------------------------------------------------------------------------
+# the UI (C8): the status line + plan-matrix button, the consent dialog's
+# copy, and the toast — all UI TRUTH, read the `machines.dump` way rather than
+# by re-deriving what the backend already proved above.
+# ---------------------------------------------------------------------------
+
+
+def _shed_roost_dump(app: TauriClient) -> dict:
+    """Every RUNNING shed's roost row as the Sheds pane actually rendered it —
+    `{}` off-pane or before the pane's board has answered its first preview.
+
+    Deliberately a different question from `roost.preview`: that is the
+    backend's answer regardless of what's on screen; this is what a person
+    looking at the pane reads — the whole point of a `*.dump` op (`machines.dump`'s
+    rule, extended to roost)."""
+    return app.call("shed_roost.dump")["sheds"] or {}
+
+
+def _roost_consent_dump(app: TauriClient) -> dict | None:
+    """The open consent card's rendered copy, or `None` with none mounted."""
+    return app.call("roost_consent.dump")["consent"]
+
+
+def _toast_dump(app: TauriClient) -> dict | None:
+    """The toast currently on screen as it reported itself, or `None`."""
+    return app.call("toast.dump")["toast"]
+
+
+def _on_screen(dump: dict, *fields: str) -> None:
+    """Assert each named copy field is IN THE DOM, not merely in the dump.
+
+    **The difference between testing the UI and testing a parallel data
+    structure.** Every other field in a `*.dump` is derived from React state, so
+    on their own they would all still pass with the component deleted from the
+    tree. `rendered` is the component's own `textContent`, read back after the
+    commit (`lib/roost.ts`'s `renderedText`) — so a copy assertion that also
+    checks `rendered` is an assertion about the screen.
+    """
+    rendered = dump.get("rendered")
+    assert rendered, f"nothing was rendered at all: {dump}"
+    for field in fields:
+        value = dump[field]
+        if value is None:
+            continue
+        assert value in rendered, f"{field}={value!r} is not on screen: {rendered!r}"
+
+
+def _wait_for_roost_row(app: TauriClient, target: str, *, timeout: float = 30.0) -> dict:
+    """Poll `shed_roost.dump` until `target` has a row with a preview loaded
+    (a `status` present — `None` while the board's fetch is still in flight)."""
+    box: dict = {}
+
+    def ready() -> bool:
+        row = _shed_roost_dump(app).get(target)
+        if row and (row.get("status") is not None or row.get("error") is not None):
+            box["row"] = row
+            return True
+        return False
+
+    app.wait_until(ready, timeout=timeout, what=f"the sheds pane to render a roost row for {target}")
+    return box["row"]
+
+
+def _open_consent(app: TauriClient, target: str) -> dict:
+    """Drive the consent card open the way the harness has to — no click — and
+    wait for it to report itself. `ui.show_roost_consent` re-previews `target`
+    host-side, so this is exercising the SAME door a card's button uses, not a
+    shortcut around it."""
+    app.call("ui.show_roost_consent", {"target": target})
+    app.wait_until(
+        lambda: (_roost_consent_dump(app) or {}).get("target") == target,
+        timeout=20,
+        what="the consent card to open and report itself",
+    )
+    return _roost_consent_dump(app)
+
+
+def _close_consent(app: TauriClient) -> None:
+    app.call("ui.close_roost_consent")
+    app.wait_until(lambda: _roost_consent_dump(app) is None, timeout=10, what="the consent card to close")
+
+
+def test_the_sheds_pane_renders_install_and_update_buttons(boot, rig):
+    """The actionable rows: a cold shed's card offers Install, a stale binary's
+    offers Update — the SAME plan `roost.preview` computed (C7), now read off
+    what the pane rendered rather than off the wire directly."""
+    boot.navigate("sheds")
+    cold = rig.host("p19-ui-cold")
+    stale = rig.host("p19-ui-stale", identity=IDENTITY_V2)
+
+    row = _wait_for_roost_row(boot, cold)
+    assert row["button"] == "Install", row
+    assert row["status"], "a status line accompanies the button"
+    _on_screen(row, "status", "button")
+
+    row = _wait_for_roost_row(boot, stale)
+    assert row["button"] == "Update", row
+    _on_screen(row, "status", "button")
+
+
+def test_the_sheds_pane_renders_start_with_no_button_states(boot, rig):
+    """A Start row (installed, not running), and the two non-actionable rows
+    the plan matrix carries no button for: up to date, and a mismatched
+    session's Report — whose message is PINNED COPY and must reach the pane
+    verbatim (plan 019 §3.4)."""
+    boot.navigate("sheds")
+    startable = rig.host("p19-ui-start", identity=IDENTITY_V4)
+    up_to_date = rig.host("p19-ui-uptodate", identity=IDENTITY_V4, running=True, roost=rig.v4)
+    reported = rig.host("p19-ui-mismatch", identity=IDENTITY_V2, running=True, roost=rig.v2)
+
+    row = _wait_for_roost_row(boot, startable)
+    assert row["button"] == "Start", row
+    _on_screen(row, "status", "button")
+
+    row = _wait_for_roost_row(boot, up_to_date)
+    assert row["button"] is None, row
+    assert "running" in row["status"], row
+    _on_screen(row, "status")
+
+    row = _wait_for_roost_row(boot, reported)
+    assert row["button"] is None, row
+    assert row["status"] == (
+        f"roost-session on {reported} speaks protocol 2, this build speaks 4 — "
+        "upgrade whichever is older; stop it there with `roostctl session stop` "
+        "and reconnect once it is."
+    ), "the Report row's message must reach the pane verbatim (pinned copy)"
+    # …and verbatim ON SCREEN, not merely in the dump.
+    _on_screen(row, "status")
+
+
+def _mint_private_shed(rig: Rig, shed: str) -> None:
+    """`Rig.host`'s jail setup, minus the part that lists the shed on the
+    SHARED session `mock` — for a cell that needs its own private server (see
+    `test_a_blocked_install_shows_the_pinned_no_source_sentence_and_no_button`).
+
+    `rig.host` always calls `self.mock.add_shed(...)`, which makes the shed
+    visible to EVERY app pointed at the shared mock — including the
+    module-scoped `boot` app, which polls `sheds.list` every 5s for the whole
+    module's lifetime and starts its OWN `observe_sheds` bridge probe on
+    anything newly running. A UI cell that then drives the Sheds pane and
+    polls for up to 30s gives that probe repeated chances to collide with this
+    cell's own preview on the exact same fake-ssh jail (`another Roost is
+    connected` — a real refusal, just aimed at the wrong opponent: two
+    read-only probes from two harness-only processes, not a real second
+    client). Still registered in `rig.hosts` so the module's final
+    hermeticity audit recognizes it.
+    """
+    home = rig.home(shed)
+    for name in ("run", "data", "state", "cache"):
+        path = home / name
+        path.mkdir(parents=True, exist_ok=True)
+        for level in (path, path.parent, path.parent.parent):
+            level.chmod(0o700)
+    (rig.root / "hosts" / shed / "socket").write_text(str(rig.v4.socket_path))
+    if shed not in rig.hosts:
+        rig.hosts.append(shed)
+
+
+def test_a_blocked_install_shows_the_pinned_no_source_sentence_and_no_button(rig):
+    """The sixth plan-matrix row, rendered: `NoSource` blocks an otherwise
+    actionable plan, and the card shows the pinned sentence IN PLACE of a
+    button — never a button, never a paraphrase (plan 019 §3.5/C8 bullet 2).
+
+    Its own app AND its own private mock server — see `_mint_private_shed`:
+    the source ladder needs an app with no override env, and this shed must
+    stay invisible to the `boot` app's own background prober."""
+    target_name = "p19-ui-nosource"
+    _mint_private_shed(rig, target_name)
+    private_mock = MockShedServer()
+    private_mock.start()
+    try:
+        private_mock.add_shed({"name": target_name, "status": "running", "backend": "vz"})
+        with _boot_app(rig, private_mock.base_url, install_bin=None, session_bin=ABSENT) as app:
+            app.navigate("sheds")
+            # The authoritative refresh that makes the shed addressable at all
+            # (`RoostHosts::ssh_entry`'s gate — see `Rig.list_running`). The
+            # frontend's own 5 s poll would get there too; asking directly keeps
+            # the cell off that clock.
+            app.call("sheds.list")
+            target = f"roost:{SERVER}/{target_name}"
+            row = _wait_for_roost_row(app, target)
+            assert row["button"] is None, row
+            # EXACT equality, not a substring check: this is the pinned
+            # `NoSource` sentence (plan 019 §3.5) and must reach the pane
+            # verbatim — a substring match would pass even if the renderer
+            # appended or reworded anything around it.
+            assert row["status"] == (
+                "no roost release speaking session protocol 4 is published yet "
+                "(the latest, 0.0.19, speaks 2). On a Linux machine with a "
+                "protocol-4 roost installed the desktop uses that roost-session; "
+                "otherwise point ROOST_SESSION_INSTALL_BIN at a protocol-4 build. "
+                f"{target} was left untouched."
+            ), row["status"]
+            # …and the whole of it is on screen, in place of a button.
+            _on_screen(row, "status")
+    finally:
+        private_mock.stop()
+
+
+def test_the_consent_dialog_names_what_where_from_and_the_hook_wiring(boot, rig):
+    """The Install consent card's four required lines (plan 019 §3.5): what,
+    where, from where, and the hook-wiring sentence — no backup note for a
+    plain install."""
+    boot.navigate("sheds")
+    target = rig.host("p19-ui-consent-install")
+    _wait_for_roost_row(boot, target)  # the board has to have a plan before consent opens meaningfully
+    try:
+        card = _open_consent(boot, target)
+        assert card["action"] == "Install", card
+        assert target in card["what"]
+        assert target in card["where"] and ".local/bin/roost-session" in card["where"]
+        # **The "from where" sentence, exactly.** `assert card["from"]` accepts any
+        # non-empty string, so the one line that tells a person whose bytes are
+        # about to be installed on their host could become meaningless and still
+        # pass. This module's app runs with `ROOST_SESSION_INSTALL_BIN` pointed at
+        # the rig's stand-in, so the sentence is the override rung's
+        # (`source.rs::override_origin`): the path, and the variable that named it.
+        assert card["from"] == (
+            f"{rig.root / 'src/roost-session'} (ROOST_SESSION_INSTALL_BIN)"
+        ), card["from"]
+        assert card["hooks"] == (
+            "roost-session will also wire its hooks into the agents already configured "
+            "there — claude, codex, cursor, opencode, grok — and nothing else."
+        ), "the hook-wiring sentence is pinned copy (plan 019 §3.4)"
+        assert card["backup"] is None, "nothing to back up on a plain install"
+        # Every one of those lines is in the card's own DOM, so this is a test of
+        # the dialog and not of a parallel copy of its state.
+        _on_screen(card, "what", "where", "from", "hooks")
+    finally:
+        _close_consent(boot)
+
+
+def test_the_consent_dialog_names_the_backup_for_an_update(boot, rig):
+    """The Update-only line: the previous file will be backed up (plan 019 §3.5).
+
+    **Exact equality.** `"backed up" in card["backup"]` also accepts the REVERSED
+    promise — "The previous file will not be backed up" is non-null and contains
+    "backed up" — which is the one thing this line exists to rule out.
+    """
+    boot.navigate("sheds")
+    shed = "p19-ui-consent-update"
+    target = rig.host(shed, identity=IDENTITY_V2)
+    _wait_for_roost_row(boot, target)
+    try:
+        card = _open_consent(boot, target)
+        assert card["action"] == "Update", card
+        assert card["backup"] == (
+            f"The file currently at {rig.installed(shed)} will be backed up "
+            "before it's replaced."
+        ), card["backup"]
+        _on_screen(card, "what", "where", "from", "hooks", "backup")
+    finally:
+        _close_consent(boot)
+
+
+def test_confirming_consent_installs_and_toasts_the_result(boot, rig):
+    """The whole loop, driven the way a click would: open the card, confirm it
+    (the harness's stand-in for the click, `ui.confirm_roost_consent`), and
+    read the toast + the row settling to Start-or-better — all UI truth, none
+    of it re-derived from the `roost.bootstrap` answer directly.
+
+    **And one confirm is one bootstrap.** The confirm door is driven TWICE here,
+    which is what a double-click looks like from the app's side, and the host's own
+    call log is asserted to carry exactly one `start`. A count rather than a
+    membership test: `"start" in calls` passes just as happily when a second
+    bootstrap streamed, committed and started over the first — the symptom of
+    running side effects inside a React state updater, which StrictMode invokes
+    twice.
+    """
+    boot.navigate("sheds")
+    shed = "p19-ui-confirm"
+    target = rig.host(shed)
+    _wait_for_roost_row(boot, target)
+    _open_consent(boot, target)
+    boot.call("ui.confirm_roost_consent")
+    boot.call("ui.confirm_roost_consent")
+    # The card closes immediately (no cancel op exists to hold it open across a
+    # 10-minute budget) — progress shows on the ROW, not a lingering modal.
+    boot.wait_until(lambda: _roost_consent_dump(boot) is None, timeout=10, what="the card to close on confirm")
+
+    def toasted() -> bool:
+        t = _toast_dump(boot)
+        return bool(t and any(target in line for line in t["lines"]))
+
+    boot.wait_until(toasted, timeout=30, what="a toast naming the target to appear")
+    toast = _toast_dump(boot)
+    assert f"roost-session started on {target}." in toast["lines"]
+    # The rig's utils jail has no `$HOME/.local/bin` on PATH (module docstring) —
+    # the PATH warning is exactly what should ride the toast, verbatim.
+    assert any("isn't on" in line and "PATH" in line for line in toast["lines"]), toast
+    assert toast["tone"] == "warn", "a PATH warning downgrades the tone from ok"
+    # The lines were painted, not just reported — `rendered` is the toast's own
+    # DOM text (see `_on_screen`).
+    for line in toast["lines"]:
+        assert line in toast["rendered"], (line, toast["rendered"])
+
+    # And the row itself moved on — the confirm bumped the board's refresh, no
+    # manual pane refresh needed. Waits for the SETTLED state specifically
+    # (not just "any answer"): the row's very first answer, from before the
+    # bootstrap ran, already had a non-null status ("roost-session not
+    # found"), so `_wait_for_roost_row`'s generic readiness would return that
+    # stale snapshot immediately.
+    boot.wait_until(
+        lambda: _shed_roost_dump(boot).get(target, {}).get("button") is None,
+        timeout=30,
+        what="the row to settle on a no-button (Start-or-better) state after the confirm",
+    )
+    row = _shed_roost_dump(boot)[target]
+    assert "running" in row["status"], row
+    _on_screen(row, "status")
+    assert rig.installed(shed).is_file()
+    calls = rig.calls(shed)
+    assert calls.count("start") == 1, f"one confirm is one bootstrap: {calls}"
 
 
 def test_the_fake_ssh_never_reached_a_real_host(boot, rig):

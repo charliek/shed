@@ -376,6 +376,96 @@ async fn machine_launch(
         .await
 }
 
+// -- roost bootstrap (plan 019 §3.6, C8) -----------------------------------
+//
+// The frontend's own door onto `RoostHosts::probe/preview/bootstrap` — the
+// `machine_*` pair's rule again: the harness drives these over the `roost.*`
+// socket ops (`ipc.rs`), the card + consent dialog drive these, and both land
+// in the same `RoostHosts` methods, so what the harness proves about a
+// bootstrap is what a click actually runs.
+//
+// A failure crosses as `"{stage}: {message}"`, the same shape `lane_error`
+// uses for the same reason: a Tauri command's error channel is a bare string,
+// and `bridge.ts` splits it back into a stage/code and a message so the UI can
+// tell "the host changed under you" (`fingerprint`) from everything else.
+
+fn roost_failure_string(stage: &str, message: String) -> String {
+    format!("{stage}: {message}")
+}
+
+/// `roost_probe` — one read-only look at `target`: what's on it, and the plan
+/// matrix row it lands on. Safe to call before consent; writes nothing.
+#[tauri::command]
+async fn roost_probe(
+    machines: tauri::State<'_, Arc<roost_hosts::RoostHosts>>,
+    target: String,
+) -> Result<serde_json::Value, String> {
+    machines
+        .probe(&target)
+        .await
+        .map_err(|f| roost_failure_string(f.stage.as_str(), f.message))
+}
+
+/// `roost_preview` — the probe, the plan, and the sentence naming where the
+/// bytes would come from: the consent card's content. Nothing is fetched here.
+#[tauri::command]
+async fn roost_preview(
+    machines: tauri::State<'_, Arc<roost_hosts::RoostHosts>>,
+    target: String,
+) -> Result<serde_json::Value, String> {
+    machines
+        .preview(&target)
+        .await
+        .map_err(|f| roost_failure_string(f.stage.as_str(), f.message))
+}
+
+/// `roost_bootstrap` — install/update/start a `roost-session` on `target` and
+/// wire its agent hooks, after consent. Mirrors `ipc::IpcHandler::roost_bootstrap`
+/// exactly (same 10-minute outer budget, same two-refusal split: a
+/// [`roost_hosts::Refusal`] is about the CALL and is a command Err carrying its
+/// code; a stale fingerprint is a fact about the host and an `ok` envelope
+/// carrying `ok: false`).
+///
+/// **`consent` is a caller-supplied boolean, and that is the pinned wire shape**
+/// (plan 019 §3.6). It asserts that the caller rendered the §3.5 consent card and
+/// a person confirmed it; it proves nothing on its own, because the backend keeps
+/// no record that a card was ever shown — `roost.preview` followed by
+/// `consent: true` is indistinguishable here from a confirmed click. The trust
+/// boundary is the webview this command is reachable from, which loads only
+/// bundled local assets. Making consent unforgeable would mean the backend
+/// minting a token at preview time, bound to the fingerprint, that a bootstrap
+/// required and consumed — a deliberate follow-up with a wire change in it, not a
+/// gap nobody noticed. The full note lives on `ipc.rs`'s twin.
+#[tauri::command]
+async fn roost_bootstrap(
+    machines: tauri::State<'_, Arc<roost_hosts::RoostHosts>>,
+    target: String,
+    fingerprint: String,
+    consent: bool,
+) -> Result<serde_json::Value, String> {
+    let run = machines.bootstrap(&target, &fingerprint, consent);
+    let outcome = match tokio::time::timeout(ipc::BOOTSTRAP_BUDGET, run).await {
+        Ok(outcome) => outcome,
+        Err(_) => {
+            return Err(roost_failure_string(
+                "action_failed",
+                format!(
+                    "{target}: the bootstrap did not finish within {} minutes",
+                    ipc::BOOTSTRAP_BUDGET.as_secs() / 60
+                ),
+            ))
+        }
+    };
+    match outcome {
+        Ok(Ok(installed)) => Ok(roost_hosts::installed_json(&installed)),
+        Ok(Err(failure)) => Ok(roost_hosts::failure_json(&failure)),
+        Err(refusal) => {
+            let code = refusal.code();
+            Err(roost_failure_string(code, refusal.message()))
+        }
+    }
+}
+
 // -- agent lanes (plan 015 §3.4) ------------------------------------------
 //
 // The frontend twins of the `lane.*` IPC ops. Both doors land in the SAME
@@ -1081,6 +1171,9 @@ pub fn run() {
             machine_kill,
             machine_capabilities,
             machine_launch,
+            roost_probe,
+            roost_preview,
+            roost_bootstrap,
             lane_open,
             lane_messages,
             lane_approvals,
