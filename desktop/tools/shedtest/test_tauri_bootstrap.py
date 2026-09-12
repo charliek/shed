@@ -103,7 +103,32 @@ IDENTITY_V2 = json.dumps(
 #: it. `$HOME/.local/bin` is deliberately absent, which is the ordinary shed case
 #: (roost execs the absolute path) and is what makes the post-install PATH
 #: warning fire. The list mirrors the Rust rig's.
-UTILS = ("sh", "uname", "head", "tail", "mv", "mkdir", "rm", "tee", "chmod", "cat")
+#:
+#: `uname` is deliberately NOT here — see `_fake_uname`.
+UTILS = ("sh", "head", "tail", "mv", "mkdir", "rm", "tee", "chmod", "cat")
+
+
+def _fake_uname(real: str) -> str:
+    """A `uname` shim, because symlinking the host's is a macOS-only failure.
+
+    `-s` always answers Linux. roost's discovery script asks the far side what it
+    is and `check_os` refuses anything but Linux — correctly, since
+    `roost-session` is built for Linux only. The far side this rig models is a
+    SHED, so borrowing the host's `uname` made every one of these cells pass on
+    the Linux render gate and fail on a macOS runner with "reports itself as
+    Darwin". Both Rust rigs had the identical bug; CI surfaced them one at a
+    time, because each failing suite hid the next.
+
+    `-m` is DELEGATED to the real `uname`. The arch assertion here accepts either
+    `amd64` or `arm64` precisely so it is not a statement about the developer's
+    machine, and keeping the real answer is what keeps that true.
+    """
+    return f"""#!/bin/sh
+case "$1" in
+  -m) exec {real} -m ;;
+  *) printf '%s\n' Linux ;;
+esac
+"""
 
 
 def _fake_session(identity: str) -> str:
@@ -477,6 +502,9 @@ def rig(mock):
             real = shutil.which(tool)
             assert real, f"the rig needs {tool} on PATH"
             (utils / tool).symlink_to(real)
+        real_uname = shutil.which("uname")
+        assert real_uname, "the rig needs uname on PATH"
+        _write_exec(utils / "uname", _fake_uname(real_uname))
         # The bytes an install streams: roost's own override rung.
         _write_exec(root / "src/roost-session", _fake_session(IDENTITY_V4))
         _write_exec(root / "bin/fake-ssh", _fake_ssh(root))
