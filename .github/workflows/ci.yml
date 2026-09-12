@@ -1,8 +1,16 @@
 name: CI
 
 on:
+  # `main` only. A `feature/*` branch with an open PR used to match BOTH this
+  # trigger and the `pull_request` one below, so every push ran the whole
+  # workflow TWICE against the same commit — including the three macOS jobs,
+  # which then queued behind each other for runner capacity. The PR run is the
+  # one that gates the merge, so the push run was pure duplication.
+  #
+  # To run CI on a long-lived branch that has no PR, add that branch here by
+  # name — deliberately, and say why.
   push:
-    branches: [main, 'feature/*']
+    branches: [main]
   pull_request:
     branches: [main, 'feature/*']
 
