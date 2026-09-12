@@ -392,6 +392,24 @@ impl RoostEventStream {
         self.stream.revision()
     }
 
+    /// The daemon incarnation that answered *this* subscribe.
+    ///
+    /// **It exists because a client dials twice.** shed identifies on one
+    /// connection and subscribes on another, so a `roost-session` that restarts
+    /// between the two hands back a snapshot from one process and an event
+    /// stream from another — a pairing that looks healthy and is not. roost
+    /// answers every ack with its own id precisely so the client can refuse
+    /// that pair itself; it does **not** check on a fresh subscribe, because it
+    /// only compares when the request names a `session_id`, which is the resume
+    /// path shed does not take.
+    ///
+    /// Compare it with the `session_id` [`Conn::session_identify`] returned and
+    /// start the cycle over on a disagreement; shed's watcher is the caller
+    /// that does, before it ever issues the cycle's `tab.list`.
+    pub fn session_id(&self) -> &str {
+        self.stream.session_id()
+    }
+
     /// Why the stream ended, once the terminal envelope has arrived. At session
     /// protocol 5 the only reachable reason is `"stop"`, and now structurally so
     /// rather than by convention: roost's `CloseReason` has exactly one variant,

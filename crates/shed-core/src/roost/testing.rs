@@ -231,6 +231,12 @@ struct FakeState {
     /// Registered event streams, by connection id. Unclassified at generation 5
     /// — every subscriber gets every frame, `tab.effect` included.
     streams: BTreeSet<u64>,
+    /// How many more `events.subscribe` acks answer from a **fresh**
+    /// incarnation. See [`FakeRoost::restart_between_dials`].
+    restarts_between_dials: u32,
+    /// Bumped by each of those, so the moved id is unique however many times it
+    /// moves.
+    dial_restarts: u64,
     /// How many `tab.list` replies have been served — the assertion that the
     /// watcher reads the inventory once per cycle and not per event.
     tab_list_calls: usize,
@@ -280,6 +286,8 @@ impl FakeState {
             agent_hooks_calls: Vec::new(),
             agent_hooks_result: None,
             streams: BTreeSet::new(),
+            restarts_between_dials: 0,
+            dial_restarts: 0,
             tab_list_calls: 0,
             before_tab_list: None,
             frames,
@@ -660,6 +668,28 @@ impl FakeRoost {
         let _ = self.hangup.send(());
     }
 
+    /// Restart the daemon **between a client's two dials**, for the next
+    /// `times` subscribes: `session.identify` reports one incarnation and the
+    /// `events.subscribe` ack that follows reports another.
+    ///
+    /// This is the one thing [`Self::restart`] cannot express. A restart moves
+    /// the id and hangs everybody up, so a client that re-dials afterwards sees
+    /// one consistent incarnation. What a real restart landing *between* a
+    /// client's identify and its subscribe produces is a **mismatched pair** —
+    /// a snapshot from the process that is gone and a stream from the one that
+    /// replaced it — and the only thing that tells a client about it is the
+    /// `session_id` on the ack.
+    ///
+    /// Reduced to that one axis on purpose. It moves the id and nothing else:
+    /// it does not reset the revision (that would mix a second resync cause,
+    /// the gap, into a test about the first) and it does not hang up the live
+    /// connection the client identified on. A client that only recovered
+    /// because its control leg died under it would be passing by luck, and the
+    /// property under test is the comparison.
+    pub fn restart_between_dials(&self, times: u32) {
+        self.lock().restarts_between_dials = times;
+    }
+
     /// Hang up on every connection that is live right now.
     pub fn close_all(&self) {
         // `Err` only means nobody is connected — which is the state this asks
@@ -801,13 +831,24 @@ fn register_stream(
             "tab_id_filter is not implemented; pass \"0\"",
         ));
     }
+    // Under the same lock as the ack, and before it is built: this is the
+    // restart that lands *between* a client's two dials, so what it must
+    // produce is an ack naming an incarnation the client's `session.identify`
+    // never saw. See [`FakeRoost::restart_between_dials`].
+    if state.restarts_between_dials > 0 {
+        state.restarts_between_dials -= 1;
+        state.dial_restarts += 1;
+        let moved = format!("{}-redial-{}", state.session_id, state.dial_restarts);
+        state.session_id = moved;
+    }
     state.streams.insert(conn_id);
     let frames = state.frames.subscribe();
     let mut ack = vector(VECTOR_EVENTS_SUBSCRIBE)["result"].clone();
     ack["revision"] = json!(state.revision);
     // The incarnation answering, echoed so a client that identified on one
     // connection and subscribed on another can refuse a mismatched pair. It
-    // tracks [`FakeRoost::restart`], which is the only thing that moves it.
+    // tracks [`FakeRoost::restart`] and [`FakeRoost::restart_between_dials`],
+    // which are the only things that move it.
     ack["session_id"] = json!(state.session_id);
     Ok((ack, frames))
 }
@@ -1388,6 +1429,50 @@ mod tests {
             "a restart is a new incarnation and the ack has to say so"
         );
         assert_eq!(after["session_id"], json!(fake.session_id()));
+    }
+
+    /// [`FakeRoost::restart_between_dials`] hands out the pair a client cannot
+    /// otherwise be made to see: an identify and a subscribe on two
+    /// incarnations, with the control connection still live underneath.
+    ///
+    /// Read through `Conn`, because the accessor a watcher compares on is the
+    /// thing being wired here — an ack the fake moved but `RoostEventStream`
+    /// did not surface would leave the check with nothing to read.
+    #[tokio::test]
+    async fn a_restart_between_the_dials_leaves_the_two_legs_disagreeing() {
+        let fake = FakeRoost::start().await;
+        let mut control = Conn::unix(fake.socket_path()).await.expect("dial");
+        let identified = control.session_identify().await.expect("identify");
+
+        fake.restart_between_dials(1);
+        let event_leg = Conn::unix(fake.socket_path())
+            .await
+            .expect("dial")
+            .subscribe()
+            .await
+            .expect("subscribe");
+        assert_ne!(
+            event_leg.session_id(),
+            identified.session_id,
+            "the ack has to name the incarnation that answered it"
+        );
+        assert_eq!(event_leg.session_id(), fake.session_id());
+        assert!(
+            control.tab_list().await.is_ok(),
+            "the control leg is deliberately left alive: the mismatch is the \
+             signal, not a dead connection"
+        );
+
+        // One subscribe, and the count is spent: the next pair agrees again,
+        // which is what lets a test drive exactly as many mismatched cycles as
+        // it asked for.
+        let after = Conn::unix(fake.socket_path())
+            .await
+            .expect("dial")
+            .subscribe()
+            .await
+            .expect("subscribe");
+        assert_eq!(after.session_id(), fake.session_id());
     }
 
     /// The `result` object of one hand-written `events.subscribe`.

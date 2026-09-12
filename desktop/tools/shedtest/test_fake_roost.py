@@ -186,6 +186,39 @@ def test_the_subscribe_ack_echoes_the_session_id_and_follows_a_restart(roost):
     assert ack_after["session_id"] == identified_after["session_id"] == roost.session_id
 
 
+def test_a_restart_between_the_dials_leaves_the_two_legs_disagreeing(roost):
+    """`restart_between_dials()` hands out the pair a client cannot otherwise be
+    made to see: an identify and a subscribe on two incarnations, with the
+    control connection still live underneath.
+
+    A client that dials twice per cycle has no other way to notice a daemon that
+    restarted in the gap, which is why roost puts its id on every ack.
+
+    Mirrors `testing.rs::a_restart_between_the_dials_leaves_the_two_legs_disagreeing`.
+    """
+    # A HELD control leg, like a real client's conn A — the point is that it
+    # survives the restart underneath it.
+    with _Wire(roost.socket_path) as control:
+        identified = control.call("session.identify")
+
+        roost.restart_between_dials(1)
+        with _Wire(roost.socket_path) as w:
+            ack = w.subscribe()
+        assert ack["session_id"] != identified["session_id"], (
+            "the ack has to name the incarnation that answered it"
+        )
+        assert ack["session_id"] == roost.session_id, ack
+        # Deliberately still usable: the mismatch is the signal, not a dead
+        # connection.
+        assert control.call("tab.list")["projects"]
+
+        # One subscribe, and the count is spent: the next pair agrees again,
+        # which is what lets a test drive exactly as many mismatched cycles as
+        # it asked for.
+        with _Wire(roost.socket_path) as w:
+            assert w.subscribe()["session_id"] == roost.session_id
+
+
 def test_a_filtered_subscribe_is_refused_rather_than_served_unfiltered(roost):
     """The real client always sends `"0"`, so this is only reachable by hand —
     which is exactly what a client written against a roost that implements the

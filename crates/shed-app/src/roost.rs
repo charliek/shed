@@ -1568,8 +1568,12 @@ async fn run_loop(
 /// every poll because a restart need not drop a polled socket; a *held stream*
 /// cannot outlive its daemon, so a restart is an EOF and the next cycle
 /// re-identifies. The one edge is a restart landing between conn A's identify
-/// and conn B's subscribe: that snapshot carries the old `daemon_session_id`,
-/// the stream EOFs immediately, and the next cycle fixes both.
+/// and conn B's subscribe, and **it is now caught rather than survived**: the
+/// two dials name their incarnation, this compares them, and a disagreement
+/// ends the cycle as a [`Cycle::Resync`] before the `tab.list` below is ever
+/// issued. It used to recover a cycle later by accident — the stream EOFed
+/// under a snapshot already published from the dead incarnation — which cost a
+/// published inventory nobody could act on.
 ///
 /// `worked` is set once the cycle's first snapshot has gone out; `applied` once
 /// a batch has actually been folded in. Returns `Err` only for something the
@@ -1623,6 +1627,30 @@ async fn observe_once(
 
     let (_, stream_result) = tokio::join!(hooks_fut, subscribe_fut);
     let mut stream = stream_result?;
+
+    // **The two legs have to be the same daemon, and this is the only place
+    // that can tell.** A `roost-session` that restarted between the two dials
+    // above answers the ack from one incarnation and answered `session.identify`
+    // from another, so the snapshot conn A is about to take describes a process
+    // that is gone while the stream describes the one that replaced it. roost
+    // puts its own id on every ack for exactly this and does **not** check it
+    // itself on a fresh subscribe — it only compares when the request names a
+    // `session_id`, which is the resume path shed does not take.
+    //
+    // Before the `tab.list`, deliberately: the failure this prevents is a
+    // published inventory built from a dead incarnation's tabs, and a check
+    // after the snapshot would prevent nothing. A resync rather than a `Down`
+    // because the daemon is alive and we are one dial behind it — the same
+    // story as an EOF, bounded by the same [`MAX_CONSECUTIVE_RESYNCS`].
+    if stream.session_id() != identify.session_id {
+        tracing::warn!(
+            label = %label,
+            identified = %identify.session_id,
+            subscribed = %stream.session_id(),
+            "roost restarted between the identify and the subscribe"
+        );
+        return Ok(Cycle::Resync);
+    }
 
     // Conn A again — the snapshot the stream is fenced against — and then conn A
     // is done: everything after this comes off the push feed.
@@ -2865,11 +2893,15 @@ mod tests {
 
     /// The next snapshot carrying `session_id`.
     ///
-    /// A restart lands between the two requests one poll makes, so the first
-    /// snapshot after it can legitimately still carry the previous instance's id
-    /// alongside the new revision. Skipping to the id under test removes that
+    /// A restart lands wherever it lands in a cycle, so a snapshot the previous
+    /// instance's cycle had already published can still be in the channel when
+    /// the caller starts looking. Skipping to the id under test removes that
     /// race without weakening anything: under the bug these tests exist for, the
     /// id never arrives at all and [`next_update`]'s timeout fails the test.
+    ///
+    /// The one thing it no longer skips past is a snapshot built from a *dead*
+    /// incarnation — `observe_once` refuses a mismatched identify/subscribe pair
+    /// before it lists, so that inventory is never published in the first place.
     async fn snapshot_from_daemon(
         rx: &mut mpsc::UnboundedReceiver<RoostUpdate>,
         session_id: &str,
@@ -3367,6 +3399,121 @@ mod tests {
             reach.invalidations.load(Ordering::SeqCst),
             0,
             "the transport was never the problem"
+        );
+        watcher.stop();
+    }
+
+    /// **A restart landing BETWEEN the two dials is caught by the pair, not by
+    /// the stream.** Conn A identifies against one incarnation, conn B's
+    /// subscribe is answered by another, and the `tab.list` conn A is about to
+    /// take would describe a process that is gone. The cycle ends there.
+    ///
+    /// The two assertions that make this mean something are the request log and
+    /// the id on the published inventory: an implementation that compared the
+    /// pair *after* listing, or after emitting, would satisfy "it resynced" and
+    /// still have done the one thing this exists to stop.
+    #[tokio::test]
+    async fn a_restart_between_the_dials_resyncs_before_it_ever_lists() {
+        let fake = FakeRoost::start().await;
+        let dead = fake.session_id();
+        let reach = FlakyReach::new(RoostEndpoint::Unix(fake.socket_path().to_path_buf()), 0);
+        // Armed before the watcher starts, so the very first cycle is the
+        // mismatched one and every number below is unambiguous.
+        fake.restart_between_dials(1);
+
+        let (watcher, mut rx) = watch(reach.clone());
+
+        // `next_snapshot` panics on a `Down`, so arriving here is already half
+        // the claim: the disagreement cost a cycle, not the row.
+        let after = next_snapshot(&mut rx).await;
+        assert_eq!(
+            fake.tab_list_calls(),
+            1,
+            "one list, from the good cycle — the mismatched one must end before \
+             it asks, because a snapshot built from the dead incarnation's tabs \
+             is the whole thing this prevents"
+        );
+        assert_ne!(
+            after.daemon_session_id, dead,
+            "the first inventory published is the second cycle's; nothing from \
+             the incarnation that went away ever reached the consumer"
+        );
+        assert_eq!(after.daemon_session_id, fake.session_id());
+        assert_eq!(
+            reach.invalidations.load(Ordering::SeqCst),
+            0,
+            "a resync tears down no transport: the daemon is fine, we are one \
+             dial behind it"
+        );
+        watcher.stop();
+    }
+
+    /// **The resync bound, on mismatched pairs.** An immediate resync is exactly
+    /// the shape that becomes a hot loop, and a daemon restarting on every
+    /// subscribe would otherwise be re-dialled as fast as the loop can run. That
+    /// the bound works for EOFs is no evidence that a *newly added* branch
+    /// increments and exits it: four in a row, and the fourth is the `Down`.
+    #[tokio::test]
+    async fn a_run_of_mismatched_pairs_is_bounded_and_the_fourth_is_a_down() {
+        let fake = FakeRoost::start().await;
+        // One more than the bound: three silent resyncs and the one that trips
+        // it. `next_down` panics on a snapshot, so the silence is asserted too.
+        fake.restart_between_dials(MAX_CONSECUTIVE_RESYNCS + 1);
+        let (watcher, mut rx) = watch(Arc::new(LocalSession::new("localhost", fake.socket_path())));
+
+        let reason = next_down(&mut rx).await;
+        assert!(
+            reason.contains("resyncing too often"),
+            "the reason has to name the bound, not the last mismatch: {reason}"
+        );
+        assert_eq!(
+            fake.tab_list_calls(),
+            0,
+            "not one of the four cycles got as far as its list"
+        );
+        watcher.stop();
+    }
+
+    /// **The check refuses a mismatch and nothing else.** A comparison that
+    /// refused every pair would pass both cells above and leave the watcher
+    /// permanently down, so the agreeing case is asserted in its own right: the
+    /// cycle lists, publishes, and then goes on folding on the *same* pair —
+    /// the gate runs once per cycle, not once per event.
+    #[tokio::test]
+    async fn an_agreeing_pair_lists_publishes_and_keeps_folding() {
+        let fake = FakeRoost::start().await;
+        fake.set_tab_axes(TAB, "working", Some(owned("session_status")), false);
+        let (watcher, mut rx) = watch(Arc::new(LocalSession::new("localhost", fake.socket_path())));
+
+        let inventory = next_snapshot(&mut rx).await;
+        assert_eq!(inventory.daemon_session_id, fake.session_id());
+        assert_eq!(
+            inventory
+                .sessions
+                .iter()
+                .find(|s| s.tab_id == TAB)
+                .expect("the list was read and folded")
+                .activity(),
+            Some(RcActivity::Working),
+        );
+        assert_eq!(fake.tab_list_calls(), 1, "the check let the cycle through");
+
+        fake.set_tab_axes(TAB, "waiting", Some(owned("permission_asked")), false);
+        let after = next_snapshot(&mut rx).await;
+        assert_eq!(
+            after
+                .sessions
+                .iter()
+                .find(|s| s.tab_id == TAB)
+                .expect("still a row")
+                .activity(),
+            Some(RcActivity::NeedsApproval),
+            "the batch was folded on the pair the cycle started with"
+        );
+        assert_eq!(
+            fake.tab_list_calls(),
+            1,
+            "still one list: a per-event comparison would have resynced here"
         );
         watcher.stop();
     }

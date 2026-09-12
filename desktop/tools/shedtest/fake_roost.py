@@ -429,6 +429,12 @@ class FakeRoost:
         self._writes: dict[int, bytes] = {}
         self._dumps: dict[int, list[str]] = {}
         self._restarts = 0
+        #: How many more `events.subscribe` acks answer from a **fresh**
+        #: incarnation. See `restart_between_dials()`.
+        self._restarts_between_dials = 0
+        #: Bumped by each of those, so the moved id is unique however many times
+        #: it moves.
+        self._dial_restarts = 0
         self._tab_list_calls = 0
         self._before_tab_list = None
         self._stopped = False
@@ -688,6 +694,32 @@ class FakeRoost:
             self._stopped = False
             self._hangup_all()
 
+    def restart_between_dials(self, times: int) -> None:
+        """Restart the daemon **between a client's two dials**, for the next
+        `times` subscribes: `session.identify` reports one incarnation and the
+        `events.subscribe` ack that follows reports another.
+
+        This is the one thing `restart()` cannot express. A restart moves the id
+        and hangs everybody up, so a client that re-dials afterwards sees one
+        consistent incarnation. What a real restart landing *between* a client's
+        identify and its subscribe produces is a **mismatched pair** — a
+        snapshot from the process that is gone and a stream from the one that
+        replaced it — and the only thing that tells a client about it is the
+        `session_id` on the ack.
+
+        Reduced to that one axis on purpose. It moves the id and nothing else:
+        it does not reset the revision (that would mix a second resync cause,
+        the gap, into a test about the first) and it does not hang up the live
+        connection the client identified on. A client that only recovered
+        because its control leg died under it would be passing by luck, and the
+        property under test is the comparison.
+
+        The twin of `testing.rs`'s `FakeRoost::restart_between_dials`; the two
+        fakes move together.
+        """
+        with self._lock:
+            self._restarts_between_dials = times
+
     def close_all(self) -> None:
         """Hang up on every connection that is live right now. Connections
         accepted afterwards are unaffected — this is a hang-up, not a shutdown,
@@ -803,12 +835,21 @@ class FakeRoost:
                 # Refused rather than ignored: a filter the server does not apply
                 # is a contract lie.
                 raise _Refusal("invalid-param", 'tab_id_filter is not implemented; pass "0"')
+            # Under the same lock as the ack, and before it is built: this is
+            # the restart that lands *between* a client's two dials, so what it
+            # must produce is an ack naming an incarnation the client's
+            # `session.identify` never saw. See `restart_between_dials()`.
+            if self._restarts_between_dials > 0:
+                self._restarts_between_dials -= 1
+                self._dial_restarts += 1
+                self._session_id = f"{self._session_id}-redial-{self._dial_restarts}"
             conn.stream = queue.Queue(maxsize=FRAME_CAPACITY)
             ack = copy.deepcopy(_EVENTS_SUBSCRIBE)
             ack["revision"] = self._revision
             # The incarnation answering, echoed so a client that identified on
             # one connection and subscribed on another can refuse a mismatched
-            # pair. It tracks `restart()`, which is the only thing that moves it.
+            # pair. It tracks `restart()` and `restart_between_dials()`, which
+            # are the only things that move it.
             ack["session_id"] = self._session_id
             return ack
 
