@@ -184,11 +184,41 @@ impl Rig {
         // shed case (roost execs the absolute path) and it is what makes the
         // post-install PATH warning fire in the happy-path test.
         for tool in [
-            "sh", "uname", "head", "tail", "mv", "mkdir", "rm", "tee", "chmod", "cat",
+            "sh", "head", "tail", "mv", "mkdir", "rm", "tee", "chmod", "cat",
         ] {
             std::os::unix::fs::symlink(real_tool(tool), utils.join(tool))
                 .expect("linking a utility");
         }
+        // **`uname` is a shim rather than a symlink, and its two answers are
+        // chosen for different reasons.**
+        //
+        // `-s` always says Linux. roost's discovery script asks the far side
+        // what it is, and `check_os` refuses anything but Linux — correctly,
+        // since `roost-session` is built for Linux only. The far side this rig
+        // models is a SHED, so symlinking the host's `uname` made every test
+        // that reaches discovery pass on a Linux dev box and fail on a macOS
+        // runner with "reports itself as Darwin". CI caught that in
+        // `shed-app`'s rig first; this rig had the identical bug, hidden behind
+        // that earlier failure, and surfaced the moment it was fixed.
+        //
+        // `-m` is DELEGATED to the real `uname`, deliberately. `expected_arch`
+        // derives its expectation from this machine through roost's own
+        // `map_arch`, precisely so the arch assertion is not a statement about
+        // the developer's laptop; keeping the real answer here is what keeps
+        // that true. The two spellings still agree, because roost maps `arm64`
+        // and `aarch64` onto the same `RemoteArch` — so a mac reports `arm64`
+        // to the script while `expected_arch` computes from `aarch64`.
+        //
+        // `FAKE_UNAME_DARWIN` still overrides all of this for the
+        // unsupported-OS row: `shim` writes into `bin`, which precedes `utils`
+        // on the PATH.
+        write_exec(
+            &utils.join("uname"),
+            &format!(
+                "#!/bin/sh\ncase \"$1\" in\n  -m) exec {} -m ;;\n  *) printf '%s\\n' Linux ;;\nesac\n",
+                real_tool("uname").display()
+            ),
+        );
         let path = format!("{}:{}", bin.display(), utils.display());
         Rig {
             fake: FakeRoost::start().await,
