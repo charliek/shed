@@ -226,6 +226,10 @@ def launch(target: str = "mac", *, mock_base_url: str, config_path: Path, state_
            host_agent_socket: str | None = None, unreachable_hosts: tuple[str, ...] = (),
            credential_hosts: tuple[str, ...] = (),
            roost_sockets: dict[str, object] | None = None,
+           ssh_bin: object | None = None,
+           roost_jail: bool = False,
+           roost_install_bin: object | None = None,
+           roost_session_bin: object | None = None,
            gx_home: object | None = None,
            gx_timings_ms: str | None = None) -> None:
     """Launch the UI hermetically and block until it answers `identify`.
@@ -253,6 +257,34 @@ def launch(target: str = "mac", *, mock_base_url: str, config_path: Path, state_
     roost-session daemon is a separate, explicit opt-in — see the
     `SHEDTEST_ROOST_SOCKETS` harness var read by conftest.py's `_app_session`
     fixture.
+    `ssh_bin` is a fake `ssh` the app's roost transports exec instead of the real
+    one (`<PREFIX>_SSH_BIN`, test-mode only) — the plan-019 bootstrap seam. Unlike
+    `roost_sockets`, which replaces the transport entirely, this KEEPS the real
+    `SshBridge` and `SshExec`: the bootstrap's subject is a host with no session,
+    and its answers come from `ssh` exit codes, `ssh` stderr and roost's own
+    scripts run through a remote `/bin/sh -s`. A host that is neither mapped nor
+    served by a fake `ssh` is unreachable, so a hermetic run still spawns no real
+    ssh.
+    `roost_jail` sets roost's `jail_fs_root` (`<PREFIX>_ROOST_JAIL=1`, test-mode
+    only), which prefixes the candidate ladder's ABSOLUTE rungs with
+    `${ROOST_BOOTSTRAP_FS_ROOT}` — expanded by the far side, i.e. by the fake
+    `ssh`. Without it a cold-host cell finds the DEVELOPER's own
+    `/usr/bin/roost-session` and reads `Mismatch` on a workstation and `Missing`
+    in CI's container.
+    `roost_install_bin` is roost's OWN override rung, `ROOST_SESSION_INSTALL_BIN`
+    (plan 019 §3.5 rung 1) — not a `<PREFIX>_` var, because shed reads roost's
+    variable by that name. It names the `roost-session` a bootstrap installs, so a
+    cell can install a fake one; unset, the ladder falls through the sibling rung
+    to `NoSource` (no roost release speaks session protocol 4 yet), which is the
+    no-button cell. Set-or-cleared like the rest, so a developer with it exported
+    cannot make the NoSource cell pass for the wrong reason.
+    `roost_session_bin` is roost's `ROOST_SESSION_BIN` — its own "which daemon do
+    I run" override, which the source ladder's SIBLING rung borrows to find a
+    roost-session beside the client (plan 019 §3.5 rung 2). Pointing it at a path
+    that does not exist is what makes "this machine has no protocol-4 roost"
+    deterministic: without it the rung finds whatever `roost-session` happens to
+    be on the developer's PATH and the NoSource cell reads differently on a
+    workstation than in CI.
     `gx_home` is the fixture `$GROK_HOME` the gx lane's LOCAL credential reader
     looks in (`<PREFIX>_GX_HOME`) — a directory holding a fake `gx-remote*.json`
     record and a `0600` `gx-remote.token`, so the SHIPPED reader (checks and all)
@@ -278,6 +310,9 @@ def launch(target: str = "mac", *, mock_base_url: str, config_path: Path, state_
                         runtime_dir=state_dir, host_agent_socket=host_agent_socket,
                         unreachable_hosts=unreachable_hosts,
                         roost_sockets=roost_sockets,
+                        ssh_bin=ssh_bin, roost_jail=roost_jail,
+                        roost_install_bin=roost_install_bin,
+                        roost_session_bin=roost_session_bin,
                         gx_home=gx_home, gx_timings_ms=gx_timings_ms)
     else:
         raise ValueError(f"unknown target {target!r} (want {'|'.join(TARGETS)})")
@@ -321,6 +356,10 @@ def subproc_env(cfg: _Subproc, *, runtime_dir: Path, mock_base_url: str,
                 config_path: Path, host_agent_socket: str | None = None,
                 unreachable_hosts: tuple[str, ...] = (),
                 roost_sockets: dict[str, object] | None = None,
+                ssh_bin: object | None = None,
+                roost_jail: bool = False,
+                roost_install_bin: object | None = None,
+                roost_session_bin: object | None = None,
                 gx_home: object | None = None,
                 gx_timings_ms: str | None = None) -> dict[str, str]:
     """The launch env for a subprocess UI — the single source of the subprocess
@@ -352,6 +391,11 @@ def subproc_env(cfg: _Subproc, *, runtime_dir: Path, mock_base_url: str,
     #    against a REAL roost-session daemon is an explicit harness opt-in via
     #    SHEDTEST_ROOST_SOCKETS (see conftest.py's `_app_session` fixture and
     #    `.claude/skills/shedtest-linux`), not env inheritance here.
+    #  * SSH_BIN — the fake `ssh` the roost transports exec (plan 019's
+    #    bootstrap seam). Load-bearing for the same reason GX_HOME is: an
+    #    inherited value would point a hermetic run's execs at a real binary.
+    #  * ROOST_JAIL — roost's `jail_fs_root`, so a cold-host cell cannot find
+    #    the developer's own /usr/bin/roost-session.
     #  * GX_HOME — points the gx lane's LOCAL credential reader at a fixture
     #    $GROK_HOME (a fake record + a 0600 token) instead of the developer's
     #    real ~/.grok. This is the one where the rule is load-bearing rather
@@ -370,6 +414,8 @@ def subproc_env(cfg: _Subproc, *, runtime_dir: Path, mock_base_url: str,
         "MOCK_UNREACHABLE_HOSTS": ",".join(unreachable_hosts) if unreachable_hosts else None,
         "ROOST_SOCKETS": (",".join(f"{n}={p}" for n, p in roost_sockets.items())
                           if roost_sockets else None),
+        "SSH_BIN": str(ssh_bin) if ssh_bin else None,
+        "ROOST_JAIL": "1" if roost_jail else None,
         "GX_HOME": str(gx_home) if gx_home else None,
         "GX_TIMINGS_MS": gx_timings_ms or None,
         "SOCKET": None,
@@ -380,6 +426,17 @@ def subproc_env(cfg: _Subproc, *, runtime_dir: Path, mock_base_url: str,
             env[key] = value
         else:
             env.pop(key, None)
+    # roost's OWN variable, under roost's own name (not `<PREFIX>_`), so it is
+    # spelled out here rather than in the table above. Same set-or-clear rule:
+    # an inherited value would silently give the NoSource cell a source.
+    for key, value in (
+        ("ROOST_SESSION_INSTALL_BIN", roost_install_bin),
+        ("ROOST_SESSION_BIN", roost_session_bin),
+    ):
+        if value:
+            env[key] = str(value)
+        else:
+            env.pop(key, None)
     return env
 
 
@@ -387,6 +444,10 @@ def _launch_subproc(target: str, *, mock_base_url: str, config_path: Path,
                     runtime_dir: Path, host_agent_socket: str | None = None,
                     unreachable_hosts: tuple[str, ...] = (),
                     roost_sockets: dict[str, object] | None = None,
+                    ssh_bin: object | None = None,
+                    roost_jail: bool = False,
+                    roost_install_bin: object | None = None,
+                    roost_session_bin: object | None = None,
                     gx_home: object | None = None,
                     gx_timings_ms: str | None = None) -> None:
     cfg = _SUBPROC[target]
@@ -398,6 +459,9 @@ def _launch_subproc(target: str, *, mock_base_url: str, config_path: Path,
                       config_path=config_path, host_agent_socket=host_agent_socket,
                       unreachable_hosts=unreachable_hosts,
                       roost_sockets=roost_sockets,
+                      ssh_bin=ssh_bin, roost_jail=roost_jail,
+                      roost_install_bin=roost_install_bin,
+                      roost_session_bin=roost_session_bin,
                       gx_home=gx_home, gx_timings_ms=gx_timings_ms)
     st = _state[target]
     st.env = env

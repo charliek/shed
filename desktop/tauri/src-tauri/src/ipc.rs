@@ -45,6 +45,14 @@ const MAX_FRAME_BYTES: usize = 1 << 20; // 1 MiB
 const REFRESH_WAIT: Duration = Duration::from_secs(10);
 /// Poll cadence while waiting for that frontend echo.
 const REFRESH_POLL: Duration = Duration::from_millis(15);
+/// The whole-op budget for `roost.bootstrap` (plan 019 §3.6).
+///
+/// Every remote step inside it is bounded by roost's own numbers (a 300-second
+/// stream, a 60-second start, …); this is the outer guarantee that a transport
+/// which wedges between them cannot hold an IPC connection open forever. Ten
+/// minutes is comfortably more than the sum of the steps on a slow link and far
+/// less than "until the app quits".
+const BOOTSTRAP_BUDGET: Duration = Duration::from_secs(600);
 
 /// Build an `(code, message)` error pair for the IPC error envelope.
 fn err(code: &str, message: impl Into<String>) -> (String, String) {
@@ -75,7 +83,7 @@ fn lane_err(failure: crate::lane::LaneFailure) -> (String, String) {
 /// a caller that asks anyway is told why instead of being handed a `tmux attach`
 /// for a session that has no tmux.
 fn machine_terminal_refusal() -> (String, String) {
-    err("not_enabled", crate::machines::NO_TERMINAL)
+    err("not_enabled", crate::roost_hosts::NO_TERMINAL)
 }
 
 /// The sheds listing payload — `{sheds, host_errors}` — the one shape every
@@ -100,12 +108,25 @@ fn machine_terminal_refusal() -> (String, String) {
 pub(crate) async fn rc_list_payload(
     backend: &Backend,
     rc_service: &RcService,
-    machines: &crate::machines::Machines,
+    machines: &crate::roost_hosts::RoostHosts,
     live: &crate::live_activity::LiveActivityLayer,
     host: Option<&str>,
     shed: Option<&str>,
 ) -> Value {
     let targets = backend.rc_targets(host, shed).await;
+    // **Every running shed is a roost host too** (plan 019 §3.6). This is the
+    // ADD-ONLY half of the reconcile: `targets` is narrowed by the caller's
+    // filter, so it can say "this shed is running" and never "that one stopped".
+    // The authoritative half — which removes a stopped shed's watcher — rides on
+    // the unfiltered `sheds.list`/`sheds.refresh`, which is the only caller that
+    // knows which SERVERS answered (see [`observe_reachability`]).
+    machines.observe_sheds(
+        &targets
+            .iter()
+            .map(|(s, target)| (target.server_name.clone(), s.name.clone()))
+            .collect::<Vec<_>>(),
+        &[],
+    );
     let sessions = rc_service.list(targets, host, shed).await;
     // The per-shed capabilities captured during the probe, keyed by `host/shed`,
     // let the launch form gate which kinds it offers (unknown/uninstalled agents
@@ -113,23 +134,26 @@ pub(crate) async fn rc_list_payload(
     // to claude+shell).
     let mut capabilities = rc_service.capabilities(host, shed);
 
-    // **Machine sessions join the SAME payload** (plan 012 R4). A separate op
-    // would force the UI to merge two async sources and reintroduce exactly the
-    // split the unified view exists to remove; the two reach paths already
-    // produce the same session type, so the only real difference is provenance,
-    // which each row carries as `origin`.
+    // **Roost sessions join the SAME payload** (plan 012 R4; extended to sheds by
+    // plan 019 §3.6). A separate op would force the UI to merge two async sources
+    // and reintroduce exactly the split the unified view exists to remove; the
+    // two reach paths already produce the same session type, so the only real
+    // difference is provenance, which each row carries as `origin` + `source`.
     //
-    // A host/shed filter is a SHED filter — it never narrows machines, because a
-    // machine belongs to no server. When one is given the caller is asking about
-    // a specific shed, so machines are omitted entirely.
-    // ONE lock acquisition for both halves — see `Machines::snapshot`: reading
+    // **The union rule.** A shed now has two row sets in one payload: the hub's
+    // (`<server>/<shed>`, `source: "hub"`) and roost's (`roost:<server>/<shed>`,
+    // `source: "roost"`), and both are returned — including under a filter. A
+    // filtered `rc.list {host, shed}` used to omit this snapshot ENTIRELY, which
+    // meant the one caller that knows exactly which shed it is asking about (the
+    // shed card) was the one caller that could not see that shed's roost rows.
+    // The filter is a SHED filter: it narrows sheds by server and name, and
+    // omits machines outright, because a machine belongs to no server.
+    //
+    // ONE lock acquisition for both halves — see `RoostHosts::snapshot`: reading
     // them separately can produce a frame where a row is `stale: false` while
-    // its machine is `reachable: false`.
-    let (machine_sessions, machine_status) = if host.is_none() && shed.is_none() {
-        machines.snapshot()
-    } else {
-        (Vec::new(), Vec::new())
-    };
+    // its host is `reachable: false`.
+    let (machine_sessions, machine_status) =
+        machines.snapshot(crate::roost_hosts::HostFilter { server: host, shed });
     // **Capabilities keyed by ORIGIN** (plan 013 §3.4). Shed capabilities are
     // keyed `host/shed`, and until this a machine row's origin — `machine:<name>`
     // — matched nothing in the map, so the UI had no data path from a row to the
@@ -139,13 +163,16 @@ pub(crate) async fn rc_list_payload(
     // Synthesized, never probed: roost has no `shed-ext-rc capabilities` to ask,
     // so the answer is the constant contract this client implements against it.
     // Stamped from the STATUS rows rather than a second read of the registry, so
-    // the keys can never disagree with the machines the same payload lists.
+    // the keys can never disagree with the hosts the same payload lists.
+    //
+    // A shed's two origins get DIFFERENT contracts, deliberately:
+    // `<server>/<shed>` stays the hub's (probed from the guest, with its own
+    // kinds and its own attach story) and `roost:<server>/<shed>` is roost's.
+    // One key per row set is what lets a card read the contract for the half a
+    // button belongs to rather than a merged answer true of neither.
     for m in &machine_status {
-        if let Some(name) = m.get("name").and_then(Value::as_str) {
-            capabilities.insert(
-                format!("machine:{name}"),
-                shed_app::roost::roost_capabilities(),
-            );
+        if let Some(origin) = m.get("origin").and_then(Value::as_str) {
+            capabilities.insert(origin.to_string(), shed_app::roost::roost_capabilities());
         }
     }
     // Shed rows are stamped with their origin too, so the UI has ONE rule for
@@ -160,6 +187,9 @@ pub(crate) async fn rc_list_payload(
             if let Some(obj) = row.as_object_mut() {
                 obj.insert("origin".into(), json!(format!("{}/{}", s.host, s.shed)));
                 obj.insert("origin_kind".into(), json!("shed"));
+                // The other half of the union stamp: this row was listed by the
+                // shed's own hub over ssh, not read from a roost-session.
+                obj.insert("source".into(), json!("hub"));
                 obj.insert("stale".into(), json!(false));
             }
             // The live overlay LAST, so the stream's view wins over the
@@ -180,6 +210,45 @@ pub(crate) async fn rc_list_payload(
 
 pub(crate) fn sheds_payload(r: &Reachability) -> Value {
     json!({ "sheds": r.sheds, "host_errors": r.host_errors })
+}
+
+/// Reconcile the roost-host layer's SHEDS against a full reachability refresh
+/// (plan 019 §3.6).
+///
+/// The authoritative half, and the only caller that can be: a
+/// [`Reachability`] carries every healthy host's sheds AND the per-host
+/// failures, so "this shed of an answering server is gone" is distinguishable
+/// from "that server never answered". Without that distinction a laptop
+/// changing networks would look exactly like every shed on it stopping, and
+/// every watcher would be torn down and rebuilt on the next refresh.
+///
+/// Called from each `backend.refresh()` site rather than inside `refresh`
+/// itself: `Backend` is `shed-app`'s and knows nothing about this app's host
+/// registry, and giving it a callback would be a layering inversion for three
+/// call sites.
+pub(crate) fn observe_reachability(hosts: &crate::roost_hosts::RoostHosts, r: &Reachability) {
+    use shed_core::models::ShedStatus;
+
+    let failed: std::collections::HashSet<&str> =
+        r.host_errors.iter().map(|e| e.server.as_str()).collect();
+    let running: Vec<(String, String)> = r
+        .sheds
+        .iter()
+        .filter(|s| s.status == ShedStatus::Running)
+        .map(|s| (s.host.clone(), s.name.clone()))
+        .collect();
+    // Every server that did NOT report a failure answered — including one that
+    // answered with no sheds at all, which is precisely the case a "servers seen
+    // in the shed list" rule would get wrong (it is indistinguishable from a
+    // failure, and a shed that stopped would keep its watcher forever).
+    let answered: Vec<String> = r
+        .sheds
+        .iter()
+        .map(|s| s.host.clone())
+        .chain(hosts.servers())
+        .filter(|server| !failed.contains(server.as_str()))
+        .collect();
+    hosts.observe_sheds(&running, &answered);
 }
 
 /// A required string param, or a `bad_request` error naming the missing key — the
@@ -349,7 +418,7 @@ pub struct Handler {
     /// (plus the implicit `localhost`), and the sessions each reports. Reached
     /// through that machine's own `roost-session` rather than a shed server's
     /// HTTP proxy — the second reach path the sessions view merges.
-    machines: Arc<crate::machines::Machines>,
+    machines: Arc<crate::roost_hosts::RoostHosts>,
     /// Live activity for SHED rows, folded from each host's `/api/rc/events`.
     /// Machine rows need no equivalent — roost reports the agent axes on every
     /// poll.
@@ -374,7 +443,7 @@ impl Handler {
         coordinator: Coordinator,
         rc_service: Arc<RcService>,
         prefs: SharedPrefs,
-        machines: Arc<crate::machines::Machines>,
+        machines: Arc<crate::roost_hosts::RoostHosts>,
         live: Arc<crate::live_activity::LiveActivityLayer>,
         lanes: Arc<crate::lane::Lanes>,
     ) -> Self {
@@ -483,7 +552,11 @@ impl Handler {
                 Ok(json!({}))
             }
             "app.screenshot" => self.screenshot().await,
-            "sheds.list" => Ok(sheds_payload(&self.backend.refresh().await)),
+            "sheds.list" => {
+                let reachability = self.backend.refresh().await;
+                observe_reachability(&self.machines, &reachability);
+                Ok(sheds_payload(&reachability))
+            }
             "sheds.refresh" => self.sheds_refresh().await,
             "dashboard.dump" => {
                 let reported = self.reported_sheds_payload();
@@ -515,9 +588,17 @@ impl Handler {
             "machines.dump" => Ok(self.machines_dump()),
             "sidebar.dump" => Ok(self.sidebar_dump()),
             "machine.kill" => self.machine_kill(params).await,
-            "machine.launch" => self.machine_launch(params).await,
+            // `machine.launch` is `roost.launch` addressed by a bare machine
+            // name — kept as an alias (plan 019 §3.6) because the dialog, the
+            // frontend bridge and every existing cell send it, and a rename with
+            // no new behaviour behind it would be churn.
+            "machine.launch" | "roost.launch" => self.roost_launch(params).await,
             "machine.capabilities" => self.machine_capabilities(params),
             "machine.add" => self.machine_add(params),
+            // -- roost hosts: probe, preview, bootstrap (plan 019 §3.6) --
+            "roost.probe" => self.roost_probe(params).await,
+            "roost.preview" => self.roost_preview(params).await,
+            "roost.bootstrap" => self.roost_bootstrap(params).await,
             // -- agent lanes (plan 015 §3.4) --
             "lane.open" => self.lane_open(params).await,
             "lane.messages" => self.lane_messages(params),
@@ -760,7 +841,9 @@ impl Handler {
         let has_frontend = self.ui.lock().ok().is_some_and(|s| s.has("main"));
         let _ = self.app.emit("refresh", json!({ "token": token }));
         if !has_frontend {
-            return Ok(sheds_payload(&self.backend.refresh().await));
+            let reachability = self.backend.refresh().await;
+            observe_reachability(&self.machines, &reachability);
+            return Ok(sheds_payload(&reachability));
         }
         let deadline = Instant::now() + REFRESH_WAIT;
         loop {
@@ -1000,20 +1083,31 @@ impl Handler {
         Ok(json!({}))
     }
 
-    /// `machine.launch {machine, kind, display_name?, workdir?, permission_mode?,
-    /// initial_prompt?}` → the opened row. The machine counterpart of
-    /// [`Self::rc_launch`], addressed by machine name over that machine's own
-    /// roost reach rather than by `(host, shed)` through a server.
+    /// `roost.launch {target, kind, workdir?, …}` → the opened row: a roost
+    /// `tab.open` running the kind's agent on that host (plan 019 §3.6).
+    ///
+    /// Addressed by the target grammar — `machine:<name>` or
+    /// `roost:<server>/<shed>` — which is what generalizes it from machines to
+    /// sheds. `machine.launch {machine, …}` is the same op under its old name
+    /// and its old parameter, kept as an alias.
+    ///
+    /// **`rc.launch {shed}` is NOT re-pointed at this** (plan 019 §3.6): a shed
+    /// launch stays hub/tmux until S6, so the two ops are two different things
+    /// happening on one shed, and a card picks between them off the row's
+    /// `source`.
     ///
     /// The full param set is still accepted; only `kind` and `workdir` reach
-    /// roost in M1 (see [`crate::machines::Machines::launch`]).
-    async fn machine_launch(&self, params: &Value) -> Result<Value, (String, String)> {
-        let machine = req_str(params, "machine")?.to_string();
+    /// roost in M1 (see [`crate::roost_hosts::RoostHosts::launch`]).
+    async fn roost_launch(&self, params: &Value) -> Result<Value, (String, String)> {
+        let target = match params.get("target").and_then(Value::as_str) {
+            Some(target) => target.to_string(),
+            None => req_str(params, "machine")?.to_string(),
+        };
         let kind = rc_kind(params)?;
         let opt = |k: &str| params.get(k).and_then(Value::as_str);
         self.machines
             .launch(
-                &machine,
+                &target,
                 &kind,
                 opt("display_name"),
                 opt("workdir"),
@@ -1022,6 +1116,75 @@ impl Handler {
             )
             .await
             .map_err(|e| err("action_failed", e))
+    }
+
+    /// `roost.probe {target}` → what is on that host, and whether anything is
+    /// serving. Read-only: it writes nothing and is safe to run before consent.
+    async fn roost_probe(&self, params: &Value) -> Result<Value, (String, String)> {
+        let target = req_str(params, "target")?.to_string();
+        self.machines
+            .probe(&target)
+            .await
+            .map_err(|failure| err(failure.stage.as_str(), failure.message))
+    }
+
+    /// `roost.preview {target}` → the probe, the plan matrix row, and the
+    /// sentence naming where the bytes would come from — the consent card's
+    /// content.
+    ///
+    /// Nothing is resolved or fetched (plan 019 §3.5).
+    async fn roost_preview(&self, params: &Value) -> Result<Value, (String, String)> {
+        let target = req_str(params, "target")?.to_string();
+        self.machines
+            .preview(&target)
+            .await
+            .map_err(|failure| err(failure.stage.as_str(), failure.message))
+    }
+
+    /// `roost.bootstrap {target, fingerprint, consent}` → install/update/start a
+    /// `roost-session` on that host and wire its agent hooks.
+    ///
+    /// ## Two different refusals, answered two different ways
+    ///
+    /// **No `consent: true`** is a CALLER bug — the client is supposed to have
+    /// shown the card — so it is an error envelope (`consent_required`) and the
+    /// host is never touched, not even probed.
+    ///
+    /// **A stale fingerprint** is a fact about the HOST: it changed between the
+    /// card and the click. That is an `ok` envelope carrying `ok: false` and
+    /// `error.stage = "fingerprint"`, like every other stage failure, because
+    /// the stage is what tells a user whether anything was written and what to
+    /// do next — and flattening "the host moved" and "the commit failed after
+    /// the backup was discarded" into one error string would lose exactly that.
+    ///
+    /// The 10-minute budget is the op's, not a step's: the machines bound each
+    /// remote step themselves (roost's own numbers), and this is the outer
+    /// guarantee that a wedged transport cannot hold the socket open forever.
+    async fn roost_bootstrap(&self, params: &Value) -> Result<Value, (String, String)> {
+        let target = req_str(params, "target")?.to_string();
+        let fingerprint = req_str(params, "fingerprint")?.to_string();
+        let consent = params
+            .get("consent")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let run = self.machines.bootstrap(&target, &fingerprint, consent);
+        let outcome = match tokio::time::timeout(BOOTSTRAP_BUDGET, run).await {
+            Ok(outcome) => outcome,
+            Err(_) => {
+                return Err(err(
+                    "action_failed",
+                    format!(
+                        "{target}: the bootstrap did not finish within {} minutes",
+                        BOOTSTRAP_BUDGET.as_secs() / 60
+                    ),
+                ))
+            }
+        };
+        match outcome {
+            Ok(Ok(installed)) => Ok(crate::roost_hosts::installed_json(&installed)),
+            Ok(Err(failure)) => Ok(crate::roost_hosts::failure_json(&failure)),
+            Err(message) => Err(err("consent_required", message)),
+        }
     }
 
     /// `machine.capabilities {machine}` → `{capabilities}` — what a create form
@@ -1958,6 +2121,8 @@ mod tests {
             mock_base_url: mock.map(str::to_string),
             mock_unreachable_hosts: std::collections::HashSet::new(),
             roost_sockets: std::collections::HashMap::new(),
+            ssh_bin: None,
+            roost_jail_fs_root: false,
             gx_home: PathBuf::new(),
             gx_timings: shed_gx::GxTimings::default(),
             config_path: PathBuf::new(),

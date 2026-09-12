@@ -52,6 +52,42 @@ pub struct Env {
     /// Parsed only in test mode, like [`Self::mock_unreachable_hosts`] — a stray
     /// env var must never redirect a real machine's session in production.
     pub roost_sockets: HashMap<String, PathBuf>,
+    /// TEST-ONLY `ssh` override: `SHED_TAURI_SSH_BIN`, the binary every roost
+    /// transport execs instead of `ssh` (plan 019 §3.6).
+    ///
+    /// [`Self::roost_sockets`] swaps the transport out entirely, which is
+    /// perfect for reading a session that is already there and useless for the
+    /// bootstrap, whose whole subject is a host with NO session: the probe's
+    /// answer comes from `ssh` exit codes and stderr, and its install runs
+    /// roost's scripts through a remote `/bin/sh -s`. So a bootstrap cell keeps
+    /// the REAL `SshBridge` and `SshExec` — roost's own classification, roost's
+    /// own scripts, this app's own argv — and points them at a fake `ssh` that
+    /// runs the far side locally under a throwaway `$HOME`.
+    ///
+    /// Test mode only, like every seam in this file — **and, unlike every other
+    /// seam in this file, dead in a release build whatever the mode says**. See
+    /// [`exec_seam`]: a stray `SHED_TAURI_SSH_BIN` in a developer's shell must
+    /// never decide which binary a shipped app execs to reach somebody's
+    /// machine, and `SHED_TAURI_TEST_MODE=1` is one more thing a shell can
+    /// export.
+    pub ssh_bin: Option<PathBuf>,
+    /// TEST-ONLY: roost's `jail_fs_root` for the bootstrap machines
+    /// (`SHED_TAURI_ROOST_JAIL=1`). **`false` in production**, always.
+    ///
+    /// roost's own bootstrap builders take this bool, and the delta it makes is
+    /// exactly one thing: the candidate ladder's ABSOLUTE rungs
+    /// (`/usr/bin/roost-session`, the linuxbrew and nix paths) gain a
+    /// `${ROOST_BOOTSTRAP_FS_ROOT}` prefix the FAR SIDE expands. That is what
+    /// lets a hermetic cell about a cold host be about a cold host: without it,
+    /// a developer's own `/usr/bin/roost-session` — protocol 2 on this machine,
+    /// absent in CI's container — answers the probe, and the same cell reads
+    /// `Mismatch` here and `Missing` there.
+    ///
+    /// It steers which binary the far side execs, so it is gated exactly as
+    /// [`shed_app::roost::SshBridgeOptions`] describes for `ROOST_TEST_MODE`:
+    /// never read outside test mode — and never read in a release build either,
+    /// for the reason on [`exec_seam`].
+    pub roost_jail_fs_root: bool,
     /// **The** directory the gx lane's LOCAL credential reader looks in for its
     /// discovery record and token — already resolved, so the lane layer makes no
     /// decision about it and reads no environment of its own.
@@ -165,11 +201,32 @@ impl Env {
         } else {
             shed_gx::GxTimings::default()
         };
+        // Both are test-mode-only AND debug-build-only for the reason on
+        // [`exec_seam`]: each decides which binary the app (or the far side)
+        // execs. The gates are [`exec_seam`] / [`jail_flag`], which is where
+        // they are tested; the refusal lines they hand back are printed here,
+        // because this is the one place that knows a process is starting.
+        let (ssh_bin, ssh_refusal) = exec_seam(
+            test_mode,
+            RELEASE_BUILD,
+            "SHED_TAURI_SSH_BIN",
+            var("SHED_TAURI_SSH_BIN"),
+        );
+        let (roost_jail_fs_root, jail_refusal) = jail_flag(
+            test_mode,
+            RELEASE_BUILD,
+            var("SHED_TAURI_ROOST_JAIL").as_deref(),
+        );
+        for refusal in [ssh_refusal, jail_refusal].into_iter().flatten() {
+            eprintln!("{refusal}");
+        }
         Self {
             test_mode,
             mock_base_url: var("SHED_TAURI_MOCK_BASE_URL"),
             mock_unreachable_hosts,
             roost_sockets,
+            ssh_bin: ssh_bin.map(PathBuf::from),
+            roost_jail_fs_root,
             gx_home,
             gx_timings,
             config_path,
@@ -184,6 +241,96 @@ impl Env {
                 .unwrap_or_else(default_extensions_path),
         }
     }
+}
+
+impl Env {
+    /// The transport choices the roost-host layer makes, bundled — see
+    /// [`crate::machines::ReachOptions`].
+    ///
+    /// Built here rather than read there so this file stays the ONE place the
+    /// process environment is consulted, which is what makes the test-mode gates
+    /// above a property of the type rather than a convention.
+    pub fn reach_options(&self) -> crate::machines::ReachOptions {
+        crate::machines::ReachOptions {
+            roost_sockets: self.roost_sockets.clone(),
+            ssh_bin: self.ssh_bin.clone(),
+            test_mode: self.test_mode,
+        }
+    }
+}
+
+/// A knob that exists only in test mode.
+///
+/// A pure function rather than an inline `if` for the reason [`gx_homes`] gives:
+/// "a stray variable in a developer's shell must never steer a shipped app" is a
+/// promise, and a promise is worth a test. This one carries the two plan-019
+/// seams, both of which decide **which binary gets exec'd** —
+/// [`Env::ssh_bin`] locally and [`Env::roost_jail_fs_root`] on the far side.
+fn test_only<T>(test_mode: bool, value: Option<T>) -> Option<T> {
+    if test_mode {
+        value
+    } else {
+        None
+    }
+}
+
+/// **Is this a release build?** — the second gate's input, resolved once here so
+/// [`exec_seam`] can take it as an argument and therefore be tested on BOTH
+/// sides of it (`cfg!` is a compile-time constant, and a `cargo test` build is
+/// always the debug side of it).
+const RELEASE_BUILD: bool = !cfg!(debug_assertions);
+
+/// A test seam that chooses **which program gets executed**, gated twice: test
+/// mode ([`test_only`], plan 019 §3.6's pin) *and* a debug build.
+///
+/// The second gate is the point. `SHED_TAURI_TEST_MODE` is a pure runtime check,
+/// so without it `SHED_TAURI_TEST_MODE=1 SHED_TAURI_SSH_BIN=/somewhere/ssh` on
+/// the SHIPPED app is enough to make it exec `/somewhere/ssh` — a variable in an
+/// environment deciding which binary runs with the user's ssh keys and the
+/// user's `roost-session` install behind it. In a release build both seams are
+/// therefore dead **whatever the mode says**, and the refusal is announced
+/// rather than silent: a harness that somehow ran against a release binary must
+/// read as a loud misconfiguration, not as a mysteriously real `ssh`.
+///
+/// **Only these two.** The other seams in this file — `SHED_TAURI_MOCK_BASE_URL`,
+/// `SHED_TAURI_ROOST_SOCKETS`, `SHED_TAURI_SHED_CONFIG`, `SHED_TAURI_GX_HOME` —
+/// redirect an HTTP base, a socket path or a config path: the worst they do is
+/// point this process's own reads somewhere unhelpful. These two pick an
+/// executable (locally, and on the far side of an ssh), which is the difference
+/// that earns the stricter gate. Strictly stricter than §3.6's "only under
+/// `SHED_TAURI_TEST_MODE`", so the pin still holds.
+///
+/// Returns the value and, when one was refused, the line to print. Pure, so the
+/// gate AND its message are both testable; the printing lives at the one call
+/// site in [`Env::from_process`].
+fn exec_seam<T>(
+    test_mode: bool,
+    release_build: bool,
+    name: &str,
+    value: Option<T>,
+) -> (Option<T>, Option<String>) {
+    if release_build {
+        // Announced whenever the variable is SET, test mode or not: what the user
+        // needs told is "I saw this and ignored it", and which one.
+        let refusal = value.is_some().then(|| {
+            format!(
+                "shed-desktop-tauri: ignoring {name} — a release build never lets \
+                 an environment variable choose which program it execs"
+            )
+        });
+        return (None, refusal);
+    }
+    (test_only(test_mode, value), None)
+}
+
+/// [`Env::roost_jail_fs_root`]: `1` in test mode, in a debug build, and nothing
+/// else, ever.
+///
+/// Strictly `"1"` rather than "any non-empty value", so the variable cannot be
+/// turned on by a shell that exports it as `0` or `false` to mean off.
+fn jail_flag(test_mode: bool, release_build: bool, raw: Option<&str>) -> (bool, Option<String>) {
+    let (value, refusal) = exec_seam(test_mode, release_build, "SHED_TAURI_ROOST_JAIL", raw);
+    (value == Some("1"), refusal)
 }
 
 /// Which of the two `$GROK_HOME` overrides survives, given the mode.
@@ -354,6 +501,121 @@ mod tests {
 
         let (gx, grok) = gx_homes(false, None, None);
         assert_eq!((gx, grok), (None, None), "neither set: ~/.grok");
+    }
+
+    /// **Neither plan-019 seam exists outside test mode** — and each of them
+    /// decides which binary something execs, which is why they are gated at all
+    /// (the fake `ssh` locally, and roost's jailed candidate ladder on the far
+    /// side). A developer with either exported must get a shipped app that
+    /// ignores both.
+    #[test]
+    fn the_bootstrap_seams_are_test_mode_only() {
+        const DEBUG: bool = false; // the build the harness drives
+
+        assert_eq!(
+            test_only(true, Some("/fake/ssh")),
+            Some("/fake/ssh"),
+            "a harness run honours the fake ssh"
+        );
+        assert_eq!(
+            test_only(false, Some("/fake/ssh")),
+            None,
+            "a shipped app execs `ssh`, whatever the shell says"
+        );
+        assert_eq!(test_only::<&str>(true, None), None);
+
+        assert_eq!(
+            exec_seam(true, DEBUG, "SHED_TAURI_SSH_BIN", Some("/fake/ssh")),
+            (Some("/fake/ssh"), None),
+            "a harness run honours the fake ssh"
+        );
+        assert_eq!(
+            exec_seam(false, DEBUG, "SHED_TAURI_SSH_BIN", Some("/fake/ssh")),
+            (None, None),
+            "outside test mode a debug build execs `ssh`, silently"
+        );
+
+        assert_eq!(jail_flag(true, DEBUG, Some("1")), (true, None));
+        assert_eq!(
+            jail_flag(false, DEBUG, Some("1")),
+            (false, None),
+            "not outside test mode"
+        );
+        assert_eq!(jail_flag(true, DEBUG, None), (false, None));
+        for off in ["0", "false", "", "yes", "true"] {
+            assert_eq!(
+                jail_flag(true, DEBUG, Some(off)),
+                (false, None),
+                "{off:?} is not how the jail is turned on"
+            );
+        }
+    }
+
+    /// **A RELEASE build ignores both exec-choosing seams even in test mode, and
+    /// says so.**
+    ///
+    /// The gate above is a runtime check over a variable, and
+    /// `SHED_TAURI_TEST_MODE=1` is one more variable a shell can export — so on
+    /// its own it leaves `SHED_TAURI_TEST_MODE=1 SHED_TAURI_SSH_BIN=…` able to
+    /// tell the SHIPPED app which binary to exec on the way to somebody's
+    /// machine. [`exec_seam`]'s second gate is what closes that, and it is
+    /// asserted here on both sides of `release_build` because `cfg!` is fixed at
+    /// compile time and a `cargo test` build is always the debug side of it.
+    ///
+    /// Both legs of the harness drive a DEBUG binary
+    /// (`tauri/src-tauri/target/debug/shed-desktop-tauri`, and
+    /// `SHED_TAURI_BIN=/target/debug/…` in the Docker render gate), so this gate
+    /// is invisible to it.
+    #[test]
+    fn a_release_build_ignores_the_exec_seams_whatever_the_mode_says() {
+        const RELEASE: bool = true;
+
+        for test_mode in [true, false] {
+            let (value, refusal) =
+                exec_seam(test_mode, RELEASE, "SHED_TAURI_SSH_BIN", Some("/fake/ssh"));
+            assert_eq!(
+                value, None,
+                "a release build execs `ssh` even with test mode on"
+            );
+            let refusal = refusal.expect("the refusal is announced, not silent");
+            assert!(
+                refusal.contains("SHED_TAURI_SSH_BIN"),
+                "the line names the variable it ignored: {refusal:?}"
+            );
+
+            let (jailed, refusal) = jail_flag(test_mode, RELEASE, Some("1"));
+            assert!(!jailed, "and the jail is never on in a release build");
+            let refusal = refusal.expect("the refusal is announced, not silent");
+            assert!(
+                refusal.contains("SHED_TAURI_ROOST_JAIL"),
+                "the line names the variable it ignored: {refusal:?}"
+            );
+        }
+
+        // Nothing set, nothing said: the line is about a variable that was SEEN.
+        assert_eq!(
+            exec_seam::<&str>(true, RELEASE, "SHED_TAURI_SSH_BIN", None),
+            (None, None)
+        );
+        assert_eq!(jail_flag(true, RELEASE, None), (false, None));
+    }
+
+    /// **With the gate wired exactly as [`Env::from_process`] wires it, a harness
+    /// run still gets its fake `ssh`.**
+    ///
+    /// The two tests above pass `release_build` by hand, which proves the gate
+    /// and proves nothing about the constant the app feeds it. This one uses
+    /// [`RELEASE_BUILD`] itself: a `cargo test` build is a debug build, so the
+    /// seam must survive — a constant that went the other way would make every
+    /// hermetic bootstrap cell silently exec the real `ssh`.
+    #[test]
+    fn a_test_build_is_the_debug_side_of_the_release_gate() {
+        assert_eq!(
+            exec_seam(true, RELEASE_BUILD, "SHED_TAURI_SSH_BIN", Some("/fake/ssh")),
+            (Some("/fake/ssh"), None),
+            "a test build honours the seam the harness sets"
+        );
+        assert_eq!(jail_flag(true, RELEASE_BUILD, Some("1")), (true, None));
     }
 
     /// The gx window knob parses what it names and drops everything else, so a

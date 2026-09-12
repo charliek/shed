@@ -15,6 +15,7 @@ mod lane;
 mod live_activity;
 mod machines;
 mod prefs;
+mod roost_hosts;
 mod screenshot;
 mod single_instance;
 mod state;
@@ -83,8 +84,16 @@ fn ui_report(
 /// dropped (plan 006 D6 / shed#300). Same payload the harness reads via the
 /// `sheds.list` IPC op — [`ipc::sheds_payload`] is the single shaper.
 #[tauri::command]
-async fn list_sheds(backend: tauri::State<'_, Arc<Backend>>) -> Result<serde_json::Value, String> {
-    Ok(ipc::sheds_payload(&backend.refresh().await))
+async fn list_sheds(
+    backend: tauri::State<'_, Arc<Backend>>,
+    machines: tauri::State<'_, Arc<roost_hosts::RoostHosts>>,
+) -> Result<serde_json::Value, String> {
+    let reachability = backend.refresh().await;
+    // The frontend's own refresh is an authoritative shed listing too — it is
+    // the one the dashboard runs on a timer, so a shed that stops while nobody
+    // is driving the socket still loses its roost watcher (plan 019 §3.6).
+    ipc::observe_reachability(&machines, &reachability);
+    Ok(ipc::sheds_payload(&reachability))
 }
 
 /// The configured hosts a create can target (the New-Shed dialog's picker) — even
@@ -237,7 +246,7 @@ fn open_terminal(
     // refusal is true in every mode, and "use terminal.preview instead" would
     // point at an op that refuses this for the same reason.
     if machine.is_some() {
-        return Err(machines::NO_TERMINAL.to_string());
+        return Err(roost_hosts::NO_TERMINAL.to_string());
     }
     if env.test_mode {
         return Err("terminal.open is disabled in test mode (use terminal.preview)".to_string());
@@ -258,7 +267,7 @@ fn open_terminal(
 async fn rc_list(
     backend: tauri::State<'_, Arc<Backend>>,
     rc: tauri::State<'_, Arc<RcService>>,
-    machines: tauri::State<'_, Arc<machines::Machines>>,
+    machines: tauri::State<'_, Arc<roost_hosts::RoostHosts>>,
     live: tauri::State<'_, Arc<live_activity::LiveActivityLayer>>,
     host: Option<String>,
     shed: Option<String>,
@@ -316,7 +325,7 @@ async fn rc_kill(
 /// `lib/bridge.ts`.
 #[tauri::command]
 async fn machine_kill(
-    machines: tauri::State<'_, Arc<machines::Machines>>,
+    machines: tauri::State<'_, Arc<roost_hosts::RoostHosts>>,
     machine: String,
     slug: String,
 ) -> Result<(), String> {
@@ -329,7 +338,7 @@ async fn machine_kill(
 /// it answers instantly and for a machine that is currently asleep.
 #[tauri::command]
 fn machine_capabilities(
-    machines: tauri::State<'_, Arc<machines::Machines>>,
+    machines: tauri::State<'_, Arc<roost_hosts::RoostHosts>>,
     machine: String,
 ) -> Result<serde_json::Value, String> {
     Ok(serde_json::json!({
@@ -343,7 +352,7 @@ fn machine_capabilities(
 #[tauri::command]
 #[allow(clippy::too_many_arguments)]
 async fn machine_launch(
-    machines: tauri::State<'_, Arc<machines::Machines>>,
+    machines: tauri::State<'_, Arc<roost_hosts::RoostHosts>>,
     machine: String,
     kind: RcKind,
     display_name: Option<String>,
@@ -478,7 +487,7 @@ fn lane_close(
 /// `add_machine` — the dialog's path into [`machines::add_from_json`].
 #[tauri::command]
 fn add_machine(
-    machines: tauri::State<'_, Arc<machines::Machines>>,
+    machines: tauri::State<'_, Arc<roost_hosts::RoostHosts>>,
     env: tauri::State<'_, Env>,
     machine: serde_json::Value,
 ) -> Result<(), String> {
@@ -489,7 +498,7 @@ fn add_machine(
 /// rows. A machine with no sessions and no reachability still gets a row; that
 /// row IS the information.
 #[tauri::command]
-fn machines_list(machines: tauri::State<'_, Arc<machines::Machines>>) -> serde_json::Value {
+fn machines_list(machines: tauri::State<'_, Arc<roost_hosts::RoostHosts>>) -> serde_json::Value {
     serde_json::json!({ "machines": machines.status() })
 }
 
@@ -1249,29 +1258,34 @@ pub fn run() {
             });
             app.manage(Arc::new(rc_hub));
 
-            // Machine targets (plan 013 S3): one roost watcher per `machines:`
-            // entry, plus the implicit `localhost` host. Started here rather than
-            // lazily so a machine's rows are already live when the Agents pane
-            // first renders — and so an unreachable machine has had a chance to
-            // say WHY by then.
+            // Roost hosts (plan 013 S3 for machines; plan 019 §3.6 for sheds):
+            // one roost watcher per `machines:` entry, plus the implicit
+            // `localhost` host. Started here rather than lazily so a machine's
+            // rows are already live when the Agents pane first renders — and so
+            // an unreachable machine has had a chance to say WHY by then.
+            //
+            // SHEDS are not started here: they are probed as the app learns
+            // which ones are running (`RoostHosts::observe_sheds`, driven from
+            // the listing ops) and watched only once a session answers on one.
             //
             // Reads the same config the Backend does. With no `machines:`
             // section only the local session is watched, which costs nothing on
             // an install that runs none.
             let machine_config_path = env.config_path.to_string_lossy().into_owned();
-            // A machine coming up (or dropping) is asynchronous — nothing the UI
+            // A host coming up (or dropping) is asynchronous — nothing the UI
             // is already watching changes — so the layer pushes the SAME
             // `refresh` event the lifecycle path uses, and the frontend's
             // existing listener re-reads. Without this a machine that connects a
             // second after mount stays invisible until a manual Refresh.
             let refresh_handle = app.handle().clone();
-            let on_machine_change: machines::OnChange = Arc::new(move || {
+            let on_machine_change: roost_hosts::OnChange = Arc::new(move || {
                 let _ = refresh_handle.emit("refresh", serde_json::json!({}));
             });
-            let machines = Arc::new(machines::Machines::start(
+            let machines = Arc::new(roost_hosts::RoostHosts::start(
                 &tauri::async_runtime::handle().inner().clone(),
                 &shed_core::config::ShedConfig::load(&machine_config_path),
-                &env.roost_sockets,
+                env.reach_options(),
+                env.roost_jail_fs_root,
                 on_machine_change,
             ));
             app.manage(machines.clone());
@@ -1455,6 +1469,20 @@ pub fn run() {
             tauri::RunEvent::ExitRequested { code: Some(_), .. } => {
                 if let Some(rt) = app_handle.try_state::<broker::BrokerRuntime>() {
                     rt.signal_shutdown();
+                }
+                // Ask every bootstrap `ssh` ControlMaster to exit and take its
+                // scratch directory with it (plan 019 §3.6). `SshExec::Drop` does
+                // the same thing blockingly, but a process that is exiting does
+                // not reliably run drops — and a `ControlPersist` master
+                // outliving the app that opened it holds a live connection to
+                // somebody's shed with nothing left to close it.
+                //
+                // Blocking, and bounded: this is the one moment where waiting is
+                // both possible and correct, and `-O exit` against a local
+                // control socket is a round trip to a process on this machine.
+                if let Some(hosts) = app_handle.try_state::<Arc<roost_hosts::RoostHosts>>() {
+                    let hosts = Arc::clone(&hosts);
+                    tauri::async_runtime::block_on(async move { hosts.shutdown().await });
                 }
             }
             _ => {}

@@ -1,64 +1,31 @@
-//! **Machine targets in the desktop app** — read from `roost-session`s
-//! (plan 013 S3, the Roost Pivot's first milestone; originally plan 012 S4).
+//! **The `machines:` section** — reading it, writing to it, and turning one
+//! entry into a way of reaching that host's `roost-session`.
 //!
-//! `machines:` has lived in `shed-core`'s config since plan 009. Until plan 013
-//! this module read each machine's **RC hub** over an `ssh -N -L` forward; it now
-//! reads the machine's **`roost-session`** directly, because that is the
-//! substrate the pivot is moving to. The reach itself lives in the shared layer:
+//! Everything about the *registry* — which hosts exist, one watcher each, the
+//! rows they report, the bootstrap — lives in [`crate::roost_hosts`], which
+//! covers sheds as well (plan 019 §3.6). What is left here is the half that is
+//! genuinely about `machines:` and nothing else:
 //!
-//! * the roost wire (`session.identify`, `tab.list`, `tab.open/close`) →
-//!   [`shed_core::roost`]
-//! * the transport seam + the observer watcher → [`shed_app::roost`]
+//! * [`add_from_json`] — the Add dialog's and `machine.add`'s shared path into
+//!   the user's `~/.shed/config.yaml`, which this app is a guest in;
+//! * [`build_ssh_reach`] / [`build_local_reach`] — a [`MachineEntry`] to a
+//!   [`RoostReach`], including the test-mode substitutions.
 //!
-//! What is left here is what a desktop app actually owns: which machines exist,
-//! one watcher per machine, the last inventory each one reported, and whether it
-//! is currently reachable.
-//!
-//! ## Unreachable is a STATE, not an error
-//!
-//! A machine that is asleep, off the network, or simply runs no `roost-session`
-//! is the normal case, not a failure. Every configured machine therefore always
-//! has a row; `reachable` and `detail` say how much to trust it. Nothing here
-//! returns an error to the UI for a machine being down.
-//!
-//! ## The implicit `localhost` host
-//!
-//! The one machine a user always has is the one they are sitting at, and it needs
-//! no config entry: when nothing in `machines:` is named `localhost`, this module
-//! registers a [`LocalSession`] reach under that name. It follows roost's
-//! connect-if-present rule in both directions — **a `localhost` whose socket has
-//! never existed in this process is not listed at all** ([`MachineState::listed`]),
-//! because a host that has never run a session is not a thing the user asked
-//! about. Once one has answered, the host stays listed and a later disappearance
-//! is an ordinary unreachable row with the reason, exactly like a configured
-//! machine that went to sleep.
-//!
-//! A configured entry named `localhost` WINS (the user said what they meant), and
-//! [`Machines::add`] refuses the name so the two can never both exist.
-//!
-//! ## One overlay per feed
-//!
-//! Sessions are held per machine and never merged into a shared activity overlay.
-//! Roost reports no shed (there is none), so `(shed, slug)` — the key
-//! [`shed_core::rc_events::ActivityOverlay`] uses — would collide across two
-//! machines whose tab ids happen to match. Rows are keyed by ORIGIN + slug here
-//! instead.
+//! A **shed**'s roost host arrives through the same door: plan 019 §3.6 pins its
+//! identity as a synthesized [`MachineEntry`]
+//! ([`shed_app::roost::shed_reach_entry`]), so the transport choice below is
+//! made once for both kinds of host rather than twice with a chance to differ.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex};
 
-use serde_json::{json, Value};
+use serde_json::Value;
 
-use roost_ipc::agent::Ownership;
-use roost_ipc::messages::{Tab, TabOpenParams};
-use shed_app::roost::{
-    launch_argv, roost_capabilities, tab_close, tab_open, LocalSession, RoostReach, RoostUpdate,
-    RoostWatcher, SshBridge, SshBridgeOptions, UnreachableReach,
-};
+use shed_app::roost::{LocalSession, RoostReach, SshBridge, SshBridgeOptions, UnreachableReach};
 use shed_core::config::{MachineEntry, ShedConfig};
-use shed_core::rc::RcKind;
-use shed_core::roost::{AgentLaneStamp, RoostSession};
+
+use crate::roost_hosts::{lock, RoostHosts};
 
 /// The name the machine the app is running on is always known by — never a
 /// configured entry's name unless the user wrote one, and never an ssh target.
@@ -70,123 +37,15 @@ use shed_core::roost::{AgentLaneStamp, RoostSession};
 /// configured machine literally named `localhost` is an [`SshBridge`] like any
 /// other, and [`shed_app::roost`] spells its target `ssh://localhost` precisely so
 /// the sentinel is not hit.
-const LOCALHOST: &str = "localhost";
+pub const LOCALHOST: &str = "localhost";
 
-/// Why a machine row offers no terminal, in the words BOTH doors answer with —
-/// the `terminal.open`/`terminal.preview` IPC ops and the `open_terminal` Tauri
-/// command (plan 013 S3). One string because it is one rule: two copies would
-/// drift and only one of them would be under the harness's eye.
-pub const NO_TERMINAL: &str = "terminal unavailable: attach is native-remote";
-
-/// Take a lock, ignoring poisoning.
-///
-/// Every mutex here guards plain data (a name list, a row cache) that a panicking
-/// holder cannot leave half-updated in a way the next reader would misread. The
-/// alternative — unwrapping — turns one unrelated panic into a permanently dead
-/// machine layer, which is strictly worse than reading a slightly stale row.
-fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
-    m.lock().unwrap_or_else(|e| e.into_inner())
-}
-
-/// Called whenever a machine's state changes, so the embedder can tell its UI
-/// to re-read. Without it the app would only ever show the state it happened to
-/// fetch at mount: a machine that comes up (or drops) later changes nothing the
-/// frontend is watching, and the rows sit stale until a manual Refresh.
-pub type OnChange = Arc<dyn Fn() + Send + Sync>;
-
-/// Called with one machine's CURRENT set of agent lanes (`session_id` →
-/// [`AgentLaneStamp`]) every time a fresh roost snapshot replaces its row set.
-///
-/// This is the eviction signal for [`crate::lane::Lanes`] (plan 015 §3.4: an
-/// entry is dropped "when the tab disappears from the roost snapshot, or when a
-/// row's `server_url` changes"). It hangs off a SNAPSHOT and not off a `Down`
-/// on purpose: a snapshot is authoritative and replaces the row set outright, so
-/// "absent from this map" genuinely means the tab is gone, whereas a `Down` is a
-/// machine that went quiet with its last rows still on screen.
-///
-/// **A tab that dies before any adapter claims it reaches here too.** roost
-/// publishes a snapshot when a tab the inventory knew about stops existing, even
-/// if nothing else about it changed (plan 014's ghost-row fix) — without that,
-/// a launched process that died young would leave a lane entry, and its `ssh -N`
-/// child, behind a row nobody can see.
-pub type OnLanes = Arc<dyn Fn(&str, &BTreeMap<String, AgentLaneStamp>) + Send + Sync>;
-
-/// One machine's live view, as the UI reads it.
-struct MachineState {
-    /// The last inventory the session reported — agent-owned tabs only
-    /// ([`shed_core::roost::RoostInventory`] filters plain shells out; a user
-    /// with fifteen terminals must not get fifteen cards).
-    ///
-    /// Retained across a disconnect on purpose: the UI keeps rendering the last
-    /// known sessions (dimmed, with a reason) rather than blanking the machine,
-    /// matching how the shed feed treats a blip.
-    sessions: Vec<RoostSession>,
-    reachable: bool,
-    /// Why it is unreachable, verbatim from the watcher. Shown to the user —
-    /// "no roost-session at /run/user/1000/roost-session/roost.sock" and "no
-    /// route to host" are different problems and the app should not flatten
-    /// them into "offline".
-    detail: Option<String>,
-    /// Whether a snapshot has EVER arrived, so the UI can distinguish "still
-    /// connecting" from "connected, and this machine genuinely has no sessions".
-    seen: bool,
-    /// Whether this host may appear in a listing at all.
-    ///
-    /// `true` from the start for every CONFIGURED machine — the user named it, so
-    /// its row (unreachable or not) is the information. `false` until the first
-    /// snapshot for the implicit [`LOCALHOST`] host, which nobody asked for: a
-    /// machine that has never run a `roost-session` should show no roost UI at
-    /// all. Once flipped it stays flipped, so a session that stops leaves a
-    /// normal unreachable row rather than making the host vanish mid-look.
-    listed: bool,
-}
-
-impl MachineState {
-    fn new(listed: bool) -> Self {
-        Self {
-            sessions: Vec::new(),
-            reachable: false,
-            detail: None,
-            seen: false,
-            listed,
-        }
-    }
-}
-
-/// The app's machine layer: one watcher per machine, plus the state each reports.
-pub struct Machines {
-    /// Keyed by machine NAME, which is also the origin handle (`machine:<name>`).
-    state: Arc<Mutex<BTreeMap<String, MachineState>>>,
-    /// The machines this app knows about, and the watchers keeping them live.
-    ///
-    /// Behind a lock because the set GROWS: adding a machine has to start
-    /// watching it now, not on the next launch. A relaunch-to-see-it would be a
-    /// worse affordance than editing the config by hand, which is what this
-    /// replaces.
-    reg: Mutex<Registry>,
-    /// Kept so a machine added later gets a watcher on the same runtime, with
-    /// the same test-mode reach substitution and the same change callback as
-    /// the ones started at boot — one code path, not two.
-    handle: tokio::runtime::Handle,
-    test_roost_sockets: HashMap<String, PathBuf>,
-    on_change: OnChange,
-    /// The lane layer's reconcile hook, installed after construction (plan 015
-    /// §3.4).
-    ///
-    /// Late-bound rather than a constructor argument because the lane layer
-    /// holds an `Arc<Machines>` of its own: the two would otherwise have to be
-    /// built at the same instant. `None` in every context that has no lanes —
-    /// the unit tests, and any embedder that never opens one.
-    on_lanes: Arc<Mutex<Option<OnLanes>>>,
-}
-
-/// The reserved-name gate, shared by both doors into [`Machines::add`].
+/// The reserved-name gate, shared by both doors into [`RoostHosts::add`].
 ///
 /// Checked BEFORE the config write in [`add_from_json`] as well as inside
-/// [`Machines::add`]: refusing only at the second step would leave a `localhost:`
-/// entry in the user's `~/.shed/config.yaml` that the next launch would silently
-/// prefer over the implicit host.
-fn reject_reserved_name(name: &str) -> Result<(), String> {
+/// [`RoostHosts::add`]: refusing only at the second step would leave a
+/// `localhost:` entry in the user's `~/.shed/config.yaml` that the next launch
+/// would silently prefer over the implicit host.
+pub(crate) fn reject_reserved_name(name: &str) -> Result<(), String> {
     if name == LOCALHOST {
         return Err(format!(
             "{LOCALHOST:?} is this machine's own roost-session and is always present — \
@@ -209,7 +68,7 @@ fn reject_reserved_name(name: &str) -> Result<(), String> {
 /// The write is INSERT-ONLY (see `shed_core::config_edit`) and takes a backup
 /// first: that file is hand-maintained, and this app is a guest in it.
 pub fn add_from_json(
-    machines: &Machines,
+    hosts: &RoostHosts,
     path: &std::path::Path,
     machine: &Value,
 ) -> Result<(), String> {
@@ -298,7 +157,7 @@ pub fn add_from_json(
         .machine(&name)
         .cloned()
         .ok_or_else(|| format!("{name:?} was written but does not parse back"))?;
-    machines.add(entry)
+    hosts.add(entry)
 }
 
 /// Write `text` to `path` without ever leaving a half-written file there.
@@ -317,7 +176,7 @@ fn write_atomically(path: &std::path::Path, text: &str) -> Result<(), String> {
     })
 }
 
-/// **How a machine is reached** — kept beside its reach so a consumer that needs
+/// **How a host is reached** — kept beside its reach so a consumer that needs
 /// a TRANSPORT of its own can pick one (plan 015 §3.4).
 ///
 /// [`RoostReach`] deliberately answers only "give me a roost connection": the
@@ -328,11 +187,12 @@ fn write_atomically(path: &std::path::Path, text: &str) -> Result<(), String> {
 /// server is dialable at the loopback address it reported, and a REMOTE one's is
 /// only reachable through an `ssh -N -L` tunnel to that same port.
 ///
-/// It is derived from the reach that was BUILT, not from the machine's name. A
-/// configured entry named `localhost` is an ssh target here (see the module
-/// doc's "implicit `localhost` host": the user spelling it in `machines:` means
-/// an ssh target they chose, and its roost reach is an [`SshBridge`] like any
-/// other) — so the lane tunnels to it rather than assuming it is this host.
+/// It is derived from the reach that was BUILT, not from the host's name. A
+/// configured entry named `localhost` is an ssh target here (see
+/// [`crate::roost_hosts`]'s "implicit `localhost` host": the user spelling it in
+/// `machines:` means an ssh target they chose, and its roost reach is an
+/// [`SshBridge`] like any other) — so the lane tunnels to it rather than
+/// assuming it is this host.
 #[derive(Debug, Clone)]
 pub enum ReachKind {
     /// This machine: the implicit [`LOCALHOST`] host, or a test-mode socket map
@@ -343,561 +203,78 @@ pub enum ReachKind {
 }
 
 /// A started reach and how it gets there.
-struct Registered {
-    reach: Arc<dyn RoostReach>,
-    kind: ReachKind,
+pub(crate) struct Registered {
+    pub(crate) reach: Arc<dyn RoostReach>,
+    pub(crate) kind: ReachKind,
 }
 
-/// The mutable half of [`Machines`]: the registered set and its live watchers.
-///
-/// `names` carries ORDER (config order, then arrival order) because the UI lists
-/// machines in it, and it is also the membership set a duplicate `add` is checked
-/// against — the implicit [`LOCALHOST`] host has no [`MachineEntry`], so a map
-/// keyed by entry would not see it.
-struct Registry {
-    names: Vec<String>,
-    /// The reach each watcher was STARTED with, keyed by name.
-    ///
-    /// Control verbs resolve through this rather than re-deriving one from the
-    /// config, so a kill can never address a different host than the row the user
-    /// is looking at: if `machines:` is edited to repoint `mini3` mid-session, the
-    /// watcher (and therefore the displayed rows) still belong to the reach that
-    /// was built at start, and the kill must follow the rows.
-    ///
-    /// A machine whose reach could not even be BUILT is absent here but present
-    /// in `names` — it is a listed, permanently-unreachable row.
-    reaches: BTreeMap<String, Registered>,
-    /// Held so the watchers (and the SSH bridges behind them) live as long as the
-    /// app does. Dropping one aborts its loop.
-    watchers: Vec<RoostWatcher>,
+/// Everything the transport choice reads that is not the entry itself — the two
+/// test-mode seams, resolved once by [`crate::env::Env`] and passed down rather
+/// than read here.
+#[derive(Clone, Default)]
+pub struct ReachOptions {
+    /// `SHED_TAURI_ROOST_SOCKETS`: per-host `roost-session` sockets, reached
+    /// directly instead of through roost's SSH client-bridge.
+    pub roost_sockets: HashMap<String, PathBuf>,
+    /// `SHED_TAURI_SSH_BIN`: the `ssh` a test-mode run execs (plan 019 §3.6).
+    /// `None` in production, where it is `ssh` on the PATH.
+    pub ssh_bin: Option<PathBuf>,
+    /// Whether test mode is on at all. It is what turns the two seams above
+    /// from "unset" into "refuse to spawn ssh", which is the hermeticity
+    /// promise — see [`build_ssh_reach`].
+    pub test_mode: bool,
 }
 
-impl Machines {
-    /// Start a watcher per configured machine, plus the implicit [`LOCALHOST`]
-    /// one. Never fails: a machine whose reach cannot even be built is still
-    /// listed, as unreachable with the reason — the same posture as one that is
-    /// merely asleep.
-    ///
-    /// `test_roost_sockets` (from the test-mode-only
-    /// [`crate::env::Env::roost_sockets`]) replaces the SSH bridge with a direct
-    /// [`LocalSession`] on the named socket, per machine. When it is non-empty NO
-    /// machine spawns ssh — an unmapped entry gets an [`UnreachableReach`] — so a
-    /// hermetic run cannot leak an ssh child, and the "machine is asleep" state is
-    /// coverable without a real machine. `localhost` goes through the same map, so
-    /// a hermetic run does not read the developer's own session either.
-    ///
-    /// `on_change` fires whenever any LISTED machine's state moves, so the
-    /// embedder can push a refresh to its UI rather than leaving rows stale until
-    /// someone clicks Refresh.
-    pub fn start(
-        handle: &tokio::runtime::Handle,
-        config: &ShedConfig,
-        test_roost_sockets: &HashMap<String, PathBuf>,
-        on_change: OnChange,
-    ) -> Machines {
-        let machines = Machines {
-            state: Arc::new(Mutex::new(BTreeMap::new())),
-            reg: Mutex::new(Registry {
-                names: Vec::new(),
-                reaches: BTreeMap::new(),
-                watchers: Vec::new(),
-            }),
-            handle: handle.clone(),
-            test_roost_sockets: test_roost_sockets.clone(),
-            on_change,
-            on_lanes: Arc::new(Mutex::new(None)),
-        };
-        for entry in &config.machines {
-            machines.watch(entry.clone());
+impl ReachOptions {
+    /// The bridge options a reach is built with. **Shared with the bootstrap's
+    /// [`shed_app::roost::SshExec`]** (plan 019 §3.6: one host-key posture, two
+    /// ssh stacks).
+    pub fn bridge_options(&self) -> SshBridgeOptions {
+        SshBridgeOptions {
+            ssh_bin: self.ssh_bin.clone(),
+            ..SshBridgeOptions::default()
         }
-        // A configured entry WINS: the user spelling `localhost` in `machines:`
-        // means an ssh target they chose, and shadowing it with the implicit
-        // local reach would make the config a lie.
-        if !config.machines.iter().any(|m| m.name == LOCALHOST) {
-            machines.watch_localhost();
-        }
-        machines
-    }
-
-    /// Start watching one configured machine: register it, seed its row, and
-    /// spawn its watcher + consumer.
-    ///
-    /// The SINGLE path a configured machine enters by, whether it came from the
-    /// config at boot or from the Add dialog a minute ago — so a machine added
-    /// later behaves identically rather than nearly so.
-    fn watch(&self, entry: MachineEntry) {
-        lock(&self.reg).names.push(entry.name.clone());
-        let reach = build_reach(&entry, &self.test_roost_sockets);
-        self.start_watching(entry.name, reach, true);
-    }
-
-    /// Start watching the implicit local host. Registered LAST so it sorts after
-    /// the machines the user actually configured, and UNLISTED until its session
-    /// answers (see the module doc).
-    fn watch_localhost(&self) {
-        lock(&self.reg).names.push(LOCALHOST.to_string());
-        let reach = Ok(build_local_reach(&self.test_roost_sockets));
-        self.start_watching(LOCALHOST.to_string(), reach, false);
-    }
-
-    /// Seed the row and start the watcher for an ALREADY-REGISTERED name.
-    ///
-    /// Split from registration so `add` can claim the name and register it in
-    /// one lock acquisition — a check-then-register across two would let two
-    /// concurrent adds both win.
-    fn start_watching(&self, name: String, reach: Result<Registered, String>, listed: bool) {
-        lock(&self.state).insert(name.clone(), MachineState::new(listed));
-
-        let reach = match reach {
-            Ok(reach) => reach,
-            Err(e) => {
-                // The reach could not even be constructed (an entry with no host,
-                // a `known_hosts` file we cannot write beside). Record it and move
-                // on: a machine that cannot be reached is a row, not an error.
-                let mut guard = lock(&self.state);
-                if let Some(m) = guard.get_mut(&name) {
-                    m.detail = Some(e);
-                }
-                return;
-            }
-        };
-
-        let (watcher, rx) =
-            RoostWatcher::spawn(&self.handle, Arc::clone(&reach.reach), name.clone());
-        {
-            let mut reg = lock(&self.reg);
-            reg.reaches.insert(name.clone(), reach);
-            reg.watchers.push(watcher);
-        }
-        self.handle.spawn(consume(
-            name,
-            rx,
-            Arc::clone(&self.state),
-            self.on_change.clone(),
-            Arc::clone(&self.on_lanes),
-        ));
-    }
-
-    /// Add a machine and start watching it now.
-    ///
-    /// Rejects a name already being watched rather than shadowing it: two rows
-    /// with one name is a UI that cannot be reasoned about, and the config write
-    /// upstream refuses the same case for the same reason. `localhost` is
-    /// reserved (see [`reject_reserved_name`]).
-    pub fn add(&self, entry: MachineEntry) -> Result<(), String> {
-        reject_reserved_name(&entry.name)?;
-        // Claim the name under the SAME lock acquisition that registers it.
-        // Checking and then registering through two acquisitions lets two adds
-        // both pass the check and both register, leaving one name with two
-        // watchers and two rows.
-        {
-            let mut reg = lock(&self.reg);
-            if reg.names.iter().any(|n| n == &entry.name) {
-                return Err(format!(
-                    "a machine named {:?} is already watched",
-                    entry.name
-                ));
-            }
-            reg.names.push(entry.name.clone());
-        }
-        let reach = build_reach(&entry, &self.test_roost_sockets);
-        self.start_watching(entry.name, reach, true);
-        (self.on_change)();
-        Ok(())
-    }
-
-    /// The sessions AND the per-machine health, read under ONE lock.
-    ///
-    /// Taken together on purpose: read separately, a disconnect landing between
-    /// the two calls yields a payload where a row says `stale: false` while its
-    /// machine says `reachable: false` — a self-contradicting frame the UI would
-    /// render as "live session on an offline machine".
-    pub fn snapshot(&self) -> (Vec<Value>, Vec<Value>) {
-        let guard = lock(&self.state);
-        (self.sessions_locked(&guard), self.status_locked(&guard))
-    }
-
-    /// Every listed machine's rows, flattened for the sessions view, each stamped
-    /// with its origin so the UI can key and label it without inspecting `shed`
-    /// (which is empty for every machine session — see the module doc).
-    fn sessions_locked(&self, guard: &BTreeMap<String, MachineState>) -> Vec<Value> {
-        let mut out = Vec::new();
-        for (name, m) in guard.iter() {
-            if !m.listed {
-                continue;
-            }
-            for session in &m.sessions {
-                out.push(machine_row(name, session, !m.reachable));
-            }
-        }
-        out
-    }
-
-    /// Close a session on a machine — `tab.close` on its roost tab — then drop
-    /// the row optimistically.
-    ///
-    /// **The optimistic drop is still worth keeping, for a different reason than
-    /// it was written for.** It used to cover a 2 s poll cadence; since plan 014
-    /// the watcher observes a push feed, so the `tab.closed` this very call
-    /// commits normally comes back within milliseconds and the row would leave on
-    /// its own. What is *not* bounded is the unhappy path: if the stream is
-    /// mid-resync (a gap, an EOF, a daemon restart) the close is only seen by the
-    /// next cycle's `tab.list`, and if the machine drops right after the close
-    /// lands there is no next snapshot at all — [`consume`] deliberately keeps
-    /// the last row set across a `Down`, so a session the user just killed would
-    /// sit there greyed out until the machine came back. Dropping it here makes
-    /// the answer immediate in every case, and matches [`Self::create`]'s
-    /// optimistic insert on the other side. The next snapshot is authoritative
-    /// and will restore the row if the close somehow did not take.
-    ///
-    /// The slug IS the tab id (`RoostSession::to_rc_dto` stringifies it), so a
-    /// slug that is not an integer is a row from somewhere else and is refused by
-    /// name rather than sent to roost as a zero.
-    pub async fn kill(&self, machine: &str, slug: &str) -> Result<(), String> {
-        let reach = self.reach(machine)?;
-        let tab_id = parse_tab_id(slug)?;
-        tab_close(reach.as_ref(), tab_id).await?;
-        {
-            let mut guard = lock(&self.state);
-            if let Some(m) = guard.get_mut(machine) {
-                m.sessions.retain(|s| s.tab_id != tab_id);
-            }
-        }
-        // The row is gone from this app's view, so the lane on it is too — the
-        // same optimism, for the same reason: waiting for the confirming
-        // snapshot would leave a subscription (and, on a remote machine, an
-        // `ssh -N` child) open against a tab the user just closed.
-        self.publish_lanes(machine);
-        // Outside the lock (the callback re-enters the app) and unconditional,
-        // exactly as [`Self::create`] does it. A Tauri caller happens to refresh
-        // afterwards, but the `machine.kill` socket op does not — so without this
-        // the one case the optimistic drop exists FOR (the stream is mid-resync,
-        // or the machine drops right after the close) is the one case an open UI
-        // never hears about.
-        (self.on_change)();
-        Ok(())
-    }
-
-    /// This machine's RC capabilities — what a create form may offer.
-    ///
-    /// **Synthesized, never probed.** roost is not shed's guest agent and has no
-    /// `shed-ext-rc capabilities` to ask; the honest answer is the contract this
-    /// client implements against it, which is a constant
-    /// ([`shed_app::roost::roost_capabilities`]). So this is no longer an SSH
-    /// round-trip — it cannot fail, cannot be stale, and answers for a machine
-    /// that is currently asleep.
-    ///
-    /// Still resolved through the registry so an unknown machine name is an error
-    /// rather than a confident answer about a host nobody is watching.
-    pub fn capabilities(&self, machine: &str) -> Result<Value, String> {
-        self.known(machine)?;
-        Ok(json!(roost_capabilities()))
-    }
-
-    /// Open a session ON this machine — a roost `tab.open` running the kind's
-    /// agent — and fold it into the local snapshot so the row appears immediately
-    /// rather than whenever the push feed next catches up (see [`Self::kill`] for
-    /// why "normally milliseconds" is not the same as "always").
-    async fn create(
-        &self,
-        machine: &str,
-        kind: &RcKind,
-        workdir: Option<&str>,
-    ) -> Result<Value, String> {
-        let reach = self.reach(machine)?;
-        let params = open_params(kind, workdir)?;
-        let tab = tab_open(reach.as_ref(), params).await?;
-        let session = opened_session(machine, kind, &tab);
-        let value = machine_row(machine, &session, false);
-        {
-            let mut guard = lock(&self.state);
-            // Only if the watcher has not already delivered it. `get_mut` also
-            // means a machine dropped from the registry mid-open is not
-            // resurrected by its own result.
-            if let Some(m) = guard.get_mut(machine) {
-                if !m.sessions.iter().any(|s| s.tab_id == session.tab_id) {
-                    m.sessions.push(session);
-                }
-            }
-        }
-        // Outside the lock (it re-enters the app), and unconditional: a caller
-        // that is not the dialog — socket IPC, say — has nothing else that
-        // would tell the open UI the row exists.
-        (self.on_change)();
-        Ok(value)
-    }
-
-    /// Create a session from CALLER-SUPPLIED, un-normalized fields.
-    ///
-    /// The one place blank-vs-absent is decided, shared by the `machine.launch`
-    /// IPC op and the `machine_launch` Tauri command: the same request must not
-    /// mean two things depending on which door it came through. A field that is
-    /// blank or all whitespace is ABSENT — `"   "` as a working directory is
-    /// someone leaving the box empty, not a directory named three spaces.
-    ///
-    /// **`display_name`, `permission_mode` and `initial_prompt` are accepted and
-    /// not used** in M1 (plan 013 §4). Kickoff is the minimal `tab.open`: the
-    /// agent binary and a cwd. roost owns the tab's title (it follows the
-    /// foreground process, and shed showing a second divergent name would be
-    /// worse than showing roost's), and prompts + permission modes need the
-    /// provider script that is S4's. They stay in the signature so both doors keep
-    /// one wire while that lands, and so a caller is not silently rejected for
-    /// sending what the old hub accepted.
-    pub async fn launch(
-        &self,
-        machine: &str,
-        kind: &RcKind,
-        _display_name: Option<&str>,
-        workdir: Option<&str>,
-        _permission_mode: Option<&str>,
-        _initial_prompt: Option<&str>,
-    ) -> Result<Value, String> {
-        self.create(
-            machine,
-            kind,
-            workdir.map(str::trim).filter(|s| !s.is_empty()),
-        )
-        .await
-    }
-
-    /// One watched machine's reach, or an error naming the ones there are.
-    fn reach(&self, machine: &str) -> Result<Arc<dyn RoostReach>, String> {
-        let reg = lock(&self.reg);
-        if let Some(reach) = reg.reaches.get(machine) {
-            return Ok(Arc::clone(&reach.reach));
-        }
-        if reg.names.iter().any(|n| n == machine) {
-            return Err(format!(
-                "machine {machine:?} has no usable transport (its reach could not be built)"
-            ));
-        }
-        Err(unknown_machine(machine, &reg.names))
-    }
-
-    /// Assert a machine is registered, without needing its reach — for the
-    /// answers (capabilities) that do not touch the wire.
-    fn known(&self, machine: &str) -> Result<(), String> {
-        let reg = lock(&self.reg);
-        if reg.names.iter().any(|n| n == machine) {
-            return Ok(());
-        }
-        Err(unknown_machine(machine, &reg.names))
-    }
-
-    /// Install the lane layer's reconcile hook. See [`OnLanes`].
-    ///
-    /// Idempotent by replacement: the last caller wins. Called once, from
-    /// `lib.rs`'s setup, right after the lane layer is built.
-    pub fn set_lane_observer(&self, observer: OnLanes) {
-        *lock(&self.on_lanes) = Some(observer);
-    }
-
-    /// Every agent lane `machine` currently exposes: agent session id → the
-    /// [`AgentLaneStamp`] [`machine_row`] stamps the row with.
-    ///
-    /// The one reader is the lane layer, which needs all three parts: the
-    /// `kind` to pick an adapter, the reported URL, and (through
-    /// [`Self::reach_kind`]) how to get to it. A machine with no rows, no rows
-    /// an adapter exists for, or no usable URL on them answers empty — which is
-    /// also how `lane.open` decides a row has `no_lane`.
-    pub fn agent_lanes(&self, machine: &str) -> BTreeMap<String, AgentLaneStamp> {
-        let guard = lock(&self.state);
-        let Some(m) = guard.get(machine) else {
-            return BTreeMap::new();
-        };
-        lanes_of(&m.sessions)
-    }
-
-    /// How `machine` is reached — the lane's transport choice. See
-    /// [`ReachKind`].
-    pub fn reach_kind(&self, machine: &str) -> Result<ReachKind, String> {
-        let reg = lock(&self.reg);
-        if let Some(reg_entry) = reg.reaches.get(machine) {
-            return Ok(reg_entry.kind.clone());
-        }
-        if reg.names.iter().any(|n| n == machine) {
-            return Err(format!(
-                "machine {machine:?} has no usable transport (its reach could not be built)"
-            ));
-        }
-        Err(unknown_machine(machine, &reg.names))
-    }
-
-    /// Tell the lane layer what `machine` now exposes. Call OUTSIDE the state
-    /// lock — the hook tears lane entries (and their `ssh -N` children) down.
-    fn publish_lanes(&self, machine: &str) {
-        let observer = lock(&self.on_lanes).clone();
-        let Some(observer) = observer else { return };
-        observer(machine, &self.agent_lanes(machine));
-    }
-
-    /// Per-machine health, for the UI's machine group headers.
-    pub fn status(&self) -> Vec<Value> {
-        let guard = lock(&self.state);
-        self.status_locked(&guard)
-    }
-
-    fn status_locked(&self, guard: &BTreeMap<String, MachineState>) -> Vec<Value> {
-        // Config order, then arrival order — a machine added mid-session appears
-        // at the end rather than reshuffling the list someone is looking at.
-        //
-        // `reg` is taken UNDER the caller's `state` guard, which is the only
-        // place the two are held at once — nothing takes them the other way
-        // round (`add` releases `reg` before `start_watching` touches `state`).
-        let reg = lock(&self.reg);
-        reg.names
-            .iter()
-            .filter_map(|name| {
-                let m = guard.get(name);
-                // An unlisted host (the implicit `localhost` before its first
-                // snapshot) is not a row at all — see the module doc. A name with
-                // no state yet is mid-registration and is listed as unreachable,
-                // which is what it is.
-                if m.is_some_and(|m| !m.listed) {
-                    return None;
-                }
-                Some(json!({
-                    "name": name,
-                    "origin": format!("machine:{name}"),
-                    "reachable": m.is_some_and(|m| m.reachable),
-                    "connected_once": m.is_some_and(|m| m.seen),
-                    "sessions": m.map_or(0, |m| m.sessions.len()),
-                    "detail": m.and_then(|m| m.detail.clone()),
-                }))
-            })
-            .collect()
     }
 }
 
-fn unknown_machine(machine: &str, names: &[String]) -> String {
-    format!(
-        "no machine {machine:?} is being watched (have: {})",
-        names.join(", ")
-    )
-}
-
-/// A row slug back into the roost tab id it is.
-fn parse_tab_id(slug: &str) -> Result<i64, String> {
-    slug.trim()
-        .parse::<i64>()
-        .map_err(|_| format!("{slug:?} is not a roost tab id"))
-}
-
-/// The `tab.open` request for one kind, or a refusal naming the kind.
-///
-/// Everything but `argv` and `cwd` is deliberately zero/empty: `project_id: 0`
-/// lets roost put the tab in its own default project (shed has no opinion about
-/// somebody's project layout), `cols`/`rows` let roost size the PTY, and `title`
-/// stays roost's — it follows the foreground process, which is the name the user
-/// sees in roost's own sidebar.
-///
-/// A kind with no launch recipe (`shell`, `claude-broker`, `grok`, anything
-/// unknown) is refused HERE, before any connection is made, so the failure names
-/// the kind rather than leaving an empty tab open on somebody's machine.
-fn open_params(kind: &RcKind, workdir: Option<&str>) -> Result<TabOpenParams, String> {
-    let argv = launch_argv(kind).ok_or_else(|| {
-        format!(
-            "unknown kind {:?}: roost has no launch recipe for it",
-            kind.as_str()
-        )
-    })?;
-    Ok(TabOpenParams {
-        project_id: 0,
-        cwd: workdir.unwrap_or_default().to_string(),
-        argv,
-        cols: 0,
-        rows: 0,
-        title: String::new(),
-    })
-}
-
-/// The session for a tab that was JUST opened.
-///
-/// `tab.open` answers with the tab **before any adapter has claimed it**:
-/// `ownership` is `None`, so [`RoostSession::agent_kind`] would read `shell` and
-/// the card would show the wrong kind for the second or two until the adapter's
-/// first report promotes it. The kind the caller ASKED for is the honest answer
-/// for that window — the process is starting — so it is stamped as a provisional
-/// ownership carrying roost's own `source` spelling and nothing else (no agent
-/// session id, no detail, no timestamp: shed knows none of them yet, and
-/// inventing one would put a fake id on the card).
-///
-/// The next snapshot REPLACES the row set outright, so this never outlives the
-/// adapter's first report.
-fn opened_session(machine: &str, kind: &RcKind, tab: &Tab) -> RoostSession {
-    RoostSession {
-        host_label: machine.to_string(),
-        tab_id: tab.id,
-        project_id: tab.project_id,
-        project_name: String::new(),
-        title: tab.title.clone(),
-        user_titled: tab.user_titled,
-        cwd: tab.cwd.clone(),
-        shell_state: tab.shell_state,
-        lifecycle: tab.agent_lifecycle,
-        attention: tab.has_notification,
-        ownership: roost_source(kind).map(|source| Ownership {
-            source: source.to_string(),
-            ..Ownership::default()
-        }),
-        created_at: tab.created_at,
-    }
-}
-
-/// The `ownership.source` string roost's own adapter writes for a kind — the
-/// inverse of [`RoostSession::agent_kind`], for the one moment shed has to
-/// predict it ([`opened_session`]).
-///
-/// `None` for every kind with no roost adapter, which is also every kind
-/// [`launch_argv`] refuses — so in practice this is only ever called for the four
-/// launchable ones, and a `None` simply leaves the fresh tab unowned rather than
-/// labelling it with a source roost will never write.
-fn roost_source(kind: &RcKind) -> Option<&'static str> {
-    match kind {
-        RcKind::ClaudeRc => Some("claude"),
-        RcKind::Codex => Some("codex"),
-        RcKind::Opencode => Some("opencode"),
-        RcKind::Cursor => Some("cursor"),
-        // BOTH map to roost's `grok`, because roost has ONE adapter for the two
-        // (plan 017 §3.2): `gx` is not a source roost ever writes. Which of the
-        // two a tab reads as is decided on the way BACK, by
-        // [`RoostSession::agent_kind`], from whether the tab carries a usable
-        // `gx.remote` — so predicting `grok` here is right for a launch of
-        // either, and a `gx` launch that binds its lane promotes itself on the
-        // next snapshot.
-        RcKind::Gx | RcKind::Grok => Some("grok"),
-        RcKind::ClaudeBroker | RcKind::Shell | RcKind::Other(_) => None,
-    }
-}
-
-/// The transport choice — the ONLY per-client part of reaching a machine's
+/// The transport choice — the ONLY per-client part of reaching a host's
 /// `roost-session`.
 ///
 /// Production is [`SshBridge`]: roost's own client-bridge over a shared
 /// `ControlMaster`, because a roost-session's socket path is resolved on the FAR
 /// side and so cannot be named in an `ssh -L`.
-fn build_reach(
+///
+/// ## The test-mode rule, and why it is not "only when a map is set"
+///
+/// In test mode a host is reached ONLY through something the harness supplied:
+/// its own socket in [`ReachOptions::roost_sockets`], or a fake `ssh` in
+/// [`ReachOptions::ssh_bin`]. Anything else is [`UnreachableReach`] — the
+/// everyday asleep/off-network state, coverable with no real host, and a
+/// guarantee that a hermetic run never spawns an `ssh` child.
+///
+/// It used to be conditional on the socket map being non-empty, which was
+/// enough while only `machines:` entries were watched: a suite with no machines
+/// had nothing to reach. Plan 019 gives every RUNNING SHED a roost host too, so
+/// that rule would have every hermetic suite in the harness dial
+/// `shed@127.0.0.1:2222` the moment the mock server reported a running shed.
+pub(crate) fn build_ssh_reach(
     entry: &MachineEntry,
-    test_roost_sockets: &HashMap<String, PathBuf>,
+    options: &ReachOptions,
 ) -> Result<Registered, String> {
-    if test_roost_sockets.is_empty() {
-        return SshBridge::new(entry, SshBridgeOptions::default())
+    if !options.test_mode || options.ssh_bin.is_some() {
+        return SshBridge::new(entry, options.bridge_options())
             .map(|b| Registered {
                 reach: Arc::new(b) as Arc<dyn RoostReach>,
                 kind: ReachKind::Ssh(entry.clone()),
             })
             .map_err(|e| e.to_string());
     }
-    // Test mode with a map present: reach the harness's fake session on its own
-    // Unix socket. That needs no transport at all, which is the point —
-    // everything ABOVE the socket is the shared code under test.
-    //
-    // An UNMAPPED machine gets a reach that simply REFUSES — that is how the
-    // suite exercises an unreachable machine, and it guarantees a hermetic run
-    // never spawns ssh for a machine the harness forgot to map.
+    // Test mode: reach the harness's fake session on its own Unix socket. That
+    // needs no transport at all, which is the point — everything ABOVE the
+    // socket is the shared code under test.
     Ok(mapped_reach(
         &entry.name,
-        test_roost_sockets,
+        options,
         ReachKind::Ssh(entry.clone()),
     ))
 }
@@ -909,31 +286,27 @@ fn build_reach(
 ///
 /// It goes through the same test-mode map as a configured machine, so a hermetic
 /// run reads the harness's fake session rather than the developer's real one.
-fn build_local_reach(test_roost_sockets: &HashMap<String, PathBuf>) -> Registered {
-    if test_roost_sockets.is_empty() {
+pub(crate) fn build_local_reach(options: &ReachOptions) -> Registered {
+    if !options.test_mode {
         return Registered {
             reach: Arc::new(LocalSession::default_local()),
             kind: ReachKind::Local,
         };
     }
-    mapped_reach(LOCALHOST, test_roost_sockets, ReachKind::Local)
+    mapped_reach(LOCALHOST, options, ReachKind::Local)
 }
 
 /// The test-mode reach for `name`, and the kind that goes with it.
 ///
-/// A MAPPED machine is [`ReachKind::Local`] — the harness's fakes (roost's and
+/// A MAPPED host is [`ReachKind::Local`] — the harness's fakes (roost's and
 /// opencode's) both live in this process's loopback space, which is precisely
 /// what the map declares, and it is how the lane's cells reach an opencode
 /// server with no ssh anywhere. An UNMAPPED one keeps `unmapped`, the kind it
 /// would have had in production: it is permanently unreachable, reports no
 /// sessions and so never reaches the lane at all, and claiming it was local
-/// would be a lie about a machine nobody described.
-fn mapped_reach(
-    name: &str,
-    test_roost_sockets: &HashMap<String, PathBuf>,
-    unmapped: ReachKind,
-) -> Registered {
-    match test_roost_sockets.get(name) {
+/// would be a lie about a host nobody described.
+fn mapped_reach(name: &str, options: &ReachOptions, unmapped: ReachKind) -> Registered {
+    match options.roost_sockets.get(name) {
         Some(socket) => Registered {
             reach: Arc::new(LocalSession::new(name, socket.clone())),
             kind: ReachKind::Local,
@@ -941,1251 +314,93 @@ fn mapped_reach(
         None => Registered {
             reach: Arc::new(UnreachableReach::new(
                 name,
-                "no roost-session mapped for this machine in test mode",
+                "no roost-session mapped for this host in test mode",
             )),
             kind: unmapped,
         },
     }
 }
 
-/// Fold one machine's watcher updates into its state.
-async fn consume(
-    name: String,
-    mut rx: tokio::sync::mpsc::UnboundedReceiver<RoostUpdate>,
-    state: Arc<Mutex<BTreeMap<String, MachineState>>>,
-    on_change: OnChange,
-    on_lanes: Arc<Mutex<Option<OnLanes>>>,
-) {
-    while let Some(update) = rx.recv().await {
-        // Set by the SNAPSHOT arm only. A `Down` deliberately keeps the last
-        // rows on screen, so it says nothing about which tabs still exist and
-        // must not evict a lane — see [`OnLanes`].
-        let mut lanes: Option<BTreeMap<String, AgentLaneStamp>> = None;
-        let visible = {
-            let mut guard = lock(&state);
-            let Some(m) = guard.get_mut(&name) else {
-                return;
-            };
-            match update {
-                RoostUpdate::Snapshot(inventory) => {
-                    // The snapshot is authoritative — it REPLACES rather than
-                    // merges, which is what makes a reconnect (or a daemon
-                    // restart, which resets roost's revision counter) a complete
-                    // resync with no replay protocol.
-                    m.sessions = inventory.sessions;
-                    m.reachable = true;
-                    m.detail = None;
-                    m.seen = true;
-                    // A session answered here at least once, so this host is real
-                    // and stays listed from now on.
-                    m.listed = true;
-                    lanes = Some(lanes_of(&m.sessions));
-                }
-                RoostUpdate::Down { reason } => {
-                    // Sessions are deliberately NOT cleared: the last snapshot
-                    // stays on screen, marked stale, until the next connect
-                    // resyncs it.
-                    m.reachable = false;
-                    m.detail = Some(reason);
-                }
-            }
-            m.listed
-        };
-        // Outside the lock, and BEFORE the repaint: the hook tears down lane
-        // entries whose tab has gone, and a UI that repainted first would offer
-        // a Transcript affordance for a row that is about to vanish.
-        //
-        // Unconditional on `visible`, unlike the repaint below: an unlisted host
-        // still has state a lane could be holding, and skipping it would leak a
-        // subscription for exactly the host nobody is looking at.
-        if let Some(lanes) = lanes {
-            let observer = lock(&on_lanes).clone();
-            if let Some(observer) = observer {
-                observer(&name, &lanes);
-            }
-        }
-        // Outside the lock: the callback re-enters the app (it emits a Tauri
-        // event), and holding a std mutex across that is how a deadlock starts.
-        //
-        // Skipped entirely for an unlisted host: an implicit `localhost` with no
-        // session running reports `Down` on every backoff step forever, and
-        // nothing the user can see changes — repainting the UI for it would be
-        // pure noise.
-        if visible {
-            on_change();
-        }
-    }
-}
-
-/// One machine session as the UI reads it: the roost row mapped onto the DTO
-/// every card already renders, stamped with where it lives.
-///
-/// Shared by the list and by `create`'s return value — a caller that keys off
-/// `origin`/`machine` (or calls `sessionKey()`) must get the same shape from
-/// both, or the one place they differ becomes the one place a caller breaks.
-///
-/// `attention` and `tab_id` are stamped HERE rather than carried on
-/// [`shed_core::rc::RcSessionDto`]: that shape is pinned byte-for-byte by the
-/// Go↔Rust parity harness and built as a struct literal at a dozen sites, so
-/// roost's two extra facts travel on [`RoostSession`] and each client adds them
-/// to its own row payload (plan 013 §3.2).
-fn machine_row(name: &str, session: &RoostSession, stale: bool) -> Value {
-    let mut row = serde_json::to_value(session.to_rc_dto()).unwrap_or_else(|_| json!({}));
-    if let Some(obj) = row.as_object_mut() {
-        obj.insert("origin".into(), json!(format!("machine:{name}")));
-        obj.insert("origin_kind".into(), json!("machine"));
-        obj.insert("machine".into(), json!(name));
-        // A machine session belongs to no shed and no server. Spell that
-        // explicitly rather than leaving the UI to infer it from an empty
-        // string.
-        obj.insert("host".into(), json!(format!("machine:{name}")));
-        obj.insert("shed".into(), json!(""));
-        obj.insert("stale".into(), json!(stale));
-        // roost's sticky notification bit. Its own affordance (a dot), NOT part
-        // of `needsYou`: roost clears it on UI focus and shed never clears it, so
-        // folding it into activity would leave a card stuck asking for attention.
-        obj.insert("attention".into(), json!(session.attention));
-        // A STRING, like every other id on roost's wire: a JavaScript client
-        // cannot round an i64 through a `Number` without losing it.
-        obj.insert("tab_id".into(), json!(session.tab_id.to_string()));
-        // The agent-lane capability signal (plan 015 §3.4). Absent unless the
-        // tab's adapter reported a server this app can actually talk to.
-        if let Some(lane) = agent_lane(session) {
-            obj.insert("agent_lane".into(), lane);
-        }
-    }
-    row
-}
-
-/// The `agent_lane` stamp for one row, or `None`.
-///
-/// **Its PRESENCE is the capability signal** — the UI offers a Transcript
-/// affordance for a row that has it and nothing for a row that does not, and
-/// `lane.open` answers `no_lane` for the latter.
-///
-/// **The derivation is [`RoostSession::agent_lane`]'s, not this module's.** It
-/// used to be spelled here: `source != "opencode"` and a hardcoded
-/// `"kind": "opencode"`, from the cut where opencode was the only adapter (plan
-/// 015). Plan 017 §3.5 retired that, because the phone mirrors these rows too
-/// and two hand-written copies of "which tabs have a lane" is exactly how the
-/// desktop and shed-mobile come to offer a transcript on different sets of
-/// rows. shed-core owns the rule; this function is the JSON it rides on.
-///
-/// The key is **`agent_lane`, not `lane`**: `lane` is taken on the session DTO
-/// (`RcSession.lane` is the RC hub's lane token) and a second meaning on the
-/// same row would be read by the wrong consumer. The stamp's own field names
-/// ([`AgentLaneStamp`]) are the wire — `server_url` keeps that name for gx too,
-/// whose roost key is `gx.remote`.
-///
-/// `ownership.metadata` reaches [`RoostSession::agent_lane`] because
-/// [`shed_core::roost::RoostSession`] keeps roost's `Ownership` whole;
-/// `to_rc_dto()` drops it, which is why this is stamped beside the DTO rather
-/// than carried on it.
-fn agent_lane(session: &RoostSession) -> Option<Value> {
-    session.agent_lane().map(|stamp| json!(stamp))
-}
-
-/// The `session_id → stamp` map for a row set, for the lane layer's reconcile.
-///
-/// **The whole stamp, not just the URL.** The lane layer keys a live entry by
-/// `(kind, server_url)` (plan 017 §3.5) — a tab that restarts as a different
-/// agent on the same loopback port is a different lane, and an entry compared on
-/// the URL alone would survive it and keep pumping the wrong adapter.
-///
-/// Deliberately derived from the SAME rule the row is stamped from
-/// ([`RoostSession::agent_lane`]): a lane the UI can see and a lane the backend
-/// will keep alive have to be the same set, or an entry survives a row it no
-/// longer belongs to.
-fn lanes_of(sessions: &[RoostSession]) -> BTreeMap<String, AgentLaneStamp> {
-    sessions
-        .iter()
-        .filter_map(|s| {
-            let stamp = s.agent_lane()?;
-            Some((stamp.session_id.clone(), stamp))
-        })
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::time::Duration;
+    fn entry(name: &str) -> MachineEntry {
+        MachineEntry {
+            name: name.to_string(),
+            host: "127.0.0.1".to_string(),
+            user: Some("nobody".to_string()),
+            ssh_port: 22,
+            known_hosts: None,
+            rc_bin: None,
+        }
+    }
 
-    use shed_core::roost::testing::{ownership, FakeRoost};
-
-    /// The tab the vendored `tab.list` vector carries — a plain `zsh` shell in
-    /// project "Roost". Every test that wants a SESSION claims it first.
-    const VECTOR_TAB: i64 = 5;
-    const VECTOR_CWD: &str = "/Users/me/projects/roost";
-
-    /// Poll `f` until it answers, or fail naming what never happened.
+    /// **A hermetic run never spawns `ssh`.**
     ///
-    /// **Polling the ASSERTION, not the watcher.** Since plan 014 nothing here
-    /// has a cadence — a change arrives on roost's push feed — so this is only
-    /// how a test observes an in-process snapshot that another task writes, and
-    /// it is never a fixed sleep.
-    async fn wait_for<T>(what: &str, mut f: impl FnMut() -> Option<T>) -> T {
-        // Ten seconds, sampled every 5 ms. The sampling rate is deliberately
-        // finer than the watcher's 500 ms first backoff step, so a test that
-        // wants the FIRST `Down`'s reason (the stopping one, before a later
-        // re-dial overwrites it) is reading a window it cannot plausibly miss.
-        for _ in 0..2_000 {
-            if let Some(value) = f() {
-                return value;
-            }
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-        panic!("timed out waiting for {what}");
-    }
-
-    /// One machine's health, read straight out of the in-process state.
-    fn machine_health(machines: &Machines, name: &str) -> (bool, Option<String>) {
-        let guard = machines.state.lock().unwrap();
-        let m = guard.get(name).expect("a registered machine");
-        (m.reachable, m.detail.clone())
-    }
-
-    fn config_with(names: &[&str]) -> ShedConfig {
-        ShedConfig {
-            machines: names
-                .iter()
-                .map(|n| MachineEntry {
-                    name: (*n).to_string(),
-                    host: (*n).to_string(),
-                    ssh_port: 22,
-                    ..Default::default()
-                })
-                .collect(),
-            ..Default::default()
-        }
-    }
-
-    fn sockets(pairs: &[(&str, &std::path::Path)]) -> HashMap<String, PathBuf> {
-        pairs
-            .iter()
-            .map(|(name, path)| ((*name).to_string(), path.to_path_buf()))
-            .collect()
-    }
-
-    fn start(config: &ShedConfig, sockets: &HashMap<String, PathBuf>) -> Machines {
-        Machines::start(
-            &tokio::runtime::Handle::current(),
-            config,
-            sockets,
-            Arc::new(|| {}),
-        )
-    }
-
-    /// Like [`start`], plus the count of `on_change` calls the layer has made —
-    /// what an open UI would have been told to re-read.
-    fn start_counting(
-        config: &ShedConfig,
-        sockets: &HashMap<String, PathBuf>,
-    ) -> (Machines, Arc<AtomicUsize>) {
-        let calls = Arc::new(AtomicUsize::new(0));
-        let counter = Arc::clone(&calls);
-        let machines = Machines::start(
-            &tokio::runtime::Handle::current(),
-            config,
-            sockets,
-            Arc::new(move || {
-                counter.fetch_add(1, Ordering::SeqCst);
-            }),
-        );
-        (machines, calls)
-    }
-
-    /// The vector's shell tab, claimed by an opencode adapter.
-    fn claim_opencode(fake: &FakeRoost, lifecycle: &str, detail: &str, notify: bool) {
-        fake.set_tab_axes(
-            VECTOR_TAB,
-            lifecycle,
-            Some(ownership("opencode", "ses_abc", detail, 1_700_000_100)),
-            notify,
-        );
-    }
-
-    fn rows(machines: &Machines) -> Vec<Value> {
-        machines.snapshot().0
-    }
-
-    /// A bare roost row, with whatever ownership a lane test needs on it.
-    fn owned(source: Option<&str>, session_id: &str, metadata: &[(&str, &str)]) -> RoostSession {
-        RoostSession {
-            host_label: "mini3".to_string(),
-            tab_id: 4,
-            project_id: 1,
-            project_name: String::new(),
-            title: "oc".to_string(),
-            user_titled: false,
-            cwd: "/home/shed/work".to_string(),
-            shell_state: roost_ipc::agent::ShellState::Unknown,
-            lifecycle: roost_ipc::agent::AgentLifecycle::Working,
-            attention: false,
-            ownership: source.map(|source| Ownership {
-                source: source.to_string(),
-                session_id: session_id.to_string(),
-                metadata: metadata
-                    .iter()
-                    .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
-                    .collect(),
-                ..Ownership::default()
-            }),
-            created_at: 0,
-        }
-    }
-
-    /// **`agent_lane` is the lane capability signal, and it is stamped from the
-    /// tab's own report** (plan 015 §3.4).
-    ///
-    /// Its PRESENCE is what makes the UI offer a transcript, so every case that
-    /// cannot actually be opened must leave it off: a different agent, a tab that
-    /// reported no server, a blank one, and a server with no session id to
-    /// address. The key is `agent_lane` and NOT `lane` — `lane` is already taken
-    /// on this DTO by the RC hub's lane token.
+    /// The one promise `SHED_TAURI_ROOST_SOCKETS` makes, and since plan 019 it
+    /// has to hold for a suite that mapped NOTHING as well: every running shed
+    /// is a roost host now, so an empty map used to mean "dial the mock's
+    /// sheds over real ssh".
     #[test]
-    fn the_lane_stamp_needs_an_opencode_tab_that_reported_a_server_and_a_session() {
-        let url = "http://127.0.0.1:41234";
-        let row = machine_row(
+    fn test_mode_refuses_to_build_a_real_bridge_for_an_unmapped_host() {
+        let options = ReachOptions {
+            test_mode: true,
+            ..ReachOptions::default()
+        };
+        let built = build_ssh_reach(&entry("mini3"), &options).expect("a reach");
+        assert_eq!(
+            built.reach.label(),
             "mini3",
-            &owned(Some("opencode"), "ses_abc", &[("server_url", url)]),
-            false,
+            "an unmapped host is a labelled refusal, not a bridge"
         );
-        assert_eq!(
-            row["agent_lane"],
-            json!({"kind": "opencode", "session_id": "ses_abc", "server_url": url})
+        assert!(
+            matches!(built.kind, ReachKind::Ssh(_)),
+            "it keeps the kind it would have had in production"
         );
-        assert!(row.get("lane").is_none() || row["lane"].is_null(), "{row}");
 
-        // Everything that must NOT carry one.
-        for (what, session) in [
-            ("a plain shell tab", owned(None, "", &[])),
-            (
-                "another agent",
-                owned(Some("claude"), "ses_abc", &[("server_url", url)]),
-            ),
-            (
-                "opencode with no server reported",
-                owned(Some("opencode"), "ses_abc", &[("model", "sonnet")]),
-            ),
-            (
-                "opencode with a blank server",
-                owned(Some("opencode"), "ses_abc", &[("server_url", "   ")]),
-            ),
-            (
-                "opencode with no session id to address",
-                owned(Some("opencode"), "", &[("server_url", url)]),
-            ),
-        ] {
-            let row = machine_row("mini3", &session, false);
-            assert!(
-                row.get("agent_lane").is_none(),
-                "{what} was stamped with a lane: {row}"
-            );
-        }
-    }
-
-    /// The reconcile map and the row stamp are the SAME fact, derived from the
-    /// same place — an entry that outlived the row it belongs to would hold a
-    /// subscription (and an `ssh -N` child) nobody can see.
-    #[test]
-    fn the_reconcile_map_is_exactly_the_stamped_rows() {
-        let url = "http://127.0.0.1:41234";
-        let mut second = owned(Some("opencode"), "ses_two", &[("server_url", url)]);
-        second.tab_id = 7;
-        let sessions = vec![
-            owned(Some("opencode"), "ses_abc", &[("server_url", url)]),
-            owned(Some("claude"), "ses_zzz", &[("server_url", url)]),
-            owned(Some("opencode"), "ses_bare", &[]),
-            second,
-        ];
-        let stamp = |id: &str| AgentLaneStamp {
-            kind: "opencode".to_string(),
-            session_id: id.to_string(),
-            server_url: url.to_string(),
+        // The same host, with a fake `ssh` supplied: now it IS a bridge, because
+        // the harness said which binary an exec may reach.
+        let with_ssh = ReachOptions {
+            test_mode: true,
+            ssh_bin: Some(PathBuf::from("/nonexistent/fake-ssh")),
+            ..ReachOptions::default()
         };
+        let built = build_ssh_reach(&entry("mini3"), &with_ssh).expect("a reach");
+        assert_eq!(built.reach.label(), "mini3");
         assert_eq!(
-            lanes_of(&sessions),
-            BTreeMap::from([
-                ("ses_abc".to_string(), stamp("ses_abc")),
-                ("ses_two".to_string(), stamp("ses_two")),
-            ])
+            with_ssh.bridge_options().ssh_bin,
+            Some(PathBuf::from("/nonexistent/fake-ssh")),
+            "and the fake is what its execs run"
         );
     }
 
-    /// **Stamping is stricter than it was, and that is deliberate.**
-    ///
-    /// Until plan 017 this module minted the stamp itself and validated nothing
-    /// beyond "non-empty". It now defers to `RoostSession::agent_lane`, which
-    /// applies `loopback_base_url` on BOTH paths — so a `server_url` roost could
-    /// once have published and this app would once have dialled is now refused,
-    /// silently, as `no_lane`.
-    ///
-    /// That is the right posture (the desktop DIALS this value, and it should
-    /// not depend on an upstream process's filtering staying correct), but it is
-    /// a behaviour change with a quiet failure mode, so it is pinned here rather
-    /// than left to be rediscovered. Every shape below is one roost's own rule
-    /// already rejects; if this test ever starts failing on a shape a real
-    /// daemon emits, the bug is upstream and the symptom will be a Transcript
-    /// affordance that vanished.
+    /// A mapped host reads as LOCAL whatever it is configured as — the lane
+    /// layer's transport choice follows the reach that was built.
     #[test]
-    fn a_server_url_that_is_not_a_bare_loopback_base_carries_no_lane() {
-        let ok = owned(
-            Some("opencode"),
-            "ses_ok",
-            &[("server_url", "http://127.0.0.1:41234")],
-        );
-        assert!(agent_lane(&ok).is_some(), "the shape roost actually stamps");
-
-        for bad in [
-            // A trailing slash: `loopback_base_url` rejects it, and it is the
-            // shape a hand-written config or a helpful URL-joiner produces.
-            "http://127.0.0.1:41234/",
-            // No port — nothing to forward to.
-            "http://127.0.0.1",
-            // Not loopback: a lane URL is the MACHINE's own loopback, never an
-            // address this host could route to.
-            "http://0.0.0.0:41234",
-            "http://10.0.0.7:41234",
-            // Not http, and not a bare base.
-            "https://127.0.0.1:41234",
-            "http://127.0.0.1:41234/v1",
-            "http://user@127.0.0.1:41234",
-            "",
-            "   ",
-        ] {
-            let session = owned(Some("opencode"), "ses_bad", &[("server_url", bad)]);
-            assert!(
-                agent_lane(&session).is_none(),
-                "{bad:?} is not a loopback base URL and must not be stamped"
-            );
-        }
-
-        // A gx tab is stamped from `gx.remote`, and is refused for the same
-        // reasons — including the one that makes it read as plain `grok`.
-        let gx = owned(
-            Some("grok"),
-            "ses_gx",
-            &[("gx.remote", "http://127.0.0.1:2431")],
-        );
-        assert_eq!(
-            agent_lane(&gx).and_then(|v| v["kind"].as_str().map(str::to_string)),
-            Some("gx".to_string())
-        );
-        let demoted = owned(
-            Some("grok"),
-            "ses_gx",
-            &[("gx.remote", "http://127.0.0.1:2431/")],
-        );
-        assert!(
-            agent_lane(&demoted).is_none(),
-            "a gx.remote that fails the rule leaves the tab as plain grok, lane-less"
-        );
-
-        // And the session id is the other half: a tab with a usable URL but no
-        // id would advertise a panel that can never open.
-        let idless = owned(
-            Some("opencode"),
-            "",
-            &[("server_url", "http://127.0.0.1:41234")],
-        );
-        assert!(agent_lane(&idless).is_none());
-    }
-
-    fn status_named<'a>(status: &'a [Value], name: &str) -> Option<&'a Value> {
-        status.iter().find(|m| m["name"] == json!(name))
-    }
-
-    /// A machine mapped to a live session lists its AGENT-OWNED tabs, with the
-    /// kind, cwd and activity roost reported — and the origin stamps every card
-    /// keys off.
-    #[tokio::test]
-    async fn a_mapped_machine_lists_its_agent_tabs() {
-        let fake = FakeRoost::start().await;
-        claim_opencode(&fake, "working", "session_status", false);
-
-        let machines = start(
-            &config_with(&["mini3"]),
-            &sockets(&[("mini3", fake.socket_path())]),
-        );
-
-        let row = wait_for("mini3's opencode row", || {
-            rows(&machines).into_iter().next()
-        })
-        .await;
-        assert_eq!(row["kind"], json!("opencode"));
-        assert_eq!(row["workdir"], json!(VECTOR_CWD));
-        assert_eq!(row["activity"], json!("working"));
-        assert_eq!(row["state"], json!("ready"), "roost tabs are always live");
-        assert_eq!(row["slug"], json!("5"), "the slug IS the tab id");
-        assert_eq!(row["tab_id"], json!("5"), "stamped as a string");
-        assert_eq!(row["attention"], json!(false));
-        assert_eq!(row["origin"], json!("machine:mini3"));
-        assert_eq!(row["origin_kind"], json!("machine"));
-        assert_eq!(row["machine"], json!("mini3"));
-        assert_eq!(row["host"], json!("machine:mini3"));
-        assert_eq!(row["shed"], json!(""), "a machine session has no shed");
-        assert_eq!(row["stale"], json!(false));
-        assert_eq!(row["tmux_session"], json!(""), "roost has no tmux");
-        // The plain shell tab beside it is NOT a session (§3.2: a roost user with
-        // fifteen terminals must not get fifteen cards) — the vector's only tab
-        // became the agent one, so the count is the proof there is no second row.
-        assert_eq!(rows(&machines).len(), 1);
-
-        let status = machines.status();
-        assert_eq!(status_named(&status, "mini3").unwrap()["reachable"], true);
-        assert_eq!(status_named(&status, "mini3").unwrap()["sessions"], 1);
-    }
-
-    /// **The negative control for `a_mapped_machine_lists_its_agent_tabs`.** An
-    /// UNMAPPED machine — the same code path, the same start, nothing to connect
-    /// to — is a listed row with a reason and NO sessions. Without this a
-    /// "machine lists its tabs" test that quietly listed every machine's tabs
-    /// under every name would still pass.
-    #[tokio::test]
-    async fn an_unmapped_machine_is_an_unreachable_row_with_a_reason() {
-        let fake = FakeRoost::start().await;
-        let machines = start(
-            &config_with(&["mini3", "ghost"]),
-            &sockets(&[("mini3", fake.socket_path())]),
-        );
-        assert_eq!(machines.status().len(), 2, "both are listed at once");
-
-        let detail = wait_for("ghost's reason for being unreachable", || {
-            let status = machines.status();
-            status_named(&status, "ghost")?["detail"]
-                .as_str()
-                .map(str::to_string)
-        })
-        .await;
-        assert!(
-            detail.contains("no roost-session mapped"),
-            "the reason names the missing mapping, not a generic offline: {detail}"
-        );
-
-        let status = machines.status();
-        let ghost = status_named(&status, "ghost").unwrap();
-        assert_eq!(ghost["reachable"], json!(false));
-        assert_eq!(ghost["connected_once"], json!(false));
-        assert_eq!(ghost["sessions"], json!(0));
-        assert_eq!(ghost["origin"], json!("machine:ghost"));
-        assert!(
-            rows(&machines).iter().all(|r| r["machine"] == "mini3"),
-            "an unreachable machine contributes no rows"
-        );
-    }
-
-    /// A lifecycle flip (and roost's sticky notification bit) reaches
-    /// `snapshot()` off the **push feed** — the S3 acceptance cell, with no
-    /// cadence anywhere to turn down.
-    ///
-    /// The `tab.list` count is the load-bearing half: exactly one per cycle
-    /// means the flip arrived as a pushed batch that the inventory folded, not
-    /// as a re-read that a poll happened to catch.
-    #[tokio::test]
-    async fn a_lifecycle_flip_is_pushed_into_the_snapshot() {
-        let fake = FakeRoost::start().await;
-        claim_opencode(&fake, "working", "session_status", false);
-        let machines = start(
-            &config_with(&["mini3"]),
-            &sockets(&[("mini3", fake.socket_path())]),
-        );
-        wait_for("the first row", || {
-            rows(&machines)
-                .into_iter()
-                .find(|r| r["activity"] == "working")
-        })
-        .await;
-        assert_eq!(fake.tab_list_calls(), 1, "one list for the first cycle");
-
-        // opencode's approval spelling, exactly — `permission_asked` is an
-        // approval, `question_asked` would be plain input.
-        claim_opencode(&fake, "waiting", "permission_asked", true);
-
-        let row = wait_for("the flipped row", || {
-            rows(&machines)
-                .into_iter()
-                .find(|r| r["activity"] == "needs_approval")
-        })
-        .await;
-        assert_eq!(row["attention"], json!(true), "the sticky notification bit");
-        assert_eq!(row["slug"], json!("5"), "the same tab, not a new row");
-        assert_eq!(
-            fake.tab_list_calls(),
-            1,
-            "the flip rode the event stream — a re-list would mean the watcher \
-             still polls"
-        );
-    }
-
-    /// **Somebody else taking the interactive lease changes nothing here.**
-    ///
-    /// At protocol 4 a takeover no longer ends an event stream; it reclassifies
-    /// it and says so once with a non-terminal `session.driver_changed`. Shed
-    /// never held the lease to begin with, so the rows must not move — and the
-    /// stream must still be delivering, which the flip afterwards is what
-    /// proves. (Two takeovers: the first mints into an unheld session and
-    /// deposes nobody, so roost announces nothing; the second is the real one.)
-    #[tokio::test]
-    async fn a_driver_change_leaves_the_rows_alone_and_the_stream_alive() {
-        let fake = FakeRoost::start().await;
-        claim_opencode(&fake, "working", "session_status", false);
-        let machines = start(
-            &config_with(&["mini3"]),
-            &sockets(&[("mini3", fake.socket_path())]),
-        );
-        let before = wait_for("the first row", || rows(&machines).into_iter().next()).await;
-        let lists_before = fake.tab_list_calls();
-
-        fake.take_over("roost ui");
-        fake.take_over("somebody else");
-
-        // Nothing to wait FOR — the assertion is that nothing happens — so give
-        // the frame time to be delivered and mishandled before reading.
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        assert_eq!(rows(&machines), vec![before], "a takeover moved a row");
-        assert_eq!(
-            machine_health(&machines, "mini3"),
-            (true, None),
-            "a takeover is not a reason to call a machine down"
-        );
-        assert_eq!(
-            fake.tab_list_calls(),
-            lists_before,
-            "a takeover is informational — it must not cost a resync"
-        );
-
-        // The stream survived it: the next commit still arrives.
-        claim_opencode(&fake, "finished", "session_idle", false);
-        let after = wait_for("the flip after the takeover", || {
-            rows(&machines)
-                .into_iter()
-                .find(|r| r["activity"] == "idle")
-        })
-        .await;
-        assert_eq!(after["slug"], json!("5"));
-        assert_eq!(
-            fake.tab_list_calls(),
-            lists_before,
-            "and it was still the SAME stream, not a reconnect"
-        );
-    }
-
-    /// **A daemon that stops says why, and the row recovers when it comes back.**
-    ///
-    /// `session.stopping` is the one terminal envelope an event stream sees at
-    /// protocol 4, and it is the reason the user reads. The last known rows stay
-    /// on screen, marked stale — a machine going away must never blank the view.
-    #[tokio::test]
-    async fn a_stopping_session_goes_stale_with_its_reason_and_then_recovers() {
-        let fake = FakeRoost::start().await;
-        claim_opencode(&fake, "working", "session_status", false);
-        let machines = start(
-            &config_with(&["mini3"]),
-            &sockets(&[("mini3", fake.socket_path())]),
-        );
-        wait_for("the first row", || rows(&machines).into_iter().next()).await;
-
-        // Latches the fake unavailable, so "further attempts fail" is real.
-        fake.stop();
-
-        let reason = wait_for("mini3 to report why it went down", || {
-            machine_health(&machines, "mini3").1
-        })
-        .await;
-        assert!(
-            reason.contains("session stopping: stop"),
-            "the FIRST reason after a stop is roost's own, not a dial failure: {reason}"
-        );
-        let stale = rows(&machines);
-        assert_eq!(stale.len(), 1, "the last known rows survive the stop");
-        assert_eq!(stale[0]["stale"], json!(true));
-
-        fake.restart();
-        wait_for("mini3 to come back", || {
-            machine_health(&machines, "mini3").0.then_some(())
-        })
-        .await;
-        let back = rows(&machines);
-        assert_eq!(back.len(), 1, "the row set is re-listed, not replayed");
-        assert_eq!(
-            back[0]["slug"],
-            json!("5"),
-            "tab ids persist across a restart"
-        );
-        assert_eq!(back[0]["stale"], json!(false));
-    }
-
-    /// **A lost commit resyncs, and the row never flickers stale.**
-    ///
-    /// `skip_revision` is the only way to manufacture the loss a resync exists
-    /// for (roost itself closes the stream instead). The watcher answers with a
-    /// whole new cycle — one more `tab.list` — and NO `Down`, so the UI sees a
-    /// row that simply updates.
-    #[tokio::test]
-    async fn a_revision_gap_resyncs_without_a_stale_flicker() {
-        let fake = FakeRoost::start().await;
-        claim_opencode(&fake, "working", "session_status", false);
-        let machines = start(
-            &config_with(&["mini3"]),
-            &sockets(&[("mini3", fake.socket_path())]),
-        );
-        wait_for("the first row", || {
-            rows(&machines)
-                .into_iter()
-                .find(|r| r["activity"] == "working")
-        })
-        .await;
-        let lists_before = fake.tab_list_calls();
-
-        // A commit nobody was told about, then one they are: the batch arrives
-        // at `expected + 1` and the client's own stream raises the gap.
-        fake.skip_revision();
-        claim_opencode(&fake, "finished", "session_idle", false);
-
-        let row = wait_for("the resynced row", || {
-            // Checked on every sample, not once at the end: a `Down` between
-            // the gap and the recovery is exactly the flicker this rules out,
-            // and it would be gone again by the time the loop finished.
-            assert_eq!(
-                machine_health(&machines, "mini3"),
-                (true, None),
-                "a resync must never render the machine down"
-            );
-            rows(&machines)
-                .into_iter()
-                .find(|r| r["activity"] == "idle")
-        })
-        .await;
-        assert_eq!(row["slug"], json!("5"));
-        assert_eq!(row["stale"], json!(false));
-        assert_eq!(
-            fake.tab_list_calls(),
-            lists_before + 1,
-            "exactly one re-list — a resync is a fresh cycle, not a retry storm"
-        );
-    }
-
-    /// Every `(reachable, detail)` pair the machine layer published, in order.
-    ///
-    /// Named because clippy asks, but the name earns its place: this is a
-    /// history, not a sample, and that distinction is the whole point of the
-    /// test below.
-    type PublishedStates = Arc<Mutex<Vec<(bool, Option<String>)>>>;
-
-    /// **No unreachable state is ever PUBLISHED across a resync** — the claim a
-    /// periodically-sampled test can only approximate.
-    ///
-    /// [`consume`] calls `on_change` after every update it applies, so a
-    /// callback that reads the row back sees EVERY transition the UI would have
-    /// been told about — including one a poll-and-compare test cannot see at
-    /// all, because a spurious `Down` followed microseconds later by a fresh
-    /// snapshot looks exactly like no `Down` at any sampling rate. The harness's
-    /// end-to-end cell samples; this one is the actual assertion.
-    ///
-    /// Both resyncs a healthy daemon produces are exercised: a revision gap
-    /// (a commit the stream never carried) and a reorder (which
-    /// `shed_app::roost` answers with a deliberate re-list). Neither may render
-    /// the machine unreachable, because the daemon was never down.
-    #[tokio::test]
-    async fn a_resync_never_publishes_an_unreachable_state() {
-        let fake = FakeRoost::start().await;
-        claim_opencode(&fake, "working", "session_status", false);
-
-        // The consumer under test, wired by hand so the callback can be one that
-        // RECORDS rather than one that repaints.
-        let state: Arc<Mutex<BTreeMap<String, MachineState>>> = Arc::new(Mutex::new(
-            BTreeMap::from([("mini3".to_string(), MachineState::new(true))]),
-        ));
-        let history: PublishedStates = Arc::new(Mutex::new(Vec::new()));
-        let on_change: OnChange = {
-            let state = Arc::clone(&state);
-            let history = Arc::clone(&history);
-            Arc::new(move || {
-                let guard = lock(&state);
-                if let Some(m) = guard.get("mini3") {
-                    history
-                        .lock()
-                        .unwrap()
-                        .push((m.reachable, m.detail.clone()));
-                }
-            })
+    fn a_mapped_host_is_local_and_an_unmapped_local_stays_unreachable() {
+        let mut sockets = HashMap::new();
+        sockets.insert("mini3".to_string(), PathBuf::from("/tmp/roost.sock"));
+        let options = ReachOptions {
+            roost_sockets: sockets,
+            test_mode: true,
+            ..ReachOptions::default()
         };
-        let reach: Arc<dyn RoostReach> = Arc::new(LocalSession::new("mini3", fake.socket_path()));
-        let (watcher, rx) = RoostWatcher::spawn(
-            &tokio::runtime::Handle::current(),
-            reach,
-            "mini3".to_string(),
-        );
-        tokio::spawn(consume(
-            "mini3".to_string(),
-            rx,
-            Arc::clone(&state),
-            on_change,
-            Arc::new(Mutex::new(None)),
-        ));
+        let built = build_ssh_reach(&entry("mini3"), &options).expect("a reach");
+        assert!(matches!(built.kind, ReachKind::Local));
 
-        fn activity(state: &Arc<Mutex<BTreeMap<String, MachineState>>>) -> Option<Value> {
-            let guard = lock(state);
-            let m = guard.get("mini3")?;
-            let session = m.sessions.first()?;
-            Some(machine_row("mini3", session, !m.reachable)["activity"].clone())
-        }
-
-        wait_for("the first snapshot", || {
-            activity(&state).filter(|a| a == &json!("working"))
-        })
-        .await;
-
-        // A commit the stream never carried: the client's own event stream
-        // raises the gap and the watcher answers with a whole new cycle.
-        let lists = fake.tab_list_calls();
-        fake.skip_revision();
-        claim_opencode(&fake, "finished", "session_idle", false);
-        wait_for("the gap to resync", || {
-            activity(&state).filter(|a| a == &json!("idle"))
-        })
-        .await;
-        assert_eq!(fake.tab_list_calls(), lists + 1, "one re-list per resync");
-
-        // A reorder: applied, and then deliberately re-listed for the new order.
-        fake.reorder_tabs();
-        wait_for("the reorder to re-list", || {
-            (fake.tab_list_calls() > lists + 1).then_some(())
-        })
-        .await;
-
-        let published = history.lock().unwrap().clone();
-        assert!(!published.is_empty(), "nothing was ever published");
+        let local = build_local_reach(&options);
         assert!(
-            published.iter().all(|(reachable, _)| *reachable),
-            "a resync published an unreachable state: {published:?}"
+            matches!(local.kind, ReachKind::Local),
+            "an unmapped localhost is still local — it is this machine"
         );
-        watcher.stop();
+        assert_eq!(local.reach.label(), LOCALHOST);
     }
 
-    /// The implicit `localhost` host is INVISIBLE until a session has answered —
-    /// connect-if-present in both directions. The watcher still runs (it has a
-    /// reason recorded), it is simply not something the user is shown.
-    #[tokio::test]
-    async fn localhost_is_absent_until_its_session_answers() {
-        // A mapped-but-nonexistent socket: the reach exists, the session does not.
-        let missing = std::env::temp_dir().join("shed-tauri-no-such-roost.sock");
-        let machines = start(
-            &config_with(&["mini3"]),
-            &sockets(&[("localhost", &missing)]),
-        );
-
-        wait_for("localhost's watcher to report", || {
-            let guard = machines.state.lock().unwrap();
-            guard.get(LOCALHOST)?.detail.clone()
-        })
-        .await;
-
-        assert!(
-            status_named(&machines.status(), LOCALHOST).is_none(),
-            "a host that has never run a session is not listed"
-        );
-        assert!(rows(&machines).iter().all(|r| r["machine"] != "localhost"));
-        // ...but it IS registered, so a verb addressed at it is not "unknown".
-        assert!(machines.capabilities(LOCALHOST).is_ok());
-    }
-
-    /// Once `localhost`'s session has answered it is listed with its rows — and
-    /// it STAYS listed when the session goes away, as an ordinary unreachable row
-    /// keeping its last known sessions.
-    #[tokio::test]
-    async fn localhost_is_listed_once_its_session_answers_and_stays() {
-        let fake = FakeRoost::start().await;
-        claim_opencode(&fake, "finished", "session_idle", false);
-        let fake_socket = fake.socket_path().to_path_buf();
-        let machines = start(&config_with(&[]), &sockets(&[(LOCALHOST, &fake_socket)]));
-
-        let row = wait_for("the localhost row", || rows(&machines).into_iter().next()).await;
-        assert_eq!(row["origin"], json!("machine:localhost"));
-        assert_eq!(row["activity"], json!("idle"));
-        assert_eq!(row["stale"], json!(false));
-        assert_eq!(
-            status_named(&machines.status(), LOCALHOST).unwrap()["reachable"],
-            json!(true)
-        );
-
-        // DROP rather than `close_all`: a hang-up is transient (the socket is
-        // still there, so the next dial succeeds and the row would flicker back),
-        // and what this asserts is the DURABLE gone state. Dropping the fake takes
-        // its scratch directory — and the socket — with it.
-        drop(fake);
-
-        // The FIRST `Down` is the held connection dying ("Connection reset by
-        // peer"), which is true but transient; the SETTLED reason — what the row
-        // keeps saying while the session stays gone — is the reach's, and it names
-        // the socket. Waiting for that is the assertion worth making.
-        let detail = wait_for("localhost to settle on the socket-gone reason", || {
-            let status = machines.status();
-            status_named(&status, LOCALHOST)?["detail"]
-                .as_str()
-                .filter(|d| d.contains("no roost-session at"))
-                .map(str::to_string)
-        })
-        .await;
-        assert!(
-            detail.contains(fake_socket.to_str().unwrap()),
-            "the reason names the socket that is gone: {detail}"
-        );
-        let after = rows(&machines);
-        assert_eq!(after.len(), 1, "the last known rows survive the disconnect");
-        assert_eq!(after[0]["stale"], json!(true));
-        assert_eq!(
-            status_named(&machines.status(), LOCALHOST).unwrap()["connected_once"],
-            json!(true),
-            "still listed — the host is real, it is just not answering"
-        );
-    }
-
-    /// `localhost` is reserved: the implicit host and a configured one must never
-    /// both exist under the name.
-    #[tokio::test]
-    async fn add_refuses_the_reserved_localhost_name() {
-        let machines = start(
-            &config_with(&[]),
-            &sockets(&[("x", std::path::Path::new("/nope"))]),
-        );
-        let e = machines
-            .add(MachineEntry {
-                name: LOCALHOST.to_string(),
-                host: "example.internal".to_string(),
-                ssh_port: 22,
-                ..Default::default()
-            })
-            .expect_err("localhost is refused");
-        assert!(e.contains("always present"), "{e}");
-        assert_eq!(
-            machines
-                .status()
-                .iter()
-                .filter(|m| m["name"] == json!(LOCALHOST))
-                .count(),
-            0,
-            "the refusal registered nothing"
-        );
-    }
-
-    /// A configured entry named `localhost` WINS — the implicit host is not
-    /// registered beside it, so the name resolves to exactly one reach.
-    #[tokio::test]
-    async fn a_configured_localhost_wins_over_the_implicit_one() {
-        let fake = FakeRoost::start().await;
-        let machines = start(
-            &config_with(&[LOCALHOST]),
-            &sockets(&[(LOCALHOST, fake.socket_path())]),
-        );
-        let reg = machines.reg.lock().unwrap();
-        assert_eq!(reg.names, vec![LOCALHOST.to_string()]);
-    }
-
-    /// `kill` is a roost `tab.close`: the tab really leaves the session (a second
-    /// close of the same id is refused by the daemon), and the row is dropped
-    /// optimistically rather than waiting for the close's own `tab.closed` to
-    /// come back off the stream.
-    #[tokio::test]
-    async fn kill_routes_to_tab_close() {
-        let fake = FakeRoost::start().await;
-        claim_opencode(&fake, "working", "session_status", false);
-        let machines = start(
-            &config_with(&["mini3"]),
-            &sockets(&[("mini3", fake.socket_path())]),
-        );
-        wait_for("the row to kill", || rows(&machines).into_iter().next()).await;
-
-        machines.kill("mini3", "5").await.expect("the close lands");
-        assert!(rows(&machines).is_empty(), "the row drops optimistically");
-
-        // The tab is GONE from the session, not just from our snapshot: roost
-        // refuses a second close by name.
-        let again = machines
-            .kill("mini3", "5")
-            .await
-            .expect_err("the tab is already closed");
-        assert!(
-            again.contains("not-found") || again.contains("no such tab"),
-            "{again}"
-        );
-
-        let bad = machines
-            .kill("mini3", "rc-abc123")
-            .await
-            .expect_err("a non-roost slug is refused");
-        assert!(bad.contains("not a roost tab id"), "{bad}");
-    }
-
-    /// **An optimistic drop that nobody is told about is not optimistic.**
-    ///
-    /// The Tauri commands happen to re-read afterwards; the `machine.kill`
-    /// socket op does not. So `kill` publishes the change itself, the way
-    /// [`Machines::create`] does — otherwise the exact case the optimistic drop
-    /// exists for (no snapshot is coming, because the stream is resyncing or the
-    /// machine just dropped) is the case an open UI never hears about.
-    #[tokio::test]
-    async fn kill_publishes_the_drop_it_made() {
-        let fake = FakeRoost::start().await;
-        claim_opencode(&fake, "working", "session_status", false);
-        let (machines, calls) = start_counting(
-            &config_with(&["mini3"]),
-            &sockets(&[("mini3", fake.socket_path())]),
-        );
-        wait_for("the row to kill", || rows(&machines).into_iter().next()).await;
-
-        // Read the count the instant `kill` returns: the watcher's own snapshot
-        // for this same `tab.closed` publishes too, but it arrives later and is
-        // exactly the delivery the unhappy path does not get.
-        let before = calls.load(Ordering::SeqCst);
-        machines.kill("mini3", "5").await.expect("the close lands");
-        assert!(rows(&machines).is_empty());
-        assert!(
-            calls.load(Ordering::SeqCst) > before,
-            "kill returned without publishing the drop it made"
-        );
-    }
-
-    /// The `tab.open` request for a kind: the agent's argv and the cwd, and
-    /// nothing else invented.
     #[test]
-    fn open_params_carry_the_kinds_argv_and_nothing_else() {
-        let params = open_params(&RcKind::Opencode, Some("/tmp/work")).expect("a launchable kind");
-        assert_eq!(params.argv, vec!["opencode".to_string()]);
-        assert_eq!(params.cwd, "/tmp/work");
-        assert_eq!(params.project_id, 0, "roost picks the project");
-        assert_eq!((params.cols, params.rows), (0, 0), "roost sizes the PTY");
-        assert_eq!(params.title, "", "the title is roost's");
-
-        assert_eq!(
-            open_params(&RcKind::ClaudeRc, None).unwrap().argv,
-            vec!["claude".to_string()]
-        );
-        let e = open_params(&RcKind::Other("borg".into()), None).expect_err("no recipe");
-        assert!(e.contains("borg"), "the refusal names the kind: {e}");
-    }
-
-    /// `launch` opens a tab on the session and answers with the row for it,
-    /// carrying the kind that was ASKED for (the adapter has not claimed the fresh
-    /// tab yet, so roost would report it as a plain shell).
-    #[tokio::test]
-    async fn launch_routes_to_tab_open() {
-        let fake = FakeRoost::start().await;
-        let machines = start(
-            &config_with(&["mini3"]),
-            &sockets(&[("mini3", fake.socket_path())]),
-        );
-        wait_for("the first snapshot", || {
-            machines
-                .state
-                .lock()
-                .unwrap()
-                .get("mini3")
-                .filter(|m| m.seen)
-                .map(|_| ())
-        })
-        .await;
-
-        let row = machines
-            .launch(
-                "mini3",
-                &RcKind::Opencode,
-                None,
-                Some("  /tmp/x  "),
-                None,
-                None,
-            )
-            .await
-            .expect("the open lands");
-        assert_eq!(
-            row["kind"],
-            json!("opencode"),
-            "the kind that was asked for"
-        );
-        assert_eq!(row["workdir"], json!("/tmp/x"), "trimmed");
-        assert_eq!(row["origin"], json!("machine:mini3"));
-        assert_eq!(row["slug"], json!("6"), "the id the fake's next tab gets");
-        // And it is in the snapshot immediately, rather than when the stream
-        // delivers the `tab.opened` this call just caused.
-        assert!(rows(&machines).iter().any(|r| r["slug"] == "6"));
-    }
-
-    /// **A failed launch must not leave a ghost row.**
-    ///
-    /// [`Machines::create`] shows a provisional row the moment the tab opens,
-    /// before any adapter has claimed it — so the watcher's inventory carries
-    /// that tab in its HIDDEN half. If the launched process dies before it ever
-    /// reports (a missing binary, an immediate crash), the `tab.closed` is a
-    /// hidden-half event too. The 2 s poller repaired this on its next
-    /// `tab.list`; the observer-only watcher publishes the vanished tab instead
-    /// (`shed_app::roost::observe_once`), and the authoritative snapshot then
-    /// replaces the provisional row set. Without either, the card is permanent.
-    #[tokio::test]
-    async fn a_launched_tab_that_dies_unclaimed_takes_its_row_with_it() {
-        let fake = FakeRoost::start().await;
-        let machines = start(
-            &config_with(&["mini3"]),
-            &sockets(&[("mini3", fake.socket_path())]),
-        );
-        wait_for("the first snapshot", || {
-            machines
-                .state
-                .lock()
-                .unwrap()
-                .get("mini3")
-                .filter(|m| m.seen)
-                .map(|_| ())
-        })
-        .await;
-
-        machines
-            .launch("mini3", &RcKind::Opencode, None, None, None, None)
-            .await
-            .expect("the open lands");
-        assert!(
-            rows(&machines).iter().any(|r| r["slug"] == "6"),
-            "the optimistic row is showing"
-        );
-
-        // The launched process dies without ever claiming the tab, and roost
-        // closes it. Out of band — through a second reach, NOT through
-        // `Machines::kill`, whose own optimistic drop would hide the bug.
-        let reach: Arc<dyn RoostReach> = Arc::new(LocalSession::new("mini3", fake.socket_path()));
-        tab_close(reach.as_ref(), 6).await.expect("the tab closes");
-
-        wait_for("the provisional row to retire", || {
-            rows(&machines)
-                .iter()
-                .all(|r| r["slug"] != "6")
-                .then_some(())
-        })
-        .await;
-    }
-
-    /// **Eviction's signal, at the layer that delivers it** (plan 015 §3.4).
-    ///
-    /// A lane entry holds a live subscription and, on a remote machine, an
-    /// `ssh -N` child. What retires it is the roost SNAPSHOT: the observer is
-    /// handed the machine's current lane set every time a fresh inventory
-    /// replaces the row set, and an entry absent from that set is dropped. So
-    /// this asserts the two ways a lane-carrying tab can stop existing, both of
-    /// which reach the observer as an EMPTY map:
-    ///
-    /// * the agent exits and its adapter releases the tab (roost's wire removes
-    ///   `ownership`, which drops the row from the agent-owned inventory), and
-    /// * the tab itself closes.
-    ///
-    /// Both matter, because after a release the tab is in the inventory's HIDDEN
-    /// half and its eventual close publishes nothing on its own account — the
-    /// case plan 014's ghost-row fix exists for. An entry that survived either
-    /// would sit behind a row nobody can see.
-    #[tokio::test]
-    async fn a_lane_carrying_tab_that_goes_away_publishes_an_empty_lane_set() {
-        let url = "http://127.0.0.1:41234";
-        let fake = FakeRoost::start().await;
-        let mut owned = ownership("opencode", "ses_abc", "session_status", 1_700_000_100);
-        owned["metadata"] = json!({ "server_url": url });
-        fake.set_tab_axes(VECTOR_TAB, "working", Some(owned), false);
-
-        let machines = start(
-            &config_with(&["mini3"]),
-            &sockets(&[("mini3", fake.socket_path())]),
-        );
-        // Record every lane set published, in order — a history, not a sample:
-        // an entry evicted and re-created between two polls looks like nothing
-        // happened.
-        type Published = Arc<Mutex<Vec<BTreeMap<String, AgentLaneStamp>>>>;
-        let history: Published = Arc::new(Mutex::new(Vec::new()));
-        {
-            let history = Arc::clone(&history);
-            machines.set_lane_observer(Arc::new(move |machine, lanes| {
-                assert_eq!(machine, "mini3");
-                history.lock().unwrap().push(lanes.clone());
-            }));
-        }
-
-        let last = || history.lock().unwrap().last().cloned();
-        wait_for("the lane to be published", || {
-            last().filter(|l| l.get("ses_abc").map(|s| s.server_url.as_str()) == Some(url))
-        })
-        .await;
-
-        // The agent exits: its adapter releases the tab, so the row leaves the
-        // agent-owned inventory even though the tab is still open.
-        fake.set_tab_axes(VECTOR_TAB, "inactive", None, false);
-        wait_for("the released tab's lane to retire", || {
-            last().filter(|l| l.is_empty())
-        })
-        .await;
-
-        // And the now-hidden tab closes — out of band, the way a dead process's
-        // shell does. It must not resurrect anything.
-        let reach: Arc<dyn RoostReach> = Arc::new(LocalSession::new("mini3", fake.socket_path()));
-        tab_close(reach.as_ref(), VECTOR_TAB).await.expect("close");
-        wait_for("the closed tab to be seen", || {
-            rows(&machines).is_empty().then_some(())
-        })
-        .await;
-        assert!(
-            history
-                .lock()
-                .unwrap()
-                .iter()
-                .all(|l| l.is_empty()
-                    || l.get("ses_abc").map(|s| s.server_url.as_str()) == Some(url)),
-            "a lane set was published that named a server nobody reported"
-        );
-        assert_eq!(last(), Some(BTreeMap::new()), "the last word is: no lanes");
-    }
-
-    /// A kind roost has no recipe for is refused BEFORE anything is opened — the
-    /// session's revision does not move.
-    #[tokio::test]
-    async fn an_unknown_kind_is_rejected_without_opening_a_tab() {
-        let fake = FakeRoost::start().await;
-        let machines = start(
-            &config_with(&["mini3"]),
-            &sockets(&[("mini3", fake.socket_path())]),
-        );
-        let before = fake.revision();
-        let e = machines
-            .launch(
-                "mini3",
-                &RcKind::Other("borg".into()),
-                None,
-                None,
-                None,
-                None,
-            )
-            .await
-            .expect_err("no launch recipe");
-        assert!(e.contains("borg"), "{e}");
-        assert_eq!(fake.revision(), before, "nothing was opened");
-    }
-
-    /// Capabilities are the synthesized roost contract — no probe, no SSH, and an
-    /// answer even for a machine that is asleep. An unknown machine is still an
-    /// error.
-    #[tokio::test]
-    async fn capabilities_are_synthesized_not_probed() {
-        let machines = start(
-            &config_with(&["ghost"]),
-            &sockets(&[("nothing", std::path::Path::new("/nope"))]),
-        );
-        let caps = machines
-            .capabilities("ghost")
-            .expect("an unreachable machine still has capabilities");
-        assert_eq!(caps["rc_version"], json!(2));
-        assert_eq!(
-            caps["kind_features"]["opencode"]["attach"],
-            json!("native-remote"),
-            "the desktop shows no terminal action for a roost row"
-        );
-
-        let e = machines.capabilities("nope").expect_err("unknown machine");
-        assert!(e.contains("no machine \"nope\""), "{e}");
+    fn the_reserved_name_is_refused_by_name() {
+        assert!(reject_reserved_name("mini3").is_ok());
+        let refusal = reject_reserved_name(LOCALHOST).expect_err("localhost is reserved");
+        assert!(refusal.contains("localhost"), "{refusal}");
     }
 }

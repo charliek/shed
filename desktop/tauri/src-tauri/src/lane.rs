@@ -2,7 +2,7 @@
 //! [`shed_core::lane`] (plan 015 §3.4, plan 017 §3.5).
 //!
 //! A machine row whose roost tab reported an agent's control surface carries an
-//! `agent_lane` stamp ([`crate::machines::machine_row`], derived by
+//! `agent_lane` stamp ([`crate::roost_hosts::host_row`], derived by
 //! [`shed_core::roost::RoostSession::agent_lane`]). This module is what that
 //! stamp makes possible: open a live transcript for one agent session, send it a
 //! prompt, cancel its turn, and answer the permissions and questions it is
@@ -94,7 +94,7 @@
 //! row's `server_url` changes (a restarted tab picks a new ephemeral port, so
 //! the old entry addresses a socket that is gone), and when the tab disappears
 //! from the roost snapshot. That last one is [`Lanes::reconcile`], driven by
-//! [`crate::machines::OnLanes`] — and it matters most for the case nothing else
+//! [`crate::roost_hosts::OnLanes`] — and it matters most for the case nothing else
 //! covers: a tab whose process **died before any adapter claimed it**. roost now
 //! publishes a snapshot for a known tab that stopped existing even when nothing
 //! visible changed (plan 014's ghost-row fix); without that signal such an entry
@@ -179,7 +179,8 @@ use shed_core::roost::AgentLaneStamp;
 use shed_gx::{FixedDial, GxClient, GxCredentialSource, GxDiscovery, GxTimings, GxTransport};
 use shed_opencode::OpencodeClient;
 
-use crate::machines::{Machines, ReachKind};
+use crate::machines::ReachKind;
+use crate::roost_hosts::RoostHosts;
 
 /// The Tauri event every lane frame reaches the UI on:
 /// `{machine, session_id, event}`, `event` being a serialized
@@ -348,13 +349,13 @@ pub trait LaneMachines: Send + Sync {
     }
 }
 
-impl LaneMachines for Machines {
+impl LaneMachines for RoostHosts {
     fn agent_lanes(&self, machine: &str) -> BTreeMap<String, AgentLaneStamp> {
-        Machines::agent_lanes(self, machine)
+        RoostHosts::agent_lanes(self, machine)
     }
 
     fn reach_kind(&self, machine: &str) -> Result<ReachKind, String> {
-        Machines::reach_kind(self, machine)
+        RoostHosts::reach_kind(self, machine)
     }
 }
 
@@ -681,7 +682,7 @@ impl Lanes {
     pub fn new(
         handle: tokio::runtime::Handle,
         app: AppHandle,
-        machines: Arc<Machines>,
+        machines: Arc<RoostHosts>,
         gx: GxConfig,
     ) -> Lanes {
         let sink: EventSink =
@@ -945,7 +946,7 @@ impl Lanes {
     /// Reconcile one machine's open lanes against a fresh roost snapshot: evict
     /// every entry whose tab is gone or whose STAMP moved.
     ///
-    /// See [`crate::machines::OnLanes`] for why the snapshot is the signal.
+    /// See [`crate::roost_hosts::OnLanes`] for why the snapshot is the signal.
     pub fn reconcile(&self, machine: &str, lanes: &BTreeMap<String, AgentLaneStamp>) {
         let gone: Vec<Arc<LaneEntry>> = {
             let mut inner = lock(&self.inner);

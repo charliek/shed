@@ -21,7 +21,7 @@
 //! wiring: one watcher per configured host, the overlays held together, and a
 //! lookup the session payload applies as it is built.
 //!
-//! Deliberately shaped like [`crate::machines`], down to the `on_change`
+//! Deliberately shaped like [`crate::roost_hosts`], down to the `on_change`
 //! callback, because they are the same problem twice — a per-target reconnect
 //! loop whose output the UI renders. Divergences are noted where they occur.
 
@@ -32,7 +32,7 @@ use serde_json::Value;
 use shed_app::{Backend, RcEventsWatcher, RcWatcherUpdate};
 use shed_core::rc_events::ActivityOverlay;
 
-use crate::machines::OnChange;
+use crate::roost_hosts::OnChange;
 
 /// One watcher per host, and the overlay each has folded so far.
 pub struct LiveActivityLayer {
