@@ -691,6 +691,16 @@ def _bootstrap(app: TauriClient, target: str) -> dict:
     return answer
 
 
+def _assert_auto_hooks_call(call: dict) -> None:
+    """A `session.set_agent_hooks` call as shed itself always sends it: `auto`
+    mode, shed's own client label, nothing pre-skipped, and — at protocol 5 —
+    no authority key on the wire at all."""
+    assert call["mode"] == "auto", call
+    assert call["client"] == "shed-desktop", call
+    assert call["skip"] == [], call
+    assert "lease" not in call, "no authority travels with this op any more"
+
+
 # ---------------------------------------------------------------------------
 # the plan matrix, read-only
 # ---------------------------------------------------------------------------
@@ -959,12 +969,6 @@ def test_a_consented_bootstrap_installs_starts_and_wires_the_hooks(boot, rig, mo
     assert hooks["wired"] == ["claude", "codex"], hooks
     assert [s["agent"] for s in hooks["skipped"]] == ["cursor", "grok"], hooks
     assert "lease_held" not in hooks and "skipped_code" not in hooks, hooks
-    served = rig.v5.agent_hooks_calls
-    assert len(served) == 1, served
-    assert served[0]["mode"] == "auto"
-    assert served[0]["client"] == "shed-desktop"
-    assert served[0]["skip"] == []
-    assert "lease" not in served[0], "no authority travels with this op any more"
 
     # And the shed is a readable roost host now: a watcher was spawned because
     # shed itself started the session.
@@ -972,6 +976,20 @@ def test_a_consented_bootstrap_installs_starts_and_wires_the_hooks(boot, rig, mo
         "the freshly bootstrapped shed to read as reachable",
         lambda: _host_status(boot, "p19-new").get("reachable") is True or None,
     )
+    # Everything the host was asked is shed's own op — asserted by CONTENT, not
+    # by a count. A count cannot be pinned here: `Rig.host`'s own `sheds.list`
+    # starts a background probe for this shed, so a watcher may have been
+    # promoted and armed mid-install and cycled once already, and the reachable
+    # row a wait returns on cannot say WHICH cycle published it. Whether that
+    # second identical call has landed yet is not this cell's subject; the
+    # re-send is, and it is
+    # `test_the_hooks_are_re_sent_on_every_watcher_cycle_and_never_for_an_observer`,
+    # which forces its cycles instead of hoping for them.
+    served = list(rig.v5.agent_hooks_calls)
+    assert served, "the install wired no hooks at all"
+    for call in served:
+        _assert_auto_hooks_call(call)
+
     status = _host_status(boot, "p19-new")
     assert status["kind"] == "shed"
     assert status["server"] == SERVER
@@ -982,6 +1000,104 @@ def test_a_consented_bootstrap_installs_starts_and_wires_the_hooks(boot, rig, mo
     again = boot.call("roost.probe", {"target": target})
     assert again["probe"]["session"]["state"] == "running"
     assert again["plan"]["kind"] == "up-to-date"
+
+
+def test_the_hooks_are_re_sent_on_every_watcher_cycle_and_never_for_an_observer(
+    boot, rig
+):
+    """**The re-send, driven through the real app** (plan 020 §3.3, §7 AC 8).
+
+    `shed-app` has three unit tests for this and all three passed while the app
+    wired nothing at all: plan 019 built `RoostWatcherOptions.hooks` and then no
+    production caller ever constructed a `HooksRefresh`, so the shipped desktop
+    sent `session.set_agent_hooks` once — inside the install — and never again.
+    A unit test of a seam cannot see that nobody reaches the seam. This cell can,
+    which is the only reason it exists.
+
+    Two hosts, one each way, because the rule has two halves and each is
+    meaningless without the other:
+
+    * the **bootstrapped** one must re-send on EVERY cycle. `mode: "auto"` wires
+      the agents whose config directory exists *at that moment*, so an agent the
+      user sets up tomorrow is wired by a later call and by nothing else — and a
+      watcher reconnects constantly (a shed restart, an ssh drop, a laptop
+      waking up).
+    * the **merely watched** one must send on NONE. At protocol 5 the far side
+      would happily let it: roost deleted the authority check on this op, so
+      "shed wires a session it started and nothing else" is now shed's own rule
+      and the only thing enforcing it.
+
+    A hang-up is how a cycle is forced, and every claim here is counted across
+    one. That is not a convenience: `Rig.host` runs a `sheds.list`, which starts
+    a background probe for the bootstrap target too, so a watcher can be promoted
+    mid-install — and a wait on "reachable" then returns on a snapshot that may
+    be from before or after the bootstrap armed the host. A count asserted
+    against such a wait is off by one at random. A count asserted against a cycle
+    this cell itself forced, after the bootstrap has returned, cannot be.
+    """
+    wired_daemon = rig.roost()
+    wired_shed = "p20-hooks-resend"
+    target = rig.host(wired_shed, identity=IDENTITY_V5, roost=wired_daemon)
+
+    # The observer, set up FIRST so it is watched across every cycle below.
+    # Its own daemon: `agent_hooks_calls` is per-fake, and a shared one could
+    # not tell "nobody wired this host" from "somebody wired the other one".
+    observed_daemon = rig.roost()
+    observed_shed = "p20-hooks-observer"
+    rig.host(observed_shed, identity=IDENTITY_V5, running=True, roost=observed_daemon)
+    _refresh(boot)
+    _wait_for(
+        "the merely-watched shed to earn a watcher",
+        lambda: _host_status(boot, observed_shed).get("reachable") is True or None,
+    )
+    assert observed_daemon.agent_hooks_calls == [], (
+        "a host shed only watched was wired on its very first cycle: "
+        f"{observed_daemon.agent_hooks_calls}"
+    )
+
+    _bootstrap(boot, target)
+    _wait_for(
+        "the bootstrapped shed to read as reachable",
+        lambda: _host_status(boot, wired_shed).get("reachable") is True or None,
+    )
+
+    # **Three forced cycles, each one required to send.** The host is armed the
+    # moment `roost.bootstrap` returns and the flag is read at the head of every
+    # cycle, so whichever watcher is on this host — the one the bootstrap
+    # started, or one a background probe promoted before it — must send on each
+    # hang-up. Three rather than two on purpose: the failure this replaces — a
+    # re-send that worked once and then quietly stopped — passes at n = 2.
+    for cycle in (1, 2, 3):
+        before = len(wired_daemon.agent_hooks_calls)
+        wired_daemon.close_all()
+        _wait_for(
+            f"watcher cycle {cycle} to re-send the agent hooks",
+            lambda before=before: len(wired_daemon.agent_hooks_calls) > before or None,
+        )
+
+    # Counted after a wait that can only be satisfied by the cycles above, so
+    # the contents below are asserted over a settled list.
+    served = list(wired_daemon.agent_hooks_calls)
+    assert len(served) >= 4, f"the install's call plus one per cycle: {served}"
+    for call in served:
+        _assert_auto_hooks_call(call)
+
+    # …and the observer wired nothing across all of it — including across a
+    # reconnect of its OWN, which is the cycle a wrongly-armed watcher would send
+    # on. The claimed tab is how that cycle is observed: the daemon is hung up on
+    # first, so the row can only reach the pane through a fresh connection's
+    # snapshot.
+    observed_daemon.close_all()
+    rig.agent_tab(observed_daemon, 21, kind="codex")
+    _wait_for(
+        "the watched shed to reconnect and re-snapshot",
+        lambda: [r for r in _roost_rows(boot, observed_shed) if r["slug"] == "21"]
+        or None,
+    )
+    assert observed_daemon.agent_hooks_calls == [], (
+        "a watcher wired hooks into a session shed never started: "
+        f"{observed_daemon.agent_hooks_calls}"
+    )
 
 
 # ---------------------------------------------------------------------------

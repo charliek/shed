@@ -63,6 +63,7 @@
 //! instead.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
@@ -72,7 +73,8 @@ use roost_ipc::agent::Ownership;
 use roost_ipc::messages::{Tab, TabOpenParams};
 use shed_app::roost::{
     launch_argv, roost_capabilities, shed_reach_entry, tab_close, tab_open, BootstrapRunner,
-    ReachKind as ReachFamily, RoostReach, RoostUpdate, RoostWatcher, SshExec,
+    HooksRefresh, ReachKind as ReachFamily, RoostReach, RoostUpdate, RoostWatcher,
+    RoostWatcherOptions, SshExec,
 };
 use shed_core::config::{MachineEntry, ShedConfig};
 use shed_core::rc::RcKind;
@@ -438,6 +440,35 @@ pub struct RoostHosts {
     /// Targets with a bootstrap in flight, for [`Self::bootstrap`]'s per-target
     /// gate. See [`BootstrapGate`].
     bootstrapping: Arc<Mutex<BTreeSet<HostId>>>,
+    /// **Did THIS APP RUN bootstrap this target?** — one flag per host, and the
+    /// whole of shed's answer to "should this watcher wire agent hooks?" (plan
+    /// 020 §3.3).
+    ///
+    /// [`Self::bootstrap`] sets a target's flag on success and [`Self::remove`]
+    /// clears it. EVERY watcher shed spawns carries a [`HooksRefresh`] holding
+    /// its host's flag, and `refresh` loads it at the head of every successful
+    /// cycle — so a watcher re-sends `session.set_agent_hooks {mode: "auto"}`
+    /// exactly while the flag is set, and is silent the rest of the time. That is
+    /// the entitlement rule — shed wires hooks into a session it started and into
+    /// nothing else — and at protocol 5 it is the only thing enforcing it,
+    /// because roost's own gate on the op is gone and any same-UID client may now
+    /// wire any session.
+    ///
+    /// **A flag rather than a spawn-time decision**, which is what makes the rule
+    /// hold under concurrency. Arming is a property of the HOST: two watchers
+    /// racing to be installed for it read the same flag, so which one wins cannot
+    /// change the answer, and a bootstrap of a host that already has a watcher
+    /// needs no replacement — the running one picks the flag up on its next
+    /// cycle. There is nothing here to be checked-then-acted-on, and so nothing
+    /// to race.
+    ///
+    /// **In memory, never persisted, and deliberately so.** It is a claim about
+    /// what this process did, not a durable grant: an app that was restarted has
+    /// no claim on a session it did not start in this run, and the phone's twin
+    /// has the same lifetime for the same reason. It is emphatically **not** a
+    /// lease — there is no token, no expiry, no tombstone and nothing the far
+    /// side knows about.
+    armed: Arc<Mutex<ArmedFlags>>,
     /// When each shed was last probed, for [`SHED_PROBE_COOLDOWN`].
     probed: Arc<Mutex<BTreeMap<HostId, Instant>>>,
     /// The shed-probe concurrency bound.
@@ -531,6 +562,38 @@ impl Registry {
     }
 }
 
+/// Per-host "may shed wire this host's agent hooks?" — see [`RoostHosts::armed`],
+/// which is where the whole rule is written down.
+type ArmedFlags = BTreeMap<HostId, Arc<AtomicBool>>;
+
+/// `id`'s arming flag, created disarmed on first ask.
+///
+/// One flag per host, however many watchers come and go over it — that sharing
+/// is the point (see [`RoostHosts::armed`]). A free function rather than a method
+/// because [`WatchHandle`] needs the same flag and deliberately holds no
+/// `RoostHosts`.
+fn arming_flag(armed: &Mutex<ArmedFlags>, id: &HostId) -> Arc<AtomicBool> {
+    Arc::clone(lock(armed).entry(id.clone()).or_default())
+}
+
+/// What a watcher for `id` does beyond watching — the ONE place that question is
+/// answered, for all three spawn sites (plan 020 §3.3).
+///
+/// **Always a [`HooksRefresh`], never `None`**, because *whether* to wire is no
+/// longer decided here: the entry carries `id`'s flag and `refresh` loads it at
+/// the head of every cycle. A watcher therefore needs no knowledge of when it was
+/// spawned relative to a bootstrap, and no watcher ever has to be replaced
+/// because the answer changed.
+fn watcher_options(armed: &Mutex<ArmedFlags>, id: &HostId) -> RoostWatcherOptions {
+    RoostWatcherOptions {
+        hooks: Some(HooksRefresh {
+            target: id.token(),
+            client_label: CLIENT_LABEL.to_string(),
+            armed: arming_flag(armed, id),
+        }),
+    }
+}
+
 impl RoostHosts {
     /// Start a watcher per configured machine, plus the implicit [`LOCALHOST`]
     /// one. Never fails: a machine whose reach cannot even be built is still
@@ -574,6 +637,7 @@ impl RoostHosts {
             probing: Arc::new(Mutex::new(BTreeSet::new())),
             listed_sheds: Arc::new(Mutex::new(BTreeSet::new())),
             bootstrapping: Arc::new(Mutex::new(BTreeSet::new())),
+            armed: Arc::new(Mutex::new(ArmedFlags::new())),
             probed: Arc::new(Mutex::new(BTreeMap::new())),
             probe_slots: Arc::new(tokio::sync::Semaphore::new(SHED_PROBE_CONCURRENCY)),
             on_change,
@@ -637,7 +701,12 @@ impl RoostHosts {
         };
 
         let label = id.token();
-        let (watcher, rx) = RoostWatcher::spawn(&self.handle, Arc::clone(&reach.reach), label);
+        let (watcher, rx) = RoostWatcher::spawn_with(
+            &self.handle,
+            Arc::clone(&reach.reach),
+            label,
+            watcher_options(&self.armed, &id),
+        );
         {
             let mut reg = lock(&self.reg);
             reg.reaches.insert(id.clone(), reach);
@@ -1188,7 +1257,12 @@ impl RoostHosts {
                 None => return,
             }
         };
-        let (watcher, rx) = RoostWatcher::spawn(&self.handle, Arc::clone(&reach), id.token());
+        let (watcher, rx) = RoostWatcher::spawn_with(
+            &self.handle,
+            Arc::clone(&reach),
+            id.token(),
+            watcher_options(&self.armed, id),
+        );
         if !lock(&self.reg).install_watcher(id, &reach, watcher) {
             return;
         }
@@ -1208,6 +1282,17 @@ impl RoostHosts {
     /// declaration and stays listed however unreachable it is (see the module
     /// doc), while a shed's roost host exists only while the shed does.
     pub fn remove(&self, id: &HostId) {
+        // **Disarmed FIRST, before anything else is torn down.** A refresh
+        // landing mid-teardown can re-register this same id and spawn a watcher
+        // for it; clearing after the teardown would let that watcher pick up a
+        // flag still reading `true` and wire a session this app run never
+        // started. Clearing first leaves that watcher two possibilities and both
+        // are disarmed: it took the entry we just removed and we stored `false`
+        // into it, or it made a fresh one, which starts `false`. Nothing in
+        // between (plan 020 §3.3).
+        if let Some(flag) = lock(&self.armed).remove(id) {
+            flag.store(false, Ordering::Release);
+        }
         {
             let mut reg = lock(&self.reg);
             // Dropping the watcher aborts its loop; dropping the reach tears
@@ -1219,7 +1304,9 @@ impl RoostHosts {
         lock(&self.execs).remove(id);
         // Forgotten, not kept: a shed that stops and starts again is a NEW
         // question, and making the user wait out a cooldown for an answer that
-        // has certainly changed would be the wrong way round.
+        // has certainly changed would be the wrong way round. (The arming flag
+        // is forgotten for the same reason, above — a host that goes away takes
+        // shed's claim to have started its session with it.)
         lock(&self.probed).remove(id);
         let was_listed = lock(&self.state).remove(id).is_some_and(|m| m.listed);
         // The lane layer holds subscriptions (and `ssh -N` children) against
@@ -1403,9 +1490,21 @@ impl RoostHosts {
         let _ = std::fs::remove_dir_all(&scratch);
 
         if outcome.is_ok() {
+            // **Armed, and that is the whole of it** (plan 020 §3.3): shed
+            // started this session, so every watcher for this host — the one
+            // below, one a background probe raced us to install, one that has
+            // been running since app start — re-sends the hooks at the head of
+            // its next cycle. The flag is per-host and read at send time, so
+            // arming needs no watcher to exist yet and no watcher to be
+            // replaced.
+            arming_flag(&self.armed, &id).store(true, Ordering::Release);
             // shed just started a session there (or proved one was already
             // serving), so this host is worth watching now rather than at
-            // whatever refresh next probes it. `watch` is idempotent.
+            // whatever refresh next probes it. `watch` is idempotent: a shed has
+            // no watcher yet and gets one, and a `machines:` host has had one
+            // since app start and keeps it — which is better than a forced
+            // reconnect as well as simpler, since the running watcher picks the
+            // arming up on its next cycle either way.
             self.watch(&id);
         }
         Ok(outcome)
@@ -1526,6 +1625,7 @@ impl RoostHosts {
             handle: self.handle.clone(),
             on_change: self.on_change.clone(),
             on_lanes: Arc::clone(&self.on_lanes),
+            armed: Arc::clone(&self.armed),
         }
     }
 
@@ -1579,6 +1679,16 @@ struct WatchHandle {
     handle: tokio::runtime::Handle,
     on_change: OnChange,
     on_lanes: Arc<Mutex<Option<OnLanes>>>,
+    /// [`RoostHosts::armed`], so a watcher promoted from a background probe
+    /// carries the same per-host flag one started anywhere else does.
+    ///
+    /// Ordinarily that flag is `false` for the hosts that reach here — a shed the
+    /// prober promotes is one nobody bootstrapped. It matters for the race:
+    /// [`RoostHosts::bootstrap`] arms its target and then watches it, and a probe
+    /// already in flight can install the watcher first. Because both watchers
+    /// hold the SAME flag and read it per cycle rather than at spawn, which of
+    /// them wins the install cannot change whether the hooks get wired.
+    armed: Arc<Mutex<ArmedFlags>>,
 }
 
 impl WatchHandle {
@@ -1599,7 +1709,12 @@ impl WatchHandle {
                 None => return,
             }
         };
-        let (watcher, rx) = RoostWatcher::spawn(&self.handle, Arc::clone(&reach), id.token());
+        let (watcher, rx) = RoostWatcher::spawn_with(
+            &self.handle,
+            Arc::clone(&reach),
+            id.token(),
+            watcher_options(&self.armed, id),
+        );
         if !lock(&self.reg).install_watcher(id, &reach, watcher) {
             return;
         }

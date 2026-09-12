@@ -1261,17 +1261,23 @@ pub struct RoostWatcher {
 
 /// What a watcher does beyond watching.
 ///
-/// Empty by default, and that is the ordinary case: a watcher over somebody
-/// else's machine reads and nothing else. Only a host **shed itself started a
-/// session on** gets the hooks entry, and that is the whole of the rule — shed
-/// wires hooks into a session it started, and into nothing else. At session
-/// protocol 5 the wire would let any same-UID client wire any session it can
-/// reach; this entry is shed's own answer to *should it*, and it is a local fact
-/// about who started what rather than anything the far side enforces.
+/// Empty by default, and that is the ordinary case for an embedder that never
+/// bootstraps anything: such a watcher reads and nothing else. A client that
+/// DOES bootstrap hands every watcher a [`HooksRefresh`] and lets its
+/// [`armed`](HooksRefresh::armed) flag answer "may shed wire this host?" — read
+/// afresh at the head of every cycle, so the entitlement is a property of the
+/// HOST rather than of which watcher happened to be spawned when.
+///
+/// The rule the flag encodes is unchanged: shed wires hooks into a session it
+/// started, and into nothing else. At session protocol 5 the wire would let any
+/// same-UID client wire any session it can reach; this is shed's own answer to
+/// *should it*, and it is a local fact about who started what rather than
+/// anything the far side enforces.
 #[derive(Default)]
 pub struct RoostWatcherOptions {
     /// Re-send `session.set_agent_hooks` at the head of every successful cycle
-    /// (plan 019 §3.4, unconditional since plan 020 §3.3).
+    /// — **for as long as [`HooksRefresh::armed`] is set** (plan 019 §3.4,
+    /// entitlement re-shaped in plan 020 §3.3).
     ///
     /// **Why on every connect and not once at install time.** roost's `auto`
     /// mode wires only the agents whose config directory exists *at that
@@ -2386,10 +2392,11 @@ fn tail(bytes: &[u8], cap: usize) -> String {
 // keeping a host's agent hooks wired
 // ---------------------------------------------------------------------------
 
-/// The watcher's standing instruction to keep one host's agent hooks wired.
+/// The watcher's standing instruction to keep one host's agent hooks wired,
+/// for as long as its owner says shed may.
 ///
-/// Cloneable and cheap: two strings, the target's grammar token and shed's own
-/// client label.
+/// Cloneable and cheap: two strings — the target's grammar token and shed's own
+/// client label — and one shared flag.
 ///
 /// **There is nothing to remember between calls**, which is the whole of plan
 /// 020 §3.3. At session protocol 4 this carried a bearer token and a table of
@@ -2399,6 +2406,14 @@ fn tail(bytes: &[u8], cap: usize) -> String {
 /// always the same one, `{mode: "auto", skip: [], client}` — against a host shed
 /// started the session on. A call that did not land is re-sent by the next
 /// cycle, so a failure needs no recovery state either.
+///
+/// **The one thing that IS consulted is [`armed`](Self::armed), and it is read
+/// at send time.** Deciding at spawn time instead made arming a property of
+/// which watcher won a race to be installed, and forced a live watcher to be
+/// torn down and replaced whenever the answer changed — a replacement whose
+/// predecessor's queued `Down` could land after the replacement's snapshot and
+/// strand a live host on screen as unreachable. A flag read one cycle later
+/// needs none of that.
 #[derive(Clone)]
 pub struct HooksRefresh {
     /// The target grammar token — what the copy and the log line say.
@@ -2407,18 +2422,30 @@ pub struct HooksRefresh {
     /// entry, so a user can ask the host which of their clients wired these
     /// hooks last (`roostctl agent status`).
     pub client_label: String,
+    /// **May shed wire this host's hooks right now?** Shared with whoever
+    /// decides — one flag per host, however many watchers it outlives.
+    ///
+    /// Flipped true when the owner bootstraps the host and false when it forgets
+    /// it; every watcher for that host reads the same flag, so neither answer
+    /// depends on a watcher being spawned, replaced, or dropped at the right
+    /// moment.
+    pub armed: Arc<AtomicBool>,
 }
 
 impl HooksRefresh {
-    /// Re-send `session.set_agent_hooks` on the cycle's own connection.
+    /// Re-send `session.set_agent_hooks` on the cycle's own connection, if shed
+    /// is entitled to this host at this moment.
     ///
-    /// Unconditional: the entitlement is the *existence* of this entry, decided
-    /// once when the watcher was spawned for a host shed itself bootstrapped
-    /// ([`RoostWatcherOptions::hooks`]). There is nothing further to consult and
-    /// no outcome that turns it off — a refusal is logged and the next cycle
-    /// sends the identical request again, because the op is declarative and the
-    /// only thing a failure proves is that it did not arrive.
+    /// [`armed`](Self::armed) is the entire gate: no token, no table, no lease,
+    /// and nothing to consult beyond one atomic load. Past it the call is
+    /// unconditional and no outcome turns it off — a refusal is logged and the
+    /// next cycle sends the identical request again, because the op is
+    /// declarative and the only thing a failure proves is that it did not
+    /// arrive.
     async fn refresh(&self, conn: &mut Conn) {
+        if !self.armed.load(Ordering::Acquire) {
+            return;
+        }
         let result = wire_agent_hooks(conn, &self.client_label).await;
         if let Some(error) = &result.error {
             tracing::warn!(target = %self.target, error = %error, "roost hooks refresh failed");
@@ -5520,9 +5547,22 @@ esac
     // safety argument (§7 AC 8). roost deleted the single-writer token that
     // used to gate `session.set_agent_hooks` and shed put nothing in its place,
     // so two things a token used to enforce are now behaviour: *whether* shed
-    // sends at all is the presence of a [`HooksRefresh`] entry and nothing else,
-    // and *recovering* from a call that did not land is the next cycle sending
-    // the identical request. Both are asserted here rather than argued.
+    // sends at all is one atomic load on [`HooksRefresh::armed`] and nothing
+    // else, and *recovering* from a call that did not land is the next cycle
+    // sending the identical request. Both are asserted here rather than argued.
+
+    /// A [`HooksRefresh`] and the flag it reads, kept apart so a cell can flip
+    /// the entitlement **under a live watcher** — which is the shape plan 020
+    /// §3.3 moved to, and the reason no watcher ever has to be replaced.
+    fn hooks_entry(armed: bool) -> (HooksRefresh, Arc<AtomicBool>) {
+        let flag = Arc::new(AtomicBool::new(armed));
+        let refresh = HooksRefresh {
+            target: "roost:popos/a".to_string(),
+            client_label: "shed-desktop".to_string(),
+            armed: Arc::clone(&flag),
+        };
+        (refresh, flag)
+    }
 
     /// (a) **The re-send happens on every successful cycle** for a host shed
     /// bootstrapped, which is what keeps `mode: auto` honest: it wires only the
@@ -5542,10 +5582,7 @@ esac
             reach,
             "roost:popos/a".to_string(),
             RoostWatcherOptions {
-                hooks: Some(HooksRefresh {
-                    target: "roost:popos/a".to_string(),
-                    client_label: "shed-desktop".to_string(),
-                }),
+                hooks: Some(hooks_entry(true).0),
             },
             BackoffSleeper::default(),
         );
@@ -5572,15 +5609,30 @@ esac
         watcher.stop();
     }
 
-    /// (b) **And on NO cycle for a host shed merely watches.** The entitlement
-    /// came through generation 5 unchanged, and it is now the only thing there
-    /// is: a watcher with no hooks entry must never wire a session it did not
-    /// start, even though at protocol 5 the far side would happily let it.
+    /// (b) **And on NO cycle for a host shed merely watches — until the moment
+    /// it stops merely watching.** The entitlement came through generation 5
+    /// unchanged, and it is now the only thing there is: a disarmed watcher must
+    /// never wire a session shed did not start, even though at protocol 5 the
+    /// far side would happily let it.
+    ///
+    /// Both directions in one cell, because the flag is read at SEND time and
+    /// that is exactly what that buys: the SAME watcher that wired nothing over
+    /// two cycles wires on its next one once the flag flips. Nothing is dropped,
+    /// respawned or reconnected to make that happen — which is why a bootstrap
+    /// of a host that already has a watcher needs to replace nothing, and so
+    /// cannot strand a row behind a dropped watcher's still-queued `Down`.
     #[tokio::test]
-    async fn a_watcher_without_a_hooks_entry_wires_nothing() {
+    async fn a_disarmed_watcher_wires_nothing_until_the_flag_flips() {
         let fake = FakeRoost::start().await;
         let reach: Arc<dyn RoostReach> = Arc::new(LocalSession::new("popos", fake.socket_path()));
-        let (watcher, mut rx) = watch(reach);
+        let (hooks, armed) = hooks_entry(false);
+        let (watcher, mut rx) = RoostWatcher::spawn_inner(
+            &tokio::runtime::Handle::current(),
+            reach,
+            "roost:popos/a".to_string(),
+            RoostWatcherOptions { hooks: Some(hooks) },
+            BackoffSleeper::default(),
+        );
         next_snapshot(&mut rx).await;
         // A second cycle too: "never" is the claim, and a first cycle alone
         // cannot tell it apart from "not yet".
@@ -5591,6 +5643,20 @@ esac
             fake.agent_hooks_calls().is_empty(),
             "an observer wired somebody's hooks"
         );
+
+        // …and now shed bootstraps this host. The live watcher picks the answer
+        // up at the head of its very next cycle.
+        armed.store(true, Ordering::Release);
+        fake.close_all();
+        next_snapshot(&mut rx).await;
+        let calls = fake.agent_hooks_calls();
+        assert_eq!(
+            calls.len(),
+            1,
+            "the flag flipped and the watcher still wired nothing: {calls:?}"
+        );
+        assert_eq!(calls[0]["mode"], "auto");
+        assert_eq!(calls[0]["client"], "shed-desktop");
         watcher.stop();
     }
 
@@ -5629,10 +5695,7 @@ esac
             reach,
             "roost:popos/a".to_string(),
             RoostWatcherOptions {
-                hooks: Some(HooksRefresh {
-                    target: "roost:popos/a".to_string(),
-                    client_label: "shed-desktop".to_string(),
-                }),
+                hooks: Some(hooks_entry(true).0),
             },
             BackoffSleeper::default(),
         );
