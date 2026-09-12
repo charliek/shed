@@ -9,7 +9,7 @@ workstation, or tailnet host — instead of baked into a shed image. It created 
 
 | What it did | What does it now |
 |---|---|
-| the one-shot verbs (`create`, `list`, `probe`, `prompt`, `kill`, …) | **No shipped successor.** The Rust porcelain that absorbed them (`sx`) was itself [sunset in plan 016](sx.md) before it ever shipped. The guest [`shed-ext-rc`](rc-helper.md) keeps serving these verbs inside sheds until the RC hub is retired (S6); machine kickoff is moving to roost's own palette (S4/S5). |
+| the one-shot verbs (`create`, `list`, `probe`, `prompt`, `kill`, …) | **No shipped successor.** The Rust porcelain that absorbed them (`sx`) was itself [sunset in plan 016](sx.md) before it ever shipped. The guest [`shed-ext-rc`](rc-helper.md) keeps serving these verbs inside sheds until the RC hub is retired (S6); machine kickoff moved to [roost's own palette](roost-provider.md) (S4), with [`roost-session` bootstrapped onto the machine first](roost-session-hosts.md) (S5) when it doesn't already have one. |
 | `serve` — the machine RC activity hub on `127.0.0.1:1029` | the [`shed-host-agent` daemon](rc-helper.md#the-machine-hub-shed-host-agent), which hosts the hub as a supervised resident role |
 
 The Rust port was wire-identical by construction, not by assertion: the
@@ -37,7 +37,8 @@ Go hub in-guest. Only the machine-facing binary retired.
    [The machine hub](rc-helper.md#the-machine-hub-shed-host-agent)). Unlike
    `shed-machine-rc serve`, it does not exit after an idle period.
 2. There is nothing to install for the one-shot verbs — `sx` was sunset unreleased
-   (see [its tombstone](sx.md) for where each job went). Machine kickoff is moving to
-   roost's palette; that provider is not built yet.
+   (see [its tombstone](sx.md) for where each job went). Machine kickoff runs through
+   [roost's palette](roost-provider.md) instead, bootstrapping
+   [`roost-session` onto the machine](roost-session-hosts.md) first if needed.
 3. Remove the old binary at your convenience — `brew uninstall shed-machine-rc`, or
    `apt remove shed-machine-rc`. Nothing in the current tree invokes it.

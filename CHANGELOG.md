@@ -215,6 +215,71 @@ reads an `## Unreleased` heading._
   render) and `bodies_to` (every recorded body for a path suffix), so a cell in
   another language can assert the bytes a decision actually posted.
 
+## Unreleased
+
+_Staged by plan 019 (S4 `charliek/shed#326`, S5 `charliek/shed#327`); at
+release time fold this body into the new `## vX.Y.Z` section and replace this
+note with a real `**Ships:** server, desktop` line — this bundle touches only
+`internal/`, `cmd/shed/`, `crates/shed-core`, `crates/shed-app`, and the Tauri
+client, none of which is `host-agent`._
+
+- **`shed roost-provider` — kickoff moves into roost's own palette (S4,
+  `charliek/shed#326`), replacing the kickoff half of the unreleased, sunset
+  `sx`.** `shed roost-provider list|activate` implements roost's dynamic
+  provider contract in Go (`internal/roostprovider/`): `list` enumerates
+  running sheds and `machines:` entries with no SSH; `activate` probes the
+  chosen host over one SSH round trip plus roost's own client-bridge wire
+  (`session.identify`, `tab.list`, `tab.open` — no `roostctl` needed on the
+  far side) and opens a tab running the chosen agent (`claude`, `codex`,
+  `cursor`, `opencode`, `gx`, `grok`) under `bash -lc` in an absolute working
+  directory. Every expected non-actionable state (not installed, not
+  running, protocol mismatch, unreachable, no local `ssh`, no agents found)
+  exits zero with a pinned row rather than failing the phase.
+  `shed roost-provider --install [--dry-run] [--uninstall]` writes the
+  launcher script roost discovers, to `<dir>/providers/shed` where `<dir>`
+  is the parent of a non-empty `$ROOST_CONFIG` else `$HOME/.config/roost` —
+  roost does not consult `$XDG_CONFIG_HOME`, so neither does this. See
+  [`docs/extensions/roost-provider.md`](https://charliek.github.io/shed/extensions/roost-provider/).
+- **The desktop app can put `roost-session` on a shed or machine that
+  doesn't have one yet (S5, `charliek/shed#327`).** A new sans-IO bootstrap
+  (`crates/shed-core/src/roost/bootstrap/`) composes roost's own script
+  builders and parsers into the install/start choreography roost's own UI
+  uses, driven over the shed's or machine's own SSH by a new `SshExec`
+  runner in `crates/shed-app`, and exposed to the Tauri client as
+  `roost.probe`/`roost.preview`/`roost.bootstrap`/`roost.launch`. After a
+  Start it performs itself, the client wires the target's agent hooks
+  (`session.set_agent_hooks {mode: "auto"}`) so a shed's `codex`/`cursor`
+  rows are meant to carry roost-sourced activity instead of liveness only —
+  see [`docs/extensions/roost-session-hosts.md`](https://charliek.github.io/shed/extensions/roost-session-hosts/)
+  for the source ladder, the exact (narrow) rollback promise, the PATH
+  warning, and `shed reset` handling. **Honestly incomplete in two ways,
+  both stated in the docs:** the release-asset source rung is implemented
+  and fixture-tested but has never been exercised against a real download —
+  `RELEASE_PIN` is `None` because no published roost release speaks session
+  protocol 4 yet (the latest, 0.0.19, speaks 2); and the payoff itself
+  (roost-sourced `codex`/`cursor` activity replacing liveness-only on a real
+  shed) has not yet been demonstrated live — `epics/roost-pivot.md`'s
+  liveness-only clause stays in place until that leg runs.
+  `crates/fixtures/machines/` gives Go a shared, Rust-asserted fixture for
+  decoding `machines:` (`internal/config/machines.go`), used by the
+  provider's inventory and by the desktop's shed-as-roost-host registry
+  alike.
+- Sheds become roost hosts in the Tauri client: a shed's `rc.list` rows are
+  now the **union** of its hub rows (`source: "hub"`) and its roost rows
+  (`source: "roost", origin: "roost:<server>/<shed>"`), and a filtered
+  `rc.list {host, shed}` returns both (previously a filtered list dropped
+  the whole snapshot). `roost.launch` generalizes `machine.launch` to any
+  roost host; `machine.launch` stays as an alias.
+- `internal/sshd/wrap_stdin_test.go` pins the far-side shape every roost
+  bootstrap script depends on: a `/bin/sh -s` script piped on stdin through
+  shed's `bash -lc` sshd wrap (`internal/sshd/wrap.go`) propagates its exit
+  code unmodified — the bootstrap machines classify every probe/install
+  outcome on that code.
+- No CLI bootstrap path was added (pin P2 — `shed` itself never installs
+  `roost-session`, only the desktop and mobile apps do), and no roost
+  binary is bundled or vendored into shed's own build or rootfs images
+  (pin P1).
+
 ## v0.8.2 — 2026-08-17
 
 **Ships:** server, machine-rc

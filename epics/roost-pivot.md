@@ -38,8 +38,8 @@ gh issue list -R charliek/shed --state open --search "in:title [A"
 | R10 | roost#439 | RP/M3 | the opencode plugin exposes the TUI's own server on loopback and reports `server_url` |
 | A7 | [#340](https://github.com/charliek/shed/issues/340) | RP/M3 | ✅ **shipped (plan 017)** — the `gx` lane adapter, the SECOND implementation of `shed_core::lane`, which is what turns the contract from a design into a contract |
 | S4m | [shed-mobile#19](https://github.com/charliek/shed-mobile/issues/19) | RP/M3 | the phone mirrors the lane DTOs through FRB and forwards `server_url` over dartssh2 — opencode AND gx |
-| S4 | [#326](https://github.com/charliek/shed/issues/326) | RP/M5 | the `shed` roost provider script — the kickoff path that replaced `sx` |
-| S5 | [#327](https://github.com/charliek/shed/issues/327) | RP/M5 | `roost-session` inside sheds and on machines, via roost's bootstrap ladder |
+| S4 | [#326](https://github.com/charliek/shed/issues/326) | RP/M5 | **landed (plan 019)** — the `shed` roost provider script, the kickoff path that replaced `sx` |
+| S5 | [#327](https://github.com/charliek/shed/issues/327) | RP/M5 | **landed (plan 019)** — `roost-session` inside sheds and on machines, via roost's bootstrap ladder; the payoff (roost-sourced activity replacing liveness-only on a shed) is implemented and hermetically tested but not yet demonstrated on a real shed — see plan 019 C10 |
 | S6 | [#328](https://github.com/charliek/shed/issues/328) | RP/M6 | retire the RC hub, tmux driver, `shed-ext-rc`, Go engine, rc-parity oracle — **after S5** |
 | S7 | [#329](https://github.com/charliek/shed/issues/329) | RP/M6 | ✅ **done (plan 016)** — `sx` sunset entirely: crate, release wiring and the rc-parity one-shot family deleted |
 
@@ -122,7 +122,9 @@ consumes the hub. S7 is done (plan 016) — it had no blockers.
 - **S3m in shed-mobile ← S1.** Same FRB bridge; ships in M1 alongside S3.
 - **A4 → shed-mobile.** The opencode crate is FRB-exposed for the phone.
 - **S5 ↔ roost HS-3 bootstrap.** The ladder installs `roost-session` over
-  SSH with verify-before-commit; decide rootfs-baked vs provisioned in S5.
+  SSH with verify-before-commit; decided in plan 019 (pin P1): SSH-provisioned
+  on demand from the connecting client, never rootfs-baked, and no bundled or
+  vendored roost binaries anywhere in shed's own build.
 - **S6 waits on S3m, A4, A5, A6, and S5** — everything off the hub first,
   *including* the live consumers: until S5 moves `prox-test` and mini3
   onto `roost-session`, they still run the hub/tmux stack, and retiring

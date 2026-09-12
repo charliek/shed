@@ -20,7 +20,7 @@ moved:
 
 | What `sx` did | Where it went |
 |---|---|
-| Kickoff (`agent`, `plan`) | Roost's own palette, via the `shed` dynamic-provider script (S4, [`charliek/shed#326`](https://github.com/charliek/shed/issues/326)) — **not yet built**. |
+| Kickoff (`agent`, `plan`) | Roost's own palette, via the [`shed` dynamic-provider script](roost-provider.md) (S4, [`charliek/shed#326`](https://github.com/charliek/shed/issues/326)). |
 | Observe (`ls`, `watch`, `attach`, `kill`) | The desktop and mobile clients, reading roost directly. |
 | Engine-compat (`sx rc <subcommand>`) | The guest [`shed-ext-rc`](rc-helper.md), until the RC hub is retired (S6, [`charliek/shed#328`](https://github.com/charliek/shed/issues/328)). |
 

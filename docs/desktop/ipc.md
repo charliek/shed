@@ -88,6 +88,16 @@ carrying no transport error text.
 | `machines.list` | — | `machines[]` — every configured machine's health, name-ordered |
 | `machine.kill` | `machine`, `slug` | `{}` (addressed by machine + slug, not host/shed) |
 | `rc.inject_test` | `shed`, `slug`, `kind?`, `state?`, `managed?`, `display_name?`, `created_by?`, … | `{}` — **test mode only**; injects a session (e.g. a legacy row) into the table |
+| `roost.probe` | `target` | `Probe` + `fingerprint` — a read-only look at a shed or machine's `roost-session` state |
+| `roost.preview` | `target` | the plan (Install/Update/Start/Report/nothing to do) plus the sentence naming where the bytes would come from |
+| `roost.bootstrap` | `target`, `fingerprint`, `consent: true` | installs/updates/starts `roost-session` on that target and wires its agent hooks; refuses without consent or against a stale fingerprint |
+| `roost.launch` | `target`, `kind?`, `workdir?`, … | generalizes `machine.launch` to any roost host (a shed or a machine); `machine.launch` stays as an alias |
+
+The four ops above are how the desktop drives [putting `roost-session` on a shed or
+machine](../extensions/roost-session-hosts.md) — the source ladder, the plan matrix, the
+consent card, and the rollback promise are documented there, not here. Kicking off an agent
+from roost's own command palette instead of the desktop app is [the `shed` roost
+provider](../extensions/roost-provider.md).
 
 `initial_prompt` is an optional one-line kickoff delivered once the session is ready (an
 initial prompt for `claude-rc`, an initial command for `shell`). Leading/trailing whitespace
@@ -141,8 +151,15 @@ Only **agent-owned tabs** are sessions; a plain shell tab in roost is not one. A
 itself). There is **no terminal action** on a roost row yet — roost's `vt` attach hasn't
 landed (`kind_features.attach = "native-remote"` gates it off) — so `kill` maps to
 `tab.close` and `launch` to `tab.open` with the chosen agent binary in the chosen working
-directory; typed prompts and permission modes arrive later with the `shed` roost provider
-script. See the roost project's own docs for the daemon and its IPC contract.
+directory; typed prompts and permission modes arrive later with [the `shed` roost
+provider](../extensions/roost-provider.md).
+
+A **shed**, not just a `machines:` entry, can also become a roost host: `roost.probe` /
+`roost.bootstrap` install and start a `roost-session` on a shed the same way, over the shed's
+own SSH — see [putting `roost-session` on a shed or machine](../extensions/roost-session-hosts.md)
+for the mechanism, the source ladder, and consent. A shed's rows are then the **union** of its
+hub rows (`source: "hub"`) and its roost rows (`source: "roost"`); a filtered `rc.list {host,
+shed}` returns both. See the roost project's own docs for the daemon and its IPC contract.
 
 ### UI-truth ops (Tauri)
 
