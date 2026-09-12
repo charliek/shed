@@ -1338,8 +1338,14 @@ fn dispatch(
                 ));
             }
             state.agent_hooks_calls.push(params.clone());
-            Ok(match &state.agent_hooks_result {
-                Some(seeded) => seeded.clone(),
+            // `take`, not a clone: both this field's doc and the setter's say
+            // "the NEXT `session.set_agent_hooks`", and a seed that is never
+            // consumed answers every later call in the same fake too. That is
+            // the shape that passes for the wrong reason — a test seeding the
+            // partial-failure row and then asserting the vendored vector on a
+            // second call would read the seed back and never notice.
+            Ok(match state.agent_hooks_result.take() {
+                Some(seeded) => seeded,
                 None => vector(VECTOR_SET_AGENT_HOOKS)["result"].clone(),
             })
         }

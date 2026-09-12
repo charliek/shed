@@ -433,16 +433,33 @@ func TestControlDirFor(t *testing.T) {
 		if err := os.WriteFile(notADir, []byte("x"), 0o644); err != nil {
 			t.Fatal(err)
 		}
-		// Both candidates unusable: XDG points under a regular file, and the
-		// /tmp fallback is forced over the length limit by a huge uid.
+		// Both candidates have to be unusable, and making the SECOND one
+		// unusable is the part that is easy to get wrong. `uid` is an int, so
+		// no representable value makes the /tmp fallback exceed the length
+		// limit — an earlier version of this test passed `1`, which produces a
+		// perfectly usable `/tmp/shed-roost-provider-1`, so it asserted the
+		// SUCCESS path under a name that promises the opposite (and left the
+		// directory behind). What does make the fallback fail is a regular
+		// FILE sitting at its path: MkdirAll stats it, finds a non-directory
+		// and answers ENOTDIR.
+		//
+		// The uid is this process's pid so two packages running the suite
+		// concurrently cannot fight over the same name.
+		uid := os.Getpid()
+		fallback := filepath.Join(tmpControlRoot, fmt.Sprintf("%s-%d", controlDirName, uid))
+		if err := os.WriteFile(fallback, []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = os.Remove(fallback) })
+
 		got := ControlDirFor(func(k string) string {
 			if k == "XDG_RUNTIME_DIR" {
 				return notADir
 			}
 			return ""
-		}, 1)
-		if got != "" && strings.HasPrefix(got, notADir) {
-			t.Fatalf("an unusable candidate was used: %q", got)
+		}, uid)
+		if got != "" {
+			t.Fatalf("both candidates were unusable, so the answer is no mux at all; got %q", got)
 		}
 	})
 }

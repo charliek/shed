@@ -34,10 +34,20 @@ type ClientConfig struct {
 	// pin P7) for the `shed roost-provider` menu, but never writes or
 	// validates it. Keeping the field itself typed as the raw yaml.Node,
 	// rather than replacing it with the decoded struct, is what makes
-	// SaveToPath's whole-document rewrite round-trip the subtree byte-for-byte
-	// instead of silently dropping any field Go's subset doesn't model on the
-	// next `shed` command that updates this file (cache refresh, `shed server
-	// add`, token mint…).
+	// SaveToPath's whole-document rewrite RETAIN the whole subtree — every
+	// field Go's subset doesn't model (rc_bin and anything the Rust schema
+	// gains later), plus head/line comments and each scalar's flow-vs-block
+	// and quoting style — instead of silently dropping it on the next `shed`
+	// command that updates this file (cache refresh, `shed server add`, token
+	// mint…).
+	//
+	// **Retained, not byte-preserved**, and the difference is worth stating
+	// because the weaker claim is the true one: SaveToPath ends in
+	// yaml.Marshal, which RE-ENCODES this node rather than copying the
+	// original bytes, so gopkg.in/yaml.v3 normalizes indentation to its own
+	// four spaces and collapses alignment padding. Measured on a hand-uglified
+	// document: comments, flow mappings and quoting all survived, the
+	// unmodelled keys all survived, and the output was not byte-identical.
 	Machines yaml.Node `yaml:"machines,omitempty"`
 
 	// updateMu serializes Update against itself inside THIS process, so the

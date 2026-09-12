@@ -19,6 +19,8 @@
  */
 import { useCallback, useEffect, useRef, useState } from "react";
 
+import { roostBoardGuard, type RoostBoardGuard } from "./roostBoard";
+
 /** A binary's self-report (`identify`), when one answered at all. */
 export type RoostIdentity = {
   app_version: string;
@@ -335,12 +337,24 @@ export function useRoostPreview(target: string | null): RoostCardState & { refre
  *  overwrite a faster one that started after it. */
 export function useRoostBoard(targets: string[], nonce: number): Record<string, RoostCardState> {
   const [board, setBoard] = useState<Record<string, RoostCardState>>({});
-  const gens = useRef<Record<string, number>>({});
+  /** Which targets need a fetch, and which answers may still commit — see
+   *  `roostBoard.ts`, which owns that bookkeeping and is tested on its own. */
+  const guard = useRef<RoostBoardGuard | null>(null);
+  if (guard.current === null) guard.current = roostBoardGuard();
   const lastNonce = useRef(nonce);
   const key = targets.join("\u0001");
 
+  // The component's real unmount, and ONLY that. It is a separate effect on
+  // purpose: React also runs a cleanup on every deps change, and reading that
+  // as "stop caring about the answers in flight" is what used to strand a card
+  // on `loading` the moment a second card joined the pane (see
+  // `roostBoard.ts`). Supersession is per-target and the guard owns it.
+  useEffect(() => () => guard.current?.unmount(), []);
+
   useEffect(() => {
-    let cancelled = false;
+    // Named so it cannot be read as the `board` STATE above — this is the
+    // bookkeeping, and the two are different things.
+    const boardGuard = guard.current!;
     const wanted = new Set(key ? key.split("\u0001") : []);
     const forceAll = lastNonce.current !== nonce;
     lastNonce.current = nonce;
@@ -356,30 +370,19 @@ export function useRoostBoard(targets: string[], nonce: number): Record<string, 
       }
       return changed ? next : b;
     });
-    for (const target of wanted) {
-      // Skip a target this board already has an answer (or an in-flight fetch)
-      // for, unless this render is the explicit `nonce`-driven refresh —
-      // re-fetching an unchanged target on every board-size change would race
-      // it against its OWN prior in-flight probe (a real `ssh` reach to the
-      // same host), and roost's reach layer refuses a second live connection
-      // to itself.
-      if (!forceAll && gens.current[target] !== undefined) continue;
-      const mine = (gens.current[target] = (gens.current[target] ?? 0) + 1);
+    for (const { target, gen } of boardGuard.sync(wanted, forceAll)) {
       setBoard((b) => ({ ...b, [target]: { preview: b[target]?.preview, error: null, loading: true } }));
       roostPreview(target).then(
         (preview) => {
-          if (cancelled || gens.current[target] !== mine) return;
+          if (!boardGuard.accept(target, gen)) return;
           setBoard((b) => ({ ...b, [target]: { preview, error: null, loading: false } }));
         },
         (e: unknown) => {
-          if (cancelled || gens.current[target] !== mine) return;
+          if (!boardGuard.accept(target, gen)) return;
           setBoard((b) => ({ ...b, [target]: { preview: undefined, error: String(e), loading: false } }));
         },
       );
     }
-    return () => {
-      cancelled = true;
-    };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [key, nonce]);
 

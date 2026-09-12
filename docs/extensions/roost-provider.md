@@ -28,7 +28,7 @@ shed roost-provider --uninstall            # remove it
 The launcher is a small POSIX shell script roost discovers by scanning its `providers/`
 directory. `--install` writes it to:
 
-```
+```text
 <dir>/providers/shed
 ```
 
@@ -125,7 +125,7 @@ before roost's own clock runs out.
 If you raise roost's own timeout for this provider in its config form — for a slow link, or a
 target that takes its time to answer — raise `SHED_ROOST_PROVIDER_TIMEOUT` to match:
 
-```
+```text
 # ~/.config/roost/config.conf (roost's own config-form syntax)
 provider = label="shed" run="/home/user/.config/roost/providers/shed" timeout=20
 ```
