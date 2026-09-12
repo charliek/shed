@@ -1129,7 +1129,7 @@ def test_a_stopped_shed_loses_its_watcher_and_its_rows(boot, rig, mock):
 # ---------------------------------------------------------------------------
 
 
-def test_without_a_source_there_is_no_button(rig, mock, _reset_mock):
+def test_without_a_source_there_is_no_button(rig):
     """The sixth plan-matrix row: the host implies an Install, and shed has
     nothing to install.
 
@@ -1137,29 +1137,56 @@ def test_without_a_source_there_is_no_button(rig, mock, _reset_mock):
     environment: no `ROOST_SESSION_INSTALL_BIN`, no protocol-4 roost beside this
     app, and `RELEASE_PIN` is `None` until roost ships one — so the ladder ends at
     `NoSource` and the preview says so in the words plan 019 §3.5 pinned.
-    """
-    with _boot_app(rig, mock.base_url, install_bin=None, session_bin=ABSENT) as app:
-        target = rig.host("p19-nosource")
-        preview = app.call("roost.preview", {"target": target})
-        assert preview["plan"]["kind"] == "install", preview
-        assert preview["source"]["rung"] == "none"
-        assert preview["actionable"] is False, "no bytes, no button"
-        sentence = preview["source"]["sentence"]
-        assert "no roost release speaking session protocol 4 is published yet" in sentence
-        assert "(the latest, 0.0.19, speaks 2)" in sentence
-        assert "ROOST_SESSION_INSTALL_BIN" in sentence
-        assert f"{target} was left untouched." in sentence
 
-        # And acting on it anyway refuses at the source stage, with that sentence.
-        probe = app.call("roost.probe", {"target": target})["probe"]
-        answer = app.call(
-            "roost.bootstrap",
-            {"target": target, "fingerprint": probe["fingerprint"], "consent": True},
-        )
-        assert answer["ok"] is False
-        assert answer["error"]["stage"] == "source"
-        assert "no roost release speaking session protocol 4" in answer["error"]["message"]
-        assert not rig.installed("p19-nosource").exists()
+    Its own PRIVATE mock too, for `_mint_private_shed`'s reason, which this cell
+    originally got away with ignoring. On the shared mock the module-scoped
+    `boot` app also sees this shed go running and starts its own `observe_sheds`
+    bridge probe on it, and roost then refuses the second live connection to the
+    same fake-ssh jail with `another Roost is connected`. Three reaches happen
+    here in a row (preview, probe, bootstrap), so there are three chances to
+    lose that race — and it IS only a race: this cell won it on the Linux render
+    gate every time and lost it on a macOS runner, where the timeout scale is 4x
+    and the machine is loaded. A refusal aimed at the wrong opponent, exactly as
+    `_mint_private_shed` describes: two read-only probes from two harness-only
+    processes, not a real second client.
+    """
+    target_name = "p19-nosource"
+    _mint_private_shed(rig, target_name)
+    private_mock = MockShedServer()
+    private_mock.start()
+    try:
+        private_mock.add_shed({"name": target_name, "status": "running", "backend": "vz"})
+        with _boot_app(
+            rig, private_mock.base_url, install_bin=None, session_bin=ABSENT
+        ) as app:
+            target = f"roost:{SERVER}/{target_name}"
+            # The authoritative refresh that makes the shed addressable at all
+            # (`RoostHosts::ssh_entry`'s gate) — `rig.host` would have done this
+            # via the shared mock; this cell does it against its private one.
+            app.call("sheds.list")
+            preview = app.call("roost.preview", {"target": target})
+            assert preview["plan"]["kind"] == "install", preview
+            assert preview["source"]["rung"] == "none"
+            assert preview["actionable"] is False, "no bytes, no button"
+            sentence = preview["source"]["sentence"]
+            assert "no roost release speaking session protocol 4 is published yet" in sentence
+            assert "(the latest, 0.0.19, speaks 2)" in sentence
+            assert "ROOST_SESSION_INSTALL_BIN" in sentence
+            assert f"{target} was left untouched." in sentence
+
+            # And acting on it anyway refuses at the source stage, with that
+            # sentence.
+            probe = app.call("roost.probe", {"target": target})["probe"]
+            answer = app.call(
+                "roost.bootstrap",
+                {"target": target, "fingerprint": probe["fingerprint"], "consent": True},
+            )
+            assert answer["ok"] is False
+            assert answer["error"]["stage"] == "source"
+            assert "no roost release speaking session protocol 4" in answer["error"]["message"]
+            assert not rig.installed(target_name).exists()
+    finally:
+        private_mock.stop()
 
 
 # ---------------------------------------------------------------------------
