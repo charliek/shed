@@ -34,7 +34,22 @@
     "(nothing in Rust has a provider menu). It is in this file rather than a file",
     "of its own precisely so the two concepts sit side by side and stay visibly",
     "distinct: §3.2's 'unreachable' row is the PROVIDER's reading of transport +",
-    "255-or-timeout, not a roost class, and three roost classes collapse into it."
+    "255-or-timeout, not a roost class, and three roost classes collapse into it.",
+    "",
+    "`reach_kinds` is the THIRD mapping and the one §3.3 names alongside Go's:",
+    "which `shed_app::roost::ReachKind` a class becomes, asserted from Rust",
+    "(crates/shed-app/src/roost.rs's own test module, against the live",
+    "`ReachError::from_ssh_failure`). It is the CLIENTS' reading of the same six",
+    "classes — what rides out on `RoostUpdate::Down { kind }` and, through the",
+    "probe's `Step::Call`, what tells `NotInstalled` from `NoSession` in the plan",
+    "matrix. It sits beside `provider_rows` because the two are deliberately",
+    "different collapses of one classifier: the provider's menu says",
+    "'not-running' where a client says 'no-session', and the client has a fourth",
+    "kind — `other` — that NO class maps to, because it is what a failure that",
+    "never ran an ssh exec at all reports.",
+    "",
+    "Plan 019 C2 shipped `classes` with only its two legs and said so; C6 added",
+    "this section when `ReachError` came into being."
   ],
   "classes": [
     {
@@ -166,6 +181,38 @@
       "name": "auth-folds-into-unreachable",
       "class": "auth",
       "row": "unreachable"
+    }
+  ],
+  "reach_kinds": [
+    {
+      "name": "not-found-is-the-kind-that-offers-an-install",
+      "class": "not-found",
+      "kind": "not-installed"
+    },
+    {
+      "name": "no-session-is-the-kind-that-offers-a-start",
+      "class": "no-session",
+      "kind": "no-session"
+    },
+    {
+      "name": "transport-is-unreachable-this-is-the-255-and-timeout-family",
+      "class": "transport",
+      "kind": "unreachable"
+    },
+    {
+      "name": "changed-host-key-is-unreachable-its-own-copy-carries-the-warning",
+      "class": "changed-host-key",
+      "kind": "unreachable"
+    },
+    {
+      "name": "host-key-unknown-is-unreachable",
+      "class": "host-key-unknown",
+      "kind": "unreachable"
+    },
+    {
+      "name": "auth-is-unreachable",
+      "class": "auth",
+      "kind": "unreachable"
     }
   ]
 }

@@ -106,7 +106,7 @@ no-semantic-edits rule above governs the vendored vectors, not these.
 |---|---|---|
 | `bootstrap/exec-chain-command.txt` | roost's candidate-ladder remote command, `roost_ipc::bootstrap::exec_chain_command(false)` | Rust (`shed-core/tests/roost_provider_vectors.rs`, against the LIVE function) and Go (`internal/roostprovider`'s `ExecChainCommand` constant) |
 | `agent-table.json` | kind → binary → title for the six agents the roost provider can start | Rust (`launch_argv` + `roost_capabilities().kinds`) and Go (`internal/roostprovider`'s `agentTable`) |
-| `stderr-classes.json` | how a failed `ssh` exec classifies (`roost_ipc::ssh::classify_ssh_failure`), plus shed's own class → provider-row mapping | Rust (the live classifier, `classes` only) and Go (`ClassifySSHFailure` + `ProviderRow`) |
+| `stderr-classes.json` | how a failed `ssh` exec classifies (`roost_ipc::ssh::classify_ssh_failure`), plus shed's own class → provider-row and class → `ReachKind` mappings | Rust (the live classifier, `classes`; and `shed_app::roost::ReachError`, `reach_kinds`) and Go (`ClassifySSHFailure` + `ProviderRow`) |
 
 They exist because one behaviour is implemented on both sides of a language
 boundary — the Go `shed roost-provider` subcommand and the Rust client core —

@@ -155,10 +155,46 @@ pub(crate) fn write_exec(path: &Path, body: &str) {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).expect("mkdir for a test script");
     }
-    std::fs::write(path, body)
-        .unwrap_or_else(|error| panic!("writing {}: {error}", path.display()));
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))
+
+    // **Stage and rename, rather than write in place** — so a reader never sees
+    // a half-written script, and so the name appears only once its contents are
+    // complete and executable.
+    //
+    // This does NOT fix the `ETXTBSY` flake in this rig, and it is worth saying
+    // so here rather than letting the next person assume it did. That race is
+    // about the INODE, not the name: a sibling test thread calling
+    // `Command::spawn` forks, the child inherits every open descriptor,
+    // and exec'ing a file that any descriptor still holds open for writing
+    // fails "Text file busy". Renaming moves the name onto the same inode the
+    // forked child may be holding, so the window survives.
+    //
+    // Measured on this rig: `the_sibling_rung_is_taken_when_it_speaks_protocol_4`
+    // fails 0 times in 20 runs on its own and about 1 in 10 inside the full
+    // `roost::bootstrap` suite, which is the signature of exactly this race —
+    // it needs concurrent forks to appear. The failure is invisible in the
+    // assertion because the sibling rung is *designed* to fall through when its
+    // local `identify` fails, so an exec error reads as "no sibling here".
+    //
+    // Closing it properly means not exec'ing a file this process wrote while
+    // other threads are forking — a rig-level change (exec from a
+    // pre-populated, read-only fixture directory) rather than a one-line fix,
+    // and out of scope for the commit that noticed it.
+    let staging = path.with_file_name(format!(
+        ".{}.{}.{:?}.staging",
+        path.file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("script"),
+        std::process::id(),
+        std::thread::current().id(),
+    ));
+    std::fs::write(&staging, body)
+        .unwrap_or_else(|error| panic!("writing {}: {error}", staging.display()));
+    std::fs::set_permissions(&staging, std::fs::Permissions::from_mode(0o755))
         .expect("chmod +x a test script");
+    std::fs::rename(&staging, path).unwrap_or_else(|error| {
+        let _ = std::fs::remove_file(&staging);
+        panic!("renaming into {}: {error}", path.display())
+    });
 }
 
 /// How a registered event stream is classified — roost's own distinction, kept
