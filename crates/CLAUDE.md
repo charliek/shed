@@ -157,34 +157,51 @@ was on the day its own lock was regenerated, against a crate that publishes **no
 stability promise** (the pin is what absorbs that). With the rev in the manifest, mobile's
 lock cannot disagree, so `shed-mobile/scripts/check-lock-rev.sh` needs no change.
 
-**Bump recipe:** edit the `rev` in `crates/Cargo.toml`, run `cargo update -p roost-ipc`, re-copy
-`fixtures/roost-vectors/` from the new rev's `tests/ipc-vectors/` (updating that README's sha),
-commit all of it. Re-read roost's `docs/reference/ipc-compatibility.md` on any bump crossing a
-`SESSION_PROTOCOL_VERSION` change — `shed_core::roost::Conn::session_identify` refuses a
-mismatch by name rather than limping. roost keeps **one `session.identify` vector per
-generation** (`session.identify.response.v<N>.json`); shed vendors only the current one, so a
-generation bump renames the vendored file and both fakes' `include_str!`/`_vector()` paths move
-with it. An older shape is a fake *control* (`set_session_protocol`, `serve_without_features`),
-never a second vector to keep in step.
+**Bump recipe:** edit the `rev` in **all three manifests that pin it** — `crates/Cargo.toml`,
+`desktop/tauri/src-tauri/Cargo.toml`, and shed-mobile's `rust/Cargo.toml` — then run
+`cargo update -p roost-ipc` in each of the three workspaces so all three lockfiles
+(`crates/Cargo.lock`, `desktop/tauri/src-tauri/Cargo.lock`, `shed-mobile/rust/Cargo.lock`) move
+together. One manifest moving without its siblings is not a smaller version of the same bump —
+it puts two disagreeing copies of `roost-ipc` in one dependency graph the moment shed-mobile's
+git dep resolves `shed-core` against the old rev, and the desktop's own comment on this
+(`desktop/tauri/src-tauri/Cargo.toml:55-59`) says so. Re-copy `fixtures/roost-vectors/` from the
+new rev's `tests/ipc-vectors/` (updating that README's sha), commit all of it. Re-read roost's
+`docs/reference/ipc-compatibility.md` on any bump crossing a `SESSION_PROTOCOL_VERSION` change —
+`shed_core::roost::Conn::session_identify` refuses a mismatch by name rather than limping. roost
+keeps **one `session.identify` vector per generation**
+(`session.identify.response.v<N>.json`); shed vendors only the current one, so a generation bump
+renames the vendored file and **every** reader of it moves with it — not just "both fakes":
+`crates/shed-core/src/roost/testing.rs`'s `include_str!`, `crates/shed-core/src/roost/fence.rs`'s
+own separate `include_str!` (a third Rust reader, easy to miss because it isn't a fake and reads
+the file for a reason unrelated to testing), and every Go site that names the vector **by
+filename** rather than reading it (`internal/roostprovider/goldens_test.go`,
+`internal/roostprovider/wire_test.go`, `internal/roostprovider/fakessh_test.go`,
+`crates/shed-core/tests/roost_provider_vectors.rs`). An older shape is a fake *control*
+(`set_session_protocol`, `serve_without_features`), never a second vector to keep in step.
 
-**What session protocol 4 gave us (roost R1, plan 014).** The pin is at `c67ac27…` and shed
-speaks generation **4**:
+**What session protocol 5 gave us (roost plan 061 / roost#477), and what it retired.** The pin
+is at `c1bfe88…` and shed speaks generation **5**. Protocol 4's lease (roost R1, plan 014) is
+gone from the wire — not narrowed, retired outright, with no replacement:
 
-- **Reads are free.** `events.subscribe` takes no lease; it *classifies*. An empty lease is an
-  **observer** stream — every workspace batch plus `notification.fired`, never `tab.effect` —
-  which is what `shed_app::roost::RoostWatcher` subscribes as, so watching somebody's machine
-  never takes the interactive lease from the roost UI they are looking at.
-- **Writes are owned.** `Conn::tab_write` takes `lease: Option<&str>` — required on a session
-  socket (`connect-required` without one, `taken-over` on a displaced one), accepted and ignored
-  on a UI socket. `Conn::session_connect(takeover, client_label)` is what mints one; nothing in
-  shed calls it outside tests yet.
-- **A takeover no longer ends a stream.** It reclassifies in place and says so once with a
-  non-terminal `session.driver_changed`. The only terminal envelope an event stream sees is
-  `session.stopping`.
-- **The watcher does not poll.** `RoostWatcher` runs one *observe cycle* — identify on conn A,
-  `subscribe("")` on conn B, `tab.list` on conn A, then fold batches through
-  `shed_core::roost::Fence` — and emits a `Snapshot` only when a row actually changed. A bare
-  EOF and a revision gap are **resyncs** (a new cycle at once, no `Down`), bounded by
+- **Every op is open, not owned.** `lease` is dropped from all seven param structs it used to
+  sit in (`TabWriteParams`, `EventsSubscribeParams`, `TabAttachParams`, `SessionSetThemeParams`,
+  `SessionSetFocusParams`, `SessionSetAgentHooksParams`, `SessionPutFileParams`).
+  `events.subscribe` takes zero arguments and `session.set_agent_hooks` is open to every
+  same-UID client — there is no `connect-required` / `taken-over` / `already-connected` refusal
+  left to hit, because there is nothing left to hold or contest.
+- **`tab.effect` now reaches every subscriber.** roost's `event_push.rs` dropped the
+  observer/driver filter that used to keep it off a plain `events.subscribe`, so watching a
+  session sees the same fan-out an interactive client does.
+  `shed_core::roost::Fence::apply_event`'s catch-all absorbs it unread — a watcher views no tab,
+  so an effect frame is inert here.
+- **A fresh subscribe gets back the daemon's incarnation.** `EventsSubscribeResult.session_id`
+  is always present now; `shed_app::roost::RoostWatcher` compares it against the `session_id`
+  `session.identify` returned on the other connection and treats a mismatch as an immediate
+  resync, rather than waiting for the next cycle's EOF to fix it by accident.
+- **The watcher still does not poll.** Unchanged from protocol 4: one *observe cycle* — identify
+  on conn A, `subscribe()` on conn B, `tab.list` on conn A, then fold batches through
+  `shed_core::roost::Fence` — and a `Snapshot` only when a row actually changed. A bare EOF and a
+  revision gap are **resyncs** (a new cycle at once, no `Down`), bounded by
   `MAX_CONSECUTIVE_RESYNCS`. **`SHED_ROOST_POLL_MS` is gone**, with `POLL_INTERVAL` and the rest
   of the cadence: latency is the push, and the only sleep left is the failure backoff.
 

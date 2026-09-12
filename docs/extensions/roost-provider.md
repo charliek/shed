@@ -96,7 +96,7 @@ answer would look like a crash to roost's palette:
 |---|---|---|
 | `roost-session` binary not found on the target (exit 127 / `command not found`) | `roost-session is not installed on <host>` | `connect from the shed desktop or mobile app to install it` |
 | Installed but not running (`client-bridge: no session`) | `roost-session is not running on <host>` | `connect from the shed app to start it, or run roost-session start there` |
-| A running session speaks a different session protocol | `roost-session on <host> speaks protocol <n>; this shed speaks 4` | `upgrade whichever is older` |
+| A running session speaks a different session protocol | `roost-session on <host> speaks protocol <n>; this shed speaks 5` | `upgrade whichever is older` |
 | SSH itself failed (unreachable, timeout, exit 255) | `<host> is unreachable` | ssh's own last stderr line |
 | No local `ssh` binary found | `ssh is not installed where roost can see it` | the paths searched (`$PATH`, then `/usr/bin/ssh`, `/opt/homebrew/bin/ssh`, `/usr/local/bin/ssh`) |
 | The probe found none of the six agent binaries | `no agents found on <host>` | `looked for claude, codex, cursor-agent, opencode, gx, grok under bash -lc` |

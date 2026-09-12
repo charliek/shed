@@ -217,9 +217,9 @@ reads an `## Unreleased` heading._
 
 ## Unreleased
 
-_Staged by plan 019 (S4 `charliek/shed#326`, S5 `charliek/shed#327`); at
-release time fold this body into the new `## vX.Y.Z` section and replace this
-note with a real `**Ships:** server, desktop` line — this bundle touches only
+_Staged by plan 019 (S4 `charliek/shed#326`, S5 `charliek/shed#327`) and plan 020 (the roost
+session protocol 5 re-pin); at release time fold this body into the new `## vX.Y.Z` section
+and replace this note with a real `**Ships:** server, desktop` line — this bundle touches only
 `internal/`, `cmd/shed/`, `crates/shed-core`, `crates/shed-app`, and the Tauri
 client, none of which is `host-agent`._
 
@@ -252,14 +252,15 @@ client, none of which is `host-agent`._
   rows are meant to carry roost-sourced activity instead of liveness only —
   see [`docs/extensions/roost-session-hosts.md`](https://charliek.github.io/shed/extensions/roost-session-hosts/)
   for the source ladder, the exact (narrow) rollback promise, the PATH
-  warning, and `shed reset` handling. **Honestly incomplete in two ways,
-  both stated in the docs:** the release-asset source rung is implemented
+  warning, and `shed reset` handling. **Honestly incomplete in one way,
+  stated in the docs:** the release-asset source rung is implemented
   and fixture-tested but has never been exercised against a real download —
-  `RELEASE_PIN` is `None` because no published roost release speaks session
-  protocol 4 yet (the latest, 0.0.19, speaks 2); and the payoff itself
-  (roost-sourced `codex`/`cursor` activity replacing liveness-only on a real
-  shed) has not yet been demonstrated live — `epics/roost-pivot.md`'s
-  liveness-only clause stays in place until that leg runs.
+  `RELEASE_PIN` is `None` because no published roost release speaks the
+  current session protocol yet (the latest, 0.0.19, speaks 2). **The payoff
+  itself is demonstrated live, not only in hermetic tests:** a real shed's
+  `codex` row carries roost-sourced `activity` with `source: "roost"`, and
+  `epics/roost-pivot.md`'s liveness-only clause closed with that leg (its S5
+  row).
   `crates/fixtures/machines/` gives Go a shared, Rust-asserted fixture for
   decoding `machines:` (`internal/config/machines.go`), used by the
   provider's inventory and by the desktop's shed-as-roost-host registry
@@ -279,6 +280,47 @@ client, none of which is `host-agent`._
   `roost-session`, only the desktop and mobile apps do), and no roost
   binary is bundled or vendored into shed's own build or rootfs images
   (pin P1).
+- **shed re-pins to roost's session protocol 5 and retires the lease with
+  it (plan 020, roost#477 / roost plan 061).** `roost-ipc` moves to
+  `c1bfe887bc843e35466a1dcc33fa2390909fd50e` in every manifest that pins
+  it (`crates/Cargo.toml`, the Tauri crate's, and — once shed-mobile's own
+  re-pin lands — its `rust/Cargo.toml`). The lease is gone from the wire
+  with no replacement: `session.connect`, the
+  `connect-required`/`taken-over`/`already-connected` refusals, and the
+  driver/observer classification of an event stream are all retired,
+  `session.set_agent_hooks` is open to every same-UID client, and
+  `tab.effect` now reaches every subscriber (shed's fold already ignored
+  it — a watcher views no tab). `SessionIdentify` drops `features`; the
+  generation integer is the whole negotiation now. One user owns every
+  client that talks to their sheds, so hook wiring being open to all of
+  them, rather than gated behind a token, is the intended shape — see
+  [`docs/extensions/roost-session-hosts.md`](https://charliek.github.io/shed/extensions/roost-session-hosts/).
+  Go's `internal/roostprovider` mirrors the same generation
+  (`SpokenProtocol`), which is why this entry ships with `server` too.
+- **The hook re-send plan 019 built and tested was never actually wired —
+  it is now.** No production caller ever constructed the seam that
+  re-sends `session.set_agent_hooks` on a watcher reconnect, so the
+  shipped desktop wired an agent's hooks once at install time and never
+  again. `RoostHosts` now remembers which targets this app run
+  bootstrapped and hands their watchers a re-send hook, so every
+  reconnect on a bootstrapped target re-sends the call and a host shed
+  only watches gets none — wired through all three watcher-spawn sites,
+  including the machine-bootstrap re-watch that a stale watcher would
+  otherwise have left unarmed.
+- **A subscribe now refuses a mismatched session pair.** shed identifies
+  on one connection and subscribes on another; the subscribe ack's new
+  `session_id` lets the watcher compare it against the id
+  `session.identify` returned and treat a disagreement as an immediate
+  resync instead of recovering by accident one cycle later, bounded by
+  the existing `MAX_CONSECUTIVE_RESYNCS`.
+- **The consequence, named rather than discovered by a user:** every host
+  plan 019's desktop bootstrapped is running a protocol-4 `roost-session`,
+  and this build reports such a session by name — naming both protocol
+  numbers — and never stops or restarts it (pin P6; a running session
+  belongs to whoever started it). The one manual step to recover:
+  `roostctl session stop` on that target, then reconnect — shed then sees
+  a stale binary with no session running and replaces and restarts it
+  unattended, the same as any other Update.
 
 ## v0.8.2 — 2026-08-17
 

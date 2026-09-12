@@ -83,7 +83,7 @@ have hidden: a protocol-5 daemon answers `payload_kinds` as
 `["ghostty-snapshot", "vt"]`, and the protocol-4 recording carried only
 `["ghostty-snapshot"]`. An integer edited by hand would have left that field
 quietly wrong. The previous recording, for the record, was taken on 2026-09-07
-from the protocol-4 daemon at rev `c67ac27…`.
+from the protocol-4 daemon at the previously-pinned rev.
 
 `shed.tab.closed.event.json` and `shed.tab.notification.event.json` are recorded
 too, and they exist because roost publishes **no** vector for either envelope

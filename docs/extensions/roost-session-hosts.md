@@ -3,11 +3,11 @@
 S5 of the Roost Pivot (`epics/roost-pivot.md`) lets the shed desktop and mobile apps install
 and start a [roost](https://github.com/charliek/roost) `roost-session` daemon on a shed or a
 `machines:` entry that doesn't already have one — over the target's own SSH, with the same
-choreography roost's own UI uses. This is what is meant to turn a shed's `codex` and `cursor`
-rows from **liveness only** into roost-sourced activity, matching what a `machines:` entry
-already gets — the mechanism this page describes is implemented and covered by hermetic tests,
-but that specific payoff has not yet been demonstrated on a real, running shed; see
-`epics/roost-pivot.md` for the current, honest status of that clause.
+choreography roost's own UI uses. This turns a shed's `codex` and `cursor` rows from
+**liveness only** into roost-sourced activity, matching what a `machines:` entry already gets —
+demonstrated live, not only in the hermetic tests that cover the mechanism this page describes:
+a real shed's `codex` row carries roost-sourced `activity` with `source: "roost"`
+(`epics/roost-pivot.md`'s S5 row).
 
 This page describes the mechanism the clients drive: where the bytes come from, what consent
 promises, what the rollback guarantee actually covers, and the edges (`shed reset`, two
@@ -26,7 +26,7 @@ decided in order, and the first rung that can answer wins:
    a *specific* binary — installing a different one instead would be worse than failing.
 2. **Sibling** — the `roost-session` sitting beside the client binary itself, **desktop only**.
    This requires the desktop to be running on Linux (there is no local candidate to compare
-   against on macOS) and a local `identify` against that sibling reporting session protocol 4 —
+   against on macOS) and a local `identify` against that sibling reporting session protocol 5 —
    the same protocol this build speaks.
 3. **Release asset** — a `roost-session-<version>-linux-<amd64|arm64>` tarball plus its
    `.sha256` sibling, fetched over HTTPS and checksum-verified, behind a version pin (below).
@@ -42,32 +42,31 @@ decided in order, and the first rung that can answer wins:
 ### The release rung is real code, but it has never run against a real release
 
 **`RELEASE_PIN` is `None` today, because no published roost release speaks session protocol
-4** — the latest, `0.0.19`, speaks protocol 2. This is checked against roost's own repository
+5** — the latest, `0.0.19`, speaks protocol 2. This is checked against roost's own repository
 at the time of writing, not assumed. The message a client shows when every rung has failed:
 
-> no roost release speaking session protocol 4 is published yet (the latest, 0.0.19, speaks
-> 2). On a Linux machine with a protocol-4 roost installed the desktop uses that roost-session;
-> otherwise point `ROOST_SESSION_INSTALL_BIN` at a protocol-4 build. `<target>` was left
+> no roost release speaking session protocol 5 is published yet (the latest, 0.0.19, speaks
+> 2). On a Linux machine with a protocol-5 roost installed the desktop uses that roost-session;
+> otherwise point `ROOST_SESSION_INSTALL_BIN` at a protocol-5 build. `<target>` was left
 > untouched.
 
-Flipping `RELEASE_PIN` once roost ships a protocol-4 release is a one-line change (it sits
+Flipping `RELEASE_PIN` once roost ships a protocol-5 release is a one-line change (it sits
 beside the version/protocol pair the message above is built from). **Say this plainly: the
 release-asset rung is implemented and unit-tested against a loopback HTTP fixture, but it has
 never been exercised against a real, published roost release, and nothing in this codebase
 claims otherwise.** Until that pin flips, the only ways a fresh Linux target gets a
 `roost-session` are the override variable and — desktop only — the sibling rung.
 
-Two source-related decisions in this design are recorded as **not yet confirmed by the
+One source-related decision in this design is recorded as **not yet confirmed by the
 project owner** rather than settled: fetching the release asset with shed's own HTTP client
-instead of roost's `curl` rung (above), and a lease shed mints being allowed to outlive the
-connection that requested it (next section). Both are implemented as described here; neither
-should be read as a closed decision.
+instead of roost's `curl` rung (above). It is implemented as described here; it should not be
+read as a closed decision.
 
 ## Compatibility: protocol only, not roost's exact triple
 
 roost's own UI refuses a `roost-session` unless its version, protocol, and embedded ghostty
 snapshot all match exactly. shed's compatibility rule is narrower and different: **a target is
-compatible if its `session.identify` reports `session_protocol == 4`, full stop.** shed does
+compatible if its `session.identify` reports `session_protocol == 5`, full stop.** shed does
 not build roost, never negotiates a ghostty snapshot, and cannot know a future release's exact
 build fingerprint in advance — the protocol number is the one thing this codebase can commit
 to checking. The accepted, documented consequence: a roost UI that later connects to a
@@ -81,7 +80,7 @@ something shed considers perfectly fine.
 | Nothing there | **Install**, then **Start** |
 | A stale or incompatible binary, nothing running | **Update** (backup + replace) then **Start** |
 | A compatible binary, nothing running | **Start** |
-| A session already running protocol 4 | Nothing — status only |
+| A session already running protocol 5 | Nothing — status only |
 | A session running any other protocol | **Report only.** Never stopped, never restarted. |
 | No source available (see the ladder above) | Unavailable — the ladder's own sentence in place of a button |
 
@@ -114,10 +113,11 @@ backup. After that line, a failure is reported honestly, but the new binary stay
 
 ## Hooks: the step that makes the payoff real
 
-After a **Start that the client itself performed**, it connects to the fresh session
-(`session.connect {takeover: false}` — a session it just started has no lease yet, so this
-always succeeds) and sends `session.set_agent_hooks {mode: "auto", client: "shed-desktop"}` (or
-`"shed-mobile"`).
+After a **Start that the client itself performed**, it sends
+`session.set_agent_hooks {mode: "auto", skip: [], client: "shed-desktop"}` (or `"shed-mobile"`)
+to the fresh session — one wire call, nothing in front of it. Session protocol 5 dropped the
+lease entirely, so there is no `session.connect` to open first and nothing to hold or lose
+before sending it.
 
 **This is a dotfile mutation, performed by the *host* session, not by shed.** shed sends one
 wire call; `roost-session` on the target is the process that writes into the configuration
@@ -131,16 +131,16 @@ there — claude, codex, cursor, opencode, grok — and nothing else."
 wired the next time hooks are (re)sent, which is:
 
 - every `shed start` (each one performs a fresh Start-and-hooks cycle if a bootstrap runs), and
-- every time a roost UI (or another shed client) connects to that session, since roost's own
-  UI re-sends `set_agent_hooks` on every connect.
+- every successful cycle of the watcher for a target this client bootstrapped — re-sent on
+  every reconnect, not only once at install time.
 
-The lease `session.connect` mints **outlives the connection that requested it** — it is a
-bearer token the client keeps in memory for as long as the app runs, and it re-presents that
-lease and re-sends `set_agent_hooks` on every watcher reconnect while the lease is still
-valid. `already-connected` at the very first connect means somebody else already holds the
-lease — the client steps aside and records that in the result, with no attempt to take over.
-`taken-over` mid-dialogue means someone else took the lease away — the client stops
-re-presenting it permanently. **shed never takes a lease over from anyone.**
+**One op, no token, last writer wins.** Every client that wires a target sends the identical
+call — the desktop, the phone, and any roost UI that connects all say `set_agent_hooks
+{mode: "auto"}` — and the host session applies whichever one it heard most recently. That is
+the design, not a gap in it: one user owns every client that talks to their sheds, so hook
+wiring is open to all of them and none of them needs to ask first. There is no session-level
+owner left to displace and nothing a second client could "take over" from a first — `roostctl
+agent status` on the host is where you read which client wired an agent's hooks last.
 
 ## The PATH warning: named, never acted on
 
@@ -158,7 +158,7 @@ to fix your own PATH, and left at that.
 where an install normally lands. There is no special-case handling for this: the next probe
 after a reset simply reports `Missing` again, exactly as it would for a shed that never had
 `roost-session` installed, and the client offers Install again from scratch. Nothing about the
-hooks wiring, the lease, or the source ladder needs to know a reset happened.
+hooks wiring or the source ladder needs to know a reset happened.
 
 ## Two clients, one target
 
@@ -166,13 +166,13 @@ The desktop app and the mobile app can both bootstrap the same target. Nothing c
 between them beyond the filesystem itself: concurrent installs are **last-writer-wins**, using
 the same `.bak.<pid>` backup-chain naming roost's own installer already uses, with the
 post-commit identify as the only detector that something unexpected landed (a different
-protocol-4 build than the one this client just streamed). This is treated as the *normal*
+protocol-5 build than the one this client just streamed). This is treated as the *normal*
 case, not a hazard to guard against further — a person with both apps open, bootstrapping the
 same shed from their phone and their laptop, is exactly the scenario this is built for.
 
 ## A read-only example: mini3
 
-A target that is already running a `roost-session` speaking a protocol other than 4 (mini3, at
+A target that is already running a `roost-session` speaking a protocol other than 5 (mini3, at
 the time of writing, runs a release build of protocol 2) gets the **Report** row from the plan
 matrix above and nothing else — probing it is read-only, and its daemon's start time is
 unaffected before and after a probe. This is pin P6: an existing session is reported, never

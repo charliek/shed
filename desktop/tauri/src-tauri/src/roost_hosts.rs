@@ -2697,7 +2697,7 @@ mod tests {
     /// **A daemon that stops says why, and the row recovers when it comes back.**
     ///
     /// `session.stopping` is the one terminal envelope an event stream sees at
-    /// protocol 4, and it is the reason the user reads. The last known rows stay
+    /// protocol 5, and it is the reason the user reads. The last known rows stay
     /// on screen, marked stale — a machine going away must never blank the view.
     #[tokio::test]
     async fn a_stopping_session_goes_stale_with_its_reason_and_then_recovers() {

@@ -68,7 +68,7 @@
 //! rule, and may well offer to reinstall it. That is not a bug in either side —
 //! it is two clients with different needs answering different questions, and the
 //! roost UI's answer is the conservative one. shed's install is still the right
-//! thing to have done: a protocol-4 session is a session shed can read, and
+//! thing to have done: a protocol-5 session is a session shed can read, and
 //! shed's whole claim on the host is reading it.
 //!
 //! ## The rollback promise, and exactly how far it reaches

@@ -130,7 +130,7 @@ make -C desktop e2e-tauri       # shared suite + test_tauri at --target tauri (n
 Since plan 013 the Tauri app's **machine** rows come from a `roost-session`, not from the RC
 hub — one `RoostWatcher` per `machines:` entry, plus an implicit `localhost` host for the
 machine the app is running on. Since plan 014 that watcher **does not poll**: it subscribes to
-roost's leaseless observer event stream (session protocol 4) and emits a snapshot only when a
+roost's observer event stream (session protocol 5) and emits a snapshot only when a
 row actually changed, so there is **no poll knob any more** — the env var that used to turn the
 cadence down was deleted from the app, from `shed_app::roost` and from `ui.py`, and a recipe
 that still exports it is exporting nothing. Two env vars steer it:
@@ -313,14 +313,16 @@ cargo clippy --locked --all-targets -- -D warnings
 pre-existing-findings exemption on macOS (those are Linux-only code paths). So on a Mac, run
 clippy with `-D warnings` as a real gate, not a filter: if it is red, the finding is yours.
 
-### The daemon must speak session protocol 4
+### The daemon must speak session protocol 5
 
-Since plan 014 shed pins `roost-ipc` at `c67ac27b6a85dbee0871f32d49c1566cc068d1c8` and
-`Conn::session_identify` **refuses a mismatch by name** rather than limping — a protocol-2
-daemon (anything before roost's R1) reads as an unreachable machine row whose detail is
-`ProtocolMismatch { theirs: 2, ours: 4 }`. That is correct, not a bug: the lease semantics
-changed in both directions (`events.subscribe` stopped taking a lease, `tab.write` started
-requiring one), so limping would mean guessing.
+Since plan 020 shed pins `roost-ipc` at `c1bfe887bc843e35466a1dcc33fa2390909fd50e` and
+`Conn::session_identify` **refuses a mismatch by name** rather than limping — a daemon at an
+older generation (protocol 4, which is what plan 019's desktop installed on every host it
+bootstrapped, or the protocol-2 releases before it) reads as an unreachable machine row whose
+detail is `ProtocolMismatch { theirs: 4, ours: 5 }` (or `{ theirs: 2, ours: 5 }` for a release
+build). That is correct, not a bug: protocol 5 retired the lease from the wire entirely
+(`events.subscribe` takes no arguments, `session.set_agent_hooks` is open to every client), so
+limping would mean guessing which side's shape to speak.
 
 Build one from roost's tree at the pinned sha into a scratch checkout of its own — a **release**
 build, so the daemon's socket lands under the non-`-dev` `roost-session` directory (the `-dev`
@@ -328,14 +330,15 @@ trap in `crates/CLAUDE.md`), and outside roost's own working tree so it survives
 that is on:
 
 ```bash
-git -C ~/projects/roost archive c67ac27b6a85dbee0871f32d49c1566cc068d1c8 \
-  | (mkdir -p ~/.cache/shed-plan014/roost-c67ac27 && tar -x -C ~/.cache/shed-plan014/roost-c67ac27)
-cd ~/.cache/shed-plan014/roost-c67ac27
+git -C ~/projects/roost archive c1bfe887bc843e35466a1dcc33fa2390909fd50e \
+  | (mkdir -p ~/.cache/shed-plan020/roost-c1bfe88 && tar -x -C ~/.cache/shed-plan020/roost-c1bfe88)
+cd ~/.cache/shed-plan020/roost-c1bfe88
 cargo build --release -p roost-session -p roost-cli   # roost-cli's binary is `roostctl`
 # → target/release/{roost-session,roostctl}
 ```
 
-(roost's build needs libghostty-vt; follow its own README if the link step complains.) Both
+(roost's build needs libghostty-vt; follow its own README if the link step complains.) A build
+at this rev was confirmed this session reporting `session_protocol: 5` over its socket. Both
 `SHED_TAURI_ROOST_SESSION_BIN` (the `real_roost` smoke below) and the mount-the-host-socket
 recipe above want that binary. If a machine row comes up unreachable with a protocol mismatch,
 the daemon is the old one — rebuild rather than un-pinning shed.
