@@ -237,11 +237,7 @@ pub fn fingerprint(
     text.push('\n');
 
     let digest = Sha256::digest(text.as_bytes());
-    digest.iter().fold(String::with_capacity(64), |mut out, b| {
-        use std::fmt::Write as _;
-        let _ = write!(out, "{b:02x}");
-        out
-    })
+    super::hex(&digest)
 }
 
 fn push_identity(text: &mut String, identity: Option<&Identity>) {

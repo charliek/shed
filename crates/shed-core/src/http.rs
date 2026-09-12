@@ -79,7 +79,7 @@ const RC_EVENTS_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 /// surfaces as an error → the watcher disconnects + reconnects, instead of
 /// buffering unboundedly.
 const RC_EVENTS_MAX_EVENT_BYTES: usize = 1 << 20;
-const USER_AGENT: &str = concat!("shed-desktop-core/", env!("CARGO_PKG_VERSION"));
+pub(crate) const USER_AGENT: &str = concat!("shed-desktop-core/", env!("CARGO_PKG_VERSION"));
 
 /// Sink for create progress. shed-core streams the SSE and drives these; the FFI
 /// layer implements it to update a create-status store the Swift side polls.

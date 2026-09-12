@@ -39,9 +39,8 @@
 //!   roost's own exact triple (`app_version` + protocol + `libghostty_build`),
 //!   which shed cannot satisfy or even compute, and the descriptor it resolves
 //!   to (`ResolvedSource::verified`) is private to roost. shed composes the
-//!   *pure* half of roost's bootstrap and brings its own ladder
-//!   (`bootstrap::source`, plan 019 C5), handing the machine a finished
-//!   [`SourceHandle`].
+//!   *pure* half of roost's bootstrap and brings its own ladder ([`source`],
+//!   plan 019 C5), handing the machine a finished [`SourceHandle`].
 //! * **`identity_matches` / `classify_probe`** — the exact-triple rule. See the
 //!   next section; the *shape* of roost's classification is reproduced in
 //!   [`plan::classify_candidates`], the *rule* is shed's.
@@ -245,6 +244,7 @@ pub mod copy;
 pub mod hooks;
 pub mod machines;
 pub mod plan;
+pub mod source;
 
 #[cfg(test)]
 mod tests;
@@ -253,6 +253,24 @@ pub use copy::{BootstrapFailure, Stage};
 pub use hooks::{wire_agent_hooks, HooksError, HooksResult, HooksSkip};
 pub use machines::{InstallMachine, InstallRequest, Installed, ProbeMachine};
 pub use plan::{fingerprint, Identity, Plan, Probe, ProbeOutcome, SessionIdentity, SessionState};
+pub use source::{
+    fetch_release, no_source, preview, resolve, unavailable, RoostRelease, Source, SourceEnv,
+    SourcePreview, LATEST_KNOWN_RELEASE, RELEASE_PIN,
+};
+
+/// Lowercase hex, shared so `roost_ipc`'s own private copy (`bootstrap.rs`'s
+/// asset-hashing) does not get a third independent restatement here:
+/// [`plan::fingerprint`]'s digest and [`source::fetch_release`]'s checksum both
+/// need one, and a two-line loop is not worth two divergent copies.
+pub(crate) fn hex(bytes: &[u8]) -> String {
+    bytes
+        .iter()
+        .fold(String::with_capacity(bytes.len() * 2), |mut out, byte| {
+            use std::fmt::Write as _;
+            let _ = write!(out, "{byte:02x}");
+            out
+        })
+}
 
 // ============================================================================
 // Budgets and caps — roost's numbers, restated
@@ -481,9 +499,9 @@ impl CallError {
 /// path it could re-open. Both read the *same* descriptor, which is the whole
 /// point: whatever `sha256` says was checked is what goes across the wire.
 ///
-/// Producing one is [`bootstrap::source`](self)'s job (plan 019 C5) — the
-/// override rung, the sibling rung, the release asset. This file defines only
-/// what a machine consumes.
+/// Producing one is [`source`]'s job (plan 019 C5) — the override rung, the
+/// sibling rung, the release asset. This file defines only what a machine
+/// consumes.
 #[derive(Clone)]
 pub struct SourceHandle {
     /// A sentence fragment for the consent card: "the roost-session beside this

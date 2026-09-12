@@ -22,6 +22,15 @@
 //!
 //! Every one of them is asserted, by exact string, in this module's tests and in
 //! the failure-injection table — copy nobody pins is copy that drifts.
+//!
+//! **One family of sentences is deliberately not here:** the source ladder's.
+//! "From where the bytes come" and "there is nowhere to get them"
+//! ([`super::source::unavailable`], the rung descriptions, pin P3's
+//! arch-mismatch skip) live beside the ladder that decides them, because they
+//! are built out of [`RELEASE_PIN`](super::source::RELEASE_PIN) and its
+//! neighbours and a pin-flip PR must edit the constant and the sentence in one
+//! place. They are pinned by exact string in that module's tests, under the same
+//! rule.
 
 use roost_ipc::bootstrap::{BootstrapError, InstallPhase};
 use roost_ipc::messages::SESSION_PROTOCOL_VERSION;

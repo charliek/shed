@@ -29,7 +29,7 @@ use std::process::{Command, Stdio};
 
 use serde_json::{json, Value};
 
-use crate::roost::testing::{FakeRoost, ScratchDir};
+use crate::roost::testing::{write_exec, FakeRoost, ScratchDir};
 use crate::roost::Conn;
 
 use super::*;
@@ -552,13 +552,6 @@ fn script_text(stdin: &Stdin) -> Cow<'_, str> {
         Stdin::Bytes(bytes) => String::from_utf8_lossy(bytes),
         _ => Cow::Borrowed(""),
     }
-}
-
-fn write_exec(path: &Path, body: &str) {
-    use std::os::unix::fs::PermissionsExt as _;
-    std::fs::write(path, body).unwrap_or_else(|e| panic!("writing {}: {e}", path.display()));
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))
-        .expect("chmod +x the script");
 }
 
 /// Name a step by what it actually runs — derived from roost's own script text,

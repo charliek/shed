@@ -136,6 +136,31 @@ impl Drop for ScratchDir {
     }
 }
 
+/// Write a test script and make it executable.
+///
+/// Shared by `roost::bootstrap`'s two test rigs, which both invented this same
+/// six lines independently: `create_dir_all`s the parent first (a no-op where
+/// the caller already made it, load-bearing where a fixture binary's directory
+/// — `app/`, `.local/bin/` — does not exist yet), then writes and `chmod +x`es.
+///
+/// `#[cfg(test)]` rather than living under the module's `test-support` gate
+/// alone: both callers are `shed-core`'s own `#[cfg(test)]` test modules, never
+/// an external crate, so under a build that only turns on `test-support`
+/// (feature-unified in for `FakeRoost`, with no `#[cfg(test)]` code around to
+/// call this) it would otherwise be unreachable dead code.
+#[cfg(test)]
+pub(crate) fn write_exec(path: &Path, body: &str) {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).expect("mkdir for a test script");
+    }
+    std::fs::write(path, body)
+        .unwrap_or_else(|error| panic!("writing {}: {error}", path.display()));
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))
+        .expect("chmod +x a test script");
+}
+
 /// How a registered event stream is classified — roost's own distinction, kept
 /// so a test can assert shed subscribed the way it claims to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
