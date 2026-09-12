@@ -59,6 +59,8 @@ the vendored file, and the `include_str!` paths move with it.
 | `session.connect.labeled.request.json` | the same request with `client_label` — the omit-when-unset key |
 | `session.connect.response.json` | the fake's `session.connect` reply (`{lease, revision}`) |
 | `tab.write.request.json` | the `tab.write` shape, whose `lease` is omit-when-unset |
+| `session.set_agent_hooks.request.json` | the shape `Conn::session_set_agent_hooks` sends (plan 019 S5) — `deny_unknown_fields` on roost's side, so this is the contract |
+| `session.set_agent_hooks.response.json` | the fake's `session.set_agent_hooks` reply template (`wired`/`refreshed`/`removed`/`skipped`/`errors`) |
 
 ## Shed-recorded vectors
 
@@ -93,3 +95,65 @@ the opencode tab (id 4, owned, `finished`, `detail: "session_idle"`, with the
 adapter's `agent`/`model`/`version` metadata). One of those two is a session row;
 the other is somebody's terminal. `shed.tab.list.opencode.over-ssh.json` is the
 same pair read from inside a shed VM over roost's SSH client-bridge.
+
+## shed's own two-language goldens
+
+Three files here are **not** roost vectors and are **not** copies of anything:
+they are shed's own, written by shed, and they may be edited. The
+no-semantic-edits rule above governs the vendored vectors, not these.
+
+| file | what it pins | asserted by |
+|---|---|---|
+| `bootstrap/exec-chain-command.txt` | roost's candidate-ladder remote command, `roost_ipc::bootstrap::exec_chain_command(false)` | Rust (`shed-core/tests/roost_provider_vectors.rs`, against the LIVE function) and Go (`internal/roostprovider`'s `ExecChainCommand` constant) |
+| `agent-table.json` | kind → binary → title for the six agents the roost provider can start | Rust (`launch_argv` + `roost_capabilities().kinds`) and Go (`internal/roostprovider`'s `agentTable`) |
+| `stderr-classes.json` | how a failed `ssh` exec classifies (`roost_ipc::ssh::classify_ssh_failure`), plus shed's own class → provider-row and class → `ReachKind` mappings | Rust (the live classifier, `classes`; and `shed_app::roost::ReachError`, `reach_kinds`) and Go (`ClassifySSHFailure` + `ProviderRow`) |
+
+They exist because one behaviour is implemented on both sides of a language
+boundary — the Go `shed roost-provider` subcommand and the Rust client core —
+and a golden asserted from both is the only thing that makes the two provably
+the same rather than the same today.
+
+### The bootstrap script goldens (`bootstrap/*`, Rust-only)
+
+Everything else under `bootstrap/` is a **tripwire on roost's own script
+builders**, written by plan 019 C4 and read only by Rust
+(`shed-core/tests/roost_bootstrap_goldens.rs`):
+
+| file | the builder it pins |
+|---|---|
+| `discovery-script.sh` | `discovery_script(false)` |
+| `path-check-command.txt` | `path_check_command()` |
+| `identity-script.sh` | `identity_script([dest, /usr/bin/roost-session])` |
+| `prepare-script.sh` | `prepare_script()` |
+| `stream-command.txt` | `stream_command(tmp)` |
+| `verify-staged-script.sh` | `verify_staged_script(tmp)` |
+| `commit-script.sh` | `commit_script(tmp, dest, backup)` |
+| `post-commit-identity-script.sh` | `identity_script([dest])` |
+| `discard-backup-script.sh` | `discard_backup_script(backup)` |
+| `rollback-script.sh` | `rollback_script(dest, backup)` |
+| `cleanup-script.sh` | `cleanup_script(tmp)` |
+| `start-script.txt` | `start_script(path)` |
+
+All in **shipped** form (`jail_fs_root: false`) with one fixed path triple, and
+all **byte-exact** — no trailing newline is added or trimmed, unlike
+`exec-chain-command.txt`, whose +1 convention exists because Go reads that one
+too. `shed_core::roost::bootstrap` composes these builders rather than writing
+its own, which means a `roost-ipc` rev bump can change what a bootstrap sends
+without a line of shed changing; these files are what makes that a failing test
+instead of a surprise on somebody's host. They are **not** a specification of
+what the scripts should say — read the diff, decide whether the choreography in
+`bootstrap/machines.rs` still matches, then regenerate:
+
+```
+SHED_UPDATE_ROOST_GOLDEN=1 cargo test -p shed-core --test roost_bootstrap_goldens
+```
+
+**`bootstrap/exec-chain-command.txt` is GENERATED, never hand-written.** It was
+produced by calling `exec_chain_command(false)` and writing the result; the Rust
+test then asserts the file still equals that call, so a `roost-ipc` bump that
+changes the ladder fails loudly instead of leaving the hand-copied Go constant
+quietly wrong. To refresh it after a bump, re-run the generator described in that
+test's comment and re-copy the string into Go.
+
+The file carries a trailing newline that the command itself does not; both tests
+trim exactly one.

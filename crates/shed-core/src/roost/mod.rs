@@ -39,9 +39,15 @@
 //! * [`fence`] — the revision fence ([`Fence`], [`Admit`]) and the event fold
 //!   ([`RoostInventory::apply`]). Pure, so it is implemented exactly once for
 //!   every client shed ships and testable against roost's own golden vectors.
+//! * [`bootstrap`] — putting a `roost-session` ONTO a host (plan 019, S5), as
+//!   two sans-IO state machines composing roost's own script builders and
+//!   parsers. Sans-IO because the desktop runs its remote steps through an `ssh`
+//!   subprocess and a phone runs them through `dartssh2`, and one choreography
+//!   both transports drive is a property rather than a coincidence.
 //! * [`testing`] — an in-process fake `roost-session`, for this crate's tests
 //!   and (under the non-default `test-support` feature) for `shed-app`'s.
 
+pub mod bootstrap;
 pub mod conn;
 mod error;
 pub mod fence;

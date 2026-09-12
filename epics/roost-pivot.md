@@ -38,8 +38,8 @@ gh issue list -R charliek/shed --state open --search "in:title [A"
 | R10 | roost#439 | RP/M3 | the opencode plugin exposes the TUI's own server on loopback and reports `server_url` |
 | A7 | [#340](https://github.com/charliek/shed/issues/340) | RP/M3 | ✅ **shipped (plan 017)** — the `gx` lane adapter, the SECOND implementation of `shed_core::lane`, which is what turns the contract from a design into a contract |
 | S4m | [shed-mobile#19](https://github.com/charliek/shed-mobile/issues/19) | RP/M3 | the phone mirrors the lane DTOs through FRB and forwards `server_url` over dartssh2 — opencode AND gx |
-| S4 | [#326](https://github.com/charliek/shed/issues/326) | RP/M5 | the `shed` roost provider script — the kickoff path that replaced `sx` |
-| S5 | [#327](https://github.com/charliek/shed/issues/327) | RP/M5 | `roost-session` inside sheds and on machines, via roost's bootstrap ladder |
+| S4 | [#326](https://github.com/charliek/shed/issues/326) | RP/M5 | **landed (plan 019)** — the `shed` roost provider script, the kickoff path that replaced `sx` |
+| S5 | [#327](https://github.com/charliek/shed/issues/327) | RP/M5 | **landed (plan 019)** — `roost-session` inside sheds and on machines, via roost's bootstrap ladder; the payoff is **demonstrated live** — a real shed's codex row carries roost-sourced `activity` with `source: "roost"` |
 | S6 | [#328](https://github.com/charliek/shed/issues/328) | RP/M6 | retire the RC hub, tmux driver, `shed-ext-rc`, Go engine, rc-parity oracle — **after S5** |
 | S7 | [#329](https://github.com/charliek/shed/issues/329) | RP/M6 | ✅ **done (plan 016)** — `sx` sunset entirely: crate, release wiring and the rc-parity one-shot family deleted |
 
@@ -69,11 +69,20 @@ consumes the hub. S7 is done (plan 016) — it had no blockers.
 
   So the same kind gets different answers depending on **where the
   session lives**. `feed` describes the *message* feed; no client gates
-  its activity chip on it. The practical consequence, until S5 puts a
-  roost-session inside sheds: **a codex or cursor session on a machine
-  shows roost-sourced activity; the same kind on a shed shows liveness
-  only, with no activity at all.** That is accepted, it is visible in
-  the payload rather than hidden, and S5 is what closes it.
+  its activity chip on it. Until S5, the practical consequence was that
+  a codex or cursor session on a machine showed roost-sourced activity
+  while the same kind on a shed showed liveness only. **S5 closed that
+  (plan 019, verified live on 2026-09-12):** a shed with a
+  roost-session bootstrapped into it reports
+  `{"origin":"roost:<server>/<shed>","kind":"codex","source":"roost","activity":"working"}`
+  in `rc.list`, the same shape a machine has always reported. A shed's
+  rows are now the **union** of its hub rows (`source: "hub"`) and its
+  roost rows (`source: "roost"`), so the two producers are told apart in
+  the payload rather than one replacing the other.
+
+  A shed with no roost-session in it is still liveness-only, and that is
+  the honest steady state rather than a gap: nothing bootstraps one
+  until a client is asked to.
 - **The hub is retired, not adapted.** Do not add roost as a provider
   *behind* the `/v1` hub; clients read roost directly through
   `shed-core`. Every hub route already has a home (§04 Q6).
@@ -122,7 +131,9 @@ consumes the hub. S7 is done (plan 016) — it had no blockers.
 - **S3m in shed-mobile ← S1.** Same FRB bridge; ships in M1 alongside S3.
 - **A4 → shed-mobile.** The opencode crate is FRB-exposed for the phone.
 - **S5 ↔ roost HS-3 bootstrap.** The ladder installs `roost-session` over
-  SSH with verify-before-commit; decide rootfs-baked vs provisioned in S5.
+  SSH with verify-before-commit; decided in plan 019 (pin P1): SSH-provisioned
+  on demand from the connecting client, never rootfs-baked, and no bundled or
+  vendored roost binaries anywhere in shed's own build.
 - **S6 waits on S3m, A4, A5, A6, and S5** — everything off the hub first,
   *including* the live consumers: until S5 moves `prox-test` and mini3
   onto `roost-session`, they still run the hub/tmux stack, and retiring

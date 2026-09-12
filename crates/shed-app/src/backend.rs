@@ -528,7 +528,7 @@ fn no_configured_host(host: Option<&str>) -> ShedError {
 
 /// The shed CLI's `known_hosts` file (`~/.shed/known_hosts`, the same file
 /// `shed server add` pins keys into) — `~/.shed` on both macOS and Linux.
-fn known_hosts_path() -> String {
+pub(crate) fn known_hosts_path() -> String {
     // Cached: HOME is stable for the process, and `rc_targets` resolves this once
     // per running shed — no need to re-read the env + reformat each time.
     static PATH: LazyLock<String> = LazyLock::new(|| {

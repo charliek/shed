@@ -10,10 +10,16 @@ workspace = true
 
 [dependencies]
 # `net` (UnixStream/TcpStream) + `io-util` (`copy_bidirectional` for the loopback-TCP
-# pump in `roost::conn`) on top of the workspace's rt/macros/sync/time. These are
-# BUILD-time features now, not just dev-time: `roost::conn` needs them in the shipped
-# lib. Feature unification with `roost-ipc` adds `fs`, `process` and `signal` on top.
-tokio = { workspace = true, features = ["net", "io-util"] }
+# pump in `roost::conn`) + `process` (the local `roost-session identify` the bootstrap
+# source ladder's sibling rung runs, `roost::bootstrap::source`) on top of the
+# workspace's rt/macros/sync/time. These are BUILD-time features now, not just
+# dev-time: `roost::conn` and `roost::bootstrap` need them in the shipped lib.
+# `process` is ALSO unified in by `roost-ipc`, so naming it here adds no crate to
+# the lock — it is named because shed-core calls `tokio::process` directly, and a
+# feature a crate depends on by unification is a feature that disappears the day
+# the dependency stops needing it. Unification with `roost-ipc` still supplies
+# `fs` and `signal`, which shed-core does not use itself.
+tokio = { workspace = true, features = ["net", "io-util", "process"] }
 reqwest = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

@@ -79,7 +79,7 @@ const RC_EVENTS_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 /// surfaces as an error → the watcher disconnects + reconnects, instead of
 /// buffering unboundedly.
 const RC_EVENTS_MAX_EVENT_BYTES: usize = 1 << 20;
-const USER_AGENT: &str = concat!("shed-desktop-core/", env!("CARGO_PKG_VERSION"));
+pub(crate) const USER_AGENT: &str = concat!("shed-desktop-core/", env!("CARGO_PKG_VERSION"));
 
 /// Sink for create progress. shed-core streams the SSE and drives these; the FFI
 /// layer implements it to update a create-status store the Swift side polls.
@@ -1047,7 +1047,16 @@ impl Client {
     /// surfacing it as an error would train people to ignore the error path.
     pub async fn rc_interrupt(&self, shed: &str, slug: &str) -> Result<bool, ShedError> {
         let url = self.build_url(
-            &["api", "sheds", shed, "rc", "v1", "sessions", slug, "interrupt"],
+            &[
+                "api",
+                "sheds",
+                shed,
+                "rc",
+                "v1",
+                "sessions",
+                slug,
+                "interrupt",
+            ],
             &[],
         )?;
         let raw = self
@@ -1062,7 +1071,9 @@ impl Client {
         // decoding garbage to `false` reports "nothing was running" — a factual
         // claim about the session — when the truth is that we do not know.
         let v: serde_json::Value = Self::decode_json_body(&raw)?;
-        Ok(v.get("interrupted").and_then(|b| b.as_bool()).unwrap_or(false))
+        Ok(v.get("interrupted")
+            .and_then(|b| b.as_bool())
+            .unwrap_or(false))
     }
 
     /// `GET /api/rc/events` with `Accept: text/event-stream` — the host-wide
@@ -2781,7 +2792,10 @@ mod tests {
                 })
                 .await;
             assert!(
-                matches!(client(&server).rc_interrupt("proj", "a").await, Err(ShedError::Decode(_))),
+                matches!(
+                    client(&server).rc_interrupt("proj", "a").await,
+                    Err(ShedError::Decode(_))
+                ),
                 "body {body:?} was decoded rather than rejected"
             );
             assert!(matches!(

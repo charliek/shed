@@ -67,7 +67,7 @@ session this binary reports carries **liveness only** (see [`state`](#json-outpu
 below). A **machine** session of the same kind — a native host running
 `roost-session`, not a shed — gets its status from **roost** instead, over roost's own
 protocol, never through `shed-ext-rc`; a shed row gets the same treatment once roost
-reaches the guest (S5). The claude.ai remote-control URL is unaffected: `url` is still
+reaches the guest ([S5](roost-session-hosts.md)). The claude.ai remote-control URL is unaffected: `url` is still
 lifted out of the pane for `claude-rc`/`claude-broker` because it is **control** (the
 address a person opens to drive the session), not status.
 
@@ -147,7 +147,7 @@ content-blind sleep (1 s) follows before the line is typed, so a kickoff lands *
 least 6 s** after liveness, bounded by the overall 20 s `--wait` timeout — a session
 whose settle would cross the deadline is delivered at the deadline rather than not at
 all. This is a fixed delay, not a heuristic about screen content: the honest interim
-until roost's provider script owns kickoff end-to-end (S4).
+until [roost's provider script](roost-provider.md) owns kickoff end-to-end.
 
 **The delivery gate is control, not status.** Immediately before typing, both
 `--wait` and `prompt` re-capture the pane and refuse if claude's workspace-trust
@@ -165,7 +165,7 @@ login screen, a codex `auth` prompt, or an agent's own approval modal from an or
 composer: only the three dialogs named above are checked. A kickoff or a `prompt`
 delivered while one of those *other* screens is up is typed into it. This is a known,
 documented trade-off, not an oversight — accepted for as long as shed derives no richer
-status than liveness. S4 (the roost provider script owning kickoff) and A4 (the
+status than liveness. [S4](roost-provider.md) (the roost provider script owning kickoff) and A4 (the
 opencode crate) are what eventually give this verb real state to gate on again.
 
 ## Capabilities
@@ -237,7 +237,7 @@ Normative matrix (exhaustive — pinned by `capabilities_test.go`):
 
 opencode is the only **live** lane (§ [Contract-v2 verbs](#contract-v2-verbs-turn-interrupt-approvalsid) below): its TUI runs an embedded HTTP+SSE server the hub steers through, so whole turns, interrupts, and approvals all go through the hub instead of the pane.
 
-Every other kind reads `feed: "none"` and `input: ""`. The claude transcript tail (`charliek/shed#321`), the codex rollout tail and the cursor hook-ingest lane (`charliek/shed#322`) were all retired, and S2 (`charliek/shed#324`) then deleted the pane-anchor mechanism that gave codex/cursor their `needs_approval` signal too: the hub derives **no signal at all** for those kinds now, so `none` — not `activity` — is the truthful value under this table's own definition of the two. They remain launchable, attachable TUI kinds; their status comes from roost rather than from the hub for a machine session, and from liveness alone for a shed session until S5. Both clients branch on `feed == "messages"` only, so the change is invisible to them, and the value flips back to a real one when roost becomes the guest's source.
+Every other kind reads `feed: "none"` and `input: ""`. The claude transcript tail (`charliek/shed#321`), the codex rollout tail and the cursor hook-ingest lane (`charliek/shed#322`) were all retired, and S2 (`charliek/shed#324`) then deleted the pane-anchor mechanism that gave codex/cursor their `needs_approval` signal too: the hub derives **no signal at all** for those kinds now, so `none` — not `activity` — is the truthful value under this table's own definition of the two. They remain launchable, attachable TUI kinds; their status comes from roost rather than from the hub for a machine session, and from liveness alone for a shed session until [S5](roost-session-hosts.md) reaches it. Both clients branch on `feed == "messages"` only, so the change is invisible to them, and the value flips back to a real one when roost becomes the guest's source.
 
 `feed` and `attach` carry `omitempty` but are **never** empty in this binary's own
 output (the strict golden pins them present) — the `omitempty` exists so a newer server
@@ -609,7 +609,7 @@ to refine it for those two kinds, are all deleted (A5 `charliek/shed#321`, A6
 `charliek/shed#322`, S2 `charliek/shed#324`). Their sessions simply carry no `activity`
 field. **roost is the status authority for those kinds instead** — directly, over its
 own protocol, for a machine session; for a shed session, only once roost reaches the
-guest (S5). Until then, a shed's `claude-rc`/`codex`/`cursor` row is liveness-only, with
+guest ([S5](roost-session-hosts.md)). Until then, a shed's `claude-rc`/`codex`/`cursor` row is liveness-only, with
 nothing standing in for the activity dimension it no longer has.
 
 **Freshness / grace.** A settled watcher verdict (`needs_input`/`needs_approval`) is

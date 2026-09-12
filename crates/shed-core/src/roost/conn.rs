@@ -28,10 +28,10 @@ use std::path::{Path, PathBuf};
 
 use roost_ipc::client::{EventFrame, EventStream, ServerCode};
 use roost_ipc::messages::{
-    ops, IdentifyParams, IdentifyResult, SessionConnectParams, SessionConnectResult,
-    SessionIdentify, SessionIdentifyParams, Tab, TabCloseParams, TabDumpParams, TabDumpResult,
-    TabListResult, TabOpenParams, TabOpenResult, TabWriteParams, WireTabRef,
-    SESSION_PROTOCOL_VERSION,
+    ops, AgentHooksMode, IdentifyParams, IdentifyResult, SessionConnectParams,
+    SessionConnectResult, SessionIdentify, SessionIdentifyParams, SessionSetAgentHooksParams,
+    SessionSetAgentHooksResult, Tab, TabCloseParams, TabDumpParams, TabDumpResult, TabListResult,
+    TabOpenParams, TabOpenResult, TabWriteParams, WireTabRef, SESSION_PROTOCOL_VERSION,
 };
 use roost_ipc::{ClientError, IpcClient};
 use tokio::net::{TcpStream, UnixStream};
@@ -318,6 +318,70 @@ impl Conn {
             .await?)
     }
 
+    /// `session.set_agent_hooks` — ask the host session to bring its agent hook
+    /// entries in line with this client's configuration.
+    ///
+    /// **The host does the writing.** roost's session links
+    /// `roost-agent-install` and edits the dotfiles under its own `$HOME`;
+    /// nothing on shed's side touches a file on that machine (pin P5). That is
+    /// what makes this op the right way to wire hooks and a hand-rolled `ssh`
+    /// heredoc the wrong one.
+    ///
+    /// Lease-gated, and for a sharper reason than most ops: it writes files. A
+    /// missing or stale lease answers `connect-required`; a displaced one
+    /// answers `taken-over`. Mint one with [`Self::session_connect`] — or, far
+    /// better, call
+    /// [`bootstrap::wire_agent_hooks`](crate::roost::bootstrap::wire_agent_hooks),
+    /// which is the one implementation of that dialogue and of what each refusal
+    /// means.
+    ///
+    /// `mode: Off` **removes** roost's entries rather than meaning "do nothing":
+    /// a host has no config of its own to consult, so the client is the
+    /// authority and `off` on the client means the host comes clean.
+    pub async fn session_set_agent_hooks(
+        &mut self,
+        lease: &str,
+        mode: AgentHooksMode,
+        skip: &[String],
+        client: &str,
+    ) -> Result<SessionSetAgentHooksResult, RoostError> {
+        Ok(self
+            .client
+            .call(
+                ops::SESSION_SET_AGENT_HOOKS,
+                SessionSetAgentHooksParams {
+                    lease: lease.to_string(),
+                    mode,
+                    skip: skip.to_vec(),
+                    client: client.to_string(),
+                },
+            )
+            .await?)
+    }
+
+    /// One op by name, params and result as raw JSON — **the ungated call**.
+    ///
+    /// The escape hatch exists for exactly one caller and the doc says so, so it
+    /// does not quietly become the way ops get added:
+    /// [`bootstrap`](crate::roost::bootstrap)'s sans-IO machines name their own
+    /// ops (today only `session.identify`) and apply their **own** compatibility
+    /// gate, which is the protocol number alone. [`Self::session_identify`]
+    /// refuses a mismatch by name, which is exactly right for a watcher — it has
+    /// nothing useful to do with a session it cannot read — and exactly wrong
+    /// for the bootstrap, whose fifth plan-matrix row IS "a session on protocol
+    /// N is serving here; report it and touch nothing" (pin P6). That row needs
+    /// the mismatched session's own identity, so the reply has to arrive as an
+    /// answer rather than as an error.
+    ///
+    /// Everything else in this file is a typed wrapper, and should stay one.
+    pub async fn call_raw(
+        &mut self,
+        op: &str,
+        params: serde_json::Value,
+    ) -> Result<serde_json::Value, RoostError> {
+        Ok(self.client.call_raw(op, params).await?)
+    }
+
     /// `events.subscribe` — flip this connection into the server's push stream.
     ///
     /// Consumes the `Conn` because that is `IpcClient`'s contract: the ack is
@@ -475,6 +539,8 @@ mod tests {
         include_str!("../../../fixtures/roost-vectors/session.connect.labeled.request.json");
     const VECTOR_TAB_WRITE_REQUEST: &str =
         include_str!("../../../fixtures/roost-vectors/tab.write.request.json");
+    const VECTOR_SET_AGENT_HOOKS_REQUEST: &str =
+        include_str!("../../../fixtures/roost-vectors/session.set_agent_hooks.request.json");
 
     /// **The omit-when-unset rule, on the wire.** roost's request structs are
     /// `deny_unknown_fields`, so a key a session predates must be *absent*, not
@@ -561,6 +627,40 @@ mod tests {
             server.captured_params().await["lease"],
             serde_json::json!("9f2c1d7a4b6e08315c0d9a72e4f16b83")
         );
+    }
+
+    /// `session.set_agent_hooks` goes out as roost's own request, key for key.
+    ///
+    /// `deny_unknown_fields` on roost's side means an extra key is a refusal and
+    /// a missing `client` is a decode failure, so the vendored request vector is
+    /// the contract: this is the op that makes the host edit dotfiles, and a
+    /// request shed cannot get right is a payoff shed never delivers.
+    #[tokio::test]
+    async fn session_set_agent_hooks_matches_the_vendored_request() {
+        let expected = vector_params(VECTOR_SET_AGENT_HOOKS_REQUEST);
+        let skip: Vec<String> = expected["skip"]
+            .as_array()
+            .expect("the vector's skip list")
+            .iter()
+            .map(|value| value.as_str().expect("a name").to_string())
+            .collect();
+
+        let server = OneShot::start(serde_json::json!({
+            "wired": [], "refreshed": [], "removed": [], "skipped": [], "errors": []
+        }))
+        .await;
+        let mut conn = Conn::unix(&server.socket).await.expect("dial");
+        conn.session_set_agent_hooks(
+            expected["lease"].as_str().expect("the vector's lease"),
+            AgentHooksMode::Auto,
+            &skip,
+            expected["client"].as_str().expect("the vector's client"),
+        )
+        .await
+        .expect("set_agent_hooks");
+        drop(conn);
+
+        assert_eq!(server.captured_params().await, expected);
     }
 
     /// Both reaches to one fake, labelled — dialed through [`Conn::endpoint`],
@@ -855,25 +955,43 @@ mod tests {
         }
 
         // Same for a port with nothing behind it. Bind an ephemeral port,
-        // take its number, then drop the listener before dialing it — that
-        // guarantees nothing is listening, unlike a fixed port number which
-        // could have something bound to it depending on the host.
-        let port = {
-            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-                .await
-                .expect("bind ephemeral port");
-            listener.local_addr().expect("local_addr").port()
-        };
-        match Conn::tcp_loopback(port).await {
-            Err(err @ RoostError::Unavailable(_)) => {
-                assert!(
-                    err.to_string().contains(&format!("127.0.0.1:{port}")),
-                    "{err}"
-                );
+        // take its number, then drop the listener before dialing it — unlike a
+        // fixed port number, which could have something bound to it depending on
+        // the host.
+        //
+        // **Re-rolled rather than asserted once.** A released ephemeral port is
+        // free for the OS to hand straight back out, and this binary's other
+        // tests bind plenty of them (every `FakeRoost` takes one); losing that
+        // race means something really is listening there, which says nothing
+        // about the code under test. A handful of rolls all finding a listener
+        // is not a race, so that still fails.
+        let mut refused = false;
+        for _ in 0..8 {
+            let port = {
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                    .await
+                    .expect("bind ephemeral port");
+                listener.local_addr().expect("local_addr").port()
+            };
+            match Conn::tcp_loopback(port).await {
+                Err(err @ RoostError::Unavailable(_)) => {
+                    assert!(
+                        err.to_string().contains(&format!("127.0.0.1:{port}")),
+                        "{err}"
+                    );
+                    refused = true;
+                    break;
+                }
+                Err(other) => panic!("expected Unavailable, got {other:?}"),
+                // Somebody else took the port back between the drop and the
+                // dial. Roll again.
+                Ok(_) => continue,
             }
-            Err(other) => panic!("expected Unavailable, got {other:?}"),
-            Ok(_) => panic!("dialing a port with nothing behind it must not succeed"),
         }
+        assert!(
+            refused,
+            "dialing a port with nothing behind it must not succeed"
+        );
     }
 
     #[tokio::test]

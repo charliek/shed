@@ -130,6 +130,7 @@ _TAB_LIST = _vector("tab.list.session.response.json")["result"]
 _TAB_OPEN = _vector("tab.open.response.json")["result"]["tab"]
 _ERROR = _vector("response.error.json")
 _SESSION_CONNECT = _vector("session.connect.response.json")["result"]
+_SET_AGENT_HOOKS = _vector("session.set_agent_hooks.response.json")["result"]
 _EVENTS_SUBSCRIBE = _vector("events.subscribe.response.json")["result"]
 _EVENTS_BATCH = _vector("events.batch.json")
 _TAB_OPENED = _vector("tab.opened.event.json")
@@ -486,6 +487,12 @@ class FakeRoost:
         self._lease_counter = 0
         #: Every `tab.open` this fake served, params verbatim, in order.
         self.opens: list[dict] = []
+        #: Every `session.set_agent_hooks` this fake served, params verbatim, in
+        #: order — the twin of `testing.rs`'s `agent_hooks_calls`.
+        self.agent_hooks_calls: list[dict] = []
+        #: What the next `session.set_agent_hooks` answers with, instead of the
+        #: vendored vector. A whole result, so a test can seed partial errors.
+        self._agent_hooks_result: dict | None = None
 
     # -- lifecycle ---------------------------------------------------------
     def start(self) -> "FakeRoost":
@@ -563,6 +570,15 @@ class FakeRoost:
         """The label the current lease holder reported on `session.connect`."""
         with self._lock:
             return self._lease_label
+
+    def set_agent_hooks_result(self, result: dict) -> None:
+        """Answer the next `session.set_agent_hooks` with this result.
+
+        The twin of `testing.rs::set_agent_hooks_result`. Seeded whole rather
+        than merged, so a partial-failure result (`errors` non-empty) is written
+        exactly as roost would send it."""
+        with self._lock:
+            self._agent_hooks_result = dict(result)
 
     def observer_count(self) -> int:
         """Registered streams that presented no live lease — what shed is."""
@@ -989,6 +1005,8 @@ class FakeRoost:
                 return self._write(_require_tab_id(params), params, conn)
             if op == "session.connect":
                 return self._connect(params, conn)
+            if op == "session.set_agent_hooks":
+                return self._set_agent_hooks(params, conn)
             # Everything else: the fake serves inventory, the lease ops and the
             # one-shots, and an op shed reaches for that roost does not serve
             # here should fail loudly in a test rather than pass.
@@ -1085,6 +1103,35 @@ class FakeRoost:
         self._require(tab_id)
         self._writes[tab_id] = self._writes.get(tab_id, b"") + decoded
         return {}
+
+    def _set_agent_hooks(self, params: dict, conn: _Conn | None) -> dict:
+        """`session.set_agent_hooks {lease, mode, skip, client}` (plan 019 §3.4).
+
+        roost's own order: decode, then the LEASE GATE, then act. This op makes
+        the host session write dotfiles under its own `$HOME`, which is the
+        sharpest reason of any lease-gated op to check authority before touching
+        the params — so the gate runs first and a refusal records nothing.
+
+        The gate is the same `_check_write_lease` `tab.write` uses (roost keeps
+        ONE tombstone: a lease displaced twice is forgotten and reads as
+        `connect-required`, not `taken-over`). Presenting the live lease
+        registers this connection under it, so a later takeover hangs this
+        connection up too.
+        """
+        if self.ui_socket:
+            raise _Refusal("unknown-op", "no such op: session.set_agent_hooks")
+        presented = params.get("lease") or None
+        self._check_write_lease(presented)
+        if conn is not None:
+            conn.lease = presented
+        if params.get("mode") not in ("auto", "off"):
+            raise _Refusal("invalid-param",
+                           f"session.set_agent_hooks mode: {params.get('mode')!r}")
+        if not isinstance(params.get("client"), str):
+            raise _Refusal("invalid-param", "session.set_agent_hooks needs a `client`")
+        self.agent_hooks_calls.append(copy.deepcopy(params))
+        seeded, self._agent_hooks_result = self._agent_hooks_result, None
+        return copy.deepcopy(seeded if seeded is not None else _SET_AGENT_HOOKS)
 
     def _connect(self, params: dict, conn: _Conn | None) -> dict:
         if self.ui_socket:

@@ -24,8 +24,11 @@ shed-broker = { path = "../shed-broker", optional = true }
 # its pre-graduation paths.
 shed-rc-engine = { path = "../shed-rc-engine", optional = true }
 # `net` (UnixStream) + `io-util` (buffered line reader) for the host-agent UDS
-# client, on top of the workspace's rt/macros/sync/time.
-tokio = { workspace = true, features = ["net", "io-util"] }
+# client, `process` for `roost::SshExec` — which is UNGATED (mobile links this
+# crate with default features) and spawns one `ssh` child per bootstrap step, so
+# it cannot sit behind `rc` the way `rc.rs`'s spawning does — on top of the
+# workspace's rt/macros/sync/time.
+tokio = { workspace = true, features = ["net", "io-util", "process"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 uuid = { workspace = true }
