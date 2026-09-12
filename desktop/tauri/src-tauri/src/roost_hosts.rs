@@ -1497,7 +1497,29 @@ impl RoostHosts {
             // its next cycle. The flag is per-host and read at send time, so
             // arming needs no watcher to exist yet and no watcher to be
             // replaced.
-            arming_flag(&self.armed, &id).store(true, Ordering::Release);
+            // **Both directions of the race with [`RoostHosts::remove`], not
+            // just one.** `remove` disarms before it tears the registry down, so
+            // a watcher spawned mid-teardown cannot read a stale `true` — that
+            // half is handled there. The half it cannot handle is this one: a
+            // `remove` that finishes while this bootstrap is still running would
+            // leave the store below inserting a FRESH `true` for a host that is
+            // already gone, and a later re-registration of the same `HostId`
+            // would find it and wire a session this app run never started.
+            //
+            // So take `armed` and then `reg` — `remove`'s own order, and there
+            // is no path that takes them the other way round (every spawn site
+            // releases `reg` before `watcher_options` reaches for `armed`) — and
+            // arm only a host that is still registered. A host removed under us
+            // gets nothing, which is the right answer: shed's claim to have
+            // started its session left with it.
+            let mut armed = lock(&self.armed);
+            if lock(&self.reg).ids.contains(&id) {
+                armed
+                    .entry(id.clone())
+                    .or_default()
+                    .store(true, Ordering::Release);
+            }
+            drop(armed);
             // shed just started a session there (or proved one was already
             // serving), so this host is worth watching now rather than at
             // whatever refresh next probes it. `watch` is idempotent: a shed has
