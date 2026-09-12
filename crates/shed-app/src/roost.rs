@@ -2448,7 +2448,7 @@ pub struct HooksRefresh {
     pub target: String,
     /// `shed-desktop` / `shed-mobile`. roost files it as the `by` of the state
     /// entry, so a user can ask the host which of their clients wired these
-    /// hooks last (`roostctl agent status`).
+    /// hooks last, in `~/.config/roost/agent-hooks.json` on that host.
     pub client_label: String,
     /// **May shed wire this host's hooks right now?** Shared with whoever
     /// decides — one flag per host, however many watchers it outlives.

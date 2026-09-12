@@ -33,7 +33,10 @@
 //! so `by` flips between labels while a desktop and a phone are both running.
 //! That churn is roost's metadata about the write, not the user's dotfile
 //! content, and "who wired these last" changing is precisely what that field is
-//! for — `roostctl agent status` on the host is where a user reads it.
+//! for — the host files it as the `by` of the agent's state entry in
+//! `~/.config/roost/agent-hooks.json`, which is where a user reads it.
+//! (NOT `roostctl agent status`: that reports installed / wired-at-version /
+//! out-of-date per agent, and names neither the writing client nor the time.)
 //!
 //! What genuinely changed with the lease: if a roost UI on that host had turned
 //! hooks off or excluded an agent, shed's next reconnect switches it back on. At
@@ -86,7 +89,7 @@ pub struct HooksError {
 pub struct HooksResult {
     /// The label shed sent as `client`. roost records it as the `by` of the
     /// state entry, which is how a user finds out which of their clients wired
-    /// these hooks last (`roostctl agent status` on the host).
+    /// these hooks last, by reading `~/.config/roost/agent-hooks.json` there.
     pub client_label: String,
     /// roost's first-announcement list — the agents this host has wired and
     /// never announced. Not "what this call wrote".
