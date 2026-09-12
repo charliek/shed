@@ -5444,10 +5444,35 @@ esac
             // particular `$HOME/.local/bin` is deliberately absent, which is what
             // makes the post-install PATH warning fire the way it does on a real
             // shed.
-            for tool in ["sh", "uname", "mkdir", "rm", "mv", "chmod", "tee", "cat"] {
+            for tool in ["sh", "mkdir", "rm", "mv", "chmod", "tee", "cat"] {
                 std::os::unix::fs::symlink(real_tool(tool), utils.join(tool))
                     .expect("linking a utility");
             }
+            // **`uname` is a shim, not the real one, and that is not a
+            // convenience.** roost's discovery script asks the far side what it
+            // is with `uname -s` / `uname -m`, and `check_os` refuses anything
+            // but Linux — correctly, since `roost-session` is built for Linux
+            // only. Symlinking the host's `uname` therefore made every runner
+            // test that reaches discovery pass on a Linux dev box and fail on
+            // macOS with "reports itself as Darwin", which is exactly what CI
+            // caught. The far side these tests model is a SHED, so it answers
+            // Linux wherever the test happens to run, and a fixed `x86_64` so
+            // the arch assertions are deterministic rather than inherited from
+            // the runner. C4's rig shims the same tool for the opposite
+            // purpose — its unsupported-OS row lies the other way.
+            write_staged_script(
+                &utils,
+                "uname",
+                concat!(
+                    "#!/bin/sh\n",
+                    "case \"$1\" in\n",
+                    "  -s) echo Linux ;;\n",
+                    "  -m) echo x86_64 ;;\n",
+                    "  *) echo Linux ;;\n",
+                    "esac\n",
+                )
+                .to_string(),
+            );
             let fake = FakeRoost::start().await;
             let ssh = write_exec_ssh(
                 dir.path(),
