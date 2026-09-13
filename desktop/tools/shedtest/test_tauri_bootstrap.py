@@ -30,7 +30,7 @@ Two more knobs make that honest:
   the way the real daemon does. `_fake_session` is deliberately the same
   stand-in `crates/shed-core/src/roost/bootstrap/tests.rs` uses, one language
   over — and `test_the_real_binary_is_installed_and_started_behind_the_fake_ssh`
-  is where that claim is checked against the actual protocol-4 binary.
+  is where that claim is checked against the actual protocol-5 binary.
 
 The far side of `client-bridge` is `fake_roost.FakeRoost`, which answers from
 roost's own vendored wire vectors — so the `session.set_agent_hooks` these cells
@@ -77,9 +77,19 @@ FIXTURES = Path(__file__).resolve().parent / "fixtures"
 #: The mock server's only configured server name (see `fixtures/config.yaml`).
 SERVER = "mock"
 
-#: The identity a protocol-4 `roost-session` prints. `libghostty_build` is
-#: deliberately something shed could never have guessed: the compatibility gate
-#: is the protocol number and only that (plan 019 §3.4).
+#: The identity a protocol-5 `roost-session` prints — the up-to-date case.
+#: `libghostty_build` is deliberately something shed could never have guessed:
+#: the compatibility gate is the protocol number and only that (plan 019 §3.4).
+IDENTITY_V5 = json.dumps(
+    {
+        "app_version": "0.0.19",
+        "session_protocol": 5,
+        "libghostty_build": "ghostty-3f6b1c9a4d2e5f80+snapshot.v1",
+    }
+)
+#: A protocol-4 `roost-session` — exactly what plan 019's desktop installed on
+#: every host it bootstrapped, and now the interesting mismatch case (plan 020):
+#: a session reporting protocol 4 is refused by name and never touched (pin P6).
 IDENTITY_V4 = json.dumps(
     {
         "app_version": "0.0.19",
@@ -335,12 +345,20 @@ def _wait_for(what: str, probe, timeout: float = 30.0):
 
 
 class Rig:
-    """The far side: a throwaway `$HOME` per shed, a fake `ssh`, and the two
+    """The far side: a throwaway `$HOME` per shed, a fake `ssh`, and the three
     `FakeRoost` daemons an installed session pumps to — plus the mock server that
-    has to agree the shed is running."""
+    has to agree the shed is running.
 
-    def __init__(self, root: Path, v4: FakeRoost, v2: FakeRoost, mock):
+    `v5` speaks the CURRENT session protocol (the default a bare `FakeRoost()`
+    answers) and is the compatible/up-to-date daemon most cells pump to; `v4`
+    and `v2` are both mismatch daemons — `v4` is exactly what plan 019's desktop
+    installed everywhere before this bump, and `v2` is every released roost
+    build today. Both are the interesting refusal cases pin P6 covers.
+    """
+
+    def __init__(self, root: Path, v5: FakeRoost, v4: FakeRoost, v2: FakeRoost, mock):
         self.root = root
+        self.v5 = v5
         self.v4 = v4
         self.v2 = v2
         self.mock = mock
@@ -352,7 +370,7 @@ class Rig:
         #: instance back on the way out.
         self.app: TauriClient | None = None
 
-    def roost(self, *, protocol: int = 4) -> FakeRoost:
+    def roost(self, *, protocol: int = 5) -> FakeRoost:
         """A `roost-session` daemon of a cell's OWN.
 
         Cells that assert about ROWS need one each: every shed pumps to whichever
@@ -422,7 +440,7 @@ class Rig:
             for level in (path, path.parent, path.parent.parent):
                 level.chmod(0o700)
         (self.root / "hosts" / shed / "socket").write_text(
-            str((roost or self.v4).socket_path)
+            str((roost or self.v5).socket_path)
         )
         if identity is not None:
             _write_exec(self.installed(shed), _fake_session(identity))
@@ -486,14 +504,17 @@ def rig(mock):
     root = Path(tempfile.mkdtemp(prefix="shed-boot-", dir="/tmp")).resolve()
     (root / "hosts").mkdir()
     (root / "hosts").chmod(0o700)
+    v5 = FakeRoost().start()
     v4 = FakeRoost().start()
     v2 = FakeRoost().start()
-    # A protocol-2 DAEMON, which is what pin P6 is about: shed reports it and
-    # never restarts it. `session_protocol` is a plain control on the fake —
-    # roost keeps one `session.identify` vector per generation and shed vendors
-    # only the current one.
+    # Two MISMATCH daemons, which is what pin P6 is about: shed reports either
+    # and never restarts it. `session_protocol` is a plain control on the
+    # fake — roost keeps one `session.identify` vector per generation and shed
+    # vendors only the current one. `v4` is exactly what plan 019's desktop
+    # installed everywhere before this bump (plan 020).
+    v4.session_protocol = 4
     v2.session_protocol = 2
-    rig = Rig(root, v4, v2, mock)
+    rig = Rig(root, v5, v4, v2, mock)
     try:
         (root / "fsroot").mkdir(parents=True, exist_ok=True)
         utils = root / "utils"
@@ -506,11 +527,11 @@ def rig(mock):
         assert real_uname, "the rig needs uname on PATH"
         _write_exec(utils / "uname", _fake_uname(real_uname))
         # The bytes an install streams: roost's own override rung.
-        _write_exec(root / "src/roost-session", _fake_session(IDENTITY_V4))
+        _write_exec(root / "src/roost-session", _fake_session(IDENTITY_V5))
         _write_exec(root / "bin/fake-ssh", _fake_ssh(root))
         yield rig
     finally:
-        for fake in [v4, v2, *rig.extra]:
+        for fake in [v5, v4, v2, *rig.extra]:
             fake.shutdown()
         shutil.rmtree(root, ignore_errors=True)
 
@@ -605,8 +626,8 @@ def _boot_app(
 def bootstrap_app(rig, mock):
     """The app instance every cell but the no-source and real-binary ones drive.
 
-    Module-scoped so the `ssh` ControlMaster, the bridges and the lease table
-    live across cells the way they do in a running app.
+    Module-scoped so the `ssh` ControlMaster and the bridges live across cells
+    the way they do in a running app.
     """
     with _boot_app(rig, mock.base_url, install_bin=rig.root / "src/roost-session") as app:
         yield app
@@ -670,6 +691,16 @@ def _bootstrap(app: TauriClient, target: str) -> dict:
     return answer
 
 
+def _assert_auto_hooks_call(call: dict) -> None:
+    """A `session.set_agent_hooks` call as shed itself always sends it: `auto`
+    mode, shed's own client label, nothing pre-skipped, and — at protocol 5 —
+    no authority key on the wire at all."""
+    assert call["mode"] == "auto", call
+    assert call["client"] == "shed-desktop", call
+    assert call["skip"] == [], call
+    assert "lease" not in call, "no authority travels with this op any more"
+
+
 # ---------------------------------------------------------------------------
 # the plan matrix, read-only
 # ---------------------------------------------------------------------------
@@ -709,16 +740,16 @@ def test_a_cold_shed_reads_missing_and_offers_an_install(boot, rig):
 def test_a_shed_with_a_usable_binary_and_no_session_offers_a_start(boot, rig):
     """Compatible + NoSession → Start.
 
-    The row a pre-installed protocol-4 binary lands on, and the one that proves
+    The row a pre-installed protocol-5 binary lands on, and the one that proves
     the bridge's `client-bridge: no session` refusal is read as a STATE (the
     binary is there, nothing is running) rather than as a failed probe.
     """
-    target = rig.host("p19-stop", identity=IDENTITY_V4)
+    target = rig.host("p19-stop", identity=IDENTITY_V5)
     answer = boot.call("roost.probe", {"target": target})
     probe = answer["probe"]
     assert probe["outcome"]["kind"] == "compatible", probe
     assert probe["outcome"]["path"] == str(rig.installed("p19-stop"))
-    assert probe["outcome"]["identity"]["session_protocol"] == 4
+    assert probe["outcome"]["identity"]["session_protocol"] == 5
     assert probe["session"]["state"] == "no-session", probe
     assert answer["plan"] == {
         "kind": "start",
@@ -782,6 +813,42 @@ def test_a_mismatched_running_session_is_reported_and_never_stopped(boot, rig):
     # A probe READS: `identify` asks the binary who it is and `client-bridge`
     # asks the session who it is. Neither changes anything. What must be absent
     # is the one verb that would: `start`.
+    assert "start" not in calls, f"P6: never restarted — {calls}"
+    assert set(calls) <= {"identify", "client-bridge"}, f"P6: reads only — {calls}"
+
+
+def test_a_protocol_4_running_session_is_reported_and_never_stopped(boot, rig):
+    """**Pin P6, at the number that is newly interesting** (plan 020).
+
+    A protocol-4 session is exactly what plan 019's desktop installed on every
+    host it bootstrapped, and the day this build starts speaking 5 every one of
+    them becomes a mismatch — reported, never stopped, never restarted, same as
+    any other generation. Otherwise identical to the protocol-2 cell above; kept
+    separate rather than parametrized so a future reader sees the exact sentence
+    each number produces.
+    """
+    target = rig.host("p20-busy", identity=IDENTITY_V4, running=True, roost=rig.v4)
+    answer = boot.call("roost.probe", {"target": target})
+    probe = answer["probe"]
+    assert probe["session"]["state"] == "running", probe
+    assert probe["session"]["session_protocol"] == 4, probe
+    plan = answer["plan"]
+    assert plan["kind"] == "report"
+    assert plan["session_protocol"] == 4
+    assert "speaks protocol 4" in plan["message"], plan
+    assert "roostctl session stop" in plan["message"], plan
+
+    refusal = boot.call(
+        "roost.bootstrap",
+        {"target": target, "fingerprint": probe["fingerprint"], "consent": True},
+    )
+    assert refusal["ok"] is False
+    assert refusal["error"]["stage"] == "report"
+    assert "speaks protocol 4" in refusal["error"]["message"]
+
+    assert rig.marker("p20-busy").exists(), "the session was left running"
+    calls = rig.calls("p20-busy")
+    assert calls, "the far side was reached at all"
     assert "start" not in calls, f"P6: never restarted — {calls}"
     assert set(calls) <= {"identify", "client-bridge"}, f"P6: reads only — {calls}"
 
@@ -852,7 +919,7 @@ def test_a_stale_fingerprint_is_refused_before_anything_is_written(boot, rig):
     re-probes too, but this check happens before a single byte is resolved.
     """
     target = rig.host("p19-moved")
-    other = rig.host("p19-other", identity=IDENTITY_V4)
+    other = rig.host("p19-other", identity=IDENTITY_V5)
     stale = boot.call("roost.probe", {"target": other})["probe"]["fingerprint"]
     answer = boot.call(
         "roost.bootstrap",
@@ -868,18 +935,18 @@ def test_a_stale_fingerprint_is_refused_before_anything_is_written(boot, rig):
 def test_a_consented_bootstrap_installs_starts_and_wires_the_hooks(boot, rig, mock):
     """The whole payoff, end to end on a cold shed.
 
-    Install → Start → the lease dialogue → the shed's roost rows in `rc.list`.
+    Install → Start → the hooks dialogue → the shed's roost rows in `rc.list`.
     The hooks half is the one that turns a shed's codex and cursor rows from
     liveness-only into roost-sourced, and it is asserted where it actually
     happens: on the far side, in the params the host session received.
     """
-    rig.v4.agent_hooks_calls.clear()
+    rig.v5.agent_hooks_calls.clear()
     target = rig.host("p19-new")
     answer = _bootstrap(boot, target)
     assert answer["plan"]["kind"] == "install"
     assert answer["dest"] == str(rig.installed("p19-new"))
     assert answer["verdict"].startswith("ready pid="), answer
-    assert answer["session_protocol"] == 4, answer
+    assert answer["session_protocol"] == 5, answer
 
     # The binary really landed, and the far side really started it.
     assert rig.installed("p19-new").is_file()
@@ -892,21 +959,16 @@ def test_a_consented_bootstrap_installs_starts_and_wires_the_hooks(boot, rig, mo
     assert answer["path_warning"], answer
     assert "roost-session" in answer["path_warning"]
 
-    # The hooks dialogue, as the HOST received it.
+    # The hooks dialogue, as the HOST received it. `lease_held` and
+    # `skipped_code` retired with the lease (plan 020) — what survives is that
+    # the op was served, unconditionally, with no authority key on the wire.
     hooks = answer["hooks"]
     assert hooks["applied"] is True, hooks
     assert hooks["client"] == "shed-desktop"
     assert hooks["mode"] == "auto"
-    assert hooks["lease_held"] is True, "the bearer token is kept for the app run"
     assert hooks["wired"] == ["claude", "codex"], hooks
     assert [s["agent"] for s in hooks["skipped"]] == ["cursor", "grok"], hooks
-    served = rig.v4.agent_hooks_calls
-    assert len(served) == 1, served
-    assert served[0]["mode"] == "auto"
-    assert served[0]["client"] == "shed-desktop"
-    assert served[0]["skip"] == []
-    assert served[0]["lease"] == rig.v4.lease, "the lease it minted, presented back"
-    assert rig.v4.lease_label == "shed-desktop"
+    assert "lease_held" not in hooks and "skipped_code" not in hooks, hooks
 
     # And the shed is a readable roost host now: a watcher was spawned because
     # shed itself started the session.
@@ -914,6 +976,20 @@ def test_a_consented_bootstrap_installs_starts_and_wires_the_hooks(boot, rig, mo
         "the freshly bootstrapped shed to read as reachable",
         lambda: _host_status(boot, "p19-new").get("reachable") is True or None,
     )
+    # Everything the host was asked is shed's own op — asserted by CONTENT, not
+    # by a count. A count cannot be pinned here: `Rig.host`'s own `sheds.list`
+    # starts a background probe for this shed, so a watcher may have been
+    # promoted and armed mid-install and cycled once already, and the reachable
+    # row a wait returns on cannot say WHICH cycle published it. Whether that
+    # second identical call has landed yet is not this cell's subject; the
+    # re-send is, and it is
+    # `test_the_hooks_are_re_sent_on_every_watcher_cycle_and_never_for_an_observer`,
+    # which forces its cycles instead of hoping for them.
+    served = list(rig.v5.agent_hooks_calls)
+    assert served, "the install wired no hooks at all"
+    for call in served:
+        _assert_auto_hooks_call(call)
+
     status = _host_status(boot, "p19-new")
     assert status["kind"] == "shed"
     assert status["server"] == SERVER
@@ -924,6 +1000,104 @@ def test_a_consented_bootstrap_installs_starts_and_wires_the_hooks(boot, rig, mo
     again = boot.call("roost.probe", {"target": target})
     assert again["probe"]["session"]["state"] == "running"
     assert again["plan"]["kind"] == "up-to-date"
+
+
+def test_the_hooks_are_re_sent_on_every_watcher_cycle_and_never_for_an_observer(
+    boot, rig
+):
+    """**The re-send, driven through the real app** (plan 020 §3.3, §7 AC 8).
+
+    `shed-app` has three unit tests for this and all three passed while the app
+    wired nothing at all: plan 019 built `RoostWatcherOptions.hooks` and then no
+    production caller ever constructed a `HooksRefresh`, so the shipped desktop
+    sent `session.set_agent_hooks` once — inside the install — and never again.
+    A unit test of a seam cannot see that nobody reaches the seam. This cell can,
+    which is the only reason it exists.
+
+    Two hosts, one each way, because the rule has two halves and each is
+    meaningless without the other:
+
+    * the **bootstrapped** one must re-send on EVERY cycle. `mode: "auto"` wires
+      the agents whose config directory exists *at that moment*, so an agent the
+      user sets up tomorrow is wired by a later call and by nothing else — and a
+      watcher reconnects constantly (a shed restart, an ssh drop, a laptop
+      waking up).
+    * the **merely watched** one must send on NONE. At protocol 5 the far side
+      would happily let it: roost deleted the authority check on this op, so
+      "shed wires a session it started and nothing else" is now shed's own rule
+      and the only thing enforcing it.
+
+    A hang-up is how a cycle is forced, and every claim here is counted across
+    one. That is not a convenience: `Rig.host` runs a `sheds.list`, which starts
+    a background probe for the bootstrap target too, so a watcher can be promoted
+    mid-install — and a wait on "reachable" then returns on a snapshot that may
+    be from before or after the bootstrap armed the host. A count asserted
+    against such a wait is off by one at random. A count asserted against a cycle
+    this cell itself forced, after the bootstrap has returned, cannot be.
+    """
+    wired_daemon = rig.roost()
+    wired_shed = "p20-hooks-resend"
+    target = rig.host(wired_shed, identity=IDENTITY_V5, roost=wired_daemon)
+
+    # The observer, set up FIRST so it is watched across every cycle below.
+    # Its own daemon: `agent_hooks_calls` is per-fake, and a shared one could
+    # not tell "nobody wired this host" from "somebody wired the other one".
+    observed_daemon = rig.roost()
+    observed_shed = "p20-hooks-observer"
+    rig.host(observed_shed, identity=IDENTITY_V5, running=True, roost=observed_daemon)
+    _refresh(boot)
+    _wait_for(
+        "the merely-watched shed to earn a watcher",
+        lambda: _host_status(boot, observed_shed).get("reachable") is True or None,
+    )
+    assert observed_daemon.agent_hooks_calls == [], (
+        "a host shed only watched was wired on its very first cycle: "
+        f"{observed_daemon.agent_hooks_calls}"
+    )
+
+    _bootstrap(boot, target)
+    _wait_for(
+        "the bootstrapped shed to read as reachable",
+        lambda: _host_status(boot, wired_shed).get("reachable") is True or None,
+    )
+
+    # **Three forced cycles, each one required to send.** The host is armed the
+    # moment `roost.bootstrap` returns and the flag is read at the head of every
+    # cycle, so whichever watcher is on this host — the one the bootstrap
+    # started, or one a background probe promoted before it — must send on each
+    # hang-up. Three rather than two on purpose: the failure this replaces — a
+    # re-send that worked once and then quietly stopped — passes at n = 2.
+    for cycle in (1, 2, 3):
+        before = len(wired_daemon.agent_hooks_calls)
+        wired_daemon.close_all()
+        _wait_for(
+            f"watcher cycle {cycle} to re-send the agent hooks",
+            lambda before=before: len(wired_daemon.agent_hooks_calls) > before or None,
+        )
+
+    # Counted after a wait that can only be satisfied by the cycles above, so
+    # the contents below are asserted over a settled list.
+    served = list(wired_daemon.agent_hooks_calls)
+    assert len(served) >= 4, f"the install's call plus one per cycle: {served}"
+    for call in served:
+        _assert_auto_hooks_call(call)
+
+    # …and the observer wired nothing across all of it — including across a
+    # reconnect of its OWN, which is the cycle a wrongly-armed watcher would send
+    # on. The claimed tab is how that cycle is observed: the daemon is hung up on
+    # first, so the row can only reach the pane through a fresh connection's
+    # snapshot.
+    observed_daemon.close_all()
+    rig.agent_tab(observed_daemon, 21, kind="codex")
+    _wait_for(
+        "the watched shed to reconnect and re-snapshot",
+        lambda: [r for r in _roost_rows(boot, observed_shed) if r["slug"] == "21"]
+        or None,
+    )
+    assert observed_daemon.agent_hooks_calls == [], (
+        "a watcher wired hooks into a session shed never started: "
+        f"{observed_daemon.agent_hooks_calls}"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -940,8 +1114,8 @@ def test_a_running_shed_is_probed_and_then_watched(boot, rig, mock):
     the whole reason the probe exists: a watcher is a live ssh client-bridge.
     """
     live = rig.roost()
-    rig.host("p19-live", identity=IDENTITY_V4, running=True, roost=live)
-    quiet = rig.host("p19-quiet", identity=IDENTITY_V4)
+    rig.host("p19-live", identity=IDENTITY_V5, running=True, roost=live)
+    quiet = rig.host("p19-quiet", identity=IDENTITY_V5)
     _refresh(boot)
 
     _wait_for(
@@ -973,7 +1147,7 @@ def test_hub_and_roost_rows_are_a_union_and_a_filter_returns_both(boot, rig, moc
     """
     shed = "p19-union"
     fake = rig.roost()
-    target = rig.host(shed, identity=IDENTITY_V4, roost=fake)
+    target = rig.host(shed, identity=IDENTITY_V5, roost=fake)
     _bootstrap(boot, target)
     # An adapter-claimed tab, so the roost half of the union is a row that
     # survives the watcher's next snapshot — see `Rig.agent_tab`.
@@ -1104,7 +1278,7 @@ def test_a_stopped_shed_loses_its_watcher_and_its_rows(boot, rig, mock):
     """
     shed = "p19-gone"
     fake = rig.roost()
-    target = rig.host(shed, identity=IDENTITY_V4, roost=fake)
+    target = rig.host(shed, identity=IDENTITY_V5, roost=fake)
     _bootstrap(boot, target)
     rig.agent_tab(fake)
     _wait_for(
@@ -1134,7 +1308,7 @@ def test_without_a_source_there_is_no_button(rig):
     nothing to install.
 
     Its own app instance, because the source ladder reads the process
-    environment: no `ROOST_SESSION_INSTALL_BIN`, no protocol-4 roost beside this
+    environment: no `ROOST_SESSION_INSTALL_BIN`, no protocol-5 roost beside this
     app, and `RELEASE_PIN` is `None` until roost ships one — so the ladder ends at
     `NoSource` and the preview says so in the words plan 019 §3.5 pinned.
 
@@ -1169,7 +1343,7 @@ def test_without_a_source_there_is_no_button(rig):
             assert preview["source"]["rung"] == "none"
             assert preview["actionable"] is False, "no bytes, no button"
             sentence = preview["source"]["sentence"]
-            assert "no roost release speaking session protocol 4 is published yet" in sentence
+            assert "no roost release speaking session protocol 5 is published yet" in sentence
             assert "(the latest, 0.0.19, speaks 2)" in sentence
             assert "ROOST_SESSION_INSTALL_BIN" in sentence
             assert f"{target} was left untouched." in sentence
@@ -1183,7 +1357,7 @@ def test_without_a_source_there_is_no_button(rig):
             )
             assert answer["ok"] is False
             assert answer["error"]["stage"] == "source"
-            assert "no roost release speaking session protocol 4" in answer["error"]["message"]
+            assert "no roost release speaking session protocol 5" in answer["error"]["message"]
             assert not rig.installed(target_name).exists()
     finally:
         private_mock.stop()
@@ -1195,16 +1369,16 @@ def test_without_a_source_there_is_no_button(rig):
 
 
 def _real_session_binary() -> Path | None:
-    """The protocol-4 `roost-session` to install, or None to skip.
+    """The protocol-5 `roost-session` to install, or None to skip.
 
     `SHED_TAURI_ROOST_SESSION_BIN` is the same knob the machine suite's
-    `real_roost` cell uses; the plan-014 build cache is the default because that
-    is where this repo's only protocol-4 binary lives (roost's own releases speak
+    `real_roost` cell uses; the plan-020 build cache is the default because that
+    is where this repo's only protocol-5 binary lives (roost's own releases speak
     2). **Read-only — never rebuilt here**: roost's tree is not this repo's to
     compile.
     """
     raw = os.environ.get("SHED_TAURI_ROOST_SESSION_BIN") or str(
-        Path.home() / ".cache/shed-plan014/roost-c67ac27/target/release/roost-session"
+        Path.home() / ".cache/shed-plan020/roost-c1bfe88/target/release/roost-session"
     )
     path = Path(raw).expanduser()
     return path if os.access(path, os.X_OK) else None
@@ -1213,14 +1387,14 @@ def _real_session_binary() -> Path | None:
 @pytest.mark.real_roost
 @pytest.mark.skipif(
     _real_session_binary() is None,
-    reason="no protocol-4 roost-session available (set SHED_TAURI_ROOST_SESSION_BIN)",
+    reason="no protocol-5 roost-session available (set SHED_TAURI_ROOST_SESSION_BIN)",
 )
 def test_the_real_binary_is_installed_and_started_behind_the_fake_ssh(rig, mock, _reset_mock):
     """The fake session's fidelity claim, checked against the real thing.
 
     Every other cell installs a shell script that answers `identify`, `start` and
     `client-bridge`. That script is written from roost's source, but a stand-in is
-    a stand-in: the assertion that binds is this one, where the REAL c67ac27
+    a stand-in: the assertion that binds is this one, where the REAL c1bfe88
     binary is streamed through roost's own install order and then identifies
     itself — all of it behind the fake `ssh`, in a throwaway `$HOME`.
 
@@ -1247,7 +1421,7 @@ def test_the_real_binary_is_installed_and_started_behind_the_fake_ssh(rig, mock,
             assert answer["ok"] is True, answer
             verdict = answer["verdict"]
             assert verdict.startswith("ready pid="), answer
-            assert answer["session_protocol"] == 4, "the real binary speaks 4"
+            assert answer["session_protocol"] == 5, "the real binary speaks 5"
             assert answer["session_id"], answer
             installed = rig.installed(shed)
             assert installed.is_file()
@@ -1261,7 +1435,7 @@ def test_the_real_binary_is_installed_and_started_behind_the_fake_ssh(rig, mock,
                 check=True,
                 env={"HOME": str(rig.home(shed)), "PATH": "/usr/bin:/bin"},
             ).stdout
-            assert json.loads(out)["session_protocol"] == 4, out
+            assert json.loads(out)["session_protocol"] == 5, out
     finally:
         if verdict and verdict.startswith("ready pid="):
             pid = verdict.split("=", 1)[1].strip()
@@ -1376,8 +1550,8 @@ def test_the_sheds_pane_renders_start_with_no_button_states(boot, rig):
     session's Report — whose message is PINNED COPY and must reach the pane
     verbatim (plan 019 §3.4)."""
     boot.navigate("sheds")
-    startable = rig.host("p19-ui-start", identity=IDENTITY_V4)
-    up_to_date = rig.host("p19-ui-uptodate", identity=IDENTITY_V4, running=True, roost=rig.v4)
+    startable = rig.host("p19-ui-start", identity=IDENTITY_V5)
+    up_to_date = rig.host("p19-ui-uptodate", identity=IDENTITY_V5, running=True, roost=rig.v5)
     reported = rig.host("p19-ui-mismatch", identity=IDENTITY_V2, running=True, roost=rig.v2)
 
     row = _wait_for_roost_row(boot, startable)
@@ -1392,7 +1566,7 @@ def test_the_sheds_pane_renders_start_with_no_button_states(boot, rig):
     row = _wait_for_roost_row(boot, reported)
     assert row["button"] is None, row
     assert row["status"] == (
-        f"roost-session on {reported} speaks protocol 2, this build speaks 4 — "
+        f"roost-session on {reported} speaks protocol 2, this build speaks 5 — "
         "upgrade whichever is older; stop it there with `roostctl session stop` "
         "and reconnect once it is."
     ), "the Report row's message must reach the pane verbatim (pinned copy)"
@@ -1423,7 +1597,7 @@ def _mint_private_shed(rig: Rig, shed: str) -> None:
         path.mkdir(parents=True, exist_ok=True)
         for level in (path, path.parent, path.parent.parent):
             level.chmod(0o700)
-    (rig.root / "hosts" / shed / "socket").write_text(str(rig.v4.socket_path))
+    (rig.root / "hosts" / shed / "socket").write_text(str(rig.v5.socket_path))
     if shed not in rig.hosts:
         rig.hosts.append(shed)
 
@@ -1457,10 +1631,10 @@ def test_a_blocked_install_shows_the_pinned_no_source_sentence_and_no_button(rig
             # verbatim — a substring match would pass even if the renderer
             # appended or reworded anything around it.
             assert row["status"] == (
-                "no roost release speaking session protocol 4 is published yet "
+                "no roost release speaking session protocol 5 is published yet "
                 "(the latest, 0.0.19, speaks 2). On a Linux machine with a "
-                "protocol-4 roost installed the desktop uses that roost-session; "
-                "otherwise point ROOST_SESSION_INSTALL_BIN at a protocol-4 build. "
+                "protocol-5 roost installed the desktop uses that roost-session; "
+                "otherwise point ROOST_SESSION_INSTALL_BIN at a protocol-5 build. "
                 f"{target} was left untouched."
             ), row["status"]
             # …and the whole of it is on screen, in place of a button.

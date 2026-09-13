@@ -1669,8 +1669,8 @@ export default function App() {
   const [roostConsent, setRoostConsent] = useState<{ target: string; preview: RoostPreview } | null>(null);
   // Per-target indeterminate-progress phrase, non-null exactly while THAT
   // target's `roost.bootstrap` is in flight. A map (not one flag) because two
-  // cards can be mid-run at once — the lease dialogue is per-host, and
-  // nothing here serializes a click on one card behind another's.
+  // cards can be mid-run at once — a bootstrap is per-host, and nothing here
+  // serializes a click on one card behind another's.
   const [roostBusy, setRoostBusy] = useState<Record<string, string>>({});
   // Bumped after every settled bootstrap so `useRoostBoard` re-previews the
   // host it just acted on (and every other row sharing the board) — a plain

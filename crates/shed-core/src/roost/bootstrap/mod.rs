@@ -68,7 +68,7 @@
 //! rule, and may well offer to reinstall it. That is not a bug in either side —
 //! it is two clients with different needs answering different questions, and the
 //! roost UI's answer is the conservative one. shed's install is still the right
-//! thing to have done: a protocol-4 session is a session shed can read, and
+//! thing to have done: a protocol-5 session is a session shed can read, and
 //! shed's whole claim on the host is reading it.
 //!
 //! ## The rollback promise, and exactly how far it reaches
@@ -390,7 +390,7 @@ pub enum Step<T> {
         op: String,
         params: serde_json::Value,
     },
-    /// The lease dialogue, over that same connection. See [`hooks`].
+    /// `session.set_agent_hooks`, over that same connection. See [`hooks`].
     Hooks { client_label: String },
     /// There is nothing left to do.
     Done(T),
@@ -467,7 +467,7 @@ pub enum Outcome {
 
 /// A refused or unreachable [`Step::Call`].
 ///
-/// `code` is either a roost server code (`unknown-op`, `connect-required`, …)
+/// `code` is either a roost server code (`unknown-op`, `not-found`, …)
 /// or one of [`reach_code`]'s transport classifications. Owned strings, because
 /// this crosses no FRB boundary but its message does reach a user.
 #[derive(Debug, Clone, PartialEq, Eq)]

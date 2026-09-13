@@ -245,7 +245,7 @@ func runRoostProviderActivate() error {
 		// different process against a far side that has had a whole human
 		// interaction's worth of time to change underneath it — restarted at a
 		// different version, upgraded, downgraded. Without this call a session
-		// that went from protocol 4 to 3 between the agent menu and the
+		// that went from protocol 5 to 4 between the agent menu and the
 		// workdir row gets a tab opened against a wire this build does not
 		// speak, instead of §3.2's pinned mismatch row. The call costs one
 		// exec on the ControlMaster the same step's ssh options already

@@ -1246,11 +1246,11 @@ pub enum RoostUpdate {
 /// schedule with the same reset-on-worked rule, so a roost row and a hub row in
 /// one sessions view go stale at the same rate.
 ///
-/// **Nothing here has a cadence.** Since roost R1 (session protocol 4) a
-/// subscribe takes no lease and classifies instead: shed subscribes with an
-/// empty one, which is an *observer* stream by construction, and every workspace
-/// commit arrives as a batch. Latency is the push; the only sleep in this module
-/// is the failure backoff.
+/// **Nothing here has a cadence.** Since roost R1 a subscribe is a plain
+/// request — at session protocol 5 it takes no token and there is no such thing
+/// as a privileged stream to be one of — and every workspace commit arrives as a
+/// batch. Latency is the push; the only sleep in this module is the failure
+/// backoff.
 ///
 /// [`spawn`]: RoostWatcher::spawn
 /// [`stop`]: RoostWatcher::stop
@@ -1261,14 +1261,23 @@ pub struct RoostWatcher {
 
 /// What a watcher does beyond watching.
 ///
-/// Empty by default, and that is the ordinary case: a watcher over somebody
-/// else's machine is a pure observer and must stay one. Only a host **shed
-/// itself started a session on** gets the hooks entry, because only there does
-/// shed hold a lease it is entitled to re-present.
+/// Empty by default, and that is the ordinary case for an embedder that never
+/// bootstraps anything: such a watcher reads and nothing else. A client that
+/// DOES bootstrap hands every watcher a [`HooksRefresh`] and lets its
+/// [`armed`](HooksRefresh::armed) flag answer "may shed wire this host?" — read
+/// afresh at the head of every cycle, so the entitlement is a property of the
+/// HOST rather than of which watcher happened to be spawned when.
+///
+/// The rule the flag encodes is unchanged: shed wires hooks into a session it
+/// started, and into nothing else. At session protocol 5 the wire would let any
+/// same-UID client wire any session it can reach; this is shed's own answer to
+/// *should it*, and it is a local fact about who started what rather than
+/// anything the far side enforces.
 #[derive(Default)]
 pub struct RoostWatcherOptions {
     /// Re-send `session.set_agent_hooks` at the head of every successful cycle
-    /// (plan 019 §3.4).
+    /// — **for as long as [`HooksRefresh::armed`] is set** (plan 019 §3.4,
+    /// entitlement re-shaped in plan 020 §3.3).
     ///
     /// **Why on every connect and not once at install time.** roost's `auto`
     /// mode wires only the agents whose config directory exists *at that
@@ -1427,7 +1436,7 @@ fn reach_other(error: &RoostError) -> ReachError {
 /// discard the new transport's first records as ones it had "already shown",
 /// which is the same stale-classification bug read backwards.
 ///
-/// [`overlay_ssh_reason`]: https://github.com/charliek/roost/blob/c67ac27/crates/roost-iced/src/host_conn.rs
+/// [`overlay_ssh_reason`]: https://github.com/charliek/roost/blob/c1bfe88/crates/roost-iced/src/host_conn.rs
 async fn overlay_reach_reason(
     reach: &dyn RoostReach,
     seen: &mut u64,
@@ -1559,8 +1568,12 @@ async fn run_loop(
 /// every poll because a restart need not drop a polled socket; a *held stream*
 /// cannot outlive its daemon, so a restart is an EOF and the next cycle
 /// re-identifies. The one edge is a restart landing between conn A's identify
-/// and conn B's subscribe: that snapshot carries the old `daemon_session_id`,
-/// the stream EOFs immediately, and the next cycle fixes both.
+/// and conn B's subscribe, and **it is now caught rather than survived**: the
+/// two dials name their incarnation, this compares them, and a disagreement
+/// ends the cycle as a [`Cycle::Resync`] before the `tab.list` below is ever
+/// issued. It used to recover a cycle later by accident — the stream EOFed
+/// under a snapshot already published from the dead incarnation — which cost a
+/// published inventory nobody could act on.
 ///
 /// `worked` is set once the cycle's first snapshot has gone out; `applied` once
 /// a batch has actually been folded in. Returns `Err` only for something the
@@ -1600,20 +1613,44 @@ async fn observe_once(
         }
     };
 
-    // Conn B — the observer stream. **An empty lease is an observer by
-    // construction on roost's side**, not merely by serde default: it builds the
-    // presented lease with `(!lease.is_empty()).then(…)` and requires a
-    // non-empty one to classify a driver. So this takes nothing from whoever is
-    // driving the session, and a takeover reclassifies rather than ends it.
+    // Conn B — the event stream. **A subscribe takes nothing and carries no
+    // claim**: at session protocol 5 roost has no stream classification at all,
+    // so every subscriber is a peer of every other and one more of them costs
+    // whoever is using the session nothing. It is also why `tab.effect` now
+    // reaches shed, which the fold below ignores because a watcher views no tab.
     let subscribe_fut = async {
         let subscriber = Conn::endpoint(&endpoint)
             .await
             .map_err(|e| reach_other(&e))?;
-        subscriber.subscribe("").await.map_err(|e| reach_other(&e))
+        subscriber.subscribe().await.map_err(|e| reach_other(&e))
     };
 
     let (_, stream_result) = tokio::join!(hooks_fut, subscribe_fut);
     let mut stream = stream_result?;
+
+    // **The two legs have to be the same daemon, and this is the only place
+    // that can tell.** A `roost-session` that restarted between the two dials
+    // above answers the ack from one incarnation and answered `session.identify`
+    // from another, so the snapshot conn A is about to take describes a process
+    // that is gone while the stream describes the one that replaced it. roost
+    // puts its own id on every ack for exactly this and does **not** check it
+    // itself on a fresh subscribe — it only compares when the request names a
+    // `session_id`, which is the resume path shed does not take.
+    //
+    // Before the `tab.list`, deliberately: the failure this prevents is a
+    // published inventory built from a dead incarnation's tabs, and a check
+    // after the snapshot would prevent nothing. A resync rather than a `Down`
+    // because the daemon is alive and we are one dial behind it — the same
+    // story as an EOF, bounded by the same [`MAX_CONSECUTIVE_RESYNCS`].
+    if stream.session_id() != identify.session_id {
+        tracing::warn!(
+            label = %label,
+            identified = %identify.session_id,
+            subscribed = %stream.session_id(),
+            "roost restarted between the identify and the subscribe"
+        );
+        return Ok(Cycle::Resync);
+    }
 
     // Conn A again — the snapshot the stream is fenced against — and then conn A
     // is done: everything after this comes off the push feed.
@@ -1721,18 +1758,7 @@ async fn observe_once(
                     return Ok(Cycle::Resync);
                 }
             },
-            // Informational: somebody else took the interactive lease. The
-            // stream survives it (that is the whole R1 re-cut) and shed never
-            // held the lease in the first place, so there is nothing to do but
-            // say so.
-            Ok(Some(EventFrame::DriverChanged(changed))) => {
-                tracing::debug!(
-                    label = %label,
-                    taken_by = %changed.taken_by,
-                    "roost driver changed"
-                );
-            }
-            // The one terminal envelope an event stream can see at protocol 4.
+            // The one terminal envelope an event stream can see at protocol 5.
             // The daemon is going away, so this is a `Down` with a reason and
             // not a resync.
             Ok(Some(EventFrame::Stopping(stopping))) => {
@@ -1823,13 +1849,13 @@ pub async fn tab_dump(reach: &dyn RoostReach, tab_id: i64) -> Result<TabDumpResu
     finish(reach, conn.tab_dump(tab_id).await).await
 }
 
-// There is no `tab_write` one-shot here. A write is lease-gated at session
-// protocol 4, so it is not a one-shot at all: a caller has to hold a lease
-// across the `session.connect` that minted it and the write it authorizes, and
-// a per-call dial would take the lease from whoever is driving on every
-// keystroke. `shed_core::roost::Conn::{session_connect, tab_write}` is the
-// surface for the code that will drive a tab (A4/S4); nothing in shed calls it
-// today.
+// There is no `tab_write` one-shot here, and it is not because the wire forbids
+// one: at session protocol 5 a write takes no token and a per-call dial would
+// be accepted. It is because a dial per keystroke is a remote `ssh` exec per
+// keystroke over an [`SshBridge`], which is the same reason [`RoostPeek`] holds
+// its connection. `shed_core::roost::Conn::tab_write` is the surface for the
+// code that will drive a tab (A4/S4), and it keeps the connection it writes on;
+// nothing in shed calls it today.
 
 /// A held connection for repeatedly dumping one tab.
 ///
@@ -1838,9 +1864,8 @@ pub async fn tab_dump(reach: &dyn RoostReach, tab_id: i64) -> Result<TabDumpResu
 /// frame — is a remote `ssh` exec per frame on a machine.
 ///
 /// **Dropping it closes the connection**, which is the whole of closing a peek:
-/// there is no server-side state to release (`tab.dump` is lease-free and
-/// stateless), so there is nothing an explicit `close()` could do that the drop
-/// does not.
+/// `tab.dump` is a stateless read, so there is no server-side state to release
+/// and nothing an explicit `close()` could do that the drop does not.
 ///
 /// ## It keeps the reach, not just the connection
 ///
@@ -2392,218 +2417,67 @@ fn tail(bytes: &[u8], cap: usize) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// the lease table
+// keeping a host's agent hooks wired
 // ---------------------------------------------------------------------------
 
-/// The in-memory lease table plan 019 §3.4 pins: **one lease per target, for the
-/// app run**.
+/// The watcher's standing instruction to keep one host's agent hooks wired,
+/// for as long as its owner says shed may.
 ///
-/// roost's lease is a bearer token that **outlives the connection that minted
-/// it** — a reconnect is a takeover, not a resumption — so it cannot live on a
-/// `Conn` and it must not be re-minted per use: `session.connect {takeover:
-/// false}` against a live lease answers `already-connected` *even when the
-/// caller is the holder*, so a client that re-minted on every reconnect would
-/// lock itself out of its own session on the second try.
+/// Cloneable and cheap: two strings — the target's grammar token and shed's own
+/// client label — and one shared flag.
 ///
-/// What it is for is one behaviour: re-sending `session.set_agent_hooks` on
-/// every watcher (re)connect, because `mode: auto` only wires the agents whose
-/// config directory exists at that moment. What ends it is `taken-over` —
-/// whoever took the lease wires the hooks themselves, and shed stops. **Nothing
-/// here ever takes a lease over.**
+/// **There is nothing to remember between calls**, which is the whole of plan
+/// 020 §3.3. At session protocol 4 this carried a bearer token and a table of
+/// entitlements around it, because the op was gated on one; roost deleted that
+/// gate at 5 and shed deleted the table with it rather than inventing a
+/// replacement. What is left is a request shed sends on every successful cycle —
+/// always the same one, `{mode: "auto", skip: [], client}` — against a host shed
+/// started the session on. A call that did not land is re-sent by the next
+/// cycle, so a failure needs no recovery state either.
 ///
-/// Deliberately not persisted. A lease is daemon-lifetime state; a token
-/// written to disk would be a stale one the next run tried to present, and the
-/// session that minted it is gone anyway.
-///
-/// ## The dialogue is a transaction, and the map's lock is not what makes it one
-///
-/// "Is shed still entitled, with which token, and send" is **one decision**, and
-/// the mutex around the map protects only its three separate steps. Two watchers
-/// on the same target (a card refresh racing a reconnect) could interleave into
-/// exactly the outcome plan 019 §3.4 forbids: A reads `active` and the token, B
-/// completes a dialogue that came back `taken-over` and records the permanent
-/// surrender, and A — deciding on a fact that is now false — presents the
-/// surrendered lease anyway. Whoever took the session over would then be fought
-/// for it by a client that had already stepped back.
-///
-/// So every read-decide-send for one target runs under that target's
-/// [`gate`](RoostLeases::gate), and the decision itself is the single locked
-/// read [`armed`](RoostLeases::armed) rather than `active` followed by `lease`.
-/// The gate is per target, not global: a dialogue holds it across a network
-/// round trip, and one unreachable host must not stall every other host's
-/// refresh.
-#[derive(Default)]
-pub struct RoostLeases {
-    inner: std::sync::Mutex<std::collections::HashMap<String, LeaseEntry>>,
-}
-
-/// One target's lease, whether shed is still entitled to it, and the gate that
-/// serializes the dialogues about it.
-#[derive(Debug, Clone, Default)]
-struct LeaseEntry {
-    /// The bearer token, while it is still good.
-    lease: Option<String>,
-    /// Set by `taken-over`: somebody else is driving, and they wire the hooks.
-    /// Terminal for the app run — a shed that re-armed on the next reconnect
-    /// would be fighting a user's roost UI for their own session.
-    ///
-    /// The one thing that clears it is [`RoostLeases::forget`], which is not a
-    /// re-arm: it says the session this was decided about is gone.
-    surrendered: bool,
-    /// Held for the length of one read-decide-send about this target. An
-    /// `async` mutex because it is held across the wire call — that is the
-    /// point — and an `Arc` so a holder does not borrow the map it is about to
-    /// need again.
-    gate: Arc<tokio::sync::Mutex<()>>,
-}
-
-impl RoostLeases {
-    pub fn new() -> RoostLeases {
-        RoostLeases::default()
-    }
-
-    /// The lease held for `target`, if shed is still holding one.
-    pub fn lease(&self, target: &str) -> Option<String> {
-        self.inner
-            .lock()
-            .expect("the roost lease table")
-            .get(target)
-            .and_then(|entry| entry.lease.clone())
-    }
-
-    /// Whether shed should still be re-sending hooks for `target`.
-    pub fn active(&self, target: &str) -> bool {
-        self.armed(target).is_some()
-    }
-
-    /// The lease to present **and** the entitlement to present it, read
-    /// together under one lock.
-    ///
-    /// The atomic form of `active(t).then(|| lease(t))`, and the only form a
-    /// sender may use: between those two calls a `taken-over` can land, and the
-    /// caller would then send a token it has just been told to stop sending.
-    fn armed(&self, target: &str) -> Option<String> {
-        let held = self.inner.lock().expect("the roost lease table");
-        held.get(target)
-            .filter(|entry| !entry.surrendered)
-            .and_then(|entry| entry.lease.clone())
-    }
-
-    /// This target's serialization gate — see the type's doc.
-    ///
-    /// Taken by **every** path that presents a lease ([`HooksRefresh::refresh`]
-    /// and [`BootstrapRunner::hooks`]), so a surrender recorded by one of them
-    /// is visible to the next before it decides, rather than after it has sent.
-    fn gate(&self, target: &str) -> Arc<tokio::sync::Mutex<()>> {
-        self.inner
-            .lock()
-            .expect("the roost lease table")
-            .entry(target.to_string())
-            .or_default()
-            .gate
-            .clone()
-    }
-
-    /// Fold one dialogue's result in.
-    ///
-    /// Three outcomes, and they are not the same:
-    ///
-    /// * a lease came back — keep it, and keep re-sending;
-    /// * `taken-over` — surrender, permanently for this run;
-    /// * anything else with no lease (`already-connected` at the first connect,
-    ///   a dead connection) — **forget the token and leave the door open**. The
-    ///   first is somebody else driving *right now*, which a later reconnect may
-    ///   well find over; the second is a transport failure that says nothing
-    ///   about entitlement at all.
-    ///
-    /// That third row is a *clear*, not a no-op, and the difference is a real
-    /// session: a token is only ever good for the session that minted it, and
-    /// every result that came back without one is evidence that the session
-    /// shed's token belongs to did not accept it (or is no longer there to).
-    /// Keeping it would have the watcher present a dead session's lease on
-    /// every reconnect for the rest of the run — a wasted `connect-required`
-    /// round trip each time, and an `active` target that is nothing of the kind.
-    pub fn record(&self, target: &str, result: &HooksResult) {
-        let mut held = self.inner.lock().expect("the roost lease table");
-        let entry = held.entry(target.to_string()).or_default();
-        if result.skipped_code.as_deref() == Some("taken-over") {
-            entry.lease = None;
-            entry.surrendered = true;
-            return;
-        }
-        // `clone`, not `take`-if-present: `None` IS the answer here.
-        //
-        // A surrendered entry keeps nothing either, whatever came back: the
-        // table would then be holding a token it has already promised not to
-        // present, which is the same stale-token shape one line further on.
-        // Only [`RoostLeases::forget`] ends a surrender, and it clears both.
-        entry.lease = (!entry.surrendered).then(|| result.lease.clone()).flatten();
-    }
-
-    /// Drop what is known about `target` — a host that was removed, or one
-    /// whose session shed has just replaced.
-    ///
-    /// **Including a surrender**, which is what distinguishes this from a
-    /// `record` that came back empty: surrendering is a decision about one
-    /// session's lease, and this says that session is gone. The caller in this
-    /// module is [`BootstrapRunner::install`], where the user has just
-    /// consented to shed starting another one.
-    ///
-    /// The target's [`gate`](RoostLeases::gate) survives: it is identity, not
-    /// state. Removing it would hand the next caller a *different* mutex from
-    /// the one a dialogue is holding right now, and the two would stop
-    /// excluding each other at exactly the moment it matters.
-    pub fn forget(&self, target: &str) {
-        let mut held = self.inner.lock().expect("the roost lease table");
-        if let Some(entry) = held.get_mut(target) {
-            entry.lease = None;
-            entry.surrendered = false;
-        }
-    }
-}
-
-/// The watcher's standing instruction to keep one host's agent hooks wired.
-///
-/// Cloneable and cheap: the table is shared, the two strings are the target's
-/// grammar token and shed's own client label.
+/// **The one thing that IS consulted is [`armed`](Self::armed), and it is read
+/// at send time.** Deciding at spawn time instead made arming a property of
+/// which watcher won a race to be installed, and forced a live watcher to be
+/// torn down and replaced whenever the answer changed — a replacement whose
+/// predecessor's queued `Down` could land after the replacement's snapshot and
+/// strand a live host on screen as unreachable. A flag read one cycle later
+/// needs none of that.
 #[derive(Clone)]
 pub struct HooksRefresh {
-    pub leases: Arc<RoostLeases>,
-    /// The target grammar token — the table's key, and what the copy says.
+    /// The target grammar token — what the copy and the log line say.
     pub target: String,
-    /// `shed-desktop` / `shed-mobile`. Becomes the lease's label, so a user who
-    /// finds their session driven can see who is driving it.
+    /// `shed-desktop` / `shed-mobile`. roost files it as the `by` of the state
+    /// entry, so a user can ask the host which of their clients wired these
+    /// hooks last, in `~/.config/roost/agent-hooks.json` on that host.
     pub client_label: String,
+    /// **May shed wire this host's hooks right now?** Shared with whoever
+    /// decides — one flag per host, however many watchers it outlives.
+    ///
+    /// Flipped true when the owner bootstraps the host and false when it forgets
+    /// it; every watcher for that host reads the same flag, so neither answer
+    /// depends on a watcher being spawned, replaced, or dropped at the right
+    /// moment.
+    pub armed: Arc<AtomicBool>,
 }
 
 impl HooksRefresh {
-    /// Re-present the held lease and re-send `session.set_agent_hooks`.
+    /// Re-send `session.set_agent_hooks` on the cycle's own connection, if shed
+    /// is entitled to this host at this moment.
     ///
-    /// A **no-op unless shed is still holding a lease for this target** — this
-    /// is a refresh, not a first wiring. The first one happens inside
-    /// [`BootstrapRunner::hooks`], after a Start that shed itself performed,
-    /// which is the only moment shed is entitled to connect at all: a session
-    /// that was already running belongs to whoever started it.
-    ///
-    /// **One transaction.** The turn is taken before the entitlement is read
-    /// and held until the result is folded back in, so a `taken-over` recorded
-    /// by another watcher on this target cannot land between this one's
-    /// decision and its send. Without it, surrender — which §3.4 makes
-    /// permanent — could be overtaken by a dialogue that had already read
-    /// `active` and was merely slow ([`RoostLeases`]).
+    /// [`armed`](Self::armed) is the entire gate: no token, no table, no lease,
+    /// and nothing to consult beyond one atomic load. Past it the call is
+    /// unconditional and no outcome turns it off — a refusal is logged and the
+    /// next cycle sends the identical request again, because the op is
+    /// declarative and the only thing a failure proves is that it did not
+    /// arrive.
     async fn refresh(&self, conn: &mut Conn) {
-        let gate = self.leases.gate(&self.target);
-        let _turn = gate.lock().await;
-        let Some(lease) = self.leases.armed(&self.target) else {
+        if !self.armed.load(Ordering::Acquire) {
             return;
-        };
-        let result = wire_agent_hooks(conn, &self.client_label, Some(&lease)).await;
-        if let Some(code) = &result.skipped_code {
-            tracing::debug!(target = %self.target, code = %code, "roost hooks refresh skipped");
-        } else if let Some(error) = &result.error {
+        }
+        let result = wire_agent_hooks(conn, &self.client_label).await;
+        if let Some(error) = &result.error {
             tracing::warn!(target = %self.target, error = %error, "roost hooks refresh failed");
         }
-        self.leases.record(&self.target, &result);
     }
 }
 
@@ -2611,8 +2485,8 @@ impl HooksRefresh {
 // driving the bootstrap machines
 // ---------------------------------------------------------------------------
 
-/// Everything a machine's steps need doing to them: the far side, the session,
-/// and the lease table.
+/// Everything a machine's steps need doing to them: the far side and the
+/// session.
 ///
 /// One struct rather than four arguments repeated twice, and borrowed rather
 /// than owned so a caller can drive a probe and then an install against the same
@@ -2623,9 +2497,7 @@ pub struct BootstrapRunner<'a> {
     /// Runs `Step::Call` and `Step::Hooks` — the client's own roost connection,
     /// which for a desktop is the bridge and for a phone is a loopback port.
     pub reach: &'a dyn RoostReach,
-    /// Where a `Step::Hooks` result is remembered.
-    pub leases: &'a RoostLeases,
-    /// The target grammar token, for the lease table's key and for copy.
+    /// The target grammar token, for the copy every failure carries.
     pub target: &'a str,
     /// roost's `BootstrapOptions::jail_fs_root`. **`false` in production**; the
     /// only thing that sets it is a hermetic lane, where it prefixes the
@@ -2681,17 +2553,6 @@ impl BootstrapRunner<'_> {
         request: InstallRequest,
         source: Option<SourceHandle>,
     ) -> Result<Installed, BootstrapFailure> {
-        // **Nothing this target's previous session decided survives into the
-        // one this is about to start.** An install is only ever planned for a
-        // host with no session shed can use (the plan matrix: a live protocol-4
-        // session is "nothing to do"), and the machine re-probes the consented
-        // fingerprint before it touches anything — so whatever token or
-        // surrender is in the table belongs to a session that is gone. Carried
-        // forward, a stale token would be presented to the new session's first
-        // hooks call, and a stale *surrender* would silently mute the hooks
-        // re-send for a session shed itself is about to start at the user's
-        // request. Neither is a decision about this session.
-        self.leases.forget(self.target);
         let mut machine = InstallMachine::new(request, source);
         let mut step = machine.begin();
         for _ in 0..MAX_STEPS {
@@ -2809,16 +2670,14 @@ impl BootstrapRunner<'_> {
         call_error(overlay_reach_reason(self.reach, seen, fallback).await)
     }
 
-    /// The lease dialogue, over the same connection kind — and the one place a
-    /// lease enters the table.
+    /// The hooks call, over the same connection kind the other steps use — the
+    /// **first** send for a session shed has just started, and the same request
+    /// the watcher then re-sends on every cycle ([`HooksRefresh`]).
     ///
-    /// Under the target's turn, for the reason [`RoostLeases`] gives: this is
-    /// the other read-decide-send about the same token, and a watcher's refresh
-    /// interleaving with it would be deciding on a fact this step is in the
-    /// middle of changing.
+    /// A connection of its own rather than one held across the install: the
+    /// steps before this one started a daemon, so the endpoint this dials is one
+    /// that did not exist when the machine began.
     async fn hooks(&self, client_label: &str) -> HooksResult {
-        let gate = self.leases.gate(self.target);
-        let _turn = gate.lock().await;
         let endpoint = match self.reach.ensure().await {
             Ok(endpoint) => endpoint,
             Err(error) => {
@@ -2836,12 +2695,7 @@ impl BootstrapRunner<'_> {
                 return hooks_error(client_label, e.to_string());
             }
         };
-        // A previous run's lease is presented rather than re-minted: see
-        // [`RoostLeases`].
-        let held = self.leases.lease(self.target);
-        let result = wire_agent_hooks(&mut conn, client_label, held.as_deref()).await;
-        self.leases.record(self.target, &result);
-        result
+        wire_agent_hooks(&mut conn, client_label).await
     }
 }
 
@@ -3039,11 +2893,15 @@ mod tests {
 
     /// The next snapshot carrying `session_id`.
     ///
-    /// A restart lands between the two requests one poll makes, so the first
-    /// snapshot after it can legitimately still carry the previous instance's id
-    /// alongside the new revision. Skipping to the id under test removes that
+    /// A restart lands wherever it lands in a cycle, so a snapshot the previous
+    /// instance's cycle had already published can still be in the channel when
+    /// the caller starts looking. Skipping to the id under test removes that
     /// race without weakening anything: under the bug these tests exist for, the
     /// id never arrives at all and [`next_update`]'s timeout fails the test.
+    ///
+    /// The one thing it no longer skips past is a snapshot built from a *dead*
+    /// incarnation — `observe_once` refuses a mismatched identify/subscribe pair
+    /// before it lists, so that inventory is never published in the first place.
     async fn snapshot_from_daemon(
         rx: &mut mpsc::UnboundedReceiver<RoostUpdate>,
         session_id: &str,
@@ -3167,18 +3025,26 @@ mod tests {
         );
     }
 
-    /// **shed watches; it never drives.** The subscribe carries an empty lease,
-    /// which is an observer stream by construction on roost's side — so a
-    /// watcher running against somebody's machine takes nothing away from the
-    /// roost UI they are looking at.
+    /// **shed watches, and takes nothing to do it.** At session protocol 5 there
+    /// is no stream classification left to ask about — every subscriber is a
+    /// peer — so what is worth pinning is the other half: a plain watcher opens
+    /// exactly ONE stream and issues nothing that changes the session it is
+    /// looking at, which is what makes it safe to point at somebody's machine.
     #[tokio::test]
-    async fn the_watcher_subscribes_as_an_observer() {
+    async fn the_watcher_subscribes_and_takes_nothing() {
         let fake = FakeRoost::start().await;
         let (watcher, mut rx) = watch(Arc::new(LocalSession::new("localhost", fake.socket_path())));
         next_snapshot(&mut rx).await;
 
-        assert_eq!(fake.observer_count(), 1);
-        assert_eq!(fake.driver_count(), 0, "shed holds no lease, ever");
+        assert_eq!(fake.stream_count(), 1, "one cycle, one stream");
+        assert!(
+            fake.written(TAB).is_empty(),
+            "a watcher wrote into somebody's tab"
+        );
+        assert!(
+            fake.agent_hooks_calls().is_empty(),
+            "a watcher wired somebody's hooks"
+        );
         watcher.stop();
     }
 
@@ -3389,49 +3255,6 @@ mod tests {
         watcher.stop();
     }
 
-    /// **`session.driver_changed` asks for nothing.** Somebody else took the
-    /// interactive lease; shed never held it, the stream survives (that is the
-    /// whole R1 re-cut), and the next commit still arrives on the same
-    /// subscription.
-    #[tokio::test]
-    async fn a_driver_change_is_informational_and_the_stream_keeps_delivering() {
-        let fake = FakeRoost::start().await;
-        fake.set_tab_axes(TAB, "working", Some(owned("session_status")), false);
-        // Somebody has to be holding the lease for a takeover to depose them —
-        // roost announces a *change* of driver, not a first claim.
-        let mut driver = Conn::endpoint(&RoostEndpoint::Unix(fake.socket_path().to_path_buf()))
-            .await
-            .expect("dial");
-        driver
-            .session_connect(false, Some("the-roost-ui"))
-            .await
-            .expect("mints");
-
-        let (watcher, mut rx) = watch(Arc::new(LocalSession::new("localhost", fake.socket_path())));
-        next_snapshot(&mut rx).await;
-
-        fake.take_over("workbox");
-        stays_silent(&mut rx).await;
-
-        fake.set_tab_axes(TAB, "waiting", Some(owned("permission_asked")), false);
-        let after = next_snapshot(&mut rx).await;
-        assert_eq!(
-            after
-                .sessions
-                .iter()
-                .find(|s| s.tab_id == TAB)
-                .expect("still a row")
-                .activity(),
-            Some(RcActivity::NeedsApproval)
-        );
-        assert_eq!(
-            fake.tab_list_calls(),
-            1,
-            "a takeover must not cost a resync — the subscription is still ours"
-        );
-        watcher.stop();
-    }
-
     /// **The subscribe/list race, which the prologue's ordering exists for.** A
     /// mutation commits between the ack and the `tab.list` reply: the batch it
     /// pushed is already in the snapshot, so it is discarded by the fence rather
@@ -3457,7 +3280,7 @@ mod tests {
         // Runs under the fake's state lock, once, just before the reply — the
         // exact interleaving a busy daemon produces.
         fake.before_tab_list(move |hook| {
-            recorder.store(hook.observer_count(), Ordering::SeqCst);
+            recorder.store(hook.stream_count(), Ordering::SeqCst);
             hook.bump_revision();
         });
 
@@ -3576,6 +3399,121 @@ mod tests {
             reach.invalidations.load(Ordering::SeqCst),
             0,
             "the transport was never the problem"
+        );
+        watcher.stop();
+    }
+
+    /// **A restart landing BETWEEN the two dials is caught by the pair, not by
+    /// the stream.** Conn A identifies against one incarnation, conn B's
+    /// subscribe is answered by another, and the `tab.list` conn A is about to
+    /// take would describe a process that is gone. The cycle ends there.
+    ///
+    /// The two assertions that make this mean something are the request log and
+    /// the id on the published inventory: an implementation that compared the
+    /// pair *after* listing, or after emitting, would satisfy "it resynced" and
+    /// still have done the one thing this exists to stop.
+    #[tokio::test]
+    async fn a_restart_between_the_dials_resyncs_before_it_ever_lists() {
+        let fake = FakeRoost::start().await;
+        let dead = fake.session_id();
+        let reach = FlakyReach::new(RoostEndpoint::Unix(fake.socket_path().to_path_buf()), 0);
+        // Armed before the watcher starts, so the very first cycle is the
+        // mismatched one and every number below is unambiguous.
+        fake.restart_between_dials(1);
+
+        let (watcher, mut rx) = watch(reach.clone());
+
+        // `next_snapshot` panics on a `Down`, so arriving here is already half
+        // the claim: the disagreement cost a cycle, not the row.
+        let after = next_snapshot(&mut rx).await;
+        assert_eq!(
+            fake.tab_list_calls(),
+            1,
+            "one list, from the good cycle — the mismatched one must end before \
+             it asks, because a snapshot built from the dead incarnation's tabs \
+             is the whole thing this prevents"
+        );
+        assert_ne!(
+            after.daemon_session_id, dead,
+            "the first inventory published is the second cycle's; nothing from \
+             the incarnation that went away ever reached the consumer"
+        );
+        assert_eq!(after.daemon_session_id, fake.session_id());
+        assert_eq!(
+            reach.invalidations.load(Ordering::SeqCst),
+            0,
+            "a resync tears down no transport: the daemon is fine, we are one \
+             dial behind it"
+        );
+        watcher.stop();
+    }
+
+    /// **The resync bound, on mismatched pairs.** An immediate resync is exactly
+    /// the shape that becomes a hot loop, and a daemon restarting on every
+    /// subscribe would otherwise be re-dialled as fast as the loop can run. That
+    /// the bound works for EOFs is no evidence that a *newly added* branch
+    /// increments and exits it: four in a row, and the fourth is the `Down`.
+    #[tokio::test]
+    async fn a_run_of_mismatched_pairs_is_bounded_and_the_fourth_is_a_down() {
+        let fake = FakeRoost::start().await;
+        // One more than the bound: three silent resyncs and the one that trips
+        // it. `next_down` panics on a snapshot, so the silence is asserted too.
+        fake.restart_between_dials(MAX_CONSECUTIVE_RESYNCS + 1);
+        let (watcher, mut rx) = watch(Arc::new(LocalSession::new("localhost", fake.socket_path())));
+
+        let reason = next_down(&mut rx).await;
+        assert!(
+            reason.contains("resyncing too often"),
+            "the reason has to name the bound, not the last mismatch: {reason}"
+        );
+        assert_eq!(
+            fake.tab_list_calls(),
+            0,
+            "not one of the four cycles got as far as its list"
+        );
+        watcher.stop();
+    }
+
+    /// **The check refuses a mismatch and nothing else.** A comparison that
+    /// refused every pair would pass both cells above and leave the watcher
+    /// permanently down, so the agreeing case is asserted in its own right: the
+    /// cycle lists, publishes, and then goes on folding on the *same* pair —
+    /// the gate runs once per cycle, not once per event.
+    #[tokio::test]
+    async fn an_agreeing_pair_lists_publishes_and_keeps_folding() {
+        let fake = FakeRoost::start().await;
+        fake.set_tab_axes(TAB, "working", Some(owned("session_status")), false);
+        let (watcher, mut rx) = watch(Arc::new(LocalSession::new("localhost", fake.socket_path())));
+
+        let inventory = next_snapshot(&mut rx).await;
+        assert_eq!(inventory.daemon_session_id, fake.session_id());
+        assert_eq!(
+            inventory
+                .sessions
+                .iter()
+                .find(|s| s.tab_id == TAB)
+                .expect("the list was read and folded")
+                .activity(),
+            Some(RcActivity::Working),
+        );
+        assert_eq!(fake.tab_list_calls(), 1, "the check let the cycle through");
+
+        fake.set_tab_axes(TAB, "waiting", Some(owned("permission_asked")), false);
+        let after = next_snapshot(&mut rx).await;
+        assert_eq!(
+            after
+                .sessions
+                .iter()
+                .find(|s| s.tab_id == TAB)
+                .expect("still a row")
+                .activity(),
+            Some(RcActivity::NeedsApproval),
+            "the batch was folded on the pair the cycle started with"
+        );
+        assert_eq!(
+            fake.tab_list_calls(),
+            1,
+            "still one list: a per-event comparison would have resynced here"
         );
         watcher.stop();
     }
@@ -3845,9 +3783,9 @@ mod tests {
         .expect("tab.open");
         assert_eq!(tab.cwd, "/home/shed/app");
 
-        // No write here: a `tab.write` is lease-gated at session protocol 4 and
-        // therefore not a one-shot at all — it lives on `Conn`, beside the
-        // `session.connect` that authorizes it, and is tested there.
+        // No write here: a `tab.write` is not a one-shot, because a dial per
+        // keystroke is an `ssh` exec per keystroke. It lives on `Conn`, which
+        // keeps the connection it writes on, and is tested there.
         let dump = tab_dump(reach.as_ref(), tab.id).await.expect("dump");
         assert!(dump.rows_text.iter().any(|line| line.contains("opencode")));
 
@@ -5426,7 +5364,6 @@ esac
         fake: FakeRoost,
         exec: SshExec,
         reach: Arc<MarkerReach>,
-        leases: Arc<RoostLeases>,
     }
 
     const BOOT_TARGET: &str = "roost:popos/p019-a";
@@ -5501,7 +5438,6 @@ esac
                 fake,
                 exec,
                 reach,
-                leases: Arc::new(RoostLeases::new()),
             }
         }
 
@@ -5509,7 +5445,6 @@ esac
             BootstrapRunner {
                 exec: &self.exec,
                 reach: self.reach.as_ref(),
-                leases: &self.leases,
                 target: BOOT_TARGET,
                 // The jail. Without it the ladder walks into the developer's own
                 // `/usr/bin/roost-session`, which on this host exists.
@@ -5559,7 +5494,7 @@ esac
     #[tokio::test]
     async fn the_runner_probes_an_installed_but_stopped_session_as_a_start() {
         let rig = BootRig::new().await;
-        rig.seed_session(4);
+        rig.seed_session(5);
         let probe = rig.runner().probe().await.expect("the probe");
         assert!(
             matches!(
@@ -5585,16 +5520,17 @@ esac
         );
     }
 
-    /// **The start, the hooks and the lease, through the real runner.**
+    /// **The start and the hooks, through the real runner.**
     ///
     /// The payoff path in miniature: a shed with a compatible `roost-session`
-    /// that is not running gets one started over the exec runner, the hooks
-    /// dialogue runs over the client's own connection, and the lease it minted
-    /// is kept in the table for the app run.
+    /// that is not running gets one started over the exec runner, and the hooks
+    /// call goes out over the client's own connection with the arguments plan
+    /// 019 pins. One op and nothing kept — the watcher's re-send needs no state
+    /// from this step, only the fact that shed is the one that started it.
     #[tokio::test]
-    async fn the_runner_starts_a_session_wires_hooks_and_keeps_the_lease() {
+    async fn the_runner_starts_a_session_and_wires_hooks() {
         let rig = BootRig::new().await;
-        rig.seed_session(4);
+        rig.seed_session(5);
         let probe = rig.runner().probe().await.expect("the probe");
 
         let installed = rig
@@ -5635,96 +5571,7 @@ esac
         assert_eq!(calls.len(), 1, "{calls:?}");
         assert_eq!(calls[0]["mode"], "auto");
         assert_eq!(calls[0]["client"], "shed-desktop");
-
-        // The lease outlives the dialogue and is held per target, which is what
-        // makes a re-send on the next reconnect possible at all.
-        assert!(rig.leases.active(BOOT_TARGET));
-        assert_eq!(rig.leases.lease(BOOT_TARGET), rig.fake.lease());
-        assert_eq!(rig.fake.lease_label().as_deref(), Some("shed-desktop"));
-    }
-
-    /// **shed never takes over.** A session somebody else is driving answers
-    /// `already-connected` at the connect, and the dialogue stops there: no
-    /// second connect, no `takeover: true`, no hooks op.
-    #[tokio::test]
-    async fn a_driven_session_is_left_alone() {
-        let rig = BootRig::new().await;
-        rig.seed_session(4);
-        let probe = rig.runner().probe().await.expect("the probe");
-        // Somebody else is holding the interactive lease before shed's start.
-        rig.fake.take_over("roost-ui");
-
-        let installed = rig
-            .runner()
-            .install(
-                InstallRequest {
-                    target: BOOT_TARGET.to_string(),
-                    jail_fs_root: true,
-                    fingerprint: probe.fingerprint.clone(),
-                    client_label: "shed-desktop".to_string(),
-                },
-                None,
-            )
-            .await
-            .expect("the install still succeeds");
-
-        let hooks = installed.hooks.expect("the dialogue ran");
-        assert_eq!(hooks.skipped_code.as_deref(), Some("already-connected"));
-        assert!(
-            rig.fake.agent_hooks_calls().is_empty(),
-            "shed wired hooks against somebody else's session"
-        );
-        assert_eq!(
-            rig.fake.lease_label().as_deref(),
-            Some("roost-ui"),
-            "shed took the lease from the driver"
-        );
-        // No lease, so nothing to re-send on the next reconnect.
-        assert!(!rig.leases.active(BOOT_TARGET));
-    }
-
-    /// **A decision about a session shed has just replaced does not carry into
-    /// the new one.** The install's call to
-    /// [`RoostLeases::forget`](RoostLeases::forget), from the far end.
-    ///
-    /// An earlier session on this target was taken over, so shed stepped back
-    /// for the run — correctly, while that session was the one being driven.
-    /// Then the session goes, and the user consents to shed starting another.
-    /// If the surrender rode through, shed would start a session, mint a lease
-    /// for it, wire its hooks once and then never re-send them: `mode: auto`
-    /// wires only the agents configured at that moment, so every agent set up
-    /// afterwards would stay unwired for the rest of the run, silently.
-    #[tokio::test]
-    async fn a_bootstrap_re_arms_a_target_that_surrendered_an_earlier_session() {
-        let rig = BootRig::new().await;
-        rig.seed_session(4);
-        // The earlier session's dialogue: somebody took the lease.
-        rig.leases
-            .record(BOOT_TARGET, &hooks_result(None, Some("taken-over")));
-        assert!(!rig.leases.active(BOOT_TARGET));
-
-        let probe = rig.runner().probe().await.expect("the probe");
-        let installed = rig
-            .runner()
-            .install(
-                InstallRequest {
-                    target: BOOT_TARGET.to_string(),
-                    jail_fs_root: true,
-                    fingerprint: probe.fingerprint.clone(),
-                    client_label: "shed-desktop".to_string(),
-                },
-                None,
-            )
-            .await
-            .expect("the install");
-
-        let hooks = installed.hooks.expect("a start shed performed wires hooks");
-        assert!(hooks.applied(), "{hooks:?}");
-        assert!(
-            rig.leases.active(BOOT_TARGET),
-            "the new session's lease was filed under the old session's surrender, so the \
-             watcher will never re-send its hooks"
-        );
+        assert_eq!(calls[0]["skip"], serde_json::json!([]));
     }
 
     /// A reach whose `ensure` always hands back an endpoint nothing is
@@ -5804,11 +5651,9 @@ esac
         );
         let exec =
             SshExec::new(&entry("mini-x"), &exec_options(dir.path().join("ssh"))).expect("exec");
-        let leases = RoostLeases::new();
         let runner = BootstrapRunner {
             exec: &exec,
             reach: reach.as_ref(),
-            leases: &leases,
             target: "roost:mini-x/user",
             jail_fs_root: true,
         };
@@ -5843,249 +5688,48 @@ esac
         );
     }
 
-    // ---- the lease table ----
+    // ---- keeping a bootstrapped host's hooks wired ----
+    //
+    // Three cells, and between them they are the whole of plan 020 §3.3's
+    // safety argument (§7 AC 8). roost deleted the single-writer token that
+    // used to gate `session.set_agent_hooks` and shed put nothing in its place,
+    // so two things a token used to enforce are now behaviour: *whether* shed
+    // sends at all is one atomic load on [`HooksRefresh::armed`] and nothing
+    // else, and *recovering* from a call that did not land is the next cycle
+    // sending the identical request. Both are asserted here rather than argued.
 
-    fn hooks_result(lease: Option<&str>, skipped: Option<&str>) -> HooksResult {
-        HooksResult {
-            client_label: "shed-desktop".to_string(),
-            lease: lease.map(str::to_string),
-            skipped_code: skipped.map(str::to_string),
-            ..HooksResult::default()
-        }
-    }
-
-    /// `taken-over` is terminal; `already-connected` is not.
-    ///
-    /// The difference is the whole of plan 019 §3.4's lease rule: somebody who
-    /// TOOK the lease wires the hooks themselves and shed stops for the run,
-    /// while somebody who merely happened to be holding it at this moment may
-    /// well be gone by the next reconnect.
-    #[test]
-    fn the_lease_table_surrenders_on_taken_over_and_not_on_already_connected() {
-        let leases = RoostLeases::new();
-        leases.record("roost:popos/a", &hooks_result(Some("L1"), None));
-        assert!(leases.active("roost:popos/a"));
-        assert_eq!(leases.lease("roost:popos/a").as_deref(), Some("L1"));
-
-        leases.record("roost:popos/a", &hooks_result(None, Some("taken-over")));
-        assert!(!leases.active("roost:popos/a"));
-        assert_eq!(leases.lease("roost:popos/a"), None);
-        // And it stays surrendered: a later success cannot re-arm a run shed has
-        // stepped back from.
-        leases.record("roost:popos/a", &hooks_result(Some("L2"), None));
-        assert!(
-            !leases.active("roost:popos/a"),
-            "a surrendered target re-armed itself"
-        );
-        assert_eq!(
-            leases.lease("roost:popos/a"),
-            None,
-            "a surrendered target kept a token it has promised not to present"
-        );
-
-        let other = RoostLeases::new();
-        other.record(
-            "roost:popos/b",
-            &hooks_result(None, Some("already-connected")),
-        );
-        assert!(!other.active("roost:popos/b"), "there is no lease to hold");
-        other.record("roost:popos/b", &hooks_result(Some("L3"), None));
-        assert!(
-            other.active("roost:popos/b"),
-            "already-connected must not be terminal"
-        );
-    }
-
-    /// **A result with no lease in it CLEARS the token**, which is the contract
-    /// the method's own doc states and the only reading under which a token
-    /// cannot outlive its session.
-    ///
-    /// A lease is good for exactly the session that minted it. Every result
-    /// that comes back carrying none is evidence that the session shed's token
-    /// belongs to did not accept it, or is not there to — and keeping it makes
-    /// the table say `active` about a session that no longer exists.
-    #[test]
-    fn the_lease_table_forgets_a_token_no_result_confirmed() {
-        let leases = RoostLeases::new();
-        leases.record("roost:popos/a", &hooks_result(Some("L1"), None));
-
-        // Somebody else is driving right now: no lease came back.
-        leases.record(
-            "roost:popos/a",
-            &hooks_result(None, Some("already-connected")),
-        );
-        assert_eq!(
-            leases.lease("roost:popos/a"),
-            None,
-            "a token no result confirmed stayed in the table"
-        );
-        assert!(!leases.active("roost:popos/a"));
-
-        // Same for a dialogue that simply failed — a transport error says
-        // nothing about entitlement, but it does not confirm a token either.
-        let leases = RoostLeases::new();
-        leases.record("roost:popos/b", &hooks_result(Some("L2"), None));
-        leases.record(
-            "roost:popos/b",
-            &HooksResult {
-                client_label: "shed-desktop".to_string(),
-                error: Some("the connection closed".to_string()),
-                ..HooksResult::default()
-            },
-        );
-        assert_eq!(leases.lease("roost:popos/b"), None);
-    }
-
-    /// **A stale token does not outlive the session that minted it**, through
-    /// the real dialogue.
-    ///
-    /// S1 mints shed's lease; S1 exits; S2 comes up on the same target with
-    /// somebody else driving it. The watcher reconnects and presents the dead
-    /// token — S2 has never heard of it — and what must not happen is the table
-    /// keeping it: every later reconnect would present it again, for the rest
-    /// of the run, against a session it was never valid for.
-    #[tokio::test]
-    async fn a_lease_whose_session_was_replaced_is_not_presented_again() {
-        let fake = FakeRoost::start().await;
-        let leases = Arc::new(RoostLeases::new());
-        let target = "roost:popos/a";
-
-        // S1 mints, the way a bootstrap's Start would have.
-        let mut conn = Conn::unix(fake.socket_path()).await.expect("dial");
-        let minted = conn
-            .session_connect(false, Some("shed-desktop"))
-            .await
-            .expect("a fresh session has no lease");
-        drop(conn);
-        leases.record(target, &hooks_result(Some(&minted.lease), None));
-        assert!(leases.active(target));
-
-        // S1 is gone and S2 is up on the same target — a new session id, no
-        // lease, no tombstone — and a roost UI is driving it by the time shed
-        // reconnects.
-        fake.restart();
-        fake.take_over("roost-ui");
-
+    /// A [`HooksRefresh`] and the flag it reads, kept apart so a cell can flip
+    /// the entitlement **under a live watcher** — which is the shape plan 020
+    /// §3.3 moved to, and the reason no watcher ever has to be replaced.
+    fn hooks_entry(armed: bool) -> (HooksRefresh, Arc<AtomicBool>) {
+        let flag = Arc::new(AtomicBool::new(armed));
         let refresh = HooksRefresh {
-            leases: leases.clone(),
-            target: target.to_string(),
+            target: "roost:popos/a".to_string(),
             client_label: "shed-desktop".to_string(),
+            armed: Arc::clone(&flag),
         };
-        let mut conn = Conn::unix(fake.socket_path()).await.expect("dial");
-        refresh.refresh(&mut conn).await;
-        drop(conn);
-
-        assert!(
-            fake.agent_hooks_calls().is_empty(),
-            "shed wired hooks against somebody else's session"
-        );
-        assert_eq!(
-            leases.lease(target),
-            None,
-            "the dead session's token survived the session"
-        );
-        assert!(
-            !leases.active(target),
-            "the table still calls a dead lease active"
-        );
-
-        // And the next reconnect presents nothing at all — no round trip, no
-        // `connect-required`, and the driver keeps their session.
-        let mut conn = Conn::unix(fake.socket_path()).await.expect("dial");
-        refresh.refresh(&mut conn).await;
-        assert!(fake.agent_hooks_calls().is_empty());
-        assert_eq!(
-            fake.lease_label().as_deref(),
-            Some("roost-ui"),
-            "shed took the lease from the driver"
-        );
+        (refresh, flag)
     }
 
-    /// **A surrender cannot be overtaken.** §3.4 makes `taken-over` permanent
-    /// for the run, and "permanent" has to survive a second watcher on the same
-    /// target that was already part-way through its own decision.
+    /// (a) **The re-send happens on every successful cycle** for a host shed
+    /// bootstrapped, which is what keeps `mode: auto` honest: it wires only the
+    /// agents whose config directory exists at that moment, so an agent
+    /// configured later is wired by a LATER call and by nothing else.
     ///
-    /// The interleaving, which the map's mutex does not prevent because it
-    /// guards three separate steps and not the decision: A reads `active` and
-    /// the token, B's dialogue comes back `taken-over` and records the
-    /// surrender, A sends the token anyway. Here B's turn is held while A
-    /// starts, and A must send nothing — not while B holds it, and not after B
-    /// has stepped shed back.
+    /// Three cycles rather than two, deliberately. "Every" is the claim, and the
+    /// failure this replaces — a table whose token went stale after the first
+    /// reconnect, so the re-send died silently for the rest of the run — passes
+    /// at n = 2.
     #[tokio::test]
-    async fn a_surrender_cannot_be_overtaken_by_a_refresh_that_is_mid_decision() {
+    async fn a_watcher_re_sends_agent_hooks_on_every_connect() {
         let fake = FakeRoost::start().await;
-        let leases = Arc::new(RoostLeases::new());
-        let target = "roost:popos/a";
-
-        let mut conn = Conn::unix(fake.socket_path()).await.expect("dial");
-        let minted = conn
-            .session_connect(false, Some("shed-desktop"))
-            .await
-            .expect("a fresh session has no lease");
-        drop(conn);
-        leases.record(target, &hooks_result(Some(&minted.lease), None));
-
-        // Watcher B: mid-dialogue, holding this target's turn.
-        let gate = leases.gate(target);
-        let turn = gate.lock().await;
-
-        // Watcher A: starts now, with an entitlement that is about to stop
-        // being true.
-        let refresh = HooksRefresh {
-            leases: leases.clone(),
-            target: target.to_string(),
-            client_label: "shed-desktop".to_string(),
-        };
-        let mut conn = Conn::unix(fake.socket_path()).await.expect("dial");
-        let a = tokio::spawn(async move { refresh.refresh(&mut conn).await });
-        // Long enough for a dialogue against a local socket several times over.
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        assert!(
-            fake.agent_hooks_calls().is_empty(),
-            "a refresh sent while another dialogue on the same target was mid-decision"
-        );
-
-        // B's dialogue came back `taken-over`.
-        leases.record(target, &hooks_result(None, Some("taken-over")));
-        drop(turn);
-
-        a.await.expect("the refresh task");
-        assert!(
-            fake.agent_hooks_calls().is_empty(),
-            "a surrendered lease was presented anyway"
-        );
-        assert!(!leases.active(target), "the surrender did not stick");
-    }
-
-    /// **The re-send on every (re)connect**, which is what keeps `mode: auto`
-    /// honest: it wires only the agents whose config directory exists at that
-    /// moment, so an agent configured later is wired by a LATER call and by
-    /// nothing else.
-    #[tokio::test]
-    async fn a_watcher_re_sends_agent_hooks_on_every_connect_while_the_lease_holds() {
-        let fake = FakeRoost::start().await;
-        let leases = Arc::new(RoostLeases::new());
-
-        // Mint a lease the way a bootstrap would have, and record it.
-        let mut conn = Conn::unix(fake.socket_path()).await.expect("dial");
-        let minted = conn
-            .session_connect(false, Some("shed-desktop"))
-            .await
-            .expect("a fresh session has no lease");
-        drop(conn);
-        leases.record("roost:popos/a", &hooks_result(Some(&minted.lease), None));
-
         let reach: Arc<dyn RoostReach> = Arc::new(LocalSession::new("popos", fake.socket_path()));
         let (watcher, mut rx) = RoostWatcher::spawn_inner(
             &tokio::runtime::Handle::current(),
             reach,
             "roost:popos/a".to_string(),
             RoostWatcherOptions {
-                hooks: Some(HooksRefresh {
-                    leases: leases.clone(),
-                    target: "roost:popos/a".to_string(),
-                    client_label: "shed-desktop".to_string(),
-                }),
+                hooks: Some(hooks_entry(true).0),
             },
             BackoffSleeper::default(),
         );
@@ -6093,67 +5737,135 @@ esac
         next_snapshot(&mut rx).await;
         assert_eq!(fake.agent_hooks_calls().len(), 1, "the first connect");
 
-        // A reconnect: the stream ends, the loop resyncs, and the hooks go again
-        // with the SAME lease — never a second `session.connect`, which would
-        // answer `already-connected` against shed's own lease.
-        fake.close_all();
-        next_snapshot(&mut rx).await;
+        // Each reconnect: the stream ends, the loop resyncs, and the hooks go
+        // again — the same request every time, with nothing carried across.
+        for expected in [2, 3] {
+            fake.close_all();
+            next_snapshot(&mut rx).await;
+            let calls = fake.agent_hooks_calls();
+            assert_eq!(
+                calls.len(),
+                expected,
+                "cycle {expected} did not re-send: {calls:?}"
+            );
+        }
+
         let calls = fake.agent_hooks_calls();
-        assert_eq!(calls.len(), 2, "the reconnect did not re-send: {calls:?}");
         assert!(calls.iter().all(|call| call["mode"] == "auto"));
+        assert!(calls.iter().all(|call| call["client"] == "shed-desktop"));
         watcher.stop();
     }
 
-    /// A watcher with no hooks entry is a **pure observer**, which is what every
-    /// watcher over somebody else's machine must stay.
+    /// (b) **And on NO cycle for a host shed merely watches — until the moment
+    /// it stops merely watching.** The entitlement came through generation 5
+    /// unchanged, and it is now the only thing there is: a disarmed watcher must
+    /// never wire a session shed did not start, even though at protocol 5 the
+    /// far side would happily let it.
+    ///
+    /// Both directions in one cell, because the flag is read at SEND time and
+    /// that is exactly what that buys: the SAME watcher that wired nothing over
+    /// two cycles wires on its next one once the flag flips. Nothing is dropped,
+    /// respawned or reconnected to make that happen — which is why a bootstrap
+    /// of a host that already has a watcher needs to replace nothing, and so
+    /// cannot strand a row behind a dropped watcher's still-queued `Down`.
     #[tokio::test]
-    async fn a_watcher_without_a_hooks_entry_wires_nothing() {
+    async fn a_disarmed_watcher_wires_nothing_until_the_flag_flips() {
         let fake = FakeRoost::start().await;
         let reach: Arc<dyn RoostReach> = Arc::new(LocalSession::new("popos", fake.socket_path()));
-        let (watcher, mut rx) = watch(reach);
+        let (hooks, armed) = hooks_entry(false);
+        let (watcher, mut rx) = RoostWatcher::spawn_inner(
+            &tokio::runtime::Handle::current(),
+            reach,
+            "roost:popos/a".to_string(),
+            RoostWatcherOptions { hooks: Some(hooks) },
+            BackoffSleeper::default(),
+        );
+        next_snapshot(&mut rx).await;
+        // A second cycle too: "never" is the claim, and a first cycle alone
+        // cannot tell it apart from "not yet".
+        fake.close_all();
         next_snapshot(&mut rx).await;
         stays_silent(&mut rx).await;
         assert!(
             fake.agent_hooks_calls().is_empty(),
             "an observer wired somebody's hooks"
         );
-        assert_eq!(fake.lease(), None, "an observer took a lease");
+
+        // …and now shed bootstraps this host. The live watcher picks the answer
+        // up at the head of its very next cycle.
+        armed.store(true, Ordering::Release);
+        fake.close_all();
+        next_snapshot(&mut rx).await;
+        let calls = fake.agent_hooks_calls();
+        assert_eq!(
+            calls.len(),
+            1,
+            "the flag flipped and the watcher still wired nothing: {calls:?}"
+        );
+        assert_eq!(calls[0]["mode"], "auto");
+        assert_eq!(calls[0]["client"], "shed-desktop");
         watcher.stop();
     }
 
-    /// **A hooks entry with no lease behind it still wires nothing**, which is a
-    /// different claim and the one that actually needs a guard.
+    /// (c) **A cycle whose hooks call failed does not stop the next one
+    /// re-sending**, which is the load-bearing half of §3.3: with no token and
+    /// no retry loop, "a connection that died mid-call is a call that did not
+    /// land, and the next reconnect re-sends it" is the entire recovery story.
     ///
-    /// The refresh is a RE-send: it presents a lease shed already holds. A
-    /// watcher that minted one instead would be connecting to a session shed did
-    /// not start — somebody else's terminal multiplexer — on the strength of
-    /// having been asked to watch it. That is the difference between keeping a
-    /// host's hooks current and taking a host over.
+    /// The injected failure is a reply shed cannot decode — the same shape on
+    /// this side as a truncated one — and it is proven to BE a failure on a
+    /// plain connection first, because a seed that quietly succeeded would make
+    /// the rest of this cell assert nothing at all.
     #[tokio::test]
-    async fn a_hooks_entry_with_no_lease_mints_nothing() {
+    async fn a_failed_hooks_cycle_does_not_stop_the_next_one_re_sending() {
         let fake = FakeRoost::start().await;
+        // `wired` is a required `Vec<String>` on roost's result type.
+        let undecodable = serde_json::json!({"wired": "not a list"});
+
+        fake.set_agent_hooks_result(undecodable.clone());
+        let mut conn = Conn::unix(fake.socket_path()).await.expect("dial");
+        let failed = wire_agent_hooks(&mut conn, "shed-desktop").await;
+        drop(conn);
+        assert!(
+            !failed.applied() && failed.error.is_some(),
+            "the injected reply is supposed to be a failure: {failed:?}"
+        );
+        // The seed is a one-shot, so it is consumed by the call above; the
+        // watcher below gets its own. That one call is this cell's baseline.
+        let baseline = fake.agent_hooks_calls().len();
+        assert_eq!(baseline, 1, "the failed call still reached the session");
+
+        fake.set_agent_hooks_result(undecodable);
         let reach: Arc<dyn RoostReach> = Arc::new(LocalSession::new("popos", fake.socket_path()));
         let (watcher, mut rx) = RoostWatcher::spawn_inner(
             &tokio::runtime::Handle::current(),
             reach,
             "roost:popos/a".to_string(),
             RoostWatcherOptions {
-                hooks: Some(HooksRefresh {
-                    // Empty: nothing has bootstrapped this host.
-                    leases: Arc::new(RoostLeases::new()),
-                    target: "roost:popos/a".to_string(),
-                    client_label: "shed-desktop".to_string(),
-                }),
+                hooks: Some(hooks_entry(true).0),
             },
             BackoffSleeper::default(),
         );
+
+        // The failing cycle still produces a snapshot: a refused hooks call is a
+        // missing enrichment, never an unreadable host.
         next_snapshot(&mut rx).await;
-        stays_silent(&mut rx).await;
-        assert!(
-            fake.agent_hooks_calls().is_empty(),
-            "a watcher with no lease wired hooks anyway"
+        assert_eq!(
+            fake.agent_hooks_calls().len(),
+            baseline + 1,
+            "the failing cycle did not send"
         );
-        assert_eq!(fake.lease(), None, "a watcher minted a lease of its own");
+
+        fake.close_all();
+        next_snapshot(&mut rx).await;
+        let calls = fake.agent_hooks_calls();
+        assert_eq!(
+            calls.len(),
+            baseline + 2,
+            "a failed cycle stopped the next one re-sending: {calls:?}"
+        );
+        assert_eq!(calls[baseline + 1]["mode"], "auto");
+        assert_eq!(calls[baseline + 1]["client"], "shed-desktop");
         watcher.stop();
     }
 }

@@ -81,7 +81,7 @@ pub use rc_events_watcher::{RcEventsWatcher, RcWatcherUpdate};
 pub use roost::{
     launch_argv, roost_capabilities, shed_reach_entry, tab_close, tab_dump, tab_open,
     BootstrapRunner, HooksRefresh, LabelledPort, LocalSession, ReachError, ReachKind,
-    RecordedReach, RoostEndpoint, RoostLeases, RoostPeek, RoostReach, RoostUpdate, RoostWatcher,
+    RecordedReach, RoostEndpoint, RoostPeek, RoostReach, RoostUpdate, RoostWatcher,
     RoostWatcherOptions, SshBridge, SshBridgeOptions, SshExec, SystemSshTunnels, Tunnel,
     TunnelOpener, UnreachableReach,
 };

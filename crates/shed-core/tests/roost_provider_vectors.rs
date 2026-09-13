@@ -244,8 +244,8 @@ fn the_stderr_classes_golden_is_roosts_own_classifier() {
     );
 }
 
-/// The vendored protocol-4 identify vector really carries this build's protocol
-/// number.
+/// The vendored current-generation identify vector really carries this build's
+/// protocol number.
 ///
 /// This is the middle link of a three-link chain: Go's `SpokenProtocol` constant
 /// is asserted against this vector's `session_protocol` on its own side, and this
@@ -254,7 +254,7 @@ fn the_stderr_classes_golden_is_roosts_own_classifier() {
 /// Rust.
 #[test]
 fn the_identify_vector_carries_this_builds_protocol() {
-    let vector = read_json("session.identify.response.v4.json");
+    let vector = read_json("session.identify.response.v5.json");
     assert_eq!(
         vector["result"]["session_protocol"].as_u64(),
         Some(u64::from(SESSION_PROTOCOL_VERSION)),

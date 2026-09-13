@@ -63,6 +63,7 @@
 //! instead.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
@@ -72,7 +73,8 @@ use roost_ipc::agent::Ownership;
 use roost_ipc::messages::{Tab, TabOpenParams};
 use shed_app::roost::{
     launch_argv, roost_capabilities, shed_reach_entry, tab_close, tab_open, BootstrapRunner,
-    ReachKind as ReachFamily, RoostLeases, RoostReach, RoostUpdate, RoostWatcher, SshExec,
+    HooksRefresh, ReachKind as ReachFamily, RoostReach, RoostUpdate, RoostWatcher,
+    RoostWatcherOptions, SshExec,
 };
 use shed_core::config::{MachineEntry, ShedConfig};
 use shed_core::rc::RcKind;
@@ -93,9 +95,9 @@ use crate::machines::{
 /// drift and only one of them would be under the harness's eye.
 pub const NO_TERMINAL: &str = "terminal unavailable: attach is native-remote";
 
-/// Who shed says it is on roost's wire — the lease label and
-/// `session.set_agent_hooks`'s `client` (plan 019 §3.4). The phone's twin is
-/// `shed-mobile`.
+/// Who shed says it is on roost's wire — `session.set_agent_hooks`'s `client`,
+/// which roost files as the `by` of the host's state entry (plan 019 §3.4). The
+/// phone's twin is `shed-mobile`.
 pub const CLIENT_LABEL: &str = "shed-desktop";
 
 /// How long one shed's "is anything serving over there?" probe may take.
@@ -420,8 +422,6 @@ pub struct RoostHosts {
     /// [`RoostHosts::shutdown`] is the same teardown for app quit, which is the
     /// one path where `Drop` alone would be too late (plan 019 §3.6).
     execs: Mutex<BTreeMap<HostId, Arc<SshExec>>>,
-    /// The interactive leases shed holds, one per target, for the app run.
-    leases: Arc<RoostLeases>,
     /// Sheds a probe is in flight for, so a second refresh landing while the
     /// first is still dialling does not fork a second `ssh` for the same host.
     probing: Arc<Mutex<BTreeSet<HostId>>>,
@@ -440,6 +440,35 @@ pub struct RoostHosts {
     /// Targets with a bootstrap in flight, for [`Self::bootstrap`]'s per-target
     /// gate. See [`BootstrapGate`].
     bootstrapping: Arc<Mutex<BTreeSet<HostId>>>,
+    /// **Did THIS APP RUN bootstrap this target?** — one flag per host, and the
+    /// whole of shed's answer to "should this watcher wire agent hooks?" (plan
+    /// 020 §3.3).
+    ///
+    /// [`Self::bootstrap`] sets a target's flag on success and [`Self::remove`]
+    /// clears it. EVERY watcher shed spawns carries a [`HooksRefresh`] holding
+    /// its host's flag, and `refresh` loads it at the head of every successful
+    /// cycle — so a watcher re-sends `session.set_agent_hooks {mode: "auto"}`
+    /// exactly while the flag is set, and is silent the rest of the time. That is
+    /// the entitlement rule — shed wires hooks into a session it started and into
+    /// nothing else — and at protocol 5 it is the only thing enforcing it,
+    /// because roost's own gate on the op is gone and any same-UID client may now
+    /// wire any session.
+    ///
+    /// **A flag rather than a spawn-time decision**, which is what makes the rule
+    /// hold under concurrency. Arming is a property of the HOST: two watchers
+    /// racing to be installed for it read the same flag, so which one wins cannot
+    /// change the answer, and a bootstrap of a host that already has a watcher
+    /// needs no replacement — the running one picks the flag up on its next
+    /// cycle. There is nothing here to be checked-then-acted-on, and so nothing
+    /// to race.
+    ///
+    /// **In memory, never persisted, and deliberately so.** It is a claim about
+    /// what this process did, not a durable grant: an app that was restarted has
+    /// no claim on a session it did not start in this run, and the phone's twin
+    /// has the same lifetime for the same reason. It is emphatically **not** a
+    /// lease — there is no token, no expiry, no tombstone and nothing the far
+    /// side knows about.
+    armed: Arc<Mutex<ArmedFlags>>,
     /// When each shed was last probed, for [`SHED_PROBE_COOLDOWN`].
     probed: Arc<Mutex<BTreeMap<HostId, Instant>>>,
     /// The shed-probe concurrency bound.
@@ -533,6 +562,38 @@ impl Registry {
     }
 }
 
+/// Per-host "may shed wire this host's agent hooks?" — see [`RoostHosts::armed`],
+/// which is where the whole rule is written down.
+type ArmedFlags = BTreeMap<HostId, Arc<AtomicBool>>;
+
+/// `id`'s arming flag, created disarmed on first ask.
+///
+/// One flag per host, however many watchers come and go over it — that sharing
+/// is the point (see [`RoostHosts::armed`]). A free function rather than a method
+/// because [`WatchHandle`] needs the same flag and deliberately holds no
+/// `RoostHosts`.
+fn arming_flag(armed: &Mutex<ArmedFlags>, id: &HostId) -> Arc<AtomicBool> {
+    Arc::clone(lock(armed).entry(id.clone()).or_default())
+}
+
+/// What a watcher for `id` does beyond watching — the ONE place that question is
+/// answered, for all three spawn sites (plan 020 §3.3).
+///
+/// **Always a [`HooksRefresh`], never `None`**, because *whether* to wire is no
+/// longer decided here: the entry carries `id`'s flag and `refresh` loads it at
+/// the head of every cycle. A watcher therefore needs no knowledge of when it was
+/// spawned relative to a bootstrap, and no watcher ever has to be replaced
+/// because the answer changed.
+fn watcher_options(armed: &Mutex<ArmedFlags>, id: &HostId) -> RoostWatcherOptions {
+    RoostWatcherOptions {
+        hooks: Some(HooksRefresh {
+            target: id.token(),
+            client_label: CLIENT_LABEL.to_string(),
+            armed: arming_flag(armed, id),
+        }),
+    }
+}
+
 impl RoostHosts {
     /// Start a watcher per configured machine, plus the implicit [`LOCALHOST`]
     /// one. Never fails: a machine whose reach cannot even be built is still
@@ -573,10 +634,10 @@ impl RoostHosts {
             reach_options,
             jail_fs_root,
             execs: Mutex::new(BTreeMap::new()),
-            leases: Arc::new(RoostLeases::new()),
             probing: Arc::new(Mutex::new(BTreeSet::new())),
             listed_sheds: Arc::new(Mutex::new(BTreeSet::new())),
             bootstrapping: Arc::new(Mutex::new(BTreeSet::new())),
+            armed: Arc::new(Mutex::new(ArmedFlags::new())),
             probed: Arc::new(Mutex::new(BTreeMap::new())),
             probe_slots: Arc::new(tokio::sync::Semaphore::new(SHED_PROBE_CONCURRENCY)),
             on_change,
@@ -640,7 +701,12 @@ impl RoostHosts {
         };
 
         let label = id.token();
-        let (watcher, rx) = RoostWatcher::spawn(&self.handle, Arc::clone(&reach.reach), label);
+        let (watcher, rx) = RoostWatcher::spawn_with(
+            &self.handle,
+            Arc::clone(&reach.reach),
+            label,
+            watcher_options(&self.armed, &id),
+        );
         {
             let mut reg = lock(&self.reg);
             reg.reaches.insert(id.clone(), reach);
@@ -1191,7 +1257,12 @@ impl RoostHosts {
                 None => return,
             }
         };
-        let (watcher, rx) = RoostWatcher::spawn(&self.handle, Arc::clone(&reach), id.token());
+        let (watcher, rx) = RoostWatcher::spawn_with(
+            &self.handle,
+            Arc::clone(&reach),
+            id.token(),
+            watcher_options(&self.armed, id),
+        );
         if !lock(&self.reg).install_watcher(id, &reach, watcher) {
             return;
         }
@@ -1211,6 +1282,17 @@ impl RoostHosts {
     /// declaration and stays listed however unreachable it is (see the module
     /// doc), while a shed's roost host exists only while the shed does.
     pub fn remove(&self, id: &HostId) {
+        // **Disarmed FIRST, before anything else is torn down.** A refresh
+        // landing mid-teardown can re-register this same id and spawn a watcher
+        // for it; clearing after the teardown would let that watcher pick up a
+        // flag still reading `true` and wire a session this app run never
+        // started. Clearing first leaves that watcher two possibilities and both
+        // are disarmed: it took the entry we just removed and we stored `false`
+        // into it, or it made a fresh one, which starts `false`. Nothing in
+        // between (plan 020 §3.3).
+        if let Some(flag) = lock(&self.armed).remove(id) {
+            flag.store(false, Ordering::Release);
+        }
         {
             let mut reg = lock(&self.reg);
             // Dropping the watcher aborts its loop; dropping the reach tears
@@ -1222,9 +1304,10 @@ impl RoostHosts {
         lock(&self.execs).remove(id);
         // Forgotten, not kept: a shed that stops and starts again is a NEW
         // question, and making the user wait out a cooldown for an answer that
-        // has certainly changed would be the wrong way round.
+        // has certainly changed would be the wrong way round. (The arming flag
+        // is forgotten for the same reason, above — a host that goes away takes
+        // shed's claim to have started its session with it.)
         lock(&self.probed).remove(id);
-        self.leases.forget(&id.token());
         let was_listed = lock(&self.state).remove(id).is_some_and(|m| m.listed);
         // The lane layer holds subscriptions (and `ssh -N` children) against
         // rows that have just gone. Publishing an empty set is how they are
@@ -1298,16 +1381,17 @@ impl RoostHosts {
     ///
     /// ## One bootstrap per target at a time
     ///
-    /// **Refused, not queued.** The lease mutex inside
-    /// [`BootstrapRunner`](shed_app::roost::BootstrapRunner) serializes the HOOKS
-    /// dialogue and nothing else, so without the gate below two calls naming the
-    /// same target — a double-clicked button, a socket driver beside a click —
-    /// would both re-probe, both resolve bytes, and then stream, commit and
-    /// `start` over each other inside roost's `.bak.<pid>` chain. Queueing the
-    /// second would be worse than refusing it: it was consented to against a
-    /// fingerprint the first call is in the middle of invalidating, so the honest
-    /// answer is to say a bootstrap is already running and let the user (or the
-    /// next preview) decide.
+    /// **Refused, not queued, and nothing below this gate serializes anything.**
+    /// [`BootstrapRunner`](shed_app::roost::BootstrapRunner) holds no lock of its
+    /// own — it drives a sans-IO machine over an `ssh` master and a roost
+    /// connection, both of which two calls would happily share. So without this
+    /// gate two calls naming the same target — a double-clicked button, a socket
+    /// driver beside a click — would both re-probe, both resolve bytes, and then
+    /// stream, commit and `start` over each other inside roost's `.bak.<pid>`
+    /// chain. Queueing the second would be worse than refusing it: it was
+    /// consented to against a fingerprint the first call is in the middle of
+    /// invalidating, so the honest answer is to say a bootstrap is already
+    /// running and let the user (or the next preview) decide.
     ///
     /// Plan 019 §3.4 pins that two DIFFERENT clients (this app and the phone) are
     /// last-writer-wins, detected by the post-commit identify. That is a
@@ -1395,7 +1479,6 @@ impl RoostHosts {
             let runner = BootstrapRunner {
                 exec: exec.as_ref(),
                 reach: reach.as_ref(),
-                leases: self.leases.as_ref(),
                 target: &token,
                 jail_fs_root: self.jail_fs_root,
             };
@@ -1407,9 +1490,43 @@ impl RoostHosts {
         let _ = std::fs::remove_dir_all(&scratch);
 
         if outcome.is_ok() {
+            // **Armed, and that is the whole of it** (plan 020 §3.3): shed
+            // started this session, so every watcher for this host — the one
+            // below, one a background probe raced us to install, one that has
+            // been running since app start — re-sends the hooks at the head of
+            // its next cycle. The flag is per-host and read at send time, so
+            // arming needs no watcher to exist yet and no watcher to be
+            // replaced.
+            // **Both directions of the race with [`RoostHosts::remove`], not
+            // just one.** `remove` disarms before it tears the registry down, so
+            // a watcher spawned mid-teardown cannot read a stale `true` — that
+            // half is handled there. The half it cannot handle is this one: a
+            // `remove` that finishes while this bootstrap is still running would
+            // leave the store below inserting a FRESH `true` for a host that is
+            // already gone, and a later re-registration of the same `HostId`
+            // would find it and wire a session this app run never started.
+            //
+            // So take `armed` and then `reg` — `remove`'s own order, and there
+            // is no path that takes them the other way round (every spawn site
+            // releases `reg` before `watcher_options` reaches for `armed`) — and
+            // arm only a host that is still registered. A host removed under us
+            // gets nothing, which is the right answer: shed's claim to have
+            // started its session left with it.
+            let mut armed = lock(&self.armed);
+            if lock(&self.reg).ids.contains(&id) {
+                armed
+                    .entry(id.clone())
+                    .or_default()
+                    .store(true, Ordering::Release);
+            }
+            drop(armed);
             // shed just started a session there (or proved one was already
             // serving), so this host is worth watching now rather than at
-            // whatever refresh next probes it. `watch` is idempotent.
+            // whatever refresh next probes it. `watch` is idempotent: a shed has
+            // no watcher yet and gets one, and a `machines:` host has had one
+            // since app start and keeps it — which is better than a forced
+            // reconnect as well as simpler, since the running watcher picks the
+            // arming up on its next cycle either way.
             self.watch(&id);
         }
         Ok(outcome)
@@ -1445,7 +1562,6 @@ impl RoostHosts {
         let runner = BootstrapRunner {
             exec: exec.as_ref(),
             reach: reach.as_ref(),
-            leases: self.leases.as_ref(),
             target: &token,
             jail_fs_root: self.jail_fs_root,
         };
@@ -1531,6 +1647,7 @@ impl RoostHosts {
             handle: self.handle.clone(),
             on_change: self.on_change.clone(),
             on_lanes: Arc::clone(&self.on_lanes),
+            armed: Arc::clone(&self.armed),
         }
     }
 
@@ -1584,6 +1701,16 @@ struct WatchHandle {
     handle: tokio::runtime::Handle,
     on_change: OnChange,
     on_lanes: Arc<Mutex<Option<OnLanes>>>,
+    /// [`RoostHosts::armed`], so a watcher promoted from a background probe
+    /// carries the same per-host flag one started anywhere else does.
+    ///
+    /// Ordinarily that flag is `false` for the hosts that reach here — a shed the
+    /// prober promotes is one nobody bootstrapped. It matters for the race:
+    /// [`RoostHosts::bootstrap`] arms its target and then watches it, and a probe
+    /// already in flight can install the watcher first. Because both watchers
+    /// hold the SAME flag and read it per cycle rather than at spawn, which of
+    /// them wins the install cannot change whether the hooks get wired.
+    armed: Arc<Mutex<ArmedFlags>>,
 }
 
 impl WatchHandle {
@@ -1604,7 +1731,12 @@ impl WatchHandle {
                 None => return,
             }
         };
-        let (watcher, rx) = RoostWatcher::spawn(&self.handle, Arc::clone(&reach), id.token());
+        let (watcher, rx) = RoostWatcher::spawn_with(
+            &self.handle,
+            Arc::clone(&reach),
+            id.token(),
+            watcher_options(&self.armed, id),
+        );
         if !lock(&self.reg).install_watcher(id, &reach, watcher) {
             return;
         }
@@ -1762,12 +1894,6 @@ fn hooks_json(hooks: &HooksResult) -> Value {
         "client": hooks.client_label,
         "mode": "auto",
         "applied": hooks.applied(),
-        // The lease itself is NEVER published: it is a bearer token for the
-        // host's interactive session, and a client that logged it would put a
-        // usable credential in a test artifact. Whether shed still holds one is
-        // the part a UI needs.
-        "lease_held": hooks.lease.is_some(),
-        "skipped_code": hooks.skipped_code,
         "wired": hooks.wired,
         "refreshed": hooks.refreshed,
         "removed": hooks.removed,
@@ -2590,63 +2716,10 @@ mod tests {
         );
     }
 
-    /// **Somebody else taking the interactive lease changes nothing here.**
-    ///
-    /// At protocol 4 a takeover no longer ends an event stream; it reclassifies
-    /// it and says so once with a non-terminal `session.driver_changed`. Shed
-    /// never held the lease to begin with, so the rows must not move — and the
-    /// stream must still be delivering, which the flip afterwards is what
-    /// proves. (Two takeovers: the first mints into an unheld session and
-    /// deposes nobody, so roost announces nothing; the second is the real one.)
-    #[tokio::test]
-    async fn a_driver_change_leaves_the_rows_alone_and_the_stream_alive() {
-        let fake = FakeRoost::start().await;
-        claim_opencode(&fake, "working", "session_status", false);
-        let machines = start(
-            &config_with(&["mini3"]),
-            &sockets(&[("mini3", fake.socket_path())]),
-        );
-        let before = wait_for("the first row", || rows(&machines).into_iter().next()).await;
-        let lists_before = fake.tab_list_calls();
-
-        fake.take_over("roost ui");
-        fake.take_over("somebody else");
-
-        // Nothing to wait FOR — the assertion is that nothing happens — so give
-        // the frame time to be delivered and mishandled before reading.
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        assert_eq!(rows(&machines), vec![before], "a takeover moved a row");
-        assert_eq!(
-            machine_health(&machines, "mini3"),
-            (true, None),
-            "a takeover is not a reason to call a machine down"
-        );
-        assert_eq!(
-            fake.tab_list_calls(),
-            lists_before,
-            "a takeover is informational — it must not cost a resync"
-        );
-
-        // The stream survived it: the next commit still arrives.
-        claim_opencode(&fake, "finished", "session_idle", false);
-        let after = wait_for("the flip after the takeover", || {
-            rows(&machines)
-                .into_iter()
-                .find(|r| r["activity"] == "idle")
-        })
-        .await;
-        assert_eq!(after["slug"], json!("5"));
-        assert_eq!(
-            fake.tab_list_calls(),
-            lists_before,
-            "and it was still the SAME stream, not a reconnect"
-        );
-    }
-
     /// **A daemon that stops says why, and the row recovers when it comes back.**
     ///
     /// `session.stopping` is the one terminal envelope an event stream sees at
-    /// protocol 4, and it is the reason the user reads. The last known rows stay
+    /// protocol 5, and it is the reason the user reads. The last known rows stay
     /// on screen, marked stale — a machine going away must never blank the view.
     #[tokio::test]
     async fn a_stopping_session_goes_stale_with_its_reason_and_then_recovers() {
@@ -3628,12 +3701,13 @@ mod tests {
 
     /// **One bootstrap per target at a time** (plan 019 §3.6).
     ///
-    /// The lease mutex inside `BootstrapRunner` serializes the HOOKS dialogue and
-    /// nothing else, so without [`RoostHosts::begin_bootstrap`] two calls naming
-    /// one target would both re-probe, both resolve bytes, and then stream,
-    /// commit and `start` over each other. §3.4's last-writer-wins pin is about
-    /// two different CLIENTS that cannot see each other; it is not licence for one
-    /// app to race itself.
+    /// `BootstrapRunner` serializes nothing — it drives a sans-IO machine over a
+    /// shared `ssh` master and a shared roost connection — so without
+    /// [`RoostHosts::begin_bootstrap`] two calls naming one target would both
+    /// re-probe, both resolve bytes, and then stream, commit and `start` over
+    /// each other. §3.4's last-writer-wins pin is about two different CLIENTS
+    /// that cannot see each other; it is not licence for one app to race
+    /// itself.
     ///
     /// The first call's claim is taken explicitly rather than by racing two real
     /// bootstraps: both legs here fail fast (this config has no usable transport),

@@ -3,15 +3,13 @@
   "ok": true,
   "result": {
     "app_version": "0.0.19",
-    "features": [
-      "put_file"
-    ],
     "libghostty_build": "ghostty-f2d5758f6305867d+snapshot.v1",
     "payload_kinds": [
-      "ghostty-snapshot"
+      "ghostty-snapshot",
+      "vt"
     ],
-    "session_id": "05124e114e2f57de4d0336f7761e7bb9",
-    "session_protocol": 4,
-    "started_at": "2026-09-07T17:08:49Z"
+    "session_id": "1400e40467439d0affedcd02f5070428",
+    "session_protocol": 5,
+    "started_at": "2026-09-12T19:09:29Z"
   }
 }

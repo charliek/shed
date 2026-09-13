@@ -532,8 +532,8 @@ async fn resolve_with(
     // by plan 019 §3.5 and may not grow a clause. What a *user* needs is on the
     // consent card they already read — [`preview`] records every skip in
     // [`SourcePreview::skipped`], including pin P3's arch sentence, and the one
-    // skip a preview cannot foresee (a sibling that will not identify as
-    // protocol 4) is exactly what its `fallback` clause warned about.
+    // skip a preview cannot foresee (a sibling that will not identify as the
+    // current generation) is exactly what its `fallback` clause warned about.
     if let Ok(handle) = sibling_handle(env, target, remote).await {
         return Ok(handle);
     }

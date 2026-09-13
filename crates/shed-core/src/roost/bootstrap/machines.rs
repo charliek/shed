@@ -397,7 +397,8 @@ pub struct InstallRequest {
     /// re-probes and refuses if the host moved underneath it.
     pub fingerprint: String,
     /// Who shed says it is on the wire: `shed-desktop`, `shed-mobile`. Becomes
-    /// the lease's label and `session.set_agent_hooks`'s `client`.
+    /// `session.set_agent_hooks`'s `client`, which is roost's record of who
+    /// wired the host's hooks last.
     pub client_label: String,
 }
 
@@ -427,7 +428,7 @@ pub struct Installed {
     /// finds at a predictable, pid-derived path and has to be careful of (see
     /// the module doc).
     pub backup_warning: Option<String>,
-    /// What the lease dialogue came to. `None` when shed started nothing, so
+    /// What the hooks call came to. `None` when shed started nothing, so
     /// there was no Start of shed's for hooks to follow.
     pub hooks: Option<HooksResult>,
 }
@@ -888,7 +889,7 @@ impl InstallMachine {
                     );
                     return self.fail(Some(staged), failure);
                 }
-                // Kept for the post-commit check: "something protocol-4 is at
+                // Kept for the post-commit check: "something of this generation is at
                 // the destination" and "the bytes shed staged are at the
                 // destination" are different claims, and only the second is what
                 // the user consented to.
@@ -993,7 +994,7 @@ impl InstallMachine {
                 // clients installing at once is the normal case — the desktop
                 // and the phone — and this check is what the plan calls the
                 // detector. A detector that compares only the protocol number
-                // reports success for somebody *else's* protocol-4 build: shed
+                // reports success for somebody *else's* same-generation build: shed
                 // would discard its backup and say it installed bytes it never
                 // installed. Nothing is rolled back on this path either, because
                 // the file at the destination is not shed's to replace.

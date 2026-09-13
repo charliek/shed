@@ -27,6 +27,7 @@ use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
+use roost_ipc::messages::AgentHooksMode;
 use serde_json::{json, Value};
 
 use crate::roost::testing::{write_exec, FakeRoost, ScratchDir};
@@ -37,13 +38,13 @@ use super::*;
 const TARGET: &str = "roost:popos/p019-a";
 const LABEL: &str = "shed-desktop";
 
-/// The identity a protocol-4 `roost-session` prints. `libghostty_build` is
-/// deliberately something shed could never have guessed — the whole point of the
-/// protocol-only gate is that shed does not know it and does not care.
-fn identity_v4() -> String {
+/// The identity a current-generation `roost-session` prints. `libghostty_build`
+/// is deliberately something shed could never have guessed — the whole point of
+/// the protocol-only gate is that shed does not know it and does not care.
+fn identity_v5() -> String {
     json!({
         "app_version": "0.0.19",
-        "session_protocol": 4,
+        "session_protocol": 5,
         "libghostty_build": "ghostty-f2d5758f6305867d+snapshot.v1",
     })
     .to_string()
@@ -156,10 +157,6 @@ struct Rig {
     /// contains the needle.
     injections: Vec<(String, Outcome)>,
     asked: Vec<Asked>,
-    /// The lease `wire_agent_hooks` last handed back — the in-memory table the
-    /// real clients keep per target (plan 019 C6), in miniature.
-    lease: Option<String>,
-    hooks_seed_lease: Option<String>,
 }
 
 impl Rig {
@@ -229,8 +226,6 @@ impl Rig {
             path,
             injections: Vec::new(),
             asked: Vec::new(),
-            lease: None,
-            hooks_seed_lease: None,
         }
     }
 
@@ -386,10 +381,7 @@ impl Rig {
         let mut conn = Conn::unix(self.fake.socket_path())
             .await
             .expect("dialling the fake");
-        let cached = self.hooks_seed_lease.clone().or_else(|| self.lease.clone());
-        let result = wire_agent_hooks(&mut conn, client_label, cached.as_deref()).await;
-        self.lease = result.lease.clone();
-        Outcome::Hooks(result)
+        Outcome::Hooks(wire_agent_hooks(&mut conn, client_label).await)
     }
 
     /// Every `.tmp.<pid>` / `.bak.<pid>` beside the destination. The rollback
@@ -733,7 +725,7 @@ async fn a_cold_host_is_installed_started_and_wired() {
         "no hook op happens without consent — a probe wires nothing"
     );
 
-    let source = rig.source(&identity_v4());
+    let source = rig.source(&identity_v5());
     let installed = install_with(&mut rig, &found.fingerprint, Some(source))
         .await
         .expect("the install");
@@ -766,7 +758,7 @@ async fn a_cold_host_is_installed_started_and_wired() {
         Some(rig.dest().display().to_string().as_str())
     );
     assert_eq!(installed.verdict.as_deref(), Some("ready pid=4242"));
-    assert_eq!(installed.session.map(|s| s.session_protocol), Some(4));
+    assert_eq!(installed.session.map(|s| s.session_protocol), Some(5));
     assert!(rig.dest().is_file(), "the binary is at the destination");
     assert!(rig.residue().is_empty(), "no .tmp or .bak is left behind");
 
@@ -777,21 +769,20 @@ async fn a_cold_host_is_installed_started_and_wired() {
         "the warning says shed does not act on it — pin P5"
     );
 
-    // The hooks dialogue reached the host with exactly what §3.4 pins.
+    // The hooks call reached the host with exactly what §3.4 pins — one op,
+    // one payload, and no authority key beside it.
     let hooks = installed.hooks.expect("a hooks result");
     assert!(hooks.applied());
     assert_eq!(hooks.client_label, LABEL);
-    assert!(hooks.lease.is_some(), "the lease is kept, not dropped");
     let calls = rig.fake.agent_hooks_calls();
-    assert_eq!(calls.len(), 1);
+    assert_eq!(calls.len(), 1, "one wire call, not a two-op dialogue");
     assert_eq!(calls[0]["mode"], json!("auto"));
     assert_eq!(calls[0]["skip"], json!([]));
     assert_eq!(calls[0]["client"], json!(LABEL));
-    assert_eq!(calls[0]["lease"], json!(hooks.lease.as_deref().unwrap()));
-    assert_eq!(
-        rig.fake.lease_label().as_deref(),
-        Some(LABEL),
-        "shed holds the lease under its own label"
+    assert!(
+        calls[0].get("lease").is_none(),
+        "the lease retired at generation 5: {}",
+        calls[0]
     );
 }
 
@@ -799,7 +790,7 @@ async fn a_cold_host_is_installed_started_and_wired() {
 #[tokio::test]
 async fn the_stream_step_never_captures_stdout() {
     let mut rig = Rig::new().await;
-    let source = rig.source(&identity_v4());
+    let source = rig.source(&identity_v5());
     probe_then_install(&mut rig, Some(source))
         .await
         .expect("the install");
@@ -824,7 +815,7 @@ async fn the_stream_step_never_captures_stdout() {
 #[tokio::test]
 async fn a_compatible_binary_that_is_not_running_is_just_started() {
     let mut rig = Rig::new().await;
-    rig.seed_incumbent(&identity_v4());
+    rig.seed_incumbent(&identity_v5());
     let before = rig.dest_text().expect("the seeded binary");
 
     let found = probe(&mut rig).await.expect("the probe");
@@ -871,14 +862,14 @@ async fn a_compatible_binary_that_is_not_running_is_just_started() {
 #[tokio::test]
 async fn a_running_compatible_session_is_left_entirely_alone() {
     let mut rig = Rig::new().await;
-    rig.seed_incumbent(&identity_v4());
+    rig.seed_incumbent(&identity_v5());
     rig.mark_session_running();
 
     let found = probe(&mut rig).await.expect("the probe");
     let SessionState::Running { identity } = &found.session else {
         panic!("expected a running session, got {:?}", found.session);
     };
-    assert_eq!(identity.session_protocol, 4);
+    assert_eq!(identity.session_protocol, 5);
     assert_eq!(
         Plan::for_probe(TARGET, &found),
         Plan::UpToDate {
@@ -913,7 +904,7 @@ async fn a_stale_binary_is_updated_and_the_backup_is_discarded() {
     };
     assert!(!replaces_newer, "protocol 2 is older than 4");
 
-    let source = rig.source(&identity_v4());
+    let source = rig.source(&identity_v5());
     install_with(&mut rig, &found.fingerprint, Some(source))
         .await
         .expect("the update");
@@ -956,7 +947,7 @@ async fn prepare_fails_and_nothing_is_written() {
     let mut rig = Rig::new().await;
     std::fs::write(rig.home.join(".local"), "not a directory").expect("blocking .local");
 
-    let source = rig.source(&identity_v4());
+    let source = rig.source(&identity_v5());
     let failure = probe_then_install(&mut rig, Some(source))
         .await
         .expect_err("prepare cannot succeed");
@@ -1003,7 +994,7 @@ async fn a_truncated_stream_removes_the_staged_file_and_keeps_the_incumbent() {
     let before = rig.dest_text().expect("the incumbent");
     rig.shim("tee", &truncating_tee(64));
 
-    let source = rig.source(&identity_v4());
+    let source = rig.source(&identity_v5());
     let whole = std::fs::read(rig.dir.0.join("source-roost-session")).expect("the source bytes");
     let failure = probe_then_install(&mut rig, Some(source))
         .await
@@ -1058,7 +1049,7 @@ async fn the_staged_verify_refuses_a_wrong_protocol_before_anything_is_replaced(
     assert_eq!(
         failure.message,
         "the roost-session staged on roost:popos/p019-a isn't one this shed can talk to: \
-         it speaks session protocol 2, and this shed speaks 4 (it reports itself as \
+         it speaks session protocol 2, and this shed speaks 5 (it reports itself as \
          roost-session 0.0.19). It was removed and roost:popos/p019-a's existing install \
          was left exactly as it was."
     );
@@ -1082,7 +1073,7 @@ async fn a_commit_that_fails_after_the_incumbent_moved_puts_it_back() {
     let before = rig.dest_text().expect("the incumbent");
     rig.shim("mv", &failing_mv(".tmp."));
 
-    let source = rig.source(&identity_v4());
+    let source = rig.source(&identity_v5());
     let failure = probe_then_install(&mut rig, Some(source))
         .await
         .expect_err("a commit whose rename fails is not an install");
@@ -1124,7 +1115,7 @@ async fn a_commit_that_cannot_win_removes_the_staged_file() {
     let mut rig = Rig::new().await;
     std::fs::create_dir_all(rig.dest()).expect("making the destination a directory");
 
-    let source = rig.source(&identity_v4());
+    let source = rig.source(&identity_v5());
     let failure = probe_then_install(&mut rig, Some(source))
         .await
         .expect_err("a directory at dest is not installable");
@@ -1147,7 +1138,7 @@ async fn a_post_commit_failure_restores_the_incumbent() {
     // The staged verify answers normally; the post-commit check does not.
     rig.queue("identify.new", &["", "FAIL"]);
 
-    let source = rig.source(&identity_v4());
+    let source = rig.source(&identity_v5());
     let failure = probe_then_install(&mut rig, Some(source))
         .await
         .expect_err("a file that will not identify itself is not an install");
@@ -1178,7 +1169,7 @@ async fn a_post_commit_failure_with_no_incumbent_keeps_the_new_binary() {
     let mut rig = Rig::new().await;
     rig.queue("identify.new", &["", "FAIL"]);
 
-    let source = rig.source(&identity_v4());
+    let source = rig.source(&identity_v5());
     let failure = probe_then_install(&mut rig, Some(source))
         .await
         .expect_err("a file that will not identify itself is not an install");
@@ -1216,7 +1207,7 @@ async fn a_stale_backup_at_a_reused_pid_is_never_rolled_forward() {
     let before = rig.dest_text().expect("the incumbent");
     rig.shim("tee", &stale_backup_planting_tee(STALE));
 
-    let source = rig.source(&identity_v4());
+    let source = rig.source(&identity_v5());
     let failure = probe_then_install(&mut rig, Some(source))
         .await
         .expect_err("the stream failed");
@@ -1254,7 +1245,7 @@ async fn a_rollback_that_fails_says_where_the_incumbent_is() {
     rig.queue("identify.new", &["", "FAIL"]);
     rig.shim("mv", &failing_rollback_mv());
 
-    let source = rig.source(&identity_v4());
+    let source = rig.source(&identity_v5());
     let failure = probe_then_install(&mut rig, Some(source))
         .await
         .expect_err("a file that will not identify itself is not an install");
@@ -1306,7 +1297,7 @@ async fn a_commit_whose_rollback_also_fails_names_the_stranded_incumbent() {
     let before = rig.dest_text().expect("the incumbent");
     rig.shim("mv", &failing_commit_and_rollback_mv());
 
-    let source = rig.source(&identity_v4());
+    let source = rig.source(&identity_v5());
     let failure = probe_then_install(&mut rig, Some(source))
         .await
         .expect_err("a commit whose rename fails is not an install");
@@ -1361,7 +1352,7 @@ async fn a_cleanup_that_fails_says_the_staged_file_is_still_there() {
     );
     rig.shim("rm", &failing_rm(".tmp."));
 
-    let source = rig.source(&identity_v4());
+    let source = rig.source(&identity_v5());
     let failure = probe_then_install(&mut rig, Some(source))
         .await
         .expect_err("the stream failed");
@@ -1400,7 +1391,7 @@ async fn a_discard_that_fails_is_not_fatal_and_is_still_reported() {
     rig.seed_incumbent(&identity_v2());
     rig.shim("rm", &failing_rm(".bak."));
 
-    let source = rig.source(&identity_v4());
+    let source = rig.source(&identity_v5());
     let installed = probe_then_install(&mut rig, Some(source))
         .await
         .expect("a backup that would not go away is not a failed install");
@@ -1424,7 +1415,7 @@ async fn a_discard_that_fails_is_not_fatal_and_is_still_reported() {
 ///
 /// Plan 019 §3.4 pins that two concurrent installers are last-writer-wins, with
 /// the post-commit identify as the detector. A detector that compares only the
-/// protocol number is not one: client B's *different* protocol-4 build passes it,
+/// protocol number is not one: client B's *different* same-generation build passes it,
 /// and client A then discards its backup and reports that it installed bytes it
 /// never installed. So the check is against the identity the **staged verify**
 /// accepted.
@@ -1433,16 +1424,16 @@ async fn a_foreign_install_that_lands_first_is_reported_and_not_overwritten() {
     let mut rig = Rig::new().await;
     rig.seed_incumbent(&identity_v2());
     // The staged verify sees shed's own bytes; by the time the destination is
-    // asked, a different protocol-4 build is answering there.
+    // asked, a different build of the same generation is answering there.
     let theirs = json!({
         "app_version": "0.0.20",
-        "session_protocol": 4,
+        "session_protocol": 5,
         "libghostty_build": "ghostty-somebody-elses-build",
     })
     .to_string();
     rig.queue("identify.new", &["", &theirs]);
 
-    let source = rig.source(&identity_v4());
+    let source = rig.source(&identity_v5());
     let failure = probe_then_install(&mut rig, Some(source))
         .await
         .expect_err("shed did not install what it staged, and will not say it did");
@@ -1480,7 +1471,7 @@ async fn a_session_that_appears_before_the_commit_stops_the_install() {
     let before = mismatched.dest_text().expect("the incumbent");
     mismatched.shim("chmod", &session_starting_chmod());
 
-    let source = mismatched.source(&identity_v4());
+    let source = mismatched.source(&identity_v5());
     let failure = probe_then_install(&mut mismatched, Some(source))
         .await
         .expect_err("the binary now has a live process behind it");
@@ -1488,7 +1479,7 @@ async fn a_session_that_appears_before_the_commit_stops_the_install() {
     assert_eq!(failure.stage, Stage::Report);
     assert_eq!(
         failure.message,
-        "roost-session on roost:popos/p019-a speaks protocol 2, this build speaks 4 — \
+        "roost-session on roost:popos/p019-a speaks protocol 2, this build speaks 5 — \
          upgrade whichever is older; stop it there with `roostctl session stop` and \
          reconnect once it is. Nothing was replaced on roost:popos/p019-a."
     );
@@ -1508,7 +1499,7 @@ async fn a_session_that_appears_before_the_commit_stops_the_install() {
     let mut compatible = Rig::new().await;
     compatible.seed_incumbent(&identity_v2());
     compatible.shim("chmod", &session_starting_chmod());
-    let source = compatible.source(&identity_v4());
+    let source = compatible.source(&identity_v5());
     let failure = probe_then_install(&mut compatible, Some(source))
         .await
         .expect_err("something is serving there now");
@@ -1528,7 +1519,7 @@ async fn a_start_that_refuses_reports_its_own_reason() {
     let mut rig = Rig::new().await;
     rig.queue("start.new", &["error: the profile socket is locked"]);
 
-    let source = rig.source(&identity_v4());
+    let source = rig.source(&identity_v5());
     let failure = probe_then_install(&mut rig, Some(source))
         .await
         .expect_err("a start that refuses is a failed bootstrap");
@@ -1571,7 +1562,7 @@ async fn a_start_with_no_exit_status_is_a_failure_however_ready_it_looks() {
         },
     );
 
-    let source = rig.source(&identity_v4());
+    let source = rig.source(&identity_v5());
     let failure = probe_then_install(&mut rig, Some(source))
         .await
         .expect_err("a step that never finished proves nothing about a session");
@@ -1610,12 +1601,12 @@ async fn the_staged_verify_needs_the_step_to_have_finished() {
         "chmod -- 700",
         Outcome::Exec {
             exit: None,
-            stdout: identity_v4().into_bytes(),
+            stdout: identity_v5().into_bytes(),
             stderr_tail: String::new(),
         },
     );
 
-    let source = rig.source(&identity_v4());
+    let source = rig.source(&identity_v5());
     let failure = probe_then_install(&mut rig, Some(source))
         .await
         .expect_err("an identity read off an unfinished step is not an identity");
@@ -1638,7 +1629,7 @@ async fn a_post_start_protocol_mismatch_is_a_failure_that_keeps_the_binary() {
     let mut rig = Rig::new().await;
     rig.fake.set_session_protocol(2);
 
-    let source = rig.source(&identity_v4());
+    let source = rig.source(&identity_v5());
     let failure = probe_then_install(&mut rig, Some(source))
         .await
         .expect_err("a protocol-2 session is not one shed can read");
@@ -1647,7 +1638,7 @@ async fn a_post_start_protocol_mismatch_is_a_failure_that_keeps_the_binary() {
     assert_eq!(
         failure.message,
         "the roost-session that came up on roost:popos/p019-a isn't one this shed can talk \
-         to: it speaks session protocol 2, and this shed speaks 4. The new binary is in \
+         to: it speaks session protocol 2, and this shed speaks 5. The new binary is in \
          place on roost:popos/p019-a; nothing was rolled back."
     );
     assert!(rig.dest().is_file());
@@ -1673,7 +1664,7 @@ async fn a_budget_that_expires_mid_stream_is_a_failure_that_cleans_up() {
         },
     );
 
-    let source = rig.source(&identity_v4());
+    let source = rig.source(&identity_v5());
     let failure = probe_then_install(&mut rig, Some(source))
         .await
         .expect_err("no exit status is a failure");
@@ -1754,7 +1745,7 @@ async fn a_clean_eof_is_the_runners_call_and_the_parser_is_still_the_gate() {
 #[tokio::test]
 async fn a_host_that_started_a_session_since_consent_is_refused() {
     let mut rig = Rig::new().await;
-    rig.seed_incumbent(&identity_v4());
+    rig.seed_incumbent(&identity_v5());
     let found = probe(&mut rig).await.expect("the consent probe");
     assert_eq!(found.session, SessionState::NoSession);
     assert!(matches!(found.outcome, ProbeOutcome::Compatible { .. }));
@@ -1782,7 +1773,7 @@ async fn a_host_that_started_a_session_since_consent_is_refused() {
 #[tokio::test]
 async fn a_host_whose_binary_vanished_since_consent_is_refused() {
     let mut rig = Rig::new().await;
-    rig.seed_incumbent(&identity_v4());
+    rig.seed_incumbent(&identity_v5());
     let found = probe(&mut rig).await.expect("the consent probe");
     assert!(matches!(found.outcome, ProbeOutcome::Compatible { .. }));
 
@@ -1810,7 +1801,7 @@ async fn the_fingerprint_moves_for_the_two_changes_that_matter_and_no_others() {
     let stale = probe(&mut rig).await.expect("a stale binary");
     assert_ne!(cold.fingerprint, stale.fingerprint);
 
-    rig.seed_incumbent(&identity_v4());
+    rig.seed_incumbent(&identity_v5());
     let fresh = probe(&mut rig).await.expect("a compatible binary");
     assert_ne!(
         stale.fingerprint, fresh.fingerprint,
@@ -1848,7 +1839,7 @@ fn the_fingerprint_covers_home_and_a_restarted_session() {
     let running = |id: &str, started: &str| SessionState::Running {
         identity: SessionIdentity {
             app_version: "0.0.19".into(),
-            session_protocol: 4,
+            session_protocol: 5,
             libghostty_build: "ghostty-f2d5758f6305867d+snapshot.v1".into(),
             session_id: id.into(),
             started_at: started.into(),
@@ -1885,78 +1876,38 @@ fn the_fingerprint_covers_home_and_a_restarted_session() {
     );
 }
 
-/// Somebody else holds the interactive lease. shed steps back — it never takes
-/// a session away from whoever is driving it.
+/// **Another client is already talking to that session, and it changes nothing.**
+///
+/// At generation 4 this was the `already-connected` row: somebody held the
+/// interactive lease, so shed stepped back and wired nothing. roost deleted the
+/// authority check, so shed's call now lands beside the other client's and the
+/// last writer wins — which is decision D2, asserted rather than described.
 #[tokio::test]
-async fn hooks_skip_when_somebody_else_is_driving() {
+async fn hooks_are_wired_even_while_another_client_is_connected() {
     let mut rig = Rig::new().await;
-    rig.fake.take_over("roost-ui");
-
-    let source = rig.source(&identity_v4());
-    let installed = probe_then_install(&mut rig, Some(source))
-        .await
-        .expect("the install still succeeds — hooks are an enrichment");
-
-    let hooks = installed.hooks.expect("a hooks result");
-    assert!(!hooks.applied());
-    assert_eq!(hooks.skipped_code.as_deref(), Some("already-connected"));
-    assert_eq!(hooks.lease, None, "nothing to keep re-sending");
-    assert!(rig.fake.agent_hooks_calls().is_empty());
-    assert_eq!(
-        rig.fake.lease_label().as_deref(),
-        Some("roost-ui"),
-        "shed never takes over"
-    );
-}
-
-/// The lease shed was holding got taken while it was using it.
-#[tokio::test]
-async fn hooks_stop_re_sending_once_the_lease_is_taken_over() {
-    let mut rig = Rig::new().await;
-    let mut owner = Conn::unix(rig.fake.socket_path())
+    // A second client, live on the same session for the whole install.
+    let mut other = Conn::unix(rig.fake.socket_path())
         .await
         .expect("dialling the fake");
-    let ours = owner
-        .session_connect(false, Some(LABEL))
+    other
+        .session_set_agent_hooks(AgentHooksMode::Auto, &[], "roost-ui")
         .await
-        .expect("minting a lease")
-        .lease;
-    rig.fake.take_over("roost-ui");
+        .expect("the other client wires first");
 
-    // The cached lease a client would re-send with on its next reconnect.
-    rig.hooks_seed_lease = Some(ours);
-    let source = rig.source(&identity_v4());
-    let installed = probe_then_install(&mut rig, Some(source))
-        .await
-        .expect("the install still succeeds");
-
-    let hooks = installed.hooks.expect("a hooks result");
-    assert_eq!(hooks.skipped_code.as_deref(), Some("taken-over"));
-    assert_eq!(
-        hooks.lease, None,
-        "dropping the lease is what stops the re-sending"
-    );
-    assert!(rig.fake.agent_hooks_calls().is_empty());
-}
-
-/// A lease the far side has forgotten earns exactly one fresh connect.
-#[tokio::test]
-async fn a_forgotten_lease_is_re_minted_once() {
-    let mut rig = Rig::new().await;
-    rig.hooks_seed_lease = Some("0123456789abcdef0123456789abcdef".to_string());
-
-    let source = rig.source(&identity_v4());
+    let source = rig.source(&identity_v5());
     let installed = probe_then_install(&mut rig, Some(source))
         .await
         .expect("the install");
 
     let hooks = installed.hooks.expect("a hooks result");
-    assert!(hooks.applied(), "the retry found nobody else holding it");
-    assert_eq!(rig.fake.agent_hooks_calls().len(), 1);
-    assert_ne!(
-        hooks.lease.as_deref(),
-        Some("0123456789abcdef0123456789abcdef"),
-        "the stale one was replaced"
+    assert!(hooks.applied(), "nothing to step back from any more");
+    let calls = rig.fake.agent_hooks_calls();
+    assert_eq!(calls.len(), 2, "both clients' calls landed");
+    assert_eq!(calls[0]["client"], json!("roost-ui"));
+    assert_eq!(
+        calls[1]["client"],
+        json!(LABEL),
+        "shed wrote last, and `client` is the record of that"
     );
 }
 
@@ -1974,7 +1925,7 @@ async fn hooks_partial_errors_are_reported_and_are_not_a_failure() {
         "errors": [{ "agent": "grok", "error": "permission denied writing ~/.grok/hooks" }],
     }));
 
-    let source = rig.source(&identity_v4());
+    let source = rig.source(&identity_v5());
     let installed = probe_then_install(&mut rig, Some(source))
         .await
         .expect("partial hook failures do not fail the bootstrap");
@@ -2025,7 +1976,7 @@ async fn a_mismatched_running_session_is_reported_and_never_touched() {
         Plan::Report {
             protocol: 2,
             message: "roost-session on roost:popos/p019-a speaks protocol 2, this build speaks \
-                      4 — upgrade whichever is older; stop it there with `roostctl session \
+                      5 — upgrade whichever is older; stop it there with `roostctl session \
                       stop` and reconnect once it is."
                 .to_string(),
         }
@@ -2037,6 +1988,50 @@ async fn a_mismatched_running_session_is_reported_and_never_touched() {
         .expect_err("shed refuses to act on somebody else's session");
     assert_eq!(failure.stage, Stage::Report);
     assert!(failure.message.contains("speaks protocol 2"));
+    assert_eq!(
+        rig.asked_what(),
+        vec!["discovery", "path-check", "identity", "session.identify"],
+        "no start, no stop, no install — only the re-probe ran"
+    );
+}
+
+/// **Pin P6 at the number that is newly interesting: protocol 4.**
+///
+/// Every host plan 019's desktop bootstrapped is running a protocol-4
+/// `roost-session`, so the day this build ships each of them lands on this row —
+/// not on the synthetic protocol-2 one beside it. It has to be **reported**,
+/// with both numbers in the sentence, and neither stopped nor restarted:
+/// somebody may be sitting in that terminal right now.
+///
+/// The `4` here is a negative-test datum and does **not** move with the
+/// generation. A sweep that turned it into a 5 would delete the one case the
+/// bump exists to justify.
+#[tokio::test]
+async fn a_running_protocol_four_session_is_reported_and_never_touched() {
+    let mut rig = Rig::new().await;
+    rig.seed_incumbent(&identity_v2());
+    rig.mark_session_running();
+    rig.fake.set_session_protocol(4);
+
+    let found = probe(&mut rig).await.expect("the probe");
+    let plan = Plan::for_probe(TARGET, &found);
+    assert_eq!(
+        plan,
+        Plan::Report {
+            protocol: 4,
+            message: "roost-session on roost:popos/p019-a speaks protocol 4, this build speaks \
+                      5 — upgrade whichever is older; stop it there with `roostctl session \
+                      stop` and reconnect once it is."
+                .to_string(),
+        }
+    );
+    assert!(!plan.actionable());
+
+    let failure = install_with(&mut rig, &found.fingerprint, None)
+        .await
+        .expect_err("shed refuses to act on somebody else's session");
+    assert_eq!(failure.stage, Stage::Report);
+    assert!(failure.message.contains("speaks protocol 4"));
     assert_eq!(
         rig.asked_what(),
         vec!["discovery", "path-check", "identity", "session.identify"],
@@ -2085,7 +2080,7 @@ async fn a_runner_that_answers_the_wrong_kind_fails_cleanly() {
 ///
 /// This is the case that needs care and the only one where the two rules differ.
 /// Rung 1 is a build too old to know `identify`, so it answers nothing and
-/// `identity_script` keeps walking; rung 2 is a perfectly good protocol-4 binary.
+/// `identity_script` keeps walking; rung 2 is a perfectly good current-generation binary.
 /// Calling the host `Compatible` on the strength of rung 2 would offer no install
 /// — forever — while the transport went on exec'ing the stale rung 1 that
 /// shadows it.
@@ -2094,7 +2089,7 @@ async fn the_first_pair_decides_the_verdict_and_the_shell_hit_lands_last() {
     let mut rig = Rig::new().await;
     std::fs::create_dir_all(rig.dest().parent().expect("a parent")).expect("mkdir .local/bin");
     write_exec(&rig.dest(), FAKE_ANCIENT);
-    rig.shim("roost-session", &fake_session("shim", &identity_v4()));
+    rig.shim("roost-session", &fake_session("shim", &identity_v5()));
 
     let found = probe(&mut rig).await.expect("the probe");
     assert_eq!(found.candidates.len(), 2);

@@ -107,8 +107,6 @@ export type RoostHooksResult = {
   client: string;
   mode: string;
   applied: boolean;
-  lease_held: boolean;
-  skipped_code: string | null;
   wired: string[];
   refreshed: string[];
   removed: string[];
@@ -501,23 +499,18 @@ export function roostToastFor(result: RoostBootstrapResult): RoostToast {
   const hooks = result.hooks;
   let tone: RoostToast["tone"] = "ok";
   if (hooks) {
-    if (hooks.skipped_code) {
-      lines.push(`Hooks not wired: ${hooks.skipped_code}.`);
+    if (hooks.wired.length) lines.push(`Hooks wired: ${hooks.wired.join(", ")}.`);
+    if (hooks.refreshed.length) lines.push(`Hooks refreshed: ${hooks.refreshed.join(", ")}.`);
+    if (hooks.skipped.length) {
+      lines.push(`Skipped: ${hooks.skipped.map((s) => `${s.agent} (${s.reason})`).join(", ")}.`);
+    }
+    if (hooks.errors.length) {
+      lines.push(`Hook errors: ${hooks.errors.map((e) => `${e.agent}: ${e.error}`).join(", ")}.`);
       tone = "warn";
-    } else {
-      if (hooks.wired.length) lines.push(`Hooks wired: ${hooks.wired.join(", ")}.`);
-      if (hooks.refreshed.length) lines.push(`Hooks refreshed: ${hooks.refreshed.join(", ")}.`);
-      if (hooks.skipped.length) {
-        lines.push(`Skipped: ${hooks.skipped.map((s) => `${s.agent} (${s.reason})`).join(", ")}.`);
-      }
-      if (hooks.errors.length) {
-        lines.push(`Hook errors: ${hooks.errors.map((e) => `${e.agent}: ${e.error}`).join(", ")}.`);
-        tone = "warn";
-      }
-      if (hooks.error) {
-        lines.push(hooks.error);
-        tone = "warn";
-      }
+    }
+    if (hooks.error) {
+      lines.push(hooks.error);
+      tone = "warn";
     }
   }
   return { tone: result.path_warning ? "warn" : tone, lines };

@@ -670,7 +670,7 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
 mod tests {
     use super::*;
     use crate::roost::result_of;
-    use roost_ipc::messages::TabState;
+    use roost_ipc::messages::{TabState, SESSION_PROTOCOL_VERSION};
     use serde_json::Value;
 
     // Shed-recorded vectors: real adapter output from the plan-013 spikes. See the
@@ -1326,15 +1326,27 @@ failed   foreground_process question_asked    -> needs_input";
         assert_eq!(dto.created_at.as_deref(), Some("2026-09-07T08:14:27Z"));
 
         assert_eq!(inventory.revision, Some(18));
-        // The identify half is the **re-recorded** protocol-4 reply — that one
-        // embeds the generation integer, so unlike the `tab.list` recordings
-        // beside it (whose shapes are byte-identical across the R1 re-cut) it
-        // had to be taken again from a `c67ac27` daemon.
+        // The identify half embeds the generation integer, so unlike the
+        // `tab.list` recordings beside it (whose shapes are byte-identical
+        // across every re-cut so far) it has to move with the pin. **Asserted
+        // rather than trusted:** `SessionIdentify` is not `deny_unknown_fields`,
+        // so a stale `features` key or a leftover `4` would decode in silence
+        // and this fixture would go on describing a daemon shed refuses.
+        let recorded: Value = serde_json::from_str(SHED_SESSION_IDENTIFY).expect("the recording");
+        assert_eq!(
+            recorded["result"]["session_protocol"],
+            serde_json::json!(SESSION_PROTOCOL_VERSION),
+            "the recording is the generation this build speaks"
+        );
+        assert!(
+            recorded["result"].get("features").is_none(),
+            "`features` retired with the lease; a stale key would decode in silence"
+        );
         assert_eq!(
             inventory.daemon_session_id,
-            "05124e114e2f57de4d0336f7761e7bb9"
+            "1400e40467439d0affedcd02f5070428"
         );
-        assert_eq!(inventory.started_at, "2026-09-07T17:08:49Z");
+        assert_eq!(inventory.started_at, "2026-09-12T19:09:29Z");
         assert_eq!(inventory.to_rc_dtos(), vec![dto]);
     }
 

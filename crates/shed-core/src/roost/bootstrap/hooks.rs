@@ -4,38 +4,45 @@
 //! multiplexer* it can read. It does not, on its own, get it **agent activity** —
 //! roost knows what codex is doing because codex's hook reports it, and the
 //! hooks are dotfile entries that have to exist on that host. Wiring them is one
-//! op: `session.set_agent_hooks`, lease-gated, served by the host session, which
-//! links `roost-agent-install` and does the writes itself.
+//! op: `session.set_agent_hooks`, served by the host session, which links
+//! `roost-agent-install` and does the writes itself.
 //!
 //! So: **nothing shed does edits a dotfile.** Shed asks; the host session writes,
 //! under its own `$HOME`, with roost's own installer. That is pin P5 kept intact
 //! and it is worth saying out loud on the consent card, because the user is
 //! consenting to a file under their home directory changing.
 //!
-//! ## The lease is a bearer token, and shed keeps it
+//! ## One op, no token, last writer wins
 //!
-//! `session.set_agent_hooks` is lease-gated, so the dialogue is two ops:
-//! `session.connect {takeover: false, client_label}` to mint one, then the op
-//! itself. Three facts about roost's lease shape everything here, and the first
-//! draft of this plan got all three wrong:
+//! At session protocol 5 this op is **open to every same-UID client**: roost
+//! deleted the lease that used to gate it, and with it the two-op dialogue this
+//! module was built around. So [`wire_agent_hooks`] is one wire call with no
+//! retry loop and nothing to carry between calls.
 //!
-//! 1. **The lease outlives its connections.** It is not per-connection state; a
-//!    reconnect is a *takeover*. So shed mints it once per target and keeps it in
-//!    memory for the app run (`shed-app`'s table, plan 019 C6), re-sending
-//!    `set_agent_hooks` on every watcher reconnect while it is still valid — the
-//!    way roost's own UI re-sends it on every connect, because the op is
-//!    idempotent and a config change has to reach the host somehow.
-//! 2. **`takeover: false` against ANY live lease answers `already-connected`** —
-//!    including one this very connection holds. So that code never means "you
-//!    already have it"; it means *somebody is driving*, and the only correct
-//!    response is to step back. [`wire_agent_hooks`] returns
-//!    [`HooksResult::skipped_code`] `already-connected` and does nothing else.
-//! 3. **`taken-over` is terminal for this lease.** Whoever took it will wire the
-//!    hooks themselves — that is what every roost client does on connect — so
-//!    shed stops re-sending rather than fighting for it.
+//! What makes that safe is that the op is **declarative rather than
+//! incremental**. shed sends one request and only ever that request —
+//! `{mode: "auto", skip: [], client: "shed-desktop"|"shed-mobile"}` — and the
+//! host brings its hook entries in line with it. The destructive direction is
+//! `mode: "off"`, which shed has no code path that sends. A connection that died
+//! mid-call is therefore a call that did not land, and the next watcher cycle
+//! re-sends the identical request.
 //!
-//! **shed never takes over.** There is no code path here that passes
-//! `takeover: true`, and there is a test that says so.
+//! **The hook entries are idempotent; roost's own bookkeeping is not.** Ten
+//! calls leave the same lines in the same agent config files, but
+//! `roost-agent-install`'s state record rewrites `wired_at` and `by` every time,
+//! so `by` flips between labels while a desktop and a phone are both running.
+//! That churn is roost's metadata about the write, not the user's dotfile
+//! content, and "who wired these last" changing is precisely what that field is
+//! for — the host files it as the `by` of the agent's state entry in
+//! `~/.config/roost/agent-hooks.json`, which is where a user reads it.
+//! (NOT `roostctl agent status`: that reports installed / wired-at-version /
+//! out-of-date per agent, and names neither the writing client nor the time.)
+//!
+//! What genuinely changed with the lease: if a roost UI on that host had turned
+//! hooks off or excluded an agent, shed's next reconnect switches it back on. At
+//! protocol 4 shed would have seen `already-connected` and stepped back. One
+//! user owns every client, and shed's `auto` only ever wires what is already
+//! configured there.
 //!
 //! ## What `mode: auto` actually does, and when it recurs
 //!
@@ -54,12 +61,11 @@
 //!
 //! ## Failures here are never fatal
 //!
-//! The install worked, the session is up, the host is readable. A hooks dialogue
-//! that refused is a missing *enrichment*, and failing the whole bootstrap over
-//! it would throw away the part that succeeded. Everything below lands in
+//! The install worked, the session is up, the host is readable. A hooks call that
+//! refused is a missing *enrichment*, and failing the whole bootstrap over it
+//! would throw away the part that succeeded. Everything below lands in
 //! [`HooksResult`], which rides out on the success value.
 
-use roost_ipc::client::ServerCode;
 use roost_ipc::messages::{AgentHooksMode, SessionSetAgentHooksResult};
 
 use crate::roost::{Conn, RoostError};
@@ -78,20 +84,13 @@ pub struct HooksError {
     pub error: String,
 }
 
-/// What the lease dialogue came to. Owned end to end — it crosses to Dart.
+/// What the call came to. Owned end to end — it crosses to Dart.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct HooksResult {
-    /// The label shed connected under. Echoed by roost as
-    /// `session.driver_changed.taken_by` if anyone ever displaces it, which is
-    /// how a user finds out who is holding their session.
+    /// The label shed sent as `client`. roost records it as the `by` of the
+    /// state entry, which is how a user finds out which of their clients wired
+    /// these hooks last, by reading `~/.config/roost/agent-hooks.json` there.
     pub client_label: String,
-    /// The bearer token, **while it is still good**. The caller keeps this in
-    /// memory per target and re-sends `set_agent_hooks` with it on every
-    /// reconnect; `None` means stop.
-    pub lease: Option<String>,
-    /// Why nothing was wired, when nothing was: `already-connected` (somebody
-    /// else drives) or `taken-over` (somebody else took it mid-dialogue).
-    pub skipped_code: Option<String>,
     /// roost's first-announcement list — the agents this host has wired and
     /// never announced. Not "what this call wrote".
     pub wired: Vec<String>,
@@ -100,23 +99,19 @@ pub struct HooksResult {
     pub skipped: Vec<HooksSkip>,
     /// Per-agent failures. Partial success is the normal case and is shown.
     pub errors: Vec<HooksError>,
-    /// The dialogue itself failed — a dead connection, a refusal with no code
-    /// shed knows. Never fatal to the bootstrap.
+    /// The call itself failed — a dead connection, a refusal shed has no
+    /// narrower name for. Never fatal to the bootstrap.
     pub error: Option<String>,
 }
 
 impl HooksResult {
     /// Whether `session.set_agent_hooks` actually ran.
+    ///
+    /// One condition, because there is one way to not run it now: at protocol 4
+    /// a live lease elsewhere was a *third* outcome, neither applied nor failed,
+    /// and that outcome no longer exists on the wire.
     pub fn applied(&self) -> bool {
-        self.skipped_code.is_none() && self.error.is_none()
-    }
-
-    fn skipped(client_label: &str, code: &str) -> HooksResult {
-        HooksResult {
-            client_label: client_label.to_string(),
-            skipped_code: Some(code.to_string()),
-            ..HooksResult::default()
-        }
+        self.error.is_none()
     }
 
     fn failed(client_label: &str, error: String) -> HooksResult {
@@ -155,80 +150,29 @@ impl From<SessionSetAgentHooksResult> for HooksResult {
     }
 }
 
-/// Mint a lease if there isn't one, then wire the host's agent hooks.
+/// Wire the host's agent hooks. One op.
 ///
-/// **The one implementation of the dialogue**, called by both clients over
+/// **The one implementation of the call**, invoked by both clients over
 /// whichever `Conn` they have — that is the point of putting it here instead of
 /// in each client's runner. `Step::Hooks` is the sans-IO machine's way of saying
 /// "call this now"; on mobile it is called on the Rust side, on the desktop by
-/// the app layer, and neither writes its own version of the lease table above.
+/// the app layer, and neither writes its own version of it.
 ///
-/// `lease` is the one the caller is holding from a previous call, if any. A
-/// cached lease that has been forgotten by the far side (`connect-required` —
-/// roost keeps exactly one tombstone, so a lease displaced twice is forgotten)
-/// earns **one** fresh connect and one retry; anything beyond that is somebody
-/// else's session and shed leaves it alone.
-pub async fn wire_agent_hooks(
-    conn: &mut Conn,
-    client_label: &str,
-    lease: Option<&str>,
-) -> HooksResult {
-    let mut cached = lease.map(str::to_string);
-    // At most two passes: one with whatever the caller had, one with a freshly
-    // minted lease. A third would be a loop against a session that is being
-    // fought over, and shed is not a participant in that fight.
-    for pass in 0..2 {
-        let minted = cached.is_none();
-        let lease = match cached.take() {
-            Some(lease) => lease,
-            None => match conn.session_connect(false, Some(client_label)).await {
-                Ok(result) => result.lease,
-                Err(RoostError::Server { code, .. })
-                    if ServerCode::from_wire(&code) == ServerCode::AlreadyConnected =>
-                {
-                    // Somebody is driving. They wire the hooks; shed never
-                    // takes a lease away to do it.
-                    return HooksResult::skipped(client_label, &code);
-                }
-                Err(error) => return HooksResult::failed(client_label, error.to_string()),
-            },
-        };
-
-        match conn
-            .session_set_agent_hooks(&lease, AgentHooksMode::Auto, &[], client_label)
-            .await
-        {
-            Ok(result) => {
-                let mut result = HooksResult::from(result);
-                result.client_label = client_label.to_string();
-                result.lease = Some(lease);
-                return result;
-            }
-            Err(RoostError::Server { code, .. })
-                if ServerCode::from_wire(&code) == ServerCode::TakenOver =>
-            {
-                // Terminal: the new driver wires them. Dropping the lease is
-                // what stops the caller re-sending on every reconnect.
-                return HooksResult::skipped(client_label, &code);
-            }
-            Err(RoostError::Server { code, .. })
-                if ServerCode::from_wire(&code) == ServerCode::ConnectRequired
-                    && !minted
-                    && pass == 0 =>
-            {
-                // The cached lease was forgotten (displaced twice). Re-mint and
-                // try once — the connect itself is what decides whether anyone
-                // else is holding it now.
-                continue;
-            }
-            Err(RoostError::Server { code, message }) => {
-                return HooksResult::failed(client_label, format!("{code}: {message}"));
-            }
-            Err(error) => return HooksResult::failed(client_label, error.to_string()),
+/// There is nothing to retry and nothing to carry: a failure means the request
+/// did not land, and the next successful watcher cycle sends the same one again.
+pub async fn wire_agent_hooks(conn: &mut Conn, client_label: &str) -> HooksResult {
+    match conn
+        .session_set_agent_hooks(AgentHooksMode::Auto, &[], client_label)
+        .await
+    {
+        Ok(result) => {
+            let mut result = HooksResult::from(result);
+            result.client_label = client_label.to_string();
+            result
         }
+        Err(RoostError::Server { code, message }) => {
+            HooksResult::failed(client_label, format!("{code}: {message}"))
+        }
+        Err(error) => HooksResult::failed(client_label, error.to_string()),
     }
-    HooksResult::failed(
-        client_label,
-        "the interactive lease could not be established".to_string(),
-    )
 }
