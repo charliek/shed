@@ -104,7 +104,7 @@ adapter's `agent`/`model`/`version` metadata). One of those two is a session row
 the other is somebody's terminal. `shed.tab.list.opencode.over-ssh.json` is the
 same pair read from inside a shed VM over roost's SSH client-bridge.
 
-## shed's own two-language goldens
+## shed's own multi-language goldens
 
 Three files here are **not** roost vectors and are **not** copies of anything:
 they are shed's own, written by shed, and they may be edited. The
@@ -112,14 +112,23 @@ no-semantic-edits rule above governs the vendored vectors, not these.
 
 | file | what it pins | asserted by |
 |---|---|---|
-| `bootstrap/exec-chain-command.txt` | roost's candidate-ladder remote command, `roost_ipc::bootstrap::exec_chain_command(false)` | Rust (`shed-core/tests/roost_provider_vectors.rs`, against the LIVE function) and Go (`internal/roostprovider`'s `ExecChainCommand` constant) |
-| `agent-table.json` | kind → binary → title for the six agents the roost provider can start | Rust (`launch_argv` + `roost_capabilities().kinds`) and Go (`internal/roostprovider`'s `agentTable`) |
-| `stderr-classes.json` | how a failed `ssh` exec classifies (`roost_ipc::ssh::classify_ssh_failure`), plus shed's own class → provider-row and class → `ReachKind` mappings | Rust (the live classifier, `classes`; and `shed_app::roost::ReachError`, `reach_kinds`) and Go (`ClassifySSHFailure` + `ProviderRow`) |
+| `bootstrap/exec-chain-command.txt` | roost's candidate-ladder remote command, `roost_ipc::bootstrap::exec_chain_command(false)` | Rust (`shed-core/tests/roost_provider_vectors.rs`, against the LIVE function), Go (`internal/roostprovider`'s `ExecChainCommand` constant) and Dart (shed-mobile's `integration_test/roost_goldens_test.dart`, against `roostRemoteCommand()` — the string its roost tunnel hands `execute` verbatim) |
+| `agent-table.json` | kind → binary → title for the six agents the roost provider can start | Rust (`launch_argv` + `roost_capabilities().kinds`), Go (`internal/roostprovider`'s `agentTable`) and Dart (the kind SET a machine's create form offers) |
+| `stderr-classes.json` | how a failed `ssh` exec classifies (`roost_ipc::ssh::classify_ssh_failure`), plus shed's own class → provider-row and class → `ReachKind` mappings | Rust (the live classifier, `classes`; and `shed_app::roost::ReachError`, `reach_kinds`), Go (`ClassifySSHFailure` + `ProviderRow`) and Dart (`classes` **and** `reach_kinds`, against shed-mobile's own port in `lib/ssh/roost_reach.dart`) |
 
 They exist because one behaviour is implemented on both sides of a language
-boundary — the Go `shed roost-provider` subcommand and the Rust client core —
-and a golden asserted from both is the only thing that makes the two provably
-the same rather than the same today.
+boundary — the Go `shed roost-provider` subcommand and the Rust client core, and
+since plan 020 the Dart transport in shed-mobile as well — and a golden asserted
+from every side is the only thing that makes the implementations provably the
+same rather than the same today.
+
+**The Dart leg reads these files out of a shed CHECKOUT**, not a vendored copy:
+shed-mobile is a separate repository, and its
+`make test-integration-linux` refuses to run without one (`SHED_CHECKOUT`,
+defaulting to a sibling `../shed`; CI checks out the pinned rev). It owns a port
+of `classify_ssh_failure` because it owns its own transport — the phone execs
+over dartssh2, so nothing in Rust can see the far end's `exit 127` — and this
+golden is what keeps that third port honest.
 
 ### The bootstrap script goldens (`bootstrap/*`, Rust-only)
 
