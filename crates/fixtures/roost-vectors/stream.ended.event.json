@@ -1,0 +1,6 @@
+{
+  "event": "stream.ended",
+  "data": {
+    "reason": "backend-switch"
+  }
+}

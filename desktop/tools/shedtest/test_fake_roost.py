@@ -30,6 +30,8 @@ import pytest
 
 from fake_roost import (
     FRAME_CAPACITY,
+    ROOST_WIRED_AGENTS,
+    SESSION_PROTOCOL,
     STREAM_WRITE_DEADLINE,
     FakeRoost,
     RoostWireError,
@@ -95,7 +97,8 @@ class _Wire:
 
     def subscribe(self) -> dict:
         """`events.subscribe` exactly as the real client sends it — the string
-        `"0"` filter and nothing else; there is no lease key at generation 5."""
+        `"0"` filter and nothing else; there has been no lease key since
+        generation 5."""
         return self.call("events.subscribe", {"tab_id_filter": "0"})
 
 
@@ -137,7 +140,7 @@ def test_the_vendored_vectors_carry_what_the_fake_reads(roost):
     `fake_roost` — which is exactly what this module's import catches.
     """
     identified = roost_call(roost.socket_path, "session.identify")
-    assert identified["session_protocol"] == 5, identified
+    assert identified["session_protocol"] == SESSION_PROTOCOL, identified
     assert identified["session_id"], identified
     assert "features" not in identified, "`features` retired at generation 5"
 
@@ -388,13 +391,13 @@ def test_the_tab_list_hook_commits_between_the_ack_and_the_reply(roost):
 
 
 # ---------------------------------------------------------------------------
-# session.set_agent_hooks: open to every connection at generation 5
+# session.set_agent_hooks: the generation-6 raise, open to every connection
 # ---------------------------------------------------------------------------
 
 
 def test_two_connections_both_wire_hooks_and_the_last_one_is_recorded(roost):
-    """`session.set_agent_hooks` is **open to every connection** at generation 5
-    and the last writer wins.
+    """`session.set_agent_hooks` is **open to every connection** since
+    generation 5 and the last writer wins.
 
     This is the one behaviour the bump actually changed about this op — roost
     deleted `AgentHooksAuthority` and `AgentHooksError::Unauthorized` outright —
@@ -404,12 +407,9 @@ def test_two_connections_both_wire_hooks_and_the_last_one_is_recorded(roost):
     Mirrors `testing.rs::two_connections_both_wire_hooks_and_the_last_one_is_recorded`.
     """
     with _Wire(roost.socket_path) as desktop, _Wire(roost.socket_path) as phone:
-        desktop.call(
-            "session.set_agent_hooks", {"mode": "auto", "skip": [], "client": "shed-desktop"}
-        )
-        phone.call(
-            "session.set_agent_hooks", {"mode": "auto", "skip": [], "client": "shed-mobile"}
-        )
+        raise_to = "session.set_agent_hooks"
+        desktop.call(raise_to, {"agents": ROOST_WIRED_AGENTS, "client": "shed-desktop"})
+        phone.call(raise_to, {"agents": ROOST_WIRED_AGENTS, "client": "shed-mobile"})
 
         calls = roost.agent_hooks_calls
         assert len(calls) == 2, calls
@@ -429,7 +429,7 @@ def test_the_hooks_op_sent_twice_yields_an_identical_wired_set(roost):
     Mirrors `testing.rs::the_hooks_op_sent_twice_yields_an_identical_wired_set`.
     """
     with _Wire(roost.socket_path) as w:
-        params = {"mode": "auto", "skip": [], "client": "shed-desktop"}
+        params = {"agents": ROOST_WIRED_AGENTS, "client": "shed-desktop"}
         first = w.call("session.set_agent_hooks", params)
         second = w.call("session.set_agent_hooks", params)
         assert first == second
@@ -437,6 +437,90 @@ def test_the_hooks_op_sent_twice_yields_an_identical_wired_set(roost):
         calls = roost.agent_hooks_calls
         assert len(calls) == 2
         assert calls[0] == calls[1], "the same request, byte for byte"
+
+
+def test_the_hooks_params_are_validated_the_way_roost_validates_them(roost):
+    """**The generation-6 params, validated the way roost validates them.**
+
+    Every row here is a refusal a real host answers with, and none is reachable
+    through the app's own code path — which is why the fake has to spell them
+    out. A fake that accepted anything would let a malformed raise pass in this
+    suite and fail on somebody's machine.
+
+    `agents` first, in roost's own order: the blank element is checked before
+    emptiness, because a blank one can only ever be a client bug. Then the
+    generation-5 shape, which is a DECODE refusal rather than a validation one
+    (`deny_unknown_fields`) — "your client is too old" and "your list is
+    malformed" answer differently on purpose.
+
+    Mirrors `testing.rs::the_hooks_params_are_validated_the_way_roost_validates_them`.
+    """
+    bad = [
+        ("a blank element", {"agents": ["claude", "  "], "client": "shed-desktop"}),
+        ("an empty list", {"agents": [], "client": "shed-desktop"}),
+        ("a missing list", {"client": "shed-desktop"}),
+        ("a list that is not a list", {"agents": "claude", "client": "shed-desktop"}),
+        ("a non-string element", {"agents": ["claude", 7], "client": "shed-desktop"}),
+        ("a missing client", {"agents": ["claude"]}),
+        ("a non-string client", {"agents": ["claude"], "client": 7}),
+    ]
+    for why, params in bad:
+        with pytest.raises(RoostWireError) as refused:
+            roost_call(roost.socket_path, "session.set_agent_hooks", params)
+        assert refused.value.code == "invalid-param", (why, refused.value)
+
+    for retired in ("mode", "skip", "lease"):
+        params = {"agents": ["claude"], "client": "shed-desktop", retired: "auto"}
+        with pytest.raises(RoostWireError) as refused:
+            roost_call(roost.socket_path, "session.set_agent_hooks", params)
+        assert refused.value.code == "unknown-field", (retired, refused.value)
+
+    # A key roost never heard of is the same refusal. `deny_unknown_fields` does
+    # not care that `mode` was once real and `nonsense` never was, and a fake
+    # that only knew the three retired names would be MORE PERMISSIVE than the
+    # server — the one failure mode a fake must not have, since it passes a
+    # client that a real host then refuses.
+    with pytest.raises(RoostWireError) as refused:
+        roost_call(
+            roost.socket_path,
+            "session.set_agent_hooks",
+            {"agents": ["claude"], "client": "shed-desktop", "nonsense": 1},
+        )
+    assert refused.value.code == "unknown-field", refused.value
+
+    # None of the refusals were recorded as calls — a refused op wrote nothing
+    # on a real host either.
+    assert roost.agent_hooks_calls == [], roost.agent_hooks_calls
+
+    # …and the generation-6 shape is served.
+    roost_call(
+        roost.socket_path,
+        "session.set_agent_hooks",
+        {"agents": ROOST_WIRED_AGENTS, "client": "shed-desktop"},
+    )
+    assert len(roost.agent_hooks_calls) == 1, roost.agent_hooks_calls
+
+
+def test_end_stream_pushes_the_terminal_frame_and_leaves_the_daemon_up(roost):
+    """`stream.ended` reaches a subscriber on a daemon that is **still
+    answering**.
+
+    The second half is the whole point: `end_stream()` pushes the envelope and
+    nothing else, so a client that treated the frame as a hang-up would be
+    reading its own EOF rather than roost's frame. The client-side consequence —
+    a resync, not a Down — is asserted in `shed_app::roost`.
+
+    Mirrors `testing.rs::end_stream_pushes_the_terminal_frame_and_leaves_the_daemon_up`.
+    """
+    with _Wire(roost.socket_path) as w:
+        w.subscribe()
+        roost.end_stream("backend-switch")
+        frame = w.readline()
+        assert frame["event"] == "stream.ended", frame
+        assert frame["data"]["reason"] == "backend-switch", frame
+
+    # Still up: a fresh dial identifies, which `stop()` would have latched away.
+    assert roost_call(roost.socket_path, "session.identify")["session_id"]
 
 
 # ---------------------------------------------------------------------------

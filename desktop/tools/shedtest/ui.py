@@ -275,16 +275,16 @@ def launch(target: str = "mac", *, mock_base_url: str, config_path: Path, state_
     (plan 019 §3.5 rung 1) — not a `<PREFIX>_` var, because shed reads roost's
     variable by that name. It names the `roost-session` a bootstrap installs, so a
     cell can install a fake one; unset, the ladder falls through the sibling rung
-    to `NoSource` (no roost release speaks session protocol 5 yet), which is the
-    no-button cell. Set-or-cleared like the rest, so a developer with it exported
-    cannot make the NoSource cell pass for the wrong reason.
+    to `NoSource` (no roost release speaks the current session protocol yet),
+    which is the no-button cell. Set-or-cleared like the rest, so a developer
+    with it exported cannot make the NoSource cell pass for the wrong reason.
     `roost_session_bin` is roost's `ROOST_SESSION_BIN` — its own "which daemon do
     I run" override, which the source ladder's SIBLING rung borrows to find a
     roost-session beside the client (plan 019 §3.5 rung 2). Pointing it at a path
-    that does not exist is what makes "this machine has no protocol-5 roost"
-    deterministic: without it the rung finds whatever `roost-session` happens to
-    be on the developer's PATH and the NoSource cell reads differently on a
-    workstation than in CI.
+    that does not exist is what makes "this machine has no current-generation
+    roost" deterministic: without it the rung finds whatever `roost-session`
+    happens to be on the developer's PATH and the NoSource cell reads
+    differently on a workstation than in CI.
     `gx_home` is the fixture `$GROK_HOME` the gx lane's LOCAL credential reader
     looks in (`<PREFIX>_GX_HOME`) — a directory holding a fake `gx-remote*.json`
     record and a `0600` `gx-remote.token`, so the SHIPPED reader (checks and all)

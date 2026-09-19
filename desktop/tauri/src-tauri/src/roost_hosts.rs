@@ -447,12 +447,18 @@ pub struct RoostHosts {
     /// [`Self::bootstrap`] sets a target's flag on success and [`Self::remove`]
     /// clears it. EVERY watcher shed spawns carries a [`HooksRefresh`] holding
     /// its host's flag, and `refresh` loads it at the head of every successful
-    /// cycle — so a watcher re-sends `session.set_agent_hooks {mode: "auto"}`
-    /// exactly while the flag is set, and is silent the rest of the time. That is
-    /// the entitlement rule — shed wires hooks into a session it started and into
-    /// nothing else — and at protocol 5 it is the only thing enforcing it,
+    /// cycle — so a watcher re-sends the raise
+    /// (`session.set_agent_hooks {agents: ROOST_WIRED_AGENTS, client}`) exactly
+    /// while the flag is set, and is silent the rest of the time. That is the
+    /// entitlement rule — shed wires hooks into a session it started and into
+    /// nothing else — and at protocol 6 it is the only thing enforcing it,
     /// because roost's own gate on the op is gone and any same-UID client may now
     /// wire any session.
+    ///
+    /// The re-send is a **raise**, so it also re-widens: a host-side narrowing
+    /// made between two cycles is put back by the next one. Generation 6 has no
+    /// way to spell "narrow this" on the wire at all, so that is the rule, not
+    /// an accident of shed's request.
     ///
     /// **A flag rather than a spawn-time decision**, which is what makes the rule
     /// hold under concurrency. Arming is a property of the HOST: two watchers
@@ -1892,7 +1898,6 @@ pub(crate) fn installed_json(installed: &Installed) -> Value {
 fn hooks_json(hooks: &HooksResult) -> Value {
     json!({
         "client": hooks.client_label,
-        "mode": "auto",
         "applied": hooks.applied(),
         "wired": hooks.wired,
         "refreshed": hooks.refreshed,
@@ -1994,6 +1999,13 @@ fn open_params(kind: &RcKind, workdir: Option<&str>) -> Result<TabOpenParams, St
         cols: 0,
         rows: 0,
         title: String::new(),
+        // **Absent on the wire, not `false`.** `activate` is
+        // `skip_serializing_if = "Option::is_none"`, and absent and `Some(true)`
+        // both select the tab — which is what the desktop wants: a launch the
+        // user just asked for should be the tab roost shows. The phone sends
+        // `Some(false)` because a kickoff from a pocket must not reach over and
+        // move somebody's foreground tab.
+        activate: None,
     })
 }
 
@@ -2718,8 +2730,10 @@ mod tests {
 
     /// **A daemon that stops says why, and the row recovers when it comes back.**
     ///
-    /// `session.stopping` is the one terminal envelope an event stream sees at
-    /// protocol 5, and it is the reason the user reads. The last known rows stay
+    /// `session.stopping` is the terminal envelope that means the daemon is
+    /// GOING AWAY — `stream.ended`, its neighbour at generation 6, means the
+    /// opposite and resyncs — and its reason is the one the user reads. The
+    /// last known rows stay
     /// on screen, marked stale — a machine going away must never blank the view.
     #[tokio::test]
     async fn a_stopping_session_goes_stale_with_its_reason_and_then_recovers() {
@@ -3110,6 +3124,10 @@ mod tests {
         assert_eq!(params.project_id, 0, "roost picks the project");
         assert_eq!((params.cols, params.rows), (0, 0), "roost sizes the PTY");
         assert_eq!(params.title, "", "the title is roost's");
+        assert_eq!(
+            params.activate, None,
+            "the desktop leaves the tab it just opened selected"
+        );
 
         assert_eq!(
             open_params(&RcKind::ClaudeRc, None).unwrap().argv,
@@ -3162,6 +3180,21 @@ mod tests {
         // And it is in the snapshot immediately, rather than when the stream
         // delivers the `tab.opened` this call just caused.
         assert!(rows(&machines).iter().any(|r| r["slug"] == "6"));
+
+        // **`activate` is ABSENT from the bytes, not `false`.** roost declares
+        // it `skip_serializing_if = "Option::is_none"`, and absent and
+        // `Some(true)` both select the tab — which is what the desktop wants for
+        // a launch the user just asked for. `open_params`'s own unit test can
+        // only see the `None`; this is the only assertion that sees the wire,
+        // and it is the one that would catch a `Some(false)` copied over from
+        // the phone (where not stealing the foreground IS the point).
+        let opened = fake.tab_open_calls();
+        assert_eq!(opened.len(), 1, "{opened:?}");
+        assert!(
+            opened[0].get("activate").is_none(),
+            "the desktop sends no `activate` key at all: {}",
+            opened[0]
+        );
     }
 
     /// **A failed launch must not leave a ghost row.**

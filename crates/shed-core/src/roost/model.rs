@@ -682,6 +682,26 @@ mod tests {
     const SHED_SESSION_IDENTIFY: &str =
         include_str!("../../../fixtures/roost-vectors/shed.session.identify.json");
 
+    /// The generation [`SHED_SESSION_IDENTIFY`] was recorded from.
+    ///
+    /// **It is a RECORDING, so it lags the pin by design, and by at most one
+    /// generation.** A re-pin is a source edit; re-recording needs a live daemon
+    /// of the new generation, which is a live leg and lands a commit later. So
+    /// the number is pinned here rather than read off `SESSION_PROTOCOL_VERSION`,
+    /// and the gap is bounded in both directions: the moment the recording is
+    /// refreshed the test below goes red (edit this), and the moment a second
+    /// bump lands without a re-record the compile-time assertion below does
+    /// (record it). Neither can pass by drifting.
+    const RECORDED_GENERATION: u32 = 5;
+
+    const _: () = assert!(
+        RECORDED_GENERATION == SESSION_PROTOCOL_VERSION
+            || RECORDED_GENERATION + 1 == SESSION_PROTOCOL_VERSION,
+        "shed.session.identify.json lags the pinned session protocol by more than one \
+         generation: re-record it from a live daemon of the pinned generation — see \
+         crates/fixtures/roost-vectors/README.md, \"Shed-recorded vectors\""
+    );
+
     fn identify() -> SessionIdentify {
         result_of(SHED_SESSION_IDENTIFY)
     }
@@ -1332,11 +1352,13 @@ failed   foreground_process question_asked    -> needs_input";
         // rather than trusted:** `SessionIdentify` is not `deny_unknown_fields`,
         // so a stale `features` key or a leftover `4` would decode in silence
         // and this fixture would go on describing a daemon shed refuses.
+        // See [`RECORDED_GENERATION`] for why the number is that constant and
+        // not `SESSION_PROTOCOL_VERSION`.
         let recorded: Value = serde_json::from_str(SHED_SESSION_IDENTIFY).expect("the recording");
         assert_eq!(
             recorded["result"]["session_protocol"],
-            serde_json::json!(SESSION_PROTOCOL_VERSION),
-            "the recording is the generation this build speaks"
+            serde_json::json!(RECORDED_GENERATION),
+            "the recording moved; set RECORDED_GENERATION to the generation it now carries"
         );
         assert!(
             recorded["result"].get("features").is_none(),

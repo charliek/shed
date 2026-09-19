@@ -23,15 +23,15 @@ const (
 // SpokenProtocol is the roost session protocol this build speaks —
 // `roost_ipc::messages::SESSION_PROTOCOL_VERSION` at the rev crates/Cargo.toml
 // pins. It appears in the protocol-mismatch row's copy ("… this shed speaks
-// 5"), and it is the gate `Remote.Identify` applies.
+// 6"), and it is the gate `Remote.Identify` applies.
 //
 // Hand-carried into Go the same way the exec chain is, and pinned the same way:
 // the Rust twin test asserts this number against the real constant through
-// crates/fixtures/roost-vectors/session.identify.response.v5.json, whose
+// crates/fixtures/roost-vectors/session.identify.response.v6.json, whose
 // filename generation is the version. A roost-ipc bump that moves the protocol
 // renames that vector, which breaks the twin test, which is the signal to
 // change this.
-const SpokenProtocol = 5
+const SpokenProtocol = 6
 
 // wireRequestID is the correlation id every request carries.
 //

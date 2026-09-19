@@ -217,11 +217,11 @@ reads an `## Unreleased` heading._
 
 ## Unreleased
 
-_Staged by plan 019 (S4 `charliek/shed#326`, S5 `charliek/shed#327`) and plan 020 (the roost
-session protocol 5 re-pin); at release time fold this body into the new `## vX.Y.Z` section
-and replace this note with a real `**Ships:** server, desktop` line — this bundle touches only
-`internal/`, `cmd/shed/`, `crates/shed-core`, `crates/shed-app`, and the Tauri
-client, none of which is `host-agent`._
+_Staged by plan 019 (S4 `charliek/shed#326`, S5 `charliek/shed#327`), plan 020 (the roost
+session protocol 5 re-pin), and plan 021 (the roost session protocol 6 re-pin); at release time
+fold this body into the new `## vX.Y.Z` section and replace this note with a real `**Ships:**
+server, desktop` line — this bundle touches only `internal/`, `cmd/shed/`, `crates/shed-core`,
+`crates/shed-app`, and the Tauri client, none of which is `host-agent`._
 
 - **`shed roost-provider` — kickoff moves into roost's own palette (S4,
   `charliek/shed#326`), replacing the kickoff half of the unreleased, sunset
@@ -321,6 +321,23 @@ client, none of which is `host-agent`._
   `roostctl session stop` on that target, then reconnect — shed then sees
   a stale binary with no session running and replaces and restarts it
   unattended, the same as any other Update.
+- **shed re-pins to roost's session protocol 6 (plan 021, roost plan 064 / roost#489).**
+  `roost-ipc` moves to `ee71e44a1de3c0de4c59ac0267c0a5e0c993d88a` in every manifest that pins
+  it. **`session.set_agent_hooks` becomes a pure raise.** `{mode, skip, client}` is gone,
+  replaced by `{agents, client}`: shed sends its own `ROOST_WIRED_AGENTS` — the five names
+  roost's whole wireable set covers (`claude, codex, cursor, grok, opencode`) — and the host
+  unions them into its own `agent-hooks` key. There is no narrowing direction left on this
+  wire; `mode: "off"` retired with nothing replacing it, because roost made removal a
+  deliberate local act on the host (`roostctl agent uninstall`), not something a client can
+  ask for. An agent name the host doesn't recognize comes back in `skipped` with reason
+  `"unknown"`, shown verbatim rather than filtered or hidden. **A host still running the
+  previous generation, protocol 5, is now refused by name and offered the update — its
+  running session is never stopped** (pin P6, unchanged from the protocol-5 re-pin above). See
+  [`docs/extensions/roost-session-hosts.md`](https://charliek.github.io/shed/extensions/roost-session-hosts/)
+  for the re-widening consequence of a raise and the gx/`$GROK_HOME` "not installed" surprise
+  on a fresh host. Nothing about the release-asset source rung changed: it still reports that
+  no published roost release speaks the current session protocol until `RELEASE_PIN` flips,
+  which is a separate PR.
 
 ## v0.8.2 — 2026-08-17
 

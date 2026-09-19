@@ -9,7 +9,7 @@
 //! so the shapes here cannot drift away from the shapes roost publishes without
 //! the copy step noticing.
 //!
-//! At session protocol 5 the wire it speaks is unowned — the lease, its takeover
+//! At session protocol 6 the wire it speaks is unowned — the lease, its takeover
 //! table and its one tombstone retired with generation 4 — so what is left to be
 //! faithful about is the stream:
 //!
@@ -27,6 +27,13 @@
 //!   the same tab, and the last writer wins — which is the one behaviour
 //!   generation 5 actually changed and the one the deleted refusal table was
 //!   standing in front of.
+//! * **`session.set_agent_hooks` validates its params the way roost does.**
+//!   Generation 6 made it a raise: `{agents, client}`, `deny_unknown_fields`, a
+//!   non-empty `agents` with no blank element. A fake that took the old
+//!   `{mode, skip}` shape would let a stale client pass here and fail on a real
+//!   host, so the two refusals roost spells out — `invalid-param` for a bad
+//!   `agents`/`client`, `unknown-field` for a retired key — are spelled out
+//!   here too.
 //!
 //! It listens on **both** a Unix socket and a loopback TCP port, because
 //! [`super::conn::Conn`] has two transports and the TCP one goes through a
@@ -54,7 +61,7 @@ use tokio::task::JoinHandle;
 // upstream and shed vendors only the current one — a protocol-2 daemon is a
 // control here ([`FakeRoost::set_session_protocol`]), not a second vector.
 const VECTOR_SESSION_IDENTIFY: &str =
-    include_str!("../../../fixtures/roost-vectors/session.identify.response.v5.json");
+    include_str!("../../../fixtures/roost-vectors/session.identify.response.v6.json");
 const VECTOR_IDENTIFY: &str =
     include_str!("../../../fixtures/roost-vectors/identify.response.json");
 const VECTOR_TAB_LIST: &str =
@@ -77,6 +84,8 @@ const VECTOR_AGENT_REPORT_CHANGED: &str =
     include_str!("../../../fixtures/roost-vectors/agent_report.changed.event.json");
 const VECTOR_SESSION_STOPPING: &str =
     include_str!("../../../fixtures/roost-vectors/session.stopping.event.json");
+const VECTOR_STREAM_ENDED: &str =
+    include_str!("../../../fixtures/roost-vectors/stream.ended.event.json");
 const VECTOR_TABS_REORDERED: &str =
     include_str!("../../../fixtures/roost-vectors/tabs.reordered.event.json");
 const VECTOR_PROJECTS_REORDERED: &str =
@@ -222,9 +231,13 @@ struct FakeState {
     /// Bytes `tab.write` delivered, per tab.
     writes: BTreeMap<i64, Vec<u8>>,
     /// Every `session.set_agent_hooks` this fake has served, params verbatim —
-    /// the assertion that shed sent `mode: auto`, `client: <label>` and an
-    /// empty skip list, and that it sent it exactly when it says it does.
+    /// the assertion that shed sent the five names and its own `client` label,
+    /// and that it sent it exactly when it says it does.
     agent_hooks_calls: Vec<Value>,
+    /// Every `tab.open` this fake has served, params verbatim. The only way to
+    /// assert a key is **absent** from a launch — `activate` is
+    /// `skip_serializing_if`, so a struct literal says nothing about the bytes.
+    tab_open_calls: Vec<Value>,
     /// What the next `session.set_agent_hooks` answers with, on top of the
     /// vendored vector's shape. `None` is the vector as recorded.
     agent_hooks_result: Option<Value>,
@@ -284,6 +297,7 @@ impl FakeState {
             projects,
             writes: BTreeMap::new(),
             agent_hooks_calls: Vec::new(),
+            tab_open_calls: Vec::new(),
             agent_hooks_result: None,
             streams: BTreeSet::new(),
             restarts_between_dials: 0,
@@ -615,12 +629,24 @@ impl FakeRoost {
 
     /// Every `session.set_agent_hooks` this fake has served, params verbatim.
     ///
-    /// The assertion that shed asked for what it says it asks for — `mode:
-    /// "auto"`, an empty `skip`, its own `client` label — and, just as
-    /// important, that it asked **only** where consent was given: an empty list
-    /// is what "no hook op happened without consent" looks like.
+    /// The assertion that shed asked for what it says it asks for — the five
+    /// [`ROOST_WIRED_AGENTS`](crate::roost::bootstrap::ROOST_WIRED_AGENTS) and
+    /// its own `client` label — and, just as important, that it asked **only**
+    /// where consent was given: an empty list is what "no hook op happened
+    /// without consent" looks like.
     pub fn agent_hooks_calls(&self) -> Vec<Value> {
         self.lock().agent_hooks_calls.clone()
+    }
+
+    /// Every `tab.open` this fake has served, params verbatim.
+    ///
+    /// The one way to assert a key is **absent** from a launch. `TabOpenParams`
+    /// declares `activate` `skip_serializing_if = "Option::is_none"`, so the
+    /// difference between "shed sent no `activate`" and "shed sent `null`" is
+    /// only visible in the bytes the host received — a struct literal, or a
+    /// decoded params object, cannot tell them apart.
+    pub fn tab_open_calls(&self) -> Vec<Value> {
+        self.lock().tab_open_calls.clone()
     }
 
     /// Answer the next `session.set_agent_hooks` with this `result` instead of
@@ -631,6 +657,27 @@ impl FakeRoost {
     /// failed call would throw away four wired agents over one that was not.
     pub fn set_agent_hooks_result(&self, result: Value) {
         self.lock().agent_hooks_result = Some(result);
+    }
+
+    /// Push roost's **other** terminal control frame: `stream.ended`, with this
+    /// `reason` (roost's own is `"backend-switch"`).
+    ///
+    /// It pushes the envelope and **nothing else** — no hang-up, no latch, no
+    /// revision bump. That is the whole point of it being separate from
+    /// [`Self::stop`]: the property under test is that a client answers
+    /// `EventFrame::Ended` with a *resync* rather than a Down, and a fake that
+    /// also closed the connection would make every client pass, because the EOF
+    /// alone is already a resync. What is left is the frame, on a daemon that is
+    /// still answering, which is exactly the shape a real UI socket produces
+    /// when it moves its tabs to another backend.
+    ///
+    /// Built from roost's own vendored envelope rather than hand-constructed,
+    /// like every other frame this fake pushes.
+    pub fn end_stream(&self, reason: &str) {
+        let state = self.lock();
+        let mut envelope = vector(VECTOR_STREAM_ENDED);
+        envelope["data"]["reason"] = json!(reason);
+        state.push(&envelope);
     }
 
     /// The daemon is stopping: every stream gets the terminal
@@ -1004,6 +1051,7 @@ fn dispatch(state: &Mutex<FakeState>, op: &str, params: &Value) -> Result<Value,
             }))
         }
         "tab.open" => {
+            state.tab_open_calls.push(params.clone());
             let id = state.next_tab_id;
             state.next_tab_id += 1;
             let project_id = params
@@ -1081,21 +1129,69 @@ fn dispatch(state: &Mutex<FakeState>, op: &str, params: &Value) -> Result<Value,
             Ok(json!({}))
         }
         "session.set_agent_hooks" => {
-            // roost's own order at generation 5: decode, barrier, handle. The
-            // `AgentHooksAuthority` check that sat between the first two was
-            // deleted with the lease, so this op WRITES FILES under the session
-            // user's home for whichever same-UID client asked last.
+            // roost's own order at generation 6: decode (strict), validate the
+            // names, handle. The `AgentHooksAuthority` check that generation 4
+            // ran between the first two was deleted with the lease, so this op
+            // WRITES FILES under the session user's home for whichever same-UID
+            // client asked last.
             if state.ui_socket {
                 return Err(refuse("unknown-op", "no such op: session.set_agent_hooks"));
             }
-            match params.get("mode").and_then(Value::as_str) {
-                Some("auto") | Some("off") => {}
-                other => {
+            // `SessionSetAgentHooksParams` is `deny_unknown_fields`, so a
+            // generation-5 client's `mode`/`skip` never reaches roost's own
+            // validation at all — it is a decode refusal. Spelled out rather
+            // than folded into the `invalid-param` below, because "your client
+            // is too old" and "your list is malformed" are different bugs.
+            for retired in ["mode", "skip", "lease"] {
+                if params.get(retired).is_some() {
                     return Err(refuse(
-                        "invalid-param",
-                        format!("session.set_agent_hooks mode: {other:?}"),
-                    ))
+                        "unknown-field",
+                        format!("session.set_agent_hooks: unknown field `{retired}`"),
+                    ));
                 }
+            }
+            // And then EVERY other unknown key, because `deny_unknown_fields`
+            // does not care which one it is. Named separately from the three
+            // above only for the message; a fake that let an unrecognised key
+            // through would be more permissive than the server it stands in
+            // for, which is the one way a fake can pass a client that a real
+            // host then refuses.
+            if let Some(extra) = params.as_object().and_then(|params| {
+                params
+                    .keys()
+                    .find(|key| !matches!(key.as_str(), "agents" | "client"))
+            }) {
+                return Err(refuse(
+                    "unknown-field",
+                    format!("session.set_agent_hooks: unknown field `{extra}`"),
+                ));
+            }
+            // roost's `check_names`, in its order: a blank element is checked
+            // before emptiness, because a blank one can only be a client bug.
+            let agents = params
+                .get("agents")
+                .and_then(Value::as_array)
+                .ok_or_else(|| {
+                    refuse(
+                        "invalid-param",
+                        "session.set_agent_hooks needs an `agents` array",
+                    )
+                })?;
+            if agents
+                .iter()
+                .any(|name| name.as_str().is_none_or(|name| name.trim().is_empty()))
+            {
+                return Err(refuse(
+                    "invalid-param",
+                    "session.set_agent_hooks: `agents` carries an empty name",
+                ));
+            }
+            if agents.is_empty() {
+                return Err(refuse(
+                    "invalid-param",
+                    "session.set_agent_hooks requires a non-empty `agents`: a client \
+                     with nothing to raise does not send the op",
+                ));
             }
             if params.get("client").and_then(Value::as_str).is_none() {
                 return Err(refuse(
@@ -1146,8 +1242,9 @@ mod tests {
     use super::*;
 
     use roost_ipc::client::{EventFrame, ServerCode};
-    use roost_ipc::messages::{AgentHooksMode, SESSION_PROTOCOL_VERSION};
+    use roost_ipc::messages::SESSION_PROTOCOL_VERSION;
 
+    use crate::roost::bootstrap::ROOST_WIRED_AGENTS;
     use crate::roost::{Conn, RoostError};
 
     /// The vectors are the fake's whole claim to fidelity — if one stops
@@ -1244,7 +1341,7 @@ mod tests {
         let mut phone = Conn::unix(fake.socket_path()).await.expect("dial");
 
         let result = desktop
-            .session_set_agent_hooks(AgentHooksMode::Auto, &[], "shed-desktop")
+            .session_set_agent_hooks(&ROOST_WIRED_AGENTS, "shed-desktop")
             .await
             .expect("no authority to hold");
         assert_eq!(
@@ -1252,13 +1349,13 @@ mod tests {
             vec!["claude".to_string(), "codex".to_string()]
         );
         phone
-            .session_set_agent_hooks(AgentHooksMode::Auto, &[], "shed-mobile")
+            .session_set_agent_hooks(&ROOST_WIRED_AGENTS, "shed-mobile")
             .await
             .expect("a second client is not refused");
 
         let calls = fake.agent_hooks_calls();
         assert_eq!(calls.len(), 2, "both landed");
-        assert_eq!(calls[0]["mode"], json!("auto"));
+        assert_eq!(calls[0]["agents"], json!(ROOST_WIRED_AGENTS));
         assert_eq!(calls[0]["client"], json!("shed-desktop"));
         assert_eq!(
             calls[1]["client"],
@@ -1283,11 +1380,11 @@ mod tests {
         let mut conn = Conn::unix(fake.socket_path()).await.expect("dial");
 
         let first = conn
-            .session_set_agent_hooks(AgentHooksMode::Auto, &[], "shed-desktop")
+            .session_set_agent_hooks(&ROOST_WIRED_AGENTS, "shed-desktop")
             .await
             .expect("the first call");
         let second = conn
-            .session_set_agent_hooks(AgentHooksMode::Auto, &[], "shed-desktop")
+            .session_set_agent_hooks(&ROOST_WIRED_AGENTS, "shed-desktop")
             .await
             .expect("the second call");
         assert_eq!(first.wired, second.wired);
@@ -1297,6 +1394,155 @@ mod tests {
         let calls = fake.agent_hooks_calls();
         assert_eq!(calls.len(), 2);
         assert_eq!(calls[0], calls[1], "the same request, byte for byte");
+    }
+
+    /// One raw request against the fake, hand-built — the way to send a params
+    /// shape no typed op will produce, and the way to read a reply envelope
+    /// whole rather than through a decoder. Answers it verbatim.
+    async fn raw_call(fake: &FakeRoost, op: &str, params: Value) -> Value {
+        let stream = tokio::net::UnixStream::connect(fake.socket_path())
+            .await
+            .expect("dial");
+        let (read, mut write) = tokio::io::split(stream);
+        let request = json!({ "id": "1", "op": op, "params": params });
+        write_line(&mut write, &request).await.expect("write");
+        let line = BufReader::new(read)
+            .lines()
+            .next_line()
+            .await
+            .expect("read")
+            .expect("a reply");
+        serde_json::from_str(&line).expect("valid JSON")
+    }
+
+    fn refusal_code(reply: &Value) -> ServerCode {
+        assert_eq!(reply["ok"], json!(false), "{reply}");
+        ServerCode::from_wire(reply["error"]["code"].as_str().unwrap_or_default())
+    }
+
+    /// **The generation-6 params, validated the way roost validates them.**
+    ///
+    /// Every row here is a refusal a real host answers with, and every one of
+    /// them is unreachable through [`Conn::session_set_agent_hooks`] — which is
+    /// exactly why the fake has to spell them out. A fake that accepted
+    /// anything would let a malformed raise pass in shed's tests and fail on
+    /// somebody's machine.
+    ///
+    /// `agents` first, in roost's own order: the blank element is checked before
+    /// emptiness, because a blank one can only ever be a client bug.
+    #[tokio::test]
+    async fn the_hooks_params_are_validated_the_way_roost_validates_them() {
+        let fake = FakeRoost::start().await;
+
+        for (why, params) in [
+            (
+                "a blank element",
+                json!({ "agents": ["claude", "  "], "client": "shed-desktop" }),
+            ),
+            (
+                "an empty list",
+                json!({ "agents": [], "client": "shed-desktop" }),
+            ),
+            ("a missing list", json!({ "client": "shed-desktop" })),
+            (
+                "a list that is not a list",
+                json!({ "agents": "claude", "client": "shed-desktop" }),
+            ),
+            (
+                "a non-string element",
+                json!({ "agents": ["claude", 7], "client": "shed-desktop" }),
+            ),
+            ("a missing client", json!({ "agents": ["claude"] })),
+            (
+                "a non-string client",
+                json!({ "agents": ["claude"], "client": 7 }),
+            ),
+        ] {
+            let reply = raw_call(&fake, "session.set_agent_hooks", params).await;
+            assert_eq!(
+                refusal_code(&reply),
+                ServerCode::InvalidParam,
+                "{why} must be invalid-param: {reply}"
+            );
+        }
+
+        // And the generation-5 shape is a DECODE refusal, not a validation one:
+        // roost's params are `deny_unknown_fields`, so "your client is too old"
+        // and "your list is malformed" answer differently on purpose.
+        for retired in ["mode", "skip", "lease"] {
+            let mut params = json!({ "agents": ["claude"], "client": "shed-desktop" });
+            params[retired] = json!("auto");
+            let reply = raw_call(&fake, "session.set_agent_hooks", params).await;
+            assert_eq!(
+                refusal_code(&reply),
+                ServerCode::UnknownField,
+                "a retired `{retired}` must be unknown-field: {reply}"
+            );
+        }
+
+        // A key roost never heard of is the same refusal. `deny_unknown_fields`
+        // does not care that `mode` was once real and `nonsense` never was, and
+        // a fake that only knew the three retired names would be MORE PERMISSIVE
+        // than the server — the one failure mode a fake must not have, since it
+        // passes a client that a real host then refuses.
+        let reply = raw_call(
+            &fake,
+            "session.set_agent_hooks",
+            json!({ "agents": ["claude"], "client": "shed-desktop", "nonsense": 1 }),
+        )
+        .await;
+        assert_eq!(
+            refusal_code(&reply),
+            ServerCode::UnknownField,
+            "an unknown key roost never had must be unknown-field too: {reply}"
+        );
+
+        // None of the refusals were recorded as calls — a refused op wrote
+        // nothing on a real host either.
+        assert!(
+            fake.agent_hooks_calls().is_empty(),
+            "{:?}",
+            fake.agent_hooks_calls()
+        );
+
+        // …and the generation-6 shape is served.
+        let reply = raw_call(
+            &fake,
+            "session.set_agent_hooks",
+            json!({ "agents": ROOST_WIRED_AGENTS, "client": "shed-desktop" }),
+        )
+        .await;
+        assert_eq!(reply["ok"], json!(true), "{reply}");
+        assert_eq!(fake.agent_hooks_calls().len(), 1);
+    }
+
+    /// `stream.ended` reaches a subscriber as [`EventFrame::Ended`], on a daemon
+    /// that is **still answering**.
+    ///
+    /// The second half is the whole point: [`FakeRoost::end_stream`] pushes the
+    /// envelope and nothing else, so a client that treated the frame as a
+    /// hang-up would be reading its own EOF rather than roost's frame. The
+    /// client-side consequence — a resync, not a Down — is asserted in
+    /// `shed_app::roost`.
+    #[tokio::test]
+    async fn end_stream_pushes_the_terminal_frame_and_leaves_the_daemon_up() {
+        let fake = FakeRoost::start().await;
+        let conn = Conn::unix(fake.socket_path()).await.expect("dial");
+        let mut stream = conn.subscribe().await.expect("subscribe");
+
+        fake.end_stream("backend-switch");
+        match stream.next().await.expect("a frame") {
+            Some(EventFrame::Ended(ended)) => assert_eq!(ended.reason, "backend-switch"),
+            other => panic!("expected an Ended frame, got {other:?}"),
+        }
+
+        // Still up: a fresh dial identifies, which `stop()` would have latched
+        // away.
+        let mut after = Conn::unix(fake.socket_path()).await.expect("re-dial");
+        assert_eq!(
+            after.session_identify().await.expect("identify").session_id,
+            fake.session_id()
+        );
     }
 
     /// A UI socket has no session state at all, so it takes a write and ignores
@@ -1336,32 +1582,9 @@ mod tests {
     /// unfiltered stream instead.
     #[tokio::test]
     async fn a_filtered_subscribe_is_refused_rather_than_served_unfiltered() {
-        use tokio::io::AsyncBufReadExt as _;
-
         let fake = FakeRoost::start().await;
-        let stream = tokio::net::UnixStream::connect(fake.socket_path())
-            .await
-            .expect("dial");
-        let (read, mut write) = tokio::io::split(stream);
-        let request = json!({
-            "id": "1",
-            "op": "events.subscribe",
-            "params": { "tab_id_filter": "5" },
-        });
-        write_line(&mut write, &request).await.expect("write");
-        let line = BufReader::new(read)
-            .lines()
-            .next_line()
-            .await
-            .expect("read")
-            .expect("a reply");
-        let reply: Value = serde_json::from_str(&line).expect("valid JSON");
-        assert_eq!(reply["ok"], json!(false), "{line}");
-        assert_eq!(
-            ServerCode::from_wire(reply["error"]["code"].as_str().unwrap_or_default()),
-            ServerCode::InvalidParam,
-            "{line}"
-        );
+        let reply = raw_call(&fake, "events.subscribe", json!({ "tab_id_filter": "5" })).await;
+        assert_eq!(refusal_code(&reply), ServerCode::InvalidParam, "{reply}");
         assert_eq!(
             fake.stream_count(),
             0,
@@ -1477,26 +1700,8 @@ mod tests {
 
     /// The `result` object of one hand-written `events.subscribe`.
     async fn raw_subscribe_ack(fake: &FakeRoost) -> Value {
-        use tokio::io::AsyncBufReadExt as _;
-
-        let stream = tokio::net::UnixStream::connect(fake.socket_path())
-            .await
-            .expect("dial");
-        let (read, mut write) = tokio::io::split(stream);
-        let request = json!({
-            "id": "1",
-            "op": "events.subscribe",
-            "params": { "tab_id_filter": "0" },
-        });
-        write_line(&mut write, &request).await.expect("write");
-        let line = BufReader::new(read)
-            .lines()
-            .next_line()
-            .await
-            .expect("read")
-            .expect("an ack");
-        let reply: Value = serde_json::from_str(&line).expect("valid JSON");
-        assert_eq!(reply["ok"], json!(true), "{line}");
+        let reply = raw_call(fake, "events.subscribe", json!({ "tab_id_filter": "0" })).await;
+        assert_eq!(reply["ok"], json!(true), "{reply}");
         reply["result"].clone()
     }
 

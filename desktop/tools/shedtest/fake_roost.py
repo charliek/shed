@@ -27,7 +27,7 @@ app never asks for a filtered subscribe or drives two connections at
 `session.set_agent_hooks` concurrently, so nothing else here would catch this
 file drifting).
 
-At session protocol 5 the wire it speaks is unowned — the lease, its takeover
+At session protocol 6 the wire it speaks is unowned — the lease, its takeover
 table and its one tombstone retired with generation 4 (roost#477) — so what is
 left to be faithful about is the stream:
 
@@ -45,6 +45,13 @@ left to be faithful about is the stream:
   the same tab, and the last writer wins — which is the one behaviour
   generation 5 actually changed and the one the deleted refusal table was
   standing in front of.
+* **`session.set_agent_hooks` validates its params the way roost does.**
+  Generation 6 made it a raise: `{agents, client}`, `deny_unknown_fields`, a
+  non-empty `agents` with no blank element. A fake that took the old
+  `{mode, skip}` shape would let a stale client pass here and fail on a real
+  host, so the two refusals roost spells out — `invalid-param` for a bad
+  `agents`/`client`, `unknown-field` for a retired key — are spelled out here
+  too.
 
 Every id on this wire is a **string-int64** (a JavaScript client cannot round an
 i64 through a `Number`); the control surface here takes plain ints and does the
@@ -55,14 +62,14 @@ wire it is on.
 
 | op | answer |
 |---|---|
-| `session.identify` | the vendored `.v5` result, with `session_protocol` / `session_id` / `started_at` from this fake's state (the compatibility gate's input); `unknown-op` on a UI socket |
+| `session.identify` | the vendored `.v6` result, with `session_protocol` / `session_id` / `started_at` from this fake's state (the compatibility gate's input); `unknown-op` on a UI socket |
 | `identify` | the vendored UI-socket result, verbatim |
 | `tab.list` | `{projects, revision}` — the SESSION variant; a UI socket omits `revision` ENTIRELY (it serves no stream, so it publishes no fence) |
 | `tab.dump` | `{cols, rows, cursor, rows_text}` from this tab's text; `not-found` for an unknown id |
 | `tab.open` | appends a tab built from the `tab.open` vector, commits a `tab.opened` batch, answers `{tab}`; the params are recorded for the test |
 | `tab.close` | removes the tab and commits a `tab.closed` batch; `not-found` for an unknown id |
 | `tab.write` | decode, then the tab (`not-found`); open to every connection, no authority to check; records the base64-decoded bytes |
-| `session.set_agent_hooks` | open to every connection, last writer wins; `unknown-op` on a UI socket |
+| `session.set_agent_hooks` | the generation-6 raise `{agents, client}`; open to every connection, last writer wins; `invalid-param` on a bad `agents`/`client`, `unknown-field` on a retired `mode`/`skip`/`lease`; `unknown-op` on a UI socket |
 | `events.subscribe` | the ack from the vendored vector with this fake's revision and `session_id`, then a one-way push stream; `invalid-param` for a non-zero `tab_id_filter`; `not-implemented` on a UI socket |
 | anything else | `unknown-op` |
 
@@ -120,31 +127,56 @@ _STREAM_IDLE_TICK = 0.05
 _STREAM_SEND_TICK = 0.05
 
 
-def _vector(name: str) -> dict:
-    """One vendored roost vector. See the README beside them: never semantically
-    edited, re-copied on a `roost-ipc` rev bump."""
+def vector(name: str) -> dict:
+    """One vendored roost vector, freshly parsed (so a caller may mutate it).
+
+    Public because it is the ONE way anything in this suite should reach the
+    vendored directory: the README beside those files keeps an inventory of
+    their readers, and a test that opens `VECTORS / ...` by hand is a reader
+    that inventory will not know about. See the README for the rest of the
+    rule: never semantically edited, re-copied on a `roost-ipc` rev bump.
+    """
     return json.loads((VECTORS / name).read_text())
 
 
 # roost keeps ONE `session.identify` vector per generation and shed vendors only
 # the current one — a protocol-2 or protocol-4 daemon is a CONTROL here
-# (`set_session_protocol`), not a second vector to keep in step.
-_SESSION_IDENTIFY = _vector("session.identify.response.v5.json")["result"]
-_IDENTIFY = _vector("identify.response.json")["result"]
-_TAB_LIST = _vector("tab.list.session.response.json")["result"]
-_TAB_OPEN = _vector("tab.open.response.json")["result"]["tab"]
-_ERROR = _vector("response.error.json")
-_SET_AGENT_HOOKS = _vector("session.set_agent_hooks.response.json")["result"]
-_EVENTS_SUBSCRIBE = _vector("events.subscribe.response.json")["result"]
-_EVENTS_BATCH = _vector("events.batch.json")
-_TAB_OPENED = _vector("tab.opened.event.json")
-_TAB_CLOSED = _vector("shed.tab.closed.event.json")
-_TAB_NOTIFICATION = _vector("shed.tab.notification.event.json")
-_AGENT_REPORT_CHANGED = _vector("agent_report.changed.event.json")
-_SESSION_STOPPING = _vector("session.stopping.event.json")
-_TABS_REORDERED = _vector("tabs.reordered.event.json")
-_PROJECTS_REORDERED = _vector("projects.reordered.event.json")
-_OPENCODE = _vector("shed.tab.list.opencode.finished.json")["result"]
+# (the `session_protocol` attribute), not a second vector to keep in step. A
+# generation bump renames the file and this import is what fails.
+_SESSION_IDENTIFY = vector("session.identify.response.v6.json")["result"]
+
+#: The session protocol this build of shed speaks, read off the vendored vector
+#: rather than typed — the Python twin of `roost_ipc::messages::
+#: SESSION_PROTOCOL_VERSION`. A generation bump moves the vector, and every
+#: Python assertion about the number moves with it for free.
+SESSION_PROTOCOL = _SESSION_IDENTIFY["session_protocol"]
+
+#: `shed_core::roost::bootstrap::ROOST_WIRED_AGENTS`, hand-carried — roost's
+#: five wireable adapters (`crates/roost-agent/src/lib.rs` `ALL_AGENTS`), which
+#: is what every shed client's `session.set_agent_hooks` raise carries.
+#:
+#: Order included: the raise is asserted by equality, not by set membership,
+#: because the wire bytes are what a real host decodes and a reordering is a
+#: diff worth seeing. Lives here rather than in either test module so the two
+#: Python copies cannot drift apart — the Rust twin is the pin that matters,
+#: and one Python echo of it is enough.
+ROOST_WIRED_AGENTS = ["claude", "codex", "cursor", "grok", "opencode"]
+_IDENTIFY = vector("identify.response.json")["result"]
+_TAB_LIST = vector("tab.list.session.response.json")["result"]
+_TAB_OPEN = vector("tab.open.response.json")["result"]["tab"]
+_ERROR = vector("response.error.json")
+_SET_AGENT_HOOKS = vector("session.set_agent_hooks.response.json")["result"]
+_EVENTS_SUBSCRIBE = vector("events.subscribe.response.json")["result"]
+_EVENTS_BATCH = vector("events.batch.json")
+_TAB_OPENED = vector("tab.opened.event.json")
+_TAB_CLOSED = vector("shed.tab.closed.event.json")
+_TAB_NOTIFICATION = vector("shed.tab.notification.event.json")
+_AGENT_REPORT_CHANGED = vector("agent_report.changed.event.json")
+_SESSION_STOPPING = vector("session.stopping.event.json")
+_STREAM_ENDED = vector("stream.ended.event.json")
+_TABS_REORDERED = vector("tabs.reordered.event.json")
+_PROJECTS_REORDERED = vector("projects.reordered.event.json")
+_OPENCODE = vector("shed.tab.list.opencode.finished.json")["result"]
 
 
 def _first_owned_tab(listing: dict) -> dict:
@@ -657,6 +689,23 @@ class FakeRoost:
             envelope["data"]["project_ids"] = [p["id"] for p in self._projects]
             self._commit([envelope])
 
+    def end_stream(self, reason: str = "backend-switch") -> None:
+        """roost's OTHER terminal control frame, `stream.ended`.
+
+        Pushes the envelope and **nothing else** — no hang-up, no latch, no
+        revision bump. That is what makes it different from `stop()`: a client
+        must answer this with a *resync*, and a fake that also closed the
+        connection would make every client pass, because the EOF alone is
+        already a resync.
+
+        The twin of `testing.rs::end_stream`. Built from roost's own vendored
+        envelope, like every other frame this fake pushes.
+        """
+        with self._lock:
+            envelope = copy.deepcopy(_STREAM_ENDED)
+            envelope["data"]["reason"] = reason
+            self._push(envelope)
+
     def stop(self) -> None:
         """roost's `session.stopping`: every stream gets the terminal
         `session.stopping{reason: "stop"}`, every connection is hung up, and the
@@ -990,18 +1039,53 @@ class FakeRoost:
         return {}
 
     def _set_agent_hooks(self, params: dict) -> dict:
-        """`session.set_agent_hooks {mode, skip, client}` (plan 019 §3.4).
+        """`session.set_agent_hooks {agents, client}` — the generation-6 raise.
 
-        roost's own order at generation 5: decode, barrier, handle. The
-        `AgentHooksAuthority` check that sat between the first two was deleted
-        with the lease, so this op WRITES FILES under the session user's home
-        for whichever same-UID client asked last.
+        roost's own order: decode (strict), validate the names, handle. The
+        `AgentHooksAuthority` check that generation 4 ran between the first two
+        was deleted with the lease, so this op WRITES FILES under the session
+        user's home for whichever same-UID client asked last.
+
+        The twin of `testing.rs`'s handler, refusal for refusal.
         """
         if self.ui_socket:
             raise _Refusal("unknown-op", "no such op: session.set_agent_hooks")
-        if params.get("mode") not in ("auto", "off"):
+        # `SessionSetAgentHooksParams` is `deny_unknown_fields`, so a
+        # generation-5 client's `mode`/`skip` never reaches roost's own
+        # validation at all — it is a decode refusal. Spelled out rather than
+        # folded into the `invalid-param` below, because "your client is too
+        # old" and "your list is malformed" are different bugs.
+        for retired in ("mode", "skip", "lease"):
+            if retired in params:
+                raise _Refusal(
+                    "unknown-field",
+                    f"session.set_agent_hooks: unknown field `{retired}`",
+                )
+        # And then EVERY other unknown key, because `deny_unknown_fields` does
+        # not care which one it is. Named separately from the three above only
+        # for the message; a fake that let an unrecognised key through would be
+        # more permissive than the server it stands in for, which is the one way
+        # a fake can pass a client that a real host then refuses.
+        extra = next((k for k in params if k not in ("agents", "client")), None)
+        if extra is not None:
+            raise _Refusal(
+                "unknown-field",
+                f"session.set_agent_hooks: unknown field `{extra}`",
+            )
+        agents = params.get("agents")
+        if not isinstance(agents, list):
+            raise _Refusal("invalid-param", "session.set_agent_hooks needs an `agents` array")
+        # roost's `check_names`, in its order: a blank element is checked before
+        # emptiness, because a blank one can only be a client bug.
+        if any(not isinstance(a, str) or not a.strip() for a in agents):
             raise _Refusal("invalid-param",
-                           f"session.set_agent_hooks mode: {params.get('mode')!r}")
+                           "session.set_agent_hooks: `agents` carries an empty name")
+        if not agents:
+            raise _Refusal(
+                "invalid-param",
+                "session.set_agent_hooks requires a non-empty `agents`: a client with "
+                "nothing to raise does not send the op",
+            )
         if not isinstance(params.get("client"), str):
             raise _Refusal("invalid-param", "session.set_agent_hooks needs a `client`")
         self.agent_hooks_calls.append(copy.deepcopy(params))

@@ -6,7 +6,7 @@
     "refreshed": [],
     "removed": [],
     "skipped": [
-      { "agent": "cursor", "reason": "skip-list" },
+      { "agent": "cursor", "reason": "not allowed" },
       { "agent": "grok", "reason": "not installed" }
     ],
     "errors": []

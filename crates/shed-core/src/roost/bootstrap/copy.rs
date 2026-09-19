@@ -520,9 +520,11 @@ mod tests {
         );
         assert_eq!(
             protocol_report(TARGET, 2),
-            "roost-session on roost:popos/p019-a speaks protocol 2, this build speaks 5 — \
-             upgrade whichever is older; stop it there with `roostctl session stop` and \
-             reconnect once it is."
+            format!(
+                "roost-session on roost:popos/p019-a speaks protocol 2, this build speaks \
+                 {SESSION_PROTOCOL_VERSION} — upgrade whichever is older; stop it there with \
+                 `roostctl session stop` and reconnect once it is."
+            )
         );
         assert!(
             start_failed(TARGET, "it exited 1: boom", true)
@@ -665,12 +667,12 @@ mod tests {
     fn a_foreign_install_is_described_rather_than_claimed() {
         let staged = super::super::Identity {
             app_version: "0.0.19".into(),
-            session_protocol: 5,
+            session_protocol: SESSION_PROTOCOL_VERSION,
             libghostty_build: "ghostty-ours".into(),
         };
         let found = super::super::Identity {
             app_version: "0.0.20".into(),
-            session_protocol: 5,
+            session_protocol: SESSION_PROTOCOL_VERSION,
             libghostty_build: "ghostty-theirs".into(),
         };
         let failure = foreign_install(
@@ -683,12 +685,15 @@ mod tests {
         assert_eq!(failure.stage, Stage::PostCommit);
         assert_eq!(
             failure.message,
-            "the roost-session now at /home/shed/.local/bin/roost-session on \
-             roost:popos/p019-a is not the one shed just staged: it reports itself as \
-             roost-session 0.0.20 (session protocol 5), and shed staged roost-session 0.0.19 \
-             (session protocol 5). Another install landed there at the same moment. Shed left \
-             it alone rather than overwrite it, so its copy of the previous install is still \
-             at /home/shed/.local/bin/roost-session.bak.4242."
+            format!(
+                "the roost-session now at /home/shed/.local/bin/roost-session on \
+                 roost:popos/p019-a is not the one shed just staged: it reports itself as \
+                 roost-session 0.0.20 (session protocol {SESSION_PROTOCOL_VERSION}), and shed \
+                 staged roost-session 0.0.19 (session protocol {SESSION_PROTOCOL_VERSION}). \
+                 Another install landed there at the same moment. Shed left it alone rather \
+                 than overwrite it, so its copy of the previous install is still at \
+                 /home/shed/.local/bin/roost-session.bak.4242."
+            )
         );
         assert!(
             foreign_install(TARGET, "/x", &staged, &found, None)
@@ -720,7 +725,9 @@ mod tests {
         };
         assert_eq!(
             session_identity_detail(&session),
-            "it speaks session protocol 2, and this shed speaks 5"
+            format!(
+                "it speaks session protocol 2, and this shed speaks {SESSION_PROTOCOL_VERSION}"
+            )
         );
         assert!(
             identity_detail(Some(&binary)).starts_with(&session_identity_detail(&session)),

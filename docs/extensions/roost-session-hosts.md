@@ -26,7 +26,7 @@ decided in order, and the first rung that can answer wins:
    a *specific* binary — installing a different one instead would be worse than failing.
 2. **Sibling** — the `roost-session` sitting beside the client binary itself, **desktop only**.
    This requires the desktop to be running on Linux (there is no local candidate to compare
-   against on macOS) and a local `identify` against that sibling reporting session protocol 5 —
+   against on macOS) and a local `identify` against that sibling reporting session protocol 6 —
    the same protocol this build speaks.
 3. **Release asset** — a `roost-session-<version>-linux-<amd64|arm64>` tarball plus its
    `.sha256` sibling, fetched over HTTPS and checksum-verified, behind a version pin (below).
@@ -42,15 +42,15 @@ decided in order, and the first rung that can answer wins:
 ### The release rung is real code, but it has never run against a real release
 
 **`RELEASE_PIN` is `None` today, because no published roost release speaks session protocol
-5** — the latest, `0.0.19`, speaks protocol 2. This is checked against roost's own repository
+6** — the latest, `0.0.19`, speaks protocol 2. This is checked against roost's own repository
 at the time of writing, not assumed. The message a client shows when every rung has failed:
 
-> no roost release speaking session protocol 5 is published yet (the latest, 0.0.19, speaks
-> 2). On a Linux machine with a protocol-5 roost installed the desktop uses that roost-session;
-> otherwise point `ROOST_SESSION_INSTALL_BIN` at a protocol-5 build. `<target>` was left
+> no roost release speaking session protocol 6 is published yet (the latest, 0.0.19, speaks
+> 2). On a Linux machine with a protocol-6 roost installed the desktop uses that roost-session;
+> otherwise point `ROOST_SESSION_INSTALL_BIN` at a protocol-6 build. `<target>` was left
 > untouched.
 
-Flipping `RELEASE_PIN` once roost ships a protocol-5 release is a one-line change (it sits
+Flipping `RELEASE_PIN` once roost ships a protocol-6 release is a one-line change (it sits
 beside the version/protocol pair the message above is built from). **Say this plainly: the
 release-asset rung is implemented and unit-tested against a loopback HTTP fixture, but it has
 never been exercised against a real, published roost release, and nothing in this codebase
@@ -66,7 +66,7 @@ read as a closed decision.
 
 roost's own UI refuses a `roost-session` unless its version, protocol, and embedded ghostty
 snapshot all match exactly. shed's compatibility rule is narrower and different: **a target is
-compatible if its `session.identify` reports `session_protocol == 5`, full stop.** shed does
+compatible if its `session.identify` reports `session_protocol == 6`, full stop.** shed does
 not build roost, never negotiates a ghostty snapshot, and cannot know a future release's exact
 build fingerprint in advance — the protocol number is the one thing this codebase can commit
 to checking. The accepted, documented consequence: a roost UI that later connects to a
@@ -80,7 +80,7 @@ something shed considers perfectly fine.
 | Nothing there | **Install**, then **Start** |
 | A stale or incompatible binary, nothing running | **Update** (backup + replace) then **Start** |
 | A compatible binary, nothing running | **Start** |
-| A session already running protocol 5 | Nothing — status only |
+| A session already running protocol 6 | Nothing — status only |
 | A session running any other protocol | **Report only.** Never stopped, never restarted. |
 | No source available (see the ladder above) | Unavailable — the ladder's own sentence in place of a button |
 
@@ -88,6 +88,13 @@ Every one of these is preceded by a fresh **probe** (read-only: OS/arch check, c
 binaries, session state) and, for Install/Update, a **consent step** naming what will happen,
 where, and where the bytes come from — nothing is downloaded or written before that consent is
 given, and the install re-probes and refuses if the target changed since the card was shown.
+
+**The protocol-5 case, specifically.** A shed at protocol 6 that finds a session already
+running the previous generation, protocol 5, lands on the "any other protocol" row above: it
+refuses that session by name, naming both protocol numbers in the report and telling you which
+side to upgrade — the same mismatch report any other protocol disagreement gets. It never stops
+or restarts the running session to do this (pin P6, above); the report is the only action
+taken.
 
 ## The rollback promise, stated exactly as narrow as it is
 
@@ -114,21 +121,53 @@ backup. After that line, a failure is reported honestly, but the new binary stay
 ## Hooks: the step that makes the payoff real
 
 After a **Start that the client itself performed**, it sends
-`session.set_agent_hooks {mode: "auto", skip: [], client: "shed-desktop"}` (or `"shed-mobile"`)
-to the fresh session — one wire call, nothing in front of it. Session protocol 5 dropped the
-lease entirely, so there is no `session.connect` to open first and nothing to hold or lose
-before sending it.
+`session.set_agent_hooks {agents: ROOST_WIRED_AGENTS, client: "shed-desktop"}` (or
+`"shed-mobile"`) to the fresh session — one wire call, nothing in front of it. Session
+protocol 5 dropped the lease entirely, so there is no `session.connect` to open first and
+nothing to hold or lose before sending it.
+
+**At session protocol 6 this op is a raise, and a raise only ever widens.** `ROOST_WIRED_AGENTS`
+is shed's own constant naming roost's whole wireable set, by value — exactly five names,
+`claude`, `codex`, `cursor`, `grok`, `opencode` — and shed sends that same array on every call.
+The host unions those names into its own `agent-hooks` key; there is no destructive direction
+left on this wire. Generation 5's `{mode: "auto", skip: [...]}` shape, and the `mode: "off"`
+"come clean" spelling that went with it, are both gone — nothing replaced them, because roost
+made removal a deliberate local act on the host (`roostctl agent uninstall`), not something a
+client can request over the wire.
+
+**A raise re-widens — say this plainly, because it surprises people.** If someone narrows a
+host's `agent-hooks` key by hand between two of shed's watcher cycles (`roostctl agent set`,
+say), shed's very next cycle puts every one of the five names right back. That is not a bug:
+shed re-sends the identical raise unconditionally, every cycle, with no memory of what the host
+looked like a moment ago. If you want a host wired to fewer than everything, doing it by hand on
+the host does not stick against a shed that is still watching it — removal has to stay a
+deliberate, one-time local act, done knowing shed will not fight you over it as long as you stop
+pointing a shed client at that host afterward.
+
+**Unknown names come back verbatim, never filtered.** An agent name the host has no adapter for
+at all lands in the result's `skipped` list with reason `"unknown"`, exactly as the host worded
+it, and the rest of the raise still applies — the UI shows that row as-is rather than hiding or
+rewording it. Seeing `skipped: "unknown"` for a name that should be known is the drift signal
+that roost renamed or dropped an adapter shed's constant does not know about yet.
+
+**gx is a special case worth knowing before you hit it live.** shed never sends `gx` — gx is the
+owner's grok fork, and it shares `$GROK_HOME` with `grok` itself, so roost reports both under
+`source: "grok"` and wiring `grok` wires gx too. But roost's installed-test for `grok` is
+`$GROK_HOME` existing as a directory — so **a host with gx on `PATH` but no `~/.grok` yet
+reports `grok` as `skipped: "not installed"`** until gx has actually run once and created that
+directory. This is the single most likely surprise on a fresh live host: gx being on `PATH`
+does not mean roost sees it as installed yet.
 
 **This is a dotfile mutation, performed by the *host* session, not by shed.** shed sends one
 wire call; `roost-session` on the target is the process that writes into the configuration
-files of whichever agents it finds already configured there — `claude`, `codex`, `cursor`,
-`opencode`, and `grok` — and nothing else. The consent copy shown before Install/Update/Start
-names this plainly: "roost-session will also wire its hooks into the agents already configured
-there — claude, codex, cursor, opencode, grok — and nothing else."
+files of whichever of those five agents it finds already configured there, and nothing else.
+The consent copy shown before Install/Update/Start names this plainly: "roost-session will also
+wire its hooks into the agents already configured there — claude, codex, cursor, opencode,
+grok — and nothing else."
 
-**When it recurs:** `mode: "auto"` only wires an agent whose configuration directory exists
-*at that moment*. An agent set up later is not retroactively wired by this one call — it gets
-wired the next time hooks are (re)sent, which is:
+**When it recurs:** the raise only wires an agent whose configuration directory exists *at that
+moment*. An agent set up later is not retroactively wired by this one call — it gets wired the
+next time hooks are (re)sent, which is:
 
 - every `shed start` (each one performs a fresh Start-and-hooks cycle if a bootstrap runs), and
 - every successful cycle of the watcher for a target this client bootstrapped — re-sent on
@@ -136,11 +175,12 @@ wired the next time hooks are (re)sent, which is:
 
 **One op, no token, last writer wins.** Every client that wires a target sends the identical
 call — the desktop, the phone, and any roost UI that connects all say `set_agent_hooks
-{mode: "auto"}` — and the host session applies whichever one it heard most recently. That is
-the design, not a gap in it: one user owns every client that talks to their sheds, so hook
-wiring is open to all of them and none of them needs to ask first. There is no session-level
-owner left to displace and nothing a second client could "take over" from a first — `roostctl
-agent status` on the host is where you read which client wired an agent's hooks last.
+{agents: ROOST_WIRED_AGENTS}` — and the host session applies whichever one it heard most
+recently. That is the design, not a gap in it: one user owns every client that talks to their
+sheds, so hook wiring is open to all of them and none of them needs to ask first. There is no
+session-level owner left to displace and nothing a second client could "take over" from a
+first — `roostctl agent status` on the host is where you read which client wired an agent's
+hooks last.
 
 ## The PATH warning: named, never acted on
 
@@ -166,13 +206,13 @@ The desktop app and the mobile app can both bootstrap the same target. Nothing c
 between them beyond the filesystem itself: concurrent installs are **last-writer-wins**, using
 the same `.bak.<pid>` backup-chain naming roost's own installer already uses, with the
 post-commit identify as the only detector that something unexpected landed (a different
-protocol-5 build than the one this client just streamed). This is treated as the *normal*
+protocol-6 build than the one this client just streamed). This is treated as the *normal*
 case, not a hazard to guard against further — a person with both apps open, bootstrapping the
 same shed from their phone and their laptop, is exactly the scenario this is built for.
 
 ## A read-only example: mini3
 
-A target that is already running a `roost-session` speaking a protocol other than 5 (mini3, at
+A target that is already running a `roost-session` speaking a protocol other than 6 (mini3, at
 the time of writing, runs a release build of protocol 2) gets the **Report** row from the plan
 matrix above and nothing else — probing it is read-only, and its daemon's start time is
 unaffected before and after a probe. This is pin P6: an existing session is reported, never

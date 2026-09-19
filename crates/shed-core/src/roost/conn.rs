@@ -28,10 +28,9 @@ use std::path::{Path, PathBuf};
 
 use roost_ipc::client::{EventFrame, EventStream, ServerCode};
 use roost_ipc::messages::{
-    ops, AgentHooksMode, IdentifyParams, IdentifyResult, SessionIdentify, SessionIdentifyParams,
-    SessionSetAgentHooksParams, SessionSetAgentHooksResult, Tab, TabCloseParams, TabDumpParams,
-    TabDumpResult, TabListResult, TabOpenParams, TabOpenResult, TabWriteParams, WireTabRef,
-    SESSION_PROTOCOL_VERSION,
+    ops, AgentHooksOutcome, IdentifyParams, IdentifyResult, SessionIdentify, SessionIdentifyParams,
+    SessionSetAgentHooksParams, Tab, TabCloseParams, TabDumpParams, TabDumpResult, TabListResult,
+    TabOpenParams, TabOpenResult, TabWriteParams, WireTabRef, SESSION_PROTOCOL_VERSION,
 };
 use roost_ipc::{ClientError, IpcClient};
 use tokio::net::{TcpStream, UnixStream};
@@ -158,10 +157,12 @@ impl Conn {
     ///   and its parameter shapes; a client that ignores it does not fail until
     ///   it sends a request the peer's generation refuses to decode.
     ///
-    /// **At generation 5 the integer is the whole negotiation.** roost's
-    /// `features` list retired with the lease — there is no additive-op channel
-    /// beside the number any more, so equality here is the only compatibility
-    /// question there is to ask.
+    /// **The integer is the whole negotiation.** roost's `features` list retired
+    /// with the lease at generation 5 — there is no additive-op channel beside
+    /// the number any more, so equality here is the only compatibility question
+    /// there is to ask. (Generation 6's `session.identify` gained `ops` and
+    /// `persist_error`; both are additive reports, not a negotiation, and shed
+    /// reads neither.)
     ///
     /// The returned [`SessionIdentify`] identifies the **daemon instance**:
     /// `session_id` changes on restart and `revision` resets with it, which is
@@ -253,7 +254,7 @@ impl Conn {
     /// `tab.write` — raw bytes into a tab's PTY, base64 on the wire. Byte-exact:
     /// this is how a prompt gets typed at an agent.
     ///
-    /// **Unowned at session protocol 5.** Generation 4 gated a write behind the
+    /// **Unowned since session protocol 5.** Generation 4 gated a write behind the
     /// single interactive lease — `connect-required` without one, `taken-over`
     /// on a displaced one. roost retired that token, so a write is now open to
     /// every same-UID client and the request carries nothing but the tab and the
@@ -281,8 +282,8 @@ impl Conn {
         Ok(())
     }
 
-    /// `session.set_agent_hooks` — ask the host session to bring its agent hook
-    /// entries in line with this client's configuration.
+    /// `session.set_agent_hooks` — ask the host session to **raise** its
+    /// `agent-hooks` key to at least the names this client allows.
     ///
     /// **The host does the writing.** roost's session links
     /// `roost-agent-install` and edits the dotfiles under its own `$HOME`;
@@ -290,32 +291,37 @@ impl Conn {
     /// what makes this op the right way to wire hooks and a hand-rolled `ssh`
     /// heredoc the wrong one.
     ///
-    /// **Open to every same-UID client at session protocol 5.** Generation 4
-    /// gated this behind the interactive lease, so a second client had to take
-    /// the token away from the first before it could wire anything; roost
-    /// deleted that authority check outright. The op is declarative — the host
-    /// brings its entries in line with the request, writing nothing for an agent
-    /// whose config directory does not exist — so the last writer wins and
-    /// `client` is the record of who that was. One caller should be
-    /// [`bootstrap::wire_agent_hooks`](crate::roost::bootstrap::wire_agent_hooks),
-    /// which is shed's one composition of it.
+    /// **A raise, never a narrowing, at session protocol 6.** The two-mode
+    /// dialogue is gone: there is no `auto`, no `off`, and no `skip` list, so
+    /// there is no spelling of "take these back out" on the wire at all. The
+    /// host unions `agents` into its own key and writes what it can; a name it
+    /// has no adapter for comes back in `skipped` with reason `"unknown"` and
+    /// the rest are still wired. `removed` is always empty from this op.
+    /// Removal is a deliberate local act on the host (`roostctl agent
+    /// uninstall`) — and because shed re-sends this on every watcher cycle, a
+    /// host-side narrowing of one of [`ROOST_WIRED_AGENTS`] is re-widened by
+    /// the next cycle.
     ///
-    /// `mode: Off` **removes** roost's entries rather than meaning "do nothing":
-    /// a host has no config of its own to consult, so the client is the
-    /// authority and `off` on the client means the host comes clean.
+    /// Still **open to every same-UID client**, as generation 5 made it:
+    /// generation 4 gated it behind the interactive lease, roost deleted that
+    /// authority check outright, and `client` is the record of who asked last.
+    /// The one caller should be
+    /// [`bootstrap::wire_agent_hooks`](crate::roost::bootstrap::wire_agent_hooks),
+    /// which is shed's one composition of it and the one place the name list
+    /// is decided.
+    ///
+    /// [`ROOST_WIRED_AGENTS`]: crate::roost::bootstrap::ROOST_WIRED_AGENTS
     pub async fn session_set_agent_hooks(
         &mut self,
-        mode: AgentHooksMode,
-        skip: &[String],
+        agents: &[&str],
         client: &str,
-    ) -> Result<SessionSetAgentHooksResult, RoostError> {
+    ) -> Result<AgentHooksOutcome, RoostError> {
         Ok(self
             .client
             .call(
                 ops::SESSION_SET_AGENT_HOOKS,
                 SessionSetAgentHooksParams {
-                    mode,
-                    skip: skip.to_vec(),
+                    agents: agents.iter().map(|name| name.to_string()).collect(),
                     client: client.to_string(),
                 },
             )
@@ -350,7 +356,7 @@ impl Conn {
     /// Consumes the `Conn` because that is `IpcClient`'s contract: the ack is
     /// the last request/response frame the connection will ever carry.
     ///
-    /// **A fresh subscribe takes no arguments at session protocol 5.** The lease
+    /// **A fresh subscribe takes no arguments since session protocol 5.** The lease
     /// that used to classify a stream as driver or observer is gone, and with it
     /// the classification: every subscriber now receives every frame, including
     /// `tab.effect`. shed's fold ignores effects because a watcher views no tab
@@ -410,10 +416,15 @@ impl RoostEventStream {
         self.stream.session_id()
     }
 
-    /// Why the stream ended, once the terminal envelope has arrived. At session
-    /// protocol 5 the only reachable reason is `"stop"`, and now structurally so
-    /// rather than by convention: roost's `CloseReason` has exactly one variant,
-    /// so the session stopping is the only thing that ends a stream.
+    /// Why the stream ended, once the terminal envelope has arrived — `"stop"`,
+    /// the session shutting down.
+    ///
+    /// **Not the only terminal envelope any more.** Generation 6 added
+    /// `stream.ended` ([`EventFrame::Ended`]), which a roost **UI** socket writes
+    /// when it moves its tabs to another local backend. A session socket never
+    /// writes it, so this accessor stays the one that matters here; the frame is
+    /// handled where it arrives, in `shed_app::roost`'s stream loop, as a resync
+    /// rather than a Down.
     pub fn stopping_reason(&self) -> Option<&str> {
         self.stream.stopping_reason()
     }
@@ -621,42 +632,65 @@ mod tests {
         assert_eq!(sent, expected, "the vendored tab.dump request vector");
     }
 
-    /// `session.set_agent_hooks` goes out as roost's own request, key for key.
+    /// **The raise shed actually sends**, pinned against roost's own request
+    /// vector everywhere except the one key that is shed's own decision.
     ///
     /// `deny_unknown_fields` on roost's side means an extra key is a refusal and
     /// a missing `client` is a decode failure, so the vendored request vector is
     /// the contract: this is the op that makes the host edit dotfiles, and a
     /// request shed cannot get right is a payoff shed never delivers.
+    ///
+    /// `agents` is compared **separately**, against [`ROOST_WIRED_AGENTS`]
+    /// rather than against the vector. roost's vector is an EXAMPLE of the shape
+    /// (two names, a laptop's own allow-list); the five names shed sends are
+    /// shed's decision, and re-vendoring the file to make a whole-object compare
+    /// work would be a semantic edit of a copy that must stay byte-for-byte
+    /// roost's. So the shape is pinned by the vector and the content by the
+    /// constant, and neither pretends to be the other.
+    ///
+    /// Driven through [`wire_agent_hooks`] rather than through the `Conn` method
+    /// with a hand-picked list, because the list IS what is under test.
     #[tokio::test]
-    async fn session_set_agent_hooks_matches_the_vendored_request() {
+    async fn the_raise_matches_the_vendored_request_except_for_its_own_agents() {
+        use crate::roost::bootstrap::{wire_agent_hooks, ROOST_WIRED_AGENTS};
+
         let expected = vector_params(VECTOR_SET_AGENT_HOOKS_REQUEST);
-        let skip: Vec<String> = expected["skip"]
-            .as_array()
-            .expect("the vector's skip list")
-            .iter()
-            .map(|value| value.as_str().expect("a name").to_string())
-            .collect();
+        let client = expected["client"].as_str().expect("the vector's client");
 
         let server = OneShot::start(serde_json::json!({
             "wired": [], "refreshed": [], "removed": [], "skipped": [], "errors": []
         }))
         .await;
         let mut conn = Conn::unix(&server.socket).await.expect("dial");
-        conn.session_set_agent_hooks(
-            AgentHooksMode::Auto,
-            &skip,
-            expected["client"].as_str().expect("the vector's client"),
-        )
-        .await
-        .expect("set_agent_hooks");
+        let result = wire_agent_hooks(&mut conn, client).await;
+        assert!(result.applied(), "{result:?}");
         drop(conn);
 
         let sent = server.captured_params().await;
         assert!(
             sent.get("lease").is_none(),
-            "the op is open to every same-UID client at generation 5; no lease is sent: {sent}"
+            "the op is open to every same-UID client; no lease is sent: {sent}"
         );
-        assert_eq!(sent, expected);
+        assert!(
+            sent.get("mode").is_none() && sent.get("skip").is_none(),
+            "the two-mode dialogue retired at generation 6, and roost's params are \
+             deny_unknown_fields: {sent}"
+        );
+        assert_eq!(
+            sent["agents"],
+            serde_json::json!(ROOST_WIRED_AGENTS),
+            "the raise carries shed's own five names, not the vector's example"
+        );
+
+        // Everything else, key for key, against roost's bytes.
+        let strip = |mut params: serde_json::Value| {
+            params
+                .as_object_mut()
+                .expect("params is an object")
+                .remove("agents");
+            params
+        };
+        assert_eq!(strip(sent), strip(expected));
     }
 
     /// Both reaches to one fake, labelled — dialed through [`Conn::endpoint`],
@@ -760,7 +794,7 @@ mod tests {
         }
     }
 
-    /// **A write needs nothing but the connection** at session protocol 5 — the
+    /// **A write needs nothing but the connection** since session protocol 5 — the
     /// generation-4 lease that made `tab_write` a two-op dialogue is gone, and
     /// two connections writing to the same tab both land.
     ///
@@ -862,7 +896,7 @@ mod tests {
             Err(RoostError::ProtocolMismatch { theirs, ours }) => {
                 assert_eq!(theirs, 2);
                 assert_eq!(ours, SESSION_PROTOCOL_VERSION);
-                assert_eq!(ours, 5, "this build speaks roost's post-lease generation");
+                assert_eq!(ours, 6, "this build speaks roost's raise generation");
             }
             other => panic!("expected ProtocolMismatch, got {other:?}"),
         }
@@ -887,6 +921,37 @@ mod tests {
                     "what plan 019 installed on every host it touched"
                 );
                 assert_eq!(ours, SESSION_PROTOCOL_VERSION);
+            }
+            other => panic!("expected ProtocolMismatch, got {other:?}"),
+        }
+    }
+
+    /// **The newly interesting number, again.** Every host plan 020's desktop
+    /// bootstrapped is running a protocol-**5** `roost-session`, so 5 is now
+    /// what 4 was one generation ago: the refusal a real user meets the day this
+    /// build ships, which must come out named rather than as a limp.
+    ///
+    /// The `5` here is a negative-test datum and does not move with the
+    /// generation. It is deliberately one BELOW the pin — the direction a
+    /// gate written as `>=` would wave through, and the one a gate written as
+    /// equality refuses. `session.identify` is the whole handshake at
+    /// generation 6, so there is no feature list to fall back on.
+    #[tokio::test]
+    async fn a_protocol_five_daemon_is_refused_by_name() {
+        let fake = FakeRoost::start().await;
+        fake.set_session_protocol(5);
+        let mut conn = Conn::unix(fake.socket_path()).await.expect("dial");
+        match conn.session_identify().await {
+            Err(RoostError::ProtocolMismatch { theirs, ours }) => {
+                assert_eq!(
+                    theirs, 5,
+                    "what plan 020 installed on every host it touched"
+                );
+                assert_eq!(ours, SESSION_PROTOCOL_VERSION);
+                assert!(
+                    theirs < ours,
+                    "one BELOW the pin: an inequality gate would serve this one"
+                );
             }
             other => panic!("expected ProtocolMismatch, got {other:?}"),
         }

@@ -68,8 +68,8 @@
 //! rule, and may well offer to reinstall it. That is not a bug in either side —
 //! it is two clients with different needs answering different questions, and the
 //! roost UI's answer is the conservative one. shed's install is still the right
-//! thing to have done: a protocol-5 session is a session shed can read, and
-//! shed's whole claim on the host is reading it.
+//! thing to have done: a session speaking the protocol this build speaks is a
+//! session shed can read, and shed's whole claim on the host is reading it.
 //!
 //! ## The rollback promise, and exactly how far it reaches
 //!
@@ -250,7 +250,7 @@ pub mod source;
 mod tests;
 
 pub use copy::{BootstrapFailure, Stage};
-pub use hooks::{wire_agent_hooks, HooksError, HooksResult, HooksSkip};
+pub use hooks::{wire_agent_hooks, HooksError, HooksResult, HooksSkip, ROOST_WIRED_AGENTS};
 pub use machines::{InstallMachine, InstallRequest, Installed, ProbeMachine};
 pub use plan::{fingerprint, Identity, Plan, Probe, ProbeOutcome, SessionIdentity, SessionState};
 pub use source::{
