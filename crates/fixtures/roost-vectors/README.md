@@ -91,16 +91,32 @@ their protocol-2 provenance because the `Tab` / `Project` / `tab.dump` shapes ar
 semantics and the protocol-5 bump retired it, and neither touched the workspace
 shapes.
 
-`shed.session.identify.json` was **re-recorded** on 2026-09-12 from a live
-protocol-5 daemon (release build of rev `c1bfe88…`, `roost-session` 0.0.19,
-started and stopped for this capture), because that reply embeds the generation
-integer and a recording from an older generation is no longer what shed's gate
-sees. It was re-recorded rather than hand-edited for a reason the hand-edit would
-have hidden: a protocol-5 daemon answers `payload_kinds` as
-`["ghostty-snapshot", "vt"]`, and the protocol-4 recording carried only
-`["ghostty-snapshot"]`. An integer edited by hand would have left that field
-quietly wrong. The previous recording, for the record, was taken on 2026-09-07
-from the protocol-4 daemon at the previously-pinned rev.
+`shed.session.identify.json` is **re-recorded on every generation bump**, because
+that reply embeds the generation integer and a recording from an older generation
+is no longer what shed's gate sees. The current one was taken on 2026-09-19 from a
+live **protocol-6** daemon (release build of rev `ee71e44…`, `roost-session`
+0.0.19) that shed's own desktop bootstrap installed and started on a scratch shed —
+so it is a recording of the path a user actually walks, not of a daemon started by
+hand for the capture.
+
+**Re-recorded, never hand-edited**, and each bump has justified that: the 4 → 5
+re-record revealed that a protocol-5 daemon answers `payload_kinds` as
+`["ghostty-snapshot", "vt"]` where the protocol-4 recording carried only
+`["ghostty-snapshot"]`; the 5 → 6 one added `ops` (27 entries — the op list that
+daemon would actually dispatch), which no integer edit would have produced. A
+hand-edited generation number would have left both quietly wrong.
+
+**It lags the pin by one commit, on purpose, and a tripwire bounds that.** A re-pin
+is a source edit, but re-recording needs a live daemon of the new generation — a
+live leg, which lands later. `crates/shed-core/src/roost/model.rs`'s test module
+carries `RECORDED_GENERATION` for what this file holds, asserted against it at
+runtime, plus a compile-time assertion that the recording may trail
+`SESSION_PROTOCOL_VERSION` by at most one generation. Refresh the recording and the
+runtime assertion goes red until the constant moves; skip a second bump and the
+build fails. Neither direction can pass by drifting.
+
+Earlier recordings, for the record: 2026-09-12 from the protocol-5 daemon at
+`c1bfe88…`, and 2026-09-07 from the protocol-4 daemon at the rev pinned then.
 
 `shed.tab.closed.event.json` and `shed.tab.notification.event.json` are recorded
 too, and they exist because roost publishes **no** vector for either envelope
