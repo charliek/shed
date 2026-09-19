@@ -40,8 +40,13 @@ nav = [
       { "v0.4 → v0.5" = "upgrades/v0.4-to-v0.5.md" },
       { "v0.5.1 → v0.5.2" = "upgrades/v0.5.1-to-v0.5.2.md" },
       { "v0.5.7 → v0.5.8" = "upgrades/v0.5.7-to-v0.5.8.md" },
+      { "v0.5.9 → v0.6.0" = "upgrades/v0.5.9-to-v0.6.0.md" },
+      { "v0.6.1 → v0.6.2" = "upgrades/v0.6.1-to-v0.6.2.md" },
       { "v0.6 → v0.7" = "upgrades/v0.6-to-v0.7.md" },
       { "v0.7.0 → v0.7.1" = "upgrades/v0.7.0-to-v0.7.1.md" },
+      { "v0.7.1 → v0.7.2" = "upgrades/v0.7.1-to-v0.7.2.md" },
+      { "v0.7.3 → v0.7.4" = "upgrades/v0.7.3-to-v0.7.4.md" },
+      { "v0.8.2 → v0.9.0" = "upgrades/v0.8.2-to-v0.9.0.md" },
     ] },
   ] },
   { "Tutorials" = [
