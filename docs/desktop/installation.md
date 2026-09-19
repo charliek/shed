@@ -73,23 +73,32 @@ its shared Rust core is the sibling `crates/` workspace. Every `make` target bel
 the monorepo root via the `desktop-` passthrough (`make desktop-<target>`) or directly with
 `make -C desktop <target>`.
 
-**macOS** — prerequisites: Xcode 16+ (Swift 6 toolchain), Rust stable ≥1.85.
+**macOS** — prerequisites: Rust stable ≥1.85, Node 20+.
+
+This builds the **shipped** client, the Tauri app:
 
 ```bash
 git clone https://github.com/charliek/shed
 cd shed
-make -C desktop bundle     # builds desktop/build/ShedDesktop.app (ad-hoc signed)
+make -C desktop tauri-bundle-mac   # desktop/build/ShedDesktop.app (ad-hoc signed)
 open desktop/build/ShedDesktop.app
 ```
 
-The bundle embeds the `shedctl` CLI at
-`desktop/build/ShedDesktop.app/Contents/Resources/bin/shedctl`. `make -C desktop dmg` packages
-a release bundle into `desktop/build/ShedDesktop-<version>.dmg`. To produce a notarizable
-build locally, set the signing identity:
+`make -C desktop tauri-dmg-mac` packages it into
+`desktop/build/ShedDesktop-<version>.dmg`. To produce a notarizable build locally, set the
+signing identity:
 
 ```bash
-SHED_DESKTOP_DEVELOPER_ID_IDENTITY="Developer ID Application: …" ./desktop/scripts/bundle.sh release
+SHED_DESKTOP_DEVELOPER_ID_IDENTITY="Developer ID Application: …" make -C desktop tauri-dmg-mac
 ```
+
+!!! note "The Swift app still builds, but is not what ships"
+
+    The original SwiftUI menu-bar client remains in the tree and is still tested in CI, but
+    its release job retired in 0.9.0 — `make -C desktop bundle` builds **that** app, not the
+    one on the releases page. Building it needs Xcode 16+ (Swift 6 toolchain). Use it only if
+    you are working on the Swift sources themselves; see
+    [the desktop RELEASING notes](https://github.com/charliek/shed/blob/main/desktop/RELEASING.md).
 
 **Linux** — the `.deb` is built (in Docker, to pin the WebKitGTK toolchain) with:
 

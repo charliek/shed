@@ -143,9 +143,12 @@ registries are off by default — see the
 ## 4. Install shed-desktop
 
 Download the latest `ShedDesktop-<version>.dmg` from the
-[releases page](https://github.com/charliek/shed-desktop/releases), open it, and
-drag **ShedDesktop.app** to Applications. Builds are signed ad-hoc (not yet
-notarized), so clear the quarantine flag once:
+[releases page](https://github.com/charliek/shed/releases), open it, and drag
+**ShedDesktop.app** to Applications.
+
+Release builds are signed and notarized, so they open normally. If you built the
+app yourself it is signed ad-hoc instead, and macOS quarantines it until you
+clear the flag once:
 
 ```bash
 xattr -dr com.apple.quarantine /Applications/ShedDesktop.app

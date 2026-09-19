@@ -297,6 +297,16 @@ appcast, debs, apt dispatch, rc-tag rehearsals) live in
    fails loudly on a tag push and warns on a dispatch republish — see
    the retired-component note under "Component selection".)
 
+   **One republish is deliberately NOT idempotent, and is refused.** The
+   macOS client changed implementation at **0.9.0** (Swift → Tauri), so
+   dispatching an older stable tag would build that tag's Tauri target,
+   `--clobber` the Swift DMG its users already installed, and re-sign
+   that version's appcast entry — same input, different application. The
+   `desktop-macos` job's first step detects a pre-0.9.0 dispatch and
+   **fails loudly** rather than shipping a different client into an
+   existing release. Image republishes of those tags are unaffected
+   (separate jobs); if you need one, re-run the image jobs alone.
+
    The `sync-version` job that existed pre-migration is **removed** —
    plugin.json is now bumped locally by the release skill before
    tagging, matching the convention.

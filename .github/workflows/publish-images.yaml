@@ -114,7 +114,11 @@ name: Publish Images and Release
 #
 # workflow_dispatch republishes re-run the image-publish chain (when
 # ship_server) and, for desktop-shipping tags, the desktop asset jobs —
-# both idempotent (--clobber uploads, appcast dedupe). The `release` job
+# both idempotent (--clobber uploads, appcast dedupe) **for tags at or
+# after v0.9.0**. Before that the mac client was the Swift app, so
+# republishing an older tag would overwrite its Swift DMG with a Tauri
+# one and re-sign that version's appcast entry: same input, different
+# client. desktop-macos guards against it and fails loudly. The `release` job
 # stays gated on tag-push events so manual republishes never cut a new
 # GitHub Release or re-push formulas/debs. Desktop jobs DO run on a
 # dispatch of a desktop-shipping tag (release is skipped, not failed);
@@ -836,6 +840,33 @@ jobs:
       # reaches the build step only when this is true.
       CAN_NOTARIZE: ${{ secrets.MACOS_CERTIFICATE_P12_BASE64 != '' && secrets.MACOS_CERTIFICATE_PASSWORD != '' && secrets.SHED_DESKTOP_DEVELOPER_ID_IDENTITY != '' && secrets.APPLE_ID != '' && secrets.APPLE_TEAM_ID != '' && secrets.APPLE_APP_SPECIFIC_PASSWORD != '' }}
     steps:
+      # The macOS client changed implementation at 0.9.0 (Swift -> Tauri), so a
+      # republish is only idempotent for tags at or after it. Dispatching an
+      # OLDER stable tag would build that tag's Tauri target and `--clobber` the
+      # Swift DMG its users already installed, then replace that version's
+      # appcast signature — same input, different client. Refuse instead: the
+      # image-publish jobs are separate and still do their work, and a loud
+      # failure here is the point (silently shipping a different app to an
+      # existing release is the outcome worth failing over).
+      - name: Guard — republishing a pre-0.9.0 tag's mac assets is not idempotent
+        run: |
+          set -euo pipefail
+          VER="${TAG#v}"
+          # Only a manual dispatch can name an old tag; a tag push is always "now".
+          if [ "${{ github.event_name }}" != "workflow_dispatch" ]; then
+            echo "::notice::tag push for ${TAG} — guard not applicable."
+            exit 0
+          fi
+          OLDEST="$(printf '%s\n0.9.0\n' "${VER%%-*}" | sort -V | head -1)"
+          if [ "${VER%%-*}" != "0.9.0" ] && [ "${OLDEST}" = "${VER%%-*}" ]; then
+            echo "::error::${TAG} predates the 0.9.0 Swift->Tauri promotion. Republishing"
+            echo "::error::its mac assets would overwrite a Swift DMG with a Tauri one and"
+            echo "::error::re-sign that version's appcast entry. Re-run the image jobs alone,"
+            echo "::error::or cut a new tag — do not republish this one's desktop assets."
+            exit 1
+          fi
+          echo "::notice::${TAG} is at or after the promotion — republish is idempotent."
+
       - name: Checkout
         uses: actions/checkout@v6
         with:
