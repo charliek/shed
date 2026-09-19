@@ -170,18 +170,27 @@ new rev's `tests/ipc-vectors/` (updating that README's sha), commit all of it. R
 `shed_core::roost::Conn::session_identify` refuses a mismatch by name rather than limping. roost
 keeps **one `session.identify` vector per generation**
 (`session.identify.response.v<N>.json`); shed vendors only the current one, so a generation bump
-renames the vendored file and **every** reader of it moves with it — not just "both fakes":
-`crates/shed-core/src/roost/testing.rs`'s `include_str!`, `crates/shed-core/src/roost/fence.rs`'s
-own separate `include_str!` (a third Rust reader, easy to miss because it isn't a fake and reads
-the file for a reason unrelated to testing), and every Go site that names the vector **by
-filename** rather than reading it (`internal/roostprovider/goldens_test.go`,
-`internal/roostprovider/wire_test.go`, `internal/roostprovider/fakessh_test.go`,
-`crates/shed-core/tests/roost_provider_vectors.rs`). An older shape is a fake *control*
-(`set_session_protocol`, `serve_without_features`), never a second vector to keep in step.
+renames the vendored file and **every** reader of it moves with it. The full list is not
+repeated here — `crates/fixtures/roost-vectors/README.md`'s reader-inventory table is the
+canonical one (a plan-021 rewrite from prose to a table, because the prose omitted readers):
+**three languages**, not just "both fakes" — Rust (`testing.rs`'s `include_str!`,
+`fence.rs`'s own separate `include_str!`, and `roost_provider_vectors.rs`), Go (three files
+that name the vector by filename), and Python (`desktop/tools/shedtest/fake_roost.py`'s
+template, the reader plan 021 found the prose list had dropped). An older shape is a fake
+*control* (`set_session_protocol`, `serve_without_features`), never a second vector to keep in
+step.
 
-**What session protocol 5 gave us (roost plan 061 / roost#477), and what it retired.** The pin
-is at `c1bfe88…` and shed speaks generation **5**. Protocol 4's lease (roost R1, plan 014) is
-gone from the wire — not narrowed, retired outright, with no replacement:
+**Two more files move with the protocol *integer* itself, separately from the vector file:**
+`cmd/shed/roost_provider_test.go` and `internal/roostprovider/menu_test.go` both build their
+expectations off `roostprovider.SpokenProtocol` rather than a literal — check them on a bump
+anyway, since a future test could reintroduce a hardcoded number and silently stop moving with
+the pin (plan 021 found exactly that: both had hard-coded "this shed speaks 5" before being
+switched to the constant).
+
+**What session protocol 6 gave us (plan 021), on top of what 5 already gave us.** The pin is at
+`ee71e44…` and shed speaks generation **6**. Protocol 4's lease (roost R1, plan 014) stayed
+gone — not narrowed, retired outright, with no replacement — and everything protocol 5 gave
+(below) carries forward unchanged; 6's own changes are the second list further down:
 
 - **Every op is open, not owned.** `lease` is dropped from all seven param structs it used to
   sit in (`TabWriteParams`, `EventsSubscribeParams`, `TabAttachParams`, `SessionSetThemeParams`,
@@ -204,6 +213,32 @@ gone from the wire — not narrowed, retired outright, with no replacement:
   revision gap are **resyncs** (a new cycle at once, no `Down`), bounded by
   `MAX_CONSECUTIVE_RESYNCS`. **`SHED_ROOST_POLL_MS` is gone**, with `POLL_INTERVAL` and the rest
   of the cadence: latency is the push, and the only sleep left is the failure backoff.
+
+**What 6 changed, on top of that:**
+
+- **`session.set_agent_hooks` became a pure raise.** `{mode, skip, client}` is gone;
+  `SessionSetAgentHooksParams` is now `{agents, client}`. `mode`/`skip` retired with **nothing
+  replacing them** — there is no narrowing direction left on this op, and removal is a
+  deliberate local act on the host (`roostctl agent uninstall`), not something a client can ask
+  for. See `crates/shed-core/src/roost/bootstrap/hooks.rs` for shed's `ROOST_WIRED_AGENTS` and
+  the doc-extensions page for the user-facing consequence (re-widening).
+- **`EventFrame::Ended` / the wire's `stream.ended` exists, and it is a resync, not a Down.**
+  Its one defined reason is `backend-switch` — the daemon is alive and this stream's workspace
+  is being replaced — so `shed_core::roost` treats it exactly like a bare EOF: a fresh cycle at
+  once, counted against the same `MAX_CONSECUTIVE_RESYNCS` bound as any other resync.
+  `session.stopping` is unchanged and still means the daemon itself is going away (a `Down`).
+- **`TabOpenParams.activate` is new.** `Some(false)` opens a tab without selecting it or its
+  project; absent (the desktop's choice — `roost_hosts.rs`'s one un-defaulted literal) and
+  `Some(true)` both select it, matching every prior generation's only behavior.
+- **`ServerCode` moved.** Gained `Busy`, `NotEnabled`, `UnknownField`, `MissingParam`,
+  `DuplicateId`. `InvalidToken` is gone outright — there is no token concept left at 6 — and
+  `TooManyTokens` was renamed to `TooManyAttaches`, a different limit (concurrent attaches, not
+  lease tokens) rather than a straight survivor.
+- **`session.identify`'s `SessionIdentify` gained `persist_error` and `ops`.** `persist_error`
+  names why the last `state.json` write failed; `ops` lists the ops this session would actually
+  dispatch right now (absent from an older session). Neither is consumed by shed's roost client
+  today — see `crates/shed-core/src/roost/model.rs` if that changes. (`features` is unrelated
+  and already gone: it retired off this same struct with the lease, at protocol 5, not here.)
 
 **What it drags in.** `roost-ipc`'s own leaf deps — **`anyhow`**, the **`tracing` facade** (a
 facade only: no subscriber, no `tracing-subscriber`) and **`libc`** — are new to `shed-core`'s
