@@ -292,8 +292,8 @@ pub fn classify_candidates(pairs: &[(String, String)]) -> ProbeOutcome {
 /// | `Missing` | `NoSession` / `NotInstalled` | [`Plan::Install`] then start |
 /// | `Mismatch` | `NoSession` / `NotInstalled` | [`Plan::Update`] then start |
 /// | `Compatible` | `NoSession` / `NotInstalled` | [`Plan::Start`] |
-/// | any | `Running`, protocol 5 | [`Plan::UpToDate`] — status only |
-/// | any | `Running`, protocol ≠ 5 | [`Plan::Report`] — **never stopped, never restarted** |
+/// | any | `Running`, the current protocol | [`Plan::UpToDate`] — status only |
+/// | any | `Running`, another protocol | [`Plan::Report`] — **never stopped, never restarted** |
 ///
 /// The sixth row — "the source preview is `NoSource`, so there is no button at
 /// all" — is deliberately **not** a variant here. A plan is what the *host*

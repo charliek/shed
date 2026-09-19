@@ -105,7 +105,6 @@ export type RoostHooksError = { agent: string; error: string };
 /** `session.set_agent_hooks`'s result, always reported and never fatal. */
 export type RoostHooksResult = {
   client: string;
-  mode: string;
   applied: boolean;
   wired: string[];
   refreshed: string[];

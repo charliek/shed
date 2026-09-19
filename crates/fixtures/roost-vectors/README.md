@@ -2,7 +2,7 @@
 
 Byte-for-byte copies of roost's own golden wire vectors, taken from
 
-    github.com/charliek/roost @ c1bfe887bc843e35466a1dcc33fa2390909fd50e
+    github.com/charliek/roost @ ee71e44a1de3c0de4c59ac0267c0a5e0c993d88a
     tests/ipc-vectors/<same filename>
 
 which is the **same rev** `crates/Cargo.toml` pins `roost-ipc` to. They travel with
@@ -26,25 +26,41 @@ When the pinned `rev` in `crates/Cargo.toml` moves:
 
 1. re-copy these files from the new rev's `tests/ipc-vectors/`,
 2. update the sha in this README,
-3. run `cargo test -p shed-core` — the fake and the decoders read these, so a
-   shape change surfaces as a test failure rather than as silence.
+3. run `cargo test -p shed-core` **and** `go test ./internal/roostprovider/...`
+   **and** the shedtest suite — the two fakes and the decoders read these in
+   three languages, so a shape change surfaces as a test failure rather than as
+   silence, but only in the language that reads the file that moved.
 
 **Generation-suffixed names.** roost keeps one `session.identify` reply per
 `SESSION_PROTOCOL_VERSION` generation — `session.identify.response.v2.json`,
-`.v3.json`, `.v4.json`, `.v5.json`. shed vendors **only the current generation**
-(`.v5.json` today, plan 020): a client that gates on the number has nothing to do
-with an older shape, and a protocol-2 daemon is exercised through the fake's
-`set_session_protocol` control rather than through a vector it would then have to
-keep in step. So a generation bump renames the vendored file, and the
-`include_str!` paths move with it — all three of them (`roost/testing.rs`,
-`roost/fence.rs`, and `shed-core/tests/roost_provider_vectors.rs` reads it by
-name), plus Go's `internal/roostprovider/goldens_test.go`.
+`.v3.json`, `.v4.json`, `.v5.json`, `.v6.json`. shed vendors **only the current
+generation** (`.v6.json` today, plan 021): a client that gates on the number has
+nothing to do with an older shape, and a protocol-2 daemon is exercised through
+the fakes' `set_session_protocol` control rather than through a vector they would
+then have to keep in step.
+
+So a generation bump **renames the vendored file, and every reader moves with
+it**. The table below is the whole list — three languages, more than "both
+fakes", and the trap this paragraph exists for:
+
+| reader | how it names the file |
+|---|---|
+| `crates/shed-core/src/roost/testing.rs` | `include_str!` (the Rust fake's template) |
+| `crates/shed-core/src/roost/fence.rs` | its own separate `include_str!` — not a fake, easy to miss |
+| `crates/shed-core/tests/roost_provider_vectors.rs` | reads it by name at runtime |
+| `internal/roostprovider/goldens_test.go` | by name (`SpokenProtocol`'s pin) |
+| `internal/roostprovider/wire_test.go` | by name, twice (decode + string-id) |
+| `internal/roostprovider/fakessh_test.go` | by name (the fake ssh session's reply) |
+| `desktop/tools/shedtest/fake_roost.py` | by name (the Python fake's template) |
+
+Go fails loudly on a missing path, so a rename that misses one of its three is a
+red `go test ./...` rather than a stale read.
 
 ## What is here, and who reads it
 
 | file | read by |
 |---|---|
-| `session.identify.response.v5.json` | the fake's `session.identify` template (the protocol gate's input); the fence tests' `daemon_session_id` / `started_at` |
+| `session.identify.response.v6.json` | both fakes' `session.identify` template (the protocol gate's input); the fence tests' `daemon_session_id` / `started_at`; Go's `SpokenProtocol` pin |
 | `identify.response.json` | the fake's `identify` template |
 | `tab.list.session.response.json` | the fake's initial project/tab set — the **session** variant, i.e. the one that carries `revision` (42); the fence replay's snapshot |
 | `tab.open.response.json` | the fake's template for a tab it opens |
@@ -59,9 +75,10 @@ name), plus Go's `internal/roostprovider/goldens_test.go`.
 | `events.subscribe.request.json` | the fresh-subscribe shape `Conn::subscribe` sends — the op shed calls on every watcher cycle, and the only thing that proves the lease key is gone from it |
 | `events.subscribe.response.json` | the fake's `events.subscribe` ack (the fence `{revision}` plus the required `session_id`) |
 | `tab.dump.request.json` | the `tab.dump` shape `Conn::tab_dump` sends — `scrollback` is omit-when-zero, so this is what proves shed's viewport read emits no `scrollback` key at all |
-| `tab.write.request.json` | the `tab.write` shape — lease-free at generation 5 |
-| `session.set_agent_hooks.request.json` | the shape `Conn::session_set_agent_hooks` sends (plan 019 S5) — `deny_unknown_fields` on roost's side, so this is the contract |
-| `session.set_agent_hooks.response.json` | the fake's `session.set_agent_hooks` reply template (`wired`/`refreshed`/`removed`/`skipped`/`errors`) |
+| `tab.write.request.json` | the `tab.write` shape — lease-free since generation 5 |
+| `session.set_agent_hooks.request.json` | the shape `Conn::session_set_agent_hooks` sends — the generation-6 raise `{agents, client}`; `deny_unknown_fields` on roost's side, so this is the contract. **Its `agents` array is roost's own two-name example**, not shed's five: the request test compares every key except `agents` against this file and `agents` against `ROOST_WIRED_AGENTS`, so the copy stays byte-for-byte roost's |
+| `session.set_agent_hooks.response.json` | both fakes' `session.set_agent_hooks` reply template — an `AgentHooksOutcome` (`wired`/`refreshed`/`removed`/`skipped`/`errors`), with the two skip reasons a client can see (`"not allowed"`, `"not installed"`) |
+| `stream.ended.event.json` | the terminal envelope `FakeRoost::end_stream` pushes — a UI-socket frame (`reason: "backend-switch"`) a session socket never writes, which is why a test is its only coverage |
 
 ## Shed-recorded vectors
 

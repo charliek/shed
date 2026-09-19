@@ -12,20 +12,22 @@
 //! and it is worth saying out loud on the consent card, because the user is
 //! consenting to a file under their home directory changing.
 //!
-//! ## One op, no token, last writer wins
+//! ## One op, no token, a raise
 //!
-//! At session protocol 5 this op is **open to every same-UID client**: roost
+//! At session protocol 6 this op is **open to every same-UID client**: roost
 //! deleted the lease that used to gate it, and with it the two-op dialogue this
 //! module was built around. So [`wire_agent_hooks`] is one wire call with no
 //! retry loop and nothing to carry between calls.
 //!
-//! What makes that safe is that the op is **declarative rather than
-//! incremental**. shed sends one request and only ever that request —
-//! `{mode: "auto", skip: [], client: "shed-desktop"|"shed-mobile"}` — and the
-//! host brings its hook entries in line with it. The destructive direction is
-//! `mode: "off"`, which shed has no code path that sends. A connection that died
-//! mid-call is therefore a call that did not land, and the next watcher cycle
-//! re-sends the identical request.
+//! What makes that safe is that the op is a **raise**. Shed sends one request
+//! and only ever that request — `{agents: ROOST_WIRED_AGENTS, client:
+//! "shed-desktop"|"shed-mobile"}` — and the host unions those names into its own
+//! `agent-hooks` key. There is no destructive direction left to send: `mode:
+//! "off"` and the `skip` list retired with generation 5, and nothing replaced
+//! them, because roost made removal a deliberate local act on the host
+//! (`roostctl agent uninstall`). A connection that died mid-call is therefore a
+//! call that did not land, and the next watcher cycle re-sends the identical
+//! request.
 //!
 //! **The hook entries are idempotent; roost's own bookkeeping is not.** Ten
 //! calls leave the same lines in the same agent config files, but
@@ -38,26 +40,29 @@
 //! (NOT `roostctl agent status`: that reports installed / wired-at-version /
 //! out-of-date per agent, and names neither the writing client nor the time.)
 //!
-//! What genuinely changed with the lease: if a roost UI on that host had turned
-//! hooks off or excluded an agent, shed's next reconnect switches it back on. At
-//! protocol 4 shed would have seen `already-connected` and stepped back. One
-//! user owns every client, and shed's `auto` only ever wires what is already
-//! configured there.
+//! **A raise re-widens.** If someone on that host narrowed the key by hand
+//! between two of shed's cycles, shed's next cycle puts back every name in
+//! [`ROOST_WIRED_AGENTS`]. That is the honest consequence of re-sending a raise
+//! unconditionally, and it is the thing to change if a user ever wants shed to
+//! wire less than everything: the fix is a shed-side allow-list, not a quieter
+//! raise.
 //!
-//! ## What `mode: auto` actually does, and when it recurs
+//! ## What the raise actually wires, and when it recurs
 //!
-//! `auto` wires **only agents whose config directory already exists**
+//! The host wires **only agents whose config directory already exists**
 //! (`roost-agent-install`'s `home.rs`). An agent a user sets up tomorrow is not
 //! wired by today's call — it is wired the next time a session starts (every
 //! `shed start` is one) or the next time any roost client connects. That is why
 //! the consent copy names the agents rather than promising "your agents", and
 //! why this is worth documenting on the S5 docs page rather than leaving as a
-//! surprise.
+//! surprise. An agent the host has no adapter for at all comes back in
+//! `skipped` with reason `"unknown"`, and the rest of the list is still wired —
+//! which is the drift signal [`ROOST_WIRED_AGENTS`] is read against.
 //!
 //! `wired` in the result is roost's **first-announcement** list — the agents this
 //! host has wired and never told any client about — not the set this call wrote.
 //! `refreshed` covers the rest. Shed reports both and never treats an empty
-//! `wired` as a failure.
+//! `wired` as a failure. `removed` is always empty from this op.
 //!
 //! ## Failures here are never fatal
 //!
@@ -66,9 +71,31 @@
 //! would throw away the part that succeeded. Everything below lands in
 //! [`HooksResult`], which rides out on the success value.
 
-use roost_ipc::messages::{AgentHooksMode, SessionSetAgentHooksResult};
+use roost_ipc::messages::AgentHooksOutcome;
 
 use crate::roost::{Conn, RoostError};
+
+/// The names shed raises a host's `agent-hooks` key to — **roost's whole
+/// wireable set**, by value.
+///
+/// It is roost's `crates/roost-agent/src/lib.rs` `ALL_AGENTS` written out here,
+/// because the raise takes strings and shed links no roost crate that exports
+/// the enum. Five, and roost's own
+/// `roost-agent-install` asserts `ALL_AGENTS.len() == 5`, so a sixth adapter
+/// upstream is a name shed would not be sending.
+///
+/// **There is no `gx` here on purpose.** gx is the owner's grok fork: it shares
+/// `$GROK_HOME`, reads roost's `$GROK_HOME/hooks/roost.json`, and roost reports
+/// it as `source: "grok"`. Sending `gx` would put a permanent
+/// `skipped/"unknown"` row in every hooks card for no gain.
+///
+/// **The drift signal is `skipped`.** A name this list carries that the host
+/// has no adapter for comes back as `{agent, reason: "unknown"}`, which both
+/// clients show verbatim — so a roost that renames or drops an adapter surfaces
+/// as a visible row rather than as silence. The reverse direction (roost gains
+/// an adapter shed never sends) surfaces only here, which is why the constant
+/// names its source.
+pub const ROOST_WIRED_AGENTS: [&str; 5] = ["claude", "codex", "cursor", "grok", "opencode"];
 
 /// One agent the host did not act on, and why.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -123,8 +150,8 @@ impl HooksResult {
     }
 }
 
-impl From<SessionSetAgentHooksResult> for HooksResult {
-    fn from(result: SessionSetAgentHooksResult) -> HooksResult {
+impl From<AgentHooksOutcome> for HooksResult {
+    fn from(result: AgentHooksOutcome) -> HooksResult {
         HooksResult {
             wired: result.wired,
             refreshed: result.refreshed,
@@ -160,9 +187,13 @@ impl From<SessionSetAgentHooksResult> for HooksResult {
 ///
 /// There is nothing to retry and nothing to carry: a failure means the request
 /// did not land, and the next successful watcher cycle sends the same one again.
+///
+/// The name list is [`ROOST_WIRED_AGENTS`] and is not a parameter: every shed
+/// client raises the same set, and a client that raised a different one would be
+/// a second policy nobody could read off one place.
 pub async fn wire_agent_hooks(conn: &mut Conn, client_label: &str) -> HooksResult {
     match conn
-        .session_set_agent_hooks(AgentHooksMode::Auto, &[], client_label)
+        .session_set_agent_hooks(&ROOST_WIRED_AGENTS, client_label)
         .await
     {
         Ok(result) => {

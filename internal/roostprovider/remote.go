@@ -677,7 +677,7 @@ func (r *Remote) call(ctx context.Context, t Target, op string, params any, out 
 // A MISSING protocol is checked before the gate, and is a different answer
 // from a mismatched one: a reply of `result:{}` decodes to 0, and 0 is not a
 // protocol any roost has ever spoken — reporting it as a mismatch would print
-// "speaks protocol 0; this shed speaks 5" and send the user off to upgrade
+// "speaks protocol 0; this shed speaks <SpokenProtocol>" and send the user off to upgrade
 // something. That is malformed far-side output, which §3.2 makes a provider
 // failure rather than a row (see MalformedReplyError).
 func (r *Remote) Identify(ctx context.Context, t Target) (IdentifyResult, error) {

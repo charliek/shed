@@ -1247,7 +1247,7 @@ pub enum RoostUpdate {
 /// one sessions view go stale at the same rate.
 ///
 /// **Nothing here has a cadence.** Since roost R1 a subscribe is a plain
-/// request — at session protocol 5 it takes no token and there is no such thing
+/// request — since session protocol 5 it takes no token and there is no such thing
 /// as a privileged stream to be one of — and every workspace commit arrives as a
 /// batch. Latency is the push; the only sleep in this module is the failure
 /// backoff.
@@ -1269,7 +1269,7 @@ pub struct RoostWatcher {
 /// HOST rather than of which watcher happened to be spawned when.
 ///
 /// The rule the flag encodes is unchanged: shed wires hooks into a session it
-/// started, and into nothing else. At session protocol 5 the wire would let any
+/// started, and into nothing else. Since session protocol 5 the wire lets any
 /// same-UID client wire any session it can reach; this is shed's own answer to
 /// *should it*, and it is a local fact about who started what rather than
 /// anything the far side enforces.
@@ -1614,7 +1614,7 @@ async fn observe_once(
     };
 
     // Conn B — the event stream. **A subscribe takes nothing and carries no
-    // claim**: at session protocol 5 roost has no stream classification at all,
+    // claim**: since session protocol 5 roost has had no stream classification at all,
     // so every subscriber is a peer of every other and one more of them costs
     // whoever is using the session nothing. It is also why `tab.effect` now
     // reaches shed, which the fold below ignores because a watcher views no tab.
@@ -1758,14 +1758,31 @@ async fn observe_once(
                     return Ok(Cycle::Resync);
                 }
             },
-            // The one terminal envelope an event stream can see at protocol 5.
-            // The daemon is going away, so this is a `Down` with a reason and
-            // not a resync.
+            // **The daemon is going away.** A `Down` with a reason, not a
+            // resync: there will be nothing to re-list.
             Ok(Some(EventFrame::Stopping(stopping))) => {
                 return Err(ReachError::other(format!(
                     "session stopping: {}",
                     stopping.reason
                 )));
+            }
+            // **The daemon is alive; this stream's workspace is not.** The one
+            // defined reason is `backend-switch` — a roost UI moving its tabs to
+            // another local backend — so the inventory shed is showing is about
+            // to be replaced, not lost. Re-list. Reporting Down here would flap
+            // a card for a host that answers the very next request, which is why
+            // this is the one terminal frame that is NOT an error.
+            //
+            // A session socket never writes it (it is a UI-socket frame), so
+            // this arm is reached in tests and, if roost ever widens it, in
+            // production — which is the case it is here for.
+            Ok(Some(EventFrame::Ended(ended))) => {
+                tracing::info!(
+                    label = %label,
+                    reason = %ended.reason,
+                    "roost ended the event stream; re-listing"
+                );
+                return Ok(Cycle::Resync);
             }
         }
     }
@@ -1850,7 +1867,7 @@ pub async fn tab_dump(reach: &dyn RoostReach, tab_id: i64) -> Result<TabDumpResu
 }
 
 // There is no `tab_write` one-shot here, and it is not because the wire forbids
-// one: at session protocol 5 a write takes no token and a per-call dial would
+// one: since session protocol 5 a write takes no token and a per-call dial would
 // be accepted. It is because a dial per keystroke is a remote `ssh` exec per
 // keystroke over an [`SshBridge`], which is the same reason [`RoostPeek`] holds
 // its connection. `shed_core::roost::Conn::tab_write` is the surface for the
@@ -2431,9 +2448,13 @@ fn tail(bytes: &[u8], cap: usize) -> String {
 /// entitlements around it, because the op was gated on one; roost deleted that
 /// gate at 5 and shed deleted the table with it rather than inventing a
 /// replacement. What is left is a request shed sends on every successful cycle —
-/// always the same one, `{mode: "auto", skip: [], client}` — against a host shed
-/// started the session on. A call that did not land is re-sent by the next
+/// always the same one, `{agents: ROOST_WIRED_AGENTS, client}` — against a host
+/// shed started the session on. A call that did not land is re-sent by the next
 /// cycle, so a failure needs no recovery state either.
+///
+/// At generation 6 that request is a **raise**, so a re-send also re-widens: a
+/// host-side narrowing made between two cycles is put back by the next one.
+/// There is no narrowing direction on the wire to send instead.
 ///
 /// **The one thing that IS consulted is [`armed`](Self::armed), and it is read
 /// at send time.** Deciding at spawn time instead made arming a property of
@@ -2731,6 +2752,7 @@ mod tests {
     use std::sync::atomic::AtomicUsize;
 
     use shed_core::rc::RcActivity;
+    use shed_core::roost::bootstrap::ROOST_WIRED_AGENTS;
     use shed_core::roost::testing::{ownership, FakeRoost};
 
     // ---- doubles ----
@@ -3025,8 +3047,8 @@ mod tests {
         );
     }
 
-    /// **shed watches, and takes nothing to do it.** At session protocol 5 there
-    /// is no stream classification left to ask about — every subscriber is a
+    /// **shed watches, and takes nothing to do it.** Since session protocol 5
+    /// there has been no stream classification to ask about — every subscriber is a
     /// peer — so what is worth pinning is the other half: a plain watcher opens
     /// exactly ONE stream and issues nothing that changes the session it is
     /// looking at, which is what makes it safe to point at somebody's machine.
@@ -3531,6 +3553,59 @@ mod tests {
         let again = next_snapshot(&mut rx).await;
         assert_eq!(again.daemon_session_id, fake.session_id());
         assert_eq!(reach.invalidations.load(Ordering::SeqCst), 0);
+        watcher.stop();
+    }
+
+    /// **`stream.ended` is a resync, not a Down** — the one terminal envelope
+    /// that does not mean the daemon is going away.
+    ///
+    /// Its only defined reason is `backend-switch`: a roost UI moving its tabs
+    /// to another local backend. The daemon answers the very next request, and
+    /// the workspace this stream was reading is being replaced rather than lost,
+    /// so re-listing is right and reporting the machine Down would flap a card
+    /// for a host that is fine. `session.stopping`, next door, IS a Down —
+    /// `a_stopping_session_is_a_down_that_recovers_on_restart` is the pair to
+    /// this.
+    ///
+    /// Asserted through [`FakeRoost::end_stream`], which pushes the envelope and
+    /// **nothing else**: no hang-up, no latch. A fake that also closed the
+    /// connection would make this test pass against a client that ignored the
+    /// frame entirely, because the EOF alone is already a resync.
+    ///
+    /// A session socket never writes this frame today (it is a UI-socket one),
+    /// which is exactly why a test is its only coverage.
+    #[tokio::test]
+    async fn a_stream_ended_is_a_resync_that_keeps_the_rows() {
+        let fake = FakeRoost::start().await;
+        fake.set_tab_axes(TAB, "working", Some(owned("session_status")), false);
+        let reach = FlakyReach::new(RoostEndpoint::Unix(fake.socket_path().to_path_buf()), 0);
+        let (watcher, mut rx) = watch(reach.clone());
+
+        let before = next_snapshot(&mut rx).await;
+        assert_eq!(fake.tab_list_calls(), 1);
+
+        fake.end_stream("backend-switch");
+
+        // `next_snapshot` panics on a `Down`, so arriving here is the first half
+        // of the claim; the second list is the other half — a client that had
+        // simply swallowed the frame would still be parked on the old stream and
+        // this would time out.
+        let after = next_snapshot(&mut rx).await;
+        assert_eq!(
+            fake.tab_list_calls(),
+            2,
+            "the frame started a new cycle, which re-lists"
+        );
+        assert_eq!(
+            after.sessions, before.sessions,
+            "the workspace is replaced, not lost: the rows survive the resync"
+        );
+        assert_eq!(after.daemon_session_id, fake.session_id());
+        assert_eq!(
+            reach.invalidations.load(Ordering::SeqCst),
+            0,
+            "a resync tears down no transport: the daemon never went away"
+        );
         watcher.stop();
     }
 
@@ -5494,7 +5569,7 @@ esac
     #[tokio::test]
     async fn the_runner_probes_an_installed_but_stopped_session_as_a_start() {
         let rig = BootRig::new().await;
-        rig.seed_session(5);
+        rig.seed_session(roost_ipc::messages::SESSION_PROTOCOL_VERSION);
         let probe = rig.runner().probe().await.expect("the probe");
         assert!(
             matches!(
@@ -5530,7 +5605,7 @@ esac
     #[tokio::test]
     async fn the_runner_starts_a_session_and_wires_hooks() {
         let rig = BootRig::new().await;
-        rig.seed_session(5);
+        rig.seed_session(roost_ipc::messages::SESSION_PROTOCOL_VERSION);
         let probe = rig.runner().probe().await.expect("the probe");
 
         let installed = rig
@@ -5569,9 +5644,8 @@ esac
         // The op really reached the session, with the arguments plan 019 pins.
         let calls = rig.fake.agent_hooks_calls();
         assert_eq!(calls.len(), 1, "{calls:?}");
-        assert_eq!(calls[0]["mode"], "auto");
+        assert_eq!(calls[0]["agents"], serde_json::json!(ROOST_WIRED_AGENTS));
         assert_eq!(calls[0]["client"], "shed-desktop");
-        assert_eq!(calls[0]["skip"], serde_json::json!([]));
     }
 
     /// A reach whose `ensure` always hands back an endpoint nothing is
@@ -5712,8 +5786,8 @@ esac
     }
 
     /// (a) **The re-send happens on every successful cycle** for a host shed
-    /// bootstrapped, which is what keeps `mode: auto` honest: it wires only the
-    /// agents whose config directory exists at that moment, so an agent
+    /// bootstrapped, which is what keeps the raise honest: the host wires only
+    /// the agents whose config directory exists at that moment, so an agent
     /// configured later is wired by a LATER call and by nothing else.
     ///
     /// Three cycles rather than two, deliberately. "Every" is the claim, and the
@@ -5751,7 +5825,8 @@ esac
         }
 
         let calls = fake.agent_hooks_calls();
-        assert!(calls.iter().all(|call| call["mode"] == "auto"));
+        let raised = serde_json::json!(ROOST_WIRED_AGENTS);
+        assert!(calls.iter().all(|call| call["agents"] == raised));
         assert!(calls.iter().all(|call| call["client"] == "shed-desktop"));
         watcher.stop();
     }
@@ -5759,7 +5834,7 @@ esac
     /// (b) **And on NO cycle for a host shed merely watches — until the moment
     /// it stops merely watching.** The entitlement came through generation 5
     /// unchanged, and it is now the only thing there is: a disarmed watcher must
-    /// never wire a session shed did not start, even though at protocol 5 the
+    /// never wire a session shed did not start, even though at protocol 6 the
     /// far side would happily let it.
     ///
     /// Both directions in one cell, because the flag is read at SEND time and
@@ -5802,7 +5877,7 @@ esac
             1,
             "the flag flipped and the watcher still wired nothing: {calls:?}"
         );
-        assert_eq!(calls[0]["mode"], "auto");
+        assert_eq!(calls[0]["agents"], serde_json::json!(ROOST_WIRED_AGENTS));
         assert_eq!(calls[0]["client"], "shed-desktop");
         watcher.stop();
     }
@@ -5864,7 +5939,10 @@ esac
             baseline + 2,
             "a failed cycle stopped the next one re-sending: {calls:?}"
         );
-        assert_eq!(calls[baseline + 1]["mode"], "auto");
+        assert_eq!(
+            calls[baseline + 1]["agents"],
+            serde_json::json!(ROOST_WIRED_AGENTS)
+        );
         assert_eq!(calls[baseline + 1]["client"], "shed-desktop");
         watcher.stop();
     }

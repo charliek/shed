@@ -336,7 +336,7 @@ mod tests {
     const VECTOR_TAB_LIST: &str =
         include_str!("../../../fixtures/roost-vectors/tab.list.session.response.json");
     const VECTOR_SESSION_IDENTIFY: &str =
-        include_str!("../../../fixtures/roost-vectors/session.identify.response.v5.json");
+        include_str!("../../../fixtures/roost-vectors/session.identify.response.v6.json");
     const VECTOR_EVENTS_BATCH: &str =
         include_str!("../../../fixtures/roost-vectors/events.batch.json");
     const VECTOR_TAB_OPENED: &str =

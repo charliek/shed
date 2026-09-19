@@ -254,7 +254,7 @@ fn the_stderr_classes_golden_is_roosts_own_classifier() {
 /// Rust.
 #[test]
 fn the_identify_vector_carries_this_builds_protocol() {
-    let vector = read_json("session.identify.response.v5.json");
+    let vector = read_json("session.identify.response.v6.json");
     assert_eq!(
         vector["result"]["session_protocol"].as_u64(),
         Some(u64::from(SESSION_PROTOCOL_VERSION)),
