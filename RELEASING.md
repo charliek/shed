@@ -20,7 +20,7 @@ equals the tag**:
 |---|---|---|
 | `server` | `.claude-plugin/plugin.json` `.version` (file unchanged; the component was renamed from `go`) | brew `shed`, apt `shed-server` deb, ghcr rootfs images (vz/fc + build-tools) |
 | `host-agent` | `crates/shed-host-agent/VERSION` | brew `shed-host-agent` + a GH release linux tarball. **brew-only — no apt deb.** |
-| `desktop` | `desktop/VERSION` (with `crates/Cargo.toml`, the Tauri `Cargo.toml`/`tauri.conf.json`, and both Cargo locks in verified lockstep) | ShedDesktop DMG + Sparkle appcast, `shed-desktop` debs — during the Swift→Tauri transition, **stable** tags ship the Swift DMG and **prerelease** (`-`) tags ship the Tauri DMG on the appcast beta channel (see [`desktop/RELEASING.md`](desktop/RELEASING.md)) |
+| `desktop` | `desktop/VERSION` (with `crates/Cargo.toml`, the Tauri `Cargo.toml`/`tauri.conf.json`, and both Cargo locks in verified lockstep) | ShedDesktop DMG (Tauri, the macOS client as of 0.9.0) + Sparkle appcast, `shed-desktop` debs — a **prerelease** (`-`) tag ships on the appcast beta channel, a stable tag on the stable channel (see [`desktop/RELEASING.md`](desktop/RELEASING.md)) |
 
 `server` and `host-agent` are the two **goreleaser** components
 — each published by its own split config (`.goreleaser.server.yaml`,

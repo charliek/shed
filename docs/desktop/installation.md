@@ -5,7 +5,7 @@ and a Tauri/WebKitGTK Linux app.
 
 ## macOS (DMG)
 
-The macOS app is an Apple Silicon (arm64) menu-bar app and requires macOS 14 or newer.
+The macOS app (Tauri) is an Apple Silicon (arm64) menu-bar app and requires macOS 14 or newer.
 
 Grab the latest `ShedDesktop-<version>.dmg` from the
 [releases page](https://github.com/charliek/shed/releases), open it, and drag
@@ -31,10 +31,11 @@ if a newer build is published, Sparkle offers it and applies it in place.
 | Verification | EdDSA signature (`SUPublicEDKey`), independent of Apple notarization |
 | Channels | Stable by default; prerelease (rc) builds subscribe to a **beta** channel |
 
-The Tauri macOS app is on a **beta rollout** — prerelease (`vX.Y.Z-rc.N`) tags publish a
-beta-channel Tauri DMG while stable users keep receiving the Swift app. Both share the same
-feed, EdDSA key, and bundle identity (`ai.stridelabs.ShedDesktop`), so the eventual promotion
-is a seamless in-place update. See
+The Tauri macOS app is the shipped macOS client as of 0.9.0 — prerelease
+(`vX.Y.Z-rc.N`) tags publish a beta-channel DMG, stable tags publish the stable-channel DMG,
+both from the same job. It shares the feed, EdDSA key, and bundle identity
+(`ai.stridelabs.ShedDesktop`) that the earlier Swift app used, so the first Tauri release was
+a seamless in-place update for existing Swift installs. See
 [RELEASING.md](https://github.com/charliek/shed/blob/main/desktop/RELEASING.md).
 
 Locally built DMGs (`make -C desktop dmg`) are **ad-hoc signed**, so Gatekeeper blocks the
@@ -106,10 +107,10 @@ make -C desktop deb-validate   # build + install-validate in a clean ubuntu:24.0
 
 **Nothing else — for the Tauri client.** `brew install shed` (or `apt install shed`) plus the
 Tauri desktop app is a complete install — its embedded broker handles credential approvals
-(SSH sign, AWS, Docker) itself, no extra daemon needed. The stable **Swift macOS client**
-still requires the separately-installed `shed-host-agent` daemon for credential approvals
-(Homebrew formula, `brew services start shed-host-agent`). See below for how that differs
-between the two clients.
+(SSH sign, AWS, Docker) itself, no extra daemon needed. The **Swift macOS client** (sources
+retained pending demolition; not shipped since 0.9.0) still requires the separately-installed
+`shed-host-agent` daemon for credential approvals (Homebrew formula, `brew services start
+shed-host-agent`). See below for how that differs between the two clients.
 
 ## Credential broker
 
@@ -119,8 +120,8 @@ differs by client:
 
 | Client | Broker |
 |---|---|
-| **Tauri** (Linux; macOS beta) | **Embedded** — runs in-process, on by default. No extra install. |
-| **Swift** (macOS stable) | **Separate daemon** — a standalone `shed-host-agent` process (Homebrew formula, `brew services start shed-host-agent`). See [Credential approvals](approvals.md). |
+| **Tauri** (macOS and Linux) | **Embedded** — runs in-process, on by default. No extra install. |
+| **Swift** (macOS, not shipped since 0.9.0) | **Separate daemon** — a standalone `shed-host-agent` process (Homebrew formula, `brew services start shed-host-agent`). See [Credential approvals](approvals.md). |
 
 The Tauri client can also run against a standalone daemon instead of its embedded broker
 — useful if you already run `shed-host-agent` headless on a server, or want one broker

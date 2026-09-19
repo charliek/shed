@@ -66,7 +66,8 @@ jobs:
           echo "::endgroup::"
 
       # ── 1b. self (charliek/shed) at contents:write — the appcast-push floor ──
-      # The desktop-macos release job pushes docs/appcast.xml to main with a
+      # The desktop-macos release job (the Tauri build, the sole macOS
+      # desktop job as of 0.9.0) pushes docs/appcast.xml to main with a
       # token minted exactly like this (owner charliek, repositories shed,
       # permission-contents: write). The MINT itself is the permission proof:
       # create-github-app-token fails if the installation's grant doesn't

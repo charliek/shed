@@ -1,9 +1,11 @@
 # Architecture
 
-shed-desktop is a native macOS menu-bar app that ties the **shed** toolchain into one
+shed-desktop is a native desktop app that ties the **shed** toolchain into one
 resident control surface: it lists and controls sheds (VMs) across hosts, launches
 remote-control agents, and brokers the credential-approval gate. It holds no credentials —
-it coordinates the processes that do.
+it coordinates the processes that do. The shipped client is Tauri on both macOS (as of
+0.9.0) and Linux; a Swift/SwiftUI macOS menu-bar app also lives in the tree (sources
+retained pending demolition — see below for its architecture).
 
 It is built as a SwiftUI app with a deliberate **core/UI split**: all I/O and logic live in
 a UI-free core (`ShedKit`) so they're unit-testable without a running app. The shed-server
@@ -146,7 +148,7 @@ sequenceDiagram
 
 ### The embedded credential broker (Tauri)
 
-The Tauri client (Linux; macOS beta) can also run the credential broker **in-process** —
+The Tauri client (macOS and Linux) can also run the credential broker **in-process** —
 the same `shed-broker` Rust crate the standalone `shed-host-agent` daemon is built from,
 embedded via `shed-app`'s non-default `broker` feature instead of dialed over a socket.
 Quitting the app stops brokering (server-side fails closed, same as stopping the daemon);

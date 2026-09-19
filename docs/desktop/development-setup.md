@@ -32,8 +32,9 @@ The Linux Tauri client + `.deb` have their own targets — `tauri-run`, `e2e-tau
 `tauri-build-linux` (WebKitGTK render gate), `tauri-test-linux`, `deb`, `deb-validate` — see
 [Test automation](test-automation.md).
 
-`make -C desktop dmg` is the local packaging path; cutting an actual release (which signs the
-DMG and publishes the Sparkle appcast) is
+`make -C desktop dmg` is the local packaging path for the Swift app;
+`make -C desktop tauri-dmg-mac` is the Tauri equivalent (the macOS client shipped since
+0.9.0). Cutting an actual release (which signs the DMG and publishes the Sparkle appcast) is
 [RELEASING.md](https://github.com/charliek/shed/blob/main/desktop/RELEASING.md).
 
 ## Layout
