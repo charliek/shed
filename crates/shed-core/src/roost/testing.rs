@@ -1150,6 +1150,22 @@ fn dispatch(state: &Mutex<FakeState>, op: &str, params: &Value) -> Result<Value,
                     ));
                 }
             }
+            // And then EVERY other unknown key, because `deny_unknown_fields`
+            // does not care which one it is. Named separately from the three
+            // above only for the message; a fake that let an unrecognised key
+            // through would be more permissive than the server it stands in
+            // for, which is the one way a fake can pass a client that a real
+            // host then refuses.
+            if let Some(extra) = params.as_object().and_then(|params| {
+                params
+                    .keys()
+                    .find(|key| !matches!(key.as_str(), "agents" | "client"))
+            }) {
+                return Err(refuse(
+                    "unknown-field",
+                    format!("session.set_agent_hooks: unknown field `{extra}`"),
+                ));
+            }
             // roost's `check_names`, in its order: a blank element is checked
             // before emptiness, because a blank one can only be a client bug.
             let agents = params
@@ -1463,6 +1479,23 @@ mod tests {
                 "a retired `{retired}` must be unknown-field: {reply}"
             );
         }
+
+        // A key roost never heard of is the same refusal. `deny_unknown_fields`
+        // does not care that `mode` was once real and `nonsense` never was, and
+        // a fake that only knew the three retired names would be MORE PERMISSIVE
+        // than the server — the one failure mode a fake must not have, since it
+        // passes a client that a real host then refuses.
+        let reply = raw_call(
+            &fake,
+            "session.set_agent_hooks",
+            json!({ "agents": ["claude"], "client": "shed-desktop", "nonsense": 1 }),
+        )
+        .await;
+        assert_eq!(
+            refusal_code(&reply),
+            ServerCode::UnknownField,
+            "an unknown key roost never had must be unknown-field too: {reply}"
+        );
 
         // None of the refusals were recorded as calls — a refused op wrote
         // nothing on a real host either.

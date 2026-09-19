@@ -475,6 +475,19 @@ def test_the_hooks_params_are_validated_the_way_roost_validates_them(roost):
             roost_call(roost.socket_path, "session.set_agent_hooks", params)
         assert refused.value.code == "unknown-field", (retired, refused.value)
 
+    # A key roost never heard of is the same refusal. `deny_unknown_fields` does
+    # not care that `mode` was once real and `nonsense` never was, and a fake
+    # that only knew the three retired names would be MORE PERMISSIVE than the
+    # server — the one failure mode a fake must not have, since it passes a
+    # client that a real host then refuses.
+    with pytest.raises(RoostWireError) as refused:
+        roost_call(
+            roost.socket_path,
+            "session.set_agent_hooks",
+            {"agents": ["claude"], "client": "shed-desktop", "nonsense": 1},
+        )
+    assert refused.value.code == "unknown-field", refused.value
+
     # None of the refusals were recorded as calls — a refused op wrote nothing
     # on a real host either.
     assert roost.agent_hooks_calls == [], roost.agent_hooks_calls

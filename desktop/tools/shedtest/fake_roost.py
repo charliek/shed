@@ -1061,6 +1061,17 @@ class FakeRoost:
                     "unknown-field",
                     f"session.set_agent_hooks: unknown field `{retired}`",
                 )
+        # And then EVERY other unknown key, because `deny_unknown_fields` does
+        # not care which one it is. Named separately from the three above only
+        # for the message; a fake that let an unrecognised key through would be
+        # more permissive than the server it stands in for, which is the one way
+        # a fake can pass a client that a real host then refuses.
+        extra = next((k for k in params if k not in ("agents", "client")), None)
+        if extra is not None:
+            raise _Refusal(
+                "unknown-field",
+                f"session.set_agent_hooks: unknown field `{extra}`",
+            )
         agents = params.get("agents")
         if not isinstance(agents, list):
             raise _Refusal("invalid-param", "session.set_agent_hooks needs an `agents` array")

@@ -1520,12 +1520,20 @@ def _wait_for_toast(app: TauriClient, target: str, *, timeout: float = 30.0) -> 
     also be satisfied by whatever the previous cell left on screen.
     """
 
+    # Captured in the predicate, not re-read after it: a toast is transient, so
+    # a second dump can catch it already replaced or gone and hand back the
+    # wrong one — or `None`. Same shape as `_wait_for_roost_row` below.
+    box: dict = {}
+
     def toasted() -> bool:
         toast = _toast_dump(app)
-        return bool(toast and any(target in line for line in toast["lines"]))
+        if toast and any(target in line for line in toast["lines"]):
+            box["toast"] = toast
+            return True
+        return False
 
     app.wait_until(toasted, timeout=timeout, what=f"a toast naming {target} to appear")
-    return _toast_dump(app)
+    return box["toast"]
 
 
 def _wait_for_roost_row(app: TauriClient, target: str, *, timeout: float = 30.0) -> dict:
