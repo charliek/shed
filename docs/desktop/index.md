@@ -1,10 +1,11 @@
 # shed-desktop
 
-A native macOS menu-bar application that ties the [shed](https://github.com/charliek/shed)
+A native desktop application that ties the [shed](https://github.com/charliek/shed)
 toolchain into one resident control surface: list and create sheds across hosts, launch
 Claude remote-control agents, approve credential requests from the shed host agent, and
-watch a live activity feed. A **Tauri** cross-platform client on the same shared Rust core
-is the shipped **Linux** client (`apt install shed-desktop`).
+watch a live activity feed. A **Tauri** cross-platform client on the shared Rust core is the
+shipped client on both **macOS** (DMG + Sparkle auto-update) and **Linux**
+(`apt install shed-desktop`).
 
 It is a coordinator — it runs no sheds and holds no credentials. It observes and drives
 components that already exist on the developer's Mac and on shed hosts (see
@@ -41,8 +42,8 @@ component ships.
 
 ## Design principles
 
-- **Native + small.** SwiftUI menu-bar app on macOS; launches instantly; no Dock icon by
-  default. A Tauri/WebKitGTK shell on Linux — both over one Rust core.
+- **Native + small.** A Tauri shell on both macOS and Linux, over one shared Rust core;
+  launches instantly; no Dock icon by default on macOS.
 - **Drivable + testable.** The app exposes a JSON IPC control socket and an in-process
   screenshot op, so every change is verified by a no-sleep functional harness — not by a
   human clicking. See [Test automation](test-automation.md).
@@ -58,11 +59,12 @@ gate, the System (disk) pane, plus notarized Sparkle auto-update on macOS and an
 
 **Shared Rust core & multi-client (delivered).** The shed-server protocol layer was extracted
 into a shared **Rust core** (`shed-core`) so the same logic backs every client instead of
-being re-implemented per language. It is the macOS **default** backend (behind
+being re-implemented per language. It is the macOS Swift app's **default** backend (behind
 `SHED_DESKTOP_RUST_CORE`, on by default) and the base for the **Tauri** cross-platform
-client, which is now the **shipped Linux client** (WebKitGTK). An earlier GTK MVP proved the
-architecture and has since been **retired** in favor of Tauri. The Swift app still requires
-`shed-host-agent` as a **separate** process; the Tauri client can broker credentials
+client, which is now the **shipped client on both macOS and Linux** (WebKitGTK on Linux). An
+earlier GTK MVP proved the architecture and has since been **retired** in favor of Tauri. The
+Swift app (sources retained pending demolition; its release job retired in 0.9.0) still
+requires `shed-host-agent` as a **separate** process; the Tauri client can broker credentials
 **in-process** instead (default) or against a separate daemon — see [Installation →
 Credential broker](installation.md#credential-broker) and [Architecture → The embedded
 credential broker](architecture.md#the-embedded-credential-broker-tauri). See [Rust

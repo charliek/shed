@@ -38,16 +38,13 @@ name: Publish Images and Release
 #                                             ships (else the first shipping
 #                                             goreleaser invocation creates
 #                                             the release + changelog body)
-#   6. desktop-macos                          Swift DMG + notarize + Sparkle
-#                                             appcast — STABLE tags only
-#   6b. desktop-macos-tauri                   Tauri DMG + notarize + Sparkle
-#                                             appcast — PRERELEASE (*-*) tags
-#                                             only (beta channel). Mutually
-#                                             exclusive with desktop-macos:
-#                                             exactly one mac desktop job runs
-#                                             per tag, both produce the same
-#                                             ShedDesktop-<ver>.dmg → identical
-#                                             appcast step.
+#   6. desktop-macos                          Tauri DMG + notarize + Sparkle
+#                                             appcast — the default macOS
+#                                             client as of 0.9.0; runs on
+#                                             every ship_desktop tag, stable
+#                                             and prerelease alike (the
+#                                             former STABLE-only Swift
+#                                             release job retired).
 #   7. desktop-linux (matrix)                 shed-desktop .deb per arch
 #   8. desktop-apt-dispatch                   apt-charliek dispatch (skips
 #                                             prerelease *-* tags)
@@ -75,7 +72,7 @@ name: Publish Images and Release
 #                          |             |   skipped ok)   |   ship_goreleaser)|
 #   desktop-release-create | skip (ship) | skip (ship)     | run              | skip (goreleaser)
 #   desktop-macos          | skip (ship) | skip (ship)     | run, after       | run, after
-#   desktop-macos-tauri    | skip (ship) | skip (ship)     |   create ok      |   goreleaser ok
+#                          |             |                 |   create ok      |   goreleaser ok
 #   desktop-linux          |             |                 |   (see below)    |   (see below)
 #   desktop-apt-dispatch   | skip (needs)| skip (needs)    | run              | run
 #
@@ -90,18 +87,16 @@ name: Publish Images and Release
 #   images are published (the whole image chain is ship_server-gated).
 #   (An `sx` component ran the same shape until plan 016 sunset it.)
 #
-# The two mac desktop jobs are MUTUALLY EXCLUSIVE on the same prerelease/stable
-# axis, and it's cross-cutting to the go/desktop/combined columns above:
-# desktop-macos runs on a STABLE tag (builds the Swift DMG) and skips on a
-# prerelease; desktop-macos-tauri runs on a PRERELEASE (*-* tag, the rc-rehearsal
-# path — builds the Tauri DMG, beta channel) and skips on a stable tag. The gate
-# is `contains(github.event.inputs.version || github.ref_name, '-')` (negated on
-# the Swift job), inlined into each job's `if:` — a job-level `if:` cannot see the
-# job's own `env.TAG`. So in any "run, after" cell above, exactly ONE of the two
-# runs; both produce ShedDesktop-<ver>.dmg, so the appcast step is identical and
-# update-appcast.py is untouched (it emits the beta channel iff the tag has a `-`).
-# desktop-linux + desktop-apt-dispatch are unaffected by that axis (the .deb
-# builds on both; apt-dispatch's own *-* guard already skips prereleases).
+# desktop-macos (Tauri) is the only mac desktop job as of 0.9.0: it runs on
+# every ship_desktop tag, stable and prerelease alike — its `if:` is
+# byte-identical to desktop-linux's, no prerelease/stable split at the job
+# level. (Before 0.9.0 there was a second, mutually exclusive Swift job that
+# owned STABLE tags only; it's retired — Swift sources stay for a later
+# demolition.) The prerelease/stable split lives solely in
+# update-appcast.py, which is unchanged: it emits the beta channel iff the
+# tag has a `-`. desktop-linux + desktop-apt-dispatch are unaffected by that
+# axis (the .deb builds on both; apt-dispatch's own *-* guard already skips
+# prereleases).
 #
 #   Failure propagation: release-plan fails → everything skips (loud, by
 #   design — includes the no-manifest-matches tag). On a server-shipping
@@ -119,7 +114,11 @@ name: Publish Images and Release
 #
 # workflow_dispatch republishes re-run the image-publish chain (when
 # ship_server) and, for desktop-shipping tags, the desktop asset jobs —
-# both idempotent (--clobber uploads, appcast dedupe). The `release` job
+# both idempotent (--clobber uploads, appcast dedupe) **for tags at or
+# after v0.9.0**. Before that the mac client was the Swift app, so
+# republishing an older tag would overwrite its Swift DMG with a Tauri
+# one and re-sign that version's appcast entry: same input, different
+# client. desktop-macos guards against it and fails loudly. The `release` job
 # stays gated on tag-push events so manual republishes never cut a new
 # GitHub Release or re-push formulas/debs. Desktop jobs DO run on a
 # dispatch of a desktop-shipping tag (release is skipped, not failed);
@@ -806,17 +805,22 @@ jobs:
               --notes "Release $TAG — assets are uploading."
           fi
 
-  # macOS (Swift app, STABLE tags only): bundle (Sparkle.framework embedded),
-  # drag-install DMG, notarize + staple when the six Apple secrets exist
-  # (CAN_NOTARIZE), EdDSA-sign for the Sparkle appcast, and bot-push
-  # docs/appcast.xml to main. Skip-safe gating: a skipped `release` (desktop-only
-  # tag) or skipped `desktop-release-create` (combined tag) must not block; a
-  # FAILED one must. The trailing `&& !contains(… '-')` makes this the STABLE-tag
-  # job — prerelease (*-*) tags route to desktop-macos-tauri instead (mutually
-  # exclusive; see the header audit table). The `inputs.version ||` half keeps a
-  # workflow_dispatch republish routing on the dispatched version, not the branch.
+  # macOS (Tauri app): the default macOS client as of 0.9.0 — runs on every
+  # ship_desktop tag, stable and prerelease alike (the Swift release job that
+  # used to own stable tags is retired; Swift sources stay for a later
+  # demolition — see the follow-up ticket). Bundle (Sparkle.framework via
+  # fetch-sparkle) → notarize+staple when the six Apple secrets exist
+  # (CAN_NOTARIZE) → upload → EdDSA-sign for the Sparkle appcast → bot-push
+  # docs/appcast.xml to main. Skip-safe gating: a skipped `release`
+  # (desktop-only tag) or skipped `desktop-release-create` (combined tag)
+  # must not block; a FAILED one must. This job's `if:` is byte-identical to
+  # desktop-linux's — there is no prerelease/stable split left at the job
+  # level. update-appcast.py is unchanged: it still emits the beta channel
+  # iff the tag has a `-`. The `inputs.version ||` half keeps a
+  # workflow_dispatch republish routing on the dispatched version, not the
+  # branch ref_name.
   desktop-macos:
-    name: Desktop macOS DMG + appcast
+    name: Desktop macOS Tauri DMG + appcast
     needs: [release-plan, release, desktop-release-create]
     if: >-
       always() &&
@@ -825,257 +829,50 @@ jobs:
       needs.release.result != 'failure' &&
       needs.release.result != 'cancelled' &&
       needs.desktop-release-create.result != 'failure' &&
-      needs.desktop-release-create.result != 'cancelled' &&
-      !contains(github.event.inputs.version || github.ref_name, '-')
+      needs.desktop-release-create.result != 'cancelled'
     runs-on: macos-15
     permissions:
       contents: write
     env:
       TAG: ${{ github.event.inputs.version || github.ref_name }}
-      # Sign + notarize only when the FULL prerequisite set is present. Any
-      # missing secret → ad-hoc fallback: a Developer-ID-signed but un-notarized
-      # DMG is still Gatekeeper-blocked, so signing without notarizing has no
-      # value, and a partial secret set must not break the build or silently
-      # drop the first-launch note. The identity is handed to the bundle/DMG
-      # steps (below) only when this is true.
+      # Sign + notarize only when the FULL six-secret prerequisite set is
+      # present, else an ad-hoc (Gatekeeper-blocked) DMG. The identity
+      # reaches the build step only when this is true.
       CAN_NOTARIZE: ${{ secrets.MACOS_CERTIFICATE_P12_BASE64 != '' && secrets.MACOS_CERTIFICATE_PASSWORD != '' && secrets.SHED_DESKTOP_DEVELOPER_ID_IDENTITY != '' && secrets.APPLE_ID != '' && secrets.APPLE_TEAM_ID != '' && secrets.APPLE_APP_SPECIFIC_PASSWORD != '' }}
     steps:
-      - name: Checkout
-        uses: actions/checkout@v6
-        with:
-          ref: ${{ github.event.inputs.version || github.ref_name }}
-          # Don't persist GITHUB_TOKEN creds: otherwise the appcast bot push
-          # authenticates as GITHUB_TOKEN (via the http.extraheader) instead of
-          # the App token, and GitHub suppresses the downstream docs.yml that
-          # republishes Pages. The repo is public, so the unauthenticated
-          # `git fetch origin main` below still works.
-          persist-credentials: false
-
-      - name: Rust toolchain
-        # bundle.sh builds the Rust core (staticlib + UniFFI bindings) before
-        # swift build — same explicit install as ci.yml's swift leg.
-        run: |
-          rustup toolchain install stable --profile minimal
-          rustc --version && cargo --version
-
-      # Inert until all six Apple secrets exist. When present, imports the
-      # Developer ID Application cert into a throwaway keychain so codesign (in
-      # bundle.sh) and notarization can use it.
-      - name: Import Developer ID certificate
-        if: env.CAN_NOTARIZE == 'true'
-        env:
-          MACOS_CERTIFICATE_P12_BASE64: ${{ secrets.MACOS_CERTIFICATE_P12_BASE64 }}
-          MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
-        run: |
-          set -euo pipefail
-          # The decoded cert must never outlive this step, even on early failure.
-          # (The keychain itself must persist — later steps sign against it.)
-          trap 'rm -f "$RUNNER_TEMP/cert.p12"' EXIT
-          kc="$RUNNER_TEMP/shed-desktop-signing.keychain-db"
-          kp="$(openssl rand -base64 24)"
-          security create-keychain -p "$kp" "$kc"
-          security set-keychain-settings -lut 21600 "$kc"
-          security unlock-keychain -p "$kp" "$kc"
-          echo "$MACOS_CERTIFICATE_P12_BASE64" | base64 --decode > "$RUNNER_TEMP/cert.p12"
-          security import "$RUNNER_TEMP/cert.p12" -k "$kc" -P "$MACOS_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
-          security set-key-partition-list -S apple-tool:,apple: -s -k "$kp" "$kc"
-          # Prepend our keychain to the user search list, keeping the existing
-          # ones; the command substitution must word-split into separate paths.
-          # shellcheck disable=SC2046
-          security list-keychains -d user -s "$kc" $(security list-keychains -d user | sed 's/"//g')
-          rm -f "$RUNNER_TEMP/cert.p12"
-
-      # The identity reaches bundle.sh / make-dmg.sh only when CAN_NOTARIZE —
-      # otherwise empty, so they take the ad-hoc path (and make-dmg keeps the
-      # FIRST-LAUNCH note).
-      - name: Build + bundle
-        working-directory: desktop
-        env:
-          SHED_DESKTOP_DEVELOPER_ID_IDENTITY: ${{ env.CAN_NOTARIZE == 'true' && secrets.SHED_DESKTOP_DEVELOPER_ID_IDENTITY || '' }}
-        run: ./scripts/bundle.sh release
-      - name: Unit tests
-        working-directory: desktop
-        run: make test
-      - name: Package DMG
-        working-directory: desktop
-        env:
-          SHED_DESKTOP_DEVELOPER_ID_IDENTITY: ${{ env.CAN_NOTARIZE == 'true' && secrets.SHED_DESKTOP_DEVELOPER_ID_IDENTITY || '' }}
-        run: ./scripts/make-dmg.sh
-
-      # Notarize + staple BEFORE the upload + appcast signing: stapling rewrites
-      # the DMG bytes, so the EdDSA sign_update below must run against the
-      # stapled file. Gated on CAN_NOTARIZE so it never tries to notarize an
-      # ad-hoc DMG (notarize.sh also self-guards on the APPLE_* creds).
-      - name: Notarize + staple (skipped without credentials)
-        if: env.CAN_NOTARIZE == 'true'
-        working-directory: desktop
-        env:
-          APPLE_ID: ${{ secrets.APPLE_ID }}
-          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
-          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
-        run: ./scripts/notarize.sh "build/ShedDesktop-${TAG#v}.dmg"
-
-      # What governs Gatekeeper on a downloaded DMG is whether it's *notarized*
-      # (a stapled ticket), not whether a signing cert exists — a Developer-ID-
-      # signed but un-notarized DMG is still blocked. Gate the release-note
-      # guidance on the real artifact state via `stapler validate`.
-      - name: Detect DMG notarization status
-        id: dmg_notarized
-        working-directory: desktop
-        run: |
-          if xcrun stapler validate "build/ShedDesktop-${TAG#v}.dmg" >/dev/null 2>&1; then
-            echo "value=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "value=false" >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: Upload the DMG (+ notarization notes on desktop-only releases)
-        # The release exists by now (goreleaser on combined tags,
-        # desktop-release-create on desktop-only tags). Notes handling:
-        # when ANY goreleaser component ships, goreleaser owns the release
-        # notes — never touch them; on a desktop-only release, APPEND the
-        # notarization guidance rather than overwrite (the old repo's job
-        # overwrote, which would clobber goreleaser's notes on combined tags).
-        env:
-          GH_TOKEN: ${{ github.token }}
-          NOTARIZED: ${{ steps.dmg_notarized.outputs.value }}
-          SHIP_GORELEASER: ${{ needs.release-plan.outputs.ship_goreleaser }}
+      # The macOS client changed implementation at 0.9.0 (Swift -> Tauri), so a
+      # republish is only idempotent for tags at or after it. Dispatching an
+      # OLDER stable tag would build that tag's Tauri target and `--clobber` the
+      # Swift DMG its users already installed, then replace that version's
+      # appcast signature — same input, different client. Refuse instead: the
+      # image-publish jobs are separate and still do their work, and a loud
+      # failure here is the point (silently shipping a different app to an
+      # existing release is the outcome worth failing over).
+      - name: Guard — republishing a pre-0.9.0 tag's mac assets is not idempotent
         run: |
           set -euo pipefail
           VER="${TAG#v}"
-          gh release upload "$TAG" "desktop/build/ShedDesktop-${VER}.dmg" --clobber
-          if [ "${SHIP_GORELEASER}" = "true" ]; then
-            echo "combined release — goreleaser owns the notes; skipping the notes edit."
+          # Only a manual dispatch can name an old tag; a tag push is always "now".
+          if [ "${{ github.event_name }}" != "workflow_dispatch" ]; then
+            echo "::notice::tag push for ${TAG} — guard not applicable."
             exit 0
           fi
-          if [ "${NOTARIZED}" = "true" ]; then
-            NOTES="Notarized Developer ID build (auto-updates via Sparkle). Drag to /Applications and open normally."
-          else
-            NOTES="Ad-hoc signed build (auto-updates via Sparkle). Not notarized yet — see FIRST-LAUNCH.txt in the DMG for the one-time Gatekeeper step."
-          fi
-          BODY="$(gh release view "$TAG" --json body --jq '.body')"
-          if printf '%s' "${BODY}" | grep -qF "${NOTES}"; then
-            echo "notes already carry the notarization line — leaving them as-is."
-          else
-            printf '%s\n\n%s\n' "${BODY}" "${NOTES}" | gh release edit "$TAG" --notes-file -
-          fi
-
-      # ---- Sparkle appcast: sign the DMG + publish the feed as the release bot ----
-      - name: Mint release-bot token (self-repo, appcast push)
-        id: bot-token
-        uses: actions/create-github-app-token@v3
-        with:
-          client-id:    ${{ secrets.RELEASE_BOT_CLIENT_ID }}
-          private-key:  ${{ secrets.RELEASE_BOT_APP_KEY }}
-          owner:        charliek
-          repositories: shed
-          # The appcast bot-push floor: push docs/appcast.xml to main.
-          # Verified by sanity-check-app.yml's self-repo contents:write block.
-          permission-contents: write
-
-      - name: Sign DMG + append appcast entry
-        env:
-          SPARKLE_ED_PRIVATE_KEY: ${{ secrets.SPARKLE_ED_PRIVATE_KEY }}
-        run: |
-          set -euo pipefail
-          if [ -z "${SPARKLE_ED_PRIVATE_KEY}" ]; then
-            echo "::error::SPARKLE_ED_PRIVATE_KEY is unset — can't sign the appcast entry."
+          OLDEST="$(printf '%s\n0.9.0\n' "${VER%%-*}" | sort -V | head -1)"
+          if [ "${VER%%-*}" != "0.9.0" ] && [ "${OLDEST}" = "${VER%%-*}" ]; then
+            echo "::error::${TAG} predates the 0.9.0 Swift->Tauri promotion. Republishing"
+            echo "::error::its mac assets would overwrite a Swift DMG with a Tauri one and"
+            echo "::error::re-sign that version's appcast entry. Re-run the image jobs alone,"
+            echo "::error::or cut a new tag — do not republish this one's desktop assets."
             exit 1
           fi
-          VER="${TAG#v}"
-          DMG="desktop/build/ShedDesktop-${VER}.dmg"
-          test -s "${DMG}" || { echo "::error::${DMG} missing — the DMG step must run first."; exit 1; }
-          SIGN_UPDATE="$(find desktop/.build/artifacts -path '*/bin/sign_update' -type f -not -path '*old_dsa*' | head -1)"
-          [ -n "${SIGN_UPDATE}" ] || { echo "::error::sign_update not found under desktop/.build/artifacts."; exit 1; }
-          W="$(mktemp -d)"; chmod 700 "$W"; trap 'rm -rf "$W"' EXIT
-          printf '%s' "${SPARKLE_ED_PRIVATE_KEY}" | base64 --decode > "${W}/key"
-          "${SIGN_UPDATE}" --ed-key-file "${W}/key" "${DMG}" > "${W}/sign.txt"
-          rm -f "${W}/key"
-          cat "${W}/sign.txt"
-          # The appcast lives on main (the tag was cut from main, so the
-          # untracked desktop/build/ + desktop/.build/ artifacts survive the
-          # checkout). update-appcast.py runs FROM THE REPO ROOT — its
-          # SHED_DESKTOP_APPCAST default is cwd-relative.
-          git fetch origin main
-          git checkout main
-          SHED_DESKTOP_VERSION="${VER}" SHED_DESKTOP_TAG="${TAG}" \
-            SHED_DESKTOP_SIGN_FILE="${W}/sign.txt" \
-            SHED_DESKTOP_APPCAST="docs/appcast.xml" \
-            SHED_DESKTOP_REPO="charliek/shed" \
-            python3 desktop/scripts/update-appcast.py
-          xmllint --noout docs/appcast.xml
+          echo "::notice::${TAG} is at or after the promotion — republish is idempotent."
 
-      - name: Push signed appcast to main as release-bot
-        env:
-          GH_TOKEN: ${{ steps.bot-token.outputs.token }}
-          BOT_SLUG: ${{ steps.bot-token.outputs.app-slug }}
-        run: |
-          set -euo pipefail
-          if git diff --quiet docs/appcast.xml; then
-            echo "::notice::docs/appcast.xml unchanged for ${TAG} — nothing to push."
-            exit 0
-          fi
-          bot_id="$(gh api "/users/${BOT_SLUG}[bot]" --jq '.id')"
-          git config user.name  "${BOT_SLUG}[bot]"
-          git config user.email "${bot_id}+${BOT_SLUG}[bot]@users.noreply.github.com"
-          git add docs/appcast.xml
-          staged="$(git diff --cached --name-only)"
-          if [ "${staged}" != "docs/appcast.xml" ]; then
-            echo "::error::unexpected staged paths beyond docs/appcast.xml:"; echo "${staged}"; exit 1
-          fi
-          git commit -m "chore(appcast): publish ${TAG}"
-          # Token embedded in the push URL (stays in argv, never written to disk).
-          TOKEN_URL="https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
-          for attempt in 1 2 3; do
-            if git push "${TOKEN_URL}" HEAD:main; then
-              echo "::notice::Appcast pushed — docs.yml redeploys Pages → feed live."
-              exit 0
-            fi
-            echo "::warning::push attempt ${attempt} failed; rebasing onto origin/main"
-            git fetch "${TOKEN_URL}" main
-            git rebase FETCH_HEAD || { echo "::error::rebase conflict on docs/appcast.xml"; exit 1; }
-          done
-          echo "::error::push failed after 3 attempts."; exit 1
-
-  # macOS (Tauri app, PRERELEASE *-* tags only): the rc-rehearsal path. Same
-  # release-asset pipeline as desktop-macos (bundle → notarize+staple → upload →
-  # EdDSA-sign → appcast bot-push), but builds the TAURI DMG (beta channel) with
-  # the ordered Sparkle re-sign, runs the Tauri unit tests, and takes sign_update
-  # from the fetch-sparkle dist (the Swift job's SwiftPM-artifacts path doesn't
-  # exist here). Mutually exclusive with desktop-macos: the trailing
-  # `&& contains(… '-')` is the ONLY delta in the `if:` — a prerelease tag lands
-  # here, a stable tag lands on the Swift job. Both emit ShedDesktop-<ver>.dmg, so
-  # update-appcast.py is byte-identical in behavior (it stamps the beta channel
-  # iff the tag has a `-`). The `inputs.version ||` half keeps a workflow_dispatch
-  # republish routing on the dispatched version, not the branch ref_name.
-  desktop-macos-tauri:
-    name: Desktop macOS Tauri DMG + appcast (prerelease)
-    needs: [release-plan, release, desktop-release-create]
-    if: >-
-      always() &&
-      needs.release-plan.result == 'success' &&
-      needs.release-plan.outputs.ship_desktop == 'true' &&
-      needs.release.result != 'failure' &&
-      needs.release.result != 'cancelled' &&
-      needs.desktop-release-create.result != 'failure' &&
-      needs.desktop-release-create.result != 'cancelled' &&
-      contains(github.event.inputs.version || github.ref_name, '-')
-    runs-on: macos-15
-    permissions:
-      contents: write
-    env:
-      TAG: ${{ github.event.inputs.version || github.ref_name }}
-      # Same six-secret gate as desktop-macos: sign + notarize only when the FULL
-      # prerequisite set is present, else an ad-hoc (Gatekeeper-blocked) DMG. The
-      # identity reaches the build step only when this is true.
-      CAN_NOTARIZE: ${{ secrets.MACOS_CERTIFICATE_P12_BASE64 != '' && secrets.MACOS_CERTIFICATE_PASSWORD != '' && secrets.SHED_DESKTOP_DEVELOPER_ID_IDENTITY != '' && secrets.APPLE_ID != '' && secrets.APPLE_TEAM_ID != '' && secrets.APPLE_APP_SPECIFIC_PASSWORD != '' }}
-    steps:
       - name: Checkout
         uses: actions/checkout@v6
         with:
           ref: ${{ github.event.inputs.version || github.ref_name }}
-          # Same rationale as desktop-macos: don't persist GITHUB_TOKEN creds, so
-          # the appcast bot push authenticates as the App token (and docs.yml runs).
+          # Don't persist GITHUB_TOKEN creds, so the appcast bot push
+          # authenticates as the App token (and docs.yml runs).
           persist-credentials: false
 
       - name: Rust toolchain
@@ -1099,7 +896,7 @@ jobs:
 
       # Inert until all six Apple secrets exist; imports the Developer ID cert into
       # a throwaway keychain so codesign (in bundle-tauri-mac.sh) + notarization use
-      # it. Identical to desktop-macos's step.
+      # it.
       - name: Import Developer ID certificate
         if: env.CAN_NOTARIZE == 'true'
         env:
@@ -1124,15 +921,15 @@ jobs:
       # Sparkle re-sign) + make-dmg.sh. Identity reaches the script only when
       # CAN_NOTARIZE, else the ad-hoc path (and make-dmg keeps the FIRST-LAUNCH
       # note). DMG name is ShedDesktop-<VERSION>.dmg where VERSION = desktop/VERSION
-      # (== TAG#v by the release-plan lockstep check), same as the Swift job.
+      # (== TAG#v by the release-plan lockstep check).
       - name: Build + bundle + DMG (Tauri)
         env:
           SHED_DESKTOP_DEVELOPER_ID_IDENTITY: ${{ env.CAN_NOTARIZE == 'true' && secrets.SHED_DESKTOP_DEVELOPER_ID_IDENTITY || '' }}
         run: make -C desktop tauri-dmg-mac
 
       - name: Unit tests (Tauri workspace)
-        # The unit tests for THIS artifact — the Tauri standalone workspace, NOT the
-        # Swift `make test` (no build-core.sh here).
+        # The unit tests for THIS artifact — the Tauri standalone workspace
+        # (no build-core.sh here).
         run: make -C desktop tauri-test
 
       # Notarize + staple BEFORE the upload + appcast signing (stapling rewrites the
@@ -1158,9 +955,8 @@ jobs:
           fi
 
       - name: Upload the DMG (+ notarization notes on desktop-only releases)
-        # Same notes handling as desktop-macos: when any goreleaser component
-        # ships, goreleaser owns the notes; on a desktop-only release, APPEND
-        # the guidance.
+        # When any goreleaser component ships, goreleaser owns the notes; on
+        # a desktop-only release, APPEND the guidance.
         env:
           GH_TOKEN: ${{ github.token }}
           NOTARIZED: ${{ steps.dmg_notarized.outputs.value }}
@@ -1208,8 +1004,8 @@ jobs:
           VER="${TAG#v}"
           DMG="desktop/build/ShedDesktop-${VER}.dmg"
           test -s "${DMG}" || { echo "::error::${DMG} missing — the DMG step must run first."; exit 1; }
-          # The Tauri job's sign_update comes from fetch-sparkle's dist (staged into
-          # the Tauri src-tauri by the bundle step), NOT the SwiftPM artifacts path.
+          # sign_update comes from fetch-sparkle's dist (staged into the
+          # Tauri src-tauri by the bundle step), not a SwiftPM artifacts path.
           SIGN_UPDATE="desktop/tauri/src-tauri/.sparkle-dist/bin/sign_update"
           [ -x "${SIGN_UPDATE}" ] || { echo "::error::${SIGN_UPDATE} not found (fetch-sparkle must run in the build step)."; exit 1; }
           W="$(mktemp -d)"; chmod 700 "$W"; trap 'rm -rf "$W"' EXIT
@@ -1221,7 +1017,7 @@ jobs:
           # desktop/build/ + gitignored desktop/tauri/src-tauri/.sparkle-dist/
           # artifacts survive the checkout. update-appcast.py runs FROM THE REPO ROOT
           # (its SHED_DESKTOP_APPCAST default is cwd-relative) and emits the beta
-          # channel for this prerelease tag (it has a `-`).
+          # channel iff the tag has a `-`.
           git fetch origin main
           git checkout main
           SHED_DESKTOP_VERSION="${VER}" SHED_DESKTOP_TAG="${TAG}" \

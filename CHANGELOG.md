@@ -23,13 +23,77 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
-_Staged by plans 010 (the machine-hub port + retirement), 011 (shipping `sx`)
-and 016 (sunsetting it again, unreleased); at release time fold this body into
-the new `## vX.Y.Z` section and replace this note with a real `**Ships:**` line
-— **host-agent** (the hub lands in host-agent; both the `machine-rc` and `sx`
-tokens are retired and rejected by release-plan.sh). release-plan.sh never
-reads an `## Unreleased` heading._
+_Staged by plans 010 (the machine-hub port + retirement), 011 (shipping `sx`), 014 (roost
+session protocol 4 + the RC-lane demolition), 015 (agent lanes: opencode), 016 (sunsetting
+`sx`, unreleased), 017 (agent lanes: gx), 018 (agent lanes: the channel bound, free-text
+answers, scoped approvals, the shared lane view), 019 (the roost-provider kickoff + the
+desktop bootstrap), 020 (the roost session protocol 5 re-pin) and 021 (the roost session
+protocol 6 re-pin + the Tauri promotion); at release time fold this body into the new
+`## v0.9.0 — <date>` section — note the **em dash** — and replace this note with a real
+`**Ships:** server, host-agent, desktop` line (all three; `recommend-components.sh 0.9.0`
+agrees). release-plan.sh never reads an `## Unreleased` heading: it anchors on the exact
+`## v0.9.0 — ` string and takes the first line-start `**Ships:**` line under it._
 
+- **Tauri is now the default macOS client — every roost feature since plan 013 moves to
+  everyone** (plan 021, C3). The release workflow's two mutually exclusive mac jobs
+  (`desktop-macos` for Swift on a stable tag, `desktop-macos-tauri` for Tauri on a
+  prerelease) collapse into one: the Tauri job takes the `desktop-macos` name and now runs
+  on every tag shape, Swift's release job is deleted (`desktop-macos-tauri` appears
+  nowhere in `.github/`), and its `if:` is byte-identical to `desktop-linux`'s. A Mac
+  running Swift 0.8.x should get a normal Sparkle prompt and update **in place** into the
+  Tauri build — same bundle id, same EdDSA key, same appcast feed, all three verified — and
+  gain everything Swift never had: the machines tab, the roost bootstrap (S5), and agent
+  lanes (opencode, gx). **This is the first release to run that path**: the mac job has
+  never executed and the two-release rehearsal was skipped deliberately, so if Sparkle
+  reports a failed update, install the DMG by hand from the releases page and file it —
+  matching identity and key make the swap possible, not proven.
+  **What it loses: preferences do not migrate.** Swift stores them in `UserDefaults`
+  (`desktop/Sources/ShedDesktopApp/PreferencesStore.swift`); Tauri reads `prefs.json`
+  (`desktop/tauri/src-tauri/src/prefs.rs`) — terminal, approvals, policy, and
+  launch-at-login all start from Tauri's defaults after the update. Swift stays buildable
+  (only its release job retired; sources demolition is filed as
+  [#364](https://github.com/charliek/shed/issues/364)), and the prerelease → beta-channel
+  behavior is unchanged — `update-appcast.py` still stamps the beta channel iff the tag
+  carries a `-`. See the
+  [v0.8.2 → v0.9.0 upgrade note](https://charliek.github.io/shed/upgrades/v0.8.2-to-v0.9.0/)
+  for the honest rollback: reinstalling the Swift 0.8.1 DMG **re-offers 0.9.0 on the next
+  check**, because it reads the same feed with the same key.
+- **shed re-pins to roost's session protocol 6, in two steps — 5 then 6 — completing the
+  migration plan 019 left in motion (plan 020, roost#477 / roost plan 061; plan 021, roost
+  plan 064 / roost#489).** `roost-ipc` moved to `c1bfe887bc843e35466a1dcc33fa2390909fd50e`
+  for protocol 5, then to `ee71e44a1de3c0de4c59ac0267c0a5e0c993d88a` for protocol 6, in
+  every manifest that pins it (`crates/Cargo.toml`, the Tauri crate's, and — once
+  shed-mobile's own re-pin lands — its `rust/Cargo.toml`). **Protocol 5 retired the
+  lease.** The lease is gone from the wire with no replacement: `session.connect`, the
+  `connect-required`/`taken-over`/`already-connected` refusals, and the driver/observer
+  classification of an event stream are all retired, `session.set_agent_hooks` is open to
+  every same-UID client, and `tab.effect` now reaches every subscriber (shed's fold
+  already ignored it — a watcher views no tab). `SessionIdentify` drops `features`; the
+  generation integer is the whole negotiation now. One user owns every client that talks
+  to their sheds, so hook wiring being open to all of them, rather than gated behind a
+  token, is the intended shape. Go's `internal/roostprovider` mirrors the same generation
+  (`SpokenProtocol`), which is why this entry ships with `server` too. **Protocol 6 turns
+  `session.set_agent_hooks` into a pure raise.** `{mode, skip, client}` is gone, replaced
+  by `{agents, client}`: shed sends its own `ROOST_WIRED_AGENTS` — the five names roost's
+  whole wireable set covers (`claude, codex, cursor, grok, opencode`) — and the host
+  unions them into its own `agent-hooks` key. There is no narrowing direction left on this
+  wire; `mode: "off"` retired with nothing replacing it, because roost made removal a
+  deliberate local act on the host (`roostctl agent uninstall`), not something a client
+  can ask for. An agent name the host doesn't recognize comes back in `skipped` with
+  reason `"unknown"`, shown verbatim rather than filtered or hidden. **A host speaking an
+  older protocol is refused by name and offered the update, and its running session is
+  never stopped** (pin P6) — this covers every host plan 019's desktop bootstrapped
+  (protocol 4), a host still on protocol 5, and a real released `roost-session` (the
+  latest, v0.0.19, speaks protocol 2, and is refused loudly the same way). The one manual
+  step to recover: `roostctl session stop` on that target, then reconnect — shed then sees
+  a stale binary with no session running and replaces and restarts it unattended, the same
+  as any other Update. See
+  [`docs/extensions/roost-session-hosts.md`](https://charliek.github.io/shed/extensions/roost-session-hosts/)
+  for the re-widening consequence of a raise and the gx/`$GROK_HOME` "not installed"
+  surprise on a fresh host. **The phone-install rung is unchanged by this release:** it
+  still reports that no published roost release speaks the current session protocol until
+  `RELEASE_PIN` flips — "no release speaks 6" — which is a separate follow-up PR, not
+  something this release fixes.
 - **The machine RC hub moves into `shed-host-agent`.** The daemon hosts the
   activity hub (`127.0.0.1:1029`) as a supervised resident role: bind-as-lock
   with a polite defer-and-retry while an older `shed-machine-rc serve` holds
@@ -214,15 +278,6 @@ reads an `## Unreleased` heading._
   allowlist carries `add_approval` (an approval a client can answer, not only
   render) and `bodies_to` (every recorded body for a path suffix), so a cell in
   another language can assert the bytes a decision actually posted.
-
-## Unreleased
-
-_Staged by plan 019 (S4 `charliek/shed#326`, S5 `charliek/shed#327`), plan 020 (the roost
-session protocol 5 re-pin), and plan 021 (the roost session protocol 6 re-pin); at release time
-fold this body into the new `## vX.Y.Z` section and replace this note with a real `**Ships:**
-server, desktop` line — this bundle touches only `internal/`, `cmd/shed/`, `crates/shed-core`,
-`crates/shed-app`, and the Tauri client, none of which is `host-agent`._
-
 - **`shed roost-provider` — kickoff moves into roost's own palette (S4,
   `charliek/shed#326`), replacing the kickoff half of the unreleased, sunset
   `sx`.** `shed roost-provider list|activate` implements roost's dynamic
@@ -280,23 +335,6 @@ server, desktop` line — this bundle touches only `internal/`, `cmd/shed/`, `cr
   `roost-session`, only the desktop and mobile apps do), and no roost
   binary is bundled or vendored into shed's own build or rootfs images
   (pin P1).
-- **shed re-pins to roost's session protocol 5 and retires the lease with
-  it (plan 020, roost#477 / roost plan 061).** `roost-ipc` moves to
-  `c1bfe887bc843e35466a1dcc33fa2390909fd50e` in every manifest that pins
-  it (`crates/Cargo.toml`, the Tauri crate's, and — once shed-mobile's own
-  re-pin lands — its `rust/Cargo.toml`). The lease is gone from the wire
-  with no replacement: `session.connect`, the
-  `connect-required`/`taken-over`/`already-connected` refusals, and the
-  driver/observer classification of an event stream are all retired,
-  `session.set_agent_hooks` is open to every same-UID client, and
-  `tab.effect` now reaches every subscriber (shed's fold already ignored
-  it — a watcher views no tab). `SessionIdentify` drops `features`; the
-  generation integer is the whole negotiation now. One user owns every
-  client that talks to their sheds, so hook wiring being open to all of
-  them, rather than gated behind a token, is the intended shape — see
-  [`docs/extensions/roost-session-hosts.md`](https://charliek.github.io/shed/extensions/roost-session-hosts/).
-  Go's `internal/roostprovider` mirrors the same generation
-  (`SpokenProtocol`), which is why this entry ships with `server` too.
 - **The hook re-send plan 019 built and tested was never actually wired —
   it is now.** No production caller ever constructed the seam that
   re-sends `session.set_agent_hooks` on a watcher reconnect, so the
@@ -313,31 +351,6 @@ server, desktop` line — this bundle touches only `internal/`, `cmd/shed/`, `cr
   `session.identify` returned and treat a disagreement as an immediate
   resync instead of recovering by accident one cycle later, bounded by
   the existing `MAX_CONSECUTIVE_RESYNCS`.
-- **The consequence, named rather than discovered by a user:** every host
-  plan 019's desktop bootstrapped is running a protocol-4 `roost-session`,
-  and this build reports such a session by name — naming both protocol
-  numbers — and never stops or restarts it (pin P6; a running session
-  belongs to whoever started it). The one manual step to recover:
-  `roostctl session stop` on that target, then reconnect — shed then sees
-  a stale binary with no session running and replaces and restarts it
-  unattended, the same as any other Update.
-- **shed re-pins to roost's session protocol 6 (plan 021, roost plan 064 / roost#489).**
-  `roost-ipc` moves to `ee71e44a1de3c0de4c59ac0267c0a5e0c993d88a` in every manifest that pins
-  it. **`session.set_agent_hooks` becomes a pure raise.** `{mode, skip, client}` is gone,
-  replaced by `{agents, client}`: shed sends its own `ROOST_WIRED_AGENTS` — the five names
-  roost's whole wireable set covers (`claude, codex, cursor, grok, opencode`) — and the host
-  unions them into its own `agent-hooks` key. There is no narrowing direction left on this
-  wire; `mode: "off"` retired with nothing replacing it, because roost made removal a
-  deliberate local act on the host (`roostctl agent uninstall`), not something a client can
-  ask for. An agent name the host doesn't recognize comes back in `skipped` with reason
-  `"unknown"`, shown verbatim rather than filtered or hidden. **A host still running the
-  previous generation, protocol 5, is now refused by name and offered the update — its
-  running session is never stopped** (pin P6, unchanged from the protocol-5 re-pin above). See
-  [`docs/extensions/roost-session-hosts.md`](https://charliek.github.io/shed/extensions/roost-session-hosts/)
-  for the re-widening consequence of a raise and the gx/`$GROK_HOME` "not installed" surprise
-  on a fresh host. Nothing about the release-asset source rung changed: it still reports that
-  no published roost release speaks the current session protocol until `RELEASE_PIN` flips,
-  which is a separate PR.
 
 ## v0.8.2 — 2026-08-17
 

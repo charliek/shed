@@ -1,8 +1,8 @@
 # macOS Quickstart
 
 The opinionated, packaged path to a working shed on macOS, with the
-[shed-desktop](https://charliek.github.io/shed-desktop/) menu-bar app handling
-credential approvals. Everything installs from Homebrew plus one DMG.
+[shed-desktop](https://charliek.github.io/shed-desktop/) menu-bar app (Tauri, the shipped
+macOS client) handling credential approvals. Everything installs from Homebrew plus one DMG.
 
 Building from source, custom images, or hacking on shed itself? See
 [macOS Developer Setup](vz-setup.md) instead.
@@ -13,7 +13,7 @@ Building from source, custom images, or hacking on shed itself? See
   `vfkit`, installed by Homebrew).
 - `shed-host-agent` brokering your real credentials (SSH agent, Docker registry
   auth, optionally AWS) into sheds — keys never leave the host.
-- **shed-desktop**: a menu-bar app that lists/creates sheds and shows a Touch ID
+- **shed-desktop**: a menu-bar app (Tauri) that lists/creates sheds and shows a Touch ID
   approval prompt whenever a shed asks to use a credential.
 
 ## Prerequisites
@@ -143,9 +143,12 @@ registries are off by default — see the
 ## 4. Install shed-desktop
 
 Download the latest `ShedDesktop-<version>.dmg` from the
-[releases page](https://github.com/charliek/shed-desktop/releases), open it, and
-drag **ShedDesktop.app** to Applications. Builds are signed ad-hoc (not yet
-notarized), so clear the quarantine flag once:
+[releases page](https://github.com/charliek/shed/releases), open it, and drag
+**ShedDesktop.app** to Applications.
+
+Release builds are signed and notarized, so they open normally. If you built the
+app yourself it is signed ad-hoc instead, and macOS quarantines it until you
+clear the flag once:
 
 ```bash
 xattr -dr com.apple.quarantine /Applications/ShedDesktop.app
@@ -212,6 +215,6 @@ Remove the test shed when you're done: `shed delete hello-world`.
 
 - [Configuration](../reference/configuration.md) — every server-config field.
 - [Extensions](../reference/extensions.md) · [Extensions Architecture](../extensions/architecture.md) — the credential bus in full.
-- [shed-desktop docs](https://charliek.github.io/shed-desktop/) — the menu-bar app in full.
+- [shed-desktop docs](https://charliek.github.io/shed-desktop/) — the menu-bar app (Tauri) in full.
 - [macOS Developer Setup](vz-setup.md) — build from source, custom images.
 - Provisioning a project: [Gradle](../tutorials/gradle-provisioning.md) · [TypeScript](../tutorials/typescript-provisioning.md) · [Python](../tutorials/python-provisioning.md).

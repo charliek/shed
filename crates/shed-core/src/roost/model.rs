@@ -692,7 +692,10 @@ mod tests {
     /// refreshed the test below goes red (edit this), and the moment a second
     /// bump lands without a re-record the compile-time assertion below does
     /// (record it). Neither can pass by drifting.
-    const RECORDED_GENERATION: u32 = 5;
+    ///
+    /// Currently **equal** to the pin: plan 021 re-recorded this off a live
+    /// protocol-6 `roost-session` bootstrapped onto a shed.
+    const RECORDED_GENERATION: u32 = 6;
 
     const _: () = assert!(
         RECORDED_GENERATION == SESSION_PROTOCOL_VERSION
@@ -1366,9 +1369,9 @@ failed   foreground_process question_asked    -> needs_input";
         );
         assert_eq!(
             inventory.daemon_session_id,
-            "1400e40467439d0affedcd02f5070428"
+            "f7cde10a67e226085e8398fe93e03aaf"
         );
-        assert_eq!(inventory.started_at, "2026-09-12T19:09:29Z");
+        assert_eq!(inventory.started_at, "2026-09-19T22:58:30Z");
         assert_eq!(inventory.to_rc_dtos(), vec![dto]);
     }
 

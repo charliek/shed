@@ -1,9 +1,11 @@
 # CLAUDE.md — working in `desktop/`
 
-The shed desktop app: a native macOS menu-bar client (SwiftUI + AppKit) and a Tauri Linux
-client, both thin shells over the shared Rust core in the sibling `crates/` workspace. This
-file orients an AI assistant working in this subtree. The root `CLAUDE.md` owns the monorepo
-layout + release model; `crates/CLAUDE.md` owns the core.
+The shed desktop app: a Tauri client, shipping as both the **macOS** client (as of 0.9.0) and
+the **Linux** client, a thin shell over the shared Rust core in the sibling `crates/` workspace.
+A native Swift macOS menu-bar client (SwiftUI + AppKit) also lives here — its release job
+retired in 0.9.0, but the sources are retained pending a later demolition and stay buildable
+(`make -C desktop test`). This file orients an AI assistant working in this subtree. The root
+`CLAUDE.md` owns the monorepo layout + release model; `crates/CLAUDE.md` owns the core.
 
 Run targets from here with `make <target>`, or from the monorepo root with `make -C desktop
 <target>` / the `make desktop-<target>` passthrough.
@@ -45,16 +47,16 @@ Core/UI split (see `docs/desktop/architecture.md`):
 The dedicated GTK client that used to ship the `.deb` has been **retired** — Tauri replaced
 it. There is no `--target gtk` and no `shed-gtk` crate.
 
-The Tauri client also has a **macOS packaging path** (Swift→Tauri transition): `make
-tauri-bundle-mac` / `make tauri-dmg-mac` build a signed `ShedDesktop.app`/DMG with an
+The Tauri client also has a **macOS packaging path**, the shipped macOS client as of 0.9.0:
+`make tauri-bundle-mac` / `make tauri-dmg-mac` build a signed `ShedDesktop.app`/DMG with an
 embedded real Sparkle updater. On **Darwin** every Tauri build (`tauri-build`/`-lint`/`-test`/
 `-run`) needs `Sparkle.framework` staged first (`make sparkle-framework` runs
 `scripts/fetch-sparkle.sh`, pinned + gitignored) — the sparkle-updater crate's `build.rs`
-panics without it. The mac Tauri bundle aligns its identity to the Swift app
-(`ai.stridelabs.ShedDesktop`, mac-only overlay `tauri.macos.conf.json`), so the mac dev
+panics without it. The mac Tauri bundle aligns its identity to the (retired-release-job) Swift
+app's (`ai.stridelabs.ShedDesktop`, mac-only overlay `tauri.macos.conf.json`), so the mac dev
 config dir is `~/Library/Application Support/ai.stridelabs.ShedDesktop`; the **Linux** identity
 `ai.stridelabs.shed-desktop` (polkit/D-Bus/nfpm) is unchanged. See `desktop/RELEASING.md` for
-the beta-rollout release flow.
+the release flow.
 
 ## The change loop (macOS)
 

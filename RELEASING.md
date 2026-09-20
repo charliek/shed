@@ -20,7 +20,7 @@ equals the tag**:
 |---|---|---|
 | `server` | `.claude-plugin/plugin.json` `.version` (file unchanged; the component was renamed from `go`) | brew `shed`, apt `shed-server` deb, ghcr rootfs images (vz/fc + build-tools) |
 | `host-agent` | `crates/shed-host-agent/VERSION` | brew `shed-host-agent` + a GH release linux tarball. **brew-only — no apt deb.** |
-| `desktop` | `desktop/VERSION` (with `crates/Cargo.toml`, the Tauri `Cargo.toml`/`tauri.conf.json`, and both Cargo locks in verified lockstep) | ShedDesktop DMG + Sparkle appcast, `shed-desktop` debs — during the Swift→Tauri transition, **stable** tags ship the Swift DMG and **prerelease** (`-`) tags ship the Tauri DMG on the appcast beta channel (see [`desktop/RELEASING.md`](desktop/RELEASING.md)) |
+| `desktop` | `desktop/VERSION` (with `crates/Cargo.toml`, the Tauri `Cargo.toml`/`tauri.conf.json`, and both Cargo locks in verified lockstep) | ShedDesktop DMG (Tauri, the macOS client as of 0.9.0) + Sparkle appcast, `shed-desktop` debs — a **prerelease** (`-`) tag ships on the appcast beta channel, a stable tag on the stable channel (see [`desktop/RELEASING.md`](desktop/RELEASING.md)) |
 
 `server` and `host-agent` are the two **goreleaser** components
 — each published by its own split config (`.goreleaser.server.yaml`,
@@ -296,6 +296,16 @@ appcast, debs, apt dispatch, rc-tag rehearsals) live in
    pre-retirement tag's own script emits `ship_machine_rc=true`, the job
    fails loudly on a tag push and warns on a dispatch republish — see
    the retired-component note under "Component selection".)
+
+   **One republish is deliberately NOT idempotent, and is refused.** The
+   macOS client changed implementation at **0.9.0** (Swift → Tauri), so
+   dispatching an older stable tag would build that tag's Tauri target,
+   `--clobber` the Swift DMG its users already installed, and re-sign
+   that version's appcast entry — same input, different application. The
+   `desktop-macos` job's first step detects a pre-0.9.0 dispatch and
+   **fails loudly** rather than shipping a different client into an
+   existing release. Image republishes of those tags are unaffected
+   (separate jobs); if you need one, re-run the image jobs alone.
 
    The `sync-version` job that existed pre-migration is **removed** —
    plugin.json is now bumped locally by the release skill before

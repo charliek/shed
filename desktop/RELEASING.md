@@ -32,11 +32,13 @@ the lockstep at workflow time and refuses to ship a drifted tree.
    (which run strictly after `release` succeeds), only add assets and
    never touch the body or clobber each other's uploads.
 
-2. **`desktop-macos`** (macos-15):
-   - Builds the Rust core + Swift app and assembles
-     `ShedDesktop.app` (`desktop/scripts/bundle.sh release`), runs the
-     unit tests, and packages the drag-install DMG
-     (`desktop/scripts/make-dmg.sh`).
+2. **`desktop-macos`** (macos-15) — the Tauri build, the macOS client as
+   of 0.9.0:
+   - Builds the Rust core + Tauri frontend and assembles the signed
+     `ShedDesktop.app`/DMG via `make -C desktop tauri-dmg-mac`
+     (`scripts/bundle-tauri-mac.sh` under the hood — Sparkle staged
+     first by `scripts/fetch-sparkle.sh`), then runs
+     `make -C desktop tauri-test` (the Tauri crate's unit tests).
    - **Developer ID signing + notarization** activate automatically
      when ALL six Apple secrets exist (the `CAN_NOTARIZE` gate — any
      missing secret means an ad-hoc-signed DMG with the FIRST-LAUNCH
@@ -48,8 +50,10 @@ the lockstep at workflow time and refuses to ship a drifted tree.
      desktop-only releases the notarization guidance is **appended**
      (not overwritten).
    - **Sparkle appcast**: signs the (stapled) DMG with
-     `SPARKLE_ED_PRIVATE_KEY` via the Sparkle distribution's
-     `sign_update`, appends the entry to `docs/appcast.xml` with
+     `SPARKLE_ED_PRIVATE_KEY` via
+     `desktop/tauri/src-tauri/.sparkle-dist/bin/sign_update` (staged by
+     `fetch-sparkle.sh` — there is no SwiftPM artifacts path for this
+     job), appends the entry to `docs/appcast.xml` with
      `desktop/scripts/update-appcast.py` (run from the REPO ROOT —
      `SHED_DESKTOP_APPCAST=docs/appcast.xml`,
      `SHED_DESKTOP_REPO=charliek/shed`), validates with `xmllint`, and
@@ -57,7 +61,9 @@ the lockstep at workflow time and refuses to ship a drifted tree.
      rebase-retry). The feed serves at
      `https://charliek.github.io/shed/appcast.xml` once docs.yml
      redeploys Pages. The bot must be a branch-protection bypass actor
-     on `main` for this push.
+     on `main` for this push. `update-appcast.py` is unchanged by the
+     0.9.0 promotion: it still stamps
+     `<sparkle:channel>beta</sparkle:channel>` iff the tag has a `-`.
 
 3. **`desktop-linux`** (matrix: ubuntu-24.04/amd64 +
    ubuntu-24.04-arm/arm64) — builds the Tauri-client `.deb` per native
@@ -82,7 +88,7 @@ All on `charliek/shed` (Settings → Secrets → Actions):
 | `APPLE_ID` | notarytool Apple ID — CAN_NOTARIZE 4/6 |
 | `APPLE_TEAM_ID` | notarytool team — CAN_NOTARIZE 5/6 |
 | `APPLE_APP_SPECIFIC_PASSWORD` | notarytool app-specific password — CAN_NOTARIZE 6/6 |
-| `SPARKLE_ED_PRIVATE_KEY` | EdDSA private key (base64) for appcast signing; the matching public key is baked into `desktop/Resources/Info.plist.template` (`SUPublicEDKey`) — never rotate one without the other |
+| `SPARKLE_ED_PRIVATE_KEY` | EdDSA private key (base64) for appcast signing; the matching public key is baked into `desktop/tauri/src-tauri/Info.plist:33-36` (`SUPublicEDKey`) — never rotate one without the other |
 | `RELEASE_BOT_CLIENT_ID` / `RELEASE_BOT_APP_KEY` | release-bot GitHub App (shared with the Go leg) — mints the appcast-push and apt-dispatch tokens |
 
 Verify the App installation + the self-repo `contents: write` floor
@@ -103,76 +109,69 @@ That makes `vX.Y.Z-rc.1` (with the desktop manifests bumped to match)
 the recommended dress rehearsal for DMG + notarize + EdDSA + appcast +
 deb before a first-of-its-kind release.
 
-## Tauri macOS app — the beta rollout (transition)
+## The Tauri macOS app
 
-The macOS app is transitioning from the Swift menu-bar app to the Tauri
-client. During the transition **the tag's channel picks the mac
-artifact** — two mutually exclusive jobs, exactly one per desktop-shipping
-tag (both still require `ship_desktop`, i.e. `desktop/VERSION` == the tag):
+`desktop-macos` is the only macOS desktop job — it runs on every
+desktop-shipping tag, stable and prerelease alike (`ship_desktop` still
+gates it, i.e. `desktop/VERSION` == the tag). It builds and ships the
+**Tauri** DMG; there is no separate Swift release job any more.
 
-| Tag shape | Job | Mac artifact | Appcast channel |
-|---|---|---|---|
-| Stable (`vX.Y.Z`) | `desktop-macos` (Swift) | `ShedDesktop-<ver>.dmg` (Swift) | stable |
-| Prerelease (`vX.Y.Z-rc.N`, any `-`) | `desktop-macos-tauri` | `ShedDesktop-<ver>.dmg` (Tauri) | beta |
+The appcast **channel** still depends on the tag shape, unchanged by the
+promotion: `update-appcast.py` stamps
+`<sparkle:channel>beta</sparkle:channel>` whenever the tag contains `-`
+(the same rc-tag guard as above), and plain `<sparkle:channel>` (stable)
+otherwise. The Tauri client itself subscribes to the **beta** channel
+iff its own version carries a prerelease suffix (`CARGO_PKG_VERSION`
+contains `-`) — so an rc build receives rc appcast entries and a stable
+build never does. That is what makes an rc1→rc2 pair a **real in-place
+Sparkle update**, not a same-version no-op.
 
-The gate is `contains(github.event.inputs.version || github.ref_name,
-'-')` (the Swift job carries the negation) — the `inputs.version ||`
-half keeps the `workflow_dispatch` republish path routing correctly
-(`ref_name` is a branch on dispatch). Both jobs emit the identically
-named `ShedDesktop-<ver>.dmg`, so the appcast append step is unchanged;
-`update-appcast.py` stamps `<sparkle:channel>beta</sparkle:channel>`
-whenever the tag contains `-` (the same rc-tag guard above).
-
-The Tauri client subscribes to the **beta** channel iff its own version
-carries a prerelease suffix (`CARGO_PKG_VERSION` contains `-`) — so an rc
-build receives rc appcast entries and a stable build never does. That is
-what makes an rc1→rc2 pair a **real in-place Sparkle update**, not a
-same-version no-op.
-
-### `desktop-macos-tauri` specifics (delta from the Swift job)
+### Job specifics
 
 - Builds via `make -C desktop tauri-dmg-mac` (Sparkle staged first by
   `scripts/fetch-sparkle.sh`, pinned Sparkle 2.8.1) and runs
-  `make -C desktop tauri-test` (the Tauri crate's unit tests — **not**
-  the Swift `make test`).
+  `make -C desktop tauri-test` (the Tauri crate's unit tests).
 - `sign_update` comes from
   `desktop/tauri/src-tauri/.sparkle-dist/bin/sign_update` (staged by
-  `fetch-sparkle.sh`), **NOT** the SwiftPM `desktop/.build/artifacts`
-  path the Swift job uses.
-- Signing is **deliberately stricter** than the Swift `bundle.sh`. The
-  Tauri script (`scripts/bundle-tauri-mac.sh`) signs Sparkle's nested
+  `fetch-sparkle.sh`) — there is no SwiftPM artifacts path for this job.
+- The Tauri script (`scripts/bundle-tauri-mac.sh`) signs Sparkle's nested
   helpers in the required inner→outer order (`Installer.xpc` →
   `Downloader.xpc` with `--preserve-metadata=entitlements` → `Autoupdate`
-  → `Updater.app` → `Sparkle.framework` → app) and **never `--deep`**,
-  while the Swift `bundle.sh` still `--deep`-signs its framework. Do NOT
-  "align" the Tauri script down to `--deep` — wrong order / `--deep`
-  signs and notarizes clean but breaks at update time.
+  → `Updater.app` → `Sparkle.framework` → app) and **never `--deep`** —
+  wrong order / `--deep` signs and notarizes clean but breaks at update
+  time.
 
-### Mandatory post-merge rehearsal before any promotion
+### Promoted in 0.9.0
 
-PR-time CI cannot prove installability — a wrong signing order
-notarizes clean and only fails when Sparkle applies the update. The only
-real proof is a two-tag rehearsal, done **after merge, before promotion**:
+The Tauri app is the shipped macOS client as of 0.9.0 — the former
+Swift release job (which used to own stable tags) is retired; the Swift
+*sources* stay in the tree pending a later demolition (see the
+follow-up ticket filed alongside the promotion commit).
 
-1. Cut `vX.Y.Z-rc.1` (desktop-only prerelease bump via
-   `scripts/release/update-version.sh X.Y.Z-rc.1 --components desktop`)
-   → `desktop-macos-tauri` builds/notarizes the beta DMG.
-2. **Install rc1's DMG by hand** (first install — nothing to update from
-   yet).
-3. Cut `vX.Y.Z-rc.2` (repeat the desktop version bump —
-   `update-version.sh X.Y.Z-rc.2 --components desktop` — commit, tag; a
-   tag without the bump fails `release-plan.sh`) and verify a **real
-   in-place Sparkle update rc1→rc2** in the installed app (the rc build
-   is on the beta channel, so it sees the rc2 entry). This is the
-   signing-order proof.
+The two-tag rc rehearsal described above (cut `vX.Y.Z-rc.1`, install by
+hand, cut `vX.Y.Z-rc.2`, verify a real in-place Sparkle update) remains
+the **recommended path for any future signing change** — PR-time CI
+cannot prove installability; a wrong signing order notarizes clean and
+only fails when Sparkle applies the update.
 
-### Promotion (a later decision — NOT this PR)
+**0.9.0 itself skipped that rehearsal, by owner decision** (few users;
+if the signing order is wrong, fix it live or in 0.9.1).
 
-Promotion flips the two job gates so **stable** tags build the Tauri DMG
-(and the Swift job retires). Because the Tauri mac bundle carries the
-Swift app's identity (`ai.stridelabs.ShedDesktop`) and the same EdDSA
-key, the first stable Tauri release rides the same-key appcast chain
-straight into existing Swift installs as an in-place update.
+Be precise about what that leaves unproven. The Tauri mac bundle carries
+the Swift app's identity (`ai.stridelabs.ShedDesktop`), the same EdDSA
+key and the same feed URL — all three verified statically — so the 0.9.0
+Tauri release is *aimed* straight at existing Swift installs through the
+same appcast chain. **Nothing has established that Sparkle performs that
+swap**: matching identity and key is what makes the update possible, not
+evidence that it works. The mac job has never run, and this is the first
+tag on which it will.
+
+That is exactly why the rehearsal exists, and the risk it covers is not
+hypothetical: a signing order that notarizes clean and only fails when
+Sparkle applies the update would leave Swift users on 0.8.1 with a
+failed-update dialog until 0.9.1. Accepted knowingly. Keep a Mac on
+Swift 0.8.1 to watch the first update land, and treat a failure there as
+a 0.9.1 blocker rather than a surprise.
 
 ## Local commands
 
