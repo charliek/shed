@@ -40,9 +40,13 @@ agrees). release-plan.sh never reads an `## Unreleased` heading: it anchors on t
   prerelease) collapse into one: the Tauri job takes the `desktop-macos` name and now runs
   on every tag shape, Swift's release job is deleted (`desktop-macos-tauri` appears
   nowhere in `.github/`), and its `if:` is byte-identical to `desktop-linux`'s. A Mac
-  running Swift 0.8.x gets a normal Sparkle prompt and updates **in place** into the Tauri
-  build — same bundle id, same EdDSA key, same appcast feed — gaining everything Swift
-  never had: the machines tab, the roost bootstrap (S5), and agent lanes (opencode, gx).
+  running Swift 0.8.x should get a normal Sparkle prompt and update **in place** into the
+  Tauri build — same bundle id, same EdDSA key, same appcast feed, all three verified — and
+  gain everything Swift never had: the machines tab, the roost bootstrap (S5), and agent
+  lanes (opencode, gx). **This is the first release to run that path**: the mac job has
+  never executed and the two-release rehearsal was skipped deliberately, so if Sparkle
+  reports a failed update, install the DMG by hand from the releases page and file it —
+  matching identity and key make the swap possible, not proven.
   **What it loses: preferences do not migrate.** Swift stores them in `UserDefaults`
   (`desktop/Sources/ShedDesktopApp/PreferencesStore.swift`); Tauri reads `prefs.json`
   (`desktop/tauri/src-tauri/src/prefs.rs`) — terminal, approvals, policy, and

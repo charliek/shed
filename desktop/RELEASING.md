@@ -155,13 +155,23 @@ cannot prove installability; a wrong signing order notarizes clean and
 only fails when Sparkle applies the update.
 
 **0.9.0 itself skipped that rehearsal, by owner decision** (few users;
-if the signing order is wrong, fix it live or in 0.9.1). Because the
-Tauri mac bundle carries the Swift app's identity
-(`ai.stridelabs.ShedDesktop`) and the same EdDSA key, the 0.9.0 Tauri
-release rides the same-key appcast chain straight into existing Swift
-installs as an in-place update — so the rehearsal's value (proving the
-signing order doesn't break that in-place update) is real and not
-hypothetical; it just wasn't exercised before this release.
+if the signing order is wrong, fix it live or in 0.9.1).
+
+Be precise about what that leaves unproven. The Tauri mac bundle carries
+the Swift app's identity (`ai.stridelabs.ShedDesktop`), the same EdDSA
+key and the same feed URL — all three verified statically — so the 0.9.0
+Tauri release is *aimed* straight at existing Swift installs through the
+same appcast chain. **Nothing has established that Sparkle performs that
+swap**: matching identity and key is what makes the update possible, not
+evidence that it works. The mac job has never run, and this is the first
+tag on which it will.
+
+That is exactly why the rehearsal exists, and the risk it covers is not
+hypothetical: a signing order that notarizes clean and only fails when
+Sparkle applies the update would leave Swift users on 0.8.1 with a
+failed-update dialog until 0.9.1. Accepted knowingly. Keep a Mac on
+Swift 0.8.1 to watch the first update land, and treat a failure there as
+a 0.9.1 blocker rather than a surprise.
 
 ## Local commands
 
