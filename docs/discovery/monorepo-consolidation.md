@@ -17,6 +17,24 @@ Design document for consolidating the shed family of repos into a single monorep
 > host-agent-port plan is panel-reviewed and pending a go-ahead. The shed-mobile
 > Rust spike (§7 Phase 0) runs in parallel and gates no phase here. §3 decisions
 > were settled 2026-07-06/07; §10 lists remaining implementation details.
+>
+> **Update (2026-09-21, plan 022/S6, [`charliek/shed#328`](https://github.com/charliek/shed/issues/328)).**
+> `shed-ext-rc` and the RC hub it fed are **retired** — the guest binary is out of the
+> images, `internal/ext/rc`, `cmd/shed-ext-rc`, `shed-rc-engine`, `shed-broker`'s `rc_hub`
+> and `tests/rc-parity` are deleted, and agent sessions are roost tabs reached through
+> `shed attach` / `shed sessions`. The four `shed-ext-rc` mentions below are left as
+> written: §1's inventory records what the old repos **contained at import time**, §2's tree and §4.3's build step record the layout **as designed**, and
+> §7's future bucket records what was **contemplated then** (the "reconcile `shed-ext-rc`
+> vs `shed-machine-rc` naming" item is moot — both are gone). Three guest extension
+> binaries ship now, not four.
+>
+> `shed-machine-rc` is stale on this page for the same reason: §3 decision 13 ("stays a
+> standalone formula/deb") and §6 ("is **not** absorbed") describe a component
+> **retired in plan 010**, when the `shed-host-agent` daemon took over the machine RC
+> hub; its brew/apt artifacts are frozen at v0.8.2 and the hub it hosted is now gone
+> too. The consolidation this page designs did happen and §§1–5 still describe the
+> repo you are looking at — but treat every `shed-ext-rc` / `shed-machine-rc` line in
+> it as history.
 
 ## 1. Current State Summary
 
