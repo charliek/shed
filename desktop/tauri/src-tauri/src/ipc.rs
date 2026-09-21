@@ -1013,7 +1013,7 @@ impl Handler {
         json!({ "machines": self.machines.status() })
     }
 
-    /// `machine.add {name, host?, user?, ssh_port?, rc_bin?}` → append the
+    /// `machine.add {name, host?, user?, ssh_port?}` → append the
     /// machine to the shed config and start watching it.
     ///
     /// The same implementation the Add dialog invokes — the harness drives the

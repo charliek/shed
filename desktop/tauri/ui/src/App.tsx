@@ -352,17 +352,18 @@ function ShedsPane({ sheds, hostErrors, refresh, onNew, roostTick, onOpenConsent
   );
 }
 
-/** Add a machine — a native host reached over SSH that runs the RC hub.
+/** Add a machine — a native host reached over SSH for its `roost-session`.
  *
  *  Mirrors the New Shed dialog because it is the same kind of act: naming a
  *  place your sessions can run.
  *
- *  It does NOT collect `rc_bin` (it was labelled "sx path"). `sx` was sunset,
- *  unreleased, in plan 016, so the field asked for a path to a binary that no
- *  longer ships and that nobody filling in this dialog could usefully supply.
- *  `machine.add` still ACCEPTS `rc_bin` and the config reader still honours an
- *  entry that has one, so a hand-written config keeps working — this is the
- *  form dropping a question, not the wire dropping a field.
+ *  It does NOT collect `rc_bin` — that field named a path to `sx`'s RC
+ *  binary, and `sx` was sunset, unreleased, in plan 016. C8 (plan 022 S6)
+ *  finished the retirement: `machine.add` no longer accepts `rc_bin` and
+ *  `shed_core::config::MachineEntry` no longer models it. A hand-written
+ *  `~/.shed/config.yaml` that still carries a leftover `rc_bin:` key keeps
+ *  loading regardless — the config reader silently ignores any key it
+ *  doesn't model.
  */
 function NewMachineDialog({ onClose, onAdded }: { onClose: () => void; onAdded: () => void }) {
   const fid = useId();

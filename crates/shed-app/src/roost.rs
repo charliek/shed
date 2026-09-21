@@ -1146,7 +1146,7 @@ fn write_private(path: &Path, contents: &[u8]) -> std::io::Result<()> {
 /// shape the bridge already takes — no second transport, no second host-key
 /// posture, no second place for the port to be wrong.
 ///
-/// Three fields are decided rather than copied:
+/// Two fields are decided rather than copied:
 ///
 /// * **`name` is the target grammar's own token**, `roost:<server>/<shed>`, not
 ///   the shed's bare name. It is what every sentence, row origin and
@@ -1157,9 +1157,6 @@ fn write_private(path: &Path, contents: &[u8]) -> std::io::Result<()> {
 /// * **`known_hosts` is always pinned.** shed mints these host keys itself, so
 ///   unlike a `machines:` entry there is no user `ssh_config` to defer to and no
 ///   case where deferring would be right.
-/// * **`rc_bin` is `None`.** This entry is never an RC target; it exists to be
-///   handed to a roost reach. (Pin P7 keeps `machines[].rc_bin` out of scope
-///   entirely.)
 pub fn shed_reach_entry(server: &shed_core::config::ShedServerEntry, shed: &str) -> MachineEntry {
     MachineEntry {
         name: format!("roost:{}/{}", server.name, shed),
@@ -1174,7 +1171,6 @@ pub fn shed_reach_entry(server: &shed_core::config::ShedServerEntry, shed: &str)
         },
         user: Some(shed.to_string()),
         ssh_port: server.ssh_port,
-        rc_bin: None,
         known_hosts: Some(crate::backend::known_hosts_path()),
     }
 }
@@ -2944,7 +2940,6 @@ mod tests {
             host: name.to_string(),
             user: None,
             ssh_port: 22,
-            rc_bin: None,
             known_hosts: None,
         }
     }
@@ -5342,7 +5337,6 @@ exec {env_bin} -i {assignments} /bin/sh -c "$remote"
         assert_eq!(reach.host, "10.0.0.4");
         assert_eq!(reach.user.as_deref(), Some("p019-a"));
         assert_eq!(reach.ssh_port, 2222);
-        assert_eq!(reach.rc_bin, None);
         assert!(
             reach
                 .known_hosts
@@ -5499,7 +5493,6 @@ esac
                 host: "10.0.0.4".to_string(),
                 user: Some("p019-a".to_string()),
                 ssh_port: 2222,
-                rc_bin: None,
                 known_hosts: None,
             };
             let exec = SshExec::new(&entry, &exec_options(ssh)).expect("exec");

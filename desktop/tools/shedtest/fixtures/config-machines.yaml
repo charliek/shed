@@ -16,9 +16,11 @@
 # None of them is special to the app; all three entries are identical, and the
 # difference is entirely in what the harness serves.
 #
-# `rc_bin` is deliberately absent: roost needs no `sx` on the far side. The field
-# is still tolerated by the config reader (and by `machine.add`), which is what
-# the add test writes.
+# `rc_bin` is absent: roost needs no `sx` on the far side, and as of C8 (plan
+# 022 S6) neither the config reader nor `machine.add` models the field at all
+# any more — a leftover `rc_bin:` key in a hand-written config still loads
+# (the reader silently ignores any key it doesn't model), but nothing here
+# writes or reads one any more.
 servers:
     mock:
         host: 127.0.0.1

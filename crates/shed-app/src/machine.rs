@@ -654,7 +654,6 @@ mod tests {
             host: "mini3".into(),
             user: Some("charliek".into()),
             ssh_port: 22,
-            rc_bin: None,
             known_hosts: None,
         }
     }

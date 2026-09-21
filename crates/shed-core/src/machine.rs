@@ -1,6 +1,5 @@
 //! **Machine targets** — reaching a native host over SSH. The PURE half: how a
-//! machine is addressed, the SSH argv it is reached with, and the argv prefix it
-//! is invoked through. No process is
+//! machine is addressed and the SSH argv it is reached with. No process is
 //! spawned here and no socket is opened; that is the transport's job
 //! (`shed_app::machine`), which differs per client.
 //!
@@ -51,13 +50,6 @@ pub fn shell_quote_always(s: &str) -> String {
     format!("'{}'", s.replace('\'', r"'\''"))
 }
 
-/// The binary a `machine:` target invokes when its entry names none — resolved
-/// on the machine's non-login SSH `PATH`.
-pub const DEFAULT_MACHINE_BIN: &str = "sx";
-
-/// The `sx` namespace carrying the one-shot engine verbs.
-const RC_NAMESPACE: &str = "rc";
-
 /// Resolve a machine by name, or explain what is configured.
 ///
 /// The error text is deliberately actionable in both directions: with machines
@@ -79,22 +71,6 @@ pub fn resolve<'a>(config: &'a ShedConfig, name: &str) -> Result<&'a MachineEntr
             known.join(", ")
         )
     })
-}
-
-/// The RC argv prefix to invoke on a machine: `<bin> rc`.
-///
-/// `machines[].rc_bin` names WHERE the binary lives on that machine — an absolute
-/// path when it is not on the non-login `PATH` an SSH exec sees — and the `rc`
-/// namespace is always appended.
-pub fn rc_prefix(entry: &MachineEntry) -> Vec<String> {
-    vec![
-        entry
-            .rc_bin
-            .as_deref()
-            .unwrap_or(DEFAULT_MACHINE_BIN)
-            .to_string(),
-        RC_NAMESPACE.to_string(),
-    ]
 }
 
 /// Non-interactive ssh to a machine, carrying `remote_argv` as one shell-quoted
@@ -232,7 +208,6 @@ mod tests {
             host: "mini2.local".into(),
             user: Some("charliek".into()),
             ssh_port: 2022,
-            rc_bin: Some("/opt/bin/sx".into()),
             known_hosts: Some("/kh".into()),
         }
     }
@@ -340,6 +315,8 @@ mod tests {
 machines:
     mini2:
         host: mini2.local
+        # An unknown key (retired with sx's rc_bin plumbing, C8): resolve()
+        # must still find this entry.
         rc_bin: /opt/homebrew/bin/sx
     plain: {}
 ",
@@ -347,23 +324,13 @@ machines:
     }
 
     #[test]
-    fn resolving_a_machine_reads_its_entry_and_its_rc_prefix() {
+    fn resolving_a_machine_reads_its_entry() {
         let cfg = config();
         let entry = resolve(&cfg, "mini2").unwrap();
         assert_eq!(entry.host, "mini2.local");
-        // An override says WHERE the binary lives; the `rc` namespace is still
-        // appended.
-        assert_eq!(
-            rc_prefix(entry),
-            vec!["/opt/homebrew/bin/sx".to_string(), "rc".to_string()]
-        );
 
         let entry = resolve(&cfg, "plain").unwrap();
         assert_eq!(entry.host, "plain");
-        assert_eq!(
-            rc_prefix(entry),
-            vec![DEFAULT_MACHINE_BIN.to_string(), "rc".to_string()]
-        );
     }
 
     #[test]

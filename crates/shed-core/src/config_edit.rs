@@ -65,7 +65,6 @@ pub struct NewMachine<'a> {
     pub host: Option<&'a str>,
     pub user: Option<&'a str>,
     pub ssh_port: Option<u16>,
-    pub rc_bin: Option<&'a str>,
 }
 
 /// Return `text` with `machine` inserted, or an [`EditError`].
@@ -179,7 +178,6 @@ fn expected_entry(m: &NewMachine<'_>) -> crate::config::MachineEntry {
             .to_string(),
         user: m.user.filter(|u| !u.is_empty()).map(str::to_string),
         ssh_port: m.ssh_port.unwrap_or(22),
-        rc_bin: m.rc_bin.filter(|b| !b.is_empty()).map(str::to_string),
         ..Default::default()
     }
 }
@@ -240,9 +238,6 @@ fn entry_lines(m: &NewMachine<'_>, indent: usize) -> Vec<String> {
     if let Some(p) = m.ssh_port.filter(|p| *p != 22) {
         out.push(format!("{inner}ssh_port: {p}"));
     }
-    if let Some(b) = m.rc_bin.filter(|b| !b.is_empty()) {
-        out.push(field("rc_bin", b));
-    }
     out
 }
 
@@ -291,7 +286,6 @@ mod tests {
             host: None,
             user: None,
             ssh_port: None,
-            rc_bin: None,
         }
     }
 
@@ -377,7 +371,6 @@ some_key_this_crate_does_not_model:
             host: Some("100.64.0.3"),
             user: Some("charliek"),
             ssh_port: Some(2200),
-            rc_bin: Some("/home/charliek/.local/bin/sx"),
         };
         let out = insert_machine("", &full).unwrap();
         let cfg = crate::config::ShedConfig::parse(&out);
@@ -385,7 +378,6 @@ some_key_this_crate_does_not_model:
         assert_eq!(e.host, "100.64.0.3");
         assert_eq!(e.user.as_deref(), Some("charliek"));
         assert_eq!(e.ssh_port, 2200);
-        assert_eq!(e.rc_bin.as_deref(), Some("/home/charliek/.local/bin/sx"));
 
         // The default port is left out rather than written — the file should not
         // fill with values that only restate the default.
@@ -443,7 +435,6 @@ some_key_this_crate_does_not_model:
             host: Some("host: with colon"),
             user: None,
             ssh_port: None,
-            rc_bin: None,
         };
         let out = insert_machine("", &odd).unwrap();
         assert!(out.contains("\"host: with colon\""), "{out}");
@@ -490,7 +481,6 @@ some_key_this_crate_does_not_model:
                 host: Some(bad_host),
                 user: None,
                 ssh_port: None,
-                rc_bin: None,
             };
             let out = insert_machine("", &entry);
             assert!(
@@ -532,7 +522,6 @@ some_key_this_crate_does_not_model:
             host: Some("100.64.0.3"),
             user: Some("charliek"),
             ssh_port: Some(2200),
-            rc_bin: Some("/home/charliek/.local/bin/sx"),
         };
         let out = insert_machine("", &entry).unwrap();
         assert_eq!(

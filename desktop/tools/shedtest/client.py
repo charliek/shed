@@ -481,12 +481,11 @@ class TauriClient(_ApprovalOps, _RcOps, _RustCoreClient):
         return self.call("machine.capabilities", {"machine": machine})["capabilities"]
 
     def machine_add(self, name: str, host: str | None = None, user: str | None = None,
-                    ssh_port: object | None = None, rc_bin: str | None = None) -> None:
+                    ssh_port: object | None = None) -> None:
         """Append a machine to the shed config and start watching it now — the
         same path the Add dialog drives."""
         params: dict = {"name": name}
-        for k, v in (("host", host), ("user", user), ("ssh_port", ssh_port),
-                     ("rc_bin", rc_bin)):
+        for k, v in (("host", host), ("user", user), ("ssh_port", ssh_port)):
             if v is not None:
                 params[k] = v
         self.call("machine.add", params)

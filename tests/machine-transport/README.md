@@ -1,6 +1,6 @@
 # tests/machine-transport — the machine-transport differential
 
-The **fifth** pytest suite in this repo, and — like the other four — never merged
+The **fourth** pytest suite in this repo, and — like the other three — never merged
 with them:
 
 | suite | what it drives |
@@ -8,8 +8,12 @@ with them:
 | `tests/integration/` | a LIVE `shed-server` create cycle |
 | `tests/host-agent-diff/` | the `shed-host-agent` daemon's wire output, vs recorded goldens |
 | `desktop/tools/shedtest/` | the desktop app over its IPC socket |
-| `tests/rc-parity/` | `sx rc <verb>` vs the Go oracle, side by side |
 | **`tests/machine-transport/`** | **every transport that reaches a machine over SSH, against one shared contract** |
+
+(A fifth, `tests/rc-parity/`, existed through plan 022 C4 — the Go↔Rust RC hub
+differential. C4 deleted it along with the RC hub itself; nothing here
+replaces it, because nothing left in either language composes the wire it
+was diffing.)
 
 ## Why it exists
 
@@ -20,8 +24,8 @@ not share an SSH implementation (that was a deliberate decision — see the plan
 
 | transport | used by | composes the wire line in |
 |---|---|---|
-| the `ssh` binary as a child process | `sx`, the Tauri desktop app | Rust (`shed_core::machine::display_line`) |
-| `dartssh2` | shed-mobile | nothing, as of plan 013 — the roost-session reach it drives execs a Rust-composed string wholesale rather than an `sx`-style argv (see "The Dart leg" below) |
+| the `ssh` binary as a child process | the Tauri desktop app (today, only `shed-gx`'s discovery probe — `sx`, the other historical caller, was sunset, unreleased, in plan 016) | Rust (`shed_core::machine::display_line`) |
+| `dartssh2` | shed-mobile | nothing, as of plan 013 — the roost-session reach it drives execs a Rust-composed string wholesale rather than an argv built through this contract (see "The Dart leg" below) |
 
 Two implementations of one wire contract drift silently, and the drift is
 invisible in ordinary testing because both usually *work*. This suite is the
@@ -57,10 +61,14 @@ work against a real server. Neither covers both alone.
 The live leg reimplements the quoting **rule** in five lines rather than calling
 the Rust implementation — if it called Rust, a quoter bug would be invisible
 because both sides would carry it. It also swaps `argv[0]` for a probe script
-(the scenarios' `argv[0]` is `sx`, which does not exist on the test host), so it
-transmits the same quoting rather than the literal golden line. What it asserts —
-the argv the remote process received — comes from `scenarios.json`, not from
-either golden, so `UPDATE_GOLDEN=1` cannot paper over a real quoting bug.
+— every scenario's `argv[0]` is `sh` as of contract version 3 (C8 re-pointed
+the corpus onto the shape `shed-gx`'s probe actually sends), which DOES exist
+on the test host, but the swap still happens: the receiver has to run in its
+place to observe what arrived, regardless of what the scenario names — so it
+transmits the same quoting rather than the literal golden line. What it
+asserts — the argv the remote process received — comes from `scenarios.json`,
+not from either golden, so `UPDATE_GOLDEN=1` cannot paper over a real quoting
+bug.
 
 ## What the live leg actually measures
 
@@ -85,11 +93,20 @@ reaching a machine's `roost-session` — since that plan it execs the string
 (`roost_remote_command()` over FRB), the same composer every other client
 uses, so there is nothing left for a Dart-side leg to independently verify.
 
-The `shed_core::machine::*` argv builders this contract still pins — the ones
-`sx rc` sends over the `ssh` binary — are on the S6 deletion path (see
-`epics/roost-pivot.md`, S7): once the RC hub, `shed-ext-rc`, and the Go
-engine retire and `sx` is stripped to a stub, this contract goes with them.
-Until then, the Rust and live legs above are the whole of it.
+The `shed_core::machine::*` argv builders this contract pins used to be `sx
+rc`'s — `sx` was sunset, unreleased, in plan 016, and S6 (plan 022, C8,
+`charliek/shed#328`) deleted the RC hub, `shed-ext-rc`, and the Go engine that
+subject belonged to. The corpus did NOT retire with them: 18 of its 19
+scenarios were **re-pointed**, not deleted, onto `["sh", "-c", <script>]`
+— the shape `shed_app::machine::exec` still composes today, for
+`shed-gx`'s discovery probe (`crates/shed-gx/src/discovery.rs::PROBE_SCRIPT`,
+already this contract's `gx-probe` scenario). Every quoting property the
+retired scenarios pinned (embedded quotes, `$VAR`, command substitution,
+metacharacters, redirection/globs, newlines, tabs, a leading dash, unicode,
+the empty argument) survives, now carried as the script body instead of an
+`sx rc create --name <value>` flag value — see `scenarios.json`'s `"//C8"`
+entry and each scenario's `why`. The Rust and live legs above are still the
+whole of it.
 
 ## The forwarded-hub family
 

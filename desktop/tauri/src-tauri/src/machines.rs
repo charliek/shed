@@ -101,7 +101,7 @@ pub fn add_from_json(
             .filter(|v| !v.is_empty())
             .map(str::to_string)
     };
-    let (host, user, rc_bin) = (field("host"), field("user"), field("rc_bin"));
+    let (host, user) = (field("host"), field("user"));
     // A port that cannot be understood is REJECTED, not silently defaulted:
     // "22" appearing where the user typed 2200 is worse than an error, because
     // the dialog would report success and the machine would be unreachable for
@@ -135,7 +135,6 @@ pub fn add_from_json(
             host: host.as_deref(),
             user: user.as_deref(),
             ssh_port,
-            rc_bin: rc_bin.as_deref(),
         },
     )
     .map_err(|e| e.to_string())?;
@@ -332,7 +331,6 @@ mod tests {
             user: Some("nobody".to_string()),
             ssh_port: 22,
             known_hosts: None,
-            rc_bin: None,
         }
     }
 

@@ -551,16 +551,17 @@ export async function openTerminal(shed: string, host: string, session?: string)
  *  Everything but `name` is optional and falls back to the config reader's own
  *  defaults, so adding `mini3` really is one field.
  *
- *  `rc_bin` is still on the wire (`machine.add` accepts it, and a hand-written
- *  config entry that sets it is still honoured) but the New Machine dialog no
- *  longer asks for it: it named a path to `sx`, which was sunset, unreleased,
- *  in plan 016. */
+ *  `rc_bin` is gone from the wire as of C8 (plan 022 S6): it named a path to
+ *  `sx`'s RC binary, and `sx` was sunset, unreleased, in plan 016. A
+ *  hand-written config entry that still carries a leftover `rc_bin:` key
+ *  keeps loading — the config reader silently ignores any key it doesn't
+ *  model — but `machine.add` no longer accepts it and this type no longer
+ *  carries it. */
 export type NewMachine = {
   name: string;
   host?: string;
   user?: string;
   ssh_port?: number;
-  rc_bin?: string;
 };
 
 /** Append a machine to `~/.shed/config.yaml` and start watching it.

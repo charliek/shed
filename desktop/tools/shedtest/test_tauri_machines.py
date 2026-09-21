@@ -261,12 +261,12 @@ def test_adding_a_machine_writes_the_config_and_starts_watching_it(addable_app):
     before = cfg.read_text()
     assert "mini4" not in before
 
-    app.machine_add("mini4", user="charliek", rc_bin="/opt/sx")
+    app.machine_add("mini4", user="charliek", ssh_port=2200)
 
     # It is in the file …
     after = cfg.read_text()
     assert "mini4:" in after
-    assert "/opt/sx" in after
+    assert "2200" in after
     # … and INSERT-ONLY: every original line survives, in order. This file is
     # hand-maintained, so an edit that reflowed it would be a bug even if the
     # result parsed.

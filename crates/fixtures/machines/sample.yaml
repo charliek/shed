@@ -8,8 +8,11 @@
 #   bare    — name only: host defaults to the entry name, ssh_port to 22,
 #             every optional absent.
 #   full    — every field Go models set explicitly.
-#   withrc  — carries `rc_bin` (Rust-owned, Go ignores it) and an unknown key
-#             (`color`) neither language models; must still decode cleanly.
+#   withrc  — carries a leftover `rc_bin` (retired with `sx` in C8, plan 022
+#             S6 — neither language models it any more) and an unknown key
+#             (`color`); must still decode cleanly. The tolerance negative
+#             control: break either decoder's unknown-key tolerance and this
+#             entry stops decoding.
 #   broken  — malformed: its value is a scalar, not a mapping. Both decoders
 #             must skip it (with a stderr note on the Go side) and keep
 #             decoding the entries around it.
