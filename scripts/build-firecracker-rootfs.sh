@@ -112,7 +112,7 @@ cleanup() {
     # stage-guest-binaries.sh.
     rm -f "$FIRECRACKER_DIR/shed-agent" "$FIRECRACKER_DIR/shed-firstboot" \
           "$FIRECRACKER_DIR/shed-ext-ssh-agent" "$FIRECRACKER_DIR/shed-ext-aws-credentials" \
-          "$FIRECRACKER_DIR/docker-credential-shed" "$FIRECRACKER_DIR/shed-ext-rc"
+          "$FIRECRACKER_DIR/docker-credential-shed"
     rm -rf "$FIRECRACKER_DIR/ext-etc"
 }
 

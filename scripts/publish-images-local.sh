@@ -193,7 +193,7 @@ command -v "${SHED_BIN}" >/dev/null || fail "shed binary missing at ${SHED_BIN}"
 [ -f "${WORK_DIR}/${BACKEND_DIR}/shed-agent" ]     || fail "${WORK_DIR}/${BACKEND_DIR}/shed-agent missing; cross-build with GOOS=linux GOARCH=${PLATFORM#linux/}"
 [ -f "${WORK_DIR}/${BACKEND_DIR}/shed-firstboot" ] || fail "${WORK_DIR}/${BACKEND_DIR}/shed-firstboot missing; cross-build with GOOS=linux GOARCH=${PLATFORM#linux/}"
 # Guest extension binaries + /etc overlay staged by scripts/stage-guest-binaries.sh.
-for guest_bin in shed-ext-ssh-agent shed-ext-aws-credentials docker-credential-shed shed-ext-rc; do
+for guest_bin in shed-ext-ssh-agent shed-ext-aws-credentials docker-credential-shed; do
   [ -f "${WORK_DIR}/${BACKEND_DIR}/${guest_bin}" ] || fail "${WORK_DIR}/${BACKEND_DIR}/${guest_bin} missing; run scripts/stage-guest-binaries.sh ${BACKEND_DIR} ${PLATFORM#linux/}"
 done
 [ -d "${WORK_DIR}/${BACKEND_DIR}/ext-etc" ]        || fail "${WORK_DIR}/${BACKEND_DIR}/ext-etc missing; run scripts/stage-guest-binaries.sh ${BACKEND_DIR} ${PLATFORM#linux/}"

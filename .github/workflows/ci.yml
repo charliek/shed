@@ -138,12 +138,12 @@ jobs:
               # Rust side: the graduated engine crate (`shed-rc-engine`,
               # re-exported through `shed-app`'s `rc` feature) over the pure
               # kernel (`shed-core::rc_agents`). Go side: the engine
-              # (`internal/ext/rc`), its CLI shell (`internal/ext/clirc`) and BOTH
-              # binaries built from them — the test-only oracle
-              # (tests/rc-parity/oracle — the retired shed-machine-rc's main,
-              # covered by the tests/rc-parity/** entry below, and since plan 016
-              # the session-creation stimulus for BOTH legs) and the guest
-              # `shed-ext-rc`, which share the same wire surface.
+              # (`internal/ext/rc`), its CLI shell (`internal/ext/clirc`) and the
+              # test-only oracle built from them (tests/rc-parity/oracle — the
+              # retired shed-machine-rc's main, covered by the tests/rc-parity/**
+              # entry below, and since plan 016 the session-creation stimulus for
+              # BOTH legs). The guest `shed-ext-rc` binary that used to share this
+              # wire surface was retired from the image in plan 022 (S6).
               - 'crates/shed-core/**'
               - 'crates/shed-app/**'
               - 'crates/shed-rc-engine/**'
@@ -161,7 +161,6 @@ jobs:
               - 'internal/ext/rc/**'
               - 'internal/ext/clirc/**'
               - 'internal/version/**'
-              - 'cmd/shed-ext-rc/**'
               - 'tests/rc-parity/**'
               # The crates-local fixture COPIES (panes, jsonl, wire goldens).
               # The byte-parity sweep that guards them is a Go test, and the
