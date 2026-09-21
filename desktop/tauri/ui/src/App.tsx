@@ -30,13 +30,14 @@ import {
   fetchApprovals, decideApproval, fetchActivity, fetchGateNamespaces,
   fetchEgressProfiles, reportEgress, inTauri,
   openPreferences, setAppearanceState,
-  rcLaunch, machineLaunch, machineCapabilities, killSession, sessionKey, reportAgents, reportMachinesPane, useRcSessions, openMachineTerminal, addMachine,
+  rcLaunch, machineLaunch, machineCapabilities, killSession, sessionKey, reportAgents, reportLaunchDialog, reportMachinesPane, useRcSessions, openMachineTerminal, addMachine,
   useCoordinatorData, useNowTick, shedsEmptyState, hostFailureFor, attachKind, capabilitiesFor,
   type Pane, type Shed, type HostDiskUsage, type HostFailure,
   type Modal, type CreateProgress, type Approval, type AuditEntry,
   type EgressProfile, type EgressProfileInfo, type HostEgressProfiles, type EgressReport,
   type RcSession, type RcKind, type RcState,
-  type RcCapabilities, type MachineStatus, type MachinePaneRow, offeredKinds, rcAuthHint,
+  type RcCapabilities, type MachineStatus, type MachinePaneRow, type AgentsLoad,
+  offeredKinds, agentsEmptyState,
 } from "@/lib/bridge";
 
 /** "server/shed" when multi-server, else the shed name. */
@@ -519,25 +520,26 @@ function rcStateTone(state: RcState): Tone {
   return "attention";
 }
 
-function AgentsPane({ sessions, machines, capabilities, onLaunch, refresh, onTranscript }:
-  { sessions: RcSession[]; machines: MachineStatus[]; capabilities: Record<string, RcCapabilities>; onLaunch: () => void; refresh: () => void; onTranscript: (s: RcSession) => void }) {
+function AgentsPane({ sessions, machines, capabilities, load, loadError, onLaunch, refresh, onTranscript, onSetUpRoost }:
+  { sessions: RcSession[]; machines: MachineStatus[]; capabilities: Record<string, RcCapabilities>; load: AgentsLoad; loadError: string | null; onLaunch: () => void; refresh: () => void; onTranscript: (s: RcSession) => void; onSetUpRoost: () => void }) {
   const [error, setError] = useState<string | null>(null);
-  // With machines configured but none reachable, "no agents running" is a claim
-  // this pane cannot actually make — it has not been able to look. Say so, and
-  // point at the pane that carries the reason.
-  const down = machines.filter((m) => !m.reachable).length;
-  const emptyBody =
-    down > 0 && down === machines.length
-      ? `Launch an agent inside a shed. ${down === 1 ? "The configured machine is" : `All ${down} configured machines are`} unreachable — see the Machines pane.`
-      : "Launch an agent — a REPL, a shell, or a coding agent — inside a shed. Sessions keep running after you disconnect.";
+  // The empty state is a VALUE, not inline JSX: it is reported as UI truth so
+  // `agents.dump` can assert the words — the `dashboard.dump.empty` rule, and
+  // the only way to drive an empty pane, which has nothing on screen to read.
+  //
+  // `load`/`loadError` are what keep the three blanks apart (see
+  // `agentsEmpty.ts`): still reading, could not read, and read-and-empty are one
+  // screen but three different pieces of news, and only the last one may offer
+  // the bootstrap.
+  const empty = sessions.length === 0 ? agentsEmptyState(machines, load, loadError) : null;
 
   // Refresh the shared RC state on mount so navigating to the pane re-lists (the
   // shared state, so the sidebar badge stays consistent — one source of truth).
   useEffect(() => { refresh(); }, [refresh]);
-  // Publish the rendered sessions so the `agents.dump` op can observe them. This
-  // effect stays IN the pane so reportAgents fires ONLY while the pane is mounted
-  // (the backend blanks the agents snapshot off-pane).
-  useEffect(() => { reportAgents(sessions); }, [sessions]);
+  // Publish the rendered sessions + empty state so the `agents.dump` op can
+  // observe them. This effect stays IN the pane so reportAgents fires ONLY while
+  // the pane is mounted (the backend blanks the agents snapshot off-pane).
+  useEffect(() => { reportAgents(sessions, empty); }, [sessions, empty?.state, empty?.title, empty?.body, empty?.action]); // eslint-disable-line react-hooks/exhaustive-deps
 
   return (
     <div>
@@ -556,8 +558,18 @@ function AgentsPane({ sessions, machines, capabilities, onLaunch, refresh, onTra
           <X size={16} className="mt-px flex-none" /> <span className="min-w-0 break-words">{error}</span>
         </div>
       )}
-      {sessions.length === 0 ? (
-        <Empty icon={Sparkles} title="No agents running" body={emptyBody} />
+      {empty ? (
+        // The offer beside the sentence, when there IS one: a shed's sessions
+        // come from its own roost-session, so the thing to DO about an empty
+        // list is to set one up — which happens on the shed's card, one pane
+        // over. A pane that is still loading, or that failed to load, offers
+        // nothing: it has made no claim about what is running.
+        <Empty
+          icon={Sparkles}
+          title={empty.title}
+          body={empty.body}
+          action={empty.action ? { label: empty.action, onClick: onSetUpRoost } : undefined}
+        />
       ) : (
         // Grouped by where they run, the same treatment the Sheds pane gives
         // hosts. The heading carries the origin, so a row no longer has to:
@@ -734,37 +746,24 @@ function MachinesPane({ machines, sessions, refresh, onNew, roostTick, onOpenCon
 function SessionCard({ session: s, capabilities, onKilled, onError, onTranscript }:
   { session: RcSession; capabilities: Record<string, RcCapabilities>; onKilled: () => void; onError: (e: string) => void; onTranscript: (s: RcSession) => void }) {
   const [busy, setBusy] = useState(false);
-  const claude = s.kind === "claude-rc" || s.kind === "claude-broker";
-  const machine = s.origin_kind === "machine";
+  const claude = s.kind === "claude-rc";
   // WORKDIR FIRST: on a narrow pane this truncates, and the working directory
   // is what tells two sessions on the same box apart. The origin is not here at
-  // all — the pane is grouped by it. `tmux_session` is dropped: a roost row
-  // carries "" for it, and a plain shed session's tmux name is not something a
-  // person reads a card for.
-  const sub = s.state === "needs-auth"
-    ? rcAuthHint(s.kind)
-    : [s.workdir, s.created_by].filter(Boolean).join(" · ");
+  // all — the pane is grouped by it.
+  const sub = s.workdir ?? "";
   const act = rcActivityLabel(s);
   const rail = sessionRail(s);
-  // `>_ open` only makes sense for a tmux-attach row — a roost session (or any
-  // future `native-remote`/`none` kind) has no tmux pane behind it to attach to.
-  // Absent/empty capabilities fall back to `"tmux"` for a SHED row (the pre-v2
-  // assumption every terminal path made before roost rows existed) but fail
-  // CLOSED for a machine row: a machine's capabilities are the synthesized
-  // roost set keyed by its origin, and until that entry is in the payload
-  // there is no tmux pane to offer (CodeRabbit review finding on C6).
+  // `>_ open` only makes sense for a tmux-attach row, and it FAILS CLOSED: a
+  // row whose contract does not say `tmux` gets no terminal button.
+  //
+  // Both halves of the old rule went with the hub (S6). Absent capabilities
+  // used to mean "a shed too old to advertise", which had always had a tmux
+  // pane; and `attachKind` used to fall back to `"tmux"` for the same reason.
+  // There is no such shed any more — every row is a roost tab, whose
+  // synthesized contract says `native-remote` — so "nothing said so" now means
+  // there is nothing to attach to, not that the answer is tmux.
   const caps = capabilitiesFor({ capabilities }, s);
-  // `attachKind` itself falls back to `"tmux"` when `caps.kind_features` has no
-  // entry for this row's kind (the pre-v2 assumption, kept for shed rows). A
-  // machine row must NOT inherit that fallback: roost reports kinds (e.g.
-  // `grok`) outside the synthesized `kind_features` set, and a synthesized-but-
-  // unlisted kind has no tmux pane behind it either — so a machine row with no
-  // explicit entry gets no terminal action at all (CodeRabbit review finding).
-  const canAttach = caps !== undefined
-    ? (machine && caps.kind_features?.[s.kind] === undefined
-        ? false
-        : attachKind(caps, s.kind) === "tmux")
-    : s.origin_kind !== "machine";
+  const canAttach = attachKind(caps, s.kind) === "tmux";
   const kill = async () => {
     setBusy(true);
     // Routes by origin — a machine session is addressed by (machine, slug), a
@@ -814,7 +813,6 @@ function SessionCard({ session: s, capabilities, onKilled, onError, onTranscript
       <div className="mt-2 flex items-center gap-4">
         <div className="flex min-w-0 flex-1 items-center gap-2.5">
           <KindBadge kind={s.kind} />
-          {!s.managed && <span className="flex-none rounded bg-shed-inset px-1.5 py-0.5 font-mono text-[10px] font-semibold text-shed-text-muted">legacy</span>}
           <span className="truncate font-mono text-[12px] text-shed-text-muted">
             {s.stale ? `${sub} · last known` : sub}
           </span>
@@ -845,14 +843,13 @@ function SessionCard({ session: s, capabilities, onKilled, onError, onTranscript
               missing.
               A roost row (attach !== "tmux") has no tmux pane behind it — R3
               lands attach for those; until then the button is simply absent
-              rather than opening onto nothing. */}
-          {canAttach && (
+              rather than opening onto nothing.
+              Addressed by `machine` for every row now, machine or shed: that is
+              the host address the backend takes, and since S6 there is no
+              second, `(host, shed, tmux_session)`-shaped terminal path. */}
+          {canAttach && s.machine && (
             <button
-              onClick={() =>
-                void (machine
-                  ? openMachineTerminal(s.machine ?? "", s.slug)
-                  : openTerminal(s.shed, s.host, s.tmux_session))
-              }
+              onClick={() => void openMachineTerminal(s.machine ?? "", s.slug)}
               title={claude ? "Open the session in a terminal" : "Open in Terminal"}
               className="hbtn inline-flex items-center rounded-[9px] px-[18px] py-2.5 font-mono text-[13px] font-medium"
               style={{ background: "var(--shed-btn-dark)", color: "var(--shed-btn-dark-fg)", border: "none" }}
@@ -1314,7 +1311,6 @@ function LaunchAgentDialog({ sheds, machines, capabilities, refresh, onClose, on
   const [kind, setKind] = useState<RcKind>("claude-rc");
   const [displayName, setDisplayName] = useState("");
   const [workdir, setWorkdir] = useState("");
-  const [prompt, setPrompt] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   // A machine's capabilities are not in the shared `rc.list` map — that covers
@@ -1355,18 +1351,31 @@ function LaunchAgentDialog({ sheds, machines, capabilities, refresh, onClose, on
   // machine nobody has asked yet — that would offer a kind on the strength of
   // never having looked. A machine is only ever read from its own probe.
   const probed = selected?.kind !== "machine" || selected.machine in machineCaps;
+  // A shed's contract is keyed by its ROOST origin since S6 — `roost:<server>/
+  // <shed>`, the same string its rows carry. The `host/shed` composite this used
+  // to read was the HUB's key, and the payload has none of them any more: a shed
+  // with no roost-session simply has no entry, and `offeredKinds(undefined)`
+  // then offers nothing, which is the truth about it.
   const caps = selected?.kind === "machine"
     ? machineCaps[selected.machine] ?? undefined
-    : capabilities[selected ? `${selected.host}/${selected.shed}` : ""];
+    : capabilities[selected ? `roost:${selected.host}/${selected.shed}` : ""];
   const kinds = probed && !capsError ? offeredKinds(caps) : [];
   // Keep the selection valid when the target changes OR its offered kinds change.
   useEffect(() => { if (kinds.length && !kinds.includes(kind)) setKind(kinds[0]); }, [target, kinds.join(",")]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const targetOpts = targets.map((t) => ({ value: t.value, label: t.label }));
-  const shell = kind === "shell";
   // `capsBusy` is part of the gate, not just a spinner: a click landing during
   // a re-probe would launch against whatever the PREVIOUS probe said.
   const canCreate = !!selected && kinds.length > 0 && !capsBusy && !capsError;
+
+  // Report what this dialog RENDERED (`launch.dump`), the `reportRoostConsent`
+  // rule: from inside the dialog, so a report made beside the JSX cannot go on
+  // answering after the JSX is gone, and read from the DOM after the commit so
+  // it can never claim a field the dialog does not show. That is what makes
+  // "there is no prompt field" (#366) assertable without a screenshot.
+  const shape = `${target}|${kind}|${kinds.join(",")}|${capsBusy}|${capsError ?? ""}`;
+  useEffect(() => { reportLaunchDialog({ rendered: renderedText("[data-launch]") }); }, [shape]);
+  useEffect(() => () => reportLaunchDialog(null), []);
 
   const submit = async () => {
     if (!selected) { setError("Pick somewhere to run it."); return; }
@@ -1379,9 +1388,6 @@ function LaunchAgentDialog({ sheds, machines, capabilities, refresh, onClose, on
           kind,
           displayName: displayName.trim() || undefined,
           workdir: workdir.trim() || undefined,
-          // The field is hidden for a machine target (roost's `tab.open` takes
-          // argv + cwd only) — never forward a stale `prompt` left over from a
-          // shed selection.
         });
       } else {
         await rcLaunch({
@@ -1390,7 +1396,6 @@ function LaunchAgentDialog({ sheds, machines, capabilities, refresh, onClose, on
           kind,
           displayName: displayName.trim() || undefined,
           workdir: workdir.trim() || undefined,
-          initialPrompt: prompt.trim() || undefined,
         });
       }
       onLaunched();
@@ -1451,22 +1456,17 @@ function LaunchAgentDialog({ sheds, machines, capabilities, refresh, onClose, on
             <Segmented options={kinds.map((k) => [k, rcKindLabel(k), agentColor(k)] as [string, string, string])} value={kind} set={(v) => setKind(v as RcKind)} />
           )}
         </Field>
-        {/* roost's `tab.open` takes argv + cwd only — a machine target's launch
-            command ignores a prompt silently. Hiding the field (rather than
-            showing it and dropping what's typed) is the only honest option
-            until S4 gives roost kickoff its own delivery path. Permission mode
-            has no field in this dialog to begin with, so there's nothing else
-            to hide for a machine target. */}
-        {selected?.kind !== "machine" && (
-          <Field
-            label={shell ? "Initial command" : "Initial prompt"}
-            hint="optional"
-            htmlFor={`${fid}-prompt`}
-            help={shell ? "Run in the shell once it's ready." : "Typed into the agent once it's ready."}
-          >
-            <textarea id={`${fid}-prompt`} value={prompt} onChange={(e) => setPrompt(e.target.value)} rows={2} placeholder={shell ? "npm install && npm test" : "summarize this repo"} className={cn(dialogInput, "resize-none")} />
-          </Field>
-        )}
+        {/* **There is no initial-prompt field, on either target** — roost's
+            `tab.open` is an argv and a working directory, and there is no typed-
+            input channel behind it. The field used to be offered for a SHED
+            target, back when a shed launch went to the hub, which typed the
+            kickoff into a tmux pane; S6 retired the hub and the shed door became
+            `roost.launch`, so the box was still on screen with nothing at the far
+            end — what was typed went nowhere, silently. Delivering it through
+            `tab.write` instead is `charliek/shed#366`'s job (it has to work the
+            same for every agent kind, which a blind write does not), and until
+            that lands the honest UI is to not ask. Permission mode has never had
+            a field here, for the same reason. */}
         {error && (
           <div className="rounded-md px-3 py-2 font-mono text-[12px]" style={{ background: "var(--shed-deny-bg)", color: "var(--shed-danger)" }}>{error}</div>
         )}
@@ -1752,7 +1752,10 @@ export default function App() {
   // the Agents pane, and the launch dialog all read this one `rc.list` state, so
   // they can't diverge. `refreshRc` reloads on the pane Refresh button, a
   // launch/kill, and pane/dialog open; the hook itself reloads on mount + `refresh`.
-  const { sessions: rcSessions, capabilities: rcCapabilities, machines: rcMachines, refresh: refreshRc } = useRcSessions();
+  const {
+    sessions: rcSessions, capabilities: rcCapabilities, machines: rcMachines,
+    load: rcLoad, error: rcLoadError, refresh: refreshRc,
+  } = useRcSessions();
   // Live approval queue (drives the badge + the pane) + the delegated namespaces
   // (a non-empty set = the host agent handshook, so it's connected).
   const approvals = useCoordinatorData<Approval[]>("approvals-changed", fetchApprovals, []);
@@ -2012,8 +2015,16 @@ export default function App() {
                 sessions={rcSessions}
                 machines={rcMachines}
                 capabilities={rcCapabilities}
+                load={rcLoad}
+                loadError={rcLoadError}
                 onLaunch={() => setModal("launch")}
                 refresh={refreshRc}
+                // The empty state's offer. A shed's roost-session is installed
+                // and started from the shed's OWN card (the plan-matrix line
+                // and its consent dialog, plan 019 §3.6) — so the offer is to
+                // go there, not a second bootstrap entry point that would have
+                // to re-ask which host it was about.
+                onSetUpRoost={() => setPane("sheds")}
                 onTranscript={(s) => {
                   // Both are guaranteed together (the stamp is machine-only) —
                   // and the card gates its affordance on the same pair, so this

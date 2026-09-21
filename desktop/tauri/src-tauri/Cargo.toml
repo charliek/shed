@@ -27,7 +27,10 @@ tauri = { version = "2", features = ["tray-icon"] }
 # The shared protocol + app-logic crates (cross-workspace path deps — this links
 # them; it does not make this crate a member of core's workspace).
 shed-core = { path = "../../../crates/shed-core" }
-shed-app = { path = "../../../crates/shed-app", features = ["rc", "broker"] }
+# `broker` only: the hub half of the Agents pane (shed-app's `rc` feature — the
+# `RcService` that ssh'd `shed-ext-rc` into a shed) went with S6, so this crate
+# no longer asks for it. The roost half is ungated (`shed_app::roost`).
+shed-app = { path = "../../../crates/shed-app", features = ["broker"] }
 # The opencode agent-lane adapter (plan 015 §3.4). A path dep like the two above
 # — it implements `shed_core::lane::AgentLane` over an opencode server's local
 # HTTP API, and `lane.rs` is the client that drives it. Its `test-support`

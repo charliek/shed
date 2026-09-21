@@ -1,5 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 
+import type { AgentsEmptyState, AgentsLoad } from "@/lib/agentsEmpty";
+
 export type Pane = "sheds" | "machines" | "approvals" | "agents" | "activity" | "egress" | "system";
 
 /** Which modal (if any) is open — reported so the harness can drive + assert it.
@@ -837,7 +839,7 @@ export function useNowTick(intervalMs = 1000): number {
  *  with a live remote lane behind it, which is a promotion roost never makes and
  *  `RoostSession::agent_kind` does. */
 export type RcKind =
-  | "claude-rc" | "claude-broker" | "codex" | "opencode" | "cursor" | "shell"
+  | "claude-rc" | "codex" | "opencode" | "cursor" | "shell"
   | "gx" | "grok"
   | (string & {});
 export type RcState =
@@ -870,22 +872,28 @@ export type RcCapabilities = {
 /** How a kind's terminal affordance is reached — mirrors
  *  `RcKindFeatures::attach_kind()` on the Rust side, the single discriminator a
  *  client uses to decide whether `>_ open` (tmux attach) makes sense for a row.
- *  Absent/empty `attach` (an old binary, or capabilities that predate contract
- *  v2) falls back to `"tmux"` — the pre-v2 assumption every terminal path made
- *  before roost rows existed. An unrecognized non-empty value passes through
- *  verbatim rather than being coerced, so a future kind doesn't silently regain
- *  an attach button it never earned. */
+ *
+ *  **`"none"` when nothing says otherwise** (S6, `charliek/shed#328`). This used
+ *  to fall back to `"tmux"` — the pre-v2 assumption every terminal path made
+ *  before roost rows existed, when a shed row really did have a tmux pane behind
+ *  it. Every row is a roost tab now, and roost's own synthesized contract says
+ *  `native-remote`, so an absent entry means "this build has nothing to say about
+ *  this kind", and offering an attach on the strength of that would open onto
+ *  nothing. An unrecognized non-empty value still passes through verbatim, so a
+ *  future kind doesn't silently gain an attach button it never earned. */
 export function attachKind(caps: RcCapabilities | undefined, kind: string): "tmux" | "native-remote" | "none" | string {
-  return caps?.kind_features?.[kind]?.attach || "tmux";
+  return caps?.kind_features?.[kind]?.attach || "none";
 }
 
-/** Look up the capabilities behind a session row, keyed the same way
- *  `rc_list_payload` keys `RcListResult.capabilities`: a shed row by
- *  `host/shed`, a machine row by its `origin` (`machine:<name>`). Falls back to
- *  the `host/shed` composite when `origin` is absent (an older payload), the
- *  same fallback `sessionKey` uses. */
+/** Look up the capabilities behind a session row, keyed exactly the way
+ *  `rc_list_payload` keys `RcListResult.capabilities`: by the row's `origin`
+ *  (`machine:<name>` or `roost:<server>/<shed>`).
+ *
+ *  The `host/shed` fallback went with the hub (S6): that composite was the HUB's
+ *  key, and a payload has none of them any more — falling back to it would look
+ *  up a key that cannot be there and answer `undefined` the slow way. */
 export function capabilitiesFor(list: Pick<RcListResult, "capabilities">, s: RcSession): RcCapabilities | undefined {
-  return list.capabilities[s.origin ?? `${s.host}/${s.shed}`];
+  return s.origin ? list.capabilities[s.origin] : undefined;
 }
 
 /** The kinds a create form can offer (broker is URL-driven; unknown never creatable).
@@ -898,38 +906,29 @@ export const RC_CREATABLE_KINDS: RcKind[] =
 /** The tool token a kind's agent maps to under capabilities.agents (undefined = no
  *  agent, e.g. shell). Mirrors `RcKind::tool`. */
 const RC_KIND_TOOL: Record<string, string | undefined> = {
-  "claude-rc": "claude", "claude-broker": "claude",
+  "claude-rc": "claude",
   codex: "codex", opencode: "opencode", cursor: "cursor", shell: undefined,
   // Both roost-only kinds carry their own tool token, and `roost_capabilities`
   // reports both installed — the same trade-off it already makes for the four.
   gx: "gx", grok: "grok",
 };
 
-/** The launch UI's gated kind list: with capabilities, the creatable kinds whose
- *  backing agent is installed. Only ABSENT capabilities (old binary / not yet
- *  probed) fall back to claude+shell; present-but-empty capabilities yield an
- *  EMPTY offer (the shed advertises no usable kinds — the form must not invent
- *  claude). Mirrors `RcCapabilities::creatable_kinds` / the Swift `availableKinds`. */
+/** The launch UI's gated kind list: the creatable kinds whose backing agent the
+ *  capabilities say is installed.
+ *
+ *  **Absent capabilities offer NOTHING** (S6). They used to fall back to
+ *  claude+shell, which was right for a shed whose `shed-ext-rc` was too old to
+ *  advertise — it had always had both. There is no such binary any more: a host's
+ *  contract is roost's synthesized one, present for every host in the payload, so
+ *  absence means there is no roost-session to launch into and the fallback would
+ *  offer a kind that could only fail. Mirrors `RcCapabilities::creatable_kinds`. */
 export function offeredKinds(caps?: RcCapabilities): RcKind[] {
-  if (!caps) return ["claude-rc", "shell"];
+  if (!caps) return [];
   return RC_CREATABLE_KINDS.filter((k) => {
     if (!caps.kinds.includes(k)) return false;
     const tool = RC_KIND_TOOL[k];
     return tool ? (caps.agents[tool]?.installed ?? false) : true;
   });
-}
-
-/** Per-kind login remediation for a needs-auth session. Mirrors `RcKind::auth_hint`. */
-export function rcAuthHint(kind: RcKind): string {
-  switch (kind) {
-    case "claude-rc": case "claude-broker": return "run `claude` → /login";
-    case "codex": return "run `codex` and complete login (`codex login`)";
-    case "opencode": return "run `opencode auth login`";
-    case "cursor": return "run `cursor-agent login`";
-    case "gx": return "run `gx` and complete login";
-    case "grok": return "run `grok` and complete login";
-    default: return "log in to the agent in a terminal";
-  }
 }
 
 /** An approval request row (contract v2). Mirrors `shed_core::rc::RcFeedApproval`. */
@@ -1050,36 +1049,58 @@ export type RcListResult = {
   machines: MachineStatus[];
 };
 
-/** A session's stable row identity. Uses `origin` where the backend supplied it
- *  and falls back to the legacy `host/shed` composite, so a mixed payload (or an
- *  older backend) still produces unique keys. */
+/** A session's stable row identity — the row's `origin` plus its slug. Every row
+ *  carries an origin since S6 (there is one row source), so the legacy
+ *  `host/shed` composite is only the shape of a payload old enough to predate
+ *  it, kept so a mixed list still produces unique keys rather than colliding. */
 export function sessionKey(s: RcSession): string {
   return `${s.origin ?? `${s.host}/${s.shed}`}/${s.slug}`;
 }
 
-/** The live RC sessions + capabilities across running sheds (the same data the
- *  `rc.list` op serves the harness). Best-effort — empty in a browser / on error. */
-export async function fetchRcList(host?: string, shed?: string): Promise<RcListResult> {
-  const r = await invoke<RcListResult>("rc_list", { host, shed });
-  return {
-    sessions: r?.sessions ?? [],
-    capabilities: r?.capabilities ?? {},
-    machines: r?.machines ?? [],
-  };
+/** One `rc.list` attempt: the payload, plus why it failed if it did.
+ *
+ *  **A failure is not an empty list**, and this type exists because it used to
+ *  be one: `fetchRcList` swallowed the invocation error and answered
+ *  `{sessions: [], …}`, which the Agents pane then rendered as "no agent
+ *  sessions — set up a roost-session", pointing the user at the wrong fix. The
+ *  reason travels with the payload rather than being logged, because the pane is
+ *  the only place it can be read. */
+export type RcListLoad = RcListResult & { error: string | null };
+
+/** The live sessions + capabilities across every listed host (the same data the
+ *  `rc.list` op serves the harness).
+ *
+ *  Does NOT use the swallowing [invoke]: the whole point is to tell an empty
+ *  answer from a failed one. A browser (no Tauri runtime to import) is a
+ *  failure like any other here — [useRcSessions] never calls it there. */
+export async function fetchRcList(host?: string, shed?: string): Promise<RcListLoad> {
+  try {
+    const core = await import("@tauri-apps/api/core");
+    const r = await core.invoke<RcListResult>("rc_list", { host, shed });
+    return {
+      sessions: r?.sessions ?? [],
+      capabilities: r?.capabilities ?? {},
+      machines: r?.machines ?? [],
+      error: null,
+    };
+  } catch (e) {
+    return { sessions: [], capabilities: {}, machines: [], error: String(e) };
+  }
 }
 
 export type RcLaunchFields = {
   shed: string;
   kind: RcKind;
   host?: string;
-  // camelCase: Tauri looks up the Rust `display_name`/`initial_prompt` params here.
+  // camelCase: Tauri looks up the Rust `display_name` param here.
   displayName?: string;
   workdir?: string;
-  initialPrompt?: string;
 };
 
-/** Launch an RC session. THROWS on error (the pane surfaces it) — unlike the
- *  swallowing `invoke`, because a validation / SSH failure must be shown. */
+/** Launch a session IN A SHED — the `rc.launch` alias, which is
+ *  [machineLaunch] on the shed's roost host since S6. THROWS on error (the pane
+ *  surfaces it) — unlike the swallowing `invoke`, because a launch failure must
+ *  be shown. */
 export async function rcLaunch(fields: RcLaunchFields): Promise<RcSession> {
   const core = await import("@tauri-apps/api/core");
   return core.invoke<RcSession>("rc_launch", fields);
@@ -1091,16 +1112,19 @@ export type MachineLaunchFields = {
   displayName?: string;
   workdir?: string;
   permissionMode?: string;
-  initialPrompt?: string;
 };
 
 /** Launch a session ON a machine. THROWS on error, like [rcLaunch].
  *
  *  Separate from `rcLaunch` for the same reason `machineKill` is separate from
  *  `rcKill`: a machine is addressed by name over its own SSH, not by
- *  `(host, shed)` through a server. Everything downstream — the flag set, the
- *  permission-mode gate, how a kickoff prompt is delivered — is the SAME shared
- *  builder, so the two creates differ in where they land and nothing else. */
+ *  `(host, shed)` through a server. Everything downstream is the SAME `tab.open`
+ *  since S6, so the two creates differ in where they land and nothing else.
+ *
+ *  **Neither takes a kickoff prompt.** roost's `tab.open` is an argv and a
+ *  working directory; there is no typed-input channel behind either door today,
+ *  which is why the launch dialog offers no prompt field
+ *  (`charliek/shed#366`). */
 export async function machineLaunch(fields: MachineLaunchFields): Promise<RcSession> {
   const core = await import("@tauri-apps/api/core");
   return core.invoke<RcSession>("machine_launch", fields);
@@ -1119,38 +1143,70 @@ export async function machineCapabilities(machine: string): Promise<RcCapabiliti
   return out?.capabilities ?? null;
 }
 
-/** Kill an RC session. THROWS on error (the pane surfaces it). */
+/** Kill a session IN A SHED, addressed by `(host, shed, slug)` — the `rc.kill`
+ *  alias, a roost `tab.close` since S6. THROWS on error (the pane surfaces it). */
 export async function rcKill(shed: string, slug: string, host?: string): Promise<void> {
   const core = await import("@tauri-apps/api/core");
   await core.invoke("rc_kill", { shed, slug, host });
 }
 
-/** Kill a session on a MACHINE. THROWS on error, like `rcKill`.
+/** Kill a session by HOST ADDRESS — a machine's bare name or a shed's
+ *  `roost:<server>/<shed>` token. THROWS on error, like `rcKill`.
  *
- *  Separate from `rcKill` because the two reach paths genuinely differ here and
- *  nowhere else: a shed session is addressed by `(host, shed, slug)` through the
- *  server's SSH endpoint, a machine session by `(machine, slug)` over the
- *  machine's own SSH. Collapsing them behind one signature would mean passing an
- *  empty `shed` and letting the backend guess. */
+ *  Separate from `rcKill` because the ADDRESSING differs and nothing else does:
+ *  both are a roost `tab.close` on the host the row came from. Collapsing them
+ *  behind one signature would mean passing an empty `shed` and letting the
+ *  backend guess which was meant. */
 export async function rcKillMachine(machine: string, slug: string): Promise<void> {
   const core = await import("@tauri-apps/api/core");
   await core.invoke("machine_kill", { machine, slug });
 }
 
-/** Kill a session, routing by its origin. The single entry point a card uses, so
- *  the machine/shed distinction lives in ONE place instead of at every call. */
+/** Kill a session — a roost `tab.close` either way since S6. Routed on the
+ *  ADDRESS the row carries (`machine`, which is a machine's bare name and a
+ *  shed's `roost:<server>/<shed>` token), so the one entry point a card uses
+ *  needs no origin special-case at all. `rcKill`'s `(host, shed, slug)` door is
+ *  the fallback for a payload too old to stamp an address. */
 export async function killSession(s: RcSession): Promise<void> {
-  if (s.origin_kind === "machine" && s.machine) {
-    return rcKillMachine(s.machine, s.slug);
-  }
+  if (s.machine) return rcKillMachine(s.machine, s.slug);
   return rcKill(s.shed, s.slug, s.host);
 }
 
-/** Report the rendered RC sessions so the `agents.dump` op can observe them — the
- *  drivable truth of the Agents pane, like `dashboard.dump` reads the sheds.
- *  (`ui_report` merges this `agents` key with the shell's snapshot.) */
-export function reportAgents(sessions: RcSession[]): void {
-  void invoke("ui_report", { snapshot: { agents: sessions } });
+/** The Agents pane's empty state — the title, the sentence, and the offer beside
+ *  it.
+ *
+ *  **Lives in `agentsEmpty.ts`** and is re-exported here so callers keep one
+ *  import: the rule it encodes (which of loading / failed / genuinely-empty this
+ *  blank screen is, and which of them may offer the bootstrap) is the copy a
+ *  person reads, and it earns a test that needs no React, no DOM and no Tauri
+ *  runtime — the `newest.ts` / `roostBoard.ts` shape. */
+export type { AgentsLoad, AgentsEmptyState } from "@/lib/agentsEmpty";
+export { agentsEmptyState } from "@/lib/agentsEmpty";
+
+/** The launch dialog as `launch.dump` reads it: its own rendered DOM text.
+ *
+ *  Text rather than a field list on purpose. A list would be a second statement
+ *  of what the JSX draws, and the two would drift — the failure the consent
+ *  card's `rendered` was added to prevent. This cannot claim a field the dialog
+ *  does not show, which is exactly the property under test: since S6 there is no
+ *  initial-prompt box, because nothing would deliver what was typed into it
+ *  (`charliek/shed#366`). */
+export type LaunchDialogDump = { rendered: string };
+
+/** Report the launch dialog's rendered copy, or `null` to clear it on unmount.
+ *
+ *  **Called by the dialog itself**, the [reportRoostConsent] rule: a report made
+ *  beside the JSX rather than inside it keeps answering after the JSX is gone. */
+export function reportLaunchDialog(dump: LaunchDialogDump | null): void {
+  void invoke("ui_report", { snapshot: { launch_dialog: dump } });
+}
+
+/** Report the rendered RC sessions — and, when the list is empty, the empty
+ *  state's own words — so the `agents.dump` op can observe them: the drivable
+ *  truth of the Agents pane, like `dashboard.dump` reads the sheds.
+ *  (`ui_report` merges these keys with the shell's snapshot.) */
+export function reportAgents(sessions: RcSession[], empty: AgentsEmptyState | null): void {
+  void invoke("ui_report", { snapshot: { agents: sessions, agents_empty: empty } });
 }
 
 /** One machine as the Machines pane renders it: the health line a person reads,
@@ -1185,17 +1241,27 @@ export function reportMachinesPane(rows: MachinePaneRow[] | null): void {
  *  between independent fetches with different triggers. Refreshed on mount, on each
  *  lifecycle `refresh` event (sheds coming up/down), and whenever a caller (the pane
  *  Refresh button, a launch/kill, the pane/dialog on open) invokes the returned
- *  `refresh`. Empty in a plain browser / on error. */
+ *  `refresh`.
+ *
+ *  **`load` is the third thing an empty `sessions` can mean.** It starts
+ *  `loading` — no answer has arrived, and the pane must not yet claim anything —
+ *  becomes `ready` when one does, and `failed` when the invocation threw, with
+ *  the reason in `error`. A plain browser has nothing to load and is `ready`
+ *  with an empty list, which is the truth about it. See `agentsEmpty.ts`. */
 export function useRcSessions(): {
   sessions: RcSession[];
   capabilities: Record<string, RcCapabilities>;
   machines: MachineStatus[];
+  load: AgentsLoad;
+  error: string | null;
   refresh: () => void;
 } {
-  const [state, setState] = useState<RcListResult>({
+  const [state, setState] = useState<RcListResult & { load: AgentsLoad; error: string | null }>({
     sessions: [],
     capabilities: {},
     machines: [],
+    load: inTauri() ? "loading" : "ready",
+    error: null,
   });
   // A generation guard shared across the mount-, event-, and caller-driven reloads,
   // so a slower older fetch can't overwrite a newer one (the pane's superseded-fetch
@@ -1205,7 +1271,10 @@ export function useRcSessions(): {
     if (!inTauri()) return;
     const mine = ++gen.current;
     void fetchRcList().then((r) => {
-      if (mine === gen.current) setState(r);
+      // A REFRESH does not go back to `loading`: the rows already on screen stay
+      // there, which is what makes the pane Refresh button a re-read rather than
+      // a blank-and-refill. Only the first load is ever `loading`.
+      if (mine === gen.current) setState({ ...r, load: r.error ? "failed" : "ready" });
     });
   }, []);
   useEffect(() => {
@@ -1228,6 +1297,8 @@ export function useRcSessions(): {
     sessions: state.sessions,
     capabilities: state.capabilities,
     machines: state.machines,
+    load: state.load,
+    error: state.error,
     refresh,
   };
 }

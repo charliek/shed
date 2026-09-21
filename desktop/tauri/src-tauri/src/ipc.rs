@@ -24,12 +24,12 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::runtime::Handle;
 
-use shed_app::{Backend, Coordinator, RcService, Reachability};
+use shed_app::{Backend, Coordinator, Reachability};
 use shed_core::approval::{
     ApprovalChoice, ApprovalDecision, ApprovalMethod, ApprovalScope, PolicyRule, SshApprovalPolicy,
 };
 use shed_core::models::CreateShedRequest;
-use shed_core::rc::{self, RcError, RcKind, RcSession, RcState};
+use shed_core::rc::RcKind;
 
 use crate::env::Env;
 use crate::prefs::SharedPrefs;
@@ -100,24 +100,30 @@ fn machine_terminal_refusal() -> (String, String) {
 /// failures that [`Backend::list_sheds`] drops on the floor are carried beside it
 /// — plural, because one failed host is not the only case. Healthy = `[]`, never
 /// absent, so a consumer can read it unconditionally.
-/// **The single shaper for `rc.list`** — shed sessions, machine sessions, the
-/// per-shed capabilities, and each machine's health.
+/// **The single shaper for `rc.list`** — the roost sessions on every listed
+/// host, each host's contract, and each host's health.
 ///
 /// Shared by the socket IPC op and the frontend's `rc_list` Tauri command, the
 /// same way [`sheds_payload`] is shared. Those two used to build this payload
 /// independently, with a comment claiming they matched; adding machine sessions
 /// to one and not the other made the pane render nothing while the IPC op was
 /// correct — exactly the divergence a single shaper prevents.
+///
+/// **One source since S6** (`charliek/shed#328`). This used to return a UNION:
+/// the hub's rows (`source: "hub"`, listed by ssh'ing `shed-ext-rc` into the
+/// shed) beside roost's. The guest binary, the server's routes and the Go
+/// engine are gone, so the hub half is gone with them — a shed's agent sessions
+/// are the tabs its `roost-session` reports, and a shed with no session lists
+/// none. `source` is still stamped (always `"roost"`), because a consumer that
+/// branches on it must keep reading a value rather than `undefined`.
 pub(crate) async fn rc_list_payload(
     backend: &Backend,
-    rc_service: &RcService,
     machines: &crate::roost_hosts::RoostHosts,
-    live: &crate::live_activity::LiveActivityLayer,
     host: Option<&str>,
     shed: Option<&str>,
 ) -> Value {
     let targets = backend.rc_targets(host, shed).await;
-    // **Every running shed is a roost host too** (plan 019 §3.6). This is the
+    // **Every running shed is a roost host** (plan 019 §3.6). This is the
     // ADD-ONLY half of the reconcile: `targets` is narrowed by the caller's
     // filter, so it can say "this shed is running" and never "that one stopped".
     // The authoritative half — which removes a stopped shed's watcher — rides on
@@ -130,83 +136,37 @@ pub(crate) async fn rc_list_payload(
             .collect::<Vec<_>>(),
         &[],
     );
-    let sessions = rc_service.list(targets, host, shed).await;
-    // The per-shed capabilities captured during the probe, keyed by `host/shed`,
-    // let the launch form gate which kinds it offers (unknown/uninstalled agents
-    // are excluded; a shed with an old binary is simply absent → the UI degrades
-    // to claude+shell).
-    let mut capabilities = rc_service.capabilities(host, shed);
-
-    // **Roost sessions join the SAME payload** (plan 012 R4; extended to sheds by
-    // plan 019 §3.6). A separate op would force the UI to merge two async sources
-    // and reintroduce exactly the split the unified view exists to remove; the
-    // two reach paths already produce the same session type, so the only real
-    // difference is provenance, which each row carries as `origin` + `source`.
+    // ONE lock acquisition for the rows and the health — see
+    // `RoostHosts::snapshot`: reading them separately can produce a frame where
+    // a row is `stale: false` while its host is `reachable: false`.
     //
-    // **The union rule.** A shed now has two row sets in one payload: the hub's
-    // (`<server>/<shed>`, `source: "hub"`) and roost's (`roost:<server>/<shed>`,
-    // `source: "roost"`), and both are returned — including under a filter. A
-    // filtered `rc.list {host, shed}` used to omit this snapshot ENTIRELY, which
-    // meant the one caller that knows exactly which shed it is asking about (the
-    // shed card) was the one caller that could not see that shed's roost rows.
     // The filter is a SHED filter: it narrows sheds by server and name, and
     // omits machines outright, because a machine belongs to no server.
-    //
-    // ONE lock acquisition for both halves — see `RoostHosts::snapshot`: reading
-    // them separately can produce a frame where a row is `stale: false` while
-    // its host is `reachable: false`.
-    let (machine_sessions, machine_status) =
+    let (sessions, machine_status) =
         machines.snapshot(crate::roost_hosts::HostFilter { server: host, shed });
-    // **Capabilities keyed by ORIGIN** (plan 013 §3.4). Shed capabilities are
-    // keyed `host/shed`, and until this a machine row's origin — `machine:<name>`
-    // — matched nothing in the map, so the UI had no data path from a row to the
-    // contract behind it. That is what gates the attach affordance: roost rows
-    // advertise `attach: "native-remote"` and the card must NOT offer a terminal.
+    // **Capabilities keyed by ORIGIN** (plan 013 §3.4) — `machine:<name>` or
+    // `roost:<server>/<shed>`, the same string each row carries, so the UI has a
+    // data path from a row to the contract behind it. That is what gates the
+    // attach affordance: roost rows advertise `attach: "native-remote"` and the
+    // card must NOT offer a terminal.
     //
-    // Synthesized, never probed: roost has no `shed-ext-rc capabilities` to ask,
-    // so the answer is the constant contract this client implements against it.
+    // Synthesized, never probed: roost has no capabilities op to ask, so the
+    // answer is the constant contract this client implements against it.
     // Stamped from the STATUS rows rather than a second read of the registry, so
     // the keys can never disagree with the hosts the same payload lists.
-    //
-    // A shed's two origins get DIFFERENT contracts, deliberately:
-    // `<server>/<shed>` stays the hub's (probed from the guest, with its own
-    // kinds and its own attach story) and `roost:<server>/<shed>` is roost's.
-    // One key per row set is what lets a card read the contract for the half a
-    // button belongs to rather than a merged answer true of neither.
-    for m in &machine_status {
-        if let Some(origin) = m.get("origin").and_then(Value::as_str) {
-            capabilities.insert(origin.to_string(), shed_app::roost::roost_capabilities());
-        }
-    }
-    // Shed rows are stamped with their origin too, so the UI has ONE rule for
-    // identity and labelling instead of a machine special-case. `origin` is
-    // injected client-side (like `host`/`shed` already are) — the hub wire is
-    // untouched, which keeps the Swift parity fixtures and shed-mobile's FRB DTOs
-    // valid.
-    let mut all: Vec<Value> = sessions
+    let capabilities: serde_json::Map<String, Value> = machine_status
         .iter()
-        .map(|s| {
-            let mut row = serde_json::to_value(s).unwrap_or_else(|_| json!({}));
-            if let Some(obj) = row.as_object_mut() {
-                obj.insert("origin".into(), json!(format!("{}/{}", s.host, s.shed)));
-                obj.insert("origin_kind".into(), json!("shed"));
-                // The other half of the union stamp: this row was listed by the
-                // shed's own hub over ssh, not read from a roost-session.
-                obj.insert("source".into(), json!("hub"));
-                obj.insert("stale".into(), json!(false));
-            }
-            // The live overlay LAST, so the stream's view wins over the
-            // one-shot's — the one-shot cannot know activity at all, so anything
-            // the stream has to say about it is strictly newer. Additive: a
-            // session the stream has not mentioned is left exactly as listed.
-            live.apply(&mut row, &s.host, &s.shed, &s.slug);
-            row
+        .filter_map(|m| m.get("origin").and_then(Value::as_str))
+        .map(|origin| {
+            (
+                origin.to_string(),
+                json!(shed_app::roost::roost_capabilities()),
+            )
         })
         .collect();
-    all.extend(machine_sessions);
     json!({
-        "sessions": all,
-        "capabilities": capabilities,
+        "sessions": sessions,
+        "capabilities": Value::Object(capabilities),
         "machines": machine_status,
     })
 }
@@ -327,16 +287,6 @@ fn rc_kind(params: &Value) -> Result<RcKind, (String, String)> {
     Ok(kind)
 }
 
-/// Map an `RcError` to an IPC `(code, message)`. A validation error surfaces as
-/// `invalid-param` — the code the shared `test_agents` suite asserts, matching the
-/// mac app; every binary/transport failure is `action_failed`.
-fn rc_err(e: RcError) -> (String, String) {
-    match e {
-        RcError::BadRequest(_) => err("invalid-param", e.to_string()),
-        _ => err("action_failed", e.to_string()),
-    }
-}
-
 /// Raise + focus the main window — the shared body of `ui.show_window`,
 /// `app.activate`, the tray/popover "Open dashboard", and the single-instance
 /// second-launch hand-off. Also the single macOS activation-policy path (a visible
@@ -451,21 +401,14 @@ pub struct Handler {
     /// The approval coordinator (the security spine): the approvals queue, policy,
     /// grants, audit, and the host-agent decision path.
     coordinator: Coordinator,
-    /// The Remote-Control service (Agents pane): the session store + the process
-    /// seam. Shared with the frontend invoke commands.
-    rc_service: Arc<RcService>,
     /// The persisted prefs store, so `ui.set_ssh_approval` persists the chosen SSH
     /// prefs through the same path as the frontend command (both survive a restart).
     prefs: SharedPrefs,
-    /// Machine targets (plan 013 S3): one roost watcher per `machines:` entry
-    /// (plus the implicit `localhost`), and the sessions each reports. Reached
-    /// through that machine's own `roost-session` rather than a shed server's
-    /// HTTP proxy — the second reach path the sessions view merges.
+    /// Roost hosts (plan 013 S3, generalized to sheds by plan 019 §3.6): one
+    /// watcher per `machines:` entry (plus the implicit `localhost`) and per
+    /// running shed, and the sessions each reports. Since S6 this is the ONLY
+    /// source the Agents pane has.
     machines: Arc<crate::roost_hosts::RoostHosts>,
-    /// Live activity for SHED rows, folded from each host's `/api/rc/events`.
-    /// Machine rows need no equivalent — roost reports the agent axes on every
-    /// poll.
-    live: Arc<crate::live_activity::LiveActivityLayer>,
     /// The agent lanes open on machine rows (plan 015 §3.4) — one live opencode
     /// transcript per `(machine, session)`.
     lanes: Arc<crate::lane::Lanes>,
@@ -484,10 +427,8 @@ impl Handler {
         backend: Arc<Backend>,
         terminal: SharedTerminal,
         coordinator: Coordinator,
-        rc_service: Arc<RcService>,
         prefs: SharedPrefs,
         machines: Arc<crate::roost_hosts::RoostHosts>,
-        live: Arc<crate::live_activity::LiveActivityLayer>,
         lanes: Arc<crate::lane::Lanes>,
     ) -> Self {
         Self {
@@ -497,10 +438,8 @@ impl Handler {
             backend,
             terminal,
             coordinator,
-            rc_service,
             prefs,
             machines,
-            live,
             lanes,
             refresh_seq: AtomicU64::new(0),
             pid: std::process::id(),
@@ -644,6 +583,7 @@ impl Handler {
             "sidebar.dump" => Ok(self.sidebar_dump()),
             "shed_roost.dump" => Ok(self.shed_roost_dump()),
             "roost_consent.dump" => Ok(self.roost_consent_dump()),
+            "launch.dump" => Ok(self.launch_dump()),
             "toast.dump" => Ok(self.toast_dump()),
             "machine.kill" => self.machine_kill(params).await,
             // `machine.launch` is `roost.launch` addressed by a bare machine
@@ -1053,21 +993,14 @@ impl Handler {
     // the wire from the guest (where it is liveness now) and a machine row's from
     // roost; no client re-derives one from a pane.
 
-    /// `rc.list {host?, shed?}` → `{sessions}`. The running sheds + their ssh
-    /// targets come from `Backend` (resolution stays in shed-app); `RcService`
-    /// probes + reconciles them (a no-op filter in test mode).
+    /// `rc.list {host?, shed?}` → `{sessions, capabilities, machines}`. The
+    /// roost tabs on every listed host. Which sheds are running comes from
+    /// `Backend` (resolution stays in shed-app); the rows come from each host's
+    /// own `roost-session`.
     async fn rc_list(&self, params: &Value) -> Result<Value, (String, String)> {
         let host = params.get("host").and_then(Value::as_str);
         let shed = params.get("shed").and_then(Value::as_str);
-        Ok(rc_list_payload(
-            &self.backend,
-            &self.rc_service,
-            &self.machines,
-            &self.live,
-            host,
-            shed,
-        )
-        .await)
+        Ok(rc_list_payload(&self.backend, &self.machines, host, shed).await)
     }
 
     /// `machines.list` → `{machines}`: per-machine reachability for the sessions
@@ -1152,6 +1085,20 @@ impl Handler {
         json!({ "consent": self.ui_get("roost_consent").unwrap_or(Value::Null) })
     }
 
+    /// `launch.dump` → the New-session dialog's own rendered text
+    /// (`{launch: {rendered}}`), or `null` while none is mounted. UI truth, the
+    /// `roost_consent.dump` rule: the dialog reports itself and this relays the
+    /// last report.
+    ///
+    /// It exists for the fields that are NOT there. Since S6 the dialog offers
+    /// no initial-prompt box — roost's `tab.open` is an argv and a cwd, and
+    /// delivering typed input is `charliek/shed#366` — and "the UI does not ask
+    /// for something it would silently drop" is only assertable against what was
+    /// actually painted.
+    fn launch_dump(&self) -> Value {
+        json!({ "launch": self.ui_get("launch_dialog").unwrap_or(Value::Null) })
+    }
+
     /// `toast.dump` → the last (or currently shown) toast the shell reported —
     /// the PATH warning / hook-wiring summary a bootstrap ends with, or an error.
     /// `null` before any has been shown.
@@ -1162,11 +1109,10 @@ impl Handler {
     /// `machine.kill {machine, slug}` → close a session on a machine (a roost
     /// `tab.close`; the slug IS the tab id).
     ///
-    /// Distinct from `rc.kill` because the addressing genuinely differs: a shed
-    /// session is `(host, shed, slug)` through the server's SSH endpoint, a
-    /// machine session is `(machine, slug)` over the machine's own roost reach.
-    /// Folding them into one op would mean passing an empty `shed` and having the
-    /// backend guess which path was meant.
+    /// Distinct from [`Self::rc_kill`] only in how the host is ADDRESSED: a shed
+    /// is `(host, shed)`, a machine is its bare name. Both end in the same
+    /// `tab.close` since S6. Folding them into one op would mean passing an
+    /// empty `shed` and having the backend guess which path was meant.
     async fn machine_kill(&self, params: &Value) -> Result<Value, (String, String)> {
         let machine = req_str(params, "machine")?.to_string();
         let slug = req_str(params, "slug")?.to_string();
@@ -1185,10 +1131,10 @@ impl Handler {
     /// sheds. `machine.launch {machine, …}` is the same op under its old name
     /// and its old parameter, kept as an alias.
     ///
-    /// **`rc.launch {shed}` is NOT re-pointed at this** (plan 019 §3.6): a shed
-    /// launch stays hub/tmux until S6, so the two ops are two different things
-    /// happening on one shed, and a card picks between them off the row's
-    /// `source`.
+    /// **`rc.launch {shed}` IS this op** since S6 (`charliek/shed#328`): the
+    /// shed launch was hub/tmux until then, and plan 019 §3.6 deliberately kept
+    /// the two apart while that was true. Now there is one launch path, and
+    /// [`Self::rc_launch`] is a second door onto it, held open for 0.9.x.
     ///
     /// The full param set is still accepted; only `kind` and `workdir` reach
     /// roost in M1 (see [`crate::roost_hosts::RoostHosts::launch`]).
@@ -1421,122 +1367,125 @@ impl Handler {
         json!({ "lane": self.ui_get("lane").unwrap_or(Value::Null) })
     }
 
-    /// `rc.launch {shed, kind, host?, display_name?, workdir?, initial_prompt?}` →
-    /// the launched `RcSession`. A validation error surfaces as `invalid-param`.
-    async fn rc_launch(&self, params: &Value) -> Result<Value, (String, String)> {
-        let shed = req_str(params, "shed")?.to_string();
-        let kind = rc_kind(params)?;
-        let target = self
+    /// The roost host a shed-addressed op is about: `roost:<server>/<shed>`.
+    ///
+    /// `host` resolves through `Backend` exactly as it did when these ops went
+    /// to the hub — an alias, a bare server name and an omitted host all land
+    /// where they always did — and only the last step, turning a resolved server
+    /// plus a shed name into a host token, is new.
+    fn shed_target(&self, params: &Value) -> Result<String, (String, String)> {
+        let shed = req_str(params, "shed")?;
+        let server = self
             .backend
             .resolve_rc_target(params.get("host").and_then(Value::as_str))
-            .map_err(|e| err("bad_request", e.to_string()))?;
-        let opt = |k: &str| params.get(k).and_then(Value::as_str).map(str::to_string);
-        let session = self
-            .rc_service
+            .map_err(|e| err("bad_request", e.to_string()))?
+            .server_name;
+        Ok(format!("roost:{server}/{shed}"))
+    }
+
+    /// `rc.launch {shed, kind, host?, display_name?, workdir?, initial_prompt?}` →
+    /// the opened row.
+    ///
+    /// **An ALIAS for [`Self::roost_launch`] since S6** (`charliek/shed#328`),
+    /// kept for 0.9.x: it is the same `tab.open` on the same host, addressed by
+    /// `{shed, host?}` instead of by `target`. The two ops were genuinely
+    /// different things while a shed launch was hub/tmux — now there is one
+    /// launch path and this is a second door onto it, held open so a client
+    /// written against the pre-S6 op keeps working through the release that
+    /// removes the hub.
+    async fn rc_launch(&self, params: &Value) -> Result<Value, (String, String)> {
+        let target = self.shed_target(params)?;
+        let kind = rc_kind(params)?;
+        let opt = |k: &str| params.get(k).and_then(Value::as_str);
+        self.machines
             .launch(
-                target,
-                &shed,
-                kind,
+                &target,
+                &kind,
                 opt("display_name"),
                 opt("workdir"),
+                opt("permission_mode"),
                 opt("initial_prompt"),
             )
             .await
-            .map_err(rc_err)?;
-        Ok(json!(session))
+            .map_err(|e| err("action_failed", e))
     }
 
-    /// `rc.kill {shed, slug, host?}` → remove the session (idempotent guest-side).
+    /// `rc.kill {shed, slug, host?}` → close the shed's roost tab.
+    ///
+    /// A `tab.close` since S6, like [`Self::machine_kill`] — the slug IS the tab
+    /// id. The two ops survive separately only because the ADDRESSING differs:
+    /// a shed is `(host, shed)`, a machine is its bare name.
     async fn rc_kill(&self, params: &Value) -> Result<Value, (String, String)> {
-        let shed = req_str(params, "shed")?;
-        let slug = req_str(params, "slug")?;
-        let target = self
-            .backend
-            .resolve_rc_target(params.get("host").and_then(Value::as_str))
-            .map_err(|e| err("bad_request", e.to_string()))?;
-        self.rc_service
-            .kill(target, shed, slug)
+        let target = self.shed_target(params)?;
+        let slug = req_str(params, "slug")?.to_string();
+        self.machines
+            .kill(&target, &slug)
             .await
-            .map_err(rc_err)?;
+            .map_err(|e| err("action_failed", e))?;
         Ok(json!({}))
     }
 
-    /// `rc.inject_test {…session fields…}` → inject a session directly (test-only,
-    /// guarded like `policy.set`). Backs the legacy/unmanaged render fixture.
+    /// `rc.inject_test {shed, slug, host?, kind?, display_name?, workdir?,
+    /// lifecycle?, attention?}` → put a row into the shed's roost snapshot
+    /// (test-only, guarded like `policy.set`).
+    ///
+    /// It lands in the ROOST snapshot since S6: that is the only row source the
+    /// Agents pane has, so the render fixture has to land there. `slug` is the
+    /// roost tab id, so it must parse as one — an invented string is refused by
+    /// name rather than injected as a row nothing could later close.
     fn rc_inject_test(&self, params: &Value) -> Result<Value, (String, String)> {
         if !self.env.test_mode {
             return Err(err("not_enabled", "rc.inject_test requires test mode"));
         }
-        self.rc_service
-            .inject_test(self.build_inject_session(params)?)
-            .map_err(rc_err)?;
+        let target = self.shed_target(params)?;
+        let row = self.build_inject_row(params)?;
+        self.machines
+            .inject_test(&target, row)
+            .map_err(|e| err("bad_request", e))?;
         Ok(json!({}))
     }
 
-    /// Build the full `RcSession` an inject-test param bag describes, filling the
-    /// tmux name + `<shed>/<slug>` display + workdir defaults the harness omits;
-    /// a missing host resolves to the default server.
-    fn build_inject_session(&self, params: &Value) -> Result<RcSession, (String, String)> {
-        let shed = req_str(params, "shed")?;
+    /// Build the roost row an inject-test param bag describes, filling the title
+    /// and workdir defaults the harness omits.
+    fn build_inject_row(
+        &self,
+        params: &Value,
+    ) -> Result<crate::roost_hosts::InjectedRow, (String, String)> {
         let slug = req_str(params, "slug")?;
-        let host = match params.get("host").and_then(Value::as_str) {
-            Some(h) => h.to_string(),
-            None => {
-                self.backend
-                    .resolve_rc_target(None)
-                    .map_err(|e| err("bad_request", e.to_string()))?
-                    .server_name
-            }
-        };
+        let tab_id = slug.parse::<i64>().map_err(|_| {
+            err(
+                "bad_request",
+                format!("slug {slug:?} is not a roost tab id"),
+            )
+        })?;
         let opt = |k: &str| params.get(k).and_then(Value::as_str).map(str::to_string);
-        let managed = params
-            .get("managed")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
-        Ok(RcSession {
-            host,
-            shed: shed.to_string(),
-            slug: slug.to_string(),
-            tmux_session: rc::tmux_name(slug),
-            // A managed session with no display_name is the bare slug; a legacy one
-            // is `<shed>/<slug>` — mirroring the Swift `rcInjectTestOp` branch.
-            display_name: opt("display_name").unwrap_or_else(|| {
-                if managed {
-                    slug.to_string()
-                } else {
-                    format!("{shed}/{slug}")
-                }
-            }),
-            workdir: Some(opt("workdir").unwrap_or_else(|| rc::DEFAULT_WORKDIR.to_string())),
-            // kind + state both default (like the Swift `RcInjectTestParams`) — this
-            // is the test-only fixture op; the harness always sends valid values.
-            kind: params
-                .get("kind")
-                .and_then(|v| serde_json::from_value(v.clone()).ok())
-                .unwrap_or(RcKind::ClaudeRc),
-            state: params
-                .get("state")
-                .and_then(|v| serde_json::from_value(v.clone()).ok())
-                .unwrap_or(RcState::Ready),
-            // Every kind is tui-laned in this phase, so the fixture op stamps the
-            // lane the guest would derive rather than taking it as a param.
-            lane: Some(rc::LANE_TUI.to_string()),
-            url: opt("url"),
-            rc_id: opt("rc_id"),
-            created_by: opt("created_by"),
-            created_at: opt("created_at"),
-            target_label: opt("target_label"),
-            activity: None,
-            activity_at: None,
-            last_message: None,
-            pending_approvals: None,
-            managed,
+        Ok(crate::roost_hosts::InjectedRow {
+            tab_id,
+            // Defaults like the rest of this op: the harness sends what the cell
+            // is about and nothing else.
+            kind: match params.get("kind") {
+                Some(_) => rc_kind(params)?,
+                None => RcKind::ClaudeRc,
+            },
+            title: opt("display_name").unwrap_or_else(|| slug.to_string()),
+            cwd: opt("workdir").unwrap_or_else(|| "/home/shed".to_string()),
+            lifecycle: opt("lifecycle"),
+            attention: params
+                .get("attention")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
         })
     }
 
-    /// `agents.dump` → the RC sessions the frontend reported (UI truth, like
-    /// `dashboard.dump` reads the reported sheds) so the pane is drivable by
-    /// logical content, not just a screenshot.
+    /// `agents.dump` → `{sessions, empty}`: the sessions the frontend reported
+    /// (UI truth, like `dashboard.dump` reads the reported sheds) so the pane is
+    /// drivable by logical content, not just a screenshot — plus, when the list
+    /// is empty, the empty state's own words.
+    ///
+    /// `empty` is how an EMPTY pane is drivable at all. Since S6 an empty list
+    /// is a meaningful answer ("this shed has no roost-session"), not a blank
+    /// waiting to fill, and a `sessions: []` alone cannot tell a caller which of
+    /// the two the pane actually said. `null` whenever rows are rendered.
     fn agents_dump(&self) -> Value {
         // UI truth = what's rendered: the Agents pane only reports its sessions
         // while mounted, so off-pane the `agents` snapshot is stale — report [] unless
@@ -1546,12 +1495,15 @@ impl Handler {
             .ui_get("pane")
             .and_then(|p| p.as_str().map(|s| s == "agents"))
             .unwrap_or(false);
-        let sessions = if on_agents {
-            self.ui_get("agents").unwrap_or_else(|| json!([]))
+        let (sessions, empty) = if on_agents {
+            (
+                self.ui_get("agents").unwrap_or_else(|| json!([])),
+                self.ui_get("agents_empty").unwrap_or(Value::Null),
+            )
         } else {
-            json!([])
+            (json!([]), Value::Null)
         };
-        json!({ "sessions": sessions })
+        json!({ "sessions": sessions, "empty": empty })
     }
 
     // -- egress (mac parity) — the pane's UI truth + its sub-tab driver --------
@@ -2222,16 +2174,6 @@ mod tests {
         // launching must reject it here.
         assert!(ensure_known_kind(&RcKind::Codex).is_ok());
         assert!(ensure_known_kind(&RcKind::Other("borg".into())).is_err());
-    }
-
-    #[test]
-    fn rc_err_maps_bad_request_to_invalid_param() {
-        // gotcha #7: the shared test_agents suite asserts `invalid-param` for a
-        // prompt-validation failure (matching the mac app's code); other RcErrors
-        // surface as action_failed.
-        assert_eq!(rc_err(RcError::BadRequest("x".into())).0, "invalid-param");
-        assert_eq!(rc_err(RcError::SlugTaken("x".into())).0, "action_failed");
-        assert_eq!(rc_err(RcError::MissingBinary).0, "action_failed");
     }
 
     fn env(mock: Option<&str>) -> Env {

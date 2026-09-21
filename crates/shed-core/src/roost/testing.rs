@@ -66,6 +66,11 @@ const VECTOR_IDENTIFY: &str =
     include_str!("../../../fixtures/roost-vectors/identify.response.json");
 const VECTOR_TAB_LIST: &str =
     include_str!("../../../fixtures/roost-vectors/tab.list.session.response.json");
+/// The tab list shed recorded off a REAL opencode run — the template for an
+/// agent-owned tab. Recorded rather than hand-written, so an added tab carries
+/// every key roost actually puts on one.
+const VECTOR_OPENCODE: &str =
+    include_str!("../../../fixtures/roost-vectors/shed.tab.list.opencode.finished.json");
 const VECTOR_TAB_OPEN: &str =
     include_str!("../../../fixtures/roost-vectors/tab.open.response.json");
 const VECTOR_ERROR: &str = include_str!("../../../fixtures/roost-vectors/response.error.json");
@@ -379,6 +384,74 @@ impl TabListHook<'_> {
     }
 }
 
+/// The agent-owned tab in a `tab.list` result — the template for a session row.
+///
+/// Searched for rather than indexed, so a re-copy of the vendored vector that
+/// reorders its tabs fails here instead of silently handing back a shell.
+fn first_owned_tab(listing: &Value) -> Value {
+    listing["result"]["projects"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .flat_map(|project| project["tabs"].as_array().into_iter().flatten())
+        .find(|tab| tab.get("ownership").is_some_and(|o| !o.is_null()))
+        .cloned()
+        .expect("no agent-owned tab in the vendored opencode vector")
+}
+
+/// A plain shell tab — somebody's terminal, and **not** a session row.
+fn shell_tab_template() -> Value {
+    vector(VECTOR_TAB_LIST)["result"]["projects"][0]["tabs"][0].clone()
+}
+
+/// What [`FakeRoost::add_tab`] should put on the tab it adds.
+///
+/// A parameter struct because its Python twin
+/// (`desktop/tools/shedtest/fake_roost.py`'s `add_tab`) takes nine keyword
+/// arguments with defaults, and nine positional ones here would be a different
+/// control wearing the same name — `TabSpec { title, cwd, ..Default::default() }`
+/// is the Rust spelling of the same call.
+#[derive(Debug, Clone)]
+pub struct TabSpec {
+    pub cwd: String,
+    pub title: String,
+    /// roost's open `ownership.source` string (`opencode`, `claude`, …).
+    /// **`None` means a plain shell tab** — no `ownership` key at all, which is
+    /// what roost's wire carries for somebody's terminal, and what makes it NOT
+    /// a session row. `Some("")` is neither and is REFUSED (see
+    /// [`ownership_with`]): the daemon rejects an empty source, so a fake that
+    /// took one would mint a row production cannot.
+    pub source: Option<String>,
+    /// The AGENT's own session id, as the adapter reports it.
+    pub session_id: String,
+    pub lifecycle: String,
+    pub detail: String,
+    pub has_notification: bool,
+    pub shell_state: String,
+    /// roost's open extension channel on the ownership
+    /// (`TabAgentReportParams.metadata`) — the adapter's own key/value bag,
+    /// carried verbatim and validated by nobody. It is how an opencode tab
+    /// reports `server_url`, which is what makes a row's `agent_lane` stamp
+    /// appear. Ignored without a `source`: there is no ownership to hang it on.
+    pub metadata: Vec<(String, String)>,
+}
+
+impl Default for TabSpec {
+    fn default() -> TabSpec {
+        TabSpec {
+            cwd: "/home/shed".to_string(),
+            title: "zsh".to_string(),
+            source: None,
+            session_id: String::new(),
+            lifecycle: "inactive".to_string(),
+            detail: String::new(),
+            has_notification: false,
+            shell_state: "at_prompt".to_string(),
+            metadata: Vec::new(),
+        }
+    }
+}
+
 /// A string-int64 wire id as a number. Every id on this wire is a *string* so a
 /// JavaScript client cannot round it through a lossy `Number`.
 fn wire_id(value: &Value) -> Option<i64> {
@@ -495,6 +568,22 @@ impl FakeRoost {
         self.lock().revision
     }
 
+    /// The tab ids this session currently holds, in list order — the twin of
+    /// `fake_roost.py`'s `tab_ids`.
+    ///
+    /// What a `tab.close` is asserted against: a row leaving a client's snapshot
+    /// is the CLIENT's doing (it drops the row optimistically), and this is
+    /// roost's.
+    pub fn tab_ids(&self) -> Vec<i64> {
+        self.lock()
+            .projects
+            .iter()
+            .filter_map(|p| p["tabs"].as_array())
+            .flatten()
+            .filter_map(|t| wire_id(&t["id"]))
+            .collect()
+    }
+
     /// How many `tab.list` replies have been served since the fake started.
     ///
     /// The observer loop reads the inventory **once per cycle** and folds
@@ -524,11 +613,94 @@ impl FakeRoost {
         self.lock().ui_socket = ui;
     }
 
+    /// Add a tab and commit it as roost does: one `tab.opened` batch.
+    ///
+    /// The twin of `fake_roost.py`'s `add_tab`, and the control a test reaches
+    /// for when it needs rows to exist at all — the vendored `tab.list` this
+    /// fake starts from carries one plain shell tab, which is deliberately NOT
+    /// a session row, so a fake with no `add_tab` has an empty inventory
+    /// forever.
+    ///
+    /// The one deliberate difference from the Python twin is that STARTING
+    /// state, not this control: the Python fake empties the vendored project and
+    /// every tab it has was added, while this one keeps the vector's shell tab
+    /// (id 5) so its own tests can address one without adding it. The two
+    /// controls otherwise take the same arguments with the same defaults
+    /// ([`TabSpec::default`]) and refuse the same thing — a `Some("")` source,
+    /// which the real daemon rejects (see [`ownership_with`]).
+    ///
+    /// Returns the tab as the wire now carries it.
+    pub fn add_tab(&self, tab_id: i64, spec: TabSpec) -> Value {
+        let TabSpec {
+            cwd,
+            title,
+            source,
+            session_id,
+            lifecycle,
+            detail,
+            has_notification,
+            shell_state,
+            metadata,
+        } = spec;
+        let mut state = self.lock();
+        let mut tab = match source {
+            Some(_) => first_owned_tab(&vector(VECTOR_OPENCODE)),
+            None => shell_tab_template(),
+        };
+        let project_id = state.projects[0]["id"].clone();
+        let position = state.projects[0]["tabs"]
+            .as_array()
+            .map(Vec::len)
+            .unwrap_or(0);
+        tab["id"] = json!(tab_id.to_string());
+        tab["project_id"] = project_id;
+        tab["title"] = json!(title);
+        tab["cwd"] = json!(cwd);
+        tab["shell_state"] = json!(shell_state);
+        tab["agent_lifecycle"] = json!(lifecycle);
+        tab["has_notification"] = json!(has_notification);
+        tab["position"] = json!(position);
+        match source {
+            Some(source) => {
+                tab["ownership"] = ownership_with(
+                    &source,
+                    &session_id,
+                    &detail,
+                    tab["last_active"].as_i64().unwrap_or(0),
+                    &metadata,
+                );
+            }
+            None => {
+                if let Some(object) = tab.as_object_mut() {
+                    object.remove("ownership");
+                }
+            }
+        }
+        state.projects[0]["tabs"]
+            .as_array_mut()
+            .expect("the vendored project carries a tabs array")
+            .push(tab.clone());
+        // A later `tab.open` must not mint an id this call already used — the
+        // Python twin recomputes `max + 1` per open and so cannot collide; this
+        // one keeps a counter, so the counter has to move.
+        state.next_tab_id = state.next_tab_id.max(tab_id + 1);
+
+        let mut opened = vector(VECTOR_TAB_OPENED);
+        opened["data"]["tab"] = tab.clone();
+        state.commit(vec![opened]);
+        tab
+    }
+
     /// Set a tab's agent axes — the whole point of the fake for a status test.
     /// `ownership` is roost's `Ownership` object (or `None` for a plain shell
     /// tab). Commits a new revision and pushes it as one batch: an
     /// `agent_report.changed`, plus a `tab.notification` when the sticky bit
     /// actually moved.
+    ///
+    /// The twin of `fake_roost.py`'s `set_axes`, which takes the same two
+    /// spellings of unowned-vs-owned and refuses the same blank source — a
+    /// hand-written object gets the [`ownership_with`] check too, since that is
+    /// the door a test that did not use the constructor comes through.
     pub fn set_tab_axes(
         &self,
         tab_id: i64,
@@ -536,6 +708,13 @@ impl FakeRoost {
         ownership: Option<Value>,
         has_notification: bool,
     ) {
+        if let Some(value) = ownership.as_ref() {
+            assert!(
+                value["source"].as_str().is_some_and(|s| !s.is_empty()),
+                "roost refuses an empty ownership.source (ReportError::EmptySource); \
+                 pass None to un-own a tab: {value}"
+            );
+        }
         let mut state = self.lock();
         let Some(tab) = state.tab_mut(tab_id) else {
             panic!("no tab {tab_id} to set axes on");
@@ -1226,14 +1405,55 @@ fn params_tab_id(params: &Value) -> Result<i64, Refusal> {
 }
 
 /// A minimal `Ownership` object, for a test that wants an agent-owned tab
-/// without hand-writing the shape.
+/// without hand-writing the shape. Empty metadata — what every adapter that
+/// stamps nothing sends.
 pub fn ownership(source: &str, session_id: &str, detail: &str, last_event_at: i64) -> Value {
+    ownership_with(source, session_id, detail, last_event_at, &[])
+}
+
+/// [`ownership`] plus roost's open extension channel — an opaque string map the
+/// daemon carries verbatim (it validates only `source` and the attention bits).
+///
+/// A second function rather than a fifth parameter because Rust has no default
+/// arguments and its Python twin (`fake_roost.py`'s `ownership`) defaults this
+/// one; that pair is the twins' ONE deliberate divergence, and everything else
+/// about the two calls — the four required arguments, and the refusal below —
+/// is identical on purpose.
+///
+/// # Panics
+///
+/// On an EMPTY `source`, because **the real daemon refuses one**:
+/// `roost_ipc::agent::validate_report` answers `ReportError::EmptySource`
+/// before it mutates anything, and `agent::is_live` reads an empty source as
+/// unowned. A fake that accepted it would hand a client a row the real server
+/// can never produce — the exact failure mode plan 021's A6 recorded, and the
+/// one a fake exists to keep out.
+pub fn ownership_with(
+    source: &str,
+    session_id: &str,
+    detail: &str,
+    last_event_at: i64,
+    metadata: &[(String, String)],
+) -> Value {
+    assert!(
+        !source.is_empty(),
+        "roost refuses an empty ownership.source (ReportError::EmptySource); \
+         an unowned tab has NO ownership key, it does not have a blank one"
+    );
     let mut object = Map::new();
     object.insert("source".into(), json!(source));
     object.insert("session_id".into(), json!(session_id));
     object.insert("last_event_at".into(), json!(last_event_at));
     object.insert("detail".into(), json!(detail));
-    object.insert("metadata".into(), json!({}));
+    object.insert(
+        "metadata".into(),
+        Value::Object(
+            metadata
+                .iter()
+                .map(|(k, v)| (k.clone(), json!(v)))
+                .collect::<Map<String, Value>>(),
+        ),
+    );
     Value::Object(object)
 }
 
@@ -1282,6 +1502,125 @@ mod tests {
             vector(VECTOR_TAB_NOTIFICATION)["event"],
             json!("tab.notification")
         );
+    }
+
+    /// **The twin of `fake_roost.py`'s `add_tab`.** A source makes it a session
+    /// row; no source makes it somebody's terminal, which roost's wire spells as
+    /// no `ownership` key at all — and which [`RoostInventory`] therefore never
+    /// lists.
+    ///
+    /// The pair is the point: without it this fake's inventory is empty forever
+    /// (its vendored `tab.list` carries one shell tab), and a test about rows
+    /// has nothing to be about.
+    #[tokio::test]
+    async fn an_added_tab_is_a_row_only_when_something_owns_it() {
+        let fake = FakeRoost::start().await;
+        let before = fake.revision();
+
+        fake.add_tab(
+            41,
+            TabSpec {
+                cwd: "/home/shed/work".to_string(),
+                title: "OC | a real one".to_string(),
+                source: Some("opencode".to_string()),
+                session_id: "ses_added".to_string(),
+                lifecycle: "working".to_string(),
+                metadata: vec![(
+                    "server_url".to_string(),
+                    "http://127.0.0.1:4096".to_string(),
+                )],
+                ..TabSpec::default()
+            },
+        );
+        fake.add_tab(
+            42,
+            TabSpec {
+                title: "shed@mini3: ~".to_string(),
+                ..TabSpec::default()
+            },
+        );
+        // One batch each, and the ids do not collide with a later `tab.open`.
+        assert_eq!(fake.revision(), before + 2);
+
+        let mut conn = Conn::unix(fake.socket_path()).await.expect("dial");
+        let identify = conn.session_identify().await.expect("identify");
+        let list = conn.tab_list().await.expect("tab.list");
+        let inventory = crate::roost::RoostInventory::from_list("mini3", &list, &identify);
+        let listed: Vec<i64> = inventory.sessions.iter().map(|s| s.tab_id).collect();
+        assert_eq!(listed, vec![41], "a shell tab is not a session row");
+
+        let row = &inventory.sessions[0];
+        assert_eq!(row.cwd, "/home/shed/work");
+        assert_eq!(row.title, "OC | a real one");
+        assert_eq!(
+            row.ownership.as_ref().map(|o| o.session_id.as_str()),
+            Some("ses_added"),
+        );
+        // The metadata channel is what carries an `agent_lane` stamp, so it has
+        // to survive the trip verbatim.
+        assert_eq!(
+            row.agent_lane().map(|lane| lane.server_url),
+            Some("http://127.0.0.1:4096".to_string()),
+        );
+
+        // And the counter really did move past the explicit id.
+        let opened = conn
+            .tab_open(roost_ipc::messages::TabOpenParams {
+                cwd: "/home/shed".to_string(),
+                ..Default::default()
+            })
+            .await
+            .expect("tab.open");
+        assert!(
+            opened.id > 42,
+            "a fresh tab reused an added id: {}",
+            opened.id
+        );
+
+        // Both controls default `cwd`/`title` the same way, so a test that only
+        // cares about ownership can say so and nothing else.
+        fake.add_tab(50, TabSpec::default());
+        let bare = {
+            let state = fake.lock();
+            state.tab(50).expect("tab 50").clone()
+        };
+        assert_eq!(bare["cwd"], json!("/home/shed"));
+        assert_eq!(bare["title"], json!("zsh"));
+        assert_eq!(fake.tab_ids(), vec![5, 41, 42, opened.id, 50]);
+    }
+
+    /// **The fakes must refuse what the server refuses.** (The Python twin is
+    /// `test_a_blank_ownership_source_is_refused_like_the_real_daemon`.)
+    ///
+    /// `roost_ipc::agent::validate_report` answers `ReportError::EmptySource`
+    /// before it mutates anything, and `agent::is_live` reads a blank source as
+    /// unowned — so an ownership carrying `""` is a row the real daemon can
+    /// never produce. This fake used to mint exactly that from `Some("")`, while
+    /// the Python twin read the same value as "no source" and handed back a
+    /// plain terminal: two fakes disagreeing, and one of them more permissive
+    /// than the thing it stands in for. `None` is the only spelling of unowned,
+    /// on both sides.
+    #[tokio::test]
+    #[should_panic(expected = "empty ownership.source")]
+    async fn a_blank_ownership_source_is_refused_like_the_real_daemon() {
+        let fake = FakeRoost::start().await;
+        fake.add_tab(
+            51,
+            TabSpec {
+                source: Some(String::new()),
+                ..TabSpec::default()
+            },
+        );
+    }
+
+    /// The other door onto the same refusal: an ownership object a test spelled
+    /// itself rather than building with [`ownership`]. See
+    /// [`a_blank_ownership_source_is_refused_like_the_real_daemon`].
+    #[tokio::test]
+    #[should_panic(expected = "empty ownership.source")]
+    async fn a_hand_written_blank_source_is_refused_too() {
+        let fake = FakeRoost::start().await;
+        fake.set_tab_axes(5, "working", Some(json!({"source": ""})), false);
     }
 
     #[tokio::test]

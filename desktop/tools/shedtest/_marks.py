@@ -6,6 +6,8 @@ time — sees the effective target whether it came from the CLI flag or the env.
 
 - `mac_only`: the Swift app's ops (the surface-based screenshot and other
   Swift-only op surfaces) that the Tauri client doesn't implement.
+- `needs_agents`: the Agents-pane suite, which reads roost — tauri only since S6
+  (see the constant below).
 - `needs_backend`: the shared-suite tests that drive the shed-core backend ops
   (sheds.list/refresh, the lifecycle actions, create + cancel). Both targets
   (mac + tauri) implement them.
@@ -41,11 +43,18 @@ needs_approvals = pytest.mark.skipif(
     reason="target has no approval spine",
 )
 
-# Targets whose UI implements the Agents / remote-control pane. Tauri gained it in
-# Phase C (B2).
-_AGENTS_TARGETS = {"mac", "tauri"}
+# Targets whose Agents pane reads ROOST.
+#
+# **Tauri only, since S6** (`charliek/shed#328`). The suite used to be
+# cross-target because both panes read the same hub: sessions listed by ssh'ing
+# `shed-ext-rc` into a shed. That guest binary is gone, and the Tauri pane now
+# reads each host's `roost-session` instead. The Swift app's pane still shells
+# `shed-ext-rc` — it compiles, and is retained pending demolition, but there is
+# nothing on a 0.9.0 image for it to shell — so pointing `test_agents.py` at it
+# would be testing a client nobody ships against a binary that no longer exists.
+_AGENTS_TARGETS = {"tauri"}
 
 needs_agents = pytest.mark.skipif(
     _TARGET not in _AGENTS_TARGETS,
-    reason="target has no Agents/RC pane",
+    reason="target has no roost-backed Agents pane",
 )

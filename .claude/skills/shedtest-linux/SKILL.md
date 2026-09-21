@@ -449,7 +449,9 @@ The driver is a Python script that:
   `sys.path` and imports `ui`, `client`, `mockserver`, `fake_host_agent`;
 - launches the mock + fake host-agent + the app hermetically via the harness's own
   `ui.launch` (throwaway HOME/XDG under `/work` or `/tmp`);
-- seeds fixtures — `rc.inject_test` sessions for the Agents pane, `fake.emit_event`
+- seeds fixtures — `rc.inject_test` rows for the Agents pane (since S6 it injects into
+  the shed's ROOST snapshot, so `slug` must parse as a roost tab id and the shed has to
+  have been listed by `sheds.list` first), `fake.emit_event`
   audit frames for Activity/Egress (mixed-ns: an `ssh-agent` + an `egress` event is
   the ns-filter fixture) — `navigate`s to the pane, drives sub-state
   (`egress.show`), calls `ui.set_appearance("dark")` for the dark shot, and captures
@@ -460,8 +462,11 @@ ImageMagick's `import -window root` if `scrot` is absent or fails (the tool orde
 `src-tauri/src/screenshot.rs::capture` is `grim` → `scrot` → `import`; `grim` is
 skipped without a `WAYLAND_DISPLAY`, so X11/Xvfb tries `scrot` then `import`). Either
 way the PNG is the full display; the reported truth ops (`dashboard.dump` / `agents.dump` /
-`egress.profiles` / `ui.badges` / `ui.computed_style`) stay the deterministic
-assertions, the pixels are the eyeball.
+`launch.dump` / `egress.profiles` / `ui.badges` / `ui.computed_style`) stay the deterministic
+assertions, the pixels are the eyeball. `agents.dump`'s `empty` and `launch.dump`'s
+`rendered` are how the ABSENCE of something is asserted — which of the four blank
+Agents panes is on screen, and that the launch dialog offers no field it cannot
+deliver — neither of which a screenshot can be made to fail on.
 
 ## Gremlins
 
@@ -490,7 +495,7 @@ assertions, the pixels are the eyeball.
   a full `cargo build` there only works in Docker.
 - **`cargo fmt --check` is not a gate on the Tauri crate, but your own files still are** —
   unlike `crates/`, `desktop/tauri/src-tauri` is NOT rustfmt-clean at `origin/main` (about
-  twenty-six hunks across `approval.rs`, `broker.rs`, `lib.rs`, `live_activity.rs`,
+  twenty-odd hunks across `approval.rs`, `broker.rs`, `lib.rs`,
   `screenshot.rs`, `termctl.rs`, `tray.rs`, `updater.rs`), so a whole-crate `cargo fmt --check`
   is red before you touch anything and a whole-crate `cargo fmt -- --emit files` would bury your
   diff in unrelated reflows. Check only the files you edited, against their own baseline:

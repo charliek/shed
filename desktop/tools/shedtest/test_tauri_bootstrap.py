@@ -1148,21 +1148,25 @@ def test_a_running_shed_is_probed_and_then_watched(boot, rig, mock):
     assert boot.call("roost.preview", {"target": quiet})["plan"]["kind"] == "start"
 
 
-def test_hub_and_roost_rows_are_a_union_and_a_filter_returns_both(boot, rig, mock):
-    """**The union rule** (plan 019 §3.6), including under a filter.
+def test_a_sheds_rows_are_roosts_and_a_filter_returns_them(boot, rig, mock):
+    """**One row source** (S6, `charliek/shed#328`), including under a filter.
 
-    One shed, two row sets: the hub's, listed over ssh, and roost's, read from
-    the session on it. They are stamped so a consumer can tell them apart, they
-    share the `host`/`shed` a filter selects on, and a filtered `rc.list` — the
-    shed card's own query, which used to drop the roost half entirely — returns
-    both.
+    This cell used to be the UNION rule: one shed with two row sets in one
+    payload — the hub's, listed over ssh, and roost's, read from the session on
+    it — and the claim was that a filtered `rc.list` returned BOTH, because the
+    shed card (the one caller that knows exactly which shed it is asking about)
+    was the one caller that used to see only the hub half.
+
+    The hub is gone, so what is left to assert is the half that survived: a
+    shed's rows are its roost-session's tabs, stamped as that shed's, and the
+    shed card's own filtered query still returns them.
     """
     shed = "p19-union"
     fake = rig.roost()
     target = rig.host(shed, identity=IDENTITY_CURRENT, roost=fake)
     _bootstrap(boot, target)
-    # An adapter-claimed tab, so the roost half of the union is a row that
-    # survives the watcher's next snapshot — see `Rig.agent_tab`.
+    # An adapter-claimed tab, so the row survives the watcher's next snapshot —
+    # see `Rig.agent_tab`.
     rig.agent_tab(fake)
 
     launched = boot.call(
@@ -1172,46 +1176,44 @@ def test_hub_and_roost_rows_are_a_union_and_a_filter_returns_both(boot, rig, moc
     assert launched["origin"] == target
     assert launched["source"] == "roost"
     assert launched["origin_kind"] == "shed"
-    assert launched["host"] == SERVER, "the SERVER, as the hub row spells it"
+    assert launched["host"] == SERVER, "the SERVER, as a shed row spells it"
     assert launched["shed"] == shed
     assert launched["machine"] == target, "the address a lane op takes"
     opened = fake.opens[-1]
     assert opened["cwd"] == "/home/shed/work"
     # `shed_core::roost::launch_argv`'s recipe for the kind: the agent's own
-    # binary, resolved by roost on the far side. (The S4 provider's `bash -lc`
-    # wrapper is its own path — this op is plan 013's `tab.open`, generalized.)
+    # binary, resolved by roost on the far side.
     assert opened["argv"] == ["codex"], opened
 
-    # A hub row for the SAME shed: test mode synthesizes it, which is exactly the
-    # other half of the union.
-    hub = boot.call("rc.launch", {"shed": shed, "kind": "claude-rc"})
+    # `rc.launch {shed}` is the SAME op under its pre-S6 name — an alias kept
+    # for 0.9.x — so it lands on the same host and stamps the same origin.
+    alias = boot.call("rc.launch", {"shed": shed, "kind": "codex"})
+    assert alias["origin"] == target, alias
+    assert alias["source"] == "roost", alias
 
     # Wait for the WATCHER's own snapshot rather than reading the optimistic row
-    # `roost.launch` inserted: the union is a claim about what a listing says once
-    # both halves are real, and the adapter-claimed tab is what makes the roost
-    # half survive a resync.
+    # `roost.launch` inserted: the claim is about what a listing says, and the
+    # adapter-claimed tab is what makes a row survive a resync.
     _wait_for(
         "the claimed tab to reach the listing",
         lambda: [r for r in _roost_rows(boot, shed) if r["slug"] == "7"] or None,
     )
     everything = boot.call("rc.list")["sessions"]
-    hub_rows = [s for s in everything if s.get("shed") == shed and s.get("source") == "hub"]
-    roost_rows = [s for s in everything if s.get("shed") == shed and s.get("source") == "roost"]
-    assert hub_rows, f"the hub half is missing: {everything}"
-    assert roost_rows, f"the roost half is missing: {everything}"
-    assert {r["origin"] for r in hub_rows} == {f"{SERVER}/{shed}"}
-    assert {r["origin"] for r in roost_rows} == {target}
-    assert hub["slug"] in {r["slug"] for r in hub_rows}
+    rows = [s for s in everything if s.get("shed") == shed]
+    assert rows, f"the shed's rows are missing: {everything}"
+    assert {r["source"] for r in rows} == {"roost"}, "there is one row source now"
+    assert {r["origin"] for r in rows} == {target}
 
-    # The two origins carry DIFFERENT contracts, which is what lets a card read
-    # the one the button it is drawing belongs to.
+    # The contract is keyed by that same origin, which is what lets a card read
+    # the contract for the row it is drawing.
     caps = boot.call("rc.list")["capabilities"]
     assert target in caps, list(caps)
+    assert f"{SERVER}/{shed}" not in caps, "the hub's key retired with the hub"
     assert caps[target]["kind_features"]["codex"]["attach"] == "native-remote"
 
     # **The filtered query.** Same rows, asked the way a shed card asks.
     filtered = boot.call("rc.list", {"host": SERVER, "shed": shed})
-    assert {s.get("source") for s in filtered["sessions"]} == {"hub", "roost"}, filtered
+    assert {s.get("source") for s in filtered["sessions"]} == {"roost"}, filtered
     assert _roost_rows(boot, shed, {"host": SERVER, "shed": shed}), filtered
     assert target in filtered["capabilities"]
     # A machine belongs to no server, so a filter omits every machine — and the

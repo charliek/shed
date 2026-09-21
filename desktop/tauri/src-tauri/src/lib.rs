@@ -12,7 +12,6 @@ mod broker;
 mod env;
 mod ipc;
 mod lane;
-mod live_activity;
 mod machines;
 mod prefs;
 mod roost_hosts;
@@ -30,8 +29,7 @@ use env::Env;
 use ipc::{Handler, IpcServer};
 use shed_app::traits::{AuthGateRef, NotifierRef};
 use shed_app::{
-    AlwaysApprovedGate, AuditStore, Backend, Coordinator, CoordinatorDeps, FakeNotifier, RcService,
-    SshPrefs,
+    AlwaysApprovedGate, AuditStore, Backend, Coordinator, CoordinatorDeps, FakeNotifier, SshPrefs,
 };
 use shed_core::approval::{
     namespace, ApprovalChoice, ApprovalDecision, ApprovalMethod, ApprovalScope, PolicyRule,
@@ -260,29 +258,41 @@ fn open_terminal(
 // -- approvals (the frontend Approvals/Activity panes + approval prefs) --------
 
 /// The pending approval cards (each with gate + scope/TTL defaults). The pane
-/// The Agents pane launches/lists/kills RC sessions over these invoke commands
-/// (the harness drives the same ops over the IPC socket). The shed→ssh target
-/// resolution stays in `Backend`; `RcService` owns the store + process seam.
+/// The Agents pane lists/launches/kills sessions over these invoke commands (the
+/// harness drives the same ops over the IPC socket). Since S6 every row is a
+/// roost tab: the shed→server resolution stays in `Backend`, and `RoostHosts`
+/// owns the watchers and the wire.
 #[tauri::command]
 async fn rc_list(
     backend: tauri::State<'_, Arc<Backend>>,
-    rc: tauri::State<'_, Arc<RcService>>,
     machines: tauri::State<'_, Arc<roost_hosts::RoostHosts>>,
-    live: tauri::State<'_, Arc<live_activity::LiveActivityLayer>>,
     host: Option<String>,
     shed: Option<String>,
 ) -> Result<serde_json::Value, String> {
     // The SAME shaper the socket IPC `rc.list` uses — not a parallel build with
     // a comment claiming they match (which is how machine sessions reached the
     // IPC op but never the pane).
-    Ok(ipc::rc_list_payload(&backend, &rc, &machines, &live, host.as_deref(), shed.as_deref()).await)
+    Ok(ipc::rc_list_payload(&backend, &machines, host.as_deref(), shed.as_deref()).await)
 }
 
+/// The roost host a shed-addressed command is about — the twin of
+/// `ipc::Handler::shed_target`, so the two doors resolve a host identically.
+fn shed_target(backend: &Backend, host: Option<&str>, shed: &str) -> Result<String, String> {
+    let server = backend
+        .resolve_rc_target(host)
+        .map_err(|e| e.to_string())?
+        .server_name;
+    Ok(format!("roost:{server}/{shed}"))
+}
+
+/// Launch a session IN a shed — an alias for [`machine_launch`] on the shed's
+/// roost host since S6, kept for 0.9.x. Same `tab.open`, addressed by
+/// `{shed, host?}` rather than by machine name.
 #[tauri::command]
 #[allow(clippy::too_many_arguments)] // a flat invoke arg list mirrors the launch form fields
 async fn rc_launch(
     backend: tauri::State<'_, Arc<Backend>>,
-    rc: tauri::State<'_, Arc<RcService>>,
+    machines: tauri::State<'_, Arc<roost_hosts::RoostHosts>>,
     shed: String,
     kind: RcKind,
     host: Option<String>,
@@ -293,30 +303,29 @@ async fn rc_launch(
     // Serde preserves an unknown kind as `Other(raw)` (the unknown-kind read
     // policy), so launching must apply the same known-kind gate as the socket IPC.
     ipc::ensure_known_kind(&kind)?;
-    let target = backend
-        .resolve_rc_target(host.as_deref())
-        .map_err(|e| e.to_string())?;
-    let session = rc
-        .launch(target, &shed, kind, display_name, workdir, initial_prompt)
+    let target = shed_target(&backend, host.as_deref(), &shed)?;
+    machines
+        .launch(
+            &target,
+            &kind,
+            display_name.as_deref(),
+            workdir.as_deref(),
+            None,
+            initial_prompt.as_deref(),
+        )
         .await
-        .map_err(|e| e.to_string())?;
-    Ok(serde_json::json!(session))
 }
 
 #[tauri::command]
 async fn rc_kill(
     backend: tauri::State<'_, Arc<Backend>>,
-    rc: tauri::State<'_, Arc<RcService>>,
+    machines: tauri::State<'_, Arc<roost_hosts::RoostHosts>>,
     shed: String,
     slug: String,
     host: Option<String>,
 ) -> Result<(), String> {
-    let target = backend
-        .resolve_rc_target(host.as_deref())
-        .map_err(|e| e.to_string())?;
-    rc.kill(target, &shed, &slug)
-        .await
-        .map_err(|e| e.to_string())
+    let target = shed_target(&backend, host.as_deref(), &shed)?;
+    machines.kill(&target, &slug).await
 }
 
 /// Kill a session on a MACHINE — a roost `tab.close` addressed by
@@ -1110,14 +1119,6 @@ pub fn run() {
     // order (§3.2) is preserved inside setup.
     let clock = shed_app::traits::system_clock();
 
-    // The Agents / Remote-Control service (session store + process seam). Same
-    // test-mode flag as the coordinator fakes — test mode synthesizes sessions;
-    // the real path shells out `shed-ext-rc` over SSH.
-    let rc_service = Arc::new(RcService::new_default(
-        env.test_mode,
-        env!("CARGO_PKG_VERSION"),
-    ));
-
     #[allow(unused_mut)] // only the macOS+non-test arm re-binds it (the sparkle plugin)
     let mut builder = tauri::Builder::default()
         // Launch-at-login (B4): register the plugin so `app.autolaunch()` resolves;
@@ -1133,7 +1134,6 @@ pub fn run() {
         .plugin(tauri_plugin_positioner::init())
         .manage(ui.clone())
         .manage(env.clone())
-        .manage(rc_service.clone())
         // The macOS test-mode login-item cell (see [`LoginItemCell`]).
         .manage(LoginItemCell(Mutex::new(false)))
         // The app-wide light/dark appearance, shared across webviews (unset at
@@ -1408,22 +1408,6 @@ pub fn run() {
             }));
             app.manage(lanes.clone());
 
-            // Live activity for SHED sessions. Machine rows carry theirs already
-            // (roost reports the agent axes on every poll); shed rows are listed
-            // by the one-shot, which by design never sets it — so without this
-            // the same list shows two different amounts of truth depending on
-            // how each row was fetched. Same `refresh` event, so both layers
-            // converge on one repaint path.
-            let live_refresh = app.handle().clone();
-            let live_activity = Arc::new(live_activity::LiveActivityLayer::start(
-                &tauri::async_runtime::handle().inner().clone(),
-                &backend,
-                Arc::new(move || {
-                    let _ = live_refresh.emit("refresh", serde_json::json!({}));
-                }),
-            ));
-            app.manage(live_activity.clone());
-
             // The terminal ops (preset resolution, launch, detection, the pref), shared
             // by the IPC handler + the frontend invoke commands (needs the Backend above).
             let terminal: termctl::SharedTerminal = Arc::new(termctl::TerminalCtl::new(
@@ -1440,10 +1424,8 @@ pub fn run() {
                 backend.clone(),
                 terminal,
                 coordinator,
-                rc_service.clone(),
                 prefs,
                 machines,
-                live_activity,
                 lanes,
             );
             // block_on enters Tauri's tokio runtime so tokio's UnixListener can

@@ -69,7 +69,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
-use roost_ipc::agent::Ownership;
+use roost_ipc::agent::{AgentLifecycle, Ownership, ShellState};
 use roost_ipc::messages::{Tab, TabOpenParams};
 use shed_app::roost::{
     launch_argv, roost_capabilities, shed_reach_entry, tab_close, tab_open, BootstrapRunner,
@@ -797,6 +797,32 @@ impl RoostHosts {
         out
     }
 
+    /// Refuse a tab id that is not one of THIS host's listed rows.
+    ///
+    /// The gate [`Self::kill`] needs and the reason it needs it are in that
+    /// method's doc: tab ids are per-host small integers, so "it parses" says
+    /// nothing about whether the caller is addressing a row this app ever
+    /// showed. The predicate is deliberately the SAME one
+    /// [`Self::sessions_locked`] publishes with — `listed`, and a row with this
+    /// id — so anything a client could have read out of `rc.list` is closable
+    /// and nothing else is. An unreachable host is NOT excluded: its last rows
+    /// stay on screen marked stale, and closing one is a request the wire will
+    /// answer for itself.
+    fn listed_row(&self, id: &HostId, tab_id: i64) -> Result<(), String> {
+        let guard = lock(&self.state);
+        let listed = guard
+            .get(id)
+            .filter(|m| m.listed)
+            .is_some_and(|m| m.sessions.iter().any(|s| s.tab_id == tab_id));
+        if listed {
+            return Ok(());
+        }
+        Err(format!(
+            "{id} lists no agent session {tab_id}: a tab id is only closable on \
+             the host whose rows carry it"
+        ))
+    }
+
     /// Close a session on a machine — `tab.close` on its roost tab — then drop
     /// the row optimistically.
     ///
@@ -817,10 +843,21 @@ impl RoostHosts {
     /// The slug IS the tab id (`RoostSession::to_rc_dto` stringifies it), so a
     /// slug that is not an integer is a row from somewhere else and is refused by
     /// name rather than sent to roost as a zero.
+    ///
+    /// **And a well-formed id is not enough** (sol review of C6). Since S6 a
+    /// shed's slug is a roost tab id too, so `rc.kill`'s slug space is the same
+    /// small-integer space every other host's is — ids collide ACROSS hosts by
+    /// construction. A `5` copied from one shed's row is a perfectly valid tab
+    /// id on another, and `tab.close` would happily close whatever tab 5 happens
+    /// to be there: somebody's plain terminal, which is not a session row at all
+    /// and which this app never offered a Kill button for. So the id is resolved
+    /// against THIS host's own listed rows first — [`Self::listed_row`] — and a
+    /// miss is refused by name rather than sent to the wire.
     pub async fn kill(&self, host: &str, slug: &str) -> Result<(), String> {
         let id = HostId::parse(host)?;
         let reach = self.reach(&id)?;
         let tab_id = parse_tab_id(slug)?;
+        self.listed_row(&id, tab_id)?;
         tab_close(reach.as_ref(), tab_id).await?;
         {
             let mut guard = lock(&self.state);
@@ -940,6 +977,62 @@ impl RoostHosts {
         // and a row on an unlisted host is not in the payload.
         self.watch(&id);
         Ok(row)
+    }
+
+    /// **TEST-MODE ONLY**: put a synthetic row into this host's snapshot, as if a
+    /// session had reported it.
+    ///
+    /// Backs the `rc.inject_test` IPC op (gated there, like `policy.set`). After
+    /// S6 the Agents pane has exactly one source — the roost snapshot — so the
+    /// render fixture has to land in it; injecting into a second, hub-shaped
+    /// store is what it used to do and there is no longer such a store.
+    ///
+    /// It registers the host if it is not registered yet (a shed still has to
+    /// have been LISTED by its server — [`Self::ssh_entry`]'s gate is not
+    /// bypassed) and marks it reached, so the row renders live rather than as
+    /// the dimmed last-known state of something unreachable. Everything above
+    /// the snapshot is the production path: the same `host_row` mapping, the
+    /// same filter, the same payload.
+    ///
+    /// **And it goes through the snapshot's OWN ownership filter** (sol review
+    /// of C6). A real inventory keeps only the agent-owned tabs
+    /// (`RoostInventory::from_list` → [`RoostSession::is_agent_owned`]); an
+    /// unowned one is somebody's terminal and is set aside, never rendered. A
+    /// kind roost has no adapter for ([`roost_source`] answers `None`: `shell`,
+    /// `claude-broker`, anything unknown) injects exactly such a tab — so
+    /// inserting it straight into the row set would let the harness photograph a
+    /// card production can never produce. Refused by name instead, which is the
+    /// honest answer: there is no such row.
+    pub fn inject_test(&self, host: &str, row: InjectedRow) -> Result<(), String> {
+        let id = HostId::parse(host)?;
+        let kind = row.kind.as_str().to_string();
+        let session = row.into_session(&id)?;
+        if !session.is_agent_owned() {
+            return Err(format!(
+                "roost has no adapter for kind {kind:?}, so an injected {kind} tab \
+                 is unowned — and an unowned tab is not a session row"
+            ));
+        }
+        self.ensure_registered(&id)?;
+        {
+            let mut guard = lock(&self.state);
+            let state = guard
+                .entry(id.clone())
+                .or_insert_with(|| HostState::new(true));
+            state.sessions.retain(|s| s.tab_id != session.tab_id);
+            state.sessions.push(session);
+            // A row that answered is a host that answered — the same three flags
+            // [`consume`]'s snapshot arm sets, so the injected row is not dimmed
+            // as the last-known state of an unreachable host.
+            state.listed = true;
+            state.reachable = true;
+            state.seen = true;
+            state.detail = None;
+            state.down_kind = None;
+        }
+        self.publish_lanes(&id);
+        (self.on_change)();
+        Ok(())
     }
 
     /// One registered host's reach, or an error naming the ones there are.
@@ -2042,6 +2135,57 @@ fn opened_session(id: &HostId, kind: &RcKind, tab: &Tab) -> RoostSession {
     }
 }
 
+/// A row the `rc.inject_test` op asks for — the render fixture's whole input.
+///
+/// A parameter object rather than six positional arguments because every field
+/// but the id is optional at the wire and they are all strings: a positional
+/// signature would let a title and a working directory swap places silently.
+#[derive(Debug, Clone)]
+pub(crate) struct InjectedRow {
+    /// roost's tab id, which IS the row's `slug` — so an injected row can be
+    /// closed by the same `rc.kill`/`tab.close` a real one can.
+    pub tab_id: i64,
+    /// Which agent owns it. Mapped to roost's `ownership.source` by the same
+    /// [`roost_source`] a real launch predicts with, so a kind roost has no
+    /// adapter for produces an UNOWNED tab — which is not a row, and which
+    /// [`RoostHosts::inject_test`] therefore refuses rather than writing a
+    /// source roost would never write.
+    pub kind: RcKind,
+    pub title: String,
+    pub cwd: String,
+    /// roost's own `agent_lifecycle` word (`working`, `waiting`, `finished`, …).
+    /// Absent is `inactive`, the wire's own default.
+    pub lifecycle: Option<String>,
+    pub attention: bool,
+}
+
+impl InjectedRow {
+    fn into_session(self, id: &HostId) -> Result<RoostSession, String> {
+        let lifecycle = match self.lifecycle.as_deref() {
+            None => AgentLifecycle::default(),
+            Some(word) => serde_json::from_value(json!(word))
+                .map_err(|_| format!("{word:?} is not a roost agent_lifecycle"))?,
+        };
+        Ok(RoostSession {
+            host_label: id.token(),
+            tab_id: self.tab_id,
+            project_id: 0,
+            project_name: String::new(),
+            title: self.title,
+            user_titled: false,
+            cwd: self.cwd,
+            shell_state: ShellState::default(),
+            lifecycle,
+            attention: self.attention,
+            ownership: roost_source(&self.kind).map(|source| Ownership {
+                source: source.to_string(),
+                ..Ownership::default()
+            }),
+            created_at: 0,
+        })
+    }
+}
+
 /// The `ownership.source` string roost's own adapter writes for a kind — the
 /// inverse of [`RoostSession::agent_kind`], for the one moment shed has to
 /// predict it ([`opened_session`]).
@@ -2403,6 +2547,19 @@ mod tests {
             }),
         );
         (hosts, calls)
+    }
+
+    /// The row an `rc.inject_test` param bag describes, with the defaults the op
+    /// fills in.
+    fn injected(tab_id: i64) -> InjectedRow {
+        InjectedRow {
+            tab_id,
+            kind: RcKind::ClaudeRc,
+            title: "injected".to_string(),
+            cwd: "/home/shed".to_string(),
+            lifecycle: None,
+            attention: false,
+        }
     }
 
     /// The vector's shell tab, claimed by an opencode adapter.
@@ -3050,10 +3207,10 @@ mod tests {
         assert_eq!(reg.ids, vec![HostId::Machine(LOCALHOST.to_string())]);
     }
 
-    /// `kill` is a roost `tab.close`: the tab really leaves the session (a second
-    /// close of the same id is refused by the daemon), and the row is dropped
-    /// optimistically rather than waiting for the close's own `tab.closed` to
-    /// come back off the stream.
+    /// `kill` is a roost `tab.close`: the tab really leaves the SESSION (not
+    /// just this app's snapshot), and the row is dropped optimistically rather
+    /// than waiting for the close's own `tab.closed` to come back off the
+    /// stream.
     #[tokio::test]
     async fn kill_routes_to_tab_close() {
         let fake = FakeRoost::start().await;
@@ -3066,23 +3223,84 @@ mod tests {
 
         machines.kill("mini3", "5").await.expect("the close lands");
         assert!(rows(&machines).is_empty(), "the row drops optimistically");
+        // Read from the DAEMON, not from our own state: the row leaving the
+        // snapshot is this client's doing, and the tab leaving the session is
+        // roost's.
+        assert!(
+            !fake.tab_ids().contains(&VECTOR_TAB),
+            "the tab survived the close: {:?}",
+            fake.tab_ids()
+        );
 
-        // The tab is GONE from the session, not just from our snapshot: roost
-        // refuses a second close by name.
+        // A second close is now refused HERE, before the wire: the row is gone
+        // from the listing, so the id is no longer one this host carries.
         let again = machines
             .kill("mini3", "5")
             .await
             .expect_err("the tab is already closed");
-        assert!(
-            again.contains("not-found") || again.contains("no such tab"),
-            "{again}"
-        );
+        assert!(again.contains("lists no agent session 5"), "{again}");
 
         let bad = machines
             .kill("mini3", "rc-abc123")
             .await
             .expect_err("a non-roost slug is refused");
         assert!(bad.contains("not a roost tab id"), "{bad}");
+    }
+
+    /// **A tab id is only closable on the host whose rows carry it** (sol review
+    /// of C6).
+    ///
+    /// Since S6 a shed's slug IS a roost tab id, so every host's slugs live in
+    /// the same small-integer space and collide across hosts by construction: a
+    /// `5` read off one host's card is a perfectly valid id on the next one. The
+    /// old gate was "does it parse", which a colliding id passes — and the tab
+    /// it then closed was whatever `5` happened to be over there. Here that is
+    /// somebody's plain terminal: not a session row, never a card, and nothing
+    /// this app ever offered a Kill button for.
+    ///
+    /// Both halves matter. The id must be refused on the host that does not list
+    /// it, AND still close on the host that does — a gate that simply refused
+    /// everything would pass the first assertion alone.
+    #[tokio::test]
+    async fn kill_refuses_an_id_the_addressed_host_does_not_list() {
+        let owner = FakeRoost::start().await;
+        claim_opencode(&owner, "working", "session_status", false);
+        // `other`'s tab 5 is left UNCLAIMED — the vendored vector's plain shell.
+        let other = FakeRoost::start().await;
+        let machines = start(
+            &config_with(&["mini3", "mini4"]),
+            &sockets(&[
+                ("mini3", owner.socket_path()),
+                ("mini4", other.socket_path()),
+            ]),
+        );
+        wait_for("mini3's row", || {
+            rows(&machines)
+                .into_iter()
+                .find(|r| r["origin"] == json!("machine:mini3"))
+        })
+        .await;
+        // mini4 has answered too — it simply lists no rows, which is the state
+        // the refusal has to be made against rather than "not looked yet".
+        wait_for("mini4 to answer", || {
+            machine_health(&machines, "mini4").0.then_some(())
+        })
+        .await;
+
+        let refused = machines
+            .kill("mini4", "5")
+            .await
+            .expect_err("an id mini4 never listed");
+        assert!(refused.contains("lists no agent session 5"), "{refused}");
+        assert!(
+            other.tab_ids().contains(&VECTOR_TAB),
+            "an unrelated terminal was closed: {:?}",
+            other.tab_ids()
+        );
+
+        // …and the very same id still closes on the host that DOES list it.
+        machines.kill("mini3", "5").await.expect("the close lands");
+        assert!(!owner.tab_ids().contains(&VECTOR_TAB));
     }
 
     /// **An optimistic drop that nobody is told about is not optimistic.**
@@ -3250,6 +3468,113 @@ mod tests {
                 .then_some(())
         })
         .await;
+    }
+
+    /// **The render fixture lands in the roost snapshot** — the only row source
+    /// the Agents pane has since S6.
+    ///
+    /// Three claims in one, because they are what make an injected row usable:
+    /// it is stamped exactly like a reported one (so the pane keys, groups and
+    /// addresses it the same way), it is NOT stale (a fixture must not render as
+    /// the dimmed last-known state of an unreachable host), and the shed gate is
+    /// not bypassed — a shed no server has listed is refused, the same refusal a
+    /// preview or a bootstrap of an invented name gets.
+    #[tokio::test]
+    async fn an_injected_row_is_stamped_live_and_still_behind_the_shed_gate() {
+        let hosts = start(&config_with_server("mock"), &sockets(&[]));
+        let target = "roost:mock/hello-world";
+
+        let refused = hosts
+            .inject_test(target, injected(9))
+            .expect_err("a shed nobody listed is not addressable");
+        assert!(
+            refused.contains("has not listed a running shed"),
+            "{refused}"
+        );
+
+        lists(&hosts, "mock", &["hello-world"]);
+        hosts
+            .inject_test(target, injected(9))
+            .expect("the injection");
+
+        let listed = rows(&hosts);
+        let row = listed
+            .iter()
+            .find(|r| r["slug"] == "9")
+            .unwrap_or_else(|| panic!("the injected row is missing: {listed:?}"));
+        assert_eq!(row["origin"], json!(target));
+        assert_eq!(row["origin_kind"], json!("shed"));
+        assert_eq!(row["source"], json!("roost"));
+        assert_eq!(row["machine"], json!(target), "the address a kill takes");
+        assert_eq!(row["host"], json!("mock"));
+        assert_eq!(row["shed"], json!("hello-world"));
+        assert_eq!(row["display_name"], json!("injected"));
+        assert_eq!(
+            row["stale"],
+            json!(false),
+            "an injected row is not the last-known state of an unreachable host"
+        );
+
+        // Re-injecting the same tab id REPLACES it rather than doubling it —
+        // the same rule the optimistic insert follows.
+        hosts.inject_test(target, injected(9)).expect("the second");
+        assert_eq!(rows(&hosts).iter().filter(|r| r["slug"] == "9").count(), 1);
+    }
+
+    /// **An injected row goes through the snapshot's own ownership filter** (sol
+    /// review of C6).
+    ///
+    /// A real inventory keeps the agent-owned tabs and sets the rest aside: an
+    /// unowned tab is somebody's terminal, and `RoostInventory::from_list` never
+    /// lists one. A kind roost has no adapter for ([`roost_source`] → `None`)
+    /// makes exactly such a tab, and inserting it straight into the row set
+    /// would let the harness photograph a card production can never draw — a
+    /// render fixture proving the wrong thing.
+    ///
+    /// The launchable kinds are the control: the op is still the render fixture
+    /// it exists to be.
+    #[tokio::test]
+    async fn an_injected_row_goes_through_the_snapshots_ownership_filter() {
+        let hosts = start(&config_with_server("mock"), &sockets(&[]));
+        let target = "roost:mock/hello-world";
+        lists(&hosts, "mock", &["hello-world"]);
+
+        for kind in [
+            RcKind::Shell,
+            RcKind::ClaudeBroker,
+            RcKind::Other("borg".into()),
+        ] {
+            let refused = hosts
+                .inject_test(
+                    target,
+                    InjectedRow {
+                        kind: kind.clone(),
+                        ..injected(31)
+                    },
+                )
+                .expect_err("a kind roost has no adapter for is not a row");
+            assert!(refused.contains("is not a session row"), "{refused}");
+        }
+        assert!(
+            rows(&hosts).is_empty(),
+            "a refused injection left a row behind: {:?}",
+            rows(&hosts)
+        );
+
+        // The kinds roost DOES own an adapter for still inject, so the fixture
+        // op is not merely refusing everything.
+        for kind in [RcKind::Opencode, RcKind::Gx] {
+            hosts
+                .inject_test(
+                    target,
+                    InjectedRow {
+                        kind,
+                        ..injected(31)
+                    },
+                )
+                .expect("an agent-owned row");
+        }
+        assert_eq!(rows(&hosts).len(), 1);
     }
 
     /// **Eviction's signal, at the layer that delivers it** (plan 015 §3.4).
