@@ -300,6 +300,9 @@ func TestVendoredVectorsDecode(t *testing.T) {
 				Cwd:            "/Users/me/projects/roost",
 				State:          "running",
 				AgentLifecycle: "inactive",
+				// The vectors' own `created_at`, in unix seconds. Asserted
+				// because `shed sessions`' CREATED column reads it.
+				CreatedAt: 1700000000,
 			}
 			if got.Tabs[0] != wantTab {
 				t.Errorf("tab = %+v, want %+v", got.Tabs[0], wantTab)

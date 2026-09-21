@@ -257,10 +257,10 @@ type Project struct {
 // Tab is one tab of a project, as `tab.list` reports it inside its project.
 //
 // The subset this package reads, not roost's whole `Tab`: it also carries
-// has_notification, is_active, user_titled, position, created_at, last_active,
-// hook_active and an optional ownership record, none of which anything here
-// needs. Decoding a subset is deliberate — a field roost adds costs nothing,
-// and a field shed does not read cannot drift.
+// has_notification, is_active, user_titled, position, last_active, hook_active
+// and an optional ownership record, none of which anything here needs.
+// Decoding a subset is deliberate — a field roost adds costs nothing, and a
+// field shed does not read cannot drift.
 //
 // `id` and `project_id` are STRINGS for the same reason Project.ID is: roost
 // serializes every int64 id through `string_int64`, so `"5"` is what the wire
@@ -273,6 +273,13 @@ type Project struct {
 // `waiting`, `finished`, `failed`) — both `#[serde(default)]` on roost's side
 // for agent_lifecycle, so an older session answering without it decodes to the
 // empty string rather than failing.
+//
+// `created_at` is UNIX SECONDS, as an integer — roost's own `created_at` on a
+// tab (see crates/fixtures/roost-vectors/tab.list.response.json), not a
+// timestamp string. It is read for one reason: `shed sessions`' CREATED column
+// (plan 022 §3.3), which renders a tab's age beside a tmux session's. A reply
+// without it decodes to 0, which the renderer shows as `unknown` rather than
+// as 1970.
 type Tab struct {
 	ID             string `json:"id"`
 	ProjectID      string `json:"project_id"`
@@ -280,6 +287,7 @@ type Tab struct {
 	Cwd            string `json:"cwd"`
 	State          string `json:"state"`
 	AgentLifecycle string `json:"agent_lifecycle"`
+	CreatedAt      int64  `json:"created_at"`
 }
 
 // TabListResult is the subset of `tab.list`'s reply this package reads.

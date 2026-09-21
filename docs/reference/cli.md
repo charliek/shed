@@ -871,7 +871,10 @@ shed exec codelens --session default -- git status
 
 ### shed attach
 
-Attaches to a tmux session. Creates the session if it doesn't exist.
+Attaches to a shed. With a local [roost](https://github.com/charliek/roost) app
+running, the shed opens as a roost tab and this terminal is left alone; without
+one, this attaches to (or creates) a tmux session in the shed and drops you
+into it.
 
 ```bash
 shed attach <name> [flags]
@@ -879,24 +882,57 @@ shed attach <name> [flags]
 
 | Flag | Short | Default | Description |
 |------|-------|---------|-------------|
-| `--session` | `-S` | `default` | Session name |
-| `--new` | | `false` | Force create new session |
+| `--session` | `-S` | `default` | Roost tab title, or tmux session name |
+| `--new` | | `false` | Force create a new tab / session |
+| `--tmux` | | `false` | Use the tmux path even with a local roost app running |
+
+**Which path runs.** The test is "is a roost app running on this machine", not
+"am I typing inside roost". The tmux path is the floor and is unchanged: it
+runs when no local roost app answers, when `--tmux` is passed, or when
+`SHED_ATTACH=tmux` is set in the environment. `SHED_ATTACH` is the form to set
+once in a shell profile; any other value of it is ignored.
+
+`-S/--session` names the **roost tab** on the roost path and the **tmux
+session** on the tmux path. Attaching twice with the same name reuses the same
+tab (matched by title and working directory); `--new` opens another one.
 
 **Examples:**
 
 ```bash
-shed attach codelens
-shed attach codelens --session debug
-shed attach codelens --new --session experiment
+shed attach codelens                        # Roost tab "default", or the tmux session
+shed attach codelens --session debug        # A named tab / tmux session
+shed attach codelens --new --session review # Force-create a new tab / session
+shed attach codelens --tmux                 # The tmux path, even with roost running
+SHED_ATTACH=tmux shed attach codelens       # Same, set once per shell
 ```
 
-Detach with `Ctrl-B D`.
+On the roost path the command prints one line (`attached shed-codelens ›
+default in roost`) and exits; the tab is focused in roost. On the tmux path,
+detach with `Ctrl-B D`.
+
+**What the roost path writes.** The first attach adds a `Host shed-<name>`
+entry to `~/.ssh/config` (or `Host shed-<server>-<name>`, if another configured
+server also has a shed of that name) and saves a roost host of the same name.
+Both are left alone on every later attach.
+
+| Behaviour | Detail |
+|---|---|
+| No `IdentityFile` | The `Host` entry carries the host, port, user and pinned `~/.shed/known_hosts` file, and no identity — your default key and ssh agent decide, exactly as `shed ssh-config --install` writes it. An entry you wrote by hand is never modified. |
+| Renaming the tab defeats reuse | Reuse matches the tab's title and working directory. A tab renamed in roost no longer matches, so the next `shed attach` opens a new one. |
+| Concurrent attaches can duplicate a saved host | Two `shed attach` runs racing on a shed that has no saved host yet can each add one, leaving a duplicate. roost offers no compare-and-swap; remove the extra host in roost. |
+| Nothing is cleaned up on `shed delete` | The `Host` entry and the saved roost host outlive the shed. Remove them by hand; automatic cleanup is future work. |
+
+**If the shed has no roost session.** The attach stops and names the remedy —
+roost's palette row `Connect Host: shed-<name>`, which installs and starts one
+with your consent, or connecting to the shed from the shed desktop app.
 
 ## Session Management
 
 ### shed sessions
 
-Lists tmux sessions.
+Lists each shed's roost tabs and tmux sessions. With no local roost app — or
+with `--tmux` / `SHED_ATTACH=tmux` — lists the tmux sessions alone, exactly as
+it always has.
 
 ```bash
 shed sessions [shed-name] [flags]
@@ -905,6 +941,7 @@ shed sessions [shed-name] [flags]
 | Flag | Short | Default | Description |
 |------|-------|---------|-------------|
 | `--all` | `-a` | `false` | List from all servers |
+| `--tmux` | | `false` | List tmux sessions only, even with a local roost app running |
 
 **Examples:**
 
@@ -912,23 +949,89 @@ shed sessions [shed-name] [flags]
 shed sessions                  # All sessions on default server
 shed sessions myproj           # Sessions in specific shed
 shed sessions --all            # Across all servers
+shed sessions --tmux           # tmux rows only
 shed sessions --json           # Structured output
 ```
 
-**Output:**
+**Output.** Per shed, the roost tabs come first and the tmux sessions follow,
+each under their own header:
 
 ```
-SHED        SESSION      STATUS      CREATED      WINDOWS
-codelens    default      attached    2h ago       1
-codelens    debug        detached    30m ago      2
+SHED      TAB      STATE    AGENT    CWD                 CREATED
+codelens  default  running  working  /home/shed/codelens  2 hours ago
+codelens  review   idle     -        /home/shed/codelens  30 mins ago
+
+SHED      SESSION  STATUS    CREATED      WINDOWS
+codelens  default  attached  2 hours ago  1
 ```
+
+`STATE` is roost's own tab state (`none`, `running`, `needs_input`, `idle`) and
+`AGENT` its agent lifecycle (`inactive`, `working`, `waiting`, `finished`,
+`failed`); a `-` marks a cell the session did not report. A tab shed did not open
+carries no locked title and shows its working directory in the `TAB` column.
+
+A shed that cannot be reached, or that is running no roost session, contributes
+its tmux rows and one `Warning:` line on stderr. It is never a failure, and the
+command still exits 0.
+
+**JSON.** `--json` stays a flat array. A tmux entry is unchanged and gains
+`"source": "tmux"`; a roost tab is an entry whose `name` is the tab title, with
+its tab-specific fields under `roost`:
+
+```json
+[
+  {
+    "name": "default",
+    "shed_name": "codelens",
+    "server_name": "mini3",
+    "created_at": "2026-09-21T09:14:00Z",
+    "attached": false,
+    "source": "roost",
+    "roost": {
+      "tab_id": "5",
+      "state": "running",
+      "agent": "working",
+      "cwd": "/home/shed/codelens"
+    }
+  },
+  {
+    "name": "default",
+    "shed_name": "codelens",
+    "server_name": "mini3",
+    "created_at": "2026-09-21T07:02:00Z",
+    "attached": true,
+    "window_count": 1,
+    "source": "tmux"
+  }
+]
+```
+
+On the tmux path (`--tmux`, `SHED_ATTACH=tmux`, or no local roost app) the
+array is exactly what it has always been — the session rows, with no `source`
+key.
 
 ### shed sessions kill
 
-Terminates a tmux session.
+Closes a roost tab, or kills a tmux session.
 
 ```bash
-shed sessions kill <shed-name> <session-name>
+shed sessions kill <shed-name> <session-name> [flags]
+```
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--tab` | | Close this roost tab id (disambiguates several tabs of one title) |
+| `--tmux` | `false` | Kill the tmux session, even with a local roost app running |
+
+One match acts: a single roost tab of that title is closed, and a name no tab
+carries falls through to the tmux session. Several tabs of one title (which
+`--new` legitimately creates), or a tab **and** a tmux session of one name, is
+refused — the message prints the tab ids and names the two disambiguators:
+
+```bash
+shed sessions kill codelens debug            # Close the "debug" tab, or kill the session
+shed sessions kill codelens debug --tab 7    # Close that one roost tab
+shed sessions kill codelens debug --tmux     # Kill the tmux session
 ```
 
 ## Port Forwarding

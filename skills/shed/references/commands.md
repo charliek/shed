@@ -58,11 +58,11 @@ shed create big --repo org/large-repo --timeout 30m
 
 | Command | Purpose |
 |---------|---------|
-| `shed attach <name> [-S <session>] [--new]` | Attach to a persistent tmux session (creates if absent). Detach: `Ctrl-B D` |
+| `shed attach <name> [-S <session>] [--new] [--tmux]` | Open the shed as a roost tab with a local roost app running, else attach to a persistent tmux session (creates if absent). Detach from tmux: `Ctrl-B D` |
 | `shed console <name>` | Direct bash shell; ephemeral (dies on disconnect). Auto-starts a stopped shed |
 | `shed exec <name> <command...> [-S <session>]` | Run a single command over SSH; argv is passed through verbatim (not a shell) |
-| `shed sessions [shed] [--all]` | List tmux sessions (one shed, default server, or all servers) |
-| `shed sessions kill <shed> <session>` | Kill a tmux session |
+| `shed sessions [shed] [--all] [--tmux]` | List each shed's roost tabs and tmux sessions (one shed, default server, or all servers) |
+| `shed sessions kill <shed> <session> [--tab <id>] [--tmux]` | Close a roost tab of that title, or kill the tmux session |
 
 ```bash
 shed attach codelens
@@ -70,7 +70,11 @@ shed attach codelens -S debug
 shed exec codelens git status
 shed exec codelens bash -lc "cd /workspace && npm test"   # shell features need an explicit shell
 shed sessions --all
+shed sessions --tmux                                      # tmux rows only, even with roost running
 ```
+
+`--tmux` (or `SHED_ATTACH=tmux`) forces the tmux path on all three; without a
+local roost app it is what runs anyway.
 
 **Native machines.** `shed` targets sheds only; native-machine kickoff is moving to
 roost's palette (S4, [`charliek/shed#326`](https://github.com/charliek/shed/issues/326)),

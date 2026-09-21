@@ -64,6 +64,7 @@ Other ways to create: `--local-dir ~/path` mounts a host directory as the worksp
 Usage notes that matter:
 
 - **`console` vs `attach`:** `console` is a direct shell that dies on disconnect; `attach` is a tmux session that survives. For anything long-running (agents, dev servers), use `attach`.
+- **roost:** with a local roost app running, `shed attach` opens the shed as a roost tab; otherwise it is tmux (force tmux with `--tmux` or `SHED_ATTACH=tmux`).
 - **One-off vs interactive:** `shed exec <name> <command...>` runs a single command over SSH with the argv passed through verbatim (it is not a shell), e.g. `shed exec myproj git status`. For pipes, `&&`, redirection, or `cd`, wrap it yourself: `shed exec myproj bash -lc "cd /workspace && npm test"`. Reserve `attach`/`console` for interactive work.
 - **Multi-server:** target one with `-s <server>`; sweep all with `--all` (on `list`, `sessions`, `system`).
 - **Scripting:** `--json` emits structured output. Destructive commands require `--force` when combined with `--json` (no interactive prompt).

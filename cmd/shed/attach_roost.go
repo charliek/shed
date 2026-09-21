@@ -171,17 +171,26 @@ var newRoostAttach = func() *roostAttach {
 	}
 }
 
-// attachWantsTmux reports whether the user asked for the tmux floor
-// explicitly: `--tmux`, or `SHED_ATTACH=tmux` in the environment.
+// wantsTmuxFloor reports whether the user asked for the tmux floor
+// explicitly: that command's own `--tmux`, or `SHED_ATTACH=tmux` in the
+// environment.
 //
 // The env var is the form that survives being set once in a shell profile or
 // a tmux config, which is the whole point — a person who lives in tmux sets it
 // and never thinks about roost again. Any OTHER value of SHED_ATTACH means
 // nothing and is ignored: this is not a mode selector with a "roost" spelling,
 // it is one escape hatch.
-func attachWantsTmux() bool {
-	return attachTmuxFlag || strings.EqualFold(strings.TrimSpace(os.Getenv("SHED_ATTACH")), "tmux")
+//
+// ONE function for every roost-native command (`attach`, `sessions`,
+// `sessions kill`), taking that command's flag: the env var is a single
+// promise about this machine, and two copies of this rule would be two ways
+// for `SHED_ATTACH` to mean something slightly different.
+func wantsTmuxFloor(flag bool) bool {
+	return flag || strings.EqualFold(strings.TrimSpace(os.Getenv("SHED_ATTACH")), "tmux")
 }
+
+// attachWantsTmux is `shed attach`'s reading of the floor gate.
+func attachWantsTmux() bool { return wantsTmuxFloor(attachTmuxFlag) }
 
 // attachShed is §3.3 step 2, the gate: the roost path iff a local roost app is
 // reachable through roostctl and the tmux floor was not asked for.
@@ -884,13 +893,29 @@ func reusableTab(projects []roostprovider.Project, title, cwd string) (string, b
 }
 
 // remoteFor builds the provider transport for one shed.
+func (a *roostAttach) remoteFor(name string, entry *config.ServerEntry) (*roostprovider.Remote, roostprovider.Target, error) {
+	return roostRemoteFor(a.sshBin, a.controlDir, roostprovider.RunningShed{
+		Name:          name,
+		ServerHost:    entry.Host,
+		ServerSSHPort: entry.SSHPort,
+	})
+}
+
+// roostRemoteFor builds the provider transport — the ssh half — for one shed.
 //
 // A shed's ssh identity is always `<shed>@<server host> -p <server ssh port>`
 // pinned against `~/.shed/known_hosts` — shed mints those host keys itself —
-// which is exactly what ShedTarget spells. The `Host <alias>` entry written in
-// step 3 is for ROOST's ssh, not for this one.
-func (a *roostAttach) remoteFor(name string, entry *config.ServerEntry) (*roostprovider.Remote, roostprovider.Target, error) {
-	bin := a.sshBin
+// which is exactly what ShedTarget spells. The `Host <alias>` entry `shed
+// attach` writes is for ROOST's ssh, not for this one, which is why nothing
+// here reads the ssh config.
+//
+// A free function rather than a method because both roost-native commands
+// need it and neither owns it: `attach` reaches one shed, `sessions` fans out
+// over the fleet, and the reach rule is the same one either way. sshBin empty
+// means resolve it here (roostprovider.ResolveSSH); controlDir empty disables
+// ssh muxing, which is correct but pays a handshake per call.
+func roostRemoteFor(sshBin, controlDir string, shed roostprovider.RunningShed) (*roostprovider.Remote, roostprovider.Target, error) {
+	bin := sshBin
 	if bin == "" {
 		resolved, err := roostprovider.ResolveSSH()
 		if err != nil {
@@ -898,12 +923,8 @@ func (a *roostAttach) remoteFor(name string, entry *config.ServerEntry) (*roostp
 		}
 		bin = resolved
 	}
-	target := roostprovider.ShedTarget(roostprovider.RunningShed{
-		Name:          name,
-		ServerHost:    entry.Host,
-		ServerSSHPort: entry.SSHPort,
-	}, config.GetKnownHostsPath())
-	return &roostprovider.Remote{SSHBin: bin, ControlDir: a.controlDir}, target, nil
+	target := roostprovider.ShedTarget(shed, config.GetKnownHostsPath())
+	return &roostprovider.Remote{SSHBin: bin, ControlDir: controlDir}, target, nil
 }
 
 // focusTab is §3.3 step 7: wait for the UI mirror to list the tab, focus it,

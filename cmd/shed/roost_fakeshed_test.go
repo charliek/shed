@@ -161,6 +161,14 @@ func (f *fakeShed) writeReplies(dir string, tabs []roostprovider.Tab) {
 	tabOpen["id"] = "1"
 	writeTestFile(t, filepath.Join(dir, "reply.tabopen.ndjson"), compactShedLine(t, tabOpen), 0o644)
 
+	// `tab.close` answers with an ack this side does not decode (see
+	// Remote.TabClose): a well-formed ok:true with an empty result IS the whole
+	// answer. Its value to the rig is the same as set_title's — the REQUEST
+	// line lands in the log, and `sessions kill` is defined by which tab id
+	// that line carries.
+	writeTestFile(t, filepath.Join(dir, "reply.tabclose.ndjson"),
+		`{"id":"1","ok":true,"result":{}}`+"\n", 0o644)
+
 	// `tab.set_title` answers with an empty result — its VALUE to this rig is
 	// that the request line lands in the log, because "was the title locked?"
 	// is the difference between a tab a later attach can find and one it
@@ -174,11 +182,20 @@ func (f *fakeShed) writeReplies(dir string, tabs []roostprovider.Tab) {
 	// one trimmed to what it wants.
 	rows := make([]map[string]any, 0, len(tabs))
 	for _, tab := range tabs {
+		// A tab that names no CreatedAt gets the fixture's own constant: the
+		// attach flow does not read it, and a rig that forced every caller to
+		// supply one would make those tests say something they do not mean.
+		// `shed sessions` DOES read it (the CREATED column), so a test that
+		// cares hands its own.
+		createdAt := int64(1700000000)
+		if tab.CreatedAt != 0 {
+			createdAt = tab.CreatedAt
+		}
 		rows = append(rows, map[string]any{
 			"id": tab.ID, "project_id": "1", "title": tab.Title,
 			"cwd": tab.Cwd, "state": tab.State, "agent_lifecycle": tab.AgentLifecycle,
 			"has_notification": false, "is_active": false, "user_titled": true,
-			"position": 0, "created_at": 1700000000, "last_active": 1700000050,
+			"position": 0, "created_at": createdAt, "last_active": 1700000050,
 			"hook_active": false, "shell_state": "foreground_process",
 		})
 	}

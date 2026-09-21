@@ -203,7 +203,7 @@ func TestTabsAndCloseThroughFakeSSH(t *testing.T) {
 		t.Fatalf("project 1 tabs = %+v, want two", projects[0].Tabs)
 	}
 	want := Tab{ID: "7", ProjectID: "1", Title: "claude", Cwd: "/home/shed/roost",
-		State: "running", AgentLifecycle: "waiting"}
+		State: "running", AgentLifecycle: "waiting", CreatedAt: 1700000000}
 	if projects[0].Tabs[1] != want {
 		t.Errorf("tab = %+v, want %+v", projects[0].Tabs[1], want)
 	}
