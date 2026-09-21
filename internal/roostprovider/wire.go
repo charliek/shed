@@ -20,6 +20,7 @@ const (
 	opTabList         = "tab.list"
 	opTabOpen         = "tab.open"
 	opTabClose        = "tab.close"
+	opTabSetTitle     = "tab.set_title"
 )
 
 // SpokenProtocol is the roost session protocol this build speaks —
@@ -320,6 +321,24 @@ type TabOpenResult struct {
 //
 // The params struct on roost's side is `deny_unknown_fields`, so this must
 // carry this key and no others; wire_test.go pins the exact request JSON.
+// TabSetTitleParams are the `tab.set_title` params.
+//
+// **This is not cosmetic, and `tab.open`'s own `title` is not enough.** A tab
+// opened with a title comes up with `user_titled: false`, which leaves the
+// title unlocked — and the login shell in that tab immediately emits an OSC
+// title sequence, overwriting it with the cwd. Measured on a live session: a
+// tab opened as `default` reports `title: "/home/shed"` by the time anyone
+// reads it back, so a find-by-title never matches and every attach opens
+// another tab. `tab.set_title` sets `user_titled: true`, which locks it
+// against OSC (roost's own `set-title` help says so), and the title then
+// survives for the reuse check to find. See live-11-attach-legs.txt.
+//
+// roost's param struct is `deny_unknown_fields`: these keys and no others.
+type TabSetTitleParams struct {
+	TabID string `json:"tab_id"`
+	Title string `json:"title"`
+}
+
 type TabCloseParams struct {
 	TabID string `json:"tab_id"`
 }

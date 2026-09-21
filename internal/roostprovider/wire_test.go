@@ -67,6 +67,15 @@ func TestExactRequestJSON(t *testing.T) {
 			// `tab.close` carries the id roost handed back, unparsed and
 			// still a string. `deny_unknown_fields` on roost's side means
 			// this one key and no others.
+			// `tab.set_title` is what makes a tab findable again: without it
+			// the shell's OSC sequence renames the tab to its cwd and the
+			// reuse-by-title check can never match (live-11).
+			name:   "tab.set_title",
+			op:     opTabSetTitle,
+			params: TabSetTitleParams{TabID: "5", Title: "default"},
+			want:   `{"id":"1","op":"tab.set_title","params":{"tab_id":"5","title":"default"}}`,
+		},
+		{
 			name:   "tab.close",
 			op:     opTabClose,
 			params: TabCloseParams{TabID: "5"},

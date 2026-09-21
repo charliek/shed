@@ -1717,3 +1717,48 @@ func TestNoSessionStillGetsShedsPinnedMessage(t *testing.T) {
 		}
 	}
 }
+
+// TestEnsureTabLocksTheTitle: a tab opened with a title comes up
+// `user_titled: false`, and the login shell inside it immediately renames it to
+// its cwd via OSC. Measured live: a tab opened as `default` read back as
+// `/home/shed`, so reuse-by-title never matched and a second `shed attach`
+// opened a third tab. The flow therefore follows `tab.open` with an explicit
+// `tab.set_title`, which marks the tab `user_titled: true` and locks it.
+func TestEnsureTabLocksTheTitle(t *testing.T) {
+	// No existing tabs, so the flow must open one — and then title it.
+	rig := newReuseRig(t, func(landing, home string) []roostprovider.Tab { return nil })
+
+	tabID, err := rig.attach.ensureTab(context.Background(), "myproj", rig.shedEntry(), rig.shedConfig(), "default", false)
+	if err != nil {
+		t.Fatalf("ensureTab: %v", err)
+	}
+
+	lines := rig.shed.requestLines()
+	openAt, titleAt := -1, -1
+	for i, line := range lines {
+		switch {
+		case strings.Contains(line, `"op":"tab.open"`):
+			openAt = i
+		case strings.Contains(line, `"op":"tab.set_title"`):
+			titleAt = i
+		}
+	}
+	if openAt == -1 {
+		t.Fatalf("no tab.open in %q", lines)
+	}
+	if titleAt == -1 {
+		t.Fatalf("the tab was opened but never titled — a later attach cannot find it: %q", lines)
+	}
+	if titleAt < openAt {
+		t.Errorf("tab.set_title came before tab.open: %q", lines)
+	}
+	// It must title the tab it just opened, with the requested title.
+	req := rig.shed.requestFor("tab.set_title")
+	want := `"tab_id":"` + tabID + `"`
+	if !strings.Contains(req, want) {
+		t.Errorf("tab.set_title did not name the tab just opened (%s): %s", tabID, req)
+	}
+	if !strings.Contains(req, `"title":"default"`) {
+		t.Errorf("tab.set_title did not carry the requested title: %s", req)
+	}
+}

@@ -123,6 +123,7 @@ case "$1" in
       *session.identify*) op=identify ;;
       *tab.list*) op=tablist ;;
       *tab.open*) op=tabopen ;;
+      *tab.set_title*) op=tabsettitle ;;
       *tab.close*) op=tabclose ;;
     esac
     cat __DIR__/reply.$op.ndjson ;;
@@ -159,6 +160,13 @@ func (f *fakeShed) writeReplies(dir string, tabs []roostprovider.Tab) {
 	tabOpen := readShedVector(t, "tab.open.response.json")
 	tabOpen["id"] = "1"
 	writeTestFile(t, filepath.Join(dir, "reply.tabopen.ndjson"), compactShedLine(t, tabOpen), 0o644)
+
+	// `tab.set_title` answers with an empty result — its VALUE to this rig is
+	// that the request line lands in the log, because "was the title locked?"
+	// is the difference between a tab a later attach can find and one it
+	// cannot (live-11).
+	writeTestFile(t, filepath.Join(dir, "reply.tabsettitle.ndjson"),
+		`{"id":"1","ok":true,"result":{}}`+"\n", 0o644)
 
 	// `tab.list`'s tabs are the one part a fixture cannot supply — each test
 	// needs its own — but every field roost's `Tab` carries is written, not

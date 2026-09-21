@@ -812,6 +812,25 @@ func (a *roostAttach) ensureTab(ctx context.Context, name string, entry *config.
 	if err != nil {
 		return "", fmt.Errorf("opening a roost tab on %s: %w", name, err)
 	}
+
+	// LOCK the title, or the next attach opens another tab.
+	//
+	// A tab opened with a title comes up `user_titled: false`, and the login
+	// shell inside it immediately emits an OSC title sequence that overwrites
+	// it with the cwd. Measured on a live session: a tab opened as `default`
+	// read back as `/home/shed`, so the reuse-by-title check above could never
+	// match and a second `shed attach` opened a third tab (live-11). Setting
+	// the title explicitly marks it `user_titled: true`, which is what makes
+	// it survive.
+	//
+	// A failure here is NOT fatal: the tab is open and usable, and the only
+	// cost is that the next attach will not recognise it. Say so and carry on
+	// rather than failing an attach that otherwise worked.
+	if err := remote.TabSetTitle(ctx, target, tabID, title); err != nil {
+		fmt.Fprintf(os.Stderr, "warning: could not title roost tab %s %q on %s: %v\n"+
+			"  (the tab is open; a later `shed attach` will not recognise it and will open another)\n",
+			tabID, title, name, err)
+	}
 	return tabID, nil
 }
 
