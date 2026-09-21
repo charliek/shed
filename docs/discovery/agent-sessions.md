@@ -1,5 +1,12 @@
 # Agent sessions: multi-agent RC, status, and the non-TUI view
 
+> **Superseded by S6, 2026-09-21 (plan 022, [`charliek/shed#328`](https://github.com/charliek/shed/issues/328)).**
+> The `rc` hub daemon and the tmux-TUI-first RC session model this page designs are
+> retired along with `shed-ext-rc`, `shed-machine-rc`, and `shed plan`/`shed attach`'s
+> RC mode. Agent sessions are roost tabs now; see
+> [`shed-ext-rc` (retired)](../extensions/rc-helper.md) for the pointer to the current
+> model. Kept as a historical design record, not maintained further.
+
 Status: draft design (2026-07-09). Companion research (transient, not committed):
 `docs/research/{claude_rc,codex,opencode,cursor}.md`.
 

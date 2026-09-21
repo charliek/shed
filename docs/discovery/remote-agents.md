@@ -1,5 +1,14 @@
 # Remote agents: the two-lane session model, machine targets, and the Rust porcelain
 
+> **Superseded by S6, 2026-09-21 (plan 022, [`charliek/shed#328`](https://github.com/charliek/shed/issues/328)).**
+> The RC hub this design's TUI lane and contract (§ [The contract](#the-contract-v2-of-the-hub-wire))
+> describe is retired — deleted, not rebased — along with `shed plan` and the
+> Remote-Control mode of `shed attach`. Agent sessions are roost tabs now; see
+> [`shed-ext-rc` (retired)](../extensions/rc-helper.md) for the pointer to the current
+> model and [Agent lanes](../desktop/agent-lanes.md) for what became of the structured-lane
+> half this page sketches (§ decision 1, "structured lane"). Kept as a historical design
+> record, not maintained further.
+
 Status: draft discovery (2026-08-15). Supersedes the Phase E follow-ons of
 [agent-sessions.md](agent-sessions.md) (whose Phases A–D are shipped and remain
 the substrate this design builds on). Companion research: protocol-maturity
@@ -437,10 +446,12 @@ table above:
   name sounds. The **global-store hazard is confirmed and worse than assumed**: one
   TUI's embedded server lists sessions from every directory on the machine, and the
   global permission-reply route can answer another project's ask — this is exactly what
-  the [session-scoping invariant](../extensions/rc-helper.md#session-scoping-invariant-hub-initiated-mutations)
-  in the as-built contract exists to structurally prevent for the hub's own adapters
-  (it does not, and cannot, fix the hazard for anything else talking to that same
-  embedded server).
+  the session-scoping invariant in the (now retired, see
+  [`shed-ext-rc` (retired)](../extensions/rc-helper.md)) as-built contract existed to
+  structurally prevent for the hub's own adapters (it did not, and could not, fix the
+  hazard for anything else talking to that same embedded server; the successor,
+  opencode's [agent lane](../desktop/agent-lanes.md#answering-scoped-and-not-free),
+  scopes its own answers the same way).
 - **codex approvals are provably absent from the rollout JSONL.** The persistence
   policy (`rollout/src/policy.rs` in the codex source) filters every
   approval-request-shaped record before it is ever written to disk, and the
