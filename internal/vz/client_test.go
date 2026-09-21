@@ -9,11 +9,13 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/charliek/shed/internal/config"
+	"github.com/charliek/shed/internal/plugin"
 	"github.com/charliek/shed/internal/vmutil"
 )
 
@@ -494,4 +496,293 @@ func TestCreateShedFromSnapshotMutualExclusionWrapsSentinel(t *testing.T) {
 			}
 		})
 	}
+}
+
+// --- ResumeRunningInstances (#315) ------------------------------------------
+
+// newResumeTestClient builds a Client over tmpDir with a real plugin bridge
+// and an injected cmdline reader. Bridge registration is the observable the
+// walk tests assert on: it is exactly what a restarted shed-server used to
+// lose for every running shed.
+func newResumeTestClient(t *testing.T, cfg *config.VZConfig, inspect func(context.Context, int) (string, error)) (*Client, *plugin.Bridge) {
+	t.Helper()
+	bridge := plugin.NewBridge(plugin.NewRegistry())
+	c := &Client{
+		cfg:         cfg,
+		vms:         make(map[string]*VM),
+		credMgr:     vmutil.NewCredentialManager(nil, bridge, string(config.BackendVZ), vmutil.NewHealthTracker()),
+		procCmdline: inspect,
+	}
+	t.Cleanup(func() { _ = c.Close() })
+	return c, bridge
+}
+
+// writeResumeInstance writes metadata for `name` in the state the walk will
+// find it in.
+func writeResumeInstance(t *testing.T, dir, name, status string, pid int) {
+	t.Helper()
+	meta := &Metadata{
+		Name:       name,
+		Status:     status,
+		CreatedAt:  time.Now(),
+		Backend:    string(config.BackendVZ),
+		PID:        pid,
+		CPUs:       2,
+		MemoryMB:   512,
+		RootfsPath: filepath.Join(dir, name, "rootfs.ext4"),
+	}
+	if err := meta.Save(dir); err != nil {
+		t.Fatalf("save metadata for %q: %v", name, err)
+	}
+}
+
+// defaultTestVfkitPath is the vfkit_path the walk cells configure. The
+// resume predicate matches argv[0] against THIS, not a hard-coded "vfkit".
+const defaultTestVfkitPath = "/opt/homebrew/bin/vfkit"
+
+// vfkitCmdline is what a live vfkit serving `name` looks like in `ps -ww`
+// output: the console log it was given identifies the instance.
+func vfkitCmdline(cfg *config.VZConfig, name string) string {
+	return vfkitCmdlineFrom(cfg.VfkitPath, cfg, name)
+}
+
+// vfkitCmdlineFrom is vfkitCmdline with argv[0] chosen by the caller, so a
+// cell can model a recycled PID running something that is NOT the VMM while
+// still naming the instance's console log.
+func vfkitCmdlineFrom(argv0 string, cfg *config.VZConfig, name string) string {
+	return strings.Join([]string{
+		argv0,
+		"--cpus", "2",
+		"--memory", "512",
+		"--device", "virtio-serial,logFilePath=" + filepath.Join(cfg.InstanceDir, name, "console.log"),
+	}, " ")
+}
+
+func resumedNames(b *plugin.Bridge) []string {
+	infos := b.ListSheds()
+	names := make([]string, 0, len(infos))
+	for _, i := range infos {
+		names = append(names, i.Name)
+	}
+	sort.Strings(names)
+	return names
+}
+
+// TestResumeRunningInstances drives the whole startup walk — the unit under
+// test for #315 is the walk, not any one predicate.
+func TestResumeRunningInstances(t *testing.T) {
+	const shed = "alpha"
+
+	tests := []struct {
+		name string
+		// status/pid are the metadata the walk finds on disk.
+		status string
+		pid    int
+		// cmdline is what the injected inspector reports for that pid; when
+		// inspectErr is set the inspector fails instead (vanished PID).
+		cmdline    func(cfg *config.VZConfig) string
+		inspectErr error
+		// vfkitPath overrides the configured VMM binary for this cell.
+		vfkitPath string
+		// shedName overrides the instance name, so a cell can use a name
+		// that collides with the family token.
+		shedName   string
+		wantResume bool
+	}{
+		{
+			name:       "running_and_alive_resumes",
+			status:     config.StatusRunning,
+			pid:        4242,
+			cmdline:    func(cfg *config.VZConfig) string { return vfkitCmdline(cfg, shed) },
+			wantResume: true,
+		},
+		{
+			// NEGATIVE CONTROL: metadata still says running but vfkit is
+			// gone, so `ps` fails. Deleting the liveness check in
+			// resumeInstance must turn this cell red.
+			name:       "control_running_but_dead_is_not_resumed",
+			status:     config.StatusRunning,
+			pid:        4242,
+			inspectErr: os.ErrNotExist,
+			wantResume: false,
+		},
+		{
+			// The PID was recycled by a DIFFERENT shed's vfkit. A
+			// family-only check ("is it vfkit?") would resume a dead
+			// record here.
+			name:   "running_with_reused_pid_is_not_resumed",
+			status: config.StatusRunning,
+			pid:    4242,
+			cmdline: func(cfg *config.VZConfig) string {
+				return vfkitCmdline(cfg, "some-other-shed")
+			},
+			wantResume: false,
+		},
+		{
+			// The family check must be INDEPENDENT evidence from the
+			// instance-path check. A shed NAMED vfkit has "vfkit" inside its
+			// own console-log path, so a whole-command-line
+			// Contains("vfkit") is satisfied by the path it is meant to
+			// corroborate — and this cell (a recycled PID merely tailing that
+			// log) would resume a dead record. Matching argv[0] stops it.
+			name:     "control_non_vmm_pid_naming_the_console_log_is_not_resumed",
+			status:   config.StatusRunning,
+			pid:      4242,
+			shedName: "vfkit",
+			cmdline: func(cfg *config.VZConfig) string {
+				return vfkitCmdlineFrom("/usr/bin/tail", cfg, "vfkit")
+			},
+			wantResume: false,
+		},
+		{
+			// vfkit_path is configurable (vm.go:82 execs exactly it), so the
+			// family check reads the CONFIGURED basename. A hard-coded
+			// "vfkit" would refuse to resume this genuinely live shed.
+			name:      "custom_vfkit_path_still_resumes",
+			status:    config.StatusRunning,
+			pid:       4242,
+			vfkitPath: "/usr/local/bin/vmm",
+			cmdline: func(cfg *config.VZConfig) string {
+				return vfkitCmdlineFrom("/usr/local/bin/vmm", cfg, shed)
+			},
+			wantResume: true,
+		},
+		{
+			name:   "stopped_is_not_resumed",
+			status: config.StatusStopped,
+			pid:    0,
+			cmdline: func(cfg *config.VZConfig) string {
+				return vfkitCmdline(cfg, shed)
+			},
+			wantResume: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tmpDir := t.TempDir()
+			cfg := &config.VZConfig{
+				InstanceDir: tmpDir,
+				SocketDir:   filepath.Join(tmpDir, "sockets"),
+				ConsolePort: 1024,
+				NotifyPort:  1026,
+				VfkitPath:   defaultTestVfkitPath,
+			}
+			if tt.vfkitPath != "" {
+				cfg.VfkitPath = tt.vfkitPath
+			}
+			name := shed
+			if tt.shedName != "" {
+				name = tt.shedName
+			}
+			writeResumeInstance(t, tmpDir, name, tt.status, tt.pid)
+
+			inspect := func(_ context.Context, pid int) (string, error) {
+				if tt.inspectErr != nil {
+					return "", tt.inspectErr
+				}
+				if pid != tt.pid {
+					t.Errorf("inspector called with pid %d, want %d", pid, tt.pid)
+				}
+				return tt.cmdline(cfg), nil
+			}
+
+			c, bridge := newResumeTestClient(t, cfg, inspect)
+			c.ResumeRunningInstances(context.Background())
+
+			got := resumedNames(bridge)
+			if tt.wantResume {
+				if len(got) != 1 || got[0] != name {
+					t.Fatalf("resumed = %v, want [%s]", got, name)
+				}
+			} else if len(got) != 0 {
+				t.Fatalf("resumed = %v, want nothing", got)
+			}
+		})
+	}
+
+	// One wedged `ps` must not stall the walk: the other instances still get
+	// resumed. The per-inspection timeout is shortened so the cell costs
+	// milliseconds rather than the production 2 s.
+	t.Run("wedged_inspection_does_not_stall_the_walk", func(t *testing.T) {
+		restore := resumeInspectTimeout
+		resumeInspectTimeout = 50 * time.Millisecond
+		t.Cleanup(func() { resumeInspectTimeout = restore })
+
+		tmpDir := t.TempDir()
+		cfg := &config.VZConfig{
+			InstanceDir: tmpDir,
+			SocketDir:   filepath.Join(tmpDir, "sockets"),
+			ConsolePort: 1024,
+			NotifyPort:  1026,
+			VfkitPath:   defaultTestVfkitPath,
+		}
+
+		// PIDs are how the injected inspector tells the instances apart.
+		pids := map[string]int{"aaa": 101, "wedged": 102, "zzz": 103}
+		for name, pid := range pids {
+			writeResumeInstance(t, tmpDir, name, config.StatusRunning, pid)
+		}
+
+		inspect := func(ctx context.Context, pid int) (string, error) {
+			if pid == pids["wedged"] {
+				// Bounded well above resumeInspectTimeout but well below the
+				// package test timeout: if the per-inspection deadline ever
+				// stops being plumbed through, this cell fails on the elapsed
+				// assertion below instead of hanging until `go test` gives up.
+				select {
+				case <-ctx.Done():
+					return "", ctx.Err()
+				case <-time.After(5 * time.Second):
+					return "", errors.New("wedged inspector was never cancelled")
+				}
+			}
+			for name, p := range pids {
+				if p == pid {
+					return vfkitCmdline(cfg, name), nil
+				}
+			}
+			return "", os.ErrNotExist
+		}
+
+		c, bridge := newResumeTestClient(t, cfg, inspect)
+
+		start := time.Now()
+		c.ResumeRunningInstances(context.Background())
+		elapsed := time.Since(start)
+
+		got := resumedNames(bridge)
+		want := []string{"aaa", "zzz"}
+		if len(got) != len(want) || got[0] != want[0] || got[1] != want[1] {
+			t.Fatalf("resumed = %v, want %v", got, want)
+		}
+		if elapsed > 2*time.Second {
+			t.Fatalf("walk took %v — the wedged inspection was not bounded", elapsed)
+		}
+	})
+
+	t.Run("cancelled_context_stops_the_walk", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		cfg := &config.VZConfig{
+			InstanceDir: tmpDir,
+			SocketDir:   filepath.Join(tmpDir, "sockets"),
+			ConsolePort: 1024,
+			NotifyPort:  1026,
+			VfkitPath:   defaultTestVfkitPath,
+		}
+		writeResumeInstance(t, tmpDir, shed, config.StatusRunning, 4242)
+
+		inspect := func(_ context.Context, _ int) (string, error) {
+			return vfkitCmdline(cfg, shed), nil
+		}
+		c, bridge := newResumeTestClient(t, cfg, inspect)
+
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		c.ResumeRunningInstances(ctx)
+
+		if got := resumedNames(bridge); len(got) != 0 {
+			t.Fatalf("resumed = %v on a cancelled walk, want nothing", got)
+		}
+	})
 }

@@ -38,6 +38,9 @@ func (c *Client) SetEgressManager(_ *egress.Manager) {}
 // SetEgressUserStore is a no-op for the stub client.
 func (c *Client) SetEgressUserStore(_ *config.UserProfileStore) {}
 
+// ResumeRunningInstances is a no-op for the stub client.
+func (c *Client) ResumeRunningInstances(_ context.Context) {}
+
 // VZBackend is a stub for non-darwin builds.
 type VZBackend struct{}
 

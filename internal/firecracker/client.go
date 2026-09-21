@@ -10,6 +10,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -67,6 +68,11 @@ type Client struct {
 	// egressUserStore is the runtime user-profile store; nil ⇒ config profiles
 	// only. Merged into resolution via userProfiles().
 	egressUserStore *config.UserProfileStore
+
+	// procCmdline reads the given PID's command line. Overridden in tests so
+	// the resume liveness predicate can be exercised against synthetic
+	// processes (vanished PIDs, reused PIDs, wedged reads).
+	procCmdline func(ctx context.Context, pid int) (string, error)
 }
 
 // SetEgressManager attaches the egress-control proxy manager, called by
@@ -96,6 +102,8 @@ func NewClient(cfg *config.FirecrackerConfig, serverCfg *config.ServerConfig, br
 		usedIPs:   make(map[string]string),
 		p9Servers: make(map[string][]*P9Server),
 		credMgr:   vmutil.NewCredentialManager(serverCfg, bridge, string(config.BackendFirecracker), vmutil.NewHealthTracker()),
+
+		procCmdline: readProcCmdline,
 	}
 
 	// Load existing instances to populate CID and IP maps
@@ -125,6 +133,168 @@ func (c *Client) loadExistingInstances() error {
 	}
 
 	return nil
+}
+
+// resumeInspectTimeout bounds a single process inspection during the startup
+// resume walk. One unreadable or wedged process must never stall the rest of
+// the walk. Shortened by tests; 2 s is the production default.
+var resumeInspectTimeout = 2 * time.Second
+
+// ResumeRunningInstances re-opens the per-VM message channel for every shed
+// that is still running, after a shed-server restart (#315).
+//
+// The host dials the guest, never the reverse, and the only callers of
+// SetupCredentials are the orchestrator's create and start steps — so a
+// restart used to leave every running shed silently credential-broken (no
+// plugin-bridge registration, no extension health) until it was stopped and
+// started by hand.
+//
+// The walk never rewrites metadata: a running-but-dead record is skipped and
+// left to GetShed's staleness path. It only spawns NotifyConn goroutines,
+// which dial with backoff, so it is safe to run in the background.
+func (c *Client) ResumeRunningInstances(ctx context.Context) {
+	names, err := ListInstances(c.cfg.InstanceDir)
+	if err != nil {
+		log.Printf("Resume: failed to list instances: %v", err)
+		return
+	}
+
+	for _, name := range names {
+		if ctx.Err() != nil {
+			log.Printf("Resume: walk cancelled before %q", name)
+			return
+		}
+		c.resumeInstance(ctx, name)
+	}
+}
+
+// resumeInstance resumes a single shed's message channel. Split out of the
+// walk so the per-shed lifecycle lock is released on every iteration.
+func (c *Client) resumeInstance(ctx context.Context, name string) {
+	// Serialize against a concurrent StartShed/StopShed/DeleteShed of the
+	// same shed, and load the metadata fresh under that lock — a pre-walk
+	// snapshot could already be stale by the time we get here.
+	defer c.acquireCreateLock(name)()
+
+	meta, err := LoadMetadata(c.cfg.InstanceDir, name)
+	if err != nil {
+		log.Printf("Resume: skipping %q with unreadable metadata: %v", name, err)
+		return
+	}
+	if meta.Status != config.StatusRunning || meta.PID <= 0 {
+		return
+	}
+
+	inspectCtx, cancel := context.WithTimeout(ctx, resumeInspectTimeout)
+	defer cancel()
+
+	alive, err := c.vmmServesInstance(inspectCtx, meta.PID, name)
+	if err != nil {
+		// Timed-out or unreadable inspection: skip this one and let the walk
+		// carry on. A vanished PID lands here too, which is the desired
+		// "running metadata, dead VM" outcome.
+		log.Printf("Resume: skipping %q: could not inspect pid %d: %v", name, meta.PID, err)
+		return
+	}
+	if !alive {
+		return
+	}
+
+	c.credMgr.ResumeMessageChannel(name, c.newAgentClient(name))
+}
+
+// vmmServesInstance reports whether pid is a live Firecracker VMM serving
+// THIS instance. Family alone (the isFirecrackerProcess idiom used by
+// VM.IsRunning) is not enough for resume: a recycled PID that happens to be
+// another shed's firecracker would resurrect a dead record, so the
+// instance's own api-sock path must appear in the command line too.
+//
+// The two checks must be INDEPENDENT evidence, which is why the family is
+// matched on argv[0] and not on the whole command line. The default socket
+// directory is `/var/run/shed/firecracker` (config/server.go:1277), so a
+// whole-command-line `Contains("firecracker")` is satisfied by the api-sock
+// path itself — it would corroborate nothing, and any recycled PID that
+// merely mentions the socket (`socat`, `rm`, a shell loop) would resume a
+// dead record.
+func (c *Client) vmmServesInstance(ctx context.Context, pid int, name string) (bool, error) {
+	cmdline, err := c.inspectCmdline(ctx, pid)
+	if err != nil {
+		return false, err
+	}
+	if !isVMMExecutable(cmdline) {
+		return false, nil
+	}
+	// The api-sock path VM.Start hands the SDK; see vm.go.
+	sockPath := filepath.Join(c.cfg.SocketDir, name+".sock")
+	return strings.Contains(cmdline, sockPath), nil
+}
+
+// isVMMExecutable reports whether a NUL-separated /proc cmdline's argv[0] is
+// the firecracker binary. shed passes no custom VMCommandBuilder
+// (vm.go:200-204), so the SDK invokes its default `firecracker` binary.
+func isVMMExecutable(cmdline string) bool {
+	argv0, _, _ := strings.Cut(cmdline, "\x00")
+	return filepath.Base(argv0) == "firecracker"
+}
+
+// inspectCmdline reads a PID's command line via the injected reader,
+// falling back to the real one for zero-value Clients.
+func (c *Client) inspectCmdline(ctx context.Context, pid int) (string, error) {
+	read := c.procCmdline
+	if read == nil {
+		read = readProcCmdline
+	}
+	return read(ctx, pid)
+}
+
+// readProcCmdline reads /proc/<pid>/cmdline. The contents are NUL-separated
+// argv, which is fine for the substring checks the resume predicate makes.
+// A missing or unreadable process returns an error ⇒ not alive.
+//
+// The read runs on its own goroutine so the context can actually cut it
+// short. os.ReadFile is not cancellable, and reading this file takes the
+// target task's mmap_lock — a VMM wedged in uninterruptible sleep can hold
+// that, which is precisely the case the walk's per-inspection timeout exists
+// to survive. Without the goroutine the timeout would be decorative here and
+// the wedged-inspection test would be passing only because its fake reader is
+// more interruptible than the real one.
+//
+// A read that never returns leaks this goroutine and its fd for the life of
+// the process. That is the deliberate trade, and it is bounded: the resume
+// walk runs ONCE per server start and inspects each instance at most once, so
+// the worst case is one parked goroutine per running-shed record on a host
+// where every /proc read wedges — not unbounded growth over time. A stalled
+// resume walk, by contrast, costs every shed behind it its credentials.
+func readProcCmdline(ctx context.Context, pid int) (string, error) {
+	// Checked up front as well as in the select below. The select alone is a
+	// race in principle — Go picks uniformly among ready cases, so an already
+	// cancelled context could still lose to a completed read — even though in
+	// practice it wins (200 runs with this check removed stayed green, because
+	// the reader goroutine has not been scheduled yet at select time). This
+	// turns "happens to win" into a guarantee.
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+
+	type result struct {
+		data []byte
+		err  error
+	}
+	done := make(chan result, 1) // buffered: the goroutine never blocks on a timed-out read
+	go func() {
+		data, err := os.ReadFile(fmt.Sprintf("/proc/%d/cmdline", pid))
+		done <- result{data, err}
+	}()
+
+	select {
+	case <-ctx.Done():
+		return "", ctx.Err()
+	case r := <-done:
+		if r.err != nil {
+			return "", r.err
+		}
+		return string(r.data), nil
+	}
 }
 
 // acquireCreateLock returns an unlock closure after taking the per-shed-name

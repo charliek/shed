@@ -11,8 +11,11 @@ import (
 	"log"
 	"net"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -63,6 +66,11 @@ type Client struct {
 	// egressUserStore is the runtime user-profile store; nil ⇒ config profiles
 	// only. Merged into resolution via userProfiles().
 	egressUserStore *config.UserProfileStore
+
+	// procCmdline reads the given PID's command line. Overridden in tests so
+	// the resume liveness predicate can be exercised against synthetic
+	// processes (vanished PIDs, reused PIDs, wedged reads).
+	procCmdline func(ctx context.Context, pid int) (string, error)
 }
 
 // SetEgressManager attaches the egress-control proxy manager, called by
@@ -87,9 +95,150 @@ func NewClient(cfg *config.VZConfig, serverCfg *config.ServerConfig, bridge *plu
 		serverCfg: serverCfg,
 		vms:       make(map[string]*VM),
 		credMgr:   vmutil.NewCredentialManager(serverCfg, bridge, string(config.BackendVZ), vmutil.NewHealthTracker()),
+
+		procCmdline: readProcCmdline,
 	}
 
 	return client, nil
+}
+
+// resumeInspectTimeout bounds a single process inspection during the startup
+// resume walk. One unreadable or wedged `ps` must never stall the rest of the
+// walk. Shortened by tests; 2 s is the production default.
+var resumeInspectTimeout = 2 * time.Second
+
+// ResumeRunningInstances re-opens the per-VM message channel for every shed
+// that is still running, after a shed-server restart (#315).
+//
+// The host dials the guest, never the reverse, and the only callers of
+// SetupCredentials are the orchestrator's create and start steps — so a
+// restart used to leave every running shed silently credential-broken (no
+// plugin-bridge registration, no extension health) until it was stopped and
+// started by hand.
+//
+// The walk never rewrites metadata: a running-but-dead record is skipped and
+// left to GetShed's staleness path. It only spawns NotifyConn goroutines,
+// which dial with backoff, so it is safe to run in the background.
+func (c *Client) ResumeRunningInstances(ctx context.Context) {
+	names, err := ListInstances(c.cfg.InstanceDir)
+	if err != nil {
+		log.Printf("Resume: failed to list instances: %v", err)
+		return
+	}
+
+	for _, name := range names {
+		if ctx.Err() != nil {
+			log.Printf("Resume: walk cancelled before %q", name)
+			return
+		}
+		c.resumeInstance(ctx, name)
+	}
+}
+
+// resumeInstance resumes a single shed's message channel. Split out of the
+// walk so the per-shed lifecycle lock is released on every iteration.
+func (c *Client) resumeInstance(ctx context.Context, name string) {
+	// Serialize against a concurrent StartShed/StopShed/DeleteShed of the
+	// same shed, and load the metadata fresh under that lock — a pre-walk
+	// snapshot could already be stale by the time we get here.
+	defer c.acquireCreateLock(name)()
+
+	meta, err := LoadMetadata(c.cfg.InstanceDir, name)
+	if err != nil {
+		log.Printf("Resume: skipping %q with unreadable metadata: %v", name, err)
+		return
+	}
+	if meta.Status != config.StatusRunning || meta.PID <= 0 {
+		return
+	}
+
+	inspectCtx, cancel := context.WithTimeout(ctx, resumeInspectTimeout)
+	defer cancel()
+
+	alive, err := c.vmmServesInstance(inspectCtx, meta.PID, name)
+	if err != nil {
+		// Timed-out or unreadable inspection: skip this one and let the walk
+		// carry on. A vanished PID lands here too, which is the desired
+		// "running metadata, dead VM" outcome.
+		log.Printf("Resume: skipping %q: could not inspect pid %d: %v", name, meta.PID, err)
+		return
+	}
+	if !alive {
+		return
+	}
+
+	c.credMgr.ResumeMessageChannel(name, c.newAgentClient(name))
+}
+
+// vmmServesInstance reports whether pid is a live vfkit serving THIS
+// instance. Family alone (the isVfkitProcess idiom used by VM.IsRunning) is
+// not enough for resume: a recycled PID that happens to be another shed's
+// vfkit would resurrect a dead record, so the instance's own console-log path
+// must appear in the command line too.
+//
+// The two checks must be INDEPENDENT evidence, which is why the family is
+// matched on argv[0] and not on the whole command line: a shed named `vfkit`
+// has "vfkit" inside its own console-log path, so a whole-command-line match
+// would corroborate nothing for it — a recycled PID merely tailing that log
+// would resume a dead record.
+func (c *Client) vmmServesInstance(ctx context.Context, pid int, name string) (bool, error) {
+	cmdline, err := c.inspectCmdline(ctx, pid)
+	if err != nil {
+		return false, err
+	}
+	if !c.isVMMExecutable(cmdline) {
+		return false, nil
+	}
+	// The path VM.Start passes as --device virtio-serial,logFilePath=<path>.
+	consoleLog := filepath.Join(c.cfg.InstanceDir, name, "console.log")
+	return strings.Contains(cmdline, consoleLog), nil
+}
+
+// isVMMExecutable reports whether a `ps -o args=` command line's argv[0] is
+// the VMM binary this server starts. Matched against the CONFIGURED
+// vfkit_path (vm.go:82 execs exactly that), not a hard-coded "vfkit", so an
+// operator who points vfkit_path at a differently named binary still gets
+// their running sheds resumed.
+//
+// argv[0] is taken as the first whitespace-separated field, which is all `ps`
+// gives us. A vfkit_path containing a space therefore fails the match and the
+// shed is not resumed — a false negative, which is the safe direction, and the
+// same direction VM.IsRunning's `ps -o comm=` check already errs in.
+func (c *Client) isVMMExecutable(cmdline string) bool {
+	fields := strings.Fields(cmdline)
+	if len(fields) == 0 {
+		return false
+	}
+	want := filepath.Base(c.cfg.VfkitPath)
+	if want == "" || want == "." || want == string(filepath.Separator) {
+		return false
+	}
+	return filepath.Base(fields[0]) == want
+}
+
+// inspectCmdline reads a PID's command line via the injected reader,
+// falling back to the real one for zero-value Clients.
+func (c *Client) inspectCmdline(ctx context.Context, pid int) (string, error) {
+	read := c.procCmdline
+	if read == nil {
+		read = readProcCmdline
+	}
+	return read(ctx, pid)
+}
+
+// readProcCmdline reads a PID's full command line. macOS lacks /proc, so this
+// shells out to ps — under the caller's context, because an unbounded
+// subprocess here would stall the whole resume walk. `-ww` is load-bearing:
+// without it ps truncates the command line to the terminal width and the
+// instance-path check below would silently never match.
+//
+// A missing process makes ps exit non-zero ⇒ error ⇒ not alive.
+func readProcCmdline(ctx context.Context, pid int) (string, error) {
+	out, err := exec.CommandContext(ctx, "ps", "-ww", "-p", strconv.Itoa(pid), "-o", "args=").Output()
+	if err != nil {
+		return "", err
+	}
+	return string(out), nil
 }
 
 // acquireCreateLock returns an unlock closure after taking the per-shed-name
