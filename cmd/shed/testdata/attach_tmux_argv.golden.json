@@ -1,0 +1,121 @@
+{
+  "_header": [
+    "This fixture pins the EXACT ssh argv `shed attach` produces for the plain-tmux",
+    "paths (plan 022 C3). It is the tmux FLOOR: plan 022 C5 makes `shed attach`",
+    "roost-native, but with no local roost, or with --tmux, or with SHED_ATTACH=tmux,",
+    "the produced argv must stay byte-identical to what is pinned here.",
+    "",
+    "Recorded against the pre-roost-native attach.go (commit 1e38346, before any S6",
+    "RC-hub-demolition CLI deletions). Consumed by",
+    "cmd/shed/attach_golden_test.go:TestAttachPlainTmuxArgvGolden, which overrides the",
+    "execSSH seam (var execSSH = syscall.Exec in attach.go) to capture argv instead of",
+    "exec'ing. HOME is pinned to /home/tester in the test so GetKnownHostsPath()'s",
+    "~/.shed/known_hosts resolves deterministically.",
+    "",
+    "If a future change to the tmux floor path makes this go red, the fix is almost",
+    "always in that new code, not in this fixture -- do not 'fix' it without first",
+    "confirming the floor is still meant to behave identically to today."
+  ],
+  "scenarios": [
+    {
+      "name": "default_session",
+      "doc": "attach <name> with no flags: default session, tmux new-session -A",
+      "session": "default",
+      "new": false,
+      "landing_dir": "/home/shed/myproj",
+      "want_argv": [
+        "ssh",
+        "-t",
+        "-p",
+        "2222",
+        "-o",
+        "UserKnownHostsFile=/home/tester/.shed/known_hosts",
+        "-o",
+        "StrictHostKeyChecking=yes",
+        "myshed@mini3",
+        "--",
+        "tmux new-session -A -s default -c '/home/shed/myproj'"
+      ]
+    },
+    {
+      "name": "empty_landing_dir_falls_back_to_home",
+      "doc": "a shed whose LandingDir is empty (older server, or a shed with no project dir) must fall back to /home/shed -- NOT to an empty -c ''",
+      "session": "default",
+      "new": false,
+      "landing_dir": "",
+      "want_argv": [
+        "ssh",
+        "-t",
+        "-p",
+        "2222",
+        "-o",
+        "UserKnownHostsFile=/home/tester/.shed/known_hosts",
+        "-o",
+        "StrictHostKeyChecking=yes",
+        "myshed@mini3",
+        "--",
+        "tmux new-session -A -s default -c '/home/shed'"
+      ]
+    },
+    {
+      "name": "named_session",
+      "doc": "-S/--session debug: a named session, still tmux new-session -A",
+      "session": "debug",
+      "new": false,
+      "landing_dir": "/home/shed/myproj",
+      "want_argv": [
+        "ssh",
+        "-t",
+        "-p",
+        "2222",
+        "-o",
+        "UserKnownHostsFile=/home/tester/.shed/known_hosts",
+        "-o",
+        "StrictHostKeyChecking=yes",
+        "myshed@mini3",
+        "--",
+        "tmux new-session -A -s debug -c '/home/shed/myproj'"
+      ]
+    },
+    {
+      "name": "new_forces_plain_new_session",
+      "doc": "--new: tmux new-session WITHOUT -A (force-create, error if exists)",
+      "session": "default",
+      "new": true,
+      "landing_dir": "/home/shed/myproj",
+      "want_argv": [
+        "ssh",
+        "-t",
+        "-p",
+        "2222",
+        "-o",
+        "UserKnownHostsFile=/home/tester/.shed/known_hosts",
+        "-o",
+        "StrictHostKeyChecking=yes",
+        "myshed@mini3",
+        "--",
+        "tmux new-session -s default -c '/home/shed/myproj'"
+      ]
+    },
+    {
+      "name": "landing_dir_needs_shell_quoting",
+      "doc": "a landing dir containing a single quote and a space must survive shellQuoteArg's escaping",
+      "session": "default",
+      "new": false,
+      "landing_dir": "/home/shed/o'brien's proj",
+      "want_argv": [
+        "ssh",
+        "-t",
+        "-p",
+        "2222",
+        "-o",
+        "UserKnownHostsFile=/home/tester/.shed/known_hosts",
+        "-o",
+        "StrictHostKeyChecking=yes",
+        "myshed@mini3",
+        "--",
+        "tmux new-session -A -s default -c '/home/shed/o'\\''brien'\\''s proj'"
+      ]
+    }
+  ]
+}

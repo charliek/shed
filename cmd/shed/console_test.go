@@ -302,6 +302,43 @@ func TestTTYFlag(t *testing.T) {
 	}
 }
 
+// TestBaseSSHArgs pins the connection options every shed SSH path shares —
+// port, the pinned known_hosts file, strict host-key checking, then
+// <shed>@<host> last so callers can append "--" and a remote command.
+//
+// Moved here from rc_test.go by plan 022 C3, retargeted from the deleted
+// sshCaptureArgs onto baseSSHArgs: sshCaptureArgs existed only for the RC
+// create path, which this commit removes, and `shed sessions` reads sessions
+// from the server API rather than over SSH — so nothing called it any more.
+func TestBaseSSHArgs(t *testing.T) {
+	entry := &config.ServerEntry{Host: "mini3", SSHPort: 2222}
+
+	t.Run("carries the shared connection options", func(t *testing.T) {
+		joined := strings.Join(baseSSHArgs("myshed", entry), " ")
+		for _, want := range []string{
+			"-p 2222",
+			"UserKnownHostsFile=",
+			"StrictHostKeyChecking=yes",
+			"myshed@mini3",
+		} {
+			if !strings.Contains(joined, want) {
+				t.Errorf("args missing %q: %v", want, joined)
+			}
+		}
+	})
+
+	t.Run("extra options land before the destination", func(t *testing.T) {
+		args := baseSSHArgs("myshed", entry, "-T", "-o", "BatchMode=yes")
+		if got := args[len(args)-1]; got != "myshed@mini3" {
+			t.Fatalf("destination must be last, got %q in %v", got, args)
+		}
+		joined := strings.Join(args, " ")
+		if !strings.Contains(joined, "-T -o BatchMode=yes myshed@mini3") {
+			t.Errorf("extra opts not placed immediately before the destination: %v", args)
+		}
+	})
+}
+
 // TestSSHSessionArgs covers the call-site wiring that ttyFlag alone can't: the
 // flag lands immediately after "ssh", the shared baseSSHArgs connection options
 // are reused (so they can't drift), and the quoted command is appended after the
