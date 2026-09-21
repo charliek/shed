@@ -126,8 +126,10 @@ start the in-process broker). The Swift app has no embedded path; it is always
 
 Test pointers:
 
-- `cargo test -p shed-app --features broker` / `--features broker,rc` — the bridge's
-  unit tests (mode resolution, `load_or_synthesize`, outcome mapping, timeout/dismiss).
+- `cargo test -p shed-app --features broker` — the bridge's unit tests (mode
+  resolution, `load_or_synthesize`, outcome mapping, timeout/dismiss). `broker` is
+  `shed-app`'s ONLY non-default feature since plan 022 (S6, `charliek/shed#328`)
+  retired `rc` with the RC hub, so there is no `broker,rc` pair left to run.
 - `desktop/tools/shedtest/test_tauri_broker.py` — the `--target tauri`-only hermetic
   e2e cells (three-way auto-detect, the bus → AppGate → Coordinator → respond
   round-trip via the mock server's plugin-bus endpoints, split-namespace `409`,

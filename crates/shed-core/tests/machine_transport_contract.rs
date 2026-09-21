@@ -107,7 +107,7 @@ fn the_contract_version_is_explicit() {
 /// single-quoted, including the bare-safe ones.
 ///
 /// This is the property that distinguishes the house quoter
-/// ([`shed_core::rc_agents::shell_quote_always`], the verbatim port of Go's
+/// ([`shed_core::machine::shell_quote_always`], the verbatim port of Go's
 /// `shellQuote`) from a conditional one. Both produce the same ARGV after the
 /// remote shell parses them, so only a byte-level assertion catches a transport
 /// that quietly switched — which is exactly the divergence shed-mobile's own

@@ -4,7 +4,7 @@
 # standalone workspace in ../tauri/src-tauri) linking shed-core + shed-app directly.
 [workspace]
 resolver = "2"
-members = ["shed-core", "shed-core-ffi", "shed-app", "shed-rc-engine", "shedctl", "shed-broker", "shed-host-agent", "shed-opencode", "shed-gx"]
+members = ["shed-core", "shed-core-ffi", "shed-app", "shedctl", "shed-broker", "shed-host-agent", "shed-opencode", "shed-gx"]
 # All members are default members: a plain `cargo build` / `cargo test` (and
 # `make core-test`) build shed-core + shed-core-ffi + shed-app + shedctl. shedctl
 # (the headless Linux CLI driver for the shed-desktop IPC socket) has no GUI-toolkit
@@ -12,10 +12,11 @@ members = ["shed-core", "shed-core-ffi", "shed-app", "shed-rc-engine", "shedctl"
 # (build-core.sh is `-p shed-core-ffi`-scoped). The Tauri client (WebKitGTK) lives
 # in its OWN workspace so its heavy deps never enter this one.
 #
-# `sx` (the RC porcelain, plan 009) was sunset in plan 016 (S7, #329) and is no
-# longer a member. Nothing in this workspace enables shed-app's non-default `rc`
-# feature by default any more — coverage is the explicit `-p shed-app --features
-# rc` leg (see the note below).
+# `sx` (the RC porcelain, plan 009) was sunset in plan 016 (S7, #329) and
+# `shed-rc-engine` — with shed-app's `rc` feature and shed-broker's `rc_hub` —
+# went with the rest of the Remote-Control hub in plan 022 (S6, #328). Neither is
+# a member any more; there is no non-default feature left here but `shed-app`'s
+# `broker`.
 #
 # `shed-opencode` (the opencode agent-lane adapter, plan 015) is a member AND a
 # default member: a pure lib on shed-core with no GUI-toolkit and no daemon
@@ -27,7 +28,7 @@ members = ["shed-core", "shed-core-ffi", "shed-app", "shed-rc-engine", "shedctl"
 # C1), no `regex`, no `base64`. Neither adapter is reachable from
 # `shed-core-ffi` or from shed-core's Android target, which is what keeps the
 # two `cargo tree` invariants true.
-default-members = ["shed-core", "shed-core-ffi", "shed-app", "shed-rc-engine", "shedctl", "shed-broker", "shed-host-agent", "shed-opencode", "shed-gx"]
+default-members = ["shed-core", "shed-core-ffi", "shed-app", "shedctl", "shed-broker", "shed-host-agent", "shed-opencode", "shed-gx"]
 
 [workspace.package]
 version = "0.8.1"

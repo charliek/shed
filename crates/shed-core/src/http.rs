@@ -11,8 +11,8 @@
 //! rejected credential — plan 001 §3.4), and `ShedError` matching
 //! `ShedClientError`. Lifecycle + SSE create land in M4.
 //!
-//! Every request shape — JSON, lifecycle, and BOTH SSE streams — goes through
-//! one re-auth path, [`Client::send_authed`]: classify the outcome
+//! Every request shape — JSON, lifecycle, and the SSE create stream — goes
+//! through one re-auth path, [`Client::send_authed`]: classify the outcome
 //! ([`crate::authfail`]: an HTTP 401 or a peer TLS alert naming a certificate
 //! problem), invalidate the credential, re-mint once, retry once. There is no
 //! second policy for streams, and none of it branches on the mode the client
@@ -29,8 +29,6 @@ use crate::models::{
     CreateShedRequest, EgressProfileInfo, ImageList, Overview, ServerInfo, SessionsResponse, Shed,
     ShedImage, ShedList, SystemDiskUsage,
 };
-use crate::rc::RcMessagesPage;
-use crate::rc_events::{parse_rc_event, RcEvent};
 use crate::sse::SseParser;
 use crate::token::{ControlTokenProvider, TokenMinter};
 
@@ -63,22 +61,6 @@ const WRITE_TIMEOUT: Duration = Duration::from_secs(15);
 /// Max gap between SSE bytes during a create before we give up (a hung stream);
 /// generous so a healthy provision with periodic progress never trips it.
 const CREATE_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
-/// Max gap between SSE BYTES on the long-lived rc-events stream before the
-/// client treats the connection as silently dead. The server heartbeats every
-/// 25s with a `: heartbeat` comment (`internal/api/rcevents.go:188-206`), and
-/// those comment bytes reset this timer even though the parser swallows them
-/// without emitting an event — the timeout wraps the byte-chunk future, never
-/// the parsed-event future (plan 001 §3.3; see [`Client::rc_events`]). 60s is
-/// two missed heartbeats plus slack.
-const RC_EVENTS_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
-/// Cap on the bytes buffered for a single rc-events SSE event, matching the
-/// broker bus's `MAX_SSE_EVENT_BYTES` (`shed-broker/src/bus.rs`): 1 MiB, the
-/// same bound Go's `bufio.Scanner` enforces. rc-events is a long-lived stream
-/// carrying guest-influenced payloads (unlike the bounded one-shot create
-/// stream, which stays uncapped), so an oversized / never-terminating event
-/// surfaces as an error → the watcher disconnects + reconnects, instead of
-/// buffering unboundedly.
-const RC_EVENTS_MAX_EVENT_BYTES: usize = 1 << 20;
 pub(crate) const USER_AGENT: &str = concat!("shed-desktop-core/", env!("CARGO_PKG_VERSION"));
 
 /// Sink for create progress. shed-core streams the SSE and drives these; the FFI
@@ -87,14 +69,6 @@ pub trait CreateSink: Send + Sync {
     fn on_progress(&self, message: String);
     fn on_complete(&self, shed: Shed);
     fn on_error(&self, message: String);
-}
-
-/// Sink for the rc-events live-activity stream (mirrors [`CreateSink`]):
-/// shed-core drives the SSE connection ([`Client::rc_events`]) and hands each
-/// decoded [`RcEvent`] here in arrival order; the fold + reconnect layer
-/// (shed-app's `RcEventsWatcher`) implements it.
-pub trait RcEventSink: Send + Sync {
-    fn on_event(&self, ev: RcEvent);
 }
 
 /// One completed send, plus the transport it went out on.
@@ -520,8 +494,8 @@ impl Client {
     }
 
     /// [`Self::credential`] BOUNDED by `bound`, mirroring the connect-phase guard
-    /// [`Self::rc_events`] already applies: a foreign [`crate::TokenMinter`] impl
-    /// can hang indefinitely (the provider holds its mutex across a mint), so an
+    /// [`Self::create_stream`] already applies: a foreign [`crate::TokenMinter`]
+    /// impl can hang indefinitely (the provider holds its mutex across a mint), so an
     /// unbounded credential resolution in a JSON/lifecycle request or a create
     /// would wedge the whole call. On timeout surface a Transport error rather
     /// than block forever. Used by [`Self::request`] for both the initial and the
@@ -613,13 +587,13 @@ impl Client {
     /// the SDK/CLI).
     ///
     /// This is the ONE re-auth path in this client. The unary JSON/lifecycle
-    /// requests ([`Self::request`]) and both SSE streams
-    /// ([`Self::create_stream`], [`Self::rc_events`]) route through it, so a
-    /// rejected credential recovers identically whether it was refused with a 401
-    /// or with a TLS alert, and whether the response was going to be a JSON body
-    /// or an event stream. (The streams previously classified nothing and only
-    /// invalidated a BEARER token, which is always `None` in mtls state — a
-    /// revoked certificate left them failing forever.)
+    /// requests ([`Self::request`]) and the SSE create stream
+    /// ([`Self::create_stream`]) route through it, so a rejected credential
+    /// recovers identically whether it was refused with a 401 or with a TLS
+    /// alert, and whether the response was going to be a JSON body or an event
+    /// stream. (The stream previously classified nothing and only invalidated a
+    /// BEARER token, which is always `None` in mtls state — a revoked
+    /// certificate left it failing forever.)
     ///
     /// "Auth-shaped" is [`crate::authfail::is_auth_failure`]: an HTTP 401, or a
     /// peer TLS alert naming a certificate problem. Both shapes are handled the
@@ -792,9 +766,8 @@ impl Client {
     /// A mint failure does not abort the call here — it rides along in the
     /// [`Resolution`] and becomes the error only if the server refuses the
     /// attempt ([`Self::send_authed`]). Every path reaches the wire through this
-    /// function (unary JSON/lifecycle via [`Self::request`], and both SSE
-    /// streams, [`Self::create_stream`] and [`Self::rc_events`]), so all three
-    /// get that behavior identically: open servers keep working, and a refusal
+    /// function (unary JSON/lifecycle via [`Self::request`], and the SSE create
+    /// stream, [`Self::create_stream`]), so both get that behavior identically: open servers keep working, and a refusal
     /// carries the actionable message instead of a bare 401.
     async fn send_resolved(
         &self,
@@ -946,261 +919,6 @@ impl Client {
         .await
     }
 
-    /// `GET /api/sheds/{shed}/rc/v1/sessions/{slug}/messages?since=N[&limit=M]`
-    /// — one page of an RC session's message feed, reverse-proxied into the
-    /// guest's rc hub (proxy `internal/api/rchub.go:280-375`; hub handler
-    /// `internal/ext/rc/hub.go:332-385`). `since` is the exclusive seq cursor
-    /// (0 = from the start); `limit` defaults to 100 server-side (capped at
-    /// 200) when `None`. Decode is the tolerant [`RcMessagesPage`].
-    ///
-    /// Errors are status-only (plan §3.2 — the hub's flat `{code,message}`
-    /// bodies are deliberately not decoded): 400 malformed since/limit, 404
-    /// unknown slug/shed, 503 shed not running / hub unavailable, 502 proxy
-    /// failed / oversized upstream body.
-    pub async fn rc_messages(
-        &self,
-        shed: &str,
-        slug: &str,
-        since: u64,
-        limit: Option<u32>,
-    ) -> Result<RcMessagesPage, ShedError> {
-        let mut query = vec![("since", since.to_string())];
-        if let Some(limit) = limit {
-            query.push(("limit", limit.to_string()));
-        }
-        self.get_json(
-            &[
-                "api", "sheds", shed, "rc", "v1", "sessions", slug, "messages",
-            ],
-            &query,
-        )
-        .await
-    }
-
-    /// `POST /api/sheds/{shed}/rc/v1/sessions/{slug}/input` with
-    /// `{"text": …}` — deliver a line of feed input to a gated RC session
-    /// (proxy `internal/api/rchub.go:280-375`; hub handler
-    /// `internal/ext/rc/hub.go:391-521`). Success is any 2xx; the 200 body
-    /// (`{"delivered":true}`) is ignored. Goes through the standard `request`
-    /// pipeline (WRITE_TIMEOUT, provider-backed 401 → invalidate +
-    /// retry-once, body re-sent).
-    ///
-    /// Errors are status-only (plan §3.2 — hub `{code,message}` bodies not
-    /// decoded; `BadStatus` carries the status): 400 invalid/unsafe text, 404
-    /// unknown slug/shed, 409 not accepting (`not_accepting` — wrong
-    /// activity, recreated identity, or a non-input-gated kind), 413 body too
-    /// large (`too_large`, >16 KiB), 503 shed not running / hub unavailable,
-    /// 502 proxy failed.
-    pub async fn rc_input(&self, shed: &str, slug: &str, text: &str) -> Result<(), ShedError> {
-        let body = serde_json::json!({ "text": text });
-        let url = self.build_url(
-            &["api", "sheds", shed, "rc", "v1", "sessions", slug, "input"],
-            &[],
-        )?;
-        self.request(reqwest::Method::POST, &url, WRITE_TIMEOUT, Some(&body))
-            .await
-            .map(|_| ())
-    }
-
-    /// Decode a 2xx body as JSON, or report the wire as malformed.
-    ///
-    /// The distinction this keeps: a body that PARSES but omits an optional
-    /// field is an older server being terse, and the caller defaults it. A body
-    /// that does not parse is a proxy error page or a truncated response, and
-    /// defaulting THAT invents an answer.
-    fn decode_json_body(raw: &[u8]) -> Result<serde_json::Value, ShedError> {
-        serde_json::from_slice(raw).map_err(|e| ShedError::Decode(e.to_string()))
-    }
-
-    /// `POST /api/sheds/{shed}/rc/v1/sessions/{slug}/turn` — start a
-    /// structured turn, returning the turn id.
-    ///
-    /// The counterpart to [`Self::rc_input`], and which one applies is the
-    /// KIND's business, not the caller's guess: a `kind_features.input` of
-    /// `"turn"` takes this, `"gated"` takes `rc_input`. Offering the wrong one
-    /// earns a `409 not_supported` the user cannot act on.
-    pub async fn rc_turn(&self, shed: &str, slug: &str, text: &str) -> Result<String, ShedError> {
-        let body = serde_json::json!({ "text": text });
-        let url = self.build_url(
-            &["api", "sheds", shed, "rc", "v1", "sessions", slug, "turn"],
-            &[],
-        )?;
-        let raw = self
-            .request(reqwest::Method::POST, &url, WRITE_TIMEOUT, Some(&body))
-            .await?;
-        // A body that is not JSON is a PROTOCOL failure, not an empty turn id.
-        // Tolerating it would report a delivered turn for an HTML error page or
-        // a truncated response. A well-formed body missing the optional
-        // `turn_id` is a different matter — see below.
-        let v: serde_json::Value = Self::decode_json_body(&raw)?;
-        Ok(v.get("turn_id")
-            .and_then(|t| t.as_str())
-            .unwrap_or_default()
-            .to_string())
-    }
-
-    /// `POST /api/sheds/{shed}/rc/v1/sessions/{slug}/interrupt` — stop the
-    /// running turn.
-    ///
-    /// `false` means nothing was running. That is an ANSWER, not a failure:
-    /// interrupting an idle session is a no-op the caller asked for, and
-    /// surfacing it as an error would train people to ignore the error path.
-    pub async fn rc_interrupt(&self, shed: &str, slug: &str) -> Result<bool, ShedError> {
-        let url = self.build_url(
-            &[
-                "api",
-                "sheds",
-                shed,
-                "rc",
-                "v1",
-                "sessions",
-                slug,
-                "interrupt",
-            ],
-            &[],
-        )?;
-        let raw = self
-            .request(
-                reqwest::Method::POST,
-                &url,
-                WRITE_TIMEOUT,
-                Some(&serde_json::json!({})),
-            )
-            .await?;
-        // Same reasoning as `rc_turn`, and it matters more here: silently
-        // decoding garbage to `false` reports "nothing was running" — a factual
-        // claim about the session — when the truth is that we do not know.
-        let v: serde_json::Value = Self::decode_json_body(&raw)?;
-        Ok(v.get("interrupted")
-            .and_then(|b| b.as_bool())
-            .unwrap_or(false))
-    }
-
-    /// `GET /api/rc/events` with `Accept: text/event-stream` — the host-wide
-    /// aggregate rc live-activity stream (Go `internal/api/rcevents.go:170-208`:
-    /// the server opens with a `: ok` comment preamble, heartbeats every 25s
-    /// with `: heartbeat` comments, and never sends a `retry:` hint — reconnect
-    /// policy is entirely the client's). Each SSE record is decoded via
-    /// [`parse_rc_event`] and delivered to `sink` in arrival order; a
-    /// malformed/unknown frame is skipped WITHOUT ending the stream (the decode
-    /// is tolerant by design — one bad guest frame must not become a reconnect
-    /// storm), and comment frames never reach the sink (the parser swallows
-    /// them). Success is exactly a 200 SSE response — any other status,
-    /// including a body-less 2xx like 204, is `BadStatus` (an empty-stream Ok
-    /// would mask the fault from the watcher). Returns `Ok(())` on clean EOF,
-    /// after flushing any final unterminated record to the sink. The idle
-    /// duration also bounds the whole connect phase (bearer mint + send).
-    ///
-    /// ONE connection, and no in-method RECONNECT: the reconnect loop (shed-app's
-    /// `RcEventsWatcher`) owns backoff, and a stream that dies mid-flight is its
-    /// problem, not this method's.
-    ///
-    /// The CONNECT, though, runs the standard re-auth path
-    /// ([`Self::send_authed`]): a refused credential is invalidated, re-minted
-    /// once, and the connect retried once. Leaving that to the watcher was a bug
-    /// rather than a division of labour — the old code invalidated a BEARER token,
-    /// which is `None` in mtls state, so a revoked or expired certificate meant
-    /// every reconnect presented the same dead identity forever. An unrecoverable
-    /// failure still surfaces (`BadStatus(401)` after the retry is refused too),
-    /// so the watcher's Down/backoff signal is unchanged.
-    ///
-    /// Liveness (plan 001 §3.3, panel-critical pin): the
-    /// [`RC_EVENTS_IDLE_TIMEOUT`] idle timer wraps the BYTE-chunk future
-    /// (`bytes_stream().next()`, the `create_stream` pattern), NOT the
-    /// parsed-event future — the server's 25s heartbeat comments arrive as
-    /// bytes and reset it even though the parser emits no event for them. An
-    /// event-level timer would falsely kill every healthy-but-quiet stream; the
-    /// byte-level timer converts a silently-dead connection into
-    /// disconnect → reconnect → resync (a liveness watchdog mobile's Dart loop
-    /// lacks). Idle/transport failures surface as [`ShedError::Transport`]
-    /// (`Create` is create-specific; to the reconnecting watcher every
-    /// teardown is the same "connection died" condition). Events are parsed
-    /// through a 1 MiB-capped [`SseParser`] ([`RC_EVENTS_MAX_EVENT_BYTES`]);
-    /// an overflow is an error, ending the stream.
-    pub async fn rc_events(&self, sink: &dyn RcEventSink) -> Result<(), ShedError> {
-        self.rc_events_with_idle(sink, RC_EVENTS_IDLE_TIMEOUT).await
-    }
-
-    /// [`Self::rc_events`] with an injectable idle timeout — the test seam
-    /// (deterministic timer tests must not wait out the 60s production value).
-    pub(crate) async fn rc_events_with_idle(
-        &self,
-        sink: &dyn RcEventSink,
-        idle: Duration,
-    ) -> Result<(), ShedError> {
-        self.rc_events_with_limits(sink, idle, RC_EVENTS_MAX_EVENT_BYTES)
-            .await
-    }
-
-    /// The full rc-events implementation with both knobs injectable (the cap
-    /// seam exists only for tests — an oversized-event test must not build a
-    /// >1 MiB body).
-    async fn rc_events_with_limits(
-        &self,
-        sink: &dyn RcEventSink,
-        idle: Duration,
-        max_event_bytes: usize,
-    ) -> Result<(), ShedError> {
-        let url = self.build_url(&["api", "rc", "events"], &[])?;
-        // Connection-open timeout: the same duration bounds the WHOLE connect
-        // phase — credential resolution (a foreign `TokenMinter` impl can hang
-        // indefinitely), the request send, and the one re-auth attempt — so no
-        // pre-stream await sits outside the bound (a server that accepts but
-        // never responds is as dead as a silent stream).
-        let connect = self.send_resolved(idle, |http| {
-            http.get(url.clone())
-                .header(reqwest::header::ACCEPT, "text/event-stream")
-        });
-        let sent = match tokio::time::timeout(idle, connect).await {
-            Err(_) => {
-                return Err(ShedError::Transport("rc-events connect timeout".into()));
-            }
-            Ok(r) => r?,
-        };
-        let status = sent.resp.status().as_u16();
-        // Exactly 200, not any-2xx: SSE lives in a 200 response body — a
-        // 204/206 minted by an intermediary carries no event stream, and
-        // treating it as success would end as a silent empty-stream Ok,
-        // masking the fault from the watcher's Down/backoff signal.
-        if status != 200 {
-            return Err(ShedError::BadStatus(status));
-        }
-        // Keep the retry's throwaway transport alive for the life of the stream
-        // (see [`Sent`]); `bytes_stream` consumes the response.
-        let _transport = sent.transport;
-        let mut stream = sent.resp.bytes_stream();
-        let mut parser = SseParser::new().with_max_event_bytes(max_event_bytes);
-        loop {
-            // The idle timer wraps the BYTE-chunk future (see rc_events docs):
-            // heartbeat comment bytes reset it even though they emit no event.
-            match tokio::time::timeout(idle, stream.next()).await {
-                Err(_) => {
-                    return Err(ShedError::Transport("rc-events stream idle timeout".into()));
-                }
-                Ok(None) => break, // clean EOF
-                Ok(Some(chunk)) => {
-                    let chunk =
-                        chunk.map_err(|e| ShedError::Transport(crate::authfail::flatten(&e)))?;
-                    let events = parser
-                        .try_feed(&chunk)
-                        .map_err(|e| ShedError::Transport(format!("rc-events stream: {e}")))?;
-                    for ev in &events {
-                        if let Some(rc) = parse_rc_event(ev) {
-                            sink.on_event(rc);
-                        }
-                    }
-                }
-            }
-        }
-        // Flush a final record that lacked its trailing blank line.
-        for ev in parser.finish() {
-            if let Some(rc) = parse_rc_event(&ev) {
-                sink.on_event(rc);
-            }
-        }
-        Ok(())
-    }
-
     /// `POST /api/sheds/{name}/start`.
     pub async fn start(&self, name: &str) -> Result<(), ShedError> {
         self.lifecycle(reqwest::Method::POST, &["api", "sheds", name, "start"])
@@ -1245,8 +963,8 @@ impl Client {
         let url = self.build_url(&["api", "sheds"], &[])?;
         // Bound the WHOLE connect phase — credential resolution (a foreign
         // TokenMinter can hang), the request send, and the one re-auth attempt —
-        // under CREATE_IDLE_TIMEOUT, mirroring rc_events, so no pre-stream await
-        // sits outside the bound.
+        // under CREATE_IDLE_TIMEOUT, so no pre-stream await sits outside the
+        // bound.
         let connect = self.send_resolved(CREATE_IDLE_TIMEOUT, |http| {
             http.post(url.clone())
                 .header(reqwest::header::ACCEPT, "text/event-stream")
@@ -1903,20 +1621,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_streaming_paths_report_the_mint_error_when_refused() {
-        // create (SSE) and rc-events resolve through the same helper, so both
-        // halves of the contract reach them: the stream is attempted, and the
-        // refusal reports the mint failure rather than a bare 401.
+    async fn the_streaming_path_reports_the_mint_error_when_refused() {
+        // The create stream resolves through the same helper every unary call
+        // does, so both halves of the contract reach it: the stream is
+        // attempted, and the refusal reports the mint failure rather than a
+        // bare 401.
         let server = MockServer::start_async().await;
         let create = server
             .mock_async(|w, t| {
                 w.method(POST).path("/api/sheds");
-                t.status(401);
-            })
-            .await;
-        let events = server
-            .mock_async(|w, t| {
-                w.method(GET).path("/api/rc/events");
                 t.status(401);
             })
             .await;
@@ -1946,20 +1659,10 @@ mod tests {
         );
         assert!(snap.shed.is_none());
 
-        let rc_sink = RecordingRcSink::default();
-        let err = c.rc_events(&rc_sink).await.unwrap_err();
-        let msg = err.to_string();
-        assert!(
-            msg.contains(UPGRADE_MSG) && msg.contains("HTTP 401"),
-            "rc-events must report the mint error, got {err:?}"
-        );
-        assert!(rc_sink.events().is_empty());
-
         assert_eq!(create.hits_async().await, 1, "one attempt, no retry");
-        assert_eq!(events.hits_async().await, 1, "one attempt, no retry");
         // One mint attempt per stream call — never a failed mint immediately
         // re-attempted by the retry machinery.
-        assert_eq!(minter.calls(), 2);
+        assert_eq!(minter.calls(), 1);
     }
 
     #[tokio::test]
@@ -2601,308 +2304,6 @@ mod tests {
         ));
     }
 
-    // ---- rc proxy: messages + input ----
-
-    #[tokio::test]
-    async fn rc_messages_happy_path_with_query_params() {
-        let server = MockServer::start_async().await;
-        let m = server
-            .mock_async(|w, t| {
-                w.method(GET)
-                    .path("/api/sheds/proj/rc/v1/sessions/abc234/messages")
-                    .query_param("since", "7")
-                    .query_param("limit", "50");
-                t.status(200).body(
-                    r#"{"messages":[
-                        {"seq":8,"ts":"2026-06-19T18:53:00Z","role":"user","type":"text","text":"hi"},
-                        {"seq":9,"role":"tool","type":"tool_use",
-                         "tool":{"name":"shell","detail":"ls -la"}}
-                    ],"truncated":false}"#,
-                );
-            })
-            .await;
-        let p = client(&server)
-            .rc_messages("proj", "abc234", 7, Some(50))
-            .await
-            .unwrap();
-        m.assert_async().await;
-        assert_eq!(p.messages.len(), 2);
-        assert!(!p.truncated);
-        assert_eq!(p.messages[0].seq, 8);
-        assert_eq!(
-            p.messages[1].tool.as_ref().unwrap().name.as_deref(),
-            Some("shell")
-        );
-    }
-
-    #[tokio::test]
-    async fn rc_messages_omits_limit_when_none() {
-        let server = MockServer::start_async().await;
-        let m = server
-            .mock_async(|w, t| {
-                w.method(GET)
-                    .path("/api/sheds/proj/rc/v1/sessions/abc234/messages")
-                    .query_param("since", "0")
-                    // The server defaults limit (100, cap 200) — the client
-                    // must not send one.
-                    .matches(|req| {
-                        !req.query_params
-                            .as_ref()
-                            .is_some_and(|q| q.iter().any(|(k, _)| k == "limit"))
-                    });
-                t.status(200).body(r#"{"messages":[],"truncated":true}"#);
-            })
-            .await;
-        let p = client(&server)
-            .rc_messages("proj", "abc234", 0, None)
-            .await
-            .unwrap();
-        m.assert_async().await;
-        assert!(p.messages.is_empty());
-        assert!(p.truncated);
-    }
-
-    #[tokio::test]
-    async fn rc_messages_tolerates_missing_keys_and_maps_errors() {
-        let server = MockServer::start_async().await;
-        // A body with no messages key decodes to the empty page (tolerant).
-        server
-            .mock_async(|w, t| {
-                w.method(GET)
-                    .path("/api/sheds/proj/rc/v1/sessions/sparse/messages");
-                t.status(200).body(r#"{"truncated":false}"#);
-            })
-            .await;
-        let p = client(&server)
-            .rc_messages("proj", "sparse", 0, None)
-            .await
-            .unwrap();
-        assert!(p.messages.is_empty());
-        assert!(!p.truncated);
-        // Unknown slug → status-only 404 (hub `{code,message}` body ignored).
-        server
-            .mock_async(|w, t| {
-                w.method(GET)
-                    .path("/api/sheds/proj/rc/v1/sessions/nope/messages");
-                t.status(404)
-                    .body(r#"{"code":"unknown_slug","message":"no such rc session"}"#);
-            })
-            .await;
-        assert!(matches!(
-            client(&server).rc_messages("proj", "nope", 0, None).await,
-            Err(ShedError::BadStatus(404))
-        ));
-    }
-
-    #[tokio::test]
-    async fn rc_input_posts_json_body_and_ignores_delivered_body() {
-        let server = MockServer::start_async().await;
-        let m = server
-            .mock_async(|w, t| {
-                w.method(POST)
-                    .path("/api/sheds/proj/rc/v1/sessions/abc234/input")
-                    .header("content-type", "application/json")
-                    .json_body(serde_json::json!({"text": "looks good, continue"}));
-                t.status(200).body(r#"{"delivered":true}"#);
-            })
-            .await;
-        client(&server)
-            .rc_input("proj", "abc234", "looks good, continue")
-            .await
-            .unwrap();
-        m.assert_async().await;
-    }
-
-    #[tokio::test]
-    async fn rc_turn_posts_the_text_and_returns_the_turn_id() {
-        let server = MockServer::start_async().await;
-        let m = server
-            .mock_async(|w, t| {
-                w.method(POST)
-                    .path("/api/sheds/proj/rc/v1/sessions/abc234/turn")
-                    .header("content-type", "application/json")
-                    .json_body(serde_json::json!({"text": "describe this project"}));
-                t.status(200).body(r#"{"turn_id":"t-7"}"#);
-            })
-            .await;
-        assert_eq!(
-            client(&server)
-                .rc_turn("proj", "abc234", "describe this project")
-                .await
-                .unwrap(),
-            "t-7"
-        );
-        m.assert_async().await;
-    }
-
-    #[tokio::test]
-    async fn rc_turn_tolerates_a_body_without_a_turn_id() {
-        // The id is a convenience, not a contract the caller depends on — an
-        // older hub that acks without one must not turn a delivered turn into
-        // an error the user sees.
-        let server = MockServer::start_async().await;
-        server
-            .mock_async(|w, t| {
-                w.method(POST).path_contains("/turn");
-                t.status(200).body("{}");
-            })
-            .await;
-        assert_eq!(client(&server).rc_turn("proj", "a", "x").await.unwrap(), "");
-    }
-
-    #[tokio::test]
-    async fn rc_interrupt_reports_whether_anything_was_running() {
-        // `false` is an ANSWER — interrupting an idle session is a no-op the
-        // caller asked for, not a failure. A body missing the key reads as
-        // false rather than erroring, for the same reason.
-        let server = MockServer::start_async().await;
-        for (slug, body, want) in [
-            ("busy", r#"{"interrupted":true}"#, true),
-            ("idle", r#"{"interrupted":false}"#, false),
-            ("terse", "{}", false),
-        ] {
-            let s2 = MockServer::start_async().await;
-            s2.mock_async(|w, t| {
-                w.method(POST)
-                    .path(format!("/api/sheds/proj/rc/v1/sessions/{slug}/interrupt"));
-                t.status(200).body(body);
-            })
-            .await;
-            assert_eq!(
-                client(&s2).rc_interrupt("proj", slug).await.unwrap(),
-                want,
-                "slug {slug}"
-            );
-        }
-        drop(server);
-    }
-
-    /// codex review: a 200 whose body is not JSON is a proxy error page or a
-    /// truncated response — decoding it to a default INVENTS an answer. For
-    /// interrupt that answer is "nothing was running", which is a factual claim
-    /// about the session that nobody actually made.
-    #[tokio::test]
-    async fn a_malformed_success_body_is_a_decode_error_not_a_default() {
-        for body in ["<html>502 Bad Gateway</html>", "{\"interrupted\": tru", ""] {
-            let server = MockServer::start_async().await;
-            server
-                .mock_async(|w, t| {
-                    w.method(POST);
-                    t.status(200).body(body);
-                })
-                .await;
-            assert!(
-                matches!(
-                    client(&server).rc_interrupt("proj", "a").await,
-                    Err(ShedError::Decode(_))
-                ),
-                "body {body:?} was decoded rather than rejected"
-            );
-            assert!(matches!(
-                client(&server).rc_turn("proj", "a", "x").await,
-                Err(ShedError::Decode(_))
-            ));
-        }
-    }
-
-    #[tokio::test]
-    async fn rc_turn_status_code_errors_are_bad_status() {
-        // The two 409s the contract distinguishes: `not_supported` means this
-        // kind never can (the client should not have offered the button), and
-        // `not_accepting` means not right now. Both must reach the caller as a
-        // status it can key off, not a swallowed default.
-        let server = MockServer::start_async().await;
-        server
-            .mock_async(|w, t| {
-                w.method(POST).path_contains("/turn");
-                t.status(409)
-                    .body(r#"{"error":"not_supported","message":"kind has no turn"}"#);
-            })
-            .await;
-        assert!(matches!(
-            client(&server).rc_turn("proj", "a", "x").await,
-            Err(ShedError::BadStatus(409))
-        ));
-    }
-
-    #[tokio::test]
-    async fn rc_input_status_code_errors_are_bad_status() {
-        // Status-only dispatch (plan §3.2): the hub's flat {code,message}
-        // bodies (hub.go:404-521) are NOT decoded; BadStatus carries the
-        // status the caller keys off.
-        let server = MockServer::start_async().await;
-        for (slug, status, body) in [
-            (
-                "busy",
-                409,
-                r#"{"code":"not_accepting","message":"session is not waiting for input"}"#,
-            ),
-            (
-                "big",
-                413,
-                r#"{"code":"too_large","message":"input body exceeds 16 KiB"}"#,
-            ),
-            (
-                "gone",
-                404,
-                r#"{"code":"unknown_slug","message":"no such rc session"}"#,
-            ),
-        ] {
-            server
-                .mock_async(|w, t| {
-                    w.method(POST)
-                        .path(format!("/api/sheds/proj/rc/v1/sessions/{slug}/input"));
-                    t.status(status).body(body);
-                })
-                .await;
-            let err = client(&server)
-                .rc_input("proj", slug, "x")
-                .await
-                .unwrap_err();
-            match err {
-                ShedError::BadStatus(s) => assert_eq!(s, status),
-                other => panic!("expected BadStatus({status}), got {other:?}"),
-            }
-        }
-    }
-
-    #[tokio::test]
-    async fn rc_input_retries_once_on_401_resending_body() {
-        // Same 401 → invalidate + retry-once contract as every request()
-        // path; the JSON body must be re-sent on the retried attempt.
-        let server = MockServer::start_async().await;
-        server
-            .mock_async(|w, t| {
-                w.method(POST)
-                    .path("/api/sheds/proj/rc/v1/sessions/abc234/input")
-                    .header("authorization", "Bearer tok-1");
-                t.status(401);
-            })
-            .await;
-        let ok = server
-            .mock_async(|w, t| {
-                w.method(POST)
-                    .path("/api/sheds/proj/rc/v1/sessions/abc234/input")
-                    .header("authorization", "Bearer tok-2")
-                    .json_body(serde_json::json!({"text": "hi"}));
-                t.status(200).body(r#"{"delivered":true}"#);
-            })
-            .await;
-        let minter = Arc::new(SeqMinter {
-            calls: AtomicUsize::new(0),
-        });
-        let c = Client::new(
-            server.base_url(),
-            "mini2".into(),
-            String::new(),
-            None,
-            Some(minter),
-        )
-        .unwrap();
-        c.rc_input("proj", "abc234", "hi").await.unwrap();
-        ok.assert_async().await;
-    }
-
     // ---- URL path-segment safety (build_url defense in depth) ----
 
     #[tokio::test]
@@ -2934,22 +2335,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rc_input_slug_with_slash_stays_one_segment() {
-        // A '/' inside a (remote-influenced) slug is %2F, never a new segment.
-        let server = MockServer::start_async().await;
-        let m = server
-            .mock_async(|w, t| {
-                w.method(POST)
-                    .path("/api/sheds/proj/rc/v1/sessions/a%2Fb/input")
-                    .json_body(serde_json::json!({"text": "hi"}));
-                t.status(200).body(r#"{"delivered":true}"#);
-            })
-            .await;
-        client(&server).rc_input("proj", "a/b", "hi").await.unwrap();
-        m.assert_async().await;
-    }
-
-    #[tokio::test]
     async fn bare_dot_and_empty_segments_are_rejected_client_side() {
         // ""/"."/".." can't be neutralized by encoding alone (a raw ".." that
         // reached the wire would be dot-normalized by the server's router into
@@ -2964,405 +2349,6 @@ mod tests {
             c.list_sessions("").await,
             Err(ShedError::Config(_))
         ));
-        assert!(matches!(
-            c.rc_messages("proj", "..", 0, None).await,
-            Err(ShedError::Config(_))
-        ));
-    }
-
-    // ---- rc-events SSE stream (plan §3.3 test matrix + AC#8) ----
-
-    use crate::rc_events::RcEvent;
-
-    #[derive(Default)]
-    struct RecordingRcSink {
-        events: std::sync::Mutex<Vec<RcEvent>>,
-    }
-    impl RecordingRcSink {
-        fn events(&self) -> Vec<RcEvent> {
-            self.events.lock().unwrap().clone()
-        }
-    }
-    impl RcEventSink for RecordingRcSink {
-        fn on_event(&self, ev: RcEvent) {
-            self.events.lock().unwrap().push(ev);
-        }
-    }
-
-    /// A minimal raw-TCP SSE server for the streaming-TIMING tests httpmock
-    /// can't express (httpmock only serves complete pre-built bodies — it
-    /// cannot trickle bytes with real gaps): accepts ONE connection, reads the
-    /// request headers, writes an HTTP/1.1 200 SSE response head, then runs
-    /// `script` against the raw socket on a plain OS thread (std sleeps
-    /// between writes = real inter-chunk gaps). Dropping the socket at the end
-    /// of `script` is the clean EOF (`connection: close`). Every script runs
-    /// for a bounded time by construction; the caller MUST end its test with
-    /// [`join_sse_server`] so no thread or listener outlives the test.
-    fn spawn_sse_server(
-        script: impl FnOnce(&mut std::net::TcpStream) + Send + 'static,
-    ) -> (String, std::thread::JoinHandle<()>) {
-        use std::io::{Read, Write};
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
-        let handle = std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            stream.set_nodelay(true).unwrap(); // each write = one prompt chunk
-            let mut req = Vec::new();
-            let mut buf = [0u8; 4096];
-            loop {
-                let n = stream.read(&mut buf).unwrap_or(0);
-                if n == 0 {
-                    return;
-                }
-                req.extend_from_slice(&buf[..n]);
-                if req.windows(4).any(|w| w == b"\r\n\r\n") {
-                    break; // headers complete (GET — no body follows)
-                }
-            }
-            stream
-                .write_all(
-                    b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\n",
-                )
-                .unwrap();
-            script(&mut stream);
-        });
-        (format!("http://{addr}"), handle)
-    }
-
-    /// Join the raw-TCP server thread with a bound (std's `JoinHandle` has no
-    /// timed join, so the blocking join runs on the blocking pool under a
-    /// tokio timeout): a wedged script fails the test instead of hanging the
-    /// suite, and a panic inside the server thread is propagated, not lost.
-    async fn join_sse_server(handle: std::thread::JoinHandle<()>) {
-        tokio::time::timeout(
-            Duration::from_secs(10),
-            tokio::task::spawn_blocking(move || handle.join().expect("sse server thread panicked")),
-        )
-        .await
-        .expect("sse server thread did not finish within the bound")
-        .unwrap();
-    }
-
-    #[tokio::test]
-    async fn rc_events_delivers_decoded_events_in_order_and_clean_eof_is_ok() {
-        // Happy path: the server's `: ok` preamble (rcevents.go:185), two data
-        // frames, then EOF. The comment preamble produces no sink call; the
-        // events arrive decoded, in order; the ended stream is Ok(()).
-        let server = MockServer::start_async().await;
-        let sse = ": ok\n\n\
-                   event: activity.changed\n\
-                   data: {\"shed\":\"proj\",\"slug\":\"cdx777\",\"activity\":\"working\",\"state\":\"ready\"}\n\n\
-                   event: session.updated\n\
-                   data: {\"shed\":\"proj\",\"slug\":\"cdx777\",\"session\":{\"state\":\"ready\",\"activity\":\"idle\"}}\n\n";
-        server
-            .mock_async(|w, t| {
-                w.method(GET)
-                    .path("/api/rc/events")
-                    .header("accept", "text/event-stream");
-                t.status(200)
-                    .header("content-type", "text/event-stream")
-                    .body(sse);
-            })
-            .await;
-        let sink = RecordingRcSink::default();
-        client(&server).rc_events(&sink).await.unwrap();
-        let evs = sink.events();
-        assert_eq!(evs.len(), 2, "got {evs:?}");
-        match &evs[0] {
-            RcEvent::ActivityChanged {
-                shed,
-                slug,
-                activity,
-                ..
-            } => {
-                assert_eq!(shed, "proj");
-                assert_eq!(slug, "cdx777");
-                assert_eq!(*activity, Some(crate::rc::RcActivity::Working));
-            }
-            other => panic!("wrong first event: {other:?}"),
-        }
-        match &evs[1] {
-            RcEvent::SessionUpdated { removed, .. } => assert!(!removed),
-            other => panic!("wrong second event: {other:?}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn rc_events_skips_malformed_and_unknown_frames_without_ending_stream() {
-        // An unknown event name, a non-JSON payload, and a frame missing its
-        // required keys are each skipped (parse_rc_event → None) — the stream
-        // keeps going and a LATER valid event is still delivered, then Ok.
-        let server = MockServer::start_async().await;
-        let sse = "event: totally.unknown\ndata: {\"shed\":\"p\"}\n\n\
-                   event: activity.changed\ndata: not-json\n\n\
-                   event: activity.changed\ndata: {\"shed\":\"p\"}\n\n\
-                   event: message.appended\ndata: {\"shed\":\"p\",\"slug\":\"s\",\"seq\":7}\n\n";
-        server
-            .mock_async(|w, t| {
-                w.method(GET).path("/api/rc/events");
-                t.status(200).body(sse);
-            })
-            .await;
-        let sink = RecordingRcSink::default();
-        client(&server).rc_events(&sink).await.unwrap();
-        assert_eq!(
-            sink.events(),
-            vec![RcEvent::MessageAppended {
-                shed: "p".into(),
-                slug: "s".into(),
-                seq: 7,
-            }]
-        );
-    }
-
-    #[tokio::test]
-    async fn rc_events_clean_eof_flushes_final_unterminated_record() {
-        // A final record with no trailing blank line is flushed to the sink
-        // via parser.finish() on EOF — delivered, not dropped.
-        let server = MockServer::start_async().await;
-        server
-            .mock_async(|w, t| {
-                w.method(GET).path("/api/rc/events");
-                t.status(200)
-                    .body("event: shed.stopped\ndata: {\"shed\":\"p\"}");
-            })
-            .await;
-        let sink = RecordingRcSink::default();
-        client(&server).rc_events(&sink).await.unwrap();
-        assert_eq!(
-            sink.events(),
-            vec![RcEvent::ShedStopped { shed: "p".into() }]
-        );
-    }
-
-    #[tokio::test]
-    async fn rc_events_oversized_event_is_an_error() {
-        // The capped parser (with_max_event_bytes + try_feed — the broker
-        // bus's convention): an event exceeding the cap ends the stream as an
-        // error (the watcher reconnects with a fresh parser), never buffers
-        // on. Cap injected via the private seam so the test body stays small.
-        let server = MockServer::start_async().await;
-        let sse = format!("event: activity.changed\ndata: {}\n\n", "x".repeat(1024));
-        server
-            .mock_async(|w, t| {
-                w.method(GET).path("/api/rc/events");
-                t.status(200).body(sse);
-            })
-            .await;
-        let sink = RecordingRcSink::default();
-        let err = client(&server)
-            .rc_events_with_limits(&sink, Duration::from_secs(5), 64)
-            .await
-            .unwrap_err();
-        match err {
-            ShedError::Transport(msg) => {
-                assert!(msg.contains("exceeded 64 bytes"), "got: {msg}");
-            }
-            other => panic!("expected Transport overflow, got {other:?}"),
-        }
-        assert!(sink.events().is_empty());
-    }
-
-    #[tokio::test]
-    async fn rc_events_401_remints_and_retries_once() {
-        // The rc-events connect runs the SAME classify → invalidate → one
-        // re-mint → retry path as a unary request (it used to surface the 401
-        // after invalidating only a bearer token — which is `None` in mtls
-        // state, so a refused certificate could never recover there).
-        let server = MockServer::start_async().await;
-        let stale = server
-            .mock_async(|w, t| {
-                w.method(GET)
-                    .path("/api/rc/events")
-                    .header("authorization", "Bearer tok-1");
-                t.status(401);
-            })
-            .await;
-        let fresh = server
-            .mock_async(|w, t| {
-                w.method(GET)
-                    .path("/api/rc/events")
-                    .header("authorization", "Bearer tok-2");
-                t.status(200)
-                    .header("content-type", "text/event-stream")
-                    .body(": ok\n\nevent: activity.changed\ndata: {\"shed\":\"proj\",\"slug\":\"cdx777\",\"activity\":\"working\",\"state\":\"ready\"}\n\n");
-            })
-            .await;
-        let minter = Arc::new(SeqMinter {
-            calls: AtomicUsize::new(0),
-        });
-        let c = Client::new(
-            server.base_url(),
-            "mini2".into(),
-            String::new(),
-            None,
-            Some(minter.clone()),
-        )
-        .unwrap();
-        let sink = RecordingRcSink::default();
-        c.rc_events(&sink).await.unwrap();
-        assert_eq!(sink.events().len(), 1, "the retried stream delivered");
-        assert_eq!(stale.hits_async().await, 1, "exactly one rejected attempt");
-        assert_eq!(fresh.hits_async().await, 1, "exactly one retry");
-        assert_eq!(minter.calls.load(Ordering::SeqCst), 2, "one re-mint");
-    }
-
-    #[tokio::test]
-    async fn rc_events_401_that_survives_the_remint_is_surfaced_once() {
-        // At-most-once: when the retry is refused too, rc_events surfaces the
-        // status rather than looping. The watcher owns the reconnect.
-        let server = MockServer::start_async().await;
-        let m = server
-            .mock_async(|w, t| {
-                w.method(GET).path("/api/rc/events");
-                t.status(401);
-            })
-            .await;
-        let minter = Arc::new(SeqMinter {
-            calls: AtomicUsize::new(0),
-        });
-        let c = Client::new(
-            server.base_url(),
-            "mini2".into(),
-            String::new(),
-            None,
-            Some(minter.clone()),
-        )
-        .unwrap();
-        let sink = RecordingRcSink::default();
-        let err = c.rc_events(&sink).await.unwrap_err();
-        assert!(matches!(err, ShedError::BadStatus(401)), "got {err:?}");
-        assert_eq!(m.hits_async().await, 2, "one attempt + one retry, no more");
-        assert!(sink.events().is_empty());
-        assert_eq!(minter.calls.load(Ordering::SeqCst), 2);
-    }
-
-    #[tokio::test]
-    async fn rc_events_connection_open_timeout() {
-        // A server that accepts but never responds trips the connection-open
-        // timeout (the same idle duration bounds the initial send).
-        let server = MockServer::start_async().await;
-        server
-            .mock_async(|w, t| {
-                w.method(GET).path("/api/rc/events");
-                t.status(200).body(": ok\n\n").delay(Duration::from_secs(2));
-            })
-            .await;
-        let sink = RecordingRcSink::default();
-        let err = client(&server)
-            .rc_events_with_idle(&sink, Duration::from_millis(150))
-            .await
-            .unwrap_err();
-        match err {
-            ShedError::Transport(msg) => assert!(msg.contains("connect"), "got: {msg}"),
-            other => panic!("expected Transport connect timeout, got {other:?}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn rc_events_idle_timeout_fires_on_a_silent_stream() {
-        // Mid-stream silence: the server delivers one event then goes quiet
-        // while HOLDING the socket open (a silently-dead connection — the case
-        // the watchdog exists for). httpmock can't hold a stream open, so this
-        // uses the raw-TCP helper. The pre-silence event was delivered; the
-        // silence surfaces as the idle-timeout Transport error. Margin: the
-        // 2s silence is ~7x the 300ms idle, so the timeout fires well inside
-        // the quiet stretch even on a loaded worker.
-        let (base, server) = spawn_sse_server(|s| {
-            use std::io::Write;
-            s.write_all(b": ok\n\nevent: hub.unavailable\ndata: {\"shed\":\"p\"}\n\n")
-                .unwrap();
-            std::thread::sleep(Duration::from_secs(2)); // silence >> idle
-        });
-        let c = Client::new(base, "mini2".into(), String::new(), None, None).unwrap();
-        let sink = RecordingRcSink::default();
-        let err = c
-            .rc_events_with_idle(&sink, Duration::from_millis(300))
-            .await
-            .unwrap_err();
-        match err {
-            ShedError::Transport(msg) => assert!(msg.contains("idle timeout"), "got: {msg}"),
-            other => panic!("expected Transport idle timeout, got {other:?}"),
-        }
-        assert_eq!(
-            sink.events(),
-            vec![RcEvent::HubUnavailable { shed: "p".into() }]
-        );
-        join_sse_server(server).await;
-    }
-
-    #[tokio::test]
-    async fn rc_events_heartbeat_comments_reset_the_idle_timer() {
-        // AC#8, the panel-critical pin: comment-only `: heartbeat` frames must
-        // NOT trip the idle timer, even though the parser swallows them
-        // without emitting an event — the timer wraps the BYTE-chunk future.
-        // Real streaming gaps via the raw-TCP helper: 2.5s of comment-only
-        // traffic (25 × 100ms) against a 1.5s idle. Margins (both directions,
-        // CI-scheduling-safe): an event-level timer fires deterministically —
-        // zero parsed events for 2.5s, a full 1s past the idle window — while
-        // a false-fail of the byte-level timer needs the writer thread
-        // descheduled >1.5s, 15× its 100ms cadence. The event after the quiet
-        // stretch still arrives, then clean EOF → Ok.
-        let (base, server) = spawn_sse_server(|s| {
-            use std::io::Write;
-            s.write_all(b": ok\n\n").unwrap();
-            for _ in 0..25 {
-                std::thread::sleep(Duration::from_millis(100));
-                s.write_all(b": heartbeat\n\n").unwrap();
-            }
-            s.write_all(b"event: shed.stopped\ndata: {\"shed\":\"p\"}\n\n")
-                .unwrap();
-        });
-        let c = Client::new(base, "mini2".into(), String::new(), None, None).unwrap();
-        let sink = RecordingRcSink::default();
-        c.rc_events_with_idle(&sink, Duration::from_millis(1500))
-            .await
-            .unwrap();
-        assert_eq!(
-            sink.events(),
-            vec![RcEvent::ShedStopped { shed: "p".into() }]
-        );
-        join_sse_server(server).await;
-    }
-
-    #[tokio::test]
-    async fn rc_events_connect_timeout_covers_a_hung_bearer_mint() {
-        // The connect bound wraps the WHOLE connect phase, bearer resolution
-        // included: a foreign TokenMinter that never resolves must surface as
-        // the connect timeout, not hang rc_events forever. (The mint pends
-        // before any dial, so the unroutable base URL is never touched.)
-        struct NeverMinter;
-        #[async_trait::async_trait]
-        impl TokenMinter for NeverMinter {
-            async fn mint(&self, _server: &str) -> Result<MintedToken, ShedError> {
-                std::future::pending().await
-            }
-        }
-        let c = Client::new(
-            "http://127.0.0.1:9".into(),
-            "s".into(),
-            String::new(),
-            None,
-            Some(Arc::new(NeverMinter)),
-        )
-        .unwrap();
-        let sink = RecordingRcSink::default();
-        let err = c
-            .rc_events_with_idle(&sink, Duration::from_millis(100))
-            .await
-            .unwrap_err();
-        match err {
-            // Either message is a correct answer, and both are the SAME bound:
-            // credential resolution is now bounded inside the connect phase
-            // (`send_resolved`), so the inner timer usually wins the race with
-            // the outer one. What this pins is that a never-resolving mint ends
-            // the call instead of hanging it.
-            ShedError::Transport(msg) => assert!(
-                msg.contains("credential resolution timed out") || msg.contains("connect"),
-                "got: {msg}"
-            ),
-            other => panic!("expected a Transport timeout, got {other:?}"),
-        }
     }
 
     #[tokio::test]
@@ -3370,7 +2356,6 @@ mod tests {
         // The bearer resolution in request() is bounded by the request's own
         // timeout: a foreign TokenMinter that never resolves must surface as an
         // error within the bound, not hang every JSON/lifecycle call. Mirrors
-        // rc_events_connect_timeout_covers_a_hung_bearer_mint for the JSON path.
         struct NeverMinter;
         #[async_trait::async_trait]
         impl TokenMinter for NeverMinter {
@@ -3402,25 +2387,6 @@ mod tests {
             ShedError::Transport(msg) => assert!(msg.contains("credential"), "got: {msg}"),
             other => panic!("expected Transport credential timeout, got {other:?}"),
         }
-    }
-
-    #[tokio::test]
-    async fn rc_events_non_200_success_status_is_bad_status() {
-        // Exactly-200 contract: SSE lives in a 200 response body. A 204/206
-        // minted by an intermediary carries no event stream — any-2xx
-        // acceptance would end as a silent empty-stream Ok, masking the fault
-        // from the watcher's Down/backoff signal.
-        let server = MockServer::start_async().await;
-        server
-            .mock_async(|w, t| {
-                w.method(GET).path("/api/rc/events");
-                t.status(204);
-            })
-            .await;
-        let sink = RecordingRcSink::default();
-        let err = client(&server).rc_events(&sink).await.unwrap_err();
-        assert!(matches!(err, ShedError::BadStatus(204)), "got {err:?}");
-        assert!(sink.events().is_empty());
     }
 }
 
@@ -3966,22 +2932,14 @@ mod mtls_tests {
         );
     }
 
-    // ---- The SSE streams take the SAME re-auth path (FIX 2) ----
+    // ---- The create SSE stream takes the SAME re-auth path (FIX 2) ----
     //
-    // Both streams used to bypass the classifier entirely: `rc_events` and
-    // `create_stream` flattened a TLS error and returned, and their 401 handling
-    // invalidated a BEARER token — which is `None` in mtls state. A revoked or
-    // expired certificate therefore left every stream permanently failing, with
-    // the provider still holding the refused credential. Each test below drives
-    // one stream through one rejection and asserts it recovers EXACTLY once.
-
-    #[derive(Default)]
-    struct RcSink(Mutex<Vec<crate::rc_events::RcEvent>>);
-    impl RcEventSink for RcSink {
-        fn on_event(&self, ev: crate::rc_events::RcEvent) {
-            self.0.lock().unwrap().push(ev);
-        }
-    }
+    // `create_stream` used to bypass the classifier entirely: it flattened a TLS
+    // error and returned, and its 401 handling invalidated a BEARER token —
+    // which is `None` in mtls state. A revoked or expired certificate therefore
+    // left the stream permanently failing, with the provider still holding the
+    // refused credential. The test below drives the stream through one rejection
+    // and asserts it recovers EXACTLY once.
 
     #[derive(Default)]
     struct CreateLog {
@@ -4042,39 +3000,6 @@ mod mtls_tests {
     /// puts an exhausted ladder far below anything that would be noticed.
     const TLS_ALERT_ATTEMPTS: usize = 20;
 
-    /// Did this outcome carry the ambiguous shape rather than the alert the
-    /// cell is pinning?
-    fn is_ambiguous(e: &ShedError) -> bool {
-        matches!(e, ShedError::Transport(m) if crate::authfail::is_connection_lost_message(m))
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn rc_events_recovers_from_a_tls_alert_rejection_exactly_once() {
-        for attempt in 0..=TLS_ALERT_ATTEMPTS {
-            let (srv, minter, provider) = tls_alert_setup().await;
-            let c = client_for(&srv, provider.clone());
-            // The re-mint issues a VALID certificate, so the retry authenticates.
-            let sink = RcSink::default();
-            match c.rc_events(&sink).await {
-                Err(ref e) if is_ambiguous(e) && attempt < TLS_ALERT_ATTEMPTS => continue,
-                other => other.expect("the stream must recover"),
-            }
-            assert_eq!(
-                sink.0.lock().unwrap().len(),
-                1,
-                "the retried stream delivered"
-            );
-            assert_eq!(minter.calls(), 2, "exactly one re-mint");
-            assert_eq!(
-                provider.credential().await.unwrap().cert_serial,
-                "2",
-                "the refused certificate must not still be cached"
-            );
-            return;
-        }
-        unreachable!("the loop returns or exhausts into expect()");
-    }
-
     #[tokio::test(flavor = "multi_thread")]
     async fn create_recovers_from_a_tls_alert_rejection_exactly_once() {
         for attempt in 0..=TLS_ALERT_ATTEMPTS {
@@ -4122,15 +3047,6 @@ mod mtls_tests {
         get(&c).await.unwrap();
         srv.set_mode(ServerAuthMode::MtlsAllow(vec!["SHA256:client-2".into()]));
         (srv, minter, provider, c)
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn rc_events_recovers_from_a_401_rejection_exactly_once() {
-        let (_srv, minter, _provider, c) = revoked_setup().await;
-        let sink = RcSink::default();
-        c.rc_events(&sink).await.expect("the stream must recover");
-        assert_eq!(sink.0.lock().unwrap().len(), 1);
-        assert_eq!(minter.calls(), 2, "exactly one re-mint");
     }
 
     #[tokio::test(flavor = "multi_thread")]

@@ -1240,11 +1240,13 @@ pub enum RoostUpdate {
 
 /// A reconnecting **observer** over one roost-session's inventory.
 ///
-/// Deliberately the same shape as [`crate::machine::MachineHubWatcher`]:
 /// [`spawn`] starts the loop and hands back the receiver, [`stop`] (and `Drop`)
-/// aborts it, and it is not restartable. The backoff is the same shared
-/// schedule with the same reset-on-worked rule, so a roost row and a hub row in
-/// one sessions view go stale at the same rate.
+/// aborts it, and it is not restartable — the shape the retired
+/// `MachineHubWatcher` shared with it. The backoff is this crate's private
+/// `backoff` module (no longer `pub`: plan 022 (S6, `charliek/shed#328`) took
+/// its second consumer, so it is not linkable from public docs) — the shared
+/// schedule with its reset-on-worked rule, so every row in one sessions view
+/// goes stale at the same rate.
 ///
 /// **Nothing here has a cadence.** Since roost R1 a subscribe is a plain
 /// request — since session protocol 5 it takes no token and there is no such thing
@@ -4949,9 +4951,7 @@ except Exception:
     fn write_exec_ssh(dir: &Path, env: &[(&str, String)]) -> PathBuf {
         let assignments = env
             .iter()
-            .map(|(key, value)| {
-                format!("{key}={}", shed_core::rc_agents::shell_quote_always(value))
-            })
+            .map(|(key, value)| format!("{key}={}", shed_core::machine::shell_quote_always(value)))
             .collect::<Vec<_>>()
             .join(" ");
         let script = format!(

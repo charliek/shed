@@ -46,7 +46,7 @@ libc = "0.2"
 # tests — `shed-app`'s roost watcher/reach tests. NON-default and named
 # `test-support` so it is unmistakable: the module is `#[cfg]`'d in only under
 # `test` or this feature, so a shipped binary never carries it. Mirrors the same
-# feature on `shed-app` / `shed-rc-engine`.
+# feature on `shed-app`.
 test-support = []
 
 [dev-dependencies]

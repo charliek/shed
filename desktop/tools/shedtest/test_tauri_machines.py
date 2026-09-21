@@ -28,11 +28,9 @@ BEFORE the tests that mutate the fake's tabs.
 
 from __future__ import annotations
 
-import json
 import os
 import platform
 import shutil
-import socket
 import subprocess
 import tempfile
 import time
@@ -51,10 +49,6 @@ pytestmark = pytest.mark.skipif(
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
 
-# The identity token a real hub returns from /v1/health (Go `rc.HubAppID`). Still
-# here because the app HOSTS a hub (S6 retires that); it no longer READS one.
-HUB_APP_ID = "shed-rc-hub"
-
 # mini3's baseline tabs. An agent tab and a plain shell tab, which is what a real
 # roost-session looks like — the shed-recorded vector these are built from
 # carries exactly that pair.
@@ -63,12 +57,6 @@ SHELL_TAB = 3
 OC_CWD = "/home/shed/oc-work"
 OC_TITLE = "OC | exact pong reply"
 OC_SESSION = "ses_f8510bbf0ffePFCHCY6iyzAieq"
-
-
-def _free_port() -> int:
-    with socket.socket() as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
 
 
 def _machine_rows(app: TauriClient, machine: str | None = None) -> list[dict]:
@@ -1008,107 +996,6 @@ def test_a_stopping_session_goes_stale_with_its_reason_and_then_recovers(
     back = _machine_rows(machine_app, "mini3")
     assert [r["slug"] for r in back] == ["7"], f"the re-listed row set: {back}"
     assert back[0]["stale"] is False
-
-
-# ---------------------------------------------------------------------------
-# The app HOSTING the rc hub (plan 012 S4 / roadmap R4's hub-home graduation)
-# ---------------------------------------------------------------------------
-
-
-def test_the_app_hosts_the_rc_hub_when_it_brokers_in_process(mock, tmp_path):
-    """**R4's hub-home graduation, proven end to end.**
-
-    The rc-hub role moved out of the `shed-host-agent` bin into
-    `shed_broker::rc_hub::role` so a second consumer could host it. This is that
-    consumer: with no daemon to broker for it, the app runs the broker
-    in-process — and now the hub with it, from the same code the daemon runs.
-
-    Hosting, not reading: since plan 013 the app's own machine rows come from
-    roost, and this hub is what `sx watch` and the phone read FROM it. S6 retires
-    it.
-
-    Hermetic on two axes: `SHED_TAURI_HOST_AGENT_SOCKET` is cleared so the app
-    resolves EMBEDDED mode (rather than dialling a real daemon), and
-    `SHED_RC_HUB_ADDR` pins the hub to an ephemeral port instead of the
-    production 1029 — otherwise this test would fight a real daemon on the
-    developer's machine and two concurrent runs would fight each other.
-    """
-    import http.client
-
-    cfg = ui._SUBPROC["tauri"]
-    runtime_dir = Path(tempfile.mkdtemp(prefix="shed-e2e-hub-"))
-    hub_port = _free_port()
-    try:
-        shed_config = runtime_dir / "config.yaml"
-        shutil.copyfile(FIXTURES / "config.yaml", shed_config)
-
-        env = ui.subproc_env(
-            cfg,
-            runtime_dir=runtime_dir,
-            mock_base_url=mock.base_url,
-            config_path=shed_config,
-            host_agent_socket=None,
-        )
-        # No desktop socket => no daemon => EMBEDDED mode, which is the mode that
-        # hosts the hub. (subproc_env only sets the key when given one; clear an
-        # inherited value so None really means "no daemon".)
-        env.pop("SHED_TAURI_HOST_AGENT_SOCKET", None)
-        env.pop("SHED_HOST_AGENT_SOCKET_DIR", None)
-        # Pin the hub off the production port — see the docstring.
-        env["SHED_RC_HUB_ADDR"] = f"127.0.0.1:{hub_port}"
-
-        sock = runtime_dir / cfg.sock_rel
-        log = runtime_dir / "hub-ui.log"
-        log_fh = open(log, "wb")
-        proc = subprocess.Popen(
-            [str(cfg.binary)], env=env, stdout=log_fh, stderr=subprocess.STDOUT
-        )
-        try:
-            ui.await_hermetic(
-                "tauri", sock=sock, mock_base_url=mock.base_url, proc=proc, log=log
-            )
-            client = TauriClient(sock)
-            try:
-                # The app must SERVE the hub wire: identity, and a snapshot. This
-                # is the same `/v1` surface `sx watch` and the phone read, so a
-                # pass here means the app is a real hub host, not a stub.
-                def hub_answers() -> bool:
-                    try:
-                        conn = http.client.HTTPConnection("127.0.0.1", hub_port, timeout=2)
-                        conn.request("GET", "/v1/health")
-                        body = json.loads(conn.getresponse().read())
-                        conn.close()
-                        return body.get("app") == HUB_APP_ID
-                    except OSError:
-                        return False
-
-                client.wait_until(
-                    hub_answers, timeout=60, what="the app's hub to answer /v1/health"
-                )
-
-                conn = http.client.HTTPConnection("127.0.0.1", hub_port, timeout=5)
-                conn.request("GET", "/v1/sessions")
-                snapshot = json.loads(conn.getresponse().read())
-                conn.close()
-                assert "sessions" in snapshot, f"the hub served no snapshot: {snapshot!r}"
-            finally:
-                client.close()
-        finally:
-            ui.terminate(proc)
-            log_fh.close()
-            # The hub must go away with the app — a leaked listener would hold the
-            # port for every later run.
-            deadline = time.monotonic() + 10
-            while time.monotonic() < deadline:
-                try:
-                    with socket.create_connection(("127.0.0.1", hub_port), timeout=0.25):
-                        time.sleep(0.1)
-                except OSError:
-                    break
-            else:
-                pytest.fail("the hub still answers after the app exited")
-    finally:
-        shutil.rmtree(runtime_dir, ignore_errors=True)
 
 
 # ---------------------------------------------------------------------------

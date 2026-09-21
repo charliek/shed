@@ -1,13 +1,13 @@
 //! The reconnect schedule shared by every long-lived feed watcher in this
 //! crate: 500 ms doubling to a 30 s ceiling.
 //!
-//! It lives in one place because two modules — [`crate::rc_events_watcher`]
-//! (the shed server's aggregate SSE stream) and [`crate::machine`] (a machine's
-//! hub) — both document their schedules as *deliberately identical*, so that a
-//! shed row and a machine row in the same unified sessions view go stale at the
-//! same rate. Two copies of the constants made that claim true only by
-//! convention: each had its own numeric test, and neither could catch one side
-//! drifting. Here it is true by construction.
+//! It lives in one place because several watchers document their schedules as
+//! *deliberately identical*, so that every row in one unified sessions view
+//! goes stale at the same rate — today that is [`crate::roost`]'s observer, and
+//! it was the rc-events and machine-hub watchers before plan 022 (S6,
+//! `charliek/shed#328`) retired them. A copy of the constants per watcher made
+//! that claim true only by convention: each had its own numeric test, and
+//! neither could catch one side drifting. Here it is true by construction.
 //!
 //! Ported from mobile's `liveActivityProvider` retry timer
 //! (`providers.dart:238-239, 325-332`), which is the original both watchers

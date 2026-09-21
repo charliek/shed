@@ -38,11 +38,12 @@ place that spells the difference out:
   recording exercises deterministically — `note_gap`, `reset`, `seed_approvals`,
   a re-ask reopening a resolved entry.
 
-The helpers in `src/helpers.rs` are **copied** from `shed-broker::rc_hub`, not
-linked: `rc_hub::watch` imports `shed_rc_engine::tmux::Tmux`, so linking would
-drag the RC engine and the hub into a crate that only speaks HTTP. The
-duplication is deliberate and temporary — the hub's copy goes away with the rest
-of its opencode watcher.
+The helpers in `src/helpers.rs` were **copied** from `shed-broker::rc_hub`
+rather than linked: `rc_hub::watch` imported `shed_rc_engine::tmux::Tmux`, so
+linking would have dragged the RC engine and the hub into a crate that only
+speaks HTTP. Plan 022 (S6, `charliek/shed#328`) deleted the hub, so this is now
+the only copy; `fixtures/opencode_turn.golden.json` is what still pins it
+against what the hub produced.
 
 Three differences from the hub are deliberate (plan 015 §3.2), and documented at
 each site in `src/fold.rs`:

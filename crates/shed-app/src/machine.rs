@@ -1,31 +1,36 @@
-//! **The machine transport seam** and the long-lived hub watcher on top of it
-//! (plan 012, roadmap R4).
+//! **The machine transport seam** (plan 012, roadmap R4).
 //!
 //! `machines:` has existed in [`shed_core::config`] since plan 009, but for two
 //! plans the only thing that read it was the `sx` porcelain. This module is the
 //! shared half the clients consume: the pure addressing lives in
-//! [`shed_core::machine`], the hub wire in [`shed_core::hub_client`], and what
-//! is left — the part that genuinely differs per client — is exactly one thing.
+//! [`shed_core::machine`], and what is left — the part that genuinely differs
+//! per client — is exactly one thing.
+//!
+//! The long-lived hub watcher that used to sit on top of this seam went with the
+//! RC hub in plan 022 (S6, `charliek/shed#328`), and `shed_core`'s hub wire
+//! module went with it. What consumes the seam today is the agent lane: the
+//! roost watcher ([`crate::roost`]) and the desktop's per-session opencode/gx
+//! forwards.
 //!
 //! ## The seam is a local port, and nothing above it is per-client
 //!
-//! A machine's hub answers on ITS `127.0.0.1:1029`, so every client needs some
-//! way to get a local socket that proxies there. That is the whole of the
-//! difference:
+//! What a client needs to reach is a loopback port on the FAR side — an agent's
+//! HTTP server, a `roost-session` socket — so every client needs some way to get
+//! a local socket that proxies there. That is the whole of the difference:
 //!
 //! | client | how it gets the port |
 //! |---|---|
-//! | `sx`, Tauri | [`SshForward`] — an `ssh -N -L` child process |
+//! | Tauri | [`SshForward`] — an `ssh -N -L` child process |
 //! | shed-mobile | a `dartssh2` local-forward bridge on the Dart side; Rust is handed the port ([`FixedPort`]) |
 //!
-//! Everything above the port — health probing, the snapshot, the SSE feed,
-//! reconnect/backoff/resync — is shared, which is why [`MachineHubWatcher`]
-//! takes a `dyn MachineForward` and never learns which kind it has.
+//! Everything above the port — health probing, the snapshot, the event feed,
+//! reconnect/backoff/resync — is shared, which is why a watcher takes a
+//! `dyn MachineForward` and never learns which kind it has.
 //!
 //! Note mobile does NOT implement this trait from Dart: it stands the bridge up
 //! itself and passes the resulting `u16` into [`FixedPort`]. Rust never calls
 //! into Dart, matching the inverted shape shed-mobile already uses for one-shot
-//! RC exec (Rust builds argv, Dart runs it, Rust decodes).
+//! remote exec (Rust builds argv, Dart runs it, Rust decodes).
 //!
 //! ## The port is STABLE across a re-establish — the load-bearing invariant
 //!
@@ -40,14 +45,14 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use tokio::sync::mpsc;
-
-use shed_core::hub_client::{HubClient, HubError, HUB_PORT};
 use shed_core::machine;
-use shed_core::rc::RcSessionDto;
-use shed_core::rc_events::RcEvent;
 
-use crate::backoff;
+/// An arbitrary far-side loopback port for the tests (and the faked-`ssh` seam)
+/// that only care that a forward carries whatever port it was handed. It was
+/// the RC hub's fixed `1029` until S6 (`charliek/shed#328`) removed the last
+/// caller with a constant far side.
+#[cfg(test)]
+const SOME_REMOTE_PORT: u16 = 1029;
 
 /// How long to wait for a freshly-established forward's local end to answer.
 const FORWARD_READY_TIMEOUT: Duration = Duration::from_secs(10);
@@ -129,7 +134,7 @@ impl MachineForward for FixedPort {
 }
 
 /// An `ssh -N -L <port>:127.0.0.1:<remote> <machine>` child process — the
-/// desktop implementation, shared by `sx` and the Tauri app.
+/// desktop implementation.
 ///
 /// The child is killed and reaped on drop, so an early return or a Ctrl-C can
 /// never leave a forward running. `ensure` respawns onto the SAME local port
@@ -137,12 +142,13 @@ impl MachineForward for FixedPort {
 /// lost race for that port is an immediate visible failure rather than a tunnel
 /// that silently forwards nothing.
 ///
-/// The REMOTE port is per-forward rather than a constant. It was
-/// [`shed_core::hub_client::HUB_PORT`] for as long as the hub was the only thing
-/// on the far side; plan 015's opencode lane forwards a loopback port an agent
-/// chose and roost reported, which is a different number per session and cannot
-/// be known at compile time. [`SshForward::reserve`] keeps the hub's meaning;
-/// [`SshForward::reserve_for`] takes the port.
+/// The REMOTE port is per-forward rather than a constant. It was the RC hub's
+/// fixed `1029` for as long as the hub was the only thing on the far side; plan
+/// 015's opencode lane forwards a loopback port an agent chose and roost
+/// reported, which is a different number per session and cannot be known at
+/// compile time — and with the hub deleted in plan 022 (S6,
+/// `charliek/shed#328`) there is no constant left to default to. Every caller
+/// names the far side through [`SshForward::reserve_for`].
 pub struct SshForward {
     entry: shed_core::config::MachineEntry,
     port: u16,
@@ -170,25 +176,18 @@ pub struct SshForward {
 }
 
 impl SshForward {
-    /// Reserve a local port for this machine's hub. Nothing is spawned until
-    /// [`MachineForward::ensure`] runs.
+    /// Reserve a local port forwarding to `remote_port` on the machine's
+    /// loopback. Nothing is spawned until [`MachineForward::ensure`] runs.
     ///
-    /// The port is grabbed the way the engine allocates opencode's: bind `:0`,
-    /// read the assignment, release. Racy in principle — and deliberately so,
-    /// because the alternative (holding the socket) is what would prevent ssh
-    /// from binding it at all.
-    pub fn reserve(entry: shed_core::config::MachineEntry) -> Result<Self, ForwardError> {
-        Self::reserve_for(entry, HUB_PORT)
-    }
-
-    /// Reserve a local port forwarding to an ARBITRARY loopback port on the
-    /// machine — [`SshForward::reserve`] with the far side named.
+    /// The local port is grabbed the cheap way: bind `:0`, read the assignment,
+    /// release. Racy in principle — and deliberately so, because the
+    /// alternative (holding the socket) is what would prevent ssh from binding
+    /// it at all.
     ///
-    /// This is the opencode lane's door (plan 015 §3.4): the agent's HTTP server
-    /// binds an ephemeral loopback port, roost reports it as `server_url`, and
-    /// the desktop needs a local socket that lands on exactly that one. Nothing
-    /// else changes — same reservation, same child lifecycle, same stable local
-    /// port.
+    /// This is the opencode/gx lane's door (plan 015 §3.4): the agent's HTTP
+    /// server binds an ephemeral loopback port, roost reports it as
+    /// `server_url`, and the desktop needs a local socket that lands on exactly
+    /// that one.
     pub fn reserve_for(
         entry: shed_core::config::MachineEntry,
         remote_port: u16,
@@ -222,7 +221,7 @@ impl SshForward {
         entry: shed_core::config::MachineEntry,
         exec_prefix: Vec<String>,
     ) -> Result<Self, ForwardError> {
-        Self::reserve_faked_for(entry, HUB_PORT, exec_prefix)
+        Self::reserve_faked_for(entry, SOME_REMOTE_PORT, exec_prefix)
     }
 
     /// [`SshForward::reserve_faked`] against an arbitrary far-side port — the
@@ -482,72 +481,24 @@ async fn run_with_deadline(
     timeout: Duration,
     label: &str,
 ) -> Result<std::process::Output, String> {
-    run_with_deadline_stdin(argv, timeout, label, None).await
-}
-
-/// [`run_with_deadline`], plus a payload written to the child's stdin.
-///
-/// Only `create` needs this: a kickoff prompt rides stdin rather than argv so it
-/// can contain anything at all. The write happens on the SAME blocking task that
-/// waits, because a payload larger than the pipe buffer would otherwise block a
-/// writer nobody is draining.
-async fn run_with_deadline_stdin(
-    argv: &[String],
-    timeout: Duration,
-    label: &str,
-    stdin: Option<String>,
-) -> Result<std::process::Output, String> {
     let (bin, rest) = argv.split_first().expect("argv is never empty");
-    let mut child = std::process::Command::new(bin)
+    let child = std::process::Command::new(bin)
         .args(rest)
-        .stdin(match stdin {
-            Some(_) => std::process::Stdio::piped(),
-            None => std::process::Stdio::null(),
-        })
+        .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
         .map_err(|e| format!("{label}: running ssh: {e}"))?;
     let pid = child.id();
-    // The write runs on its OWN thread, concurrent with the wait below. Doing
-    // it inline before `wait_with_output` deadlocks in a real case: a payload
-    // larger than the stdin pipe buffer, against a child that fills stdout
-    // before draining stdin — neither side can progress and only the deadline
-    // breaks it. The join handle carries the write's own error, which is NOT
-    // discarded: a partially-written prompt that the far side still exits 0 on
-    // would otherwise be reported as a successful create of a session whose
-    // kickoff was truncated.
-    let writer = child.stdin.take().zip(stdin).map(|(mut w, payload)| {
-        std::thread::spawn(move || {
-            use std::io::Write as _;
-            let res = w.write_all(payload.as_bytes());
-            // Dropping the handle closes the pipe — the EOF a reader waits for.
-            drop(w);
-            res
-        })
-    });
     match tokio::time::timeout(
         timeout,
         tokio::task::spawn_blocking(move || child.wait_with_output()),
     )
     .await
     {
-        Ok(joined) => {
-            let out = joined
-                .map_err(|e| format!("{label}: {e}"))?
-                .map_err(|e| format!("{label}: running ssh: {e}"))?;
-            // Consulted only on an otherwise-successful run: when the command
-            // itself failed, its own exit tells a better story than a broken
-            // pipe caused by that failure.
-            if out.status.success() {
-                if let Some(w) = writer {
-                    if matches!(w.join(), Ok(Err(_)) | Err(_)) {
-                        return Err(format!("{label}: writing the payload to ssh failed"));
-                    }
-                }
-            }
-            Ok(out)
-        }
+        Ok(joined) => joined
+            .map_err(|e| format!("{label}: {e}"))?
+            .map_err(|e| format!("{label}: running ssh: {e}")),
         Err(_) => {
             // SIGKILL rather than SIGTERM: ssh with a wedged remote can ignore a
             // polite signal, and by here the caller has already given up. The
@@ -563,19 +514,17 @@ async fn run_with_deadline_stdin(
     }
 }
 
-/// Run one RC verb on a machine over SSH and return its stdout.
+/// Run one command on a machine over SSH and return its stdout.
 ///
-/// This is the CONTROL half of machine reach — the watcher above is the observe
-/// half. Kept here rather than in a client so `sx`, the desktop app and (via the
-/// pure builders) mobile all address a machine identically.
+/// The CONTROL half of machine reach. Kept here rather than in a client so the
+/// desktop and (via the pure builders in [`shed_core::machine`]) mobile address
+/// a machine identically.
 ///
-/// Deliberately NOT on `crate::rc`'s `RcRunner` seam: that lives behind the `rc`
-/// feature and this module must stay ungated for shed-mobile. The cost is a
-/// small duplicate spawn; the alternative is gating machine control out of the
-/// one client that most needs it.
-///
-/// A non-zero exit is mapped through the engine's exit-code classes, so a
-/// missing session reads the same as it does locally.
+/// **A non-zero exit reports the remote's stderr, or its STDOUT when stderr is
+/// empty.** That fallback is load-bearing and callers are built on it:
+/// `shed-gx`'s discovery probe exits 0 and reports in band precisely because a
+/// failure here could otherwise quote the token it just printed
+/// (`shed_gx::PROBE_SCRIPT`'s rule 1).
 pub async fn exec(
     entry: &shed_core::config::MachineEntry,
     remote_argv: &[String],
@@ -585,146 +534,22 @@ pub async fn exec(
     let out = run_with_deadline(&argv, EXEC_TIMEOUT, &label).await?;
 
     if !out.status.success() {
-        let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        let stderr = String::from_utf8_lossy(&out.stderr);
         let stdout = String::from_utf8_lossy(&out.stdout);
+        let detail = if stderr.trim().is_empty() {
+            stdout.trim()
+        } else {
+            stderr.trim()
+        };
+        let code = out.status.code().unwrap_or(-1);
         let bin = remote_argv.first().map(String::as_str).unwrap_or_default();
-        let err = shed_core::rc::error_from_exit_with_bin(
-            bin,
-            out.status.code().unwrap_or(-1),
-            &stderr,
-            &stdout,
-        );
-        return Err(format!("{label}: {err}"));
+        return Err(if detail.is_empty() {
+            format!("{label}: {bin} exited {code}")
+        } else {
+            format!("{label}: {detail}")
+        });
     }
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
-}
-
-/// The interactive `ssh -t … tmux attach` command that opens a machine session
-/// in a terminal — the machine counterpart of `Backend::terminal_preview`.
-///
-/// Returned as a [`TerminalCommand`] (argv PLUS the re-parseable quoted line)
-/// because a terminal opener is handed one string: a preset drops `command`
-/// into an AppleScript/`-e` invocation, so the quoting has to survive that trip
-/// intact. Same shape the shed path returns, so the caller above needs no idea
-/// which kind of target it is holding — which is the point.
-pub fn terminal_command(
-    entry: &shed_core::config::MachineEntry,
-    slug: &str,
-) -> shed_core::terminal::TerminalCommand {
-    let argv = machine::tty_argv(
-        entry,
-        &[
-            "tmux".to_string(),
-            "attach".to_string(),
-            "-t".to_string(),
-            shed_core::rc::tmux_name(slug),
-        ],
-    );
-    // The MINIMAL quoter for the outer line — `tty_argv` has already quoted the
-    // remote command internally (that is its safety property), and quoting the
-    // result again would be correct but unreadable. The shed path's line is
-    // built the same way, so a preview reads alike whichever kind it is.
-    let command = shed_core::terminal::quote_argv(&argv);
-    shed_core::terminal::TerminalCommand { argv, command }
-}
-
-/// Read a machine's RC capabilities: which kinds its engine advertises, which
-/// backing agents are actually installed, and the per-kind feature rows the UI
-/// renders controls from.
-///
-/// The one honest source for "what can I start here?" — a machine's answer
-/// differs from a shed's and from this Mac's, and guessing from the kind name is
-/// exactly the mistake the capability wire exists to prevent.
-/// Capabilities ride on the LIST envelope, so this is one `rc list` — the same
-/// call the watcher makes. An engine too old to advertise them answers with a
-/// list and no capabilities block, which is `None` rather than an error.
-pub async fn capabilities(
-    entry: &shed_core::config::MachineEntry,
-) -> Result<Option<shed_core::rc::RcCapabilities>, String> {
-    let prefix = shed_core::machine::rc_prefix(entry);
-    let mut argv = shed_core::rc::list_argv(prefix.last().expect("prefix is never empty"));
-    argv.splice(0..1, prefix.iter().cloned());
-    let out = exec(entry, &argv).await?;
-    Ok(shed_core::rc::decode_list_response(&out)
-        .map_err(|e| e.to_string())?
-        .capabilities)
-}
-
-/// Create a session on a machine, returning the created session.
-///
-/// `interactive_shell` is TRUE here and must be: the pane command is wrapped in
-/// `bash -ic` so a tool installed by a shell rc-file (mise, nvm, bun,
-/// `~/.local/bin`) is on PATH. Without it the pane inherits the bare ssh-exec
-/// PATH, the agent is not found, and the session comes up `dead` while the
-/// create still exits 0. A SHED must leave it off — there the sshd's own
-/// `bash -lc` wrap already supplies a login PATH. Same rule `sx` applies.
-pub async fn create(
-    entry: &shed_core::config::MachineEntry,
-    spec: MachineCreate<'_>,
-) -> Result<shed_core::rc::RcSessionDto, String> {
-    let prefix = shed_core::machine::rc_prefix(entry);
-    let (mut argv, stdin) = shed_core::rc::create_invocation_v2(&shed_core::rc::CreateSpec {
-        bin: prefix.last().expect("prefix is never empty"),
-        kind: spec.kind,
-        name: spec.name,
-        slug: spec.slug,
-        workdir: spec.workdir,
-        created_by: spec.created_by,
-        target: &format!("machine:{}", entry.name),
-        permission_mode: spec.permission_mode,
-        wait: true,
-        interactive_shell: true,
-        payload: match spec.prompt {
-            Some(p) => shed_core::rc::CreatePayload::Prompt(p),
-            None => shed_core::rc::CreatePayload::None,
-        },
-    })
-    .map_err(|e| e.to_string())?;
-    argv.splice(0..1, prefix.iter().cloned());
-
-    let ssh = shed_core::machine::ssh_argv(entry, &argv);
-    let label = format!("machine:{}", entry.name);
-    // `--wait` blocks on the far side while the agent comes up; the shared
-    // EXEC_TIMEOUT already has headroom over it.
-    let out = run_with_deadline_stdin(&ssh, EXEC_TIMEOUT, &label, stdin).await?;
-    if !out.status.success() {
-        let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
-        let stdout = String::from_utf8_lossy(&out.stdout);
-        let err = shed_core::rc::error_from_exit_with_bin(
-            prefix.last().map(String::as_str).unwrap_or_default(),
-            out.status.code().unwrap_or(-1),
-            &stderr,
-            &stdout,
-        );
-        return Err(format!("{label}: {err}"));
-    }
-    shed_core::rc::decode_session(&String::from_utf8_lossy(&out.stdout))
-        .map_err(|e| format!("{label}: {e}"))
-}
-
-/// What a machine create needs beyond the machine itself. A borrowed spec
-/// rather than eight positional arguments, so a caller cannot transpose two
-/// strings that happen to have the same type.
-pub struct MachineCreate<'a> {
-    pub kind: &'a shed_core::rc::RcKind,
-    pub name: &'a str,
-    pub slug: &'a str,
-    pub workdir: Option<&'a str>,
-    pub created_by: &'a str,
-    pub permission_mode: Option<&'a str>,
-    pub prompt: Option<&'a str>,
-}
-
-/// Kill a session on a machine (idempotent — the engine exits 0 for a session
-/// that is already gone).
-pub async fn kill(entry: &shed_core::config::MachineEntry, slug: &str) -> Result<(), String> {
-    let prefix = machine::rc_prefix(entry);
-    let mut argv = shed_core::rc::kill_argv(prefix.last().expect("prefix is never empty"), slug);
-    // The shed-core builders take a single `bin` for argv[0]; splice the full
-    // `<bin> rc` prefix back over it so a multi-token prefix stays separate argv
-    // words under the one quoter.
-    argv.splice(0..1, prefix.iter().cloned());
-    exec(entry, &argv).await.map(|_| ())
 }
 
 fn port_answers(port: u16) -> bool {
@@ -732,11 +557,6 @@ fn port_answers(port: u16) -> bool {
 }
 
 /// An unused loopback port: bind `:0`, read the assignment, release.
-///
-/// A deliberate second copy of `shed_rc_engine::free_loopback_port` rather than
-/// a call to it: that crate is behind the `rc` feature and THIS module must not
-/// be (shed-mobile links shed-app with default features). Four lines of
-/// duplication is the cheaper side of that trade.
 fn free_loopback_port() -> std::io::Result<u16> {
     let ln = std::net::TcpListener::bind("127.0.0.1:0")?;
     let port = ln.local_addr()?.port();
@@ -744,324 +564,13 @@ fn free_loopback_port() -> std::io::Result<u16> {
     Ok(port)
 }
 
-// ---------------------------------------------------------------------------
-// the long-lived watcher
-// ---------------------------------------------------------------------------
-
-/// One update from a [`MachineHubWatcher`].
-///
-/// Shaped to match [`crate::rc_events_watcher::RcWatcherUpdate`] so a unified
-/// sessions view folds both feeds through one consumer — a machine row and a
-/// shed row differ in where they came from, not in how they update.
-#[derive(Debug, Clone, PartialEq)]
-pub enum MachineHubUpdate {
-    /// A fresh connection's authoritative snapshot. Emitted on EVERY successful
-    /// connect, including the first.
-    ///
-    /// The hub's `/v1/sessions` is authoritative and the feed is a patch stream
-    /// on top of it, so a reconnect is a complete resync by construction — there
-    /// is no replay window to negotiate and no gap for the consumer to reason
-    /// about. This is why a backgrounded phone can simply stop the watcher and
-    /// restart it on foreground.
-    Snapshot { sessions: Vec<RcSessionDto> },
-    /// A decoded event from the live feed.
-    Event { event: RcEvent },
-    /// The feed is not up: the forward could not be established, the hub did not
-    /// answer, or a live stream ended. The watcher backs off and retries.
-    ///
-    /// **This is a normal state, not an error.** A machine that is asleep, off
-    /// the network, or simply has no hub running is expected, and the consumer
-    /// should render its rows as stale-with-a-reason rather than failing.
-    Down { reason: String },
-}
-
-/// A reconnecting watcher over one machine's hub.
-///
-/// Constructing it ([`spawn`]) starts the loop; dropping it (or [`stop`]) aborts
-/// it. Not restartable — build a new one per subscription, matching
-/// [`crate::rc_events_watcher::RcEventsWatcher`].
-///
-/// [`spawn`]: MachineHubWatcher::spawn
-/// [`stop`]: MachineHubWatcher::stop
-pub struct MachineHubWatcher {
-    machine: String,
-    task: tokio::task::JoinHandle<()>,
-}
-
-impl MachineHubWatcher {
-    /// Spawn the connect-snapshot-stream-retry loop for `forward` onto
-    /// `handle`, returning the handle and the update stream. `machine` names the
-    /// host to the consumer; the loop keys nothing off it.
-    pub fn spawn(
-        handle: &tokio::runtime::Handle,
-        forward: Arc<dyn MachineForward>,
-        machine: String,
-    ) -> (MachineHubWatcher, mpsc::UnboundedReceiver<MachineHubUpdate>) {
-        Self::spawn_inner(handle, forward, machine, BackoffSleeper::default())
-    }
-
-    /// [`spawn`](Self::spawn) with the backoff-sleep seam supplied — the real
-    /// clock (`BackoffSleeper::default()`) everywhere but the schedule test.
-    fn spawn_inner(
-        handle: &tokio::runtime::Handle,
-        forward: Arc<dyn MachineForward>,
-        machine: String,
-        sleeper: BackoffSleeper,
-    ) -> (MachineHubWatcher, mpsc::UnboundedReceiver<MachineHubUpdate>) {
-        let (tx, rx) = mpsc::unbounded_channel();
-        let task = handle.spawn(run_loop(forward, tx, sleeper));
-        (MachineHubWatcher { machine, task }, rx)
-    }
-
-    /// The machine this watcher follows.
-    pub fn machine(&self) -> &str {
-        &self.machine
-    }
-
-    /// Abort the loop. Aborting drops the in-flight connection future, which
-    /// closes the underlying HTTP connection; the forward is torn down when the
-    /// last reference to it goes.
-    pub fn stop(&self) {
-        self.task.abort();
-    }
-}
-
-impl Drop for MachineHubWatcher {
-    fn drop(&mut self) {
-        self.stop();
-    }
-}
-
-/// **Where the loop's backoff sleep goes — a `cfg(test)` seam that is an EMPTY
-/// struct in a normal build**, its `sleep` a plain `tokio::time::sleep`.
-///
-/// The reset rule below is only observable from outside as *when* the next
-/// attempt happens, and the schedule is deliberately long (500 ms → 30 s), so
-/// asserting it against the real clock would mean sleeping through it. The
-/// sibling watcher ([`crate::rc_events_watcher`]) carries the same seam as a
-/// full `Sleeper` trait; here nothing outside this file's own tests injects it,
-/// so the injectable half is `#[cfg(test)]` and a release build carries a
-/// zero-sized value.
-#[derive(Default)]
-struct BackoffSleeper {
-    /// Absent in a normal build: the struct is empty and [`sleep`] is
-    /// `tokio::time::sleep`, verbatim.
-    ///
-    /// [`sleep`]: BackoffSleeper::sleep
-    #[cfg(test)]
-    scripted: Option<Arc<tests::ScriptedSleeper>>,
-}
-
-impl BackoffSleeper {
-    async fn sleep(&self, wait: Duration) {
-        #[cfg(test)]
-        if let Some(scripted) = &self.scripted {
-            return scripted.sleep(wait).await;
-        }
-        tokio::time::sleep(wait).await;
-    }
-}
-
-async fn run_loop(
-    forward: Arc<dyn MachineForward>,
-    tx: mpsc::UnboundedSender<MachineHubUpdate>,
-    sleeper: BackoffSleeper,
-) {
-    let mut backoff = backoff::INITIAL;
-    loop {
-        if tx.is_closed() {
-            break;
-        }
-        // **The reset is keyed on the connection having WORKED, not on how it
-        // later ended.** Almost every real disconnect is an `Err` — a stream
-        // chunk error, the hub restarting, the forward dropping — so resetting
-        // only on a clean end would ratchet the delay up across successful
-        // connections and pin a healthy feed at the 30 s ceiling forever. That
-        // is also what `rc_events_watcher` does (it resets on the first data of
-        // a connection), and these two schedules are meant to stay identical.
-        let mut connected = false;
-        let outcome = connect_once(&forward, &tx, &mut connected).await;
-        if connected {
-            backoff = backoff::INITIAL;
-        }
-        let reason = match outcome {
-            Ok(()) => "the hub feed ended".to_string(),
-            Err(reason) => reason,
-        };
-        if tx.send(MachineHubUpdate::Down { reason }).is_err() {
-            break;
-        }
-        let (wait, next) = backoff::step(backoff);
-        backoff = next;
-        // Race the sleep against the consumer going away: a machine that stays
-        // down delivers no events, so a send failure alone would never be
-        // observed here and an abandoned receiver would leak the task.
-        tokio::select! {
-            () = sleeper.sleep(wait) => {}
-            _ = tx.closed() => break,
-        }
-    }
-}
-
-/// The slug an event pertains to (`""` for the shed-scoped synthetic events,
-/// which a machine hub never emits).
-fn event_slug(event: &RcEvent) -> &str {
-    match event {
-        RcEvent::ActivityChanged { slug, .. }
-        | RcEvent::SessionUpdated { slug, .. }
-        | RcEvent::MessageAppended { slug, .. } => slug,
-        RcEvent::HubUnavailable { .. } | RcEvent::ShedStopped { .. } => "",
-    }
-}
-
-/// One full attempt: establish the forward, confirm a hub is there, send the
-/// authoritative snapshot, then stream the feed until it ends.
-///
-/// `connected` is set once the hub has actually answered and the snapshot has
-/// gone out — the caller's signal that this attempt worked, whatever happens to
-/// the stream afterwards.
-async fn connect_once(
-    forward: &Arc<dyn MachineForward>,
-    tx: &mpsc::UnboundedSender<MachineHubUpdate>,
-    connected: &mut bool,
-) -> Result<(), String> {
-    forward.ensure().await.map_err(|e| e.to_string())?;
-    // Built per attempt rather than once, because `HubClient::loopback` is
-    // fallible and the port — though stable by the seam's contract — is read
-    // from the forward each time; the cost is one `reqwest::Client`, which is
-    // cheap next to establishing an SSH tunnel.
-    let client = HubClient::loopback(forward.port()).map_err(|e: HubError| e.to_string())?;
-    client.health().await.map_err(|e: HubError| e.to_string())?;
-
-    let sessions = client
-        .sessions()
-        .await
-        .map_err(|e: HubError| format!("the hub snapshot failed ({e})"))?;
-    *connected = true;
-    // Track which slugs the snapshot covered. An event for anything else means
-    // the client's picture is INCOMPLETE — see the unknown-slug rule below.
-    let mut known: std::collections::HashSet<String> =
-        sessions.iter().map(|s| s.slug.clone()).collect();
-    if tx.send(MachineHubUpdate::Snapshot { sessions }).is_err() {
-        return Ok(());
-    }
-
-    let (ev_tx, mut ev_rx) = mpsc::unbounded_channel();
-    let stream = client.events(&ev_tx);
-    tokio::pin!(stream);
-    loop {
-        tokio::select! {
-            result = &mut stream => {
-                // Drain anything the stream delivered before ending.
-                while let Ok(event) = ev_rx.try_recv() {
-                    if tx.send(MachineHubUpdate::Event { event }).is_err() {
-                        return Ok(());
-                    }
-                }
-                return result.map_err(|e: HubError| format!("the hub feed stopped ({e})"));
-            }
-            Some(event) = ev_rx.recv() => {
-                // **An event for an unknown slug triggers a re-snapshot.**
-                //
-                // The feed is a PATCH stream over the snapshot, and its payloads
-                // carry a display subset rather than a full session — so a
-                // session created after the snapshot cannot be reconstructed
-                // from its event alone. Without this, a client that connected
-                // while a machine was idle would never show anything launched
-                // afterwards: the connection stays healthy, so no reconnect (and
-                // therefore no new snapshot) ever happens.
-                //
-                // The slug is marked known BEFORE the refetch, so a slug the hub
-                // keeps mentioning but never lists cannot drive a refetch loop.
-                let slug = event_slug(&event);
-                if !slug.is_empty() && known.insert(slug.to_string()) {
-                    match client.sessions().await {
-                        Ok(sessions) => {
-                            known.extend(sessions.iter().map(|s| s.slug.clone()));
-                            if tx.send(MachineHubUpdate::Snapshot { sessions }).is_err() {
-                                return Ok(());
-                            }
-                        }
-                        // A failed refetch is not fatal: the event still goes
-                        // out, and the next reconnect re-snapshots anyway.
-                        Err(e) => {
-                            let _ = e;
-                        }
-                    }
-                }
-                if tx.send(MachineHubUpdate::Event { event }).is_err() {
-                    return Ok(());
-                }
-            }
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     use std::path::Path;
-    use std::sync::atomic::{AtomicUsize, Ordering};
 
     // ---- doubles ----
-
-    /// The backoff-sleep seam's test half: record the wait the loop is ABOUT to
-    /// take, and return immediately rather than spend it.
-    ///
-    /// After `park_after` waits it pends forever, which parks the loop at a
-    /// known point instead of letting it spin against the mock hub while the
-    /// test finishes its assertions.
-    pub(super) struct ScriptedSleeper {
-        waits: mpsc::UnboundedSender<Duration>,
-        taken: AtomicUsize,
-        park_after: usize,
-    }
-
-    impl ScriptedSleeper {
-        fn new(park_after: usize) -> (Arc<ScriptedSleeper>, mpsc::UnboundedReceiver<Duration>) {
-            let (waits, rx) = mpsc::unbounded_channel();
-            (
-                Arc::new(ScriptedSleeper {
-                    waits,
-                    taken: AtomicUsize::new(0),
-                    park_after,
-                }),
-                rx,
-            )
-        }
-
-        pub(super) async fn sleep(&self, wait: Duration) {
-            let _ = self.waits.send(wait);
-            if self.taken.fetch_add(1, Ordering::SeqCst) + 1 >= self.park_after {
-                std::future::pending::<()>().await;
-            }
-        }
-    }
-
-    /// A forward that refuses its first `failures_left` `ensure`s and then hands
-    /// over a port that works — the "machine is asleep, then wakes up" shape.
-    /// The refusals cost no I/O at all, so a whole failing ladder runs in the
-    /// test's own time.
-    struct FlakyForward {
-        port: u16,
-        failures_left: AtomicUsize,
-    }
-
-    #[async_trait::async_trait]
-    impl MachineForward for FlakyForward {
-        fn port(&self) -> u16 {
-            self.port
-        }
-
-        async fn ensure(&self) -> Result<(), ForwardError> {
-            if self.failures_left.load(Ordering::SeqCst) > 0 {
-                self.failures_left.fetch_sub(1, Ordering::SeqCst);
-                return Err(ForwardError("the machine is asleep".to_string()));
-            }
-            Ok(())
-        }
-    }
 
     /// The stand-in for the `ssh` child: it appends its own pid to `log` — the
     /// side-effect a test can wait on WITHOUT consulting the slot that is under
@@ -1160,16 +669,16 @@ mod tests {
     }
 
     #[test]
-    fn a_reserved_ssh_forward_picks_a_port_and_forwards_the_hub() {
-        let f = SshForward::reserve(entry()).expect("reserve");
+    fn a_reserved_ssh_forward_picks_a_local_port_and_spawns_nothing_yet() {
+        let f = SshForward::reserve_for(entry(), SOME_REMOTE_PORT).expect("reserve");
         assert!(f.port() > 0);
         let argv = f.argv();
-        // The concrete thing that matters: this local port maps to the hub's
-        // fixed loopback port on the far side, and a lost race is loud.
+        // The concrete thing that matters: this local port maps to the named
+        // loopback port on the far side, and a lost race is loud.
         assert!(argv.windows(2).any(|w| w
             == [
                 "-L",
-                &format!("127.0.0.1:{}:127.0.0.1:{HUB_PORT}", f.port())
+                &format!("127.0.0.1:{}:127.0.0.1:{SOME_REMOTE_PORT}", f.port())
             ]));
         assert!(argv.contains(&"ExitOnForwardFailure=yes".to_string()));
         assert!(argv.contains(&"-N".to_string()), "runs no remote command");
@@ -1180,12 +689,12 @@ mod tests {
     ///
     /// `reserve_for` is what an opencode lane reserves with: the agent's HTTP
     /// server binds an ephemeral loopback port, roost reports it, and the tunnel
-    /// has to land on THAT port rather than on the hub's fixed 1029. The `-L`
-    /// spec is the only place the number appears, so this asserts it there.
+    /// has to land on THAT port. The `-L` spec is the only place the number
+    /// appears, so this asserts it there.
     #[test]
     fn a_forward_reserved_for_a_port_tunnels_to_that_port() {
         let remote = 41_811;
-        assert_ne!(remote, HUB_PORT, "the point is that it is NOT the hub port");
+        assert_ne!(remote, SOME_REMOTE_PORT, "a different port on purpose");
         let f = SshForward::reserve_for(entry(), remote).expect("reserve_for");
         let argv = f.argv();
         assert!(
@@ -1198,16 +707,18 @@ mod tests {
         assert!(argv.contains(&"-N".to_string()), "runs no remote command");
         assert!(argv.contains(&"ExitOnForwardFailure=yes".to_string()));
         assert!(
-            !argv.iter().any(|a| a.contains(&HUB_PORT.to_string())),
-            "the hub port leaked into a lane forward: {argv:?}"
+            !argv
+                .iter()
+                .any(|a| a.contains(&SOME_REMOTE_PORT.to_string())),
+            "another forward's port leaked into this one: {argv:?}"
         );
-        // `reserve` still means the hub, unchanged: the shape (and the existing
-        // tests) survive the new parameter.
-        let hub = SshForward::reserve(entry()).expect("reserve");
-        assert!(hub.argv().windows(2).any(|w| w
+        // A second forward names its own far side independently — the port is
+        // per-forward, not a shared constant.
+        let other = SshForward::reserve_for(entry(), SOME_REMOTE_PORT).expect("reserve_for");
+        assert!(other.argv().windows(2).any(|w| w
             == [
                 "-L",
-                &format!("127.0.0.1:{}:127.0.0.1:{HUB_PORT}", hub.port())
+                &format!("127.0.0.1:{}:127.0.0.1:{SOME_REMOTE_PORT}", other.port())
             ]));
     }
 
@@ -1274,7 +785,7 @@ mod tests {
         bad.host = "127.0.0.1".into();
         bad.ssh_port = refused;
         bad.user = None;
-        let f = SshForward::reserve(bad).expect("reserve");
+        let f = SshForward::reserve_for(bad, 1029).expect("reserve");
 
         let started = std::time::Instant::now();
         let err = f.ensure().await.expect_err("nothing is listening there");
@@ -1291,32 +802,6 @@ mod tests {
         assert!(err.to_string().contains("machine:mini3"), "{err}");
         // A failed attempt leaves nothing running.
         assert!(f.child_is_dead());
-    }
-
-    /// A watcher pointed at a port with no hub reports `Down` with a reason and
-    /// keeps retrying — the "machine is asleep" case, which must never surface
-    /// as a failure.
-    #[tokio::test]
-    async fn a_missing_hub_is_a_down_update_not_an_error() {
-        let ln = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
-        let port = ln.local_addr().expect("addr").port();
-        drop(ln);
-
-        let (watcher, mut rx) = MachineHubWatcher::spawn(
-            &tokio::runtime::Handle::current(),
-            Arc::new(FixedPort(port)),
-            "mini3".to_string(),
-        );
-        let update = tokio::time::timeout(Duration::from_secs(10), rx.recv())
-            .await
-            .expect("an update should arrive")
-            .expect("the channel stays open");
-        match update {
-            MachineHubUpdate::Down { reason } => assert!(!reason.is_empty()),
-            other => panic!("expected Down, got {other:?}"),
-        }
-        assert_eq!(watcher.machine(), "mini3");
-        watcher.stop();
     }
 
     /// **The timeout must KILL the child, not orphan it.**
@@ -1390,465 +875,6 @@ mod tests {
         assert_eq!(String::from_utf8_lossy(&out.stderr), "oops");
         assert!(out.status.success());
     }
-
-    /// **A session created AFTER the snapshot must still appear.**
-    ///
-    /// The feed is a patch stream whose payloads carry a display subset, not a
-    /// full session — so a slug the snapshot never mentioned cannot be
-    /// reconstructed from its event. Without a re-snapshot on an unknown slug, a
-    /// client that connected while a machine was idle would never see anything
-    /// launched afterwards.
-    ///
-    /// **The SSE stream is deliberately held OPEN** by a hand-rolled server. A
-    /// mock that closes it produces a disconnect, and the reconnect's snapshot
-    /// would deliver the session anyway — making the test pass with the fix
-    /// removed. (It did, on the first attempt.) The whole bug is that a HEALTHY
-    /// connection never re-snapshots, so the connection has to stay healthy.
-    #[tokio::test]
-    async fn a_session_created_after_the_snapshot_triggers_a_resnapshot() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind");
-        let port = listener.local_addr().expect("addr").port();
-        // How many times /v1/sessions has been asked. The first answer is empty;
-        // every later one carries the session the event announced.
-        let asks = Arc::new(AtomicUsize::new(0));
-        let server_asks = Arc::clone(&asks);
-
-        tokio::spawn(async move {
-            loop {
-                let Ok((mut sock, _)) = listener.accept().await else {
-                    return;
-                };
-                let asks = Arc::clone(&server_asks);
-                tokio::spawn(async move {
-                    // Read until the END OF HEADERS, not once. A single `read`
-                    // can return a partial request when the kernel splits it
-                    // across segments (which happens under a loaded test
-                    // runner, not in isolation) — the route match then fails,
-                    // this handler answers nothing, and the client correctly
-                    // reports the connection dropped. That is a flaky mock, not
-                    // a flaky client, and it cost a 1-in-6 failure.
-                    let mut req = String::new();
-                    let mut buf = vec![0u8; 1024];
-                    loop {
-                        let n = sock.read(&mut buf).await.unwrap_or(0);
-                        if n == 0 {
-                            return; // peer went away mid-request
-                        }
-                        req.push_str(&String::from_utf8_lossy(&buf[..n]));
-                        if req.contains("\r\n\r\n") {
-                            break;
-                        }
-                    }
-
-                    // `Connection: close` is load-bearing, not decoration.
-                    // This mock serves ONE request per connection and then
-                    // drops it; without the header the client pools the socket
-                    // and reuses it for the next request, racing the close —
-                    // which surfaced as a 1-in-2 "error sending request" on the
-                    // very first snapshot. A real hub keeps the connection
-                    // alive properly; a mock that does not must say so.
-                    let json = |body: &str| {
-                        format!(
-                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
-                             Connection: close\r\n\
-                             Content-Length: {}\r\n\r\n{body}",
-                            body.len()
-                        )
-                    };
-
-                    if req.contains("/v1/health") {
-                        let body = format!("{{\"app\":\"{}\"}}", shed_core::hub_client::HUB_APP_ID);
-                        let _ = sock.write_all(json(&body).as_bytes()).await;
-                    } else if req.contains("/v1/sessions") {
-                        let nth = asks.fetch_add(1, Ordering::SeqCst);
-                        let body = if nth == 0 {
-                            "{\"sessions\":[]}".to_string()
-                        } else {
-                            "{\"sessions\":[{\"slug\":\"late01\",\"tmux_session\":\"rc-late01\",\
-                             \"kind\":\"shell\",\"state\":\"ready\",\"managed\":true,\
-                             \"display_name\":\"launched later\"}]}"
-                                .to_string()
-                        };
-                        let _ = sock.write_all(json(&body).as_bytes()).await;
-                    } else if req.contains("/v1/events") {
-                        // Chunked, and never terminated: the stream stays open
-                        // exactly as a real hub's does.
-                        let head = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\
-                                    Transfer-Encoding: chunked\r\n\r\n";
-                        let _ = sock.write_all(head.as_bytes()).await;
-                        let frame = "event: session.updated\n\
-                                     data: {\"shed\":\"\",\"slug\":\"late01\",\"session\":\
-                                     {\"slug\":\"late01\",\"tmux_session\":\"rc-late01\",\
-                                     \"kind\":\"shell\",\"state\":\"ready\",\"managed\":true,\
-                                     \"display_name\":\"launched later\"}}\n\n";
-                        let _ = sock
-                            .write_all(format!("{:x}\r\n{frame}\r\n", frame.len()).as_bytes())
-                            .await;
-                        let _ = sock.flush().await;
-                        // Hold it open with heartbeats, like the real hub.
-                        loop {
-                            tokio::time::sleep(Duration::from_millis(200)).await;
-                            if sock
-                                .write_all(format!("{:x}\r\n: ok\n\n\r\n", 6).as_bytes())
-                                .await
-                                .is_err()
-                            {
-                                return;
-                            }
-                        }
-                    }
-                });
-            }
-        });
-
-        let (watcher, mut rx) = MachineHubWatcher::spawn(
-            &tokio::runtime::Handle::current(),
-            Arc::new(FixedPort(port)),
-            "mini3".to_string(),
-        );
-
-        let first = tokio::time::timeout(Duration::from_secs(10), rx.recv())
-            .await
-            .expect("a snapshot arrives")
-            .expect("channel open");
-        match first {
-            MachineHubUpdate::Snapshot { sessions } => assert!(sessions.is_empty()),
-            other => panic!("expected the opening snapshot, got {other:?}"),
-        }
-
-        let deadline = std::time::Instant::now() + Duration::from_secs(15);
-        while std::time::Instant::now() < deadline {
-            match tokio::time::timeout(Duration::from_secs(5), rx.recv()).await {
-                Ok(Some(MachineHubUpdate::Snapshot { sessions })) => {
-                    if sessions.iter().any(|s| s.slug == "late01") {
-                        watcher.stop();
-                        return;
-                    }
-                }
-                Ok(Some(MachineHubUpdate::Down { reason })) => {
-                    watcher.stop();
-                    panic!("the connection dropped — this test needs it healthy: {reason}");
-                }
-                Ok(Some(_)) => {}
-                Ok(None) => break,
-                Err(_) => break,
-            }
-        }
-        watcher.stop();
-        panic!("the late session never reached the client");
-    }
-
-    /// **Live check against a real machine.** `#[ignore]`d, so CI and a normal
-    /// `cargo test` never touch the network; run it deliberately:
-    ///
-    /// ```text
-    /// SX_LIVE_MACHINE=mini3 cargo test -p shed-app --ignored live_machine
-    /// ```
-    ///
-    /// It is here rather than in a scratch script because it is the only thing
-    /// that exercises the parts unit tests structurally cannot: a real `ssh -N -L`
-    /// child, a real hub answering `/v1/health` behind it, and a real
-    /// snapshot — i.e. everything the `sx watch` machine path depends on.
-    /// The machine must exist in `~/.shed/config.yaml` and be running a hub.
-    #[tokio::test]
-    #[ignore = "needs a live machine; set SX_LIVE_MACHINE"]
-    async fn live_machine_forward_reaches_a_real_hub() {
-        let Ok(name) = std::env::var("SX_LIVE_MACHINE") else {
-            panic!("set SX_LIVE_MACHINE=<machine name from ~/.shed/config.yaml>");
-        };
-        let home = std::env::var("HOME").expect("HOME");
-        let cfg = shed_core::config::ShedConfig::load(&format!("{home}/.shed/config.yaml"));
-        let entry = shed_core::machine::resolve(&cfg, &name).expect("machine in config");
-
-        let forward = SshForward::reserve(entry.clone()).expect("reserve");
-        forward.ensure().await.expect("the tunnel should come up");
-
-        let client = HubClient::loopback(forward.port()).expect("client");
-        client.health().await.expect("a real hub should answer");
-        let sessions = client.sessions().await.expect("snapshot");
-        eprintln!(
-            "live: {name} hub on local :{} — {} session(s)",
-            forward.port(),
-            sessions.len()
-        );
-
-        // ensure() is idempotent and must not move the port.
-        let port = forward.port();
-        forward.ensure().await.expect("second ensure is a no-op");
-        assert_eq!(forward.port(), port, "ensure must never change the port");
-        drop(forward);
-
-        // **And the FEED, end to end through the watcher.** This is the half
-        // unit tests cannot vouch for: a real hub emits `"shed":""`, and while
-        // that was required-non-empty every frame decoded to `None` — the
-        // snapshot above would still have passed while the feed stayed
-        // permanently, invisibly silent.
-        let forward = Arc::new(SshForward::reserve(entry.clone()).expect("reserve"));
-        let (watcher, mut rx) =
-            MachineHubWatcher::spawn(&tokio::runtime::Handle::current(), forward, name.clone());
-        let first = tokio::time::timeout(Duration::from_secs(30), rx.recv())
-            .await
-            .expect("a snapshot should arrive")
-            .expect("channel open");
-        assert!(
-            matches!(first, MachineHubUpdate::Snapshot { .. }),
-            "expected the snapshot first, got {first:?}"
-        );
-
-        // Poke the machine so the hub emits something, then require a decoded
-        // event within the window.
-        // The stimulus has to change something the hub OBSERVES, and that has
-        // two requirements learned the hard way:
-        //
-        //  * it must be a real state change — a read-only poke (`tmux
-        //    list-sessions`) produces nothing but the ~25 s heartbeat comment;
-        //  * the change must OUTLIVE a reconcile tick. The hub polls on a
-        //    2 s active / 10 s idle cadence, so a create-then-kill inside one
-        //    tick is never seen at all: the session appears and vanishes
-        //    between two observations and no event is ever emitted.
-        //
-        // So: create and LEAVE it, then clean up after the assertion.
-        //
-        // `std::process`, not `tokio::process`: shed-app's tokio features
-        // deliberately exclude `process` (it would enter shed-mobile's default
-        // build), and a test may block briefly.
-        let rc_bin = entry.rc_bin.as_deref().unwrap_or("sx");
-        let dest = shed_core::machine::user_at_host(entry);
-        let remote = |cmd: &str| {
-            std::process::Command::new("ssh")
-                .args(["-o", "BatchMode=yes", &dest, "--", cmd])
-                .status()
-        };
-        let poke = remote(&format!(
-            "{rc_bin} rc create --kind shell --name livefeed --slug livefd \
-             --target local --created-by live-test >/dev/null 2>&1"
-        ));
-        eprintln!("live: poke status {poke:?}");
-
-        let deadline = std::time::Instant::now() + Duration::from_secs(45);
-        let mut saw_event = false;
-        while std::time::Instant::now() < deadline {
-            match tokio::time::timeout(Duration::from_secs(10), rx.recv()).await {
-                Ok(Some(MachineHubUpdate::Event { event })) => {
-                    eprintln!("live: decoded feed event {event:?}");
-                    saw_event = true;
-                    break;
-                }
-                Ok(Some(other)) => eprintln!("live: {other:?}"),
-                Ok(None) => break,
-                Err(_) => {}
-            }
-        }
-        watcher.stop();
-        let _ = remote(&format!("{rc_bin} rc kill --slug livefd >/dev/null 2>&1"));
-        assert!(
-            saw_event,
-            "no feed event decoded within the window — the machine hub's \
-             frames carry an empty `shed`, and requiring it non-empty drops \
-             every one of them"
-        );
-    }
-
-    /// **The load-bearing claim: a connect always yields the authoritative
-    /// snapshot first, then the live feed.** That is what makes a reconnect a
-    /// complete resync with no replay protocol to negotiate — and therefore
-    /// what lets a backgrounded phone simply stop the watcher and restart it.
-    ///
-    /// Driven through `FixedPort` against a mock hub, so the REAL `HubClient`
-    /// and the REAL loop run with no ssh anywhere. (This is the same shape the
-    /// hermetic desktop harness will use.)
-    #[tokio::test]
-    async fn a_connect_yields_the_snapshot_then_the_feed() {
-        let server = httpmock::MockServer::start();
-        server.mock(|when, then| {
-            when.method(httpmock::Method::GET).path("/v1/health");
-            then.status(200).json_body(serde_json::json!({
-                "app": shed_core::hub_client::HUB_APP_ID
-            }));
-        });
-        server.mock(|when, then| {
-            when.method(httpmock::Method::GET).path("/v1/sessions");
-            then.status(200).json_body(serde_json::json!({"sessions": [{
-                "slug": "hkn4vd",
-                "tmux_session": "rc-hkn4vd",
-                "kind": "shell",
-                "state": "ready",
-                "managed": true,
-                "display_name": "plan012-probe"
-            }]}));
-        });
-        server.mock(|when, then| {
-            when.method(httpmock::Method::GET).path("/v1/events");
-            then.status(200)
-                .header("content-type", "text/event-stream")
-                // A real machine hub sends an EMPTY shed — the frames are
-                // shaped exactly like the ones captured off mini3.
-                .body(concat!(
-                    "event: activity.changed\n",
-                    "data: {\"shed\":\"\",\"slug\":\"hkn4vd\",\"activity\":\"working\",\"state\":\"ready\"}\n",
-                    "\n"
-                ));
-        });
-
-        let (watcher, mut rx) = MachineHubWatcher::spawn(
-            &tokio::runtime::Handle::current(),
-            Arc::new(FixedPort(server.port())),
-            "mini3".to_string(),
-        );
-
-        let first = tokio::time::timeout(Duration::from_secs(10), rx.recv())
-            .await
-            .expect("a snapshot should arrive")
-            .expect("channel open");
-        match first {
-            MachineHubUpdate::Snapshot { sessions } => {
-                assert_eq!(sessions.len(), 1);
-                assert_eq!(sessions[0].slug, "hkn4vd");
-            }
-            other => panic!("the snapshot must come first, got {other:?}"),
-        }
-
-        let second = tokio::time::timeout(Duration::from_secs(10), rx.recv())
-            .await
-            .expect("a feed event should follow")
-            .expect("channel open");
-        match second {
-            MachineHubUpdate::Event { event } => match event {
-                RcEvent::ActivityChanged { shed, slug, .. } => {
-                    assert_eq!(slug, "hkn4vd");
-                    assert_eq!(shed, "", "a directly-read hub names no shed");
-                }
-                other => panic!("expected ActivityChanged, got {other:?}"),
-            },
-            other => panic!("expected a feed Event, got {other:?}"),
-        }
-        watcher.stop();
-    }
-
-    /// Dropping the receiver stops the loop rather than leaking the task — the
-    /// case a silent (heartbeat-only) feed would otherwise hide.
-    #[tokio::test]
-    async fn dropping_the_receiver_ends_the_loop() {
-        let ln = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
-        let port = ln.local_addr().expect("addr").port();
-        drop(ln);
-
-        let (watcher, rx) = MachineHubWatcher::spawn(
-            &tokio::runtime::Handle::current(),
-            Arc::new(FixedPort(port)),
-            "mini3".to_string(),
-        );
-        drop(rx);
-        for _ in 0..100 {
-            if watcher.task.is_finished() {
-                return;
-            }
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-        panic!("the loop should stop once the consumer is gone");
-    }
-
-    // ---- the reconnect schedule ----
-
-    /// **The reset is keyed on the connection having WORKED, not on how it
-    /// ended.** Almost every real disconnect is an `Err` — a stream chunk error,
-    /// the hub restarting, the forward dropping — so a reset that fired only on
-    /// a clean end of stream would ratchet the delay up across *successful*
-    /// connections and pin a healthy feed at the 30 s ceiling forever.
-    ///
-    /// Driven through the real loop: two dead attempts to ratchet the delay,
-    /// then one that reaches the hub, emits the snapshot, and dies on the feed —
-    /// the shape a hub restart has. The wait after THAT must be the initial
-    /// delay again, not the doubled one. (`backoff::step`'s own test pins the
-    /// numbers; only this one can see which value the loop feeds it.)
-    #[tokio::test]
-    async fn a_connection_that_worked_resets_the_delay_however_it_later_ended() {
-        let server = httpmock::MockServer::start();
-        server.mock(|when, then| {
-            when.method(httpmock::Method::GET).path("/v1/health");
-            then.status(200).json_body(serde_json::json!({
-                "app": shed_core::hub_client::HUB_APP_ID
-            }));
-        });
-        server.mock(|when, then| {
-            when.method(httpmock::Method::GET).path("/v1/sessions");
-            then.status(200)
-                .json_body(serde_json::json!({"sessions": []}));
-        });
-        // The feed refuses: a connection that reached the hub and then FAILED,
-        // which is what a hub restart looks like from here.
-        server.mock(|when, then| {
-            when.method(httpmock::Method::GET).path("/v1/events");
-            then.status(503);
-        });
-
-        let (sleeper, mut waits) = ScriptedSleeper::new(3);
-        let forward = Arc::new(FlakyForward {
-            port: server.port(),
-            failures_left: AtomicUsize::new(2),
-        });
-        let (watcher, mut rx) = MachineHubWatcher::spawn_inner(
-            &tokio::runtime::Handle::current(),
-            forward,
-            "mini3".to_string(),
-            BackoffSleeper {
-                scripted: Some(sleeper),
-            },
-        );
-
-        async fn next_wait(waits: &mut mpsc::UnboundedReceiver<Duration>) -> Duration {
-            tokio::time::timeout(Duration::from_secs(5), waits.recv())
-                .await
-                .expect("the loop should reach its backoff")
-                .expect("the sleeper outlives the loop")
-        }
-
-        assert_eq!(
-            next_wait(&mut waits).await,
-            backoff::INITIAL,
-            "a first dead attempt waits the initial delay"
-        );
-        assert_eq!(
-            next_wait(&mut waits).await,
-            backoff::INITIAL * 2,
-            "a second dead attempt ratchets"
-        );
-        assert_eq!(
-            next_wait(&mut waits).await,
-            backoff::INITIAL,
-            "the third attempt reached the hub and sent its snapshot, so the \
-             schedule must start over — resetting only on a clean end of stream \
-             would leave a healthy feed reconnecting at the ceiling"
-        );
-
-        // Everything the loop emitted is already queued (each `Down` precedes
-        // the wait we just read), so this needs no further synchronisation.
-        let updates: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
-        assert!(
-            matches!(
-                updates.as_slice(),
-                [
-                    MachineHubUpdate::Down { .. },
-                    MachineHubUpdate::Down { .. },
-                    MachineHubUpdate::Snapshot { .. },
-                    MachineHubUpdate::Down { .. }
-                ]
-            ),
-            "expected two dead attempts, then a snapshot and a lost feed: {updates:?}"
-        );
-        watcher.stop();
-    }
-
-    // ---- the ssh child's lifecycle ----
-    //
-    // Against a scriptable stand-in for `ssh` (see `SshForward::reserve_faked`)
-    // and the test's own listener standing in for a live tunnel, so nothing
-    // here needs a real machine.
 
     /// **An eviction that lands before a queued repair still must not orphan
     /// that repair's child.**

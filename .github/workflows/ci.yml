@@ -111,9 +111,6 @@ jobs:
               # A change there is a change to the shipped daemon's behavior, so it must
               # trigger the differential harness + the release-snapshot.
               - 'crates/shed-broker/**'
-              # shed-broker depends on shed-rc-engine from plan 010 H4 (the rc_hub
-              # port), so an engine-only change now reaches the shipped daemon too.
-              - 'crates/shed-rc-engine/**'
               # The Rust host-agent has a path-dep on shed-core, and the release
               # build (builder: rust) reads rust-toolchain.toml — a change to
               # either can break the shipped binary, so both must trigger the

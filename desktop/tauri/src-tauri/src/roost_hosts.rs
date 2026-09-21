@@ -57,10 +57,9 @@
 //! ## One overlay per feed
 //!
 //! Sessions are held per host and never merged into a shared activity overlay.
-//! Roost reports no shed (there is none), so `(shed, slug)` — the key
-//! [`shed_core::rc_events::ActivityOverlay`] uses — would collide across two
-//! hosts whose tab ids happen to match. Rows are keyed by ORIGIN + slug here
-//! instead.
+//! Roost reports no shed (there is none), so a `(shed, slug)` key — what the
+//! retired rc-events overlay used — would collide across two hosts whose tab
+//! ids happen to match. Rows are keyed by ORIGIN + slug here instead.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicBool, Ordering};

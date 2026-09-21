@@ -1333,24 +1333,6 @@ pub fn run() {
             app.manage(coordinator.clone());
             app.manage(auth_modes);
 
-            // **The machine RC activity hub, hosted by the app** (plan 012 R4).
-            // Started regardless of broker mode: the role binds AS A LOCK, so a
-            // daemon that already serves the port simply wins and this reports
-            // `deferred`. Gating it on embedded mode would leave nobody hosting
-            // the hub whenever a daemon is present but predates it (0.8.1 does).
-            //
-            // Held in app state so it lives as long as the app and releases the
-            // port on drop.
-            // `spawn` needs a reactor (it starts a task), so enter Tauri's
-            // runtime — the same reason the IPC bind below uses `block_on`.
-            let rc_hub = tauri::async_runtime::block_on(async {
-                shed_app::RcHubHost::spawn(
-                    format!("shed-desktop {}", env!("CARGO_PKG_VERSION")),
-                    true,
-                )
-            });
-            app.manage(Arc::new(rc_hub));
-
             // Roost hosts (plan 013 S3 for machines; plan 019 §3.6 for sheds):
             // one roost watcher per `machines:` entry, plus the implicit
             // `localhost` host. Started here rather than lazily so a machine's

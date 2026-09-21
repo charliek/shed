@@ -17,10 +17,7 @@
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 
-use crate::rc::{
-    strip_format_chars, RcActivity, RcAgentInfo, RcCapabilities, RcKind, RcKindFeatures, RcSession,
-    RcState, TMUX_PREFIX,
-};
+use crate::rc::{strip_format_chars, RcActivity, RcKind, RcSession, RcState, TMUX_PREFIX};
 
 /// Deserialize `T`, mapping an explicit JSON `null` to `T::default()`. serde's
 /// `#[serde(default)]` only covers an ABSENT field; shed-server sends `null` for
@@ -310,13 +307,6 @@ pub struct SessionsResponse {
 /// (`internal/api/overview.go:17-34`); a client gates endpoint use on these
 /// (via [`OverviewServer::has_feature`]) instead of probing for 404s.
 pub const FEATURE_OVERVIEW: &str = "overview";
-/// rc-enriched session rows (the `rc` block) in overview/sessions responses.
-pub const FEATURE_RC_ENRICH: &str = "rc-enrich";
-/// The `GET /api/rc/events` live-activity SSE stream.
-pub const FEATURE_RC_EVENTS: &str = "rc-events";
-/// The rc hub proxy endpoints (messages/input).
-pub const FEATURE_RC_PROXY: &str = "rc-proxy";
-
 /// Keep only the string elements of a maybe-list; a non-list/absent value
 /// degrades to `[]` (Dart's `if (raw is List) for (f in raw) if (f is String)`).
 fn string_list(v: Option<&Value>) -> Vec<String> {
@@ -382,11 +372,6 @@ pub(crate) fn clean_display(v: Option<&Value>) -> Option<String> {
 fn int_or_zero(v: Option<&Value>) -> i64 {
     v.and_then(|v| v.as_i64().or_else(|| v.as_f64().map(|f| f as i64)))
         .unwrap_or(0)
-}
-
-/// Dart's `j['k'] == true`: `true` only for exactly boolean `true`.
-fn is_true(v: Option<&Value>) -> bool {
-    matches!(v, Some(Value::Bool(true)))
 }
 
 /// Read a maybe-string VERBATIM — no trim, absent/non-string → `""` (Dart's
@@ -543,73 +528,6 @@ fn overview_df(obj: &serde_json::Map<String, Value>) -> SystemDiskUsage {
     }
 }
 
-/// Overview-tolerant decode of the `rc_capabilities` block into the shared
-/// [`RcCapabilities`] — per-field like Dart's `RcCapabilities.fromJson`
-/// (`rc_capabilities.dart:56-93, 138-143`): missing/non-numeric `rc_version` →
-/// 0, wrong-typed list/map entries filtered, per-kind feature fields
-/// defaulted. An empty `{}` map yields tolerant capabilities, never `None`
-/// (absence is decided by the caller on map-ness). The strict serde derive
-/// stays the `shed-ext-rc` stdout (`decode_list_response`) contract.
-fn overview_capabilities(obj: &serde_json::Map<String, Value>) -> RcCapabilities {
-    let map_of_maps = |key: &str| -> Vec<(String, &serde_json::Map<String, Value>)> {
-        obj.get(key)
-            .and_then(Value::as_object)
-            .map(|m| {
-                m.iter()
-                    .filter_map(|(k, v)| v.as_object().map(|o| (k.clone(), o)))
-                    .collect()
-            })
-            .unwrap_or_default()
-    };
-    RcCapabilities {
-        rc_version: int_or_zero(obj.get("rc_version")),
-        kinds: obj
-            .get("kinds")
-            .and_then(Value::as_array)
-            .map(|a| {
-                a.iter()
-                    .filter_map(Value::as_str)
-                    .map(RcKind::from_wire)
-                    .collect()
-            })
-            .unwrap_or_default(),
-        agents: map_of_maps("agents")
-            .into_iter()
-            .map(|(tool, o)| {
-                (
-                    tool,
-                    RcAgentInfo {
-                        installed: is_true(o.get("installed")),
-                        version: opt_trimmed(o.get("version")),
-                    },
-                )
-            })
-            .collect(),
-        features: string_list(obj.get("features")),
-        kind_features: map_of_maps("kind_features")
-            .into_iter()
-            .map(|(kind, o)| {
-                (
-                    kind,
-                    RcKindFeatures {
-                        post_input: is_true(o.get("post_input")),
-                        approvals: opt_trimmed(o.get("approvals")).unwrap_or_default(),
-                        watch: is_true(o.get("watch")),
-                        input: opt_trimmed(o.get("input")).unwrap_or_default(),
-                        // Contract v2; absent/wrong-typed → the same empty/false
-                        // defaults the serde path uses, which the
-                        // `feed_messages()` / `attach_kind()` accessors then
-                        // resolve through their v3 fallbacks.
-                        feed: opt_trimmed(o.get("feed")).unwrap_or_default(),
-                        interrupt: is_true(o.get("interrupt")),
-                        attach: opt_trimmed(o.get("attach")).unwrap_or_default(),
-                    },
-                )
-            })
-            .collect(),
-    }
-}
-
 /// The `server` block of `GET /api/overview`: the server's version and the
 /// feature-token set (mirrored from `GET /api/info`). A client learns which
 /// endpoints/behaviors a server supports from `features` without probing each.
@@ -639,18 +557,15 @@ impl OverviewServer {
 }
 
 /// One shed in `GET /api/overview`: the full shed record plus the shed's RC
-/// sessions (only the rc-enriched tmux rows are surfaced) and, for a running
-/// shed, its rc capabilities. A stopped shed carries no sessions and omits
-/// capabilities (`capabilities == None`), which a create form treats as
-/// "absent" (fall back to claude + shell).
+/// sessions (only the rc-enriched tmux rows are surfaced). A stopped shed
+/// carries no sessions.
 ///
 /// Ported from mobile's `OverviewShed.fromJson` (`shed_dtos.dart:246-294`);
-/// reuses [`RcSession`]/[`RcSessionDto`]/[`RcCapabilities`] from `rc.rs`.
+/// reuses [`RcSession`] from `rc.rs`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OverviewShed {
     pub shed: Shed,
     pub sessions: Vec<RcSession>,
-    pub capabilities: Option<RcCapabilities>,
 }
 
 impl OverviewShed {
@@ -672,19 +587,7 @@ impl OverviewShed {
             })
             .unwrap_or_default();
 
-        // `rc_capabilities` is decoded only when it is a map (else None —
-        // absence is the create form's claude+shell fallback signal); a map
-        // decodes field-tolerantly, so a malformed block degrades per field.
-        let capabilities = obj
-            .get("rc_capabilities")
-            .and_then(Value::as_object)
-            .map(overview_capabilities);
-
-        Some(OverviewShed {
-            shed,
-            sessions,
-            capabilities,
-        })
+        Some(OverviewShed { shed, sessions })
     }
 
     /// Adapt one `sessions[]` row (a tmux session) to an [`RcSession`], or
@@ -764,7 +667,7 @@ impl<'de> Deserialize<'de> for Overview {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::rc::{ATTACH_TMUX, LANE_TUI};
+    use crate::rc::LANE_TUI;
 
     #[test]
     fn opt_trimmed_trims_on_darts_set_including_bom() {
@@ -809,7 +712,7 @@ mod tests {
         )
         .unwrap();
         assert!(v.has_feature(FEATURE_OVERVIEW));
-        assert!(v.has_feature(FEATURE_RC_EVENTS));
+        assert!(v.has_feature(FEATURE_OVERVIEW));
         assert!(!v.has_feature("nope"));
         // Explicit null (not just absent) also decodes to [].
         let v: ServerInfo =
@@ -1067,10 +970,6 @@ mod tests {
         let o = golden_overview();
         assert_eq!(o.server.version, "0.8.0");
         assert!(o.server.has_feature(FEATURE_OVERVIEW));
-        assert!(o.server.has_feature(FEATURE_RC_ENRICH));
-        // Endpoint-discovery tokens that drive the live-events subscription.
-        assert!(o.server.has_feature(FEATURE_RC_EVENTS));
-        assert!(o.server.has_feature(FEATURE_RC_PROXY));
         assert!(!o.server.has_feature("nope"));
     }
 
@@ -1088,30 +987,6 @@ mod tests {
             claude.last_message.as_deref(),
             Some("Running the test suite now.")
         );
-    }
-
-    #[test]
-    fn overview_kind_features_carries_hub_hints() {
-        // Every kind_features hint — v1's watch/input and contract v2's
-        // feed/interrupt/attach alike — is invisible on this hand-rolled
-        // Value-walk path until explicitly picked up, so pin the whole row.
-        let o = golden_overview();
-        let caps = proj(&o).capabilities.as_ref().unwrap();
-        let codex = &caps.kind_features["codex"];
-        assert!(codex.watch);
-        assert!(codex.input_gated());
-        assert_eq!(codex.feed, "messages");
-        assert!(codex.feed_messages());
-        assert!(!codex.interrupt); // no lane implements the verb yet
-        assert_eq!(codex.attach_kind(), ATTACH_TMUX);
-        // claude-rc carries neither v1 hint → additive defaults; on v2 it is the
-        // activity-only kind: no message feed, same tmux attach.
-        let claude = &caps.kind_features["claude-rc"];
-        assert!(!claude.watch);
-        assert!(!claude.input_gated());
-        assert_eq!(claude.feed, "activity");
-        assert!(!claude.feed_messages());
-        assert_eq!(claude.attach_kind(), ATTACH_TMUX);
     }
 
     #[test]
@@ -1173,24 +1048,11 @@ mod tests {
     }
 
     #[test]
-    fn overview_running_shed_carries_rc_capabilities() {
-        let o = golden_overview();
-        let caps = proj(&o).capabilities.as_ref().unwrap();
-        assert_eq!(caps.rc_version, 4);
-        assert!(caps.has_feature("contract-v2")); // the v2 route-existence token
-                                                  // codex advertised + installed → offered; opencode not installed → not.
-        assert!(caps.offers(&RcKind::Codex));
-        assert!(caps.creatable_kinds().contains(&RcKind::Codex));
-        assert!(!caps.offers(&RcKind::Opencode));
-    }
-
-    #[test]
-    fn overview_stopped_shed_has_no_sessions_and_absent_capabilities() {
+    fn overview_stopped_shed_has_no_sessions() {
         let o = golden_overview();
         let asleep = o.sheds.iter().find(|s| s.shed.name == "asleep").unwrap();
         assert_eq!(asleep.shed.status, ShedStatus::Stopped);
         assert!(asleep.sessions.is_empty());
-        assert!(asleep.capabilities.is_none()); // absent → tolerated
     }
 
     #[test]
@@ -1305,45 +1167,6 @@ mod tests {
         assert_eq!(df.totals.all.physical_bytes, 0);
         assert_eq!(df.totals.all.logical_bytes, 9);
         assert!(df.images.is_empty());
-    }
-
-    #[test]
-    fn overview_empty_capabilities_map_is_tolerant_not_absent() {
-        // rc_capabilities: {} is a PRESENT block (rc_version 0, empty
-        // collections) — only a non-map is None (rc_capabilities.dart:56-93).
-        let o: Overview = serde_json::from_str(
-            r#"{"sheds":[{"name":"web","status":"running","rc_capabilities":{}}]}"#,
-        )
-        .unwrap();
-        let caps = o.sheds[0]
-            .capabilities
-            .as_ref()
-            .expect("empty map decodes to tolerant capabilities");
-        assert_eq!(caps.rc_version, 0);
-        assert!(caps.kinds.is_empty());
-        assert!(caps.agents.is_empty());
-        assert!(caps.features.is_empty());
-        assert!(caps.kind_features.is_empty());
-        assert!(caps.creatable_kinds().is_empty());
-        // Wrong-typed entries are filtered, valid ones kept.
-        let o: Overview = serde_json::from_str(
-            r#"{"sheds":[{"name":"web","status":"running","rc_capabilities":{
-                "rc_version":"three",
-                "kinds":["codex",7],
-                "agents":{"codex":{"installed":true},"bad":"nope"},
-                "kind_features":{"codex":{"watch":true},"bad":4}}}]}"#,
-        )
-        .unwrap();
-        let caps = o.sheds[0].capabilities.as_ref().unwrap();
-        assert_eq!(caps.rc_version, 0); // non-numeric → 0
-        assert_eq!(caps.kinds, vec![RcKind::Codex]);
-        assert_eq!(caps.agents.len(), 1);
-        assert!(caps.offers(&RcKind::Codex));
-        let kf = &caps.kind_features["codex"];
-        assert!(kf.watch);
-        assert!(!kf.post_input); // absent → false
-        assert_eq!(kf.approvals, ""); // absent → ""
-        assert!(!kf.input_gated());
     }
 
     #[test]

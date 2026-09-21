@@ -26,13 +26,13 @@
 //! which is shed-core's own now) and are deliberately NOT re-listed here: a
 //! re-export nothing uses is a name that goes stale silently.
 //!
-//! **Copied, not linked, on purpose.** `rc_hub::watch` imports
-//! `shed_rc_engine::tmux::Tmux` at its module head (`watch.rs:28`), so a `use
-//! shed_broker::rc_hub::watch::…` here would drag the whole RC engine — and the
-//! hub — into an adapter that talks to opencode over HTTP and has no tmux in
-//! sight. The hub's copy is S6's to delete along with the rest of its opencode
-//! watcher; until then the two are duplicates by design, pinned against each
-//! other by `fixtures/opencode_turn.golden.json`.
+//! **Copied, not linked**, and now the only copy: the hub's originals imported
+//! `shed_rc_engine::tmux::Tmux` at their module head, so linking rather than
+//! copying would have dragged the whole RC engine — and the hub — into an
+//! adapter that talks to opencode over HTTP and has no tmux in sight. Plan 022
+//! (S6, `charliek/shed#328`) deleted the hub and its watcher; what remains
+//! pinning these against what the hub produced is
+//! `fixtures/opencode_turn.golden.json`.
 //!
 //! The `null_default`/`object_opt`/`vec_objects` family exists because this wire
 //! was first read by a Go producer: Go's `json.Unmarshal` treats `null` into a
