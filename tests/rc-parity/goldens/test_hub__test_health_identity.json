@@ -1,8 +1,0 @@
-{
-  "body": {
-    "app": "shed-rc-hub",
-    "pid": "<pid>",
-    "version": "<version>"
-  },
-  "status": 200
-}

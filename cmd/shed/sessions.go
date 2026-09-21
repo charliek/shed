@@ -113,9 +113,6 @@ func runSessions(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	// RC metadata is populated server-side (Session.RC on GET /api/sessions); the
-	// CLI renders whatever the server returned and opens no SSH connection here.
-
 	if jsonFlag {
 		if allSessions == nil {
 			allSessions = make([]config.Session, 0)

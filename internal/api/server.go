@@ -2,7 +2,6 @@
 package api
 
 import (
-	"net/http"
 	"time"
 
 	"github.com/charliek/shed/internal/authtoken"
@@ -12,7 +11,6 @@ import (
 	"github.com/charliek/shed/internal/plugin"
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
-	"golang.org/x/sync/singleflight"
 )
 
 // Server is the HTTP API server for shed.
@@ -37,25 +35,6 @@ type Server struct {
 	// trusts and when it must be rotated. Zero values in every other mode.
 	caFingerprint string
 	caNotAfter    time.Time
-	rcCaps        *rcCapsCache // per-shed rc capabilities cache (session enrichment + overview)
-	// rcCapsFlight dedupes concurrent capability probes per shed across requests
-	// (singleflight keyed by shed name), so M concurrent overview requests —
-	// ?fresh=1 or a shared cache miss — share one guest exec per shed instead of
-	// fanning out M execs (see RCCapabilities). Zero value is ready to use.
-	rcCapsFlight singleflight.Group
-
-	// rcHubFlight dedupes concurrent rc-hub ensure-start attempts per shed
-	// (singleflight keyed by shed name): N racing proxy requests that find the hub
-	// absent share ONE `shed-ext-rc serve --detach` exec and record ONE breaker
-	// outcome. Zero value is ready to use.
-	rcHubFlight singleflight.Group
-	// rcHubBreaker is the per-shed circuit breaker over hub start attempts (3 fails
-	// in 5 min → immediate 503 for the window), so a shed whose hub can't start
-	// (old image without the hub binary, or a broken binary) can't drive an exec storm.
-	rcHubBreaker *hubBreaker
-	// rcAgg is the demand-driven GET /api/rc/events aggregator: zero connected
-	// clients ⇒ zero upstream hub connections.
-	rcAgg *rcAggregator
 }
 
 // SetEgressAudit attaches the durable egress audit log so `shed egress show`
@@ -94,17 +73,13 @@ func (s *Server) SetClientCAInfo(fingerprint string, notAfter time.Time) {
 
 // NewServer creates a new API server.
 func NewServer(b backend.Backend, cfg *config.ServerConfig, sshHostKey string, plugins *plugin.Registry, bridge *plugin.Bridge) *Server {
-	s := &Server{
-		backend:      b,
-		cfg:          cfg,
-		sshHostKey:   sshHostKey,
-		plugins:      plugins,
-		bridge:       bridge,
-		rcCaps:       newRCCapsCache(),
-		rcHubBreaker: newHubBreaker(),
+	return &Server{
+		backend:    b,
+		cfg:        cfg,
+		sshHostKey: sshHostKey,
+		plugins:    plugins,
+		bridge:     bridge,
 	}
-	s.rcAgg = s.newRCAggregator()
-	return s
 }
 
 // useCommonMiddleware installs the shared middleware stack. RealIP is
@@ -146,15 +121,9 @@ func (s *Server) Router() chi.Router {
 		r.Get("/sessions", s.handleListAllSessions)
 
 		// Single-call host snapshot: server identity + features, df, and every
-		// shed with its rc-enriched sessions and capabilities (control scope,
-		// GET-only — the auth middleware's default branch requires control).
+		// shed with its sessions (control scope, GET-only — the auth
+		// middleware's default branch requires control).
 		r.Get("/overview", s.handleOverview)
-
-		// Aggregate rc activity SSE across every shed on this host (control scope,
-		// GET-only, demand-driven). Registered as a literal before /sheds so it is
-		// unambiguous; it is NOT the credential bus / Connect / egress stream, so
-		// the auth middleware's default branch requires a control token.
-		r.Get("/rc/events", s.handleRCEvents)
 
 		// Images
 		r.Route("/images", func(r chi.Router) {
@@ -242,14 +211,6 @@ func (s *Server) Router() chi.Router {
 
 				// Connect API: TCP tunnel via HTTP upgrade
 				r.Get("/connect/{port}", s.handleConnect)
-
-				// rc hub reverse proxy: a strict allowlist of hub endpoints
-				// (GET v1/sessions|events|.../messages, POST .../input) forwarded
-				// into the shed's guest-local rc hub. Method/path allowlist is
-				// enforced inside the handler before any dial; the "*" wildcard
-				// catches every sub-path so a disallowed one is 404/405, never
-				// proxied. Control scope (default auth branch).
-				r.Handle("/rc/*", http.HandlerFunc(s.handleRCProxy))
 			})
 		})
 	})

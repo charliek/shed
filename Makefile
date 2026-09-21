@@ -1,4 +1,4 @@
-.PHONY: build build-cli build-server build-egress-proxy build-agent build-firstboot build-tools build-fc-remote-server test test-integration test-host-agent-diff test-rc-parity test-integration-dev test-integration-dev-fc dev-server-up dev-server-down dev-server-status dev-server-logs dev-server-restart dev-server-up-fc dev-server-down-fc dev-server-status-fc dev-server-logs-fc dev-server-restart-fc release clean dev-server dev-cli check check-kernel-pin coverage lint-all docs docs-serve firecracker-rootfs download-firecracker vz-rootfs vz-rootfs-base vz-rootfs-all
+.PHONY: build build-cli build-server build-egress-proxy build-agent build-firstboot build-tools build-fc-remote-server test test-integration test-host-agent-diff test-integration-dev test-integration-dev-fc dev-server-up dev-server-down dev-server-status dev-server-logs dev-server-restart dev-server-up-fc dev-server-down-fc dev-server-status-fc dev-server-logs-fc dev-server-restart-fc release clean dev-server dev-cli check check-kernel-pin coverage lint-all docs docs-serve firecracker-rootfs download-firecracker vz-rootfs vz-rootfs-base vz-rootfs-all
 
 GOARCH ?= $(shell go env GOARCH)
 
@@ -76,33 +76,8 @@ test-host-agent-diff:
 	# filter scoped to the bin alone silently ran ZERO of them.
 	cd crates && PATH="$$HOME/.cargo/bin:$$PATH" cargo test -p shed-host-agent -p shed-broker golden
 
-# Go↔Rust RC-hub parity harness (one of the five pytest suites — never merged
-# with tests/integration, tests/host-agent-diff, desktop/tools/shedtest or
-# tests/machine-transport). It runs
-# BOTH resident hub daemons — the Go oracle (tests/rc-parity/oracle, the retired
-# shed-machine-rc's main, kept test-only) via `serve --foreground`, and
-# `shed-host-agent rc-hub` (Rust) — on ephemeral loopback ports over identical
-# hermetic tmux sessions, asserts the two /v1 wires agree under
-# tests/rc-parity/normalize.py, and pins the agreed value to a committed golden.
-# Both legs are stimulated by the oracle CLI (plan 016 sunset `sx`), so the
-# daemon is the only controlled variable — asserted, not assumed, by
-# test_hub_wiring.py. Needs Go, Rust (cargo on PATH), uv, and tmux >= 3.2.
-# See tests/rc-parity/README.md.
-test-rc-parity:
-	@command -v uv >/dev/null 2>&1 || { \
-	  echo "uv is required for the rc parity harness."; \
-	  echo "Install: brew install uv  (or https://docs.astral.sh/uv/getting-started/installation/)"; \
-	  exit 1; \
-	}
-	@command -v tmux >/dev/null 2>&1 || { \
-	  echo "tmux (>= 3.2) is required for the rc parity harness."; \
-	  echo "Install: brew install tmux  (or apt-get install -y tmux)"; \
-	  exit 1; \
-	}
-	cd tests/rc-parity && uv sync && PATH="$$HOME/.cargo/bin:$$PATH" uv run pytest -v
-
-# The machine-transport differential (plan 012 AC2). The FIFTH pytest suite,
-# and — like the other four — never merged with them. SSH has no argv API, so a
+# The machine-transport differential (plan 012 AC2). The FOURTH pytest suite,
+# and — like the other three — never merged with them. SSH has no argv API, so a
 # remote command is one string the far side re-parses; `shed-core`/the Tauri app
 # compose it in Rust and shed-mobile composes it in Dart, and two implementations
 # of one wire contract drift silently. This suite owns the shared contract

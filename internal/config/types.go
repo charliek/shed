@@ -186,38 +186,6 @@ type Session struct {
 	CreatedAt   time.Time `json:"created_at"`
 	Attached    bool      `json:"attached"`
 	WindowCount int       `json:"window_count,omitempty"`
-	// RC carries Remote Control Session Convention metadata for "rc-*" sessions.
-	// The server populates it by exec'ing the in-shed shed-ext-rc binary over the
-	// guest agent channel and merging by tmux name (GET /api/sessions and
-	// GET /api/sheds/{name}/sessions, unless ?rc=0). It is nil for non-RC sessions
-	// and for rc-* rows on a shed whose enrichment degraded (a warnings entry is
-	// added in that case).
-	RC *SessionRC `json:"rc,omitempty"`
-}
-
-// SessionRC holds the RC Session Convention fields surfaced for an "rc-*"
-// session (a subset of shed-ext-rc's neutral DTO, for display). Managed is
-// false for legacy/unmanaged rc-* sessions.
-type SessionRC struct {
-	Kind        string `json:"kind,omitempty"`
-	State       string `json:"state,omitempty"`
-	Managed     bool   `json:"managed"`
-	DisplayName string `json:"display_name,omitempty"`
-	URL         string `json:"url,omitempty"`
-	CreatedBy   string `json:"created_by,omitempty"`
-	// Lane is the session's current lane (contract v2): "tui" or "structured",
-	// projected straight from rc.Session.Lane. omitempty here (unlike the always-
-	// present wire field) is deliberate: a shed running a pre-lane guest binary
-	// yields an empty string, and a client reading an ABSENT lane must treat it as
-	// "tui" — the same old-payload rule rc.Session documents at its own field.
-	Lane string `json:"lane,omitempty"`
-	// Live-activity dimension (Phase C), projected from the rc DTO so listings can
-	// carry it once a hub is running. Absent when the hub is not running / the kind
-	// is unsupported. Activity is one of working|needs_input|idle|unknown; ActivityAt
-	// is RFC3339; LastMessage is a sanitized ≤200-rune preview.
-	Activity    string `json:"activity,omitempty"`
-	ActivityAt  string `json:"activity_at,omitempty"`
-	LastMessage string `json:"last_message,omitempty"`
 }
 
 // Session constants.
@@ -294,9 +262,9 @@ type ServerInfo struct {
 	// encoding/json's omitempty does not apply to struct values.
 	CANotAfter string `json:"ca_not_after,omitempty"`
 
-	// Features advertises server capability tokens (e.g. "overview",
-	// "rc-enrich") for endpoint discovery, so a client learns which endpoints
-	// and behaviors this server supports without probing each one. The same set
+	// Features advertises server capability tokens (e.g. "overview") for
+	// endpoint discovery, so a client learns which endpoints and behaviors
+	// this server supports without probing each one. The same set
 	// is mirrored in the GET /api/overview server block. The token list is owned
 	// by internal/api (serverFeatures); older clients decode it as an empty slice.
 	Features []string `json:"features,omitempty"`

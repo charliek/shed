@@ -112,9 +112,8 @@ func ProbeCommand(landingDir string) string {
 
 // shellQuote wraps s in single quotes, escaping embedded single quotes with the
 // POSIX close-escape-reopen trick, so it is a single safe shell token. Same as
-// internal/ext/rc's shellQuote and cmd/shed/console.go's shellQuoteArg — copied
-// rather than shared because neither is exported and this package must not take
-// a dependency on either for four lines.
+// cmd/shed/console.go's shellQuoteArg — copied rather than shared because it is
+// not exported and this package must not take a dependency on it for four lines.
 func shellQuote(s string) string {
 	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
 }
