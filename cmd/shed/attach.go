@@ -14,20 +14,27 @@ import (
 var (
 	attachSessionFlag string
 	attachNewFlag     bool
+	attachTmuxFlag    bool
 )
 
 var attachCmd = &cobra.Command{
 	Use:   "attach <name>",
-	Short: "Attach to a tmux session in a shed",
-	Long: `Attach to a tmux session in a shed container.
+	Short: "Attach to a shed: a roost tab, or a tmux session",
+	Long: `Attach to a shed.
 
-By default, attaches to or creates a session named "default" and drops you into it
-(tmux gives you detach/reconnect persistence).
+With a local roost app running, the shed is opened as a roost tab and this
+terminal is left alone. Without one -- or with --tmux, or SHED_ATTACH=tmux --
+this attaches to (or creates) a tmux session in the shed and drops you into it,
+exactly as it always has.
+
+--session/-S names the roost tab on the first path and the tmux session on the
+second; --new forces a new one either way.
 
 Examples:
-  shed attach myproj                         # attach/create the "default" tmux session
-  shed attach myproj --session debug         # a named tmux session
-  shed attach myproj --new --session review  # force-create a new session (error if it exists)`,
+  shed attach myproj                         # roost tab "default", or the tmux session
+  shed attach myproj --session debug         # a named tab / tmux session
+  shed attach myproj --new --session review  # force-create a new tab / session
+  shed attach myproj --tmux                  # the tmux path, even with roost running`,
 	Args: cobra.ExactArgs(1),
 	RunE: runAttach,
 }
@@ -35,6 +42,7 @@ Examples:
 func init() {
 	attachCmd.Flags().StringVarP(&attachSessionFlag, "session", "S", config.DefaultSessionName, "Session name to attach to")
 	attachCmd.Flags().BoolVar(&attachNewFlag, "new", false, "Force create a new session (error if exists)")
+	attachCmd.Flags().BoolVar(&attachTmuxFlag, "tmux", false, "Use the tmux path even when a local roost app is running (same as SHED_ATTACH=tmux)")
 
 	rootCmd.AddCommand(attachCmd)
 }
@@ -58,11 +66,16 @@ func runAttach(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	return attachPlain(name, serverName, entry, shed)
+	return attachShed(name, serverName, entry, shed)
 }
 
-// attachPlain attaches to (or creates) a named tmux session. (The session name
-// was validated in runAttach.)
+// attachPlain attaches to (or creates) a named tmux session — the FLOOR the
+// roost path in attach_roost.go falls back to, and the only path a machine
+// with no roost ever takes. (The session name was validated in runAttach.)
+//
+// Its argv is pinned byte-for-byte by testdata/attach_tmux_argv.golden.json:
+// whatever the roost path does, this must keep producing exactly what it
+// produced before roost existed.
 func attachPlain(name, serverName string, entry *config.ServerEntry, shed *config.Shed) error {
 	if attachNewFlag {
 		sessions, err := listShedSessions(serverName, entry, name)

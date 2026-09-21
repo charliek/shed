@@ -285,6 +285,46 @@ func TestWhatCountsAsAnExistingDeclaration(t *testing.T) {
 	}
 }
 
+// TestAliasDeclaredAnswersWithoutWriting covers the read-only half of the same
+// question. It shares hostAliasDeclared with AddEntryIfAbsent — so what is
+// asserted here is the wrapper's own contract, not the pattern's: the three
+// answers, and that asking leaves the file exactly as it was (a caller that
+// used it to decide a NAME must not create the file it asked about).
+func TestAliasDeclaredAnswersWithoutWriting(t *testing.T) {
+	t.Run("a missing file has no aliases in it", func(t *testing.T) {
+		path := configPath(t)
+		declared, err := AliasDeclared(path, "shed-demo")
+		if err != nil {
+			t.Fatalf("AliasDeclared: %v", err)
+		}
+		if declared {
+			t.Error("a config that does not exist declared something")
+		}
+		if _, err := os.Stat(path); !os.IsNotExist(err) {
+			t.Errorf("asking created the file: %v", err)
+		}
+	})
+
+	t.Run("declared and not declared", func(t *testing.T) {
+		path := configPath(t)
+		content := "Host shed-demo\n    ProxyJump bastion\n"
+		writeConfig(t, path, content)
+
+		for alias, want := range map[string]bool{"shed-demo": true, "shed-other": false} {
+			declared, err := AliasDeclared(path, alias)
+			if err != nil {
+				t.Fatalf("AliasDeclared(%q): %v", alias, err)
+			}
+			if declared != want {
+				t.Errorf("AliasDeclared(%q) = %v, want %v", alias, declared, want)
+			}
+		}
+		if got := readConfigFile(t, path); got != content {
+			t.Errorf("asking modified the file:\n got %q\nwant %q", got, content)
+		}
+	})
+}
+
 // TestAddingTwiceIsIdempotent: the second call writes nothing and reports why.
 func TestAddingTwiceIsIdempotent(t *testing.T) {
 	path := configPath(t)

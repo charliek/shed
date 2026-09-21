@@ -38,6 +38,27 @@ func (o AddOutcome) String() string {
 	}
 }
 
+// AliasDeclared reports whether any Host line in the config at path names
+// alias — the read-only half of AddEntryIfAbsent's "is this alias already
+// claimed" question, for a caller that needs the answer without writing.
+//
+// Managed or hand-written makes no difference here, exactly as it makes none
+// there: what is being asked is whether `ssh <alias>` already resolves to
+// something on this machine. A missing file is not an error — it is a file
+// with no aliases in it — so the only error this returns is a real read
+// failure.
+//
+// No lock is taken. This is a hint, not a read-modify-write: a caller acting
+// on it goes on to call AddEntryIfAbsent, which locks and re-checks under the
+// lock, so a config that changed in between costs nothing.
+func AliasDeclared(path, alias string) (bool, error) {
+	content, _, err := readConfig(path)
+	if err != nil {
+		return false, err
+	}
+	return hostAliasDeclared(content, alias), nil
+}
+
 // AddEntryIfAbsent adds ONE Host entry to the managed block, and only if no
 // Host entry anywhere in the file already claims its alias.
 //

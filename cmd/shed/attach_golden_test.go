@@ -39,6 +39,23 @@ type attachTmuxGoldenScenario struct {
 	WantArgv   []string `json:"want_argv"`
 }
 
+// readAttachTmuxGolden decodes the pinned fixture. Both readers go through it
+// — this test and attach_roost_test.go's tmux-fallback assertions — so the
+// fallback is checked against the SAME bytes this test pins, and a second
+// decoder cannot drift from this one.
+func readAttachTmuxGolden(t *testing.T) attachTmuxGolden {
+	t.Helper()
+	data, err := os.ReadFile(attachTmuxGoldenPath)
+	if err != nil {
+		t.Fatalf("reading golden fixture: %v", err)
+	}
+	var golden attachTmuxGolden
+	if err := json.Unmarshal(data, &golden); err != nil {
+		t.Fatalf("decoding golden fixture: %v", err)
+	}
+	return golden
+}
+
 // TestAttachPlainTmuxArgvGolden pins the exact ssh argv (and, embedded in its
 // final element, the exact tmux command string) that attachPlain hands to
 // execSSH for the plain-tmux paths: default session, a named session, --new,
@@ -50,14 +67,7 @@ func TestAttachPlainTmuxArgvGolden(t *testing.T) {
 	// machine-independent.
 	t.Setenv("HOME", "/home/tester")
 
-	data, err := os.ReadFile(attachTmuxGoldenPath)
-	if err != nil {
-		t.Fatalf("reading golden fixture: %v", err)
-	}
-	var golden attachTmuxGolden
-	if err := json.Unmarshal(data, &golden); err != nil {
-		t.Fatalf("decoding golden fixture: %v", err)
-	}
+	golden := readAttachTmuxGolden(t)
 	if len(golden.Scenarios) == 0 {
 		t.Fatal("golden fixture has no scenarios")
 	}
