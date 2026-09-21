@@ -97,6 +97,9 @@ func newResumeTestManager(t *testing.T) (*CredentialManager, *plugin.Bridge) {
 	return cm, bridge
 }
 
+// bridgeNames is the sorted list of sheds currently registered on the
+// bridge — the observable the resume tests assert on, because a lost bridge
+// registration is half of what #315 cost a restarted server.
 func bridgeNames(b *plugin.Bridge) []string {
 	infos := b.ListSheds()
 	names := make([]string, 0, len(infos))
@@ -107,6 +110,9 @@ func bridgeNames(b *plugin.Bridge) []string {
 	return names
 }
 
+// TestResumeMessageChannel covers the manager-level half of #315: a resume
+// registers the shed on the bridge, and the shared dedupe holds in both
+// orders so a StartShed either side of the startup walk opens one channel.
 func TestResumeMessageChannel(t *testing.T) {
 	t.Run("registers_on_bridge", func(t *testing.T) {
 		cm, bridge := newResumeTestManager(t)
@@ -193,6 +199,9 @@ func (cm *CredentialManager) channelCount() int {
 	return len(cm.messageChannels)
 }
 
+// channel returns the NotifyConn registered for name, or nil. Identity of
+// the returned pointer is what the idempotence tests compare, so they can
+// tell "kept the existing channel" from "opened a second, equivalent one".
 func (cm *CredentialManager) channel(name string) *NotifyConn {
 	cm.mu.Lock()
 	defer cm.mu.Unlock()

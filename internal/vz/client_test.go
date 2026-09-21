@@ -558,6 +558,9 @@ func vfkitCmdlineFrom(argv0 string, cfg *config.VZConfig, name string) string {
 	}, " ")
 }
 
+// resumedNames is the sorted list of sheds the walk registered on the
+// bridge — the observable these tests assert on rather than spying on the
+// walk itself.
 func resumedNames(b *plugin.Bridge) []string {
 	infos := b.ListSheds()
 	names := make([]string, 0, len(infos))
