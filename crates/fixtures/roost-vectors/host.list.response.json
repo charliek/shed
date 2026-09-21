@@ -1,0 +1,20 @@
+{
+  "id": "31",
+  "ok": true,
+  "result": {
+    "hosts": [
+      {
+        "id": "3f9a2b7c1d4e4f5a",
+        "label": "pop-os",
+        "target": "/home/charlie/.local/state/roost/roost-session.sock",
+        "last_connected": "2026-08-27T00:00:00Z"
+      },
+      {
+        "id": "a1b2c3d4e5f60718",
+        "label": "shed",
+        "target": "test1@localhost",
+        "last_connected": null
+      }
+    ]
+  }
+}

@@ -64,6 +64,15 @@ func TestExactRequestJSON(t *testing.T) {
 				`{"project_id":"12","cwd":"/home/shed/roost","title":"cursor","argv":["bash","-lc","exec \"$@\"","shed","cursor-agent"]}}`,
 		},
 		{
+			// `tab.close` carries the id roost handed back, unparsed and
+			// still a string. `deny_unknown_fields` on roost's side means
+			// this one key and no others.
+			name:   "tab.close",
+			op:     opTabClose,
+			params: TabCloseParams{TabID: "5"},
+			want:   `{"id":"1","op":"tab.close","params":{"tab_id":"5"}}`,
+		},
+		{
 			// HTML escaping is off, so an `&` in a cwd travels as itself.
 			// Go's default would render it `&` — valid JSON that decodes
 			// identically, but not what serde emits, so the two sides' wire
@@ -253,15 +262,53 @@ func TestVendoredVectorsDecode(t *testing.T) {
 		}
 	})
 
-	t.Run("tab.list", func(t *testing.T) {
+	// Both `tab.list` variants, because roost publishes two and they differ:
+	// the SESSION one carries `revision`, the UI one does not. The project and
+	// tab shapes inside them are identical, which is the point — a decoder
+	// that only ever saw one would not prove that.
+	//
+	// Asserted field by field rather than with a struct comparison: Project
+	// carries a []Tab now, so `==` does not compile on it, and the tab set is
+	// the half of this that a `tabs`-dropping regression would take out.
+	for _, name := range []string{"tab.list.session.response.json", "tab.list.response.json"} {
+		t.Run(name, func(t *testing.T) {
+			var list TabListResult
+			decodeVectorResult(t, name, &list)
+			if len(list.Projects) != 1 {
+				t.Fatalf("projects = %+v", list.Projects)
+			}
+			got := list.Projects[0]
+			if got.ID != "1" || got.Name != "Roost" || got.Cwd != "/Users/me/projects/roost" {
+				t.Errorf("project = %+v", got)
+			}
+			if len(got.Tabs) != 1 {
+				t.Fatalf("tabs = %+v, want exactly one", got.Tabs)
+			}
+			wantTab := Tab{
+				ID:             "5",
+				ProjectID:      "1",
+				Title:          "zsh",
+				Cwd:            "/Users/me/projects/roost",
+				State:          "running",
+				AgentLifecycle: "inactive",
+			}
+			if got.Tabs[0] != wantTab {
+				t.Errorf("tab = %+v, want %+v", got.Tabs[0], wantTab)
+			}
+		})
+	}
+
+	// A project roost answers with no `tabs` key at all — its field is
+	// `#[serde(default)]`, so that is a legal reply and it has to read as an
+	// empty tab set rather than as a decode failure.
+	t.Run("a project with no tabs key", func(t *testing.T) {
 		var list TabListResult
-		decodeVectorResult(t, "tab.list.session.response.json", &list)
-		if len(list.Projects) != 1 {
-			t.Fatalf("projects = %+v", list.Projects)
+		if err := json.Unmarshal([]byte(
+			`{"projects":[{"id":"9","name":"empty","cwd":"/tmp"}]}`), &list); err != nil {
+			t.Fatalf("decoding a tab-less project: %v", err)
 		}
-		want := Project{ID: "1", Name: "Roost", Cwd: "/Users/me/projects/roost"}
-		if list.Projects[0] != want {
-			t.Errorf("project = %+v, want %+v", list.Projects[0], want)
+		if len(list.Projects) != 1 || len(list.Projects[0].Tabs) != 0 {
+			t.Errorf("projects = %+v", list.Projects)
 		}
 	})
 
@@ -297,6 +344,7 @@ func TestVendoredVectorIdsAreStrings(t *testing.T) {
 	for _, name := range []string{
 		"session.identify.response.v6.json",
 		"tab.list.session.response.json",
+		"tab.list.response.json",
 		"tab.open.response.json",
 	} {
 		if !bytes.Contains(readVector(t, name), []byte(`"id": "`)) {

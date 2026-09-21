@@ -722,3 +722,16 @@ func (r *Remote) TabOpen(ctx context.Context, t Target, params TabOpenParams) (s
 	}
 	return res.Tab.ID, nil
 }
+
+// TabClose runs `tab.close` on one tab id.
+//
+// The reply is not decoded. `tab.close` is an ack — roost answers it with a
+// result this side has nothing to read — so the only two outcomes worth
+// distinguishing are already distinguished by `call`: an `ok:false` envelope
+// (the tab is gone, or the id was never one) comes back as a *ResponseError,
+// and an unreachable far side as a *ReachError. There is no MalformedReply
+// check to make here for the same reason: unlike `tab.open`, a well-formed
+// `ok:true` with an empty result IS the whole answer.
+func (r *Remote) TabClose(ctx context.Context, t Target, tabID string) error {
+	return r.call(ctx, t, opTabClose, TabCloseParams{TabID: tabID}, nil)
+}

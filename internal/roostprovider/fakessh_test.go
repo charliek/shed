@@ -258,6 +258,7 @@ case "$1" in
       *session.identify*) op=identify ;;
       *tab.list*) op=tablist ;;
       *tab.open*) op=tabopen ;;
+      *tab.close*) op=tabclose ;;
     esac
     cat __DIR__/event.ndjson
     cat __DIR__/reply.$op.ndjson ;;
@@ -330,13 +331,34 @@ func (r *rig) writeReplies(dir string, protocol int, projects []Project) {
 	tabOpen["id"] = wireRequestID
 	mustWrite(t, filepath.Join(dir, "reply.tabopen.ndjson"), compactLine(t, tabOpen), 0o644)
 
+	// `tab.close` is an ack and roost publishes no vector for its reply, so
+	// the envelope is written here rather than copied. The shape is the one
+	// thing being faked: an `ok:true` whose result this side never reads.
+	mustWrite(t, filepath.Join(dir, "reply.tabclose.ndjson"), compactLine(t, map[string]any{
+		"id": wireRequestID, "ok": true, "result": map[string]any{},
+	}), 0o644)
+
 	// `tab.list`'s projects are the one part a fixture cannot supply: each test
 	// needs its own set. The envelope around them is still roost's.
 	rows := make([]map[string]any, 0, len(projects))
 	for _, p := range projects {
+		// Every field roost's own `Tab` carries, not just the six this
+		// package reads: the fake answers what a session answers, so the
+		// decoder is exercised against a reply with fields in it that shed
+		// ignores rather than against a reply trimmed to what shed wants.
+		tabs := make([]map[string]any, 0, len(p.Tabs))
+		for _, tab := range p.Tabs {
+			tabs = append(tabs, map[string]any{
+				"id": tab.ID, "project_id": tab.ProjectID, "title": tab.Title,
+				"cwd": tab.Cwd, "state": tab.State, "agent_lifecycle": tab.AgentLifecycle,
+				"has_notification": false, "is_active": false, "user_titled": false,
+				"position": 0, "created_at": 1700000000, "last_active": 1700000050,
+				"hook_active": false, "shell_state": "foreground_process",
+			})
+		}
 		rows = append(rows, map[string]any{
 			"id": p.ID, "name": p.Name, "cwd": p.Cwd,
-			"position": 0, "created_at": 1700000000, "tabs": []any{},
+			"position": 0, "created_at": 1700000000, "tabs": tabs,
 		})
 	}
 	mustWrite(t, filepath.Join(dir, "reply.tablist.ndjson"), compactLine(t, map[string]any{

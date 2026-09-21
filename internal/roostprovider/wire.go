@@ -8,16 +8,18 @@ import (
 	"io"
 )
 
-// roost's op names (`roost_ipc::messages::ops`). Three, and no more: the
-// provider gates on identify, reads projects, and opens a tab. At session
-// protocol 5 nothing on this wire is lease-gated any more — the lease, its
-// takeover table and `session.connect` all retired with generation 4 — so
-// `tab.open` needs no authority to check either. The provider's cut was always
-// this leaseless shape; roost's bump only made it official.
+// roost's op names (`roost_ipc::messages::ops`). Four, and no more: the
+// provider gates on identify, reads projects and their tabs, opens a tab, and
+// closes one. At session protocol 5 nothing on this wire is lease-gated any
+// more — the lease, its takeover table and `session.connect` all retired with
+// generation 4 — so `tab.open` needs no authority to check either, and neither
+// does `tab.close`. The provider's cut was always this leaseless shape; roost's
+// bump only made it official.
 const (
 	opSessionIdentify = "session.identify"
 	opTabList         = "tab.list"
 	opTabOpen         = "tab.open"
+	opTabClose        = "tab.close"
 )
 
 // SpokenProtocol is the roost session protocol this build speaks —
@@ -241,10 +243,42 @@ type IdentifyResult struct {
 // on the wire (string_int64) and is carried as one all the way to `tab.open`'s
 // `project_id`, so it is never parsed into a number here — parsing it would
 // add a failure mode and gain nothing.
+//
+// `tabs` is roost's own `#[serde(default)]` field: a project with no tabs may
+// answer with the key absent, and a nil slice is the right reading of that.
 type Project struct {
 	ID   string `json:"id"`
 	Name string `json:"name"`
 	Cwd  string `json:"cwd"`
+	Tabs []Tab  `json:"tabs"`
+}
+
+// Tab is one tab of a project, as `tab.list` reports it inside its project.
+//
+// The subset this package reads, not roost's whole `Tab`: it also carries
+// has_notification, is_active, user_titled, position, created_at, last_active,
+// hook_active and an optional ownership record, none of which anything here
+// needs. Decoding a subset is deliberate — a field roost adds costs nothing,
+// and a field shed does not read cannot drift.
+//
+// `id` and `project_id` are STRINGS for the same reason Project.ID is: roost
+// serializes every int64 id through `string_int64`, so `"5"` is what the wire
+// carries and `5` is a shape roost never emits. Carried as strings all the way
+// to `tab.close`'s `tab_id` and to `tab focus --tab`, neither of which wants a
+// number back.
+//
+// `state` is roost's `TabState` spelling (`running`, `finished`, …) and
+// `agent_lifecycle` its `AgentLifecycle` one (`inactive`, `working`,
+// `waiting`, `finished`, `failed`) — both `#[serde(default)]` on roost's side
+// for agent_lifecycle, so an older session answering without it decodes to the
+// empty string rather than failing.
+type Tab struct {
+	ID             string `json:"id"`
+	ProjectID      string `json:"project_id"`
+	Title          string `json:"title"`
+	Cwd            string `json:"cwd"`
+	State          string `json:"state"`
+	AgentLifecycle string `json:"agent_lifecycle"`
 }
 
 // TabListResult is the subset of `tab.list`'s reply this package reads.
@@ -277,4 +311,15 @@ type TabOpenResult struct {
 	Tab struct {
 		ID string `json:"id"`
 	} `json:"tab"`
+}
+
+// TabCloseParams are the `tab.close` params.
+//
+// `tab_id` is a JSON STRING, like every other roost id (string_int64) — the
+// same spelling `tab.list` handed back, passed through unparsed.
+//
+// The params struct on roost's side is `deny_unknown_fields`, so this must
+// carry this key and no others; wire_test.go pins the exact request JSON.
+type TabCloseParams struct {
+	TabID string `json:"tab_id"`
 }
