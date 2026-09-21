@@ -1,6 +1,5 @@
-//! **Machine targets** — reaching a native host that runs `sx` and hosts the RC
-//! activity hub. The PURE half: how a machine is addressed, the SSH argv it is
-//! reached with, and the RC argv prefix it is invoked through. No process is
+//! **Machine targets** — reaching a native host over SSH. The PURE half: how a
+//! machine is addressed and the SSH argv it is reached with. No process is
 //! spawned here and no socket is opened; that is the transport's job
 //! (`shed_app::machine`), which differs per client.
 //!
@@ -17,8 +16,8 @@
 //! through shed-server's SSH daemon at an endpoint the shed CLI wrote into
 //! `~/.shed/config.yaml`, with the server's host key pinned in
 //! `~/.shed/known_hosts` and `StrictHostKeyChecking=yes` — that posture is
-//! [`crate::rc::ssh_argv`] / [`crate::terminal::ssh_command`] and is reused
-//! verbatim by every client, so they all dial a shed identically.
+//! [`crate::terminal::ssh_command`] and is reused verbatim by every client, so
+//! they all dial a shed identically.
 //!
 //! A **machine** is an ordinary SSH host the operator already manages. Its entry
 //! may name a user, a port, a `known_hosts` file — or none of them, in which case
@@ -27,18 +26,29 @@
 //! through a jump host, an agent, or a per-host identity.
 
 use crate::config::{MachineEntry, ShedConfig};
-use crate::rc_agents::shell_quote_always;
 
 /// ssh `ConnectTimeout` for the non-interactive ops — bounds connection setup
 /// only, never a hung remote command (same value + rationale as `RcService`).
 pub const CONNECT_TIMEOUT_SECS: u32 = 10;
 
-/// The binary a `machine:` target invokes when its entry names none — resolved
-/// on the machine's non-login SSH `PATH`.
-pub const DEFAULT_MACHINE_BIN: &str = "sx";
-
-/// The `sx` namespace carrying the one-shot engine verbs.
-const RC_NAMESPACE: &str = "rc";
+/// Wrap `s` in single quotes, escaping embedded single quotes with the POSIX
+/// `'\''` trick — a VERBATIM port of the guest's `shellQuote`.
+///
+/// **Always quotes**, even a token that needs no quoting (`my-shed/abc` →
+/// `'my-shed/abc'`). That is deliberate and load-bearing, and is why this is NOT
+/// `crate::terminal::shell_quote`, which passes safe strings through bare: one
+/// quoter everywhere means a remote command line reads identically whoever built
+/// it, and the quoted form is written verbatim into interoperable artifacts
+/// (roost's agent-hook entries, whose idempotent match compares the literal
+/// quoted string) — so a producer emitting the bare form would append a
+/// DUPLICATE next to a quoted one.
+///
+/// Lived in `rc_agents.rs` until S6 (`charliek/shed#328`) deleted that module
+/// with the rest of the RC hub; it moved here because [`display_line`] — the one
+/// composer every machine transport shares — is its only remaining caller.
+pub fn shell_quote_always(s: &str) -> String {
+    format!("'{}'", s.replace('\'', r"'\''"))
+}
 
 /// Resolve a machine by name, or explain what is configured.
 ///
@@ -61,22 +71,6 @@ pub fn resolve<'a>(config: &'a ShedConfig, name: &str) -> Result<&'a MachineEntr
             known.join(", ")
         )
     })
-}
-
-/// The RC argv prefix to invoke on a machine: `<bin> rc`.
-///
-/// `machines[].rc_bin` names WHERE the binary lives on that machine — an absolute
-/// path when it is not on the non-login `PATH` an SSH exec sees — and the `rc`
-/// namespace is always appended.
-pub fn rc_prefix(entry: &MachineEntry) -> Vec<String> {
-    vec![
-        entry
-            .rc_bin
-            .as_deref()
-            .unwrap_or(DEFAULT_MACHINE_BIN)
-            .to_string(),
-        RC_NAMESPACE.to_string(),
-    ]
 }
 
 /// Non-interactive ssh to a machine, carrying `remote_argv` as one shell-quoted
@@ -144,10 +138,10 @@ pub fn forward_argv(entry: &MachineEntry, local_port: u16, remote_port: u16) -> 
     argv.push("-L".to_string());
     // **The bind address is explicit**, and must stay that way: with no bind
     // address ssh binds whatever `localhost` resolves to, which on a dual-stack
-    // host is `::1` AND `127.0.0.1` — but [`crate::hub_client::HubClient`] dials
-    // `127.0.0.1` specifically. An `AddressFamily inet6` in the operator's
-    // ssh_config would then produce a forward that looks perfectly healthy on
-    // `::1` while every hub read fails on `127.0.0.1`. Pinning it makes the bind
+    // host is `::1` AND `127.0.0.1` — but a client dials `127.0.0.1`
+    // specifically. An `AddressFamily inet6` in the operator's ssh_config would
+    // then produce a forward that looks perfectly healthy on `::1` while every
+    // read fails on `127.0.0.1`. Pinning it makes the bind
     // and the dial the same address by construction, and has the side benefit
     // that a taken v4 port trips `ExitOnForwardFailure` instead of quietly
     // succeeding on v6.
@@ -214,7 +208,6 @@ mod tests {
             host: "mini2.local".into(),
             user: Some("charliek".into()),
             ssh_port: 2022,
-            rc_bin: Some("/opt/bin/sx".into()),
             known_hosts: Some("/kh".into()),
         }
     }
@@ -276,18 +269,35 @@ mod tests {
     }
 
     #[test]
-    fn forward_argv_binds_the_loopback_hub_port_and_fails_loudly() {
-        let argv = forward_argv(&full(), 40123, crate::hub_client::HUB_PORT);
+    fn forward_argv_binds_the_loopback_port_and_fails_loudly() {
+        let argv = forward_argv(&full(), 40123, 1029);
         assert!(argv.contains(&"-N".to_string()));
         assert!(argv.contains(&"ExitOnForwardFailure=yes".to_string()));
         // The BIND ADDRESS is pinned, not left to `localhost` resolution — the
-        // hub client dials 127.0.0.1 specifically, so the forward must bind
-        // exactly that (see the builder's comment).
+        // client dials 127.0.0.1 specifically, so the forward must bind exactly
+        // that (see the builder's comment).
         assert!(argv
             .windows(2)
             .any(|w| w == ["-L", "127.0.0.1:40123:127.0.0.1:1029"]));
         // The destination is last — nothing to run remotely.
         assert_eq!(argv.last().unwrap(), "charliek@mini2.local");
+    }
+
+    /// Moved here with the function itself when S6 deleted `rc_agents.rs`
+    /// (mirrors Go's `TestShellQuote`, `rc_test.go:57`).
+    #[test]
+    fn shell_quote_always_wraps() {
+        for (input, want) in [
+            ("plain", "'plain'"),
+            ("two words", "'two words'"),
+            ("it's mine", r"'it'\''s mine'"),
+            // The pin that separates this from terminal.rs's conditional quoter:
+            // a "safe" token is STILL wrapped.
+            ("my-shed/abc", "'my-shed/abc'"),
+            ("", "''"),
+        ] {
+            assert_eq!(shell_quote_always(input), want, "input {input:?}");
+        }
     }
 
     #[test]
@@ -305,6 +315,8 @@ mod tests {
 machines:
     mini2:
         host: mini2.local
+        # An unknown key (retired with sx's rc_bin plumbing, C8): resolve()
+        # must still find this entry.
         rc_bin: /opt/homebrew/bin/sx
     plain: {}
 ",
@@ -312,23 +324,13 @@ machines:
     }
 
     #[test]
-    fn resolving_a_machine_reads_its_entry_and_its_rc_prefix() {
+    fn resolving_a_machine_reads_its_entry() {
         let cfg = config();
         let entry = resolve(&cfg, "mini2").unwrap();
         assert_eq!(entry.host, "mini2.local");
-        // An override says WHERE the binary lives; the `rc` namespace is still
-        // appended.
-        assert_eq!(
-            rc_prefix(entry),
-            vec!["/opt/homebrew/bin/sx".to_string(), "rc".to_string()]
-        );
 
         let entry = resolve(&cfg, "plain").unwrap();
         assert_eq!(entry.host, "plain");
-        assert_eq!(
-            rc_prefix(entry),
-            vec![DEFAULT_MACHINE_BIN.to_string(), "rc".to_string()]
-        );
     }
 
     #[test]

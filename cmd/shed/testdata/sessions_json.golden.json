@@ -1,0 +1,146 @@
+{
+  "_header": [
+    "This fixture pins the EXACT `shed sessions --json` document the ROOST path",
+    "produces (plan 022 C5c): a FLAT array, one entry per row, in the same order the",
+    "table prints -- per shed, the roost tabs and then the tmux rows.",
+    "",
+    "What it exists to catch: a renamed, dropped, added or reordered key. The array",
+    "is what scripts read, and the C5c rule is that it stays ADDITIVE -- a tmux entry",
+    "is byte-for-byte the config.Session it always was, plus \"source\":\"tmux\"; a roost",
+    "entry borrows that same shape (\"name\" is the TAB TITLE, which is what",
+    "`shed sessions kill <shed> <name>` takes) and nests everything roost-specific",
+    "under \"roost\". Consumed by cmd/shed/sessions_roost_test.go:",
+    "TestSessionsJSONGolden, which feeds `listings` to mergedSessionRows and compares",
+    "the compacted marshalling against `want_json`.",
+    "",
+    "Two shapes are deliberately visible here and neither is a bug:",
+    "  - a roost row's \"attached\" is always false and its \"window_count\" is absent --",
+    "    a tab has neither, and its liveness is roost.state, not a second answer;",
+    "  - a tab from an older session carries no created_at and no agent_lifecycle, so",
+    "    it serializes as the zero time and an empty \"agent\". The CREATED column",
+    "    renders that as `unknown`.",
+    "",
+    "The tmux FLOOR (--tmux / SHED_ATTACH=tmux / no local roost) is NOT this shape:",
+    "it prints today's bare config.Session array with no \"source\" key at all, which",
+    "TestSessionsJSONFloorHasNoSourceKey pins separately.",
+    "",
+    "If a change to the rendering makes this go red, the fix is almost always in that",
+    "new code, not in this fixture -- an array key is somebody's script."
+  ],
+  "scenarios": [
+    {
+      "name": "roost_tab_then_tmux_row",
+      "doc": "one shed with a tab shed opened (titled and locked) and a tmux session of the same name: the tab comes first, both carry their source",
+      "listings": [
+        {
+          "server": "mini3",
+          "shed": "myproj",
+          "tabs": [
+            {
+              "id": "5",
+              "project_id": "1",
+              "title": "default",
+              "cwd": "/home/shed/myproj",
+              "state": "running",
+              "agent_lifecycle": "working",
+              "created_at": 1700000000
+            }
+          ],
+          "tmux": [
+            {
+              "name": "default",
+              "shed_name": "myproj",
+              "server_name": "mini3",
+              "created_at": "2023-11-14T21:00:00Z",
+              "attached": true,
+              "window_count": 2
+            }
+          ]
+        }
+      ],
+      "want_json": [
+        {
+          "name": "default",
+          "shed_name": "myproj",
+          "server_name": "mini3",
+          "created_at": "2023-11-14T22:13:20Z",
+          "attached": false,
+          "source": "roost",
+          "roost": {
+            "tab_id": "5",
+            "state": "running",
+            "agent": "working",
+            "cwd": "/home/shed/myproj"
+          }
+        },
+        {
+          "name": "default",
+          "shed_name": "myproj",
+          "server_name": "mini3",
+          "created_at": "2023-11-14T21:00:00Z",
+          "attached": true,
+          "window_count": 2,
+          "source": "tmux"
+        }
+      ]
+    },
+    {
+      "name": "two_servers_and_an_older_session",
+      "doc": "the fleet shape: sheds ordered by (server, shed), a shed whose only rows are roost tabs, a shed whose only rows are tmux sessions, and a tab from a session that reports neither created_at nor agent_lifecycle",
+      "listings": [
+        {
+          "server": "mini3",
+          "shed": "api",
+          "tabs": [
+            {
+              "id": "3",
+              "project_id": "1",
+              "title": "zsh",
+              "cwd": "/home/shed",
+              "state": "none"
+            }
+          ],
+          "tmux": []
+        },
+        {
+          "server": "mini4",
+          "shed": "web",
+          "tabs": [],
+          "tmux": [
+            {
+              "name": "build",
+              "shed_name": "web",
+              "server_name": "mini4",
+              "created_at": "2023-11-14T21:00:00Z",
+              "attached": false
+            }
+          ]
+        }
+      ],
+      "want_json": [
+        {
+          "name": "zsh",
+          "shed_name": "api",
+          "server_name": "mini3",
+          "created_at": "0001-01-01T00:00:00Z",
+          "attached": false,
+          "source": "roost",
+          "roost": {
+            "tab_id": "3",
+            "state": "none",
+            "agent": "",
+            "cwd": "/home/shed"
+          }
+        },
+        {
+          "name": "build",
+          "shed_name": "web",
+          "server_name": "mini4",
+          "created_at": "2023-11-14T21:00:00Z",
+          "attached": false,
+          "source": "tmux"
+        }
+      ]
+    }
+  ]
+}

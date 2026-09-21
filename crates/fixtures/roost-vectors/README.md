@@ -26,9 +26,10 @@ When the pinned `rev` in `crates/Cargo.toml` moves:
 
 1. re-copy these files from the new rev's `tests/ipc-vectors/`,
 2. update the sha in this README,
-3. run `cargo test -p shed-core` **and** `go test ./internal/roostprovider/...`
-   **and** the shedtest suite — the two fakes and the decoders read these in
-   three languages, so a shape change surfaces as a test failure rather than as
+3. run `cargo test -p shed-core` **and**
+   `go test ./internal/roostprovider/... ./internal/roostctl/...` **and** the
+   shedtest suite — the two fakes and the decoders read these in three
+   languages, so a shape change surfaces as a test failure rather than as
    silence, but only in the language that reads the file that moved.
 
 **Generation-suffixed names.** roost keeps one `session.identify` reply per
@@ -61,8 +62,14 @@ red `go test ./...` rather than a stale read.
 | file | read by |
 |---|---|
 | `session.identify.response.v6.json` | both fakes' `session.identify` template (the protocol gate's input); the fence tests' `daemon_session_id` / `started_at`; Go's `SpokenProtocol` pin |
-| `identify.response.json` | the fake's `identify` template |
-| `tab.list.session.response.json` | the fake's initial project/tab set — the **session** variant, i.e. the one that carries `revision` (42); the fence replay's snapshot |
+| `identify.response.json` | the fake's `identify` template; Go's `internal/roostctl` — the **UI-socket** identity `roostctl identify --json` prints, which is what the local-roost gate reads (note its `protocol_version` is the UI protocol, NOT the session one) |
+| `tab.list.session.response.json` | the fake's initial project/tab set — the **session** variant, i.e. the one that carries `revision` (42); the fence replay's snapshot; Go's `internal/roostprovider/wire_test.go` decode pin |
+| `tab.list.response.json` | the **UI** variant of the same reply — identical project/tab shapes, no `revision`. Go's `internal/roostprovider/wire_test.go` pins `Project.Tabs` / `Tab` against it, which is why it is vendored at all: the provider grew a tab model in plan 022 C5a and a hand-written tab fixture would have been a shape remembered rather than one roost publishes |
+| `app.sidebar_dump.response.json` | Go's `internal/roostctl/client_test.go` — the `SidebarDump` decode pin. Vendored for one field: `hosts[].projects[].tabs[].key`, the `h<incarnation>.<id>` spelling, which is the ONLY place the numeric host incarnation reaches the wire and exactly what `roostctl tab focus --tab` takes (a saved host's opaque string `id` will not do) |
+| `host.status.response.json` | Go's `internal/roostctl/client_test.go` — the `HostStatus` decode pin for the NOT-connected shapes. Vendored because plan 022's attach flow reads `generation` and `state` off exactly this reply to decide whether a connect has landed; roost's own vector carries both a mid-retry host (`generation: 3`, with a `reason`) and one that has never connected (`generation: 0`, no `reason`), and the second is the case a hand-written fixture would not have thought to include |
+| `host.status.connect.response.json` | same reader — the state the generation fence is waiting FOR (`state: "connected"`). Also carries `connect`, `payload_kind` and `rollup`, which shed deliberately does not model, so it doubles as the pin that unmodelled fields do not break the decode |
+| `host.list.response.json` | same reader — pins the documented difference from `host status`: `host list` is the saved-host REGISTRY alone, with no `state` and no `generation`. A caller reaching for either here would silently read a zero value |
+| `host.connect.response.json`, `host.add.response.json` | same reader — the two envelopes the registry verbs answer with (`{"host":…}` and `{"host":…,"state":…}`), so the whole saved-host verb set this repo drives is pinned to roost's published shapes rather than to a mix of published and remembered ones. `host.connect`'s is also where `state: "connecting"` comes from: a connect returns once the attempt is under way, not once it has settled |
 | `tab.open.response.json` | the fake's template for a tab it opens |
 | `response.error.json` | the fake's error-envelope shape (`unknown-op`) |
 | `events.batch.json` | the fence replay's batch shape (`{revision, events: […]}`), its revision-42 replay, and the envelope the fake commits every mutation as |

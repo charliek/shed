@@ -1,0 +1,49 @@
+{
+  "id": "21",
+  "ok": true,
+  "result": {
+    "agents_visible": true,
+    "projects": [
+      {
+        "project_id": "1",
+        "agents": [
+          {
+            "tab_id": "7",
+            "name": "slauth-refactor",
+            "lifecycle": "waiting",
+            "status_text": "Waiting for input",
+            "time_text": "2m",
+            "is_active": false
+          }
+        ]
+      },
+      {
+        "project_id": "2",
+        "agents": []
+      }
+    ],
+    "hosts": [
+      {
+        "id": "hs-2f1c",
+        "label": "workbench",
+        "state": "connected",
+        "projects": [
+          {
+            "key": "h3.4",
+            "name": "roost",
+            "tabs": [
+              { "key": "h3.9", "title": "zsh" },
+              { "key": "h3.7", "title": "claude" }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "hs-9d40",
+        "label": "laptop",
+        "state": "disconnected",
+        "projects": []
+      }
+    ]
+  }
+}

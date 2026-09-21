@@ -35,6 +35,7 @@ from fake_roost import (
     STREAM_WRITE_DEADLINE,
     FakeRoost,
     RoostWireError,
+    ownership,
     roost_call,
 )
 
@@ -147,6 +148,77 @@ def test_the_vendored_vectors_carry_what_the_fake_reads(roost):
     listed = roost_call(roost.socket_path, "tab.list")
     assert isinstance(listed["revision"], int)
     assert [t["id"] for p in listed["projects"] for t in p["tabs"]] == ["5"]
+
+
+def test_an_added_tab_is_a_row_only_when_something_owns_it(roost):
+    """`add_tab` is the control every row in this harness comes from — and the
+    source is what decides whether a tab IS a row. (The Rust twin is
+    `an_added_tab_is_a_row_only_when_something_owns_it`.)
+
+    An unowned tab is somebody's terminal, which roost's wire spells as no
+    `ownership` KEY at all rather than a null one — fifteen terminals must not be
+    fifteen cards. The `metadata` bag is what carries an `agent_lane` stamp, so
+    it has to survive the trip verbatim.
+    """
+    before = roost.revision
+    roost.add_tab(41, cwd="/home/shed/work", title="OC | a real one",
+                  source="opencode", session_id="ses_added", lifecycle="working",
+                  metadata={"server_url": "http://127.0.0.1:4096"})
+    roost.add_tab(42, cwd="/home/shed", title="shed@mini3: ~")
+    assert roost.revision == before + 2, "one tab.opened batch each"
+
+    tabs = {t["id"]: t for p in roost_call(roost.socket_path, "tab.list")["projects"]
+            for t in p["tabs"]}
+    assert set(tabs) == {"5", "41", "42"}
+    owned = tabs["41"]
+    assert owned["cwd"] == "/home/shed/work"
+    assert owned["title"] == "OC | a real one"
+    assert owned["ownership"]["session_id"] == "ses_added"
+    assert owned["ownership"]["metadata"] == {"server_url": "http://127.0.0.1:4096"}
+    assert "ownership" not in tabs["42"], "a shell tab carries no ownership key"
+
+    # …and a later `tab.open` does not reuse an id `add_tab` already handed out.
+    opened = roost_call(roost.socket_path, "tab.open", {"cwd": "/home/shed"})["tab"]
+    assert int(opened["id"]) > 42, opened
+
+    # Both controls default `cwd`/`title` the way `TabSpec::default()` does, so
+    # a test that only cares about ownership can say so and nothing else.
+    roost.add_tab(43)
+    bare = {t["id"]: t for p in roost_call(roost.socket_path, "tab.list")["projects"]
+            for t in p["tabs"]}["43"]
+    assert (bare["cwd"], bare["title"]) == ("/home/shed", "zsh"), bare
+
+
+def test_a_blank_ownership_source_is_refused_like_the_real_daemon(roost):
+    """**The fakes must refuse what the server refuses.** (The Rust twin is
+    `a_blank_ownership_source_is_refused_like_the_real_daemon`.)
+
+    roost's `validate_report` answers `EmptySource` before it mutates anything,
+    and `is_live` reads a blank source as unowned — so an ownership with `""` is
+    a row the real daemon can never produce. This fake used to read `source=""`
+    as "no source" and quietly hand back a plain terminal, while the Rust twin
+    read it as ownership and minted an impossible row: two fakes disagreeing, and
+    one of them more permissive than the thing it stands in for. Both refuse now.
+
+    `None` is the only spelling of unowned, on both sides.
+    """
+    with pytest.raises(ValueError, match="empty ownership.source"):
+        roost.add_tab(51, source="")
+    with pytest.raises(ValueError, match="empty ownership.source"):
+        ownership("", "ses_x", "session_status", 0)
+    # The hand-written door too — a test that spelled the object itself rather
+    # than calling the constructor.
+    with pytest.raises(ValueError, match="empty ownership.source"):
+        roost.set_axes(5, ownership={"source": "", "session_id": "s",
+                                     "detail": "", "last_event_at": 0,
+                                     "metadata": {}})
+
+    # None still means a plain terminal, and it is still not a row.
+    roost.add_tab(52)
+    tabs = {t["id"]: t for p in roost_call(roost.socket_path, "tab.list")["projects"]
+            for t in p["tabs"]}
+    assert "51" not in tabs, "the refusal added nothing"
+    assert "ownership" not in tabs["52"]
 
 
 # ---------------------------------------------------------------------------

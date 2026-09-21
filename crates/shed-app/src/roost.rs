@@ -1146,7 +1146,7 @@ fn write_private(path: &Path, contents: &[u8]) -> std::io::Result<()> {
 /// shape the bridge already takes — no second transport, no second host-key
 /// posture, no second place for the port to be wrong.
 ///
-/// Three fields are decided rather than copied:
+/// Two fields are decided rather than copied:
 ///
 /// * **`name` is the target grammar's own token**, `roost:<server>/<shed>`, not
 ///   the shed's bare name. It is what every sentence, row origin and
@@ -1157,9 +1157,6 @@ fn write_private(path: &Path, contents: &[u8]) -> std::io::Result<()> {
 /// * **`known_hosts` is always pinned.** shed mints these host keys itself, so
 ///   unlike a `machines:` entry there is no user `ssh_config` to defer to and no
 ///   case where deferring would be right.
-/// * **`rc_bin` is `None`.** This entry is never an RC target; it exists to be
-///   handed to a roost reach. (Pin P7 keeps `machines[].rc_bin` out of scope
-///   entirely.)
 pub fn shed_reach_entry(server: &shed_core::config::ShedServerEntry, shed: &str) -> MachineEntry {
     MachineEntry {
         name: format!("roost:{}/{}", server.name, shed),
@@ -1174,7 +1171,6 @@ pub fn shed_reach_entry(server: &shed_core::config::ShedServerEntry, shed: &str)
         },
         user: Some(shed.to_string()),
         ssh_port: server.ssh_port,
-        rc_bin: None,
         known_hosts: Some(crate::backend::known_hosts_path()),
     }
 }
@@ -1240,11 +1236,13 @@ pub enum RoostUpdate {
 
 /// A reconnecting **observer** over one roost-session's inventory.
 ///
-/// Deliberately the same shape as [`crate::machine::MachineHubWatcher`]:
 /// [`spawn`] starts the loop and hands back the receiver, [`stop`] (and `Drop`)
-/// aborts it, and it is not restartable. The backoff is the same shared
-/// schedule with the same reset-on-worked rule, so a roost row and a hub row in
-/// one sessions view go stale at the same rate.
+/// aborts it, and it is not restartable — the shape the retired
+/// `MachineHubWatcher` shared with it. The backoff is this crate's private
+/// `backoff` module (no longer `pub`: plan 022 (S6, `charliek/shed#328`) took
+/// its second consumer, so it is not linkable from public docs) — the shared
+/// schedule with its reset-on-worked rule, so every row in one sessions view
+/// goes stale at the same rate.
 ///
 /// **Nothing here has a cadence.** Since roost R1 a subscribe is a plain
 /// request — since session protocol 5 it takes no token and there is no such thing
@@ -2942,7 +2940,6 @@ mod tests {
             host: name.to_string(),
             user: None,
             ssh_port: 22,
-            rc_bin: None,
             known_hosts: None,
         }
     }
@@ -4949,9 +4946,7 @@ except Exception:
     fn write_exec_ssh(dir: &Path, env: &[(&str, String)]) -> PathBuf {
         let assignments = env
             .iter()
-            .map(|(key, value)| {
-                format!("{key}={}", shed_core::rc_agents::shell_quote_always(value))
-            })
+            .map(|(key, value)| format!("{key}={}", shed_core::machine::shell_quote_always(value)))
             .collect::<Vec<_>>()
             .join(" ");
         let script = format!(
@@ -5342,7 +5337,6 @@ exec {env_bin} -i {assignments} /bin/sh -c "$remote"
         assert_eq!(reach.host, "10.0.0.4");
         assert_eq!(reach.user.as_deref(), Some("p019-a"));
         assert_eq!(reach.ssh_port, 2222);
-        assert_eq!(reach.rc_bin, None);
         assert!(
             reach
                 .known_hosts
@@ -5499,7 +5493,6 @@ esac
                 host: "10.0.0.4".to_string(),
                 user: Some("p019-a".to_string()),
                 ssh_port: 2222,
-                rc_bin: None,
                 known_hosts: None,
             };
             let exec = SshExec::new(&entry, &exec_options(ssh)).expect("exec");

@@ -352,8 +352,13 @@ _SHED_EXTENSIONS_BINARIES = (
     "/usr/local/bin/shed-ext-ssh-agent",
     "/usr/local/bin/shed-ext-aws-credentials",
     "/usr/local/bin/docker-credential-shed",
-    "/usr/local/bin/shed-ext-rc",
 )
+
+# Developer tools installed from the stridelabs apt repo in the extensions
+# stage (strix: a TUI for staging/diffs; prox: a process manager with an
+# HTTP API + TUI). Not part of the shed-extensions credential-brokering
+# payload above, but added by the same stage's Dockerfile RUN block.
+_STRIDELABS_APT_TOOLS = ("strix", "prox")
 
 # systemd units + config files staged from guest/extensions/etc/ (via
 # stage-guest-binaries.sh -> ext-etc/) and installed by the extensions stage.
@@ -408,6 +413,25 @@ def test_extensions_image_smoke(shed_server, test_shed_name):
             f"stage-guest-binaries.sh likely failed to stage this binary, or "
             f"the extensions-stage install RUN in vz/Dockerfile / "
             f"firecracker/Dockerfile regressed."
+        )
+
+    # shed-ext-rc (the guest RC helper) was removed from the image in plan
+    # 022/S6 — assert it stays gone rather than silently reappearing.
+    r = shed_server.exec(test_shed_name, ["test", "-e", "/usr/local/bin/shed-ext-rc"])
+    assert r.returncode != 0, (
+        "/usr/local/bin/shed-ext-rc is present in the booted shed, but "
+        "shed-ext-rc was removed from the image in plan 022/S6 (shed#328) "
+        "— check the extensions-stage install RUN in vz/Dockerfile / "
+        "firecracker/Dockerfile."
+    )
+
+    for tool in _STRIDELABS_APT_TOOLS:
+        r = shed_server.exec(test_shed_name, [tool, "--version"])
+        assert r.returncode == 0, (
+            f"`{tool} --version` failed in the booted shed: "
+            f"exit={r.returncode} stdout={r.stdout!r} stderr={r.stderr!r}. "
+            f"Check the stridelabs apt repo RUN in the extensions stage of "
+            f"vz/Dockerfile / firecracker/Dockerfile."
         )
 
     for unit in _SHED_EXTENSIONS_UNITS:

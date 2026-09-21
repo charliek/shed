@@ -55,16 +55,17 @@ run: bundle  ## Build the bundle and launch it
 core:  ## Build the Rust core + generate Swift UniFFI bindings (xcframework)
 	./scripts/build-core.sh debug
 
-core-test:  ## cargo test the Rust core workspace (+ the non-default `rc` feature)
+core-test:  ## cargo test the Rust core workspace (+ the non-default `broker` feature)
 	cd ../crates && cargo test
-	# `rc` (B2 Agents/RC) is non-default, so a bare `cargo test` skips its tests
-	# (the RcRunner timeout watchdog, the filter-aware list reconcile, slug/argv).
-	cd ../crates && cargo test -p shed-app --features rc
+	# `broker` (the embedded host-agent bridge) is non-default, so a bare
+	# `cargo test` skips `broker_bridge.rs` entirely. `rc` was the other
+	# non-default feature until plan 022 (S6, charliek/shed#328) deleted it.
+	cd ../crates && cargo test -p shed-app --features broker
 
-core-lint:  ## cargo clippy the Rust core (deny warnings; + the `rc` feature)
+core-lint:  ## cargo clippy the Rust core (deny warnings; + the `broker` feature)
 	cd ../crates && cargo clippy --workspace --all-targets -- -D warnings
-	# The default clippy above never compiles the `rc` module (non-default feature).
-	cd ../crates && cargo clippy -p shed-app --features rc --all-targets -- -D warnings
+	# The default clippy above never compiles the `broker` module.
+	cd ../crates && cargo clippy -p shed-app --features broker --all-targets -- -D warnings
 
 core-fmt:  ## cargo fmt the Rust core
 	cd ../crates && cargo fmt --all

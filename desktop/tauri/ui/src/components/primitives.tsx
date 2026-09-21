@@ -77,7 +77,6 @@ export function ImageChip({ children }: { children: React.ReactNode }) {
     opencode=blue, everything else muted). */
 const AGENT_COLOR: Record<string, string> = {
   "claude-rc": "var(--shed-accent)",
-  "claude-broker": "var(--shed-accent)",
   "claude-code": "var(--shed-accent)",
   codex: "#10A37F",
   "codex-rc": "#10A37F",
@@ -244,9 +243,15 @@ export function HeadAction({
 }
 
 /** The empty-state card (accent-tinted glyph tile + title + body). */
-export function Empty({ icon: Icon, title, body }: { icon: LucideIcon; title: string; body: string }) {
+export function Empty({ icon: Icon, title, body, action }: {
+  icon: LucideIcon; title: string; body: string;
+  /** An optional offer under the sentence — the one thing to DO about this
+   *  emptiness. Absent when there is nothing to offer (a pane that cannot see,
+   *  as opposed to one that saw nothing). */
+  action?: { label: string; onClick: () => void };
+}) {
   return (
-    <div className={cn(cardCls, "flex flex-col items-center gap-3 px-6 py-[52px] text-center")}>
+    <div className={cn(cardCls, "flex flex-col items-center gap-3 px-6 py-[52px] text-center")} data-empty={title}>
       <div
         className="flex h-[50px] w-[50px] items-center justify-center rounded-[13px] border"
         style={{ background: "var(--shed-accent-subtle)", borderColor: "var(--shed-accent-border)" }}
@@ -255,6 +260,15 @@ export function Empty({ icon: Icon, title, body }: { icon: LucideIcon; title: st
       </div>
       <div className="text-[17px] font-semibold text-shed-text">{title}</div>
       <div className="max-w-[340px] text-[14px] leading-relaxed text-shed-text-muted">{body}</div>
+      {action && (
+        <button
+          onClick={action.onClick}
+          className="hbtn mt-1 inline-flex items-center rounded-[9px] px-[18px] py-2.5 text-[13px] font-semibold"
+          style={{ background: "var(--shed-accent)", color: "var(--shed-accent-fg)", border: "none" }}
+        >
+          {action.label}
+        </button>
+      )}
     </div>
   );
 }

@@ -13,9 +13,6 @@
     "docker-credentials": "deny-all",
     "ssh-agent": "shed-desktop"
   },
-  "rc_hub": {
-    "state": "disabled"
-  },
   "schema": 1,
   "servers": [],
   "started_at": "<ts>",

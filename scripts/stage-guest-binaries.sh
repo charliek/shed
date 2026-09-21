@@ -7,8 +7,8 @@
 # install them from the context (`--mount=type=bind,source=.,target=/ctx`)
 # instead of `COPY --from=` a published ghcr.io/charliek/shed-extensions image.
 #
-# It cross-compiles the four guest binaries — shed-ext-ssh-agent,
-# shed-ext-aws-credentials, docker-credential-shed, shed-ext-rc — for
+# It cross-compiles the three guest binaries — shed-ext-ssh-agent,
+# shed-ext-aws-credentials, docker-credential-shed — for
 # linux/<goarch> (CGO disabled; version-stamped via the same -X ldflags the
 # Makefile uses, see below), then mirrors guest/extensions/etc/ into
 # <context-dir>/ext-etc/.
@@ -54,7 +54,7 @@ LDFLAGS="-X github.com/charliek/shed/internal/version.Version=$VERSION -X github
 
 # Guest extension binaries. CGO disabled so the linux/<goarch> cross-compile
 # is static and needs no host toolchain.
-for cmd in shed-ext-ssh-agent shed-ext-aws-credentials docker-credential-shed shed-ext-rc; do
+for cmd in shed-ext-ssh-agent shed-ext-aws-credentials docker-credential-shed; do
     echo "=== Building $cmd (linux/$goarch) ==="
     CGO_ENABLED=0 GOOS=linux GOARCH="$goarch" \
         go build -ldflags "$LDFLAGS" -o "$ctx_dir/$cmd" "./cmd/$cmd"

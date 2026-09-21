@@ -9,12 +9,10 @@ require (
 	github.com/creack/pty v1.1.21
 	github.com/distribution/reference v0.6.0
 	github.com/firecracker-microvm/firecracker-go-sdk v1.0.1-0.20251224190957-6fb280e993d4
-	github.com/fsnotify/fsnotify v1.10.1
 	github.com/gliderlabs/ssh v0.3.8
 	github.com/go-chi/chi/v5 v5.2.4
 	github.com/google/cel-go v0.28.1
 	github.com/google/go-containerregistry v0.21.5
-	github.com/google/uuid v1.6.0
 	github.com/hugelgupf/p9 v0.3.0
 	github.com/mdlayher/vsock v1.2.1
 	github.com/sirupsen/logrus v1.9.4
@@ -48,6 +46,7 @@ require (
 	github.com/go-openapi/strfmt v0.23.0 // indirect
 	github.com/go-openapi/swag v0.23.0 // indirect
 	github.com/go-openapi/validate v0.24.0 // indirect
+	github.com/google/uuid v1.6.0 // indirect
 	github.com/hashicorp/errwrap v1.1.0 // indirect
 	github.com/hashicorp/go-multierror v1.1.1 // indirect
 	github.com/inconshreveable/mousetrap v1.1.0 // indirect

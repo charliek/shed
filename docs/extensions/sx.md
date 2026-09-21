@@ -22,18 +22,20 @@ moved:
 |---|---|
 | Kickoff (`agent`, `plan`) | Roost's own palette, via the [`shed` dynamic-provider script](roost-provider.md) (S4, [`charliek/shed#326`](https://github.com/charliek/shed/issues/326)). |
 | Observe (`ls`, `watch`, `attach`, `kill`) | The desktop and mobile clients, reading roost directly. |
-| Engine-compat (`sx rc <subcommand>`) | The guest [`shed-ext-rc`](rc-helper.md), until the RC hub is retired (S6, [`charliek/shed#328`](https://github.com/charliek/shed/issues/328)). |
+| Engine-compat (`sx rc <subcommand>`) | Gone with the RC hub itself, retired in S6 ([`charliek/shed#328`](https://github.com/charliek/shed/issues/328), plan 022) — see [`shed-ext-rc` (retired)](rc-helper.md). There is no engine-compat surface any more, `sx` or otherwise. |
 
-!!! warning "The S7 → S6 window"
-    `machines[].rc_bin` still defaults to `sx`, and the desktop's Add-Machine dialog
-    still asks for its path — that wiring is S6's to remove, not this plan's. A
-    machine's RC sessions keep working only where a **pre-sunset** `sx` binary is
-    already installed, and after this sunset there is no way to install one anywhere
-    else. Machine *status* is unaffected: it has read roost, not `sx`, since plan 013.
+!!! note "The S7 → S6 window has closed"
+    Until S6 landed, `machines[].rc_bin` still defaulted to `sx` and the desktop's
+    Add-Machine dialog still asked for its path. S6 removed both: `rc_bin` is gone from
+    the Rust config model and the Add-Machine dialog (the Go CLI's config model never
+    modeled `rc_bin` at all — plan 019 pin P7 deliberately left it Rust/desktop-only). A
+    `~/.shed/config.yaml` that still carries `rc_bin:` under a machine loads unchanged on
+    both sides — the key is ignored, not rejected. Machine *status* was unaffected
+    throughout — it has read roost, not `sx`, since plan 013.
 
 ## See also
 
-- [`shed-ext-rc` (RC session helper)](rc-helper.md) — the wire contract, kinds,
-  permission modes, JSON DTO, exit codes, and the activity hub, including
-  [the machine hub](rc-helper.md#the-machine-hub-shed-host-agent) `sx` used to probe.
+- [`shed-ext-rc` (retired)](rc-helper.md) — what replaced RC sessions end to end:
+  roost tabs, `shed attach`/`shed sessions`, and the roost provider/session-hosts
+  mechanism.
 - [`shed-machine-rc`](shed-machine-rc.md) — the retired Go engine `sx` absorbed.

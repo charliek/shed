@@ -383,9 +383,9 @@ OUTPUT_DIR="$HOME/Library/Application Support/shed-dev/vz" \
 OUTPUT_DIR="$HOME/Library/Application Support/shed-dev/vz" \
   ./scripts/build-vz-rootfs.sh --variant base --build-tools-version dev
 
-# Note on guest extension changes: the four guest binaries
-# (shed-ext-ssh-agent, shed-ext-aws-credentials, docker-credential-shed,
-# shed-ext-rc) and the guest/extensions/etc/ overlay are built in-tree and
+# Note on guest extension changes: the three guest binaries
+# (shed-ext-ssh-agent, shed-ext-aws-credentials, docker-credential-shed)
+# and the guest/extensions/etc/ overlay are built in-tree and
 # staged into the build context by scripts/stage-guest-binaries.sh, which
 # the build script calls automatically. There is no SHED_EXT_VERSION /
 # --shed-ext-version any more — edit cmd/shed-ext-* or guest/extensions/etc/

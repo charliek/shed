@@ -130,7 +130,7 @@ pub const PROBE_TOKEN_SENTINEL: &str = "===token===";
 ///    -spawn wide, and the trust boundary here is already "same UID on that
 ///    host", the same one roost's socket has.
 /// 4. **No single quote appears in it.** The script crosses SSH as one
-///    shell-quoted argument (`shed_core::rc_agents::shell_quote_always`
+///    shell-quoted argument (`shed_core::machine::shell_quote_always`
 ///    single-quote-wraps and rewrites `'` as `'\''`), which survives a quote
 ///    fine — but a golden that pins this string, in `tests/machine-transport`'s
 ///    `gx-probe` scenario and in shed-mobile's Dart composer after it, is worth

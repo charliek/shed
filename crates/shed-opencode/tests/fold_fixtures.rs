@@ -3,7 +3,8 @@
 //!
 //! - `fixtures/opencode_turn.golden.json` (C2) is a **fidelity** pin. It is a
 //!   recording of what the rc hub's fold
-//!   (`shed_broker::rc_hub::watch_opencode::OpencodeFold`) produced on
+//!   (`shed_broker::rc_hub::watch_opencode::OpencodeFold`, deleted with the hub
+//!   in plan 022 — this golden is the only surviving record of it) produced on
 //!   `crates/fixtures/jsonl/opencode_turn.jsonl` — a 32-line opencode **1.17.15**
 //!   turn — so the port matching it is evidence the port changed no behavior.
 //!   Because the OTHER program minted it, it is **not** regenerable from this

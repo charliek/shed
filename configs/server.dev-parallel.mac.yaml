@@ -68,12 +68,17 @@ mounts:
     target: /home/shed/.config/gh
     readonly: false
   # Linux cursor-agent tokens live OUTSIDE ~/.cursor, in ~/.config/cursor — mount
-  # ONLY this. Intentionally NOT mounting ~/.cursor: the rc hub's cursor preseed
-  # writes a hook relay into ~/.cursor/hooks.json (the only live signal a cursor
-  # session produces) and SKIPS that write whenever ~/.cursor is on a different
-  # device than $HOME (its host-auth-mount guard, PreseedCursorHooks in
-  # internal/ext/rc/preseed_cursor.go) — mounting ~/.cursor here would silently
-  # disable the hook feed for every cursor rc session on this dev server.
+  # ONLY this. That much is a fact about cursor and still holds.
+  #
+  # The reason for the "ONLY" is gone, in two steps. The rc hub's cursor preseed
+  # wrote a hook relay into ~/.cursor/hooks.json and skipped that write whenever
+  # ~/.cursor sat on a different device than $HOME, so mounting ~/.cursor here
+  # used to silently kill the hook feed. That preseed (internal/ext/rc/
+  # preseed_cursor.go) went in plan 014 with the cursor lane (c5e1012); the hub
+  # that hosted it went in plan 022/S6 (shed#328). Nothing breaks today if
+  # ~/.cursor is mounted — but nothing needs it either, and a narrower mount is
+  # the better default, so this is kept as-is rather than widened on the
+  # strength of a rationale that no longer applies.
   cursor_config:
     source: ~/.shed/mounts/cursor-config
     target: /home/shed/.config/cursor

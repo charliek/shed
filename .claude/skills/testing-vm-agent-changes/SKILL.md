@@ -158,18 +158,22 @@ shed -s my-server-dev exec dbg -- bash -c \
 ```
 
 **The same verify applies to the guest extension binaries.** Since the monorepo
-import, the `extensions` / `full` variants bake the four guest binaries
-(`shed-ext-ssh-agent`, `shed-ext-aws-credentials`, `docker-credential-shed`,
-`shed-ext-rc`) **in-tree** — cross-compiled from `cmd/shed-ext-*` and staged into
+import, the `extensions` / `full` variants bake the three guest binaries
+(`shed-ext-ssh-agent`, `shed-ext-aws-credentials`, `docker-credential-shed`)
+**in-tree** — cross-compiled from `cmd/shed-ext-*` and staged into
 the build context by `scripts/stage-guest-binaries.sh` (called by the rootfs
 scripts). There is no `ghcr.io/charliek/shed-extensions` image to `COPY --from`.
-If you changed a guest binary, build the `extensions` (or `full`) variant and
-confirm the VM runs **your** build — the dev-build convention is no ldflags, so
-the version is a dev string, not the last extensions release (`v0.4.9`):
+(A fourth binary, `shed-ext-rc`, was baked the same way through v0.8.x; it was
+dropped from the image in plan 022's S6 retirement — see
+[`shed-ext-rc` (retired)](../../../docs/extensions/rc-helper.md) — and `strix` +
+`prox`, installed from the stridelabs apt repo rather than built in-tree, took
+its place.) If you changed a guest binary, build the `extensions` (or `full`)
+variant and confirm the VM runs **your** build — the dev-build convention is no
+ldflags, so the version is a dev string, not the last extensions release:
 
 ```bash
 shed -s my-server-dev create dbg --image extensions
-shed -s my-server-dev exec dbg -- shed-ext-rc version   # must NOT report v0.4.9
+shed -s my-server-dev exec dbg -- docker-credential-shed version   # must report a dev string
 ```
 
 To extract+inspect the agent from a manifest without booting a VM (useful to
@@ -198,89 +202,28 @@ Edit agent → unit tests (Docker) → rebuild rootfs (step 2) → verify (step 
 integration (step 5). Comment-only edits don't change the binary, so they don't
 need a rebuild.
 
-## Guest extension binaries (`shed-ext-rc` and friends)
+## Guest extension binaries (`shed-ext-ssh-agent` and friends)
 
-The `cmd/shed-ext-*` binaries (notably **`shed-ext-rc`**, which now includes the resident
-`serve` **rc activity hub**) are baked into the `extensions`/`full` variants the same way
-`shed-agent` is baked into every variant — so the **full rebuild loop above applies
-unchanged**: edit `cmd/shed-ext-rc/` (or `internal/ext/rc/`) → rebuild the `extensions`
-variant (step 2, `--variant extensions`) → verify (`shed-ext-rc version` reports a dev
-string, step 4) → create a fresh shed. `internal/ext/rc/*.go` is **not** `//go:build
-linux`, so its unit tests run under plain `make test` on macOS (no Docker needed, unlike
-the agent tests).
+The surviving `cmd/shed-ext-*` binaries — `shed-ext-ssh-agent`, `shed-ext-aws-credentials`,
+`docker-credential-shed` — are baked into the `extensions`/`full` variants the same way
+`shed-agent` is baked into every variant, so the **full rebuild loop above applies
+unchanged**: edit `cmd/shed-ext-*` (or the `internal/ext/{sshagent,awsproxy,dockercred}`
+package behind it) → rebuild the `extensions` variant (step 2, `--variant extensions`) →
+verify (a `version` subcommand reports a dev string, step 4) → create a fresh shed.
+`internal/ext/*.go` is **not** `//go:build linux`, so its unit tests run under plain
+`make test` on macOS (no Docker needed, unlike the agent tests).
 
-> **Rebuild BOTH `extensions` AND `full` for the rc-hub integration tests.** The rc-hub
-> integration tests (`tests/integration/test_rc_enrichment.py`,
-> `tests/integration/test_rc_hub_activity.py`) provision their sheds from the
-> **`extensions`** alias (`server.create(shed, image="extensions")`), *not* the dev
-> server's usual `full` `default_image`. So a dev-image rebuild done only as
-> `--variant full` leaves the `extensions` alias pointing at a **stale** image — the rc
-> tests then run old guest code (or skip on an image that predates `shed-ext-rc serve`)
-> while looking green. When validating an rc change, rebuild **both**
-> `./scripts/build-vz-rootfs.sh --variant full …` **and** `--variant extensions …` (FC:
-> the matching `build-firecracker-rootfs.sh` invocations) so both aliases carry your build.
-> This two-variant rebuild requirement was correct before plan 008 and stays correct — no
-> change needed there.
-
-**New guest surfaces since plan 008 (opencode dual-control + cursor hooks):**
-`tests/integration/test_rc_kickoff.py` now gives CLI-path coverage — `shed attach
---kind shell -d` end to end through the client CLI's own argv-building, flag
-validation, and plain-text output rendering (see its module docstring). What it does
-NOT cover, because both need a real agent login plus a rebuilt rootfs and so stay out
-of CI's reach for now, are the two guest-side runtime surfaces below — smoke these by
-hand when touching the rc hub:
-
-- **opencode verbs** (`turn`/`interrupt`/`approvals/{id}`, live only for opencode):
-  create an opencode rc session on the rebuilt image, drive a turn/interrupt/approval
-  through `curl` against the server's `/api/sheds/{name}/rc/v1/sessions/{slug}/{verb}`
-  proxy route (or the guest-local hub port directly, `shed exec <shed> curl
-  127.0.0.1:1029/v1/sessions`), and confirm the steer renders in the attached TUI at
-  the same time — that's the dual-control property the whole design bets on. Two
-  sessions in one opencode store is the WS-B regression to re-check by hand
-  occasionally: steering session A must never touch session B. Runnable example below.
-- **cursor hook ingestion**: create a cursor rc session on a host with cursor auth
-  mounted (`~/.config/cursor`, **not** `~/.cursor` — see
-  `docs/reference/configuration.md`), run a turn, and confirm the feed
-  (`GET .../messages`) picks up hook-derived rows (`beforeSubmitPrompt`, tool
-  use/result, `afterAgentResponse`) and that `~/.shed-rc-hub/hub.log` shows no
-  `hooks.json` write-skip warning (the foreign-device guard). If cursor auth mounts
-  aren't set up on the dev host, this leg is Mac-local-hub-only — see the plan's
-  §Verified conditionality note for AC-3.
-
-Copy-pasteable opencode-verb smoke, against the parallel dev server (`make
-dev-server-up`, port 18080) — full route reference in `docs/extensions/rc-helper.md`
-§Contract-v2 verbs:
-
-```bash
-# 1. Create an opencode rc session on the rebuilt image (prints the session DTO,
-#    including "slug"); opencode must already be logged in on that host.
-shed -s my-server-dev attach dbg --kind opencode -d
-
-# 2. Drive a turn through the SERVER'S PROXY route. 18080 is the dev server's
-#    http_port; if the dev config runs `auth.mode: token`, add
-#    `-H "Authorization: Bearer <token>"` (see docs/development/testing.md).
-curl -sS -X POST \
-  http://127.0.0.1:18080/api/sheds/dbg/rc/v1/sessions/<slug>/turn \
-  -H 'content-type: application/json' \
-  -d '{"text":"list the files in this directory"}'
-
-# 3. Interrupt the in-flight turn (body is ignored, still size-capped).
-curl -sS -X POST \
-  http://127.0.0.1:18080/api/sheds/dbg/rc/v1/sessions/<slug>/interrupt
-
-# 4. Resolve a pending approval (the id comes from GET .../sessions' pending_approvals,
-#    or an approval_request row on the feed).
-curl -sS -X POST \
-  http://127.0.0.1:18080/api/sheds/dbg/rc/v1/sessions/<slug>/approvals/<id> \
-  -H 'content-type: application/json' \
-  -d '{"decision":"allow"}'
-
-# Or skip the server proxy and hit the GUEST-LOCAL hub directly (same routes minus the
-# /api/sheds/<name> prefix, no server auth — this is how a shed reaches its own hub):
-shed -s my-server-dev exec dbg -- curl -sS -X POST \
-  127.0.0.1:1029/v1/sessions/<slug>/turn \
-  -H 'content-type: application/json' -d '{"text":"list the files in this directory"}'
-```
+> **A fourth guest binary, `shed-ext-rc`, and the RC activity hub it hosted (`serve`,
+> `internal/ext/rc`) were retired in plan 022's S6
+> ([`charliek/shed#328`](https://github.com/charliek/shed/issues/328)) — deleted from the
+> tree, dropped from the `extensions`/`full` images, and replaced there by `strix` and
+> `prox` (installed from the stridelabs apt repo, not built in-tree, so they need no
+> rebuild loop at all). Everything this section used to say about rc sessions, the guest
+> hub, `tests/integration/test_rc_kickoff.py`/`test_rc_enrichment.py`/
+> `test_rc_hub_activity.py`, and the opencode-verb/cursor-hook smoke tests is gone with
+> it — none of those tests or binaries exist any more. Agent sessions are roost tabs now;
+> see [`shed-ext-rc` (retired)](../../../docs/extensions/rc-helper.md) if you land here
+> looking for where that went.
 
 ### Fast loop: copy the binary into a running shed
 
@@ -289,28 +232,23 @@ A full rootfs rebuild is minutes; for a tight edit→test loop on a guest binary
 
 ```bash
 # VZ is arm64; FC is amd64. Match the shed's arch.
-GOOS=linux GOARCH=arm64 go build -o /tmp/shed-ext-rc ./cmd/shed-ext-rc
-shed -s my-server-dev cp /tmp/shed-ext-rc dbg:/tmp/shed-ext-rc   # or: pipe over `exec … tee`
-shed -s my-server-dev exec dbg -- sudo install -m0755 /tmp/shed-ext-rc /usr/local/bin/shed-ext-rc
-shed -s my-server-dev exec dbg -- shed-ext-rc version            # confirm the dev build
+GOOS=linux GOARCH=arm64 go build -o /tmp/docker-credential-shed ./cmd/docker-credential-shed
+shed -s my-server-dev cp /tmp/docker-credential-shed dbg:/tmp/docker-credential-shed   # or: pipe over `exec … tee`
+shed -s my-server-dev exec dbg -- sudo install -m0755 /tmp/docker-credential-shed /usr/local/bin/docker-credential-shed
+shed -s my-server-dev exec dbg -- docker-credential-shed version   # confirm the dev build
 ```
 
 If `shed cp` is unavailable, stream it: `go build -o /dev/stdout … | shed -s … exec dbg
--- sudo tee /usr/local/bin/shed-ext-rc >/dev/null` then `chmod +x`.
+-- sudo tee /usr/local/bin/docker-credential-shed >/dev/null` then `chmod +x`.
 
-**Two caveats specific to the rc hub:**
-
-1. **A recreated shed reverts to the image binary.** The copy lives only in that shed's
-   writable upper — `shed create`/recreate (or a snapshot restore) boots the baked
-   image's `shed-ext-rc` again. Use the copy shortcut for iteration; use the full rootfs
-   rebuild (step 2) for anything you'll assert on across a recreate, and for the final
-   pre-PR verification.
-2. **Kill the running hub so your new binary takes over.** The old `serve` daemon keeps
-   running the *previous* binary (the port bind is the lock, so a fresh `serve` just
-   exits 0 against it). After installing, stop it — kill the hub process (or every
-   `rc-*` session, which lets it idle-exit) — so the next ensure-start spawns **your**
-   build. Confirm with `shed -s … exec dbg -- pgrep -af 'shed-ext-rc serve'` and check
-   `~/.shed-rc-hub/hub.log`.
+**One caveat:** a recreated shed reverts to the image binary. The copy lives only in that
+shed's writable upper — `shed create`/recreate (or a snapshot restore) boots the baked
+image's binary again. Use the copy shortcut for iteration; use the full rootfs rebuild
+(step 2) for anything you'll assert on across a recreate, and for the final pre-PR
+verification. `shed-ext-ssh-agent` and `shed-ext-aws-credentials` run as systemd services
+rather than one-shot CLIs, so after installing a copy of either, restart its unit
+(`shed exec dbg -- sudo systemctl restart shed-ext-ssh-agent`, respectively
+`shed-ext-aws-credentials`) so the new binary actually takes over the running process.
 
 ## Gremlin: FC remote rootfs build + mise + sudo
 
@@ -334,8 +272,8 @@ ssh mini3 'cd ~/projects/shed && export PATH="$HOME/.local/share/mise/shims:$PAT
 The root-run FC dev server (sudo nohup) still reads the user-owned blobs fine.
 (Guest **extension** binaries — `extensions`/`full` variants — are now built
 in-tree by `scripts/stage-guest-binaries.sh`, staged into the context like
-shed-agent; verify `shed-ext-rc version` reports a non-release version in the
-booted shed, same as the shed-agent check.)
+shed-agent; verify `docker-credential-shed version` reports a non-release version
+in the booted shed, same as the shed-agent check.)
 
 ## When you hit a NEW rough edge
 

@@ -78,16 +78,22 @@ carrying no transport error text.
 | `terminal.preview` | `host?`, `shed`, `session?` | the ssh `TerminalCommand` (spawns nothing) |
 | `terminal.open` | `host?`, `shed`, `session?` | launches the terminal (**disabled** in test mode) |
 
-## Remote control
+## Agent sessions
+
+Every session here is a **roost tab**. A shed's agent sessions are what its own
+`roost-session` reports, exactly as a machine's are — a shed with no session running has
+none. (Before 0.9.0 a shed's rows came from an in-guest RC hub, reached by ssh'ing
+`shed-ext-rc` into the shed, and a shed's answer was the *union* of that and roost's. The
+guest binary and the hub are gone.)
 
 | op | params | result |
 |----|--------|--------|
-| `rc.list` | `host?`, `shed?` | `sessions[]` |
-| `rc.launch` | `host?`, `shed`, `kind?`, `display_name?`, `workdir?`, `initial_prompt?` | the launched `RcSession` |
-| `rc.kill` | `host?`, `shed`, `slug` | `{}` |
+| `rc.list` | `host?`, `shed?` | `{sessions, capabilities, machines}` |
+| `rc.launch` | `host?`, `shed`, `kind?`, `display_name?`, `workdir?`, `initial_prompt?` | the opened row — an **alias** for `roost.launch` on `roost:<host>/<shed>`, kept for 0.9.x |
+| `rc.kill` | `host?`, `shed`, `slug` | `{}` — a roost `tab.close`; the slug IS the tab id, and must be one THIS host lists (ids are per-host, so one copied from elsewhere would close an unrelated tab) |
 | `machines.list` | — | `machines[]` — every configured machine's health, name-ordered |
 | `machine.kill` | `machine`, `slug` | `{}` (addressed by machine + slug, not host/shed) |
-| `rc.inject_test` | `shed`, `slug`, `kind?`, `state?`, `managed?`, `display_name?`, `created_by?`, … | `{}` — **test mode only**; injects a session (e.g. a legacy row) into the table |
+| `rc.inject_test` | `shed`, `slug`, `kind?`, `display_name?`, `workdir?`, `lifecycle?`, `attention?` | `{}` — **test mode only**; puts a row into that shed's roost snapshot. `slug` must parse as a roost tab id, and `kind` must be one roost has an adapter for (anything else would be an unowned tab, which a real snapshot never lists) |
 | `roost.probe` | `target` | `target`, `probe` (its `fingerprint` nested inside) and `plan` — a read-only look at a shed or machine's `roost-session` state. The plan matrix row comes back from here too, so a caller that needs only the row does not also have to call `roost.preview` |
 | `roost.preview` | `target` | the plan (Install/Update/Start/Report/nothing to do) plus the sentence naming where the bytes would come from |
 | `roost.bootstrap` | `target`, `fingerprint`, `consent: true` | installs/updates/starts `roost-session` on that target and wires its agent hooks; refuses without consent or against a stale fingerprint |
@@ -99,42 +105,45 @@ consent card, and the rollback promise are documented there, not here. Kicking o
 from roost's own command palette instead of the desktop app is [the `shed` roost
 provider](../extensions/roost-provider.md).
 
-`initial_prompt` is an optional one-line kickoff delivered once the session is ready (an
-initial prompt for `claude-rc`, an initial command for `shell`). Leading/trailing whitespace
-(including newlines) is trimmed, and a blank value sends nothing. After trimming, an embedded
-control character, a value over 2000 UTF-8 bytes, or any prompt for a kind that doesn't accept
-typed input (`claude-broker`) is rejected with `invalid-param`. (Mirrors shed-remote-agent's
-create-request normalization.)
+`display_name`, `permission_mode` and `initial_prompt` are **accepted and not used** on
+either launch door: roost's `tab.open` is the agent binary plus a working directory, roost
+owns the tab's title, and typed prompts arrive with [the `shed` roost
+provider](../extensions/roost-provider.md). They stay in the wire so a caller written against
+the pre-0.9.0 op is not silently refused for sending what the hub accepted — but **the app's
+own launch dialog no longer offers a prompt field**, because a box whose contents go nowhere
+is worse than no box (`charliek/shed#366` tracks delivering one).
 
-Each `RcSession` carries the [RC Session Convention v2](rc-sessions.md) metadata:
-`managed`, and (when managed) `rc_id`, `created_by`, `created_at`, `target_label`.
-A legacy/unmanaged `rc-*` session decodes with `managed: false` and no metadata.
+`capabilities` is keyed by a row's **`origin`** — `machine:<name>` or
+`roost:<server>/<shed>` — so a card can read the contract behind the row it is drawing. It is
+roost's synthesized contract, not a probe: there is nothing to ask, and it answers for a host
+that is currently asleep.
 
 ### Machines (Tauri)
 
-A **machine** is a native host you reach over SSH that runs the RC activity hub on its
-loopback `1029` — no shed server in the path, no TLS pin, no control token. Machines come
+A **machine** is a native host you reach over SSH that runs a `roost-session` — no shed
+server in the path, no TLS pin, no control token. Machines come
 from the `machines:` section of `~/.shed/config.yaml` and are
 read ONCE at startup, so there is no in-app add/edit; an editor that silently needed a
 relaunch would be worse than the file.
 
 Machine sessions appear in `rc.list` beside shed sessions, each stamped with
 `origin_kind: "machine"` and `origin: "machine:<name>"`. **Row keys and grouping must use
-`origin`, never `shed`** — a hub reports an EMPTY shed on every session it serves, so two
-machines sharing a slug would collide into one row. `machines.list` is separate from
+`origin`, never `shed`** — a machine row carries an EMPTY shed, so two machines sharing a
+slug would collide into one row. `machines.list` is separate from
 `rc.list` because a machine is worth showing even when it has no sessions and cannot be
 reached: that row IS the information ("mini3 is asleep"), and a sessions-only payload has
 nowhere to put it. Each entry carries `{name, origin, reachable, connected_once, sessions,
 detail?}`, where `detail` is why it is unreachable — verbatim, because "no route to host"
-and "nothing is listening on 1029" need different fixes.
+and "nothing is listening" need different fixes.
 
 Unreachable is a first-class state, not an error: a machine that is asleep, off-network, or
-simply not running a hub is the everyday case, and it must never fail the sessions view.
+simply not running a `roost-session` is the everyday case, and it must never fail the
+sessions view.
 
 ### Sessions from roost
 
 Plan 013 (the Roost Pivot) re-points the section above: a machine row's sessions come
-from that machine's `roost-session` daemon, not the RC hub. Plan 014 replaced the
+from that machine's `roost-session` daemon. Plan 014 replaced the
 2 s poll with roost's **observer event stream**: the watcher holds one subscription per cycle
 and pushes a snapshot only when a row actually changes, so there is no polling cadence left
 (`SHED_ROOST_POLL_MS` no longer exists). At session protocol 5 (plan 020) there is no
@@ -156,12 +165,14 @@ landed (`kind_features.attach = "native-remote"` gates it off) — so `kill` map
 directory; typed prompts and permission modes arrive later with [the `shed` roost
 provider](../extensions/roost-provider.md).
 
-A **shed**, not just a `machines:` entry, can also become a roost host: `roost.probe` /
-`roost.bootstrap` install and start a `roost-session` on a shed the same way, over the shed's
+A **shed**, not just a `machines:` entry, is a roost host the same way: `roost.probe` /
+`roost.bootstrap` install and start a `roost-session` on it over the shed's
 own SSH — see [putting `roost-session` on a shed or machine](../extensions/roost-session-hosts.md)
-for the mechanism, the source ladder, and consent. A shed's rows are then the **union** of its
-hub rows (`source: "hub"`) and its roost rows (`source: "roost"`); a filtered `rc.list {host,
-shed}` returns both. See the roost project's own docs for the daemon and its IPC contract.
+for the mechanism, the source ladder, and consent. A shed's rows are then its roost rows
+(`source: "roost"`, `origin: "roost:<server>/<shed>"`), and a filtered `rc.list {host, shed}`
+returns them. **A shed with no `roost-session` lists no sessions**, which is what the Agents
+pane's empty state says — and it offers the setup, which happens on the shed's own card.
+See the roost project's own docs for the daemon and its IPC contract.
 
 ### UI-truth ops (Tauri)
 
@@ -171,7 +182,8 @@ backend's view — the two can disagree, and have.
 | op | answers | result |
 |----|---------|--------|
 | `dashboard.dump` | on the Sheds pane | `{rows, host_errors, empty}` |
-| `agents.dump` | on the Agents pane | `{sessions}` |
+| `agents.dump` | on the Agents pane | `{sessions, empty}` — `empty` is the rendered empty state (`{state, title, body, action}`), `null` when rows rendered. `state` is `loading` \| `failed` \| `unreachable` \| `empty`: four blanks wearing one screen, and only `empty` offers the bootstrap |
+| `launch.dump` | while the New-session dialog is open | `{launch}` — the dialog's own rendered text (`{rendered}`), `null` when none is mounted |
 | `egress.profiles` | on the Egress pane | `{egress}` |
 | `machines.dump` | on the Machines pane | `{machines}` — a row per machine with its `status` word, `detail` line, and grouped session slugs |
 | `sidebar.dump` | **always** | `{servers, machines}` — the sidebar's status foot |

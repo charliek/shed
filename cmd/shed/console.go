@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"strconv"
 	"strings"
 	"syscall"
 
@@ -142,11 +143,26 @@ func ttyFlag(hasCommand, stdinTTY, stdoutTTY bool) string {
 	return "-t"
 }
 
+// baseSSHArgs returns the SSH args common to every shed connection: port, pinned
+// known_hosts, strict host-key check, any extra -o options, then <shed>@<host>.
+// Callers prepend "ssh" (and "-t" for an interactive PTY) and append "--" + the
+// remote command. Shared by the interactive attach and exec/console paths so
+// the connection options can't drift.
+func baseSSHArgs(shedName string, entry *config.ServerEntry, extraOpts ...string) []string {
+	args := []string{
+		"-p", strconv.Itoa(entry.SSHPort),
+		"-o", "UserKnownHostsFile=" + config.GetKnownHostsPath(),
+		"-o", "StrictHostKeyChecking=yes",
+	}
+	args = append(args, extraOpts...)
+	return append(args, shedName+"@"+entry.Host)
+}
+
 // sshSessionArgs assembles the ssh argv for a shed session: ["ssh", flag], the
-// shared connection options (baseSSHArgs, reused from rc.go so options can't
-// drift), then the already-quoted remote command (empty for an interactive
-// shell). Kept pure so a test can assert flag placement and option reuse; the
-// syscall.Exec that consumes it can't be unit-tested.
+// shared connection options (baseSSHArgs, so options can't drift), then the
+// already-quoted remote command (empty for an interactive shell). Kept pure so
+// a test can assert flag placement and option reuse; the syscall.Exec that
+// consumes it can't be unit-tested.
 //
 // Unlike rc.go's capture path, no "--" precedes the command: this preserves the
 // pre-existing console/exec behavior (ssh treats everything after the

@@ -154,13 +154,10 @@ logging:
 # `approval_timeout` above.
 
 # ---------------------------------------------------------------------------
-# Machine RC hub
+# Retired keys
 # ---------------------------------------------------------------------------
-# The agent hosts the machine RC activity hub (the loopback service the
-# desktop and mobile clients read live session activity from) on
-# 127.0.0.1:1029. Binding the port is the lock: while an older standalone hub
-# holds it the agent defers and retries, taking the port over when that hub
-# exits. Set `enabled: false` to opt this machine out of hosting the hub
-# entirely.
-# rc_hub:
-#   enabled: false
+# `rc_hub:` configured the machine RC activity hub the agent used to host on
+# 127.0.0.1:1029. The hub was removed in v0.9.0 (charliek/shed#328) — machine
+# session activity now comes from roost. The key is IGNORED, not rejected: a
+# config that still carries it loads unchanged, so there is nothing to do on
+# upgrade beyond deleting the stanza whenever it suits you.

@@ -484,12 +484,6 @@ func (s *Server) handleEgressOff(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleDeleteShed(w http.ResponseWriter, r *http.Request) {
 	name := chi.URLParam(r, "name")
 
-	// Drop the per-shed rc state (cached capabilities + hub breaker entry) up
-	// front — the shed is being torn down, so it is stale regardless of which
-	// teardown path (plain/SSE) runs and regardless of outcome (a failed delete
-	// just re-probes on the next list).
-	s.invalidateShedRC(name)
-
 	// Stream teardown progress via SSE if the client requests it.
 	if strings.Contains(r.Header.Get("Accept"), "text/event-stream") {
 		s.handleDeleteShedSSE(w, r, name)
@@ -551,9 +545,6 @@ func (s *Server) handleStartShed(w http.ResponseWriter, r *http.Request) {
 		writeError(w, code, errCode, msg)
 		return
 	}
-	// A restart can pick up an in-place agent install; drop the stale per-shed rc
-	// state (caps + hub breaker — a fresh boot deserves fresh start attempts).
-	s.invalidateShedRC(name)
 
 	writeJSON(w, http.StatusOK, shed)
 }
@@ -569,9 +560,6 @@ func (s *Server) handleStopShed(w http.ResponseWriter, r *http.Request) {
 		writeError(w, code, errCode, msg)
 		return
 	}
-	// A stopped shed can't be re-probed; drop its per-shed rc state (caps + hub
-	// breaker) so a later start re-probes fresh.
-	s.invalidateShedRC(name)
 
 	writeJSON(w, http.StatusOK, shed)
 }
@@ -589,9 +577,6 @@ func (s *Server) handleResetShed(w http.ResponseWriter, r *http.Request) {
 		writeError(w, code, errCode, msg)
 		return
 	}
-	// Recreated upper layer: the cached caps and any hub-start breaker entry are
-	// for the old rootfs state.
-	s.invalidateShedRC(name)
 
 	writeJSON(w, http.StatusOK, shed)
 }
@@ -610,9 +595,6 @@ func (s *Server) handleListSessions(w http.ResponseWriter, r *http.Request) {
 
 	resp := config.SessionsResponse{
 		Sessions: sessions,
-	}
-	if rcEnrichEnabled(r) {
-		resp.Warnings = s.enrichSessionsRC(r.Context(), sessions)
 	}
 
 	writeJSON(w, http.StatusOK, resp)
@@ -665,10 +647,6 @@ func (s *Server) handleListAllSessions(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		allSessions = append(allSessions, sessions...)
-	}
-
-	if rcEnrichEnabled(r) {
-		warnings = append(warnings, s.enrichSessionsRC(r.Context(), allSessions)...)
 	}
 
 	resp := config.SessionsResponse{

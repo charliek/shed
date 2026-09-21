@@ -1,120 +1,78 @@
 {
   "absolute-bin": [
-    "rc",
-    "list"
+    "-c",
+    "/home/charliek/.local/bin/probe.sh"
   ],
   "backslash": [
-    "rc",
-    "create",
-    "--name",
+    "-c",
     "a\\b\\\\c"
   ],
   "command-substitution": [
-    "rc",
-    "create",
-    "--name",
+    "-c",
     "`id` and $(id)"
   ],
   "dollar-var": [
-    "rc",
-    "create",
-    "--name",
+    "-c",
     "$HOME and ${PATH}"
   ],
   "double-quote": [
-    "rc",
-    "create",
-    "--name",
+    "-c",
     "say \"hi\""
   ],
   "empty-string": [
-    "rc",
-    "create",
-    "--name",
+    "-c",
     ""
   ],
   "flag-with-value": [
-    "rc",
-    "create",
-    "--kind",
-    "shell",
-    "--slug",
-    "abc123"
+    "-c",
+    "find /tmp -maxdepth 1 -name gx-remote.sock"
   ],
   "gx-probe": [
     "-c",
     "h=${GROK_HOME:-$HOME/.grok}\nfor f in \"$h\"/gx-remote*.json; do\n  [ -f \"$f\" ] || continue\n  cat \"$f\" 2>/dev/null\n  printf \"\\n---\\n\"\ndone\nprintf \"===token===\\n\"\nt=\"$h/gx-remote.token\"\nfind \"$t\" -prune -type f -perm 0600 -user \"$(id -un)\" -exec cat {} \\; 2>/dev/null\nexit 0\n"
   ],
   "leading-dash": [
-    "rc",
-    "create",
-    "--name",
+    "-c",
     "--not-a-flag"
   ],
   "many-args": [
-    "rc",
-    "create",
-    "--kind",
-    "shell",
-    "--name",
-    "plan 012 probe",
-    "--slug",
-    "hkn4vd",
-    "--target",
-    "local",
-    "--created-by",
-    "sx"
+    "-c",
+    "h=$HOME/.myagent\nfor f in \"$h\"/session-*.json; do\n  [ -f \"$f\" ] || continue\n  cat \"$f\"\ndone\necho 'done'\n"
   ],
   "newline": [
-    "rc",
-    "create",
-    "--name",
+    "-c",
     "line one\nline two"
   ],
   "plain": [
-    "rc",
-    "list"
+    "-c",
+    "echo hi"
   ],
   "redirection-and-glob": [
-    "rc",
-    "create",
-    "--name",
+    "-c",
     "> out < in *.txt ?[a-z]"
   ],
   "shell-metacharacters": [
-    "rc",
-    "kill",
-    "--slug",
+    "-c",
     "abc; touch /tmp/pwn && echo no | cat"
   ],
   "single-quote": [
-    "rc",
-    "create",
-    "--name",
+    "-c",
     "it's mine"
   ],
   "space-in-value": [
-    "rc",
-    "create",
-    "--name",
+    "-c",
     "my session"
   ],
   "tab-and-spaces": [
-    "rc",
-    "create",
-    "--name",
+    "-c",
     "a\tb   c"
   ],
   "tilde": [
-    "rc",
-    "create",
-    "--workdir",
+    "-c",
     "~/projects"
   ],
   "unicode": [
-    "rc",
-    "create",
-    "--name",
+    "-c",
     "café 日本語 🦉"
   ]
 }

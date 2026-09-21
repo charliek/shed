@@ -695,6 +695,35 @@ def test_launch_dialog_opens(tauri):
     assert png[:8] == PNG_MAGIC and w > 0 and h > 0
 
 
+def test_the_launch_dialog_does_not_ask_for_a_prompt_it_cannot_deliver(tauri):
+    """**The dialog offers no initial-prompt field** (`charliek/shed#366`).
+
+    It used to, for a SHED target, back when a shed launch went to the in-guest
+    hub — which typed the kickoff into the tmux pane it had just created. S6
+    retired the hub and re-pointed that door at `roost.launch`, whose `tab.open`
+    is an argv and a working directory and nothing else: the box stayed on
+    screen with nothing at the far end, and what a user typed into it went
+    nowhere, silently. Delivering it through `tab.write` is #366's job (it has
+    to work the same for every agent kind, which a blind write does not), so
+    until that lands the honest UI is to not ask.
+
+    Asserted against the dialog's own rendered text, so it is about what was
+    painted rather than about what the source says. The three fields it DOES
+    offer are the control — a dump of a dialog that never mounted would pass a
+    bare `not in` check.
+    """
+    tauri.wait_until(lambda: tauri.current_pane() is not None, timeout=15, what="frontend ready")
+    tauri.show_launch()
+    tauri.wait_until(lambda: tauri.modal() == "launch", timeout=15, what="launch dialog open")
+    tauri.wait_until(lambda: tauri.launch_dump(), timeout=15,
+                     what="the launch dialog to report its rendered copy")
+    rendered = tauri.launch_dump()["rendered"]
+    for offered in ("Where", "Session name", "Working directory", "Kind"):
+        assert offered in rendered, (offered, rendered)
+    for withheld in ("Initial prompt", "Initial command", "Typed into the agent"):
+        assert withheld not in rendered, (withheld, rendered)
+
+
 def test_hosts_auth_reports_the_config_mode_unlearned(tauri):
     # Plan 002 C3: the app's mtls surface. The hermetic fixture config carries no
     # `auth_mode`, and ABSENT MEANS TOKEN — an entry written before client

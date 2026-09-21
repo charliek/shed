@@ -41,18 +41,12 @@ steps.
 | Variant | Description |
 |---------|-------------|
 | `base` | Minimal OS layer: systemd, SSH, git, gh, build-essential, jq, ripgrep, neovim, tmux, and the shed-agent. No Docker, no coding agents, no language runtimes. |
-| `extensions` | `base` + [credential brokering](extensions.md) (SSH agent forwarding, AWS STS proxy, Docker credential helper) and the `shed-ext-rc` Remote Control helper. No Docker daemon, no coding agents pinned — start here for custom images. |
+| `extensions` | `base` + [credential brokering](extensions.md) (SSH agent forwarding, AWS STS proxy, Docker credential helper) plus `strix` and `prox` from the stridelabs apt repo. No Docker daemon, no coding agents pinned — start here for custom images. |
 | `full` | `extensions` + Docker CE (with `docker compose`), [mise](https://mise.jdx.dev/), [bun](https://bun.sh/), and coding agents (Claude Code, OpenCode, Codex CLI). The batteries-included default. |
 
 Each variant inherits from the one above it as a discrete OCI layer, so
 `shed image pull shed-vz-full` reuses the `base` and `extensions` layers
 already cached locally.
-
-!!! note "Autonomous Remote Control sessions need `full`"
-    `shed attach --plan` / Remote Control autonomous sessions drive Claude Code
-    via `shed-ext-rc`. `shed-ext-rc` ships in `extensions` and `full`, but Claude
-    Code is only in `full` — so the autonomous-plan workflow requires the `full`
-    variant (and Claude logged in inside the shed).
 
 !!! note "Docker is only in `full`"
     The Docker daemon ships **only** in the `full` variant. `base` and
@@ -71,6 +65,8 @@ The `extensions` variant adds [credential brokering](extensions.md) on top of `b
 - **`shed-aws-proxy`** — AWS credential proxy that vends short-lived STS tokens via the host.
 - **`docker-credential-shed`** — Docker credential helper that delegates registry authentication to the host. Guest Docker is pre-configured with `{"credsStore": "shed"}`.
 - **`shed-ext`** — CLI for checking extension connectivity and health.
+- **`strix`** — TUI for staging and reviewing diffs, from the stridelabs apt repo.
+- **`prox`** — process manager with an HTTP API and TUI, from the stridelabs apt repo.
 - Pre-configured `SSH_AUTH_SOCK` and `AWS_CONTAINER_CREDENTIALS_FULL_URI` environment variables.
 
 **When to use it:** as a base for organization-specific images, or when you

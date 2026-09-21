@@ -9,10 +9,16 @@ re-implemented per language. The root `CLAUDE.md` owns the monorepo layout + rel
 
 - **`shed-core`** — a *pure* Rust lib (no UI, no UniFFI): the reqwest(rustls) HTTP client, the
   SSE parser, defensive wire decoders, leaf-cert TLS pinning, the control-token FSM, a `config`
-  parser, the pull-based `create` orchestration store, and `rc.rs` (the Remote-Control
-  wire types + argv builders; its pure pane classifier went with S2, charliek/shed#324 —
-  a shed row's `state` is liveness off the wire, a machine row's status comes from
-  roost). The Linux clients link it directly.
+  parser, the pull-based `create` orchestration store, and `rc.rs` — which since plan 022
+  (S6, charliek/shed#328) is the Remote-Control **model and nothing else**: `RcKind` /
+  `RcState` / `RcActivity`, `RcCapabilities` / `RcKindFeatures`, the `RcSessionDto` wire
+  row, the `RcFeed*` transcript rows `lane.rs` reuses, and `RcError` (shed-mobile's error
+  mapping names it). The argv builders, the create/prompt invocations, the permission-mode
+  table, the stdout decoders, the non-interactive ssh argv and the last of the claude.ai
+  pane classifier all went with the hub; `hub_client.rs`, `rc_events.rs` and `rc_agents.rs`
+  went with it entirely (`shell_quote_always` moved from `rc_agents` into `machine.rs`,
+  where `display_line` — the one composer every machine transport shares — is its only
+  caller). The Linux clients link it directly.
   `lane.rs` (plan 015) is the **agent-lane contract** — the DTOs plus the `AgentLane`
   async trait that normalizes "a coding agent with sessions, a transcript and approvals",
   one adapter per agent (opencode over its local HTTP server; `gx` next). Pure types, **no
@@ -35,18 +41,15 @@ re-implemented per language. The root `CLAUDE.md` owns the monorepo layout + rel
   reuses (`RcFeedMessage` IS the transcript row) — which is why those gained `Serialize`
   plus a tolerant `Deserialize` delegating to their existing `from_map` reader.
 - **`shed-app`** — the UI-free app-logic layer (`Backend`) the clients share; holds the
-  `RcRunner` portability seam (`rc.rs`) behind the non-default `rc` feature — which also
-  pulls in and re-exports `shed-rc-engine` as `shed_app::rc_engine` — and the embedded
-  broker bridge (`broker_bridge.rs`, behind the non-default `broker = ["dep:shed-broker"]`
-  feature — leg 3a.2). `roost.rs` (plan 013, ungated like `machine.rs` so mobile's
+  embedded broker bridge (`broker_bridge.rs`, behind the non-default
+  `broker = ["dep:shed-broker"]` feature — leg 3a.2), which since plan 022 is its ONLY
+  non-default feature (`rc`, the `RcRunner` seam plus the re-exported `shed-rc-engine`,
+  went with the hub). `roost.rs` (plan 013, ungated like `machine.rs` so mobile's
   default-features build links it) is the reach + watcher layer over `shed_core::roost` —
   `RoostReach`/`RoostWatcher`/`RoostPeek` — that both clients read a machine's or the local
   `roost-session` through. A bare `cargo test`/`clippy` run against `shed-app` **alone**
-  (`-p shed-app`, no `--features`) skips the `rc`/`broker` modules — cover them with
-  `-p shed-app --features rc` and `-p shed-app --features broker` (or `broker,rc`
-  together). Since `sx` was sunset in plan 016 (S7, #329), nothing in this workspace
-  enables `rc` by default any more — the explicit `-p shed-app --features rc` leg
-  (see the note below) is the ONLY coverage for it, same as `broker`.
+  (`-p shed-app`, no `--features`) skips `broker_bridge.rs` — cover it with
+  `-p shed-app --features broker`, which is its ONLY coverage and what CI runs.
   `lane_view.rs` (plan 018 §3.5, ungated for the same reason `machine.rs` and
   `roost.rs` are) is the **staged agent-lane view** — `LaneView`/`LaneViewSnapshot`,
   moved down out of the Tauri crate — that folds a `shed_core::lane` subscription
@@ -56,13 +59,6 @@ re-implemented per language. The root `CLAUDE.md` owns the monorepo layout + rel
   poll go through. It is ungated because mobile links `shed-app` with default features
   and needs the identical fold — the phone showing the same view the desktop shows is
   a property of one implementation, not two that have to agree.
-- **`shed-rc-engine`** — the one-shot Remote-Control engine ported from the Go guest
-  binary (plan 009), graduated out of shed-app at its second consumer (plan 010:
-  shed-broker's `rc_hub` — a broker→shed-app dep would cycle through shed-app's `broker`
-  feature). Synchronous by design, on the pure `shed_core::rc_agents` kernel; carries its
-  own minimal `clock` seam (shed-app's `traits::Clock` stays in shed-app). The
-  `test-support` feature exports `fake` (the fake tmux runner) for the hub's
-  tests. In `default-members`.
 - **`shed-core-ffi`** — a thin UniFFI wrapper (`crate-type = ["staticlib", "lib"]`)
   exposing a `ShedCore` object to Swift. The `.a` is what the app links (signing/notarization
   unchanged); `lib` is required so `cargo run -p shed-core-ffi --bin uniffi-bindgen` works
@@ -96,9 +92,9 @@ re-implemented per language. The root `CLAUDE.md` owns the monorepo layout + rel
   `SHED_OPENCODE_LIVE=1 SHED_OPENCODE_RECORD=1 … --test live`; re-derive the golden
   OFFLINE with `SHED_OPENCODE_REGOLD=1 … --test fold_fixtures`). The helpers the
   fold needs are **copied** into `helpers.rs` rather than linked, because
-  `rc_hub::watch` imports `shed_rc_engine::tmux::Tmux` — linking would drag the RC
-  engine into an HTTP adapter. The duplication ends when S6 deletes the hub's watcher.
-  In `default-members`.
+  `rc_hub::watch` imported `shed_rc_engine::tmux::Tmux` — linking would have dragged the
+  RC engine into an HTTP adapter. S6 (plan 022) deleted the hub, so `helpers.rs` is now
+  the only copy and the golden is what still pins it. In `default-members`.
 - **`shed-gx`** — the **gx adapter** for `shed_core::lane`: the second
   implementation of `AgentLane`, against gx's remote lane (`gx-remote-api`) —
   a bearer-token HTTP API with a resumable `Last-Event-ID` cursor, unlike
@@ -307,26 +303,22 @@ onto `saphyr-parser` would be a separate shed-core slice, not assumed here.
 
 ```bash
 cd crates && cargo test                              # workspace tests
-cargo test -p shed-app --features rc                 # the non-default rc module
 cargo test -p shed-app --features broker             # the embedded broker bridge (3a.2)
-cargo test -p shed-app --features broker,rc          # both non-default features together
-cargo test -p shed-rc-engine --features test-support # the graduated engine + its doubles
 cargo test -p shed-core --features test-support      # exports `roost::testing::FakeRoost`
 cargo clippy --workspace --all-targets -- -D warnings
-cargo clippy -p shed-app --features rc --all-targets -- -D warnings
 cargo clippy -p shed-app --features broker --all-targets -- -D warnings
-cargo clippy -p shed-app --features broker,rc --all-targets -- -D warnings
 cargo test -p shed-opencode                          # the opencode agent-lane adapter
 cargo test -p shed-opencode --features test-support  # exports `testing::FakeOpencode`
 cargo test -p shed-gx                                 # the gx agent-lane adapter
 cargo test -p shed-gx --features test-support        # exports `testing::FakeGx`; live/regold tests still skip cleanly
 ```
 
-Note: `sx` (the crate that used to be a default member enabling shed-app's `rc` feature
-via workspace-wide feature unification) was sunset in plan 016 (S7, #329). A bare
-`cargo test`/`clippy --workspace` no longer compiles the `rc` modules at all — the
-explicit `-p shed-app --features rc` legs above are now the ONLY coverage for them
-(and what CI runs).
+Note: `broker` is the one non-default feature left in this workspace. A bare
+`cargo test`/`clippy --workspace` does not compile `broker_bridge.rs` at all, so the
+explicit `-p shed-app --features broker` legs above are its ONLY coverage (and what CI
+runs). `shed-app`'s other non-default feature, `rc`, went with `shed-rc-engine` and the
+RC hub in plan 022 (S6, #328); `sx`, which used to enable `rc` workspace-wide by feature
+unification, was sunset in plan 016 (S7, #329).
 
 `shed-core` also builds/tests on Linux — `make -C desktop core-linux` runs it in Docker.
 

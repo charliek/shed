@@ -19,9 +19,10 @@ Four `machines:` entries:
   field absent.
 - `full` — every field Go's decoder models (`host`, `user`, `ssh_port`, `known_hosts`) set
   explicitly.
-- `withrc` — carries `rc_bin` (see "The one intentional asymmetry" below) plus an unknown
-  key (`color`) neither language models. Both decoders must still decode it cleanly —
-  unknown-key tolerance is part of the contract, not an oversight.
+- `withrc` — carries a leftover `rc_bin` (see "The retired `rc_bin` field" below) plus an
+  unknown key (`color`) — as of C8 (plan 022 S6), NEITHER language models either key. Both
+  decoders must still decode it cleanly — unknown-key tolerance is part of the contract, not
+  an oversight, and this entry is the negative control that pins it.
 - `broken` — malformed: its value is a YAML scalar, not a mapping. Both decoders must SKIP
   it (Go additionally writes a one-line stderr note) and keep decoding the entries around
   it — one bad hand edit in `machines:` must never take down `shed list` or the roost
@@ -39,22 +40,28 @@ already-sorted sample would let a decoder that merely preserved document order p
 coincidence, which is exactly what happened to the first draft of this fixture. Both tests
 assert the decoded name sequence against `expected.json`'s, not just membership.
 
-## The one intentional asymmetry: `rc_bin`
+## The retired `rc_bin` field
 
-`shed-core`'s `MachineEntry` models `rc_bin` (the Rust `machine.rs`/RC-session kickoff path
-reads it). Go's `internal/config/machines.go` deliberately does **not** model it — plan 019
-pin P7 puts `rc_bin` and the whole machine-RC surface out of scope for Go's roost-provider
-work.
+Through plan 019, `shed-core`'s `MachineEntry` modeled `rc_bin` — where `sx`'s one-shot RC
+binary lived on the remote — while Go's `internal/config/machines.go` deliberately did
+**not** (pin P7 put `rc_bin` and the whole machine-RC surface out of scope for Go's
+roost-provider work). `expected.json` used to carry an explicit `rc_bin` key on every entry
+for exactly that reason: asserted by the Rust test, silently ignored by the Go one (whose
+JSON decoder skips a key its struct has no field for).
 
-`expected.json` handles that explicitly rather than by accident: every entry carries an
-`rc_bin` key (`null` when absent, the path string on `withrc`), and it is:
+`sx` was sunset, unreleased, in plan 016, and C8 (plan 022 S6) deleted the rest of the
+plumbing built for it: `machine::rc_prefix`, `machine::DEFAULT_MACHINE_BIN`, and the
+`rc_bin` field itself — `MachineEntry` no longer carries it in **either** language.
+`expected.json` no longer has an `rc_bin` key at all.
 
-- **asserted** by the Rust test, which reads the full `MachineEntry` shape including
-  `rc_bin`;
-- **deliberately ignored** by the Go test, which decodes `expected.json` into a
-  Go-shaped struct with no `rc_bin` field — Go's JSON decoder silently skips a key it has no
-  field for, so the asymmetry is a documented decision here, not a silent gap in either
-  test.
+The `withrc` entry stays, unchanged in `sample.yaml` (still `rc_bin:
+/opt/homebrew/bin/shed-machine-rc`), because it is now doing a more important job: it is
+the **tolerance negative control**. Both `MachineEntry`s dropped the field, but a config a
+user wrote before that could still carry the key — and a decoder must not choke on a key
+it no longer models any more than it chokes on one it never modeled. Comment out either
+decoder's unknown-key tolerance and this entry (and its Go twin,
+`TestDecodeMachines_UnknownKeysAndRcBinIgnored` in `internal/config/machines_test.go`) stops
+decoding.
 
 ## Confirmed Go↔Rust divergences (outside this fixture's agreed subset)
 

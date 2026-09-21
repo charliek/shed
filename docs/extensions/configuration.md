@@ -49,12 +49,15 @@ docker:
 logging:
   enabled: true
   path: ~/.local/share/shed/extensions-audit.log
-
-# Machine RC hub — the agent hosts it on 127.0.0.1:1029 by default.
-# Set to false to opt this machine out of hosting it.
-rc_hub:
-  enabled: true
 ```
+
+!!! note "`rc_hub:` is retired"
+    A config file may still carry a `rc_hub:` block from before v0.9.0 (the agent used
+    to host the machine RC activity hub on `127.0.0.1:1029`). Plan 022 (S6,
+    [`charliek/shed#328`](https://github.com/charliek/shed/issues/328)) removed the hub —
+    machine session activity now comes from [roost](roost-session-hosts.md).
+    The key is **ignored, not rejected**: a config that still carries it loads unchanged,
+    so there is nothing to do beyond deleting the stanza whenever it suits you.
 
 ### Approval model
 
@@ -254,11 +257,13 @@ It reports:
 - which **config file** the running agent loaded (the absolute `config_path`);
 - the **effective approval policy** per provider, and which are delegated to shed-desktop;
 - the **approval channel**: its socket path and whether a consumer (e.g. shed-desktop) is connected;
-- the **RC hub**: whether this machine's hub is `listening` (with its address), `deferred` (another
-  hub or a foreign process holds the port — the agent retries and takes it over when it frees up),
-  or `disabled` (`rc_hub.enabled: false`);
 - each **watched server**: per-namespace connection state — `connected`, `reconnecting` (with the
   failure reason), or `stopped`.
+
+Before v0.9.0 the report also carried an **RC hub** line (the machine activity hub the
+agent used to host on `127.0.0.1:1029`). That role was retired in plan 022 (S6,
+[`charliek/shed#328`](https://github.com/charliek/shed/issues/328)) and the line is gone
+with it.
 
 If the agent isn't running, `status` says so and exits non-zero (nothing is listening on the
 socket) rather than guessing from a file. Start it with `brew services start shed-host-agent`.
@@ -276,7 +281,7 @@ checks connectivity from inside a shed.)
 | `--log-file` | `""` (stderr) | Write the operational log to this file, size-capped + rotated (the brew service sets it; empty logs to stderr) |
 | `version` | — | Print version and exit |
 | `status [--json]` | — | Query the running daemon's self-report (config, policies, connection state) and exit (see [Diagnostics](#diagnostics)) |
-| `rc-hub` | — | Diagnostic: run the machine RC hub in the foreground until interrupted, logging to stderr. Reads no config file (`--config`/`--log-file` and `rc_hub.enabled` are ignored) — the daemon normally hosts the hub itself |
+| `rc-hub` | — | **Retired** (plan 022, S6, [`charliek/shed#328`](https://github.com/charliek/shed/issues/328)). Exits 2 naming the retirement rather than starting anything — kept as a tombstone so stale docs or launchd/systemd entries fail loudly instead of silently doing something else |
 
 ### shed-ext-ssh-agent
 

@@ -1,0 +1,12 @@
+{
+  "id": "30",
+  "ok": true,
+  "result": {
+    "host": {
+      "id": "3f9a2b7c1d4e4f5a",
+      "label": "pop-os",
+      "target": "/home/charlie/.local/state/roost/roost-session.sock",
+      "last_connected": null
+    }
+  }
+}

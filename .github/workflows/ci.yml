@@ -42,7 +42,6 @@ jobs:
       packaging: ${{ steps.filter.outputs.packaging }}
       harness: ${{ steps.filter.outputs.harness }}
       hostagent: ${{ steps.filter.outputs.hostagent }}
-      rcparity: ${{ steps.filter.outputs.rcparity }}
       docs: ${{ steps.filter.outputs.docs }}
       ci: ${{ steps.filter.outputs.ci }}
     steps:
@@ -112,9 +111,6 @@ jobs:
               # A change there is a change to the shipped daemon's behavior, so it must
               # trigger the differential harness + the release-snapshot.
               - 'crates/shed-broker/**'
-              # shed-broker depends on shed-rc-engine from plan 010 H4 (the rc_hub
-              # port), so an engine-only change now reaches the shipped daemon too.
-              - 'crates/shed-rc-engine/**'
               # The Rust host-agent has a path-dep on shed-core, and the release
               # build (builder: rust) reads rust-toolchain.toml — a change to
               # either can break the shipped binary, so both must trigger the
@@ -127,48 +123,6 @@ jobs:
               - 'internal/ext/protocol/**'
               - 'tests/host-agent-diff/**'
               - 'docs/development/host-agent-wire-catalog.md'
-              - 'go.mod'
-              - 'go.sum'
-            rcparity:
-              # The Go-vs-Rust RC differential leg (plan 009/010): BOTH hub
-              # implementations, the engines under them, the harness that runs
-              # them side by side, and the shared build manifests a dependency
-              # bump would ride in on.
-              #
-              # Rust side: the graduated engine crate (`shed-rc-engine`,
-              # re-exported through `shed-app`'s `rc` feature) over the pure
-              # kernel (`shed-core::rc_agents`). Go side: the engine
-              # (`internal/ext/rc`), its CLI shell (`internal/ext/clirc`) and BOTH
-              # binaries built from them — the test-only oracle
-              # (tests/rc-parity/oracle — the retired shed-machine-rc's main,
-              # covered by the tests/rc-parity/** entry below, and since plan 016
-              # the session-creation stimulus for BOTH legs) and the guest
-              # `shed-ext-rc`, which share the same wire surface.
-              - 'crates/shed-core/**'
-              - 'crates/shed-app/**'
-              - 'crates/shed-rc-engine/**'
-              # The hub port (plan 010): shed-broker carries `rc_hub` — the Rust
-              # side of the hub differential family — from H4 on, so a
-              # broker-only PR must not skip the wire gate.
-              - 'crates/shed-broker/**'
-              # From H11 the shed-host-agent bin MOUNTS the hub (the `rc-hub`
-              # debug subcommand is the harness's Rust leg from H12), so a
-              # bin-only change must run the wire gate too.
-              - 'crates/shed-host-agent/**'
-              - 'crates/Cargo.toml'
-              - 'crates/Cargo.lock'
-              - 'crates/rust-toolchain.toml'
-              - 'internal/ext/rc/**'
-              - 'internal/ext/clirc/**'
-              - 'internal/version/**'
-              - 'cmd/shed-ext-rc/**'
-              - 'tests/rc-parity/**'
-              # The crates-local fixture COPIES (panes, jsonl, wire goldens).
-              # The byte-parity sweep that guards them is a Go test, and the
-              # `go` filter excludes crates/** — so a copy-only edit would
-              # otherwise run NO job that executes the guard. This filter plus
-              # the fixture-guard step in the rc-parity job below close that.
-              - 'crates/fixtures/**'
               - 'go.mod'
               - 'go.sum'
             docs:
@@ -614,101 +568,6 @@ jobs:
         # against the recorded goldens + the Rust golden-fixture runners.
         run: make test-host-agent-diff
 
-  # The Go↔Rust RC parity leg (plan 009 §3.6, plan 010) — one of the five
-  # pytest suites. Same organization as host-agent-diff above: one Linux job covers BOTH
-  # the Rust crates' own build/test/clippy AND the differential harness that
-  # drives the two hub daemons side by side. The cargo legs here are what close
-  # the §2.2 gap — no other job compiles `shed-app --features rc` at all, so
-  # without them the ported engine would only ever be built as a side effect of
-  # the harness (no tests, no clippy). Since plan 016 sunset `sx` they are the
-  # feature's ONLY coverage: do not drop them.
-  rc-parity:
-    name: rc-parity (Go↔Rust wire goldens)
-    needs: changes
-    if: ${{ needs.changes.outputs.rcparity == 'true' || needs.changes.outputs.ci == 'true' }}
-    runs-on: ubuntu-latest
-    # The only job in this workflow with a timeout: it drives REAL tmux sessions,
-    # so a wedged pane (an agent shim that never draws, a poller that never
-    # settles) is a hang rather than a failure. The whole leg runs in ~3 min
-    # locally; 30 minutes is generous headroom that still fails the same day.
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@v6
-      # Builds the Go oracle (tests/rc-parity/oracle) — same version as the other Go jobs.
-      - uses: actions/setup-go@v6
-        with:
-          go-version: '1.25'
-      - name: Rust toolchain
-        run: |
-          rustup toolchain install stable --profile minimal --component clippy
-          rustc --version && cargo --version
-      # build-essential: ring's crypto backend (shed-core) needs a C toolchain.
-      # tmux: NOT preinstalled on GitHub runners, and it is the engine's hard
-      # dependency on both sides.
-      - name: C toolchain + tmux
-        # Bounded + retried on purpose. A stalled apt mirror (the Azure mirror
-        # unreachable, archive.ubuntu.com hanging mid-fetch) once produced ZERO
-        # output for 29 minutes and ate this job's whole 30-minute budget, so a
-        # 2-minute infrastructure blip cancelled the job and read like a harness
-        # hang. `timeout` bounds each attempt (a hang, not a failure, is the
-        # observed shape — a bare retry loop would never re-enter), and the
-        # step cap is the backstop — sized ABOVE the loop's worst case
-        # (3x120s update + sleeps + 300s install ≈ 11.3 min) so the loud
-        # ::error:: diagnostic can actually fire before GitHub kills the step.
-        timeout-minutes: 12
-        run: |
-          set -euo pipefail
-          ok=""
-          for attempt in 1 2 3; do
-            if sudo timeout 120 apt-get update; then ok=1; break; fi
-            echo "apt-get update stalled or failed (attempt ${attempt}/3); retrying" >&2
-            sleep 10
-          done
-          if [ -z "${ok}" ]; then
-            echo "::error::apt-get update failed 3x — mirror outage?"
-            exit 1
-          fi
-          sudo timeout 300 apt-get install -y build-essential tmux
-      - name: Assert tmux >= 3.2
-        # `new-session -e` (how BOTH implementations stamp session metadata)
-        # arrived in tmux 3.2. The harness asserts this too, but only after
-        # building both binaries — failing here makes the cause unmistakable.
-        run: |
-          set -euo pipefail
-          raw="$(tmux -V)"
-          echo "${raw}"
-          major="$(printf '%s' "${raw}" | sed -E 's/^tmux[^0-9]*([0-9]+)\.([0-9]+).*/\1/')"
-          minor="$(printf '%s' "${raw}" | sed -E 's/^tmux[^0-9]*([0-9]+)\.([0-9]+).*/\2/')"
-          if [ "${major}" -lt 3 ] || { [ "${major}" -eq 3 ] && [ "${minor}" -lt 2 ]; }; then
-            echo "::error::${raw} is below the 3.2 floor required by \`new-session -e\`"
-            exit 1
-          fi
-      - uses: astral-sh/setup-uv@v6
-      # The ported engine lives behind shed-app's non-default `rc` feature and in
-      # `shed-rc-engine` — neither is reached by core-linux (`-p shed-core`) or by
-      # host-agent-diff (`-p shed-broker -p shed-host-agent`). Both are named
-      # explicitly: a filter that matched nothing would run ZERO tests silently
-      # (the lesson recorded on `test-host-agent-diff` in the Makefile).
-      - name: Rust RC engine — test + clippy (Linux)
-        working-directory: crates
-        run: |
-          cargo test -p shed-rc-engine --features test-support --all-targets --locked
-          cargo clippy -p shed-rc-engine --features test-support --all-targets --locked -- -D warnings
-          cargo test -p shed-app --features rc --all-targets --locked
-          cargo clippy -p shed-app --features rc --all-targets --locked -- -D warnings
-      - name: Fixture-copy byte-parity guard
-        # The crates-local fixture copies (crates/fixtures/{panes,jsonl} + the
-        # wire goldens) are guarded by Go sweeps in internal/ext/rc — but the
-        # `go` job's filter excludes crates/**, so a copy-only edit reaches
-        # ONLY this job (via the rcparity filter's crates/fixtures/** entry).
-        # Run the sweeps here so copy drift can never land green.
-        run: go test ./internal/ext/rc/ -run 'CopiesAreByteIdentical' -count=1
-      - name: Go↔Rust parity harness
-        # Builds BOTH implementations and runs every differential cell against the
-        # committed goldens (a clean unfiltered run, so the stale-golden sweep is
-        # armed).
-        run: make test-rc-parity
-
   deb:
     name: deb
     needs: changes
@@ -925,12 +784,12 @@ jobs:
   ci-success:
     name: ci-success
     if: always()
-    needs: [changes, test, lint, plugin, release-snapshot, swift, core-linux, host-agent-diff, rc-parity, deb, tauri-linux, tauri-mac, docs-build]
+    needs: [changes, test, lint, plugin, release-snapshot, swift, core-linux, host-agent-diff, deb, tauri-linux, tauri-mac, docs-build]
     runs-on: ubuntu-latest
     steps:
       - name: Require no job failed (skipped-by-filter counts as pass)
         run: |
-          results="${{ needs.changes.result }} ${{ needs.test.result }} ${{ needs.lint.result }} ${{ needs.plugin.result }} ${{ needs.release-snapshot.result }} ${{ needs.swift.result }} ${{ needs.core-linux.result }} ${{ needs.host-agent-diff.result }} ${{ needs.rc-parity.result }} ${{ needs.deb.result }} ${{ needs.tauri-linux.result }} ${{ needs.tauri-mac.result }} ${{ needs.docs-build.result }}"
+          results="${{ needs.changes.result }} ${{ needs.test.result }} ${{ needs.lint.result }} ${{ needs.plugin.result }} ${{ needs.release-snapshot.result }} ${{ needs.swift.result }} ${{ needs.core-linux.result }} ${{ needs.host-agent-diff.result }} ${{ needs.deb.result }} ${{ needs.tauri-linux.result }} ${{ needs.tauri-mac.result }} ${{ needs.docs-build.result }}"
           echo "job results: ${results}"
           for r in ${results}; do
             case "${r}" in

@@ -149,8 +149,8 @@ fn is_http_url_with_host(s: &str) -> bool {
     !host.is_empty() && !host.contains(char::is_whitespace)
 }
 
-/// One `machines:` entry — a **native** host (not a shed) that runs the RC
-/// helper, reachable over plain SSH (plan 009 §3.3).
+/// One `machines:` entry — a **native** host (not a shed), reachable over plain
+/// SSH (plan 009 §3.3).
 ///
 /// The SCHEMA is **Rust-defined and Rust-owned**. The Go `shed` CLI still
 /// carries the raw section as a schema-agnostic passthrough
@@ -158,18 +158,25 @@ fn is_http_url_with_host(s: &str) -> bool {
 /// whole-document `SaveToPath` round-trip cannot delete it — but as of plan
 /// 019 C1, Go additionally READS a tolerant SUBSET of these fields through
 /// its own decoder, `internal/config/machines.go` (`DecodeMachines`):
-/// `name`/`host`/`user`/`ssh_port`/`known_hosts`, deliberately never
-/// `rc_bin` (plan 019 pin P7). That decoder never writes this section and
-/// never validates it beyond skip-on-malformed — Rust remains the schema's
-/// sole owner and the only place `rc_bin` is modeled.
+/// `name`/`host`/`user`/`ssh_port`/`known_hosts`. That decoder never writes
+/// this section and never validates it beyond skip-on-malformed — Rust
+/// remains the schema's sole owner.
+///
+/// **`rc_bin` used to live here** — it named where the `sx` one-shot RC
+/// binary lived on the remote, for `machine::rc_prefix` to invoke. `sx` was
+/// sunset (unreleased) in plan 016, and S6 (plan 022, C8) deleted the last of
+/// that plumbing: `rc_prefix`, `machine::DEFAULT_MACHINE_BIN`, and this
+/// field. Neither decoder models it now, so a hand-written config carrying a
+/// leftover `rc_bin:` key must still parse cleanly — that tolerance (an
+/// unmodeled key is silently ignored, never a parse failure) is pinned by
+/// [`tests::machines_fixture_matches_expected_json`] (the `withrc` entry) and
+/// its Go twin.
 ///
 /// Absent optionals mean "defer to ssh": no `user` → whatever `~/.ssh/config` (or
 /// the current login) resolves, no `known_hosts` → the user's normal file with
-/// the user's normal strictness, no `rc_bin` →
-/// [`crate::machine::DEFAULT_MACHINE_BIN`] on the remote's SSH-exec PATH. That
-/// deliberately differs from a shed target, whose host key is always pinned in
-/// `~/.shed/known_hosts` — a machine is an ordinary SSH host the operator
-/// already manages.
+/// the user's normal strictness. That deliberately differs from a shed target,
+/// whose host key is always pinned in `~/.shed/known_hosts` — a machine is an
+/// ordinary SSH host the operator already manages.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct MachineEntry {
     pub name: String,
@@ -179,15 +186,6 @@ pub struct MachineEntry {
     pub user: Option<String>,
     /// Defaults to 22.
     pub ssh_port: u16,
-    /// Where the RC binary lives on the remote. `None` →
-    /// [`crate::machine::DEFAULT_MACHINE_BIN`] (`sx`), resolved on the PATH an
-    /// `ssh <host> <cmd>` exec sees.
-    ///
-    /// That PATH is the NON-login one, which routinely omits `~/.local/bin` and
-    /// `/opt/homebrew/bin` — so an absolute path here is the normal case for
-    /// anything not installed under `/usr/bin`, not an exotic override.
-    /// (Pre-plan-010 this defaulted to the retired `shed-machine-rc`.)
-    pub rc_bin: Option<String>,
     /// `UserKnownHostsFile` to pin against; `None` → ssh's own default.
     pub known_hosts: Option<String>,
 }
@@ -268,8 +266,7 @@ impl ShedConfig {
                 let Node::Map(fields) = value else { continue };
                 let scalar = |k: &str| fields.get(k).and_then(Node::as_scalar);
                 // An optional string is ABSENT when the key is missing OR its
-                // value is empty: `rc_bin:` with nothing after it must mean "use
-                // the default", not "run the empty-string binary".
+                // value is empty.
                 let opt = |k: &str| scalar(k).filter(|s| !s.is_empty()).map(str::to_string);
                 machines.push(MachineEntry {
                     name: name.clone(),
@@ -281,7 +278,6 @@ impl ShedConfig {
                     ssh_port: scalar("ssh_port")
                         .and_then(|s| s.parse().ok())
                         .unwrap_or(22),
-                    rc_bin: opt("rc_bin"),
                     known_hosts: opt("known_hosts"),
                 });
             }
@@ -597,21 +593,17 @@ default_server: ghost
         assert_eq!(full.user.as_deref(), Some("charliek"));
         assert_eq!(full.ssh_port, 2022);
         assert_eq!(
-            full.rc_bin.as_deref(),
-            Some("/opt/homebrew/bin/shed-machine-rc")
-        );
-        assert_eq!(
             full.known_hosts.as_deref(),
             Some("/Users/dev/.ssh/known_hosts")
         );
 
-        // A present-but-EMPTY optional is absent, not `Some("")` — the default
-        // binary must still be used.
+        // `rc_bin:` is present in the fixture but unmodeled by either
+        // language now (C8 retired it with `sx`) — it must not stop the
+        // entry from decoding.
         let partial = config.machine("mini2box").expect("mini2box");
         assert_eq!(partial.host, "mini2box"); // host defaults to the entry name
         assert_eq!(partial.user.as_deref(), Some("builder"));
         assert_eq!(partial.ssh_port, 22);
-        assert_eq!(partial.rc_bin, None);
         assert_eq!(partial.known_hosts, None);
 
         // `bare: {}` → every default.
@@ -622,7 +614,6 @@ default_server: ghost
                 host: "bare".into(),
                 user: None,
                 ssh_port: 22,
-                rc_bin: None,
                 known_hosts: None,
             })
         );
@@ -646,10 +637,13 @@ default_server: mini2
     }
 
     /// Plan 019 C1's shared two-language fixture: asserts the FULL
-    /// `MachineEntry` shape — including `rc_bin`, which Go's decoder
-    /// (`internal/config/machines.go`) deliberately does not model (pin P7) —
-    /// against `crates/fixtures/machines/expected.json`. See that directory's
-    /// README for the asymmetry this test and its Go twin split between them.
+    /// `MachineEntry` shape against `crates/fixtures/machines/expected.json`.
+    ///
+    /// The `withrc` entry carries a leftover `rc_bin:` key (retired with `sx`
+    /// in C8, plan 022 S6) plus an unmodeled `color:` — **this is the Rust
+    /// tolerance negative control**: neither language models either key any
+    /// more, and both must still decode the entry cleanly rather than skip
+    /// it. See `crates/fixtures/machines/README.md`.
     #[test]
     fn machines_fixture_matches_expected_json() {
         #[derive(serde::Deserialize)]
@@ -658,7 +652,6 @@ default_server: mini2
             host: String,
             user: Option<String>,
             ssh_port: u16,
-            rc_bin: Option<String>,
             known_hosts: Option<String>,
         }
         #[derive(serde::Deserialize)]
@@ -683,13 +676,17 @@ default_server: mini2
             assert_eq!(got.host, want.host, "host for {}", want.name);
             assert_eq!(got.user, want.user, "user for {}", want.name);
             assert_eq!(got.ssh_port, want.ssh_port, "ssh_port for {}", want.name);
-            assert_eq!(got.rc_bin, want.rc_bin, "rc_bin for {}", want.name);
             assert_eq!(
                 got.known_hosts, want.known_hosts,
                 "known_hosts for {}",
                 want.name
             );
         }
+        assert!(
+            config.machine("withrc").is_some(),
+            "an entry carrying rc_bin (unmodeled by either language now) must \
+             still decode — the tolerance this fixture exists to pin"
+        );
         assert!(
             config.machine("broken").is_none(),
             "the malformed entry must be skipped, not decoded"

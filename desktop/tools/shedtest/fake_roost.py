@@ -562,7 +562,8 @@ class FakeRoost:
         with self._lock:
             return self._count_streams()
 
-    def add_tab(self, tab_id: int, *, cwd: str, title: str, source: str | None = None,
+    def add_tab(self, tab_id: int, *, cwd: str = "/home/shed", title: str = "zsh",
+                source: str | None = None,
                 session_id: str = "", lifecycle: str = "inactive", detail: str = "",
                 has_notification: bool = False, shell_state: str = "at_prompt",
                 metadata: dict | None = None) -> dict:
@@ -571,7 +572,9 @@ class FakeRoost:
         `source` is roost's open `ownership.source` string (`opencode`, `claude`,
         …). **`None` means a plain shell tab** — no `ownership` key at all, which
         is what roost's wire carries for somebody's terminal, and what makes it
-        NOT a session row.
+        NOT a session row. `""` is neither, and is REFUSED (see `ownership`):
+        the daemon rejects an empty source, so a fake that quietly read it as
+        "unowned" would accept a call the real server answers `invalid-param` to.
 
         `metadata` is roost's open extension channel on the ownership
         (`TabAgentReportParams.metadata`) — the adapter's own key/value bag,
@@ -579,9 +582,18 @@ class FakeRoost:
         reports `server_url` (roost R10, plan 015 §3.3), which is what makes the
         row's `agent_lane` stamp appear. Ignored without a `source`, because
         there is no ownership to hang it on.
+
+        The Rust twin is `FakeRoost::add_tab(tab_id, TabSpec { .. })` — nine
+        keyword arguments there are a parameter struct with a `Default` carrying
+        these same defaults, which is the same call in a language with no default
+        arguments. The one deliberate difference is the STARTING state, not the
+        control: this fake starts with no tabs at all (`_PROJECT` empties the
+        vendored project), while the Rust one keeps the vendored `tab.list`'s
+        single shell tab (id 5) so its own tests can address one without adding
+        it.
         """
         with self._lock:
-            tab = copy.deepcopy(_AGENT_TAB if source else _SHELL_TAB)
+            tab = copy.deepcopy(_AGENT_TAB if source is not None else _SHELL_TAB)
             tabs = self._projects[0]["tabs"]
             tab["id"] = str(tab_id)
             tab["project_id"] = self._projects[0]["id"]
@@ -591,9 +603,9 @@ class FakeRoost:
             tab["agent_lifecycle"] = lifecycle
             tab["has_notification"] = has_notification
             tab["position"] = len(tabs)
-            if source:
-                tab["ownership"] = _ownership(source, session_id, detail,
-                                              tab.get("last_active", 0), metadata)
+            if source is not None:
+                tab["ownership"] = ownership(source, session_id, detail,
+                                             tab.get("last_active", 0), metadata)
             else:
                 tab.pop("ownership", None)
             tabs.append(tab)
@@ -614,7 +626,18 @@ class FakeRoost:
         `ownership=None` un-owns the tab (the key is REMOVED, as roost's wire has
         it), which drops it from the row set; a dict replaces it wholesale.
         `detail` edits the current ownership's detail in place.
+
+        The twin of `testing.rs::set_tab_axes`, down to refusing an ownership
+        dict with a blank `source` — this is the door a test that hand-wrote the
+        object rather than calling `ownership()` comes through, and the real
+        daemon refuses it either way.
         """
+        if ownership is not _UNSET and ownership is not None:
+            if not (ownership or {}).get("source"):
+                raise ValueError(
+                    "roost refuses an empty ownership.source "
+                    "(ReportError::EmptySource); pass ownership=None to un-own "
+                    f"a tab: {ownership!r}")
         with self._lock:
             tab = self._tab(tab_id)
             if tab is None:
@@ -1093,14 +1116,30 @@ class FakeRoost:
         return copy.deepcopy(seeded if seeded is not None else _SET_AGENT_HOOKS)
 
 
-def _ownership(source: str, session_id: str, detail: str, last_event_at: int,
-               metadata: dict | None = None) -> dict:
+def ownership(source: str, session_id: str, detail: str, last_event_at: int,
+              metadata: dict | None = None) -> dict:
     """A minimal roost `Ownership`, so a test never hand-writes the shape.
 
     `metadata` is roost's open extension channel — an opaque string map the
     daemon carries verbatim (it validates only `source` and the attention bits).
     Defaults to empty, which is what every adapter that stamps nothing sends.
+
+    Public, and the twin of `shed_core::roost::testing::ownership` /
+    `ownership_with`. The four required arguments are the same four there; the
+    ONE deliberate divergence is `metadata`, which Rust (having no default
+    arguments) splits into that second function and this one defaults.
+
+    **An empty `source` is refused**, because the real daemon refuses one:
+    `roost_ipc::agent::validate_report` answers `EmptySource` before it mutates
+    anything, and `is_live` reads a blank source as unowned. A fake more
+    permissive than the server it stands in for passes a client the real server
+    then rejects — plan 021's A6 recorded exactly that — so an unowned tab has
+    NO `ownership` key rather than a blank one.
     """
+    if not source:
+        raise ValueError(
+            "roost refuses an empty ownership.source (ReportError::EmptySource); "
+            "an unowned tab has NO ownership key, it does not have a blank one")
     return {
         "source": source,
         "session_id": session_id,

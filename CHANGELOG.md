@@ -23,16 +23,21 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+**Ships:** server, host-agent, desktop
+
 _Staged by plans 010 (the machine-hub port + retirement), 011 (shipping `sx`), 014 (roost
 session protocol 4 + the RC-lane demolition), 015 (agent lanes: opencode), 016 (sunsetting
 `sx`, unreleased), 017 (agent lanes: gx), 018 (agent lanes: the channel bound, free-text
 answers, scoped approvals, the shared lane view), 019 (the roost-provider kickoff + the
-desktop bootstrap), 020 (the roost session protocol 5 re-pin) and 021 (the roost session
-protocol 6 re-pin + the Tauri promotion); at release time fold this body into the new
-`## v0.9.0 — <date>` section — note the **em dash** — and replace this note with a real
-`**Ships:** server, host-agent, desktop` line (all three; `recommend-components.sh 0.9.0`
-agrees). release-plan.sh never reads an `## Unreleased` heading: it anchors on the exact
-`## v0.9.0 — ` string and takes the first line-start `**Ships:**` line under it._
+desktop bootstrap), 020 (the roost session protocol 5 re-pin), 021 (the roost session
+protocol 6 re-pin + the Tauri promotion) and 022 (S6: the RC hub's full retirement, the
+roost-native `shed attach`/`shed sessions` CLI, and the `shed-ext-rc` → strix/prox image
+swap); at release time fold this body into the new `## v0.9.0 — <date>` section — note the
+**em dash** — carrying the `**Ships:**` line above down with it (all three components;
+`recommend-components.sh 0.9.0` agrees). release-plan.sh never reads an `## Unreleased`
+heading: it anchors on the exact `## v0.9.0 — ` string and takes the first line-start
+`**Ships:**` line under that heading, which is why the line above must survive the fold
+verbatim._
 
 - **Tauri is now the default macOS client — every roost feature since plan 013 moves to
   everyone** (plan 021, C3). The release workflow's two mutually exclusive mac jobs
@@ -351,6 +356,83 @@ agrees). release-plan.sh never reads an `## Unreleased` heading: it anchors on t
   `session.identify` returned and treat a disagreement as an immediate
   resync instead of recovering by accident one cycle later, bounded by
   the existing `MAX_CONSECUTIVE_RESYNCS`.
+- **The RC hub is retired, end to end (S6, plan 022, `charliek/shed#328`).** Eight commits
+  remove the whole remote-control-hub stack plans 008–010 built and plan 014 partly
+  demolished already: the guest binary (`shed-ext-rc` no longer bakes into the
+  `extensions`/`full` rootfs images; in its place both stages install `strix`, a TUI for
+  staging and reviewing diffs, and `prox`, a process manager with an HTTP API and TUI, from
+  the stridelabs apt repo — measured +32.6 MiB over a base that already carries `strix`'s
+  `git` dependency); the server surface (`internal/api/{rchub,rchub_breaker,rcevents,
+  rcenrich}.go`, `internal/ext/rc`, `internal/ext/clirc` — ~18.5k lines — and the `rc-enrich`/
+  `rc-events`/`rc-proxy` feature tokens + `rc_capabilities` off `/api/overview` and
+  `/api/info`); the desktop app's hub half of the Agents pane (`shed_app::RcService`,
+  `live_activity.rs` — `rc.list` survives as the roost half alone, same op/envelope/row
+  shape); and the Rust engine (`crates/shed-rc-engine` entirely, `shed-broker`'s `rc_hub`
+  module, and the host-agent's resident `rc-hub` role + its `rc_hub` config knob —
+  `shed-host-agent rc-hub` is now a **tombstone** that names the retirement instead of
+  silently starting the daemon, and a config file that still carries `rc_hub:` loads
+  unchanged, the key simply ignored). `tests/rc-parity` (both the one-shot family plan 016
+  had already retired and the surviving hub family) is deleted whole. The pure
+  `shed_core::rc` **model** survives — `RcKind`, `RcSession`, `RcState`, `RcActivity`,
+  `RcKindFeatures`, `RcCapabilities`, `RcAgentInfo`, `RcError` — it's what the lane
+  adapters, `roost::model`, and shed-mobile read; `kind_features` is now derived
+  client-side from whether a lane adapter is attached, not read off the wire.
+- **`shed attach` and `shed sessions` are roost-native, with tmux as the unchanged floor**
+  (owner decision D1, plan 022). With a local roost app running, `shed attach <shed>` opens
+  the shed as a roost tab instead of a tmux session; with no local roost app, `--tmux`, or
+  `SHED_ATTACH=tmux`, both commands run byte-for-byte as before — pinned by a golden
+  recorded before anything moved. `-S/--session` names the roost **tab title** on the roost
+  path. `shed sessions` lists a shed's roost tabs above its tmux rows (the shed list comes
+  from the server, not from tmux, so a shed used entirely through roost still shows up);
+  `sessions kill` closes a roost tab when exactly one match exists and refuses — naming
+  `--tab`/`--tmux` — when several tabs, or a tab and a tmux session, collide on one title.
+  `shed plan` and the whole Remote-Control flag set on `shed attach`
+  (`--kind/--name/--slug/--workdir/--prompt/--prompt-file/--edit/--plan/--plan-edit/
+  --permission-mode/--skip/--detach`) are **removed, not rebased** — handing a plan to a
+  shed is now `shed attach` for the tab, then the agent inside it; #371 tracks the one
+  capability with no successor yet (opening a tab with a command already running,
+  non-interactively). Known trade-offs, left as documented hazards rather than fixed here:
+  renaming a roost tab defeats reuse and opens a new one; two concurrent attaches can race
+  a duplicate saved host; nothing removes the `Host shed-<name>` ssh alias or the saved
+  roost host on `shed delete`. See
+  [`shed attach`](https://charliek.github.io/shed/reference/cli/#shed-attach) and
+  [`shed sessions`](https://charliek.github.io/shed/reference/cli/#shed-sessions) in the
+  CLI reference.
+- **`shed-server` restarts no longer leave a running shed's credential channel broken**
+  (#315). The host only ever dials the guest, never the reverse, so a restart — which every
+  brew/apt upgrade performs — left every already-running shed silently credential-broken:
+  `shed list` still said `running` and `shed exec` still worked, but SSH-agent/AWS/Docker
+  credential requests failed, reading as an auth problem rather than a plumbing one. Both
+  backends now walk their running instances at startup (in a goroutine, so boot never waits
+  on it) and resume each one's message channel — deliberately just the channel: no mounts,
+  no provisioning, no hooks — gated on a stricter liveness check than a bare PID match (the
+  process family AND its command line must name *this* instance) so a recycled PID can
+  never resurrect a dead record. Upgrading past this release needs no `shed stop && shed
+  start` dance; older servers still do. See the
+  [v0.8.2 → v0.9.0 upgrade note](https://charliek.github.io/shed/upgrades/v0.8.2-to-v0.9.0/).
+- **Filed while landing the above, deliberately not fixed in this PR:**
+  - #369 — Firecracker: a restart doesn't re-serve `--local-dir`/`--add-dir` 9P host
+    mounts (VZ is unaffected; vfkit's VirtioFS servers live in the VMM process, which
+    survives a `shed-server` restart). A sibling of #315's channel fix, found while tracing
+    it — the same resume walk re-dials the credential channel but deliberately does not
+    re-run mounts.
+  - #370 — Port the roost-session installer (probe/pick-a-source-rung/push/verify) from
+    `crates/shed-core/src/roost/bootstrap/` to the Go CLI, so a CLI-only user on a
+    session-less shed has an unattended path. Deferred behind plan 023's baked-image +
+    start-only rung; may turn out unnecessary once those land.
+  - #371 — `shed attach --run <cmd...>`: open a roost tab with a command already running,
+    non-interactively — the one `shed plan` capability with no successor above.
+  - #372 — Firecracker: stopping/restarting `shed-server` kills every running shed's VM
+    (the SDK's default `ForwardSignals` relays SIGTERM/etc. straight to each VMM process);
+    VZ is unaffected. Same command, opposite outcome on the two backends, undocumented
+    until this ticket.
+  - #373 — The Mac parallel-dev config pins `v0.8.0` image aliases while a workstation's
+    dev image cache can hold a user-pulled `v0.8.1`, failing
+    `test_images_expose_alias_and_default[vz]` for a dev-environment reason unrelated to
+    the change under test.
+  - #375 — `shed sessions --all <shed>` silently ignores the shed argument (pre-existing;
+    found by review of the roost-tab merge above, whose new half was made to match this
+    behavior rather than fix it, so one command doesn't answer two different questions).
 
 ## v0.8.2 — 2026-08-17
 

@@ -64,10 +64,10 @@ Other ways to create: `--local-dir ~/path` mounts a host directory as the worksp
 Usage notes that matter:
 
 - **`console` vs `attach`:** `console` is a direct shell that dies on disconnect; `attach` is a tmux session that survives. For anything long-running (agents, dev servers), use `attach`.
+- **roost:** with a local roost app running, `shed attach` opens the shed as a roost tab; otherwise it is tmux (force tmux with `--tmux` or `SHED_ATTACH=tmux`).
 - **One-off vs interactive:** `shed exec <name> <command...>` runs a single command over SSH with the argv passed through verbatim (it is not a shell), e.g. `shed exec myproj git status`. For pipes, `&&`, redirection, or `cd`, wrap it yourself: `shed exec myproj bash -lc "cd /workspace && npm test"`. Reserve `attach`/`console` for interactive work.
 - **Multi-server:** target one with `-s <server>`; sweep all with `--all` (on `list`, `sessions`, `system`).
 - **Scripting:** `--json` emits structured output. Destructive commands require `--force` when combined with `--json` (no interactive prompt).
-- **Autonomous agents:** to hand a plan to a shed and have an agent run it unattended, use the one-command **`shed plan <file> --shed <name> [--repo owner/repo] [-s server] [--kind …] -d`** porcelain (creates the shed if missing, ships the plan, starts the session, reports it). It's built on `shed attach`'s Remote Control mode (`--kind`/`--plan` creates an `rc-*` session; `-d/--detach` returns instead of attaching, printing a `claude.ai/code` URL for Claude). Agent kinds: `claude-rc` (default), `codex`, `cursor`, `opencode`, `shell`. For the full workflow — authoring the plan, picking/creating the shed, per-agent auth, watching the run — use the **`shed-plan`** skill.
 
 ## Reaching services inside a shed (tunnels)
 

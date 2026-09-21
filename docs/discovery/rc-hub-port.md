@@ -1,11 +1,20 @@
 # RC activity hub — Go→Rust port map (plan 010)
 
+> **Superseded by S6, 2026-09-21 (plan 022, [`charliek/shed#328`](https://github.com/charliek/shed/issues/328)).**
+> Everything this page describes — the Go hub, its Rust port in `shed-broker`'s `rc_hub`
+> module, `shed-host-agent`'s resident hub role, and the `tests/rc-parity` differential
+> harness it names below — is deleted. There is no RC hub, on either side of the wire, any
+> more. Kept as a historical design/port record, not maintained further. For the current
+> model (roost tabs, `shed attach`/`shed sessions`, agent lanes) see
+> [`shed-ext-rc` (retired)](../extensions/rc-helper.md) and
+> [Agent lanes](../desktop/agent-lanes.md).
+
 The working reference for porting the RC activity hub (`serve`) from
 `internal/ext/rc/` into `shed-broker`'s `rc_hub` module, hosted by the
-`shed-host-agent` daemon. The **normative wire** is
-[rc-helper.md § The RC activity hub](../extensions/rc-helper.md#the-rc-activity-hub-serve)
-— this page maps source to destination and inventories the tests each file must
-bring with it, so the port (and its acceptance criteria) are auditable from the
+`shed-host-agent` daemon. The **normative wire** was
+[rc-helper.md § The RC activity hub](../extensions/rc-helper.md) (now retired, see the
+note above) — this page maps source to destination and inventories the tests each file
+must bring with it, so the port (and its acceptance criteria) are auditable from the
 repo alone. The one-shot engine is already Rust (plan 009:
 `shed_app::rc_engine`, graduating into its own `crates/shed-rc-engine` at plan
 010 H2; kernel in `shed_core::rc_agents`).

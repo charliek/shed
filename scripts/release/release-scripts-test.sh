@@ -195,7 +195,7 @@ step "update-version.sh --components desktop lands all four surfaces + both lock
 grep -q '^version = "0.8.0"' "${SCRATCH}/crates/Cargo.toml" || fail "crates/Cargo.toml didn't bump"
 grep -q '^version = "0.8.0"' "${SCRATCH}/desktop/tauri/src-tauri/Cargo.toml" || fail "tauri Cargo.toml didn't bump"
 [ "$(jq -r '.version' "${SCRATCH}/desktop/tauri/src-tauri/tauri.conf.json")" = "0.8.0" ] || fail "tauri.conf.json didn't bump"
-for dep in shed-core shed-app shed-rc-engine shed-broker shed-opencode shed-gx; do
+for dep in shed-core shed-app shed-broker shed-opencode shed-gx; do
   grep -A1 "^name = \"${dep}\"$" "${SCRATCH}/crates/Cargo.lock" | grep -q '^version = "0.8.0"' \
     || fail "crates/Cargo.lock ${dep} entry didn't refresh"
   grep -A1 "^name = \"${dep}\"$" "${SCRATCH}/desktop/tauri/src-tauri/Cargo.lock" | grep -q '^version = "0.8.0"' \
@@ -869,6 +869,62 @@ h3_err="$(cd "${FIX3}" && RECOMMEND_NO_GH=1 "${RECO}" 2.0.1 2>&1 1>/dev/null)" |
 [ "${h3_rc}" -eq 1 ] || fail "H3: basis-less 'desktop' didn't hard-error (got ${h3_rc}): ${h3_err}"
 echo "${h3_err}" | grep -q "no historical basis for component 'desktop'" || fail "H3: error doesn't name desktop: ${h3_err}"
 ok "desktop (absent from the EMPTY production NEVER_SHIPPED) still exits 1 with 'no historical basis'"
+
+# ---------------------------------------------------------------------------
+# H4: the desktop path list must cover EVERY crate the Tauri app links.
+#
+# `desktop/tauri/src-tauri/Cargo.toml` takes `shed-opencode` and `shed-gx` as
+# plain path-deps, so their source IS in the shipped DMG/.deb — but
+# PATHS_DESKTOP listed neither, so a correctness fix confined to an adapter
+# recommended NO component at all on a patch tag and the desktop shipped stale.
+# A SEPARATE fixture (the shared one is spent: H2 wrote an rc into its
+# desktop/VERSION).
+#
+#   v3.0.0  plugin=3.0.0, desktop=3.0.0, NO host-agent VERSION (pre-migration →
+#           its walk falls back to this tag, so all three resolve a basis and a
+#           mis-attributed diff would show up as a WRONG component, not a crash).
+#   HEAD    exactly one commit, touching ONLY crates/shed-opencode, then (added
+#           mid-block) one touching ONLY crates/shed-gx.
+#
+# Both adapters are asserted, and both assert desktop AND ONLY desktop: neither
+# reaches the host-agent binary (shed-broker has never linked either adapter),
+# so a lazy "add them everywhere" fix is red here too.
+# ---------------------------------------------------------------------------
+FIX4="${SCRATCH}/reco-fixture-h4"
+mkdir -p "${FIX4}"
+git -C "${FIX4}" init -q
+gitf4() { git -C "${FIX4}" -c user.email=t@t -c user.name=t "$@"; }
+mkdir -p "${FIX4}/.claude-plugin" "${FIX4}/desktop" \
+         "${FIX4}/crates/shed-opencode/src" "${FIX4}/crates/shed-gx/src"
+printf '{"version": "3.0.0"}\n' > "${FIX4}/.claude-plugin/plugin.json"
+printf '3.0.0\n' > "${FIX4}/desktop/VERSION"
+printf 'pub fn fold() {}\n' > "${FIX4}/crates/shed-opencode/src/fold.rs"
+printf 'pub fn fold() {}\n' > "${FIX4}/crates/shed-gx/src/fold.rs"
+gitf4 add -A; gitf4 commit -q -m 'v3.0.0 base'
+gitf4 tag v3.0.0
+
+run_reco4() {
+  RECO_RC=0
+  RECO_OUT="$(cd "${FIX4}" && RECOMMEND_NO_GH=1 "${RECO}" 3.0.1 2>"${SCRATCH}/reco4.err")" || RECO_RC=$?
+  RECO_ERR="$(cat "${SCRATCH}/reco4.err")"
+}
+
+for adapter in shed-opencode shed-gx; do
+  step "recommend-components.sh: a ${adapter}-only change flags desktop (the Tauri app links it) and nothing else"
+  printf 'pub fn fold() { /* changed */ }\n' > "${FIX4}/crates/${adapter}/src/fold.rs"
+  gitf4 add -A; gitf4 commit -q -m "desktop: ${adapter} change"
+  run_reco4
+  [ "${RECO_RC}" -eq 0 ] || fail "H4 ${adapter}: recommend exited ${RECO_RC}: ${RECO_ERR}"
+  echo "${RECO_OUT}" | grep -qx "level=patch" || fail "H4 ${adapter}: level wrong: ${RECO_OUT}"
+  echo "${RECO_OUT}" | grep -qx "recommended_components=desktop" \
+    || fail "H4 ${adapter}: expected exactly 'desktop' — is crates/${adapter} missing from PATHS_DESKTOP (or wrongly in another list)? got: ${RECO_OUT} // ${RECO_ERR}"
+  echo "${RECO_ERR}" | grep -q "NO component changed" \
+    && fail "H4 ${adapter}: the recommender saw no change at all — crates/${adapter} is in NO path list: ${RECO_ERR}"
+  ok "${adapter}-only change → recommended_components=desktop"
+  # Restore so the NEXT adapter's commit is the only diff since v3.0.0.
+  printf 'pub fn fold() {}\n' > "${FIX4}/crates/${adapter}/src/fold.rs"
+  gitf4 add -A; gitf4 commit -q -m "revert ${adapter} change"
+done
 
 echo
 echo "release-scripts-test: all ${PASS} checks passed"

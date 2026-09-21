@@ -505,6 +505,33 @@ impl RoostInventory {
 /// `attach` is [`ATTACH_NATIVE_REMOTE`]: the terminal belongs to roost, and a
 /// client reaches it with its own affordance (mobile's read-only `tab.dump`
 /// peek) or not at all — never a tmux attach.
+///
+/// The per-kind rows come from [`roost_kind_features`], asked about the kind and
+/// whether an agent-lane adapter exists for it — so opencode and gx advertise
+/// the message feed their adapters produce and the bare-TUI kinds advertise the
+/// activity dimension they do carry. No row says `"none"`.
+///
+/// # What this block is, and what it is NOT
+///
+/// It is per-**origin**, minted once for a whole roost host, and this function
+/// has no row in hand. So every row it can state is a **CEILING** — "this is the
+/// most an opencode row here could offer" — and a ceiling is all
+/// [`RcKindFeatures`] has ever been able to mean on this path. It is deliberately
+/// not narrowed to a per-row API: no consumer asked for one, and the per-row
+/// truth already exists and is cheaper to read.
+///
+/// **The per-row truth is [`RoostSession::agent_lane`].** A row whose tab never
+/// reported a `server_url` (or reported an unusable one, or has no session id)
+/// gets `None` there and `lane.open` answers `no_lane`, even though its kind's
+/// row here says `feed: "messages"`, `watch: true`. That is not a contradiction
+/// to be fixed — it is the ceiling and the row disagreeing, which is what a
+/// ceiling is for. `capabilities_are_a_kind_ceiling_not_a_row_promise` pins it.
+///
+/// So: a client picking which affordances a KIND could ever have reads this; a
+/// client deciding whether to offer THIS ROW a transcript reads
+/// [`RoostSession::agent_lane`] and nothing else. (The Tauri client does —
+/// `desktop/tauri/ui/src/App.tsx` gates its Transcript button on
+/// `s.agent_lane && s.machine`, "and on nothing about the kind".)
 pub fn roost_capabilities() -> RcCapabilities {
     let kinds = vec![
         RcKind::ClaudeRc,
@@ -516,7 +543,16 @@ pub fn roost_capabilities() -> RcCapabilities {
     ];
     let kind_features: HashMap<String, RcKindFeatures> = kinds
         .iter()
-        .map(|kind| (kind.as_str().to_string(), roost_kind_features()))
+        .map(|kind| {
+            (
+                kind.as_str().to_string(),
+                // `lane_adapter_exists`, NOT "a lane is attached": there is no
+                // row here to ask. This is the kind's ceiling — see this
+                // function's doc, and read [`RoostSession::agent_lane`] for the
+                // per-row answer.
+                roost_kind_features(kind, lane_adapter_exists(kind)),
+            )
+        })
         .collect();
     // `RcCapabilities::offers` gates a kind on its backing agent being
     // installed, and roost's wire carries no agent inventory. Claim every
@@ -548,26 +584,44 @@ pub fn roost_capabilities() -> RcCapabilities {
     }
 }
 
-/// The one per-kind feature set every roost kind gets. See
-/// [`roost_capabilities`].
+/// Whether an agent-lane adapter exists for `kind` — the same two kinds
+/// [`RoostSession::agent_lane`] will stamp, named once so the capability block
+/// and the stamp cannot drift apart.
+fn lane_adapter_exists(kind: &RcKind) -> bool {
+    matches!(kind, RcKind::Opencode | RcKind::Gx)
+}
+
+/// One roost kind's feature row — **per kind and client-side** since plan 022
+/// (S6, `charliek/shed#328`). The guest hub used to mint this block and it is
+/// now synthesized here, which is why the shape is a function of the two things
+/// a client actually knows: the kind, and whether a lane is attached.
 ///
-/// **`feed` is `"activity"`.** Three words are in play and only one is true here.
-/// An EMPTY `feed` means the field is absent because the producer predates v2 —
-/// wrong, since shed synthesizes this block as a v2 producer (`rc_version: 2`,
-/// `contract-v2` in `features`). `"none"` means "no signal at all" — also wrong,
-/// and the value this briefly carried: a roost row DOES carry a live activity
-/// dimension, folded out of `agent_lifecycle` and the adapter's `detail` by
-/// [`RoostSession::activity`] and refreshed by every batch the observer stream
-/// delivers. `"activity"` is the vocabulary's word for exactly that — the
-/// activity dimension and no message feed — so it is the honest one.
+/// **Per KIND, which makes it a ceiling.** Its only production caller,
+/// [`roost_capabilities`], is per-origin and passes `lane_adapter_exists(kind)`
+/// because it has no row — so what lands on the wire states what a kind COULD do
+/// here, never what a given row does. [`RoostSession::agent_lane`] is the per-row
+/// truth, and it is allowed to say `None` under a kind row that says
+/// `feed: "messages"`.
+///
+/// **`feed` is `"messages"` when a lane is attached and `"activity"` when it is
+/// not, and it is never `"none"`.** Three words are in play:
+///
+/// * `""` means the field is absent because the producer predates v2 — wrong,
+///   since shed synthesizes this block as a v2 producer (`rc_version: 2`,
+///   `contract-v2` in `features`);
+/// * `"none"` means "no signal at all" — wrong for every roost row, and the
+///   value this briefly carried. A roost row ALWAYS carries a live activity
+///   dimension, folded out of `agent_lifecycle` and the adapter's `detail` by
+///   [`RoostSession::activity`] and refreshed by every batch the observer stream
+///   delivers. With the hub gone there is no producer of `"none"` left anywhere;
+///   `feed_is_never_none` pins that.
+/// * `"messages"` means a normalized conversation feed exists — true exactly
+///   when a lane is attached ([`RoostSession::agent_lane`] stamped it), because
+///   the lane adapter IS the feed's producer.
 ///
 /// The distinction that makes this easy to get backwards: `feed` describes the
 /// **message** feed, and no client gates its activity chip on it (the chip reads
-/// the row's own `activity` field). So the guest hub, whose codex and cursor
-/// rows have had no activity producer since A6, correctly says `"none"`, while
-/// roost — which reports activity for those same kinds — says `"activity"`.
-/// Same two kinds, different answer, because the answer is about where the
-/// session lives, not what it is.
+/// the row's own `activity` field).
 ///
 /// `approvals` is `"none"`, a third value beside the documented `tui` | `remote`
 /// pair (recorded in rc-helper.md's field table): roost answers approvals in the
@@ -575,13 +629,20 @@ pub fn roost_capabilities() -> RcCapabilities {
 /// affordance no shed client has. Clients branch on `== "remote"` only, so the
 /// value is inert on the wire — it is stated here because the alternatives are
 /// both lies.
-fn roost_kind_features() -> RcKindFeatures {
+pub fn roost_kind_features(kind: &RcKind, lane_attached: bool) -> RcKindFeatures {
+    // `kind` is not decoration: a caller can only honestly claim an attached
+    // lane for a kind an adapter exists for, and `&&`-ing the two here makes the
+    // capability row and [`RoostSession::agent_lane`] unable to contradict each
+    // other even if a future caller passes the flag from somewhere looser.
+    let messages = lane_attached && lane_adapter_exists(kind);
     RcKindFeatures {
         post_input: false,
         approvals: "none".to_string(),
-        watch: false,
+        // DEPRECATED by `feed`, and held in the lockstep the contract promises:
+        // `watch == (feed == "messages")`.
+        watch: messages,
         input: String::new(),
-        feed: "activity".to_string(),
+        feed: if messages { "messages" } else { "activity" }.to_string(),
         interrupt: false,
         attach: ATTACH_NATIVE_REMOTE.to_string(),
     }
@@ -1454,9 +1515,21 @@ failed   foreground_process question_asked    -> needs_input";
             .values()
             .all(|a| a.installed && a.version.is_none()));
 
-        let wire_names = ["claude-rc", "codex", "opencode", "cursor", "gx", "grok"];
+        // The rows are PER KIND since S6 (`charliek/shed#328`): the two kinds an
+        // agent-lane adapter exists for advertise the message feed that adapter
+        // produces; the bare-TUI kinds advertise the activity dimension they do
+        // carry. `""` (pre-v2, fall back to `watch`) and `"none"` (no signal at
+        // all) are BOTH wrong for a roost row and neither appears.
+        let wire_names = [
+            ("claude-rc", "activity"),
+            ("codex", "activity"),
+            ("opencode", "messages"),
+            ("cursor", "activity"),
+            ("gx", "messages"),
+            ("grok", "activity"),
+        ];
         assert_eq!(caps.kind_features.len(), wire_names.len());
-        for name in wire_names {
+        for (name, feed) in wire_names {
             let features = caps
                 .kind_features
                 .get(name)
@@ -1469,22 +1542,41 @@ failed   foreground_process question_asked    -> needs_input";
             // recorded as such in rc-helper.md's field table — see
             // `roost_kind_features`.
             assert_eq!(features.approvals, "none");
-            assert!(!features.watch);
-            assert!(!features.feed_messages());
             assert_eq!(features.input, "");
             assert!(!features.input_gated());
-            // A roost row carries a live activity dimension (see the matrix in
-            // `activity_matrix_pins_every_cell`), so the honest word is
-            // `"activity"` — the vocabulary's "activity dimension, no message
-            // feed". NOT `""` (which means "pre-v2, fall back to `watch`") and
-            // not `"none"` (which would deny the status this whole pivot
-            // exists to deliver). The guest hub says `"none"` for these same
-            // kinds because ITS producer is gone; the answer depends on where
-            // the session lives.
-            assert_eq!(features.feed, "activity");
-            assert!(!features.feed_messages(), "activity is not a message feed");
             assert!(!features.interrupt);
+            assert_eq!(features.feed, feed, "{name}'s feed");
+            assert_eq!(features.feed_messages(), feed == "messages", "{name}");
+            // `watch` is DEPRECATED by `feed` and the contract promises the two
+            // stay in lockstep; this is the producer side of that invariant.
+            assert_eq!(features.watch, feed == "messages", "{name}'s watch");
         }
+
+        // **No producer of `"none"` is left.** The hub was the last one, and it
+        // went with S6 — so every row this client can synthesize, for every kind
+        // and either lane state, names a real signal.
+        for kind in &caps.kinds {
+            for lane_attached in [false, true] {
+                let row = roost_kind_features(kind, lane_attached);
+                assert!(
+                    row.feed == "activity" || row.feed == "messages",
+                    "{}/{lane_attached} produced feed {:?}",
+                    kind.as_str(),
+                    row.feed
+                );
+            }
+        }
+        // A kind with no adapter cannot be talked into claiming a feed, however
+        // the flag arrives.
+        assert_eq!(roost_kind_features(&RcKind::Codex, true).feed, "activity");
+        assert_eq!(
+            roost_kind_features(&RcKind::Opencode, true).feed,
+            "messages"
+        );
+        assert_eq!(
+            roost_kind_features(&RcKind::Opencode, false).feed,
+            "activity"
+        );
 
         // Every advertised kind is offered for creation: `offers` requires an
         // installed agent, and roost publishes no agent inventory, so the
@@ -1508,6 +1600,79 @@ failed   foreground_process question_asked    -> needs_input";
         assert!(caps.offers(&RcKind::Grok));
         assert!(!caps.offers(&RcKind::Shell));
         assert!(!caps.offers(&RcKind::ClaudeBroker));
+    }
+
+    /// **The ceiling and the row are allowed to disagree, and this is the shape
+    /// of the disagreement.**
+    ///
+    /// [`roost_capabilities`] is per-ORIGIN: it has no row in hand, so it passes
+    /// `lane_adapter_exists(kind)` and every opencode/gx row it describes
+    /// advertises `feed: "messages"` / `watch: true`. That is a CEILING. The
+    /// per-row truth is [`RoostSession::agent_lane`], and a tab that never
+    /// reported a `server_url` (or reported an unusable one, or has no session
+    /// id) has none — `lane.open` on it answers `no_lane`.
+    ///
+    /// A future reader who "fixes" the mismatch by making one side follow the
+    /// other breaks something: narrowing the block needs a row it does not have,
+    /// and widening `agent_lane` hands a client a URL to dial that does not
+    /// exist. So the relationship is pinned rather than the equality.
+    #[test]
+    fn capabilities_are_a_kind_ceiling_not_a_row_promise() {
+        let caps = roost_capabilities();
+
+        // Both lane kinds advertise the transcript at the CEILING.
+        for kind in ["opencode", "gx"] {
+            let f = &caps.kind_features[kind];
+            assert_eq!(f.feed, "messages", "{kind} ceiling");
+            assert!(f.watch, "{kind} ceiling");
+            assert!(f.feed_messages(), "{kind} ceiling");
+        }
+
+        // ... and these rows, of exactly those kinds, carry no lane.
+        //
+        // opencode: the tab reported nothing (a TUI that never started its
+        // server, or started it before roost read the tab).
+        let no_url = session_with("opencode", &[]);
+        assert_eq!(no_url.agent_kind(), RcKind::Opencode);
+        assert!(
+            no_url.agent_lane().is_none(),
+            "an opencode row with no server_url must have NO lane, whatever its kind advertises",
+        );
+
+        // opencode: a reported URL shed will not dial.
+        let off_loopback = session_with("opencode", &[("server_url", "http://evil.com:80")]);
+        assert_eq!(off_loopback.agent_kind(), RcKind::Opencode);
+        assert!(off_loopback.agent_lane().is_none());
+
+        // gx: the same, one tab short of a lane — `gx.remote` is there and
+        // loopback (so the row IS promoted to `Gx`), but the agent reported no
+        // session id, which is the address every lane verb takes.
+        let mut t = tab(4, AgentLifecycle::Finished, ShellState::Unknown, "");
+        {
+            let own = t.ownership.as_mut().expect("the sample tab is owned");
+            own.source = "grok".to_string();
+            own.session_id = String::new();
+            own.metadata = [(
+                GX_REMOTE_KEY.to_string(),
+                "http://127.0.0.1:2421".to_string(),
+            )]
+            .into_iter()
+            .collect();
+        }
+        let gx_no_session = session_of(&t);
+        assert_eq!(gx_no_session.agent_kind(), RcKind::Gx);
+        assert!(
+            gx_no_session.agent_lane().is_none(),
+            "a gx row with no session id must have NO lane, whatever its kind advertises",
+        );
+
+        // The converse half, so this can't pass by the ceiling collapsing: a row
+        // that DOES report both still stamps a lane.
+        assert!(
+            session_with("opencode", &[("server_url", "http://127.0.0.1:4096")])
+                .agent_lane()
+                .is_some()
+        );
     }
 
     #[test]

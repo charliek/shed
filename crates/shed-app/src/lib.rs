@@ -9,9 +9,7 @@
 pub mod audit_store;
 pub mod auth_modes;
 pub mod backend;
-/// The reconnect schedule shared by the long-lived feed watchers
-/// ([`rc_events_watcher`] and [`machine`]), so their "deliberately identical"
-/// cadences are identical by construction rather than by convention.
+/// The reconnect schedule for the long-lived feed watchers.
 mod backoff;
 #[cfg(feature = "broker")]
 pub mod broker_bridge;
@@ -24,21 +22,10 @@ pub mod host_agent;
 /// this crate with default features and folds the same subscription the desktop
 /// does, so the fold has to be one implementation rather than two.
 pub mod lane_view;
-/// The machine transport seam + the reconnecting hub watcher (plan 012).
-/// Deliberately NOT behind the `rc` feature: shed-mobile links this crate with
-/// default features and the machine feed is exactly what it needs.
+/// The machine transport seam (plan 012) — the per-client local-port forward
+/// every machine reach is built on. Ungated for the same reason [`roost`] is:
+/// shed-mobile links this crate with default features.
 pub mod machine;
-#[cfg(feature = "rc")]
-pub mod rc;
-/// The ported one-shot RC **engine** (plan 009 C3) — the local, synchronous
-/// producer of RC sessions, as opposed to [`rc`]'s async client of a REMOTE one.
-/// Graduated into its own crate at its second consumer (plan 010 H2:
-/// shed-broker's `rc_hub`); re-exported here so the desktop keeps the
-/// `shed_app::rc_engine::…` path. Behind the same `rc` feature: a consumer
-/// that has no RC pane wants neither.
-#[cfg(feature = "rc")]
-pub use shed_rc_engine as rc_engine;
-pub mod rc_events_watcher;
 /// The roost reach seam + the polling roost-session inventory watcher (plan
 /// 013). Ungated for the same reason [`machine`] is: shed-mobile links this
 /// crate with default features, and reading a roost-session is exactly what it
@@ -57,8 +44,7 @@ pub use backend::{
 #[cfg(feature = "broker")]
 pub use broker_bridge::{
     detect_mode, load_or_synthesize, probe_sockets, probe_sockets_at, resolve_mode, BrokerConfig,
-    BrokerError, DetectedMode, EffectiveMode, EmbeddedHostAgent, ModePref, ModeProbe, RcHubHost,
-    ResolvedMode,
+    BrokerError, DetectedMode, EffectiveMode, EmbeddedHostAgent, ModePref, ModeProbe, ResolvedMode,
 };
 pub use coordinator::{Coordinator, CoordinatorDeps, SshPrefs};
 pub use fakes::{AlwaysApprovedGate, FakeNotifier, NoopEventSink};
@@ -67,17 +53,7 @@ pub use host_agent::{
     HostAgentClientError, HostAgentEvent,
 };
 pub use lane_view::{LaneView, LaneViewSnapshot, MAX_VIEW_MESSAGES};
-pub use machine::{
-    FixedPort, ForwardError, MachineForward, MachineHubUpdate, MachineHubWatcher, SshForward,
-};
-#[cfg(feature = "rc")]
-pub use rc::{RcRunner, RcRunnerRef, RcService, RunOutput, TokioProcessRunner};
-#[cfg(feature = "rc")]
-pub use rc_engine::{
-    CreateOptions as RcCreateOptions, Engine as RcEngine, EngineError as RcEngineError, ExecRunner,
-    PromptOptions as RcPromptOptions, TmuxResult, TmuxRunner,
-};
-pub use rc_events_watcher::{RcEventsWatcher, RcWatcherUpdate};
+pub use machine::{FixedPort, ForwardError, MachineForward, SshForward};
 pub use roost::{
     launch_argv, roost_capabilities, shed_reach_entry, tab_close, tab_dump, tab_open,
     BootstrapRunner, HooksRefresh, LabelledPort, LocalSession, ReachError, ReachKind,

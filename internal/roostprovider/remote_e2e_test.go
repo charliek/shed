@@ -169,6 +169,77 @@ func TestBridgeOpsThroughFakeSSH(t *testing.T) {
 	assertSeq(t, "request lines", r.requestLines(), want)
 }
 
+// TestTabsAndCloseThroughFakeSSH is the tab half of the bridge ops: the tabs
+// `tab.list` nests inside each project come back decoded, and `tab.close`
+// closes one by the id they carried.
+//
+// The ids are asserted as the STRINGS they arrived as. roost serializes every
+// int64 id through `string_int64`, and the whole point of carrying them
+// unparsed is that the id `tab.list` reported is the byte-identical id
+// `tab.close` sends back.
+func TestTabsAndCloseThroughFakeSSH(t *testing.T) {
+	r := newRig(t, rigOpts{
+		projects: []Project{
+			{ID: "1", Name: "roost", Cwd: "/home/shed/roost", Tabs: []Tab{
+				{ID: "5", ProjectID: "1", Title: "zsh", Cwd: "/home/shed/roost",
+					State: "running", AgentLifecycle: "inactive"},
+				{ID: "7", ProjectID: "1", Title: "claude", Cwd: "/home/shed/roost",
+					State: "running", AgentLifecycle: "waiting"},
+			}},
+			{ID: "2", Name: "shed", Cwd: "/home/shed/shed"},
+		},
+	})
+	ctx := e2eContext(t)
+	target := r.target()
+
+	projects, err := r.remote.TabList(ctx, target)
+	if err != nil {
+		t.Fatalf("TabList: %v", err)
+	}
+	if len(projects) != 2 {
+		t.Fatalf("projects = %+v", projects)
+	}
+	if len(projects[0].Tabs) != 2 {
+		t.Fatalf("project 1 tabs = %+v, want two", projects[0].Tabs)
+	}
+	want := Tab{ID: "7", ProjectID: "1", Title: "claude", Cwd: "/home/shed/roost",
+		State: "running", AgentLifecycle: "waiting", CreatedAt: 1700000000}
+	if projects[0].Tabs[1] != want {
+		t.Errorf("tab = %+v, want %+v", projects[0].Tabs[1], want)
+	}
+	// A project with no tabs is not a project with a missing tab list.
+	if len(projects[1].Tabs) != 0 {
+		t.Errorf("project 2 tabs = %+v, want none", projects[1].Tabs)
+	}
+
+	if err := r.remote.TabClose(ctx, target, projects[0].Tabs[1].ID); err != nil {
+		t.Fatalf("TabClose: %v", err)
+	}
+
+	assertSeq(t, "request lines", r.requestLines(), []string{
+		`{"id":"1","op":"tab.list","params":{}}`,
+		`{"id":"1","op":"tab.close","params":{"tab_id":"7"}}`,
+	})
+}
+
+// TestTabCloseSurfacesARefusal: `tab.close` on a tab that is gone is an
+// `ok:false` envelope, and it has to arrive as roost's own code rather than as
+// a bare failure — the caller's whole decision is "was it already closed?".
+func TestTabCloseSurfacesARefusal(t *testing.T) {
+	r := newRig(t, rigOpts{})
+	r.replaceReply("tabclose",
+		`{"id":"1","ok":false,"error":{"code":"not-found","message":"no tab 404"}}`)
+
+	err := r.remote.TabClose(e2eContext(t), r.target(), "404")
+	var refusal *ResponseError
+	if !errors.As(err, &refusal) {
+		t.Fatalf("TabClose error = %v (%T), want a *ResponseError", err, err)
+	}
+	if refusal.Code != "not-found" {
+		t.Errorf("code = %q", refusal.Code)
+	}
+}
+
 // TestBridgeSkipsEventFramesOnTheWire: the rig's bridge pushes an unsolicited
 // `tab.opened` before EVERY answer, so this is really asserted by every call in
 // this file — this test just names the property and proves the frame is

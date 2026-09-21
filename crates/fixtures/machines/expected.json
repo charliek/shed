@@ -1,12 +1,11 @@
 {
-  "//": "Expected decode of sample.yaml, sorted by name (both parsers sort machines: entries by name). `broken` is intentionally ABSENT — both decoders skip a malformed entry rather than fail the whole document. `rc_bin` is the ONE deliberate asymmetry: shed-core's MachineEntry models it and asserts it here; Go's decoder (internal/config/machines.go) does not model the field at all (plan 019 pin P7) and its test ignores this key rather than asserting it — see README.md.",
+  "//": "Expected decode of sample.yaml, sorted by name (both parsers sort machines: entries by name). `broken` is intentionally ABSENT — both decoders skip a malformed entry rather than fail the whole document. `withrc` carries a leftover `rc_bin` key (plus an unknown `color` key) that NEITHER language models any more (C8, plan 022 S6, retired `rc_bin` with `sx`) — this is the tolerance negative control: an unmodeled key must not stop the entry from decoding. See README.md.",
   "entries": [
     {
       "name": "bare",
       "host": "bare",
       "user": null,
       "ssh_port": 22,
-      "rc_bin": null,
       "known_hosts": null
     },
     {
@@ -14,7 +13,6 @@
       "host": "builder.example.com",
       "user": "charliek",
       "ssh_port": 2022,
-      "rc_bin": null,
       "known_hosts": "/Users/dev/.ssh/known_hosts"
     },
     {
@@ -22,7 +20,6 @@
       "host": "side.example.com",
       "user": null,
       "ssh_port": 22,
-      "rc_bin": "/opt/homebrew/bin/shed-machine-rc",
       "known_hosts": null
     }
   ]

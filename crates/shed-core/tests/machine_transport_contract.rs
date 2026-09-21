@@ -1,16 +1,18 @@
 //! **The Rust leg of the machine-transport differential** (plan 012 S3, AC2).
 //!
 //! SSH has no argv API: a remote command is sent as ONE string the far side's
-//! shell re-parses. `sx` and the Tauri app compose that string in Rust; shed-
-//! mobile composes it in Dart over `dartssh2`. Two implementations of one wire
-//! contract is a standing drift risk, and this file is one of the three legs
-//! that keeps them honest:
+//! shell re-parses. The Tauri app composes that string in Rust
+//! (`machine::display_line`, today reached only through `shed-gx`'s discovery
+//! probe — see `crates/shed-gx/src/discovery.rs::PROBE_SCRIPT` — `sx`, its
+//! other caller, was sunset, unreleased, in plan 016). There is no Dart leg:
+//! shed-mobile execs the string `roost_ipc::ssh::remote_command()` composes,
+//! not an argv built from this contract (see the README's "The Dart leg").
+//! This file is one of the two legs that keep the Rust composer honest:
 //!
 //! | leg | lives in | asserts |
 //! |---|---|---|
 //! | **Rust** | here | `machine::display_line` composes `goldens/wire.json` |
 //! | live | `tests/machine-transport/` (pytest + a hermetic sshd) | that wire line really delivers `goldens/received.json` |
-//! | Dart | `shed-mobile` | its bridge composes the SAME `wire.json` |
 //!
 //! The scenarios and goldens are shared files, deliberately outside this crate
 //! (`tests/machine-transport/`), because a contract that lived in one leg's
@@ -86,20 +88,21 @@ fn rust_composes_the_agreed_wire_line_for_every_scenario() {
     }
 }
 
-/// The contract's `version` is pinned here as well as in the Dart leg.
+/// The contract's `version` is pinned here.
 ///
 /// Bumping `scenarios.json` without bumping `version` is the failure mode this
-/// catches: shed-mobile pins the version it was last validated against, so a
-/// silent edit in this repo would otherwise leave the two repos disagreeing
-/// with every test green on both sides.
+/// catches: this assertion pins the revision the corpus was last validated
+/// against, so a silent edit here fails loudly instead of leaving the Rust
+/// byte pin and the live leg's fresh read of `scenarios.json` disagreeing
+/// about which contract is current.
 #[test]
 fn the_contract_version_is_explicit() {
     let scenarios = read_json("scenarios.json");
     let version = scenarios["version"].as_u64().expect("scenarios.version");
     assert_eq!(
-        version, 2,
-        "the machine-transport contract changed version — re-run the Dart leg in \
-         shed-mobile and update its pinned version, then update this assertion"
+        version, 3,
+        "the machine-transport contract changed version — update this assertion \
+         once the new revision is re-recorded"
     );
 }
 
@@ -107,7 +110,7 @@ fn the_contract_version_is_explicit() {
 /// single-quoted, including the bare-safe ones.
 ///
 /// This is the property that distinguishes the house quoter
-/// ([`shed_core::rc_agents::shell_quote_always`], the verbatim port of Go's
+/// ([`shed_core::machine::shell_quote_always`], the verbatim port of Go's
 /// `shellQuote`) from a conditional one. Both produce the same ARGV after the
 /// remote shell parses them, so only a byte-level assertion catches a transport
 /// that quietly switched — which is exactly the divergence shed-mobile's own
@@ -123,12 +126,12 @@ fn every_element_is_always_quoted_never_conditionally() {
             line.starts_with('\''),
             "scenario {id:?}: the first element must be quoted even when bare-safe: {line}"
         );
-        // A bare-safe token like `sx` must still appear quoted.
-        if argv.first().map(String::as_str) == Some("sx") {
-            assert!(
-                line.starts_with("'sx'"),
-                "scenario {id:?}: bare-safe tokens are quoted too: {line}"
-            );
-        }
+        // Every scenario's argv[0] is `sh` (C8 re-pointed the corpus onto the
+        // one surviving composer, gx's `sh -c <script>` probe) — a bare-safe
+        // token that must still appear quoted.
+        assert!(
+            line.starts_with("'sh'"),
+            "scenario {id:?}: bare-safe tokens are quoted too: {line}"
+        );
     }
 }

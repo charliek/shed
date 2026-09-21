@@ -120,7 +120,7 @@ cleanup() {
     # binaries + /etc overlay staged by stage-guest-binaries.sh.
     rm -f "$VZ_DIR/shed-agent" "$VZ_DIR/shed-firstboot" \
           "$VZ_DIR/shed-ext-ssh-agent" "$VZ_DIR/shed-ext-aws-credentials" \
-          "$VZ_DIR/docker-credential-shed" "$VZ_DIR/shed-ext-rc"
+          "$VZ_DIR/docker-credential-shed"
     rm -rf "$VZ_DIR/ext-etc"
 }
 

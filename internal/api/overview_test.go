@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -14,6 +15,91 @@ import (
 	"github.com/charliek/shed/internal/backend"
 	"github.com/charliek/shed/internal/config"
 )
+
+// overviewFakeBackend is a Backend stub for the overview + session-listing
+// handler tests. Only the methods those paths touch are wired; the rest panic
+// so an unexpected call is loud.
+type overviewFakeBackend struct {
+	sheds    []config.Shed
+	sessions map[string][]config.Session // keyed by shed name
+	// dfUsage / dfErr back DiskUsage (used by the overview endpoint's df block);
+	// zero values give an empty usage with no error.
+	dfUsage config.DiskUsage
+	dfErr   error
+	// listErr injects a per-shed ListSessions failure (keyed by shed name) so the
+	// overview session-list-degrade path is testable; nil entries list normally.
+	listErr map[string]error
+}
+
+func (f *overviewFakeBackend) Type() backend.Type { return backend.TypeVZ }
+func (f *overviewFakeBackend) Close() error       { return nil }
+func (f *overviewFakeBackend) CreateShed(context.Context, config.CreateShedRequest) (*config.Shed, error) {
+	panic("unexpected")
+}
+func (f *overviewFakeBackend) GetShed(_ context.Context, name string) (*config.Shed, error) {
+	return &config.Shed{Name: name, Status: config.StatusRunning}, nil
+}
+func (f *overviewFakeBackend) ListSheds(context.Context) ([]config.Shed, error) { return f.sheds, nil }
+func (f *overviewFakeBackend) DeleteShed(context.Context, string) error         { return nil }
+func (f *overviewFakeBackend) StartShed(_ context.Context, name string) (*config.Shed, error) {
+	return &config.Shed{Name: name, Status: config.StatusRunning}, nil
+}
+func (f *overviewFakeBackend) StopShed(_ context.Context, name string) (*config.Shed, error) {
+	return &config.Shed{Name: name, Status: config.StatusStopped}, nil
+}
+func (f *overviewFakeBackend) ResetShed(_ context.Context, name string) (*config.Shed, error) {
+	return &config.Shed{Name: name, Status: config.StatusStopped}, nil
+}
+func (f *overviewFakeBackend) ListSessions(_ context.Context, name string) ([]config.Session, error) {
+	if f.listErr != nil {
+		if err := f.listErr[name]; err != nil {
+			return nil, err
+		}
+	}
+	return f.sessions[name], nil
+}
+func (f *overviewFakeBackend) KillSession(context.Context, string, string) error { return nil }
+func (f *overviewFakeBackend) Exec(context.Context, string, backend.ExecOptions) error {
+	panic("unexpected Exec call")
+}
+func (f *overviewFakeBackend) DialService(context.Context, string, uint16) (net.Conn, error) {
+	panic("unexpected DialService call")
+}
+func (f *overviewFakeBackend) ListImages(context.Context) ([]config.ImageInfo, error) {
+	panic("unexpected")
+}
+func (f *overviewFakeBackend) InspectImage(context.Context, string) (config.ImageInspectResponse, error) {
+	panic("unexpected")
+}
+func (f *overviewFakeBackend) TagImage(context.Context, string, string) error { panic("unexpected") }
+func (f *overviewFakeBackend) PullImage(context.Context, string, string, string, bool) (string, error) {
+	panic("unexpected")
+}
+func (f *overviewFakeBackend) PushImage(context.Context, string, string) error { panic("unexpected") }
+func (f *overviewFakeBackend) DeleteImage(context.Context, string) error       { panic("unexpected") }
+func (f *overviewFakeBackend) PruneImages(context.Context, bool) ([]config.ImageInfo, error) {
+	panic("unexpected")
+}
+func (f *overviewFakeBackend) DiskUsage(context.Context) (config.DiskUsage, error) {
+	return f.dfUsage, f.dfErr
+}
+func (f *overviewFakeBackend) Prune(context.Context, backend.PruneOptions) (config.PruneReport, error) {
+	panic("unexpected")
+}
+func (f *overviewFakeBackend) ListSnapshots(context.Context) ([]config.Snapshot, error) {
+	panic("unexpected")
+}
+func (f *overviewFakeBackend) CreateSnapshot(context.Context, config.SnapshotCreateRequest) (*config.Snapshot, error) {
+	panic("unexpected")
+}
+func (f *overviewFakeBackend) GetSnapshot(context.Context, string) (*config.Snapshot, error) {
+	panic("unexpected")
+}
+func (f *overviewFakeBackend) DeleteSnapshot(context.Context, string) error { panic("unexpected") }
+
+func newOverviewServer(be backend.Backend) *Server {
+	return NewServer(be, &config.ServerConfig{Name: "test-server"}, "", nil, nil)
+}
 
 // getOverview issues GET path against srv and decodes the 200 response.
 func getOverview(t *testing.T, srv *Server, path string) OverviewResponse {
@@ -40,6 +126,15 @@ func findOverviewShed(sheds []OverviewShed, name string) *OverviewShed {
 	return nil
 }
 
+func findSession(sessions []config.Session, name string) *config.Session {
+	for i := range sessions {
+		if sessions[i].Name == name {
+			return &sessions[i]
+		}
+	}
+	return nil
+}
+
 // sliceHas reports whether any element of ss contains substr. Used for both
 // warning assertions and feature-token presence (order-independent).
 func sliceHas(ss []string, substr string) bool {
@@ -51,22 +146,21 @@ func sliceHas(ss []string, substr string) bool {
 	return false
 }
 
-// TestOverview_HappyPath: a running rc-bearing shed carries enriched sessions +
-// capabilities; a stopped shed carries an empty sessions slice and no caps; the
-// df block and the server feature set are present.
+// TestOverview_HappyPath: a running shed carries its sessions; a stopped shed
+// carries an empty sessions slice; the df block and the server feature set are
+// present.
 func TestOverview_HappyPath(t *testing.T) {
-	be := &rcFakeBackend{
+	be := &overviewFakeBackend{
 		sheds: []config.Shed{
 			{Name: "proj", Status: config.StatusRunning},
 			{Name: "asleep", Status: config.StatusStopped},
 		},
 		sessions: map[string][]config.Session{
-			"proj": {{Name: "rc-abc234", ShedName: "proj"}, {Name: "default", ShedName: "proj"}},
+			"proj": {{Name: "default", ShedName: "proj"}},
 		},
 		dfUsage: config.DiskUsage{ServerName: "test-server", Backend: "vz"},
-		execFn:  execServes(newEnvelope),
 	}
-	srv := newRCServer(be)
+	srv := newOverviewServer(be)
 
 	resp := getOverview(t, srv, "/api/overview")
 
@@ -74,30 +168,26 @@ func TestOverview_HappyPath(t *testing.T) {
 	if resp.Server.Version == "" {
 		t.Fatal("server.version empty")
 	}
-	if !sliceHas(resp.Server.Features, FeatureOverview) ||
-		!sliceHas(resp.Server.Features, FeatureRCEnrich) {
+	if !sliceHas(resp.Server.Features, FeatureOverview) {
 		t.Fatalf("server.features missing tokens: %v", resp.Server.Features)
 	}
+	assertNoRetiredRCFeatures(t, "server.features", resp.Server.Features)
 
 	// df block present
 	if resp.DF == nil || resp.DF.ServerName != "test-server" {
 		t.Fatalf("df block missing/wrong: %+v", resp.DF)
 	}
 
-	// running shed: enriched rc session + caps
+	// running shed: its sessions are listed under it
 	proj := findOverviewShed(resp.Sheds, "proj")
 	if proj == nil {
 		t.Fatal("proj shed absent")
 	}
-	rcRow := findSession(proj.Sessions, "rc-abc234")
-	if rcRow == nil || rcRow.RC == nil || rcRow.RC.Kind != "claude-rc" || rcRow.RC.State != "ready" {
-		t.Fatalf("rc row not enriched under its shed: %+v", rcRow)
-	}
-	if proj.RCCapabilities == nil || proj.RCCapabilities.RCVersion != 3 {
-		t.Fatalf("running shed caps missing: %+v", proj.RCCapabilities)
+	if findSession(proj.Sessions, "default") == nil {
+		t.Fatalf("running shed sessions missing: %+v", proj.Sessions)
 	}
 
-	// stopped shed: empty sessions, no caps
+	// stopped shed: empty sessions
 	asleep := findOverviewShed(resp.Sheds, "asleep")
 	if asleep == nil {
 		t.Fatal("asleep shed absent")
@@ -105,29 +195,20 @@ func TestOverview_HappyPath(t *testing.T) {
 	if len(asleep.Sessions) != 0 {
 		t.Fatalf("stopped shed must have no sessions: %+v", asleep.Sessions)
 	}
-	if asleep.RCCapabilities != nil {
-		t.Fatalf("stopped shed must omit caps: %+v", asleep.RCCapabilities)
-	}
 	if len(resp.Warnings) != 0 {
 		t.Fatalf("no warnings expected, got %v", resp.Warnings)
-	}
-	// Only the rc-bearing running shed execs; caps served from the enrichment cache.
-	if got := be.execCalls.Load(); got != 1 {
-		t.Fatalf("exec called %d times, want exactly 1", got)
 	}
 }
 
 // TestOverview_DFFailure_Degrades: a df error omits the df block + adds a warning,
 // but the rest of the overview still renders (no 500).
 func TestOverview_DFFailure_Degrades(t *testing.T) {
-	be := &rcFakeBackend{
+	be := &overviewFakeBackend{
 		sheds:    []config.Shed{{Name: "proj", Status: config.StatusRunning}},
 		sessions: map[string][]config.Session{"proj": {{Name: "default", ShedName: "proj"}}},
 		dfErr:    errors.New("df computation failed"),
-		// A running shed still gets a capabilities probe (create-chip discovery).
-		execFn: execServes(newEnvelope),
 	}
-	srv := newRCServer(be)
+	srv := newOverviewServer(be)
 
 	resp := getOverview(t, srv, "/api/overview")
 	if resp.DF != nil {
@@ -144,7 +225,7 @@ func TestOverview_DFFailure_Degrades(t *testing.T) {
 // TestOverview_SessionListFailure_Degrades: a shed whose ListSessions fails
 // degrades to an empty sessions slice + a warning; sibling sheds are unaffected.
 func TestOverview_SessionListFailure_Degrades(t *testing.T) {
-	be := &rcFakeBackend{
+	be := &overviewFakeBackend{
 		sheds: []config.Shed{
 			{Name: "bad", Status: config.StatusRunning},
 			{Name: "good", Status: config.StatusRunning},
@@ -153,10 +234,8 @@ func TestOverview_SessionListFailure_Degrades(t *testing.T) {
 			"good": {{Name: "default", ShedName: "good"}},
 		},
 		listErr: map[string]error{"bad": errors.New("tmux server not responding")},
-		// Running sheds are still capability-probed (independent of ListSessions).
-		execFn: execServes(newEnvelope),
 	}
-	srv := newRCServer(be)
+	srv := newOverviewServer(be)
 
 	resp := getOverview(t, srv, "/api/overview")
 	bad := findOverviewShed(resp.Sheds, "bad")
@@ -172,39 +251,13 @@ func TestOverview_SessionListFailure_Degrades(t *testing.T) {
 	}
 }
 
-// TestOverview_EnrichmentFailure_Degrades: an rc exec error leaves rc-* rows
-// un-enriched + a warning; the call still succeeds.
-func TestOverview_EnrichmentFailure_Degrades(t *testing.T) {
-	be := &rcFakeBackend{
-		sheds:    []config.Shed{{Name: "proj", Status: config.StatusRunning}},
-		sessions: map[string][]config.Session{"proj": {{Name: "rc-abc234", ShedName: "proj"}}},
-		execFn: func(context.Context, string, backend.ExecOptions) error {
-			return errors.New("exit status 127: shed-ext-rc: command not found")
-		},
-	}
-	srv := newRCServer(be)
-
-	resp := getOverview(t, srv, "/api/overview")
-	proj := findOverviewShed(resp.Sheds, "proj")
-	if proj == nil {
-		t.Fatal("proj shed absent")
-	}
-	if rcRow := findSession(proj.Sessions, "rc-abc234"); rcRow == nil || rcRow.RC != nil {
-		t.Fatalf("degraded rc row must stay un-enriched: %+v", rcRow)
-	}
-	if !sliceHas(resp.Warnings, "RC metadata unavailable") &&
-		!sliceHas(resp.Warnings, "RC capabilities unavailable") {
-		t.Fatalf("want an rc-degrade warning, got %v", resp.Warnings)
-	}
-}
-
 // TestOverview_EmptySlicesNotNull: with no sheds the JSON renders `"sheds":[]`
 // (never null); a running shed with no sessions renders `"sessions":[]`; the df
 // slices render `[]`.
 func TestOverview_EmptySlicesNotNull(t *testing.T) {
 	// No sheds at all.
-	be := &rcFakeBackend{dfUsage: config.DiskUsage{ServerName: "test-server"}}
-	srv := newRCServer(be)
+	be := &overviewFakeBackend{dfUsage: config.DiskUsage{ServerName: "test-server"}}
+	srv := newOverviewServer(be)
 	r := httptest.NewRequest(http.MethodGet, "/api/overview", nil)
 	w := httptest.NewRecorder()
 	srv.Router().ServeHTTP(w, r)
@@ -223,12 +276,11 @@ func TestOverview_EmptySlicesNotNull(t *testing.T) {
 	}
 
 	// A running shed with zero sessions renders "sessions":[].
-	be2 := &rcFakeBackend{
+	be2 := &overviewFakeBackend{
 		sheds:    []config.Shed{{Name: "empty", Status: config.StatusRunning}},
 		sessions: map[string][]config.Session{}, // no rows for "empty"
-		execFn:   execServes(newEnvelope),       // running shed still capability-probed
 	}
-	srv2 := newRCServer(be2)
+	srv2 := newOverviewServer(be2)
 	r2 := httptest.NewRequest(http.MethodGet, "/api/overview", nil)
 	w2 := httptest.NewRecorder()
 	srv2.Router().ServeHTTP(w2, r2)
@@ -240,18 +292,16 @@ func TestOverview_EmptySlicesNotNull(t *testing.T) {
 	}
 }
 
-// TestOverview_StoppedShedShape: a stopped shed omits the rc_capabilities key
-// entirely and carries an empty sessions slice.
+// TestOverview_StoppedShedShape: a stopped shed carries an empty sessions slice.
 func TestOverview_StoppedShedShape(t *testing.T) {
-	be := &rcFakeBackend{
+	be := &overviewFakeBackend{
 		sheds: []config.Shed{{Name: "asleep", Status: config.StatusStopped}},
 	}
-	srv := newRCServer(be)
+	srv := newOverviewServer(be)
 	r := httptest.NewRequest(http.MethodGet, "/api/overview", nil)
 	w := httptest.NewRecorder()
 	srv.Router().ServeHTTP(w, r)
 
-	// Raw-JSON key presence: rc_capabilities must be absent on a stopped shed.
 	var raw struct {
 		Sheds []map[string]json.RawMessage `json:"sheds"`
 	}
@@ -261,44 +311,16 @@ func TestOverview_StoppedShedShape(t *testing.T) {
 	if len(raw.Sheds) != 1 {
 		t.Fatalf("want 1 shed, got %d", len(raw.Sheds))
 	}
-	if _, present := raw.Sheds[0]["rc_capabilities"]; present {
-		t.Fatalf("stopped shed must omit rc_capabilities, got: %v", raw.Sheds[0])
-	}
 	sess, ok := raw.Sheds[0]["sessions"]
 	if !ok || string(sess) != "[]" {
 		t.Fatalf(`stopped shed sessions must be [], got: %s`, string(sess))
 	}
 }
 
-// TestOverview_RC0_SkipsEnrichment: ?rc=0 issues zero guest execs — sessions are
-// present but un-enriched, and no capabilities are probed.
-func TestOverview_RC0_SkipsEnrichment(t *testing.T) {
-	be := &rcFakeBackend{
-		sheds:    []config.Shed{{Name: "proj", Status: config.StatusRunning}},
-		sessions: map[string][]config.Session{"proj": {{Name: "rc-abc234", ShedName: "proj"}}},
-		// execFn nil -> Exec panics if any enrichment/capability exec runs.
-	}
-	srv := newRCServer(be)
-
-	resp := getOverview(t, srv, "/api/overview?rc=0")
-	proj := findOverviewShed(resp.Sheds, "proj")
-	if proj == nil {
-		t.Fatal("proj shed absent")
-	}
-	if rcRow := findSession(proj.Sessions, "rc-abc234"); rcRow == nil || rcRow.RC != nil {
-		t.Fatalf("?rc=0 must not enrich: %+v", rcRow)
-	}
-	if proj.RCCapabilities != nil {
-		t.Fatalf("?rc=0 must not probe caps: %+v", proj.RCCapabilities)
-	}
-	if got := be.execCalls.Load(); got != 0 {
-		t.Fatalf("?rc=0 must issue 0 execs, got %d", got)
-	}
-}
-
-// newTokenModeRCServer builds a token-mode server (bearer tokens enforced) backed
-// by be, with a control and a credentials token minted for scope assertions.
-func newTokenModeRCServer(t *testing.T, be *rcFakeBackend) (srv *Server, control, credentials string) {
+// newTokenModeOverviewServer builds a token-mode server (bearer tokens enforced)
+// backed by be, with a control and a credentials token minted for scope
+// assertions.
+func newTokenModeOverviewServer(t *testing.T, be *overviewFakeBackend) (srv *Server, control, credentials string) {
 	t.Helper()
 	store := authtoken.NewStore()
 	control, _, err := store.Mint("SHA256:test", authtoken.ScopeControl, authtoken.ClientCLI, time.Hour)
@@ -318,8 +340,8 @@ func newTokenModeRCServer(t *testing.T, be *rcFakeBackend) (srv *Server, control
 // do NOT apply). A credentials token is rejected (403); a control token is
 // accepted (200); an unauthenticated request is 401.
 func TestOverview_Scope(t *testing.T) {
-	be := &rcFakeBackend{} // empty: handler returns 200 with no sheds
-	srv, control, credentials := newTokenModeRCServer(t, be)
+	be := &overviewFakeBackend{} // empty: handler returns 200 with no sheds
+	srv, control, credentials := newTokenModeOverviewServer(t, be)
 
 	call := func(token string) int {
 		r := httptest.NewRequest(http.MethodGet, "/api/overview", nil)
@@ -346,8 +368,8 @@ func TestOverview_Scope(t *testing.T) {
 // router (405 Method Not Allowed). Run in open mode so the request reaches the
 // router rather than tripping the auth gate first.
 func TestOverview_MethodGuard(t *testing.T) {
-	be := &rcFakeBackend{}
-	srv := newRCServer(be)
+	be := &overviewFakeBackend{}
+	srv := newOverviewServer(be)
 	r := httptest.NewRequest(http.MethodPost, "/api/overview", nil)
 	w := httptest.NewRecorder()
 	srv.Router().ServeHTTP(w, r)
@@ -370,8 +392,86 @@ func TestInfo_Features(t *testing.T) {
 	if err := json.Unmarshal(w.Body.Bytes(), &info); err != nil {
 		t.Fatalf("decode ServerInfo: %v", err)
 	}
-	if !sliceHas(info.Features, FeatureOverview) ||
-		!sliceHas(info.Features, FeatureRCEnrich) {
+	if !sliceHas(info.Features, FeatureOverview) {
 		t.Fatalf("/api/info features missing tokens: %v", info.Features)
+	}
+	assertNoRetiredRCFeatures(t, "/api/info features", info.Features)
+}
+
+// TestSessions_ListShed: GET /api/sheds/{name}/sessions returns the backend's
+// rows unchanged (no enrichment layer any more).
+func TestSessions_ListShed(t *testing.T) {
+	be := &overviewFakeBackend{
+		sheds:    []config.Shed{{Name: "proj", Status: config.StatusRunning}},
+		sessions: map[string][]config.Session{"proj": {{Name: "default", ShedName: "proj"}}},
+	}
+	srv := newOverviewServer(be)
+
+	r := httptest.NewRequest(http.MethodGet, "/api/sheds/proj/sessions", nil)
+	w := httptest.NewRecorder()
+	srv.Router().ServeHTTP(w, r)
+	if w.Code != http.StatusOK {
+		t.Fatalf("GET sessions = %d, want 200 (body: %s)", w.Code, w.Body.String())
+	}
+	var resp config.SessionsResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode sessions: %v", err)
+	}
+	if findSession(resp.Sessions, "default") == nil {
+		t.Fatalf("session row missing: %+v", resp.Sessions)
+	}
+	if len(resp.Warnings) != 0 {
+		t.Fatalf("no warnings expected, got %v", resp.Warnings)
+	}
+}
+
+// TestSessions_ListAll: GET /api/sessions flattens every running shed's rows and
+// skips stopped sheds.
+func TestSessions_ListAll(t *testing.T) {
+	be := &overviewFakeBackend{
+		sheds: []config.Shed{
+			{Name: "proj", Status: config.StatusRunning},
+			{Name: "asleep", Status: config.StatusStopped},
+		},
+		sessions: map[string][]config.Session{
+			"proj":   {{Name: "default", ShedName: "proj"}},
+			"asleep": {{Name: "ghost", ShedName: "asleep"}},
+		},
+	}
+	srv := newOverviewServer(be)
+
+	r := httptest.NewRequest(http.MethodGet, "/api/sessions", nil)
+	w := httptest.NewRecorder()
+	srv.Router().ServeHTTP(w, r)
+	if w.Code != http.StatusOK {
+		t.Fatalf("GET /api/sessions = %d, want 200 (body: %s)", w.Code, w.Body.String())
+	}
+	var resp config.SessionsResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode sessions: %v", err)
+	}
+	if findSession(resp.Sessions, "default") == nil {
+		t.Fatalf("running shed row missing: %+v", resp.Sessions)
+	}
+	if findSession(resp.Sessions, "ghost") != nil {
+		t.Fatalf("stopped shed rows must not be listed: %+v", resp.Sessions)
+	}
+}
+
+// retiredRCFeatureTokens are the feature tokens the S6 RC-hub demolition
+// removed (plan 022 C4). The server can no longer serve any of the behaviour
+// they advertised, so re-adding one would send clients probing deleted
+// routes. Asserting only that "overview" is PRESENT would not catch that —
+// hence the absence check below.
+var retiredRCFeatureTokens = []string{"rc-enrich", "rc-events", "rc-proxy"}
+
+// assertNoRetiredRCFeatures fails if any retired RC token reappears in a
+// feature list.
+func assertNoRetiredRCFeatures(t *testing.T, where string, features []string) {
+	t.Helper()
+	for _, tok := range retiredRCFeatureTokens {
+		if sliceHas(features, tok) {
+			t.Errorf("%s re-advertises retired RC feature %q: %v", where, tok, features)
+		}
 	}
 }

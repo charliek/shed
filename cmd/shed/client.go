@@ -1226,8 +1226,8 @@ func (c *APIClient) ResetShed(name string) (*config.Shed, error) {
 
 // ListSessions retrieves all tmux sessions in a shed. Returns the full
 // SessionsResponse: like ListAllSessions, the warnings field carries per-shed
-// rc-enrichment degradations (e.g. a slow guest probe) that callers should
-// surface rather than silently rendering un-enriched rows.
+// degradations (e.g. tmux unavailable in the guest) that callers should
+// surface rather than silently rendering an incomplete list.
 func (c *APIClient) ListSessions(shedName string) (*config.SessionsResponse, error) {
 	var resp config.SessionsResponse
 	if err := c.doRequest(http.MethodGet, "/api/sheds/"+shedName+"/sessions", nil, &resp); err != nil {

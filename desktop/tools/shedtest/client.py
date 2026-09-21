@@ -225,14 +225,17 @@ class _ApprovalOps:
 
 
 class _RcOps:
-    """The remote-control (Agents) op surface — list / launch / kill /
-    inject_test — shared by the mac app and the Tauri client (both wire the same
-    shed-core/shed-app RC spine with identical op names + shapes). `self.call`
-    comes from the `IPCClient` base each mixes in with.
+    """The Agents op surface — list / launch / kill / inject_test.
+
+    **All four are roost ops since S6** (charliek/shed#328): a shed's agent
+    sessions are the tabs its own `roost-session` reports, so `rc.list` returns
+    that and only that, `rc.launch` is `roost.launch` addressed by `{shed, host?}`
+    (an alias kept for 0.9.x), `rc.kill` is a `tab.close`, and `rc.inject_test`
+    puts a row into the roost snapshot. `self.call` comes from the `IPCClient`
+    base each mixes in with.
 
     The pure pane-classifier op and its `rc_classify` helper went with S2
-    (charliek/shed#324): a shed row's `state` comes off the wire from the guest,
-    where it is liveness now."""
+    (charliek/shed#324): a row's `state` comes off the wire, not from a pane."""
 
     def rc_list(self, host: str | None = None, shed: str | None = None) -> list[dict]:
         params: dict = {}
@@ -262,16 +265,19 @@ class _RcOps:
         self.call("rc.kill", params)
 
     def rc_inject_test(self, shed: str, slug: str, *, host: str | None = None,
-                       kind: str = "claude-broker", state: str = "ready", managed: bool = False,
-                       display_name: str | None = None, created_by: str | None = None,
-                       created_at: str | None = None, rc_id: str | None = None,
-                       url: str | None = None, target_label: str | None = None) -> None:
-        """Inject a session (managed or legacy) into the table — test mode only."""
-        params: dict = {"shed": shed, "slug": slug, "kind": kind,
-                        "state": state, "managed": managed}
+                       kind: str = "claude-rc", display_name: str | None = None,
+                       workdir: str | None = None, lifecycle: str | None = None,
+                       attention: bool | None = None) -> None:
+        """Put a row into the shed's ROOST snapshot — test mode only.
+
+        `slug` is the roost tab id, so it must parse as one: the injected row is
+        closeable by the same `rc.kill`/`tab.close` a real one is, and a row with
+        an invented slug would not be. `lifecycle` is roost's own
+        `agent_lifecycle` word (`working`, `waiting`, `finished`, …)."""
+        params: dict = {"shed": shed, "slug": slug, "kind": kind}
         for k, v in (("host", host), ("display_name", display_name),
-                     ("created_by", created_by), ("created_at", created_at),
-                     ("rc_id", rc_id), ("url", url), ("target_label", target_label)):
+                     ("workdir", workdir), ("lifecycle", lifecycle),
+                     ("attention", attention)):
             if v is not None:
                 params[k] = v
         self.call("rc.inject_test", params)
@@ -399,10 +405,31 @@ class TauriClient(_ApprovalOps, _RcOps, _RustCoreClient):
         """Open the New-session (launch agent) dialog (raises the window + emits the event)."""
         self.call("ui.show_launch")
 
+    def launch_dump(self) -> dict | None:
+        """The New-session dialog's own rendered text (`{rendered}`), or None
+        while none is mounted.
+
+        Its own DOM text rather than a list of fields, so it cannot claim a field
+        the dialog does not show — which is what makes the ABSENCE of one
+        assertable (there is no initial-prompt box: charliek/shed#366)."""
+        return self.call("launch.dump").get("launch")
+
     def agents_dump(self) -> list[dict]:
-        """The RC sessions the Agents pane rendered — the drivable `agents.dump`
+        """The sessions the Agents pane rendered — the drivable `agents.dump`
         UI truth (empty unless the UI is on the agents pane)."""
         return self.call("agents.dump")["sessions"]
+
+    def agents_empty(self) -> dict | None:
+        """The Agents pane's rendered EMPTY STATE (`{state, title, body, action}`),
+        or None when it rendered rows / another pane is up.
+
+        The other half of `agents_dump`: since S6 an empty list is a meaningful
+        answer ("this shed has no roost-session"), and `sessions == []` alone
+        cannot tell that from a pane that has not looked. `state` is which of the
+        four blanks this is — `loading` / `failed` / `unreachable` / `empty` —
+        because those wear the same screen and only the last one may offer the
+        bootstrap."""
+        return self.call("agents.dump").get("empty")
 
     def dashboard_dump(self) -> dict:
         """The Sheds pane's full UI truth: `{rows, host_errors, empty}` — the shed
@@ -454,12 +481,11 @@ class TauriClient(_ApprovalOps, _RcOps, _RustCoreClient):
         return self.call("machine.capabilities", {"machine": machine})["capabilities"]
 
     def machine_add(self, name: str, host: str | None = None, user: str | None = None,
-                    ssh_port: object | None = None, rc_bin: str | None = None) -> None:
+                    ssh_port: object | None = None) -> None:
         """Append a machine to the shed config and start watching it now — the
         same path the Add dialog drives."""
         params: dict = {"name": name}
-        for k, v in (("host", host), ("user", user), ("ssh_port", ssh_port),
-                     ("rc_bin", rc_bin)):
+        for k, v in (("host", host), ("user", user), ("ssh_port", ssh_port)):
             if v is not None:
                 params[k] = v
         self.call("machine.add", params)

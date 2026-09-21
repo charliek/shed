@@ -219,8 +219,8 @@ RUN set -euo pipefail && \
     # way to scroll it. Larger history for build/agent output; focus-events
     # so TUIs get focus/blur (Claude Code warns when off); a short
     # escape-time so neovim's ESC isn't laggy; truecolor passthrough.
-    # shed-ext-rc uses the default tmux server (no -f/-L), which reads
-    # /etc/tmux.conf on start. See issue #220.
+    # shed attach starts plain tmux (new-session/attach, no -f/-L), which
+    # reads /etc/tmux.conf on start. See issue #220.
     printf '%s\n' \
         'set -g mouse on' \
         'set -g history-limit 50000' \
@@ -276,7 +276,6 @@ RUN --mount=type=bind,source=.,target=/ctx \
     install -m 0755 /ctx/shed-ext-ssh-agent       /usr/local/bin/shed-ext-ssh-agent && \
     install -m 0755 /ctx/shed-ext-aws-credentials /usr/local/bin/shed-ext-aws-credentials && \
     install -m 0755 /ctx/docker-credential-shed   /usr/local/bin/docker-credential-shed && \
-    install -m 0755 /ctx/shed-ext-rc              /usr/local/bin/shed-ext-rc && \
     install -m 0644 /ctx/ext-etc/systemd/system/shed-ext-ssh-agent.service       /etc/systemd/system/shed-ext-ssh-agent.service && \
     install -m 0644 /ctx/ext-etc/systemd/system/shed-ext-aws-credentials.service /etc/systemd/system/shed-ext-aws-credentials.service && \
     install -m 0644 /ctx/ext-etc/environment.d/shed-extensions.conf              /etc/environment.d/shed-extensions.conf && \
@@ -286,6 +285,28 @@ RUN --mount=type=bind,source=.,target=/ctx \
     chown -R shed:shed /home/shed/.docker
     # Units ship disabled — shed-agent enables them from server config.
 
+# stridelabs apt repo: strix (a TUI for staging/diffs) and prox (a process
+# manager with an HTTP API + TUI) are developer tools for use inside a
+# shed, pulled from stridelabs' own apt repo rather than built in-tree
+# like the shed-extensions binaries above.
+#
+# NOTE: unlike the Docker CE block further down, this keyring is `.gpg`, not
+# `.asc`. Docker serves an ARMORED key, so apt can read it from a `.asc`
+# as-is; apt.stridelabs.ai/pubkey.gpg serves a BINARY OpenPGP key, and apt
+# only accepts binary keyrings under a `.gpg` name. Naming it `.asc` makes
+# `apt-get update` fail with "NO_PUBKEY ... the repository is not signed",
+# which is how this was found. This matches the recipe this repo already
+# documents in docs/getting-started/linux-quickstart.md. No dearmor step is
+# needed either way — the key is already in the form apt wants.
+RUN install -m 0755 -d /etc/apt/keyrings \
+    && curl -fsSL https://apt.stridelabs.ai/pubkey.gpg -o /etc/apt/keyrings/stridelabs.gpg \
+    && chmod a+r /etc/apt/keyrings/stridelabs.gpg \
+    && printf "Types: deb\nURIs: https://apt.stridelabs.ai\nSuites: noble\nComponents: main\nSigned-By: /etc/apt/keyrings/stridelabs.gpg\n" \
+       > /etc/apt/sources.list.d/stridelabs.sources \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends strix prox \
+    && rm -rf /var/lib/apt/lists/*
+
 WORKDIR /home/shed
 ENTRYPOINT ["/sbin/init"]
 
@@ -293,7 +314,8 @@ ENTRYPOINT ["/sbin/init"]
 # =============================================================================
 # Stage: shed-fc-full
 # Extensions + Bun + coding agents (Claude Code, OpenCode, Codex CLI, Cursor CLI).
-# mise stays for Go-binary tools (prox, envsecrets). Node/Python/uv
+# mise stays for the envsecrets Go binary (prox now comes from the
+# stridelabs apt repo in `extensions`, so every variant has one). Node/Python/uv
 # dropped — Bun is the JS runtime + package manager, and users who
 # need Python can `uv python install 3.13` inside a shed.
 # =============================================================================
@@ -344,7 +366,7 @@ RUN set -euo pipefail && \
     # All shed-user installations happen via `runuser -l shed -c` so the
     # umasks, HOMEs, and downloaders behave as if `shed` ran them.
     runuser -l shed -c 'set -euo pipefail; \
-        # mise (kept for prox + envsecrets Go binaries; no Node/Python). \
+        # mise (kept for the envsecrets Go binary; no Node/Python). \
         curl https://mise.run | sh && \
         echo "eval \"\$(mise activate bash)\"" >> /home/shed/.bashrc && \
         # Bun (single-binary runtime + package manager for opencode + codex). \
@@ -352,7 +374,7 @@ RUN set -euo pipefail && \
         # Claude Code (ships its own bundled runtime; not Node-dependent). \
         curl -fsSL https://claude.ai/install.sh | bash && \
         # Additional mise-managed tools. \
-        mise use -g github:charliek/prox github:charliek/envsecrets && \
+        mise use -g github:charliek/envsecrets && \
         # OpenCode via Bun. \
         /home/shed/.bun/bin/bun add -g opencode-ai && \
         # Codex CLI via Bun. Bun lays down an npm-style shim \
