@@ -40,6 +40,9 @@ func (c *Client) SetEgressManager(_ *egress.Manager) {}
 // SetEgressUserStore is a no-op for the stub client.
 func (c *Client) SetEgressUserStore(_ *config.UserProfileStore) {}
 
+// ResumeRunningInstances is a no-op for the stub client.
+func (c *Client) ResumeRunningInstances(_ context.Context) {}
+
 // FirecrackerBackend is a stub for non-linux builds.
 type FirecrackerBackend struct{}
 

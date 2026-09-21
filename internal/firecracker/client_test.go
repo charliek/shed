@@ -10,10 +10,14 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/charliek/shed/internal/config"
+	"github.com/charliek/shed/internal/plugin"
+	"github.com/charliek/shed/internal/vmutil"
 )
 
 // TestAcquireSnapshotLock mirrors TestAcquireCreateLock for the snapshot-name
@@ -619,4 +623,296 @@ func TestCreateShedFromSnapshotMutualExclusionWrapsSentinel(t *testing.T) {
 			}
 		})
 	}
+}
+
+// --- ResumeRunningInstances (#315) ------------------------------------------
+
+// newResumeTestClient builds a Client over tmpDir with a real plugin bridge
+// and an injected cmdline reader. Bridge registration is the observable the
+// walk tests assert on: it is exactly what a restarted shed-server used to
+// lose for every running shed.
+func newResumeTestClient(t *testing.T, cfg *config.FirecrackerConfig, inspect func(context.Context, int) (string, error)) (*Client, *plugin.Bridge) {
+	t.Helper()
+	bridge := plugin.NewBridge(plugin.NewRegistry())
+	c := &Client{
+		cfg:         cfg,
+		vms:         make(map[string]*VM),
+		usedCIDs:    make(map[uint32]string),
+		usedIPs:     make(map[string]string),
+		p9Servers:   make(map[string][]*P9Server),
+		credMgr:     vmutil.NewCredentialManager(nil, bridge, string(config.BackendFirecracker), vmutil.NewHealthTracker()),
+		procCmdline: inspect,
+	}
+	t.Cleanup(func() { _ = c.Close() })
+	return c, bridge
+}
+
+// writeResumeInstance writes metadata for `name` in the state the walk will
+// find it in. Built on the shared createTestInstance helper.
+func writeResumeInstance(t *testing.T, dir, name, status string, pid int) {
+	t.Helper()
+	meta := createTestInstance(t, dir, name)
+	meta.Status = status
+	meta.PID = pid
+	if err := meta.Save(dir); err != nil {
+		t.Fatalf("save metadata for %q: %v", name, err)
+	}
+}
+
+// fcCmdline is what a live Firecracker VMM serving `name` looks like on
+// /proc: NUL-separated argv naming the binary and this instance's api-sock.
+func fcCmdline(cfg *config.FirecrackerConfig, name string) string {
+	return strings.Join([]string{
+		"/usr/bin/firecracker",
+		"--api-sock",
+		filepath.Join(cfg.SocketDir, name+".sock"),
+		"--id",
+		name,
+	}, "\x00")
+}
+
+// resumedNames is the sorted list of sheds the walk registered on the
+// bridge — the observable these tests assert on rather than spying on the
+// walk itself.
+func resumedNames(b *plugin.Bridge) []string {
+	infos := b.ListSheds()
+	names := make([]string, 0, len(infos))
+	for _, i := range infos {
+		names = append(names, i.Name)
+	}
+	sort.Strings(names)
+	return names
+}
+
+// TestResumeRunningInstances drives the whole startup walk — the unit under
+// test for #315 is the walk, not any one predicate.
+func TestResumeRunningInstances(t *testing.T) {
+	const shed = "alpha"
+
+	tests := []struct {
+		name string
+		// status/pid are the metadata the walk finds on disk.
+		status string
+		pid    int
+		// cmdline is what the injected inspector reports for that pid; when
+		// inspectErr is set the inspector fails instead (vanished PID).
+		cmdline    func(cfg *config.FirecrackerConfig) string
+		inspectErr error
+		// socketDir overrides the default test socket dir. Only the
+		// family-independence cell needs it, to reproduce the SHIPPED
+		// default (/var/run/shed/firecracker), whose own path contains the
+		// family token. A plain t.TempDir() socket dir does not, so the cell
+		// would pass against the buggy whole-command-line check too.
+		socketDir  func(tmpDir string) string
+		wantResume bool
+	}{
+		{
+			name:       "running_and_alive_resumes",
+			status:     config.StatusRunning,
+			pid:        4242,
+			cmdline:    func(cfg *config.FirecrackerConfig) string { return fcCmdline(cfg, shed) },
+			wantResume: true,
+		},
+		{
+			// NEGATIVE CONTROL: metadata still says running but the VMM is
+			// gone, so the inspection fails. Deleting the liveness check in
+			// resumeInstance must turn this cell red.
+			name:       "control_running_but_dead_is_not_resumed",
+			status:     config.StatusRunning,
+			pid:        4242,
+			inspectErr: os.ErrNotExist,
+			wantResume: false,
+		},
+		{
+			// The PID was recycled by a DIFFERENT shed's firecracker. A
+			// family-only check ("is it firecracker?") would resume a dead
+			// record here.
+			name:   "running_with_reused_pid_is_not_resumed",
+			status: config.StatusRunning,
+			pid:    4242,
+			cmdline: func(cfg *config.FirecrackerConfig) string {
+				return fcCmdline(cfg, "some-other-shed")
+			},
+			wantResume: false,
+		},
+		{
+			// The family check must be INDEPENDENT evidence from the
+			// instance-path check. The default socket dir is
+			// /var/run/shed/firecracker, so a whole-command-line
+			// Contains("firecracker") is satisfied by the sock path itself —
+			// and this cell (a recycled PID merely touching the socket) would
+			// resume a dead record. Matching argv[0] is what stops it.
+			name:   "control_non_vmm_pid_naming_the_socket_is_not_resumed",
+			status: config.StatusRunning,
+			pid:    4242,
+			socketDir: func(tmpDir string) string {
+				// Mirrors config/server.go:1277's /var/run/shed/firecracker.
+				return filepath.Join(tmpDir, "run", "shed", "firecracker")
+			},
+			cmdline: func(cfg *config.FirecrackerConfig) string {
+				return strings.Join([]string{
+					"/usr/bin/socat",
+					"-",
+					"UNIX-CONNECT:" + filepath.Join(cfg.SocketDir, shed+".sock"),
+				}, "\x00")
+			},
+			wantResume: false,
+		},
+		{
+			name:   "stopped_is_not_resumed",
+			status: config.StatusStopped,
+			pid:    0,
+			cmdline: func(cfg *config.FirecrackerConfig) string {
+				return fcCmdline(cfg, shed)
+			},
+			wantResume: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tmpDir := t.TempDir()
+			cfg := testFirecrackerConfig(tmpDir)
+			if tt.socketDir != nil {
+				cfg.SocketDir = tt.socketDir(tmpDir)
+			}
+			writeResumeInstance(t, tmpDir, shed, tt.status, tt.pid)
+
+			inspect := func(_ context.Context, pid int) (string, error) {
+				if tt.inspectErr != nil {
+					return "", tt.inspectErr
+				}
+				if pid != tt.pid {
+					t.Errorf("inspector called with pid %d, want %d", pid, tt.pid)
+				}
+				return tt.cmdline(cfg), nil
+			}
+
+			c, bridge := newResumeTestClient(t, cfg, inspect)
+			c.ResumeRunningInstances(context.Background())
+
+			got := resumedNames(bridge)
+			if tt.wantResume {
+				if len(got) != 1 || got[0] != shed {
+					t.Fatalf("resumed = %v, want [%s]", got, shed)
+				}
+			} else if len(got) != 0 {
+				t.Fatalf("resumed = %v, want nothing", got)
+			}
+		})
+	}
+
+	// One wedged inspection must not stall the walk: the other instances
+	// still get resumed. The per-inspection timeout is shortened so the cell
+	// costs milliseconds rather than the production 2 s.
+	t.Run("wedged_inspection_does_not_stall_the_walk", func(t *testing.T) {
+		restore := resumeInspectTimeout
+		resumeInspectTimeout = 50 * time.Millisecond
+		t.Cleanup(func() { resumeInspectTimeout = restore })
+
+		tmpDir := t.TempDir()
+		cfg := testFirecrackerConfig(tmpDir)
+
+		// PIDs are how the injected inspector tells the instances apart.
+		pids := map[string]int{"aaa": 101, "wedged": 102, "zzz": 103}
+		for name, pid := range pids {
+			writeResumeInstance(t, tmpDir, name, config.StatusRunning, pid)
+		}
+
+		inspect := func(ctx context.Context, pid int) (string, error) {
+			if pid == pids["wedged"] {
+				// Bounded well above resumeInspectTimeout but well below the
+				// package test timeout: if the per-inspection deadline ever
+				// stops being plumbed through, this cell fails on the elapsed
+				// assertion below instead of hanging until `go test` gives up.
+				select {
+				case <-ctx.Done():
+					return "", ctx.Err()
+				case <-time.After(5 * time.Second):
+					return "", errors.New("wedged inspector was never cancelled")
+				}
+			}
+			for name, p := range pids {
+				if p == pid {
+					return fcCmdline(cfg, name), nil
+				}
+			}
+			return "", os.ErrNotExist
+		}
+
+		c, bridge := newResumeTestClient(t, cfg, inspect)
+
+		start := time.Now()
+		c.ResumeRunningInstances(context.Background())
+		elapsed := time.Since(start)
+
+		got := resumedNames(bridge)
+		want := []string{"aaa", "zzz"}
+		if len(got) != len(want) || got[0] != want[0] || got[1] != want[1] {
+			t.Fatalf("resumed = %v, want %v", got, want)
+		}
+		if elapsed > 2*time.Second {
+			t.Fatalf("walk took %v — the wedged inspection was not bounded", elapsed)
+		}
+	})
+
+	t.Run("cancelled_context_stops_the_walk", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		cfg := testFirecrackerConfig(tmpDir)
+		writeResumeInstance(t, tmpDir, shed, config.StatusRunning, 4242)
+
+		inspect := func(_ context.Context, _ int) (string, error) {
+			return fcCmdline(cfg, shed), nil
+		}
+		c, bridge := newResumeTestClient(t, cfg, inspect)
+
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		c.ResumeRunningInstances(ctx)
+
+		if got := resumedNames(bridge); len(got) != 0 {
+			t.Fatalf("resumed = %v on a cancelled walk, want nothing", got)
+		}
+	})
+}
+
+// TestReadProcCmdline covers the REAL /proc reader, which the walk tests never
+// touch: they inject a fake so the liveness predicate can be driven against
+// synthetic processes. That left the production reader — the one that has to
+// honour the walk's per-inspection timeout on a VMM wedged in uninterruptible
+// sleep — with no coverage at all.
+func TestReadProcCmdline(t *testing.T) {
+	t.Run("reads_a_live_pid", func(t *testing.T) {
+		got, err := readProcCmdline(context.Background(), os.Getpid())
+		if err != nil {
+			t.Fatalf("readProcCmdline(self) failed: %v", err)
+		}
+		// /proc/<pid>/cmdline is NUL-separated argv. The predicate matches on
+		// substrings, so pin that a substring of argv[0] is findable in the
+		// raw bytes exactly as vmmServesInstance would look for it.
+		if !strings.Contains(got, "firecracker.test") {
+			t.Fatalf("self cmdline %q does not contain the test binary name", got)
+		}
+		if !strings.Contains(got, "\x00") {
+			t.Fatalf("expected NUL-separated argv, got %q", got)
+		}
+	})
+
+	t.Run("vanished_pid_is_an_error", func(t *testing.T) {
+		// PID 0 is never a readable /proc entry, so this stands in for the
+		// "running metadata, dead VM" case without racing a real reaped pid.
+		if _, err := readProcCmdline(context.Background(), 0); err == nil {
+			t.Fatal("expected an error for a pid with no /proc entry")
+		}
+	})
+
+	t.Run("already_cancelled_context_is_refused", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		// Self is guaranteed readable, so a nil error here would mean the
+		// reader ignored the context rather than that the read failed.
+		if _, err := readProcCmdline(ctx, os.Getpid()); !errors.Is(err, context.Canceled) {
+			t.Fatalf("err = %v, want context.Canceled", err)
+		}
+	})
 }

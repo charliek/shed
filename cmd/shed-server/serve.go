@@ -204,6 +204,9 @@ func runServe(cmd *cobra.Command, args []string) error {
 	var egressStateDir string  // persistent dir for the durable audit log
 	var attachEgress func(*egress.Manager)
 	var attachEgressStore func(*config.UserProfileStore)
+	// resumeChannels re-opens the message channel of every shed that is
+	// already running (#315). Captured per-backend like attachEgress.
+	var resumeChannels func(context.Context)
 	switch cfg.DefaultBackend {
 	case config.BackendFirecracker:
 		fcCfg := cfg.Firecracker
@@ -220,6 +223,7 @@ func runServe(cmd *cobra.Command, args []string) error {
 		egressStateDir = filepath.Dir(fcCfg.InstanceDir)
 		attachEgress = fcClient.SetEgressManager
 		attachEgressStore = fcClient.SetEgressUserStore
+		resumeChannels = fcClient.ResumeRunningInstances
 
 	case config.BackendVZ:
 		vzCfg := cfg.VZ
@@ -236,11 +240,23 @@ func runServe(cmd *cobra.Command, args []string) error {
 		egressStateDir = filepath.Dir(vzCfg.InstanceDir)
 		attachEgress = vzClient.SetEgressManager
 		attachEgressStore = vzClient.SetEgressUserStore
+		resumeChannels = vzClient.ResumeRunningInstances
 
 	default:
 		return fmt.Errorf("unsupported backend type: %s", cfg.DefaultBackend)
 	}
 	defer be.Close()
+
+	// The host dials the guest, so nothing re-establishes a running shed's
+	// message channel on its own after a server restart — the plugin bridge
+	// would hold no registration and `shed list -vv` would report no
+	// extension health until the shed was stopped and started by hand (#315).
+	// Run in the background so a wedged VM can never delay startup; cancelled
+	// on shutdown alongside the other background loops.
+	resumeCtx, cancelResume := context.WithCancel(context.Background())
+	defer cancelResume()
+	log.Printf("Resuming message channels for already-running sheds in the background")
+	go resumeChannels(resumeCtx)
 
 	// Optional egress-control proxy child, started only when enabled. A start
 	// failure is a hard startup error — never a silent disable (AC-11).
