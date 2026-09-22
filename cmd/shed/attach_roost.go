@@ -93,6 +93,24 @@ const (
 	// ceiling (roostctl.ExecTimeout, 10 s), which is the right proportion for
 	// the half that has a network and a far-side process start in it.
 	defaultRoostRemoteCap = 30 * time.Second
+
+	// defaultRoostStartCap bounds the START RUNG as a whole — the
+	// `roost-session start` over the shed's own ssh AND the post-start
+	// `session.identify` that follows it.
+	//
+	// **shed-core's START_BUDGET, restated** (crates/shed-core/src/roost/
+	// bootstrap/mod.rs: "`roost-session start` plus the transport leg. The far
+	// side's forking parent has its own 30 s readiness wait, so this must
+	// comfortably exceed it or a start that was still going to answer reads as
+	// a timeout."). Two clients starting the same daemon must wait the same
+	// amount for it.
+	//
+	// A context DEADLINE rather than a check between steps, because
+	// Remote.Identify adds no timeout of its own and attachShed's context is
+	// effectively unbounded — nothing else in this flow would ever end a start
+	// that hung. One budget over both halves for the same reason
+	// defaultRoostRemoteCap covers step 6's three calls.
+	defaultRoostStartCap = 60 * time.Second
 )
 
 // aliasAmbiguityBudget bounds step 3's "does another server have a shed of
@@ -142,6 +160,22 @@ type roostAttach struct {
 	// clock seam — it bounds a network call, not a poll, so a fake clock that
 	// shortened it would be asserting something about os/exec.
 	remoteCap time.Duration
+	// startCap bounds the START RUNG as a whole — the `roost-session start`
+	// and the post-start `session.identify` together. Real time, and a field
+	// for the same reason remoteCap is one: it bounds network calls, and it is
+	// one assert to move.
+	startCap time.Duration
+
+	// shedName and shedEntry identify the shed this attempt is for. The start
+	// rung reaches it over its OWN ssh (the same Target `ensureTab` uses), so
+	// step 5 needs the shed's identity that step 6 already had. Set by attach;
+	// a test that drives connectHost directly sets them itself.
+	shedName  string
+	shedEntry *config.ServerEntry
+	// recoveryAttempted is the start rung's one-shot latch: at most ONE remote
+	// recovery per attach, and therefore at most two `host connect` calls. The
+	// second poll cannot re-enter the rung, whatever it settles on.
+	recoveryAttempted bool
 
 	// now and sleep are the clock. Production wires them to time.Now and
 	// time.Sleep; a test hands both to one fake clock whose sleep advances
@@ -166,6 +200,7 @@ var newRoostAttach = func() *roostAttach {
 		sidebarPoll:   defaultRoostSidebarPoll,
 		sidebarCap:    defaultRoostSidebarCap,
 		remoteCap:     defaultRoostRemoteCap,
+		startCap:      defaultRoostStartCap,
 		now:           time.Now,
 		sleep:         time.Sleep,
 	}
@@ -223,6 +258,9 @@ func attachShed(name, serverName string, entry *config.ServerEntry, shed *config
 // title is `-S/--session` (the roost TAB TITLE on this path, the tmux session
 // name on the other); forceNew is `--new`.
 func (a *roostAttach) attach(ctx context.Context, name, serverName string, entry *config.ServerEntry, shed *config.Shed, title string, forceNew bool) error {
+	// Which shed this attempt is for, recorded before step 5 because step 5's
+	// start rung reaches the shed directly (see startRemoteSession).
+	a.shedName, a.shedEntry = name, entry
 	alias := a.aliasFor(ctx, name, serverName) // step 3, naming
 	if err := a.ensureSSHAlias(alias, name, entry); err != nil {
 		return err
@@ -548,6 +586,11 @@ func (a *roostAttach) ensureSavedHost(ctx context.Context, alias string) (roostc
 // `stopped` and `needs-restart` are not provisional. They are roost saying the
 // host will not come up without being asked again, and no amount of waiting
 // changes them.
+//
+// **The fence runs at most twice**, and only the start rung (§3.4, below) can
+// make it run again: a settled failure that means "there is no roost-session
+// over there" is recoverable exactly once, after which the second pass is the
+// last word whatever it settles on.
 func (a *roostAttach) connectHost(ctx context.Context, alias, id string) error {
 	status, err := a.hostStatus(ctx, id)
 	if err != nil {
@@ -558,10 +601,63 @@ func (a *roostAttach) connectHost(ctx context.Context, alias, id string) error {
 	if status.State == roostctl.StateConnected {
 		return nil
 	}
-	baseline := status.Generation
+	for {
+		settled, err := a.connectAndSettle(ctx, alias, id, status.Generation)
+		if err != nil {
+			return err
+		}
+		if settled.State == roostctl.StateConnected {
+			return nil
+		}
+		// §3.4's start rung. A far side that is REACHABLE and simply has
+		// nothing listening is the one connect failure shed can repair itself
+		// — it has an ssh route to that shed of its own — and today's message
+		// sends the user off to do by hand what this does in one round trip.
+		//
+		// Three gates, and the first two are what bound the fence: the latch
+		// (one recovery, so two `host connect` calls), and the shed identity
+		// attach recorded before step 5 — without which the rung has no Target
+		// to aim at, which is the one way a nil dereference could reach a user
+		// mid-attach.
+		if a.recoveryAttempted || a.shedEntry == nil || !startableRemotely(settled) {
+			return errors.New(connectFailureMessage(alias, settled))
+		}
+		a.recoveryAttempted = true
+		if err := a.startRemoteSession(ctx, alias); err != nil {
+			// A refusal is the daemon answering and being unusable — a
+			// protocol this shed does not speak, or nothing there after it
+			// claimed to be ready. Pin P6 says both are REPORTED, never
+			// repaired, and neither is something "install and start one"
+			// fixes, so they replace today's message rather than falling back
+			// to it.
+			var refusal *roostStartRefusal
+			if errors.As(err, &refusal) {
+				return err
+			}
+			// Everything else — no binary over there, a start that would not
+			// start, a budget that expired — ends at the message §3.3 pinned,
+			// byte for byte. The rung's own diagnosis goes to stderr beside
+			// it: it is what a user debugging this needs and exactly what the
+			// pinned sentence has no room for.
+			fmt.Fprintf(a.errOut, "could not start roost-session on %s: %v\n", alias, err)
+			return errors.New(connectFailureMessage(alias, settled))
+		}
+		// Round two: connect again from the generation the failed attempt
+		// left, and re-enter the poll once.
+		status = settled
+	}
+}
 
+// connectAndSettle is one `host connect` and the poll that waits it out. It
+// returns the row that settled the wait — `connected` is the success.
+//
+// It returns an ERROR only for the outcomes no second pass could change (a
+// refused connect, a failed read, the cap). A settled not-connected row is a
+// VALUE, because whether that row is the last word is connectHost's decision,
+// not this loop's.
+func (a *roostAttach) connectAndSettle(ctx context.Context, alias, id string, baseline uint64) (roostctl.HostStatus, error) {
 	if _, err := a.ctl.HostConnect(ctx, id); err != nil {
-		return fmt.Errorf("connecting roost to %s: %w", alias, err)
+		return roostctl.HostStatus{}, fmt.Errorf("connecting roost to %s: %w", alias, err)
 	}
 
 	deadline := a.now().Add(a.connectCap)
@@ -596,16 +692,16 @@ func (a *roostAttach) connectHost(ctx context.Context, alias, id string) error {
 			// remedy rather than an exec error naming a timeout they never
 			// set.
 			if pollCtx.Err() != nil {
-				return connectCapError(alias, id)
+				return roostctl.HostStatus{}, connectCapError(alias, id)
 			}
-			return err
+			return roostctl.HostStatus{}, err
 		}
 		if status.Generation > baseline {
 			switch status.State {
 			case roostctl.StateConnected:
-				return nil
+				return status, nil
 			case roostctl.StateStopped, roostctl.StateNeedsRestart:
-				return errors.New(connectFailureMessage(alias, status))
+				return status, nil
 			case roostctl.StateDisconnected:
 				// Disconnected with nothing to say is not a diagnosis. It is
 				// what the gap between "the attempt started" and "the
@@ -619,7 +715,7 @@ func (a *roostAttach) connectHost(ctx context.Context, alias, id string) error {
 						provisionalKey, provisionalSince = key, a.now()
 					}
 					if a.now().Sub(provisionalSince) >= a.connectSettle {
-						return errors.New(connectFailureMessage(alias, status))
+						return status, nil
 					}
 				}
 			default:
@@ -628,7 +724,7 @@ func (a *roostAttach) connectHost(ctx context.Context, alias, id string) error {
 			}
 		}
 		if !a.now().Before(deadline) {
-			return connectCapError(alias, id)
+			return roostctl.HostStatus{}, connectCapError(alias, id)
 		}
 	}
 }
@@ -753,6 +849,162 @@ func connectFailureMessage(alias string, status roostctl.HostStatus) string {
 		// and it still beats an empty error line.
 		return fmt.Sprintf("roost could not connect to %s (state %q)", alias, status.State)
 	}
+}
+
+// startableRemotely reports whether a settled, not-connected status is one the
+// start rung (§3.4) can do anything about: the far side is REACHABLE and simply
+// has nothing listening over there.
+//
+// Three conditions, each load-bearing:
+//
+//   - **`disconnected`.** `stopped` and `needs-restart` are roost saying this
+//     host will not come up until it is asked again — a statement about the
+//     LOCAL app's end of the connection, which starting a daemon on the far
+//     side does not change.
+//   - **a reason in noRoostSessionReasons.** That set is the only place
+//     "nothing is listening over there" exists at all; roost's five host states
+//     cannot tell it from "the network is down".
+//   - **NOT in roostOwnRemedyReasons.** That is the `NotFound` shape, and it
+//     means roost already looked and found no BINARY. There is nothing over
+//     there to start, so the rung would spend a round trip rediscovering a 127
+//     roost has already reported — and roost's own sentence, which names the
+//     non-interactive PATH, is the better answer to it.
+func startableRemotely(status roostctl.HostStatus) bool {
+	if status.State != roostctl.StateDisconnected {
+		return false
+	}
+	for _, fragment := range roostOwnRemedyReasons {
+		if strings.Contains(status.Reason, fragment) {
+			return false
+		}
+	}
+	for _, fragment := range noRoostSessionReasons {
+		if strings.Contains(status.Reason, fragment) {
+			return true
+		}
+	}
+	return false
+}
+
+// roostStartRefusal is a start rung outcome that PRODUCED a daemon this shed
+// cannot use: one speaking a protocol shed does not, or none answering at all
+// after a start claimed to be ready.
+//
+// It is separated from every other start failure because it needs a different
+// ending. "Install and start one" — §3.3's pinned remedy — is the right answer
+// when there is no session; it is the wrong answer when there is one and shed
+// will not talk to it. Pin P6 says a protocol mismatch is REPORTED, never
+// repaired, which also means never retried: the rung has already done the one
+// thing it can do.
+type roostStartRefusal struct {
+	// Spoken is the protocol the far side answered with, or 0 when nothing
+	// answered.
+	Spoken int
+	msg    string
+	err    error
+}
+
+func (e *roostStartRefusal) Error() string { return e.msg }
+
+// Unwrap exposes the transport failure behind a session that never answered.
+// Spelled with the explicit nil check because a typed nil in an interface is
+// not nil.
+func (e *roostStartRefusal) Unwrap() error {
+	if e.err == nil {
+		return nil
+	}
+	return e.err
+}
+
+// startRemoteSession is §3.4's rung: start the shed's own roost-session over
+// the shed's OWN ssh, then prove the session that answers is one this shed
+// speaks to.
+//
+// **Two calls, one budget** (defaultRoostStartCap): the deadline here is the
+// only thing that ends a start that hangs, and it has to cover the identify
+// too, or a session that comes up and then goes quiet hangs the attach after
+// the start succeeded.
+//
+// **The reach is the same one step 6 uses**, built through remoteFor rather
+// than composed here: a shed is always `<shed>@<server host> -p <server ssh
+// port>` pinned against `~/.shed/known_hosts`, and two places spelling that
+// would be two places to get it wrong. Note that this is NOT the `Host <alias>`
+// entry roost connects through — that one is for roost's ssh.
+//
+// The progress line is not decoration. This rung can legitimately take the
+// better part of a minute, and an attach that printed nothing for that long
+// reads as a hang; it goes to errOut because the two lines on stdout are the
+// command's result.
+func (a *roostAttach) startRemoteSession(ctx context.Context, alias string) error {
+	remote, target, err := a.remoteFor(a.shedName, a.shedEntry)
+	if err != nil {
+		return err
+	}
+	ctx, cancel := context.WithTimeout(ctx, a.startCap)
+	defer cancel()
+
+	fmt.Fprintf(a.errOut, "starting roost-session on %s…\n", alias)
+	if _, err := remote.Start(ctx, target); err != nil {
+		return err
+	}
+	// The post-start identify, and the whole reason accepting an
+	// `already-running` verdict is safe: it asks the session that is actually
+	// SERVING who it is, rather than trusting the one that was launched.
+	// Remote.Identify applies the protocol gate itself (pin P6), so the
+	// comparison lives in one place rather than two.
+	if _, err := remote.Identify(ctx, target); err != nil {
+		var mismatch *roostprovider.ProtocolMismatchError
+		if errors.As(err, &mismatch) {
+			// Pin P6's sentence, in shed's own words: the shape shed-core's
+			// `copy::protocol_report` uses — both numbers, so a reader can
+			// tell which side is behind, and "upgrade whichever is older"
+			// because shed does not know which. Built from SpokenProtocol and
+			// never a literal 6, which a roost-ipc bump would make wrong. It
+			// does NOT tell the user to stop the session over there, which
+			// roost's own copy does: a shed's roost-session is shed's to
+			// manage, and the fix is an image rebuild.
+			return &roostStartRefusal{
+				Spoken: mismatch.Spoken,
+				msg: fmt.Sprintf("roost-session on %s speaks protocol %d, this shed speaks %d — upgrade whichever is older",
+					alias, mismatch.Spoken, roostprovider.SpokenProtocol),
+			}
+		}
+		// The other half of the post-start gate, in shed-core's wording for it
+		// (machines.rs:1118): the start said it was up and then nothing
+		// answered. Not a race this side can wait out, so never a retry.
+		//
+		// **Only a DEFINITE absence counts**, and that is what BridgeRow
+		// decides. `session.identify` fails for two quite different reasons,
+		// and "no session was there" is an assertion about the far side that
+		// only one of them supports: the bridge RAN and refused because
+		// nothing is listening on the socket (roost exits 1 rather than ssh's
+		// 255 precisely so a client can tell those apart). A transport failure
+		// or the shared 60 s budget expiring establishes no such absence — it
+		// establishes that shed never found out — and reporting it as a
+		// missing session would end the attach on a hard refusal, past the
+		// remedy, over a stalled network. The class alone is not enough
+		// either: a `no session` substring can ride on a stderr blob whose
+		// exit was 127 or a timeout, and ClassifySSHFailure keys on the
+		// substring — so the exit code that makes the bridge's answer
+		// definitive (1, never ssh's 255, never a killed exec) is required
+		// beside it. A false fall-through costs the pinned message; a false
+		// refusal ends the attach past the remedy (sol review finding).
+		var reach *roostprovider.ReachError
+		if errors.As(err, &reach) &&
+			reach.Class == roostprovider.ClassNoSession && reach.ExitCode != nil && *reach.ExitCode == 1 && !reach.TimedOut {
+			return &roostStartRefusal{
+				msg: fmt.Sprintf("roost-session on %s reported ready and then no session was there: %v", alias, err),
+				err: err,
+			}
+		}
+		// Everything else — the reach failing, the budget expiring, a reply
+		// this side could not read — is an ordinary rung failure: the caller
+		// prints this diagnosis to stderr and ends at §3.3's pinned message,
+		// which is still the best advice available when shed could not find
+		// out what is over there.
+		return fmt.Errorf("confirming the roost-session on %s: %w", alias, err)
+	}
+	return nil
 }
 
 // ensureTab is §3.3 step 6: reuse the shed's tab of this title, or open one.

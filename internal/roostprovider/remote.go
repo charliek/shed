@@ -18,9 +18,8 @@ import (
 	"github.com/charliek/shed/internal/config"
 )
 
-// ExecChainCommand is the remote command that reaches a far side's
-// roost-session: roost's own candidate ladder, first executable rung winning,
-// `exec`ed with `client-bridge`.
+// execChain builds roost's candidate ladder as one remote command: the same
+// rungs in the same order, first executable one winning, `exec`ed with verb.
 //
 // **A hand-copy of `roost_ipc::bootstrap::exec_chain_command(false)`, pinned
 // byte-for-byte by crates/fixtures/roost-vectors/bootstrap/exec-chain-command.txt.**
@@ -29,13 +28,60 @@ import (
 // second, independently-written ladder — is exactly the two-ladder drift roost's
 // own module comments exist to prevent. The golden is GENERATED from the live
 // Rust function and asserted from both sides, so a `roost-ipc` bump that changes
-// the ladder fails the Rust twin test loudly rather than leaving this constant
+// the ladder fails the Rust twin test loudly rather than leaving this copy
 // quietly wrong.
+//
+// **A builder rather than two hand-copies**, because roost's own
+// `exec_chain_command` is one too: it interpolates `exec "$p" {BRIDGE_SUBCOMMAND}`
+// into a rung set it does not otherwise vary. shed now needs the ladder for a
+// second subcommand — `start`, the recovery rung `shed attach` runs when the
+// far side has no session — and two hand-copied ladders is precisely the drift
+// this comment exists to prevent. The golden still pins the `client-bridge`
+// spelling byte for byte, so the builder cannot drift into rendering
+// something else.
+//
+// verb is a package-internal literal and is interpolated raw: the whole chain
+// is wrapped in ONE pair of single quotes (roost's `shell_quote` over a body
+// that contains no quote), so a verb carrying one would break the wrapping.
+// TestExecChainsCarryNoEmbeddedSingleQuote is what holds that.
 //
 // Falling off the end of the ladder exits 127 with `roost-session: command not
 // found` on stderr, which ClassifySSHFailure reads as ClassNotFound — the
 // family whose row becomes "roost-session is not installed on <host>".
-const ExecChainCommand = `sh -c 'if [ -n "${HOME:-}" ]; then p="$HOME/.local/bin/roost-session"; [ -f "$p" ] && [ -x "$p" ] && exec "$p" client-bridge; fi; p=$(command -v roost-session 2>/dev/null) || p=; case "$p" in /*) [ -f "$p" ] && [ -x "$p" ] && exec "$p" client-bridge;; esac; p="/usr/bin/roost-session"; [ -f "$p" ] && [ -x "$p" ] && exec "$p" client-bridge; p="/home/linuxbrew/.linuxbrew/bin/roost-session"; [ -f "$p" ] && [ -x "$p" ] && exec "$p" client-bridge; if [ -n "${HOME:-}" ]; then p="$HOME/.nix-profile/bin/roost-session"; [ -f "$p" ] && [ -x "$p" ] && exec "$p" client-bridge; fi; if [ -n "${USER:-}" ]; then p="/etc/profiles/per-user/$USER/bin/roost-session"; [ -f "$p" ] && [ -x "$p" ] && exec "$p" client-bridge; fi; p="/nix/var/nix/profiles/default/bin/roost-session"; [ -f "$p" ] && [ -x "$p" ] && exec "$p" client-bridge; p="/run/current-system/sw/bin/roost-session"; [ -f "$p" ] && [ -x "$p" ] && exec "$p" client-bridge; printf "%s\n" "roost-session: command not found" >&2; exit 127'`
+func execChain(verb string) string {
+	action := `exec "$p" ` + verb
+	steps := []string{
+		`if [ -n "${HOME:-}" ]; then p="$HOME/.local/bin/roost-session"; [ -f "$p" ] && [ -x "$p" ] && ` + action + `; fi`,
+		`p=$(command -v roost-session 2>/dev/null) || p=; case "$p" in /*) [ -f "$p" ] && [ -x "$p" ] && ` + action + `;; esac`,
+		`p="/usr/bin/roost-session"; [ -f "$p" ] && [ -x "$p" ] && ` + action,
+		`p="/home/linuxbrew/.linuxbrew/bin/roost-session"; [ -f "$p" ] && [ -x "$p" ] && ` + action,
+		`if [ -n "${HOME:-}" ]; then p="$HOME/.nix-profile/bin/roost-session"; [ -f "$p" ] && [ -x "$p" ] && ` + action + `; fi`,
+		`if [ -n "${USER:-}" ]; then p="/etc/profiles/per-user/$USER/bin/roost-session"; [ -f "$p" ] && [ -x "$p" ] && ` + action + `; fi`,
+		`p="/nix/var/nix/profiles/default/bin/roost-session"; [ -f "$p" ] && [ -x "$p" ] && ` + action,
+		`p="/run/current-system/sw/bin/roost-session"; [ -f "$p" ] && [ -x "$p" ] && ` + action,
+		`printf "%s\n" "roost-session: command not found" >&2; exit 127`,
+	}
+	return `sh -c '` + strings.Join(steps, "; ") + `'`
+}
+
+// ExecChainCommand is the remote command that reaches a far side's
+// roost-session: the ladder, `exec`ed with `client-bridge`. The one pinned by
+// the cross-language golden — see execChain.
+var ExecChainCommand = execChain("client-bridge")
+
+// StartCommand is the same ladder `exec`ed with `start`: the recovery rung
+// `shed attach` runs over a shed's own ssh when roost reports the far side has
+// no session (plan 023 §3.4).
+//
+// The ladder, not `roost_ipc::bootstrap::start_script(path)`, because that
+// builder takes the absolute path an INSTALL just wrote and this rung installs
+// nothing — it starts a binary that is already over there, wherever the ladder
+// finds it. Same rungs as the bridge command by construction, so the daemon
+// this starts is the one the bridge will then reach.
+//
+// Exported and pure for the same reason Argv and ProbeCommand are: the wire
+// shape is asserted directly rather than inferred from a fake's behaviour.
+var StartCommand = execChain("start")
 
 const (
 	// sshConnectTimeoutSecs is ssh's own ConnectTimeout. roost budgets a
@@ -414,6 +460,14 @@ const (
 	// PhaseBridge — a `session.identify` / `tab.list` / `tab.open` call over
 	// roost's exec chain.
 	PhaseBridge ReachPhase = "bridge"
+	// PhaseStart — the `roost-session start` recovery rung (Remote.Start).
+	//
+	// Its own value rather than PhaseBridge's, because the two fail
+	// differently: a bridge call's 127 means "nothing to reach", while a
+	// start's 127 means "nothing to START" — the one outcome the rung has no
+	// answer for. Nothing in RowForError reaches this phase: the wizard never
+	// starts anything (pin P6).
+	PhaseStart ReachPhase = "start"
 )
 
 func (e *ReachError) Error() string {
