@@ -922,9 +922,17 @@ Both are left alone on every later attach.
 | Concurrent attaches can duplicate a saved host | Two `shed attach` runs racing on a shed that has no saved host yet can each add one, leaving a duplicate. roost offers no compare-and-swap; remove the extra host in roost. |
 | Nothing is cleaned up on `shed delete` | The `Host` entry and the saved roost host outlive the shed. Remove them by hand; automatic cleanup is future work. |
 
-**If the shed has no roost session.** The attach stops and names the remedy —
-roost's palette row `Connect Host: shed-<name>`, which installs and starts one
-with your consent, or connecting to the shed from the shed desktop app.
+**If the shed has no roost session.** When the shed is reachable and its
+roost-session is simply not running, `shed attach` starts one itself over the
+shed's own SSH connection and then connects — printing `starting roost-session
+on shed-<name>…` while it does. The whole recovery is bounded at 60 seconds and
+is attempted at most once per attach; a session that comes up speaking a roost
+protocol this shed does not is a hard error naming both versions, never a retry.
+
+If the shed has no `roost-session` **installed** at all, nothing changes: the
+attach stops and names the remedy — roost's palette row `Connect Host:
+shed-<name>`, which installs and starts one with your consent, or connecting to
+the shed from the shed desktop app.
 
 ## Session Management
 
@@ -942,6 +950,10 @@ shed sessions [shed-name] [flags]
 |------|-------|---------|-------------|
 | `--all` | `-a` | `false` | List from all servers |
 | `--tmux` | | `false` | List tmux sessions only, even with a local roost app running |
+
+`--all` takes no `shed-name` argument — it lists every shed on every server, so
+the two are refused together: `--all lists every shed; drop the argument or
+drop --all`.
 
 **Examples:**
 

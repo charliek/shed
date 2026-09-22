@@ -20,6 +20,7 @@ those over time as §15 1a / 1b / 2c land.
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import statistics
 import time
@@ -465,4 +466,117 @@ def test_extensions_image_smoke(shed_server, test_shed_name):
         f"~/.docker/config.json does not declare the shed credsStore: "
         f"got {r.stdout!r}. Written by the extensions-stage RUN in "
         f"vz/Dockerfile / firecracker/Dockerfile."
+    )
+
+
+# ---------------------------------------------------------------------------
+# 10. roost-session baked into the extensions/full images (plan 023 §3.3)
+# ---------------------------------------------------------------------------
+
+
+def _roost_baked_backends() -> set[str]:
+    """`SHED_IMAGE_HAS_ROOST` is a comma list of the backends whose
+    `extensions` image was rebuilt with the bake (`vz`, `fc`). The dev
+    targets set exactly the one they retargeted, because the suite is
+    parameterized over BOTH backends and the other one still boots the
+    published image (sol review finding)."""
+    raw = os.environ.get("SHED_IMAGE_HAS_ROOST", "")
+    return {b.strip() for b in raw.split(",") if b.strip()}
+
+
+@pytest.mark.skipif(
+    not _roost_baked_backends(),
+    reason=(
+        "SHED_IMAGE_HAS_ROOST unset: the published images carry no "
+        "roost-session until the 0.9.0 tag"
+    ),
+)
+def test_roost_session_baked(shed_server, test_shed_name):
+    """`/usr/bin/roost-session` is baked into the `extensions` image, with
+    no systemd unit enabled — the CLI/desktop/phone start it on first
+    contact instead.
+
+    Gated behind `SHED_IMAGE_HAS_ROOST=<backends>`: the published images carry no
+    roost-session until the 0.9.0 tag, so this stays skipped everywhere
+    except the parallel-dev servers (`test-integration-dev[-fc]`, which
+    export the variable — see the root Makefile). The gate is a
+    `skipif` marker rather than a runtime `pytest.skip()`, so pytest
+    evaluates it during setup, before the `shed_server`/`test_shed_name`
+    fixtures instantiate — a skipped run never probes a backend or
+    creates a shed, and the named reason shows even when no server is
+    reachable at all.
+    """
+    backend_key = "fc" if shed_server.backend == "firecracker" else "vz"
+    if backend_key not in _roost_baked_backends():
+        pytest.skip(
+            f"SHED_IMAGE_HAS_ROOST does not list {backend_key}: this backend "
+            "still boots the published image, which carries no roost-session"
+        )
+
+    want_version = os.environ.get("SHED_ROOST_SESSION_VERSION", "0.0.20")
+    want_protocol = os.environ.get("SHED_ROOST_SESSION_PROTOCOL", "6")
+
+    try:
+        shed_server.create(test_shed_name, image="extensions")
+    except AssertionError as e:
+        msg = str(e)
+        if "extensions" in msg and (
+            "no image tag" in msg or "not found" in msg or "unknown image" in msg
+        ):
+            pytest.skip(
+                "server has no `extensions` image tag configured; this "
+                "gate only applies where the extensions variant is "
+                "installed."
+            )
+        raise
+
+    r = shed_server.exec(
+        test_shed_name, ["test", "-f", "/usr/bin/roost-session", "-a", "-x", "/usr/bin/roost-session"]
+    )
+    assert r.returncode == 0, (
+        f"/usr/bin/roost-session missing or not executable in the booted "
+        f"shed: exit={r.returncode} stdout={r.stdout!r} stderr={r.stderr!r}. "
+        f"Two causes: (1) the dev server's image store still holds an "
+        f"`extensions` image built BEFORE the bake — rebuild it into the dev "
+        f"store (docs/development/testing.md, SHED_SOURCE_REF = the dev "
+        f"config's alias) or run with SHED_IMAGE_HAS_ROOST= (empty) to skip "
+        f"this cell; (2) the roost-session install steps folded into the "
+        f"stridelabs-apt RUN in the extensions stage of vz/Dockerfile / "
+        f"firecracker/Dockerfile regressed."
+    )
+
+    r = shed_server.exec(test_shed_name, ["roost-session", "identify"])
+    assert r.returncode == 0, (
+        f"`roost-session identify` failed in the booted shed: "
+        f"exit={r.returncode} stdout={r.stdout!r} stderr={r.stderr!r}."
+    )
+    try:
+        identify = json.loads(r.stdout)
+    except json.JSONDecodeError:
+        raise AssertionError(
+            f"`roost-session identify` did not print JSON: got {r.stdout!r}"
+        )
+    assert identify.get("app_version") == want_version, (
+        f"baked roost-session app_version={identify.get('app_version')!r}, "
+        f"want {want_version!r} (override via SHED_ROOST_SESSION_VERSION). "
+        f"Check ARG ROOST_SESSION_VERSION in vz/Dockerfile / "
+        f"firecracker/Dockerfile and RELEASE_PIN in "
+        f"crates/shed-core/src/roost/bootstrap/source.rs (make check-roost-pin)."
+    )
+    assert str(identify.get("session_protocol")) == str(want_protocol), (
+        f"baked roost-session session_protocol={identify.get('session_protocol')!r}, "
+        f"want {want_protocol!r} (override via SHED_ROOST_SESSION_PROTOCOL). "
+        f"Check ARG ROOST_SESSION_PROTOCOL in vz/Dockerfile / "
+        f"firecracker/Dockerfile and LATEST_KNOWN_RELEASE in "
+        f"crates/shed-core/src/roost/bootstrap/source.rs (make check-roost-pin)."
+    )
+
+    r = shed_server.exec(
+        test_shed_name,
+        ["bash", "-c", "systemctl list-unit-files | grep -c roost"],
+    )
+    assert r.stdout.strip() == "0", (
+        f"expected no roost* systemd unit (no autostart — the CLI/desktop/"
+        f"phone start roost-session on first contact), got count="
+        f"{r.stdout.strip()!r} stderr={r.stderr!r}."
     )

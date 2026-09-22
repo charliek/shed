@@ -4318,7 +4318,13 @@ except Exception:
                 // the 103-byte AF_UNIX limit (the CI Swift job runs this suite
                 // there). `/tmp` is short on every platform, and roost's own
                 // per-attempt `roost-ssh-<host>-<pid>-<seq>` naming keeps two
-                // processes apart under it.
+                // processes apart under it — for the SCRATCH. The liveness
+                // sweep is per host NAME, not per pid: `ensure` refuses when
+                // another process's live `roost-ssh-<host>-*` bridge sits under
+                // the parent (its own are skipped), so `name` must be one no
+                // real process on the developer's box could hold a bridge to. A
+                // test that said `mini3` failed the moment a running desktop
+                // app was connected to that machine.
                 scratch_parents: vec![PathBuf::from("/tmp")],
                 config_paths: Some(SshConfigPaths {
                     user: None,
@@ -4339,7 +4345,8 @@ except Exception:
         let dir = tempfile::tempdir().expect("tempdir");
         let log = dir.path().join("ssh.log");
         let ssh = write_fake_ssh(dir.path(), fake.socket_path(), &log);
-        let bridge = faked_bridge("mini3", ssh);
+        // Per-run unique, so not even a `mini-bridge` alias on this box collides.
+        let bridge = faked_bridge(&format!("mini-bridge-{}", std::process::id()), ssh);
 
         let first = bridge.ensure().await.expect("the tunnel establishes");
         let RoostEndpoint::Unix(first_socket) = first.clone() else {

@@ -82,6 +82,7 @@ func newRoostRig(t *testing.T, tabs []roostprovider.Tab, withLanding bool) *roos
 		sidebarPoll:   defaultRoostSidebarPoll,
 		sidebarCap:    defaultRoostSidebarCap,
 		remoteCap:     defaultRoostRemoteCap,
+		startCap:      defaultRoostStartCap,
 		now:           rig.clock.now,
 		sleep:         rig.clock.sleep,
 	}
@@ -828,7 +829,8 @@ func TestEnsureSavedHostMatching(t *testing.T) {
 // -----------------------------------------------------------------------
 
 // The reason strings below are roost's own, copied from
-// roost-ipc/src/ssh.rs's `SshFailure::message` at the pinned rev (ee71e44) —
+// roost-ipc/src/ssh.rs's `SshFailure::message` at the pinned rev (8c91ce9,
+// roost v0.0.20; that file is byte-identical to ee71e44's, where they were copied from) —
 // the copy a failed host connection puts in `HostStatus.reason`.
 const (
 	roostReasonNoSession = "shed-myproj is reachable but has no roost session running. " +

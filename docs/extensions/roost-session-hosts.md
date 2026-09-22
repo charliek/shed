@@ -39,23 +39,33 @@ decided in order, and the first rung that can answer wins:
 4. **Nothing** — the target is left completely untouched, and the client shows the sentence in
    the next section.
 
-### The release rung is real code, but it has never run against a real release
+### The release rung is fixed, as of 0.9.0
 
-**`RELEASE_PIN` is `None` today, because no published roost release speaks session protocol
-6** — the latest, `0.0.19`, speaks protocol 2. This is checked against roost's own repository
-at the time of writing, not assumed. The message a client shows when every rung has failed:
+**`RELEASE_PIN` is `0.0.20`** — roost v0.0.20 is the first published release that speaks
+session protocol 6, and shed 0.9.0 pins it. Before that the pin was `None`, because there was
+no release to point it at honestly; the flip was the one-line change it was designed to be (it
+sits beside the version/protocol pair below). A fresh Linux target on an architecture roost
+publishes a build for now gets a `roost-session` from the release asset, with no override
+variable and no sibling binary needed.
 
-> no roost release speaking session protocol 6 is published yet (the latest, 0.0.19, speaks
-> 2). On a Linux machine with a protocol-6 roost installed the desktop uses that roost-session;
-> otherwise point `ROOST_SESSION_INSTALL_BIN` at a protocol-6 build. `<target>` was left
-> untouched.
+The rung's own unit coverage is against a loopback HTTP fixture, not against github.com — a
+unit test does not reach across the network — so what the fixture proves is every clause of
+the fetch contract, and what stays unproven there is the one URL.
 
-Flipping `RELEASE_PIN` once roost ships a protocol-6 release is a one-line change (it sits
-beside the version/protocol pair the message above is built from). **Say this plainly: the
-release-asset rung is implemented and unit-tested against a loopback HTTP fixture, but it has
-never been exercised against a real, published roost release, and nothing in this codebase
-claims otherwise.** Until that pin flips, the only ways a fresh Linux target gets a
-`roost-session` are the override variable and — desktop only — the sibling rung.
+The client still has a sentence for "every rung failed", and it is **pin-aware** — it names
+the reason that actually applies rather than repeating the pre-0.9.0 one. What you see today,
+when something has taken the release rung away:
+
+> the roost 0.0.20 release asset is not usable for `<target>`: either
+> `ROOST_SESSION_ASSET_BASE` names a base shed refuses, or roost publishes no roost-session
+> build for this architecture. On a Linux machine with a protocol-6 roost installed the desktop
+> uses that roost-session; otherwise point `ROOST_SESSION_INSTALL_BIN` at a protocol-6 build.
+> `<target>` was left untouched.
+
+Before 0.9.0, with no pin to name, the same rung read *"no roost release speaking session
+protocol 6 is published yet (the latest, 0.0.19, speaks 2)…"* with the identical two-rung tail.
+That wording is still what a build whose newest known roost release speaks an older protocol
+produces; it is not what this one does.
 
 One source-related decision in this design is recorded as **not yet confirmed by the
 project owner** rather than settled: fetching the release asset with shed's own HTTP client

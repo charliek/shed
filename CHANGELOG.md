@@ -66,7 +66,10 @@ verbatim._
 - **shed re-pins to roost's session protocol 6, in two steps — 5 then 6 — completing the
   migration plan 019 left in motion (plan 020, roost#477 / roost plan 061; plan 021, roost
   plan 064 / roost#489).** `roost-ipc` moved to `c1bfe887bc843e35466a1dcc33fa2390909fd50e`
-  for protocol 5, then to `ee71e44a1de3c0de4c59ac0267c0a5e0c993d88a` for protocol 6, in
+  for protocol 5, then to `ee71e44a1de3c0de4c59ac0267c0a5e0c993d88a` for protocol 6, and
+  finally to `8c91ce9ddd49c5a43841f72ecd149dd778d6151c` — the **roost v0.0.20 release tag**,
+  the first published roost that speaks 6 (the `roost-ipc` crate is byte-identical to
+  `ee71e44`'s; the tag is what makes it a rev somebody ships) — in
   every manifest that pins it (`crates/Cargo.toml`, the Tauri crate's, and — once
   shed-mobile's own re-pin lands — its `rust/Cargo.toml`). **Protocol 5 retired the
   lease.** The lease is gone from the wire with no replacement: `session.connect`, the
@@ -88,17 +91,22 @@ verbatim._
   reason `"unknown"`, shown verbatim rather than filtered or hidden. **A host speaking an
   older protocol is refused by name and offered the update, and its running session is
   never stopped** (pin P6) — this covers every host plan 019's desktop bootstrapped
-  (protocol 4), a host still on protocol 5, and a real released `roost-session` (the
-  latest, v0.0.19, speaks protocol 2, and is refused loudly the same way). The one manual
+  (protocol 4), a host still on protocol 5, and a `roost-session` from any roost release
+  before v0.0.20 (v0.0.19 speaks protocol 2, and is refused loudly the same way). The one manual
   step to recover: `roostctl session stop` on that target, then reconnect — shed then sees
   a stale binary with no session running and replaces and restarts it unattended, the same
   as any other Update. See
   [`docs/extensions/roost-session-hosts.md`](https://charliek.github.io/shed/extensions/roost-session-hosts/)
   for the re-widening consequence of a raise and the gx/`$GROK_HOME` "not installed"
-  surprise on a fresh host. **The phone-install rung is unchanged by this release:** it
-  still reports that no published roost release speaks the current session protocol until
-  `RELEASE_PIN` flips — "no release speaks 6" — which is a separate follow-up PR, not
-  something this release fixes.
+  surprise on a fresh host. **The phone-install rung is fixed by this release:** roost
+  v0.0.20 (`8c91ce9`) is the first published release that speaks session protocol 6, and
+  `RELEASE_PIN` is now `Some("0.0.20")` — so the desktop's release-asset rung (rung 3)
+  installs a `roost-session` onto a fresh Linux target straight from the GitHub release,
+  checksum-verified against its published `.sha256`, with no `$ROOST_SESSION_INSTALL_BIN`
+  and no sibling binary needed. The "nothing can supply these bytes" sentence is pin-aware
+  with that: it names the reason that applies (a refused `ROOST_SESSION_ASSET_BASE`, or an
+  architecture roost publishes no build for) instead of repeating plan 019's "no release
+  speaks 6", which stopped being true the moment the pin moved.
 - **The machine RC hub moves into `shed-host-agent`.** The daemon hosts the
   activity hub (`127.0.0.1:1029`) as a supervised resident role: bind-as-lock
   with a polite defer-and-retry while an older `shed-machine-rc serve` holds
@@ -313,10 +321,12 @@ verbatim._
   see [`docs/extensions/roost-session-hosts.md`](https://charliek.github.io/shed/extensions/roost-session-hosts/)
   for the source ladder, the exact (narrow) rollback promise, the PATH
   warning, and `shed reset` handling. **Honestly incomplete in one way,
-  stated in the docs:** the release-asset source rung is implemented
-  and fixture-tested but has never been exercised against a real download —
-  `RELEASE_PIN` is `None` because no published roost release speaks the
-  current session protocol yet (the latest, 0.0.19, speaks 2). **The payoff
+  stated in the docs:** the release-asset source rung shipped implemented and
+  fixture-tested but never exercised against a real download, because
+  `RELEASE_PIN` was `None` — no published roost release spoke the current
+  session protocol. That pin is flipped in this same release (see the
+  protocol-6 entry above); the rung's unit coverage is still a loopback HTTP
+  fixture rather than github.com. **The payoff
   itself is demonstrated live, not only in hermetic tests:** a real shed's
   `codex` row carries roost-sourced `activity` with `source: "roost"`, and
   `epics/roost-pivot.md`'s liveness-only clause closed with that leg (its S5
@@ -410,6 +420,18 @@ verbatim._
   never resurrect a dead record. Upgrading past this release needs no `shed stop && shed
   start` dance; older servers still do. See the
   [v0.8.2 → v0.9.0 upgrade note](https://charliek.github.io/shed/upgrades/v0.8.2-to-v0.9.0/).
+- **Stopping `shed-server` no longer kills every running Firecracker shed** (#372). The
+  firecracker-go-sdk forwards INT/QUIT/TERM/HUP/ABRT to each VMM child unless
+  `ForwardSignals` is an empty, non-nil slice, and the systemd unit carried no `KillMode`,
+  so systemd's `control-group` default reaped whatever the relay missed: one
+  `systemctl restart shed-server` — the restart every apt upgrade performs — took down every
+  shed on the host, while the same command on VZ left vfkit untouched. Both halves are fixed
+  together: the config block moves into a pure `machineConfig()` that sets
+  `ForwardSignals: []os.Signal{}`, and the unit gains `KillMode=process`. The surviving VMMs
+  are re-attached by #315's startup resume walk; if the server can't come back, they stay
+  alive and unmanaged until it does. The egress helper is unaffected — it has its own
+  parent-death signal. See the
+  [v0.8.2 → v0.9.0 upgrade note](https://charliek.github.io/shed/upgrades/v0.8.2-to-v0.9.0/).
 - **Filed while landing the above, deliberately not fixed in this PR:**
   - #369 — Firecracker: a restart doesn't re-serve `--local-dir`/`--add-dir` 9P host
     mounts (VZ is unaffected; vfkit's VirtioFS servers live in the VMM process, which
@@ -425,7 +447,7 @@ verbatim._
   - #372 — Firecracker: stopping/restarting `shed-server` kills every running shed's VM
     (the SDK's default `ForwardSignals` relays SIGTERM/etc. straight to each VMM process);
     VZ is unaffected. Same command, opposite outcome on the two backends, undocumented
-    until this ticket.
+    until this ticket. **Fixed later in this release — see the bullet above.**
   - #373 — The Mac parallel-dev config pins `v0.8.0` image aliases while a workstation's
     dev image cache can hold a user-pulled `v0.8.1`, failing
     `test_images_expose_alias_and_default[vz]` for a dev-environment reason unrelated to

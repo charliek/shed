@@ -26,7 +26,7 @@ import (
 // checks at stop/start boundaries. It does NOT verify that the pid
 // belongs to the expected program — callers concerned about PID reuse
 // should follow up with the backend-specific check (isVfkitProcess /
-// isFirecrackerProcess).
+// isThisVMsProcess).
 func IsProcessAlive(pid int) bool {
 	if pid <= 0 {
 		return false

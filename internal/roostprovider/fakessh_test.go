@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -68,6 +69,9 @@ type rig struct {
 	remote *Remote
 	// requests is the file every request line the bridge saw is appended to.
 	requests string
+	// starts is the file every `roost-session start` invocation is appended
+	// to, one line each.
+	starts string
 	// argv is the file every fake-ssh invocation's argv is appended to.
 	argv string
 	// lcAll is the file every fake-ssh invocation's $LC_ALL is appended to,
@@ -88,6 +92,7 @@ func newRig(t *testing.T, opts rigOpts) *rig {
 		t:        t,
 		home:     home,
 		requests: filepath.Join(dir, "requests.ndjson"),
+		starts:   filepath.Join(dir, "starts.log"),
 		argv:     filepath.Join(dir, "argv.log"),
 		lcAll:    filepath.Join(dir, "lcall.log"),
 	}
@@ -234,12 +239,25 @@ exit 255
 )
 
 const (
-	// sessionHead opens the fake `roost-session`'s dispatch. `identify` and
-	// `client-bridge` are the two subcommands anything in this package can
-	// reach.
+	// sessionHead opens the fake `roost-session`'s dispatch. `identify`,
+	// `start` and `client-bridge` are the three subcommands anything in this
+	// package can reach.
+	//
+	// `start` answers from files the test stages (rig.stageStart), one entry
+	// per call with the last repeating, because the thing under test is how
+	// the verdict CHANGES across consecutive starts: roost's
+	// `already-running` is the sub-second socket-lock race, and a fake that
+	// answered the same bytes every time could not express "lost the race
+	// four times, then came up". Every call is logged, so "how many starts
+	// were there" is an assertion rather than an inference.
 	sessionHead = `#!/bin/sh
 case "$1" in
   identify) cat __DIR__/identify.json ;;
+  start)
+    printf 'start\n' >> __START_LOG__
+    n=$(wc -l < __START_LOG__ | tr -d ' ')
+    [ -f __DIR__/start.$n ] || n=last
+    exec /bin/sh __DIR__/start.$n ;;
   client-bridge)
 `
 
@@ -306,7 +324,66 @@ func (r *rig) sessionScript(dir string, mode sessionMode) string {
 	return strings.NewReplacer(
 		"__DIR__", shellQuote(dir),
 		"__REQUEST_LOG__", shellQuote(r.requests),
+		"__START_LOG__", shellQuote(r.starts),
 	).Replace(sessionHead + body + sessionTail)
+}
+
+// startReply is one staged answer to `roost-session start`: what it prints,
+// what it says on stderr, how long it takes, and how it exits.
+type startReply struct {
+	stdout string
+	stderr string
+	// sleep is seconds the start hangs for AFTER printing — the shape a
+	// budget has to cut short.
+	sleep int
+	exit  int
+}
+
+// startScript renders one reply as the shell the fake `start` execs. The reply
+// IS the script — one file per call rather than a sidecar per field, so there
+// is nothing to probe for and no way to stage half of one.
+func startScript(reply startReply) string {
+	var b strings.Builder
+	if reply.stdout != "" {
+		b.WriteString("printf '%s' " + shellQuote(reply.stdout) + "\n")
+	}
+	if reply.stderr != "" {
+		b.WriteString("printf '%s' " + shellQuote(reply.stderr) + " >&2\n")
+	}
+	if reply.sleep != 0 {
+		b.WriteString("sleep " + strconv.Itoa(reply.sleep) + "\n")
+	}
+	b.WriteString("exit " + strconv.Itoa(reply.exit) + "\n")
+	return b.String()
+}
+
+// stageStart lays down the answers `roost-session start` gives, in order. The
+// LAST one repeats for every call after it, so "already-running forever" and
+// "already-running until the fourth" are both one call to write.
+func (r *rig) stageStart(replies ...startReply) {
+	r.t.Helper()
+	if len(replies) == 0 {
+		r.t.Fatal("stageStart needs at least one reply")
+	}
+	dir := filepath.Dir(r.requests)
+	for i, reply := range replies {
+		mustWrite(r.t, filepath.Join(dir, "start."+strconv.Itoa(i+1)), startScript(reply), 0o644)
+	}
+	// The slot every call past the staged set falls back to.
+	mustWrite(r.t, filepath.Join(dir, "start.last"), startScript(replies[len(replies)-1]), 0o644)
+}
+
+// startCalls is how many times `roost-session start` ran on the far side.
+func (r *rig) startCalls() int {
+	r.t.Helper()
+	data, err := os.ReadFile(r.starts)
+	if os.IsNotExist(err) {
+		return 0
+	}
+	if err != nil {
+		r.t.Fatalf("reading the start log: %v", err)
+	}
+	return strings.Count(string(data), "\n")
 }
 
 // writeReplies lays down the NDJSON the fake bridge answers with, built from

@@ -21,15 +21,26 @@
 //!    by [`fetch_release`].
 //! 4. **Nothing** — [`unavailable`], and the host is left untouched.
 //!
-//! ## The pin is `None`, and that is the state of the world
+//! ## The pin is `0.0.20`, and that is the state of the world
 //!
-//! [`RELEASE_PIN`] is `None` **because no roost release speaks session protocol
-//! [`SESSION_PROTOCOL_VERSION`]** — the latest is [`LATEST_KNOWN_RELEASE`],
-//! which speaks 2. That is an external gate, not an unfinished branch: rung 3 is
-//! implemented and tested against a loopback fixture, and the only thing missing
-//! is a release to point it at. Flipping the pin is a one-line edit *here*,
-//! which is the whole reason the version and the protocol number live in
-//! constants rather than in the sentence that mentions them.
+//! [`RELEASE_PIN`] names roost **v0.0.20** — [`LATEST_KNOWN_RELEASE`] — the
+//! first published release that speaks session protocol
+//! [`SESSION_PROTOCOL_VERSION`]. It was `None` until that release existed, and
+//! that was an external gate rather than an unfinished branch: rung 3 was
+//! implemented and tested against a loopback fixture the whole time, and the
+//! only thing missing was a release to point it at. Flipping it was the one-line
+//! edit *here* the module was written to absorb, which is the whole reason the
+//! version and the protocol number live in constants rather than in the sentence
+//! that mentions them.
+//!
+//! **What that changes below.** With a pin, rung 3 answers for every
+//! architecture roost publishes a build for, so rung 4 is no longer where a cold
+//! Linux target lands. It is still reachable — an asset base the fetch would
+//! refuse, an architecture with no build, or a `None` pin, which is how the
+//! tests still exercise it — and [`unavailable`]'s sentence became **pin-aware**
+//! for that reason: plan 019's "no release speaks this protocol yet" is a lie
+//! once one does, so the copy branches on the constants it is built from rather
+//! than restating a fact that stopped being one (plan 023 §3.2 amendment).
 //!
 //! ## Why shed fetches the asset itself, on the desktop too
 //!
@@ -111,7 +122,8 @@ use std::time::Duration;
 use futures_util::StreamExt as _;
 use roost_ipc::bootstrap::{
     asset_name, check_asset_base, checksum_name, client_arch, default_asset_base, map_arch,
-    parse_checksum_file, sniff_binary, BootstrapError, RemoteArch, Sniff, INSTALL_BIN_ENV,
+    parse_checksum_file, sniff_binary, BootstrapError, RemoteArch, Sniff, ASSET_BASE_ENV,
+    INSTALL_BIN_ENV,
 };
 use roost_ipc::messages::SESSION_PROTOCOL_VERSION;
 use roost_ipc::session_launch::locate_session_binary;
@@ -138,21 +150,35 @@ pub struct RoostRelease {
     pub version: &'static str,
 }
 
-/// The release rung 3 fetches from — **`None` today**.
+/// The release rung 3 fetches from — **roost v0.0.20**.
 ///
-/// See the module doc: no published roost release speaks session protocol
-/// [`SESSION_PROTOCOL_VERSION`], so there is nothing honest to point this at.
-/// A `Some(RoostRelease { version: "0.0.20" })` here is the entire pin-flip.
-pub const RELEASE_PIN: Option<RoostRelease> = None;
+/// See the module doc: v0.0.20 is the first published roost release that speaks
+/// session protocol [`SESSION_PROTOCOL_VERSION`], so it is the first one there
+/// was anything honest to point this at. It was `None` before that, and plan 023
+/// §3.2 is the flip. It must name [`LATEST_KNOWN_RELEASE`]'s version — this
+/// module's tests assert that it does, and that the protocol beside it is the
+/// one this shed speaks.
+pub const RELEASE_PIN: Option<RoostRelease> = Some(RoostRelease { version: "0.0.20" });
 
 /// The newest roost release shed knows of, and the session protocol it speaks —
-/// **`("0.0.19", 2)`**.
+/// **`("0.0.20", 6)`**.
 ///
-/// Its only job is [`unavailable`]'s parenthesis. It is a constant so that the
-/// sentence a user reads ("the latest, 0.0.19, speaks 2") cannot drift away from
-/// the pin above it: one PR edits both, in one file, and this module's tests
-/// assert the sentence is built from them rather than typed out.
-pub const LATEST_KNOWN_RELEASE: (&str, u32) = ("0.0.19", 2);
+/// It is the release [`RELEASE_PIN`] points at, and it is what
+/// [`unavailable`]'s parenthesis names. It is a constant so that the pin and the
+/// sentence a user reads cannot drift apart: one PR edits both, in one file, and
+/// this module's tests assert the sentence is built from them rather than typed
+/// out.
+pub const LATEST_KNOWN_RELEASE: (&str, u32) = ("0.0.20", 6);
+
+// Compile-time tripwire (the `RECORDED_GENERATION` precedent in `model.rs`): a
+// pin may only exist while the newest known release speaks the protocol this
+// shed speaks. A future bump that moves one constant and not the other, or
+// pins a release that speaks an older generation, fails to build rather than
+// advertising a rung 3 that hands every target an incompatible daemon.
+const _: () = assert!(
+    RELEASE_PIN.is_none() || LATEST_KNOWN_RELEASE.1 == SESSION_PROTOCOL_VERSION,
+    "RELEASE_PIN is set but LATEST_KNOWN_RELEASE does not speak SESSION_PROTOCOL_VERSION"
+);
 
 // ============================================================================
 // Caps and budgets — roost's numbers, restated
@@ -381,7 +407,7 @@ impl SourceEnv {
             session_bin: non_empty(std::env::var_os(roost_ipc::session_launch::BIN_ENV)),
             caller_exe: std::env::current_exe().ok(),
             path: std::env::var_os("PATH"),
-            asset_base: non_empty(std::env::var_os(roost_ipc::bootstrap::ASSET_BASE_ENV))
+            asset_base: non_empty(std::env::var_os(ASSET_BASE_ENV))
                 .map(|value| value.to_string_lossy().into_owned()),
         }
     }
@@ -391,19 +417,60 @@ impl SourceEnv {
 // Rung 4's sentence
 // ============================================================================
 
-/// The copy plan 019 §3.5 pinned for "nothing can supply these bytes", word for
-/// word — built from [`RELEASE_PIN`]'s neighbours so that a pin-flip PR editing
-/// the constants above cannot leave this sentence claiming something that has
-/// stopped being true.
+/// The copy for "nothing can supply these bytes" — **pin-aware**, because the
+/// reason changed when the pin did.
+///
+/// Plan 019 §3.5 pinned one sentence, and its whole point was that the constants
+/// above and the copy could not drift apart: "a pin-flip PR editing the
+/// constants cannot leave this sentence claiming something that has stopped
+/// being true". Flipping [`RELEASE_PIN`] to a release that *does* speak
+/// [`SESSION_PROTOCOL_VERSION`] did exactly that — "no roost release speaking
+/// protocol 6 is published yet (the latest, 0.0.20, speaks 6)" contradicts
+/// itself — so the promise is kept the only way it can be: the sentence branches
+/// on the fact it is asserting. Plan 023 §3.2 amendment.
+///
+/// Two branches, one function, and the **tail is identical in both** — the same
+/// two working rungs, the same `… was left untouched.` ending every consumer
+/// keys on:
+///
+/// * [`LATEST_KNOWN_RELEASE`] speaks something **other** than this generation —
+///   the pre-flip world, and what an injected `None` pin still means in this
+///   module's tests: plan 019's sentence, byte for byte.
+/// * It speaks **this** generation — today: rung 3 exists and did not answer, so
+///   the copy names the two things that can take it away instead of denying it
+///   exists.
+///
+/// [`unavailable_for`] is where both live; this is the one every caller uses.
 pub fn unavailable(target: &str) -> String {
-    let (version, protocol) = LATEST_KNOWN_RELEASE;
-    format!(
-        "no roost release speaking session protocol {SESSION_PROTOCOL_VERSION} is published yet \
-         (the latest, {version}, speaks {protocol}). On a Linux machine with a protocol-\
-         {SESSION_PROTOCOL_VERSION} roost installed the desktop uses that roost-session; \
-         otherwise point {INSTALL_BIN_ENV} at a protocol-{SESSION_PROTOCOL_VERSION} build. \
-         {target} was left untouched."
-    )
+    unavailable_for(target, LATEST_KNOWN_RELEASE)
+}
+
+/// [`unavailable`] with the known release lifted into an argument.
+///
+/// Private, and it exists for one reason: with the constants at their shipped
+/// values the pre-flip branch is unreachable, and an untested branch is a branch
+/// that rots. The tests drive both through here.
+fn unavailable_for(target: &str, latest: (&str, u32)) -> String {
+    let (version, protocol) = latest;
+    // The tail both branches end with: the two rungs that still work whatever
+    // took rung 3 away, and the sentence every consumer keys on.
+    let tail = format!(
+        "On a Linux machine with a protocol-{SESSION_PROTOCOL_VERSION} roost installed the \
+         desktop uses that roost-session; otherwise point {INSTALL_BIN_ENV} at a protocol-\
+         {SESSION_PROTOCOL_VERSION} build. {target} was left untouched."
+    );
+    if protocol == SESSION_PROTOCOL_VERSION {
+        format!(
+            "the roost {version} release asset is not usable for {target}: either \
+             {ASSET_BASE_ENV} names a base shed refuses, or roost publishes no roost-session \
+             build for this architecture. {tail}"
+        )
+    } else {
+        format!(
+            "no roost release speaking session protocol {SESSION_PROTOCOL_VERSION} is published \
+             yet (the latest, {version}, speaks {protocol}). {tail}"
+        )
+    }
 }
 
 /// [`unavailable`] as the failure an install refuses with.
@@ -782,6 +849,11 @@ async fn local_identify_within(path: &Path, budget: Duration) -> Result<Identity
 /// [`check_asset_base`] runs **here**, at preview time, and not only inside the
 /// fetch: a consent card that names a base the fetch is going to refuse has
 /// asked the user to approve something that cannot happen.
+///
+/// The no-pin arm below is not dead code for a `None` [`RELEASE_PIN`] that no
+/// longer exists: the pin is an argument precisely so it can be absent, and the
+/// tests drive rung 4 through it. Its sentence is about the pin rather than
+/// about a host, which is why it is here and not in `copy`.
 fn asset_source(env: &SourceEnv, pin: Option<&RoostRelease>) -> Result<Source, String> {
     let pin = pin.ok_or_else(|| {
         let (version, protocol) = LATEST_KNOWN_RELEASE;

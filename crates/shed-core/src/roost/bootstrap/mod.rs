@@ -505,7 +505,7 @@ impl CallError {
 #[derive(Clone)]
 pub struct SourceHandle {
     /// A sentence fragment for the consent card: "the roost-session beside this
-    /// app", "roost-session 0.0.19 from github.com/charliek/roost", …
+    /// app", "roost-session 0.0.20 from github.com/charliek/roost", …
     origin: Arc<str>,
     len: u64,
     sha256: Option<Arc<str>>,

@@ -49,6 +49,10 @@ type sessionsAPI struct {
 	// only way to test what the destructive path does with an answer it cannot
 	// trust.
 	sessionWarnings []string
+	// requests counts every HTTP request this server saw, of any kind — the
+	// "zero calls" side of the --all/positional refusal test needs to prove
+	// silence, not just the absence of one particular endpoint's traffic.
+	requests int
 }
 
 func newSessionsAPI(t *testing.T, sheds []config.Shed, sessions []config.Session) *sessionsAPI {
@@ -60,6 +64,7 @@ func newSessionsAPI(t *testing.T, sheds []config.Shed, sessions []config.Session
 }
 
 func (a *sessionsAPI) serve(w http.ResponseWriter, r *http.Request) {
+	a.requests++
 	w.Header().Set("Content-Type", "application/json")
 	writeJSON := func(v any) {
 		_ = json.NewEncoder(w).Encode(v)
@@ -837,35 +842,61 @@ func TestKillProceedsWhenTheTmuxAnswerIsComplete(t *testing.T) {
 	}
 }
 
-// TestAllIgnoresThePositionalInBothHalves: `--all` makes the tmux half call
-// ListAllSessions, which never looks at a positional shed argument — so the
-// roost half must not look at it either.
+// TestAllWithPositionalRefused replaces TestAllIgnoresThePositionalInBothHalves.
 //
-// sol review finding: it did. `shed sessions --all web` showed EVERY shed's
-// tmux rows but only `web`'s roost tabs, so one command answered two different
-// questions at once. Consistency with the floor is the rule; that `--all`
-// silently ignores its argument at all is a pre-existing wart, filed rather
-// than changed here.
-func TestAllIgnoresThePositionalInBothHalves(t *testing.T) {
-	rig := newSessionsRig(t, []roostprovider.Tab{
-		roostTab("5", "default", "running", "inactive"),
-	}, nil)
-	// A second running shed, whose tabs must appear even though the positional
-	// names the first one.
-	rig.api.sheds = append(rig.api.sheds, config.Shed{Name: "other", Status: config.StatusRunning})
-	sessionsAllFlag = true
+// sol review finding: `--all` made the tmux half call ListAllSessions, which
+// never looked at a positional shed argument, while the roost half filtered
+// on it — so `shed sessions --all web` showed EVERY shed's tmux rows but only
+// `web`'s roost tabs, one command answering two different questions at once.
+//
+// The fix is refusal, in cobra's Args validation on sessionsCmd, before
+// either half of the command runs at all: `--all` together with a positional
+// is rejected up front, so the combination that used to answer two different
+// questions now answers none. This drives the real cobra pipeline
+// (rootCmd.Execute, not runSessions directly) precisely so that the ordering
+// -- flags parsed, Args validated, and only THEN would PersistentPreRunE and
+// RunE ever touch the API client or roostctl -- is exercised for real, not
+// asserted by reading the source.
+func TestAllWithPositionalRefused(t *testing.T) {
+	const wantMsg = "--all lists every shed; drop the argument or drop --all"
 
-	out, err := runSessionsCapturing(t, testSessionsShed)
-	if err != nil {
-		t.Fatalf("runSessions: %v", err)
-	}
-	// The floor ignores the positional under --all, so the roost half must
-	// have asked about BOTH sheds.
-	if !strings.Contains(out, testSessionsShed) {
-		t.Errorf("the named shed's tabs are missing:\n%s", out)
-	}
-	if !strings.Contains(out, "other") {
-		t.Errorf("--all dropped the other shed's roost tabs — the roost half filtered on a "+
-			"positional the tmux half ignores:\n%s", out)
+	for _, tc := range []struct {
+		name string
+		args []string
+	}{
+		// The default path: no --json, no --tmux, whatever runSessions would
+		// otherwise have picked based on roost availability.
+		{name: "default", args: []string{"sessions", "--all", testSessionsShed}},
+		// The JSON output path.
+		{name: "json", args: []string{"sessions", "--all", testSessionsShed, "--json"}},
+		// The tmux-only path.
+		{name: "tmux", args: []string{"sessions", "--all", testSessionsShed, "--tmux"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rig := newSessionsRig(t, []roostprovider.Tab{
+				roostTab("5", "default", "running", "inactive"),
+			}, nil)
+			rig.api.sheds = append(rig.api.sheds, config.Shed{Name: "other", Status: config.StatusRunning})
+
+			// rootCmd is package-level: leave its argv the way we found it so a
+			// later Execute() without SetArgs does not replay this refusal
+			// (sol review finding).
+			rootCmd.SetArgs(tc.args)
+			t.Cleanup(func() { rootCmd.SetArgs(nil) })
+			err := rootCmd.Execute()
+
+			if err == nil {
+				t.Fatal("Execute() returned nil error, want the --all/positional refusal")
+			}
+			if !strings.Contains(err.Error(), wantMsg) {
+				t.Errorf("error = %q, want it to contain %q", err.Error(), wantMsg)
+			}
+			if n := rig.api.requests; n != 0 {
+				t.Errorf("the fake API client saw %d requests despite the refusal", n)
+			}
+			if runs := rig.shim.argvRuns(); len(runs) != 0 {
+				t.Errorf("the roostctl shim saw %d invocations despite the refusal: %v", len(runs), runs)
+			}
+		})
 	}
 }

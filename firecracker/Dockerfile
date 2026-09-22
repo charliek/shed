@@ -298,6 +298,19 @@ RUN --mount=type=bind,source=.,target=/ctx \
 # which is how this was found. This matches the recipe this repo already
 # documents in docs/getting-started/linux-quickstart.md. No dearmor step is
 # needed either way — the key is already in the form apt wants.
+#
+# roost-session (the headless roost daemon) is baked from the standalone release asset —
+# no headless deb exists, and the GUI deb would pull ~45 X11/Wayland packages. Kept in
+# lockstep with RELEASE_PIN in crates/shed-core/src/roost/bootstrap/source.rs —
+# `make check-roost-pin` asserts it (the check-kernel-pin precedent). Digests are pinned
+# IN-TREE, not fetched: a .sha256 from the same mutable release proves transport, not
+# provenance. These ARGs are NOT forwarded by scripts/build-*-rootfs.sh; they exist so
+# the values are named here and overridable by --build-arg on a manual build.
+ARG ROOST_SESSION_VERSION=0.0.20
+ARG ROOST_SESSION_PROTOCOL=6
+ARG ROOST_SESSION_SHA256_AMD64=72f3e348a15b349fd9220f4c2365c39602c59b454cc1ed1ac27567eff73fff2a
+ARG ROOST_SESSION_SHA256_ARM64=5b857cf41ca4d7d15379b5c97ffad4b478f1fdd03d1533ac527303a2f1a02757
+
 RUN install -m 0755 -d /etc/apt/keyrings \
     && curl -fsSL https://apt.stridelabs.ai/pubkey.gpg -o /etc/apt/keyrings/stridelabs.gpg \
     && chmod a+r /etc/apt/keyrings/stridelabs.gpg \
@@ -305,7 +318,16 @@ RUN install -m 0755 -d /etc/apt/keyrings \
        > /etc/apt/sources.list.d/stridelabs.sources \
     && apt-get update \
     && apt-get install -y --no-install-recommends strix prox \
-    && rm -rf /var/lib/apt/lists/*
+    && rm -rf /var/lib/apt/lists/* \
+    && arch="$(dpkg --print-architecture)" \
+    && case "$arch" in amd64) want="$ROOST_SESSION_SHA256_AMD64";; arm64) want="$ROOST_SESSION_SHA256_ARM64";; *) echo "ERROR: no roost-session digest for $arch" >&2; exit 1;; esac \
+    && base="https://github.com/charliek/roost/releases/download/v${ROOST_SESSION_VERSION}" \
+    && curl -fsSL --retry 5 --retry-delay 2 -o /tmp/rs "${base}/roost-session-${ROOST_SESSION_VERSION}-linux-${arch}" \
+    && echo "${want}  /tmp/rs" | sha256sum -c - \
+    && install -m 0755 /tmp/rs /usr/bin/roost-session && rm -f /tmp/rs \
+    && /usr/bin/roost-session identify \
+         | jq -e ".session_protocol == ${ROOST_SESSION_PROTOCOL} and .app_version == \"${ROOST_SESSION_VERSION}\"" >/dev/null \
+         || { echo "ERROR: baked roost-session is not ${ROOST_SESSION_VERSION}/protocol ${ROOST_SESSION_PROTOCOL}" >&2; exit 1; }
 
 WORKDIR /home/shed
 ENTRYPOINT ["/sbin/init"]

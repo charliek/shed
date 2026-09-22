@@ -67,6 +67,7 @@ The `extensions` variant adds [credential brokering](extensions.md) on top of `b
 - **`shed-ext`** — CLI for checking extension connectivity and health.
 - **`strix`** — TUI for staging and reviewing diffs, from the stridelabs apt repo.
 - **`prox`** — process manager with an HTTP API and TUI, from the stridelabs apt repo.
+- **`/usr/bin/roost-session`** — the headless [roost](https://github.com/charliek/roost) daemon, roost v0.0.20 (session protocol 6), baked from the standalone release asset and checksum-verified at build time with a build-time `identify` assert. No systemd unit is enabled — `shed attach`, the desktop app, and the phone app start it on first contact. Kept in lockstep with `crates/shed-core/src/roost/bootstrap/source.rs`'s `RELEASE_PIN` by `make check-roost-pin`.
 - Pre-configured `SSH_AUTH_SOCK` and `AWS_CONTAINER_CREDENTIALS_FULL_URI` environment variables.
 
 **When to use it:** as a base for organization-specific images, or when you

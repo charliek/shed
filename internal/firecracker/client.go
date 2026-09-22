@@ -10,7 +10,6 @@ import (
 	"net"
 	"os"
 	"path/filepath"
-	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -204,37 +203,21 @@ func (c *Client) resumeInstance(ctx context.Context, name string) {
 }
 
 // vmmServesInstance reports whether pid is a live Firecracker VMM serving
-// THIS instance. Family alone (the isFirecrackerProcess idiom used by
-// VM.IsRunning) is not enough for resume: a recycled PID that happens to be
-// another shed's firecracker would resurrect a dead record, so the
-// instance's own api-sock path must appear in the command line too.
+// THIS instance. Family alone ("is it some firecracker?") is not enough for
+// resume: a recycled PID that happens to be another shed's firecracker would
+// resurrect a dead record, so the instance's own api-sock argument has to be
+// there too.
 //
-// The two checks must be INDEPENDENT evidence, which is why the family is
-// matched on argv[0] and not on the whole command line. The default socket
-// directory is `/var/run/shed/firecracker` (config/server.go:1277), so a
-// whole-command-line `Contains("firecracker")` is satisfied by the api-sock
-// path itself — it would corroborate nothing, and any recycled PID that
-// merely mentions the socket (`socat`, `rm`, a shell loop) would resume a
-// dead record.
+// The predicate itself lives in vm.go (vmmCmdlineServesInstance) because
+// every pid-fallback path — Stop, Kill/delete, the zombie and
+// stop-incomplete guards, IsRunning — has to ask the same question; this
+// wrapper only adds the resume walk's cancellable, injectable cmdline read.
 func (c *Client) vmmServesInstance(ctx context.Context, pid int, name string) (bool, error) {
 	cmdline, err := c.inspectCmdline(ctx, pid)
 	if err != nil {
 		return false, err
 	}
-	if !isVMMExecutable(cmdline) {
-		return false, nil
-	}
-	// The api-sock path VM.Start hands the SDK; see vm.go.
-	sockPath := filepath.Join(c.cfg.SocketDir, name+".sock")
-	return strings.Contains(cmdline, sockPath), nil
-}
-
-// isVMMExecutable reports whether a NUL-separated /proc cmdline's argv[0] is
-// the firecracker binary. shed passes no custom VMCommandBuilder
-// (vm.go:200-204), so the SDK invokes its default `firecracker` binary.
-func isVMMExecutable(cmdline string) bool {
-	argv0, _, _ := strings.Cut(cmdline, "\x00")
-	return filepath.Base(argv0) == "firecracker"
+	return vmmCmdlineServesInstance(cmdline, instanceAPISocketPath(c.cfg.SocketDir, name)), nil
 }
 
 // inspectCmdline reads a PID's command line via the injected reader,
@@ -735,7 +718,15 @@ func (c *Client) GetShed(ctx context.Context, name string) (*config.Shed, error)
 	status := meta.Status
 	if status == config.StatusRunning {
 		vm := &VM{meta: meta, cfg: c.cfg}
-		if !vm.IsRunning() {
+		running, verifyErr := vm.IsRunning()
+		switch {
+		case verifyErr != nil:
+			// UNKNOWN identity (see isThisVMsProcess): the pid is alive but
+			// we could not read whose it is. Keep the recorded status —
+			// rewriting it to Stopped here would strip a live shed's PID and
+			// let the next start spawn a second firecracker over it.
+			log.Printf("Warning: GetShed %q: cannot verify pid %d, keeping recorded status: %v", name, meta.PID, verifyErr)
+		case !running:
 			meta.Status = config.StatusStopped
 			meta.PID = 0
 			if err := meta.Save(c.cfg.InstanceDir); err != nil {
@@ -816,10 +807,22 @@ func (c *Client) DeleteShed(ctx context.Context, name string) error {
 			delete(c.vms, name)
 			c.mu.Unlock()
 			if meta.PID > 0 {
-				if !isFirecrackerProcess(meta.PID) {
-					log.Printf("Warning: PID %d is not a Firecracker process, skipping SIGKILL during delete of %s", meta.PID, name)
-				} else {
-					_ = syscall.Kill(meta.PID, syscall.SIGKILL)
+				// Pin the pid before asking whose it is, then signal through
+				// that handle (pidfd on Linux) — never by number after a
+				// separate check.
+				vm := &VM{meta: meta, cfg: c.cfg}
+				proc, owns, verifyErr := vm.recordedPIDHandle()
+				switch {
+				case verifyErr != nil:
+					// UNKNOWN identity: refuse to carry on. Everything below
+					// this branch releases the TAP, the CID/IP reservation and
+					// the upper, which would strand a VMM that may well still
+					// be running.
+					return fmt.Errorf("cannot verify pid %d while deleting %s; refusing to release its resources: %w", meta.PID, name, verifyErr)
+				case !owns:
+					log.Printf("Warning: PID %d is not %s's firecracker VMM (recycled pid?), skipping SIGKILL during delete of %s", meta.PID, name, name)
+				default:
+					_ = proc.Signal(syscall.SIGKILL)
 					if !waitForProcessExit(meta.PID, 2*time.Second) {
 						log.Printf("Warning: PID %d did not exit within timeout during delete of %s", meta.PID, name)
 					}
@@ -955,8 +958,17 @@ func (c *Client) stopShedLocked(ctx context.Context, meta *Metadata, mode stopMo
 	// to die. Verify before flipping status — otherwise the next StartShed
 	// would find PID=0 in metadata and silently spawn a second firecracker
 	// under the same name.
-	if meta.PID > 0 && vmutil.IsProcessAlive(meta.PID) && isFirecrackerProcess(meta.PID) {
-		return nil, fmt.Errorf("%w: %s (pid %d)", config.ErrStopIncompleteSentinel, meta.Name, meta.PID)
+	if meta.PID > 0 && vmutil.IsProcessAlive(meta.PID) {
+		owns, verifyErr := isThisVMsProcess(meta.PID, instanceAPISocketPath(c.cfg.SocketDir, meta.Name))
+		if verifyErr != nil {
+			// UNKNOWN identity: do not flip the metadata to Stopped/PID=0.
+			// The caller (stop or delete) must fail loudly instead of
+			// releasing resources a live VMM may still hold.
+			return nil, fmt.Errorf("cannot verify pid %d after stopping %s: %w", meta.PID, meta.Name, verifyErr)
+		}
+		if owns {
+			return nil, fmt.Errorf("%w: %s (pid %d)", config.ErrStopIncompleteSentinel, meta.Name, meta.PID)
+		}
 	}
 
 	meta.Status = config.StatusStopped

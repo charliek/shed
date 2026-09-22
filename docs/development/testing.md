@@ -375,8 +375,16 @@ To make the local-built image visible to the dev server, override
 # 1. Build the variant you changed. OUTPUT_DIR is the key override —
 #    it lands the blobs in the dev server's images_dir so `shed -s
 #    my-server-dev create --image base` picks them up.
+# SHED_SOURCE_REF must equal the dev config's image_aliases.<variant>
+# (configs/server.dev-parallel.mac.yaml) — the build writes the ref-index
+# entry for THAT ref, which is what `create --image <variant>` resolves.
+# Without it the build lands under `...:dev`, the alias still names the
+# published tag, and `create` quietly PULLS the published image instead
+# (plan 023 hit exactly this). --build-tools-version <released tag> is
+# needed on a host with no local shed-build-tools:dev.
+SHED_SOURCE_REF=ghcr.io/charliek/shed-vz-base:v0.8.0 \
 OUTPUT_DIR="$HOME/Library/Application Support/shed-dev/vz" \
-  ./scripts/build-vz-rootfs.sh --variant base
+  ./scripts/build-vz-rootfs.sh --variant base --build-tools-version v0.8.2
 
 # If your change is in build-tools too, pass --build-tools-version
 # dev so the local shed-build-tools:dev mints the rootfs erofs:
@@ -390,8 +398,9 @@ OUTPUT_DIR="$HOME/Library/Application Support/shed-dev/vz" \
 # the build script calls automatically. There is no SHED_EXT_VERSION /
 # --shed-ext-version any more — edit cmd/shed-ext-* or guest/extensions/etc/
 # and rebuild the extensions (or full) variant to pick the change up:
+SHED_SOURCE_REF=ghcr.io/charliek/shed-vz-extensions:v0.8.0 \
 OUTPUT_DIR="$HOME/Library/Application Support/shed-dev/vz" \
-  ./scripts/build-vz-rootfs.sh --variant extensions
+  ./scripts/build-vz-rootfs.sh --variant extensions --build-tools-version v0.8.2
 
 # 2. Restart the dev server (it picks up the new blobs automatically
 #    — the OCI store is content-addressed so a `shed image ls` will
@@ -433,13 +442,21 @@ one-command target for this yet; the manual sequence is:
 # Setup
 # -----
 # 1. Build on the remote, writing blobs directly to the dev
-#    images_dir. `sudo env OUTPUT_DIR=...` (not `OUTPUT_DIR=... sudo`)
-#    is the load-bearing detail — sudo strips environment variables
-#    by default; `sudo env VAR=value ...` is the standard way to
-#    pass an env var through.
-ssh $SHED_FC_HOST "cd /path/to/shed && \
-  sudo env OUTPUT_DIR=/var/lib/shed-dev/firecracker/images \
-    ./scripts/build-firecracker-rootfs.sh --variant base"
+#    images_dir — as the NORMAL USER, not under sudo. Root's Docker has
+#    no buildx builder that supports the OCI exporter the script needs
+#    ("OCI exporter is not supported for the docker driver"), and mise
+#    shims (Go for the guest-binary staging) are per-user. Make the dev
+#    store user-writable once; the root-run dev server (sudo nohup)
+#    reads user-owned blobs fine. (The .claude/skills/testing-vm-agent-
+#    changes skill records the same trap.)
+ssh $SHED_FC_HOST 'sudo chown -R $USER:$USER /var/lib/shed-dev/firecracker'
+#    SHED_SOURCE_REF must equal image_aliases.<variant> in
+#    configs/server.dev-parallel.linux-fc.yaml, for the same reason as on
+#    the Mac (the ref-index entry is what `create` resolves).
+ssh $SHED_FC_HOST 'cd /path/to/shed && export PATH="$HOME/.local/share/mise/shims:$PATH" && \
+  SHED_SOURCE_REF=ghcr.io/charliek/shed-fc-base:v0.5.9 \
+  OUTPUT_DIR=/var/lib/shed-dev/firecracker/images \
+    ./scripts/build-firecracker-rootfs.sh --variant base --build-tools-version v0.8.2'
 
 # 2. Restart the dev FC server so it sees the new blobs.
 make dev-server-restart-fc

@@ -270,10 +270,45 @@ ssh mini3 'cd ~/projects/shed && export PATH="$HOME/.local/share/mise/shims:$PAT
 ```
 
 The root-run FC dev server (sudo nohup) still reads the user-owned blobs fine.
+
+Three more edges from plan 023 (2026-09-22), all setup, none in the Dockerfile:
+
+- **Under `sudo` the build also dies later, at the OCI export** — `OCI exporter is not
+  supported for the docker driver` — because root's Docker has only the plain `docker`
+  builder; the user's `shedoci` (docker-container) builder is what the script needs. A
+  past `sudo` run can also leave root-owned files under `~/.docker/buildx/`, which then
+  breaks `docker buildx ls` for the user (`permission denied`): `sudo chown -R $USER
+  ~/.docker` fixes it. Same remedy: build as the user.
+- **A fresh scratch checkout / worktree of the repo (on the Mac or on mini3) has an
+  untrusted `.mise.toml`**, and the failure is instant ("Config files … are not
+  trusted"). `mise trust <checkout>/.mise.toml` first — with the REAL mise binary
+  (`~/.local/bin/mise`), which is NOT on a non-interactive ssh PATH even though its
+  shims dir is; `mise trust -q` is not a thing and fails silently.
+- **`--build-tools-version <released tag>` is mandatory when the host has no local
+  `shed-build-tools:dev`** (the Mac mini does not): the default mints the erofs through
+  `shed-build-tools:dev` and the whole Docker build succeeds before it fails at
+  `Unable to find image 'shed-build-tools:dev'`. Pass the latest `v*` tag
+  (`git tag --list 'v*' | sort -V | tail -1`) and it pulls `ghcr.io/charliek/
+  shed-build-tools:<tag>` instead.
+
 (Guest **extension** binaries — `extensions`/`full` variants — are now built
 in-tree by `scripts/stage-guest-binaries.sh`, staged into the context like
 shed-agent; verify `docker-credential-shed version` reports a non-release version
 in the booted shed, same as the shed-agent check.)
+
+## Gremlin: `kill 0` (or any empty-pid kill) over tailscale ssh reaches OTHER sessions
+
+Every non-pty tailscale ssh session on mini3 runs in tailscaled's process group, and so
+does anything you `nohup … &` from one — the dev shed-server and every firecracker VMM it
+spawns. A script that does `kill -KILL $PID` with `$PID` equal to `0` — which is exactly what
+`systemctl show -p MainPID --value` prints for a unit that failed to start — is `kill -KILL 0`,
+and signals that whole group (an EMPTY `$PID` is only a usage error; `0` is the dangerous
+value): it
+killed an orphaned VMM that had survived a real SIGKILL of its server, and restarted
+tailscaled (plan 023 live-05, 2026-09-22). Guard every signal: refuse an empty/0/1 pid.
+Related, for KillMode legs: a transient unit that merely ADOPTS a VMM spawned elsewhere
+cannot reap it on stop under any KillMode (wrong cgroup) — spawn the shed UNDER the unit
+you are testing, and `cat /proc/<vmm>/cgroup` to prove it.
 
 ## When you hit a NEW rough edge
 

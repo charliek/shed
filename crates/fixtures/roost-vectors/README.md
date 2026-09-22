@@ -2,7 +2,7 @@
 
 Byte-for-byte copies of roost's own golden wire vectors, taken from
 
-    github.com/charliek/roost @ ee71e44a1de3c0de4c59ac0267c0a5e0c993d88a
+    github.com/charliek/roost @ 8c91ce9ddd49c5a43841f72ecd149dd778d6151c
     tests/ipc-vectors/<same filename>
 
 which is the **same rev** `crates/Cargo.toml` pins `roost-ipc` to. They travel with
@@ -152,7 +152,7 @@ no-semantic-edits rule above governs the vendored vectors, not these.
 
 | file | what it pins | asserted by |
 |---|---|---|
-| `bootstrap/exec-chain-command.txt` | roost's candidate-ladder remote command, `roost_ipc::bootstrap::exec_chain_command(false)` | Rust (`shed-core/tests/roost_provider_vectors.rs`, against the LIVE function), Go (`internal/roostprovider`'s `ExecChainCommand` constant) and Dart (shed-mobile's `integration_test/roost_goldens_test.dart`, against `roostRemoteCommand()` — the string its roost tunnel hands `execute` verbatim) |
+| `bootstrap/exec-chain-command.txt` | roost's candidate-ladder remote command, `roost_ipc::bootstrap::exec_chain_command(false)` | Rust (`shed-core/tests/roost_provider_vectors.rs`, against the LIVE function), Go (`internal/roostprovider`'s `ExecChainCommand` value (built by `execChain`)) and Dart (shed-mobile's `integration_test/roost_goldens_test.dart`, against `roostRemoteCommand()` — the string its roost tunnel hands `execute` verbatim) |
 | `agent-table.json` | kind → binary → title for the six agents the roost provider can start | Rust (`launch_argv` + `roost_capabilities().kinds`), Go (`internal/roostprovider`'s `agentTable`) and Dart (the kind SET a machine's create form offers) |
 | `stderr-classes.json` | how a failed `ssh` exec classifies (`roost_ipc::ssh::classify_ssh_failure`), plus shed's own class → provider-row and class → `ReachKind` mappings | Rust (the live classifier, `classes`; and `shed_app::roost::ReachError`, `reach_kinds`), Go (`ClassifySSHFailure` + `ProviderRow`) and Dart (`classes` **and** `reach_kinds`, against shed-mobile's own port in `lib/ssh/roost_reach.dart`) |
 

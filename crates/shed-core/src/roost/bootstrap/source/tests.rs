@@ -15,12 +15,19 @@
 //! the client must refuse to follow.
 //!
 //! **What is NOT covered, and why:** rung 3 against the real
-//! `github.com/charliek/roost` release. [`RELEASE_PIN`] is `None` because no
-//! published roost release speaks session protocol
-//! [`SESSION_PROTOCOL_VERSION`], so there is no live asset to fetch and no
-//! honest way to fetch one. That is plan 019's stated external gate. Every
-//! clause of the fetch contract is exercised here against the fixture; what is
-//! untested is one URL.
+//! `github.com/charliek/roost` release. [`RELEASE_PIN`] now names one — roost
+//! v0.0.20, the first published release speaking session protocol
+//! [`SESSION_PROTOCOL_VERSION`] — but a unit test may not reach across the
+//! network to fetch it, so the same version is driven against the loopback
+//! fixture instead. Every clause of the fetch contract is exercised here; what
+//! is untested is one URL.
+//!
+//! **Nothing here resolves the real pin.** `resolve`/`preview` read
+//! [`RELEASE_PIN`], and a `resolve` that fell past the local rungs with the real
+//! pin in hand would download from github.com from a unit test. Rows about
+//! falling all the way to rung 4 therefore drive [`resolve_with`] with an
+//! explicit `None` pin — the no-pin control, which is also what keeps
+//! [`unavailable`]'s sentence covered now that the pin is set.
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -42,10 +49,16 @@ use super::*;
 
 const TARGET: &str = "roost:popos/p019-a";
 
-/// A version that is not [`LATEST_KNOWN_RELEASE`]'s — the tests that reach rung
-/// 3 are about a pin that does not exist yet, and borrowing today's version
-/// number would read like a claim that it does.
+/// The pinned release's version — [`LATEST_KNOWN_RELEASE`]'s, which is what
+/// [`RELEASE_PIN`] names. The rung-3 rows drive it against the loopback fixture
+/// rather than against the real release page.
 const VERSION: &str = "0.0.20";
+
+/// A real roost release from **before** protocol 6, deliberately not
+/// [`LATEST_KNOWN_RELEASE`]: the incumbent a host bootstrapped long ago — or one
+/// that installed a roost release itself — is still running. Older test data,
+/// labelled as such, never a claim about what the latest release is.
+const OLD_RELEASE: (&str, u32) = ("0.0.19", 2);
 
 // ============================================================================
 // The fixture server
@@ -439,34 +452,54 @@ fn sealed_env() -> SourceEnv {
     SourceEnv::default()
 }
 
+/// What rung 3 answers with when nothing overrides the base: the pinned release
+/// on roost's own downloads page. Built the way the code builds it, so a change
+/// to roost's tag spelling moves both together.
+fn pinned_asset() -> Source {
+    Source::Asset {
+        base: default_asset_base(VERSION).expect("the pinned version is a plain x.y.z"),
+        version: VERSION.to_string(),
+    }
+}
+
 // ============================================================================
 // The pin
 // ============================================================================
 
-/// The external gate, asserted rather than described.
+/// The external gate, now open — asserted rather than described.
+///
+/// Plan 019 §3.5 kept the asset rung behind a pin until a roost release spoke
+/// this generation; roost v0.0.20 does, and plan 023 §3.2 flipped it. What is
+/// asserted here is the invariant that survives the flip: the pin and the
+/// latest release shed knows of are **one** release, and it speaks the protocol
+/// this shed speaks. A pin naming a release that does not is the mistake this
+/// row exists to catch.
 #[test]
-fn nothing_is_pinned_until_a_current_protocol_release_ships() {
-    assert!(
-        RELEASE_PIN.is_none(),
-        "plan 019 §3.5: the asset rung stays behind a pin until a roost release speaks \
-         protocol {SESSION_PROTOCOL_VERSION}"
+fn the_pin_names_the_release_that_speaks_this_protocol() {
+    assert_eq!(LATEST_KNOWN_RELEASE, ("0.0.20", 6));
+    let (version, protocol) = LATEST_KNOWN_RELEASE;
+    assert_eq!(
+        RELEASE_PIN,
+        Some(RoostRelease { version }),
+        "the pin and the latest known release are one release, not two that have to agree"
     );
-    assert_eq!(LATEST_KNOWN_RELEASE, ("0.0.19", 2));
-    assert_ne!(
-        LATEST_KNOWN_RELEASE.1, SESSION_PROTOCOL_VERSION,
-        "if these ever agree, the pin above is what needs editing — not this test"
+    assert_eq!(
+        protocol, SESSION_PROTOCOL_VERSION,
+        "the pin may only name a release speaking the protocol this shed speaks — if these \
+         ever disagree, the pin above is what needs editing, not this test"
     );
 }
 
-/// Plan 019 §3.5's sentence, word for word, and built from the constants beside
-/// it rather than typed out.
+/// Today's rung-4 copy, word for word: the known release speaks this generation,
+/// so the sentence names what took rung 3 away instead of denying rung 3 exists.
 #[test]
-fn the_no_source_copy_is_the_one_the_plan_pinned() {
+fn the_no_source_copy_names_the_reason_the_asset_rung_did_not_answer() {
     assert_eq!(
         unavailable(TARGET),
         format!(
-            "no roost release speaking session protocol {SESSION_PROTOCOL_VERSION} is published \
-             yet (the latest, 0.0.19, speaks 2). On a Linux machine with a protocol-\
+            "the roost {VERSION} release asset is not usable for roost:popos/p019-a: either \
+             ROOST_SESSION_ASSET_BASE names a base shed refuses, or roost publishes no \
+             roost-session build for this architecture. On a Linux machine with a protocol-\
              {SESSION_PROTOCOL_VERSION} roost installed the desktop uses that roost-session; \
              otherwise point ROOST_SESSION_INSTALL_BIN at a protocol-{SESSION_PROTOCOL_VERSION} \
              build. roost:popos/p019-a was left untouched."
@@ -477,21 +510,69 @@ fn the_no_source_copy_is_the_one_the_plan_pinned() {
     assert_eq!(failure.stage, Stage::Source);
     assert_eq!(failure.message, unavailable(TARGET));
 
-    // The numbers are read, not written: a pin-flip PR that edits the constants
-    // and forgets the copy is the failure this catches.
-    let (version, protocol) = LATEST_KNOWN_RELEASE;
-    assert!(unavailable(TARGET).contains(&format!("the latest, {version}, speaks {protocol}")));
-    assert!(unavailable(TARGET).contains(&format!("session protocol {SESSION_PROTOCOL_VERSION}")));
+    // The version is read, not written: a re-pin that edits the constants and
+    // forgets the copy is the failure this catches.
+    let (version, _) = LATEST_KNOWN_RELEASE;
+    assert!(
+        unavailable(TARGET).contains(&format!("the roost {version} release asset is not usable"))
+    );
+    // The generation is named too — in the tail, which both branches share.
+    assert!(unavailable(TARGET).contains(&format!("protocol-{SESSION_PROTOCOL_VERSION}")));
+}
+
+/// Plan 019 §3.5's sentence, word for word — **still produced**, when the known
+/// release speaks something other than this generation.
+///
+/// That is the pre-flip world, and it is what an injected `None` pin means to
+/// every other row in this file. Driven through [`unavailable_for`] because the
+/// shipped constants make the branch unreachable otherwise, and an untested
+/// branch is a branch that rots.
+#[test]
+fn the_older_shape_still_gets_the_sentence_plan_019_pinned() {
+    let (version, protocol) = OLD_RELEASE;
+    assert_eq!(
+        unavailable_for(TARGET, OLD_RELEASE),
+        format!(
+            "no roost release speaking session protocol {SESSION_PROTOCOL_VERSION} is published \
+             yet (the latest, 0.0.19, speaks 2). On a Linux machine with a protocol-\
+             {SESSION_PROTOCOL_VERSION} roost installed the desktop uses that roost-session; \
+             otherwise point ROOST_SESSION_INSTALL_BIN at a protocol-{SESSION_PROTOCOL_VERSION} \
+             build. roost:popos/p019-a was left untouched."
+        )
+    );
+    assert!(unavailable_for(TARGET, OLD_RELEASE)
+        .contains(&format!("the latest, {version}, speaks {protocol}")));
+
+    // One function, two branches, and the tail every consumer keys on is the
+    // same in both — including the ending `copy` and the desktop pane match on.
+    for sentence in [unavailable(TARGET), unavailable_for(TARGET, OLD_RELEASE)] {
+        assert!(
+            sentence.ends_with(&format!("{TARGET} was left untouched.")),
+            "{sentence}"
+        );
+        assert!(sentence.contains("ROOST_SESSION_INSTALL_BIN"), "{sentence}");
+    }
+    assert_eq!(
+        unavailable(TARGET),
+        unavailable_for(TARGET, LATEST_KNOWN_RELEASE),
+        "`unavailable` is `unavailable_for` with the shipped constants and nothing else"
+    );
 }
 
 /// With no pin there is no asset rung, so a client with nothing else lands on
 /// rung 4 — and the preview says why.
+///
+/// **The no-pin control.** [`RELEASE_PIN`] is set now, so this shape is no
+/// longer what a real client meets; the pin is injected as `None` to keep rung
+/// 4 — and [`unavailable`]'s sentence, and `asset_source`'s "no roost release is
+/// pinned" skip — covered rather than deleted along with the world that used to
+/// produce them. Its asset-shape twin is the row below.
 #[tokio::test]
-async fn a_client_with_no_rungs_lands_on_no_source() {
+async fn a_client_with_no_rungs_and_no_pin_lands_on_no_source() {
     let (_dir, scratch_path) = scratch();
     let env = sealed_env();
 
-    let previewed = preview(&env, TARGET, "amd64");
+    let previewed = preview_with(&env, TARGET, "amd64", None);
     assert_eq!(previewed.source, Source::None);
     assert!(!previewed.available());
     assert_eq!(previewed.describe(TARGET), unavailable(TARGET));
@@ -504,11 +585,41 @@ async fn a_client_with_no_rungs_lands_on_no_source() {
         previewed.skipped
     );
 
-    let failure = resolve(&env, TARGET, "amd64", &scratch_path)
+    let failure = resolve_with(&env, TARGET, "amd64", None, &scratch_path, Limits::DEFAULT)
         .await
         .expect_err("nothing can supply these bytes");
     assert_eq!(failure.stage, Stage::Source);
     assert_eq!(failure.message, unavailable(TARGET));
+}
+
+/// The same client, against the pin a real one reads: rung 3 answers, and the
+/// consent card names the release rather than saying there is nothing.
+///
+/// A preview resolves nothing, which is the whole reason this row can assert the
+/// real pin at all — the matching `resolve` would download from github.com.
+#[test]
+fn a_client_with_no_local_rungs_lands_on_the_pinned_asset() {
+    let env = sealed_env();
+
+    let previewed = preview(&env, TARGET, "amd64");
+    assert_eq!(previewed.source, pinned_asset());
+    assert!(previewed.available());
+    assert_eq!(previewed.fallback, None);
+    assert_eq!(
+        previewed.describe(TARGET),
+        format!(
+            "roost-session {VERSION} from https://github.com/charliek/roost/releases/download/\
+             v{VERSION}, checksum-verified"
+        )
+    );
+    assert!(
+        !previewed
+            .skipped
+            .iter()
+            .any(|why| why.contains("no roost release is pinned")),
+        "the asset rung is not gated any more: {:?}",
+        previewed.skipped
+    );
 }
 
 // ============================================================================
@@ -556,7 +667,7 @@ async fn the_override_rung_wins_over_the_sibling() {
     let app = dir.0.join("app");
     write_exec(
         &app.join("roost-session"),
-        &fake_session("0.0.19", SESSION_PROTOCOL_VERSION),
+        &fake_session(VERSION, SESSION_PROTOCOL_VERSION),
     );
     let override_bin = dir.0.join("chosen");
     let machine = match local {
@@ -772,15 +883,17 @@ async fn the_sibling_rung_is_taken_when_it_speaks_the_current_protocol() {
     let (dir, scratch_path) = scratch();
     let app = dir.0.join("app");
     let session = app.join("roost-session");
-    write_exec(&session, &fake_session("0.0.19", SESSION_PROTOCOL_VERSION));
+    write_exec(&session, &fake_session(VERSION, SESSION_PROTOCOL_VERSION));
     let env = SourceEnv {
         caller_exe: Some(app.join("shed-desktop")),
         ..sealed_env()
     };
 
     let Some(local) = client_arch() else {
+        // Off Linux the sibling rung is skipped by the code under test, and the
+        // ladder lands on the pinned asset instead.
         let previewed = preview(&env, TARGET, "amd64");
-        assert_eq!(previewed.source, Source::None);
+        assert_eq!(previewed.source, pinned_asset());
         assert!(
             previewed
                 .skipped
@@ -799,8 +912,66 @@ async fn the_sibling_rung_is_taken_when_it_speaks_the_current_protocol() {
             path: session.display().to_string()
         }
     );
-    // No pin, so the fall-through is nothing — and the card says so rather than
-    // promising a sibling it has not yet run.
+    // The pin is set, so the fall-through is the release asset — and the card
+    // names it rather than promising a sibling it has not yet run.
+    assert_eq!(previewed.fallback, Some(pinned_asset()));
+    assert_eq!(
+        previewed.describe(TARGET),
+        format!(
+            "the roost-session beside this app ({}) — or roost-session {VERSION} from \
+             https://github.com/charliek/roost/releases/download/v{VERSION}, checksum-verified, \
+             if it turns out not to speak session protocol {SESSION_PROTOCOL_VERSION}",
+            session.display()
+        )
+    );
+
+    // `resolve_with(.., None, ..)` and not `resolve`: the preview above already
+    // proved the real pin sits under the sibling, and resolution must not be
+    // able to fall past a sibling that fails to spawn onto a live GitHub
+    // download from a unit test (astra review finding).
+    let handle = resolve_with(
+        &env,
+        TARGET,
+        local.as_str(),
+        None,
+        &scratch_path,
+        Limits::DEFAULT,
+    )
+    .await
+    .expect("the sibling rung");
+    assert_eq!(
+        handle.origin(),
+        format!("the roost-session beside this app ({})", session.display())
+    );
+    assert_eq!(handle.sha256(), None);
+    assert_eq!(
+        drain(&handle),
+        fake_session(VERSION, SESSION_PROTOCOL_VERSION).into_bytes()
+    );
+}
+
+/// The fall-through clause's other half: a sibling with **nothing** under it.
+///
+/// `None` pin, because [`RELEASE_PIN`] is set and rung 3 now catches every
+/// architecture roost builds for — so "and nothing else" is the wording a real
+/// client meets only when something has taken rung 3 away. It is still the only
+/// honest card for that case, and deleting its coverage along with the world
+/// that used to produce it by default would be how it silently rots.
+#[test]
+fn a_sibling_with_nothing_under_it_says_so_on_the_card() {
+    let Some(local) = client_arch() else {
+        return; // no sibling rung off Linux.
+    };
+    let dir = ScratchDir::with_prefix("shed-bootstrap-fallthrough");
+    let app = dir.0.join("app");
+    let session = app.join("roost-session");
+    write_exec(&session, &fake_session(VERSION, SESSION_PROTOCOL_VERSION));
+    let env = SourceEnv {
+        caller_exe: Some(app.join("shed-desktop")),
+        ..sealed_env()
+    };
+
+    let previewed = preview_with(&env, TARGET, local.as_str(), None);
     assert_eq!(previewed.fallback, Some(Source::None));
     assert_eq!(
         previewed.describe(TARGET),
@@ -810,29 +981,21 @@ async fn the_sibling_rung_is_taken_when_it_speaks_the_current_protocol() {
             session.display()
         )
     );
-
-    let handle = resolve(&env, TARGET, local.as_str(), &scratch_path)
-        .await
-        .expect("the sibling rung");
-    assert_eq!(
-        handle.origin(),
-        format!("the roost-session beside this app ({})", session.display())
-    );
-    assert_eq!(handle.sha256(), None);
-    assert_eq!(
-        drain(&handle),
-        fake_session("0.0.19", SESSION_PROTOCOL_VERSION).into_bytes()
-    );
 }
 
 /// Pin P3's arch gate, and the copy that names the arch.
+///
+/// The preview half runs against the **real** pin, so what it asserts is that
+/// the arch skip is recorded even though the ladder has somewhere else to go.
+/// The fall-through half drives a `None` pin: with the real one the ladder would
+/// fall past the sibling straight onto a github.com download.
 #[tokio::test]
 async fn a_sibling_for_another_architecture_is_skipped_and_the_copy_names_it() {
     let (dir, scratch_path) = scratch();
     let app = dir.0.join("app");
     write_exec(
         &app.join("roost-session"),
-        &fake_session("0.0.19", SESSION_PROTOCOL_VERSION),
+        &fake_session(VERSION, SESSION_PROTOCOL_VERSION),
     );
     let env = SourceEnv {
         caller_exe: Some(app.join("shed-desktop")),
@@ -851,22 +1014,38 @@ async fn a_sibling_for_another_architecture_is_skipped_and_the_copy_names_it() {
     let remote = client_arch().map_or(RemoteArch::Arm64, other_arch);
 
     let previewed = preview(&env, TARGET, remote.as_str());
-    assert_eq!(previewed.source, Source::None);
+    assert_eq!(previewed.source, pinned_asset());
     assert!(
         previewed.skipped.contains(&expected),
         "the skip names the arch: {:?}",
         previewed.skipped
     );
+    assert_eq!(
+        preview_with(&env, TARGET, remote.as_str(), None).source,
+        Source::None,
+        "and with nothing below it, the same skip is the end of the ladder"
+    );
 
     // And the ladder really does fall past it, rather than merely saying so.
-    let failure = resolve(&env, TARGET, remote.as_str(), &scratch_path)
-        .await
-        .expect_err("a sibling for another arch is not a source");
+    let failure = resolve_with(
+        &env,
+        TARGET,
+        remote.as_str(),
+        None,
+        &scratch_path,
+        Limits::DEFAULT,
+    )
+    .await
+    .expect_err("a sibling for another arch is not a source");
     assert_eq!(failure.message, unavailable(TARGET));
 }
 
-/// shed's gate is the protocol number: today's released `roost-session` speaks
-/// 2, and it is not a source however real a binary it is.
+/// shed's gate is the protocol number: a `roost-session` from an older roost
+/// release speaks an older one, and it is not a source however real a binary it
+/// is.
+///
+/// The fall-through is driven with a `None` pin for the row above's reason — the
+/// claim under test is that rung 2 is *left*, not which rung catches it.
 #[tokio::test]
 async fn a_sibling_that_speaks_the_wrong_protocol_falls_through() {
     let Some(local) = client_arch() else {
@@ -876,7 +1055,7 @@ async fn a_sibling_that_speaks_the_wrong_protocol_falls_through() {
     let app = dir.0.join("app");
     write_exec(
         &app.join("roost-session"),
-        &fake_session(LATEST_KNOWN_RELEASE.0, LATEST_KNOWN_RELEASE.1),
+        &fake_session(OLD_RELEASE.0, OLD_RELEASE.1),
     );
     let env = SourceEnv {
         caller_exe: Some(app.join("shed-desktop")),
@@ -890,13 +1069,23 @@ async fn a_sibling_that_speaks_the_wrong_protocol_falls_through() {
         preview(&env, TARGET, local.as_str()).source,
         Source::Sibling { .. }
     ));
-    let failure = resolve(&env, TARGET, local.as_str(), &scratch_path)
-        .await
-        .expect_err("protocol 2 is not a source");
+    let failure = resolve_with(
+        &env,
+        TARGET,
+        local.as_str(),
+        None,
+        &scratch_path,
+        Limits::DEFAULT,
+    )
+    .await
+    .expect_err("an older generation is not a source");
     assert_eq!(failure.message, unavailable(TARGET));
 }
 
 /// A binary too old to know `identify` at all is the same answer.
+///
+/// `None` pin, for [`a_sibling_that_speaks_the_wrong_protocol_falls_through`]'s
+/// reason.
 #[tokio::test]
 async fn a_sibling_that_will_not_identify_falls_through() {
     let Some(local) = client_arch() else {
@@ -909,9 +1098,16 @@ async fn a_sibling_that_will_not_identify_falls_through() {
         caller_exe: Some(app.join("shed-desktop")),
         ..sealed_env()
     };
-    let failure = resolve(&env, TARGET, local.as_str(), &scratch_path)
-        .await
-        .expect_err("a binary that says nothing is not a source");
+    let failure = resolve_with(
+        &env,
+        TARGET,
+        local.as_str(),
+        None,
+        &scratch_path,
+        Limits::DEFAULT,
+    )
+    .await
+    .expect_err("a binary that says nothing is not a source");
     assert_eq!(failure.message, unavailable(TARGET));
 }
 
@@ -937,9 +1133,16 @@ async fn a_flooding_identify_is_read_only_to_the_cap() {
         ..sealed_env()
     };
 
-    let failure = resolve(&env, TARGET, local.as_str(), &scratch_path)
-        .await
-        .expect_err("a binary that answers `identify` with noise is not a source");
+    let failure = resolve_with(
+        &env,
+        TARGET,
+        local.as_str(),
+        None,
+        &scratch_path,
+        Limits::DEFAULT,
+    )
+    .await
+    .expect_err("a binary that answers `identify` with noise is not a source");
     assert_eq!(failure.message, unavailable(TARGET));
     assert!(
         !finished.exists(),
@@ -1524,17 +1727,20 @@ async fn the_public_fetch_takes_roosts_arch_spellings() {
 }
 
 // ============================================================================
-// The pin flip, rehearsed
+// The pin flip, rehearsed — and now performed
 // ============================================================================
 
-/// **The one-line follow-up, proven to be one line.**
+/// **The one-line follow-up, proven to be one line — and this row is the
+/// receipt.**
 ///
-/// Everything below runs the real ladder with a pin supplied, which is exactly
-/// what `RELEASE_PIN = Some(...)` will do — so the day a roost release speaking
-/// the pinned protocol ships, the change is the constant and nothing else. This
-/// is the closest an
-/// automated test can get to the live asset path while the external gate is
-/// shut, and it is deliberately not described as covering it.
+/// It ran with a pin supplied back when [`RELEASE_PIN`] was still `None`, which
+/// is exactly what `Some(...)` would do; plan 023 §3.2 set the constant, this
+/// row did not move, and that is what "the change is the constant and nothing
+/// else" meant. It is still driven through [`preview_with`]/[`resolve_with`]
+/// against the loopback fixture rather than through [`preview`]/[`resolve`]:
+/// what those two read is a real release URL, and a unit test does not fetch
+/// across the network. So this remains the closest an automated test gets to the
+/// live asset path, and is deliberately not described as covering it.
 #[tokio::test]
 async fn the_asset_rung_is_one_pin_away() {
     let fixture = Fixture::start().await;

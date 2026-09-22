@@ -3,8 +3,10 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -43,6 +45,15 @@ type fakeShed struct {
 	sshBin string
 	// requests is the file every request line the bridge saw is appended to.
 	requests string
+	// starts is the file every `roost-session start` invocation is appended
+	// to, one line each.
+	starts string
+	// protocol is what `session.identify` answers with. 0 means the vendored
+	// vector's own (v6, which is this side's SpokenProtocol).
+	protocol int
+	// tabs is the set `tab.list` currently answers with, kept so one reply can
+	// be restaged without rewriting the others from nothing.
+	tabs []roostprovider.Tab
 }
 
 // newFakeShed builds the rig. tabs are the tabs `tab.list` reports, filed
@@ -59,6 +70,7 @@ func newFakeShed(t *testing.T, tabs []roostprovider.Tab, withLanding bool) *fake
 		t:        t,
 		home:     home,
 		requests: filepath.Join(dir, "requests.ndjson"),
+		starts:   filepath.Join(dir, "starts.log"),
 		sshBin:   filepath.Join(dir, "ssh"),
 	}
 	// The landing dir is named whether or not it exists: a shed's server
@@ -111,10 +123,28 @@ PATH=/usr/bin:/bin; export PATH
 exec /bin/sh -c "$cmd"
 `
 
-// fakeSessionScript is the fake `roost-session`. Only `client-bridge` is
-// reachable from this package: one request line in, the staged answer out.
+// fakeSessionScript is the fake `roost-session`. Two subcommands are reachable
+// from this package: `client-bridge` (one request line in, the staged answer
+// out) and `start` (the recovery rung's readiness verdict).
+//
+// `start` answers from files the test stages (stageStart), one entry per call
+// with the last repeating, because the thing under test is how the verdict
+// CHANGES across consecutive starts. Every call is logged, so "how many starts
+// did this attach make" is an assertion rather than an inference — which is
+// what the one-recovery pin rests on.
+//
+// A `bridge.<op>` script, when one is staged, REPLACES that op's reply — the
+// only way to express a bridge that accepts a request and then fails rather
+// than answering (it hangs, or it refuses on stderr with an exit code). The
+// request line is logged before the script runs either way, so a stalled call
+// is still a call that happened.
 const fakeSessionScript = `#!/bin/sh
 case "$1" in
+  start)
+    printf 'start\n' >> __START_LOG__
+    n=$(wc -l < __START_LOG__ | tr -d ' ')
+    [ -f __DIR__/start.$n ] || n=last
+    exec /bin/sh __DIR__/start.$n ;;
   client-bridge)
     line=$(head -n 1)
     printf '%s\n' "$line" >> __REQUEST_LOG__
@@ -126,6 +156,7 @@ case "$1" in
       *tab.set_title*) op=tabsettitle ;;
       *tab.close*) op=tabclose ;;
     esac
+    if [ -f __DIR__/bridge.$op ]; then exec /bin/sh __DIR__/bridge.$op; fi
     cat __DIR__/reply.$op.ndjson ;;
   *) printf '%s\n' "fake roost-session: unknown subcommand $1" >&2; exit 2 ;;
 esac
@@ -141,7 +172,121 @@ func (f *fakeShed) sessionScript(dir string) string {
 	return strings.NewReplacer(
 		"__DIR__", shellQuoteArg(dir),
 		"__REQUEST_LOG__", shellQuoteArg(f.requests),
+		"__START_LOG__", shellQuoteArg(f.starts),
 	).Replace(fakeSessionScript)
+}
+
+// startReply is one staged answer to `roost-session start`: what it prints,
+// what it says on stderr, how long it takes, and how it exits.
+type startReply struct {
+	stdout string
+	stderr string
+	// sleep is seconds the start hangs for AFTER printing — the shape a budget
+	// has to cut short.
+	sleep int
+	exit  int
+}
+
+// notInstalledStart is roost's own fall-through, byte for byte: what the exec
+// chain prints when no rung is executable. Staged as a `start` answer rather
+// than produced by removing the fake binary, because the ladder's four
+// ABSOLUTE rungs (/usr/bin, linuxbrew, the two nix profiles) are real paths on
+// the machine running the test — so "the far side has no roost-session" is not
+// a state this rig can produce by omission, only by replay. (The provider
+// package's rig makes the same call, and logs which half it ran.)
+var notInstalledStart = startReply{stderr: "roost-session: command not found\n", exit: 127}
+
+// startScript renders one reply as the shell the fake `start` execs. The reply
+// IS the script — one file per call rather than a sidecar per field, so there
+// is nothing to probe for and no way to stage half of one.
+func startScript(reply startReply) string {
+	var b strings.Builder
+	if reply.stdout != "" {
+		b.WriteString("printf '%s' " + shellQuoteArg(reply.stdout) + "\n")
+	}
+	if reply.stderr != "" {
+		b.WriteString("printf '%s' " + shellQuoteArg(reply.stderr) + " >&2\n")
+	}
+	if reply.sleep != 0 {
+		b.WriteString("sleep " + strconv.Itoa(reply.sleep) + "\n")
+	}
+	b.WriteString("exit " + strconv.Itoa(reply.exit) + "\n")
+	return b.String()
+}
+
+// stageStart lays down the answers `roost-session start` gives, in order. The
+// LAST one repeats for every call after it.
+func (f *fakeShed) stageStart(replies ...startReply) {
+	f.t.Helper()
+	if len(replies) == 0 {
+		f.t.Fatal("stageStart needs at least one reply")
+	}
+	dir := filepath.Dir(f.requests)
+	for i, reply := range replies {
+		writeTestFile(f.t, filepath.Join(dir, "start."+strconv.Itoa(i+1)), startScript(reply), 0o644)
+	}
+	// The slot every call past the staged set falls back to.
+	writeTestFile(f.t, filepath.Join(dir, "start.last"), startScript(replies[len(replies)-1]), 0o644)
+}
+
+// startCalls is how many times `roost-session start` ran on the far side.
+func (f *fakeShed) startCalls() int {
+	f.t.Helper()
+	data, err := os.ReadFile(f.starts)
+	if os.IsNotExist(err) {
+		return 0
+	}
+	if err != nil {
+		f.t.Fatalf("reading the start log: %v", err)
+	}
+	return strings.Count(string(data), "\n")
+}
+
+// stallIdentify makes `session.identify` accept the request and never answer:
+// the far-side bridge is alive, the socket took the call, and nothing comes
+// back. The shape a hung session (or a stalled link) has, and the one that must
+// NOT be read as "there is no session over there".
+func (f *fakeShed) stallIdentify(seconds int) {
+	f.t.Helper()
+	writeTestFile(f.t, filepath.Join(filepath.Dir(f.requests), "bridge.identify"),
+		"sleep "+strconv.Itoa(seconds)+"\n", 0o644)
+}
+
+// refuseIdentifyWithNoSession makes `session.identify` fail the way roost's own
+// bridge does when nothing is listening — its exact stderr substring (the one
+// ClassifySSHFailure matches on) and exit 1, which roost chose over ssh's 255
+// so a client can tell a refusal from a transport failure.
+func (f *fakeShed) refuseIdentifyWithNoSession() {
+	f.t.Helper()
+	f.refuseIdentifyWithNoSessionExit(1)
+}
+
+// refuseIdentifyWithNoSessionExit is the same stderr with a chosen exit code —
+// the bridge's own refusal exits 1; anything else carrying that substring is a
+// blob whose exit status, not its text, is what shed must believe.
+func (f *fakeShed) refuseIdentifyWithNoSessionExit(code int) {
+	f.t.Helper()
+	writeTestFile(f.t, filepath.Join(filepath.Dir(f.requests), "bridge.identify"),
+		"printf '%s\\n' 'client-bridge: no session is listening at "+
+			"/run/user/1000/roost/session.sock; run roostctl session start on this machine' >&2\n"+
+			fmt.Sprintf("exit %d\n", code), 0o644)
+}
+
+// setIdentifyReply overwrites `session.identify`'s answer with one line. For
+// the replies a vendored vector cannot express: a well-formed envelope that is
+// semantically nothing.
+func (f *fakeShed) setIdentifyReply(line string) {
+	f.t.Helper()
+	writeTestFile(f.t, filepath.Join(filepath.Dir(f.requests), "reply.identify.ndjson"), line+"\n", 0o644)
+}
+
+// setProtocol restages `session.identify` to answer with a different protocol.
+// The vendored vector is v6 — this side's own SpokenProtocol — so a mismatch
+// has to be written on purpose.
+func (f *fakeShed) setProtocol(protocol int) {
+	f.t.Helper()
+	f.protocol = protocol
+	f.writeReplies(filepath.Dir(f.requests), f.tabs)
 }
 
 // writeReplies lays down the NDJSON the fake bridge answers with, built from
@@ -150,9 +295,15 @@ func (f *fakeShed) sessionScript(dir string) string {
 func (f *fakeShed) writeReplies(dir string, tabs []roostprovider.Tab) {
 	t := f.t
 	t.Helper()
+	// Remembered so a later restage of one reply (setProtocol) does not drop
+	// the tabs another one staged.
+	f.tabs = tabs
 
 	identify := readShedVector(t, "session.identify.response.v6.json")
 	identify["id"] = "1"
+	if f.protocol != 0 {
+		identify["result"].(map[string]any)["session_protocol"] = f.protocol
+	}
 	writeTestFile(t, filepath.Join(dir, "reply.identify.ndjson"), compactShedLine(t, identify), 0o644)
 
 	// `tab.open`'s answer is roost's vector verbatim but for the envelope id,
