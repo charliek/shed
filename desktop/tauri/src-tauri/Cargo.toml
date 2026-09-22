@@ -60,7 +60,7 @@ reqwest = { version = "0.12", default-features = false }
 # `crates/Cargo.toml`'s workspace pin, and it MUST stay in lockstep with it: two
 # revs would put two copies of the crate in this tree and `shed_app::roost`'s
 # signatures would stop accepting these types. Bump both together.
-roost-ipc = { git = "https://github.com/charliek/roost", rev = "ee71e44a1de3c0de4c59ac0267c0a5e0c993d88a" }
+roost-ipc = { git = "https://github.com/charliek/roost", rev = "8c91ce9ddd49c5a43841f72ecd149dd778d6151c" }
 # The tracing FACADE, for the one thing this crate has to say that must NOT
 # reach the app log: the raw error of a failed gx discovery probe, which can
 # carry the remote's stdout and therefore the token (`TauriGxCredentials`). No

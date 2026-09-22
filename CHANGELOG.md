@@ -66,7 +66,10 @@ verbatim._
 - **shed re-pins to roost's session protocol 6, in two steps — 5 then 6 — completing the
   migration plan 019 left in motion (plan 020, roost#477 / roost plan 061; plan 021, roost
   plan 064 / roost#489).** `roost-ipc` moved to `c1bfe887bc843e35466a1dcc33fa2390909fd50e`
-  for protocol 5, then to `ee71e44a1de3c0de4c59ac0267c0a5e0c993d88a` for protocol 6, in
+  for protocol 5, then to `ee71e44a1de3c0de4c59ac0267c0a5e0c993d88a` for protocol 6, and
+  finally to `8c91ce9ddd49c5a43841f72ecd149dd778d6151c` — the **roost v0.0.20 release tag**,
+  the first published roost that speaks 6 (the `roost-ipc` crate is byte-identical to
+  `ee71e44`'s; the tag is what makes it a rev somebody ships) — in
   every manifest that pins it (`crates/Cargo.toml`, the Tauri crate's, and — once
   shed-mobile's own re-pin lands — its `rust/Cargo.toml`). **Protocol 5 retired the
   lease.** The lease is gone from the wire with no replacement: `session.connect`, the

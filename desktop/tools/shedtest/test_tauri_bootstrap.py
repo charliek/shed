@@ -1391,14 +1391,15 @@ def _real_session_binary() -> Path | None:
 
     `SHED_TAURI_ROOST_SESSION_BIN` is the same knob the machine suite's
     `real_roost` cell uses; a build cache beside the pinned rev is the default
-    because that is where this repo's only current-generation binary lives
-    (roost's own releases still speak 2). The default path carries the
+    because that is where a current-generation binary built from the exact
+    pinned rev lives (a clean `git archive` of it, per the plan-014 recipe;
+    roost v0.0.20 is that rev). The default path carries the
     PINNED rev, so a re-pin that nobody has built for skips this cell rather than
     quietly testing the previous generation's binary. **Read-only — never
     rebuilt here**: roost's tree is not this repo's to compile.
     """
     raw = os.environ.get("SHED_TAURI_ROOST_SESSION_BIN") or str(
-        Path.home() / ".cache/shed-plan021/roost-ee71e44/target/release/roost-session"
+        Path.home() / ".cache/shed-plan023/roost-8c91ce9/target/release/roost-session"
     )
     path = Path(raw).expanduser()
     return path if os.access(path, os.X_OK) else None

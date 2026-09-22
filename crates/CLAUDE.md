@@ -184,7 +184,8 @@ the pin (plan 021 found exactly that: both had hard-coded "this shed speaks 5" b
 switched to the constant).
 
 **What session protocol 6 gave us (plan 021), on top of what 5 already gave us.** The pin is at
-`ee71e44…` and shed speaks generation **6**. Protocol 4's lease (roost R1, plan 014) stayed
+`8c91ce9…` (roost **v0.0.20**, the first release that speaks 6; the `roost-ipc` crate is
+byte-identical to `ee71e44…`, where 6 landed) and shed speaks generation **6**. Protocol 4's lease (roost R1, plan 014) stayed
 gone — not narrowed, retired outright, with no replacement — and everything protocol 5 gave
 (below) carries forward unchanged; 6's own changes are the second list further down:
 
