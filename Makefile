@@ -1,4 +1,4 @@
-.PHONY: build build-cli build-server build-egress-proxy build-agent build-firstboot build-tools build-fc-remote-server test test-integration test-host-agent-diff test-integration-dev test-integration-dev-fc dev-server-up dev-server-down dev-server-status dev-server-logs dev-server-restart dev-server-up-fc dev-server-down-fc dev-server-status-fc dev-server-logs-fc dev-server-restart-fc release clean dev-server dev-cli check check-kernel-pin coverage lint-all docs docs-serve firecracker-rootfs download-firecracker vz-rootfs vz-rootfs-base vz-rootfs-all
+.PHONY: build build-cli build-server build-egress-proxy build-agent build-firstboot build-tools build-fc-remote-server test test-integration test-host-agent-diff test-integration-dev test-integration-dev-fc dev-server-up dev-server-down dev-server-status dev-server-logs dev-server-restart dev-server-up-fc dev-server-down-fc dev-server-status-fc dev-server-logs-fc dev-server-restart-fc release clean dev-server dev-cli check check-kernel-pin check-roost-pin coverage lint-all docs docs-serve firecracker-rootfs download-firecracker vz-rootfs vz-rootfs-base vz-rootfs-all
 
 GOARCH ?= $(shell go env GOARCH)
 
@@ -408,6 +408,7 @@ test-integration-dev: build
 	  SHED_VZ_DEV_SERVER=$(SHED_VZ_DEV_SERVER) \
 	  SHED_VZ_DEV_LOG_PATH=$(DEV_LOG_PATH) \
 	  SHED_DEV_AUTH_MODE=$(SHED_DEV_AUTH_MODE) \
+	  SHED_IMAGE_HAS_ROOST=vz \
 	  $(MAKE) test-integration
 
 # Parallel dev shed-server lifecycle (FC remote).
@@ -675,6 +676,7 @@ test-integration-dev-fc:
 	  SHED_FC_DEV_SERVER=$(SHED_FC_DEV_SERVER) \
 	  SHED_FC_DEV_LOG_PATH=$(FC_DEV_LOG_PATH) \
 	  SHED_DEV_AUTH_MODE=$(SHED_DEV_AUTH_MODE) \
+	  SHED_IMAGE_HAS_ROOST=fc \
 	  $(MAKE) test-integration
 
 # Cross-compile for release
@@ -772,8 +774,41 @@ check-kernel-pin:
 	 fi ; \
 	 echo "kernel pin OK: $$vz"
 
+# check-roost-pin: the roost-session version + protocol baked into both
+# rootfs Dockerfiles (ARG ROOST_SESSION_VERSION / ROOST_SESSION_PROTOCOL)
+# must match the Rust source of truth: RELEASE_PIN's version and
+# LATEST_KNOWN_RELEASE's protocol in crates/shed-core/src/roost/bootstrap/source.rs.
+# Modeled on check-kernel-pin above — same fail-fast-on-drift shape.
+check-roost-pin:
+	@vz_v=$$(awk -F= '/^ARG ROOST_SESSION_VERSION=/ { print $$2; exit }' vz/Dockerfile) ; \
+	 fc_v=$$(awk -F= '/^ARG ROOST_SESSION_VERSION=/ { print $$2; exit }' firecracker/Dockerfile) ; \
+	 vz_p=$$(awk -F= '/^ARG ROOST_SESSION_PROTOCOL=/ { print $$2; exit }' vz/Dockerfile) ; \
+	 fc_p=$$(awk -F= '/^ARG ROOST_SESSION_PROTOCOL=/ { print $$2; exit }' firecracker/Dockerfile) ; \
+	 pin_v=$$(sed -n 's/^pub const RELEASE_PIN: .*RoostRelease { version: "\([0-9.][0-9.]*\)".*/\1/p' crates/shed-core/src/roost/bootstrap/source.rs | head -1) ; \
+	 known_p=$$(sed -n 's/^pub const LATEST_KNOWN_RELEASE: .*= ("[0-9.]*", \([0-9][0-9]*\)).*/\1/p' crates/shed-core/src/roost/bootstrap/source.rs | head -1) ; \
+	 if [ -z "$$vz_v" ] || [ -z "$$fc_v" ] || [ -z "$$vz_p" ] || [ -z "$$fc_p" ] || [ -z "$$pin_v" ] || [ -z "$$known_p" ]; then \
+	   echo "ERROR: roost-session pin values missing:" ; \
+	   echo "  vz/Dockerfile ARG ROOST_SESSION_VERSION:           $$vz_v" ; \
+	   echo "  firecracker/Dockerfile ARG ROOST_SESSION_VERSION:  $$fc_v" ; \
+	   echo "  vz/Dockerfile ARG ROOST_SESSION_PROTOCOL:          $$vz_p" ; \
+	   echo "  firecracker/Dockerfile ARG ROOST_SESSION_PROTOCOL: $$fc_p" ; \
+	   echo "  RELEASE_PIN version:                               $$pin_v" ; \
+	   echo "  LATEST_KNOWN_RELEASE protocol:                     $$known_p" ; \
+	   exit 1 ; \
+	 fi ; \
+	 if [ "$$vz_v" != "$$fc_v" ] || [ "$$vz_v" != "$$pin_v" ] || [ "$$vz_p" != "$$fc_p" ] || [ "$$vz_p" != "$$known_p" ]; then \
+	   echo "ERROR: roost-session pin drifted:" ; \
+	   echo "  vz/Dockerfile:          version=$$vz_v protocol=$$vz_p" ; \
+	   echo "  firecracker/Dockerfile: version=$$fc_v protocol=$$fc_p" ; \
+	   echo "  crates/shed-core RELEASE_PIN version:            $$pin_v" ; \
+	   echo "  crates/shed-core LATEST_KNOWN_RELEASE protocol:  $$known_p" ; \
+	   echo "Bump in lockstep (see docs/reference/images.md)." ; \
+	   exit 1 ; \
+	 fi ; \
+	 echo "roost-session pin OK: $$vz_v / protocol $$vz_p"
+
 # Run all checks (lint + test + kernel pin)
-check: check-kernel-pin lint test
+check: check-kernel-pin check-roost-pin lint test
 
 # Run tests with coverage
 coverage:
