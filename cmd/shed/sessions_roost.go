@@ -163,16 +163,7 @@ func (r *roostSessions) runningSheds(servers []namedServer, only string) []roost
 			if shed.Status != config.StatusRunning {
 				continue
 			}
-			// `--all` IGNORES a positional shed argument in the tmux half
-			// (collectSessions calls ListAllSessions and never looks at it),
-			// so filtering here would have produced a listing that showed
-			// every shed's tmux rows but only one shed's roost tabs — the
-			// same command answering two different questions at once.
-			// Consistency with the floor wins; `shed sessions --all <shed>`
-			// silently ignoring its argument is a pre-existing wart, filed
-			// rather than changed here, because fixing it means changing what
-			// the tmux half has always printed.
-			if !sessionsAllFlag && only != "" && shed.Name != only {
+			if only != "" && shed.Name != only {
 				continue
 			}
 			out = append(out, roostprovider.RunningShed{

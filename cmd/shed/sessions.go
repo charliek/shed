@@ -39,8 +39,29 @@ Examples:
   shed sessions --all           # List across all servers
   shed sessions --tmux          # tmux rows only, even with roost running
   shed sessions --json          # Output as JSON`,
-	Args: cobra.MaximumNArgs(1),
+	Args: sessionsArgs,
 	RunE: runSessions,
+}
+
+// sessionsArgs refuses `--all` together with a positional shed argument,
+// before either half of runSessions makes a single API or roostctl call.
+//
+// Cobra parses flags before it calls Args (Command.execute in
+// github.com/spf13/cobra: c.ParseFlags(a) runs, then c.ValidateArgs(argWoFlags)
+// -- which calls c.Args(c, args) -- runs after), so the flag is already set by
+// the time this validator reads it.
+//
+// `--all` lists every server's sheds; a positional names exactly one. The two
+// used to coexist silently -- the tmux half ignored the argument outright,
+// and the roost half filtered on it, so one command answered two different
+// questions in the same output. Refusing the combination is the honest fix:
+// the bug was the silence, not the missing filter.
+func sessionsArgs(cmd *cobra.Command, args []string) error {
+	all, _ := cmd.Flags().GetBool("all")
+	if all && len(args) > 0 {
+		return fmt.Errorf("--all lists every shed; drop the argument or drop --all")
+	}
+	return cobra.MaximumNArgs(1)(cmd, args)
 }
 
 var sessionsKillCmd = &cobra.Command{

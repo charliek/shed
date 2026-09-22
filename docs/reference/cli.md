@@ -951,6 +951,10 @@ shed sessions [shed-name] [flags]
 | `--all` | `-a` | `false` | List from all servers |
 | `--tmux` | | `false` | List tmux sessions only, even with a local roost app running |
 
+`--all` takes no `shed-name` argument — it lists every shed on every server, so
+the two are refused together: `--all lists every shed; drop the argument or
+drop --all`.
+
 **Examples:**
 
 ```bash
