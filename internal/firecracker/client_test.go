@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"sort"
@@ -915,4 +916,76 @@ func TestReadProcCmdline(t *testing.T) {
 			t.Fatalf("err = %v, want context.Canceled", err)
 		}
 	})
+}
+
+// --- UNKNOWN pid identity must never be read as "stopped" (#372 follow-up) ---
+//
+// The predicate is tri-state (see isThisVMsProcess): a live pid whose /proc
+// cmdline can't be read is UNKNOWN, not "not ours". These cover the three
+// callers that would otherwise act destructively on that answer.
+
+// unknownIdentityClient builds a Client over tmpDir with one running instance
+// whose recorded pid is live, and a /proc reader that fails with EACCES.
+func unknownIdentityClient(t *testing.T, name string) (*Client, *config.FirecrackerConfig, int) {
+	t.Helper()
+	tmpDir := t.TempDir()
+	cfg := testFirecrackerConfig(tmpDir)
+	c, _ := newResumeTestClient(t, cfg, func(context.Context, int) (string, error) {
+		return "", os.ErrPermission
+	})
+	pid := mustSpawnLiveChild(t)
+	writeResumeInstance(t, tmpDir, name, config.StatusRunning, pid)
+	swapPIDCmdlineReader(t, func(int) ([]byte, error) { return nil, fs.ErrPermission })
+	return c, cfg, pid
+}
+
+func TestGetShedKeepsStatusWhenIdentityUnknown(t *testing.T) {
+	c, cfg, pid := unknownIdentityClient(t, "alpha")
+
+	shed, err := c.GetShed(context.Background(), "alpha")
+	if err != nil {
+		t.Fatalf("GetShed() error = %v", err)
+	}
+	if shed.Status != config.StatusRunning {
+		t.Errorf("Status = %q, want %q: an unverifiable pid must not be reported as stopped", shed.Status, config.StatusRunning)
+	}
+
+	// And the metadata on disk must be untouched — rewriting it to
+	// Stopped/PID=0 is what lets the next start spawn a second firecracker.
+	meta, err := LoadMetadata(cfg.InstanceDir, "alpha")
+	if err != nil {
+		t.Fatalf("LoadMetadata() error = %v", err)
+	}
+	if meta.Status != config.StatusRunning || meta.PID != pid {
+		t.Errorf("persisted metadata = (%q, pid %d), want (%q, pid %d)", meta.Status, meta.PID, config.StatusRunning, pid)
+	}
+}
+
+func TestCheckNotRunningRefusesWhenIdentityUnknown(t *testing.T) {
+	c, cfg, _ := unknownIdentityClient(t, "alpha")
+
+	meta, err := LoadMetadata(cfg.InstanceDir, "alpha")
+	if err != nil {
+		t.Fatalf("LoadMetadata() error = %v", err)
+	}
+	starter := &fcStarter{c: c}
+	err = starter.CheckNotRunning(context.Background(), &fcMetaHandle{meta: meta})
+	if err == nil {
+		t.Fatal("CheckNotRunning() = nil on an unverifiable pid; it must refuse to spawn a second firecracker over a possibly-live VMM")
+	}
+	if meta.PID == 0 {
+		t.Error("CheckNotRunning() cleared the recorded PID on UNKNOWN")
+	}
+}
+
+func TestDeleteShedRefusesWhenIdentityUnknown(t *testing.T) {
+	c, cfg, _ := unknownIdentityClient(t, "alpha")
+
+	err := c.DeleteShed(context.Background(), "alpha")
+	if err == nil {
+		t.Fatal("DeleteShed() = nil on an unverifiable pid; it must not release the TAP/CID/upper of a possibly-live VMM")
+	}
+	if _, err := LoadMetadata(cfg.InstanceDir, "alpha"); err != nil {
+		t.Errorf("metadata was removed despite the refusal: %v", err)
+	}
 }

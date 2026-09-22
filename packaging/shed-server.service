@@ -6,6 +6,10 @@ Wants=docker.service
 [Service]
 Type=simple
 ExecStart=/usr/local/bin/shed-server serve --config /etc/shed/server.yaml
+# #372: only shed-server itself gets the stop signal; each shed's
+# firecracker VMM stays up and is re-attached by the resume walk (#315)
+# when the server comes back.
+KillMode=process
 Restart=on-failure
 RestartSec=5
 LimitNOFILE=65536

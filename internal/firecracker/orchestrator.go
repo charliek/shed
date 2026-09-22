@@ -538,7 +538,14 @@ func (b *fcStarter) CheckNotRunning(_ context.Context, metaRaw orchestrator.Meta
 
 	if meta.Status == config.StatusRunning {
 		vm := &VM{meta: meta, cfg: b.c.cfg}
-		if vm.IsRunning() {
+		running, err := vm.IsRunning()
+		if err != nil {
+			// UNKNOWN identity (see isThisVMsProcess): refuse to spawn.
+			// Treating it as "not running" is how you end up with two
+			// firecrackers on one upper.
+			return fmt.Errorf("cannot verify whether %s is still running (pid %d): %w", meta.Name, meta.PID, err)
+		}
+		if running {
 			return fmt.Errorf("%w: %s", config.ErrShedAlreadyRunningSentinel, meta.Name)
 		}
 		meta.Status = config.StatusStopped
@@ -548,8 +555,14 @@ func (b *fcStarter) CheckNotRunning(_ context.Context, metaRaw orchestrator.Meta
 	// Defensive zombie-pid check — same shape as VZ. Refuse to
 	// double-spawn even if status reads "stopped" but the recorded
 	// PID is still a live firecracker.
-	if meta.PID > 0 && vmutil.IsProcessAlive(meta.PID) && isFirecrackerProcess(meta.PID) {
-		return fmt.Errorf("%w: %s (pid %d)", config.ErrZombiePresentSentinel, meta.Name, meta.PID)
+	if meta.PID > 0 && vmutil.IsProcessAlive(meta.PID) {
+		owns, err := isThisVMsProcess(meta.PID, instanceAPISocketPath(b.c.cfg.SocketDir, meta.Name))
+		if err != nil {
+			return fmt.Errorf("cannot verify the recorded pid %d for %s; refusing to start: %w", meta.PID, meta.Name, err)
+		}
+		if owns {
+			return fmt.Errorf("%w: %s (pid %d)", config.ErrZombiePresentSentinel, meta.Name, meta.PID)
+		}
 	}
 	meta.PID = 0
 
@@ -615,8 +628,14 @@ func (b *fcStarter) PersistRunningState(_ context.Context, metaRaw orchestrator.
 // lying-Stopped state.
 func (b *fcStarter) RestoreStoppedMetadata(metaRaw orchestrator.MetadataHandle) error {
 	meta := metaRaw.(*fcMetaHandle).meta
-	if meta.PID > 0 && vmutil.IsProcessAlive(meta.PID) && isFirecrackerProcess(meta.PID) {
-		return fmt.Errorf("firecracker still alive (pid %d) after stop-VM cleanup; leaving metadata as-is for GetShed staleness check", meta.PID)
+	if meta.PID > 0 && vmutil.IsProcessAlive(meta.PID) {
+		owns, err := isThisVMsProcess(meta.PID, instanceAPISocketPath(b.c.cfg.SocketDir, meta.Name))
+		if err != nil {
+			return fmt.Errorf("cannot verify pid %d after stop-VM cleanup of %s; leaving metadata as-is: %w", meta.PID, meta.Name, err)
+		}
+		if owns {
+			return fmt.Errorf("firecracker still alive (pid %d) after stop-VM cleanup; leaving metadata as-is for GetShed staleness check", meta.PID)
+		}
 	}
 	meta.Status = config.StatusStopped
 	meta.PID = 0

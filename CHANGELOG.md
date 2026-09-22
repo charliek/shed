@@ -420,6 +420,18 @@ verbatim._
   never resurrect a dead record. Upgrading past this release needs no `shed stop && shed
   start` dance; older servers still do. See the
   [v0.8.2 → v0.9.0 upgrade note](https://charliek.github.io/shed/upgrades/v0.8.2-to-v0.9.0/).
+- **Stopping `shed-server` no longer kills every running Firecracker shed** (#372). The
+  firecracker-go-sdk forwards INT/QUIT/TERM/HUP/ABRT to each VMM child unless
+  `ForwardSignals` is an empty, non-nil slice, and the systemd unit carried no `KillMode`,
+  so systemd's `control-group` default reaped whatever the relay missed: one
+  `systemctl restart shed-server` — the restart every apt upgrade performs — took down every
+  shed on the host, while the same command on VZ left vfkit untouched. Both halves are fixed
+  together: the config block moves into a pure `machineConfig()` that sets
+  `ForwardSignals: []os.Signal{}`, and the unit gains `KillMode=process`. The surviving VMMs
+  are re-attached by #315's startup resume walk; if the server can't come back, they stay
+  alive and unmanaged until it does. The egress helper is unaffected — it has its own
+  parent-death signal. See the
+  [v0.8.2 → v0.9.0 upgrade note](https://charliek.github.io/shed/upgrades/v0.8.2-to-v0.9.0/).
 - **Filed while landing the above, deliberately not fixed in this PR:**
   - #369 — Firecracker: a restart doesn't re-serve `--local-dir`/`--add-dir` 9P host
     mounts (VZ is unaffected; vfkit's VirtioFS servers live in the VMM process, which
@@ -435,7 +447,7 @@ verbatim._
   - #372 — Firecracker: stopping/restarting `shed-server` kills every running shed's VM
     (the SDK's default `ForwardSignals` relays SIGTERM/etc. straight to each VMM process);
     VZ is unaffected. Same command, opposite outcome on the two backends, undocumented
-    until this ticket.
+    until this ticket. **Fixed later in this release — see the bullet above.**
   - #373 — The Mac parallel-dev config pins `v0.8.0` image aliases while a workstation's
     dev image cache can hold a user-pulled `v0.8.1`, failing
     `test_images_expose_alias_and_default[vz]` for a dev-environment reason unrelated to

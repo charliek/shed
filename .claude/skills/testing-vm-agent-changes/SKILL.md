@@ -296,6 +296,18 @@ in-tree by `scripts/stage-guest-binaries.sh`, staged into the context like
 shed-agent; verify `docker-credential-shed version` reports a non-release version
 in the booted shed, same as the shed-agent check.)
 
+## Gremlin: `kill 0` (or any empty-pid kill) over tailscale ssh reaches OTHER sessions
+
+Every non-pty tailscale ssh session on mini3 runs in tailscaled's process group, and so
+does anything you `nohup … &` from one — the dev shed-server and every firecracker VMM it
+spawns. A script that does `kill -KILL $PID` with `$PID` empty or `0` (e.g. read from a
+`systemctl show -p MainPID` of a unit that failed to start) signals that whole group: it
+killed an orphaned VMM that had survived a real SIGKILL of its server, and restarted
+tailscaled (plan 023 live-05, 2026-09-22). Guard every signal: refuse an empty/0/1 pid.
+Related, for KillMode legs: a transient unit that merely ADOPTS a VMM spawned elsewhere
+cannot reap it on stop under any KillMode (wrong cgroup) — spawn the shed UNDER the unit
+you are testing, and `cat /proc/<vmm>/cgroup` to prove it.
+
 ## When you hit a NEW rough edge
 
 Add it here. This file exists because the agent-in-image split has non-obvious
