@@ -536,9 +536,13 @@ def test_roost_session_baked(shed_server, test_shed_name):
     assert r.returncode == 0, (
         f"/usr/bin/roost-session missing or not executable in the booted "
         f"shed: exit={r.returncode} stdout={r.stdout!r} stderr={r.stderr!r}. "
-        f"Check the roost-session install steps folded into the "
+        f"Two causes: (1) the dev server's image store still holds an "
+        f"`extensions` image built BEFORE the bake — rebuild it into the dev "
+        f"store (docs/development/testing.md, SHED_SOURCE_REF = the dev "
+        f"config's alias) or run with SHED_IMAGE_HAS_ROOST= (empty) to skip "
+        f"this cell; (2) the roost-session install steps folded into the "
         f"stridelabs-apt RUN in the extensions stage of vz/Dockerfile / "
-        f"firecracker/Dockerfile."
+        f"firecracker/Dockerfile regressed."
     )
 
     r = shed_server.exec(test_shed_name, ["roost-session", "identify"])

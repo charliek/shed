@@ -300,8 +300,10 @@ in the booted shed, same as the shed-agent check.)
 
 Every non-pty tailscale ssh session on mini3 runs in tailscaled's process group, and so
 does anything you `nohup … &` from one — the dev shed-server and every firecracker VMM it
-spawns. A script that does `kill -KILL $PID` with `$PID` empty or `0` (e.g. read from a
-`systemctl show -p MainPID` of a unit that failed to start) signals that whole group: it
+spawns. A script that does `kill -KILL $PID` with `$PID` equal to `0` — which is exactly what
+`systemctl show -p MainPID --value` prints for a unit that failed to start — is `kill -KILL 0`,
+and signals that whole group (an EMPTY `$PID` is only a usage error; `0` is the dangerous
+value): it
 killed an orphaned VMM that had survived a real SIGKILL of its server, and restarted
 tailscaled (plan 023 live-05, 2026-09-22). Guard every signal: refuse an empty/0/1 pid.
 Related, for KillMode legs: a transient unit that merely ADOPTS a VMM spawned elsewhere
