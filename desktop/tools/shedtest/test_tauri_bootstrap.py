@@ -84,7 +84,7 @@ SERVER = "mock"
 #: bump moves this with it.
 IDENTITY_CURRENT = json.dumps(
     {
-        "app_version": "0.0.19",
+        "app_version": "0.0.20",
         "session_protocol": SESSION_PROTOCOL,
         "libghostty_build": "ghostty-3f6b1c9a4d2e5f80+snapshot.v1",
     }
@@ -99,8 +99,8 @@ IDENTITY_V4 = json.dumps(
         "libghostty_build": "ghostty-f2d5758f6305867d+snapshot.v1",
     }
 )
-#: A protocol-2 `roost-session` — every released build today, which is why this
-#: is the realistic stale incumbent.
+#: A protocol-2 `roost-session` — every roost release before v0.0.20, which is
+#: why this is the realistic stale incumbent.
 IDENTITY_V2 = json.dumps(
     {
         "app_version": "0.0.19",
@@ -544,6 +544,13 @@ def rig(mock):
 #: A path that names no file, for `ROOST_SESSION_BIN`. See `_boot_app`.
 ABSENT = Path("/nonexistent/roost-session")
 
+#: An asset base the fetch refuses before it opens a socket — `http://`, and not
+#: the loopback address roost's own check carves out. It is how a cell takes rung
+#: 3 away now that `RELEASE_PIN` names a real release (plan 023 §3.2): the ladder
+#: used to end at `NoSource` all by itself, and no longer does. See
+#: `test_without_a_source_there_is_no_button`.
+REFUSED_ASSET_BASE = "http://roost.invalid/download"
+
 
 @contextmanager
 def _boot_app(
@@ -552,6 +559,7 @@ def _boot_app(
     *,
     install_bin: Path | None,
     session_bin: Path | None = None,
+    asset_base: str | None = None,
 ):
     """Launch an INDEPENDENT tauri instance pointed at `rig` — its own throwaway
     `HOME`/`XDG_RUNTIME_DIR`, its own socket, its own fake host-agent — and yield
@@ -572,6 +580,15 @@ def _boot_app(
     without it the rung finds whatever `roost-session` is on the developer's PATH
     (this workstation has a protocol-2 one; CI has none) and the cell reads
     differently in the two places.
+
+    `asset_base` is roost's `ROOST_SESSION_ASSET_BASE`, rung 3's base — set here
+    to [`REFUSED_ASSET_BASE`] by the no-source cells and **cleared** for everyone
+    else, the same set-or-clear rule `ui.subproc_env` applies to roost's other
+    two variables and for the same reason: an inherited value would point rung 3
+    somewhere this run did not choose. It is spelled out here rather than in
+    `ui.subproc_env` because these are the only cells whose answer depends on it
+    (every other cell sets `install_bin`, and rung 1 wins before rung 3 is
+    consulted).
     """
     cfg = ui._SUBPROC["tauri"]
     if not cfg.binary.exists():
@@ -595,6 +612,10 @@ def _boot_app(
             roost_install_bin=install_bin,
             roost_session_bin=session_bin,
         )
+        if asset_base:
+            env["ROOST_SESSION_ASSET_BASE"] = asset_base
+        else:
+            env.pop("ROOST_SESSION_ASSET_BASE", None)
         log_fh = open(log, "wb")
         proc = subprocess.Popen(
             [str(cfg.binary)], env=env, stdout=log_fh, stderr=subprocess.STDOUT
@@ -1322,9 +1343,14 @@ def test_without_a_source_there_is_no_button(rig):
     nothing to install.
 
     Its own app instance, because the source ladder reads the process
-    environment: no `ROOST_SESSION_INSTALL_BIN`, no current-generation roost beside this
-    app, and `RELEASE_PIN` is `None` until roost ships one — so the ladder ends at
-    `NoSource` and the preview says so in the words plan 019 §3.5 pinned.
+    environment: no `ROOST_SESSION_INSTALL_BIN`, no current-generation roost
+    beside this app — **and** an asset base the fetch refuses, which is what
+    takes rung 3 away. Since plan 023 flipped `RELEASE_PIN` to roost 0.0.20 the
+    release rung answers for every architecture roost builds for, so this row is
+    no longer where a cold target lands by itself; it is still a real row (a
+    misconfigured `ROOST_SESSION_ASSET_BASE`, an architecture with no build), and
+    it is still the only card shed has for it. The preview says so in the words
+    plan 019 §3.5 pinned.
 
     Its own PRIVATE mock too, for `_mint_private_shed`'s reason, which this cell
     originally got away with ignoring. On the shared mock the module-scoped
@@ -1345,7 +1371,11 @@ def test_without_a_source_there_is_no_button(rig):
     try:
         private_mock.add_shed({"name": target_name, "status": "running", "backend": "vz"})
         with _boot_app(
-            rig, private_mock.base_url, install_bin=None, session_bin=ABSENT
+            rig,
+            private_mock.base_url,
+            install_bin=None,
+            session_bin=ABSENT,
+            asset_base=REFUSED_ASSET_BASE,
         ) as app:
             target = f"roost:{SERVER}/{target_name}"
             # The authoritative refresh that makes the shed addressable at all
@@ -1356,12 +1386,14 @@ def test_without_a_source_there_is_no_button(rig):
             assert preview["plan"]["kind"] == "install", preview
             assert preview["source"]["rung"] == "none"
             assert preview["actionable"] is False, "no bytes, no button"
+            # The rung was taken away on purpose, and the card records why
+            # rather than leaving the reader to guess the pin is missing.
+            assert any(
+                "usable https:// URL" in why for why in preview["source"]["skipped"]
+            ), preview["source"]["skipped"]
             sentence = preview["source"]["sentence"]
-            assert (
-                f"no roost release speaking session protocol {SESSION_PROTOCOL} is "
-                "published yet"
-            ) in sentence
-            assert "(the latest, 0.0.19, speaks 2)" in sentence
+            assert "the roost 0.0.20 release asset is not usable for " in sentence
+            assert "ROOST_SESSION_ASSET_BASE names a base shed refuses" in sentence
             assert "ROOST_SESSION_INSTALL_BIN" in sentence
             assert f"{target} was left untouched." in sentence
 
@@ -1375,7 +1407,7 @@ def test_without_a_source_there_is_no_button(rig):
             assert answer["ok"] is False
             assert answer["error"]["stage"] == "source"
             message = answer["error"]["message"]
-            assert f"no roost release speaking session protocol {SESSION_PROTOCOL}" in message
+            assert "the roost 0.0.20 release asset is not usable for " in message
             assert not rig.installed(target_name).exists()
     finally:
         private_mock.stop()
@@ -1653,18 +1685,27 @@ def _mint_private_shed(rig: Rig, shed: str) -> None:
 def test_a_blocked_install_shows_the_pinned_no_source_sentence_and_no_button(rig):
     """The sixth plan-matrix row, rendered: `NoSource` blocks an otherwise
     actionable plan, and the card shows the pinned sentence IN PLACE of a
-    button — never a button, never a paraphrase (plan 019 §3.5/C8 bullet 2).
+    button — never a button, never a paraphrase (plan 019 §3.5/C8 bullet 2,
+    with the pin-aware copy plan 023 §3.2 amended it to).
 
     Its own app AND its own private mock server — see `_mint_private_shed`:
-    the source ladder needs an app with no override env, and this shed must
-    stay invisible to the `boot` app's own background prober."""
+    the source ladder needs an app with no override env and a refused asset base
+    (see `test_without_a_source_there_is_no_button` for why the second one is
+    needed now), and this shed must stay invisible to the `boot` app's own
+    background prober."""
     target_name = "p19-ui-nosource"
     _mint_private_shed(rig, target_name)
     private_mock = MockShedServer()
     private_mock.start()
     try:
         private_mock.add_shed({"name": target_name, "status": "running", "backend": "vz"})
-        with _boot_app(rig, private_mock.base_url, install_bin=None, session_bin=ABSENT) as app:
+        with _boot_app(
+            rig,
+            private_mock.base_url,
+            install_bin=None,
+            session_bin=ABSENT,
+            asset_base=REFUSED_ASSET_BASE,
+        ) as app:
             app.navigate("sheds")
             # The authoritative refresh that makes the shed addressable at all
             # (`RoostHosts::ssh_entry`'s gate — see `Rig.list_running`). The
@@ -1679,10 +1720,11 @@ def test_a_blocked_install_shows_the_pinned_no_source_sentence_and_no_button(rig
             # verbatim — a substring match would pass even if the renderer
             # appended or reworded anything around it.
             assert row["status"] == (
-                f"no roost release speaking session protocol {SESSION_PROTOCOL} is "
-                "published yet (the latest, 0.0.19, speaks 2). On a Linux machine "
-                f"with a protocol-{SESSION_PROTOCOL} roost installed the desktop "
-                "uses that roost-session; otherwise point "
+                f"the roost 0.0.20 release asset is not usable for {target}: either "
+                "ROOST_SESSION_ASSET_BASE names a base shed refuses, or roost "
+                "publishes no roost-session build for this architecture. On a Linux "
+                f"machine with a protocol-{SESSION_PROTOCOL} roost installed the "
+                "desktop uses that roost-session; otherwise point "
                 f"ROOST_SESSION_INSTALL_BIN at a protocol-{SESSION_PROTOCOL} build. "
                 f"{target} was left untouched."
             ), row["status"]

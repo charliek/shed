@@ -91,17 +91,22 @@ verbatim._
   reason `"unknown"`, shown verbatim rather than filtered or hidden. **A host speaking an
   older protocol is refused by name and offered the update, and its running session is
   never stopped** (pin P6) — this covers every host plan 019's desktop bootstrapped
-  (protocol 4), a host still on protocol 5, and a real released `roost-session` (the
-  latest, v0.0.19, speaks protocol 2, and is refused loudly the same way). The one manual
+  (protocol 4), a host still on protocol 5, and a `roost-session` from any roost release
+  before v0.0.20 (v0.0.19 speaks protocol 2, and is refused loudly the same way). The one manual
   step to recover: `roostctl session stop` on that target, then reconnect — shed then sees
   a stale binary with no session running and replaces and restarts it unattended, the same
   as any other Update. See
   [`docs/extensions/roost-session-hosts.md`](https://charliek.github.io/shed/extensions/roost-session-hosts/)
   for the re-widening consequence of a raise and the gx/`$GROK_HOME` "not installed"
-  surprise on a fresh host. **The phone-install rung is unchanged by this release:** it
-  still reports that no published roost release speaks the current session protocol until
-  `RELEASE_PIN` flips — "no release speaks 6" — which is a separate follow-up PR, not
-  something this release fixes.
+  surprise on a fresh host. **The phone-install rung is fixed by this release:** roost
+  v0.0.20 (`8c91ce9`) is the first published release that speaks session protocol 6, and
+  `RELEASE_PIN` is now `Some("0.0.20")` — so the desktop's release-asset rung (rung 3)
+  installs a `roost-session` onto a fresh Linux target straight from the GitHub release,
+  checksum-verified against its published `.sha256`, with no `$ROOST_SESSION_INSTALL_BIN`
+  and no sibling binary needed. The "nothing can supply these bytes" sentence is pin-aware
+  with that: it names the reason that applies (a refused `ROOST_SESSION_ASSET_BASE`, or an
+  architecture roost publishes no build for) instead of repeating plan 019's "no release
+  speaks 6", which stopped being true the moment the pin moved.
 - **The machine RC hub moves into `shed-host-agent`.** The daemon hosts the
   activity hub (`127.0.0.1:1029`) as a supervised resident role: bind-as-lock
   with a polite defer-and-retry while an older `shed-machine-rc serve` holds
@@ -316,10 +321,12 @@ verbatim._
   see [`docs/extensions/roost-session-hosts.md`](https://charliek.github.io/shed/extensions/roost-session-hosts/)
   for the source ladder, the exact (narrow) rollback promise, the PATH
   warning, and `shed reset` handling. **Honestly incomplete in one way,
-  stated in the docs:** the release-asset source rung is implemented
-  and fixture-tested but has never been exercised against a real download —
-  `RELEASE_PIN` is `None` because no published roost release speaks the
-  current session protocol yet (the latest, 0.0.19, speaks 2). **The payoff
+  stated in the docs:** the release-asset source rung shipped implemented and
+  fixture-tested but never exercised against a real download, because
+  `RELEASE_PIN` was `None` — no published roost release spoke the current
+  session protocol. That pin is flipped in this same release (see the
+  protocol-6 entry above); the rung's unit coverage is still a loopback HTTP
+  fixture rather than github.com. **The payoff
   itself is demonstrated live, not only in hermetic tests:** a real shed's
   `codex` row carries roost-sourced `activity` with `source: "roost"`, and
   `epics/roost-pivot.md`'s liveness-only clause closed with that leg (its S5
