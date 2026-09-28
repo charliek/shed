@@ -184,8 +184,10 @@ the pin (plan 021 found exactly that: both had hard-coded "this shed speaks 5" b
 switched to the constant).
 
 **What session protocol 6 gave us (plan 021), on top of what 5 already gave us.** The pin is at
-`8c91ce9…` (roost **v0.0.20**, the first release that speaks 6; the `roost-ipc` crate is
-byte-identical to `ee71e44…`, where 6 landed) and shed speaks generation **6**. Protocol 4's lease (roost R1, plan 014) stayed
+`2bc71fa…` (roost **v0.0.21**, roost's bug-fix release after v0.0.20; v0.0.20 was the first
+release that speaks 6, and its `roost-ipc` crate was byte-identical to `ee71e44…`, where 6
+landed) and shed speaks generation **6**. 0.0.21's only `roost-ipc` API change shed sees is
+`TabOpenParams.cwd_from_tab`. Protocol 4's lease (roost R1, plan 014) stayed
 gone — not narrowed, retired outright, with no replacement — and everything protocol 5 gave
 (below) carries forward unchanged; 6's own changes are the second list further down:
 

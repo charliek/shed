@@ -2,7 +2,7 @@
 
 Byte-for-byte copies of roost's own golden wire vectors, taken from
 
-    github.com/charliek/roost @ 8c91ce9ddd49c5a43841f72ecd149dd778d6151c
+    github.com/charliek/roost @ 2bc71fa3848ddbf2d190aab6c4ef61ad2d432aa1
     tests/ipc-vectors/<same filename>
 
 which is the **same rev** `crates/Cargo.toml` pins `roost-ipc` to. They travel with

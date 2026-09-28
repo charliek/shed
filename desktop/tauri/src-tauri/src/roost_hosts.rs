@@ -2098,6 +2098,10 @@ fn open_params(kind: &RcKind, workdir: Option<&str>) -> Result<TabOpenParams, St
         // `Some(false)` because a kickoff from a pocket must not reach over and
         // move somebody's foreground tab.
         activate: None,
+        // **Absent on the wire.** `cwd_from_tab` is roost's "start where another
+        // tab is" (roostctl `--cwd-from-tab`/`--here`); the desktop always names
+        // the tab's cwd explicitly above, so shed has no use for it.
+        cwd_from_tab: None,
     })
 }
 

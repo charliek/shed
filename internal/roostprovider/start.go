@@ -16,8 +16,8 @@ import (
 // lives in a file and the console tee is on stderr — so a caller can read
 // stdout without a parser". The three shapes and their spellings are copied
 // from `Verdict`'s Display and `Verdict::parse` at the pinned rev
-// (~/.cargo/git/checkouts/roost-251d7f489d96afc6/8c91ce9/crates/roost-ipc/src/
-// session_launch.rs:186-246), never guessed at. roost publishes no vector for a
+// (~/.cargo/git/checkouts/roost-251d7f489d96afc6/2bc71fa/crates/roost-ipc/src/
+// session_launch.rs:187-247), never guessed at. roost publishes no vector for a
 // verdict line, so the shapes are pinned here by TestParseStartVerdict instead.
 //
 // **The choreography is shed-core's**, restated for the same reason: Rust's
