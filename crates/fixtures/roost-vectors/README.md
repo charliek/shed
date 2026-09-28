@@ -83,8 +83,8 @@ red `go test ./...` rather than a stale read.
 | `events.subscribe.response.json` | the fake's `events.subscribe` ack (the fence `{revision}` plus the required `session_id`) |
 | `tab.dump.request.json` | the `tab.dump` shape `Conn::tab_dump` sends — `scrollback` is omit-when-zero, so this is what proves shed's viewport read emits no `scrollback` key at all |
 | `tab.write.request.json` | the `tab.write` shape — lease-free since generation 5 |
-| `session.set_agent_hooks.request.json` | the shape `Conn::session_set_agent_hooks` sends — the generation-6 raise `{agents, client}`; `deny_unknown_fields` on roost's side, so this is the contract. **Its `agents` array is roost's own two-name example**, not shed's five: the request test compares every key except `agents` against this file and `agents` against `ROOST_WIRED_AGENTS`, so the copy stays byte-for-byte roost's |
-| `session.set_agent_hooks.response.json` | both fakes' `session.set_agent_hooks` reply template — an `AgentHooksOutcome` (`wired`/`refreshed`/`removed`/`skipped`/`errors`), with the two skip reasons a client can see (`"not allowed"`, `"not installed"`) |
+| `session.set_agent_hooks.request.json` | the shape `Conn::session_set_agent_hooks` sends — the generation-6 raise `{agents, client}`; `deny_unknown_fields` on roost's side, so this is the contract. **Its `agents` array is roost's own two-name example**, not shed's five: the request test compares every key except `agents` against this file and `agents` against `ROOST_WIRED_AGENTS`, so the copy stays byte-for-byte roost's. Go's `internal/roostprovider/wire_test.go` is the same test for `shed attach`'s raise (`TestSetAgentHooksRequestMatchesTheVendoredVector`: every key but `agents`, which is checked against `WiredAgents()`) |
+| `session.set_agent_hooks.response.json` | both fakes' `session.set_agent_hooks` reply template — an `AgentHooksOutcome` (`wired`/`refreshed`/`removed`/`skipped`/`errors`), with the two skip reasons a client can see (`"not allowed"`, `"not installed"`); Go's `internal/roostprovider/wire_test.go` decode pin (through the presence-aware DTO), and both Go fake-ssh rigs' reply to the raise (`internal/roostprovider/fakessh_test.go`, `cmd/shed/roost_fakeshed_test.go`) |
 | `stream.ended.event.json` | the terminal envelope `FakeRoost::end_stream` pushes — a UI-socket frame (`reason: "backend-switch"`) a session socket never writes, which is why a test is its only coverage |
 
 ## Shed-recorded vectors
@@ -146,7 +146,7 @@ same pair read from inside a shed VM over roost's SSH client-bridge.
 
 ## shed's own multi-language goldens
 
-Three files here are **not** roost vectors and are **not** copies of anything:
+Four files here are **not** roost vectors and are **not** copies of anything:
 they are shed's own, written by shed, and they may be edited. The
 no-semantic-edits rule above governs the vendored vectors, not these.
 
@@ -155,9 +155,11 @@ no-semantic-edits rule above governs the vendored vectors, not these.
 | `bootstrap/exec-chain-command.txt` | roost's candidate-ladder remote command, `roost_ipc::bootstrap::exec_chain_command(false)` | Rust (`shed-core/tests/roost_provider_vectors.rs`, against the LIVE function), Go (`internal/roostprovider`'s `ExecChainCommand` value (built by `execChain`)) and Dart (shed-mobile's `integration_test/roost_goldens_test.dart`, against `roostRemoteCommand()` — the string its roost tunnel hands `execute` verbatim) |
 | `agent-table.json` | kind → binary → title for the six agents the roost provider can start | Rust (`launch_argv` + `roost_capabilities().kinds`), Go (`internal/roostprovider`'s `agentTable`) and Dart (the kind SET a machine's create form offers) |
 | `stderr-classes.json` | how a failed `ssh` exec classifies (`roost_ipc::ssh::classify_ssh_failure`), plus shed's own class → provider-row and class → `ReachKind` mappings | Rust (the live classifier, `classes`; and `shed_app::roost::ReachError`, `reach_kinds`), Go (`ClassifySSHFailure` + `ProviderRow`) and Dart (`classes` **and** `reach_kinds`, against shed-mobile's own port in `lib/ssh/roost_reach.dart`) |
+| `wired-agents.json` | the agent names every shed client raises a host's `agent-hooks` key to (`session.set_agent_hooks`'s `agents`), in the order they are sent | Rust (`shed_core::roost::bootstrap::ROOST_WIRED_AGENTS` — the desktop's and the phone's raise) and Go (`internal/roostprovider`'s `WiredAgents()` — `shed attach`'s start-rung raise) |
 
 They exist because one behaviour is implemented on both sides of a language
-boundary — the Go `shed roost-provider` subcommand and the Rust client core, and
+boundary — the Go `shed roost-provider` subcommand (and, for `wired-agents.json`,
+`shed attach`'s start rung) and the Rust client core, and
 since plan 020 the Dart transport in shed-mobile as well — and a golden asserted
 from every side is the only thing that makes the implementations provably the
 same rather than the same today.

@@ -136,6 +136,16 @@ After a **Start that the client itself performed**, it sends
 protocol 5 dropped the lease entirely, so there is no `session.connect` to open first and
 nothing to hold or lose before sending it.
 
+**The CLI raises too, under `"shed-cli"`.** `shed attach`'s start rung — the one that starts
+a shed's stopped `roost-session` over the shed's own SSH connection — sends the same call
+with the same five names once that session's post-start identify passes: after a start the
+rung performed, or accepted because another client won the start race in the same moment (as
+the desktop's bootstrap does). An attach that finds the session already running sends
+nothing. It prints one line naming what
+the host wired, and a failure is a warning, never a failed attach. There is no consent card
+on this path: the rung only ever targets a shed, a shed-managed VM writing into its own
+`$HOME`, and running `shed attach` against it is the consent.
+
 **At session protocol 6 this op is a raise, and a raise only ever widens.** `ROOST_WIRED_AGENTS`
 is shed's own constant naming roost's whole wireable set, by value — exactly five names,
 `claude`, `codex`, `cursor`, `grok`, `opencode` — and shed sends that same array on every call.
@@ -179,9 +189,11 @@ grok — and nothing else."
 moment*. An agent set up later is not retroactively wired by this one call — it gets wired the
 next time hooks are (re)sent, which is:
 
-- every `shed start` (each one performs a fresh Start-and-hooks cycle if a bootstrap runs), and
+- every `shed start` (each one performs a fresh Start-and-hooks cycle if a bootstrap runs),
 - every successful cycle of the watcher for a target this client bootstrapped — re-sent on
-  every reconnect, not only once at install time.
+  every reconnect, not only once at install time, and
+- every start the CLI rung performs (`shed attach` on a shed whose `roost-session` was not
+  running).
 
 **One op, no token, last writer wins.** Every client that wires a target sends the identical
 call — the desktop, the phone, and any roost UI that connects all say `set_agent_hooks

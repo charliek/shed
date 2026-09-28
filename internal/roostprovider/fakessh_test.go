@@ -274,6 +274,7 @@ case "$1" in
     op=unknown
     case "$line" in
       *session.identify*) op=identify ;;
+      *session.set_agent_hooks*) op=sethooks ;;
       *tab.list*) op=tablist ;;
       *tab.open*) op=tabopen ;;
       *tab.close*) op=tabclose ;;
@@ -415,6 +416,12 @@ func (r *rig) writeReplies(dir string, protocol int, projects []Project) {
 		"id": wireRequestID, "ok": true, "result": map[string]any{},
 	}), 0o644)
 
+	// `session.set_agent_hooks` answers with roost's own vector but for the
+	// envelope id — an AgentHooksOutcome with two agents wired and two skipped.
+	setHooks := readVectorMap(t, "session.set_agent_hooks.response.json")
+	setHooks["id"] = wireRequestID
+	mustWrite(t, filepath.Join(dir, "reply.sethooks.ndjson"), compactLine(t, setHooks), 0o644)
+
 	// `tab.list`'s projects are the one part a fixture cannot supply: each test
 	// needs its own set. The envelope around them is still roost's.
 	rows := make([]map[string]any, 0, len(projects))
@@ -452,7 +459,8 @@ func (r *rig) writeReplies(dir string, protocol int, projects []Project) {
 }
 
 // replaceReply overwrites the NDJSON the fake bridge answers one op with
-// (`identify`, `tablist`, `tabopen` — writeReplies' own file names).
+// (`identify`, `tablist`, `tabopen`, `tabclose`, `sethooks` — writeReplies'
+// own file names).
 //
 // For the replies a fixture cannot express: a well-formed envelope whose
 // `result` is empty. That shape has to come from a literal, because every

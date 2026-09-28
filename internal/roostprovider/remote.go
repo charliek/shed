@@ -797,3 +797,27 @@ func (r *Remote) TabSetTitle(ctx context.Context, t Target, tabID, title string)
 func (r *Remote) TabClose(ctx context.Context, t Target, tabID string) error {
 	return r.call(ctx, t, opTabClose, TabCloseParams{TabID: tabID}, nil)
 }
+
+// SetAgentHooks runs `session.set_agent_hooks` — protocol 6's RAISE: the host
+// unions WiredAgents() into its own `agent-hooks` key and writes the hook
+// entries itself, under its own `$HOME`, with roost's own installer. Nothing
+// here edits a dotfile. client is the label the host records as the `by` of
+// its state entry.
+//
+// The agent list is not a parameter, for the reason shed-core's
+// `wire_agent_hooks` gives: every shed client raises the same set, and a caller
+// that raised a different one would be a second policy nobody could read off
+// one place.
+//
+// A reply missing any of the five outcome fields is a *MalformedReplyError
+// (see agentHooksOutcomeWire), never an empty outcome. What a caller does with
+// an error is its own policy; shed's one caller treats every failure here as a
+// warning (a missing enrichment), never as a failed attach.
+func (r *Remote) SetAgentHooks(ctx context.Context, t Target, client string) (AgentHooksOutcome, error) {
+	var wire agentHooksOutcomeWire
+	params := SetAgentHooksParams{Agents: WiredAgents(), Client: client}
+	if err := r.call(ctx, t, opSessionSetAgentHooks, params, &wire); err != nil {
+		return AgentHooksOutcome{}, err
+	}
+	return wire.outcome()
+}

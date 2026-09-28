@@ -391,6 +391,25 @@ verbatim._
   `RcKindFeatures`, `RcCapabilities`, `RcAgentInfo`, `RcError` — it's what the lane
   adapters, `roost::model`, and shed-mobile read; `kind_features` is now derived
   client-side from whether a lane adapter is attached, not read off the wire.
+- **`shed attach` starts a shed's stopped `roost-session` itself, and wires its agent hooks
+  when it does** (plan 023, #383; plan 024, #387). When roost reports a reachable shed with
+  no session running, `shed attach` now runs `roost-session start` over the shed's own SSH
+  connection instead of ending at the "has no roost-session" message — printing `starting
+  roost-session on shed-<name>…`, bounded at 60 seconds, attempted at most once per attach,
+  and gated by a post-start `session.identify` (a session speaking another protocol is a
+  hard error naming both versions, never a retry). A shed with no `roost-session`
+  *installed* keeps the old message byte for byte. After a start it performed or accepted
+  (another client winning the start race in the same moment) — and only then — the attach
+  raises shed's agent-hook set on that shed (`session.set_agent_hooks`, the same five names
+  the desktop sends, recorded as `"shed-cli"` in the shed's `~/.config/roost/agent-hooks.json`),
+  so a shed first reached from a terminal shows agent rows without the desktop ever
+  bootstrapping it. It prints one line naming what was
+  wired, skipped or failed (`nothing to wire` when the host has nothing new to report),
+  every far-side value escaped onto that one line; a failure, or no answer within 15
+  seconds, is a `warning:` line and never fails the attach; entries past five per group are
+  counted, not named. An attach that finds the session already running raises nothing, so
+  a hook set narrowed by hand on the shed is not re-widened on every attach. See
+  [`shed attach`](https://charliek.github.io/shed/reference/cli/#shed-attach).
 - **`shed attach` and `shed sessions` are roost-native, with tmux as the unchanged floor**
   (owner decision D1, plan 022). With a local roost app running, `shed attach <shed>` opens
   the shed as a roost tab instead of a tmux session; with no local roost app, `--tmux`, or

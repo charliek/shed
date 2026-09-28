@@ -83,6 +83,7 @@ func newRoostRig(t *testing.T, tabs []roostprovider.Tab, withLanding bool) *roos
 		sidebarCap:    defaultRoostSidebarCap,
 		remoteCap:     defaultRoostRemoteCap,
 		startCap:      defaultRoostStartCap,
+		hooksCap:      defaultRoostHooksCap,
 		now:           rig.clock.now,
 		sleep:         rig.clock.sleep,
 	}

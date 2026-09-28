@@ -1,0 +1,22 @@
+{
+  "_comment": [
+    "The agent names every shed client raises a host's `agent-hooks` key to —",
+    "`session.set_agent_hooks`'s `agents` (plan 024 §3.4). roost's whole",
+    "wireable set, by value, in the order every client sends it.",
+    "",
+    "NOT a roost vector — see this directory's README, section 'shed's own",
+    "multi-language goldens'. This file is shed's, and it may be edited; the",
+    "no-semantic-edits rule applies to the vendored vectors around it.",
+    "",
+    "Asserted from both languages that raise it, which is the whole point:",
+    "  - Rust: crates/shed-core/tests/roost_provider_vectors.rs, against",
+    "    `shed_core::roost::bootstrap::ROOST_WIRED_AGENTS` (the desktop's and",
+    "    the phone's raise).",
+    "  - Go: internal/roostprovider/goldens_test.go, against `WiredAgents()`",
+    "    (`shed attach`'s start rung).",
+    "",
+    "No `gx`: it shares $GROK_HOME with grok and roost reports it as grok, so",
+    "wiring `grok` wires gx too. See ROOST_WIRED_AGENTS' doc comment."
+  ],
+  "agents": ["claude", "codex", "cursor", "grok", "opencode"]
+}

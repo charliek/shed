@@ -4,12 +4,13 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 )
 
-// The Go leg of the three shared goldens under crates/fixtures/roost-vectors/
-// (plan 019 §3.2, §3.3). The Rust leg is
+// The Go leg of the four shared goldens under crates/fixtures/roost-vectors/
+// (plan 019 §3.2, §3.3; plan 024 §3.4 for wired-agents.json). The Rust leg is
 // crates/shed-core/tests/roost_provider_vectors.rs, which asserts the same files
 // against the live `roost-ipc` functions they were derived from. Neither leg is
 // meaningful alone: this one proves Go matches the file, that one proves the
@@ -111,6 +112,21 @@ func TestAgentBinaryListMatchesGolden(t *testing.T) {
 	}
 	if want := strings.Join(names, ", "); agentBinaryList() != want {
 		t.Errorf("agentBinaryList() = %q, want %q", agentBinaryList(), want)
+	}
+}
+
+// TestWiredAgentsMatchesGolden pins the CLI's raise list to the shared golden.
+// The Rust leg pins the same file to shed-core's `ROOST_WIRED_AGENTS` — the
+// list the desktop and the phone raise — so the two languages' lists are one
+// list by construction rather than by convention. Order is asserted too: both
+// sides send it as written, and a reorder is a wire change a reader should see.
+func TestWiredAgentsMatchesGolden(t *testing.T) {
+	var golden struct {
+		Agents []string `json:"agents"`
+	}
+	readVectorJSON(t, "wired-agents.json", &golden)
+	if got := WiredAgents(); !slices.Equal(got, golden.Agents) {
+		t.Errorf("WiredAgents() = %q, the golden says %q", got, golden.Agents)
 	}
 }
 

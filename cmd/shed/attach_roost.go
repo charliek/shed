@@ -9,6 +9,8 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/charliek/shed/internal/config"
 	"github.com/charliek/shed/internal/roostctl"
@@ -111,7 +113,30 @@ const (
 	// that hung. One budget over both halves for the same reason
 	// defaultRoostRemoteCap covers step 6's three calls.
 	defaultRoostStartCap = 60 * time.Second
+
+	// defaultRoostHooksCap bounds the start rung's agent-hook raise
+	// (`session.set_agent_hooks`, plan 024 D4) — roost-iced's own budget for
+	// the same op.
+	//
+	// A SUB-deadline, derived from the rung's startCap-bounded context rather
+	// than beside it, so the rung's documented 60 s envelope still bounds
+	// everything; a typical start plus identify is ~3 s, so the raise normally
+	// gets all of this. Its own number because the raise is an enrichment: a
+	// host that takes the rest of the minute to answer it must not hold an
+	// attach that has already succeeded in every way that matters.
+	defaultRoostHooksCap = 15 * time.Second
 )
+
+// roostHooksClient is the `client` label `shed attach` raises agent hooks
+// under. The host records it as the `by` of its agent-hooks state entry, so it
+// is how a user reading `~/.config/roost/agent-hooks.json` on a shed tells the
+// CLI's raise from the desktop's ("shed-desktop") or the phone's
+// ("shed-mobile").
+const roostHooksClient = "shed-cli"
+
+// remoteValueCap is how many runes of one far-side value sanitizeRemoteText
+// prints before cutting it with an ellipsis.
+const remoteValueCap = 120
 
 // aliasAmbiguityBudget bounds step 3's "does another server have a shed of
 // this name" question — ALL of it, however many servers are configured. See
@@ -165,6 +190,12 @@ type roostAttach struct {
 	// for the same reason remoteCap is one: it bounds network calls, and it is
 	// one assert to move.
 	startCap time.Duration
+	// hooksCap bounds the agent-hook raise that follows a start the rung
+	// performed (defaultRoostHooksCap). A real context deadline like startCap,
+	// NOT the fake clock below, which only drives polling. Must be set: a zero
+	// value is an already-expired deadline that turns every raise into a
+	// warning.
+	hooksCap time.Duration
 
 	// shedName and shedEntry identify the shed this attempt is for. The start
 	// rung reaches it over its OWN ssh (the same Target `ensureTab` uses), so
@@ -201,6 +232,7 @@ var newRoostAttach = func() *roostAttach {
 		sidebarCap:    defaultRoostSidebarCap,
 		remoteCap:     defaultRoostRemoteCap,
 		startCap:      defaultRoostStartCap,
+		hooksCap:      defaultRoostHooksCap,
 		now:           time.Now,
 		sleep:         time.Sleep,
 	}
@@ -917,13 +949,15 @@ func (e *roostStartRefusal) Unwrap() error {
 }
 
 // startRemoteSession is §3.4's rung: start the shed's own roost-session over
-// the shed's OWN ssh, then prove the session that answers is one this shed
-// speaks to.
+// the shed's OWN ssh, prove the session that answers is one this shed speaks
+// to, and then wire that host's agent hooks (plan 024 D4 — see
+// raiseAgentHooks).
 //
-// **Two calls, one budget** (defaultRoostStartCap): the deadline here is the
-// only thing that ends a start that hangs, and it has to cover the identify
-// too, or a session that comes up and then goes quiet hangs the attach after
-// the start succeeded.
+// **One budget over all three** (defaultRoostStartCap): the deadline here is
+// the only thing that ends a start that hangs, and it has to cover the
+// identify too, or a session that comes up and then goes quiet hangs the
+// attach after the start succeeded. The raise runs under its own shorter
+// sub-deadline carved out of the same budget.
 //
 // **The reach is the same one step 6 uses**, built through remoteFor rather
 // than composed here: a shed is always `<shed>@<server host> -p <server ssh
@@ -1004,7 +1038,155 @@ func (a *roostAttach) startRemoteSession(ctx context.Context, alias string) erro
 		// out what is over there.
 		return fmt.Errorf("confirming the roost-session on %s: %w", alias, err)
 	}
+	// **Placement is the policy** (plan 024 §3.4). Here and only here: after
+	// the compatible identify — protocol-6 parity with shed-core's PostStart →
+	// Hooks, which also covers an `already-running` accepted at the retry cap
+	// — and before connectHost's second `host connect`, so the hooks exist
+	// before step 6 opens the tab. Never on the already-connected early
+	// return, the not-installed shape, a protocol refusal or any rung failure,
+	// all of which return above or never reach this function; and at most
+	// once per attach, because the recoveryAttempted latch lets this function
+	// run at most once.
+	a.raiseAgentHooks(ctx, remote, target, alias)
 	return nil
+}
+
+// raiseAgentHooks is owner decision D4: after a start the rung performed, raise
+// the host's agent-hook set to roost's whole wireable set, labelled "shed-cli".
+//
+// **Why here, and why not on every attach.** A shed first reached from a
+// terminal would otherwise show no agent rows: the rung starts roost-session
+// but wires nothing, and the desktop cannot repair it later because its
+// bootstrap refuses a session that is already serving. Raising on EVERY attach
+// was rejected: a raise re-widens, so it would undo a hand-narrowed
+// `agent-hooks` key on the host every time anyone attached, and it would break
+// shed's rule of wiring only a session shed itself started. Consent is the
+// attach: the rung only ever targets a shed, a shed-managed VM writing into its
+// own `$HOME`.
+//
+// **It warns and continues, always** — parity with shed-core's hooks.rs, where
+// a hooks call that refused is a missing enrichment and never a failed
+// bootstrap. Nothing here returns an error: the session is up, the tab is about
+// to open, and failing the attach over this would throw away the part that
+// worked.
+//
+// Exactly one physical stderr line either way, every far-side value in it
+// sanitized (sanitizeRemoteText): on a reply, the summary (hooksSummary); on a
+// transport failure, an `ok:false`, a malformed reply or the sub-deadline
+// expiring, `warning: could not wire agent hooks on <alias>: <err>`.
+func (a *roostAttach) raiseAgentHooks(ctx context.Context, remote *roostprovider.Remote, target roostprovider.Target, alias string) {
+	hooksCtx, cancel := context.WithTimeout(ctx, a.hooksCap)
+	defer cancel()
+	outcome, err := remote.SetAgentHooks(hooksCtx, target, roostHooksClient)
+	if err != nil {
+		fmt.Fprintf(a.errOut, "warning: could not wire agent hooks on %s: %s\n", alias, sanitizeRemoteText(err.Error()))
+		return
+	}
+	fmt.Fprintf(a.errOut, "agent hooks on %s: %s\n", alias, hooksSummary(outcome))
+}
+
+// hooksSummary renders a raise's outcome as the tail of its one stderr line:
+// the non-empty groups joined by "; ", in the fixed order wired, refreshed,
+// removed, skipped, failed — `wired a, b`, `skipped c (reason)`, `failed d
+// (error)`. With every group empty it is exactly "nothing to wire" — a real
+// answer (every agent named was already wired and already announced to some
+// client), which must not print as a line with nothing after the colon.
+func hooksSummary(o roostprovider.AgentHooksOutcome) string {
+	// Agent and detail are sanitized separately, so each keeps its own cap.
+	withDetail := func(agent, detail string) string {
+		return sanitizeRemoteText(agent) + " (" + sanitizeRemoteText(detail) + ")"
+	}
+	var groups []string
+	groups = appendHooksGroup(groups, "wired", o.Wired, sanitizeRemoteText)
+	groups = appendHooksGroup(groups, "refreshed", o.Refreshed, sanitizeRemoteText)
+	groups = appendHooksGroup(groups, "removed", o.Removed, sanitizeRemoteText)
+	groups = appendHooksGroup(groups, "skipped", o.Skipped, func(s roostprovider.AgentHooksSkip) string {
+		return withDetail(s.Agent, s.Reason)
+	})
+	groups = appendHooksGroup(groups, "failed", o.Errors, func(f roostprovider.AgentHooksFailure) string {
+		return withDetail(f.Agent, f.Error)
+	})
+	if len(groups) == 0 {
+		return "nothing to wire"
+	}
+	return strings.Join(groups, "; ")
+}
+
+// hooksGroupCap is how many entries of one summary group the hooks line names;
+// the rest are counted as `(+N more)`.
+//
+// **Per-value caps alone do not bound the line.** A replaced or hostile daemon
+// can answer with 100,000 names of 120 runes each and still fit the transport's
+// 16 MiB — a ~12 MB single stderr line, written synchronously, which a slow
+// terminal or pipe can hold past the rung's whole budget (no context interrupts
+// a stderr write). A legitimate reply never names an agent shed did not ask
+// for, so more entries than WiredAgents() is already anomalous; capping at that
+// count bounds the line to about 17 KB in the very worst case (five groups,
+// five entries each, every value remoteValueCap runes of four bytes, a skipped
+// or failed entry carrying two values; TestHooksSummaryWorstCaseIsBounded pins
+// it) while a real reply prints in full.
+var hooksGroupCap = len(roostprovider.WiredAgents())
+
+// appendHooksGroup appends one summary group — `label a, b` — to groups, or
+// nothing when items is empty. Past hooksGroupCap entries the group ends in
+// `(+N more)`.
+func appendHooksGroup[T any](groups []string, label string, items []T, show func(T) string) []string {
+	if len(items) == 0 {
+		return groups
+	}
+	named := items[:min(len(items), hooksGroupCap)]
+	shown := make([]string, len(named))
+	for i, item := range named {
+		shown[i] = show(item)
+	}
+	group := label + " " + strings.Join(shown, ", ")
+	if rest := len(items) - len(named); rest > 0 {
+		group += fmt.Sprintf(" (+%d more)", rest)
+	}
+	return append(groups, group)
+}
+
+// sanitizeRemoteText makes one far-side value safe to print inside a single
+// terminal line. Its first caller is the agent-hooks line, whose every value
+// came from the host.
+//
+// Far-side text is untrusted display text: roost documents skip reasons and
+// per-agent errors as free display strings, and a session that is not the one
+// shed expects could send anything — a newline that forges a second line, a
+// `\x1b[…` sequence that recolours or rewrites the terminal. So every
+// control character is escaped into visible text — `\n`, `\r`, `\t` by name,
+// the rest (ESC, DEL, the C1 block) as `\xNN` / `\u00NN` — as are the two
+// Unicode line/paragraph separators, and the result is cut at remoteValueCap
+// runes with an ellipsis. The cut falls between whole escapes, never inside
+// one.
+func sanitizeRemoteText(s string) string {
+	var b strings.Builder
+	shown := 0
+	for _, r := range s {
+		var piece string
+		switch {
+		case r == '\n':
+			piece = `\n`
+		case r == '\r':
+			piece = `\r`
+		case r == '\t':
+			piece = `\t`
+		case r < 0x80 && unicode.IsControl(r):
+			piece = fmt.Sprintf(`\x%02x`, r)
+		case unicode.IsControl(r), r == '\u2028', r == '\u2029':
+			piece = fmt.Sprintf(`\u%04x`, r)
+		default:
+			piece = string(r)
+		}
+		width := utf8.RuneCountInString(piece)
+		if shown+width > remoteValueCap {
+			b.WriteString("…")
+			break
+		}
+		b.WriteString(piece)
+		shown += width
+	}
+	return b.String()
 }
 
 // ensureTab is §3.3 step 6: reuse the shed's tab of this title, or open one.

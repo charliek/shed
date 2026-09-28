@@ -8,19 +8,22 @@ import (
 	"io"
 )
 
-// roost's op names (`roost_ipc::messages::ops`). Four, and no more: the
-// provider gates on identify, reads projects and their tabs, opens a tab, and
-// closes one. At session protocol 5 nothing on this wire is lease-gated any
-// more — the lease, its takeover table and `session.connect` all retired with
-// generation 4 — so `tab.open` needs no authority to check either, and neither
-// does `tab.close`. The provider's cut was always this leaseless shape; roost's
-// bump only made it official.
+// roost's op names (`roost_ipc::messages::ops`). Six, and no more: this
+// package gates on identify, reads projects and their tabs, opens a tab, locks
+// its title, and closes one — and `shed attach`'s start rung raises the host's
+// agent-hook set after a start it performed (plan 024 D4). At session protocol
+// 5 nothing on this wire is lease-gated any more — the lease, its takeover
+// table and `session.connect` all retired with generation 4 — so `tab.open`
+// needs no authority to check, and neither do `tab.close` or the hooks raise
+// (open to every same-UID client since then). The provider's cut was always
+// this leaseless shape; roost's bump only made it official.
 const (
-	opSessionIdentify = "session.identify"
-	opTabList         = "tab.list"
-	opTabOpen         = "tab.open"
-	opTabClose        = "tab.close"
-	opTabSetTitle     = "tab.set_title"
+	opSessionIdentify      = "session.identify"
+	opTabList              = "tab.list"
+	opTabOpen              = "tab.open"
+	opTabClose             = "tab.close"
+	opTabSetTitle          = "tab.set_title"
+	opSessionSetAgentHooks = "session.set_agent_hooks"
 )
 
 // SpokenProtocol is the roost session protocol this build speaks —
@@ -349,4 +352,123 @@ type TabSetTitleParams struct {
 
 type TabCloseParams struct {
 	TabID string `json:"tab_id"`
+}
+
+// wiredAgents is the set every shed client raises a host's `agent-hooks` key
+// to — roost's whole wireable set, by value. Go's copy of shed-core's
+// `ROOST_WIRED_AGENTS` (crates/shed-core/src/roost/bootstrap/hooks.rs), which
+// the desktop and the phone send; see that constant for why these five and
+// why never `gx`.
+//
+// **Not derived from agentTable.** That is a LAUNCH table — `cursor-agent`,
+// `gx` — in the provider menu's vocabulary; this is roost's adapter names. The
+// two lists answer different questions and share no spelling rule.
+//
+// **Pinned across languages by crates/fixtures/roost-vectors/wired-agents.json**,
+// asserted against this array here (goldens_test.go) and against the Rust
+// constant there (roost_provider_vectors.rs), so the CLI's raise and the
+// desktop's cannot drift apart.
+//
+// An unexported ARRAY behind a copying accessor rather than an exported slice:
+// the list is a policy (Rust's is a `const`), and a slice var would hand every
+// importer a way to rewrite what shed raises.
+var wiredAgents = [5]string{"claude", "codex", "cursor", "grok", "opencode"}
+
+// WiredAgents returns the agent names shed raises a host's `agent-hooks` key
+// to, as a fresh slice the caller may do anything with.
+func WiredAgents() []string {
+	return append([]string(nil), wiredAgents[:]...)
+}
+
+// SetAgentHooksParams are the `session.set_agent_hooks` params — protocol 6's
+// raise. roost's struct is `deny_unknown_fields`, `agents` must be non-empty
+// and `client` is required, so these two keys and no others; wire_test.go pins
+// the exact request JSON and its key parity with roost's own request vector.
+//
+// `client` is who is asking: the host records it as the `by` of its
+// agent-hooks state entry (`~/.config/roost/agent-hooks.json` there), which is
+// how a user finds out which client wired these hooks last.
+type SetAgentHooksParams struct {
+	Agents []string `json:"agents"`
+	Client string   `json:"client"`
+}
+
+// AgentHooksSkip is one agent the host did not act on, and why. roost's
+// `AgentHooksSkipped`: `reason` is a free display string ("not installed",
+// "not allowed", "unknown"), never a code — which is why a caller that prints
+// it must treat it as untrusted text.
+type AgentHooksSkip struct {
+	Agent  string `json:"agent"`
+	Reason string `json:"reason"`
+}
+
+// AgentHooksFailure is one agent the host tried to wire and could not
+// (roost's `AgentHooksFailed`).
+type AgentHooksFailure struct {
+	Agent string `json:"agent"`
+	Error string `json:"error"`
+}
+
+// AgentHooksOutcome is `session.set_agent_hooks`'s reply (roost's
+// `AgentHooksOutcome`).
+//
+// `Wired` is roost's FIRST-ANNOUNCEMENT list — agents this host has wired and
+// never told any client about — not "what this call wrote"; `Refreshed` covers
+// the rest. `Removed` is always empty from this op (a raise only widens). An
+// all-empty outcome is a real answer — roost gives it when every agent the
+// raise named is already wired and already announced to some client (roost's
+// own `a_second_client_is_told_nothing`) — and is distinct from a MISSING
+// field; see agentHooksOutcomeWire.
+type AgentHooksOutcome struct {
+	Wired     []string
+	Refreshed []string
+	Removed   []string
+	Skipped   []AgentHooksSkip
+	Errors    []AgentHooksFailure
+}
+
+// agentHooksOutcomeWire is the decode side of AgentHooksOutcome, and the
+// reason it is a separate type: **presence**.
+//
+// roost's five outcome fields are REQUIRED (no `#[serde(default)]` on
+// `AgentHooksOutcome`), but Go's decoder reads a missing key and an empty
+// array identically — so `result:{}` would decode into an all-empty outcome
+// and be reported to the user as "nothing to wire", a statement about the host
+// that the reply never made. Pointer fields tell the two apart: a nil pointer
+// is a key the reply did not carry (or carried as `null`, which roost never
+// emits for a `Vec`), and that is a MalformedReplyError, the same treatment
+// Identify gives a missing `session_protocol`.
+type agentHooksOutcomeWire struct {
+	Wired     *[]string            `json:"wired"`
+	Refreshed *[]string            `json:"refreshed"`
+	Removed   *[]string            `json:"removed"`
+	Skipped   *[]AgentHooksSkip    `json:"skipped"`
+	Errors    *[]AgentHooksFailure `json:"errors"`
+}
+
+// outcome checks every field is present, in roost's declaration order, and
+// unwraps them. The first missing one names the error.
+func (w agentHooksOutcomeWire) outcome() (AgentHooksOutcome, error) {
+	missing := func(field string) (AgentHooksOutcome, error) {
+		return AgentHooksOutcome{}, &MalformedReplyError{Op: opSessionSetAgentHooks, Reason: "no " + field}
+	}
+	switch {
+	case w.Wired == nil:
+		return missing("wired")
+	case w.Refreshed == nil:
+		return missing("refreshed")
+	case w.Removed == nil:
+		return missing("removed")
+	case w.Skipped == nil:
+		return missing("skipped")
+	case w.Errors == nil:
+		return missing("errors")
+	}
+	return AgentHooksOutcome{
+		Wired:     *w.Wired,
+		Refreshed: *w.Refreshed,
+		Removed:   *w.Removed,
+		Skipped:   *w.Skipped,
+		Errors:    *w.Errors,
+	}, nil
 }
