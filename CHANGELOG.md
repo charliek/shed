@@ -65,11 +65,15 @@ verbatim._
   check**, because it reads the same feed with the same key.
 - **shed re-pins to roost's session protocol 6, in two steps — 5 then 6 — completing the
   migration plan 019 left in motion (plan 020, roost#477 / roost plan 061; plan 021, roost
-  plan 064 / roost#489).** `roost-ipc` moved to `c1bfe887bc843e35466a1dcc33fa2390909fd50e`
-  for protocol 5, then to `ee71e44a1de3c0de4c59ac0267c0a5e0c993d88a` for protocol 6, and
-  finally to `8c91ce9ddd49c5a43841f72ecd149dd778d6151c` — the **roost v0.0.20 release tag**,
+  plan 064 / roost#489), then re-pins again onto roost's bug-fix release (plan 024).**
+  `roost-ipc` moved to `c1bfe887bc843e35466a1dcc33fa2390909fd50e`
+  for protocol 5, then to `ee71e44a1de3c0de4c59ac0267c0a5e0c993d88a` for protocol 6, then to
+  `8c91ce9ddd49c5a43841f72ecd149dd778d6151c` — the **roost v0.0.20 release tag**,
   the first published roost that speaks 6 (the `roost-ipc` crate is byte-identical to
-  `ee71e44`'s; the tag is what makes it a rev somebody ships) — in
+  `ee71e44`'s; the tag is what makes it a rev somebody ships) — and finally to
+  `2bc71fa3848ddbf2d190aab6c4ef61ad2d432aa1` — the **roost v0.0.21 release tag**, roost's
+  bug-fix release after v0.0.20 (it includes roost plan 072; protocol is still 6; the one
+  `roost-ipc` API change shed sees is `TabOpenParams.cwd_from_tab`) — in
   every manifest that pins it (`crates/Cargo.toml`, the Tauri crate's, and — once
   shed-mobile's own re-pin lands — its `rust/Cargo.toml`). **Protocol 5 retired the
   lease.** The lease is gone from the wire with no replacement: `session.connect`, the
@@ -100,7 +104,7 @@ verbatim._
   for the re-widening consequence of a raise and the gx/`$GROK_HOME` "not installed"
   surprise on a fresh host. **The phone-install rung is fixed by this release:** roost
   v0.0.20 (`8c91ce9`) is the first published release that speaks session protocol 6, and
-  `RELEASE_PIN` is now `Some("0.0.20")` — so the desktop's release-asset rung (rung 3)
+  `RELEASE_PIN` is now `Some("0.0.21")` (roost v0.0.21) — so the desktop's release-asset rung (rung 3)
   installs a `roost-session` onto a fresh Linux target straight from the GitHub release,
   checksum-verified against its published `.sha256`, with no `$ROOST_SESSION_INSTALL_BIN`
   and no sibling binary needed. The "nothing can supply these bytes" sentence is pin-aware
@@ -387,6 +391,25 @@ verbatim._
   `RcKindFeatures`, `RcCapabilities`, `RcAgentInfo`, `RcError` — it's what the lane
   adapters, `roost::model`, and shed-mobile read; `kind_features` is now derived
   client-side from whether a lane adapter is attached, not read off the wire.
+- **`shed attach` starts a shed's stopped `roost-session` itself, and wires its agent hooks
+  when it does** (plan 023, #383; plan 024, #387). When roost reports a reachable shed with
+  no session running, `shed attach` now runs `roost-session start` over the shed's own SSH
+  connection instead of ending at the "has no roost-session" message — printing `starting
+  roost-session on shed-<name>…`, bounded at 60 seconds, attempted at most once per attach,
+  and gated by a post-start `session.identify` (a session speaking another protocol is a
+  hard error naming both versions, never a retry). A shed with no `roost-session`
+  *installed* keeps the old message byte for byte. After a start it performed or accepted
+  (another client winning the start race in the same moment) — and only then — the attach
+  raises shed's agent-hook set on that shed (`session.set_agent_hooks`, the same five names
+  the desktop sends, recorded as `"shed-cli"` in the shed's `~/.config/roost/agent-hooks.json`),
+  so a shed first reached from a terminal shows agent rows without the desktop ever
+  bootstrapping it. It prints one line naming what was
+  wired, skipped or failed (`nothing to wire` when the host has nothing new to report),
+  every far-side value escaped onto that one line; a failure, or no answer within 15
+  seconds, is a `warning:` line and never fails the attach; entries past five per group are
+  counted, not named. An attach that finds the session already running raises nothing, so
+  a hook set narrowed by hand on the shed is not re-widened on every attach. See
+  [`shed attach`](https://charliek.github.io/shed/reference/cli/#shed-attach).
 - **`shed attach` and `shed sessions` are roost-native, with tmux as the unchanged floor**
   (owner decision D1, plan 022). With a local roost app running, `shed attach <shed>` opens
   the shed as a roost tab instead of a tmux session; with no local roost app, `--tmux`, or
@@ -408,6 +431,15 @@ verbatim._
   [`shed attach`](https://charliek.github.io/shed/reference/cli/#shed-attach) and
   [`shed sessions`](https://charliek.github.io/shed/reference/cli/#shed-sessions) in the
   CLI reference.
+- **The `extensions` rootfs image bakes `/usr/bin/roost-session`, the standalone headless
+  roost daemon (roost v0.0.21, session protocol 6), from its GitHub release asset.** No
+  headless deb exists, and the GUI deb would pull ~45 X11/Wayland packages, so the binary is
+  fetched from the standalone release asset instead — its version and per-architecture
+  sha256 digests are pinned in-tree (not fetched at build time) and checked with
+  `sha256sum -c` plus a build-time `identify` assert. `make check-roost-pin` keeps both
+  Dockerfiles' pin in lockstep with `RELEASE_PIN`/`LATEST_KNOWN_RELEASE` in
+  `crates/shed-core/src/roost/bootstrap/source.rs`. No systemd unit is enabled — the CLI,
+  the desktop app, and the phone app start it on first contact.
 - **`shed-server` restarts no longer leave a running shed's credential channel broken**
   (#315). The host only ever dials the guest, never the reverse, so a restart — which every
   brew/apt upgrade performs — left every already-running shed silently credential-broken:

@@ -778,20 +778,37 @@ check-kernel-pin:
 # rootfs Dockerfiles (ARG ROOST_SESSION_VERSION / ROOST_SESSION_PROTOCOL)
 # must match the Rust source of truth: RELEASE_PIN's version and
 # LATEST_KNOWN_RELEASE's protocol in crates/shed-core/src/roost/bootstrap/source.rs.
-# Modeled on check-kernel-pin above — same fail-fast-on-drift shape.
+# It also holds both Dockerfiles' ROOST_SESSION_SHA256_{AMD64,ARM64} ARGs in
+# lockstep with each other — it cannot verify the digests offline (that is
+# what each image build's sha256sum -c does), but it stops the two files
+# drifting apart, which matters most for the pair no build ever exercises:
+# vz only ever builds arm64 (on the Mac) and fc only ever builds amd64 (on
+# mini3), so vz's AMD64 value and fc's ARM64 value are never proven by a
+# build. Modeled on check-kernel-pin above — same fail-fast-on-drift shape.
+# Portable to macOS BSD sed/grep: awk/sed -E only, no grep -P (023 found that
+# breaks there).
 check-roost-pin:
 	@vz_v=$$(awk -F= '/^ARG ROOST_SESSION_VERSION=/ { print $$2; exit }' vz/Dockerfile) ; \
 	 fc_v=$$(awk -F= '/^ARG ROOST_SESSION_VERSION=/ { print $$2; exit }' firecracker/Dockerfile) ; \
 	 vz_p=$$(awk -F= '/^ARG ROOST_SESSION_PROTOCOL=/ { print $$2; exit }' vz/Dockerfile) ; \
 	 fc_p=$$(awk -F= '/^ARG ROOST_SESSION_PROTOCOL=/ { print $$2; exit }' firecracker/Dockerfile) ; \
+	 vz_amd64=$$(awk -F= '/^ARG ROOST_SESSION_SHA256_AMD64=/ { print $$2; exit }' vz/Dockerfile) ; \
+	 fc_amd64=$$(awk -F= '/^ARG ROOST_SESSION_SHA256_AMD64=/ { print $$2; exit }' firecracker/Dockerfile) ; \
+	 vz_arm64=$$(awk -F= '/^ARG ROOST_SESSION_SHA256_ARM64=/ { print $$2; exit }' vz/Dockerfile) ; \
+	 fc_arm64=$$(awk -F= '/^ARG ROOST_SESSION_SHA256_ARM64=/ { print $$2; exit }' firecracker/Dockerfile) ; \
 	 pin_v=$$(sed -n 's/^pub const RELEASE_PIN: .*RoostRelease { version: "\([0-9.][0-9.]*\)".*/\1/p' crates/shed-core/src/roost/bootstrap/source.rs | head -1) ; \
 	 known_p=$$(sed -n 's/^pub const LATEST_KNOWN_RELEASE: .*= ("[0-9.]*", \([0-9][0-9]*\)).*/\1/p' crates/shed-core/src/roost/bootstrap/source.rs | head -1) ; \
-	 if [ -z "$$vz_v" ] || [ -z "$$fc_v" ] || [ -z "$$vz_p" ] || [ -z "$$fc_p" ] || [ -z "$$pin_v" ] || [ -z "$$known_p" ]; then \
+	 if [ -z "$$vz_v" ] || [ -z "$$fc_v" ] || [ -z "$$vz_p" ] || [ -z "$$fc_p" ] || [ -z "$$pin_v" ] || [ -z "$$known_p" ] || \
+	    [ -z "$$vz_amd64" ] || [ -z "$$fc_amd64" ] || [ -z "$$vz_arm64" ] || [ -z "$$fc_arm64" ]; then \
 	   echo "ERROR: roost-session pin values missing:" ; \
 	   echo "  vz/Dockerfile ARG ROOST_SESSION_VERSION:           $$vz_v" ; \
 	   echo "  firecracker/Dockerfile ARG ROOST_SESSION_VERSION:  $$fc_v" ; \
 	   echo "  vz/Dockerfile ARG ROOST_SESSION_PROTOCOL:          $$vz_p" ; \
 	   echo "  firecracker/Dockerfile ARG ROOST_SESSION_PROTOCOL: $$fc_p" ; \
+	   echo "  vz/Dockerfile ARG ROOST_SESSION_SHA256_AMD64:      $$vz_amd64" ; \
+	   echo "  firecracker/Dockerfile ARG ROOST_SESSION_SHA256_AMD64: $$fc_amd64" ; \
+	   echo "  vz/Dockerfile ARG ROOST_SESSION_SHA256_ARM64:      $$vz_arm64" ; \
+	   echo "  firecracker/Dockerfile ARG ROOST_SESSION_SHA256_ARM64: $$fc_arm64" ; \
 	   echo "  RELEASE_PIN version:                               $$pin_v" ; \
 	   echo "  LATEST_KNOWN_RELEASE protocol:                     $$known_p" ; \
 	   exit 1 ; \
@@ -803,6 +820,17 @@ check-roost-pin:
 	   echo "  crates/shed-core RELEASE_PIN version:            $$pin_v" ; \
 	   echo "  crates/shed-core LATEST_KNOWN_RELEASE protocol:  $$known_p" ; \
 	   echo "Bump in lockstep (see docs/reference/images.md)." ; \
+	   exit 1 ; \
+	 fi ; \
+	 if [ "$$vz_amd64" != "$$fc_amd64" ] || [ "$$vz_arm64" != "$$fc_arm64" ]; then \
+	   echo "ERROR: roost-session digests drifted between Dockerfiles:" ; \
+	   if [ "$$vz_amd64" != "$$fc_amd64" ]; then \
+	     echo "  ROOST_SESSION_SHA256_AMD64: vz=$$vz_amd64 fc=$$fc_amd64" ; \
+	   fi ; \
+	   if [ "$$vz_arm64" != "$$fc_arm64" ]; then \
+	     echo "  ROOST_SESSION_SHA256_ARM64: vz=$$vz_arm64 fc=$$fc_arm64" ; \
+	   fi ; \
+	   echo "Both Dockerfiles must carry the identical digest pair (see docs/reference/images.md)." ; \
 	   exit 1 ; \
 	 fi ; \
 	 echo "roost-session pin OK: $$vz_v / protocol $$vz_p"

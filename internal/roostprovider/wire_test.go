@@ -3,6 +3,7 @@ package roostprovider
 import (
 	"bytes"
 	"encoding/json"
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -80,6 +81,17 @@ func TestExactRequestJSON(t *testing.T) {
 			op:     opTabClose,
 			params: TabCloseParams{TabID: "5"},
 			want:   `{"id":"1","op":"tab.close","params":{"tab_id":"5"}}`,
+		},
+		{
+			// The start rung's raise (plan 024 D4): shed's own five names and
+			// the CLI's label, `{agents, client}` and nothing else — roost's
+			// params are deny_unknown_fields, `agents` must be non-empty and
+			// `client` is required.
+			name:   "session.set_agent_hooks",
+			op:     opSessionSetAgentHooks,
+			params: SetAgentHooksParams{Agents: WiredAgents(), Client: "shed-cli"},
+			want: `{"id":"1","op":"session.set_agent_hooks","params":` +
+				`{"agents":["claude","codex","cursor","grok","opencode"],"client":"shed-cli"}}`,
 		},
 		{
 			// HTML escaping is off, so an `&` in a cwd travels as itself.
@@ -331,6 +343,79 @@ func TestVendoredVectorsDecode(t *testing.T) {
 			t.Errorf("tab id = %q", opened.Tab.ID)
 		}
 	})
+
+	// Through the presence-aware wire DTO, the way SetAgentHooks decodes it:
+	// roost's own reply carries all five fields, the empty ones as `[]`, and
+	// they must come out present-and-empty rather than tripping the check.
+	t.Run("session.set_agent_hooks", func(t *testing.T) {
+		var wire agentHooksOutcomeWire
+		decodeVectorResult(t, "session.set_agent_hooks.response.json", &wire)
+		got, err := wire.outcome()
+		if err != nil {
+			t.Fatalf("roost's own hooks reply was refused: %v", err)
+		}
+		if !reflect.DeepEqual(got, vectorHooksOutcome) {
+			t.Errorf("outcome:\n got %+v\nwant %+v", got, vectorHooksOutcome)
+		}
+	})
+}
+
+// vectorHooksOutcome is session.set_agent_hooks.response.json's `result`,
+// decoded — the empty groups as present, non-nil empty slices.
+var vectorHooksOutcome = AgentHooksOutcome{
+	Wired:     []string{"claude", "codex"},
+	Refreshed: []string{},
+	Removed:   []string{},
+	Skipped: []AgentHooksSkip{
+		{Agent: "cursor", Reason: "not allowed"},
+		{Agent: "grok", Reason: "not installed"},
+	},
+	Errors: []AgentHooksFailure{},
+}
+
+// TestSetAgentHooksRequestMatchesTheVendoredVector is the Go twin of shed-core's
+// `the_raise_matches_the_vendored_request_except_for_its_own_agents`
+// (crates/shed-core/src/roost/conn.rs): the raise shed sends is roost's own
+// request vector key for key — the envelope and every params key — except
+// `agents`, whose VALUE is shed's decision. roost's vector carries its own
+// two-name example there, and re-vendoring the file to make a whole-object
+// compare work would be a semantic edit of a copy that must stay roost's; so
+// the shape is pinned by the vector and the content by WiredAgents().
+func TestSetAgentHooksRequestMatchesTheVendoredVector(t *testing.T) {
+	var want map[string]any
+	readVectorJSON(t, "session.set_agent_hooks.request.json", &want)
+	wantParams, _ := want["params"].(map[string]any)
+	client, _ := wantParams["client"].(string)
+
+	line, err := encodeRequest(opSessionSetAgentHooks, SetAgentHooksParams{Agents: WiredAgents(), Client: client})
+	if err != nil {
+		t.Fatalf("encodeRequest: %v", err)
+	}
+	var got map[string]any
+	if err := json.Unmarshal(line, &got); err != nil {
+		t.Fatalf("our own request is not JSON: %v", err)
+	}
+
+	// The id is a STRING on both sides; its value is each recording's own
+	// correlation id, so it is compared by type and then carried over.
+	_, gotString := got["id"].(string)
+	_, wantString := want["id"].(string)
+	if !gotString || !wantString {
+		t.Errorf("id is not a string on both sides: ours %v, the vector's %v", got["id"], want["id"])
+	}
+	want["id"] = got["id"]
+	// `agents` is shed's decision, not the vector's two-name example.
+	if wantParams != nil {
+		wantParams["agents"] = WiredAgents()
+	}
+
+	// Every other key and value, envelope and params, against roost's bytes.
+	// json.Marshal sorts map keys, so the two renderings are canonical.
+	gotJSON, _ := json.Marshal(got)
+	wantJSON, _ := json.Marshal(want)
+	if string(gotJSON) != string(wantJSON) {
+		t.Errorf("request:\n got %s\nwant %s", gotJSON, wantJSON)
+	}
 }
 
 // decodeVectorResult unwraps a vendored reply's `result` and decodes it.

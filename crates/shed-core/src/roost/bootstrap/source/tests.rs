@@ -16,8 +16,8 @@
 //!
 //! **What is NOT covered, and why:** rung 3 against the real
 //! `github.com/charliek/roost` release. [`RELEASE_PIN`] now names one — roost
-//! v0.0.20, the first published release speaking session protocol
-//! [`SESSION_PROTOCOL_VERSION`] — but a unit test may not reach across the
+//! v0.0.21 (v0.0.20 was the first published release speaking session protocol
+//! [`SESSION_PROTOCOL_VERSION`]) — but a unit test may not reach across the
 //! network to fetch it, so the same version is driven against the loopback
 //! fixture instead. Every clause of the fetch contract is exercised here; what
 //! is untested is one URL.
@@ -52,7 +52,7 @@ const TARGET: &str = "roost:popos/p019-a";
 /// The pinned release's version — [`LATEST_KNOWN_RELEASE`]'s, which is what
 /// [`RELEASE_PIN`] names. The rung-3 rows drive it against the loopback fixture
 /// rather than against the real release page.
-const VERSION: &str = "0.0.20";
+const VERSION: &str = "0.0.21";
 
 /// A real roost release from **before** protocol 6, deliberately not
 /// [`LATEST_KNOWN_RELEASE`]: the incumbent a host bootstrapped long ago — or one
@@ -469,14 +469,16 @@ fn pinned_asset() -> Source {
 /// The external gate, now open — asserted rather than described.
 ///
 /// Plan 019 §3.5 kept the asset rung behind a pin until a roost release spoke
-/// this generation; roost v0.0.20 does, and plan 023 §3.2 flipped it. What is
-/// asserted here is the invariant that survives the flip: the pin and the
-/// latest release shed knows of are **one** release, and it speaks the protocol
-/// this shed speaks. A pin naming a release that does not is the mistake this
-/// row exists to catch.
+/// this generation; roost v0.0.20 does, and plan 023 §3.2 flipped it. Plan 024
+/// §3.3 moved the pin again, to v0.0.21 — roost's bug-fix release after
+/// v0.0.20, still speaking the same protocol. What is asserted here is the
+/// invariant that survives both flips: the pin and the latest release shed
+/// knows of are **one** release, and it speaks the protocol this shed speaks.
+/// A pin naming a release that does not is the mistake this row exists to
+/// catch.
 #[test]
 fn the_pin_names_the_release_that_speaks_this_protocol() {
-    assert_eq!(LATEST_KNOWN_RELEASE, ("0.0.20", 6));
+    assert_eq!(LATEST_KNOWN_RELEASE, ("0.0.21", 6));
     let (version, protocol) = LATEST_KNOWN_RELEASE;
     assert_eq!(
         RELEASE_PIN,

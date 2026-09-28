@@ -73,7 +73,7 @@ func TestStartCommandCarriesNoEmbeddedSingleQuote(t *testing.T) {
 
 // TestParseStartVerdict pins roost's verdict grammar, copied from
 // `Verdict`'s Display and `Verdict::parse` at the pinned rev
-// (roost-ipc/src/session_launch.rs:186-246). roost publishes no vector for a
+// (roost-ipc/src/session_launch.rs:187-247). roost publishes no vector for a
 // verdict line, so this table IS the pin on this side.
 func TestParseStartVerdict(t *testing.T) {
 	cases := []struct {

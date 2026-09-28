@@ -1,7 +1,7 @@
 //! **The Rust leg of the `shed roost-provider` goldens** (plan 019 §3.2, §3.3).
 //!
 //! The provider is Go (`internal/roostprovider/`, in the `server` component,
-//! which has no Rust in it) but three of the things it has to get exactly right
+//! which has no Rust in it) but four of the things it has to get exactly right
 //! are defined in Rust — two of them in `roost-ipc` itself, at the rev
 //! `crates/Cargo.toml` pins. A Go constant that merely *looked* right on the day
 //! it was copied is the failure mode; a golden asserted from BOTH sides is what
@@ -12,6 +12,7 @@
 //! | `bootstrap/exec-chain-command.txt` | the live `roost_ipc::bootstrap::exec_chain_command(false)` | `roostprovider.ExecChainCommand` |
 //! | `agent-table.json` | `launch_argv` + `roost_capabilities().kinds` | `roostprovider`'s `agentTable` |
 //! | `stderr-classes.json` (`classes`) | the live `roost_ipc::ssh::classify_ssh_failure` | `roostprovider.ClassifySSHFailure` |
+//! | `wired-agents.json` | `shed_core::roost::bootstrap::ROOST_WIRED_AGENTS` (the desktop's and the phone's raise) | `roostprovider.WiredAgents()` (`shed attach`'s start-rung raise) |
 //!
 //! `stderr-classes.json`'s other section, `provider_rows`, is shed-only (nothing
 //! in Rust has a provider menu) and is asserted from Go alone — see that file's
@@ -37,6 +38,7 @@ use roost_ipc::bootstrap::exec_chain_command;
 use roost_ipc::messages::SESSION_PROTOCOL_VERSION;
 use roost_ipc::ssh::{classify_ssh_failure, SshFailure};
 use shed_core::rc::RcKind;
+use shed_core::roost::bootstrap::ROOST_WIRED_AGENTS;
 use shed_core::roost::model::{launch_argv, roost_capabilities};
 
 /// Set this to 1 to REWRITE the generated goldens instead of asserting them.
@@ -241,6 +243,30 @@ fn the_stderr_classes_golden_is_roosts_own_classifier() {
             "not-found",
             "transport",
         ])
+    );
+}
+
+/// `wired-agents.json`'s shape: the `_comment` is ignored.
+#[derive(serde::Deserialize)]
+struct WiredAgents {
+    agents: Vec<String>,
+}
+
+/// The names every shed client raises a host's `agent-hooks` key to are ONE
+/// list across both languages that raise it: the desktop and the phone send
+/// [`ROOST_WIRED_AGENTS`], `shed attach`'s start rung sends Go's
+/// `WiredAgents()`, and each side is asserted against this same golden.
+///
+/// Compared as a SEQUENCE: both clients send the list as written, so a reorder
+/// is a change to what goes on the wire and should read as one.
+#[test]
+fn the_wired_agents_golden_is_shed_cores_raise() {
+    let golden: WiredAgents = serde_json::from_str(&read_vector("wired-agents.json"))
+        .expect("wired-agents.json's `agents` array");
+    assert_eq!(
+        golden.agents, ROOST_WIRED_AGENTS,
+        "ROOST_WIRED_AGENTS no longer matches wired-agents.json — move the golden \
+         and Go's WiredAgents() with it, or the CLI raises a different set than the desktop"
     );
 }
 

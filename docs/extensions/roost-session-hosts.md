@@ -41,10 +41,10 @@ decided in order, and the first rung that can answer wins:
 
 ### The release rung is fixed, as of 0.9.0
 
-**`RELEASE_PIN` is `0.0.20`** — roost v0.0.20 is the first published release that speaks
-session protocol 6, and shed 0.9.0 pins it. Before that the pin was `None`, because there was
-no release to point it at honestly; the flip was the one-line change it was designed to be (it
-sits beside the version/protocol pair below). A fresh Linux target on an architecture roost
+**`RELEASE_PIN` is `0.0.21`** — roost v0.0.20 is the first published release that speaks
+session protocol 6, and shed 0.9.0 pins v0.0.21, roost's bug-fix release after it. Before
+v0.0.20 the pin was `None`, because there was no release to point it at honestly; the flip was
+the one-line change it was designed to be (it sits beside the version/protocol pair below). A fresh Linux target on an architecture roost
 publishes a build for now gets a `roost-session` from the release asset, with no override
 variable and no sibling binary needed.
 
@@ -56,7 +56,7 @@ The client still has a sentence for "every rung failed", and it is **pin-aware**
 the reason that actually applies rather than repeating the pre-0.9.0 one. What you see today,
 when something has taken the release rung away:
 
-> the roost 0.0.20 release asset is not usable for `<target>`: either
+> the roost 0.0.21 release asset is not usable for `<target>`: either
 > `ROOST_SESSION_ASSET_BASE` names a base shed refuses, or roost publishes no roost-session
 > build for this architecture. On a Linux machine with a protocol-6 roost installed the desktop
 > uses that roost-session; otherwise point `ROOST_SESSION_INSTALL_BIN` at a protocol-6 build.
@@ -136,6 +136,16 @@ After a **Start that the client itself performed**, it sends
 protocol 5 dropped the lease entirely, so there is no `session.connect` to open first and
 nothing to hold or lose before sending it.
 
+**The CLI raises too, under `"shed-cli"`.** `shed attach`'s start rung — the one that starts
+a shed's stopped `roost-session` over the shed's own SSH connection — sends the same call
+with the same five names once that session's post-start identify passes: after a start the
+rung performed, or accepted because another client won the start race in the same moment (as
+the desktop's bootstrap does). An attach that finds the session already running sends
+nothing. It prints one line naming what
+the host wired, and a failure is a warning, never a failed attach. There is no consent card
+on this path: the rung only ever targets a shed, a shed-managed VM writing into its own
+`$HOME`, and running `shed attach` against it is the consent.
+
 **At session protocol 6 this op is a raise, and a raise only ever widens.** `ROOST_WIRED_AGENTS`
 is shed's own constant naming roost's whole wireable set, by value — exactly five names,
 `claude`, `codex`, `cursor`, `grok`, `opencode` — and shed sends that same array on every call.
@@ -179,9 +189,11 @@ grok — and nothing else."
 moment*. An agent set up later is not retroactively wired by this one call — it gets wired the
 next time hooks are (re)sent, which is:
 
-- every `shed start` (each one performs a fresh Start-and-hooks cycle if a bootstrap runs), and
+- every `shed start` (each one performs a fresh Start-and-hooks cycle if a bootstrap runs),
 - every successful cycle of the watcher for a target this client bootstrapped — re-sent on
-  every reconnect, not only once at install time.
+  every reconnect, not only once at install time, and
+- every start the CLI rung performs (`shed attach` on a shed whose `roost-session` was not
+  running).
 
 **One op, no token, last writer wins.** Every client that wires a target sends the identical
 call — the desktop, the phone, and any roost UI that connects all say `set_agent_hooks

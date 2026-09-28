@@ -151,6 +151,7 @@ case "$1" in
     op=unknown
     case "$line" in
       *session.identify*) op=identify ;;
+      *session.set_agent_hooks*) op=sethooks ;;
       *tab.list*) op=tablist ;;
       *tab.open*) op=tabopen ;;
       *tab.set_title*) op=tabsettitle ;;
@@ -280,6 +281,43 @@ func (f *fakeShed) setIdentifyReply(line string) {
 	writeTestFile(f.t, filepath.Join(filepath.Dir(f.requests), "reply.identify.ndjson"), line+"\n", 0o644)
 }
 
+// setReply overwrites one op's answer with one line (op is the fake's own
+// name: `identify`, `sethooks`, `tablist`, …) — for the replies a vendored
+// vector does not carry: an `ok:false`, a well-formed envelope missing fields,
+// an outcome with terminal escapes in it. Stage it AFTER anything that rewrites
+// every reply (setProtocol, setTabs), which would put the vector's answer back.
+func (f *fakeShed) setReply(op, line string) {
+	f.t.Helper()
+	writeTestFile(f.t, filepath.Join(filepath.Dir(f.requests), "reply."+op+".ndjson"), line+"\n", 0o644)
+}
+
+// setBridge stages a `bridge.<op>` script that REPLACES that op's reply: a
+// bridge that accepts the request and then stalls (`sleep N`) or fails on
+// stderr with an exit code instead of answering.
+func (f *fakeShed) setBridge(op, script string) {
+	f.t.Helper()
+	writeTestFile(f.t, filepath.Join(filepath.Dir(f.requests), "bridge."+op), script, 0o644)
+}
+
+// requestOps returns the op of every request the bridge saw, in order — the
+// ONE log the start rung's raise and step 6's tab ops both land in, which is
+// what makes "the hooks are wired before the tab opens" assertable at all.
+func (f *fakeShed) requestOps() []string {
+	f.t.Helper()
+	lines := f.requestLines()
+	ops := make([]string, 0, len(lines))
+	for _, line := range lines {
+		var req struct {
+			Op string `json:"op"`
+		}
+		if err := json.Unmarshal([]byte(line), &req); err != nil {
+			f.t.Fatalf("the bridge logged a request that is not JSON: %q: %v", line, err)
+		}
+		ops = append(ops, req.Op)
+	}
+	return ops
+}
+
 // setProtocol restages `session.identify` to answer with a different protocol.
 // The vendored vector is v6 — this side's own SpokenProtocol — so a mismatch
 // has to be written on purpose.
@@ -326,6 +364,14 @@ func (f *fakeShed) writeReplies(dir string, tabs []roostprovider.Tab) {
 	// cannot (live-11).
 	writeTestFile(t, filepath.Join(dir, "reply.tabsettitle.ndjson"),
 		`{"id":"1","ok":true,"result":{}}`+"\n", 0o644)
+
+	// `session.set_agent_hooks` — the start rung's raise — answers with
+	// roost's own vector but for the envelope id: two agents wired, two
+	// skipped, so the summary line the rung prints has more than one group in
+	// it by default.
+	setHooks := readShedVector(t, "session.set_agent_hooks.response.json")
+	setHooks["id"] = "1"
+	writeTestFile(t, filepath.Join(dir, "reply.sethooks.ndjson"), compactShedLine(t, setHooks), 0o644)
 
 	// `tab.list`'s tabs are the one part a fixture cannot supply — each test
 	// needs its own — but every field roost's `Tab` carries is written, not

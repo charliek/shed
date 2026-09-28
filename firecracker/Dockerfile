@@ -306,10 +306,10 @@ RUN --mount=type=bind,source=.,target=/ctx \
 # IN-TREE, not fetched: a .sha256 from the same mutable release proves transport, not
 # provenance. These ARGs are NOT forwarded by scripts/build-*-rootfs.sh; they exist so
 # the values are named here and overridable by --build-arg on a manual build.
-ARG ROOST_SESSION_VERSION=0.0.20
+ARG ROOST_SESSION_VERSION=0.0.21
 ARG ROOST_SESSION_PROTOCOL=6
-ARG ROOST_SESSION_SHA256_AMD64=72f3e348a15b349fd9220f4c2365c39602c59b454cc1ed1ac27567eff73fff2a
-ARG ROOST_SESSION_SHA256_ARM64=5b857cf41ca4d7d15379b5c97ffad4b478f1fdd03d1533ac527303a2f1a02757
+ARG ROOST_SESSION_SHA256_AMD64=cbf9ae38d9f613cff88b951a7a895cf2241a831476a42fcf9844488331a6e435
+ARG ROOST_SESSION_SHA256_ARM64=dca26f903c5815020e27f8cc87df1ec806ffe943637c08c5324c51a714238d2b
 
 RUN install -m 0755 -d /etc/apt/keyrings \
     && curl -fsSL https://apt.stridelabs.ai/pubkey.gpg -o /etc/apt/keyrings/stridelabs.gpg \

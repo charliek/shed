@@ -291,6 +291,22 @@ Three more edges from plan 023 (2026-09-22), all setup, none in the Dockerfile:
   (`git tag --list 'v*' | sort -V | tail -1`) and it pulls `ghcr.io/charliek/
   shed-build-tools:<tag>` instead.
 
+Three more from plan 024 (2026-09-28), driving the Mac mini from the Linux box:
+
+- **`ssh mac-mini '<cmd>'` exits 0 whatever the remote command returned** (`ssh mac-mini
+  'exit 3'` → 0; `ssh mini3 'exit 3'` → 3). An `if ssh mac-mini …`, a `ssh mac-mini make … &&
+  …` chain or an exit-status poll is blind: a `ps -p` poll never saw a finished build, and a
+  `grep -q` poll "finished" a 21-minute suite after one minute. Capture the status INSIDE the
+  remote command (`…; echo rc=$?`) or decide on log contents, never on ssh's own status.
+- **`uv` is at `~/.local/bin/uv` on the Mac**, off a non-interactive ssh PATH (the `mise` note's
+  root cause), so `uv run pytest` is `command not found` and `make test-integration*` stops at
+  its "uv is required" check. APPEND `$HOME/.local/bin` to PATH, so the tree's `bin/shed`
+  still wins.
+- **Both dev configs pin PUBLISHED images** (Mac `shed-vz-*:v0.8.0`, FC `shed-fc-*:v0.5.9`,
+  `pull_policy: missing`), and the suite's fixtures boot `base` by default. Build a current
+  `base` into BOTH dev stores under the alias ref before `make test-integration-dev*`, or every
+  `base`-booting cell runs an old in-VM agent (#373 and its FC twin).
+
 (Guest **extension** binaries — `extensions`/`full` variants — are now built
 in-tree by `scripts/stage-guest-binaries.sh`, staged into the context like
 shed-agent; verify `docker-credential-shed version` reports a non-release version

@@ -369,6 +369,18 @@ that's how CI stays roost-binary-free):
 … uv run --group test pytest tools/shedtest/test_tauri_machines.py -m real_roost
 ```
 
+**Running this natively (no Docker) on a host with a group-writable `umask`:** the fixture
+(`_jailed_session_env` in `test_tauri_machines.py`) creates its XDG runtime dir with plain
+`Path.mkdir()`, which inherits the process umask rather than forcing `0700`. A dev host whose
+default umask is `0002` (group-writable, common on shared-group Debian/Ubuntu setups) produces
+`0775` directories, and roost-session's own runtime-dir validator refuses to start under a
+group-/world-writable ancestor with no sticky bit (`error: validate runtime dir …: runtime-dir
+ancestor … is group- or world-writable without the sticky bit`) — the daemon exits 1 almost
+immediately and the test fails with `roost-session exited 1; see …/session.stderr` (the stderr
+file itself is already gone by the time you look, since the `finally` block `rmtree`s `root`
+unconditionally). This is a host-umask mismatch, not a shed or roost defect: run the pytest
+invocation under `(umask 022 && …)` and it passes.
+
 ## How the Docker legs are wired (so failures make sense)
 
 The `deb`, `tauri-build-linux`, and `tauri-test-linux` targets `tar` a **repo-root-relative**

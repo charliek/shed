@@ -84,7 +84,7 @@ SERVER = "mock"
 #: bump moves this with it.
 IDENTITY_CURRENT = json.dumps(
     {
-        "app_version": "0.0.20",
+        "app_version": "0.0.21",
         "session_protocol": SESSION_PROTOCOL,
         "libghostty_build": "ghostty-3f6b1c9a4d2e5f80+snapshot.v1",
     }
@@ -1345,8 +1345,9 @@ def test_without_a_source_there_is_no_button(rig):
     Its own app instance, because the source ladder reads the process
     environment: no `ROOST_SESSION_INSTALL_BIN`, no current-generation roost
     beside this app — **and** an asset base the fetch refuses, which is what
-    takes rung 3 away. Since plan 023 flipped `RELEASE_PIN` to roost 0.0.20 the
-    release rung answers for every architecture roost builds for, so this row is
+    takes rung 3 away. Since plan 023 flipped `RELEASE_PIN` to roost 0.0.20
+    (plan 024 moved it to 0.0.21) the release rung answers for every
+    architecture roost builds for, so this row is
     no longer where a cold target lands by itself; it is still a real row (a
     misconfigured `ROOST_SESSION_ASSET_BASE`, an architecture with no build), and
     it is still the only card shed has for it. The preview says so in the words
@@ -1392,7 +1393,7 @@ def test_without_a_source_there_is_no_button(rig):
                 "usable https:// URL" in why for why in preview["source"]["skipped"]
             ), preview["source"]["skipped"]
             sentence = preview["source"]["sentence"]
-            assert "the roost 0.0.20 release asset is not usable for " in sentence
+            assert "the roost 0.0.21 release asset is not usable for " in sentence
             assert "ROOST_SESSION_ASSET_BASE names a base shed refuses" in sentence
             assert "ROOST_SESSION_INSTALL_BIN" in sentence
             assert f"{target} was left untouched." in sentence
@@ -1407,7 +1408,7 @@ def test_without_a_source_there_is_no_button(rig):
             assert answer["ok"] is False
             assert answer["error"]["stage"] == "source"
             message = answer["error"]["message"]
-            assert "the roost 0.0.20 release asset is not usable for " in message
+            assert "the roost 0.0.21 release asset is not usable for " in message
             assert not rig.installed(target_name).exists()
     finally:
         private_mock.stop()
@@ -1425,13 +1426,13 @@ def _real_session_binary() -> Path | None:
     `real_roost` cell uses; a build cache beside the pinned rev is the default
     because that is where a current-generation binary built from the exact
     pinned rev lives (a clean `git archive` of it, per the plan-014 recipe;
-    roost v0.0.20 is that rev). The default path carries the
+    roost v0.0.21 is that rev). The default path carries the
     PINNED rev, so a re-pin that nobody has built for skips this cell rather than
     quietly testing the previous generation's binary. **Read-only — never
     rebuilt here**: roost's tree is not this repo's to compile.
     """
     raw = os.environ.get("SHED_TAURI_ROOST_SESSION_BIN") or str(
-        Path.home() / ".cache/shed-plan023/roost-8c91ce9/target/release/roost-session"
+        Path.home() / ".cache/shed-plan024/roost-2bc71fa/target/release/roost-session"
     )
     path = Path(raw).expanduser()
     return path if os.access(path, os.X_OK) else None
@@ -1720,7 +1721,7 @@ def test_a_blocked_install_shows_the_pinned_no_source_sentence_and_no_button(rig
             # verbatim — a substring match would pass even if the renderer
             # appended or reworded anything around it.
             assert row["status"] == (
-                f"the roost 0.0.20 release asset is not usable for {target}: either "
+                f"the roost 0.0.21 release asset is not usable for {target}: either "
                 "ROOST_SESSION_ASSET_BASE names a base shed refuses, or roost "
                 "publishes no roost-session build for this architecture. On a Linux "
                 f"machine with a protocol-{SESSION_PROTOCOL} roost installed the "

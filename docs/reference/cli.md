@@ -929,6 +929,29 @@ on shed-<name>…` while it does. The whole recovery is bounded at 60 seconds an
 is attempted at most once per attach; a session that comes up speaking a roost
 protocol this shed does not is a hard error naming both versions, never a retry.
 
+**Agent hooks after a start.** Once the session it started answers, the attach
+also wires shed's agent hooks on that shed — the same five agents the desktop
+wires (`claude`, `codex`, `cursor`, `grok`, `opencode`), written by the shed's
+own `roost-session` into the configuration of whichever of them is already set
+up there, and recorded as `shed-cli` in `~/.config/roost/agent-hooks.json` on
+the shed. That is what makes an agent running in the tab show up in roost's
+agent rows. It prints one line saying what it wired:
+
+```text
+starting roost-session on shed-codelens…
+agent hooks on shed-codelens: wired grok; skipped claude (not installed), codex (not installed), cursor (not installed), opencode (not installed)
+```
+
+An agent that is not set up on the shed is listed as skipped, and the line reads
+`nothing to wire` when the shed has nothing new to report (every agent already
+wired and already announced). The hooks never fail an attach: if the call fails
+or takes longer than 15 seconds, the line is a `warning: could not wire agent
+hooks on shed-<name>: …` and the attach carries on. The hooks follow only a
+start the attach performed or accepted (another client may start the session in
+the same moment, and the attach then uses that one). An attach that finds the
+session **already running** wires nothing, so a hook set someone narrowed by hand
+on the shed is not widened again every time you attach.
+
 If the shed has no `roost-session` **installed** at all, nothing changes: the
 attach stops and names the remedy — roost's palette row `Connect Host:
 shed-<name>`, which installs and starts one with your consent, or connecting to
