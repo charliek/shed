@@ -21,10 +21,10 @@
 //!    by [`fetch_release`].
 //! 4. **Nothing** — [`unavailable`], and the host is left untouched.
 //!
-//! ## The pin is `0.0.20`, and that is the state of the world
+//! ## The pin is `0.0.21`, and that is the state of the world
 //!
-//! [`RELEASE_PIN`] names roost **v0.0.20** — [`LATEST_KNOWN_RELEASE`] — the
-//! first published release that speaks session protocol
+//! [`RELEASE_PIN`] names roost **v0.0.21** — [`LATEST_KNOWN_RELEASE`]. v0.0.20
+//! was the first published release that speaks session protocol
 //! [`SESSION_PROTOCOL_VERSION`]. It was `None` until that release existed, and
 //! that was an external gate rather than an unfinished branch: rung 3 was
 //! implemented and tested against a loopback fixture the whole time, and the
@@ -150,25 +150,26 @@ pub struct RoostRelease {
     pub version: &'static str,
 }
 
-/// The release rung 3 fetches from — **roost v0.0.20**.
+/// The release rung 3 fetches from — **roost v0.0.21**.
 ///
 /// See the module doc: v0.0.20 is the first published roost release that speaks
 /// session protocol [`SESSION_PROTOCOL_VERSION`], so it is the first one there
 /// was anything honest to point this at. It was `None` before that, and plan 023
-/// §3.2 is the flip. It must name [`LATEST_KNOWN_RELEASE`]'s version — this
-/// module's tests assert that it does, and that the protocol beside it is the
-/// one this shed speaks.
-pub const RELEASE_PIN: Option<RoostRelease> = Some(RoostRelease { version: "0.0.20" });
+/// §3.2 is the flip. Plan 024 §3.3 moves the pin to v0.0.21, roost's bug-fix
+/// release after v0.0.20, still speaking the same protocol. It must name
+/// [`LATEST_KNOWN_RELEASE`]'s version — this module's tests assert that it
+/// does, and that the protocol beside it is the one this shed speaks.
+pub const RELEASE_PIN: Option<RoostRelease> = Some(RoostRelease { version: "0.0.21" });
 
 /// The newest roost release shed knows of, and the session protocol it speaks —
-/// **`("0.0.20", 6)`**.
+/// **`("0.0.21", 6)`**.
 ///
 /// It is the release [`RELEASE_PIN`] points at, and it is what
 /// [`unavailable`]'s parenthesis names. It is a constant so that the pin and the
 /// sentence a user reads cannot drift apart: one PR edits both, in one file, and
 /// this module's tests assert the sentence is built from them rather than typed
 /// out.
-pub const LATEST_KNOWN_RELEASE: (&str, u32) = ("0.0.20", 6);
+pub const LATEST_KNOWN_RELEASE: (&str, u32) = ("0.0.21", 6);
 
 // Compile-time tripwire (the `RECORDED_GENERATION` precedent in `model.rs`): a
 // pin may only exist while the newest known release speaks the protocol this

@@ -84,7 +84,7 @@ SERVER = "mock"
 #: bump moves this with it.
 IDENTITY_CURRENT = json.dumps(
     {
-        "app_version": "0.0.20",
+        "app_version": "0.0.21",
         "session_protocol": SESSION_PROTOCOL,
         "libghostty_build": "ghostty-3f6b1c9a4d2e5f80+snapshot.v1",
     }
@@ -1345,8 +1345,9 @@ def test_without_a_source_there_is_no_button(rig):
     Its own app instance, because the source ladder reads the process
     environment: no `ROOST_SESSION_INSTALL_BIN`, no current-generation roost
     beside this app — **and** an asset base the fetch refuses, which is what
-    takes rung 3 away. Since plan 023 flipped `RELEASE_PIN` to roost 0.0.20 the
-    release rung answers for every architecture roost builds for, so this row is
+    takes rung 3 away. Since plan 023 flipped `RELEASE_PIN` to roost 0.0.20
+    (plan 024 moved it to 0.0.21) the release rung answers for every
+    architecture roost builds for, so this row is
     no longer where a cold target lands by itself; it is still a real row (a
     misconfigured `ROOST_SESSION_ASSET_BASE`, an architecture with no build), and
     it is still the only card shed has for it. The preview says so in the words
@@ -1392,7 +1393,7 @@ def test_without_a_source_there_is_no_button(rig):
                 "usable https:// URL" in why for why in preview["source"]["skipped"]
             ), preview["source"]["skipped"]
             sentence = preview["source"]["sentence"]
-            assert "the roost 0.0.20 release asset is not usable for " in sentence
+            assert "the roost 0.0.21 release asset is not usable for " in sentence
             assert "ROOST_SESSION_ASSET_BASE names a base shed refuses" in sentence
             assert "ROOST_SESSION_INSTALL_BIN" in sentence
             assert f"{target} was left untouched." in sentence
@@ -1407,7 +1408,7 @@ def test_without_a_source_there_is_no_button(rig):
             assert answer["ok"] is False
             assert answer["error"]["stage"] == "source"
             message = answer["error"]["message"]
-            assert "the roost 0.0.20 release asset is not usable for " in message
+            assert "the roost 0.0.21 release asset is not usable for " in message
             assert not rig.installed(target_name).exists()
     finally:
         private_mock.stop()
@@ -1720,7 +1721,7 @@ def test_a_blocked_install_shows_the_pinned_no_source_sentence_and_no_button(rig
             # verbatim — a substring match would pass even if the renderer
             # appended or reworded anything around it.
             assert row["status"] == (
-                f"the roost 0.0.20 release asset is not usable for {target}: either "
+                f"the roost 0.0.21 release asset is not usable for {target}: either "
                 "ROOST_SESSION_ASSET_BASE names a base shed refuses, or roost "
                 "publishes no roost-session build for this architecture. On a Linux "
                 f"machine with a protocol-{SESSION_PROTOCOL} roost installed the "

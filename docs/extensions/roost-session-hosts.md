@@ -41,10 +41,10 @@ decided in order, and the first rung that can answer wins:
 
 ### The release rung is fixed, as of 0.9.0
 
-**`RELEASE_PIN` is `0.0.20`** — roost v0.0.20 is the first published release that speaks
-session protocol 6, and shed 0.9.0 pins it. Before that the pin was `None`, because there was
-no release to point it at honestly; the flip was the one-line change it was designed to be (it
-sits beside the version/protocol pair below). A fresh Linux target on an architecture roost
+**`RELEASE_PIN` is `0.0.21`** — roost v0.0.20 is the first published release that speaks
+session protocol 6, and shed 0.9.0 pins v0.0.21, roost's bug-fix release after it. Before
+v0.0.20 the pin was `None`, because there was no release to point it at honestly; the flip was
+the one-line change it was designed to be (it sits beside the version/protocol pair below). A fresh Linux target on an architecture roost
 publishes a build for now gets a `roost-session` from the release asset, with no override
 variable and no sibling binary needed.
 
@@ -56,7 +56,7 @@ The client still has a sentence for "every rung failed", and it is **pin-aware**
 the reason that actually applies rather than repeating the pre-0.9.0 one. What you see today,
 when something has taken the release rung away:
 
-> the roost 0.0.20 release asset is not usable for `<target>`: either
+> the roost 0.0.21 release asset is not usable for `<target>`: either
 > `ROOST_SESSION_ASSET_BASE` names a base shed refuses, or roost publishes no roost-session
 > build for this architecture. On a Linux machine with a protocol-6 roost installed the desktop
 > uses that roost-session; otherwise point `ROOST_SESSION_INSTALL_BIN` at a protocol-6 build.

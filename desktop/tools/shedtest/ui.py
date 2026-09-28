@@ -275,7 +275,7 @@ def launch(target: str = "mac", *, mock_base_url: str, config_path: Path, state_
     (plan 019 §3.5 rung 1) — not a `<PREFIX>_` var, because shed reads roost's
     variable by that name. It names the `roost-session` a bootstrap installs, so a
     cell can install a fake one; unset, the ladder falls through the sibling rung
-    to the pinned release asset (`RELEASE_PIN`, roost 0.0.20) — and only reaches
+    to the pinned release asset (`RELEASE_PIN`, roost 0.0.21) — and only reaches
     `NoSource`, the no-button cell, when that rung is taken away too. Set-or-
     cleared like the rest, so a developer with it exported cannot make the
     NoSource cell pass for the wrong reason.

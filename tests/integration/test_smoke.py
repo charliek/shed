@@ -513,7 +513,7 @@ def test_roost_session_baked(shed_server, test_shed_name):
             "still boots the published image, which carries no roost-session"
         )
 
-    want_version = os.environ.get("SHED_ROOST_SESSION_VERSION", "0.0.20")
+    want_version = os.environ.get("SHED_ROOST_SESSION_VERSION", "0.0.21")
     want_protocol = os.environ.get("SHED_ROOST_SESSION_PROTOCOL", "6")
 
     try:
