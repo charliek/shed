@@ -116,6 +116,7 @@ nav = [
     { "Lazy Rootfs Streaming" = "discovery/lazy-rootfs-streaming.md" },
     { "Proxy Integration" = "discovery/proxy_integration_design.md" },
     { "Runtime Optimization Backlog" = "discovery/runtime-optimization-backlog.md" },
+    { "craze in shed" = "discovery/craze-lane.md" },
   ] },
   { "Development" = [
     { "Setup" = "development/setup.md" },
