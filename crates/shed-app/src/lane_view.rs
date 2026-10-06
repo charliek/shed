@@ -144,6 +144,18 @@ pub struct LaneViewSnapshot {
     /// The session row's activity, or [`RcActivity::Unknown`] if no session row
     /// has been seen in this generation yet.
     pub activity: RcActivity,
+    /// The session row itself, as of the live generation — the stream's latest
+    /// [`LaneEvent::Session`], staged and swapped in like everything else here,
+    /// and `None` until a seed carrying one has completed.
+    ///
+    /// **This, not the row a lane was opened with, is the session's current
+    /// state.** An open answers whatever its source listed at that instant —
+    /// for a craze session created a moment before, the create's own row, which
+    /// carries none of what the attach's info document says (its
+    /// `permission_mode`, plan 025 §3.6.5) — and a client that cached that row
+    /// would render it for as long as the lane stayed open. A reader takes the
+    /// row's facts from here once it is `Some`.
+    pub session: Option<LaneSession>,
     /// The generation `messages` belong to. Ours, monotonic, and it moves only
     /// when a seed completes — see [`Snapshot::generation`].
     pub generation: u64,
@@ -338,9 +350,9 @@ impl LaneView {
     /// A cursor that fell out the back of the 500-row cap is refused by the same
     /// bound, for the same reason: the delta would have a hole in it.
     ///
-    /// `generation`, `stale`, `ended`, `capabilities` and `settings` ride EVERY
-    /// snapshot, delta or not, so a reader that wants to react to any of them
-    /// changing has them without a second call.
+    /// `session`, `generation`, `stale`, `ended`, `capabilities` and `settings`
+    /// ride EVERY snapshot, delta or not, so a reader that wants to react to any
+    /// of them changing has them without a second call.
     ///
     /// `approvals` is always the complete pending set — there is no cursor for
     /// it and it is bounded by what the human has not answered. `is_pending()`
@@ -387,6 +399,7 @@ impl LaneView {
                 .as_ref()
                 .map(|s| s.activity)
                 .unwrap_or(RcActivity::Unknown),
+            session: self.live.session.clone(),
             generation: self.live.generation,
             stale: self.stale.clone(),
             ended: self.ended,
@@ -750,6 +763,89 @@ mod tests {
         let live = view.snapshot(None);
         assert_eq!(live.capabilities, Some(caps("craze", true)));
         assert_eq!(live.settings, Some(model("m2")));
+    }
+
+    fn session_row(permission_mode: Option<&str>, activity: RcActivity) -> LaneSession {
+        LaneSession {
+            id: "0123456789ab".to_string(),
+            title: "w-new".to_string(),
+            cwd: "/w/w-new".to_string(),
+            activity,
+            permission_mode: permission_mode.map(str::to_string),
+            ..LaneSession::default()
+        }
+    }
+
+    /// **The snapshot carries the session ROW, the live generation's** (plan
+    /// 025 §3.6.5; live leg 1's permission-line finding). A seed's `Session`
+    /// is staged with the rest of it, and a `Session` between seeds — the
+    /// watcher's re-read, a presence count, the info document's
+    /// `permissionMode` — applies to the live view, latest wins. That is what
+    /// a client renders the row's facts from: the row a lane was OPENED with
+    /// is whatever its source listed at that instant, and for a session created
+    /// a moment before it is the create's own, with no permission mode.
+    #[test]
+    fn the_session_row_is_staged_and_rides_every_snapshot() {
+        let mut view = LaneView::default();
+        assert_eq!(view.snapshot(None).session, None, "nothing before a seed");
+
+        view.apply(&LaneEvent::Reset {
+            reason: "connect".into(),
+            generation: 1,
+        });
+        view.apply(&LaneEvent::Session {
+            session: session_row(Some("bypass"), RcActivity::Idle),
+        });
+        assert_eq!(
+            view.snapshot(None).session,
+            None,
+            "a half seed's row is not shown"
+        );
+        view.apply(&LaneEvent::Ready { generation: 1 });
+        assert_eq!(
+            view.snapshot(None).session,
+            Some(session_row(Some("bypass"), RcActivity::Idle)),
+            "the seed's row, with the info document's permission mode"
+        );
+
+        // Between seeds: the live row, latest wins — and a delta read carries
+        // it too.
+        view.apply(&LaneEvent::Message {
+            message: message("m1", 1),
+            cursor: None,
+        });
+        view.apply(&LaneEvent::Session {
+            session: session_row(Some("bypass"), RcActivity::Working),
+        });
+        let delta = view.snapshot(Some(1));
+        assert!(!delta.full);
+        assert_eq!(
+            delta.session,
+            Some(session_row(Some("bypass"), RcActivity::Working))
+        );
+        assert_eq!(delta.activity, RcActivity::Working, "the same row's");
+
+        // A reseed's row waits for its Ready, then replaces the old one.
+        view.apply(&LaneEvent::Reset {
+            reason: "server_reset:session_replaced".into(),
+            generation: 2,
+        });
+        view.apply(&LaneEvent::Session {
+            session: session_row(Some("prompt"), RcActivity::Idle),
+        });
+        assert_eq!(
+            view.snapshot(None)
+                .session
+                .and_then(|s| s.permission_mode)
+                .as_deref(),
+            Some("bypass"),
+            "mid-seed the reader still sees the live generation's row"
+        );
+        view.apply(&LaneEvent::Ready { generation: 2 });
+        assert_eq!(
+            view.snapshot(None).session,
+            Some(session_row(Some("prompt"), RcActivity::Idle))
+        );
     }
 
     /// **A late `Ready` cannot clear the banner while a reseed is staged**

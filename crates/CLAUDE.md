@@ -84,7 +84,7 @@ re-implemented per language. The root `CLAUDE.md` owns the monorepo layout + rel
   `roost.rs` are) is the **staged agent-lane view** — `LaneView`/`LaneViewSnapshot`,
   moved down out of the Tauri crate — that folds a `shed_core::lane` subscription
   (messages, activity, generation, approvals, and — staged and swapped with the seed —
-  the session's capabilities and settings) into what `lane.messages`/`lane.approvals`
+  the session row and its capabilities and settings) into what `lane.messages`/`lane.approvals`
   return, behind the same `Reset … Ready` staging the contract promises. Generations are
   MATCHED (only a `Ready` equal to the staged `Reset`'s swaps; only one equal to the live
   generation clears `stale`), and `stale` (the banner, set by `Stale` or `Down`) is kept

@@ -1431,10 +1431,17 @@ export type LaneMessage = {
  *  `capabilities` and `settings` are the LIVE generation's, staged and swapped
  *  in with its rows: what this session can do, read HERE and nowhere else (not
  *  from `lane.open`, which no longer carries them). `null` until a seed carrying
- *  them has completed; `settings` stays `null` on a session with none to show. */
+ *  them has completed; `settings` stays `null` on a session with none to show.
+ *
+ *  `session` is the live generation's session ROW — the stream's latest, `null`
+ *  until a seed has swapped one in — and the row the panel's header reads once
+ *  it is there (`laneHeader`). `lane.open`'s row is the one the lane was opened
+ *  with and never changes while it stays open: for a session the create sheet
+ *  opened at once, the create's own row, with no permission mode. */
 export type LaneView = {
   messages: LaneMessage[];
   activity: string;
+  session: LaneSessionRow | null;
   generation: number;
   stale: string | null;
   ended: boolean;
@@ -1569,8 +1576,10 @@ export type LaneSettingChange =
   | { kind: "mode"; id: string }
   | { kind: "config"; id: string; value: string; for_model?: string };
 
-/** `lane.open`'s answer: the session row alone. What the session can do is the
- *  view's (`LaneView.capabilities`), not the open's. */
+/** `lane.open`'s answer: the session row alone — the row as the source listed
+ *  it at the open, re-answered unchanged while the lane stays open. What the
+ *  session can do is the view's (`LaneView.capabilities`), not the open's; and
+ *  once a seed has swapped in, so is the row (`LaneView.session`). */
 export type LaneOpened = { session: LaneSessionRow };
 
 /** The four forms `lane.answer` accepts (`lane::parse_answer`). Exactly one key
@@ -1789,7 +1798,10 @@ export type LaneReport = {
    *  swapped in. */
   kind: string;
   /** The header's permission line (`permissionLine` — `bypass` reads "runs
-   *  tools without asking"), or `null` when the session states none. */
+   *  tools without asking"), or `null` when the session states none. Like
+   *  `title` and `cwd`, read off the LIVE session row (`LaneView.session`),
+   *  and off `lane.open`'s only until a seed has swapped one in
+   *  (`laneHeader`). */
   permission: string | null;
   title: string;
   cwd: string;

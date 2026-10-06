@@ -259,7 +259,7 @@ failure codes — is [Agent lanes](agent-lanes.md).
 | op | params | result |
 |----|--------|--------|
 | `lane.open` | `machine`, `kind`, `session_id` | `{session}` — the session row alone. Idempotent: a second call re-answers from the open lane |
-| `lane.messages` | `machine`, `kind`, `session_id` | `{messages, activity, generation, stale, ended, capabilities, settings}` — the staged view, never a half-seeded one |
+| `lane.messages` | `machine`, `kind`, `session_id` | `{messages, activity, session, generation, stale, ended, capabilities, settings}` — the staged view, never a half-seeded one; `session` is the live session row (`null` until the first seed) |
 | `lane.approvals` | `machine`, `kind`, `session_id` | `{approvals}` — pending only, oldest first |
 | `lane.send` | `machine`, `kind`, `session_id`, `text`, `mode?` (`queue` \| `interject`) | `{}` |
 | `lane.cancel` | `machine`, `kind`, `session_id` | `{}` |
@@ -288,6 +288,14 @@ each `null` until a seed carrying it has completed, and `settings` stays `null` 
 with none to show (every opencode lane). `stale` is the banner — the reason a lane is not live
 — and `ended` is a different fact: `true` only once the subscription is over, where a `stale`
 lane alone may be reconnecting on its own.
+
+**So is the session row, once there is one.** `lane.open`'s `session` is the row as the
+source listed it at the open, and a second `lane.open` re-answers that same row for as long as
+the lane stays open. `lane.messages`' `session` is the stream's latest — `null` until the first
+seed has swapped one in — and it carries what the session states after the open: for a craze
+session opened the moment its create answered, the open's row is the create's own, and only the
+stream's carries the attach's `permission_mode`. The panel's header (title, directory,
+permission line) reads the live row, and `lane.open`'s only until the first seed.
 
 ### UI-truth ops (Tauri)
 

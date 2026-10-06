@@ -21,6 +21,10 @@
    change with its incarnation — so `lane.open` answers the session row alone
    and the panel reads `capabilities` off the same `lane.messages` poll as
    everything else it renders. A copy taken at open would be stale by design.
+   So, once a seed has swapped one in, is the session ROW the header reads
+   (`lane.messages`' `session`): `lane.open`'s row is re-answered unchanged
+   while the lane stays open, and the one the create sheet's transcript is
+   opened on is the create's own, with no permission mode (live leg 1).
 
    Three things about it are load-bearing rather than stylistic:
 
@@ -59,7 +63,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { ChevronDown, ChevronRight, OctagonX, ScrollText, Send, SlidersHorizontal, Square, X, Zap } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { laneVerbs, sendFailureText } from "@/lib/laneVerbs";
-import { permissionLine } from "@/lib/crazeRows";
+import { laneHeader } from "@/lib/crazeRows";
 import { newestWins } from "@/lib/newest";
 import { NO_SETTINGS, settingsChip, settingsOffered } from "@/lib/laneSettings";
 import { LaneSettingsSheet, useSettingChanges } from "@/components/LaneSettings";
@@ -403,7 +407,14 @@ export function LanePanel({ machine, kind, sessionId, settingsOpen, onSettingsOp
   /** Stop exists only when the session's streamed capabilities offer it — a
    *  TUI-hosted craze session, and every opencode one, has none. */
   const canStop = capabilities?.stop === true;
-  const permission = permissionLine(opened?.session.permission_mode);
+  /** The header — title, directory, permission line — from the LIVE session
+   *  row (`lane.messages`' `session`), and from `lane.open`'s only until the
+   *  first seed has swapped one in: the open's row is re-answered unchanged
+   *  while the lane stays open, and for the transcript the create sheet opens
+   *  at once it is the create's own row, with no permission mode
+   *  (`laneHeader`). */
+  const header = laneHeader(opened?.session, view?.session);
+  const permission = header.permission;
   /** The settings chip and sheet exist only when the session's streamed
    *  capabilities say `settings` (plan 025 §3.10): hidden, never disabled —
    *  and that capability alone decides. */
@@ -503,8 +514,8 @@ export function LanePanel({ machine, kind, sessionId, settingsOpen, onSettingsOp
     lane_kind: kind,
     kind: capabilities?.kind ?? "",
     permission,
-    title: opened?.session.title ?? "",
-    cwd: opened?.session.cwd ?? "",
+    title: header.title,
+    cwd: header.cwd,
     activity: view?.activity ?? "unknown",
     generation: view?.generation ?? 0,
     stale: view?.stale ?? null,
@@ -546,7 +557,7 @@ export function LanePanel({ machine, kind, sessionId, settingsOpen, onSettingsOp
           <ScrollText size={18} className="mt-0.5 flex-none text-shed-text-secondary" />
           <div className="min-w-0 flex-1">
             <div className="truncate text-[15px] font-semibold text-shed-text">
-              {opened?.session.title || "Transcript"}
+              {header.title || "Transcript"}
             </div>
             <div className="mt-0.5 truncate font-mono text-[11.5px] text-shed-text-muted">
               {machine} · {sessionId}

@@ -238,7 +238,8 @@ defaults or history of its own.
 - Not in the sheet: model, effort, fast and permission mode. A session starts
   on its provider's default model, and a sheet-created session runs in craze's
   default permission mode, `bypass` — its transcript header says "runs tools
-  without asking".
+  without asking" once the session's attach has stated it (the lane's live
+  session row, not the create's own, which states no permission mode).
 
 | State | What the sheet shows |
 |---|---|
@@ -618,7 +619,8 @@ open subscription, **client-shared Rust, not Tauri-specific**. It folds a
 `shed_core::lane` subscription's frames in arrival order behind the same
 `Reset … Ready` staging the contract promises, and exposes them through a
 typed `LaneView::snapshot(since_seq)` (`LaneViewSnapshot { messages, full,
-activity, generation, stale, ended, capabilities, settings, approvals }`);
+activity, session, generation, stale, ended, capabilities, settings,
+approvals }`);
 `None` returns everything, `Some` a delta honored only when the cursor still
 lands inside the live generation's `seq` window. It lives in `shed-app`,
 ungated, for the same reason `machine.rs` and `roost.rs` are — mobile links
@@ -637,8 +639,8 @@ namespaces.
 
 | Op | Does |
 |---|---|
-| `lane.open` | Ensures a subscription (idempotent — a second call for an already-open lane re-answers from the existing entry) and answers the session row. |
-| `lane.messages` | The staged transcript: up to the last 500 rows, current activity, generation, a `stale` reason when the lane is not live, `ended` once its subscription is over, and the session's `capabilities` and `settings` — the only place the panel reads what the session can do. |
+| `lane.open` | Ensures a subscription (idempotent — a second call for an already-open lane re-answers from the existing entry) and answers the session row as the source listed it at the open. |
+| `lane.messages` | The staged transcript: up to the last 500 rows, current activity, the live session row (`session`, `null` until the first seed), generation, a `stale` reason when the lane is not live, `ended` once its subscription is over, and the session's `capabilities` and `settings` — the only place the panel reads what the session can do. The panel's header reads the live row too: `lane.open`'s is re-answered unchanged while the lane stays open, and for a session opened the moment its create answered it is the create's own, with no permission mode. |
 | `lane.approvals` | Pending approvals, oldest first (`created_at`, then `id`): for opencode the root session's and its children's, for craze every open ask in the session's registry, a sub-agent's included. |
 | `lane.send` | Queues a prompt (`mode: queue`), or preempts the turn in flight (`mode: interject`) when the lane advertises `interject` — the panel shows the toggle only then, and only enables it while the turn is `Working`. |
 | `lane.cancel` | Aborts the turn in flight. The panel offers Cancel only when the session's streamed `capabilities.cancel` is true, and enables it only while the session is `Working`. |

@@ -4,11 +4,23 @@
  *
  * The case marked CONTROL is the one plan 025's C9 control list names: a craze
  * row's End tab must close its TAB (`machine.kill {slug: String(tab_id)}`),
- * never send the row's slug — which is a craze hostId, not a roost tab id. */
+ * never send the row's slug — which is a craze hostId, not a roost tab id.
+ *
+ * The case marked REGRESSION is plan 025 live leg 1's finding: the transcript
+ * the create sheet opens at once read its permission line off `lane.open`'s
+ * row — the create's own, with no permission mode — and so never said "runs
+ * tools without asking" for as long as it stayed open. */
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { canOpenTerminal, crazeDoingLine, crazeMachineNote, killTarget, permissionLine } from "../dist-test/crazeRows.js";
+import {
+  canOpenTerminal,
+  crazeDoingLine,
+  crazeMachineNote,
+  killTarget,
+  laneHeader,
+  permissionLine,
+} from "../dist-test/crazeRows.js";
 
 const crazeRow = (extra) => ({
   source: "craze",
@@ -73,6 +85,40 @@ test("the permission line says what bypass means", () => {
   assert.equal(permissionLine("careful"), "permissions: careful");
   assert.equal(permissionLine(""), null);
   assert.equal(permissionLine(null), null);
+});
+
+// The create-time row a just-created craze session is opened on (live leg 1's
+// `lane.open` answer): no permission mode, no model, approximate.
+const createdRow = { id: "a998d6431654", title: "w-new", cwd: "/tmp/p025h1/w-new", activity: "unknown", approximate: true };
+// The same session's row as the lane's stream states it once the attach's info
+// document is in.
+const liveRow = { ...createdRow, activity: "idle", approximate: false, permission_mode: "bypass" };
+
+test("REGRESSION: the header reads the LIVE row's permission mode, not the row the lane was opened on", () => {
+  assert.deepEqual(laneHeader(createdRow, liveRow), {
+    title: "w-new",
+    cwd: "/tmp/p025h1/w-new",
+    permission: "runs tools without asking",
+  });
+});
+
+test("the header falls back to lane.open's row only until a seed has swapped one in", () => {
+  const opened = { ...createdRow, permission_mode: "prompt" };
+  for (const live of [null, undefined]) {
+    assert.deepEqual(laneHeader(opened, live), {
+      title: "w-new",
+      cwd: "/tmp/p025h1/w-new",
+      permission: "asks before running tools",
+    });
+  }
+  // Once there is a live row it wins WHOLE — including about what it does not
+  // say, and about a title the stream renamed.
+  assert.deepEqual(laneHeader(opened, { ...createdRow, title: "renamed" }), {
+    title: "renamed",
+    cwd: "/tmp/p025h1/w-new",
+    permission: null,
+  });
+  assert.deepEqual(laneHeader(null, null), { title: "", cwd: "", permission: null });
 });
 
 test("Open in terminal: a headless craze row only", () => {

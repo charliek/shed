@@ -84,3 +84,35 @@ export function permissionLine(mode: string | null | undefined): string | null {
   if (m === "prompt") return "asks before running tools";
   return `permissions: ${m}`;
 }
+
+/** The fields of a lane's session row the transcript header reads — the
+ *  shape of `LaneSessionRow` in `bridge.ts`, narrowed. */
+export type LaneHeaderRowLike = {
+  title?: string | null;
+  cwd?: string | null;
+  permission_mode?: string | null;
+};
+
+/** What the transcript header says: the session's title, its directory and
+ *  its permission line.
+ *
+ *  **From the LIVE row — `lane.messages`' `session` — and from `lane.open`'s
+ *  only until the first seed has swapped one in** (plan 025 §3.6.5). The open's
+ *  row is whatever the source listed at that instant and is re-answered
+ *  unchanged while the lane stays open; for the transcript the create sheet
+ *  opens at once, that is the create's own row, which carries no permission
+ *  mode — so a header that kept reading it never said "runs tools without
+ *  asking" for as long as the panel stayed open (live leg 1). The stream's row
+ *  carries the attach info document's mode. Whole rows, not field by field:
+ *  the live row is the newer truth, including about what it does not say. */
+export function laneHeader(
+  opened: LaneHeaderRowLike | null | undefined,
+  live: LaneHeaderRowLike | null | undefined,
+): { title: string; cwd: string; permission: string | null } {
+  const row = live ?? opened ?? null;
+  return {
+    title: row?.title ?? "",
+    cwd: row?.cwd ?? "",
+    permission: permissionLine(row?.permission_mode),
+  };
+}

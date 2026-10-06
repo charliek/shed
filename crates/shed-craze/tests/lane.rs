@@ -578,6 +578,64 @@ async fn presence_and_compaction_ride_the_session_row() {
     );
 }
 
+/// **The attach info document's `permissionMode` rides the session row**
+/// (plan 025 §3.6.5; live leg 1's permission-line finding), over an opened
+/// row that says none — a just-created session's: the desktop's transcript
+/// header reads the stream's row, and a sheet-created session runs `bypass`.
+/// The host's `sessions.list` row is given none either, so this pins the info
+/// document's own mapping, not the row's.
+#[tokio::test]
+async fn the_info_documents_permission_mode_rides_the_session_row() {
+    let (_dial, mut conns, lane) = scripted(fast());
+    assert_eq!(
+        lane.session()
+            .await
+            .expect("the opened row")
+            .permission_mode,
+        None,
+        "opened with a row that says none"
+    );
+    let (mut rx, _stop) = subscribed(&lane).await;
+    let mut bypass = info(false);
+    bypass["permissionMode"] = json!("bypass");
+    let mut hub = next_conn(&mut conns).await;
+    hub.splice(HOST).await;
+    hub.listed(row()).await;
+    hub.attached(attach_result(
+        SUB,
+        &bypass,
+        (INC, 1),
+        Some(snapshot_at(INC, 1, json!({}))),
+        None,
+    ))
+    .await;
+    hub.synchronized(SUB, 1).await;
+    let mut checker = LaneChecker::new();
+    let seed = drive(&mut rx, &mut checker, "the seed", is_ready).await;
+    let session = seed
+        .iter()
+        .rev()
+        .find_map(|e| match e {
+            LaneEvent::Session { session } => Some(session.clone()),
+            _ => None,
+        })
+        .expect("the seed carries the session row");
+    assert_eq!(
+        session.permission_mode.as_deref(),
+        Some("bypass"),
+        "the info document's permissionMode, on the seed's row"
+    );
+    assert_eq!(
+        lane.session()
+            .await
+            .expect("the row")
+            .permission_mode
+            .as_deref(),
+        Some("bypass"),
+        "and the lane's own row follows the stream's"
+    );
+}
+
 /// The flush clock: a streak that stops growing for 2 s is flushed as a
 /// partial row; the continuing stream starts a new segment.
 #[tokio::test(start_paused = true)]

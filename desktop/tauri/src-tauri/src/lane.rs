@@ -1005,14 +1005,24 @@ impl Lanes {
     }
 
     /// `lane.messages` — the staged-then-swapped view, as this app's IPC
-    /// payload: `{messages, activity, generation, stale, ended, capabilities,
-    /// settings}`.
+    /// payload: `{messages, activity, session, generation, stale, ended,
+    /// capabilities, settings}`.
     ///
     /// `capabilities` and `settings` are the LIVE generation's (each `null`
     /// until a seed carrying it has swapped in), which is where a client reads
     /// what the session can do — never from `lane.open` (module doc). `stale` is
     /// the banner and `ended` the lifecycle; the two are different facts
     /// (`shed_app::lane_view`'s module doc).
+    ///
+    /// `session` is the live generation's session ROW — the stream's latest
+    /// `Session`, `null` until a seed has swapped one in — and it is where a
+    /// client reads the row's facts once there is one. `lane.open`'s row is
+    /// cached for the life of the entry (that is what makes it idempotent), and
+    /// it is whatever the source listed at the open: for a craze session opened
+    /// the moment its create answered, the create's own row, with none of the
+    /// attach info document's facts — so a header that kept reading it showed
+    /// no permission line for as long as the panel stayed open (plan 025
+    /// §3.6.5; live leg 1).
     ///
     /// The fold and the projection are [`shed_app::lane_view`]'s; the only thing
     /// that belongs here is the envelope's SHAPE, which is Tauri's and not a
@@ -1029,6 +1039,7 @@ impl Lanes {
         Ok(json!({
             "messages": snap.messages,
             "activity": snap.activity,
+            "session": snap.session,
             "generation": snap.generation,
             "stale": snap.stale,
             "ended": snap.ended,
@@ -3058,6 +3069,52 @@ mod tests {
         assert_eq!(view["ended"], false);
     }
 
+    /// **`lane.messages` carries the LIVE session row; `lane.open`'s is the one
+    /// it opened with** (plan 025 §3.6.5; live leg 1's permission-line
+    /// finding). `lane.open` caches its row for the life of the entry — which
+    /// is what makes it idempotent — so a row fact the stream states later (an
+    /// activity here; for a craze session created a moment before, the attach
+    /// info document's permission mode) reaches a client only through
+    /// `lane.messages`' `session`. The panel's header reads it from there.
+    #[tokio::test]
+    async fn the_live_session_row_rides_lane_messages_and_lane_open_keeps_its_own() {
+        let fake = one_session("ses_a").await;
+        let (lanes, _log, _events) = lanes_for(&fake, &["ses_a"]);
+
+        let opened = lanes
+            .open(MACHINE, OC, "ses_a")
+            .await
+            .expect("the lane opens");
+        assert_eq!(opened["session"]["activity"], "idle");
+        wait_for("the first generation to seed", || {
+            (generation(&lanes, "ses_a") >= 1).then_some(())
+        })
+        .await;
+        let view = lanes.messages(MACHINE, OC, "ses_a").expect("lane.messages");
+        assert_eq!(view["session"]["id"], "ses_a", "the seed's row: {view}");
+        assert_eq!(view["session"]["title"], "the lane");
+
+        // The agent starts a turn: the stream's next `Session` says so.
+        fake.set_status("ses_a", "busy");
+        fake.push_event(&json!({"type": "session.status",
+            "properties": {"sessionID": "ses_a", "status": {"type": "busy"}}}));
+        let live = wait_for("the live row to say working", || {
+            let v = lanes.messages(MACHINE, OC, "ses_a").ok()?;
+            (v["session"]["activity"] == "working").then_some(v)
+        })
+        .await;
+        assert_eq!(live["activity"], "working", "the same row's activity");
+        let again = lanes
+            .open(MACHINE, OC, "ses_a")
+            .await
+            .expect("an idempotent re-open");
+        assert_eq!(
+            again["session"]["activity"], "idle",
+            "lane.open re-answers the row it opened with — which is why a \
+             client reads the row's facts from lane.messages"
+        );
+    }
+
     /// **A tunnel that will not come back under a live lane is STALE, not an
     /// end — and the lane comes back on its own once the tunnel does.** The pump
     /// has already scheduled its next attempt, so it must not mark the view
@@ -3271,5 +3328,94 @@ mod tests {
         );
         lanes.evict_craze(MACHINE, 1, &[ID.to_string()]);
         assert!(!lanes.is_open(MACHINE, CRAZE, ID), "evict_craze retires it");
+    }
+
+    /// **A craze lane opened on a row that states no permission mode shows the
+    /// one its attach states, on `lane.messages`** (plan 025 §3.6.5; live leg
+    /// 1's permission-line finding). The panel the create sheet opens at once
+    /// is opened on the create's own row, which says nothing of the session's
+    /// posture; `lane.open` caches that row for the life of the lane. The
+    /// attach's info document says `bypass`, the watcher's `Session` carries
+    /// it, and `lane.messages`' `session` is where the panel's header reads it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_craze_lanes_permission_mode_arrives_on_lane_messages_not_lane_open() {
+        use shed_core::lane::AgentSource as _;
+        use shed_craze::testing::{
+            attach_result, full_hub_capabilities, host_session_row, roster_row, session_caps,
+            session_info, snapshot_at, ScriptedDial,
+        };
+
+        const HOST: &str = "0123456789ab";
+        const SID: &str = "craze-1";
+        const INC: &str = "INCARNATION-1";
+        let (dial, mut conns) = ScriptedDial::new();
+        let source = CrazeSource::new(dial, "shed-desktop-test");
+        let _roster = source.subscribe().await.expect("subscribe");
+        let mut hub = conns.recv().await.expect("the roster dialled");
+        hub.hello("0a1b2c3d4e5f", full_hub_capabilities()).await;
+        // A row with no permission mode — what a just-created session's is.
+        hub.subscribed(
+            "sub-1",
+            "0a1b2c3d4e5f",
+            json!([roster_row(HOST, SID, "/w", json!({"title": "w-new"}))]),
+        )
+        .await;
+        wait_for("the source lists the row", || {
+            source.listed(HOST).map(|_| ())
+        })
+        .await;
+        let (lanes, _log, _recorder) = lanes_with_craze(
+            REMOTE_PORT,
+            BTreeMap::new(),
+            Some((source, vec![HOST.to_string()])),
+        );
+
+        let opened = lanes
+            .open(MACHINE, CRAZE, HOST)
+            .await
+            .expect("the craze lane");
+        assert_eq!(
+            opened["session"].get("permission_mode"),
+            None,
+            "opened on a row that says none: {opened}"
+        );
+
+        // The lane's own connection: the host's row, then an attach whose info
+        // document says `bypass`.
+        let mut conn = conns.recv().await.expect("the lane dialled");
+        conn.splice(HOST).await;
+        let mut info = session_info(HOST, SID, INC, session_caps(true));
+        info["permissionMode"] = json!("bypass");
+        conn.listed(host_session_row(&info, json!({"title": "w-new"})))
+            .await;
+        conn.attached(attach_result(
+            "s-1",
+            &info,
+            (INC, 1),
+            Some(snapshot_at(INC, 1, json!({}))),
+            None,
+        ))
+        .await;
+        conn.synchronized("s-1", 1).await;
+
+        let view = wait_for("the seed's row on lane.messages", || {
+            let v = lanes.messages(MACHINE, CRAZE, HOST).ok()?;
+            (!v["session"].is_null()).then_some(v)
+        })
+        .await;
+        assert_eq!(view["session"]["id"], HOST);
+        assert_eq!(
+            view["session"]["permission_mode"], "bypass",
+            "the attach's permission mode, on the live row: {view}"
+        );
+        let again = lanes
+            .open(MACHINE, CRAZE, HOST)
+            .await
+            .expect("an idempotent re-open");
+        assert_eq!(
+            again["session"].get("permission_mode"),
+            None,
+            "lane.open keeps the row it opened with"
+        );
     }
 }

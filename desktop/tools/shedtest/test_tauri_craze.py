@@ -890,7 +890,8 @@ def test_a_create_from_the_sheet_opens_its_transcript_at_once(app, rig):
     provider, a fresh directory and a first prompt; Create closes the sheet and
     opens the new session's transcript straight away — the row was folded in
     on the create's own answer — and it shows the prompt and the fake agent's
-    echo. Exactly one session runs there."""
+    echo, and its header says the session runs tools without asking. Exactly
+    one session runs there."""
     cwd = _mkdir_0700(rig.root / "w-sheet")
     rig.switch("proxy", True)
     before = len(rig.creates())
@@ -905,7 +906,19 @@ def test_a_create_from_the_sheet_opens_its_transcript_at_once(app, rig):
     lane = _dump(app)
     host = lane["session_id"]
     assert any(r["text"] == "hello sheet" for r in lane["rows"]), lane["rows"]
-    assert lane["permission"] == "runs tools without asking", "a sheet-created session runs bypass"
+    # A sheet-created session runs bypass, and the panel it opened says so —
+    # from the LIVE session row (`lane.messages`' `session`, which carries the
+    # attach info document's `permissionMode`), never only from the row it was
+    # opened with: that can be the create's own, with no permission mode, and
+    # `lane.open` re-answers it for as long as the panel stays open (plan 025
+    # §3.6.5; live leg 1). Which row the open got is a race this cell cannot
+    # pin: the header rule is pinned by `crazeRows.test.mjs`'s REGRESSION, the
+    # backend half by `lane.rs`'s `a_craze_lanes_permission_mode_arrives_on_
+    # lane_messages_not_lane_open`.
+    live = _messages(app, host)["session"]
+    assert live and live["permission_mode"] == "bypass", live
+    app.wait_until(lambda: (_dump(app) or {}).get("permission") == "runs tools without asking",
+                   timeout=WAIT, what="the open panel's permission line, from the live row")
     row = _exactly_one_session_in(app, cwd)
     assert row["slug"] == host and row["provider"] == "grok", row
     sent = rig.creates()[before:]
