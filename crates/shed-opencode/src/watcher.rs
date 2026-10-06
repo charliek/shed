@@ -25,7 +25,10 @@
 //!    the hub's seed-complete barrier expressed as an ordering rather than a
 //!    marker frame. Their session/approval effects are folded but NOT emitted
 //!    ([`Emit::Defer`]) — step 5 owns that half of the order.
-//! 5. Emit [`LaneEvent::Session`], then the approval frames, then
+//! 5. Emit [`LaneEvent::Session`], then [`LaneEvent::Capabilities`] (opencode's
+//!    fixed row, [`crate::client::opencode_capabilities`] — every seed carries
+//!    it, plan 025 §3.2.4; never a [`LaneEvent::Settings`], because those
+//!    capabilities say `settings: false`), then the approval frames, then
 //!    [`LaneEvent::Ready`]. From here frames apply as they arrive.
 //!
 //! Seeding BEFORE opening the stream is the bug this order exists to prevent: an
@@ -89,7 +92,8 @@ use shed_core::lane::{
 use shed_core::sse::SseParser;
 
 use crate::client::{
-    lane_session, OpencodeClient, RestMessage, RestPermission, RestQuestion, RestSession,
+    lane_session, opencode_capabilities, OpencodeClient, RestMessage, RestPermission, RestQuestion,
+    RestSession,
 };
 use crate::fold::OpencodeFold;
 use crate::helpers::{null_default, object_default};
@@ -166,6 +170,7 @@ pub(crate) fn spawn(
         emitted_approvals: HashMap::new(),
         last_session: None,
         session_row: None,
+        ready: false,
     };
     let task = tokio::spawn(watcher.run(cursor));
     LaneSubscription {
@@ -199,6 +204,10 @@ struct Watcher {
     /// The REST row behind [`LaneEvent::Session`] (title, cwd, timestamps),
     /// refreshed by every seed.
     session_row: Option<RestSession>,
+    /// The current generation reached its `Ready` — it WORKED, so a lag that
+    /// ends it restarts the backoff curve at the floor instead of climbing on
+    /// from wherever the last lag left it.
+    ready: bool,
 }
 
 /// Whether a frame's SESSION and APPROVAL effects are emitted as it is applied.
@@ -290,6 +299,13 @@ impl Watcher {
                     if self.tx.wait_drained().await.is_err() {
                         return; // the subscriber went away while we waited
                     }
+                    // Reset once a generation reaches `Ready` (the module doc):
+                    // a lag that ends a generation which WORKED is a first
+                    // failure, not the next step of an old climb — only lags
+                    // with no `Ready` between them climb.
+                    if self.ready {
+                        backoff = OC_BACKOFF_BASE;
+                    }
                     backoff = next_backoff(backoff, false);
                     tokio::time::sleep(jittered(backoff)).await;
                     reason = "lagged";
@@ -327,6 +343,7 @@ impl Watcher {
         self.fold.reset();
         self.emitted_approvals.clear();
         self.last_session = None;
+        self.ready = false;
         self.scope = HashSet::from([self.root.clone()]);
         sent
     }
@@ -433,13 +450,8 @@ impl Watcher {
             self.apply_frame(&raw, Emit::Defer)?;
         }
 
-        // Step 5: the seed's closing frames. Session first, then approvals —
-        // the order `shed_core::lane`'s module doc pins — then `Ready`.
-        self.emit_session()?;
-        self.emit_approvals()?;
-        self.emit(LaneEvent::Ready {
-            generation: self.generation,
-        })?;
+        // Step 5: the seed's closing frames.
+        self.close_seed()?;
 
         // Steady state.
         loop {
@@ -543,6 +555,25 @@ impl Watcher {
     }
 
     // ---- emitting ----
+
+    /// Step 5 of every generation: the session row, its capabilities, the
+    /// approvals — the order `shed_core::lane`'s module doc pins — then `Ready`.
+    ///
+    /// The capabilities ride EVERY seed, reconnects included (plan 025
+    /// §3.2.4): a client reads them from its view, and a view that swapped in a
+    /// seed without them would hold none.
+    fn close_seed(&mut self) -> Emitted {
+        self.emit_session()?;
+        self.emit(LaneEvent::Capabilities {
+            capabilities: opencode_capabilities(),
+        })?;
+        self.emit_approvals()?;
+        self.emit(LaneEvent::Ready {
+            generation: self.generation,
+        })?;
+        self.ready = true;
+        Ok(())
+    }
 
     /// Publish one frame, and hand the caller the ONE outcome it must not
     /// absorb.
@@ -962,10 +993,11 @@ where
 // the identical one, and its floor/ceiling differ, which is why the shared half
 // takes them as arguments. `jittered` is re-exported unchanged; `next_backoff`
 // keeps this crate's two-argument spelling by binding opencode's own bounds, so
-// every call site (and every test) below is untouched.
+// every call site (and every test) below is untouched — and the source's poller
+// (`crate::source`) climbs the same curve through it.
 pub(crate) use shed_core::lane::backoff::jittered;
 
-fn next_backoff(current: Duration, worked: bool) -> Duration {
+pub(crate) fn next_backoff(current: Duration, worked: bool) -> Duration {
     shed_core::lane::backoff::next_backoff(current, worked, OC_BACKOFF_BASE, OC_BACKOFF_MAX)
 }
 
@@ -1222,6 +1254,7 @@ mod tests {
             emitted_approvals: HashMap::new(),
             last_session: None,
             session_row: None,
+            ready: false,
         }
     }
 
@@ -1257,6 +1290,9 @@ mod tests {
             LaneEvent::Message { .. } => "message",
             LaneEvent::Session { .. } => "session",
             LaneEvent::Approval { .. } => "approval",
+            LaneEvent::Capabilities { .. } => "capabilities",
+            LaneEvent::Settings { .. } => "settings",
+            LaneEvent::Stale { .. } => "stale",
             LaneEvent::Ready { .. } => "ready",
             LaneEvent::Down { .. } => "down",
             // The contract's forward-compat arm; this watcher never mints one.
@@ -1289,10 +1325,7 @@ mod tests {
         )
         .expect("the replay fits");
         // Step 5.
-        w.emit_session().expect("the session row fits");
-        w.emit_approvals().expect("the approval fits");
-        w.emit(LaneEvent::Ready { generation: 1 })
-            .expect("the Ready fits");
+        w.close_seed().expect("the closing frames fit");
 
         let mut kinds: Vec<&str> = Vec::new();
         while let Ok(ev) = rx.try_recv() {
@@ -1308,9 +1341,17 @@ mod tests {
             .iter()
             .position(|k| *k == "approval")
             .unwrap_or_else(|| panic!("an Approval frame: {kinds:?}"));
+        let capabilities_at = kinds
+            .iter()
+            .position(|k| *k == "capabilities")
+            .unwrap_or_else(|| panic!("a Capabilities frame: {kinds:?}"));
         assert!(
-            session_at < approval_at,
-            "messages, then session, then approvals — got {kinds:?}"
+            session_at < capabilities_at && capabilities_at < approval_at,
+            "messages, then session, then capabilities, then approvals — got {kinds:?}"
+        );
+        assert!(
+            !kinds.contains(&"settings"),
+            "opencode's capabilities say settings: false, so no seed carries Settings: {kinds:?}"
         );
         assert!(
             kinds[session_at..].iter().all(|k| *k != "message"),
@@ -1328,10 +1369,9 @@ mod tests {
             .expect("an empty channel takes the Reset");
         w.apply_seed(seed_with_a_pending_permission())
             .expect("the seed fits");
-        // Drain the seed's own frames, then emit the closing sequence so the
-        // dedup state matches a live subscription's.
-        w.emit_session().expect("the session row fits");
-        w.emit_approvals().expect("the approval fits");
+        // Emit the closing sequence so the dedup state matches a live
+        // subscription's, then drain the seed's frames.
+        w.close_seed().expect("the closing frames fit");
         while rx.try_recv().is_ok() {}
 
         w.apply_frame(

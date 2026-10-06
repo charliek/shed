@@ -10,7 +10,20 @@ use std::time::Duration;
 use serde_json::{json, Value};
 use shed_core::lane::LaneEvent;
 use shed_opencode::testing::FakeOpencode;
+use shed_opencode::{OpencodeLane, OpencodeSource};
 use tokio::sync::mpsc::Receiver;
+
+/// A source on the fake — how every client reaches an opencode session since
+/// plan 025 split the contract.
+pub fn source(fake: &FakeOpencode) -> OpencodeSource {
+    OpencodeSource::new(fake.base_url(), None).expect("the source builds")
+}
+
+/// The session-scoped lane on `id`: what `AgentSource::open` hands back, as its
+/// concrete type. Binding only — nothing is dialled until a verb runs.
+pub fn lane_on(fake: &FakeOpencode, id: &str) -> OpencodeLane {
+    source(fake).lane(id)
+}
 
 /// How long any single wait may take. Generous next to a loopback round trip
 /// and the watcher's 100 ms backoff floor; short enough that a wedged test
@@ -76,6 +89,9 @@ pub fn shape(events: &[LaneEvent]) -> Vec<&'static str> {
             LaneEvent::Message { .. } => "message",
             LaneEvent::Session { .. } => "session",
             LaneEvent::Approval { .. } => "approval",
+            LaneEvent::Capabilities { .. } => "capabilities",
+            LaneEvent::Settings { .. } => "settings",
+            LaneEvent::Stale { .. } => "stale",
             LaneEvent::Down { .. } => "down",
             LaneEvent::Unknown => "unknown",
         })

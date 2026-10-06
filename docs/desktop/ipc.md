@@ -189,6 +189,31 @@ returns them. **A shed with no `roost-session` lists no sessions**, which is wha
 pane's empty state says — and it offers the setup, which happens on the shed's own card.
 See the roost project's own docs for the daemon and its IPC contract.
 
+### Agent lanes (Tauri)
+
+A row whose roost tab reported an agent server carries an `agent_lane` stamp, and these ops
+open a live transcript on it. `session_id` is the **agent's** session id from that stamp, not
+the tab's slug. The full contract — staging, reconnects, the answer forms, the failure codes
+— is [Agent lanes](agent-lanes.md).
+
+| op | params | result |
+|----|--------|--------|
+| `lane.open` | `machine`, `session_id` | `{session}` — the session row alone. Idempotent: a second call re-answers from the open lane |
+| `lane.messages` | `machine`, `session_id` | `{messages, activity, generation, stale, ended, capabilities, settings}` — the staged view, never a half-seeded one |
+| `lane.approvals` | `machine`, `session_id` | `{approvals}` — pending only, oldest first |
+| `lane.send` | `machine`, `session_id`, `text`, `mode?` (`queue` \| `interject`) | `{}` |
+| `lane.cancel` | `machine`, `session_id` | `{}` |
+| `lane.answer` | `machine`, `session_id`, `approval_id`, `answer` | `{}` |
+| `lane.close` | `machine`, `session_id` | `{}` — idempotent |
+
+**What the session can do is read from `lane.messages`, not `lane.open`.** Capabilities are
+per session and ride the lane's stream (a craze session's change with its incarnation), so
+`capabilities` and `settings` are the live generation's, staged and swapped in with its rows —
+each `null` until a seed carrying it has completed, and `settings` stays `null` on a session
+with none to show (every opencode lane). `stale` is the banner — the reason a lane is not live
+— and `ended` is a different fact: `true` only once the subscription is over, where a `stale`
+lane alone may be reconnecting on its own.
+
 ### UI-truth ops (Tauri)
 
 These report what the frontend RENDERED, so a test can assert the window rather than the
@@ -202,6 +227,7 @@ backend's view — the two can disagree, and have.
 | `egress.profiles` | on the Egress pane | `{egress}` |
 | `machines.dump` | on the Machines pane | `{machines}` — a row per machine with its `status` word, `detail` line, and grouped session slugs |
 | `sidebar.dump` | **always** | `{servers, machines}` — the sidebar's status foot |
+| `lane.dump` | while the transcript panel is open | `{lane}` — what the panel rendered: its rows, approval cards, `kind` badge, Interject toggle and `can_cancel` (all read off `lane.messages`' `capabilities`; Cancel and Interject exist only when the capabilities offer them, and are live only while the session is working), `stale`, `ended`, and its error; `null` when none is mounted |
 
 The New-session dialog is driven the same way: `ui.show_launch` opens it, and — **in test
 mode only** — `ui.fill_launch {mode?, target?, command?, workdir?}` types into it (`mode` is

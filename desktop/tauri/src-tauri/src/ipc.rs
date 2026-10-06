@@ -1380,7 +1380,10 @@ impl Handler {
     // `already_resolved`, `unauthorized`, …) plus `no_lane` for a row that has
     // no transcript to show. See [`crate::lane::LaneFailure`].
 
-    /// `lane.open {machine, session_id}` → `{session, capabilities}`.
+    /// `lane.open {machine, session_id}` → `{session}`.
+    ///
+    /// The session row alone: what the session can do rides its stream and is
+    /// answered by `lane.messages` (plan 025 §3.2.6).
     ///
     /// Idempotent: a second call for an already-open lane re-answers from the
     /// entry rather than opening a second subscription, and two concurrent calls
@@ -1394,7 +1397,9 @@ impl Handler {
     }
 
     /// `lane.messages {machine, session_id}` → `{messages, activity, generation,
-    /// stale}` — the staged-then-swapped view, never a half-seeded one.
+    /// stale, ended, capabilities, settings}` — the staged-then-swapped view,
+    /// never a half-seeded one, and the one place a client reads what the
+    /// session can do.
     fn lane_messages(&self, params: &Value) -> Result<Value, (String, String)> {
         let (machine, session_id) = lane_target(params)?;
         self.lanes.messages(&machine, &session_id).map_err(lane_err)

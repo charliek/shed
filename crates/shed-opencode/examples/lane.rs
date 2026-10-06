@@ -1,15 +1,17 @@
-//! `shed-opencode-lane` — a tiny CLI over [`shed_core::lane::AgentLane`], for
+//! `shed-opencode-lane` — a tiny CLI over the agent-lane contract
+//! ([`shed_core::lane::AgentSource`] and [`shed_core::lane::AgentLane`]), for
 //! driving a real opencode server by hand.
 //!
 //! It exists for two reasons: it is the manual verification tool plan 015 §8
 //! drives a roost tab's session with, and it is the smallest possible proof
-//! that the contract is usable from outside this crate (it calls nothing but
-//! `AgentLane`).
+//! that the contract is usable from outside this crate (past building the
+//! source, it calls nothing but the two traits — `sessions` is the source's
+//! first seed, every other verb runs on the lane the source opens).
 //!
 //! ```text
 //! shed-opencode-lane <base_url> <session_id> <verb> [args]
 //!
-//!   sessions                                     every root session on the server
+//!   sessions                                     every root session on the server (the source's seed)
 //!   history                                      the transcript, refolded from the top
 //!   watch                                        the live stream until ^C
 //!   send <text>                                  queue a prompt
@@ -23,14 +25,14 @@
 
 use std::process::ExitCode;
 
-use shed_core::lane::{AgentLane, LaneAnswer, LaneDecision, LaneEvent, SendMode};
-use shed_opencode::{BasicAuth, OpencodeClient};
+use shed_core::lane::{AgentSource, LaneAnswer, LaneDecision, LaneEvent, SendMode, SourceEvent};
+use shed_opencode::{BasicAuth, OpencodeSource};
 
 const USAGE: &str = "\
 usage: shed-opencode-lane <base_url> <session_id> <verb> [args]
 
 verbs:
-  sessions                                     every root session on the server
+  sessions                                     every root session on the server (the source's seed)
   history                                      the transcript, refolded from the top
   watch                                        the live stream until ^C
   send <text>                                  queue a prompt
@@ -68,26 +70,41 @@ async fn run() -> Result<(), String> {
         .ok()
         .filter(|p| !p.is_empty())
         .map(BasicAuth::password);
-    let lane = OpencodeClient::new(base, auth).map_err(|e| e.to_string())?;
+    let source = OpencodeSource::new(base, auth).map_err(|e| e.to_string())?;
+    // Opening is binding: nothing is dialled until a verb runs, so this is
+    // harmless for `sessions` (whose `-` names no session at all).
+    let lane = source.open(session).await.map_err(|e| e.to_string())?;
 
     match verb {
         "sessions" => {
-            for s in lane.sessions().await.map_err(|e| e.to_string())? {
-                println!(
-                    "{}  {:<12} {:>2} waiting  {}  {}",
-                    s.id,
-                    s.activity.as_str(),
-                    s.pending_approvals,
-                    s.cwd,
-                    s.title
-                );
+            // The source's FIRST seed — `Reset`, a `Session` per root, its
+            // capabilities, `Ready` — is the session list. Both halves stay
+            // bound while it is read (see `Subscription`).
+            let (mut rx, _stop) = source
+                .subscribe()
+                .await
+                .map_err(|e| e.to_string())?
+                .into_parts();
+            while let Some(event) = rx.recv().await {
+                match event {
+                    SourceEvent::Session { session: s } => println!(
+                        "{}  {:<12} {:>2} waiting  {}  {}",
+                        s.id,
+                        s.activity.as_str(),
+                        s.pending_approvals,
+                        s.cwd,
+                        s.title
+                    ),
+                    SourceEvent::Offline { reason, .. } => {
+                        return Err(format!("the server is unreachable: {reason}"))
+                    }
+                    SourceEvent::Ready { .. } => break,
+                    _ => {}
+                }
             }
         }
         "history" => {
-            let page = lane
-                .history(session, None, 200)
-                .await
-                .map_err(|e| e.to_string())?;
+            let page = lane.history(None, 200).await.map_err(|e| e.to_string())?;
             for m in &page.messages {
                 println!(
                     "#{:<4} {:<9} {:<16} {}",
@@ -105,7 +122,7 @@ async fn run() -> Result<(), String> {
             // BOTH halves are kept alive: dropping `stop` aborts the pump, and
             // the receiver then yields nothing forever. See `LaneSubscription`.
             let (mut rx, _stop) = lane
-                .subscribe(session, None)
+                .subscribe(None)
                 .await
                 .map_err(|e| e.to_string())?
                 .into_parts();
@@ -120,17 +137,17 @@ async fn run() -> Result<(), String> {
             let text = args
                 .get(3)
                 .ok_or_else(|| format!("send needs text\n\n{USAGE}"))?;
-            lane.send(session, text, SendMode::Queue)
+            lane.send(text, SendMode::Queue)
                 .await
                 .map_err(|e| e.to_string())?;
             println!("queued");
         }
         "cancel" => {
-            lane.cancel(session).await.map_err(|e| e.to_string())?;
+            lane.cancel().await.map_err(|e| e.to_string())?;
             println!("cancelled");
         }
         "approvals" => {
-            for a in lane.approvals(session).await.map_err(|e| e.to_string())? {
+            for a in lane.approvals().await.map_err(|e| e.to_string())? {
                 println!(
                     "{}  {:<12} {:<10} {}  [{}]",
                     a.id,
@@ -158,7 +175,7 @@ async fn run() -> Result<(), String> {
                 "reject" => LaneDecision::Reject,
                 other => return Err(format!("unknown decision {other:?}\n\n{USAGE}")),
             };
-            lane.answer(session, id, LaneAnswer::Permission { decision })
+            lane.answer(id, LaneAnswer::Permission { decision })
                 .await
                 .map_err(|e| e.to_string())?;
             println!("answered");
@@ -197,6 +214,22 @@ fn print_event(event: &LaneEvent) {
             approval.status.as_str(),
             approval.title
         ),
+        LaneEvent::Capabilities { capabilities } => println!(
+            "+++ capabilities: interject={} cancel={} approvals={} history_cursor={} settings={} stop={}",
+            capabilities.interject,
+            capabilities.cancel,
+            capabilities.approvals,
+            capabilities.history_cursor,
+            capabilities.settings,
+            capabilities.stop
+        ),
+        LaneEvent::Settings { settings } => println!(
+            "+++ settings: model {:?}, mode {:?}",
+            settings.model, settings.mode
+        ),
+        LaneEvent::Stale { reason } => {
+            println!("--- stale ({reason}): reconnecting, the view is kept")
+        }
         LaneEvent::Down { reason } => println!("--- down ({reason}): the subscription ended"),
         LaneEvent::Unknown => println!("--- an event kind this build does not know (ignored)"),
     }

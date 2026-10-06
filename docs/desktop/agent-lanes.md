@@ -9,10 +9,11 @@ a card into a lane, and what this cut does not do.
 ## What a lane is
 
 `shed_core::lane` (plan 015) defines the contract every agent adapter
-implements: a set of DTOs (session, transcript row, approval, event) plus one
-async trait, `AgentLane` — "a coding agent with sessions, a transcript and
-approvals," normalized so the desktop app (and, later, mobile) drives every
-agent the same way. The contract carries no I/O of its own; each agent gets
+implements: a set of DTOs (session, transcript row, approval, event) plus two
+async traits — a machine-level `AgentSource` (the session list, create, open)
+and the session-scoped `AgentLane` it opens (plan 025) — "a coding agent with
+sessions, a transcript and approvals," normalized so the desktop app (and,
+later, mobile) drives every agent the same way. The contract carries no I/O of its own; each agent gets
 its own adapter crate that supplies the transport, the reconnect loop, and
 the translation from that agent's wire format into the contract's DTOs.
 
@@ -52,16 +53,25 @@ so the transcript panel never shows a half-seeded view mid-reconnect. A
 `Down` event means the subscription ended; the panel keeps the last good
 transcript on screen with a banner explaining why, rather than clearing it.
 
-`shed-opencode`'s capabilities, as reported by `AgentLane::capabilities()`:
+`shed-opencode`'s capabilities, as its lane emits them in every seed (a
+`Capabilities` event on the stream — capabilities are per session and ride
+the stream rather than a getter, and the desktop answers them on
+`lane.messages`, not `lane.open`):
 
 | Field | Value | Meaning |
 |---|---|---|
 | `kind` | `"opencode"` | The adapter identity. |
-| `create` | `true` | New sessions can be opened through the contract. |
 | `cancel` | `true` | A turn in flight can be aborted. |
 | `approvals` | `true` | Permissions and questions surface and can be answered. |
 | `interject` | `false` | See [Limits](#limits) below. |
 | `history_cursor` | `false` | See [Limits](#limits) below. |
+| `settings` | `false` | No model, mode or option to show or change: the lane answers an empty settings read and refuses a change as unsupported. |
+| `stop` | `false` | The contract cannot end an opencode session; `stop` is refused as unsupported. |
+
+Creating a session is a property of the machine-level **source**, not of a
+lane: `shed_opencode::OpencodeSource` lists the server's sessions (a 5 s poll,
+diffed into upserts and removals), offers its one provider, creates (the
+first prompt optional), and opens the session-scoped lane the app talks to.
 
 ### Answering: scoped, and not free
 
@@ -382,7 +392,8 @@ open subscription, **client-shared Rust, not Tauri-specific**. It folds a
 `shed_core::lane` subscription's frames in arrival order behind the same
 `Reset … Ready` staging the contract promises, and exposes them through a
 typed `LaneView::snapshot(since_seq)` (`LaneViewSnapshot { messages, full,
-activity, generation, stale, approvals }`); `None` returns everything, `Some`
+activity, generation, stale, ended, capabilities, settings, approvals }`);
+`None` returns everything, `Some`
 a delta honored only when the cursor still lands inside the live
 generation's `seq` window. It lives in `shed-app`, ungated, for the same
 reason `machine.rs` and `roost.rs` are — mobile links `shed-app` with default
@@ -397,12 +408,12 @@ Once a row carries `agent_lane`, opening its Transcript affordance calls
 
 | Op | Does |
 |---|---|
-| `lane.open` | Ensures a subscription (idempotent — a second call for an already-open lane re-answers from the existing entry). |
-| `lane.messages` | The staged transcript: up to the last 500 rows, current activity, generation, and a `stale` reason when the lane is `Down`. |
+| `lane.open` | Ensures a subscription (idempotent — a second call for an already-open lane re-answers from the existing entry) and answers the session row. |
+| `lane.messages` | The staged transcript: up to the last 500 rows, current activity, generation, a `stale` reason when the lane is not live, `ended` once its subscription is over, and the session's `capabilities` and `settings` — the only place the panel reads what the session can do. |
 | `lane.approvals` | Pending permissions and questions, root session plus its children, sorted `created_at` then `id`. |
 | `lane.send` | Queues a prompt (`mode: queue`), or preempts the turn in flight (`mode: interject`) when the lane advertises `interject` — the panel shows the toggle only then, and only enables it while the turn is `Working`. |
-| `lane.cancel` | Aborts the turn in flight. |
-| `lane.answer` | Answers one approval. Four forms, exactly one per answer: `{choice: "<id>"}` — the exact option id the approval offered, which is what the panel always sends, because an agent can offer several options of the same decision kind (see [gx's `option_for` refusal](#the-option_for-ambiguity-refusal)); the scripted `{permission: "allow-once" \| "allow-always" \| "reject"}`, which resolves by semantic kind and refuses an ambiguous one; `{question: [[…]]}`, optionally with `custom_text` beside it (see [Free-text answers](#free-text-answers)); and `{reject: true}`. |
+| `lane.cancel` | Aborts the turn in flight. The panel offers Cancel only when the session's streamed `capabilities.cancel` is true, and enables it only while the session is `Working`. |
+| `lane.answer` | Answers one approval. Four forms, exactly one per answer and nothing beside it (any other key — say an `option_id` next to `permission` — is `bad_request`, so an answer can never execute as something other than what it reads as): `{choice: "<id>"}` — the exact option id the approval offered, which is what the panel always sends, because an agent can offer several options of the same decision kind (see [gx's `option_for` refusal](#the-option_for-ambiguity-refusal)); the scripted `{permission: "allow-once" \| "allow-always" \| "reject"}`, which resolves by semantic kind and refuses an ambiguous one; `{question: [[…]]}`, optionally with `custom_text` beside it (see [Free-text answers](#free-text-answers)); and `{reject: true}`. |
 | `lane.close` | Ends the subscription; the last close on a shared SSH forward tears it down. |
 
 A failure comes back as `{code, message}` with the contract's own snake_case
@@ -417,8 +428,9 @@ build has.
 The channel each subscription streams over is bounded — `LANE_CHANNEL_CAPACITY`
 (1024 frames) — so a client that stops draining (a backgrounded phone
 mid-session is the canonical case) cannot grow a watcher's backlog without
-limit; before this, it was unbounded. `shed_core::lane::LanePublisher` is the
-one place the overflow policy lives, shared by both adapters: `publish` is a
+limit; before this, it was unbounded. `shed_core::lane::Publisher<T>` — a
+lane's `LanePublisher`, a source's `SourcePublisher` — is the one place the
+overflow policy lives, shared by every adapter at both levels: `publish` is a
 `try_send`, and a full channel answers `Publish::Lagged` rather than blocking
 or dropping the frame unnoticed. Every emitting helper in both adapters
 propagates that, so a generation ends at the **first** dropped frame —
@@ -456,11 +468,11 @@ otherwise.
 
 ## Limits
 
-- **No interject.** `capabilities().interject` is `false`. Every send goes
+- **No interject.** Its capabilities' `interject` is `false`. Every send goes
   through opencode's `prompt_async`, which is accepted and ordered after
   whatever the session's runner is already doing — it does not preempt a
   turn in flight. There is no "type over the agent" affordance.
-- **No resume-from-cursor.** `capabilities().history_cursor` is `false`.
+- **No resume-from-cursor.** Its capabilities' `history_cursor` is `false`.
   Every reconnect refolds the full transcript from the top rather than
   resuming from a client-held position; this is what the `Reset` … `Ready`
   bracket exists to make invisible to the panel. A durable, resumable stream

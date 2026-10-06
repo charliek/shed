@@ -1369,14 +1369,27 @@ export type LaneMessage = {
 
 /** The staged-then-swapped view `lane.messages` answers with. `generation` is
  *  the generation of the rows being handed back (it moves when a reseed
- *  COMPLETES), and `stale` is the reason a `Down` gave — non-null means the last
- *  good generation is still on screen and the feed behind it is not live. That is
- *  the contract's "consume" posture: keep rendering, say so, don't blank. */
+ *  COMPLETES), and `stale` is the banner — the reason a `Stale` or a `Down` gave;
+ *  non-null means the last good generation is still on screen and the feed behind
+ *  it is not live. That is the contract's "consume" posture: keep rendering, say
+ *  so, don't blank.
+ *
+ *  `ended` is a DIFFERENT fact (plan 025 §3.2.4): `true` only after a `Down` —
+ *  the subscription is over — where `stale` alone can be a lane that is
+ *  reconnecting on its own and must not be reopened.
+ *
+ *  `capabilities` and `settings` are the LIVE generation's, staged and swapped
+ *  in with its rows: what this session can do, read HERE and nowhere else (not
+ *  from `lane.open`, which no longer carries them). `null` until a seed carrying
+ *  them has completed; `settings` stays `null` on a session with none to show. */
 export type LaneView = {
   messages: LaneMessage[];
   activity: string;
   generation: number;
   stale: string | null;
+  ended: boolean;
+  capabilities: LaneCapabilities | null;
+  settings: LaneSettings | null;
 };
 
 /** One button an approval offers, exactly as the agent offered it.
@@ -1434,7 +1447,9 @@ export type LaneApproval = {
   created_at_unix_ms?: number | null;
 };
 
-/** The agent session behind a lane (`shed_core::lane::LaneSession`). */
+/** The agent session behind a lane (`shed_core::lane::LaneSession`). The
+ *  fields after `last_change_unix_ms` are a craze roster row's facts (plan 025)
+ *  and are absent from an opencode row. */
 export type LaneSessionRow = {
   id: string;
   title: string;
@@ -1444,19 +1459,58 @@ export type LaneSessionRow = {
   approximate: boolean;
   parent_id?: string | null;
   last_change_unix_ms?: number | null;
+  provider?: string | null;
+  model?: string | null;
+  doing?: string | null;
+  head_ask_summary?: string | null;
+  last_reply?: string | null;
+  since_unix_ms?: number | null;
+  attached?: number | null;
+  start_error?: string | null;
+  provider_session_id?: string | null;
+  permission_mode?: string | null;
+  tab_id?: number | null;
 };
 
-/** What the adapter behind a lane can do (`lane.open`'s second half). */
+/** What THIS SESSION can do (`shed_core::lane::LaneCapabilities`) — per session,
+ *  riding the lane's stream, and read from `lane.messages`' `capabilities`
+ *  (plan 025 §3.2). `create` left this type: creating is a machine-level act. */
 export type LaneCapabilities = {
   kind: string;
   interject: boolean;
-  create: boolean;
   cancel: boolean;
   approvals: boolean;
   history_cursor: boolean;
+  settings: boolean;
+  stop: boolean;
 };
 
-export type LaneOpened = { session: LaneSessionRow; capabilities: LaneCapabilities };
+/** One selectable value — a model, a mode, an option's value
+ *  (`shed_core::lane::LaneChoice`). `id` is what a change sends back. */
+export type LaneChoice = { id: string; name: string; rank?: number | null; description?: string | null };
+
+/** One of a model's own options (`shed_core::lane::LaneSetting`): its current
+ *  value and the values it offers. `category` is an open string. */
+export type LaneSetting = { id: string; name: string; category: string; current: string; values: LaneChoice[] };
+
+/** How full a session's context is (`shed_core::lane::LaneUsage`). */
+export type LaneUsage = { context_tokens?: number | null; context_window?: number | null };
+
+/** A session's settings, rendered generically (`shed_core::lane::LaneSettings`):
+ *  the model and the models, the mode and the modes, the model's own options,
+ *  and how full its context is. */
+export type LaneSettings = {
+  model?: string | null;
+  models: LaneChoice[];
+  mode?: string | null;
+  modes: LaneChoice[];
+  options: LaneSetting[];
+  usage?: LaneUsage | null;
+};
+
+/** `lane.open`'s answer: the session row alone. What the session can do is the
+ *  view's (`LaneView.capabilities`), not the open's. */
+export type LaneOpened = { session: LaneSessionRow };
 
 /** The four forms `lane.answer` accepts (`lane::parse_answer`). Exactly one key
  *  per answer — naming two is a `bad_request`.
@@ -1626,8 +1680,9 @@ export type LaneApprovalCard = {
 export type LaneReport = {
   machine: string;
   session_id: string;
-  /** Which adapter is behind this panel (`opened.capabilities.kind`), and what
-   *  the header badge says. `""` until `lane.open` answers. */
+  /** Which adapter is behind this panel (the view's `capabilities.kind`), and
+   *  what the header badge says. `""` until a seed carrying capabilities has
+   *  swapped in. */
   kind: string;
   title: string;
   cwd: string;
@@ -1635,18 +1690,23 @@ export type LaneReport = {
   generation: number;
   /** The stale banner's reason, or null while the lane is live. */
   stale: string | null;
+  /** The subscription ENDED (a `Down`) — not merely stale. */
+  ended: boolean;
   rows: LaneRow[];
   approvals: LaneApprovalCard[];
-  /** The Cancel button is enabled — i.e. the session is Working. */
+  /** The Cancel button exists AND is enabled: the session's streamed
+   *  capabilities offer `cancel` and it is Working (`laneVerbs`). `false` both
+   *  for a session that cannot cancel (no button at all) and for one that can
+   *  but is not working (a disabled button). */
   can_cancel: boolean;
-  /** The Interject toggle, or `null` when the adapter does not advertise the
-   *  capability and no toggle is rendered at all.
+  /** The Interject toggle, or `null` when the session's capabilities do not
+   *  advertise it and no toggle is rendered at all.
    *
    *  Three states rather than a bool because "absent" and "present but
    *  disabled" are different claims and both are pinned: opencode advertises no
-   *  `interject`, so its panel has no toggle; gx advertises it, so its panel
-   *  has one — enabled only while the session is Working, because that is the
-   *  only time the agent accepts one. */
+   *  `interject`, so its panel has no toggle; a session that does (gx did; a
+   *  craze session may) gets one — enabled only while the session is Working,
+   *  because that is the only time the agent accepts one. */
   interject: { on: boolean; enabled: boolean } | null;
   error: string | null;
 };

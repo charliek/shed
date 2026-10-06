@@ -1,5 +1,7 @@
-//! The HTTP client — two reqwest clients, opencode's routes, and the
-//! [`AgentLane`] implementation on top of them.
+//! The HTTP client — two reqwest clients, opencode's routes, the id-addressed
+//! verbs on top of them, and [`OpencodeLane`], the session-scoped [`AgentLane`]
+//! that binds one session's id to those verbs ([`crate::OpencodeSource`] is the
+//! machine-level half, plan 025 P7).
 //!
 //! # Two clients, not one
 //!
@@ -70,7 +72,7 @@ use serde_json::value::RawValue;
 use shed_core::lane::{
     normalize_question_answer, option_kind, AgentLane, LaneAnswer, LaneApproval, LaneApprovalKind,
     LaneApprovalOption, LaneCapabilities, LaneDecision, LaneError, LaneHistory, LaneSession,
-    LaneSubscription, SendMode,
+    LaneSettingChange, LaneSettings, LaneSubscription, SendMode,
 };
 use shed_core::rc::RcActivity;
 
@@ -151,11 +153,14 @@ pub(crate) enum Route {
     Approval,
 }
 
-/// The opencode adapter: the transport, the verbs, and [`AgentLane`].
+/// The opencode transport and its id-addressed verbs — what an
+/// [`OpencodeLane`] (one session) and a [`crate::OpencodeSource`] (the server's
+/// sessions) are built on. Neither contract trait is implemented here: the
+/// lane binds a session id to these verbs, the source polls and creates.
 ///
 /// Cheap to clone — both reqwest clients are `Arc` inside, and the rest is a
 /// URL and a header string. [`AgentLane::subscribe`] clones one into the pump
-/// task it spawns.
+/// task it spawns, and every lane a source opens holds a clone.
 #[derive(Debug, Clone)]
 pub struct OpencodeClient {
     base: reqwest::Url,
@@ -756,34 +761,51 @@ pub(crate) fn lane_session(
         approximate,
         parent_id: (!s.parent_id.is_empty()).then(|| s.parent_id.clone()),
         last_change_unix_ms: (s.time.updated > 0).then_some(s.time.updated),
+        // The roster facts plan 025 added are a craze row's: opencode IS its
+        // provider and states none of them, so a row from here is byte-identical
+        // to what it was before they existed.
+        ..LaneSession::default()
     }
 }
 
-// ---- the contract ----
+// ---- the verbs, id-addressed (what `OpencodeLane` and `OpencodeSource` bind) ----
 
-#[async_trait::async_trait]
-impl AgentLane for OpencodeClient {
-    /// Pinned by plan 015 §3.1: opencode has no interject (`prompt_async` joins
-    /// the running turn, it does not preempt it) and no resumable history
-    /// cursor (every `history` refolds from the top).
-    fn capabilities(&self) -> LaneCapabilities {
-        LaneCapabilities {
-            kind: "opencode".to_string(),
-            interject: false,
-            create: true,
-            cancel: true,
-            approvals: true,
-            history_cursor: false,
-        }
+/// The agent token opencode's capabilities carry at both levels
+/// ([`opencode_capabilities`], [`crate::opencode_source_capabilities`]), and its
+/// source's `kind`.
+pub(crate) const KIND: &str = "opencode";
+
+/// opencode's capabilities, as its lane emits them in every seed
+/// ([`shed_core::lane::LaneEvent::Capabilities`]).
+///
+/// Pinned by plan 015 §3.1 and plan 025 §3.2.6: opencode has no interject
+/// (`prompt_async` joins the running turn, it does not preempt it), no
+/// resumable stream (every reconnect refolds from the top, so
+/// `history_cursor: false`), no settings to show or change, and no way to end a
+/// session from this contract. The same for every opencode session — but it
+/// rides the stream all the same, because a client reads capabilities from
+/// there for every adapter.
+pub fn opencode_capabilities() -> LaneCapabilities {
+    LaneCapabilities {
+        kind: KIND.to_string(),
+        interject: false,
+        cancel: true,
+        approvals: true,
+        history_cursor: false,
+        settings: false,
+        stop: false,
     }
+}
 
-    /// Every ROOT session in the server's global store.
+impl OpencodeClient {
+    /// Every ROOT session in the server's global store — the poll behind
+    /// [`crate::OpencodeSource`]'s subscription.
     ///
     /// Activity comes from one `/session/status` read per DISTINCT directory —
     /// that route is instance-scoped, so a single un-scoped read would report
     /// only the server process's own cwd. Rows are `approximate: true`: this is
     /// a poll, not a fold, and it cannot see approvals.
-    async fn sessions(&self) -> Result<Vec<LaneSession>, LaneError> {
+    pub(crate) async fn sessions(&self) -> Result<Vec<LaneSession>, LaneError> {
         let all = self.rest_sessions().await?;
         let roots: Vec<RestSession> = all.into_iter().filter(|s| s.parent_id.is_empty()).collect();
 
@@ -817,7 +839,7 @@ impl AgentLane for OpencodeClient {
 
     /// One session row, with a real approval count (the roster's cheap poll
     /// cannot afford one per row; a single row can).
-    async fn session(&self, id: &str) -> Result<LaneSession, LaneError> {
+    pub(crate) async fn session(&self, id: &str) -> Result<LaneSession, LaneError> {
         let s = self.rest_session(id).await?;
         let status = self.rest_status(&s.directory).await;
         let (known, map) = match &status {
@@ -832,11 +854,12 @@ impl AgentLane for OpencodeClient {
     /// Refolds the transcript from the top through a FRESH ring (seq from 1)
     /// and returns its tail.
     ///
-    /// `cursor` is ignored — `history_cursor: false` — and the page is the most
-    /// recent `limit` rows, so a client renders the end of the conversation
-    /// rather than its beginning. `truncated` is true whenever the client is
-    /// therefore NOT holding the whole history.
-    async fn history(
+    /// `cursor` is ignored — it is advisory, and opencode has no per-session
+    /// `?after=` route — and the page is the most recent `limit` rows, so a
+    /// client renders the end of the conversation rather than its beginning.
+    /// `truncated` is true whenever the client is therefore NOT holding the
+    /// whole history.
+    pub(crate) async fn history(
         &self,
         id: &str,
         _cursor: Option<&str>,
@@ -860,9 +883,10 @@ impl AgentLane for OpencodeClient {
         })
     }
 
-    /// `POST /session?directory=<cwd>` then `prompt_async` — opencode takes the
-    /// directory as a QUERY parameter on create, not in the body.
-    async fn create(&self, cwd: &str, text: &str) -> Result<LaneSession, LaneError> {
+    /// `POST /session?directory=<cwd>` — opencode takes the directory as a
+    /// QUERY parameter on create, not in the body. The prompt, if any, is the
+    /// caller's next step ([`crate::OpencodeSource`]'s `create`).
+    pub(crate) async fn create_session(&self, cwd: &str) -> Result<RestSession, LaneError> {
         let body = self
             .post_json("/session", Some(cwd), Route::Session, json!({}))
             .await?;
@@ -873,17 +897,13 @@ impl AgentLane for OpencodeClient {
                 "POST /session returned no session id".to_string(),
             ));
         }
-        self.send(&created.id, text, SendMode::Queue).await?;
-        // `Working` is asserted rather than polled: a prompt was just accepted,
-        // and a `/session/status` read this instant would race the runner and
-        // report idle. `approximate: true` is what says so.
-        Ok(lane_session(&created, RcActivity::Working, 0, true))
+        Ok(created)
     }
 
     /// [`SendMode::Queue`] is `prompt_async` (204). [`SendMode::Interject`] is
-    /// refused rather than silently downgraded — `capabilities().interject` is
-    /// false and a client that ignored it must see the refusal.
-    async fn send(&self, id: &str, text: &str, mode: SendMode) -> Result<(), LaneError> {
+    /// refused rather than silently downgraded — the capabilities say
+    /// `interject: false` and a client that ignored them must see the refusal.
+    pub(crate) async fn send(&self, id: &str, text: &str, mode: SendMode) -> Result<(), LaneError> {
         if mode == SendMode::Interject {
             return Err(LaneError::NotAccepting);
         }
@@ -897,7 +917,7 @@ impl AgentLane for OpencodeClient {
         Ok(())
     }
 
-    async fn cancel(&self, id: &str) -> Result<(), LaneError> {
+    pub(crate) async fn cancel(&self, id: &str) -> Result<(), LaneError> {
         self.post_json(
             &session_path(id, &["abort"]),
             None,
@@ -914,7 +934,7 @@ impl AgentLane for OpencodeClient {
     /// Both halves are read independently: a failed `/question` read must not
     /// hide the permissions that DID load, and vice versa. Both failing is the
     /// error.
-    async fn approvals(&self, id: &str) -> Result<Vec<LaneApproval>, LaneError> {
+    pub(crate) async fn approvals(&self, id: &str) -> Result<Vec<LaneApproval>, LaneError> {
         let root = self.rest_session(id).await?;
         let scope = self.approval_scope(id).await;
 
@@ -938,7 +958,7 @@ impl AgentLane for OpencodeClient {
     /// ([`OpencodeClient::resolve_approval`]), which is what keeps this
     /// session's panel from answering a SIBLING session's request. It is also
     /// the pin the caller asserts and the fake's guard checks.
-    async fn answer(
+    pub(crate) async fn answer(
         &self,
         id: &str,
         approval_id: &str,
@@ -955,7 +975,7 @@ impl AgentLane for OpencodeClient {
 
     /// Opens a live stream for one session. See [`crate::watcher`] for the
     /// generation bracket and the seed order.
-    async fn subscribe(
+    pub(crate) async fn subscribe(
         &self,
         id: &str,
         cursor: Option<String>,
@@ -971,6 +991,86 @@ impl AgentLane for OpencodeClient {
             id.to_string(),
             session.directory,
             cursor,
+        ))
+    }
+}
+
+// ---- the contract: one session ----
+
+/// One opencode session — the session-scoped [`AgentLane`] an
+/// [`crate::OpencodeSource`] opens.
+///
+/// Today's verbs with the session id bound (plan 025 P7): every behaviour, every
+/// route and every error mapping is the client's, unchanged. What the split
+/// added is the three verbs opencode cannot do — [`AgentLane::settings`] answers
+/// the empty default, and [`AgentLane::set`]/[`AgentLane::stop`] are refused as
+/// unsupported, which its capabilities already said.
+///
+/// Cheap to clone and to hold: the client inside is `Arc`s and a header string.
+#[derive(Debug, Clone)]
+pub struct OpencodeLane {
+    client: OpencodeClient,
+    id: String,
+}
+
+impl OpencodeLane {
+    pub(crate) fn new(client: OpencodeClient, id: String) -> OpencodeLane {
+        OpencodeLane { client, id }
+    }
+}
+
+#[async_trait::async_trait]
+impl AgentLane for OpencodeLane {
+    fn session_id(&self) -> &str {
+        &self.id
+    }
+
+    async fn session(&self) -> Result<LaneSession, LaneError> {
+        self.client.session(&self.id).await
+    }
+
+    async fn history(&self, cursor: Option<&str>, limit: u32) -> Result<LaneHistory, LaneError> {
+        self.client.history(&self.id, cursor, limit).await
+    }
+
+    async fn subscribe(&self, cursor: Option<String>) -> Result<LaneSubscription, LaneError> {
+        self.client.subscribe(&self.id, cursor).await
+    }
+
+    async fn send(&self, text: &str, mode: SendMode) -> Result<(), LaneError> {
+        self.client.send(&self.id, text, mode).await
+    }
+
+    async fn cancel(&self) -> Result<(), LaneError> {
+        self.client.cancel(&self.id).await
+    }
+
+    async fn approvals(&self) -> Result<Vec<LaneApproval>, LaneError> {
+        self.client.approvals(&self.id).await
+    }
+
+    async fn answer(&self, approval_id: &str, answer: LaneAnswer) -> Result<(), LaneError> {
+        self.client.answer(&self.id, approval_id, answer).await
+    }
+
+    /// Nothing to show: opencode's capabilities say `settings: false`.
+    async fn settings(&self) -> Result<LaneSettings, LaneError> {
+        Ok(LaneSettings::default())
+    }
+
+    /// Refused — never `NotAccepting`, because "not now" would be a lie about
+    /// "never" (`shed_core::lane`'s module doc, "Two levels").
+    async fn set(&self, _change: LaneSettingChange) -> Result<(), LaneError> {
+        Err(LaneError::Failed(
+            "changing a session's settings is not supported by opencode".to_string(),
+        ))
+    }
+
+    /// Refused for the same reason: the contract has no way to end an opencode
+    /// session (its server owns that), and the capabilities say `stop: false`.
+    async fn stop(&self) -> Result<(), LaneError> {
+        Err(LaneError::Failed(
+            "stopping a session is not supported by opencode".to_string(),
         ))
     }
 }

@@ -10,11 +10,17 @@
    `capabilities` rather than from a branch on the kind.** Plan 015 shipped this
    with `capabilities` stored and never read, which was invisible while opencode
    was the only adapter: what it can do and what the panel offered happened to
-   agree. gx does not agree — it interjects, and its permissions offer whatever
-   the agent asked, not a fixed three — so the panel now reads the flags (the
-   Interject toggle) and the approval's own `options` (the buttons). The kind
-   itself appears exactly once, as a badge in the header, so a person can see
-   which agent they are talking to.
+   agree. gx did not agree (plan 017) — it interjected, and its permissions
+   offered whatever the agent asked, not a fixed three — so the panel reads the
+   flags (the Interject toggle) and the approval's own `options` (the buttons).
+   The kind itself appears exactly once, as a badge in the header, so a person
+   can see which agent they are talking to.
+
+   **The capabilities come from the VIEW, not from `lane.open`** (plan 025
+   §3.2). They are per session and ride the lane's stream — a craze session's
+   change with its incarnation — so `lane.open` answers the session row alone
+   and the panel reads `capabilities` off the same `lane.messages` poll as
+   everything else it renders. A copy taken at open would be stale by design.
 
    Three things about it are load-bearing rather than stylistic:
 
@@ -34,6 +40,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { ChevronDown, ChevronRight, ScrollText, Send, Square, X, Zap } from "lucide-react";
 import { cn } from "@/lib/utils";
+import { laneVerbs } from "@/lib/laneVerbs";
 import { newestWins } from "@/lib/newest";
 import { cardCls, KindBadge, StatusChip, type Tone } from "@/components/primitives";
 import {
@@ -265,16 +272,20 @@ export function LanePanel({ machine, sessionId, onClose }: {
   }, [messages.length]);
 
   const act = activityBadge(view?.activity ?? "unknown");
-  const working = (view?.activity ?? "") === "working";
-  /** The capability half of the Interject affordance: is there a toggle at all?
+  /** The capability half of the verb affordances: is there a button at all,
+   *  and can it be pressed?
    *
-   *  `lane.open`'s `capabilities` were stored and never read until now — the
-   *  panel offered whatever it felt like and let the adapter refuse. That is the
-   *  wrong way round for an affordance: an adapter that cannot interject (every
-   *  opencode lane) should not show a button whose only outcome is an error. */
-  const canInterject = opened?.capabilities?.interject === true;
+   *  Read off the VIEW's capabilities — the live generation's, from the
+   *  `lane.messages` poll — never off `lane.open`, which no longer carries any —
+   *  through `laneVerbs`, the ONE rule both the buttons and `lane.dump` read: a
+   *  verb the session's capabilities do not offer has no button (every opencode
+   *  lane has no Interject; a session whose capabilities say `cancel: false`
+   *  has no Cancel), and an offered verb is enabled only while it is Working. */
+  const capabilities = view?.capabilities ?? null;
+  const verbs = laneVerbs(capabilities, view?.activity ?? "");
+  const canInterject = verbs.interject.shown;
   /** …and the state half: armed only while the agent would accept one. */
-  const interjecting = canInterject && working && interject;
+  const interjecting = verbs.interject.enabled && interject;
   // What the reader just tried outranks what the lane is doing: a refusal is
   // about them, a read failure is about the machine.
   const error = actionError ?? readError;
@@ -400,16 +411,17 @@ export function LanePanel({ machine, sessionId, onClose }: {
   const report: LaneReport = {
     machine,
     session_id: sessionId,
-    kind: opened?.capabilities?.kind ?? "",
+    kind: capabilities?.kind ?? "",
     title: opened?.session.title ?? "",
     cwd: opened?.session.cwd ?? "",
     activity: view?.activity ?? "unknown",
     generation: view?.generation ?? 0,
     stale: view?.stale ?? null,
+    ended: view?.ended ?? false,
     rows,
     approvals: cards,
-    can_cancel: working,
-    interject: canInterject ? { on: interjecting, enabled: working } : null,
+    can_cancel: verbs.cancel.enabled,
+    interject: canInterject ? { on: interjecting, enabled: verbs.interject.enabled } : null,
     error,
   };
   // Compared BY VALUE, not by reference: the report is rebuilt every render, so
@@ -449,9 +461,10 @@ export function LanePanel({ machine, sessionId, onClose }: {
         {/* WHICH agent this transcript belongs to. Two adapters in one app made
             it worth saying out loud: the panels differ in what they offer
             (interject, the shape of a permission's buttons), and the kind is the
-            reason. Empty until `lane.open` answers, and no placeholder for it —
-            a badge that said "…" would be noise on every mount. */}
-        {opened?.capabilities?.kind && <KindBadge kind={opened.capabilities.kind} />}
+            reason. Empty until the first seed's capabilities have swapped into
+            the view, and no placeholder for it — a badge that said "…" would be
+            noise on every mount. */}
+        {capabilities?.kind && <KindBadge kind={capabilities.kind} />}
         <StatusChip tone={act.tone} label={act.label} />
         <button
           onClick={onClose}
@@ -462,15 +475,16 @@ export function LanePanel({ machine, sessionId, onClose }: {
         </button>
       </header>
 
-      {/* The `Down` posture: the last good generation stays on screen, and the
-          banner says why it is not moving. Not an error dialog — a machine that
-          went to sleep is normal. */}
+      {/* The `Stale`/`Down` posture: the last good generation stays on screen,
+          and the banner says why it is not moving — and whether the lane is
+          reconnecting on its own (stale) or over (ended). Not an error dialog — a
+          machine that went to sleep is normal. */}
       {view?.stale && (
         <div
           className="flex-none border-b border-shed-border px-4 py-2 font-mono text-[12px]"
           style={{ background: "var(--shed-warn-bg)", color: "var(--shed-warn-fg)" }}
         >
-          not live · {view.stale} — showing the last known transcript
+          {view.ended ? "ended" : "not live"} · {view.stale} — showing the last known transcript
         </div>
       )}
       {error && (
@@ -723,9 +737,9 @@ export function LanePanel({ machine, sessionId, onClose }: {
           {canInterject && (
             <button
               onClick={() => setInterject(!interject)}
-              disabled={busy || !working}
+              disabled={busy || !verbs.interject.enabled}
               title={
-                working
+                verbs.interject.enabled
                   ? interjecting
                     ? "Interject: the next prompt interrupts the turn in flight"
                     : "Queue: the next prompt waits for the turn in flight"
@@ -737,7 +751,7 @@ export function LanePanel({ machine, sessionId, onClose }: {
                 background: interjecting ? "var(--shed-accent)" : "var(--shed-surface)",
                 color: interjecting ? "var(--shed-accent-fg)" : "var(--shed-text-secondary)",
                 border: "1px solid var(--shed-border)",
-                opacity: busy || !working ? 0.5 : 1,
+                opacity: busy || !verbs.interject.enabled ? 0.5 : 1,
               }}
             >
               <Zap size={15} />
@@ -757,22 +771,27 @@ export function LanePanel({ machine, sessionId, onClose }: {
           >
             <Send size={15} />
           </button>
-          {/* Enabled only while the session is Working — cancelling a session
-              that is already waiting on you is a no-op the agent would refuse. */}
-          <button
-            onClick={() => void cancel()}
-            disabled={busy || !working}
-            title="Cancel the turn in flight"
-            className="hbtn inline-flex h-9 w-9 items-center justify-center rounded-[9px]"
-            style={{
-              background: "var(--shed-deny-bg)",
-              color: "var(--shed-danger)",
-              border: "none",
-              opacity: busy || !working ? 0.5 : 1,
-            }}
-          >
-            <Square size={14} />
-          </button>
+          {/* Present only when the session's capabilities offer `cancel`, and
+              enabled only while it is Working — cancelling a session that is
+              already waiting on you is a no-op the agent would refuse, and a
+              session that cannot cancel at all gets no button whose only
+              outcome is a refusal (`laneVerbs`). */}
+          {verbs.cancel.shown && (
+            <button
+              onClick={() => void cancel()}
+              disabled={busy || !verbs.cancel.enabled}
+              title="Cancel the turn in flight"
+              className="hbtn inline-flex h-9 w-9 items-center justify-center rounded-[9px]"
+              style={{
+                background: "var(--shed-deny-bg)",
+                color: "var(--shed-danger)",
+                border: "none",
+                opacity: busy || !verbs.cancel.enabled ? 0.5 : 1,
+              }}
+            >
+              <Square size={14} />
+            </button>
+          )}
         </div>
       </div>
     </aside>

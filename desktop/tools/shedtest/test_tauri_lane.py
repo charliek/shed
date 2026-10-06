@@ -438,14 +438,22 @@ def test_only_a_tab_that_reported_a_server_carries_a_lane(app, oc):
     opened = _open(app)
     assert opened["session"]["id"] == LANE_SESSION
     assert opened["session"]["cwd"] == DIRECTORY
-    assert opened["capabilities"] == {
+    # `lane.open` answers the session row ALONE (plan 025 §3.2.6): what the
+    # session can do is per session, rides the lane's stream, and is read from
+    # the staged view — `lane.messages` — once the seed carrying it swaps in.
+    assert set(opened) == {"session"}, opened
+    view = _ready(app)
+    assert view["capabilities"] == {
         "kind": "opencode",
         "interject": False,
-        "create": True,
         "cancel": True,
         "approvals": True,
         "history_cursor": False,
-    }
+        "settings": False,
+        "stop": False,
+    }, view["capabilities"]
+    assert view["settings"] is None, "opencode has no settings to show"
+    assert view["ended"] is False
 
     refused = _error(lambda: _open(app, BARE_SESSION))
     assert refused.code == "no_lane", refused
@@ -507,7 +515,12 @@ def test_the_history_seeds_into_the_lane_view(app):
     # what makes those two able to disagree impossible.
     assert [r["seq"] for r in panel["rows"]] == [m["seq"] for m in _messages(app)["messages"]]
     assert panel["activity"] == "needs_input", "the badge says what the view says"
+    # The header badge and the Interject toggle read the VIEW's capabilities —
+    # the `lane.messages` poll — not `lane.open`, which carries none.
+    assert panel["kind"] == "opencode", "the kind badge reads the view's capabilities"
+    assert panel["interject"] is None, "opencode advertises no interject: no toggle"
     assert panel["stale"] is None, "no stale banner on a live lane"
+    assert panel["ended"] is False
     assert panel["generation"] >= view["generation"]
     assert panel["approvals"] == [], "nothing is blocking on the human"
     assert panel["can_cancel"] is False, "Cancel is enabled only while Working"
@@ -866,6 +879,38 @@ def test_cancel_aborts_the_pinned_session(app, oc):
     app.call("lane.cancel", {"machine": MACHINE, "session_id": LANE_SESSION})
     assert oc.post_paths.count(f"/session/{LANE_SESSION}/abort") == before + 1
     assert oc.violations == []
+
+
+def test_cancel_is_offered_by_the_streamed_capability_and_live_only_while_working(app, oc):
+    """The panel's Cancel exists because the session's STREAMED capabilities
+    offer it — `lane.messages`' `capabilities.cancel`, which every opencode seed
+    carries as true — and it is live only while the agent is Working (the
+    panel's one rule, `laneVerbs`; plan 025 §3.6.5). `lane.dump`'s `can_cancel`
+    IS that rule: false at rest, true while working, false once it settles.
+
+    The `cancel: false` half — no button at all — is pinned on the UI's node
+    test runner (`tauri/ui/test/laneVerbs.test.mjs`): no opencode session can
+    advertise it, so this cell cannot reach it.
+    """
+    _ready(app)
+    assert _messages(app)["capabilities"]["cancel"] is True
+    _panel(app)
+    assert _dump(app)["can_cancel"] is False, "at rest the button is not live"
+
+    oc.set_status(LANE_SESSION, "busy")
+    oc.stream({"type": "session.status",
+               "properties": {"sessionID": LANE_SESSION, "status": {"type": "busy"}}})
+    try:
+        app.wait_until(lambda: (_dump(app) or {}).get("can_cancel") is True,
+                       timeout=20, what="Cancel to go live while the agent works")
+        assert _dump(app)["activity"] == "working"
+    finally:
+        # Settle the session back to where every later cell expects it.
+        oc.set_status(LANE_SESSION, "idle")
+        oc.stream_idle(LANE_SESSION)
+    app.wait_until(lambda: (_dump(app) or {}).get("can_cancel") is False,
+                   timeout=20, what="Cancel to go dead once the agent settles")
+    _unmount(app)
 
 
 # ---------------------------------------------------------------------------

@@ -38,7 +38,7 @@ shed-app = { path = "../../../crates/shed-app", features = ["broker"] }
 # shipped path against a Python fake over a real socket. The Rust fake is a
 # dev-dependency instead (below), so it reaches `cargo test` and nothing else.
 shed-opencode = { path = "../../../crates/shed-opencode" }
-# ONLY for `reqwest::Url` — `OpencodeClient::new` takes a parsed base URL, and
+# ONLY for `reqwest::Url` — `OpencodeSource::new` takes a parsed base URL, and
 # this crate has to name the type to build one. `default-features = false` and no
 # features of its own: the version and the feature set are whatever shed-core
 # already resolved (`rustls-tls, stream, json`), so this adds nothing to the lock

@@ -20,6 +20,7 @@ pub mod sse;
 pub mod terminal;
 #[cfg(test)]
 mod testtls;
+pub mod time;
 pub mod tls;
 pub mod token;
 

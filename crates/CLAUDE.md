@@ -19,24 +19,36 @@ re-implemented per language. The root `CLAUDE.md` owns the monorepo layout + rel
   went with it entirely (`shell_quote_always` moved from `rc_agents` into `machine.rs`,
   where `display_line` — the one composer every machine transport shares — is its only
   caller). The Linux clients link it directly.
-  `lane.rs` (plan 015) is the **agent-lane contract** — the DTOs plus the `AgentLane`
-  async trait that normalizes "a coding agent with sessions, a transcript and approvals",
-  one adapter per agent (opencode over its local HTTP server today; `shed-craze`, plan 025
-  C7+, is next — plan 017's `gx` adapter held this second slot and was retired in plan 025
-  C1, shed#390). Pure types, **no
-  I/O** — the transport, fold, ring and reconnect loop belong to whatever crate implements
-  it. It lives here, not in `shed-app`, because shed-mobile links the DTOs through FRB.
-  It also owns the one shared overflow policy (plan 018, module doc correction 13):
-  `LaneSubscription`'s frame channel is bounded at `LANE_CHANNEL_CAPACITY` (1024 frames),
-  and `LanePublisher` — deliberately **not** `Clone`, one per subscription — is the only
-  way onto it: `publish` (`try_send`; a full channel answers `Publish::Lagged` and drops
-  the frame), `publish_final` (consumes self and awaits; the terminal `Down` is the one
-  frame that can never be the dropped one), and `wait_drained` (resolves only once every
-  slot is free). Every adapter propagates a `Lagged` out of every emitting helper and
-  reseeds rather than silently resumes — the dropped frames may already be behind the
-  client's cursor (plan 017's gx adapter, which also offered a bounded silent resume on
-  its OWN cursor-honoured reconnect, proved the two are independent; it was retired in
-  plan 025 C1, shed#390).
+  `lane.rs` (plan 015; split in plan 025 C4, shed#391) is the **agent-lane contract** —
+  the DTOs plus TWO async traits that normalize "a coding agent with sessions, a
+  transcript and approvals": a machine-level `AgentSource` (`subscribe` → the live session
+  list as `SourceEvent`s, `create_options`, `create`, `open(id)`) and the session-scoped
+  `AgentLane` it opens (no verb takes an id; `settings`/`set`/`stop` have no default
+  bodies). One adapter per agent implements both (opencode over its local HTTP server
+  today; `shed-craze`, plan 025 C7+, is next — plan 017's `gx` adapter held this second
+  slot and was retired in plan 025 C1, shed#390). **Capabilities are per session and ride
+  the stream** (`LaneEvent::Capabilities`, and `Settings` when they say so) — there is no
+  capabilities getter, so a client reads them from its view, never caches them at open.
+  `LaneEvent::Stale` is a non-terminal transport loss (a silent resume ends it with a lone
+  `Ready` of the same generation); `Down` alone ends a lane; a source's outage is the
+  non-terminal `SourceEvent::Offline`. Pure types, **no I/O** — the transport, fold, ring
+  and reconnect loop belong to whatever crate implements them. It lives here, not in
+  `shed-app`, because shed-mobile links the DTOs through FRB. `lane::conformance` (behind
+  `test-support`) is the shared kit every adapter's tests run their streams through (the
+  bracket, capabilities before `Ready`, seq, silent resume, `Down` last, no source-set
+  `tab_id`). `time.rs` is the pure RFC 3339 → unix-ms parser (no `chrono`; correction 10).
+  It also owns the one shared overflow policy (plan 018, module doc correction 13), for
+  BOTH levels: the frame channel (`Subscription<T>`, aliased `LaneSubscription` /
+  `SourceSubscription`) is bounded at `LANE_CHANNEL_CAPACITY` (1024 frames), and the
+  generic `Publisher<T>` (`LanePublisher` / `SourcePublisher`) — deliberately **not**
+  `Clone`, one per subscription — is the only way onto it: `publish` (`try_send`; a full
+  channel answers `Publish::Lagged` and drops the frame), `publish_final` (consumes self
+  and awaits; the terminal `Down` is the one frame that can never be the dropped one), and
+  `wait_drained` (resolves only once every slot is free). Every adapter propagates a
+  `Lagged` out of every emitting helper and reseeds rather than silently resumes — the
+  dropped frames may already be behind the client's cursor (plan 017's gx adapter, which
+  also offered a bounded silent resume on its OWN cursor-honoured reconnect, proved the
+  two are independent; it was retired in plan 025 C1, shed#390).
   **The FRB-mirror rule (load-bearing):** mobile HAND-mirrors every lane DTO into Dart, so
   every field is an owned `String`/`Option`/`Vec`/scalar — **no `serde_json::Value`, no
   `HashMap`, no borrowed lifetimes**; free-form payloads travel as a `String` of raw JSON
@@ -57,8 +69,12 @@ re-implemented per language. The root `CLAUDE.md` owns the monorepo layout + rel
   `lane_view.rs` (plan 018 §3.5, ungated for the same reason `machine.rs` and
   `roost.rs` are) is the **staged agent-lane view** — `LaneView`/`LaneViewSnapshot`,
   moved down out of the Tauri crate — that folds a `shed_core::lane` subscription
-  (messages, activity, generation, approvals) into what `lane.messages`/`lane.approvals`
-  return, behind the same `Reset … Ready` staging the contract promises;
+  (messages, activity, generation, approvals, and — staged and swapped with the seed —
+  the session's capabilities and settings) into what `lane.messages`/`lane.approvals`
+  return, behind the same `Reset … Ready` staging the contract promises. Generations are
+  MATCHED (only a `Ready` equal to the staged `Reset`'s swaps; only one equal to the live
+  generation clears `stale`), and `stale` (the banner, set by `Stale` or `Down`) is kept
+  apart from `ended` (set only by `Down` — the one thing a client reopens a lane on);
   `LaneView::snapshot(since_seq)` is the typed projection both a full read and a delta
   poll go through. It is ungated because mobile links `shed-app` with default features
   and needs the identical fold — the phone showing the same view the desktop shows is
@@ -78,12 +94,17 @@ re-implemented per language. The root `CLAUDE.md` owns the monorepo layout + rel
   signals, socket bind, the Surface-A desktop UDS server) and, from leg 3a.2, embedded
   in-process by the desktop app. Carries no daemon-only or WebKitGTK concern.
 - **`shed-opencode`** — the **opencode adapter** for `shed_core::lane` (plan 015): the
-  one implementation of `AgentLane` that talks to an opencode server's local HTTP API —
-  the same server the TUI is already running, never a sidecar it launches itself. The
-  Tauri client consumes it as a plain path-dep (a machine row's `agent_lane` stamp,
-  fed by roost's `server_url` report on the tab; see `docs/desktop/agent-lanes.md` for
-  the end-to-end contract and its current limits). `fold.rs` is a **port** of the rc
-  hub's `OpencodeFold`, and it is pinned as one —
+  implementation of both contract traits that talks to an opencode server's local HTTP
+  API — the same server the TUI is already running, never a sidecar it launches itself.
+  `OpencodeSource` (plan 025 P7) is the `AgentSource` (a 5 s poll of the session list,
+  create with an optional first prompt, `open` binding an id with no I/O) and
+  `OpencodeLane` the session-scoped `AgentLane` it opens (the pre-split verbs with the id
+  bound; every seed carries its fixed `Capabilities` row; `settings`/`set`/`stop`
+  answer "unsupported"). The Tauri client consumes it as a plain path-dep, opening each
+  lane as `OpencodeSource::new(url, None).open(session_id)` (a machine row's
+  `agent_lane` stamp, fed by roost's `server_url` report on the tab; see
+  `docs/desktop/agent-lanes.md` for the end-to-end contract and its current limits).
+  `fold.rs` is a **port** of the rc hub's `OpencodeFold`, and it is pinned as one —
   `fixtures/opencode_turn.golden.json` records what the HUB's fold produced on
   `fixtures/jsonl/opencode_turn.jsonl`, and the test replays the port against it (that
   test must NEVER take a `shed-broker` dep; the golden file is the pin). A **second**
@@ -282,7 +303,7 @@ onto `saphyr-parser` would be a separate shed-core slice, not assumed here.
 ```bash
 cd crates && cargo test                              # workspace tests
 cargo test -p shed-app --features broker             # the embedded broker bridge (3a.2)
-cargo test -p shed-core --features test-support      # exports `roost::testing::FakeRoost`
+cargo test -p shed-core --features test-support      # exports `roost::testing::FakeRoost` + `lane::conformance`
 cargo clippy --workspace --all-targets -- -D warnings
 cargo clippy -p shed-app --features broker --all-targets -- -D warnings
 cargo test -p shed-opencode                          # the opencode agent-lane adapter

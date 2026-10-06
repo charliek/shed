@@ -14,8 +14,8 @@
 //!            ReachKind::Local   -> dial server_url          |
 //!            ReachKind::Ssh(e)  -> SshForward::reserve_for  |
 //!                                                          v
-//!                              match stamp.kind {  "opencode" => OpencodeClient,
-//!                                                  other      => UnsupportedLane }
+//!                 match stamp.kind {  "opencode" => OpencodeSource::new(url).open(id),
+//!                                     other      => UnsupportedLane }
 //!                                                          |
 //!                                              Arc<dyn AgentLane>
 //!                                                          |
@@ -27,12 +27,22 @@
 //! # One trait, one adapter today — and the line the dispatch draws
 //!
 //! [`LaneEntry`] holds an `Arc<dyn AgentLane>`, and the ONLY place in this app
-//! that names a concrete client type is the `match` in [`Lanes::open`]. That is
+//! that names a concrete adapter type is the `match` in [`Lanes::open`]. That is
 //! the whole point of plan 017: everything below the match — the pump, the view,
 //! the tunnel bookkeeping, the six IPC verbs — is written against the contract,
 //! so the next adapter is a `match` arm rather than a refactor. (gx held this
 //! second slot from plan 017 until plan 025 C1 retired it, shed#390; craze,
 //! plan 025 C7+, is next.)
+//!
+//! Since plan 025 split the contract (§3.2), the arm builds the agent's SOURCE
+//! and opens the session-scoped lane through it — `OpencodeSource::new(url,
+//! None).open(session_id)`, binding with no I/O — so every adapter is reached
+//! the same way. And the lane's **capabilities ride its stream**
+//! ([`LaneEvent::Capabilities`]), not a getter: [`LaneEntry`] caches none, and
+//! `lane.open` answers `{session}` alone. What the session can do is read where
+//! the panel reads everything else — `lane.messages`, from the staged view —
+//! because a craze session's capabilities change with its incarnation and a
+//! copy taken at open would go stale.
 //!
 //! An entry is keyed and evicted by the FULL stamp, `(kind, server_url)`. A tab
 //! that restarts as a different agent on the same loopback port is a different
@@ -111,8 +121,11 @@
 //! HERE rather than in the frontend, so `lane.messages` (which the harness reads,
 //! and which is the same truth the panel renders) can never answer with a half
 //! seeded transcript: a `Reset` opens a staging buffer, frames land in it, and
-//! `Ready` swaps it in. `Down` marks the entry stale-with-a-reason and keeps the
-//! last good view on screen — the "consume" posture, not an error dialog.
+//! `Ready` swaps it in. `Stale` and `Down` both mark the view stale-with-a-reason
+//! and keep the last good view on screen — the "consume" posture, not an error
+//! dialog — but only `Down` sets `ended`, and only an ENDED subscription is ever
+//! replaced (see [`Lanes::spawn_pump`]): reopening on a mere stale mark would
+//! throw away the cursor a silent resume needs (plan 025 §3.2.4).
 //!
 //! `generation` is this module's own counter, and it is **the generation of the
 //! rows being handed back**, not of the connect in flight: it is stamped on each
@@ -156,11 +169,10 @@ use shed_app::lane_view::LaneView;
 use shed_app::machine::{MachineForward, SshForward};
 use shed_core::config::MachineEntry;
 use shed_core::lane::{
-    AgentLane, LaneAnswer, LaneCapabilities, LaneDecision, LaneError, LaneEvent, LaneSession,
-    SendMode,
+    AgentLane, AgentSource, LaneAnswer, LaneDecision, LaneError, LaneEvent, LaneSession, SendMode,
 };
 use shed_core::roost::AgentLaneStamp;
-use shed_opencode::OpencodeClient;
+use shed_opencode::OpencodeSource;
 
 use crate::machines::ReachKind;
 use crate::roost_hosts::RoostHosts;
@@ -183,12 +195,25 @@ const RESUBSCRIBE_BASE: Duration = Duration::from_millis(200);
 /// See [`RESUBSCRIBE_BASE`].
 const RESUBSCRIBE_MAX: Duration = Duration::from_secs(5);
 
-/// The [`LaneEvent::Down`] reason that means "stop trying".
-///
-/// The adapter emits it when a reseed answers 404: the session was deleted, and
-/// no amount of reconnecting brings it back. Every other `Down` is worth another
-/// attempt (the agent restarted, the tunnel blipped).
+/// The [`LaneEvent::Down`] reason an adapter ends a lane with when the session
+/// does not exist (opencode: a reseed answered 404; craze: `unknown_session` on
+/// connect or attach).
 const DOWN_UNKNOWN_SESSION: &str = "unknown_session";
+
+/// Whether a lane that ENDED with this `Down` reason is gone for good — so the
+/// pump stops instead of resubscribing.
+///
+/// `shed_core::lane`'s module doc (plan 025 §3.3.5) names three: the session
+/// does not exist (`unknown_session`), it was closed (`session_closed`, craze's
+/// end after a stop), or it never started (`start_failed:<cause>`). No amount
+/// of reconnecting changes any of them. Every other `Down` is worth another
+/// attempt (the agent restarted, the tunnel blipped, a bound ran out).
+fn down_is_final(reason: &str) -> bool {
+    reason == DOWN_UNKNOWN_SESSION
+        || reason == "session_closed"
+        || reason == "start_failed"
+        || reason.starts_with("start_failed:")
+}
 
 /// `(machine, agent session id)` — one open lane.
 type Key = (String, String);
@@ -216,7 +241,7 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 const LANE_KINDS: [&str; 1] = ["opencode"];
 
 /// **Test-only seam:** how many times this module has actually constructed a
-/// concrete `AgentLane` adapter (today, the one call to `OpencodeClient::new`
+/// concrete `AgentLane` adapter (today, the one `OpencodeSource::new(…).open(…)`
 /// in [`Lanes::open`]'s match). Exists so a control can assert "no adapter was
 /// built" as a fact about the code, not an inference from "no tunnel was
 /// reserved" — see `a_gx_stamped_row_is_unsupported_lane_with_no_forward_reserved`.
@@ -549,9 +574,10 @@ struct LaneEntry {
     /// to delay a closed panel's `ssh` child from dying.
     forward: Mutex<Option<ForwardShare>>,
     /// What `lane.open` answered with, cached so a second `open` is genuinely
-    /// idempotent rather than a second round trip.
+    /// idempotent rather than a second round trip. The session row ONLY: the
+    /// lane's capabilities are stream state, read from the view by
+    /// `lane.messages` (module doc), and deliberately not cached here.
     session: LaneSession,
-    capabilities: LaneCapabilities,
     /// The adapter, as the CONTRACT. Every verb below reaches the agent through
     /// this trait object; the concrete type was chosen once, in
     /// [`Lanes::open`]'s match, and is deliberately not knowable from here.
@@ -564,7 +590,7 @@ struct LaneEntry {
 
 impl LaneEntry {
     fn opened(&self) -> Value {
-        json!({ "session": self.session, "capabilities": self.capabilities })
+        json!({ "session": self.session })
     }
 
     /// End the subscription and give the tunnel share back. Idempotent, and
@@ -658,9 +684,12 @@ impl Lanes {
         }
     }
 
-    /// `lane.open` — ensure the transport, build the client, start the
-    /// subscription, and answer with the session row plus what this adapter can
-    /// do.
+    /// `lane.open` — ensure the transport, open the lane through its agent's
+    /// source, start the subscription, and answer with the session row.
+    ///
+    /// Not with what the lane can do: capabilities are per session and ride the
+    /// stream, so `lane.messages` answers them from the staged view (module
+    /// doc).
     ///
     /// **Idempotent.** A second call for a key that is already open re-answers
     /// from the entry; it does not open a second subscription. A call for a key
@@ -726,11 +755,12 @@ impl Lanes {
                         stamp.server_url
                     )))
                 })?;
-                // No credential source — see the module doc.
-                let built = OpencodeClient::new(url, None)?;
+                // No credential source — see the module doc. Opening is
+                // binding: the source dials nothing here.
+                let built = OpencodeSource::new(url, None)?.open(session_id).await?;
                 #[cfg(test)]
                 note_adapter_built();
-                Arc::new(built)
+                built
             }
             // Unreachable: the guard above ran before anything was reserved.
             // Restated rather than `unreachable!()` so that adding a kind to one
@@ -742,11 +772,7 @@ impl Lanes {
         // failure inside the pump would be a `Down` the panel has to wait for.
         // It is also the last await, and the one that fails on a
         // password-protected agent — hence the share above.
-        let session = client
-            .session(session_id)
-            .await
-            .map_err(LaneFailure::from)?;
-        let capabilities = client.capabilities();
+        let session = client.session().await.map_err(LaneFailure::from)?;
 
         let view = Arc::new(Mutex::new(LaneView::default()));
         // Commit, or roll back. ONE acquisition: the re-check and the insert
@@ -771,7 +797,6 @@ impl Lanes {
             stamp,
             forward: Mutex::new(forward),
             session,
-            capabilities,
             client,
             view,
             pump,
@@ -782,7 +807,14 @@ impl Lanes {
     }
 
     /// `lane.messages` — the staged-then-swapped view, as this app's IPC
-    /// payload.
+    /// payload: `{messages, activity, generation, stale, ended, capabilities,
+    /// settings}`.
+    ///
+    /// `capabilities` and `settings` are the LIVE generation's (each `null`
+    /// until a seed carrying it has swapped in), which is where a client reads
+    /// what the session can do — never from `lane.open` (module doc). `stale` is
+    /// the banner and `ended` the lifecycle; the two are different facts
+    /// (`shed_app::lane_view`'s module doc).
     ///
     /// The fold and the projection are [`shed_app::lane_view`]'s; the only thing
     /// that belongs here is the envelope's SHAPE, which is Tauri's and not a
@@ -796,6 +828,9 @@ impl Lanes {
             "activity": snap.activity,
             "generation": snap.generation,
             "stale": snap.stale,
+            "ended": snap.ended,
+            "capabilities": snap.capabilities,
+            "settings": snap.settings,
         }))
     }
 
@@ -811,9 +846,9 @@ impl Lanes {
         Ok(json!({ "approvals": snap.approvals }))
     }
 
-    /// `lane.send` — a prompt. `mode` defaults to `queue`; `interject` is
-    /// refused by the adapter (`capabilities.interject` is false) rather than
-    /// silently downgraded.
+    /// `lane.send` — a prompt. `mode` defaults to `queue`; `interject` on a
+    /// session whose capabilities say `interject: false` is refused by the
+    /// adapter rather than silently downgraded.
     pub async fn send(
         &self,
         machine: &str,
@@ -822,14 +857,14 @@ impl Lanes {
         mode: SendMode,
     ) -> Result<Value, LaneFailure> {
         let entry = self.open_entry(machine, session_id)?;
-        entry.client.send(session_id, text, mode).await?;
+        entry.client.send(text, mode).await?;
         Ok(json!({}))
     }
 
     /// `lane.cancel` — stop the turn in flight.
     pub async fn cancel(&self, machine: &str, session_id: &str) -> Result<Value, LaneFailure> {
         let entry = self.open_entry(machine, session_id)?;
-        entry.client.cancel(session_id).await?;
+        entry.client.cancel().await?;
         Ok(json!({}))
     }
 
@@ -842,7 +877,7 @@ impl Lanes {
         answer: LaneAnswer,
     ) -> Result<Value, LaneFailure> {
         let entry = self.open_entry(machine, session_id)?;
-        entry.client.answer(session_id, approval_id, answer).await?;
+        entry.client.answer(approval_id, answer).await?;
         Ok(json!({}))
     }
 
@@ -1049,13 +1084,31 @@ impl Lanes {
 
     /// The supervision loop for one lane: ensure the transport, subscribe, pump
     /// frames into the view and out to the UI, and start over on a backoff when
-    /// the subscription ends.
+    /// the subscription ENDS.
     ///
     /// The adapter reconnects on its own inside one subscription (that is the
-    /// `Reset` … `Ready` bracket); this loop is the layer ABOVE it, and it
-    /// exists for the failure the adapter cannot fix — a transport that has gone
-    /// away. On a remote machine, re-`ensure`ing the forward is what respawns a
-    /// dead `ssh -N` child before redialing.
+    /// `Reset` … `Ready` bracket, or — on an adapter that can resume — a `Stale`
+    /// and a lone `Ready`); this loop is the layer ABOVE it, and it exists for
+    /// the failure the adapter cannot fix — a transport that has gone away. On a
+    /// remote machine, re-`ensure`ing the forward is what respawns a dead
+    /// `ssh -N` child before redialing.
+    ///
+    /// **It replaces a subscription only when that subscription ENDED** (its
+    /// `Down`, or its channel closing) — never on an ADAPTER's `Stale`, which
+    /// is the adapter saying it is retrying with its cursor intact; a
+    /// resubscribe there would throw the cursor away (plan 025 §3.2.4). And it
+    /// does not replace one that ended for good ([`down_is_final`]). Every
+    /// failure this loop itself retries — a forward that would not come up, a
+    /// `subscribe` refused for any reason but a missing session — is shown as
+    /// [`LaneEvent::Stale`], because it is not an end: the next attempt is
+    /// already scheduled.
+    ///
+    /// **The one time it ends a subscription itself** is its own: a tunnel that
+    /// fails its re-`ensure` mid-subscription. That `Stale` abandons the seed
+    /// the adapter has just opened, so the subscription is dropped and a fresh
+    /// one taken once the tunnel is back — a kept one could finish the
+    /// abandoned seed and stream on into a view that takes none of it, a lane
+    /// left stale on a healthy connection.
     ///
     /// **Two places re-`ensure`, and the second one is the one that matters.**
     /// Before subscribing is the obvious one. But once a subscription has
@@ -1086,28 +1139,37 @@ impl Lanes {
                     Ensured::Ready => {}
                     Ensured::Gone => return,
                     Ensured::Failed(e) => {
-                        note_down(&sink, &view, &machine, &session_id, format!("forward: {e}"));
+                        note(
+                            &sink,
+                            &view,
+                            &machine,
+                            &session_id,
+                            stale(format!("forward: {e}")),
+                        );
                         tokio::time::sleep(backoff).await;
                         backoff = next_backoff(backoff);
                         continue;
                     }
                 }
-                let subscription = match client.subscribe(&session_id, None).await {
+                let subscription = match client.subscribe(None).await {
                     Ok(subscription) => subscription,
-                    // The session is gone for good. Anything else is worth
-                    // retrying — the agent may simply be restarting.
+                    // The session is gone for good: an END, and the last one.
+                    // Anything else is worth retrying — the agent may simply be
+                    // restarting — so it is stale, not ended.
                     Err(LaneError::UnknownSession) => {
-                        note_down(
+                        note(
                             &sink,
                             &view,
                             &machine,
                             &session_id,
-                            DOWN_UNKNOWN_SESSION.to_string(),
+                            LaneEvent::Down {
+                                reason: DOWN_UNKNOWN_SESSION.to_string(),
+                            },
                         );
                         return;
                     }
                     Err(e) => {
-                        note_down(&sink, &view, &machine, &session_id, e.to_string());
+                        note(&sink, &view, &machine, &session_id, stale(e.to_string()));
                         tokio::time::sleep(backoff).await;
                         backoff = next_backoff(backoff);
                         continue;
@@ -1117,6 +1179,10 @@ impl Lanes {
                 // stop handle, which aborts the pump it is reading from.
                 let (mut rx, stop) = subscription.into_parts();
                 let mut down: Option<String> = None;
+                // This loop's OWN reason to drop the subscription — set when the
+                // tunnel under it failed, so the read below is abandoned and a
+                // fresh subscription brings the lane back.
+                let mut restart = false;
                 // The subscription's FIRST Reset is the seed of the connect this
                 // loop just ensured for; every later one is a reconnect.
                 let mut generations = 0usize;
@@ -1127,6 +1193,9 @@ impl Lanes {
                         LaneEvent::Ready { .. } => backoff = RESUBSCRIBE_BASE,
                         LaneEvent::Down { reason } => down = Some(reason.clone()),
                         LaneEvent::Reset { .. } => generations += 1,
+                        // A `Stale` is the adapter retrying on its own, cursor
+                        // intact: keep reading. It is folded into the view (the
+                        // banner) like any other frame, and that is all.
                         _ => {}
                     }
                     lock(&view).apply(&event);
@@ -1136,21 +1205,38 @@ impl Lanes {
                             Ensured::Ready => {}
                             // Every share is gone: this lane was evicted.
                             Ensured::Gone => return,
-                            // Stale-with-a-reason, and keep reading: the adapter
-                            // is still retrying, and its next Reset is the next
-                            // attempt at the tunnel too.
-                            Ensured::Failed(e) => note_down(
-                                &sink,
-                                &view,
-                                &machine,
-                                &session_id,
-                                format!("forward: {e}"),
-                            ),
+                            // Stale-with-a-reason — not a `Down`, which would
+                            // mark a live lane ended — AND a restart. The
+                            // `Stale` lands inside the seed this `Reset` just
+                            // opened, which abandons it in the view (a loss
+                            // before `Ready` reseeds — `shed_app::lane_view`);
+                            // if this subscription were kept, an adapter that
+                            // reconnected anyway would finish that seed and
+                            // stream on into a view that can no longer take any
+                            // of it, stale until some unrelated reconnect. So
+                            // this loop drops the subscription itself and
+                            // resubscribes once the tunnel is back: recovery
+                            // always arrives as the adapter's fresh `Reset …
+                            // Ready`. (An ADAPTER's own `Stale` is not this
+                            // case: the adapter reseeds or resumes on its own.)
+                            Ensured::Failed(e) => {
+                                note(
+                                    &sink,
+                                    &view,
+                                    &machine,
+                                    &session_id,
+                                    stale(format!("forward: {e}")),
+                                );
+                                restart = true;
+                                break;
+                            }
                         }
                     }
                 }
                 drop(stop);
-                if down.as_deref() == Some(DOWN_UNKNOWN_SESSION) {
+                // The subscription ENDED, or this loop ended it. Replace it —
+                // unless the adapter ended it for good.
+                if !restart && down.as_deref().is_some_and(down_is_final) {
                     return;
                 }
                 tokio::time::sleep(backoff).await;
@@ -1182,20 +1268,28 @@ async fn ensure_forward(forward: &Option<Weak<OwnedForward>>) -> Ensured {
     }
 }
 
-/// Record a transport-level failure as the same stale-with-a-reason state a
-/// [`LaneEvent::Down`] produces, and tell the UI about it on the same event.
+/// A failure THIS layer is retrying, as the frame that says so.
+///
+/// [`LaneEvent::Stale`], not `Down`: the pump has already scheduled its next
+/// attempt, so the lane has not ended — and `Down` would set the view's `ended`,
+/// which a client reads as "this lane is over, reopen it".
+fn stale(reason: String) -> LaneEvent {
+    LaneEvent::Stale { reason }
+}
+
+/// Fold a frame THIS layer minted (not the adapter) into the view, and tell the
+/// UI about it on the same event.
 ///
 /// The panel must not care whether the thing that went away was the agent or the
 /// tunnel to it: both mean "this transcript is not live", and both are recovered
 /// by the same retry.
-fn note_down(
+fn note(
     sink: &EventSink,
     view: &Arc<Mutex<LaneView>>,
     machine: &str,
     session_id: &str,
-    reason: String,
+    event: LaneEvent,
 ) {
-    let event = LaneEvent::Down { reason };
     lock(view).apply(&event);
     emit(sink, machine, session_id, &event);
 }
@@ -1263,7 +1357,11 @@ fn remote_port(server_url: &str) -> Result<u16, LaneFailure> {
 /// supplies for the identical input. With a typed refusal neither door can lose
 /// it — the command one will not compile without saying how it is spelled.
 ///
-/// **Exactly one form.** The keys are counted before any of them is read, so a
+/// **Exactly one form, and nothing beside it** (but `question`'s
+/// `custom_text`): a key this grammar does not read is refused, never skipped
+/// — `{"permission": "allow-always", "option_id": "reject"}` must not execute
+/// as "allow always". **Exactly one form.** The keys are counted before any of
+/// them is read, so a
 /// payload naming two — `{"permission": "reject", "question": [["yes"]]}` — is
 /// refused instead of resolving as whichever the code happened to check first
 /// and silently discarding the other half. An answer RESOLVES an approval; a
@@ -1291,6 +1389,27 @@ pub fn parse_answer(value: &Value) -> Result<LaneAnswer, LaneFailure> {
                 several.join(" and ")
             )))
         }
+    }
+    // **Nothing else rides beside the form** (review, astra 6). A key this
+    // grammar does not read is not harmless decoration: `{"permission":
+    // "allow-always", "option_id": "reject"}` reads as "refuse" to a human and
+    // used to execute as "allow always", the `option_id` dropped on the way past.
+    // The contract's own `LaneAnswer` refuses that payload by
+    // `deny_unknown_fields`; this door is held to the same rule, so the answer
+    // either means exactly what it says or is refused before anything is sent.
+    // `custom_text` is the one modifier, and only `question` takes it — checked
+    // just below, with its own message.
+    if let Some(stray) = value
+        .as_object()
+        .into_iter()
+        .flat_map(|o| o.keys())
+        .find(|key| key.as_str() != named[0] && key.as_str() != "custom_text")
+    {
+        return Err(LaneFailure::bad_request(format!(
+            "an answer carries its one form and nothing else; `{stray}` is not part \
+             of a `{}` answer",
+            named[0]
+        )));
     }
     // `custom_text` is not a FORM — it modifies exactly one of them. Checked
     // here, against the single form just established, so that every other arm
@@ -1596,13 +1715,55 @@ mod tests {
             );
         }
         // …and each single form still parses, so the count did not become a
-        // blanket refusal. A key that is NOT one of the three is not counted:
-        // `{permission, note}` is still one answer.
+        // blanket refusal.
         assert!(parse_answer(&json!({"choice": "p-1"})).is_ok());
         assert!(parse_answer(&json!({"permission": "reject"})).is_ok());
         assert!(parse_answer(&json!({"question": [["yes"]]})).is_ok());
         assert!(parse_answer(&json!({"reject": true})).is_ok());
-        assert!(parse_answer(&json!({"permission": "reject", "note": "hi"})).is_ok());
+    }
+
+    /// **An answer carries its one form and NOTHING else** (review, astra 6). A
+    /// key this grammar does not read used to be skipped: `{"permission":
+    /// "allow-always", "option_id": "reject"}` — "refuse" to a human — decoded
+    /// as `Permission{AllowAlways}` and opencode would have executed it as a
+    /// persistent approval. The contract's `LaneAnswer` refuses that payload
+    /// (`deny_unknown_fields`); this door now does too, before any answer exists.
+    #[test]
+    fn an_answer_with_any_key_beside_its_form_is_refused() {
+        for stray in [
+            json!({"permission": "allow-always", "option_id": "reject"}),
+            json!({"permission": "reject", "note": "hi"}),
+            json!({"choice": "p-1", "decision": "allow_once"}),
+            json!({"question": [["yes"]], "option_id": "p-1"}),
+            json!({"question": [["yes"]], "custom_text": [null], "extra": 1}),
+            json!({"reject": true, "why": "no"}),
+        ] {
+            let failure = parse_answer(&stray)
+                .err()
+                .unwrap_or_else(|| panic!("{stray} carries a stray key and must be refused"));
+            assert_eq!(failure.code(), "bad_request", "{stray}");
+            assert!(
+                failure.message().contains("nothing else"),
+                "the refusal names what is wrong: {}",
+                failure.message()
+            );
+        }
+        // The contract's own tagged spelling is not this door's grammar at all:
+        // a `kind` key names no form, so the payload is refused, extra keys or
+        // not — the unit-variant leniency serde has for `{"kind":"reject",…}`
+        // never reaches an adapter through this door.
+        for tagged in [
+            json!({"kind": "reject", "extra": 1}),
+            json!({"kind": "reject"}),
+        ] {
+            assert_eq!(
+                parse_answer(&tagged).err().map(|f| f.code()),
+                Some("bad_request"),
+                "{tagged}"
+            );
+        }
+        // `custom_text` is the one modifier `question` takes.
+        assert!(parse_answer(&json!({"question": [["yes"]], "custom_text": [null]})).is_ok());
     }
 
     #[test]
@@ -1645,8 +1806,8 @@ mod tests {
     // -----------------------------------------------------------------------
     // ownership: `open` against `close`, `reconcile` and itself
     //
-    // These drive the REAL `Lanes` — the real `OpencodeClient`, the real
-    // watcher, the real staging — against two doubles: an in-process
+    // These drive the REAL `Lanes` — the real `OpencodeSource` and its lane,
+    // the real watcher, the real staging — against two doubles: an in-process
     // `FakeOpencode` on a loopback port, and a machine layer whose "ssh tunnel"
     // is a scriptable stand-in that lands on that port. The double is what makes
     // the races reachable: an `ssh -N` child needs a live machine, and the
@@ -1686,6 +1847,8 @@ mod tests {
         /// `kill`+`waitpid` must never do.
         dropped: AtomicUsize,
         dropped_on_runtime: AtomicUsize,
+        /// When set, `ensure` FAILS — a tunnel that will not come back up.
+        fail_ensure: AtomicBool,
     }
 
     /// A forward that is not a tunnel: it simply names the port a fake opencode
@@ -1703,6 +1866,9 @@ mod tests {
 
         async fn ensure(&self) -> Result<(), ForwardError> {
             self.log.ensures.fetch_add(1, SeqCst);
+            if self.log.fail_ensure.load(SeqCst) {
+                return Err(ForwardError("the ssh child will not start".to_string()));
+            }
             self.log.alive.store(true, SeqCst);
             Ok(())
         }
@@ -1779,6 +1945,9 @@ mod tests {
                 LaneEvent::Message { .. } => "message",
                 LaneEvent::Session { .. } => "session",
                 LaneEvent::Approval { .. } => "approval",
+                LaneEvent::Capabilities { .. } => "capabilities",
+                LaneEvent::Settings { .. } => "settings",
+                LaneEvent::Stale { .. } => "stale",
                 LaneEvent::Unknown => "unknown",
             });
         }
@@ -2360,6 +2529,139 @@ mod tests {
         })
         .await;
         assert_eq!(log.built.load(SeqCst), 1, "recovery rebuilt the tunnel");
+    }
+
+    /// **Capabilities ride `lane.messages`, not `lane.open`** (plan 025 §3.2.6).
+    /// `lane.open` answers the session row alone; once the seed swaps in, the
+    /// staged view's capabilities — opencode's fixed row, carried by every seed —
+    /// are on `lane.messages`, beside `settings` (none: opencode has none) and
+    /// the two lifecycle facts.
+    #[tokio::test]
+    async fn capabilities_and_settings_ride_lane_messages_not_lane_open() {
+        let fake = one_session("ses_a").await;
+        let (lanes, _log, _events) = lanes_for(&fake, &["ses_a"]);
+
+        let opened = lanes.open(MACHINE, "ses_a").await.expect("the lane opens");
+        assert_eq!(opened["session"]["id"], "ses_a");
+        assert!(
+            opened.get("capabilities").is_none(),
+            "lane.open answers {{session}} alone: {opened}"
+        );
+        wait_for("the first generation to seed", || {
+            (generation(&lanes, "ses_a") >= 1).then_some(())
+        })
+        .await;
+        let view = lanes.messages(MACHINE, "ses_a").expect("lane.messages");
+        assert_eq!(
+            view["capabilities"],
+            serde_json::to_value(shed_opencode::opencode_capabilities()).expect("caps encode"),
+            "the seed's capabilities, from the staged view: {view}"
+        );
+        assert_eq!(view["settings"], Value::Null, "opencode has no settings");
+        assert_eq!(view["stale"], Value::Null);
+        assert_eq!(view["ended"], false);
+    }
+
+    /// **A tunnel that will not come back under a live lane is STALE, not an
+    /// end — and the lane comes back on its own once the tunnel does.** The pump
+    /// has already scheduled its next attempt, so it must not mark the view
+    /// `ended` (which a client reads as "reopen me"). Its `Stale` lands inside
+    /// the reconnect's seed and abandons it (a loss before `Ready` reseeds —
+    /// `shed_app::lane_view`), so the pump also DROPS that subscription and
+    /// resubscribes once the tunnel is back: recovery arrives as the adapter's
+    /// fresh `Reset … Ready`, with no manual reconnect (review, sol confirm).
+    /// Kept instead, the subscription would finish the abandoned seed and stream
+    /// on into a view that takes none of it — stale forever on a healthy
+    /// connection, which is what this cell's bound turns red.
+    #[tokio::test]
+    async fn a_failed_tunnel_under_a_live_lane_is_stale_and_recovers_by_itself() {
+        let fake = one_session("ses_a").await;
+        let (lanes, log, events) = lanes_for(&fake, &["ses_a"]);
+        lanes.open(MACHINE, "ses_a").await.expect("the lane opens");
+        wait_for("the first generation to seed", || {
+            (generation(&lanes, "ses_a") >= 1).then_some(())
+        })
+        .await;
+        let event_dials = || {
+            fake.get_paths()
+                .iter()
+                .filter(|p| p.starts_with("/event"))
+                .count()
+        };
+
+        // The agent's stream drops, and the tunnel under it will not come back.
+        log.fail_ensure.store(true, SeqCst);
+        fake.close_streams();
+        wait_for("the failed re-ensure to be reported", || {
+            (events.count("stale") >= 1).then_some(())
+        })
+        .await;
+        assert_eq!(events.count("down"), 0, "a retried failure is never a Down");
+        let view = lanes.messages(MACHINE, "ses_a").expect("lane.messages");
+        assert_eq!(view["ended"], false, "the lane did not end: {view}");
+        assert!(
+            !view["stale"].is_null(),
+            "and it says it is not live: {view}"
+        );
+        let dials_while_down = event_dials();
+
+        // The tunnel recovers. Nothing else happens — no stream close, no
+        // reopen — and the lane must come back by itself, through a FRESH
+        // subscription (a new `/event` dial), not the abandoned one.
+        log.fail_ensure.store(false, SeqCst);
+        wait_for(
+            "the lane to reseed and clear its stale mark on its own (a kept \
+             subscription streams into the abandoned seed forever)",
+            || {
+                let view = lanes.messages(MACHINE, "ses_a").ok()?;
+                (view["generation"].as_u64() >= Some(2) && view["stale"].is_null()).then_some(())
+            },
+        )
+        .await;
+        assert!(
+            event_dials() > dials_while_down,
+            "the recovery rode a fresh subscription: {} /event dials before, {} after",
+            dials_while_down,
+            event_dials()
+        );
+        let view = lanes.messages(MACHINE, "ses_a").expect("lane.messages");
+        assert_eq!(view["ended"], false, "and the lane was never ended: {view}");
+        assert!(
+            view["capabilities"].is_object(),
+            "the fresh seed's capabilities are live: {view}"
+        );
+        wait_for("the abandoned subscription's stream to be released", || {
+            (fake.stream_count() == 1).then_some(())
+        })
+        .await;
+    }
+
+    /// The `Down` reasons the pump never resubscribes after: the three plan 025
+    /// §3.3.5 names, and nothing else.
+    #[test]
+    fn only_a_final_down_stops_the_pump() {
+        for reason in [
+            "unknown_session",
+            "session_closed",
+            "start_failed",
+            "start_failed: acp: agent exited",
+        ] {
+            assert!(down_is_final(reason), "{reason:?} is final");
+        }
+        for reason in [
+            "unreachable",
+            "re-attach bound",
+            "craze unavailable: not installed",
+            "the opencode event stream ended",
+            "closed",
+            "session_closed_soon",
+            "",
+        ] {
+            assert!(
+                !down_is_final(reason),
+                "{reason:?} is worth another attempt"
+            );
+        }
     }
 
     /// **Review finding 5.** `SshForward`'s `Drop` kills and REAPS its child —

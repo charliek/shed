@@ -52,7 +52,6 @@ use common::{
 use serde_json::{json, Value};
 use shed_core::lane::{AgentLane, LaneEvent, LANE_CHANNEL_CAPACITY};
 use shed_opencode::testing::FakeOpencode;
-use shed_opencode::OpencodeClient;
 use tokio::sync::mpsc::Receiver;
 
 const SID: &str = "ses_a";
@@ -104,9 +103,8 @@ async fn fake_with(rows: usize) -> FakeOpencode {
 }
 
 async fn subscribe(fake: &FakeOpencode) -> (Receiver<LaneEvent>, shed_core::lane::LaneStop) {
-    OpencodeClient::new(fake.base_url(), None)
-        .expect("the client builds")
-        .subscribe(SID, None)
+    common::lane_on(fake, SID)
+        .subscribe(None)
         .await
         .expect("the subscription opens")
         .into_parts()
@@ -444,5 +442,54 @@ async fn consecutive_lags_keep_the_bracket_and_climb_the_backoff() {
         Some(LaneEvent::Ready { generation: 3 })
     ));
     assert_eq!(texts(&rest), transcript_texts(SMALL));
+    assert_clean(&fake);
+}
+
+/// **A lag after a generation that WORKED restarts the backoff at the floor**
+/// (review, sol 2). Lags with no `Ready` between them climb (the cell above);
+/// lags separated by fully recovered generations are each a FIRST failure.
+/// Before the fix the curve only ever climbed on the lag path, so three
+/// isolated lags waited ~200 ms, ~400 ms, ~800 ms — a client that lagged once a
+/// minute would, by the third, wait out seconds for a reseed it was owed at
+/// once. Here each of three isolated lags waits one first-step backoff
+/// (jittered `2 × OC_BACKOFF_BASE`: 100–200 ms), never the climb's 400+.
+#[tokio::test]
+async fn a_lag_after_a_recovered_generation_restarts_the_backoff_at_the_floor() {
+    const SMALL: usize = 2;
+    let fake = fake_with(SMALL).await;
+    let (mut rx, _stop) = subscribe(&fake).await;
+    let first = until_ready(&mut rx).await;
+    assert_eq!(resets(&first), vec![("seed".to_string(), 1)]);
+
+    for cycle in 0..3u64 {
+        // Stop reading; overflow in steady state.
+        stream_rows(&fake, LANE_CHANNEL_CAPACITY + 50);
+        wait_for("the lagged generation to release its stream", || {
+            fake.stream_count() == 0
+        })
+        .await;
+        assert_eq!(drain_now(&mut rx).len(), LANE_CHANNEL_CAPACITY);
+
+        let drained_at = Instant::now();
+        let reset = common::next_event(&mut rx, "the lagged reseed's Reset").await;
+        let waited = drained_at.elapsed();
+        assert!(
+            matches!(&reset, LaneEvent::Reset { reason, .. } if reason == "lagged"),
+            "cycle {cycle}: {reset:?}"
+        );
+        assert!(
+            waited >= Duration::from_millis(100),
+            "cycle {cycle}: a lag still waits out the first backoff step: {waited:?}"
+        );
+        assert!(
+            waited < Duration::from_millis(350),
+            "cycle {cycle}: the previous generation reached Ready, so this lag starts \
+             the curve over — it waited {waited:?}, the climb's next step"
+        );
+        // The reseed completes: this generation WORKED.
+        let rest = until_ready(&mut rx).await;
+        assert!(matches!(rest.last(), Some(LaneEvent::Ready { .. })));
+        assert_eq!(texts(&rest), transcript_texts(SMALL));
+    }
     assert_clean(&fake);
 }

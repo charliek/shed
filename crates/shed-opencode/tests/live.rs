@@ -32,10 +32,11 @@ use std::time::Duration;
 use futures_util::StreamExt as _;
 use serde_json::{json, Value};
 use shed_core::lane::{
-    AgentLane, LaneAnswer, LaneApprovalKind, LaneDecision, LaneEvent, LaneSubscription, SendMode,
+    AgentSource, LaneAnswer, LaneApprovalKind, LaneCreateRequest, LaneDecision, LaneEvent,
+    LaneSubscription, SendMode,
 };
 use shed_core::rc::RcActivity;
-use shed_opencode::OpencodeClient;
+use shed_opencode::OpencodeSource;
 use tokio::io::{AsyncBufReadExt as _, BufReader};
 use tokio::sync::mpsc::Receiver;
 
@@ -97,23 +98,30 @@ async fn live_smoke() {
         "model": model,
     }));
     let server = Opencode::spawn(scratch.path()).await;
-    let lane = OpencodeClient::new(server.base_url(), None).expect("the client builds");
+    let source = OpencodeSource::new(server.base_url(), None).expect("the source builds");
 
     // A raw recorder alongside the lane, so `SHED_OPENCODE_RECORD=1` captures
     // the wire EXACTLY as opencode wrote it rather than as the fold read it.
     let recorder = Recorder::start(server.base_url(), scratch.path()).await;
 
-    // create + subscribe.
-    let created = lane
-        .create(
-            scratch.path().to_str().expect("a utf-8 scratch path"),
-            "Reply with the single word: pong",
-        )
+    // create (through the source), open, subscribe.
+    let created = source
+        .create(LaneCreateRequest {
+            cwd: scratch
+                .path()
+                .to_str()
+                .expect("a utf-8 scratch path")
+                .to_string(),
+            provider: None,
+            prompt: Some("Reply with the single word: pong".to_string()),
+            request_id: "live-smoke".to_string(),
+        })
         .await
-        .expect("create");
+        .expect("create")
+        .session;
     eprintln!("live_smoke: session {}", created.id);
-    let subscription: LaneSubscription =
-        lane.subscribe(&created.id, None).await.expect("subscribe");
+    let lane = source.open(&created.id).await.expect("open");
+    let subscription: LaneSubscription = lane.subscribe(None).await.expect("subscribe");
     let (mut rx, _stop) = subscription.into_parts();
 
     // The seed bracket, live.
@@ -131,7 +139,6 @@ async fn live_smoke() {
 
     // --- a permission, induced by the `bash: ask` policy -------------------
     lane.send(
-        &created.id,
         "Use the bash tool to run exactly: echo shed-lane-live",
         SendMode::Queue,
     )
@@ -147,7 +154,6 @@ async fn live_smoke() {
         "a fresh ask is answerable: {permission:?}"
     );
     lane.answer(
-        &created.id,
         &permission.id,
         LaneAnswer::Permission {
             decision: LaneDecision::AllowOnce,
@@ -162,7 +168,6 @@ async fn live_smoke() {
 
     // --- a question, if the agent can be induced to ask one ---------------
     lane.send(
-        &created.id,
         "Use your question tool to ask me whether to proceed, offering exactly two options: yes and no.",
         SendMode::Queue,
     )
@@ -185,7 +190,6 @@ async fn live_smoke() {
                 .map(|o| o.id.clone())
                 .unwrap_or_else(|| "yes".to_string());
             lane.answer(
-                &created.id,
                 &question.id,
                 LaneAnswer::Question {
                     answers: vec![vec![answer]],
@@ -204,14 +208,13 @@ async fn live_smoke() {
 
     // --- cancel a turn in flight ------------------------------------------
     lane.send(
-        &created.id,
         "Count slowly from one to five hundred, one number per line.",
         SendMode::Queue,
     )
     .await
     .expect("send");
     wait_for_session(&mut rx, |s| s.activity == RcActivity::Working).await;
-    lane.cancel(&created.id).await.expect("cancel");
+    lane.cancel().await.expect("cancel");
     let after_cancel = wait_for_session(&mut rx, |s| s.activity != RcActivity::Working).await;
     eprintln!(
         "live_smoke: after cancel, activity {:?}",
@@ -219,8 +222,8 @@ async fn live_smoke() {
     );
 
     // --- clean up ----------------------------------------------------------
-    // `DELETE /session/{id}` is not a contract verb (nothing in `AgentLane`
-    // deletes), so the teardown goes direct.
+    // `DELETE /session/{id}` is not a contract verb (opencode's lane refuses
+    // `stop`, and nothing else deletes), so the teardown goes direct.
     let deleted = reqwest::Client::builder()
         .no_proxy()
         .build()
