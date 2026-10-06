@@ -48,8 +48,17 @@
 //!   atomic from this side; craze SF-152 (a find-only `bridge --hub`, reserved
 //!   2026-10-04) removes the race and the probe both. Until then the window is
 //!   the gap between two execs on one ControlMaster.
-//!   A hub is born remotely only by an explicit user action (create, open in
-//!   terminal — plan 025 C10), whose dial is not this one.
+//! * **A hub is born remotely only by an explicit user action** (plan 025
+//!   §3.6.1, C10): opening the create sheet (its `create_options`) and the
+//!   create itself run through the host's UNGATED dial,
+//!   [`CrazeReach::ensure`] — `bridge --hub` with no probe in front, which
+//!   Ensures a hub — on a clone of the source that shares its rows
+//!   ([`shed_craze::CrazeSource::dialling`]), so the session it creates is
+//!   openable through the roster's source at once. The task is then woken
+//!   ([`run`]'s `wake`) so a dormant source probes again now, finds the hub
+//!   the user just started, and attaches to it, rather than at its next
+//!   [`DORMANT_PROBE`]. (Open in terminal runs `craze attach` in a roost tab,
+//!   which reaches the hub on its own.)
 //!
 //! # The state, staged
 //!
@@ -117,6 +126,11 @@ pub struct CrazeReach {
     /// `None`: EAGER (this machine). `Some`: ATTACH-ONLY (a remote machine or
     /// a shed) — and its dial is probe-gated too.
     pub probe: Option<Arc<dyn CrazeProbe>>,
+    /// The dial a user's EXPLICIT action runs through — the create sheet's
+    /// `create_options` and the create (the module doc): an attach-only host's
+    /// ungated `bridge --hub`, which may birth a hub there. `None`: the same as
+    /// [`Self::dial`], which for an eager host is already ungated.
+    pub ensure: Option<Arc<dyn CrazeDial>>,
 }
 
 /// The source's clocks — the defaults are the pinned ones; a test shortens
@@ -199,11 +213,15 @@ impl CrazeProbe for SshCrazeProbe {
 /// [`SshExec::spawn_duplex`] (the module doc). Every connection — the roster's
 /// and every lane's — asks the find-only probe first, and a host with no hub
 /// running is `Unreachable`, never a hub this app births in the background.
+///
+/// The one UNGATED instance ([`Self::ungated`]) is the host's
+/// [`CrazeReach::ensure`]: only a user's explicit action dials it.
 pub struct SshCrazeDial {
     exec: Arc<SshExec>,
     /// `display_line` of the bridge form (production, or jailed in test mode).
     bridge: String,
-    probe: Arc<dyn CrazeProbe>,
+    /// `None` only for [`Self::ungated`].
+    probe: Option<Arc<dyn CrazeProbe>>,
 }
 
 impl SshCrazeDial {
@@ -211,7 +229,18 @@ impl SshCrazeDial {
         Self {
             exec,
             bridge,
-            probe,
+            probe: Some(probe),
+        }
+    }
+
+    /// The same bridge with NO probe in front: it Ensures a hub on the far side
+    /// whether or not one runs. For [`CrazeReach::ensure`] only — the create
+    /// sheet's `create_options` and the create, a user's explicit action.
+    pub fn ungated(exec: Arc<SshExec>, bridge: String) -> Self {
+        Self {
+            exec,
+            bridge,
+            probe: None,
         }
     }
 }
@@ -227,19 +256,22 @@ impl CrazeDial for SshCrazeDial {
     fn dial(&self) -> BoxFut<Result<CrazeStream, DialError>> {
         let exec = Arc::clone(&self.exec);
         let bridge = self.bridge.clone();
-        let probe = self.probe.probe();
+        let probe = self.probe.as_ref().map(|p| p.probe());
         Box::pin(async move {
-            match probe.await {
-                Probe::Hub => {}
-                Probe::NoHub => return Err(no_hub(exec.label())),
-                Probe::Offline { cause, reason } => {
-                    return Err(match cause {
-                        SourceOffline::NotInstalled => DialError::NotInstalled(reason),
-                        SourceOffline::TooOld => DialError::TooOld(reason),
-                        SourceOffline::Failed => DialError::Failed(reason),
-                        _ => DialError::Unreachable(reason),
-                    })
-                }
+            match probe {
+                None => {}
+                Some(probe) => match probe.await {
+                    Probe::Hub => {}
+                    Probe::NoHub => return Err(no_hub(exec.label())),
+                    Probe::Offline { cause, reason } => {
+                        return Err(match cause {
+                            SourceOffline::NotInstalled => DialError::NotInstalled(reason),
+                            SourceOffline::TooOld => DialError::TooOld(reason),
+                            SourceOffline::Failed => DialError::Failed(reason),
+                            _ => DialError::Unreachable(reason),
+                        })
+                    }
+                },
             }
             let child = exec.spawn_duplex(&bridge).map_err(|e| {
                 DialError::Unreachable(format!("{}: could not run ssh: {e}", exec.label()))
@@ -277,6 +309,29 @@ pub fn tracked(
 ) -> (Arc<dyn CrazeDial>, tokio::sync::oneshot::Receiver<()>) {
     let (tx, rx) = tokio::sync::oneshot::channel();
     (Arc::new(TrackedDial { inner, _gone: tx }), rx)
+}
+
+/// A host's explicit-action dial ([`CrazeReach::ensure`]) TETHERED to its
+/// tracked dial: it holds a clone of `tether`, so the host's teardown — which
+/// waits for the tracked dial's last holder ([`tracked`]) — waits for a create
+/// in flight through it too.
+struct Tethered {
+    inner: Arc<dyn CrazeDial>,
+    _tether: Arc<dyn CrazeDial>,
+}
+
+impl CrazeDial for Tethered {
+    fn dial(&self) -> BoxFut<Result<CrazeStream, DialError>> {
+        self.inner.dial()
+    }
+}
+
+/// `inner`, tethered to `tether` (see [`Tethered`]).
+pub fn tethered(inner: Arc<dyn CrazeDial>, tether: &Arc<dyn CrazeDial>) -> Arc<dyn CrazeDial> {
+    Arc::new(Tethered {
+        inner,
+        _tether: Arc::clone(tether),
+    })
 }
 
 /// A spawned bridge child as a [`CrazeStream`]: its stdout and stdin, its
@@ -361,11 +416,6 @@ impl CrazeState {
     /// on (D4).
     pub fn live(&self) -> bool {
         self.phase == Some(CrazePhase::Live)
-    }
-
-    /// The hub's rows for the merge: `Some` iff the feed is live.
-    pub fn hub_rows(&self) -> Option<Vec<LaneSession>> {
-        self.live().then(|| self.rows.values().cloned().collect())
     }
 
     /// Every hostId this host holds a row for.
@@ -481,6 +531,34 @@ impl CrazeState {
         }
     }
 
+    /// A row the source's ROSTER already lists, folded in ahead of its own
+    /// `Session` frame (plan 025 §3.6.4): a create answers once its session
+    /// runs, by when the roster has usually listed it — but that frame can
+    /// still be queued behind the create's answer, and the transcript the
+    /// sheet opens next resolves its row here. The frame that follows is the
+    /// same row, and every later frame (a `Removed`, a swap) governs it as any
+    /// roster row — so this holds nothing of its own: a row only a CREATE
+    /// answered with is never folded here; it is the source's
+    /// ([`shed_craze::CrazeSource::created_rows`]), read at listing time.
+    ///
+    /// Into a seed in progress too, so that seed's swap cannot depart it (and
+    /// its lane) before its frame lands. Never over a row already held.
+    pub fn listed_now(&mut self, session: LaneSession) -> Applied {
+        if let Some(staged) = self.staged.as_mut() {
+            staged
+                .rows
+                .entry(session.id.clone())
+                .or_insert_with(|| session.clone());
+        }
+        let visible = !self.rows.contains_key(&session.id);
+        self.rows.entry(session.id.clone()).or_insert(session);
+        Applied {
+            departed: Vec::new(),
+            ready: false,
+            visible,
+        }
+    }
+
     /// The status row's `craze` half (plan 025 §3.6.2): `state` is `live`,
     /// `dormant`, `offline` or `absent` (never reached — and not installed,
     /// which renders as absent); `cause` names an offline (or not-installed)
@@ -510,6 +588,115 @@ impl CrazeState {
 }
 
 // ---------------------------------------------------------------------------
+// the create sheet's ops: their refusals
+// ---------------------------------------------------------------------------
+
+/// A refusal of one of the craze ops a user's click lands in —
+/// `craze.create_options`, `craze.create`, `craze.open_terminal` (plan 025
+/// §3.6.7) — as BOTH doors carry it: the socket's `{code, message}` envelope,
+/// and a `#[tauri::command]`'s `"<code>: <message>"` string, which `bridge.ts`
+/// splits back (the `lane.*` ops' rule, so one vocabulary crosses both).
+///
+/// The codes are the lane contract's own ([`crate::lane::LaneFailure::code`]),
+/// plus the ones only a create sheet needs:
+///
+/// * `outcome_unknown` — a create whose answer was lost, twice
+///   ([`shed_craze::is_outcome_unknown`]): the ONE refusal after which the
+///   sheet keeps its request id (plan 025 §3.8);
+/// * `too_old` — this machine's craze cannot list providers or create
+///   (`createOptions`/`sessionCreate` missing from its hub's `hello`, or a
+///   v0.0.1): the sheet says "update craze on this machine";
+/// * `not_installed` / `no_craze` — no craze there, or no craze source for
+///   the host at all;
+/// * `bad_request` — a caller's mistake (an unknown host, a request id not in
+///   craze's form, a session this machine does not list, a host id that is not
+///   craze's form) as well as craze's own `bad_request`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CrazeFailure {
+    pub code: &'static str,
+    pub message: String,
+}
+
+impl CrazeFailure {
+    pub fn new(code: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            code,
+            message: message.into(),
+        }
+    }
+
+    pub fn bad_request(message: impl Into<String>) -> Self {
+        Self::new("bad_request", message)
+    }
+
+    /// A source call's [`LaneError`](shed_core::lane::LaneError): the lane
+    /// contract's code, except a lost create's — `outcome_unknown`, its own.
+    pub fn lane(e: shed_core::lane::LaneError) -> Self {
+        if shed_craze::is_outcome_unknown(&e) {
+            return Self::new("outcome_unknown", e.to_string());
+        }
+        let message = e.to_string();
+        Self::new(crate::lane::LaneFailure::Lane(e).code(), message)
+    }
+
+    /// The `#[tauri::command]` door's error string.
+    pub fn command_string(&self) -> String {
+        format!("{}: {}", self.code, self.message)
+    }
+}
+
+/// A `craze.create` request from CALLER-SUPPLIED fields — the one place both
+/// doors (the `craze.create` socket op and the `craze_create` command) decide
+/// what they mean, so the same request cannot mean two things by door:
+///
+/// * `cwd` is required and must be ABSOLUTE (trimmed; plan 025 §3.8 refuses a
+///   relative or empty path client-side, and so does this) — craze itself
+///   checks that it exists;
+/// * a blank `provider` is absent (craze's default provider);
+/// * a blank `prompt` is absent (an idle session); any other prompt goes
+///   EXACTLY as typed, newlines and all;
+/// * `request_id`, when PRESENT, must be craze's form
+///   ([`shed_craze::valid_request_id`]) and is used exactly as given — the
+///   caller is retrying an unknown outcome under it, or minted it itself. A
+///   present id that is empty, blank or not craze's form is `bad_request`, never
+///   quietly replaced: minting a fresh one in its place would turn the retry of
+///   an unknown outcome into a SECOND session. Only an ABSENT id is minted here
+///   ([`shed_craze::new_request_id`]). (A door whose wire can carry a
+///   non-string `request_id` refuses that before it gets here — `ipc.rs`'s
+///   `craze_create_request`.)
+pub fn create_request(
+    cwd: Option<&str>,
+    provider: Option<&str>,
+    prompt: Option<&str>,
+    request_id: Option<&str>,
+) -> Result<shed_core::lane::LaneCreateRequest, CrazeFailure> {
+    let cwd = cwd.map(str::trim).unwrap_or_default();
+    if !cwd.starts_with('/') {
+        return Err(CrazeFailure::bad_request(format!(
+            "the session's directory must be an absolute path, got {cwd:?}"
+        )));
+    }
+    let request_id = match request_id {
+        Some(id) if shed_craze::valid_request_id(id) => id.to_string(),
+        Some(id) => {
+            return Err(CrazeFailure::bad_request(format!(
+                "request id {id:?} is not craze's form (1–64 of [A-Za-z0-9._-])"
+            )))
+        }
+        None => shed_craze::new_request_id(),
+    };
+    Ok(shed_core::lane::LaneCreateRequest {
+        cwd: cwd.to_string(),
+        provider: provider
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string),
+        prompt: prompt.filter(|s| !s.trim().is_empty()).map(str::to_string),
+        request_id,
+    })
+}
+
+// ---------------------------------------------------------------------------
 // the loop
 // ---------------------------------------------------------------------------
 
@@ -526,15 +713,31 @@ pub trait CrazeSink: Send + Sync {
 /// One host's craze source, for as long as the host is registered (the module
 /// doc's state machine). Aborting the task drops the roster subscription,
 /// whose stop ends the source's pump and kills its bridge child.
+///
+/// `wake` cuts an attach-only source's wait short: a user's explicit action
+/// that may have started a hub there (the create sheet's `create_options`, a
+/// create) wakes it, so it probes again NOW and attaches to that hub. A wake
+/// that arrives while no wait is pending is kept for the next one (one
+/// `Notify` permit), so it is never lost to a probe in flight; an eager
+/// source has no wait to cut.
 pub async fn run(
     source: CrazeSource,
     probe: Option<Arc<dyn CrazeProbe>>,
     sink: Arc<dyn CrazeSink>,
     timings: CrazeTimings,
+    wake: Arc<tokio::sync::Notify>,
 ) {
     match probe {
         None => eager(source, sink).await,
-        Some(probe) => attach_only(source, probe, sink, timings).await,
+        Some(probe) => attach_only(source, probe, sink, timings, wake).await,
+    }
+}
+
+/// Sleep `d`, or until `wake` is notified — whichever is first.
+async fn wait(d: Duration, wake: &tokio::sync::Notify) {
+    tokio::select! {
+        _ = tokio::time::sleep(d) => {}
+        _ = wake.notified() => {}
     }
 }
 
@@ -560,6 +763,7 @@ async fn attach_only(
     probe: Arc<dyn CrazeProbe>,
     sink: Arc<dyn CrazeSink>,
     t: CrazeTimings,
+    wake: Arc<tokio::sync::Notify>,
 ) {
     use shed_core::lane::AgentSource as _;
     let mut backoff = t.backoff_base;
@@ -589,14 +793,18 @@ async fn attach_only(
                 drop(stop);
                 drop(rx);
                 backoff = next_backoff(backoff, reached, t.backoff_base, t.backoff_max);
-                tokio::time::sleep(jittered(if reached { t.backoff_base } else { backoff })).await;
+                wait(
+                    jittered(if reached { t.backoff_base } else { backoff }),
+                    &wake,
+                )
+                .await;
             }
             Probe::NoHub => {
                 if !sink.dormant() {
                     return;
                 }
                 backoff = t.backoff_base;
-                tokio::time::sleep(t.dormant).await;
+                wait(t.dormant, &wake).await;
             }
             Probe::Offline { cause, reason } => {
                 let slow = matches!(cause, SourceOffline::NotInstalled | SourceOffline::TooOld);
@@ -604,9 +812,9 @@ async fn attach_only(
                     return;
                 }
                 if slow {
-                    tokio::time::sleep(t.dormant).await;
+                    wait(t.dormant, &wake).await;
                 } else {
-                    tokio::time::sleep(jittered(backoff)).await;
+                    wait(jittered(backoff), &wake).await;
                     backoff = next_backoff(backoff, false, t.backoff_base, t.backoff_max);
                 }
             }
@@ -707,10 +915,7 @@ mod tests {
             cause: SourceOffline::Unreachable,
         });
         assert_eq!(s.held(), ["a"], "retained, stale");
-        assert!(
-            s.hub_rows().is_none(),
-            "but not live: the merge absorbs nothing"
-        );
+        assert!(!s.live(), "but not live: the merge absorbs nothing");
         assert_eq!(s.status()["state"], "offline");
         assert_eq!(s.status()["cause"], "unreachable");
         let dormant = s.dormant();
@@ -808,6 +1013,143 @@ mod tests {
         }
         assert_eq!(recorded.trim(), "BRIDGE-HUB", "the bridge ran over ssh");
         drop(stream);
+
+        // The UNGATED instance — a user's explicit action, `CrazeReach::ensure`
+        // — asks no probe: it runs the bridge, which Ensures a hub.
+        std::fs::remove_file(&log).expect("rm log");
+        let stream = SshCrazeDial::ungated(Arc::clone(&exec), "ENSURE-HUB".to_string())
+            .dial()
+            .await
+            .expect("an ungated dial always spawns its bridge");
+        let mut recorded = String::new();
+        for _ in 0..500 {
+            recorded = std::fs::read_to_string(&log).unwrap_or_default();
+            if !recorded.is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            recorded.trim(),
+            "ENSURE-HUB",
+            "no probe, straight to the bridge"
+        );
+        drop(stream);
+    }
+
+    /// **A roster-listed row is folded ahead of its frame** (plan 025
+    /// §3.6.4): never over a row already held; into a seed in progress, so
+    /// that seed's swap does not depart it; and governed from then on by the
+    /// roster's frames like any other row — this state keeps no created rows
+    /// of its own (the source does: C10 confirmation).
+    #[test]
+    fn a_roster_listed_row_is_folded_ahead_of_its_frame() {
+        let mut s = CrazeState::new(1);
+        seed(&mut s, 1, &["a"]);
+        let applied = s.listed_now(row("n"));
+        assert!(applied.visible && applied.departed.is_empty());
+        assert_eq!(s.held(), ["a", "n"]);
+
+        let mut roster = row("n");
+        roster.title = "the frame's".to_string();
+        s.apply(SourceEvent::Session { session: roster });
+        let mut stale = row("n");
+        stale.title = "an earlier read".to_string();
+        assert!(!s.listed_now(stale).visible, "never over a held row");
+        assert_eq!(s.rows["n"].title, "the frame's");
+
+        // A seed in progress that started before the frame keeps it on its swap.
+        s.apply(SourceEvent::Reset {
+            reason: "server_reset:omitted".into(),
+            generation: 2,
+        });
+        s.apply(SourceEvent::Session { session: row("a") });
+        s.listed_now(row("m"));
+        let swapped = s.apply(SourceEvent::Ready {
+            generation: 2,
+            truncated: false,
+        });
+        assert_eq!(
+            swapped.departed,
+            ["n"],
+            "m kept on that swap; n is the seed's own say (it does not list it)"
+        );
+
+        // From then on the roster's frames govern it.
+        let removed = s.apply(SourceEvent::Removed {
+            session_id: "m".into(),
+        });
+        assert_eq!(removed.departed, ["m"]);
+        assert_eq!(s.held(), ["a"]);
+    }
+
+    /// Both doors' one reading of a create: an absolute directory required, a
+    /// blank provider or prompt absent, a prompt otherwise sent as typed, a
+    /// given request id kept (in craze's form) and an absent one minted.
+    #[test]
+    fn a_create_request_is_read_one_way() {
+        for bad in [
+            None,
+            Some(""),
+            Some("   "),
+            Some("relative/dir"),
+            Some("~/w"),
+        ] {
+            let e = create_request(bad, None, None, None).unwrap_err();
+            assert_eq!(e.code, "bad_request", "{bad:?}");
+        }
+        let r = create_request(Some(" /w/x "), Some("  "), Some(" \n "), None).unwrap();
+        assert_eq!(r.cwd, "/w/x");
+        assert_eq!((r.provider, r.prompt), (None, None));
+        assert!(
+            shed_craze::valid_request_id(&r.request_id),
+            "{}",
+            r.request_id
+        );
+        let r = create_request(
+            Some("/w"),
+            Some("grok"),
+            Some("two\nlines\n"),
+            Some("shed-abc"),
+        )
+        .unwrap();
+        assert_eq!(r.provider.as_deref(), Some("grok"));
+        assert_eq!(r.prompt.as_deref(), Some("two\nlines\n"), "as typed");
+        assert_eq!(r.request_id, "shed-abc", "a caller's id is kept");
+        // A PRESENT id that is not craze's form is refused — blank and empty
+        // included — never replaced by a fresh one (a retry under it would
+        // then be a second session).
+        for bad in [
+            "not craze's!",
+            "",
+            "   ",
+            " shed-abc",
+            "x".repeat(65).as_str(),
+        ] {
+            let e = create_request(Some("/w"), None, None, Some(bad)).unwrap_err();
+            assert_eq!(e.code, "bad_request", "{bad:?}");
+        }
+    }
+
+    /// The create ops' failures: the lane contract's codes, and a lost
+    /// create's own `outcome_unknown` — the one the sheet keeps its id on.
+    #[test]
+    fn a_craze_failure_carries_the_lane_code_or_outcome_unknown() {
+        use shed_core::lane::LaneError;
+        let unknown = CrazeFailure::lane(shed_craze::errors::outcome_unknown("lost twice"));
+        assert_eq!(unknown.code, "outcome_unknown");
+        assert_eq!(
+            CrazeFailure::lane(LaneError::BadRequest("no such dir".into())).code,
+            "bad_request"
+        );
+        let failed = CrazeFailure::lane(LaneError::Failed("Error: KEYCHAIN LOCKED".into()));
+        assert_eq!(failed.code, "failed");
+        assert_eq!(failed.message, "Error: KEYCHAIN LOCKED");
+        assert_eq!(failed.command_string(), "failed: Error: KEYCHAIN LOCKED");
+        assert_eq!(
+            CrazeFailure::lane(LaneError::Unavailable("busy".into())).code,
+            "unavailable"
+        );
     }
 
     #[test]

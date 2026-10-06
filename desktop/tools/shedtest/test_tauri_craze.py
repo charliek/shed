@@ -18,8 +18,14 @@ lock, the session app untouched):
   seam: a directory holding a RECORDING `craze` wrapper (it notes the `PATH`
   and argv it was run with, then execs a private copy of the real binary), so
   the jailed ladder is observable. `localhost`'s roost is a `FakeRoost` (for
-  the row merge). The hub this app's eager source births is under the app's
-  own HOME / `CRAZE_HOME` / a short `/tmp` `CRAZE_RUNTIME_DIR`.
+  the row merge, and Open in terminal's `tab.open`). The hub this app's eager
+  source births is under the app's own HOME / `CRAZE_HOME` / a short `/tmp`
+  `CRAZE_RUNTIME_DIR`. Two switches in the rig's root steer the wrapper for
+  the create sheet's cells (C10): `outage` makes every craze run fail at once
+  (exit 1, before any hub — an unreachable machine), and `proxy` runs each NEW
+  `bridge --hub` through `bridge_proxy.py`, which logs every `session.create`'s
+  requestId to `creates.log` and — while `drop-creates` exists — cuts the
+  connection once the hub has the create, so its answer is lost.
 * `app_absent` — an EMPTY seam directory (craze not installed) and a
   host-installed-craze SENTINEL at `$HOME/.nix-profile/bin/craze` (an absolute
   rung the production ladder would reach and the jailed one never may).
@@ -44,6 +50,7 @@ import platform
 import shutil
 import signal
 import subprocess
+import sys
 import tempfile
 import time
 from pathlib import Path
@@ -78,6 +85,54 @@ WAIT = 30.0
 BIN_NAMES = ("craze", "craze-fake-host", "craze-fake-agent", "craze-0.0.1")
 
 HELLO = {"protocols": [1], "client": {"kind": "test", "name": "shedtest"}}
+
+#: The create-logging, create-dropping `bridge --hub` proxy the recording
+#: wrapper runs while the rig's `proxy` switch is on (C10). It relays NDJSON
+#: lines both ways, unchanged; each client line that is a `session.create` is
+#: logged (`creates.log`: its requestId, and whether it was dropped) — and while
+#: `drop-creates` exists, relayed with nothing relayed back from then on, given
+#: a second for the hub to take it, and then the connection is CUT: the hub has
+#: the create (and a waiter that disconnects does not cancel one), the client
+#: never sees its answer — an unknown outcome, exactly.
+BRIDGE_PROXY = r"""
+import json, os, subprocess, sys, threading, time
+root = os.path.dirname(os.path.abspath(__file__))
+child = subprocess.Popen(sys.argv[1:], stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+cut = threading.Event()
+def down():
+    for line in child.stdout:
+        if cut.is_set():
+            continue
+        sys.stdout.buffer.write(line)
+        sys.stdout.buffer.flush()
+    os._exit(0)
+threading.Thread(target=down, daemon=True).start()
+for line in sys.stdin.buffer:
+    drop = False
+    try:
+        msg = json.loads(line)
+    except ValueError:
+        msg = None
+    if isinstance(msg, dict) and msg.get("method") == "session.create":
+        drop = os.path.exists(os.path.join(root, "drop-creates"))
+        rid = (msg.get("params") or {}).get("requestId")
+        with open(os.path.join(root, "creates.log"), "a") as log:
+            log.write(json.dumps({"requestId": rid, "dropped": drop}) + "\n")
+    if drop:
+        cut.set()
+    child.stdin.write(line)
+    child.stdin.flush()
+    if drop:
+        time.sleep(1.0)
+        child.kill()
+        os._exit(0)
+try:
+    child.stdin.close()
+except OSError:
+    pass
+child.wait()
+os._exit(0)
+"""
 
 
 # ---------------------------------------------------------------------------
@@ -207,13 +262,45 @@ class CrazeEnv:
             'provider = "grok"\nhost_idle_exit = "10m"\n\n'
             f'[agents]\ngrok = "{self.grok_echo}"\n')
         if kind == "recipe":
-            # The recording wrapper: what the ladder found, run with what PATH.
+            # The recording wrapper: what the ladder found, run with what PATH
+            # — and the C10 switches (the class doc): an outage, and the
+            # create-logging (and -dropping) bridge proxy.
+            (self.root / "bridge_proxy.py").write_text(BRIDGE_PROXY)
             _write_exec(self.path_dir / "craze", (
                 "#!/bin/sh\n"
                 f"printf '%s\\t%s\\n' \"$PATH\" \"$*\" >> '{self.calls}'\n"
+                f"if [ -e '{self.root / 'outage'}' ]; then\n"
+                "  printf '%s\\n' 'craze: a simulated outage (shedtest)' >&2; exit 1\n"
+                "fi\n"
+                f"if [ \"$*\" = 'bridge --hub' ] && [ -e '{self.root / 'proxy'}' ]; then\n"
+                f"  exec '{sys.executable}' '{self.root / 'bridge_proxy.py'}' '{self.real / 'craze'}' \"$@\"\n"
+                "fi\n"
                 f"exec '{self.real / 'craze'}' \"$@\"\n"))
         elif kind == "old":
             os.symlink(self.real / "craze-0.0.1", self.path_dir / "craze")
+
+    def creates(self) -> list[dict]:
+        """Every `session.create` a proxied bridge carried: `{requestId,
+        dropped}`, in order."""
+        log = self.root / "creates.log"
+        if not log.exists():
+            return []
+        return [json.loads(line) for line in log.read_text().splitlines() if line.strip()]
+
+    def set_grok(self, agent: Path) -> None:
+        """Point `[agents].grok` at `agent` (craze reads it at every create)."""
+        (self.craze_home / "config.toml").write_text(
+            'provider = "grok"\nhost_idle_exit = "10m"\n\n'
+            f'[agents]\ngrok = "{agent}"\n')
+
+    def switch(self, name: str, on: bool) -> None:
+        """Turn one of the wrapper's switches (`outage`, `proxy`,
+        `drop-creates`) on or off."""
+        flag = self.root / name
+        if on:
+            flag.touch()
+        else:
+            flag.unlink(missing_ok=True)
 
     def env(self) -> dict[str, str]:
         """Exactly what a craze process of this namespace sees."""
@@ -262,13 +349,20 @@ class CrazeEnv:
 
     def sigterm_hub(self) -> None:
         """SIGTERM this namespace's hub, by the pid its record names, checked to
-        run this namespace's private copy just before."""
+        run this namespace's private copy just before. A record whose pid no
+        longer runs (a hub stopped earlier in the module) is skipped; at least
+        one live hub must be signalled."""
         pids = self.hub_pids()
         assert pids, "no hub record"
+        signalled = 0
         for pid in pids:
             args = _program_args(pid)
+            if not args:
+                continue
             assert args.startswith(str(self.real)), f"pid {pid} is not this rig's hub: {args!r}"
             os.kill(pid, signal.SIGTERM)
+            signalled += 1
+        assert signalled, f"no live hub among the records: {pids}"
 
     def teardown(self) -> list[int]:
         for proc in self.fake_hosts + self.bridges:
@@ -641,6 +735,321 @@ def test_stop_ends_the_session_and_its_row(app, created):
 
 
 # ---------------------------------------------------------------------------
+# (2b) the create sheet and Open in terminal (plan 025 §3.6.6, §3.8 — C10)
+# ---------------------------------------------------------------------------
+
+#: What the C10 cells hand on: the session the sheet created (Open in
+#: terminal's subject).
+C10: dict[str, str] = {}
+
+
+def _sheet(app: TauriClient) -> dict | None:
+    return app.call("craze_create.dump")["craze_create"]
+
+
+def _open_sheet(app: TauriClient, machine: str = LOCAL) -> dict:
+    """`ui.show_craze_create`, then the sheet's options read (or failed)."""
+    app.call("ui.show_craze_create", {"machine": machine})
+    app.wait_until(lambda: bool((d := _sheet(app)) and d["machine"] == machine
+                                and d["state"] != "loading"),
+                   timeout=WAIT, what=f"the create sheet on {machine} to read its options")
+    return _sheet(app)
+
+
+def _close_sheet(app: TauriClient) -> None:
+    app.call("ui.close_craze_create")
+    app.wait_until(lambda: _sheet(app) is None, timeout=20, what="the create sheet to close")
+
+
+def _fill(app: TauriClient, **fill) -> dict:
+    """Fill the sheet (test-mode door) and wait until it SHOWS what was typed."""
+    app.call("ui.fill_craze_create", fill)
+    labels = {"cwd": "Directory", "prompt": "First prompt"}
+
+    def shown() -> bool:
+        d = _sheet(app) or {}
+        return all(d.get("values", {}).get(labels[k]) == v for k, v in fill.items() if k in labels)
+
+    app.wait_until(shown, timeout=20, what=f"the sheet to show {fill}")
+    return _sheet(app)
+
+
+def _submit_when_ready(app: TauriClient) -> None:
+    app.wait_until(lambda: bool((d := _sheet(app)) and d["create_enabled"]), timeout=20,
+                   what="the sheet's primary button to be enabled")
+    app.call("ui.submit_craze_create")
+
+
+def _rows_in(app: TauriClient, cwd: Path) -> list[dict]:
+    return [r for r in _rows(app) if r.get("source") == "craze" and r.get("workdir") == str(cwd)]
+
+
+def _exactly_one_session_in(app: TauriClient, cwd: Path) -> dict:
+    """The one craze session in `cwd` — waited for, then given a moment for a
+    second (which must never come) to be listed too."""
+    app.wait_until(lambda: len(_rows_in(app, cwd)) >= 1, timeout=WAIT,
+                   what=f"the session in {cwd} to be listed")
+    time.sleep(scaled_timeout(2.0))
+    rows = _rows_in(app, cwd)
+    assert len(rows) == 1, f"exactly one session in {cwd}: {rows}"
+    return rows[0]
+
+
+def test_the_sheet_renders_crazes_options_in_order(app, created, rig):
+    """**The create sheet** (plan 025 §3.8) renders craze's own createOptions,
+    in craze's order: cursor UNAVAILABLE (no cursor-agent on the rig's PATH)
+    and native NEEDS_SETUP (no key) both dimmed, each with craze's reason and
+    fix, and NOT selectable — a click on one is refused; grok ready and
+    preselected as craze's default. The recent directories are craze's (the
+    created session's), one tap each."""
+    d = _open_sheet(app)
+    assert d["state"] == "idle", d
+    assert [p["id"] for p in d["providers"]] == ["cursor", "grok", "native"], d["providers"]
+    cursor, grok, native = d["providers"]
+    assert cursor["state"] == "unavailable" and cursor["dimmed"] is True, cursor
+    assert cursor["reason"] == "cursor-agent not found on PATH", cursor
+    assert "install cursor-agent" in (cursor["fix"] or ""), cursor
+    assert native["state"] == "needs_setup" and native["dimmed"] is True, native
+    assert native["reason"] and native["fix"], native
+    assert grok["dimmed"] is False and grok["selected"] is True, grok
+    assert d["preselected"] == "grok" == d["default_provider"], d
+    assert not cursor["selected"] and not native["selected"]
+
+    # A dimmed provider refuses the click (the prompt, typed in the same fill,
+    # proves the click was delivered before it).
+    d = _fill(app, provider="cursor", prompt="probe")
+    assert [p["id"] for p in d["providers"] if p["selected"]] == ["grok"], d["providers"]
+    _fill(app, prompt="")
+
+    recent = d["recent_dirs"]
+    assert str(rig.work) in recent, f"the created session's directory is a recent one: {recent}"
+    d = _fill(app, cwd="")
+    app.call("ui.fill_craze_create", {"recent": recent.index(str(rig.work))})
+    app.wait_until(lambda: (_sheet(app) or {}).get("values", {}).get("Directory") == str(rig.work),
+                   timeout=20, what="the recent directory tapped into the field")
+    assert _sheet(app)["create_enabled"] is True
+    _shot(app, "craze-create-sheet.png")
+    _close_sheet(app)
+
+
+def test_the_launch_dialogs_target_list_leads_to_the_sheet(app):
+    """The New-session dialog's "Where" lists a craze target for this machine
+    (its craze is live and can create); picking it and pressing Continue opens
+    craze's own sheet there."""
+    app.call("ui.show_launch")
+    app.wait_until(lambda: bool(app.call("launch.dump")["launch"]), timeout=20,
+                   what="the launch dialog")
+    assert "localhost — new craze session" in app.call("launch.dump")["launch"]["rendered"]
+    app.call("ui.fill_launch", {"target": f"craze:{LOCAL}"})
+    app.wait_until(lambda: "Continue" in (app.call("launch.dump")["launch"] or {}).get("rendered", ""),
+                   timeout=20, what="the craze target selected")
+    app.call("ui.submit_launch")
+    app.wait_until(lambda: bool((d := _sheet(app)) and d["machine"] == LOCAL), timeout=WAIT,
+                   what="the craze sheet, from the launch dialog")
+    assert app.call("launch.dump")["launch"] is None, "the launch dialog gave way to the sheet"
+    _close_sheet(app)
+
+
+def test_a_create_from_the_sheet_opens_its_transcript_at_once(app, rig):
+    """**Create, then the transcript at once** (plan 025 §3.8, §3.6.4): a
+    provider, a fresh directory and a first prompt; Create closes the sheet and
+    opens the new session's transcript straight away — the row was folded in
+    on the create's own answer — and it shows the prompt and the fake agent's
+    echo. Exactly one session runs there."""
+    cwd = _mkdir_0700(rig.root / "w-sheet")
+    rig.switch("proxy", True)
+    before = len(rig.creates())
+    _open_sheet(app)
+    _fill(app, cwd=str(cwd), prompt="hello sheet")
+    _shot(app, "craze-create-filled.png")
+    _submit_when_ready(app)
+    app.wait_until(lambda: _sheet(app) is None, timeout=WAIT, what="the sheet to close on Created")
+    app.wait_until(lambda: bool((lane := _dump(app)) and lane["lane_kind"] == KIND
+                                and any(r["text"] == "echo: hello sheet" for r in lane["rows"])),
+                   timeout=WAIT, what="the new session's transcript, with its first prompt's echo")
+    lane = _dump(app)
+    host = lane["session_id"]
+    assert any(r["text"] == "hello sheet" for r in lane["rows"]), lane["rows"]
+    assert lane["permission"] == "runs tools without asking", "a sheet-created session runs bypass"
+    row = _exactly_one_session_in(app, cwd)
+    assert row["slug"] == host and row["provider"] == "grok", row
+    sent = rig.creates()[before:]
+    assert len(sent) == 1 and sent[0]["dropped"] is False, sent
+    rig.switch("proxy", False)
+    _shot(app, "craze-create-transcript.png")
+    _unmount(app)
+    C10["host"] = host
+
+
+def test_an_unknown_outcome_is_retried_under_the_same_id(app, rig):
+    """**An unknown outcome never makes a second session** (plan 025 §3.8): the
+    bridge carrying the create is cut once the hub has it — and so is the
+    source's one automatic retry, under the SAME requestId — so the sheet says
+    the outcome is unknown and HOLDS that id. "Try again" resumes it: the same
+    id a third time, craze answers with the session the first one started, and
+    exactly one session runs."""
+    cwd = _mkdir_0700(rig.root / "w-unknown")
+    rig.switch("proxy", True)
+    rig.switch("drop-creates", True)
+    before = len(rig.creates())
+    try:
+        _open_sheet(app)
+        _fill(app, cwd=str(cwd), prompt="")
+        _submit_when_ready(app)
+        try:
+            app.wait_until(lambda: (_sheet(app) or {}).get("state") == "unknown", timeout=WAIT,
+                           what="the sheet to report an unknown outcome")
+        except Exception as e:
+            raise AssertionError(f"{e}: sheet={_sheet(app)} creates={rig.creates()}") from e
+    finally:
+        rig.switch("drop-creates", False)
+    d = _sheet(app)
+    held = d["request_id"]
+    assert held and held.startswith("shed-"), d
+    assert d["primary"] == "Try again", d
+    assert "check the session list" in d["rendered"], d["rendered"]
+    assert d["error"]["code"] == "outcome_unknown", d["error"]
+    sent = rig.creates()[before:]
+    assert [c["requestId"] for c in sent] == [held, held], f"the source's own retry, same id: {sent}"
+    assert all(c["dropped"] for c in sent), sent
+    _shot(app, "craze-create-unknown.png")
+
+    app.call("ui.submit_craze_create")  # Try again
+    app.wait_until(lambda: _sheet(app) is None, timeout=WAIT, what="the sheet to close on Created")
+    sent = rig.creates()[before:]
+    assert [c["requestId"] for c in sent] == [held, held, held], f"Try again resumed the same request: {sent}"
+    assert sent[-1]["dropped"] is False
+    rig.switch("proxy", False)
+    _exactly_one_session_in(app, cwd)
+    _unmount(app)
+
+
+def test_a_start_failure_shows_crazes_cause_and_try_again_mints_a_new_id(app, rig):
+    """**A definite failure** (plan 025 §3.8): grok's agent dies at its start
+    (`[agents]` → the fake's `exit-two-lines`), and the sheet shows craze's
+    cause VERBATIM — the agent's two stderr lines — with the typed form intact
+    and NO id held (craze would replay that failure under it). With the config
+    fixed, "Try again" sends a NEW id, and one session results."""
+    cwd = _mkdir_0700(rig.root / "w-fail")
+    failing = _write_exec(rig.root / "grok-fail-agent",
+                          f"#!/bin/sh\nexec '{rig.real / 'craze-fake-agent'}' -script exit-two-lines \"$@\"\n")
+    rig.set_grok(failing)
+    rig.switch("proxy", True)
+    before = len(rig.creates())
+    try:
+        _open_sheet(app)
+        _fill(app, cwd=str(cwd), prompt="this one will not start")
+        _submit_when_ready(app)
+        app.wait_until(lambda: (_sheet(app) or {}).get("state") == "refused", timeout=WAIT,
+                       what="the start failure")
+    finally:
+        rig.set_grok(rig.grok_echo)
+    d = _sheet(app)
+    assert d["error"]["code"] == "failed", d["error"]
+    assert "KEYCHAIN LOCKED" in d["cause"] and "Run unlock and retry." in d["cause"], d["cause"]
+    assert d["cause"] == d["error"]["message"], "craze's cause, verbatim"
+    assert d["request_id"] is None, "a definite answer ends the id's life"
+    assert d["primary"] == "Try again"
+    assert d["values"] == {"Directory": str(cwd), "First prompt": "this one will not start"}, d["values"]
+    app.wait_until(lambda: not _rows_in(app, cwd), timeout=WAIT,
+                   what="the failed start to leave no session")
+    _shot(app, "craze-create-start-failed.png")
+
+    app.call("ui.submit_craze_create")  # Try again, the config fixed
+    app.wait_until(lambda: _sheet(app) is None, timeout=WAIT, what="the sheet to close on Created")
+    sent = rig.creates()[before:]
+    assert len(sent) == 2, sent
+    assert sent[1]["requestId"] != sent[0]["requestId"], f"a NEW id after a definite failure: {sent}"
+    rig.switch("proxy", False)
+    _exactly_one_session_in(app, cwd)
+    _unmount(app)
+
+
+def test_the_typed_form_survives_the_machine_going_offline(app, rig):
+    """**No state clears the typed form** (plan 025 §3.8): with the sheet open
+    and filled, this machine's craze goes OFFLINE under it (its hub stopped, and
+    craze unreachable for a while) — the sheet says so and disables Create, and
+    keeps every typed character; when craze is back, the note goes and Create
+    works again, the form as it was."""
+    _open_sheet(app)
+    typed = {"cwd": "/typed/before/the/outage", "prompt": "kept\nacross the outage"}
+    _fill(app, **typed)
+    rig.switch("outage", True)
+    try:
+        rig.sigterm_hub()
+        app.wait_until(lambda: "offline" in ((_sheet(app) or {}).get("note") or ""), timeout=WAIT,
+                       what="the sheet's offline note")
+        d = _sheet(app)
+        assert d["create_enabled"] is False, d
+        assert d["values"] == {"Directory": typed["cwd"], "First prompt": typed["prompt"]}, d["values"]
+        assert [p["id"] for p in d["providers"] if p["selected"]] == ["grok"]
+        _shot(app, "craze-create-offline.png")
+    finally:
+        rig.switch("outage", False)
+    app.wait_until(lambda: (_status(app, LOCAL) or {}).get("craze", {}).get("state") == "live",
+                   timeout=WAIT * 2, what="this machine's craze back")
+    app.wait_until(lambda: (_sheet(app) or {}).get("note") is None, timeout=WAIT,
+                   what="the offline note gone")
+    d = _sheet(app)
+    assert d["values"] == {"Directory": typed["cwd"], "First prompt": typed["prompt"]}, d["values"]
+    assert d["create_enabled"] is True, d
+    _fill(app, cwd="", prompt="")
+    _close_sheet(app)
+
+
+def test_open_in_terminal_attaches_a_tab_across_roost_snapshots(app, roost):
+    """**Open in terminal** (plan 025 §3.6.6) on the headless session the sheet
+    created: a roost `tab.open` whose argv is the `sh -c` ladder running
+    `craze attach --session '<hostId>'` — it RUNS exactly that, through a real
+    `sh` and a stub craze at the ladder's first rung — and whose cwd is the
+    session's workspace. The row shows that tab, and still does after a full
+    roost resync (roost reports the tab unowned; the app's own map keeps it);
+    End tab on it only detaches — the session runs on."""
+    host = C10.get("host")
+    assert host, "the sheet's session (test_a_create_from_the_sheet_opens_its_transcript_at_once)"
+    row = _row(app, host)
+    assert row and "tab_id" not in row, row
+    opens = len(roost.opens)
+    out = app.call("craze.open_terminal", {"machine": LOCAL, "session_id": host})
+    assert len(roost.opens) == opens + 1, "one tab.open reached roost"
+    call = roost.opens[-1]
+    assert call["argv"] == out["argv"], (call, out)
+    assert call["argv"][:2] == ["sh", "-c"], call["argv"]
+    assert f"attach --session '{host}'" in call["argv"][2], call["argv"][2]
+    assert call["cwd"] == row["workdir"], (call, row)
+    # What it runs: the first rung ($HOME/.local/bin) is a stub that records.
+    stub_home = Path(tempfile.mkdtemp(prefix="shcz-attach-", dir="/tmp")).resolve()
+    try:
+        record = stub_home / "argv"
+        _write_exec(stub_home / ".local" / "bin" / "craze",
+                    f"#!/bin/sh\nprintf '%s\\n' \"$*\" > '{record}'\n")
+        subprocess.run(call["argv"], env={"HOME": str(stub_home), "PATH": "/usr/bin:/bin"},
+                       check=True, timeout=10)
+        assert record.read_text().strip() == f"attach --session {host}"
+    finally:
+        shutil.rmtree(stub_home, ignore_errors=True)
+
+    tab = out["tab_id"]
+    app.wait_until(lambda: (_row(app, host) or {}).get("tab_id") == tab, timeout=WAIT,
+                   what="the row to show its tab")
+    lists = roost.tab_list_calls
+    roost.end_stream()
+    app.wait_until(lambda: roost.tab_list_calls > lists, timeout=WAIT, what="roost's resync")
+    deadline = time.monotonic() + scaled_timeout(1.5)
+    while time.monotonic() < deadline:
+        assert (_row(app, host) or {}).get("tab_id") == tab, "the row keeps its tab across a roost snapshot"
+        time.sleep(0.1)
+    app.navigate("agents")
+    _shot(app, "craze-open-terminal.png")
+
+    app.call("machine.kill", {"machine": LOCAL, "slug": tab})
+    app.wait_until(lambda: "tab_id" not in (_row(app, host) or {"tab_id": tab}), timeout=WAIT,
+                   what="the row headless again")
+    assert _row(app, host) is not None, "closing the attach tab only detached: the session runs on"
+    assert int(tab) not in roost.tab_ids()
+
+
+# ---------------------------------------------------------------------------
 # (3) the row merge — D4, on this machine
 # ---------------------------------------------------------------------------
 
@@ -921,6 +1330,42 @@ def test_too_old_shows_the_machines_pane_note(app_remote):
         timeout=20, what="the machines pane's craze note")
     row = next(m for m in app_remote.machines_dump() if m["name"] == "craze-old")
     assert row["craze_note"] == "craze on this machine is too old for shed; update it", row
+    assert row["craze_create"] is False, "too old: no create entry (plan 025 §3.8)"
     dormant = next(m for m in app_remote.machines_dump() if m["name"] == "craze-dormant")
     assert dormant.get("craze_note") is None, "dormant is not a problem to report"
+    assert dormant["craze_create"] is True, "dormant: create is offered (plan 025 §3.6.5)"
     _shot(app_remote, "craze-machines.png")
+
+
+def test_the_sheet_on_a_dormant_machine_starts_its_hub_and_attaches(app_remote, remote):
+    """**Create on a DORMANT machine** (plan 025 §3.6.5, §3.6.1): opening the
+    sheet is the explicit action that starts a remote hub — its
+    `create_options` dials `bridge --hub` (jailed, like every remote command in
+    test mode) where no hub ran — and the machine's source, WOKEN by it, probes
+    and attaches at once rather than at its next 30 s dormant probe.
+
+    LAST in the module: craze-dormant is no longer dormant after it."""
+    machine = "craze-dormant"
+    jail = remote.jails[machine]
+    app_remote.wait_until(lambda: _craze_state(app_remote, machine).get("state") == "dormant",
+                          timeout=WAIT, what="craze-dormant dormant")
+    assert not jail.hub_pids()
+    # Anchor on a fresh dormant probe: without the wake, the next one — the
+    # earliest the source could attach — is a full DORMANT_PROBE (30 s) later.
+    probes = lambda: [c for c in remote.commands(machine) if "providers --hub --json" in c]  # noqa: E731
+    seen = len(probes())
+    app_remote.wait_until(lambda: len(probes()) > seen, timeout=45, what="a fresh dormant probe")
+    probed_at = time.monotonic()
+    d = _open_sheet(app_remote, machine)
+    assert d["state"] == "idle", d
+    assert [p["id"] for p in d["providers"]] == ["cursor", "grok", "native"], d["providers"]
+    assert d["preselected"] == "grok"
+    assert any("bridge --hub" in c for c in remote.commands(machine)), \
+        "the sheet's create_options dialled bridge --hub (an explicit action)"
+    assert jail.hub_pids(), "a hub runs there now"
+    assert not (remote.root / "refused").exists(), "a remote craze command named an absolute rung"
+    app_remote.wait_until(lambda: _craze_state(app_remote, machine).get("state") == "live",
+                          timeout=WAIT, what="craze-dormant attached")
+    assert time.monotonic() - probed_at < 25, "woken by the sheet, not left to its next dormant probe"
+    _shot(app_remote, "craze-create-dormant.png")
+    _close_sheet(app_remote)

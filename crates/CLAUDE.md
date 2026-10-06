@@ -178,8 +178,16 @@ re-implemented per language. The root `CLAUDE.md` owns the monorepo layout + rel
   deviation (a create refused `not_accepting/start_failed` → `Failed(data.cause)`).
   `CrazeSource::create` retries ONCE under the same `requestId` on an unknown outcome (a
   dropped connection, the 120 s deadline) and never on a definite answer;
-  `is_outcome_unknown` is the one test a caller keeps its id on. A row's id is its
-  **hostId** (P11). **`CrazeLane`** (plan 025 C8, `open` binds one with no I/O) is one
+  `is_outcome_unknown` is the one test a caller keeps its id on. A create keeps the row it
+  answered with APART from the roster's (`Held`): until a roster lists that hostId or removes
+  it — a seed that does not list it yet keeps it — or 10 min pass (craze's replay window);
+  never for a hostId a roster let go within craze's 10-minute replay window (timestamped
+  tombstones, a 4096 count only as a memory backstop, so a replayed create cannot resurrect
+  it); at most 64 at once. `created_rows()` is that set, evaluated at the call — the one
+  authority a client lists created rows from (the desktop keeps no copy). So `open(hostId)` on a just-created session binds a
+  lane that knows its row at once; `dialling(dial)` is the same source — its rows — on
+  another dial (the desktop runs a user's explicit `create_options`/`create` through an
+  ungated one). A row's id is its **hostId** (P11). **`CrazeLane`** (plan 025 C8, `open` binds one with no I/O) is one
   session: its watcher (`watcher.rs` — the state machine table is its module doc) dials
   one connection per lane, splices to the host (`session.connect{hostId}` with the host
   `hello` pipelined), re-reads the host's own `sessions.list` row (the craze `sessionId`

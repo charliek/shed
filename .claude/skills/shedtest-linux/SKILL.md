@@ -238,6 +238,48 @@ SHED_CRAZE_REQUIRE=1 SHED_CRAZE_BIN_DIR=/work/desktop/tools/shedtest/.craze-bin 
 - `lane.*` ops all take `kind` now (`"craze"` / `"opencode"`, the row's `agent_lane.kind`);
   `ui.show_lane` too.
 
+### The craze create sheet and Open in terminal (plan 025 C10)
+
+- **Drive the sheet through its doors**: `ui.show_craze_create {machine}` (opening it reads
+  `craze.create_options` — on a DORMANT remote that is the explicit action that starts its hub),
+  `ui.fill_craze_create {provider?, cwd?, prompt?, recent?}` and `ui.submit_craze_create` (test
+  mode only), `ui.close_craze_create`; read it with `craze_create.dump` (providers with
+  `dimmed`/`selected`/`reason`/`fix`, `values`, the `request_id` it holds, `note`, `error`,
+  `cause`, `create_enabled`, `primary`). **Wait for the dump to SHOW a fill** (its `values`, or
+  `create_enabled`) before `ui.submit_craze_create`: the submit door presses the button through
+  the gate of the LAST render, and a submit landing before the fill re-rendered is dropped
+  (the launch dialog's doors behave the same).
+- **The draft is the app shell's, per machine**, not the sheet's: closing and re-opening the
+  sheet keeps the typed form (and a held request id). A cell that wants a clean form fills
+  every field it relies on.
+- **Losing a create's answer on purpose** (the unknown-outcome cell): the recipe rig's
+  recording `craze` wrapper has switches in the rig root — `proxy` runs each NEW
+  `bridge --hub` through `bridge_proxy.py`, which logs every `session.create`'s requestId to
+  `creates.log`; with `drop-creates` too it relays the create, relays NOTHING back from then
+  on (or a fast hub's answer slips through in the grace second), and cuts the connection a
+  second later. The source's own retry is cut the same way, so the sheet sees
+  `outcome_unknown` with the same id twice in the log. `outage` makes every craze run exit 1
+  before any hub (Unreachable — a short backoff, unlike not-installed's 30 s); SIGTERM the hub
+  with it on to take a machine OFFLINE under an open sheet, then remove it to bring it back.
+- **A start failure on demand**: point `[agents].grok` at `craze-fake-agent -script
+  exit-two-lines` (`rig.set_grok(...)`); craze reads it at every create. Restore it (in a
+  `finally`) before the next create.
+- **The fake agent reuses one provider session id**, so every hub-created session's row
+  claims the same `provider_session_id`. Open in terminal attaches its tab to ITS row by
+  hostId when a provider session is ambiguous (or absent) — a fold that went through the
+  shared rule's tie-break would hand the tab to the newest row.
+- **An attach tab is kept by a revision FENCE, not a timer**: `craze.open_terminal` reads
+  `session.identify` + `tab.list`'s `revision` right after its `tab.open`
+  (`shed_app::roost::tab_open_fenced`, retried once on a fresh connection); a snapshot of the
+  SAME daemon below it is silent about the fresh (hidden, unowned) tab and is ignored, any later
+  one — or one from a RESTARTED roost, whose revisions start again at 1 — that does not list the
+  tab drops it. An unfenced entry (both reads failed) is kept 5 s whatever a snapshot says. A fake's `tab.list` must carry `revision`
+  (both FakeRoosts do) or every snapshot is taken at its word. While the craze feed is down
+  the tab stays on its retained row (the map is the app's own knowledge, not roost ownership).
+- **`laneFailure` must not be applied twice**: a wrapper that already threw a coded
+  `LaneFailure` has a message WITHOUT the code, and re-splitting it read `outcome_unknown` as
+  `failed`. `laneFailure` now returns a `LaneFailure` unchanged.
+
 ### Against a REAL local daemon
 
 The render-gate container can drive the roost-session running on the **host**. Mount its

@@ -483,6 +483,246 @@ async fn the_create_deadline_is_an_unknown_outcome() {
     drop(hub);
 }
 
+/// One create answered `created_result()`'s row, on `src`, through the next
+/// scripted connection.
+async fn create_answered(
+    src: &CrazeSource,
+    conns: &mut tokio::sync::mpsc::UnboundedReceiver<HubEnd>,
+    id: &str,
+) -> LaneCreated {
+    let src = src.clone();
+    let id = id.to_string();
+    let create = tokio::spawn(async move { src.create(create_request(&id)).await });
+    let mut hub = next_conn(conns).await;
+    hub.hello("epoch-1", full_hub_capabilities()).await;
+    let req = hub.expect("session.create").await;
+    hub.reply(&req, created_result()).await;
+    create.await.unwrap().unwrap()
+}
+
+/// **A created session is openable at once, and stays so until a roster
+/// speaks for it** (plan 025 §3.6.4, the C9 hand-off and the C10 review): the
+/// create's own row is kept — through a clone that dials elsewhere too
+/// ([`CrazeSource::dialling`]) — so `open(hostId)` binds a lane whose
+/// `session()` answers with no roster at all; a roster seed that does NOT list
+/// it yet keeps it (its answer can predate the new host); a roster that lists
+/// it is the one from then on (its row is the fresher, and never overwritten);
+/// a roster `Removed` lets it go for good — a replay of the same create's
+/// answer (craze replays one for ten minutes) does not bring it back, nor does
+/// one for a hostId an epoch reseed dropped.
+#[tokio::test]
+async fn a_created_row_is_kept_until_a_roster_speaks_for_it() {
+    const NEW: &str = "cccccccccccc";
+    let (roster_dial, mut roster_conns) = ScriptedDial::new();
+    let (ask_dial, mut ask_conns) = ScriptedDial::new();
+    let src = source(Arc::clone(&roster_dial));
+    let ask = src.dialling(Arc::clone(&ask_dial) as Arc<dyn CrazeDial>);
+
+    // No subscription anywhere: nothing has listed the new session.
+    assert!(src.listed(NEW).is_none());
+    let created = create_answered(&ask, &mut ask_conns, "req-open").await;
+    assert_eq!(created.session.id, NEW);
+    assert_eq!(
+        roster_dial.dials(),
+        0,
+        "the create went through the clone's dial"
+    );
+    let (row, session_id) = src
+        .listed(NEW)
+        .expect("the create's row is the source's at once");
+    assert_eq!(
+        (row.id.as_str(), session_id.as_str()),
+        (NEW, "session-created")
+    );
+    assert_eq!(
+        src.created_rows()
+            .iter()
+            .map(|r| r.id.as_str())
+            .collect::<Vec<_>>(),
+        [NEW],
+        "the authority a client reads its created rows from"
+    );
+    assert!(src.roster_row(NEW).is_none(), "no roster has listed it");
+    let lane = src.open(NEW).await.unwrap();
+    assert_eq!(
+        lane.session()
+            .await
+            .expect("a lane on a just-created session knows its row")
+            .id,
+        NEW
+    );
+    assert_eq!(
+        roster_dial.dials() + ask_dial.dials(),
+        1,
+        "session() never dials"
+    );
+
+    // A seed whose answer does not list it yet (it predates the new host):
+    // the created row is KEPT — a lane opened now still knows it.
+    let (mut rx, _stop) = src.subscribe().await.unwrap().into_parts();
+    let mut hub = next_conn(&mut roster_conns).await;
+    hub.hello("epoch-1", full_hub_capabilities()).await;
+    hub.subscribed("r-1", "epoch-1", json!([row_a()])).await;
+    until(&mut rx, "the seed", is_ready).await;
+    assert!(
+        src.listed(NEW).is_some(),
+        "a seed that does not list it yet keeps the create's row"
+    );
+    let lane = src.open(NEW).await.unwrap();
+    assert!(
+        lane.session().await.is_ok(),
+        "still openable after the seed"
+    );
+
+    // The roster lists it, with its own (fresher) row: that row is the one,
+    // and a create's answer arriving after never overwrites it.
+    let fresher = roster_row(
+        NEW,
+        "session-created",
+        "/w/new",
+        json!({"title": "the roster's", "activity": "idle", "pendingAsks": 0}),
+    );
+    hub.roster("r-1", "epoch-1", json!([fresher]), json!([]))
+        .await;
+    until(&mut rx, "the upsert", |e| {
+        matches!(e, SourceEvent::Session { .. })
+    })
+    .await;
+    assert_eq!(src.listed(NEW).unwrap().0.title, "the roster's");
+    assert!(
+        src.created_rows().is_empty(),
+        "the roster speaks for it now"
+    );
+    assert_eq!(src.roster_row(NEW).unwrap().title, "the roster's");
+    create_answered(&ask, &mut ask_conns, "req-open").await;
+    assert_eq!(src.listed(NEW).unwrap().0.title, "the roster's");
+
+    // The roster removes it: gone, and a REPLAY of the same create's answer
+    // (same requestId, craze's ten-minute replay) does not bring it back.
+    hub.roster("r-1", "epoch-1", json!([]), json!([NEW])).await;
+    until(&mut rx, "the remove", |e| {
+        matches!(e, SourceEvent::Removed { .. })
+    })
+    .await;
+    assert!(src.listed(NEW).is_none(), "a Removed lets it go");
+    create_answered(&ask, &mut ask_conns, "req-open").await;
+    assert!(
+        src.listed(NEW).is_none(),
+        "a replayed create never resurrects a removed session's row"
+    );
+    assert!(src.created_rows().is_empty(), "nor offers it to a client");
+
+    // An epoch reseed that no longer lists row A (no `Removed` for it) lets
+    // it go too: a create answer naming it is not kept.
+    hub.reset("r-1", "omitted").await;
+    let resub = hub.expect("sessions.subscribe").await;
+    hub.reply(
+        &resub,
+        json!({"subscription": "r-2", "epoch": "epoch-1", "cursor": 9, "sessions": []}),
+    )
+    .await;
+    until(&mut rx, "the reseed", is_ready).await;
+    assert!(src.listed("0a0a0a0a0a0a").is_none());
+    let replay_a = json!({"session": row_a(), "prompt": "none"});
+    {
+        let ask = ask.clone();
+        let create = tokio::spawn(async move { ask.create(create_request("req-a")).await });
+        let mut hub = next_conn(&mut ask_conns).await;
+        hub.hello("epoch-1", full_hub_capabilities()).await;
+        let req = hub.expect("session.create").await;
+        hub.reply(&req, replay_a).await;
+        create.await.unwrap().unwrap();
+    }
+    assert!(
+        src.listed("0a0a0a0a0a0a").is_none(),
+        "a hostId a reseed dropped is not resurrected by a create's answer"
+    );
+}
+
+/// A row with this hostId, for [`Held`]'s own cells.
+fn session_row(host_id: &str) -> LaneSession {
+    LaneSession {
+        id: host_id.to_string(),
+        title: host_id.to_string(),
+        cwd: "/w".to_string(),
+        ..LaneSession::default()
+    }
+}
+
+/// **The created rows are bounded** (C10 review): at most [`CREATED_KEEP`],
+/// the oldest out first, and none outlives [`CREATED_TTL`] — so creates on a
+/// source with no roster subscription cannot pile up.
+#[tokio::test(start_paused = true)]
+async fn created_rows_are_bounded_and_expire() {
+    let mut held = Held::default();
+    for i in 0..=CREATED_KEEP {
+        held.remember_created(&session_row(&format!("{i:012x}")), "s");
+        tokio::time::advance(Duration::from_millis(1)).await;
+    }
+    assert_eq!(held.created.len(), CREATED_KEEP, "bounded");
+    assert!(
+        held.listed(&format!("{:012x}", 0)).is_none(),
+        "the oldest went first"
+    );
+    assert!(held.listed(&format!("{CREATED_KEEP:012x}")).is_some());
+
+    tokio::time::advance(CREATED_TTL).await;
+    assert!(
+        held.listed(&format!("{CREATED_KEEP:012x}")).is_none(),
+        "expired with craze's replay window"
+    );
+    held.remember_created(&session_row("ffffffffffff"), "s");
+    assert_eq!(held.created.len(), 1, "a remember prunes the expired");
+
+    // The tombstones' memory backstop.
+    for i in 0..TOMBSTONES + 10 {
+        held.let_go(&format!("{i:012x}"));
+    }
+    assert_eq!(held.gone.len(), TOMBSTONES);
+}
+
+/// **`created_rows` is evaluated at the call** (C10 confirmation): a created
+/// row offered to a client goes once craze's replay window has passed, with no
+/// roster frame and no seed in between — the client reads it there rather than
+/// keeping a copy that would outlive it.
+#[tokio::test(start_paused = true)]
+async fn created_rows_expire_at_the_read() {
+    let (dial, mut conns) = ScriptedDial::new();
+    let src = source(Arc::clone(&dial));
+    let created = create_answered(&src, &mut conns, "req-ttl").await;
+    let listed: Vec<String> = src.created_rows().into_iter().map(|r| r.id).collect();
+    assert_eq!(listed, std::slice::from_ref(&created.session.id));
+    tokio::time::advance(CREATED_TTL).await;
+    assert!(src.created_rows().is_empty(), "expired at the read");
+    assert!(src.listed(&created.session.id).is_none());
+}
+
+/// **A tombstone lasts craze's whole replay window** (C10 confirmation): a
+/// session let go, then 300 other hosts let go within the ten minutes — a
+/// replayed create for the first is still refused; once the window has
+/// passed (craze no longer replays it), its id is free again.
+#[tokio::test(start_paused = true)]
+async fn a_tombstone_outlives_many_other_removals_within_the_replay_window() {
+    const A: &str = "aaaaaaaaaaaa";
+    let mut held = Held::default();
+    held.let_go(A);
+    for i in 0..300 {
+        held.let_go(&format!("{i:012x}"));
+        tokio::time::advance(Duration::from_secs(1)).await;
+    }
+    held.remember_created(&session_row(A), "s");
+    assert!(
+        held.listed(A).is_none(),
+        "a replayed create for A is refused, 300 removals and five minutes later"
+    );
+    tokio::time::advance(CREATED_TTL).await;
+    held.remember_created(&session_row(A), "s");
+    assert!(
+        held.listed(A).is_some(),
+        "past the replay window the id is free"
+    );
+}
+
 /// Any DEFINITE answer ends the id's life — no retry, whatever the refusal.
 #[tokio::test]
 async fn a_definite_refusal_is_never_retried() {

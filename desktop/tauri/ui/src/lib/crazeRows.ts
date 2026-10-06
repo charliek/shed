@@ -43,6 +43,14 @@ export function killTarget(s: CrazeRowLike): KillTarget | null {
   return { via: "shed", host: s.host, shed: s.shed, slug: s.slug };
 }
 
+/** **Open in terminal is offered on a HEADLESS craze row** (plan 025
+ *  §3.6.5/§3.6.6): a craze session with no roost tab attached, on a host the
+ *  row addresses. A row that has a tab offers End tab instead; a roost row
+ *  never offers it. */
+export function canOpenTerminal(s: CrazeRowLike): boolean {
+  return s.source === "craze" && !!s.machine && (s.tab_id == null || s.tab_id === "");
+}
+
 /** The card's one-line "what is it doing": craze's `doing`; else, when the
  *  session is idle, its last reply DIMMED (it is history, not activity);
  *  else nothing. */

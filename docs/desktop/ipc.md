@@ -223,6 +223,30 @@ A machine whose craze is too old says so on its Machines-pane card ("craze on th
 too old for shed; update it", `machines.dump`'s `craze_note`); a machine without craze says
 nothing.
 
+#### Creating a craze session, and Open in terminal
+
+A machine offers **New craze session** (its Machines-pane card, its group in the Agents pane,
+and a "— new craze session" entry in the New-session dialog's "Where") when its craze is
+**live** and its hub can list providers and create, or when it is **dormant** — opening the
+sheet is then the explicit action that starts its hub. A live hub that cannot create shows
+"update craze on this machine to create sessions here"; listing still works.
+
+| op | params | result |
+|----|--------|--------|
+| `craze.create_options` | `machine` | `{machine, options: {providers, default_provider?, recent_dirs}}` — every provider in craze's order with its `state` (`ready` \| `needs_setup` \| `unavailable`) and, when not ready, craze's `reason` and `fix`; the default provider as craze states it; the recent directories, newest first. Read afresh on every call. **On a dormant machine this starts its hub** (an explicit action), and the machine's source attaches to it at once |
+| `craze.create` | `machine`, `cwd`, `provider?`, `prompt?`, `request_id?` | `{session, host_id, ended, prompt, prompt_error?, request_id}` — a new session (provider, directory and first prompt only: no model, effort or permission mode). `cwd` must be absolute; a blank `provider` (craze's default) or `prompt` (an idle session) is absent. `session` is its row, **already in the machine's listing**, so `lane.open {kind: "craze", session_id: host_id}` works at once — unless `ended` is `true`: craze replayed an earlier create's answer (it does, for ten minutes, under the same `request_id`) for a session that has since ended, and nothing is listed. `prompt` is `none` \| `accepted` \| `unknown` \| `refused`. `request_id` is the caller's — a present one must be a string in craze's form (1–64 of `[A-Za-z0-9._-]`), else `bad_request`, and is never replaced — or minted when absent (or `null`), and answered back. Every field is typed: a non-string is `bad_request`, never read as absent |
+| `craze.open_terminal` | `machine`, `session_id` (the row's hostId) | `{origin, machine, session_id, tab_id, cwd, argv}` — a roost tab running `craze attach --session <hostId>` (craze's ladder, the same `sh -c` composition every craze command uses) in the session's workspace. The hub row shows that tab (`tab_id`, End tab and all) from then on, across roost snapshots — and while the machine's craze feed is down, on the retained (stale) row — for as long as roost lists the tab: a snapshot taken after the open — or by a restarted roost — that no longer lists it ends that. Closing the tab only **detaches**; `/exit` inside it **stops** the session. The hostId must be twelve lowercase hex digits (`bad_request`) and a session the machine lists (`unknown_session`) |
+
+**The request id** makes a create idempotent: craze answers a repeat of one with the first
+create's answer — its failure too — for ten minutes. So a caller keeps its id **only while the
+outcome is unknown** (`outcome_unknown`: craze's answer was lost twice) and retries under it;
+after any definite answer — a session, or any refusal — the next create needs a new one.
+Refusal codes: the lane contract's (`bad_request` — craze's own, an unknown host, a relative
+`cwd`, an id not in craze's form; `unavailable`; `failed` — a session that failed to start,
+its message craze's own cause, verbatim), plus `outcome_unknown`, `too_old` ("update craze
+on this machine"), `not_installed`, `no_craze` (the host has no craze source), and
+`unknown_session`/`action_failed` for Open in terminal.
+
 ### Agent lanes (Tauri)
 
 A row that carries an `agent_lane` stamp — an opencode tab that reported its server, or a
@@ -267,8 +291,9 @@ backend's view — the two can disagree, and have.
 | `agents.dump` | on the Agents pane | `{sessions, empty}` — `empty` is the rendered empty state (`{state, title, body, action}`), `null` when rows rendered. `state` is `loading` \| `failed` \| `unreachable` \| `empty`: four blanks wearing one screen, and only `empty` offers the bootstrap |
 | `launch.dump` | while the New-session dialog is open | `{launch}` — `{rendered, values, create_enabled}`, `null` when none is mounted: the dialog's own rendered text, each labelled control's current value keyed by its label (what was typed is not text content), and whether its Create button is enabled — all three read off the mounted DOM |
 | `egress.profiles` | on the Egress pane | `{egress}` |
-| `machines.dump` | on the Machines pane | `{machines}` — a row per machine with its `status` word, `detail` line, and grouped session slugs, plus its `craze_note`: the note the card renders about the machine's craze ("craze on this machine is too old for shed; update it"), `null` when it says nothing — a machine without craze is not a problem to report |
+| `machines.dump` | on the Machines pane | `{machines}` — a row per machine with its `status` word, `detail` line, and grouped session slugs, plus its `craze_note`: the note the card renders about the machine's craze ("craze on this machine is too old for shed; update it", or for a live hub that cannot create "update craze on this machine to create sessions here"), `null` when it says nothing — a machine without craze is not a problem to report — and `craze_create`: whether the card offers New craze session |
 | `sidebar.dump` | **always** | `{servers, machines}` — the sidebar's status foot |
+| `craze_create.dump` | while the craze create sheet is open | `{craze_create}` — what the sheet rendered: `machine`; `state` (`loading` \| `failed` (the options) \| `idle` \| `submitting` \| `refused` \| `unknown` \| `created`); `providers[]` — `{id, label, state, dimmed, selected, reason, fix}`, a non-ready one dimmed and never selectable; `preselected` (the default provider when listed and ready, else the first ready one) and `default_provider`; `recent_dirs`; `values` (the typed "Directory" and "First prompt"); the `request_id` it holds (only while a submission is in flight or its outcome is unknown); its `note` (offline / too old / not installed, or "no provider is ready on this machine"); the `error` as shown (`{code, message, where, text}`), a start failure's `cause` verbatim, the directory's own `cwd_problem`; `create_enabled` and the `primary` button's label (Create, Try again, Creating…) — read off the mounted DOM; `null` when none is mounted |
 | `lane.dump` | while the transcript panel is open | `{lane}` — what the panel rendered: its rows, approval cards, `kind` badge (and `lane_kind`, the kind it was opened with), the `permission` line (`bypass` reads "runs tools without asking"), Interject toggle, `can_cancel` and `stop` (`{confirming}`, or `null` with no Stop button) — all read off `lane.messages`' `capabilities`; Cancel, Interject and Stop exist only when the capabilities offer them, and Cancel/Interject are live only while the session is working — `stale`, `ended`, and its error; `null` when none is mounted |
 
 The transcript panel is mounted by `ui.show_lane {machine, kind, session_id}` (the card's
@@ -280,7 +305,19 @@ mode only** — `ui.fill_launch {mode?, target?, command?, workdir?}` types into
 absent key is left as it is) and `ui.submit_launch` presses Create, through the button's own
 gate. They exist because the "Run a command" mode is reachable only by typing and clicking;
 outside test mode both answer `not_enabled`, and the production door onto the same backend is
-`roost.run`.
+`roost.run`. A `craze:<machine>` target (a machine that offers New craze session) leads on to
+the craze create sheet: its button reads Continue.
+
+The craze create sheet is opened by `ui.show_craze_create {machine}` (the New craze session
+action, a click; opening it reads `craze.create_options`, so on a dormant machine it starts the
+hub) and closed by `ui.close_craze_create` — closing it while a create runs keeps the create
+running, and its session simply appears as a row. **In test mode only**,
+`ui.fill_craze_create {provider?, cwd?, prompt?, recent?}` fills it the way a person would
+(`provider` clicks that provider's row — a dimmed one refuses the click; `recent: <n>` taps the
+n-th recent directory) and `ui.submit_craze_create` presses its primary button (Create, or Try
+again) through the button's own gate; outside test mode both answer `not_enabled`, and the
+production door is `craze.create`. After a create the sheet closes and opens the session's
+transcript at once; a first prompt craze did not take is said in a toast (`toast.dump`).
 
 A pane dump answers `null` off its pane; reporting copy nobody is reading would let a test
 assert a surface that isn't on screen. `sidebar.dump` is the exception because the sidebar

@@ -330,6 +330,7 @@ pub(crate) fn build_local_craze(options: &ReachOptions) -> Option<CrazeReach> {
         return Some(CrazeReach {
             dial: Arc::new(ProcessDial::bridge_hub(EnvPolicy::Inherit)),
             probe: None,
+            ensure: None,
         });
     }
     let dir = options.craze_path.as_ref()?;
@@ -338,13 +339,16 @@ pub(crate) fn build_local_craze(options: &ReachOptions) -> Option<CrazeReach> {
     Some(CrazeReach {
         dial: Arc::new(ProcessDial::bridge_hub_jailed(EnvPolicy::Exactly(env))),
         probe: None,
+        ensure: None,
     })
 }
 
 /// A remote machine's or a shed's craze reach (plan 025 §3.6.1) —
 /// ATTACH-ONLY: the find-only probe, and a probe-gated `bridge --hub`, both
 /// over the host's own [`SshExec`] (its pinned host key and its
-/// ControlMaster, shared with the bootstrap).
+/// ControlMaster, shared with the bootstrap) — plus the same bridge UNGATED
+/// ([`CrazeReach::ensure`]), which only a user's explicit action (the create
+/// sheet) dials, and which may birth a hub there.
 ///
 /// **In test mode it exists only through the fake-ssh seam**, mirroring
 /// [`build_ssh_reach`] — and it composes the JAILED ladder, because the fake
@@ -367,8 +371,13 @@ pub(crate) fn build_ssh_craze(exec: Arc<SshExec>, options: &ReachOptions) -> Opt
     let probe: Arc<dyn crate::craze::CrazeProbe> =
         Arc::new(SshCrazeProbe::new(Arc::clone(&exec), probe));
     Some(CrazeReach {
-        dial: Arc::new(SshCrazeDial::new(exec, bridge, Arc::clone(&probe))),
+        dial: Arc::new(SshCrazeDial::new(
+            Arc::clone(&exec),
+            bridge.clone(),
+            Arc::clone(&probe),
+        )),
         probe: Some(probe),
+        ensure: Some(Arc::new(SshCrazeDial::ungated(exec, bridge))),
     })
 }
 

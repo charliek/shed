@@ -1,13 +1,14 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 
 import type { AgentsEmptyState, AgentsLoad } from "@/lib/agentsEmpty";
+import type { CrazeCreateOptions } from "@/lib/crazeCreate";
 import { killTarget } from "@/lib/crazeRows";
 
 export type Pane = "sheds" | "machines" | "approvals" | "agents" | "activity" | "egress" | "system";
 
 /** Which modal (if any) is open — reported so the harness can drive + assert it.
  *  (Preferences is a dedicated window, not a modal — see `reportPrefs`.) */
-export type Modal = null | "create" | "launch" | "machine";
+export type Modal = null | "create" | "launch" | "machine" | "craze";
 
 const PANES: readonly Pane[] = ["sheds", "machines", "approvals", "agents", "activity", "egress", "system"];
 
@@ -1612,6 +1613,9 @@ export class LaneFailure extends Error {
 const LANE_CODE = /^[a-z][a-z_]*$/;
 
 export function laneFailure(e: unknown): LaneFailure {
+  // Already recovered (a wrapper threw one): its message no longer carries the
+  // code, so splitting it again would turn the code into `failed`.
+  if (e instanceof LaneFailure) return e;
   const raw = typeof e === "string" ? e : e instanceof Error ? e.message : String(e);
   const cut = raw.indexOf(": ");
   const code = cut > 0 ? raw.slice(0, cut) : "";
@@ -1790,6 +1794,135 @@ export type LaneReport = {
  *  `null` for "no panel" instead of the previous mount's stale snapshot. */
 export function reportLane(snapshot: LaneReport | null): void {
   void invoke("ui_report", { snapshot: { lane: snapshot } });
+}
+
+/* ---- craze: the create sheet and Open in terminal (plan 025 §3.6.6, §3.8) -- */
+
+/** A refusal of one of the `craze_*` commands, its code recovered — the
+ *  `lane_*` commands' `"<code>: <message>"` agreement ([laneFailure] splits it
+ *  the same way). `outcome_unknown` is the one the sheet keeps its request id
+ *  on; `too_old` / `not_installed` / `no_craze` say what this machine's craze
+ *  is; the rest are the lane contract's own codes. */
+export type CrazeOpFailure = LaneFailure;
+
+/** Invoke a craze command, THROWING a coded [LaneFailure]. */
+async function crazeInvoke<T>(cmd: string, args: Record<string, unknown>): Promise<T> {
+  const core = await import("@tauri-apps/api/core");
+  try {
+    return await core.invoke<T>(cmd, args);
+  } catch (e) {
+    throw laneFailure(e);
+  }
+}
+
+/** What a create can start on `machine` — read afresh on every sheet open
+ *  (D8: nothing is cached). On a DORMANT machine this is the explicit action
+ *  that starts its hub. THROWS a coded failure. */
+export async function crazeCreateOptions(machine: string): Promise<CrazeCreateOptions> {
+  const r = await crazeInvoke<{ options: CrazeCreateOptions }>("craze_create_options", { machine });
+  return r.options;
+}
+
+/** The fields of one create — the sheet's typed form and the request id it
+ *  holds (`crazeCreate.ts`'s lifecycle). */
+export type CrazeCreateFields = {
+  machine: string;
+  cwd: string;
+  provider?: string | null;
+  prompt?: string | null;
+  requestId: string;
+};
+
+/** What `craze_create` answers: the new session's row (already in the
+ *  machine's listing), its hostId, what became of the first prompt, and the
+ *  request id it ran under. */
+export type CrazeCreated = {
+  session: RcSession;
+  host_id: string;
+  /** craze answered with a session that has ALREADY ENDED (a replay of an
+   *  earlier create's answer, within craze's ten-minute window): nothing is
+   *  listed, and there is no transcript to open. */
+  ended?: boolean;
+  prompt: "none" | "accepted" | "unknown" | "refused" | string;
+  prompt_error?: string | null;
+  request_id: string;
+};
+
+/** Create a craze session. THROWS a coded failure — `outcome_unknown` when
+ *  craze's answer was lost twice (keep the id; Try again resumes it). */
+export async function crazeCreate(f: CrazeCreateFields): Promise<CrazeCreated> {
+  return crazeInvoke<CrazeCreated>("craze_create", {
+    machine: f.machine,
+    cwd: f.cwd,
+    provider: f.provider ?? undefined,
+    prompt: f.prompt ?? undefined,
+    requestId: f.requestId,
+  });
+}
+
+/** What `craze_open_terminal` answers: the roost tab it opened. */
+export type CrazeTerminal = {
+  origin: string;
+  machine: string;
+  session_id: string;
+  tab_id: string;
+  cwd: string;
+  argv: string[];
+};
+
+/** Open in terminal on a headless craze row: a roost tab running `craze
+ *  attach` on the session (its hostId), in its workspace. THROWS a coded
+ *  failure. */
+export async function crazeOpenTerminal(machine: string, sessionId: string): Promise<CrazeTerminal> {
+  return crazeInvoke<CrazeTerminal>("craze_open_terminal", { machine, sessionId });
+}
+
+/** One provider row AS RENDERED in the sheet — read back off its DOM
+ *  (`data-provider` and its attributes), never restated from state. */
+export type CrazeCreateProviderRow = {
+  id: string;
+  label: string;
+  state: string;
+  dimmed: boolean;
+  selected: boolean;
+  reason: string | null;
+  fix: string | null;
+};
+
+/** The create sheet as `craze_create.dump` reads it. */
+export type CrazeCreateDump = {
+  machine: string;
+  /** `loading` | `failed` (options) | the draft's phase: `idle` |
+   *  `submitting` | `refused` | `unknown` | `created`. */
+  state: string;
+  providers: CrazeCreateProviderRow[];
+  /** The default rule's answer (`preselectedProvider`). */
+  preselected: string | null;
+  default_provider: string | null;
+  recent_dirs: string[];
+  /** Each labelled control's current value ("Directory", "First prompt"). */
+  values: Record<string, string>;
+  /** The request id the sheet holds — set only while a submission is in
+   *  flight or its outcome is unknown. */
+  request_id: string | null;
+  /** The machine's note (offline / too old / not installed) or "no provider
+   *  is ready on this machine". */
+  note: string | null;
+  /** The refusal as shown, by code. */
+  error: { code: string; message: string; where: string; text: string } | null;
+  /** The start failure's cause, verbatim, as the monospace block shows it. */
+  cause: string | null;
+  /** The directory field's own refusal (relative or empty). */
+  cwd_problem: string | null;
+  create_enabled: boolean;
+  primary: string;
+  rendered: string;
+};
+
+/** Report the create sheet's rendered state, or `null` on unmount — called
+ *  by the sheet itself (the `reportLaunchDialog` rule). */
+export function reportCrazeCreate(dump: CrazeCreateDump | null): void {
+  void invoke("ui_report", { snapshot: { craze_create: dump } });
 }
 
 /* ---- menu-bar popover (B1b) ------------------------------------------------ */

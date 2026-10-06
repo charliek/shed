@@ -150,6 +150,54 @@ async fn a_lane_seeds_sends_and_echoes() {
     recipe.teardown().await.unwrap();
 }
 
+/// **A just-created session is openable at once** (plan 025 §3.6.4, the C9
+/// hand-off): with NO roster subscription anywhere — nothing has listed the
+/// new hostId — `open` on the create's row binds a lane whose `session()`
+/// answers, and whose subscription seeds the transcript with the first
+/// prompt and its echo.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_created_session_opens_at_once_with_no_roster_wait() {
+    let Some(bins) = bins("a_created_session_opens_at_once_with_no_roster_wait") else {
+        return;
+    };
+    let recipe = Recipe::start(&bins);
+    recipe.set_grok_agent(&recipe.script_agent("grok-echo"));
+    {
+        let source = recipe.source();
+        let created = source
+            .create(LaneCreateRequest {
+                cwd: recipe.work.to_string_lossy().into_owned(),
+                provider: None,
+                prompt: Some("hello at once".into()),
+                request_id: new_request_id(),
+            })
+            .await
+            .unwrap();
+        let host = created.session.id.clone();
+        let lane = source.open(&host).await.unwrap();
+        let s = lane
+            .session()
+            .await
+            .expect("the create's row is the lane's, before any roster");
+        assert_eq!(s.id, host);
+        let (mut rx, _stop) = lane.subscribe(None).await.unwrap().into_parts();
+        let mut checker = LaneChecker::new();
+        let seed = drive(&mut rx, &mut checker, "the seed", is_ready).await;
+        let mut t = texts(&seed);
+        if !t.iter().any(|x| x == "echo: hello at once") {
+            let more = drive(&mut rx, &mut checker, "the first prompt's echo", |e| {
+                matches!(e, LaneEvent::Message { message, .. }
+                    if message.text.as_deref() == Some("echo: hello at once"))
+            })
+            .await;
+            t.extend(texts(&more));
+        }
+        assert!(t.iter().any(|x| x == "hello at once"), "{t:?}");
+        assert!(t.iter().any(|x| x == "echo: hello at once"), "{t:?}");
+    }
+    recipe.teardown().await.unwrap();
+}
+
 /// Cancel with nothing to cancel is craze's `not_accepting`:
 /// `NotAccepting` (correction 8); interject on a session that cannot is
 /// `NotAccepting` too (its capabilities say so).

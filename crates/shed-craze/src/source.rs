@@ -62,6 +62,37 @@
 //! result, or any refusal, `unavailable` included — ends that id's life: the
 //! caller's next submission mints a new one ([`new_request_id`]).
 //!
+//! **A created session is openable at once** (plan 025 §3.6.4): a create's
+//! answer carries the new session's roster row, and the source keeps it beside
+//! the rows its roster lists — so [`AgentSource::open`] on the new hostId binds
+//! a lane that already knows its row and its craze `sessionId`, and that lane's
+//! `session()` answers before the roster has caught up (the hub's roster can
+//! lag a create by a poll round and its flush). The created rows are kept
+//! APART from the roster's ([`Held`]), so nothing the roster does to its own
+//! set can drop one by accident (C10 review):
+//!
+//! - a created row is kept until a roster LISTS that hostId (the roster's row
+//!   is then the one — and the fresher) or REMOVES it, or until it expires
+//!   ([`CREATED_TTL`], craze's own replay window). A roster seed that does not
+//!   list it yet — one whose answer predates the new host — keeps it;
+//! - never kept for a hostId a roster has already let go (removed, or listed
+//!   and then dropped by a reseed): craze replays a successful create's answer
+//!   for ten minutes, and a replay after the session ended must not bring its
+//!   row back — every such hostId is remembered for that whole window
+//!   ([`TOMBSTONES`] is only a memory backstop);
+//! - at most [`CREATED_KEEP`] at once, oldest first out, so creates on a source
+//!   with no roster subscription cannot pile up.
+//!
+//! The created rows are this source's to say: a client shows
+//! [`CrazeSource::created_rows`] beside the roster it follows instead of
+//! keeping a copy, so its rows and what `open` binds can never diverge.
+//!
+//! **One machine, more than one dial** ([`CrazeSource::dialling`]): a client
+//! whose roster dial is gated (the desktop's remote dial refuses to birth a hub
+//! that is not already running, §3.6.1) runs a user's explicit `create_options`
+//! and `create` through a second dial, on a clone that shares this source's
+//! rows — so a create through it is openable through the roster's source.
+//!
 //! # The row (P11)
 //!
 //! A row's id is its `hostId` — the key the roster is keyed by, and what the
@@ -72,11 +103,12 @@
 //! Binding, not dialling: a [`CrazeLane`] on the row's hostId, carrying the
 //! row and its craze `sessionId` when this source holds the row (every
 //! subscription of this source keeps the rows its roster lists — seeded,
-//! upserted, removed — for exactly this). An id the source never listed opens
+//! upserted, removed — for exactly this, and every create keeps the row it
+//! answered with until the roster lists it). An id the source never listed opens
 //! a lane whose `session()` is `UnknownSession` until a subscription of its own
 //! reads the host's row (plan 025 §3.3.4).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -174,9 +206,152 @@ pub fn valid_request_id(id: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
 }
 
-/// The rows a source's roster listed, by hostId: the row as the contract's,
-/// and the craze `sessionId` a lane opened on it carries.
-type Rows = Arc<Mutex<HashMap<String, (LaneSession, String)>>>;
+/// How long a created row is kept while no roster lists it — craze's own
+/// window for replaying a create's answer (PM "`session.create`").
+pub const CREATED_TTL: Duration = Duration::from_secs(600);
+/// The most created rows kept at once.
+pub const CREATED_KEEP: usize = 64;
+/// A memory BACKSTOP on the hostIds a roster let go — never the rule: every
+/// tombstone younger than [`CREATED_TTL`] (craze's replay window) is kept, so a
+/// create's replayed answer cannot bring a gone session back however many
+/// others went meanwhile; only past this many at once does the oldest go
+/// early.
+pub const TOMBSTONES: usize = 4096;
+
+/// One row a create answered with, kept until a roster speaks for it.
+#[derive(Debug, Clone)]
+struct Created {
+    session: LaneSession,
+    session_id: String,
+    at: tokio::time::Instant,
+}
+
+/// The rows a source holds, by hostId — each as the contract's row and the
+/// craze `sessionId` a lane opened on it carries (the module doc).
+#[derive(Debug, Default)]
+struct Held {
+    /// The roster's own: replaced by every seed, edited by every notification.
+    roster: HashMap<String, (LaneSession, String)>,
+    /// Creates' rows no roster has listed (or removed) yet.
+    created: HashMap<String, Created>,
+    /// HostIds a roster let go, and when, oldest first: each kept for
+    /// [`CREATED_TTL`] (the backstop: at most [`TOMBSTONES`]).
+    gone: VecDeque<(String, tokio::time::Instant)>,
+}
+
+impl Held {
+    fn listed(&self, host_id: &str) -> Option<(LaneSession, String)> {
+        if let Some(row) = self.roster.get(host_id) {
+            return Some(row.clone());
+        }
+        self.created
+            .get(host_id)
+            .filter(|c| c.at.elapsed() < CREATED_TTL)
+            .map(|c| (c.session.clone(), c.session_id.clone()))
+    }
+
+    /// The created rows no roster has listed or let go, unexpired — what a
+    /// client shows beside the roster it follows ([`CrazeSource::created_rows`]).
+    fn created_rows(&self) -> Vec<LaneSession> {
+        let mut rows: Vec<LaneSession> = self
+            .created
+            .values()
+            .filter(|c| c.at.elapsed() < CREATED_TTL)
+            .map(|c| c.session.clone())
+            .collect();
+        rows.sort_by(|a, b| a.id.cmp(&b.id));
+        rows
+    }
+
+    /// A roster speaks for `host_id` now: its created row (if any) is spent,
+    /// and it is not gone.
+    fn listed_by_roster(&mut self, host_id: &str) {
+        self.created.remove(host_id);
+        self.gone.retain(|(h, _)| h != host_id);
+    }
+
+    /// Forget the tombstones past craze's replay window.
+    fn prune_gone(&mut self) {
+        while self
+            .gone
+            .front()
+            .is_some_and(|(_, at)| at.elapsed() >= CREATED_TTL)
+        {
+            self.gone.pop_front();
+        }
+    }
+
+    /// Whether a roster let `host_id` go within craze's replay window.
+    fn is_gone(&self, host_id: &str) -> bool {
+        self.gone
+            .iter()
+            .any(|(h, at)| h == host_id && at.elapsed() < CREATED_TTL)
+    }
+
+    /// A roster let `host_id` go: its created row (if any) with it, and a
+    /// tombstone for craze's whole replay window.
+    fn let_go(&mut self, host_id: &str) {
+        self.created.remove(host_id);
+        self.prune_gone();
+        self.gone.retain(|(h, _)| h != host_id);
+        if self.gone.len() >= TOMBSTONES {
+            self.gone.pop_front();
+        }
+        self.gone
+            .push_back((host_id.to_string(), tokio::time::Instant::now()));
+    }
+
+    /// A seed: the roster's whole set, replaced. A hostId the last set listed
+    /// and this one does not was let go (an epoch reseed sends no `Removed`);
+    /// a created row this set does not list yet is KEPT (its answer may
+    /// predate the new host).
+    fn seed(&mut self, rows: HashMap<String, (LaneSession, String)>) {
+        let dropped: Vec<String> = self
+            .roster
+            .keys()
+            .filter(|h| !rows.contains_key(*h))
+            .cloned()
+            .collect();
+        for host_id in &dropped {
+            self.let_go(host_id);
+        }
+        for host_id in rows.keys() {
+            self.listed_by_roster(host_id);
+        }
+        self.roster = rows;
+    }
+
+    /// A create's row: kept unless the roster already lists it (its row is the
+    /// fresher) or let it go (a replayed answer), within [`CREATED_KEEP`].
+    fn remember_created(&mut self, session: &LaneSession, session_id: &str) {
+        let host_id = &session.id;
+        if self.roster.contains_key(host_id) || self.is_gone(host_id) {
+            return;
+        }
+        self.created.retain(|_, c| c.at.elapsed() < CREATED_TTL);
+        if !self.created.contains_key(host_id) && self.created.len() >= CREATED_KEEP {
+            let oldest = self
+                .created
+                .iter()
+                .min_by_key(|(_, c)| c.at)
+                .map(|(h, _)| h.clone());
+            if let Some(oldest) = oldest {
+                self.created.remove(&oldest);
+            }
+        }
+        self.created.insert(
+            host_id.clone(),
+            Created {
+                session: session.clone(),
+                session_id: session_id.to_string(),
+                at: tokio::time::Instant::now(),
+            },
+        );
+    }
+}
+
+/// [`Held`], shared by a source's clones.
+type Rows = Arc<Mutex<Held>>;
 
 /// One machine's craze hub, reached through a client-supplied dial.
 ///
@@ -226,10 +401,48 @@ impl CrazeSource {
         self
     }
 
-    /// The row this source's roster lists under `host_id`, with its craze
-    /// session id.
+    /// This source — its rows, its clocks, the client it says it is — dialling
+    /// through `dial` instead (the module doc's "more than one dial"). Every
+    /// row either one lists or creates is the other's too: a session created
+    /// through the clone is openable through this source at once.
+    pub fn dialling(&self, dial: Arc<dyn CrazeDial>) -> CrazeSource {
+        CrazeSource {
+            dial,
+            ..self.clone()
+        }
+    }
+
+    /// The row this source's roster lists under `host_id` (or a create of its
+    /// own answered with, until the roster lists it), with its craze session
+    /// id.
     pub fn listed(&self, host_id: &str) -> Option<(LaneSession, String)> {
-        lock(&self.rows).get(host_id).cloned()
+        lock(&self.rows).listed(host_id)
+    }
+
+    /// Keep a created session's row, so a lane opened on it at once knows it
+    /// (the module doc's rules: never over the roster's own, never for a
+    /// hostId the roster let go, bounded).
+    fn remember_created(&self, session: &LaneSession, session_id: &str) {
+        lock(&self.rows).remember_created(session, session_id);
+    }
+
+    /// **The created rows this source holds right now** — answered by its
+    /// creates (through any clone), not yet listed by its roster nor let go by
+    /// it, unexpired, at most [`CREATED_KEEP`] — evaluated at the call, hostId
+    /// order. THE one authority on them: a client shows these beside the
+    /// roster rows it follows rather than keeping a copy of its own, so a row
+    /// it shows is always one [`AgentSource::open`] binds (a copy would outlive
+    /// this set's expiry and bound, and survive its tombstones).
+    pub fn created_rows(&self) -> Vec<LaneSession> {
+        lock(&self.rows).created_rows()
+    }
+
+    /// The row this source's ROSTER lists under `host_id` — not a create's.
+    pub fn roster_row(&self, host_id: &str) -> Option<LaneSession> {
+        lock(&self.rows)
+            .roster
+            .get(host_id)
+            .map(|(row, _)| row.clone())
     }
 
     /// Who this source says it is.
@@ -273,7 +486,10 @@ impl CrazeSource {
             .request(method::SESSION_CREATE, params, self.timings.create)
             .await
         {
-            Ok(result) => Attempt::Done(created(result)),
+            Ok(result) => Attempt::Done(created(result).map(|(created, session_id)| {
+                self.remember_created(&created.session, &session_id);
+                created
+            })),
             Err(CallError::Refused(e)) => Attempt::Done(Err(create_error(&e))),
             Err(e) if e.outcome_unknown() => Attempt::Unknown(e.to_string()),
             Err(e) => Attempt::Done(Err(LaneError::Failed(e.to_string()))),
@@ -294,8 +510,9 @@ enum Attempt {
     Unknown(String),
 }
 
-/// `session.create`'s result as the contract's.
-fn created(result: serde_json::Value) -> Result<LaneCreated, LaneError> {
+/// `session.create`'s result as the contract's, with the new session's craze
+/// `sessionId` (what a lane opened on it carries).
+fn created(result: serde_json::Value) -> Result<(LaneCreated, String), LaneError> {
     let r: CreateResult = serde_json::from_value(result).map_err(|e| {
         LaneError::Failed(format!(
             "craze answered session.create with something shed cannot read: {e}"
@@ -306,11 +523,12 @@ fn created(result: serde_json::Value) -> Result<LaneCreated, LaneError> {
             "craze created a session and answered with a row shed cannot read ({e})"
         ))
     })?;
-    Ok(LaneCreated {
+    let created = LaneCreated {
         session: lane_session(&row),
         prompt: LanePromptOutcome::from_wire(r.prompt.as_deref().unwrap_or("none")),
         prompt_error: r.prompt_error,
-    })
+    };
+    Ok((created, row.session_id))
 }
 
 /// A read-only call's failure as the contract's.
@@ -747,11 +965,13 @@ impl RosterPump {
     ) -> Result<(), End> {
         // The rows a lane opened on this source binds to: the whole roster,
         // replaced before the seed is said, so a client that opens a lane on a
-        // row it was just told of finds it.
-        *lock(&self.source.rows) = rows
-            .iter()
-            .map(|r| (r.host_id.clone(), (lane_session(r), r.session_id.clone())))
-            .collect();
+        // row it was just told of finds it — and the created rows it does not
+        // list yet kept ([`Held::seed`]).
+        lock(&self.source.rows).seed(
+            rows.iter()
+                .map(|r| (r.host_id.clone(), (lane_session(r), r.session_id.clone())))
+                .collect(),
+        );
         self.generation += 1;
         let generation = self.generation;
         self.emit(SourceEvent::Reset {
@@ -854,13 +1074,15 @@ impl RosterPump {
         {
             let mut held = lock(&self.source.rows);
             for (row, session) in upserts.iter().zip(&sessions) {
-                held.insert(
+                held.listed_by_roster(&row.host_id);
+                held.roster.insert(
                     row.host_id.clone(),
                     (session.clone(), row.session_id.clone()),
                 );
             }
             for host_id in removes {
-                held.remove(host_id);
+                held.roster.remove(host_id);
+                held.let_go(host_id);
             }
         }
         for session in sessions {

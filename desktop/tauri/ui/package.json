@@ -5,7 +5,7 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "test": "tsc src/lib/newest.ts src/lib/roostBoard.ts src/lib/agentsEmpty.ts src/lib/laneVerbs.ts src/lib/crazeRows.ts --outDir dist-test --target ES2020 --module ES2020 --moduleResolution bundler --strict --removeComments && node --test test/newest.test.mjs test/roostBoard.test.mjs test/agentsEmpty.test.mjs test/laneVerbs.test.mjs test/crazeRows.test.mjs",
+    "test": "tsc src/lib/newest.ts src/lib/roostBoard.ts src/lib/agentsEmpty.ts src/lib/laneVerbs.ts src/lib/crazeRows.ts src/lib/crazeCreate.ts --outDir dist-test --target ES2020 --module ES2020 --moduleResolution bundler --strict --removeComments && node --test test/newest.test.mjs test/roostBoard.test.mjs test/agentsEmpty.test.mjs test/laneVerbs.test.mjs test/crazeRows.test.mjs test/crazeCreate.test.mjs",
     "build": "tsc --noEmit && npm run test && vite build",
     "preview": "vite preview"
   },

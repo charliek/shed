@@ -19,6 +19,7 @@ use super::*;
 use crate::craze::{BoxFut, CrazeProbe, CrazeReach, CrazeTimings};
 use crate::lane::Lanes;
 use crate::machines::ReachOptions;
+use shed_app::roost::LocalSession;
 
 const EPOCH: &str = "0a1b2c3d4e5f";
 const HOST_A: &str = "aaaaaaaaaaaa";
@@ -113,6 +114,9 @@ impl Scripted {
                 .probe
                 .as_ref()
                 .map(|p| Arc::new(ProbeRef(Arc::clone(p))) as Arc<dyn CrazeProbe>),
+            // The scripted dial is ungated (the gate is `SshCrazeDial`'s), so
+            // an explicit action dials the same one.
+            ensure: None,
         }
     }
 
@@ -908,7 +912,7 @@ async fn a_hidden_craze_tab_is_still_killable() {
     wait_for("the tab hidden behind a live feed", || {
         let hidden = lock(&hosts.state)
             .get(&local())
-            .is_some_and(|m| m.fold_plan().hidden.contains(&TAB));
+            .is_some_and(|m| m.fold_plan(&[]).hidden.contains(&TAB));
         let rows = rows_of(&hosts);
         (hidden && rows.len() == 1 && rows[0]["source"] == "craze").then_some(())
     })
@@ -1077,4 +1081,785 @@ async fn a_refreshs_removals_wait_once_not_once_per_host() {
         "the three waits ran together, not one after another (took {took:?})"
     );
     drop(held);
+}
+
+// ---------------------------------------------------------------------------
+// C10: the create sheet's ops and Open in terminal (plan 025 §3.6.6, §3.8)
+// ---------------------------------------------------------------------------
+
+/// The created session's hostId in the C10 cells.
+const HOST_NEW: &str = "cccccccccccc";
+
+/// A create request the scripted hub answers.
+fn create_req(id: &str) -> LaneCreateRequest {
+    crate::craze::create_request(Some("/work/new"), Some("grok"), Some("hello"), Some(id))
+        .expect("a well-formed request")
+}
+
+/// `session.create`'s result for [`HOST_NEW`], its provider session `psid`.
+fn created_result(psid: &str) -> serde_json::Value {
+    json!({"session": roster_row(HOST_NEW, "craze-new", "/work/new",
+                                 json!({"title": "new one", "activity": "working",
+                                        "providerSessionId": psid})),
+           "prompt": "accepted"})
+}
+
+/// The layer with one host's scripted craze, on chosen clocks.
+fn start_scripted_with(
+    config: &ShedConfig,
+    options: &ReachOptions,
+    reaches: Vec<(HostId, Arc<Scripted>)>,
+    timings: CrazeTimings,
+) -> RoostHosts {
+    let map: BTreeMap<HostId, Arc<Scripted>> = reaches.into_iter().collect();
+    RoostHosts::start_with(
+        &tokio::runtime::Handle::current(),
+        config,
+        options.clone(),
+        false,
+        Arc::new(|| {}),
+        CrazeReaches::Fixed(Arc::new(move |id: &HostId| map.get(id).map(|s| s.reach()))),
+        timings,
+    )
+}
+
+/// **A just-created session's transcript opens at once** (plan 025 §3.6.4,
+/// the C9 hand-off): the roster never lists the new session here (its flush
+/// still to come), and `lane.open` on it straight after the create succeeds —
+/// the create's row was folded into this host's state (so the stamp
+/// resolves) AND kept by the source (so the lane's `session()` answers). The
+/// row is listed, live, with its craze facts; the answer names the hostId
+/// and echoes the request id.
+#[tokio::test]
+async fn a_created_session_is_listed_and_openable_at_once() {
+    let craze = Scripted::eager();
+    let hosts = Arc::new(start_scripted(
+        &ShedConfig::default(),
+        &test_options(&[]),
+        vec![(local(), Arc::clone(&craze))],
+    ));
+    let lanes = lanes_over(&hosts);
+    let _roster = craze.roster(json!([row(HOST_A, "ses-a")])).await;
+    wait_for("the roster", || {
+        (craze_rows(&hosts).len() == 1).then_some(())
+    })
+    .await;
+
+    let create = {
+        let hosts = Arc::clone(&hosts);
+        tokio::spawn(async move {
+            hosts
+                .craze_create(LOCALHOST, create_req("shed-req-1"))
+                .await
+        })
+    };
+    let mut hub = craze.next().await;
+    hub.hello(EPOCH, full_hub_capabilities()).await;
+    let req = hub.expect("session.create").await;
+    assert_eq!(req["params"]["requestId"], "shed-req-1");
+    hub.reply(&req, created_result("ses-new")).await;
+    let answer = create.await.unwrap().expect("created");
+    assert_eq!(answer["host_id"], HOST_NEW);
+    assert_eq!(answer["request_id"], "shed-req-1");
+    assert_eq!(answer["prompt"], "accepted");
+    assert_eq!(answer["session"]["slug"], HOST_NEW);
+    assert_eq!(answer["session"]["stale"], false);
+
+    // No roster frame names it — and it is listed, and its lane opens.
+    let listed = craze_rows(&hosts);
+    assert!(
+        listed.iter().any(|r| r["slug"] == HOST_NEW),
+        "listed at once: {listed:?}"
+    );
+    lanes
+        .open(LOCALHOST, "craze", HOST_NEW)
+        .await
+        .expect("the transcript of a just-created session opens at once");
+    assert!(lanes.is_open(LOCALHOST, "craze", HOST_NEW));
+}
+
+/// **Open in terminal** (plan 025 §3.6.6): a roost `tab.open` whose argv is
+/// EXACTLY `attach_argv(<hostId>)` and whose cwd is the row's workspace; the
+/// hub row shows that tab — and still does after a full roost resync (the
+/// opened-tab map, since roost reports the tab unowned); End tab on it only
+/// DETACHES (the session's lane stays); and a tab roost stops listing leaves
+/// the map.
+#[tokio::test]
+async fn open_in_terminal_attaches_a_tab_that_survives_roost_snapshots() {
+    let fake = FakeRoost::start().await;
+    let craze = Scripted::eager();
+    let hosts = Arc::new(start_scripted(
+        &ShedConfig::default(),
+        &test_options(&[(LOCALHOST, fake.socket_path())]),
+        vec![(local(), Arc::clone(&craze))],
+    ));
+    let lanes = lanes_over(&hosts);
+    let _roster = craze.roster(json!([row(HOST_A, "ses-a")])).await;
+    wait_for("the hub row", || {
+        (craze_rows(&hosts).len() == 1).then_some(())
+    })
+    .await;
+    let hub_row = || {
+        craze_rows(&hosts)
+            .into_iter()
+            .find(|r| r["slug"] == HOST_A)
+            .expect("the hub row")
+    };
+    assert!(hub_row().get("tab_id").is_none(), "headless before");
+
+    let opened = hosts
+        .craze_open_terminal(LOCALHOST, HOST_A)
+        .await
+        .expect("Open in terminal");
+    let calls = fake.tab_open_calls();
+    let call = calls.last().expect("a tab.open reached roost");
+    assert_eq!(
+        call["argv"],
+        json!(shed_core::craze::attach_argv(HOST_A).unwrap()),
+        "the argv is attach_argv(<hostId>), verbatim"
+    );
+    assert_eq!(call["cwd"], "/work", "the row's workspace");
+    let tab: i64 = opened["tab_id"].as_str().unwrap().parse().unwrap();
+    assert_eq!(
+        hub_row()["tab_id"],
+        tab.to_string(),
+        "the row shows its tab"
+    );
+    assert!(
+        !rows_of(&hosts).iter().any(|r| r["source"] == "roost"),
+        "the attach tab is not a roost row"
+    );
+
+    // A full roost resync: the tab is unowned there, and the row keeps it.
+    let before = fake.tab_list_calls();
+    fake.end_stream("backend-switch");
+    wait_for("the resync's tab.list", || {
+        (fake.tab_list_calls() > before).then_some(())
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(
+        hub_row()["tab_id"],
+        tab.to_string(),
+        "the row keeps its tab across a roost snapshot"
+    );
+
+    // End tab on it: the tab closes, the session (and its lane) run on.
+    lanes.open(LOCALHOST, "craze", HOST_A).await.expect("lane");
+    hosts
+        .kill(LOCALHOST, &tab.to_string())
+        .await
+        .expect("an attach tab is closable from its row");
+    assert!(!fake.tab_ids().contains(&tab));
+    assert!(hub_row().get("tab_id").is_none(), "headless again");
+    assert!(
+        lanes.is_open(LOCALHOST, "craze", HOST_A),
+        "closing an attach tab only detaches: the lane stays"
+    );
+
+    // A second tab, closed on roost's side: the close's snapshot is past the
+    // tab's fence and does not list it, so the map lets it go.
+    let again = hosts
+        .craze_open_terminal(LOCALHOST, HOST_A)
+        .await
+        .expect("Open in terminal again");
+    let tab2: i64 = again["tab_id"].as_str().unwrap().parse().unwrap();
+    let reach = LocalSession::new(LOCALHOST, fake.socket_path());
+    tab_close(&reach, tab2).await.expect("closed on roost");
+    wait_for("the map to drop the closed tab", || {
+        (!lock(&hosts.state)
+            .get(&local())
+            .is_some_and(|m| m.opened_tabs.contains_key(&tab2)))
+        .then_some(())
+    })
+    .await;
+    assert!(hub_row().get("tab_id").is_none());
+}
+
+/// A session still starting names no provider session yet, so the shared
+/// rule has nothing to match its opened tab on: it attaches by hostId, and
+/// the newest of two such tabs wins.
+#[tokio::test]
+async fn an_opened_tab_on_a_session_with_no_provider_session_attaches_by_host_id() {
+    let fake = FakeRoost::start().await;
+    let craze = Scripted::eager();
+    let hosts = start_scripted(
+        &ShedConfig::default(),
+        &test_options(&[(LOCALHOST, fake.socket_path())]),
+        vec![(local(), Arc::clone(&craze))],
+    );
+    let starting = roster_row(
+        HOST_A,
+        "craze-a",
+        "/work",
+        json!({"title": "starting", "activity": "starting"}),
+    );
+    let _roster = craze.roster(json!([starting])).await;
+    wait_for("the hub row", || {
+        (craze_rows(&hosts).len() == 1).then_some(())
+    })
+    .await;
+    hosts.craze_open_terminal(LOCALHOST, HOST_A).await.unwrap();
+    let newer = hosts.craze_open_terminal(LOCALHOST, HOST_A).await.unwrap();
+    let rows = craze_rows(&hosts);
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(
+        rows[0]["tab_id"], newer["tab_id"],
+        "the newest tab attaches"
+    );
+}
+
+/// **The desktop's use of `attach_argv` refuses a hostId not in craze's form**
+/// before anything reaches roost: the id is spliced into a command line, and a
+/// hub's roster is where it came from.
+#[tokio::test]
+async fn open_in_terminal_refuses_a_host_id_not_in_crazes_form() {
+    let fake = FakeRoost::start().await;
+    let craze = Scripted::eager();
+    let hosts = start_scripted(
+        &ShedConfig::default(),
+        &test_options(&[(LOCALHOST, fake.socket_path())]),
+        vec![(local(), Arc::clone(&craze))],
+    );
+    const ODD: &str = "0123456789AB";
+    let _roster = craze.roster(json!([row(ODD, "ses-odd")])).await;
+    wait_for("the odd row", || {
+        (craze_rows(&hosts).len() == 1).then_some(())
+    })
+    .await;
+    let refused = hosts
+        .craze_open_terminal(LOCALHOST, ODD)
+        .await
+        .expect_err("not twelve lowercase hex digits");
+    assert_eq!(refused.code, "bad_request", "{refused:?}");
+    assert!(fake.tab_open_calls().is_empty(), "nothing reached roost");
+    let unknown = hosts
+        .craze_open_terminal(LOCALHOST, HOST_B)
+        .await
+        .expect_err("a session this host does not list");
+    assert_eq!(unknown.code, "unknown_session");
+}
+
+/// **Create on a DORMANT machine** (plan 025 §3.6.5): the sheet's
+/// `create_options` dials the host's explicit-action dial even though no hub
+/// runs (it Ensures one), and WAKES the source — which probes at once, rather
+/// than at its next dormant probe an hour away, finds the hub and attaches.
+#[tokio::test]
+async fn create_options_on_a_dormant_machine_starts_a_hub_and_wakes_the_source() {
+    let craze = Scripted::attach_only();
+    let hosts = start_scripted_with(
+        &config_with(&["mini3"]),
+        &test_options(&[]),
+        vec![(HostId::Machine("mini3".to_string()), Arc::clone(&craze))],
+        CrazeTimings {
+            dormant: Duration::from_secs(3600),
+            ..timings()
+        },
+    );
+    let probe = craze.probe.as_ref().unwrap();
+    probe.answer(Probe::NoHub);
+    wait_for("dormant", || {
+        (status_of(&hosts, "mini3")?["craze"]["state"] == "dormant").then_some(())
+    })
+    .await;
+    assert_eq!(craze.hook.dials(), 0);
+    let calls = probe.calls.load(Ordering::SeqCst);
+
+    let hosts = Arc::new(hosts);
+    let asking = {
+        let hosts = Arc::clone(&hosts);
+        tokio::spawn(async move { hosts.craze_create_options("mini3").await })
+    };
+    let mut hub = craze.next().await;
+    hub.hello(EPOCH, full_hub_capabilities()).await;
+    let req = hub.expect("sessions.createOptions").await;
+    hub.reply(
+        &req,
+        json!({"providers": [{"id": "grok", "label": "grok", "state": "ready"}],
+               "defaultProvider": "grok", "recentDirs": [{"dir": "/work"}]}),
+    )
+    .await;
+    let options = asking
+        .await
+        .unwrap()
+        .expect("options from a dormant machine");
+    assert_eq!(options["options"]["providers"][0]["id"], "grok");
+    assert_eq!(options["options"]["recent_dirs"], json!(["/work"]));
+
+    // Woken: the source probes again now, not in an hour.
+    wait_for("the woken probe", || {
+        (probe.calls.load(Ordering::SeqCst) > calls).then_some(())
+    })
+    .await;
+    probe.answer(Probe::Hub);
+    let _roster = craze.roster(json!([row(HOST_A, "ses-a")])).await;
+    wait_for("live", || {
+        (status_of(&hosts, "mini3")?["craze"]["state"] == "live").then_some(())
+    })
+    .await;
+}
+
+/// **Too old for the sheet** (plan 025 §3.8): a live hub whose `hello` lacks
+/// `createOptions` (or `sessionCreate`) is refused `too_old` — "update craze on
+/// this machine" — without a dial; so is a machine whose probe read v0.0.1.
+#[tokio::test]
+async fn a_hub_too_old_to_create_is_refused_without_a_dial() {
+    let craze = Scripted::eager();
+    let hosts = start_scripted(
+        &ShedConfig::default(),
+        &test_options(&[]),
+        vec![(local(), Arc::clone(&craze))],
+    );
+    let mut hub = craze.next().await;
+    let mut caps = full_hub_capabilities();
+    caps["createOptions"] = json!(false);
+    caps["sessionCreate"] = json!(false);
+    hub.hello(EPOCH, caps).await;
+    hub.subscribed("sub-1", EPOCH, json!([])).await;
+    wait_for("live", || {
+        (status_of(&hosts, LOCALHOST)?["craze"]["state"] == "live").then_some(())
+    })
+    .await;
+    let dials = craze.hook.dials();
+    let e = hosts.craze_create_options(LOCALHOST).await.unwrap_err();
+    assert_eq!(e.code, "too_old", "{e:?}");
+    assert!(
+        e.message.starts_with("update craze on this machine"),
+        "{e:?}"
+    );
+    let e = hosts
+        .craze_create(LOCALHOST, create_req("shed-req-old"))
+        .await
+        .unwrap_err();
+    assert_eq!(e.code, "too_old", "{e:?}");
+    assert_eq!(craze.hook.dials(), dials, "refused before any dial");
+}
+
+/// **An opened tab attaches to ITS session** even when another row claims the
+/// same provider session (a re-hosted session briefly listed twice — or a fake
+/// agent that reuses one id): the app ran `craze attach --session <hostId>`,
+/// so it attaches by hostId rather than letting the shared rule's tie-break
+/// hand it to the newer row.
+#[tokio::test]
+async fn an_opened_tab_attaches_to_its_own_row_when_a_provider_session_is_shared() {
+    let fake = FakeRoost::start().await;
+    let craze = Scripted::eager();
+    let hosts = start_scripted(
+        &ShedConfig::default(),
+        &test_options(&[(LOCALHOST, fake.socket_path())]),
+        vec![(local(), Arc::clone(&craze))],
+    );
+    let older = row(HOST_A, "ses-shared");
+    let mut newer = row(HOST_B, "ses-shared");
+    newer["row"]["since"] = json!("2026-06-01T00:00:00Z");
+    let _roster = craze.roster(json!([older, newer])).await;
+    wait_for("both rows", || {
+        (craze_rows(&hosts).len() == 2).then_some(())
+    })
+    .await;
+    let opened = hosts.craze_open_terminal(LOCALHOST, HOST_A).await.unwrap();
+    let rows = craze_rows(&hosts);
+    let a = rows.iter().find(|r| r["slug"] == HOST_A).unwrap();
+    let b = rows.iter().find(|r| r["slug"] == HOST_B).unwrap();
+    assert_eq!(a["tab_id"], opened["tab_id"], "the tab is A's: {rows:?}");
+    assert!(b.get("tab_id").is_none(), "never the newer row's: {rows:?}");
+}
+
+/// A craze TUI's own tab and an Open-in-terminal tab on the same session: the
+/// shared rule's tie-break decides — the NEWER tab attaches, the other folds
+/// silently (neither is a roost row).
+#[tokio::test]
+async fn a_tui_tab_and_an_attach_tab_of_one_session_newest_attaches() {
+    let fake = FakeRoost::start().await;
+    fake.set_tab_axes(
+        TAB,
+        "working",
+        Some(ownership("craze", "ses-a", "", 1_700_000_100)),
+        false,
+    );
+    let craze = Scripted::eager();
+    let hosts = start_scripted(
+        &ShedConfig::default(),
+        &test_options(&[(LOCALHOST, fake.socket_path())]),
+        vec![(local(), Arc::clone(&craze))],
+    );
+    let _roster = craze.roster(json!([row(HOST_A, "ses-a")])).await;
+    wait_for("the TUI tab folded into the row", || {
+        let rows = rows_of(&hosts);
+        let tab = rows
+            .first()
+            .and_then(|r| r["tab_id"].as_str()?.parse::<i64>().ok());
+        (rows.len() == 1 && tab == Some(TAB)).then_some(())
+    })
+    .await;
+    let opened = hosts.craze_open_terminal(LOCALHOST, HOST_A).await.unwrap();
+    let rows = rows_of(&hosts);
+    assert_eq!(rows.len(), 1, "one row, no roost row: {rows:?}");
+    assert_eq!(
+        rows[0]["tab_id"], opened["tab_id"],
+        "the newer (attach) tab"
+    );
+}
+
+/// A snapshot's identity, as [`OpenedTab::retained`] reads it.
+fn snapshot_of(revision: Option<u64>, daemon: &str) -> RoostInventory {
+    let mut at = RoostInventory::default();
+    at.revision = revision;
+    at.daemon_session_id = daemon.to_string();
+    at.started_at = "2026-10-06T00:00:00Z".to_string();
+    at
+}
+
+/// The fence of `daemon` at `revision`.
+fn fence_of(revision: u64, daemon: &str) -> TabFence {
+    TabFence {
+        revision,
+        daemon_session_id: daemon.to_string(),
+        started_at: "2026-10-06T00:00:00Z".to_string(),
+    }
+}
+
+/// **An opened tab is judged by its FENCE, within its daemon** (C10 review and
+/// confirmation): a snapshot that lists it keeps it; one of the SAME daemon
+/// taken before the open (its revision below the fence) is silent about it
+/// and says nothing; any other of that daemon that does not list it says it
+/// is gone; and a snapshot from ANOTHER incarnation — whose revisions restart
+/// from 1 — is judged by presence alone.
+#[test]
+fn an_opened_tab_is_judged_by_its_fence_within_its_daemon() {
+    let now = Instant::now();
+    let fenced = OpenedTab {
+        host_id: HOST_A.to_string(),
+        fence: Some(fence_of(100, "d1")),
+        opened: now,
+    };
+    assert!(
+        fenced.retained(true, &snapshot_of(Some(3), "d2"), now),
+        "listed: kept"
+    );
+    assert!(
+        fenced.retained(false, &snapshot_of(Some(99), "d1"), now),
+        "the same daemon, before the open"
+    );
+    assert!(
+        !fenced.retained(false, &snapshot_of(Some(100), "d1"), now),
+        "the same daemon, at the fence, unlisted: gone"
+    );
+    assert!(!fenced.retained(false, &snapshot_of(Some(150), "d1"), now));
+    assert!(
+        !fenced.retained(false, &snapshot_of(Some(2), "d2"), now),
+        "a restarted daemon's revision 2 is not 'before' revision 100: absent is gone"
+    );
+    assert!(
+        !fenced.retained(false, &snapshot_of(None, "d1"), now),
+        "no revision: at its word"
+    );
+}
+
+/// **An UNFENCED tab gets a grace** (C10 confirmation): with no fence a
+/// snapshot queued before the open cannot be told from one after a close, so
+/// for [`UNFENCED_GRACE`] no snapshot removes it; after it, presence decides.
+#[test]
+fn an_unfenced_tab_outlasts_snapshots_for_its_grace_then_presence_decides() {
+    let opened = Instant::now();
+    let unfenced = OpenedTab {
+        host_id: HOST_A.to_string(),
+        fence: None,
+        opened,
+    };
+    let at = snapshot_of(Some(7), "d1");
+    assert!(
+        unfenced.retained(false, &at, opened),
+        "within the grace: kept"
+    );
+    assert!(unfenced.retained(
+        false,
+        &at,
+        opened + UNFENCED_GRACE - Duration::from_millis(1)
+    ));
+    assert!(
+        !unfenced.retained(false, &at, opened + UNFENCED_GRACE),
+        "past the grace, absent: gone"
+    );
+    assert!(
+        unfenced.retained(true, &at, opened + UNFENCED_GRACE * 10),
+        "listed: kept"
+    );
+}
+
+/// **A roost restart does not keep a closed tab mapped** (C10 confirmation):
+/// a tab opened at a fence well past 1; roost restarts (a new daemon, its
+/// revision back to 1, tab ids kept); the tab closes under the new daemon,
+/// whose snapshot's small revision is NOT "before the open" — it is another
+/// incarnation, so absence removes the tab.
+#[tokio::test]
+async fn a_restarted_roost_judges_an_opened_tab_by_presence() {
+    let fake = FakeRoost::start().await;
+    for _ in 0..5 {
+        fake.bump_revision();
+    }
+    let craze = Scripted::eager();
+    let hosts = start_scripted(
+        &ShedConfig::default(),
+        &test_options(&[(LOCALHOST, fake.socket_path())]),
+        vec![(local(), Arc::clone(&craze))],
+    );
+    let _roster = craze.roster(json!([row(HOST_A, "ses-a")])).await;
+    wait_for("the hub row", || {
+        (craze_rows(&hosts).len() == 1).then_some(())
+    })
+    .await;
+    let opened = hosts.craze_open_terminal(LOCALHOST, HOST_A).await.unwrap();
+    let tab: i64 = opened["tab_id"].as_str().unwrap().parse().unwrap();
+    let fence = lock(&hosts.state)
+        .get(&local())
+        .and_then(|m| m.opened_tabs.get(&tab).and_then(|o| o.fence.clone()))
+        .expect("fenced");
+    assert!(
+        fence.revision > 3,
+        "a fence past a restarted daemon's first revisions"
+    );
+
+    let before = fake.session_id();
+    fake.restart();
+    wait_for("the watcher on the new daemon", || {
+        let resynced = fake.session_id() != before && fake.stream_count() > 0;
+        resynced.then_some(())
+    })
+    .await;
+    // Still listed by the new daemon (tab ids persist): kept.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(craze_rows(&hosts)[0]["tab_id"], tab.to_string());
+
+    let reach = LocalSession::new(LOCALHOST, fake.socket_path());
+    tab_close(&reach, tab)
+        .await
+        .expect("closed under the new daemon");
+    assert!(
+        fake.revision() < fence.revision,
+        "the new daemon counts below the fence"
+    );
+    wait_for("the closed tab to leave the map", || {
+        (!lock(&hosts.state)
+            .get(&local())
+            .is_some_and(|m| m.opened_tabs.contains_key(&tab)))
+        .then_some(())
+    })
+    .await;
+    assert!(craze_rows(&hosts)[0].get("tab_id").is_none());
+}
+
+/// **A tab closed before any snapshot listed it leaves the map** (C10
+/// review): a fresh attach tab is a hidden one — its open publishes no
+/// snapshot — and it is closed right away; the close's snapshot (roost
+/// publishes one for a tab the watcher knew) is past its fence, and the row
+/// is headless again, for good.
+#[tokio::test]
+async fn a_tab_closed_before_any_snapshot_listed_it_leaves_the_map() {
+    let fake = FakeRoost::start().await;
+    let craze = Scripted::eager();
+    let hosts = start_scripted(
+        &ShedConfig::default(),
+        &test_options(&[(LOCALHOST, fake.socket_path())]),
+        vec![(local(), Arc::clone(&craze))],
+    );
+    let _roster = craze.roster(json!([row(HOST_A, "ses-a")])).await;
+    wait_for("the hub row", || {
+        (craze_rows(&hosts).len() == 1).then_some(())
+    })
+    .await;
+    let lists = fake.tab_list_calls();
+    let opened = hosts.craze_open_terminal(LOCALHOST, HOST_A).await.unwrap();
+    let tab: i64 = opened["tab_id"].as_str().unwrap().parse().unwrap();
+    let fence = lock(&hosts.state)
+        .get(&local())
+        .and_then(|m| m.opened_tabs.get(&tab).and_then(|o| o.fence.clone()));
+    assert!(fence.is_some(), "the open read its fence");
+    assert_eq!(
+        fake.tab_list_calls(),
+        lists + 1,
+        "the one tab.list is the fence read: no resync listed the tab"
+    );
+    let reach = LocalSession::new(LOCALHOST, fake.socket_path());
+    tab_close(&reach, tab).await.expect("closed on roost");
+    wait_for("the closed tab to leave the map", || {
+        (!lock(&hosts.state)
+            .get(&local())
+            .is_some_and(|m| m.opened_tabs.contains_key(&tab)))
+        .then_some(())
+    })
+    .await;
+    let row = craze_rows(&hosts).pop().unwrap();
+    assert!(row.get("tab_id").is_none(), "headless again: {row}");
+}
+
+/// **While the hub feed is down, an attach tab stays on its row** (C10
+/// review): the opened-tab map is this app's own knowledge, so the retained
+/// (stale) row keeps showing its still-open tab — and so offers End tab, not a
+/// second Open in terminal — while D4 still absorbs nothing by roost
+/// ownership.
+#[tokio::test]
+async fn an_attach_tab_stays_on_its_row_while_the_feed_is_down() {
+    let fake = FakeRoost::start().await;
+    fake.set_tab_axes(
+        TAB,
+        "working",
+        Some(ownership("craze", "ses-b", "", 1_700_000_100)),
+        false,
+    );
+    let craze = Scripted::eager();
+    let hosts = start_scripted(
+        &ShedConfig::default(),
+        &test_options(&[(LOCALHOST, fake.socket_path())]),
+        vec![(local(), Arc::clone(&craze))],
+    );
+    let hub = craze
+        .roster(json!([row(HOST_A, "ses-a"), row(HOST_B, "ses-b")]))
+        .await;
+    wait_for("both hub rows, B absorbing its TUI tab", || {
+        let rows = rows_of(&hosts);
+        (rows.len() == 2 && rows.iter().all(|r| r["source"] == "craze")).then_some(())
+    })
+    .await;
+    let opened = hosts.craze_open_terminal(LOCALHOST, HOST_A).await.unwrap();
+
+    craze.hook.hold_dials();
+    hub.close().await;
+    wait_for("the feed down", || {
+        (status_of(&hosts, LOCALHOST)?["craze"]["state"] == "offline").then_some(())
+    })
+    .await;
+    let rows = rows_of(&hosts);
+    let a = rows
+        .iter()
+        .find(|r| r["source"] == "craze" && r["slug"] == HOST_A)
+        .expect("A's retained row");
+    assert_eq!(a["stale"], true);
+    assert_eq!(
+        a["tab_id"], opened["tab_id"],
+        "the attach tab stays on its stale row: {rows:?}"
+    );
+    // D4 unchanged: B's roost-owned TUI tab is roost's row again, not B's.
+    assert!(
+        rows.iter().any(|r| r["source"] == "roost"
+            && r["slug"].as_str().and_then(|t| t.parse::<i64>().ok()) == Some(TAB)),
+        "{rows:?}"
+    );
+    let b = rows
+        .iter()
+        .find(|r| r["source"] == "craze" && r["slug"] == HOST_B)
+        .unwrap();
+    assert!(b.get("tab_id").is_none(), "{b}");
+}
+
+/// One scripted create, answered with `result`, on `craze`'s next connection.
+async fn create_answering(
+    hosts: &Arc<RoostHosts>,
+    craze: &Scripted,
+    request_id: &str,
+    result: serde_json::Value,
+) -> Result<Value, CrazeFailure> {
+    let create = {
+        let hosts = Arc::clone(hosts);
+        let request_id = request_id.to_string();
+        tokio::spawn(async move { hosts.craze_create(LOCALHOST, create_req(&request_id)).await })
+    };
+    let mut hub = craze.next().await;
+    hub.hello(EPOCH, full_hub_capabilities()).await;
+    let req = hub.expect("session.create").await;
+    hub.reply(&req, result).await;
+    create.await.unwrap()
+}
+
+/// **The source is the one authority on created rows** (C10 confirmation): a
+/// create craze answered for a session a roster has already let go — a
+/// REPLAY of its first create's answer, within craze's ten-minute window — is
+/// refused by the source, and so the desktop does not list it either (it keeps
+/// no created rows of its own): the answer says `ended`, nothing is listed, and
+/// no lane opens on it.
+#[tokio::test]
+async fn a_replayed_create_of_an_ended_session_is_not_listed() {
+    let craze = Scripted::eager();
+    let hosts = Arc::new(start_scripted(
+        &ShedConfig::default(),
+        &test_options(&[]),
+        vec![(local(), Arc::clone(&craze))],
+    ));
+    let lanes = lanes_over(&hosts);
+    let mut roster = craze.roster(json!([row(HOST_A, "ses-a")])).await;
+    wait_for("the roster", || {
+        (craze_rows(&hosts).len() == 1).then_some(())
+    })
+    .await;
+
+    // The first create: listed at once (the source's created row).
+    let first = create_answering(&hosts, &craze, "shed-replay-1", created_result("ses-new"))
+        .await
+        .expect("created");
+    assert_eq!(first["ended"], false);
+    assert!(craze_rows(&hosts).iter().any(|r| r["slug"] == HOST_NEW));
+
+    // The roster lists it, then removes it: the session ended.
+    roster
+        .roster("sub-1", EPOCH, json!([row(HOST_NEW, "ses-new")]), json!([]))
+        .await;
+    roster
+        .roster("sub-1", EPOCH, json!([]), json!([HOST_NEW]))
+        .await;
+    wait_for("the ended session gone", || {
+        (!craze_rows(&hosts).iter().any(|r| r["slug"] == HOST_NEW)).then_some(())
+    })
+    .await;
+
+    // craze replays the first create's answer under the same request id.
+    let replay = create_answering(&hosts, &craze, "shed-replay-1", created_result("ses-new"))
+        .await
+        .expect("craze answered");
+    assert_eq!(replay["ended"], true, "{replay}");
+    assert!(
+        !craze_rows(&hosts).iter().any(|r| r["slug"] == HOST_NEW),
+        "a replay never resurrects an ended session's row"
+    );
+    let refused = lanes.open(LOCALHOST, "craze", HOST_NEW).await;
+    assert!(refused.is_err(), "no lane on it: {refused:?}");
+}
+
+/// **The desktop's created rows ARE the source's** (C10 confirmation): listed
+/// at read time from [`shed_craze::CrazeSource::created_rows`], so they follow
+/// the source's bound — 64, the oldest out first — with no roster frame and
+/// no `Ready` in between.
+#[tokio::test]
+async fn the_desktops_created_rows_follow_the_sources_bound() {
+    let craze = Scripted::eager();
+    let hosts = Arc::new(start_scripted(
+        &ShedConfig::default(),
+        &test_options(&[]),
+        vec![(local(), Arc::clone(&craze))],
+    ));
+    let _roster = craze.roster(json!([])).await;
+    wait_for("live", || {
+        (status_of(&hosts, LOCALHOST)?["craze"]["state"] == "live").then_some(())
+    })
+    .await;
+    let keep = shed_craze::source::CREATED_KEEP;
+    for i in 0..=keep {
+        let host_id = format!("{i:012x}");
+        let result = json!({"session": roster_row(&host_id, &format!("s-{i}"), "/work/new",
+                                                  json!({"activity": "idle"})),
+                            "prompt": "none"});
+        create_answering(&hosts, &craze, &format!("shed-bound-{i}"), result)
+            .await
+            .expect("created");
+    }
+    let rows = craze_rows(&hosts);
+    assert_eq!(rows.len(), keep, "the source's bound, read at listing time");
+    assert!(
+        !rows.iter().any(|r| r["slug"] == format!("{:012x}", 0)),
+        "the oldest went first"
+    );
+    assert_eq!(
+        status_of(&hosts, LOCALHOST).unwrap()["sessions"],
+        json!(keep),
+        "the status count agrees"
+    );
 }

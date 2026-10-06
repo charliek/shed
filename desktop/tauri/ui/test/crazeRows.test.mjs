@@ -8,7 +8,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { crazeDoingLine, crazeMachineNote, killTarget, permissionLine } from "../dist-test/crazeRows.js";
+import { canOpenTerminal, crazeDoingLine, crazeMachineNote, killTarget, permissionLine } from "../dist-test/crazeRows.js";
 
 const crazeRow = (extra) => ({
   source: "craze",
@@ -73,4 +73,12 @@ test("the permission line says what bypass means", () => {
   assert.equal(permissionLine("careful"), "permissions: careful");
   assert.equal(permissionLine(""), null);
   assert.equal(permissionLine(null), null);
+});
+
+test("Open in terminal: a headless craze row only", () => {
+  assert.equal(canOpenTerminal(crazeRow({})), true);
+  assert.equal(canOpenTerminal(crazeRow({ tab_id: "" })), true);
+  assert.equal(canOpenTerminal(crazeRow({ tab_id: "7" })), false, "a tab: End tab instead");
+  assert.equal(canOpenTerminal(crazeRow({ machine: null })), false);
+  assert.equal(canOpenTerminal({ source: "roost", machine: "m", host: "h", shed: "", slug: "5" }), false);
 });

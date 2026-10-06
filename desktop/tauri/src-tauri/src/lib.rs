@@ -634,6 +634,66 @@ fn lane_close(
     lanes.close(&machine, &kind, &session_id)
 }
 
+// -- craze: the create sheet and Open in terminal (plan 025 §3.6.6, §3.8) --
+//
+// The frontend twins of the `craze.*` socket ops — the same [`RoostHosts`]
+// methods, so what the harness proves about a create is what the sheet runs.
+// A refusal crosses as `"<code>: <message>"` (the `lane_*` commands' rule),
+// which `bridge.ts` splits back so the sheet can tell `outcome_unknown` (keep
+// the request id) from a definite refusal (mint a new one).
+
+/// `craze_create_options` — what a create can start on `machine` (D8: read
+/// afresh on every sheet open). May start a hub on a dormant machine.
+#[tauri::command]
+async fn craze_create_options(
+    machines: tauri::State<'_, Arc<roost_hosts::RoostHosts>>,
+    machine: String,
+) -> Result<serde_json::Value, String> {
+    machines
+        .craze_create_options(&machine)
+        .await
+        .map_err(|f| f.command_string())
+}
+
+/// `craze_create` — a new craze session; `request_id` is the sheet's own
+/// (reused only while the last outcome is unknown). Read through
+/// [`craze::create_request`], the socket door's one reading.
+#[tauri::command]
+async fn craze_create(
+    machines: tauri::State<'_, Arc<roost_hosts::RoostHosts>>,
+    machine: String,
+    cwd: Option<String>,
+    provider: Option<String>,
+    prompt: Option<String>,
+    request_id: Option<String>,
+) -> Result<serde_json::Value, String> {
+    let request = craze::create_request(
+        cwd.as_deref(),
+        provider.as_deref(),
+        prompt.as_deref(),
+        request_id.as_deref(),
+    )
+    .map_err(|f| f.command_string())?;
+    machines
+        .craze_create(&machine, request)
+        .await
+        .map_err(|f| f.command_string())
+}
+
+/// `craze_open_terminal` — Open in terminal on a headless craze row: a roost
+/// tab running `craze attach` on it.
+#[tauri::command]
+async fn craze_open_terminal(
+    machines: tauri::State<'_, Arc<roost_hosts::RoostHosts>>,
+    machine: String,
+    session_id: String,
+) -> Result<serde_json::Value, String> {
+    machines
+        .craze_open_terminal(&machine, &session_id)
+        .await
+        .map_err(|f| f.command_string())
+}
+
 /// `add_machine` — the dialog's path into [`machines::add_from_json`].
 #[tauri::command]
 fn add_machine(
@@ -1234,6 +1294,9 @@ pub fn run() {
             lane_answer,
             lane_close,
             lane_stop,
+            craze_create_options,
+            craze_create,
+            craze_open_terminal,
             machines_list,
             add_machine,
             open_terminal,
