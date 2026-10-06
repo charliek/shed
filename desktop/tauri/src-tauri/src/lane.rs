@@ -31,8 +31,36 @@
 //! the whole point of plan 017: everything below the match — the pump, the view,
 //! the tunnel bookkeeping, the six IPC verbs — is written against the contract,
 //! so the next adapter is a `match` arm rather than a refactor. (gx held this
-//! second slot from plan 017 until plan 025 C1 retired it, shed#390; craze,
-//! plan 025 C7+, is next.)
+//! second slot from plan 017 until plan 025 C1 retired it, shed#390; craze
+//! holds it since plan 025 C9.)
+//!
+//! # Two kinds of stamp: roost's and craze's
+//!
+//! An opencode row's lane is stamped by ROOST — its tab reported a server —
+//! and is reached by that URL, over a forward when the machine is remote. A
+//! craze row's lane is stamped by the machine's craze SOURCE: the row is the
+//! hub's (`agent_lane: {kind: "craze", session_id: <hostId>}`,
+//! [`crate::roost_hosts::RoostHosts::craze_lanes`]), and [`Lanes::open`]
+//! branches on the kind BEFORE any reach or forward: a craze stamp resolves the
+//! host's [`shed_craze::CrazeSource`] and calls `source.open(hostId)`, which
+//! binds with no I/O; the lane reaches its session through the hub's splice on
+//! connections of its own. Everything below that branch — the pump, the view,
+//! `lane-event`, the `lane.*` verbs — is the same for both.
+//!
+//! **The registry key carries the kind**, `(machine, kind, session_id)`, so a
+//! craze hostId and an opencode session id live in separate namespaces, and
+//! every `lane.*` op takes `kind` (the row's `agent_lane.kind`). **Eviction is
+//! split the same way**: [`Lanes::reconcile`] judges only the roost-stamped
+//! entries against a roost snapshot — a craze lane is not in it and must not
+//! be torn down by it — and [`Lanes::evict_craze`] retires the craze entries
+//! whose rows the source no longer holds (a `Removed`, a reseed that dropped
+//! them, the hub gone, the host removed, its tab ended). A craze entry is
+//! filed under the GENERATION of the source it was opened through, and an
+//! eviction names its generation: the news of a source that has since been
+//! replaced (the host removed and registered again) never ends a lane opened
+//! through the new one. An open re-reads the host's current generation after
+//! it declares itself, so a removal that published its eviction before the
+//! declaration — with nothing yet to cancel — still stops the open.
 //!
 //! Since plan 025 split the contract (§3.2), the arm builds the agent's SOURCE
 //! and opens the session-scoped lane through it — `OpencodeSource::new(url,
@@ -172,13 +200,14 @@ use shed_core::lane::{
     AgentLane, AgentSource, LaneAnswer, LaneDecision, LaneError, LaneEvent, LaneSession, SendMode,
 };
 use shed_core::roost::AgentLaneStamp;
+use shed_craze::CrazeSource;
 use shed_opencode::OpencodeSource;
 
 use crate::machines::ReachKind;
 use crate::roost_hosts::RoostHosts;
 
 /// The Tauri event every lane frame reaches the UI on:
-/// `{machine, session_id, event}`, `event` being a serialized
+/// `{machine, kind, session_id, event}`, `event` being a serialized
 /// [`LaneEvent`].
 ///
 /// Kebab-case like every other event this app emits (`refresh`,
@@ -215,8 +244,31 @@ fn down_is_final(reason: &str) -> bool {
         || reason.starts_with("start_failed:")
 }
 
-/// `(machine, agent session id)` — one open lane.
-type Key = (String, String);
+/// `(machine, kind, agent session id)` — one open lane. The kind is part of
+/// the key (plan 025 §3.6.4): a craze hostId and an opencode session id are
+/// different namespaces, and one must never answer for the other.
+type Key = (String, String, String);
+
+/// The one place a [`Key`] is built — every op addresses its lane through it.
+fn key(machine: &str, kind: &str, session_id: &str) -> Key {
+    (
+        machine.to_string(),
+        kind.to_string(),
+        session_id.to_string(),
+    )
+}
+
+/// The craze adapter's kind token (`shed_craze::KIND`) — a craze row's
+/// `agent_lane.kind`.
+pub(crate) const CRAZE: &str = shed_craze::KIND;
+
+/// Whether `kind`'s lanes are stamped by ROOST (a tab that reported a server)
+/// rather than listed by a machine-level source — the entries
+/// [`Lanes::reconcile`] judges against a roost snapshot. craze's are the
+/// source's, and [`Lanes::evict_craze`] is theirs.
+fn roost_stamped(kind: &str) -> bool {
+    kind != CRAZE
+}
 
 /// `(machine, remote port)` — one shared `ssh -N -L` tunnel.
 type ForwardKey = (String, u16);
@@ -238,7 +290,7 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 /// human message are the same fact twice, and the message is the copy that rots
 /// silently: a second adapter that forgot it would go on claiming this build
 /// speaks only one.
-const LANE_KINDS: [&str; 1] = ["opencode"];
+const LANE_KINDS: [&str; 2] = ["opencode", CRAZE];
 
 /// **Test-only seam:** how many times this module has actually constructed a
 /// concrete `AgentLane` adapter (today, the one `OpencodeSource::new(…).open(…)`
@@ -361,6 +413,19 @@ pub trait LaneMachines: Send + Sync {
     /// How this machine is reached — the lane's transport choice.
     fn reach_kind(&self, machine: &str) -> Result<ReachKind, String>;
 
+    /// The craze lanes this machine's craze source lists: hostId → its stamp
+    /// (`kind: "craze"`, no URL). Empty for a machine with no craze source.
+    fn craze_lanes(&self, _machine: &str) -> BTreeMap<String, AgentLaneStamp> {
+        BTreeMap::new()
+    }
+
+    /// This machine's craze source — what a craze lane opens through — and
+    /// the generation it was started under, which the lane is filed with
+    /// ([`Lanes::evict_craze`]).
+    fn craze_source(&self, machine: &str) -> Result<(CrazeSource, u64), String> {
+        Err(format!("{machine} has no craze source"))
+    }
+
     /// RESERVE (do not start) a tunnel to `remote_port` on `entry`'s machine.
     /// [`MachineForward::ensure`] is what starts it.
     fn forward(
@@ -381,6 +446,14 @@ impl LaneMachines for RoostHosts {
 
     fn reach_kind(&self, machine: &str) -> Result<ReachKind, String> {
         RoostHosts::reach_kind(self, machine)
+    }
+
+    fn craze_lanes(&self, machine: &str) -> BTreeMap<String, AgentLaneStamp> {
+        RoostHosts::craze_lanes(self, machine)
+    }
+
+    fn craze_source(&self, machine: &str) -> Result<(CrazeSource, u64), String> {
+        RoostHosts::craze_source(self, machine)
     }
 }
 
@@ -502,6 +575,9 @@ struct Pending {
     /// the same lock acquisition that inserts the entry, so the decision cannot
     /// be raced.
     cancelled: bool,
+    /// The craze source generation this open is building through, or `None`
+    /// for a roost-stamped lane — the same fence [`LaneEntry::craze_gen`] is.
+    craze_gen: Option<u64>,
 }
 
 /// Removes the [`Pending`] declaration on every exit path, committed or not.
@@ -586,6 +662,12 @@ struct LaneEntry {
     /// The supervision loop. Shares nothing with this struct but the view, so
     /// there is no reference cycle and dropping the entry really does end it.
     pump: tokio::task::JoinHandle<()>,
+    /// For a craze lane, the generation of the craze source it was opened
+    /// through; `None` for a roost-stamped one. [`Lanes::evict_craze`] ends
+    /// only the lanes of the generation it names, so a stale source's eviction
+    /// — published after a remove and a re-registration of the same host —
+    /// never ends a lane opened through the new one (C9 review).
+    craze_gen: Option<u64>,
 }
 
 impl LaneEntry {
@@ -633,7 +715,7 @@ type Gates = HashMap<Key, Arc<tokio::sync::Mutex<()>>>;
 /// A closure rather than the [`AppHandle`] itself so the ownership rules below
 /// can be tested without a Tauri app; production builds one that emits
 /// [`LANE_EVENT`] and nothing else does.
-type EventSink = Arc<dyn Fn(&str, &str, &LaneEvent) + Send + Sync>;
+type EventSink = Arc<dyn Fn(&str, &str, &str, &LaneEvent) + Send + Sync>;
 
 /// Every open lane in this app, and the tunnels under them.
 pub struct Lanes {
@@ -656,18 +738,45 @@ pub struct Lanes {
     /// and a map that only grows is a leak reachable by anyone who can name a
     /// machine and a session.
     gates: Arc<Mutex<Gates>>,
+    /// [`crate::roost_hosts::TestGap`], armed by a test: `open`'s gap between
+    /// resolving a craze source and declaring the open.
+    #[cfg(test)]
+    pub(crate) open_gap: Mutex<Option<crate::roost_hosts::TestGap>>,
 }
 
 impl Lanes {
     pub fn new(handle: tokio::runtime::Handle, app: AppHandle, machines: Arc<RoostHosts>) -> Lanes {
-        let sink: EventSink =
-            Arc::new(move |machine: &str, session_id: &str, event: &LaneEvent| {
+        let sink: EventSink = Arc::new(
+            move |machine: &str, kind: &str, session_id: &str, event: &LaneEvent| {
                 let _ = app.emit(
                     LANE_EVENT,
-                    json!({ "machine": machine, "session_id": session_id, "event": event }),
+                    json!({ "machine": machine, "kind": kind, "session_id": session_id, "event": event }),
                 );
-            });
+            },
+        );
         Lanes::with_sink(handle, sink, machines)
+    }
+
+    /// A layer whose frames go nowhere — for the roost-host layer's tests,
+    /// which drive the craze half through a real [`RoostHosts`].
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        handle: tokio::runtime::Handle,
+        machines: Arc<dyn LaneMachines>,
+    ) -> Lanes {
+        Lanes::with_sink(
+            handle,
+            Arc::new(|_: &str, _: &str, _: &str, _: &LaneEvent| {}),
+            machines,
+        )
+    }
+
+    /// Whether a lane is committed under this key — the registry's own state.
+    #[cfg(test)]
+    pub(crate) fn is_open(&self, machine: &str, kind: &str, session_id: &str) -> bool {
+        lock(&self.inner)
+            .entries
+            .contains_key(&key(machine, kind, session_id))
     }
 
     fn with_sink(
@@ -681,6 +790,8 @@ impl Lanes {
             machines,
             inner: Arc::new(Mutex::new(Inner::default())),
             gates: Arc::new(Mutex::new(Gates::new())),
+            #[cfg(test)]
+            open_gap: Mutex::new(None),
         }
     }
 
@@ -702,15 +813,20 @@ impl Lanes {
     /// re-checks whether the lane is still wanted. There is no path on which it
     /// leaves a tunnel behind, and none on which it inserts an entry for a key
     /// that was closed or evicted while it was in flight.
-    pub async fn open(&self, machine: &str, session_id: &str) -> Result<Value, LaneFailure> {
-        let key = (machine.to_string(), session_id.to_string());
+    pub async fn open(
+        &self,
+        machine: &str,
+        kind: &str,
+        session_id: &str,
+    ) -> Result<Value, LaneFailure> {
+        let key = key(machine, kind, session_id);
         // The row is resolved BEFORE a gate is registered for the key. Both IPC
         // doors take `machine` and `session_id` as free strings, so a call that
         // names nothing real must not be able to make this app remember it:
         // `lane.open` with junk (or with the session ids of a machine whose tabs
         // churn) used to mint a gate per call and keep it for the life of the
         // process.
-        self.lane_stamp(machine, session_id)?;
+        self.lane_stamp(machine, kind, session_id)?;
         let gate = self.gate(&key);
         let _serialized = gate.lock().await;
 
@@ -718,7 +834,7 @@ impl Lanes {
         // uses: the pre-gate one was read before waiting, and waiting is exactly
         // when a tab restarts onto a new port or goes away. Using it would open
         // a lane against a socket the snapshot has already retired.
-        let stamp = self.lane_stamp(machine, session_id)?;
+        let stamp = self.lane_stamp(machine, kind, session_id)?;
         if let Some(entry) = self.entry(&key) {
             if entry.stamp == stamp {
                 return Ok(entry.opened());
@@ -733,40 +849,60 @@ impl Lanes {
             return Err(LaneFailure::UnsupportedLane(stamp.kind.clone()));
         }
 
+        // A craze lane's source — and the generation it is filed under —
+        // resolved before the declaration, so the declaration carries it.
+        let craze = if stamp.kind == CRAZE {
+            Some(
+                self.machines
+                    .craze_source(machine)
+                    .map_err(|e| LaneFailure::Lane(LaneError::Unavailable(e)))?,
+            )
+        } else {
+            None
+        };
+        let craze_gen = craze.as_ref().map(|(_, gen)| *gen);
+        #[cfg(test)]
+        crate::roost_hosts::at_gap(&self.open_gap).await;
+
         // Declared BEFORE the first await, so a `close` or a `reconcile` landing
         // anywhere below has something to cancel.
-        let _pending = self.declare(&key, &stamp);
+        let _pending = self.declare(&key, &stamp, craze_gen);
 
-        let reach = self
-            .machines
-            .reach_kind(machine)
-            .map_err(|e| LaneFailure::Lane(LaneError::Unavailable(e)))?;
-        // Reserved, not merely created: from here every `?` gives the share back
-        // (and with it the `ssh` child, if this open was its only user).
-        let (base_url, forward) = self.transport(machine, &reach, &stamp.server_url).await?;
-
-        // **The one place this app names a concrete adapter.** Everything after
-        // it is written against `dyn AgentLane`; see the module doc.
-        let client: Arc<dyn AgentLane> = match stamp.kind.as_str() {
-            "opencode" => {
-                let url = reqwest::Url::parse(&base_url).map_err(|e| {
-                    LaneFailure::Lane(LaneError::BadRequest(format!(
-                        "the reported agent server {:?} is not a usable URL: {e}",
-                        stamp.server_url
-                    )))
-                })?;
-                // No credential source — see the module doc. Opening is
-                // binding: the source dials nothing here.
-                let built = OpencodeSource::new(url, None)?.open(session_id).await?;
-                #[cfg(test)]
-                note_adapter_built();
-                built
+        // **A craze source's generation is re-checked AFTER the declaration**
+        // (C9 confirmation, N1). The source was resolved above, outside the
+        // lane registry's lock, and the host can be removed in between: its
+        // eviction ([`Self::evict_craze`]) then finds no open to cancel, and
+        // the clone resolved here — a stopped source still holding its old
+        // roster — would commit a lane nothing would ever end. The removal
+        // takes the source out of the registry BEFORE it publishes the
+        // eviction, and the eviction and the declaration take the same lock, so
+        // one of the two always catches it: an eviction after the declaration
+        // cancels this pending open; one before it left this re-check a host
+        // with no source, or another generation's.
+        if let Some(gen) = craze_gen {
+            let current = self.machines.craze_source(machine).map(|(_, now)| now);
+            if current.as_ref().ok() != Some(&gen) {
+                return Err(LaneFailure::Lane(LaneError::Unavailable(format!(
+                    "{machine}'s craze source stopped while the lane for session \
+                     {session_id:?} was being opened"
+                ))));
             }
-            // Unreachable: the guard above ran before anything was reserved.
-            // Restated rather than `unreachable!()` so that adding a kind to one
-            // list and forgetting the other is a refusal, not a panic.
-            other => return Err(LaneFailure::UnsupportedLane(other.to_string())),
+        }
+
+        // **A craze stamp branches off BEFORE any reach or forward** (plan 025
+        // §3.6.4): its lane is the source's, reached through the machine's hub
+        // on connections of its own — there is no URL to forward to.
+        let opened: (Arc<dyn AgentLane>, Option<ForwardShare>) = if let Some((source, _)) = craze {
+            // Binding, not dialling (`CrazeSource::open`).
+            let built = source.open(session_id).await?;
+            #[cfg(test)]
+            note_adapter_built();
+            (built, None)
+        } else {
+            self.open_roost_stamped(machine, session_id, &stamp).await?
         };
+        let (client, forward) = opened;
+
         // The roster row is fetched BEFORE the subscription starts: a 404 here
         // is an honest `unknown_session` the caller can render, where the same
         // failure inside the pump would be a `Down` the panel has to wait for.
@@ -787,8 +923,7 @@ impl Lanes {
             )));
         }
         let pump = self.spawn_pump(
-            machine.to_string(),
-            session_id.to_string(),
+            key.clone(),
             Arc::clone(&client),
             Arc::clone(&view),
             forward.as_ref().map(ForwardShare::weak),
@@ -800,10 +935,53 @@ impl Lanes {
             client,
             view,
             pump,
+            craze_gen,
         });
         let opened = entry.opened();
         inner.entries.insert(key, entry);
         Ok(opened)
+    }
+
+    /// The roost-stamped half of [`Self::open`]: the machine's reach, the
+    /// forward (RESERVED, so every `?` after it gives the share back — and
+    /// with it the `ssh` child, if this open was its only user), and the
+    /// adapter on the reported URL.
+    async fn open_roost_stamped(
+        &self,
+        machine: &str,
+        session_id: &str,
+        stamp: &AgentLaneStamp,
+    ) -> Result<(Arc<dyn AgentLane>, Option<ForwardShare>), LaneFailure> {
+        let reach = self
+            .machines
+            .reach_kind(machine)
+            .map_err(|e| LaneFailure::Lane(LaneError::Unavailable(e)))?;
+        let (base_url, forward) = self.transport(machine, &reach, &stamp.server_url).await?;
+
+        // **The one place this app names a roost-stamped adapter.** Everything
+        // after it is written against `dyn AgentLane`; see the module doc.
+        let client: Arc<dyn AgentLane> = match stamp.kind.as_str() {
+            "opencode" => {
+                let url = reqwest::Url::parse(&base_url).map_err(|e| {
+                    LaneFailure::Lane(LaneError::BadRequest(format!(
+                        "the reported agent server {:?} is not a usable URL: {e}",
+                        stamp.server_url
+                    )))
+                })?;
+                // No credential source — see the module doc. Opening is
+                // binding: the source dials nothing here.
+                let built = OpencodeSource::new(url, None)?.open(session_id).await?;
+                #[cfg(test)]
+                note_adapter_built();
+                built
+            }
+            // Unreachable: the guard in `open` ran before anything was
+            // reserved. Restated rather than `unreachable!()` so that adding a
+            // kind to one list and forgetting the other is a refusal, not a
+            // panic.
+            other => return Err(LaneFailure::UnsupportedLane(other.to_string())),
+        };
+        Ok((client, forward))
     }
 
     /// `lane.messages` — the staged-then-swapped view, as this app's IPC
@@ -820,8 +998,13 @@ impl Lanes {
     /// that belongs here is the envelope's SHAPE, which is Tauri's and not a
     /// client-neutral API (the phone converts the same
     /// [`shed_app::lane_view::LaneViewSnapshot`] into its own DTOs).
-    pub fn messages(&self, machine: &str, session_id: &str) -> Result<Value, LaneFailure> {
-        let entry = self.open_entry(machine, session_id)?;
+    pub fn messages(
+        &self,
+        machine: &str,
+        kind: &str,
+        session_id: &str,
+    ) -> Result<Value, LaneFailure> {
+        let entry = self.open_entry(machine, kind, session_id)?;
         let snap = lock(&entry.view).snapshot(None);
         Ok(json!({
             "messages": snap.messages,
@@ -840,8 +1023,13 @@ impl Lanes {
     /// Pending only, oldest first: the snapshot already filtered and sorted
     /// them ([`shed_app::lane_view::LaneView::snapshot`] owns that rule), so
     /// this is the envelope and nothing else.
-    pub fn approvals(&self, machine: &str, session_id: &str) -> Result<Value, LaneFailure> {
-        let entry = self.open_entry(machine, session_id)?;
+    pub fn approvals(
+        &self,
+        machine: &str,
+        kind: &str,
+        session_id: &str,
+    ) -> Result<Value, LaneFailure> {
+        let entry = self.open_entry(machine, kind, session_id)?;
         let snap = lock(&entry.view).snapshot(None);
         Ok(json!({ "approvals": snap.approvals }))
     }
@@ -852,19 +1040,42 @@ impl Lanes {
     pub async fn send(
         &self,
         machine: &str,
+        kind: &str,
         session_id: &str,
         text: &str,
         mode: SendMode,
     ) -> Result<Value, LaneFailure> {
-        let entry = self.open_entry(machine, session_id)?;
+        let entry = self.open_entry(machine, kind, session_id)?;
         entry.client.send(text, mode).await?;
         Ok(json!({}))
     }
 
     /// `lane.cancel` — stop the turn in flight.
-    pub async fn cancel(&self, machine: &str, session_id: &str) -> Result<Value, LaneFailure> {
-        let entry = self.open_entry(machine, session_id)?;
+    pub async fn cancel(
+        &self,
+        machine: &str,
+        kind: &str,
+        session_id: &str,
+    ) -> Result<Value, LaneFailure> {
+        let entry = self.open_entry(machine, kind, session_id)?;
         entry.client.cancel().await?;
+        Ok(json!({}))
+    }
+
+    /// `lane.stop` — end the SESSION (plan 025 §3.6.4), not just this
+    /// transcript: craze's `session.stop`, answered on its receipt; the lane
+    /// itself ends when the session's `session_closed` arrives, and the row
+    /// leaves the roster then. A session whose capabilities say `stop: false`
+    /// (a TUI-hosted craze session, every opencode one) refuses it — the panel
+    /// offers no Stop there.
+    pub async fn stop(
+        &self,
+        machine: &str,
+        kind: &str,
+        session_id: &str,
+    ) -> Result<Value, LaneFailure> {
+        let entry = self.open_entry(machine, kind, session_id)?;
+        entry.client.stop().await?;
         Ok(json!({}))
     }
 
@@ -872,11 +1083,12 @@ impl Lanes {
     pub async fn answer(
         &self,
         machine: &str,
+        kind: &str,
         session_id: &str,
         approval_id: &str,
         answer: LaneAnswer,
     ) -> Result<Value, LaneFailure> {
-        let entry = self.open_entry(machine, session_id)?;
+        let entry = self.open_entry(machine, kind, session_id)?;
         entry.client.answer(approval_id, answer).await?;
         Ok(json!({}))
     }
@@ -886,15 +1098,20 @@ impl Lanes {
     /// Idempotent: closing a lane that is not open is success, because the
     /// caller's intent (there is no lane here any more) is already true. The
     /// panel calls this on unmount, and an unmount can race an eviction.
-    pub fn close(&self, machine: &str, session_id: &str) -> Value {
-        self.evict(&(machine.to_string(), session_id.to_string()));
+    pub fn close(&self, machine: &str, kind: &str, session_id: &str) -> Value {
+        self.evict(&key(machine, kind, session_id));
         json!({})
     }
 
-    /// Reconcile one machine's open lanes against a fresh roost snapshot: evict
-    /// every entry whose tab is gone or whose STAMP moved.
+    /// Reconcile one machine's ROOST-STAMPED lanes against a fresh roost
+    /// snapshot: evict every entry whose tab is gone or whose STAMP moved.
     ///
     /// See [`crate::roost_hosts::OnLanes`] for why the snapshot is the signal.
+    ///
+    /// **Scoped to the kinds roost stamps** (plan 025 §3.6.4): a craze lane's
+    /// row is its machine's craze source's, which a roost snapshot never
+    /// lists — judged by this rule, every roost snapshot on its machine would
+    /// tear it down. Its eviction is [`Self::evict_craze`].
     pub fn reconcile(&self, machine: &str, lanes: &BTreeMap<String, AgentLaneStamp>) {
         let gone: Vec<Arc<LaneEntry>> = {
             let mut inner = lock(&self.inner);
@@ -902,13 +1119,16 @@ impl Lanes {
             // entries. Without this a tab that went away mid-open would be
             // resurrected by the open that was already past the check.
             for (key, pending) in inner.pending.iter_mut() {
-                if key.0 == machine && lanes.get(&key.1) != Some(&pending.stamp) {
+                if key.0 == machine
+                    && roost_stamped(&key.1)
+                    && lanes.get(&key.2) != Some(&pending.stamp)
+                {
                     pending.cancelled = true;
                 }
             }
             let mut gone = Vec::new();
-            inner.entries.retain(|(m, session_id), entry| {
-                if m != machine {
+            inner.entries.retain(|(m, kind, session_id), entry| {
+                if m != machine || !roost_stamped(kind) {
                     return true;
                 }
                 let keep = lanes
@@ -927,15 +1147,60 @@ impl Lanes {
         }
     }
 
+    /// Retire the craze lanes on `machine` whose rows left its craze source of
+    /// generation `gen` (plan 025 §3.6.4) — a roster `Removed`, a `Ready` swap
+    /// that no longer lists them, the hub gone (Dormant), the host removed, or
+    /// the tab of a TUI-hosted session ended — and cancel any open of theirs
+    /// still in flight. Driven by [`crate::roost_hosts::OnCrazeGone`].
+    ///
+    /// **Fenced by the generation, under this registry's own lock** (C9
+    /// review): the eviction is published after the roost-host layer's lock
+    /// that computed it is released, and by then the host may have been
+    /// removed, registered again and had a lane opened on the same hostId
+    /// through its NEW source. Only an entry (or a pending open) filed under
+    /// `gen` is touched, and the comparison and the removal are one
+    /// acquisition, so a lane of another generation can never be ended by
+    /// this one's news.
+    pub fn evict_craze(&self, machine: &str, gen: u64, host_ids: &[String]) {
+        let gone: Vec<Arc<LaneEntry>> = {
+            let mut inner = lock(&self.inner);
+            host_ids
+                .iter()
+                .filter_map(|host_id| {
+                    let key = key(machine, CRAZE, host_id);
+                    if let Some(pending) = inner.pending.get_mut(&key) {
+                        if pending.craze_gen == Some(gen) {
+                            pending.cancelled = true;
+                        }
+                    }
+                    let ours = inner
+                        .entries
+                        .get(&key)
+                        .is_some_and(|entry| entry.craze_gen == Some(gen));
+                    if ours {
+                        inner.entries.remove(&key)
+                    } else {
+                        None
+                    }
+                })
+                .collect()
+        };
+        // Outside the lock: retiring gives a tunnel share back, which takes it.
+        for entry in gone {
+            entry.retire();
+        }
+    }
+
     // ---- internals ----
 
     /// Declare an open in flight for `key`. See [`Pending`].
-    fn declare(&self, key: &Key, stamp: &AgentLaneStamp) -> PendingGuard {
+    fn declare(&self, key: &Key, stamp: &AgentLaneStamp, craze_gen: Option<u64>) -> PendingGuard {
         lock(&self.inner).pending.insert(
             key.clone(),
             Pending {
                 stamp: stamp.clone(),
                 cancelled: false,
+                craze_gen,
             },
         );
         PendingGuard {
@@ -965,8 +1230,13 @@ impl Lanes {
     }
 
     /// The entry every verb but `open` needs, or the reason there is none.
-    fn open_entry(&self, machine: &str, session_id: &str) -> Result<Arc<LaneEntry>, LaneFailure> {
-        let key = (machine.to_string(), session_id.to_string());
+    fn open_entry(
+        &self,
+        machine: &str,
+        kind: &str,
+        session_id: &str,
+    ) -> Result<Arc<LaneEntry>, LaneFailure> {
+        let key = key(machine, kind, session_id);
         if let Some(entry) = self.entry(&key) {
             return Ok(entry);
         }
@@ -974,7 +1244,7 @@ impl Lanes {
         // a caller does the same thing about both (there is no transcript here),
         // and a second code would be one more thing for a client to branch on
         // for no behavioural difference.
-        match self.lane_stamp(machine, session_id) {
+        match self.lane_stamp(machine, kind, session_id) {
             Err(e) => Err(e),
             Ok(_) => Err(LaneFailure::NoLane(format!(
                 "no lane is open for session {session_id:?} on machine {machine:?} — \
@@ -984,13 +1254,35 @@ impl Lanes {
     }
 
     /// The [`AgentLaneStamp`] this row reports, or `no_lane`.
-    fn lane_stamp(&self, machine: &str, session_id: &str) -> Result<AgentLaneStamp, LaneFailure> {
+    ///
+    /// Looked up in the namespace `kind` names (plan 025 §3.6.4): a craze
+    /// hostId among the craze source's rows, anything else among roost's
+    /// stamps — and a roost stamp of ANOTHER kind under that id is no lane of
+    /// this one.
+    fn lane_stamp(
+        &self,
+        machine: &str,
+        kind: &str,
+        session_id: &str,
+    ) -> Result<AgentLaneStamp, LaneFailure> {
+        if kind == CRAZE {
+            return self
+                .machines
+                .craze_lanes(machine)
+                .remove(session_id)
+                .ok_or_else(|| {
+                    LaneFailure::NoLane(format!(
+                        "machine {machine:?}'s craze source lists no session {session_id:?}"
+                    ))
+                });
+        }
         self.machines
             .agent_lanes(machine)
             .remove(session_id)
+            .filter(|stamp| stamp.kind == kind)
             .ok_or_else(|| {
                 LaneFailure::NoLane(format!(
-                    "session {session_id:?} on machine {machine:?} carries no agent_lane \
+                    "session {session_id:?} on machine {machine:?} carries no {kind} agent_lane \
                      (its tab reported no agent server)"
                 ))
             })
@@ -1125,8 +1417,7 @@ impl Lanes {
     /// probe that returns at once.
     fn spawn_pump(
         &self,
-        machine: String,
-        session_id: String,
+        key: Key,
         client: Arc<dyn AgentLane>,
         view: Arc<Mutex<LaneView>>,
         forward: Option<Weak<OwnedForward>>,
@@ -1139,13 +1430,7 @@ impl Lanes {
                     Ensured::Ready => {}
                     Ensured::Gone => return,
                     Ensured::Failed(e) => {
-                        note(
-                            &sink,
-                            &view,
-                            &machine,
-                            &session_id,
-                            stale(format!("forward: {e}")),
-                        );
+                        note(&sink, &view, &key, stale(format!("forward: {e}")));
                         tokio::time::sleep(backoff).await;
                         backoff = next_backoff(backoff);
                         continue;
@@ -1160,8 +1445,7 @@ impl Lanes {
                         note(
                             &sink,
                             &view,
-                            &machine,
-                            &session_id,
+                            &key,
                             LaneEvent::Down {
                                 reason: DOWN_UNKNOWN_SESSION.to_string(),
                             },
@@ -1169,7 +1453,7 @@ impl Lanes {
                         return;
                     }
                     Err(e) => {
-                        note(&sink, &view, &machine, &session_id, stale(e.to_string()));
+                        note(&sink, &view, &key, stale(e.to_string()));
                         tokio::time::sleep(backoff).await;
                         backoff = next_backoff(backoff);
                         continue;
@@ -1199,7 +1483,7 @@ impl Lanes {
                         _ => {}
                     }
                     lock(&view).apply(&event);
-                    emit(&sink, &machine, &session_id, &event);
+                    emit(&sink, &key, &event);
                     if generations > 1 && matches!(event, LaneEvent::Reset { .. }) {
                         match ensure_forward(&forward).await {
                             Ensured::Ready => {}
@@ -1220,13 +1504,7 @@ impl Lanes {
                             // Ready`. (An ADAPTER's own `Stale` is not this
                             // case: the adapter reseeds or resumes on its own.)
                             Ensured::Failed(e) => {
-                                note(
-                                    &sink,
-                                    &view,
-                                    &machine,
-                                    &session_id,
-                                    stale(format!("forward: {e}")),
-                                );
+                                note(&sink, &view, &key, stale(format!("forward: {e}")));
                                 restart = true;
                                 break;
                             }
@@ -1283,19 +1561,13 @@ fn stale(reason: String) -> LaneEvent {
 /// The panel must not care whether the thing that went away was the agent or the
 /// tunnel to it: both mean "this transcript is not live", and both are recovered
 /// by the same retry.
-fn note(
-    sink: &EventSink,
-    view: &Arc<Mutex<LaneView>>,
-    machine: &str,
-    session_id: &str,
-    event: LaneEvent,
-) {
+fn note(sink: &EventSink, view: &Arc<Mutex<LaneView>>, key: &Key, event: LaneEvent) {
     lock(view).apply(&event);
-    emit(sink, machine, session_id, &event);
+    emit(sink, key, &event);
 }
 
-fn emit(sink: &EventSink, machine: &str, session_id: &str, event: &LaneEvent) {
-    (**sink)(machine, session_id, event);
+fn emit(sink: &EventSink, key: &Key, event: &LaneEvent) {
+    (**sink)(&key.0, &key.1, &key.2, event);
 }
 
 fn next_backoff(current: Duration) -> Duration {
@@ -1823,6 +2095,8 @@ mod tests {
 
     /// The machine every cell below opens a lane on.
     const MACHINE: &str = "m1";
+    /// The kind most cells open — opencode's lanes are the roost-stamped ones.
+    const OC: &str = "opencode";
     /// The FAR-side port the row reports. Deliberately NOT the fake's own port:
     /// a lane on an ssh machine must dial the FORWARD's local port, and a test
     /// where the two numbers agree would not notice if it dialed the reported
@@ -1902,6 +2176,9 @@ mod tests {
         /// `Local` for the ones about the LOCAL credential reader, which is the
         /// path that reads files instead of shelling out.
         reach: ReachKind,
+        /// The machine's craze source and the hostIds it lists, for the cells
+        /// about the craze namespace. `None` everywhere else.
+        craze: Mutex<Option<(CrazeSource, Vec<String>)>>,
     }
 
     impl LaneMachines for FakeMachines {
@@ -1911,6 +2188,33 @@ mod tests {
             } else {
                 BTreeMap::new()
             }
+        }
+
+        fn craze_lanes(&self, machine: &str) -> BTreeMap<String, AgentLaneStamp> {
+            let craze = lock(&self.craze);
+            let Some((_, ids)) = craze.as_ref().filter(|_| machine == MACHINE) else {
+                return BTreeMap::new();
+            };
+            ids.iter()
+                .map(|id| {
+                    (
+                        id.clone(),
+                        AgentLaneStamp {
+                            kind: CRAZE.to_string(),
+                            session_id: id.clone(),
+                            server_url: String::new(),
+                        },
+                    )
+                })
+                .collect()
+        }
+
+        fn craze_source(&self, machine: &str) -> Result<(CrazeSource, u64), String> {
+            lock(&self.craze)
+                .as_ref()
+                .filter(|_| machine == MACHINE)
+                .map(|(source, _)| (source.clone(), 1))
+                .ok_or_else(|| format!("{machine} has no craze source"))
         }
 
         fn reach_kind(&self, _machine: &str) -> Result<ReachKind, String> {
@@ -1994,6 +2298,16 @@ mod tests {
         port: u16,
         rows: BTreeMap<String, AgentLaneStamp>,
     ) -> (Arc<Lanes>, Arc<ForwardLog>, Arc<Recorder>) {
+        lanes_with_craze(port, rows, None)
+    }
+
+    /// [`lanes_on`], the machine also having a craze source listing `craze`'s
+    /// hostIds.
+    fn lanes_with_craze(
+        port: u16,
+        rows: BTreeMap<String, AgentLaneStamp>,
+        craze: Option<(CrazeSource, Vec<String>)>,
+    ) -> (Arc<Lanes>, Arc<ForwardLog>, Arc<Recorder>) {
         let log = Arc::new(ForwardLog::default());
         let recorder = Arc::new(Recorder::default());
         let machines = Arc::new(FakeMachines {
@@ -2001,12 +2315,15 @@ mod tests {
             port,
             log: Arc::clone(&log),
             reach: ReachKind::Ssh(fake_entry()),
+            craze: Mutex::new(craze),
         });
         let sink: EventSink = {
             let recorder = Arc::clone(&recorder);
-            Arc::new(move |_machine: &str, _session: &str, event: &LaneEvent| {
-                recorder.record(event)
-            })
+            Arc::new(
+                move |_machine: &str, _kind: &str, _session: &str, event: &LaneEvent| {
+                    recorder.record(event)
+                },
+            )
         };
         let lanes = Arc::new(Lanes::with_sink(
             tokio::runtime::Handle::current(),
@@ -2041,7 +2358,7 @@ mod tests {
         let (lanes, log, _recorder) = lanes_on(1, lane_rows_of("claude", &["ses_x"]));
 
         let failure = lanes
-            .open(MACHINE, "ses_x")
+            .open(MACHINE, "claude", "ses_x")
             .await
             .expect_err("this build speaks opencode, not claude");
         assert_eq!(failure.code(), "unsupported_lane");
@@ -2057,7 +2374,7 @@ mod tests {
         // refusal is stateless, not a poisoned entry.
         assert_eq!(
             lanes
-                .open(MACHINE, "ses_x")
+                .open(MACHINE, "claude", "ses_x")
                 .await
                 .expect_err("still refused")
                 .code(),
@@ -2081,7 +2398,7 @@ mod tests {
     #[tokio::test]
     async fn a_gx_stamped_row_is_unsupported_lane_with_no_forward_reserved() {
         let (lanes, log, recorder) = lanes_on(1, lane_rows_of("gx", &["ses_gx"]));
-        let key: Key = (MACHINE.to_string(), "ses_gx".to_string());
+        let key: Key = (MACHINE.to_string(), "gx".to_string(), "ses_gx".to_string());
         // Snapshotted, not asserted against zero: this counter is a single
         // process-wide static shared by every test in this binary, and
         // `cargo test` runs them concurrently. The claim is "this `open` built
@@ -2090,7 +2407,7 @@ mod tests {
         let builds_before = ADAPTER_BUILDS.load(SeqCst);
 
         let failure = lanes
-            .open(MACHINE, "ses_gx")
+            .open(MACHINE, "gx", "ses_gx")
             .await
             .expect_err("the gx adapter left this app in plan 025 C1");
 
@@ -2154,7 +2471,7 @@ mod tests {
     async fn an_entry_is_evicted_when_the_kind_changes_under_a_stable_url() {
         let fake = one_session("ses_a").await;
         let (lanes, log, _recorder) = lanes_for(&fake, &["ses_a"]);
-        lanes.open(MACHINE, "ses_a").await.expect("opens");
+        lanes.open(MACHINE, OC, "ses_a").await.expect("opens");
         assert_eq!(forward_users(&lanes), Some(1));
 
         // Same session, same URL, different agent.
@@ -2205,7 +2522,7 @@ mod tests {
     /// first seed swaps in.
     fn generation(lanes: &Lanes, session: &str) -> u64 {
         lanes
-            .messages(MACHINE, session)
+            .messages(MACHINE, OC, session)
             .ok()
             .and_then(|v| v["generation"].as_u64())
             .unwrap_or(0)
@@ -2217,7 +2534,7 @@ mod tests {
         session: &'static str,
     ) -> tokio::task::JoinHandle<Result<Value, LaneFailure>> {
         let lanes = Arc::clone(lanes);
-        tokio::spawn(async move { lanes.open(MACHINE, session).await })
+        tokio::spawn(async move { lanes.open(MACHINE, OC, session).await })
     }
 
     /// Wait until the fake has RECEIVED (and parked) the roster GET.
@@ -2250,14 +2567,14 @@ mod tests {
         for i in 0..64 {
             // A machine this app has never heard of …
             let failure = lanes
-                .open("no-such-machine", &format!("ses_{i}"))
+                .open("no-such-machine", OC, &format!("ses_{i}"))
                 .await
                 .expect_err("a machine with no rows has no lane");
             assert_eq!(failure.code(), "no_lane", "{}", failure.message());
             // … and a real one whose rows do not name this session (the churn
             // case: yesterday's tab ids, replayed).
             let failure = lanes
-                .open(MACHINE, &format!("churned_{i}"))
+                .open(MACHINE, OC, &format!("churned_{i}"))
                 .await
                 .expect_err("a session with no row has no lane");
             assert_eq!(failure.code(), "no_lane", "{}", failure.message());
@@ -2269,12 +2586,15 @@ mod tests {
         );
 
         // A REAL open, and its close, likewise.
-        lanes.open(MACHINE, "ses_a").await.expect("the lane opens");
+        lanes
+            .open(MACHINE, OC, "ses_a")
+            .await
+            .expect("the lane opens");
         assert!(
             lock(&lanes.gates).is_empty(),
             "a committed open kept its gate"
         );
-        lanes.close(MACHINE, "ses_a");
+        lanes.close(MACHINE, OC, "ses_a");
         assert!(lock(&lanes.gates).is_empty());
 
         // And the gate still DOES its job: two concurrent opens on one key are
@@ -2300,7 +2620,7 @@ mod tests {
             lock(&lanes.gates).is_empty(),
             "the gate two opens shared outlived both of them"
         );
-        lanes.close(MACHINE, "ses_a");
+        lanes.close(MACHINE, OC, "ses_a");
     }
 
     /// **Review finding 1.** `close` used to look for an entry, find none
@@ -2323,7 +2643,7 @@ mod tests {
             "an open in flight must own the tunnel it reserved"
         );
 
-        lanes.close(MACHINE, "ses_a");
+        lanes.close(MACHINE, OC, "ses_a");
         fake.release_get("/session/ses_a");
 
         let failure = opening
@@ -2392,7 +2712,7 @@ mod tests {
             let (lanes, log, _events) = lanes_for(&fake, &["ses_a"]);
 
             let failure = lanes
-                .open(MACHINE, "ses_a")
+                .open(MACHINE, OC, "ses_a")
                 .await
                 .err()
                 .unwrap_or_else(|| panic!("a {status} roster GET must fail the open"));
@@ -2466,14 +2786,14 @@ mod tests {
 
         // And the refcount is what decides when it dies: the first close keeps
         // the neighbour's tunnel, the second reaps it.
-        lanes.close(MACHINE, "ses_a");
+        lanes.close(MACHINE, OC, "ses_a");
         assert_eq!(
             forward_users(&lanes),
             Some(1),
             "closing one lane took the other's tunnel with it"
         );
         assert_eq!(log.dropped.load(SeqCst), 0);
-        lanes.close(MACHINE, "ses_b");
+        lanes.close(MACHINE, OC, "ses_b");
         assert_eq!(forward_users(&lanes), None);
         wait_for("the tunnel's child to be reaped", || {
             (log.dropped.load(SeqCst) == 1).then_some(())
@@ -2497,7 +2817,10 @@ mod tests {
         let fake = one_session("ses_a").await;
         let (lanes, log, events) = lanes_for(&fake, &["ses_a"]);
 
-        lanes.open(MACHINE, "ses_a").await.expect("the lane opens");
+        lanes
+            .open(MACHINE, OC, "ses_a")
+            .await
+            .expect("the lane opens");
         wait_for("the first generation to seed", || {
             (generation(&lanes, "ses_a") >= 1).then_some(())
         })
@@ -2541,7 +2864,10 @@ mod tests {
         let fake = one_session("ses_a").await;
         let (lanes, _log, _events) = lanes_for(&fake, &["ses_a"]);
 
-        let opened = lanes.open(MACHINE, "ses_a").await.expect("the lane opens");
+        let opened = lanes
+            .open(MACHINE, OC, "ses_a")
+            .await
+            .expect("the lane opens");
         assert_eq!(opened["session"]["id"], "ses_a");
         assert!(
             opened.get("capabilities").is_none(),
@@ -2551,7 +2877,7 @@ mod tests {
             (generation(&lanes, "ses_a") >= 1).then_some(())
         })
         .await;
-        let view = lanes.messages(MACHINE, "ses_a").expect("lane.messages");
+        let view = lanes.messages(MACHINE, OC, "ses_a").expect("lane.messages");
         assert_eq!(
             view["capabilities"],
             serde_json::to_value(shed_opencode::opencode_capabilities()).expect("caps encode"),
@@ -2577,7 +2903,10 @@ mod tests {
     async fn a_failed_tunnel_under_a_live_lane_is_stale_and_recovers_by_itself() {
         let fake = one_session("ses_a").await;
         let (lanes, log, events) = lanes_for(&fake, &["ses_a"]);
-        lanes.open(MACHINE, "ses_a").await.expect("the lane opens");
+        lanes
+            .open(MACHINE, OC, "ses_a")
+            .await
+            .expect("the lane opens");
         wait_for("the first generation to seed", || {
             (generation(&lanes, "ses_a") >= 1).then_some(())
         })
@@ -2597,7 +2926,7 @@ mod tests {
         })
         .await;
         assert_eq!(events.count("down"), 0, "a retried failure is never a Down");
-        let view = lanes.messages(MACHINE, "ses_a").expect("lane.messages");
+        let view = lanes.messages(MACHINE, OC, "ses_a").expect("lane.messages");
         assert_eq!(view["ended"], false, "the lane did not end: {view}");
         assert!(
             !view["stale"].is_null(),
@@ -2613,7 +2942,7 @@ mod tests {
             "the lane to reseed and clear its stale mark on its own (a kept \
              subscription streams into the abandoned seed forever)",
             || {
-                let view = lanes.messages(MACHINE, "ses_a").ok()?;
+                let view = lanes.messages(MACHINE, OC, "ses_a").ok()?;
                 (view["generation"].as_u64() >= Some(2) && view["stale"].is_null()).then_some(())
             },
         )
@@ -2624,7 +2953,7 @@ mod tests {
             dials_while_down,
             event_dials()
         );
-        let view = lanes.messages(MACHINE, "ses_a").expect("lane.messages");
+        let view = lanes.messages(MACHINE, OC, "ses_a").expect("lane.messages");
         assert_eq!(view["ended"], false, "and the lane was never ended: {view}");
         assert!(
             view["capabilities"].is_object(),
@@ -2679,13 +3008,16 @@ mod tests {
         let fake = one_session("ses_a").await;
         let (lanes, log, _events) = lanes_for(&fake, &["ses_a"]);
 
-        lanes.open(MACHINE, "ses_a").await.expect("the lane opens");
+        lanes
+            .open(MACHINE, OC, "ses_a")
+            .await
+            .expect("the lane opens");
         wait_for("the lane to seed", || {
             (generation(&lanes, "ses_a") >= 1).then_some(())
         })
         .await;
 
-        lanes.close(MACHINE, "ses_a");
+        lanes.close(MACHINE, OC, "ses_a");
         wait_for("the tunnel's child to be reaped", || {
             (log.dropped.load(SeqCst) == 1).then_some(())
         })
@@ -2695,5 +3027,79 @@ mod tests {
             0,
             "the blocking kill/waitpid ran on a runtime thread"
         );
+    }
+
+    /// **The lane key carries the kind** (plan 025 §3.6.4): a craze hostId and
+    /// an opencode session id are separate namespaces, so the SAME id on one
+    /// machine is two lanes — opening one never answers for, evicts or closes
+    /// the other.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_craze_lane_and_an_opencode_lane_sharing_an_id_are_two_lanes() {
+        use shed_core::lane::AgentSource as _;
+        use shed_craze::testing::{full_hub_capabilities, roster_row, ScriptedDial};
+
+        const ID: &str = "ses_a";
+        let fake = one_session(ID).await;
+        let (dial, mut conns) = ScriptedDial::new();
+        let source = CrazeSource::new(dial, "shed-desktop-test");
+        let _roster = source.subscribe().await.expect("subscribe");
+        let mut hub = conns.recv().await.expect("the roster dialled");
+        hub.hello("0a1b2c3d4e5f", full_hub_capabilities()).await;
+        hub.subscribed(
+            "sub-1",
+            "0a1b2c3d4e5f",
+            json!([roster_row(ID, "craze-1", "/w", json!({"title": "craze"}))]),
+        )
+        .await;
+        wait_for("the source lists the row", || source.listed(ID).map(|_| ())).await;
+
+        let (lanes, _log, _recorder) = lanes_with_craze(
+            fake.addr().port(),
+            lane_rows(&[ID]),
+            Some((source, vec![ID.to_string()])),
+        );
+        lanes
+            .open(MACHINE, OC, ID)
+            .await
+            .expect("the opencode lane");
+        lanes
+            .open(MACHINE, CRAZE, ID)
+            .await
+            .expect("the craze lane");
+        assert!(
+            lanes.is_open(MACHINE, OC, ID),
+            "the opencode lane survived the craze open"
+        );
+        assert!(lanes.is_open(MACHINE, CRAZE, ID));
+        assert_eq!(lock(&lanes.inner).entries.len(), 2, "two lanes, one id");
+
+        lanes.close(MACHINE, CRAZE, ID);
+        assert!(!lanes.is_open(MACHINE, CRAZE, ID));
+        assert!(
+            lanes.is_open(MACHINE, OC, ID),
+            "closing the craze lane left the opencode one"
+        );
+        // And a roost reconcile that drops the opencode row leaves a craze one
+        // alone — only roost-stamped lanes are roost's to reconcile.
+        lanes
+            .open(MACHINE, CRAZE, ID)
+            .await
+            .expect("the craze lane again");
+        lanes.reconcile(MACHINE, &BTreeMap::new());
+        assert!(
+            !lanes.is_open(MACHINE, OC, ID),
+            "the roost-stamped lane went with its row"
+        );
+        assert!(
+            lanes.is_open(MACHINE, CRAZE, ID),
+            "the craze lane is not roost's to evict"
+        );
+        lanes.evict_craze(MACHINE, 2, &[ID.to_string()]);
+        assert!(
+            lanes.is_open(MACHINE, CRAZE, ID),
+            "another generation's eviction leaves it alone"
+        );
+        lanes.evict_craze(MACHINE, 1, &[ID.to_string()]);
+        assert!(!lanes.is_open(MACHINE, CRAZE, ID), "evict_craze retires it");
     }
 }

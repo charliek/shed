@@ -38,6 +38,11 @@ shed-app = { path = "../../../crates/shed-app", features = ["broker"] }
 # shipped path against a Python fake over a real socket. The Rust fake is a
 # dev-dependency instead (below), so it reaches `cargo test` and nothing else.
 shed-opencode = { path = "../../../crates/shed-opencode" }
+# The craze adapter (plan 025 C9): one craze SOURCE per machine — this machine's
+# hub over a local `/bin/sh` bridge, a remote one over `SshExec::spawn_duplex` —
+# and a `CrazeLane` per open transcript. A plain path dep like shed-opencode; its
+# `test-support` recipe harness is a dev-dependency only (below).
+shed-craze = { path = "../../../crates/shed-craze" }
 # ONLY for `reqwest::Url` — `OpencodeSource::new` takes a parsed base URL, and
 # this crate has to name the type to build one. `default-features = false` and no
 # features of its own: the version and the feature set are whatever shed-core
@@ -126,6 +131,10 @@ shed-core = { path = "../../../crates/shed-core", features = ["test-support"] }
 # package to the lock and nothing to the shipped binary, which still links the
 # crate without it (see the `[dependencies]` entry).
 shed-opencode = { path = "../../../crates/shed-opencode", features = ["test-support"] }
+# `shed_craze::testing` — the scripted hub (`ScriptedDial`) the craze-source
+# cells drive (the host-removal races, the fold, the eviction hooks), and the
+# recipe's skip-or-require rule. Same feature-only switch as the two above.
+shed-craze = { path = "../../../crates/shed-craze", features = ["test-support"] }
 
 # A debug build is what the harness drives; keep it reasonably snappy.
 #

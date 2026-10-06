@@ -2273,6 +2273,22 @@ impl SshExec {
         }
     }
 
+    /// Start `command` on the far side as a **long-lived duplex**: the child
+    /// with its stdin, stdout and stderr all piped, nothing written and nothing
+    /// read — the caller owns the three bands for as long as the connection
+    /// lives (plan 025 §3.3.2: the desktop's craze dial, one `craze bridge
+    /// --hub` per connection over this host's ssh).
+    ///
+    /// The same argv as [`SshExec::run`] — the pinned `ssh_config`, the
+    /// private `ControlMaster` (so a roster connection, every lane's and the
+    /// bootstrap's execs share one handshake), `-T`, `BatchMode`, `LC_ALL=C` —
+    /// and the same `kill_on_drop`: a dropped child is a killed one, so a
+    /// connection that is let go never leaves its bridge running. Nothing here
+    /// bounds the child's life; a duplex lives as long as its caller holds it.
+    pub fn spawn_duplex(&self, command: &str) -> std::io::Result<tokio::process::Child> {
+        self.spawn_child(command)
+    }
+
     fn spawn_child(&self, command: &str) -> std::io::Result<tokio::process::Child> {
         tokio::process::Command::new(&self.ssh_bin)
             .args(self.argv(command))
@@ -5113,6 +5129,65 @@ exec {env_bin} -i {assignments} /bin/sh -c "$remote"
             String::from_utf8_lossy(&stdout),
             format!("it's {}", home.display())
         );
+    }
+
+    /// **A duplex is a live pipe both ways** (plan 025 C9, the desktop's craze
+    /// dial): what is written reaches the far side's stdin as it is written —
+    /// not at EOF — and its answers come back while the child is still running,
+    /// on the same ControlMaster argv every step uses. Dropping the child kills
+    /// it (`kill_on_drop`), which is how a craze connection that is let go
+    /// never leaves its bridge behind.
+    #[tokio::test]
+    async fn an_ssh_duplex_carries_lines_both_ways_while_it_runs() {
+        use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let ssh = write_exec_ssh(dir.path(), &[("PATH", "/usr/bin:/bin".to_string())]);
+        let exec = SshExec::new(&entry("mini3"), &exec_options(ssh)).expect("exec");
+
+        // `cat` answers each line only once it has READ it, so a reply proves
+        // the duplex is live, not a buffered one-shot.
+        let mut child = exec.spawn_duplex("cat").expect("spawn");
+        let mut stdin = child.stdin.take().expect("piped stdin");
+        let stdout = child.stdout.take().expect("piped stdout");
+        assert!(child.stderr.is_some(), "stderr is the caller's to read");
+        let mut lines = tokio::io::BufReader::new(stdout).lines();
+        for word in ["hello", "again"] {
+            stdin
+                .write_all(format!("{word}\n").as_bytes())
+                .await
+                .expect("write");
+            stdin.flush().await.expect("flush");
+            let line = tokio::time::timeout(Duration::from_secs(10), lines.next_line())
+                .await
+                .expect("an answer while the child runs")
+                .expect("read")
+                .expect("a line");
+            assert_eq!(line, word);
+        }
+        assert!(
+            child.try_wait().expect("try_wait").is_none(),
+            "still running"
+        );
+        let pid = child.id().expect("a pid");
+        drop(stdin);
+        drop(lines);
+        drop(child);
+        // Killed with its last handle — `kill(pid, 0)` failing (or the pid
+        // being a zombie reaped by tokio's orphan queue) is what "gone" means
+        // here; give the reaper a moment.
+        let gone = async {
+            loop {
+                // SAFETY: a signal-0 probe sends nothing.
+                if unsafe { libc::kill(pid as i32, 0) } != 0 {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(10), gone)
+            .await
+            .expect("a dropped duplex child is killed and reaped");
     }
 
     /// A step that fails keeps its status and the **tail** of its stderr, and a

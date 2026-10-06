@@ -1,0 +1,35 @@
+# Seed shed config for the craze source/lane E2E (plan 025 §3.6.7).
+#
+# THIS machine's craze is the local one (`localhost`, reached through the
+# test-mode `SHED_TAURI_CRAZE_PATH` seam), so it needs no entry. The three
+# machines below are REMOTE craze hosts, reached only through the fake `ssh`
+# the remote module instance installs (`SHED_TAURI_SSH_BIN`) — each `user` is
+# the name of the jail that fake runs the remote command in:
+#
+#   craze-dormant — craze installed, no hub running: the source must stay
+#                   DORMANT, probing, never dialling `bridge --hub`;
+#   craze-live    — craze installed and a hub already running (with a fake host
+#                   in its roster): the first probe finds it, and the roster
+#                   attaches over the ssh duplex;
+#   craze-old     — the real craze v0.0.1: too old, the machines-pane note.
+#
+# An instance launched WITHOUT the fake `ssh` reaches none of them: test mode
+# gives a remote host no craze source unless that seam is set, and its roost
+# reach is the usual unmapped, unreachable row.
+servers:
+    mock:
+        host: 127.0.0.1
+        http_port: 8080
+        ssh_port: 2222
+default_server: mock
+sheds: {}
+machines:
+    craze-dormant:
+        host: craze-host
+        user: craze-dormant
+    craze-live:
+        host: craze-host
+        user: craze-live
+    craze-old:
+        host: craze-host
+        user: craze-old

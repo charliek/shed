@@ -82,10 +82,28 @@ const AGENT_COLOR: Record<string, string> = {
   "claude-rc": "var(--shed-accent)",
   "claude-code": "var(--shed-accent)",
   opencode: "#3B82F6",
+  // craze — the provider abstraction (plan 025): cursor, grok, gx and native
+  // sessions behind one machine-level hub.
+  craze: "#8B5CF6",
   shell: "var(--shed-text-muted)",
 };
 export function agentColor(kind: string): string {
   return AGENT_COLOR[kind] ?? "var(--shed-text-muted)";
+}
+
+/** A quiet fact chip — a craze session's provider, its model (plan 025
+ *  §3.6.5): mono, muted, borderless, so it reads as a label beside the kind
+ *  badge rather than a second one. */
+export function FactChip({ label, title }: { label: string; title?: string }) {
+  return (
+    <span
+      title={title}
+      className="flex-none truncate rounded-[5px] bg-shed-inset font-mono text-[11.5px] leading-none text-shed-text-secondary"
+      style={{ padding: "4px 7px", maxWidth: 180 }}
+    >
+      {label}
+    </span>
+  );
 }
 
 /** The agent-kind badge — the raw kind in a bordered pill with a kind-colored left rail. */

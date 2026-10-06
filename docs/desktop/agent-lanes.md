@@ -404,7 +404,10 @@ serialises the snapshot's fields into the `lane.messages`/`lane.approvals`
 payload and folds nothing itself.
 
 Once a row carries `agent_lane`, opening its Transcript affordance calls
-`lane.open {machine, session_id}` and mounts the panel:
+`lane.open {machine, kind, session_id}` and mounts the panel. Every `lane.*` op
+takes the stamp's `kind` as well as its `session_id`: a craze row's
+`session_id` is its hostId and an opencode row's is opencode's own id, and the
+two are separate namespaces.
 
 | Op | Does |
 |---|---|
@@ -414,6 +417,7 @@ Once a row carries `agent_lane`, opening its Transcript affordance calls
 | `lane.send` | Queues a prompt (`mode: queue`), or preempts the turn in flight (`mode: interject`) when the lane advertises `interject` — the panel shows the toggle only then, and only enables it while the turn is `Working`. |
 | `lane.cancel` | Aborts the turn in flight. The panel offers Cancel only when the session's streamed `capabilities.cancel` is true, and enables it only while the session is `Working`. |
 | `lane.answer` | Answers one approval. Four forms, exactly one per answer and nothing beside it (any other key — say an `option_id` next to `permission` — is `bad_request`, so an answer can never execute as something other than what it reads as): `{choice: "<id>"}` — the exact option id the approval offered, which is what the panel always sends, because an agent can offer several options of the same decision kind (see [gx's `option_for` refusal](#the-option_for-ambiguity-refusal)); the scripted `{permission: "allow-once" \| "allow-always" \| "reject"}`, which resolves by semantic kind and refuses an ambiguous one; `{question: [[…]]}`, optionally with `custom_text` beside it (see [Free-text answers](#free-text-answers)); and `{reject: true}`. |
+| `lane.stop` | Ends the SESSION (craze's `session.stop`), not just the transcript: answered on craze's receipt, after which the lane ends and the row leaves. The panel offers Stop only when the session's `capabilities.stop` is true, behind an inline confirm. |
 | `lane.close` | Ends the subscription; the last close on a shared SSH forward tears it down. |
 
 A failure comes back as `{code, message}` with the contract's own snake_case

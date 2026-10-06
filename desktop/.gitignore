@@ -7,6 +7,10 @@ build/
 # Docs
 site-build/
 
+# The craze binaries the Docker Tauri legs read from inside the tarred
+# desktop/tools (plan 025 §3.5): `make craze-binaries OUT=desktop/tools/shedtest/.craze-bin`.
+tools/shedtest/.craze-bin/
+
 # Python / uv
 .venv/
 __pycache__/

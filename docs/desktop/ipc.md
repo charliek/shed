@@ -91,8 +91,8 @@ guest binary and the hub are gone.)
 | `rc.list` | `host?`, `shed?` | `{sessions, capabilities, machines}` |
 | `rc.launch` | `host?`, `shed`, `kind?`, `display_name?`, `workdir?`, `initial_prompt?` | the opened row — an **alias** for `roost.launch` on `roost:<host>/<shed>`, kept for 0.9.x |
 | `rc.kill` | `host?`, `shed`, `slug` | `{}` — a roost `tab.close`; the slug IS the tab id, and must be one THIS host lists (ids are per-host, so one copied from elsewhere would close an unrelated tab) |
-| `machines.list` | — | `machines[]` — every configured machine's health, name-ordered |
-| `machine.kill` | `machine`, `slug` | `{}` (addressed by machine + slug, not host/shed) |
+| `machines.list` | — | `machines[]` — every configured machine's health, name-ordered, each with its `craze` source's state (below) |
+| `machine.kill` | `machine`, `slug` | `{}` (addressed by machine + slug, not host/shed). For a **craze row**, `slug` is the row's `tab_id` — its End tab closes the roost tab the session runs in; a craze row's own slug is its hostId, not a tab id |
 | `rc.inject_test` | `shed`, `slug`, `kind?`, `display_name?`, `workdir?`, `lifecycle?`, `attention?` | `{}` — **test mode only**; puts a row into that shed's roost snapshot. `slug` must parse as a roost tab id, and `kind` must be one roost has an adapter for (anything else would be an unowned tab, which a real snapshot never lists) |
 | `roost.probe` | `target` | `target`, `probe` (its `fingerprint` nested inside) and `plan` — a read-only look at a shed or machine's `roost-session` state. The plan matrix row comes back from here too, so a caller that needs only the row does not also have to call `roost.preview` |
 | `roost.preview` | `target` | the plan (Install/Update/Start/Report/nothing to do) plus the sentence naming where the bytes would come from |
@@ -189,22 +189,64 @@ returns them. **A shed with no `roost-session` lists no sessions**, which is wha
 pane's empty state says — and it offers the setup, which happens on the shed's own card.
 See the roost project's own docs for the daemon and its IPC contract.
 
+### Craze sessions (Tauri)
+
+Each host — this machine, every configured machine, every running shed — has a **craze
+source**: its craze hub's live session list (craze is the provider abstraction for cursor,
+grok, gx and native sessions). Its rows ride `rc.list` beside roost's, stamped
+`source: "craze"`, `kind: "craze"`, with `slug` = the session's **hostId**, the hub's own
+facts (`provider`, `model`, `doing`, `head_ask_summary`, `last_reply`, `attached`,
+`start_error`, `pending_approvals` — a count here — `permission_mode`,
+`provider_session_id`), and `agent_lane: {kind: "craze", session_id: <hostId>}`.
+
+**For a craze session the hub row IS the row.** A roost tab owned by craze (a craze TUI)
+folds into the hub row it names — the row gains that tab's `tab_id`, and the tab is not
+listed as a roost row — but only while the host's craze feed is **live**; with it dormant,
+offline or absent, roost's row stands alone as before. A craze row a source still holds while
+it is not live is the last known one: `stale: true`, `approximate: true`. The fold is computed
+per host and never crosses machines.
+
+This machine's source is **eager** (one roster connection from launch; its hub is born in the
+app's own session). A **remote** machine's or a shed's is **attach-only**: a find-only probe
+(`craze providers --hub --json`, which never starts a hub) runs every 30 s while there is no
+hub, and the roster attaches only once one is running — the app never starts a hub on another
+machine in the background. Every status row (`machines.list`, `rc.list`'s `machines`) carries
+the source's state:
+
+| field | meaning |
+|-------|---------|
+| `craze.state` | `live` (attached), `dormant` (craze there, no hub running), `offline` (it dropped, or could not be asked), or `absent` (never reached — and not installed, which renders as absent) |
+| `craze.cause` | an offline (or not-installed) state's class: `unreachable`, `too_old`, `failed`, `not_installed` |
+| `craze.create`, `craze.create_options` | the LIVE hub's capabilities; `false` otherwise |
+
+A machine whose craze is too old says so on its Machines-pane card ("craze on this machine is
+too old for shed; update it", `machines.dump`'s `craze_note`); a machine without craze says
+nothing.
+
 ### Agent lanes (Tauri)
 
-A row whose roost tab reported an agent server carries an `agent_lane` stamp, and these ops
-open a live transcript on it. `session_id` is the **agent's** session id from that stamp, not
-the tab's slug. The full contract — staging, reconnects, the answer forms, the failure codes
-— is [Agent lanes](agent-lanes.md).
+A row that carries an `agent_lane` stamp — an opencode tab that reported its server, or a
+craze row — opens a live transcript through these ops. `session_id` is the **agent's**
+session id from that stamp (a craze row's hostId), not the tab's slug, and **`kind` is
+required on every op**: it is the stamp's `kind`, and a craze hostId and an opencode session id
+are separate namespaces. The full contract — staging, reconnects, the answer forms, the
+failure codes — is [Agent lanes](agent-lanes.md).
 
 | op | params | result |
 |----|--------|--------|
-| `lane.open` | `machine`, `session_id` | `{session}` — the session row alone. Idempotent: a second call re-answers from the open lane |
-| `lane.messages` | `machine`, `session_id` | `{messages, activity, generation, stale, ended, capabilities, settings}` — the staged view, never a half-seeded one |
-| `lane.approvals` | `machine`, `session_id` | `{approvals}` — pending only, oldest first |
-| `lane.send` | `machine`, `session_id`, `text`, `mode?` (`queue` \| `interject`) | `{}` |
-| `lane.cancel` | `machine`, `session_id` | `{}` |
-| `lane.answer` | `machine`, `session_id`, `approval_id`, `answer` | `{}` |
-| `lane.close` | `machine`, `session_id` | `{}` — idempotent |
+| `lane.open` | `machine`, `kind`, `session_id` | `{session}` — the session row alone. Idempotent: a second call re-answers from the open lane |
+| `lane.messages` | `machine`, `kind`, `session_id` | `{messages, activity, generation, stale, ended, capabilities, settings}` — the staged view, never a half-seeded one |
+| `lane.approvals` | `machine`, `kind`, `session_id` | `{approvals}` — pending only, oldest first |
+| `lane.send` | `machine`, `kind`, `session_id`, `text`, `mode?` (`queue` \| `interject`) | `{}` |
+| `lane.cancel` | `machine`, `kind`, `session_id` | `{}` |
+| `lane.answer` | `machine`, `kind`, `session_id`, `approval_id`, `answer` | `{}` |
+| `lane.stop` | `machine`, `kind`, `session_id` | `{}` — ends the **session** (craze's `session.stop`), answered on craze's receipt; the lane ends (`ended`) and the row leaves when the session closes. Refused by a session whose capabilities say `stop: false` |
+| `lane.close` | `machine`, `kind`, `session_id` | `{}` — idempotent |
+
+Every frame reaches the frontend as the `lane-event` Tauri event, `{machine, kind, session_id,
+event}`. A craze lane is evicted when its row leaves its machine's craze source (removed, a
+reseed that no longer lists it, the hub gone, the host removed, its tab ended); a roost
+snapshot never evicts one.
 
 **What the session can do is read from `lane.messages`, not `lane.open`.** Capabilities are
 per session and ride the lane's stream (a craze session's change with its incarnation), so
@@ -225,9 +267,12 @@ backend's view — the two can disagree, and have.
 | `agents.dump` | on the Agents pane | `{sessions, empty}` — `empty` is the rendered empty state (`{state, title, body, action}`), `null` when rows rendered. `state` is `loading` \| `failed` \| `unreachable` \| `empty`: four blanks wearing one screen, and only `empty` offers the bootstrap |
 | `launch.dump` | while the New-session dialog is open | `{launch}` — `{rendered, values, create_enabled}`, `null` when none is mounted: the dialog's own rendered text, each labelled control's current value keyed by its label (what was typed is not text content), and whether its Create button is enabled — all three read off the mounted DOM |
 | `egress.profiles` | on the Egress pane | `{egress}` |
-| `machines.dump` | on the Machines pane | `{machines}` — a row per machine with its `status` word, `detail` line, and grouped session slugs |
+| `machines.dump` | on the Machines pane | `{machines}` — a row per machine with its `status` word, `detail` line, and grouped session slugs, plus its `craze_note`: the note the card renders about the machine's craze ("craze on this machine is too old for shed; update it"), `null` when it says nothing — a machine without craze is not a problem to report |
 | `sidebar.dump` | **always** | `{servers, machines}` — the sidebar's status foot |
-| `lane.dump` | while the transcript panel is open | `{lane}` — what the panel rendered: its rows, approval cards, `kind` badge, Interject toggle and `can_cancel` (all read off `lane.messages`' `capabilities`; Cancel and Interject exist only when the capabilities offer them, and are live only while the session is working), `stale`, `ended`, and its error; `null` when none is mounted |
+| `lane.dump` | while the transcript panel is open | `{lane}` — what the panel rendered: its rows, approval cards, `kind` badge (and `lane_kind`, the kind it was opened with), the `permission` line (`bypass` reads "runs tools without asking"), Interject toggle, `can_cancel` and `stop` (`{confirming}`, or `null` with no Stop button) — all read off `lane.messages`' `capabilities`; Cancel, Interject and Stop exist only when the capabilities offer them, and Cancel/Interject are live only while the session is working — `stale`, `ended`, and its error; `null` when none is mounted |
+
+The transcript panel is mounted by `ui.show_lane {machine, kind, session_id}` (the card's
+Transcript affordance, which is a click) and unmounted by `ui.close_lane`.
 
 The New-session dialog is driven the same way: `ui.show_launch` opens it, and — **in test
 mode only** — `ui.fill_launch {mode?, target?, command?, workdir?}` types into it (`mode` is
@@ -273,6 +318,13 @@ When launched with `SHED_DESKTOP_TEST_MODE=1`, `identify` reports `test_mode: tr
 `mock_base_url` the app's HTTP clients were redirected to, so the harness can confirm a run
 is hermetic before asserting anything. Fault-injection ops (like `policy.set`) are gated
 behind this flag.
+
+`SHED_TAURI_CRAZE_PATH` (Tauri, test mode **and** a debug build) names the directory this
+machine's craze source finds `craze` in: the local dial then runs craze's ladder JAILED to its
+first two rungs, with `PATH` exactly that directory and nothing of the app's environment but
+`HOME`, `CRAZE_HOME` and `CRAZE_RUNTIME_DIR`. Unset in test mode, the app has no local craze
+source; a remote one exists in test mode only through the fake-`ssh` seam
+(`SHED_TAURI_SSH_BIN`), jailed the same way.
 
 Two launch-time overrides exist only in test mode, both taking comma-separated server
 names: `SHED_DESKTOP_MOCK_UNREACHABLE_HOSTS` points a host at a closed port (a

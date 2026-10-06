@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 
 import type { AgentsEmptyState, AgentsLoad } from "@/lib/agentsEmpty";
+import { killTarget } from "@/lib/crazeRows";
 
 export type Pane = "sheds" | "machines" | "approvals" | "agents" | "activity" | "egress" | "system";
 
@@ -967,7 +968,27 @@ export type RcSession = {
   activity?: string | null;
   activity_at?: string | null;
   last_message?: string | null;
-  pending_approvals?: RcFeedApproval[] | null;
+  /** A roost row's open approvals, when a feed carries them (none does today);
+   *  a CRAZE row's open-ask COUNT (`pendingAsks`, plan 025 §3.6.3). Read it
+   *  through the row's `source` — the two are different facts. */
+  pending_approvals?: RcFeedApproval[] | number | null;
+  /** Which feed produced this row: `"roost"` (a roost tab) or `"craze"` (a
+   *  machine's craze hub roster, plan 025 §3.6.3 — the hub row IS the row for
+   *  a craze session, and a roost tab craze owns folds into it). */
+  source?: "roost" | "craze" | string | null;
+  /** The craze roster's own facts (plan 025 §3.6.3), on a craze row only. */
+  provider?: string | null;
+  model?: string | null;
+  doing?: string | null;
+  head_ask_summary?: string | null;
+  last_reply?: string | null;
+  attached?: number | null;
+  start_error?: string | null;
+  permission_mode?: string | null;
+  provider_session_id?: string | null;
+  /** The row's facts came from a cheap or stale read — rendered as "last
+   *  known". Every row of a craze source that is not live has it. */
+  approximate?: boolean | null;
   /** Where this session was reached FROM — `machine:<name>` or `<host>/<shed>`.
    *  Injected client-side by the backend (like `host`/`shed` already are), never
    *  a wire field, so the hub contract and shed-mobile's DTOs are untouched.
@@ -991,7 +1012,9 @@ export type RcSession = {
    *  would leave a card stuck demanding attention forever. */
   attention?: boolean;
   /** The roost tab id backing a machine row (a string — roost's own ids are
-   *  strings on the wire); absent for a shed session. */
+   *  strings on the wire); absent for a shed session. On a CRAZE row it is the
+   *  roost tab the merge attached to the session (plan 025 §3.6.3) — what its
+   *  End tab closes — and absent for a headless one. */
   tab_id?: string;
   /** The agent lane behind this row, if it has one (plan 015 §3.4). Stamped
    *  client-side like `origin`/`machine`, from what the tab's adapter reported.
@@ -1015,15 +1038,30 @@ export type RcSession = {
  *  Its PRESENCE is the capability signal: a row that has it gets a Transcript
  *  affordance, a row that does not gets none. */
 export type AgentLane = {
-  /** Which adapter speaks to it — `"opencode"` or `"gx"` today. The backend
+  /** Which adapter speaks to it — `"opencode"` or `"craze"`. The backend
    *  dispatches on this string and refuses one it has no adapter for by name
    *  (`unsupported_lane`), so a kind stamped by a newer core than the binary
-   *  reading it is a visible refusal rather than a silent blank panel. */
+   *  reading it is a visible refusal rather than a silent blank panel. Every
+   *  `lane.*` op takes it: a craze hostId and an opencode session id are
+   *  different namespaces (plan 025 §3.6.4). */
   kind: string;
   /** The AGENT's own session id — the address every `lane.*` op takes, and not
-   *  the roost tab id (`tab_id` / `slug`). */
+   *  the roost tab id (`tab_id` / `slug`). A craze row's is its hostId. */
   session_id: string;
-  server_url: string;
+  /** The reported loopback URL — roost-stamped lanes only; a craze lane is
+   *  reached through its machine's hub, not a URL. */
+  server_url?: string;
+};
+
+/** A host's craze source, as `rc.list`'s `machines[].craze` reports it (plan
+ *  025 §3.6.2). `absent` is "never reached" and "not installed" alike; `cause`
+ *  names an offline (or not-installed) state's class (`too_old`,
+ *  `unreachable`, …). */
+export type CrazeStatus = {
+  state: "live" | "dormant" | "offline" | "absent" | string;
+  cause?: string | null;
+  create: boolean;
+  create_options: boolean;
 };
 
 /** A configured machine's health, for the sessions view's group rows. A machine
@@ -1040,6 +1078,8 @@ export type MachineStatus = {
   /** Why it is unreachable, verbatim from the watcher: "no route to host" and
    *  "nothing is listening on 1029" are different problems. */
   detail?: string | null;
+  /** This host's craze source (plan 025 §3.6.2). */
+  craze?: CrazeStatus | null;
 };
 
 /** The `rc.list` result: live sessions (shed AND machine), the per-shed
@@ -1203,10 +1243,16 @@ export async function rcKillMachine(machine: string, slug: string): Promise<void
  *  ADDRESS the row carries (`machine`, which is a machine's bare name and a
  *  shed's `roost:<server>/<shed>` token), so the one entry point a card uses
  *  needs no origin special-case at all. `rcKill`'s `(host, shed, slug)` door is
- *  the fallback for a payload too old to stamp an address. */
+ *  the fallback for a payload too old to stamp an address.
+ *
+ *  **A craze row's End tab closes its TAB**, by the typed `tab_id` — never by
+ *  its slug, which is a craze hostId (plan 025 §3.6.5). The rule is
+ *  `crazeRows.ts`'s `killTarget`, pinned on node's test runner. */
 export async function killSession(s: RcSession): Promise<void> {
-  if (s.machine) return rcKillMachine(s.machine, s.slug);
-  return rcKill(s.shed, s.slug, s.host);
+  const target = killTarget(s);
+  if (!target) throw new Error("this session has no tab to end");
+  if (target.via === "machine") return rcKillMachine(target.machine, target.slug);
+  return rcKill(target.shed, target.slug, target.host);
 }
 
 /** The Agents pane's empty state — the title, the sentence, and the offer beside
@@ -1268,6 +1314,9 @@ export type MachinePaneRow = {
   status: string;
   detail: string;
   sessions: string[];
+  /** The craze note the card renders (`crazeMachineNote`) — "too old",
+   *  or `null` when it says nothing (plan 025 §3.6.5). */
+  craze_note?: string | null;
   /** The card's roost sub-line, as rendered (plan 019 §3.6/C8) —
    *  `RoostDumpRow` from `@/lib/roost`, kept as `unknown` here so this module
    *  doesn't need to import roost's types just to describe its shape. */
@@ -1534,11 +1583,11 @@ export type LaneAnswer =
   | { question: string[][]; custom_text?: (string | null)[] }
   | { reject: true };
 
-/** `{machine, session_id, event}` — the Tauri `lane-event` payload. The panel
- *  only reads the address (it re-reads the staged view rather than folding
- *  frames itself, so what it renders is the same truth `lane.messages` answers
- *  with), which is why `event` stays `unknown`. */
-export type LaneEventEnvelope = { machine?: unknown; session_id?: unknown; event?: unknown };
+/** `{machine, kind, session_id, event}` — the Tauri `lane-event` payload. The
+ *  panel only reads the address (it re-reads the staged view rather than
+ *  folding frames itself, so what it renders is the same truth `lane.messages`
+ *  answers with), which is why `event` stays `unknown`. */
+export type LaneEventEnvelope = { machine?: unknown; kind?: unknown; session_id?: unknown; event?: unknown };
 
 /** The Tauri event every lane frame arrives on (`lane::LANE_EVENT`). */
 export const LANE_EVENT = "lane-event";
@@ -1590,46 +1639,60 @@ async function laneInvoke<T>(cmd: string, args: Record<string, unknown>): Promis
 /** Start (or re-answer) a live transcript. Idempotent: a second call for an
  *  already-open lane re-answers from the entry, it does not open a second
  *  subscription. */
-export async function laneOpen(machine: string, sessionId: string): Promise<LaneOpened> {
-  return laneInvoke<LaneOpened>("lane_open", { machine, sessionId });
+export async function laneOpen(machine: string, kind: string, sessionId: string): Promise<LaneOpened> {
+  return laneInvoke<LaneOpened>("lane_open", { machine, kind, sessionId });
 }
 
-export async function laneMessages(machine: string, sessionId: string): Promise<LaneView> {
-  return laneInvoke<LaneView>("lane_messages", { machine, sessionId });
+export async function laneMessages(machine: string, kind: string, sessionId: string): Promise<LaneView> {
+  return laneInvoke<LaneView>("lane_messages", { machine, kind, sessionId });
 }
 
-export async function laneApprovals(machine: string, sessionId: string): Promise<LaneApproval[]> {
-  const r = await laneInvoke<{ approvals?: LaneApproval[] }>("lane_approvals", { machine, sessionId });
+export async function laneApprovals(machine: string, kind: string, sessionId: string): Promise<LaneApproval[]> {
+  const r = await laneInvoke<{ approvals?: LaneApproval[] }>("lane_approvals", { machine, kind, sessionId });
   return r.approvals ?? [];
 }
 
 /** Send a prompt. `mode` defaults to `queue`; `interject` is REFUSED by the
  *  opencode adapter (`capabilities.interject` is false) rather than silently
  *  downgraded, so a caller that passes it gets `not_accepting`. */
-export async function laneSend(machine: string, sessionId: string, text: string, mode?: string): Promise<void> {
-  await laneInvoke("lane_send", { machine, sessionId, text, mode });
+export async function laneSend(
+  machine: string,
+  kind: string,
+  sessionId: string,
+  text: string,
+  mode?: string,
+): Promise<void> {
+  await laneInvoke("lane_send", { machine, kind, sessionId, text, mode });
 }
 
-export async function laneCancel(machine: string, sessionId: string): Promise<void> {
-  await laneInvoke("lane_cancel", { machine, sessionId });
+export async function laneCancel(machine: string, kind: string, sessionId: string): Promise<void> {
+  await laneInvoke("lane_cancel", { machine, kind, sessionId });
+}
+
+/** End the SESSION (plan 025 §3.6.4) — craze's `session.stop`. Answered on
+ *  craze's receipt; the lane ends, and the row leaves, when the session closes.
+ *  The panel offers it only when the session's capabilities say `stop`. */
+export async function laneStop(machine: string, kind: string, sessionId: string): Promise<void> {
+  await laneInvoke("lane_stop", { machine, kind, sessionId });
 }
 
 export async function laneAnswer(
   machine: string,
+  kind: string,
   sessionId: string,
   approvalId: string,
   answer: LaneAnswer,
 ): Promise<void> {
-  await laneInvoke("lane_answer", { machine, sessionId, approvalId, answer });
+  await laneInvoke("lane_answer", { machine, kind, sessionId, approvalId, answer });
 }
 
 /** End the subscription and release the transport. Idempotent, and deliberately
  *  BEST-EFFORT: this runs from the panel's unmount cleanup, where a throw would
  *  escape into React and where an unmount racing an eviction (the tab went away)
  *  is normal, not an error. */
-export async function laneClose(machine: string, sessionId: string): Promise<void> {
+export async function laneClose(machine: string, kind: string, sessionId: string): Promise<void> {
   try {
-    await laneInvoke("lane_close", { machine, sessionId });
+    await laneInvoke("lane_close", { machine, kind, sessionId });
   } catch {
     /* the lane is already gone — which is what close asked for */
   }
@@ -1680,10 +1743,16 @@ export type LaneApprovalCard = {
 export type LaneReport = {
   machine: string;
   session_id: string;
+  /** The lane's kind as the panel was OPENED with it — the address half every
+   *  `lane.*` call it makes carries (plan 025 §3.6.4). */
+  lane_kind: string;
   /** Which adapter is behind this panel (the view's `capabilities.kind`), and
    *  what the header badge says. `""` until a seed carrying capabilities has
    *  swapped in. */
   kind: string;
+  /** The header's permission line (`permissionLine` — `bypass` reads "runs
+   *  tools without asking"), or `null` when the session states none. */
+  permission: string | null;
   title: string;
   cwd: string;
   activity: string;
@@ -1708,6 +1777,10 @@ export type LaneReport = {
    *  craze session may) gets one — enabled only while the session is Working,
    *  because that is the only time the agent accepts one. */
   interject: { on: boolean; enabled: boolean } | null;
+  /** The Stop button (plan 025 §3.6.5): `null` when the session's capabilities
+   *  do not offer `stop` and no button is rendered at all; otherwise whether
+   *  its inline confirm is open. */
+  stop: { confirming: boolean } | null;
   error: string | null;
 };
 

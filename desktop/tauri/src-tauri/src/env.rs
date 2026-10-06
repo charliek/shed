@@ -88,6 +88,24 @@ pub struct Env {
     /// never read outside test mode — and never read in a release build either,
     /// for the reason on [`exec_seam`].
     pub roost_jail_fs_root: bool,
+    /// TEST-ONLY craze seam: `SHED_TAURI_CRAZE_PATH`, a directory this
+    /// machine's craze source finds `craze` in (plan 025 §3.6.1). When set, the
+    /// local dial runs the JAILED ladder (rungs 1–2 only) with `PATH` set to
+    /// it and nothing else of this process's environment but
+    /// [`Self::craze_env`]; when unset in test mode there is no local craze
+    /// source at all.
+    ///
+    /// It decides which binary the app execs, so it is an [`exec_seam`]: test
+    /// mode AND a debug build, like [`Self::ssh_bin`] — a release build
+    /// ignores it, whatever the mode says.
+    pub craze_path: Option<PathBuf>,
+    /// What the jailed local craze dial passes through from this process's own
+    /// environment beside the seam's `PATH`: `HOME`, `CRAZE_HOME` and
+    /// `CRAZE_RUNTIME_DIR`, those that are set. The harness sets short ones
+    /// (a craze runtime dir must be short, 0700, and under no group-writable
+    /// ancestor). Read only alongside [`Self::craze_path`], so empty in
+    /// production.
+    pub craze_env: Vec<(String, String)>,
     /// The host-agent `extensions.yaml` the EMBEDDED broker loads (`SHED_TAURI_EXTENSIONS_CONFIG`,
     /// else the daemon default `~/.config/shed/extensions.yaml`). Only read in embedded /
     /// headless-coexist mode; external mode never touches it. The harness overrides it to
@@ -163,9 +181,28 @@ impl Env {
             RELEASE_BUILD,
             var("SHED_TAURI_ROOST_JAIL").as_deref(),
         );
-        for refusal in [ssh_refusal, jail_refusal].into_iter().flatten() {
+        let (craze_path, craze_refusal) = exec_seam(
+            test_mode,
+            RELEASE_BUILD,
+            "SHED_TAURI_CRAZE_PATH",
+            var("SHED_TAURI_CRAZE_PATH"),
+        );
+        for refusal in [ssh_refusal, jail_refusal, craze_refusal]
+            .into_iter()
+            .flatten()
+        {
             eprintln!("{refusal}");
         }
+        // Only beside the seam: the jailed dial is the one consumer, and a
+        // production run passes the whole environment through anyway.
+        let craze_env = if craze_path.is_some() {
+            ["HOME", "CRAZE_HOME", "CRAZE_RUNTIME_DIR"]
+                .into_iter()
+                .filter_map(|k| var(k).map(|v| (k.to_string(), v)))
+                .collect()
+        } else {
+            Vec::new()
+        };
         Self {
             test_mode,
             mock_base_url: var("SHED_TAURI_MOCK_BASE_URL"),
@@ -173,6 +210,8 @@ impl Env {
             roost_sockets,
             ssh_bin: ssh_bin.map(PathBuf::from),
             roost_jail_fs_root,
+            craze_path: craze_path.map(PathBuf::from),
+            craze_env,
             config_path,
             socket_path: var("SHED_TAURI_SOCKET")
                 .map(PathBuf::from)
@@ -199,6 +238,8 @@ impl Env {
             roost_sockets: self.roost_sockets.clone(),
             ssh_bin: self.ssh_bin.clone(),
             test_mode: self.test_mode,
+            craze_path: self.craze_path.clone(),
+            craze_env: self.craze_env.clone(),
         }
     }
 }
@@ -236,7 +277,9 @@ const RELEASE_BUILD: bool = !cfg!(debug_assertions);
 /// rather than silent: a harness that somehow ran against a release binary must
 /// read as a loud misconfiguration, not as a mysteriously real `ssh`.
 ///
-/// **Only these two.** The other seams in this file — `SHED_TAURI_MOCK_BASE_URL`,
+/// **Only these three** (`SHED_TAURI_CRAZE_PATH` joined the two plan-019
+/// seams in plan 025: it picks the directory the local craze dial execs
+/// from). The other seams in this file — `SHED_TAURI_MOCK_BASE_URL`,
 /// `SHED_TAURI_ROOST_SOCKETS`, `SHED_TAURI_SHED_CONFIG` —
 /// redirect an HTTP base, a socket path or a config path: the worst they do is
 /// point this process's own reads somewhere unhelpful. These two pick an
@@ -433,6 +476,22 @@ mod tests {
                 "the line names the variable it ignored: {refusal:?}"
             );
         }
+
+        // The craze seam rides the same gate (plan 025 §3.6.1): it picks the
+        // directory the local craze dial execs from.
+        let (craze, refusal) = exec_seam(true, RELEASE, "SHED_TAURI_CRAZE_PATH", Some("/fake/bin"));
+        assert_eq!(craze, None, "a release build never execs a test craze");
+        assert!(refusal.is_some_and(|r| r.contains("SHED_TAURI_CRAZE_PATH")));
+        assert_eq!(
+            exec_seam(
+                true,
+                RELEASE_BUILD,
+                "SHED_TAURI_CRAZE_PATH",
+                Some("/fake/bin")
+            ),
+            (Some("/fake/bin"), None),
+            "and a test build honours it"
+        );
 
         // Nothing set, nothing said: the line is about a variable that was SEEN.
         assert_eq!(

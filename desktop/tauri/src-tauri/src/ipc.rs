@@ -62,10 +62,14 @@ fn err(code: &str, message: impl Into<String>) -> (String, String) {
     (code.to_string(), message.into())
 }
 
-/// `(machine, session_id)` — the address every `lane.*` op takes.
-fn lane_target(params: &Value) -> Result<(String, String), (String, String)> {
+/// `(machine, kind, session_id)` — the address every `lane.*` op takes. The
+/// kind is the row's `agent_lane.kind` and is REQUIRED (plan 025 §3.6.4): a
+/// craze hostId and an opencode session id are separate namespaces, and a
+/// lane op that guessed which one it meant could address the wrong lane.
+fn lane_target(params: &Value) -> Result<(String, String, String), (String, String)> {
     Ok((
         req_str(params, "machine")?.to_string(),
+        req_str(params, "kind")?.to_string(),
         req_str(params, "session_id")?.to_string(),
     ))
 }
@@ -129,13 +133,15 @@ pub(crate) async fn rc_list_payload(
     // The authoritative half — which removes a stopped shed's watcher — rides on
     // the unfiltered `sheds.list`/`sheds.refresh`, which is the only caller that
     // knows which SERVERS answered (see [`observe_reachability`]).
-    machines.observe_sheds(
-        &targets
-            .iter()
-            .map(|(s, target)| (target.server_name.clone(), s.name.clone()))
-            .collect::<Vec<_>>(),
-        &[],
-    );
+    machines
+        .observe_sheds(
+            &targets
+                .iter()
+                .map(|(s, target)| (target.server_name.clone(), s.name.clone()))
+                .collect::<Vec<_>>(),
+            &[],
+        )
+        .await;
     // ONE lock acquisition for the rows and the health — see
     // `RoostHosts::snapshot`: reading them separately can produce a frame where
     // a row is `stale: false` while its host is `reachable: false`.
@@ -189,7 +195,7 @@ pub(crate) fn sheds_payload(r: &Reachability) -> Value {
 /// itself: `Backend` is `shed-app`'s and knows nothing about this app's host
 /// registry, and giving it a callback would be a layering inversion for three
 /// call sites.
-pub(crate) fn observe_reachability(hosts: &crate::roost_hosts::RoostHosts, r: &Reachability) {
+pub(crate) async fn observe_reachability(hosts: &crate::roost_hosts::RoostHosts, r: &Reachability) {
     use shed_core::models::ShedStatus;
 
     let failed: std::collections::HashSet<&str> =
@@ -211,7 +217,7 @@ pub(crate) fn observe_reachability(hosts: &crate::roost_hosts::RoostHosts, r: &R
         .chain(hosts.servers())
         .filter(|server| !failed.contains(server.as_str()))
         .collect();
-    hosts.observe_sheds(&running, &answered);
+    hosts.observe_sheds(&running, &answered).await;
 }
 
 /// A required string param, or a `bad_request` error naming the missing key — the
@@ -601,11 +607,11 @@ impl Handler {
             // closes the lane. Two doors into one `Lanes` (`lib.rs`'s commands
             // and this module's `lane.*`), not three.
             "ui.show_lane" => {
-                let (machine, session_id) = lane_target(params)?;
+                let (machine, kind, session_id) = lane_target(params)?;
                 present_main_window(&self.app);
                 let _ = self.app.emit(
                     "show-lane",
-                    json!({ "machine": machine, "session_id": session_id }),
+                    json!({ "machine": machine, "kind": kind, "session_id": session_id }),
                 );
                 Ok(json!({}))
             }
@@ -616,7 +622,7 @@ impl Handler {
             "app.screenshot" => self.screenshot().await,
             "sheds.list" => {
                 let reachability = self.backend.refresh().await;
-                observe_reachability(&self.machines, &reachability);
+                observe_reachability(&self.machines, &reachability).await;
                 Ok(sheds_payload(&reachability))
             }
             "sheds.refresh" => self.sheds_refresh().await,
@@ -676,6 +682,7 @@ impl Handler {
             "lane.cancel" => self.lane_cancel(params).await,
             "lane.answer" => self.lane_answer(params).await,
             "lane.close" => self.lane_close(params),
+            "lane.stop" => self.lane_stop(params).await,
             "lane.dump" => Ok(self.lane_dump()),
             "agents.dump" => Ok(self.agents_dump()),
             "prefs.get" => Ok(self.prefs_get()),
@@ -911,7 +918,7 @@ impl Handler {
         let _ = self.app.emit("refresh", json!({ "token": token }));
         if !has_frontend {
             let reachability = self.backend.refresh().await;
-            observe_reachability(&self.machines, &reachability);
+            observe_reachability(&self.machines, &reachability).await;
             return Ok(sheds_payload(&reachability));
         }
         let deadline = Instant::now() + REFRESH_WAIT;
@@ -1380,7 +1387,7 @@ impl Handler {
     // `already_resolved`, `unauthorized`, …) plus `no_lane` for a row that has
     // no transcript to show. See [`crate::lane::LaneFailure`].
 
-    /// `lane.open {machine, session_id}` → `{session}`.
+    /// `lane.open {machine, kind, session_id}` → `{session}`.
     ///
     /// The session row alone: what the session can do rides its stream and is
     /// answered by `lane.messages` (plan 025 §3.2.6).
@@ -1389,53 +1396,67 @@ impl Handler {
     /// entry rather than opening a second subscription, and two concurrent calls
     /// build ONE.
     async fn lane_open(&self, params: &Value) -> Result<Value, (String, String)> {
-        let (machine, session_id) = lane_target(params)?;
+        let (machine, kind, session_id) = lane_target(params)?;
         self.lanes
-            .open(&machine, &session_id)
+            .open(&machine, &kind, &session_id)
             .await
             .map_err(lane_err)
     }
 
-    /// `lane.messages {machine, session_id}` → `{messages, activity, generation,
-    /// stale, ended, capabilities, settings}` — the staged-then-swapped view,
-    /// never a half-seeded one, and the one place a client reads what the
-    /// session can do.
+    /// `lane.messages {machine, kind, session_id}` → `{messages, activity,
+    /// generation, stale, ended, capabilities, settings}` — the
+    /// staged-then-swapped view, never a half-seeded one, and the one place a
+    /// client reads what the session can do.
     fn lane_messages(&self, params: &Value) -> Result<Value, (String, String)> {
-        let (machine, session_id) = lane_target(params)?;
-        self.lanes.messages(&machine, &session_id).map_err(lane_err)
-    }
-
-    /// `lane.approvals {machine, session_id}` → `{approvals}` — what is blocking
-    /// on the human, this session's and its descendants'.
-    fn lane_approvals(&self, params: &Value) -> Result<Value, (String, String)> {
-        let (machine, session_id) = lane_target(params)?;
+        let (machine, kind, session_id) = lane_target(params)?;
         self.lanes
-            .approvals(&machine, &session_id)
+            .messages(&machine, &kind, &session_id)
             .map_err(lane_err)
     }
 
-    /// `lane.send {machine, session_id, text, mode?}` → `{}`.
+    /// `lane.approvals {machine, kind, session_id}` → `{approvals}` — what is
+    /// blocking on the human, this session's and its descendants'.
+    fn lane_approvals(&self, params: &Value) -> Result<Value, (String, String)> {
+        let (machine, kind, session_id) = lane_target(params)?;
+        self.lanes
+            .approvals(&machine, &kind, &session_id)
+            .map_err(lane_err)
+    }
+
+    /// `lane.send {machine, kind, session_id, text, mode?}` → `{}`.
     async fn lane_send(&self, params: &Value) -> Result<Value, (String, String)> {
-        let (machine, session_id) = lane_target(params)?;
+        let (machine, kind, session_id) = lane_target(params)?;
         let text = req_str(params, "text")?.to_string();
         let mode = crate::lane::parse_mode(params.get("mode").and_then(Value::as_str))
             .map_err(lane_err)?;
         self.lanes
-            .send(&machine, &session_id, &text, mode)
+            .send(&machine, &kind, &session_id, &text, mode)
             .await
             .map_err(lane_err)
     }
 
-    /// `lane.cancel {machine, session_id}` → `{}`.
+    /// `lane.cancel {machine, kind, session_id}` → `{}`.
     async fn lane_cancel(&self, params: &Value) -> Result<Value, (String, String)> {
-        let (machine, session_id) = lane_target(params)?;
+        let (machine, kind, session_id) = lane_target(params)?;
         self.lanes
-            .cancel(&machine, &session_id)
+            .cancel(&machine, &kind, &session_id)
             .await
             .map_err(lane_err)
     }
 
-    /// `lane.answer {machine, session_id, approval_id, answer}` → `{}`.
+    /// `lane.stop {machine, kind, session_id}` → `{}` — end the SESSION (plan
+    /// 025 §3.6.4): answered on craze's receipt; the lane ends, and the row
+    /// leaves, when the session's close arrives. Refused by a session whose
+    /// capabilities say `stop: false`.
+    async fn lane_stop(&self, params: &Value) -> Result<Value, (String, String)> {
+        let (machine, kind, session_id) = lane_target(params)?;
+        self.lanes
+            .stop(&machine, &kind, &session_id)
+            .await
+            .map_err(lane_err)
+    }
+
+    /// `lane.answer {machine, kind, session_id, approval_id, answer}` → `{}`.
     ///
     /// `answer` is one of `{choice: "<option id>"}` (the offered option, by its
     /// own id — what the panel sends), `{permission:
@@ -1444,22 +1465,22 @@ impl Handler {
     /// free text per question — or `{reject: true}`. See
     /// [`crate::lane::parse_answer`].
     async fn lane_answer(&self, params: &Value) -> Result<Value, (String, String)> {
-        let (machine, session_id) = lane_target(params)?;
+        let (machine, kind, session_id) = lane_target(params)?;
         let approval_id = req_str(params, "approval_id")?.to_string();
         let answer = params
             .get("answer")
             .ok_or_else(|| err("bad_request", "missing 'answer'"))?;
         let answer = crate::lane::parse_answer(answer).map_err(lane_err)?;
         self.lanes
-            .answer(&machine, &session_id, &approval_id, answer)
+            .answer(&machine, &kind, &session_id, &approval_id, answer)
             .await
             .map_err(lane_err)
     }
 
-    /// `lane.close {machine, session_id}` → `{}`. Idempotent.
+    /// `lane.close {machine, kind, session_id}` → `{}`. Idempotent.
     fn lane_close(&self, params: &Value) -> Result<Value, (String, String)> {
-        let (machine, session_id) = lane_target(params)?;
-        Ok(self.lanes.close(&machine, &session_id))
+        let (machine, kind, session_id) = lane_target(params)?;
+        Ok(self.lanes.close(&machine, &kind, &session_id))
     }
 
     /// `lane.dump` → what the transcript PANEL rendered (UI truth, like
@@ -2290,6 +2311,8 @@ mod tests {
             roost_sockets: std::collections::HashMap::new(),
             ssh_bin: None,
             roost_jail_fs_root: false,
+            craze_path: None,
+            craze_env: Vec::new(),
             config_path: PathBuf::new(),
             socket_path: PathBuf::from("/run/user/0/shed-tauri/shed-tauri.sock"),
             host_agent_socket: PathBuf::from("/run/user/0/shed/host-agent.sock"),

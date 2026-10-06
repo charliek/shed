@@ -754,16 +754,36 @@ jobs:
           cache-dependency-path: desktop/tauri/ui/package-lock.json
       - name: Frontend deps
         run: cd desktop/tauri/ui && npm ci
+      # The craze cells (plan 025 §3.5/§3.6.7: test_tauri_craze.py, the craze
+      # source's Rust cells) run against the REAL craze binaries at the pinned
+      # CRAZE_TEST_SHA, built by the shared composite action into the
+      # gitignored desktop/tools/shedtest/.craze-bin — which the Docker legs tar
+      # with desktop/tools, because the container only sees the repo layout.
+      - name: craze binaries at the pin (into the Docker legs' layout)
+        uses: ./.github/actions/craze-binaries
+        with:
+          shed-path: ${{ github.workspace }}
+          out-dir: desktop/tools/shedtest/.craze-bin
       # The Tauri crate's Linux-only approval-seam tests (polkit/libnotify gate is
       # fail-closed: never Approved without a real auth). Docker (ubuntu:24.04),
       # same image as the render gate below; no display needed.
+      #
+      # SHED_CRAZE_BIN_DIR is the IN-CONTAINER path (the action exported the
+      # host's), and SHED_CRAZE_REQUIRE=1 turns a skipped craze cell into a
+      # failure; desktop/Makefile forwards both into `docker run` by name.
       - name: Tauri crate tests (Linux)
+        env:
+          SHED_CRAZE_REQUIRE: "1"
+          SHED_CRAZE_BIN_DIR: /work/desktop/tools/shedtest/.craze-bin
         run: make -C desktop tauri-test-linux
       # The render gate: builds the frontend + the Tauri app and runs the
       # --target tauri hermetic e2e on WebKitGTK 2.44 under Xvfb (the pinned
       # WebView = the real CSS/render gate). GitHub runners allow privileged
       # docker run for the WebKitGTK web-process sandbox.
       - name: Tauri render gate + hermetic E2E (WebKitGTK)
+        env:
+          SHED_CRAZE_REQUIRE: "1"
+          SHED_CRAZE_BIN_DIR: /work/desktop/tools/shedtest/.craze-bin
         run: make -C desktop tauri-build-linux
 
   tauri-mac:
@@ -788,6 +808,14 @@ jobs:
       - name: Tauri clippy (standalone workspace)
         run: make -C desktop tauri-lint
       - uses: astral-sh/setup-uv@v6
+      # The craze cells run on the mac client too (plan 025 §3.5), against the
+      # pinned craze binaries built for darwin on this runner; the action
+      # exports SHED_CRAZE_BIN_DIR and SHED_CRAZE_REQUIRE=1 for the steps below.
+      - name: craze binaries at the pin (darwin)
+        uses: ./.github/actions/craze-binaries
+        with:
+          shed-path: ${{ github.workspace }}
+          out-dir: ${{ runner.temp }}/craze-bin
       - name: Hermetic Tauri E2E (macOS WKWebView)
         # A wider timeout scale buys headroom on a shared CI runner (as the swift
         # + tauri-linux legs do). WKWebView needs no Xvfb; the mac screenshot op is

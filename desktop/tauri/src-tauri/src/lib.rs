@@ -9,6 +9,7 @@
 
 mod approval;
 mod broker;
+mod craze;
 mod env;
 mod ipc;
 mod lane;
@@ -90,7 +91,7 @@ async fn list_sheds(
     // The frontend's own refresh is an authoritative shed listing too — it is
     // the one the dashboard runs on a timer, so a shed that stops while nobody
     // is driving the socket still loses its roost watcher (plan 019 §3.6).
-    ipc::observe_reachability(&machines, &reachability);
+    ipc::observe_reachability(&machines, &reachability).await;
     Ok(ipc::sheds_payload(&reachability))
 }
 
@@ -517,13 +518,18 @@ pub(crate) fn lane_error(failure: lane::LaneFailure) -> String {
 }
 
 /// `lane_open` — start (or re-answer) a live transcript for one agent session.
+/// `kind` is the row's `agent_lane.kind` (plan 025 §3.6.4).
 #[tauri::command]
 async fn lane_open(
     lanes: tauri::State<'_, Arc<lane::Lanes>>,
     machine: String,
+    kind: String,
     session_id: String,
 ) -> Result<serde_json::Value, String> {
-    lanes.open(&machine, &session_id).await.map_err(lane_error)
+    lanes
+        .open(&machine, &kind, &session_id)
+        .await
+        .map_err(lane_error)
 }
 
 /// `lane_messages` — the staged-then-swapped transcript view.
@@ -531,9 +537,12 @@ async fn lane_open(
 fn lane_messages(
     lanes: tauri::State<'_, Arc<lane::Lanes>>,
     machine: String,
+    kind: String,
     session_id: String,
 ) -> Result<serde_json::Value, String> {
-    lanes.messages(&machine, &session_id).map_err(lane_error)
+    lanes
+        .messages(&machine, &kind, &session_id)
+        .map_err(lane_error)
 }
 
 /// `lane_approvals` — what the session (or a descendant) is blocked on.
@@ -541,9 +550,12 @@ fn lane_messages(
 fn lane_approvals(
     lanes: tauri::State<'_, Arc<lane::Lanes>>,
     machine: String,
+    kind: String,
     session_id: String,
 ) -> Result<serde_json::Value, String> {
-    lanes.approvals(&machine, &session_id).map_err(lane_error)
+    lanes
+        .approvals(&machine, &kind, &session_id)
+        .map_err(lane_error)
 }
 
 /// `lane_send` — a prompt. `mode` defaults to `queue`.
@@ -551,13 +563,14 @@ fn lane_approvals(
 async fn lane_send(
     lanes: tauri::State<'_, Arc<lane::Lanes>>,
     machine: String,
+    kind: String,
     session_id: String,
     text: String,
     mode: Option<String>,
 ) -> Result<serde_json::Value, String> {
     let mode = lane::parse_mode(mode.as_deref()).map_err(lane_error)?;
     lanes
-        .send(&machine, &session_id, &text, mode)
+        .send(&machine, &kind, &session_id, &text, mode)
         .await
         .map_err(lane_error)
 }
@@ -567,10 +580,27 @@ async fn lane_send(
 async fn lane_cancel(
     lanes: tauri::State<'_, Arc<lane::Lanes>>,
     machine: String,
+    kind: String,
     session_id: String,
 ) -> Result<serde_json::Value, String> {
     lanes
-        .cancel(&machine, &session_id)
+        .cancel(&machine, &kind, &session_id)
+        .await
+        .map_err(lane_error)
+}
+
+/// `lane_stop` — end the SESSION (plan 025 §3.6.4), the twin of the
+/// `lane.stop` socket op. The panel offers it only when the session's
+/// capabilities say `stop`, behind an inline confirm.
+#[tauri::command]
+async fn lane_stop(
+    lanes: tauri::State<'_, Arc<lane::Lanes>>,
+    machine: String,
+    kind: String,
+    session_id: String,
+) -> Result<serde_json::Value, String> {
+    lanes
+        .stop(&machine, &kind, &session_id)
         .await
         .map_err(lane_error)
 }
@@ -581,13 +611,14 @@ async fn lane_cancel(
 async fn lane_answer(
     lanes: tauri::State<'_, Arc<lane::Lanes>>,
     machine: String,
+    kind: String,
     session_id: String,
     approval_id: String,
     answer: serde_json::Value,
 ) -> Result<serde_json::Value, String> {
     let answer = lane::parse_answer(&answer).map_err(lane_error)?;
     lanes
-        .answer(&machine, &session_id, &approval_id, answer)
+        .answer(&machine, &kind, &session_id, &approval_id, answer)
         .await
         .map_err(lane_error)
 }
@@ -597,9 +628,10 @@ async fn lane_answer(
 fn lane_close(
     lanes: tauri::State<'_, Arc<lane::Lanes>>,
     machine: String,
+    kind: String,
     session_id: String,
 ) -> serde_json::Value {
-    lanes.close(&machine, &session_id)
+    lanes.close(&machine, &kind, &session_id)
 }
 
 /// `add_machine` — the dialog's path into [`machines::add_from_json`].
@@ -1201,6 +1233,7 @@ pub fn run() {
             lane_cancel,
             lane_answer,
             lane_close,
+            lane_stop,
             machines_list,
             add_machine,
             open_terminal,
@@ -1404,6 +1437,18 @@ pub fn run() {
                     lanes.reconcile(machine, open);
                 }
             }));
+            // The craze half (plan 025 §3.6.4): a craze lane's row is its
+            // machine's craze source's, so its eviction rides that source —
+            // a `Removed`, a reseed that dropped the row, the hub gone, the
+            // host removed, its tab ended — not a roost snapshot.
+            let craze_hook = Arc::downgrade(&lanes);
+            machines.set_craze_observer(Arc::new(
+                move |machine: &str, gen: u64, gone: &[String]| {
+                    if let Some(lanes) = craze_hook.upgrade() {
+                        lanes.evict_craze(machine, gen, gone);
+                    }
+                },
+            ));
             app.manage(lanes.clone());
 
             // The terminal ops (preset resolution, launch, detection, the pref), shared

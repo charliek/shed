@@ -71,6 +71,9 @@ PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
 SHOTS = os.environ.get("SHED_LANE_SHOTS")
 
 MACHINE = "mini3"
+#: The lane kind every `lane.*` op here names — the rows' `agent_lane.kind`
+#: (plan 025 §3.6.4: the kind is half of a lane's address).
+KIND = "opencode"
 #: The workspace every session in this suite lives in. ONE directory on purpose:
 #: opencode scopes `/event`, `/session/status`, `/permission` and `/question` by
 #: it, so two sessions sharing one is the case where a leak would actually show
@@ -272,7 +275,7 @@ def _row(app: TauriClient, session_id: str) -> dict | None:
 
 
 def _open(app: TauriClient, session_id: str = LANE_SESSION) -> dict:
-    return app.call("lane.open", {"machine": MACHINE, "session_id": session_id})
+    return app.call("lane.open", {"machine": MACHINE, "kind": KIND, "session_id": session_id})
 
 
 def _ready(app: TauriClient, session_id: str = LANE_SESSION) -> dict:
@@ -299,7 +302,7 @@ def _ready(app: TauriClient, session_id: str = LANE_SESSION) -> dict:
 
 
 def _messages(app: TauriClient, session_id: str = LANE_SESSION) -> dict:
-    return app.call("lane.messages", {"machine": MACHINE, "session_id": session_id})
+    return app.call("lane.messages", {"machine": MACHINE, "kind": KIND, "session_id": session_id})
 
 
 def _texts(app: TauriClient, session_id: str = LANE_SESSION) -> list[str]:
@@ -308,11 +311,11 @@ def _texts(app: TauriClient, session_id: str = LANE_SESSION) -> list[str]:
 
 def _approvals(app: TauriClient, session_id: str = LANE_SESSION) -> list[dict]:
     return app.call("lane.approvals",
-                    {"machine": MACHINE, "session_id": session_id})["approvals"]
+                    {"machine": MACHINE, "kind": KIND, "session_id": session_id})["approvals"]
 
 
 def _close(app: TauriClient, session_id: str = LANE_SESSION) -> None:
-    app.call("lane.close", {"machine": MACHINE, "session_id": session_id})
+    app.call("lane.close", {"machine": MACHINE, "kind": KIND, "session_id": session_id})
 
 
 def _error(fn) -> ShedError:
@@ -358,7 +361,7 @@ def _panel(app: TauriClient, session_id: str = LANE_SESSION) -> dict:
     the panel itself calls `lane.open` on mount and `lane.close` on unmount, so
     this is a UI action, not a second door into the lane layer.
     """
-    app.call("ui.show_lane", {"machine": MACHINE, "session_id": session_id})
+    app.call("ui.show_lane", {"machine": MACHINE, "kind": KIND, "session_id": session_id})
     app.wait_until(lambda: _mounted(app, session_id), timeout=20,
                    what="the transcript panel to mount and report")
     return _dump(app)
@@ -563,7 +566,7 @@ def test_send_posts_prompt_async_to_the_pinned_session_only(app, oc):
     another, and a fake that answered 200 to anything would prove nothing.
     """
     _ready(app)
-    app.call("lane.send", {"machine": MACHINE, "session_id": LANE_SESSION,
+    app.call("lane.send", {"machine": MACHINE, "kind": KIND, "session_id": LANE_SESSION,
                            "text": "do the thing"})
     path = f"/session/{LANE_SESSION}/prompt_async"
     assert path in oc.post_paths, oc.post_paths
@@ -575,7 +578,7 @@ def test_send_posts_prompt_async_to_the_pinned_session_only(app, oc):
     # `interject` is advertised false, so it is REFUSED rather than quietly
     # downgraded into a queue.
     refused = _error(lambda: app.call(
-        "lane.send", {"machine": MACHINE, "session_id": LANE_SESSION,
+        "lane.send", {"machine": MACHINE, "kind": KIND, "session_id": LANE_SESSION,
                       "text": "now", "mode": "interject"}))
     assert refused.code == "not_accepting", refused
     assert oc.violations == []
@@ -626,7 +629,7 @@ def test_a_permission_ask_surfaces_and_is_answered_on_its_own_route(app, oc):
     assert panel["error"] is None
     _shot(app, "tauri-lane-approval.png")
 
-    app.call("lane.answer", {"machine": MACHINE, "session_id": LANE_SESSION,
+    app.call("lane.answer", {"machine": MACHINE, "kind": KIND, "session_id": LANE_SESSION,
                              "approval_id": ask,
                              "answer": {"permission": "allow-once"}})
     assert f"/permission/{ask}/reply" in oc.post_paths, oc.post_paths
@@ -635,7 +638,7 @@ def test_a_permission_ask_surfaces_and_is_answered_on_its_own_route(app, oc):
 
     # A second answer is the double-tap gate, not a second POST.
     again = _error(lambda: app.call(
-        "lane.answer", {"machine": MACHINE, "session_id": LANE_SESSION,
+        "lane.answer", {"machine": MACHINE, "kind": KIND, "session_id": LANE_SESSION,
                         "approval_id": ask, "answer": {"permission": "reject"}}))
     assert again.code == "already_resolved", again
     assert oc.post_paths.count(f"/permission/{ask}/reply") == 1
@@ -701,7 +704,7 @@ def test_a_question_surfaces_with_its_options_and_answers_on_the_question_route(
     assert card["buttons"] == [], "one question, one choice, no free text: a click IS the answer"
     _shot(app, "tauri-lane-question.png")
 
-    app.call("lane.answer", {"machine": MACHINE, "session_id": LANE_SESSION,
+    app.call("lane.answer", {"machine": MACHINE, "kind": KIND, "session_id": LANE_SESSION,
                              "approval_id": ask,
                              "answer": {"question": [["develop"]]}})
     assert json.loads(oc.post_body(f"/question/{ask}/reply")) == {
@@ -735,7 +738,7 @@ def test_a_question_surfaces_with_its_options_and_answers_on_the_question_route(
     # that is opencode's own shape (a custom answer is a label the ask did not
     # offer), so the wire is unchanged while the contract is now able to say
     # which entry the human typed.
-    app.call("lane.answer", {"machine": MACHINE, "session_id": LANE_SESSION,
+    app.call("lane.answer", {"machine": MACHINE, "kind": KIND, "session_id": LANE_SESSION,
                              "approval_id": free,
                              "answer": {"question": [["main"]],
                                         "custom_text": ["  a-branch-i-typed  "]}})
@@ -759,7 +762,7 @@ def test_a_question_surfaces_with_its_options_and_answers_on_the_question_route(
                    timeout=10, what="the strict question to reach the panel")
     before = len(oc.post_paths)
     err = _error(lambda: app.call("lane.answer", {
-        "machine": MACHINE, "session_id": LANE_SESSION, "approval_id": strict,
+        "machine": MACHINE, "kind": KIND, "session_id": LANE_SESSION, "approval_id": strict,
         "answer": {"question": [[]], "custom_text": ["something I typed"]}}))
     assert err.code == "bad_request", err
     assert oc.post_paths[before:] == [], \
@@ -770,7 +773,7 @@ def test_a_question_surfaces_with_its_options_and_answers_on_the_question_route(
     # reaches an adapter at all — the IPC grammar refuses it.
     before = len(oc.post_paths)
     err = _error(lambda: app.call("lane.answer", {
-        "machine": MACHINE, "session_id": LANE_SESSION, "approval_id": strict,
+        "machine": MACHINE, "kind": KIND, "session_id": LANE_SESSION, "approval_id": strict,
         "answer": {"choice": "main", "custom_text": ["typed"]}}))
     assert err.code == "bad_request", err
     assert "custom_text" in err.message and "choice" in err.message, err
@@ -852,7 +855,7 @@ def test_a_child_sessions_approval_surfaces_on_the_roots_panel(app, oc):
     assert approval["session_id"] == CHILD_SESSION, "attributed to the child"
     assert all(a["id"] != sibling_ask for a in _approvals(app)), _approvals(app)
 
-    app.call("lane.answer", {"machine": MACHINE, "session_id": LANE_SESSION,
+    app.call("lane.answer", {"machine": MACHINE, "kind": KIND, "session_id": LANE_SESSION,
                              "approval_id": child_ask,
                              "answer": {"permission": "allow-always"}})
     assert json.loads(oc.post_body(f"/permission/{child_ask}/reply")) == {
@@ -876,7 +879,7 @@ def test_cancel_aborts_the_pinned_session(app, oc):
     else."""
     _ready(app)
     before = oc.post_paths.count(f"/session/{LANE_SESSION}/abort")
-    app.call("lane.cancel", {"machine": MACHINE, "session_id": LANE_SESSION})
+    app.call("lane.cancel", {"machine": MACHINE, "kind": KIND, "session_id": LANE_SESSION})
     assert oc.post_paths.count(f"/session/{LANE_SESSION}/abort") == before + 1
     assert oc.violations == []
 

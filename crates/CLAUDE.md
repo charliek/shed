@@ -93,6 +93,16 @@ re-implemented per language. The root `CLAUDE.md` owns the monorepo layout + rel
   poll go through. It is ungated because mobile links `shed-app` with default features
   and needs the identical fold — the phone showing the same view the desktop shows is
   a property of one implementation, not two that have to agree.
+  `craze_rows.rs` (plan 025 §3.6.3, ungated for the same reason) is **the craze row
+  merge, D4 literally**: `fold_plan(roost_tabs, hub_rows)` for ONE machine — with the
+  hub feed live (`Some`) every craze-owned roost tab is absorbed (attached to the hub row
+  whose `provider_session_id` it names, or hidden when none does), with it down (`None`)
+  nothing is; only craze ownership folds, the newest tab of a session attaches, two rows
+  claiming one session resolve to the newer `since`/`startedAt` then the greater hostId.
+  The desktop applies it in `roost_hosts.rs`; the phone (CM3) links the same function.
+  `SshExec::spawn_duplex(command)` (C9) is the long-lived sibling of `SshExec::run` — the
+  same pinned config and private ControlMaster, all three bands piped, killed on drop —
+  that the desktop's remote craze dial runs `craze bridge --hub` through.
 - **`shed-core-ffi`** — a thin UniFFI wrapper (`crate-type = ["staticlib", "lib"]`)
   exposing a `ShedCore` object to Swift. The `.a` is what the app links (signing/notarization
   unchanged); `lib` is required so `cargo run -p shed-core-ffi --bin uniffi-bindgen` works

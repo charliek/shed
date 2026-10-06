@@ -251,7 +251,7 @@ step "update-version.sh --components desktop lands all four surfaces + both lock
 grep -q '^version = "0.8.0"' "${SCRATCH}/crates/Cargo.toml" || fail "crates/Cargo.toml didn't bump"
 grep -q '^version = "0.8.0"' "${SCRATCH}/desktop/tauri/src-tauri/Cargo.toml" || fail "tauri Cargo.toml didn't bump"
 [ "$(jq -r '.version' "${SCRATCH}/desktop/tauri/src-tauri/tauri.conf.json")" = "0.8.0" ] || fail "tauri.conf.json didn't bump"
-for dep in shed-core shed-app shed-broker shed-opencode; do
+for dep in shed-core shed-app shed-broker shed-opencode shed-craze; do
   grep -A1 "^name = \"${dep}\"$" "${SCRATCH}/crates/Cargo.lock" | grep -q '^version = "0.8.0"' \
     || fail "crates/Cargo.lock ${dep} entry didn't refresh"
   grep -A1 "^name = \"${dep}\"$" "${SCRATCH}/desktop/tauri/src-tauri/Cargo.lock" | grep -q '^version = "0.8.0"' \
@@ -940,23 +940,25 @@ ok "desktop (absent from the EMPTY production NEVER_SHIPPED) still exits 1 with 
 #   v3.0.0  plugin=3.0.0, desktop=3.0.0, NO host-agent VERSION (pre-migration →
 #           its walk falls back to this tag, so all three resolve a basis and a
 #           mis-attributed diff would show up as a WRONG component, not a crash).
-#   HEAD    exactly one commit, touching ONLY crates/shed-opencode.
+#   HEAD    exactly one commit, touching ONLY one adapter's crate (each in turn).
 #
-# The loop is over one adapter today (gx's own commit was removed with it);
-# kept as a loop rather than inlined so the next agent-lane adapter
-# (shed-craze, plan 025 C9) re-proves the same genericity by being ADDED to
-# this list, not by a second copy of the fixture. The assertion is desktop AND
-# ONLY desktop: the adapter never reaches the host-agent binary (shed-broker
-# has never linked it), so a lazy "add it everywhere" fix is red here too.
+# The loop is over both agent-lane adapters the Tauri app links — shed-opencode
+# and, since plan 025 C9, shed-craze (gx's own commit was removed with it) —
+# so each re-proves the same genericity by being ADDED to this list, not by a
+# second copy of the fixture. The assertion is desktop AND ONLY desktop: no
+# adapter reaches the host-agent binary (shed-broker has never linked one), so
+# a lazy "add it everywhere" fix is red here too.
 # ---------------------------------------------------------------------------
 FIX4="${SCRATCH}/reco-fixture-h4"
 mkdir -p "${FIX4}"
 git -C "${FIX4}" init -q
 gitf4() { git -C "${FIX4}" -c user.email=t@t -c user.name=t "$@"; }
-mkdir -p "${FIX4}/.claude-plugin" "${FIX4}/desktop" "${FIX4}/crates/shed-opencode/src"
+mkdir -p "${FIX4}/.claude-plugin" "${FIX4}/desktop" "${FIX4}/crates/shed-opencode/src" \
+  "${FIX4}/crates/shed-craze/src"
 printf '{"version": "3.0.0"}\n' > "${FIX4}/.claude-plugin/plugin.json"
 printf '3.0.0\n' > "${FIX4}/desktop/VERSION"
 printf 'pub fn fold() {}\n' > "${FIX4}/crates/shed-opencode/src/fold.rs"
+printf 'pub fn fold() {}\n' > "${FIX4}/crates/shed-craze/src/fold.rs"
 gitf4 add -A; gitf4 commit -q -m 'v3.0.0 base'
 gitf4 tag v3.0.0
 
@@ -966,7 +968,7 @@ run_reco4() {
   RECO_ERR="$(cat "${SCRATCH}/reco4.err")"
 }
 
-for adapter in shed-opencode; do
+for adapter in shed-opencode shed-craze; do
   step "recommend-components.sh: a ${adapter}-only change flags desktop (the Tauri app links it) and nothing else"
   printf 'pub fn fold() { /* changed */ }\n' > "${FIX4}/crates/${adapter}/src/fold.rs"
   gitf4 add -A; gitf4 commit -q -m "desktop: ${adapter} change"

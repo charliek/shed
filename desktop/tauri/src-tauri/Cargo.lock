@@ -4451,6 +4451,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "shed-craze"
+version = "0.8.1"
+dependencies = [
+ "async-trait",
+ "futures-util",
+ "serde",
+ "serde_json",
+ "shed-core",
+ "thiserror 1.0.69",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
 name = "shed-desktop-tauri"
 version = "0.8.1"
 dependencies = [
@@ -4469,6 +4483,7 @@ dependencies = [
  "serde_json",
  "shed-app",
  "shed-core",
+ "shed-craze",
  "shed-opencode",
  "tauri",
  "tauri-build",

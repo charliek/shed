@@ -347,13 +347,27 @@ def subproc_env(cfg: _Subproc, *, runtime_dir: Path, mock_base_url: str,
                 ssh_bin: object | None = None,
                 roost_jail: bool = False,
                 roost_install_bin: object | None = None,
-                roost_session_bin: object | None = None) -> dict[str, str]:
+                roost_session_bin: object | None = None,
+                craze_path: object | None = None,
+                craze_home: object | None = None,
+                craze_runtime_dir: object | None = None) -> dict[str, str]:
     """The launch env for a subprocess UI — the single source of the subprocess
     env-var contract, shared by the session launcher and a self-managed instance
     (down-host). HOME/XDG_RUNTIME_DIR/XDG_CONFIG_HOME are redirected to the
     throwaway `runtime_dir` (never the dev's ~/.shed, real runtime socket, or real
     prefs), config is pinned to the fixture, test mode + mock are set, and
-    `<PREFIX>_SOCKET` is cleared so the XDG default (under runtime_dir) is used."""
+    `<PREFIX>_SOCKET` is cleared so the XDG default (under runtime_dir) is used.
+
+    `craze_path` is the craze seam (`<PREFIX>_CRAZE_PATH`, plan 025 §3.6.1,
+    test-mode and debug-build only): the directory this machine's craze source
+    finds `craze` in — the app then dials it through the JAILED ladder with
+    `PATH` set to exactly that directory, and passes through only `HOME`,
+    `CRAZE_HOME` and `CRAZE_RUNTIME_DIR`. Unset, a hermetic app has no local
+    craze source at all. `craze_home` / `craze_runtime_dir` are craze's own
+    `CRAZE_HOME` / `CRAZE_RUNTIME_DIR` for that dial — the runtime dir must be
+    SHORT, 0700, and under `/tmp` (craze refuses one beneath a group-writable
+    ancestor, plan 025 Amendment A3). All three are set-or-cleared: a
+    developer's own `CRAZE_HOME` must never reach a hermetic launch."""
     env = dict(os.environ)
     env["HOME"] = str(runtime_dir)
     env["XDG_RUNTIME_DIR"] = str(runtime_dir)
@@ -389,12 +403,16 @@ def subproc_env(cfg: _Subproc, *, runtime_dir: Path, mock_base_url: str,
     # observes roost's push feed (`events.subscribe`) instead of polling
     # `tab.list`, so a machine-row change arrives when roost commits it — the
     # cadence env var this used to seed was deleted on both sides.
+    #  * CRAZE_PATH — the craze seam (plan 025): the directory the LOCAL
+    #    craze dial's jailed ladder finds `craze` in. Load-bearing like
+    #    SSH_BIN: an inherited one would point a hermetic run at a real craze.
     managed = {
         "MOCK_UNREACHABLE_HOSTS": ",".join(unreachable_hosts) if unreachable_hosts else None,
         "ROOST_SOCKETS": (",".join(f"{n}={p}" for n, p in roost_sockets.items())
                           if roost_sockets else None),
         "SSH_BIN": str(ssh_bin) if ssh_bin else None,
         "ROOST_JAIL": "1" if roost_jail else None,
+        "CRAZE_PATH": str(craze_path) if craze_path else None,
         "SOCKET": None,
     }
     for suffix, value in managed.items():
@@ -409,6 +427,10 @@ def subproc_env(cfg: _Subproc, *, runtime_dir: Path, mock_base_url: str,
     for key, value in (
         ("ROOST_SESSION_INSTALL_BIN", roost_install_bin),
         ("ROOST_SESSION_BIN", roost_session_bin),
+        # craze's own variables, under craze's own names, for the local
+        # craze dial (the app passes them through beside the seam's PATH).
+        ("CRAZE_HOME", craze_home),
+        ("CRAZE_RUNTIME_DIR", craze_runtime_dir),
     ):
         if value:
             env[key] = str(value)

@@ -181,7 +181,62 @@ panel cells keep their `app.screenshot` PNGs there; unset, they still capture an
 ### The gx lane (plan 017) — retired
 
 gx and its lane left shed in plan 025 C1 (shed#390); `test_tauri_gx_lane.py` and `fake_gx.py`
-are gone with it. See plan 025's craze cells (C9) for this seam's current adapter-testing traps.
+are gone with it. Its slot is craze's — next section.
+
+### Craze sessions (plan 025 C9) — the real hub, two seams
+
+`test_tauri_craze.py` drives the **real** craze hub: the pinned `craze`, `craze-fake-host`,
+`craze-fake-agent` and the real `craze-0.0.1`, from `SHED_CRAZE_BIN_DIR`. Without it the module
+SKIPS; with **`SHED_CRAZE_REQUIRE=1`** a missing binary FAILS it instead (CI sets both, so CI can
+never go green on skipped craze cells).
+
+```bash
+# native (a Linux host): build the binaries once, then point the harness at them
+make craze-binaries                                  # prints SHED_CRAZE_BIN_DIR=~/.cache/shed/craze-<sha12>
+# the Docker legs only see the repo layout, so build INTO it (gitignored) and pass the
+# IN-CONTAINER path — desktop/Makefile forwards both variables into `docker run` by name
+make craze-binaries OUT=desktop/tools/shedtest/.craze-bin
+SHED_CRAZE_REQUIRE=1 SHED_CRAZE_BIN_DIR=/work/desktop/tools/shedtest/.craze-bin make -C desktop tauri-build-linux
+```
+
+- **The local seam is `SHED_TAURI_CRAZE_PATH`** (test mode AND a debug build, an `exec_seam` like
+  `SHED_TAURI_SSH_BIN`): a directory the local craze dial's **jailed** ladder (rungs 1–2 only, no
+  exec-PATH enhancement) finds `craze` in, run under `env_clear()` + `HOME`/`CRAZE_HOME`/
+  `CRAZE_RUNTIME_DIR` from the app's env + `PATH=<that dir>`. `ui.subproc_env(craze_path=…,
+  craze_home=…, craze_runtime_dir=…)` sets or CLEARS all three, so a developer's own `CRAZE_HOME`
+  never reaches a hermetic launch. Unset → the app has no local craze source at all.
+- **`CRAZE_RUNTIME_DIR` must be short, 0700 and under `/tmp`** — craze refuses one beneath a
+  group-writable ancestor (`~/.cache` is 0775 on some hosts) and a socket path over ~104 bytes.
+  The rigs use `tempfile.mkdtemp(prefix="shcz-", dir="/tmp")`.
+- **Remote craze in test mode exists only through the fake ssh** (`SHED_TAURI_SSH_BIN`), also
+  jailed. The craze fake ssh (`_fake_ssh` in the test file) runs each remote command in the jail
+  its destination USER names, records every command (`cmds/<user>.*`), answers roost's
+  `client-bridge` with `command not found`, and REFUSES (records `refused`, exit 255) any craze
+  command naming an absolute ladder rung — so the jailed composition is asserted without the
+  production ladder ever running here. The jail's `bin` holds `sh` beside `craze`: the remote
+  command is `sh -c '…'`.
+- **Remote is attach-only, so a dormant machine never sees `bridge --hub`.** To test a LIVE
+  remote, start its hub BEFORE the app launches (the rig's own `craze bridge --hub`, held open):
+  the dormant re-probe is 30 s, so a hub started later is only seen half a minute on.
+- **The sentinels.** The main instance's seam holds a RECORDING `craze` wrapper (it logs the
+  `PATH` and argv it ran with, then execs a private copy) — every dial must have run with `PATH`
+  exactly the seam dir. The empty-seam instance and the dormant remote jail each carry a craze
+  stub at `$HOME/.nix-profile/bin` (an absolute rung relative to HOME) that must never run.
+- **Do NOT run a "swap the jailed ladder for the production one" control over the whole file on
+  a workstation**: the EMPTY-seam instance would then walk the production ladder to this host's
+  own `/usr/local/bin/craze`. Run that control with `-k` on the recording-wrapper cell
+  (`test_the_local_dial_is_jailed`), whose rung 2 answers first, or in the Docker leg.
+- **Teardown is by program path**: every craze process of a rig — each bridge, the hub, each
+  `craze serve` it creates, the fake hosts and agents — runs a private COPY under the rig's
+  `real/`, and the module end signals exactly those (re-checking each pid's command line first).
+  Never `pkill -f craze`: the owner's own craze and hub may be running.
+- The row merge needs a `FakeRoost` tab with `source="craze"` and `session_id` = the hub row's
+  `provider_session_id` (the craze rows carry it). To show the roost row coming BACK, the feed
+  must stay down: rename the seam's `craze` first (the eager source then reads not-installed)
+  and only then SIGTERM the hub — otherwise the eager redial births a new hub within a second.
+  That cell is LAST in the module for that reason.
+- `lane.*` ops all take `kind` now (`"craze"` / `"opencode"`, the row's `agent_lane.kind`);
+  `ui.show_lane` too.
 
 ### Against a REAL local daemon
 
@@ -440,6 +495,14 @@ deliver — neither of which a screenshot can be made to fail on.
 
 ## Gremlins
 
+- **On a Linux workstation, `e2e-tauri` must run under Xvfb — never on the inherited desktop.**
+  An agent's shell inherits `DISPLAY`/`WAYLAND_DISPLAY` from the owner's Wayland session; a run
+  there pops windows onto the owner's screen, fails every screenshot cell (`scrot: no image
+  grabbed`) and fails `test_tauri_lane.py` cells that pass under Xvfb (this cost plan 025's C1
+  hours). The exact command:
+  `env -u WAYLAND_DISPLAY -u DISPLAY XDG_SESSION_TYPE=x11 xvfb-run -a --server-args="-screen 0 1400x900x24" make -C desktop e2e-tauri`
+  — and kill any `shed-desktop-tauri` the run leaves behind BY PID (`ps -o pid,ppid,lstart,args
+  -C shed-desktop-tauri`), never one the owner started.
 - **WebKitGTK web-process dies / JS never runs** → the render gate needs
   `--cap-add SYS_ADMIN --security-opt seccomp=unconfined` (already in the target) so WebKitGTK's
   bubblewrap sandbox can create user namespaces Docker's default seccomp blocks.

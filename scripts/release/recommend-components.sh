@@ -129,7 +129,9 @@ PATHS_HOST_AGENT=(
 # release-plan.sh and update-version.sh already carry it in their desktop
 # lockstep dep lists; this list had not caught up. (`shed-gx`, plan 017's
 # second adapter, rode the same path-dep shape until plan 025 C1 — shed#390 —
-# retired the gx lane; the next adapter this list gains is shed-craze, C9.)
+# retired the gx lane. `shed-craze`, the craze adapter, joined in plan 025 C9,
+# when the Tauri app began linking it — and it is a desktop crate only, like
+# shed-opencode: shed-broker never links it, so it is not a host-agent path.)
 # shellcheck disable=SC2034  # read via get_paths()
 PATHS_DESKTOP=(
   desktop
@@ -139,6 +141,7 @@ PATHS_DESKTOP=(
   crates/shedctl
   crates/shed-broker
   crates/shed-opencode
+  crates/shed-craze
   crates/Cargo.toml
   crates/Cargo.lock
   crates/rust-toolchain.toml

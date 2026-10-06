@@ -36,16 +36,25 @@
      assert the panel, not just the backend behind it. `null` on unmount, because
      "no panel" is the question a caller is actually asking.
 
-   `lane.open` on mount, `lane.close` on unmount, and no polling anywhere. */
+   `lane.open` on mount, `lane.close` on unmount, and no polling anywhere.
+
+   **The lane's kind is part of its address** (plan 025 §3.6.4): the panel is
+   opened with the row's `agent_lane.kind`, and every `lane.*` call carries it —
+   a craze hostId and an opencode session id are different namespaces. For a
+   craze session the panel also shows the session's permission posture (a
+   sheet-created session runs `bypass` — "runs tools without asking") and,
+   when its capabilities offer `stop`, a Stop behind an inline confirm: Stop
+   ends the SESSION, not just this transcript. */
 import { useCallback, useEffect, useRef, useState } from "react";
-import { ChevronDown, ChevronRight, ScrollText, Send, Square, X, Zap } from "lucide-react";
+import { ChevronDown, ChevronRight, OctagonX, ScrollText, Send, Square, X, Zap } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { laneVerbs } from "@/lib/laneVerbs";
+import { permissionLine } from "@/lib/crazeRows";
 import { newestWins } from "@/lib/newest";
 import { cardCls, KindBadge, StatusChip, type Tone } from "@/components/primitives";
 import {
   LANE_EVENT, laneAnswer, laneApprovals, laneCancel, laneClose, laneFailure,
-  laneMessages, laneOpen, laneSend, reportLane,
+  laneMessages, laneOpen, laneSend, laneStop, reportLane,
   type LaneAnswer, type LaneApproval, type LaneApprovalCard, type LaneEventEnvelope,
   type LaneMessage, type LaneOpened, type LaneOption, type LaneReport, type LaneRow,
   type LaneView,
@@ -146,8 +155,10 @@ function roleColor(role: string): string {
   return "var(--shed-text-secondary)";
 }
 
-export function LanePanel({ machine, sessionId, onClose }: {
+export function LanePanel({ machine, kind, sessionId, onClose }: {
   machine: string;
+  /** The row's `agent_lane.kind` — half of the lane's address. */
+  kind: string;
   sessionId: string;
   onClose: () => void;
 }) {
@@ -180,6 +191,9 @@ export function LanePanel({ machine, sessionId, onClose }: {
    *  cannot share a selection. */
   const [picks, setPicks] = useState<Record<string, string[][]>>({});
   const [typed, setTyped] = useState<Record<string, string[]>>({});
+  /** The Stop button's inline confirm is open. Stop ends the SESSION, so it
+   *  is never one click. */
+  const [confirmStop, setConfirmStop] = useState(false);
 
   const list = useRef<HTMLDivElement | null>(null);
   /** Stick to the bottom only when the reader already IS at the bottom — a
@@ -208,7 +222,7 @@ export function LanePanel({ machine, sessionId, onClose }: {
         // ONE round-trip pair, in parallel: the two reads are independent
         // projections of the same locked view, so there is nothing to order
         // BETWEEN them — only between one pull and the next.
-        () => Promise.all([laneMessages(machine, sessionId), laneApprovals(machine, sessionId)]),
+        () => Promise.all([laneMessages(machine, kind, sessionId), laneApprovals(machine, kind, sessionId)]),
         ([v, a]) => {
           setView(v);
           setApprovals(a);
@@ -236,7 +250,9 @@ export function LanePanel({ machine, sessionId, onClose }: {
       // for and the panel would sit empty until the next unrelated frame.
       const { listen } = await import("@tauri-apps/api/event");
       const un = await listen<LaneEventEnvelope>(LANE_EVENT, (e) => {
-        if (e.payload?.machine === machine && e.payload?.session_id === sessionId) schedule();
+        if (e.payload?.machine === machine && e.payload?.kind === kind && e.payload?.session_id === sessionId) {
+          schedule();
+        }
       });
       if (cancelled) {
         un();
@@ -244,7 +260,7 @@ export function LanePanel({ machine, sessionId, onClose }: {
       }
       unlisten.push(un);
       try {
-        const o = await laneOpen(machine, sessionId);
+        const o = await laneOpen(machine, kind, sessionId);
         if (cancelled) return;
         setOpened(o);
       } catch (e) {
@@ -262,9 +278,9 @@ export function LanePanel({ machine, sessionId, onClose }: {
       if (frame !== null) cancelAnimationFrame(frame);
       if (timer !== null) clearTimeout(timer);
       unlisten.forEach((u) => u());
-      void laneClose(machine, sessionId);
+      void laneClose(machine, kind, sessionId);
     };
-  }, [machine, sessionId]);
+  }, [machine, kind, sessionId]);
 
   const messages = view?.messages ?? [];
   useEffect(() => {
@@ -304,8 +320,8 @@ export function LanePanel({ machine, sessionId, onClose }: {
   }, []);
 
   const answer = useCallback(
-    (id: string, a: LaneAnswer) => act1(() => laneAnswer(machine, sessionId, id, a)),
-    [act1, machine, sessionId],
+    (id: string, a: LaneAnswer) => act1(() => laneAnswer(machine, kind, sessionId, id, a)),
+    [act1, machine, kind, sessionId],
   );
 
   const send = async () => {
@@ -315,12 +331,23 @@ export function LanePanel({ machine, sessionId, onClose }: {
       // `undefined` rather than `"queue"` for the ordinary case: queue is the
       // op's own default, and a client that always spelled the mode out would
       // make every adapter's default this component's business.
-      await laneSend(machine, sessionId, text, interjecting ? "interject" : undefined);
+      await laneSend(machine, kind, sessionId, text, interjecting ? "interject" : undefined);
       setPrompt("");
     });
   };
 
-  const cancel = () => act1(() => laneCancel(machine, sessionId));
+  const cancel = () => act1(() => laneCancel(machine, kind, sessionId));
+  /** Stop the SESSION, from the confirm's own button. The lane ends when the
+   *  session's close arrives (the banner says `ended`), and the row leaves. */
+  const stop = () =>
+    act1(async () => {
+      await laneStop(machine, kind, sessionId);
+      setConfirmStop(false);
+    });
+  /** Stop exists only when the session's streamed capabilities offer it — a
+   *  TUI-hosted craze session, and every opencode one, has none. */
+  const canStop = capabilities?.stop === true;
+  const permission = permissionLine(opened?.session.permission_mode);
 
   const pickedFor = (a: LaneApproval): string[][] =>
     picks[a.id] ?? a.questions.map(() => []);
@@ -411,7 +438,9 @@ export function LanePanel({ machine, sessionId, onClose }: {
   const report: LaneReport = {
     machine,
     session_id: sessionId,
+    lane_kind: kind,
     kind: capabilities?.kind ?? "",
+    permission,
     title: opened?.session.title ?? "",
     cwd: opened?.session.cwd ?? "",
     activity: view?.activity ?? "unknown",
@@ -422,6 +451,7 @@ export function LanePanel({ machine, sessionId, onClose }: {
     approvals: cards,
     can_cancel: verbs.cancel.enabled,
     interject: canInterject ? { on: interjecting, enabled: verbs.interject.enabled } : null,
+    stop: canStop ? { confirming: confirmStop } : null,
     error,
   };
   // Compared BY VALUE, not by reference: the report is rebuilt every render, so
@@ -457,6 +487,14 @@ export function LanePanel({ machine, sessionId, onClose }: {
           <div className="mt-0.5 truncate font-mono text-[11.5px] text-shed-text-muted">
             {machine} · {sessionId}
           </div>
+          {/* The session's permission posture, when it states one: a session
+              the create sheet started runs `bypass`, and this is where that
+              consequence is visible (plan 025 §3.6.5). */}
+          {permission && (
+            <div className="mt-0.5 truncate text-[12px] text-shed-text-secondary" data-permission>
+              {permission}
+            </div>
+          )}
         </div>
         {/* WHICH agent this transcript belongs to. Two adapters in one app made
             it worth saying out loud: the panels differ in what they offer
@@ -466,6 +504,25 @@ export function LanePanel({ machine, sessionId, onClose }: {
             noise on every mount. */}
         {capabilities?.kind && <KindBadge kind={capabilities.kind} />}
         <StatusChip tone={act.tone} label={act.label} />
+        {/* Stop ends the SESSION — offered only when its capabilities say
+            `stop`, and never in one click: the first press opens an inline
+            confirm. */}
+        {canStop && !confirmStop && (
+          <button
+            onClick={() => setConfirmStop(true)}
+            disabled={busy || !!view?.ended}
+            title="Stop the session (craze ends it; the transcript stays until you close it)"
+            className="hbtn inline-flex flex-none items-center gap-1.5 rounded-[9px] px-2.5 py-1.5 text-[12.5px] font-semibold"
+            style={{
+              background: "var(--shed-deny-bg)",
+              color: "var(--shed-danger)",
+              border: "none",
+              opacity: busy || view?.ended ? 0.5 : 1,
+            }}
+          >
+            <OctagonX size={14} /> Stop
+          </button>
+        )}
         <button
           onClick={onClose}
           title="Close transcript"
@@ -474,6 +531,32 @@ export function LanePanel({ machine, sessionId, onClose }: {
           <X size={16} />
         </button>
       </header>
+
+      {canStop && confirmStop && (
+        <div
+          data-stop-confirm
+          className="flex flex-none items-center gap-2 border-b border-shed-border px-4 py-2 text-[12.5px]"
+          style={{ background: "var(--shed-deny-bg)", color: "var(--shed-danger)" }}
+        >
+          <span className="min-w-0 flex-1">Stop this session? The agent ends; the transcript stays.</span>
+          <button
+            onClick={() => void stop()}
+            disabled={busy}
+            className="hbtn rounded-[9px] px-2.5 py-1.5 text-[12.5px] font-semibold"
+            style={{ background: "var(--shed-danger)", color: "var(--shed-accent-fg)", border: "none", opacity: busy ? 0.5 : 1 }}
+          >
+            Stop session
+          </button>
+          <button
+            onClick={() => setConfirmStop(false)}
+            disabled={busy}
+            className="hbtn rounded-[9px] px-2.5 py-1.5 text-[12.5px] font-semibold"
+            style={{ background: "var(--shed-surface)", color: "var(--shed-text-secondary)", border: "1px solid var(--shed-border)" }}
+          >
+            Keep
+          </button>
+        </div>
+      )}
 
       {/* The `Stale`/`Down` posture: the last good generation stays on screen,
           and the banner says why it is not moving — and whether the lane is

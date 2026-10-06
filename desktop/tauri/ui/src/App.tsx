@@ -13,11 +13,12 @@ import { cn } from "@/lib/utils";
 import owlOrange from "@/assets/owl-orange.svg";
 import owlAmber from "@/assets/owl-amber.svg";
 import {
-  cardCls, Dot, StatusChip, Tag, ImageChip, KindBadge, ActBtn, GhostBtn,
+  cardCls, Dot, StatusChip, Tag, ImageChip, KindBadge, FactChip, ActBtn, GhostBtn,
   PageHead, HeadAction, RefreshHeadButton, Empty, agentColor, type Tone,
 } from "@/components/primitives";
 import { Scrim, DialogShell, Field, Select, Segmented, dialogInput, dialogBtnSecondary, useEscClose } from "@/components/dialog";
 import { LanePanel } from "@/components/LanePanel";
+import { crazeDoingLine, crazeMachineNote, killTarget } from "@/lib/crazeRows";
 import { RoostLine, RoostConsentDialog, Toast } from "@/components/RoostBootstrap";
 import {
   roostBootstrap, roostPreview, roostProgressSteps, roostToastFor, roostDumpRow,
@@ -645,6 +646,14 @@ function MachineCard({ machine: m, sessions, waiting, roostState, roostBusy, onO
         </div>
       </div>
       <RoostLine target={m.origin} state={roostState} busyDetail={roostBusy} onOpenConsent={onOpenConsent} />
+      {/* This machine's craze, when there is something to say about it — a
+          craze too old for shed says so, and what to do; a machine with no
+          craze at all says nothing (plan 025 §3.6.5). */}
+      {crazeMachineNote(m.craze) && (
+        <div className="font-mono text-[12px]" style={{ color: "var(--shed-warn-fg)" }} data-craze-note>
+          {crazeMachineNote(m.craze)}
+        </div>
+      )}
     </div>
   );
 }
@@ -685,6 +694,7 @@ function MachinesPane({ machines, sessions, refresh, onNew, roostTick, onOpenCon
     detail: machineDetailLine(m, rows.length),
     sessions: rows.map((s) => s.slug),
     waiting,
+    craze_note: crazeMachineNote(m.craze),
     // The plan-matrix status line + button, as rendered — the SAME data
     // `MachineCard`'s `RoostLine` reads, so `machines.dump` can never claim a
     // word the card doesn't show (the pane's own rule, extended to roost).
@@ -764,6 +774,13 @@ function SessionCard({ session: s, capabilities, onKilled, onError, onTranscript
   // there is nothing to attach to, not that the answer is tmux.
   const caps = capabilitiesFor({ capabilities }, s);
   const canAttach = attachKind(caps, s.kind) === "tmux";
+  // A craze session's row is its HUB's (plan 025 §3.6.3): the provider and
+  // model, what it is doing, what it is blocked on, who is attached — and its
+  // End tab exists only when the merge attached a roost tab to it.
+  const craze = s.source === "craze";
+  const doing = craze ? crazeDoingLine(s) : null;
+  const asks = craze && typeof s.pending_approvals === "number" ? s.pending_approvals : 0;
+  const canEnd = killTarget(s) !== null;
   const kill = async () => {
     setBusy(true);
     // Routes by origin — a machine session is addressed by (machine, slug), a
@@ -806,15 +823,19 @@ function SessionCard({ session: s, capabilities, onKilled, onError, onTranscript
               style={{ width: 8, height: 8, borderRadius: 9999, background: "var(--shed-attention)", flex: "none" }}
             />
           )}
-          <StatusChip tone={rcStateTone(s.state)} label={s.state} />
+          {/* A craze row has no roost lifecycle to show — its activity,
+              its start error and its staleness say what there is to say. */}
+          {!craze && <StatusChip tone={rcStateTone(s.state)} label={s.state} />}
           {act && <StatusChip tone={act.tone} label={act.label} />}
         </span>
       </div>
       <div className="mt-2 flex items-center gap-4">
         <div className="flex min-w-0 flex-1 items-center gap-2.5">
           <KindBadge kind={s.kind} />
+          {craze && s.provider && <FactChip label={s.provider} title="provider" />}
+          {craze && s.model && <FactChip label={s.model} title="model" />}
           <span className="truncate font-mono text-[12px] text-shed-text-muted">
-            {s.stale ? `${sub} · last known` : sub}
+            {s.stale || (craze && s.approximate) ? `${sub} · last known` : sub}
           </span>
         </div>
         <div className="flex flex-none items-center gap-1.5">
@@ -873,10 +894,50 @@ function SessionCard({ session: s, capabilities, onKilled, onError, onTranscript
             </a>
           )}
           {/* Delete is a bare glyph, last and quietest. A tinted red box makes
-              it the loudest thing on a card you are only reading. */}
-          <GhostBtn icon={Trash2} title="End session" onClick={() => void kill()} disabled={busy} spin={busy} />
+              it the loudest thing on a card you are only reading. On a craze
+              row it is End TAB — it closes the roost tab the session runs in
+              (by the row's typed `tab_id`, never its hostId slug), and a
+              headless craze session has none to close; Stop is the
+              transcript's. */}
+          {canEnd && (
+            <GhostBtn
+              icon={Trash2}
+              title={craze ? "End tab" : "End session"}
+              onClick={() => void kill()}
+              disabled={busy}
+              spin={busy}
+            />
+          )}
         </div>
       </div>
+      {craze && (doing || asks > 0 || (s.attached ?? 0) > 0 || s.start_error) && (
+        <div className="mt-2 flex flex-col gap-1" data-craze-facts>
+          {doing && (
+            <div
+              className="truncate text-[13px]"
+              style={{ color: doing.dimmed ? "var(--shed-text-muted)" : "var(--shed-text-secondary)" }}
+            >
+              {doing.text}
+            </div>
+          )}
+          {asks > 0 && (
+            <div className="truncate text-[13px]" style={{ color: "var(--shed-warn-fg)" }}>
+              {asks === 1 ? "needs you" : `needs you · ${asks}`}
+              {s.head_ask_summary ? ` — ${s.head_ask_summary}` : ""}
+            </div>
+          )}
+          {(s.attached ?? 0) > 0 && (
+            <div className="truncate font-mono text-[12px] text-shed-text-muted">
+              {s.attached === 1 ? "1 client attached" : `${s.attached} clients attached`}
+            </div>
+          )}
+          {s.start_error && (
+            <div className="truncate font-mono text-[12px]" style={{ color: "var(--shed-danger)" }}>
+              {s.start_error}
+            </div>
+          )}
+        </div>
+      )}
     </div>
   );
 }
@@ -1750,7 +1811,7 @@ export default function App() {
   // belongs to a ROW, so it lives beside the panes rather than replacing one —
   // and it stays put when you navigate, because a transcript you opened is
   // something you are reading, not somewhere you went.
-  const [lane, setLane] = useState<{ machine: string; sessionId: string } | null>(null);
+  const [lane, setLane] = useState<{ machine: string; kind: string; sessionId: string } | null>(null);
 
   // -- roost bootstrap (plan 019 §3.6, C8) ---------------------------------
   // The open consent card, if any — one at a time, App-level like `lane`
@@ -1923,11 +1984,12 @@ export default function App() {
       // and the harness has no click — while `lane.dump` (the panel's own truth,
       // and the whole point of C6) is only observable once one is mounted.
       uns.push(
-        await listen<{ machine?: unknown; session_id?: unknown }>("show-lane", (e) => {
+        await listen<{ machine?: unknown; kind?: unknown; session_id?: unknown }>("show-lane", (e) => {
           const machine = e.payload?.machine;
+          const kind = e.payload?.kind;
           const sessionId = e.payload?.session_id;
-          if (typeof machine === "string" && typeof sessionId === "string") {
-            setLane({ machine, sessionId });
+          if (typeof machine === "string" && typeof kind === "string" && typeof sessionId === "string") {
+            setLane({ machine, kind, sessionId });
           }
         }),
       );
@@ -2120,7 +2182,7 @@ export default function App() {
                   // and the card gates its affordance on the same pair, so this
                   // never silently does nothing.
                   if (s.agent_lane && s.machine) {
-                    setLane({ machine: s.machine, sessionId: s.agent_lane.session_id });
+                    setLane({ machine: s.machine, kind: s.agent_lane.kind, sessionId: s.agent_lane.session_id });
                   }
                 }}
               />
@@ -2136,8 +2198,9 @@ export default function App() {
           reusing one would leave them pinned to the session you left. */}
       {lane && (
         <LanePanel
-          key={`${lane.machine}/${lane.sessionId}`}
+          key={`${lane.machine}/${lane.kind}/${lane.sessionId}`}
           machine={lane.machine}
+          kind={lane.kind}
           sessionId={lane.sessionId}
           onClose={() => setLane(null)}
         />
