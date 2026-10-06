@@ -56,6 +56,17 @@ re-implemented per language. The root `CLAUDE.md` owns the monorepo layout + rel
   class, a plain one a plain Dart enum. Same rule as `rc.rs`'s feed types, which `lane`
   reuses (`RcFeedMessage` IS the transcript row) — which is why those gained `Serialize`
   plus a tolerant `Deserialize` delegating to their existing `from_map` reader.
+  `craze.rs` (plan 025 C5) is the **craze remote command**, pure like `machine.rs`: the
+  `sh -c '<ladder>'` argv every client runs to reach `craze` on a host —
+  `bridge_hub_argv`/`bridge_hub_command` (every hub connection), `providers_hub_argv` (the
+  find-only probe, which never starts a hub) and `attach_argv(host_id)` (Open in terminal;
+  the id must be twelve lowercase hex digits). The script is craze's published
+  binary-finding ladder verbatim plus one change, an enhanced PATH applied only at the
+  `exec`, composed over two tables (`Ladder { rungs, exec_path }`) so tests can re-root
+  them; the `*_argv_jailed()` variants keep rungs 1–2 and no PATH change, for test mode
+  only. `tests/machine-transport`'s `craze-bridge-hub`/`craze-providers-hub` scenarios
+  EQUAL the composers' output (the Rust leg asserts it), and `tests/craze_ladder.rs` runs
+  the ladder for real under every local `sh`.
 - **`shed-app`** — the UI-free app-logic layer (`Backend`) the clients share; holds the
   embedded broker bridge (`broker_bridge.rs`, behind the non-default
   `broker = ["dep:shed-broker"]` feature — leg 3a.2), which since plan 022 is its ONLY

@@ -24,7 +24,7 @@ not share an SSH implementation (that was a deliberate decision — see the plan
 
 | transport | used by | composes the wire line in |
 |---|---|---|
-| the `ssh` binary as a child process | the Tauri desktop app (no live composer right now — `shed-gx`'s discovery probe, its last one, retired in plan 025 C1, shed#390; `sx`, the caller before that, was sunset, unreleased, in plan 016; shed-craze's remote command, plan 025 C5, is the next) | Rust (`shed_core::machine::display_line`) |
+| the `ssh` binary as a child process | the Tauri desktop app (its live composer is `shed_core::craze`, plan 025 C5; `shed-gx`'s discovery probe, the composer before it, retired in plan 025 C1, shed#390; `sx`, the caller before that, was sunset, unreleased, in plan 016) | Rust (`shed_core::machine::display_line`) |
 | `dartssh2` | shed-mobile | nothing, as of plan 013 — the roost-session reach it drives execs a Rust-composed string wholesale rather than an argv built through this contract (see "The Dart leg" below) |
 
 Two implementations of one wire contract drift silently, and the drift is
@@ -104,8 +104,9 @@ probe (`crates/shed-gx/src/discovery.rs::PROBE_SCRIPT`, this contract's
 `gx-probe` scenario). Both the gx lane and `shed_app::machine::exec` (its only
 caller) retired in turn in plan 025 C1 (shed#390); `gx-probe` stays anyway —
 a scenario is never deleted to make a leg pass — as a pure quoting fixture
-with no production composer, pinned ahead of the one that reaches this shape
-next (shed-craze's remote command, plan 025 C5). Every quoting property the
+with no production composer, pinned ahead of the one that now reaches this
+shape (shed-craze's remote command, `shed_core::craze`, plan 025 C5; see "The
+craze remote command" below). Every quoting property the
 originally-retired scenarios pinned (embedded quotes, `$VAR`, command
 substitution, metacharacters, redirection/globs, newlines, tabs, a leading
 dash, unicode, the empty argument) survives, carried as the script body
@@ -127,6 +128,51 @@ completely dead feed.** So the fixture pins the real frame shape, including the
 empty `shed` a directly-read hub emits (it has no shed to name — only the shed
 server's aggregate proxy fills that in).
 
+## The craze remote command
+
+The corpus's live production composer is **`shed_core::craze`** (plan 025
+C5): the `sh -c '<ladder>'` command every client sends to reach a machine's
+craze hub — craze's published binary-finding ladder (craze's
+`docs/reference/protocol.md`, "SSH exec"), verbatim, plus one change, an
+enhanced PATH applied only at the `exec`. Two scenarios carry it, and they are
+the command itself, not look-alikes:
+
+| scenario | composer | what it runs |
+|---|---|---|
+| `craze-bridge-hub` | `shed_core::craze::bridge_hub_argv()` | `craze bridge --hub` — every hub connection (it starts a hub if none runs) |
+| `craze-providers-hub` | `shed_core::craze::providers_hub_argv()` | `craze providers --hub --json` — the find-only probe (it never starts one) |
+
+The Rust leg asserts each scenario's argv **equals** its composer's output
+(`the_craze_scenarios_are_the_production_composers_argv`), so a composer change
+fails until the scenario and both goldens are re-recorded with it — the corpus
+pins the command that ships, not a copy of it. The two goldens then do their
+usual jobs: `wire.json` pins the bytes, and `received.json` records that a real
+sshd delivers the whole script as one intact argument. (`display_line` renders
+the script's inner `'` as `'\''`, the house quoter's escape; craze's own
+published example spells it `'"'"'`. Both deliver the identical argv, which is
+exactly what the live leg checks.)
+
+The live leg's receiver swap means it never RUNS the ladder, so what the ladder
+does with its argument is measured in two more places:
+
+- **`crates/shed-core/tests/craze_ladder.rs`** — Rust, a local `sh`, no sshd, no
+  root, each case under every distinct POSIX `sh` the host has (dash, bash as
+  `sh`, busybox `sh`). The production tables are re-rooted under a temp dir and
+  a stub `craze` on a rung records what it was handed: each rung exec'd with
+  each form's arguments, the earliest winning; the exec PATH is the ladder's
+  directories in the ladder's order, then the original PATH; a craze on the
+  original PATH beats a stub in every injected directory; an executable
+  directory is skipped; a relative `HOME` makes no rung relative; no craze
+  anywhere is `craze: command not found`, exit 127; the jailed test-mode
+  variant reaches no absolute rung and passes PATH through untouched.
+- **`test_craze_ladder.py`**, here — the same contract against the REAL rung
+  paths (`/opt/homebrew/bin`, `/usr/local/bin`, …), which only a throwaway box
+  may write. It runs only under `MT_CRAZE_RUNGS=1`, which the Docker recipe
+  below sets after preparing those directories, and skips everywhere else. Its
+  live cell sends the `craze-bridge-hub` wire line verbatim through the
+  hermetic sshd and watches it reach a stub at `/opt/homebrew/bin` with
+  `bridge --hub` and the enhanced PATH.
+
 ## Running
 
 ```bash
@@ -138,8 +184,17 @@ cd tests/machine-transport && uv sync && uv run pytest -v
 
 Requirements: **uv**, and the three OpenSSH executables — **`sshd`** (serves),
 **`ssh-keygen`** (mints the throwaway host + client keys) and **`ssh`** (the
-client under test). The suite skips cleanly if any is missing. No Rust, no Go, no
-tmux. Nothing leaves 127.0.0.1.
+client under test). The suite skips cleanly if any is missing — unless
+**`MT_REQUIRE_SSHD=1`**, which turns that skip into a failure. No Rust, no Go,
+no tmux. Nothing leaves 127.0.0.1.
+
+CI runs it as its own job, `machine-transport` (`.github/workflows/ci.yml`):
+`openssh-server` installed on the runner, then `MT_REQUIRE_SSHD=1 make
+test-machine-transport`, on every PR that touches this directory or
+`crates/shed-core/src/{machine,craze}.rs` — so a runner that lost its sshd
+fails the job instead of passing it vacuously. The same job runs the Rust leg
+and `craze_ladder.rs`, so a scenario edited on its own still meets the
+composer it pins.
 
 Hermetic by construction: a throwaway OpenSSH server per session with freshly
 generated host and client keys under a temp dir, its own `authorized_keys` and
@@ -185,16 +240,27 @@ docker run --rm -v "$PWD/tests/machine-transport:/work" ubuntu:24.04 bash -c '
   apt-get update -qq && apt-get install -y -qq openssh-server openssh-client python3 python3-pytest
   mkdir -p /run/sshd
   useradd -m -s /bin/bash probe
+  # The craze ladder absolute rungs, for test_craze_ladder.py: sticky and
+  # world-writable, so probe can add and remove its OWN stub craze there.
+  for d in /opt/homebrew/bin /usr/local/bin /home/linuxbrew/.linuxbrew/bin \
+           /usr/bin /etc/profiles/per-user/probe/bin /run/current-system/sw/bin; do
+    mkdir -p "$d" && chmod 1777 "$d"
+  done
   cp -r /work /home/probe/mt && chown -R probe:probe /home/probe/mt
-  su probe -c "cd /home/probe/mt && UPDATE_GOLDEN=1 python3 -m pytest -q"
+  su probe -c "cd /home/probe/mt && MT_REQUIRE_SSHD=1 MT_CRAZE_RUNGS=1 UPDATE_GOLDEN=1 python3 -m pytest -q"
   cp /home/probe/mt/goldens/*.json /work/goldens/
   chown --reference=/work/scenarios.json /work/goldens/*.json'
 ```
 
 It copies the suite OUT of the mount and the goldens back, so a failed run
-cannot leave the checkout half-written. `python3 -m pytest` rather than `uv run`
-because the only dependency is pytest and the container needs no network beyond
-apt.
+cannot leave the checkout half-written. A recording is not done until the same
+run WITHOUT `UPDATE_GOLDEN=1` is green against the goldens it just wrote — on a
+host with no sshd, that re-run is the only place the live leg (the production
+craze rungs included) runs at all. `MT_REQUIRE_SSHD=1` keeps a broken sshd from
+passing as a skip, and `MT_CRAZE_RUNGS=1` un-skips `test_craze_ladder.py` (the
+`for` loop is the preparation that variable promises). `python3 -m pytest`
+rather than `uv run` because the only dependency is pytest and the container
+needs no network beyond apt.
 
 The `chown` matters the day the contract gains a **new** golden filename: the
 `cp` runs as root in the container, and `cp` onto an EXISTING file keeps that
@@ -205,9 +271,12 @@ is certainly the developer's, so the recipe needs no uid passed in.
 
 ## Changing the contract
 
-1. Edit `scenarios.json` and **bump its `version`**.
+1. Edit `scenarios.json`. **Bump its `version`** when an existing scenario's
+   argv changes, or the contract's shape does. ADDING a scenario is not a
+   version change (C5 added `craze-bridge-hub` and `craze-providers-hub` at
+   version 3): a scenario with no golden already fails both legs on its own.
 2. Re-record both goldens (`UPDATE_GOLDEN=1`).
-3. Update the pinned version in
+3. On a version bump, update the pinned version in
    `crates/shed-core/tests/machine_transport_contract.rs`.
 
 The version exists so the Rust leg cannot silently drift from what's checked

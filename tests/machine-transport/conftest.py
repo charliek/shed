@@ -8,6 +8,9 @@ agent is consulted, and no remote host is contacted.
 Why a REAL sshd rather than a fake: the thing under test is what a remote shell
 does to a composed command line, and only a real server + a real login shell
 answers that. A mock would happily agree with whatever the goldens already say.
+
+A host with no sshd SKIPS the live tests — unless `MT_REQUIRE_SSHD=1`, which
+makes the missing server a failure (see the `sshd` fixture).
 """
 
 from __future__ import annotations
@@ -85,10 +88,17 @@ def sshd(tmp_path_factory) -> dict:
     sshd_bin = shutil.which("sshd") or "/usr/sbin/sshd"
     missing = [name for name in ("ssh", "ssh-keygen") if shutil.which(name) is None]
     if not os.path.exists(sshd_bin) or missing:
-        pytest.skip(
+        reason = (
             "the live transport leg needs sshd, ssh and ssh-keygen "
             f"(missing: {', '.join(missing) or 'sshd'})"
         )
+        # `MT_REQUIRE_SSHD=1` (the CI job and the Docker recipe set it) turns
+        # this skip into a FAILURE: a run that is there to prove the live leg
+        # must not go green by proving nothing — a skip records no golden and
+        # asserts no argv.
+        if os.environ.get("MT_REQUIRE_SSHD") == "1":
+            pytest.fail(f"MT_REQUIRE_SSHD=1, but {reason}", pytrace=False)
+        pytest.skip(reason)
 
     root = tmp_path_factory.mktemp("sshd")
     # OpenSSH refuses keys/dirs that are group- or world-readable.

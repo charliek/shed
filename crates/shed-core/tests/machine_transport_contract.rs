@@ -2,12 +2,15 @@
 //!
 //! SSH has no argv API: a remote command is sent as ONE string the far side's
 //! shell re-parses. The Tauri app composes that string in Rust
-//! (`machine::display_line`). Its last production caller, `shed-gx`'s
-//! discovery probe (`crates/shed-gx/src/discovery.rs::PROBE_SCRIPT`), retired
-//! with the gx lane (plan 025 C1, shed#390) — `sx`, its caller before that,
-//! was sunset, unreleased, in plan 016. The contract stays pinned ahead of its
-//! next live composer (shed-craze's remote command, plan 025 C5): a scenario
-//! is never deleted to make a leg pass. There is no Dart leg:
+//! (`machine::display_line`). Its live production caller is now
+//! `shed_core::craze`'s remote command (plan 025 C5) — see
+//! `the_craze_scenarios_are_the_production_composers_argv` below. The
+//! composer before it, `shed-gx`'s discovery probe
+//! (`crates/shed-gx/src/discovery.rs::PROBE_SCRIPT`), retired with the gx
+//! lane (plan 025 C1, shed#390); `sx`, its caller before that, was sunset,
+//! unreleased, in plan 016. Both retired composers' scenarios stay pinned as
+//! quoting fixtures: a scenario is never deleted to make a leg pass. There is
+//! no Dart leg:
 //! shed-mobile execs the string `roost_ipc::ssh::remote_command()` composes,
 //! not an argv built from this contract (see the README's "The Dart leg").
 //! This file is one of the two legs that keep the Rust composer honest:
@@ -137,4 +140,48 @@ fn every_element_is_always_quoted_never_conditionally() {
             "scenario {id:?}: bare-safe tokens are quoted too: {line}"
         );
     }
+}
+
+/// **The corpus pins the production craze command** (plan 025 C5): the
+/// `craze-bridge-hub` and `craze-providers-hub` scenarios' argv EQUAL what
+/// `shed_core::craze` composes — the remote command every craze hub
+/// connection and every find-only probe actually sends.
+///
+/// Without this the two scenarios would be quoting fixtures that merely look
+/// like the command: the composer could change (a rung moved, the exec PATH
+/// reordered, an argument dropped) with every byte-level and live assertion
+/// above still green against the stale copy. With it, a composer change fails
+/// here until the scenario — and so both goldens — are re-recorded with it.
+#[test]
+fn the_craze_scenarios_are_the_production_composers_argv() {
+    let scenarios = read_json("scenarios.json");
+    let cases = scenarios["scenarios"].as_array().expect("scenarios array");
+    let argv_for = |id: &str| -> Vec<String> {
+        let scenario = cases
+            .iter()
+            .find(|s| s["id"].as_str() == Some(id))
+            .unwrap_or_else(|| panic!("scenarios.json has no {id:?} scenario"));
+        argv_of(scenario)
+    };
+
+    assert_eq!(
+        argv_for("craze-bridge-hub"),
+        shed_core::craze::bridge_hub_argv(),
+        "craze-bridge-hub is not shed_core::craze::bridge_hub_argv() — re-point the \
+         scenario at the composer's output and re-record both goldens"
+    );
+    assert_eq!(
+        argv_for("craze-providers-hub"),
+        shed_core::craze::providers_hub_argv(),
+        "craze-providers-hub is not shed_core::craze::providers_hub_argv() — re-point \
+         the scenario at the composer's output and re-record both goldens"
+    );
+    // …and the one string an ssh transport sends for the bridge is that argv's
+    // wire line, byte for byte the recorded golden.
+    let wire = read_json("goldens/wire.json");
+    assert_eq!(
+        wire["craze-bridge-hub"].as_str(),
+        Some(shed_core::craze::bridge_hub_command().as_str()),
+        "goldens/wire.json's craze-bridge-hub is not shed_core::craze::bridge_hub_command()"
+    );
 }

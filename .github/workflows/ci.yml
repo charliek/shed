@@ -42,6 +42,7 @@ jobs:
       packaging: ${{ steps.filter.outputs.packaging }}
       harness: ${{ steps.filter.outputs.harness }}
       hostagent: ${{ steps.filter.outputs.hostagent }}
+      machinetransport: ${{ steps.filter.outputs.machinetransport }}
       docs: ${{ steps.filter.outputs.docs }}
       ci: ${{ steps.filter.outputs.ci }}
     steps:
@@ -125,6 +126,14 @@ jobs:
               - 'docs/development/host-agent-wire-catalog.md'
               - 'go.mod'
               - 'go.sum'
+            machinetransport:
+              # The machine-transport differential's live leg (plan 025 C5): the
+              # shared contract + goldens + the pytest suite, and the two Rust
+              # composers whose output the corpus pins (`display_line`, and the
+              # craze remote command that ships through it).
+              - 'tests/machine-transport/**'
+              - 'crates/shed-core/src/machine.rs'
+              - 'crates/shed-core/src/craze.rs'
             docs:
               - 'docs/**'
               - 'zensical.toml'
@@ -569,6 +578,55 @@ jobs:
         # against the recorded goldens + the Rust golden-fixture runners.
         run: make test-host-agent-diff
 
+  # The machine-transport differential's LIVE leg (plan 025 C5, P10): every
+  # scenario's wire line through a throwaway sshd on 127.0.0.1, asserting the
+  # argv the far side really received, plus the forwarded-hub family. It ran
+  # in no CI job before (and a dev box without sshd skips it), and since C5
+  # it carries production code: the craze remote
+  # command (`craze-bridge-hub` / `craze-providers-hub`), whose quoting must be
+  # proven on a real sshd. `MT_REQUIRE_SSHD=1` turns the suite's no-sshd SKIP
+  # into a FAILURE, so a runner that lost openssh-server fails this job rather
+  # than passing it vacuously. The Rust leg (and the craze ladder's behaviour
+  # tests) ride along because core-linux's `rust` filter does not see
+  # `tests/machine-transport/**`: without them a scenarios-only edit would
+  # never meet the composer equality it is pinned by.
+  machine-transport:
+    name: machine-transport (live sshd)
+    needs: changes
+    if: ${{ needs.changes.outputs.machinetransport == 'true' || needs.changes.outputs.ci == 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: OpenSSH server + C toolchain
+        # Bounded+retried apt — see the "C toolchain + tmux" step's rationale.
+        # /run/sshd is sshd's privilege-separation directory, which the suite's
+        # unprivileged sshd needs and the package does not leave behind.
+        timeout-minutes: 12
+        run: |
+          set -euo pipefail
+          ok=""
+          for attempt in 1 2 3; do
+            if sudo timeout 120 apt-get update; then ok=1; break; fi
+            echo "apt-get update stalled or failed (attempt ${attempt}/3); retrying" >&2
+            sleep 10
+          done
+          if [ -z "${ok}" ]; then
+            echo "::error::apt-get update failed 3x — mirror outage?"
+            exit 1
+          fi
+          sudo timeout 300 apt-get install -y openssh-server build-essential
+          sudo mkdir -p /run/sshd
+      - name: Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustc --version && cargo --version
+      - name: Rust leg + the craze ladder's behaviour tests
+        working-directory: crates
+        run: cargo test -p shed-core --test machine_transport_contract --test craze_ladder --locked
+      - uses: astral-sh/setup-uv@v6
+      - name: Live leg + forwarded-hub family (a missing sshd FAILS, never skips)
+        run: MT_REQUIRE_SSHD=1 make test-machine-transport
+
   deb:
     name: deb
     needs: changes
@@ -785,12 +843,12 @@ jobs:
   ci-success:
     name: ci-success
     if: always()
-    needs: [changes, test, lint, plugin, release-snapshot, swift, core-linux, host-agent-diff, deb, tauri-linux, tauri-mac, docs-build]
+    needs: [changes, test, lint, plugin, release-snapshot, swift, core-linux, host-agent-diff, machine-transport, deb, tauri-linux, tauri-mac, docs-build]
     runs-on: ubuntu-latest
     steps:
       - name: Require no job failed (skipped-by-filter counts as pass)
         run: |
-          results="${{ needs.changes.result }} ${{ needs.test.result }} ${{ needs.lint.result }} ${{ needs.plugin.result }} ${{ needs.release-snapshot.result }} ${{ needs.swift.result }} ${{ needs.core-linux.result }} ${{ needs.host-agent-diff.result }} ${{ needs.deb.result }} ${{ needs.tauri-linux.result }} ${{ needs.tauri-mac.result }} ${{ needs.docs-build.result }}"
+          results="${{ needs.changes.result }} ${{ needs.test.result }} ${{ needs.lint.result }} ${{ needs.plugin.result }} ${{ needs.release-snapshot.result }} ${{ needs.swift.result }} ${{ needs.core-linux.result }} ${{ needs.host-agent-diff.result }} ${{ needs.machine-transport.result }} ${{ needs.deb.result }} ${{ needs.tauri-linux.result }} ${{ needs.tauri-mac.result }} ${{ needs.docs-build.result }}"
           echo "job results: ${results}"
           for r in ${results}; do
             case "${r}" in

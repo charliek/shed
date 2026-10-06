@@ -8,6 +8,7 @@ pub mod approval;
 pub mod authfail;
 pub mod config;
 pub mod config_edit;
+pub mod craze;
 pub mod create;
 pub mod csr;
 pub mod http;
