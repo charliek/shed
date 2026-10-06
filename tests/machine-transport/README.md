@@ -24,7 +24,7 @@ not share an SSH implementation (that was a deliberate decision — see the plan
 
 | transport | used by | composes the wire line in |
 |---|---|---|
-| the `ssh` binary as a child process | the Tauri desktop app (today, only `shed-gx`'s discovery probe — `sx`, the other historical caller, was sunset, unreleased, in plan 016) | Rust (`shed_core::machine::display_line`) |
+| the `ssh` binary as a child process | the Tauri desktop app (no live composer right now — `shed-gx`'s discovery probe, its last one, retired in plan 025 C1, shed#390; `sx`, the caller before that, was sunset, unreleased, in plan 016; shed-craze's remote command, plan 025 C5, is the next) | Rust (`shed_core::machine::display_line`) |
 | `dartssh2` | shed-mobile | nothing, as of plan 013 — the roost-session reach it drives execs a Rust-composed string wholesale rather than an argv built through this contract (see "The Dart leg" below) |
 
 Two implementations of one wire contract drift silently, and the drift is
@@ -62,7 +62,8 @@ The live leg reimplements the quoting **rule** in five lines rather than calling
 the Rust implementation — if it called Rust, a quoter bug would be invisible
 because both sides would carry it. It also swaps `argv[0]` for a probe script
 — every scenario's `argv[0]` is `sh` as of contract version 3 (C8 re-pointed
-the corpus onto the shape `shed-gx`'s probe actually sends), which DOES exist
+the corpus onto the shape `shed-gx`'s probe actually sent, before plan 025 C1
+retired it), which DOES exist
 on the test host, but the swap still happens: the receiver has to run in its
 place to observe what arrived, regardless of what the scenario names — so it
 transmits the same quoting rather than the literal golden line. What it
@@ -98,15 +99,19 @@ rc`'s — `sx` was sunset, unreleased, in plan 016, and S6 (plan 022, C8,
 `charliek/shed#328`) deleted the RC hub, `shed-ext-rc`, and the Go engine that
 subject belonged to. The corpus did NOT retire with them: 18 of its 19
 scenarios were **re-pointed**, not deleted, onto `["sh", "-c", <script>]`
-— the shape `shed_app::machine::exec` still composes today, for
-`shed-gx`'s discovery probe (`crates/shed-gx/src/discovery.rs::PROBE_SCRIPT`,
-already this contract's `gx-probe` scenario). Every quoting property the
-retired scenarios pinned (embedded quotes, `$VAR`, command substitution,
-metacharacters, redirection/globs, newlines, tabs, a leading dash, unicode,
-the empty argument) survives, now carried as the script body instead of an
-`sx rc create --name <value>` flag value — see `scenarios.json`'s `"//C8"`
-entry and each scenario's `why`. The Rust and live legs above are still the
-whole of it.
+— the shape `shed_app::machine::exec` composed for `shed-gx`'s discovery
+probe (`crates/shed-gx/src/discovery.rs::PROBE_SCRIPT`, this contract's
+`gx-probe` scenario). Both the gx lane and `shed_app::machine::exec` (its only
+caller) retired in turn in plan 025 C1 (shed#390); `gx-probe` stays anyway —
+a scenario is never deleted to make a leg pass — as a pure quoting fixture
+with no production composer, pinned ahead of the one that reaches this shape
+next (shed-craze's remote command, plan 025 C5). Every quoting property the
+originally-retired scenarios pinned (embedded quotes, `$VAR`, command
+substitution, metacharacters, redirection/globs, newlines, tabs, a leading
+dash, unicode, the empty argument) survives, carried as the script body
+instead of an `sx rc create --name <value>` flag value — see
+`scenarios.json`'s `"//C8"` entry and each scenario's `why`. The Rust and live
+legs above are still the whole of it.
 
 ## The forwarded-hub family
 

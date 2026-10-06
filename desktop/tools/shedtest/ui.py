@@ -229,9 +229,7 @@ def launch(target: str = "mac", *, mock_base_url: str, config_path: Path, state_
            ssh_bin: object | None = None,
            roost_jail: bool = False,
            roost_install_bin: object | None = None,
-           roost_session_bin: object | None = None,
-           gx_home: object | None = None,
-           gx_timings_ms: str | None = None) -> None:
+           roost_session_bin: object | None = None) -> None:
     """Launch the UI hermetically and block until it answers `identify`.
 
     `state_dir` is the throwaway per-session dir: on mac SHED_DESKTOP_STATE_DIR;
@@ -286,16 +284,6 @@ def launch(target: str = "mac", *, mock_base_url: str, config_path: Path, state_
     roost" deterministic: without it the rung finds whatever `roost-session`
     happens to be on the developer's PATH and the NoSource cell reads
     differently on a workstation than in CI.
-    `gx_home` is the fixture `$GROK_HOME` the gx lane's LOCAL credential reader
-    looks in (`<PREFIX>_GX_HOME`) — a directory holding a fake `gx-remote*.json`
-    record and a `0600` `gx-remote.token`, so the SHIPPED reader (checks and all)
-    finds them without the run touching the developer's real `~/.grok`.
-    `gx_timings_ms` shrinks the gx adapter's windows
-    (`<PREFIX>_GX_TIMINGS_MS`, e.g. `stall=2000,flush_after=300,down_after=6000`)
-    so a cell exercises the reconnect ladder in seconds instead of minutes. Both
-    are test-mode-only on the app side and set-or-clear here, for the same reason
-    `roost_sockets` is: an inherited `GX_HOME` reaching a hermetic launch would
-    point the app at a REAL token. Tauri-only.
     `credential_hosts` are server NAMES that keep their REAL control-credential
     wiring against the mock (host agent + the config's auth_mode) instead of the
     tokenless open-mode shortcut — the agent-upgrade scenario's override, mac-only
@@ -313,8 +301,7 @@ def launch(target: str = "mac", *, mock_base_url: str, config_path: Path, state_
                         roost_sockets=roost_sockets,
                         ssh_bin=ssh_bin, roost_jail=roost_jail,
                         roost_install_bin=roost_install_bin,
-                        roost_session_bin=roost_session_bin,
-                        gx_home=gx_home, gx_timings_ms=gx_timings_ms)
+                        roost_session_bin=roost_session_bin)
     else:
         raise ValueError(f"unknown target {target!r} (want {'|'.join(TARGETS)})")
 
@@ -360,9 +347,7 @@ def subproc_env(cfg: _Subproc, *, runtime_dir: Path, mock_base_url: str,
                 ssh_bin: object | None = None,
                 roost_jail: bool = False,
                 roost_install_bin: object | None = None,
-                roost_session_bin: object | None = None,
-                gx_home: object | None = None,
-                gx_timings_ms: str | None = None) -> dict[str, str]:
+                roost_session_bin: object | None = None) -> dict[str, str]:
     """The launch env for a subprocess UI — the single source of the subprocess
     env-var contract, shared by the session launcher and a self-managed instance
     (down-host). HOME/XDG_RUNTIME_DIR/XDG_CONFIG_HOME are redirected to the
@@ -393,17 +378,10 @@ def subproc_env(cfg: _Subproc, *, runtime_dir: Path, mock_base_url: str,
     #    SHEDTEST_ROOST_SOCKETS (see conftest.py's `_app_session` fixture and
     #    `.claude/skills/shedtest-linux`), not env inheritance here.
     #  * SSH_BIN — the fake `ssh` the roost transports exec (plan 019's
-    #    bootstrap seam). Load-bearing for the same reason GX_HOME is: an
-    #    inherited value would point a hermetic run's execs at a real binary.
+    #    bootstrap seam). Load-bearing: an inherited value would point a
+    #    hermetic run's execs at a real binary.
     #  * ROOST_JAIL — roost's `jail_fs_root`, so a cold-host cell cannot find
     #    the developer's own /usr/bin/roost-session.
-    #  * GX_HOME — points the gx lane's LOCAL credential reader at a fixture
-    #    $GROK_HOME (a fake record + a 0600 token) instead of the developer's
-    #    real ~/.grok. This is the one where the rule is load-bearing rather
-    #    than tidy: an inherited value would point the app at a REAL token.
-    #  * GX_TIMINGS_MS — shrinks the gx adapter's windows
-    #    (`stall=…,resume_window=…,flush_after=…,down_after=…`, in ms) so a cell
-    #    does not wait out a thirty-second stall.
     #  * SOCKET — cleared unconditionally so the XDG default (under
     #    runtime_dir) is used.
     #
@@ -417,8 +395,6 @@ def subproc_env(cfg: _Subproc, *, runtime_dir: Path, mock_base_url: str,
                           if roost_sockets else None),
         "SSH_BIN": str(ssh_bin) if ssh_bin else None,
         "ROOST_JAIL": "1" if roost_jail else None,
-        "GX_HOME": str(gx_home) if gx_home else None,
-        "GX_TIMINGS_MS": gx_timings_ms or None,
         "SOCKET": None,
     }
     for suffix, value in managed.items():
@@ -448,9 +424,7 @@ def _launch_subproc(target: str, *, mock_base_url: str, config_path: Path,
                     ssh_bin: object | None = None,
                     roost_jail: bool = False,
                     roost_install_bin: object | None = None,
-                    roost_session_bin: object | None = None,
-                    gx_home: object | None = None,
-                    gx_timings_ms: str | None = None) -> None:
+                    roost_session_bin: object | None = None) -> None:
     cfg = _SUBPROC[target]
     if not cfg.binary.exists():
         raise RuntimeError(
@@ -462,8 +436,7 @@ def _launch_subproc(target: str, *, mock_base_url: str, config_path: Path,
                       roost_sockets=roost_sockets,
                       ssh_bin=ssh_bin, roost_jail=roost_jail,
                       roost_install_bin=roost_install_bin,
-                      roost_session_bin=roost_session_bin,
-                      gx_home=gx_home, gx_timings_ms=gx_timings_ms)
+                      roost_session_bin=roost_session_bin)
     st = _state[target]
     st.env = env
     st.runtime_dir = runtime_dir

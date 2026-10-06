@@ -19,7 +19,7 @@ session and does not appear here. Each row shows:
 
 - **Name** — the tab's title.
 - **State and activity** — roost's own liveness state, plus a live activity badge for
-  agents with a [structured lane](agent-lanes.md) (opencode, gx) attached.
+  agents with a [structured lane](agent-lanes.md) (opencode today) attached.
 - **A sticky attention dot** mirroring roost's own notification bit — shed never clears it
   itself.
 - **Transcript** — opens the [agent lane](agent-lanes.md) panel, only on a row that carries
@@ -72,7 +72,7 @@ off-network) contributes its own row on the Machines pane, naming why.
 
 ## See also
 
-- [Agent lanes](agent-lanes.md) — the Transcript panel: opencode and gx, capabilities,
+- [Agent lanes](agent-lanes.md) — the Transcript panel: opencode, capabilities,
   reconnects, and the roost `server_url` handshake that turns a row into a lane.
 - [IPC § Agent sessions](ipc.md#agent-sessions) — the full `rc.*`/`machine.*`/`roost.*` op
   table this pane is driven by.

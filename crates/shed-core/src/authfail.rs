@@ -385,8 +385,11 @@ mod tests {
     /// vanishingly unlikely rather than merely rare.
     ///
     /// Sized off a MEASURED rate, not a guess (`measure_ambiguity_rate_under_
-    /// load`, `load-run.txt`): under the same sustained `cargo build
-    /// --release -p shed-gx` load this module's own tests run against, 500
+    /// load`, `load-run.txt`): under a sustained `cargo build --release`
+    /// load this module's own tests run against (originally `-p shed-gx`;
+    /// that crate retired in plan 025 C1, shed#390, so a re-calibration
+    /// picks a current heavy-compile substitute — see
+    /// `measure_ambiguity_rate_under_load`'s own doc), 500
     /// consecutive `probe_once` calls (V13, no-cert) came back ambiguous
     /// 80-85% of the time across four runs (423, 405, 401, 399 / 500) — FAR
     /// above the ~1-in-100 unloaded rate the module docs record (finding 6),
@@ -483,9 +486,14 @@ mod tests {
     ///
     ///     cargo test -p shed-core -- --ignored measure_ambiguity_rate_under_load --nocapture
     ///
-    /// alongside a concurrent `cargo build --release -p shed-gx` loop (see
-    /// `load-run.txt` for the exact loop) whenever this module's dependencies bump
-    /// enough that the measured rate might have moved, and update
+    /// alongside a concurrent `cargo build --release` loop on a sizeable crate
+    /// (originally `-p shed-gx`, see `load-run.txt` for that exact loop; `shed-gx`
+    /// retired in plan 025 C1, shed#390, so a re-run picks whatever crate is
+    /// currently heaviest to compile in this workspace — `shed-broker`, with its
+    /// `aws-sdk-*`/`notify`/`saphyr-parser` leaf deps, is the obvious one today —
+    /// the point is sustained CPU starvation during the loopback handshake, not
+    /// which crate in particular produces it) whenever this module's dependencies
+    /// bump enough that the measured rate might have moved, and update
     /// [`AMBIGUOUS_RETRY_ATTEMPTS`]'s doc with the new numbers. Every attempt is
     /// classified into exactly one of "ambiguous" (the [`Stage`] this module cannot
     /// see an alert on) or "deterministic" (carries `CertificateRequired`); anything

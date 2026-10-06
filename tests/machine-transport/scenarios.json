@@ -15,7 +15,7 @@
     "A scenario is never removed to make a leg pass."
   ],
   "//version": "The contract revision. Bump on any change to `scenarios`; crates/shed-core/tests/machine_transport_contract.rs pins it so an edit here that forgets to re-record can't pass silently.",
-  "//C8": "Version 3 (C8, plan 022 S6): `sx` was sunset, unreleased, in plan 016, and the RC hub it drove retired in S6 — every scenario that used to send `sx rc <verb>` argv was RE-POINTED, not deleted, onto the one composer that still calls `shed_core::machine::display_line` in production: shed-gx's discovery probe (`crates/shed-gx/src/discovery.rs::PROBE_SCRIPT`), invoked as `[\"sh\", \"-c\", <script>]` by `shed_app::machine::exec`. Every quoting property the retired scenarios pinned survives, now carried as the `-c` script body instead of an `sx rc create --name <value>` flag value.",
+  "//C8": "Version 3 (C8, plan 022 S6): `sx` was sunset, unreleased, in plan 016, and the RC hub it drove retired in S6 — every scenario that used to send `sx rc <verb>` argv was RE-POINTED, not deleted, onto the one composer that still called `shed_core::machine::display_line` in production at the time: shed-gx's discovery probe (`crates/shed-gx/src/discovery.rs::PROBE_SCRIPT`), invoked as `[\"sh\", \"-c\", <script>]` by `shed_app::machine::exec`. Every quoting property the retired scenarios pinned survives, now carried as the `-c` script body instead of an `sx rc create --name <value>` flag value. That composer retired in turn with the gx lane (plan 025 C1, shed#390; `shed_app::machine::exec` and `shed-gx` are both gone) — the corpus is NOT re-pointed again (a scenario is never deleted to make a leg pass, and these argv/goldens are byte-identical pins, not a claim about a live caller): `gx-probe` is now a pure quoting fixture with no production composer, same as the rest of this corpus's historical rungs.",
   "version": 3,
   "scenarios": [
     {
@@ -114,7 +114,7 @@
     },
     {
       "id": "gx-probe",
-      "why": "shed-gx's discovery probe (plan 017): a whole multi-line POSIX sh script as ONE argv element - newlines, $-expansions, a command substitution and a backslash-semicolon. It is the string the gx lane's credential seam sends over the reach, so a transport that mangles it reads no discovery record at all.",
+      "why": "shed-gx's discovery probe (plan 017, retired plan 025 C1 — shed#390): a whole multi-line POSIX sh script as ONE argv element - newlines, $-expansions, a command substitution and a backslash-semicolon. It was the string the gx lane's credential seam sent over the reach, so a transport that mangled it read no discovery record at all; it is now a pure quoting fixture with no production composer — the corpus's one multi-line hazardous script, kept byte-identical rather than deleted.",
       "argv": [
         "sh",
         "-c",

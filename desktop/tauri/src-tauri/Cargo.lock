@@ -4469,7 +4469,6 @@ dependencies = [
  "serde_json",
  "shed-app",
  "shed-core",
- "shed-gx",
  "shed-opencode",
  "tauri",
  "tauri-build",
@@ -4478,22 +4477,7 @@ dependencies = [
  "tauri-plugin-sparkle-updater",
  "tempfile",
  "tokio",
- "tracing",
  "zbus",
-]
-
-[[package]]
-name = "shed-gx"
-version = "0.8.1"
-dependencies = [
- "async-trait",
- "futures-util",
- "reqwest 0.12.28",
- "serde",
- "serde_json",
- "shed-core",
- "thiserror 1.0.69",
- "tokio",
 ]
 
 [[package]]

@@ -16,22 +16,23 @@ agent the same way. The contract carries no I/O of its own; each agent gets
 its own adapter crate that supplies the transport, the reconnect loop, and
 the translation from that agent's wire format into the contract's DTOs.
 
-There are two adapters today: `crates/shed-opencode` for
-[opencode](https://opencode.ai), and `crates/shed-gx` for
-[gx](https://github.com/charliek/grok-build)'s remote lane (`gx-remote-api`).
-Nothing in the Tauri app assumes either is the only agent — the capability
-signal described below is what turns the affordance on or off per row, and
-`Lanes::open` picks a concrete client by the row's own `kind`, never by
-assuming one.
+There is one adapter today: `crates/shed-opencode` for
+[opencode](https://opencode.ai). `crates/shed-gx`, for
+[gx](https://github.com/charliek/grok-build)'s remote lane (`gx-remote-api`),
+was the second — retired before release, in plan 025 C1 (shed#390); craze,
+plan 025's own adapter, is next. Nothing in the Tauri app assumes opencode is
+the only agent — the capability signal described below is what turns the
+affordance on or off per row, and `Lanes::open` picks a concrete client by
+the row's own `kind`, never by assuming one.
 
-gx is the *second* adapter, and that matters beyond feature count: a contract
-validated against one implementation is a design, not yet a contract. Building
-`shed-gx` forced real corrections into `shed_core::lane` itself — recorded in
-the module's own doc as "what the gx adapter changed" — because gx's remote
-lane has things opencode's local server never needed: a bearer token, a
-resumable cursor, and permission options whose semantic `kind` is separate
-from their id and not always unique. Those corrections are what the [gx's
-lane](#gxs-lane) section below is mostly about.
+gx was the *second* adapter, and that mattered beyond feature count: a
+contract validated against one implementation is a design, not yet a
+contract. Building `shed-gx` forced real corrections into `shed_core::lane`
+itself — recorded in the module's own doc as "what the gx adapter changed" —
+because gx's remote lane had things opencode's local server never needed: a
+bearer token, a resumable cursor, and permission options whose semantic
+`kind` is separate from their id and not always unique. Those corrections are
+what the [gx's lane](#gxs-lane) section below is mostly about.
 
 ## opencode's lane
 
@@ -168,6 +169,13 @@ app's `lane.*` ops drive. `OPENCODE_SERVER_PASSWORD` is honored if opencode's
 own password gate is set.
 
 ## gx's lane
+
+!!! note "Retired before release — kept for history only"
+    The gx lane was retired in plan 025 C1 (shed#390), before the first
+    release that would have shipped it; `crates/shed-gx` is gone. Craze,
+    plan 025's own provider abstraction, replaces it. This section stays
+    only until plan 025's C12 rewrites this page structurally — read it as
+    history, not as a description of anything the app can still do.
 
 `shed-gx`'s capabilities, as reported by `AgentLane::capabilities()`:
 

@@ -3351,21 +3351,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "shed-gx"
-version = "0.8.1"
-dependencies = [
- "async-trait",
- "futures-util",
- "reqwest",
- "serde",
- "serde_json",
- "shed-core",
- "shed-gx",
- "thiserror 1.0.69",
- "tokio",
-]
-
-[[package]]
 name = "shed-host-agent"
 version = "0.8.1"
 dependencies = [

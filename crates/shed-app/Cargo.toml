@@ -20,9 +20,8 @@ shed-core = { path = "../shed-core" }
 # means a default `shed-app` (and the mac FFI build) never links them.
 shed-broker = { path = "../shed-broker", optional = true }
 # `net` (UnixStream) + `io-util` (buffered line reader) for the host-agent UDS
-# client, `process` for `roost::SshExec` and `machine::exec` — one `ssh` child
-# per bootstrap step / per remote one-shot — on top of the workspace's
-# rt/macros/sync/time.
+# client, `process` for `roost::SshExec` and the machine forward's `ssh -N -L`
+# child — on top of the workspace's rt/macros/sync/time.
 tokio = { workspace = true, features = ["net", "io-util", "process"] }
 serde = { workspace = true }
 serde_json = { workspace = true }

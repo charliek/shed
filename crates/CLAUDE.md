@@ -21,7 +21,9 @@ re-implemented per language. The root `CLAUDE.md` owns the monorepo layout + rel
   caller). The Linux clients link it directly.
   `lane.rs` (plan 015) is the **agent-lane contract** — the DTOs plus the `AgentLane`
   async trait that normalizes "a coding agent with sessions, a transcript and approvals",
-  one adapter per agent (opencode over its local HTTP server; `gx` next). Pure types, **no
+  one adapter per agent (opencode over its local HTTP server today; `shed-craze`, plan 025
+  C7+, is next — plan 017's `gx` adapter held this second slot and was retired in plan 025
+  C1, shed#390). Pure types, **no
   I/O** — the transport, fold, ring and reconnect loop belong to whatever crate implements
   it. It lives here, not in `shed-app`, because shed-mobile links the DTOs through FRB.
   It also owns the one shared overflow policy (plan 018, module doc correction 13):
@@ -30,9 +32,11 @@ re-implemented per language. The root `CLAUDE.md` owns the monorepo layout + rel
   way onto it: `publish` (`try_send`; a full channel answers `Publish::Lagged` and drops
   the frame), `publish_final` (consumes self and awaits; the terminal `Down` is the one
   frame that can never be the dropped one), and `wait_drained` (resolves only once every
-  slot is free). Both adapters propagate a `Lagged` out of every emitting helper and
-  reseed rather than silently resume, even on gx — the dropped frames may already be
-  behind the client's cursor.
+  slot is free). Every adapter propagates a `Lagged` out of every emitting helper and
+  reseeds rather than silently resumes — the dropped frames may already be behind the
+  client's cursor (plan 017's gx adapter, which also offered a bounded silent resume on
+  its OWN cursor-honoured reconnect, proved the two are independent; it was retired in
+  plan 025 C1, shed#390).
   **The FRB-mirror rule (load-bearing):** mobile HAND-mirrors every lane DTO into Dart, so
   every field is an owned `String`/`Option`/`Vec`/scalar — **no `serde_json::Value`, no
   `HashMap`, no borrowed lifetimes**; free-form payloads travel as a `String` of raw JSON
@@ -95,41 +99,12 @@ re-implemented per language. The root `CLAUDE.md` owns the monorepo layout + rel
   `rc_hub::watch` imported `shed_rc_engine::tmux::Tmux` — linking would have dragged the
   RC engine into an HTTP adapter. S6 (plan 022) deleted the hub, so `helpers.rs` is now
   the only copy and the golden is what still pins it. In `default-members`.
-- **`shed-gx`** — the **gx adapter** for `shed_core::lane`: the second
-  implementation of `AgentLane`, against gx's remote lane (`gx-remote-api`) —
-  a bearer-token HTTP API with a resumable `Last-Event-ID` cursor, unlike
-  opencode's unauthenticated, cursor-less local server. Building it forced the
-  twelve contract corrections recorded in `shed_core::lane`'s own module doc
-  ("what the gx adapter changed"); see `docs/desktop/agent-lanes.md` for the
-  end-to-end contract, including the two-URL split (reported vs. dial), the
-  `healthz`/`instanceId` credential pin, bounded silent resume vs. reseed, and
-  the `option_for` ambiguity refusal a real five-option gx permission forced.
-  Shaped like `shed-opencode`: `discovery.rs` (the probe script + parser +
-  `GxCredentialSource`), `transport.rs` (`GxTransport::dial`, called before
-  every connect attempt so a moved forward is never dialled blind), `fold.rs`
-  (pure: envelopes → rows + activity; gx's event-id counters are **not**
-  monotonic in transcript order, so the cursor is the maximum counter seen,
-  not the last applied one, and history is cut positionally), `watcher.rs`
-  (the pump: seed, bounded silent resume, reconcile, reset → reseed, stall,
-  `Down`), `testing.rs::FakeGx`, `examples/lane.rs` (the same manual-drive CLI
-  shape as opencode's). Ring/backoff/feed are **not** duplicated here — they
-  live in `shed_core::lane` (moved there by this same change) and this crate
-  re-exports them, same as `shed-opencode` does. Its own dependency set is
-  `shed-opencode`'s minus `regex`/`chrono`; not FFI-exported.
-  **`fixtures/`** carries one recording from a real gx leader
-  (`1.0.16+gx.12/{history.json, event-frames.jsonl, approvals.jsonl}`) and one
-  golden derived from it (`fold.golden.json`) — but **unlike** `shed-opencode`'s
-  two-golden split, there is no second implementation to port against: nothing
-  else folds gx's wire, so the golden is **regression detection only**
-  ("this is what the fold does today"), never a fidelity claim against some
-  other producer. `crates/shed-gx/fixtures/README.md` is the one place that
-  spells out that distinction, the two-step regeneration recipe (re-record
-  live with `SHED_GX_LIVE=1 SHED_GX_RECORD=1 …`, re-derive offline with
-  `SHED_GX_REGOLD=1 …`), and what the recording deliberately proves that a
-  hand-written fixture would not think to (non-monotonic counters, gx's
-  double-announced approval — a null-`method`/`request` placeholder followed
-  by the real request on the same id — and its own by-counter resume edge,
-  filed against gx as a known residual). In `default-members`.
+  (`shed-gx` — the **gx adapter**, plan 017's second implementation of
+  `AgentLane` against gx's remote lane — lived here the same shape, with the
+  twelve contract corrections it forced recorded in `shed_core::lane`'s own
+  module doc; it was retired in plan 025 C1, shed#390, when gx and the other
+  direct-agent kinds left shed for the craze lane. `shed-craze`, plan 025 C7+,
+  is the next adapter in this slot.)
 
 `fixtures/` holds the real-shaped JSON/YAML samples (server info, `shed list`, `system df`,
 egress profiles, enriched image, config) that both the Rust decoders and the Swift
@@ -312,8 +287,6 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo clippy -p shed-app --features broker --all-targets -- -D warnings
 cargo test -p shed-opencode                          # the opencode agent-lane adapter
 cargo test -p shed-opencode --features test-support  # exports `testing::FakeOpencode`
-cargo test -p shed-gx                                 # the gx agent-lane adapter
-cargo test -p shed-gx --features test-support        # exports `testing::FakeGx`; live/regold tests still skip cleanly
 ```
 
 Note: `broker` is the one non-default feature left in this workspace. A bare

@@ -120,14 +120,16 @@ PATHS_HOST_AGENT=(
 # desktop: the app + every crate it links + the shared cargo manifests/locks
 # (which the desktop bump owns).
 #
-# "every crate it links" is the rule, and the two agent-lane adapters are part of
-# it: `desktop/tauri/src-tauri/Cargo.toml` takes `shed-opencode` and `shed-gx` as
-# plain path-deps, so a correctness fix in either is IN the shipped DMG/.deb and
-# must flag desktop. (Neither reaches the host-agent binary — shed-broker has
-# never linked either adapter, and the hub that had its own opencode watcher is
-# gone (plan 022, S6, charliek/shed#328) — so they stay OFF PATHS_HOST_AGENT.)
-# release-plan.sh and update-version.sh already carry both in their desktop
-# lockstep dep lists; this list had not caught up.
+# "every crate it links" is the rule, and the agent-lane adapter is part of
+# it: `desktop/tauri/src-tauri/Cargo.toml` takes `shed-opencode` as a plain
+# path-dep, so a correctness fix in it is IN the shipped DMG/.deb and must
+# flag desktop. (It never reaches the host-agent binary — shed-broker has
+# never linked it, and the hub that had its own opencode watcher is gone
+# (plan 022, S6, charliek/shed#328) — so it stays OFF PATHS_HOST_AGENT.)
+# release-plan.sh and update-version.sh already carry it in their desktop
+# lockstep dep lists; this list had not caught up. (`shed-gx`, plan 017's
+# second adapter, rode the same path-dep shape until plan 025 C1 — shed#390 —
+# retired the gx lane; the next adapter this list gains is shed-craze, C9.)
 # shellcheck disable=SC2034  # read via get_paths()
 PATHS_DESKTOP=(
   desktop
@@ -137,7 +139,6 @@ PATHS_DESKTOP=(
   crates/shedctl
   crates/shed-broker
   crates/shed-opencode
-  crates/shed-gx
   crates/Cargo.toml
   crates/Cargo.lock
   crates/rust-toolchain.toml

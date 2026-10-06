@@ -2184,8 +2184,6 @@ mod tests {
             roost_sockets: std::collections::HashMap::new(),
             ssh_bin: None,
             roost_jail_fs_root: false,
-            gx_home: PathBuf::new(),
-            gx_timings: shed_gx::GxTimings::default(),
             config_path: PathBuf::new(),
             socket_path: PathBuf::from("/run/user/0/shed-tauri/shed-tauri.sock"),
             host_agent_socket: PathBuf::from("/run/user/0/shed/host-agent.sock"),

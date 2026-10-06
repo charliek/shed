@@ -8,7 +8,8 @@
 //! `shed-ext-rc` argv builders, the create/prompt invocations, the permission-mode
 //! table, the stdout decoders, the non-interactive SSH argv, and the last of the
 //! claude.ai pane classifier. What is left is what the SURVIVORS read — the lane
-//! adapters (`shed-opencode`, `shed-gx`), `shed_core::lane`, and `roost::model`,
+//! adapters (`shed-opencode`; `shed-gx` until plan 025 C1 retired it, shed#390),
+//! `shed_core::lane`, and `roost::model`,
 //! which synthesizes an [`RcSessionDto`] per roost tab and states its own
 //! capabilities — plus [`RcError`], which shed-mobile's error mapping names.
 

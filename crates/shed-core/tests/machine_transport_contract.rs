@@ -2,9 +2,12 @@
 //!
 //! SSH has no argv API: a remote command is sent as ONE string the far side's
 //! shell re-parses. The Tauri app composes that string in Rust
-//! (`machine::display_line`, today reached only through `shed-gx`'s discovery
-//! probe — see `crates/shed-gx/src/discovery.rs::PROBE_SCRIPT` — `sx`, its
-//! other caller, was sunset, unreleased, in plan 016). There is no Dart leg:
+//! (`machine::display_line`). Its last production caller, `shed-gx`'s
+//! discovery probe (`crates/shed-gx/src/discovery.rs::PROBE_SCRIPT`), retired
+//! with the gx lane (plan 025 C1, shed#390) — `sx`, its caller before that,
+//! was sunset, unreleased, in plan 016. The contract stays pinned ahead of its
+//! next live composer (shed-craze's remote command, plan 025 C5): a scenario
+//! is never deleted to make a leg pass. There is no Dart leg:
 //! shed-mobile execs the string `roost_ipc::ssh::remote_command()` composes,
 //! not an argv built from this contract (see the README's "The Dart leg").
 //! This file is one of the two legs that keep the Rust composer honest:
@@ -127,8 +130,8 @@ fn every_element_is_always_quoted_never_conditionally() {
             "scenario {id:?}: the first element must be quoted even when bare-safe: {line}"
         );
         // Every scenario's argv[0] is `sh` (C8 re-pointed the corpus onto the
-        // one surviving composer, gx's `sh -c <script>` probe) — a bare-safe
-        // token that must still appear quoted.
+        // then-surviving composer, gx's `sh -c <script>` probe, since retired
+        // in plan 025 C1) — a bare-safe token that must still appear quoted.
         assert!(
             line.starts_with("'sh'"),
             "scenario {id:?}: bare-safe tokens are quoted too: {line}"
