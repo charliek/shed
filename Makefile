@@ -1,4 +1,4 @@
-.PHONY: build build-cli build-server build-egress-proxy build-agent build-firstboot build-tools build-fc-remote-server test test-integration test-host-agent-diff test-integration-dev test-integration-dev-fc dev-server-up dev-server-down dev-server-status dev-server-logs dev-server-restart dev-server-up-fc dev-server-down-fc dev-server-status-fc dev-server-logs-fc dev-server-restart-fc release clean dev-server dev-cli check check-kernel-pin check-roost-pin coverage lint-all docs docs-serve firecracker-rootfs download-firecracker vz-rootfs vz-rootfs-base vz-rootfs-all
+.PHONY: build build-cli build-server build-egress-proxy build-agent build-firstboot build-tools build-fc-remote-server test test-integration test-host-agent-diff test-integration-dev test-integration-dev-fc dev-server-up dev-server-down dev-server-status dev-server-logs dev-server-restart dev-server-up-fc dev-server-down-fc dev-server-status-fc dev-server-logs-fc dev-server-restart-fc release clean dev-server dev-cli check check-kernel-pin check-roost-pin check-craze-pin craze-binaries coverage lint-all docs docs-serve firecracker-rootfs download-firecracker vz-rootfs vz-rootfs-base vz-rootfs-all
 
 GOARCH ?= $(shell go env GOARCH)
 
@@ -835,8 +835,138 @@ check-roost-pin:
 	 fi ; \
 	 echo "roost-session pin OK: $$vz_v / protocol $$vz_p"
 
+# CRAZE_SRC: the dedicated cache clone craze-binaries builds from (plan 025
+# Amendment A4). NEVER ~/projects/craze and NEVER a `git worktree add` into
+# it — that still writes into the owner's working repository, and another
+# session may be working in it. A plain clone/fetch here touches nothing but
+# this cache dir.
+CRAZE_SRC ?= $(HOME)/.cache/shed/craze-src
+
+# craze-binaries: builds craze, craze-fake-host and craze-fake-agent at the
+# pinned CRAZE_TEST_SHA (craze-pin.env), plus craze at the real v0.0.1 tag as
+# craze-0.0.1 (the too-old test cell, plan 025 Amendment A1 — stamped with
+# craze's own 0.0.1 source default, never test-<sha12>), into OUT (default
+# ~/.cache/shed/craze-<sha12>/). Asserts the pin is a MERGED craze main
+# commit (O4: never a branch head) before building. `set -e`: a failed
+# fetch/checkout/build fails the target rather than being masked by a later
+# successful step. CRAZE_SRC is forced clean at each checkout
+# (`--force --detach` + `git clean -fdx`) — safe because it is shed's own
+# cache clone (never `~/projects/craze` or a worktree of it, Amendment A4),
+# so there is no owner work to lose; this is what makes the target
+# idempotent and immune to a half-finished prior run leaving stray files.
+# OUT is resolved to an ABSOLUTE path up front: `go build -o` runs inside a
+# `cd "$(CRAZE_SRC)"` subshell, so a relative OUT would otherwise be written
+# relative to CRAZE_SRC instead of the caller's cwd (`OUT=bin` must mean
+# `./bin` next to the shed repo, not `$(CRAZE_SRC)/bin`). Prints the
+# resolved absolute SHED_CRAZE_BIN_DIR= line a caller exports.
+craze-binaries:
+	@set -eu; \
+	 sha="$$(scripts/release/read-craze-pin.sh --field CRAZE_TEST_SHA craze-pin.env)"; \
+	 sha12=$$(printf '%s' "$$sha" | cut -c1-12); \
+	 out="$${OUT:-$(HOME)/.cache/shed/craze-$$sha12}"; \
+	 case "$$out" in \
+	   /*) ;; \
+	   *) out="$$(pwd)/$$out" ;; \
+	 esac; \
+	 craze_src_abs="$(CRAZE_SRC)"; \
+	 case "$$craze_src_abs" in \
+	   /*) ;; \
+	   *) craze_src_abs="$$(pwd)/$$craze_src_abs" ;; \
+	 esac; \
+	 case "$$out" in \
+	   "$$craze_src_abs" | "$$craze_src_abs"/*) \
+	     echo "ERROR: OUT ($$out) resolves inside CRAZE_SRC ($$craze_src_abs) — every checkout force-cleans CRAZE_SRC (git clean -fdx below), which would delete anything just built there even though this target would still report success. Pick an OUT outside CRAZE_SRC." >&2; \
+	     exit 1 ;; \
+	 esac; \
+	 mkdir -p "$$out"; \
+	 if [ -d "$(CRAZE_SRC)/.git" ]; then \
+	   echo "craze-binaries: fetching charliek/craze into $(CRAZE_SRC)"; \
+	   git -C "$(CRAZE_SRC)" fetch --quiet origin; \
+	 else \
+	   echo "craze-binaries: cloning charliek/craze into $(CRAZE_SRC)"; \
+	   git clone --quiet https://github.com/charliek/craze "$(CRAZE_SRC)"; \
+	 fi; \
+	 if ! git -C "$(CRAZE_SRC)" merge-base --is-ancestor "$$sha" origin/main; then \
+	   echo "ERROR: CRAZE_TEST_SHA $$sha is not an ancestor of charliek/craze origin/main (O4: a merged main commit, never a branch head)" >&2; exit 1; \
+	 fi; \
+	 git -C "$(CRAZE_SRC)" checkout --quiet --force --detach "$$sha"; \
+	 git -C "$(CRAZE_SRC)" clean --quiet -fdx; \
+	 ( cd "$(CRAZE_SRC)" && CGO_ENABLED=0 go build -trimpath \
+	     -ldflags "-X github.com/charliek/craze/internal/version.Version=test-$$sha12" \
+	     -o "$$out/" ./cmd/craze ./cmd/craze-fake-host ./cmd/craze-fake-agent ); \
+	 git -C "$(CRAZE_SRC)" fetch --quiet --tags origin v0.0.1; \
+	 git -C "$(CRAZE_SRC)" checkout --quiet --force --detach v0.0.1; \
+	 git -C "$(CRAZE_SRC)" clean --quiet -fdx; \
+	 ( cd "$(CRAZE_SRC)" && CGO_ENABLED=0 go build -trimpath -o "$$out/craze-0.0.1" ./cmd/craze ); \
+	 git -C "$(CRAZE_SRC)" checkout --quiet --force --detach "$$sha"; \
+	 git -C "$(CRAZE_SRC)" clean --quiet -fdx; \
+	 echo "SHED_CRAZE_BIN_DIR=$$out"
+
+# check-craze-pin: craze-pin.env (plan 025) must be well formed, and when
+# CRAZE_RELEASE is set, the baked Dockerfiles' CRAZE_VERSION ARGs must agree
+# with it and with each other's digest pair (vz==fc) — the same fail-fast-
+# on-drift shape as check-roost-pin above. Offline, macOS-portable
+# awk/sed -E/grep -E only.
+#
+# CRAZE_RELEASE is empty until the bake lands (plan 025 §3.9 / C13): until
+# then NEITHER Dockerfile may DECLARE an ARG CRAZE_VERSION at all — checked
+# by a DECLARATION regex (`^[[:space:]]*ARG[[:space:]]+CRAZE_VERSION([=[:space:]]|$)`,
+# comment lines excluded first), not by whether a default value happened to
+# be extracted, so `ARG CRAZE_VERSION` or `ARG CRAZE_VERSION=` (no default)
+# is still caught as a half-landed bake even though it carries no value to
+# compare.
+#
+# The vendored-fixture clause (crates/shed-craze/fixtures/wire.PIN ==
+# CRAZE_TEST_SHA) arrives in C7, once the crate and its fixtures exist.
+check-craze-pin:
+	@sha="$$(scripts/release/read-craze-pin.sh --field CRAZE_TEST_SHA craze-pin.env)" || exit 1; \
+	 rel="$$(scripts/release/read-craze-pin.sh --field CRAZE_RELEASE craze-pin.env)" || exit 1; \
+	 vz_decl=no; fc_decl=no; \
+	 grep -Ev '^[[:space:]]*#' vz/Dockerfile | grep -Eq '^[[:space:]]*ARG[[:space:]]+CRAZE_VERSION([=[:space:]]|$$)' && vz_decl=yes; \
+	 grep -Ev '^[[:space:]]*#' firecracker/Dockerfile | grep -Eq '^[[:space:]]*ARG[[:space:]]+CRAZE_VERSION([=[:space:]]|$$)' && fc_decl=yes; \
+	 vz_v=$$(sed -nE 's/^[[:space:]]*ARG[[:space:]]+CRAZE_VERSION=(.*)$$/\1/p' vz/Dockerfile | head -1) ; \
+	 fc_v=$$(sed -nE 's/^[[:space:]]*ARG[[:space:]]+CRAZE_VERSION=(.*)$$/\1/p' firecracker/Dockerfile | head -1) ; \
+	 if [ -z "$$rel" ]; then \
+	   if [ "$$vz_decl" = "yes" ] || [ "$$fc_decl" = "yes" ]; then \
+	     echo "ERROR: craze-pin.env CRAZE_RELEASE is empty but a Dockerfile already declares ARG CRAZE_VERSION:" ; \
+	     echo "  vz/Dockerfile declares it:          $$vz_decl (value='$$vz_v')" ; \
+	     echo "  firecracker/Dockerfile declares it: $$fc_decl (value='$$fc_v')" ; \
+	     echo "Bake landed without CRAZE_RELEASE being set (see plan 025 S3.9)." ; \
+	     exit 1 ; \
+	   fi ; \
+	   echo "craze pin OK: no release baked yet (CRAZE_TEST_SHA=$$sha)" ; \
+	 else \
+	   vz_amd64=$$(awk -F= '/^ARG CRAZE_SHA256_AMD64=/ { print $$2; exit }' vz/Dockerfile) ; \
+	   fc_amd64=$$(awk -F= '/^ARG CRAZE_SHA256_AMD64=/ { print $$2; exit }' firecracker/Dockerfile) ; \
+	   vz_arm64=$$(awk -F= '/^ARG CRAZE_SHA256_ARM64=/ { print $$2; exit }' vz/Dockerfile) ; \
+	   fc_arm64=$$(awk -F= '/^ARG CRAZE_SHA256_ARM64=/ { print $$2; exit }' firecracker/Dockerfile) ; \
+	   if [ "$$vz_decl" != "yes" ] || [ "$$fc_decl" != "yes" ] || [ -z "$$vz_v" ] || [ -z "$$fc_v" ] || [ -z "$$vz_amd64" ] || [ -z "$$fc_amd64" ] || [ -z "$$vz_arm64" ] || [ -z "$$fc_arm64" ]; then \
+	     echo "ERROR: craze-pin.env CRAZE_RELEASE=$$rel but a Dockerfile is missing a CRAZE ARG or its value:" ; \
+	     echo "  vz/Dockerfile declares ARG CRAZE_VERSION:          $$vz_decl (value='$$vz_v')" ; \
+	     echo "  firecracker/Dockerfile declares ARG CRAZE_VERSION: $$fc_decl (value='$$fc_v')" ; \
+	     echo "  vz/Dockerfile ARG CRAZE_SHA256_AMD64:          $$vz_amd64" ; \
+	     echo "  firecracker/Dockerfile ARG CRAZE_SHA256_AMD64: $$fc_amd64" ; \
+	     echo "  vz/Dockerfile ARG CRAZE_SHA256_ARM64:          $$vz_arm64" ; \
+	     echo "  firecracker/Dockerfile ARG CRAZE_SHA256_ARM64: $$fc_arm64" ; \
+	     exit 1 ; \
+	   fi ; \
+	   if [ "$$vz_v" != "$$rel" ] || [ "$$fc_v" != "$$rel" ]; then \
+	     echo "ERROR: craze-pin.env CRAZE_RELEASE=$$rel but a Dockerfile's CRAZE_VERSION disagrees:" ; \
+	     echo "  vz/Dockerfile:          CRAZE_VERSION=$$vz_v" ; \
+	     echo "  firecracker/Dockerfile: CRAZE_VERSION=$$fc_v" ; \
+	     exit 1 ; \
+	   fi ; \
+	   if [ "$$vz_amd64" != "$$fc_amd64" ] || [ "$$vz_arm64" != "$$fc_arm64" ]; then \
+	     echo "ERROR: craze digests drifted between Dockerfiles:" ; \
+	     if [ "$$vz_amd64" != "$$fc_amd64" ]; then echo "  CRAZE_SHA256_AMD64: vz=$$vz_amd64 fc=$$fc_amd64" ; fi ; \
+	     if [ "$$vz_arm64" != "$$fc_arm64" ]; then echo "  CRAZE_SHA256_ARM64: vz=$$vz_arm64 fc=$$fc_arm64" ; fi ; \
+	     exit 1 ; \
+	   fi ; \
+	   echo "craze pin OK: release $$rel (CRAZE_TEST_SHA=$$sha)" ; \
+	 fi
+
 # Run all checks (lint + test + kernel pin)
-check: check-kernel-pin check-roost-pin lint test
+check: check-kernel-pin check-roost-pin check-craze-pin lint test
 
 # Run tests with coverage
 coverage:

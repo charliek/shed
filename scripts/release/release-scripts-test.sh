@@ -70,6 +70,9 @@ tar -C "${REPO_ROOT}" -cf - \
   scripts/release/update-version.sh \
   scripts/release/release-plan.sh \
   scripts/release/recommend-components.sh \
+  scripts/release/check-craze-pin.sh \
+  scripts/release/read-craze-pin.sh \
+  craze-pin.env \
   .claude-plugin/plugin.json \
   desktop/VERSION \
   crates/shed-host-agent/VERSION \
@@ -81,6 +84,7 @@ tar -C "${REPO_ROOT}" -cf - \
 UV="${SCRATCH}/scripts/release/update-version.sh"
 RP="${SCRATCH}/scripts/release/release-plan.sh"
 RECO="${SCRATCH}/scripts/release/recommend-components.sh"
+CRAZE_PIN_FILE="${SCRATCH}/craze-pin.env"
 
 # Prime the cargo registry index for both scratch workspaces. update-version.sh
 # runs `cargo update --offline` (the script's no-network contract), and offline
@@ -102,6 +106,58 @@ RECO="${SCRATCH}/scripts/release/recommend-components.sh"
 # update-version.sh's desktop arm, so it needs the primed cargo index above.)
 BASELINE=0.0.0
 "${UV}" "${BASELINE}" --components server,host-agent,desktop >/dev/null
+
+# ---------------------------------------------------------------------------
+# release-plan.sh now calls scripts/release/check-craze-pin.sh for every
+# stable tag that ships `server` (plan 025 O4). That script's `git
+# ls-remote` against charliek/craze is network, which this self-test must
+# never need — SHED_RELEASE_SELFTEST=1 + CRAZE_PIN_LS_REMOTE substitute a
+# fake that always resolves to CRAZE_FAKE_RESOLVED_SHA (see
+# check-craze-pin.sh's seam). Exported ONCE here, matching
+# CRAZE_FAKE_RESOLVED_SHA to the scratch craze-pin.env's CRAZE_TEST_SHA, so
+# EVERY existing ship_server=true case above (and below) gets a default
+# MATCHING fake with no per-case wiring — Phase 4 at the end of this file is
+# the only place that deliberately mismatches it.
+#
+# FAKE_CRAZE_SHA / OTHER_FAKE_SHA are built via `printf` repetition rather
+# than typed out, so their exactly-40-lowercase-hex shape (what
+# check-craze-pin.sh itself validates) can't be thrown off by a manual
+# miscount.
+FAKE_CRAZE_SHA="$(printf 'a%.0s' $(seq 1 40))"
+OTHER_FAKE_SHA="$(printf 'b%.0s' $(seq 1 40))"
+cat > "${CRAZE_PIN_FILE}" <<EOF
+CRAZE_TEST_SHA=${FAKE_CRAZE_SHA}
+CRAZE_RELEASE=1.2.3
+EOF
+# CRAZE_FAKE_CALL_LOG: every fake invocation appends its args here, so a
+# "the checker must NOT run at all" case (a desktop-only / host-agent-only
+# stable tag, Phase 4) can assert the fake was never called — the matching
+# fake alone can't prove that, since it would ALSO silently "pass" a scope
+# regression that calls the checker when it must not.
+CRAZE_FAKE_CALL_LOG="${SCRATCH}/craze-fake-calls.log"
+: > "${CRAZE_FAKE_CALL_LOG}"
+FAKE_LS_REMOTE="${SCRATCH}/fake-ls-remote.sh"
+cat > "${FAKE_LS_REMOTE}" <<'EOF'
+#!/usr/bin/env bash
+# Self-test seam for check-craze-pin.sh's `git ls-remote` call (honoured
+# ONLY under SHED_RELEASE_SELFTEST=1 — see release-scripts-test.sh and
+# check-craze-pin.sh). Emits one ls-remote-style row per ref argument, all
+# resolving to $CRAZE_FAKE_RESOLVED_SHA, and (if set) logs its invocation to
+# $CRAZE_FAKE_CALL_LOG so a caller can assert it was or wasn't called.
+set -euo pipefail
+sha="${CRAZE_FAKE_RESOLVED_SHA:?CRAZE_FAKE_RESOLVED_SHA not set}"
+if [ -n "${CRAZE_FAKE_CALL_LOG:-}" ]; then
+  printf '%s\n' "$*" >> "${CRAZE_FAKE_CALL_LOG}"
+fi
+for ref in "$@"; do
+  printf '%s\t%s\n' "${sha}" "${ref}"
+done
+EOF
+chmod +x "${FAKE_LS_REMOTE}"
+export SHED_RELEASE_SELFTEST=1
+export CRAZE_PIN_LS_REMOTE="${FAKE_LS_REMOTE}"
+export CRAZE_FAKE_RESOLVED_SHA="${FAKE_CRAZE_SHA}"
+export CRAZE_FAKE_CALL_LOG
 
 PASS=0
 step() { echo "--- $*"; }
@@ -926,6 +982,212 @@ for adapter in shed-opencode; do
   printf 'pub fn fold() {}\n' > "${FIX4}/crates/${adapter}/src/fold.rs"
   gitf4 add -A; gitf4 commit -q -m "revert ${adapter} change"
 done
+
+# ===========================================================================
+# Phase 4: scripts/release/check-craze-pin.sh's release-time check (plan 025
+# §3.5/O4), exercised through release-plan.sh's ship_server call-out. Every
+# PRECEDING ship_server=true case above ran against the DEFAULT matching
+# fake wired in just after SCRATCH was built. This phase deliberately
+# mutates that state in its own FRESH ship_server=true tag (8.8.8, unused
+# above) so it can't perturb any earlier case, and nothing below depends on
+# what it leaves behind.
+# ===========================================================================
+
+calls_count() { wc -l < "${CRAZE_FAKE_CALL_LOG}" | tr -d ' '; }
+
+READ_PIN="${SCRATCH}/scripts/release/read-craze-pin.sh"
+
+# ---------------------------------------------------------------------------
+# read-craze-pin.sh's own literal-value contract: a CRLF line ending or
+# trailing space/tab in a value must fail validation, never be silently
+# trimmed/normalized — the exact regression a sourced `. craze-pin.env`
+# used to hide (and an earlier version of this parser reintroduced by
+# trimming before matching). Written directly as files rather than via
+# write_changelog/run_plan — this is read-craze-pin.sh's own unit contract,
+# independent of release-plan.sh's integration.
+# ---------------------------------------------------------------------------
+
+step "read-craze-pin.sh: a CRLF-terminated CRAZE_TEST_SHA line is rejected, not silently normalized"
+CRLF_PIN="${SCRATCH}/crlf-pin.env"
+printf 'CRAZE_TEST_SHA=%s\r\nCRAZE_RELEASE=\r\n' "${FAKE_CRAZE_SHA}" > "${CRLF_PIN}"
+crlf_rc=0
+crlf_out="$("${READ_PIN}" "${CRLF_PIN}" 2>&1 1>/dev/null)" || crlf_rc=$?
+[ "${crlf_rc}" -eq 1 ] || fail "CRLF pin file accepted (rc=${crlf_rc}, want 1): ${crlf_out}"
+echo "${crlf_out}" | grep -q "not EXACTLY 40 lowercase hex" || fail "CRLF pin error doesn't name the literal-shape violation: ${crlf_out}"
+echo "${crlf_out}" | grep -q "^::error::${CRLF_PIN}:1:" || fail "CRLF pin error doesn't cite line 1: ${crlf_out}"
+ok "a CRLF-terminated value fails validation, citing the offending line"
+
+step "read-craze-pin.sh: a trailing space on CRAZE_TEST_SHA and a trailing tab on CRAZE_RELEASE are both rejected"
+TRAIL_PIN="${SCRATCH}/trailing-ws-pin.env"
+printf 'CRAZE_TEST_SHA=%s   \nCRAZE_RELEASE=1.2.3\t\n' "${FAKE_CRAZE_SHA}" > "${TRAIL_PIN}"
+trail_rc=0
+trail_out="$("${READ_PIN}" "${TRAIL_PIN}" 2>&1 1>/dev/null)" || trail_rc=$?
+[ "${trail_rc}" -eq 1 ] || fail "trailing-whitespace pin file accepted (rc=${trail_rc}, want 1): ${trail_out}"
+echo "${trail_out}" | grep -q "^::error::${TRAIL_PIN}:1:" || fail "trailing-space error doesn't cite line 1 (CRAZE_TEST_SHA): ${trail_out}"
+echo "${trail_out}" | grep -q "not EXACTLY 40 lowercase hex" || fail "trailing-space error doesn't name the literal-shape violation: ${trail_out}"
+ok "trailing space/tab on either value is rejected (CRAZE_TEST_SHA checked first, per line order)"
+
+step "read-craze-pin.sh: an indented assignment line is an unexpected line, not a lenient match"
+INDENT_PIN="${SCRATCH}/indented-pin.env"
+printf '  CRAZE_TEST_SHA=%s\nCRAZE_RELEASE=\n' "${FAKE_CRAZE_SHA}" > "${INDENT_PIN}"
+indent_rc=0
+indent_out="$("${READ_PIN}" "${INDENT_PIN}" 2>&1 1>/dev/null)" || indent_rc=$?
+[ "${indent_rc}" -eq 1 ] || fail "indented-assignment pin file accepted (rc=${indent_rc}, want 1): ${indent_out}"
+echo "${indent_out}" | grep -q "unexpected line" || fail "indented-assignment error doesn't say 'unexpected line': ${indent_out}"
+ok "an indented CRAZE_TEST_SHA= line is refused as an unexpected line (must start at column 1)"
+
+step "read-craze-pin.sh: comment and blank lines (including a CRLF blank line) still skip cleanly around a valid pin"
+GOOD_PIN="${SCRATCH}/good-with-comments-pin.env"
+printf '# a comment\r\n   \r\n\nCRAZE_TEST_SHA=%s\n  # an indented comment\nCRAZE_RELEASE=1.2.3\n' "${FAKE_CRAZE_SHA}" > "${GOOD_PIN}"
+good_rc=0
+good_out="$("${READ_PIN}" "${GOOD_PIN}")" || good_rc=$?
+[ "${good_rc}" -eq 0 ] || fail "a well-formed pin with comments/blank lines (one CRLF-blank) was rejected: ${good_out}"
+[ "${good_out}" = "$(printf 'CRAZE_TEST_SHA=%s\nCRAZE_RELEASE=1.2.3' "${FAKE_CRAZE_SHA}")" ] || fail "well-formed pin output mismatch: ${good_out}"
+ok "comments (plain and indented) and blank/CRLF-blank lines are skipped; the two real values parse cleanly"
+
+step "release-plan.sh: craze release check PASSES when the resolved commit matches CRAZE_TEST_SHA (non-vacuous: the checker actually ran)"
+"${UV}" 8.8.8 --components go >/dev/null
+write_changelog 8.8.8 "server"
+cat > "${CRAZE_PIN_FILE}" <<EOF
+CRAZE_TEST_SHA=${FAKE_CRAZE_SHA}
+CRAZE_RELEASE=1.2.3
+EOF
+calls_before="$(calls_count)"
+match_rc=0
+match_out="$("${RP}" v8.8.8 2>"${SCRATCH}/craze-match.err")" || match_rc=$?
+match_err="$(cat "${SCRATCH}/craze-match.err")"
+calls_after="$(calls_count)"
+[ "${match_rc}" -eq 0 ] || fail "craze-match plan exited ${match_rc} (want 0): ${match_err}"
+[ "${match_out}" = "$(expect_plan true false false true)" ] || fail "craze-match plan stdout: ${match_out}"
+# Non-vacuous: a no-op integration (the call removed entirely) would ALSO
+# exit 0 with the same stdout, so assert the checker's own success line
+# reached stderr AND that the ls-remote fake was actually invoked (the call
+# log grew) — proof the checker really ran, not just that nothing failed.
+echo "${match_err}" | grep -q "craze release check OK" || fail "craze-match: checker's OK line missing from stderr (did it actually run?): ${match_err}"
+[ "${calls_after}" -gt "${calls_before}" ] || fail "craze-match: the ls-remote fake was never invoked (checker didn't run) — before=${calls_before} after=${calls_after}"
+ok "a resolved commit matching CRAZE_TEST_SHA plans cleanly, AND the checker provably ran (OK line + fake invocation observed)"
+
+step "release-plan.sh: craze release check FAILS when the resolved commit mismatches CRAZE_TEST_SHA"
+craze_mismatch_rc=0
+craze_mismatch_out="$(CRAZE_FAKE_RESOLVED_SHA="${OTHER_FAKE_SHA}" "${RP}" v8.8.8 2>&1 1>/dev/null)" || craze_mismatch_rc=$?
+[ "${craze_mismatch_rc}" -eq 1 ] || fail "craze-mismatch plan exited ${craze_mismatch_rc} (want 1)"
+echo "${craze_mismatch_out}" | grep -q "drifted apart" || fail "craze-mismatch error missing 'drifted apart': ${craze_mismatch_out}"
+ok "a resolved commit disagreeing with CRAZE_TEST_SHA fails the stable server-shipping plan"
+
+step "release-plan.sh: craze release check FAILS when CRAZE_RELEASE is empty"
+cat > "${CRAZE_PIN_FILE}" <<EOF
+CRAZE_TEST_SHA=${FAKE_CRAZE_SHA}
+CRAZE_RELEASE=
+EOF
+craze_empty_rc=0
+craze_empty_out="$("${RP}" v8.8.8 2>&1 1>/dev/null)" || craze_empty_rc=$?
+[ "${craze_empty_rc}" -eq 1 ] || fail "craze-empty plan exited ${craze_empty_rc} (want 1)"
+echo "${craze_empty_out}" | grep -q "craze release is empty" || fail "craze-empty error missing 'craze release is empty': ${craze_empty_out}"
+ok "an empty CRAZE_RELEASE fails a stable server-shipping plan (RELEASING.md's stated consequence)"
+
+# Restore a matching pin AND re-write the v8.8.8 CHANGELOG section — the
+# scope cases below call write_changelog for OTHER tags (8.8.9, 8.8.10),
+# and write_changelog REPLACES the whole scratch CHANGELOG.md file each
+# time, so v8.8.8's section (and thus release-plan.sh's reason to reach the
+# craze check at all) would otherwise be gone by the time the seam tests
+# below run. The seam tests run BEFORE the scope tests for the same reason:
+# keeping v8.8.8 the LAST tag written to the scratch CHANGELOG before they
+# fire means a seam-ignored case's exit 1 can only come from the craze
+# check itself, never from an unrelated "no CHANGELOG entry" failure
+# upstream of it (that exact vacuous-pass trap was caught live while
+# writing this test — see live-c6-controls.txt).
+cat > "${CRAZE_PIN_FILE}" <<EOF
+CRAZE_TEST_SHA=${FAKE_CRAZE_SHA}
+CRAZE_RELEASE=1.2.3
+EOF
+write_changelog 8.8.8 "server"
+
+# ---------------------------------------------------------------------------
+# A hermetic stand-in for the real charliek/craze remote, for the two
+# seam-negative controls below. Those must prove the REAL `git ls-remote`
+# code path ran (not the fake) WITHOUT touching the network and WITHOUT
+# modifying check-craze-pin.sh's hardcoded GitHub URL (nor assuming that URL
+# will never grow a real v1.2.3 tag). git's own URL-rewrite config
+# (`url.<base>.insteadOf`, set via GIT_CONFIG_COUNT/KEY_0/VALUE_0, git
+# >=2.31) transparently redirects that EXACT URL string to a local repo —
+# scoped to just these two invocations' environment, so nothing else in
+# this file is affected.
+# ---------------------------------------------------------------------------
+LOCAL_CRAZE_REMOTE="${SCRATCH}/local-craze-remote"
+mkdir -p "${LOCAL_CRAZE_REMOTE}"
+git -C "${LOCAL_CRAZE_REMOTE}" init -q
+git -C "${LOCAL_CRAZE_REMOTE}" -c user.email=t@t -c user.name=t commit -q --allow-empty -m "hermetic stand-in for charliek/craze v1.2.3"
+LOCAL_CRAZE_COMMIT="$(git -C "${LOCAL_CRAZE_REMOTE}" rev-parse HEAD)"
+git -C "${LOCAL_CRAZE_REMOTE}" tag v1.2.3
+
+step "release-plan.sh: the CRAZE_PIN_LS_REMOTE seam is IGNORED when SHED_RELEASE_SELFTEST is unset/empty (never a bypass)"
+# CRAZE_PIN_LS_REMOTE still points at the matching fake, but
+# SHED_RELEASE_SELFTEST is cleared for this one call — check-craze-pin.sh
+# must fall through to the REAL `git ls-remote` code path, which (via the
+# insteadOf redirect) resolves v1.2.3 against the LOCAL stand-in repo, to
+# LOCAL_CRAZE_COMMIT — a real git sha that is NOT CRAZE_TEST_SHA (the fake
+# sha), so this is reported as a mismatch (reusing the same "drifted apart"
+# wording the mismatch case above already asserts). If the
+# SHED_RELEASE_SELFTEST=1 gate is ever dropped, this case goes green instead
+# (the fake always matches CRAZE_TEST_SHA) — that is the negative control.
+# Asserting the SPECIFIC local commit (not just rc==1, and not just "drifted
+# apart") is load-bearing: an unrelated upstream failure also exits 1 with
+# some message, and must not be mistaken for the seam actually being
+# rejected — only the real resolver can have produced THIS sha.
+craze_seam_rc=0
+craze_seam_out="$(SHED_RELEASE_SELFTEST= GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0="url.${LOCAL_CRAZE_REMOTE}.insteadOf" GIT_CONFIG_VALUE_0="https://github.com/charliek/craze" "${RP}" v8.8.8 2>&1 1>/dev/null)" || craze_seam_rc=$?
+[ "${craze_seam_rc}" -eq 1 ] || fail "craze-seam-ignored plan exited ${craze_seam_rc} (want 1 — the fake must not be honoured): ${craze_seam_out}"
+echo "${craze_seam_out}" | grep -q "resolves to ${LOCAL_CRAZE_COMMIT}" || fail "craze-seam-ignored: expected the REAL (locally-redirected) ls-remote to report the stand-in's commit ${LOCAL_CRAZE_COMMIT}, got: ${craze_seam_out}"
+echo "${craze_seam_out}" | grep -q "drifted apart" || fail "craze-seam-ignored: expected the mismatch wording, got: ${craze_seam_out}"
+ok "CRAZE_PIN_LS_REMOTE is ignored when SHED_RELEASE_SELFTEST is unset/empty; the real (locally-redirected) resolver ran, offline, and reported the stand-in's commit"
+
+step "release-plan.sh: the CRAZE_PIN_LS_REMOTE seam is IGNORED when SHED_RELEASE_SELFTEST=0 (strict '=1', not merely non-empty)"
+# Distinct from the unset/empty case above: an implementation that checks
+# `[ -n "${SHED_RELEASE_SELFTEST:-}" ]` instead of the strict `= "1"` would
+# treat "0" as enabled too and wrongly honour the fake here. Same local
+# stand-in redirect, same specific-commit assertion.
+craze_seam0_rc=0
+craze_seam0_out="$(SHED_RELEASE_SELFTEST=0 GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0="url.${LOCAL_CRAZE_REMOTE}.insteadOf" GIT_CONFIG_VALUE_0="https://github.com/charliek/craze" "${RP}" v8.8.8 2>&1 1>/dev/null)" || craze_seam0_rc=$?
+[ "${craze_seam0_rc}" -eq 1 ] || fail "craze-seam-zero plan exited ${craze_seam0_rc} (want 1 — SHED_RELEASE_SELFTEST=0 must not enable the fake): ${craze_seam0_out}"
+echo "${craze_seam0_out}" | grep -q "resolves to ${LOCAL_CRAZE_COMMIT}" || fail "craze-seam-zero: expected the REAL (locally-redirected) ls-remote to report the stand-in's commit ${LOCAL_CRAZE_COMMIT}, got: ${craze_seam0_out}"
+echo "${craze_seam0_out}" | grep -q "drifted apart" || fail "craze-seam-zero: expected the mismatch wording, got: ${craze_seam0_out}"
+ok "CRAZE_PIN_LS_REMOTE is ignored when SHED_RELEASE_SELFTEST=0 (strict equality, not a truthy/non-empty check); offline via the local redirect"
+
+# ---------------------------------------------------------------------------
+# Scope: the always-matching fake above proves the checker behaves correctly
+# WHEN CALLED, but it would also silently paper over a regression that calls
+# it when it must NOT be called (e.g. the `[ "${SHIP_SERVER}" = "true" ]`
+# guard in release-plan.sh accidentally dropped) — a desktop-only or
+# host-agent-only tag would then get a free matching result instead of
+# failing loudly. These two cases assert the ls-remote fake's call log is
+# UNCHANGED, i.e. the checker was never invoked at all, for stable tags that
+# do NOT ship `server`. Fresh tags (8.8.9, 8.8.10) unused elsewhere in this
+# file, so they can't collide with any other case's manifest state. They run
+# LAST because each write_changelog call replaces the scratch CHANGELOG.md
+# wholesale — nothing after this point still needs v8.8.8's section.
+# ---------------------------------------------------------------------------
+
+step "release-plan.sh: a desktop-only stable tag NEVER invokes the craze checker (SHIP_SERVER=false)"
+"${UV}" 8.8.9 --components desktop >/dev/null
+write_changelog 8.8.9 "desktop"
+calls_before="$(calls_count)"
+run_plan v8.8.9
+calls_after="$(calls_count)"
+[ "${PLAN_RC}" -eq 0 ] || fail "desktop-only scope-case plan exited ${PLAN_RC} (want 0)"
+[ "${PLAN_OUT}" = "$(expect_plan false false true false)" ] || fail "desktop-only scope-case plan stdout: ${PLAN_OUT}"
+[ "${calls_before}" -eq "${calls_after}" ] || fail "desktop-only tag invoked the craze ls-remote fake (the checker ran when SHIP_SERVER=false) — calls before=${calls_before} after=${calls_after}"
+ok "a desktop-only stable tag plans cleanly and never touches the craze checker (call log unchanged)"
+
+step "release-plan.sh: a host-agent-only stable tag NEVER invokes the craze checker (SHIP_SERVER=false)"
+printf '8.8.10\n' > "${HOST_AGENT_VER}"
+write_changelog 8.8.10 "host-agent"
+calls_before="$(calls_count)"
+run_plan v8.8.10
+calls_after="$(calls_count)"
+[ "${PLAN_RC}" -eq 0 ] || fail "host-agent-only scope-case plan exited ${PLAN_RC} (want 0)"
+[ "${PLAN_OUT}" = "$(expect_plan false true false true)" ] || fail "host-agent-only scope-case plan stdout: ${PLAN_OUT}"
+[ "${calls_before}" -eq "${calls_after}" ] || fail "host-agent-only tag invoked the craze ls-remote fake (the checker ran when SHIP_SERVER=false) — calls before=${calls_before} after=${calls_after}"
+ok "a host-agent-only stable tag plans cleanly and never touches the craze checker (call log unchanged)"
 
 echo
 echo "release-scripts-test: all ${PASS} checks passed"

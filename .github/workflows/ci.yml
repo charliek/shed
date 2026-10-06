@@ -75,6 +75,10 @@ jobs:
           filters: |
             rust:
               - 'crates/**'
+              # the craze pins (plan 025): a merged craze CI-test SHA and the
+              # craze release the images bake, read by the craze-binaries
+              # composite action and make check-craze-pin.
+              - 'craze-pin.env'
             desktop:
               - 'desktop/**'
               - 'crates/**'
@@ -92,6 +96,7 @@ jobs:
               - 'desktop/scripts/fetch-sparkle.sh'
               - 'desktop/scripts/bundle-tauri-mac.sh'
               - 'desktop/Makefile'
+              - 'craze-pin.env'
             packaging:
               - 'desktop/packaging/**'
               - 'desktop/linux/**'
@@ -100,6 +105,7 @@ jobs:
               # the shedtest harness env
               - 'desktop/pyproject.toml'
               - 'desktop/uv.lock'
+              - 'craze-pin.env'
             hostagent:
               # The Go-vs-Rust host-agent differential leg: both daemons, their
               # shared wire contract (sdk envelope + ext/protocol payloads), the
@@ -142,10 +148,12 @@ jobs:
               - '.github/workflows/docs.yml'
             ci:
               - '.github/workflows/**'
+              - '.github/actions/**'
               - '.goreleaser*.yaml'
               - 'scripts/release/**'
               - 'Makefile'
               - 'desktop/Makefile'
+              - 'craze-pin.env'
 
   test:
     needs: changes
@@ -195,6 +203,23 @@ jobs:
         # the rest of this job; the `ci` filter includes scripts/release/**,
         # so any edit to the release scripts always runs this.
         run: scripts/release/release-scripts-test.sh
+
+  # The two offline, fail-fast-on-drift pins (`make check-roost-pin
+  # check-craze-pin`) ran in NO CI job before plan 025 — the paths they read
+  # (crates/shed-core/src/roost/bootstrap/source.rs, craze-pin.env, both
+  # Dockerfiles) live partly under crates/, which the `go` filter excludes,
+  # so this job runs on `go || rust || ci` rather than riding along with
+  # `test`/`lint`. No Rust/Go toolchain needed — just the checkout and the
+  # Makefile's awk/sed -E checks.
+  pins:
+    name: pins (roost + craze)
+    needs: changes
+    if: ${{ needs.changes.outputs.go == 'true' || needs.changes.outputs.rust == 'true' || needs.changes.outputs.ci == 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: check-roost-pin + check-craze-pin (offline)
+        run: make check-roost-pin check-craze-pin
 
   release-snapshot:
     name: GoReleaser snapshot (artifact sanity)
@@ -843,12 +868,12 @@ jobs:
   ci-success:
     name: ci-success
     if: always()
-    needs: [changes, test, lint, plugin, release-snapshot, swift, core-linux, host-agent-diff, machine-transport, deb, tauri-linux, tauri-mac, docs-build]
+    needs: [changes, test, lint, plugin, pins, release-snapshot, swift, core-linux, host-agent-diff, machine-transport, deb, tauri-linux, tauri-mac, docs-build]
     runs-on: ubuntu-latest
     steps:
       - name: Require no job failed (skipped-by-filter counts as pass)
         run: |
-          results="${{ needs.changes.result }} ${{ needs.test.result }} ${{ needs.lint.result }} ${{ needs.plugin.result }} ${{ needs.release-snapshot.result }} ${{ needs.swift.result }} ${{ needs.core-linux.result }} ${{ needs.host-agent-diff.result }} ${{ needs.machine-transport.result }} ${{ needs.deb.result }} ${{ needs.tauri-linux.result }} ${{ needs.tauri-mac.result }} ${{ needs.docs-build.result }}"
+          results="${{ needs.changes.result }} ${{ needs.test.result }} ${{ needs.lint.result }} ${{ needs.plugin.result }} ${{ needs.pins.result }} ${{ needs.release-snapshot.result }} ${{ needs.swift.result }} ${{ needs.core-linux.result }} ${{ needs.host-agent-diff.result }} ${{ needs.machine-transport.result }} ${{ needs.deb.result }} ${{ needs.tauri-linux.result }} ${{ needs.tauri-mac.result }} ${{ needs.docs-build.result }}"
           echo "job results: ${results}"
           for r in ${results}; do
             case "${r}" in

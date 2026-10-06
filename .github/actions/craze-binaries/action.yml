@@ -1,0 +1,160 @@
+name: "craze-binaries"
+description: >-
+  Builds craze, craze-fake-host and craze-fake-agent at the pinned
+  CRAZE_TEST_SHA (plus craze at the real v0.0.1 tag as craze-0.0.1, the
+  too-old test cell — plan 025 Amendment A1) from a fresh charliek/craze
+  checkout, and exports SHED_CRAZE_BIN_DIR + SHED_CRAZE_REQUIRE=1 for every
+  job step that consumes craze's binaries. Used from both shed's and
+  shed-mobile's CI (the latter via a local-action reference into its sibling
+  shed checkout) so the two CIs can never drift onto different craze SHAs.
+  See plan 025 §3.5 ("Pins and CI") and craze-pin.env at the shed checkout's
+  root.
+
+inputs:
+  shed-path:
+    description: >-
+      Path to the shed checkout that holds craze-pin.env at its root (and,
+      from plan 025 C7 on, crates/shed-craze/fixtures/wire to diff against
+      craze's own vendored wire fixtures). shed-mobile passes its sibling
+      shed checkout here.
+    required: true
+  out-dir:
+    description: Directory the four binaries are built into.
+    required: true
+
+runs:
+  using: "composite"
+  steps:
+    # craze-pin.env is NEVER sourced as shell (`. craze-pin.env`) — it is a
+    # repo file that can carry attacker/mistake-controlled content, and
+    # sourcing it would let a line like `CRAZE_TEST_SHA=$(cmd)` execute
+    # before anything validates it. scripts/release/read-craze-pin.sh (the
+    # one shared reader every consumer uses — the Makefile targets and
+    # check-craze-pin.sh too) parses it as DATA and validates the value
+    # BEFORE this step ever uses or exports it.
+    - name: Read and validate the craze pin (parsed as data, never sourced)
+      shell: bash
+      run: |
+        set -euo pipefail
+        SHA="$("${{ inputs.shed-path }}/scripts/release/read-craze-pin.sh" --field CRAZE_TEST_SHA "${{ inputs.shed-path }}/craze-pin.env")"
+        echo "CRAZE_TEST_SHA=${SHA}" >> "$GITHUB_ENV"
+
+    # Resolved here, up front, into an ABSOLUTE path — every later step that
+    # writes a binary does so from inside a `cd craze-src` subshell, so a
+    # relative out-dir would otherwise land under craze-src instead of
+    # where the caller meant it (the same bug the Makefile's `OUT=` fix
+    # addresses). $GITHUB_WORKSPACE is the job's checkout root, the natural
+    # base for a relative input.
+    - name: Resolve out-dir to an absolute path
+      shell: bash
+      run: |
+        set -euo pipefail
+        OUT_DIR="${{ inputs.out-dir }}"
+        case "${OUT_DIR}" in
+          /*) ;;
+          *) OUT_DIR="${GITHUB_WORKSPACE}/${OUT_DIR}" ;;
+        esac
+        mkdir -p "${OUT_DIR}"
+        echo "CRAZE_OUT_DIR=${OUT_DIR}" >> "$GITHUB_ENV"
+
+    - name: Check out charliek/craze at the pin
+      uses: actions/checkout@v6
+      with:
+        repository: charliek/craze
+        ref: ${{ env.CRAZE_TEST_SHA }}
+        path: craze-src
+        fetch-depth: 0
+        persist-credentials: false
+
+    - name: Assert HEAD == the pin, and that the pin is a merged main commit
+      shell: bash
+      run: |
+        set -euo pipefail
+        head="$(git -C craze-src rev-parse HEAD)"
+        if [ "${head}" != "${CRAZE_TEST_SHA}" ]; then
+          echo "::error::craze-src HEAD (${head}) != CRAZE_TEST_SHA (${CRAZE_TEST_SHA})" >&2
+          exit 1
+        fi
+        # O4: "the SHA may run ahead of releases (always a merged craze main
+        # commit, never a branch head)" — enforced, not just commented.
+        if ! git -C craze-src merge-base --is-ancestor "${CRAZE_TEST_SHA}" origin/main; then
+          echo "::error::CRAZE_TEST_SHA ${CRAZE_TEST_SHA} is not an ancestor of charliek/craze origin/main" >&2
+          exit 1
+        fi
+
+    - name: Set up Go (craze's own toolchain)
+      uses: actions/setup-go@v6
+      with:
+        go-version-file: craze-src/go.mod
+        cache-dependency-path: craze-src/go.sum
+
+    - name: Assert the active Go matches craze-src/go.mod's toolchain
+      shell: bash
+      run: |
+        set -euo pipefail
+        toolchain="$(awk '/^toolchain /{print $2; exit}' craze-src/go.mod | sed 's/^go//')"
+        if [ -z "${toolchain}" ]; then
+          echo "::error::craze-src/go.mod has no 'toolchain' line to assert against" >&2
+          exit 1
+        fi
+        active="$(go version | awk '{print $3}' | sed 's/^go//')"
+        if [ "${active}" != "${toolchain}" ]; then
+          echo "::error::active Go (${active}) != craze-src/go.mod toolchain (${toolchain}) — a craze toolchain move must be loud, not silently skipped" >&2
+          exit 1
+        fi
+        echo "go toolchain OK: ${active}"
+
+    - name: Build craze, craze-fake-host, craze-fake-agent at the pin
+      shell: bash
+      run: |
+        set -euo pipefail
+        OUT_DIR="${CRAZE_OUT_DIR}"
+        sha12="${CRAZE_TEST_SHA:0:12}"
+        ( cd craze-src && CGO_ENABLED=0 go build -trimpath \
+            -ldflags "-X github.com/charliek/craze/internal/version.Version=test-${sha12}" \
+            -o "${OUT_DIR}/" ./cmd/craze ./cmd/craze-fake-host ./cmd/craze-fake-agent )
+        echo "built craze, craze-fake-host, craze-fake-agent (test-${sha12}) into ${OUT_DIR}"
+
+    - name: Build craze at the v0.0.1 tag as craze-0.0.1 (the too-old cell)
+      shell: bash
+      run: |
+        set -euo pipefail
+        OUT_DIR="${CRAZE_OUT_DIR}"
+        git -C craze-src fetch --quiet --tags origin v0.0.1
+        git -C craze-src checkout --quiet --detach v0.0.1
+        # Plain `go build`, no -ldflags: craze's own source default already
+        # reports 0.0.1 (internal/version/version.go) — the real release
+        # string, so the too-old binary never claims to be the pin build.
+        ( cd craze-src && CGO_ENABLED=0 go build -trimpath -o "${OUT_DIR}/craze-0.0.1" ./cmd/craze )
+        git -C craze-src checkout --quiet --detach "${CRAZE_TEST_SHA}"
+        echo "built craze-0.0.1 (stamped 0.0.1) into ${OUT_DIR}"
+
+    - name: Export SHED_CRAZE_BIN_DIR and SHED_CRAZE_REQUIRE
+      shell: bash
+      run: |
+        set -euo pipefail
+        echo "SHED_CRAZE_BIN_DIR=${CRAZE_OUT_DIR}" >> "$GITHUB_ENV"
+        echo "SHED_CRAZE_REQUIRE=1" >> "$GITHUB_ENV"
+
+    # Diff choice: conditional on the shed fixtures dir EXISTING, rather than
+    # a consumer-provided opt-in input. crates/shed-craze (and its vendored
+    # fixtures/wire) doesn't exist until plan 025 C7 — a required input would
+    # force every consumer (C6 has none yet; C7 wires core-linux) to remember
+    # to flip it on later, and a forgotten flip would silently skip the drift
+    # check forever. Keying off the directory's existence means the check
+    # self-activates the moment C7 vendors the fixtures, with no second edit
+    # to this action and no edit to whatever workflow step calls it.
+    - name: Diff craze's wire fixtures against shed's vendored copy
+      shell: bash
+      run: |
+        set -euo pipefail
+        FIXTURES_DIR="${{ inputs.shed-path }}/crates/shed-craze/fixtures/wire"
+        if [ ! -d "${FIXTURES_DIR}" ]; then
+          echo "crates/shed-craze/fixtures/wire does not exist yet (the crate lands in plan 025 C7) — skipping the drift diff"
+          exit 0
+        fi
+        if ! diff -rq craze-src/internal/fakehost/testdata/wire "${FIXTURES_DIR}"; then
+          echo "::error::craze's internal/fakehost/testdata/wire drifted from the vendored crates/shed-craze/fixtures/wire — re-vendor at the current CRAZE_TEST_SHA" >&2
+          exit 1
+        fi
+        echo "wire fixtures OK: byte-identical to craze-src/internal/fakehost/testdata/wire"

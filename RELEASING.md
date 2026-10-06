@@ -169,6 +169,58 @@ The desktop leg's recurring specifics (secrets, DMG/notarize, Sparkle
 appcast, debs, apt dispatch, rc-tag rehearsals) live in
 [`desktop/RELEASING.md`](desktop/RELEASING.md).
 
+### craze pin (plan 025)
+
+`craze-pin.env` at the repo root holds two independent pins for
+[craze](https://github.com/charliek/craze), the agent-lane provider shed's
+desktop and phone clients drive:
+
+- **`CRAZE_TEST_SHA`** — a MERGED craze `main` commit (never a branch head)
+  that both this repo's CI and shed-mobile's CI build `craze`,
+  `craze-fake-host` and `craze-fake-agent` from for their hermetic tests.
+  `make craze-binaries` builds the same four binaries locally (plus
+  `craze-0.0.1`, the too-old test cell, built at the real `v0.0.1` tag); the
+  `.github/actions/craze-binaries` composite action does the equivalent in
+  CI, shared by both repos so their craze SHAs can't drift apart.
+- **`CRAZE_RELEASE`** — the craze release the shed images actually bake
+  (bare `X.Y.Z`), or empty before the bake lands.
+
+`craze-pin.env` is never sourced as shell by anything that reads it — every
+consumer (the Makefile targets, `check-craze-pin.sh`, the composite action,
+`release-plan.sh`) goes through `scripts/release/read-craze-pin.sh`, the one
+shared strict parser that treats the file as DATA: only `CRAZE_TEST_SHA=`
+and `CRAZE_RELEASE=` lines are recognized, validated before anything uses
+them, and any other line is refused outright. Sourcing it would let the file
+itself run a command or flip the release-time check's self-test seam.
+
+`make check-craze-pin` (offline, run by `make check` and CI's `pins` job)
+keeps the two pins well-formed and, once `CRAZE_RELEASE` is set, keeps both
+Dockerfiles' `CRAZE_VERSION`/digest `ARG`s in lockstep with it and with each
+other — the same fail-fast-on-drift shape as `check-roost-pin`.
+
+**The release-time check.** `scripts/release/check-craze-pin.sh --release
+vX.Y.Z` (network) resolves `v$CRAZE_RELEASE` against
+`github.com/charliek/craze` via `git ls-remote` and requires the resolved
+commit to equal `CRAZE_TEST_SHA` — O4's rule that "at the shed release the
+test SHA must equal the baked release's tag commit, enforced by a check."
+`release-plan.sh` calls it for every **stable tag whose component set
+includes `server`** (the images ship with the server component), in both
+the mandatory local pre-tag run and CI's `release-plan` job.
+
+> **Consequence.** From this check's merge until the craze bake lands (plan
+> 025 §3.9 / C13), `CRAZE_RELEASE` is empty — so **every** stable tag that
+> ships `server` from `main`, a hotfix included, is refused by this check.
+> That is the rule working as intended: 0.9.0 must bake craze. For a true
+> emergency, the owner may set `SHED_RELEASE_ALLOW_NO_CRAZE=<reason>`, which
+> prints loudly and records the override in `release-plan.sh`'s output
+> instead of being silently honoured — it must never be set by CI.
+
+`scripts/release/release-scripts-test.sh` covers the release-time check
+too, through a `CRAZE_PIN_LS_REMOTE` seam honoured **only** under
+`SHED_RELEASE_SELFTEST=1` (so a stray variable can never bypass a real
+release run) — match passes, mismatch fails, an empty `CRAZE_RELEASE`
+fails, and the seam is proven ignored without the self-test flag.
+
 ## What happens
 
 1. **`release-workflows:release`** (LLM, local):
