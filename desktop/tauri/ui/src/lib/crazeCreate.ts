@@ -253,3 +253,34 @@ export function sheetOnScreen(modal: string | null, machine: string | null): str
 export function closesOntoTranscript(onScreen: string | null, machine: string): boolean {
   return onScreen === machine;
 }
+
+// ---- the Agents pane's group header (plan 025 CR-fix finding 1) ------------
+
+/** A session row, as far as this lookup needs it — structurally compatible
+ *  with `bridge.ts`'s `RcSession` without importing it (this module stays
+ *  dependency-free so node's own test runner can compile it alone). */
+export type OriginRow = { origin?: string | null };
+
+/** A configured machine, as far as this lookup needs it — structurally
+ *  compatible with `bridge.ts`'s `MachineStatus`. */
+export type OriginMachine = { origin: string };
+
+/** Which machine a session group's header belongs to.
+ *
+ *  The Agents pane groups by `sessionOrigin(s)` (`App.tsx`), whose group KEY
+ *  is a display string: `machine:<name>` for a machine, but `<host>/<shed>`
+ *  — not the shed's real origin token — for a shed. Every row still carries
+ *  its real `origin` (`roost:<server>/<shed>` or `machine:<name>`, since
+ *  S6 — `bridge.ts`'s `sessionKey` relies on the same fact), so this looks
+ *  the machine up by a row's real origin first, falling back to the group
+ *  key itself (an old payload with no `origin` on any row). Looking it up by
+ *  the group key alone — the bug this fixes — always misses for a shed
+ *  group, because a shed's key and its origin token are different strings. */
+export function groupMachine<M extends OriginMachine>(
+  groupKey: string,
+  rows: OriginRow[],
+  machines: M[],
+): M | undefined {
+  const origin = rows.find((r) => r.origin)?.origin ?? groupKey;
+  return machines.find((m) => m.origin === origin);
+}

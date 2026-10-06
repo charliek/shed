@@ -1858,6 +1858,99 @@ async fn an_ask_resolved_between_list_and_get_is_no_approval() {
     assert!(lane.approvals().await.unwrap().is_empty());
 }
 
+/// **`asks.get` REFUSED `unknown_ask`** — craze's own client (`Session.Ask`)
+/// treats only this code as "the ask ended since the list" — is skipped the
+/// same way a `resolved` record is: no `Approval` frame, and the seed still
+/// reaches `Ready` (plan 025 CR-fix finding 2).
+#[tokio::test]
+async fn an_asks_get_refused_unknown_ask_is_skipped_and_the_lane_seeds() {
+    let (_dial, mut conns, lane) = scripted(fast());
+    let (mut rx, _stop) = subscribed(&lane).await;
+    let mut hub = next_conn(&mut conns).await;
+    hub.splice(HOST).await;
+    hub.listed(row()).await;
+    hub.attached_only(attach_result(
+        SUB,
+        &info(false),
+        (INC, 1),
+        Some(snapshot_at(INC, 1, json!({}))),
+        None,
+    ))
+    .await;
+    let list = hub.expect("asks.list").await;
+    hub.reply(
+        &list,
+        json!({"asks": [{"id": "ask-gone", "kind": "permission", "label": "",
+                          "openedAt": "2026-01-01T00:00:01Z"}]}),
+    )
+    .await;
+    let get = hub.expect("asks.get").await;
+    assert_eq!(get["params"]["askId"], "ask-gone");
+    hub.refuse(
+        &get,
+        shed_craze::wire::code::UNKNOWN_ASK,
+        "forgotten",
+        json!({}),
+    )
+    .await;
+    let sync = hub.expect("session.sync").await;
+    hub.reply(&sync, json!({"seq": 1})).await;
+    hub.synchronized(SUB, 1).await;
+    let mut checker = LaneChecker::new();
+    let seed = drive(&mut rx, &mut checker, "the seed", is_ready).await;
+    assert!(approvals_seen(&seed).is_empty(), "{seed:#?}");
+    assert!(lane.approvals().await.unwrap().is_empty());
+}
+
+/// **`asks.get` refused with ANY OTHER code** is not "gone since the list" —
+/// it is a fault, exactly like `asks.list`'s own refusal a few lines up: the
+/// connection is dropped and the next one reseeds. The catch-all this fixes
+/// would instead have dropped the ask silently, leaving an open "needs you"
+/// ask invisible — the regression Amendment A11 exists to prevent (plan 025
+/// CR-fix finding 2).
+#[tokio::test]
+async fn an_asks_get_refused_with_another_code_faults_the_lane() {
+    let (_dial, mut conns, lane) = scripted(fast());
+    let (mut rx, _stop) = subscribed(&lane).await;
+    let mut hub = next_conn(&mut conns).await;
+    hub.splice(HOST).await;
+    hub.listed(row()).await;
+    hub.attached_only(attach_result(
+        SUB,
+        &info(false),
+        (INC, 1),
+        Some(snapshot_at(INC, 1, json!({}))),
+        None,
+    ))
+    .await;
+    let list = hub.expect("asks.list").await;
+    hub.reply(
+        &list,
+        json!({"asks": [{"id": "ask-bad", "kind": "permission", "label": "",
+                          "openedAt": "2026-01-01T00:00:01Z"}]}),
+    )
+    .await;
+    let get = hub.expect("asks.get").await;
+    assert_eq!(get["params"]["askId"], "ask-bad");
+    hub.refuse(
+        &get,
+        shed_craze::wire::code::BAD_REQUEST,
+        "malformed",
+        json!({}),
+    )
+    .await;
+    let (mut hub2, _) = seed_conn(&mut conns, SUB, 1, json!({})).await;
+    hub2.synchronized(SUB, 1).await;
+    let mut checker = LaneChecker::new();
+    let frames = drive(&mut rx, &mut checker, "the fault then reseed", is_ready).await;
+    assert_eq!(
+        resets(&frames).last(),
+        Some(&("protocol".to_string(), 1)),
+        "{frames:#?}"
+    );
+    drop(hub);
+}
+
 /// **A hidden kind is never an approval**, seeded or live — craze's own
 /// `HiddenBy`: on a session whose capabilities lack `askCards`, a QUESTION is
 /// hidden (no `Approval`, no card row), while a PERMISSION is never hidden —

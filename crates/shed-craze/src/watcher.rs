@@ -823,8 +823,16 @@ impl Watcher {
             };
             match conn.request(method::ASKS_GET, &params, t).await {
                 Ok(v) => records.push(read::<AskGetResult>(conn, v, "an asks.get")?.ask),
-                // Ended (and forgotten) since the list: nothing to adopt.
-                Err(CallError::Refused(_)) => {}
+                // Ended (and forgotten) since the list: nothing to adopt. ONLY
+                // this code means that — craze's own client (`Session.Ask`)
+                // treats every other refusal as an error, and so do we: a
+                // `bad_request`/`unknown_session`/etc. here would otherwise
+                // drop an open ask from the registry seed silently.
+                Err(CallError::Refused(e)) if e.data_code.as_deref() == Some(code::UNKNOWN_ASK) => {
+                }
+                Err(CallError::Refused(e)) => {
+                    return Err(fault(conn, &format!("craze refused asks.get: {e}"), true))
+                }
                 Err(_) => return Err(End::lost(true)),
             }
         }

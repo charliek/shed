@@ -22,7 +22,7 @@ import { CrazeCreateDialog } from "@/components/CrazeCreateDialog";
 import { canOpenTerminal, crazeDoingLine, crazeMachineNote, killTarget } from "@/lib/crazeRows";
 import {
   EMPTY_DRAFT, beginSubmit, closesOntoTranscript, crazeCreateOffered, crazeCreateUpdateNote,
-  edit as editCrazeDraft, liveSetter, settle, sheetOnScreen,
+  edit as editCrazeDraft, groupMachine, liveSetter, settle, sheetOnScreen,
   type CrazeDraft,
 } from "@/lib/crazeCreate";
 import { RoostLine, RoostConsentDialog, Toast } from "@/components/RoostBootstrap";
@@ -589,7 +589,7 @@ function AgentsPane({ sessions, machines, capabilities, load, loadError, onLaunc
                 its "New craze session". */}
             <div className="flex items-start justify-between gap-3">
               <HostLabel host={origin} />
-              <CrazeCreateAction machine={machines.find((m) => m.origin === origin)} onCrazeCreate={onCrazeCreate} compact />
+              <CrazeCreateAction machine={groupMachine(origin, rows, machines)} onCrazeCreate={onCrazeCreate} compact />
             </div>
             <div className="flex flex-col gap-3">
               {rows.map((s) => (

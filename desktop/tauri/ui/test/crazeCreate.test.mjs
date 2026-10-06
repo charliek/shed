@@ -17,6 +17,7 @@ import {
   crazeSheetNote,
   directoryProblem,
   edit,
+  groupMachine,
   liveSetter,
   mintRequestId,
   preselectedProvider,
@@ -215,4 +216,35 @@ test("CONTROL: a create resolving decides by the sheet on screen THEN", () => {
   setMachine("other");
   setModal("craze"); // another machine's sheet
   assert.equal(decide("m"), false, "another machine's sheet is left alone");
+});
+
+test("CONTROL: a group header's machine is found by the ROWS' real origin, not the group key", () => {
+  const machines = [
+    { origin: "machine:mini3", name: "mini3" },
+    { origin: "roost:mini3-dev/p025r-leg3", name: "p025r-leg3" },
+  ];
+
+  // A shed group: the group key is `${host}/${shed}` (App.tsx's sessionOrigin),
+  // a display string — never the shed's grammar token. Only the rows carry that.
+  assert.equal(
+    groupMachine("mini3-dev/p025r-leg3", [{ origin: "roost:mini3-dev/p025r-leg3" }], machines),
+    machines[1],
+  );
+
+  // A machine group: the group key already IS the row's origin, so this keeps
+  // working the same way it always did.
+  assert.equal(
+    groupMachine("machine:mini3", [{ origin: "machine:mini3" }], machines),
+    machines[0],
+  );
+
+  // No row has an origin (an old payload): falls back to the group key, same
+  // as the pre-fix behavior for the case it actually handled.
+  assert.equal(
+    groupMachine("machine:mini3", [{ origin: null }, {}], machines),
+    machines[0],
+  );
+
+  // An unknown origin finds nothing.
+  assert.equal(groupMachine("machine:ghost", [{ origin: "machine:ghost" }], machines), undefined);
 });
