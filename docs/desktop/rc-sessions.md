@@ -13,9 +13,12 @@ rows were the *union* of a guest RC hub's sessions and roost's; the guest binary
 
 ## What a row is
 
-A row is one roost tab whose owning process is a recognized agent (`claude`, `codex`,
-`cursor-agent`/`cursor`, `opencode`, `gx`/`grok`) — a plain shell tab in roost is not a
-session and does not appear here. Each row shows:
+A row is one roost tab with an owner — a plain shell tab in roost is not a session and
+does not appear here. Two kinds are typed and get the full set of affordances below:
+`claude` and `opencode`. Every other agent (`codex`, `cursor-agent`, `gx`/`grok`, and
+anything craze drives) still renders as a row — roost's own status hooks cover them — but
+as a **plain row**: its raw kind string, no Transcript affordance, no typed-input prompt.
+Each row shows:
 
 - **Name** — the tab's title.
 - **State and activity** — roost's own liveness state, plus a live activity badge for

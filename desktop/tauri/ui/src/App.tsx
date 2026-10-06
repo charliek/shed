@@ -501,15 +501,14 @@ function ApprovalsPane({ approvals }: { approvals: Approval[] }) {
 }
 
 /* ---- Agents / remote-control ---------------------------------------------- */
-/** Human labels for the creatable kinds (the gated set is capability-derived). */
+/** Human labels for the creatable kinds (the gated set is capability-derived).
+ *  `codex`/`cursor`/`gx`/`grok` left this table in plan 025 (shed#390) — a
+ *  row of one of those kinds renders through the `?? k` fallback below, its
+ *  raw kind string, which is the plain-row contract (D1). `craze` is the one
+ *  addition: craze's own lane, named rather than left as a raw string. */
 const RC_KIND_LABELS: Record<string, string> = {
-  "claude-rc": "Claude", codex: "Codex", opencode: "opencode",
-  cursor: "Cursor", shell: "Shell",
-  // Two kinds, one binary family. `gx` is the lane-bearing one — a grok tab
-  // that bound its remote lane — and `grok` is the same agent without one:
-  // status only, no transcript. The labels keep them apart on purpose, because
-  // whether a row has a Transcript affordance is exactly the difference.
-  gx: "gx", grok: "Grok",
+  "claude-rc": "Claude", opencode: "opencode", shell: "Shell",
+  craze: "Craze",
 };
 const rcKindLabel = (k: RcKind): string => RC_KIND_LABELS[k] ?? k;
 

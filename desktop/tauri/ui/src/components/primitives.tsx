@@ -73,20 +73,15 @@ export function ImageChip({ children }: { children: React.ReactNode }) {
   );
 }
 
-/** agent kind → left-border accent color (claude=orange, codex=green, cursor=violet,
-    opencode=blue, everything else muted). */
+/** agent kind → left-border accent color (claude=orange, opencode=blue,
+    everything else muted — including craze for now, kept minimal; C9 gives
+    it its own colour if the row needs one). codex/cursor/gx/grok left this
+    table in plan 025 (shed#390): a row of one of those kinds now falls
+    through to the muted default, same as any other unrecognized kind. */
 const AGENT_COLOR: Record<string, string> = {
   "claude-rc": "var(--shed-accent)",
   "claude-code": "var(--shed-accent)",
-  codex: "#10A37F",
-  "codex-rc": "#10A37F",
-  cursor: "#6E56CF",
   opencode: "#3B82F6",
-  // One colour for both, because they are one agent: `gx` is a grok tab whose
-  // remote lane is up, `grok` the same tab before (or without) it. A rail that
-  // changed colour when the lane bound would read as the agent being replaced.
-  gx: "#E5484D",
-  grok: "#E5484D",
   shell: "var(--shed-text-muted)",
 };
 export function agentColor(kind: string): string {

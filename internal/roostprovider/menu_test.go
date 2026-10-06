@@ -248,7 +248,7 @@ func TestPinnedNonActionableRows(t *testing.T) {
 	t.Run("no agents", func(t *testing.T) {
 		assertNoneRow(t, NoAgentsRow(shed),
 			"no agents found on my-server/dev",
-			"looked for claude, codex, cursor-agent, opencode, gx, grok under bash -lc")
+			"looked for claude, opencode under bash -lc")
 	})
 }
 
@@ -257,15 +257,14 @@ func TestAgentMenuRowsPerFoundAgent(t *testing.T) {
 	p := Probe{
 		Home: "/home/shed",
 		Found: map[string]string{
-			"codex":     "/home/shed/.bun/bin/codex",
+			"opencode":  "/home/shed/.bun/bin/opencode",
 			"claude-rc": "/home/shed/.local/bin/claude",
-			"gx":        "/home/shed/.local/bin/gx",
 		},
 	}
 	m := AgentMenu(host, p)
 
-	// Display order, not map order: claude, codex, …, gx.
-	assertSeq(t, "titles", rowTitles(m), []string{"claude", "codex", "gx"})
+	// Display order, not map order: claude, opencode.
+	assertSeq(t, "titles", rowTitles(m), []string{"claude", "opencode"})
 
 	claude := rowByTitle(t, m, "claude")
 	if claude.Subtitle != "/home/shed/.local/bin/claude" {
@@ -286,7 +285,7 @@ func TestAgentMenuWithNothingFound(t *testing.T) {
 		t.Fatalf("want one row, got %+v", m.Items)
 	}
 	assertNoneRow(t, m.Items[0], "no agents found on mini2",
-		"looked for claude, codex, cursor-agent, opencode, gx, grok under bash -lc")
+		"looked for claude, opencode under bash -lc")
 }
 
 // TestAgentMenuHomeWithSpacesSurvivesTheRowId is the shape that breaks a naive
@@ -294,7 +293,7 @@ func TestAgentMenuWithNothingFound(t *testing.T) {
 func TestAgentMenuHomeWithSpacesSurvivesTheRowId(t *testing.T) {
 	m := AgentMenu(Token{Machine: "laptop"}, Probe{
 		Home:  "/Users/First Last",
-		Found: map[string]string{"codex": "/Users/First Last/.bun/bin/codex"},
+		Found: map[string]string{"claude-rc": "/Users/First Last/.local/bin/claude"},
 	})
 	tok, err := ParseToken(m.Items[0].ID)
 	if err != nil {

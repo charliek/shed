@@ -4,8 +4,9 @@
 `roost-session`) with a command palette (`roost-iced`) in front of it. Its palette is
 extensible through **dynamic providers** — small executables that print a menu and act on a
 selection. `shed roost-provider` is shed's provider: it puts "start an agent on a shed or
-machine" into roost's own palette, so opening a `claude`, `codex`, `cursor`, `opencode`, `gx`,
-or `grok` session no longer needs a separate tool.
+machine" into roost's own palette, so opening a `claude` or `opencode` session no longer
+needs a separate tool. (Every other agent — codex, cursor, gx, grok, and anything else
+craze drives — is started through craze instead, not through this provider.)
 
 This is the S4 half of the Roost Pivot (`epics/roost-pivot.md`) and the replacement for
 [`sx`](sx.md), which was sunset unreleased before it ever shipped a kickoff path. See
@@ -72,8 +73,7 @@ these day to day):
    side; the provider speaks roost's wire directly. The probe uses **the same shell verb the
    launch itself uses**, so the menu never offers an agent a tab would then fail to find. On
    success it lists one row per agent binary the probe actually found on that host —
-   `claude`, `codex`, `cursor`, `opencode`, `gx`, `grok` — each subtitled with its resolved
-   path.
+   `claude`, `opencode` — each subtitled with its resolved path.
 3. **Workdir selection** — one candidate per far-side roost project, plus `Home` (the probed
    absolute `$HOME`) and the shed's landing directory when it differs and exists. Exactly one
    candidate collapses this step automatically.
@@ -99,7 +99,7 @@ answer would look like a crash to roost's palette:
 | A running session speaks a different session protocol | `roost-session on <host> speaks protocol <n>; this shed speaks 6` | `upgrade whichever is older` |
 | SSH itself failed (unreachable, timeout, exit 255) | `<host> is unreachable` | ssh's own last stderr line |
 | No local `ssh` binary found | `ssh is not installed where roost can see it` | the paths searched (`$PATH`, then `/usr/bin/ssh`, `/opt/homebrew/bin/ssh`, `/usr/local/bin/ssh`) |
-| The probe found none of the six agent binaries | `no agents found on <host>` | `looked for claude, codex, cursor-agent, opencode, gx, grok under bash -lc` |
+| The probe found neither agent binary | `no agents found on <host>` | `looked for claude, opencode under bash -lc` |
 
 A **protocol mismatch is reported, never acted on** — shed never stops or restarts a session it
 does not speak the same protocol as; a running session belongs to whoever started it. These

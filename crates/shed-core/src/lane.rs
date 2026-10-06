@@ -251,10 +251,13 @@
 //!     is the only reason the ANSI stripper could come along.
 //! 11. **[`crate::roost::loopback_base_url`]** is roost's own rule, ported
 //!     verbatim: `http`, a host of `127.0.0.1`/`localhost`/`[::1]`, an explicit
-//!     decimal port in `1..=65535`, and nothing after it. It is what promotes a
-//!     grok tab to [`crate::rc::RcKind::Gx`] and what a discovery record's URL is
-//!     matched under, so shed judges an agent-supplied URL by exactly the rule
-//!     roost judged it by.
+//!     decimal port in `1..=65535`, and nothing after it. It is what
+//!     [`crate::roost::RoostSession::agent_lane`] judges opencode's reported
+//!     `server_url` against before stamping a lane, so shed judges an
+//!     agent-supplied URL by exactly the rule roost judged it by. (Plan 017's
+//!     gx adapter judged its own `gx.remote` metadata the same way, for the
+//!     same reason, before plan 025 retired gx and the other direct-agent
+//!     kinds from shed entirely — shed#390.)
 //! 12. **The mapping table above is rewritten from gx as built**, and the error
 //!     table is explicit rather than "the error table verbatim" — a row-by-row
 //!     table is a test, and a prose promise is not.

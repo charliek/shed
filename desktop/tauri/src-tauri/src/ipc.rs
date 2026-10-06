@@ -2172,7 +2172,7 @@ mod tests {
         // The shared gate both entry points (socket IPC rc_kind + the tauri
         // rc_launch command) apply: serde preserves an unknown kind as Other, so
         // launching must reject it here.
-        assert!(ensure_known_kind(&RcKind::Codex).is_ok());
+        assert!(ensure_known_kind(&RcKind::Opencode).is_ok());
         assert!(ensure_known_kind(&RcKind::Other("borg".into())).is_err());
     }
 

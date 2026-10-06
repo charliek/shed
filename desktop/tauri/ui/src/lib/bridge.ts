@@ -834,14 +834,17 @@ export function useNowTick(intervalMs = 1000): number {
 // The known kinds, plus `(string & {})` so an UNKNOWN kind from a newer/other tool
 // keeps its raw string (the unknown-kind policy) instead of failing the type — it
 // renders neutrally and is never offered for creation.
-/** The agent kinds this build names. The first six mirror the guest's tmux/RC
- *  registry; `gx` and `grok` are roost-only row kinds (plan 017 §3.2) — an agent
- *  shed can SEE in somebody's roost tab, with no guest producer. `gx` is `grok`
- *  with a live remote lane behind it, which is a promotion roost never makes and
- *  `RoostSession::agent_kind` does. */
+/** The agent kinds this build names. `claude-rc`/`opencode`/`shell` mirror the
+ *  guest's tmux/RC registry. `codex`, `cursor`, `gx` and `grok` — the
+ *  direct-agent and roost-only row kinds — left this build in plan 025
+ *  (shed#390): a roost tab running one of them directly renders as a plain
+ *  `(string & {})` row with no typed affordances. `craze` is the one
+ *  addition — the lane craze provides for every other agent (plan 025, D1);
+ *  it is not creatable through roost's own launch form (craze's own create
+ *  sheet is that surface). */
 export type RcKind =
-  | "claude-rc" | "codex" | "opencode" | "cursor" | "shell"
-  | "gx" | "grok"
+  | "claude-rc" | "opencode" | "shell"
+  | "craze"
   | (string & {});
 export type RcState =
   | "starting" | "ready" | "reconnecting" | "needs-trust" | "needs-auth" | "dead";
@@ -897,21 +900,19 @@ export function capabilitiesFor(list: Pick<RcListResult, "capabilities">, s: RcS
   return s.origin ? list.capabilities[s.origin] : undefined;
 }
 
-/** The kinds a create form can offer (broker is URL-driven; unknown never creatable).
- *  Mirrors `RcKind::creatable`. `grok` is creatable and LANE-LESS by design — it
- *  gets a status row and no transcript; a `grok` tab that binds its remote lane
- *  is reported as `gx` on the next snapshot and gains one. */
-export const RC_CREATABLE_KINDS: RcKind[] =
-  ["claude-rc", "codex", "opencode", "cursor", "gx", "grok", "shell"];
+/** The kinds a create form can offer (broker is URL-driven; `craze` is craze's
+ *  own create sheet's job, not this launch form; unknown never creatable).
+ *  Mirrors `RcKind::creatable`. */
+export const RC_CREATABLE_KINDS: RcKind[] = ["claude-rc", "opencode", "shell"];
 
 /** The tool token a kind's agent maps to under capabilities.agents (undefined = no
- *  agent, e.g. shell). Mirrors `RcKind::tool`. */
+ *  agent, e.g. shell). `craze` has its own token (P2) — it still gates on an
+ *  installed agent entry through this generic mechanism, even though craze's
+ *  own protocol is what states a PROVIDER's availability (D5). Mirrors
+ *  `RcKind::tool`. */
 const RC_KIND_TOOL: Record<string, string | undefined> = {
   "claude-rc": "claude",
-  codex: "codex", opencode: "opencode", cursor: "cursor", shell: undefined,
-  // Both roost-only kinds carry their own tool token, and `roost_capabilities`
-  // reports both installed — the same trade-off it already makes for the four.
-  gx: "gx", grok: "grok",
+  opencode: "opencode", shell: undefined, craze: "craze",
 };
 
 /** The launch UI's gated kind list: the creatable kinds whose backing agent the

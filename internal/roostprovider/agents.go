@@ -25,20 +25,18 @@ type Agent struct {
 
 // agentTable is THE table, in the provider's display order.
 //
-// That order is `claude codex cursor-agent opencode gx grok` — pinned twice by
-// plan 019 §3.2 (the probe's `command -v` list, and the "no agents found"
-// subtitle's copy) — and it deliberately differs from
-// `roost_capabilities().kinds`, which orders cursor and opencode the other way
-// around. The two lists are asserted equal as SETS, never as sequences: one is
-// a capabilities advertisement whose order means nothing, the other is a menu a
-// human reads. See the Rust twin test for the same note from the other side.
+// Shrunk to two rows by plan 025 C2 (shed#390): codex, cursor, gx and grok
+// left shed's direct-agent surface — craze is now the lane for every provider
+// but Claude and opencode, and craze's own create sheet (not this roost menu)
+// is the launch surface for those agents. That order is `claude opencode` —
+// still pinned by plan 019 §3.2 (the probe's `command -v` list, and the "no
+// agents found" subtitle's copy) — and is asserted equal, as a SET, to
+// `roost_capabilities().kinds`: one is a capabilities advertisement whose
+// order means nothing, the other is a menu a human reads. See the Rust twin
+// test for the same note from the other side.
 var agentTable = []Agent{
 	{Kind: "claude-rc", Binary: "claude", Title: "claude"},
-	{Kind: "codex", Binary: "codex", Title: "codex"},
-	{Kind: "cursor", Binary: "cursor-agent", Title: "cursor"},
 	{Kind: "opencode", Binary: "opencode", Title: "opencode"},
-	{Kind: "gx", Binary: "gx", Title: "gx"},
-	{Kind: "grok", Binary: "grok", Title: "grok"},
 }
 
 // AgentByKind looks an agent up by its RC kind string (a row id's `agent=`

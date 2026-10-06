@@ -1,7 +1,10 @@
 {
   "_comment": [
-    "The agent table (plan 019 §3.2): kind -> binary -> title, for the six agents",
-    "the `shed roost-provider` menu can start in a roost tab.",
+    "The agent table (plan 019 §3.2; shrunk to two rows by plan 025 C2, shed#390):",
+    "kind -> binary -> title, for the agents the `shed roost-provider` menu can",
+    "start in a roost tab. Codex, cursor, gx and grok left this table in plan",
+    "025 — craze is now the lane for every provider but Claude and opencode, and",
+    "its own create sheet (not this roost menu) is the launch surface for it.",
     "",
     "NOT a roost vector — see this directory's README, section 'shed's own",
     "multi-language goldens'. This file is shed's, and it may be edited; the",
@@ -13,25 +16,22 @@
     "    `shed_core::roost::model::launch_argv` (kind -> binary) and against",
     "    `roost_capabilities().kinds` (the kind SET).",
     "  - Dart: shed-mobile's integration_test/roost_goldens_test.dart, against",
-    "    the kind SET a machine's create form offers (plan 020 C-M3). It reads",
-    "    this file out of a shed checkout named by $SHED_CHECKOUT.",
+    "    the ROOST-BACKED launch kinds (not the machine create form's full set,",
+    "    which also offers craze — plan 025 CM2 re-scopes that assertion). It",
+    "    reads this file out of a shed checkout named by $SHED_CHECKOUT.",
     "",
-    "Order is the PROVIDER's display order — `claude codex cursor-agent",
-    "opencode gx grok`, pinned twice by §3.2 (the probe's `command -v` list and",
-    "the 'no agents found' subtitle). It differs from `roost_capabilities().kinds`,",
-    "which orders cursor and opencode the other way round; the Rust test compares",
-    "those as sets, never as sequences.",
+    "Order is the PROVIDER's display order — `claude opencode`, pinned by §3.2",
+    "(the probe's `command -v` list and the 'no agents found' subtitle). It",
+    "differs from `roost_capabilities().kinds`'s own order only in principle now",
+    "that both are two rows; the Rust test still compares them as sets, never as",
+    "sequences, since one is a capabilities advertisement and the other a menu.",
     "",
     "The three spellings are not interchangeable: `claude-rc` is the RC wire kind,",
-    "`cursor-agent` is the binary on the far side, and the titles are what a human",
+    "`claude` is the binary on the far side, and the titles are what a human",
     "reads in roost's palette."
   ],
   "agents": [
     { "kind": "claude-rc", "binary": "claude", "title": "claude" },
-    { "kind": "codex", "binary": "codex", "title": "codex" },
-    { "kind": "cursor", "binary": "cursor-agent", "title": "cursor" },
-    { "kind": "opencode", "binary": "opencode", "title": "opencode" },
-    { "kind": "gx", "binary": "gx", "title": "gx" },
-    { "kind": "grok", "binary": "grok", "title": "grok" }
+    { "kind": "opencode", "binary": "opencode", "title": "opencode" }
   ]
 }

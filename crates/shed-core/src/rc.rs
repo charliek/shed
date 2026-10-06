@@ -47,14 +47,17 @@ pub const ATTACH_NONE: &str = "none";
 /// RC session kind (Convention v2). `<tool>-<mode>` so the model can grow to
 /// other agents later; `shell` is tool-agnostic.
 ///
-/// **Two axes lived in one enum, deliberately, and one of them has now gone.**
-/// The six kinds through `shell` mirrored the guest's `rc.Kind` — the tmux/RC
-/// registry the `shed-ext-rc` binary carried, deleted with the hub in plan 022
-/// (S6, `charliek/shed#328`). [`RcKind::Gx`] and [`RcKind::Grok`] are
-/// **roost-only row kinds**: they name an agent shed can SEE in somebody's
-/// roost tab and never had a guest-registry entry. Keeping both families in one
-/// enum is what lets every row sort into the same list, render the same badge,
-/// and share [`RcKind::from_wire`]'s tolerance.
+/// **Two axes lived in one enum, and plan 025 retired one agent generation of
+/// the second.** The six kinds through `shell` mirrored the guest's `rc.Kind`
+/// — the tmux/RC registry the `shed-ext-rc` binary carried, deleted with the
+/// hub in plan 022 (S6, `charliek/shed#328`). `Codex`, `Cursor`, `Gx` and
+/// `Grok` were the direct-agent and roost-only row kinds that named an agent
+/// shed could see or launch without a shared provider abstraction behind it;
+/// plan 025 (shed#390) retired all four — craze is now the lane for every
+/// provider but Claude and opencode, and a roost tab running one of them
+/// directly renders as a plain [`RcKind::Other`] row (`crate::roost::model`'s
+/// `agent_kind` maps their wire sources there). [`RcKind::Craze`] is the kind a
+/// craze-owned roost tab or lane reports — see its own doc.
 ///
 /// The [`RcKind::Other`] case implements the **unknown-kind policy**: an
 /// unrecognized wire value is PRESERVED verbatim (not coerced to claude-broker as
@@ -66,25 +69,16 @@ pub const ATTACH_NONE: &str = "none";
 pub enum RcKind {
     ClaudeRc,
     ClaudeBroker,
-    Codex,
     Opencode,
-    Cursor,
-    /// grok's `gx` agent **with its remote lane bound** — a roost tab whose
-    /// `metadata["gx.remote"]` carries a loopback base URL
-    /// ([`crate::roost::loopback_base_url`]). The only difference from
-    /// [`RcKind::Grok`] is that a lane can be opened against it.
-    ///
-    /// roost never says `gx`: its adapter reports `source: "grok"` either way
-    /// and shed PROMOTES the row when the lane key is present
-    /// ([`crate::roost::RoostSession::agent_kind`]). The promotion is a hint,
-    /// not liveness — a dead leader leaves the key on the tab, and the lane
-    /// answers `unavailable`.
-    Gx,
-    /// grok's `gx` agent with **no** remote lane — status through roost, no
-    /// transcript. Creatable and lane-less by design: a client can start one in
-    /// a tab and watch its activity chip, and the Transcript affordance simply
-    /// is not offered.
-    Grok,
+    /// A craze-owned session — the lane craze provides for every agent but
+    /// Claude and opencode (plan 025, shed#390). Not creatable through roost
+    /// (craze's own create sheet is the path, plan 025 C10+); it carries no
+    /// `tool()`/`auth_hint()` of its own (craze states its own providers'
+    /// availability, D5) and no permission-mode posture (craze's settings
+    /// sheet is the mode surface, D7) — see [`RcKind::accepts_typed_input`]
+    /// and [`RcKind::has_permission_mode`], both explicitly `false` for this
+    /// kind rather than inheriting the known-kind default.
+    Craze,
     Shell,
     /// An unrecognized kind, its raw wire string preserved (unknown-kind policy).
     Other(String),
@@ -94,10 +88,15 @@ impl RcKind {
     /// Whether this kind accepts a typed kickoff line — an initial prompt for the
     /// agent REPLs/TUIs, an initial command for `shell`. Mirrors the guest's
     /// `AcceptsTypedInput`: every registered kind except `claude-broker` (whose
-    /// input is a remote URL, not the pane); an [`RcKind::Other`] is NOT promptable
-    /// (no affordances under the unknown-kind policy).
+    /// input is a remote URL, not the pane) and [`RcKind::Craze`] (craze's own
+    /// create sheet is the kickoff surface, D6 — no permission-mode picker, no
+    /// prompt at roost-launch time); an [`RcKind::Other`] is NOT promptable
+    /// either (no affordances under the unknown-kind policy).
     pub fn accepts_typed_input(&self) -> bool {
-        !matches!(self, RcKind::ClaudeBroker | RcKind::Other(_))
+        !matches!(
+            self,
+            RcKind::ClaudeBroker | RcKind::Craze | RcKind::Other(_)
+        )
     }
 
     /// A recognized kind (not the preserved-raw unknown case). A `false` here is the
@@ -108,44 +107,48 @@ impl RcKind {
 
     /// Whether this kind runs claude — i.e. one of the two claude kinds (and so
     /// gets claude's full `--permission-mode` set and URL affordances). NOT true
-    /// for codex/cursor/opencode. Mirrors the guest's `IsClaudeKind` and mobile's
+    /// for opencode or craze. Mirrors the guest's `IsClaudeKind` and mobile's
     /// `RcKind.runsClaude` (`rc_models.dart:76`).
     pub fn runs_claude(&self) -> bool {
         matches!(self, RcKind::ClaudeBroker | RcKind::ClaudeRc)
     }
 
     /// Whether this kind carries an autonomy/permission posture: every known
-    /// agent kind does; `shell` has none, and an unknown kind renders neutrally
-    /// with none. Mirrors mobile's `RcKind.hasPermissionMode`
-    /// (`rc_models.dart:81`).
+    /// agent kind does, with ONE deliberate exception — [`RcKind::Craze`],
+    /// whose mode is craze's own generic settings sheet (D7), not this
+    /// permission-mode vocabulary. `shell` has none either, and an unknown
+    /// kind renders neutrally with none. Mirrors mobile's
+    /// `RcKind.hasPermissionMode` (`rc_models.dart:81`).
     pub fn has_permission_mode(&self) -> bool {
-        self.is_known() && !matches!(self, RcKind::Shell)
+        self.is_known() && !matches!(self, RcKind::Shell | RcKind::Craze)
     }
 
     /// The tool token this kind's agent maps to under `capabilities.agents`, or
-    /// `None` for a kind with no installable agent (`shell`) or an unknown kind.
+    /// `None` for a kind with no installable agent (`shell`) or an unknown
+    /// kind. [`RcKind::Craze`] has its own token — `"craze"` (P2) — so
+    /// [`RcCapabilities::offers`] still gates it on an installed agent entry
+    /// rather than offering it unconditionally; craze's own protocol is what
+    /// states a PROVIDER's availability (D5), not this generic tool gate.
     pub fn tool(&self) -> Option<&'static str> {
         match self {
             RcKind::ClaudeRc | RcKind::ClaudeBroker => Some("claude"),
-            RcKind::Codex => Some("codex"),
             RcKind::Opencode => Some("opencode"),
-            RcKind::Cursor => Some("cursor"),
-            RcKind::Gx => Some("gx"),
-            RcKind::Grok => Some("grok"),
+            RcKind::Craze => Some("craze"),
             RcKind::Shell | RcKind::Other(_) => None,
         }
     }
 
     /// The per-agent login remediation surfaced for this kind's `needs-auth` state,
     /// mirroring the guest's `AuthHintFor` (`internal/ext/rc/agents.go`).
+    ///
+    /// [`RcKind::Craze`] has none (P2: "no auth hint") — craze's own protocol
+    /// states a provider's `needs_setup` reason and fix (D5), so shed never
+    /// second-guesses it with a generic hint here.
     pub fn auth_hint(&self) -> &'static str {
         match self {
             RcKind::ClaudeRc | RcKind::ClaudeBroker => "run `claude` \u{2192} /login",
-            RcKind::Codex => "run `codex` and complete login (`codex login`)",
             RcKind::Opencode => "run `opencode auth login`",
-            RcKind::Cursor => "run `cursor-agent login`",
-            RcKind::Gx => "run `gx` and complete login",
-            RcKind::Grok => "run `grok` and complete login",
+            RcKind::Craze => "",
             RcKind::Shell | RcKind::Other(_) => "log in to the agent in a terminal",
         }
     }
@@ -154,11 +157,8 @@ impl RcKind {
         match self {
             RcKind::ClaudeRc => "claude-rc",
             RcKind::ClaudeBroker => "claude-broker",
-            RcKind::Codex => "codex",
             RcKind::Opencode => "opencode",
-            RcKind::Cursor => "cursor",
-            RcKind::Gx => "gx",
-            RcKind::Grok => "grok",
+            RcKind::Craze => "craze",
             RcKind::Shell => "shell",
             RcKind::Other(s) => s,
         }
@@ -170,35 +170,19 @@ impl RcKind {
         match s {
             "claude-rc" => RcKind::ClaudeRc,
             "claude-broker" => RcKind::ClaudeBroker,
-            "codex" => RcKind::Codex,
             "opencode" => RcKind::Opencode,
-            "cursor" => RcKind::Cursor,
-            "gx" => RcKind::Gx,
-            "grok" => RcKind::Grok,
+            "craze" => RcKind::Craze,
             "shell" => RcKind::Shell,
             other => RcKind::Other(other.to_string()),
         }
     }
 
     /// The kinds the launch UI can offer for creation (`claude-broker` is
-    /// URL-driven, not create-from-a-form; `Other` is never creatable). Capability
-    /// gating narrows this further per shed.
-    ///
-    /// [`RcKind::Grok`] is here and is **lane-less by design**: launching one
-    /// opens a `grok` tab whose status shed reads through roost, with no
-    /// transcript affordance. [`RcKind::Gx`] is here too, but a launcher only
-    /// ever reaches it through a host that advertises it — the promotion from
-    /// `grok` to `gx` happens on the ROW, once the lane binds, not at launch.
-    pub fn creatable() -> [RcKind; 7] {
-        [
-            RcKind::ClaudeRc,
-            RcKind::Codex,
-            RcKind::Opencode,
-            RcKind::Cursor,
-            RcKind::Gx,
-            RcKind::Grok,
-            RcKind::Shell,
-        ]
+    /// URL-driven, not create-from-a-form; [`RcKind::Craze`] is craze's own
+    /// create sheet's job, not roost's launch form (plan 025 P2); `Other` is
+    /// never creatable). Capability gating narrows this further per shed.
+    pub fn creatable() -> [RcKind; 3] {
+        [RcKind::ClaudeRc, RcKind::Opencode, RcKind::Shell]
     }
 }
 
@@ -1305,19 +1289,15 @@ mod tests {
     // ---- permission modes (ported from mobile's rc_service_test.dart:58-253) ----
 
     #[test]
-    fn has_permission_mode_excludes_shell_and_unknown() {
+    fn has_permission_mode_excludes_shell_craze_and_unknown() {
         // rc_models.dart:81: every known agent kind has a permission posture;
-        // shell has none, and an unknown kind renders neutrally with none.
-        for kind in [
-            RcKind::ClaudeRc,
-            RcKind::ClaudeBroker,
-            RcKind::Codex,
-            RcKind::Opencode,
-            RcKind::Cursor,
-        ] {
+        // shell has none, craze's mode lives in its own settings sheet (D7),
+        // and an unknown kind renders neutrally with none.
+        for kind in [RcKind::ClaudeRc, RcKind::ClaudeBroker, RcKind::Opencode] {
             assert!(kind.has_permission_mode());
         }
         assert!(!RcKind::Shell.has_permission_mode());
+        assert!(!RcKind::Craze.has_permission_mode());
         assert!(!RcKind::Other("borg".into()).has_permission_mode());
     }
 
@@ -1726,91 +1706,136 @@ mod tests {
         assert_eq!(pending[1], RcFeedApproval::default()); // non-object → default
     }
 
-    // ---- the roost-only kinds (gx / grok) ----
+    // ---- retired direct-agent kinds (plan 025, shed#390) ----
 
-    /// `gx` and `grok` cross the wire, come back as themselves, and answer every
-    /// predicate with the KNOWN-kind default — the whole difference from
-    /// [`RcKind::Other`], which is what "renders neutrally" means.
+    /// `codex`, `cursor`, `gx` and `grok` cross the wire and come back as
+    /// [`RcKind::Other`] — D1's "a tab running one of those agents directly is
+    /// a plain row" at the type level. This is the P3 audit test: `git grep`
+    /// over this crate shows no test pairing [`crate::roost::bootstrap::ROOST_WIRED_AGENTS`]
+    /// (roost's own status-hook list, unchanged by this retirement — it is a
+    /// roost-side behaviour D1 leaves untouched) with this typed-kind surface,
+    /// so this one pins the plain-row claim directly: none of the four is
+    /// `is_known()`, none has an affordance, and none is coerced to anything
+    /// else.
     #[test]
-    fn gx_and_grok_round_trip_and_take_the_known_kind_defaults() {
-        for (wire, kind, tool, hint) in [
-            ("gx", RcKind::Gx, "gx", "run `gx` and complete login"),
-            (
-                "grok",
-                RcKind::Grok,
-                "grok",
-                "run `grok` and complete login",
-            ),
-        ] {
-            assert_eq!(RcKind::from_wire(wire), kind, "{wire} decodes");
-            assert_eq!(kind.as_str(), wire, "{wire} encodes");
+    fn retired_direct_agent_kinds_decode_as_plain_other_rows() {
+        for wire in ["codex", "cursor", "gx", "grok"] {
+            let kind = RcKind::from_wire(wire);
+            assert_eq!(kind, RcKind::Other(wire.to_string()), "{wire}");
+            assert!(!kind.is_known(), "{wire} is not a known kind any more");
+            assert!(!kind.accepts_typed_input(), "{wire} has no affordances");
+            assert!(!kind.has_permission_mode(), "{wire} has no affordances");
+            assert_eq!(kind.tool(), None, "{wire}");
+            // Round-trips as its own raw string — nothing coerces it.
             assert_eq!(serde_json::to_value(&kind).unwrap(), wire);
-            assert_eq!(
-                serde_json::from_value::<RcKind>(serde_json::json!(wire)).unwrap(),
-                kind
-            );
-
-            assert!(kind.is_known(), "{wire} is a known kind, not Other");
-            // A TUI agent: it takes a kickoff line, it has an autonomy posture,
-            // and it is not claude.
-            assert!(kind.accepts_typed_input(), "{wire} takes a kickoff prompt");
-            assert!(kind.has_permission_mode(), "{wire} has a posture");
-            assert!(!kind.runs_claude(), "{wire} is not claude");
-            assert_eq!(kind.tool(), Some(tool));
-            assert_eq!(kind.auth_hint(), hint);
         }
     }
 
-    /// Both are creatable, in the canonical create-form order, and `creatable()`
-    /// is still the list a capability gate narrows rather than the list itself.
+    /// `creatable()` is now claude, opencode and shell, in that order — the
+    /// list a capability gate narrows rather than the list itself.
     #[test]
-    fn creatable_carries_gx_and_grok_in_order() {
+    fn creatable_is_claude_opencode_and_shell() {
         assert_eq!(
             RcKind::creatable(),
-            [
-                RcKind::ClaudeRc,
-                RcKind::Codex,
-                RcKind::Opencode,
-                RcKind::Cursor,
-                RcKind::Gx,
-                RcKind::Grok,
-                RcKind::Shell,
-            ]
+            [RcKind::ClaudeRc, RcKind::Opencode, RcKind::Shell]
         );
-        // `claude-broker` is URL-driven and `Other` is never creatable.
+        // `claude-broker` is URL-driven, `craze` is craze's own create sheet's
+        // job (not roost's launch form, P2), and `Other` is never creatable.
         assert!(!RcKind::creatable().contains(&RcKind::ClaudeBroker));
+        assert!(!RcKind::creatable().contains(&RcKind::Craze));
         assert!(!RcKind::creatable()
             .iter()
             .any(|k| matches!(k, RcKind::Other(_))));
+    }
 
-        // A GUEST shed advertises neither, so neither is offered there — the
-        // gate is per-host and these two are roost's, not the guest's.
-        let guest = RcCapabilities {
+    // ---- craze (plan 025, shed#390) ----
+
+    #[test]
+    fn craze_round_trips_and_is_known_but_not_creatable() {
+        assert_eq!(RcKind::from_wire("craze"), RcKind::Craze);
+        assert_eq!(RcKind::Craze.as_str(), "craze");
+        assert_eq!(serde_json::to_value(&RcKind::Craze).unwrap(), "craze");
+        assert_eq!(
+            serde_json::from_value::<RcKind>(serde_json::json!("craze")).unwrap(),
+            RcKind::Craze
+        );
+        assert!(RcKind::Craze.is_known());
+        assert!(!RcKind::Craze.runs_claude());
+        assert!(!RcKind::creatable().contains(&RcKind::Craze));
+    }
+
+    /// Every blanket predicate that would otherwise default to `true` for a
+    /// recognized, non-`shell` kind is decided EXPLICITLY `false` for craze
+    /// (P2): craze's own create sheet and settings sheet are the real
+    /// surfaces, not roost's kickoff prompt or permission-mode picker.
+    #[test]
+    fn craze_opts_out_of_every_roost_authored_affordance() {
+        assert!(!RcKind::Craze.accepts_typed_input());
+        assert!(!RcKind::Craze.has_permission_mode());
+        // P2: `tool()` is `Some("craze")` — craze still gates on an installed
+        // agent entry through the generic tool mechanism — but `auth_hint()`
+        // is empty: craze's own protocol states a provider's `needs_setup`
+        // reason and fix (D5), so shed never second-guesses it with a
+        // generic hint here.
+        assert_eq!(RcKind::Craze.tool(), Some("craze"));
+        assert_eq!(RcKind::Craze.auth_hint(), "");
+    }
+
+    /// `offers()` gates `RcKind::Craze` on `agents["craze"].installed` exactly
+    /// like any other tool-bearing kind — `tool() == Some("craze")` is what
+    /// makes that gate apply, rather than the kind being offered merely
+    /// because it was advertised (the `None`-tool shortcut `shell`/unknown
+    /// kinds take).
+    #[test]
+    fn craze_offers_gates_on_its_own_agent_entry() {
+        let advertised_not_installed = RcCapabilities {
             rc_version: 2,
-            kinds: vec![RcKind::ClaudeRc, RcKind::Shell],
-            agents: HashMap::new(),
+            kinds: vec![RcKind::Craze],
+            agents: HashMap::from([(
+                "craze".to_string(),
+                RcAgentInfo {
+                    installed: false,
+                    version: None,
+                },
+            )]),
             features: vec![],
             kind_features: HashMap::new(),
         };
-        assert!(!guest.offers(&RcKind::Gx));
-        assert!(!guest.offers(&RcKind::Grok));
+        assert!(!advertised_not_installed.offers(&RcKind::Craze));
+
+        let advertised_and_installed = RcCapabilities {
+            agents: HashMap::from([(
+                "craze".to_string(),
+                RcAgentInfo {
+                    installed: true,
+                    version: None,
+                },
+            )]),
+            ..advertised_not_installed
+        };
+        assert!(advertised_and_installed.offers(&RcKind::Craze));
+
+        // Advertised with no agents entry at all — same refusal as any other
+        // tool-bearing kind with nothing in `agents`.
+        let advertised_no_entry = RcCapabilities {
+            agents: HashMap::new(),
+            kinds: vec![RcKind::Craze],
+            rc_version: 2,
+            features: vec![],
+            kind_features: HashMap::new(),
+        };
+        assert!(!advertised_no_entry.offers(&RcKind::Craze));
     }
 
-    // ---- new kinds + unknown-kind policy ----
+    // ---- opencode + unknown-kind policy ----
 
     #[test]
-    fn new_kinds_round_trip_and_accept_input() {
-        for (wire, kind) in [
-            ("codex", RcKind::Codex),
-            ("opencode", RcKind::Opencode),
-            ("cursor", RcKind::Cursor),
-        ] {
-            assert_eq!(RcKind::from_wire(wire), kind);
-            assert_eq!(kind.as_str(), wire);
-            assert!(kind.is_known());
-            assert!(kind.accepts_typed_input()); // bare-TUI kinds take a kickoff prompt
-            assert_eq!(serde_json::to_value(&kind).unwrap(), wire);
-        }
+    fn opencode_round_trips_and_accepts_input() {
+        assert_eq!(RcKind::from_wire("opencode"), RcKind::Opencode);
+        assert_eq!(RcKind::Opencode.as_str(), "opencode");
+        assert!(RcKind::Opencode.is_known());
+        assert!(RcKind::Opencode.accepts_typed_input());
+        assert_eq!(serde_json::to_value(&RcKind::Opencode).unwrap(), "opencode");
     }
 
     #[test]
@@ -1825,16 +1850,18 @@ mod tests {
     }
 
     #[test]
-    fn decoding_a_list_preserves_unknown_and_new_kinds() {
-        // A session created by a newer/other tool must survive decode (not be
-        // dropped or coerced to claude-broker) — the unknown-kind policy.
+    fn decoding_a_list_preserves_unknown_kinds() {
+        // A session created by a newer/other tool — or, since plan 025, by one
+        // of the direct-agent kinds this build no longer types — must survive
+        // decode (not be dropped or coerced to claude-broker) — the
+        // unknown-kind policy.
         let stdout = r#"{"rc_sessions":[
             {"slug":"a","tmux_session":"rc-a","kind":"codex","state":"ready","managed":true},
             {"slug":"b","tmux_session":"rc-b","kind":"borg","state":"starting","managed":true}
         ]}"#;
         let dtos = decode_envelope(stdout).rc_sessions;
         assert_eq!(dtos.len(), 2);
-        assert_eq!(dtos[0].kind, RcKind::Codex);
+        assert_eq!(dtos[0].kind, RcKind::Other("codex".into()));
         assert_eq!(dtos[1].kind, RcKind::Other("borg".into()));
     }
 
@@ -2094,14 +2121,17 @@ mod tests {
 
     #[test]
     fn an_envelope_carries_capabilities() {
+        // "codex" is no longer a typed kind (plan 025, shed#390) — it decodes
+        // as a plain `Other` row, and its string-keyed `kind_features` entry
+        // (untouched by this retirement, since that map is keyed by the wire
+        // string, not by `RcKind`) still carries through unchanged.
         let stdout = r#"{
           "rc_sessions": [],
           "capabilities": {
             "rc_version": 3,
-            "kinds": ["claude-rc","codex","opencode","cursor","shell"],
+            "kinds": ["claude-rc","opencode","codex","shell"],
             "agents": { "claude": {"installed": true, "version": "2.1.206"},
-                        "codex":  {"installed": true, "version": "0.143.0"},
-                        "cursor": {"installed": false} },
+                        "codex":  {"installed": true, "version": "0.143.0"} },
             "features": ["generic-perm","plan-stdin","prompt-b64"],
             "kind_features": { "codex": {"post_input": true, "approvals": "tui"} }
           }
@@ -2111,19 +2141,20 @@ mod tests {
             .expect("capabilities present");
         assert_eq!(caps.rc_version, 3);
         assert!(caps.has_feature("generic-perm"));
-        assert!(caps.kinds.contains(&RcKind::Codex));
+        assert!(caps.kinds.contains(&RcKind::Other("codex".into())));
         assert_eq!(caps.kind_features["codex"].approvals, "tui");
-        // Gating: claude + codex installed, cursor not, opencode absent from agents,
-        // shell always offered when advertised.
+        // Gating: claude installed, opencode advertised but absent from
+        // agents, shell always offered when advertised, and an `Other` kind
+        // has no `tool()` to gate on — so it offers whenever merely
+        // advertised, same as shell.
         assert!(caps.offers(&RcKind::ClaudeRc));
-        assert!(caps.offers(&RcKind::Codex));
-        assert!(!caps.offers(&RcKind::Cursor)); // advertised but not installed
         assert!(!caps.offers(&RcKind::Opencode)); // advertised but no agents entry
         assert!(caps.offers(&RcKind::Shell));
+        assert!(caps.offers(&RcKind::Other("codex".into()))); // no tool to gate on
         assert!(!caps.offers(&RcKind::ClaudeBroker)); // not advertised (URL-driven)
         assert_eq!(
             caps.creatable_kinds(),
-            vec![RcKind::ClaudeRc, RcKind::Codex, RcKind::Shell]
+            vec![RcKind::ClaudeRc, RcKind::Shell]
         );
     }
 

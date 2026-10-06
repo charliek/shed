@@ -2194,24 +2194,17 @@ impl InjectedRow {
 /// predict it ([`opened_session`]).
 ///
 /// `None` for every kind with no roost adapter, which is also every kind
-/// [`launch_argv`] refuses — so in practice this is only ever called for the four
-/// launchable ones, and a `None` simply leaves the fresh tab unowned rather than
-/// labelling it with a source roost will never write.
+/// [`launch_argv`] refuses — so in practice this is only ever called for the
+/// two launchable ones, and a `None` simply leaves the fresh tab unowned
+/// rather than labelling it with a source roost will never write. (The
+/// direct-agent kinds this used to also predict — codex, cursor, gx, grok —
+/// left shed in plan 025, shed#390; craze is their lane now, and a craze
+/// session is never opened through THIS launch path.)
 fn roost_source(kind: &RcKind) -> Option<&'static str> {
     match kind {
         RcKind::ClaudeRc => Some("claude"),
-        RcKind::Codex => Some("codex"),
         RcKind::Opencode => Some("opencode"),
-        RcKind::Cursor => Some("cursor"),
-        // BOTH map to roost's `grok`, because roost has ONE adapter for the two
-        // (plan 017 §3.2): `gx` is not a source roost ever writes. Which of the
-        // two a tab reads as is decided on the way BACK, by
-        // [`RoostSession::agent_kind`], from whether the tab carries a usable
-        // `gx.remote` — so predicting `grok` here is right for a launch of
-        // either, and a `gx` launch that binds its lane promotes itself on the
-        // next snapshot.
-        RcKind::Gx | RcKind::Grok => Some("grok"),
-        RcKind::ClaudeBroker | RcKind::Shell | RcKind::Other(_) => None,
+        RcKind::ClaudeBroker | RcKind::Craze | RcKind::Shell | RcKind::Other(_) => None,
     }
 }
 
@@ -2731,25 +2724,17 @@ mod tests {
             );
         }
 
-        // A gx tab is stamped from `gx.remote`, and is refused for the same
-        // reasons — including the one that makes it read as plain `grok`.
-        let gx = owned(
+        // grok (and any shape of gx) is a retired direct-agent kind now (plan
+        // 025, shed#390): a plain `Other` row with no adapter, so it stamps no
+        // lane no matter what metadata the tab carries.
+        let grok = owned(
             Some("grok"),
-            "ses_gx",
+            "ses_grok",
             &[("gx.remote", "http://127.0.0.1:2431")],
         );
-        assert_eq!(
-            agent_lane(&gx).and_then(|v| v["kind"].as_str().map(str::to_string)),
-            Some("gx".to_string())
-        );
-        let demoted = owned(
-            Some("grok"),
-            "ses_gx",
-            &[("gx.remote", "http://127.0.0.1:2431/")],
-        );
         assert!(
-            agent_lane(&demoted).is_none(),
-            "a gx.remote that fails the rule leaves the tab as plain grok, lane-less"
+            agent_lane(&grok).is_none(),
+            "grok has no lane adapter any more, whatever metadata it carries"
         );
 
         // And the session id is the other half: a tab with a usable URL but no
@@ -3564,19 +3549,17 @@ mod tests {
             rows(&hosts)
         );
 
-        // The kinds roost DOES own an adapter for still inject, so the fixture
+        // The kind roost DOES own an adapter for still injects, so the fixture
         // op is not merely refusing everything.
-        for kind in [RcKind::Opencode, RcKind::Gx] {
-            hosts
-                .inject_test(
-                    target,
-                    InjectedRow {
-                        kind,
-                        ..injected(31)
-                    },
-                )
-                .expect("an agent-owned row");
-        }
+        hosts
+            .inject_test(
+                target,
+                InjectedRow {
+                    kind: RcKind::Opencode,
+                    ..injected(31)
+                },
+            )
+            .expect("an agent-owned row");
         assert_eq!(rows(&hosts).len(), 1);
     }
 

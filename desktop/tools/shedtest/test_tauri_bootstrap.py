@@ -1192,7 +1192,7 @@ def test_a_sheds_rows_are_roosts_and_a_filter_returns_them(boot, rig, mock):
 
     launched = boot.call(
         "roost.launch",
-        {"target": target, "kind": "codex", "workdir": "/home/shed/work"},
+        {"target": target, "kind": "opencode", "workdir": "/home/shed/work"},
     )
     assert launched["origin"] == target
     assert launched["source"] == "roost"
@@ -1204,11 +1204,11 @@ def test_a_sheds_rows_are_roosts_and_a_filter_returns_them(boot, rig, mock):
     assert opened["cwd"] == "/home/shed/work"
     # `shed_core::roost::launch_argv`'s recipe for the kind: the agent's own
     # binary, resolved by roost on the far side.
-    assert opened["argv"] == ["codex"], opened
+    assert opened["argv"] == ["opencode"], opened
 
     # `rc.launch {shed}` is the SAME op under its pre-S6 name — an alias kept
     # for 0.9.x — so it lands on the same host and stamps the same origin.
-    alias = boot.call("rc.launch", {"shed": shed, "kind": "codex"})
+    alias = boot.call("rc.launch", {"shed": shed, "kind": "opencode"})
     assert alias["origin"] == target, alias
     assert alias["source"] == "roost", alias
 
@@ -1230,7 +1230,7 @@ def test_a_sheds_rows_are_roosts_and_a_filter_returns_them(boot, rig, mock):
     caps = boot.call("rc.list")["capabilities"]
     assert target in caps, list(caps)
     assert f"{SERVER}/{shed}" not in caps, "the hub's key retired with the hub"
-    assert caps[target]["kind_features"]["codex"]["attach"] == "native-remote"
+    assert caps[target]["kind_features"]["opencode"]["attach"] == "native-remote"
 
     # **The filtered query.** Same rows, asked the way a shed card asks.
     filtered = boot.call("rc.list", {"host": SERVER, "shed": shed})
@@ -1262,7 +1262,7 @@ def test_a_down_kind_reaches_rc_list_and_a_flap_keeps_the_roost_rows(boot, rig, 
     installed = _bootstrap(boot, target)
     assert installed["plan"]["kind"] == "update", installed
     rig.agent_tab(fake)
-    boot.call("roost.launch", {"target": target, "kind": "codex", "workdir": "/home/shed"})
+    boot.call("roost.launch", {"target": target, "kind": "opencode", "workdir": "/home/shed"})
     # The WATCHER's rows, not the optimistic one `roost.launch` inserted: an
     # unclaimed tab leaves the agent-owned inventory on the next snapshot (it is
     # somebody's terminal), so the row that must survive the flap is the claimed
