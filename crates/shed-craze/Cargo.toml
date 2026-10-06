@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 publish.workspace = true
-description = "shed-craze — the craze adapter for the shed_core::lane agent-lane contract (plan 025): a machine's craze hub as an AgentSource over one NDJSON JSON-RPC duplex per connection. The session-scoped lane arrives in C8."
+description = "shed-craze — the craze adapter for the shed_core::lane agent-lane contract (plan 025): a machine's craze hub as an AgentSource, and each session as an AgentLane, over one NDJSON JSON-RPC duplex per connection."
 
 [lib]
 name = "shed_craze"
@@ -62,7 +62,7 @@ shed-core = { path = "../shed-core", features = ["test-support"] }
 
 # The manual verification tool and the smallest proof the contract is usable
 # from OUTSIDE this crate: past building the source it calls nothing but
-# `AgentSource`. Named explicitly so `cargo run --example shed-craze-lane`
+# `AgentSource` and the `AgentLane` it opens. Named explicitly so `cargo run --example shed-craze-lane`
 # matches the name the docs use.
 [[example]]
 name = "shed-craze-lane"

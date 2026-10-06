@@ -6,10 +6,8 @@
 //!
 //! Two adapters: opencode over its local HTTP server (`shed-opencode`), both
 //! levels; and craze over its per-machine hub (`shed-craze`) — its source since
-//! plan 025 C7, its lane arriving in C8. craze is what this split was shaped
-//! for, so where this doc says what a craze LANE does it describes that half as
-//! plan 025 designs it from craze's published protocol, not code that exists
-//! yet. gx's `/v1` lane
+//! plan 025 C7, its lane since C8. craze is what this split was shaped for.
+//! gx's `/v1` lane
 //! held the second slot from plan 017 until plan 025 retired it (shed#390); the
 //! corrections it forced are recorded below as history, because the readers of
 //! this module — the next adapter, and shed-mobile's hand-written mirror — read
@@ -243,9 +241,9 @@
 //! What each contract verb costs on each side, and the reason the contract is
 //! shaped the way it is (two levels, session-scoped lanes, per-session
 //! capabilities, cursor-optional, approvals as first-class rows). The opencode
-//! column is the adapter as built; the craze column's source rows are
-//! `shed-craze` as built (plan 025 C7) and its lane rows the lane C8 builds —
-//! both written from craze's published protocol reference
+//! column is the adapter as built; the craze column is `shed-craze` as built
+//! (its source plan 025 C7, its lane C8) — both written from craze's published
+//! protocol reference
 //! (`docs/reference/protocol.md` at the pinned craze sha, "PM"), not from a
 //! guess.
 //!
@@ -257,16 +255,16 @@
 //! | source `open` | binds the session id; no I/O | binds the `hostId` (and the roster row's craze `sessionId` when the source holds it); no I/O |
 //! | `session` | `GET /session/{sessionID}` plus its `/session/status` and approval lists | the roster row the lane was opened with, refreshed by the watcher (attach's info document, the fold's activity); never dials |
 //! | `history` | `GET /session/{sessionID}/message` through a fresh fold (seq from 1); `cursor` ignored, `truncated` from the page cap | `session.snapshot` folded into rows; `cursor` ignored (craze has no paging); `truncated` when the snapshot was windowed or dropped, or its omitted ledger is non-empty |
-//! | `subscribe` | `GET /event?directory=<session dir>` opened **first**, then the REST seed while live frames buffer; `Reset` … `Ready` brackets every (re)connect; transcript frames filtered to the root id, approval frames to root + descendants; empty-id frames count as liveness | `session.connect{sessionId: <hostId>}` through the hub's splice, the host's `hello`, then `session.attach{sessionId, cursor?, when: "ready"}`: a reply with a `snapshot` seeds `Reset … Ready`; one without is the cursor honoured — a silent resume, `Stale` then a lone `Ready`; every `Ready` waits for the attachment's `synchronized` |
+//! | `subscribe` | `GET /event?directory=<session dir>` opened **first**, then the REST seed while live frames buffer; `Reset` … `Ready` brackets every (re)connect; transcript frames filtered to the root id, approval frames to root + descendants; empty-id frames count as liveness | `session.connect{sessionId: <hostId>}` through the hub's splice, the host's `hello` pipelined behind it, the host's own `sessions.list` (the row, and the craze session id every call carries), then `session.attach{sessionId, cursor?}` (`when` at its default, `ready`): a reply with a `snapshot` seeds `Reset … Ready`; one without is the cursor honoured — a silent resume, `Stale` then a lone `Ready`; every `Ready` waits for the attachment's `synchronized` |
 //! | `send(Queue)` | `POST /session/{sessionID}/prompt_async` | `session.prompt{mode: "queue"}` |
-//! | `send(Interject)` | [`LaneError::NotAccepting`] | `session.prompt{mode: "interject"}`; refused when idle → `NotAccepting` (correction 8's posture) |
+//! | `send(Interject)` | [`LaneError::NotAccepting`] | `session.prompt{mode: "interject"}`; refused when idle → `NotAccepting` (correction 8's posture); a session whose capabilities say it cannot interject is refused before anything is sent, `NotAccepting` too |
 //! | `cancel` | `POST /session/{sessionID}/abort` | `session.cancel` with no `turnId` — the current turn |
 //! | `approvals` | fold state seeded from `GET /permission` + `GET /question` (`?directory=` of the session) filtered to the root id **and its descendants** (`GET /session/{sessionID}/children`, refreshed on a `session.created` whose `parentID` is in the set) | the attachment's `snapshot.asks` (`asks.get` for a truncated one), kept current by the fold; automatic questions and plans are never approvals |
 //! | `answer(Permission)` | `POST /permission/{requestID}/reply {reply}` (the live route; the deprecated session-scoped route is the recorded fallback) | `asks.answer{askId, answer: {optionId}}`, the option chosen by its `kind` through [`LaneApproval::option_for`] (correction 3) |
 //! | `answer(Question)` | `POST /question/{requestID}/reply {answers}`; [`LaneAnswer::Reject`] → `…/reject` | `asks.answer` with `{answers: {<question id>: [<option id>…]}}`; [`LaneAnswer::Reject`] → `{skip: true}`; free text refused (craze questions take none) |
 //! | `answer(Choice)` | the offered option id, which for opencode IS one of its three | the offered `optionId` verbatim; on a plan approval, the synthesized `accept`/`reject` |
 //! | `settings` | [`LaneSettings::default`] — capabilities say `settings: false` | the session info document's catalogs and the snapshot's settings, re-read on a `meta` event |
-//! | `set` | [`LaneError::Failed`] — not supported | `session.set{setting: {kind, id?, value, forModel?}}` |
+//! | `set` | [`LaneError::Failed`] — not supported | `session.set{setting: {kind, id?, value, forModel?}}` — plan 025's settings milestone (C11); [`LaneError::Failed`] until it lands |
 //! | `stop` | [`LaneError::Failed`] — not supported | `session.stop` where the session capability `stop` is true — a receipt; the stream's `Down{"session_closed"}` is its completion |
 //! | errors | 401 → [`LaneError::Unauthorized`]; 404 on a session route → [`LaneError::UnknownSession`], on a permission/question route → [`LaneError::UnknownApproval`]; 409/4xx with an opencode error body → `NotAccepting`/`BadRequest(message)` by body; other non-2xx → [`LaneError::Failed`]; dial failure → [`LaneError::Unavailable`] | the table below |
 //!
@@ -468,7 +466,11 @@
 //!     behind its cursor. The terminal [`LaneEvent::Down`] is the ONE frame
 //!     that is never dropped — it goes through [`Publisher::publish_final`],
 //!     which awaits, so a client can never hold a stale `Ready` view with no
-//!     stale reason.
+//!     stale reason. The rows a terminal path flushes just before it (the
+//!     open segment's partial row) go through [`Publisher::publish_waiting`],
+//!     which awaits the same way, so a `Down` never lands without the
+//!     transcript's last words ahead of it — there is no reseed after it to
+//!     restore them. Only a terminal path may wait; a live one never does.
 //!
 //!     **`lagged` and `overflow` are different overflows and both names stay.**
 //!     `overflow` is an ADAPTER-INTERNAL one — the bounded inbox that buffers
@@ -1664,6 +1666,22 @@ impl<T> Publisher<T> {
         // `Err` only means the subscriber is already gone, which is the state
         // this was going to tell it about.
         let _ = self.tx.send(ev).await;
+    }
+
+    /// Queue one frame on a TERMINAL path, **waiting for room** the way
+    /// [`Publisher::publish_final`] does, without consuming the publisher: the
+    /// last transcript rows an adapter flushes just before its `Down`. A
+    /// `Down` that waited for room while the rows ahead of it were dropped
+    /// would end the transcript short of its last words, with no reseed left
+    /// to restore them.
+    ///
+    /// **Never on a live path**: the publishing task is the one reading the
+    /// agent's stream, and waiting there on a slow consumer is the stall
+    /// correction 13 exists to prevent — a live path publishes with
+    /// [`Publisher::publish`] and reseeds on `Lagged`. [`Closed`]: the
+    /// subscriber is gone.
+    pub async fn publish_waiting(&self, ev: T) -> Result<(), Closed> {
+        self.tx.send(ev).await.map_err(|_| Closed)
     }
 
     /// Whether the subscriber has dropped its receiver.

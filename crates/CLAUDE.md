@@ -25,8 +25,8 @@ re-implemented per language. The root `CLAUDE.md` owns the monorepo layout + rel
   list as `SourceEvent`s, `create_options`, `create`, `open(id)`) and the session-scoped
   `AgentLane` it opens (no verb takes an id; `settings`/`set`/`stop` have no default
   bodies). One adapter per agent implements both (opencode over its local HTTP server;
-  craze over its per-machine hub, `shed-craze` — its source since plan 025 C7, its lane in
-  C8 — in the slot plan 017's `gx` adapter held until plan 025 C1 retired it, shed#390).
+  craze over its per-machine hub, `shed-craze` — its source since plan 025 C7, its lane
+  since C8 — in the slot plan 017's `gx` adapter held until plan 025 C1 retired it, shed#390).
   **Capabilities are per session and ride
   the stream** (`LaneEvent::Capabilities`, and `Settings` when they say so) — there is no
   capabilities getter, so a client reads them from its view, never caches them at open.
@@ -44,7 +44,9 @@ re-implemented per language. The root `CLAUDE.md` owns the monorepo layout + rel
   generic `Publisher<T>` (`LanePublisher` / `SourcePublisher`) — deliberately **not**
   `Clone`, one per subscription — is the only way onto it: `publish` (`try_send`; a full
   channel answers `Publish::Lagged` and drops the frame), `publish_final` (consumes self
-  and awaits; the terminal `Down` is the one frame that can never be the dropped one), and
+  and awaits; the terminal `Down` is the one frame that can never be the dropped one),
+  `publish_waiting` (awaits room like `publish_final` without consuming — ONLY for the
+  rows a terminal path flushes just before its `Down`, never on a live path), and
   `wait_drained` (resolves only once every slot is free). Every adapter propagates a
   `Lagged` out of every emitting helper and reseeds rather than silently resumes — the
   dropped frames may already be behind the client's cursor (plan 017's gx adapter, which
@@ -167,8 +169,45 @@ re-implemented per language. The root `CLAUDE.md` owns the monorepo layout + rel
   `CrazeSource::create` retries ONCE under the same `requestId` on an unknown outcome (a
   dropped connection, the 120 s deadline) and never on a definite answer;
   `is_outcome_unknown` is the one test a caller keeps its id on. A row's id is its
-  **hostId** (P11). The lane (`open`, the watcher, the fold) is **C8**: `open` answers
-  `Failed` until then. Pure lib — serde, tokio, no `reqwest`, no `chrono` — not
+  **hostId** (P11). **`CrazeLane`** (plan 025 C8, `open` binds one with no I/O) is one
+  session: its watcher (`watcher.rs` — the state machine table is its module doc) dials
+  one connection per lane, splices to the host (`session.connect{hostId}` with the host
+  `hello` pipelined), re-reads the host's own `sessions.list` row (the craze `sessionId`
+  every session call carries — learned, and re-learned after `session_replaced`), and
+  attaches: a snapshot seeds `Reset … Ready` (every `Ready` waits for its attachment's
+  `synchronized` at the last seq held); after `Ready`, a lost connection is `Stale` and a
+  redial that offers the cursor — the host decides: honoured is a SILENT resume (a lone
+  `Ready`, same generation), refused is `Reset{cursor_lost:…}`. Bounds: 8 attaches per
+  episode (reset at `synchronized`), dials give up 10 min into an outage (an outage ends
+  only at a `synchronized`, so a host that answers attaches and never synchronizes is ended
+  too); every dial is under a 30 s deadline (`dial::DIAL_DEADLINE` — for a source an
+  `Offline`, for a create an unknown outcome retried under the same id), and an attachment
+  that goes 60 s without a word before its `synchronized` is a dead connection; a
+  client-channel lag (or `ConnEnd::Backlog`) drops the connection, waits for the drain and
+  reseeds; terminal `Down` only for `session_closed`, `unknown_session`, `start_failed:
+  <cause>`, a splice to another host (`protocol: …`, which every read refuses too) and
+  the bounds — a `reset{omitted}` whose re-attach gets no answer is confirmed by a redial,
+  never assumed closed; the rows flushed ahead of a `Down` wait for room like the `Down`;
+  a seed's rows are capped at what the ring keeps so it always fits the channel. The
+  verbs share the lane's connection (`send`/`cancel`/`answer`/`stop`, fresh commandIds
+  per lane): issued while disconnected they wait 10 s then fail `Unavailable`;
+  in flight at a drop, or past their 30 s deadline (which also closes the connection),
+  they are "outcome unknown" and never resent. `session()` never dials; `approvals()`/
+  `settings()` answer from a RUNNING watcher's fold once it seeded (the watcher that set
+  it alone clears it), else read a snapshot on a connection of their own. `fold.rs` is
+  craze's events/snapshots → append-only rows (craze's own wordings ported: `noteTodos`,
+  `compactionNote`, the foreign-turn notes, the shell-context/attachment strip) with an
+  approval book (`answer_body` maps the contract's answers onto `asks.answer`). **Rows
+  follow craze's transcript, approvals its ENGINE ask registry** (Amendment A11): a
+  sub-agent's ask (craze's fold child-ignores all four ask kinds) draws no row, yet is an
+  approval — the registry has no agent field, and `pendingAsks` counts it — gated exactly
+  as craze's `HiddenBy` (a question needs `askCards`, a plan `planCards`; a permission is
+  never hidden); every seed and silent resume runs a FENCED read
+  (attach, `asks.list` + `asks.get`, `session.sync`) and its `Ready` waits for every event
+  through the sync's seq;
+  `segment.rs` is shed-gx's segmenter, ported (8 KiB lossless splits, the 2 s flush
+  clock); `settings.rs` is the settings READ (craze's model order; `set` is C11, `Failed`
+  until then). Pure lib — serde, tokio, no `reqwest`, no `chrono` — not
   FFI-exported, builds for `aarch64-linux-android` (mobile links it). In
   `default-members`. **Tests:** `tests/wire.rs` runs every vendored WIRE fixture
   (`fixtures/wire/`, craze's `internal/fakehost/testdata/wire` at the sha
@@ -181,7 +220,15 @@ re-implemented per language. The root `CLAUDE.md` owns the monorepo layout + rel
   binaries copied into a private `PATH`, the hub's pid read from its record and checked
   before any signal, and craze's own `cleanup` as the teardown. Its cells **skip** without
   `SHED_CRAZE_BIN_DIR` (`make craze-binaries` prints the line) and **fail** instead under
-  `SHED_CRAZE_REQUIRE=1`, which CI's `core-linux` sets. Every source frame goes through
+  `SHED_CRAZE_REQUIRE=1`, which CI's `core-linux` sets. `tests/recipe_lane.rs` drives lanes
+  the same way (fake-host ops for the asks, a hub-created `craze serve` for `stop`, a
+  `HookDial` that kills a lane's bridge for the silent resume); `tests/lane.rs` and
+  `tests/overflow.rs` pin the watcher's edges against a SCRIPTED host (the bounds on tokio's
+  paused clock). `fixtures/0.1.0+gx/` is one LIVE recording of a gx session through a real
+  hub, replayed offline into `fold.golden.json` — **regression detection only**;
+  `fixtures/README.md` says what each artifact claims and how to re-record
+  (`SHED_CRAZE_LIVE=1 SHED_CRAZE_RECORD=1 … --test live`) and re-derive
+  (`SHED_CRAZE_REGOLD=1`). Every source and lane frame goes through
   `shed_core::lane::conformance`.
 
 `fixtures/` holds the real-shaped JSON/YAML samples (server info, `shed list`, `system df`,

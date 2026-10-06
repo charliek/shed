@@ -60,18 +60,22 @@ pub fn lane_error(e: &RpcError) -> LaneError {
 /// What a session that failed to start says when craze gives no cause.
 pub const START_FAILED_FALLBACK: &str = "the session failed to start";
 
+/// A start failure's cause as shown: craze's own text, trimmed, else
+/// [`START_FAILED_FALLBACK`] — a create's refusal, a lane's attach refusal and
+/// a `ready` that failed all word it this one way.
+pub fn start_failed_cause(cause: Option<&str>) -> &str {
+    cause
+        .map(str::trim)
+        .filter(|c| !c.is_empty())
+        .unwrap_or(START_FAILED_FALLBACK)
+}
+
 /// `session.create`'s refusal: the table, except P14's one row.
 pub fn create_error(e: &RpcError) -> LaneError {
     let start_failed = e.data_code.as_deref() == Some(code::NOT_ACCEPTING)
         && e.reason.as_deref() == Some(reason::START_FAILED);
     if start_failed {
-        let cause = e
-            .cause
-            .as_deref()
-            .map(str::trim)
-            .filter(|c| !c.is_empty())
-            .unwrap_or(START_FAILED_FALLBACK);
-        return LaneError::Failed(cause.to_string());
+        return LaneError::Failed(start_failed_cause(e.cause.as_deref()).to_string());
     }
     lane_error(e)
 }

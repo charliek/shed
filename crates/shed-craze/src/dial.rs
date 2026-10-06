@@ -11,7 +11,7 @@
 //! ```
 //!
 //! Every connection — the roster, every `createOptions`, every create, and
-//! (from C8) every open lane — dials its own. A dial is never reused: craze's
+//! every open lane — dials its own. A dial is never reused: craze's
 //! hub answers one request at a time in order, and a splice takes the whole
 //! connection.
 //!
@@ -37,6 +37,16 @@
 //! A dial without a process ([`TcpDial`]) sees neither an exit code nor
 //! stderr: everything before `hello` is `Unreachable` there, and on the phone
 //! the Dart side's own classifier is authoritative for it (§3.3.2).
+//!
+//! **The dial itself is under a deadline** ([`DIAL_DEADLINE`]): a dial that
+//! never hands back a stream — an ssh exec held at its host-key prompt, a
+//! loopback connect that blocks, a test's held dial — is
+//! [`DialError::TimedOut`], never a wait without end. A source reads it as
+//! `Offline{Unreachable}` and redials with its backoff; a lane counts it toward
+//! its outage bound; `createOptions` fails `Unavailable`; and a create, whose
+//! outcome its caller must never guess, takes it as an unknown outcome — the
+//! one retry under the same request id (nothing was written, so the retry is
+//! safe either way).
 //!
 //! # The find-only probe
 //!
@@ -110,6 +120,22 @@ impl CrazeStream {
         (self.reader, self.writer, self.stderr_tail, self.exit)
     }
 
+    /// [`CrazeStream::into_parts`]'s inverse: a wrapping dial's stream, put
+    /// back together around the halves it wrapped.
+    pub fn from_parts(
+        reader: BoxRead,
+        writer: BoxWrite,
+        stderr_tail: Option<StderrTail>,
+        exit: Option<ExitWatch>,
+    ) -> CrazeStream {
+        CrazeStream {
+            reader,
+            writer,
+            stderr_tail,
+            exit,
+        }
+    }
+
     /// The process's exit, when there is one.
     pub fn exit(&self) -> Option<&ExitWatch> {
         self.exit.as_ref()
@@ -132,6 +158,10 @@ pub enum DialError {
     /// craze answered, and refused.
     #[error("{0}")]
     Failed(String),
+    /// The dial itself handed back no stream within its deadline
+    /// ([`DIAL_DEADLINE`]): nothing was written.
+    #[error("{0}")]
+    TimedOut(String),
 }
 
 impl DialError {
@@ -140,19 +170,19 @@ impl DialError {
         match self {
             DialError::NotInstalled(_) => SourceOffline::NotInstalled,
             DialError::TooOld(_) => SourceOffline::TooOld,
-            DialError::Unreachable(_) => SourceOffline::Unreachable,
+            DialError::Unreachable(_) | DialError::TimedOut(_) => SourceOffline::Unreachable,
             DialError::Failed(_) => SourceOffline::Failed,
         }
     }
 
-    /// The contract error for a call whose dial failed. `NotInstalled` and
-    /// `Unreachable` are quiet (`Unavailable`: nothing to talk to); `TooOld`
-    /// and a refusal are `Failed` with craze's words.
+    /// The contract error for a call whose dial failed. `NotInstalled`,
+    /// `Unreachable` and `TimedOut` are quiet (`Unavailable`: nothing to talk
+    /// to); `TooOld` and a refusal are `Failed` with craze's words.
     pub fn into_lane_error(self) -> LaneError {
         match self {
-            e @ (DialError::NotInstalled(_) | DialError::Unreachable(_)) => {
-                LaneError::Unavailable(e.to_string())
-            }
+            e @ (DialError::NotInstalled(_)
+            | DialError::Unreachable(_)
+            | DialError::TimedOut(_)) => LaneError::Unavailable(e.to_string()),
             DialError::TooOld(m) | DialError::Failed(m) => LaneError::Failed(m),
         }
     }
@@ -162,13 +192,26 @@ impl DialError {
 /// its stderr.
 const EXIT_GRACE: Duration = Duration::from_secs(2);
 
-/// Dial, say `hello` to the hub, and judge it — or classify why not.
+/// How long a dial may take to hand back a stream before it counts as a
+/// failed dial ([`DialError::TimedOut`], the module doc).
+pub const DIAL_DEADLINE: Duration = Duration::from_secs(30);
+
+/// Dial (within `dial_deadline`), say `hello` to the hub (within
+/// `hello_deadline`), and judge it — or classify why not.
 pub async fn connect_hub(
     dial: &dyn CrazeDial,
     client: &ClientInfo,
+    dial_deadline: Duration,
     hello_deadline: Duration,
 ) -> Result<(Conn, Notifications, HubHello), DialError> {
-    let stream = dial.dial().await?;
+    let stream = match tokio::time::timeout(dial_deadline, dial.dial()).await {
+        Ok(stream) => stream?,
+        Err(_) => {
+            return Err(DialError::TimedOut(format!(
+                "the dial to craze handed back no connection within {dial_deadline:?}"
+            )))
+        }
+    };
     let (conn, notes) = Conn::start(stream);
     match hello_hub(&conn, client, hello_deadline).await {
         Ok(hello) => Ok((conn, notes, hello)),
@@ -800,7 +843,7 @@ mod tests {
             EnvPolicy::Exactly(vec![("PATH".into(), "/usr/bin:/bin".into())]),
         );
         let client = crate::wire::ClientInfo::shed("t");
-        match connect_hub(&dial, &client, Duration::from_secs(30)).await {
+        match connect_hub(&dial, &client, DIAL_DEADLINE, Duration::from_secs(30)).await {
             Ok(_) => panic!("{script}: no hub here"),
             Err(e) => e,
         }

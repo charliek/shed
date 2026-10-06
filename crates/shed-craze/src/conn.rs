@@ -31,7 +31,7 @@
 //! files both replies and notifications, so a reader that waited for a slow
 //! consumer would hold every reply queued behind the notification it is
 //! stuck on, and a caller that awaits a reply while it drains notifications
-//! (C8's watcher, attaching while events stream in) would deadlock. A full
+//! (the lane's watcher, attaching while events stream in) would deadlock. A full
 //! queue ends the connection instead, as [`ConnEnd::Backlog`]: a source treats
 //! it as a lost connection (redial, reseed), a lane as correction 13's
 //! `Lagged` (drain, then reseed). What the reader DOES do, once the queue is
@@ -62,9 +62,17 @@
 //! the two capabilities the source cannot work without, `rosterSubscribe` and
 //! `connect` — anything short of that is [`HelloError::TooOld`]. A refusal of
 //! `hello` for want of a shared protocol (`bad_request`/`protocol_version`) is
-//! `TooOld` too; any other refusal is [`HelloError::Refused`]. (The host
-//! `hello` the lane says after its splice — the same codec rule, `endpoint.kind
-//! "host"` — arrives with the lane, C8.)
+//! `TooOld` too; any other refusal is [`HelloError::Refused`]. The host
+//! `hello` the lane says through the splice ([`judge_host_hello`]) is held to
+//! the same protocol and codec rule, from an `endpoint.kind` of `"host"`.
+//!
+//! # Ending a connection from outside
+//!
+//! [`Conn::close`] ends a live connection on purpose: every waiter fails, the
+//! notifications end, and a process behind it is killed. The lane uses it when
+//! a verb's deadline passes with no reply — a half-open transport shows up
+//! exactly there, since nothing keeps the loopback or exec stream alive — so
+//! its watcher sees the connection gone and reconnects.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -318,6 +326,21 @@ impl Conn {
     /// The process's exit, when the dial has one.
     pub fn exit(&self) -> Option<&ExitWatch> {
         self.exit.as_ref()
+    }
+
+    /// End the connection now, for `why` (the module doc): every waiter fails
+    /// with it, the reader stops — so the notifications end once the consumer
+    /// has the ones already queued — and the process behind it is killed. A
+    /// connection that already ended keeps its first reason.
+    pub fn close(&self, why: &str) {
+        lock(&self.shared).end(ConnEnd::Lost(why.to_string()));
+        // The reader holds the notifications' sender: aborting it is what ends
+        // them. It holds no lock across an await, so the abort leaves nothing
+        // half-written.
+        self.reader.abort();
+        if let Some(exit) = &self.exit {
+            exit.kill();
+        }
     }
 }
 
@@ -596,7 +619,38 @@ pub fn judge_hub_hello(result: &Value) -> Result<HubHello, HelloError> {
     })
 }
 
-/// The rule every `hello` — the hub's and, from C8, the host's — is held to:
+/// A host's `hello`, said through the hub's splice, accepted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostHello {
+    /// The host's own id — the lane's row id (P11).
+    pub host_id: String,
+    pub craze_version: String,
+}
+
+/// An answered host `hello`: a `host` endpoint, protocol 1, codecs 1/1 — the
+/// same rule the hub's is held to (PM "Versioning": a client never folds a
+/// codec it does not know). Anything but a host answering is a refusal: the
+/// splice landed somewhere it should not have.
+pub fn judge_host_hello(result: &Value) -> Result<HostHello, HelloError> {
+    let hello = HelloResult::deserialize(result).map_err(|e| {
+        HelloError::Refused(format!(
+            "craze's host answered hello with something shed cannot read: {e}"
+        ))
+    })?;
+    if hello.endpoint.kind != "host" {
+        return Err(HelloError::Refused(format!(
+            "expected the session's host to answer through the splice, got a {:?} endpoint",
+            hello.endpoint.kind
+        )));
+    }
+    check_protocol_and_codecs(&hello)?;
+    Ok(HostHello {
+        host_id: hello.endpoint.host_id,
+        craze_version: hello.endpoint.craze_version,
+    })
+}
+
+/// The rule every `hello` — the hub's and the host's — is held to:
 /// protocol 1, and the event and snapshot codecs this crate folds. Anything
 /// else is `TooOld` and nothing is folded (PM "Versioning").
 pub fn check_protocol_and_codecs(hello: &HelloResult) -> Result<(), HelloError> {
@@ -1126,6 +1180,61 @@ mod tests {
         assert!(matches!(
             judge_hub_hello(&host),
             Err(HelloError::Refused(_))
+        ));
+    }
+
+    /// A host's `hello` through the splice: a host endpoint, protocol 1,
+    /// codecs 1/1 — anything else refused or too old.
+    #[test]
+    fn a_host_hello_is_a_host_at_protocol_one_and_codecs_one() {
+        let ok = crate::testing::host_hello_result("0123456789ab");
+        assert_eq!(judge_host_hello(&ok).unwrap().host_id, "0123456789ab");
+        let mut hub = ok.clone();
+        hub["endpoint"]["kind"] = json!("hub");
+        assert!(matches!(
+            judge_host_hello(&hub),
+            Err(HelloError::Refused(_))
+        ));
+        let mut codec = ok.clone();
+        codec["codecs"]["snapshot"] = json!(2);
+        assert!(matches!(
+            judge_host_hello(&codec),
+            Err(HelloError::TooOld(_))
+        ));
+        let mut proto = ok;
+        proto["protocol"] = json!(2);
+        assert!(matches!(
+            judge_host_hello(&proto),
+            Err(HelloError::TooOld(_))
+        ));
+    }
+
+    /// `close` ends a live connection on purpose: a waiter fails with the
+    /// reason, the notifications end, and a later request is refused at once.
+    #[tokio::test]
+    async fn close_ends_the_connection_from_outside() {
+        let (conn, mut notes, mut server, _w) = pair();
+        let conn = Arc::new(conn);
+        let c = Arc::clone(&conn);
+        let call = tokio::spawn(async move { c.request("x", &wire::Empty {}, SECOND).await });
+        read_request(&mut server).await;
+        conn.close("a verb's deadline passed");
+        let got = call.await.unwrap();
+        assert!(
+            matches!(&got, Err(CallError::Ended(why)) if why.contains("deadline passed")),
+            "{got:?}"
+        );
+        let ended = tokio::time::timeout(SECOND, notes.recv())
+            .await
+            .expect("the notifications END — not hang on a reader nobody stopped");
+        assert!(ended.is_none(), "the notifications end");
+        assert_eq!(
+            conn.ended(),
+            Some(ConnEnd::Lost("a verb's deadline passed".into()))
+        );
+        assert!(matches!(
+            conn.request("y", &wire::Empty {}, SECOND).await,
+            Err(CallError::Ended(_))
         ));
     }
 

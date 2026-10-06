@@ -21,6 +21,7 @@ use crate::wire::RosterRow;
 
 fn fast() -> Timings {
     Timings {
+        dial: Duration::from_secs(5),
         hello: Duration::from_secs(5),
         request: Duration::from_secs(5),
         create: Duration::from_secs(120),
@@ -914,4 +915,111 @@ async fn a_create_whose_write_stalls_is_an_unknown_outcome_and_retried() {
     assert!(create.await.unwrap().is_ok());
     assert_eq!(dial.dials(), 2);
     drop(hub);
+}
+
+// ---- the dial deadline (C7+C8 review) ----
+
+/// A source on a [`HookDial`](crate::testing::HookDial) around `dial`, on
+/// the pinned clocks (the paused-clock cells run them).
+fn hooked(dial: &Arc<ScriptedDial>) -> (Arc<crate::testing::HookDial>, CrazeSource) {
+    let hook = crate::testing::HookDial::new(Arc::clone(dial) as Arc<dyn CrazeDial>);
+    let src = CrazeSource::new(Arc::clone(&hook) as Arc<dyn CrazeDial>, "t");
+    (hook, src)
+}
+
+/// **A dial that never resolves is `Offline{Unreachable}` and a redial**, on
+/// a paused clock: the held dial gives up at the dial deadline — never a
+/// roster that waits without end and says nothing — and once dials go through
+/// again the roster seeds.
+#[tokio::test(start_paused = true)]
+async fn a_held_dial_is_offline_and_redialled() {
+    let (dial, mut conns) = ScriptedDial::new();
+    let (hook, src) = hooked(&dial);
+    hook.hold_dials();
+    let started = tokio::time::Instant::now();
+    let (mut rx, _stop) = src.subscribe().await.unwrap().into_parts();
+    let first = tokio::time::timeout(DIAL_DEADLINE + Duration::from_secs(1), rx.recv())
+        .await
+        .expect("the held dial gave up at its deadline")
+        .unwrap();
+    assert!(
+        matches!(&first, SourceEvent::Offline { cause: SourceOffline::Unreachable, reason }
+            if reason.contains("handed back no connection")),
+        "{first:?}"
+    );
+    assert!(
+        started.elapsed() >= DIAL_DEADLINE,
+        "{:?}",
+        started.elapsed()
+    );
+    assert_eq!(dial.dials(), 0, "nothing got through");
+    hook.release_dials();
+    let mut hub = tokio::time::timeout(Duration::from_secs(120), conns.recv())
+        .await
+        .expect("the source redialled")
+        .unwrap();
+    hub.hello("epoch-1", full_hub_capabilities()).await;
+    hub.subscribed("sub-1", "epoch-1", json!([row_a()])).await;
+    until(&mut rx, "the seed", is_ready).await;
+}
+
+/// **A create whose dial never resolves is an UNKNOWN outcome**: the one
+/// retry goes out under the same `requestId` (nothing was written, so the
+/// retry is safe), and a second held dial is `outcome unknown` — the caller
+/// keeps the id. Never a create that waits without end.
+#[tokio::test(start_paused = true)]
+async fn a_held_dial_is_an_unknown_create_outcome_retried_under_the_same_id() {
+    let (dial, mut conns) = ScriptedDial::new();
+    let (hook, src) = hooked(&dial);
+    hook.hold_dials();
+    let create = tokio::spawn(async move { src.create(create_request("req-held")).await });
+    // The first dial gives up at 30 s; the retry is dialling (held) when the
+    // dials are let through.
+    tokio::time::sleep(DIAL_DEADLINE + Duration::from_secs(1)).await;
+    assert_eq!(
+        hook.dials(),
+        2,
+        "the first held dial gave up, the retry is dialling"
+    );
+    hook.release_dials();
+    let mut hub = tokio::time::timeout(Duration::from_secs(60), conns.recv())
+        .await
+        .expect("the retry got through")
+        .unwrap();
+    hub.hello("epoch-1", full_hub_capabilities()).await;
+    let req = hub.expect("session.create").await;
+    assert_eq!(req["params"]["requestId"], "req-held", "the same id");
+    hub.reply(&req, created_result()).await;
+    assert!(create.await.unwrap().is_ok());
+
+    let (dial, _conns) = ScriptedDial::new();
+    let (hook, src) = hooked(&dial);
+    hook.hold_dials();
+    let got = tokio::time::timeout(
+        DIAL_DEADLINE * 2 + Duration::from_secs(1),
+        src.create(create_request("req-held-2")),
+    )
+    .await
+    .expect("two held dials end the create")
+    .unwrap_err();
+    assert!(crate::errors::is_outcome_unknown(&got), "{got:?}");
+    assert_eq!(hook.dials(), 2, "one retry, no more");
+}
+
+/// **`createOptions` whose dial never resolves fails** — `Unavailable` at the
+/// dial deadline, a read with nothing to guess about.
+#[tokio::test(start_paused = true)]
+async fn a_held_dial_fails_create_options() {
+    let (dial, _conns) = ScriptedDial::new();
+    let (hook, src) = hooked(&dial);
+    hook.hold_dials();
+    let got = tokio::time::timeout(DIAL_DEADLINE + Duration::from_secs(1), src.create_options())
+        .await
+        .expect("the held dial ended the call at its deadline")
+        .unwrap_err();
+    assert!(
+        matches!(&got, LaneError::Unavailable(m) if m.contains("handed back no connection")),
+        "{got:?}"
+    );
+    assert!(!crate::errors::is_outcome_unknown(&got));
 }

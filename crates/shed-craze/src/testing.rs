@@ -170,6 +170,10 @@ pub struct Recipe {
     pub work: PathBuf,
     bins: Bins,
     fake_hosts: tokio::sync::Mutex<Vec<FakeHost>>,
+    /// Directories after the private one on `PATH` (the live recording only).
+    path_after: Vec<String>,
+    /// Variables beyond the six (the live recording only).
+    extra_env: Vec<(String, String)>,
     torn_down: bool,
 }
 
@@ -233,23 +237,40 @@ impl Recipe {
             work,
             bins: bins.clone(),
             fake_hosts: tokio::sync::Mutex::new(Vec::new()),
+            path_after: Vec::new(),
+            extra_env: Vec::new(),
             torn_down: false,
         };
         recipe.set_grok_agent(&recipe.bins.fake_agent);
         recipe
     }
 
-    /// The recipe's six variables, and nothing else.
+    /// The recipe's six variables, and nothing else (but what
+    /// [`Recipe::with_path_after`]/[`Recipe::with_env`] added, which no recipe
+    /// cell does).
     pub fn env(&self) -> Vec<(String, String)> {
         let s = |p: &Path| p.to_string_lossy().into_owned();
-        vec![
+        let mut path = s(&self.path_dir);
+        for dir in &self.path_after {
+            path = format!("{path}:{dir}");
+        }
+        let mut env: Vec<(String, String)> = vec![
             ("HOME".into(), s(&self.home)),
             ("CRAZE_HOME".into(), s(&self.craze_home)),
             ("CRAZE_RUNTIME_DIR".into(), s(&self.runtime)),
-            ("PATH".into(), s(&self.path_dir)),
+            ("PATH".into(), path),
             ("CRAZE_FAKE_SCRIPT".into(), "grok-echo".into()),
             ("CRAZE_FAKE_SESSION_ID".into(), "{dir}".into()),
-        ]
+        ];
+        env.extend(self.extra_env.iter().cloned());
+        env
+    }
+
+    /// One more variable for every craze process (the live recording only:
+    /// the recipe's own cells run under exactly the six).
+    pub fn with_env(mut self, key: &str, value: &str) -> Recipe {
+        self.extra_env.push((key.to_string(), value.to_string()));
+        self
     }
 
     /// The recipe's own `craze bridge --hub`, run by its full path under
@@ -338,12 +359,19 @@ impl Recipe {
     /// does on a locked keychain: the fake agent's `exit-two-lines`, behind a
     /// two-line wrapper (`[agents]` names one binary, no arguments).
     pub fn exit_two_lines_agent(&self) -> PathBuf {
+        self.script_agent("exit-two-lines")
+    }
+
+    /// The fake agent running `script` (`hang`, `grok-ask`, …), behind a
+    /// two-line wrapper — `[agents]` names one binary, no arguments, and the
+    /// flag wins over the recipe's `CRAZE_FAKE_SCRIPT`.
+    pub fn script_agent(&self, script: &str) -> PathBuf {
         use std::os::unix::fs::PermissionsExt;
-        let p = self.root.join("exit-two-lines-agent");
+        let p = self.root.join(format!("{script}-agent"));
         std::fs::write(
             &p,
             format!(
-                "#!/bin/sh\nexec '{}' -script exit-two-lines \"$@\"\n",
+                "#!/bin/sh\nexec '{}' -script {script} \"$@\"\n",
                 self.bins.fake_agent.display()
             ),
         )
@@ -351,6 +379,19 @@ impl Recipe {
         std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755))
             .unwrap_or_else(|e| panic!("{}: {e}", p.display()));
         p
+    }
+
+    /// Replace `config.toml` whole (the live recording's own config).
+    pub fn write_config(&self, text: &str) {
+        std::fs::write(self.config_path(), text).unwrap_or_else(|e| panic!("config.toml: {e}"));
+    }
+
+    /// Run every craze process with `dirs` after the private directory on
+    /// its `PATH` (the live recording: a real agent's tools need a shell's
+    /// usual programs). The recipe's own cells never do.
+    pub fn with_path_after(mut self, dirs: &[&str]) -> Recipe {
+        self.path_after = dirs.iter().map(|d| d.to_string()).collect();
+        self
     }
 
     /// Start a fake host listed in the registry under `HOME` as `host_id`
@@ -369,9 +410,7 @@ impl Recipe {
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::null())
             .kill_on_drop(true);
-        let mut child = cmd
-            .spawn()
-            .unwrap_or_else(|e| panic!("craze-fake-host: {e}"));
+        let mut child = spawn_fresh(&mut cmd, "craze-fake-host").await;
         let stdout = child.stdout.take().expect("piped stdout");
         let stdin = child.stdin.take();
         // Filed before anything waits on it, so a ready line that never comes
@@ -611,15 +650,48 @@ fn command_line(pid: u32) -> Option<String> {
     (!s.is_empty()).then_some(s)
 }
 
+/// Spawn a binary [`Recipe::new`] has only just copied, with a bounded
+/// `ETXTBSY` retry. The fd table is process-wide: a sibling cell's spawn that
+/// forks while this recipe's copy still holds its write fd carries that fd
+/// into its child until the child execs, and an exec of the copy in that
+/// window fails "Text file busy" — the classic fork/exec race, the same one
+/// `shed-broker`'s `run_shim` retries. Anything but `ETXTBSY` is returned at
+/// once; a busy file that stays busy fails loudly, because that is no longer
+/// the transient race.
+async fn spawn_fresh(cmd: &mut Command, what: &str) -> Child {
+    let mut delay = Duration::from_millis(10);
+    for _ in 0..10 {
+        match cmd.spawn() {
+            Ok(child) => return child,
+            Err(e) if e.kind() == std::io::ErrorKind::ExecutableFileBusy => {
+                tokio::time::sleep(delay).await;
+                delay = (delay * 2).min(Duration::from_millis(160));
+            }
+            Err(e) => panic!("{what}: {e}"),
+        }
+    }
+    panic!("{what}: persistently busy (ETXTBSY) — not the transient fork/exec race")
+}
+
 // ---- dial hooks ----
 
-/// A dial around another that counts its dials and can hold reads, and can cut
-/// one connection off right after a given request is written.
+/// Every connection a [`HookDial`] made: its own read gate, and its process.
+type LiveConns = Arc<Mutex<Vec<(Arc<Gate>, Option<ExitWatch>)>>>;
+
+/// A dial around another that counts its dials and can hold reads, can cut
+/// one connection off right after a given request is written, can cut every
+/// live connection off at once ([`HookDial::sever_live`] — a lane's bridge
+/// killed mid-stream), and can hold new dials ([`HookDial::hold_dials`] — a
+/// lane kept disconnected while the far side changes under it).
 pub struct HookDial {
     inner: Arc<dyn CrazeDial>,
     gate: Arc<Gate>,
     armed: Mutex<Option<SeverArm>>,
     dials: AtomicUsize,
+    /// Every connection dialled so far: its own read gate, and its process.
+    live: LiveConns,
+    /// `true` while new dials wait.
+    held: tokio::sync::watch::Sender<bool>,
 }
 
 /// Where an armed cut leaves the connection it marked: its own read gate,
@@ -668,7 +740,33 @@ impl HookDial {
             gate: Gate::new(),
             armed: Mutex::new(None),
             dials: AtomicUsize::new(0),
+            live: Arc::default(),
+            held: tokio::sync::watch::channel(false).0,
         })
+    }
+
+    /// Cut every connection dialled so far: its process killed, its reads at
+    /// EOF from now on, whatever was buffered — a transport that dropped.
+    /// Returns how many were cut.
+    pub fn sever_live(&self) -> usize {
+        let conns = std::mem::take(&mut *lock(&self.live));
+        for (gate, exit) in &conns {
+            gate.sever();
+            if let Some(exit) = exit {
+                exit.kill();
+            }
+        }
+        conns.len()
+    }
+
+    /// Hold every NEW dial until [`HookDial::release_dials`].
+    pub fn hold_dials(&self) {
+        self.held.send_replace(true);
+    }
+
+    /// Let held dials (and later ones) through.
+    pub fn release_dials(&self) {
+        self.held.send_replace(false);
     }
 
     /// How many connections were dialled.
@@ -705,12 +803,18 @@ impl HookDial {
 impl CrazeDial for HookDial {
     fn dial(&self) -> BoxFuture<'static, Result<CrazeStream, DialError>> {
         self.dials.fetch_add(1, Ordering::SeqCst);
-        let inner = self.inner.dial();
+        let inner = Arc::clone(&self.inner);
         let gate = Arc::clone(&self.gate);
         let arm = lock(&self.armed).take();
+        let live = Arc::clone(&self.live);
+        let mut held = self.held.subscribe();
         Box::pin(async move {
-            let (r, w, tail, exit) = inner.await?.into_parts();
+            let _ = held.wait_for(|h| !*h).await;
+            let (r, w, tail, exit) = inner.dial().await?.into_parts();
             let r: BoxRead = Box::new(GatedRead::new(r, gate));
+            let mine = Gate::new();
+            lock(&live).push((Arc::clone(&mine), exit.clone()));
+            let r: BoxRead = Box::new(GatedRead::new(r, mine));
             let (r, w): (BoxRead, BoxWrite) = match arm {
                 None => (r, w),
                 Some(arm) => {
@@ -728,14 +832,7 @@ impl CrazeDial for HookDial {
                     (r, w)
                 }
             };
-            let mut s = CrazeStream::new(r, w);
-            if let Some(t) = tail {
-                s = s.with_stderr_tail(t);
-            }
-            if let Some(e) = exit {
-                s = s.with_exit(e);
-            }
-            Ok(s)
+            Ok(CrazeStream::from_parts(r, w, tail, exit))
         })
     }
 }
@@ -1044,7 +1141,8 @@ impl HubEnd {
             .await;
     }
 
-    /// A `reset` notification.
+    /// A `reset` notification — a roster's, or an attachment's (the same
+    /// line).
     pub async fn reset(&mut self, sub: &str, reason: &str) {
         self.send(&json!({"jsonrpc": "2.0", "method": "reset",
                           "params": {"subscription": sub, "reason": reason}}))
@@ -1067,4 +1165,366 @@ pub fn roster_row(host_id: &str, session_id: &str, workspace: &str, row: Value) 
         v["row"] = row;
     }
     v
+}
+
+// ---- a scripted host behind the hub, for the lane's unit cells ----
+
+/// One open ask as `asks.get` carries it: `kind`'s `payload` as its body,
+/// opened at `opened_at`.
+pub fn ask_record(kind: &str, payload: &Value, opened_at: &str) -> Value {
+    json!({"id": payload["id"], "kind": kind, "status": "open",
+           "body": { kind: payload }, "openedAt": opened_at})
+}
+
+/// WIRE/01's session capabilities, with `stop` as given.
+pub fn session_caps(stop: bool) -> Value {
+    json!({"interject": false, "subagentCancel": false, "subagentBackground": false, "modes": true,
+           "effort": true, "fastToggle": true, "subagentRows": true, "subagentTranscript": false,
+           "todos": true, "askCards": true, "planCards": true, "parameterizedPicker": true,
+           "cancel": true, "approvals": true, "historyCursor": true, "stop": stop})
+}
+
+/// A session info document (WIRE/01's shape) for `host_id` serving
+/// `session_id` in `incarnation`.
+pub fn session_info(host_id: &str, session_id: &str, incarnation: &str, caps: Value) -> Value {
+    let mut info = json!({"sessionId": session_id, "providerSessionId": "stub-session-1", "incarnation": incarnation,
+           "hostId": host_id, "workspace": "/work", "provider": {"name": "grok", "label": "Grok"},
+           "catalogs": {"models": [{"id": "grok", "name": "Grok"}, {"id": "fast", "name": "Fast"}],
+                        "modes": [{"id": "agent", "name": "Agent", "description": "Full agent capabilities with tool access"}]},
+           "retryHorizon": {"commands": 1024, "ageMs": 600000}});
+    info["capabilities"] = caps;
+    info
+}
+
+/// A host's `sessions.list` row: the info document and the live facts
+/// (`facts` merged over `{title: "", activity: "idle", foreignTurn: false,
+/// pendingAsks: 0}`).
+pub fn host_session_row(info: &Value, facts: Value) -> Value {
+    let mut row = info.clone();
+    for (k, v) in [
+        ("title", json!("")),
+        ("activity", json!("idle")),
+        ("foreignTurn", json!(false)),
+        ("pendingAsks", json!(0)),
+    ] {
+        row[k] = v;
+    }
+    if let Value::Object(facts) = facts {
+        for (k, v) in facts {
+            row[k.as_str()] = v;
+        }
+    }
+    row
+}
+
+/// A snapshot (codec 1) cut at `incarnation:seq`, with WIRE/01's settings and
+/// `main` as given.
+pub fn snapshot_at(incarnation: &str, seq: u64, main: Value) -> Value {
+    let mut snap = json!({"version": 1, "incarnation": incarnation, "seq": seq,
+           "settings": {"mode": "agent", "model": "grok", "config": {"options": [
+               {"id": "effort", "name": "Effort", "category": "thought_level", "type": "select", "current": "medium",
+                "selectValues": [{"value": "low", "name": "Low"}, {"value": "medium", "name": "Medium"}, {"value": "high", "name": "High"}]}]}}});
+    snap["main"] = main;
+    snap
+}
+
+/// A host `hello` result (WIRE/01's, the host's id given).
+pub fn host_hello_result(host_id: &str) -> Value {
+    json!({"protocol": 1, "endpoint": {"kind": "host", "hostId": host_id, "crazeVersion": "0.0.0-fakehost", "pid": 4242},
+           "clientId": "c-1", "token": "52fdfc072182654f163f5f0f9a621d72", "resumed": false,
+           "capabilities": {"rosterSubscribe": false, "sessionCreate": false, "multiplex": false, "connect": false,
+                            "snapshot": true, "attachWhenNow": true},
+           "codecs": {"event": 1, "snapshot": 1},
+           "limits": {"inboundLine": 4194304, "outboundLine": 16777216},
+           "retryHorizon": {"commands": 1024, "ageMs": 600000}})
+}
+
+/// An attach result: `snapshot` present exactly when the cursor was not
+/// honoured; `reset` the refused cursor's reason.
+pub fn attach_result(
+    subscription: &str,
+    info: &Value,
+    after: (&str, u64),
+    snapshot: Option<Value>,
+    reset: Option<&str>,
+) -> Value {
+    let mut v = json!({"subscription": subscription, "session": info, "ready": true,
+                       "after": {"incarnation": after.0, "seq": after.1}});
+    if let Some(s) = snapshot {
+        v["snapshot"] = s;
+    }
+    if let Some(r) = reset {
+        v["reset"] = json!(r);
+    }
+    v
+}
+
+impl HubEnd {
+    /// The next request, waiting at most `within` (a paused-clock cell's own
+    /// bound); `None` once the client closed or the time passed.
+    pub async fn recv_within(&mut self, within: Duration) -> Option<Value> {
+        let line = tokio::time::timeout(within, self.lines.next_line())
+            .await
+            .ok()?
+            .ok()
+            .flatten()?;
+        Some(serde_json::from_str(&line).unwrap_or_else(|e| panic!("a request {line:?}: {e}")))
+    }
+
+    /// A lane's splice: the hub's `hello`, then `session.connect` for
+    /// `host_id` and the host `hello` pipelined behind it, both answered.
+    /// Returns the connect request.
+    pub async fn splice(&mut self, host_id: &str) -> Value {
+        self.splice_answered_by(host_id, host_id).await
+    }
+
+    /// [`HubEnd::splice`] for `host_id`, the host `hello` answered by
+    /// `answering` — a misrouting hub when the two differ.
+    pub async fn splice_answered_by(&mut self, host_id: &str, answering: &str) -> Value {
+        self.hello("0a1b2c3d4e5f", full_hub_capabilities()).await;
+        let connect = self.expect("session.connect").await;
+        assert_eq!(
+            connect["params"],
+            json!({"sessionId": host_id}),
+            "connect by hostId"
+        );
+        let hello = self.expect("hello").await;
+        self.reply(&connect, json!({})).await;
+        self.reply(&hello, host_hello_result(answering)).await;
+        connect
+    }
+
+    /// Read `sessions.list` and answer with the one `row`.
+    pub async fn listed(&mut self, row: Value) -> Value {
+        let req = self.expect("sessions.list").await;
+        self.reply(
+            &req,
+            json!({"epoch": "0123456789ab", "cursor": 1, "sessions": [row]}),
+        )
+        .await;
+        req
+    }
+
+    /// Read `session.attach` and answer with `result` — then the lane's
+    /// fenced read (Amendment A11) with an empty registry and a
+    /// `session.sync` at the reply's `after.seq`. Returns the attach request.
+    pub async fn attached(&mut self, result: Value) -> Value {
+        let seq = result["after"]["seq"].as_u64().unwrap_or(0);
+        let req = self.attached_only(result).await;
+        self.registry(json!([]), seq).await;
+        req
+    }
+
+    /// Read `session.attach` and answer with `result`, nothing more.
+    pub async fn attached_only(&mut self, result: Value) -> Value {
+        let req = self.expect("session.attach").await;
+        self.reply(&req, result).await;
+        req
+    }
+
+    /// The lane's fenced read after an attach: `asks.list` answered with
+    /// `records`' summaries, `asks.get` for each answered with its record (in
+    /// order), then `session.sync` answered at `seq`. Nothing at all when the
+    /// lane let the connection go instead (a fault in the reply).
+    pub async fn registry(&mut self, records: Value, seq: u64) {
+        if !self.registry_reads(records).await {
+            return;
+        }
+        let sync = self.expect("session.sync").await;
+        self.reply(&sync, json!({ "seq": seq })).await;
+    }
+
+    /// The registry half of it: `asks.list` answered with `records`'
+    /// summaries, then `asks.get` for each, in order. `false` when the lane
+    /// closed instead of asking.
+    pub async fn registry_reads(&mut self, records: Value) -> bool {
+        let Some(list) = self.recv().await else {
+            return false;
+        };
+        assert_eq!(list["method"], "asks.list", "the registry read: {list}");
+        let records = records.as_array().cloned().unwrap_or_default();
+        let summaries: Vec<Value> = records
+            .iter()
+            .map(|r| json!({"id": r["id"], "kind": r["kind"], "label": "", "openedAt": r["openedAt"]}))
+            .collect();
+        self.reply(&list, json!({ "asks": summaries })).await;
+        for record in &records {
+            let get = self.expect("asks.get").await;
+            assert_eq!(
+                get["params"]["askId"], record["id"],
+                "the listed ids, in order"
+            );
+            self.reply(&get, json!({ "ask": record })).await;
+        }
+        true
+    }
+
+    /// One notification.
+    pub async fn notify(&mut self, method: &str, params: Value) {
+        self.send(&json!({"jsonrpc": "2.0", "method": method, "params": params}))
+            .await;
+    }
+
+    /// One `event` notification.
+    pub async fn event(&mut self, subscription: &str, seq: u64, event: Value) {
+        self.notify(
+            "event",
+            json!({"subscription": subscription, "seq": seq, "event": event}),
+        )
+        .await;
+    }
+
+    /// One `synchronized` notification.
+    pub async fn synchronized(&mut self, subscription: &str, seq: u64) {
+        self.notify(
+            "synchronized",
+            json!({"subscription": subscription, "seq": seq}),
+        )
+        .await;
+    }
+}
+
+// ---- a tee, for the live recording ----
+
+/// One line a connection carried: which connection (in dial order), which
+/// way, and the line.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TeeLine {
+    pub conn: usize,
+    /// `"c2s"` or `"s2c"`, as craze's own fixtures say.
+    pub dir: &'static str,
+    pub line: String,
+}
+
+/// A dial around another that records every line each connection writes and
+/// reads, in order per direction — the live recording's capture. It records;
+/// it never rewrites (the recording's guard refuses, it does not scrub).
+pub struct TeeDial {
+    inner: Arc<dyn CrazeDial>,
+    lines: Arc<Mutex<Vec<TeeLine>>>,
+    next: AtomicUsize,
+}
+
+impl TeeDial {
+    pub fn new(inner: Arc<dyn CrazeDial>) -> Arc<TeeDial> {
+        Arc::new(TeeDial {
+            inner,
+            lines: Arc::default(),
+            next: AtomicUsize::new(0),
+        })
+    }
+
+    /// Every line recorded so far.
+    pub fn lines(&self) -> Vec<TeeLine> {
+        lock(&self.lines).clone()
+    }
+}
+
+impl CrazeDial for TeeDial {
+    fn dial(&self) -> BoxFuture<'static, Result<CrazeStream, DialError>> {
+        let conn = self.next.fetch_add(1, Ordering::SeqCst);
+        let inner = self.inner.dial();
+        let lines = Arc::clone(&self.lines);
+        Box::pin(async move {
+            let (r, w, tail, exit) = inner.await?.into_parts();
+            let r: BoxRead = Box::new(TeeRead {
+                inner: r,
+                tee: Tee::new(conn, "s2c", Arc::clone(&lines)),
+            });
+            let w: BoxWrite = Box::new(TeeWrite {
+                inner: w,
+                tee: Tee::new(conn, "c2s", lines),
+            });
+            Ok(CrazeStream::from_parts(r, w, tail, exit))
+        })
+    }
+}
+
+/// One direction's line splitter.
+struct Tee {
+    conn: usize,
+    dir: &'static str,
+    buf: Vec<u8>,
+    lines: Arc<Mutex<Vec<TeeLine>>>,
+}
+
+impl Tee {
+    fn new(conn: usize, dir: &'static str, lines: Arc<Mutex<Vec<TeeLine>>>) -> Tee {
+        Tee {
+            conn,
+            dir,
+            buf: Vec::new(),
+            lines,
+        }
+    }
+
+    fn take(&mut self, bytes: &[u8]) {
+        self.buf.extend_from_slice(bytes);
+        while let Some(pos) = self.buf.iter().position(|&b| b == b'\n') {
+            let line: Vec<u8> = self.buf.drain(..=pos).collect();
+            let text = String::from_utf8_lossy(&line[..line.len() - 1])
+                .trim_end_matches('\r')
+                .to_string();
+            lock(&self.lines).push(TeeLine {
+                conn: self.conn,
+                dir: self.dir,
+                line: text,
+            });
+        }
+    }
+}
+
+struct TeeRead {
+    inner: BoxRead,
+    tee: Tee,
+}
+
+impl AsyncRead for TeeRead {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let before = buf.filled().len();
+        let this = &mut *self;
+        let poll = std::pin::Pin::new(&mut this.inner).poll_read(cx, buf);
+        if let std::task::Poll::Ready(Ok(())) = &poll {
+            this.tee.take(&buf.filled()[before..]);
+        }
+        poll
+    }
+}
+
+struct TeeWrite {
+    inner: BoxWrite,
+    tee: Tee,
+}
+
+impl AsyncWrite for TeeWrite {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        let this = &mut *self;
+        let poll = std::pin::Pin::new(&mut this.inner).poll_write(cx, buf);
+        if let std::task::Poll::Ready(Ok(n)) = &poll {
+            this.tee.take(&buf[..*n]);
+        }
+        poll
+    }
+
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
 }

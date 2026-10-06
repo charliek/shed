@@ -1,6 +1,6 @@
 //! [`CrazeSource`] — a machine's craze hub as the contract's MACHINE-level
 //! half (plan 025 §3.3.3, P8, P11, P14): its sessions listed live, what a create
-//! can start, the create, and (from C8) a lane opened on a row.
+//! can start, the create, and a lane opened on a row ([`crate::lane`]).
 //!
 //! Every call dials its OWN connection through the client's [`CrazeDial`]
 //! (D10, P8): the hub answers one request at a time, in order (craze
@@ -20,7 +20,8 @@
 //!
 //! - A roster `reset` other than `hub_closing` (`slow_consumer`, `omitted`, or
 //!   one this build does not know) **resubscribes on the same connection** — a
-//!   fresh `Reset … Ready`. `hub_closing`, EOF or a read error is
+//!   fresh `Reset … Ready`. `hub_closing`, EOF, a read error, or a dial that
+//!   handed back no connection within [`DIAL_DEADLINE`] is
 //!   `Offline{Unreachable}` and a redial with backoff ([`BACKOFF_BASE`] →
 //!   [`BACKOFF_MAX`], `shed_core::lane::backoff`, back to the floor once a
 //!   cycle reached `Ready`). A new hub — a new `epoch` — reseeds by
@@ -53,8 +54,9 @@
 //! under a [`CREATE_DEADLINE`] that covers the write as well as the reply (a
 //! hub that stops reading mid-prompt is an unknown outcome, not a hang). **The retry rule** (craze joins a running duplicate
 //! and replays the stored answer — failures included — for 10 minutes, across
-//! a hub restart, PM "`session.create`"): a dropped connection or the deadline
-//! is an UNKNOWN outcome, retried ONCE under the same `requestId` on a fresh
+//! a hub restart, PM "`session.create`"): a dropped connection, the deadline,
+//! or a dial that handed back no connection within [`DIAL_DEADLINE`] is an
+//! UNKNOWN outcome, retried ONCE under the same `requestId` on a fresh
 //! connection; a second unknown is [`errors::outcome_unknown`] and the caller
 //! keeps the id ([`errors::is_outcome_unknown`]). Any DEFINITE answer — a
 //! result, or any refusal, `unavailable` included — ends that id's life: the
@@ -64,9 +66,19 @@
 //!
 //! A row's id is its `hostId` — the key the roster is keyed by, and what the
 //! lane's `session.connect` is given. The mapping is [`lane_session`].
+//!
+//! # `open`
+//!
+//! Binding, not dialling: a [`CrazeLane`] on the row's hostId, carrying the
+//! row and its craze `sessionId` when this source holds the row (every
+//! subscription of this source keeps the rows its roster lists — seeded,
+//! upserted, removed — for exactly this). An id the source never listed opens
+//! a lane whose `session()` is `UnknownSession` until a subscription of its own
+//! reads the host's row (plan 025 §3.3.4).
 
+use std::collections::HashMap;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use shed_core::lane::backoff::{jittered, next_backoff};
@@ -78,16 +90,17 @@ use shed_core::lane::{
 };
 use shed_core::rc::RcActivity;
 
-use crate::conn::{CallError, Conn, HubHello, Notifications, HELLO_DEADLINE};
-use crate::dial::{connect_hub, CrazeDial, DialError};
+use crate::conn::{lock, CallError, Conn, HubHello, Notifications, HELLO_DEADLINE};
+use crate::dial::{connect_hub, CrazeDial, DialError, DIAL_DEADLINE};
 use crate::errors::{create_error, lane_error, outcome_unknown};
+use crate::lane::{CrazeLane, LaneTimings};
 use crate::wire::{
     self, method, notify, ClientInfo, ConnCapabilities, CreateOptionsResult, CreateParams,
-    CreateResult, Empty, ResetParams, RosterParams, RosterRow, SubscribeResult,
+    CreateResult, Empty, HostRow, ResetParams, RosterParams, RosterRow, SubscribeResult,
 };
 
 /// The agent token: [`AgentSource::kind`], `SourceCapabilities::kind` and
-/// (from C8) `LaneCapabilities::kind`.
+/// `LaneCapabilities::kind`.
 pub const KIND: &str = "craze";
 
 /// The roster's reconnect floor.
@@ -108,6 +121,8 @@ pub const REQUEST_DEADLINE: Duration = Duration::from_secs(30);
 /// them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Timings {
+    /// How long a dial may take to hand back a stream ([`DIAL_DEADLINE`]).
+    pub dial: Duration,
     /// How long a `hello` may take to be answered ([`HELLO_DEADLINE`]).
     pub hello: Duration,
     /// [`REQUEST_DEADLINE`].
@@ -123,6 +138,7 @@ pub struct Timings {
 impl Default for Timings {
     fn default() -> Timings {
         Timings {
+            dial: DIAL_DEADLINE,
             hello: HELLO_DEADLINE,
             request: REQUEST_DEADLINE,
             create: CREATE_DEADLINE,
@@ -158,14 +174,21 @@ pub fn valid_request_id(id: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
 }
 
+/// The rows a source's roster listed, by hostId: the row as the contract's,
+/// and the craze `sessionId` a lane opened on it carries.
+type Rows = Arc<Mutex<HashMap<String, (LaneSession, String)>>>;
+
 /// One machine's craze hub, reached through a client-supplied dial.
 ///
-/// Cheap to clone; every clone dials through the same dialer.
+/// Cheap to clone; every clone dials through the same dialer and shares the
+/// rows its subscriptions list.
 #[derive(Clone)]
 pub struct CrazeSource {
     dial: Arc<dyn CrazeDial>,
     client: ClientInfo,
     timings: Timings,
+    lane_timings: LaneTimings,
+    rows: Rows,
 }
 
 impl std::fmt::Debug for CrazeSource {
@@ -186,6 +209,8 @@ impl CrazeSource {
             dial,
             client: ClientInfo::shed(client_name),
             timings: Timings::default(),
+            lane_timings: LaneTimings::default(),
+            rows: Arc::default(),
         }
     }
 
@@ -195,13 +220,31 @@ impl CrazeSource {
         self
     }
 
+    /// Open lanes on other clocks and bounds (tests).
+    pub fn with_lane_timings(mut self, timings: LaneTimings) -> CrazeSource {
+        self.lane_timings = timings;
+        self
+    }
+
+    /// The row this source's roster lists under `host_id`, with its craze
+    /// session id.
+    pub fn listed(&self, host_id: &str) -> Option<(LaneSession, String)> {
+        lock(&self.rows).get(host_id).cloned()
+    }
+
     /// Who this source says it is.
     pub fn client(&self) -> &ClientInfo {
         &self.client
     }
 
     async fn connect(&self) -> Result<(Conn, Notifications, HubHello), DialError> {
-        connect_hub(&*self.dial, &self.client, self.timings.hello).await
+        connect_hub(
+            &*self.dial,
+            &self.client,
+            self.timings.dial,
+            self.timings.hello,
+        )
+        .await
     }
 
     /// One create attempt. `retry` says an earlier attempt's outcome is
@@ -212,6 +255,10 @@ impl CrazeSource {
             Err(e) if retry => {
                 return Attempt::Unknown(format!("the retry could not reach craze: {e}"))
             }
+            // A dial that never came back: its caller must not guess, so it
+            // is an unknown outcome — the one retry under the same id (the
+            // module doc of `crate::dial`).
+            Err(e @ DialError::TimedOut(_)) => return Attempt::Unknown(e.to_string()),
             Err(e) => return Attempt::Done(Err(e.into_lane_error())),
         };
         if !hello.capabilities.session_create {
@@ -300,6 +347,20 @@ pub fn lane_create_options(r: &CreateOptionsResult) -> LaneCreateOptions {
     }
 }
 
+/// A host row's WORK activity — `foreignTurn`, else its `activity` — the
+/// roster mapping without its approval override, which the lane's own fold
+/// supplies from its book.
+pub(crate) fn work_activity(row: &HostRow) -> RcActivity {
+    if row.foreign_turn {
+        return RcActivity::Working;
+    }
+    match row.activity.as_deref() {
+        Some("working" | "starting" | "replaying") => RcActivity::Working,
+        Some("idle") => RcActivity::Idle,
+        _ => RcActivity::Unknown,
+    }
+}
+
 /// A roster row as the contract's [`LaneSession`] (plan 025 §3.3.3):
 ///
 /// - `id` = `hostId` (P11); `title` = the row's title, else the workspace's
@@ -333,12 +394,7 @@ pub fn lane_session(r: &RosterRow) -> LaneSession {
         _ if pending > 0 => RcActivity::NeedsApproval,
         None => RcActivity::Unknown,
         Some(_) if r.status == "unreachable" => RcActivity::Unknown,
-        Some(w) if w.foreign_turn => RcActivity::Working,
-        Some(w) => match w.activity.as_deref() {
-            Some("working" | "starting" | "replaying") => RcActivity::Working,
-            Some("idle") => RcActivity::Idle,
-            _ => RcActivity::Unknown,
-        },
+        Some(w) => work_activity(w),
     };
     let since = row
         .and_then(|w| w.since.as_deref())
@@ -446,18 +502,22 @@ impl AgentSource for CrazeSource {
             Attempt::Unknown(_) => match self.create_once(&params, true).await {
                 Attempt::Done(answer) => answer,
                 Attempt::Unknown(why) => Err(outcome_unknown(&format!(
-                    "the connection to craze dropped twice during the create ({why}); it may have started a session — check the session list, or try again with the same request id, which craze answers with that session"
+                    "craze did not answer the create, twice ({why}); it may have started a session — check the session list, or try again with the same request id, which craze answers with that session"
                 ))),
             },
         }
     }
 
-    /// The craze lane is plan 025 C8; this build lists and creates craze
-    /// sessions, and opens none.
-    async fn open(&self, _session_id: &str) -> Result<Arc<dyn AgentLane>, LaneError> {
-        Err(LaneError::Failed(
-            "the craze lane arrives in plan 025 C8: this build lists and creates craze sessions, and does not open them yet".to_string(),
-        ))
+    /// A [`CrazeLane`] bound to the row's hostId — and to the row and its
+    /// craze session id when this source lists it. No I/O (the module doc).
+    async fn open(&self, session_id: &str) -> Result<Arc<dyn AgentLane>, LaneError> {
+        Ok(Arc::new(CrazeLane::new(
+            Arc::clone(&self.dial),
+            self.client.clone(),
+            session_id,
+            self.listed(session_id),
+            self.lane_timings,
+        )))
     }
 }
 
@@ -685,6 +745,13 @@ impl RosterPump {
         caps: &SourceCapabilities,
         reason: &str,
     ) -> Result<(), End> {
+        // The rows a lane opened on this source binds to: the whole roster,
+        // replaced before the seed is said, so a client that opens a lane on a
+        // row it was just told of finds it.
+        *lock(&self.source.rows) = rows
+            .iter()
+            .map(|r| (r.host_id.clone(), (lane_session(r), r.session_id.clone())))
+            .collect();
         self.generation += 1;
         let generation = self.generation;
         self.emit(SourceEvent::Reset {
@@ -783,10 +850,21 @@ impl RosterPump {
     /// One `roster` notification: upserts as `Session`, removes — host ids —
     /// as `Removed`.
     fn apply(&self, upserts: &[RosterRow], removes: &[String]) -> Result<(), End> {
-        for row in upserts {
-            self.emit(SourceEvent::Session {
-                session: lane_session(row),
-            })?;
+        let sessions: Vec<LaneSession> = upserts.iter().map(lane_session).collect();
+        {
+            let mut held = lock(&self.source.rows);
+            for (row, session) in upserts.iter().zip(&sessions) {
+                held.insert(
+                    row.host_id.clone(),
+                    (session.clone(), row.session_id.clone()),
+                );
+            }
+            for host_id in removes {
+                held.remove(host_id);
+            }
+        }
+        for session in sessions {
+            self.emit(SourceEvent::Session { session })?;
         }
         for host_id in removes {
             self.emit(SourceEvent::Removed {

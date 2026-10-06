@@ -1,0 +1,145 @@
+{
+  "activity": [
+    "working",
+    "idle",
+    "working",
+    "idle"
+  ],
+  "approvals": [],
+  "attach": {
+    "incarnation": "01a1106b-d8bb-71cb-a746-56f3281b8198",
+    "seq": 1,
+    "truncated": false
+  },
+  "capabilities": {
+    "approvals": true,
+    "cancel": true,
+    "history_cursor": true,
+    "interject": true,
+    "kind": "craze",
+    "settings": true,
+    "stop": true
+  },
+  "end": "session_closed",
+  "events": 51,
+  "recording": "0.1.0+gx",
+  "rows": [
+    {
+      "role": "user",
+      "seq": 1,
+      "text": "Reply with exactly one word: pong",
+      "ts": "2026-10-06T08:54:26.953338948Z",
+      "type": "text"
+    },
+    {
+      "role": "assistant",
+      "seq": 2,
+      "text": "The user wants me to reply with exactly one word: pong",
+      "ts": "2026-10-06T08:54:32.501769049Z",
+      "type": "reasoning"
+    },
+    {
+      "role": "assistant",
+      "seq": 3,
+      "text": "pong",
+      "ts": "2026-10-06T08:54:32.504128858Z",
+      "type": "text"
+    },
+    {
+      "role": "user",
+      "seq": 4,
+      "text": "Use your shell tool to run `echo shed-craze-live` and then tell me, in one short sentence, what it printed.",
+      "ts": "2026-10-06T08:54:32.520802107Z",
+      "type": "text"
+    },
+    {
+      "role": "assistant",
+      "seq": 5,
+      "text": "The user wants me to run a simple echo command and report what it printed.",
+      "ts": "2026-10-06T08:54:37.422397807Z",
+      "type": "reasoning"
+    },
+    {
+      "role": "tool",
+      "seq": 6,
+      "tool": {
+        "detail": "run_terminal_command",
+        "name": "run_terminal_command"
+      },
+      "ts": "2026-10-06T08:54:37.452311043Z",
+      "type": "tool_use"
+    },
+    {
+      "role": "tool",
+      "seq": 7,
+      "text": "shed-craze-live\n",
+      "tool": {
+        "detail": "Execute `echo shed-craze-live`",
+        "name": "run_terminal_command"
+      },
+      "ts": "2026-10-06T08:54:37.468485128Z",
+      "type": "tool_result"
+    },
+    {
+      "role": "assistant",
+      "seq": 8,
+      "text": "It printed `shed-craze-live`.",
+      "ts": "2026-10-06T08:54:41.813297107Z",
+      "type": "text"
+    }
+  ],
+  "settings": {
+    "mode": "default",
+    "model": "glm-5.3-flash",
+    "models": [
+      {
+        "id": "glm-5.3-flash",
+        "name": "GLM 5.3 Flash (Z.AI)"
+      },
+      {
+        "id": "grok-4.6",
+        "name": "Grok 4.6"
+      },
+      {
+        "id": "grok-4.5",
+        "name": "Grok 4.5"
+      }
+    ],
+    "modes": [
+      {
+        "id": "default",
+        "name": "Default"
+      },
+      {
+        "id": "plan",
+        "name": "Plan"
+      },
+      {
+        "id": "ask",
+        "name": "Ask"
+      }
+    ],
+    "options": [
+      {
+        "category": "thought_level",
+        "current": "high",
+        "id": "reasoning_effort",
+        "name": "Reasoning Effort",
+        "values": [
+          {
+            "id": "low",
+            "name": "Low"
+          },
+          {
+            "id": "high",
+            "name": "High"
+          },
+          {
+            "id": "max",
+            "name": "Max"
+          }
+        ]
+      }
+    ]
+  }
+}

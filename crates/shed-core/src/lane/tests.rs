@@ -757,6 +757,49 @@ async fn wait_drained_resolves_only_when_every_slot_is_free() {
 
 /// A subscriber that went away ends BOTH awaits — the adapter then stops
 /// silently, with no `Down` and no reseed, exactly as its `is_closed` checks
+/// A terminal path's last rows: [`Publisher::publish_waiting`] WAITS for room
+/// under a full queue (never `Lagged`, never dropped), keeps the publisher, and
+/// the frames it waited with land in order ahead of the terminal one.
+#[tokio::test]
+async fn publish_waiting_waits_for_room_and_keeps_the_order() {
+    let (tx, mut rx) = LanePublisher::channel();
+    for n in 0..LANE_CHANNEL_CAPACITY as u64 {
+        assert_eq!(tx.publish(lane_frame(n)), Publish::Sent);
+    }
+    let last_row = lane_frame(u64::MAX);
+    let sending = tokio::spawn({
+        let last_row = last_row.clone();
+        async move {
+            tx.publish_waiting(last_row)
+                .await
+                .expect("the subscriber is there");
+            tx.publish_final(LaneEvent::Down {
+                reason: "done".to_string(),
+            })
+            .await;
+        }
+    });
+    tokio::task::yield_now().await;
+    assert!(
+        !sending.is_finished(),
+        "publish_waiting must await room, not drop the row"
+    );
+    let mut frames = Vec::new();
+    while let Some(ev) = tokio::time::timeout(RECV_TIMEOUT, rx.recv())
+        .await
+        .expect("the waited frames arrive once the queue drains")
+    {
+        frames.push(ev);
+    }
+    assert_eq!(frames.len(), LANE_CHANNEL_CAPACITY + 2);
+    assert_eq!(frames[LANE_CHANNEL_CAPACITY], last_row, "the row, then…");
+    assert!(
+        matches!(frames.last(), Some(LaneEvent::Down { .. })),
+        "…the Down, last"
+    );
+    sending.await.expect("the sender task finishes");
+}
+
 /// already do.
 async fn a_dropped_receiver_ends_everything<T>(
     (tx, rx): (Publisher<T>, mpsc::Receiver<T>),
@@ -777,7 +820,13 @@ async fn a_dropped_receiver_ends_everything<T>(
             .expect("wait_drained must not hang on a closed channel"),
         Err(Closed),
     );
-    tokio::time::timeout(RECV_TIMEOUT, tx.publish_final(frame(3)))
+    assert_eq!(
+        tokio::time::timeout(RECV_TIMEOUT, tx.publish_waiting(frame(3)))
+            .await
+            .expect("publish_waiting must not hang on a closed channel"),
+        Err(Closed),
+    );
+    tokio::time::timeout(RECV_TIMEOUT, tx.publish_final(frame(4)))
         .await
         .expect("publish_final must return on a closed channel rather than hang");
 }

@@ -17,10 +17,15 @@
 //! vendored WIRE fixtures write them, so a request this crate composes is the
 //! fixture's `c2s` line field for field (`tests/wire.rs`).
 //!
-//! This module composes `hello` (the hub's), `sessions.subscribe`,
-//! `sessions.createOptions` and `session.create` — the source's half (plan 025
-//! C7). The lane's methods (`session.connect`, the host `hello`, `attach`, the
-//! verbs) join it with the lane (C8).
+//! This module composes `hello` (the hub's and, through the splice, the
+//! host's), `sessions.subscribe`, `sessions.createOptions` and
+//! `session.create` — the source's half (plan 025 C7) — and the lane's (C8):
+//! `session.connect`, `sessions.list` on a host, `session.attach`,
+//! `session.snapshot`, `asks.get`, and the verbs `session.prompt`,
+//! `session.cancel`, `asks.answer` and `session.stop`. (`session.set` is the
+//! settings milestone's, C11.) The attachment's notifications (`event`,
+//! `synchronized`, `ready`, `presence`, `reset`) decode here as envelopes; an
+//! event's body is the fold's to read (`crate::fold`).
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -54,25 +59,56 @@ pub mod method {
     pub const SESSIONS_SUBSCRIBE: &str = "sessions.subscribe";
     pub const SESSIONS_CREATE_OPTIONS: &str = "sessions.createOptions";
     pub const SESSION_CREATE: &str = "session.create";
+    // The lane's (C8).
+    pub const SESSION_CONNECT: &str = "session.connect";
+    pub const SESSIONS_LIST: &str = "sessions.list";
+    pub const SESSION_ATTACH: &str = "session.attach";
+    pub const SESSION_SNAPSHOT: &str = "session.snapshot";
+    pub const ASKS_GET: &str = "asks.get";
+    /// The ENGINE's ask registry: every open, non-automatic ask, whatever its
+    /// agent (Amendment A11).
+    pub const ASKS_LIST: &str = "asks.list";
+    /// The reply barrier with no command: the committed head, every event
+    /// through it already queued to this connection's attachment.
+    pub const SESSION_SYNC: &str = "session.sync";
+    pub const SESSION_PROMPT: &str = "session.prompt";
+    pub const SESSION_CANCEL: &str = "session.cancel";
+    pub const ASKS_ANSWER: &str = "asks.answer";
+    pub const SESSION_STOP: &str = "session.stop";
 }
 
-/// The notifications the source reads.
+/// The notifications this crate reads: the roster's (the source) and an
+/// attachment's (the lane).
 pub mod notify {
     pub const ROSTER: &str = "roster";
     pub const RESET: &str = "reset";
+    pub const EVENT: &str = "event";
+    pub const SYNCHRONIZED: &str = "synchronized";
+    pub const READY: &str = "ready";
+    pub const PRESENCE: &str = "presence";
 }
 
-/// A roster subscription's `reset` reasons (PM "The hub's roster").
+/// The `reset` reasons (PM "Notifications"): a roster subscription's and an
+/// attachment's, one open set.
 pub mod reset {
-    /// A notification's write blocked for 10 s: subscribe again, same
-    /// connection.
+    /// A notification's write blocked (the roster), or the subscriber fell
+    /// behind its budget (an attachment): subscribe again, same connection.
     pub const SLOW_CONSUMER: &str = "slow_consumer";
     /// The roster's completeness changed (it crossed 512 rows): subscribe
-    /// again, same connection, and read `truncated` from the new reply.
+    /// again, same connection, and read `truncated` from the new reply. On an
+    /// attachment: a record no client could fold — re-attach with no cursor,
+    /// unless it is the session's closing reset.
     pub const OMITTED: &str = "omitted";
     /// The hub is shutting down and closes the connection: reconnect, and the
     /// new hub's `epoch` reseeds.
     pub const HUB_CLOSING: &str = "hub_closing";
+    /// The journal leg of a cursor replay failed: re-attach with no cursor.
+    pub const REPLAY_FAILED: &str = "replay_failed";
+    /// The host swapped its engine for a new session: the connection closes;
+    /// reconnect, `hello` afresh, re-learn the session id, attach anew.
+    pub const SESSION_REPLACED: &str = "session_replaced";
+    /// The session is over: the connection closes, nothing to reconnect to.
+    pub const SESSION_CLOSED: &str = "session_closed";
 }
 
 /// craze's closed `data.code` set (PM "Codes and retry") — what a client
@@ -194,6 +230,88 @@ pub struct CreateParams {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub provider: Option<String>,
     pub request_id: String,
+}
+
+// ---- outbound: the lane's (C8) ----
+
+/// `session.connect`'s params: the hub's splice, by the row's `hostId` (plan
+/// 025 §3.3.4 — exact, and never `ambiguous_session` should a session ever be
+/// re-hosted).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConnectParams {
+    pub session_id: String,
+}
+
+/// The params of a session-scoped read that takes nothing else
+/// (`session.snapshot` at its default budget).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionParams {
+    pub session_id: String,
+}
+
+/// Where a client already is in a session's stream: the log incarnation and
+/// the seq of the last event it folded.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Cursor {
+    pub incarnation: String,
+    pub seq: u64,
+}
+
+/// `session.attach`'s params: the session, and the cursor when there is one to
+/// offer. `when` is never sent — its default, `"ready"`, is what this client
+/// always wants (a `session/load` replay then arrives as a snapshot, never as
+/// a live burst) — and neither is `budget`: the host's default holds the seed
+/// a client can render.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AttachParams {
+    pub session_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<Cursor>,
+}
+
+/// `asks.get`'s params.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AskParams {
+    pub session_id: String,
+    pub ask_id: String,
+}
+
+/// `session.prompt`'s params: text alone, never `fromRow` (no client of this
+/// crate edits craze's queue).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PromptParams {
+    pub session_id: String,
+    pub command_id: String,
+    pub text: String,
+    /// `queue` | `interject` (plan 025 §3.3.7's send-mode mapping).
+    pub mode: &'static str,
+}
+
+/// The params of a mutating verb that names nothing but itself:
+/// `session.cancel` (no `turnId` — the current turn, §3.3.7) and
+/// `session.stop`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CommandParams {
+    pub session_id: String,
+    pub command_id: String,
+}
+
+/// `asks.answer`'s params. `answer` is the one free-form member: its shape is
+/// the ask kind's (`{optionId}`, `{answers}`, `{accept}`…), composed by
+/// `crate::lane::answer_body` from the contract's answer.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AnswerParams {
+    pub session_id: String,
+    pub command_id: String,
+    pub ask_id: String,
+    pub answer: Value,
 }
 
 // ---- inbound: the envelope ----
@@ -514,6 +632,243 @@ pub struct CreateResult {
     pub prompt_error: Option<String>,
 }
 
+// ---- inbound: the lane's (C8) ----
+
+/// The session info document (PM "The session info document"): an attach
+/// reply's `session`, a `ready` notification's, and the first half of a host's
+/// `sessions.list` row. Only what this crate reads; every member defaults.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionInfo {
+    /// The durable craze session id every session-scoped call carries.
+    #[serde(default)]
+    pub session_id: String,
+    #[serde(default)]
+    pub provider_session_id: String,
+    /// The event log's id: a cursor's first half.
+    #[serde(default)]
+    pub incarnation: String,
+    #[serde(default)]
+    pub host_id: String,
+    #[serde(default)]
+    pub workspace: String,
+    #[serde(default)]
+    pub provider: ProviderInfo,
+    #[serde(default)]
+    pub catalogs: Catalogs,
+    #[serde(default)]
+    pub capabilities: SessionCapabilities,
+    /// `bypass` | `prompt`; absent when the host does not say.
+    #[serde(default)]
+    pub permission_mode: Option<String>,
+    #[serde(default)]
+    pub started_at: Option<String>,
+}
+
+/// `{name, label}`: the provider id (`cursor`, `grok`, `gx`, `native`) and the
+/// label a client shows.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+pub struct ProviderInfo {
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub label: String,
+}
+
+/// The models and modes a session can move to — empty until it is ready — and
+/// the model list's revision (absent while `0`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+pub struct Catalogs {
+    #[serde(default)]
+    pub models: Vec<CatalogModel>,
+    #[serde(default)]
+    pub modes: Vec<ModeInfo>,
+    #[serde(default)]
+    pub revision: u64,
+}
+
+/// One model: the info document's, and a `catalog` section's (one shape).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+pub struct CatalogModel {
+    #[serde(default)]
+    pub id: String,
+    #[serde(default)]
+    pub name: String,
+    /// Its rank in the native provider's model memory (`1` the most recent);
+    /// absent for a model not remembered.
+    #[serde(default)]
+    pub recent: Option<u32>,
+}
+
+/// One mode.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+pub struct ModeInfo {
+    #[serde(default)]
+    pub id: String,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub description: Option<String>,
+}
+
+/// A SESSION's capabilities (PM "Capabilities"), the members this crate maps
+/// onto `LaneCapabilities` (§3.3.9). Every member absent reads `false`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionCapabilities {
+    #[serde(default)]
+    pub interject: bool,
+    #[serde(default)]
+    pub cancel: bool,
+    #[serde(default)]
+    pub ask_cards: bool,
+    #[serde(default)]
+    pub plan_cards: bool,
+    #[serde(default)]
+    pub approvals: bool,
+    #[serde(default)]
+    pub history_cursor: bool,
+    #[serde(default)]
+    pub stop: bool,
+    #[serde(default)]
+    pub row_facts: bool,
+    #[serde(default)]
+    pub presence: bool,
+}
+
+/// `session.attach`'s result. `subscription` and `after` are required — an
+/// attach reply without them cannot be placed, and craze's own client refuses
+/// one the same way.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct AttachResult {
+    pub subscription: String,
+    #[serde(default)]
+    pub session: SessionInfo,
+    /// The session's start has run (always, for a `when: "ready"` attach that
+    /// did not race the start).
+    #[serde(default)]
+    pub ready: bool,
+    /// Where the stream continues: the cursor when honoured, else the
+    /// snapshot's cut.
+    pub after: Cursor,
+    /// Present exactly when the cursor was not honoured (refused, or none
+    /// given). Kept raw: the fold reads it.
+    #[serde(default)]
+    pub snapshot: Option<Value>,
+    /// Why a cursor that was given was refused.
+    #[serde(default)]
+    pub reset: Option<String>,
+}
+
+/// A host's `sessions.list` result: its one row (a `sessionRow` — the info
+/// document and the live facts — read on its own).
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+pub struct SessionsListResult {
+    #[serde(default)]
+    pub epoch: String,
+    #[serde(default)]
+    pub cursor: u64,
+    #[serde(default)]
+    pub sessions: Vec<Value>,
+}
+
+/// An `event` notification: one committed event, its body kept raw for the
+/// fold.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct EventParams {
+    #[serde(default)]
+    pub subscription: String,
+    pub seq: u64,
+    pub event: Value,
+}
+
+/// A `synchronized` notification: the stream has delivered through this
+/// attachment's cutoff.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct SyncParams {
+    #[serde(default)]
+    pub subscription: String,
+    pub seq: u64,
+}
+
+/// A `ready` notification: the session's start finished — or failed.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReadyParams {
+    #[serde(default)]
+    pub subscription: String,
+    #[serde(default)]
+    pub session: SessionInfo,
+    #[serde(default)]
+    pub start_failed: bool,
+    #[serde(default)]
+    pub err: Option<String>,
+}
+
+/// A `presence` notification: how many clients are attached now.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct PresenceParams {
+    #[serde(default)]
+    pub subscription: String,
+    #[serde(default)]
+    pub attached: u32,
+}
+
+/// `asks.get`'s result.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct AskGetResult {
+    pub ask: AskRecord,
+}
+
+/// `asks.list`'s result: the engine registry's open asks, as summaries (no
+/// body — `asks.get` reads one whole).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+pub struct AsksListResult {
+    #[serde(default)]
+    pub asks: Vec<AskSummary>,
+}
+
+/// One open ask as `asks.list` carries it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AskSummary {
+    pub id: String,
+    #[serde(default)]
+    pub kind: String,
+    #[serde(default)]
+    pub label: String,
+    #[serde(default)]
+    pub opened_at: Option<String>,
+}
+
+/// `session.sync`'s result: the committed head at the call.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+pub struct SyncResult {
+    pub seq: u64,
+}
+
+/// An ask record's `status` while it is still open.
+pub const ASK_OPEN: &str = "open";
+
+/// One ask's record: its opening exactly as offered (`body`, kept raw for the
+/// fold), whether it is still open, and whether a body string was cut.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AskRecord {
+    pub id: String,
+    #[serde(default)]
+    pub kind: String,
+    /// `open` | `resolved`.
+    #[serde(default)]
+    pub status: String,
+    #[serde(default)]
+    pub body: Value,
+    #[serde(default)]
+    pub opened_at: Option<String>,
+    #[serde(default)]
+    pub truncated: bool,
+}
+
 // ---- inbound: the roster row ----
 
 /// One roster row (PM "The hub's roster"): what the hub knows about one host,
@@ -663,6 +1018,38 @@ impl RosterRow {
             row,
             malformed,
         })
+    }
+
+    /// Read a HOST's own `sessions.list` row — the info document and the live
+    /// facts in one object, which the hub's roster wraps as `row` — as the
+    /// roster row the hub would have built from it: `status` reachable, the
+    /// host half from the info document. Its `HostRow` must read (a host's row
+    /// read through the lane's own connection is not one the hub vouched
+    /// for); `Err` says why not.
+    pub fn from_host_row(v: &Value) -> Result<(RosterRow, SessionInfo), String> {
+        let info = SessionInfo::deserialize(v).map_err(|e| format!("a session row: {e}"))?;
+        let row = HostRow::deserialize(v).map_err(|e| format!("a session row: {e}"))?;
+        if info.host_id.is_empty() || info.session_id.is_empty() {
+            return Err("a session row with an empty hostId or sessionId".to_string());
+        }
+        let roster = RosterRow {
+            host_id: info.host_id.clone(),
+            session_id: info.session_id.clone(),
+            host: RosterHost {
+                pid: None,
+                craze_version: String::new(),
+                protocol: None,
+                provider: info.provider.name.clone(),
+                workspace: info.workspace.clone(),
+                started_at: info.started_at.clone(),
+                ready: true,
+            },
+            status: "reachable".to_string(),
+            approximate: false,
+            row: Some(row),
+            malformed: false,
+        };
+        Ok((roster, info))
     }
 }
 

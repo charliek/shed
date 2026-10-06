@@ -5,7 +5,7 @@
 //! bracket, `Capabilities` (and `Settings` only when advertised) before
 //! `Ready`, `seq` climbing across reseeds, a silent resume keeping the
 //! generation, `Stale` non-terminal and `Down` last, no source-set `tab_id`.
-//! craze runs the same kit over its recipe in C7/C8, so two adapters at two
+//! craze runs the same kit over its recipe (plan 025 C7/C8), so two adapters at two
 //! levels cannot drift apart. Every frame below is judged as it is read; the
 //! cells only steer opencode through the shapes worth judging.
 

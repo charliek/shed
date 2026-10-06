@@ -9,12 +9,18 @@
 //!   and a host's `hello`, the roster, `createOptions`, a create, every
 //!   refusal's `data.code`).
 //! - **Every request this crate composes is the fixture's `c2s` line, field
-//!   for field**: `hello` (the hub's), `sessions.subscribe`,
+//!   for field**: `hello` (the hub's and the host's), `sessions.subscribe`,
 //!   `sessions.createOptions` and `session.create` — composed by the wire types
 //!   AND written by the source itself, replayed against the fixture's own
-//!   answers. `hello`'s `client` is the one member that differs, by design
-//!   (`{kind: "shed", name, version}`, plan 025 §3.3.2); everything else is
-//!   compared exactly, ids included.
+//!   answers — and the lane's `session.connect`, `sessions.list`,
+//!   `session.attach` (with and without a cursor), `session.prompt`,
+//!   `session.cancel`, `asks.get`, `asks.answer`, `session.stop` and the
+//!   fenced read's `session.sync` (Amendment A11). `hello`'s `client` is the
+//!   one member that differs, by design (`{kind: "shed", name, version}`,
+//!   plan 025 §3.3.2); everything else is compared exactly, ids included.
+//!   The lane requests no fixture line composes as this crate does —
+//!   `session.snapshot` at its default budget, and the fenced read's
+//!   `asks.list` (no fixture calls it) — are pinned by hand.
 //! - **What the source makes of those answers** is the contract's: rows keyed
 //!   by hostId, an upsert with an open ask, a remove; craze's provider order;
 //!   the created row and its prompt; P14's start failure with its cause.
@@ -146,9 +152,23 @@ fn every_s2c_line_decodes() {
                             let p: ResetParams = serde_json::from_value(params).unwrap();
                             assert!(!p.reason.is_empty());
                         }
-                        // The attachment's notifications are the lane's (C8):
-                        // here they need only file as notifications.
-                        "event" | "synchronized" | "presence" | "ready" => {}
+                        // The attachment's: each decodes as the lane reads
+                        // it, and every event body folds without a panic.
+                        "event" => {
+                            let p: wire::EventParams = serde_json::from_value(params).unwrap();
+                            let mut fold = shed_craze::fold::CrazeFold::new("0123456789ab");
+                            fold.apply(&p.event);
+                        }
+                        "synchronized" => {
+                            let _: wire::SyncParams = serde_json::from_value(params).unwrap();
+                        }
+                        "presence" => {
+                            let p: wire::PresenceParams = serde_json::from_value(params).unwrap();
+                            assert!(p.attached >= 1, "{name}");
+                        }
+                        "ready" => {
+                            let _: wire::ReadyParams = serde_json::from_value(params).unwrap();
+                        }
                         other => panic!("{name}: an unexpected notification {other}"),
                     }
                 }
@@ -213,6 +233,11 @@ fn decode_result(name: &str, method: &str, hub: bool, result: &Value) {
                 } else {
                     let _: HostRow = serde_json::from_value(row.clone())
                         .unwrap_or_else(|e| panic!("{name}: {e}"));
+                    // The lane reads a host's row whole: the session id to
+                    // carry, and the row.
+                    let (roster, _) = RosterRow::from_host_row(row)
+                        .unwrap_or_else(|e| panic!("{name}: a host row the lane refuses: {e}"));
+                    assert_eq!(roster.session_id, "session-fake-1", "{name}");
                 }
             }
         }
@@ -226,7 +251,39 @@ fn decode_result(name: &str, method: &str, hub: bool, result: &Value) {
                 "{name}"
             );
         }
-        // The lane's methods (C8) decode with the lane.
+        // The lane's (C8).
+        "session.attach" => {
+            let r: wire::AttachResult = serde_json::from_value(result.clone())
+                .unwrap_or_else(|e| panic!("{name}: an attach reply: {e}"));
+            if let Some(snap) = &r.snapshot {
+                let (_rows, restored) = shed_craze::fold::snapshot_rows("0123456789ab", snap)
+                    .unwrap_or_else(|e| panic!("{name}: a snapshot the fold refuses: {e}"));
+                assert_eq!(
+                    (restored.incarnation.as_str(), restored.seq),
+                    (r.after.incarnation.as_str(), r.after.seq),
+                    "{name}: a snapshot is cut where the stream continues"
+                );
+            } else {
+                assert!(r.reset.is_none(), "{name}");
+            }
+        }
+        "session.snapshot" => {
+            shed_craze::fold::snapshot_rows("0123456789ab", &result["snapshot"])
+                .unwrap_or_else(|e| panic!("{name}: {e}"));
+        }
+        "asks.get" => {
+            let _: wire::AskGetResult =
+                serde_json::from_value(result.clone()).unwrap_or_else(|e| panic!("{name}: {e}"));
+        }
+        // The fenced read's (Amendment A11).
+        "session.sync" => {
+            let _: wire::SyncResult =
+                serde_json::from_value(result.clone()).unwrap_or_else(|e| panic!("{name}: {e}"));
+        }
+        "asks.list" => {
+            let _: wire::AsksListResult =
+                serde_json::from_value(result.clone()).unwrap_or_else(|e| panic!("{name}: {e}"));
+        }
         _ => {}
     }
 }
@@ -267,9 +324,81 @@ fn composed(msg: &Value) -> Value {
                 request_id: p["requestId"].as_str().unwrap().into(),
             },
         ),
+        // The lane's (C8).
+        m @ method::SESSIONS_LIST => wire::request_line(id, m, &Empty {}),
+        m @ method::SESSION_CONNECT => wire::request_line(
+            id,
+            m,
+            &wire::ConnectParams {
+                session_id: str_of(p, "sessionId"),
+            },
+        ),
+        m @ method::SESSION_ATTACH => wire::request_line(
+            id,
+            m,
+            &wire::AttachParams {
+                session_id: str_of(p, "sessionId"),
+                cursor: p
+                    .get("cursor")
+                    .map(|c| serde_json::from_value(c.clone()).unwrap()),
+            },
+        ),
+        m @ method::SESSION_PROMPT => wire::request_line(
+            id,
+            m,
+            &wire::PromptParams {
+                session_id: str_of(p, "sessionId"),
+                command_id: str_of(p, "commandId"),
+                text: str_of(p, "text"),
+                mode: match p["mode"].as_str().unwrap() {
+                    "queue" => "queue",
+                    "interject" => "interject",
+                    other => panic!("a mode this crate never sends: {other}"),
+                },
+            },
+        ),
+        m @ (method::SESSION_CANCEL | method::SESSION_STOP) => wire::request_line(
+            id,
+            m,
+            &wire::CommandParams {
+                session_id: str_of(p, "sessionId"),
+                command_id: str_of(p, "commandId"),
+            },
+        ),
+        m @ method::SESSION_SYNC => wire::request_line(
+            id,
+            m,
+            &wire::SessionParams {
+                session_id: str_of(p, "sessionId"),
+            },
+        ),
+        m @ method::ASKS_GET => wire::request_line(
+            id,
+            m,
+            &wire::AskParams {
+                session_id: str_of(p, "sessionId"),
+                ask_id: str_of(p, "askId"),
+            },
+        ),
+        m @ method::ASKS_ANSWER => wire::request_line(
+            id,
+            m,
+            &wire::AnswerParams {
+                session_id: str_of(p, "sessionId"),
+                command_id: str_of(p, "commandId"),
+                ask_id: str_of(p, "askId"),
+                answer: p["answer"].clone(),
+            },
+        ),
         other => panic!("not a method this crate composes: {other}"),
     };
     serde_json::from_slice(&line.unwrap()).unwrap()
+}
+
+fn str_of(p: &Value, k: &str) -> String {
+    p[k].as_str()
+        .unwrap_or_else(|| panic!("{k} in {p}"))
+        .to_string()
 }
 
 /// Every c2s line of every method this crate composes is what `wire` composes
@@ -290,10 +419,25 @@ fn every_composed_request_is_the_fixtures_c2s_line() {
                 method::SESSIONS_SUBSCRIBE => method::SESSIONS_SUBSCRIBE,
                 method::SESSIONS_CREATE_OPTIONS => method::SESSIONS_CREATE_OPTIONS,
                 method::SESSION_CREATE => method::SESSION_CREATE,
+                method::SESSION_CONNECT => method::SESSION_CONNECT,
+                method::SESSIONS_LIST => method::SESSIONS_LIST,
+                method::SESSION_ATTACH => method::SESSION_ATTACH,
+                method::SESSION_PROMPT => method::SESSION_PROMPT,
+                method::SESSION_CANCEL => method::SESSION_CANCEL,
+                method::SESSION_STOP => method::SESSION_STOP,
+                method::ASKS_GET => method::ASKS_GET,
+                method::ASKS_ANSWER => method::ASKS_ANSWER,
+                method::SESSION_SYNC => method::SESSION_SYNC,
                 _ => continue,
             };
             if m == method::SESSION_CREATE && msg["params"].get("model").is_some() {
                 assert_eq!(name, "22-hub-create.ndjson");
+                continue;
+            }
+            // A lowered budget (WIRE/04's deliberate slow consumer): the lane
+            // attaches at the host's default.
+            if m == method::SESSION_ATTACH && msg["params"].get("budget").is_some() {
+                assert_eq!(name, "04-slow-consumer-reattach.ndjson");
                 continue;
             }
             // A host hello taking a client id back: no token resume in plan
@@ -310,6 +454,69 @@ fn every_composed_request_is_the_fixtures_c2s_line() {
     assert_eq!(seen[method::SESSIONS_CREATE_OPTIONS], 2);
     assert_eq!(seen[method::SESSION_CREATE], 3);
     assert!(seen[method::HELLO] >= 40, "{}", seen[method::HELLO]);
+    // The lane's, each with at least one fixture line.
+    for m in [
+        method::SESSION_CONNECT,
+        method::SESSIONS_LIST,
+        method::SESSION_ATTACH,
+        method::SESSION_PROMPT,
+        method::SESSION_CANCEL,
+        method::SESSION_STOP,
+        method::ASKS_GET,
+        method::ASKS_ANSWER,
+        method::SESSION_SYNC,
+    ] {
+        assert!(
+            seen.get(m).is_some_and(|n| *n >= 1),
+            "no fixture line for {m}"
+        );
+    }
+    assert!(
+        seen[method::SESSION_ATTACH] >= 20,
+        "with and without a cursor"
+    );
+}
+
+/// `session.snapshot`, the one lane request no fixture line composes as the
+/// lane does (every fixture line names a budget or a sub-agent): pinned by
+/// hand — the session id, at the host's default budget.
+#[test]
+fn the_snapshot_request_is_pinned_by_hand() {
+    let line = wire::request_line(
+        "7",
+        method::SESSION_SNAPSHOT,
+        &wire::SessionParams {
+            session_id: "session-fake-1".into(),
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        std::str::from_utf8(&line).unwrap(),
+        r#"{"jsonrpc":"2.0","id":"7","method":"session.snapshot","params":{"sessionId":"session-fake-1"}}"#
+    );
+}
+
+/// `asks.list`, the fenced read's registry (Amendment A11), which no fixture
+/// line calls: pinned by hand — the session id and nothing else.
+#[test]
+fn the_registry_request_is_pinned_by_hand() {
+    let line = wire::request_line(
+        "8",
+        method::ASKS_LIST,
+        &wire::SessionParams {
+            session_id: "session-fake-1".into(),
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        std::str::from_utf8(&line).unwrap(),
+        r#"{"jsonrpc":"2.0","id":"8","method":"asks.list","params":{"sessionId":"session-fake-1"}}"#
+    );
+    // Its answer as craze's protocol reference writes it.
+    let r: wire::AsksListResult = serde_json::from_value(json!({"asks": [
+        {"id": "perm-1", "kind": "permission", "label": "Shell", "openedAt": "2026-01-01T00:00:00Z"}]}))
+    .unwrap();
+    assert_eq!(r.asks[0].id, "perm-1");
 }
 
 /// A fixture conn's lines, in order.
