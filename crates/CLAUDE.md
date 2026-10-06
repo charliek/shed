@@ -214,8 +214,9 @@ re-implemented per language. The root `CLAUDE.md` owns the monorepo layout + rel
   session's `Settings` before its lone `Ready`, so a client showing a lost change "not
   confirmed" has the real value to replace it with. `session()` never dials; `approvals()`/
   `settings()` answer from a RUNNING watcher's fold once it seeded (the watcher that set
-  it alone clears it), else read a snapshot on a connection of their own. `fold.rs` is
-  craze's events/snapshots → append-only rows (craze's own wordings ported: `noteTodos`,
+  it alone clears it), else read on a connection of their own — `approvals()` the
+  engine's ask registry (`asks.list` + `asks.get`, Amendment A11), `settings()` a
+  snapshot. `fold.rs` is craze's events/snapshots → append-only rows (craze's own wordings ported: `noteTodos`,
   `compactionNote`, the foreign-turn notes, the shell-context/attachment strip) with an
   approval book (`answer_body` maps the contract's answers onto `asks.answer`). **Rows
   follow craze's transcript, approvals its ENGINE ask registry** (Amendment A11): a

@@ -206,8 +206,8 @@ offline or absent, roost's row stands alone as before. A craze row a source stil
 it is not live is the last known one: `stale: true`, `approximate: true`. The fold is computed
 per host and never crosses machines.
 
-This machine's source is **eager** (one roster connection from launch; its hub is born in the
-app's own session). A **remote** machine's or a shed's is **attach-only**: a find-only probe
+This machine's source is **eager** (one roster connection from launch, joining the hub already
+running here or, when none is running yet, starting one in the app's own session). A **remote** machine's or a shed's is **attach-only**: a find-only probe
 (`craze providers --hub --json`, which never starts a hub) runs every 30 s while there is no
 hub, and the roster attaches only once one is running — the app never starts a hub on another
 machine in the background. Every status row (`machines.list`, `rc.list`'s `machines`) carries

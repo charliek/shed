@@ -9,25 +9,26 @@
 //! blocked on.
 //!
 //! ```text
-//! machine row  --agent_lane{kind, session_id, server_url}-->  Lanes::open
-//!                                                          |
-//!            ReachKind::Local   -> dial server_url          |
-//!            ReachKind::Ssh(e)  -> SshForward::reserve_for  |
-//!                                                          v
-//!                 match stamp.kind {  "opencode" => OpencodeSource::new(url).open(id),
-//!                                     other      => UnsupportedLane }
-//!                                                          |
-//!                                              Arc<dyn AgentLane>
-//!                                                          |
-//!                                       subscribe() -> Reset … Ready … frames
-//!                                                          |
-//!                                     LaneView (staged, then swapped) + `lane-event`
+//! machine row  --agent_lane{kind, session_id, server_url?}-->  Lanes::open
+//!                                                           |
+//!   "craze"     -> the host's CrazeSource, .open(hostId)     |  (no reach, no forward)
+//!   "opencode"  -> ReachKind::Local   -> dial server_url     |
+//!                  ReachKind::Ssh(e)  -> SshForward::reserve_for
+//!                  then OpencodeSource::new(url).open(id)   |
+//!   other       -> UnsupportedLane                           |
+//!                                                           v
+//!                                               Arc<dyn AgentLane>
+//!                                                           |
+//!                                        subscribe() -> Reset … Ready … frames
+//!                                                           |
+//!                                      LaneView (staged, then swapped) + `lane-event`
 //! ```
 //!
-//! # One trait, one adapter today — and the line the dispatch draws
+//! # One trait, two adapters — and the line the dispatch draws
 //!
 //! [`LaneEntry`] holds an `Arc<dyn AgentLane>`, and the ONLY place in this app
-//! that names a concrete adapter type is the `match` in [`Lanes::open`]. That is
+//! that builds a concrete adapter is [`Lanes::open`] — its craze branch, and the
+//! roost-stamped `match` it hands every other kind to. That is
 //! the whole point of plan 017: everything below the match — the pump, the view,
 //! the tunnel bookkeeping, the `lane.*` verbs — is written against the contract,
 //! so the next adapter is a `match` arm rather than a refactor. (gx held this
@@ -294,8 +295,9 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 const LANE_KINDS: [&str; 2] = ["opencode", CRAZE];
 
 /// **Test-only seam:** how many times this module has actually constructed a
-/// concrete `AgentLane` adapter (today, the one `OpencodeSource::new(…).open(…)`
-/// in [`Lanes::open`]'s match). Exists so a control can assert "no adapter was
+/// concrete `AgentLane` adapter (the craze branch's `CrazeSource::open` and the
+/// roost-stamped match's `OpencodeSource::new(…).open(…)`, both under
+/// [`Lanes::open`]). Exists so a control can assert "no adapter was
 /// built" as a fact about the code, not an inference from "no tunnel was
 /// reserved" — see `a_gx_stamped_row_is_unsupported_lane_with_no_forward_reserved`.
 /// `#[cfg(test)]` end to end: zero cost and zero surface in a shipped binary.

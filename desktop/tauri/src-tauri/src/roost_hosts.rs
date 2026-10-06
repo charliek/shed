@@ -364,7 +364,9 @@ struct CrazeHost {
     /// `None` only once [`Self::stop`] has let it go.
     ask: Option<CrazeSource>,
     /// Wakes the task's wait ([`crate::craze::run`]): a user's explicit action
-    /// may have just started a hub on an attach-only host.
+    /// — the create sheet's `create_options` or a create, the only remote hub
+    /// births (plan 025 Amendment A14) — may have just started a hub on an
+    /// attach-only host.
     wake: Arc<tokio::sync::Notify>,
     task: tokio::task::JoinHandle<()>,
     gen: u64,
@@ -1664,8 +1666,10 @@ impl RoostHosts {
             }
         }
         // A `tab.open` that answered is a session answering (the reason
-        // [`Self::run`] starts a watcher); and `craze attach` may have started
-        // a hub on an attach-only host — wake its source to attach to it.
+        // [`Self::run`] starts a watcher). `craze attach` starts no hub — it
+        // joins the session over its own control socket (plan 025 Amendment
+        // A14) — so the wake below births nothing; it only makes a source
+        // waiting between probes look again now.
         self.watch(&id);
         let wake = lock(&self.reg).crazes.get(&id).map(|c| Arc::clone(&c.wake));
         if let Some(wake) = wake {

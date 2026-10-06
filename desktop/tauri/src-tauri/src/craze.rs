@@ -26,7 +26,7 @@
 //!   | (absent) | started; nothing answered yet | the find-only probe | its first answer |
 //!   | **Dormant** | the probe said `no hub is running` | the probe again in [`DORMANT_PROBE`] | a probe that finds a hub |
 //!   | **Live** | the probe found a hub, then the roster seeded | ONE `bridge --hub` roster connection | the roster's `Offline` (EOF, `hub_closing`, an error) |
-//!   | **Offline** | the roster dropped, or the probe could not ask (unreachable; not installed and too old are offline causes too) | the probe again: at once after a live cycle, on a backoff while unreachable, every [`DORMANT_PROBE`] while not installed or too old | the probe's next answer |
+//!   | **Offline** | the roster dropped, or the probe could not ask (unreachable; not installed and too old are offline causes too) | the probe again: after about a second once a live cycle ends (jittered [`PROBE_BACKOFF_BASE`]), on a backoff while unreachable, every [`DORMANT_PROBE`] while not installed or too old | the probe's next answer |
 //!
 //!   After a live cycle ends the probe runs again before anything redials: a
 //!   hub that is gone sends the source back to Dormant (its rows dropped and
@@ -57,8 +57,11 @@
 //!   openable through the roster's source at once. The task is then woken
 //!   ([`run`]'s `wake`) so a dormant source probes again now, finds the hub
 //!   the user just started, and attaches to it, rather than at its next
-//!   [`DORMANT_PROBE`]. (Open in terminal runs `craze attach` in a roost tab,
-//!   which reaches the hub on its own.)
+//!   [`DORMANT_PROBE`]. Those two are the ONLY things that birth a remote hub
+//!   (plan 025 Amendment A14): Open in terminal runs `craze attach` in a roost
+//!   tab, which joins the session over the session's own control socket and
+//!   starts nothing — no hub (craze's `cli.md`, "craze attach": "Nothing is
+//!   spawned, nothing binds a socket").
 //!
 //! # The state, staged
 //!

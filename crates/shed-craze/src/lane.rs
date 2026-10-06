@@ -1009,10 +1009,10 @@ impl AgentLane for CrazeLane {
             .map(|_| ())
     }
 
-    /// Everything open on the session — the main agent's asks, which are all
-    /// craze's fold keeps (it child-ignores a sub-agent's, `crate::fold`'s
-    /// module doc): a running watcher's fold once it has seeded, else the asks
-    /// of a snapshot read now.
+    /// Every open approval on the session — craze's ENGINE ask registry, a
+    /// sub-agent's asks included (Amendment A11, `crate::fold`'s module doc):
+    /// a running watcher's fold once it has seeded, else the registry read now
+    /// (`asks.list`, then `asks.get` per id — `read_registry`).
     async fn approvals(&self) -> Result<Vec<LaneApproval>, LaneError> {
         {
             let state = lock(&self.shared.state);
