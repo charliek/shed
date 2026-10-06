@@ -183,7 +183,8 @@ desktop and phone clients drive:
   `.github/actions/craze-binaries` composite action does the equivalent in
   CI, shared by both repos so their craze SHAs can't drift apart.
 - **`CRAZE_RELEASE`** — the craze release the shed images actually bake
-  (bare `X.Y.Z`), or empty before the bake lands.
+  (bare `X.Y.Z`), or empty before a bake lands. Set to `0.1.0` since plan
+  025 §3.9 / C13.
 
 `craze-pin.env` is never sourced as shell by anything that reads it — every
 consumer (the Makefile targets, `check-craze-pin.sh`, the composite action,
@@ -214,13 +215,17 @@ test SHA must equal the baked release's tag commit, enforced by a check."
 includes `server`** (the images ship with the server component), in both
 the mandatory local pre-tag run and CI's `release-plan` job.
 
-> **Consequence.** From this check's merge until the craze bake lands (plan
-> 025 §3.9 / C13), `CRAZE_RELEASE` is empty — so **every** stable tag that
-> ships `server` from `main`, a hotfix included, is refused by this check.
-> That is the rule working as intended: 0.9.0 must bake craze. For a true
-> emergency, the owner may set `SHED_RELEASE_ALLOW_NO_CRAZE=<reason>`, which
-> prints loudly and records the override in `release-plan.sh`'s output
-> instead of being silently honoured — it must never be set by CI.
+> **Consequence.** The craze bake landed in plan 025 §3.9 / C13:
+> `CRAZE_RELEASE=0.1.0` and `CRAZE_TEST_SHA` equals v0.1.0's tag commit, so
+> this check now passes against the real tag. Before the bake landed,
+> `CRAZE_RELEASE` was empty and **every** stable tag that ships `server`
+> from `main`, a hotfix included, was refused — that was the rule working
+> as intended: 0.9.0 must bake craze. The same trap returns if `CRAZE_RELEASE`
+> is ever cleared or a future craze release moves `CRAZE_TEST_SHA` without a
+> matching bump here. For a true emergency, the owner may set
+> `SHED_RELEASE_ALLOW_NO_CRAZE=<reason>`, which prints loudly and records
+> the override in `release-plan.sh`'s output instead of being silently
+> honoured — it must never be set by CI.
 
 `scripts/release/release-scripts-test.sh` covers the release-time check
 too, through a `CRAZE_PIN_LS_REMOTE` seam honoured **only** under

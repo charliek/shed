@@ -553,6 +553,16 @@ verbatim._
   commit equals `CRAZE_TEST_SHA`, or the tag is refused — an empty `CRAZE_RELEASE`
   included. `SHED_RELEASE_ALLOW_NO_CRAZE=<reason>` is the owner's loud emergency override,
   never set by CI. See `RELEASING.md` § "craze pin".
+- **The `extensions` rootfs image bakes `/usr/bin/craze`, craze v0.1.0, from its GitHub
+  release asset** (plan 025 §3.9 C13, `charliek/shed#394`). Folded into the same `RUN` as
+  the roost-session bake above, so the layer count is unchanged: `craze_linux_{amd64,arm64}.tar.gz`
+  is fetched, its sha256 checked against an in-tree digest (never fetched — a `.sha256`
+  from the same mutable release proves transport, not provenance), and `craze --version`
+  asserted to equal the pinned version at build time. `craze-pin.env`'s `CRAZE_RELEASE` is
+  now `0.1.0`; `make check-craze-pin` keeps both Dockerfiles' `CRAZE_VERSION` and digest
+  pairs in lockstep with it, and `scripts/release/check-craze-pin.sh --release v0.1.0`
+  now passes against the real tag. No systemd unit is enabled — `shed attach` starts a
+  lane's hub itself.
 
 ## v0.8.2 — 2026-08-17
 
