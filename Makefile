@@ -916,11 +916,24 @@ craze-binaries:
 # is still caught as a half-landed bake even though it carries no value to
 # compare.
 #
-# The vendored-fixture clause (crates/shed-craze/fixtures/wire.PIN ==
-# CRAZE_TEST_SHA) arrives in C7, once the crate and its fixtures exist.
+# The vendored-fixture clause (plan 025 C7): crates/shed-craze/fixtures/wire.PIN
+# — the craze sha the vendored WIRE fixtures were copied from — must equal
+# CRAZE_TEST_SHA, so moving the test pin without re-vendoring the fixtures (or
+# the other way round) fails here, offline, before CI's drift diff ever runs.
 check-craze-pin:
 	@sha="$$(scripts/release/read-craze-pin.sh --field CRAZE_TEST_SHA craze-pin.env)" || exit 1; \
 	 rel="$$(scripts/release/read-craze-pin.sh --field CRAZE_RELEASE craze-pin.env)" || exit 1; \
+	 pin_file=crates/shed-craze/fixtures/wire.PIN; \
+	 if [ ! -f "$$pin_file" ]; then \
+	   echo "ERROR: $$pin_file is missing — it names the craze sha the vendored wire fixtures were copied from" ; \
+	   exit 1 ; \
+	 fi ; \
+	 wire_pin=$$(tr -d '[:space:]' < "$$pin_file") ; \
+	 if [ "$$wire_pin" != "$$sha" ]; then \
+	   echo "ERROR: $$pin_file ($$wire_pin) != craze-pin.env CRAZE_TEST_SHA ($$sha)" ; \
+	   echo "Re-vendor craze's internal/fakehost/testdata/wire (README.md included) at CRAZE_TEST_SHA into crates/shed-craze/fixtures/wire and write the sha to $$pin_file." ; \
+	   exit 1 ; \
+	 fi ; \
 	 vz_decl=no; fc_decl=no; \
 	 grep -Ev '^[[:space:]]*#' vz/Dockerfile | grep -Eq '^[[:space:]]*ARG[[:space:]]+CRAZE_VERSION([=[:space:]]|$$)' && vz_decl=yes; \
 	 grep -Ev '^[[:space:]]*#' firecracker/Dockerfile | grep -Eq '^[[:space:]]*ARG[[:space:]]+CRAZE_VERSION([=[:space:]]|$$)' && fc_decl=yes; \
@@ -934,7 +947,7 @@ check-craze-pin:
 	     echo "Bake landed without CRAZE_RELEASE being set (see plan 025 S3.9)." ; \
 	     exit 1 ; \
 	   fi ; \
-	   echo "craze pin OK: no release baked yet (CRAZE_TEST_SHA=$$sha)" ; \
+	   echo "craze pin OK: no release baked yet (CRAZE_TEST_SHA=$$sha, wire.PIN matches)" ; \
 	 else \
 	   vz_amd64=$$(awk -F= '/^ARG CRAZE_SHA256_AMD64=/ { print $$2; exit }' vz/Dockerfile) ; \
 	   fc_amd64=$$(awk -F= '/^ARG CRAZE_SHA256_AMD64=/ { print $$2; exit }' firecracker/Dockerfile) ; \
@@ -962,7 +975,7 @@ check-craze-pin:
 	     if [ "$$vz_arm64" != "$$fc_arm64" ]; then echo "  CRAZE_SHA256_ARM64: vz=$$vz_arm64 fc=$$fc_arm64" ; fi ; \
 	     exit 1 ; \
 	   fi ; \
-	   echo "craze pin OK: release $$rel (CRAZE_TEST_SHA=$$sha)" ; \
+	   echo "craze pin OK: release $$rel (CRAZE_TEST_SHA=$$sha, wire.PIN matches)" ; \
 	 fi
 
 # Run all checks (lint + test + kernel pin)

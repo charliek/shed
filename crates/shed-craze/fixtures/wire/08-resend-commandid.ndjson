@@ -1,0 +1,8 @@
+{"conn":1,"dir":"c2s","msg":{"jsonrpc":"2.0","id":"1","method":"hello","params":{"protocols":[1],"client":{"kind":"test","name":"fakehost-wire"}}}}
+{"conn":1,"dir":"s2c","msg":{"jsonrpc":"2.0","id":"1","result":{"protocol":1,"endpoint":{"kind":"host","hostId":"0123456789ab","crazeVersion":"0.0.0-fakehost","pid":4242},"clientId":"c-1","token":"52fdfc072182654f163f5f0f9a621d72","resumed":false,"capabilities":{"rosterSubscribe":false,"sessionCreate":false,"multiplex":false,"connect":false,"snapshot":true,"attachWhenNow":true},"codecs":{"event":1,"snapshot":1},"limits":{"inboundLine":4194304,"outboundLine":16777216},"retryHorizon":{"commands":1024,"ageMs":600000}}}}
+{"conn":1,"dir":"c2s","msg":{"jsonrpc":"2.0","id":"2","method":"session.queue.add","params":{"sessionId":"session-fake-1","commandId":"1","text":"hello"}}}
+{"conn":1,"dir":"s2c","msg":{"jsonrpc":"2.0","id":"2","result":{"row":{"id":"q-1","text":"hello","queuedAt":"2026-01-01T00:00:00Z"}}}}
+{"conn":1,"dir":"c2s","msg":{"jsonrpc":"2.0","id":"3","method":"session.queue.add","params":{"sessionId":"session-fake-1","commandId":"1","text":"hello"}}}
+{"conn":1,"dir":"s2c","msg":{"jsonrpc":"2.0","id":"3","result":{"row":{"id":"q-1","text":"hello","queuedAt":"2026-01-01T00:00:00Z"}}}}
+{"conn":1,"dir":"c2s","msg":{"jsonrpc":"2.0","id":"4","method":"session.queue.add","params":{"sessionId":"session-fake-1","commandId":"1","text":"different"}}}
+{"conn":1,"dir":"s2c","msg":{"jsonrpc":"2.0","id":"4","error":{"code":-32000,"message":"engine: bad request: command c-1/1 was already sent with a different payload","data":{"code":"bad_request","reason":"bad_request"}}}}

@@ -4,11 +4,12 @@
 //! session-scoped **lane** that streams one session's transcript and takes its
 //! verbs. One adapter per agent implements both.
 //!
-//! One adapter today: opencode over its local HTTP server (`shed-opencode`).
-//! craze's, over its per-machine hub (`shed-craze`), arrives in plan 025 C7/C8 —
-//! it is what this split was shaped for, so where this doc says what "craze"
-//! does it describes that adapter as plan 025 designs it from craze's published
-//! protocol, not code that exists yet. gx's `/v1` lane
+//! Two adapters: opencode over its local HTTP server (`shed-opencode`), both
+//! levels; and craze over its per-machine hub (`shed-craze`) — its source since
+//! plan 025 C7, its lane arriving in C8. craze is what this split was shaped
+//! for, so where this doc says what a craze LANE does it describes that half as
+//! plan 025 designs it from craze's published protocol, not code that exists
+//! yet. gx's `/v1` lane
 //! held the second slot from plan 017 until plan 025 retired it (shed#390); the
 //! corrections it forced are recorded below as history, because the readers of
 //! this module — the next adapter, and shed-mobile's hand-written mirror — read
@@ -242,10 +243,11 @@
 //! What each contract verb costs on each side, and the reason the contract is
 //! shaped the way it is (two levels, session-scoped lanes, per-session
 //! capabilities, cursor-optional, approvals as first-class rows). The opencode
-//! column is the adapter as built; the craze column is the adapter plan 025
-//! C7/C8 builds — no craze adapter exists before then — written from craze's
-//! published protocol reference (`docs/reference/protocol.md` at the pinned
-//! craze sha, "PM"), not from a guess.
+//! column is the adapter as built; the craze column's source rows are
+//! `shed-craze` as built (plan 025 C7) and its lane rows the lane C8 builds —
+//! both written from craze's published protocol reference
+//! (`docs/reference/protocol.md` at the pinned craze sha, "PM"), not from a
+//! guess.
 //!
 //! | contract | opencode | craze |
 //! |---|---|---|

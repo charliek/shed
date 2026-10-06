@@ -546,6 +546,29 @@ jobs:
         run: |
           cargo test -p shed-core -p shed-opencode --all-targets --locked
           cargo clippy -p shed-core -p shed-opencode --all-targets --locked -- -D warnings
+      # shed-craze (plan 025 C7) runs its recipe cells against the REAL craze
+      # hub, craze-fake-host and craze-fake-agent, built here at the pinned
+      # CRAZE_TEST_SHA (craze-pin.env) by the shared composite action — which
+      # also diffs craze's wire fixtures against the vendored
+      # crates/shed-craze/fixtures/wire and exports SHED_CRAZE_BIN_DIR. Both
+      # paths are absolute: a composite action's steps do not run in this
+      # job's `crates` default working directory.
+      - name: craze binaries at the pin (shed-craze's recipe)
+        uses: ./.github/actions/craze-binaries
+        with:
+          shed-path: ${{ github.workspace }}
+          out-dir: ${{ runner.temp }}/craze-bin
+      - name: shed-craze — test (the recipe, required) + clippy (Linux)
+        # SHED_CRAZE_REQUIRE=1 (the action exports it too; set here so this
+        # step cannot lose it): a recipe cell that would SKIP for want of the
+        # binaries FAILS instead, so this job can never go green on skipped
+        # craze cells. `--features test-support` exports the recipe harness
+        # the integration tests drive.
+        env:
+          SHED_CRAZE_REQUIRE: "1"
+        run: |
+          cargo test -p shed-craze --all-targets --features test-support --locked
+          cargo clippy -p shed-craze --all-targets --features test-support --locked -- -D warnings
 
   # The host-agent wire-goldens leg (Phase 3 leg 3a.1; the Go twin sunset by
   # plan 006-mtls-cleanup-hostagent-sunset.md). One Linux job covers BOTH the

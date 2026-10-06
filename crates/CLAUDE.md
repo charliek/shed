@@ -24,9 +24,10 @@ re-implemented per language. The root `CLAUDE.md` owns the monorepo layout + rel
   transcript and approvals": a machine-level `AgentSource` (`subscribe` → the live session
   list as `SourceEvent`s, `create_options`, `create`, `open(id)`) and the session-scoped
   `AgentLane` it opens (no verb takes an id; `settings`/`set`/`stop` have no default
-  bodies). One adapter per agent implements both (opencode over its local HTTP server
-  today; `shed-craze`, plan 025 C7+, is next — plan 017's `gx` adapter held this second
-  slot and was retired in plan 025 C1, shed#390). **Capabilities are per session and ride
+  bodies). One adapter per agent implements both (opencode over its local HTTP server;
+  craze over its per-machine hub, `shed-craze` — its source since plan 025 C7, its lane in
+  C8 — in the slot plan 017's `gx` adapter held until plan 025 C1 retired it, shed#390).
+  **Capabilities are per session and ride
   the stream** (`LaneEvent::Capabilities`, and `Settings` when they say so) — there is no
   capabilities getter, so a client reads them from its view, never caches them at open.
   `LaneEvent::Stale` is a non-terminal transport loss (a silent resume ends it with a lone
@@ -135,8 +136,53 @@ re-implemented per language. The root `CLAUDE.md` owns the monorepo layout + rel
   `AgentLane` against gx's remote lane — lived here the same shape, with the
   twelve contract corrections it forced recorded in `shed_core::lane`'s own
   module doc; it was retired in plan 025 C1, shed#390, when gx and the other
-  direct-agent kinds left shed for the craze lane. `shed-craze`, plan 025 C7+,
-  is the next adapter in this slot.)
+  direct-agent kinds left shed for the craze lane. `shed-craze`, below, holds
+  this slot now.)
+- **`shed-craze`** — the **craze adapter** for `shed_core::lane` (plan 025 C7+, shed#392):
+  one machine's craze **hub** — craze's per-machine process that lists every cursor, grok,
+  gx and native session, says what a create can start, starts one, and splices a client
+  through to a session's host — as an `AgentSource`, `CrazeSource`. **The transport is the
+  client's** (P8): every connection is a fresh duplex to `craze bridge --hub` from a
+  client-supplied `CrazeDial` — `ProcessDial` (a local `/bin/sh -c '<ladder>'`, run by
+  absolute path; the ladder is `shed_core::craze`'s), `TcpDial` (the phone's loopback
+  port), and the desktop's `SshExec` duplex (C9) — one for the roster, one per
+  `createOptions`, one per create, because the hub answers one request at a time, in
+  order. `conn.rs` is one NDJSON connection: craze's line limits **from the client's
+  side** (never WRITE a line over 4 MiB; READ up to 16 MiB), id demux (host replies come
+  out of order; a reply's id must be the request's JSON value verbatim, and every message
+  `"jsonrpc":"2.0"`), notifications on a bounded channel the reader **never waits on** (a
+  full queue ends the connection as `ConnEnd::Backlog` rather than stall the replies
+  behind it), deadlines that cover the write as well as the reply, the **bounded
+  preamble** (up to 16 non-JSON lines / 4 KiB before the first reply — a shed's `bash
+  -lc` login profile — kept for the error; after it, any non-JSON line, a blank one
+  included, is a fault), and the hub `hello` (protocol 1, **codecs event 1 and snapshot
+  1**, `rosterSubscribe` + `connect`). `dial.rs` classifies a dial that never reached a hub, in
+  plan 025 §3.3.2's precedence (exit 127 → `NotInstalled`; `unknown flag: --hub` on stderr
+  — v0.0.1 — or a hub `hello` short of the rule → `TooOld`; anything else before `hello` →
+  `Unreachable` with the stderr tail; a refused `hello` → `Failed`, `protocol_version` →
+  `TooOld`) and classifies the find-only probe (`providers --hub --json`, which never
+  starts a hub) by its stderr TEXT, never its exit code. `errors.rs` is craze's published
+  code → `LaneError` table **verbatim, keyed on `data.code` only**, with P14's one
+  deviation (a create refused `not_accepting/start_failed` → `Failed(data.cause)`).
+  `CrazeSource::create` retries ONCE under the same `requestId` on an unknown outcome (a
+  dropped connection, the 120 s deadline) and never on a definite answer;
+  `is_outcome_unknown` is the one test a caller keeps its id on. A row's id is its
+  **hostId** (P11). The lane (`open`, the watcher, the fold) is **C8**: `open` answers
+  `Failed` until then. Pure lib — serde, tokio, no `reqwest`, no `chrono` — not
+  FFI-exported, builds for `aarch64-linux-android` (mobile links it). In
+  `default-members`. **Tests:** `tests/wire.rs` runs every vendored WIRE fixture
+  (`fixtures/wire/`, craze's `internal/fakehost/testdata/wire` at the sha
+  `fixtures/wire.PIN` names, its `README.md` included — `make check-craze-pin` requires
+  `wire.PIN` == `CRAZE_TEST_SHA`, and CI's `craze-binaries` action diffs the two trees);
+  `tests/recipe_source.rs` is craze's own **hermetic recipe** (`testing::Recipe`, behind
+  `test-support`): the REAL hub over `craze-fake-host` entries, creates spawning
+  `craze-fake-agent` as grok, every craze process under the recipe's six variables with a
+  short 0700 `CRAZE_RUNTIME_DIR` under `/tmp` (never `~/.cache`, which craze refuses),
+  binaries copied into a private `PATH`, the hub's pid read from its record and checked
+  before any signal, and craze's own `cleanup` as the teardown. Its cells **skip** without
+  `SHED_CRAZE_BIN_DIR` (`make craze-binaries` prints the line) and **fail** instead under
+  `SHED_CRAZE_REQUIRE=1`, which CI's `core-linux` sets. Every source frame goes through
+  `shed_core::lane::conformance`.
 
 `fixtures/` holds the real-shaped JSON/YAML samples (server info, `shed list`, `system df`,
 egress profiles, enriched image, config) that both the Rust decoders and the Swift
@@ -319,6 +365,10 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo clippy -p shed-app --features broker --all-targets -- -D warnings
 cargo test -p shed-opencode                          # the opencode agent-lane adapter
 cargo test -p shed-opencode --features test-support  # exports `testing::FakeOpencode`
+cargo test -p shed-craze                             # the craze adapter (recipe cells skip)
+# the craze recipe against the real hub: build the pinned binaries, then require them
+make -C .. craze-binaries                            # prints SHED_CRAZE_BIN_DIR=…
+SHED_CRAZE_BIN_DIR=… SHED_CRAZE_REQUIRE=1 cargo test -p shed-craze --all-targets --features test-support
 ```
 
 Note: `broker` is the one non-default feature left in this workspace. A bare

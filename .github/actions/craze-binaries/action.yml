@@ -22,6 +22,11 @@ inputs:
     description: Directory the four binaries are built into.
     required: true
 
+# Every run step below pins `working-directory: ${{ github.workspace }}` — the
+# directory `actions/checkout`'s `path: craze-src` and `setup-go`'s
+# `go-version-file` are relative to — so the relative `craze-src` paths, and a
+# relative `shed-path`/`out-dir`, mean the same thing whatever directory the
+# calling job runs its own steps in (shed's core-linux defaults to `crates`).
 runs:
   using: "composite"
   steps:
@@ -34,6 +39,7 @@ runs:
     # BEFORE this step ever uses or exports it.
     - name: Read and validate the craze pin (parsed as data, never sourced)
       shell: bash
+      working-directory: ${{ github.workspace }}
       run: |
         set -euo pipefail
         SHA="$("${{ inputs.shed-path }}/scripts/release/read-craze-pin.sh" --field CRAZE_TEST_SHA "${{ inputs.shed-path }}/craze-pin.env")"
@@ -47,6 +53,7 @@ runs:
     # base for a relative input.
     - name: Resolve out-dir to an absolute path
       shell: bash
+      working-directory: ${{ github.workspace }}
       run: |
         set -euo pipefail
         OUT_DIR="${{ inputs.out-dir }}"
@@ -68,6 +75,7 @@ runs:
 
     - name: Assert HEAD == the pin, and that the pin is a merged main commit
       shell: bash
+      working-directory: ${{ github.workspace }}
       run: |
         set -euo pipefail
         head="$(git -C craze-src rev-parse HEAD)"
@@ -90,6 +98,7 @@ runs:
 
     - name: Assert the active Go matches craze-src/go.mod's toolchain
       shell: bash
+      working-directory: ${{ github.workspace }}
       run: |
         set -euo pipefail
         toolchain="$(awk '/^toolchain /{print $2; exit}' craze-src/go.mod | sed 's/^go//')"
@@ -106,6 +115,7 @@ runs:
 
     - name: Build craze, craze-fake-host, craze-fake-agent at the pin
       shell: bash
+      working-directory: ${{ github.workspace }}
       run: |
         set -euo pipefail
         OUT_DIR="${CRAZE_OUT_DIR}"
@@ -117,6 +127,7 @@ runs:
 
     - name: Build craze at the v0.0.1 tag as craze-0.0.1 (the too-old cell)
       shell: bash
+      working-directory: ${{ github.workspace }}
       run: |
         set -euo pipefail
         OUT_DIR="${CRAZE_OUT_DIR}"
@@ -131,6 +142,7 @@ runs:
 
     - name: Export SHED_CRAZE_BIN_DIR and SHED_CRAZE_REQUIRE
       shell: bash
+      working-directory: ${{ github.workspace }}
       run: |
         set -euo pipefail
         echo "SHED_CRAZE_BIN_DIR=${CRAZE_OUT_DIR}" >> "$GITHUB_ENV"
@@ -146,6 +158,7 @@ runs:
     # to this action and no edit to whatever workflow step calls it.
     - name: Diff craze's wire fixtures against shed's vendored copy
       shell: bash
+      working-directory: ${{ github.workspace }}
       run: |
         set -euo pipefail
         FIXTURES_DIR="${{ inputs.shed-path }}/crates/shed-craze/fixtures/wire"

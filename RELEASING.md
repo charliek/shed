@@ -194,9 +194,16 @@ them, and any other line is refused outright. Sourcing it would let the file
 itself run a command or flip the release-time check's self-test seam.
 
 `make check-craze-pin` (offline, run by `make check` and CI's `pins` job)
-keeps the two pins well-formed and, once `CRAZE_RELEASE` is set, keeps both
-Dockerfiles' `CRAZE_VERSION`/digest `ARG`s in lockstep with it and with each
-other — the same fail-fast-on-drift shape as `check-roost-pin`.
+keeps the two pins well-formed, requires
+`crates/shed-craze/fixtures/wire.PIN` — the sha shed-craze's vendored wire
+fixtures were copied from — to equal `CRAZE_TEST_SHA` (so the pin never moves
+without the fixtures, or the other way round), and, once `CRAZE_RELEASE` is
+set, keeps both Dockerfiles' `CRAZE_VERSION`/digest `ARG`s in lockstep with it
+and with each other — the same fail-fast-on-drift shape as `check-roost-pin`.
+Moving `CRAZE_TEST_SHA` means re-vendoring craze's
+`internal/fakehost/testdata/wire` (its `README.md` included) into
+`crates/shed-craze/fixtures/wire` and rewriting `wire.PIN` in the same commit;
+CI's `craze-binaries` action diffs the two trees on every run.
 
 **The release-time check.** `scripts/release/check-craze-pin.sh --release
 vX.Y.Z` (network) resolves `v$CRAZE_RELEASE` against

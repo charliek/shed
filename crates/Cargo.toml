@@ -4,7 +4,7 @@
 # standalone workspace in ../tauri/src-tauri) linking shed-core + shed-app directly.
 [workspace]
 resolver = "2"
-members = ["shed-core", "shed-core-ffi", "shed-app", "shedctl", "shed-broker", "shed-host-agent", "shed-opencode"]
+members = ["shed-core", "shed-core-ffi", "shed-app", "shedctl", "shed-broker", "shed-host-agent", "shed-opencode", "shed-craze"]
 # All members are default members: a plain `cargo build` / `cargo test` (and
 # `make core-test`) build shed-core + shed-core-ffi + shed-app + shedctl. shedctl
 # (the headless Linux CLI driver for the shed-desktop IPC socket) has no GUI-toolkit
@@ -26,7 +26,14 @@ members = ["shed-core", "shed-core-ffi", "shed-app", "shedctl", "shed-broker", "
 #
 # `shed-gx` (the gx agent-lane adapter, plan 017) was retired in plan 025 C1
 # (shed#390) — gx and the other direct-agent kinds left shed for the craze lane.
-default-members = ["shed-core", "shed-core-ffi", "shed-app", "shedctl", "shed-broker", "shed-host-agent", "shed-opencode"]
+#
+# `shed-craze` (the craze adapter, plan 025 C7+, shed#392) is a member AND a
+# default member on the same terms as `shed-opencode`: a pure lib on shed-core
+# (serde, tokio, no reqwest, no chrono), not reachable from `shed-core-ffi`, so
+# the `cargo tree -p shed-core-ffi` invariant holds. Its recipe cells skip
+# without `SHED_CRAZE_BIN_DIR` (`make craze-binaries`); CI sets
+# `SHED_CRAZE_REQUIRE=1` so a skip there fails.
+default-members = ["shed-core", "shed-core-ffi", "shed-app", "shedctl", "shed-broker", "shed-host-agent", "shed-opencode", "shed-craze"]
 
 [workspace.package]
 version = "0.8.1"

@@ -3351,6 +3351,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "shed-craze"
+version = "0.8.1"
+dependencies = [
+ "async-trait",
+ "futures-util",
+ "serde",
+ "serde_json",
+ "shed-core",
+ "shed-craze",
+ "thiserror 1.0.69",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
 name = "shed-host-agent"
 version = "0.8.1"
 dependencies = [

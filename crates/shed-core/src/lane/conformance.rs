@@ -1,14 +1,16 @@
 //! The lane contract's **conformance kit** (plan 025 §3.2.4): the rules every
-//! adapter's streams must keep, written once, so the adapters — opencode's
-//! today, craze's from plan 025 C7/C8 — cannot drift apart at either level.
+//! adapter's streams must keep, written once, so the adapters — opencode's,
+//! and craze's (its source since plan 025 C7, its lane from C8) — cannot drift
+//! apart at either level.
 //!
 //! A test drives an adapter and feeds every frame it receives through a checker
 //! — [`LaneChecker`] for an [`AgentLane::subscribe`](super::AgentLane::subscribe)
 //! stream, [`SourceChecker`] for an
-//! [`AgentSource::subscribe`](super::AgentSource::subscribe) one. Today that is
-//! opencode's (`shed-opencode`'s `tests/conformance.rs`, against
-//! `FakeOpencode`); craze's adapter, which arrives in plan 025 C7/C8, will run
-//! the same kit against the recipe's real hub. The first frame
+//! [`AgentSource::subscribe`](super::AgentSource::subscribe) one: opencode's
+//! (`shed-opencode`'s `tests/conformance.rs`, against `FakeOpencode`), and
+//! craze's source against craze's own hermetic recipe — the real hub
+//! (`shed-craze`'s `tests/recipe_source.rs`); craze's lane joins it in C8. The
+//! first frame
 //! that breaks a rule is a [`Violation`] naming the [`Rule`], the frame's index
 //! and what was wrong. [`drive_lane`]/[`drive_source`] do the reading;
 //! [`check_lane`]/[`check_source`] judge a recorded slice.
