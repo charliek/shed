@@ -88,43 +88,24 @@ pub struct Env {
     /// never read outside test mode — and never read in a release build either,
     /// for the reason on [`exec_seam`].
     pub roost_jail_fs_root: bool,
-    /// **The** directory the gx lane's LOCAL credential reader looks in for its
-    /// discovery record and token — already resolved, so the lane layer makes no
-    /// decision about it and reads no environment of its own.
+    /// TEST-ONLY craze seam: `SHED_TAURI_CRAZE_PATH`, a directory this
+    /// machine's craze source finds `craze` in (plan 025 §3.6.1). When set, the
+    /// local dial runs the JAILED ladder (rungs 1–2 only) with `PATH` set to
+    /// it and nothing else of this process's environment but
+    /// [`Self::craze_env`]; when unset in test mode there is no local craze
+    /// source at all.
     ///
-    /// [`shed_gx::gx_home`]'s three candidates, applied here in its order:
-    ///
-    /// 1. `SHED_TAURI_GX_HOME`, the TEST-ONLY override. It is what lets the
-    ///    harness seed a fixture home with a fake token and a fake record and
-    ///    have the shipped reader — checks and all — find them. **Test mode
-    ///    only**, and the outright winner when it is set: a stray var must never
-    ///    point a production lane at somebody else's token.
-    /// 2. the user's own `$GROK_HOME`, honoured only OUTSIDE test mode. A
-    ///    hermetic run redirects `$HOME` to the harness runtime dir, but nothing
-    ///    clears `$GROK_HOME`, so honouring an inherited one would let a cell
-    ///    read the developer's real token.
-    /// 3. `$HOME/.grok`.
-    ///
-    /// The gate over 1 and 2 is [`gx_homes`], which is where that promise is
-    /// tested. Resolving the whole path here rather than passing the candidates
-    /// down is what keeps this the ONLY place the three are weighed — and what
-    /// keeps `$HOME` read beside every other env read in this file.
-    pub gx_home: PathBuf,
-    /// The gx adapter's windows, with `SHED_TAURI_GX_TIMINGS_MS` applied.
-    ///
-    /// A harness cannot wait out a thirty-second stall window, so
-    /// [`shed_gx::GxTimings`] takes its windows as constructor options and this
-    /// is where the app's come from. The var is a comma-separated
-    /// `<field>=<milliseconds>` list over the four DURATION fields —
-    /// `stall`, `resume_window`, `flush_after`, `down_after` — e.g.
-    /// `stall=2000,flush_after=300,down_after=6000`. Anything unnamed keeps
-    /// [`shed_gx::GxTimings::default`]'s value.
-    ///
-    /// **Test mode only**, and a malformed pair is DROPPED rather than fatal —
-    /// [`Self::roost_sockets`]'s rule, for the same reason: a launch that dies
-    /// on a typo is harder to debug than a lane whose window is visibly the
-    /// default.
-    pub gx_timings: shed_gx::GxTimings,
+    /// It decides which binary the app execs, so it is an [`exec_seam`]: test
+    /// mode AND a debug build, like [`Self::ssh_bin`] — a release build
+    /// ignores it, whatever the mode says.
+    pub craze_path: Option<PathBuf>,
+    /// What the jailed local craze dial passes through from this process's own
+    /// environment beside the seam's `PATH`: `HOME`, `CRAZE_HOME` and
+    /// `CRAZE_RUNTIME_DIR`, those that are set. The harness sets short ones
+    /// (a craze runtime dir must be short, 0700, and under no group-writable
+    /// ancestor). Read only alongside [`Self::craze_path`], so empty in
+    /// production.
+    pub craze_env: Vec<(String, String)>,
     /// The host-agent `extensions.yaml` the EMBEDDED broker loads (`SHED_TAURI_EXTENSIONS_CONFIG`,
     /// else the daemon default `~/.config/shed/extensions.yaml`). Only read in embedded /
     /// headless-coexist mode; external mode never touches it. The harness overrides it to
@@ -184,23 +165,6 @@ impl Env {
         } else {
             HashMap::new()
         };
-        // The gx credential seam's two test-mode knobs. Same rule as the two
-        // above — parsed ONLY in test mode, so a stray `SHED_TAURI_GX_HOME` in
-        // a developer's shell can never redirect a production lane's token read.
-        // Resolved to one path right here: see [`Env::gx_home`].
-        let (gx_seam, grok_home) = gx_homes(test_mode, var("SHED_TAURI_GX_HOME"), var("GROK_HOME"));
-        let gx_home = shed_gx::gx_home(
-            gx_seam.as_deref(),
-            grok_home.as_deref(),
-            &std::env::var_os("HOME")
-                .map(PathBuf::from)
-                .unwrap_or_default(),
-        );
-        let gx_timings = if test_mode {
-            gx_timings_from(var("SHED_TAURI_GX_TIMINGS_MS").as_deref())
-        } else {
-            shed_gx::GxTimings::default()
-        };
         // Both are test-mode-only AND debug-build-only for the reason on
         // [`exec_seam`]: each decides which binary the app (or the far side)
         // execs. The gates are [`exec_seam`] / [`jail_flag`], which is where
@@ -217,9 +181,28 @@ impl Env {
             RELEASE_BUILD,
             var("SHED_TAURI_ROOST_JAIL").as_deref(),
         );
-        for refusal in [ssh_refusal, jail_refusal].into_iter().flatten() {
+        let (craze_path, craze_refusal) = exec_seam(
+            test_mode,
+            RELEASE_BUILD,
+            "SHED_TAURI_CRAZE_PATH",
+            var("SHED_TAURI_CRAZE_PATH"),
+        );
+        for refusal in [ssh_refusal, jail_refusal, craze_refusal]
+            .into_iter()
+            .flatten()
+        {
             eprintln!("{refusal}");
         }
+        // Only beside the seam: the jailed dial is the one consumer, and a
+        // production run passes the whole environment through anyway.
+        let craze_env = if craze_path.is_some() {
+            ["HOME", "CRAZE_HOME", "CRAZE_RUNTIME_DIR"]
+                .into_iter()
+                .filter_map(|k| var(k).map(|v| (k.to_string(), v)))
+                .collect()
+        } else {
+            Vec::new()
+        };
         Self {
             test_mode,
             mock_base_url: var("SHED_TAURI_MOCK_BASE_URL"),
@@ -227,8 +210,8 @@ impl Env {
             roost_sockets,
             ssh_bin: ssh_bin.map(PathBuf::from),
             roost_jail_fs_root,
-            gx_home,
-            gx_timings,
+            craze_path: craze_path.map(PathBuf::from),
+            craze_env,
             config_path,
             socket_path: var("SHED_TAURI_SOCKET")
                 .map(PathBuf::from)
@@ -255,15 +238,17 @@ impl Env {
             roost_sockets: self.roost_sockets.clone(),
             ssh_bin: self.ssh_bin.clone(),
             test_mode: self.test_mode,
+            craze_path: self.craze_path.clone(),
+            craze_env: self.craze_env.clone(),
         }
     }
 }
 
 /// A knob that exists only in test mode.
 ///
-/// A pure function rather than an inline `if` for the reason [`gx_homes`] gives:
-/// "a stray variable in a developer's shell must never steer a shipped app" is a
-/// promise, and a promise is worth a test. This one carries the two plan-019
+/// A pure function rather than an inline `if`: "a stray variable in a
+/// developer's shell must never steer a shipped app" is a promise, and a
+/// promise is worth a test. This one carries the two plan-019
 /// seams, both of which decide **which binary gets exec'd** —
 /// [`Env::ssh_bin`] locally and [`Env::roost_jail_fs_root`] on the far side.
 fn test_only<T>(test_mode: bool, value: Option<T>) -> Option<T> {
@@ -292,8 +277,10 @@ const RELEASE_BUILD: bool = !cfg!(debug_assertions);
 /// rather than silent: a harness that somehow ran against a release binary must
 /// read as a loud misconfiguration, not as a mysteriously real `ssh`.
 ///
-/// **Only these two.** The other seams in this file — `SHED_TAURI_MOCK_BASE_URL`,
-/// `SHED_TAURI_ROOST_SOCKETS`, `SHED_TAURI_SHED_CONFIG`, `SHED_TAURI_GX_HOME` —
+/// **Only these three** (`SHED_TAURI_CRAZE_PATH` joined the two plan-019
+/// seams in plan 025: it picks the directory the local craze dial execs
+/// from). The other seams in this file — `SHED_TAURI_MOCK_BASE_URL`,
+/// `SHED_TAURI_ROOST_SOCKETS`, `SHED_TAURI_SHED_CONFIG` —
 /// redirect an HTTP base, a socket path or a config path: the worst they do is
 /// point this process's own reads somewhere unhelpful. These two pick an
 /// executable (locally, and on the far side of an ssh), which is the difference
@@ -331,67 +318,6 @@ fn exec_seam<T>(
 fn jail_flag(test_mode: bool, release_build: bool, raw: Option<&str>) -> (bool, Option<String>) {
     let (value, refusal) = exec_seam(test_mode, release_build, "SHED_TAURI_ROOST_JAIL", raw);
     (value == Some("1"), refusal)
-}
-
-/// Which of the two `$GROK_HOME` overrides survives, given the mode.
-///
-/// A pure function so the gate is TESTABLE rather than merely visible: it is the
-/// whole of the hermeticity promise on [`Env::gx_home`], and "the app must not
-/// read a real token in a hermetic run" is not a claim to leave to a reading of
-/// `from_process`.
-///
-/// The two are mutually exclusive by construction. In test mode only the
-/// harness's override is honoured and an inherited `GROK_HOME` is DROPPED — a
-/// hermetic launch redirects `$HOME` but nothing clears `GROK_HOME`, so
-/// honouring it would let a cell read the developer's own `~/.grok`. Outside
-/// test mode it is the reverse: `SHED_TAURI_GX_HOME` is a test seam and must
-/// never redirect a production lane's token read.
-fn gx_homes(
-    test_mode: bool,
-    gx_home: Option<String>,
-    grok_home: Option<String>,
-) -> (Option<PathBuf>, Option<PathBuf>) {
-    if test_mode {
-        (gx_home.map(PathBuf::from), None)
-    } else {
-        (None, grok_home.map(PathBuf::from))
-    }
-}
-
-/// Apply `SHED_TAURI_GX_TIMINGS_MS` to [`shed_gx::GxTimings::default`].
-///
-/// The syntax is `<field>=<milliseconds>`, comma separated, over the four
-/// DURATION fields — the only ones a harness needs to shrink, and the only ones
-/// whose unit the var's name can promise. `resume_tries`, `seed_limit` and
-/// `rest_cap` are not durations and are deliberately not settable here: a knob
-/// whose name says `_MS` should not silently accept a count.
-///
-/// **Every malformed pair is dropped, never fatal** — [`Env::roost_sockets`]'s
-/// rule. An unknown field, a non-numeric value or a missing `=` leaves that
-/// window at its default, which is a visible symptom (the cell waits out a real
-/// window and times out) rather than an app that will not launch.
-fn gx_timings_from(spec: Option<&str>) -> shed_gx::GxTimings {
-    let mut timings = shed_gx::GxTimings::default();
-    let Some(spec) = spec else {
-        return timings;
-    };
-    for pair in spec.split(',') {
-        let Some((field, millis)) = pair.split_once('=') else {
-            continue;
-        };
-        let Ok(millis) = millis.trim().parse::<u64>() else {
-            continue;
-        };
-        let value = std::time::Duration::from_millis(millis);
-        match field.trim() {
-            "stall" => timings.stall = value,
-            "resume_window" => timings.resume_window = value,
-            "flush_after" => timings.flush_after = value,
-            "down_after" => timings.down_after = value,
-            _ => {}
-        }
-    }
-    timings
 }
 
 /// The embedded broker's `extensions.yaml`, matching where `shed-host-agent` reads it
@@ -452,9 +378,7 @@ fn default_socket_path() -> PathBuf {
     dir.join("shed-tauri.sock")
 }
 
-/// The uid the app runs as — what the gx token file's owner check compares
-/// against ([`shed_gx::read_token_file`]), and what the IPC socket path falls
-/// back to.
+/// The uid the app runs as — what the IPC socket path falls back to.
 pub(crate) fn current_uid() -> u32 {
     // getuid() is infallible and has no safety preconditions.
     unsafe { libc::getuid() }
@@ -463,45 +387,6 @@ pub(crate) fn current_uid() -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// **A hermetic run cannot reach a real `~/.grok`.**
-    ///
-    /// The harness redirects `$HOME`, so the `~/.grok` fallback is already
-    /// contained — but `$GROK_HOME` is an absolute path nobody clears, and it
-    /// used to be read un-gated at the point of use. Honouring it in test mode
-    /// would have let any cell that opens a gx lane read the developer's own
-    /// token, which is exactly what `Env::gx_home`'s doc promises cannot happen.
-    #[test]
-    fn test_mode_drops_an_inherited_grok_home_and_production_drops_the_test_seam() {
-        let (gx, grok) = gx_homes(
-            true,
-            Some("/fixture/home".into()),
-            Some("/home/dev/.grok".into()),
-        );
-        assert_eq!(gx, Some(PathBuf::from("/fixture/home")));
-        assert_eq!(
-            grok, None,
-            "an inherited GROK_HOME never reaches a test run"
-        );
-
-        // …and with no fixture home set, test mode still refuses it: the reader
-        // falls through to `$HOME/.grok`, which the harness has redirected.
-        let (gx, grok) = gx_homes(true, None, Some("/home/dev/.grok".into()));
-        assert_eq!((gx, grok), (None, None));
-
-        // Production is the mirror image: the test seam is inert, the user's own
-        // var is honoured.
-        let (gx, grok) = gx_homes(
-            false,
-            Some("/fixture/home".into()),
-            Some("/home/dev/.grok".into()),
-        );
-        assert_eq!(gx, None, "the test seam never redirects a production lane");
-        assert_eq!(grok, Some(PathBuf::from("/home/dev/.grok")));
-
-        let (gx, grok) = gx_homes(false, None, None);
-        assert_eq!((gx, grok), (None, None), "neither set: ~/.grok");
-    }
 
     /// **Neither plan-019 seam exists outside test mode** — and each of them
     /// decides which binary something execs, which is why they are gated at all
@@ -592,6 +477,22 @@ mod tests {
             );
         }
 
+        // The craze seam rides the same gate (plan 025 §3.6.1): it picks the
+        // directory the local craze dial execs from.
+        let (craze, refusal) = exec_seam(true, RELEASE, "SHED_TAURI_CRAZE_PATH", Some("/fake/bin"));
+        assert_eq!(craze, None, "a release build never execs a test craze");
+        assert!(refusal.is_some_and(|r| r.contains("SHED_TAURI_CRAZE_PATH")));
+        assert_eq!(
+            exec_seam(
+                true,
+                RELEASE_BUILD,
+                "SHED_TAURI_CRAZE_PATH",
+                Some("/fake/bin")
+            ),
+            (Some("/fake/bin"), None),
+            "and a test build honours it"
+        );
+
         // Nothing set, nothing said: the line is about a variable that was SEEN.
         assert_eq!(
             exec_seam::<&str>(true, RELEASE, "SHED_TAURI_SSH_BIN", None),
@@ -616,35 +517,5 @@ mod tests {
             "a test build honours the seam the harness sets"
         );
         assert_eq!(jail_flag(true, RELEASE_BUILD, Some("1")), (true, None));
-    }
-
-    /// The gx window knob parses what it names and drops everything else, so a
-    /// typo in a harness launch costs one defaulted window rather than the app.
-    #[test]
-    fn gx_timings_apply_the_named_windows_and_drop_the_rest() {
-        let d = shed_gx::GxTimings::default();
-        assert_eq!(gx_timings_from(None), d, "no var, no change");
-
-        let t = gx_timings_from(Some(
-            "stall=2000, resume_window=3000,flush_after=250,down_after=6000",
-        ));
-        assert_eq!(t.stall, std::time::Duration::from_millis(2000));
-        assert_eq!(t.resume_window, std::time::Duration::from_millis(3000));
-        assert_eq!(t.flush_after, std::time::Duration::from_millis(250));
-        assert_eq!(t.down_after, std::time::Duration::from_millis(6000));
-        // Untouched: the non-duration fields are not settable here.
-        assert_eq!(t.resume_tries, d.resume_tries);
-        assert_eq!(t.seed_limit, d.seed_limit);
-        assert_eq!(t.rest_cap, d.rest_cap);
-
-        // A bare word, an unknown field, a non-number, and a count field that
-        // does not belong here: each is dropped on its own, and `stall` — the
-        // one well-formed pair in the line — still lands.
-        let t = gx_timings_from(Some(
-            "nonsense,unknown=5,stall=1500,flush_after=soon,resume_tries=1",
-        ));
-        assert_eq!(t.stall, std::time::Duration::from_millis(1500));
-        assert_eq!(t.flush_after, d.flush_after);
-        assert_eq!(t.resume_tries, d.resume_tries);
     }
 }

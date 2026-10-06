@@ -27,7 +27,7 @@ func e2eContext(t *testing.T) context.Context {
 // than from anything this side arranged.
 func TestProbeThroughFakeSSH(t *testing.T) {
 	r := newRig(t, rigOpts{
-		agents:  []string{"claude", "opencode", "gx"},
+		agents:  []string{"claude", "opencode"},
 		landing: "proj",
 	})
 
@@ -48,11 +48,10 @@ func TestProbeThroughFakeSSH(t *testing.T) {
 		t.Errorf("the landing dir exists but the probe did not find it")
 	}
 
-	// Keyed by KIND; `cursor-agent` is a binary and `cursor` is a kind.
+	// Keyed by KIND; `claude` is a binary and `claude-rc` is a kind.
 	want := map[string]string{
 		"claude-rc": filepath.Join(r.home, ".local", "bin", "claude"),
 		"opencode":  filepath.Join(r.home, ".local", "bin", "opencode"),
-		"gx":        filepath.Join(r.home, ".local", "bin", "gx"),
 	}
 	if len(got.Found) != len(want) {
 		t.Fatalf("found = %v, want %v", got.Found, want)
@@ -81,22 +80,22 @@ func TestProbeWithNoAgentsAndNoLandingDir(t *testing.T) {
 	host := Token{Machine: "mini2"}
 	m := AgentMenu(host, got)
 	assertNoneRow(t, m.Items[0], "no agents found on mini2",
-		"looked for claude, codex, cursor-agent, opencode, gx, grok under bash -lc")
+		"looked for claude, opencode under bash -lc")
 }
 
 // TestProbeDoesNotOfferANonExecutableAgent: `command -v` under a login shell is
 // the SAME lookup the tab's `bash -lc 'exec "$@"'` will do, and a file without
 // an execute bit is not on it. Offering one would put a dead tab in the palette.
 func TestProbeDoesNotOfferANonExecutableAgent(t *testing.T) {
-	r := newRig(t, rigOpts{agents: []string{"codex"}})
-	if err := os.Chmod(filepath.Join(r.home, ".local", "bin", "codex"), 0o644); err != nil {
+	r := newRig(t, rigOpts{agents: []string{"opencode"}})
+	if err := os.Chmod(filepath.Join(r.home, ".local", "bin", "opencode"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	got, err := r.remote.Probe(e2eContext(t), r.target(), "")
 	if err != nil {
 		t.Fatalf("Probe: %v", err)
 	}
-	if _, ok := got.Found["codex"]; ok {
+	if _, ok := got.Found["opencode"]; ok {
 		t.Errorf("a non-executable file was offered as an agent")
 	}
 }
@@ -147,7 +146,7 @@ func TestBridgeOpsThroughFakeSSH(t *testing.T) {
 	}
 
 	params, err := TabOpenFor(Token{
-		Machine: "mini2", Agent: "cursor", Home: "/home/shed", Cwd: "/home/shed/roost", Project: "1",
+		Machine: "mini2", Agent: "opencode", Home: "/home/shed", Cwd: "/home/shed/roost", Project: "1",
 	})
 	if err != nil {
 		t.Fatalf("TabOpenFor: %v", err)
@@ -163,8 +162,8 @@ func TestBridgeOpsThroughFakeSSH(t *testing.T) {
 	want := []string{
 		`{"id":"1","op":"session.identify","params":{}}`,
 		`{"id":"1","op":"tab.list","params":{}}`,
-		`{"id":"1","op":"tab.open","params":{"project_id":"1","cwd":"/home/shed/roost","title":"cursor",` +
-			`"argv":["bash","-lc","exec \"$@\"","shed","cursor-agent"]}}`,
+		`{"id":"1","op":"tab.open","params":{"project_id":"1","cwd":"/home/shed/roost","title":"opencode",` +
+			`"argv":["bash","-lc","exec \"$@\"","shed","opencode"]}}`,
 	}
 	assertSeq(t, "request lines", r.requestLines(), want)
 }
@@ -490,7 +489,7 @@ func assertReachClass(t *testing.T, err error, class SSHClass, phase ReachPhase)
 // TestActivateStepTwoEndToEnd is §3.2 step 2 as a whole: probe, identify, build
 // the agent menu, and confirm every row's id is a token the NEXT step can read.
 func TestActivateStepTwoEndToEnd(t *testing.T) {
-	r := newRig(t, rigOpts{agents: []string{"claude", "codex", "cursor-agent"}})
+	r := newRig(t, rigOpts{agents: []string{"claude", "opencode"}})
 	ctx := e2eContext(t)
 	host := Token{Shed: "dev", Server: "my-server"}
 
@@ -503,7 +502,7 @@ func TestActivateStepTwoEndToEnd(t *testing.T) {
 	}
 
 	m := AgentMenu(host, probe)
-	if len(m.Items) != 3 {
+	if len(m.Items) != 2 {
 		t.Fatalf("rows = %+v", m.Items)
 	}
 	for _, row := range m.Items {
@@ -524,7 +523,7 @@ func TestActivateStepTwoEndToEnd(t *testing.T) {
 // count, including the one-candidate collapse.
 func TestActivateStepThreeEndToEnd(t *testing.T) {
 	t.Run("zero projects and no landing dir collapses straight to open", func(t *testing.T) {
-		r := newRig(t, rigOpts{agents: []string{"codex"}})
+		r := newRig(t, rigOpts{agents: []string{"opencode"}})
 		ctx := e2eContext(t)
 
 		probe, err := r.remote.Probe(ctx, r.target(), "")
@@ -539,7 +538,7 @@ func TestActivateStepThreeEndToEnd(t *testing.T) {
 			t.Fatalf("projects = %+v", projects)
 		}
 
-		tok := Token{Machine: "mini2", Agent: "codex", Home: probe.Home}
+		tok := Token{Machine: "mini2", Agent: "opencode", Home: probe.Home}
 		candidates := WorkdirCandidates(projects, probe.Home, "", probe.LandingDirExists)
 		opened, collapsed := CollapseWorkdirs(tok, candidates)
 		if !collapsed {
@@ -570,7 +569,7 @@ func TestActivateStepThreeEndToEnd(t *testing.T) {
 
 	t.Run("several projects offer a menu that does not collapse", func(t *testing.T) {
 		r := newRig(t, rigOpts{
-			agents:  []string{"codex"},
+			agents:  []string{"opencode"},
 			landing: "proj",
 			projects: []Project{
 				{ID: "1", Name: "roost", Cwd: "/src/roost"},
@@ -588,7 +587,7 @@ func TestActivateStepThreeEndToEnd(t *testing.T) {
 			t.Fatalf("TabList: %v", err)
 		}
 
-		tok := Token{Machine: "mini2", Agent: "codex", Home: probe.Home}
+		tok := Token{Machine: "mini2", Agent: "opencode", Home: probe.Home}
 		candidates := WorkdirCandidates(projects, probe.Home, filepath.Join(r.home, "proj"), probe.LandingDirExists)
 		if _, collapsed := CollapseWorkdirs(tok, candidates); collapsed {
 			t.Fatalf("four candidates collapsed")
@@ -728,7 +727,7 @@ func TestEmptyResultIsAProviderFailure(t *testing.T) {
 		r.replaceReply("tabopen", `{"id":"1","ok":true,"result":{}}`)
 
 		params, err := TabOpenFor(Token{
-			Machine: "mini2", Agent: "codex", Home: "/home/shed", Cwd: "/home/shed",
+			Machine: "mini2", Agent: "claude-rc", Home: "/home/shed", Cwd: "/home/shed",
 		})
 		if err != nil {
 			t.Fatalf("TabOpenFor: %v", err)
@@ -749,7 +748,7 @@ func TestEmptyResultIsAProviderFailure(t *testing.T) {
 		if _, err := r.remote.Identify(ctx, r.target()); err != nil {
 			t.Errorf("Identify against roost's own vector: %v", err)
 		}
-		params, err := TabOpenFor(Token{Machine: "mini2", Agent: "codex", Cwd: "/home/shed"})
+		params, err := TabOpenFor(Token{Machine: "mini2", Agent: "claude-rc", Cwd: "/home/shed"})
 		if err != nil {
 			t.Fatalf("TabOpenFor: %v", err)
 		}

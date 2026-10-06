@@ -73,24 +73,37 @@ export function ImageChip({ children }: { children: React.ReactNode }) {
   );
 }
 
-/** agent kind → left-border accent color (claude=orange, codex=green, cursor=violet,
-    opencode=blue, everything else muted). */
+/** agent kind → left-border accent color (claude=orange, opencode=blue,
+    everything else muted — including craze for now, kept minimal; C9 gives
+    it its own colour if the row needs one). codex/cursor/gx/grok left this
+    table in plan 025 (shed#390): a row of one of those kinds now falls
+    through to the muted default, same as any other unrecognized kind. */
 const AGENT_COLOR: Record<string, string> = {
   "claude-rc": "var(--shed-accent)",
   "claude-code": "var(--shed-accent)",
-  codex: "#10A37F",
-  "codex-rc": "#10A37F",
-  cursor: "#6E56CF",
   opencode: "#3B82F6",
-  // One colour for both, because they are one agent: `gx` is a grok tab whose
-  // remote lane is up, `grok` the same tab before (or without) it. A rail that
-  // changed colour when the lane bound would read as the agent being replaced.
-  gx: "#E5484D",
-  grok: "#E5484D",
+  // craze — the provider abstraction (plan 025): cursor, grok, gx and native
+  // sessions behind one machine-level hub.
+  craze: "#8B5CF6",
   shell: "var(--shed-text-muted)",
 };
 export function agentColor(kind: string): string {
   return AGENT_COLOR[kind] ?? "var(--shed-text-muted)";
+}
+
+/** A quiet fact chip — a craze session's provider, its model (plan 025
+ *  §3.6.5): mono, muted, borderless, so it reads as a label beside the kind
+ *  badge rather than a second one. */
+export function FactChip({ label, title }: { label: string; title?: string }) {
+  return (
+    <span
+      title={title}
+      className="flex-none truncate rounded-[5px] bg-shed-inset font-mono text-[11.5px] leading-none text-shed-text-secondary"
+      style={{ padding: "4px 7px", maxWidth: 180 }}
+    >
+      {label}
+    </span>
+  );
 }
 
 /** The agent-kind badge — the raw kind in a bordered pill with a kind-colored left rail. */

@@ -3,7 +3,7 @@
    op (via the `navigate` Tauri event); the rendered pane + a computed-style sample
    are reported back to Rust (useUiBridge) so the harness can assert them over IPC.
    The shared visual vocabulary lives in components/{primitives,dialog}. */
-import { useCallback, useEffect, useId, useLayoutEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from "react";
 import {
   Boxes, Shield, Sparkles, ScrollText, Globe, HardDrive, Box, Plus,
   Terminal, RotateCw, Square, Play, Trash2, RefreshCw, ExternalLink, Key, Server,
@@ -13,15 +13,22 @@ import { cn } from "@/lib/utils";
 import owlOrange from "@/assets/owl-orange.svg";
 import owlAmber from "@/assets/owl-amber.svg";
 import {
-  cardCls, Dot, StatusChip, Tag, ImageChip, KindBadge, ActBtn, GhostBtn,
+  cardCls, Dot, StatusChip, Tag, ImageChip, KindBadge, FactChip, ActBtn, GhostBtn,
   PageHead, HeadAction, RefreshHeadButton, Empty, agentColor, type Tone,
 } from "@/components/primitives";
 import { Scrim, DialogShell, Field, Select, Segmented, dialogInput, dialogBtnSecondary, useEscClose } from "@/components/dialog";
 import { LanePanel } from "@/components/LanePanel";
+import { CrazeCreateDialog } from "@/components/CrazeCreateDialog";
+import { canOpenTerminal, crazeDoingLine, crazeMachineNote, killTarget } from "@/lib/crazeRows";
+import {
+  EMPTY_DRAFT, beginSubmit, closesOntoTranscript, crazeCreateOffered, crazeCreateUpdateNote,
+  edit as editCrazeDraft, groupMachine, liveSetter, settle, sheetOnScreen,
+  type CrazeDraft,
+} from "@/lib/crazeCreate";
 import { RoostLine, RoostConsentDialog, Toast } from "@/components/RoostBootstrap";
 import {
   roostBootstrap, roostPreview, roostProgressSteps, roostToastFor, roostDumpRow,
-  reportShedRoost, renderedText, useRoostBoard,
+  reportShedRoost, renderedText, renderedValues, useRoostBoard,
   type RoostPreview, type RoostToast, type RoostCardState, type RoostDumpRow,
 } from "@/lib/roost";
 import {
@@ -30,7 +37,8 @@ import {
   fetchApprovals, decideApproval, fetchActivity, fetchGateNamespaces,
   fetchEgressProfiles, reportEgress, inTauri,
   openPreferences, setAppearanceState,
-  rcLaunch, machineLaunch, machineCapabilities, killSession, sessionKey, reportAgents, reportLaunchDialog, reportMachinesPane, useRcSessions, openMachineTerminal, addMachine,
+  rcLaunch, machineLaunch, roostRun, machineCapabilities, killSession, sessionKey, reportAgents, reportLaunchDialog, reportMachinesPane, useRcSessions, openMachineTerminal, addMachine,
+  crazeCreate, crazeOpenTerminal, laneFailure,
   useCoordinatorData, useNowTick, shedsEmptyState, hostFailureFor, attachKind, capabilitiesFor,
   type Pane, type Shed, type HostDiskUsage, type HostFailure,
   type Modal, type CreateProgress, type Approval, type AuditEntry,
@@ -501,15 +509,14 @@ function ApprovalsPane({ approvals }: { approvals: Approval[] }) {
 }
 
 /* ---- Agents / remote-control ---------------------------------------------- */
-/** Human labels for the creatable kinds (the gated set is capability-derived). */
+/** Human labels for the creatable kinds (the gated set is capability-derived).
+ *  `codex`/`cursor`/`gx`/`grok` left this table in plan 025 (shed#390) — a
+ *  row of one of those kinds renders through the `?? k` fallback below, its
+ *  raw kind string, which is the plain-row contract (D1). `craze` is the one
+ *  addition: craze's own lane, named rather than left as a raw string. */
 const RC_KIND_LABELS: Record<string, string> = {
-  "claude-rc": "Claude", codex: "Codex", opencode: "opencode",
-  cursor: "Cursor", shell: "Shell",
-  // Two kinds, one binary family. `gx` is the lane-bearing one — a grok tab
-  // that bound its remote lane — and `grok` is the same agent without one:
-  // status only, no transcript. The labels keep them apart on purpose, because
-  // whether a row has a Transcript affordance is exactly the difference.
-  gx: "gx", grok: "Grok",
+  "claude-rc": "Claude", opencode: "opencode", shell: "Shell",
+  craze: "Craze",
 };
 const rcKindLabel = (k: RcKind): string => RC_KIND_LABELS[k] ?? k;
 
@@ -521,8 +528,8 @@ function rcStateTone(state: RcState): Tone {
   return "attention";
 }
 
-function AgentsPane({ sessions, machines, capabilities, load, loadError, onLaunch, refresh, onTranscript, onSetUpRoost }:
-  { sessions: RcSession[]; machines: MachineStatus[]; capabilities: Record<string, RcCapabilities>; load: AgentsLoad; loadError: string | null; onLaunch: () => void; refresh: () => void; onTranscript: (s: RcSession) => void; onSetUpRoost: () => void }) {
+function AgentsPane({ sessions, machines, capabilities, load, loadError, onLaunch, refresh, onTranscript, onSetUpRoost, onCrazeCreate }:
+  { sessions: RcSession[]; machines: MachineStatus[]; capabilities: Record<string, RcCapabilities>; load: AgentsLoad; loadError: string | null; onLaunch: () => void; refresh: () => void; onTranscript: (s: RcSession) => void; onSetUpRoost: () => void; onCrazeCreate: (machine: string) => void }) {
   const [error, setError] = useState<string | null>(null);
   // The empty state is a VALUE, not inline JSX: it is reported as UI truth so
   // `agents.dump` can assert the words — the `dashboard.dump.empty` rule, and
@@ -577,7 +584,13 @@ function AgentsPane({ sessions, machines, capabilities, load, loadError, onLaunc
         // said once per group instead of once per card.
         groupBy(sessions, sessionOrigin).map(([origin, rows]) => (
           <div key={origin} className="mb-[22px] last:mb-0">
-            <HostLabel host={origin} />
+            {/* The group's heading — and, on a machine whose craze can create
+                one (live with the capability, or dormant: plan 025 §3.6.5),
+                its "New craze session". */}
+            <div className="flex items-start justify-between gap-3">
+              <HostLabel host={origin} />
+              <CrazeCreateAction machine={groupMachine(origin, rows, machines)} onCrazeCreate={onCrazeCreate} compact />
+            </div>
             <div className="flex flex-col gap-3">
               {rows.map((s) => (
                 // Keyed by ORIGIN, not host/shed: a machine session's shed is
@@ -616,12 +629,14 @@ function machineDetailLine(m: MachineStatus, sessions: number): string {
  *  `detail` is shown verbatim because "no route to host" and "nothing is
  *  listening on 1029" are different problems with different fixes, and
  *  flattening them to "offline" would throw away the only actionable part. */
-function MachineCard({ machine: m, sessions, waiting, roostState, roostBusy, onOpenConsent }:
+function MachineCard({ machine: m, sessions, waiting, roostState, roostBusy, onOpenConsent, onCrazeCreate }:
   {
     machine: MachineStatus; sessions: number; waiting: number;
     roostState: RoostCardState | undefined; roostBusy: string | undefined;
     onOpenConsent: (target: string, preview: RoostPreview) => void;
+    onCrazeCreate: (machine: string) => void;
   }) {
+  const crazeNote = crazeMachineNote(m.craze) ?? crazeCreateUpdateNote(m.craze);
   return (
     <div
       className={cn(cardCls, "flex flex-col gap-1 px-[18px] py-4")}
@@ -644,9 +659,43 @@ function MachineCard({ machine: m, sessions, waiting, roostState, roostBusy, onO
             {machineDetailLine(m, sessions)}
           </div>
         </div>
+        <CrazeCreateAction machine={m} onCrazeCreate={onCrazeCreate} />
       </div>
       <RoostLine target={m.origin} state={roostState} busyDetail={roostBusy} onOpenConsent={onOpenConsent} />
+      {/* This machine's craze, when there is something to say about it — a
+          craze too old for shed says so, and what to do; a live hub that
+          cannot create says to update it (listing still works); a machine
+          with no craze at all says nothing (plan 025 §3.6.5, §3.8). */}
+      {crazeNote && (
+        <div className="font-mono text-[12px]" style={{ color: "var(--shed-warn-fg)" }} data-craze-note>
+          {crazeNote}
+        </div>
+      )}
     </div>
+  );
+}
+
+/** "New craze session" on a machine (plan 025 §3.8): offered where its craze
+ *  can create one — a live hub with the capability, or a DORMANT machine,
+ *  whose sheet opening is the explicit action that starts its hub (§3.6.5).
+ *  Too old, offline, absent or not installed: nothing (the card's note says
+ *  why when there is something to say). */
+function CrazeCreateAction({ machine: m, onCrazeCreate, compact }:
+  { machine: MachineStatus | undefined; onCrazeCreate: (machine: string) => void; compact?: boolean }) {
+  if (!m || !crazeCreateOffered(m.craze)) return null;
+  return (
+    <button
+      data-craze-create-action={m.name}
+      onClick={() => onCrazeCreate(m.name)}
+      title={`Start a craze session on ${m.name}: pick a provider, a directory and an optional first prompt`}
+      className={cn(
+        "hlink inline-flex flex-none items-center gap-1.5 rounded-[8px] font-semibold",
+        compact ? "-mt-1 px-2 py-1 text-[12px]" : "px-3 py-2 text-[13px]",
+      )}
+      style={{ color: "var(--shed-accent)" }}
+    >
+      <Plus size={compact ? 13 : 15} /> New craze session
+    </button>
   );
 }
 
@@ -659,9 +708,10 @@ function MachineCard({ machine: m, sessions, waiting, roostState, roostBusy, onO
  *  `sx` reads) and are read ONCE at startup, so there is deliberately no add/edit
  *  affordance here — an in-app editor that silently needed a relaunch would be
  *  worse than the file. */
-function MachinesPane({ machines, sessions, refresh, onNew, roostTick, onOpenConsent, roostBusy }: {
+function MachinesPane({ machines, sessions, refresh, onNew, roostTick, onOpenConsent, roostBusy, onCrazeCreate }: {
   machines: MachineStatus[]; sessions: RcSession[]; refresh: () => void; onNew: () => void;
   roostTick: number; onOpenConsent: (target: string, preview: RoostPreview) => void; roostBusy: Record<string, string>;
+  onCrazeCreate: (machine: string) => void;
 }) {
   useEffect(() => { refresh(); }, [refresh]);
   const reachable = machines.filter((m) => m.reachable).length;
@@ -686,6 +736,10 @@ function MachinesPane({ machines, sessions, refresh, onNew, roostTick, onOpenCon
     detail: machineDetailLine(m, rows.length),
     sessions: rows.map((s) => s.slug),
     waiting,
+    craze_note: crazeMachineNote(m.craze) ?? crazeCreateUpdateNote(m.craze),
+    // Whether the card offers "New craze session" — the same rule its button
+    // is rendered by (plan 025 §3.6.5).
+    craze_create: crazeCreateOffered(m.craze),
     // The plan-matrix status line + button, as rendered — the SAME data
     // `MachineCard`'s `RoostLine` reads, so `machines.dump` can never claim a
     // word the card doesn't show (the pane's own rule, extended to roost).
@@ -736,6 +790,7 @@ function MachinesPane({ machines, sessions, refresh, onNew, roostTick, onOpenCon
               roostState={roostBoard[m.origin]}
               roostBusy={roostBusy[m.origin]}
               onOpenConsent={onOpenConsent}
+              onCrazeCreate={onCrazeCreate}
             />
           ))}
         </div>
@@ -765,6 +820,23 @@ function SessionCard({ session: s, capabilities, onKilled, onError, onTranscript
   // there is nothing to attach to, not that the answer is tmux.
   const caps = capabilitiesFor({ capabilities }, s);
   const canAttach = attachKind(caps, s.kind) === "tmux";
+  // A craze session's row is its HUB's (plan 025 §3.6.3): the provider and
+  // model, what it is doing, what it is blocked on, who is attached — and its
+  // End tab exists only when the merge attached a roost tab to it.
+  const craze = s.source === "craze";
+  const doing = craze ? crazeDoingLine(s) : null;
+  const asks = craze && typeof s.pending_approvals === "number" ? s.pending_approvals : 0;
+  const canEnd = killTarget(s) !== null;
+  // Open in terminal (plan 025 §3.6.6): a headless craze session — no tab
+  // attached — gets `craze attach` in a new roost tab; the row then carries
+  // that tab (and its End tab).
+  const canAttachCraze = canOpenTerminal(s);
+  const attachCraze = async () => {
+    setBusy(true);
+    try { await crazeOpenTerminal(s.machine ?? "", s.slug); onKilled(); }
+    catch (e) { onError(String(e)); }
+    finally { setBusy(false); }
+  };
   const kill = async () => {
     setBusy(true);
     // Routes by origin — a machine session is addressed by (machine, slug), a
@@ -807,15 +879,19 @@ function SessionCard({ session: s, capabilities, onKilled, onError, onTranscript
               style={{ width: 8, height: 8, borderRadius: 9999, background: "var(--shed-attention)", flex: "none" }}
             />
           )}
-          <StatusChip tone={rcStateTone(s.state)} label={s.state} />
+          {/* A craze row has no roost lifecycle to show — its activity,
+              its start error and its staleness say what there is to say. */}
+          {!craze && <StatusChip tone={rcStateTone(s.state)} label={s.state} />}
           {act && <StatusChip tone={act.tone} label={act.label} />}
         </span>
       </div>
       <div className="mt-2 flex items-center gap-4">
         <div className="flex min-w-0 flex-1 items-center gap-2.5">
           <KindBadge kind={s.kind} />
+          {craze && s.provider && <FactChip label={s.provider} title="provider" />}
+          {craze && s.model && <FactChip label={s.model} title="model" />}
           <span className="truncate font-mono text-[12px] text-shed-text-muted">
-            {s.stale ? `${sub} · last known` : sub}
+            {s.stale || (craze && s.approximate) ? `${sub} · last known` : sub}
           </span>
         </div>
         <div className="flex flex-none items-center gap-1.5">
@@ -833,6 +909,21 @@ function SessionCard({ session: s, capabilities, onKilled, onError, onTranscript
               style={{ background: "var(--shed-surface)", border: "1px solid var(--shed-border)", color: "var(--shed-text-secondary)" }}
             >
               <ScrollText size={15} /> Transcript
+            </button>
+          )}
+          {/* Open in terminal on a HEADLESS craze session: `craze attach` in
+              a new roost tab. What the two ways out of that tab mean is
+              craze's, and the tooltip says it (plan 025 §3.6.6). */}
+          {canAttachCraze && (
+            <button
+              data-craze-open-terminal={s.slug}
+              onClick={() => void attachCraze()}
+              disabled={busy}
+              title="Attach to this session in a new roost terminal tab. Closing the tab only detaches; typing /exit in it STOPS the session."
+              className="hbtn inline-flex items-center gap-[7px] rounded-[9px] px-[14px] py-2.5 text-[13px] font-medium"
+              style={{ background: "var(--shed-surface)", border: "1px solid var(--shed-border)", color: "var(--shed-text-secondary)" }}
+            >
+              <Terminal size={15} /> Open in terminal
             </button>
           )}
           {/* Every session opens in a terminal, whichever kind of place it runs
@@ -874,10 +965,50 @@ function SessionCard({ session: s, capabilities, onKilled, onError, onTranscript
             </a>
           )}
           {/* Delete is a bare glyph, last and quietest. A tinted red box makes
-              it the loudest thing on a card you are only reading. */}
-          <GhostBtn icon={Trash2} title="End session" onClick={() => void kill()} disabled={busy} spin={busy} />
+              it the loudest thing on a card you are only reading. On a craze
+              row it is End TAB — it closes the roost tab the session runs in
+              (by the row's typed `tab_id`, never its hostId slug), and a
+              headless craze session has none to close; Stop is the
+              transcript's. */}
+          {canEnd && (
+            <GhostBtn
+              icon={Trash2}
+              title={craze ? "End tab" : "End session"}
+              onClick={() => void kill()}
+              disabled={busy}
+              spin={busy}
+            />
+          )}
         </div>
       </div>
+      {craze && (doing || asks > 0 || (s.attached ?? 0) > 0 || s.start_error) && (
+        <div className="mt-2 flex flex-col gap-1" data-craze-facts>
+          {doing && (
+            <div
+              className="truncate text-[13px]"
+              style={{ color: doing.dimmed ? "var(--shed-text-muted)" : "var(--shed-text-secondary)" }}
+            >
+              {doing.text}
+            </div>
+          )}
+          {asks > 0 && (
+            <div className="truncate text-[13px]" style={{ color: "var(--shed-warn-fg)" }}>
+              {asks === 1 ? "needs you" : `needs you · ${asks}`}
+              {s.head_ask_summary ? ` — ${s.head_ask_summary}` : ""}
+            </div>
+          )}
+          {(s.attached ?? 0) > 0 && (
+            <div className="truncate font-mono text-[12px] text-shed-text-muted">
+              {s.attached === 1 ? "1 client attached" : `${s.attached} clients attached`}
+            </div>
+          )}
+          {s.start_error && (
+            <div className="truncate font-mono text-[12px]" style={{ color: "var(--shed-danger)" }}>
+              {s.start_error}
+            </div>
+          )}
+        </div>
+      )}
     </div>
   );
 }
@@ -1287,10 +1418,27 @@ function kindHelp(kind: RcKind): string {
  *  it would be the first place that stopped being true. */
 type LaunchTarget =
   | { kind: "shed"; value: string; label: string; host: string; shed: string }
-  | { kind: "machine"; value: string; label: string; machine: string };
+  | { kind: "machine"; value: string; label: string; machine: string }
+  /** A craze session on a machine whose craze can create one (plan 025
+   *  §3.8): picking it leads on to the craze create sheet, which owns the
+   *  provider, the directory and the first prompt. */
+  | { kind: "craze"; value: string; label: string; machine: string };
 
-function LaunchAgentDialog({ sheds, machines, capabilities, refresh, onClose, onLaunched }:
-  { sheds: Shed[]; machines: MachineStatus[]; capabilities: Record<string, RcCapabilities>; refresh: () => void; onClose: () => void; onLaunched: () => void }) {
+/** What the dialog starts: an agent of a kind (`roost.launch`, offered only for
+ *  the kinds the target's contract names), or a command line run as typed in a
+ *  new roost tab (`roost.run`, plan 025 P5 — gated by no kind at all). The
+ *  second is how an agent's own TUI is started now that the per-agent kinds are
+ *  gone: `codex --model x` is a command like any other. */
+type LaunchMode = "agent" | "command";
+const LAUNCH_MODES: [LaunchMode, string][] = [["agent", "An agent"], ["command", "Run a command"]];
+/** The Command field's help: the split rule, in the words a person needs. */
+const RUN_COMMAND_HELP =
+  "Runs as typed in a new roost tab, split on ASCII whitespace (spaces, tabs, newlines; a non-ASCII space such as NBSP is part of the word) — " +
+  "no shell, so quotes, pipes and $VARIABLES are passed through literally. " +
+  "An agent roost recognises appears as a session; anything else is a plain roost tab.";
+
+function LaunchAgentDialog({ sheds, machines, capabilities, refresh, onClose, onLaunched, onCrazeCreate }:
+  { sheds: Shed[]; machines: MachineStatus[]; capabilities: Record<string, RcCapabilities>; refresh: () => void; onClose: () => void; onLaunched: () => void; onCrazeCreate: (machine: string) => void }) {
   const fid = useId(); // base for per-field control ids (label↔control association)
   const running = sheds.filter((s) => s.status === "running");
   const targets: LaunchTarget[] = [
@@ -1307,11 +1455,19 @@ function LaunchAgentDialog({ sheds, machines, capabilities, refresh, onClose, on
       label: `machine:${m.name}`,
       machine: m.name,
     })),
+    ...machines.filter((m) => crazeCreateOffered(m.craze)).map((m) => ({
+      kind: "craze" as const,
+      value: `craze:${m.name}`,
+      label: `${m.name} — new craze session`,
+      machine: m.name,
+    })),
   ];
   const [target, setTarget] = useState(targets[0]?.value ?? "");
   const [kind, setKind] = useState<RcKind>("claude-rc");
   const [displayName, setDisplayName] = useState("");
   const [workdir, setWorkdir] = useState("");
+  const [mode, setMode] = useState<LaunchMode>("agent");
+  const [command, setCommand] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   // A machine's capabilities are not in the shared `rc.list` map — that covers
@@ -1359,7 +1515,7 @@ function LaunchAgentDialog({ sheds, machines, capabilities, refresh, onClose, on
   // then offers nothing, which is the truth about it.
   const caps = selected?.kind === "machine"
     ? machineCaps[selected.machine] ?? undefined
-    : capabilities[selected ? `roost:${selected.host}/${selected.shed}` : ""];
+    : capabilities[selected?.kind === "shed" ? `roost:${selected.host}/${selected.shed}` : ""];
   const kinds = probed && !capsError ? offeredKinds(caps) : [];
   // Keep the selection valid when the target changes OR its offered kinds change.
   useEffect(() => { if (kinds.length && !kinds.includes(kind)) setKind(kinds[0]); }, [target, kinds.join(",")]); // eslint-disable-line react-hooks/exhaustive-deps
@@ -1367,23 +1523,89 @@ function LaunchAgentDialog({ sheds, machines, capabilities, refresh, onClose, on
   const targetOpts = targets.map((t) => ({ value: t.value, label: t.label }));
   // `capsBusy` is part of the gate, not just a spinner: a click landing during
   // a re-probe would launch against whatever the PREVIOUS probe said.
-  const canCreate = !!selected && kinds.length > 0 && !capsBusy && !capsError;
+  //
+  // A command consults none of it — no kind is offered, so there is nothing for
+  // a probe to gate — and needs only somewhere to run and a word to run there.
+  // Blank is not offered as "a plain shell": roost's own UI opens shells, and
+  // the backend refuses a blank command anyway.
+  const crazeTarget = selected?.kind === "craze";
+  const canCreate = crazeTarget
+    ? true
+    : mode === "command"
+    ? !!selected && command.trim() !== ""
+    : !!selected && kinds.length > 0 && !capsBusy && !capsError;
 
   // Report what this dialog RENDERED (`launch.dump`), the `reportRoostConsent`
   // rule: from inside the dialog, so a report made beside the JSX cannot go on
   // answering after the JSX is gone, and read from the DOM after the commit so
   // it can never claim a field the dialog does not show. That is what makes
   // "there is no prompt field" (#366) assertable without a screenshot.
-  const shape = `${target}|${kind}|${kinds.join(",")}|${capsBusy}|${capsError ?? ""}`;
-  useEffect(() => { reportLaunchDialog({ rendered: renderedText("[data-launch]") }); }, [shape]);
+  //
+  // `values` (what is typed into each labelled control) and `create_enabled`
+  // (the Create button's own `disabled`) are read back off the same DOM, for the
+  // "Run a command" mode: what a person typed is not text content.
+  const shape = `${target}|${kind}|${kinds.join(",")}|${capsBusy}|${capsError ?? ""}|${mode}|${command}|${workdir}|${displayName}|${busy}`;
+  useEffect(() => {
+    reportLaunchDialog({
+      rendered: renderedText("[data-launch]"),
+      values: renderedValues("[data-launch]"),
+      create_enabled: document.querySelector<HTMLButtonElement>("[data-launch] [data-launch-create]")?.disabled === false,
+    });
+  }, [shape]);
   useEffect(() => () => reportLaunchDialog(null), []);
+
+  // The dialog's typing-and-clicking doors (`ui.fill_launch` /
+  // `ui.submit_launch`, test mode only — `ipc.rs`'s `launch_door`): the
+  // "Run a command" mode is only reachable by typing into the dialog and
+  // pressing Create, and the harness has neither a keyboard nor a pointer.
+  // Fill sets the named controls exactly as typing would; submit presses Create
+  // through the button's own gate, which a ref keeps current — the listeners are
+  // registered once, so a handler that closed over the first render would judge
+  // the press by that render's (empty) fields.
+  const pressCreate = useRef<() => void>(() => {});
+  useEffect(() => { pressCreate.current = () => { if (canCreate && !busy) void submit(); }; });
+  useEffect(() => {
+    if (typeof window === "undefined" || !("__TAURI_INTERNALS__" in window)) return;
+    const uns: Array<() => void> = [];
+    let cancelled = false;
+    void import("@tauri-apps/api/event").then(async ({ listen }) => {
+      uns.push(
+        await listen<{ mode?: unknown; target?: unknown; command?: unknown; workdir?: unknown }>("fill-launch", (e) => {
+          const fill = e.payload ?? {};
+          if (fill.mode === "agent" || fill.mode === "command") setMode(fill.mode);
+          if (typeof fill.target === "string") setTarget(fill.target);
+          if (typeof fill.command === "string") setCommand(fill.command);
+          if (typeof fill.workdir === "string") setWorkdir(fill.workdir);
+        }),
+      );
+      uns.push(await listen("submit-launch", () => pressCreate.current()));
+      if (cancelled) uns.forEach((u) => u());
+    });
+    return () => {
+      cancelled = true;
+      uns.forEach((u) => u());
+    };
+  }, []);
 
   const submit = async () => {
     if (!selected) { setError("Pick somewhere to run it."); return; }
+    // A craze target goes on to craze's own sheet: what to start there is
+    // craze's question (its providers, its recent directories).
+    if (selected.kind === "craze") { onCrazeCreate(selected.machine); return; }
     setBusy(true);
     setError(null);
     try {
-      if (selected.kind === "machine") {
+      if (mode === "command") {
+        // The line goes as typed: the split is the backend's one rule
+        // (`RunCommand::parse`, shared with the `roost.run` socket op), so it
+        // is not split a second way here. A shed is addressed by its roost
+        // origin — the key its capabilities are already read under above.
+        await roostRun({
+          target: selected.kind === "machine" ? selected.machine : `roost:${selected.host}/${selected.shed}`,
+          command,
+          workdir: workdir.trim() || undefined,
+        });
+      } else if (selected.kind === "machine") {
         await machineLaunch({
           machine: selected.machine,
           kind,
@@ -1417,6 +1639,7 @@ function LaunchAgentDialog({ sheds, machines, capabilities, refresh, onClose, on
           <>
             <button onClick={onClose} className={dialogBtnSecondary}>Cancel</button>
             <button
+              data-launch-create
               onClick={() => void submit()}
               disabled={!canCreate || busy}
               className="hbtn inline-flex items-center gap-2 rounded-[9px] px-[22px] py-2.5 text-[14px] font-semibold"
@@ -1428,7 +1651,7 @@ function LaunchAgentDialog({ sheds, machines, capabilities, refresh, onClose, on
                 cursor: canCreate && !busy ? "pointer" : "default",
               }}
             >
-              <Sparkles size={16} /> {busy ? "Launching…" : "Create"}
+              <Sparkles size={16} /> {crazeTarget ? "Continue" : busy ? "Launching…" : "Create"}
             </button>
           </>
         }
@@ -1440,24 +1663,48 @@ function LaunchAgentDialog({ sheds, machines, capabilities, refresh, onClose, on
             <div className="rounded-lg border border-shed-border bg-shed-bg px-3 py-2.5 text-[13px] leading-snug text-shed-text-muted">Nothing to run on yet — start a shed, or add a machine.</div>
           )}
         </Field>
-        <Field label="Session name" hint="optional" htmlFor={`${fid}-name`}>
-          <input id={`${fid}-name`} value={displayName} onChange={(e) => setDisplayName(e.target.value)} placeholder={selected?.kind === "machine" ? `defaults to ${selected.machine}/slug` : "defaults to shed/slug"} className={dialogInput} />
+        {crazeTarget ? (
+          <div className="rounded-lg border border-shed-border bg-shed-bg px-3 py-2.5 text-[13px] leading-snug text-shed-text-secondary" data-launch-craze>
+            A craze session on {selected?.machine}: Continue opens craze&apos;s create sheet — its providers, its recent directories, and an optional first prompt.
+          </div>
+        ) : (
+        <>
+        <Field label="Start">
+          <Segmented options={LAUNCH_MODES} value={mode} set={(v) => setMode(v as LaunchMode)} />
         </Field>
+        {/* A command takes no session name: `roost.run` is an argv and a working
+            directory, and roost owns the tab's title — so the box is not offered
+            for something that would be dropped (the prompt field's rule, below). */}
+        {mode === "agent" && (
+          <Field label="Session name" hint="optional" htmlFor={`${fid}-name`}>
+            <input id={`${fid}-name`} value={displayName} onChange={(e) => setDisplayName(e.target.value)} placeholder={selected?.kind === "machine" ? `defaults to ${selected.machine}/slug` : "defaults to shed/slug"} className={dialogInput} />
+          </Field>
+        )}
         <Field label="Working directory" hint="optional" htmlFor={`${fid}-workdir`}>
           <input id={`${fid}-workdir`} value={workdir} onChange={(e) => setWorkdir(e.target.value)} placeholder={selected?.kind === "machine" ? "defaults to $HOME on that machine" : "defaults to $SHED_WORKSPACE"} className={cn(dialogInput, "font-mono text-[13px]")} />
         </Field>
-        <Field label="Kind" help={kinds.length ? kindHelp(kind) : undefined}>
-          {capsBusy && kinds.length === 0 ? (
-            <div className="px-1 py-2 text-[13px] text-shed-text-muted">reading what {selected?.kind === "machine" ? selected.machine : "this shed"} can run…</div>
-          ) : capsError ? (
-            <div className="px-1 py-2 text-[13px] text-shed-text-muted">{capsError}</div>
-          ) : kinds.length === 0 ? (
-            <div className="px-1 py-2 text-[13px] text-shed-text-muted">{selected?.kind === "machine" ? `no agents installed on ${selected.machine} that sx can run` : "no agent kinds available in this shed"}</div>
-          ) : (
-            <Segmented options={kinds.map((k) => [k, rcKindLabel(k), agentColor(k)] as [string, string, string])} value={kind} set={(v) => setKind(v as RcKind)} />
-          )}
-        </Field>
-        {/* **There is no initial-prompt field, on either target** — roost's
+        {mode === "command" ? (
+          <Field label="Command" htmlFor={`${fid}-command`} help={RUN_COMMAND_HELP}>
+            <input id={`${fid}-command`} value={command} onChange={(e) => setCommand(e.target.value)} placeholder="codex --model gpt-5" spellCheck={false} className={cn(dialogInput, "font-mono text-[13px]")} />
+          </Field>
+        ) : (
+          <Field label="Kind" help={kinds.length ? kindHelp(kind) : undefined}>
+            {capsBusy && kinds.length === 0 ? (
+              <div className="px-1 py-2 text-[13px] text-shed-text-muted">reading what {selected?.kind === "machine" ? selected.machine : "this shed"} can run…</div>
+            ) : capsError ? (
+              <div className="px-1 py-2 text-[13px] text-shed-text-muted">{capsError}</div>
+            ) : kinds.length === 0 ? (
+              <div className="px-1 py-2 text-[13px] text-shed-text-muted">{selected?.kind === "machine" ? `no agents installed on ${selected.machine} that sx can run` : "no agent kinds available in this shed"}</div>
+            ) : (
+              <Segmented options={kinds.map((k) => [k, rcKindLabel(k), agentColor(k)] as [string, string, string])} value={kind} set={(v) => setKind(v as RcKind)} />
+            )}
+          </Field>
+        )}
+        </>
+        )}
+        {/* **There is no initial-prompt field, on either roost target** (a
+            craze target's first prompt is craze's create sheet's, plan 025
+            §3.8, where something delivers it) — roost's
             `tab.open` is an argv and a working directory, and there is no typed-
             input channel behind it. The field used to be offered for a SHED
             target, back when a shed launch went to the hub, which typed the
@@ -1656,12 +1903,21 @@ function NewShedDialog({ refresh, onClose }: { refresh: () => void; onClose: () 
 export default function App() {
   const [pane, setPane] = useState<Pane>("sheds");
   const [mode, setMode] = useState<"light" | "dark">("light");
-  const [modal, setModal] = useState<Modal>(null);
+  // The open modal — and its LIVE value (`modalNow`), written synchronously by
+  // the one setter, which is what a craze create that resolves later decides
+  // by (`crazeCreate.ts`'s `liveSetter`): a ref a passive effect copies into
+  // lags a render.
+  const [modal, publishModal] = useState<Modal>(null);
+  const modalNow = useRef<Modal>(null);
+  const setModal = useMemo(() => liveSetter(modalNow, publishModal), []);
   // The open agent-lane transcript, if any (plan 015 §3.4). Not a pane: it
   // belongs to a ROW, so it lives beside the panes rather than replacing one —
   // and it stays put when you navigate, because a transcript you opened is
   // something you are reading, not somewhere you went.
-  const [lane, setLane] = useState<{ machine: string; sessionId: string } | null>(null);
+  // `settings` is whether its settings sheet is asked for (the header chip, or
+  // `ui.show_lane_settings`); the panel shows it only on a session whose
+  // capabilities say `settings`. Opening a lane any other way asks for none.
+  const [lane, setLane] = useState<{ machine: string; kind: string; sessionId: string; settings?: boolean } | null>(null);
 
   // -- roost bootstrap (plan 019 §3.6, C8) ---------------------------------
   // The open consent card, if any — one at a time, App-level like `lane`
@@ -1757,6 +2013,79 @@ export default function App() {
     sessions: rcSessions, capabilities: rcCapabilities, machines: rcMachines,
     load: rcLoad, error: rcLoadError, refresh: refreshRc,
   } = useRcSessions();
+
+  // -- the craze create sheet (plan 025 §3.8, C10) ---------------------------
+  // Which machine's sheet is open (with `modal === "craze"`), and every
+  // machine's DRAFT — the typed form, the request id, the submission's phase —
+  // held HERE, above the sheet: dismissing the sheet keeps a submission
+  // running (its session appears as a row), and re-opening it finds the same
+  // form and the same id (`crazeCreate.ts` has the lifecycle). The ref is the
+  // authoritative copy, written synchronously, so a submit right behind an
+  // edit reads the edit; the state mirrors it for rendering.
+  const [crazeMachine, publishCrazeMachine] = useState<string | null>(null);
+  const crazeMachineNow = useRef<string | null>(null);
+  const setCrazeMachine = useMemo(() => liveSetter(crazeMachineNow, publishCrazeMachine), []);
+  const crazeDrafts = useRef<Record<string, CrazeDraft>>({});
+  const [drafts, setDrafts] = useState<Record<string, CrazeDraft>>({});
+  const updateDraft = useCallback((machine: string, f: (d: CrazeDraft) => CrazeDraft) => {
+    const next = f(crazeDrafts.current[machine] ?? EMPTY_DRAFT);
+    crazeDrafts.current = { ...crazeDrafts.current, [machine]: next };
+    setDrafts(crazeDrafts.current);
+  }, []);
+  const openCrazeSheet = useCallback((machine: string) => {
+    setCrazeMachine(machine);
+    setModal("craze");
+  }, [setCrazeMachine, setModal]);
+  // Run one submission of `machine`'s draft. **The request id is the draft's**
+  // — reused while an outcome is unknown, minted anew after any definite one
+  // (`beginSubmit`/`settle`). Created: the draft is spent, the rows refresh,
+  // a first prompt craze did not take is said, and — if this sheet is still
+  // the one open — it closes onto that session's transcript at once.
+  const submitCraze = useCallback(async (machine: string) => {
+    const current = crazeDrafts.current[machine] ?? EMPTY_DRAFT;
+    if (current.phase === "submitting") return;
+    const started = beginSubmit(current);
+    updateDraft(machine, () => started);
+    try {
+      const created = await crazeCreate({
+        machine,
+        cwd: started.cwd.trim(),
+        provider: started.provider,
+        prompt: started.prompt,
+        requestId: started.requestId ?? "",
+      });
+      updateDraft(machine, () => EMPTY_DRAFT);
+      refreshRc();
+      if (created.ended) {
+        // A replayed answer for a session that has since ended: craze's word,
+        // and nothing to open (the source lists no such session).
+        setToast({ tone: "warn", lines: ["craze answered with a session that has already ended."] });
+        if (sheetOnScreen(modalNow.current, crazeMachineNow.current) === machine) setModal(null);
+        return;
+      }
+      if (created.prompt !== "accepted" && created.prompt !== "none") {
+        setToast({
+          tone: "warn",
+          lines: [
+            created.prompt === "refused"
+              ? "craze started the session, and the session refused its first prompt."
+              : "craze started the session, and the answer to its first prompt was lost.",
+            ...(created.prompt_error ? [created.prompt_error] : []),
+          ],
+        });
+      }
+      // Decided by the sheet on screen NOW, read live — not by a copy a
+      // passive effect may not have made yet (C10 review).
+      if (closesOntoTranscript(sheetOnScreen(modalNow.current, crazeMachineNow.current), machine)) {
+        setModal(null);
+        setPane("agents");
+        setLane({ machine, kind: "craze", sessionId: created.host_id });
+      }
+    } catch (e) {
+      const f = laneFailure(e);
+      updateDraft(machine, (d) => settle(d, { ok: false, refusal: { code: f.code, message: f.message } }));
+    }
+  }, [refreshRc, updateDraft, setModal]);
   // Live approval queue (drives the badge + the pane) + the delegated namespaces
   // (a non-empty set = the host agent handshook, so it's connected).
   const approvals = useCoordinatorData<Approval[]>("approvals-changed", fetchApprovals, []);
@@ -1829,20 +2158,45 @@ export default function App() {
     void import("@tauri-apps/api/event").then(async ({ listen }) => {
       uns.push(await listen("show-create", () => setModal("create")));
       uns.push(await listen("show-launch", () => setModal("launch")));
+      // The craze create sheet's door (`ui.show_craze_create {machine}`),
+      // the same pattern: it opens from a machine's "New craze session" — a
+      // click the harness has none of.
+      uns.push(
+        await listen<{ machine?: unknown }>("show-craze-create", (e) => {
+          if (typeof e.payload?.machine === "string") openCrazeSheet(e.payload.machine);
+        }),
+      );
+      uns.push(await listen("close-craze-create", () => setModal((m) => (m === "craze" ? null : m))));
       // The transcript panel's drivable door (`ui.show_lane` / `ui.close_lane`),
       // the show-create/show-launch pattern: the panel opens from a card CLICK,
       // and the harness has no click — while `lane.dump` (the panel's own truth,
       // and the whole point of C6) is only observable once one is mounted.
       uns.push(
-        await listen<{ machine?: unknown; session_id?: unknown }>("show-lane", (e) => {
+        await listen<{ machine?: unknown; kind?: unknown; session_id?: unknown }>("show-lane", (e) => {
           const machine = e.payload?.machine;
+          const kind = e.payload?.kind;
           const sessionId = e.payload?.session_id;
-          if (typeof machine === "string" && typeof sessionId === "string") {
-            setLane({ machine, sessionId });
+          if (typeof machine === "string" && typeof kind === "string" && typeof sessionId === "string") {
+            setLane({ machine, kind, sessionId });
           }
         }),
       );
       uns.push(await listen("close-lane", () => setLane(null)));
+      // The settings sheet's door (`ui.show_lane_settings`, plan 025 §3.10),
+      // the same pattern: the sheet opens from the transcript header's chip —
+      // a click — so the door mounts the panel for that session (if it is
+      // not the one open) and asks for its sheet.
+      uns.push(
+        await listen<{ machine?: unknown; kind?: unknown; session_id?: unknown }>("show-lane-settings", (e) => {
+          const machine = e.payload?.machine;
+          const kind = e.payload?.kind;
+          const sessionId = e.payload?.session_id;
+          if (typeof machine === "string" && typeof kind === "string" && typeof sessionId === "string") {
+            setLane({ machine, kind, sessionId, settings: true });
+          }
+        }),
+      );
+      uns.push(await listen("close-lane-settings", () => setLane((l) => (l ? { ...l, settings: false } : l))));
       // The roost consent card's drivable doors (plan 019 §3.6/C8), same
       // pattern: it opens from a card's plan-matrix BUTTON, a click the
       // harness has none of. `show-roost-consent` re-previews `target` rather
@@ -2008,6 +2362,7 @@ export default function App() {
                 roostTick={roostTick}
                 roostBusy={roostBusy}
                 onOpenConsent={openRoostConsent}
+                onCrazeCreate={openCrazeSheet}
               />
             )}
             {pane === "approvals" && <ApprovalsPane approvals={approvals} />}
@@ -2026,12 +2381,13 @@ export default function App() {
                 // go there, not a second bootstrap entry point that would have
                 // to re-ask which host it was about.
                 onSetUpRoost={() => setPane("sheds")}
+                onCrazeCreate={openCrazeSheet}
                 onTranscript={(s) => {
                   // Both are guaranteed together (the stamp is machine-only) —
                   // and the card gates its affordance on the same pair, so this
                   // never silently does nothing.
                   if (s.agent_lane && s.machine) {
-                    setLane({ machine: s.machine, sessionId: s.agent_lane.session_id });
+                    setLane({ machine: s.machine, kind: s.agent_lane.kind, sessionId: s.agent_lane.session_id });
                   }
                 }}
               />
@@ -2047,15 +2403,31 @@ export default function App() {
           reusing one would leave them pinned to the session you left. */}
       {lane && (
         <LanePanel
-          key={`${lane.machine}/${lane.sessionId}`}
+          key={`${lane.machine}/${lane.kind}/${lane.sessionId}`}
           machine={lane.machine}
+          kind={lane.kind}
           sessionId={lane.sessionId}
+          settingsOpen={!!lane.settings}
+          onSettingsOpen={(open) => setLane((l) => (l ? { ...l, settings: open } : l))}
           onClose={() => setLane(null)}
         />
       )}
       {modal === "create" && <NewShedDialog refresh={refresh} onClose={() => setModal(null)} />}
       {modal === "machine" && <NewMachineDialog onClose={() => setModal(null)} onAdded={refreshRc} />}
-      {modal === "launch" && <LaunchAgentDialog sheds={sheds} machines={rcMachines} capabilities={rcCapabilities} refresh={refreshRc} onClose={() => setModal(null)} onLaunched={onLaunched} />}
+      {modal === "launch" && <LaunchAgentDialog sheds={sheds} machines={rcMachines} capabilities={rcCapabilities} refresh={refreshRc} onClose={() => setModal(null)} onLaunched={onLaunched} onCrazeCreate={openCrazeSheet} />}
+      {/* Keyed by machine so another machine's sheet REMOUNTS (its options
+          read afresh); the draft it edits is the shell's, per machine. */}
+      {modal === "craze" && crazeMachine && (
+        <CrazeCreateDialog
+          key={crazeMachine}
+          machine={crazeMachine}
+          craze={rcMachines.find((m) => m.name === crazeMachine)?.craze}
+          draft={drafts[crazeMachine] ?? EMPTY_DRAFT}
+          onEdit={(patch) => updateDraft(crazeMachine, (d) => editCrazeDraft(d, patch))}
+          onSubmit={() => void submitCraze(crazeMachine)}
+          onClose={() => setModal(null)}
+        />
+      )}
       {roostConsent && (
         <RoostConsentDialog
           preview={roostConsent.preview}

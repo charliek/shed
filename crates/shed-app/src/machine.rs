@@ -9,7 +9,7 @@
 //! The long-lived hub watcher that used to sit on top of this seam went with the
 //! RC hub in plan 022 (S6, `charliek/shed#328`), and `shed_core`'s hub wire
 //! module went with it. What consumes the seam today is the agent lane: the
-//! roost watcher ([`crate::roost`]) and the desktop's per-session opencode/gx
+//! roost watcher ([`crate::roost`]) and the desktop's per-session opencode
 //! forwards.
 //!
 //! ## The seam is a local port, and nothing above it is per-client
@@ -90,9 +90,10 @@ pub trait MachineForward: Send + Sync {
     ///
     /// It exists because [`ensure`] is NOT that. `ensure` is the authoritative
     /// answer and it pays for one: it serializes on a lock and probes the local
-    /// port. A caller that only wants to know whether it needs to ask — plan
-    /// 017's `TauriTransport`, which is invoked before **every** gx request —
-    /// would otherwise turn a per-verb hook into a per-verb connect.
+    /// port. A caller that re-checks before every verb on a live lane (plan
+    /// 017's now-retired `TauriTransport` was shaped exactly this way, invoked
+    /// before every gx request) would otherwise turn a per-verb hook into a
+    /// per-verb connect.
     ///
     /// **`false` means "definitely ask `ensure`"; `true` means "probably fine".**
     /// It is a proxy, not a proof: [`SshForward`] answers it from whether the
@@ -184,10 +185,10 @@ impl SshForward {
     /// alternative (holding the socket) is what would prevent ssh from binding
     /// it at all.
     ///
-    /// This is the opencode/gx lane's door (plan 015 §3.4): the agent's HTTP
-    /// server binds an ephemeral loopback port, roost reports it as
-    /// `server_url`, and the desktop needs a local socket that lands on exactly
-    /// that one.
+    /// This is the agent-lane door (plan 015 §3.4; opencode today, gx until
+    /// plan 025 C1 retired it): the agent's HTTP server binds an ephemeral
+    /// loopback port, roost reports it as `server_url`, and the desktop needs
+    /// a local socket that lands on exactly that one.
     pub fn reserve_for(
         entry: shed_core::config::MachineEntry,
         remote_port: u16,
@@ -453,105 +454,6 @@ fn spawn_and_wait(
     }
 }
 
-// ---------------------------------------------------------------------------
-// one-shot exec (the control verbs)
-// ---------------------------------------------------------------------------
-
-/// How long a one-shot machine command may take end to end. Generous because
-/// the far side may poll a pane; ssh's own `ConnectTimeout` is what bounds an
-/// unreachable host.
-const EXEC_TIMEOUT: Duration = Duration::from_secs(60);
-
-/// Spawn `argv`, wait for it, and KILL it if it overruns `timeout`.
-///
-/// **A `spawn_blocking` task cannot be aborted** — dropping its handle detaches
-/// it — so a bare `timeout(spawn_blocking(… .output()))` leaves BOTH the child
-/// process and the blocked thread running after the timeout fires, with nothing
-/// able to reach either. (The same leak class [`SshForward::ensure`] had.) The
-/// child is therefore spawned HERE, where its pid stays reachable; signalling
-/// that pid unblocks the waiter, which reaps the child and lets the thread end.
-///
-/// `wait_with_output` is kept for the wait itself because it drains stdout and
-/// stderr concurrently; polling `try_wait` instead would deadlock against a
-/// child that fills a pipe buffer before exiting.
-///
-/// [`SshForward::ensure`]: MachineForward::ensure
-async fn run_with_deadline(
-    argv: &[String],
-    timeout: Duration,
-    label: &str,
-) -> Result<std::process::Output, String> {
-    let (bin, rest) = argv.split_first().expect("argv is never empty");
-    let child = std::process::Command::new(bin)
-        .args(rest)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .map_err(|e| format!("{label}: running ssh: {e}"))?;
-    let pid = child.id();
-    match tokio::time::timeout(
-        timeout,
-        tokio::task::spawn_blocking(move || child.wait_with_output()),
-    )
-    .await
-    {
-        Ok(joined) => joined
-            .map_err(|e| format!("{label}: {e}"))?
-            .map_err(|e| format!("{label}: running ssh: {e}")),
-        Err(_) => {
-            // SIGKILL rather than SIGTERM: ssh with a wedged remote can ignore a
-            // polite signal, and by here the caller has already given up. The
-            // detached blocking thread reaps the child and exits on its own.
-            //
-            // The pid cannot have been recycled: the child is un-reaped (the
-            // waiter still holds it), so it is a zombie at worst, and a zombie's
-            // pid is not reassigned.
-            // SAFETY: `kill` has no preconditions beyond a valid signal number.
-            unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
-            Err(format!("{label}: the command timed out"))
-        }
-    }
-}
-
-/// Run one command on a machine over SSH and return its stdout.
-///
-/// The CONTROL half of machine reach. Kept here rather than in a client so the
-/// desktop and (via the pure builders in [`shed_core::machine`]) mobile address
-/// a machine identically.
-///
-/// **A non-zero exit reports the remote's stderr, or its STDOUT when stderr is
-/// empty.** That fallback is load-bearing and callers are built on it:
-/// `shed-gx`'s discovery probe exits 0 and reports in band precisely because a
-/// failure here could otherwise quote the token it just printed
-/// (`shed_gx::PROBE_SCRIPT`'s rule 1).
-pub async fn exec(
-    entry: &shed_core::config::MachineEntry,
-    remote_argv: &[String],
-) -> Result<String, String> {
-    let argv = machine::ssh_argv(entry, remote_argv);
-    let label = format!("machine:{}", entry.name);
-    let out = run_with_deadline(&argv, EXEC_TIMEOUT, &label).await?;
-
-    if !out.status.success() {
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        let stdout = String::from_utf8_lossy(&out.stdout);
-        let detail = if stderr.trim().is_empty() {
-            stdout.trim()
-        } else {
-            stderr.trim()
-        };
-        let code = out.status.code().unwrap_or(-1);
-        let bin = remote_argv.first().map(String::as_str).unwrap_or_default();
-        return Err(if detail.is_empty() {
-            format!("{label}: {bin} exited {code}")
-        } else {
-            format!("{label}: {detail}")
-        });
-    }
-    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
-}
-
 fn port_answers(port: u16) -> bool {
     std::net::TcpStream::connect(("127.0.0.1", port)).is_ok()
 }
@@ -801,78 +703,6 @@ mod tests {
         assert!(err.to_string().contains("machine:mini3"), "{err}");
         // A failed attempt leaves nothing running.
         assert!(f.child_is_dead());
-    }
-
-    /// **The timeout must KILL the child, not orphan it.**
-    ///
-    /// `spawn_blocking` cannot be aborted, so the naive
-    /// `timeout(spawn_blocking(… .output()))` leaves a live process and a stuck
-    /// thread behind when it fires — invisible in normal runs because the child
-    /// eventually exits on its own, and fatal when it does not (a wedged ssh to
-    /// an unresponsive machine is exactly that case).
-    ///
-    /// The child writes its OWN pid to a file before sleeping, and liveness is
-    /// then checked with `kill(pid, 0)`. Deterministic, unlike matching a `pgrep`
-    /// pattern — which can both miss (escaping) and collide with another test's
-    /// process, and would make this assertion vacuous either way.
-    #[tokio::test]
-    async fn an_overrunning_command_is_killed_not_orphaned() {
-        let dir = std::env::temp_dir().join(format!("shed-exec-kill-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("temp dir");
-        let pidfile = dir.join("pid");
-        let argv = vec![
-            "/bin/sh".to_string(),
-            "-c".to_string(),
-            // `exec` so the pid recorded IS the sleeping process, not a parent
-            // shell that might exit independently.
-            format!("echo $$ > {}; exec sleep 30", pidfile.display()),
-        ];
-
-        let started = std::time::Instant::now();
-        let err = run_with_deadline(&argv, Duration::from_millis(300), "machine:test")
-            .await
-            .expect_err("a 30s sleep must overrun a 300ms deadline");
-        assert!(err.contains("timed out"), "{err}");
-        assert!(
-            started.elapsed() < Duration::from_secs(5),
-            "the deadline must not wait out the child: {:?}",
-            started.elapsed()
-        );
-
-        let pid: i32 = std::fs::read_to_string(&pidfile)
-            .expect("the child recorded its pid")
-            .trim()
-            .parse()
-            .expect("a numeric pid");
-        // Give the signal a moment to land, then require the process to be gone.
-        // `kill(pid, 0)` reports whether it is still signalable — 0 means alive.
-        let mut alive = true;
-        for _ in 0..50 {
-            // SAFETY: signal 0 performs no action; it only probes deliverability.
-            if unsafe { libc::kill(pid, 0) } != 0 {
-                alive = false;
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
-        let _ = std::fs::remove_dir_all(&dir);
-        assert!(!alive, "the child (pid {pid}) survived the timeout");
-    }
-
-    /// The ordinary path still returns the child's output.
-    #[tokio::test]
-    async fn a_command_that_finishes_returns_its_output() {
-        let argv = vec![
-            "/bin/sh".to_string(),
-            "-c".to_string(),
-            "printf hello; printf oops >&2; exit 0".to_string(),
-        ];
-        let out = run_with_deadline(&argv, Duration::from_secs(10), "machine:test")
-            .await
-            .expect("it exits well inside the deadline");
-        assert_eq!(String::from_utf8_lossy(&out.stdout), "hello");
-        assert_eq!(String::from_utf8_lossy(&out.stderr), "oops");
-        assert!(out.status.success());
     }
 
     /// **An eviction that lands before a queued repair still must not orphan

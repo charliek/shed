@@ -62,10 +62,14 @@ fn err(code: &str, message: impl Into<String>) -> (String, String) {
     (code.to_string(), message.into())
 }
 
-/// `(machine, session_id)` — the address every `lane.*` op takes.
-fn lane_target(params: &Value) -> Result<(String, String), (String, String)> {
+/// `(machine, kind, session_id)` — the address every `lane.*` op takes. The
+/// kind is the row's `agent_lane.kind` and is REQUIRED (plan 025 §3.6.4): a
+/// craze hostId and an opencode session id are separate namespaces, and a
+/// lane op that guessed which one it meant could address the wrong lane.
+fn lane_target(params: &Value) -> Result<(String, String, String), (String, String)> {
     Ok((
         req_str(params, "machine")?.to_string(),
+        req_str(params, "kind")?.to_string(),
         req_str(params, "session_id")?.to_string(),
     ))
 }
@@ -129,13 +133,15 @@ pub(crate) async fn rc_list_payload(
     // The authoritative half — which removes a stopped shed's watcher — rides on
     // the unfiltered `sheds.list`/`sheds.refresh`, which is the only caller that
     // knows which SERVERS answered (see [`observe_reachability`]).
-    machines.observe_sheds(
-        &targets
-            .iter()
-            .map(|(s, target)| (target.server_name.clone(), s.name.clone()))
-            .collect::<Vec<_>>(),
-        &[],
-    );
+    machines
+        .observe_sheds(
+            &targets
+                .iter()
+                .map(|(s, target)| (target.server_name.clone(), s.name.clone()))
+                .collect::<Vec<_>>(),
+            &[],
+        )
+        .await;
     // ONE lock acquisition for the rows and the health — see
     // `RoostHosts::snapshot`: reading them separately can produce a frame where
     // a row is `stale: false` while its host is `reachable: false`.
@@ -189,7 +195,7 @@ pub(crate) fn sheds_payload(r: &Reachability) -> Value {
 /// itself: `Backend` is `shed-app`'s and knows nothing about this app's host
 /// registry, and giving it a callback would be a layering inversion for three
 /// call sites.
-pub(crate) fn observe_reachability(hosts: &crate::roost_hosts::RoostHosts, r: &Reachability) {
+pub(crate) async fn observe_reachability(hosts: &crate::roost_hosts::RoostHosts, r: &Reachability) {
     use shed_core::models::ShedStatus;
 
     let failed: std::collections::HashSet<&str> =
@@ -211,7 +217,7 @@ pub(crate) fn observe_reachability(hosts: &crate::roost_hosts::RoostHosts, r: &R
         .chain(hosts.servers())
         .filter(|server| !failed.contains(server.as_str()))
         .collect();
-    hosts.observe_sheds(&running, &answered);
+    hosts.observe_sheds(&running, &answered).await;
 }
 
 /// A required string param, or a `bad_request` error naming the missing key — the
@@ -285,6 +291,209 @@ fn rc_kind(params: &Value) -> Result<RcKind, (String, String)> {
     let kind = RcKind::from_wire(raw);
     ensure_known_kind(&kind).map_err(|m| err("bad_request", m))?;
     Ok(kind)
+}
+
+/// Parse `roost.run`'s `command` param — the shared [`RunCommand::parse`],
+/// with its refusal answered as `bad_request` (a missing, non-string, empty or
+/// whitespace-only command is the caller's mistake, not the host's).
+///
+/// [`RunCommand::parse`]: crate::roost_hosts::RunCommand::parse
+fn run_command(params: &Value) -> Result<crate::roost_hosts::RunCommand, (String, String)> {
+    crate::roost_hosts::RunCommand::parse(params.get("command").and_then(Value::as_str))
+        .map_err(|m| err("bad_request", m))
+}
+
+/// The one gate + router behind the New-session dialog's two driver doors
+/// (`ui.fill_launch` / `ui.submit_launch`, plan 025 C3): the event name and
+/// payload to emit, or the refusal.
+///
+/// **TEST-MODE ONLY**, the [`roost_consent_door`] rule. They exist because the
+/// dialog's "Run a command" mode is only reachable by typing into it and
+/// clicking Create, and the harness has no keyboard and no click — while
+/// `launch.dump` (the dialog's own rendered truth) is what proves the mode
+/// works. Filling a person's dialog and pressing its button for them is not
+/// something a shipped app needs anyone to do; the production door onto the
+/// same backend is `roost.run`.
+///
+/// `ui.fill_launch {mode?, target?, command?, workdir?}` sets those controls
+/// the way a person would (an absent key is left as it is); `mode` is `agent`
+/// (the kind picker) or `command` (the Command field). `ui.submit_launch`
+/// presses Create, through the same gate the button has — a dialog that would
+/// not let a person submit does not let this door either.
+fn launch_door(
+    env: &Env,
+    op: &str,
+    params: &Value,
+) -> Result<(&'static str, Value), (String, String)> {
+    if !env.test_mode {
+        return Err(err("not_enabled", format!("{op} requires test mode")));
+    }
+    match op {
+        "ui.fill_launch" => {
+            let mut fill = serde_json::Map::new();
+            for key in ["mode", "target", "command", "workdir"] {
+                match params.get(key) {
+                    None | Some(Value::Null) => {}
+                    Some(Value::String(s)) => {
+                        if key == "mode" && s != "agent" && s != "command" {
+                            return Err(err(
+                                "bad_request",
+                                format!("unknown launch mode: {s:?} (agent | command)"),
+                            ));
+                        }
+                        fill.insert(key.to_string(), json!(s));
+                    }
+                    Some(_) => return Err(err("bad_request", format!("'{key}' must be a string"))),
+                }
+            }
+            Ok(("fill-launch", Value::Object(fill)))
+        }
+        "ui.submit_launch" => Ok(("submit-launch", json!({}))),
+        other => Err(err("unknown_op", format!("{other} is not a launch door"))),
+    }
+}
+
+/// The one gate + router behind the craze create sheet's two driver doors
+/// (`ui.fill_craze_create` / `ui.submit_craze_create`, plan 025 C10): the event
+/// name and payload to emit, or the refusal.
+///
+/// **TEST-MODE ONLY**, [`launch_door`]'s rule and for its reason: the sheet's
+/// request-id lifecycle (§3.8) is only reachable by filling it in and pressing
+/// its button — the very thing a harness has no keyboard or pointer for — while
+/// `craze_create.dump` (the sheet's own rendered truth) is what proves it.
+/// Filling a person's sheet and pressing Create for them is nothing a shipped
+/// app needs; the production door onto the same backend is `craze.create`.
+///
+/// `ui.fill_craze_create {provider?, cwd?, prompt?, recent?}` sets those
+/// controls the way a person would (an absent key is left as it is): `provider`
+/// clicks that provider's row (a dimmed one refuses the click, as it refuses a
+/// pointer), `cwd` and `prompt` type into their fields, and `recent: <n>` taps
+/// the n-th recent-directory chip. `ui.submit_craze_create` presses the sheet's
+/// primary button — Create, or Try again — through the button's own gate.
+fn craze_create_door(
+    env: &Env,
+    op: &str,
+    params: &Value,
+) -> Result<(&'static str, Value), (String, String)> {
+    if !env.test_mode {
+        return Err(err("not_enabled", format!("{op} requires test mode")));
+    }
+    match op {
+        "ui.fill_craze_create" => {
+            let mut fill = serde_json::Map::new();
+            for key in ["provider", "cwd", "prompt"] {
+                match params.get(key) {
+                    None | Some(Value::Null) => {}
+                    Some(Value::String(s)) => {
+                        fill.insert(key.to_string(), json!(s));
+                    }
+                    Some(_) => return Err(err("bad_request", format!("'{key}' must be a string"))),
+                }
+            }
+            match params.get("recent") {
+                None | Some(Value::Null) => {}
+                Some(v) => match v.as_u64() {
+                    Some(n) => {
+                        fill.insert("recent".to_string(), json!(n));
+                    }
+                    None => {
+                        return Err(err("bad_request", "'recent' must be a non-negative index"))
+                    }
+                },
+            }
+            Ok(("fill-craze-create", Value::Object(fill)))
+        }
+        "ui.submit_craze_create" => Ok(("submit-craze-create", json!({}))),
+        other => Err(err(
+            "unknown_op",
+            format!("{other} is not a craze create door"),
+        )),
+    }
+}
+
+/// The gate + reader behind the settings sheet's one driver door,
+/// `ui.pick_lane_setting {row, value}` (plan 025 §3.10, C11): the payload to
+/// emit, or the refusal.
+///
+/// **TEST-MODE ONLY**, [`craze_create_door`]'s rule and for its reason: what
+/// the sheet does with a change — the row's `pending` until craze answers, a
+/// refusal inline on its row, "not confirmed" after a lost answer until the
+/// next `Settings` — happens only when a person presses one of its values,
+/// which a harness has no pointer for; `lane_settings.dump` (the sheet's own
+/// rendered truth) is what proves it. The production door onto the same
+/// backend is `lane.set`.
+///
+/// `row` is the row's id as the dump names it — `model`, `mode`, or an
+/// option's id — and `value` the id of the value to press, both verbatim
+/// (opaque: never trimmed). The sheet presses it through the control's own
+/// gate: a value it does not render, or a row whose change is still pending,
+/// takes no press.
+fn pick_setting_door(env: &Env, params: &Value) -> Result<Value, (String, String)> {
+    if !env.test_mode {
+        return Err(err(
+            "not_enabled",
+            "ui.pick_lane_setting requires test mode",
+        ));
+    }
+    let row = req_str(params, "row")?;
+    let value = req_str(params, "value")?;
+    if row.is_empty() {
+        return Err(err("bad_request", "'row' names a settings row"));
+    }
+    Ok(json!({ "row": row, "value": value }))
+}
+
+/// The gate + reader behind `ui.hold_lane_view {hold}` (plan 025 Amendment
+/// A13's harness door): the payload to emit, or the refusal.
+///
+/// **TEST-MODE ONLY**, [`pick_setting_door`]'s rule. While held, the open
+/// transcript panel goes on reading its lane and commits nothing it reads, so
+/// it keeps SHOWING what it showed — the moment between the adapter folding a
+/// change and the panel rendering it, which in a shipped app lasts a frame,
+/// held open so a harness can press inside it (a settings option chosen on
+/// the model the sheet still displays). `hold: false` releases it and the
+/// panel reads afresh. Nothing a shipped app needs.
+fn hold_view_door(env: &Env, params: &Value) -> Result<Value, (String, String)> {
+    if !env.test_mode {
+        return Err(err("not_enabled", "ui.hold_lane_view requires test mode"));
+    }
+    match params.get("hold") {
+        Some(Value::Bool(hold)) => Ok(json!({ "hold": hold })),
+        _ => Err(err("bad_request", "'hold' must be true or false")),
+    }
+}
+
+/// An OPTIONAL string param: absent or `null` is `None`; a string is itself;
+/// anything else is `bad_request` — never read as absent, because absence has a
+/// meaning of its own (a default, or a freshly minted id).
+fn opt_str<'a>(params: &'a Value, key: &str) -> Result<Option<&'a str>, (String, String)> {
+    match params.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(s)) => Ok(Some(s)),
+        Some(_) => Err(err("bad_request", format!("'{key}' must be a string"))),
+    }
+}
+
+/// `craze.create`'s request from the socket's params: every field TYPED
+/// ([`opt_str`]) — a `request_id: 7` is `bad_request`, not an absent id that
+/// [`crate::craze::create_request`] would replace with a fresh one, which would
+/// turn a retry of an unknown outcome into a second session — then read the
+/// one way both doors read it.
+fn craze_create_request(
+    params: &Value,
+) -> Result<shed_core::lane::LaneCreateRequest, (String, String)> {
+    crate::craze::create_request(
+        opt_str(params, "cwd")?,
+        opt_str(params, "provider")?,
+        opt_str(params, "prompt")?,
+        opt_str(params, "request_id")?,
+    )
+    .map_err(craze_err)
+}
+
+/// A craze op's refusal as the IPC error envelope ([`crate::craze::CrazeFailure`]).
+fn craze_err(failure: crate::craze::CrazeFailure) -> (String, String) {
+    err(failure.code, failure.message)
 }
 
 /// Raise + focus the main window — the shared body of `ui.show_window`,
@@ -510,6 +719,14 @@ impl Handler {
                 let _ = self.app.emit("show-launch", json!({}));
                 Ok(json!({}))
             }
+            // The New-session dialog's typing-and-clicking doors (plan 025 C3)
+            // — TEST-MODE ONLY, see [`launch_door`]. They act on a dialog that
+            // `ui.show_launch` already opened, so neither raises the window.
+            "ui.fill_launch" | "ui.submit_launch" => {
+                let (event, payload) = launch_door(&self.env, op, params)?;
+                let _ = self.app.emit(event, payload);
+                Ok(json!({}))
+            }
             // The roost bootstrap consent dialog's drivable doors (plan 019
             // §3.6/C8) — TEST-MODE ONLY, see [`roost_consent_door`].
             "ui.show_roost_consent" | "ui.confirm_roost_consent" | "ui.close_roost_consent" => {
@@ -533,11 +750,11 @@ impl Handler {
             // closes the lane. Two doors into one `Lanes` (`lib.rs`'s commands
             // and this module's `lane.*`), not three.
             "ui.show_lane" => {
-                let (machine, session_id) = lane_target(params)?;
+                let (machine, kind, session_id) = lane_target(params)?;
                 present_main_window(&self.app);
                 let _ = self.app.emit(
                     "show-lane",
-                    json!({ "machine": machine, "session_id": session_id }),
+                    json!({ "machine": machine, "kind": kind, "session_id": session_id }),
                 );
                 Ok(json!({}))
             }
@@ -545,10 +762,68 @@ impl Handler {
                 let _ = self.app.emit("close-lane", json!({}));
                 Ok(json!({}))
             }
+            // The craze create sheet (plan 025 §3.8, C10), on the show-lane
+            // pattern: it opens from a machine group's "New craze session" (or
+            // the launch dialog's craze target) — a CLICK — and
+            // `craze_create.dump` only means anything once one is mounted.
+            // Opening it runs `create_options`, an explicit action that may
+            // start a hub on a dormant machine, exactly as the click does.
+            "ui.show_craze_create" => {
+                let machine = req_str(params, "machine")?.to_string();
+                present_main_window(&self.app);
+                let _ = self
+                    .app
+                    .emit("show-craze-create", json!({ "machine": machine }));
+                Ok(json!({}))
+            }
+            "ui.close_craze_create" => {
+                let _ = self.app.emit("close-craze-create", json!({}));
+                Ok(json!({}))
+            }
+            // Its typing-and-clicking doors — TEST-MODE ONLY, see
+            // [`craze_create_door`]. They act on a sheet that is already open.
+            "ui.fill_craze_create" | "ui.submit_craze_create" => {
+                let (event, payload) = craze_create_door(&self.env, op, params)?;
+                let _ = self.app.emit(event, payload);
+                Ok(json!({}))
+            }
+            // The settings sheet (plan 025 §3.10, C11), on the show-lane
+            // pattern: it opens from the transcript header's settings chip — a
+            // CLICK — and `lane_settings.dump` only means anything once one is
+            // open. Showing it mounts the transcript panel for that session
+            // too (the sheet is the panel's); a session whose capabilities say
+            // `settings: false` has no chip, and no sheet opens.
+            "ui.show_lane_settings" => {
+                let (machine, kind, session_id) = lane_target(params)?;
+                present_main_window(&self.app);
+                let _ = self.app.emit(
+                    "show-lane-settings",
+                    json!({ "machine": machine, "kind": kind, "session_id": session_id }),
+                );
+                Ok(json!({}))
+            }
+            "ui.close_lane_settings" => {
+                let _ = self.app.emit("close-lane-settings", json!({}));
+                Ok(json!({}))
+            }
+            // Its press door — TEST-MODE ONLY, see [`pick_setting_door`]. It
+            // acts on a sheet that is already open.
+            "ui.pick_lane_setting" => {
+                let payload = pick_setting_door(&self.env, params)?;
+                let _ = self.app.emit("pick-lane-setting", payload);
+                Ok(json!({}))
+            }
+            // The transcript panel's view hold — TEST-MODE ONLY, see
+            // [`hold_view_door`].
+            "ui.hold_lane_view" => {
+                let payload = hold_view_door(&self.env, params)?;
+                let _ = self.app.emit("hold-lane-view", payload);
+                Ok(json!({}))
+            }
             "app.screenshot" => self.screenshot().await,
             "sheds.list" => {
                 let reachability = self.backend.refresh().await;
-                observe_reachability(&self.machines, &reachability);
+                observe_reachability(&self.machines, &reachability).await;
                 Ok(sheds_payload(&reachability))
             }
             "sheds.refresh" => self.sheds_refresh().await,
@@ -591,6 +866,9 @@ impl Handler {
             // frontend bridge and every existing cell send it, and a rename with
             // no new behaviour behind it would be churn.
             "machine.launch" | "roost.launch" => self.roost_launch(params).await,
+            // "Run a command in a tab" (plan 025 P5) — `roost.launch`'s sibling
+            // that goes through no kind.
+            "roost.run" => self.roost_run(params).await,
             "machine.capabilities" => self.machine_capabilities(params),
             "machine.add" => self.machine_add(params),
             // -- roost hosts: probe, preview, bootstrap (plan 019 §3.6) --
@@ -605,7 +883,15 @@ impl Handler {
             "lane.cancel" => self.lane_cancel(params).await,
             "lane.answer" => self.lane_answer(params).await,
             "lane.close" => self.lane_close(params),
+            "lane.stop" => self.lane_stop(params).await,
+            "lane.settings" => self.lane_settings(params).await,
+            "lane.set" => self.lane_set(params).await,
             "lane.dump" => Ok(self.lane_dump()),
+            "lane_settings.dump" => Ok(self.lane_settings_dump()),
+            "craze.create_options" => self.craze_create_options(params).await,
+            "craze.create" => self.craze_create(params).await,
+            "craze.open_terminal" => self.craze_open_terminal(params).await,
+            "craze_create.dump" => Ok(self.craze_create_dump()),
             "agents.dump" => Ok(self.agents_dump()),
             "prefs.get" => Ok(self.prefs_get()),
             "prefs.set_terminal" => self.prefs_set_terminal(params),
@@ -840,7 +1126,7 @@ impl Handler {
         let _ = self.app.emit("refresh", json!({ "token": token }));
         if !has_frontend {
             let reachability = self.backend.refresh().await;
-            observe_reachability(&self.machines, &reachability);
+            observe_reachability(&self.machines, &reachability).await;
             return Ok(sheds_payload(&reachability));
         }
         let deadline = Instant::now() + REFRESH_WAIT;
@@ -1158,6 +1444,36 @@ impl Handler {
             .map_err(|e| err("action_failed", e))
     }
 
+    /// `roost.run {target | machine, command, workdir?}` → the tab it opened: a
+    /// roost `tab.open` running `command` on that host (plan 025 P5, "Run a
+    /// command in a tab").
+    ///
+    /// Addressed like [`Self::roost_launch`] — `target` in the grammar, or a bare
+    /// `machine` — but **gated by no kind**: there is no `kind` param, nothing is
+    /// checked against [`shed_app::roost::roost_capabilities`], and no launch
+    /// recipe is looked up. `command` is split on ASCII whitespace into the argv
+    /// verbatim, with no shell and no quoting ([`crate::roost_hosts::RunCommand`]
+    /// has the whole rule): `codex --model x` works, a quoted argument does not.
+    ///
+    /// `command` is REQUIRED — absent, empty or whitespace-only is `bad_request`,
+    /// answered before the host is touched. A host that cannot be reached is
+    /// `action_failed`, as a launch's is.
+    async fn roost_run(&self, params: &Value) -> Result<Value, (String, String)> {
+        let target = match params.get("target").and_then(Value::as_str) {
+            Some(target) => target.to_string(),
+            None => req_str(params, "machine")?.to_string(),
+        };
+        let command = run_command(params)?;
+        self.machines
+            .run(
+                &target,
+                &command,
+                params.get("workdir").and_then(Value::as_str),
+            )
+            .await
+            .map_err(|e| err("action_failed", e))
+    }
+
     /// `roost.probe {target}` → what is on that host, and whether anything is
     /// serving. Read-only: it writes nothing and is safe to run before consent.
     async fn roost_probe(&self, params: &Value) -> Result<Value, (String, String)> {
@@ -1279,57 +1595,107 @@ impl Handler {
     // `already_resolved`, `unauthorized`, …) plus `no_lane` for a row that has
     // no transcript to show. See [`crate::lane::LaneFailure`].
 
-    /// `lane.open {machine, session_id}` → `{session, capabilities}`.
+    /// `lane.open {machine, kind, session_id}` → `{session}`.
+    ///
+    /// The session row alone: what the session can do rides its stream and is
+    /// answered by `lane.messages` (plan 025 §3.2.6).
     ///
     /// Idempotent: a second call for an already-open lane re-answers from the
     /// entry rather than opening a second subscription, and two concurrent calls
     /// build ONE.
     async fn lane_open(&self, params: &Value) -> Result<Value, (String, String)> {
-        let (machine, session_id) = lane_target(params)?;
+        let (machine, kind, session_id) = lane_target(params)?;
         self.lanes
-            .open(&machine, &session_id)
+            .open(&machine, &kind, &session_id)
             .await
             .map_err(lane_err)
     }
 
-    /// `lane.messages {machine, session_id}` → `{messages, activity, generation,
-    /// stale}` — the staged-then-swapped view, never a half-seeded one.
+    /// `lane.messages {machine, kind, session_id}` → `{messages, activity,
+    /// generation, stale, ended, capabilities, settings}` — the
+    /// staged-then-swapped view, never a half-seeded one, and the one place a
+    /// client reads what the session can do.
     fn lane_messages(&self, params: &Value) -> Result<Value, (String, String)> {
-        let (machine, session_id) = lane_target(params)?;
-        self.lanes.messages(&machine, &session_id).map_err(lane_err)
-    }
-
-    /// `lane.approvals {machine, session_id}` → `{approvals}` — what is blocking
-    /// on the human, this session's and its descendants'.
-    fn lane_approvals(&self, params: &Value) -> Result<Value, (String, String)> {
-        let (machine, session_id) = lane_target(params)?;
+        let (machine, kind, session_id) = lane_target(params)?;
         self.lanes
-            .approvals(&machine, &session_id)
+            .messages(&machine, &kind, &session_id)
             .map_err(lane_err)
     }
 
-    /// `lane.send {machine, session_id, text, mode?}` → `{}`.
+    /// `lane.approvals {machine, kind, session_id}` → `{approvals}` — what is
+    /// blocking on the human, this session's and its descendants'.
+    fn lane_approvals(&self, params: &Value) -> Result<Value, (String, String)> {
+        let (machine, kind, session_id) = lane_target(params)?;
+        self.lanes
+            .approvals(&machine, &kind, &session_id)
+            .map_err(lane_err)
+    }
+
+    /// `lane.send {machine, kind, session_id, text, mode?}` → `{}`.
     async fn lane_send(&self, params: &Value) -> Result<Value, (String, String)> {
-        let (machine, session_id) = lane_target(params)?;
+        let (machine, kind, session_id) = lane_target(params)?;
         let text = req_str(params, "text")?.to_string();
         let mode = crate::lane::parse_mode(params.get("mode").and_then(Value::as_str))
             .map_err(lane_err)?;
         self.lanes
-            .send(&machine, &session_id, &text, mode)
+            .send(&machine, &kind, &session_id, &text, mode)
             .await
             .map_err(lane_err)
     }
 
-    /// `lane.cancel {machine, session_id}` → `{}`.
+    /// `lane.cancel {machine, kind, session_id}` → `{}`.
     async fn lane_cancel(&self, params: &Value) -> Result<Value, (String, String)> {
-        let (machine, session_id) = lane_target(params)?;
+        let (machine, kind, session_id) = lane_target(params)?;
         self.lanes
-            .cancel(&machine, &session_id)
+            .cancel(&machine, &kind, &session_id)
             .await
             .map_err(lane_err)
     }
 
-    /// `lane.answer {machine, session_id, approval_id, answer}` → `{}`.
+    /// `lane.stop {machine, kind, session_id}` → `{}` — end the SESSION (plan
+    /// 025 §3.6.4): answered on craze's receipt; the lane ends, and the row
+    /// leaves, when the session's close arrives. Refused by a session whose
+    /// capabilities say `stop: false`.
+    async fn lane_stop(&self, params: &Value) -> Result<Value, (String, String)> {
+        let (machine, kind, session_id) = lane_target(params)?;
+        self.lanes
+            .stop(&machine, &kind, &session_id)
+            .await
+            .map_err(lane_err)
+    }
+
+    /// `lane.settings {machine, kind, session_id}` → `{settings}` — the
+    /// session's settings, read now (plan 025 §3.10): the model and models
+    /// (craze's order), the mode and modes, the current model's options (in
+    /// the order a client shows them) and the usage. `lane.messages`'
+    /// `settings` is the same thing as the stream last said it.
+    async fn lane_settings(&self, params: &Value) -> Result<Value, (String, String)> {
+        let (machine, kind, session_id) = lane_target(params)?;
+        self.lanes
+            .settings(&machine, &kind, &session_id)
+            .await
+            .map_err(lane_err)
+    }
+
+    /// `lane.set {machine, kind, session_id, change}` → `{}` — change one
+    /// setting (plan 025 §3.10). `change` is `{kind: "model"|"mode", id}` or
+    /// `{kind: "config", id, value}` ([`crate::lane::parse_setting`]); the new
+    /// value arrives on the stream. `not_accepting` is craze's `stale_model`
+    /// among others (the session left the model an option was chosen for),
+    /// and `outcome_unknown` an answer lost to a drop — never resent.
+    async fn lane_set(&self, params: &Value) -> Result<Value, (String, String)> {
+        let (machine, kind, session_id) = lane_target(params)?;
+        let change = params
+            .get("change")
+            .ok_or_else(|| err("bad_request", "missing 'change'"))?;
+        let change = crate::lane::parse_setting(change).map_err(lane_err)?;
+        self.lanes
+            .set(&machine, &kind, &session_id, change)
+            .await
+            .map_err(lane_err)
+    }
+
+    /// `lane.answer {machine, kind, session_id, approval_id, answer}` → `{}`.
     ///
     /// `answer` is one of `{choice: "<option id>"}` (the offered option, by its
     /// own id — what the panel sends), `{permission:
@@ -1338,22 +1704,22 @@ impl Handler {
     /// free text per question — or `{reject: true}`. See
     /// [`crate::lane::parse_answer`].
     async fn lane_answer(&self, params: &Value) -> Result<Value, (String, String)> {
-        let (machine, session_id) = lane_target(params)?;
+        let (machine, kind, session_id) = lane_target(params)?;
         let approval_id = req_str(params, "approval_id")?.to_string();
         let answer = params
             .get("answer")
             .ok_or_else(|| err("bad_request", "missing 'answer'"))?;
         let answer = crate::lane::parse_answer(answer).map_err(lane_err)?;
         self.lanes
-            .answer(&machine, &session_id, &approval_id, answer)
+            .answer(&machine, &kind, &session_id, &approval_id, answer)
             .await
             .map_err(lane_err)
     }
 
-    /// `lane.close {machine, session_id}` → `{}`. Idempotent.
+    /// `lane.close {machine, kind, session_id}` → `{}`. Idempotent.
     fn lane_close(&self, params: &Value) -> Result<Value, (String, String)> {
-        let (machine, session_id) = lane_target(params)?;
-        Ok(self.lanes.close(&machine, &session_id))
+        let (machine, kind, session_id) = lane_target(params)?;
+        Ok(self.lanes.close(&machine, &kind, &session_id))
     }
 
     /// `lane.dump` → what the transcript PANEL rendered (UI truth, like
@@ -1365,6 +1731,72 @@ impl Handler {
     /// exactly the question a caller is asking.
     fn lane_dump(&self) -> Value {
         json!({ "lane": self.ui_get("lane").unwrap_or(Value::Null) })
+    }
+
+    /// `lane_settings.dump` → what the settings SHEET rendered (UI truth, the
+    /// `lane.dump` rule): its session, its rows — the model list, each
+    /// option, the mode — with their control, values, current value and the
+    /// row's state (`pending`, `refused` with its inline text, `not_confirmed`),
+    /// and the context meter — or `null` while none is open.
+    fn lane_settings_dump(&self) -> Value {
+        json!({ "lane_settings": self.ui_get("lane_settings").unwrap_or(Value::Null) })
+    }
+
+    // -- craze: the create sheet and Open in terminal (plan 025 §3.6.6, §3.8) --
+    //
+    // Addressed by `machine` — a machine's bare name or a shed's
+    // `roost:<server>/<shed>` token, the row's own `machine`. Refusals carry
+    // [`crate::craze::CrazeFailure`]'s codes: the lane contract's, plus
+    // `outcome_unknown` (the one a caller keeps its request id on), `too_old`,
+    // `not_installed` and `no_craze`.
+
+    /// `craze.create_options {machine}` → `{machine, options: {providers,
+    /// default_provider?, recent_dirs}}` — what a create can start there, read
+    /// afresh (D8). May start a hub on a dormant machine: an explicit action.
+    async fn craze_create_options(&self, params: &Value) -> Result<Value, (String, String)> {
+        let machine = req_str(params, "machine")?.to_string();
+        self.machines
+            .craze_create_options(&machine)
+            .await
+            .map_err(craze_err)
+    }
+
+    /// `craze.create {machine, cwd, provider?, prompt?, request_id?}` →
+    /// `{session, host_id, prompt, prompt_error?, request_id}`: a new craze
+    /// session, its row folded into the machine's listing at once. `cwd` must
+    /// be absolute; a blank provider or prompt is absent
+    /// ([`crate::craze::create_request`]); `request_id` is the caller's (reused
+    /// only to retry an unknown outcome) or minted here — and answered back
+    /// either way.
+    async fn craze_create(&self, params: &Value) -> Result<Value, (String, String)> {
+        let machine = req_str(params, "machine")?.to_string();
+        let request = craze_create_request(params)?;
+        self.machines
+            .craze_create(&machine, request)
+            .await
+            .map_err(craze_err)
+    }
+
+    /// `craze.open_terminal {machine, session_id}` → `{origin, machine,
+    /// session_id, tab_id, cwd, argv}`: a roost tab running `craze attach` on
+    /// that session (the row's `slug`, its hostId), in its workspace; the row
+    /// shows that tab from now on.
+    async fn craze_open_terminal(&self, params: &Value) -> Result<Value, (String, String)> {
+        let machine = req_str(params, "machine")?.to_string();
+        let session_id = req_str(params, "session_id")?.to_string();
+        self.machines
+            .craze_open_terminal(&machine, &session_id)
+            .await
+            .map_err(craze_err)
+    }
+
+    /// `craze_create.dump` → what the create SHEET rendered (UI truth, the
+    /// `lane.dump` rule): its machine, its state, the providers with their
+    /// state, dimming and reason/fix, the selected one, the recent
+    /// directories, the typed fields, the request id it holds, the note and
+    /// the outcome — or `null` while none is mounted.
+    fn craze_create_dump(&self) -> Value {
+        json!({ "craze_create": self.ui_get("craze_create").unwrap_or(Value::Null) })
     }
 
     /// The roost host a shed-addressed op is about: `roost:<server>/<shed>`.
@@ -2172,7 +2604,7 @@ mod tests {
         // The shared gate both entry points (socket IPC rc_kind + the tauri
         // rc_launch command) apply: serde preserves an unknown kind as Other, so
         // launching must reject it here.
-        assert!(ensure_known_kind(&RcKind::Codex).is_ok());
+        assert!(ensure_known_kind(&RcKind::Opencode).is_ok());
         assert!(ensure_known_kind(&RcKind::Other("borg".into())).is_err());
     }
 
@@ -2184,8 +2616,8 @@ mod tests {
             roost_sockets: std::collections::HashMap::new(),
             ssh_bin: None,
             roost_jail_fs_root: false,
-            gx_home: PathBuf::new(),
-            gx_timings: shed_gx::GxTimings::default(),
+            craze_path: None,
+            craze_env: Vec::new(),
             config_path: PathBuf::new(),
             socket_path: PathBuf::from("/run/user/0/shed-tauri/shed-tauri.sock"),
             host_agent_socket: PathBuf::from("/run/user/0/shed/host-agent.sock"),
@@ -2306,5 +2738,234 @@ mod tests {
             .await
             .unwrap()
             .is_none());
+    }
+
+    /// **`roost.run`'s `command` is required** (plan 025 P5): absent, empty and
+    /// whitespace-only are each `bad_request` — the caller's mistake, answered
+    /// before any host is touched — and so is a `command` that is not a string
+    /// at all. A real one comes back split, with no kind in sight.
+    #[test]
+    fn roost_run_refuses_an_absent_empty_or_blank_command_as_bad_request() {
+        for (what, params) in [
+            ("absent", json!({ "target": "mini3" })),
+            ("null", json!({ "target": "mini3", "command": null })),
+            ("empty", json!({ "target": "mini3", "command": "" })),
+            (
+                "whitespace",
+                json!({ "target": "mini3", "command": "  \t \n" }),
+            ),
+            (
+                "not a string",
+                json!({ "target": "mini3", "command": ["codex"] }),
+            ),
+        ] {
+            let (code, message) =
+                run_command(&params).expect_err(&format!("{what} must be refused, not run"));
+            assert_eq!(code, "bad_request", "{what}: {message}");
+            assert!(message.contains("'command'"), "{what}: {message}");
+        }
+
+        let command = run_command(&json!({ "target": "mini3", "command": "codex --model x" }))
+            .expect("a command line");
+        assert_eq!(command.argv(), ["codex", "--model", "x"]);
+        // Not gated by kinds: a first word no kind table has ever named is a
+        // command like any other.
+        let command = run_command(&json!({ "command": "borg -v" })).expect("any program");
+        assert_eq!(command.argv(), ["borg", "-v"]);
+    }
+
+    /// **The New-session dialog's driver doors are test-mode only**, the
+    /// consent doors' rule: filling a person's dialog and pressing its button for
+    /// them is the harness's need, never a shipped app's. In test mode they
+    /// route to their events, carrying only the controls that were named, and a
+    /// mode the dialog does not have — or a control that is not text — is a bad
+    /// request rather than an event the dialog would have to second-guess.
+    #[test]
+    fn the_launch_dialog_doors_are_test_mode_only() {
+        let fill = json!({
+            "mode": "command",
+            "target": "machine:mini3",
+            "command": "codex --model x",
+        });
+
+        let mut prod = env(None);
+        prod.test_mode = false;
+        for op in ["ui.fill_launch", "ui.submit_launch"] {
+            let (code, message) = launch_door(&prod, op, &fill)
+                .expect_err("a driver door must not be reachable in a shipped app");
+            assert_eq!(code, "not_enabled", "{op}");
+            assert!(message.contains(op), "the refusal names the op: {message}");
+        }
+
+        let test = env(None);
+        assert_eq!(
+            launch_door(&test, "ui.fill_launch", &fill).unwrap(),
+            ("fill-launch", fill.clone()),
+            "the named controls, and nothing invented for the others"
+        );
+        assert_eq!(
+            launch_door(&test, "ui.submit_launch", &json!({})).unwrap(),
+            ("submit-launch", json!({}))
+        );
+        assert_eq!(
+            launch_door(&test, "ui.fill_launch", &json!({ "mode": "shell" }))
+                .expect_err("no such mode")
+                .0,
+            "bad_request"
+        );
+        assert_eq!(
+            launch_door(&test, "ui.fill_launch", &json!({ "command": 7 }))
+                .expect_err("not text")
+                .0,
+            "bad_request"
+        );
+    }
+
+    /// **`craze.create`'s `request_id` is read strictly** (C10 review): only an
+    /// ABSENT (or null) id is minted; a present one is used as given or refused
+    /// — a non-string, an empty or a malformed one is `bad_request`, because
+    /// minting in its place would turn the retry of an unknown outcome into a
+    /// second session. Every other field is typed the same way.
+    #[test]
+    fn craze_create_reads_its_request_id_strictly() {
+        let base = json!({ "machine": "localhost", "cwd": "/w" });
+        let with = |key: &str, v: Value| {
+            let mut p = base.clone();
+            p[key] = v;
+            p
+        };
+        for bad in [
+            json!(7),
+            json!(true),
+            json!(["shed-1"]),
+            json!({}),
+            json!(""),
+            json!("no spaces!"),
+        ] {
+            let refused = craze_create_request(&with("request_id", bad.clone()))
+                .expect_err("a present, unusable request id is refused");
+            assert_eq!(refused.0, "bad_request", "{bad}");
+        }
+        assert_eq!(
+            craze_create_request(&with("request_id", json!("shed-retry-1")))
+                .unwrap()
+                .request_id,
+            "shed-retry-1",
+            "a given id is used as given"
+        );
+        for absent in [base.clone(), with("request_id", Value::Null)] {
+            let minted = craze_create_request(&absent).unwrap().request_id;
+            assert!(minted.starts_with("shed-"), "{minted}");
+        }
+        for key in ["cwd", "provider", "prompt"] {
+            assert_eq!(
+                craze_create_request(&with(key, json!(7))).unwrap_err().0,
+                "bad_request",
+                "{key}: not a string"
+            );
+        }
+    }
+
+    /// **The craze create sheet's driver doors are test-mode only** (plan 025
+    /// C10), the launch doors' rule; in test mode they route to their events
+    /// with only the controls that were named, and a control of the wrong type
+    /// is a bad request.
+    #[test]
+    fn the_craze_create_doors_are_test_mode_only() {
+        let fill = json!({ "provider": "grok", "cwd": "/w", "prompt": "two\nlines", "recent": 1 });
+        let mut prod = env(None);
+        prod.test_mode = false;
+        for op in ["ui.fill_craze_create", "ui.submit_craze_create"] {
+            let (code, message) = craze_create_door(&prod, op, &fill)
+                .expect_err("a driver door must not be reachable in a shipped app");
+            assert_eq!(code, "not_enabled", "{op}");
+            assert!(message.contains(op), "{message}");
+        }
+        let test = env(None);
+        assert_eq!(
+            craze_create_door(&test, "ui.fill_craze_create", &fill).unwrap(),
+            ("fill-craze-create", fill.clone())
+        );
+        assert_eq!(
+            craze_create_door(&test, "ui.fill_craze_create", &json!({ "cwd": "/w" })).unwrap(),
+            ("fill-craze-create", json!({ "cwd": "/w" })),
+            "nothing invented for the controls not named"
+        );
+        assert_eq!(
+            craze_create_door(&test, "ui.submit_craze_create", &json!({})).unwrap(),
+            ("submit-craze-create", json!({}))
+        );
+        for bad in [
+            json!({ "prompt": 7 }),
+            json!({ "recent": -1 }),
+            json!({ "recent": "0" }),
+        ] {
+            assert_eq!(
+                craze_create_door(&test, "ui.fill_craze_create", &bad)
+                    .expect_err("a control of the wrong type")
+                    .0,
+                "bad_request",
+                "{bad}"
+            );
+        }
+    }
+
+    /// **The settings sheet's press door is test-mode only** (plan 025 C11),
+    /// the craze create doors' rule; in test mode it carries the row and the
+    /// value verbatim, and anything but two strings (a named row) is a bad
+    /// request.
+    #[test]
+    fn the_settings_press_door_is_test_mode_only() {
+        let press = json!({ "row": "effort", "value": " low " });
+        let mut prod = env(None);
+        prod.test_mode = false;
+        let (code, message) = pick_setting_door(&prod, &press)
+            .expect_err("a driver door must not be reachable in a shipped app");
+        assert_eq!(code, "not_enabled");
+        assert!(message.contains("ui.pick_lane_setting"), "{message}");
+        let test = env(None);
+        assert_eq!(
+            pick_setting_door(&test, &press).unwrap(),
+            press,
+            "ids are opaque: never trimmed"
+        );
+        for bad in [
+            json!({ "row": "effort" }),
+            json!({ "value": "low" }),
+            json!({ "row": "", "value": "low" }),
+            json!({ "row": "effort", "value": 3 }),
+        ] {
+            assert_eq!(
+                pick_setting_door(&test, &bad).expect_err("not a press").0,
+                "bad_request",
+                "{bad}"
+            );
+        }
+    }
+
+    /// **The view hold is test-mode only** (Amendment A13's harness door): in
+    /// test mode it carries the boolean, and anything else is a bad request.
+    #[test]
+    fn the_view_hold_is_test_mode_only() {
+        let mut prod = env(None);
+        prod.test_mode = false;
+        let (code, message) = hold_view_door(&prod, &json!({ "hold": true }))
+            .expect_err("a driver door must not be reachable in a shipped app");
+        assert_eq!(code, "not_enabled");
+        assert!(message.contains("ui.hold_lane_view"), "{message}");
+        let test = env(None);
+        for hold in [true, false] {
+            assert_eq!(
+                hold_view_door(&test, &json!({ "hold": hold })).unwrap(),
+                json!({ "hold": hold })
+            );
+        }
+        for bad in [json!({}), json!({ "hold": "yes" }), json!({ "hold": 1 })] {
+            assert_eq!(
+                hold_view_door(&test, &bad).expect_err("not a hold").0,
+                "bad_request",
+                "{bad}"
+            );
+        }
     }
 }

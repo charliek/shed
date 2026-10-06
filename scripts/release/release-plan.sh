@@ -49,8 +49,12 @@
 #     scripts/release/update-version.sh run — failing loudly here prevents a
 #     silent no-op release); ship_desktop but the desktop version surfaces are
 #     out of lockstep; a prerelease tag ships a goreleaser component
-#     (stable-only); or (stable tags only) the CHANGELOG `**Ships:**` line
-#     disagrees with the manifest-computed ship set.
+#     (stable-only); (stable tags only) the CHANGELOG `**Ships:**` line
+#     disagrees with the manifest-computed ship set; or (stable tags that
+#     ship `server`, plan 025 O4) scripts/release/check-craze-pin.sh fails —
+#     craze-pin.env's CRAZE_RELEASE is empty or doesn't resolve to
+#     CRAZE_TEST_SHA on charliek/craze. SHED_RELEASE_ALLOW_NO_CRAZE=<reason>
+#     is the owner's emergency escape for that last one (never set by CI).
 
 set -euo pipefail
 
@@ -174,7 +178,7 @@ if [ "${SHIP_DESKTOP}" = "true" ]; then
   # The Tauri lock's path-dep entries: build-deb.sh's `cargo build --locked`
   # pins the workspace path-dep crates by version — a stale entry fails the .deb build
   # mid-release. `[[package]]` blocks put `version` on the line after `name`.
-  for dep in shed-core shed-app shed-broker shed-opencode shed-gx; do
+  for dep in shed-core shed-app shed-broker shed-opencode shed-craze; do
     LOCK_V="$(grep -A1 "^name = \"${dep}\"$" "${REPO_ROOT}/desktop/tauri/src-tauri/Cargo.lock" | grep -m1 '^version = ' | sed -E 's/.*"([^"]+)".*/\1/' || true)"
     [ "${LOCK_V}" = "${DESKTOP_V}" ] || fail_lockstep "desktop/tauri/src-tauri/Cargo.lock entry for ${dep}" "${LOCK_V:-<missing>}"
   done
@@ -283,6 +287,32 @@ if [ "${IS_PRERELEASE}" = "false" ]; then
   if [ "${actual_sorted}" != "${expected_sorted}" ]; then
     echo "::error::CHANGELOG.md '## v${V}' **Ships:** set (${actual_sorted}) disagrees with the manifest-computed ship set (${expected_sorted}). Fix the CHANGELOG Ships line or re-run update-version.sh for the intended components." >&2
     exit 1
+  fi
+fi
+
+# craze release check (plan 025 §3.5, O4): a stable tag that ships `server`
+# must bake a REAL, matching craze release. Runs LAST, after every guard
+# above, so a lockstep/Ships failure is still reported at its own point
+# instead of being masked by a craze-pin network call. SHED_RELEASE_ALLOW_NO_CRAZE
+# is the owner's emergency escape (never set by CI) — it prints loudly on
+# stderr (release-plan's own diagnostic stream) rather than being silently
+# honoured, and skips the check entirely rather than this script trying to
+# second-guess the override.
+if [ "${IS_PRERELEASE}" = "false" ] && [ "${SHIP_SERVER}" = "true" ]; then
+  if [ -n "${SHED_RELEASE_ALLOW_NO_CRAZE:-}" ]; then
+    echo "::warning::SHED_RELEASE_ALLOW_NO_CRAZE is set ('${SHED_RELEASE_ALLOW_NO_CRAZE}') — skipping the craze release/test-pin check for ${TAG}. This is an emergency override; it must never be set by CI." >&2
+  else
+    # craze-pin.env is NEVER sourced as shell here — read-craze-pin.sh
+    # parses it as DATA and validates CRAZE_RELEASE before this script ever
+    # sees it (same reasoning as check-craze-pin.sh's own header: a sourced
+    # pin file could run a command or set SHED_RELEASE_SELFTEST itself).
+    CRAZE_PIN_FILE="${REPO_ROOT}/craze-pin.env"
+    CRAZE_RELEASE="$("${SCRIPT_DIR}/read-craze-pin.sh" --field CRAZE_RELEASE "${CRAZE_PIN_FILE}")" || exit 1
+    # Redirect its stdout to stderr: release-plan.sh's own stdout is a
+    # strict 4-line machine-parseable contract (ship_server=... etc, see the
+    # header above) and the checker's own diagnostic line must not leak
+    # into it.
+    "${SCRIPT_DIR}/check-craze-pin.sh" --release "v${CRAZE_RELEASE}" >&2 || exit 1
   fi
 fi
 

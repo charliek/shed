@@ -4,27 +4,32 @@ The **Agents** pane shows agent sessions running anywhere shed can see them — 
 `machines:` entry or inside a shed — and lets you launch, watch, and end them without
 leaving the dashboard.
 
-Since v0.9.0 (S6, [`charliek/shed#328`](https://github.com/charliek/shed/issues/328)) every
-session here is a **roost tab**. A shed's agent sessions are exactly what its own
+Since v0.9.0 a session here is either a **roost tab** or a **craze session**. A shed's
+roost sessions are exactly what its own
 [`roost-session`](../extensions/roost-session-hosts.md) reports, the same way a machine's
 always have been — a shed with no `roost-session` running has none. Before v0.9.0 a shed's
 rows were the *union* of a guest RC hub's sessions and roost's; the guest binary
-(`shed-ext-rc`) and the hub are gone, and roost is now the only source.
+(`shed-ext-rc`) and the hub are gone (S6,
+[`charliek/shed#328`](https://github.com/charliek/shed/issues/328)). A craze session comes
+from the craze hub on its host — see [Craze sessions](#craze-sessions) below.
 
 ## What a row is
 
-A row is one roost tab whose owning process is a recognized agent (`claude`, `codex`,
-`cursor-agent`/`cursor`, `opencode`, `gx`/`grok`) — a plain shell tab in roost is not a
-session and does not appear here. Each row shows:
+A roost row is one roost tab with an owner — a plain shell tab in roost is not a session
+and does not appear here. Two kinds are typed and get the full set of affordances below:
+`claude` and `opencode`. An agent run directly in a roost tab (`codex`, `cursor-agent`,
+`grok`, `gx`) still renders as a row — roost's own status hooks cover them — but as a
+**plain row**: its raw kind string, no Transcript affordance, no typed-input prompt.
+Each row shows:
 
 - **Name** — the tab's title.
 - **State and activity** — roost's own liveness state, plus a live activity badge for
-  agents with a [structured lane](agent-lanes.md) (opencode, gx) attached.
+  agents with a [structured lane](agent-lanes.md) (craze and opencode) attached.
 - **A sticky attention dot** mirroring roost's own notification bit — shed never clears it
   itself.
 - **Transcript** — opens the [agent lane](agent-lanes.md) panel, only on a row that carries
-  an `agent_lane` stamp (a lane-capable agent whose roost plugin reported a live server
-  address). A row without one is status-only.
+  an `agent_lane` stamp: every craze row, and an opencode tab whose roost plugin reported a
+  live server address. A row without one is status-only.
 - **Open** — opens a terminal on the session, addressed by the row's own machine (a shed's
   own SSH endpoint, or the machine's configured address) — the same button whether the row
   is a shed or a `machines:` entry.
@@ -32,6 +37,18 @@ session and does not appear here. Each row shows:
   agents have no browser URL.
 - **End session** — closes the roost tab (`tab.close`). Idempotent; a session already gone
   is treated as already ended.
+
+### Craze sessions
+
+Every host — this machine, every `machines:` entry, every running shed — also has a
+**craze source**: its craze hub's live session list. A craze session's row is the hub's:
+its provider and model, what it is doing (or its last reply, dimmed, when idle), how many
+asks wait on you with the first one's summary, the attached-client count, and a start
+error when it failed to start. A roost tab running a craze TUI folds into that row while
+the hub feed is live, and the row gains **End tab**; with the feed down, roost's own row
+for the tab stands alone and the hub's rows show as last known. A craze row offers
+**Transcript**, and **Open in terminal** when it has no tab. See
+[Agent lanes § craze](agent-lanes.md#craze) for the source, the fold and the transcript.
 
 ## Empty states
 
@@ -62,6 +79,30 @@ opens, and a typed kickoff has no wire to travel down yet
 Kicking off an agent from roost's own command palette instead of this dialog is
 [the `shed` roost provider](../extensions/roost-provider.md).
 
+A craze session is started from the craze create sheet instead: **New craze session** on a
+machine's card, on its group here, or as a "Where" choice in the dialog — see
+[Agent lanes § Creating a session](agent-lanes.md#creating-a-session).
+
+### Run a command in a tab
+
+The dialog's **Start** picker has a second mode beside **An agent**: **Run a command**. It
+replaces the Kind picker (and the session-name box, which nothing would receive) with a
+**Command** field, and opens a roost tab running that command line on the chosen shed or
+machine, in the chosen working directory (`roost.run`). It is how an agent's own TUI is started
+with flags of your choosing — `codex --model gpt-5`, say — and it is not limited to agents:
+the first word can name any program on that host (roost execs it directly).
+
+The line is split on **ASCII whitespace** (spaces, tabs, newlines; a non-ASCII space such as
+NBSP is part of the word) into the program and its arguments and run **as typed: there is no
+shell**. Quotes are not understood (`say 'a b'` passes `'a` and `b'` as two arguments, quotes
+included), and `$VARIABLES`, pipes and globs are passed through literally. A blank command is
+refused rather than read as "a plain shell" — roost's own UI opens shells.
+
+What appears in this pane afterwards is whatever roost reports for the new tab: a row once
+roost's own agent hooks recognise the program (a `codex` tab is a plain row with roost's
+activity and directory), and nothing for a program they do not recognise, which stays a plain
+terminal tab in roost.
+
 ## Machines
 
 A **machine** is a native host reached over SSH that runs a `roost-session` — no shed
@@ -72,8 +113,9 @@ off-network) contributes its own row on the Machines pane, naming why.
 
 ## See also
 
-- [Agent lanes](agent-lanes.md) — the Transcript panel: opencode and gx, capabilities,
-  reconnects, and the roost `server_url` handshake that turns a row into a lane.
+- [Agent lanes](agent-lanes.md) — the Transcript panel: craze and opencode, capabilities,
+  reconnects, creating a craze session, and the roost `server_url` handshake that turns an
+  opencode row into a lane.
 - [IPC § Agent sessions](ipc.md#agent-sessions) — the full `rc.*`/`machine.*`/`roost.*` op
   table this pane is driven by.
 - [Putting `roost-session` on a shed or machine](../extensions/roost-session-hosts.md) — the

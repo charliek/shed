@@ -8,8 +8,11 @@ re-implemented per language.
 
 ## Layout
 
-A cargo workspace under `crates/` (its members `shed-core`, `shed-core-ffi`,
-`shed-app`, `shedctl` are all default-members):
+A cargo workspace under `crates/`, every member a default-member. The client
+core is `shed-core`, `shed-core-ffi`, `shed-app` and `shedctl`, below; beside
+them sit the credential broker (`shed-broker`) and its daemon
+(`shed-host-agent`), and the two [agent-lane](agent-lanes.md) adapters,
+`shed-opencode` and `shed-craze`:
 
 - **`shed-core`** — a *pure* Rust lib (no UniFFI): wire DTOs + serde decoders
   (`models.rs`), the reqwest(rustls) client (`http.rs`), the SSE parser

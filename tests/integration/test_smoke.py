@@ -23,11 +23,16 @@ import hashlib
 import json
 import os
 import statistics
+import subprocess
 import time
+from pathlib import Path
 
 import pytest
 
 from fixtures.server import DEFAULT_AGENT_P50_MS
+
+# tests/integration/test_smoke.py -> tests/integration -> tests -> repo root.
+REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
 # Pinned to the long-stable octocat/Hello-World head. This repo hasn't
@@ -580,3 +585,166 @@ def test_roost_session_baked(shed_server, test_shed_name):
         f"phone start roost-session on first contact), got count="
         f"{r.stdout.strip()!r} stderr={r.stderr!r}."
     )
+
+
+# ---------------------------------------------------------------------------
+# 11. craze baked into the extensions/full images (plan 025 §3.9)
+# ---------------------------------------------------------------------------
+
+
+def _craze_baked_backends() -> set[str]:
+    """`SHED_IMAGE_HAS_CRAZE` is a comma list of the backends whose
+    `extensions` image was rebuilt with craze baked in (`vz`, `fc`). Same
+    shape as `_roost_baked_backends` above — the dev targets set exactly
+    the one they retargeted, because the suite is parameterized over BOTH
+    backends and the other one still boots the published image."""
+    raw = os.environ.get("SHED_IMAGE_HAS_CRAZE", "")
+    return {b.strip() for b in raw.split(",") if b.strip()}
+
+
+def _default_craze_version() -> str:
+    """Reads `CRAZE_RELEASE` out of `craze-pin.env` through
+    `scripts/release/read-craze-pin.sh` — the ONE shared, strict reader
+    (never shell-sourced; see that script's own header for why)."""
+    reader = REPO_ROOT / "scripts" / "release" / "read-craze-pin.sh"
+    pin_file = REPO_ROOT / "craze-pin.env"
+    r = subprocess.run(
+        [str(reader), "--field", "CRAZE_RELEASE", str(pin_file)],
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    assert r.returncode == 0, (
+        f"{reader} --field CRAZE_RELEASE {pin_file} failed: "
+        f"exit={r.returncode} stdout={r.stdout!r} stderr={r.stderr!r}."
+    )
+    version = r.stdout.strip()
+    assert version, (
+        f"craze-pin.env's CRAZE_RELEASE is empty — no craze release has "
+        f"been baked yet (plan 025 §3.9); SHED_IMAGE_HAS_CRAZE should not "
+        f"be set until it is, so test_craze_baked should have skipped "
+        f"before reaching this helper."
+    )
+    return version
+
+
+def _baked_image_verdict(
+    backend: str, listed_backends: set[str], image_present: bool
+) -> str:
+    """Decides what `test_craze_baked` does for `backend`, given the set of
+    backends `SHED_IMAGE_HAS_CRAZE` lists (`listed_backends`) and whether
+    the `extensions` image actually exists on the server
+    (`image_present`). Returns one of `"run"`, `"skip"`, `"fail"`.
+
+    Pulled out as a pure function (cursor/sol review, plan 025 C13 item 3)
+    because the two cases were previously collapsed into a single skip: a
+    backend NOT listed has nothing to check and skips either way, but a
+    backend the caller explicitly LISTED is a promise that its dev store
+    was rebuilt with the bake — the dev Makefile targets
+    (`test-integration-dev[-fc]`) set `SHED_IMAGE_HAS_CRAZE` unconditionally,
+    so treating a missing image there as a skip let `make
+    test-integration-dev` finish green on a store that never got the
+    `extensions` image rebuilt, without ever checking `/usr/bin/craze`.
+    """
+    if backend not in listed_backends:
+        return "skip"
+    return "run" if image_present else "fail"
+
+
+@pytest.mark.skipif(
+    not _craze_baked_backends(),
+    reason=(
+        "SHED_IMAGE_HAS_CRAZE unset: the published images carry no craze "
+        "until the 0.9.0 tag"
+    ),
+)
+def test_craze_baked(shed_server, test_shed_name):
+    """`/usr/bin/craze` is baked into the `extensions` image (plan 025
+    §3.9), the same way as `roost-session` above: a standalone release
+    asset, checksum-verified at build time, with no systemd unit —
+    `shed attach` starts a lane's hub itself.
+
+    Gated behind `SHED_IMAGE_HAS_CRAZE=<backends>`: the published images
+    carry no craze until the 0.9.0 tag, so this stays skipped everywhere
+    except the parallel-dev servers (`test-integration-dev[-fc]`, which
+    export the variable — see the root Makefile). The gate is a `skipif`
+    marker rather than a runtime `pytest.skip()`, so pytest evaluates it
+    during setup, before the `shed_server`/`test_shed_name` fixtures
+    instantiate.
+    """
+    backend_key = "fc" if shed_server.backend == "firecracker" else "vz"
+    listed_backends = _craze_baked_backends()
+    if backend_key not in listed_backends:
+        # Mirrors `_baked_image_verdict`'s "not listed" branch — short-circuit
+        # here (rather than call it with a placeholder `image_present`) so an
+        # unlisted backend never even attempts `shed_server.create` below.
+        pytest.skip(
+            f"SHED_IMAGE_HAS_CRAZE does not list {backend_key}: this "
+            "backend still boots the published image, which carries no "
+            "craze"
+        )
+
+    want_version = os.environ.get("SHED_CRAZE_VERSION") or _default_craze_version()
+
+    image_present = True
+    try:
+        shed_server.create(test_shed_name, image="extensions")
+    except AssertionError as e:
+        msg = str(e)
+        if "extensions" in msg and (
+            "no image tag" in msg or "not found" in msg or "unknown image" in msg
+        ):
+            image_present = False
+        else:
+            raise
+
+    verdict = _baked_image_verdict(backend_key, listed_backends, image_present)
+    if verdict == "fail":
+        pytest.fail(
+            f"SHED_IMAGE_HAS_CRAZE lists {backend_key!r} but its dev store "
+            "has no `extensions` image; build it per "
+            "docs/development/testing.md (SHED_SOURCE_REF = the dev "
+            "config's alias) before running test-integration-dev"
+            f"{'-fc' if backend_key == 'fc' else ''}, or unset "
+            "SHED_IMAGE_HAS_CRAZE to skip this check."
+        )
+    assert verdict == "run", f"unexpected _baked_image_verdict result: {verdict!r}"
+
+    r = shed_server.exec(
+        test_shed_name, ["test", "-f", "/usr/bin/craze", "-a", "-x", "/usr/bin/craze"]
+    )
+    assert r.returncode == 0, (
+        f"/usr/bin/craze missing or not executable in the booted shed: "
+        f"exit={r.returncode} stdout={r.stdout!r} stderr={r.stderr!r}. "
+        f"Two causes: (1) the dev server's image store still holds an "
+        f"`extensions` image built BEFORE the bake — rebuild it into the "
+        f"dev store (docs/development/testing.md, SHED_SOURCE_REF = the "
+        f"dev config's alias) or run with SHED_IMAGE_HAS_CRAZE= (empty) to "
+        f"skip this cell; (2) the craze install steps folded into the "
+        f"roost-session RUN in the extensions stage of vz/Dockerfile / "
+        f"firecracker/Dockerfile regressed."
+    )
+
+    r = shed_server.exec(test_shed_name, ["craze", "--version"])
+    assert r.returncode == 0, (
+        f"`craze --version` failed in the booted shed: exit={r.returncode} "
+        f"stdout={r.stdout!r} stderr={r.stderr!r}."
+    )
+    assert r.stdout.strip() == want_version, (
+        f"baked craze --version={r.stdout.strip()!r}, want {want_version!r} "
+        f"(override via SHED_CRAZE_VERSION). Check ARG CRAZE_VERSION in "
+        f"vz/Dockerfile / firecracker/Dockerfile and CRAZE_RELEASE in "
+        f"craze-pin.env (make check-craze-pin)."
+    )
+
+    r = shed_server.exec(test_shed_name, ["craze", "providers", "--json"])
+    assert r.returncode == 0, (
+        f"`craze providers --json` failed in the booted shed: "
+        f"exit={r.returncode} stdout={r.stdout!r} stderr={r.stderr!r}."
+    )
+    try:
+        json.loads(r.stdout)
+    except json.JSONDecodeError:
+        raise AssertionError(
+            f"`craze providers --json` did not print JSON: got {r.stdout!r}"
+        )

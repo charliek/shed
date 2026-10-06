@@ -69,6 +69,11 @@ test-support = []
 tokio = { workspace = true, features = ["rt", "test-util"] }
 # The integration tests drive the fake, which lives behind the feature.
 shed-opencode = { path = ".", features = ["test-support"] }
+# `shed_core::lane::conformance` — the contract's shared conformance kit (plan
+# 025 §3.2.4), behind shed-core's own `test-support`. A dev-dependency
+# (resolver v2), so the shipped build of this crate — and everything that
+# path-depends on it — never carries the kit.
+shed-core = { path = "../shed-core", features = ["test-support"] }
 
 # The manual verification tool (plan 015 §8) and the smallest proof the contract
 # is usable from OUTSIDE this crate: it calls nothing but `AgentLane`. Named

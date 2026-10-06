@@ -238,13 +238,11 @@ mounts:
     readonly: false
 
   # cursor-agent auth — ~/.config/cursor ONLY. On Linux (the guest OS) the
-  # cursor-agent CLI keeps its login tokens here, not under ~/.cursor. Do NOT
-  # also mount ~/.cursor: shed's rc hub writes a hook relay into
-  # ~/.cursor/hooks.json so cursor-agent sessions report activity/feed to the
-  # hub, and it deliberately SKIPS that write whenever ~/.cursor sits on a
-  # different filesystem than $HOME (its "this is a host auth mount, not a
-  # guest-local dir" guard) — mounting ~/.cursor silently disables the hook
-  # feed for every cursor session in the shed. Leave ~/.cursor guest-local.
+  # cursor-agent CLI keeps its login tokens here, not under ~/.cursor. Leave
+  # ~/.cursor guest-local: it is cursor's own per-machine configuration, and
+  # the shed's roost-session wires its status hooks into an agent's
+  # configuration inside the shed (see "Putting roost-session on a shed or
+  # machine") — a mount would hand it the host's copy instead.
   cursor:
     source: ~/.config/cursor
     target: /home/shed/.config/cursor

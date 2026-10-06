@@ -10,11 +10,21 @@
    `capabilities` rather than from a branch on the kind.** Plan 015 shipped this
    with `capabilities` stored and never read, which was invisible while opencode
    was the only adapter: what it can do and what the panel offered happened to
-   agree. gx does not agree — it interjects, and its permissions offer whatever
-   the agent asked, not a fixed three — so the panel now reads the flags (the
-   Interject toggle) and the approval's own `options` (the buttons). The kind
-   itself appears exactly once, as a badge in the header, so a person can see
-   which agent they are talking to.
+   agree. gx did not agree (plan 017) — it interjected, and its permissions
+   offered whatever the agent asked, not a fixed three — so the panel reads the
+   flags (the Interject toggle) and the approval's own `options` (the buttons).
+   The kind itself appears exactly once, as a badge in the header, so a person
+   can see which agent they are talking to.
+
+   **The capabilities come from the VIEW, not from `lane.open`** (plan 025
+   §3.2). They are per session and ride the lane's stream — a craze session's
+   change with its incarnation — so `lane.open` answers the session row alone
+   and the panel reads `capabilities` off the same `lane.messages` poll as
+   everything else it renders. A copy taken at open would be stale by design.
+   So, once a seed has swapped one in, is the session ROW the header reads
+   (`lane.messages`' `session`): `lane.open`'s row is re-answered unchanged
+   while the lane stays open, and the one the create sheet's transcript is
+   opened on is the create's own, with no permission mode (live leg 1).
 
    Three things about it are load-bearing rather than stylistic:
 
@@ -30,15 +40,37 @@
      assert the panel, not just the backend behind it. `null` on unmount, because
      "no panel" is the question a caller is actually asking.
 
-   `lane.open` on mount, `lane.close` on unmount, and no polling anywhere. */
+   `lane.open` on mount, `lane.close` on unmount, and no polling anywhere.
+
+   **The lane's kind is part of its address** (plan 025 §3.6.4): the panel is
+   opened with the row's `agent_lane.kind`, and every `lane.*` call carries it —
+   a craze hostId and an opencode session id are different namespaces. For a
+   craze session the panel also shows the session's permission posture (a
+   sheet-created session runs `bypass` — "runs tools without asking") and,
+   when its capabilities offer `stop`, a Stop behind an inline confirm: Stop
+   ends the SESSION, not just this transcript.
+
+   **The settings chip** (plan 025 §3.10): on a session whose streamed
+   capabilities say `settings`, the header carries `<model name> · <effort
+   value> · fast` from the current values; pressing it opens the settings
+   sheet (`LaneSettings.tsx`) under the header. No chip, and no sheet even
+   when asked for (`ui.show_lane_settings`), on a session that says no —
+   hidden, never disabled. The panel counts the session's `Settings` frames
+   (the `lane-event` nudges that carry one) and moves the count only with the
+   read that shows them: a change whose answer was lost is "not confirmed"
+   until that count moves. */
 import { useCallback, useEffect, useRef, useState } from "react";
-import { ChevronDown, ChevronRight, ScrollText, Send, Square, X, Zap } from "lucide-react";
+import { ChevronDown, ChevronRight, OctagonX, ScrollText, Send, SlidersHorizontal, Square, X, Zap } from "lucide-react";
 import { cn } from "@/lib/utils";
+import { laneVerbs, sendFailureText } from "@/lib/laneVerbs";
+import { laneHeader } from "@/lib/crazeRows";
 import { newestWins } from "@/lib/newest";
+import { NO_SETTINGS, settingsChip, settingsOffered } from "@/lib/laneSettings";
+import { LaneSettingsSheet, useSettingChanges } from "@/components/LaneSettings";
 import { cardCls, KindBadge, StatusChip, type Tone } from "@/components/primitives";
 import {
   LANE_EVENT, laneAnswer, laneApprovals, laneCancel, laneClose, laneFailure,
-  laneMessages, laneOpen, laneSend, reportLane,
+  laneMessages, laneOpen, laneSend, laneStop, reportLane,
   type LaneAnswer, type LaneApproval, type LaneApprovalCard, type LaneEventEnvelope,
   type LaneMessage, type LaneOpened, type LaneOption, type LaneReport, type LaneRow,
   type LaneView,
@@ -139,9 +171,15 @@ function roleColor(role: string): string {
   return "var(--shed-text-secondary)";
 }
 
-export function LanePanel({ machine, sessionId, onClose }: {
+export function LanePanel({ machine, kind, sessionId, settingsOpen, onSettingsOpen, onClose }: {
   machine: string;
+  /** The row's `agent_lane.kind` — half of the lane's address. */
+  kind: string;
   sessionId: string;
+  /** The settings sheet is ASKED for (the chip, or `ui.show_lane_settings`);
+   *  it shows only while the session's capabilities say `settings`. */
+  settingsOpen: boolean;
+  onSettingsOpen: (open: boolean) => void;
   onClose: () => void;
 }) {
   const [opened, setOpened] = useState<LaneOpened | null>(null);
@@ -173,6 +211,22 @@ export function LanePanel({ machine, sessionId, onClose }: {
    *  cannot share a selection. */
   const [picks, setPicks] = useState<Record<string, string[][]>>({});
   const [typed, setTyped] = useState<Record<string, string[]>>({});
+  /** The Stop button's inline confirm is open. Stop ends the SESSION, so it
+   *  is never one click. */
+  const [confirmStop, setConfirmStop] = useState(false);
+  /** How many `Settings` frames the session has sent that a committed read
+   *  reflects — what ends a lost change's "not confirmed". `arrived` counts
+   *  them as the nudges come in; a read takes the count as it STARTS, and
+   *  commits it with the view it read, so the mark never clears a frame
+   *  before the value that replaces it is on screen. */
+  const arrived = useRef(0);
+  const [settingsSeen, setSettingsSeen] = useState(0);
+  /** The view is HELD (`ui.hold_lane_view`, test mode only): reads go on, and
+   *  nothing they return is committed until it is released — what a person
+   *  sees in the moment between the adapter folding a change and this panel
+   *  rendering it, held open so a harness can act inside it. */
+  const held = useRef(false);
+  const changes = useSettingChanges(machine, kind, sessionId, settingsSeen, view?.settings ?? NO_SETTINGS);
 
   const list = useRef<HTMLDivElement | null>(null);
   /** Stick to the bottom only when the reader already IS at the bottom — a
@@ -196,19 +250,23 @@ export function LanePanel({ machine, sessionId, onClose }: {
     // transcript with a stale one, on a panel that never polls and would
     // therefore stay wrong until the next unrelated frame.
     const reads = newestWins();
-    const pull = () =>
-      reads.run(
+    const pull = () => {
+      const upto = arrived.current;
+      return reads.run(
         // ONE round-trip pair, in parallel: the two reads are independent
         // projections of the same locked view, so there is nothing to order
         // BETWEEN them — only between one pull and the next.
-        () => Promise.all([laneMessages(machine, sessionId), laneApprovals(machine, sessionId)]),
+        () => Promise.all([laneMessages(machine, kind, sessionId), laneApprovals(machine, kind, sessionId)]),
         ([v, a]) => {
+          if (held.current) return;
           setView(v);
           setApprovals(a);
           setReadError(null);
+          setSettingsSeen(upto);
         },
         (e) => setReadError(laneFailure(e).message),
       );
+    };
     const run = () => {
       if (frame !== null) cancelAnimationFrame(frame);
       if (timer !== null) clearTimeout(timer);
@@ -229,15 +287,30 @@ export function LanePanel({ machine, sessionId, onClose }: {
       // for and the panel would sit empty until the next unrelated frame.
       const { listen } = await import("@tauri-apps/api/event");
       const un = await listen<LaneEventEnvelope>(LANE_EVENT, (e) => {
-        if (e.payload?.machine === machine && e.payload?.session_id === sessionId) schedule();
+        if (e.payload?.machine === machine && e.payload?.kind === kind && e.payload?.session_id === sessionId) {
+          if ((e.payload.event as { kind?: unknown } | null | undefined)?.kind === "settings") {
+            arrived.current += 1;
+          }
+          schedule();
+        }
       });
       if (cancelled) {
         un();
         return;
       }
       unlisten.push(un);
+      // The view hold's door (test mode only; the backend refuses it otherwise).
+      const unHold = await listen<{ hold?: unknown }>("hold-lane-view", (e) => {
+        held.current = e.payload?.hold === true;
+        if (!held.current) schedule();
+      });
+      if (cancelled) {
+        unHold();
+        return;
+      }
+      unlisten.push(unHold);
       try {
-        const o = await laneOpen(machine, sessionId);
+        const o = await laneOpen(machine, kind, sessionId);
         if (cancelled) return;
         setOpened(o);
       } catch (e) {
@@ -255,9 +328,9 @@ export function LanePanel({ machine, sessionId, onClose }: {
       if (frame !== null) cancelAnimationFrame(frame);
       if (timer !== null) clearTimeout(timer);
       unlisten.forEach((u) => u());
-      void laneClose(machine, sessionId);
+      void laneClose(machine, kind, sessionId);
     };
-  }, [machine, sessionId]);
+  }, [machine, kind, sessionId]);
 
   const messages = view?.messages ?? [];
   useEffect(() => {
@@ -265,38 +338,52 @@ export function LanePanel({ machine, sessionId, onClose }: {
   }, [messages.length]);
 
   const act = activityBadge(view?.activity ?? "unknown");
-  const working = (view?.activity ?? "") === "working";
-  /** The capability half of the Interject affordance: is there a toggle at all?
+  /** The capability half of the verb affordances: is there a button at all,
+   *  and can it be pressed?
    *
-   *  `lane.open`'s `capabilities` were stored and never read until now — the
-   *  panel offered whatever it felt like and let the adapter refuse. That is the
-   *  wrong way round for an affordance: an adapter that cannot interject (every
-   *  opencode lane) should not show a button whose only outcome is an error. */
-  const canInterject = opened?.capabilities?.interject === true;
+   *  Read off the VIEW's capabilities — the live generation's, from the
+   *  `lane.messages` poll — never off `lane.open`, which no longer carries any —
+   *  through `laneVerbs`, the ONE rule both the buttons and `lane.dump` read: a
+   *  verb the session's capabilities do not offer has no button (every opencode
+   *  lane has no Interject; a session whose capabilities say `cancel: false`
+   *  has no Cancel), and an offered verb is enabled only while it is Working. */
+  const capabilities = view?.capabilities ?? null;
+  const verbs = laneVerbs(capabilities, view?.activity ?? "");
+  const canInterject = verbs.interject.shown;
   /** …and the state half: armed only while the agent would accept one. */
-  const interjecting = canInterject && working && interject;
+  const interjecting = verbs.interject.enabled && interject;
   // What the reader just tried outranks what the lane is doing: a refusal is
   // about them, a read failure is about the machine.
   const error = actionError ?? readError;
 
-  /** Run one user action: clear the last refusal, and keep this one if it fails. */
-  const act1 = useCallback(async (run: () => Promise<void>) => {
-    setBusy(true);
-    setActionError(null);
-    try {
-      await run();
-    } catch (e) {
-      setActionError(laneFailure(e).message);
-    } finally {
-      setBusy(false);
-    }
-  }, []);
-
-  const answer = useCallback(
-    (id: string, a: LaneAnswer) => act1(() => laneAnswer(machine, sessionId, id, a)),
-    [act1, machine, sessionId],
+  /** Run one user action: clear the last refusal, and keep this one if it
+   *  fails — said as `describe` words it (the failure's own message by
+   *  default). */
+  const act1 = useCallback(
+    async (run: () => Promise<void>, describe: (f: { code: string; message: string }) => string = (f) => f.message) => {
+      setBusy(true);
+      setActionError(null);
+      try {
+        await run();
+      } catch (e) {
+        setActionError(describe(laneFailure(e)));
+      } finally {
+        setBusy(false);
+      }
+    },
+    [],
   );
 
+  const answer = useCallback(
+    (id: string, a: LaneAnswer) => act1(() => laneAnswer(machine, kind, sessionId, id, a)),
+    [act1, machine, kind, sessionId],
+  );
+
+  /** Send the prompt. The text is cleared only once the agent took it: on a
+   *  refusal it stays to be edited, and on a LOST answer (`outcome_unknown` —
+   *  the prompt may or may not have started a turn, and it is never resent)
+   *  it stays too, with the panel saying to check the transcript before
+   *  sending again (`sendFailureText`): the person decides. */
   const send = async () => {
     const text = prompt.trim();
     if (!text) return;
@@ -304,12 +391,36 @@ export function LanePanel({ machine, sessionId, onClose }: {
       // `undefined` rather than `"queue"` for the ordinary case: queue is the
       // op's own default, and a client that always spelled the mode out would
       // make every adapter's default this component's business.
-      await laneSend(machine, sessionId, text, interjecting ? "interject" : undefined);
+      await laneSend(machine, kind, sessionId, text, interjecting ? "interject" : undefined);
       setPrompt("");
-    });
+    }, sendFailureText);
   };
 
-  const cancel = () => act1(() => laneCancel(machine, sessionId));
+  const cancel = () => act1(() => laneCancel(machine, kind, sessionId));
+  /** Stop the SESSION, from the confirm's own button. The lane ends when the
+   *  session's close arrives (the banner says `ended`), and the row leaves. */
+  const stop = () =>
+    act1(async () => {
+      await laneStop(machine, kind, sessionId);
+      setConfirmStop(false);
+    });
+  /** Stop exists only when the session's streamed capabilities offer it — a
+   *  TUI-hosted craze session, and every opencode one, has none. */
+  const canStop = capabilities?.stop === true;
+  /** The header — title, directory, permission line — from the LIVE session
+   *  row (`lane.messages`' `session`), and from `lane.open`'s only until the
+   *  first seed has swapped one in: the open's row is re-answered unchanged
+   *  while the lane stays open, and for the transcript the create sheet opens
+   *  at once it is the create's own row, with no permission mode
+   *  (`laneHeader`). */
+  const header = laneHeader(opened?.session, view?.session);
+  const permission = header.permission;
+  /** The settings chip and sheet exist only when the session's streamed
+   *  capabilities say `settings` (plan 025 §3.10): hidden, never disabled —
+   *  and that capability alone decides. */
+  const offered = settingsOffered(capabilities);
+  const settings = view?.settings ?? NO_SETTINGS;
+  const chip = offered ? settingsChip(settings) : null;
 
   const pickedFor = (a: LaneApproval): string[][] =>
     picks[a.id] ?? a.questions.map(() => []);
@@ -400,16 +511,21 @@ export function LanePanel({ machine, sessionId, onClose }: {
   const report: LaneReport = {
     machine,
     session_id: sessionId,
-    kind: opened?.capabilities?.kind ?? "",
-    title: opened?.session.title ?? "",
-    cwd: opened?.session.cwd ?? "",
+    lane_kind: kind,
+    kind: capabilities?.kind ?? "",
+    permission,
+    title: header.title,
+    cwd: header.cwd,
     activity: view?.activity ?? "unknown",
     generation: view?.generation ?? 0,
     stale: view?.stale ?? null,
+    ended: view?.ended ?? false,
     rows,
     approvals: cards,
-    can_cancel: working,
-    interject: canInterject ? { on: interjecting, enabled: working } : null,
+    can_cancel: verbs.cancel.enabled,
+    interject: canInterject ? { on: interjecting, enabled: verbs.interject.enabled } : null,
+    stop: canStop ? { confirming: confirmStop } : null,
+    settings_chip: chip,
     error,
   };
   // Compared BY VALUE, not by reference: the report is rebuilt every render, so
@@ -436,41 +552,129 @@ export function LanePanel({ machine, sessionId, onClose }: {
       className="flex h-full w-[460px] max-w-[50%] flex-none flex-col border-l border-shed-border bg-shed-bg"
       style={{ animation: "shed-in .18s ease" }}
     >
-      <header className="flex flex-none items-start gap-3 border-b border-shed-border bg-shed-bg-sidebar px-4 py-3">
-        <ScrollText size={18} className="mt-0.5 flex-none text-shed-text-secondary" />
-        <div className="min-w-0 flex-1">
-          <div className="truncate text-[15px] font-semibold text-shed-text">
-            {opened?.session.title || "Transcript"}
+      <header className="flex-none border-b border-shed-border bg-shed-bg-sidebar px-4 py-3">
+        <div className="flex items-start gap-3">
+          <ScrollText size={18} className="mt-0.5 flex-none text-shed-text-secondary" />
+          <div className="min-w-0 flex-1">
+            <div className="truncate text-[15px] font-semibold text-shed-text">
+              {header.title || "Transcript"}
+            </div>
+            <div className="mt-0.5 truncate font-mono text-[11.5px] text-shed-text-muted">
+              {machine} · {sessionId}
+            </div>
+            {/* The session's permission posture, when it states one: a session
+                the create sheet started runs `bypass`, and this is where that
+                consequence is visible (plan 025 §3.6.5). */}
+            {permission && (
+              <div className="mt-0.5 truncate text-[12px] text-shed-text-secondary" data-permission>
+                {permission}
+              </div>
+            )}
           </div>
-          <div className="mt-0.5 truncate font-mono text-[11.5px] text-shed-text-muted">
-            {machine} · {sessionId}
-          </div>
+          {/* WHICH agent this transcript belongs to. Two adapters in one app made
+              it worth saying out loud: the panels differ in what they offer
+              (interject, the shape of a permission's buttons), and the kind is the
+              reason. Empty until the first seed's capabilities have swapped into
+              the view, and no placeholder for it — a badge that said "…" would be
+              noise on every mount. */}
+          {capabilities?.kind && <KindBadge kind={capabilities.kind} />}
+          <StatusChip tone={act.tone} label={act.label} />
+          {/* Stop ends the SESSION — offered only when its capabilities say
+              `stop`, and never in one click: the first press opens an inline
+              confirm. */}
+          {canStop && !confirmStop && (
+            <button
+              onClick={() => setConfirmStop(true)}
+              disabled={busy || !!view?.ended}
+              title="Stop the session (craze ends it; the transcript stays until you close it)"
+              className="hbtn inline-flex flex-none items-center gap-1.5 rounded-[9px] px-2.5 py-1.5 text-[12.5px] font-semibold"
+              style={{
+                background: "var(--shed-deny-bg)",
+                color: "var(--shed-danger)",
+                border: "none",
+                opacity: busy || view?.ended ? 0.5 : 1,
+              }}
+            >
+              <OctagonX size={14} /> Stop
+            </button>
+          )}
+          <button
+            onClick={onClose}
+            title="Close transcript"
+            className="hlink flex h-[30px] w-[30px] flex-none items-center justify-center rounded-lg text-shed-text-muted"
+          >
+            <X size={16} />
+          </button>
         </div>
-        {/* WHICH agent this transcript belongs to. Two adapters in one app made
-            it worth saying out loud: the panels differ in what they offer
-            (interject, the shape of a permission's buttons), and the kind is the
-            reason. Empty until `lane.open` answers, and no placeholder for it —
-            a badge that said "…" would be noise on every mount. */}
-        {opened?.capabilities?.kind && <KindBadge kind={opened.capabilities.kind} />}
-        <StatusChip tone={act.tone} label={act.label} />
-        <button
-          onClick={onClose}
-          title="Close transcript"
-          className="hlink flex h-[30px] w-[30px] flex-none items-center justify-center rounded-lg text-shed-text-muted"
-        >
-          <X size={16} />
-        </button>
+        {/* The settings chip (plan 025 §3.10): the current model, effort
+            and fast, one press from the sheet that changes them. */}
+        {chip && (
+          <button
+            data-settings-chip
+            onClick={() => onSettingsOpen(!settingsOpen)}
+            title={settingsOpen ? "Close session settings" : "Session settings: model, options, mode"}
+            aria-pressed={settingsOpen}
+            className="hbtn ml-[30px] mt-2 inline-flex max-w-[calc(100%-30px)] items-center gap-1.5 rounded-full px-2.5 py-1 text-[12px] font-semibold"
+            style={{
+              background: settingsOpen ? "var(--shed-accent)" : "var(--shed-accent-subtle)",
+              color: settingsOpen ? "var(--shed-accent-fg)" : "var(--shed-accent)",
+              border: "none",
+            }}
+          >
+            <SlidersHorizontal size={12} className="flex-none" />
+            <span className="truncate">{chip}</span>
+          </button>
+        )}
       </header>
 
-      {/* The `Down` posture: the last good generation stays on screen, and the
-          banner says why it is not moving. Not an error dialog — a machine that
-          went to sleep is normal. */}
+      {canStop && confirmStop && (
+        <div
+          data-stop-confirm
+          className="flex flex-none items-center gap-2 border-b border-shed-border px-4 py-2 text-[12.5px]"
+          style={{ background: "var(--shed-deny-bg)", color: "var(--shed-danger)" }}
+        >
+          <span className="min-w-0 flex-1">Stop this session? The agent ends; the transcript stays.</span>
+          <button
+            onClick={() => void stop()}
+            disabled={busy}
+            className="hbtn rounded-[9px] px-2.5 py-1.5 text-[12.5px] font-semibold"
+            style={{ background: "var(--shed-danger)", color: "var(--shed-accent-fg)", border: "none", opacity: busy ? 0.5 : 1 }}
+          >
+            Stop session
+          </button>
+          <button
+            onClick={() => setConfirmStop(false)}
+            disabled={busy}
+            className="hbtn rounded-[9px] px-2.5 py-1.5 text-[12.5px] font-semibold"
+            style={{ background: "var(--shed-surface)", color: "var(--shed-text-secondary)", border: "1px solid var(--shed-border)" }}
+          >
+            Keep
+          </button>
+        </div>
+      )}
+
+      {offered && settingsOpen && (
+        <LaneSettingsSheet
+          machine={machine}
+          kind={kind}
+          sessionId={sessionId}
+          settings={settings}
+          markOf={changes.markOf}
+          press={changes.press}
+          onClose={() => onSettingsOpen(false)}
+        />
+      )}
+
+      {/* The `Stale`/`Down` posture: the last good generation stays on screen,
+          and the banner says why it is not moving — and whether the lane is
+          reconnecting on its own (stale) or over (ended). Not an error dialog — a
+          machine that went to sleep is normal. */}
       {view?.stale && (
         <div
           className="flex-none border-b border-shed-border px-4 py-2 font-mono text-[12px]"
           style={{ background: "var(--shed-warn-bg)", color: "var(--shed-warn-fg)" }}
         >
-          not live · {view.stale} — showing the last known transcript
+          {view.ended ? "ended" : "not live"} · {view.stale} — showing the last known transcript
         </div>
       )}
       {error && (
@@ -723,9 +927,9 @@ export function LanePanel({ machine, sessionId, onClose }: {
           {canInterject && (
             <button
               onClick={() => setInterject(!interject)}
-              disabled={busy || !working}
+              disabled={busy || !verbs.interject.enabled}
               title={
-                working
+                verbs.interject.enabled
                   ? interjecting
                     ? "Interject: the next prompt interrupts the turn in flight"
                     : "Queue: the next prompt waits for the turn in flight"
@@ -737,7 +941,7 @@ export function LanePanel({ machine, sessionId, onClose }: {
                 background: interjecting ? "var(--shed-accent)" : "var(--shed-surface)",
                 color: interjecting ? "var(--shed-accent-fg)" : "var(--shed-text-secondary)",
                 border: "1px solid var(--shed-border)",
-                opacity: busy || !working ? 0.5 : 1,
+                opacity: busy || !verbs.interject.enabled ? 0.5 : 1,
               }}
             >
               <Zap size={15} />
@@ -757,22 +961,27 @@ export function LanePanel({ machine, sessionId, onClose }: {
           >
             <Send size={15} />
           </button>
-          {/* Enabled only while the session is Working — cancelling a session
-              that is already waiting on you is a no-op the agent would refuse. */}
-          <button
-            onClick={() => void cancel()}
-            disabled={busy || !working}
-            title="Cancel the turn in flight"
-            className="hbtn inline-flex h-9 w-9 items-center justify-center rounded-[9px]"
-            style={{
-              background: "var(--shed-deny-bg)",
-              color: "var(--shed-danger)",
-              border: "none",
-              opacity: busy || !working ? 0.5 : 1,
-            }}
-          >
-            <Square size={14} />
-          </button>
+          {/* Present only when the session's capabilities offer `cancel`, and
+              enabled only while it is Working — cancelling a session that is
+              already waiting on you is a no-op the agent would refuse, and a
+              session that cannot cancel at all gets no button whose only
+              outcome is a refusal (`laneVerbs`). */}
+          {verbs.cancel.shown && (
+            <button
+              onClick={() => void cancel()}
+              disabled={busy || !verbs.cancel.enabled}
+              title="Cancel the turn in flight"
+              className="hbtn inline-flex h-9 w-9 items-center justify-center rounded-[9px]"
+              style={{
+                background: "var(--shed-deny-bg)",
+                color: "var(--shed-danger)",
+                border: "none",
+                opacity: busy || !verbs.cancel.enabled ? 0.5 : 1,
+              }}
+            >
+              <Square size={14} />
+            </button>
+          )}
         </div>
       </div>
     </aside>

@@ -169,6 +169,70 @@ The desktop leg's recurring specifics (secrets, DMG/notarize, Sparkle
 appcast, debs, apt dispatch, rc-tag rehearsals) live in
 [`desktop/RELEASING.md`](desktop/RELEASING.md).
 
+### craze pin (plan 025)
+
+`craze-pin.env` at the repo root holds two independent pins for
+[craze](https://github.com/charliek/craze), the agent-lane provider shed's
+desktop and phone clients drive:
+
+- **`CRAZE_TEST_SHA`** — a MERGED craze `main` commit (never a branch head)
+  that both this repo's CI and shed-mobile's CI build `craze`,
+  `craze-fake-host` and `craze-fake-agent` from for their hermetic tests.
+  `make craze-binaries` builds the same four binaries locally (plus
+  `craze-0.0.1`, the too-old test cell, built at the real `v0.0.1` tag); the
+  `.github/actions/craze-binaries` composite action does the equivalent in
+  CI, shared by both repos so their craze SHAs can't drift apart.
+- **`CRAZE_RELEASE`** — the craze release the shed images actually bake
+  (bare `X.Y.Z`), or empty before a bake lands. Set to `0.1.0` since plan
+  025 §3.9 / C13.
+
+`craze-pin.env` is never sourced as shell by anything that reads it — every
+consumer (the Makefile targets, `check-craze-pin.sh`, the composite action,
+`release-plan.sh`) goes through `scripts/release/read-craze-pin.sh`, the one
+shared strict parser that treats the file as DATA: only `CRAZE_TEST_SHA=`
+and `CRAZE_RELEASE=` lines are recognized, validated before anything uses
+them, and any other line is refused outright. Sourcing it would let the file
+itself run a command or flip the release-time check's self-test seam.
+
+`make check-craze-pin` (offline, run by `make check` and CI's `pins` job)
+keeps the two pins well-formed, requires
+`crates/shed-craze/fixtures/wire.PIN` — the sha shed-craze's vendored wire
+fixtures were copied from — to equal `CRAZE_TEST_SHA` (so the pin never moves
+without the fixtures, or the other way round), and, once `CRAZE_RELEASE` is
+set, keeps both Dockerfiles' `CRAZE_VERSION`/digest `ARG`s in lockstep with it
+and with each other — the same fail-fast-on-drift shape as `check-roost-pin`.
+Moving `CRAZE_TEST_SHA` means re-vendoring craze's
+`internal/fakehost/testdata/wire` (its `README.md` included) into
+`crates/shed-craze/fixtures/wire` and rewriting `wire.PIN` in the same commit;
+CI's `craze-binaries` action diffs the two trees on every run.
+
+**The release-time check.** `scripts/release/check-craze-pin.sh --release
+vX.Y.Z` (network) resolves `v$CRAZE_RELEASE` against
+`github.com/charliek/craze` via `git ls-remote` and requires the resolved
+commit to equal `CRAZE_TEST_SHA` — O4's rule that "at the shed release the
+test SHA must equal the baked release's tag commit, enforced by a check."
+`release-plan.sh` calls it for every **stable tag whose component set
+includes `server`** (the images ship with the server component), in both
+the mandatory local pre-tag run and CI's `release-plan` job.
+
+> **Consequence.** The craze bake landed in plan 025 §3.9 / C13:
+> `CRAZE_RELEASE=0.1.0` and `CRAZE_TEST_SHA` equals v0.1.0's tag commit, so
+> this check now passes against the real tag. Before the bake landed,
+> `CRAZE_RELEASE` was empty and **every** stable tag that ships `server`
+> from `main`, a hotfix included, was refused — that was the rule working
+> as intended: 0.9.0 must bake craze. The same trap returns if `CRAZE_RELEASE`
+> is ever cleared or a future craze release moves `CRAZE_TEST_SHA` without a
+> matching bump here. For a true emergency, the owner may set
+> `SHED_RELEASE_ALLOW_NO_CRAZE=<reason>`, which prints loudly and records
+> the override in `release-plan.sh`'s output instead of being silently
+> honoured — it must never be set by CI.
+
+`scripts/release/release-scripts-test.sh` covers the release-time check
+too, through a `CRAZE_PIN_LS_REMOTE` seam honoured **only** under
+`SHED_RELEASE_SELFTEST=1` (so a stray variable can never bypass a real
+release run) — match passes, mismatch fails, an empty `CRAZE_RELEASE`
+fails, and the seam is proven ignored without the self-test flag.
+
 ## What happens
 
 1. **`release-workflows:release`** (LLM, local):

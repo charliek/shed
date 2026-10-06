@@ -22,8 +22,14 @@ use std::sync::{Arc, Mutex};
 
 use serde_json::Value;
 
-use shed_app::roost::{LocalSession, RoostReach, SshBridge, SshBridgeOptions, UnreachableReach};
+use shed_app::roost::{
+    LocalSession, RoostReach, SshBridge, SshBridgeOptions, SshExec, UnreachableReach,
+};
 use shed_core::config::{MachineEntry, ShedConfig};
+use shed_core::machine::display_line;
+use shed_craze::{EnvPolicy, ProcessDial};
+
+use crate::craze::{CrazeReach, SshCrazeDial, SshCrazeProbe};
 
 use crate::roost_hosts::{lock, RoostHosts};
 
@@ -222,6 +228,16 @@ pub struct ReachOptions {
     /// from "unset" into "refuse to spawn ssh", which is the hermeticity
     /// promise — see [`build_ssh_reach`].
     pub test_mode: bool,
+    /// `SHED_TAURI_CRAZE_PATH` (plan 025 §3.6.1): the directory THIS machine's
+    /// craze source finds `craze` in, in test mode — the local dial then runs
+    /// the jailed ladder with `PATH` set to it. `None` in production, and in a
+    /// test-mode run that did not ask for craze, which then has no local craze
+    /// source at all. See [`build_local_craze`].
+    pub craze_path: Option<PathBuf>,
+    /// The variables the jailed local dial passes through from this app's own
+    /// environment — `HOME`, `CRAZE_HOME`, `CRAZE_RUNTIME_DIR`, those that are
+    /// set — beside the seam's `PATH`. Read in test mode only.
+    pub craze_env: Vec<(String, String)>,
 }
 
 impl ReachOptions {
@@ -293,6 +309,76 @@ pub(crate) fn build_local_reach(options: &ReachOptions) -> Registered {
         };
     }
     mapped_reach(LOCALHOST, options, ReachKind::Local)
+}
+
+/// THIS machine's craze reach (plan 025 §3.6.1) — EAGER, a local
+/// `/bin/sh -c '<ladder>'` per connection.
+///
+/// Production runs craze's published ladder with the app's own environment
+/// ([`EnvPolicy::Inherit`]): the hub this births lives in the app's session —
+/// the GUI session on a Mac, which is what lets cursor run there.
+///
+/// **Test mode reaches only what the harness supplied**, the same rule
+/// [`build_ssh_reach`] holds for roost: `SHED_TAURI_CRAZE_PATH` names a
+/// directory, and the dial runs the JAILED ladder (rungs 1–2 only, no PATH
+/// enhancement) under `env_clear()` + `HOME`/`CRAZE_HOME`/`CRAZE_RUNTIME_DIR`
+/// from the app's environment + `PATH=<that dir>`, so no absolute rung — and
+/// not this host's own `/usr/local/bin/craze` — can answer a hermetic run.
+/// Without the seam there is no local craze source at all.
+pub(crate) fn build_local_craze(options: &ReachOptions) -> Option<CrazeReach> {
+    if !options.test_mode {
+        return Some(CrazeReach {
+            dial: Arc::new(ProcessDial::bridge_hub(EnvPolicy::Inherit)),
+            probe: None,
+            ensure: None,
+        });
+    }
+    let dir = options.craze_path.as_ref()?;
+    let mut env = options.craze_env.clone();
+    env.push(("PATH".to_string(), dir.display().to_string()));
+    Some(CrazeReach {
+        dial: Arc::new(ProcessDial::bridge_hub_jailed(EnvPolicy::Exactly(env))),
+        probe: None,
+        ensure: None,
+    })
+}
+
+/// A remote machine's or a shed's craze reach (plan 025 §3.6.1) —
+/// ATTACH-ONLY: the find-only probe, and a probe-gated `bridge --hub`, both
+/// over the host's own [`SshExec`] (its pinned host key and its
+/// ControlMaster, shared with the bootstrap) — plus the same bridge UNGATED
+/// ([`CrazeReach::ensure`]), which only a user's explicit action (the create
+/// sheet) dials, and which may birth a hub there.
+///
+/// **In test mode it exists only through the fake-ssh seam**, mirroring
+/// [`build_ssh_reach`] — and it composes the JAILED ladder, because the fake
+/// `ssh` runs whatever it is not told about through this host's own
+/// `/bin/sh`, where the absolute rungs would find this host's craze. A
+/// test-mode host with no fake `ssh` has no craze source.
+pub(crate) fn build_ssh_craze(exec: Arc<SshExec>, options: &ReachOptions) -> Option<CrazeReach> {
+    let (bridge, probe) = if options.test_mode {
+        options.ssh_bin.as_ref()?;
+        (
+            display_line(&shed_core::craze::bridge_hub_argv_jailed()),
+            display_line(&shed_core::craze::providers_hub_argv_jailed()),
+        )
+    } else {
+        (
+            shed_core::craze::bridge_hub_command(),
+            display_line(&shed_core::craze::providers_hub_argv()),
+        )
+    };
+    let probe: Arc<dyn crate::craze::CrazeProbe> =
+        Arc::new(SshCrazeProbe::new(Arc::clone(&exec), probe));
+    Some(CrazeReach {
+        dial: Arc::new(SshCrazeDial::new(
+            Arc::clone(&exec),
+            bridge.clone(),
+            Arc::clone(&probe),
+        )),
+        probe: Some(probe),
+        ensure: Some(Arc::new(SshCrazeDial::ungated(exec, bridge))),
+    })
 }
 
 /// The test-mode reach for `name`, and the kind that goes with it.
@@ -393,6 +479,104 @@ mod tests {
             "an unmapped localhost is still local — it is this machine"
         );
         assert_eq!(local.reach.label(), LOCALHOST);
+    }
+
+    /// **This machine's craze source in test mode exists only through the
+    /// seam** (plan 025 §3.6.1), and a remote one only through the fake-ssh
+    /// seam; production always has both, the local one eager and the remote
+    /// one attach-only.
+    #[test]
+    fn a_craze_reach_exists_in_test_mode_only_through_a_seam() {
+        let bare = ReachOptions {
+            test_mode: true,
+            ..ReachOptions::default()
+        };
+        assert!(
+            build_local_craze(&bare).is_none(),
+            "no seam, no local craze"
+        );
+        let seamed = ReachOptions {
+            test_mode: true,
+            craze_path: Some(PathBuf::from("/nonexistent/craze-bin")),
+            ..ReachOptions::default()
+        };
+        let local = build_local_craze(&seamed).expect("the seam's local craze");
+        assert!(local.probe.is_none(), "this machine is EAGER");
+        let production = build_local_craze(&ReachOptions::default()).expect("production");
+        assert!(production.probe.is_none());
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let exec = Arc::new(
+            SshExec::new(
+                &entry("mini3"),
+                &ReachOptions {
+                    ssh_bin: Some(dir.path().join("ssh")),
+                    ..ReachOptions::default()
+                }
+                .bridge_options(),
+            )
+            .expect("exec"),
+        );
+        assert!(
+            build_ssh_craze(Arc::clone(&exec), &bare).is_none(),
+            "test mode with no fake ssh: no remote craze"
+        );
+        let with_ssh = ReachOptions {
+            test_mode: true,
+            ssh_bin: Some(dir.path().join("ssh")),
+            ..ReachOptions::default()
+        };
+        let remote = build_ssh_craze(Arc::clone(&exec), &with_ssh).expect("through the fake ssh");
+        assert!(remote.probe.is_some(), "a remote host is ATTACH-ONLY");
+        let remote = build_ssh_craze(exec, &ReachOptions::default()).expect("production");
+        assert!(remote.probe.is_some());
+    }
+
+    /// **The test-mode local dial is the JAILED ladder** (plan 025 §3.6.1): the
+    /// stub on the seam directory is found by rung 2 and exec'd with `PATH`
+    /// left EXACTLY the seam directory — the production ladder would have
+    /// prepended its exec-PATH (`/opt/homebrew/bin`, `/usr/local/bin`, …),
+    /// which is how a host-installed craze could reach a hermetic run — and
+    /// with nothing of this process's environment but what `craze_env` names.
+    #[tokio::test]
+    async fn the_test_mode_local_dial_is_jailed() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let seam = dir.path().join("bin");
+        std::fs::create_dir_all(&seam).expect("mkdir");
+        let stub = seam.join("craze");
+        std::fs::write(
+            &stub,
+            "#!/bin/sh\necho \"stub PATH=$PATH HOME=${HOME:-} STRAY=${SHED_TAURI_STRAY:-} ARGS=$*\" >&2\nexit 3\n",
+        )
+        .expect("write");
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        let home = dir.path().join("home");
+        let options = ReachOptions {
+            test_mode: true,
+            craze_path: Some(seam.clone()),
+            craze_env: vec![("HOME".to_string(), home.display().to_string())],
+            ..ReachOptions::default()
+        };
+        let reach = build_local_craze(&options).expect("the seam's local craze");
+        // A variable of THIS process that must not reach the dial.
+        std::env::set_var("SHED_TAURI_STRAY", "leaked");
+        let client = shed_craze::wire::ClientInfo::shed("t");
+        let err = shed_craze::connect_hub(
+            reach.dial.as_ref(),
+            &client,
+            std::time::Duration::from_secs(10),
+            std::time::Duration::from_secs(10),
+        )
+        .await
+        .err()
+        .expect("a stub is no hub");
+        let said = err.to_string();
+        assert!(
+            said.contains(&format!("stub PATH={} HOME={} STRAY= ARGS=bridge --hub", seam.display(), home.display())),
+            "the jailed ladder ran the seam's craze with PATH untouched and nothing inherited: {said}"
+        );
     }
 
     #[test]

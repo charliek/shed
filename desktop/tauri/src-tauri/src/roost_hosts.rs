@@ -15,8 +15,8 @@
 //!
 //! What is left here is what a desktop app actually owns: which hosts exist, one
 //! watcher per host, the last inventory each one reported, whether it is
-//! currently reachable, and the four ops (`roost.probe` / `preview` /
-//! `bootstrap` / `launch`) a user's click lands in.
+//! currently reachable, and the five ops (`roost.probe` / `preview` /
+//! `bootstrap` / `launch` / `run`) a user's click lands in.
 //!
 //! ## Two kinds of host, one registry
 //!
@@ -71,9 +71,9 @@ use serde_json::{json, Value};
 use roost_ipc::agent::{AgentLifecycle, Ownership, ShellState};
 use roost_ipc::messages::{Tab, TabOpenParams};
 use shed_app::roost::{
-    launch_argv, roost_capabilities, shed_reach_entry, tab_close, tab_open, BootstrapRunner,
-    HooksRefresh, ReachKind as ReachFamily, RoostReach, RoostUpdate, RoostWatcher,
-    RoostWatcherOptions, SshExec,
+    launch_argv, roost_capabilities, shed_reach_entry, tab_close, tab_open, tab_open_fenced,
+    BootstrapRunner, HooksRefresh, ReachKind as ReachFamily, RoostReach, RoostUpdate, RoostWatcher,
+    RoostWatcherOptions, SshExec, TabFence,
 };
 use shed_core::config::{MachineEntry, ShedConfig};
 use shed_core::rc::RcKind;
@@ -81,11 +81,18 @@ use shed_core::roost::bootstrap::{
     self, BootstrapFailure, HooksResult, InstallRequest, Installed, Plan, Probe, ProbeOutcome,
     SessionState, SourceEnv, Stage,
 };
-use shed_core::roost::{AgentLaneStamp, Conn, RoostSession};
+use shed_core::roost::{AgentLaneStamp, Conn, RoostInventory, RoostSession};
 
+use shed_app::craze_rows::{fold_plan, FoldPlan, RoostTabRef};
+use shed_core::lane::{
+    AgentSource as _, LaneCreateRequest, LaneSession, SourceEvent, SourceOffline,
+};
+use shed_craze::CrazeSource;
+
+use crate::craze::{CrazeFailure, CrazePhase, CrazeReach, CrazeSink, CrazeState, CrazeTimings};
 use crate::machines::{
-    build_local_reach, build_ssh_reach, reject_reserved_name, ReachKind, ReachOptions, Registered,
-    LOCALHOST,
+    build_local_craze, build_local_reach, build_ssh_craze, build_ssh_reach, reject_reserved_name,
+    ReachKind, ReachOptions, Registered, LOCALHOST,
 };
 
 /// Why a roost row offers no terminal, in the words BOTH doors answer with —
@@ -290,6 +297,146 @@ pub type OnChange = Arc<dyn Fn() + Send + Sync>;
 /// child, behind a row nobody can see.
 pub type OnLanes = Arc<dyn Fn(&str, &BTreeMap<String, AgentLaneStamp>) + Send + Sync>;
 
+/// Called with one host's ADDRESS, the GENERATION of the craze source that
+/// held them, and the craze rows (hostIds) that just left it — a roster
+/// `Removed`, a `Ready` swap that no longer lists them (an epoch reseed sends
+/// no `Removed`), the hub gone (Dormant), the host removed, or its tab ended
+/// (plan 025 §3.6.4). The lane layer's [`crate::lane::Lanes::evict_craze`] is
+/// the one observer: the craze half of [`OnLanes`], which since plan 025
+/// reconciles only the roost-stamped lanes.
+///
+/// **The generation is the fence the eviction is judged by** (C9 review): it
+/// is published AFTER the state lock that computed it is released, and by
+/// then the host may have been removed, registered again, and had a lane
+/// opened on the same hostId under a NEW source. The lane layer evicts only
+/// the lanes opened through the generation named, so a stale source's
+/// eviction can never end a current lane.
+pub type OnCrazeGone = Arc<dyn Fn(&str, u64, &[String]) + Send + Sync>;
+
+/// The fence every craze task's writes are checked against (see
+/// [`CrazeState::gen`]): a fresh number per craze source started, never 0.
+static NEXT_CRAZE_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// A fresh number per REGISTRATION of a host ([`HostState::reg_gen`]), never 0.
+static NEXT_REG_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// How long [`RoostHosts::remove`] waits for a removed host's craze source to
+/// have stopped — its task joined, and every holder of its dial (its roster's
+/// pump, its lanes) gone — before it logs and returns anyway. The removals of
+/// one refresh are waited for TOGETHER, so a refresh waits this long once, not
+/// once per host.
+///
+/// **A bounded best-effort teardown, not a barrier** (C9 confirmation): it
+/// waits up to this long for the task and the dial; a held lane verb (a
+/// `LaneEntry` clone mid-command, or an in-flight source call) can outlive it,
+/// and the last holder's drop releases it.
+const CRAZE_STOP_WAIT: Duration = Duration::from_secs(2);
+
+/// How each host's craze is reached (plan 025 §3.6.1).
+#[derive(Clone)]
+pub(crate) enum CrazeReaches {
+    /// Production, and the harness: this machine's local dial, every other
+    /// host's ssh — each under its test-mode seam
+    /// ([`crate::machines::build_local_craze`] / `build_ssh_craze`).
+    Options,
+    /// Unit tests: a reach per host chosen by the test (`None`: no craze
+    /// there) — a scripted hub instead of a process.
+    #[cfg(test)]
+    Fixed(FixedCrazeReach),
+}
+
+/// [`CrazeReaches::Fixed`]'s chooser.
+#[cfg(test)]
+pub(crate) type FixedCrazeReach = Arc<dyn Fn(&HostId) -> Option<CrazeReach> + Send + Sync>;
+
+/// One host's running craze source: the source its lanes open through, the
+/// task that keeps its [`CrazeState`] current, and the generation both were
+/// started under. Dropping it aborts the task (the backstop); [`Self::stop`]
+/// is the teardown that waits — bounded and best-effort
+/// ([`CRAZE_STOP_WAIT`]).
+struct CrazeHost {
+    /// `None` only once [`Self::stop`] has let it go.
+    source: Option<CrazeSource>,
+    /// The same source dialling through the host's EXPLICIT-ACTION dial
+    /// ([`CrazeReach::ensure`], tethered to the tracked one) — what the create
+    /// sheet's `create_options` and the create run on. It shares the source's
+    /// rows, so a session it creates is openable through `source` at once.
+    /// `None` only once [`Self::stop`] has let it go.
+    ask: Option<CrazeSource>,
+    /// Wakes the task's wait ([`crate::craze::run`]): a user's explicit action
+    /// — the create sheet's `create_options` or a create, the only remote hub
+    /// births (plan 025 Amendment A14) — may have just started a hub on an
+    /// attach-only host.
+    wake: Arc<tokio::sync::Notify>,
+    task: tokio::task::JoinHandle<()>,
+    gen: u64,
+    /// Resolves when the source's dial's LAST holder is gone
+    /// ([`crate::craze::tracked`]) — its roster's pump, its lanes, and so the
+    /// host's `SshExec`. `None` once [`Self::stop`] consumed it.
+    gone: Option<tokio::sync::oneshot::Receiver<()>>,
+}
+
+impl CrazeHost {
+    /// Stop it and wait — at most [`CRAZE_STOP_WAIT`] — until it HAS stopped:
+    /// the task joined (its probe child killed with its future), and every
+    /// holder of its dial dropped (its roster's pump, whose connection's drop
+    /// closes the bridge's stdin and kills it; its lanes; the `SshExec` behind
+    /// them, whose last drop asks the ControlMaster to exit). Answers whether
+    /// that happened in time; when it did not — a held lane verb still owns a
+    /// clone of the dial — that holder's own drop releases it later.
+    async fn stop(mut self) -> bool {
+        self.task.abort();
+        self.source = None;
+        self.ask = None;
+        let gone = self.gone.take();
+        let task = &mut self.task;
+        tokio::time::timeout(CRAZE_STOP_WAIT, async move {
+            let _ = task.await;
+            if let Some(gone) = gone {
+                let _ = gone.await;
+            }
+        })
+        .await
+        .is_ok()
+    }
+}
+
+impl Drop for CrazeHost {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+/// One host [`RoostHosts::detach`] took out of the registry: what the rest of
+/// its removal ([`RoostHosts::remove`]) still has to do.
+struct Detached {
+    id: HostId,
+    /// Whether it was in a listing, so its going is a change to announce.
+    was_listed: bool,
+    /// Its craze source, to stop.
+    craze: Option<CrazeHost>,
+}
+
+/// A test seam at an await point the code under test passes: it notifies the
+/// first and waits on the second, so a test can land something racing in the
+/// gap. Armed once; taken by the first pass through it. Used for
+/// [`RoostHosts::remove`]'s gap between its one critical section and its
+/// teardown, [`RoostHosts::observe_sheds`]' between reading the registry and
+/// acting on it, and `lane.open`'s between resolving a craze source and
+/// declaring the open.
+#[cfg(test)]
+pub(crate) type TestGap = (Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>);
+
+/// Pass through `slot`'s [`TestGap`] if a test armed it.
+#[cfg(test)]
+pub(crate) async fn at_gap(slot: &Mutex<Option<TestGap>>) {
+    let gap = lock(slot).take();
+    if let Some((reached, proceed)) = gap {
+        reached.notify_one();
+        proceed.notified().await;
+    }
+}
+
 /// One host's live view, as the UI reads it.
 struct HostState {
     /// The last inventory the session reported — agent-owned tabs only
@@ -328,7 +475,87 @@ struct HostState {
     /// answered there (plan 019 §3.6's probe-then-watch). Once flipped it stays
     /// flipped, so a session that stops leaves a normal unreachable row rather
     /// than making the host vanish mid-look.
+    ///
+    /// **A craze `Ready` lists a host too** (plan 025 §3.6.2): a machine with
+    /// ssh and craze but no roost still shows its craze sessions, and a
+    /// craze-only `localhost` is somewhere to create one.
     listed: bool,
+    /// This host's craze roster (plan 025 §3.6.2), under THIS lock — so a
+    /// listing reads the roost rows and the craze rows in one acquisition and
+    /// a session never appears twice in one answer. `gen` 0: no craze source.
+    craze: CrazeState,
+    /// Which REGISTRATION of this host the entry belongs to: fresh each time
+    /// one is made. A craze source started for one registration is installed
+    /// only into that same one ([`RoostHosts::start_craze`]), so a source built
+    /// across a remove and a re-registration is dropped, never grafted onto
+    /// the new host.
+    reg_gen: u64,
+    /// The roost tabs THIS app opened with Open in terminal (plan 025 §3.6.6):
+    /// tab id → the craze session (hostId) its `craze attach` runs.
+    ///
+    /// **Why the app keeps them, not roost:** `craze attach` claims no tab
+    /// (craze `attach.go`: "no session claim is taken"), so roost never reports
+    /// one as craze-owned, and a provisional ownership stamped at open would be
+    /// replaced by the next snapshot. So [`Self::fold_plan`] feeds these to the
+    /// row merge itself, for as long as roost lists the tab, and the hub row
+    /// shows its tab — End tab and all — across every roost snapshot. An entry
+    /// leaves when a snapshot no longer lists its tab ([`OpenedTab::retained`])
+    /// or when the tab is ended here. In memory only: after a restart such a
+    /// tab is an unowned tab (not a row), and the hub row offers Open in
+    /// terminal again.
+    opened_tabs: BTreeMap<i64, OpenedTab>,
+}
+
+/// One tab Open in terminal opened ([`HostState::opened_tabs`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct OpenedTab {
+    /// The craze session its `craze attach` runs.
+    host_id: String,
+    /// A roost revision at or past the commit that opened the tab, in the
+    /// daemon incarnation that opened it ([`shed_app::roost::tab_open_fenced`]);
+    /// `None` when roost published none (a UI socket) or both reads after the
+    /// open failed.
+    fence: Option<TabFence>,
+    /// When `tab.open` answered — what an UNFENCED entry's grace counts from.
+    opened: Instant,
+}
+
+/// How long an UNFENCED opened tab outlasts snapshots that do not list it: with
+/// no fence there is no telling a snapshot taken before the open (one queued
+/// just as the tab was opened) from one taken after it closed, so for this long
+/// none may remove it; after it, presence decides.
+const UNFENCED_GRACE: Duration = Duration::from_secs(5);
+
+impl OpenedTab {
+    /// Whether this entry outlives the roost snapshot `at` that `listed` (or
+    /// not) its tab, judged at `now` — by the FENCE (C10 review and
+    /// confirmation):
+    ///
+    /// * listed: kept;
+    /// * fenced, and `at` is the SAME daemon incarnation: a revision below the
+    ///   fence is a snapshot taken before the tab existed (a fresh unowned tab
+    ///   is a hidden one, whose churn publishes no snapshot of its own) and
+    ///   says nothing; at or past it, the tab is gone — closing a tab the
+    ///   watcher knew always publishes such a snapshot, so a closed tab never
+    ///   stays mapped;
+    /// * fenced, and `at` is ANOTHER incarnation (roost's revisions reset when
+    ///   its daemon restarts, so they do not compare across one): presence
+    ///   alone — absent is gone;
+    /// * unfenced: kept for [`UNFENCED_GRACE`] from the open, whatever a
+    ///   snapshot says; after it, presence alone. The grace is judged here,
+    ///   when a snapshot is folded — the only moment an entry can be removed.
+    fn retained(&self, listed: bool, at: &RoostInventory, now: Instant) -> bool {
+        if listed {
+            return true;
+        }
+        match &self.fence {
+            Some(fence) if fence.same_daemon(at) => at
+                .revision
+                .is_some_and(|revision| revision < fence.revision),
+            Some(_) => false,
+            None => now.saturating_duration_since(self.opened) < UNFENCED_GRACE,
+        }
+    }
 }
 
 impl HostState {
@@ -340,7 +567,117 @@ impl HostState {
             down_kind: None,
             seen: false,
             listed,
+            craze: CrazeState::default(),
+            reg_gen: NEXT_REG_GEN.fetch_add(1, Ordering::Relaxed),
+            opened_tabs: BTreeMap::new(),
         }
+    }
+
+    /// The row merge for this host (plan 025 §3.6.3): its roost tabs against
+    /// its hub's rows — only while that feed is live.
+    ///
+    /// **The tabs Open in terminal opened join the merge** (§3.6.6). Each is
+    /// fed to the shared rule as one more [`RoostTabRef`], owned by the
+    /// provider session of the hub row it attaches to — exactly as if roost had
+    /// reported it craze-owned — so the shared rule decides it like any other
+    /// (the newest tab of a session attaches; the rest fold silently). That
+    /// translation is only sound while the provider session names ONE row:
+    /// a row that names none yet (a session still starting), or one whose
+    /// provider session another row claims too (a re-hosted session briefly
+    /// listed twice), has nothing the shared rule could match the tab on
+    /// without guessing — and this app KNOWS which session the tab attaches
+    /// (it ran `craze attach --session <hostId>`). So such a tab attaches to
+    /// its own row by hostId, under the shared rule's tie-break: the newest
+    /// tab of a row wins, the others fold silently. A tab roost reports itself
+    /// is never added twice.
+    ///
+    /// **With the hub feed down the opened tabs STILL attach** (C10 review), by
+    /// hostId, to the rows the source retains (stale): the opened-tab map is
+    /// this app's own knowledge of a tab it opened, not roost's ownership, so
+    /// D4's "nothing is absorbed while the feed is down" — which is about
+    /// roost-owned craze tabs, and still holds for them — does not hide it.
+    /// Otherwise a still-open attach tab would vanish from its row, and the row
+    /// would offer Open in terminal again: a second attach tab.
+    ///
+    /// `created` is the source's created rows this state does not hold
+    /// ([`created_rows`]): they are rows of this host like the roster's, for
+    /// every rule here.
+    fn fold_plan(&self, created: &[LaneSession]) -> FoldPlan {
+        let mut tabs: Vec<RoostTabRef> = self
+            .sessions
+            .iter()
+            .map(|s| RoostTabRef {
+                tab_id: s.tab_id,
+                craze_owner: (s.agent_kind() == RcKind::Craze).then(|| {
+                    s.ownership
+                        .as_ref()
+                        .map(|o| o.session_id.clone())
+                        .unwrap_or_default()
+                }),
+            })
+            .collect();
+        // The host's craze rows: the roster's, and the created ones it does not
+        // list yet.
+        let mut rows: BTreeMap<&str, &LaneSession> = self
+            .craze
+            .rows
+            .values()
+            .map(|row| (row.id.as_str(), row))
+            .collect();
+        for row in created {
+            rows.entry(row.id.as_str()).or_insert(row);
+        }
+        let mut claims: BTreeMap<&str, usize> = BTreeMap::new();
+        for row in rows.values() {
+            if let Some(psid) = row.provider_session_id.as_deref() {
+                *claims.entry(psid).or_default() += 1;
+            }
+        }
+        let live = self.craze.live();
+        let hub: Option<Vec<LaneSession>> =
+            live.then(|| rows.values().map(|row| (*row).clone()).collect());
+        let mut direct: Vec<(i64, &str)> = Vec::new();
+        for (&tab_id, opened) in &self.opened_tabs {
+            if self.sessions.iter().any(|s| s.tab_id == tab_id) {
+                continue;
+            }
+            let psid = rows
+                .get(opened.host_id.as_str())
+                .and_then(|row| row.provider_session_id.as_deref());
+            match psid {
+                Some(psid) if live && claims.get(psid) == Some(&1) => tabs.push(RoostTabRef {
+                    tab_id,
+                    craze_owner: Some(psid.to_string()),
+                }),
+                _ => direct.push((tab_id, &opened.host_id)),
+            }
+        }
+        let mut plan = fold_plan(&tabs, hub.as_deref());
+        for (tab_id, host_id) in direct {
+            if !rows.contains_key(host_id) {
+                // Its row is gone: while the feed is live the tab folds
+                // silently; while it is down nothing is folded at all.
+                if live {
+                    plan.hidden.insert(tab_id);
+                }
+                continue;
+            }
+            match plan.tab_of(host_id) {
+                None => {
+                    plan.absorbed.insert(tab_id, host_id.to_string());
+                }
+                // The newer tab attaches; the one it displaces folds.
+                Some(current) if current < tab_id => {
+                    plan.absorbed.remove(&current);
+                    plan.hidden.insert(current);
+                    plan.absorbed.insert(tab_id, host_id.to_string());
+                }
+                Some(_) => {
+                    plan.hidden.insert(tab_id);
+                }
+            }
+        }
+        plan
     }
 }
 
@@ -487,6 +824,27 @@ pub struct RoostHosts {
     /// built at the same instant. `None` in every context that has no lanes —
     /// the unit tests, and any embedder that never opens one.
     on_lanes: Arc<Mutex<Option<OnLanes>>>,
+    /// The lane layer's craze eviction hook ([`OnCrazeGone`]) — late-bound
+    /// for [`Self::on_lanes`]' reason.
+    on_craze: Arc<Mutex<Option<OnCrazeGone>>>,
+    /// How each host's craze is reached.
+    craze_reaches: CrazeReaches,
+    /// The craze sources' clocks (the pinned ones but in unit tests).
+    craze_timings: CrazeTimings,
+    /// **One shed-observation pass at a time** (C9 confirmation, N2): held
+    /// across the whole of [`Self::observe_sheds`] — its registry read, its
+    /// removals and its registrations — so a pass never acts on a view another
+    /// pass has changed underneath it, and the registry ends on the LATEST
+    /// observation. Async, because a pass awaits its removals.
+    observe_pass: tokio::sync::Mutex<()>,
+    /// [`TestGap`]s, armed by a test: [`Self::remove`]'s,
+    /// [`Self::observe_sheds`]' and [`Self::craze_create`]'s.
+    #[cfg(test)]
+    remove_gap: Mutex<Option<TestGap>>,
+    #[cfg(test)]
+    observe_gap: Mutex<Option<TestGap>>,
+    #[cfg(test)]
+    create_gap: Mutex<Option<TestGap>>,
 }
 
 /// The mutable half of [`RoostHosts`]: the registered set and its live watchers.
@@ -518,6 +876,10 @@ struct Registry {
     /// stopped loses its watcher without waiting for a relaunch (plan 019 §3.6).
     /// Dropping one aborts its loop.
     watchers: BTreeMap<HostId, RoostWatcher>,
+    /// Each host's craze source (plan 025 §3.6.1), started with the host's
+    /// registration — independently of its roost watcher — and dropped with
+    /// it.
+    crazes: BTreeMap<HostId, CrazeHost>,
 }
 
 impl Registry {
@@ -627,12 +989,35 @@ impl RoostHosts {
         jail_fs_root: bool,
         on_change: OnChange,
     ) -> RoostHosts {
+        Self::start_with(
+            handle,
+            config,
+            reach_options,
+            jail_fs_root,
+            on_change,
+            CrazeReaches::Options,
+            CrazeTimings::default(),
+        )
+    }
+
+    /// [`Self::start`], with the craze reaches and clocks chosen by the caller
+    /// (a unit test's scripted hubs).
+    pub(crate) fn start_with(
+        handle: &tokio::runtime::Handle,
+        config: &ShedConfig,
+        reach_options: ReachOptions,
+        jail_fs_root: bool,
+        on_change: OnChange,
+        craze_reaches: CrazeReaches,
+        craze_timings: CrazeTimings,
+    ) -> RoostHosts {
         let hosts = RoostHosts {
             state: Arc::new(Mutex::new(BTreeMap::new())),
             reg: Arc::new(Mutex::new(Registry {
                 ids: Vec::new(),
                 reaches: BTreeMap::new(),
                 watchers: BTreeMap::new(),
+                crazes: BTreeMap::new(),
             })),
             handle: handle.clone(),
             config: config.clone(),
@@ -647,6 +1032,16 @@ impl RoostHosts {
             probe_slots: Arc::new(tokio::sync::Semaphore::new(SHED_PROBE_CONCURRENCY)),
             on_change,
             on_lanes: Arc::new(Mutex::new(None)),
+            on_craze: Arc::new(Mutex::new(None)),
+            craze_reaches,
+            craze_timings,
+            observe_pass: tokio::sync::Mutex::new(()),
+            #[cfg(test)]
+            remove_gap: Mutex::new(None),
+            #[cfg(test)]
+            observe_gap: Mutex::new(None),
+            #[cfg(test)]
+            create_gap: Mutex::new(None),
         };
         for entry in &config.machines {
             hosts.watch_machine(entry.clone());
@@ -690,6 +1085,9 @@ impl RoostHosts {
     /// concurrent adds both win.
     fn start_watching(&self, id: HostId, reach: Result<Registered, String>, listed: bool) {
         lock(&self.state).insert(id.clone(), HostState::new(listed));
+        // Its craze source too, beside (not behind) the roost watcher: a
+        // host's craze does not wait on roost (plan 025 §3.6.1).
+        self.start_craze(&id);
 
         let reach = match reach {
             Ok(reach) => reach,
@@ -785,12 +1183,31 @@ impl RoostHosts {
         filter: HostFilter<'_>,
     ) -> Vec<Value> {
         let mut out = Vec::new();
+        // `reg` under the caller's `state` guard: the one order the two are
+        // held in.
+        let reg = lock(&self.reg);
         for (id, m) in guard.iter() {
             if !m.listed || !filter.keeps(id) {
                 continue;
             }
+            // The source's created rows, read NOW — never a copy of them.
+            let created = created_rows(&reg, id, m);
+            // The row merge (plan 025 §3.6.3, D4): with the host's craze feed
+            // live, every craze-owned roost tab folds into the hub row it
+            // names (or is hidden), and the hub row is the row. Computed per
+            // host, so a fold never crosses machines.
+            let plan = m.fold_plan(&created);
             for session in &m.sessions {
+                if plan.folds(session.tab_id) {
+                    continue;
+                }
                 out.push(host_row(id, session, !m.reachable));
+            }
+            // Retained rows render stale: a source that is not live shows the
+            // last rows it swapped in as the last KNOWN state.
+            let stale = !m.craze.live();
+            for row in m.craze.rows.values().chain(created.iter()) {
+                out.push(craze_row(id, row, stale, plan.tab_of(&row.id)));
             }
         }
         out
@@ -807,12 +1224,23 @@ impl RoostHosts {
     /// and nothing else is. An unreachable host is NOT excluded: its last rows
     /// stay on screen marked stale, and closing one is a request the wire will
     /// answer for itself.
+    ///
+    /// **A craze-owned tab the row merge folded away is still closable**
+    /// (plan 025 §3.6.3, C9 review): an ABSORBED one's id is its hub row's
+    /// `tab_id` — what that row's End tab sends — and a HIDDEN one (a craze tab
+    /// the live roster names no row for: a TUI with craze's control socket off,
+    /// plan 025 §9) is still an agent-owned tab of this host's, which
+    /// `machine.kill` (and roost's own UI) must be able to end. D4 hides it
+    /// from the ROWS; it does not make it unkillable.
+    ///
+    /// **And so is a tab Open in terminal opened** (plan 025 §3.6.6): roost
+    /// reports it as an unowned tab, never a row, yet its hub row carries its
+    /// id as `tab_id` — what that row's End tab sends.
     fn listed_row(&self, id: &HostId, tab_id: i64) -> Result<(), String> {
         let guard = lock(&self.state);
-        let listed = guard
-            .get(id)
-            .filter(|m| m.listed)
-            .is_some_and(|m| m.sessions.iter().any(|s| s.tab_id == tab_id));
+        let listed = guard.get(id).filter(|m| m.listed).is_some_and(|m| {
+            m.sessions.iter().any(|s| s.tab_id == tab_id) || m.opened_tabs.contains_key(&tab_id)
+        });
         if listed {
             return Ok(());
         }
@@ -858,12 +1286,27 @@ impl RoostHosts {
         let tab_id = parse_tab_id(slug)?;
         self.listed_row(&id, tab_id)?;
         tab_close(reach.as_ref(), tab_id).await?;
-        {
+        // The craze session that tab ran (a craze row's End tab — plan 025
+        // §3.6.5): a TUI-hosted session ends with its tab, so its lane goes
+        // now rather than at the roster's `Removed`, the same optimism as the
+        // roost lanes below. NOT a tab Open in terminal opened: closing a
+        // `craze attach` only DETACHES (its `/exit` is what stops the
+        // session, §3.6.6) — the session runs on, headless, its lane with it.
+        let (gen, ended): (u64, Vec<String>) = {
             let mut guard = lock(&self.state);
-            if let Some(m) = guard.get_mut(&id) {
-                m.sessions.retain(|s| s.tab_id != tab_id);
+            match guard.get_mut(&id) {
+                Some(m) => {
+                    let attach = m.opened_tabs.remove(&tab_id).is_some();
+                    let created = created_rows(&lock(&self.reg), &id, m);
+                    let host = m.fold_plan(&created).absorbed.get(&tab_id).cloned();
+                    m.sessions.retain(|s| s.tab_id != tab_id);
+                    let ended = if attach { None } else { host };
+                    (m.craze.gen, ended.into_iter().collect())
+                }
+                None => (0, Vec::new()),
             }
-        }
+        };
+        publish_craze_gone(&self.on_craze, &id, gen, &ended);
         // The row is gone from this app's view, so the lane on it is too — the
         // same optimism, for the same reason: waiting for the confirming
         // snapshot would leave a subscription (and, on a remote machine, an
@@ -978,6 +1421,286 @@ impl RoostHosts {
         Ok(row)
     }
 
+    /// Open a tab ON this host running a [`RunCommand`] — "Run a command in a
+    /// tab" (plan 025 P5), the sibling of [`Self::launch`] that goes through no
+    /// kind at all.
+    ///
+    /// Addressed and normalized exactly like a launch: the same target grammar,
+    /// the same blank-is-absent working directory, the same registration (a user
+    /// action may be what FIRST reaches an unwatched shed), the same watcher once
+    /// `tab.open` has answered.
+    ///
+    /// **What it does not share is the optimistic row.** A launch knows which
+    /// agent it started, so it can stamp a provisional ownership for the second
+    /// before roost's adapter claims the tab ([`opened_session`]). A command could
+    /// be anything, and a tab nobody owns is not a session row
+    /// ([`RoostSession::is_agent_owned`]) — inserting one would put a card on
+    /// screen that no snapshot will ever produce. So the row that results is
+    /// whatever roost reports: a plain row once roost's own agent hooks claim the
+    /// tab (a `codex`, say — plan 025 D1), and no row at all for a tab nothing
+    /// claims (an `htop`), which is a plain terminal in roost and nothing else.
+    ///
+    /// Answers with the tab it opened, addressed the way a row would be
+    /// (`origin`, `machine`, and the tab id as the `slug` a later row for it will
+    /// carry), plus the `argv` that was sent: the split is the one part of this
+    /// a caller cannot see from outside.
+    pub async fn run(
+        &self,
+        host: &str,
+        command: &RunCommand,
+        workdir: Option<&str>,
+    ) -> Result<Value, String> {
+        let id = HostId::parse(host)?;
+        self.ensure_registered(&id)?;
+        let reach = self.reach(&id)?;
+        let params = run_params(command, workdir.map(str::trim).filter(|s| !s.is_empty()));
+        let tab = tab_open(reach.as_ref(), params).await?;
+        // A `tab.open` that answered is a session answering — the same reason
+        // [`Self::launch`] starts one — and it is the watcher that will carry
+        // the row, if one comes, now that nothing optimistic does.
+        self.watch(&id);
+        Ok(json!({
+            "origin": id.token(),
+            "machine": id.address(),
+            "slug": tab.id.to_string(),
+            "cwd": tab.cwd,
+            "argv": command.argv(),
+        }))
+    }
+
+    // -- craze: the create sheet and Open in terminal (plan 025 §3.6.6, §3.8) --
+
+    /// `host`'s craze source for a user's EXPLICIT action — its
+    /// [`CrazeHost::ask`], which dials the host's ungated `bridge --hub` and
+    /// may birth a hub there (§3.6.1) — with its generation and its task's
+    /// wake; or the refusal the sheet renders instead of dialling: no craze
+    /// source at all (`no_craze`), craze not installed (`not_installed`), or
+    /// craze too old for `need` (`too_old`: the probe read a v0.0.1, or a live
+    /// hub's `hello` lacks `createOptions`/`sessionCreate` — §3.8's "update
+    /// craze on this machine"). Anything else — live, dormant, unreachable,
+    /// never reached — is tried: the dial says for itself whether it worked.
+    fn craze_ask(
+        &self,
+        host: &str,
+        need: CrazeNeed,
+    ) -> Result<(HostId, CrazeSource, u64, Arc<tokio::sync::Notify>), CrazeFailure> {
+        let id = HostId::parse(host).map_err(CrazeFailure::bad_request)?;
+        // `state`, then `reg`: the one order the two are ever held in.
+        let state = lock(&self.state);
+        let reg = lock(&self.reg);
+        if !reg.ids.contains(&id) {
+            return Err(CrazeFailure::bad_request(unknown_host(&id, &reg.ids)));
+        }
+        let no_craze = || CrazeFailure::new("no_craze", format!("{id} has no craze source"));
+        let craze = reg.crazes.get(&id).ok_or_else(no_craze)?;
+        let ask = craze.ask.clone().ok_or_else(no_craze)?;
+        if let Some(m) = state.get(&id).filter(|m| m.craze.gen == craze.gen) {
+            match (m.craze.phase, &m.craze.offline) {
+                (Some(CrazePhase::Offline), Some((SourceOffline::NotInstalled, why))) => {
+                    return Err(CrazeFailure::new(
+                        "not_installed",
+                        format!("craze is not installed on {id}: {why}"),
+                    ))
+                }
+                (Some(CrazePhase::Offline), Some((SourceOffline::TooOld, _))) => {
+                    return Err(CrazeFailure::new("too_old", CRAZE_TOO_OLD))
+                }
+                (Some(CrazePhase::Live), _) => {
+                    let caps = m.craze.caps.as_ref();
+                    let has = match need {
+                        CrazeNeed::CreateOptions => caps.is_some_and(|c| c.create_options),
+                        CrazeNeed::Create => caps.is_some_and(|c| c.create),
+                    };
+                    if !has {
+                        return Err(CrazeFailure::new(
+                            "too_old",
+                            format!(
+                                "update craze on this machine: its hub cannot {}",
+                                need.what()
+                            ),
+                        ));
+                    }
+                }
+                _ => {}
+            }
+        }
+        Ok((id, ask, craze.gen, Arc::clone(&craze.wake)))
+    }
+
+    /// `craze.create_options {machine}` (plan 025 §3.8): what a create can
+    /// start on `host` — providers in craze's order with their states, reasons
+    /// and fixes; the default provider; the recent directories — read afresh
+    /// on every call (D8: nothing cached), on a connection of its own.
+    ///
+    /// **An explicit user action** (§3.6.1): on an attach-only host with no hub
+    /// running, this is what births one — the create sheet opening. The host's
+    /// source is woken either way, so a dormant one attaches to that hub now.
+    pub async fn craze_create_options(&self, host: &str) -> Result<Value, CrazeFailure> {
+        let (id, ask, _gen, wake) = self.craze_ask(host, CrazeNeed::CreateOptions)?;
+        let answer = ask.create_options().await;
+        wake.notify_one();
+        let options = answer.map_err(CrazeFailure::lane)?;
+        Ok(json!({ "machine": id.address(), "options": options }))
+    }
+
+    /// `craze.create {machine, cwd, provider?, prompt?, request_id}` (plan 025
+    /// §3.8): a new craze session on `host`, on a connection of its own, with
+    /// craze's own retry rule — ONE retry under the same request id when the
+    /// outcome is unknown, `outcome_unknown` after a second, and the caller
+    /// keeps its id only then ([`CrazeFailure`]).
+    ///
+    /// **The created session is listed at once** (§3.6.4), with the SOURCE
+    /// the one authority on it (C10 confirmation): a row only the create's
+    /// answer carries is the source's ([`CrazeSource::created_rows`], read at
+    /// every listing — never copied here, so it expires, is bounded and is
+    /// refused after its session ended exactly as the source rules); a row the
+    /// source's roster already lists is folded ahead of its own frame
+    /// ([`CrazeState::listed_now`]). Either way the transcript the sheet opens
+    /// next finds it. A replayed answer for a session that has already ENDED
+    /// (craze replays a create for ten minutes) is in neither: it is answered
+    /// `ended: true`, and nothing is listed. Like [`Self::craze_create_options`]
+    /// it is an explicit action that may birth a hub, and it wakes the host's
+    /// source.
+    ///
+    /// **The source's rows are read UNDER this layer's state lock** (live leg
+    /// 1's ghost-row review): the roster pump updates the source's rows BEFORE
+    /// it emits the frame the host's sink then applies under that lock, so a
+    /// roster row read there is never one whose `Removed` this state has
+    /// already applied — read before the lock, a session the roster listed
+    /// and let go in between would be folded back by `listed_now`, a row no
+    /// later frame removes.
+    pub async fn craze_create(
+        &self,
+        host: &str,
+        request: LaneCreateRequest,
+    ) -> Result<Value, CrazeFailure> {
+        let (id, ask, gen, wake) = self.craze_ask(host, CrazeNeed::Create)?;
+        let request_id = request.request_id.clone();
+        let answer = ask.create(request).await;
+        wake.notify_one();
+        let created = answer.map_err(CrazeFailure::lane)?;
+        let host_id = created.session.id.clone();
+        #[cfg(test)]
+        at_gap(&self.create_gap).await;
+        let (row, ended) = {
+            let mut guard = lock(&self.state);
+            let roster_row = ask.roster_row(&host_id);
+            let ended = ask.listed(&host_id).is_none();
+            let shown = roster_row
+                .clone()
+                .unwrap_or_else(|| created.session.clone());
+            let row = match guard.get_mut(&id).filter(|m| m.craze.gen == gen) {
+                Some(m) => {
+                    if let Some(listed) = roster_row {
+                        m.craze.listed_now(listed);
+                    }
+                    // A create craze answered is craze answering here — the
+                    // condition a host is listed on (§3.6.2).
+                    m.listed = true;
+                    let created_now = created_rows(&lock(&self.reg), &id, m);
+                    let tab = m.fold_plan(&created_now).tab_of(&host_id);
+                    craze_row(&id, &shown, !m.craze.live() || ended, tab)
+                }
+                // Removed (or restarted) meanwhile: the session exists all the
+                // same, and its row says so — as the last known.
+                None => craze_row(&id, &shown, true, None),
+            };
+            (row, ended)
+        };
+        (self.on_change)();
+        Ok(json!({
+            "session": row,
+            "host_id": host_id,
+            "ended": ended,
+            "prompt": created.prompt.as_str(),
+            "prompt_error": created.prompt_error,
+            "request_id": request_id,
+        }))
+    }
+
+    /// `craze.open_terminal {machine, session_id}` (plan 025 §3.6.6): a roost
+    /// `tab.open` on `host` running `craze attach` on that craze session —
+    /// `argv` = [`shed_core::craze::attach_argv`]`(session_id)`, `cwd` = the
+    /// row's workspace — recorded in the host's opened-tab map
+    /// ([`HostState::opened_tabs`]) so the hub row shows that tab across every
+    /// roost snapshot.
+    ///
+    /// The id is validated FIRST — twelve lowercase hex digits, before anything
+    /// is looked up or sent — because it is spliced into a command line and
+    /// this app does not control its provenance (a hub's roster supplied it).
+    /// It must name a craze row this host holds (`unknown_session`).
+    ///
+    /// Closing that tab only DETACHES; `/exit` inside it stops the session
+    /// (craze `attach.go`) — which is what the button's tooltip says.
+    pub async fn craze_open_terminal(
+        &self,
+        host: &str,
+        session_id: &str,
+    ) -> Result<Value, CrazeFailure> {
+        let id = HostId::parse(host).map_err(CrazeFailure::bad_request)?;
+        let argv = shed_core::craze::attach_argv(session_id)
+            .map_err(|e| CrazeFailure::bad_request(e.to_string()))?;
+        let (cwd, reg_gen) = {
+            let guard = lock(&self.state);
+            let row = guard.get(&id).and_then(|m| {
+                let held = m.craze.rows.get(session_id).cloned();
+                let row = held.or_else(|| {
+                    created_rows(&lock(&self.reg), &id, m)
+                        .into_iter()
+                        .find(|row| row.id == session_id)
+                });
+                row.map(|row| (row.cwd, m.reg_gen))
+            });
+            match row {
+                Some((cwd, reg_gen)) => (cwd, reg_gen),
+                None => {
+                    return Err(CrazeFailure::new(
+                        "unknown_session",
+                        format!("{id} lists no craze session {session_id:?}"),
+                    ))
+                }
+            }
+        };
+        let reach = self
+            .reach(&id)
+            .map_err(|e| CrazeFailure::new("action_failed", e))?;
+        let (tab, fence) = tab_open_fenced(reach.as_ref(), attach_params(argv.clone(), &cwd))
+            .await
+            .map_err(|e| CrazeFailure::new("action_failed", e))?;
+        {
+            let mut guard = lock(&self.state);
+            if let Some(m) = guard.get_mut(&id).filter(|m| m.reg_gen == reg_gen) {
+                m.opened_tabs.insert(
+                    tab.id,
+                    OpenedTab {
+                        host_id: session_id.to_string(),
+                        fence,
+                        opened: Instant::now(),
+                    },
+                );
+            }
+        }
+        // A `tab.open` that answered is a session answering (the reason
+        // [`Self::run`] starts a watcher). `craze attach` starts no hub — it
+        // joins the session over its own control socket (plan 025 Amendment
+        // A14) — so the wake below births nothing; it only makes a source
+        // waiting between probes look again now.
+        self.watch(&id);
+        let wake = lock(&self.reg).crazes.get(&id).map(|c| Arc::clone(&c.wake));
+        if let Some(wake) = wake {
+            wake.notify_one();
+        }
+        (self.on_change)();
+        Ok(json!({
+            "origin": id.token(),
+            "machine": id.address(),
+            "session_id": session_id,
+            "tab_id": tab.id.to_string(),
+            "cwd": tab.cwd,
+            "argv": argv,
+        }))
+    }
+
     /// **TEST-MODE ONLY**: put a synthetic row into this host's snapshot, as if a
     /// session had reported it.
     ///
@@ -1015,9 +1738,12 @@ impl RoostHosts {
         self.ensure_registered(&id)?;
         {
             let mut guard = lock(&self.state);
-            let state = guard
-                .entry(id.clone())
-                .or_insert_with(|| HostState::new(true));
+            // `get_mut`, never an insert: the registration above made the
+            // entry, and a `remove` landing since has taken it — a state entry
+            // made here would be one the registry does not know.
+            let Some(state) = guard.get_mut(&id) else {
+                return Err(format!("{id} was removed while the row was injected"));
+            };
             state.sessions.retain(|s| s.tab_id != session.tab_id);
             state.sessions.push(session);
             // A row that answered is a host that answered — the same three flags
@@ -1064,6 +1790,199 @@ impl RoostHosts {
     /// `lib.rs`'s setup, right after the lane layer is built.
     pub fn set_lane_observer(&self, observer: OnLanes) {
         *lock(&self.on_lanes) = Some(observer);
+    }
+
+    /// Install the lane layer's craze eviction hook. See [`OnCrazeGone`].
+    pub fn set_craze_observer(&self, observer: OnCrazeGone) {
+        *lock(&self.on_craze) = Some(observer);
+    }
+
+    /// The craze lanes `host` exposes: hostId → the stamp a `lane.open {kind:
+    /// "craze"}` resolves (plan 025 §3.6.4) — one per craze row the host holds,
+    /// live or retained. Keyed apart from [`Self::agent_lanes`]: a hostId and an
+    /// opencode session id are different namespaces.
+    pub fn craze_lanes(&self, host: &str) -> BTreeMap<String, AgentLaneStamp> {
+        let Ok(id) = HostId::parse(host) else {
+            return BTreeMap::new();
+        };
+        let guard = lock(&self.state);
+        guard
+            .get(&id)
+            .map(|m| {
+                // The rows the host LISTS: the roster's, and the source's
+                // created rows read now (a row listed is a row that opens).
+                let created = created_rows(&lock(&self.reg), &id, m);
+                m.craze
+                    .rows
+                    .keys()
+                    .chain(created.iter().map(|row| &row.id))
+                    .map(|host_id| {
+                        (
+                            host_id.clone(),
+                            AgentLaneStamp {
+                                kind: crate::lane::CRAZE.to_string(),
+                                session_id: host_id.clone(),
+                                server_url: String::new(),
+                            },
+                        )
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// `host`'s craze source — what a craze lane opens through (its rows are
+    /// the roster's, so a lane binds to the row it was opened on) — and the
+    /// generation it was started under, which the lane is filed with so that
+    /// only that generation's evictions can end it ([`OnCrazeGone`]).
+    pub fn craze_source(&self, host: &str) -> Result<(CrazeSource, u64), String> {
+        let id = HostId::parse(host)?;
+        lock(&self.reg)
+            .crazes
+            .get(&id)
+            .and_then(|c| c.source.clone().map(|source| (source, c.gen)))
+            .ok_or_else(|| format!("{id} has no craze source"))
+    }
+
+    /// How `id`'s craze is reached, or `None` when it has none (plan 025
+    /// §3.6.1): the implicit `localhost` eagerly through a local `/bin/sh`,
+    /// every other host attach-only over its own [`SshExec`] — each under its
+    /// test-mode seam.
+    ///
+    /// Also answers the [`SshExec`] a remote reach was built on, so a start
+    /// that loses its race can take back an exec it was the one to create.
+    fn craze_reach(&self, id: &HostId) -> (Option<CrazeReach>, Option<Arc<SshExec>>) {
+        match &self.craze_reaches {
+            #[cfg(test)]
+            CrazeReaches::Fixed(reach) => (reach(id), None),
+            CrazeReaches::Options => {
+                let implicit_local = *id == HostId::Machine(LOCALHOST.to_string())
+                    && self.config.machine(LOCALHOST).is_none();
+                if implicit_local {
+                    return (build_local_craze(&self.reach_options), None);
+                }
+                // Checked BEFORE the exec is built: a test-mode host with no
+                // fake `ssh` must not even write an ssh scratch directory.
+                if self.reach_options.test_mode && self.reach_options.ssh_bin.is_none() {
+                    return (None, None);
+                }
+                let Ok(exec) = self.exec_for(id) else {
+                    return (None, None);
+                };
+                (
+                    build_ssh_craze(Arc::clone(&exec), &self.reach_options),
+                    Some(exec),
+                )
+            }
+        }
+    }
+
+    /// Start `id`'s craze source (plan 025 §3.6.1). Idempotent, and a no-op for
+    /// a host with no craze reach.
+    ///
+    /// **The registration fence.** The REGISTRATION this start is for is read
+    /// first ([`HostState::reg_gen`]); the reach is built outside every lock
+    /// (an ssh exec writes a scratch directory); and the source is installed —
+    /// its [`CrazeState::gen`] into the state, its [`CrazeHost`] into the
+    /// registry — under ONE acquisition of both locks (`state`, then `reg`, the
+    /// order [`Self::status_locked`] and [`Self::remove`] take them in), and
+    /// only if that same registration is still the one there. So a
+    /// [`Self::remove`] at any point of a start leaves nothing: before the
+    /// install there is nothing to leave (and an exec this start created for a
+    /// host that is gone is taken back out of `execs`); after it, `remove`
+    /// takes the entry and stops it. A host removed AND registered again
+    /// mid-start is a different registration: this start's source is dropped,
+    /// never grafted onto the new one, whose own start installs its own. The
+    /// task's every write re-checks the craze generation ([`HostCrazeSink`]).
+    fn start_craze(&self, id: &HostId) {
+        let reg_gen = {
+            let state = lock(&self.state);
+            let reg = lock(&self.reg);
+            if reg.crazes.contains_key(id) || !reg.ids.contains(id) {
+                return;
+            }
+            match state.get(id) {
+                Some(m) => m.reg_gen,
+                None => return,
+            }
+        };
+        // Built OUTSIDE the locks: the ssh exec writes a scratch directory.
+        let (reach, exec) = self.craze_reach(id);
+        let Some(reach) = reach else {
+            return;
+        };
+        let (dial, gone) = crate::craze::tracked(Arc::clone(&reach.dial));
+        let source = CrazeSource::new(Arc::clone(&dial), CLIENT_LABEL);
+        // A created row its lane saw end (a create stopped before any roster
+        // listed it) leaves the source with no roster frame to say so: the UI
+        // re-reads the listing, which reads the source's created rows now.
+        let on_change = self.on_change.clone();
+        source.on_created_gone(move || on_change());
+        // A user's explicit action dials through the host's ungated dial when
+        // it has one (an attach-only host), on a clone sharing the source's
+        // rows; an eager host's own dial is already ungated.
+        let ask = match &reach.ensure {
+            Some(ensure) => source.dialling(crate::craze::tethered(Arc::clone(ensure), &dial)),
+            None => source.clone(),
+        };
+        drop(dial);
+        let wake = Arc::new(tokio::sync::Notify::new());
+        let gen = NEXT_CRAZE_GEN.fetch_add(1, Ordering::Relaxed);
+        let installed = {
+            let mut state = lock(&self.state);
+            let mut reg = lock(&self.reg);
+            match state.get_mut(id) {
+                Some(m)
+                    if m.reg_gen == reg_gen
+                        && reg.ids.contains(id)
+                        && !reg.crazes.contains_key(id) =>
+                {
+                    m.craze = CrazeState::new(gen);
+                    let sink: Arc<dyn CrazeSink> = Arc::new(HostCrazeSink {
+                        id: id.clone(),
+                        gen,
+                        state: Arc::clone(&self.state),
+                        on_change: self.on_change.clone(),
+                        on_craze: Arc::clone(&self.on_craze),
+                    });
+                    let task = self.handle.spawn(crate::craze::run(
+                        source.clone(),
+                        reach.probe.clone(),
+                        sink,
+                        self.craze_timings,
+                        Arc::clone(&wake),
+                    ));
+                    reg.crazes.insert(
+                        id.clone(),
+                        CrazeHost {
+                            source: Some(source.clone()),
+                            ask: Some(ask.clone()),
+                            wake: Arc::clone(&wake),
+                            task,
+                            gen,
+                            gone: Some(gone),
+                        },
+                    );
+                    true
+                }
+                // Removed meanwhile (or re-registered as another
+                // registration), or another start won.
+                _ => false,
+            }
+        };
+        if !installed {
+            // What was built drops here, having started nothing — and an exec
+            // this start created for a host that is no longer registered is
+            // taken back out of the map, so no ControlMaster is left behind for
+            // a host nothing tracks.
+            if let Some(exec) = exec {
+                let registered = lock(&self.reg).ids.contains(id);
+                let mut execs = lock(&self.execs);
+                if !registered && execs.get(id).is_some_and(|e| Arc::ptr_eq(e, &exec)) {
+                    execs.remove(id);
+                }
+            }
+        }
     }
 
     /// Every agent lane `host` currently exposes: agent session id → the
@@ -1157,12 +2076,24 @@ impl RoostHosts {
                     "server": id.server(),
                     "reachable": m.is_some_and(|m| m.reachable),
                     "connected_once": m.is_some_and(|m| m.seen),
-                    "sessions": m.map_or(0, |m| m.sessions.len()),
+                    // The rows this host lists — roost's, less the craze tabs
+                    // the merge folded away, plus its craze rows — so the count
+                    // beside a machine is the count of its cards.
+                    "sessions": m.map_or(0, |m| {
+                        let created = created_rows(&reg, id, m);
+                        let plan = m.fold_plan(&created);
+                        m.sessions.iter().filter(|s| !plan.folds(s.tab_id)).count()
+                            + m.craze.rows.len()
+                            + created.len()
+                    }),
                     "detail": m.and_then(|m| m.detail.clone()),
                     // The transport's own classification (plan 019 §3.6), so a
                     // client offers an install or a start without reading the
                     // sentence beside it.
                     "down_kind": m.and_then(|m| m.down_kind).map(|k| k.as_str()),
+                    // This host's craze source (plan 025 §3.6.2): `live`,
+                    // `dormant`, `offline` (with its cause) or `absent`.
+                    "craze": m.map_or_else(|| CrazeState::default().status(), |m| m.craze.status()),
                 }))
             })
             .collect()
@@ -1190,7 +2121,18 @@ impl RoostHosts {
     /// which is the difference between "your shed stopped" and "your laptop
     /// changed networks". A narrowed view (`rc.list {host, shed}`) passes an
     /// empty set: it may add, never remove.
-    pub fn observe_sheds(&self, running: &[(String, String)], authoritative: &[String]) {
+    ///
+    /// **One pass at a time** ([`Self::observe_pass`], C9 confirmation N2). A
+    /// pass reads the registry once and decides on that view; another pass
+    /// changing the registry between the read and the decision — on another
+    /// worker, or while this one awaits its removals — would let the OLDER
+    /// observation be the one applied last (a shed listed running again, then
+    /// removed by a stale "stopped"; or the reverse). Serialized, the registry
+    /// always ends on the latest observation. The removals of one pass are
+    /// waited for together ([`Self::remove`]), so a pass holds the others
+    /// up for at most about one [`CRAZE_STOP_WAIT`].
+    pub async fn observe_sheds(&self, running: &[(String, String)], authoritative: &[String]) {
+        let _pass = self.observe_pass.lock().await;
         let answered: BTreeSet<&str> = authoritative.iter().map(String::as_str).collect();
         let live: BTreeSet<HostId> = running
             .iter()
@@ -1231,18 +2173,21 @@ impl RoostHosts {
                 reg.watchers.keys().cloned().collect(),
             )
         };
+        #[cfg(test)]
+        at_gap(&self.observe_gap).await;
 
-        for id in &known {
-            let Some(server) = id.server() else { continue };
-            if !answered.contains(server) || live.contains(id) {
-                continue;
-            }
-            // The shed stopped (or went away). Its rows are about a session that
-            // no longer exists, so the watcher, the reach and the row all go —
-            // including for a shed that was only ever registered by a probe,
-            // which would otherwise keep a bridge for a host that is gone.
-            self.remove(id);
-        }
+        // The shed stopped (or went away). Its rows are about a session that no
+        // longer exists, so the watcher, the reach and the row all go —
+        // including for a shed that was only ever registered by a probe, which
+        // would otherwise keep a bridge for a host that is gone.
+        let stopped: Vec<HostId> = known
+            .into_iter()
+            .filter(|id| {
+                id.server()
+                    .is_some_and(|server| answered.contains(server) && !live.contains(id))
+            })
+            .collect();
+        self.remove(&stopped).await;
 
         for id in live {
             if watched.contains(&id) {
@@ -1320,23 +2265,39 @@ impl RoostHosts {
         }
         let entry = self.ssh_entry(id)?;
         let built = build_ssh_reach(&entry, &self.reach_options)?;
-        let mut reg = lock(&self.reg);
-        if reg.reaches.contains_key(id) {
-            // Somebody won the race; theirs is the one the rows belong to.
+        // **The registration is made under ONE acquisition of both locks**
+        // (`state`, then `reg` — [`Self::remove`]'s order), so it is never
+        // half-made: a `remove` sees all of it or none of it, and the registry
+        // and the state cannot diverge (C9 review).
+        let lost = {
+            let mut state = lock(&self.state);
+            let mut reg = lock(&self.reg);
+            if reg.reaches.contains_key(id) {
+                // Somebody won the race; theirs is the one the rows belong to.
+                Some(built)
+            } else {
+                if !reg.ids.contains(id) {
+                    reg.ids.push(id.clone());
+                }
+                reg.reaches.insert(id.clone(), built);
+                state
+                    .entry(id.clone())
+                    // UNLISTED: a registration is not an answer. A shed becomes
+                    // a listed host when a session answers on it (the snapshot
+                    // arm of [`consume`] flips this, as does its craze source's
+                    // first `Ready`), which is the same rule the implicit
+                    // `localhost` follows.
+                    .or_insert_with(|| HostState::new(false));
+                None
+            }
+        };
+        if lost.is_some() {
             return Ok(());
         }
-        if !reg.ids.contains(id) {
-            reg.ids.push(id.clone());
-        }
-        reg.reaches.insert(id.clone(), built);
-        drop(reg);
-        lock(&self.state)
-            .entry(id.clone())
-            // UNLISTED: a registration is not an answer. A shed becomes a listed
-            // host when a session answers on it (the snapshot arm of [`consume`]
-            // flips this), which is the same rule the implicit `localhost`
-            // follows.
-            .or_insert_with(|| HostState::new(false));
+        // A running shed's craze source starts when the shed is first
+        // observed — NOT when its roost watcher is promoted, which waits on a
+        // `session.identify` a craze-only shed never answers (plan 025 §3.6.1).
+        self.start_craze(id);
         Ok(())
     }
 
@@ -1374,12 +2335,78 @@ impl RoostHosts {
         (self.on_change)();
     }
 
-    /// Forget a host: stop its watcher, drop its reach and its rows.
+    /// Forget hosts: stop their watchers, drop their reaches and their rows —
+    /// each one [`Self::detach`]ed, then their craze sources stopped TOGETHER.
     ///
-    /// Only ever a SHED in practice — a `machines:` entry is the user's own
+    /// Only ever SHEDS in practice — a `machines:` entry is the user's own
     /// declaration and stays listed however unreachable it is (see the module
     /// doc), while a shed's roost host exists only while the shed does.
-    pub fn remove(&self, id: &HostId) {
+    ///
+    /// **A bounded best-effort teardown, not a barrier** (C9 review and
+    /// confirmation). After the detach, outside the locks: each removed craze
+    /// source is stopped ([`CrazeHost::stop`]) — its task aborted and joined,
+    /// and its dial waited for until its last holder (its roster's pump, its
+    /// lanes, and so the `SshExec` behind them) lets go — for up to
+    /// [`CRAZE_STOP_WAIT`], all of them at once, so a refresh that removes
+    /// several hosts waits about that long in all, not that long per host. A
+    /// held lane verb (a `LaneEntry` clone mid-command, or an in-flight source
+    /// call) can outlive the wait; that is logged, and the last holder's drop
+    /// releases the dial (and with it the ssh master) when it finishes.
+    async fn remove(&self, ids: &[HostId]) {
+        let mut removed = Vec::with_capacity(ids.len());
+        for id in ids {
+            removed.push(self.detach(id).await);
+        }
+        // Spawned, so the stops run side by side: each is a `'static` future
+        // that owns its source, and each is bounded by its own timeout.
+        let stops: Vec<_> = removed
+            .iter_mut()
+            .filter_map(|r| {
+                r.craze
+                    .take()
+                    .map(|craze| (r.id.clone(), self.handle.spawn(craze.stop())))
+            })
+            .collect();
+        for (id, stop) in stops {
+            if !stop.await.unwrap_or(false) {
+                eprintln!(
+                    "shed-desktop-tauri: {id}'s craze source had not stopped {}s after it was \
+                     removed (a lane verb still in flight holds it); its last holder releases it",
+                    CRAZE_STOP_WAIT.as_secs()
+                );
+            }
+        }
+        // The lane layer holds subscriptions (and `ssh -N` children) against
+        // rows that have just gone. Publishing an empty set is how they are
+        // released — the same signal a snapshot with no tabs sends.
+        let observer = lock(&self.on_lanes).clone();
+        if let Some(observer) = observer {
+            for r in &removed {
+                observer(&r.id.address(), &BTreeMap::new());
+            }
+        }
+        if removed.iter().any(|r| r.was_listed) {
+            (self.on_change)();
+        }
+    }
+
+    /// Take one host out of the registry — the half of a removal that does
+    /// not wait.
+    ///
+    /// **One critical section** (C9 review). Every entry of the registration
+    /// being removed — its state, its registry ids, reach, watcher and craze
+    /// source, its ssh exec, its probe cooldown — is taken under ONE
+    /// acquisition of `state` then `reg` (the order registration takes them
+    /// in, [`Self::ensure_registered`]), so the registry and the state never
+    /// diverge, and what is removed is exactly the registration that was
+    /// there: a registration of the host AFTER that section is a whole new
+    /// one, which nothing below touches. Then, outside the locks, its watcher,
+    /// reach and exec drop, and its craze lanes are evicted — by the removed
+    /// source's generation, so a new registration's lanes on the same hostIds
+    /// are not, and before the source is waited for, because a lane holds the
+    /// source's dial. The craze source itself is handed back for
+    /// [`Self::remove`] to stop.
+    async fn detach(&self, id: &HostId) -> Detached {
         // **Disarmed FIRST, before anything else is torn down.** A refresh
         // landing mid-teardown can re-register this same id and spawn a watcher
         // for it; clearing after the teardown would let that watcher pick up a
@@ -1391,31 +2418,36 @@ impl RoostHosts {
         if let Some(flag) = lock(&self.armed).remove(id) {
             flag.store(false, Ordering::Release);
         }
-        {
+        let (removed, craze, dropped) = {
+            let mut state = lock(&self.state);
             let mut reg = lock(&self.reg);
             // Dropping the watcher aborts its loop; dropping the reach tears
-            // down the `ssh` master behind it.
-            reg.watchers.remove(id);
-            reg.reaches.remove(id);
+            // down the `ssh` master behind it — both done BELOW, outside the
+            // locks, with the exec this host's bootstrap and craze shared.
+            let watcher = reg.watchers.remove(id);
+            let reach = reg.reaches.remove(id);
             reg.ids.retain(|known| known != id);
+            let craze = reg.crazes.remove(id);
+            let exec = lock(&self.execs).remove(id);
+            // Forgotten, not kept: a shed that stops and starts again is a NEW
+            // question, and making the user wait out a cooldown for an answer
+            // that has certainly changed would be the wrong way round. (The
+            // arming flag is forgotten for the same reason, above — a host that
+            // goes away takes shed's claim to have started its session with
+            // it.)
+            lock(&self.probed).remove(id);
+            (state.remove(id), craze, (watcher, reach, exec))
+        };
+        #[cfg(test)]
+        at_gap(&self.remove_gap).await;
+        drop(dropped);
+        if let Some(m) = &removed {
+            publish_craze_gone(&self.on_craze, id, m.craze.gen, &m.craze.held());
         }
-        lock(&self.execs).remove(id);
-        // Forgotten, not kept: a shed that stops and starts again is a NEW
-        // question, and making the user wait out a cooldown for an answer that
-        // has certainly changed would be the wrong way round. (The arming flag
-        // is forgotten for the same reason, above — a host that goes away takes
-        // shed's claim to have started its session with it.)
-        lock(&self.probed).remove(id);
-        let was_listed = lock(&self.state).remove(id).is_some_and(|m| m.listed);
-        // The lane layer holds subscriptions (and `ssh -N` children) against
-        // rows that have just gone. Publishing an empty set is how they are
-        // released — the same signal a snapshot with no tabs sends.
-        let observer = lock(&self.on_lanes).clone();
-        if let Some(observer) = observer {
-            observer(&id.address(), &BTreeMap::new());
-        }
-        if was_listed {
-            (self.on_change)();
+        Detached {
+            id: id.clone(),
+            was_listed: removed.as_ref().is_some_and(|m| m.listed),
+            craze,
         }
     }
 
@@ -1766,6 +2798,11 @@ impl RoostHosts {
     /// `ControlPersist` master outliving the app that opened it would be visible
     /// (plan 019 §3.6).
     pub async fn shutdown(&self) {
+        // Every craze source first: aborting a task drops its roster
+        // subscription, whose bridge child dies with it — before the masters
+        // its ssh duplexes ride on are asked to exit.
+        let crazes = std::mem::take(&mut lock(&self.reg).crazes);
+        drop(crazes);
         let execs: Vec<Arc<SshExec>> = lock(&self.execs).values().cloned().collect();
         for exec in &execs {
             exec.shutdown().await;
@@ -1846,6 +2883,83 @@ impl WatchHandle {
             Arc::clone(&self.on_lanes),
         ));
         (self.on_change)();
+    }
+}
+
+/// Where one host's craze task reports: the host's [`CrazeState`], under the
+/// shared state lock, behind the fence `gen` (see [`RoostHosts::start_craze`]).
+struct HostCrazeSink {
+    id: HostId,
+    gen: u64,
+    state: Arc<Mutex<BTreeMap<HostId, HostState>>>,
+    on_change: OnChange,
+    on_craze: Arc<Mutex<Option<OnCrazeGone>>>,
+}
+
+impl HostCrazeSink {
+    /// Fold under the lock — only while this task's fence still holds — and
+    /// act on what changed outside it: the departed rows' lanes go first, then
+    /// a listed host's UI is told to re-read.
+    fn fold(&self, f: impl FnOnce(&mut CrazeState) -> crate::craze::Applied) -> bool {
+        let (applied, listed) = {
+            let mut guard = lock(&self.state);
+            let Some(m) = guard.get_mut(&self.id) else {
+                return false;
+            };
+            if m.craze.gen != self.gen {
+                return false;
+            }
+            let applied = f(&mut m.craze);
+            if applied.ready {
+                // A craze `Ready` is an answer — this host is real and listed
+                // from now on, roost or no roost (plan 025 §3.6.2).
+                m.listed = true;
+            }
+            (applied, m.listed)
+        };
+        // With THIS source's generation: by the time it lands, the host may
+        // be registered again under another, and only this one's lanes are
+        // this source's to end.
+        publish_craze_gone(&self.on_craze, &self.id, self.gen, &applied.departed);
+        if listed && applied.visible {
+            (self.on_change)();
+        }
+        true
+    }
+}
+
+impl CrazeSink for HostCrazeSink {
+    fn event(&self, event: SourceEvent) -> bool {
+        self.fold(|c| c.apply(event))
+    }
+
+    fn dormant(&self) -> bool {
+        self.fold(CrazeState::dormant)
+    }
+
+    fn offline(&self, cause: SourceOffline, reason: String) -> bool {
+        self.fold(|c| c.offline(cause, reason))
+    }
+}
+
+/// [`RoostHosts::publish_craze_gone`], for the callers that hold only the
+/// hook's slot.
+/// Tell the lane layer which of `id`'s craze rows left the source of
+/// generation `gen` ([`OnCrazeGone`]). Call OUTSIDE the state lock — the hook
+/// retires lane entries.
+fn publish_craze_gone(
+    slot: &Mutex<Option<OnCrazeGone>>,
+    id: &HostId,
+    gen: u64,
+    host_ids: &[String],
+) {
+    if host_ids.is_empty() {
+        return;
+    }
+    let observer = lock(slot).clone();
+    if let Some(observer) = observer {
+        // The ADDRESS — see `RoostHosts::publish_lanes`.
+        observer(&id.address(), gen, host_ids);
     }
 }
 
@@ -2105,6 +3219,141 @@ fn open_params(kind: &RcKind, workdir: Option<&str>) -> Result<TabOpenParams, St
     })
 }
 
+/// `id`'s craze rows that only a CREATE answered with — the source's own set
+/// ([`CrazeSource::created_rows`]: unexpired, bounded, never a session a roster
+/// already let go), read at the call — less those `m`'s roster state already
+/// holds. Empty when the registry's craze source for `id` is not the one `m`
+/// is fenced to (a removed or restarted host). The ONE place the desktop reads
+/// created rows from: it keeps none of its own (C10 confirmation), so every
+/// row it lists is one the source opens.
+fn created_rows(reg: &Registry, id: &HostId, m: &HostState) -> Vec<LaneSession> {
+    reg.crazes
+        .get(id)
+        .filter(|craze| craze.gen == m.craze.gen)
+        .and_then(|craze| craze.source.as_ref())
+        .map(CrazeSource::created_rows)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|row| !m.craze.rows.contains_key(&row.id))
+        .collect()
+}
+
+/// Open in terminal's `tab.open` (plan 025 §3.6.6): `craze attach` on one
+/// session, in its workspace — roost's defaults otherwise, as a launch's.
+fn attach_params(argv: Vec<String>, cwd: &str) -> TabOpenParams {
+    TabOpenParams {
+        project_id: 0,
+        cwd: cwd.to_string(),
+        argv,
+        cols: 0,
+        rows: 0,
+        title: String::new(),
+        activate: None,
+        cwd_from_tab: None,
+    }
+}
+
+/// What a create-sheet op needs the hub to offer ([`RoostHosts::craze_ask`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CrazeNeed {
+    /// `sessions.createOptions` — the sheet opening.
+    CreateOptions,
+    /// `session.create`.
+    Create,
+}
+
+impl CrazeNeed {
+    fn what(self) -> &'static str {
+        match self {
+            CrazeNeed::CreateOptions => "list what a create can start",
+            CrazeNeed::Create => "create sessions",
+        }
+    }
+}
+
+/// A host whose craze the probe read as too old (v0.0.1) — the machines
+/// pane's note, word for word (plan 025 §3.6.5).
+const CRAZE_TOO_OLD: &str = "craze on this machine is too old for shed; update it";
+
+/// A `roost.run` command line, parsed into the argv its tab opens with (plan
+/// 025 P5). The only way to build one is [`RunCommand::parse`], so a
+/// [`RoostHosts::run`] can never be handed an empty argv.
+///
+/// **Split on ASCII whitespace, and nothing else.** No shell runs and nothing is
+/// unquoted: roost's `tab.open` takes an argv and execs it, so `codex --model x`
+/// is `["codex", "--model", "x"]` — and a quoted argument is NOT one argument:
+/// `say 'a b'` is `["say", "'a", "b'"]`, quotes and all, and `$HOME` or a `|` is
+/// passed through as the literal text it is. Rejected: wrapping the line as
+/// `["sh", "-c", command]`, which would put a second quoting layer (and a whole
+/// shell grammar, on a host that may not be the user's own) between what was
+/// typed and what runs, for no case this door exists for — starting an agent's
+/// own TUI with a flag or two. A pipeline belongs in a shell tab, which roost's
+/// own UI opens.
+///
+/// **Required, and never blank.** An absent, empty or whitespace-only command is
+/// refused before any connection is made: roost would open an empty argv as a
+/// plain shell, and a blank box meaning "a shell" is a door the plan rejected
+/// (roost's own UI opens shells). "Whitespace" for the refusal is Unicode's,
+/// which is a superset of the split's ASCII set — so a command that passes
+/// always yields at least one word, and a lone no-break space is refused rather
+/// than exec'd as a program named `\u{a0}`.
+///
+/// **No kind is consulted.** This is the deliberate difference from
+/// [`open_params`]: a launch is offered only for [`roost_capabilities`]' kinds
+/// and refused without a [`launch_argv`] recipe, while a command runs whatever
+/// its first word names. Which ROW (if any) it becomes is roost's to report —
+/// see [`RoostHosts::run`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RunCommand {
+    argv: Vec<String>,
+}
+
+impl RunCommand {
+    /// The one parse both doors share — the `roost.run` socket op and the
+    /// `roost_run` Tauri command — so the same line cannot split two ways
+    /// depending on which door it came through. The refusal is the caller's
+    /// mistake, so the socket door answers it as `bad_request`.
+    pub(crate) fn parse(command: Option<&str>) -> Result<Self, String> {
+        let command = command.unwrap_or_default();
+        if command.trim().is_empty() {
+            return Err(
+                "missing 'command': name the program to run (a blank command is not a plain \
+                 shell — roost's own UI opens those)"
+                    .to_string(),
+            );
+        }
+        Ok(Self {
+            argv: command
+                .split_ascii_whitespace()
+                .map(str::to_string)
+                .collect(),
+        })
+    }
+
+    /// The argv, in order: the program, then its arguments.
+    pub(crate) fn argv(&self) -> &[String] {
+        &self.argv
+    }
+}
+
+/// The `tab.open` request for a [`RunCommand`]: its argv in the cwd, with every
+/// other field exactly as [`open_params`] sets it, for [`open_params`]'s reasons
+/// (roost's project, roost's PTY size, roost's title, the tab left selected, no
+/// `cwd_from_tab`). A test pins the two equal but for `argv`, so they cannot
+/// drift apart.
+fn run_params(command: &RunCommand, workdir: Option<&str>) -> TabOpenParams {
+    TabOpenParams {
+        project_id: 0,
+        cwd: workdir.unwrap_or_default().to_string(),
+        argv: command.argv().to_vec(),
+        cols: 0,
+        rows: 0,
+        title: String::new(),
+        activate: None,
+        cwd_from_tab: None,
+    }
+}
+
 /// The session for a tab that was JUST opened.
 ///
 /// `tab.open` answers with the tab **before any adapter has claimed it**:
@@ -2194,24 +3443,17 @@ impl InjectedRow {
 /// predict it ([`opened_session`]).
 ///
 /// `None` for every kind with no roost adapter, which is also every kind
-/// [`launch_argv`] refuses — so in practice this is only ever called for the four
-/// launchable ones, and a `None` simply leaves the fresh tab unowned rather than
-/// labelling it with a source roost will never write.
+/// [`launch_argv`] refuses — so in practice this is only ever called for the
+/// two launchable ones, and a `None` simply leaves the fresh tab unowned
+/// rather than labelling it with a source roost will never write. (The
+/// direct-agent kinds this used to also predict — codex, cursor, gx, grok —
+/// left shed in plan 025, shed#390; craze is their lane now, and a craze
+/// session is never opened through THIS launch path.)
 fn roost_source(kind: &RcKind) -> Option<&'static str> {
     match kind {
         RcKind::ClaudeRc => Some("claude"),
-        RcKind::Codex => Some("codex"),
         RcKind::Opencode => Some("opencode"),
-        RcKind::Cursor => Some("cursor"),
-        // BOTH map to roost's `grok`, because roost has ONE adapter for the two
-        // (plan 017 §3.2): `gx` is not a source roost ever writes. Which of the
-        // two a tab reads as is decided on the way BACK, by
-        // [`RoostSession::agent_kind`], from whether the tab carries a usable
-        // `gx.remote` — so predicting `grok` here is right for a launch of
-        // either, and a `gx` launch that binds its lane promotes itself on the
-        // next snapshot.
-        RcKind::Gx | RcKind::Grok => Some("grok"),
-        RcKind::ClaudeBroker | RcKind::Shell | RcKind::Other(_) => None,
+        RcKind::ClaudeBroker | RcKind::Craze | RcKind::Shell | RcKind::Other(_) => None,
     }
 }
 
@@ -2239,6 +3481,15 @@ async fn consume(
                     // merges, which is what makes a reconnect (or a daemon
                     // restart, which resets roost's revision counter) a complete
                     // resync with no replay protocol.
+                    // The tabs Open in terminal opened stay while roost
+                    // lists them (as rows or as hidden, unowned tabs — which
+                    // is what they are), and a snapshot older than one's open
+                    // says nothing about it — see [`OpenedTab::retained`].
+                    let known = inventory.known_tab_ids();
+                    let now = Instant::now();
+                    m.opened_tabs.retain(|tab_id, opened| {
+                        opened.retained(known.contains(tab_id), &inventory, now)
+                    });
                     m.sessions = inventory.sessions;
                     m.reachable = true;
                     m.detail = None;
@@ -2357,6 +3608,61 @@ fn host_row(id: &HostId, session: &RoostSession, stale: bool) -> Value {
     row
 }
 
+/// One craze session as the UI reads it (plan 025 §3.6.3): the hub row,
+/// stamped like a roost row so the Agents pane groups, keys and addresses it
+/// the same way — `origin`, `machine`, `host`/`shed` — with `source: "craze"`,
+/// `kind: "craze"`, `slug` = its hostId (P11), and the roster's own facts.
+///
+/// * `tab_id` is the roost tab the merge attached to it (a string, like a roost
+///   row's) — what its End tab closes. Absent for a headless session.
+/// * `agent_lane: {kind: "craze", session_id: <hostId>}` is its transcript —
+///   the address `lane.open {kind: "craze"}` takes; there is no URL, because
+///   the source reaches the session through its hub.
+/// * `stale` and `approximate` are both set on every row a source holds while
+///   it is not live (retained rows render stale, §3.6.2).
+/// * `state` is `"ready"`: a craze session has no roost lifecycle, and the
+///   card shows its activity, its start error and its staleness instead.
+fn craze_row(id: &HostId, session: &LaneSession, stale: bool, tab_id: Option<i64>) -> Value {
+    let (host, shed) = match id {
+        HostId::Machine(_) => (id.token(), String::new()),
+        HostId::Shed { server, name } => (server.clone(), name.clone()),
+    };
+    let mut row = json!({
+        "host": host,
+        "shed": shed,
+        "slug": session.id,
+        "tmux_session": "",
+        "display_name": session.title,
+        "workdir": session.cwd,
+        "kind": crate::lane::CRAZE,
+        "state": "ready",
+        "managed": false,
+        "activity": session.activity,
+        "origin": id.token(),
+        "origin_kind": id.kind(),
+        "machine": id.address(),
+        "source": "craze",
+        "stale": stale,
+        "approximate": session.approximate || stale,
+        "attention": false,
+        "pending_approvals": session.pending_approvals,
+        "provider": session.provider,
+        "model": session.model,
+        "doing": session.doing,
+        "head_ask_summary": session.head_ask_summary,
+        "last_reply": session.last_reply,
+        "attached": session.attached,
+        "start_error": session.start_error,
+        "permission_mode": session.permission_mode,
+        "provider_session_id": session.provider_session_id,
+        "agent_lane": {"kind": crate::lane::CRAZE, "session_id": session.id},
+    });
+    if let (Some(tab), Some(obj)) = (tab_id, row.as_object_mut()) {
+        obj.insert("tab_id".into(), json!(tab.to_string()));
+    }
+    row
+}
+
 /// The `agent_lane` stamp for one row, or `None`.
 ///
 /// **Its PRESENCE is the capability signal** — the UI offers a Transcript
@@ -2405,6 +3711,9 @@ fn lanes_of(sessions: &[RoostSession]) -> BTreeMap<String, AgentLaneStamp> {
         })
         .collect()
 }
+
+#[cfg(test)]
+mod craze_tests;
 
 #[cfg(test)]
 mod tests {
@@ -2501,12 +3810,12 @@ mod tests {
     /// servers, are running" — the one input [`RoostHosts::ssh_entry`]'s shed gate
     /// reads, so every shed test has to perform it before the shed it minted is
     /// addressable at all.
-    fn lists(hosts: &RoostHosts, server: &str, sheds: &[&str]) {
+    async fn lists(hosts: &RoostHosts, server: &str, sheds: &[&str]) {
         let running: Vec<(String, String)> = sheds
             .iter()
             .map(|name| (server.to_string(), (*name).to_string()))
             .collect();
-        hosts.observe_sheds(&running, &[server.to_string()]);
+        hosts.observe_sheds(&running, &[server.to_string()]).await;
     }
 
     /// The test-mode reach options for a socket map: every named host answers on
@@ -2519,6 +3828,7 @@ mod tests {
                 .collect(),
             ssh_bin: None,
             test_mode: true,
+            ..ReachOptions::default()
         }
     }
 
@@ -2731,25 +4041,17 @@ mod tests {
             );
         }
 
-        // A gx tab is stamped from `gx.remote`, and is refused for the same
-        // reasons — including the one that makes it read as plain `grok`.
-        let gx = owned(
+        // grok (and any shape of gx) is a retired direct-agent kind now (plan
+        // 025, shed#390): a plain `Other` row with no adapter, so it stamps no
+        // lane no matter what metadata the tab carries.
+        let grok = owned(
             Some("grok"),
-            "ses_gx",
+            "ses_grok",
             &[("gx.remote", "http://127.0.0.1:2431")],
         );
-        assert_eq!(
-            agent_lane(&gx).and_then(|v| v["kind"].as_str().map(str::to_string)),
-            Some("gx".to_string())
-        );
-        let demoted = owned(
-            Some("grok"),
-            "ses_gx",
-            &[("gx.remote", "http://127.0.0.1:2431/")],
-        );
         assert!(
-            agent_lane(&demoted).is_none(),
-            "a gx.remote that fails the rule leaves the tab as plain grok, lane-less"
+            agent_lane(&grok).is_none(),
+            "grok has no lane adapter any more, whatever metadata it carries"
         );
 
         // And the session id is the other half: a tab with a usable URL but no
@@ -3495,7 +4797,7 @@ mod tests {
             "{refused}"
         );
 
-        lists(&hosts, "mock", &["hello-world"]);
+        lists(&hosts, "mock", &["hello-world"]).await;
         hosts
             .inject_test(target, injected(9))
             .expect("the injection");
@@ -3540,7 +4842,7 @@ mod tests {
     async fn an_injected_row_goes_through_the_snapshots_ownership_filter() {
         let hosts = start(&config_with_server("mock"), &sockets(&[]));
         let target = "roost:mock/hello-world";
-        lists(&hosts, "mock", &["hello-world"]);
+        lists(&hosts, "mock", &["hello-world"]).await;
 
         for kind in [
             RcKind::Shell,
@@ -3564,19 +4866,17 @@ mod tests {
             rows(&hosts)
         );
 
-        // The kinds roost DOES own an adapter for still inject, so the fixture
+        // The kind roost DOES own an adapter for still injects, so the fixture
         // op is not merely refusing everything.
-        for kind in [RcKind::Opencode, RcKind::Gx] {
-            hosts
-                .inject_test(
-                    target,
-                    InjectedRow {
-                        kind,
-                        ..injected(31)
-                    },
-                )
-                .expect("an agent-owned row");
-        }
+        hosts
+            .inject_test(
+                target,
+                InjectedRow {
+                    kind: RcKind::Opencode,
+                    ..injected(31)
+                },
+            )
+            .expect("an agent-owned row");
         assert_eq!(rows(&hosts).len(), 1);
     }
 
@@ -3895,7 +5195,7 @@ mod tests {
         // The refresh that makes the shed addressable at all — see
         // [`RoostHosts::ssh_entry`]'s gate. It is also what a probe rides on in
         // production, so starting from it is the realistic order.
-        lists(&hosts, "popos", &["p019-a"]);
+        lists(&hosts, "popos", &["p019-a"]).await;
 
         // Where a probe starts: the shed is registered, and not yet watched.
         hosts.ensure_registered(&id).expect("the shed registers");
@@ -3904,7 +5204,7 @@ mod tests {
         let reach = hosts.reach(&id).expect("the registered reach");
 
         // The refresh that says the shed has stopped.
-        hosts.remove(&id);
+        hosts.remove(std::slice::from_ref(&id)).await;
 
         // The probe resumes: its watcher is already spawned, and is now offered
         // to a registry that no longer knows this host.
@@ -4007,7 +5307,7 @@ mod tests {
         assert!(e.contains("has not listed"), "{e}");
 
         // One authoritative refresh, and it is.
-        lists(&hosts, "popos", &["p019-a"]);
+        lists(&hosts, "popos", &["p019-a"]).await;
         hosts
             .ensure_registered(&listed)
             .expect("a listed shed registers");
@@ -4053,7 +5353,7 @@ mod tests {
         // And a shed that STOPS stops being addressable again: the authoritative
         // refresh that no longer lists it takes its entry with it, which is the
         // same rule that takes its watcher.
-        lists(&hosts, "popos", &[]);
+        lists(&hosts, "popos", &[]).await;
         let e = hosts
             .ensure_registered(&listed)
             .expect_err("a stopped shed is no longer addressable");
@@ -4082,7 +5382,7 @@ mod tests {
             &config_with_server("popos"),
             &sockets(&[(&id.token(), fake.socket_path())]),
         );
-        lists(&hosts, "popos", &["p019-a"]);
+        lists(&hosts, "popos", &["p019-a"]).await;
 
         let claim = hosts
             .begin_bootstrap(&id)
@@ -4106,7 +5406,7 @@ mod tests {
         // Per-TARGET, not a global lock: a second host is claimable while the
         // first is held.
         let other = shed_id("popos", "p019-b");
-        lists(&hosts, "popos", &["p019-a", "p019-b"]);
+        lists(&hosts, "popos", &["p019-a", "p019-b"]).await;
         let other_claim = hosts
             .begin_bootstrap(&other)
             .expect("a different target is unaffected");
@@ -4118,6 +5418,141 @@ mod tests {
         assert!(
             hosts.begin_bootstrap(&id).is_some(),
             "the gate is released when its claim drops"
+        );
+    }
+
+    // -- "Run a command in a tab" (plan 025 P5) ------------------------------
+
+    fn argv_of(command: &str) -> Vec<String> {
+        RunCommand::parse(Some(command))
+            .expect("a command with a word in it")
+            .argv()
+            .to_vec()
+    }
+
+    /// **The split is ASCII whitespace and nothing else** — no shell, no
+    /// quoting — which is what the op's documentation promises: `codex --model
+    /// x` works, and a quoted argument does not become one argument.
+    #[test]
+    fn a_run_command_splits_on_ascii_whitespace_and_nothing_else() {
+        assert_eq!(argv_of("codex --model x"), ["codex", "--model", "x"]);
+        // Runs of whitespace, tabs and newlines, leading and trailing: one rule.
+        assert_eq!(
+            argv_of("  codex\t--model   x \r\n"),
+            ["codex", "--model", "x"]
+        );
+        // No quoting: the quotes are the argument's own characters, and the
+        // space inside them still splits.
+        assert_eq!(argv_of("say 'a b'"), ["say", "'a", "b'"]);
+        assert_eq!(argv_of(r#"say "a b""#), ["say", "\"a", "b\""]);
+        // No shell: a variable, a pipe and a glob are literal text.
+        assert_eq!(
+            argv_of("echo $HOME | wc *"),
+            ["echo", "$HOME", "|", "wc", "*"]
+        );
+        // Unicode whitespace that is not ASCII is DATA for the split — it stays
+        // inside the word it is in.
+        assert_eq!(argv_of("a\u{a0}b c"), ["a\u{a0}b", "c"]);
+    }
+
+    /// **`command` is required: absent, empty and whitespace-only are each
+    /// refused**, before anything could reach a host (there is no host here at
+    /// all — the refusal is the parse's).
+    #[test]
+    fn an_absent_empty_or_blank_run_command_is_refused() {
+        for (what, command) in [
+            ("absent", None),
+            ("empty", Some("")),
+            ("spaces", Some("   ")),
+            ("ascii whitespace", Some(" \t\r\n ")),
+            // Unicode whitespace alone is blank too: it would otherwise survive
+            // the ASCII split as a "program" named after a no-break space.
+            ("unicode whitespace", Some("\u{a0}\u{2003}")),
+        ] {
+            let refusal =
+                RunCommand::parse(command).expect_err(&format!("{what} must be refused, not run"));
+            assert!(
+                refusal.contains("'command'"),
+                "{what}: the refusal names the missing field: {refusal}"
+            );
+        }
+    }
+
+    /// A run's `tab.open` is a launch's in every field but `argv` — the same
+    /// deliberate zeros and absences, for the same reasons. Pinned against
+    /// [`open_params`] itself rather than restated, so the two cannot drift.
+    #[test]
+    fn run_params_are_a_launchs_with_the_typed_argv() {
+        let command = RunCommand::parse(Some("codex --model x")).unwrap();
+        let run = run_params(&command, Some("/tmp/work"));
+        assert_eq!(run.argv, ["codex", "--model", "x"]);
+        let launch = open_params(&RcKind::Opencode, Some("/tmp/work")).unwrap();
+        assert_eq!(
+            TabOpenParams {
+                argv: launch.argv.clone(),
+                ..run
+            },
+            launch,
+            "every field but argv is the launch's"
+        );
+    }
+
+    /// **`run` consults no kind.** Its first word here is one the launch path
+    /// refuses outright — `borg` has no [`launch_argv`] recipe, so
+    /// [`open_params`] would never reach the wire with it — and the tab still
+    /// opens, with the typed argv exactly as split. And, unlike a launch, it
+    /// inserts no optimistic row: a tab nobody owns is not a session row, so
+    /// the row (if any) is the one roost goes on to report.
+    #[tokio::test]
+    async fn run_opens_the_typed_argv_without_consulting_a_kind() {
+        let fake = FakeRoost::start().await;
+        let machines = start(
+            &config_with(&["mini3"]),
+            &sockets(&[("mini3", fake.socket_path())]),
+        );
+        wait_for("the first snapshot", || {
+            machines
+                .state
+                .lock()
+                .unwrap()
+                .get(&HostId::Machine("mini3".to_string()))
+                .filter(|m| m.seen)
+                .map(|_| ())
+        })
+        .await;
+        assert!(
+            open_params(&RcKind::from_wire("borg"), None).is_err(),
+            "the premise: a launch has no recipe for this word"
+        );
+
+        let command = RunCommand::parse(Some("borg  --model x")).unwrap();
+        let answer = machines
+            .run("mini3", &command, Some("  /tmp/x  "))
+            .await
+            .expect("the open lands");
+
+        let opened = fake.tab_open_calls();
+        assert_eq!(opened.len(), 1, "{opened:?}");
+        assert_eq!(opened[0]["argv"], json!(["borg", "--model", "x"]));
+        assert_eq!(opened[0]["cwd"], json!("/tmp/x"), "trimmed");
+        assert!(
+            opened[0].get("activate").is_none(),
+            "the tab is left selected, as a launch's is: {}",
+            opened[0]
+        );
+
+        assert_eq!(answer["origin"], json!("machine:mini3"));
+        assert_eq!(answer["machine"], json!("mini3"));
+        assert_eq!(
+            answer["slug"],
+            json!("6"),
+            "the id the fake's next tab gets"
+        );
+        assert_eq!(answer["argv"], json!(["borg", "--model", "x"]));
+        assert!(
+            rows(&machines).iter().all(|r| r["slug"] != "6"),
+            "no optimistic row for a tab nobody owns: {:?}",
+            rows(&machines)
         );
     }
 }

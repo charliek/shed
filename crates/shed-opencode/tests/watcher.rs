@@ -6,19 +6,14 @@ mod common;
 use std::time::Duration;
 
 use common::{
-    approval_ids, assert_clean, assistant_turn, marker, message_text, next_event, permission_asked,
-    seqs, texts, until_ready, until_text, wait_for,
+    approval_ids, assert_clean, assistant_turn, lane_on, marker, message_text, next_event,
+    permission_asked, seqs, texts, until_ready, until_text, wait_for,
 };
 use serde_json::json;
 use shed_core::lane::{AgentLane, LaneError, LaneEvent, LaneSubscription};
 use shed_core::rc::RcActivity;
 use shed_opencode::client::STREAM_HEAD_TIMEOUT;
 use shed_opencode::testing::FakeOpencode;
-use shed_opencode::OpencodeClient;
-
-fn client(fake: &FakeOpencode) -> OpencodeClient {
-    OpencodeClient::new(fake.base_url(), None).expect("the client builds")
-}
 
 /// One root session in `/w`, with a two-turn transcript, pinned.
 async fn one_session() -> FakeOpencode {
@@ -31,8 +26,8 @@ async fn one_session() -> FakeOpencode {
 }
 
 async fn subscribe(fake: &FakeOpencode, id: &str) -> LaneSubscription {
-    client(fake)
-        .subscribe(id, None)
+    lane_on(fake, id)
+        .subscribe(None)
         .await
         .expect("the subscription opens")
 }
@@ -63,19 +58,31 @@ async fn the_seed_is_bracketed_by_reset_and_ready() {
     assert_eq!(rows[1], "hi there");
     assert_eq!(seqs(&seed)[..2], [1, 2]);
 
-    // The session row, then the approvals — the order `shed_core::lane`'s
-    // module doc pins for a seed.
+    // The session row, its capabilities, then the approvals — the order
+    // `shed_core::lane`'s module doc pins for a seed.
     let session_at = seed
         .iter()
         .position(|e| matches!(e, LaneEvent::Session { .. }))
         .expect("a Session frame");
+    let capabilities_at = seed
+        .iter()
+        .position(|e| matches!(e, LaneEvent::Capabilities { .. }))
+        .expect("a Capabilities frame — every seed carries one (plan 025)");
     let approval_at = seed
         .iter()
         .position(|e| matches!(e, LaneEvent::Approval { .. }))
         .expect("an Approval frame");
     assert!(
-        session_at < approval_at,
-        "messages, then session, then approvals"
+        session_at < capabilities_at && capabilities_at < approval_at,
+        "messages, then session, then capabilities, then approvals"
+    );
+    let LaneEvent::Capabilities { capabilities } = &seed[capabilities_at] else {
+        unreachable!()
+    };
+    assert_eq!(*capabilities, shed_opencode::opencode_capabilities());
+    assert!(
+        !seed.iter().any(|e| matches!(e, LaneEvent::Settings { .. })),
+        "opencode's capabilities say settings: false, so its seed carries no Settings"
     );
 
     let LaneEvent::Session { session } = &seed[session_at] else {
@@ -111,8 +118,8 @@ async fn the_seed_is_bracketed_by_reset_and_ready() {
 #[tokio::test]
 async fn a_cursor_this_adapter_cannot_honor_names_itself_on_the_reset() {
     let fake = one_session().await;
-    let (mut rx, _stop) = client(&fake)
-        .subscribe("ses_a", Some("some-old-cursor".to_string()))
+    let (mut rx, _stop) = lane_on(&fake, "ses_a")
+        .subscribe(Some("some-old-cursor".to_string()))
         .await
         .expect("the subscription opens")
         .into_parts();
@@ -317,8 +324,8 @@ async fn a_first_connect_that_never_comes_up_is_down_not_a_retry_loop() {
 async fn a_401_refuses_the_subscription_up_front() {
     let fake = FakeOpencode::start_with_auth("opencode", "hunter2").await;
     fake.add_session("ses_a", "root", "/w", None);
-    let err = client(&fake)
-        .subscribe("ses_a", None)
+    let err = lane_on(&fake, "ses_a")
+        .subscribe(None)
         .await
         .err()
         .expect("no credentials");
@@ -483,9 +490,8 @@ async fn a_childs_approval_surfaces_but_its_transcript_does_not() {
 
     // Answering the child's approval addresses the CHILD's request id — the pin
     // guard's ledger is what proves that is what happened.
-    client(&fake)
+    lane_on(&fake, "ses_a")
         .answer(
-            "ses_a",
             "per_child",
             shed_core::lane::LaneAnswer::Permission {
                 decision: shed_core::lane::LaneDecision::AllowOnce,

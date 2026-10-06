@@ -1,37 +1,37 @@
 #!/usr/bin/env python3
 """A control door on the fakes, for a harness in another language (plan 018 §3.6).
 
-Hosts one of `fake_gx.FakeGx` / `fake_opencode.FakeOpencode` and exposes its
-knobs over a second, loopback-only HTTP port — so a Dart (or any other
-language's) test can seed a session, push a frame, or ask "how many streams are
-live" without re-deriving either fake in its own runtime.
+Hosts `fake_opencode.FakeOpencode` and exposes its knobs over a second,
+loopback-only HTTP port — so a Dart (or any other language's) test can seed a
+session, push a frame, or ask "how many streams are live" without re-deriving
+the fake in its own runtime. (It hosted a second agent, `fake_gx.FakeGx`,
+through plan 017; gx and its lane left shed in plan 025 C1 — shed#390 — and
+the `--agent` choice and its allowlist went with it. A future second adapter
+re-adds that shape rather than reviving this one, since nothing here is
+gx-specific by construction.)
 
 ```
-fake_lane_server.py --agent gx|opencode [--home DIR] [--token T] [--instance-id I]
-→ stdout, one line: {"agent":"gx","port":41234,"reported_url":"http://127.0.0.1:41234",
-                      "home":"/tmp/…","control":"http://127.0.0.1:41235"}
+fake_lane_server.py --agent opencode
+→ stdout, one line: {"agent":"opencode","port":41234,"reported_url":"http://127.0.0.1:41234",
+                      "home":null,"control":"http://127.0.0.1:41235"}
 POST /_/<method>   body: {"args": [...], "kwargs": {...}} → 200 JSON result | 400 {"error":…}
 GET  /_/info       → the same JSON as the startup line
 POST /_/stop
 ```
 
-`<method>` is an **explicit per-agent allowlist** (`GX_METHODS` / `OPENCODE_METHODS`
-below — a dict, not introspection over the fake's public methods), so a wire a
-Dart test depends on can't silently grow or shrink just because someone added a
-helper to `fake_gx.py`. The envelope builders (`permission_request`,
-`chunk`, `turn_completed`, …) are reached at `POST /_/envelope/<name>`, whose
-body IS the kwargs object directly (no `args`/`kwargs` wrapping — there are no
-positional-only envelope builders, so the ambiguity doesn't arise there).
-Lifecycle (`stop`) is never in the allowlist; it is its own route.
+`<method>` is an **explicit allowlist** (`OPENCODE_METHODS` below — a dict,
+not introspection over the fake's public methods), so a wire a Dart test
+depends on can't silently grow or shrink just because someone added a helper
+to `fake_opencode.py`. Lifecycle (`stop`) is never in the allowlist; it is its
+own route.
 
 Every result is made JSON-serialisable by construction: allowlisted functions
-either return plain dicts/lists/scalars already, or (for the three cases
-that don't — gx's `requests()`, which shapes `RequestRecord` to a dict, gx's
-`bodies_to()`, which projects one `RequestRecord` field to a list of strings,
-and opencode's `post_paths` attribute) are given a small adapter here that
-shapes the result before it hits `json.dumps`. A `Path` or a dataclass instance reaching the encoder is
-still handled (`_Encoder` below), for any future knob that returns one
-directly, but nothing shipped today relies on that fallback.
+either return plain dicts/lists/scalars already, or (for the one case that
+doesn't — opencode's `post_paths` attribute) are given a small adapter here
+that shapes the result before it hits `json.dumps`. A `Path` or a dataclass
+instance reaching the encoder is still handled (`_Encoder` below), for any
+future knob that returns one directly, but nothing shipped today relies on
+that fallback.
 
 A **stdin-EOF watchdog** runs as a daemon thread: a test that holds this
 process's stdin pipe open controls its lifetime for free, and a `flutter
@@ -58,7 +58,6 @@ from urllib.parse import unquote, urlsplit
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-import fake_gx  # noqa: E402
 import fake_opencode  # noqa: E402
 
 #: How long the stdin-EOF watchdog's read loop is allowed to block on any one
@@ -95,7 +94,7 @@ class ServerState:
         self.stopped = threading.Event()
 
     def info(self) -> dict:
-        reported = self.fake.reported_url if self.agent == "gx" else self.fake.base_url
+        reported = self.fake.base_url
         return {
             "agent": self.agent,
             "port": self.fake.port,
@@ -119,122 +118,11 @@ def _call(name: str) -> Callable[[ServerState, list, dict], Any]:
     return _fn
 
 
-def _gx_requests(state: ServerState, _args: list, _kwargs: dict) -> list[dict]:
-    """`requests()` returns `RequestRecord` (a `__slots__` class, not a
-    dataclass) — shaped here into the wire the plan pins: `{method, path,
-    query, had_bearer, bearer_ok}`. `last_event_id`/`body` are dropped, and the
-    token itself was never in the ledger to begin with.
-
-    Bodies are reachable through `bodies_to` rather than here: this shape is
-    pinned (a cell asserts the key set exactly), and widening it to carry every
-    request's body would put a posted token-bearing body into the one ledger a
-    test prints on failure."""
-    return [
-        {
-            "method": r.method,
-            "path": r.path,
-            "query": r.query,
-            "had_bearer": r.had_bearer,
-            "bearer_ok": r.bearer_ok,
-        }
-        for r in state.fake.requests()
-    ]
-
-
-def _gx_bodies_to(state: ServerState, args: list, kwargs: dict) -> list[str]:
-    """Every recorded body whose path ends with `suffix`, in order served.
-
-    A list, not `FakeGx.body_of`'s first match: the cell that proves
-    `mode: "interject"` posts to `…/messages` twice — a queued send first, then
-    the interject — and asserting the FIRST body there would assert the wrong
-    one and pass.
-    """
-    suffix = kwargs.get("suffix")
-    if suffix is None and len(args) > 0:
-        suffix = args[0]
-    # A nonempty STRING, not merely "not None": `"".endswith` is true of every
-    # path, so an empty suffix would quietly hand back the whole ledger — the
-    # one answer a body assertion must never silently receive.
-    if not isinstance(suffix, str) or not suffix:
-        raise ValueError("bodies_to requires a nonempty string suffix")
-    return [r.body for r in state.fake.requests_to(suffix)]
-
-
-def _restart_leader_and_rewrite_home(state: ServerState, args: list, kwargs: dict) -> dict:
-    """`restart_leader` then `write_home` — a composite because `restart_leader`
-    deliberately does not rewrite the discovery record itself
-    (`fake_gx.py:restart_leader`'s own docstring). `home` defaults to whatever
-    `--home` this process started with, so the common case
-    (`{"args": ["new-instance-id"]}`) needs no caller-side path plumbing."""
-    instance_id = kwargs.get("instance_id")
-    if instance_id is None and len(args) > 0:
-        instance_id = args[0]
-    if instance_id is None:
-        raise ValueError("restart_leader_and_rewrite_home requires instance_id")
-
-    home = kwargs.get("home")
-    if home is None and len(args) > 1:
-        home = args[1]
-    if home is None:
-        home = state.home
-    if home is None:
-        raise ValueError(
-            "restart_leader_and_rewrite_home requires a home (pass one, or "
-            "start fake_lane_server.py with --home)")
-
-    state.fake.restart_leader(instance_id)
-    written = state.fake.write_home(home)
-    return {"instance_id": instance_id, "home": str(written)}
-
-
 def _opencode_post_paths(state: ServerState, _args: list, _kwargs: dict) -> list[str]:
     """`post_paths` is a plain list attribute on `FakeOpencode`, not a method —
     exposed here as a zero-arg read."""
     return list(state.fake.post_paths)
 
-
-GX_METHODS: dict[str, Callable[[ServerState, list, dict], Any]] = {
-    "add_session": _call("add_session"),
-    "set_history": _call("set_history"),
-    "push_update": _call("push_update"),
-    "stage_update": _call("stage_update"),
-    "push_session_frame": _call("push_session_frame"),
-    "push_session_removed": _call("push_session_removed"),
-    "push_approval_frame": _call("push_approval_frame"),
-    "push_reset": _call("push_reset"),
-    "push_keepalive": _call("push_keepalive"),
-    "close_streams": _call("close_streams"),
-    "stream_count": _call("stream_count"),
-    "add_approval": _call("add_approval"),
-    "add_placeholder_approval": _call("add_placeholder_approval"),
-    "resolve_approval": _call("resolve_approval"),
-    "answered_with": _call("answered_with"),
-    "fail": _call("fail"),
-    "clear_failures": _call("clear_failures"),
-    "set_instance_id": _call("set_instance_id"),
-    "restart_leader_and_rewrite_home": _restart_leader_and_rewrite_home,
-    "requests": _gx_requests,
-    "bodies_to": _gx_bodies_to,
-    "clear_requests": _call("clear_requests"),
-    "hold_seed": _call("hold_seed"),
-    "release_seed": _call("release_seed"),
-}
-
-#: `POST /_/envelope/<name>` — the wire vocabulary a Dart test never re-derives.
-#: opencode has no equivalent route: its `stream_*` methods already build AND
-#: broadcast their own envelopes in one call.
-GX_ENVELOPES: dict[str, Callable[..., dict]] = {
-    "chunk": fake_gx.chunk,
-    "turn_completed": fake_gx.turn_completed,
-    "hook": fake_gx.hook,
-    "tool_call": fake_gx.tool_call,
-    "tool_call_update": fake_gx.tool_call_update,
-    "permission_request": fake_gx.permission_request,
-    "opaque_permission_request": fake_gx.opaque_permission_request,
-    "question_request": fake_gx.question_request,
-    "plan_request": fake_gx.plan_request,
-    "elicitation_request": fake_gx.elicitation_request,
-}
 
 OPENCODE_METHODS: dict[str, Callable[[ServerState, list, dict], Any]] = {
     "add_session": _call("add_session"),
@@ -362,30 +250,13 @@ def _watchdog(state: ServerState) -> None:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="fake_lane_server.py")
-    parser.add_argument("--agent", required=True, choices=("gx", "opencode"))
-    parser.add_argument("--home", default=None,
-                        help="gx: write $GROK_HOME here at startup (write_home)")
-    parser.add_argument("--token", default=None, help="gx only")
-    parser.add_argument("--instance-id", default=None, help="gx only")
+    parser.add_argument("--agent", required=True, choices=("opencode",))
     args = parser.parse_args(argv)
 
-    if args.agent == "gx":
-        kwargs: dict[str, Any] = {}
-        if args.token is not None:
-            kwargs["token"] = args.token
-        if args.instance_id is not None:
-            kwargs["instance_id"] = args.instance_id
-        fake: Any = fake_gx.FakeGx(**kwargs)
-        methods, envelopes = GX_METHODS, GX_ENVELOPES
-    else:
-        fake = fake_opencode.FakeOpencode()
-        methods, envelopes = OPENCODE_METHODS, {}
+    fake: Any = fake_opencode.FakeOpencode()
+    methods, envelopes = OPENCODE_METHODS, {}
 
-    home = Path(args.home) if args.home else None
-    if home is not None and args.agent == "gx":
-        fake.write_home(home)
-
-    state = ServerState(args.agent, fake, home, methods, envelopes)
+    state = ServerState(args.agent, fake, None, methods, envelopes)
 
     control = ThreadingHTTPServer(("127.0.0.1", 0), _make_control_handler(state))
     state.control_port = control.server_address[1]

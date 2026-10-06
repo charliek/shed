@@ -38,16 +38,12 @@ shed-app = { path = "../../../crates/shed-app", features = ["broker"] }
 # shipped path against a Python fake over a real socket. The Rust fake is a
 # dev-dependency instead (below), so it reaches `cargo test` and nothing else.
 shed-opencode = { path = "../../../crates/shed-opencode" }
-# The gx agent-lane adapter (plan 017 §3.4). The SECOND implementation of
-# `shed_core::lane::AgentLane`, and the reason `lane.rs` now dispatches on the
-# row's stamped `kind` instead of naming one client type. Same path-dep shape and
-# same `test-support`-in-dev-dependencies rule as shed-opencode above. It also
-# supplies the two halves the contract deliberately leaves to a client: the
-# `GxTransport` hook (`TauriTransport` implements it) and the `GxCredentialSource`
-# seam plus the pure file/probe readers behind it (`TauriGxCredentials` calls
-# them rather than reimplementing the checks).
-shed-gx = { path = "../../../crates/shed-gx" }
-# ONLY for `reqwest::Url` — `OpencodeClient::new` takes a parsed base URL, and
+# The craze adapter (plan 025 C9): one craze SOURCE per machine — this machine's
+# hub over a local `/bin/sh` bridge, a remote one over `SshExec::spawn_duplex` —
+# and a `CrazeLane` per open transcript. A plain path dep like shed-opencode; its
+# `test-support` recipe harness is a dev-dependency only (below).
+shed-craze = { path = "../../../crates/shed-craze" }
+# ONLY for `reqwest::Url` — `OpencodeSource::new` takes a parsed base URL, and
 # this crate has to name the type to build one. `default-features = false` and no
 # features of its own: the version and the feature set are whatever shed-core
 # already resolved (`rustls-tls, stream, json`), so this adds nothing to the lock
@@ -61,14 +57,6 @@ reqwest = { version = "0.12", default-features = false }
 # revs would put two copies of the crate in this tree and `shed_app::roost`'s
 # signatures would stop accepting these types. Bump both together.
 roost-ipc = { git = "https://github.com/charliek/roost", rev = "2bc71fa3848ddbf2d190aab6c4ef61ad2d432aa1" }
-# The tracing FACADE, for the one thing this crate has to say that must NOT
-# reach the app log: the raw error of a failed gx discovery probe, which can
-# carry the remote's stdout and therefore the token (`TauriGxCredentials`). No
-# subscriber is installed anywhere in this tree, so the macro compiles to a
-# no-op — which is precisely the posture wanted here, and why the raw text goes
-# through it rather than through this crate's usual `eprintln!`. Already in the
-# lock via shed-app and roost-ipc; a direct dep adds no package.
-tracing = "0.1"
 # "process" backs the Linux AuthGate (the pkcheck subprocess; the notifier is zbus).
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "net", "io-util", "time", "process"] }
 serde = { version = "1", features = ["derive"] }
@@ -143,11 +131,10 @@ shed-core = { path = "../../../crates/shed-core", features = ["test-support"] }
 # package to the lock and nothing to the shipped binary, which still links the
 # crate without it (see the `[dependencies]` entry).
 shed-opencode = { path = "../../../crates/shed-opencode", features = ["test-support"] }
-# `shed_gx::testing::FakeGx` — the in-process gx double, for the forward-repair
-# cell (a silent cursor resume across a fake-induced EOF must re-`ensure` the
-# tunnel without emitting a `Reset`, which is the one claim `TauriTransport`
-# exists to make). Same feature-only switch as the two above.
-shed-gx = { path = "../../../crates/shed-gx", features = ["test-support"] }
+# `shed_craze::testing` — the scripted hub (`ScriptedDial`) the craze-source
+# cells drive (the host-removal races, the fold, the eviction hooks), and the
+# recipe's skip-or-require rule. Same feature-only switch as the two above.
+shed-craze = { path = "../../../crates/shed-craze", features = ["test-support"] }
 
 # A debug build is what the harness drives; keep it reasonably snappy.
 #

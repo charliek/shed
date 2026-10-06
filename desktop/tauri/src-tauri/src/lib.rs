@@ -9,6 +9,7 @@
 
 mod approval;
 mod broker;
+mod craze;
 mod env;
 mod ipc;
 mod lane;
@@ -90,7 +91,7 @@ async fn list_sheds(
     // The frontend's own refresh is an authoritative shed listing too — it is
     // the one the dashboard runs on a timer, so a shed that stops while nobody
     // is driving the socket still loses its roost watcher (plan 019 §3.6).
-    ipc::observe_reachability(&machines, &reachability);
+    ipc::observe_reachability(&machines, &reachability).await;
     Ok(ipc::sheds_payload(&reachability))
 }
 
@@ -385,6 +386,25 @@ async fn machine_launch(
         .await
 }
 
+/// `roost_run` — "Run a command in a tab" (plan 025 P5): the frontend's door
+/// onto [`roost_hosts::RoostHosts::run`], the twin of the `roost.run` socket op.
+///
+/// Addressed by `target` (a machine's bare name or a shed's
+/// `roost:<server>/<shed>`) and gated by NO kind — the launch dialog's "Run a
+/// command" mode lands here, not in [`machine_launch`]/[`rc_launch`]. The same
+/// [`roost_hosts::RunCommand::parse`] as the socket door, so an absent, empty
+/// or whitespace-only `command` is refused here too, before the host is touched.
+#[tauri::command]
+async fn roost_run(
+    machines: tauri::State<'_, Arc<roost_hosts::RoostHosts>>,
+    target: String,
+    command: Option<String>,
+    workdir: Option<String>,
+) -> Result<serde_json::Value, String> {
+    let command = roost_hosts::RunCommand::parse(command.as_deref())?;
+    machines.run(&target, &command, workdir.as_deref()).await
+}
+
 // -- roost bootstrap (plan 019 §3.6, C8) -----------------------------------
 //
 // The frontend's own door onto `RoostHosts::probe/preview/bootstrap` — the
@@ -498,13 +518,18 @@ pub(crate) fn lane_error(failure: lane::LaneFailure) -> String {
 }
 
 /// `lane_open` — start (or re-answer) a live transcript for one agent session.
+/// `kind` is the row's `agent_lane.kind` (plan 025 §3.6.4).
 #[tauri::command]
 async fn lane_open(
     lanes: tauri::State<'_, Arc<lane::Lanes>>,
     machine: String,
+    kind: String,
     session_id: String,
 ) -> Result<serde_json::Value, String> {
-    lanes.open(&machine, &session_id).await.map_err(lane_error)
+    lanes
+        .open(&machine, &kind, &session_id)
+        .await
+        .map_err(lane_error)
 }
 
 /// `lane_messages` — the staged-then-swapped transcript view.
@@ -512,9 +537,12 @@ async fn lane_open(
 fn lane_messages(
     lanes: tauri::State<'_, Arc<lane::Lanes>>,
     machine: String,
+    kind: String,
     session_id: String,
 ) -> Result<serde_json::Value, String> {
-    lanes.messages(&machine, &session_id).map_err(lane_error)
+    lanes
+        .messages(&machine, &kind, &session_id)
+        .map_err(lane_error)
 }
 
 /// `lane_approvals` — what the session (or a descendant) is blocked on.
@@ -522,9 +550,12 @@ fn lane_messages(
 fn lane_approvals(
     lanes: tauri::State<'_, Arc<lane::Lanes>>,
     machine: String,
+    kind: String,
     session_id: String,
 ) -> Result<serde_json::Value, String> {
-    lanes.approvals(&machine, &session_id).map_err(lane_error)
+    lanes
+        .approvals(&machine, &kind, &session_id)
+        .map_err(lane_error)
 }
 
 /// `lane_send` — a prompt. `mode` defaults to `queue`.
@@ -532,13 +563,14 @@ fn lane_approvals(
 async fn lane_send(
     lanes: tauri::State<'_, Arc<lane::Lanes>>,
     machine: String,
+    kind: String,
     session_id: String,
     text: String,
     mode: Option<String>,
 ) -> Result<serde_json::Value, String> {
     let mode = lane::parse_mode(mode.as_deref()).map_err(lane_error)?;
     lanes
-        .send(&machine, &session_id, &text, mode)
+        .send(&machine, &kind, &session_id, &text, mode)
         .await
         .map_err(lane_error)
 }
@@ -548,10 +580,64 @@ async fn lane_send(
 async fn lane_cancel(
     lanes: tauri::State<'_, Arc<lane::Lanes>>,
     machine: String,
+    kind: String,
     session_id: String,
 ) -> Result<serde_json::Value, String> {
     lanes
-        .cancel(&machine, &session_id)
+        .cancel(&machine, &kind, &session_id)
+        .await
+        .map_err(lane_error)
+}
+
+/// `lane_stop` — end the SESSION (plan 025 §3.6.4), the twin of the
+/// `lane.stop` socket op. The panel offers it only when the session's
+/// capabilities say `stop`, behind an inline confirm.
+#[tauri::command]
+async fn lane_stop(
+    lanes: tauri::State<'_, Arc<lane::Lanes>>,
+    machine: String,
+    kind: String,
+    session_id: String,
+) -> Result<serde_json::Value, String> {
+    lanes
+        .stop(&machine, &kind, &session_id)
+        .await
+        .map_err(lane_error)
+}
+
+/// `lane_settings` — the session's settings, read now (plan 025 §3.10); the
+/// twin of the `lane.settings` socket op. The sheet renders the stream's copy
+/// (`lane_messages`' `settings`); this is the one-shot read.
+#[tauri::command]
+async fn lane_settings(
+    lanes: tauri::State<'_, Arc<lane::Lanes>>,
+    machine: String,
+    kind: String,
+    session_id: String,
+) -> Result<serde_json::Value, String> {
+    lanes
+        .settings(&machine, &kind, &session_id)
+        .await
+        .map_err(lane_error)
+}
+
+/// `lane_set` — change one setting (plan 025 §3.10), the twin of the
+/// `lane.set` socket op and read by the same [`lane::parse_setting`]: the
+/// settings sheet's every press. A refusal crosses with its code
+/// (`not_accepting` — craze's `stale_model` among others — or
+/// `outcome_unknown` for an answer lost to a drop, which the sheet shows "not
+/// confirmed" until the next `Settings`).
+#[tauri::command]
+async fn lane_set(
+    lanes: tauri::State<'_, Arc<lane::Lanes>>,
+    machine: String,
+    kind: String,
+    session_id: String,
+    change: serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    let change = lane::parse_setting(&change).map_err(lane_error)?;
+    lanes
+        .set(&machine, &kind, &session_id, change)
         .await
         .map_err(lane_error)
 }
@@ -562,13 +648,14 @@ async fn lane_cancel(
 async fn lane_answer(
     lanes: tauri::State<'_, Arc<lane::Lanes>>,
     machine: String,
+    kind: String,
     session_id: String,
     approval_id: String,
     answer: serde_json::Value,
 ) -> Result<serde_json::Value, String> {
     let answer = lane::parse_answer(&answer).map_err(lane_error)?;
     lanes
-        .answer(&machine, &session_id, &approval_id, answer)
+        .answer(&machine, &kind, &session_id, &approval_id, answer)
         .await
         .map_err(lane_error)
 }
@@ -578,9 +665,70 @@ async fn lane_answer(
 fn lane_close(
     lanes: tauri::State<'_, Arc<lane::Lanes>>,
     machine: String,
+    kind: String,
     session_id: String,
 ) -> serde_json::Value {
-    lanes.close(&machine, &session_id)
+    lanes.close(&machine, &kind, &session_id)
+}
+
+// -- craze: the create sheet and Open in terminal (plan 025 §3.6.6, §3.8) --
+//
+// The frontend twins of the `craze.*` socket ops — the same [`RoostHosts`]
+// methods, so what the harness proves about a create is what the sheet runs.
+// A refusal crosses as `"<code>: <message>"` (the `lane_*` commands' rule),
+// which `bridge.ts` splits back so the sheet can tell `outcome_unknown` (keep
+// the request id) from a definite refusal (mint a new one).
+
+/// `craze_create_options` — what a create can start on `machine` (D8: read
+/// afresh on every sheet open). May start a hub on a dormant machine.
+#[tauri::command]
+async fn craze_create_options(
+    machines: tauri::State<'_, Arc<roost_hosts::RoostHosts>>,
+    machine: String,
+) -> Result<serde_json::Value, String> {
+    machines
+        .craze_create_options(&machine)
+        .await
+        .map_err(|f| f.command_string())
+}
+
+/// `craze_create` — a new craze session; `request_id` is the sheet's own
+/// (reused only while the last outcome is unknown). Read through
+/// [`craze::create_request`], the socket door's one reading.
+#[tauri::command]
+async fn craze_create(
+    machines: tauri::State<'_, Arc<roost_hosts::RoostHosts>>,
+    machine: String,
+    cwd: Option<String>,
+    provider: Option<String>,
+    prompt: Option<String>,
+    request_id: Option<String>,
+) -> Result<serde_json::Value, String> {
+    let request = craze::create_request(
+        cwd.as_deref(),
+        provider.as_deref(),
+        prompt.as_deref(),
+        request_id.as_deref(),
+    )
+    .map_err(|f| f.command_string())?;
+    machines
+        .craze_create(&machine, request)
+        .await
+        .map_err(|f| f.command_string())
+}
+
+/// `craze_open_terminal` — Open in terminal on a headless craze row: a roost
+/// tab running `craze attach` on it.
+#[tauri::command]
+async fn craze_open_terminal(
+    machines: tauri::State<'_, Arc<roost_hosts::RoostHosts>>,
+    machine: String,
+    session_id: String,
+) -> Result<serde_json::Value, String> {
+    machines
+        .craze_open_terminal(&machine, &session_id)
+        .await
+        .map_err(|f| f.command_string())
 }
 
 /// `add_machine` — the dialog's path into [`machines::add_from_json`].
@@ -1171,6 +1319,7 @@ pub fn run() {
             machine_kill,
             machine_capabilities,
             machine_launch,
+            roost_run,
             roost_probe,
             roost_preview,
             roost_bootstrap,
@@ -1181,6 +1330,12 @@ pub fn run() {
             lane_cancel,
             lane_answer,
             lane_close,
+            lane_stop,
+            lane_settings,
+            lane_set,
+            craze_create_options,
+            craze_create,
+            craze_open_terminal,
             machines_list,
             add_machine,
             open_terminal,
@@ -1377,10 +1532,6 @@ pub fn run() {
                 tauri::async_runtime::handle().inner().clone(),
                 app.handle().clone(),
                 machines.clone(),
-                lane::GxConfig {
-                    home: env.gx_home.clone(),
-                    timings: env.gx_timings.clone(),
-                },
             ));
             let lanes_hook = Arc::downgrade(&lanes);
             machines.set_lane_observer(Arc::new(move |machine: &str, open: &_| {
@@ -1388,6 +1539,18 @@ pub fn run() {
                     lanes.reconcile(machine, open);
                 }
             }));
+            // The craze half (plan 025 §3.6.4): a craze lane's row is its
+            // machine's craze source's, so its eviction rides that source —
+            // a `Removed`, a reseed that dropped the row, the hub gone, the
+            // host removed, its tab ended — not a roost snapshot.
+            let craze_hook = Arc::downgrade(&lanes);
+            machines.set_craze_observer(Arc::new(
+                move |machine: &str, gen: u64, gone: &[String]| {
+                    if let Some(lanes) = craze_hook.upgrade() {
+                        lanes.evict_craze(machine, gen, gone);
+                    }
+                },
+            ));
             app.manage(lanes.clone());
 
             // The terminal ops (preset resolution, launch, detection, the pref), shared

@@ -310,6 +310,23 @@ ARG ROOST_SESSION_PROTOCOL=6
 ARG ROOST_SESSION_SHA256_AMD64=cbf9ae38d9f613cff88b951a7a895cf2241a831476a42fcf9844488331a6e435
 ARG ROOST_SESSION_SHA256_ARM64=dca26f903c5815020e27f8cc87df1ec806ffe943637c08c5324c51a714238d2b
 
+# craze (the agent-lane CLI shed's `shed attach` drives) is baked the same way —
+# a standalone release asset, not a deb, fetched from charliek/craze's GitHub
+# release. Pinned to a NAMED release, never "whatever is latest": plan 025's O2
+# weighed baking latest-on-main so craze "works now" and rejected it — the bake
+# must prove provenance at shed release time (O4: CRAZE_TEST_SHA must equal
+# CRAZE_RELEASE's tag commit, scripts/release/check-craze-pin.sh), which needs a
+# named release, and two arch builds of one "latest" publish could even resolve
+# different releases. Digests are pinned IN-TREE, not fetched: a .sha256 from
+# the same mutable release proves transport, not provenance. `make
+# check-craze-pin` keeps both Dockerfiles' CRAZE_VERSION and digest pairs in
+# lockstep with craze-pin.env's CRAZE_RELEASE (the check-roost-pin precedent).
+# These ARGs are NOT forwarded by scripts/build-*-rootfs.sh; they exist so the
+# values are named here and overridable by --build-arg on a manual build.
+ARG CRAZE_VERSION=0.1.0
+ARG CRAZE_SHA256_AMD64=926954b32bd0fcc672f962813b61767a2615f49ae8e453e6c737826d7443f724
+ARG CRAZE_SHA256_ARM64=4bea888fcae1592f75552511b0144018584452dcd5e67254f11e3c9619a038d0
+
 RUN install -m 0755 -d /etc/apt/keyrings \
     && curl -fsSL https://apt.stridelabs.ai/pubkey.gpg -o /etc/apt/keyrings/stridelabs.gpg \
     && chmod a+r /etc/apt/keyrings/stridelabs.gpg \
@@ -326,7 +343,17 @@ RUN install -m 0755 -d /etc/apt/keyrings \
     && install -m 0755 /tmp/rs /usr/bin/roost-session && rm -f /tmp/rs \
     && /usr/bin/roost-session identify \
          | jq -e ".session_protocol == ${ROOST_SESSION_PROTOCOL} and .app_version == \"${ROOST_SESSION_VERSION}\"" >/dev/null \
-         || { echo "ERROR: baked roost-session is not ${ROOST_SESSION_VERSION}/protocol ${ROOST_SESSION_PROTOCOL}" >&2; exit 1; }
+         || { echo "ERROR: baked roost-session is not ${ROOST_SESSION_VERSION}/protocol ${ROOST_SESSION_PROTOCOL}" >&2; exit 1; } \
+    && case "$arch" in amd64) craze_want="$CRAZE_SHA256_AMD64";; arm64) craze_want="$CRAZE_SHA256_ARM64";; *) echo "ERROR: no craze digest for $arch" >&2; exit 1;; esac \
+    && craze_base="https://github.com/charliek/craze/releases/download/v${CRAZE_VERSION}" \
+    && curl -fsSL --retry 5 --retry-delay 2 -o /tmp/craze.tgz "${craze_base}/craze_linux_${arch}.tar.gz" \
+    && echo "${craze_want}  /tmp/craze.tgz" | sha256sum -c - \
+    && craze_dir="$(mktemp -d)" \
+    && tar -xzf /tmp/craze.tgz -C "$craze_dir" \
+    && install -m 0755 "$craze_dir/craze" /usr/bin/craze \
+    && rm -rf /tmp/craze.tgz "$craze_dir" \
+    && test "$(/usr/bin/craze --version)" = "${CRAZE_VERSION}" \
+         || { echo "ERROR: baked craze is not ${CRAZE_VERSION} — check ARG CRAZE_VERSION in vz/Dockerfile and firecracker/Dockerfile and CRAZE_RELEASE in craze-pin.env" >&2; exit 1; }
 
 WORKDIR /home/shed
 ENTRYPOINT ["/sbin/init"]

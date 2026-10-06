@@ -5,16 +5,26 @@ mod common;
 
 use std::time::Duration;
 
-use common::{assert_clean, wait_for};
+use common::{assert_clean, lane_on, source, wait_for};
 use serde_json::json;
-use shed_core::lane::{AgentLane, LaneAnswer, LaneApprovalKind, LaneDecision, LaneError, SendMode};
+use shed_core::lane::{
+    AgentLane, AgentSource, LaneAnswer, LaneApprovalKind, LaneCreateRequest, LaneDecision,
+    LaneError, LanePromptOutcome, LaneProviderState, LaneSettingChange, LaneSettings, SendMode,
+};
 use shed_core::rc::RcActivity;
 use shed_opencode::client::{MAX_DESCENDANT_DEPTH, MAX_DESCENDANT_SESSIONS, MAX_REST_BYTES};
 use shed_opencode::testing::FakeOpencode;
-use shed_opencode::{BasicAuth, OpencodeClient};
+use shed_opencode::{BasicAuth, OpencodeSource};
 
-fn client(fake: &FakeOpencode) -> OpencodeClient {
-    OpencodeClient::new(fake.base_url(), None).expect("the client builds")
+/// A create request for opencode: `cwd`, an optional first prompt, and a
+/// request id opencode accepts and does not use.
+fn create_request(cwd: &str, prompt: Option<&str>) -> LaneCreateRequest {
+    LaneCreateRequest {
+        cwd: cwd.to_string(),
+        provider: None,
+        prompt: prompt.map(str::to_string),
+        request_id: "req-1".to_string(),
+    }
 }
 
 /// The fake with one root, one child and one sibling root, all in `/w`.
@@ -27,26 +37,81 @@ async fn three_sessions() -> FakeOpencode {
     fake
 }
 
+/// opencode's capabilities, pinned — the row every seed of its lane carries
+/// (the seed itself is asserted in `tests/watcher.rs`) — and the three verbs
+/// those capabilities say it cannot do, answered without a byte on the wire:
+/// `settings` is the empty default, `set` and `stop` are refused as
+/// unsupported, never as "not now".
 #[tokio::test]
-async fn capabilities_are_opencodes_pinned_row() {
-    let fake = FakeOpencode::start().await;
-    let caps = client(&fake).capabilities();
+async fn capabilities_are_opencodes_pinned_row_and_its_unsupported_verbs_say_so() {
+    let caps = shed_opencode::opencode_capabilities();
     assert_eq!(caps.kind, "opencode");
     assert!(
         !caps.interject,
         "prompt_async joins a turn, it cannot preempt"
     );
-    assert!(caps.create);
     assert!(caps.cancel);
     assert!(caps.approvals);
     assert!(
         !caps.history_cursor,
-        "there is no v1 per-session ?after= route: history refolds from the top"
+        "there is no v1 per-session ?after= route: every reconnect reseeds"
     );
+    assert!(!caps.settings, "opencode has no settings to show");
+    assert!(!caps.stop, "the contract cannot end an opencode session");
+
+    let fake = FakeOpencode::start().await;
+    fake.add_session("ses_a", "a", "/w", None);
+    fake.pin("ses_a");
+    let lane = lane_on(&fake, "ses_a");
+    assert_eq!(lane.session_id(), "ses_a", "the id is bound at open");
+    assert_eq!(
+        lane.settings().await.expect("settings answers"),
+        LaneSettings::default()
+    );
+    for (what, err) in [
+        (
+            "set",
+            lane.set(LaneSettingChange::Model { id: "m".into() })
+                .await
+                .expect_err("set is unsupported"),
+        ),
+        ("stop", lane.stop().await.expect_err("stop is unsupported")),
+    ] {
+        match err {
+            LaneError::Failed(m) => assert!(
+                m.contains("not supported by opencode"),
+                "{what}'s refusal names the agent: {m}"
+            ),
+            other => panic!("{what} must be Failed, never {other:?}"),
+        }
+    }
+    assert!(
+        fake.post_paths().is_empty() && fake.get_paths().is_empty(),
+        "an unsupported verb never reaches the wire"
+    );
+    assert_clean(&fake);
+}
+
+/// The source's first seed, read the way a client reads it: every frame up to
+/// the `Ready`, the rows in the order the seed carried them.
+async fn first_seed(source: &OpencodeSource) -> Vec<shed_core::lane::LaneSession> {
+    let (mut rx, _stop) = source.subscribe().await.expect("subscribe").into_parts();
+    let mut rows = Vec::new();
+    loop {
+        let ev = tokio::time::timeout(common::DEADLINE, rx.recv())
+            .await
+            .expect("the seed arrives")
+            .expect("the source stays subscribed");
+        match ev {
+            shed_core::lane::SourceEvent::Session { session } => rows.push(session),
+            shed_core::lane::SourceEvent::Ready { .. } => return rows,
+            _ => {}
+        }
+    }
 }
 
 #[tokio::test]
-async fn sessions_lists_roots_with_a_per_directory_status_poll() {
+async fn the_source_lists_roots_with_a_per_directory_status_poll() {
     let fake = FakeOpencode::start().await;
     fake.add_session("ses_a", "a", "/w1", None);
     fake.add_session("ses_child", "child", "/w1", Some("ses_a"));
@@ -54,7 +119,7 @@ async fn sessions_lists_roots_with_a_per_directory_status_poll() {
     fake.set_status("ses_a", "busy");
     // ses_c is absent from the status map, which opencode reads as idle.
 
-    let rows = client(&fake).sessions().await.expect("sessions");
+    let rows = first_seed(&source(&fake)).await;
     let ids: Vec<&str> = rows.iter().map(|r| r.id.as_str()).collect();
     assert_eq!(ids, vec!["ses_a", "ses_c"], "children are not roster rows");
     assert_eq!(rows[0].activity, RcActivity::Working);
@@ -62,6 +127,10 @@ async fn sessions_lists_roots_with_a_per_directory_status_poll() {
     assert!(
         rows.iter().all(|r| r.approximate),
         "a status poll cannot see approvals, so the row says so"
+    );
+    assert!(
+        rows.iter().all(|r| r.tab_id.is_none()),
+        "a source never sets tab_id"
     );
 
     // /session/status is INSTANCE-scoped: one read per distinct directory, or
@@ -78,11 +147,12 @@ async fn a_failed_status_read_degrades_to_unknown_rather_than_claiming_idle() {
     fake.add_session("ses_a", "a", "/w1", None);
     fake.fail_get("/session/status", 500);
 
-    let rows = client(&fake)
-        .sessions()
-        .await
-        .expect("the roster still loads");
-    assert_eq!(rows[0].activity, RcActivity::Unknown);
+    let rows = first_seed(&source(&fake)).await;
+    assert_eq!(
+        rows[0].activity,
+        RcActivity::Unknown,
+        "the roster still loads"
+    );
     assert_clean(&fake);
 }
 
@@ -94,7 +164,7 @@ async fn session_counts_the_root_and_its_childs_approvals() {
     fake.add_permission("ses_sib", "per_sib", "bash", "rm -rf /");
     fake.set_status("ses_a", "busy");
 
-    let row = client(&fake).session("ses_a").await.expect("session");
+    let row = lane_on(&fake, "ses_a").session().await.expect("session");
     assert_eq!(row.id, "ses_a");
     assert_eq!(row.cwd, "/w");
     assert_eq!(row.activity, RcActivity::Working);
@@ -111,8 +181,8 @@ async fn history_refolds_from_the_top_through_a_fresh_ring() {
     fake.add_session("ses_a", "a", "/w", None);
     fake.set_simple_transcript("ses_a", "hello", "hi there");
 
-    let page = client(&fake)
-        .history("ses_a", None, 100)
+    let page = lane_on(&fake, "ses_a")
+        .history(None, 100)
         .await
         .expect("history");
     let texts: Vec<&str> = page
@@ -147,8 +217,8 @@ async fn history_returns_the_tail_and_reports_truncation() {
         .collect();
     fake.set_messages("ses_a", json!(turns));
 
-    let page = client(&fake)
-        .history("ses_a", None, 2)
+    let page = lane_on(&fake, "ses_a")
+        .history(None, 2)
         .await
         .expect("history");
     let texts: Vec<&str> = page
@@ -173,46 +243,142 @@ async fn history_ignores_a_cursor_it_cannot_honor() {
     let fake = FakeOpencode::start().await;
     fake.add_session("ses_a", "a", "/w", None);
     fake.set_simple_transcript("ses_a", "hello", "hi there");
-    let with = client(&fake)
-        .history("ses_a", Some("whatever"), 100)
+    let with = lane_on(&fake, "ses_a")
+        .history(Some("whatever"), 100)
         .await
         .expect("history");
-    let without = client(&fake)
-        .history("ses_a", None, 100)
+    let without = lane_on(&fake, "ses_a")
+        .history(None, 100)
         .await
         .expect("history");
     assert_eq!(with, without, "the cursor is ignored, not honored halfway");
 }
 
+/// `create` with a prompt: the session is created with the directory as a
+/// QUERY, then the prompt is sent — the pre-split create, through the source.
 #[tokio::test]
 async fn create_sends_the_directory_as_a_query_then_prompts() {
     let fake = FakeOpencode::start().await;
-    let created = client(&fake)
-        .create("/tmp/project", "first prompt")
+    let created = source(&fake)
+        .create(create_request("/tmp/project", Some("first prompt")))
         .await
         .expect("create");
     // The pin is only known AFTER the create, which is why it is set here.
-    fake.pin(&created.id);
+    fake.pin(&created.session.id);
 
     let targets = fake.post_targets();
     assert_eq!(
         targets[0], "/session?directory=%2Ftmp%2Fproject",
         "opencode takes the directory as a QUERY on create, not in the body"
     );
-    assert_eq!(targets[1], format!("/session/{}/prompt_async", created.id));
+    assert_eq!(
+        targets[1],
+        format!("/session/{}/prompt_async", created.session.id)
+    );
     let body = fake
         .post_body("/prompt_async")
         .expect("the prompt body was recorded");
     assert_eq!(body, r#"{"parts":[{"text":"first prompt","type":"text"}]}"#);
+    assert_eq!(created.prompt, LanePromptOutcome::Accepted);
+    assert_eq!(created.prompt_error, None);
+    assert_eq!(created.session.activity, RcActivity::Working);
+    assert!(
+        !body.contains("req-1") && targets.iter().all(|t| !t.contains("req-1")),
+        "the request id is accepted and unused: opencode has no create idempotency"
+    );
     assert_clean(&fake);
+}
+
+/// `create` WITHOUT a prompt creates and sends nothing — the pre-split create
+/// always sent one, and that is exactly what made it unusable for a "start a
+/// session, prompt later" sheet.
+#[tokio::test]
+async fn create_without_a_prompt_sends_none() {
+    let fake = FakeOpencode::start().await;
+    let created = source(&fake)
+        .create(create_request("/tmp/project", None))
+        .await
+        .expect("create");
+    assert_eq!(
+        fake.post_paths(),
+        vec!["/session"],
+        "exactly the create, and no prompt_async"
+    );
+    assert_eq!(created.prompt, LanePromptOutcome::None);
+    assert_eq!(created.session.activity, RcActivity::Idle);
+    // The new row is openable at once, through the same source.
+    let row = source(&fake)
+        .open(&created.session.id)
+        .await
+        .expect("open binds")
+        .session()
+        .await
+        .expect("the created session is there");
+    assert_eq!(row.id, created.session.id);
+    assert_clean(&fake);
+}
+
+/// A send that fails after the create is the CREATE's error — not swallowed
+/// into a `refused` outcome — exactly as before the split.
+#[tokio::test]
+async fn a_failed_first_prompt_fails_the_create() {
+    let fake = FakeOpencode::start().await;
+    fake.fail_post("/prompt_async", 500);
+    let err = source(&fake)
+        .create(create_request("/tmp/project", Some("hi")))
+        .await
+        .expect_err("the first prompt failed, so the create did");
+    assert!(matches!(err, LaneError::Failed(_)), "got {err:?}");
+    assert_eq!(
+        fake.post_paths().len(),
+        2,
+        "the session was created and the prompt was tried"
+    );
+}
+
+/// opencode offers one provider — itself — and says so; a create naming any
+/// other is refused before anything reaches the wire.
+#[tokio::test]
+async fn create_options_offer_opencode_alone_and_another_provider_is_refused() {
+    let fake = FakeOpencode::start().await;
+    let options = source(&fake)
+        .create_options()
+        .await
+        .expect("create options");
+    assert_eq!(options.providers.len(), 1);
+    let only = &options.providers[0];
+    assert_eq!(
+        (only.id.as_str(), only.label.as_str(), &only.state),
+        ("opencode", "opencode", &LaneProviderState::Ready)
+    );
+    assert_eq!(options.default_provider, None);
+    assert!(options.recent_dirs.is_empty());
+    assert!(fake.get_paths().is_empty(), "create options are not a poll");
+
+    let err = source(&fake)
+        .create(LaneCreateRequest {
+            provider: Some("grok".into()),
+            ..create_request("/tmp/project", None)
+        })
+        .await
+        .expect_err("grok is not opencode");
+    assert!(matches!(err, LaneError::BadRequest(_)), "got {err:?}");
+    assert!(fake.post_paths().is_empty(), "refused before the wire");
+    source(&fake)
+        .create(LaneCreateRequest {
+            provider: Some("opencode".into()),
+            ..create_request("/tmp/project", None)
+        })
+        .await
+        .expect("naming opencode itself is fine");
 }
 
 #[tokio::test]
 async fn a_failed_create_surfaces_failed() {
     let fake = FakeOpencode::start().await;
     fake.fail_post("/session", 500);
-    let err = client(&fake)
-        .create("/tmp/project", "hi")
+    let err = source(&fake)
+        .create(create_request("/tmp/project", Some("hi")))
         .await
         .expect_err("a 500 create cannot succeed");
     assert!(matches!(err, LaneError::Failed(_)), "got {err:?}");
@@ -225,8 +391,8 @@ async fn a_failed_prompt_surfaces_failed() {
     fake.add_session("ses_a", "a", "/w", None);
     fake.pin("ses_a");
     fake.fail_post("/prompt_async", 500);
-    let err = client(&fake)
-        .send("ses_a", "hi", SendMode::Queue)
+    let err = lane_on(&fake, "ses_a")
+        .send("hi", SendMode::Queue)
         .await
         .expect_err("a 500 prompt cannot succeed");
     assert!(matches!(err, LaneError::Failed(_)), "got {err:?}");
@@ -238,8 +404,8 @@ async fn interject_is_refused_rather_than_downgraded() {
     let fake = FakeOpencode::start().await;
     fake.add_session("ses_a", "a", "/w", None);
     fake.pin("ses_a");
-    let err = client(&fake)
-        .send("ses_a", "now", SendMode::Interject)
+    let err = lane_on(&fake, "ses_a")
+        .send("now", SendMode::Interject)
         .await
         .expect_err("opencode cannot interject");
     assert_eq!(err, LaneError::NotAccepting);
@@ -254,14 +420,11 @@ async fn interject_is_refused_rather_than_downgraded() {
 async fn the_verbs_address_only_the_pinned_session() {
     let fake = three_sessions().await;
     fake.add_permission("ses_a", "per_root", "bash", "ls");
-    let lane = client(&fake);
+    let lane = lane_on(&fake, "ses_a");
 
-    lane.send("ses_a", "go", SendMode::Queue)
-        .await
-        .expect("send");
-    lane.cancel("ses_a").await.expect("cancel");
+    lane.send("go", SendMode::Queue).await.expect("send");
+    lane.cancel().await.expect("cancel");
     lane.answer(
-        "ses_a",
         "per_root",
         LaneAnswer::Permission {
             decision: LaneDecision::AllowOnce,
@@ -299,7 +462,10 @@ async fn approvals_cover_the_root_and_its_child_never_a_sibling() {
         &["left", "right"],
     );
 
-    let open = client(&fake).approvals("ses_a").await.expect("approvals");
+    let open = lane_on(&fake, "ses_a")
+        .approvals()
+        .await
+        .expect("approvals");
     let ids: Vec<&str> = open.iter().map(|a| a.id.as_str()).collect();
     assert_eq!(ids, vec!["per_root", "per_child", "que_root"]);
 
@@ -328,9 +494,8 @@ async fn approvals_cover_the_root_and_its_child_never_a_sibling() {
 async fn answering_a_child_hits_the_childs_own_request_id() {
     let fake = three_sessions().await;
     fake.add_permission("ses_child", "per_child", "bash", "pwd");
-    client(&fake)
+    lane_on(&fake, "ses_a")
         .answer(
-            "ses_a",
             "per_child",
             LaneAnswer::Permission {
                 decision: LaneDecision::AllowAlways,
@@ -351,9 +516,8 @@ async fn a_question_answer_and_a_reject_take_their_own_routes() {
     let fake = three_sessions().await;
     fake.add_question("ses_a", "que_1", "Pick", "Which?", &["left"]);
     fake.add_question("ses_a", "que_2", "Pick", "Which?", &["left"]);
-    let lane = client(&fake);
+    let lane = lane_on(&fake, "ses_a");
     lane.answer(
-        "ses_a",
         "que_1",
         LaneAnswer::Question {
             answers: vec![vec!["left".to_string()]],
@@ -362,7 +526,7 @@ async fn a_question_answer_and_a_reject_take_their_own_routes() {
     )
     .await
     .expect("question answer");
-    lane.answer("ses_a", "que_2", LaneAnswer::Reject)
+    lane.answer("que_2", LaneAnswer::Reject)
         .await
         .expect("question reject");
     assert_eq!(
@@ -388,9 +552,9 @@ async fn free_text_is_appended_to_its_questions_answer_list() {
     let fake = three_sessions().await;
     // No `custom` key at all.
     fake.add_question("ses_a", "que_1", "Pick", "Which branch?", &["left"]);
-    let lane = client(&fake);
+    let lane = lane_on(&fake, "ses_a");
 
-    let approvals = lane.approvals("ses_a").await.expect("approvals");
+    let approvals = lane.approvals().await.expect("approvals");
     let asked = approvals
         .iter()
         .find(|a| a.id == "que_1")
@@ -401,7 +565,6 @@ async fn free_text_is_appended_to_its_questions_answer_list() {
     );
 
     lane.answer(
-        "ses_a",
         "que_1",
         LaneAnswer::Question {
             answers: vec![vec!["left".to_string()]],
@@ -437,9 +600,9 @@ async fn free_text_on_a_question_that_refuses_it_never_reaches_the_wire() {
         &["left"],
         Some(false),
     );
-    let lane = client(&fake);
+    let lane = lane_on(&fake, "ses_a");
 
-    let approvals = lane.approvals("ses_a").await.expect("approvals");
+    let approvals = lane.approvals().await.expect("approvals");
     let asked = approvals
         .iter()
         .find(|a| a.id == "que_1")
@@ -448,7 +611,6 @@ async fn free_text_on_a_question_that_refuses_it_never_reaches_the_wire() {
 
     let err = lane
         .answer(
-            "ses_a",
             "que_1",
             LaneAnswer::Question {
                 answers: vec![vec![]],
@@ -473,9 +635,8 @@ async fn free_text_on_a_question_that_refuses_it_never_reaches_the_wire() {
 async fn more_free_text_than_questions_is_refused_before_the_wire() {
     let fake = three_sessions().await;
     fake.add_question("ses_a", "que_1", "Pick", "Which branch?", &["left"]);
-    let err = client(&fake)
+    let err = lane_on(&fake, "ses_a")
         .answer(
-            "ses_a",
             "que_1",
             LaneAnswer::Question {
                 answers: vec![],
@@ -494,29 +655,24 @@ async fn basic_auth_is_honored_and_its_absence_is_unauthorized() {
     let fake = FakeOpencode::start_with_auth("opencode", "hunter2").await;
     fake.add_session("ses_a", "a", "/w", None);
 
-    let anonymous = client(&fake);
+    let anonymous = lane_on(&fake, "ses_a");
     assert_eq!(
-        anonymous
-            .session("ses_a")
-            .await
-            .expect_err("no credentials"),
+        anonymous.session().await.expect_err("no credentials"),
         LaneError::Unauthorized
     );
     assert_eq!(
         anonymous
-            .subscribe("ses_a", None)
+            .subscribe(None)
             .await
             .err()
             .expect("subscribe demands the same credentials"),
         LaneError::Unauthorized
     );
 
-    let authed = OpencodeClient::new(fake.base_url(), Some(BasicAuth::password("hunter2")))
-        .expect("the client builds");
-    assert_eq!(
-        authed.session("ses_a").await.expect("authorized").id,
-        "ses_a"
-    );
+    let authed = OpencodeSource::new(fake.base_url(), Some(BasicAuth::password("hunter2")))
+        .expect("the source builds")
+        .lane("ses_a");
+    assert_eq!(authed.session().await.expect("authorized").id, "ses_a");
     assert_clean(&fake);
 }
 
@@ -533,12 +689,13 @@ async fn every_lane_error_variant_is_reachable() {
             .expect("a throwaway port");
         let addr = socket.local_addr().expect("its address");
         drop(socket);
-        OpencodeClient::new(format!("http://{addr}/").parse().expect("url"), None)
-            .expect("the client builds")
+        OpencodeSource::new(format!("http://{addr}/").parse().expect("url"), None)
+            .expect("the source builds")
+            .lane("ses_a")
     };
     assert!(
         matches!(
-            dead.session("ses_a").await.expect_err("nothing to dial"),
+            dead.session().await.expect_err("nothing to dial"),
             LaneError::Unavailable(_)
         ),
         "a refused dial is quiet, not a Failed"
@@ -549,12 +706,13 @@ async fn every_lane_error_variant_is_reachable() {
     fake.add_permission("ses_a", "per_gone", "bash", "ls");
     fake.add_permission("ses_a", "per_bad", "bash", "ls");
     fake.add_permission("ses_a", "per_busy", "bash", "ls");
-    let lane = client(&fake);
+    let lane = lane_on(&fake, "ses_a");
 
     // Unauthorized has its own test (it needs an auth-demanding fake).
     // UnknownSession: an id the server does not have.
     assert_eq!(
-        lane.session("ses_missing")
+        lane_on(&fake, "ses_missing")
+            .session()
             .await
             .expect_err("no such session"),
         LaneError::UnknownSession
@@ -565,7 +723,6 @@ async fn every_lane_error_variant_is_reachable() {
     fake.fail_post("/permission/per_gone/reply", 404);
     assert_eq!(
         lane.answer(
-            "ses_a",
             "per_gone",
             LaneAnswer::Permission {
                 decision: LaneDecision::Reject
@@ -580,7 +737,6 @@ async fn every_lane_error_variant_is_reachable() {
     fake.fail_post("/permission/per_bad/reply", 400);
     assert_eq!(
         lane.answer(
-            "ses_a",
             "per_bad",
             LaneAnswer::Permission {
                 decision: LaneDecision::Reject
@@ -595,7 +751,6 @@ async fn every_lane_error_variant_is_reachable() {
     fake.fail_post("/permission/per_busy/reply", 409);
     assert_eq!(
         lane.answer(
-            "ses_a",
             "per_busy",
             LaneAnswer::Permission {
                 decision: LaneDecision::Reject
@@ -611,7 +766,6 @@ async fn every_lane_error_variant_is_reachable() {
     // while the first is still IN FLIGHT is `AlreadySubmitted`, which is what
     // the concurrent pair below exercises.
     lane.answer(
-        "ses_a",
         "per_root",
         LaneAnswer::Permission {
             decision: LaneDecision::AllowOnce,
@@ -621,7 +775,6 @@ async fn every_lane_error_variant_is_reachable() {
     .expect("the first answer lands");
     assert_eq!(
         lane.answer(
-            "ses_a",
             "per_root",
             LaneAnswer::Permission {
                 decision: LaneDecision::AllowOnce
@@ -636,7 +789,7 @@ async fn every_lane_error_variant_is_reachable() {
     fake.fail_post("/abort", 500);
     assert!(
         matches!(
-            lane.cancel("ses_a").await.expect_err("a 500"),
+            lane.cancel().await.expect_err("a 500"),
             LaneError::Failed(_)
         ),
         "a 5xx is the loud residue"
@@ -650,7 +803,7 @@ async fn every_lane_error_variant_is_reachable() {
 async fn a_double_tap_while_the_answer_is_in_flight_is_already_submitted() {
     let fake = three_sessions().await;
     fake.add_permission("ses_a", "per_root", "bash", "ls");
-    let lane = client(&fake);
+    let lane = lane_on(&fake, "ses_a");
     // Park the first answer INSIDE the fake, so "in flight" is a condition the
     // test stands on rather than a race it hopes to win.
     fake.hold_post("/permission/per_root/reply");
@@ -658,7 +811,6 @@ async fn a_double_tap_while_the_answer_is_in_flight_is_already_submitted() {
         let lane = lane.clone();
         tokio::spawn(async move {
             lane.answer(
-                "ses_a",
                 "per_root",
                 LaneAnswer::Permission {
                     decision: LaneDecision::AllowOnce,
@@ -674,7 +826,6 @@ async fn a_double_tap_while_the_answer_is_in_flight_is_already_submitted() {
 
     assert_eq!(
         lane.answer(
-            "ses_a",
             "per_root",
             LaneAnswer::Permission {
                 decision: LaneDecision::AllowOnce
@@ -784,8 +935,8 @@ async fn an_id_with_a_slash_cannot_re_address_the_request() {
     //
     // The id is untrusted input — it arrives from a remote roost tab — so it is
     // percent-encoded into ONE path segment rather than pasted into the path.
-    let err = client(&fake)
-        .send("ses_a/../ses_b", "hi", SendMode::Queue)
+    let err = lane_on(&fake, "ses_a/../ses_b")
+        .send("hi", SendMode::Queue)
         .await
         .expect_err("the fake has no such session");
     assert_eq!(
@@ -808,8 +959,8 @@ async fn a_held_request_is_observable_before_it_answers() {
     let fake = FakeOpencode::start().await;
     fake.add_session("ses_a", "a", "/w", None);
     fake.hold_get("/session/ses_a/message");
-    let lane = client(&fake);
-    let pending = tokio::spawn(async move { lane.history("ses_a", None, 10).await });
+    let lane = lane_on(&fake, "ses_a");
+    let pending = tokio::spawn(async move { lane.history(None, 10).await });
     wait_for("the held GET to be recorded", || {
         fake.get_paths()
             .iter()
@@ -840,7 +991,7 @@ async fn a_parent_cycle_terminates_the_descendant_walk() {
     fake.add_permission("ses_b", "per_b", "bash", "ls");
     fake.pin("ses_a");
 
-    let open = tokio::time::timeout(Duration::from_secs(15), client(&fake).approvals("ses_a"))
+    let open = tokio::time::timeout(Duration::from_secs(15), lane_on(&fake, "ses_a").approvals())
         .await
         .expect("the walk terminated on a cycle instead of looping")
         .expect("approvals");
@@ -872,7 +1023,10 @@ async fn the_descendant_walk_stops_at_the_depth_bound() {
     }
     fake.pin("ses_0");
 
-    let open = client(&fake).approvals("ses_0").await.expect("approvals");
+    let open = lane_on(&fake, "ses_0")
+        .approvals()
+        .await
+        .expect("approvals");
     let ids: Vec<String> = open.iter().map(|a| a.id.clone()).collect();
     assert_eq!(
         ids.len(),
@@ -904,8 +1058,8 @@ async fn the_descendant_walk_stops_at_the_total_bound() {
     }
     fake.pin("ses_root");
 
-    let open = client(&fake)
-        .approvals("ses_root")
+    let open = lane_on(&fake, "ses_root")
+        .approvals()
         .await
         .expect("approvals");
     assert_eq!(
@@ -936,8 +1090,8 @@ async fn an_oversized_rest_body_is_refused_from_its_declared_length() {
     fake.add_session("ses_a", "a", "/w", None);
     fake.flood_get("/session/ses_a/message", MAX_REST_BYTES * 8, true);
 
-    let err = client(&fake)
-        .history("ses_a", None, 10)
+    let err = lane_on(&fake, "ses_a")
+        .history(None, 10)
         .await
         .expect_err("an over-cap body is not a transcript");
     match &err {
@@ -968,8 +1122,8 @@ async fn an_oversized_close_delimited_body_is_refused_while_it_is_consumed() {
     fake.add_session("ses_a", "a", "/w", None);
     fake.flood_get("/session/ses_a/message", MAX_REST_BYTES + (1 << 20), false);
 
-    let err = client(&fake)
-        .history("ses_a", None, 10)
+    let err = lane_on(&fake, "ses_a")
+        .history(None, 10)
         .await
         .expect_err("an over-cap body is not a transcript");
     match &err {
@@ -991,7 +1145,7 @@ async fn an_oversized_close_delimited_body_is_refused_while_it_is_consumed() {
 async fn a_cancelled_answer_releases_its_claim_so_a_retry_is_accepted() {
     let fake = three_sessions().await;
     fake.add_permission("ses_a", "per_root", "bash", "ls");
-    let lane = client(&fake);
+    let lane = lane_on(&fake, "ses_a");
 
     // Park the POST inside the fake, so "mid-request" is a condition the test
     // stands on rather than a race it hopes to win.
@@ -1000,7 +1154,6 @@ async fn a_cancelled_answer_releases_its_claim_so_a_retry_is_accepted() {
         let lane = lane.clone();
         tokio::spawn(async move {
             lane.answer(
-                "ses_a",
                 "per_root",
                 LaneAnswer::Permission {
                     decision: LaneDecision::AllowOnce,
@@ -1024,7 +1177,6 @@ async fn a_cancelled_answer_releases_its_claim_so_a_retry_is_accepted() {
 
     fake.release_post("/permission/per_root/reply");
     lane.answer(
-        "ses_a",
         "per_root",
         LaneAnswer::Permission {
             decision: LaneDecision::AllowOnce,
@@ -1351,8 +1503,8 @@ async fn the_answer_matrix_resolves_the_approval_it_was_addressed_to() {
                     }
                 };
                 let case = format!("{} × {} × {placement:?}", shape.label, kind.as_str());
-                let got = client(&fake)
-                    .answer("ses_a", &id, shape.answer.clone())
+                let got = lane_on(&fake, "ses_a")
+                    .answer(&id, shape.answer.clone())
                     .await;
                 check(&case, got, &expect, &fake);
             }
@@ -1370,9 +1522,8 @@ async fn an_answer_of_the_right_shape_can_still_name_something_that_was_not_offe
     let (fake, id) = placed(Placement::Root, &LaneApprovalKind::Permission).await;
     check(
         "choice{nope} × permission",
-        client(&fake)
+        lane_on(&fake, "ses_a")
             .answer(
-                "ses_a",
                 &id,
                 LaneAnswer::Choice {
                     option_id: "nope".to_string(),
@@ -1389,9 +1540,8 @@ async fn an_answer_of_the_right_shape_can_still_name_something_that_was_not_offe
     let (fake, id) = placed(Placement::Root, &LaneApprovalKind::Question).await;
     check(
         "choice{left} × question",
-        client(&fake)
+        lane_on(&fake, "ses_a")
             .answer(
-                "ses_a",
                 &id,
                 LaneAnswer::Choice {
                     option_id: "left".to_string(),
@@ -1410,9 +1560,8 @@ async fn an_answer_of_the_right_shape_can_still_name_something_that_was_not_offe
     let (fake, id) = placed(Placement::Root, &LaneApprovalKind::Permission).await;
     check(
         "raw{not json} × permission",
-        client(&fake)
+        lane_on(&fake, "ses_a")
             .answer(
-                "ses_a",
                 &id,
                 LaneAnswer::Raw {
                     json: "not json".to_string(),

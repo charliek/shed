@@ -1193,11 +1193,11 @@ shed ssh-config --uninstall           # Remove managed block
 ### shed roost-provider
 
 Implements [roost's](https://github.com/charliek/roost) provider contract so
-roost's own command palette can start an agent — `claude`, `codex`, `cursor`,
-`opencode`, `gx`, or `grok` — on a running shed or a `machines:` entry in
-`~/.shed/config.yaml`, opened as a tab in that host's own `roost-session`. See
-`docs/extensions/roost-provider.md` for the full walkthrough; this is the
-reference for the flags and phases.
+roost's own command palette can start an agent — `claude` or `opencode` — on a
+running shed or a `machines:` entry in `~/.shed/config.yaml`, opened as a tab
+in that host's own `roost-session`. Every other agent is started through
+craze instead. See `docs/extensions/roost-provider.md` for the full
+walkthrough; this is the reference for the flags and phases.
 
 ```bash
 shed roost-provider [list|activate] [flags]

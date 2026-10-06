@@ -1,12 +1,14 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 
 import type { AgentsEmptyState, AgentsLoad } from "@/lib/agentsEmpty";
+import type { CrazeCreateOptions } from "@/lib/crazeCreate";
+import { killTarget } from "@/lib/crazeRows";
 
 export type Pane = "sheds" | "machines" | "approvals" | "agents" | "activity" | "egress" | "system";
 
 /** Which modal (if any) is open — reported so the harness can drive + assert it.
  *  (Preferences is a dedicated window, not a modal — see `reportPrefs`.) */
-export type Modal = null | "create" | "launch" | "machine";
+export type Modal = null | "create" | "launch" | "machine" | "craze";
 
 const PANES: readonly Pane[] = ["sheds", "machines", "approvals", "agents", "activity", "egress", "system"];
 
@@ -834,14 +836,17 @@ export function useNowTick(intervalMs = 1000): number {
 // The known kinds, plus `(string & {})` so an UNKNOWN kind from a newer/other tool
 // keeps its raw string (the unknown-kind policy) instead of failing the type — it
 // renders neutrally and is never offered for creation.
-/** The agent kinds this build names. The first six mirror the guest's tmux/RC
- *  registry; `gx` and `grok` are roost-only row kinds (plan 017 §3.2) — an agent
- *  shed can SEE in somebody's roost tab, with no guest producer. `gx` is `grok`
- *  with a live remote lane behind it, which is a promotion roost never makes and
- *  `RoostSession::agent_kind` does. */
+/** The agent kinds this build names. `claude-rc`/`opencode`/`shell` mirror the
+ *  guest's tmux/RC registry. `codex`, `cursor`, `gx` and `grok` — the
+ *  direct-agent and roost-only row kinds — left this build in plan 025
+ *  (shed#390): a roost tab running one of them directly renders as a plain
+ *  `(string & {})` row with no typed affordances. `craze` is the one
+ *  addition — the lane craze provides for every other agent (plan 025, D1);
+ *  it is not creatable through roost's own launch form (craze's own create
+ *  sheet is that surface). */
 export type RcKind =
-  | "claude-rc" | "codex" | "opencode" | "cursor" | "shell"
-  | "gx" | "grok"
+  | "claude-rc" | "opencode" | "shell"
+  | "craze"
   | (string & {});
 export type RcState =
   | "starting" | "ready" | "reconnecting" | "needs-trust" | "needs-auth" | "dead";
@@ -897,21 +902,19 @@ export function capabilitiesFor(list: Pick<RcListResult, "capabilities">, s: RcS
   return s.origin ? list.capabilities[s.origin] : undefined;
 }
 
-/** The kinds a create form can offer (broker is URL-driven; unknown never creatable).
- *  Mirrors `RcKind::creatable`. `grok` is creatable and LANE-LESS by design — it
- *  gets a status row and no transcript; a `grok` tab that binds its remote lane
- *  is reported as `gx` on the next snapshot and gains one. */
-export const RC_CREATABLE_KINDS: RcKind[] =
-  ["claude-rc", "codex", "opencode", "cursor", "gx", "grok", "shell"];
+/** The kinds a create form can offer (broker is URL-driven; `craze` is craze's
+ *  own create sheet's job, not this launch form; unknown never creatable).
+ *  Mirrors `RcKind::creatable`. */
+export const RC_CREATABLE_KINDS: RcKind[] = ["claude-rc", "opencode", "shell"];
 
 /** The tool token a kind's agent maps to under capabilities.agents (undefined = no
- *  agent, e.g. shell). Mirrors `RcKind::tool`. */
+ *  agent, e.g. shell). `craze` has its own token (P2) — it still gates on an
+ *  installed agent entry through this generic mechanism, even though craze's
+ *  own protocol is what states a PROVIDER's availability (D5). Mirrors
+ *  `RcKind::tool`. */
 const RC_KIND_TOOL: Record<string, string | undefined> = {
   "claude-rc": "claude",
-  codex: "codex", opencode: "opencode", cursor: "cursor", shell: undefined,
-  // Both roost-only kinds carry their own tool token, and `roost_capabilities`
-  // reports both installed — the same trade-off it already makes for the four.
-  gx: "gx", grok: "grok",
+  opencode: "opencode", shell: undefined, craze: "craze",
 };
 
 /** The launch UI's gated kind list: the creatable kinds whose backing agent the
@@ -966,7 +969,27 @@ export type RcSession = {
   activity?: string | null;
   activity_at?: string | null;
   last_message?: string | null;
-  pending_approvals?: RcFeedApproval[] | null;
+  /** A roost row's open approvals, when a feed carries them (none does today);
+   *  a CRAZE row's open-ask COUNT (`pendingAsks`, plan 025 §3.6.3). Read it
+   *  through the row's `source` — the two are different facts. */
+  pending_approvals?: RcFeedApproval[] | number | null;
+  /** Which feed produced this row: `"roost"` (a roost tab) or `"craze"` (a
+   *  machine's craze hub roster, plan 025 §3.6.3 — the hub row IS the row for
+   *  a craze session, and a roost tab craze owns folds into it). */
+  source?: "roost" | "craze" | string | null;
+  /** The craze roster's own facts (plan 025 §3.6.3), on a craze row only. */
+  provider?: string | null;
+  model?: string | null;
+  doing?: string | null;
+  head_ask_summary?: string | null;
+  last_reply?: string | null;
+  attached?: number | null;
+  start_error?: string | null;
+  permission_mode?: string | null;
+  provider_session_id?: string | null;
+  /** The row's facts came from a cheap or stale read — rendered as "last
+   *  known". Every row of a craze source that is not live has it. */
+  approximate?: boolean | null;
   /** Where this session was reached FROM — `machine:<name>` or `<host>/<shed>`.
    *  Injected client-side by the backend (like `host`/`shed` already are), never
    *  a wire field, so the hub contract and shed-mobile's DTOs are untouched.
@@ -990,7 +1013,9 @@ export type RcSession = {
    *  would leave a card stuck demanding attention forever. */
   attention?: boolean;
   /** The roost tab id backing a machine row (a string — roost's own ids are
-   *  strings on the wire); absent for a shed session. */
+   *  strings on the wire); absent for a shed session. On a CRAZE row it is the
+   *  roost tab the merge attached to the session (plan 025 §3.6.3) — what its
+   *  End tab closes — and absent for a headless one. */
   tab_id?: string;
   /** The agent lane behind this row, if it has one (plan 015 §3.4). Stamped
    *  client-side like `origin`/`machine`, from what the tab's adapter reported.
@@ -1014,15 +1039,30 @@ export type RcSession = {
  *  Its PRESENCE is the capability signal: a row that has it gets a Transcript
  *  affordance, a row that does not gets none. */
 export type AgentLane = {
-  /** Which adapter speaks to it — `"opencode"` or `"gx"` today. The backend
+  /** Which adapter speaks to it — `"opencode"` or `"craze"`. The backend
    *  dispatches on this string and refuses one it has no adapter for by name
    *  (`unsupported_lane`), so a kind stamped by a newer core than the binary
-   *  reading it is a visible refusal rather than a silent blank panel. */
+   *  reading it is a visible refusal rather than a silent blank panel. Every
+   *  `lane.*` op takes it: a craze hostId and an opencode session id are
+   *  different namespaces (plan 025 §3.6.4). */
   kind: string;
   /** The AGENT's own session id — the address every `lane.*` op takes, and not
-   *  the roost tab id (`tab_id` / `slug`). */
+   *  the roost tab id (`tab_id` / `slug`). A craze row's is its hostId. */
   session_id: string;
-  server_url: string;
+  /** The reported loopback URL — roost-stamped lanes only; a craze lane is
+   *  reached through its machine's hub, not a URL. */
+  server_url?: string;
+};
+
+/** A host's craze source, as `rc.list`'s `machines[].craze` reports it (plan
+ *  025 §3.6.2). `absent` is "never reached" and "not installed" alike; `cause`
+ *  names an offline (or not-installed) state's class (`too_old`,
+ *  `unreachable`, …). */
+export type CrazeStatus = {
+  state: "live" | "dormant" | "offline" | "absent" | string;
+  cause?: string | null;
+  create: boolean;
+  create_options: boolean;
 };
 
 /** A configured machine's health, for the sessions view's group rows. A machine
@@ -1039,6 +1079,8 @@ export type MachineStatus = {
   /** Why it is unreachable, verbatim from the watcher: "no route to host" and
    *  "nothing is listening on 1029" are different problems. */
   detail?: string | null;
+  /** This host's craze source (plan 025 §3.6.2). */
+  craze?: CrazeStatus | null;
 };
 
 /** The `rc.list` result: live sessions (shed AND machine), the per-shed
@@ -1131,6 +1173,41 @@ export async function machineLaunch(fields: MachineLaunchFields): Promise<RcSess
   return core.invoke<RcSession>("machine_launch", fields);
 }
 
+export type RoostRunFields = {
+  /** A machine's bare name, or a shed's `roost:<server>/<shed>` — the same
+   *  address a row's `machine` field carries. */
+  target: string;
+  /** The command line. REQUIRED: blank is refused (it is not a plain shell). */
+  command: string;
+  workdir?: string;
+};
+
+/** What `roost_run` answers: the tab roost opened, addressed the way a row for
+ *  it would be, plus the argv the command was split into. NOT a row — a tab
+ *  nobody owns is not a session, so the row (if any) is the one roost goes on
+ *  to report. */
+export type RoostRunResult = {
+  origin: string;
+  machine: string;
+  slug: string;
+  cwd: string;
+  argv: string[];
+};
+
+/** "Run a command in a tab" (plan 025 P5) — a roost `tab.open` running
+ *  `command` on a machine or a shed, gated by NO kind: the launch dialog's
+ *  "Run a command" mode. THROWS on error, like [machineLaunch].
+ *
+ *  The command is split on ASCII whitespace into the argv, verbatim — no shell,
+ *  no quoting: `codex --model x` works, a quoted argument does not. The split is
+ *  the backend's (`RunCommand::parse`), shared with the `roost.run` socket op,
+ *  so this wrapper sends the line as typed rather than splitting it a second
+ *  way. */
+export async function roostRun(fields: RoostRunFields): Promise<RoostRunResult> {
+  const core = await import("@tauri-apps/api/core");
+  return core.invoke<RoostRunResult>("roost_run", fields);
+}
+
 /** One machine's RC capabilities, or null when its engine is too old to say.
  *  Probed on demand by the launch dialog — a machine that was asleep at startup
  *  must not be stuck with whatever the first probe found. THROWS if the machine
@@ -1167,10 +1244,16 @@ export async function rcKillMachine(machine: string, slug: string): Promise<void
  *  ADDRESS the row carries (`machine`, which is a machine's bare name and a
  *  shed's `roost:<server>/<shed>` token), so the one entry point a card uses
  *  needs no origin special-case at all. `rcKill`'s `(host, shed, slug)` door is
- *  the fallback for a payload too old to stamp an address. */
+ *  the fallback for a payload too old to stamp an address.
+ *
+ *  **A craze row's End tab closes its TAB**, by the typed `tab_id` — never by
+ *  its slug, which is a craze hostId (plan 025 §3.6.5). The rule is
+ *  `crazeRows.ts`'s `killTarget`, pinned on node's test runner. */
 export async function killSession(s: RcSession): Promise<void> {
-  if (s.machine) return rcKillMachine(s.machine, s.slug);
-  return rcKill(s.shed, s.slug, s.host);
+  const target = killTarget(s);
+  if (!target) throw new Error("this session has no tab to end");
+  if (target.via === "machine") return rcKillMachine(target.machine, target.slug);
+  return rcKill(target.shed, target.slug, target.host);
 }
 
 /** The Agents pane's empty state — the title, the sentence, and the offer beside
@@ -1191,8 +1274,19 @@ export { agentsEmptyState } from "@/lib/agentsEmpty";
  *  card's `rendered` was added to prevent. This cannot claim a field the dialog
  *  does not show, which is exactly the property under test: since S6 there is no
  *  initial-prompt box, because nothing would deliver what was typed into it
- *  (`charliek/shed#366`). */
-export type LaunchDialogDump = { rendered: string };
+ *  (`charliek/shed#366`). `values` and `create_enabled` (plan 025 C3, the "Run a
+ *  command" mode) keep that rule: both are read off the same mounted DOM, never
+ *  restated from React state. */
+export type LaunchDialogDump = {
+  rendered: string;
+  /** Each labelled control's current value, keyed by its label ("Where",
+   *  "Working directory", "Command", …) — read back off the DOM
+   *  (`renderedValues`), because what a person TYPED is not in `rendered`. */
+  values: Record<string, string>;
+  /** Whether the Create button can be pressed — the button's own `disabled`
+   *  attribute, read off the DOM. */
+  create_enabled: boolean;
+};
 
 /** Report the launch dialog's rendered copy, or `null` to clear it on unmount.
  *
@@ -1221,6 +1315,9 @@ export type MachinePaneRow = {
   status: string;
   detail: string;
   sessions: string[];
+  /** The craze note the card renders (`crazeMachineNote`) — "too old",
+   *  or `null` when it says nothing (plan 025 §3.6.5). */
+  craze_note?: string | null;
   /** The card's roost sub-line, as rendered (plan 019 §3.6/C8) —
    *  `RoostDumpRow` from `@/lib/roost`, kept as `unknown` here so this module
    *  doesn't need to import roost's types just to describe its shape. */
@@ -1322,14 +1419,34 @@ export type LaneMessage = {
 
 /** The staged-then-swapped view `lane.messages` answers with. `generation` is
  *  the generation of the rows being handed back (it moves when a reseed
- *  COMPLETES), and `stale` is the reason a `Down` gave — non-null means the last
- *  good generation is still on screen and the feed behind it is not live. That is
- *  the contract's "consume" posture: keep rendering, say so, don't blank. */
+ *  COMPLETES), and `stale` is the banner — the reason a `Stale` or a `Down` gave;
+ *  non-null means the last good generation is still on screen and the feed behind
+ *  it is not live. That is the contract's "consume" posture: keep rendering, say
+ *  so, don't blank.
+ *
+ *  `ended` is a DIFFERENT fact (plan 025 §3.2.4): `true` only after a `Down` —
+ *  the subscription is over — where `stale` alone can be a lane that is
+ *  reconnecting on its own and must not be reopened.
+ *
+ *  `capabilities` and `settings` are the LIVE generation's, staged and swapped
+ *  in with its rows: what this session can do, read HERE and nowhere else (not
+ *  from `lane.open`, which no longer carries them). `null` until a seed carrying
+ *  them has completed; `settings` stays `null` on a session with none to show.
+ *
+ *  `session` is the live generation's session ROW — the stream's latest, `null`
+ *  until a seed has swapped one in — and the row the panel's header reads once
+ *  it is there (`laneHeader`). `lane.open`'s row is the one the lane was opened
+ *  with and never changes while it stays open: for a session the create sheet
+ *  opened at once, the create's own row, with no permission mode. */
 export type LaneView = {
   messages: LaneMessage[];
   activity: string;
+  session: LaneSessionRow | null;
   generation: number;
   stale: string | null;
+  ended: boolean;
+  capabilities: LaneCapabilities | null;
+  settings: LaneSettings | null;
 };
 
 /** One button an approval offers, exactly as the agent offered it.
@@ -1387,7 +1504,9 @@ export type LaneApproval = {
   created_at_unix_ms?: number | null;
 };
 
-/** The agent session behind a lane (`shed_core::lane::LaneSession`). */
+/** The agent session behind a lane (`shed_core::lane::LaneSession`). The
+ *  fields after `last_change_unix_ms` are a craze roster row's facts (plan 025)
+ *  and are absent from an opencode row. */
 export type LaneSessionRow = {
   id: string;
   title: string;
@@ -1397,19 +1516,71 @@ export type LaneSessionRow = {
   approximate: boolean;
   parent_id?: string | null;
   last_change_unix_ms?: number | null;
+  provider?: string | null;
+  model?: string | null;
+  doing?: string | null;
+  head_ask_summary?: string | null;
+  last_reply?: string | null;
+  since_unix_ms?: number | null;
+  attached?: number | null;
+  start_error?: string | null;
+  provider_session_id?: string | null;
+  permission_mode?: string | null;
+  tab_id?: number | null;
 };
 
-/** What the adapter behind a lane can do (`lane.open`'s second half). */
+/** What THIS SESSION can do (`shed_core::lane::LaneCapabilities`) — per session,
+ *  riding the lane's stream, and read from `lane.messages`' `capabilities`
+ *  (plan 025 §3.2). `create` left this type: creating is a machine-level act. */
 export type LaneCapabilities = {
   kind: string;
   interject: boolean;
-  create: boolean;
   cancel: boolean;
   approvals: boolean;
   history_cursor: boolean;
+  settings: boolean;
+  stop: boolean;
 };
 
-export type LaneOpened = { session: LaneSessionRow; capabilities: LaneCapabilities };
+/** One selectable value — a model, a mode, an option's value
+ *  (`shed_core::lane::LaneChoice`). `id` is what a change sends back. */
+export type LaneChoice = { id: string; name: string; rank?: number | null; description?: string | null };
+
+/** One of a model's own options (`shed_core::lane::LaneSetting`): its current
+ *  value and the values it offers. `category` is an open string. */
+export type LaneSetting = { id: string; name: string; category: string; current: string; values: LaneChoice[] };
+
+/** How full a session's context is (`shed_core::lane::LaneUsage`). */
+export type LaneUsage = { context_tokens?: number | null; context_window?: number | null };
+
+/** A session's settings, rendered generically (`shed_core::lane::LaneSettings`):
+ *  the model and the models, the mode and the modes, the model's own options,
+ *  and how full its context is. */
+export type LaneSettings = {
+  model?: string | null;
+  models: LaneChoice[];
+  mode?: string | null;
+  modes: LaneChoice[];
+  options: LaneSetting[];
+  usage?: LaneUsage | null;
+};
+
+/** One change to a session's settings (`shed_core::lane::LaneSettingChange`,
+ *  `lane_set`'s `change`): a model or a mode by its id, or one of the current
+ *  model's options by its id and value — every id as `LaneSettings` offered it,
+ *  verbatim — and, on an option, `for_model`: the model the client DISPLAYED it
+ *  for (plan 025 Amendment A13). Strict on the backend: a shape it cannot name
+ *  is `bad_request`. */
+export type LaneSettingChange =
+  | { kind: "model"; id: string }
+  | { kind: "mode"; id: string }
+  | { kind: "config"; id: string; value: string; for_model?: string };
+
+/** `lane.open`'s answer: the session row alone — the row as the source listed
+ *  it at the open, re-answered unchanged while the lane stays open. What the
+ *  session can do is the view's (`LaneView.capabilities`), not the open's; and
+ *  once a seed has swapped in, so is the row (`LaneView.session`). */
+export type LaneOpened = { session: LaneSessionRow };
 
 /** The four forms `lane.answer` accepts (`lane::parse_answer`). Exactly one key
  *  per answer — naming two is a `bad_request`.
@@ -1433,11 +1604,11 @@ export type LaneAnswer =
   | { question: string[][]; custom_text?: (string | null)[] }
   | { reject: true };
 
-/** `{machine, session_id, event}` — the Tauri `lane-event` payload. The panel
- *  only reads the address (it re-reads the staged view rather than folding
- *  frames itself, so what it renders is the same truth `lane.messages` answers
- *  with), which is why `event` stays `unknown`. */
-export type LaneEventEnvelope = { machine?: unknown; session_id?: unknown; event?: unknown };
+/** `{machine, kind, session_id, event}` — the Tauri `lane-event` payload. The
+ *  panel only reads the address (it re-reads the staged view rather than
+ *  folding frames itself, so what it renders is the same truth `lane.messages`
+ *  answers with), which is why `event` stays `unknown`. */
+export type LaneEventEnvelope = { machine?: unknown; kind?: unknown; session_id?: unknown; event?: unknown };
 
 /** The Tauri event every lane frame arrives on (`lane::LANE_EVENT`). */
 export const LANE_EVENT = "lane-event";
@@ -1462,6 +1633,9 @@ export class LaneFailure extends Error {
 const LANE_CODE = /^[a-z][a-z_]*$/;
 
 export function laneFailure(e: unknown): LaneFailure {
+  // Already recovered (a wrapper threw one): its message no longer carries the
+  // code, so splitting it again would turn the code into `failed`.
+  if (e instanceof LaneFailure) return e;
   const raw = typeof e === "string" ? e : e instanceof Error ? e.message : String(e);
   const cut = raw.indexOf(": ");
   const code = cut > 0 ? raw.slice(0, cut) : "";
@@ -1489,46 +1663,83 @@ async function laneInvoke<T>(cmd: string, args: Record<string, unknown>): Promis
 /** Start (or re-answer) a live transcript. Idempotent: a second call for an
  *  already-open lane re-answers from the entry, it does not open a second
  *  subscription. */
-export async function laneOpen(machine: string, sessionId: string): Promise<LaneOpened> {
-  return laneInvoke<LaneOpened>("lane_open", { machine, sessionId });
+export async function laneOpen(machine: string, kind: string, sessionId: string): Promise<LaneOpened> {
+  return laneInvoke<LaneOpened>("lane_open", { machine, kind, sessionId });
 }
 
-export async function laneMessages(machine: string, sessionId: string): Promise<LaneView> {
-  return laneInvoke<LaneView>("lane_messages", { machine, sessionId });
+export async function laneMessages(machine: string, kind: string, sessionId: string): Promise<LaneView> {
+  return laneInvoke<LaneView>("lane_messages", { machine, kind, sessionId });
 }
 
-export async function laneApprovals(machine: string, sessionId: string): Promise<LaneApproval[]> {
-  const r = await laneInvoke<{ approvals?: LaneApproval[] }>("lane_approvals", { machine, sessionId });
+export async function laneApprovals(machine: string, kind: string, sessionId: string): Promise<LaneApproval[]> {
+  const r = await laneInvoke<{ approvals?: LaneApproval[] }>("lane_approvals", { machine, kind, sessionId });
   return r.approvals ?? [];
 }
 
 /** Send a prompt. `mode` defaults to `queue`; `interject` is REFUSED by the
  *  opencode adapter (`capabilities.interject` is false) rather than silently
  *  downgraded, so a caller that passes it gets `not_accepting`. */
-export async function laneSend(machine: string, sessionId: string, text: string, mode?: string): Promise<void> {
-  await laneInvoke("lane_send", { machine, sessionId, text, mode });
+export async function laneSend(
+  machine: string,
+  kind: string,
+  sessionId: string,
+  text: string,
+  mode?: string,
+): Promise<void> {
+  await laneInvoke("lane_send", { machine, kind, sessionId, text, mode });
 }
 
-export async function laneCancel(machine: string, sessionId: string): Promise<void> {
-  await laneInvoke("lane_cancel", { machine, sessionId });
+export async function laneCancel(machine: string, kind: string, sessionId: string): Promise<void> {
+  await laneInvoke("lane_cancel", { machine, kind, sessionId });
+}
+
+/** End the SESSION (plan 025 §3.6.4) — craze's `session.stop`. Answered on
+ *  craze's receipt; the lane ends, and the row leaves, when the session closes.
+ *  The panel offers it only when the session's capabilities say `stop`. */
+export async function laneStop(machine: string, kind: string, sessionId: string): Promise<void> {
+  await laneInvoke("lane_stop", { machine, kind, sessionId });
+}
+
+/** The session's settings, read now (`lane.settings`; plan 025 §3.10). The
+ *  sheet renders the STREAM's copy — `LaneView.settings` — and this one-shot
+ *  read is the socket op's twin. THROWS a coded failure. */
+export async function laneSettings(machine: string, kind: string, sessionId: string): Promise<LaneSettings> {
+  const r = await laneInvoke<{ settings: LaneSettings }>("lane_settings", { machine, kind, sessionId });
+  return r.settings;
+}
+
+/** Change one setting (`lane.set`; plan 025 §3.10). Resolves on craze's
+ *  confirmation — the new value arrives on the stream, as the next
+ *  `LaneView.settings`. THROWS a coded failure: `not_accepting` (on an option,
+ *  craze's `stale_model`: the model moved under the choice), `outcome_unknown`
+ *  (the answer was lost with the connection — the change may have run, and it
+ *  is never resent), or the contract's others. */
+export async function laneSet(
+  machine: string,
+  kind: string,
+  sessionId: string,
+  change: LaneSettingChange,
+): Promise<void> {
+  await laneInvoke("lane_set", { machine, kind, sessionId, change });
 }
 
 export async function laneAnswer(
   machine: string,
+  kind: string,
   sessionId: string,
   approvalId: string,
   answer: LaneAnswer,
 ): Promise<void> {
-  await laneInvoke("lane_answer", { machine, sessionId, approvalId, answer });
+  await laneInvoke("lane_answer", { machine, kind, sessionId, approvalId, answer });
 }
 
 /** End the subscription and release the transport. Idempotent, and deliberately
  *  BEST-EFFORT: this runs from the panel's unmount cleanup, where a throw would
  *  escape into React and where an unmount racing an eviction (the tab went away)
  *  is normal, not an error. */
-export async function laneClose(machine: string, sessionId: string): Promise<void> {
+export async function laneClose(machine: string, kind: string, sessionId: string): Promise<void> {
   try {
-    await laneInvoke("lane_close", { machine, sessionId });
+    await laneInvoke("lane_close", { machine, kind, sessionId });
   } catch {
     /* the lane is already gone — which is what close asked for */
   }
@@ -1579,28 +1790,51 @@ export type LaneApprovalCard = {
 export type LaneReport = {
   machine: string;
   session_id: string;
-  /** Which adapter is behind this panel (`opened.capabilities.kind`), and what
-   *  the header badge says. `""` until `lane.open` answers. */
+  /** The lane's kind as the panel was OPENED with it — the address half every
+   *  `lane.*` call it makes carries (plan 025 §3.6.4). */
+  lane_kind: string;
+  /** Which adapter is behind this panel (the view's `capabilities.kind`), and
+   *  what the header badge says. `""` until a seed carrying capabilities has
+   *  swapped in. */
   kind: string;
+  /** The header's permission line (`permissionLine` — `bypass` reads "runs
+   *  tools without asking"), or `null` when the session states none. Like
+   *  `title` and `cwd`, read off the LIVE session row (`LaneView.session`),
+   *  and off `lane.open`'s only until a seed has swapped one in
+   *  (`laneHeader`). */
+  permission: string | null;
   title: string;
   cwd: string;
   activity: string;
   generation: number;
   /** The stale banner's reason, or null while the lane is live. */
   stale: string | null;
+  /** The subscription ENDED (a `Down`) — not merely stale. */
+  ended: boolean;
   rows: LaneRow[];
   approvals: LaneApprovalCard[];
-  /** The Cancel button is enabled — i.e. the session is Working. */
+  /** The Cancel button exists AND is enabled: the session's streamed
+   *  capabilities offer `cancel` and it is Working (`laneVerbs`). `false` both
+   *  for a session that cannot cancel (no button at all) and for one that can
+   *  but is not working (a disabled button). */
   can_cancel: boolean;
-  /** The Interject toggle, or `null` when the adapter does not advertise the
-   *  capability and no toggle is rendered at all.
+  /** The Interject toggle, or `null` when the session's capabilities do not
+   *  advertise it and no toggle is rendered at all.
    *
    *  Three states rather than a bool because "absent" and "present but
    *  disabled" are different claims and both are pinned: opencode advertises no
-   *  `interject`, so its panel has no toggle; gx advertises it, so its panel
-   *  has one — enabled only while the session is Working, because that is the
-   *  only time the agent accepts one. */
+   *  `interject`, so its panel has no toggle; a session that does (gx did; a
+   *  craze session may) gets one — enabled only while the session is Working,
+   *  because that is the only time the agent accepts one. */
   interject: { on: boolean; enabled: boolean } | null;
+  /** The Stop button (plan 025 §3.6.5): `null` when the session's capabilities
+   *  do not offer `stop` and no button is rendered at all; otherwise whether
+   *  its inline confirm is open. */
+  stop: { confirming: boolean } | null;
+  /** The header's settings chip as it reads (`<model name> · <effort value> ·
+   *  fast`, plan 025 §3.10), or `null` when there is none — the session's
+   *  capabilities do not say `settings` (it is hidden, never disabled). */
+  settings_chip: string | null;
   error: string | null;
 };
 
@@ -1610,6 +1844,169 @@ export type LaneReport = {
  *  `null` for "no panel" instead of the previous mount's stale snapshot. */
 export function reportLane(snapshot: LaneReport | null): void {
   void invoke("ui_report", { snapshot: { lane: snapshot } });
+}
+
+/** The settings sheet as rendered — the UI truth `lane_settings.dump` reads
+ *  (plan 025 §3.10). Each row is what a person sees: the control it is drawn
+ *  as, its values with the selected one, and its state — `pending` while a
+ *  change awaits craze, `refused` with the text shown inline, or
+ *  `not_confirmed` after an answer lost to a drop, until the next `Settings`.
+ *  `enabled` is whether the row takes a press now. */
+export type LaneSettingsReport = {
+  machine: string;
+  session_id: string;
+  lane_kind: string;
+  chip: string;
+  rows: {
+    id: string;
+    kind: "model" | "mode" | "config";
+    name: string;
+    category: string | null;
+    control: "segmented" | "list";
+    current: string | null;
+    current_name: string | null;
+    values: { id: string; name: string; selected: boolean }[];
+    state: "pending" | "refused" | "not_confirmed" | null;
+    text: string | null;
+    enabled: boolean;
+  }[];
+  usage: { tokens: number; window: number; percent: number; text: string } | null;
+};
+
+/** Report the settings sheet's rendered state (mounted-only, the `reportLane`
+ *  rule): `null` on close CLEARS the key, so `lane_settings.dump` answers
+ *  `null` for "no sheet". */
+export function reportLaneSettings(snapshot: LaneSettingsReport | null): void {
+  void invoke("ui_report", { snapshot: { lane_settings: snapshot } });
+}
+
+/* ---- craze: the create sheet and Open in terminal (plan 025 §3.6.6, §3.8) -- */
+
+/** A refusal of one of the `craze_*` commands, its code recovered — the
+ *  `lane_*` commands' `"<code>: <message>"` agreement ([laneFailure] splits it
+ *  the same way). `outcome_unknown` is the one the sheet keeps its request id
+ *  on; `too_old` / `not_installed` / `no_craze` say what this machine's craze
+ *  is; the rest are the lane contract's own codes. */
+export type CrazeOpFailure = LaneFailure;
+
+/** Invoke a craze command, THROWING a coded [LaneFailure]. */
+async function crazeInvoke<T>(cmd: string, args: Record<string, unknown>): Promise<T> {
+  const core = await import("@tauri-apps/api/core");
+  try {
+    return await core.invoke<T>(cmd, args);
+  } catch (e) {
+    throw laneFailure(e);
+  }
+}
+
+/** What a create can start on `machine` — read afresh on every sheet open
+ *  (D8: nothing is cached). On a DORMANT machine this is the explicit action
+ *  that starts its hub. THROWS a coded failure. */
+export async function crazeCreateOptions(machine: string): Promise<CrazeCreateOptions> {
+  const r = await crazeInvoke<{ options: CrazeCreateOptions }>("craze_create_options", { machine });
+  return r.options;
+}
+
+/** The fields of one create — the sheet's typed form and the request id it
+ *  holds (`crazeCreate.ts`'s lifecycle). */
+export type CrazeCreateFields = {
+  machine: string;
+  cwd: string;
+  provider?: string | null;
+  prompt?: string | null;
+  requestId: string;
+};
+
+/** What `craze_create` answers: the new session's row (already in the
+ *  machine's listing), its hostId, what became of the first prompt, and the
+ *  request id it ran under. */
+export type CrazeCreated = {
+  session: RcSession;
+  host_id: string;
+  /** craze answered with a session that has ALREADY ENDED (a replay of an
+   *  earlier create's answer, within craze's ten-minute window): nothing is
+   *  listed, and there is no transcript to open. */
+  ended?: boolean;
+  prompt: "none" | "accepted" | "unknown" | "refused" | string;
+  prompt_error?: string | null;
+  request_id: string;
+};
+
+/** Create a craze session. THROWS a coded failure — `outcome_unknown` when
+ *  craze's answer was lost twice (keep the id; Try again resumes it). */
+export async function crazeCreate(f: CrazeCreateFields): Promise<CrazeCreated> {
+  return crazeInvoke<CrazeCreated>("craze_create", {
+    machine: f.machine,
+    cwd: f.cwd,
+    provider: f.provider ?? undefined,
+    prompt: f.prompt ?? undefined,
+    requestId: f.requestId,
+  });
+}
+
+/** What `craze_open_terminal` answers: the roost tab it opened. */
+export type CrazeTerminal = {
+  origin: string;
+  machine: string;
+  session_id: string;
+  tab_id: string;
+  cwd: string;
+  argv: string[];
+};
+
+/** Open in terminal on a headless craze row: a roost tab running `craze
+ *  attach` on the session (its hostId), in its workspace. THROWS a coded
+ *  failure. */
+export async function crazeOpenTerminal(machine: string, sessionId: string): Promise<CrazeTerminal> {
+  return crazeInvoke<CrazeTerminal>("craze_open_terminal", { machine, sessionId });
+}
+
+/** One provider row AS RENDERED in the sheet — read back off its DOM
+ *  (`data-provider` and its attributes), never restated from state. */
+export type CrazeCreateProviderRow = {
+  id: string;
+  label: string;
+  state: string;
+  dimmed: boolean;
+  selected: boolean;
+  reason: string | null;
+  fix: string | null;
+};
+
+/** The create sheet as `craze_create.dump` reads it. */
+export type CrazeCreateDump = {
+  machine: string;
+  /** `loading` | `failed` (options) | the draft's phase: `idle` |
+   *  `submitting` | `refused` | `unknown` | `created`. */
+  state: string;
+  providers: CrazeCreateProviderRow[];
+  /** The default rule's answer (`preselectedProvider`). */
+  preselected: string | null;
+  default_provider: string | null;
+  recent_dirs: string[];
+  /** Each labelled control's current value ("Directory", "First prompt"). */
+  values: Record<string, string>;
+  /** The request id the sheet holds — set only while a submission is in
+   *  flight or its outcome is unknown. */
+  request_id: string | null;
+  /** The machine's note (offline / too old / not installed) or "no provider
+   *  is ready on this machine". */
+  note: string | null;
+  /** The refusal as shown, by code. */
+  error: { code: string; message: string; where: string; text: string } | null;
+  /** The start failure's cause, verbatim, as the monospace block shows it. */
+  cause: string | null;
+  /** The directory field's own refusal (relative or empty). */
+  cwd_problem: string | null;
+  create_enabled: boolean;
+  primary: string;
+  rendered: string;
+};
+
+/** Report the create sheet's rendered state, or `null` on unmount — called
+ *  by the sheet itself (the `reportLaunchDialog` rule). */
+export function reportCrazeCreate(dump: CrazeCreateDump | null): void {
+  void invoke("ui_report", { snapshot: { craze_create: dump } });
 }
 
 /* ---- menu-bar popover (B1b) ------------------------------------------------ */

@@ -1,0 +1,7 @@
+{"dir":"op","op":{"name":"permission","id":"perm-1","tool":"Shell","options":[{"optionId":"allow","name":"Allow","kind":"allow_once"},{"optionId":"deny","name":"Deny","kind":"reject_once"}]}}
+{"conn":1,"dir":"c2s","msg":{"jsonrpc":"2.0","id":"1","method":"hello","params":{"protocols":[1],"client":{"kind":"test","name":"fakehost-wire"}}}}
+{"conn":1,"dir":"s2c","msg":{"jsonrpc":"2.0","id":"1","result":{"protocol":1,"endpoint":{"kind":"host","hostId":"0123456789ab","crazeVersion":"0.0.0-fakehost","pid":4242},"clientId":"c-1","token":"52fdfc072182654f163f5f0f9a621d72","resumed":false,"capabilities":{"rosterSubscribe":false,"sessionCreate":false,"multiplex":false,"connect":false,"snapshot":true,"attachWhenNow":true},"codecs":{"event":1,"snapshot":1},"limits":{"inboundLine":4194304,"outboundLine":16777216},"retryHorizon":{"commands":1024,"ageMs":600000}}}}
+{"conn":1,"dir":"c2s","msg":{"jsonrpc":"2.0","id":"2","method":"asks.answer","params":{"sessionId":"session-fake-1","commandId":"1","askId":"perm-1","answer":{"optionId":"deny"}}}}
+{"conn":1,"dir":"s2c","msg":{"jsonrpc":"2.0","id":"2","result":{}}}
+{"conn":1,"dir":"c2s","msg":{"jsonrpc":"2.0","id":"3","method":"asks.answer","params":{"sessionId":"session-fake-1","commandId":"2","askId":"perm-1","answer":{"optionId":"deny"}}}}
+{"conn":1,"dir":"s2c","msg":{"jsonrpc":"2.0","id":"3","error":{"code":-32000,"message":"agent: that ask is already resolved: perm-1","data":{"code":"already_resolved","reason":"already_resolved"}}}}

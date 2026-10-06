@@ -1851,6 +1851,85 @@ pub async fn tab_open(reach: &dyn RoostReach, params: TabOpenParams) -> Result<T
     finish(reach, conn.tab_open(params).await).await
 }
 
+/// Where a client is in ONE roost daemon's history: a revision, and the
+/// daemon incarnation it counts in. roost's `revision` is an in-process counter
+/// that resets when the daemon restarts (`shed_core::roost::RoostInventory`),
+/// so two revisions compare only within one incarnation — `session.identify`'s
+/// `session_id` and `started_at`, the pair a watcher's inventory carries too.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TabFence {
+    pub revision: u64,
+    pub daemon_session_id: String,
+    pub started_at: String,
+}
+
+impl TabFence {
+    /// Whether `inventory` was read from the same daemon incarnation.
+    pub fn same_daemon(&self, inventory: &RoostInventory) -> bool {
+        self.daemon_session_id == inventory.daemon_session_id
+            && self.started_at == inventory.started_at
+    }
+}
+
+/// A fence on `conn`: `session.identify` (the incarnation) and `tab.list` (a
+/// revision) on one connection, so both are the same daemon's. `Err` from a UI
+/// socket, which publishes no revision.
+async fn read_fence(reach: &dyn RoostReach, conn: &mut Conn) -> Result<TabFence, String> {
+    let identify = finish(reach, conn.session_identify().await).await?;
+    let list = finish(reach, conn.tab_list().await).await?;
+    let revision = list
+        .revision
+        .ok_or_else(|| "this roost socket publishes no revision".to_string())?;
+    Ok(TabFence {
+        revision,
+        daemon_session_id: identify.session_id,
+        started_at: identify.started_at,
+    })
+}
+
+/// The first read, or — when it failed — ONE more, and then none: a fence is
+/// worth one retry, never a hung open.
+pub async fn fence_or_retry<F, Fut>(first: Result<TabFence, String>, retry: F) -> Option<TabFence>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<TabFence, String>>,
+{
+    match first {
+        Ok(fence) => Some(fence),
+        Err(_) => retry().await.ok(),
+    }
+}
+
+/// `tab.open`, then a [`TabFence`] read on the SAME connection: the tab, and a
+/// revision at or past the commit that opened it, in the incarnation that
+/// opened it — the FENCE for a client that keeps its own knowledge of a tab
+/// roost reports unowned (an unowned tab is a hidden one, whose churn publishes
+/// no snapshot). A watcher snapshot of the same incarnation whose revision is
+/// below the fence was taken before the tab existed, and its silence about the
+/// tab means nothing; one at or past it — or from another incarnation — that
+/// does not list the tab says the tab is gone.
+///
+/// A failed read after a successful open is retried ONCE on a fresh connection
+/// (still a revision at or past the open: the same daemon, later — or another
+/// incarnation, which the fence then names). The fence is `None` when both
+/// fail, or from a UI socket (no revisions); the tab is opened either way, and
+/// is answered.
+pub async fn tab_open_fenced(
+    reach: &dyn RoostReach,
+    params: TabOpenParams,
+) -> Result<(Tab, Option<TabFence>), String> {
+    let mut conn = dial(reach).await?;
+    let tab = finish(reach, conn.tab_open(params).await).await?;
+    let first = read_fence(reach, &mut conn).await;
+    drop(conn);
+    let fence = fence_or_retry(first, || async {
+        let mut conn = dial(reach).await?;
+        read_fence(reach, &mut conn).await
+    })
+    .await;
+    Ok((tab, fence))
+}
+
 /// `tab.close` — end a tab. It leaves `tab.list` entirely.
 pub async fn tab_close(reach: &dyn RoostReach, tab_id: i64) -> Result<(), String> {
     let mut conn = dial(reach).await?;
@@ -2271,6 +2350,22 @@ impl SshExec {
             stdout,
             stderr_tail,
         }
+    }
+
+    /// Start `command` on the far side as a **long-lived duplex**: the child
+    /// with its stdin, stdout and stderr all piped, nothing written and nothing
+    /// read — the caller owns the three bands for as long as the connection
+    /// lives (plan 025 §3.3.2: the desktop's craze dial, one `craze bridge
+    /// --hub` per connection over this host's ssh).
+    ///
+    /// The same argv as [`SshExec::run`] — the pinned `ssh_config`, the
+    /// private `ControlMaster` (so a roster connection, every lane's and the
+    /// bootstrap's execs share one handshake), `-T`, `BatchMode`, `LC_ALL=C` —
+    /// and the same `kill_on_drop`: a dropped child is a killed one, so a
+    /// connection that is let go never leaves its bridge running. Nothing here
+    /// bounds the child's life; a duplex lives as long as its caller holds it.
+    pub fn spawn_duplex(&self, command: &str) -> std::io::Result<tokio::process::Child> {
+        self.spawn_child(command)
     }
 
     fn spawn_child(&self, command: &str) -> std::io::Result<tokio::process::Child> {
@@ -2754,6 +2849,69 @@ mod tests {
     use shed_core::roost::testing::{ownership, FakeRoost};
 
     // ---- doubles ----
+
+    /// **A fence read is retried once, and only once** (C10 confirmation): the
+    /// first read's answer when it has one; after a failure, the retry's —
+    /// and none after a second failure (the tab stays opened, unfenced).
+    #[tokio::test]
+    async fn a_fence_read_is_retried_once() {
+        let fence = |revision| TabFence {
+            revision,
+            daemon_session_id: "d".into(),
+            started_at: "t".into(),
+        };
+        let retried = AtomicUsize::new(0);
+        let retry = |answer: Result<TabFence, String>| {
+            let retried = &retried;
+            move || async move {
+                retried.fetch_add(1, Ordering::SeqCst);
+                answer
+            }
+        };
+        assert_eq!(
+            fence_or_retry(Ok(fence(7)), retry(Ok(fence(9)))).await,
+            Some(fence(7))
+        );
+        assert_eq!(retried.load(Ordering::SeqCst), 0, "no retry after a read");
+        assert_eq!(
+            fence_or_retry(Err("list failed".into()), retry(Ok(fence(9)))).await,
+            Some(fence(9)),
+            "a failed read is retried"
+        );
+        assert_eq!(
+            fence_or_retry(Err("list failed".into()), retry(Err("again".into()))).await,
+            None
+        );
+        assert_eq!(retried.load(Ordering::SeqCst), 2, "once per failed read");
+    }
+
+    /// `tab_open_fenced` reads the fence of the daemon it opened on — its
+    /// incarnation, and a revision at or past the open.
+    #[tokio::test]
+    async fn a_fenced_open_names_its_daemon_and_a_revision_past_the_open() {
+        let fake = FakeRoost::start().await;
+        let reach = LocalSession::new("localhost", fake.socket_path());
+        let before = fake.revision();
+        let (tab, fence) = tab_open_fenced(
+            &reach,
+            TabOpenParams {
+                project_id: 0,
+                cwd: "/w".into(),
+                argv: vec!["sh".into()],
+                cols: 0,
+                rows: 0,
+                title: String::new(),
+                activate: None,
+                cwd_from_tab: None,
+            },
+        )
+        .await
+        .expect("opened");
+        let fence = fence.expect("a session socket publishes a revision");
+        assert!(fence.revision > before, "{} > {before}", fence.revision);
+        assert_eq!(fence.daemon_session_id, fake.session_id());
+        assert!(fake.tab_ids().contains(&tab.id));
+    }
 
     /// The backoff-sleep seam's test half: record the wait the loop is ABOUT to
     /// take and return immediately rather than spend it. After `park_after`
@@ -5113,6 +5271,65 @@ exec {env_bin} -i {assignments} /bin/sh -c "$remote"
             String::from_utf8_lossy(&stdout),
             format!("it's {}", home.display())
         );
+    }
+
+    /// **A duplex is a live pipe both ways** (plan 025 C9, the desktop's craze
+    /// dial): what is written reaches the far side's stdin as it is written —
+    /// not at EOF — and its answers come back while the child is still running,
+    /// on the same ControlMaster argv every step uses. Dropping the child kills
+    /// it (`kill_on_drop`), which is how a craze connection that is let go
+    /// never leaves its bridge behind.
+    #[tokio::test]
+    async fn an_ssh_duplex_carries_lines_both_ways_while_it_runs() {
+        use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let ssh = write_exec_ssh(dir.path(), &[("PATH", "/usr/bin:/bin".to_string())]);
+        let exec = SshExec::new(&entry("mini3"), &exec_options(ssh)).expect("exec");
+
+        // `cat` answers each line only once it has READ it, so a reply proves
+        // the duplex is live, not a buffered one-shot.
+        let mut child = exec.spawn_duplex("cat").expect("spawn");
+        let mut stdin = child.stdin.take().expect("piped stdin");
+        let stdout = child.stdout.take().expect("piped stdout");
+        assert!(child.stderr.is_some(), "stderr is the caller's to read");
+        let mut lines = tokio::io::BufReader::new(stdout).lines();
+        for word in ["hello", "again"] {
+            stdin
+                .write_all(format!("{word}\n").as_bytes())
+                .await
+                .expect("write");
+            stdin.flush().await.expect("flush");
+            let line = tokio::time::timeout(Duration::from_secs(10), lines.next_line())
+                .await
+                .expect("an answer while the child runs")
+                .expect("read")
+                .expect("a line");
+            assert_eq!(line, word);
+        }
+        assert!(
+            child.try_wait().expect("try_wait").is_none(),
+            "still running"
+        );
+        let pid = child.id().expect("a pid");
+        drop(stdin);
+        drop(lines);
+        drop(child);
+        // Killed with its last handle — `kill(pid, 0)` failing (or the pid
+        // being a zombie reaped by tokio's orphan queue) is what "gone" means
+        // here; give the reaper a moment.
+        let gone = async {
+            loop {
+                // SAFETY: a signal-0 probe sends nothing.
+                if unsafe { libc::kill(pid as i32, 0) } != 0 {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(10), gone)
+            .await
+            .expect("a dropped duplex child is killed and reaped");
     }
 
     /// A step that fails keeps its status and the **tail** of its stderr, and a

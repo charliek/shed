@@ -27,9 +27,10 @@ var roostProviderCmd = &cobra.Command{
 	Use:   "roost-provider [list|activate]",
 	Short: "roost palette provider: start an agent on a shed or machine",
 	Long: `Implements roost's provider contract (see roost's docs/guides/extending.md)
-so roost's own command palette can start an agent — claude, codex, cursor,
-opencode, gx, or grok — on a running shed or a configured machines: entry,
-opened as a tab in that host's own roost-session.
+so roost's own command palette can start an agent — claude or opencode — on a
+running shed or a configured machines: entry, opened as a tab in that host's
+own roost-session. Every other agent (codex, cursor, gx, grok, and anything
+else craze drives) is started through craze instead, not through this menu.
 
 Phases (run by roost itself, not typed by a person):
 

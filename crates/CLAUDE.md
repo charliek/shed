@@ -19,20 +19,39 @@ re-implemented per language. The root `CLAUDE.md` owns the monorepo layout + rel
   went with it entirely (`shell_quote_always` moved from `rc_agents` into `machine.rs`,
   where `display_line` — the one composer every machine transport shares — is its only
   caller). The Linux clients link it directly.
-  `lane.rs` (plan 015) is the **agent-lane contract** — the DTOs plus the `AgentLane`
-  async trait that normalizes "a coding agent with sessions, a transcript and approvals",
-  one adapter per agent (opencode over its local HTTP server; `gx` next). Pure types, **no
-  I/O** — the transport, fold, ring and reconnect loop belong to whatever crate implements
-  it. It lives here, not in `shed-app`, because shed-mobile links the DTOs through FRB.
-  It also owns the one shared overflow policy (plan 018, module doc correction 13):
-  `LaneSubscription`'s frame channel is bounded at `LANE_CHANNEL_CAPACITY` (1024 frames),
-  and `LanePublisher` — deliberately **not** `Clone`, one per subscription — is the only
-  way onto it: `publish` (`try_send`; a full channel answers `Publish::Lagged` and drops
-  the frame), `publish_final` (consumes self and awaits; the terminal `Down` is the one
-  frame that can never be the dropped one), and `wait_drained` (resolves only once every
-  slot is free). Both adapters propagate a `Lagged` out of every emitting helper and
-  reseed rather than silently resume, even on gx — the dropped frames may already be
-  behind the client's cursor.
+  `lane.rs` (plan 015; split in plan 025 C4, shed#391) is the **agent-lane contract** —
+  the DTOs plus TWO async traits that normalize "a coding agent with sessions, a
+  transcript and approvals": a machine-level `AgentSource` (`subscribe` → the live session
+  list as `SourceEvent`s, `create_options`, `create`, `open(id)`) and the session-scoped
+  `AgentLane` it opens (no verb takes an id; `settings`/`set`/`stop` have no default
+  bodies). One adapter per agent implements both (opencode over its local HTTP server;
+  craze over its per-machine hub, `shed-craze` — its source since plan 025 C7, its lane
+  since C8 — in the slot plan 017's `gx` adapter held until plan 025 C1 retired it, shed#390).
+  **Capabilities are per session and ride
+  the stream** (`LaneEvent::Capabilities`, and `Settings` when they say so) — there is no
+  capabilities getter, so a client reads them from its view, never caches them at open.
+  `LaneEvent::Stale` is a non-terminal transport loss (a silent resume ends it with a lone
+  `Ready` of the same generation); `Down` alone ends a lane; a source's outage is the
+  non-terminal `SourceEvent::Offline`. Pure types, **no I/O** — the transport, fold, ring
+  and reconnect loop belong to whatever crate implements them. It lives here, not in
+  `shed-app`, because shed-mobile links the DTOs through FRB. `lane::conformance` (behind
+  `test-support`) is the shared kit every adapter's tests run their streams through (the
+  bracket, capabilities before `Ready`, seq, silent resume, `Down` last, no source-set
+  `tab_id`). `time.rs` is the pure RFC 3339 → unix-ms parser (no `chrono`; correction 10).
+  It also owns the one shared overflow policy (plan 018, module doc correction 13), for
+  BOTH levels: the frame channel (`Subscription<T>`, aliased `LaneSubscription` /
+  `SourceSubscription`) is bounded at `LANE_CHANNEL_CAPACITY` (1024 frames), and the
+  generic `Publisher<T>` (`LanePublisher` / `SourcePublisher`) — deliberately **not**
+  `Clone`, one per subscription — is the only way onto it: `publish` (`try_send`; a full
+  channel answers `Publish::Lagged` and drops the frame), `publish_final` (consumes self
+  and awaits; the terminal `Down` is the one frame that can never be the dropped one),
+  `publish_waiting` (awaits room like `publish_final` without consuming — ONLY for the
+  rows a terminal path flushes just before its `Down`, never on a live path), and
+  `wait_drained` (resolves only once every slot is free). Every adapter propagates a
+  `Lagged` out of every emitting helper and reseeds rather than silently resumes — the
+  dropped frames may already be behind the client's cursor (plan 017's gx adapter, which
+  also offered a bounded silent resume on its OWN cursor-honoured reconnect, proved the
+  two are independent; it was retired in plan 025 C1, shed#390).
   **The FRB-mirror rule (load-bearing):** mobile HAND-mirrors every lane DTO into Dart, so
   every field is an owned `String`/`Option`/`Vec`/scalar — **no `serde_json::Value`, no
   `HashMap`, no borrowed lifetimes**; free-form payloads travel as a `String` of raw JSON
@@ -40,6 +59,17 @@ re-implemented per language. The root `CLAUDE.md` owns the monorepo layout + rel
   class, a plain one a plain Dart enum. Same rule as `rc.rs`'s feed types, which `lane`
   reuses (`RcFeedMessage` IS the transcript row) — which is why those gained `Serialize`
   plus a tolerant `Deserialize` delegating to their existing `from_map` reader.
+  `craze.rs` (plan 025 C5) is the **craze remote command**, pure like `machine.rs`: the
+  `sh -c '<ladder>'` argv every client runs to reach `craze` on a host —
+  `bridge_hub_argv`/`bridge_hub_command` (every hub connection), `providers_hub_argv` (the
+  find-only probe, which never starts a hub) and `attach_argv(host_id)` (Open in terminal;
+  the id must be twelve lowercase hex digits). The script is craze's published
+  binary-finding ladder verbatim plus one change, an enhanced PATH applied only at the
+  `exec`, composed over two tables (`Ladder { rungs, exec_path }`) so tests can re-root
+  them; the `*_argv_jailed()` variants keep rungs 1–2 and no PATH change, for test mode
+  only. `tests/machine-transport`'s `craze-bridge-hub`/`craze-providers-hub` scenarios
+  EQUAL the composers' output (the Rust leg asserts it), and `tests/craze_ladder.rs` runs
+  the ladder for real under every local `sh`.
 - **`shed-app`** — the UI-free app-logic layer (`Backend`) the clients share; holds the
   embedded broker bridge (`broker_bridge.rs`, behind the non-default
   `broker = ["dep:shed-broker"]` feature — leg 3a.2), which since plan 022 is its ONLY
@@ -53,12 +83,26 @@ re-implemented per language. The root `CLAUDE.md` owns the monorepo layout + rel
   `lane_view.rs` (plan 018 §3.5, ungated for the same reason `machine.rs` and
   `roost.rs` are) is the **staged agent-lane view** — `LaneView`/`LaneViewSnapshot`,
   moved down out of the Tauri crate — that folds a `shed_core::lane` subscription
-  (messages, activity, generation, approvals) into what `lane.messages`/`lane.approvals`
-  return, behind the same `Reset … Ready` staging the contract promises;
+  (messages, activity, generation, approvals, and — staged and swapped with the seed —
+  the session row and its capabilities and settings) into what `lane.messages`/`lane.approvals`
+  return, behind the same `Reset … Ready` staging the contract promises. Generations are
+  MATCHED (only a `Ready` equal to the staged `Reset`'s swaps; only one equal to the live
+  generation clears `stale`), and `stale` (the banner, set by `Stale` or `Down`) is kept
+  apart from `ended` (set only by `Down` — the one thing a client reopens a lane on);
   `LaneView::snapshot(since_seq)` is the typed projection both a full read and a delta
   poll go through. It is ungated because mobile links `shed-app` with default features
   and needs the identical fold — the phone showing the same view the desktop shows is
   a property of one implementation, not two that have to agree.
+  `craze_rows.rs` (plan 025 §3.6.3, ungated for the same reason) is **the craze row
+  merge, D4 literally**: `fold_plan(roost_tabs, hub_rows)` for ONE machine — with the
+  hub feed live (`Some`) every craze-owned roost tab is absorbed (attached to the hub row
+  whose `provider_session_id` it names, or hidden when none does), with it down (`None`)
+  nothing is; only craze ownership folds, the newest tab of a session attaches, two rows
+  claiming one session resolve to the newer `since`/`startedAt` then the greater hostId.
+  The desktop applies it in `roost_hosts.rs`; the phone (CM3) links the same function.
+  `SshExec::spawn_duplex(command)` (C9) is the long-lived sibling of `SshExec::run` — the
+  same pinned config and private ControlMaster, all three bands piped, killed on drop —
+  that the desktop's remote craze dial runs `craze bridge --hub` through.
 - **`shed-core-ffi`** — a thin UniFFI wrapper (`crate-type = ["staticlib", "lib"]`)
   exposing a `ShedCore` object to Swift. The `.a` is what the app links (signing/notarization
   unchanged); `lib` is required so `cargo run -p shed-core-ffi --bin uniffi-bindgen` works
@@ -74,12 +118,17 @@ re-implemented per language. The root `CLAUDE.md` owns the monorepo layout + rel
   signals, socket bind, the Surface-A desktop UDS server) and, from leg 3a.2, embedded
   in-process by the desktop app. Carries no daemon-only or WebKitGTK concern.
 - **`shed-opencode`** — the **opencode adapter** for `shed_core::lane` (plan 015): the
-  one implementation of `AgentLane` that talks to an opencode server's local HTTP API —
-  the same server the TUI is already running, never a sidecar it launches itself. The
-  Tauri client consumes it as a plain path-dep (a machine row's `agent_lane` stamp,
-  fed by roost's `server_url` report on the tab; see `docs/desktop/agent-lanes.md` for
-  the end-to-end contract and its current limits). `fold.rs` is a **port** of the rc
-  hub's `OpencodeFold`, and it is pinned as one —
+  implementation of both contract traits that talks to an opencode server's local HTTP
+  API — the same server the TUI is already running, never a sidecar it launches itself.
+  `OpencodeSource` (plan 025 P7) is the `AgentSource` (a 5 s poll of the session list,
+  create with an optional first prompt, `open` binding an id with no I/O) and
+  `OpencodeLane` the session-scoped `AgentLane` it opens (the pre-split verbs with the id
+  bound; every seed carries its fixed `Capabilities` row; `settings`/`set`/`stop`
+  answer "unsupported"). The Tauri client consumes it as a plain path-dep, opening each
+  lane as `OpencodeSource::new(url, None).open(session_id)` (a machine row's
+  `agent_lane` stamp, fed by roost's `server_url` report on the tab; see
+  `docs/desktop/agent-lanes.md` for the end-to-end contract and its current limits).
+  `fold.rs` is a **port** of the rc hub's `OpencodeFold`, and it is pinned as one —
   `fixtures/opencode_turn.golden.json` records what the HUB's fold produced on
   `fixtures/jsonl/opencode_turn.jsonl`, and the test replays the port against it (that
   test must NEVER take a `shed-broker` dep; the golden file is the pin). A **second**
@@ -95,41 +144,135 @@ re-implemented per language. The root `CLAUDE.md` owns the monorepo layout + rel
   `rc_hub::watch` imported `shed_rc_engine::tmux::Tmux` — linking would have dragged the
   RC engine into an HTTP adapter. S6 (plan 022) deleted the hub, so `helpers.rs` is now
   the only copy and the golden is what still pins it. In `default-members`.
-- **`shed-gx`** — the **gx adapter** for `shed_core::lane`: the second
-  implementation of `AgentLane`, against gx's remote lane (`gx-remote-api`) —
-  a bearer-token HTTP API with a resumable `Last-Event-ID` cursor, unlike
-  opencode's unauthenticated, cursor-less local server. Building it forced the
-  twelve contract corrections recorded in `shed_core::lane`'s own module doc
-  ("what the gx adapter changed"); see `docs/desktop/agent-lanes.md` for the
-  end-to-end contract, including the two-URL split (reported vs. dial), the
-  `healthz`/`instanceId` credential pin, bounded silent resume vs. reseed, and
-  the `option_for` ambiguity refusal a real five-option gx permission forced.
-  Shaped like `shed-opencode`: `discovery.rs` (the probe script + parser +
-  `GxCredentialSource`), `transport.rs` (`GxTransport::dial`, called before
-  every connect attempt so a moved forward is never dialled blind), `fold.rs`
-  (pure: envelopes → rows + activity; gx's event-id counters are **not**
-  monotonic in transcript order, so the cursor is the maximum counter seen,
-  not the last applied one, and history is cut positionally), `watcher.rs`
-  (the pump: seed, bounded silent resume, reconcile, reset → reseed, stall,
-  `Down`), `testing.rs::FakeGx`, `examples/lane.rs` (the same manual-drive CLI
-  shape as opencode's). Ring/backoff/feed are **not** duplicated here — they
-  live in `shed_core::lane` (moved there by this same change) and this crate
-  re-exports them, same as `shed-opencode` does. Its own dependency set is
-  `shed-opencode`'s minus `regex`/`chrono`; not FFI-exported.
-  **`fixtures/`** carries one recording from a real gx leader
-  (`1.0.16+gx.12/{history.json, event-frames.jsonl, approvals.jsonl}`) and one
-  golden derived from it (`fold.golden.json`) — but **unlike** `shed-opencode`'s
-  two-golden split, there is no second implementation to port against: nothing
-  else folds gx's wire, so the golden is **regression detection only**
-  ("this is what the fold does today"), never a fidelity claim against some
-  other producer. `crates/shed-gx/fixtures/README.md` is the one place that
-  spells out that distinction, the two-step regeneration recipe (re-record
-  live with `SHED_GX_LIVE=1 SHED_GX_RECORD=1 …`, re-derive offline with
-  `SHED_GX_REGOLD=1 …`), and what the recording deliberately proves that a
-  hand-written fixture would not think to (non-monotonic counters, gx's
-  double-announced approval — a null-`method`/`request` placeholder followed
-  by the real request on the same id — and its own by-counter resume edge,
-  filed against gx as a known residual). In `default-members`.
+  (`shed-gx` — the **gx adapter**, plan 017's second implementation of
+  `AgentLane` against gx's remote lane — lived here the same shape, with the
+  twelve contract corrections it forced recorded in `shed_core::lane`'s own
+  module doc; it was retired in plan 025 C1, shed#390, when gx and the other
+  direct-agent kinds left shed for the craze lane. `shed-craze`, below, holds
+  this slot now.)
+- **`shed-craze`** — the **craze adapter** for `shed_core::lane` (plan 025 C7+, shed#392):
+  one machine's craze **hub** — craze's per-machine process that lists every cursor, grok,
+  gx and native session, says what a create can start, starts one, and splices a client
+  through to a session's host — as an `AgentSource`, `CrazeSource`. **The transport is the
+  client's** (P8): every connection is a fresh duplex to `craze bridge --hub` from a
+  client-supplied `CrazeDial` — `ProcessDial` (a local `/bin/sh -c '<ladder>'`, run by
+  absolute path; the ladder is `shed_core::craze`'s), `TcpDial` (the phone's loopback
+  port), and the desktop's `SshExec` duplex (C9) — one for the roster, one per
+  `createOptions`, one per create, because the hub answers one request at a time, in
+  order. `conn.rs` is one NDJSON connection: craze's line limits **from the client's
+  side** (never WRITE a line over 4 MiB; READ up to 16 MiB), id demux (host replies come
+  out of order; a reply's id must be the request's JSON value verbatim, and every message
+  `"jsonrpc":"2.0"`), notifications on a bounded channel the reader **never waits on** (a
+  full queue ends the connection as `ConnEnd::Backlog` rather than stall the replies
+  behind it), deadlines that cover the write as well as the reply, the **bounded
+  preamble** (up to 16 non-JSON lines / 4 KiB before the first reply — a shed's `bash
+  -lc` login profile — kept for the error; after it, any non-JSON line, a blank one
+  included, is a fault), and the hub `hello` (protocol 1, **codecs event 1 and snapshot
+  1**, `rosterSubscribe` + `connect`). `dial.rs` classifies a dial that never reached a hub, in
+  plan 025 §3.3.2's precedence (exit 127 → `NotInstalled`; `unknown flag: --hub` on stderr
+  — v0.0.1 — or a hub `hello` short of the rule → `TooOld`; anything else before `hello` →
+  `Unreachable` with the stderr tail; a refused `hello` → `Failed`, `protocol_version` →
+  `TooOld`) and classifies the find-only probe (`providers --hub --json`, which never
+  starts a hub) by its stderr TEXT, never its exit code. `errors.rs` is craze's published
+  code → `LaneError` table **verbatim, keyed on `data.code` only**, with P14's one
+  deviation (a create refused `not_accepting/start_failed` → `Failed(data.cause)`).
+  `CrazeSource::create` retries ONCE under the same `requestId` on an unknown outcome (a
+  dropped connection, the 120 s deadline) and never on a definite answer;
+  `is_outcome_unknown` is the one test a caller keeps its id on. A create keeps the row it
+  answered with APART from the roster's (`Held`): until a roster lists that hostId or removes
+  it — a seed that does not list it yet keeps it — or a lane opened through the source sees
+  the session end, or 10 min pass (craze's replay window); never for a hostId a roster (or
+  such a lane) let go within craze's 10-minute replay window (timestamped tombstones, a 4096
+  count only as a memory backstop, so a replayed create cannot resurrect it); at most 64 at
+  once. **The lane's end is load-bearing** (live leg 1's ghost row): craze's roster removes
+  only a host it SENT, so a session created and stopped before its next flush is never
+  removed by it — the lane, holding the source's rows weakly, lets the created row go and
+  tombstones it on a terminal `Down` of `session_closed`/`unknown_session`/`start_failed`,
+  or on ANY end of the lane's LAST running watcher once the host took its `session.stop`
+  (the receipt is craze's word the close follows) — by the receipt itself when no
+  subscription is left to see the close — said before the `Down` is published for every end
+  the watcher sees (a receipt whose wake loses the race to a lane fault's `Down` says it just
+  after it: the row still goes), once per lane; `on_created_gone(f)` is the
+  client's hook for that one change no roster frame says (the desktop re-reads its listing).
+  `created_rows()` is that set, evaluated at the call — the one
+  authority a client lists created rows from (the desktop keeps no copy). So `open(hostId)` on a just-created session binds a
+  lane that knows its row at once; `dialling(dial)` is the same source — its rows — on
+  another dial (the desktop runs a user's explicit `create_options`/`create` through an
+  ungated one). A row's id is its **hostId** (P11). **`CrazeLane`** (plan 025 C8, `open` binds one with no I/O) is one
+  session: its watcher (`watcher.rs` — the state machine table is its module doc) dials
+  one connection per lane, splices to the host (`session.connect{hostId}` with the host
+  `hello` pipelined), re-reads the host's own `sessions.list` row (the craze `sessionId`
+  every session call carries — learned, and re-learned after `session_replaced`), and
+  attaches: a snapshot seeds `Reset … Ready` (every `Ready` waits for its attachment's
+  `synchronized` at the last seq held); after `Ready`, a lost connection is `Stale` and a
+  redial that offers the cursor — the host decides: honoured is a SILENT resume (a lone
+  `Ready`, same generation), refused is `Reset{cursor_lost:…}`. Bounds: 8 attaches per
+  episode (reset at `synchronized`), dials give up 10 min into an outage (an outage ends
+  only at a `synchronized`, so a host that answers attaches and never synchronizes is ended
+  too); every dial is under a 30 s deadline (`dial::DIAL_DEADLINE` — for a source an
+  `Offline`, for a create an unknown outcome retried under the same id), and an attachment
+  that goes 60 s without a word before its `synchronized` is a dead connection; a
+  client-channel lag (or `ConnEnd::Backlog`) drops the connection, waits for the drain and
+  reseeds; terminal `Down` only for `session_closed`, `unknown_session`, `start_failed:
+  <cause>`, a splice to another host (`protocol: …`, which every read refuses too) and
+  the bounds — a `reset{omitted}` whose re-attach gets no answer is confirmed by a redial,
+  never assumed closed; the rows flushed ahead of a `Down` wait for room like the `Down`;
+  a seed's rows are capped at what the ring keeps so it always fits the channel. The
+  verbs share the lane's connection (`send`/`cancel`/`answer`/`set`/`stop`, fresh
+  commandIds per lane): issued while disconnected they wait 10 s then fail `Unavailable`;
+  in flight at a drop, or past their 30 s deadline (which also closes the connection),
+  they are "outcome unknown" and never resent — and a silent resume restates the
+  session's `Settings` before its lone `Ready`, so a client showing a lost change "not
+  confirmed" has the real value to replace it with. `session()` never dials; `approvals()`/
+  `settings()` answer from a RUNNING watcher's fold once it seeded (the watcher that set
+  it alone clears it), else read on a connection of their own — `approvals()` the
+  engine's ask registry (`asks.list` + `asks.get`, Amendment A11), `settings()` a
+  snapshot. `fold.rs` is craze's events/snapshots → append-only rows (craze's own wordings ported: `noteTodos`,
+  `compactionNote`, the foreign-turn notes, the shell-context/attachment strip) with an
+  approval book (`answer_body` maps the contract's answers onto `asks.answer`). **Rows
+  follow craze's transcript, approvals its ENGINE ask registry** (Amendment A11): a
+  sub-agent's ask (craze's fold child-ignores all four ask kinds) draws no row, yet is an
+  approval — the registry has no agent field, and `pendingAsks` counts it — gated exactly
+  as craze's `HiddenBy` (a question needs `askCards`, a plan `planCards`; a permission is
+  never hidden); every seed and silent resume runs a FENCED read
+  (attach, `asks.list` + `asks.get`, `session.sync`) and its `Ready` waits for every event
+  through the sync's seq;
+  `segment.rs` is shed-gx's segmenter, ported (8 KiB lossless splits, the 2 s flush
+  clock); `settings.rs` is the settings data (plan 025 §3.10: craze's model order and the
+  options' order, computed once; modes hidden when the session's `modes` capability is
+  off) and `set` (C11) is `session.set` — `setting_for` binds a config change to the model
+  the CLIENT displayed (`LaneSettingChange::Config`'s `for_model`, Amendment A13), else the
+  lane's folded one, waiting for the lane's first settings rather than going out unbound
+  (`forModel`), so craze refuses it `stale_model` (`NotAccepting`) once the session has left
+  that model; the new value comes back on the stream, from the change's own `meta` delta —
+  or, answered `rev: 0` (no delta will follow), from the confirmed value, which every
+  running watcher applies (`LaneShared::confirmed`). `errors::craze_says` keeps a craze
+  message that happens to begin "outcome unknown: " from reading as shed's own. `tests/recipe_settings.rs` drives it against the real
+  hub with `craze-fake-agent -script permodel` as `cursor` (cursor's per-model catalogs;
+  `Recipe::set_agents`, and `script_agent_with` for the agent's own
+  `CRAZE_FAKE_DUMP_CALLS` record). Pure lib — serde, tokio, no `reqwest`, no `chrono` — not
+  FFI-exported, builds for `aarch64-linux-android` (mobile links it). In
+  `default-members`. **Tests:** `tests/wire.rs` runs every vendored WIRE fixture
+  (`fixtures/wire/`, craze's `internal/fakehost/testdata/wire` at the sha
+  `fixtures/wire.PIN` names, its `README.md` included — `make check-craze-pin` requires
+  `wire.PIN` == `CRAZE_TEST_SHA`, and CI's `craze-binaries` action diffs the two trees);
+  `tests/recipe_source.rs` is craze's own **hermetic recipe** (`testing::Recipe`, behind
+  `test-support`): the REAL hub over `craze-fake-host` entries, creates spawning
+  `craze-fake-agent` as grok, every craze process under the recipe's six variables with a
+  short 0700 `CRAZE_RUNTIME_DIR` under `/tmp` (never `~/.cache`, which craze refuses),
+  binaries copied into a private `PATH`, the hub's pid read from its record and checked
+  before any signal, and craze's own `cleanup` as the teardown. Its cells **skip** without
+  `SHED_CRAZE_BIN_DIR` (`make craze-binaries` prints the line) and **fail** instead under
+  `SHED_CRAZE_REQUIRE=1`, which CI's `core-linux` sets. `tests/recipe_lane.rs` drives lanes
+  the same way (fake-host ops for the asks, a hub-created `craze serve` for `stop`, a
+  `HookDial` that kills a lane's bridge for the silent resume); `tests/lane.rs` and
+  `tests/overflow.rs` pin the watcher's edges against a SCRIPTED host (the bounds on tokio's
+  paused clock). `fixtures/0.1.0+gx/` is one LIVE recording of a gx session through a real
+  hub, replayed offline into `fold.golden.json` — **regression detection only**;
+  `fixtures/README.md` says what each artifact claims and how to re-record
+  (`SHED_CRAZE_LIVE=1 SHED_CRAZE_RECORD=1 … --test live`) and re-derive
+  (`SHED_CRAZE_REGOLD=1`). Every source and lane frame goes through
+  `shed_core::lane::conformance`.
 
 `fixtures/` holds the real-shaped JSON/YAML samples (server info, `shed list`, `system df`,
 egress profiles, enriched image, config) that both the Rust decoders and the Swift
@@ -307,13 +450,15 @@ onto `saphyr-parser` would be a separate shed-core slice, not assumed here.
 ```bash
 cd crates && cargo test                              # workspace tests
 cargo test -p shed-app --features broker             # the embedded broker bridge (3a.2)
-cargo test -p shed-core --features test-support      # exports `roost::testing::FakeRoost`
+cargo test -p shed-core --features test-support      # exports `roost::testing::FakeRoost` + `lane::conformance`
 cargo clippy --workspace --all-targets -- -D warnings
 cargo clippy -p shed-app --features broker --all-targets -- -D warnings
 cargo test -p shed-opencode                          # the opencode agent-lane adapter
 cargo test -p shed-opencode --features test-support  # exports `testing::FakeOpencode`
-cargo test -p shed-gx                                 # the gx agent-lane adapter
-cargo test -p shed-gx --features test-support        # exports `testing::FakeGx`; live/regold tests still skip cleanly
+cargo test -p shed-craze                             # the craze adapter (recipe cells skip)
+# the craze recipe against the real hub: build the pinned binaries, then require them
+make -C .. craze-binaries                            # prints SHED_CRAZE_BIN_DIR=…
+SHED_CRAZE_BIN_DIR=… SHED_CRAZE_REQUIRE=1 cargo test -p shed-craze --all-targets --features test-support
 ```
 
 Note: `broker` is the one non-default feature left in this workspace. A bare

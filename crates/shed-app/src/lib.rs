@@ -14,6 +14,11 @@ mod backoff;
 #[cfg(feature = "broker")]
 pub mod broker_bridge;
 pub mod coordinator;
+/// The craze row merge (plan 025 §3.6.3, D4) — which roost tabs a machine's
+/// live craze hub absorbs. Ungated for the reason [`lane_view`] is: shed-mobile
+/// links this crate with default features and folds the same two feeds, so the
+/// rule has to be one implementation rather than two.
+pub mod craze_rows;
 pub mod fakes;
 pub mod host_agent;
 /// The staged agent-lane view (plan 018 §3.5) — the client-side fold of a
@@ -47,6 +52,7 @@ pub use broker_bridge::{
     BrokerError, DetectedMode, EffectiveMode, EmbeddedHostAgent, ModePref, ModeProbe, ResolvedMode,
 };
 pub use coordinator::{Coordinator, CoordinatorDeps, SshPrefs};
+pub use craze_rows::{fold_plan, FoldPlan, RoostTabRef};
 pub use fakes::{AlwaysApprovedGate, FakeNotifier, NoopEventSink};
 pub use host_agent::{
     AgentCapabilityState, CapabilitySnapshot, HelloClientInfo, HostAgentClient,

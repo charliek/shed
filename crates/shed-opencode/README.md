@@ -5,10 +5,12 @@ adapter per agent; this is opencode's, speaking its server's local HTTP API over
 loopback (the server the TUI already runs, whose URL the roost plugin reports).
 
 ```text
-OpencodeClient  — the transport (two reqwest clients), the verbs, AgentLane
-  ├─ fold.rs    — the pure fold: envelopes → activity + rows + approvals
-  ├─ ring.rs    — the bounded ring that OWNS `seq`
-  └─ watcher.rs — the reconnecting pump: generations, Reset … Ready
+OpencodeSource  — AgentSource: the polled session list, create, open
+  └─ OpencodeLane — AgentLane: one session's id bound to the client's verbs
+       OpencodeClient — the transport (two reqwest clients) and the verbs
+         ├─ fold.rs    — the pure fold: envelopes → activity + rows + approvals
+         ├─ ring.rs    — the bounded ring that OWNS `seq`
+         └─ watcher.rs — the reconnecting pump: generations, Reset … Ready
 ```
 
 ## The fold is a port, and it is pinned as one
@@ -111,7 +113,9 @@ pinned (`src/watcher.rs` carries the full version):
    **deferred** to step 5, because emitting them here would put an `Approval`
    ahead of the first `Session` and emission is deduplicated, so step 5 could
    not repair it;
-5. `Session`, then the approvals, then `Ready { generation }`.
+5. `Session`, then `Capabilities` (opencode's fixed row — every seed carries
+   it, plan 025; never `Settings`, because that row says `settings: false`),
+   then the approvals, then `Ready { generation }`.
 
 Seeding before subscribing is the bug that order exists to prevent, and
 `tests/watcher.rs` injects an event *during* the seed and asserts it is neither

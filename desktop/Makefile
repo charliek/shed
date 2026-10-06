@@ -173,6 +173,16 @@ tauri-test: tauri-ui-build  ## cargo test the Tauri client locally (its standalo
 # --cap-add SYS_ADMIN + seccomp=unconfined let WebKitGTK's web-process bubblewrap
 # sandbox create the user namespaces Docker's default seccomp blocks (else the
 # content process dies and JS never runs).
+#
+# The craze cells (plan 025 §3.5/§3.6.7): `docker run` forwards only explicit
+# `-e` variables, so SHED_CRAZE_REQUIRE and SHED_CRAZE_BIN_DIR are passed through
+# by name (unset on the host = unset in the container). The binaries ride the
+# tarred `desktop/tools` — build them into the gitignored
+# `desktop/tools/shedtest/.craze-bin` with `make craze-binaries
+# OUT=desktop/tools/shedtest/.craze-bin`, and point the container at them:
+# `SHED_CRAZE_REQUIRE=1 SHED_CRAZE_BIN_DIR=/work/desktop/tools/shedtest/.craze-bin
+# make -C desktop tauri-build-linux` (or `tauri-test-linux`). With REQUIRE set
+# and the directory empty, the craze cells FAIL rather than skip.
 tauri-build-linux: tauri-ui-build  ## Render gate: Tauri e2e on ubuntu:24.04 + WebKitGTK 2.44 under Xvfb
 	docker build -t shed-tauri-linux:latest - < Dockerfile.tauri-linux
 	docker run --rm \
@@ -186,6 +196,7 @@ tauri-build-linux: tauri-ui-build  ## Render gate: Tauri e2e on ubuntu:24.04 + W
 	  -e UV_PROJECT_ENVIRONMENT=/tmp/uv-venv \
 	  -e SHED_TAURI_BIN=/target/debug/shed-desktop-tauri \
 	  -e SHED_TAURI_TEST_TIMEOUT_SCALE=6 \
+	  -e SHED_CRAZE_REQUIRE -e SHED_CRAZE_BIN_DIR \
 	  shed-tauri-linux:latest \
 	  bash -lc 'set -e; mkdir -p /work; \
 	    tar -C /repo $(TAR_EXCLUDES) \
@@ -209,6 +220,7 @@ tauri-test-linux: tauri-ui-build  ## Tauri crate cargo test on ubuntu:24.04 (Lin
 	  -v shed-tauri-linux-target:/target \
 	  -w /repo \
 	  -e CARGO_TARGET_DIR=/target \
+	  -e SHED_CRAZE_REQUIRE -e SHED_CRAZE_BIN_DIR \
 	  shed-tauri-linux:latest \
 	  bash -lc 'set -e; mkdir -p /work; \
 	    tar -C /repo $(TAR_EXCLUDES) \

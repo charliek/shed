@@ -1,16 +1,25 @@
 //! **shed-opencode** — the opencode adapter for the agent-lane contract.
 //!
-//! [`shed_core::lane::AgentLane`] normalizes "a coding agent with sessions, a
-//! transcript and approvals"; this crate is its opencode implementation, talking
-//! to an opencode server's local HTTP API (the one the TUI already runs and,
-//! under the Roost Pivot, reports the URL of).
+//! `shed_core::lane` normalizes "a coding agent with sessions, a transcript and
+//! approvals" at two levels — an [`shed_core::lane::AgentSource`] (a machine's
+//! sessions) and a session-scoped [`shed_core::lane::AgentLane`] (plan 025 D3);
+//! this crate is opencode's implementation of both, talking to an opencode
+//! server's local HTTP API (the one the TUI already runs and, under the Roost
+//! Pivot, reports the URL of).
 //!
 //! ```text
-//! OpencodeClient  — the transport (two reqwest clients), the verbs, AgentLane
-//!   ├─ fold.rs    — the pure fold: envelopes → activity + rows + approvals
-//!   ├─ ring.rs    — the bounded ring that OWNS `seq`
-//!   └─ watcher.rs — the reconnecting pump: generations, Reset … Ready
+//! OpencodeSource  — AgentSource: the polled session list, create, open
+//!   └─ OpencodeLane — AgentLane: one session's id bound to the client's verbs
+//!        OpencodeClient — the transport (two reqwest clients) and the verbs
+//!          ├─ fold.rs    — the pure fold: envelopes → activity + rows + approvals
+//!          ├─ ring.rs    — the bounded ring that OWNS `seq`
+//!          └─ watcher.rs — the reconnecting pump: generations, Reset … Ready
 //! ```
+//!
+//! A client reaches a session the way it reaches one on every adapter:
+//! `OpencodeSource::new(url, auth)?.open(id)` — opening is binding, with no I/O.
+//! Capabilities ride the lane's stream (every seed carries
+//! [`opencode_capabilities`]), not a getter.
 //!
 //! # Why the LEGACY `/event` feed
 //!
@@ -47,11 +56,13 @@ mod helpers;
 pub mod client;
 pub mod fold;
 pub mod ring;
+pub mod source;
 pub mod watcher;
 
 #[cfg(any(test, feature = "test-support"))]
 pub mod testing;
 
-pub use client::{BasicAuth, OpencodeClient};
+pub use client::{opencode_capabilities, BasicAuth, OpencodeClient, OpencodeLane};
 pub use fold::OpencodeFold;
 pub use ring::MessageRing;
+pub use source::{opencode_source_capabilities, OpencodeSource};

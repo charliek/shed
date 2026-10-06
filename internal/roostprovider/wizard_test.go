@@ -195,15 +195,14 @@ func TestTabOpenFor(t *testing.T) {
 	})
 
 	t.Run("a project-bearing workdir keeps its id", func(t *testing.T) {
-		got, err := TabOpenFor(Token{Machine: "mini2", Agent: "cursor", Home: "/root", Cwd: "/src", Project: "7"})
+		got, err := TabOpenFor(Token{Machine: "mini2", Agent: "opencode", Home: "/root", Cwd: "/src", Project: "7"})
 		if err != nil {
 			t.Fatalf("TabOpenFor: %v", err)
 		}
 		if got.ProjectID != "7" {
 			t.Errorf("project_id = %q", got.ProjectID)
 		}
-		// The BINARY is cursor-agent even though the kind and title are cursor.
-		if got.Argv[len(got.Argv)-1] != "cursor-agent" {
+		if got.Argv[len(got.Argv)-1] != "opencode" {
 			t.Errorf("argv = %q", got.Argv)
 		}
 	})
@@ -215,8 +214,18 @@ func TestTabOpenFor(t *testing.T) {
 		}
 	})
 
+	t.Run("a retired direct-agent kind is refused like any other unknown one", func(t *testing.T) {
+		// codex/cursor/gx/grok left the table in plan 025 (shed#390); a stale
+		// row id naming one is refused exactly like any other unrecognized
+		// kind, not specially diagnosed.
+		_, err := TabOpenFor(Token{Machine: "mini2", Agent: "codex", Home: "/root", Cwd: "/src"})
+		if err == nil {
+			t.Fatalf("a retired agent kind was accepted")
+		}
+	})
+
 	t.Run("no workdir is refused", func(t *testing.T) {
-		_, err := TabOpenFor(Token{Machine: "mini2", Agent: "codex", Home: "/root"})
+		_, err := TabOpenFor(Token{Machine: "mini2", Agent: "opencode", Home: "/root"})
 		if err == nil {
 			t.Fatalf("a token with no cwd was accepted")
 		}
@@ -227,7 +236,7 @@ func TestTabOpenFor(t *testing.T) {
 // `deny_unknown_fields` TabOpenParams accepts from this provider, and the one
 // thing that is easy to get wrong from Go: `project_id` is a STRING.
 func TestTabOpenParamsSerialization(t *testing.T) {
-	params, err := TabOpenFor(Token{Machine: "mini2", Agent: "gx", Home: "/root", Cwd: "/root/src", Project: "12"})
+	params, err := TabOpenFor(Token{Machine: "mini2", Agent: "opencode", Home: "/root", Cwd: "/root/src", Project: "12"})
 	if err != nil {
 		t.Fatalf("TabOpenFor: %v", err)
 	}
@@ -235,7 +244,7 @@ func TestTabOpenParamsSerialization(t *testing.T) {
 	if err != nil {
 		t.Fatalf("marshal: %v", err)
 	}
-	want := `{"project_id":"12","cwd":"/root/src","title":"gx","argv":["bash","-lc","exec \"$@\"","shed","gx"]}`
+	want := `{"project_id":"12","cwd":"/root/src","title":"opencode","argv":["bash","-lc","exec \"$@\"","shed","opencode"]}`
 	if string(data) != want {
 		t.Errorf("params JSON:\n got %s\nwant %s", data, want)
 	}

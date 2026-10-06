@@ -1,0 +1,69 @@
+[package]
+name = "shed-craze"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "shed-craze — the craze adapter for the shed_core::lane agent-lane contract (plan 025): a machine's craze hub as an AgentSource, and each session as an AgentLane, over one NDJSON JSON-RPC duplex per connection."
+
+[lib]
+name = "shed_craze"
+path = "src/lib.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+# The contract this crate implements (`shed_core::lane`), the craze remote
+# command it dials through (`shed_core::craze`, the published ladder) and the
+# RFC 3339 parser a roster row's `since` goes through (`shed_core::time`).
+shed-core = { path = "../shed-core" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+# On top of the workspace's rt-multi-thread/macros/sync/time: `net` (the
+# phone's loopback `TcpDial`), `io-util` (the NDJSON line reader and writer),
+# `process` (the desktop's local `/bin/sh` bridge, `ProcessDial`). All three
+# are already enabled by shed-core, so this adds no feature to the workspace's
+# tokio build — it just stops this crate depending on a sibling's list.
+tokio = { workspace = true, features = ["net", "io-util", "process", "time", "sync"] }
+async-trait = { workspace = true }
+# `BoxFuture` for the dial seam (`CrazeDial::dial`).
+futures-util = { workspace = true }
+# `new_request_id` — a fresh create request id a client mints after every
+# definite answer (plan 025 §3.3.3, §3.8).
+uuid = { workspace = true }
+# NO `reqwest` (craze speaks NDJSON over a duplex, not HTTP) and NO `chrono`
+# (a roster row's RFC 3339 goes through `shed_core::time`). Not FFI-exported,
+# and it must build for `aarch64-linux-android`: shed-mobile links it.
+
+[features]
+# Exports `testing` — the hermetic recipe harness (craze's "Testing a client
+# against a real hub": the real hub over `craze-fake-host`, creates spawning
+# `craze-fake-agent`) and the dial hooks the recipe cells drive — across the
+# crate boundary, the `shed_opencode::testing::FakeOpencode` pattern.
+# Integration tests (`tests/*.rs`) reach it THROUGH this feature; `cfg(test)`
+# would not cross the boundary. Test-only by construction: the module is
+# `#[cfg(any(test, feature = "test-support"))]`, so a shipped binary never
+# carries it.
+test-support = []
+
+[dev-dependencies]
+# `rt` (the current-thread runtime) for the async tests and `test-util` for the
+# paused-clock cells (the create deadline, the backoff). Both are tokio's own
+# features — no package joins the lock.
+tokio = { workspace = true, features = ["rt", "test-util"] }
+# The integration tests drive the recipe harness, which lives behind the feature.
+shed-craze = { path = ".", features = ["test-support"] }
+# `shed_core::lane::conformance` — the contract's shared conformance kit (plan
+# 025 §3.2.4), behind shed-core's own `test-support`. A dev-dependency
+# (resolver v2), so the shipped build never carries the kit.
+shed-core = { path = "../shed-core", features = ["test-support"] }
+
+# The manual verification tool and the smallest proof the contract is usable
+# from OUTSIDE this crate: past building the source it calls nothing but
+# `AgentSource` and the `AgentLane` it opens. Named explicitly so `cargo run --example shed-craze-lane`
+# matches the name the docs use.
+[[example]]
+name = "shed-craze-lane"
+path = "examples/lane.rs"

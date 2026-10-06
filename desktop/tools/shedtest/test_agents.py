@@ -212,7 +212,7 @@ def test_the_sheds_contract_is_keyed_by_its_roost_origin(app):
     caps = app.call("rc.list")["capabilities"]
     assert TARGET in caps, list(caps)
     assert f"{SERVER}/{SHED}" not in caps, "the hub's key is gone"
-    assert caps[TARGET]["kind_features"]["codex"]["attach"] == "native-remote"
+    assert caps[TARGET]["kind_features"]["opencode"]["attach"] == "native-remote"
 
 
 def test_a_filtered_list_narrows_to_that_shed(app):
@@ -230,7 +230,7 @@ def test_launch_lists_and_kill_closes_the_tab(app, shed_roost):
     path `roost.launch` takes, so the launched row carries the same origin stamp
     the listed ones do.
     """
-    launched = app.call("rc.launch", {"shed": SHED, "kind": "codex",
+    launched = app.call("rc.launch", {"shed": SHED, "kind": "opencode",
                                       "workdir": "/home/shed/fresh"})
     slug = launched["slug"]
     try:
@@ -240,7 +240,7 @@ def test_launch_lists_and_kill_closes_the_tab(app, shed_roost):
         # `shed_core::roost::launch_argv`'s recipe for the kind — the agent's own
         # binary, resolved by roost on the far side.
         opened = shed_roost.opens[-1]
-        assert opened["argv"] == ["codex"], opened
+        assert opened["argv"] == ["opencode"], opened
         assert opened["cwd"] == "/home/shed/fresh"
         # A fresh `tab.open` is UNOWNED, and shed's row for it is optimistic: the
         # watcher's next snapshot keeps only the agent-owned tabs, because an
@@ -249,7 +249,7 @@ def test_launch_lists_and_kill_closes_the_tab(app, shed_roost):
         # for the claimed row rather than reading the optimistic one.
         shed_roost.set_axes(
             int(slug), lifecycle="working",
-            ownership=ownership("codex", f"ses_{slug}", "session_status", 1_700_000_100))
+            ownership=ownership("opencode", f"ses_{slug}", "session_status", 1_700_000_100))
         _wait_for(app, "the claimed tab to reach the listing",
                   lambda: _rows(app).get(slug))
     finally:
@@ -345,7 +345,7 @@ def test_agents_pane_renders_an_injected_session(app, target):
     needs no display) + a window screenshot where the capture is available —
     macOS-tauri shells out to a Screen-Recording-TCC-gated tool, so the
     Linux/Xvfb render gate covers that pixel."""
-    app.call("rc.inject_test", {"shed": SHED, "slug": "78", "kind": "codex",
+    app.call("rc.inject_test", {"shed": SHED, "slug": "78", "kind": "opencode",
                                 "display_name": "shot1"})
     app.navigate("agents")
     app.show_window()

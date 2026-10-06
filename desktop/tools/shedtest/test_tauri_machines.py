@@ -848,6 +848,141 @@ def test_launching_an_unknown_kind_on_a_machine_is_refused(machine_app, fake_roo
     assert len(fake_roost.opens) == before, "a refused launch still opened a tab"
 
 
+# ---------------------------------------------------------------------------
+# "Run a command in a tab" (plan 025 P5) — `roost.run`, gated by no kind
+# ---------------------------------------------------------------------------
+
+
+def _close_tabs_opened_since(fake: FakeRoost, before: set[int]) -> None:
+    """Close every tab opened since `before`, out of band on the fake's own wire,
+    so a cell that opens tabs leaves the session's id space as it found it.
+
+    The fake hands each `tab.open` the next free id, and the cells further down
+    this module pin literal ids (`add_tab(6, …)`): a run tab left behind would
+    take one of them. Unlike a launch's tab, a run's is not a row, so there is no
+    `machine.kill` door to close it through.
+    """
+    for tab_id in set(fake.tab_ids()) - before:
+        roost_call(fake.socket_path, "tab.close", {"tab_id": str(tab_id)})
+
+
+def test_the_launch_dialogs_run_a_command_mode_opens_the_typed_argv(machine_app, fake_roost):
+    """**The New-session dialog's "Run a command" mode opens `argv` as typed**
+    — through the dialog itself, not around it.
+
+    Launching an agent's own TUI in a tab stays a desktop option after the
+    per-agent kinds leave (plan 025 D1), as ONE generic mode rather than a kind
+    each: the Command field's line is split on ASCII whitespace into the argv
+    roost's `tab.open` execs — no shell, no quoting, no kind consulted. So
+    `codex --model x` must arrive as three elements: a dialog (or a backend) that
+    sent the line as one would ask roost to exec a program named
+    `codex --model x`.
+
+    Driven through the app's own doors end to end: `ui.show_launch` opens the
+    dialog, `ui.fill_launch` types into it, `ui.submit_launch` presses Create —
+    so what lands on the fake is what the dialog's `roostRun` → `roost_run` →
+    `RoostHosts::run` path sends, the path a click takes. The fill is
+    re-sent until the dialog's own DOM shows it (`launch.dump`'s `values`,
+    `create_enabled`): the listener registers after the dialog mounts.
+    """
+    before = len(fake_roost.opens)
+    before_tabs = set(fake_roost.tab_ids())
+    fill = {"mode": "command", "target": "machine:mini3",
+            "command": "codex --model x", "workdir": "/home/shed/run"}
+
+    def filled() -> bool:
+        machine_app.fill_launch(**fill)
+        dump = machine_app.launch_dump() or {}
+        values = dump.get("values") or {}
+        return (values.get("Where") == "machine:mini3"
+                and values.get("Command") == "codex --model x"
+                and values.get("Working directory") == "/home/shed/run"
+                and dump.get("create_enabled") is True)
+
+    try:
+        machine_app.show_launch()
+        machine_app.wait_until(lambda: machine_app.modal() == "launch", timeout=15,
+                               what="the launch dialog to open")
+        machine_app.wait_until(filled, timeout=15, what="the Run-a-command fields, as typed")
+
+        # The mode REPLACED the kind picker rather than sitting beside it, and
+        # took the session-name box with it (`roost.run` takes no name — nothing
+        # would receive one).
+        rendered = machine_app.launch_dump()["rendered"]
+        assert "Run a command" in rendered and "Command" in rendered, rendered
+        assert "Kind" not in rendered, f"the kind picker is still on screen: {rendered}"
+        assert "Session name" not in rendered, f"a name box with nowhere to go: {rendered}"
+        assert len(fake_roost.opens) == before, "typing alone must not open anything"
+
+        machine_app.submit_launch()
+        machine_app.wait_until(lambda: len(fake_roost.opens) > before, timeout=15,
+                               what="the dialog's tab.open to reach the machine")
+        # A run that answered closes the dialog, as a launch does.
+        machine_app.wait_until(lambda: machine_app.modal() is None, timeout=15,
+                               what="the dialog to close after the run")
+    finally:
+        _close_tabs_opened_since(fake_roost, before_tabs)
+
+    opened = fake_roost.opens[-1]
+    assert opened["argv"] == ["codex", "--model", "x"], (
+        f"the command line, split on whitespace and nothing else: {opened}"
+    )
+    assert opened["cwd"] == "/home/shed/run", opened
+    assert opened["title"] == "", "the title is roost's"
+    assert len(fake_roost.opens) == before + 1, f"one press is one tab: {fake_roost.opens[before:]}"
+
+
+def test_running_a_command_on_a_machine_opens_its_argv_as_typed(machine_app, fake_roost):
+    """`roost.run` over the socket — the op the dialog's mode is a door onto —
+    with a first word NO kind table names: nothing about the run consults a
+    kind, so `vim` is a program like any other.
+
+    It answers with the TAB, not a row: a tab nobody owns is not a session row,
+    so there is no optimistic card for it (a launch can stamp the kind it asked
+    for; a command could be anything). The row, if one comes, is the one roost
+    goes on to report — and for an unclaimed `vim`, none does.
+    """
+    before = len(fake_roost.opens)
+    before_tabs = set(fake_roost.tab_ids())
+    try:
+        out = machine_app.roost_run("mini3", "  vim\tnotes.md  ", workdir="  /home/shed/run  ")
+        opened_ids = {str(i) for i in set(fake_roost.tab_ids()) - before_tabs}
+        rows = {r["slug"] for r in _machine_rows(machine_app, "mini3")}
+    finally:
+        _close_tabs_opened_since(fake_roost, before_tabs)
+
+    assert len(fake_roost.opens) == before + 1, "the run never reached the session"
+    opened = fake_roost.opens[-1]
+    assert opened["argv"] == ["vim", "notes.md"], opened
+    assert opened["cwd"] == "/home/shed/run", "the workdir, trimmed"
+
+    assert out["origin"] == "machine:mini3"
+    assert out["machine"] == "mini3"
+    assert out["argv"] == ["vim", "notes.md"], "the answer names the split it sent"
+    assert out["slug"] in opened_ids, (out, opened_ids)
+    assert out["slug"] not in rows, f"an unowned tab became a card: {rows}"
+
+
+def test_running_a_blank_command_is_refused_before_the_transport(machine_app, fake_roost):
+    """`command` is REQUIRED: absent, empty and whitespace-only are each
+    `bad_request`, and none of them opens a tab — roost would open an empty argv
+    as a plain shell, and a blank box meaning "a shell" is a door plan 025
+    rejected (roost's own UI opens shells)."""
+    before = len(fake_roost.opens)
+    before_tabs = set(fake_roost.tab_ids())
+    try:
+        for command in (None, "", "   \t  "):
+            with pytest.raises(ShedError) as excinfo:
+                machine_app.roost_run("mini3", command)
+            assert excinfo.value.code == "bad_request", (command, excinfo.value)
+            assert "'command'" in excinfo.value.message, excinfo.value
+    finally:
+        # Only ever non-empty when the refusal is broken — and then the leaked
+        # tab would fail the cells below for a reason that is this one's.
+        _close_tabs_opened_since(fake_roost, before_tabs)
+    assert len(fake_roost.opens) == before, "a refused run still opened a tab"
+
+
 def test_probing_an_unknown_machine_is_rejected(machine_app):
     """A capability probe for a machine that is not configured names the ones
     that are, rather than failing as a transport error."""

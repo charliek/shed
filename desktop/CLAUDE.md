@@ -107,6 +107,13 @@ in Docker). **Run `make tauri-build-linux` (the render gate) for any shared/Linu
 the mac WKWebView e2e alone can miss Linux-only breaks. On Linux the tray is a native menu
 (Tauri emits no Linux tray-click events → no popover; expected).
 
+The craze cells (`tools/shedtest/test_tauri_craze.py`, plan 025) drive the REAL craze hub and
+need the pinned binaries: `make craze-binaries` (natively; it prints `SHED_CRAZE_BIN_DIR`), or
+`make craze-binaries OUT=desktop/tools/shedtest/.craze-bin` plus
+`SHED_CRAZE_BIN_DIR=/work/desktop/tools/shedtest/.craze-bin` for the Docker legs. Without them
+the module skips; `SHED_CRAZE_REQUIRE=1` (CI) makes that a failure. The shedtest-linux skill has
+the seams (`SHED_TAURI_CRAZE_PATH`, the jailed ladder) and the traps.
+
 ## The embedded credential broker (leg 3a.2)
 
 The Tauri app can broker credentials **in-process**, no separate `shed-host-agent`

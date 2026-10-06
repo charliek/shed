@@ -4,7 +4,7 @@
 # standalone workspace in ../tauri/src-tauri) linking shed-core + shed-app directly.
 [workspace]
 resolver = "2"
-members = ["shed-core", "shed-core-ffi", "shed-app", "shedctl", "shed-broker", "shed-host-agent", "shed-opencode", "shed-gx"]
+members = ["shed-core", "shed-core-ffi", "shed-app", "shedctl", "shed-broker", "shed-host-agent", "shed-opencode", "shed-craze"]
 # All members are default members: a plain `cargo build` / `cargo test` (and
 # `make core-test`) build shed-core + shed-core-ffi + shed-app + shedctl. shedctl
 # (the headless Linux CLI driver for the shed-desktop IPC socket) has no GUI-toolkit
@@ -20,15 +20,20 @@ members = ["shed-core", "shed-core-ffi", "shed-app", "shedctl", "shed-broker", "
 #
 # `shed-opencode` (the opencode agent-lane adapter, plan 015) is a member AND a
 # default member: a pure lib on shed-core with no GUI-toolkit and no daemon
-# dependency, so a plain `cargo test`/`clippy --workspace` covers it.
+# dependency, so a plain `cargo test`/`clippy --workspace` covers it. It is not
+# reachable from `shed-core-ffi` or from shed-core's Android target, which is
+# what keeps the two `cargo tree` invariants true.
 #
-# `shed-gx` (the gx agent-lane adapter, plan 017) is a member and a default
-# member for exactly the same reasons, and it takes a NARROWER dependency set
-# than shed-opencode does — no `chrono` (the ring is chrono-free since plan 017
-# C1), no `regex`, no `base64`. Neither adapter is reachable from
-# `shed-core-ffi` or from shed-core's Android target, which is what keeps the
-# two `cargo tree` invariants true.
-default-members = ["shed-core", "shed-core-ffi", "shed-app", "shedctl", "shed-broker", "shed-host-agent", "shed-opencode", "shed-gx"]
+# `shed-gx` (the gx agent-lane adapter, plan 017) was retired in plan 025 C1
+# (shed#390) — gx and the other direct-agent kinds left shed for the craze lane.
+#
+# `shed-craze` (the craze adapter, plan 025 C7+, shed#392) is a member AND a
+# default member on the same terms as `shed-opencode`: a pure lib on shed-core
+# (serde, tokio, no reqwest, no chrono), not reachable from `shed-core-ffi`, so
+# the `cargo tree -p shed-core-ffi` invariant holds. Its recipe cells skip
+# without `SHED_CRAZE_BIN_DIR` (`make craze-binaries`); CI sets
+# `SHED_CRAZE_REQUIRE=1` so a skip there fails.
+default-members = ["shed-core", "shed-core-ffi", "shed-app", "shedctl", "shed-broker", "shed-host-agent", "shed-opencode", "shed-craze"]
 
 [workspace.package]
 version = "0.8.1"

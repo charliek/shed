@@ -460,6 +460,12 @@ impl FakeOpencode {
         self.lock().fail_get.push((suffix.to_string(), status));
     }
 
+    /// Take back every [`Self::fail_get`] for `suffix` — the server recovering,
+    /// which is what a poller's next good read has to notice.
+    pub fn unfail_get(&self, suffix: &str) {
+        self.lock().fail_get.retain(|(s, _)| s != suffix);
+    }
+
     /// ACCEPT the connection for every GET whose path ends with `suffix`, and
     /// then STALL — forever, until the fake hangs up or is dropped.
     ///

@@ -156,6 +156,17 @@ ssh. Against a real remote machine the same code takes the other branch — an
 `ssh -N -L <local>:127.0.0.1:<reported>` child per session-port — which nothing hermetic can
 exercise.
 
+**Driving the New-session dialog's "Run a command" mode** (plan 025 C3, `roost.run`). The mode
+is reachable only by typing and clicking, so it has TEST-MODE-ONLY doors beside
+`ui.show_launch`: `ui.fill_launch {mode?, target?, command?, workdir?}` types into the open
+dialog and `ui.submit_launch` presses Create through the button's own gate. The fill is an
+event to a listener the dialog registers AFTER it mounts, so one sent the instant
+`ui.show_launch` returns can land on nobody — re-send it (it is idempotent) until
+`launch.dump`'s `values` / `create_enabled` show it, as `test_tauri_machines.py`'s dialog cell
+does. And a run's tab is not a row (nobody owns it), so there is no `machine.kill` for it: a cell
+that opens one must close it on the fake's own wire (`roost_call(…, "tab.close", …)`), because
+the module's later cells pin literal tab ids and the fake hands each `tab.open` the next free one.
+
 **Driving the transcript PANEL.** The panel opens from a card's Transcript affordance — a
 click, which the harness does not have — so it has drivable ops on the `ui.show_create` /
 `ui.show_launch` pattern: `ui.show_lane {machine, session_id}` mounts it (and raises the
@@ -167,63 +178,144 @@ subscription up. `lane.messages` (what the backend staged) and `lane.dump` (what
 screen) are different questions — assert the one you mean. `SHED_LANE_SHOTS=<dir>` makes the
 panel cells keep their `app.screenshot` PNGs there; unset, they still capture and assert one.
 
-### The gx lane (plan 017), and the four traps it cost
+### The gx lane (plan 017) — retired
 
-`test_tauri_gx_lane.py` + `fake_gx.py` are the second adapter, driven the same way but with a
-**credential seam**: gx wants a bearer on every route but `healthz`, and the app reads it off
-the filesystem. Two test-mode envs (`ui.subproc_env` set-or-clears both):
+gx and its lane left shed in plan 025 C1 (shed#390); `test_tauri_gx_lane.py` and `fake_gx.py`
+are gone with it. Its slot is craze's — next section.
 
-| env | what it does |
-|---|---|
-| `SHED_TAURI_GX_HOME` | the `$GROK_HOME` the LOCAL reader reads — `FakeGx.write_home(dir)` lays out a `gx-remote*.json` record naming the fake's URL plus a `0600` `gx-remote.token`. Write it **before** the app launches. |
-| `SHED_TAURI_GX_TIMINGS_MS` | `stall=,resume_window=,flush_after=,down_after=` in ms. Durations only — `resume_tries` is not settable, and a malformed pair is silently dropped (the symptom is a cell waiting out a REAL 30 s window). |
+### Craze sessions (plan 025 C9) — the real hub, two seams
 
-Four things cost real time here. All four are properties of the lane layer, not of gx, so they
-bite the next adapter too:
+`test_tauri_craze.py` drives the **real** craze hub: the pinned `craze`, `craze-fake-host`,
+`craze-fake-agent` and the real `craze-0.0.1`, from `SHED_CRAZE_BIN_DIR`. Without it the module
+SKIPS; with **`SHED_CRAZE_REQUIRE=1`** a missing binary FAILS it instead (CI sets both, so CI can
+never go green on skipped craze cells).
 
-1. **The seed's last streak is still open when the subscription reaches `Ready`.** `lane.open`
-   returning and `generation >= 1` do NOT mean the transcript is complete — a trailing chunk
-   streak becomes a row only when the watcher's `flush_after` timer fires. A cell that reads
-   rows at `Ready` sees the prompt and no answer. Wait for the transcript to STOP GROWING
-   (`_settled` in that file: same row count across a window longer than `flush_after`) before
-   counting anything.
-2. **Unmounting the panel closes the lane, and the failure surfaces somewhere else.** The panel
-   calls `lane.close` on unmount, so a cell that keeps using the lane after `ui.close_lane` gets
-   `no_lane` — and because `wait_until` swallows `ShedError`, that arrives as a **timeout in a
-   later cell naming an unrelated condition**. Re-open with `lane.open` after every unmount, or
-   keep the panel mounted for the whole cell (which is also what you want when comparing
-   generations: a close/open resets the counter rather than advancing it).
-3. **Cutting the SSE stream and then scripting the gap is a race you lose.** The app reconnects
-   on its own ~100 ms backoff, so frames pushed "after" a `close_streams()` often arrive LIVE
-   and the cell passes without ever exercising a replay. `FakeGx.stage_update()` writes the
-   leader's history+ring **without broadcasting**: script the gap first, then cut, and the
-   resume is the only path the frame has. Same for "wait until `stream_count() == 0`" — the
-   reconnect can beat the next poll; assert on what arrived, not on the socket.
-4. **A held-pending approval overrides the session's activity** (`→ needs_approval`). An
-   approval cell that fails before answering leaves every later "wait for a working turn"
-   timing out for a reason that has nothing to do with the cell you are reading. Answer and
-   `resolve_approval` at the end of each approval cell.
+```bash
+# native (a Linux host): build the binaries once, then point the harness at them
+make craze-binaries                                  # prints SHED_CRAZE_BIN_DIR=~/.cache/shed/craze-<sha12>
+# the Docker legs only see the repo layout, so build INTO it (gitignored) and pass the
+# IN-CONTAINER path — desktop/Makefile forwards both variables into `docker run` by name
+make craze-binaries OUT=desktop/tools/shedtest/.craze-bin
+SHED_CRAZE_REQUIRE=1 SHED_CRAZE_BIN_DIR=/work/desktop/tools/shedtest/.craze-bin make -C desktop tauri-build-linux
+```
 
-5. **A backend wait does not license a panel assertion — they are two clocks.**
-   `lane.messages` is the backend's staged view and changes the instant the adapter commits;
-   `lane.dump` is what the panel last REPORTED, and the panel re-reads on its own
-   frame/40 ms timer. So `wait_until(lane.messages …)` followed immediately by
-   `assert lane.dump[…]` has a real window in it, and it is wide enough to fail about one run
-   in three under Xvfb. Wait on the surface you are asserting about. The tell when it bites is
-   a dump that already agrees with the backend everywhere EXCEPT the field asserted (an
-   `activity: "working"` sitting next to a stale banner that has not cleared yet).
+- **The local seam is `SHED_TAURI_CRAZE_PATH`** (test mode AND a debug build, an `exec_seam` like
+  `SHED_TAURI_SSH_BIN`): a directory the local craze dial's **jailed** ladder (rungs 1–2 only, no
+  exec-PATH enhancement) finds `craze` in, run under `env_clear()` + `HOME`/`CRAZE_HOME`/
+  `CRAZE_RUNTIME_DIR` from the app's env + `PATH=<that dir>`. `ui.subproc_env(craze_path=…,
+  craze_home=…, craze_runtime_dir=…)` sets or CLEARS all three, so a developer's own `CRAZE_HOME`
+  never reaches a hermetic launch. Unset → the app has no local craze source at all.
+- **`CRAZE_RUNTIME_DIR` must be short, 0700 and under `/tmp`** — craze refuses one beneath a
+  group-writable ancestor (`~/.cache` is 0775 on some hosts) and a socket path over ~104 bytes.
+  The rigs use `tempfile.mkdtemp(prefix="shcz-", dir="/tmp")`.
+- **Remote craze in test mode exists only through the fake ssh** (`SHED_TAURI_SSH_BIN`), also
+  jailed. The craze fake ssh (`_fake_ssh` in the test file) runs each remote command in the jail
+  its destination USER names, records every command (`cmds/<user>.*`), answers roost's
+  `client-bridge` with `command not found`, and REFUSES (records `refused`, exit 255) any craze
+  command naming an absolute ladder rung — so the jailed composition is asserted without the
+  production ladder ever running here. The jail's `bin` holds `sh` beside `craze`: the remote
+  command is `sh -c '…'`.
+- **Remote is attach-only, so a dormant machine never sees `bridge --hub`.** To test a LIVE
+  remote, start its hub BEFORE the app launches (the rig's own `craze bridge --hub`, held open):
+  the dormant re-probe is 30 s, so a hub started later is only seen half a minute on.
+- **The sentinels.** The main instance's seam holds a RECORDING `craze` wrapper (it logs the
+  `PATH` and argv it ran with, then execs a private copy) — every dial must have run with `PATH`
+  exactly the seam dir. The empty-seam instance and the dormant remote jail each carry a craze
+  stub at `$HOME/.nix-profile/bin` (an absolute rung relative to HOME) that must never run.
+- **Do NOT run a "swap the jailed ladder for the production one" control over the whole file on
+  a workstation**: the EMPTY-seam instance would then walk the production ladder to this host's
+  own `/usr/local/bin/craze`. Run that control with `-k` on the recording-wrapper cell
+  (`test_the_local_dial_is_jailed`), whose rung 2 answers first, or in the Docker leg.
+- **Teardown is by program path**: every craze process of a rig — each bridge, the hub, each
+  `craze serve` it creates, the fake hosts and agents — runs a private COPY under the rig's
+  `real/`, and the module end signals exactly those (re-checking each pid's command line first).
+  Never `pkill -f craze`: the owner's own craze and hub may be running.
+- The row merge needs a `FakeRoost` tab with `source="craze"` and `session_id` = the hub row's
+  `provider_session_id` (the craze rows carry it). To show the roost row coming BACK, the feed
+  must stay down: rename the seam's `craze` first (the eager source then reads not-installed)
+  and only then SIGTERM the hub — otherwise the eager redial births a new hub within a second.
+  That cell is LAST in the module for that reason.
+- `lane.*` ops all take `kind` now (`"craze"` / `"opencode"`, the row's `agent_lane.kind`);
+  `ui.show_lane` too.
 
-   The same rule shapes the "is the panel ready" predicate: a panel reports from its first
-   render, and its rows and its `capabilities` arrive on two different awaits — a lane-event
-   can trigger the read that fills `generation` before `lane.open`'s promise resolves. So
-   "mounted" for a cell that reads `kind`/`interject` means *generation ≥ 1 **and** kind
-   non-empty*, not generation alone.
+### The craze create sheet and Open in terminal (plan 025 C10)
 
-And one that is not a trap but reads like one: **a row count is not stable across a reseed.**
-`approval_request` rows are emitted on FIRST SIGHT of a pending approval, so a rebuilt
-generation whose approvals are all resolved is legitimately shorter. Assert the staging
-property (the old generation is unchanged until the new one swaps in), never a floor on the
-count.
+- **Drive the sheet through its doors**: `ui.show_craze_create {machine}` (opening it reads
+  `craze.create_options` — on a DORMANT remote that is the explicit action that starts its hub),
+  `ui.fill_craze_create {provider?, cwd?, prompt?, recent?}` and `ui.submit_craze_create` (test
+  mode only), `ui.close_craze_create`; read it with `craze_create.dump` (providers with
+  `dimmed`/`selected`/`reason`/`fix`, `values`, the `request_id` it holds, `note`, `error`,
+  `cause`, `create_enabled`, `primary`). **Wait for the dump to SHOW a fill** (its `values`, or
+  `create_enabled`) before `ui.submit_craze_create`: the submit door presses the button through
+  the gate of the LAST render, and a submit landing before the fill re-rendered is dropped
+  (the launch dialog's doors behave the same).
+- **The draft is the app shell's, per machine**, not the sheet's: closing and re-opening the
+  sheet keeps the typed form (and a held request id). A cell that wants a clean form fills
+  every field it relies on.
+- **Losing a create's answer on purpose** (the unknown-outcome cell): the recipe rig's
+  recording `craze` wrapper has switches in the rig root — `proxy` runs each NEW
+  `bridge --hub` through `bridge_proxy.py`, which logs every `session.create`'s requestId to
+  `creates.log`; with `drop-creates` too it relays the create, relays NOTHING back from then
+  on (or a fast hub's answer slips through in the grace second), and cuts the connection a
+  second later. The source's own retry is cut the same way, so the sheet sees
+  `outcome_unknown` with the same id twice in the log. `outage` makes every craze run exit 1
+  before any hub (Unreachable — a short backoff, unlike not-installed's 30 s); SIGTERM the hub
+  with it on to take a machine OFFLINE under an open sheet, then remove it to bring it back.
+- **A start failure on demand**: point `[agents].grok` at `craze-fake-agent -script
+  exit-two-lines` (`rig.set_grok(...)`); craze reads it at every create. Restore it (in a
+  `finally`) before the next create.
+- **The fake agent reuses one provider session id**, so every hub-created session's row
+  claims the same `provider_session_id`. Open in terminal attaches its tab to ITS row by
+  hostId when a provider session is ambiguous (or absent) — a fold that went through the
+  shared rule's tie-break would hand the tab to the newest row.
+- **An attach tab is kept by a revision FENCE, not a timer**: `craze.open_terminal` reads
+  `session.identify` + `tab.list`'s `revision` right after its `tab.open`
+  (`shed_app::roost::tab_open_fenced`, retried once on a fresh connection); a snapshot of the
+  SAME daemon below it is silent about the fresh (hidden, unowned) tab and is ignored, any later
+  one — or one from a RESTARTED roost, whose revisions start again at 1 — that does not list the
+  tab drops it. An unfenced entry (both reads failed) is kept 5 s whatever a snapshot says. A fake's `tab.list` must carry `revision`
+  (both FakeRoosts do) or every snapshot is taken at its word. While the craze feed is down
+  the tab stays on its retained row (the map is the app's own knowledge, not roost ownership).
+- **`laneFailure` must not be applied twice**: a wrapper that already threw a coded
+  `LaneFailure` has a message WITHOUT the code, and re-splitting it read `outcome_unknown` as
+  `failed`. `laneFailure` now returns a `LaneFailure` unchanged.
+
+### The settings sheet (plan 025 C11)
+
+- **Drive it through its doors**: `ui.show_lane_settings {machine, kind, session_id}` mounts
+  the transcript panel AND asks for its sheet; `ui.pick_lane_setting {row, value}` (test mode
+  only) presses a value — `row` is `model`, `mode` or an option's id; `ui.close_lane_settings`.
+  Read it with `lane_settings.dump` (rows with `control`, `current`, `values[].selected`,
+  `state`/`text`/`enabled`, the `chip`, `usage`) and the header chip with `lane.dump`'s
+  `settings_chip`. Wait for the dump to show a press's effect (`state == "pending"`, or the new
+  `current`) — never sleep. A press on the value a row already shows sends nothing.
+- **A session with per-model settings**: `craze-fake-agent -script permodel` is cursor's wire
+  (four models, each with its own options) and speaks cursor's AUTH, so it must run as
+  `cursor`, not grok (as grok it fails `no supported auth method`). `rig.set_agents(grok=…,
+  cursor=<wrapper>)` and create with `provider: "cursor"`; then `rig.set_grok(rig.grok_echo)` AT
+  ONCE — the C10 sheet cell asserts cursor is NOT ready. Every fake-agent script advertises
+  models and modes, so no craze session in the rig has `settings: false`: the hidden-sheet cell
+  uses an opencode tab (FakeOpencode + a FakeRoost tab with `server_url`), closed again with
+  `machine.kill` so the last cell (the D4 fold) still sees no roost rows.
+- **The agent's own knobs go in its wrapper** (the hub's env is fixed at its birth):
+  `CRAZE_FAKE_DUMP_CALLS=<file>` records every `set_config_option <id>=<value>` the agent was
+  ASKED for (what reached it, not what was sent); `CRAZE_FAKE_SET_GATE=<path>` holds each set
+  until a byte is written to that FIFO — and is a no-op while no FIFO exists there, so a cell
+  turns it on with `mkfifo` (`SetGate`) and off by unlinking it. Release only after the set is
+  at the agent (the dump shows it): the gate's reader opens the FIFO when the set arrives.
+- **`stale_model` on demand**: a SECOND client (the rig's own `craze bridge --hub`: `hello`,
+  `session.connect{hostId}`, the host `hello`, `sessions.list`) sends a model change while the
+  gate holds it; the sheet's option press, bound to the old model, queues behind it in craze's
+  one-at-a-time settings queue; release the gate and craze refuses it `stale_model`. Seen on
+  the wire in `sets.log` (the proxy logs every `session.set` with its params).
+- **"The sheet shows A, the lane has folded B"** (Amendment A13): `ui.hold_lane_view {hold:
+  true}` (test mode) stops the panel committing its reads, so it keeps rendering the old model
+  while `lane.messages` shows the move a second client made; a press then is bound to the
+  displayed model (`for_model`). Release it (`hold: false`) in a `finally`.
+- **A lost answer on demand**: with `proxy` on (BEFORE the lane's bridge is dialled — the
+  wrapper reads the switch per spawn), `drop-sets` makes the proxy relay a `session.set` and
+  cut its connection; with `outage` on too the redial fails, so "not confirmed" holds until
+  both are off and the lane resumes. The resume restates the settings before its `Ready`.
 
 ### Against a REAL local daemon
 
@@ -482,6 +574,14 @@ deliver — neither of which a screenshot can be made to fail on.
 
 ## Gremlins
 
+- **On a Linux workstation, `e2e-tauri` must run under Xvfb — never on the inherited desktop.**
+  An agent's shell inherits `DISPLAY`/`WAYLAND_DISPLAY` from the owner's Wayland session; a run
+  there pops windows onto the owner's screen, fails every screenshot cell (`scrot: no image
+  grabbed`) and fails `test_tauri_lane.py` cells that pass under Xvfb (this cost plan 025's C1
+  hours). The exact command:
+  `env -u WAYLAND_DISPLAY -u DISPLAY XDG_SESSION_TYPE=x11 xvfb-run -a --server-args="-screen 0 1400x900x24" make -C desktop e2e-tauri`
+  — and kill any `shed-desktop-tauri` the run leaves behind BY PID (`ps -o pid,ppid,lstart,args
+  -C shed-desktop-tauri`), never one the owner started.
 - **WebKitGTK web-process dies / JS never runs** → the render gate needs
   `--cap-add SYS_ADMIN --security-opt seccomp=unconfined` (already in the target) so WebKitGTK's
   bubblewrap sandbox can create user namespaces Docker's default seccomp blocks.

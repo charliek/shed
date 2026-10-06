@@ -30,9 +30,10 @@ session protocol 4 + the RC-lane demolition), 015 (agent lanes: opencode), 016 (
 `sx`, unreleased), 017 (agent lanes: gx), 018 (agent lanes: the channel bound, free-text
 answers, scoped approvals, the shared lane view), 019 (the roost-provider kickoff + the
 desktop bootstrap), 020 (the roost session protocol 5 re-pin), 021 (the roost session
-protocol 6 re-pin + the Tauri promotion) and 022 (S6: the RC hub's full retirement, the
+protocol 6 re-pin + the Tauri promotion), 022 (S6: the RC hub's full retirement, the
 roost-native `shed attach`/`shed sessions` CLI, and the `shed-ext-rc` → strix/prox image
-swap); at release time fold this body into the new `## v0.9.0 — <date>` section — note the
+swap) and 025 (craze as shed's agent lane: the gx lane and the direct-agent kinds retired,
+the lane contract split); at release time fold this body into the new `## v0.9.0 — <date>` section — note the
 **em dash** — carrying the `**Ships:**` line above down with it (all three components;
 `recommend-components.sh 0.9.0` agrees). release-plan.sh never reads an `## Unreleased`
 heading: it anchors on the exact `## v0.9.0 — ` string and takes the first line-start
@@ -48,7 +49,8 @@ verbatim._
   running Swift 0.8.x should get a normal Sparkle prompt and update **in place** into the
   Tauri build — same bundle id, same EdDSA key, same appcast feed, all three verified — and
   gain everything Swift never had: the machines tab, the roost bootstrap (S5), and agent
-  lanes (opencode, gx). **This is the first release to run that path**: the mac job has
+  lanes (opencode, and craze — the gx lane this bullet first listed was retired before
+  release, plan 025). **This is the first release to run that path**: the mac job has
   never executed and the two-release rehearsal was skipped deliberately, so if Sparkle
   reports a failed update, install the DMG by hand from the releases page and file it —
   matching identity and key make the swap possible, not proven.
@@ -208,36 +210,16 @@ verbatim._
   credential source for a password-protected opencode server — it answers
   `401`, which surfaces as an inline "unauthorized" error, status-only. See
   [Agent lanes](https://charliek.github.io/shed/desktop/agent-lanes/).
-- **Agent lanes: the gx lane, the SECOND adapter** (plan 017, `charliek/shed#340`).
-  `crates/shed-gx` implements `AgentLane` over gx's remote lane
-  (`gx-remote-api`) — a bearer-token HTTP API with a resumable
-  `Last-Event-ID` cursor, unlike opencode's unauthenticated, cursor-less
-  server — and validating the contract against a second real agent forced
-  twelve corrections into `shed_core::lane` itself. **The credential rule:**
-  roost reports only where an agent is, never how to be let in, so an
-  adapter takes its credentials at construction from a source the client
-  supplies — read locally under `$GROK_HOME`, or over SSH through one POSIX
-  probe, both checking the same file permissions gx's own reader does. A
-  reported URL (matched against discovery) and a dial URL (where HTTP
-  actually goes) are never conflated, and no bearer request leaves the
-  adapter until a token-free `healthz` call confirms its `instanceId`
-  against discovery. **The reconnect story changes:** a cursor-capable
-  adapter resumes silently within bounds (three attempts in thirty seconds);
-  past that, `Reset` … `Ready` reseeds exactly as it always meant for
-  opencode. **The headline contract change:** an agent can offer several
-  permission options of the same semantic kind — a real gx permission
-  offered five options, two of them `allow_once` — so a bare decision is
-  refused as ambiguous (`BadRequest`) rather than guessed; the panel now
-  renders every offered option under the agent's own label and answers with
-  its exact id (`LaneAnswer::Choice`), for both adapters. A roost tab is
-  promoted to the `gx` kind only when its metadata carries a valid loopback
-  `gx.remote` URL — a hint, not liveness: a dead lane stays `gx` until roost
-  says otherwise, and `lane.open` answers `unavailable`. A `gx` session with
-  no bound lane (`--no-leader`, or metadata not yet arrived) is the new
-  lane-less `grok` kind — creatable, status-only. The Tauri backend now
-  dispatches by kind rather than binding to opencode's concrete type
-  (`Arc<dyn AgentLane>`, keyed by `(kind, server_url)`; an unrecognized kind
-  answers `unsupported_lane`). See
+- **The gx lane (plan 017) is retired before release** (plan 025): craze replaces it;
+  nothing shipped. `crates/shed-gx`, the `gx` and lane-less `grok` kinds, and the
+  desktop's gx credential probe are deleted (plan 025 C1–C2, `charliek/shed#390`). What
+  building it changed in the contract stays, because it is the contract and not gx's: the
+  twelve corrections it forced into `shed_core::lane` (kept in the module doc, numbered),
+  the silent resume that a cursor-capable adapter is allowed, and the refusal to guess an
+  ambiguous decision — a real gx permission offered five options, two of them `allow_once`,
+  so the panel renders every offered option under the agent's own label and answers with
+  its exact id (`LaneAnswer::Choice`) for every adapter. The Tauri backend dispatches lanes
+  by kind (`Arc<dyn AgentLane>`; an unrecognized kind answers `unsupported_lane`). See
   [Agent lanes](https://charliek.github.io/shed/desktop/agent-lanes/).
 - **Agent lanes: the client channel gets a bound, and overflow becomes a
   reseed** (plan 018, `charliek/shed#342`). A lane subscription's frame
@@ -251,7 +233,9 @@ verbatim._
   mid-stream, mid-seed, or mid-reseed alike — and reseeds with a fresh
   `Reset { reason: "lagged" } … Ready` rather than resuming, even on gx,
   because the dropped frames may already sit behind the client's cursor. The
-  terminal `Down` is the one frame that is never dropped.
+  terminal `Down` is the one frame that is never dropped. (Since plan 025 the
+  adapter that can resume and still reseeds on a lag is craze, gx's successor,
+  and the same bound covers a source's session list.)
 - **Agent lanes: a question's free-text answer reaches either agent**
   (plan 018, `charliek/shed#341`). `LaneAnswer::Question` gains a positional
   `custom_text` field, one entry per question, `null` where nothing was
@@ -260,7 +244,10 @@ verbatim._
   advertise `custom: true`, they lose the panel's one-click answer path;
   opencode appends the text as one more entry in that question's `answers`
   array, matching what its own TUI posts. Text aimed at a question whose
-  `custom` is `false` is refused before anything reaches the wire.
+  `custom` is `false` is refused before anything reaches the wire. (The gx
+  half left with the gx lane, plan 025; craze's questions take no free text
+  and say `custom: false`, so a lone single-choice craze question keeps the
+  one-click answer path.)
 - **Agent lanes: opencode answers the approval its own panel addressed, in
   that session's own scope** (plan 018, `charliek/shed#345`). opencode has no
   by-id GET for a permission or question, so an unscoped lookup across its
@@ -270,7 +257,8 @@ verbatim._
   `unknown_approval`, an id open in both lists is refused as ambiguous, and
   answering an approval whose session has since been deleted is now
   `unknown_session` rather than reaching the wire. Costs four GETs per answer
-  on a childless session, where gx — which has a by-id route — pays one.
+  on a childless session, where an agent with a by-id route (gx had one;
+  craze's `asks.get` is one) pays one.
 - **Agent lanes: the staged transcript/approvals view moves into
   `shed_app::lane_view`** (plan 018 §3.5). `LaneView`, `apply`, and the
   500-row cap move out of the Tauri client into the ungated `shed-app` crate,
@@ -294,7 +282,9 @@ verbatim._
   "no partial view before `Ready`" is observable rather than vacuous. The gx
   allowlist carries `add_approval` (an approval a client can answer, not only
   render) and `bodies_to` (every recorded body for a path suffix), so a cell in
-  another language can assert the bytes a decision actually posted.
+  another language can assert the bytes a decision actually posted. The gx
+  half — its fake, its allowlist and its cells — left with the gx lane in plan
+  025; the opencode half, `hold_seed`/`release_seed` included, is unchanged.
 - **`shed roost-provider` — kickoff moves into roost's own palette (S4,
   `charliek/shed#326`), replacing the kickoff half of the unreleased, sunset
   `sx`.** `shed roost-provider list|activate` implements roost's dynamic
@@ -302,9 +292,10 @@ verbatim._
   running sheds and `machines:` entries with no SSH; `activate` probes the
   chosen host over one SSH round trip plus roost's own client-bridge wire
   (`session.identify`, `tab.list`, `tab.open` — no `roostctl` needed on the
-  far side) and opens a tab running the chosen agent (`claude`, `codex`,
-  `cursor`, `opencode`, `gx`, `grok`) under `bash -lc` in an absolute working
-  directory. Every expected non-actionable state (not installed, not
+  far side) and opens a tab running the chosen agent under `bash -lc` in an
+  absolute working directory — `claude` or `opencode` since plan 025 (it
+  offered `codex`, `cursor`, `gx` and `grok` as well until then; every other
+  agent now starts through craze). Every expected non-actionable state (not installed, not
   running, protocol mismatch, unreachable, no local `ssh`, no agents found)
   exits zero with a pinned row rather than failing the phase.
   `shed roost-provider --install [--dry-run] [--uninstall]` writes the
@@ -321,7 +312,9 @@ verbatim._
   `roost.probe`/`roost.preview`/`roost.bootstrap`/`roost.launch`. After a
   Start it performs itself, the client wires the target's agent hooks
   (`session.set_agent_hooks {mode: "auto"}`) so a shed's `codex`/`cursor`
-  rows are meant to carry roost-sourced activity instead of liveness only —
+  rows are meant to carry roost-sourced activity instead of liveness only
+  (since plan 025 those are plain rows, their kind shown as roost reports it,
+  and the activity is still roost's) —
   see [`docs/extensions/roost-session-hosts.md`](https://charliek.github.io/shed/extensions/roost-session-hosts/)
   for the source ladder, the exact (narrow) rollback promise, the PATH
   warning, and `shed reset` handling. **Honestly incomplete in one way,
@@ -487,6 +480,89 @@ verbatim._
   - #375 — `shed sessions --all <shed>` silently ignores the shed argument (pre-existing;
     found by review of the roost-tab merge above, whose new half was made to match this
     behavior rather than fix it, so one command doesn't answer two different questions).
+- **craze is shed's agent lane** (plan 025, `charliek/shed#392`, `#393`). craze — one
+  per-machine hub in front of every cursor, grok, gx and native session — replaces the gx
+  lane and the per-agent integrations; opencode and Claude stay roost tabs.
+  `crates/shed-craze` is its adapter: `CrazeSource` for a hub, `CrazeLane` for one session.
+  **The source:** the Tauri app runs one per host — eager on this machine, where it joins
+  the running hub or, when none is running yet, starts one in the app's own session — and
+  attach-only on every `machines:` entry and running shed,
+  where a find-only `craze providers --hub --json` probe runs every 30 s while no hub is
+  there and the app never starts one in the background. craze is reached through craze's
+  published binary-finding ladder (`~/.local/bin` first) with the ladder's own directories
+  put on the PATH craze runs with, so the hub can find agents an SSH exec's PATH would hide.
+  A craze session is a row of its own (provider, model, what it is doing, needs-you with the
+  first ask's summary), and a roost tab craze owns folds into it while the hub feed is live.
+  **Create:** a sheet per machine — craze's providers in craze's order, a not-ready one
+  dimmed with craze's reason and fix and not selectable, recent directories or an absolute
+  path, an optional first prompt; no model, effort or permission mode — under a request id
+  reused only while the outcome is unknown, so a lost answer never makes a second session.
+  Opening it on a dormant remote machine is the explicit action that starts that machine's
+  hub. **Open in terminal** runs `craze attach` in a roost tab. **The transcript** resumes
+  silently from its cursor after a dropped connection (a "reconnecting" banner, no reseed)
+  and reseeds only when craze refuses the cursor; permission, question and plan approvals
+  come from craze's ask registry, a sub-agent's included; Cancel, Interject and Stop appear
+  where the session's capabilities offer them; a verb whose answer was lost is
+  `outcome_unknown` and never resent. **Settings:** a chip in the transcript header
+  (`<model> · <effort> · fast`) opens one sheet for the model, its options and the mode,
+  applied at once; an option is bound to the model on screen, so a model changed underneath
+  is refused ("the model changed; try again"), and a change whose answer was lost shows "not
+  confirmed" until the session restates its settings — unless the session's settings had
+  already put the new value on screen. On a Mac, a hub first started over
+  SSH cannot start cursor (craze SF-126); the sheet dims it with craze's fix. See
+  [Agent lanes](https://charliek.github.io/shed/desktop/agent-lanes/).
+- **The lane contract splits into a machine-level source and a session-scoped lane** (plan
+  025 C4, `charliek/shed#391`). `shed_core::lane::AgentLane` was server-scoped, with static
+  capabilities and a `create` no client called. It is now an `AgentSource` (`subscribe` to
+  the session list as `SourceEvent`s, `create_options`, `create`, `open`) and the
+  session-scoped `AgentLane` it opens: no verb takes an id, and `settings`/`set`/`stop`
+  join the verbs with no default bodies. Capabilities ride the stream
+  (`LaneEvent::Capabilities`, and `Settings` when they say so) instead of a getter;
+  `LaneEvent::Stale` is a non-terminal transport loss that a silent resume clears, so a
+  client reopens a lane only once it has ended (`Down`); a source's outage is the
+  non-terminal `SourceEvent::Offline`. `Publisher<T>` is the one bounded channel for both
+  levels, and `lane::conformance` (behind `test-support`) checks every adapter's streams.
+  opencode implements both levels (`OpencodeSource`). On the desktop's socket every `lane.*`
+  op now takes `kind`, `lane.open` answers `{session}`, and capabilities and settings are
+  read from `lane.messages`; `lane.stop`, `lane.settings` and `lane.set` are new.
+- **shed's codex, cursor, gx and grok kinds are retired** (plan 025 C2,
+  `charliek/shed#390`). `RcKind` loses `Codex`, `Cursor`, `Gx` and `Grok`; a roost tab
+  running one of those agents directly is a **plain row** — its raw kind, roost's activity
+  and directory, no typed input, no lane. `RcKind::Craze` names a craze-owned tab. The
+  `shed roost-provider` palette and the desktop's launch dialog offer `claude` and
+  `opencode`. `ROOST_WIRED_AGENTS` is unchanged: roost still wires codex, cursor and grok's
+  status hooks, which is where a plain row's activity comes from.
+- **Run a command in a tab** (plan 025 C3, `charliek/shed#390`). The desktop's launch
+  dialog gains a **Run a command** mode beside **An agent**, and the socket a `roost.run
+  {target, command, workdir?}` op: a roost tab running the command line as typed — split on
+  ASCII whitespace, with no shell and no quoting — gated by no kind. It is how an agent's
+  own TUI starts with flags of your choosing (`codex --model x`) now that the per-agent
+  kinds are gone. A blank command is refused, never read as a plain shell.
+- **The craze pins and their CI** (plan 025 C5–C7, `charliek/shed#394`). `craze-pin.env`
+  pins `CRAZE_TEST_SHA`, a merged craze `main` commit — craze v0.1.0's tag commit — that
+  CI builds `craze`, `craze-fake-host` and `craze-fake-agent` from (the
+  `.github/actions/craze-binaries` composite action, written for shed-mobile's CI to share;
+  `make craze-binaries` locally). shed-craze runs against the real hub, its cells fail rather than skip under
+  CI's `SHED_CRAZE_REQUIRE=1`, and it vendors craze's wire fixtures at that sha (`wire.PIN`,
+  diffed against craze's on every CI run). `make check-craze-pin` joins `make check`, and a
+  new `pins` CI job runs it beside `check-roost-pin`, which no CI job ran before. A new
+  `machine-transport` CI job runs the live machine-transport leg on a real sshd: the craze
+  remote command is pinned by its `craze-bridge-hub` and `craze-providers-hub` scenarios.
+  **At release time,** `release-plan.sh` runs `scripts/release/check-craze-pin.sh` for
+  every stable tag that ships `server`: `CRAZE_RELEASE` must name a craze release whose tag
+  commit equals `CRAZE_TEST_SHA`, or the tag is refused — an empty `CRAZE_RELEASE`
+  included. `SHED_RELEASE_ALLOW_NO_CRAZE=<reason>` is the owner's loud emergency override,
+  never set by CI. See `RELEASING.md` § "craze pin".
+- **The `extensions` rootfs image bakes `/usr/bin/craze`, craze v0.1.0, from its GitHub
+  release asset** (plan 025 §3.9 C13, `charliek/shed#394`). Folded into the same `RUN` as
+  the roost-session bake above, so the layer count is unchanged: `craze_linux_{amd64,arm64}.tar.gz`
+  is fetched, its sha256 checked against an in-tree digest (never fetched — a `.sha256`
+  from the same mutable release proves transport, not provenance), and `craze --version`
+  asserted to equal the pinned version at build time. `craze-pin.env`'s `CRAZE_RELEASE` is
+  now `0.1.0`; `make check-craze-pin` keeps both Dockerfiles' `CRAZE_VERSION` and digest
+  pairs in lockstep with it, and `scripts/release/check-craze-pin.sh --release v0.1.0`
+  now passes against the real tag. No systemd unit is enabled — `shed attach` starts a
+  lane's hub itself.
 
 ## v0.8.2 — 2026-08-17
 

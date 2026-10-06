@@ -33,6 +33,7 @@ fn sample_session() -> LaneSession {
         approximate: false,
         parent_id: Some("ses_root".into()),
         last_change_unix_ms: Some(1_757_260_800_000),
+        ..LaneSession::default()
     }
 }
 
@@ -222,26 +223,49 @@ fn lane_answer_choice_round_trips_and_stays_strict() {
     assert!(serde_json::from_value::<LaneAnswer>(serde_json::json!({"kind": "choice"})).is_err());
 }
 
+/// opencode's row, pinned; and the plan-025 shape: `create` gone (it is a
+/// SOURCE property now), `settings` and `stop` added and defaulted, so an older
+/// producer's row — `create` and all — still decodes.
 #[test]
 fn capabilities_round_trip_and_pin_opencodes_row() {
     let caps = LaneCapabilities {
         kind: "opencode".into(),
         interject: false,
-        create: true,
         cancel: true,
         approvals: true,
         history_cursor: false,
+        settings: false,
+        stop: false,
     };
     assert_eq!(
         round_trip(&caps),
         json!({
             "kind": "opencode",
             "interject": false,
-            "create": true,
             "cancel": true,
             "approvals": true,
-            "history_cursor": false
+            "history_cursor": false,
+            "settings": false,
+            "stop": false
         })
+    );
+
+    // A producer from before plan 025: it still says `create` and knows
+    // nothing of `settings`/`stop`. Tolerant: the old key is ignored and the
+    // new flags read as the conservative `false`.
+    let old: LaneCapabilities = serde_json::from_value(json!({
+        "kind": "opencode",
+        "interject": false,
+        "create": true,
+        "cancel": true,
+        "approvals": true,
+        "history_cursor": false
+    }))
+    .expect("a pre-025 capabilities object decodes");
+    assert_eq!(old, caps);
+    assert!(
+        round_trip(&old).get("create").is_none(),
+        "create is no longer a lane capability"
     );
 }
 
@@ -491,7 +515,7 @@ async fn lane_stop_aborts_the_pump_on_stop_and_on_drop() {
 /// half on the way out, which aborts the pump, so the receiver its caller holds is
 /// DEAD — silently, with no `Down` frame and no error.
 ///
-/// This is exactly `Ok(lane.subscribe(id, None).await?.rx)`. It is here so the
+/// This is exactly `Ok(lane.subscribe(None).await?.rx)`. It is here so the
 /// failure is documented and caught, rather than discovered in a client rendering
 /// an empty transcript.
 #[tokio::test]
@@ -574,29 +598,52 @@ async fn into_parts_keeps_frames_flowing_while_both_halves_live() {
 }
 
 // ---- the bounded channel (module doc, correction 13) ----
+//
+// One generic `Publisher<T>`, two aliases, ONE overflow policy — so every case
+// below is written once, generic over the frame, and run for BOTH aliases: a
+// lane's (`LanePublisher`, `LaneEvent`) and a source's (`SourcePublisher`,
+// `SourceEvent`). A regression in the shared code shows up twice; a copy of the
+// publisher that drifted for one level could not hide behind the other.
 
-/// [`LanePublisher::publish`]'s three outcomes, and the one that matters: a full
+/// A numbered frame for each level, so a test can say "frame n" generically.
+fn lane_frame(n: u64) -> LaneEvent {
+    LaneEvent::Ready { generation: n }
+}
+
+fn source_frame(n: u64) -> SourceEvent {
+    SourceEvent::Ready {
+        generation: n,
+        truncated: false,
+    }
+}
+
+/// [`Publisher::publish`]'s three outcomes, and the one that matters: a full
 /// queue DROPS the frame rather than queueing it behind, which is why the caller
-/// has to end its generation instead of carrying on.
-#[tokio::test]
-async fn publish_answers_sent_until_it_is_full_then_lagged() {
-    let (tx, mut rx) = LanePublisher::channel();
-    for generation in 0..LANE_CHANNEL_CAPACITY as u64 {
+/// has to end its generation instead of carrying on — and nothing published
+/// after the gap reaches the client.
+async fn publish_is_sent_until_full_then_lagged<T>(
+    (tx, mut rx): (Publisher<T>, mpsc::Receiver<T>),
+    frame: fn(u64) -> T,
+) where
+    T: PartialEq + std::fmt::Debug,
+{
+    for n in 0..LANE_CHANNEL_CAPACITY as u64 {
         assert_eq!(
-            tx.publish(LaneEvent::Ready { generation }),
+            tx.publish(frame(n)),
             Publish::Sent,
-            "frame {generation} is inside LANE_CHANNEL_CAPACITY and must fit"
+            "frame {n} is inside LANE_CHANNEL_CAPACITY and must fit"
         );
     }
     assert_eq!(
-        tx.publish(LaneEvent::Ready { generation: 9_999 }),
+        tx.publish(frame(9_999)),
         Publish::Lagged,
         "the frame past the bound is refused, not queued"
     );
 
-    // And it is GONE — the queue holds exactly what fit, in order.
-    for generation in 0..LANE_CHANNEL_CAPACITY as u64 {
-        assert_eq!(rx.recv().await, Some(LaneEvent::Ready { generation }));
+    // And it is GONE — the queue holds exactly what fit, in order, and no
+    // post-gap frame sneaks in behind it.
+    for n in 0..LANE_CHANNEL_CAPACITY as u64 {
+        assert_eq!(rx.recv().await, Some(frame(n)));
     }
     assert!(
         rx.try_recv().is_err(),
@@ -604,61 +651,87 @@ async fn publish_answers_sent_until_it_is_full_then_lagged() {
     );
 }
 
-/// The terminal `Down` is the one frame that is never dropped:
-/// [`LanePublisher::publish_final`] WAITS for room and lands after everything
-/// the client had queued.
 #[tokio::test]
-async fn publish_final_waits_for_room_and_the_down_still_lands() {
-    let (tx, mut rx) = LanePublisher::channel();
-    for generation in 0..LANE_CHANNEL_CAPACITY as u64 {
-        assert_eq!(tx.publish(LaneEvent::Ready { generation }), Publish::Sent);
+async fn publish_answers_sent_until_it_is_full_then_lagged() {
+    publish_is_sent_until_full_then_lagged(LanePublisher::channel(), lane_frame).await;
+    publish_is_sent_until_full_then_lagged(SourcePublisher::channel(), source_frame).await;
+}
+
+/// The terminal frame is the one that is never dropped:
+/// [`Publisher::publish_final`] WAITS for room under a full queue and lands
+/// after everything the client had queued.
+async fn publish_final_waits_and_lands_last<T>(
+    (tx, mut rx): (Publisher<T>, mpsc::Receiver<T>),
+    frame: fn(u64) -> T,
+    last: T,
+) where
+    T: PartialEq + std::fmt::Debug + Clone + Send + 'static,
+{
+    for n in 0..LANE_CHANNEL_CAPACITY as u64 {
+        assert_eq!(tx.publish(frame(n)), Publish::Sent);
     }
-    let sending = tokio::spawn(async move {
-        tx.publish_final(LaneEvent::Down {
-            reason: "lagged-then-gone".to_string(),
-        })
-        .await;
+    let sending = tokio::spawn({
+        let last = last.clone();
+        async move { tx.publish_final(last).await }
     });
     // Nothing can move while the queue is full, and `publish_final` must be
     // waiting rather than having quietly dropped the frame.
     tokio::task::yield_now().await;
     assert!(
         !sending.is_finished(),
-        "publish_final must await room for the Down, not drop it"
+        "publish_final must await room for the terminal frame, not drop it"
     );
 
     let mut frames = 0usize;
-    let mut last = None;
+    let mut seen = None;
     while let Some(ev) = tokio::time::timeout(RECV_TIMEOUT, rx.recv())
         .await
-        .expect("the Down must arrive once the queue drains")
+        .expect("the terminal frame must arrive once the queue drains")
     {
         frames += 1;
-        last = Some(ev);
+        seen = Some(ev);
     }
     assert_eq!(
         frames,
         LANE_CHANNEL_CAPACITY + 1,
-        "everything, plus the Down"
+        "everything, plus the terminal frame"
     );
-    assert_eq!(
-        last,
-        Some(LaneEvent::Down {
-            reason: "lagged-then-gone".to_string()
-        }),
-        "the Down is the last thing a subscription says"
-    );
+    assert_eq!(seen, Some(last), "it is the last thing a subscription says");
     sending.await.expect("the sender task finishes");
 }
 
-/// [`LanePublisher::wait_drained`] is "the client has caught up ENTIRELY", not
+#[tokio::test]
+async fn publish_final_waits_for_room_and_the_down_still_lands() {
+    publish_final_waits_and_lands_last(
+        LanePublisher::channel(),
+        lane_frame,
+        LaneEvent::Down {
+            reason: "lagged-then-gone".to_string(),
+        },
+    )
+    .await;
+    // A source has no terminal frame of its own, but the publisher is the same
+    // code: whatever it is handed last is never the dropped one.
+    publish_final_waits_and_lands_last(
+        SourcePublisher::channel(),
+        source_frame,
+        SourceEvent::Offline {
+            reason: "the last word".to_string(),
+            cause: SourceOffline::Unreachable,
+        },
+    )
+    .await;
+}
+
+/// [`Publisher::wait_drained`] is "the client has caught up ENTIRELY", not
 /// "there is room again". A reseed republishes a whole seed, so starting one
 /// against a merely-not-full queue would lag again a few frames in.
-#[tokio::test]
-async fn wait_drained_resolves_only_when_every_slot_is_free() {
-    let (tx, mut rx) = LanePublisher::channel();
-    for generation in 0..3u64 {
-        assert_eq!(tx.publish(LaneEvent::Ready { generation }), Publish::Sent);
+async fn wait_drained_needs_every_slot<T>(
+    (tx, mut rx): (Publisher<T>, mpsc::Receiver<T>),
+    frame: fn(u64) -> T,
+) {
+    for n in 0..3u64 {
+        assert_eq!(tx.publish(frame(n)), Publish::Sent);
     }
     rx.recv().await.expect("the first frame");
     assert!(
@@ -676,21 +749,68 @@ async fn wait_drained_resolves_only_when_every_slot_is_free() {
         .expect("the receiver is still alive");
 }
 
+#[tokio::test]
+async fn wait_drained_resolves_only_when_every_slot_is_free() {
+    wait_drained_needs_every_slot(LanePublisher::channel(), lane_frame).await;
+    wait_drained_needs_every_slot(SourcePublisher::channel(), source_frame).await;
+}
+
 /// A subscriber that went away ends BOTH awaits — the adapter then stops
 /// silently, with no `Down` and no reseed, exactly as its `is_closed` checks
-/// already do.
+/// A terminal path's last rows: [`Publisher::publish_waiting`] WAITS for room
+/// under a full queue (never `Lagged`, never dropped), keeps the publisher, and
+/// the frames it waited with land in order ahead of the terminal one.
 #[tokio::test]
-async fn a_dropped_receiver_ends_publish_and_both_awaits() {
-    let (tx, rx) = LanePublisher::channel();
-    assert_eq!(
-        tx.publish(LaneEvent::Ready { generation: 1 }),
-        Publish::Sent
+async fn publish_waiting_waits_for_room_and_keeps_the_order() {
+    let (tx, mut rx) = LanePublisher::channel();
+    for n in 0..LANE_CHANNEL_CAPACITY as u64 {
+        assert_eq!(tx.publish(lane_frame(n)), Publish::Sent);
+    }
+    let last_row = lane_frame(u64::MAX);
+    let sending = tokio::spawn({
+        let last_row = last_row.clone();
+        async move {
+            tx.publish_waiting(last_row)
+                .await
+                .expect("the subscriber is there");
+            tx.publish_final(LaneEvent::Down {
+                reason: "done".to_string(),
+            })
+            .await;
+        }
+    });
+    tokio::task::yield_now().await;
+    assert!(
+        !sending.is_finished(),
+        "publish_waiting must await room, not drop the row"
     );
+    let mut frames = Vec::new();
+    while let Some(ev) = tokio::time::timeout(RECV_TIMEOUT, rx.recv())
+        .await
+        .expect("the waited frames arrive once the queue drains")
+    {
+        frames.push(ev);
+    }
+    assert_eq!(frames.len(), LANE_CHANNEL_CAPACITY + 2);
+    assert_eq!(frames[LANE_CHANNEL_CAPACITY], last_row, "the row, then…");
+    assert!(
+        matches!(frames.last(), Some(LaneEvent::Down { .. })),
+        "…the Down, last"
+    );
+    sending.await.expect("the sender task finishes");
+}
+
+/// already do.
+async fn a_dropped_receiver_ends_everything<T>(
+    (tx, rx): (Publisher<T>, mpsc::Receiver<T>),
+    frame: fn(u64) -> T,
+) {
+    assert_eq!(tx.publish(frame(1)), Publish::Sent);
     drop(rx);
 
     assert!(tx.is_closed());
     assert_eq!(
-        tx.publish(LaneEvent::Ready { generation: 2 }),
+        tx.publish(frame(2)),
         Publish::Closed,
         "a closed channel is Closed, never Lagged — the two mean different things"
     );
@@ -700,84 +820,137 @@ async fn a_dropped_receiver_ends_publish_and_both_awaits() {
             .expect("wait_drained must not hang on a closed channel"),
         Err(Closed),
     );
-    tokio::time::timeout(
-        RECV_TIMEOUT,
-        tx.publish_final(LaneEvent::Down {
-            reason: "nobody is listening".to_string(),
-        }),
-    )
-    .await
-    .expect("publish_final must return on a closed channel rather than hang");
+    assert_eq!(
+        tokio::time::timeout(RECV_TIMEOUT, tx.publish_waiting(frame(3)))
+            .await
+            .expect("publish_waiting must not hang on a closed channel"),
+        Err(Closed),
+    );
+    tokio::time::timeout(RECV_TIMEOUT, tx.publish_final(frame(4)))
+        .await
+        .expect("publish_final must return on a closed channel rather than hang");
 }
 
-// ---- the trait ----
+#[tokio::test]
+async fn a_dropped_receiver_ends_publish_and_both_awaits() {
+    a_dropped_receiver_ends_everything(LanePublisher::channel(), lane_frame).await;
+    a_dropped_receiver_ends_everything(SourcePublisher::channel(), source_frame).await;
+}
 
-/// The trait is object-safe and its futures are `Send`: a client holds one
-/// adapter behind `Arc<dyn AgentLane>` and drives it from any task, which is the
-/// whole point of the `&self` signatures.
+/// The source subscription is the same handle as the lane's: `into_parts`
+/// keeps both halves, and dropping the stop half ends the pump.
+#[tokio::test]
+async fn a_source_subscription_is_torn_down_like_a_lane_one() {
+    let (tx, rx) = SourcePublisher::channel();
+    let task = tokio::spawn(async move {
+        tx.publish(source_frame(1));
+        std::future::pending::<()>().await;
+    });
+    let sub: SourceSubscription = Subscription {
+        rx,
+        stop: LaneStop::new(task),
+    };
+    let (mut rx, stop) = sub.into_parts();
+    assert_eq!(
+        tokio::time::timeout(RECV_TIMEOUT, rx.recv())
+            .await
+            .expect("a live source subscription delivers"),
+        Some(source_frame(1))
+    );
+    drop(stop);
+    assert!(tokio::time::timeout(RECV_TIMEOUT, rx.recv())
+        .await
+        .expect("dropping the stop half aborts the source pump")
+        .is_none());
+}
+
+// ---- the traits ----
+
+/// Both traits are object-safe and their futures are `Send`: a client holds a
+/// source behind `Arc<dyn AgentSource>` and the lanes it opens behind
+/// `Arc<dyn AgentLane>`, and drives either from any task, which is the whole
+/// point of the `&self` signatures. The lane is SESSION-scoped — no verb takes
+/// an id — and `settings`/`set`/`stop` have no default bodies, so an adapter
+/// that forgets one does not compile.
 #[test]
-fn agent_lane_is_object_safe() {
-    struct Nothing;
+fn both_traits_are_object_safe_and_the_lane_is_session_scoped() {
+    struct NoLane(String);
 
     #[async_trait::async_trait]
-    impl AgentLane for Nothing {
-        fn capabilities(&self) -> LaneCapabilities {
-            LaneCapabilities {
-                kind: "nothing".into(),
-                interject: false,
-                create: false,
-                cancel: false,
-                approvals: false,
-                history_cursor: false,
-            }
+    impl AgentLane for NoLane {
+        fn session_id(&self) -> &str {
+            &self.0
         }
-        async fn sessions(&self) -> Result<Vec<LaneSession>, LaneError> {
-            Ok(Vec::new())
-        }
-        async fn session(&self, _id: &str) -> Result<LaneSession, LaneError> {
+        async fn session(&self) -> Result<LaneSession, LaneError> {
             Err(LaneError::UnknownSession)
         }
         async fn history(
             &self,
-            _id: &str,
             _cursor: Option<&str>,
             _limit: u32,
         ) -> Result<LaneHistory, LaneError> {
             Err(LaneError::UnknownSession)
         }
-        async fn create(&self, _cwd: &str, _text: &str) -> Result<LaneSession, LaneError> {
+        async fn subscribe(&self, _cursor: Option<String>) -> Result<LaneSubscription, LaneError> {
+            Err(LaneError::Unavailable("nothing to dial".into()))
+        }
+        async fn send(&self, _text: &str, _mode: SendMode) -> Result<(), LaneError> {
             Err(LaneError::NotAccepting)
         }
-        async fn send(&self, _id: &str, _text: &str, _mode: SendMode) -> Result<(), LaneError> {
+        async fn cancel(&self) -> Result<(), LaneError> {
             Err(LaneError::NotAccepting)
         }
-        async fn cancel(&self, _id: &str) -> Result<(), LaneError> {
-            Err(LaneError::NotAccepting)
-        }
-        async fn approvals(&self, _id: &str) -> Result<Vec<LaneApproval>, LaneError> {
+        async fn approvals(&self) -> Result<Vec<LaneApproval>, LaneError> {
             Ok(Vec::new())
         }
-        async fn answer(
-            &self,
-            _id: &str,
-            _approval_id: &str,
-            _answer: LaneAnswer,
-        ) -> Result<(), LaneError> {
+        async fn answer(&self, _approval_id: &str, _answer: LaneAnswer) -> Result<(), LaneError> {
             Err(LaneError::UnknownApproval)
         }
-        async fn subscribe(
-            &self,
-            _id: &str,
-            _cursor: Option<String>,
-        ) -> Result<LaneSubscription, LaneError> {
-            Err(LaneError::Unavailable("nothing to dial".into()))
+        async fn settings(&self) -> Result<LaneSettings, LaneError> {
+            Ok(LaneSettings::default())
+        }
+        async fn set(&self, _change: LaneSettingChange) -> Result<(), LaneError> {
+            Err(LaneError::Failed(
+                "setting is not supported by nothing".into(),
+            ))
+        }
+        async fn stop(&self) -> Result<(), LaneError> {
+            Err(LaneError::Failed(
+                "stopping is not supported by nothing".into(),
+            ))
         }
     }
 
-    let lane: std::sync::Arc<dyn AgentLane> = std::sync::Arc::new(Nothing);
-    assert_eq!(lane.capabilities().kind, "nothing");
+    struct NoSource;
+
+    #[async_trait::async_trait]
+    impl AgentSource for NoSource {
+        fn kind(&self) -> &str {
+            "nothing"
+        }
+        async fn subscribe(&self) -> Result<SourceSubscription, LaneError> {
+            Err(LaneError::Unavailable("nothing to dial".into()))
+        }
+        async fn create_options(&self) -> Result<LaneCreateOptions, LaneError> {
+            Ok(LaneCreateOptions::default())
+        }
+        async fn create(&self, _request: LaneCreateRequest) -> Result<LaneCreated, LaneError> {
+            Err(LaneError::NotAccepting)
+        }
+        async fn open(&self, session_id: &str) -> Result<Arc<dyn AgentLane>, LaneError> {
+            Ok(Arc::new(NoLane(session_id.to_string())))
+        }
+    }
+
+    let source: Arc<dyn AgentSource> = Arc::new(NoSource);
+    assert_eq!(source.kind(), "nothing");
     fn assert_send<T: Send>(_: &T) {}
-    assert_send(&lane.sessions());
+    assert_send(&source.subscribe());
+    assert_send(&source.open("ses_1"));
+    let lane: Arc<dyn AgentLane> = Arc::new(NoLane("ses_1".into()));
+    assert_eq!(lane.session_id(), "ses_1", "the id is bound, not passed");
+    assert_send(&lane.send("hi", SendMode::Queue));
+    assert_send(&lane.stop());
 }
 
 /// A `LaneQuestion` whose optional booleans are absent must decode — opencode
@@ -1059,27 +1232,32 @@ fn option_for_resolves_every_decision_by_kind_never_by_id() {
     }
 }
 
-/// gx's REAL five, and the escalation the by-kind rule used to pick.
+/// A REAL five-option permission, and the escalation the by-kind rule used to
+/// pick — kept as CONTRACT coverage, not as gx coverage.
 ///
-/// Recorded off a live gx leader: one `session/request_permission` for
-/// `id -un`. Two of the five options declare `allow_once` — the ordinary "Yes,
-/// proceed" AND an "always-approve mode" switch that stops the agent asking
-/// about ANYTHING for the rest of the session — and the escalating one is
-/// offered FIRST.
+/// Recorded off a live gx leader in plan 017 (gx itself was retired in plan
+/// 025, shed#390; the shed-gx adapter is gone and nothing in shed speaks to gx
+/// any more): one `session/request_permission` for `id -un`. Two of the five
+/// options declare `allow_once` — the ordinary "Yes, proceed" AND an
+/// "always-approve mode" switch that stops the agent asking about ANYTHING for
+/// the rest of the session — and the escalating one is offered FIRST. craze
+/// passes an ACP agent's permission options through verbatim (module doc,
+/// correction 3), so this exact shape can reach [`LaneApproval::option_for`]
+/// again from any agent craze drives; that is why the fixture stays.
 ///
 /// Under the original rule ("the first option in offered order whose kind
 /// matches"), [`LaneDecision::AllowOnce`] resolved to `enable-always-approve`:
 /// a human tapping "Allow once" would silently have disabled permission
 /// prompting. That is the exact failure the by-kind design exists to prevent,
-/// and only a real agent exposes it — the plan assumed `kind` disambiguates,
-/// and against gx it does not.
+/// and only a real agent exposed it — the plan assumed `kind` disambiguates,
+/// and against a real agent it does not.
 ///
-/// So the rule is now "exactly one, or nothing". This test fails on the gx case
+/// So the rule is now "exactly one, or nothing". This test fails on this case
 /// under the old first-match implementation, which is what makes it
 /// load-bearing rather than decorative.
 ///
-/// The option set is gx's own generic vocabulary — no user data, no paths, no
-/// session content — which is why it is safe to pin here verbatim.
+/// The option set is the agent's own generic vocabulary — no user data, no
+/// paths, no session content — which is why it is safe to pin here verbatim.
 #[test]
 fn real_gx_offers_two_allow_once_options_so_a_decision_cannot_choose() {
     let gx = approval_offering(vec![
@@ -1455,4 +1633,516 @@ fn normalize_refuses_free_text_on_a_question_that_does_not_take_it() {
     let out = normalize_question_answer(&qs, &[], &[None, Some("   ".into())])
         .expect("blank is not text");
     assert_eq!(out[1].text, None);
+}
+
+// ---- plan 025: the split's new DTOs ----
+
+/// The roster facts a craze row carries survive a round trip under their own
+/// snake_case keys — and every one is OMITTED when absent, so an opencode row
+/// is byte-identical to what this type emitted before the fields existed, and
+/// a pre-025 row still decodes.
+#[test]
+fn lane_session_carries_the_roster_facts_and_omits_them_when_absent() {
+    let full = LaneSession {
+        provider: Some("grok".into()),
+        model: Some("grok-4".into()),
+        doing: Some("running the tests".into()),
+        head_ask_summary: Some("run `make check`?".into()),
+        last_reply: Some("done — two failures left".into()),
+        since_unix_ms: Some(1_791_028_800_000),
+        attached: Some(2),
+        start_error: Some("acp: agent exited".into()),
+        provider_session_id: Some("prov-1".into()),
+        permission_mode: Some("prompt".into()),
+        tab_id: Some(7),
+        ..sample_session()
+    };
+    let encoded = round_trip(&full);
+    for (key, want) in [
+        ("provider", json!("grok")),
+        ("model", json!("grok-4")),
+        ("doing", json!("running the tests")),
+        ("head_ask_summary", json!("run `make check`?")),
+        ("last_reply", json!("done — two failures left")),
+        ("since_unix_ms", json!(1_791_028_800_000i64)),
+        ("attached", json!(2)),
+        ("start_error", json!("acp: agent exited")),
+        ("provider_session_id", json!("prov-1")),
+        ("permission_mode", json!("prompt")),
+        ("tab_id", json!(7)),
+    ] {
+        assert_eq!(encoded[key], want, "{key}");
+    }
+
+    // Absent: not one of them on the wire.
+    let bare = round_trip(&sample_session());
+    for key in [
+        "provider",
+        "model",
+        "doing",
+        "head_ask_summary",
+        "last_reply",
+        "since_unix_ms",
+        "attached",
+        "start_error",
+        "provider_session_id",
+        "permission_mode",
+        "tab_id",
+    ] {
+        assert!(bare.get(key).is_none(), "{key} must be omitted when absent");
+    }
+
+    // A pre-025 row — none of the new keys — decodes with all of them `None`.
+    let old: LaneSession = serde_json::from_value(json!({
+        "id": "ses_1", "title": "t", "cwd": "/w", "activity": "idle",
+        "pending_approvals": 0, "approximate": true,
+    }))
+    .expect("a pre-025 row decodes");
+    assert_eq!(
+        old,
+        LaneSession {
+            id: "ses_1".into(),
+            title: "t".into(),
+            cwd: "/w".into(),
+            activity: RcActivity::Idle,
+            approximate: true,
+            ..LaneSession::default()
+        }
+    );
+}
+
+/// The three frames the split added to a lane's stream, tagged like their
+/// siblings with the payload nested — `LaneCapabilities` has a `kind` of its
+/// own, which a flattened variant would collide with the tag.
+#[test]
+fn the_new_lane_frames_are_tagged_and_nested() {
+    let caps = LaneCapabilities {
+        kind: "craze".into(),
+        interject: true,
+        cancel: true,
+        approvals: true,
+        history_cursor: true,
+        settings: true,
+        stop: true,
+    };
+    let encoded = round_trip(&LaneEvent::Capabilities {
+        capabilities: caps.clone(),
+    });
+    assert_eq!(encoded["kind"], "capabilities");
+    assert_eq!(
+        encoded["capabilities"]["kind"], "craze",
+        "the capabilities' own kind survives the tag"
+    );
+
+    let settings = LaneSettings {
+        model: Some("m1".into()),
+        models: vec![LaneChoice {
+            id: "m1".into(),
+            name: "Model one".into(),
+            rank: Some(1),
+            description: None,
+        }],
+        ..LaneSettings::default()
+    };
+    let encoded = round_trip(&LaneEvent::Settings { settings });
+    assert_eq!(encoded["kind"], "settings");
+    assert_eq!(encoded["settings"]["model"], "m1");
+
+    assert_eq!(
+        round_trip(&LaneEvent::Stale {
+            reason: "reconnecting".into()
+        }),
+        json!({"kind": "stale", "reason": "reconnecting"})
+    );
+}
+
+/// Every [`SourceEvent`], pinned against its literal JSON — the shape the Dart
+/// mirror is written against.
+#[test]
+fn source_event_is_tagged_on_kind_in_snake_case() {
+    assert_eq!(
+        round_trip(&SourceEvent::Reset {
+            reason: "seed".into(),
+            generation: 1
+        }),
+        json!({"kind": "reset", "reason": "seed", "generation": 1})
+    );
+    let encoded = round_trip(&SourceEvent::Session {
+        session: sample_session(),
+    });
+    assert_eq!(encoded["kind"], "session");
+    assert_eq!(encoded["session"]["id"], "ses_1");
+    assert_eq!(
+        round_trip(&SourceEvent::Removed {
+            session_id: "ses_1".into()
+        }),
+        json!({"kind": "removed", "session_id": "ses_1"})
+    );
+    assert_eq!(
+        round_trip(&SourceEvent::Capabilities {
+            capabilities: SourceCapabilities {
+                kind: "opencode".into(),
+                create: true,
+                create_options: true,
+            }
+        }),
+        json!({"kind": "capabilities",
+               "capabilities": {"kind": "opencode", "create": true, "create_options": true}})
+    );
+    assert_eq!(
+        round_trip(&SourceEvent::Ready {
+            generation: 2,
+            truncated: true
+        }),
+        json!({"kind": "ready", "generation": 2, "truncated": true})
+    );
+    assert_eq!(
+        round_trip(&SourceEvent::Offline {
+            reason: "connection refused".into(),
+            cause: SourceOffline::Unreachable,
+        }),
+        json!({"kind": "offline", "reason": "connection refused", "cause": "unreachable"})
+    );
+
+    // Tolerant: an absent `truncated` claims nothing, and an unknown kind is a
+    // frame to ignore, not a failed read.
+    let ready: SourceEvent = serde_json::from_value(json!({"kind": "ready", "generation": 3}))
+        .expect("a Ready without truncated decodes");
+    assert_eq!(
+        ready,
+        SourceEvent::Ready {
+            generation: 3,
+            truncated: false
+        }
+    );
+    let unknown: SourceEvent =
+        serde_json::from_value(json!({"kind": "epoch", "hub": "new"})).expect("tolerated");
+    assert_eq!(unknown, SourceEvent::Unknown);
+    assert_eq!(
+        round_trip(&SourceEvent::Unknown),
+        json!({"kind": "unknown"})
+    );
+}
+
+/// The three tolerant enums the split added follow [`LaneApprovalKind`]'s
+/// pattern EXACTLY: a bare snake_case string each way, and an unknown word kept
+/// in `Other` — never an error, and never encoded as an object (what derived
+/// serde would do with `Other("x")`). Each is also exercised nested, where a
+/// strict value would have taken the whole frame with it.
+#[test]
+fn the_tolerant_enums_are_bare_strings_and_keep_an_unknown_word() {
+    for (v, wire) in [
+        (SourceOffline::NotInstalled, "not_installed"),
+        (SourceOffline::TooOld, "too_old"),
+        (SourceOffline::Unreachable, "unreachable"),
+        (SourceOffline::Failed, "failed"),
+    ] {
+        assert_eq!(round_trip(&v), json!(wire));
+        assert_eq!(SourceOffline::from_wire(wire), v);
+        assert!(v.is_known());
+    }
+    for (v, wire) in [
+        (LaneProviderState::Ready, "ready"),
+        (LaneProviderState::NeedsSetup, "needs_setup"),
+        (LaneProviderState::Unavailable, "unavailable"),
+    ] {
+        assert_eq!(round_trip(&v), json!(wire));
+        assert_eq!(LaneProviderState::from_wire(wire), v);
+        assert!(v.is_known());
+    }
+    for (v, wire) in [
+        (LanePromptOutcome::None, "none"),
+        (LanePromptOutcome::Accepted, "accepted"),
+        (LanePromptOutcome::Unknown, "unknown"),
+        (LanePromptOutcome::Refused, "refused"),
+    ] {
+        assert_eq!(round_trip(&v), json!(wire));
+        assert_eq!(LanePromptOutcome::from_wire(wire), v);
+        assert!(v.is_known());
+    }
+
+    // An unknown word: preserved, a bare string on the way back out.
+    let cause: SourceOffline = serde_json::from_value(json!("rate_limited")).expect("tolerated");
+    assert_eq!(cause, SourceOffline::Other("rate_limited".into()));
+    assert!(!cause.is_known());
+    assert_eq!(round_trip(&cause), json!("rate_limited"));
+    let state: LaneProviderState = serde_json::from_value(json!("beta")).expect("tolerated");
+    assert_eq!(state, LaneProviderState::Other("beta".into()));
+    assert_eq!(round_trip(&state), json!("beta"));
+    let outcome: LanePromptOutcome = serde_json::from_value(json!("queued")).expect("tolerated");
+    assert_eq!(outcome, LanePromptOutcome::Other("queued".into()));
+    assert_eq!(round_trip(&outcome), json!("queued"));
+
+    // …and nested, where it matters: the enclosing frame or result survives.
+    let ev: SourceEvent = serde_json::from_value(json!({
+        "kind": "offline", "reason": "r", "cause": "quota_exhausted",
+    }))
+    .expect("an unknown cause must not fail the frame");
+    assert_eq!(
+        ev,
+        SourceEvent::Offline {
+            reason: "r".into(),
+            cause: SourceOffline::Other("quota_exhausted".into()),
+        }
+    );
+    let provider: LaneProvider = serde_json::from_value(json!({
+        "id": "x", "label": "X", "state": "deprecated",
+    }))
+    .expect("an unknown provider state must not fail the provider");
+    assert_eq!(
+        provider.state,
+        LaneProviderState::Other("deprecated".into())
+    );
+    let created: LaneCreated = serde_json::from_value(json!({
+        "session": round_trip(&sample_session()), "prompt": "deferred",
+    }))
+    .expect("an unknown prompt outcome must not fail the create's answer");
+    assert_eq!(created.prompt, LanePromptOutcome::Other("deferred".into()));
+}
+
+/// The two OUTBOUND types the split added are strict to the field: a create or
+/// a setting change carrying a key this build would drop is refused at decode,
+/// not carried out without it. `deny_unknown_fields` on the internally tagged
+/// [`LaneSettingChange`] is the subtle half — the `kind` tag must still be
+/// accepted — so both are asserted, as they are for [`LaneAnswer`].
+#[test]
+fn create_requests_and_setting_changes_refuse_unknown_fields() {
+    let full = LaneCreateRequest {
+        cwd: "/home/shed/lumen".into(),
+        provider: Some("grok".into()),
+        prompt: Some("fix the flaky test".into()),
+        request_id: "new-9c1f04ab".into(),
+    };
+    assert_eq!(
+        round_trip(&full),
+        json!({"cwd": "/home/shed/lumen", "provider": "grok",
+               "prompt": "fix the flaky test", "request_id": "new-9c1f04ab"})
+    );
+    let minimal = LaneCreateRequest {
+        provider: None,
+        prompt: None,
+        ..full.clone()
+    };
+    assert_eq!(
+        round_trip(&minimal),
+        json!({"cwd": "/home/shed/lumen", "request_id": "new-9c1f04ab"}),
+        "the optional halves are omitted, never null"
+    );
+    for bad in [
+        json!({"cwd": "/w", "request_id": "r", "model": "m"}),
+        json!({"cwd": "/w", "request_id": "r", "permission_mode": "bypass"}),
+    ] {
+        assert!(
+            serde_json::from_value::<LaneCreateRequest>(bad.clone()).is_err(),
+            "{bad} must be refused"
+        );
+    }
+    assert!(
+        serde_json::from_value::<LaneCreateRequest>(json!({"cwd": "/w"})).is_err(),
+        "a create with no request id is not a create"
+    );
+
+    for (change, wire) in [
+        (
+            LaneSettingChange::Model { id: "m1".into() },
+            json!({"kind": "model", "id": "m1"}),
+        ),
+        (
+            LaneSettingChange::Mode { id: "plan".into() },
+            json!({"kind": "mode", "id": "plan"}),
+        ),
+        (
+            LaneSettingChange::Config {
+                id: "effort".into(),
+                value: "high".into(),
+                for_model: None,
+            },
+            json!({"kind": "config", "id": "effort", "value": "high"}),
+        ),
+        // Amendment A13: the model the client displayed the option for.
+        (
+            LaneSettingChange::Config {
+                id: "effort".into(),
+                value: "high".into(),
+                for_model: Some("grok-4.6".into()),
+            },
+            json!({"kind": "config", "id": "effort", "value": "high", "for_model": "grok-4.6"}),
+        ),
+    ] {
+        assert_eq!(round_trip(&change), wire);
+    }
+    for bad in [
+        // An unknown field inside each struct variant — `for_model` is a
+        // config change's alone: a model or mode change takes none.
+        json!({"kind": "model", "id": "m1", "for_model": "m0"}),
+        json!({"kind": "mode", "id": "plan", "for_model": "m0"}),
+        json!({"kind": "config", "id": "effort", "value": "high", "for_model": "m0", "extra": 1}),
+        json!({"kind": "config", "id": "effort", "value": "high", "forModel": "m0"}),
+        json!({"kind": "mode", "id": "plan", "nonsense": 1}),
+        json!({"kind": "config", "id": "effort", "value": "high", "extra": true}),
+        // An unknown kind — including `option`, which this type is NOT named.
+        json!({"kind": "option", "id": "effort", "value": "high"}),
+        json!({"kind": "fast", "on": true}),
+        // A missing payload.
+        json!({"kind": "config", "id": "effort"}),
+    ] {
+        assert!(
+            serde_json::from_value::<LaneSettingChange>(bad.clone()).is_err(),
+            "{bad} must be refused"
+        );
+    }
+}
+
+/// The result DTOs round-trip, and decode TOLERANTLY: an unknown field is
+/// ignored and an absent list is empty — a newer producer's create options or
+/// settings must degrade, not fail.
+#[test]
+fn create_options_created_and_settings_round_trip_and_tolerate() {
+    let options = LaneCreateOptions {
+        providers: vec![
+            LaneProvider {
+                id: "cursor".into(),
+                label: "cursor".into(),
+                state: LaneProviderState::Unavailable,
+                reason: Some("cursor-agent not found on PATH".into()),
+                fix: Some("install cursor-agent".into()),
+            },
+            LaneProvider {
+                id: "grok".into(),
+                label: "grok".into(),
+                state: LaneProviderState::Ready,
+                reason: None,
+                fix: None,
+            },
+        ],
+        default_provider: Some("grok".into()),
+        recent_dirs: vec!["/home/me/lumen".into()],
+    };
+    let encoded = round_trip(&options);
+    assert_eq!(encoded["providers"][0]["state"], "unavailable");
+    assert!(
+        encoded["providers"][1].get("reason").is_none(),
+        "a ready provider carries no reason"
+    );
+    let sparse: LaneCreateOptions =
+        serde_json::from_value(json!({"providers": [], "epoch": 4})).expect("tolerated");
+    assert_eq!(sparse, LaneCreateOptions::default());
+
+    let created = LaneCreated {
+        session: sample_session(),
+        prompt: LanePromptOutcome::Refused,
+        prompt_error: Some("the session refused it".into()),
+    };
+    assert_eq!(round_trip(&created)["prompt"], "refused");
+
+    let settings = LaneSettings {
+        model: Some("m1".into()),
+        models: vec![LaneChoice {
+            id: "m1".into(),
+            name: "Model one".into(),
+            rank: Some(2),
+            description: Some("the fast one".into()),
+        }],
+        mode: Some("default".into()),
+        modes: vec![LaneChoice {
+            id: "default".into(),
+            name: "Default".into(),
+            rank: None,
+            description: None,
+        }],
+        options: vec![LaneSetting {
+            id: "effort".into(),
+            name: "Effort".into(),
+            category: "thought_level".into(),
+            current: "high".into(),
+            values: vec![LaneChoice {
+                id: "high".into(),
+                name: "High".into(),
+                rank: None,
+                description: None,
+            }],
+        }],
+        usage: Some(LaneUsage {
+            context_tokens: Some(12_000),
+            context_window: Some(200_000),
+        }),
+    };
+    let encoded = round_trip(&settings);
+    assert_eq!(encoded["options"][0]["current"], "high");
+    assert_eq!(encoded["usage"]["context_window"], 200_000);
+    assert_eq!(
+        round_trip(&LaneSettings::default()),
+        json!({"models": [], "modes": [], "options": []}),
+        "nothing to show is three empty lists and no absent field on the wire"
+    );
+    let sparse: LaneSettings =
+        serde_json::from_value(json!({"model": "m", "catalog_rev": 9})).expect("tolerated");
+    assert_eq!(
+        sparse,
+        LaneSettings {
+            model: Some("m".into()),
+            ..LaneSettings::default()
+        }
+    );
+}
+
+/// The three plan-025 tolerant enums take ANY JSON value (review, astra 2): a
+/// non-string — an object, a number, `null` — decodes as `Other(<its compact
+/// JSON>)` instead of failing its whole frame. One malformed cause must not
+/// take the `Offline` it rode in with it, and leave a client believing a dead
+/// source is live.
+#[test]
+fn the_tolerant_enums_take_any_json_value() {
+    let ev: SourceEvent = serde_json::from_value(json!({
+        "kind": "offline", "reason": "lost", "cause": {},
+    }))
+    .expect("an object for a cause must not fail the frame");
+    assert_eq!(
+        ev,
+        SourceEvent::Offline {
+            reason: "lost".into(),
+            cause: SourceOffline::Other("{}".into()),
+        }
+    );
+    for (value, text) in [
+        (json!(7), "7"),
+        (json!(null), "null"),
+        (json!(true), "true"),
+        (json!(["a"]), r#"["a"]"#),
+        (json!({"why": 1}), r#"{"why":1}"#),
+    ] {
+        assert_eq!(
+            serde_json::from_value::<SourceOffline>(value.clone()).expect("tolerated"),
+            SourceOffline::Other(text.into()),
+            "{value}"
+        );
+        assert_eq!(
+            serde_json::from_value::<LaneProviderState>(value.clone()).expect("tolerated"),
+            LaneProviderState::Other(text.into()),
+            "{value}"
+        );
+        assert_eq!(
+            serde_json::from_value::<LanePromptOutcome>(value.clone()).expect("tolerated"),
+            LanePromptOutcome::Other(text.into()),
+            "{value}"
+        );
+    }
+    // Nested where it matters: a provider and a create's answer survive too.
+    let provider: LaneProvider =
+        serde_json::from_value(json!({"id": "x", "label": "X", "state": 3}))
+            .expect("a numeric state must not fail the provider");
+    assert_eq!(provider.state, LaneProviderState::Other("3".into()));
+    let created: LaneCreated = serde_json::from_value(json!({
+        "session": round_trip(&sample_session()), "prompt": {"queued": true},
+    }))
+    .expect("an object prompt outcome must not fail the create's answer");
+    assert_eq!(
+        created.prompt,
+        LanePromptOutcome::Other(r#"{"queued":true}"#.into())
+    );
+    // Strings are untouched: known words are known, unknown words kept bare.
+    assert_eq!(
+        serde_json::from_value::<SourceOffline>(json!("too_old")).expect("known"),
+        SourceOffline::TooOld
+    );
 }

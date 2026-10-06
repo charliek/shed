@@ -1042,7 +1042,7 @@ mod tests {
         assert_eq!(claude.created_at.as_deref(), Some("2026-06-19T18:53:00Z"));
         // Second row: the codex kind, needs-auth, no url.
         let codex = &p.sessions[1];
-        assert_eq!(codex.kind, RcKind::Codex);
+        assert_eq!(codex.kind, RcKind::Other("codex".into()));
         assert_eq!(codex.state, RcState::NeedsAuth);
         assert!(codex.url.is_none());
     }
@@ -1098,7 +1098,7 @@ mod tests {
         assert_eq!(sessions.len(), 2); // nothing dropped
         let fut = &sessions[0];
         assert_eq!(fut.slug, "fut1");
-        assert_eq!(fut.kind, RcKind::Codex);
+        assert_eq!(fut.kind, RcKind::Other("codex".into()));
         assert_eq!(fut.state, RcState::Starting); // unknown state → transient
         assert!(!fut.managed); // absent → false
         assert_eq!(fut.workdir, None); // absent → None, NO DEFAULT_WORKDIR injection

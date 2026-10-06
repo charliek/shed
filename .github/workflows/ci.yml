@@ -42,6 +42,7 @@ jobs:
       packaging: ${{ steps.filter.outputs.packaging }}
       harness: ${{ steps.filter.outputs.harness }}
       hostagent: ${{ steps.filter.outputs.hostagent }}
+      machinetransport: ${{ steps.filter.outputs.machinetransport }}
       docs: ${{ steps.filter.outputs.docs }}
       ci: ${{ steps.filter.outputs.ci }}
     steps:
@@ -74,6 +75,10 @@ jobs:
           filters: |
             rust:
               - 'crates/**'
+              # the craze pins (plan 025): a merged craze CI-test SHA and the
+              # craze release the images bake, read by the craze-binaries
+              # composite action and make check-craze-pin.
+              - 'craze-pin.env'
             desktop:
               - 'desktop/**'
               - 'crates/**'
@@ -91,6 +96,7 @@ jobs:
               - 'desktop/scripts/fetch-sparkle.sh'
               - 'desktop/scripts/bundle-tauri-mac.sh'
               - 'desktop/Makefile'
+              - 'craze-pin.env'
             packaging:
               - 'desktop/packaging/**'
               - 'desktop/linux/**'
@@ -99,6 +105,7 @@ jobs:
               # the shedtest harness env
               - 'desktop/pyproject.toml'
               - 'desktop/uv.lock'
+              - 'craze-pin.env'
             hostagent:
               # The Go-vs-Rust host-agent differential leg: both daemons, their
               # shared wire contract (sdk envelope + ext/protocol payloads), the
@@ -125,6 +132,14 @@ jobs:
               - 'docs/development/host-agent-wire-catalog.md'
               - 'go.mod'
               - 'go.sum'
+            machinetransport:
+              # The machine-transport differential's live leg (plan 025 C5): the
+              # shared contract + goldens + the pytest suite, and the two Rust
+              # composers whose output the corpus pins (`display_line`, and the
+              # craze remote command that ships through it).
+              - 'tests/machine-transport/**'
+              - 'crates/shed-core/src/machine.rs'
+              - 'crates/shed-core/src/craze.rs'
             docs:
               - 'docs/**'
               - 'zensical.toml'
@@ -133,10 +148,12 @@ jobs:
               - '.github/workflows/docs.yml'
             ci:
               - '.github/workflows/**'
+              - '.github/actions/**'
               - '.goreleaser*.yaml'
               - 'scripts/release/**'
               - 'Makefile'
               - 'desktop/Makefile'
+              - 'craze-pin.env'
 
   test:
     needs: changes
@@ -186,6 +203,23 @@ jobs:
         # the rest of this job; the `ci` filter includes scripts/release/**,
         # so any edit to the release scripts always runs this.
         run: scripts/release/release-scripts-test.sh
+
+  # The two offline, fail-fast-on-drift pins (`make check-roost-pin
+  # check-craze-pin`) ran in NO CI job before plan 025 — the paths they read
+  # (crates/shed-core/src/roost/bootstrap/source.rs, craze-pin.env, both
+  # Dockerfiles) live partly under crates/, which the `go` filter excludes,
+  # so this job runs on `go || rust || ci` rather than riding along with
+  # `test`/`lint`. No Rust/Go toolchain needed — just the checkout and the
+  # Makefile's awk/sed -E checks.
+  pins:
+    name: pins (roost + craze)
+    needs: changes
+    if: ${{ needs.changes.outputs.go == 'true' || needs.changes.outputs.rust == 'true' || needs.changes.outputs.ci == 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: check-roost-pin + check-craze-pin (offline)
+        run: make check-roost-pin check-craze-pin
 
   release-snapshot:
     name: GoReleaser snapshot (artifact sanity)
@@ -493,24 +527,48 @@ jobs:
             exit 1
           fi
           sudo timeout 300 apt-get install -y build-essential
-      - name: shed-core + shed-opencode + shed-gx — test + clippy (Linux)
+      - name: shed-core + shed-opencode — test + clippy (Linux)
         # Scoped to -p so the macOS-only shed-core-ffi (uniffi) is never dragged
         # in. --all-targets runs the pinned-TLS verifier + redirect/non-https
         # fail-closed tests here; the e2e's plain-HTTP mock never exercises the
         # pin/token paths, so they stay cargo-only on Linux.
         #
-        # shed-opencode (plan 015) and shed-gx (plan 017) ride along rather than
-        # getting jobs of their own: each is a pure client of shed-core's lane
-        # contract with the same dependency surface, each suite is hermetic (the
-        # loopback `FakeOpencode`/`FakeGx` behind the `test-support` feature —
-        # the env-gated live smokes skip without `SHED_OPENCODE_LIVE` /
-        # `SHED_GX_LIVE`), and both are crates the Tauri app links, so a break
-        # here must not first surface as a desktop build failure. Named
-        # EXPLICITLY, like the engine leg below: a filter that matched nothing
-        # would run zero tests silently.
+        # shed-opencode (plan 015) rides along rather than getting a job of its
+        # own: it is a pure client of shed-core's lane contract with the same
+        # dependency surface, its suite is hermetic (the loopback `FakeOpencode`
+        # behind the `test-support` feature — the env-gated live smoke skips
+        # without `SHED_OPENCODE_LIVE`), and it is a crate the Tauri app links,
+        # so a break here must not first surface as a desktop build failure.
+        # (shed-gx, plan 017's second adapter, rode along the same way until
+        # plan 025 C1 — shed#390 — retired the gx lane.) Named EXPLICITLY, like
+        # the engine leg below: a filter that matched nothing would run zero
+        # tests silently.
         run: |
-          cargo test -p shed-core -p shed-opencode -p shed-gx --all-targets --locked
-          cargo clippy -p shed-core -p shed-opencode -p shed-gx --all-targets --locked -- -D warnings
+          cargo test -p shed-core -p shed-opencode --all-targets --locked
+          cargo clippy -p shed-core -p shed-opencode --all-targets --locked -- -D warnings
+      # shed-craze (plan 025 C7) runs its recipe cells against the REAL craze
+      # hub, craze-fake-host and craze-fake-agent, built here at the pinned
+      # CRAZE_TEST_SHA (craze-pin.env) by the shared composite action — which
+      # also diffs craze's wire fixtures against the vendored
+      # crates/shed-craze/fixtures/wire and exports SHED_CRAZE_BIN_DIR. Both
+      # paths are absolute: a composite action's steps do not run in this
+      # job's `crates` default working directory.
+      - name: craze binaries at the pin (shed-craze's recipe)
+        uses: ./.github/actions/craze-binaries
+        with:
+          shed-path: ${{ github.workspace }}
+          out-dir: ${{ runner.temp }}/craze-bin
+      - name: shed-craze — test (the recipe, required) + clippy (Linux)
+        # SHED_CRAZE_REQUIRE=1 (the action exports it too; set here so this
+        # step cannot lose it): a recipe cell that would SKIP for want of the
+        # binaries FAILS instead, so this job can never go green on skipped
+        # craze cells. `--features test-support` exports the recipe harness
+        # the integration tests drive.
+        env:
+          SHED_CRAZE_REQUIRE: "1"
+        run: |
+          cargo test -p shed-craze --all-targets --features test-support --locked
+          cargo clippy -p shed-craze --all-targets --features test-support --locked -- -D warnings
 
   # The host-agent wire-goldens leg (Phase 3 leg 3a.1; the Go twin sunset by
   # plan 006-mtls-cleanup-hostagent-sunset.md). One Linux job covers BOTH the
@@ -567,6 +625,55 @@ jobs:
         # Builds the Rust daemon binary (conftest) and runs the pytest suite
         # against the recorded goldens + the Rust golden-fixture runners.
         run: make test-host-agent-diff
+
+  # The machine-transport differential's LIVE leg (plan 025 C5, P10): every
+  # scenario's wire line through a throwaway sshd on 127.0.0.1, asserting the
+  # argv the far side really received, plus the forwarded-hub family. It ran
+  # in no CI job before (and a dev box without sshd skips it), and since C5
+  # it carries production code: the craze remote
+  # command (`craze-bridge-hub` / `craze-providers-hub`), whose quoting must be
+  # proven on a real sshd. `MT_REQUIRE_SSHD=1` turns the suite's no-sshd SKIP
+  # into a FAILURE, so a runner that lost openssh-server fails this job rather
+  # than passing it vacuously. The Rust leg (and the craze ladder's behaviour
+  # tests) ride along because core-linux's `rust` filter does not see
+  # `tests/machine-transport/**`: without them a scenarios-only edit would
+  # never meet the composer equality it is pinned by.
+  machine-transport:
+    name: machine-transport (live sshd)
+    needs: changes
+    if: ${{ needs.changes.outputs.machinetransport == 'true' || needs.changes.outputs.ci == 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: OpenSSH server + C toolchain
+        # Bounded+retried apt — see the "C toolchain + tmux" step's rationale.
+        # /run/sshd is sshd's privilege-separation directory, which the suite's
+        # unprivileged sshd needs and the package does not leave behind.
+        timeout-minutes: 12
+        run: |
+          set -euo pipefail
+          ok=""
+          for attempt in 1 2 3; do
+            if sudo timeout 120 apt-get update; then ok=1; break; fi
+            echo "apt-get update stalled or failed (attempt ${attempt}/3); retrying" >&2
+            sleep 10
+          done
+          if [ -z "${ok}" ]; then
+            echo "::error::apt-get update failed 3x — mirror outage?"
+            exit 1
+          fi
+          sudo timeout 300 apt-get install -y openssh-server build-essential
+          sudo mkdir -p /run/sshd
+      - name: Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustc --version && cargo --version
+      - name: Rust leg + the craze ladder's behaviour tests
+        working-directory: crates
+        run: cargo test -p shed-core --test machine_transport_contract --test craze_ladder --locked
+      - uses: astral-sh/setup-uv@v6
+      - name: Live leg + forwarded-hub family (a missing sshd FAILS, never skips)
+        run: MT_REQUIRE_SSHD=1 make test-machine-transport
 
   deb:
     name: deb
@@ -647,16 +754,36 @@ jobs:
           cache-dependency-path: desktop/tauri/ui/package-lock.json
       - name: Frontend deps
         run: cd desktop/tauri/ui && npm ci
+      # The craze cells (plan 025 §3.5/§3.6.7: test_tauri_craze.py, the craze
+      # source's Rust cells) run against the REAL craze binaries at the pinned
+      # CRAZE_TEST_SHA, built by the shared composite action into the
+      # gitignored desktop/tools/shedtest/.craze-bin — which the Docker legs tar
+      # with desktop/tools, because the container only sees the repo layout.
+      - name: craze binaries at the pin (into the Docker legs' layout)
+        uses: ./.github/actions/craze-binaries
+        with:
+          shed-path: ${{ github.workspace }}
+          out-dir: desktop/tools/shedtest/.craze-bin
       # The Tauri crate's Linux-only approval-seam tests (polkit/libnotify gate is
       # fail-closed: never Approved without a real auth). Docker (ubuntu:24.04),
       # same image as the render gate below; no display needed.
+      #
+      # SHED_CRAZE_BIN_DIR is the IN-CONTAINER path (the action exported the
+      # host's), and SHED_CRAZE_REQUIRE=1 turns a skipped craze cell into a
+      # failure; desktop/Makefile forwards both into `docker run` by name.
       - name: Tauri crate tests (Linux)
+        env:
+          SHED_CRAZE_REQUIRE: "1"
+          SHED_CRAZE_BIN_DIR: /work/desktop/tools/shedtest/.craze-bin
         run: make -C desktop tauri-test-linux
       # The render gate: builds the frontend + the Tauri app and runs the
       # --target tauri hermetic e2e on WebKitGTK 2.44 under Xvfb (the pinned
       # WebView = the real CSS/render gate). GitHub runners allow privileged
       # docker run for the WebKitGTK web-process sandbox.
       - name: Tauri render gate + hermetic E2E (WebKitGTK)
+        env:
+          SHED_CRAZE_REQUIRE: "1"
+          SHED_CRAZE_BIN_DIR: /work/desktop/tools/shedtest/.craze-bin
         run: make -C desktop tauri-build-linux
 
   tauri-mac:
@@ -681,6 +808,14 @@ jobs:
       - name: Tauri clippy (standalone workspace)
         run: make -C desktop tauri-lint
       - uses: astral-sh/setup-uv@v6
+      # The craze cells run on the mac client too (plan 025 §3.5), against the
+      # pinned craze binaries built for darwin on this runner; the action
+      # exports SHED_CRAZE_BIN_DIR and SHED_CRAZE_REQUIRE=1 for the steps below.
+      - name: craze binaries at the pin (darwin)
+        uses: ./.github/actions/craze-binaries
+        with:
+          shed-path: ${{ github.workspace }}
+          out-dir: ${{ runner.temp }}/craze-bin
       - name: Hermetic Tauri E2E (macOS WKWebView)
         # A wider timeout scale buys headroom on a shared CI runner (as the swift
         # + tauri-linux legs do). WKWebView needs no Xvfb; the mac screenshot op is
@@ -784,12 +919,12 @@ jobs:
   ci-success:
     name: ci-success
     if: always()
-    needs: [changes, test, lint, plugin, release-snapshot, swift, core-linux, host-agent-diff, deb, tauri-linux, tauri-mac, docs-build]
+    needs: [changes, test, lint, plugin, pins, release-snapshot, swift, core-linux, host-agent-diff, machine-transport, deb, tauri-linux, tauri-mac, docs-build]
     runs-on: ubuntu-latest
     steps:
       - name: Require no job failed (skipped-by-filter counts as pass)
         run: |
-          results="${{ needs.changes.result }} ${{ needs.test.result }} ${{ needs.lint.result }} ${{ needs.plugin.result }} ${{ needs.release-snapshot.result }} ${{ needs.swift.result }} ${{ needs.core-linux.result }} ${{ needs.host-agent-diff.result }} ${{ needs.deb.result }} ${{ needs.tauri-linux.result }} ${{ needs.tauri-mac.result }} ${{ needs.docs-build.result }}"
+          results="${{ needs.changes.result }} ${{ needs.test.result }} ${{ needs.lint.result }} ${{ needs.plugin.result }} ${{ needs.pins.result }} ${{ needs.release-snapshot.result }} ${{ needs.swift.result }} ${{ needs.core-linux.result }} ${{ needs.host-agent-diff.result }} ${{ needs.machine-transport.result }} ${{ needs.deb.result }} ${{ needs.tauri-linux.result }} ${{ needs.tauri-mac.result }} ${{ needs.docs-build.result }}"
           echo "job results: ${results}"
           for r in ${results}; do
             case "${r}" in

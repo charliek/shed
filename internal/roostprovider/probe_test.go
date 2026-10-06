@@ -13,11 +13,7 @@ func TestProbeScriptIsPinned(t *testing.T) {
 	want := `printf "%s\0" "shed-roost-probe-v1"; ` +
 		`printf "%s\0" "${HOME:-}"; ` +
 		`p=$(command -v claude 2>/dev/null) || p=""; case "$p" in /*) [ -f "$p" ] && [ -x "$p" ] || p="" ;; *) p="" ;; esac; printf "%s\0" "$p"; ` +
-		`p=$(command -v codex 2>/dev/null) || p=""; case "$p" in /*) [ -f "$p" ] && [ -x "$p" ] || p="" ;; *) p="" ;; esac; printf "%s\0" "$p"; ` +
-		`p=$(command -v cursor-agent 2>/dev/null) || p=""; case "$p" in /*) [ -f "$p" ] && [ -x "$p" ] || p="" ;; *) p="" ;; esac; printf "%s\0" "$p"; ` +
 		`p=$(command -v opencode 2>/dev/null) || p=""; case "$p" in /*) [ -f "$p" ] && [ -x "$p" ] || p="" ;; *) p="" ;; esac; printf "%s\0" "$p"; ` +
-		`p=$(command -v gx 2>/dev/null) || p=""; case "$p" in /*) [ -f "$p" ] && [ -x "$p" ] || p="" ;; *) p="" ;; esac; printf "%s\0" "$p"; ` +
-		`p=$(command -v grok 2>/dev/null) || p=""; case "$p" in /*) [ -f "$p" ] && [ -x "$p" ] || p="" ;; *) p="" ;; esac; printf "%s\0" "$p"; ` +
 		`if [ -n "${1:-}" ] && [ -d "$1" ]; then printf "%s\0" 1; else printf "%s\0" ""; fi; ` +
 		`exit 0`
 	if got := ProbeScript(); got != want {
@@ -88,9 +84,8 @@ func fullRecords(home string, paths map[string]string, landing string) []string 
 func TestParseProbe(t *testing.T) {
 	t.Run("everything found", func(t *testing.T) {
 		out := probeOutput("", fullRecords("/home/shed", map[string]string{
-			"claude":       "/home/shed/.local/bin/claude",
-			"cursor-agent": "/home/shed/.local/bin/cursor-agent",
-			"opencode":     "/home/shed/.bun/bin/opencode",
+			"claude":   "/home/shed/.local/bin/claude",
+			"opencode": "/home/shed/.bun/bin/opencode",
 		}, "1")...)
 		p, err := ParseProbe(out)
 		if err != nil {
@@ -102,16 +97,16 @@ func TestParseProbe(t *testing.T) {
 		if !p.LandingDirExists {
 			t.Errorf("landing dir should exist")
 		}
-		if len(p.Found) != 3 {
+		if len(p.Found) != 2 {
 			t.Fatalf("found = %v", p.Found)
 		}
-		// Keyed by KIND, not by binary — `cursor-agent` is the binary and
-		// `cursor` is the kind, and the row id carries the kind.
-		if p.Found["cursor"] != "/home/shed/.local/bin/cursor-agent" {
-			t.Errorf("cursor = %q", p.Found["cursor"])
+		// Keyed by KIND, not by binary — `claude` is the binary and
+		// `claude-rc` is the kind, and the row id carries the kind.
+		if p.Found["claude-rc"] != "/home/shed/.local/bin/claude" {
+			t.Errorf("claude-rc = %q", p.Found["claude-rc"])
 		}
-		if _, ok := p.Found["codex"]; ok {
-			t.Errorf("codex was not found but is in the map")
+		if _, ok := p.Found["cursor"]; ok {
+			t.Errorf("cursor was not found but is in the map")
 		}
 	})
 
@@ -130,7 +125,7 @@ func TestParseProbe(t *testing.T) {
 
 	t.Run("a home path with spaces", func(t *testing.T) {
 		p, err := ParseProbe(probeOutput("", fullRecords("/Users/First Last", map[string]string{
-			"codex": "/Users/First Last/.bun/bin/codex",
+			"claude": "/Users/First Last/.local/bin/claude",
 		}, "")...))
 		if err != nil {
 			t.Fatalf("ParseProbe: %v", err)
@@ -138,8 +133,8 @@ func TestParseProbe(t *testing.T) {
 		if p.Home != "/Users/First Last" {
 			t.Errorf("home = %q", p.Home)
 		}
-		if p.Found["codex"] != "/Users/First Last/.bun/bin/codex" {
-			t.Errorf("codex = %q", p.Found["codex"])
+		if p.Found["claude-rc"] != "/Users/First Last/.local/bin/claude" {
+			t.Errorf("claude-rc = %q", p.Found["claude-rc"])
 		}
 	})
 
@@ -185,7 +180,7 @@ func TestParseProbeRejectsMalformedOutput(t *testing.T) {
 			// tail.
 			"one record short",
 			probeOutput("", fullRecords("/home/shed", nil, "")[:probeRecordCount-1]...),
-			"carried 8 NUL-terminated fields",
+			"carried 4 NUL-terminated fields",
 		},
 		{
 			// The other direction, and the one the `>=` check let through: a
@@ -196,8 +191,8 @@ func TestParseProbeRejectsMalformedOutput(t *testing.T) {
 			// wrong parse presented as a success, which ends as a tab opened
 			// in a directory nobody named.
 			"an extra NUL inside $HOME",
-			probeOutput("", fullRecords("/home\x00shed", map[string]string{"grok": "/usr/bin/grok"}, "")...),
-			"carried 10 NUL-terminated fields",
+			probeOutput("", fullRecords("/home\x00shed", map[string]string{"claude": "/usr/bin/claude"}, "")...),
+			"carried 6 NUL-terminated fields",
 		},
 		{
 			// Exactly N+1 fields, but the last one is not the empty
