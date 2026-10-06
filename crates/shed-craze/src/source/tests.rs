@@ -9,8 +9,8 @@ use std::time::Duration;
 use serde_json::{json, Value};
 use shed_core::lane::conformance::{check_source, drive_source, SourceChecker};
 use shed_core::lane::{
-    AgentSource, LaneCreateRequest, LaneError, LanePromptOutcome, LaneProviderState, SourceEvent,
-    SourceOffline, LANE_CHANNEL_CAPACITY,
+    AgentSource, LaneCreateRequest, LaneError, LaneEvent, LanePromptOutcome, LaneProviderState,
+    SourceEvent, SourceOffline, LANE_CHANNEL_CAPACITY,
 };
 use shed_core::rc::RcActivity;
 use tokio::sync::mpsc::Receiver;
@@ -720,6 +720,489 @@ async fn a_tombstone_outlives_many_other_removals_within_the_replay_window() {
     assert!(
         held.listed(A).is_some(),
         "past the replay window the id is free"
+    );
+}
+
+/// The hostId [`created_result`] answers with.
+const CREATED: &str = "cccccccccccc";
+
+/// The host [`CREATED`]'s info document — a `craze serve`'s, so it can stop.
+fn created_info() -> Value {
+    crate::testing::session_info(
+        CREATED,
+        "session-created",
+        "INC-1",
+        crate::testing::session_caps(true),
+    )
+}
+
+/// A session created through `src` (no roster lists it: `src` has no
+/// subscription), a lane opened on its row through `src` and subscribed, and
+/// craze's end of that lane's first connection, nothing on it read yet.
+async fn created_lane(
+    src: &CrazeSource,
+    conns: &mut tokio::sync::mpsc::UnboundedReceiver<HubEnd>,
+    request_id: &str,
+) -> (Receiver<LaneEvent>, LaneStop, Arc<dyn AgentLane>, HubEnd) {
+    create_answered(src, conns, request_id).await;
+    assert_eq!(
+        ids(&src.created_rows()),
+        [CREATED],
+        "the create's row, and no roster's"
+    );
+    let lane = src.open(CREATED).await.unwrap();
+    let (rx, stop) = lane.subscribe(None).await.unwrap().into_parts();
+    let hub = next_conn(conns).await;
+    (rx, stop, lane, hub)
+}
+
+fn ids(rows: &[LaneSession]) -> Vec<&str> {
+    rows.iter().map(|r| r.id.as_str()).collect()
+}
+
+/// The created lane's connection seeded — the splice, the host's row, a
+/// no-cursor attach — through its `Ready`.
+async fn seeded_created(hub: &mut HubEnd, rx: &mut Receiver<LaneEvent>) {
+    seeded_created_as(hub, rx, "s-1").await;
+}
+
+/// [`seeded_created`], the attachment's subscription named `sub`.
+async fn seeded_created_as(hub: &mut HubEnd, rx: &mut Receiver<LaneEvent>, sub: &str) {
+    hub.splice(CREATED).await;
+    hub.listed(crate::testing::host_session_row(&created_info(), json!({})))
+        .await;
+    hub.attached(crate::testing::attach_result(
+        sub,
+        &created_info(),
+        ("INC-1", 1),
+        Some(crate::testing::snapshot_at("INC-1", 1, json!({}))),
+        None,
+    ))
+    .await;
+    hub.synchronized(sub, 1).await;
+    loop {
+        let ev = tokio::time::timeout(SCRIPT_WAIT, rx.recv())
+            .await
+            .expect("the seed in time")
+            .expect("the lane is alive");
+        if matches!(ev, LaneEvent::Ready { .. }) {
+            return;
+        }
+    }
+}
+
+/// `lane.stop()` on `hub`, receipted.
+async fn stop_receipted(lane: &Arc<dyn AgentLane>, hub: &mut HubEnd) {
+    let stopping = {
+        let lane = Arc::clone(lane);
+        tokio::spawn(async move { lane.stop().await })
+    };
+    let req = hub.expect("session.stop").await;
+    hub.reply(&req, json!({})).await;
+    stopping.await.unwrap().expect("the host's receipt");
+}
+
+/// Wait until `lane` runs exactly `n` watchers.
+async fn until_watching(lane: &CrazeLane, n: usize) {
+    for _ in 0..500 {
+        if lane.watching() == n {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert_eq!(lane.watching(), n, "the lane's running watchers");
+}
+
+/// A created session's lane with TWO subscriptions, each seeded on its own
+/// connection (`s-a`, then `s-b` — whose attachment the verbs then use), and
+/// the host's receipt for a stop taken on `s-b`'s.
+async fn two_subscriptions_stopped(
+    src: &CrazeSource,
+    conns: &mut tokio::sync::mpsc::UnboundedReceiver<HubEnd>,
+) -> (
+    Arc<CrazeLane>,
+    (Receiver<LaneEvent>, LaneStop, HubEnd),
+    (Receiver<LaneEvent>, LaneStop, HubEnd),
+) {
+    create_answered(src, conns, "req-two").await;
+    let lane = Arc::new(src.open_lane(CREATED));
+    let (mut rx_a, stop_a) = lane.subscribe(None).await.unwrap().into_parts();
+    let mut hub_a = next_conn(conns).await;
+    seeded_created_as(&mut hub_a, &mut rx_a, "s-a").await;
+    let (mut rx_b, stop_b) = lane.subscribe(None).await.unwrap().into_parts();
+    let mut hub_b = next_conn(conns).await;
+    seeded_created_as(&mut hub_b, &mut rx_b, "s-b").await;
+    assert_eq!(lane.watching(), 2);
+    let as_dyn: Arc<dyn AgentLane> = Arc::clone(&lane) as Arc<dyn AgentLane>;
+    stop_receipted(&as_dyn, &mut hub_b).await;
+    (lane, (rx_a, stop_a, hub_a), (rx_b, stop_b, hub_b))
+}
+
+/// A counter of [`CrazeSource::on_created_gone`]'s calls on `src`.
+fn count_created_gone(src: &CrazeSource) -> Arc<std::sync::atomic::AtomicUsize> {
+    let gone = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counter = Arc::clone(&gone);
+    src.on_created_gone(move || {
+        counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    });
+    gone
+}
+
+fn calls(gone: &std::sync::atomic::AtomicUsize) -> usize {
+    gone.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// The lane's frames up to and including its `Down`; that `Down`'s reason.
+async fn lane_down(rx: &mut Receiver<LaneEvent>) -> String {
+    loop {
+        let ev = tokio::time::timeout(SCRIPT_WAIT, rx.recv())
+            .await
+            .expect("the lane's Down in time")
+            .expect("the lane's stream ends with its Down");
+        if let LaneEvent::Down { reason } = ev {
+            return reason;
+        }
+    }
+}
+
+/// **A created session that ends before any roster listed it leaves the
+/// source for good** (live leg 1's ghost row, re-run on 82eabbd: a session
+/// the create sheet started and `lane.stop` ended 0.4 s later stayed listed
+/// for its whole ten minutes). craze's roster sends a remove only for a host
+/// it SENT — one that came and went between two flushes gets neither
+/// (`internal/hub/roster.go`'s `take`) — so no `Removed` ever comes for it,
+/// and the lane is the one that sees the end. Its stop's RECEIPT lets nothing
+/// go (the session is closing, its closing records still to come); its
+/// `Down{"session_closed"}` drops the created row and tombstones the hostId,
+/// as a roster `Removed` would: a replay of the same create's answer (craze
+/// replays one for ten minutes) does not bring it back.
+#[tokio::test]
+async fn a_created_session_stopped_before_any_roster_lists_it_is_let_go() {
+    let (dial, mut conns) = ScriptedDial::new();
+    let src = source(Arc::clone(&dial));
+    let gone = count_created_gone(&src);
+    let (mut rx, _stop, lane, mut hub) = created_lane(&src, &mut conns, "req-ghost").await;
+    seeded_created(&mut hub, &mut rx).await;
+
+    stop_receipted(&lane, &mut hub).await;
+    assert_eq!(
+        ids(&src.created_rows()),
+        [CREATED],
+        "the receipt is not the end: the row stays while the session closes"
+    );
+    assert_eq!(calls(&gone), 0);
+
+    hub.reset("s-1", "session_closed").await;
+    assert_eq!(lane_down(&mut rx).await, "session_closed");
+    assert!(
+        src.created_rows().is_empty(),
+        "the ended session's created row is gone: {:?}",
+        ids(&src.created_rows())
+    );
+    assert!(src.listed(CREATED).is_none(), "and nothing opens on it");
+    assert_eq!(
+        calls(&gone),
+        1,
+        "the client is told, before the Down: no roster frame will say it"
+    );
+    assert!(
+        lane.session().await.is_ok(),
+        "the lane itself keeps the row it knew"
+    );
+
+    // craze replays the create's stored answer under the same request id.
+    create_answered(&src, &mut conns, "req-ghost").await;
+    assert!(
+        src.created_rows().is_empty(),
+        "a replayed create never resurrects an ended session's row"
+    );
+    assert!(src.listed(CREATED).is_none());
+    assert_eq!(calls(&gone), 1, "said once");
+}
+
+/// **After a stop the host took, the lane's end is the session's, however it
+/// comes** (`crate::lane`'s "The session's end"): the receipt is craze's word
+/// that the close follows (PM "`session.stop`"), so a subscription let go
+/// before the close reached it — a panel closed at once — still lets the
+/// created row go, and the client's hook is told.
+#[tokio::test]
+async fn a_subscription_let_go_after_a_stop_receipt_still_lets_the_row_go() {
+    let (dial, mut conns) = ScriptedDial::new();
+    let src = source(Arc::clone(&dial));
+    let gone = count_created_gone(&src);
+    let (mut rx, stop, lane, mut hub) = created_lane(&src, &mut conns, "req-let-go").await;
+    seeded_created(&mut hub, &mut rx).await;
+    stop_receipted(&lane, &mut hub).await;
+    assert_eq!(ids(&src.created_rows()), [CREATED], "closing, not closed");
+    drop(stop);
+    drop(rx);
+    for _ in 0..500 {
+        if src.created_rows().is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert!(
+        src.created_rows().is_empty(),
+        "a subscription let go after the receipt still says the session's end"
+    );
+    assert_eq!(calls(&gone), 1);
+}
+
+/// **After a stop the host took, any terminal `Down` is the session's end** —
+/// even one that on its own says only that this lane cannot go on: here the
+/// connection drops before the close, and the redial reaches another host
+/// (`protocol: …`). Without the receipt that `Down` keeps the row
+/// (`only_the_sessions_own_end_lets_its_created_row_go`).
+#[tokio::test]
+async fn after_a_stop_receipt_any_terminal_down_lets_the_row_go() {
+    let (dial, mut conns) = ScriptedDial::new();
+    let src = source(Arc::clone(&dial));
+    let gone = count_created_gone(&src);
+    let (mut rx, _stop, lane, mut hub) = created_lane(&src, &mut conns, "req-fault").await;
+    seeded_created(&mut hub, &mut rx).await;
+    stop_receipted(&lane, &mut hub).await;
+    hub.close().await;
+    let mut again = next_conn(&mut conns).await;
+    again.splice_answered_by(CREATED, "dddddddddddd").await;
+    assert!(lane_down(&mut rx).await.starts_with("protocol: "));
+    assert!(
+        src.created_rows().is_empty(),
+        "after the receipt, any end of the lane is the session's"
+    );
+    assert_eq!(calls(&gone), 1);
+}
+
+/// **A stop receipted after its subscription was let go still says the
+/// session's end** (the ghost-row review's race): the stop request goes out
+/// on the lane's connection, the subscription is dropped — the watcher and its
+/// guard gone, the stop's receipt still held by the host — and only THEN does
+/// the receipt arrive. No watcher is left to see the close, so the receipt
+/// itself says it: the created row goes, and the client's hook is told once.
+#[tokio::test]
+async fn a_stop_receipted_after_its_subscription_was_let_go_lets_the_row_go() {
+    let (dial, mut conns) = ScriptedDial::new();
+    let src = source(Arc::clone(&dial));
+    let gone = count_created_gone(&src);
+    create_answered(&src, &mut conns, "req-race").await;
+    let lane = Arc::new(src.open_lane(CREATED));
+    let (mut rx, stop) = lane.subscribe(None).await.unwrap().into_parts();
+    let mut hub = next_conn(&mut conns).await;
+    seeded_created(&mut hub, &mut rx).await;
+
+    let stopping = {
+        let lane = Arc::clone(&lane);
+        tokio::spawn(async move { lane.stop().await })
+    };
+    // Sent — and its receipt held.
+    let req = hub.expect("session.stop").await;
+    drop(stop);
+    drop(rx);
+    for _ in 0..500 {
+        if lane.watching() == 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert_eq!(
+        lane.watching(),
+        0,
+        "the subscription and its watcher are gone"
+    );
+    assert_eq!(
+        ids(&src.created_rows()),
+        [CREATED],
+        "nothing has said the end: no receipt yet"
+    );
+    assert_eq!(calls(&gone), 0);
+
+    hub.reply(&req, json!({})).await;
+    stopping
+        .await
+        .unwrap()
+        .expect("the receipt reaches the stop");
+    assert!(
+        src.created_rows().is_empty(),
+        "with no watcher left, the receipt says the session's end"
+    );
+    assert!(src.listed(CREATED).is_none());
+    assert_eq!(calls(&gone), 1, "told once");
+}
+
+/// **The session's end is said BEFORE the `Down`** (the ghost-row review):
+/// a client that re-reads its listing on the `Down` must already find the
+/// created row gone. The client's hook here BLOCKS until the test releases it
+/// (bounded, so a broken order fails the cell rather than hanging it); while
+/// it blocks, the row is already gone and no `Down` is observable — and once
+/// it is released, the `Down` arrives.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_sessions_end_is_said_before_the_down() {
+    let (dial, mut conns) = ScriptedDial::new();
+    let src = source(Arc::clone(&dial));
+    let (entered_tx, entered) = std::sync::mpsc::channel::<()>();
+    let (release, release_rx) = std::sync::mpsc::channel::<()>();
+    let entered_tx = Mutex::new(entered_tx);
+    let release_rx = Mutex::new(release_rx);
+    src.on_created_gone(move || {
+        let _ = lock(&entered_tx).send(());
+        let _ = lock(&release_rx).recv_timeout(Duration::from_secs(5));
+    });
+    let (mut rx, _stop, _lane, mut hub) = created_lane(&src, &mut conns, "req-order").await;
+    seeded_created(&mut hub, &mut rx).await;
+
+    hub.reset("s-1", "session_closed").await;
+    let mut inside = false;
+    for _ in 0..1000 {
+        if entered.try_recv().is_ok() {
+            inside = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert!(inside, "the hook was called");
+    assert!(
+        src.created_rows().is_empty(),
+        "the row is gone before the hook is told"
+    );
+    let early = tokio::time::timeout(Duration::from_millis(200), async {
+        while let Some(ev) = rx.recv().await {
+            if matches!(ev, LaneEvent::Down { .. }) {
+                return true;
+            }
+        }
+        false
+    })
+    .await;
+    assert!(
+        early.is_err(),
+        "no Down while the session's end is still being said: {early:?}"
+    );
+
+    release.send(()).unwrap();
+    assert_eq!(lane_down(&mut rx).await, "session_closed");
+}
+
+/// **Only the lane's LAST watcher's end is the session's** (the confirmation
+/// review): with two subscriptions on one lane and the host's stop receipt
+/// taken, letting ONE go leaves the row — the other is still live, its closing
+/// records still to come — and the hook untold. The other's
+/// `Down{"session_closed"}` then lets the row go, and the hook is told exactly
+/// once, though that watcher's own end says it again.
+#[tokio::test]
+async fn after_a_stop_only_the_last_subscriptions_end_lets_the_row_go() {
+    let (dial, mut conns) = ScriptedDial::new();
+    let src = source(Arc::clone(&dial));
+    let gone = count_created_gone(&src);
+    let (lane, (rx_a, stop_a, _hub_a), (mut rx_b, stop_b, mut hub_b)) =
+        two_subscriptions_stopped(&src, &mut conns).await;
+
+    drop(stop_a);
+    drop(rx_a);
+    until_watching(&lane, 1).await;
+    assert_eq!(
+        ids(&src.created_rows()),
+        [CREATED],
+        "another subscription is still live: the close is its to see"
+    );
+    assert_eq!(calls(&gone), 0);
+
+    hub_b.reset("s-b", "session_closed").await;
+    assert_eq!(lane_down(&mut rx_b).await, "session_closed");
+    assert!(src.created_rows().is_empty(), "the close lets the row go");
+    drop(stop_b);
+    drop(rx_b);
+    until_watching(&lane, 0).await;
+    assert_eq!(calls(&gone), 1, "told exactly once");
+}
+
+/// **A lane fault after a stop leaves the row while another watcher is live**
+/// — the same rule for a `Down` that says nothing of the session: after the
+/// receipt, `s-a`'s connection drops and its redial reaches another host
+/// (`protocol: …`), while `s-b` still follows the closing session. The row
+/// stays; only once `s-b`, the last, is let go does the receipt's word end it.
+#[tokio::test]
+async fn after_a_stop_a_lane_fault_with_another_watcher_live_keeps_the_row() {
+    let (dial, mut conns) = ScriptedDial::new();
+    let src = source(Arc::clone(&dial));
+    let gone = count_created_gone(&src);
+    let (lane, (mut rx_a, _stop_a, hub_a), (rx_b, stop_b, _hub_b)) =
+        two_subscriptions_stopped(&src, &mut conns).await;
+
+    hub_a.close().await;
+    let mut again = next_conn(&mut conns).await;
+    again.splice_answered_by(CREATED, "dddddddddddd").await;
+    assert!(lane_down(&mut rx_a).await.starts_with("protocol: "));
+    until_watching(&lane, 1).await;
+    assert_eq!(
+        ids(&src.created_rows()),
+        [CREATED],
+        "s-b still follows the close: s-a's fault is not the session's end"
+    );
+    assert_eq!(calls(&gone), 0);
+
+    drop(stop_b);
+    drop(rx_b);
+    until_watching(&lane, 0).await;
+    assert!(
+        src.created_rows().is_empty(),
+        "the last watcher gone after the receipt: the session's end"
+    );
+    assert_eq!(calls(&gone), 1);
+}
+
+/// **Only the session's own end lets it go** — every terminal `Down` that
+/// says the SESSION is over (`unknown_session` from the hub's splice,
+/// `start_failed: <cause>` from the attach) drops the created row, through a
+/// clone that dials elsewhere too ([`CrazeSource::dialling`]); a terminal
+/// `Down` that says only that THIS lane cannot go on (a splice to another
+/// host, `protocol: …`) keeps it: the session may well be running.
+#[tokio::test]
+async fn only_the_sessions_own_end_lets_its_created_row_go() {
+    // unknown_session: the hub knows no such host.
+    let (dial, mut conns) = ScriptedDial::new();
+    let src = source(Arc::clone(&dial));
+    let (mut rx, _stop, _lane, mut hub) = created_lane(&src, &mut conns, "req-unknown").await;
+    hub.hello("0a1b2c3d4e5f", full_hub_capabilities()).await;
+    let connect = hub.expect("session.connect").await;
+    hub.refuse(&connect, "unknown_session", "unknown_session", json!({}))
+        .await;
+    assert_eq!(lane_down(&mut rx).await, "unknown_session");
+    assert!(src.created_rows().is_empty(), "unknown_session ends it");
+
+    // start_failed: the session never started — through a clone of the
+    // source that dials elsewhere, sharing its rows.
+    let (roster_dial, _roster_conns) = ScriptedDial::new();
+    let (dial, mut conns) = ScriptedDial::new();
+    let src = source(roster_dial);
+    let ask = src.dialling(Arc::clone(&dial) as Arc<dyn CrazeDial>);
+    let (mut rx, _stop, _lane, mut hub) = created_lane(&ask, &mut conns, "req-failed").await;
+    hub.splice(CREATED).await;
+    hub.listed(crate::testing::host_session_row(&created_info(), json!({})))
+        .await;
+    let attach = hub.expect("session.attach").await;
+    hub.refuse(
+        &attach,
+        "not_accepting",
+        "start_failed",
+        json!({"cause": "KEYCHAIN LOCKED"}),
+    )
+    .await;
+    assert_eq!(lane_down(&mut rx).await, "start_failed: KEYCHAIN LOCKED");
+    assert!(
+        src.created_rows().is_empty() && ask.created_rows().is_empty(),
+        "start_failed ends it, for every clone"
+    );
+
+    // protocol: another host answered — this lane's end, not the session's.
+    let (dial, mut conns) = ScriptedDial::new();
+    let src = source(Arc::clone(&dial));
+    let (mut rx, _stop, _lane, mut hub) = created_lane(&src, &mut conns, "req-fault").await;
+    hub.splice_answered_by(CREATED, "dddddddddddd").await;
+    assert!(lane_down(&mut rx).await.starts_with("protocol: "));
+    assert_eq!(
+        ids(&src.created_rows()),
+        [CREATED],
+        "a lane's own fault says nothing of the session"
     );
 }
 

@@ -180,10 +180,21 @@ re-implemented per language. The root `CLAUDE.md` owns the monorepo layout + rel
   dropped connection, the 120 s deadline) and never on a definite answer;
   `is_outcome_unknown` is the one test a caller keeps its id on. A create keeps the row it
   answered with APART from the roster's (`Held`): until a roster lists that hostId or removes
-  it — a seed that does not list it yet keeps it — or 10 min pass (craze's replay window);
-  never for a hostId a roster let go within craze's 10-minute replay window (timestamped
-  tombstones, a 4096 count only as a memory backstop, so a replayed create cannot resurrect
-  it); at most 64 at once. `created_rows()` is that set, evaluated at the call — the one
+  it — a seed that does not list it yet keeps it — or a lane opened through the source sees
+  the session end, or 10 min pass (craze's replay window); never for a hostId a roster (or
+  such a lane) let go within craze's 10-minute replay window (timestamped tombstones, a 4096
+  count only as a memory backstop, so a replayed create cannot resurrect it); at most 64 at
+  once. **The lane's end is load-bearing** (live leg 1's ghost row): craze's roster removes
+  only a host it SENT, so a session created and stopped before its next flush is never
+  removed by it — the lane, holding the source's rows weakly, lets the created row go and
+  tombstones it on a terminal `Down` of `session_closed`/`unknown_session`/`start_failed`,
+  or on ANY end of the lane's LAST running watcher once the host took its `session.stop`
+  (the receipt is craze's word the close follows) — by the receipt itself when no
+  subscription is left to see the close — said before the `Down` is published for every end
+  the watcher sees (a receipt whose wake loses the race to a lane fault's `Down` says it just
+  after it: the row still goes), once per lane; `on_created_gone(f)` is the
+  client's hook for that one change no roster frame says (the desktop re-reads its listing).
+  `created_rows()` is that set, evaluated at the call — the one
   authority a client lists created rows from (the desktop keeps no copy). So `open(hostId)` on a just-created session binds a
   lane that knows its row at once; `dialling(dial)` is the same source — its rows — on
   another dial (the desktop runs a user's explicit `create_options`/`create` through an

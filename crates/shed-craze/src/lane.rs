@@ -90,8 +90,42 @@
 //! a short connection.
 //! `history` ignores its cursor (craze has no paging; the module doc of
 //! `shed_core::lane`), and its rows carry seqs local to the call.
+//!
+//! # The session's end
+//!
+//! A lane opened through a [`crate::CrazeSource`] holds that source's rows
+//! WEAKLY and says its session's end back to them, so a row only a create
+//! answered with — one no roster will ever remove — leaves with its session
+//! (the source's module doc; live leg 1's ghost row). The end is the
+//! watcher's terminal `Down` that says the SESSION is over — `session_closed`,
+//! `unknown_session`, `start_failed: <cause>` — said to the source BEFORE the
+//! `Down` is published, so a client that re-reads its listing on the `Down`
+//! finds the row gone. A `Down` that says only that this lane cannot go on
+//! (`unreachable`, `protocol: …`, `connect refused: …`, the bounds) says
+//! nothing of the session, which may well be running — UNLESS the host took a
+//! `session.stop` this lane sent: its receipt is craze's word that the
+//! session's end follows (PM "`session.stop`"), so from then on the lane's
+//! end, however it comes — any `Down`, or its subscription let go before the
+//! close reached it — is the session's. That holds for the lane's LAST
+//! running watcher only: while another subscription is still live, it is the
+//! one to see the close (or to end in turn). The receipt alone lets nothing
+//! go: the session is closing, its closing records still to come — unless no
+//! subscription is left to see the close (one let go while the stop was in
+//! flight, before its receipt): then the receipt itself says it, since nothing
+//! else will. Said at most once per lane, whichever of the watcher's `Down`,
+//! its end, or the receipt gets there first. A lane bound with no source
+//! ([`CrazeLane::new`]) says it to nothing.
+//!
+//! **The order.** Said-before-`Down` holds for every end the watcher itself
+//! sees. One window is accepted, not closed: the receipt is on the wire, but
+//! a `Down` that says nothing of the session (`unreachable`, say) runs before
+//! the `stop()` future wakes to record it — so that `Down` does not say the
+//! end, its watcher goes, and the receipt, finding no watcher left, says it
+//! just AFTER the `Down`. The row still goes and the client's hook
+//! ([`crate::CrazeSource::on_created_gone`]) still fires; only the order is
+//! lost, within one task wake.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -113,7 +147,7 @@ use crate::dial::{connect_hub, CrazeDial, DialError, DIAL_DEADLINE};
 use crate::errors::{craze_says, lane_error, outcome_unknown};
 use crate::fold::{plan_option, record_approval, Cards, CrazeFold, Restored};
 use crate::settings::{SettingsSections, SettingsState};
-use crate::source::KIND;
+use crate::source::{SourceRows, KIND};
 use crate::wire::{
     self, code, method, AskGetResult, AskParams, AsksListResult, ClientInfo, CommandParams,
     ConnectParams, Empty, HelloParams, PromptParams, RosterRow, SessionCapabilities, SessionInfo,
@@ -264,6 +298,18 @@ pub(crate) struct LaneShared {
     /// for every running watcher to apply to its fold and re-emit `Settings`
     /// with (the module doc, "Settings").
     pub confirmed: broadcast::Sender<Setting>,
+    /// The rows of the source the lane was opened through, held weakly — what
+    /// the session's end is said to (the module doc).
+    source: SourceRows,
+    /// The host took a `session.stop` this lane sent (its receipt): the
+    /// session's end follows, so the lane's own end is the session's.
+    stop_taken: AtomicBool,
+    /// The session's end has been said (at most once per lane).
+    end_said: AtomicBool,
+    /// The watchers running — counted from their spawn to their guard's drop,
+    /// an abort included — so a stop receipted after the last one went knows
+    /// that nothing is left to see the close.
+    watchers: AtomicUsize,
     next_command: AtomicU64,
     next_watcher: AtomicU64,
 }
@@ -277,6 +323,59 @@ impl LaneShared {
     /// lane, never reused.
     pub fn command_id(&self) -> String {
         (self.next_command.fetch_add(1, Ordering::Relaxed) + 1).to_string()
+    }
+
+    /// The session ended for good, as this lane saw it (the module doc's
+    /// "The session's end"): the source it was opened through lets its hostId
+    /// go. Said ONCE per lane — whichever path gets here first; nothing for a
+    /// lane bound with no source.
+    pub fn session_ended(&self) {
+        if !self.end_said.swap(true, Ordering::SeqCst) {
+            self.source.session_ended(&self.host_id);
+        }
+    }
+
+    /// Whether the host took a `session.stop` this lane sent — from then on
+    /// the lane's end, however it comes, is the session's.
+    pub fn stop_taken(&self) -> bool {
+        self.stop_taken.load(Ordering::SeqCst)
+    }
+
+    /// A watcher began (counted from its spawn, before its task first runs).
+    pub fn watcher_began(&self) {
+        self.watchers.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// A watcher went — however it ended, an abort included. After a stop the
+    /// host took, the LAST watcher's end is the session's (the module doc);
+    /// one that leaves another running leaves the close to that one.
+    ///
+    /// Paired with [`LaneShared::took_stop`] in sequentially consistent order
+    /// — each writes its own flag, then reads the other's — so of the last
+    /// watcher going and a receipt arriving at once, at least one sees the
+    /// other and says the end (both may; it is said once).
+    pub fn watcher_gone(&self) {
+        let last = self.watchers.fetch_sub(1, Ordering::SeqCst) == 1;
+        if last && self.stop_taken() {
+            self.session_ended();
+        }
+    }
+
+    /// Whether the calling watcher is the only one running — so its end,
+    /// after a stop the host took, leaves nothing to see the close.
+    pub fn sole_watcher(&self) -> bool {
+        self.watchers.load(Ordering::SeqCst) == 1
+    }
+
+    /// The host took this lane's `session.stop` (its receipt). With a watcher
+    /// running, the close it will see — or its own end — says the session's
+    /// end; with none left (the subscription let go while the stop was in
+    /// flight), nothing would, so the receipt says it now.
+    fn took_stop(&self) {
+        self.stop_taken.store(true, Ordering::SeqCst);
+        if self.watchers.load(Ordering::SeqCst) == 0 {
+            self.session_ended();
+        }
     }
 
     /// A watcher's id.
@@ -699,12 +798,28 @@ impl CrazeLane {
     /// opened it with — `None` when it never listed one, and then
     /// [`AgentLane::session`] is `UnknownSession` until a watcher reads the
     /// row. Binding, not dialling: nothing happens until a call.
+    ///
+    /// Bound to no source: its session's end is said to nothing (the module
+    /// doc) — [`crate::CrazeSource`]'s `open` is what binds one that says it.
     pub fn new(
         dial: Arc<dyn CrazeDial>,
         client: ClientInfo,
         host_id: &str,
         row: Option<(LaneSession, String)>,
         timings: LaneTimings,
+    ) -> CrazeLane {
+        CrazeLane::opened_through(dial, client, host_id, row, timings, SourceRows::default())
+    }
+
+    /// [`CrazeLane::new`], opened through the source whose rows `source`
+    /// names: the session's end is said back to them (the module doc).
+    pub(crate) fn opened_through(
+        dial: Arc<dyn CrazeDial>,
+        client: ClientInfo,
+        host_id: &str,
+        row: Option<(LaneSession, String)>,
+        timings: LaneTimings,
+        source: SourceRows,
     ) -> CrazeLane {
         let (session, session_id) = match row {
             Some((session, sid)) => (Some(session), Some(sid)),
@@ -725,6 +840,10 @@ impl CrazeLane {
                 live,
                 settings_known: watch::channel(false).0,
                 confirmed: broadcast::channel(CONFIRMED_BACKLOG).0,
+                source,
+                stop_taken: AtomicBool::new(false),
+                end_said: AtomicBool::new(false),
+                watchers: AtomicUsize::new(0),
                 next_command: AtomicU64::new(0),
                 next_watcher: AtomicU64::new(0),
             }),
@@ -735,6 +854,13 @@ impl CrazeLane {
     /// the one it learned) — what every session call carries.
     pub fn craze_session_id(&self) -> Option<String> {
         lock(&self.shared.state).session_id.clone()
+    }
+
+    /// How many of this lane's watchers are running (a test's sight of a
+    /// subscription let go).
+    #[cfg(test)]
+    pub(crate) fn watching(&self) -> usize {
+        self.shared.watchers.load(Ordering::SeqCst)
     }
 }
 
@@ -1158,15 +1284,19 @@ impl AgentLane for CrazeLane {
     /// (PM "`session.stop`"; Amendment A7): the session's closing records
     /// follow on the stream, then `reset{session_closed}`, which ends the
     /// subscription `Down{"session_closed"}`. A host that cannot stop (`stop:
-    /// false`) answers `unsupported` — `Failed` (the table).
+    /// false`) answers `unsupported` — `Failed` (the table). A receipt makes
+    /// the lane's own end, however it comes, the session's — and says it at
+    /// once when no subscription is left to (the module doc's "The session's
+    /// end").
     async fn stop(&self) -> Result<(), LaneError> {
         self.shared
             .command("stop", method::SESSION_STOP, |sid, cmd| CommandParams {
                 session_id: sid,
                 command_id: cmd,
             })
-            .await
-            .map(|_| ())
+            .await?;
+        self.shared.took_stop();
+        Ok(())
     }
 }
 

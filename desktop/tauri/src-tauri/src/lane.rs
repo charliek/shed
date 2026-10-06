@@ -1096,9 +1096,11 @@ impl Lanes {
     /// `lane.stop` — end the SESSION (plan 025 §3.6.4), not just this
     /// transcript: craze's `session.stop`, answered on its receipt; the lane
     /// itself ends when the session's `session_closed` arrives, and the row
-    /// leaves the roster then. A session whose capabilities say `stop: false`
-    /// (a TUI-hosted craze session, every opencode one) refuses it — the panel
-    /// offers no Stop there.
+    /// leaves then — the roster's `Removed`, or, for a session no roster has
+    /// listed yet, the source letting its created row go
+    /// (`shed_craze::lane`'s "The session's end"). A session whose
+    /// capabilities say `stop: false` (a TUI-hosted craze session, every
+    /// opencode one) refuses it — the panel offers no Stop there.
     pub async fn stop(
         &self,
         machine: &str,

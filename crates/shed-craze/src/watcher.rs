@@ -140,7 +140,11 @@ pub(crate) fn spawn(shared: Arc<LaneShared>, hint: Option<String>) -> LaneSubscr
         confirm_closed: false,
         confirms,
     };
-    let task = tokio::spawn(watcher.run(hint));
+    // The guard exists from the spawn, not from the task's first poll: a
+    // subscription let go before its watcher ever ran still counts as one that
+    // went (`LaneShared::watcher_gone`).
+    let guard = LiveGuard::new(Arc::clone(&watcher.shared), owner);
+    let task = tokio::spawn(watcher.run(hint, guard));
     LaneSubscription {
         rx,
         stop: LaneStop::new(task),
@@ -253,10 +257,19 @@ struct Watcher {
 }
 
 /// Takes the live connection back from the verbs however the watcher ends —
-/// an abort included (a dropped future runs no code but its destructors).
+/// an abort included (a dropped future runs no code but its destructors) —
+/// and counts the watcher out.
 struct LiveGuard {
     shared: Arc<LaneShared>,
     owner: u64,
+}
+
+impl LiveGuard {
+    /// Counts the watcher in ([`LaneShared::watcher_began`]).
+    fn new(shared: Arc<LaneShared>, owner: u64) -> LiveGuard {
+        shared.watcher_began();
+        LiveGuard { shared, owner }
+    }
 }
 
 impl Drop for LiveGuard {
@@ -265,15 +278,27 @@ impl Drop for LiveGuard {
         // The reads stop answering from this watcher's fold — unless a newer
         // watcher has seeded since, whose fold they answer from now.
         self.shared.unseed(self.owner);
+        // Counted out — and the lane's LAST subscription to end after the host
+        // took its stop (let go, or aborted, before the close reached it)
+        // still says the session's end: the receipt is craze's word that it
+        // follows (`crate::lane`'s "The session's end"). Said once per lane,
+        // so a `Down` that already said it makes this nothing.
+        self.shared.watcher_gone();
     }
 }
 
+/// Whether a terminal `Down`'s reason says the SESSION is over, not only this
+/// lane (`crate::lane`'s "The session's end"): its close, a hub or host that
+/// knows no such session, a start that failed. Every other terminal reason —
+/// `unreachable`, `protocol: …`, `connect refused: …`, `craze unavailable: …`,
+/// `re-attach bound` — is this lane's end alone.
+fn ends_the_session(reason: &str) -> bool {
+    matches!(reason, "session_closed" | "unknown_session") || reason.starts_with("start_failed: ")
+}
+
 impl Watcher {
-    async fn run(mut self, hint: Option<String>) {
-        let _guard = LiveGuard {
-            shared: Arc::clone(&self.shared),
-            owner: self.owner,
-        };
+    async fn run(mut self, hint: Option<String>, guard: LiveGuard) {
+        let _guard = guard;
         let t = self.shared.timings;
         // The caller's cursor is not honoured (this lane resumes from a cursor
         // it keeps itself), and the first `Reset` says so.
@@ -488,8 +513,19 @@ impl Watcher {
     /// `Down` — the frame `publish_final` never drops. The rows ahead of it
     /// WAIT for room too (`publish_waiting`): there is no reseed after a
     /// `Down` to restore a row a full channel dropped, so a terminal end never
-    /// costs the transcript its last words.
+    /// costs the transcript its last words. A `Down` that ends the SESSION
+    /// ([`ends_the_session`], or — from the lane's last running watcher — any
+    /// after a stop the host took) is said to the source the lane was opened
+    /// through first (`crate::lane`'s "The session's end").
     async fn go_down(mut self, reason: String) {
+        // The session's end is said to the source BEFORE the `Down` (and the
+        // rows ahead of it), so a client that re-reads its listing on the
+        // `Down` already finds a created row gone — and whatever becomes of
+        // the publish, it is said. A lane fault after a stop says it only when
+        // no other watcher of the lane is left to see the close.
+        if ends_the_session(&reason) || (self.shared.stop_taken() && self.shared.sole_watcher()) {
+            self.shared.session_ended();
+        }
         self.fold.flush();
         let now = now_unix_ms();
         for row in self.fold.drain() {

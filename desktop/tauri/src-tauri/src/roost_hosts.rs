@@ -837,12 +837,14 @@ pub struct RoostHosts {
     /// pass has changed underneath it, and the registry ends on the LATEST
     /// observation. Async, because a pass awaits its removals.
     observe_pass: tokio::sync::Mutex<()>,
-    /// [`TestGap`]s, armed by a test: [`Self::remove`]'s and
-    /// [`Self::observe_sheds`]'.
+    /// [`TestGap`]s, armed by a test: [`Self::remove`]'s,
+    /// [`Self::observe_sheds`]' and [`Self::craze_create`]'s.
     #[cfg(test)]
     remove_gap: Mutex<Option<TestGap>>,
     #[cfg(test)]
     observe_gap: Mutex<Option<TestGap>>,
+    #[cfg(test)]
+    create_gap: Mutex<Option<TestGap>>,
 }
 
 /// The mutable half of [`RoostHosts`]: the registered set and its live watchers.
@@ -1038,6 +1040,8 @@ impl RoostHosts {
             remove_gap: Mutex::new(None),
             #[cfg(test)]
             observe_gap: Mutex::new(None),
+            #[cfg(test)]
+            create_gap: Mutex::new(None),
         };
         for entry in &config.machines {
             hosts.watch_machine(entry.clone());
@@ -1557,6 +1561,14 @@ impl RoostHosts {
     /// `ended: true`, and nothing is listed. Like [`Self::craze_create_options`]
     /// it is an explicit action that may birth a hub, and it wakes the host's
     /// source.
+    ///
+    /// **The source's rows are read UNDER this layer's state lock** (live leg
+    /// 1's ghost-row review): the roster pump updates the source's rows BEFORE
+    /// it emits the frame the host's sink then applies under that lock, so a
+    /// roster row read there is never one whose `Removed` this state has
+    /// already applied — read before the lock, a session the roster listed
+    /// and let go in between would be folded back by `listed_now`, a row no
+    /// later frame removes.
     pub async fn craze_create(
         &self,
         host: &str,
@@ -1568,14 +1580,16 @@ impl RoostHosts {
         wake.notify_one();
         let created = answer.map_err(CrazeFailure::lane)?;
         let host_id = created.session.id.clone();
-        let roster_row = ask.roster_row(&host_id);
-        let ended = ask.listed(&host_id).is_none();
-        let shown = roster_row
-            .clone()
-            .unwrap_or_else(|| created.session.clone());
-        let row = {
+        #[cfg(test)]
+        at_gap(&self.create_gap).await;
+        let (row, ended) = {
             let mut guard = lock(&self.state);
-            match guard.get_mut(&id).filter(|m| m.craze.gen == gen) {
+            let roster_row = ask.roster_row(&host_id);
+            let ended = ask.listed(&host_id).is_none();
+            let shown = roster_row
+                .clone()
+                .unwrap_or_else(|| created.session.clone());
+            let row = match guard.get_mut(&id).filter(|m| m.craze.gen == gen) {
                 Some(m) => {
                     if let Some(listed) = roster_row {
                         m.craze.listed_now(listed);
@@ -1590,7 +1604,8 @@ impl RoostHosts {
                 // Removed (or restarted) meanwhile: the session exists all the
                 // same, and its row says so — as the last known.
                 None => craze_row(&id, &shown, true, None),
-            }
+            };
+            (row, ended)
         };
         (self.on_change)();
         Ok(json!({
@@ -1898,6 +1913,11 @@ impl RoostHosts {
         };
         let (dial, gone) = crate::craze::tracked(Arc::clone(&reach.dial));
         let source = CrazeSource::new(Arc::clone(&dial), CLIENT_LABEL);
+        // A created row its lane saw end (a create stopped before any roster
+        // listed it) leaves the source with no roster frame to say so: the UI
+        // re-reads the listing, which reads the source's created rows now.
+        let on_change = self.on_change.clone();
+        source.on_created_gone(move || on_change());
         // A user's explicit action dials through the host's ungated dial when
         // it has one (an attach-only host), on a clone sharing the source's
         // rows; an eager host's own dial is already ungated.

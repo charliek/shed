@@ -75,11 +75,22 @@
 //!   is then the one — and the fresher) or REMOVES it, or until it expires
 //!   ([`CREATED_TTL`], craze's own replay window). A roster seed that does not
 //!   list it yet — one whose answer predates the new host — keeps it;
-//! - never kept for a hostId a roster has already let go (removed, or listed
-//!   and then dropped by a reseed): craze replays a successful create's answer
-//!   for ten minutes, and a replay after the session ended must not bring its
-//!   row back — every such hostId is remembered for that whole window
-//!   ([`TOMBSTONES`] is only a memory backstop);
+//! - **or until a lane opened on it through this source sees its session
+//!   end** ([`crate::lane`]'s "The session's end"): dropped and tombstoned,
+//!   exactly as a roster `Removed` would. craze's roster sends a remove only
+//!   for a host it SENT — a host that came and went between two of its
+//!   flushes is neither upserted nor removed (craze
+//!   `internal/hub/roster.go`, `take`) — so a create stopped at once is never
+//!   removed by the roster, and without this its row stayed listed for the
+//!   whole of [`CREATED_TTL`] (live leg 1's ghost row). A client that lists
+//!   the created rows learns of this through [`CrazeSource::on_created_gone`],
+//!   since no roster frame will say it;
+//! - never kept for a hostId a roster (or such a lane) has already let go
+//!   (removed, listed and then dropped by a reseed, or ended): craze replays a
+//!   successful create's answer for ten minutes, and a replay after the
+//!   session ended must not bring its row back — every such hostId is
+//!   remembered for that whole window ([`TOMBSTONES`] is only a memory
+//!   backstop);
 //! - at most [`CREATED_KEEP`] at once, oldest first out, so creates on a source
 //!   with no roster subscription cannot pile up.
 //!
@@ -106,7 +117,9 @@
 //! upserted, removed — for exactly this, and every create keeps the row it
 //! answered with until the roster lists it). An id the source never listed opens
 //! a lane whose `session()` is `UnknownSession` until a subscription of its own
-//! reads the host's row (plan 025 §3.3.4).
+//! reads the host's row (plan 025 §3.3.4). The lane holds this source's rows
+//! WEAKLY, to say its session's end back to them (the created rows' rules
+//! above) — never keeping a dropped source's rows alive.
 
 use std::collections::{HashMap, VecDeque};
 use std::path::Path;
@@ -234,9 +247,23 @@ struct Held {
     roster: HashMap<String, (LaneSession, String)>,
     /// Creates' rows no roster has listed (or removed) yet.
     created: HashMap<String, Created>,
-    /// HostIds a roster let go, and when, oldest first: each kept for
-    /// [`CREATED_TTL`] (the backstop: at most [`TOMBSTONES`]).
+    /// HostIds a roster — or a lane that saw the session end — let go, and
+    /// when, oldest first: each kept for [`CREATED_TTL`] (the backstop: at most
+    /// [`TOMBSTONES`]).
     gone: VecDeque<(String, tokio::time::Instant)>,
+    /// The client's hook for a created row that left with no roster frame to
+    /// say so ([`CrazeSource::on_created_gone`]).
+    created_gone: Option<CreatedGone>,
+}
+
+/// [`CrazeSource::on_created_gone`]'s hook.
+#[derive(Clone)]
+struct CreatedGone(Arc<dyn Fn() + Send + Sync>);
+
+impl std::fmt::Debug for CreatedGone {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("CreatedGone")
+    }
 }
 
 impl Held {
@@ -288,7 +315,8 @@ impl Held {
             .any(|(h, at)| h == host_id && at.elapsed() < CREATED_TTL)
     }
 
-    /// A roster let `host_id` go: its created row (if any) with it, and a
+    /// A roster let `host_id` go — or a lane saw its session end
+    /// ([`Held::session_ended`]): its created row (if any) with it, and a
     /// tombstone for craze's whole replay window.
     fn let_go(&mut self, host_id: &str) {
         self.created.remove(host_id);
@@ -299,6 +327,18 @@ impl Held {
         }
         self.gone
             .push_back((host_id.to_string(), tokio::time::Instant::now()));
+    }
+
+    /// A lane opened through this source saw `host_id`'s session end for good
+    /// (the module doc): exactly a roster `Removed`'s effect on the created
+    /// rows and the tombstones ([`Held::let_go`]). The roster's own row, if
+    /// its roster lists one, stays the roster's: it listed the host, so its
+    /// own `Removed` follows. Answers the client's hook when a created row
+    /// went — the one change no roster frame will say.
+    fn session_ended(&mut self, host_id: &str) -> Option<CreatedGone> {
+        let went = self.created.contains_key(host_id);
+        self.let_go(host_id);
+        went.then(|| self.created_gone.clone()).flatten()
     }
 
     /// A seed: the roster's whole set, replaced. A hostId the last set listed
@@ -352,6 +392,28 @@ impl Held {
 
 /// [`Held`], shared by a source's clones.
 type Rows = Arc<Mutex<Held>>;
+
+/// A lane's way back to the rows of the source it was opened through
+/// ([`AgentSource::open`]): WEAK, so a lane never keeps a dropped source's
+/// rows alive — and a lane bound with none ([`CrazeLane::new`]) says its
+/// session's end to nothing.
+#[derive(Clone, Default)]
+pub(crate) struct SourceRows(std::sync::Weak<Mutex<Held>>);
+
+impl SourceRows {
+    /// The lane's session ended for good ([`crate::lane`]'s "The session's
+    /// end"): the source lets `host_id` go ([`Held::session_ended`]), then —
+    /// outside its lock — calls the client's hook when a created row went.
+    pub(crate) fn session_ended(&self, host_id: &str) {
+        let Some(rows) = self.0.upgrade() else {
+            return;
+        };
+        let hook = lock(&rows).session_ended(host_id);
+        if let Some(CreatedGone(hook)) = hook {
+            hook();
+        }
+    }
+}
 
 /// One machine's craze hub, reached through a client-supplied dial.
 ///
@@ -437,6 +499,18 @@ impl CrazeSource {
         lock(&self.rows).created_rows()
     }
 
+    /// **Call `f` whenever a created row leaves this source with no roster
+    /// frame to say so** — a lane opened on it through this source saw its
+    /// session end (the module doc) — so a client that lists
+    /// [`CrazeSource::created_rows`] re-reads them then. The roster's own
+    /// changes reach it as [`SourceEvent`]s; an expiry ([`CREATED_TTL`]) is
+    /// simply absent from its next listing. One hook per source, shared by
+    /// every clone ([`CrazeSource::dialling`]); a later call replaces it. It
+    /// is called on the lane's task, with no lock of this source's held.
+    pub fn on_created_gone(&self, f: impl Fn() + Send + Sync + 'static) {
+        lock(&self.rows).created_gone = Some(CreatedGone(Arc::new(f)));
+    }
+
     /// The row this source's ROSTER lists under `host_id` — not a create's.
     pub fn roster_row(&self, host_id: &str) -> Option<LaneSession> {
         lock(&self.rows)
@@ -448,6 +522,18 @@ impl CrazeSource {
     /// Who this source says it is.
     pub fn client(&self) -> &ClientInfo {
         &self.client
+    }
+
+    /// [`AgentSource::open`]'s lane, as itself.
+    pub(crate) fn open_lane(&self, session_id: &str) -> CrazeLane {
+        CrazeLane::opened_through(
+            Arc::clone(&self.dial),
+            self.client.clone(),
+            session_id,
+            self.listed(session_id),
+            self.lane_timings,
+            SourceRows(Arc::downgrade(&self.rows)),
+        )
     }
 
     async fn connect(&self) -> Result<(Conn, Notifications, HubHello), DialError> {
@@ -727,15 +813,11 @@ impl AgentSource for CrazeSource {
     }
 
     /// A [`CrazeLane`] bound to the row's hostId — and to the row and its
-    /// craze session id when this source lists it. No I/O (the module doc).
+    /// craze session id when this source lists it — holding this source's
+    /// rows weakly, to say its session's end back to them. No I/O (the module
+    /// doc).
     async fn open(&self, session_id: &str) -> Result<Arc<dyn AgentLane>, LaneError> {
-        Ok(Arc::new(CrazeLane::new(
-            Arc::clone(&self.dial),
-            self.client.clone(),
-            session_id,
-            self.listed(session_id),
-            self.lane_timings,
-        )))
+        Ok(Arc::new(self.open_lane(session_id)))
     }
 }
 

@@ -264,11 +264,22 @@ refusal — and any edit of the form mint a new one.
 
 **A created session is listed at once.** The roster can list a new session a
 moment after the create answers, so `CrazeSource` keeps the created row apart
-until a roster lists or removes that hostId, or ten minutes pass (at most 64
-rows). `CrazeSource::created_rows()` is the one authority the desktop lists
-them from; it keeps no copy. A hostId a roster removed is not listed again
-within craze's ten-minute replay window, so a replayed create of a session
-that has since ended opens nothing.
+until a roster lists or removes that hostId, a lane opened on it sees the
+session end, or ten minutes pass (at most 64 rows). `CrazeSource::created_rows()`
+is the one authority the desktop lists them from; it keeps no copy. A hostId a
+roster removed, or whose session a lane saw end, is not listed again within
+craze's ten-minute replay window, so a replayed create of a session that has
+since ended opens nothing.
+
+The lane is what ends a session the roster never listed. craze's roster sends
+a removal only for a session it has already sent, so a session created and
+stopped before the roster's next flush is never removed by it. Its lane's end
+lets the created row go instead: a `Down` of `session_closed`,
+`unknown_session` or `start_failed`, or, once the host has taken a stop, any
+end of the lane, including a transcript closed before the close arrived. A
+transcript closed while the stop was still in flight leaves no lane to see the
+close, so the stop's receipt says it instead. The source then tells the
+desktop to re-read the listing, since no roster frame will.
 
 ### Open in terminal
 

@@ -1863,3 +1863,185 @@ async fn the_desktops_created_rows_follow_the_sources_bound() {
         "the status count agrees"
     );
 }
+
+/// The layer with `reaches` as each host's scripted craze, counting every
+/// `on_change` (the UI's "re-read") in `changes`.
+fn start_counting(
+    options: &ReachOptions,
+    reaches: Vec<(HostId, Arc<Scripted>)>,
+    changes: Arc<AtomicUsize>,
+) -> RoostHosts {
+    let map: BTreeMap<HostId, Arc<Scripted>> = reaches.into_iter().collect();
+    RoostHosts::start_with(
+        &tokio::runtime::Handle::current(),
+        &ShedConfig::default(),
+        options.clone(),
+        false,
+        Arc::new(move || {
+            changes.fetch_add(1, Ordering::SeqCst);
+        }),
+        CrazeReaches::Fixed(Arc::new(move |id: &HostId| map.get(id).map(|s| s.reach()))),
+        timings(),
+    )
+}
+
+/// Whether the listing carries a craze row for `host_id`.
+fn lists(hosts: &RoostHosts, host_id: &str) -> bool {
+    craze_rows(hosts).iter().any(|r| r["slug"] == host_id)
+}
+
+/// **A session created and stopped before any roster lists it leaves the
+/// listing** (live leg 1's ghost row, re-run on 82eabbd: a sheet-created
+/// session stopped 0.4 s after its create stayed in `rc.list` — and
+/// `lane.open` on it still answered — for more than eight minutes). The
+/// roster never lists it, so no `Removed` will ever come; its lane's
+/// `Down{"session_closed"}` lets the source's created row go, and the listing,
+/// which reads the source's created rows at every read and keeps none of its
+/// own, drops it — `rc.list`, the machine's count and `lane.open` alike. The
+/// stop's receipt alone drops nothing, and the UI is told to re-read
+/// (`on_change`) when the row goes, since no roster frame will say so.
+#[tokio::test]
+async fn a_created_session_stopped_before_any_roster_lists_it_leaves_the_listing() {
+    use shed_craze::testing::{
+        attach_result, host_session_row, session_caps, session_info, snapshot_at,
+    };
+    // A quiet roost on this machine: nothing re-reads but what the test does.
+    let fake = FakeRoost::start().await;
+    let craze = Scripted::eager();
+    let changes = Arc::new(AtomicUsize::new(0));
+    let hosts = Arc::new(start_counting(
+        &test_options(&[(LOCALHOST, fake.socket_path())]),
+        vec![(local(), Arc::clone(&craze))],
+        Arc::clone(&changes),
+    ));
+    let lanes = lanes_over(&hosts);
+    let _roster = craze.roster(json!([row(HOST_A, "ses-a")])).await;
+    wait_for("the roster", || {
+        (craze_rows(&hosts).len() == 1).then_some(())
+    })
+    .await;
+    create_answering(&hosts, &craze, "shed-ghost-1", created_result("ses-new"))
+        .await
+        .expect("created");
+    assert!(lists(&hosts, HOST_NEW), "listed at once, by the source");
+
+    // Its transcript opens, and the lane's own connection seeds.
+    lanes
+        .open(LOCALHOST, "craze", HOST_NEW)
+        .await
+        .expect("the transcript of a just-created session opens");
+    let mut conn = craze.next().await;
+    conn.splice(HOST_NEW).await;
+    let info = session_info(HOST_NEW, "craze-new", "INC-1", session_caps(true));
+    conn.listed(host_session_row(&info, json!({}))).await;
+    conn.attached(attach_result(
+        "s-1",
+        &info,
+        ("INC-1", 1),
+        Some(snapshot_at("INC-1", 1, json!({}))),
+        None,
+    ))
+    .await;
+    conn.synchronized("s-1", 1).await;
+    wait_for("the seed", || {
+        let v = lanes.messages(LOCALHOST, "craze", HOST_NEW).ok()?;
+        (!v["session"].is_null()).then_some(())
+    })
+    .await;
+
+    // Stop: answered on the receipt — the row stays while the session closes.
+    let stopping = {
+        let lanes = Arc::clone(&lanes);
+        tokio::spawn(async move { lanes.stop(LOCALHOST, "craze", HOST_NEW).await })
+    };
+    let req = conn.expect("session.stop").await;
+    conn.reply(&req, json!({})).await;
+    stopping.await.unwrap().expect("the host's receipt");
+    assert!(lists(&hosts, HOST_NEW), "closing, not closed");
+    let before = changes.load(Ordering::SeqCst);
+
+    // The close: the row leaves the listing, though no roster frame says so —
+    // and the UI was told to re-read before the lane's `Down` reached it.
+    conn.reset("s-1", "session_closed").await;
+    wait_for("the lane's Down", || {
+        let v = lanes.messages(LOCALHOST, "craze", HOST_NEW).ok()?;
+        (v["ended"] == true).then_some(())
+    })
+    .await;
+    assert!(
+        !lists(&hosts, HOST_NEW),
+        "the stopped session is gone from the listing"
+    );
+    assert!(
+        changes.load(Ordering::SeqCst) > before,
+        "the UI is told to re-read: no roster frame will"
+    );
+    assert!(lists(&hosts, HOST_A), "the roster's own row stays");
+    assert_eq!(
+        status_of(&hosts, LOCALHOST).unwrap()["sessions"],
+        json!(1),
+        "the machine's count agrees"
+    );
+    let refused = lanes.open(LOCALHOST, "craze", HOST_NEW).await;
+    assert!(refused.is_err(), "no lane opens on it: {refused:?}");
+}
+
+/// **A create answered as the roster lets its session go is not listed
+/// again** (the ghost-row review of `craze_create`): the roster lists the new
+/// session, and removes it while the create's answer is between the source
+/// and this layer's state lock. The source's rows are read UNDER that lock,
+/// so the roster row the answer folds in is never one whose `Removed` this
+/// state already applied — read before it, `listed_now` folded the row back,
+/// and no later frame would ever remove it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_create_answered_as_the_roster_lets_it_go_is_not_listed_again() {
+    let craze = Scripted::eager();
+    let hosts = Arc::new(start_scripted(
+        &ShedConfig::default(),
+        &test_options(&[]),
+        vec![(local(), Arc::clone(&craze))],
+    ));
+    let mut roster = craze.roster(json!([row(HOST_A, "ses-a")])).await;
+    wait_for("the roster", || {
+        (craze_rows(&hosts).len() == 1).then_some(())
+    })
+    .await;
+    // The roster lists the new session before its create is answered.
+    roster
+        .roster("sub-1", EPOCH, json!([row(HOST_NEW, "ses-new")]), json!([]))
+        .await;
+    wait_for("the roster's row", || lists(&hosts, HOST_NEW).then_some(())).await;
+
+    let reached = Arc::new(tokio::sync::Notify::new());
+    let proceed = Arc::new(tokio::sync::Notify::new());
+    *lock(&hosts.create_gap) = Some((Arc::clone(&reached), Arc::clone(&proceed)));
+    let create = {
+        let hosts = Arc::clone(&hosts);
+        tokio::spawn(async move {
+            hosts
+                .craze_create(LOCALHOST, create_req("shed-race-1"))
+                .await
+        })
+    };
+    let mut hub = craze.next().await;
+    hub.hello(EPOCH, full_hub_capabilities()).await;
+    let req = hub.expect("session.create").await;
+    hub.reply(&req, created_result("ses-new")).await;
+    reached.notified().await;
+    // The session ends while the answer is in hand: the roster lets it go,
+    // and this layer applies the `Removed`.
+    roster
+        .roster("sub-1", EPOCH, json!([]), json!([HOST_NEW]))
+        .await;
+    wait_for("the Removed applied", || {
+        (!lists(&hosts, HOST_NEW)).then_some(())
+    })
+    .await;
+    proceed.notify_one();
+    let answer = create.await.unwrap().expect("craze answered");
+    assert!(
+        !lists(&hosts, HOST_NEW),
+        "a row the roster let go is not folded back"
+    );
+    assert_eq!(answer["ended"], true, "{answer}");
+}

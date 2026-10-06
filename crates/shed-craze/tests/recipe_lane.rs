@@ -496,6 +496,74 @@ async fn stop_ends_the_lane_after_its_closing_records() {
     recipe.teardown().await.unwrap();
 }
 
+/// **A session created and stopped at once leaves the source** (live leg 1's
+/// ghost row, re-run on 82eabbd: a sheet-created session stopped 0.4 s after
+/// its create stayed listed for its whole ten minutes). No roster subscription
+/// runs, so no roster ever lists the session — exactly a host that comes and
+/// goes between two of the hub's roster flushes, which craze neither upserts
+/// nor removes — and the lane's `Down{"session_closed"}` is what lets the
+/// create's row go: the source lists nothing for it after, and the same
+/// create's id, which craze answers with its stored answer for ten minutes,
+/// does not bring it back.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_session_created_and_stopped_at_once_leaves_the_source() {
+    let Some(bins) = bins("a_session_created_and_stopped_at_once_leaves_the_source") else {
+        return;
+    };
+    let recipe = Recipe::start(&bins);
+    recipe.set_grok_agent(&recipe.script_agent("grok-echo"));
+    {
+        let source = recipe.source();
+        let request = LaneCreateRequest {
+            cwd: recipe.work.to_string_lossy().into_owned(),
+            provider: None,
+            prompt: None,
+            request_id: new_request_id(),
+        };
+        let created = source.create(request.clone()).await.unwrap();
+        let host = created.session.id.clone();
+        let created_ids = |source: &CrazeSource| -> Vec<String> {
+            source.created_rows().into_iter().map(|r| r.id).collect()
+        };
+        assert_eq!(created_ids(&source), std::slice::from_ref(&host));
+        let lane = source.open(&host).await.unwrap();
+        let (mut rx, _stop) = lane.subscribe(None).await.unwrap().into_parts();
+        // At once: the stop waits only for the lane's connection.
+        lane.stop().await.unwrap();
+        let mut checker = LaneChecker::new();
+        let f = drive(&mut rx, &mut checker, "Down", |e| {
+            matches!(e, LaneEvent::Down { .. })
+        })
+        .await;
+        assert_eq!(
+            f.last(),
+            Some(&LaneEvent::Down {
+                reason: "session_closed".into()
+            })
+        );
+        assert!(
+            created_ids(&source).is_empty(),
+            "the stopped session's created row is gone: {:?}",
+            created_ids(&source)
+        );
+        assert!(
+            source.listed(&host).is_none(),
+            "the source lists nothing for it"
+        );
+
+        let replay = source.create(request).await.unwrap();
+        assert_eq!(
+            replay.session.id, host,
+            "craze answers the same request id with the session it started"
+        );
+        assert!(
+            created_ids(&source).is_empty() && source.listed(&host).is_none(),
+            "a replayed answer does not bring an ended session back"
+        );
+    }
+    recipe.teardown().await.unwrap();
+}
+
 /// **The silent resume**: the lane's bridge killed mid-stream, the fake host
 /// writes more while it is gone, and the lane reconnects with NO `Reset`: the
 /// same generation, the rows contiguous, the missed text folded once.
