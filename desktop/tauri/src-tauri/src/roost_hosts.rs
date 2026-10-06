@@ -15,8 +15,8 @@
 //!
 //! What is left here is what a desktop app actually owns: which hosts exist, one
 //! watcher per host, the last inventory each one reported, whether it is
-//! currently reachable, and the four ops (`roost.probe` / `preview` /
-//! `bootstrap` / `launch`) a user's click lands in.
+//! currently reachable, and the five ops (`roost.probe` / `preview` /
+//! `bootstrap` / `launch` / `run`) a user's click lands in.
 //!
 //! ## Two kinds of host, one registry
 //!
@@ -976,6 +976,53 @@ impl RoostHosts {
         // and a row on an unlisted host is not in the payload.
         self.watch(&id);
         Ok(row)
+    }
+
+    /// Open a tab ON this host running a [`RunCommand`] — "Run a command in a
+    /// tab" (plan 025 P5), the sibling of [`Self::launch`] that goes through no
+    /// kind at all.
+    ///
+    /// Addressed and normalized exactly like a launch: the same target grammar,
+    /// the same blank-is-absent working directory, the same registration (a user
+    /// action may be what FIRST reaches an unwatched shed), the same watcher once
+    /// `tab.open` has answered.
+    ///
+    /// **What it does not share is the optimistic row.** A launch knows which
+    /// agent it started, so it can stamp a provisional ownership for the second
+    /// before roost's adapter claims the tab ([`opened_session`]). A command could
+    /// be anything, and a tab nobody owns is not a session row
+    /// ([`RoostSession::is_agent_owned`]) — inserting one would put a card on
+    /// screen that no snapshot will ever produce. So the row that results is
+    /// whatever roost reports: a plain row once roost's own agent hooks claim the
+    /// tab (a `codex`, say — plan 025 D1), and no row at all for a tab nothing
+    /// claims (an `htop`), which is a plain terminal in roost and nothing else.
+    ///
+    /// Answers with the tab it opened, addressed the way a row would be
+    /// (`origin`, `machine`, and the tab id as the `slug` a later row for it will
+    /// carry), plus the `argv` that was sent: the split is the one part of this
+    /// a caller cannot see from outside.
+    pub async fn run(
+        &self,
+        host: &str,
+        command: &RunCommand,
+        workdir: Option<&str>,
+    ) -> Result<Value, String> {
+        let id = HostId::parse(host)?;
+        self.ensure_registered(&id)?;
+        let reach = self.reach(&id)?;
+        let params = run_params(command, workdir.map(str::trim).filter(|s| !s.is_empty()));
+        let tab = tab_open(reach.as_ref(), params).await?;
+        // A `tab.open` that answered is a session answering — the same reason
+        // [`Self::launch`] starts one — and it is the watcher that will carry
+        // the row, if one comes, now that nothing optimistic does.
+        self.watch(&id);
+        Ok(json!({
+            "origin": id.token(),
+            "machine": id.address(),
+            "slug": tab.id.to_string(),
+            "cwd": tab.cwd,
+            "argv": command.argv(),
+        }))
     }
 
     /// **TEST-MODE ONLY**: put a synthetic row into this host's snapshot, as if a
@@ -2103,6 +2150,85 @@ fn open_params(kind: &RcKind, workdir: Option<&str>) -> Result<TabOpenParams, St
         // the tab's cwd explicitly above, so shed has no use for it.
         cwd_from_tab: None,
     })
+}
+
+/// A `roost.run` command line, parsed into the argv its tab opens with (plan
+/// 025 P5). The only way to build one is [`RunCommand::parse`], so a
+/// [`RoostHosts::run`] can never be handed an empty argv.
+///
+/// **Split on ASCII whitespace, and nothing else.** No shell runs and nothing is
+/// unquoted: roost's `tab.open` takes an argv and execs it, so `codex --model x`
+/// is `["codex", "--model", "x"]` — and a quoted argument is NOT one argument:
+/// `say 'a b'` is `["say", "'a", "b'"]`, quotes and all, and `$HOME` or a `|` is
+/// passed through as the literal text it is. Rejected: wrapping the line as
+/// `["sh", "-c", command]`, which would put a second quoting layer (and a whole
+/// shell grammar, on a host that may not be the user's own) between what was
+/// typed and what runs, for no case this door exists for — starting an agent's
+/// own TUI with a flag or two. A pipeline belongs in a shell tab, which roost's
+/// own UI opens.
+///
+/// **Required, and never blank.** An absent, empty or whitespace-only command is
+/// refused before any connection is made: roost would open an empty argv as a
+/// plain shell, and a blank box meaning "a shell" is a door the plan rejected
+/// (roost's own UI opens shells). "Whitespace" for the refusal is Unicode's,
+/// which is a superset of the split's ASCII set — so a command that passes
+/// always yields at least one word, and a lone no-break space is refused rather
+/// than exec'd as a program named `\u{a0}`.
+///
+/// **No kind is consulted.** This is the deliberate difference from
+/// [`open_params`]: a launch is offered only for [`roost_capabilities`]' kinds
+/// and refused without a [`launch_argv`] recipe, while a command runs whatever
+/// its first word names. Which ROW (if any) it becomes is roost's to report —
+/// see [`RoostHosts::run`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RunCommand {
+    argv: Vec<String>,
+}
+
+impl RunCommand {
+    /// The one parse both doors share — the `roost.run` socket op and the
+    /// `roost_run` Tauri command — so the same line cannot split two ways
+    /// depending on which door it came through. The refusal is the caller's
+    /// mistake, so the socket door answers it as `bad_request`.
+    pub(crate) fn parse(command: Option<&str>) -> Result<Self, String> {
+        let command = command.unwrap_or_default();
+        if command.trim().is_empty() {
+            return Err(
+                "missing 'command': name the program to run (a blank command is not a plain \
+                 shell — roost's own UI opens those)"
+                    .to_string(),
+            );
+        }
+        Ok(Self {
+            argv: command
+                .split_ascii_whitespace()
+                .map(str::to_string)
+                .collect(),
+        })
+    }
+
+    /// The argv, in order: the program, then its arguments.
+    pub(crate) fn argv(&self) -> &[String] {
+        &self.argv
+    }
+}
+
+/// The `tab.open` request for a [`RunCommand`]: its argv in the cwd, with every
+/// other field exactly as [`open_params`] sets it, for [`open_params`]'s reasons
+/// (roost's project, roost's PTY size, roost's title, the tab left selected, no
+/// `cwd_from_tab`). A test pins the two equal but for `argv`, so they cannot
+/// drift apart.
+fn run_params(command: &RunCommand, workdir: Option<&str>) -> TabOpenParams {
+    TabOpenParams {
+        project_id: 0,
+        cwd: workdir.unwrap_or_default().to_string(),
+        argv: command.argv().to_vec(),
+        cols: 0,
+        rows: 0,
+        title: String::new(),
+        activate: None,
+        cwd_from_tab: None,
+    }
 }
 
 /// The session for a tab that was JUST opened.
@@ -4101,6 +4227,141 @@ mod tests {
         assert!(
             hosts.begin_bootstrap(&id).is_some(),
             "the gate is released when its claim drops"
+        );
+    }
+
+    // -- "Run a command in a tab" (plan 025 P5) ------------------------------
+
+    fn argv_of(command: &str) -> Vec<String> {
+        RunCommand::parse(Some(command))
+            .expect("a command with a word in it")
+            .argv()
+            .to_vec()
+    }
+
+    /// **The split is ASCII whitespace and nothing else** — no shell, no
+    /// quoting — which is what the op's documentation promises: `codex --model
+    /// x` works, and a quoted argument does not become one argument.
+    #[test]
+    fn a_run_command_splits_on_ascii_whitespace_and_nothing_else() {
+        assert_eq!(argv_of("codex --model x"), ["codex", "--model", "x"]);
+        // Runs of whitespace, tabs and newlines, leading and trailing: one rule.
+        assert_eq!(
+            argv_of("  codex\t--model   x \r\n"),
+            ["codex", "--model", "x"]
+        );
+        // No quoting: the quotes are the argument's own characters, and the
+        // space inside them still splits.
+        assert_eq!(argv_of("say 'a b'"), ["say", "'a", "b'"]);
+        assert_eq!(argv_of(r#"say "a b""#), ["say", "\"a", "b\""]);
+        // No shell: a variable, a pipe and a glob are literal text.
+        assert_eq!(
+            argv_of("echo $HOME | wc *"),
+            ["echo", "$HOME", "|", "wc", "*"]
+        );
+        // Unicode whitespace that is not ASCII is DATA for the split — it stays
+        // inside the word it is in.
+        assert_eq!(argv_of("a\u{a0}b c"), ["a\u{a0}b", "c"]);
+    }
+
+    /// **`command` is required: absent, empty and whitespace-only are each
+    /// refused**, before anything could reach a host (there is no host here at
+    /// all — the refusal is the parse's).
+    #[test]
+    fn an_absent_empty_or_blank_run_command_is_refused() {
+        for (what, command) in [
+            ("absent", None),
+            ("empty", Some("")),
+            ("spaces", Some("   ")),
+            ("ascii whitespace", Some(" \t\r\n ")),
+            // Unicode whitespace alone is blank too: it would otherwise survive
+            // the ASCII split as a "program" named after a no-break space.
+            ("unicode whitespace", Some("\u{a0}\u{2003}")),
+        ] {
+            let refusal =
+                RunCommand::parse(command).expect_err(&format!("{what} must be refused, not run"));
+            assert!(
+                refusal.contains("'command'"),
+                "{what}: the refusal names the missing field: {refusal}"
+            );
+        }
+    }
+
+    /// A run's `tab.open` is a launch's in every field but `argv` — the same
+    /// deliberate zeros and absences, for the same reasons. Pinned against
+    /// [`open_params`] itself rather than restated, so the two cannot drift.
+    #[test]
+    fn run_params_are_a_launchs_with_the_typed_argv() {
+        let command = RunCommand::parse(Some("codex --model x")).unwrap();
+        let run = run_params(&command, Some("/tmp/work"));
+        assert_eq!(run.argv, ["codex", "--model", "x"]);
+        let launch = open_params(&RcKind::Opencode, Some("/tmp/work")).unwrap();
+        assert_eq!(
+            TabOpenParams {
+                argv: launch.argv.clone(),
+                ..run
+            },
+            launch,
+            "every field but argv is the launch's"
+        );
+    }
+
+    /// **`run` consults no kind.** Its first word here is one the launch path
+    /// refuses outright — `borg` has no [`launch_argv`] recipe, so
+    /// [`open_params`] would never reach the wire with it — and the tab still
+    /// opens, with the typed argv exactly as split. And, unlike a launch, it
+    /// inserts no optimistic row: a tab nobody owns is not a session row, so
+    /// the row (if any) is the one roost goes on to report.
+    #[tokio::test]
+    async fn run_opens_the_typed_argv_without_consulting_a_kind() {
+        let fake = FakeRoost::start().await;
+        let machines = start(
+            &config_with(&["mini3"]),
+            &sockets(&[("mini3", fake.socket_path())]),
+        );
+        wait_for("the first snapshot", || {
+            machines
+                .state
+                .lock()
+                .unwrap()
+                .get(&HostId::Machine("mini3".to_string()))
+                .filter(|m| m.seen)
+                .map(|_| ())
+        })
+        .await;
+        assert!(
+            open_params(&RcKind::from_wire("borg"), None).is_err(),
+            "the premise: a launch has no recipe for this word"
+        );
+
+        let command = RunCommand::parse(Some("borg  --model x")).unwrap();
+        let answer = machines
+            .run("mini3", &command, Some("  /tmp/x  "))
+            .await
+            .expect("the open lands");
+
+        let opened = fake.tab_open_calls();
+        assert_eq!(opened.len(), 1, "{opened:?}");
+        assert_eq!(opened[0]["argv"], json!(["borg", "--model", "x"]));
+        assert_eq!(opened[0]["cwd"], json!("/tmp/x"), "trimmed");
+        assert!(
+            opened[0].get("activate").is_none(),
+            "the tab is left selected, as a launch's is: {}",
+            opened[0]
+        );
+
+        assert_eq!(answer["origin"], json!("machine:mini3"));
+        assert_eq!(answer["machine"], json!("mini3"));
+        assert_eq!(
+            answer["slug"],
+            json!("6"),
+            "the id the fake's next tab gets"
+        );
+        assert_eq!(answer["argv"], json!(["borg", "--model", "x"]));
+        assert!(
+            rows(&machines).iter().all(|r| r["slug"] != "6"),
+            "no optimistic row for a tab nobody owns: {:?}",
+            rows(&machines)
         );
     }
 }

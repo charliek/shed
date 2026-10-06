@@ -287,6 +287,66 @@ fn rc_kind(params: &Value) -> Result<RcKind, (String, String)> {
     Ok(kind)
 }
 
+/// Parse `roost.run`'s `command` param — the shared [`RunCommand::parse`],
+/// with its refusal answered as `bad_request` (a missing, non-string, empty or
+/// whitespace-only command is the caller's mistake, not the host's).
+///
+/// [`RunCommand::parse`]: crate::roost_hosts::RunCommand::parse
+fn run_command(params: &Value) -> Result<crate::roost_hosts::RunCommand, (String, String)> {
+    crate::roost_hosts::RunCommand::parse(params.get("command").and_then(Value::as_str))
+        .map_err(|m| err("bad_request", m))
+}
+
+/// The one gate + router behind the New-session dialog's two driver doors
+/// (`ui.fill_launch` / `ui.submit_launch`, plan 025 C3): the event name and
+/// payload to emit, or the refusal.
+///
+/// **TEST-MODE ONLY**, the [`roost_consent_door`] rule. They exist because the
+/// dialog's "Run a command" mode is only reachable by typing into it and
+/// clicking Create, and the harness has no keyboard and no click — while
+/// `launch.dump` (the dialog's own rendered truth) is what proves the mode
+/// works. Filling a person's dialog and pressing its button for them is not
+/// something a shipped app needs anyone to do; the production door onto the
+/// same backend is `roost.run`.
+///
+/// `ui.fill_launch {mode?, target?, command?, workdir?}` sets those controls
+/// the way a person would (an absent key is left as it is); `mode` is `agent`
+/// (the kind picker) or `command` (the Command field). `ui.submit_launch`
+/// presses Create, through the same gate the button has — a dialog that would
+/// not let a person submit does not let this door either.
+fn launch_door(
+    env: &Env,
+    op: &str,
+    params: &Value,
+) -> Result<(&'static str, Value), (String, String)> {
+    if !env.test_mode {
+        return Err(err("not_enabled", format!("{op} requires test mode")));
+    }
+    match op {
+        "ui.fill_launch" => {
+            let mut fill = serde_json::Map::new();
+            for key in ["mode", "target", "command", "workdir"] {
+                match params.get(key) {
+                    None | Some(Value::Null) => {}
+                    Some(Value::String(s)) => {
+                        if key == "mode" && s != "agent" && s != "command" {
+                            return Err(err(
+                                "bad_request",
+                                format!("unknown launch mode: {s:?} (agent | command)"),
+                            ));
+                        }
+                        fill.insert(key.to_string(), json!(s));
+                    }
+                    Some(_) => return Err(err("bad_request", format!("'{key}' must be a string"))),
+                }
+            }
+            Ok(("fill-launch", Value::Object(fill)))
+        }
+        "ui.submit_launch" => Ok(("submit-launch", json!({}))),
+        other => Err(err("unknown_op", format!("{other} is not a launch door"))),
+    }
+}
+
 /// Raise + focus the main window — the shared body of `ui.show_window`,
 /// `app.activate`, the tray/popover "Open dashboard", and the single-instance
 /// second-launch hand-off. Also the single macOS activation-policy path (a visible
@@ -510,6 +570,14 @@ impl Handler {
                 let _ = self.app.emit("show-launch", json!({}));
                 Ok(json!({}))
             }
+            // The New-session dialog's typing-and-clicking doors (plan 025 C3)
+            // — TEST-MODE ONLY, see [`launch_door`]. They act on a dialog that
+            // `ui.show_launch` already opened, so neither raises the window.
+            "ui.fill_launch" | "ui.submit_launch" => {
+                let (event, payload) = launch_door(&self.env, op, params)?;
+                let _ = self.app.emit(event, payload);
+                Ok(json!({}))
+            }
             // The roost bootstrap consent dialog's drivable doors (plan 019
             // §3.6/C8) — TEST-MODE ONLY, see [`roost_consent_door`].
             "ui.show_roost_consent" | "ui.confirm_roost_consent" | "ui.close_roost_consent" => {
@@ -591,6 +659,9 @@ impl Handler {
             // frontend bridge and every existing cell send it, and a rename with
             // no new behaviour behind it would be churn.
             "machine.launch" | "roost.launch" => self.roost_launch(params).await,
+            // "Run a command in a tab" (plan 025 P5) — `roost.launch`'s sibling
+            // that goes through no kind.
+            "roost.run" => self.roost_run(params).await,
             "machine.capabilities" => self.machine_capabilities(params),
             "machine.add" => self.machine_add(params),
             // -- roost hosts: probe, preview, bootstrap (plan 019 §3.6) --
@@ -1153,6 +1224,36 @@ impl Handler {
                 opt("workdir"),
                 opt("permission_mode"),
                 opt("initial_prompt"),
+            )
+            .await
+            .map_err(|e| err("action_failed", e))
+    }
+
+    /// `roost.run {target | machine, command, workdir?}` → the tab it opened: a
+    /// roost `tab.open` running `command` on that host (plan 025 P5, "Run a
+    /// command in a tab").
+    ///
+    /// Addressed like [`Self::roost_launch`] — `target` in the grammar, or a bare
+    /// `machine` — but **gated by no kind**: there is no `kind` param, nothing is
+    /// checked against [`shed_app::roost::roost_capabilities`], and no launch
+    /// recipe is looked up. `command` is split on ASCII whitespace into the argv
+    /// verbatim, with no shell and no quoting ([`crate::roost_hosts::RunCommand`]
+    /// has the whole rule): `codex --model x` works, a quoted argument does not.
+    ///
+    /// `command` is REQUIRED — absent, empty or whitespace-only is `bad_request`,
+    /// answered before the host is touched. A host that cannot be reached is
+    /// `action_failed`, as a launch's is.
+    async fn roost_run(&self, params: &Value) -> Result<Value, (String, String)> {
+        let target = match params.get("target").and_then(Value::as_str) {
+            Some(target) => target.to_string(),
+            None => req_str(params, "machine")?.to_string(),
+        };
+        let command = run_command(params)?;
+        self.machines
+            .run(
+                &target,
+                &command,
+                params.get("workdir").and_then(Value::as_str),
             )
             .await
             .map_err(|e| err("action_failed", e))
@@ -2304,5 +2405,86 @@ mod tests {
             .await
             .unwrap()
             .is_none());
+    }
+
+    /// **`roost.run`'s `command` is required** (plan 025 P5): absent, empty and
+    /// whitespace-only are each `bad_request` — the caller's mistake, answered
+    /// before any host is touched — and so is a `command` that is not a string
+    /// at all. A real one comes back split, with no kind in sight.
+    #[test]
+    fn roost_run_refuses_an_absent_empty_or_blank_command_as_bad_request() {
+        for (what, params) in [
+            ("absent", json!({ "target": "mini3" })),
+            ("null", json!({ "target": "mini3", "command": null })),
+            ("empty", json!({ "target": "mini3", "command": "" })),
+            (
+                "whitespace",
+                json!({ "target": "mini3", "command": "  \t \n" }),
+            ),
+            (
+                "not a string",
+                json!({ "target": "mini3", "command": ["codex"] }),
+            ),
+        ] {
+            let (code, message) =
+                run_command(&params).expect_err(&format!("{what} must be refused, not run"));
+            assert_eq!(code, "bad_request", "{what}: {message}");
+            assert!(message.contains("'command'"), "{what}: {message}");
+        }
+
+        let command = run_command(&json!({ "target": "mini3", "command": "codex --model x" }))
+            .expect("a command line");
+        assert_eq!(command.argv(), ["codex", "--model", "x"]);
+        // Not gated by kinds: a first word no kind table has ever named is a
+        // command like any other.
+        let command = run_command(&json!({ "command": "borg -v" })).expect("any program");
+        assert_eq!(command.argv(), ["borg", "-v"]);
+    }
+
+    /// **The New-session dialog's driver doors are test-mode only**, the
+    /// consent doors' rule: filling a person's dialog and pressing its button for
+    /// them is the harness's need, never a shipped app's. In test mode they
+    /// route to their events, carrying only the controls that were named, and a
+    /// mode the dialog does not have — or a control that is not text — is a bad
+    /// request rather than an event the dialog would have to second-guess.
+    #[test]
+    fn the_launch_dialog_doors_are_test_mode_only() {
+        let fill = json!({
+            "mode": "command",
+            "target": "machine:mini3",
+            "command": "codex --model x",
+        });
+
+        let mut prod = env(None);
+        prod.test_mode = false;
+        for op in ["ui.fill_launch", "ui.submit_launch"] {
+            let (code, message) = launch_door(&prod, op, &fill)
+                .expect_err("a driver door must not be reachable in a shipped app");
+            assert_eq!(code, "not_enabled", "{op}");
+            assert!(message.contains(op), "the refusal names the op: {message}");
+        }
+
+        let test = env(None);
+        assert_eq!(
+            launch_door(&test, "ui.fill_launch", &fill).unwrap(),
+            ("fill-launch", fill.clone()),
+            "the named controls, and nothing invented for the others"
+        );
+        assert_eq!(
+            launch_door(&test, "ui.submit_launch", &json!({})).unwrap(),
+            ("submit-launch", json!({}))
+        );
+        assert_eq!(
+            launch_door(&test, "ui.fill_launch", &json!({ "mode": "shell" }))
+                .expect_err("no such mode")
+                .0,
+            "bad_request"
+        );
+        assert_eq!(
+            launch_door(&test, "ui.fill_launch", &json!({ "command": 7 }))
+                .expect_err("not text")
+                .0,
+            "bad_request"
+        );
     }
 }

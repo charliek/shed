@@ -401,6 +401,28 @@ export function renderedText(selector: string): string {
   return document.querySelector(selector)?.textContent ?? "";
 }
 
+/** The current value of every LABELLED form control under `selector`, keyed by
+ *  its label's own text (the label's first text node, so a hint beside it such
+ *  as "optional" is not part of the key) — `{}` when no such node is mounted.
+ *
+ *  [renderedText]'s rule, for what text content cannot see: an `<input>`'s value
+ *  is not in `textContent`, so a dump that wants to show what a person has typed
+ *  reads it back off the DOM here, after the commit, rather than restating React
+ *  state. A control with no `<label>` is not a field a person can read, and is
+ *  left out. Call it from an EFFECT, never during render. */
+export function renderedValues(selector: string): Record<string, string> {
+  if (typeof document === "undefined") return {};
+  const out: Record<string, string> = {};
+  document
+    .querySelector(selector)
+    ?.querySelectorAll<HTMLInputElement | HTMLSelectElement | HTMLTextAreaElement>("input, select, textarea")
+    .forEach((el) => {
+      const label = el.labels?.[0]?.childNodes[0]?.textContent?.trim();
+      if (label) out[label] = el.value;
+    });
+  return out;
+}
+
 /** Report the Sheds pane's per-shed roost rows (mounted-only, the
  *  `machines.dump`/`reportMachinesPane` rule — pass `null` on unmount). Read
  *  by `shed_roost.dump`. */

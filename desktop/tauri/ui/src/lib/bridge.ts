@@ -1132,6 +1132,41 @@ export async function machineLaunch(fields: MachineLaunchFields): Promise<RcSess
   return core.invoke<RcSession>("machine_launch", fields);
 }
 
+export type RoostRunFields = {
+  /** A machine's bare name, or a shed's `roost:<server>/<shed>` — the same
+   *  address a row's `machine` field carries. */
+  target: string;
+  /** The command line. REQUIRED: blank is refused (it is not a plain shell). */
+  command: string;
+  workdir?: string;
+};
+
+/** What `roost_run` answers: the tab roost opened, addressed the way a row for
+ *  it would be, plus the argv the command was split into. NOT a row — a tab
+ *  nobody owns is not a session, so the row (if any) is the one roost goes on
+ *  to report. */
+export type RoostRunResult = {
+  origin: string;
+  machine: string;
+  slug: string;
+  cwd: string;
+  argv: string[];
+};
+
+/** "Run a command in a tab" (plan 025 P5) — a roost `tab.open` running
+ *  `command` on a machine or a shed, gated by NO kind: the launch dialog's
+ *  "Run a command" mode. THROWS on error, like [machineLaunch].
+ *
+ *  The command is split on ASCII whitespace into the argv, verbatim — no shell,
+ *  no quoting: `codex --model x` works, a quoted argument does not. The split is
+ *  the backend's (`RunCommand::parse`), shared with the `roost.run` socket op,
+ *  so this wrapper sends the line as typed rather than splitting it a second
+ *  way. */
+export async function roostRun(fields: RoostRunFields): Promise<RoostRunResult> {
+  const core = await import("@tauri-apps/api/core");
+  return core.invoke<RoostRunResult>("roost_run", fields);
+}
+
 /** One machine's RC capabilities, or null when its engine is too old to say.
  *  Probed on demand by the launch dialog — a machine that was asleep at startup
  *  must not be stuck with whatever the first probe found. THROWS if the machine
@@ -1192,8 +1227,19 @@ export { agentsEmptyState } from "@/lib/agentsEmpty";
  *  card's `rendered` was added to prevent. This cannot claim a field the dialog
  *  does not show, which is exactly the property under test: since S6 there is no
  *  initial-prompt box, because nothing would deliver what was typed into it
- *  (`charliek/shed#366`). */
-export type LaunchDialogDump = { rendered: string };
+ *  (`charliek/shed#366`). `values` and `create_enabled` (plan 025 C3, the "Run a
+ *  command" mode) keep that rule: both are read off the same mounted DOM, never
+ *  restated from React state. */
+export type LaunchDialogDump = {
+  rendered: string;
+  /** Each labelled control's current value, keyed by its label ("Where",
+   *  "Working directory", "Command", …) — read back off the DOM
+   *  (`renderedValues`), because what a person TYPED is not in `rendered`. */
+  values: Record<string, string>;
+  /** Whether the Create button can be pressed — the button's own `disabled`
+   *  attribute, read off the DOM. */
+  create_enabled: boolean;
+};
 
 /** Report the launch dialog's rendered copy, or `null` to clear it on unmount.
  *

@@ -98,8 +98,10 @@ guest binary and the hub are gone.)
 | `roost.preview` | `target` | the plan (Install/Update/Start/Report/nothing to do) plus the sentence naming where the bytes would come from |
 | `roost.bootstrap` | `target`, `fingerprint`, `consent: true` | installs/updates/starts `roost-session` on that target and wires its agent hooks; refuses without consent or against a stale fingerprint |
 | `roost.launch` | `target`, `kind?`, `workdir?`, … | generalizes `machine.launch` to any roost host (a shed or a machine); `machine.launch` stays as an alias |
+| `roost.run` | `target` (or `machine`), `command`, `workdir?` | `{origin, machine, slug, cwd, argv}` — the tab it opened. **Run a command in a tab**: `command` split on ASCII whitespace into the argv, with **no shell and no quoting**; gated by no kind. `command` is required — absent, empty or whitespace-only is `bad_request` |
 
-The four ops above are how the desktop drives [putting `roost-session` on a shed or
+`roost.probe`, `roost.preview`, `roost.bootstrap` and `roost.launch` are how the desktop
+drives [putting `roost-session` on a shed or
 machine](../extensions/roost-session-hosts.md) — the source ladder, the plan matrix, the
 consent card, and the rollback promise are documented there, not here. Kicking off an agent
 from roost's own command palette instead of the desktop app is [the `shed` roost
@@ -112,6 +114,19 @@ provider](../extensions/roost-provider.md). They stay in the wire so a caller wr
 the pre-0.9.0 op is not silently refused for sending what the hub accepted — but **the app's
 own launch dialog no longer offers a prompt field**, because a box whose contents go nowhere
 is worse than no box (`charliek/shed#366` tracks delivering one).
+
+**`roost.run` — run a command in a tab.** The launch dialog's second mode, beside the agent
+picker, and how an agent's own TUI is started now that the per-agent kinds are gone: a roost
+`tab.open` of the command line as typed, on a shed or a machine. It is **not gated by kinds**
+— there is no `kind`, nothing is checked against the host's capabilities, and the first word
+can name any program. The line is split on ASCII whitespace into the argv and handed to roost
+verbatim; **there is no shell and no quoting**, so `codex --model x` runs `codex` with two
+arguments, while `say 'a b'` passes `'a` and `b'` (quotes and all) and `$HOME` or `|` is
+literal text. A pipeline belongs in a shell tab, which roost's own UI opens. `command` is
+required: absent, empty or whitespace-only is `bad_request`, answered before the host is
+touched — a blank command is not a plain shell. The answer is the **tab**, not a row: a tab
+nobody owns is not a session, so the row that results is whatever roost reports — a plain row
+once roost's own agent hooks claim the tab (a `codex`, say), and none for a tab no hook claims.
 
 `capabilities` is keyed by a row's **`origin`** — `machine:<name>` or
 `roost:<server>/<shed>` — so a card can read the contract behind the row it is drawing. It is
@@ -183,10 +198,18 @@ backend's view — the two can disagree, and have.
 |----|---------|--------|
 | `dashboard.dump` | on the Sheds pane | `{rows, host_errors, empty}` |
 | `agents.dump` | on the Agents pane | `{sessions, empty}` — `empty` is the rendered empty state (`{state, title, body, action}`), `null` when rows rendered. `state` is `loading` \| `failed` \| `unreachable` \| `empty`: four blanks wearing one screen, and only `empty` offers the bootstrap |
-| `launch.dump` | while the New-session dialog is open | `{launch}` — the dialog's own rendered text (`{rendered}`), `null` when none is mounted |
+| `launch.dump` | while the New-session dialog is open | `{launch}` — `{rendered, values, create_enabled}`, `null` when none is mounted: the dialog's own rendered text, each labelled control's current value keyed by its label (what was typed is not text content), and whether its Create button is enabled — all three read off the mounted DOM |
 | `egress.profiles` | on the Egress pane | `{egress}` |
 | `machines.dump` | on the Machines pane | `{machines}` — a row per machine with its `status` word, `detail` line, and grouped session slugs |
 | `sidebar.dump` | **always** | `{servers, machines}` — the sidebar's status foot |
+
+The New-session dialog is driven the same way: `ui.show_launch` opens it, and — **in test
+mode only** — `ui.fill_launch {mode?, target?, command?, workdir?}` types into it (`mode` is
+`agent` or `command`; `target` is a "Where" value, `machine:<name>` or `shed:<host>/<name>`; an
+absent key is left as it is) and `ui.submit_launch` presses Create, through the button's own
+gate. They exist because the "Run a command" mode is reachable only by typing and clicking;
+outside test mode both answer `not_enabled`, and the production door onto the same backend is
+`roost.run`.
 
 A pane dump answers `null` off its pane; reporting copy nobody is reading would let a test
 assert a surface that isn't on screen. `sidebar.dump` is the exception because the sidebar

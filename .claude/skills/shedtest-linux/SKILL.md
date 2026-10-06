@@ -156,6 +156,17 @@ ssh. Against a real remote machine the same code takes the other branch — an
 `ssh -N -L <local>:127.0.0.1:<reported>` child per session-port — which nothing hermetic can
 exercise.
 
+**Driving the New-session dialog's "Run a command" mode** (plan 025 C3, `roost.run`). The mode
+is reachable only by typing and clicking, so it has TEST-MODE-ONLY doors beside
+`ui.show_launch`: `ui.fill_launch {mode?, target?, command?, workdir?}` types into the open
+dialog and `ui.submit_launch` presses Create through the button's own gate. The fill is an
+event to a listener the dialog registers AFTER it mounts, so one sent the instant
+`ui.show_launch` returns can land on nobody — re-send it (it is idempotent) until
+`launch.dump`'s `values` / `create_enabled` show it, as `test_tauri_machines.py`'s dialog cell
+does. And a run's tab is not a row (nobody owns it), so there is no `machine.kill` for it: a cell
+that opens one must close it on the fake's own wire (`roost_call(…, "tab.close", …)`), because
+the module's later cells pin literal tab ids and the fake hands each `tab.open` the next free one.
+
 **Driving the transcript PANEL.** The panel opens from a card's Transcript affordance — a
 click, which the harness does not have — so it has drivable ops on the `ui.show_create` /
 `ui.show_launch` pattern: `ui.show_lane {machine, session_id}` mounts it (and raises the

@@ -65,6 +65,26 @@ opens, and a typed kickoff has no wire to travel down yet
 Kicking off an agent from roost's own command palette instead of this dialog is
 [the `shed` roost provider](../extensions/roost-provider.md).
 
+### Run a command in a tab
+
+The dialog's **Start** picker has a second mode beside **An agent**: **Run a command**. It
+replaces the Kind picker (and the session-name box, which nothing would receive) with a
+**Command** field, and opens a roost tab running that command line on the chosen shed or
+machine, in the chosen working directory (`roost.run`). It is how an agent's own TUI is started
+with flags of your choosing — `codex --model gpt-5`, say — and it is not limited to agents:
+the first word can name any program on that host (roost execs it directly).
+
+The line is split on **ASCII whitespace** (spaces, tabs, newlines; a non-ASCII space such as
+NBSP is part of the word) into the program and its arguments and run **as typed: there is no
+shell**. Quotes are not understood (`say 'a b'` passes `'a` and `b'` as two arguments, quotes
+included), and `$VARIABLES`, pipes and globs are passed through literally. A blank command is
+refused rather than read as "a plain shell" — roost's own UI opens shells.
+
+What appears in this pane afterwards is whatever roost reports for the new tab: a row once
+roost's own agent hooks recognise the program (a `codex` tab is a plain row with roost's
+activity and directory), and nothing for a program they do not recognise, which stays a plain
+terminal tab in roost.
+
 ## Machines
 
 A **machine** is a native host reached over SSH that runs a `roost-session` — no shed

@@ -406,13 +406,46 @@ class TauriClient(_ApprovalOps, _RcOps, _RustCoreClient):
         self.call("ui.show_launch")
 
     def launch_dump(self) -> dict | None:
-        """The New-session dialog's own rendered text (`{rendered}`), or None
-        while none is mounted.
+        """The New-session dialog's own rendered truth — `{rendered, values,
+        create_enabled}` — or None while none is mounted.
 
-        Its own DOM text rather than a list of fields, so it cannot claim a field
-        the dialog does not show — which is what makes the ABSENCE of one
-        assertable (there is no initial-prompt box: charliek/shed#366)."""
+        `rendered` is its DOM text rather than a list of fields, so it cannot
+        claim a field the dialog does not show — which is what makes the ABSENCE
+        of one assertable (there is no initial-prompt box: charliek/shed#366).
+        `values` is each labelled control's current value keyed by its label
+        (what was typed is not text content), and `create_enabled` is the Create
+        button's own `disabled`, inverted — both read off the same DOM."""
         return self.call("launch.dump").get("launch")
+
+    def fill_launch(self, **fields: str) -> None:
+        """Type into the open New-session dialog — `mode` (`agent` | `command`),
+        `target` (a `Where` value: `machine:<name>` or `shed:<host>/<name>`),
+        `command`, `workdir`; an absent key is left as it is. TEST MODE ONLY.
+
+        An event to a dialog that registers its listener after it mounts, so a
+        fill sent the instant `ui.show_launch` returns can land before anyone is
+        listening: poll `launch_dump()` for the values and re-send (it is
+        idempotent) rather than assuming one send arrived."""
+        self.call("ui.fill_launch", fields)
+
+    def submit_launch(self) -> None:
+        """Press the open New-session dialog's Create button, through the
+        button's own gate (a disabled Create is not pressed). TEST MODE ONLY."""
+        self.call("ui.submit_launch")
+
+    def roost_run(self, target: str, command: str | None,
+                  workdir: str | None = None) -> dict:
+        """Run a command in a tab (plan 025 P5): a roost `tab.open` of
+        `command` split on ASCII whitespace — no shell, no quoting, no kind — on
+        `target` (a machine's bare name, or `roost:<server>/<shed>`). Answers
+        `{origin, machine, slug, cwd, argv}`; `command=None` omits the key (a
+        `bad_request`, as blank is)."""
+        params: dict = {"target": target}
+        if command is not None:
+            params["command"] = command
+        if workdir is not None:
+            params["workdir"] = workdir
+        return self.call("roost.run", params)
 
     def agents_dump(self) -> list[dict]:
         """The sessions the Agents pane rendered — the drivable `agents.dump`

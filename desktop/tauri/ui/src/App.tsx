@@ -21,7 +21,7 @@ import { LanePanel } from "@/components/LanePanel";
 import { RoostLine, RoostConsentDialog, Toast } from "@/components/RoostBootstrap";
 import {
   roostBootstrap, roostPreview, roostProgressSteps, roostToastFor, roostDumpRow,
-  reportShedRoost, renderedText, useRoostBoard,
+  reportShedRoost, renderedText, renderedValues, useRoostBoard,
   type RoostPreview, type RoostToast, type RoostCardState, type RoostDumpRow,
 } from "@/lib/roost";
 import {
@@ -30,7 +30,7 @@ import {
   fetchApprovals, decideApproval, fetchActivity, fetchGateNamespaces,
   fetchEgressProfiles, reportEgress, inTauri,
   openPreferences, setAppearanceState,
-  rcLaunch, machineLaunch, machineCapabilities, killSession, sessionKey, reportAgents, reportLaunchDialog, reportMachinesPane, useRcSessions, openMachineTerminal, addMachine,
+  rcLaunch, machineLaunch, roostRun, machineCapabilities, killSession, sessionKey, reportAgents, reportLaunchDialog, reportMachinesPane, useRcSessions, openMachineTerminal, addMachine,
   useCoordinatorData, useNowTick, shedsEmptyState, hostFailureFor, attachKind, capabilitiesFor,
   type Pane, type Shed, type HostDiskUsage, type HostFailure,
   type Modal, type CreateProgress, type Approval, type AuditEntry,
@@ -1288,6 +1288,19 @@ type LaunchTarget =
   | { kind: "shed"; value: string; label: string; host: string; shed: string }
   | { kind: "machine"; value: string; label: string; machine: string };
 
+/** What the dialog starts: an agent of a kind (`roost.launch`, offered only for
+ *  the kinds the target's contract names), or a command line run as typed in a
+ *  new roost tab (`roost.run`, plan 025 P5 — gated by no kind at all). The
+ *  second is how an agent's own TUI is started now that the per-agent kinds are
+ *  gone: `codex --model x` is a command like any other. */
+type LaunchMode = "agent" | "command";
+const LAUNCH_MODES: [LaunchMode, string][] = [["agent", "An agent"], ["command", "Run a command"]];
+/** The Command field's help: the split rule, in the words a person needs. */
+const RUN_COMMAND_HELP =
+  "Runs as typed in a new roost tab, split on ASCII whitespace (spaces, tabs, newlines; a non-ASCII space such as NBSP is part of the word) — " +
+  "no shell, so quotes, pipes and $VARIABLES are passed through literally. " +
+  "An agent roost recognises appears as a session; anything else is a plain roost tab.";
+
 function LaunchAgentDialog({ sheds, machines, capabilities, refresh, onClose, onLaunched }:
   { sheds: Shed[]; machines: MachineStatus[]; capabilities: Record<string, RcCapabilities>; refresh: () => void; onClose: () => void; onLaunched: () => void }) {
   const fid = useId(); // base for per-field control ids (label↔control association)
@@ -1311,6 +1324,8 @@ function LaunchAgentDialog({ sheds, machines, capabilities, refresh, onClose, on
   const [kind, setKind] = useState<RcKind>("claude-rc");
   const [displayName, setDisplayName] = useState("");
   const [workdir, setWorkdir] = useState("");
+  const [mode, setMode] = useState<LaunchMode>("agent");
+  const [command, setCommand] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   // A machine's capabilities are not in the shared `rc.list` map — that covers
@@ -1366,23 +1381,83 @@ function LaunchAgentDialog({ sheds, machines, capabilities, refresh, onClose, on
   const targetOpts = targets.map((t) => ({ value: t.value, label: t.label }));
   // `capsBusy` is part of the gate, not just a spinner: a click landing during
   // a re-probe would launch against whatever the PREVIOUS probe said.
-  const canCreate = !!selected && kinds.length > 0 && !capsBusy && !capsError;
+  //
+  // A command consults none of it — no kind is offered, so there is nothing for
+  // a probe to gate — and needs only somewhere to run and a word to run there.
+  // Blank is not offered as "a plain shell": roost's own UI opens shells, and
+  // the backend refuses a blank command anyway.
+  const canCreate = mode === "command"
+    ? !!selected && command.trim() !== ""
+    : !!selected && kinds.length > 0 && !capsBusy && !capsError;
 
   // Report what this dialog RENDERED (`launch.dump`), the `reportRoostConsent`
   // rule: from inside the dialog, so a report made beside the JSX cannot go on
   // answering after the JSX is gone, and read from the DOM after the commit so
   // it can never claim a field the dialog does not show. That is what makes
   // "there is no prompt field" (#366) assertable without a screenshot.
-  const shape = `${target}|${kind}|${kinds.join(",")}|${capsBusy}|${capsError ?? ""}`;
-  useEffect(() => { reportLaunchDialog({ rendered: renderedText("[data-launch]") }); }, [shape]);
+  //
+  // `values` (what is typed into each labelled control) and `create_enabled`
+  // (the Create button's own `disabled`) are read back off the same DOM, for the
+  // "Run a command" mode: what a person typed is not text content.
+  const shape = `${target}|${kind}|${kinds.join(",")}|${capsBusy}|${capsError ?? ""}|${mode}|${command}|${workdir}|${displayName}|${busy}`;
+  useEffect(() => {
+    reportLaunchDialog({
+      rendered: renderedText("[data-launch]"),
+      values: renderedValues("[data-launch]"),
+      create_enabled: document.querySelector<HTMLButtonElement>("[data-launch] [data-launch-create]")?.disabled === false,
+    });
+  }, [shape]);
   useEffect(() => () => reportLaunchDialog(null), []);
+
+  // The dialog's typing-and-clicking doors (`ui.fill_launch` /
+  // `ui.submit_launch`, test mode only — `ipc.rs`'s `launch_door`): the
+  // "Run a command" mode is only reachable by typing into the dialog and
+  // pressing Create, and the harness has neither a keyboard nor a pointer.
+  // Fill sets the named controls exactly as typing would; submit presses Create
+  // through the button's own gate, which a ref keeps current — the listeners are
+  // registered once, so a handler that closed over the first render would judge
+  // the press by that render's (empty) fields.
+  const pressCreate = useRef<() => void>(() => {});
+  useEffect(() => { pressCreate.current = () => { if (canCreate && !busy) void submit(); }; });
+  useEffect(() => {
+    if (typeof window === "undefined" || !("__TAURI_INTERNALS__" in window)) return;
+    const uns: Array<() => void> = [];
+    let cancelled = false;
+    void import("@tauri-apps/api/event").then(async ({ listen }) => {
+      uns.push(
+        await listen<{ mode?: unknown; target?: unknown; command?: unknown; workdir?: unknown }>("fill-launch", (e) => {
+          const fill = e.payload ?? {};
+          if (fill.mode === "agent" || fill.mode === "command") setMode(fill.mode);
+          if (typeof fill.target === "string") setTarget(fill.target);
+          if (typeof fill.command === "string") setCommand(fill.command);
+          if (typeof fill.workdir === "string") setWorkdir(fill.workdir);
+        }),
+      );
+      uns.push(await listen("submit-launch", () => pressCreate.current()));
+      if (cancelled) uns.forEach((u) => u());
+    });
+    return () => {
+      cancelled = true;
+      uns.forEach((u) => u());
+    };
+  }, []);
 
   const submit = async () => {
     if (!selected) { setError("Pick somewhere to run it."); return; }
     setBusy(true);
     setError(null);
     try {
-      if (selected.kind === "machine") {
+      if (mode === "command") {
+        // The line goes as typed: the split is the backend's one rule
+        // (`RunCommand::parse`, shared with the `roost.run` socket op), so it
+        // is not split a second way here. A shed is addressed by its roost
+        // origin — the key its capabilities are already read under above.
+        await roostRun({
+          target: selected.kind === "machine" ? selected.machine : `roost:${selected.host}/${selected.shed}`,
+          command,
+          workdir: workdir.trim() || undefined,
+        });
+      } else if (selected.kind === "machine") {
         await machineLaunch({
           machine: selected.machine,
           kind,
@@ -1416,6 +1491,7 @@ function LaunchAgentDialog({ sheds, machines, capabilities, refresh, onClose, on
           <>
             <button onClick={onClose} className={dialogBtnSecondary}>Cancel</button>
             <button
+              data-launch-create
               onClick={() => void submit()}
               disabled={!canCreate || busy}
               className="hbtn inline-flex items-center gap-2 rounded-[9px] px-[22px] py-2.5 text-[14px] font-semibold"
@@ -1439,23 +1515,37 @@ function LaunchAgentDialog({ sheds, machines, capabilities, refresh, onClose, on
             <div className="rounded-lg border border-shed-border bg-shed-bg px-3 py-2.5 text-[13px] leading-snug text-shed-text-muted">Nothing to run on yet — start a shed, or add a machine.</div>
           )}
         </Field>
-        <Field label="Session name" hint="optional" htmlFor={`${fid}-name`}>
-          <input id={`${fid}-name`} value={displayName} onChange={(e) => setDisplayName(e.target.value)} placeholder={selected?.kind === "machine" ? `defaults to ${selected.machine}/slug` : "defaults to shed/slug"} className={dialogInput} />
+        <Field label="Start">
+          <Segmented options={LAUNCH_MODES} value={mode} set={(v) => setMode(v as LaunchMode)} />
         </Field>
+        {/* A command takes no session name: `roost.run` is an argv and a working
+            directory, and roost owns the tab's title — so the box is not offered
+            for something that would be dropped (the prompt field's rule, below). */}
+        {mode === "agent" && (
+          <Field label="Session name" hint="optional" htmlFor={`${fid}-name`}>
+            <input id={`${fid}-name`} value={displayName} onChange={(e) => setDisplayName(e.target.value)} placeholder={selected?.kind === "machine" ? `defaults to ${selected.machine}/slug` : "defaults to shed/slug"} className={dialogInput} />
+          </Field>
+        )}
         <Field label="Working directory" hint="optional" htmlFor={`${fid}-workdir`}>
           <input id={`${fid}-workdir`} value={workdir} onChange={(e) => setWorkdir(e.target.value)} placeholder={selected?.kind === "machine" ? "defaults to $HOME on that machine" : "defaults to $SHED_WORKSPACE"} className={cn(dialogInput, "font-mono text-[13px]")} />
         </Field>
-        <Field label="Kind" help={kinds.length ? kindHelp(kind) : undefined}>
-          {capsBusy && kinds.length === 0 ? (
-            <div className="px-1 py-2 text-[13px] text-shed-text-muted">reading what {selected?.kind === "machine" ? selected.machine : "this shed"} can run…</div>
-          ) : capsError ? (
-            <div className="px-1 py-2 text-[13px] text-shed-text-muted">{capsError}</div>
-          ) : kinds.length === 0 ? (
-            <div className="px-1 py-2 text-[13px] text-shed-text-muted">{selected?.kind === "machine" ? `no agents installed on ${selected.machine} that sx can run` : "no agent kinds available in this shed"}</div>
-          ) : (
-            <Segmented options={kinds.map((k) => [k, rcKindLabel(k), agentColor(k)] as [string, string, string])} value={kind} set={(v) => setKind(v as RcKind)} />
-          )}
-        </Field>
+        {mode === "command" ? (
+          <Field label="Command" htmlFor={`${fid}-command`} help={RUN_COMMAND_HELP}>
+            <input id={`${fid}-command`} value={command} onChange={(e) => setCommand(e.target.value)} placeholder="codex --model gpt-5" spellCheck={false} className={cn(dialogInput, "font-mono text-[13px]")} />
+          </Field>
+        ) : (
+          <Field label="Kind" help={kinds.length ? kindHelp(kind) : undefined}>
+            {capsBusy && kinds.length === 0 ? (
+              <div className="px-1 py-2 text-[13px] text-shed-text-muted">reading what {selected?.kind === "machine" ? selected.machine : "this shed"} can run…</div>
+            ) : capsError ? (
+              <div className="px-1 py-2 text-[13px] text-shed-text-muted">{capsError}</div>
+            ) : kinds.length === 0 ? (
+              <div className="px-1 py-2 text-[13px] text-shed-text-muted">{selected?.kind === "machine" ? `no agents installed on ${selected.machine} that sx can run` : "no agent kinds available in this shed"}</div>
+            ) : (
+              <Segmented options={kinds.map((k) => [k, rcKindLabel(k), agentColor(k)] as [string, string, string])} value={kind} set={(v) => setKind(v as RcKind)} />
+            )}
+          </Field>
+        )}
         {/* **There is no initial-prompt field, on either target** — roost's
             `tab.open` is an argv and a working directory, and there is no typed-
             input channel behind it. The field used to be offered for a SHED

@@ -385,6 +385,25 @@ async fn machine_launch(
         .await
 }
 
+/// `roost_run` — "Run a command in a tab" (plan 025 P5): the frontend's door
+/// onto [`roost_hosts::RoostHosts::run`], the twin of the `roost.run` socket op.
+///
+/// Addressed by `target` (a machine's bare name or a shed's
+/// `roost:<server>/<shed>`) and gated by NO kind — the launch dialog's "Run a
+/// command" mode lands here, not in [`machine_launch`]/[`rc_launch`]. The same
+/// [`roost_hosts::RunCommand::parse`] as the socket door, so an absent, empty
+/// or whitespace-only `command` is refused here too, before the host is touched.
+#[tauri::command]
+async fn roost_run(
+    machines: tauri::State<'_, Arc<roost_hosts::RoostHosts>>,
+    target: String,
+    command: Option<String>,
+    workdir: Option<String>,
+) -> Result<serde_json::Value, String> {
+    let command = roost_hosts::RunCommand::parse(command.as_deref())?;
+    machines.run(&target, &command, workdir.as_deref()).await
+}
+
 // -- roost bootstrap (plan 019 §3.6, C8) -----------------------------------
 //
 // The frontend's own door onto `RoostHosts::probe/preview/bootstrap` — the
@@ -1171,6 +1190,7 @@ pub fn run() {
             machine_kill,
             machine_capabilities,
             machine_launch,
+            roost_run,
             roost_probe,
             roost_preview,
             roost_bootstrap,
