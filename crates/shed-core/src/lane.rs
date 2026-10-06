@@ -264,7 +264,7 @@
 //! | `answer(Question)` | `POST /question/{requestID}/reply {answers}`; [`LaneAnswer::Reject`] → `…/reject` | `asks.answer` with `{answers: {<question id>: [<option id>…]}}`; [`LaneAnswer::Reject`] → `{skip: true}`; free text refused (craze questions take none) |
 //! | `answer(Choice)` | the offered option id, which for opencode IS one of its three | the offered `optionId` verbatim; on a plan approval, the synthesized `accept`/`reject` |
 //! | `settings` | [`LaneSettings::default`] — capabilities say `settings: false` | the session info document's catalogs and the snapshot's settings, re-read on a `meta` event |
-//! | `set` | [`LaneError::Failed`] — not supported | `session.set{setting: {kind, id?, value, forModel?}}` — plan 025's settings milestone (C11); [`LaneError::Failed`] until it lands |
+//! | `set` | [`LaneError::Failed`] — not supported | `session.set{setting: {kind, id?, value, forModel?}}` (plan 025's settings milestone, C11): a model or mode by its id; a config option by its id and value, bound (`forModel`) to the model the CLIENT displayed it for ([`LaneSettingChange::Config`]'s `for_model`, Amendment A13; the lane's folded model only when the client sent none) — refused `stale_model` (`NotAccepting`) once the session has left it. The new value returns on the stream, from the change's own `meta` delta (or, when craze could learn no revision, from its confirmed value) |
 //! | `stop` | [`LaneError::Failed`] — not supported | `session.stop` where the session capability `stop` is true — a receipt; the stream's `Down{"session_closed"}` is its completion |
 //! | errors | 401 → [`LaneError::Unauthorized`]; 404 on a session route → [`LaneError::UnknownSession`], on a permission/question route → [`LaneError::UnknownApproval`]; 409/4xx with an opencode error body → `NotAccepting`/`BadRequest(message)` by body; other non-2xx → [`LaneError::Failed`]; dial failure → [`LaneError::Unavailable`] | the table below |
 //!
@@ -2250,7 +2250,20 @@ pub enum LaneSettingChange {
     /// Move to the mode with this [`LaneChoice::id`].
     Mode { id: String },
     /// Set the option [`LaneSetting::id`] to the value [`LaneChoice::id`].
-    Config { id: String, value: String },
+    Config {
+        id: String,
+        value: String,
+        /// The model the client DISPLAYED the option for — its
+        /// [`LaneSettings::model`] as rendered when the person chose it (plan
+        /// 025 Amendment A13). An adapter binds the change to it, so a session
+        /// that has left that model refuses the change rather than apply an
+        /// option chosen for one model to another — even when the adapter's
+        /// own fold has already seen the move and the client has not. Absent,
+        /// the adapter binds the model its own fold shows. Omitted from the
+        /// wire when absent, never `null`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        for_model: Option<String>,
+    },
 }
 
 // ---- the traits ----

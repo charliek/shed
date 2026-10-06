@@ -29,7 +29,7 @@
 //! [`LaneEntry`] holds an `Arc<dyn AgentLane>`, and the ONLY place in this app
 //! that names a concrete adapter type is the `match` in [`Lanes::open`]. That is
 //! the whole point of plan 017: everything below the match — the pump, the view,
-//! the tunnel bookkeeping, the six IPC verbs — is written against the contract,
+//! the tunnel bookkeeping, the `lane.*` verbs — is written against the contract,
 //! so the next adapter is a `match` arm rather than a refactor. (gx held this
 //! second slot from plan 017 until plan 025 C1 retired it, shed#390; craze
 //! holds it since plan 025 C9.)
@@ -197,7 +197,8 @@ use shed_app::lane_view::LaneView;
 use shed_app::machine::{MachineForward, SshForward};
 use shed_core::config::MachineEntry;
 use shed_core::lane::{
-    AgentLane, AgentSource, LaneAnswer, LaneDecision, LaneError, LaneEvent, LaneSession, SendMode,
+    AgentLane, AgentSource, LaneAnswer, LaneDecision, LaneError, LaneEvent, LaneSession,
+    LaneSettingChange, SendMode,
 };
 use shed_core::roost::AgentLaneStamp;
 use shed_craze::CrazeSource;
@@ -335,6 +336,16 @@ pub enum LaneFailure {
     /// Carries the kind verbatim, because the whole value of the variant is
     /// naming what was refused.
     UnsupportedLane(String),
+    /// A verb whose answer was lost — its connection dropped while it was in
+    /// flight, or it was never answered — so it MAY have run, and it is never
+    /// resent ([`shed_craze::is_outcome_unknown`], the craze lane's "outcome
+    /// unknown"). A code of its own, `outcome_unknown` (the `craze.*` ops'
+    /// too), because a client does something different about it than about a
+    /// refusal and must not have to read a message to know which it got: the
+    /// settings sheet shows such a change "not confirmed" until the session's
+    /// next `Settings` says what it is at (plan 025 §3.10), where a refusal is
+    /// shown as one.
+    OutcomeUnknown(String),
     /// The adapter (or the transport under it) said no.
     Lane(LaneError),
 }
@@ -358,6 +369,7 @@ impl LaneFailure {
         match self {
             LaneFailure::NoLane(_) => "no_lane",
             LaneFailure::UnsupportedLane(_) => "unsupported_lane",
+            LaneFailure::OutcomeUnknown(_) => "outcome_unknown",
             LaneFailure::Lane(e) => match e {
                 LaneError::Unauthorized => "unauthorized",
                 LaneError::BadRequest(_) => "bad_request",
@@ -375,7 +387,7 @@ impl LaneFailure {
     /// The IPC envelope's `error.message`.
     pub fn message(&self) -> String {
         match self {
-            LaneFailure::NoLane(m) => m.clone(),
+            LaneFailure::NoLane(m) | LaneFailure::OutcomeUnknown(m) => m.clone(),
             LaneFailure::UnsupportedLane(kind) => format!(
                 "this build has no adapter for agent lanes of kind {kind:?} \
                  (it speaks {})",
@@ -387,7 +399,13 @@ impl LaneFailure {
 }
 
 impl From<LaneError> for LaneFailure {
+    /// The adapter's refusal under its own code — but an "outcome unknown" (a
+    /// craze verb whose answer was lost) under `outcome_unknown`, recognised
+    /// by the one test that recognises it, never by this layer reading text.
     fn from(e: LaneError) -> Self {
+        if shed_craze::is_outcome_unknown(&e) {
+            return LaneFailure::OutcomeUnknown(e.to_string());
+        }
         LaneFailure::Lane(e)
     }
 }
@@ -1076,6 +1094,43 @@ impl Lanes {
     ) -> Result<Value, LaneFailure> {
         let entry = self.open_entry(machine, kind, session_id)?;
         entry.client.stop().await?;
+        Ok(json!({}))
+    }
+
+    /// `lane.settings` — the session's settings NOW, the adapter's one-shot
+    /// read ([`AgentLane::settings`]; a craze lane answers from its running
+    /// watcher's fold once it has seeded). A session whose capabilities say
+    /// `settings: false` answers the empty default. What the settings sheet
+    /// renders is the STREAM's copy — `lane.messages`' `settings`, staged with
+    /// the rest of the view — which this read does not replace.
+    pub async fn settings(
+        &self,
+        machine: &str,
+        kind: &str,
+        session_id: &str,
+    ) -> Result<Value, LaneFailure> {
+        let entry = self.open_entry(machine, kind, session_id)?;
+        let settings = entry.client.settings().await?;
+        Ok(json!({ "settings": settings }))
+    }
+
+    /// `lane.set` — change one setting (plan 025 §3.10): a model, a mode, or
+    /// one of the current model's options ([`parse_setting`]). `{}` is the
+    /// agent's confirmation; the new value arrives on the stream (`Settings`,
+    /// re-emitted from the change's own `meta` delta, which craze delivers
+    /// ahead of the answer). A refusal keeps its code — craze's `stale_model`
+    /// (the session left the model an option was chosen for) is
+    /// `not_accepting` — and an answer lost to a drop is `outcome_unknown`:
+    /// never resent, and decided by the next `Settings`.
+    pub async fn set(
+        &self,
+        machine: &str,
+        kind: &str,
+        session_id: &str,
+        change: LaneSettingChange,
+    ) -> Result<Value, LaneFailure> {
+        let entry = self.open_entry(machine, kind, session_id)?;
+        entry.client.set(change).await?;
         Ok(json!({}))
     }
 
@@ -1770,6 +1825,42 @@ pub fn parse_answer(value: &Value) -> Result<LaneAnswer, LaneFailure> {
     }
 }
 
+/// Decode `lane.set`'s `change` — the contract's [`LaneSettingChange`], read
+/// STRICTLY by its own serde (`deny_unknown_fields`): `{"kind": "model", "id":
+/// "<model id>"}`, `{"kind": "mode", "id": "<mode id>"}` or `{"kind": "config",
+/// "id": "<option id>", "value": "<value id>", "for_model"?: "<model id>"}` —
+/// the ids `lane.messages`' `settings` offer, sent back verbatim (opaque, never
+/// trimmed); `for_model` is the model the client DISPLAYED the option for
+/// (Amendment A13), which the adapter binds the change to. A change is a
+/// command: a shape this build cannot name, a field it would drop, or an empty
+/// id or model (which no setting offers) is refused rather than sent as
+/// something else.
+pub fn parse_setting(value: &Value) -> Result<LaneSettingChange, LaneFailure> {
+    let change: LaneSettingChange = serde_json::from_value(value.clone()).map_err(|e| {
+        LaneFailure::bad_request(format!(
+            "a setting change is {{kind: \"model\"|\"mode\", id}} or \
+             {{kind: \"config\", id, value}}: {e}"
+        ))
+    })?;
+    let (id, for_model) = match &change {
+        LaneSettingChange::Model { id } | LaneSettingChange::Mode { id } => (id, None),
+        LaneSettingChange::Config { id, for_model, .. } => (id, for_model.as_ref()),
+    };
+    if id.is_empty() {
+        return Err(LaneFailure::bad_request(
+            "a setting change names a model, mode or option the session offers by its id"
+                .to_string(),
+        ));
+    }
+    if for_model.is_some_and(String::is_empty) {
+        return Err(LaneFailure::bad_request(
+            "`for_model` names the model the option was chosen for; omit it rather than send it empty"
+                .to_string(),
+        ));
+    }
+    Ok(change)
+}
+
 /// Decode the optional `mode` of `lane.send`.
 pub fn parse_mode(value: Option<&str>) -> Result<SendMode, LaneFailure> {
     match value.map(str::trim).unwrap_or("queue") {
@@ -1810,6 +1901,29 @@ mod tests {
         }
         assert_eq!(LaneFailure::NoLane("nope".into()).code(), "no_lane");
         assert_eq!(LaneFailure::NoLane("nope".into()).message(), "nope");
+        // A craze verb whose answer was lost: its own code, recognised by the
+        // adapter's one test — the settings sheet's "not confirmed" (plan 025
+        // §3.10) — and its message whole.
+        let lost = LaneFailure::from(shed_craze::errors::outcome_unknown(
+            "the connection to craze dropped; check the transcript",
+        ));
+        assert_eq!(lost.code(), "outcome_unknown");
+        assert!(
+            lost.message().starts_with("outcome unknown"),
+            "{}",
+            lost.message()
+        );
+        assert!(seen.insert("outcome_unknown"));
+        // …and ONLY one the adapter constructed: a definite craze failure
+        // whose own words happen to begin the same way is `failed` (C11
+        // review), never taken for a lost answer.
+        let said = LaneFailure::from(shed_craze::lane_error(
+            &shed_craze::wire::RpcError::from_value(&json!({
+                "code": -32000, "message": "outcome unknown: x",
+                "data": {"code": "failed", "reason": "failed"}
+            })),
+        ));
+        assert_eq!(said.code(), "failed", "{}", said.message());
         // The kind-dispatch refusal (plan 017 §3.5). A code of its own, and it
         // NAMES the kind — that is the whole reason it is not `no_lane`.
         let unsupported = LaneFailure::UnsupportedLane("claude".into());
@@ -1819,6 +1933,60 @@ mod tests {
             "the refusal must name the kind it refused: {}",
             unsupported.message()
         );
+    }
+
+    /// `lane.set`'s `change` is the contract's [`LaneSettingChange`], read
+    /// strictly: the three forms, verbatim ids, and nothing else — an unknown
+    /// kind, a field beside the form, a config change with no value, an empty
+    /// id or a non-object are each refused `bad_request`.
+    #[test]
+    fn the_setting_change_forms_are_strict() {
+        assert_eq!(
+            parse_setting(&json!({"kind": "model", "id": "claude-opus-5"})).unwrap(),
+            LaneSettingChange::Model {
+                id: "claude-opus-5".into()
+            }
+        );
+        assert_eq!(
+            parse_setting(&json!({"kind": "mode", "id": "plan"})).unwrap(),
+            LaneSettingChange::Mode { id: "plan".into() }
+        );
+        assert_eq!(
+            parse_setting(&json!({"kind": "config", "id": "fast", "value": " true "})).unwrap(),
+            LaneSettingChange::Config {
+                id: "fast".into(),
+                value: " true ".into(),
+                for_model: None,
+            },
+            "ids and values are opaque: never trimmed"
+        );
+        // Amendment A13: the model the client displayed the option for.
+        assert_eq!(
+            parse_setting(
+                &json!({"kind": "config", "id": "fast", "value": "true", "for_model": "grok-4.6"})
+            )
+            .unwrap(),
+            LaneSettingChange::Config {
+                id: "fast".into(),
+                value: "true".into(),
+                for_model: Some("grok-4.6".into()),
+            }
+        );
+        for bad in [
+            json!({"kind": "effort", "id": "high"}),
+            json!({"kind": "model", "id": "m", "value": "x"}),
+            json!({"kind": "config", "id": "fast", "value": "true", "forModel": "m"}),
+            json!({"kind": "config", "id": "fast", "value": "true", "for_model": ""}),
+            json!({"kind": "model", "id": "m", "for_model": "m0"}),
+            json!({"kind": "config", "id": "fast"}),
+            json!({"kind": "model", "id": ""}),
+            json!({"kind": "config", "id": "", "value": "true"}),
+            json!({"id": "m"}),
+            json!("model"),
+        ] {
+            let refused = parse_setting(&bad).expect_err(&bad.to_string());
+            assert_eq!(refused.code(), "bad_request", "{bad}");
+        }
     }
 
     #[test]

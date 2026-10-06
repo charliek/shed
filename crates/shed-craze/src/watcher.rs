@@ -30,9 +30,10 @@
 //! | following | 60 s ([`LaneTimings::sync_wait`]) without a notification of this attachment, before its `synchronized` — progress-based, so a long replay that keeps delivering is never cut | close; redial by the rules below (before the seed's `Ready`, reseed; after it, the cursor) | `Stale{"reconnecting"}` |
 //! | following | `synchronized` at the last seq held | the episode count and the outage reset | — |
 //! | following | the attachment SETTLED — its `synchronized` came AND every event through the fence is folded — while seeding | the seed is complete | `Ready{generation}` |
-//! | following | the same, after a loss | the resume is complete | `Session` (re-read), lone `Ready{same generation}` |
+//! | following | the same, after a loss | the resume is complete | `Session` (re-read), `Settings` (restated, changed or not), lone `Ready{same generation}` |
 //! | following | a hole or duplicate seq; a second, early, late or wrong-subscription `synchronized`; a frame that does not read | close; reseed | `Stale`, then `Reset{protocol}` … |
 //! | following | `presence` | — | `Session{attached}` |
+//! | following | a `session.set` this lane made was answered `rev: 0` (no `meta` delta will carry it) | apply its confirmed value to the fold | `Settings` when changed |
 //! | following | `ready` (the final info document) | — | `Capabilities`/`Settings` on change; `Down{"start_failed: …"}` when it failed |
 //! | following | `reset{slow_consumer}` after readiness | re-attach WITH the cursor, same connection | — (a snapshot back reseeds) |
 //! | following | `reset{slow_consumer}` before readiness, `omitted`, `replay_failed`, an unknown reason | re-attach with NO cursor, same connection | `Reset{server_reset:<r>}` … |
@@ -111,6 +112,7 @@ pub const SEED_ROWS: usize = shed_core::lane::ring::MAX_RING_MESSAGES;
 pub(crate) fn spawn(shared: Arc<LaneShared>, hint: Option<String>) -> LaneSubscription {
     let (tx, rx) = LanePublisher::channel();
     let owner = shared.watcher_id();
+    let confirms = shared.confirmed.subscribe();
     let watcher = Watcher {
         host_id: shared.host_id.clone(),
         fold: CrazeFold::new(&shared.host_id),
@@ -136,6 +138,7 @@ pub(crate) fn spawn(shared: Arc<LaneShared>, hint: Option<String>) -> LaneSubscr
         outage: None,
         refusals: 0,
         confirm_closed: false,
+        confirms,
     };
     let task = tokio::spawn(watcher.run(hint));
     LaneSubscription {
@@ -244,6 +247,9 @@ struct Watcher {
     /// only the next connection's definite answer can say. Until then a
     /// "no such session" answer is that close, `Down{"session_closed"}`.
     confirm_closed: bool,
+    /// The lane's `rev: 0` confirmations (`LaneShared::confirmed`): changes
+    /// craze made that no `meta` delta will carry, applied to this fold.
+    confirms: tokio::sync::broadcast::Receiver<crate::wire::Setting>,
 }
 
 /// Takes the live connection back from the verbs however the watcher ends —
@@ -394,6 +400,10 @@ impl Watcher {
             return Ok(());
         };
         let caps = lane_capabilities(&info.capabilities, self.fold.settings().has_any());
+        if !caps.settings {
+            // Nothing to wait for: a config change has no model to bind.
+            self.shared.settings_known.send_replace(true);
+        }
         if self.last_caps.as_ref() == Some(&caps) {
             return Ok(());
         }
@@ -414,6 +424,7 @@ impl Watcher {
         }
         self.last_settings = Some(settings.clone());
         lock(&self.shared.state).settings = Some(settings.clone());
+        self.shared.settings_known.send_replace(true);
         self.emit(LaneEvent::Settings { settings })
     }
 
@@ -851,6 +862,12 @@ impl Watcher {
         // its rows are capped at what the ring keeps.
         fold.cap_pending(SEED_ROWS);
         self.fold = fold;
+        // A confirmation queued before this snapshot was cut is in it already.
+        while !matches!(
+            self.confirms.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty
+                | tokio::sync::broadcast::error::TryRecvError::Closed)
+        ) {}
         let _ = self.fold.take_approvals_changed();
         self.adopt_info(r.session.clone());
         self.cursor = Some(r.after.clone());
@@ -917,6 +934,16 @@ impl Watcher {
             let deadline = self.flush.deadline(flush_after);
             let note = tokio::select! {
                 n = notes.recv() => n,
+                c = self.confirms.recv() => {
+                    // A lagged receiver lost only confirmations the stream's
+                    // next `Settings` restates anyway.
+                    if let Ok(c) = c {
+                        if let Err(end) = self.confirmed(&c) {
+                            return Follow::End(end);
+                        }
+                    }
+                    continue;
+                }
                 () = sleep_until(deadline), if deadline.is_some() => {
                     self.fold.flush();
                     if let Err(end) = self.drain_rows() {
@@ -968,12 +995,37 @@ impl Watcher {
             lock(&self.shared.state).seeded_by = Some(self.owner);
         } else if self.stale {
             self.emit_session()?;
+            self.restate_settings()?;
             self.emit(LaneEvent::Ready {
                 generation: self.generation,
             })?;
             self.stale = false;
         }
         Ok(())
+    }
+
+    /// A change craze confirmed at `rev: 0` (`LaneShared::confirmed`): no
+    /// `meta` delta will carry it, so it is folded here and `Settings`
+    /// re-emitted — a client never keeps the old value for want of an event.
+    fn confirmed(&mut self, s: &crate::wire::Setting) -> Emitted {
+        if self.fold.apply_confirmed(s) {
+            self.emit_capabilities()?;
+            self.emit_settings()?;
+        }
+        Ok(())
+    }
+
+    /// A silent resume's own `Settings`, said whether or not they changed
+    /// (plan 025 §3.10): a `set` in flight at the loss was answered "outcome
+    /// unknown" and is never resent, and a client shows that change "not
+    /// confirmed" until the NEXT `Settings` states what the session is at.
+    /// Said once the resume has folded everything through its fence — the
+    /// lost change's own `meta` delta among it, if it ran — so it is the real
+    /// value, not the one from before the outage. Only on a session whose
+    /// capabilities say `settings`, as every `Settings`.
+    fn restate_settings(&mut self) -> Emitted {
+        self.last_settings = None;
+        self.emit_settings()
     }
 
     /// One notification of the attachment `r`. `Ok(Some(_))` ends the

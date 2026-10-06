@@ -207,10 +207,12 @@ re-implemented per language. The root `CLAUDE.md` owns the monorepo layout + rel
   the bounds — a `reset{omitted}` whose re-attach gets no answer is confirmed by a redial,
   never assumed closed; the rows flushed ahead of a `Down` wait for room like the `Down`;
   a seed's rows are capped at what the ring keeps so it always fits the channel. The
-  verbs share the lane's connection (`send`/`cancel`/`answer`/`stop`, fresh commandIds
-  per lane): issued while disconnected they wait 10 s then fail `Unavailable`;
+  verbs share the lane's connection (`send`/`cancel`/`answer`/`set`/`stop`, fresh
+  commandIds per lane): issued while disconnected they wait 10 s then fail `Unavailable`;
   in flight at a drop, or past their 30 s deadline (which also closes the connection),
-  they are "outcome unknown" and never resent. `session()` never dials; `approvals()`/
+  they are "outcome unknown" and never resent — and a silent resume restates the
+  session's `Settings` before its lone `Ready`, so a client showing a lost change "not
+  confirmed" has the real value to replace it with. `session()` never dials; `approvals()`/
   `settings()` answer from a RUNNING watcher's fold once it seeded (the watcher that set
   it alone clears it), else read a snapshot on a connection of their own. `fold.rs` is
   craze's events/snapshots → append-only rows (craze's own wordings ported: `noteTodos`,
@@ -224,8 +226,19 @@ re-implemented per language. The root `CLAUDE.md` owns the monorepo layout + rel
   (attach, `asks.list` + `asks.get`, `session.sync`) and its `Ready` waits for every event
   through the sync's seq;
   `segment.rs` is shed-gx's segmenter, ported (8 KiB lossless splits, the 2 s flush
-  clock); `settings.rs` is the settings READ (craze's model order; `set` is C11, `Failed`
-  until then). Pure lib — serde, tokio, no `reqwest`, no `chrono` — not
+  clock); `settings.rs` is the settings data (plan 025 §3.10: craze's model order and the
+  options' order, computed once; modes hidden when the session's `modes` capability is
+  off) and `set` (C11) is `session.set` — `setting_for` binds a config change to the model
+  the CLIENT displayed (`LaneSettingChange::Config`'s `for_model`, Amendment A13), else the
+  lane's folded one, waiting for the lane's first settings rather than going out unbound
+  (`forModel`), so craze refuses it `stale_model` (`NotAccepting`) once the session has left
+  that model; the new value comes back on the stream, from the change's own `meta` delta —
+  or, answered `rev: 0` (no delta will follow), from the confirmed value, which every
+  running watcher applies (`LaneShared::confirmed`). `errors::craze_says` keeps a craze
+  message that happens to begin "outcome unknown: " from reading as shed's own. `tests/recipe_settings.rs` drives it against the real
+  hub with `craze-fake-agent -script permodel` as `cursor` (cursor's per-model catalogs;
+  `Recipe::set_agents`, and `script_agent_with` for the agent's own
+  `CRAZE_FAKE_DUMP_CALLS` record). Pure lib — serde, tokio, no `reqwest`, no `chrono` — not
   FFI-exported, builds for `aarch64-linux-android` (mobile links it). In
   `default-members`. **Tests:** `tests/wire.rs` runs every vendored WIRE fixture
   (`fixtures/wire/`, craze's `internal/fakehost/testdata/wire` at the sha

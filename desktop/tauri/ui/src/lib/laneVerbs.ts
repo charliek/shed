@@ -34,3 +34,16 @@ export function laneVerbs(
   };
   return { cancel: gate(capabilities?.cancel), interject: gate(capabilities?.interject) };
 }
+
+/** What the panel says when a SEND's answer was lost (`outcome_unknown`, plan
+ *  025 §3.3.4): the prompt may or may not have started a turn, it is never
+ *  resent, and the typed text stays in the box — so the panel says plainly
+ *  what to do before pressing Send again, and the person decides. */
+export const SEND_OUTCOME_UNKNOWN =
+  "outcome unknown: the connection to craze dropped; check the transcript before sending again";
+
+/** The line a failed Send shows: the lost answer's own words for an
+ *  `outcome_unknown`, the refusal's message for anything else. */
+export function sendFailureText(failure: { code: string; message: string }): string {
+  return failure.code === "outcome_unknown" ? SEND_OUTCOME_UNKNOWN : failure.message;
+}

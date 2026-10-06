@@ -349,3 +349,59 @@ fn command_ids_count_from_one() {
     let ids: Vec<String> = (0..3).map(|_| lane.shared.command_id()).collect();
     assert_eq!(ids, ["1", "2", "3"]);
 }
+
+/// **`session.set`'s setting, kind by kind** (plan 025 §3.10): a model and a
+/// mode by their id alone; a config option by its id and value, BOUND
+/// (`forModel`) to the model the CLIENT displayed it for (Amendment A13) — the
+/// fold's model only when the client sent none — and unbound only when
+/// neither is known.
+#[test]
+fn the_setting_for_each_change() {
+    let wire = |change: LaneSettingChange, folded: Option<&str>| {
+        serde_json::to_value(setting_for(&change, folded)).unwrap()
+    };
+    let config = |for_model: Option<&str>| LaneSettingChange::Config {
+        id: "effort".into(),
+        value: "low".into(),
+        for_model: for_model.map(str::to_string),
+    };
+    assert_eq!(
+        wire(
+            LaneSettingChange::Model {
+                id: "claude-opus-5".into()
+            },
+            Some("grok-4.6")
+        ),
+        json!({"kind": "model", "value": "claude-opus-5"}),
+        "a model change takes no id and no binding"
+    );
+    assert_eq!(
+        wire(
+            LaneSettingChange::Mode { id: "plan".into() },
+            Some("grok-4.6")
+        ),
+        json!({"kind": "mode", "value": "plan"})
+    );
+    assert_eq!(
+        wire(config(Some("grok-4.6")), Some("claude-opus-5")),
+        json!({"kind": "config", "id": "effort", "value": "low", "forModel": "grok-4.6"}),
+        "the model the client DISPLAYED, though the fold has moved on"
+    );
+    assert_eq!(
+        wire(config(None), Some("grok-4.6")),
+        json!({"kind": "config", "id": "effort", "value": "low", "forModel": "grok-4.6"}),
+        "no model from the client: the fold's"
+    );
+    assert_eq!(
+        wire(config(Some("")), Some("grok-4.6")),
+        json!({"kind": "config", "id": "effort", "value": "low", "forModel": "grok-4.6"}),
+        "an empty model names none: the fold's"
+    );
+    for unknown in [None, Some("")] {
+        assert_eq!(
+            wire(config(None), unknown),
+            json!({"kind": "config", "id": "effort", "value": "low"}),
+            "no model known: no binding rather than an empty one"
+        );
+    }
+}

@@ -418,14 +418,17 @@ two are separate namespaces.
 | `lane.cancel` | Aborts the turn in flight. The panel offers Cancel only when the session's streamed `capabilities.cancel` is true, and enables it only while the session is `Working`. |
 | `lane.answer` | Answers one approval. Four forms, exactly one per answer and nothing beside it (any other key — say an `option_id` next to `permission` — is `bad_request`, so an answer can never execute as something other than what it reads as): `{choice: "<id>"}` — the exact option id the approval offered, which is what the panel always sends, because an agent can offer several options of the same decision kind (see [gx's `option_for` refusal](#the-option_for-ambiguity-refusal)); the scripted `{permission: "allow-once" \| "allow-always" \| "reject"}`, which resolves by semantic kind and refuses an ambiguous one; `{question: [[…]]}`, optionally with `custom_text` beside it (see [Free-text answers](#free-text-answers)); and `{reject: true}`. |
 | `lane.stop` | Ends the SESSION (craze's `session.stop`), not just the transcript: answered on craze's receipt, after which the lane ends and the row leaves. The panel offers Stop only when the session's `capabilities.stop` is true, behind an inline confirm. |
+| `lane.settings` | The session's settings, read now — the model and models (craze's order: the current model, the remembered ones by rank, the rest), the mode and modes, the current model's own options (`thought_level` first, then `model_config`) and the usage. The panel renders the stream's copy, `lane.messages`' `settings`. |
+| `lane.set` | Changes one setting: `{kind: "model"\|"mode", id}` or `{kind: "config", id, value, for_model?}` (craze's `session.set`, a config change bound to the model it was chosen for — `for_model`, the model the client displayed, else the lane's folded one). The new value arrives on the stream; craze's `stale_model` (the model moved under the choice) is `not_accepting`, and an answer lost to a drop is `outcome_unknown` — never resent. The panel offers it only when the session's `capabilities.settings` is true, through the settings sheet. |
 | `lane.close` | Ends the subscription; the last close on a shared SSH forward tears it down. |
 
 A failure comes back as `{code, message}` with the contract's own snake_case
 codes (`unauthorized`, `unknown_session`, `unknown_approval`,
 `already_submitted`, `already_resolved`, `not_accepting`, `unavailable`,
-`failed`), plus `no_lane` for a row with no `agent_lane` stamp at all and
+`failed`), plus `no_lane` for a row with no `agent_lane` stamp at all,
 `unsupported_lane` for a row whose `agent_lane.kind` names no adapter this
-build has.
+build has, and `outcome_unknown` for a craze verb whose answer was lost with its
+connection (it may have run, and it is never resent).
 
 ## A stalled client and the channel bound
 

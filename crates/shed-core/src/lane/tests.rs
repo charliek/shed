@@ -1955,15 +1955,29 @@ fn create_requests_and_setting_changes_refuse_unknown_fields() {
             LaneSettingChange::Config {
                 id: "effort".into(),
                 value: "high".into(),
+                for_model: None,
             },
             json!({"kind": "config", "id": "effort", "value": "high"}),
+        ),
+        // Amendment A13: the model the client displayed the option for.
+        (
+            LaneSettingChange::Config {
+                id: "effort".into(),
+                value: "high".into(),
+                for_model: Some("grok-4.6".into()),
+            },
+            json!({"kind": "config", "id": "effort", "value": "high", "for_model": "grok-4.6"}),
         ),
     ] {
         assert_eq!(round_trip(&change), wire);
     }
     for bad in [
-        // An unknown field inside each struct variant.
+        // An unknown field inside each struct variant — `for_model` is a
+        // config change's alone: a model or mode change takes none.
         json!({"kind": "model", "id": "m1", "for_model": "m0"}),
+        json!({"kind": "mode", "id": "plan", "for_model": "m0"}),
+        json!({"kind": "config", "id": "effort", "value": "high", "for_model": "m0", "extra": 1}),
+        json!({"kind": "config", "id": "effort", "value": "high", "forModel": "m0"}),
         json!({"kind": "mode", "id": "plan", "nonsense": 1}),
         json!({"kind": "config", "id": "effort", "value": "high", "extra": true}),
         // An unknown kind — including `option`, which this type is NOT named.

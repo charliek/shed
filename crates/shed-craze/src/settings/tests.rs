@@ -206,3 +206,32 @@ fn a_session_with_nothing_to_show_has_no_settings() {
     let sec = SettingsSections::from_value(&json!({"model": 5, "mode": "plan"}));
     assert_eq!((sec.model, sec.mode.as_deref()), (None, Some("plan")));
 }
+
+/// **Modes are hidden by capability, never shown disabled** (§3.10; PM
+/// "Capabilities": a client hides what a capability says the session cannot
+/// do): an info document whose capabilities lack `modes` takes the catalog's
+/// modes out of what a client is shown — and a session with nothing else is
+/// then a session with no settings at all.
+#[test]
+fn modes_are_hidden_when_the_capabilities_offer_none() {
+    let info = |modes: bool| -> SessionInfo {
+        serde_json::from_value(json!({
+            "sessionId": "s", "hostId": "0123456789ab",
+            "catalogs": {"models": [], "modes": [{"id": "agent", "name": "Agent"}, {"id": "plan", "name": "Plan"}]},
+            "capabilities": {"modes": modes}
+        }))
+        .unwrap()
+    };
+    let mut s = SettingsState::new();
+    assert!(s.apply_info(&info(true)));
+    let ids: Vec<String> = s.lane_settings().modes.into_iter().map(|m| m.id).collect();
+    assert_eq!(ids, ["agent", "plan"]);
+    assert!(s.has_any());
+    assert!(
+        s.apply_info(&info(false)),
+        "the capability's change is a change"
+    );
+    assert!(s.lane_settings().modes.is_empty(), "hidden, not listed");
+    assert!(!s.has_any(), "modes it cannot switch are nothing to show");
+    assert!(!s.apply_info(&info(false)), "the same document again");
+}

@@ -411,6 +411,58 @@ fn craze_create_door(
     }
 }
 
+/// The gate + reader behind the settings sheet's one driver door,
+/// `ui.pick_lane_setting {row, value}` (plan 025 §3.10, C11): the payload to
+/// emit, or the refusal.
+///
+/// **TEST-MODE ONLY**, [`craze_create_door`]'s rule and for its reason: what
+/// the sheet does with a change — the row's `pending` until craze answers, a
+/// refusal inline on its row, "not confirmed" after a lost answer until the
+/// next `Settings` — happens only when a person presses one of its values,
+/// which a harness has no pointer for; `lane_settings.dump` (the sheet's own
+/// rendered truth) is what proves it. The production door onto the same
+/// backend is `lane.set`.
+///
+/// `row` is the row's id as the dump names it — `model`, `mode`, or an
+/// option's id — and `value` the id of the value to press, both verbatim
+/// (opaque: never trimmed). The sheet presses it through the control's own
+/// gate: a value it does not render, or a row whose change is still pending,
+/// takes no press.
+fn pick_setting_door(env: &Env, params: &Value) -> Result<Value, (String, String)> {
+    if !env.test_mode {
+        return Err(err(
+            "not_enabled",
+            "ui.pick_lane_setting requires test mode",
+        ));
+    }
+    let row = req_str(params, "row")?;
+    let value = req_str(params, "value")?;
+    if row.is_empty() {
+        return Err(err("bad_request", "'row' names a settings row"));
+    }
+    Ok(json!({ "row": row, "value": value }))
+}
+
+/// The gate + reader behind `ui.hold_lane_view {hold}` (plan 025 Amendment
+/// A13's harness door): the payload to emit, or the refusal.
+///
+/// **TEST-MODE ONLY**, [`pick_setting_door`]'s rule. While held, the open
+/// transcript panel goes on reading its lane and commits nothing it reads, so
+/// it keeps SHOWING what it showed — the moment between the adapter folding a
+/// change and the panel rendering it, which in a shipped app lasts a frame,
+/// held open so a harness can press inside it (a settings option chosen on
+/// the model the sheet still displays). `hold: false` releases it and the
+/// panel reads afresh. Nothing a shipped app needs.
+fn hold_view_door(env: &Env, params: &Value) -> Result<Value, (String, String)> {
+    if !env.test_mode {
+        return Err(err("not_enabled", "ui.hold_lane_view requires test mode"));
+    }
+    match params.get("hold") {
+        Some(Value::Bool(hold)) => Ok(json!({ "hold": hold })),
+        _ => Err(err("bad_request", "'hold' must be true or false")),
+    }
+}
+
 /// An OPTIONAL string param: absent or `null` is `None`; a string is itself;
 /// anything else is `bad_request` — never read as absent, because absence has a
 /// meaning of its own (a default, or a freshly minted id).
@@ -735,6 +787,39 @@ impl Handler {
                 let _ = self.app.emit(event, payload);
                 Ok(json!({}))
             }
+            // The settings sheet (plan 025 §3.10, C11), on the show-lane
+            // pattern: it opens from the transcript header's settings chip — a
+            // CLICK — and `lane_settings.dump` only means anything once one is
+            // open. Showing it mounts the transcript panel for that session
+            // too (the sheet is the panel's); a session whose capabilities say
+            // `settings: false` has no chip, and no sheet opens.
+            "ui.show_lane_settings" => {
+                let (machine, kind, session_id) = lane_target(params)?;
+                present_main_window(&self.app);
+                let _ = self.app.emit(
+                    "show-lane-settings",
+                    json!({ "machine": machine, "kind": kind, "session_id": session_id }),
+                );
+                Ok(json!({}))
+            }
+            "ui.close_lane_settings" => {
+                let _ = self.app.emit("close-lane-settings", json!({}));
+                Ok(json!({}))
+            }
+            // Its press door — TEST-MODE ONLY, see [`pick_setting_door`]. It
+            // acts on a sheet that is already open.
+            "ui.pick_lane_setting" => {
+                let payload = pick_setting_door(&self.env, params)?;
+                let _ = self.app.emit("pick-lane-setting", payload);
+                Ok(json!({}))
+            }
+            // The transcript panel's view hold — TEST-MODE ONLY, see
+            // [`hold_view_door`].
+            "ui.hold_lane_view" => {
+                let payload = hold_view_door(&self.env, params)?;
+                let _ = self.app.emit("hold-lane-view", payload);
+                Ok(json!({}))
+            }
             "app.screenshot" => self.screenshot().await,
             "sheds.list" => {
                 let reachability = self.backend.refresh().await;
@@ -799,7 +884,10 @@ impl Handler {
             "lane.answer" => self.lane_answer(params).await,
             "lane.close" => self.lane_close(params),
             "lane.stop" => self.lane_stop(params).await,
+            "lane.settings" => self.lane_settings(params).await,
+            "lane.set" => self.lane_set(params).await,
             "lane.dump" => Ok(self.lane_dump()),
+            "lane_settings.dump" => Ok(self.lane_settings_dump()),
             "craze.create_options" => self.craze_create_options(params).await,
             "craze.create" => self.craze_create(params).await,
             "craze.open_terminal" => self.craze_open_terminal(params).await,
@@ -1576,6 +1664,37 @@ impl Handler {
             .map_err(lane_err)
     }
 
+    /// `lane.settings {machine, kind, session_id}` → `{settings}` — the
+    /// session's settings, read now (plan 025 §3.10): the model and models
+    /// (craze's order), the mode and modes, the current model's options (in
+    /// the order a client shows them) and the usage. `lane.messages`'
+    /// `settings` is the same thing as the stream last said it.
+    async fn lane_settings(&self, params: &Value) -> Result<Value, (String, String)> {
+        let (machine, kind, session_id) = lane_target(params)?;
+        self.lanes
+            .settings(&machine, &kind, &session_id)
+            .await
+            .map_err(lane_err)
+    }
+
+    /// `lane.set {machine, kind, session_id, change}` → `{}` — change one
+    /// setting (plan 025 §3.10). `change` is `{kind: "model"|"mode", id}` or
+    /// `{kind: "config", id, value}` ([`crate::lane::parse_setting`]); the new
+    /// value arrives on the stream. `not_accepting` is craze's `stale_model`
+    /// among others (the session left the model an option was chosen for),
+    /// and `outcome_unknown` an answer lost to a drop — never resent.
+    async fn lane_set(&self, params: &Value) -> Result<Value, (String, String)> {
+        let (machine, kind, session_id) = lane_target(params)?;
+        let change = params
+            .get("change")
+            .ok_or_else(|| err("bad_request", "missing 'change'"))?;
+        let change = crate::lane::parse_setting(change).map_err(lane_err)?;
+        self.lanes
+            .set(&machine, &kind, &session_id, change)
+            .await
+            .map_err(lane_err)
+    }
+
     /// `lane.answer {machine, kind, session_id, approval_id, answer}` → `{}`.
     ///
     /// `answer` is one of `{choice: "<option id>"}` (the offered option, by its
@@ -1612,6 +1731,15 @@ impl Handler {
     /// exactly the question a caller is asking.
     fn lane_dump(&self) -> Value {
         json!({ "lane": self.ui_get("lane").unwrap_or(Value::Null) })
+    }
+
+    /// `lane_settings.dump` → what the settings SHEET rendered (UI truth, the
+    /// `lane.dump` rule): its session, its rows — the model list, each
+    /// option, the mode — with their control, values, current value and the
+    /// row's state (`pending`, `refused` with its inline text, `not_confirmed`),
+    /// and the context meter — or `null` while none is open.
+    fn lane_settings_dump(&self) -> Value {
+        json!({ "lane_settings": self.ui_get("lane_settings").unwrap_or(Value::Null) })
     }
 
     // -- craze: the create sheet and Open in terminal (plan 025 §3.6.6, §3.8) --
@@ -2776,6 +2904,65 @@ mod tests {
                 craze_create_door(&test, "ui.fill_craze_create", &bad)
                     .expect_err("a control of the wrong type")
                     .0,
+                "bad_request",
+                "{bad}"
+            );
+        }
+    }
+
+    /// **The settings sheet's press door is test-mode only** (plan 025 C11),
+    /// the craze create doors' rule; in test mode it carries the row and the
+    /// value verbatim, and anything but two strings (a named row) is a bad
+    /// request.
+    #[test]
+    fn the_settings_press_door_is_test_mode_only() {
+        let press = json!({ "row": "effort", "value": " low " });
+        let mut prod = env(None);
+        prod.test_mode = false;
+        let (code, message) = pick_setting_door(&prod, &press)
+            .expect_err("a driver door must not be reachable in a shipped app");
+        assert_eq!(code, "not_enabled");
+        assert!(message.contains("ui.pick_lane_setting"), "{message}");
+        let test = env(None);
+        assert_eq!(
+            pick_setting_door(&test, &press).unwrap(),
+            press,
+            "ids are opaque: never trimmed"
+        );
+        for bad in [
+            json!({ "row": "effort" }),
+            json!({ "value": "low" }),
+            json!({ "row": "", "value": "low" }),
+            json!({ "row": "effort", "value": 3 }),
+        ] {
+            assert_eq!(
+                pick_setting_door(&test, &bad).expect_err("not a press").0,
+                "bad_request",
+                "{bad}"
+            );
+        }
+    }
+
+    /// **The view hold is test-mode only** (Amendment A13's harness door): in
+    /// test mode it carries the boolean, and anything else is a bad request.
+    #[test]
+    fn the_view_hold_is_test_mode_only() {
+        let mut prod = env(None);
+        prod.test_mode = false;
+        let (code, message) = hold_view_door(&prod, &json!({ "hold": true }))
+            .expect_err("a driver door must not be reachable in a shipped app");
+        assert_eq!(code, "not_enabled");
+        assert!(message.contains("ui.hold_lane_view"), "{message}");
+        let test = env(None);
+        for hold in [true, false] {
+            assert_eq!(
+                hold_view_door(&test, &json!({ "hold": hold })).unwrap(),
+                json!({ "hold": hold })
+            );
+        }
+        for bad in [json!({}), json!({ "hold": "yes" }), json!({ "hold": 1 })] {
+            assert_eq!(
+                hold_view_door(&test, &bad).expect_err("not a hold").0,
                 "bad_request",
                 "{bad}"
             );

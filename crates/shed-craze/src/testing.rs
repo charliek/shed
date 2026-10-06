@@ -316,10 +316,18 @@ impl Recipe {
     /// Point `[agents].grok` at `agent` (the hub reads `config.toml` at every
     /// create).
     pub fn set_grok_agent(&self, agent: &Path) {
-        let config = format!(
-            "provider = \"grok\"\nhost_idle_exit = \"30s\"\n\n[agents]\ngrok = \"{}\"\n",
-            agent.display()
-        );
+        self.set_agents(&[("grok", agent)]);
+    }
+
+    /// Point each `[agents].<provider>` named at its agent, `grok` staying the
+    /// default provider — the settings cells run the fake agent's `permodel`
+    /// script (cursor's per-model catalogs, on cursor's own wire) as
+    /// `cursor`, which `[agents]` makes ready on any machine.
+    pub fn set_agents(&self, agents: &[(&str, &Path)]) {
+        let mut config = "provider = \"grok\"\nhost_idle_exit = \"30s\"\n\n[agents]\n".to_string();
+        for (provider, agent) in agents {
+            config.push_str(&format!("{provider} = \"{}\"\n", agent.display()));
+        }
         std::fs::write(self.config_path(), config).unwrap_or_else(|e| panic!("config.toml: {e}"));
     }
 
@@ -366,12 +374,26 @@ impl Recipe {
     /// two-line wrapper — `[agents]` names one binary, no arguments, and the
     /// flag wins over the recipe's `CRAZE_FAKE_SCRIPT`.
     pub fn script_agent(&self, script: &str) -> PathBuf {
+        self.script_agent_with(script, &[])
+    }
+
+    /// [`Recipe::script_agent`] with the fake agent's own knobs set in its
+    /// wrapper (the hub's environment is fixed at its birth, so a knob for one
+    /// create goes here): `CRAZE_FAKE_DUMP_CALLS` (a file the agent appends
+    /// every message it reads to — `session/set_config_option <id>=<value>`
+    /// for a set, so a cell can count what reached the agent) and
+    /// `CRAZE_FAKE_SET_GATE` among them. Values are single-quoted.
+    pub fn script_agent_with(&self, script: &str, env: &[(&str, &str)]) -> PathBuf {
         use std::os::unix::fs::PermissionsExt;
         let p = self.root.join(format!("{script}-agent"));
+        let mut exports = String::new();
+        for (k, v) in env {
+            exports.push_str(&format!("export {k}='{v}'\n"));
+        }
         std::fs::write(
             &p,
             format!(
-                "#!/bin/sh\nexec '{}' -script {script} \"$@\"\n",
+                "#!/bin/sh\n{exports}exec '{}' -script {script} \"$@\"\n",
                 self.bins.fake_agent.display()
             ),
         )

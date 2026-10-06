@@ -1914,7 +1914,10 @@ export default function App() {
   // belongs to a ROW, so it lives beside the panes rather than replacing one —
   // and it stays put when you navigate, because a transcript you opened is
   // something you are reading, not somewhere you went.
-  const [lane, setLane] = useState<{ machine: string; kind: string; sessionId: string } | null>(null);
+  // `settings` is whether its settings sheet is asked for (the header chip, or
+  // `ui.show_lane_settings`); the panel shows it only on a session whose
+  // capabilities say `settings`. Opening a lane any other way asks for none.
+  const [lane, setLane] = useState<{ machine: string; kind: string; sessionId: string; settings?: boolean } | null>(null);
 
   // -- roost bootstrap (plan 019 §3.6, C8) ---------------------------------
   // The open consent card, if any — one at a time, App-level like `lane`
@@ -2179,6 +2182,21 @@ export default function App() {
         }),
       );
       uns.push(await listen("close-lane", () => setLane(null)));
+      // The settings sheet's door (`ui.show_lane_settings`, plan 025 §3.10),
+      // the same pattern: the sheet opens from the transcript header's chip —
+      // a click — so the door mounts the panel for that session (if it is
+      // not the one open) and asks for its sheet.
+      uns.push(
+        await listen<{ machine?: unknown; kind?: unknown; session_id?: unknown }>("show-lane-settings", (e) => {
+          const machine = e.payload?.machine;
+          const kind = e.payload?.kind;
+          const sessionId = e.payload?.session_id;
+          if (typeof machine === "string" && typeof kind === "string" && typeof sessionId === "string") {
+            setLane({ machine, kind, sessionId, settings: true });
+          }
+        }),
+      );
+      uns.push(await listen("close-lane-settings", () => setLane((l) => (l ? { ...l, settings: false } : l))));
       // The roost consent card's drivable doors (plan 019 §3.6/C8), same
       // pattern: it opens from a card's plan-matrix BUTTON, a click the
       // harness has none of. `show-roost-consent` re-previews `target` rather
@@ -2389,6 +2407,8 @@ export default function App() {
           machine={lane.machine}
           kind={lane.kind}
           sessionId={lane.sessionId}
+          settingsOpen={!!lane.settings}
+          onSettingsOpen={(open) => setLane((l) => (l ? { ...l, settings: open } : l))}
           onClose={() => setLane(null)}
         />
       )}

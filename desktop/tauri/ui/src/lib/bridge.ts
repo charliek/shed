@@ -1558,6 +1558,17 @@ export type LaneSettings = {
   usage?: LaneUsage | null;
 };
 
+/** One change to a session's settings (`shed_core::lane::LaneSettingChange`,
+ *  `lane_set`'s `change`): a model or a mode by its id, or one of the current
+ *  model's options by its id and value — every id as `LaneSettings` offered it,
+ *  verbatim — and, on an option, `for_model`: the model the client DISPLAYED it
+ *  for (plan 025 Amendment A13). Strict on the backend: a shape it cannot name
+ *  is `bad_request`. */
+export type LaneSettingChange =
+  | { kind: "model"; id: string }
+  | { kind: "mode"; id: string }
+  | { kind: "config"; id: string; value: string; for_model?: string };
+
 /** `lane.open`'s answer: the session row alone. What the session can do is the
  *  view's (`LaneView.capabilities`), not the open's. */
 export type LaneOpened = { session: LaneSessionRow };
@@ -1680,6 +1691,29 @@ export async function laneStop(machine: string, kind: string, sessionId: string)
   await laneInvoke("lane_stop", { machine, kind, sessionId });
 }
 
+/** The session's settings, read now (`lane.settings`; plan 025 §3.10). The
+ *  sheet renders the STREAM's copy — `LaneView.settings` — and this one-shot
+ *  read is the socket op's twin. THROWS a coded failure. */
+export async function laneSettings(machine: string, kind: string, sessionId: string): Promise<LaneSettings> {
+  const r = await laneInvoke<{ settings: LaneSettings }>("lane_settings", { machine, kind, sessionId });
+  return r.settings;
+}
+
+/** Change one setting (`lane.set`; plan 025 §3.10). Resolves on craze's
+ *  confirmation — the new value arrives on the stream, as the next
+ *  `LaneView.settings`. THROWS a coded failure: `not_accepting` (on an option,
+ *  craze's `stale_model`: the model moved under the choice), `outcome_unknown`
+ *  (the answer was lost with the connection — the change may have run, and it
+ *  is never resent), or the contract's others. */
+export async function laneSet(
+  machine: string,
+  kind: string,
+  sessionId: string,
+  change: LaneSettingChange,
+): Promise<void> {
+  await laneInvoke("lane_set", { machine, kind, sessionId, change });
+}
+
 export async function laneAnswer(
   machine: string,
   kind: string,
@@ -1785,6 +1819,10 @@ export type LaneReport = {
    *  do not offer `stop` and no button is rendered at all; otherwise whether
    *  its inline confirm is open. */
   stop: { confirming: boolean } | null;
+  /** The header's settings chip as it reads (`<model name> · <effort value> ·
+   *  fast`, plan 025 §3.10), or `null` when there is none — the session's
+   *  capabilities do not say `settings` (it is hidden, never disabled). */
+  settings_chip: string | null;
   error: string | null;
 };
 
@@ -1794,6 +1832,40 @@ export type LaneReport = {
  *  `null` for "no panel" instead of the previous mount's stale snapshot. */
 export function reportLane(snapshot: LaneReport | null): void {
   void invoke("ui_report", { snapshot: { lane: snapshot } });
+}
+
+/** The settings sheet as rendered — the UI truth `lane_settings.dump` reads
+ *  (plan 025 §3.10). Each row is what a person sees: the control it is drawn
+ *  as, its values with the selected one, and its state — `pending` while a
+ *  change awaits craze, `refused` with the text shown inline, or
+ *  `not_confirmed` after an answer lost to a drop, until the next `Settings`.
+ *  `enabled` is whether the row takes a press now. */
+export type LaneSettingsReport = {
+  machine: string;
+  session_id: string;
+  lane_kind: string;
+  chip: string;
+  rows: {
+    id: string;
+    kind: "model" | "mode" | "config";
+    name: string;
+    category: string | null;
+    control: "segmented" | "list";
+    current: string | null;
+    current_name: string | null;
+    values: { id: string; name: string; selected: boolean }[];
+    state: "pending" | "refused" | "not_confirmed" | null;
+    text: string | null;
+    enabled: boolean;
+  }[];
+  usage: { tokens: number; window: number; percent: number; text: string } | null;
+};
+
+/** Report the settings sheet's rendered state (mounted-only, the `reportLane`
+ *  rule): `null` on close CLEARS the key, so `lane_settings.dump` answers
+ *  `null` for "no sheet". */
+export function reportLaneSettings(snapshot: LaneSettingsReport | null): void {
+  void invoke("ui_report", { snapshot: { lane_settings: snapshot } });
 }
 
 /* ---- craze: the create sheet and Open in terminal (plan 025 §3.6.6, §3.8) -- */

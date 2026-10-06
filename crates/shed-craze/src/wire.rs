@@ -22,8 +22,8 @@
 //! `session.create` — the source's half (plan 025 C7) — and the lane's (C8):
 //! `session.connect`, `sessions.list` on a host, `session.attach`,
 //! `session.snapshot`, `asks.get`, and the verbs `session.prompt`,
-//! `session.cancel`, `asks.answer` and `session.stop`. (`session.set` is the
-//! settings milestone's, C11.) The attachment's notifications (`event`,
+//! `session.cancel`, `asks.answer` and `session.stop` — and the settings
+//! milestone's `session.set` (C11). The attachment's notifications (`event`,
 //! `synchronized`, `ready`, `presence`, `reset`) decode here as envelopes; an
 //! event's body is the fold's to read (`crate::fold`).
 
@@ -75,6 +75,8 @@ pub mod method {
     pub const SESSION_CANCEL: &str = "session.cancel";
     pub const ASKS_ANSWER: &str = "asks.answer";
     pub const SESSION_STOP: &str = "session.stop";
+    /// One settings change (the settings milestone, C11).
+    pub const SESSION_SET: &str = "session.set";
 }
 
 /// The notifications this crate reads: the roster's (the source) and an
@@ -312,6 +314,50 @@ pub struct AnswerParams {
     pub command_id: String,
     pub ask_id: String,
     pub answer: Value,
+}
+
+/// `session.set`'s params: one settings change.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetParams {
+    pub session_id: String,
+    pub command_id: String,
+    pub setting: Setting,
+}
+
+/// One settings change as craze names it (PM's `setting{kind, id?, value,
+/// forModel?}`; the schema's `session.set.json`, closed). `kind` is `model`,
+/// `mode` or `config`; `id` names a config option, and `forModel` binds a
+/// config change to the model it was chosen for — craze refuses it
+/// `stale_model` once the session has left that model. A model or mode change
+/// takes neither, so both are left out rather than sent empty (the schema
+/// closes the object, and a host refuses what it does not name).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Setting {
+    pub kind: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    pub value: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub for_model: Option<String>,
+}
+
+/// `session.set`'s result: the CONFIRMED value — what the session is at now,
+/// never an echo of the request — and `rev`, the seq of the `meta` delta that
+/// carried the change. The delta reaches the attachment before this reply (the
+/// reply barrier), so a lane learns the change from its stream — EXCEPT when
+/// `rev` is `0`: craze could not learn a revision (its log was closing, or the
+/// call's context ended before the delta was committed), the change WAS made,
+/// and no event will carry it, so the lane applies `value` itself
+/// (`crate::lane`, "Settings"). `rev` is `None` when the answer did not say —
+/// never read as `0`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+pub struct SetResult {
+    #[serde(default)]
+    pub value: String,
+    #[serde(default)]
+    pub rev: Option<u64>,
 }
 
 // ---- inbound: the envelope ----
@@ -730,6 +776,10 @@ pub struct SessionCapabilities {
     pub history_cursor: bool,
     #[serde(default)]
     pub stop: bool,
+    /// The provider has switchable modes: a session without it shows none
+    /// (`crate::settings`).
+    #[serde(default)]
+    pub modes: bool,
     #[serde(default)]
     pub row_facts: bool,
     #[serde(default)]

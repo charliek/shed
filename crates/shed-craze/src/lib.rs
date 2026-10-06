@@ -16,7 +16,7 @@
 //!   ├─ fold.rs     — craze's events and snapshots → append-only rows, activity,
 //!   │                the approval book (craze's own wordings, ported)
 //!   ├─ segment.rs  — the streak segmenter and its flush clock (ported from shed-gx)
-//!   ├─ settings.rs — the session's settings read: catalogs, sections, craze's order
+//!   ├─ settings.rs — the session's settings: catalogs, sections, craze's order
 //!   ├─ dial.rs   — the seam: one fresh duplex to `craze bridge --hub` per connection
 //!   │              (ProcessDial: a local /bin/sh; TcpDial: the phone's loopback port),
 //!   │              and the classification of a dial that never reached a hub
@@ -39,7 +39,9 @@
 //! (P11) and reaches its host through the hub's splice; its watcher seeds from
 //! an attach's snapshot, resumes SILENTLY from its cursor whenever the host
 //! honours it (P12), and reseeds when it does not. The settings it reads are
-//! [`settings`]'s; changing one is the settings milestone's (C11).
+//! [`settings`]'s — craze's model order and the options' order, computed here
+//! once — and it changes one with `session.set` (the settings milestone, C11):
+//! a config change bound to the model it was chosen for ([`setting_for`]).
 //!
 //! Not FFI-exported; it builds for `aarch64-linux-android` because shed-mobile
 //! links it. `testing` (behind `test-support`) is craze's own hermetic recipe
@@ -65,7 +67,7 @@ pub use dial::{
     DialError, EnvPolicy, ExitWatch, Probe, ProcessDial, StderrTail, TcpDial,
 };
 pub use errors::{is_outcome_unknown, lane_error};
-pub use lane::{answer_body, lane_capabilities, CrazeLane, LaneTimings};
+pub use lane::{answer_body, lane_capabilities, setting_for, CrazeLane, LaneTimings};
 pub use source::{
     lane_session, new_request_id, source_capabilities, valid_request_id, CrazeSource, Timings, KIND,
 };

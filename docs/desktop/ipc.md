@@ -265,12 +265,21 @@ failure codes — is [Agent lanes](agent-lanes.md).
 | `lane.cancel` | `machine`, `kind`, `session_id` | `{}` |
 | `lane.answer` | `machine`, `kind`, `session_id`, `approval_id`, `answer` | `{}` |
 | `lane.stop` | `machine`, `kind`, `session_id` | `{}` — ends the **session** (craze's `session.stop`), answered on craze's receipt; the lane ends (`ended`) and the row leaves when the session closes. Refused by a session whose capabilities say `stop: false` |
+| `lane.settings` | `machine`, `kind`, `session_id` | `{settings}` — the session's settings, read now: `model` and `models` (craze's order: the current model, the remembered ones by rank, the rest in catalog order), `mode` and `modes` (none when its capabilities offer no switchable modes), `options` (the current model's own, the model and mode rows excluded, `thought_level` first, then `model_config`, each in the provider's order; values in the provider's order) and `usage` (`{context_tokens, context_window}`, a native session's). The empty default on a session whose capabilities say `settings: false`. `lane.messages`' `settings` is the stream's copy, which the sheet renders |
+| `lane.set` | `machine`, `kind`, `session_id`, `change` | `{}` — change one setting (craze's `session.set`). `change` is `{kind: "model", id}`, `{kind: "mode", id}` or `{kind: "config", id, value, for_model?}` — ids as `settings` offers them, verbatim; anything else (an unknown kind, a field beside the form, an empty id or `for_model`) is `bad_request`. A config change is bound to `for_model`, the model the caller DISPLAYED the option for (the settings sheet always sends it), or — absent — to the model the lane has folded, waiting for the lane's first settings when none has arrived (refused `unavailable`, unsent, if they do not come within the verb deadline); craze refuses it `stale_model` — `not_accepting` — once the session has left that model, and a retry is a new command. `{}` is craze's confirmation; the new value arrives on the stream, ahead of it — or, when craze could learn no revision (`rev: 0`, no event will follow), from the confirmed value, which the lane applies itself. An answer lost to a drop is `outcome_unknown`: the change may have run, it is never resent, and the next `settings` says what the session is at |
 | `lane.close` | `machine`, `kind`, `session_id` | `{}` — idempotent |
 
 Every frame reaches the frontend as the `lane-event` Tauri event, `{machine, kind, session_id,
 event}`. A craze lane is evicted when its row leaves its machine's craze source (removed, a
 reseed that no longer lists it, the hub gone, the host removed, its tab ended); a roost
 snapshot never evicts one.
+
+A craze verb whose answer was lost with its connection — in flight at a drop, or unanswered
+within its 30 s deadline — fails `outcome_unknown` (it may have run; it is never resent; a
+definite craze failure is never given that code, whatever its words); a verb issued while the
+lane is reconnecting waits up to 10 s, then fails `unavailable` (never sent, so a retry is
+safe). The panel keeps a Send's text after `outcome_unknown` and says to check the transcript
+before sending again.
 
 **What the session can do is read from `lane.messages`, not `lane.open`.** Capabilities are
 per session and ride the lane's stream (a craze session's change with its incarnation), so
@@ -294,10 +303,24 @@ backend's view — the two can disagree, and have.
 | `machines.dump` | on the Machines pane | `{machines}` — a row per machine with its `status` word, `detail` line, and grouped session slugs, plus its `craze_note`: the note the card renders about the machine's craze ("craze on this machine is too old for shed; update it", or for a live hub that cannot create "update craze on this machine to create sessions here"), `null` when it says nothing — a machine without craze is not a problem to report — and `craze_create`: whether the card offers New craze session |
 | `sidebar.dump` | **always** | `{servers, machines}` — the sidebar's status foot |
 | `craze_create.dump` | while the craze create sheet is open | `{craze_create}` — what the sheet rendered: `machine`; `state` (`loading` \| `failed` (the options) \| `idle` \| `submitting` \| `refused` \| `unknown` \| `created`); `providers[]` — `{id, label, state, dimmed, selected, reason, fix}`, a non-ready one dimmed and never selectable; `preselected` (the default provider when listed and ready, else the first ready one) and `default_provider`; `recent_dirs`; `values` (the typed "Directory" and "First prompt"); the `request_id` it holds (only while a submission is in flight or its outcome is unknown); its `note` (offline / too old / not installed, or "no provider is ready on this machine"); the `error` as shown (`{code, message, where, text}`), a start failure's `cause` verbatim, the directory's own `cwd_problem`; `create_enabled` and the `primary` button's label (Create, Try again, Creating…) — read off the mounted DOM; `null` when none is mounted |
-| `lane.dump` | while the transcript panel is open | `{lane}` — what the panel rendered: its rows, approval cards, `kind` badge (and `lane_kind`, the kind it was opened with), the `permission` line (`bypass` reads "runs tools without asking"), Interject toggle, `can_cancel` and `stop` (`{confirming}`, or `null` with no Stop button) — all read off `lane.messages`' `capabilities`; Cancel, Interject and Stop exist only when the capabilities offer them, and Cancel/Interject are live only while the session is working — `stale`, `ended`, and its error; `null` when none is mounted |
+| `lane.dump` | while the transcript panel is open | `{lane}` — what the panel rendered: its rows, approval cards, `kind` badge (and `lane_kind`, the kind it was opened with), the `permission` line (`bypass` reads "runs tools without asking"), Interject toggle, `can_cancel` and `stop` (`{confirming}`, or `null` with no Stop button) — all read off `lane.messages`' `capabilities`; Cancel, Interject and Stop exist only when the capabilities offer them, and Cancel/Interject are live only while the session is working — `settings_chip` (the header's `<model name> · <effort value> · fast`, from the current values; `null` — no chip — when the capabilities do not say `settings`), `stale`, `ended`, and its error; `null` when none is mounted |
+| `lane_settings.dump` | while the settings sheet is open | `{lane_settings}` — what the sheet rendered: its `machine`, `session_id`, `lane_kind` and `chip`; `rows[]` in render order (the model, the current model's options, the mode) — `{id, kind, name, category, control, current, current_name, values: [{id, name, selected}], state, text, enabled}`, where `control` is `list` (the model, and any row of more than four values) or `segmented`, `state` is `pending` (craze has not answered; the row takes no press), `refused` (`text` the refusal shown inline — "the model changed; try again" on an option whose model moved under it) or `not_confirmed` (the answer was lost; until the session's next settings), else `null`; and `usage` (`{tokens, window, percent, text}`, the context meter, when the session reports both) — `null` when none is open |
 
 The transcript panel is mounted by `ui.show_lane {machine, kind, session_id}` (the card's
 Transcript affordance, which is a click) and unmounted by `ui.close_lane`.
+
+Its settings sheet is opened by `ui.show_lane_settings {machine, kind, session_id}` (the header's
+settings chip, a click; it mounts that session's transcript panel too) and closed by
+`ui.close_lane_settings`. It opens only on a session whose capabilities say `settings` — on any
+other there is no chip, and no sheet opens (`lane_settings.dump` stays `null`). **In test mode
+only**, `ui.pick_lane_setting {row, value}` presses a value on an open sheet the way a person
+would — `row` is `model`, `mode` or an option's id, `value` the value's id, both verbatim —
+through the row's own gate (a row still pending, a value it does not render, and the value it
+already shows take no press); outside test mode it answers `not_enabled`, and the production
+door is `lane.set`. Also test mode only, `ui.hold_lane_view {hold: true|false}` holds the open
+transcript panel's view: it goes on reading its lane and renders nothing new until released —
+the moment between the lane folding a change and the panel showing it, held open (a settings
+option pressed then is still bound to the model the sheet displays).
 
 The New-session dialog is driven the same way: `ui.show_launch` opens it, and — **in test
 mode only** — `ui.fill_launch {mode?, target?, command?, workdir?}` types into it (`mode` is

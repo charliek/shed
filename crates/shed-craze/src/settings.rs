@@ -1,5 +1,7 @@
-//! A craze session's settings as the contract's [`LaneSettings`] — the READ
-//! half of plan 025 §3.10 (`set` is the settings milestone's, C11).
+//! A craze session's settings as the contract's [`LaneSettings`] — plan 025
+//! §3.10's data. Changing one is `crate::lane`'s (`session.set`, C11): a client
+//! names a value from what this module produced, and the change comes back on
+//! the stream as a `meta` delta this module folds.
 //!
 //! # Where they come from
 //!
@@ -25,8 +27,15 @@
 //!   ordered `thought_level` first, then `model_config` in the provider's
 //!   order, then the rest in the provider's order. A select's values keep the
 //!   provider's order; a value maps as `{id: value, name}`.
-//! - **Modes** in the catalog's order; **usage** as `{contextTokens,
-//!   contextWindow}`, a window of `0` (craze does not know it) read as absent.
+//! - **Modes** in the catalog's order — and NONE when the session's
+//!   capabilities say it has no switchable modes (`modes: false`, or absent on
+//!   an older host): craze's rule is that a client hides, never disables, what
+//!   a capability says the session cannot do (PM "Capabilities"), and `modes`
+//!   is the one settings row with a capability of its own. (Its `effort` and
+//!   `fastToggle` bits gate craze's own status chips, never a control: the
+//!   current model's catalog is the one authority on which options there are.)
+//!   **Usage** as `{contextTokens, contextWindow}`, a window of `0` (craze does
+//!   not know it) read as absent.
 //!
 //! [`SettingsState::has_any`] is the capability half (§3.9): a session has
 //! settings when it has any model, mode or option to show.
@@ -35,7 +44,7 @@ use serde::Deserialize;
 use serde_json::Value;
 use shed_core::lane::{LaneChoice, LaneSetting, LaneSettings, LaneUsage};
 
-use crate::wire::{CatalogModel, Catalogs, ModeInfo};
+use crate::wire::{CatalogModel, Catalogs, ModeInfo, SessionInfo};
 
 /// One config option as craze carries it (`config.options[]`, the event
 /// codec's `configOption`).
@@ -133,6 +142,10 @@ pub struct SettingsState {
     /// The model list's revision (PM "Live models").
     revision: u64,
     modes: Vec<ModeInfo>,
+    /// The session's capabilities say it has no switchable modes: its modes
+    /// are not shown (the module doc). Learned from each info document; a
+    /// state that has seen none shows what it holds.
+    modes_hidden: bool,
     model: Option<String>,
     mode: Option<String>,
     options: Vec<ConfigOption>,
@@ -142,6 +155,13 @@ pub struct SettingsState {
 impl SettingsState {
     pub fn new() -> SettingsState {
         SettingsState::default()
+    }
+
+    /// An info document: its catalogs ([`SettingsState::apply_catalogs`]) and
+    /// whether its capabilities offer modes. Whether anything changed.
+    pub fn apply_info(&mut self, info: &SessionInfo) -> bool {
+        let hidden = replace(&mut self.modes_hidden, &!info.capabilities.modes);
+        self.apply_catalogs(&info.catalogs) | hidden
     }
 
     /// The info document's catalogs. The modes are taken whole; the model
@@ -190,6 +210,31 @@ impl SettingsState {
         true
     }
 
+    /// A change craze CONFIRMED with no revision to learn it from
+    /// (`session.set` answered `rev: 0`, so no `meta` delta will carry it): its
+    /// confirmed value applied to the section it names — the current model,
+    /// the current mode, or one option's current value. A model's own options
+    /// are not known until a `Settings` that carries them; this keeps the
+    /// value the session confirmed from being lost meanwhile. Whether anything
+    /// changed.
+    pub fn apply_confirmed(&mut self, kind: &str, id: Option<&str>, value: &str) -> bool {
+        match kind {
+            "model" => replace_id(&mut self.model, value),
+            "mode" => replace_id(&mut self.mode, value),
+            "config" => {
+                let Some(o) = id.and_then(|id| self.options.iter_mut().find(|o| o.id == id)) else {
+                    return false;
+                };
+                if o.current == value {
+                    return false;
+                }
+                value.clone_into(&mut o.current);
+                true
+            }
+            _ => false,
+        }
+    }
+
     /// The model list's revision.
     pub fn revision(&self) -> u64 {
         self.revision
@@ -198,7 +243,17 @@ impl SettingsState {
     /// Whether the session has any model, mode or option to show — the
     /// `settings` capability (§3.9).
     pub fn has_any(&self) -> bool {
-        !self.models.is_empty() || !self.modes.is_empty() || self.options.iter().any(shown)
+        !self.models.is_empty() || !self.shown_modes().is_empty() || self.options.iter().any(shown)
+    }
+
+    /// The modes a client shows: the catalog's, unless the capabilities say
+    /// the session has none to switch.
+    fn shown_modes(&self) -> &[ModeInfo] {
+        if self.modes_hidden {
+            &[]
+        } else {
+            &self.modes
+        }
     }
 
     /// The options a client shows: the current model's, less the model and
@@ -231,7 +286,7 @@ impl SettingsState {
                 .collect(),
             mode: self.mode.clone(),
             modes: self
-                .modes
+                .shown_modes()
                 .iter()
                 .map(|m| LaneChoice {
                     id: m.id.clone(),

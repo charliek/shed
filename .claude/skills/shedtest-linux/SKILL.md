@@ -280,6 +280,43 @@ SHED_CRAZE_REQUIRE=1 SHED_CRAZE_BIN_DIR=/work/desktop/tools/shedtest/.craze-bin 
   `LaneFailure` has a message WITHOUT the code, and re-splitting it read `outcome_unknown` as
   `failed`. `laneFailure` now returns a `LaneFailure` unchanged.
 
+### The settings sheet (plan 025 C11)
+
+- **Drive it through its doors**: `ui.show_lane_settings {machine, kind, session_id}` mounts
+  the transcript panel AND asks for its sheet; `ui.pick_lane_setting {row, value}` (test mode
+  only) presses a value — `row` is `model`, `mode` or an option's id; `ui.close_lane_settings`.
+  Read it with `lane_settings.dump` (rows with `control`, `current`, `values[].selected`,
+  `state`/`text`/`enabled`, the `chip`, `usage`) and the header chip with `lane.dump`'s
+  `settings_chip`. Wait for the dump to show a press's effect (`state == "pending"`, or the new
+  `current`) — never sleep. A press on the value a row already shows sends nothing.
+- **A session with per-model settings**: `craze-fake-agent -script permodel` is cursor's wire
+  (four models, each with its own options) and speaks cursor's AUTH, so it must run as
+  `cursor`, not grok (as grok it fails `no supported auth method`). `rig.set_agents(grok=…,
+  cursor=<wrapper>)` and create with `provider: "cursor"`; then `rig.set_grok(rig.grok_echo)` AT
+  ONCE — the C10 sheet cell asserts cursor is NOT ready. Every fake-agent script advertises
+  models and modes, so no craze session in the rig has `settings: false`: the hidden-sheet cell
+  uses an opencode tab (FakeOpencode + a FakeRoost tab with `server_url`), closed again with
+  `machine.kill` so the last cell (the D4 fold) still sees no roost rows.
+- **The agent's own knobs go in its wrapper** (the hub's env is fixed at its birth):
+  `CRAZE_FAKE_DUMP_CALLS=<file>` records every `set_config_option <id>=<value>` the agent was
+  ASKED for (what reached it, not what was sent); `CRAZE_FAKE_SET_GATE=<path>` holds each set
+  until a byte is written to that FIFO — and is a no-op while no FIFO exists there, so a cell
+  turns it on with `mkfifo` (`SetGate`) and off by unlinking it. Release only after the set is
+  at the agent (the dump shows it): the gate's reader opens the FIFO when the set arrives.
+- **`stale_model` on demand**: a SECOND client (the rig's own `craze bridge --hub`: `hello`,
+  `session.connect{hostId}`, the host `hello`, `sessions.list`) sends a model change while the
+  gate holds it; the sheet's option press, bound to the old model, queues behind it in craze's
+  one-at-a-time settings queue; release the gate and craze refuses it `stale_model`. Seen on
+  the wire in `sets.log` (the proxy logs every `session.set` with its params).
+- **"The sheet shows A, the lane has folded B"** (Amendment A13): `ui.hold_lane_view {hold:
+  true}` (test mode) stops the panel committing its reads, so it keeps rendering the old model
+  while `lane.messages` shows the move a second client made; a press then is bound to the
+  displayed model (`for_model`). Release it (`hold: false`) in a `finally`.
+- **A lost answer on demand**: with `proxy` on (BEFORE the lane's bridge is dialled — the
+  wrapper reads the switch per spawn), `drop-sets` makes the proxy relay a `session.set` and
+  cut its connection; with `outage` on too the redial fails, so "not confirmed" holds until
+  both are off and the lane resumes. The resume restates the settings before its `Ready`.
+
 ### Against a REAL local daemon
 
 The render-gate container can drive the roost-session running on the **host**. Mount its

@@ -19,8 +19,9 @@
 //!   one member that differs, by design (`{kind: "shed", name, version}`,
 //!   plan 025 §3.3.2); everything else is compared exactly, ids included.
 //!   The lane requests no fixture line composes as this crate does —
-//!   `session.snapshot` at its default budget, and the fenced read's
-//!   `asks.list` (no fixture calls it) — are pinned by hand.
+//!   `session.snapshot` at its default budget, the fenced read's `asks.list`
+//!   and the settings milestone's `session.set` (no fixture calls either) —
+//!   are pinned by hand.
 //! - **What the source makes of those answers** is the contract's: rows keyed
 //!   by hostId, an upsert with an open ask, a remove; craze's provider order;
 //!   the created row and its prompt; P14's start failure with its cause.
@@ -517,6 +518,64 @@ fn the_registry_request_is_pinned_by_hand() {
         {"id": "perm-1", "kind": "permission", "label": "Shell", "openedAt": "2026-01-01T00:00:00Z"}]}))
     .unwrap();
     assert_eq!(r.asks[0].id, "perm-1");
+}
+
+/// `session.set` (the settings milestone, C11), which no fixture line calls:
+/// pinned by hand against craze's closed schema (`session.set.json`) — the
+/// session and command ids, and the setting: a model or a mode by its value
+/// alone, a config option by its id and value with `forModel`, the model it
+/// was chosen for. Its answer is the confirmed value and the delta's seq.
+#[test]
+fn the_set_request_is_pinned_by_hand() {
+    use shed_core::lane::LaneSettingChange;
+    let line = |cmd: &str, change: LaneSettingChange, model: Option<&str>| {
+        let l = wire::request_line(
+            "9",
+            method::SESSION_SET,
+            &wire::SetParams {
+                session_id: "session-fake-1".into(),
+                command_id: cmd.into(),
+                setting: shed_craze::setting_for(&change, model),
+            },
+        )
+        .unwrap();
+        String::from_utf8(l).unwrap()
+    };
+    assert_eq!(
+        line(
+            "3",
+            LaneSettingChange::Config {
+                id: "effort".into(),
+                value: "low".into(),
+                for_model: Some("grok-4.6".into()),
+            },
+            Some("claude-opus-5")
+        ),
+        r#"{"jsonrpc":"2.0","id":"9","method":"session.set","params":{"sessionId":"session-fake-1","commandId":"3","setting":{"kind":"config","id":"effort","value":"low","forModel":"grok-4.6"}}}"#
+    );
+    assert_eq!(
+        line(
+            "4",
+            LaneSettingChange::Model {
+                id: "claude-opus-5".into()
+            },
+            Some("grok-4.6")
+        ),
+        r#"{"jsonrpc":"2.0","id":"9","method":"session.set","params":{"sessionId":"session-fake-1","commandId":"4","setting":{"kind":"model","value":"claude-opus-5"}}}"#
+    );
+    assert_eq!(
+        line("5", LaneSettingChange::Mode { id: "plan".into() }, None),
+        r#"{"jsonrpc":"2.0","id":"9","method":"session.set","params":{"sessionId":"session-fake-1","commandId":"5","setting":{"kind":"mode","value":"plan"}}}"#
+    );
+    // Its answer as the schema writes it.
+    let r: wire::SetResult = serde_json::from_value(json!({"value": "low", "rev": 4})).unwrap();
+    assert_eq!((r.value.as_str(), r.rev), ("low", Some(4)));
+    // `rev: 0` is craze's "confirmed, and no event will carry it" — read as
+    // 0, while an answer that does not say is no revision at all.
+    let r: wire::SetResult = serde_json::from_value(json!({"value": "low", "rev": 0})).unwrap();
+    assert_eq!(r.rev, Some(0));
+    let r: wire::SetResult = serde_json::from_value(json!({"value": "low"})).unwrap();
+    assert_eq!(r.rev, None);
 }
 
 /// A fixture conn's lines, in order.

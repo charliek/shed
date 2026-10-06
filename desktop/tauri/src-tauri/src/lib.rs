@@ -605,6 +605,43 @@ async fn lane_stop(
         .map_err(lane_error)
 }
 
+/// `lane_settings` — the session's settings, read now (plan 025 §3.10); the
+/// twin of the `lane.settings` socket op. The sheet renders the stream's copy
+/// (`lane_messages`' `settings`); this is the one-shot read.
+#[tauri::command]
+async fn lane_settings(
+    lanes: tauri::State<'_, Arc<lane::Lanes>>,
+    machine: String,
+    kind: String,
+    session_id: String,
+) -> Result<serde_json::Value, String> {
+    lanes
+        .settings(&machine, &kind, &session_id)
+        .await
+        .map_err(lane_error)
+}
+
+/// `lane_set` — change one setting (plan 025 §3.10), the twin of the
+/// `lane.set` socket op and read by the same [`lane::parse_setting`]: the
+/// settings sheet's every press. A refusal crosses with its code
+/// (`not_accepting` — craze's `stale_model` among others — or
+/// `outcome_unknown` for an answer lost to a drop, which the sheet shows "not
+/// confirmed" until the next `Settings`).
+#[tauri::command]
+async fn lane_set(
+    lanes: tauri::State<'_, Arc<lane::Lanes>>,
+    machine: String,
+    kind: String,
+    session_id: String,
+    change: serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    let change = lane::parse_setting(&change).map_err(lane_error)?;
+    lanes
+        .set(&machine, &kind, &session_id, change)
+        .await
+        .map_err(lane_error)
+}
+
 /// `lane_answer` — resolve one approval. See [`lane::parse_answer`] for the
 /// three shapes `answer` takes.
 #[tauri::command]
@@ -1294,6 +1331,8 @@ pub fn run() {
             lane_answer,
             lane_close,
             lane_stop,
+            lane_settings,
+            lane_set,
             craze_create_options,
             craze_create,
             craze_open_terminal,

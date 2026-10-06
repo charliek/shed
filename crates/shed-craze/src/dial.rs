@@ -66,6 +66,7 @@ use tokio::process::{Child, Command};
 use tokio::sync::{oneshot, watch};
 
 use crate::conn::{hello_hub, lock, Conn, HelloError, HubHello, Notifications};
+use crate::errors::craze_says;
 use crate::wire::ClientInfo;
 
 /// A boxed read half.
@@ -183,7 +184,7 @@ impl DialError {
             e @ (DialError::NotInstalled(_)
             | DialError::Unreachable(_)
             | DialError::TimedOut(_)) => LaneError::Unavailable(e.to_string()),
-            DialError::TooOld(m) | DialError::Failed(m) => LaneError::Failed(m),
+            DialError::TooOld(m) | DialError::Failed(m) => LaneError::Failed(craze_says(m)),
         }
     }
 }

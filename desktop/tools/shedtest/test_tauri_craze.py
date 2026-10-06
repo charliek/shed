@@ -25,7 +25,10 @@ lock, the session app untouched):
   (exit 1, before any hub — an unreachable machine), and `proxy` runs each NEW
   `bridge --hub` through `bridge_proxy.py`, which logs every `session.create`'s
   requestId to `creates.log` and — while `drop-creates` exists — cuts the
-  connection once the hub has the create, so its answer is lost.
+  connection once the hub has the create, so its answer is lost. The settings
+  cells (C11) use the same proxy for `session.set`: every one is logged to
+  `sets.log` (its params, so `forModel` and the commandId are on record), and
+  while `drop-sets` exists the connection that carried it is cut the same way.
 * `app_absent` — an EMPTY seam directory (craze not installed) and a
   host-installed-craze SENTINEL at `$HOME/.nix-profile/bin/craze` (an absolute
   rung the production ladder would reach and the jailed one never may).
@@ -60,6 +63,7 @@ import pytest
 import ui
 from client import ShedError, TauriClient, scaled_timeout
 from fake_host_agent import FakeHostAgent
+from fake_opencode import FakeOpencode
 from fake_roost import FakeRoost
 
 pytestmark = pytest.mark.skipif(
@@ -93,7 +97,9 @@ HELLO = {"protocols": [1], "client": {"kind": "test", "name": "shedtest"}}
 #: `drop-creates` exists, relayed with nothing relayed back from then on, given
 #: a second for the hub to take it, and then the connection is CUT: the hub has
 #: the create (and a waiter that disconnects does not cancel one), the client
-#: never sees its answer — an unknown outcome, exactly.
+#: never sees its answer — an unknown outcome, exactly. A `session.set` (C11) is
+#: the same: logged to `sets.log` with its params, and cut while `drop-sets`
+#: exists — craze runs the change, and the lane never reads its answer.
 BRIDGE_PROXY = r"""
 import json, os, subprocess, sys, threading, time
 root = os.path.dirname(os.path.abspath(__file__))
@@ -118,6 +124,10 @@ for line in sys.stdin.buffer:
         rid = (msg.get("params") or {}).get("requestId")
         with open(os.path.join(root, "creates.log"), "a") as log:
             log.write(json.dumps({"requestId": rid, "dropped": drop}) + "\n")
+    if isinstance(msg, dict) and msg.get("method") == "session.set":
+        drop = os.path.exists(os.path.join(root, "drop-sets"))
+        with open(os.path.join(root, "sets.log"), "a") as log:
+            log.write(json.dumps({"params": msg.get("params"), "dropped": drop}) + "\n")
     if drop:
         cut.set()
     child.stdin.write(line)
@@ -289,13 +299,29 @@ class CrazeEnv:
 
     def set_grok(self, agent: Path) -> None:
         """Point `[agents].grok` at `agent` (craze reads it at every create)."""
+        self.set_agents(grok=agent)
+
+    def set_agents(self, **agents: Path) -> None:
+        """Point each named `[agents].<provider>` at its agent, grok staying the
+        default provider (craze reads it at every create). Naming `cursor` makes
+        cursor READY here — so the C10 sheet cell, which asserts it is not,
+        must never see it: restore with `set_grok` once the create is done."""
+        lines = "".join(f'{p} = "{a}"\n' for p, a in agents.items())
         (self.craze_home / "config.toml").write_text(
             'provider = "grok"\nhost_idle_exit = "10m"\n\n'
-            f'[agents]\ngrok = "{agent}"\n')
+            f'[agents]\n{lines}')
+
+    def sets(self) -> list[dict]:
+        """Every `session.set` a proxied bridge carried: `{params, dropped}`,
+        in order."""
+        log = self.root / "sets.log"
+        if not log.exists():
+            return []
+        return [json.loads(line) for line in log.read_text().splitlines() if line.strip()]
 
     def switch(self, name: str, on: bool) -> None:
         """Turn one of the wrapper's switches (`outage`, `proxy`,
-        `drop-creates`) on or off."""
+        `drop-creates`, `drop-sets`) on or off."""
         flag = self.root / name
         if on:
             flag.touch()
@@ -390,11 +416,20 @@ class Bridge:
         self.notes: list[dict] = []
 
     def call(self, method: str, params: dict, timeout: float = WAIT) -> dict:
+        return self.wait(self.send(method, params), method, timeout)
+
+    def send(self, method: str, params: dict) -> int:
+        """Write one request and return its id, without waiting for the
+        answer ([`Bridge.wait`] reads it)."""
         self._next += 1
         rid = self._next
         self.proc.stdin.write((json.dumps({"jsonrpc": "2.0", "id": rid, "method": method,
                                            "params": params}) + "\n").encode())
         self.proc.stdin.flush()
+        return rid
+
+    def wait(self, rid: int, method: str, timeout: float = WAIT) -> dict:
+        """The answer to request `rid` (`method` names it in a failure)."""
         deadline = time.monotonic() + scaled_timeout(timeout)
         while time.monotonic() < deadline:
             line = self.proc.stdout.readline()
@@ -1047,6 +1082,382 @@ def test_open_in_terminal_attaches_a_tab_across_roost_snapshots(app, roost):
                    what="the row headless again")
     assert _row(app, host) is not None, "closing the attach tab only detached: the session runs on"
     assert int(tab) not in roost.tab_ids()
+
+
+# ---------------------------------------------------------------------------
+# (2c) the settings sheet (plan 025 §3.10 — C11)
+# ---------------------------------------------------------------------------
+
+#: The permodel session's starting state, cursor's own (`craze-fake-agent
+#: -script permodel`): four models, each with option catalog of its OWN.
+PERMODEL_MODELS = ["grok-4.6", "composer-2.5", "claude-opus-5", "glm-5.2"]
+#: The stale-model refusal as the sheet words it (`laneSettings.ts`).
+STALE_MODEL_TEXT = "the model changed; try again"
+
+
+def _settings(app: TauriClient) -> dict | None:
+    return app.call("lane_settings.dump")["lane_settings"]
+
+
+def _row_of(app: TauriClient, row: str) -> dict:
+    d = _settings(app) or {}
+    return next((r for r in d.get("rows", []) if r["id"] == row), {})
+
+
+def _press(app: TauriClient, row: str, value: str) -> None:
+    """Press `value` on the sheet's `row` (test-mode door) — the press a person
+    makes, through the row's own gate."""
+    app.call("ui.pick_lane_setting", {"row": row, "value": value})
+
+
+def _agent_sets(calls: Path) -> list[str]:
+    """The config sets the permodel agent was ASKED for (`<id>=<value>`), in
+    order — its own record (`CRAZE_FAKE_DUMP_CALLS`)."""
+    if not calls.exists():
+        return []
+    return [line.split(" ", 1)[1] for line in calls.read_text().splitlines()
+            if line.startswith("session/set_config_option ")]
+
+
+class SetGate:
+    """The permodel agent's set gate (`CRAZE_FAKE_SET_GATE`): while the FIFO
+    exists, each `set_config_option` waits for one byte before the agent
+    answers — so a change stays PENDING, and the engine's one-at-a-time queue
+    holds every set behind it. Absent, sets run at once."""
+
+    def __init__(self, path: Path):
+        self.path = path
+
+    def __enter__(self) -> "SetGate":
+        os.mkfifo(self.path, 0o600)
+        return self
+
+    def release(self) -> None:
+        """Let one waiting set through (a reader holds the FIFO while one
+        waits; open for writing only once it does)."""
+        deadline = time.monotonic() + scaled_timeout(WAIT)
+        while True:
+            try:
+                fd = os.open(self.path, os.O_WRONLY | os.O_NONBLOCK)
+                break
+            except OSError:
+                assert time.monotonic() < deadline, "no set is waiting at the gate"
+                time.sleep(0.05)
+        try:
+            os.write(fd, b"x")
+        finally:
+            os.close(fd)
+
+    def __exit__(self, *_exc) -> None:
+        self.path.unlink(missing_ok=True)
+
+
+@pytest.fixture(scope="module")
+def permodel(app, rig) -> dict:
+    """A craze session running cursor's per-model catalogs — `craze-fake-agent
+    -script permodel` as `cursor` (`[agents]` makes cursor ready; grok stays the
+    default and the config is restored at once, so nothing else here sees
+    cursor ready) — created through the harness's own bridge. Its lane's bridge
+    runs through the rig's proxy (`sets.log`, `drop-sets`), which stays on for
+    the settings cells. Answers `{host, calls, gate}`."""
+    calls = rig.root / "permodel-calls"
+    gate = rig.root / "set-gate"
+    agent = _write_exec(rig.root / "permodel-agent", (
+        "#!/bin/sh\n"
+        f"export CRAZE_FAKE_DUMP_CALLS='{calls}'\n"
+        f"export CRAZE_FAKE_SET_GATE='{gate}'\n"
+        f"exec '{rig.real / 'craze-fake-agent'}' -script permodel \"$@\"\n"))
+    rig.set_agents(grok=rig.grok_echo, cursor=agent)
+    b = rig.bridge()
+    try:
+        assert b.call("hello", HELLO)["endpoint"]["kind"] == "hub"
+        res = b.call("session.create", {"cwd": str(_mkdir_0700(rig.root / "w-settings")),
+                                        "provider": "cursor",
+                                        "requestId": "shedtest-settings-1"}, timeout=90)
+        host = res["session"]["hostId"]
+    finally:
+        b.close()
+        rig.set_grok(rig.grok_echo)
+    app.wait_until(lambda: _row(app, host) is not None, timeout=WAIT,
+                   what="the permodel session's craze row")
+    rig.switch("proxy", True)
+    try:
+        yield {"host": host, "calls": calls, "gate": gate}
+    finally:
+        rig.switch("proxy", False)
+
+
+def _sheet_open(app: TauriClient, host: str) -> dict:
+    """`ui.show_lane_settings` on `host`, then the sheet's first report."""
+    app.call("ui.show_lane_settings", {"machine": LOCAL, "kind": KIND, "session_id": host})
+    app.wait_until(lambda: bool((d := _settings(app)) and d["session_id"] == host and d["rows"]),
+                   timeout=WAIT, what="the settings sheet to open and report its rows")
+    return _settings(app)
+
+
+def test_the_chip_and_sheet_render_crazes_settings(app, permodel):
+    """**The chip and the sheet render the session's settings** (plan 025
+    §3.10): the transcript header's chip reads `<model> · <effort> · fast` from
+    the CURRENT values; the sheet lists the model (a list, craze's order), the
+    current model's options — the model and mode rows excluded, each ≤ 4 values
+    a segmented control — and the mode; no context meter (an ACP session
+    reports no usage)."""
+    host = permodel["host"]
+    _ready(app, host)
+    _panel(app, host)
+    app.wait_until(lambda: (_dump(app) or {}).get("settings_chip") == "Grok 4.6 · High · fast",
+                   timeout=WAIT, what="the header's settings chip")
+    d = _sheet_open(app, host)
+    assert d["chip"] == "Grok 4.6 · High · fast", d
+    rows = {r["id"]: r for r in d["rows"]}
+    assert [r["id"] for r in d["rows"]] == ["model", "effort", "fast", "mode"], d["rows"]
+    assert rows["model"]["control"] == "list"
+    assert [v["id"] for v in rows["model"]["values"]] == PERMODEL_MODELS
+    assert rows["model"]["current"] == "grok-4.6"
+    assert rows["effort"]["control"] == "segmented" and rows["effort"]["current"] == "high"
+    assert [v["name"] for v in rows["effort"]["values"]] == ["Low", "Medium", "High", "Extra High"]
+    assert rows["fast"]["control"] == "segmented" and rows["fast"]["current"] == "true"
+    assert rows["mode"]["control"] == "segmented"
+    assert [v["id"] for v in rows["mode"]["values"]] == ["agent", "plan", "ask"]
+    assert all(r["state"] is None and r["enabled"] for r in d["rows"]), d["rows"]
+    assert d["usage"] is None, "an ACP session reports no usage: no context meter"
+    _shot(app, "craze-settings-sheet.png")
+
+
+def test_a_model_change_is_pending_then_redraws_the_options(app, rig, permodel):
+    """**A press applies at once and the sheet re-renders from the next
+    `Settings`** (plan 025 §3.10): with the agent holding its answer, the model
+    row reads PENDING (and takes no other press); once it answers, the sheet
+    redraws claude-opus-5's OWN options — thinking and effort (thought_level)
+    before context and fast (model_config), effort now five values and so a
+    list. An option change and a mode change come back the same way."""
+    host = permodel["host"]
+    _sheet_open(app, host)
+    with SetGate(permodel["gate"]) as gate:
+        _press(app, "model", "claude-opus-5")
+        app.wait_until(lambda: _row_of(app, "model").get("state") == "pending", timeout=WAIT,
+                       what="the model row pending")
+        row = _row_of(app, "model")
+        assert row["text"] == "applying…" and row["enabled"] is False, row
+        assert row["current"] == "grok-4.6", "no optimistic value while pending"
+        _shot(app, "craze-settings-pending.png")
+        gate.release()
+        app.wait_until(lambda: _row_of(app, "model").get("current") == "claude-opus-5",
+                       timeout=WAIT, what="the model change in the sheet")
+    app.wait_until(lambda: _row_of(app, "model").get("state") is None, timeout=WAIT,
+                   what="the model row settled")
+    d = _settings(app)
+    assert [r["id"] for r in d["rows"]] == ["model", "thinking", "effort", "context", "fast", "mode"], d["rows"]
+    effort = _row_of(app, "effort")
+    assert effort["control"] == "list" and len(effort["values"]) == 5, effort
+    assert [v["id"] for v in _row_of(app, "model")["values"]][0] == "claude-opus-5", \
+        "the current model first"
+    assert d["chip"] == "Claude Opus 5 · High", "fast is off on claude-opus-5: the chip says nothing of it"
+    _shot(app, "craze-settings-model-changed.png")
+
+    _press(app, "effort", "low")
+    app.wait_until(lambda: _row_of(app, "effort").get("current") == "low", timeout=WAIT,
+                   what="the option change")
+    _press(app, "mode", "plan")
+    app.wait_until(lambda: _row_of(app, "mode").get("current") == "plan", timeout=WAIT,
+                   what="the mode change")
+    assert _settings(app)["chip"] == "Claude Opus 5 · Low"
+    sets = [e["params"]["setting"] for e in rig.sets()]
+    assert {"kind": "config", "id": "effort", "value": "low", "forModel": "claude-opus-5"} in sets, sets
+    assert {"kind": "mode", "value": "plan"} in sets, sets
+
+
+def test_a_stale_model_is_refused_inline_and_the_retry_is_a_new_command(app, rig, permodel):
+    """**`stale_model`, inline** (plan 025 §3.10): a second client moves the
+    session back to grok-4.6 while the agent holds that change; the sheet's
+    effort press — chosen on claude-opus-5, and bound to it (`forModel`) —
+    queues behind it, and once the move lands craze refuses it `stale_model`:
+    the effort row says "the model changed; try again" and the sheet shows
+    grok-4.6's options. The change never reached the agent. The retry is a NEW
+    command, bound to grok-4.6, and takes."""
+    host = permodel["host"]
+    calls = permodel["calls"]
+    _sheet_open(app, host)
+    assert _row_of(app, "model").get("current") == "claude-opus-5"
+    other = rig.bridge()
+    try:
+        assert other.call("hello", HELLO)["endpoint"]["kind"] == "hub"
+        other.call("session.connect", {"sessionId": host})
+        other.call("hello", HELLO)
+        sid = other.call("sessions.list", {})["sessions"][0]["sessionId"]
+        with SetGate(permodel["gate"]) as gate:
+            moved = other.send("session.set", {"sessionId": sid, "commandId": "1",
+                                               "setting": {"kind": "model", "value": "grok-4.6"}})
+            app.wait_until(lambda: _agent_sets(calls)[-1:] == ["model=grok-4.6"], timeout=WAIT,
+                           what="the other client's move at the agent")
+            before = len(rig.sets())
+            _press(app, "effort", "max")
+            app.wait_until(lambda: len(rig.sets()) > before, timeout=WAIT,
+                           what="the sheet's change on the wire")
+            chosen = rig.sets()[-1]["params"]
+            assert chosen["setting"] == {"kind": "config", "id": "effort", "value": "max",
+                                         "forModel": "claude-opus-5"}, chosen
+            assert _row_of(app, "effort").get("state") == "pending"
+            # Let the change reach craze's queue behind the held move.
+            time.sleep(scaled_timeout(0.5))
+            gate.release()
+            app.wait_until(lambda: _row_of(app, "effort").get("state") == "refused", timeout=WAIT,
+                           what="the stale_model refusal on the effort row")
+        assert other.wait(moved, "session.set")["value"] == "grok-4.6"
+    finally:
+        other.close()
+    row = _row_of(app, "effort")
+    assert row["text"] == STALE_MODEL_TEXT, row
+    assert _row_of(app, "model")["current"] == "grok-4.6", "the sheet redrew the session's model"
+    assert [r["id"] for r in _settings(app)["rows"]] == ["model", "effort", "fast", "mode"]
+    assert "effort=max" not in _agent_sets(calls), "a change chosen for another model reached the agent"
+    _shot(app, "craze-settings-stale-model.png")
+
+    _press(app, "effort", "medium")
+    app.wait_until(lambda: _row_of(app, "effort").get("current") == "medium", timeout=WAIT,
+                   what="the retry taking")
+    assert _row_of(app, "effort")["state"] is None
+    retry = rig.sets()[-1]["params"]
+    assert retry["setting"]["forModel"] == "grok-4.6", retry
+    assert retry["commandId"] != chosen["commandId"], "the retry is a NEW command"
+
+
+def _other_client(rig: CrazeEnv, host: str) -> tuple["Bridge", str]:
+    """A second client of `host`'s session — the rig's own `craze bridge
+    --hub`, spliced to the host — and the craze session id it speaks for."""
+    other = rig.bridge()
+    assert other.call("hello", HELLO)["endpoint"]["kind"] == "hub"
+    other.call("session.connect", {"sessionId": host})
+    other.call("hello", HELLO)
+    return other, other.call("sessions.list", {})["sessions"][0]["sessionId"]
+
+
+def test_an_option_is_bound_to_the_model_the_sheet_displayed(app, rig, permodel):
+    """**The model the sheet DISPLAYED binds an option** (plan 025 Amendment
+    A13): a second client moves the session to composer-2.5 and the lane FOLDS
+    it (`lane.messages` says composer-2.5), while the sheet still shows
+    grok-4.6 (the panel's view held, `ui.hold_lane_view` — the frame between
+    the adapter folding a change and the panel rendering it). The fast press —
+    an option composer-2.5 also has — goes out bound to grok-4.6, and craze
+    refuses it `stale_model`, inline on its row, rather than apply it to
+    composer-2.5. It never reaches the agent. Released, the sheet shows
+    composer-2.5; the session is moved back to grok-4.6 for the next cell."""
+    host = permodel["host"]
+    calls = permodel["calls"]
+    target = {"machine": LOCAL, "kind": KIND, "session_id": host}
+    _sheet_open(app, host)
+    assert _row_of(app, "model").get("current") == "grok-4.6"
+    assert _row_of(app, "fast").get("current") == "true"
+    other, sid = _other_client(rig, host)
+    try:
+        app.call("ui.hold_lane_view", {"hold": True})
+        try:
+            other.call("session.set", {"sessionId": sid, "commandId": "1",
+                                       "setting": {"kind": "model", "value": "composer-2.5"}})
+            app.wait_until(lambda: (app.call("lane.messages", target).get("settings") or {})
+                           .get("model") == "composer-2.5",
+                           timeout=WAIT, what="the move folded by the lane")
+            assert _row_of(app, "model")["current"] == "grok-4.6", "the sheet still shows grok-4.6"
+            before = len(rig.sets())
+            _press(app, "fast", "false")
+            app.wait_until(lambda: _row_of(app, "fast").get("state") == "refused", timeout=WAIT,
+                           what="the stale_model refusal on the fast row")
+            assert _row_of(app, "fast")["text"] == STALE_MODEL_TEXT
+            sent = rig.sets()[before:]
+            assert len(sent) == 1, sent
+            assert sent[0]["params"]["setting"] == {"kind": "config", "id": "fast", "value": "false",
+                                                    "forModel": "grok-4.6"}, sent
+            assert "fast=false" not in _agent_sets(calls), "an option chosen on grok-4.6 reached composer-2.5"
+            _shot(app, "craze-settings-displayed-model.png")
+        finally:
+            app.call("ui.hold_lane_view", {"hold": False})
+        app.wait_until(lambda: _row_of(app, "model").get("current") == "composer-2.5", timeout=WAIT,
+                       what="the sheet, released, showing the move")
+        other.call("session.set", {"sessionId": sid, "commandId": "2",
+                                   "setting": {"kind": "model", "value": "grok-4.6"}})
+        app.wait_until(lambda: _row_of(app, "model").get("current") == "grok-4.6", timeout=WAIT,
+                       what="the session back on grok-4.6")
+    finally:
+        other.close()
+
+
+def test_a_change_lost_to_a_drop_is_not_confirmed_until_the_next_settings(app, rig, permodel):
+    """**A lost answer is "not confirmed", never resent** (plan 025 §3.10): the
+    lane's bridge is cut once craze has the fast change (and the redial fails a
+    while — this machine's craze unreachable), so the fast row reads "not
+    confirmed", still showing the old value; when craze is back the lane
+    resumes, and its next `Settings` — the change DID run — replaces the mark
+    with the real value. The agent was asked once, and the wire carried it
+    once."""
+    host = permodel["host"]
+    calls = permodel["calls"]
+    _sheet_open(app, host)
+    assert _row_of(app, "fast").get("current") == "true"
+    before = len(rig.sets())
+    rig.switch("outage", True)
+    rig.switch("drop-sets", True)
+    try:
+        _press(app, "fast", "false")
+        app.wait_until(lambda: _row_of(app, "fast").get("state") == "not_confirmed", timeout=WAIT,
+                       what="the fast row not confirmed")
+        row = _row_of(app, "fast")
+        assert row["current"] == "true", "the old value until the session says otherwise"
+        assert row["text"].startswith("not confirmed"), row
+        app.wait_until(lambda: bool((_dump(app) or {}).get("stale")), timeout=WAIT,
+                       what="the panel to say the lane is reconnecting")
+        assert _row_of(app, "fast").get("state") == "not_confirmed", "still not confirmed"
+        assert "fast=false" in _agent_sets(calls), "craze ran the change"
+        _shot(app, "craze-settings-not-confirmed.png")
+    finally:
+        rig.switch("drop-sets", False)
+        rig.switch("outage", False)
+    app.wait_until(lambda: _row_of(app, "fast").get("state") is None
+                   and _row_of(app, "fast").get("current") == "false",
+                   timeout=WAIT * 2, what="the resume's Settings replacing the mark")
+    time.sleep(scaled_timeout(1.0))
+    sent = [e for e in rig.sets()[before:] if e["params"]["setting"].get("id") == "fast"]
+    assert len(sent) == 1 and sent[0]["dropped"] is True, f"never resent: {sent}"
+    assert _agent_sets(calls).count("fast=false") == 1, _agent_sets(calls)
+    app.call("ui.close_lane_settings")
+    app.wait_until(lambda: _settings(app) is None, timeout=20, what="the sheet to close")
+    assert (_dump(app) or {}).get("settings_chip"), "closing the sheet leaves the chip"
+    _unmount(app)
+
+
+def test_no_settings_where_the_capabilities_say_none(app, roost):
+    """**Hidden, never disabled** (plan 025 §3.10): an opencode lane on this
+    machine — its capabilities say `settings: false` — gets no chip, and
+    `ui.show_lane_settings` opens its transcript and NO sheet."""
+    session = "ses_settingless"
+    tab = 90
+    oc = FakeOpencode()
+    oc.add_session(session, title="no settings here", directory="/home/shed/oc")
+    oc.set_simple_transcript(session, "a question", "an answer")
+    oc.set_status(session, "idle")
+    try:
+        roost.add_tab(tab, cwd="/home/shed/oc", title="oc", source="opencode", session_id=session,
+                      lifecycle="working", detail="session_status", shell_state="unknown",
+                      metadata={"server_url": oc.base_url})
+        app.wait_until(lambda: any((r.get("agent_lane") or {}).get("session_id") == session
+                                   for r in _rows(app)),
+                       timeout=WAIT, what="the opencode row's lane stamp")
+        target = {"machine": LOCAL, "kind": "opencode", "session_id": session}
+        app.call("lane.open", target)
+        app.call("ui.show_lane_settings", target)
+        app.wait_until(lambda: bool((d := _dump(app)) and d["session_id"] == session
+                                    and d["kind"] == "opencode" and d["generation"] >= 1),
+                       timeout=WAIT, what="the opencode transcript, seeded")
+        caps = app.call("lane.messages", target)["capabilities"]
+        assert caps["settings"] is False, caps
+        assert _dump(app)["settings_chip"] is None, "no chip"
+        time.sleep(scaled_timeout(0.5))
+        assert _settings(app) is None, "no sheet, even when asked for"
+        _shot(app, "craze-settings-none.png")
+        _unmount(app)
+    finally:
+        app.call("machine.kill", {"machine": LOCAL, "slug": str(tab)})
+        app.wait_until(lambda: tab not in roost.tab_ids(), timeout=WAIT, what="the opencode tab gone")
+        oc.stop()
 
 
 # ---------------------------------------------------------------------------

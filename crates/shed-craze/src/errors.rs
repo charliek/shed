@@ -19,14 +19,37 @@
 //! A code this build does not know (or a refusal with no `data.code` at all)
 //! is [`LaneError::Failed`] with the message — the contract's rule that an
 //! unknown code is `Failed`'s job.
+//!
+//! **craze's words never wear shed's "outcome unknown"**: a client keeps a
+//! create's request id, and the desktop shows a change "not confirmed", only
+//! on [`is_outcome_unknown`] — which reads a `Failed`'s text prefix, because
+//! the contract's `LaneError` has no variant for it. So every text craze (or
+//! the far side of a dial) wrote that becomes a message here goes through
+//! [`craze_says`], which escapes one that happens to begin with that prefix:
+//! only shed's own [`outcome_unknown`] carries it.
 
 use shed_core::lane::LaneError;
 
 use crate::wire::{code, reason, RpcError};
 
+/// craze's own text (a refusal's message, a start failure's cause, a refused
+/// `hello`'s or `session.connect`'s words) as a [`LaneError`]'s message:
+/// verbatim — unless it begins with shed's [`OUTCOME_UNKNOWN`], which marks a
+/// request whose answer was LOST and is never a definite answer's, so it is
+/// said as craze's (`craze: outcome unknown: …`) and [`is_outcome_unknown`]
+/// cannot mistake it for one.
+pub fn craze_says(text: impl Into<String>) -> String {
+    let text = text.into();
+    if text.starts_with(OUTCOME_UNKNOWN) {
+        format!("craze: {text}")
+    } else {
+        text
+    }
+}
+
 /// The table, verbatim: one craze `data.code` → one [`LaneError`].
 pub fn lane_error(e: &RpcError) -> LaneError {
-    let text = e.text();
+    let text = craze_says(e.text());
     match e.data_code.as_deref() {
         Some(code::BAD_REQUEST | code::STALE_VERSION | code::STALE_TURN) => {
             LaneError::BadRequest(text)
@@ -75,7 +98,7 @@ pub fn create_error(e: &RpcError) -> LaneError {
     let start_failed = e.data_code.as_deref() == Some(code::NOT_ACCEPTING)
         && e.reason.as_deref() == Some(reason::START_FAILED);
     if start_failed {
-        return LaneError::Failed(start_failed_cause(e.cause.as_deref()).to_string());
+        return LaneError::Failed(craze_says(start_failed_cause(e.cause.as_deref())));
     }
     lane_error(e)
 }
@@ -228,5 +251,30 @@ mod tests {
         assert!(!is_outcome_unknown(&LaneError::Unavailable(
             "outcome unknown: no".into()
         )));
+    }
+
+    /// **craze's words never wear shed's "outcome unknown"** (C11 review): a
+    /// DEFINITE craze failure whose message happens to begin with the prefix
+    /// — a refusal, and a create's start-failure cause — is said as craze's,
+    /// so [`is_outcome_unknown`] (a create keeping its id, the desktop's "not
+    /// confirmed") never takes it for a lost answer. Any other text is
+    /// untouched.
+    #[test]
+    fn a_craze_message_never_reads_as_outcome_unknown() {
+        let failed = RpcError::from_value(
+            &json!({"code": -32000, "message": "outcome unknown: x", "data": {"code": "failed", "reason": "failed"}}),
+        );
+        let e = lane_error(&failed);
+        assert_eq!(e, LaneError::Failed("craze: outcome unknown: x".into()));
+        assert!(
+            !is_outcome_unknown(&e),
+            "a definite failure, not a lost answer"
+        );
+        let start = RpcError::from_value(
+            &json!({"code": -32000, "message": "m", "data": {"code": "not_accepting",
+                    "reason": "start_failed", "cause": "outcome unknown: the agent said so"}}),
+        );
+        assert!(!is_outcome_unknown(&create_error(&start)));
+        assert_eq!(craze_says("craze says failed"), "craze says failed");
     }
 }

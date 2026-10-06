@@ -10,7 +10,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { laneVerbs } from "../dist-test/laneVerbs.js";
+import { SEND_OUTCOME_UNKNOWN, laneVerbs, sendFailureText } from "../dist-test/laneVerbs.js";
 
 const caps = (cancel, interject) => ({ cancel, interject });
 
@@ -42,4 +42,15 @@ test("before the first seed's capabilities arrive, neither button exists", () =>
     assert.deepEqual(verbs.cancel, { shown: false, enabled: false });
     assert.deepEqual(verbs.interject, { shown: false, enabled: false });
   }
+});
+
+test("CONTROL: a Send whose answer was lost says to check the transcript before sending again", () => {
+  assert.equal(
+    sendFailureText({ code: "outcome_unknown", message: "outcome unknown: the connection to craze dropped; check the transcript" }),
+    "outcome unknown: the connection to craze dropped; check the transcript before sending again",
+  );
+  assert.equal(SEND_OUTCOME_UNKNOWN.startsWith("outcome unknown: "), true);
+  // Any other failure is shown in its own words.
+  assert.equal(sendFailureText({ code: "not_accepting", message: "the session is not accepting that right now" }),
+               "the session is not accepting that right now");
 });

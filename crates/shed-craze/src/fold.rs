@@ -746,10 +746,19 @@ impl CrazeFold {
     }
 
     /// An info document's catalogs (an attach reply's, a `ready`
-    /// notification's), under the revision rule.
+    /// notification's), under the revision rule, and its capabilities'
+    /// say on modes ([`SettingsState::apply_info`]).
     pub fn apply_info(&mut self, info: &SessionInfo) {
-        self.settings.apply_catalogs(&info.catalogs);
+        self.settings.apply_info(info);
         self.cards = Cards::of(&info.capabilities);
+    }
+
+    /// A `session.set` craze confirmed at `rev: 0` — no `meta` delta will
+    /// carry it — applied to the settings
+    /// ([`SettingsState::apply_confirmed`]). Whether they changed.
+    pub fn apply_confirmed(&mut self, s: &crate::wire::Setting) -> bool {
+        self.settings
+            .apply_confirmed(s.kind, s.id.as_deref(), &s.value)
     }
 
     /// The cards the session exposes — before a [`CrazeFold::restore`], so a

@@ -16,7 +16,7 @@ use std::time::Duration;
 use common::*;
 use serde_json::{json, Value};
 use shed_core::lane::conformance::LaneChecker;
-use shed_core::lane::{AgentLane, LaneAnswer, LaneError, LaneEvent, SendMode};
+use shed_core::lane::{AgentLane, LaneAnswer, LaneError, LaneEvent, LaneSettingChange, SendMode};
 use shed_core::rc::RcActivity;
 use shed_craze::testing::{
     ask_record, attach_result, host_session_row, session_info, snapshot_at, SCRIPT_WAIT,
@@ -2042,4 +2042,457 @@ async fn a_session_with_no_cards_still_advertises_and_answers_approvals() {
     assert_eq!(req["params"]["askId"], "perm-1");
     hub.reply(&req, json!({})).await;
     answer.await.unwrap().unwrap();
+}
+
+// ---- the settings milestone (plan 025 §3.10, C11) ----
+
+/// The last `Settings` among `frames`.
+fn last_settings(frames: &[LaneEvent]) -> Option<shed_core::lane::LaneSettings> {
+    frames.iter().rev().find_map(|e| match e {
+        LaneEvent::Settings { settings } => Some(settings.clone()),
+        _ => None,
+    })
+}
+
+fn is_settings(e: &LaneEvent) -> bool {
+    matches!(e, LaneEvent::Settings { .. })
+}
+
+/// The effort option's current value in `s`.
+fn effort(s: &shed_core::lane::LaneSettings) -> Option<String> {
+    s.options
+        .iter()
+        .find(|o| o.id == "effort")
+        .map(|o| o.current.clone())
+}
+
+/// A `meta` delta setting the effort option (the WIRE/01 option, `current`
+/// as given) — what craze writes ahead of a config set's reply.
+fn effort_delta(current: &str) -> Value {
+    json!({"type": "meta", "state": {"config": {"options": [
+        {"id": "effort", "name": "Effort", "category": "thought_level", "type": "select", "current": current,
+         "selectValues": [{"value": "low", "name": "Low"}, {"value": "medium", "name": "Medium"}, {"value": "high", "name": "High"}]}]}}})
+}
+
+/// **`set` is `session.set`, bound to the model the lane shows** (plan 025
+/// §3.10): each change a fresh commandId on the lane's connection; a config
+/// change carries `forModel` — the model as the lane last folded it, so after
+/// a model change the NEXT config change is bound to the new one; the `meta`
+/// delta ahead of the reply is what re-emits `Settings`. A refusal maps
+/// through the table (`stale_model` → `NotAccepting`), and the retry is a NEW
+/// commandId.
+#[tokio::test]
+async fn set_is_session_set_bound_to_the_model_the_lane_shows() {
+    let (_dial, mut conns, lane) = scripted(fast());
+    let lane = Arc::new(lane);
+    let (mut rx, _stop) = subscribed(&lane).await;
+    let (mut hub, _) = seed_conn(&mut conns, SUB, 1, json!({})).await;
+    hub.synchronized(SUB, 1).await;
+    let mut checker = LaneChecker::new();
+    let seed = drive(&mut rx, &mut checker, "the seed", is_ready).await;
+    let s = last_settings(&seed).expect("the seed's Settings");
+    assert_eq!(s.model.as_deref(), Some("grok"));
+
+    let set = |change: LaneSettingChange| {
+        let l = Arc::clone(&lane);
+        tokio::spawn(async move { l.set(change).await })
+    };
+    let command_id = |req: &Value| -> u64 {
+        req["params"]["commandId"]
+            .as_str()
+            .and_then(|c| c.parse().ok())
+            .unwrap_or_else(|| panic!("a canonical commandId: {req}"))
+    };
+
+    // A config change, bound to the model the lane shows.
+    let pending = set(LaneSettingChange::Config {
+        id: "effort".into(),
+        value: "high".into(),
+        for_model: None,
+    });
+    let req = hub.expect("session.set").await;
+    assert_eq!(req["params"]["sessionId"], SID);
+    assert_eq!(
+        req["params"]["setting"],
+        json!({"kind": "config", "id": "effort", "value": "high", "forModel": "grok"})
+    );
+    let first = command_id(&req);
+    hub.event(SUB, 2, effort_delta("high")).await;
+    hub.reply(&req, json!({"value": "high", "rev": 2})).await;
+    pending.await.unwrap().unwrap();
+    let f = drive(&mut rx, &mut checker, "the delta's Settings", is_settings).await;
+    assert_eq!(effort(&last_settings(&f).unwrap()).as_deref(), Some("high"));
+
+    // A model change: its id alone.
+    let pending = set(LaneSettingChange::Model { id: "fast".into() });
+    let req = hub.expect("session.set").await;
+    assert_eq!(
+        req["params"]["setting"],
+        json!({"kind": "model", "value": "fast"})
+    );
+    let second = command_id(&req);
+    assert!(second > first, "a fresh commandId: {first} then {second}");
+    hub.event(SUB, 3, json!({"type": "meta", "state": {"model": "fast"}}))
+        .await;
+    hub.reply(&req, json!({"value": "fast", "rev": 3})).await;
+    pending.await.unwrap().unwrap();
+    let f = drive(&mut rx, &mut checker, "the model's Settings", is_settings).await;
+    assert_eq!(last_settings(&f).unwrap().model.as_deref(), Some("fast"));
+
+    // The next config change is bound to the model the lane now shows — and
+    // craze, which has moved on again, refuses it `stale_model`.
+    let pending = set(LaneSettingChange::Config {
+        id: "effort".into(),
+        value: "low".into(),
+        for_model: None,
+    });
+    let req = hub.expect("session.set").await;
+    assert_eq!(req["params"]["setting"]["forModel"], "fast");
+    let third = command_id(&req);
+    hub.refuse(&req, "stale_model", "stale_model", json!({}))
+        .await;
+    let refused = pending.await.unwrap();
+    assert_eq!(
+        refused,
+        Err(LaneError::NotAccepting),
+        "the table's stale_model"
+    );
+
+    // The retry is a NEW command.
+    let pending = set(LaneSettingChange::Config {
+        id: "effort".into(),
+        value: "low".into(),
+        for_model: None,
+    });
+    let req = hub.expect("session.set").await;
+    assert!(
+        command_id(&req) > third,
+        "a retry never reuses the refused id"
+    );
+    hub.event(SUB, 4, effort_delta("low")).await;
+    hub.reply(&req, json!({"value": "low", "rev": 4})).await;
+    pending.await.unwrap().unwrap();
+
+    // A mode change: its id alone.
+    let pending = set(LaneSettingChange::Mode { id: "plan".into() });
+    let req = hub.expect("session.set").await;
+    assert_eq!(
+        req["params"]["setting"],
+        json!({"kind": "mode", "value": "plan"})
+    );
+    hub.refuse(&req, "unsupported", "unsupported", json!({}))
+        .await;
+    assert!(
+        matches!(pending.await.unwrap(), Err(LaneError::Failed(_))),
+        "unsupported is Failed (the table)"
+    );
+}
+
+/// **A set lost to a drop is never resent, and the resume restates the
+/// settings** (plan 025 §3.10): the reply lost with the connection is "outcome
+/// unknown"; the resume's connection carries the attach and no `session.set`;
+/// and before its lone `Ready` the resume says `Settings` — changed or not —
+/// so a client showing the change "not confirmed" has the real value to
+/// replace it with.
+#[tokio::test]
+async fn a_set_lost_to_a_drop_is_never_resent_and_the_resume_restates_the_settings() {
+    let (_dial, mut conns, lane) = scripted(fast());
+    let lane = Arc::new(lane);
+    let (mut rx, _stop) = subscribed(&lane).await;
+    let (mut hub, _) = seed_conn(&mut conns, SUB, 1, json!({})).await;
+    hub.synchronized(SUB, 1).await;
+    let mut checker = LaneChecker::new();
+    drive(&mut rx, &mut checker, "the seed", is_ready).await;
+    let l = Arc::clone(&lane);
+    let set = tokio::spawn(async move {
+        l.set(LaneSettingChange::Config {
+            id: "effort".into(),
+            value: "high".into(),
+            for_model: None,
+        })
+        .await
+    });
+    hub.expect("session.set").await;
+    hub.close().await;
+    let got = set.await.unwrap().unwrap_err();
+    assert!(is_outcome_unknown(&got), "{got:?}");
+    drive(&mut rx, &mut checker, "Stale", |e| {
+        matches!(e, LaneEvent::Stale { .. })
+    })
+    .await;
+
+    let mut hub = next_conn(&mut conns).await;
+    hub.splice(HOST).await;
+    hub.listed(row()).await;
+    hub.attached(attach_result("s-2", &info(false), (INC, 1), None, None))
+        .await;
+    hub.synchronized("s-2", 1).await;
+    let resumed = drive(&mut rx, &mut checker, "the lone Ready", is_ready).await;
+    assert!(resets(&resumed).is_empty(), "a silent resume: {resumed:#?}");
+    let restated = last_settings(&resumed).expect("the resume restates the settings");
+    assert_eq!(
+        effort(&restated).as_deref(),
+        Some("medium"),
+        "the change did not take: the real value, unchanged"
+    );
+    assert!(
+        hub.recv_within(Duration::from_millis(300)).await.is_none(),
+        "the set was resent"
+    );
+}
+
+/// **craze's model order, on the stream** (plan 025 §3.10; PM "The session
+/// info document"): the current model first, the remembered ones by `recent`
+/// ascending, then the rest in the catalog's order — whatever order the
+/// catalog lists them in.
+#[tokio::test]
+async fn the_models_are_ordered_current_then_by_rank_then_catalog() {
+    let (_dial, mut conns, lane) = scripted(fast());
+    let (mut rx, _stop) = subscribed(&lane).await;
+    let mut i = info(false);
+    i["catalogs"]["models"] = json!([
+        {"id": "x", "name": "X"},
+        {"id": "fireworks/kimi-k3", "name": "Kimi K3 (Fireworks)", "recent": 2},
+        {"id": "cur", "name": "Current"},
+        {"id": "muse-spark-1.3-contributor", "name": "Muse Spark 1.3 Contributor (Meta)", "recent": 1},
+        {"id": "y", "name": "Y"}
+    ]);
+    let mut snap = snapshot_at(INC, 1, json!({}));
+    snap["settings"]["model"] = json!("cur");
+    let mut hub = next_conn(&mut conns).await;
+    hub.splice(HOST).await;
+    hub.listed(host_session_row(&i, json!({}))).await;
+    hub.attached(attach_result(SUB, &i, (INC, 1), Some(snap), None))
+        .await;
+    hub.synchronized(SUB, 1).await;
+    let mut checker = LaneChecker::new();
+    let seed = drive(&mut rx, &mut checker, "the seed", is_ready).await;
+    let order: Vec<String> = last_settings(&seed)
+        .unwrap()
+        .models
+        .into_iter()
+        .map(|m| m.id)
+        .collect();
+    assert_eq!(
+        order,
+        [
+            "cur",
+            "muse-spark-1.3-contributor",
+            "fireworks/kimi-k3",
+            "x",
+            "y"
+        ]
+    );
+}
+
+/// **A catalog is applied only at an equal or higher revision** (plan 025
+/// §3.10; PM "Live models"), on the stream: a `catalog` delta at revision 2
+/// re-emits `Settings`; one at revision 1 — older than the list held — draws
+/// nothing; revision 3 is applied again.
+#[tokio::test]
+async fn a_catalog_below_the_held_revision_is_never_applied() {
+    let (_dial, mut conns, lane) = scripted(fast());
+    let (mut rx, _stop) = subscribed(&lane).await;
+    let (mut hub, _) = seed_conn(&mut conns, SUB, 1, json!({})).await;
+    hub.synchronized(SUB, 1).await;
+    let mut checker = LaneChecker::new();
+    drive(&mut rx, &mut checker, "the seed", is_ready).await;
+    let catalog = |seq: u64, ids: &[&str], revision: u64| {
+        let models: Vec<Value> = ids
+            .iter()
+            .map(|id| json!({"id": id, "name": id.to_uppercase()}))
+            .collect();
+        (
+            seq,
+            json!({"type": "meta", "state": {"catalog": {"models": models, "revision": revision}}}),
+        )
+    };
+    let ids = |s: &shed_core::lane::LaneSettings| -> Vec<String> {
+        s.models.iter().map(|m| m.id.clone()).collect()
+    };
+
+    let (seq, ev) = catalog(2, &["grok", "k3"], 2);
+    hub.event(SUB, seq, ev).await;
+    let f = drive(&mut rx, &mut checker, "revision 2", is_settings).await;
+    assert_eq!(ids(&last_settings(&f).unwrap()), ["grok", "k3"]);
+
+    // Older than the list held: ignored. A text event after it is the marker
+    // that the stream moved on with no `Settings` from it.
+    let (seq, ev) = catalog(3, &["grok", "old"], 1);
+    hub.event(SUB, seq, ev).await;
+    hub.event(SUB, 4, text("after the old catalog")).await;
+    hub.event(SUB, 5, json!({"type": "done", "stopReason": "end_turn"}))
+        .await;
+    let f = drive(&mut rx, &mut checker, "the marker", |e| {
+        matches!(e, LaneEvent::Message { message, .. }
+            if message.text.as_deref() == Some("after the old catalog"))
+    })
+    .await;
+    assert!(
+        last_settings(&f).is_none(),
+        "a lower revision brought a list back: {f:#?}"
+    );
+
+    let (seq, ev) = catalog(6, &["grok", "k4"], 3);
+    hub.event(SUB, seq, ev).await;
+    let f = drive(&mut rx, &mut checker, "revision 3", is_settings).await;
+    assert_eq!(ids(&last_settings(&f).unwrap()), ["grok", "k4"]);
+}
+
+/// **The model the client DISPLAYED binds a config change** (Amendment A13):
+/// the lane's fold has already seen the session move to `fast`, but the client
+/// still shows `grok` and chose the option there — the change goes out bound
+/// to `grok`, and craze's `stale_model` refusal (`NotAccepting`) is what the
+/// client hears, rather than the option being applied to `fast`. A change the
+/// client sent no model with is bound to the fold's.
+#[tokio::test]
+async fn the_model_the_client_displayed_binds_a_config_change() {
+    let (_dial, mut conns, lane) = scripted(fast());
+    let lane = Arc::new(lane);
+    let (mut rx, _stop) = subscribed(&lane).await;
+    let (mut hub, _) = seed_conn(&mut conns, SUB, 1, json!({})).await;
+    hub.synchronized(SUB, 1).await;
+    let mut checker = LaneChecker::new();
+    drive(&mut rx, &mut checker, "the seed", is_ready).await;
+    hub.event(SUB, 2, json!({"type": "meta", "state": {"model": "fast"}}))
+        .await;
+    let f = drive(&mut rx, &mut checker, "the move, folded", is_settings).await;
+    assert_eq!(last_settings(&f).unwrap().model.as_deref(), Some("fast"));
+
+    let l = Arc::clone(&lane);
+    let chosen_on_grok = tokio::spawn(async move {
+        l.set(LaneSettingChange::Config {
+            id: "effort".into(),
+            value: "high".into(),
+            for_model: Some("grok".into()),
+        })
+        .await
+    });
+    let req = hub.expect("session.set").await;
+    assert_eq!(
+        req["params"]["setting"]["forModel"], "grok",
+        "the model the client displayed, not the fold's"
+    );
+    hub.refuse(&req, "stale_model", "stale_model", json!({}))
+        .await;
+    assert_eq!(chosen_on_grok.await.unwrap(), Err(LaneError::NotAccepting));
+
+    let l = Arc::clone(&lane);
+    let unbound = tokio::spawn(async move {
+        l.set(LaneSettingChange::Config {
+            id: "effort".into(),
+            value: "high".into(),
+            for_model: None,
+        })
+        .await
+    });
+    let req = hub.expect("session.set").await;
+    assert_eq!(req["params"]["setting"]["forModel"], "fast", "the fold's");
+    hub.event(SUB, 3, effort_delta("high")).await;
+    hub.reply(&req, json!({"value": "high", "rev": 3})).await;
+    unbound.await.unwrap().unwrap();
+}
+
+/// **A config change racing the lane's first seed waits for its settings**
+/// (Amendment A13; C11 review): issued once the lane's connection is live but
+/// before the seed's `Settings`, it is not written until they arrive — and
+/// then goes out bound to the session's model, never unbound. A lane whose
+/// settings never come refuses it `Unavailable` (unsent) at the verb deadline.
+#[tokio::test]
+async fn a_config_change_racing_the_seed_waits_for_the_settings() {
+    let (_dial, mut conns, lane) = scripted(fast());
+    let lane = Arc::new(lane);
+    let (mut rx, _stop) = subscribed(&lane).await;
+    let mut hub = next_conn(&mut conns).await;
+    hub.splice(HOST).await;
+    hub.listed(row()).await;
+    hub.attached_only(attach_result(
+        SUB,
+        &info(false),
+        (INC, 1),
+        Some(snapshot_at(INC, 1, json!({}))),
+        None,
+    ))
+    .await;
+    // Attached (the connection is the verbs' now), not yet seeded.
+    let l = Arc::clone(&lane);
+    let early = tokio::spawn(async move {
+        l.set(LaneSettingChange::Config {
+            id: "effort".into(),
+            value: "high".into(),
+            for_model: None,
+        })
+        .await
+    });
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    // The fenced read comes first, untouched by the change in waiting.
+    hub.registry(json!([]), 1).await;
+    hub.synchronized(SUB, 1).await;
+    let mut checker = LaneChecker::new();
+    drive(&mut rx, &mut checker, "the seed", is_ready).await;
+    let req = hub.expect("session.set").await;
+    assert_eq!(
+        req["params"]["setting"]["forModel"], "grok",
+        "bound to the session's model once the settings arrived"
+    );
+    hub.event(SUB, 2, effort_delta("high")).await;
+    hub.reply(&req, json!({"value": "high", "rev": 2})).await;
+    early.await.unwrap().unwrap();
+
+    // Settings that never come: refused at the deadline, never sent.
+    let mut t = fast();
+    t.request = Duration::from_millis(300);
+    let (_dial2, _conns2, lonely) = scripted(t);
+    let got = lonely
+        .set(LaneSettingChange::Config {
+            id: "effort".into(),
+            value: "high".into(),
+            for_model: None,
+        })
+        .await;
+    assert!(
+        matches!(&got, Err(LaneError::Unavailable(m)) if m.contains("not sent")),
+        "{got:?}"
+    );
+}
+
+/// **A change confirmed at `rev: 0` reaches the settings anyway** (C11
+/// review): craze answers `session.set` with the confirmed value and `rev: 0`
+/// when it could learn no revision — and then NO `meta` delta follows. The
+/// lane applies the confirmed value itself and re-emits `Settings`, so a
+/// client never keeps the old value for want of an event.
+#[tokio::test]
+async fn a_change_confirmed_at_rev_zero_reaches_the_settings() {
+    let (_dial, mut conns, lane) = scripted(fast());
+    let lane = Arc::new(lane);
+    let (mut rx, _stop) = subscribed(&lane).await;
+    let (mut hub, _) = seed_conn(&mut conns, SUB, 1, json!({})).await;
+    hub.synchronized(SUB, 1).await;
+    let mut checker = LaneChecker::new();
+    drive(&mut rx, &mut checker, "the seed", is_ready).await;
+
+    let l = Arc::clone(&lane);
+    let set = tokio::spawn(async move {
+        l.set(LaneSettingChange::Config {
+            id: "effort".into(),
+            value: "high".into(),
+            for_model: None,
+        })
+        .await
+    });
+    let req = hub.expect("session.set").await;
+    // The confirmed value, no revision — and no delta.
+    hub.reply(&req, json!({"value": "high", "rev": 0})).await;
+    set.await.unwrap().unwrap();
+    let f = drive(&mut rx, &mut checker, "the confirmed Settings", is_settings).await;
+    assert_eq!(effort(&last_settings(&f).unwrap()).as_deref(), Some("high"));
+
+    let l = Arc::clone(&lane);
+    let set =
+        tokio::spawn(async move { l.set(LaneSettingChange::Mode { id: "plan".into() }).await });
+    let req = hub.expect("session.set").await;
+    hub.reply(&req, json!({"value": "plan", "rev": 0})).await;
+    set.await.unwrap().unwrap();
+    let f = drive(&mut rx, &mut checker, "the confirmed mode", is_settings).await;
+    assert_eq!(last_settings(&f).unwrap().mode.as_deref(), Some("plan"));
 }

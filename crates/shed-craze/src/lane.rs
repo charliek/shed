@@ -26,9 +26,9 @@
 //! A subscription's watcher (`crate::watcher`) holds the lane's connection:
 //! dial → hub `hello` → `session.connect{hostId}` with the host's `hello`
 //! pipelined behind it → `sessions.list` → `session.attach`. **The verbs share
-//! it** — `send`, `cancel`, `answer` and `stop` are requests on that live
-//! connection, demuxed by id, each with a fresh commandId (counted from 1 per
-//! lane, never repeated) and the [`VERB_DEADLINE`]. Three cases, never
+//! it** — `send`, `cancel`, `answer`, `set` and `stop` are requests on that
+//! live connection, demuxed by id, each with a fresh commandId (counted from 1
+//! per lane, never repeated) and the [`VERB_DEADLINE`]. Three cases, never
 //! blurred:
 //!
 //! - **issued while disconnected**: waits up to [`WAIT_CONNECTED`] for the
@@ -44,6 +44,32 @@
 //!   and offers its cursor.
 //!
 //! No token resume and no command resend in this plan (§9's future work).
+//!
+//! # Settings (plan 025 §3.10)
+//!
+//! [`AgentLane::set`] is `session.set{sessionId, commandId, setting}`:
+//! `{kind: "model", value}`, `{kind: "mode", value}`, or `{kind: "config", id,
+//! value, forModel}` — a config change BOUND to the model the option was chosen
+//! for ([`setting_for`]), so craze refuses it `stale_model` (the table's
+//! `NotAccepting`) rather than apply an option chosen for one model to
+//! another. That model is the one the CLIENT displayed —
+//! `LaneSettingChange::Config`'s `for_model` (Amendment A13), because the
+//! lane's fold can have seen a move the person has not — and only when the
+//! client sent none, the model the fold shows; a change issued before the lane
+//! has any settings waits for them (up to the verb deadline, then
+//! `Unavailable`, unsent) rather than going out unbound. The reply says
+//! nothing the stream does not: the `meta` delta that carries the change
+//! reaches the attachment BEFORE it (the reply barrier), and the watcher's
+//! fold re-emits `Settings` from it — so the stream, not this call, is where a
+//! client learns the new value. The one exception is a reply at `rev: 0` (craze
+//! could learn no revision, and no event will follow): its confirmed value is
+//! handed to every running watcher (`LaneShared::confirmed`), which applies it
+//! to its fold and re-emits `Settings`. Every `set` is a fresh commandId,
+//! so a retry after a refusal is a new command (craze stores none of the retry
+//! codes, `stale_model` among them); one lost to a drop is "outcome unknown"
+//! like every verb, and never resent — the watcher's next `Settings` (a silent
+//! resume restates them before its `Ready`; a reseed seeds them) says whether
+//! it took.
 //!
 //! # `session()` never dials
 //!
@@ -77,21 +103,21 @@ use shed_core::lane::{
     LaneCapabilities, LaneDecision, LaneError, LaneHistory, LaneSession, LaneSettingChange,
     LaneSettings, LaneSubscription, SendMode,
 };
-use tokio::sync::watch;
+use tokio::sync::{broadcast, watch};
 
 use crate::conn::{
     judge_hello_refusal, judge_host_hello, lock, CallError, Conn, HelloError, HostHello,
     Notifications, HELLO_DEADLINE,
 };
 use crate::dial::{connect_hub, CrazeDial, DialError, DIAL_DEADLINE};
-use crate::errors::{lane_error, outcome_unknown};
+use crate::errors::{craze_says, lane_error, outcome_unknown};
 use crate::fold::{plan_option, record_approval, Cards, CrazeFold, Restored};
 use crate::settings::{SettingsSections, SettingsState};
 use crate::source::KIND;
 use crate::wire::{
     self, code, method, AskGetResult, AskParams, AsksListResult, ClientInfo, CommandParams,
     ConnectParams, Empty, HelloParams, PromptParams, RosterRow, SessionCapabilities, SessionInfo,
-    SessionParams, SessionsListResult,
+    SessionParams, SessionsListResult, SetParams, SetResult, Setting,
 };
 
 /// Every verb's deadline: the write and the reply (§3.3.4). The host answers
@@ -229,9 +255,22 @@ pub(crate) struct LaneShared {
     pub timings: LaneTimings,
     pub state: Mutex<LaneState>,
     pub live: watch::Sender<Option<Live>>,
+    /// `true` once the lane KNOWS its settings — a watcher stored the
+    /// session's `Settings`, or its capabilities say it has none — so a config
+    /// change the client sent no model with can be bound to the folded one
+    /// (Amendment A13: it waits for them rather than going out unbound).
+    pub settings_known: watch::Sender<bool>,
+    /// A change craze confirmed at `rev: 0` — no `meta` delta will carry it —
+    /// for every running watcher to apply to its fold and re-emit `Settings`
+    /// with (the module doc, "Settings").
+    pub confirmed: broadcast::Sender<Setting>,
     next_command: AtomicU64,
     next_watcher: AtomicU64,
 }
+
+/// How many `rev: 0` confirmations a watcher may have unread at once — far
+/// more than a person can press while a watcher is between connections.
+const CONFIRMED_BACKLOG: usize = 64;
 
 impl LaneShared {
     /// A fresh commandId: a canonical positive decimal, counted from 1 per
@@ -304,6 +343,29 @@ impl LaneShared {
         let live = self.connected(what).await?;
         let p = params(live.session_id.clone(), self.command_id());
         self.call_on(&live.conn, method, &p).await
+    }
+
+    /// The model the lane's fold shows, for a config change the client sent
+    /// no model with (Amendment A13) — once the lane knows its settings,
+    /// waiting up to the verb deadline for them when a change races the
+    /// lane's first seed, so it never goes out unbound while the session HAS
+    /// a model. They not arriving in time is `Unavailable`: the change was not
+    /// sent, so a retry is safe.
+    async fn folded_model(&self) -> Result<Option<String>, LaneError> {
+        let mut known = self.settings_known.subscribe();
+        let arrived = tokio::time::timeout(self.timings.request, known.wait_for(|k| *k))
+            .await
+            .is_ok_and(|r| r.is_ok());
+        if !arrived {
+            return Err(LaneError::Unavailable(format!(
+                "the session's settings did not arrive within {:?}; the change was not sent — try again",
+                self.timings.request
+            )));
+        }
+        Ok(lock(&self.state)
+            .settings
+            .as_ref()
+            .and_then(|s| s.model.clone()))
     }
 
     /// A request on `conn`, mapped: a refusal through the table; a dropped
@@ -489,7 +551,7 @@ impl Splice {
     pub fn into_lane_error(self) -> LaneError {
         match self {
             Splice::UnknownSession => LaneError::UnknownSession,
-            Splice::Refused(m) | Splice::TooOld(m) => LaneError::Failed(m),
+            Splice::Refused(m) | Splice::TooOld(m) => LaneError::Failed(craze_says(m)),
             Splice::Lost(m) => LaneError::Unavailable(m),
             Splice::Fault(m) => LaneError::Failed(format!("protocol: {m}")),
         }
@@ -661,6 +723,8 @@ impl CrazeLane {
                     ..LaneState::default()
                 }),
                 live,
+                settings_known: watch::channel(false).0,
+                confirmed: broadcast::channel(CONFIRMED_BACKLOG).0,
                 next_command: AtomicU64::new(0),
                 next_watcher: AtomicU64::new(0),
             }),
@@ -671,6 +735,43 @@ impl CrazeLane {
     /// the one it learned) — what every session call carries.
     pub fn craze_session_id(&self) -> Option<String> {
         lock(&self.shared.state).session_id.clone()
+    }
+}
+
+/// The wire setting for `change` (plan 025 §3.10): a model or a mode by its
+/// id, and nothing else; a config option by its id and value, BOUND
+/// (`forModel`) to the model the CLIENT displayed it for — the change's own
+/// `for_model` (Amendment A13) — and only when the client sent none, to
+/// `folded`, the model the lane's fold shows. Unbound only when neither is
+/// known. Pure, so the table is a test.
+pub fn setting_for(change: &LaneSettingChange, folded: Option<&str>) -> Setting {
+    match change {
+        LaneSettingChange::Model { id } => Setting {
+            kind: "model",
+            id: None,
+            value: id.clone(),
+            for_model: None,
+        },
+        LaneSettingChange::Mode { id } => Setting {
+            kind: "mode",
+            id: None,
+            value: id.clone(),
+            for_model: None,
+        },
+        LaneSettingChange::Config {
+            id,
+            value,
+            for_model,
+        } => Setting {
+            kind: "config",
+            id: Some(id.clone()),
+            value: value.clone(),
+            for_model: [for_model.as_deref(), folded]
+                .into_iter()
+                .flatten()
+                .find(|m| !m.is_empty())
+                .map(str::to_string),
+        },
     }
 }
 
@@ -1001,7 +1102,7 @@ impl AgentLane for CrazeLane {
             )
             .await?;
         let mut s = SettingsState::new();
-        s.apply_catalogs(&info.catalogs);
+        s.apply_info(&info);
         if let Some(settings) = v.get("snapshot").and_then(|s| s.get("settings")) {
             s.apply_sections(&SettingsSections::from_value(settings));
         }
@@ -1012,12 +1113,45 @@ impl AgentLane for CrazeLane {
         })
     }
 
-    /// Changing a setting is plan 025's settings milestone (C11).
-    async fn set(&self, _change: LaneSettingChange) -> Result<(), LaneError> {
-        Err(LaneError::Failed(
-            "changing a craze session's settings arrives with plan 025's settings milestone (C11)"
-                .to_string(),
-        ))
+    /// `session.set` on the live connection (the module doc, "Settings"): a
+    /// config change bound to the model the client displayed (its
+    /// `for_model`), else to the model the lane's fold shows — read when the
+    /// call is made, waiting for the lane's first settings if none has
+    /// arrived, so a change chosen on one model is never sent for another.
+    /// `Ok` is craze's confirmation; the new value arrives on the stream (its
+    /// `meta` delta is ahead of the reply) — or, answered `rev: 0`, from the
+    /// confirmed value itself, which every running watcher applies. A refusal
+    /// maps through the table (`stale_model` → `NotAccepting`); a reply lost
+    /// to a drop is "outcome unknown", never resent.
+    async fn set(&self, change: LaneSettingChange) -> Result<(), LaneError> {
+        let folded = match &change {
+            LaneSettingChange::Config {
+                for_model: Some(m), ..
+            } if !m.is_empty() => None,
+            LaneSettingChange::Config { .. } => self.shared.folded_model().await?,
+            LaneSettingChange::Model { .. } | LaneSettingChange::Mode { .. } => None,
+        };
+        let setting = setting_for(&change, folded.as_deref());
+        let sent = setting.clone();
+        let v = self
+            .shared
+            .command("set", method::SESSION_SET, |sid, cmd| SetParams {
+                session_id: sid,
+                command_id: cmd,
+                setting: sent,
+            })
+            .await?;
+        // `rev: 0`: confirmed, and no event will say so (wire::SetResult).
+        if let Ok(r) = serde_json::from_value::<SetResult>(v) {
+            if r.rev == Some(0) {
+                let _ = self.shared.confirmed.send(Setting {
+                    value: r.value,
+                    for_model: None,
+                    ..setting
+                });
+            }
+        }
+        Ok(())
     }
 
     /// `session.stop`: `Ok` is the host's RECEIPT, never the stop's completion
