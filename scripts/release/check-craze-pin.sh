@@ -10,9 +10,10 @@
 # hermetic and must never touch the network.
 #
 # Usage:
-#   scripts/release/check-craze-pin.sh --release vX.Y.Z
+#   scripts/release/check-craze-pin.sh --release v<craze X.Y.Z>
 #
-#   vX.Y.Z   the craze release to verify. Normally == craze-pin.env's
+#   v<craze X.Y.Z>  the CRAZE release to verify (craze's own version, e.g.
+#            v0.1.0), NOT the shed tag. Normally == craze-pin.env's
 #            CRAZE_RELEASE, v-prefixed (release-plan.sh passes exactly that).
 #            Taken as an explicit argument, rather than this script reading
 #            CRAZE_RELEASE straight out of craze-pin.env itself, so a caller
@@ -56,14 +57,14 @@ while [ $# -gt 0 ]; do
       shift
       ;;
     *)
-      echo "usage: $0 --release vX.Y.Z" >&2
+      echo "usage: $0 --release v<craze X.Y.Z>   (craze's own version, e.g. v0.1.0, not the shed tag)" >&2
       exit 2
       ;;
   esac
 done
 
 if [ -z "${RELEASE_ARG}" ]; then
-  echo "usage: $0 --release vX.Y.Z" >&2
+  echo "usage: $0 --release v<craze X.Y.Z>   (craze's own version, e.g. v0.1.0, not the shed tag)" >&2
   exit 2
 fi
 
@@ -126,7 +127,12 @@ if [ "${peeled_count}" -eq 1 ]; then
 elif [ "${direct_count}" -eq 1 ]; then
   RESOLVED="$(printf '%s\n' "${OUT}" | awk -v r="${TAG_REF}" '$2==r {print $1}')"
 else
-  echo "::error::craze tag v${RELEASE_V} not found on charliek/craze (no ${TAG_REF} and no ${PEELED_REF})" >&2
+  hint=""
+  SHED_SERVER_V="$(jq -r '.version // empty' "${REPO_ROOT}/.claude-plugin/plugin.json" 2>/dev/null || true)"
+  if [ -n "${SHED_SERVER_V}" ] && [ "${RELEASE_V}" = "${SHED_SERVER_V}" ]; then
+    hint=" (this takes craze's version from craze-pin.env, not the shed tag)"
+  fi
+  echo "::error::craze tag v${RELEASE_V} not found on charliek/craze (no ${TAG_REF} and no ${PEELED_REF})${hint}" >&2
   exit 1
 fi
 

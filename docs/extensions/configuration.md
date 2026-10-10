@@ -260,11 +260,6 @@ It reports:
 - each **watched server**: per-namespace connection state — `connected`, `reconnecting` (with the
   failure reason), or `stopped`.
 
-Before v0.9.0 the report also carried an **RC hub** line (the machine activity hub the
-agent used to host on `127.0.0.1:1029`). That role was retired in plan 022 (S6,
-[`charliek/shed#328`](https://github.com/charliek/shed/issues/328)) and the line is gone
-with it.
-
 If the agent isn't running, `status` says so and exits non-zero (nothing is listening on the
 socket) rather than guessing from a file. Start it with `brew services start shed-host-agent`.
 

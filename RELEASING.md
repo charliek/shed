@@ -226,10 +226,14 @@ Moving `CRAZE_TEST_SHA` means re-vendoring craze's
 CI's `craze-binaries` action diffs the two trees on every run.
 
 **The release-time check.** `scripts/release/check-craze-pin.sh --release
-vX.Y.Z` (network) resolves `v$CRAZE_RELEASE` against
+v<CRAZE_RELEASE>` (network) takes **craze's own version**, e.g. `v0.1.0`,
+**not** the shed tag; `release-plan.sh` passes `v$CRAZE_RELEASE`. It resolves
+`v$CRAZE_RELEASE` against
 `github.com/charliek/craze` via `git ls-remote` and requires the resolved
 commit to equal `CRAZE_TEST_SHA` — O4's rule that "at the shed release the
 test SHA must equal the baked release's tag commit, enforced by a check."
+Passing the shed tag by mistake fails with "not found" plus a hint that the
+argument is craze's version from `craze-pin.env`.
 `release-plan.sh` calls it for every **stable tag whose component set
 includes `server`** (the images ship with the server component), in both
 the mandatory local pre-tag run and CI's `release-plan` job.
@@ -262,7 +266,9 @@ fails, and the seam is proven ignored without the self-test flag.
    - Runs `scripts/release/recommend-components.sh X.Y.Z`, presents the
      recommendation, and gets the human's confirmed/edited component
      set (see "Recommend + confirm" above).
-   - Drafts a CHANGELOG entry from `git log v<previous>..HEAD` with a
+   - Drafts a CHANGELOG entry from `git log v<previous>..HEAD` (or, when
+     `## Unreleased` is curated, folds it instead — see "Folding a
+     curated `## Unreleased`") with a
      `**Ships:**` line naming the confirmed set, commits as
      `docs(changelog): vX.Y.Z entry`
    - Runs `scripts/release/update-version.sh X.Y.Z --components
@@ -461,6 +467,25 @@ generated changelog (`changelog: use: github`, filtered: skip `docs:`,
 
 `pyproject.toml` is for the docs site only and has its own version cadence;
 not touched by `update-version.sh`.
+
+### Folding a curated `## Unreleased`
+
+When the `## Unreleased` section was curated as release notes while the work
+landed (as 0.9.0's was), fold it instead of drafting a new entry:
+
+1. Rename the heading to `## vX.Y.Z — YYYY-MM-DD` (an em dash, as
+   `release-plan.sh` requires) and keep the `**Ships:**` line first under it.
+   Add a fresh empty `## Unreleased` above it if you want one.
+2. Do **not** let the release skill draft the entry from `git log
+   v<previous>..HEAD` when the section is curated: that replaces the curated
+   text with a commit list. Tell the skill to fold the existing section.
+3. Check it before tagging: `scripts/release/changelog-section.sh vX.Y.Z`
+   prints the section, and `scripts/release/release-plan.sh vX.Y.Z` passes.
+
+The folded section **is the release page body**: the `release` job publishes
+exactly what `changelog-section.sh` prints, so it must read as release notes
+from its first line, with any one-time upgrade warning near the top. It must
+not contain a line starting `## Unreleased` or `## v<digit>` (see above).
 
 ## Host-agent: Rust binary
 

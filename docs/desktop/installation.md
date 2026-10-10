@@ -1,7 +1,7 @@
 # Installation
 
-shed-desktop ships two clients from one shared Rust core: a native macOS app (Apple Silicon)
-and a Tauri/WebKitGTK Linux app.
+shed-desktop is a Tauri app on one shared Rust core, shipped for macOS (Apple Silicon, a
+DMG) and for Linux (WebKitGTK, an apt `.deb`).
 
 ## macOS (DMG)
 
@@ -11,10 +11,10 @@ Grab the latest `ShedDesktop-<version>.dmg` from the
 [releases page](https://github.com/charliek/shed/releases), open it, and drag
 **ShedDesktop.app** to Applications.
 
-Official release DMGs are Developer-ID-signed and notarized when the release
-pipeline has signing credentials, and then launch without a Gatekeeper prompt.
-(An ad-hoc-signed, non-notarized build ships a `FIRST-LAUNCH.txt` with the
-one-time bypass steps.)
+Official stable release DMGs are always Developer-ID-signed and notarized, and launch
+without a Gatekeeper prompt: a stable desktop tag fails to publish without the signing
+credentials. Only a prerelease (`-rc`) tag may ship an ad-hoc-signed, non-notarized DMG,
+which carries a `FIRST-LAUNCH.txt` with the one-time bypass steps.
 
 ### Updates
 
@@ -34,8 +34,9 @@ if a newer build is published, Sparkle offers it and applies it in place.
 The Tauri macOS app is the shipped macOS client as of 0.9.0 — prerelease
 (`vX.Y.Z-rc.N`) tags publish a beta-channel DMG, stable tags publish the stable-channel DMG,
 both from the same job. It shares the feed, EdDSA key, and bundle identity
-(`ai.stridelabs.ShedDesktop`) that the earlier Swift app used, so the first Tauri release was
-a seamless in-place update for existing Swift installs. See
+(`ai.stridelabs.ShedDesktop`) that the earlier Swift app used, so the first Tauri release is
+designed to update in place for existing Swift installs (0.9.0 is the first release to exercise
+that path; see the [0.9.0 upgrade guide](../upgrades/v0.8.2-to-v0.9.0.md#macos-desktop)). See
 [RELEASING.md](https://github.com/charliek/shed/blob/main/desktop/RELEASING.md).
 
 Locally built DMGs (`make -C desktop dmg`) are **ad-hoc signed**, so Gatekeeper blocks the
@@ -114,7 +115,7 @@ make -C desktop deb-validate   # build + install-validate in a clean ubuntu:24.0
 - A reachable `shed-server` on at least one configured host. Unreachable hosts are shown
   as a degraded state, never a hard failure.
 
-**Nothing else — for the Tauri client.** `brew install shed` (or `apt install shed`) plus the
+**Nothing else — for the Tauri client.** `brew install shed` (or `apt install shed-server` on a Linux host) plus the
 Tauri desktop app is a complete install — its embedded broker handles credential approvals
 (SSH sign, AWS, Docker) itself, no extra daemon needed. The **Swift macOS client** (sources
 retained pending demolition; not shipped since 0.9.0) still requires the separately-installed

@@ -135,12 +135,14 @@ restart, and the `extensions` image now carries `roost-session` and `craze`.
   `"unknown"`. Removing a hook is a deliberate local act on the host (`roostctl agent
   uninstall`). Go's `internal/roostprovider` mirrors the same generation, which is why this
   also ships with `server`.
-  **A host speaking an older protocol is refused by name and offered the update, and its
-  running session is never stopped.** That covers a host the desktop bootstrapped earlier
+  **A host speaking an older protocol is refused by name, and its running session is never
+  stopped.** That covers a host the desktop bootstrapped earlier
   (protocol 4), a host on protocol 5, and a `roost-session` from any roost release before
-  v0.0.20 (v0.0.19 speaks protocol 2). To recover, run `roostctl session stop` on that
-  target and reconnect; shed then sees a stale binary with no session running and replaces
-  and restarts it unattended, like any other Update. Installing roost-session from roost's release assets
+  v0.0.20 (v0.0.19 speaks protocol 2). A running old daemon shows
+  as a report with no button. To recover, stop it with `roostctl session stop` on that target
+  (`roost-session` has no stop command, and a host shed bootstrapped may lack `roostctl`:
+  install roost's first), then reconnect: the stopped, incompatible binary gets an Update
+  button, with its consent step. Installing roost-session from roost's release assets
   now works against a fresh Linux target straight from roost's GitHub release,
   checksum-verified against its published `.sha256`.
 - **`shed attach` starts a shed's stopped `roost-session` itself, and wires its agent hooks

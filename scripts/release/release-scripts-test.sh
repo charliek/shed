@@ -1210,6 +1210,26 @@ calls_after="$(calls_count)"
 [ "${calls_before}" -eq "${calls_after}" ] || fail "host-agent-only tag invoked the craze ls-remote fake (the checker ran when SHIP_SERVER=false) — calls before=${calls_before} after=${calls_after}"
 ok "a host-agent-only stable tag plans cleanly and never touches the craze checker (call log unchanged)"
 
+step "check-craze-pin.sh: a not-found tag hints 'craze's version, not the shed tag' ONLY when the argument is the shed manifest version"
+# The seam emits NO rows (/bin/true), so the tag is "not found" whatever the
+# argument is. The hint must name the mistake (passing the shed tag), and must
+# not appear for an ordinary craze version that is merely absent.
+CCP="${SCRATCH}/scripts/release/check-craze-pin.sh"
+SHED_MANIFEST_V="$(jq -r '.version' "${SCRATCH}/.claude-plugin/plugin.json")"
+[[ "${SHED_MANIFEST_V}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || fail "scratch shed manifest version '${SHED_MANIFEST_V}' is not X.Y.Z"
+CCP_HINT="this takes craze's version from craze-pin.env, not the shed tag"
+ccp_shed_rc=0
+ccp_shed_out="$(CRAZE_PIN_LS_REMOTE=/bin/true "${CCP}" --release "v${SHED_MANIFEST_V}" 2>&1)" || ccp_shed_rc=$?
+[ "${ccp_shed_rc}" -eq 1 ] || fail "craze-hint (shed version) exited ${ccp_shed_rc} (want 1): ${ccp_shed_out}"
+echo "${ccp_shed_out}" | grep -qF "not found on charliek/craze" || fail "craze-hint (shed version): the not-found error is missing: ${ccp_shed_out}"
+echo "${ccp_shed_out}" | grep -qF "${CCP_HINT}" || fail "craze-hint (shed version): the hint is missing: ${ccp_shed_out}"
+ccp_other_rc=0
+ccp_other_out="$(CRAZE_PIN_LS_REMOTE=/bin/true "${CCP}" --release "v9.9.9" 2>&1)" || ccp_other_rc=$?
+[ "${ccp_other_rc}" -eq 1 ] || fail "craze-hint (other version) exited ${ccp_other_rc} (want 1): ${ccp_other_out}"
+echo "${ccp_other_out}" | grep -qF "not found on charliek/craze" || fail "craze-hint (other version): the not-found error is missing: ${ccp_other_out}"
+echo "${ccp_other_out}" | grep -qF "${CCP_HINT}" && fail "craze-hint (other version): the hint appeared for a version that is not the shed manifest's: ${ccp_other_out}"
+ok "the hint appears for the shed manifest version (${SHED_MANIFEST_V}) and not for an unrelated craze version"
+
 # ===========================================================================
 # Phase 5 (plan 026 §3.11): the desktop signing gate and the curated release
 # body. desktop-signing-gate.sh and changelog-section.sh run as deployed (the

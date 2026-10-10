@@ -8,12 +8,13 @@ Linux box) with the `shed` CLI.
 Building from source, custom kernels/images, or the full manual setup? See
 [Firecracker Developer Setup](fc-setup.md).
 
-!!! note "Scope on Linux today"
-    Linux currently runs the **server** (`shed-server`). Host-side credential
-    brokering (`shed-host-agent`) and a desktop GUI are roadmap items — a headless
-    Linux host-agent is planned first, once the macOS pieces are established. For
-    now, credential brokering and the shed-desktop approval UI are macOS-only (see
-    the [macOS Quickstart](macos-quickstart.md)).
+!!! note "Scope on Linux"
+    Linux runs the **server** (`shed-server`) and the **desktop app**
+    (`shed-desktop`, a Tauri client, installed from the same apt repository with
+    `sudo apt install shed-desktop`). The desktop app embeds the credential
+    broker, so it handles credential approvals itself with no separate
+    `shed-host-agent` daemon; a standalone host-agent is brew-only. See
+    [Desktop installation](../desktop/installation.md).
 
 ## Prerequisites
 

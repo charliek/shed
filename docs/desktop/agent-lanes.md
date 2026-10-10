@@ -9,7 +9,7 @@ reaches each one, and what the current build does not do.
 
 ## Lanes and sources
 
-`shed_core::lane` (plan 015, split in plan 025) is the contract every agent
+`shed_core::lane` is the contract every agent
 adapter implements, at two levels:
 
 - A **source** (`AgentSource`) is a machine's view of its sessions: it streams
@@ -204,8 +204,8 @@ restart. While the source is not live, the rows it still holds show as last
 known (`stale`, `approximate`).
 
 A craze session can also be a roost tab: a craze TUI claims its tab, and roost
-reports it as owned by craze. For craze sessions **the hub row is the row**
-(plan 025 D4), computed per machine by `shed_app::craze_rows::fold_plan`:
+reports it as owned by craze. For craze sessions **the hub row is the row**,
+computed per machine by `shed_app::craze_rows::fold_plan`:
 
 - **While the hub feed is live,** every craze-owned roost tab is folded away. A
   tab that names a hub row's provider session id attaches to that row, which
@@ -286,6 +286,13 @@ an unknown outcome, and reopening the sheet mid-submit all reuse it, so a lost
 answer never makes a second session. Any definite answer — a session or any
 refusal — and any edit of the form mint a new one.
 
+The boundary of that guarantee: Try again can never start a **second session
+while the first one is still running**. Within ten minutes of craze's original
+answer, a retry gets that same answer back, even if the session has since
+ended (shed does not resurrect the ended row). Only after that, and only if the
+session has ended and craze finds no live session for the request, does a retry
+start a new one.
+
 **A created session is listed at once.** The roster can list a new session a
 moment after the create answers, so `CrazeSource` keeps the created row apart
 until a roster lists or removes that hostId, a lane opened on it sees the
@@ -358,6 +365,14 @@ the craze session id every later call uses), then `session.attach`.
 - **Stop** ends the session, not just the transcript, behind an inline
   confirm. craze answers with a receipt; the lane ends with `session_closed`
   and the row leaves.
+- **End tab and Stop are different on a row hosted in a TUI.** **End tab**
+  closes only that roost tab; the session keeps running in craze's hub, and its
+  row stays (without the tab). **Stop** is what ends the session.
+- **A stopped session can reappear for about a second.** Right after Stop, a
+  craze roster update can list the session once more before the hub's next
+  update removes it. It is craze's roster behaviour
+  ([craze#93](https://github.com/charliek/craze/issues/93)), cosmetic, and
+  shed does not hide it, because the roster is the listing authority.
 
 **What the transcript draws.** craze's own fold updates rows in place; shed's
 rows are append-only, so the adapter segments: a streaming text or reasoning
@@ -427,6 +442,11 @@ attached craze TUI appears live.
   requested value on screen, the row just shows it. Otherwise it says "not
   confirmed" until the session's next `Settings` states the real value; a
   silent resume always restates the settings, so a reconnect clears it.
+
+- **A cursor model change is the machine's default.** Changing a cursor
+  session's model from the sheet changes cursor's own global default on that
+  machine (cursor keeps it in `~/.cursor/cli-config.json`), so sessions you
+  start there later begin on it too, not only this one.
 
 A session with nothing to set has no chip and no sheet.
 
@@ -597,7 +617,7 @@ otherwise.
 `LaneApprovalOption.kind` is an option's *semantic* kind (`allow_once` /
 `allow_always` / `reject_once` / `reject_always`); `id` is opaque and
 independent of it, and an agent can offer several options of the same kind. A
-live gx leader (plan 017's adapter, retired in plan 025) proved it: asked to
+live gx leader (an earlier adapter, since retired) proved it: asked to
 run `id -un`, it offered five options, two of them `allow_once` — "Yes,
 proceed" and "Yes, and don't ask again for anything (always-approve mode)". So
 a bare decision (`AllowOnce` / `AllowAlways` / `Reject`) is not always enough

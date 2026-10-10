@@ -163,8 +163,8 @@ Sparkle update**, not a same-version no-op.
 
 The Tauri app is the shipped macOS client as of 0.9.0 — the former
 Swift release job (which used to own stable tags) is retired; the Swift
-*sources* stay in the tree pending a later demolition (see the
-follow-up ticket filed alongside the promotion commit).
+*sources* stay in the tree pending a later demolition, tracked in
+[#364](https://github.com/charliek/shed/issues/364).
 
 The two-tag rc rehearsal described above (cut `vX.Y.Z-rc.1`, install by
 hand, cut `vX.Y.Z-rc.2`, verify a real in-place Sparkle update) remains
