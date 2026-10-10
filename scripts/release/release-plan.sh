@@ -197,22 +197,26 @@ fi
 # CHANGELOG entry and skip the whole check.
 if [ "${IS_PRERELEASE}" = "false" ]; then
   # Body of the `## v<V> — <date>` section (heading excluded), up to the next
-  # `## ` heading. index()==1 anchors an exact prefix match — no regex-metachar
-  # surprises from the version's dots — and naturally skips `## Unreleased`
-  # (its own `**Ships:**` line must never be read).
-  # `!seen` gates the section-open rule to the FIRST matching heading, so a
-  # pathological second `## v<V> — ` heading is treated as a section boundary
-  # (the exit rule below fires) rather than re-opening the capture and merging
-  # the two bodies — which would let a Ships-less first section borrow the
-  # second's Ships line.
-  section="$(awk -v head="## v${V} — " '
-    index($0, head) == 1 && !seen { seen = 1; insec = 1; next }
-    insec && /^## / { exit }
-    insec { print }
-  ' "${CHANGELOG}")"
-
-  if [ -z "${section}" ]; then
-    echo "::error::CHANGELOG.md has no '## v${V} — <date>' section — a stable tag (${TAG}) requires a changelog entry with a **Ships:** line." >&2
+  # section heading, read by changelog-section.sh: the same extractor the publish
+  # workflow uses for the release body, so the section checked here is the one
+  # published. It anchors an exact prefix match, which naturally skips
+  # `## Unreleased` (its own `**Ships:**` line must never be read), and only the
+  # FIRST matching heading opens the section, so a pathological second
+  # `## v<V> — ` heading is a boundary rather than a merge — which would let a
+  # Ships-less first section borrow the second's Ships line.
+  # The section ends only at the next `## Unreleased`/`## v<digit>` heading,
+  # so any other `## ` line (an upgrade example's, say) is body text. Its own
+  # stderr names the reason it found no section; exit 1 is "no usable
+  # section", anything else is the extractor itself failing, reported as such.
+  [ -f "${CHANGELOG}" ] || { echo "::error::CHANGELOG.md is missing" >&2; exit 1; }
+  section_rc=0
+  section="$("${SCRIPT_DIR}/changelog-section.sh" "v${V}")" || section_rc=$?
+  if [ "${section_rc}" -eq 1 ] || { [ "${section_rc}" -eq 0 ] && [ -z "${section}" ]; }; then
+    echo "::error::a stable tag (${TAG}) requires a complete '## v${V} — <date>' CHANGELOG.md section with a **Ships:** line (the reason is above)." >&2
+    exit 1
+  fi
+  if [ "${section_rc}" -ne 0 ]; then
+    echo "::error::scripts/release/changelog-section.sh v${V} failed (exit ${section_rc}) reading CHANGELOG.md" >&2
     exit 1
   fi
 

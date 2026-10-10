@@ -824,6 +824,13 @@ jobs:
         run: cd desktop/tauri/ui && npm ci
       - name: Tauri clippy (standalone workspace)
         run: make -C desktop tauri-lint
+      - name: Tauri unit tests (macOS)
+        # publish-images.yaml's desktop-macos job runs this same target, after
+        # the GitHub release is out, so a macOS-only red cell must surface here
+        # first (plan 026 §3.11). Sparkle.framework is staged by now:
+        # tauri-lint's Darwin prerequisite ran fetch-sparkle, and tauri-test's
+        # own re-run of it is the idempotent no-op.
+        run: make -C desktop tauri-test
       - uses: astral-sh/setup-uv@v6
       # The craze cells run on the mac client too (plan 025 §3.5), against the
       # pinned craze binaries built for darwin on this runner; the action

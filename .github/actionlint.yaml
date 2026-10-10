@@ -1,0 +1,15 @@
+# actionlint configuration (read by `mise exec -- actionlint`, the G-ci gate).
+#
+# Every finding fails except the two messages below, and only in
+# publish-images.yaml. actionlint 1.7.12's bundled metadata for
+# actions/create-github-app-token@v3 predates the input rename: the action's
+# own action.yml at v3 defines `client-id` (optional) and keeps `app-id` only
+# as a deprecated alias ("Use 'client-id' instead."), so the workflow's
+# `client-id:` inputs are correct and actionlint misreads them as an unknown
+# input plus a missing required one. Drop this file once an actionlint release
+# ships the current metadata. (Plan 026, AM8.)
+paths:
+  .github/workflows/publish-images.yaml:
+    ignore:
+      - '^input "client-id" is not defined in action "actions/create-github-app-token@v3"\. '
+      - '^missing input "app-id" which is required by action "actions/create-github-app-token@v3"\. '

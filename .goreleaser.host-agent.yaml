@@ -137,8 +137,10 @@ release:
   draft: false
   prerelease: auto
   # keep-existing: the first SHIPPING invocation (server → host-agent)
-  # creates the release + the goreleaser-changelog body; later
-  # invocations upload their assets without touching the body.
+  # creates the release, with the tag's curated CHANGELOG section as its
+  # body (publish-images.yaml passes it as --release-notes, which skips the
+  # changelog below); later invocations upload their assets without
+  # touching the body.
   mode: keep-existing
   # replace_existing_artifacts: a re-run of a partially-failed release job
   # replaces its own already-uploaded assets instead of dying `already_exists`
