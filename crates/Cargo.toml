@@ -36,7 +36,7 @@ members = ["shed-core", "shed-core-ffi", "shed-app", "shedctl", "shed-broker", "
 default-members = ["shed-core", "shed-core-ffi", "shed-app", "shedctl", "shed-broker", "shed-host-agent", "shed-opencode", "shed-craze"]
 
 [workspace.package]
-version = "0.8.1"
+version = "0.9.0"
 edition = "2021"
 # 1.97 is `roost-ipc`'s own MSRV (roost's `[workspace.package] rust-version`);
 # this workspace cannot claim to build on less than what its dependency needs.

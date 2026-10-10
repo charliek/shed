@@ -3258,7 +3258,7 @@ dependencies = [
 
 [[package]]
 name = "shed-app"
-version = "0.8.1"
+version = "0.9.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -3278,7 +3278,7 @@ dependencies = [
 
 [[package]]
 name = "shed-broker"
-version = "0.8.1"
+version = "0.9.0"
 dependencies = [
  "async-trait",
  "aws-config",
@@ -3317,7 +3317,7 @@ dependencies = [
 
 [[package]]
 name = "shed-core"
-version = "0.8.1"
+version = "0.9.0"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -3340,7 +3340,7 @@ dependencies = [
 
 [[package]]
 name = "shed-core-ffi"
-version = "0.8.1"
+version = "0.9.0"
 dependencies = [
  "async-trait",
  "serde_json",
@@ -3352,7 +3352,7 @@ dependencies = [
 
 [[package]]
 name = "shed-craze"
-version = "0.8.1"
+version = "0.9.0"
 dependencies = [
  "async-trait",
  "futures-util",
@@ -3367,7 +3367,7 @@ dependencies = [
 
 [[package]]
 name = "shed-host-agent"
-version = "0.8.1"
+version = "0.9.0"
 dependencies = [
  "async-trait",
  "serde",
@@ -3381,7 +3381,7 @@ dependencies = [
 
 [[package]]
 name = "shed-opencode"
-version = "0.8.1"
+version = "0.9.0"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -3398,7 +3398,7 @@ dependencies = [
 
 [[package]]
 name = "shedctl"
-version = "0.8.1"
+version = "0.9.0"
 dependencies = [
  "base64 0.22.1",
  "libc",
