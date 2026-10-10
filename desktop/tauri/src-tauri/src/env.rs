@@ -240,6 +240,11 @@ impl Env {
             test_mode: self.test_mode,
             craze_path: self.craze_path.clone(),
             craze_env: self.craze_env.clone(),
+            // Not an environment knob: the app's spawn gate is created once in
+            // `setup` and attached there (plan 026 §3.3), as is its shared
+            // teardown sink.
+            spawn_gate: None,
+            teardowns: None,
         }
     }
 }

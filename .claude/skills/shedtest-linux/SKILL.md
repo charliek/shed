@@ -315,6 +315,42 @@ SHED_CRAZE_REQUIRE=1 SHED_CRAZE_BIN_DIR=/work/desktop/tools/shedtest/.craze-bin 
   keeps its last listing — `ui.show_launch` re-reads on mount, so open the dialog FIRST when a
   control must reach a later assertion. `ui.close_launch` closes it.
 
+### The orderly shutdown cells (plan 026 C3)
+
+The app now handles SIGTERM/SIGINT/SIGHUP (a dedicated signal thread) and runs one bounded,
+idempotent shutdown of every child it owns — so **the harness's `ui.terminate` (SIGTERM) runs that
+shutdown too**. `test_tauri_craze.py`'s `_stop` times every stop and fails if the 5 s grace's
+SIGKILL was ever needed; a typical stop is ~0.03 s. The app logs each phase to its own log
+(`shed-desktop-tauri: shutdown: phase N … took M ms`).
+
+- **A signal cell signals an app instance of its OWN** (`SigRig`, a function-scoped rig), never
+  the module's shared `app`. Signal by the recorded pid; the test-mode `app.quit` op is the tray's
+  path (`app.exit(0)`).
+- **A descendant check alone cannot prove the orderly path in this rig.** Kill the app with no
+  handler and every descendant still dies within a second: the craze bridges exit on stdin EOF,
+  WebKit's helpers die with their parent. What a hard kill leaves behind is the `SshExec`
+  ControlMaster, which ssh daemonizes — it is never in the descendant tree. Its proof is the fake
+  ssh's `exits.log` (every `-O exit`, by control path); check it, and the exit status (an orderly
+  exit is 0).
+- **The craze hub is in the app's tree while the app runs** (the first bridge that Ensures it is
+  its parent until that bridge exits), so list it — and everything under it — apart, from its own
+  hub record, before asserting what died.
+- **The post-exit grace for recorded descendants is 0.5 s, not more** (C3 fix round 1): the
+  shutdown kills AND awaits its own children before the app exits, so they are gone already; the
+  half second is only for WebKit's helpers noticing their parent went and a killed child's zombie
+  being reaped once reparented. Don't widen it to make a cell pass — a bridge that needs longer
+  is a bug. Likewise `_launch` releases its own app, log and agent if it fails after the spawn,
+  and `SigRig.teardown` runs every step (holder, both namespaces) before re-raising the first
+  failure, so a forced kill never leaks a jail.
+- **Two signals sent back to back are ONE signal.** The OS and tokio coalesce a SIGTERM that
+  arrives before the signal thread consumed the previous one. A "second signal" cell must wait
+  for proof the first is being handled (a NEW `-O exit` past `phase 2` in the app's log) — not
+  for any `-O exit`: with the fake ssh's `wedge-exit` switch on from launch, roost's own replace
+  path logs (and is held by) some during normal operation.
+- **Every dir above a `CRAZE_RUNTIME_DIR` must be 0700**: a nested rig dir made with
+  `mkdir(parents=True)` is group-writable under a 002 umask, and craze then refuses the runtime
+  dir with no error the harness surfaces (the fake host just exits before its ready line).
+
 ### The settings sheet (plan 025 C11)
 
 - **Drive it through its doors**: `ui.show_lane_settings {machine, kind, session_id}` mounts

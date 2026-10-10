@@ -84,6 +84,7 @@ use shed_core::roost::bootstrap::{
 use shed_core::roost::{AgentLaneStamp, Conn, RoostInventory, RoostSession};
 
 use shed_app::craze_rows::{fold_plan, FoldPlan, RoostTabRef};
+use shed_app::spawn_gate::{ShuttingDown, SpawnGate};
 use shed_core::lane::{
     AgentSource as _, LaneCreateRequest, LaneSession, SourceEvent, SourceOffline,
 };
@@ -733,6 +734,8 @@ pub enum Refusal {
     /// A bootstrap for this target is already in flight. Refused rather than
     /// queued — see [`RoostHosts::bootstrap`].
     AlreadyBootstrapping(String),
+    /// The app is quitting (plan 026 §3.3): nothing new is started.
+    ShuttingDown(String),
 }
 
 impl Refusal {
@@ -743,6 +746,7 @@ impl Refusal {
             Refusal::ConsentRequired(_) => "consent_required",
             Refusal::BadTarget(_) => "bad_request",
             Refusal::AlreadyBootstrapping(_) => "already_bootstrapping",
+            Refusal::ShuttingDown(_) => shed_app::spawn_gate::SHUTTING_DOWN,
         }
     }
 
@@ -751,7 +755,8 @@ impl Refusal {
         match self {
             Refusal::ConsentRequired(m)
             | Refusal::BadTarget(m)
-            | Refusal::AlreadyBootstrapping(m) => m,
+            | Refusal::AlreadyBootstrapping(m)
+            | Refusal::ShuttingDown(m) => m,
         }
     }
 }
@@ -870,6 +875,23 @@ pub struct RoostHosts {
     /// pass has changed underneath it, and the registry ends on the LATEST
     /// observation. Async, because a pass awaits its removals.
     observe_pass: tokio::sync::Mutex<()>,
+    /// **The shed probes in flight** (plan 026 §3.3): tracked tasks, not
+    /// loose ones, so the orderly shutdown can join every one — they are roost
+    /// clients, and every client is joined before the tunnels they ride are
+    /// shut. Spawned and taken under the registry lock, so a probe either is
+    /// in the set the shutdown joins or was refused by its closing flag.
+    probes: Mutex<tokio::task::JoinSet<()>>,
+    /// **Every roost one-shot and craze call in flight** (plan 026 §3.3, F2):
+    /// admitted under the registry lock ([`Self::admit`], [`Self::craze_ask`]),
+    /// counted, joined by phase 0 within its bound, and past it cancelled —
+    /// their futures dropped, connections and all — and awaited.
+    admitted: Arc<Admitted>,
+    /// **A removed host's transports** (plan 026 §3.3, F4), held WEAKLY: a
+    /// borrower (an admitted op) can keep a detached host's `SshExec` or
+    /// `SshBridge` alive past its removal, and the shutdown's phases 3 and 4
+    /// drain whatever of them is still alive. Weak, so a removed host's
+    /// transports still drop — and tear down — the moment nothing uses them.
+    retired: Mutex<Retired>,
     /// [`TestGap`]s, armed by a test: [`Self::remove`]'s,
     /// [`Self::observe_sheds`]' and [`Self::craze_create`]'s.
     #[cfg(test)]
@@ -913,6 +935,12 @@ struct Registry {
     /// registration — independently of its roost watcher — and dropped with
     /// it.
     crazes: BTreeMap<HostId, CrazeHost>,
+    /// **Set when the app's orderly shutdown begins** (plan 026 §3.3), never
+    /// cleared. Every registration path reads it in the critical section that
+    /// registers — a reach, a watcher, a craze source, an exec runner, a probe,
+    /// an admitted craze call — so each one either registered before the
+    /// shutdown (and the shutdown finds it) or is refused.
+    closing: bool,
 }
 
 impl Registry {
@@ -946,9 +974,10 @@ impl Registry {
         reach: &Arc<dyn RoostReach>,
         watcher: RoostWatcher,
     ) -> bool {
-        if self.watchers.contains_key(id) {
-            // Lost the race; the loser's watcher is stopped by its own drop here
-            // rather than left running beside the winner's.
+        if self.closing || self.watchers.contains_key(id) {
+            // Lost the race (or the app is quitting); the loser's watcher is
+            // stopped by its own drop here rather than left running beside the
+            // winner's.
             return false;
         }
         match self.reaches.get(id) {
@@ -1073,6 +1102,7 @@ impl RoostHosts {
                 reaches: BTreeMap::new(),
                 watchers: BTreeMap::new(),
                 crazes: BTreeMap::new(),
+                closing: false,
             })),
             handle: handle.clone(),
             config: config.clone(),
@@ -1091,6 +1121,9 @@ impl RoostHosts {
             craze_reaches,
             craze_timings,
             observe_pass: tokio::sync::Mutex::new(()),
+            probes: Mutex::new(tokio::task::JoinSet::new()),
+            admitted: Arc::new(Admitted::default()),
+            retired: Mutex::new(Retired::default()),
             #[cfg(test)]
             remove_gap: Mutex::new(None),
             #[cfg(test)]
@@ -1170,6 +1203,11 @@ impl RoostHosts {
             // no status row sees the watcher without its flag (plan 026 §3.2).
             let mut state = lock(&self.state);
             let mut reg = lock(&self.reg);
+            if reg.closing {
+                // Quitting (plan 026 §3.3): the watcher drops — and stops —
+                // here, and the reach was never installed.
+                return;
+            }
             reg.reaches.insert(id.clone(), reach);
             reg.watchers.insert(id.clone(), watcher);
             if let Some(m) = state.get_mut(&id) {
@@ -1200,6 +1238,9 @@ impl RoostHosts {
         // watchers and two rows.
         {
             let mut reg = lock(&self.reg);
+            if reg.closing {
+                return Err(ShuttingDown.to_string());
+            }
             if reg.ids.contains(&id) {
                 return Err(format!(
                     "a machine named {:?} is already watched",
@@ -1381,6 +1422,14 @@ impl RoostHosts {
     /// against THIS host's own listed rows first — [`Self::listed_row`] — and a
     /// miss is refused by name rather than sent to the wire.
     pub async fn kill(&self, host: &str, slug: &str) -> Result<(), String> {
+        let admitted = self.admit()?;
+        admitted
+            .run(self.kill_admitted(host, slug), || Err(cancelled()))
+            .await
+    }
+
+    /// [`Self::kill`], admitted (plan 026 §3.3, F2).
+    async fn kill_admitted(&self, host: &str, slug: &str) -> Result<(), String> {
         let id = HostId::parse(host)?;
         let reach = self.reach(&id)?;
         let tab_id = parse_tab_id(slug)?;
@@ -1498,6 +1547,32 @@ impl RoostHosts {
         &self,
         host: &str,
         kind: &RcKind,
+        display_name: Option<&str>,
+        workdir: Option<&str>,
+        permission_mode: Option<&str>,
+        initial_prompt: Option<&str>,
+    ) -> Result<Value, String> {
+        let admitted = self.admit()?;
+        admitted
+            .run(
+                self.launch_admitted(
+                    host,
+                    kind,
+                    display_name,
+                    workdir,
+                    permission_mode,
+                    initial_prompt,
+                ),
+                || Err(cancelled()),
+            )
+            .await
+    }
+
+    /// [`Self::launch`], admitted (plan 026 §3.3, F2).
+    async fn launch_admitted(
+        &self,
+        host: &str,
+        kind: &RcKind,
         _display_name: Option<&str>,
         workdir: Option<&str>,
         _permission_mode: Option<&str>,
@@ -1550,6 +1625,21 @@ impl RoostHosts {
         command: &RunCommand,
         workdir: Option<&str>,
     ) -> Result<Value, String> {
+        let admitted = self.admit()?;
+        admitted
+            .run(self.run_admitted(host, command, workdir), || {
+                Err(cancelled())
+            })
+            .await
+    }
+
+    /// [`Self::run`], admitted (plan 026 §3.3, F2).
+    async fn run_admitted(
+        &self,
+        host: &str,
+        command: &RunCommand,
+        workdir: Option<&str>,
+    ) -> Result<Value, String> {
         let id = HostId::parse(host)?;
         self.ensure_registered(&id)?;
         let reach = self.reach(&id)?;
@@ -1579,15 +1669,34 @@ impl RoostHosts {
     /// hub's `hello` lacks `createOptions`/`sessionCreate` — §3.8's "update
     /// craze on this machine"). Anything else — live, dormant, unreachable,
     /// never reached — is tried: the dial says for itself whether it worked.
+    #[allow(clippy::type_complexity)]
     fn craze_ask(
         &self,
         host: &str,
         need: CrazeNeed,
-    ) -> Result<(HostId, CrazeSource, u64, Arc<tokio::sync::Notify>), CrazeFailure> {
+    ) -> Result<
+        (
+            HostId,
+            CrazeSource,
+            u64,
+            Arc<tokio::sync::Notify>,
+            AdmittedGuard,
+        ),
+        CrazeFailure,
+    > {
         let id = HostId::parse(host).map_err(CrazeFailure::bad_request)?;
         // `state`, then `reg`: the one order the two are ever held in.
         let state = lock(&self.state);
         let reg = lock(&self.reg);
+        // **Admitted under the registry lock, or refused** (plan 026 §3.3):
+        // the shutdown sets the flag under this same lock and then waits for
+        // every call it admitted.
+        if reg.closing {
+            return Err(CrazeFailure::new(
+                shed_app::spawn_gate::SHUTTING_DOWN,
+                ShuttingDown.to_string(),
+            ));
+        }
         if !reg.ids.contains(&id) {
             return Err(CrazeFailure::bad_request(unknown_host(&id, &reg.ids)));
         }
@@ -1624,7 +1733,13 @@ impl RoostHosts {
                 _ => {}
             }
         }
-        Ok((id, ask, craze.gen, Arc::clone(&craze.wake)))
+        Ok((
+            id,
+            ask,
+            craze.gen,
+            Arc::clone(&craze.wake),
+            self.admitted.admit(),
+        ))
     }
 
     /// `craze.create_options {machine}` (plan 025 §3.8): what a create can
@@ -1636,8 +1751,19 @@ impl RoostHosts {
     /// running, this is what births one — the create sheet opening. The host's
     /// source is woken either way, so a dormant one attaches to that hub now.
     pub async fn craze_create_options(&self, host: &str) -> Result<Value, CrazeFailure> {
-        let (id, ask, _gen, wake) = self.craze_ask(host, CrazeNeed::CreateOptions)?;
-        let answer = ask.create_options().await;
+        let (id, ask, _gen, wake, _admitted) = self.craze_ask(host, CrazeNeed::CreateOptions)?;
+        let answer = match _admitted
+            .run(async { Some(ask.create_options().await) }, || None)
+            .await
+        {
+            Some(answer) => answer,
+            None => {
+                return Err(CrazeFailure::new(
+                    shed_app::spawn_gate::SHUTTING_DOWN,
+                    cancelled(),
+                ))
+            }
+        };
         wake.notify_one();
         let options = answer.map_err(CrazeFailure::lane)?;
         Ok(json!({ "machine": id.address(), "options": options }))
@@ -1687,7 +1813,7 @@ impl RoostHosts {
         held: bool,
     ) -> Result<Value, CrazeFailure> {
         HostId::parse(host).map_err(CrazeFailure::bad_request)?;
-        let (id, ask, gen, wake) = match self.craze_ask(host, CrazeNeed::Create) {
+        let (id, ask, gen, wake, _admitted) = match self.craze_ask(host, CrazeNeed::Create) {
             Ok(asked) => asked,
             Err(f) if held => {
                 return Err(CrazeFailure::new(
@@ -1702,10 +1828,23 @@ impl RoostHosts {
             Err(f) => return Err(f),
         };
         let request_id = request.request_id.clone();
-        let answer = if held {
-            ask.create_held(request).await
-        } else {
-            ask.create(request).await
+        let creating = async {
+            Some(if held {
+                ask.create_held(request).await
+            } else {
+                ask.create(request).await
+            })
+        };
+        // Cancelled past phase 0's bound (plan 026 §3.3, F2): the create was in
+        // flight, so its outcome is unknown — the sheet keeps its id.
+        let Some(answer) = _admitted.run(creating, || None).await else {
+            return Err(CrazeFailure::new(
+                "outcome_unknown",
+                shed_craze::errors::outcome_unknown(&format!(
+                    "the app quit while this create was in flight on {host}; it may have started a session"
+                ))
+                .to_string(),
+            ));
         };
         wake.notify_one();
         let created = answer.map_err(CrazeFailure::lane)?;
@@ -1763,6 +1902,25 @@ impl RoostHosts {
     /// Closing that tab only DETACHES; `/exit` inside it stops the session
     /// (craze `attach.go`) — which is what the button's tooltip says.
     pub async fn craze_open_terminal(
+        &self,
+        host: &str,
+        session_id: &str,
+    ) -> Result<Value, CrazeFailure> {
+        let admitted = self
+            .admit()
+            .map_err(|e| CrazeFailure::new(shed_app::spawn_gate::SHUTTING_DOWN, e))?;
+        admitted
+            .run(self.craze_open_terminal_admitted(host, session_id), || {
+                Err(CrazeFailure::new(
+                    shed_app::spawn_gate::SHUTTING_DOWN,
+                    cancelled(),
+                ))
+            })
+            .await
+    }
+
+    /// [`Self::craze_open_terminal`], admitted (plan 026 §3.3, F2).
+    async fn craze_open_terminal_admitted(
         &self,
         host: &str,
         session_id: &str,
@@ -2028,7 +2186,7 @@ impl RoostHosts {
         let reg_gen = {
             let state = lock(&self.state);
             let reg = lock(&self.reg);
-            if reg.crazes.contains_key(id) || !reg.ids.contains(id) {
+            if reg.closing || reg.crazes.contains_key(id) || !reg.ids.contains(id) {
                 return;
             }
             match state.get(id) {
@@ -2062,8 +2220,12 @@ impl RoostHosts {
             let mut state = lock(&self.state);
             let mut reg = lock(&self.reg);
             match state.get_mut(id) {
+                // **A reach built outside the lock is installed only if the
+                // app is not quitting** (plan 026 §3.3): read here, in the
+                // install's own critical section.
                 Some(m)
-                    if m.reg_gen == reg_gen
+                    if !reg.closing
+                        && m.reg_gen == reg_gen
                         && reg.ids.contains(id)
                         && !reg.crazes.contains_key(id) =>
                 {
@@ -2267,7 +2429,23 @@ impl RoostHosts {
     /// waited for together ([`Self::remove`]), so a pass holds the others
     /// up for at most about one [`CRAZE_STOP_WAIT`].
     pub async fn observe_sheds(&self, running: &[(String, String)], authoritative: &[String]) {
+        // The UI's `rc.list`/`sheds.refresh` keep landing during a shutdown;
+        // they change nothing once it has begun, and one in flight is admitted
+        // work the shutdown joins (plan 026 §3.3, F2/F4).
+        let Ok(admitted) = self.admit() else {
+            return;
+        };
+        admitted
+            .run(self.observe_sheds_admitted(running, authoritative), || ())
+            .await;
+    }
+
+    /// [`Self::observe_sheds`], admitted.
+    async fn observe_sheds_admitted(&self, running: &[(String, String)], authoritative: &[String]) {
         let _pass = self.observe_pass.lock().await;
+        if lock(&self.reg).closing {
+            return;
+        }
         let answered: BTreeSet<&str> = authoritative.iter().map(String::as_str).collect();
         let live: BTreeSet<HostId> = running
             .iter()
@@ -2322,6 +2500,12 @@ impl RoostHosts {
                     .is_some_and(|server| answered.contains(server) && !live.contains(id))
             })
             .collect();
+        // Re-checked before acting (F4): a shutdown that began while this pass
+        // waited tears everything down itself; a removal now would only race
+        // its phases.
+        if lock(&self.reg).closing {
+            return;
+        }
         self.remove(&stopped).await;
 
         for id in live {
@@ -2368,19 +2552,39 @@ impl RoostHosts {
         let probing = Arc::clone(&self.probing);
         let slots = Arc::clone(&self.probe_slots);
         let hosts = self.watch_handle();
-        self.handle.spawn(async move {
-            let answered = {
-                // The permit is held for the dial and dropped before the watch,
-                // so a slow host occupies a slot for its own probe and not for
-                // anyone else's.
-                let _permit = slots.acquire().await;
-                session_answers(reach.as_ref()).await
-            };
-            if answered {
-                hosts.watch(&id);
+        let task = {
+            let probing = Arc::clone(&probing);
+            let id = id.clone();
+            async move {
+                let answered = {
+                    // The permit is held for the dial and dropped before the
+                    // watch, so a slow host occupies a slot for its own probe
+                    // and not for anyone else's.
+                    let _permit = slots.acquire().await;
+                    session_answers(reach.as_ref()).await
+                };
+                // `watch` re-checks the closing flag under the registry lock
+                // before it spawns a watcher (plan 026 §3.3): a probe that
+                // answers after the shutdown began promotes nothing.
+                if answered {
+                    hosts.watch(&id);
+                }
+                lock(&probing).remove(&id);
             }
+        };
+        // **A tracked task, spawned under the registry lock** (plan 026
+        // §3.3): either it is in the set the shutdown joins, or the closing
+        // flag refused it here.
+        let reg = lock(&self.reg);
+        if reg.closing {
+            drop(reg);
             lock(&probing).remove(&id);
-        });
+            return;
+        }
+        let mut probes = lock(&self.probes);
+        // Finished probes are reaped as new ones arrive.
+        while probes.try_join_next().is_some() {}
+        probes.spawn_on(task, &self.handle);
     }
 
     /// Register a host without watching it: build its reach once, and keep it.
@@ -2394,6 +2598,9 @@ impl RoostHosts {
     fn ensure_registered(&self, id: &HostId) -> Result<(), String> {
         {
             let reg = lock(&self.reg);
+            if reg.closing {
+                return Err(ShuttingDown.to_string());
+            }
             if reg.reaches.contains_key(id) {
                 return Ok(());
             }
@@ -2407,6 +2614,9 @@ impl RoostHosts {
         let lost = {
             let mut state = lock(&self.state);
             let mut reg = lock(&self.reg);
+            if reg.closing {
+                return Err(ShuttingDown.to_string());
+            }
             if reg.reaches.contains_key(id) {
                 // Somebody won the race; theirs is the one the rows belong to.
                 Some(built)
@@ -2443,7 +2653,7 @@ impl RoostHosts {
     fn watch(&self, id: &HostId) {
         let reach = {
             let reg = lock(&self.reg);
-            if reg.watchers.contains_key(id) {
+            if reg.closing || reg.watchers.contains_key(id) {
                 return;
             }
             match reg.reaches.get(id) {
@@ -2556,6 +2766,8 @@ impl RoostHosts {
             flag.store(false, Ordering::Release);
         }
         let (removed, craze, dropped) = {
+            // Lock order: `state`, then `reg`, then `execs`, then `retired` —
+            // and no path takes them the other way round.
             let mut state = lock(&self.state);
             let mut reg = lock(&self.reg);
             // Dropping the watcher aborts its loop; dropping the reach tears
@@ -2565,7 +2777,6 @@ impl RoostHosts {
             let reach = reg.reaches.remove(id);
             reg.ids.retain(|known| known != id);
             let craze = reg.crazes.remove(id);
-            let exec = lock(&self.execs).remove(id);
             // Forgotten, not kept: a shed that stops and starts again is a NEW
             // question, and making the user wait out a cooldown for an answer
             // that has certainly changed would be the wrong way round. (The
@@ -2573,6 +2784,27 @@ impl RoostHosts {
             // goes away takes shed's claim to have started its session with
             // it.)
             lock(&self.probed).remove(id);
+            // Retired, weakly (F4), INSIDE the section that removed them
+            // (R2-3): the reach under `reg`, the exec under a NAMED `execs`
+            // guard held until it is in `retired` (C3 round 3) — phase 3 reads
+            // `reg` then `retired`, phase 4 holds `execs` while it reads
+            // `retired`, so neither snapshot can see a transport in neither
+            // place. If an admitted op still holds this host's bridge or exec,
+            // the shutdown drains it; if nothing does, it drops below exactly
+            // as before.
+            let mut execs = lock(&self.execs);
+            let exec = execs.remove(id);
+            {
+                let mut retired = lock(&self.retired);
+                retired.prune();
+                if let Some(registered) = &reach {
+                    retired.reaches.push(Arc::downgrade(&registered.reach));
+                }
+                if let Some(exec) = &exec {
+                    retired.execs.push(Arc::downgrade(exec));
+                }
+            }
+            drop(execs);
             (state.remove(id), craze, (watcher, reach, exec))
         };
         #[cfg(test)]
@@ -2598,6 +2830,18 @@ impl RoostHosts {
     /// card — and what lets the card carry the fingerprint the install
     /// re-checks.
     pub async fn probe(&self, target: &str) -> Result<Value, BootstrapFailure> {
+        let admitted = self
+            .admit()
+            .map_err(|e| BootstrapFailure::new(Stage::Probe, e))?;
+        admitted
+            .run(self.probe_admitted(target), || {
+                Err(BootstrapFailure::new(Stage::Probe, cancelled()))
+            })
+            .await
+    }
+
+    /// [`Self::probe`], admitted (plan 026 §3.3, F2).
+    async fn probe_admitted(&self, target: &str) -> Result<Value, BootstrapFailure> {
         let (id, probe) = self.run_probe(target).await?;
         let plan = Plan::for_probe(&id.token(), &probe);
         Ok(json!({
@@ -2614,6 +2858,18 @@ impl RoostHosts {
     /// the consent card is built from, and consent has to come before the fetch.
     /// The `fingerprint` it answers with is what [`Self::bootstrap`] re-checks.
     pub async fn preview(&self, target: &str) -> Result<Value, BootstrapFailure> {
+        let admitted = self
+            .admit()
+            .map_err(|e| BootstrapFailure::new(Stage::Probe, e))?;
+        admitted
+            .run(self.preview_admitted(target), || {
+                Err(BootstrapFailure::new(Stage::Probe, cancelled()))
+            })
+            .await
+    }
+
+    /// [`Self::preview`], admitted (plan 026 §3.3, F2).
+    async fn preview_admitted(&self, target: &str) -> Result<Value, BootstrapFailure> {
         let (id, probe) = self.run_probe(target).await?;
         let token = id.token();
         let plan = Plan::for_probe(&token, &probe);
@@ -2671,6 +2927,24 @@ impl RoostHosts {
         fingerprint: &str,
         consent: bool,
     ) -> Result<Result<Installed, BootstrapFailure>, Refusal> {
+        let admitted = self
+            .admit()
+            .map_err(|e| Refusal::ShuttingDown(format!("{target}: {e} — nothing was changed")))?;
+        admitted
+            .run(
+                self.bootstrap_admitted(target, fingerprint, consent),
+                || Ok(Err(bootstrap_cancelled(target))),
+            )
+            .await
+    }
+
+    /// [`Self::bootstrap`], admitted (plan 026 §3.3, F2).
+    async fn bootstrap_admitted(
+        &self,
+        target: &str,
+        fingerprint: &str,
+        consent: bool,
+    ) -> Result<Result<Installed, BootstrapFailure>, Refusal> {
         if !consent {
             return Err(Refusal::ConsentRequired(format!(
                 "{target}: roost.bootstrap needs consent: true — nothing was changed"
@@ -2678,6 +2952,11 @@ impl RoostHosts {
         }
         let id = HostId::parse(target).map_err(Refusal::BadTarget)?;
         let token = id.token();
+        if lock(&self.reg).closing {
+            return Err(Refusal::ShuttingDown(format!(
+                "{token}: {ShuttingDown} — nothing was changed"
+            )));
+        }
         // Held for the WHOLE call — the re-probe, the source resolution and every
         // remote step — and released by its own drop, including on the early
         // returns below and on the outer budget dropping this future.
@@ -2843,6 +3122,11 @@ impl RoostHosts {
     /// follows it are a dozen remote execs, and paying a fresh handshake for
     /// each of them turns a 20-second install into a two-minute one.
     fn exec_for(&self, id: &HostId) -> Result<Arc<SshExec>, String> {
+        // No runner for new work once the shutdown has begun (plan 026 §3.3);
+        // the shutdown's own masters phase reads `execs` directly.
+        if lock(&self.reg).closing {
+            return Err(ShuttingDown.to_string());
+        }
         if let Some(exec) = lock(&self.execs).get(id) {
             return Ok(Arc::clone(exec));
         }
@@ -2851,6 +3135,12 @@ impl RoostHosts {
             SshExec::new(&entry, &self.reach_options.bridge_options())
                 .map_err(|e| e.to_string())?,
         );
+        // `reg`, then `execs` — [`Self::detach`]'s order — so a runner is
+        // either in the map the masters phase reads, or refused.
+        let reg = lock(&self.reg);
+        if reg.closing {
+            return Err(ShuttingDown.to_string());
+        }
         let mut execs = lock(&self.execs);
         // Last writer loses, not wins: a runner built in a lost race is dropped
         // here, which exits its own master and removes its own scratch dir.
@@ -2928,24 +3218,414 @@ impl RoostHosts {
         self.config.servers.iter().map(|s| s.name.clone()).collect()
     }
 
-    /// Ask every `ssh` ControlMaster this layer opened to exit, and remove their
-    /// scratch directories — the explicit half of the teardown, for app quit.
-    ///
-    /// `SshExec`'s own `Drop` does the same thing blockingly for every other way
-    /// a runner can end; this is the path where waiting is possible and a
-    /// `ControlPersist` master outliving the app that opened it would be visible
-    /// (plan 019 §3.6).
-    pub async fn shutdown(&self) {
-        // Every craze source first: aborting a task drops its roster
-        // subscription, whose bridge child dies with it — before the masters
-        // its ssh duplexes ride on are asked to exit.
-        let crazes = std::mem::take(&mut lock(&self.reg).crazes);
-        drop(crazes);
-        let execs: Vec<Arc<SshExec>> = lock(&self.execs).values().cloned().collect();
-        for exec in &execs {
-            exec.shutdown().await;
+    /// The app's spawn gate, as the lane layer's forwards take it (plan 026
+    /// §3.3).
+    pub(crate) fn spawn_gate(&self) -> Option<SpawnGate> {
+        self.reach_options.spawn_gate.clone()
+    }
+
+    /// **Admit one roost one-shot** (plan 026 §3.3, F2) — a launch, a run, a
+    /// tab close, Open in terminal, a probe, a preview, a bootstrap, a sheds
+    /// observation: everything that can dial a host's bridge socket. Admitted
+    /// under the registry lock the closing flag is set under, so a call is
+    /// either refused or tracked from BEFORE it obtains an endpoint until it
+    /// finishes — and phase 0 joins (or, past its bound, cancels) it before
+    /// any tunnel is shut down.
+    fn admit(&self) -> Result<AdmittedGuard, String> {
+        let reg = lock(&self.reg);
+        if reg.closing {
+            return Err(ShuttingDown.to_string());
         }
+        Ok(self.admitted.admit())
+    }
+
+    // -- the orderly shutdown's phases (plan 026 §3.3) -----------------------
+    //
+    // [`crate::shutdown`] runs them in order; each bounds itself.
+
+    /// **Refuse new work from now on** — set with the spawn gate, under the
+    /// registry lock every registration path reads it under.
+    pub fn begin_closing(&self) {
+        lock(&self.reg).closing = true;
+    }
+
+    /// **Phase 0: join this layer's roost clients and its admitted work**,
+    /// within `within` — a bound of its own, not what the gate's close left
+    /// over (plan 026 §3.3, F2). Three joins run side by side:
+    ///
+    /// * every roost WATCHER is aborted at once (a watcher has no end of its
+    ///   own) and awaited;
+    /// * every shed PROBE is given until the soft bound to end, then aborted —
+    ///   and that abort awaited too;
+    /// * every ADMITTED one-shot ([`Self::admit`]: launch, run, tab close,
+    ///   Open in terminal, probe, preview, bootstrap, a sheds observation, and
+    ///   the craze create sheet's calls) is given until the soft bound, then
+    ///   cancelled — its future dropped, its connection with it — and awaited.
+    ///
+    /// They are this app's only clients of a tunnel's bridge socket, so once
+    /// they are joined no connection can arrive while phase 3 shuts the
+    /// tunnels down, and roost's per-connection spawn has nothing to answer
+    /// (R10).
+    ///
+    /// **A client still running at the hard bound** (plan 026 AM4) is one whose
+    /// current poll has not returned — an abort or a cancel takes effect only
+    /// at its next poll. It is counted, logged and abandoned. What that one
+    /// poll can still do: it gets no NEW endpoint (every reach refuses `ensure`
+    /// once the gate has closed, so no tunnel is established) and spawns
+    /// nothing (the gate); but an endpoint it obtained BEFORE the close can
+    /// still be connected to, and roost then serves that connection — §9's
+    /// accept-loop race. That is the residual AM4 records; nothing here claims
+    /// more.
+    pub async fn join_clients(&self, within: Duration) -> JoinedClients {
+        let started = tokio::time::Instant::now();
+        let hard = started + within;
+        let soft = started + within.mul_f64(0.6);
+        let watchers: Vec<RoostWatcher> = {
+            let mut reg = lock(&self.reg);
+            reg.closing = true;
+            std::mem::take(&mut reg.watchers).into_values().collect()
+        };
+        let mut probes = {
+            let _reg = lock(&self.reg);
+            std::mem::take(&mut *lock(&self.probes))
+        };
+        let watcher_count = watchers.len();
+        let probe_count = probes.len();
+
+        // Each watcher aborted and awaited on a task of its own; one past the
+        // hard bound is counted, and its task detached (already aborted).
+        let mut watcher_stops: Vec<tokio::task::JoinHandle<()>> = watchers
+            .into_iter()
+            .map(|watcher| self.handle.spawn(watcher.stop_and_join()))
+            .collect();
+        let watchers_join = async {
+            let mut left = 0;
+            for stop in watcher_stops.iter_mut() {
+                if tokio::time::timeout_at(hard, stop).await.is_err() {
+                    left += 1;
+                }
+            }
+            left
+        };
+        let probes_join = async {
+            let ended = tokio::time::timeout_at(soft, async {
+                while probes.join_next().await.is_some() {}
+            })
+            .await
+            .is_ok();
+            if ended {
+                return (0, 0);
+            }
+            let aborted = probes.len();
+            probes.abort_all();
+            let _ = tokio::time::timeout_at(hard, async {
+                while probes.join_next().await.is_some() {}
+            })
+            .await;
+            // Past the hard bound the set is detached, not aborted again: its
+            // tasks are already aborted and end at their next poll.
+            let left = probes.len();
+            probes.detach_all();
+            (aborted, left)
+        };
+        let admitted_join = async {
+            if self.admitted.wait_idle(soft).await {
+                return (0, 0);
+            }
+            let cancelled = self.admitted.in_flight();
+            self.admitted.cancel_all();
+            self.admitted.wait_idle(hard).await;
+            (cancelled, self.admitted.in_flight())
+        };
+        let (watchers_left, (probes_aborted, probes_left), (cancelled, one_shots_left)) =
+            tokio::join!(watchers_join, probes_join, admitted_join);
+        if watchers_left + probes_left + one_shots_left > 0 {
+            eprintln!(
+                "shed-desktop-tauri: shutdown: roost clients still running at the bound — \
+                 watchers {watchers_left}, probes {probes_left}, one-shots {one_shots_left}; \
+                 each was aborted or cancelled and is abandoned (the gate stays closed)"
+            );
+        }
+        JoinedClients {
+            watchers: watcher_count,
+            watchers_left,
+            probes: probe_count,
+            probes_aborted,
+            probes_left,
+            cancelled,
+            one_shots_left,
+        }
+    }
+
+    /// **Phase 2a: stop every craze source** — [`CrazeHost::stop`] for each,
+    /// in parallel: its task aborted and joined, then every holder of its dial
+    /// waited for, bounded by [`CRAZE_STOP_WAIT`]. Answers `(stopped, late)`.
+    pub async fn stop_crazes(&self) -> (usize, usize) {
+        let crazes: Vec<(HostId, CrazeHost)> = std::mem::take(&mut lock(&self.reg).crazes)
+            .into_iter()
+            .collect();
+        let count = crazes.len();
+        let stops: Vec<(HostId, tokio::task::JoinHandle<bool>)> = crazes
+            .into_iter()
+            .map(|(id, craze)| (id, self.handle.spawn(craze.stop())))
+            .collect();
+        let mut late = 0;
+        for (id, stop) in stops {
+            if !stop.await.unwrap_or(false) {
+                late += 1;
+                eprintln!(
+                    "shed-desktop-tauri: shutdown: {id}'s craze source had not stopped within {}s \
+                     (a lane verb still holds its dial); the registry's drain ends its children",
+                    CRAZE_STOP_WAIT.as_secs()
+                );
+            }
+        }
+        (count, late)
+    }
+
+    /// **Phase 3: every reach's own teardown, all at once, with no outer
+    /// timeout** — [`RoostReach::shutdown`]: an [`shed_app::roost::SshBridge`]
+    /// abandons an establishment in flight, refuses any new one, shuts its live
+    /// tunnel down and joins its teardowns. The registry's reaches AND a
+    /// removed host's still alive in some borrower's hands (F4), then the app's
+    /// shared teardown sink, so a teardown a dropped bridge left running is
+    /// joined too.
+    ///
+    /// roost bounds each itself: a 2 s drain, then a 2 s `exit_master`.
+    /// (Kept as designed, recorded in plan §9: if that `-O exit` is not reaped
+    /// in its 2 s, roost SIGKILLs it and then awaits that kill without a
+    /// bound — which can only hang on an unkillable, uninterruptible-sleep
+    /// child, and the 20 s escape bounds the exit regardless.) Cancelling one
+    /// midway is what would skip its `Drop`, so nothing here does.
+    pub async fn shutdown_reaches(&self) -> usize {
+        let mut reaches: Vec<Arc<dyn RoostReach>> = lock(&self.reg)
+            .reaches
+            .values()
+            .map(|registered| Arc::clone(&registered.reach))
+            .collect();
+        for retired in lock(&self.retired)
+            .reaches
+            .iter()
+            .filter_map(std::sync::Weak::upgrade)
+        {
+            // A transport detached between the two reads is in both.
+            if !reaches.iter().any(|reach| Arc::ptr_eq(reach, &retired)) {
+                reaches.push(retired);
+            }
+        }
+        let count = reaches.len();
+        all(
+            &self.handle,
+            reaches
+                .into_iter()
+                .map(|reach| async move { reach.shutdown().await }),
+        )
+        .await;
+        if let Some(sink) = &self.reach_options.teardowns {
+            sink.join_all().await;
+        }
+        count
+    }
+
+    /// **Phase 4: every `ssh` ControlMaster this layer opened, in parallel**
+    /// — the registry's and a removed host's still alive (F4) —
+    /// [`SshExec::shutdown`], each clamped to one
+    /// [`MASTER_SHUTDOWN_BOUND`](shed_app::roost::MASTER_SHUTDOWN_BOUND)
+    /// (`-O exit`, `-O check`, the verified pid fallback — and, for a master it
+    /// could not confirm, the retried `-O exit` its `Drop` would have run,
+    /// R2-1). Every runner is marked when its shutdown returns, so letting go
+    /// of them below runs no destructor work: N masters take one bound, not one
+    /// plus N serial destructor waits. Answers `(masters, unconfirmed)` — the
+    /// unconfirmed ones abandoned (plan 026 AM4).
+    pub async fn shutdown_execs(&self) -> (usize, usize) {
+        // ONE snapshot of both, `execs` held while `retired` is read (the lock
+        // order `detach` takes them in): `detach` moves a runner from one to
+        // the other under its own `execs` guard, so this read sees it before
+        // the move or after it, never in between (C3 round 3).
+        let execs: Vec<Arc<SshExec>> = {
+            let registered = lock(&self.execs);
+            let retired = lock(&self.retired);
+            let mut execs: Vec<Arc<SshExec>> = registered.values().cloned().collect();
+            for retired in retired.execs.iter().filter_map(std::sync::Weak::upgrade) {
+                if !execs.iter().any(|exec| Arc::ptr_eq(exec, &retired)) {
+                    execs.push(retired);
+                }
+            }
+            execs
+        };
+        let count = execs.len();
+        let unconfirmed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        all(
+            &self.handle,
+            execs.iter().cloned().map(|exec| {
+                let unconfirmed = Arc::clone(&unconfirmed);
+                async move {
+                    if !exec.shutdown().await {
+                        unconfirmed.fetch_add(1, Ordering::SeqCst);
+                        eprintln!(
+                            "shed-desktop-tauri: shutdown: {}'s ssh master could not be confirmed \
+                             ended after a retried -O exit; abandoned",
+                            exec.label()
+                        );
+                    }
+                }
+            }),
+        )
+        .await;
         lock(&self.execs).clear();
+        (count, unconfirmed.load(Ordering::SeqCst))
+    }
+}
+
+/// What [`RoostHosts::join_clients`] found — and what it abandoned at its
+/// hard bound (plan 026 AM4) — for the shutdown's log.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct JoinedClients {
+    pub watchers: usize,
+    /// Watchers whose aborted task had not ended by the bound.
+    pub watchers_left: usize,
+    pub probes: usize,
+    /// Probes still running at the soft bound, and so aborted.
+    pub probes_aborted: usize,
+    /// Probes (aborted) still running at the hard bound.
+    pub probes_left: usize,
+    /// Admitted one-shots still running at the soft bound, and so cancelled.
+    pub cancelled: usize,
+    /// Admitted one-shots (cancelled) still running at the hard bound.
+    pub one_shots_left: usize,
+}
+
+/// What a one-shot cancelled by the shutdown answers.
+fn cancelled() -> String {
+    format!("{ShuttingDown} (the app quit while this was in flight)")
+}
+
+/// What a bootstrap cancelled past phase 0's bound answers. It may have stopped
+/// part way, and the stage cannot be known from here, so the copy says so.
+fn bootstrap_cancelled(target: &str) -> BootstrapFailure {
+    BootstrapFailure::new(
+        Stage::Probe,
+        format!(
+            "{target}: {} — the app quit while this bootstrap ran, and it may have \
+             stopped part way; preview the host again before retrying",
+            cancelled()
+        ),
+    )
+}
+
+/// A removed host's transports, weakly ([`RoostHosts::retired`]).
+#[derive(Default)]
+struct Retired {
+    reaches: Vec<std::sync::Weak<dyn RoostReach>>,
+    execs: Vec<std::sync::Weak<SshExec>>,
+}
+
+impl Retired {
+    fn prune(&mut self) {
+        self.reaches.retain(|reach| reach.strong_count() > 0);
+        self.execs.retain(|exec| exec.strong_count() > 0);
+    }
+}
+
+/// Run `futures` side by side, each on its own task, and wait for all of them.
+/// The tasks are detached, never aborted, if this future is dropped: a teardown
+/// started here finishes.
+async fn all<F>(handle: &tokio::runtime::Handle, futures: impl IntoIterator<Item = F>)
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    let tasks: Vec<tokio::task::JoinHandle<()>> =
+        futures.into_iter().map(|f| handle.spawn(f)).collect();
+    for task in tasks {
+        let _ = task.await;
+    }
+}
+
+/// The roost one-shots and craze calls in flight ([`RoostHosts::admitted`]):
+/// a count, a `Notify` for the shutdown waiting on it, and the cancel signal
+/// it sends past its bound.
+#[derive(Default)]
+pub(crate) struct Admitted {
+    count: std::sync::atomic::AtomicUsize,
+    idle: tokio::sync::Notify,
+    cancelled: AtomicBool,
+    cancel: tokio::sync::Notify,
+}
+
+impl Admitted {
+    fn admit(self: &Arc<Self>) -> AdmittedGuard {
+        self.count.fetch_add(1, Ordering::SeqCst);
+        AdmittedGuard(Arc::clone(self))
+    }
+
+    fn in_flight(&self) -> usize {
+        self.count.load(Ordering::SeqCst)
+    }
+
+    /// Wait until no call is in flight, or `deadline`; whether none was.
+    async fn wait_idle(&self, deadline: tokio::time::Instant) -> bool {
+        loop {
+            let notified = self.idle.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.count.load(Ordering::SeqCst) == 0 {
+                return true;
+            }
+            if tokio::time::timeout_at(deadline, notified).await.is_err() {
+                return self.count.load(Ordering::SeqCst) == 0;
+            }
+        }
+    }
+
+    /// Cancel every call still in flight (they select on [`Self::cancelled`]).
+    fn cancel_all(&self) {
+        self.cancelled.store(true, Ordering::SeqCst);
+        self.cancel.notify_waiters();
+    }
+
+    async fn cancelled(&self) {
+        loop {
+            let notified = self.cancel.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.cancelled.load(Ordering::SeqCst) {
+                return;
+            }
+            notified.await;
+        }
+    }
+}
+
+/// One admitted call; dropped when the call returns (or is dropped).
+pub(crate) struct AdmittedGuard(Arc<Admitted>);
+
+impl AdmittedGuard {
+    /// Run `work` to its end — or, once the shutdown cancels what is left
+    /// past phase 0's bound, drop it and answer `cancelled()`.
+    ///
+    /// **The cancel is polled FIRST** (C3 r1 review): once it is latched, the
+    /// work is dropped without being polled again. It is latched only by the
+    /// shutdown, and every `cancelled()` answer says the outcome is unknown
+    /// ("the app quit while this was in flight"), so a result that happened
+    /// to be ready at the same moment is honestly reported as unknown.
+    async fn run<T>(
+        &self,
+        work: impl std::future::Future<Output = T>,
+        cancelled: impl FnOnce() -> T,
+    ) -> T {
+        tokio::select! {
+            biased;
+            () = self.0.cancelled() => cancelled(),
+            out = work => out,
+        }
+    }
+}
+
+impl Drop for AdmittedGuard {
+    fn drop(&mut self) {
+        if self.0.count.fetch_sub(1, Ordering::SeqCst) == 1 {
+            self.0.idle.notify_waiters();
+        }
     }
 }
 
@@ -2996,7 +3676,7 @@ impl WatchHandle {
     fn watch(&self, id: &HostId) {
         let reach = {
             let reg = lock(&self.reg);
-            if reg.watchers.contains_key(id) {
+            if reg.closing || reg.watchers.contains_key(id) {
                 return;
             }
             match reg.reaches.get(id) {
@@ -3860,6 +4540,9 @@ fn lanes_of(sessions: &[RoostSession]) -> BTreeMap<String, AgentLaneStamp> {
 
 #[cfg(test)]
 mod craze_tests;
+
+#[cfg(test)]
+mod shutdown_tests;
 
 #[cfg(test)]
 mod tests {

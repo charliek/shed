@@ -42,10 +42,12 @@
 //! client would need its own re-acquire protocol and the watcher could not be
 //! written once.
 
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::sync::{Arc, Condvar, Mutex, Weak};
+use std::time::{Duration, Instant};
 
 use shed_core::machine;
+
+use crate::spawn_gate::{SlotClose, SpawnGate, SpawnSection, SHUTTING_DOWN};
 
 /// An arbitrary far-side loopback port for the tests (and the faked-`ssh` seam)
 /// that only care that a forward carries whatever port it was handed. It was
@@ -56,6 +58,20 @@ const SOME_REMOTE_PORT: u16 = 1029;
 
 /// How long to wait for a freshly-established forward's local end to answer.
 const FORWARD_READY_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How long a killed forward child is waited for (`try_wait` polling) before
+/// it is left to the kernel — plan 026 §3.3's bound on every reap, so no
+/// teardown and no destructor can block an exit on a `waitpid` that does not
+/// return.
+const REAP_BOUND: Duration = Duration::from_secs(1);
+
+/// How long [`MachineForward::close_now`] waits for an `ensure` already in
+/// flight on the blocking pool to notice the closed slot and return (plan 026
+/// §3.3: ≤ 0.5 s; its readiness loop re-checks every [`READY_POLL`]).
+const IN_FLIGHT_WAIT: Duration = Duration::from_millis(500);
+
+/// The readiness loop's poll interval, and the local probe's connect budget.
+const READY_POLL: Duration = Duration::from_millis(100);
 
 /// A forward could not be established.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -108,6 +124,25 @@ pub trait MachineForward: Send + Sync {
     ///
     /// [`ensure`]: MachineForward::ensure
     fn looks_alive(&self) -> bool {
+        true
+    }
+
+    /// **Close this forward now, whoever else still holds it** (plan 026
+    /// §3.3): kill and reap whatever child it owns, and refuse every later
+    /// `ensure`. The app's orderly shutdown calls it on every forward it can
+    /// reach, because dropping one is not enough — the last reference can sit
+    /// in an aborted pump's future or a detached thread.
+    ///
+    /// **Blocking and bounded**: a kill, a reap bounded by its own deadline,
+    /// and a bounded wait for an `ensure` in flight. Never call it on an async
+    /// worker. Answers whether it SETTLED within those bounds: `false` when a
+    /// reap or an `ensure` was still running at its bound (its child already
+    /// SIGKILLed) and was abandoned (plan 026 AM4), for the shutdown's log.
+    ///
+    /// The default does nothing and answers `true`, which is right for a
+    /// forward this side does not own ([`FixedPort`]) and keeps every other
+    /// implementor compiling.
+    fn close_now(&self) -> bool {
         true
     }
 }
@@ -169,6 +204,13 @@ pub struct SshForward {
     /// would spawn onto the same local port and the loser (killed by
     /// `ExitOnForwardFailure`) could be the one we keep.
     ensuring: tokio::sync::Mutex<()>,
+    /// The app's spawn gate (plan 026 §3.3), when it has one: every spawn of
+    /// this forward runs inside one of its sections, and the slot is registered
+    /// with it so the drain can close it. `None` by default.
+    gate: Option<SpawnGate>,
+    /// The `ensure`s whose blocking half is running — what
+    /// [`MachineForward::close_now`] waits (bounded) to see end.
+    in_flight: Arc<InFlight>,
     /// **Test seam** (see [`SshForward::reserve_faked`]): an argv prefix exec'd
     /// in place of `ssh`, with the real ssh argv handed to it as ignored
     /// trailing arguments. Compiled away outside `cfg(test)`.
@@ -203,9 +245,18 @@ impl SshForward {
             label,
             child: Arc::new(ChildSlot::default()),
             ensuring: tokio::sync::Mutex::new(()),
+            gate: None,
+            in_flight: Arc::new(InFlight::default()),
             #[cfg(test)]
             exec_prefix: None,
         })
+    }
+
+    /// Spawn only inside `gate`'s sections, and register the slot with it
+    /// (plan 026 §3.3). A forward without one — the default — spawns freely.
+    pub fn with_spawn_gate(mut self, gate: SpawnGate) -> Self {
+        self.gate = Some(gate);
+        self
     }
 
     /// **Test-only:** a forward that execs `exec_prefix` (plus the real ssh
@@ -273,7 +324,7 @@ impl SshForward {
     /// Is the child gone (exited, reaped elsewhere, or never spawned)?
     fn child_is_dead(&self) -> bool {
         let mut guard = self.child.lock();
-        match guard.as_mut() {
+        match guard.child.as_mut() {
             None => true,
             // A probe error means it was reaped elsewhere — either way there is
             // no tunnel to wait for.
@@ -296,23 +347,32 @@ impl MachineForward for SshForward {
     }
 
     async fn ensure(&self) -> Result<(), ForwardError> {
+        // A closed forward is closed for good (plan 026 §3.3): refused before
+        // the lock, and again under it.
+        if self.child.is_closed() {
+            return Err(shutting_down(&self.label));
+        }
         // One ensure at a time (see the `ensuring` field).
         let _serialized = self.ensuring.lock().await;
+        if self.child.is_closed() {
+            return Err(shutting_down(&self.label));
+        }
         if !self.child_is_dead() && self.port_answers().await? {
             return Ok(());
         }
-        // Kill any predecessor BEFORE spawning: a child that is merely
-        // unresponsive (rather than exited) still holds the local port, and
-        // leaving it running would both orphan it and doom the replacement to
-        // `ExitOnForwardFailure`.
-        kill_child(&self.child);
 
         let argv = self.spawn_argv();
         let port = self.port;
         let label = self.label.clone();
         let slot = Arc::clone(&self.child);
-        // Spawning and the readiness poll are both blocking; keep them off the
-        // async worker so a slow-to-refuse host cannot stall the runtime.
+        let gate = self.gate.clone();
+        // Counted INTO the blocking task: an `ensure` whose future is dropped
+        // mid-await still has its blocking half running, and that half is what
+        // could spawn.
+        let in_flight = self.in_flight.enter();
+        // Spawning, the predecessor's kill and the readiness poll are all
+        // blocking; keep them off the async worker so a slow-to-refuse host
+        // cannot stall the runtime, and no `kill`/`waitpid` runs on one.
         //
         // The slot is handed INTO the blocking task so the child is recorded
         // the instant it exists. `spawn_blocking` tasks cannot be aborted — if
@@ -320,31 +380,122 @@ impl MachineForward for SshForward {
         // routine), the task still runs to completion, and storing the child
         // only after `.await` would orphan an `ssh -N -L` process that nothing
         // can ever kill: `std::process::Child`'s `Drop` does not kill.
-        let outcome =
-            tokio::task::spawn_blocking(move || spawn_and_wait(&slot, &argv, port, &label))
-                .await
-                .map_err(|e| ForwardError(format!("forward task failed: {e}")))?;
-        if outcome.is_err() {
-            // A failed attempt must not leave a half-established tunnel behind.
-            kill_child(&self.child);
-        }
-        outcome
+        tokio::task::spawn_blocking(move || {
+            let _in_flight = in_flight;
+            // Kill any predecessor BEFORE spawning: a child that is merely
+            // unresponsive (rather than exited) still holds the local port, and
+            // leaving it running would both orphan it and doom the replacement
+            // to `ExitOnForwardFailure`.
+            kill_child(&slot);
+            let outcome = spawn_and_wait(&slot, &argv, port, &label, gate.as_ref());
+            if outcome.is_err() {
+                // A failed attempt must not leave a half-established tunnel
+                // behind — killed here, inside the task, so a dropped `ensure`
+                // cannot skip it.
+                kill_child(&slot);
+            }
+            outcome
+        })
+        .await
+        .map_err(|e| ForwardError(format!("forward task failed: {e}")))?
+    }
+
+    /// Close the slot — its child killed and reaped (bounded), every later
+    /// store refused — then wait at most [`IN_FLIGHT_WAIT`] for an `ensure`
+    /// already in flight to notice and return. **Blocking.** Answers whether
+    /// both settled within their bounds.
+    fn close_now(&self) -> bool {
+        let settled = self.child.close();
+        let idle = self.in_flight.wait_idle(IN_FLIGHT_WAIT);
+        settled && idle
     }
 }
 
 impl Drop for SshForward {
+    /// Through the slot's close (plan 026 §3.3, F5): the kill is the slot's
+    /// recorded obligation while it runs, so a registry close that finds the
+    /// slot empty mid-drop waits (bounded) for this kill instead of reading
+    /// "empty" as "nothing here". This drop usually runs on
+    /// `OwnedForward`'s detached thread.
     fn drop(&mut self) {
-        kill_child(&self.child);
+        let _ = self.child.close();
     }
 }
 
 /// Kill + reap whatever child is in `slot`, and empty it. Idempotent, and safe
 /// on an already-reaped child (`try_wait` caches the status and `kill` refuses
-/// to signal a reaped process, so no recycled PID can be hit).
+/// to signal a reaped process, so no recycled PID can be hit). The child is
+/// TAKEN under the slot's mutex — and the kill recorded there as in progress —
+/// and killed outside it, the reap bounded. Unlike [`ChildSlot::close`] it
+/// leaves the slot open: it is the respawn's own teardown.
 fn kill_child(slot: &ChildSlot) {
-    if let Some(mut child) = slot.lock().take() {
-        let _ = child.kill();
-        let _ = child.wait();
+    let deadline = Instant::now() + REAP_BOUND;
+    let child = slot.lock().take_for_kill();
+    if let Some(child) = child {
+        slot.reap_taken(child, deadline);
+    }
+}
+
+/// SIGKILL `child`, then reap it — `try_wait` polling for at most
+/// [`REAP_BOUND`]. A child that is still not reapable then is left to the
+/// kernel: an exit must never wait on a `waitpid` that does not return.
+fn kill_and_reap(mut child: std::process::Child) {
+    let _ = child.kill();
+    reap_until(&mut child, Instant::now() + REAP_BOUND);
+}
+
+fn reap_until(child: &mut std::process::Child, deadline: Instant) {
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) | Err(_) => return,
+            Ok(None) if Instant::now() >= deadline => return,
+            Ok(None) => std::thread::sleep(Duration::from_millis(5)),
+        }
+    }
+}
+
+/// The error a closed forward or a closed gate answers with.
+fn shutting_down(label: &str) -> ForwardError {
+    ForwardError(format!(
+        "{SHUTTING_DOWN}: the app is quitting, so the hub tunnel to {label} is not started"
+    ))
+}
+
+/// The `ensure`s whose blocking half is running: a count, and a `Condvar` —
+/// its one waiter is [`MachineForward::close_now`], which runs on a plain OS
+/// thread.
+#[derive(Default)]
+struct InFlight {
+    count: Mutex<usize>,
+    idle: Condvar,
+}
+
+impl InFlight {
+    fn enter(self: &Arc<Self>) -> InFlightGuard {
+        *self.count.lock().unwrap_or_else(|e| e.into_inner()) += 1;
+        InFlightGuard(Arc::clone(self))
+    }
+
+    /// Wait at most `within` for the count to reach zero; whether it did.
+    fn wait_idle(&self, within: Duration) -> bool {
+        let guard = self.count.lock().unwrap_or_else(|e| e.into_inner());
+        let (guard, _) = self
+            .idle
+            .wait_timeout_while(guard, within, |count| *count > 0)
+            .unwrap_or_else(|e| e.into_inner());
+        *guard == 0
+    }
+}
+
+struct InFlightGuard(Arc<InFlight>);
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        let mut count = self.0.count.lock().unwrap_or_else(|e| e.into_inner());
+        *count = count.saturating_sub(1);
+        if *count == 0 {
+            self.0.idle.notify_all();
+        }
     }
 }
 
@@ -370,15 +521,211 @@ fn kill_child(slot: &ChildSlot) {
 /// the eviction and the spawn happened in, and without any storer having to
 /// remember a check. It is the natural completion of the "hand the slot INTO
 /// the task" design: the slot owns the child, so the slot owns killing it.
+///
+/// **And it can be closed for good** (plan 026 §3.3). The orderly shutdown
+/// cannot wait for a last reference that may live in an aborted pump's future
+/// or a detached thread, so [`ChildSlot::close`] evicts permanently: it marks
+/// the slot closed and TAKES the child under the mutex, then kills and reaps it
+/// outside it, bounded. The store a spawn makes ([`ChildSlot::store`]) checks
+/// the same flag under the same mutex, so a child spawned after the close is
+/// killed at once — by the store's ordering, not by some later drop.
+///
+/// **An empty slot is not a dead child** (F5). Whoever takes the child to kill
+/// it records the kill as in progress (`killing`) until its reap is done, so a
+/// [`ChildSlot::close`] that finds the slot empty while another thread — a
+/// detached `SshForward` drop, say — still owns an unfinished reap waits for it
+/// (bounded).
+///
+/// **And the SIGKILL is sent before the child leaves the slot** (R2-2, plan
+/// 026 AM4): under the slot's mutex — `Child::kill` sends the signal and does
+/// not wait — so a child counted in `killing` has always been signalled
+/// already. A thread descheduled after taking it can delay only the REAP; a
+/// close whose bound passes first returns with that child SIGKILLed, and says
+/// so.
 #[derive(Default)]
-struct ChildSlot(Mutex<Option<std::process::Child>>);
+struct ChildSlot {
+    state: Mutex<SlotState>,
+    /// Signalled when the last kill in progress has finished.
+    settled: Condvar,
+    /// Test seam: run after a teardown took the child (already SIGKILLed,
+    /// under the mutex) and before its reap — a destroying thread descheduled
+    /// at the worst moment.
+    #[cfg(test)]
+    at_taken: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    /// Test seam: run inside the spawn section, before the spawn — a spawn
+    /// admitted before a close and descheduled until after it.
+    #[cfg(test)]
+    at_spawn: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    /// Test record: the pid of every child spawned into this slot, taken at
+    /// the spawn itself (a child killed at once may never run far enough to
+    /// say so itself).
+    #[cfg(test)]
+    spawned: Mutex<Vec<i32>>,
+    /// Test seam: run just before the reap, outside the mutex — where a test
+    /// proves the mutex is not held.
+    #[cfg(test)]
+    at_reap: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+}
+
+#[derive(Default)]
+struct SlotState {
+    child: Option<std::process::Child>,
+    /// Set by [`ChildSlot::close`], never cleared.
+    closed: bool,
+    /// Whether this slot is in the spawn gate's registry — entered inside the
+    /// first spawn section that used it, held weakly there, so it leaves when
+    /// the slot drops.
+    registered: bool,
+    /// Kills in progress: children taken out of this slot whose kill and reap
+    /// some thread has not finished yet.
+    killing: usize,
+}
+
+impl SlotState {
+    /// SIGKILL the child HERE — the caller holds the slot's mutex, and `kill`
+    /// sends the signal without waiting — then take it for its reap, recording
+    /// the reap as in progress (R2-2). `kill` on a child already reaped is a
+    /// no-op (std caches its status), so no recycled pid is ever signalled.
+    fn take_for_kill(&mut self) -> Option<std::process::Child> {
+        let mut child = self.child.take()?;
+        let _ = child.kill();
+        self.killing += 1;
+        Some(child)
+    }
+}
 
 impl ChildSlot {
     /// The guard, ignoring poisoning — this module's rule, for the reason
-    /// [`crate::machine`]'s peers give: the data behind it is one `Option`, and
-    /// a panic elsewhere must not turn a tunnel into an un-killable one.
-    fn lock(&self) -> std::sync::MutexGuard<'_, Option<std::process::Child>> {
-        self.0.lock().unwrap_or_else(|e| e.into_inner())
+    /// [`crate::machine`]'s peers give: the data behind it is one child and a
+    /// flag, and a panic elsewhere must not turn a tunnel into an un-killable
+    /// one.
+    fn lock(&self) -> std::sync::MutexGuard<'_, SlotState> {
+        self.state.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn is_closed(&self) -> bool {
+        self.lock().closed
+    }
+
+    /// Record a freshly spawned child — unless the slot was closed, in which
+    /// case the child is killed and reaped here and now and the store answers
+    /// [`SHUTTING_DOWN`]. The check and the store are one critical section, so
+    /// a close can land before it (the child is refused) or after it (the close
+    /// takes the child), never between.
+    fn store(&self, child: std::process::Child, label: &str) -> Result<(), ForwardError> {
+        let mut state = self.lock();
+        if state.closed {
+            // Signalled under the mutex, like every other kill here (R2-2).
+            let mut child = child;
+            let _ = child.kill();
+            state.killing += 1;
+            drop(state);
+            self.reap_taken(child, Instant::now() + REAP_BOUND);
+            return Err(shutting_down(label));
+        }
+        state.child = Some(child);
+        Ok(())
+    }
+
+    /// Register this slot with `gate`, inside the spawn's `section` — and, on a
+    /// gate that has CLOSED, close the slot here and now (its child killed and
+    /// reaped, bounded) and answer [`SHUTTING_DOWN`] (plan 026 §3.3, F1): a
+    /// section admitted before the close whose child came after it must not
+    /// leave that child for a drain that may already have passed. Blocking —
+    /// this is the spawn's own blocking thread.
+    fn register(
+        self: &Arc<Self>,
+        gate: &SpawnGate,
+        section: &SpawnSection,
+        label: &str,
+    ) -> Result<(), ForwardError> {
+        if !gate.is_closed() && self.lock().registered {
+            return Ok(());
+        }
+        let weak: Weak<dyn SlotClose> = Arc::downgrade(self) as Weak<ChildSlot>;
+        match gate.register_slot(section, weak) {
+            Ok(()) => {
+                self.lock().registered = true;
+                Ok(())
+            }
+            Err(_) => {
+                self.close();
+                Err(shutting_down(label))
+            }
+        }
+    }
+
+    /// Reap a child taken from this slot — SIGKILLed already, under the mutex,
+    /// and its reap recorded as in progress — until `deadline`, and settle the
+    /// record. Outside the mutex.
+    fn reap_taken(&self, mut child: std::process::Child, deadline: Instant) {
+        #[cfg(test)]
+        if let Some(hook) = self
+            .at_taken
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+        {
+            hook();
+        }
+        #[cfg(test)]
+        if let Some(hook) = self
+            .at_reap
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+        {
+            hook();
+        }
+        reap_until(&mut child, deadline);
+        let mut state = self.lock();
+        state.killing = state.killing.saturating_sub(1);
+        if state.killing == 0 {
+            self.settled.notify_all();
+        }
+    }
+
+    /// Close for good: mark it closed, and SIGKILL and take the child, under
+    /// the mutex; then reap it OUTSIDE the mutex — and wait for any reap
+    /// another thread has in progress. All of it within one [`REAP_BOUND`].
+    /// Idempotent.
+    ///
+    /// Answers whether it SETTLED. A reap another thread still owns at the
+    /// bound (a destroy descheduled after taking its child) is abandoned to
+    /// that thread — its child was SIGKILLed before it left the slot — and
+    /// that is said (plan 026 AM4).
+    fn close(&self) -> bool {
+        let deadline = Instant::now() + REAP_BOUND;
+        let child = {
+            let mut state = self.lock();
+            state.closed = true;
+            state.take_for_kill()
+        };
+        if let Some(child) = child {
+            self.reap_taken(child, deadline);
+        }
+        let state = self.lock();
+        let left = deadline.saturating_duration_since(Instant::now());
+        let (state, _) = self
+            .settled
+            .wait_timeout_while(state, left, |state| state.killing > 0)
+            .unwrap_or_else(|e| e.into_inner());
+        let unsettled = state.killing;
+        drop(state);
+        if unsettled > 0 {
+            tracing::warn!(
+                unsettled,
+                "forward slot: a reap another thread owns had not finished by the bound; its \
+                 child was SIGKILLed before it left the slot, and the reap is abandoned to it"
+            );
+        }
+        unsettled == 0
+    }
+}
+
+impl SlotClose for ChildSlot {
+    fn close(&self) -> bool {
+        ChildSlot::close(self)
     }
 }
 
@@ -386,9 +733,9 @@ impl Drop for ChildSlot {
     fn drop(&mut self) {
         // `get_mut` rather than `lock`: we hold `&mut self`, so there is no
         // contention to wait on and no way to deadlock against a poisoned lock.
-        if let Some(mut child) = self.0.get_mut().unwrap_or_else(|e| e.into_inner()).take() {
-            let _ = child.kill();
-            let _ = child.wait();
+        let state = self.state.get_mut().unwrap_or_else(|e| e.into_inner());
+        if let Some(child) = state.child.take() {
+            kill_and_reap(child);
         }
     }
 }
@@ -406,28 +753,63 @@ impl Drop for ChildSlot {
 /// forward would otherwise make `port_answers` true on the first evaluation and
 /// a doomed child would be reported ready without its exit ever being consulted.
 fn spawn_and_wait(
-    slot: &ChildSlot,
+    slot: &Arc<ChildSlot>,
     argv: &[String],
     port: u16,
     label: &str,
+    gate: Option<&SpawnGate>,
 ) -> Result<(), ForwardError> {
     let (bin, rest) = argv.split_first().expect("ssh argv is never empty");
+    // **The spawn section** (plan 026 §3.3): check → spawn → store → register,
+    // all under the gate's shared guard, so a close either waits for this
+    // spawn to be recorded where the drain finds it or refuses it outright.
+    let section = match gate {
+        Some(gate) => Some(gate.enter().map_err(|_| shutting_down(label))?),
+        None => None,
+    };
+    if slot.is_closed() {
+        return Err(shutting_down(label));
+    }
+    #[cfg(test)]
+    if let Some(hook) = slot
+        .at_spawn
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .take()
+    {
+        hook();
+    }
     let child = std::process::Command::new(bin)
         .args(rest)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .spawn()
         .map_err(|e| ForwardError(format!("opening the hub tunnel to {label}: {e}")))?;
+    #[cfg(test)]
+    slot.spawned
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push(child.id() as i32);
     // Recorded before anything can fail or be cancelled — this is the only
-    // window in which the process is untracked, and it is now just `spawn`.
-    *slot.lock() = Some(child);
+    // window in which the process is untracked, and it is now just `spawn`. A
+    // slot closed meanwhile kills it here.
+    slot.store(child, label)?;
+    if let (Some(gate), Some(section)) = (gate, section.as_ref()) {
+        slot.register(gate, section, label)?;
+    }
+    drop(section);
 
     let deadline = std::time::Instant::now() + FORWARD_READY_TIMEOUT;
     loop {
+        // A close ends the wait within about one poll (plan 026 §3.3): it took
+        // the child, and nothing here may outlive it.
+        if slot.is_closed() {
+            return Err(shutting_down(label));
+        }
         // Exit status first, then readiness (see the doc above).
         let exited = {
             let mut guard = slot.lock();
-            match guard.as_mut() {
+            match guard.child.as_mut() {
                 Some(child) => match child.try_wait() {
                     Ok(Some(status)) => Some(status.to_string()),
                     Ok(None) => None,
@@ -450,12 +832,15 @@ fn spawn_and_wait(
                 "the hub tunnel to {label} did not come up"
             )));
         }
-        std::thread::sleep(Duration::from_millis(100));
+        std::thread::sleep(READY_POLL);
     }
 }
 
+/// Does the local end accept a connection — within [`READY_POLL`]? Bounded,
+/// so a close lands within about one poll even when the connect would hang.
 fn port_answers(port: u16) -> bool {
-    std::net::TcpStream::connect(("127.0.0.1", port)).is_ok()
+    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+    std::net::TcpStream::connect_timeout(&addr, READY_POLL).is_ok()
 }
 
 /// An unused loopback port: bind `:0`, read the assignment, release.
@@ -512,6 +897,25 @@ mod tests {
     /// child has run at all and every "how many were spawned" assertion below
     /// races the log. The listener lives in the task's output, so awaiting the
     /// handle hands the test something to hold the port with.
+    /// Stop a test tunnel answering — for EVERY copy of its fd, not just
+    /// this one. A plain drop closes one descriptor; a child that another test
+    /// thread forked a moment earlier holds an inherited copy until its exec
+    /// (CLOEXEC), and the kernel keeps accepting on the port meanwhile — so a
+    /// re-ensure probing the port right after the drop could read the dead
+    /// tunnel as alive and skip its respawn (#397; diagnosed in plan 026 C3's
+    /// fix round 2: the cell's first child still alive, nothing listening on
+    /// the port seconds later). `shutdown(2)` takes a listening socket out of
+    /// LISTEN for every descriptor that shares it. On a platform where it does
+    /// not apply to a listener, it fails harmlessly and the drop still closes.
+    fn close_tunnel(listener: std::net::TcpListener) {
+        use std::os::fd::AsRawFd as _;
+        // SAFETY: shutdown(2) on a socket this test owns; no memory is touched.
+        unsafe {
+            libc::shutdown(listener.as_raw_fd(), libc::SHUT_RDWR);
+        }
+        drop(listener);
+    }
+
     fn tunnel_once_started(
         port: u16,
         log: &Path,
@@ -648,7 +1052,7 @@ mod tests {
 
         // Kill the tunnel so the next ensure genuinely re-establishes rather
         // than short-circuiting on a healthy child.
-        drop(tunnel);
+        close_tunnel(tunnel);
         let tunnel = tunnel_once_started(port, &log, 2);
         forward.ensure().await.expect("the re-establish");
         let _tunnel = tunnel.await.expect("the tunnel task");
@@ -746,7 +1150,7 @@ mod tests {
             .spawn()
             .expect("the fake forward starts");
         let pid = child.id() as i32;
-        *queued.lock() = Some(child);
+        queued.lock().child = Some(child);
         assert!(pid_is_alive(pid), "the fake forward really started");
 
         // The task ends, releasing the last reference.
@@ -794,14 +1198,14 @@ mod tests {
         assert_eq!(pids.len(), 1, "exactly one forward process was started");
         wait_for("the child to be recorded", || !forward.child_is_dead()).await;
         assert_eq!(
-            slot.lock().as_ref().map(std::process::Child::id),
+            slot.lock().child.as_ref().map(std::process::Child::id),
             Some(pids[0] as u32),
             "the recorded child must be the process that was actually spawned"
         );
 
         drop(forward);
         assert!(
-            slot.lock().is_none(),
+            slot.lock().child.is_none(),
             "dropping the forward reaps and clears the child"
         );
         assert!(
@@ -864,7 +1268,7 @@ mod tests {
 
         // The tunnel stops forwarding while its process lives on — from here
         // the local port refuses, but the child is still very much running.
-        drop(tunnel);
+        close_tunnel(tunnel);
         assert!(
             !forward.child_is_dead(),
             "the wedged child is still running"
@@ -917,5 +1321,401 @@ mod tests {
 
         drop(forward);
         assert!(!pid_is_alive(pids[0]));
+    }
+
+    // ---- plan 026 §3.3: the orderly shutdown's half of the forward ----
+
+    /// Spawn `argv` as a fake forward child, the way `spawn_and_wait` does.
+    fn spawn_fake(argv: &[String]) -> std::process::Child {
+        let (bin, rest) = argv.split_first().expect("argv is never empty");
+        std::process::Command::new(bin)
+            .args(rest)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .expect("the fake forward starts")
+    }
+
+    /// **A child stored after `close()` is killed by the store itself** — by
+    /// the store's ordering, while the slot is still held, not by a later
+    /// last-reference drop (plan 026 §3.3).
+    #[test]
+    fn a_child_stored_after_close_is_killed_by_the_store() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log = dir.path().join("spawns");
+        let slot = Arc::new(ChildSlot::default());
+        slot.close();
+
+        let child = spawn_fake(&fake_ssh(&log, "exec sleep 30"));
+        let pid = child.id() as i32;
+        let err = slot
+            .store(child, "machine:mini3")
+            .expect_err("a closed slot refuses the store");
+        assert!(err.0.starts_with(SHUTTING_DOWN), "{err}");
+        assert!(slot.lock().child.is_none(), "nothing was recorded");
+        assert!(
+            !pid_is_alive(pid),
+            "pid {pid} outlived a store into a closed slot — and the slot is still held"
+        );
+    }
+
+    /// **A child that ignores SIGTERM is still gone when `close()` returns**,
+    /// within the reap bound — the kill is a SIGKILL — and the slot's mutex is
+    /// never held across the reap (plan 026 §3.3, R12): the seam between the
+    /// kill and the reap finds the mutex free.
+    #[test]
+    fn closing_a_slot_whose_child_ignores_sigterm_is_bounded_and_reaps_outside_the_mutex() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log = dir.path().join("spawns");
+        let slot = Arc::new(ChildSlot::default());
+        let child = spawn_fake(&fake_ssh(&log, "trap '' TERM; exec sleep 30"));
+        let pid = child.id() as i32;
+        slot.store(child, "machine:mini3")
+            .expect("an open slot stores");
+
+        let free_during_reap = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        {
+            let probe = Arc::clone(&slot);
+            let free = Arc::clone(&free_during_reap);
+            *slot.at_reap.lock().unwrap() = Some(Box::new(move || {
+                free.store(
+                    probe.state.try_lock().is_ok(),
+                    std::sync::atomic::Ordering::SeqCst,
+                );
+            }));
+        }
+        let started = std::time::Instant::now();
+        slot.close();
+        assert!(
+            started.elapsed() < REAP_BOUND + Duration::from_millis(500),
+            "close took {:?}",
+            started.elapsed()
+        );
+        assert!(
+            free_during_reap.load(std::sync::atomic::Ordering::SeqCst),
+            "the slot's mutex was held across the reap"
+        );
+        assert!(!pid_is_alive(pid), "pid {pid} survived close()");
+        assert!(slot.is_closed());
+    }
+
+    /// **`close_now` kills a live forward's child whoever holds it, and the
+    /// forward stays closed**: a later `ensure` answers `shutting_down` and
+    /// spawns nothing.
+    #[tokio::test]
+    async fn close_now_kills_the_child_and_refuses_every_later_ensure() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log = dir.path().join("spawns");
+        let forward = Arc::new(
+            SshForward::reserve_faked(entry(), fake_ssh(&log, "exec sleep 30")).expect("reserve"),
+        );
+        let tunnel = tunnel_once_started(forward.port(), &log, 1);
+        forward.ensure().await.expect("the first ensure");
+        let _tunnel = tunnel.await.expect("the tunnel task");
+        let pids = spawned_pids(&log);
+        assert_eq!(pids.len(), 1);
+
+        // A second holder, as an aborted pump's future would be.
+        let held = Arc::clone(&forward);
+        let closing = Arc::clone(&forward);
+        tokio::task::spawn_blocking(move || closing.close_now())
+            .await
+            .expect("close_now");
+        assert!(
+            !pid_is_alive(pids[0]),
+            "the forward's child outlived close_now"
+        );
+
+        let err = held
+            .ensure()
+            .await
+            .expect_err("a closed forward stays closed");
+        assert!(err.0.starts_with(SHUTTING_DOWN), "{err}");
+        assert_eq!(spawned_pids(&log), pids, "a closed forward spawned again");
+    }
+
+    /// **An `ensure` in flight when the forward is closed ends within about one
+    /// poll, and its child is dead on return** — the readiness loop re-checks
+    /// the slot every poll, and `close_now` waits (bounded) for it.
+    #[tokio::test]
+    async fn close_now_ends_an_ensure_in_flight_and_its_child() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log = dir.path().join("spawns");
+        // Nothing ever listens on the port: the ensure sits in its readiness loop.
+        let forward = Arc::new(
+            SshForward::reserve_faked(entry(), fake_ssh(&log, "exec sleep 30")).expect("reserve"),
+        );
+        let ensuring = Arc::clone(&forward);
+        let task = tokio::spawn(async move { ensuring.ensure().await });
+        wait_for("the forward process to start", || {
+            !spawned_pids(&log).is_empty()
+        })
+        .await;
+        let pid = spawned_pids(&log)[0];
+
+        let closing = Arc::clone(&forward);
+        let started = std::time::Instant::now();
+        tokio::task::spawn_blocking(move || closing.close_now())
+            .await
+            .expect("close_now");
+        let outcome = tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("the in-flight ensure returned")
+            .expect("the ensure task");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "took {:?}",
+            started.elapsed()
+        );
+        let err = outcome.expect_err("an ensure closed mid-flight fails");
+        assert!(err.0.starts_with(SHUTTING_DOWN), "{err}");
+        assert!(!pid_is_alive(pid), "pid {pid} outlived the close");
+        assert_eq!(spawned_pids(&log).len(), 1, "nothing respawned");
+    }
+
+    /// **A closed gate refuses the spawn itself**: the forward's `ensure`
+    /// answers `shutting_down` and the fake ssh never ran.
+    #[tokio::test]
+    async fn a_closed_gate_refuses_the_forward_spawn() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log = dir.path().join("spawns");
+        let gate = SpawnGate::new();
+        let forward = SshForward::reserve_faked(entry(), fake_ssh(&log, "exec sleep 30"))
+            .expect("reserve")
+            .with_spawn_gate(gate.clone());
+        assert!(gate.close(Duration::from_millis(100)).await);
+        let err = forward
+            .ensure()
+            .await
+            .expect_err("a closed gate spawns nothing");
+        assert!(err.0.starts_with(SHUTTING_DOWN), "{err}");
+        assert!(
+            spawned_pids(&log).is_empty(),
+            "the fake ssh ran past a closed gate"
+        );
+    }
+
+    /// **The slot is registered with the gate, so the drain closes it whoever
+    /// holds the forward**: `close_slots` kills a live tunnel's child while the
+    /// forward itself is still alive.
+    #[tokio::test]
+    async fn the_gate_registers_the_slot_and_its_drain_kills_the_child() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log = dir.path().join("spawns");
+        let gate = SpawnGate::new();
+        let forward = SshForward::reserve_faked(entry(), fake_ssh(&log, "exec sleep 30"))
+            .expect("reserve")
+            .with_spawn_gate(gate.clone());
+        let tunnel = tunnel_once_started(forward.port(), &log, 1);
+        forward.ensure().await.expect("the first ensure");
+        let _tunnel = tunnel.await.expect("the tunnel task");
+        let pid = spawned_pids(&log)[0];
+
+        assert!(gate.close(Duration::from_millis(100)).await);
+        let drain = gate.clone();
+        let closed = tokio::task::spawn_blocking(move || drain.close_slots())
+            .await
+            .expect("close_slots");
+        assert_eq!(
+            closed,
+            crate::spawn_gate::SlotsClosed {
+                closed: 1,
+                unsettled: 0
+            },
+            "the forward's slot was registered, and settled"
+        );
+        assert!(!pid_is_alive(pid), "pid {pid} outlived the gate's drain");
+        assert!(
+            forward.child_is_dead(),
+            "the forward still holds a child after the drain"
+        );
+    }
+
+    // ---- plan 026 C3 fix round 1 ----
+
+    /// **A detached destroy mid-kill is waited for** (F5): the forward's drop
+    /// (on `OwnedForward`'s thread) has taken the child and is descheduled
+    /// before its reap; the shutdown's slot sweep finds the slot EMPTY — and
+    /// waits for that reap (within its bound) instead of returning at once.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_slot_sweep_waits_for_a_destroy_in_progress() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log = dir.path().join("spawns");
+        let gate = SpawnGate::new();
+        let forward = SshForward::reserve_faked(entry(), fake_ssh(&log, "exec sleep 30"))
+            .expect("reserve")
+            .with_spawn_gate(gate.clone());
+        let tunnel = tunnel_once_started(forward.port(), &log, 1);
+        forward.ensure().await.expect("the first ensure");
+        let _tunnel = tunnel.await.expect("the tunnel task");
+        let pid = spawned_pids(&log)[0];
+
+        let (reached_tx, reached_rx) = std::sync::mpsc::channel::<()>();
+        let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
+        *forward.child.at_taken.lock().unwrap() = Some(Box::new(move || {
+            let _ = reached_tx.send(());
+            let _ = go_rx.recv();
+        }));
+        let destroying = std::thread::spawn(move || drop(forward));
+        reached_rx
+            .recv()
+            .expect("the destroy took the child and paused");
+
+        let sweep = {
+            let gate = gate.clone();
+            tokio::task::spawn_blocking(move || {
+                let started = std::time::Instant::now();
+                let closed = gate.close_slots();
+                assert_eq!(closed.unsettled, 0, "the sweep settled: {closed:?}");
+                started.elapsed()
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            !sweep.is_finished(),
+            "the sweep returned while a kill was still in progress"
+        );
+        go_tx.send(()).expect("release the destroy");
+        let took = sweep.await.expect("the sweep");
+        assert!(
+            took >= Duration::from_millis(250),
+            "the sweep did not wait: {took:?}"
+        );
+        assert!(
+            !pid_is_alive(pid),
+            "pid {pid} was alive when the sweep returned"
+        );
+        destroying.join().expect("the destroy");
+    }
+
+    /// Whether `pid` is gone or a zombie — exited (here: SIGKILLed) and not
+    /// yet reaped by its parent. `ps -o stat=` (macOS and Linux alike, no
+    /// `/proc`); a zombie's state starts with `Z`.
+    fn gone_or_zombie(pid: i32) -> bool {
+        if !pid_is_alive(pid) {
+            return true;
+        }
+        let out = std::process::Command::new("ps")
+            .args(["-o", "stat=", "-p", &pid.to_string()])
+            .output()
+            .expect("ps");
+        let stat = String::from_utf8_lossy(&out.stdout);
+        let stat = stat.trim();
+        stat.is_empty() || stat.starts_with('Z')
+    }
+
+    /// **A destroy descheduled past the sweep's bound has already signalled
+    /// its child** (R2-2, plan 026 AM4): the forward's drop took the child
+    /// and is paused before its reap for longer than the slot sweep waits.
+    /// The sweep returns at its bound and SAYS it did not settle — and the
+    /// child, SIGKILLed under the slot's mutex before it left the slot, is
+    /// already dead (a zombie the paused thread has yet to reap).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_destroy_paused_past_the_sweeps_bound_has_already_signalled_its_child() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log = dir.path().join("spawns");
+        let gate = SpawnGate::new();
+        let forward = SshForward::reserve_faked(entry(), fake_ssh(&log, "exec sleep 30"))
+            .expect("reserve")
+            .with_spawn_gate(gate.clone());
+        let tunnel = tunnel_once_started(forward.port(), &log, 1);
+        forward.ensure().await.expect("the first ensure");
+        // Let go of the port at once: the child is what this cell is about,
+        // and a listener held through the >1 s pause below only widens the
+        // window in which another cell can meet it (a reserved port is
+        // released until its tunnel binds it).
+        close_tunnel(tunnel.await.expect("the tunnel task"));
+        let pid = spawned_pids(&log)[0];
+
+        let (reached_tx, reached_rx) = std::sync::mpsc::channel::<()>();
+        let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
+        *forward.child.at_taken.lock().unwrap() = Some(Box::new(move || {
+            let _ = reached_tx.send(());
+            let _ = go_rx.recv();
+        }));
+        let destroying = std::thread::spawn(move || drop(forward));
+        reached_rx
+            .recv()
+            .expect("the destroy took the child and paused");
+
+        let (closed, took, dead) = {
+            let gate = gate.clone();
+            tokio::task::spawn_blocking(move || {
+                let started = std::time::Instant::now();
+                let closed = gate.close_slots();
+                // Read AT the sweep's return, the destroy still paused.
+                (closed, started.elapsed(), gone_or_zombie(pid))
+            })
+            .await
+            .expect("the sweep")
+        };
+        assert_eq!(
+            closed,
+            crate::spawn_gate::SlotsClosed {
+                closed: 1,
+                unsettled: 1
+            },
+            "the sweep reports the reap it abandoned"
+        );
+        assert!(
+            took >= REAP_BOUND - Duration::from_millis(50)
+                && took < REAP_BOUND + Duration::from_millis(500),
+            "the sweep returned at its bound: {took:?}"
+        );
+        assert!(
+            dead,
+            "pid {pid} was still running when the sweep gave up on its reap"
+        );
+        go_tx.send(()).expect("release the destroy");
+        destroying.join().expect("the destroy");
+        assert!(!pid_is_alive(pid), "pid {pid} was never reaped");
+    }
+
+    /// **A spawn admitted before the close and made after it closes its own
+    /// slot** (F1): the section was entered while the gate was open, the close
+    /// gave up waiting for it, the spawn happened anyway — and the slot's
+    /// registration, finding the gate closed, killed the child at once.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_spawn_after_a_timed_out_close_is_killed_at_registration() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log = dir.path().join("spawns");
+        let gate = SpawnGate::new();
+        let forward = Arc::new(
+            SshForward::reserve_faked(entry(), fake_ssh(&log, "exec sleep 30"))
+                .expect("reserve")
+                .with_spawn_gate(gate.clone()),
+        );
+        let (reached_tx, reached_rx) = std::sync::mpsc::channel::<()>();
+        let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
+        *forward.child.at_spawn.lock().unwrap() = Some(Box::new(move || {
+            let _ = reached_tx.send(());
+            let _ = go_rx.recv();
+        }));
+        let ensuring = Arc::clone(&forward);
+        let ensure = tokio::spawn(async move { ensuring.ensure().await });
+        tokio::task::spawn_blocking(move || reached_rx.recv())
+            .await
+            .expect("join")
+            .expect("the spawn section was entered and paused");
+
+        assert!(
+            !gate.close(Duration::from_millis(100)).await,
+            "the close gave up on the section"
+        );
+        go_tx.send(()).expect("release the spawn");
+        let err = tokio::time::timeout(Duration::from_secs(5), ensure)
+            .await
+            .expect("the ensure returned")
+            .expect("the ensure task")
+            .expect_err("a child registered on a closed gate is refused");
+        assert!(err.0.starts_with(SHUTTING_DOWN), "{err}");
+        let pids = forward.child.spawned.lock().unwrap().clone();
+        assert_eq!(pids.len(), 1, "the late spawn happened");
+        assert!(
+            !pid_is_alive(pids[0]),
+            "the late child {} survived its registration",
+            pids[0]
+        );
+        assert!(forward.child.is_closed(), "the slot closed itself");
     }
 }

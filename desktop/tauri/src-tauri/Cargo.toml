@@ -58,7 +58,10 @@ reqwest = { version = "0.12", default-features = false }
 # signatures would stop accepting these types. Bump both together.
 roost-ipc = { git = "https://github.com/charliek/roost", rev = "2bc71fa3848ddbf2d190aab6c4ef61ad2d432aa1" }
 # "process" backs the Linux AuthGate (the pkcheck subprocess; the notifier is zbus).
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "net", "io-util", "time", "process"] }
+# "signal" backs the orderly shutdown's signal thread (plan 026 §3.3) — DECLARED
+# here rather than left to roost-ipc's feature unification, which already
+# enables it (so the lock does not move).
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "net", "io-util", "time", "process", "signal"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 base64 = "0.22"

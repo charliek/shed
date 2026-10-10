@@ -103,6 +103,23 @@ re-implemented per language. The root `CLAUDE.md` owns the monorepo layout + rel
   `SshExec::spawn_duplex(command)` (C9) is the long-lived sibling of `SshExec::run` — the
   same pinned config and private ControlMaster, all three bands piped, killed on drop —
   that the desktop's remote craze dial runs `craze bridge --hub` through.
+  `spawn_gate.rs` (plan 026 §3.3, ungated) is the desktop's orderly-shutdown barrier: a
+  `SpawnGate` whose sections every spawn site takes across check → spawn → registration
+  (`SshExec`, `SshForward`'s slot and `SshBridge`'s establishment, each through an optional
+  gate — `SshBridgeOptions::spawn_gate`, `SshForward::with_spawn_gate`, `None` for the phone)
+  and a registry of kill-and-await handles (never a pid) the drain ends; `close()` waits,
+  bounded, for every section in progress, a registration on a closed gate kills its own child
+  and answers `shutting_down` (counted, with the pid of any whose exit it did not see), and the
+  drain waits for open sections and sweeps again rather than reading one snapshot — reporting
+  what it abandoned at its bound (`Drained`, `SlotsClosed`; plan 026 AM4). A forward slot
+  sends its SIGKILL under its mutex, before the child leaves it. Alongside it:
+  `MachineForward::close_now` (answering whether it settled), `RoostReach::shutdown` and
+  `TunnelOpener::open_owned` (all defaulted), the bridge's teardown `JoinSet`
+  (`TeardownSink`), and `SshExec::shutdown`'s bounded `-O exit` plus its pid fallback
+  (verified against the control path with `ps`), every step — including the retry an
+  unconfirmed master's `Drop` would have made — clamped to one `MASTER_SHUTDOWN_BOUND`, after
+  which the runner is marked so its `Drop` does nothing.
+  `shed-craze`'s `ExitWatch::pid()` exists only to name a child in such a log.
 - **`shed-core-ffi`** — a thin UniFFI wrapper (`crate-type = ["staticlib", "lib"]`)
   exposing a `ShedCore` object to Swift. The `.a` is what the app links (signing/notarization
   unchanged); `lib` is required so `cargo run -p shed-core-ffi --bin uniffi-bindgen` works

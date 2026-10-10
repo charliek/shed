@@ -486,31 +486,59 @@ def _launch(mock, *, runtime_dir: Path, craze: CrazeEnv | None, roost: FakeRoost
         raise RuntimeError(f"tauri binary not found at {cfg.binary}; build it first (make tauri-build).")
     agent = FakeHostAgent()
     agent.start()
-    sock = runtime_dir / cfg.sock_rel
-    log = runtime_dir / "craze-ui.log"
-    env = ui.subproc_env(
-        cfg, runtime_dir=runtime_dir, mock_base_url=mock.base_url,
-        config_path=config, host_agent_socket=agent.socket_path,
-        roost_sockets={LOCAL: roost.socket_path} if roost else None,
-        ssh_bin=ssh_bin,
-        craze_path=craze.path_dir if craze else None,
-        craze_home=craze.craze_home if craze else None,
-        craze_runtime_dir=craze.runtime if craze else None)
-    log_fh = open(log, "wb")
-    proc = subprocess.Popen([str(cfg.binary)], env=env, stdout=log_fh, stderr=subprocess.STDOUT)
-    ui.await_hermetic("tauri", sock=sock, mock_base_url=mock.base_url, proc=proc, log=log)
-    client = TauriClient(sock)
-    client.wait_until(lambda: client.current_pane() is not None, timeout=30,
-                      what="tauri frontend ready")
+    client = proc = log_fh = None
+    try:
+        sock = runtime_dir / cfg.sock_rel
+        log = runtime_dir / "craze-ui.log"
+        env = ui.subproc_env(
+            cfg, runtime_dir=runtime_dir, mock_base_url=mock.base_url,
+            config_path=config, host_agent_socket=agent.socket_path,
+            roost_sockets={LOCAL: roost.socket_path} if roost else None,
+            ssh_bin=ssh_bin,
+            craze_path=craze.path_dir if craze else None,
+            craze_home=craze.craze_home if craze else None,
+            craze_runtime_dir=craze.runtime if craze else None)
+        log_fh = open(log, "wb")
+        proc = subprocess.Popen([str(cfg.binary)], env=env, stdout=log_fh, stderr=subprocess.STDOUT)
+        ui.await_hermetic("tauri", sock=sock, mock_base_url=mock.base_url, proc=proc, log=log)
+        client = TauriClient(sock)
+        client.wait_until(lambda: client.current_pane() is not None, timeout=30,
+                          what="tauri frontend ready")
+    except BaseException:
+        # A launch that failed after its spawn still owns what it started (plan
+        # 026 §3.3, F9): the app — and with it its children — its log handle and
+        # its agent, each released even if another's release fails.
+        try:
+            if client is not None:
+                client.close()
+        finally:
+            try:
+                if proc is not None:
+                    ui.terminate(proc)
+            finally:
+                try:
+                    if log_fh is not None:
+                        log_fh.close()
+                finally:
+                    agent.stop()
+        raise
     return client, proc, log_fh, agent
 
 
 def _stop(client, proc, log_fh, agent) -> None:
     if client is not None:
         client.close()
+    started = time.monotonic()
     ui.terminate(proc)
+    took = time.monotonic() - started
     log_fh.close()
     agent.stop()
+    print(f"\n[craze] app pid {proc.pid} stopped in {took:.2f}s (exit {proc.returncode})")
+    # Plan 026 §3.3: the harness's SIGTERM runs the app's orderly shutdown,
+    # which ends it by itself — the 5 s grace, and the SIGKILL after it, must
+    # never be what ends an app.
+    assert proc.returncode != -signal.SIGKILL, \
+        f"the app needed the harness's SIGKILL after {took:.2f}s: its orderly shutdown hung"
 
 
 @pytest.fixture(scope="module")
@@ -1701,9 +1729,12 @@ def _fake_ssh(root: Path) -> str:
     """A stand-in for `ssh` that runs each remote command in the jail its
     destination's USER names, recording every command first.
 
-    * `-O exit` is a recorded no-op; a remote `true` (roost's warm-up)
-      succeeds; roost's `client-bridge` chain is answered `command not found`
-      (these machines run no roost-session — they are craze hosts).
+    * `-O exit` is a recorded no-op (each one's control path is appended to
+      `exits.log`), held while the root's `wedge-exit` switch exists — a
+      wedged master (plan 026 §3.3); `-O check` finds no master (there is no
+      master process here); a remote `true` (roost's warm-up) succeeds;
+      roost's `client-bridge` chain is answered `command not found` (these
+      machines run no roost-session — they are craze hosts).
     * **A craze command naming an absolute ladder rung is REFUSED and
       recorded, never run** — the production ladder would reach this host's
       own craze there, and the remote dials must be the jailed composition.
@@ -1729,12 +1760,14 @@ ctl=
 want=0
 prev=
 is_exit=0
+is_check=0
 dest=
 cmd=
 for arg in "$@"; do
     if [ "$want" -eq 1 ]; then ctl="$arg"; want=0; fi
     if [ "$arg" = "-S" ]; then want=1; fi
     if [ "$prev" = "-O" ] && [ "$arg" = "exit" ]; then is_exit=1; fi
+    if [ "$prev" = "-O" ] && [ "$arg" = "check" ]; then is_check=1; fi
     case "$arg" in
         *" "*) ;;
         *@*) dest="$arg" ;;
@@ -1743,8 +1776,14 @@ for arg in "$@"; do
     cmd="$arg"
 done
 if [ "$is_exit" -eq 1 ]; then
+    printf 'exit %s\n' "$ctl" >> "$root/exits.log"
+    while [ -e "$root/wedge-exit" ]; do sleep 0.1; done
     if [ -n "$ctl" ]; then rm -f "$ctl"; fi
     exit 0
+fi
+if [ "$is_check" -eq 1 ]; then
+    printf 'Control socket connect(%s): No such file or directory\n' "$ctl" >&2
+    exit 255
 fi
 if [ -n "$ctl" ] && [ ! -e "$ctl" ]; then : > "$ctl"; fi
 user=${{dest##*://}}
@@ -2334,3 +2373,335 @@ def test_a_stopped_dormant_shed_leaves_where(app_shed, shed_rig, shed_mock):
         _close_launch(app)
     assert _offered(app, name) is None, "a stopped shed is no entry"
     assert not any("bridge --hub" in c for c in shed_rig.commands(name))
+
+
+# ---------------------------------------------------------------------------
+# (7) the orderly shutdown, from every exit path (plan 026 §3.3, shed#389)
+# ---------------------------------------------------------------------------
+
+#: The signal cells' remote machine: a live hub there (the harness's own
+#: bridge holds it, started BEFORE launch), reached through the fake ssh.
+SIG_MACHINE = "craze-sig"
+SIG_FAKE_HOST = "0e0e0e0e0e0e"
+SIG_CONFIG = f"""servers:
+    mock:
+        host: 127.0.0.1
+        http_port: 8080
+        ssh_port: 2222
+default_server: mock
+sheds: {{}}
+machines:
+    {SIG_MACHINE}:
+        host: craze-host
+        user: {SIG_MACHINE}
+"""
+
+
+def _ps_table() -> dict[int, tuple[int, str]]:
+    """pid → (ppid, args), every process — `ps`, POSIX, no `/proc`."""
+    out = subprocess.run(["ps", "-A", "-ww", "-o", "pid=,ppid=,args="],
+                         capture_output=True, text=True, check=False)
+    table: dict[int, tuple[int, str]] = {}
+    for line in out.stdout.splitlines():
+        parts = line.split(None, 2)
+        if len(parts) >= 2 and parts[0].isdigit() and parts[1].isdigit():
+            table[int(parts[0])] = (int(parts[1]), parts[2] if len(parts) > 2 else "")
+    return table
+
+
+def _descendants(root: int, table: dict[int, tuple[int, str]] | None = None) -> dict[int, str]:
+    """Every process descended from `root` (a ppid walk), `root` excluded: pid → args."""
+    table = table if table is not None else _ps_table()
+    kids: dict[int, list[int]] = {}
+    for pid, (ppid, _) in table.items():
+        kids.setdefault(ppid, []).append(pid)
+    found: dict[int, str] = {}
+    todo = list(kids.get(root, []))
+    while todo:
+        pid = todo.pop()
+        if pid in found or pid in (0, 1, root):
+            continue
+        found[pid] = table[pid][1]
+        todo.extend(kids.get(pid, []))
+    return found
+
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+class SigRig:
+    """One signal cell's world (plan 026 §3.3) — everything its OWN app
+    instance needs, never the module's shared `app`: this machine's craze
+    (the recording seam over the real binary, its own HOME and hub), and one
+    remote machine through the fake ssh with a live hub of its own."""
+
+    def __init__(self, bins: Path, *, wedge: bool = False):
+        self.root = Path(tempfile.mkdtemp(prefix="shsg-", dir="/tmp")).resolve()
+        self.started = None
+        self.holder = None
+        self.local = None
+        self.remote = None
+        try:
+            # 0700 all the way down: craze refuses a runtime dir beneath a
+            # group-writable ancestor.
+            local = _mkdir_0700(self.root / "local")
+            self.local = CrazeEnv(bins, local, local / "h")
+            self.remote = Remote(bins, jails=((SIG_MACHINE, "recipe"),), prefix="shsr-")
+            live = self.remote.jails[SIG_MACHINE]
+            live.fake_host(SIG_FAKE_HOST, "craze-sig-fake")
+            self.holder = live.bridge()
+            assert self.holder.call("hello", HELLO)["endpoint"]["kind"] == "hub"
+            self.local.fake_host(FAKE_HOST, FAKE_SESSION)
+            self.config = self.root / "config.yaml"
+            self.config.write_text(SIG_CONFIG)
+            if wedge:
+                (self.remote.root / "wedge-exit").touch()
+        except BaseException:
+            # A rig that failed halfway still owns what it started. The
+            # original failure is the one reported.
+            try:
+                self.teardown()
+            except BaseException:
+                pass
+            raise
+
+    def launch(self, mock):
+        """An app instance of this rig's own: its HOME is the local namespace's."""
+        self.started = _launch(mock, runtime_dir=self.local.home, craze=self.local, roost=None,
+                               ssh_bin=self.remote.ssh, config=self.config)
+        return self.started
+
+    def exits(self) -> list[str]:
+        log = self.remote.root / "exits.log"
+        return log.read_text().splitlines() if log.exists() else []
+
+    def teardown(self) -> list[int]:
+        """Every step runs, whatever an earlier one raised (plan 026 §3.3, F9):
+        an app that needed the harness's SIGKILL is reported only once the
+        holder is closed and both namespaces are swept — the first failure is
+        re-raised at the end, with any craze process left behind printed."""
+        failures: list[BaseException] = []
+        left: list[int] = []
+
+        def step(do):
+            try:
+                do()
+            except BaseException as failure:  # re-raised below, once all ran
+                failures.append(failure)
+
+        if self.remote is not None:
+            step(lambda: (self.remote.root / "wedge-exit").unlink(missing_ok=True))
+        if self.started is not None:
+            started, self.started = self.started, None
+            step(lambda: _stop(*started))
+        if self.holder is not None:
+            step(self.holder.close)
+        if self.local is not None:
+            step(lambda: left.extend(self.local.teardown()))
+        if self.remote is not None:
+            step(lambda: left.extend(self.remote.teardown()))
+        shutil.rmtree(self.root, ignore_errors=True)
+        if failures:
+            if left:
+                print(f"\n[craze] signal rig: craze processes left behind: {left}")
+            raise failures[0]
+        return left
+
+
+@pytest.fixture
+def sig_rig(bins):
+    """A FUNCTION-scoped rig (plan 026 §3.3): each signal cell signals an app
+    instance of its own, the way `test_tauri_downhost.py`'s fixture does —
+    signalling the module's shared `app` would end every later cell's app."""
+    rig = SigRig(bins)
+    try:
+        yield rig
+    finally:
+        left = rig.teardown()
+        assert not left, f"craze processes left behind: {left}"
+
+
+@pytest.fixture
+def wedged_rig(bins):
+    """A signal cell's rig whose masters WEDGE on `-O exit` (the fake ssh holds
+    it while its `wedge-exit` switch exists)."""
+    rig = SigRig(bins, wedge=True)
+    try:
+        yield rig
+    finally:
+        left = rig.teardown()
+        assert not left, f"craze processes left behind: {left}"
+
+
+def _remote_lane(app: TauriClient, host_id: str) -> None:
+    """Open the remote machine's craze lane on `host_id` and wait for its seed."""
+    args = {"machine": SIG_MACHINE, "kind": KIND, "session_id": host_id}
+    app.call("lane.open", args)
+    app.wait_until(lambda: app.call("lane.messages", args)["generation"] >= 1, timeout=WAIT,
+                   what=f"the seeded remote craze lane on {host_id}")
+
+
+def _set_up_children(app: TauriClient, rig: SigRig) -> str:
+    """Every child class the harness can reach (plan 026 §3.3's table): this
+    machine's roster and an open local lane (class C, local craze bridges), a
+    session CREATED through the app (its `craze serve` is the hub's, so it must
+    outlive the app), and the remote machine's roster and an open lane over the
+    fake ssh, with that host's `SshExec` master (class B). Answers the created
+    session's hostId."""
+    app.wait_until(lambda: _row(app, FAKE_HOST) is not None, timeout=WAIT,
+                   what="this machine's craze row")
+    cwd = _mkdir_0700(rig.local.root / "w-sig")
+    created = app.call("craze.create", {"machine": LOCAL, "cwd": str(cwd),
+                                        "prompt": "hello quit"})
+    host = created["host_id"]
+    app.wait_until(lambda: _row(app, host) is not None, timeout=WAIT,
+                   what="the created session's row")
+    _ready(app, FAKE_HOST)
+    _ready(app, host)
+    app.wait_until(lambda: _row(app, SIG_FAKE_HOST, machine=SIG_MACHINE) is not None,
+                   timeout=WAIT, what="the remote machine's craze row")
+    _remote_lane(app, SIG_FAKE_HOST)
+    assert rig.remote.live_bridges(SIG_MACHINE), "the remote lane's ssh bridge runs"
+    return host
+
+
+def _app_owned(app_pid: int, rig: SigRig) -> tuple[dict[int, str], set[int]]:
+    """The app's DESCENDANT tree, recorded by walking ppids from its pid — and,
+    listed apart, the persistent processes it does not own: this machine's
+    craze hub (by its own record) and everything under it (its session hosts
+    and their agents). A hub is the bridge's child until that bridge exits, so
+    it sits inside the app's tree while the app runs, and must be told apart."""
+    table = _ps_table()
+    tree = _descendants(app_pid, table)
+    persistent: set[int] = set()
+    for hub in rig.local.hub_pids():
+        if hub in table and table[hub][1].startswith(str(rig.local.real)):
+            persistent.add(hub)
+            persistent.update(_descendants(hub, table))
+    owned = {pid: args for pid, args in tree.items() if pid not in persistent}
+    return owned, persistent
+
+
+def _quit(app: TauriClient, proc: subprocess.Popen, how: str) -> None:
+    if how == "app.quit":
+        app.call("app.quit")
+    else:
+        os.kill(proc.pid, getattr(signal, how))
+
+
+@pytest.mark.parametrize("how", ["SIGTERM", "SIGINT", "SIGHUP", "app.quit"])
+def test_sigterm_leaves_no_app_children(sig_rig, mock, how):
+    """**Every exit path ends every child the app owns, and nothing it does
+    not** (plan 026 §3.3, shed#389). An app instance of the cell's own is set
+    up with a local craze lane (jailed), a session created through it, and a
+    remote fake-ssh machine with an open lane and its `SshExec` master; its
+    descendant tree is recorded; then it is sent SIGTERM, SIGINT or SIGHUP by
+    its RECORDED pid — or the test-mode `app.quit` door, the tray's own
+    `app.exit(0)`. Then:
+
+    * it exits by itself within 5 s (the harness's kill is never used);
+    * every recorded app-owned descendant is dead — checked before any sweep;
+    * the fake ssh logged `-O exit` for the remote host's `SshExec` master;
+    * the craze hub and the created session still run, and `craze ps` lists
+      the session;
+    * a relaunched app re-opens its lane."""
+    rig = sig_rig
+    app, proc, _log_fh, _agent = rig.launch(mock)
+    host = _set_up_children(app, rig)
+    owned, persistent = _app_owned(proc.pid, rig)
+    hubs = [p for p in rig.local.hub_pids() if p in persistent]
+    assert hubs, "this machine's hub was recorded among the persistent processes"
+    bridges = [pid for pid, args in owned.items() if "bridge" in args or "ssh" in args]
+    assert bridges, f"the app's craze bridges were recorded among its children: {owned}"
+
+    started = time.monotonic()
+    _quit(app, proc, how)
+    try:
+        code = proc.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        pytest.fail(f"{how}: the app did not exit by itself within 5 s")
+    took = time.monotonic() - started
+
+    # Every recorded app-owned descendant: dead — checked before any sweep.
+    # The shutdown kills AND awaits its own children before the app exits, so
+    # they are gone already; the half second (F9: at most 0.5 s) is for what
+    # the shutdown does not own — a WebKit helper noticing its parent went, a
+    # killed child's zombie being reaped once it is reparented.
+    deadline = time.monotonic() + 0.5
+    while time.monotonic() < deadline and [p for p in owned if _pid_alive(p)]:
+        time.sleep(0.05)
+    survivors = {p: owned[p] for p in owned if _pid_alive(p)}
+    assert not survivors, f"{how}: app-owned children outlived the app: {survivors}"
+    # The child that WOULD outlive a hard kill: the remote host's `SshExec`
+    # ControlMaster. ssh daemonizes it, so it is never in the descendant tree
+    # above (the craze bridges and WebKit's helpers end with the app on their
+    # own) — its proof is the `-O exit` the fake ssh logged.
+    exits = rig.exits()
+    assert any("shed-roost-x" in line for line in exits), \
+        f"{how}: the remote host's SshExec master was never asked to -O exit: {exits}"
+
+    assert code == 0, f"{how}: an orderly exit is a clean one (exit {code})"
+    said = [line for line in (rig.local.home / "craze-ui.log").read_text(errors="replace").splitlines()
+            if "shutdown" in line]
+    assert any("shutdown: done" in line for line in said), \
+        f"{how}: the orderly shutdown did not run: {said}"
+    print(f"\n{how}: exited by itself in {took:.2f}s\n" + "\n".join(said))
+
+    # The persistent processes the app does not own: still there.
+    for hub in hubs:
+        assert _pid_alive(hub) and _program_args(hub).startswith(str(rig.local.real)), \
+            f"{how}: the craze hub {hub} did not survive the app"
+    ps = subprocess.run([str(rig.local.real / "craze"), "ps", "--json"], env=rig.local.env(),
+                        capture_output=True, text=True, timeout=30, cwd=str(rig.local.root))
+    assert host in ps.stdout, f"{how}: craze ps no longer lists the session: {ps.stdout} {ps.stderr}"
+
+    # A relaunched app re-opens its lane (the first instance's own handles
+    # released first: it has exited).
+    first, rig.started = rig.started, None
+    first[0].close()
+    first[2].close()
+    first[3].stop()
+    app2, _proc2, _fh2, _agent2 = rig.launch(mock)
+    app2.wait_until(lambda: _row(app2, host) is not None, timeout=WAIT,
+                    what="the session's row after the relaunch")
+    _ready(app2, host)
+
+
+def test_a_second_signal_exits_at_once(wedged_rig, mock):
+    """**A second signal is the escape hatch** (plan 026 §3.3): with the remote
+    masters' `-O exit` WEDGED (the fake ssh holds it), the first SIGTERM's
+    orderly shutdown is held in its tunnels/masters phase; a second SIGTERM
+    ends the app at once, with status 143 (128 + SIGTERM)."""
+    rig = wedged_rig
+    app, proc, _log_fh, _agent = rig.launch(mock)
+    app.wait_until(lambda: _row(app, SIG_FAKE_HOST, machine=SIG_MACHINE) is not None,
+                   timeout=WAIT, what="the remote machine's craze row")
+    # The wedge is on from launch, so roost's own replace path may have logged
+    # (and been held by) `-O exit`s already: wait for one the SHUTDOWN sends,
+    # past its craze phase — and only then signal again. A second SIGTERM sent
+    # before the signal thread took the first is coalesced with it by the OS
+    # and tokio, which is no test of the escape.
+    before = len(rig.exits())
+    ui_log = rig.local.home / "craze-ui.log"
+    os.kill(proc.pid, signal.SIGTERM)
+    deadline = time.monotonic() + scaled_timeout(15)
+    while not (len(rig.exits()) > before
+               and "shutdown: phase 2" in ui_log.read_text(errors="replace")):
+        assert proc.poll() is None, f"the app exited ({proc.returncode}) before any -O exit wedged"
+        assert time.monotonic() < deadline, "the shutdown sent no -O exit to the wedged fake ssh"
+        time.sleep(0.05)
+    assert proc.poll() is None, "the shutdown is held by the wedge"
+    second = time.monotonic()
+    os.kill(proc.pid, signal.SIGTERM)
+    code = proc.wait(timeout=5)
+    took = time.monotonic() - second
+    assert code == 143, f"a second SIGTERM exits with 128 + 15, not {code}"
+    assert took < 1.5, f"the second signal took {took:.2f}s to end the app"
+

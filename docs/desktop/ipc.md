@@ -34,6 +34,7 @@ Request structs reject unknown fields. Errors use stable codes: `unknown-op`,
 | `system.df` | — | `usage[]` (per-host `GET /api/system/df`: totals + image/shed/orphan disk entries) |
 | `app.window_metrics` | — | `window_width`, `window_height`, `sidebar_width`, `visible_pane` |
 | `app.screenshot` | `surface` (window\|menu), `scale` (1\|2) | `png` (base64), `width`, `height`, `scale`, `surface` |
+| `app.quit` | — | `{}`, then the app exits (Tauri, test mode only): the tray's Quit, drivable — the orderly shutdown runs, then the process ends (see [Architecture](architecture.md#shutting-down-tauri)) |
 
 The screenshot renders the target window's content view to a PNG in-process — no screen
 capture permission, works even when the window is occluded or off-screen. Capturing the

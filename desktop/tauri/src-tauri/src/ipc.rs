@@ -471,6 +471,19 @@ fn hold_view_door(env: &Env, params: &Value) -> Result<Value, (String, String)> 
     }
 }
 
+/// The gate behind `app.quit` (plan 026 §3.3): the tray's Quit, drivable.
+///
+/// **TEST-MODE ONLY**, the other driver doors' rule. It is `app.exit(0)` —
+/// exactly what the tray's Quit and the popover's call — so the harness can
+/// prove the tray's path runs the orderly shutdown. A socket client that could
+/// quit the user's app is nothing a shipped app needs.
+fn app_quit_door(env: &Env) -> Result<(), (String, String)> {
+    if !env.test_mode {
+        return Err(err("not_enabled", "app.quit requires test mode"));
+    }
+    Ok(())
+}
+
 /// An OPTIONAL string param: absent or `null` is `None`; a string is itself;
 /// anything else is `bad_request` — never read as absent, because absence has a
 /// meaning of its own (a default, or a freshly minted id).
@@ -849,6 +862,14 @@ impl Handler {
                 Ok(json!({}))
             }
             "app.screenshot" => self.screenshot().await,
+            // The tray's Quit, drivable (plan 026 §3.3) — TEST-MODE ONLY, see
+            // [`app_quit_door`]. The answer goes out while the orderly
+            // shutdown runs; the app is gone once it finishes.
+            "app.quit" => {
+                app_quit_door(&self.env)?;
+                self.app.exit(0);
+                Ok(json!({}))
+            }
             "sheds.list" => {
                 let reachability = self.backend.refresh().await;
                 observe_reachability(&self.machines, &reachability).await;
@@ -3026,5 +3047,18 @@ mod tests {
                 "{bad}"
             );
         }
+    }
+
+    /// **`app.quit` is the tray's Quit, and a privilege**: outside test mode it
+    /// answers `not_enabled` (plan 026 §3.3).
+    #[test]
+    fn the_quit_door_is_test_mode_only() {
+        let mut prod = env(None);
+        prod.test_mode = false;
+        let (code, message) =
+            app_quit_door(&prod).expect_err("a driver door must not be reachable in a shipped app");
+        assert_eq!(code, "not_enabled");
+        assert!(message.contains("app.quit"), "{message}");
+        assert!(app_quit_door(&env(None)).is_ok());
     }
 }

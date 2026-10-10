@@ -247,6 +247,41 @@ private/unstable. The app is an accessory (`LSUIElement`): menu-bar only, no Doc
 (On Linux the Tauri tray is a native menu — Tauri emits no Linux tray-click events, so there
 is no popover; this is expected.)
 
+## Shutting down (Tauri)
+
+The Tauri app ends every child process it owns from every way it can exit: the tray's or
+the popover's Quit, SIGTERM, SIGINT and SIGHUP, and on macOS a Dock Quit, a logout or an
+AppleScript `quit` (which reach the app only as Tauri's `RunEvent::Exit`). All of them run
+one orderly shutdown, once — a later trigger waits for the run already going.
+
+- **Nothing new starts once it begins.** The app holds one spawn gate, closed first. Every
+  place the app starts a child — a craze bridge (local or over ssh), an ssh exec, an opencode
+  `ssh -N -L` forward, a roost tunnel — takes a section of that gate across the spawn and the
+  child's registration, so a spawn either finished before the close (and the shutdown ends
+  it) or is refused with `shutting_down`; a spawn already under way when the close began
+  that lands after it kills its own child at registration. The UI's own calls (a refresh,
+  `lane.open`, `craze.create`, a bootstrap) are refused the same way.
+- **Then it ends what it owns, in a fixed order, each step bounded:** the app's own roost
+  watchers, probes and in-flight one-shots (a launch, a bootstrap, a tab close) are joined,
+  and cancelled past a short bound (they are the only clients of a roost tunnel, so no
+  connection can arrive while the tunnels close); the agent lanes and their forwards are
+  closed (on a thread of their own, the forward children killed and reaped); the craze
+  sources stop and every registered bridge child is killed and its exit seen, even one a
+  transcript request is still holding; each roost tunnel runs its own teardown; and each ssh
+  connection master is asked to exit — and, if it does not, is ended by its pid after
+  checking that pid is the master on this app's control socket.
+- **What the app does not own keeps running.** A craze hub and its sessions, and a remote
+  `roost-session`, are left alone: a session started from the app is still there, and still
+  attachable, after the app quits.
+
+The worst case is about 16 seconds and the usual case is well under 3. Each step's time is
+logged to stderr (`shed-desktop-tauri: shutdown: phase N …`), with anything it gave up on at
+its bound: work that could not finish in time is abandoned with the spawn gate still closed, so
+nothing it starts later survives its registration. A second signal, or a
+shutdown still running 20 seconds after the first signal, exits at once (status 128 + the
+signal number). A crash or a `kill -9` runs none of this; an ssh master left behind then
+exits on its own once its 60-second `ControlPersist` lapses.
+
 ## State + storage
 
 | What | Where | Notes |
