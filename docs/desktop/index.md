@@ -7,7 +7,8 @@ credential requests from the shed host agent, and watch a live activity feed. A 
 shipped client on both **macOS** (DMG + Sparkle auto-update) and **Linux**
 (`apt install shed-desktop`).
 
-It is a coordinator — it runs no sheds and holds no credentials. It observes and drives
+It is a coordinator — it runs no sheds. With an external host agent it holds no credentials;
+in its default embedded-broker mode (Tauri) the credential broker runs inside the app. It observes and drives
 components that already exist on the developer's Mac and on shed hosts (see
 [Architecture](architecture.md) for the full picture):
 

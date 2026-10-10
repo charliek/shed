@@ -74,9 +74,10 @@ The `extensions` variant adds [credential brokering](extensions.md) on top of `b
 **When to use it:** as a base for organization-specific images, or when you
 want credential brokering without the full coding-agent set.
 
-**Prerequisite:** the `shed-host-agent` binary must be running on your host.
-See the [macOS quickstart](../getting-started/macos-quickstart.md) for host-agent
-setup and the [Extensions configuration reference](../extensions/configuration.md).
+**Prerequisite:** a credential broker on your host: the desktop app's embedded broker
+(the Tauri app's default) or the `shed-host-agent` daemon. See the
+[macOS quickstart](../getting-started/macos-quickstart.md) for host-agent setup and the
+[Extensions configuration reference](../extensions/configuration.md).
 
 ```bash
 shed create mydev --image extensions

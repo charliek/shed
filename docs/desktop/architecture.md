@@ -261,7 +261,11 @@ is no popover; this is expected.)
 The Tauri app ends every child process it owns from every way it can exit: the tray's or
 the popover's Quit, SIGTERM, SIGINT and SIGHUP, and on macOS a Dock Quit, a logout or an
 AppleScript `quit` (which reach the app only as Tauri's `RunEvent::Exit`). All of them run
-one orderly shutdown, once — a later trigger waits for the run already going.
+one bounded, orderly shutdown, once — a later trigger waits for the run already going. Two
+things deliberately cut it short: a **second** SIGTERM/SIGINT/SIGHUP, or the 20-second escape
+timeout, exits the process at once, so a wedged shutdown can never hang a quit; children the
+run had not reached by then are left to their own protocols (an ssh master's
+`ControlPersist`, a bridge's stdin closing).
 
 - **Nothing new starts once it begins.** The app holds one spawn gate, closed first. Every
   place the app starts a child — a craze bridge (local or over ssh), an ssh exec, an opencode

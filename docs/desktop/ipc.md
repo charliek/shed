@@ -296,7 +296,9 @@ registered, craze not installed or too old) all answer `outcome_unknown` again, 
 keeps the id. A session, `bad_request` (an id reused with other params included) and a replayed
 start failure end it. A success the app cannot read, or one craze could not send (its `failed`
 with reason `failed` or `response_too_large`), is `outcome_unknown` on any create, held or not. craze keeps the guarantee while the first session
-runs: a retry after it has ended starts another.
+runs. Within ten minutes of the first answer a retry gets that answer back, even after the
+session has ended; after that, if the session has ended and craze finds no live session for
+the request, a retry starts another.
 Refusal codes: the lane contract's (`bad_request` — craze's own, an unknown host, a relative
 `cwd`, an id not in craze's form; `unavailable`; `failed` — a session that failed to start,
 its message craze's own cause, verbatim), plus `outcome_unknown`, `too_old` ("update craze
