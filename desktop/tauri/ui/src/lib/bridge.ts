@@ -3,6 +3,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import type { AgentsEmptyState, AgentsLoad } from "@/lib/agentsEmpty";
 import type { CrazeCreateOptions } from "@/lib/crazeCreate";
 import { killTarget } from "@/lib/crazeRows";
+import { initialReport } from "@/lib/report";
 
 export type Pane = "sheds" | "machines" | "approvals" | "agents" | "activity" | "egress" | "system";
 
@@ -146,22 +147,28 @@ export function hostFailureFor(hostErrors: HostFailure[], host: string): HostFai
   return hostErrors.find((e) => e.server === host);
 }
 
+/** Everything one full report is built from: what the shell rendered, before
+ *  `report` derives the send-time parts (the sampled style, each server's failure
+ *  `detail`, the pane-keyed empty state). `useUiBridge` keeps the latest one it
+ *  built, so its initial report can re-send it (`initialReport`, shed#400). */
+type ReportPayload = {
+  pane: Pane;
+  sheds: Shed[];
+  refreshToken: number;
+  modal: Modal;
+  badges: Badges;
+  sidebar: SidebarInput;
+  mode?: string;
+  hostErrors: HostFailure[];
+};
+
 /** Report the rendered snapshot Rust relays to the harness (`ui.current_pane` /
  *  `ui.computed_style` / `dashboard.dump` / `ui.badges`). ALWAYS a FULL blob — every
  *  key present — so no partial report can (a) create the `main` slot before the shell
  *  is ready and false-signal readiness to `sheds.refresh`, or (b) omit `sheds` and
  *  zero the mac tray running-count (lib.rs recomputes it from each report). A new
  *  reader is one more key. The refresh token is echoed so `sheds.refresh` blocks on it. */
-function report(
-  pane: Pane,
-  sheds: Shed[],
-  refreshToken: number,
-  modal: Modal,
-  badges: Badges,
-  sidebar: SidebarInput,
-  mode?: string,
-  hostErrors: HostFailure[] = [],
-) {
+function report({ pane, sheds, refreshToken, modal, badges, sidebar, mode, hostErrors }: ReportPayload) {
   void invoke("ui_report", {
     snapshot: {
       pane,
@@ -226,6 +233,10 @@ export function useUiBridge(
   const paneRef = useRef(pane);
   paneRef.current = pane;
   const ready = useRef(false);
+  // The latest complete report the report effect built — what the listener
+  // effect's initial report re-sends (with the current pane) instead of a seed
+  // that would undo it (shed#400). Null until the first one is built.
+  const latestReport = useRef<ReportPayload | null>(null);
   const fetchGen = useRef(0);
   // The highest refresh token not yet echoed. A token-bearing fetch records it
   // BEFORE awaiting, so whichever fetch ends up committing rows echoes it —
@@ -282,14 +293,14 @@ export function useUiBridge(
       }
       ready.current = true; // both listeners live → readiness signal + initial report
       await fetchSheds(0);
-      // Fresh sheds + real badges arrive via the report effect on the next render;
-      // this initial report just publishes the pane, so `current_pane != null` =
-      // "listeners live". No modal is open at mount; badges seed at zero.
-      report(
-        paneRef.current, [], 0, null,
-        { sheds: 0, agents: 0, hosts: 0, pending: 0 },
-        { servers: [], machines: [] },
-      );
+      // Fresh sheds arrive via the report effect on the next render; this initial
+      // report publishes the pane, so `current_pane != null` = "listeners live".
+      // It re-sends the latest report the effect built — which, while that first
+      // list was in flight, may already carry the real badges and sidebar (the
+      // host list answers on its own) — and seeds empty ONLY when none was built.
+      // A seed sent after a real report replaced its every key: the Hosts badge
+      // and the sidebar read empty until the next render (shed#400).
+      report(initialReport(latestReport.current, paneRef.current));
     })();
     return () => {
       cancelled = true;
@@ -375,7 +386,9 @@ export function useUiBridge(
     // `hosts` = the configured-host count (with reachability) the shell supplies —
     // covers zero-shed hosts, unlike a sheds-derived distinct-host count.
     const badges: Badges = { sheds: sheds.length, agents: agentCount, hosts: hostCount, pending };
-    report(pane, sheds, refreshToken, modal, badges, sidebar, mode, hostErrors);
+    const payload: ReportPayload = { pane, sheds, refreshToken, modal, badges, sidebar, mode, hostErrors };
+    latestReport.current = payload;
+    report(payload);
     // `sidebar` is rebuilt by the caller each render, so it is compared by VALUE
     // (a reference dep would re-report on every render — the flap this whole
     // shape exists to avoid).
@@ -412,6 +425,15 @@ export type HostDiskUsage = {
  *  serves the harness). An unreachable host comes back as an error row. */
 export async function fetchSystemDf(): Promise<HostDiskUsage[]> {
   return (await invoke<HostDiskUsage[]>("system_df")) ?? [];
+}
+
+/** The same `system_df` read for the shell's host list (the Hosts badge and the
+ *  sidebar's servers), except that a failed invoke REJECTS rather than reading
+ *  as "no hosts": the list's reload keeps its last rows on a failure
+ *  (`newestReload`, shed#400), which it can only do if it can tell one. */
+export async function fetchHostRows(): Promise<HostDiskUsage[]> {
+  const core = await import("@tauri-apps/api/core");
+  return (await core.invoke<HostDiskUsage[] | null>("system_df")) ?? [];
 }
 
 /* ---- egress (mac parity: profiles per host + the ns=="egress" activity) ---- */

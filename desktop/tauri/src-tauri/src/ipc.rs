@@ -471,6 +471,24 @@ fn hold_view_door(env: &Env, params: &Value) -> Result<Value, (String, String)> 
     }
 }
 
+/// The gate behind `ui.report_history` (plan 026 §3.4, shed#400): whether to
+/// clear the ring after reading it, or the refusal.
+///
+/// **TEST-MODE ONLY**, the other driver doors' rule. It answers what every one
+/// of the dashboard's full reports carried ([`crate::state::ReportRecord`]), so
+/// a cell can assert that NO report zeroed the Hosts badge — a sampled read can
+/// fall between two reports and miss one. Nothing a shipped app needs.
+fn report_history_door(env: &Env, params: &Value) -> Result<bool, (String, String)> {
+    if !env.test_mode {
+        return Err(err("not_enabled", "ui.report_history requires test mode"));
+    }
+    match params.get("clear") {
+        None | Some(Value::Null) => Ok(false),
+        Some(Value::Bool(clear)) => Ok(*clear),
+        Some(_) => Err(err("bad_request", "'clear' must be true or false")),
+    }
+}
+
 /// The gate behind `app.quit` (plan 026 §3.3): the tray's Quit, drivable.
 ///
 /// **TEST-MODE ONLY**, the other driver doors' rule. It is `app.exit(0)` —
@@ -731,6 +749,15 @@ impl Handler {
             // The sidebar nav badge counts the shell reported {sheds, agents, hosts,
             // pending}, or null before its first report.
             "ui.badges" => Ok(json!({ "badges": self.ui_get("badges") })),
+            "ui.report_history" => {
+                let clear = report_history_door(&self.env, params)?;
+                let (reports, dropped) = self
+                    .ui
+                    .lock()
+                    .map(|mut s| s.report_history(clear))
+                    .unwrap_or_default();
+                Ok(json!({ "reports": reports, "dropped": dropped }))
+            }
             "ui.set_appearance" => self.set_appearance(params),
             "ui.show_window" | "app.activate" => {
                 present_main_window(&self.app);
@@ -3017,6 +3044,35 @@ mod tests {
         ] {
             assert_eq!(
                 pick_setting_door(&test, &bad).expect_err("not a press").0,
+                "bad_request",
+                "{bad}"
+            );
+        }
+    }
+
+    /// **The report history is test-mode only** (plan 026 §3.4): outside test
+    /// mode it answers `not_enabled`; in test mode `clear` is optional and must
+    /// be a boolean.
+    #[test]
+    fn the_report_history_door_is_test_mode_only() {
+        let mut prod = env(None);
+        prod.test_mode = false;
+        for params in [json!({}), json!({ "clear": true })] {
+            let (code, message) = report_history_door(&prod, &params)
+                .expect_err("a driver door must not be reachable in a shipped app");
+            assert_eq!(code, "not_enabled", "{params}");
+            assert!(message.contains("ui.report_history"), "{message}");
+        }
+        let test = env(None);
+        assert!(!report_history_door(&test, &json!({})).unwrap());
+        assert!(!report_history_door(&test, &json!({ "clear": null })).unwrap());
+        assert!(!report_history_door(&test, &json!({ "clear": false })).unwrap());
+        assert!(report_history_door(&test, &json!({ "clear": true })).unwrap());
+        for bad in [json!({ "clear": "yes" }), json!({ "clear": 1 })] {
+            assert_eq!(
+                report_history_door(&test, &bad)
+                    .expect_err("not a clear flag")
+                    .0,
                 "bad_request",
                 "{bad}"
             );

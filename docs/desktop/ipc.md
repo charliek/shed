@@ -350,6 +350,13 @@ backend's view — the two can disagree, and have.
 | `lane.dump` | while the transcript panel is open | `{lane}` — what the panel rendered: its rows, approval cards, `kind` badge (and `lane_kind`, the kind it was opened with), the `permission` line (`bypass` reads "runs tools without asking"), Interject toggle, `can_cancel` and `stop` (`{confirming}`, or `null` with no Stop button) — all read off `lane.messages`' `capabilities`; Cancel, Interject and Stop exist only when the capabilities offer them, and Cancel/Interject are live only while the session is working — `settings_chip` (the header's `<model name> · <effort value> · fast`, from the current values; `null` — no chip — when the capabilities do not say `settings`), `stale`, `ended`, and its error; `null` when none is mounted |
 | `lane_settings.dump` | while the settings sheet is open | `{lane_settings}` — what the sheet rendered: its `machine`, `session_id`, `lane_kind` and `chip`; `rows[]` in render order (the model, the current model's options, the mode) — `{id, kind, name, category, control, current, current_name, values: [{id, name, selected}], state, text, enabled}`, where `control` is `list` (the model, and any row of more than four values) or `segmented`, `state` is `pending` (craze has not answered; the row takes no press), `refused` (`text` the refusal shown inline — "the model changed; try again" on an option whose model moved under it) or `not_confirmed` (the answer was lost; until the session's next settings), else `null`; and `usage` (`{tokens, window, percent, text}`, the context meter, when the session reports both) — `null` when none is open |
 
+**In test mode only**, `ui.report_history {clear?}` answers what every one of the dashboard's
+full reports carried, oldest first: `{reports: [{hosts, rows, servers}], dropped}` — the Hosts
+badge, the dashboard's row count and the sidebar's server count, per report — from a ring of
+the last 256. `dropped` counts the reports the ring evicted since it was last cleared, and
+`clear: true` empties it after the read. A sampled `ui.badges` can fall between two reports and
+miss one; the history cannot. Outside test mode it answers `not_enabled`.
+
 The transcript panel is mounted by `ui.show_lane {machine, kind, session_id}` (the card's
 Transcript affordance, which is a click) and unmounted by `ui.close_lane`.
 

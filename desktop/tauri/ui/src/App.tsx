@@ -20,6 +20,7 @@ import { Scrim, DialogShell, Field, Select, Segmented, dialogInput, dialogBtnSec
 import { LanePanel } from "@/components/LanePanel";
 import { CrazeCreateDialog } from "@/components/CrazeCreateDialog";
 import { canOpenTerminal, crazeDoingLine, crazeMachineNote, killTarget } from "@/lib/crazeRows";
+import { newestReload } from "@/lib/newest";
 import {
   EMPTY_DRAFT, beginSubmit, closesOntoTranscript, crazeCreateOffered, crazeCreateTargets,
   crazeCreateUpdateNote, crazeStatusFor, edit as editCrazeDraft, groupMachine, liveSetter,
@@ -33,7 +34,7 @@ import {
   type RoostPreview, type RoostToast, type RoostCardState, type RoostDumpRow,
 } from "@/lib/roost";
 import {
-  useUiBridge, shedAction, fetchSystemDf, openTerminal,
+  useUiBridge, shedAction, fetchSystemDf, fetchHostRows, openTerminal,
   createStart, createStatus, createCancel, fetchHosts,
   fetchApprovals, decideApproval, fetchActivity, fetchGateNamespaces,
   fetchEgressProfiles, reportEgress, inTauri,
@@ -2177,12 +2178,17 @@ export default function App() {
   // unreachable dot — instead of deriving from `sheds` (which hides zero-shed hosts,
   // undercounts the badge, and paints every dot green). Reuses the existing `refresh`
   // event that drives the shed re-fetch — no extra poll.
+  //
+  // Newest-wins (shed#400): a burst of `refresh` events overlaps these reads, and
+  // an older answer landing second must not overwrite a newer one; a failed read
+  // keeps the last rows rather than reading as "no hosts".
   const [hostRows, setHostRows] = useState<HostDiskUsage[]>([]);
   useEffect(() => {
     if (!inTauri()) return;
     let cancelled = false;
     let unlisten: (() => void) | undefined;
-    const reload = () => void fetchSystemDf().then((r) => { if (!cancelled) setHostRows(r); });
+    const rows = newestReload(fetchHostRows, setHostRows);
+    const reload = () => void rows.reload();
     void (async () => {
       const { listen } = await import("@tauri-apps/api/event");
       const un = await listen("refresh", reload);
@@ -2192,6 +2198,7 @@ export default function App() {
     })();
     return () => {
       cancelled = true;
+      rows.cancel();
       unlisten?.();
     };
   }, []);

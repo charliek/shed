@@ -595,6 +595,16 @@ class TauriClient(_ApprovalOps, _RcOps, _RustCoreClient):
         pending}), or None before its first report — UI truth, like agents_dump."""
         return self.call("ui.badges").get("badges")
 
+    def report_history(self, clear: bool = False) -> dict:
+        """What EVERY one of the dashboard's full reports carried, oldest first:
+        `{reports: [{hosts, rows, servers}], dropped}` — the Hosts badge, the
+        dashboard's row count and the sidebar's server count per report, and how
+        many the app's bounded ring evicted since the last clear (nonzero means
+        the list no longer starts at that clear). `clear=True` empties the ring
+        after this read. Test mode only (`ui.report_history`, shed#400): a
+        sampled `badges()` read can fall between two reports and miss one."""
+        return self.call("ui.report_history", {"clear": clear})
+
     def system_df(self) -> list[dict]:
         """Per-host disk usage (`[HostDiskUsage]`); each row has host/usage/error."""
         return self.call("system.df")["usage"]
