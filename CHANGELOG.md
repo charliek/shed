@@ -25,492 +25,74 @@ All notable changes to this project will be documented in this file.
 
 **Ships:** server, host-agent, desktop
 
-_Staged by plans 010 (the machine-hub port + retirement), 011 (shipping `sx`), 014 (roost
-session protocol 4 + the RC-lane demolition), 015 (agent lanes: opencode), 016 (sunsetting
-`sx`, unreleased), 017 (agent lanes: gx), 018 (agent lanes: the channel bound, free-text
-answers, scoped approvals, the shared lane view), 019 (the roost-provider kickoff + the
-desktop bootstrap), 020 (the roost session protocol 5 re-pin), 021 (the roost session
-protocol 6 re-pin + the Tauri promotion), 022 (S6: the RC hub's full retirement, the
-roost-native `shed attach`/`shed sessions` CLI, and the `shed-ext-rc` → strix/prox image
-swap) and 025 (craze as shed's agent lane: the gx lane and the direct-agent kinds retired,
-the lane contract split); at release time fold this body into the new `## v0.9.0 — <date>` section — note the
-**em dash** — carrying the `**Ships:**` line above down with it (all three components;
-`recommend-components.sh 0.9.0` agrees). release-plan.sh never reads an `## Unreleased`
-heading: it anchors on the exact `## v0.9.0 — ` string and takes the first line-start
-`**Ships:**` line under that heading, which is why the line above must survive the fold
-verbatim._
+v0.9.0 makes the Tauri app the macOS desktop client, adds craze as the desktop's agent lane
+beside opencode, moves `shed attach` and `shed sessions` onto roost, and retires the
+remote-control (RC) hub. The server no longer drops running sheds' credential channels on a
+restart, and the `extensions` image now carries `roost-session` and `craze`.
 
-- **Tauri is now the default macOS client — every roost feature since plan 013 moves to
-  everyone** (plan 021, C3). The release workflow's two mutually exclusive mac jobs
-  (`desktop-macos` for Swift on a stable tag, `desktop-macos-tauri` for Tauri on a
-  prerelease) collapse into one: the Tauri job takes the `desktop-macos` name and now runs
-  on every tag shape, Swift's release job is deleted (`desktop-macos-tauri` appears
-  nowhere in `.github/`), and its `if:` is byte-identical to `desktop-linux`'s. A Mac
+> **Firecracker hosts: upgrading from 0.8.x stops every running shed once.** The 0.8.x
+> `shed-server` that the apt upgrade restarts is the old binary, and it takes its Firecracker
+> VMs down with it. This includes unattended upgrades. Stop your sheds first (`shed stop`), or
+> `shed start` them afterwards. From 0.9.0 on, a `shed-server` restart or upgrade leaves
+> running VMs alone.
+>
+> Read the [v0.8.2 to v0.9.0 upgrade guide](https://charliek.github.io/shed/upgrades/v0.8.2-to-v0.9.0/)
+> before upgrading. It covers the macOS app swap, craze and roost on your hosts, and rollback.
+
+### Desktop
+
+- **Tauri is now the default macOS client, so every roost feature since 0.8.2 reaches
+  everyone.** The release workflow's two mutually exclusive mac jobs (Swift on a stable tag,
+  Tauri on a prerelease) collapse into one Tauri job that runs on every tag shape. A Mac
   running Swift 0.8.x should get a normal Sparkle prompt and update **in place** into the
-  Tauri build — same bundle id, same EdDSA key, same appcast feed, all three verified — and
-  gain everything Swift never had: the machines tab, the roost bootstrap (S5), and agent
-  lanes (opencode, and craze — the gx lane this bullet first listed was retired before
-  release, plan 025). **This is the first release to run that path**: the mac job has
-  never executed and the two-release rehearsal was skipped deliberately, so if Sparkle
-  reports a failed update, install the DMG by hand from the releases page and file it —
-  matching identity and key make the swap possible, not proven.
-  **What it loses: preferences do not migrate.** Swift stores them in `UserDefaults`
-  (`desktop/Sources/ShedDesktopApp/PreferencesStore.swift`); Tauri reads `prefs.json`
-  (`desktop/tauri/src-tauri/src/prefs.rs`) — terminal, approvals, policy, and
-  launch-at-login all start from Tauri's defaults after the update. Swift stays buildable
-  (only its release job retired; sources demolition is filed as
-  [#364](https://github.com/charliek/shed/issues/364)), and the prerelease → beta-channel
-  behavior is unchanged — `update-appcast.py` still stamps the beta channel iff the tag
-  carries a `-`. See the
-  [v0.8.2 → v0.9.0 upgrade note](https://charliek.github.io/shed/upgrades/v0.8.2-to-v0.9.0/)
-  for the honest rollback: reinstalling the Swift 0.8.1 DMG **re-offers 0.9.0 on the next
-  check**, because it reads the same feed with the same key.
-- **shed re-pins to roost's session protocol 6, in two steps — 5 then 6 — completing the
-  migration plan 019 left in motion (plan 020, roost#477 / roost plan 061; plan 021, roost
-  plan 064 / roost#489), then re-pins again onto roost's bug-fix release (plan 024).**
-  `roost-ipc` moved to `c1bfe887bc843e35466a1dcc33fa2390909fd50e`
-  for protocol 5, then to `ee71e44a1de3c0de4c59ac0267c0a5e0c993d88a` for protocol 6, then to
-  `8c91ce9ddd49c5a43841f72ecd149dd778d6151c` — the **roost v0.0.20 release tag**,
-  the first published roost that speaks 6 (the `roost-ipc` crate is byte-identical to
-  `ee71e44`'s; the tag is what makes it a rev somebody ships) — and finally to
-  `2bc71fa3848ddbf2d190aab6c4ef61ad2d432aa1` — the **roost v0.0.21 release tag**, roost's
-  bug-fix release after v0.0.20 (it includes roost plan 072; protocol is still 6; the one
-  `roost-ipc` API change shed sees is `TabOpenParams.cwd_from_tab`) — in
-  every manifest that pins it (`crates/Cargo.toml`, the Tauri crate's, and — once
-  shed-mobile's own re-pin lands — its `rust/Cargo.toml`). **Protocol 5 retired the
-  lease.** The lease is gone from the wire with no replacement: `session.connect`, the
-  `connect-required`/`taken-over`/`already-connected` refusals, and the driver/observer
-  classification of an event stream are all retired, `session.set_agent_hooks` is open to
-  every same-UID client, and `tab.effect` now reaches every subscriber (shed's fold
-  already ignored it — a watcher views no tab). `SessionIdentify` drops `features`; the
-  generation integer is the whole negotiation now. One user owns every client that talks
-  to their sheds, so hook wiring being open to all of them, rather than gated behind a
-  token, is the intended shape. Go's `internal/roostprovider` mirrors the same generation
-  (`SpokenProtocol`), which is why this entry ships with `server` too. **Protocol 6 turns
-  `session.set_agent_hooks` into a pure raise.** `{mode, skip, client}` is gone, replaced
-  by `{agents, client}`: shed sends its own `ROOST_WIRED_AGENTS` — the five names roost's
-  whole wireable set covers (`claude, codex, cursor, grok, opencode`) — and the host
-  unions them into its own `agent-hooks` key. There is no narrowing direction left on this
-  wire; `mode: "off"` retired with nothing replacing it, because roost made removal a
-  deliberate local act on the host (`roostctl agent uninstall`), not something a client
-  can ask for. An agent name the host doesn't recognize comes back in `skipped` with
-  reason `"unknown"`, shown verbatim rather than filtered or hidden. **A host speaking an
-  older protocol is refused by name and offered the update, and its running session is
-  never stopped** (pin P6) — this covers every host plan 019's desktop bootstrapped
-  (protocol 4), a host still on protocol 5, and a `roost-session` from any roost release
-  before v0.0.20 (v0.0.19 speaks protocol 2, and is refused loudly the same way). The one manual
-  step to recover: `roostctl session stop` on that target, then reconnect — shed then sees
-  a stale binary with no session running and replaces and restarts it unattended, the same
-  as any other Update. See
-  [`docs/extensions/roost-session-hosts.md`](https://charliek.github.io/shed/extensions/roost-session-hosts/)
-  for the re-widening consequence of a raise and the gx/`$GROK_HOME` "not installed"
-  surprise on a fresh host. **The phone-install rung is fixed by this release:** roost
-  v0.0.20 (`8c91ce9`) is the first published release that speaks session protocol 6, and
-  `RELEASE_PIN` is now `Some("0.0.21")` (roost v0.0.21) — so the desktop's release-asset rung (rung 3)
-  installs a `roost-session` onto a fresh Linux target straight from the GitHub release,
-  checksum-verified against its published `.sha256`, with no `$ROOST_SESSION_INSTALL_BIN`
-  and no sibling binary needed. The "nothing can supply these bytes" sentence is pin-aware
-  with that: it names the reason that applies (a refused `ROOST_SESSION_ASSET_BASE`, or an
-  architecture roost publishes no build for) instead of repeating plan 019's "no release
-  speaks 6", which stopped being true the moment the pin moved.
-- **The machine RC hub moves into `shed-host-agent`.** The daemon hosts the
-  activity hub (`127.0.0.1:1029`) as a supervised resident role: bind-as-lock
-  with a polite defer-and-retry while an older `shed-machine-rc serve` holds
-  the port, `rc_hub.enabled` config knob (default on), an `RC hub:` line in
-  `shed-host-agent status` (+ the `rc_hub` LiveStatus field), and a
-  `shed-host-agent rc-hub` foreground diagnostic subcommand. The hub itself is
-  a Rust port of the Go hub (`shed-broker`'s `rc_hub`), wire-identical at
-  `/v1` under the `tests/rc-parity` hub differential family (snapshot, SSE,
-  side-effect, opencode-lane, and cursor-ingest cells — both daemons run side
-  by side in CI).
-- Machine-posture docs: "The machine hub" (trust model: loopback + SSH tunnel
-  is the boundary; no proxy on machines) — written for `docs/extensions/sx.md`
-  in plan 010 and moved to `rc-helper.md` by the plan 016 sunset;
-  `shed-machine-rc.md` carries the retirement note.
-- **The `machine-rc` component is retired** (plan 010 H15, evidence-gated on
-  live e2e on this Mac + mini3). `cmd/shed-machine-rc`,
-  `.goreleaser.machine-rc.yaml`, and the component wiring (release scripts,
-  CI snapshot leg, apt dispatch) are deleted;
-  `update-version.sh`/`release-plan.sh` reject the `machine-rc` token, and
-  `publish-images.yaml` fails loudly if a re-dispatched pre-retirement tag
-  plans `ship_machine_rc=true`. The parity harness's Go oracle relocated to
-  `tests/rc-parity/oracle/` (byte-identical main, test-only, same
-  `shed-machine-rc` identity the goldens pin). Artifacts published before the
-  retirement are not withdrawn but are unsupported; the surviving machine-side
-  daemon is `shed-host-agent`.
-- **`sx` was made its own release component, then sunset unreleased.**
-  Plan 011 gave it the brew + apt channel pair `machine-rc` vacated — selector
-  `crates/sx/VERSION`, its own `.goreleaser.sx.yaml`, a `ship_sx` output
-  threaded through the release scripts, the CI snapshot leg and the publish
-  workflow — so machines could install it without a Rust toolchain. No tag
-  ever matched that selector, and plan 016 (S7,
-  [#329](https://github.com/charliek/shed/issues/329)) removed the component
-  and the crate instead: its verbs were the hub/tmux verbs the Roost Pivot
-  replaces. **Nothing is withdrawn — no `sx` artifact was ever published.**
-  `sx` is now rejected as a `--components` token and as a `**Ships:**` token,
-  each naming the sunset, the way `machine-rc` is. `crates/sx` (5,719 lines)
-  and the `tests/rc-parity` ONE-SHOT differential family (46 cells) are
-  deleted with it; the hub family survives with both legs stimulated by the Go
-  oracle. `docs/extensions/sx.md` is a tombstone.
-- **The component recommender bootstraps a never-shipped component.**
-  `recommend-components.sh` carries a `NEVER_SHIPPED` list whose members report
-  the basis `(never shipped)` and are recommended unconditionally, instead of
-  tripping the "no historical basis" hard error a brand-new component would
-  otherwise hit on its first run. Components not on that list keep the hard
-  error. The list is **empty** since the plan 016 sunset removed its only
-  member (`sx`); a synthetic test proves the mechanism still works.
-- **shed speaks roost's session protocol 4 and stops polling** (plan 014).
-  `roost-ipc` bumps to roost's R1 daemon; `RoostWatcher` swaps `tab.list`
-  polling for roost's leaseless **observer event stream** — subscribing takes
-  no lease, so watching a session never contests it, and a takeover
-  reclassifies the stream in place (`session.driver_changed`) instead of
-  ending it. `SHED_ROOST_POLL_MS` and the poll cadence are gone; a snapshot is
-  pushed only when a row actually changes.
-- **The claude, codex, and cursor RC lanes are demolished**
-  (`charliek/shed#321`, `#322`, `#324`). shed's own claude transcript tail,
-  codex JSONL tail, the cursor hook-ingest endpoint
-  (`POST /v1/ingest/cursor`) and its hook preseeding, and the pane-anchor
-  classifier + stability engine are all deleted — in both the Go guest hub and
-  the Rust broker/machine hub — because roost now derives status for these
-  kinds instead of a second, independently buggy shed-side derivation of the
-  same thing. `kind_features` for `claude-rc`/`codex`/`cursor` becomes
-  `{post_input: true, approvals: "tui", watch: false, input: "", feed: "none",
-  interrupt: false, attach: "tmux"}`; `POST /v1/sessions/{slug}/input` answers
-  `409 not_accepting` for every kind — no kind is `gated` any more, and
-  opencode steers through the `turn` verb instead. A shed row's `state` is now
-  pure **liveness** (`ready` while its tmux session exists); `activity`
-  survives only for opencode's lane.
-- **`create --wait` and `prompt` wait for liveness, then settle, before
-  delivering a kickoff.** With no classifier left to confirm a composer is
-  actually drawn, `--wait` treats a successful pane capture as live and then
-  holds for a further settle window (plus a short delivery pause) before
-  typing, and both `--wait` and the one-shot `prompt` verb refuse to deliver
-  while a claude or codex trust/bypass dialog is on the pane. This is a real
-  behavior change: delivery confirms only that no *known* one-time dialog is
-  showing, not that the target is genuinely a live composer — an auth screen
-  or an agent's own approval modal is no longer detected. Accepted as an
-  interim hazard until the roost provider script (S4) owns kickoff end to end.
-- **Agent lanes: a live opencode transcript from a machine row** (plan 015,
-  `charliek/shed#320`). `shed_core::lane` is the new agent-lane contract — DTOs
-  plus an `AgentLane` trait for "a coding agent with sessions, a transcript and
-  approvals," one adapter per agent. `crates/shed-opencode` is the first
-  adapter: it drives the same local HTTP server opencode's own TUI is already
-  running (never a sidecar), replaying and streaming its transcript over the
-  legacy `GET /event` feed, and answering permission/question approvals.
-  Reconnects are bracketed by `Reset` … `Ready` so a client's view never shows
-  a half-seeded transcript. The Tauri desktop client consumes it: a machine
-  row whose roost tab reports a `server_url` (roost R10) gets an `agent_lane`
-  stamp and a Transcript panel — reached directly when the machine is local,
-  or through a shared `ssh -N -L` forward otherwise. Two sessions in one
-  directory never see each other's rows; a child session's approvals surface
-  (attributed to it) while its own transcript never renders — only the parent
-  session's does. **Limits, stated rather than hidden:** no interject (every send
-  joins the session's own runner, it does not preempt a turn in flight); no
-  resume-from-cursor (every reconnect refolds history from the top); no
-  credential source for a password-protected opencode server — it answers
-  `401`, which surfaces as an inline "unauthorized" error, status-only. See
-  [Agent lanes](https://charliek.github.io/shed/desktop/agent-lanes/).
-- **The gx lane (plan 017) is retired before release** (plan 025): craze replaces it;
-  nothing shipped. `crates/shed-gx`, the `gx` and lane-less `grok` kinds, and the
-  desktop's gx credential probe are deleted (plan 025 C1–C2, `charliek/shed#390`). What
-  building it changed in the contract stays, because it is the contract and not gx's: the
-  twelve corrections it forced into `shed_core::lane` (kept in the module doc, numbered),
-  the silent resume that a cursor-capable adapter is allowed, and the refusal to guess an
-  ambiguous decision — a real gx permission offered five options, two of them `allow_once`,
-  so the panel renders every offered option under the agent's own label and answers with
-  its exact id (`LaneAnswer::Choice`) for every adapter. The Tauri backend dispatches lanes
-  by kind (`Arc<dyn AgentLane>`; an unrecognized kind answers `unsupported_lane`). See
-  [Agent lanes](https://charliek.github.io/shed/desktop/agent-lanes/).
-- **Agent lanes: the client channel gets a bound, and overflow becomes a
-  reseed** (plan 018, `charliek/shed#342`). A lane subscription's frame
-  channel was unbounded, so a client that stopped draining — a phone
-  backgrounded mid-session is the canonical case — let a watcher's backlog
-  grow for as long as the lane stayed connected. It is now bounded at 1,024
-  frames, with the overflow policy in one place, `shed_core::lane::LanePublisher`
-  (deliberately not `Clone` — one publisher per subscription): a full channel
-  drops the frame and answers `Lagged`, which both adapters propagate out of
-  every emitting helper so a generation ends at the first dropped frame —
-  mid-stream, mid-seed, or mid-reseed alike — and reseeds with a fresh
-  `Reset { reason: "lagged" } … Ready` rather than resuming, even on gx,
-  because the dropped frames may already sit behind the client's cursor. The
-  terminal `Down` is the one frame that is never dropped. (Since plan 025 the
-  adapter that can resume and still reseeds on a lag is craze, gx's successor,
-  and the same bound covers a source's session list.)
-- **Agent lanes: a question's free-text answer reaches either agent**
-  (plan 018, `charliek/shed#341`). `LaneAnswer::Question` gains a positional
-  `custom_text` field, one entry per question, `null` where nothing was
-  typed. gx maps it to the label `"Other"` plus prose in a parallel
-  `annotations[...].notes` map — and because gx's questions now always
-  advertise `custom: true`, they lose the panel's one-click answer path;
-  opencode appends the text as one more entry in that question's `answers`
-  array, matching what its own TUI posts. Text aimed at a question whose
-  `custom` is `false` is refused before anything reaches the wire. (The gx
-  half left with the gx lane, plan 025; craze's questions take no free text
-  and say `custom: false`, so a lone single-choice craze question keeps the
-  one-click answer path.)
-- **Agent lanes: opencode answers the approval its own panel addressed, in
-  that session's own scope** (plan 018, `charliek/shed#345`). opencode has no
-  by-id GET for a permission or question, so an unscoped lookup across its
-  two directory-wide lists could let one panel answer a sibling session's
-  request. `answer` now resolves the addressed approval inside the root
-  session plus its transitive descendants first; an id outside that scope is
-  `unknown_approval`, an id open in both lists is refused as ambiguous, and
-  answering an approval whose session has since been deleted is now
-  `unknown_session` rather than reaching the wire. Costs four GETs per answer
-  on a childless session, where an agent with a by-id route (gx had one;
-  craze's `asks.get` is one) pays one.
-- **Agent lanes: the staged transcript/approvals view moves into
-  `shed_app::lane_view`** (plan 018 §3.5). `LaneView`, `apply`, and the
-  500-row cap move out of the Tauri client into the ungated `shed-app` crate,
-  so the phone will fold the same subscription into the same view instead of
-  a second implementation of it. `LaneView::snapshot(since_seq)` returns a
-  typed `LaneViewSnapshot`; pending approvals are now sorted `created_at`
-  then `id` (previously unsorted — the old builder iterated a `HashMap`).
-- Three tests stop asserting wall-clock budgets that only failed under
-  parallel compile load (plan 018, `charliek/shed#343`, covering
-  `charliek/shed#335`): `shed-app`'s `wait_for` deadline is now a 60s hang
-  bound rather than a latency assertion, `shed-broker`'s dead-address leg
-  gets a 10x margin over its 300ms budget, and `shed-core`'s TLS-rejection
-  test classifies a typed `Stage` (`Connect`/`SendRequest`/`Canceled`)
-  instead of matching error substrings, behind a 200-attempt retry ladder
-  sized off measurement.
-- shedtest: `desktop/tools/shedtest/fake_lane_server.py` hosts the `gx`/
-  opencode lane fakes over a control HTTP port (a startup JSON line, a
-  per-agent method allowlist, wire-envelope builders, `/_/info`, `/_/stop`)
-  so shed-mobile's Dart harness can drive them without re-deriving either
-  agent's wire format. Both fakes also gain `hold_seed`/`release_seed` so
-  "no partial view before `Ready`" is observable rather than vacuous. The gx
-  allowlist carries `add_approval` (an approval a client can answer, not only
-  render) and `bodies_to` (every recorded body for a path suffix), so a cell in
-  another language can assert the bytes a decision actually posted. The gx
-  half — its fake, its allowlist and its cells — left with the gx lane in plan
-  025; the opencode half, `hold_seed`/`release_seed` included, is unchanged.
-- **`shed roost-provider` — kickoff moves into roost's own palette (S4,
-  `charliek/shed#326`), replacing the kickoff half of the unreleased, sunset
-  `sx`.** `shed roost-provider list|activate` implements roost's dynamic
-  provider contract in Go (`internal/roostprovider/`): `list` enumerates
-  running sheds and `machines:` entries with no SSH; `activate` probes the
-  chosen host over one SSH round trip plus roost's own client-bridge wire
-  (`session.identify`, `tab.list`, `tab.open` — no `roostctl` needed on the
-  far side) and opens a tab running the chosen agent under `bash -lc` in an
-  absolute working directory — `claude` or `opencode` since plan 025 (it
-  offered `codex`, `cursor`, `gx` and `grok` as well until then; every other
-  agent now starts through craze). Every expected non-actionable state (not installed, not
-  running, protocol mismatch, unreachable, no local `ssh`, no agents found)
-  exits zero with a pinned row rather than failing the phase.
-  `shed roost-provider --install [--dry-run] [--uninstall]` writes the
-  launcher script roost discovers, to `<dir>/providers/shed` where `<dir>`
-  is the parent of a non-empty `$ROOST_CONFIG` else `$HOME/.config/roost` —
-  roost does not consult `$XDG_CONFIG_HOME`, so neither does this. See
-  [`docs/extensions/roost-provider.md`](https://charliek.github.io/shed/extensions/roost-provider/).
-- **The desktop app can put `roost-session` on a shed or machine that
-  doesn't have one yet (S5, `charliek/shed#327`).** A new sans-IO bootstrap
-  (`crates/shed-core/src/roost/bootstrap/`) composes roost's own script
-  builders and parsers into the install/start choreography roost's own UI
-  uses, driven over the shed's or machine's own SSH by a new `SshExec`
-  runner in `crates/shed-app`, and exposed to the Tauri client as
-  `roost.probe`/`roost.preview`/`roost.bootstrap`/`roost.launch`. After a
-  Start it performs itself, the client wires the target's agent hooks
-  (`session.set_agent_hooks {mode: "auto"}`) so a shed's `codex`/`cursor`
-  rows are meant to carry roost-sourced activity instead of liveness only
-  (since plan 025 those are plain rows, their kind shown as roost reports it,
-  and the activity is still roost's) —
-  see [`docs/extensions/roost-session-hosts.md`](https://charliek.github.io/shed/extensions/roost-session-hosts/)
-  for the source ladder, the exact (narrow) rollback promise, the PATH
-  warning, and `shed reset` handling. **Honestly incomplete in one way,
-  stated in the docs:** the release-asset source rung shipped implemented and
-  fixture-tested but never exercised against a real download, because
-  `RELEASE_PIN` was `None` — no published roost release spoke the current
-  session protocol. That pin is flipped in this same release (see the
-  protocol-6 entry above); the rung's unit coverage is still a loopback HTTP
-  fixture rather than github.com. **The payoff
-  itself is demonstrated live, not only in hermetic tests:** a real shed's
-  `codex` row carries roost-sourced `activity` with `source: "roost"`, and
-  `epics/roost-pivot.md`'s liveness-only clause closed with that leg (its S5
-  row).
-  `crates/fixtures/machines/` gives Go a shared, Rust-asserted fixture for
-  decoding `machines:` (`internal/config/machines.go`), used by the
-  provider's inventory and by the desktop's shed-as-roost-host registry
-  alike.
-- Sheds become roost hosts in the Tauri client: a shed's `rc.list` rows are
-  now the **union** of its hub rows (`source: "hub"`) and its roost rows
-  (`source: "roost", origin: "roost:<server>/<shed>"`), and a filtered
-  `rc.list {host, shed}` returns both (previously a filtered list dropped
-  the whole snapshot). `roost.launch` generalizes `machine.launch` to any
-  roost host; `machine.launch` stays as an alias.
-- `internal/sshd/wrap_stdin_test.go` pins the far-side shape every roost
-  bootstrap script depends on: a `/bin/sh -s` script piped on stdin through
-  shed's `bash -lc` sshd wrap (`internal/sshd/wrap.go`) propagates its exit
-  code unmodified — the bootstrap machines classify every probe/install
-  outcome on that code.
-- No CLI bootstrap path was added (pin P2 — `shed` itself never installs
-  `roost-session`, only the desktop and mobile apps do), and no roost
-  binary is bundled or vendored into shed's own build or rootfs images
-  (pin P1).
-- **The hook re-send plan 019 built and tested was never actually wired —
-  it is now.** No production caller ever constructed the seam that
-  re-sends `session.set_agent_hooks` on a watcher reconnect, so the
-  shipped desktop wired an agent's hooks once at install time and never
-  again. `RoostHosts` now remembers which targets this app run
-  bootstrapped and hands their watchers a re-send hook, so every
-  reconnect on a bootstrapped target re-sends the call and a host shed
-  only watches gets none — wired through all three watcher-spawn sites,
-  including the machine-bootstrap re-watch that a stale watcher would
-  otherwise have left unarmed.
-- **A subscribe now refuses a mismatched session pair.** shed identifies
-  on one connection and subscribes on another; the subscribe ack's new
-  `session_id` lets the watcher compare it against the id
-  `session.identify` returned and treat a disagreement as an immediate
-  resync instead of recovering by accident one cycle later, bounded by
-  the existing `MAX_CONSECUTIVE_RESYNCS`.
-- **The RC hub is retired, end to end (S6, plan 022, `charliek/shed#328`).** Eight commits
-  remove the whole remote-control-hub stack plans 008–010 built and plan 014 partly
-  demolished already: the guest binary (`shed-ext-rc` no longer bakes into the
-  `extensions`/`full` rootfs images; in its place both stages install `strix`, a TUI for
-  staging and reviewing diffs, and `prox`, a process manager with an HTTP API and TUI, from
-  the stridelabs apt repo — measured +32.6 MiB over a base that already carries `strix`'s
-  `git` dependency); the server surface (`internal/api/{rchub,rchub_breaker,rcevents,
-  rcenrich}.go`, `internal/ext/rc`, `internal/ext/clirc` — ~18.5k lines — and the `rc-enrich`/
-  `rc-events`/`rc-proxy` feature tokens + `rc_capabilities` off `/api/overview` and
-  `/api/info`); the desktop app's hub half of the Agents pane (`shed_app::RcService`,
-  `live_activity.rs` — `rc.list` survives as the roost half alone, same op/envelope/row
-  shape); and the Rust engine (`crates/shed-rc-engine` entirely, `shed-broker`'s `rc_hub`
-  module, and the host-agent's resident `rc-hub` role + its `rc_hub` config knob —
-  `shed-host-agent rc-hub` is now a **tombstone** that names the retirement instead of
-  silently starting the daemon, and a config file that still carries `rc_hub:` loads
-  unchanged, the key simply ignored). `tests/rc-parity` (both the one-shot family plan 016
-  had already retired and the surviving hub family) is deleted whole. The pure
-  `shed_core::rc` **model** survives — `RcKind`, `RcSession`, `RcState`, `RcActivity`,
-  `RcKindFeatures`, `RcCapabilities`, `RcAgentInfo`, `RcError` — it's what the lane
-  adapters, `roost::model`, and shed-mobile read; `kind_features` is now derived
-  client-side from whether a lane adapter is attached, not read off the wire.
-- **`shed attach` starts a shed's stopped `roost-session` itself, and wires its agent hooks
-  when it does** (plan 023, #383; plan 024, #387). When roost reports a reachable shed with
-  no session running, `shed attach` now runs `roost-session start` over the shed's own SSH
-  connection instead of ending at the "has no roost-session" message — printing `starting
-  roost-session on shed-<name>…`, bounded at 60 seconds, attempted at most once per attach,
-  and gated by a post-start `session.identify` (a session speaking another protocol is a
-  hard error naming both versions, never a retry). A shed with no `roost-session`
-  *installed* keeps the old message byte for byte. After a start it performed or accepted
-  (another client winning the start race in the same moment) — and only then — the attach
-  raises shed's agent-hook set on that shed (`session.set_agent_hooks`, the same five names
-  the desktop sends, recorded as `"shed-cli"` in the shed's `~/.config/roost/agent-hooks.json`),
-  so a shed first reached from a terminal shows agent rows without the desktop ever
-  bootstrapping it. It prints one line naming what was
-  wired, skipped or failed (`nothing to wire` when the host has nothing new to report),
-  every far-side value escaped onto that one line; a failure, or no answer within 15
-  seconds, is a `warning:` line and never fails the attach; entries past five per group are
-  counted, not named. An attach that finds the session already running raises nothing, so
-  a hook set narrowed by hand on the shed is not re-widened on every attach. See
-  [`shed attach`](https://charliek.github.io/shed/reference/cli/#shed-attach).
-- **`shed attach` and `shed sessions` are roost-native, with tmux as the unchanged floor**
-  (owner decision D1, plan 022). With a local roost app running, `shed attach <shed>` opens
-  the shed as a roost tab instead of a tmux session; with no local roost app, `--tmux`, or
-  `SHED_ATTACH=tmux`, both commands run byte-for-byte as before — pinned by a golden
-  recorded before anything moved. `-S/--session` names the roost **tab title** on the roost
-  path. `shed sessions` lists a shed's roost tabs above its tmux rows (the shed list comes
-  from the server, not from tmux, so a shed used entirely through roost still shows up);
-  `sessions kill` closes a roost tab when exactly one match exists and refuses — naming
-  `--tab`/`--tmux` — when several tabs, or a tab and a tmux session, collide on one title.
-  `shed plan` and the whole Remote-Control flag set on `shed attach`
-  (`--kind/--name/--slug/--workdir/--prompt/--prompt-file/--edit/--plan/--plan-edit/
-  --permission-mode/--skip/--detach`) are **removed, not rebased** — handing a plan to a
-  shed is now `shed attach` for the tab, then the agent inside it; #371 tracks the one
-  capability with no successor yet (opening a tab with a command already running,
-  non-interactively). Known trade-offs, left as documented hazards rather than fixed here:
-  renaming a roost tab defeats reuse and opens a new one; two concurrent attaches can race
-  a duplicate saved host; nothing removes the `Host shed-<name>` ssh alias or the saved
-  roost host on `shed delete`. See
-  [`shed attach`](https://charliek.github.io/shed/reference/cli/#shed-attach) and
-  [`shed sessions`](https://charliek.github.io/shed/reference/cli/#shed-sessions) in the
-  CLI reference.
-- **The `extensions` rootfs image bakes `/usr/bin/roost-session`, the standalone headless
-  roost daemon (roost v0.0.21, session protocol 6), from its GitHub release asset.** No
-  headless deb exists, and the GUI deb would pull ~45 X11/Wayland packages, so the binary is
-  fetched from the standalone release asset instead — its version and per-architecture
-  sha256 digests are pinned in-tree (not fetched at build time) and checked with
-  `sha256sum -c` plus a build-time `identify` assert. `make check-roost-pin` keeps both
-  Dockerfiles' pin in lockstep with `RELEASE_PIN`/`LATEST_KNOWN_RELEASE` in
-  `crates/shed-core/src/roost/bootstrap/source.rs`. No systemd unit is enabled — the CLI,
-  the desktop app, and the phone app start it on first contact.
-- **`shed-server` restarts no longer leave a running shed's credential channel broken**
-  (#315). The host only ever dials the guest, never the reverse, so a restart — which every
-  brew/apt upgrade performs — left every already-running shed silently credential-broken:
-  `shed list` still said `running` and `shed exec` still worked, but SSH-agent/AWS/Docker
-  credential requests failed, reading as an auth problem rather than a plumbing one. Both
-  backends now walk their running instances at startup (in a goroutine, so boot never waits
-  on it) and resume each one's message channel — deliberately just the channel: no mounts,
-  no provisioning, no hooks — gated on a stricter liveness check than a bare PID match (the
-  process family AND its command line must name *this* instance) so a recycled PID can
-  never resurrect a dead record. Upgrading past this release needs no `shed stop && shed
-  start` dance; older servers still do. See the
-  [v0.8.2 → v0.9.0 upgrade note](https://charliek.github.io/shed/upgrades/v0.8.2-to-v0.9.0/).
-- **Stopping `shed-server` no longer kills every running Firecracker shed** (#372). The
-  firecracker-go-sdk forwards INT/QUIT/TERM/HUP/ABRT to each VMM child unless
-  `ForwardSignals` is an empty, non-nil slice, and the systemd unit carried no `KillMode`,
-  so systemd's `control-group` default reaped whatever the relay missed: one
-  `systemctl restart shed-server` — the restart every apt upgrade performs — took down every
-  shed on the host, while the same command on VZ left vfkit untouched. Both halves are fixed
-  together: the config block moves into a pure `machineConfig()` that sets
-  `ForwardSignals: []os.Signal{}`, and the unit gains `KillMode=process`. The surviving VMMs
-  are re-attached by #315's startup resume walk; if the server can't come back, they stay
-  alive and unmanaged until it does. The egress helper is unaffected — it has its own
-  parent-death signal. See the
-  [v0.8.2 → v0.9.0 upgrade note](https://charliek.github.io/shed/upgrades/v0.8.2-to-v0.9.0/).
-- **Filed while landing the above, deliberately not fixed in this PR:**
-  - #369 — Firecracker: a restart doesn't re-serve `--local-dir`/`--add-dir` 9P host
-    mounts (VZ is unaffected; vfkit's VirtioFS servers live in the VMM process, which
-    survives a `shed-server` restart). A sibling of #315's channel fix, found while tracing
-    it — the same resume walk re-dials the credential channel but deliberately does not
-    re-run mounts.
-  - #370 — Port the roost-session installer (probe/pick-a-source-rung/push/verify) from
-    `crates/shed-core/src/roost/bootstrap/` to the Go CLI, so a CLI-only user on a
-    session-less shed has an unattended path. Deferred behind plan 023's baked-image +
-    start-only rung; may turn out unnecessary once those land.
-  - #371 — `shed attach --run <cmd...>`: open a roost tab with a command already running,
-    non-interactively — the one `shed plan` capability with no successor above.
-  - #372 — Firecracker: stopping/restarting `shed-server` kills every running shed's VM
-    (the SDK's default `ForwardSignals` relays SIGTERM/etc. straight to each VMM process);
-    VZ is unaffected. Same command, opposite outcome on the two backends, undocumented
-    until this ticket. **Fixed later in this release — see the bullet above.**
-  - #373 — The Mac parallel-dev config pins `v0.8.0` image aliases while a workstation's
-    dev image cache can hold a user-pulled `v0.8.1`, failing
-    `test_images_expose_alias_and_default[vz]` for a dev-environment reason unrelated to
-    the change under test.
-  - #375 — `shed sessions --all <shed>` silently ignores the shed argument (pre-existing;
-    found by review of the roost-tab merge above, whose new half was made to match this
-    behavior rather than fix it, so one command doesn't answer two different questions).
-- **craze is shed's agent lane** (plan 025, `charliek/shed#392`, `#393`). craze — one
-  per-machine hub in front of every cursor, grok, gx and native session — replaces the gx
-  lane and the per-agent integrations; opencode and Claude stay roost tabs.
-  `crates/shed-craze` is its adapter: `CrazeSource` for a hub, `CrazeLane` for one session.
-  **The source:** the Tauri app runs one per host — eager on this machine, where it joins
-  the running hub or, when none is running yet, starts one in the app's own session — and
-  attach-only on every `machines:` entry and running shed,
-  where a find-only `craze providers --hub --json` probe runs every 30 s while no hub is
-  there and the app never starts one in the background. craze is reached through craze's
-  published binary-finding ladder (`~/.local/bin` first) with the ladder's own directories
-  put on the PATH craze runs with, so the hub can find agents an SSH exec's PATH would hide.
-  A craze session is a row of its own (provider, model, what it is doing, needs-you with the
-  first ask's summary), and a roost tab craze owns folds into it while the hub feed is live.
-  **Create:** a sheet per machine — craze's providers in craze's order, a not-ready one
-  dimmed with craze's reason and fix and not selectable, recent directories or an absolute
-  path, an optional first prompt; no model, effort or permission mode — under a request id
-  reused only while the outcome is unknown, so a lost answer never makes a second session.
-  Opening it on a dormant remote machine is the explicit action that starts that machine's
-  hub. **Open in terminal** runs `craze attach` in a roost tab. **The transcript** resumes
-  silently from its cursor after a dropped connection (a "reconnecting" banner, no reseed)
-  and reseeds only when craze refuses the cursor; permission, question and plan approvals
-  come from craze's ask registry, a sub-agent's included; Cancel, Interject and Stop appear
-  where the session's capabilities offer them; a verb whose answer was lost is
-  `outcome_unknown` and never resent. **Settings:** a chip in the transcript header
-  (`<model> · <effort> · fast`) opens one sheet for the model, its options and the mode,
-  applied at once; an option is bound to the model on screen, so a model changed underneath
-  is refused ("the model changed; try again"), and a change whose answer was lost shows "not
-  confirmed" until the session restates its settings — unless the session's settings had
-  already put the new value on screen. On a Mac, a hub first started over
-  SSH cannot start cursor (craze SF-126); the sheet dims it with craze's fix. See
-  [Agent lanes](https://charliek.github.io/shed/desktop/agent-lanes/).
+  Tauri build (same bundle id, same EdDSA key, same appcast feed, all three verified), and
+  gain everything Swift never had: the machines tab, the roost bootstrap, and agent lanes
+  (opencode and craze). **This is the first release to run that path.** The two-release
+  rehearsal was skipped deliberately, so if Sparkle reports a failed update, install the DMG
+  by hand from the releases page and file an issue. Matching identity and key make the swap
+  possible; they do not prove it.
+  **Preferences do not migrate.** Swift stores them in `UserDefaults`, Tauri reads
+  `prefs.json`, so terminal, approvals, policy and launch-at-login all start from Tauri's
+  defaults after the update. Swift's sources stay buildable (their removal is filed as
+  [#364](https://github.com/charliek/shed/issues/364)); only its release job retired. A
+  prerelease tag still lands on the beta channel. Rolling back by reinstalling the Swift
+  0.8.1 DMG **re-offers 0.9.0 on the next check**, because it reads the same feed with the
+  same key.
+- **craze is the desktop's agent lane.** craze, one per-machine hub in front of every cursor,
+  grok, gx and native session, replaces the per-agent integrations; opencode and Claude stay
+  roost tabs.
+  - **The source:** the Tauri app runs one per host. It is eager on this machine, where it
+    joins the running hub or, when none is running yet, starts one in the app's own session.
+    It is attach-only on every `machines:` entry and running shed, where a find-only
+    `craze providers --hub --json` probe runs every 30 s while no hub is there, and only an
+    explicit create or Open in terminal starts one. (A hub that exits between the probe
+    finding it and the app attaching can be restarted by that attach.) craze is found through craze's published
+    binary-finding ladder (`~/.local/bin` first), with the ladder's own directories put on the
+    PATH craze runs with, so the hub can find agents an SSH exec's PATH would hide.
+  - **Rows:** a craze session is a row of its own (provider, model, what it is doing, and
+    needs-you with the first ask's summary). A roost tab craze owns folds into it while the
+    hub feed is live.
+  - **Create:** a sheet per machine lists craze's providers in craze's order, with a
+    not-ready one dimmed (craze's reason and fix, not selectable), recent directories or an
+    absolute path, and an optional first prompt. There is no model, effort or permission mode
+    in the sheet. The request id is reused only while the outcome is unknown, so a lost
+    answer never makes a second session. Opening the sheet on a dormant remote machine is the
+    explicit action that starts that machine's hub. **Open in terminal** runs `craze attach`
+    in a roost tab.
+  - **The transcript** resumes silently from its cursor after a dropped connection (a
+    "reconnecting" banner, no reseed) and reseeds only when craze refuses the cursor.
+    Permission, question and plan approvals come from craze's ask registry, a sub-agent's
+    included. Cancel, Interject and Stop appear where the session's capabilities offer them,
+    and a verb whose answer was lost is `outcome_unknown` and never resent.
+  - **Settings:** a chip in the transcript header (`<model> · <effort> · fast`) opens one
+    sheet for the model, its options and the mode, applied at once. An option is bound to the
+    model on screen, so a model changed underneath is refused ("the model changed; try
+    again"), and a change whose answer was lost shows "not confirmed" until the session
+    restates its settings.
+  - On a Mac, a hub first started over SSH cannot start cursor (a craze limitation); the
+    sheet dims it with craze's fix.
+
+  See [Agent lanes](https://charliek.github.io/shed/desktop/agent-lanes/).
 - After a lost create answer, the desktop's craze create sheet keeps the request id across a
   re-read and a failed retry, so Try again can't start a second session while the first one
   runs.
@@ -521,60 +103,282 @@ verbatim._
 - The Hosts badge no longer flickers to 0 after a refresh.
 - A launched tab takes the dialog's display name; a launch with a first prompt or permission
   mode is refused instead of silently ignored.
-- A stable desktop release refuses to ship an unsigned Mac build, and the release page carries
-  the curated release notes.
-- **The lane contract splits into a machine-level source and a session-scoped lane** (plan
-  025 C4, `charliek/shed#391`). `shed_core::lane::AgentLane` was server-scoped, with static
-  capabilities and a `create` no client called. It is now an `AgentSource` (`subscribe` to
-  the session list as `SourceEvent`s, `create_options`, `create`, `open`) and the
-  session-scoped `AgentLane` it opens: no verb takes an id, and `settings`/`set`/`stop`
-  join the verbs with no default bodies. Capabilities ride the stream
-  (`LaneEvent::Capabilities`, and `Settings` when they say so) instead of a getter;
-  `LaneEvent::Stale` is a non-terminal transport loss that a silent resume clears, so a
-  client reopens a lane only once it has ended (`Down`); a source's outage is the
-  non-terminal `SourceEvent::Offline`. `Publisher<T>` is the one bounded channel for both
-  levels, and `lane::conformance` (behind `test-support`) checks every adapter's streams.
-  opencode implements both levels (`OpencodeSource`). On the desktop's socket every `lane.*`
-  op now takes `kind`, `lane.open` answers `{session}`, and capabilities and settings are
-  read from `lane.messages`; `lane.stop`, `lane.settings` and `lane.set` are new.
-- **shed's codex, cursor, gx and grok kinds are retired** (plan 025 C2,
-  `charliek/shed#390`). `RcKind` loses `Codex`, `Cursor`, `Gx` and `Grok`; a roost tab
-  running one of those agents directly is a **plain row** — its raw kind, roost's activity
-  and directory, no typed input, no lane. `RcKind::Craze` names a craze-owned tab. The
-  `shed roost-provider` palette and the desktop's launch dialog offer `claude` and
-  `opencode`. `ROOST_WIRED_AGENTS` is unchanged: roost still wires codex, cursor and grok's
-  status hooks, which is where a plain row's activity comes from.
-- **Run a command in a tab** (plan 025 C3, `charliek/shed#390`). The desktop's launch
-  dialog gains a **Run a command** mode beside **An agent**, and the socket a `roost.run
-  {target, command, workdir?}` op: a roost tab running the command line as typed — split on
-  ASCII whitespace, with no shell and no quoting — gated by no kind. It is how an agent's
-  own TUI starts with flags of your choosing (`codex --model x`) now that the per-agent
-  kinds are gone. A blank command is refused, never read as a plain shell.
-- **The craze pins and their CI** (plan 025 C5–C7, `charliek/shed#394`). `craze-pin.env`
-  pins `CRAZE_TEST_SHA`, a merged craze `main` commit — craze v0.1.0's tag commit — that
-  CI builds `craze`, `craze-fake-host` and `craze-fake-agent` from (the
-  `.github/actions/craze-binaries` composite action, written for shed-mobile's CI to share;
-  `make craze-binaries` locally). shed-craze runs against the real hub, its cells fail rather than skip under
-  CI's `SHED_CRAZE_REQUIRE=1`, and it vendors craze's wire fixtures at that sha (`wire.PIN`,
-  diffed against craze's on every CI run). `make check-craze-pin` joins `make check`, and a
-  new `pins` CI job runs it beside `check-roost-pin`, which no CI job ran before. A new
-  `machine-transport` CI job runs the live machine-transport leg on a real sshd: the craze
-  remote command is pinned by its `craze-bridge-hub` and `craze-providers-hub` scenarios.
-  **At release time,** `release-plan.sh` runs `scripts/release/check-craze-pin.sh` for
-  every stable tag that ships `server`: `CRAZE_RELEASE` must name a craze release whose tag
-  commit equals `CRAZE_TEST_SHA`, or the tag is refused — an empty `CRAZE_RELEASE`
-  included. `SHED_RELEASE_ALLOW_NO_CRAZE=<reason>` is the owner's loud emergency override,
-  never set by CI. See `RELEASING.md` § "craze pin".
+- **Run a command in a tab.** The desktop's launch dialog gains a **Run a command** mode
+  beside **An agent**: a roost tab running the command line as typed, split on ASCII
+  whitespace with no shell and no quoting. It is how an agent's own TUI starts with flags of
+  your choosing (`codex --model x`). A blank command is refused, never read as a plain shell.
+- **The desktop can put `roost-session` on a shed or machine that doesn't have one yet.** It
+  composes roost's own install and start steps over the target's own SSH (probe, preview,
+  bootstrap, launch). After a Start it performs itself, it wires the target's agent hooks, so
+  a shed's agent rows carry roost-sourced activity instead of liveness only. The wiring is
+  re-sent on every watcher reconnect for targets the app bootstrapped this run, and a host
+  the app only watches gets none. A subscribe whose session id disagrees with the one
+  `session.identify` returned now triggers an immediate resync. See
+  [roost-session hosts](https://charliek.github.io/shed/extensions/roost-session-hosts/) for
+  the source ladder, the exact (narrow) rollback promise, the PATH warning, and `shed reset`
+  handling.
+- **Sheds are roost hosts in the desktop.** A running shed's roost rows appear in the Agents
+  pane, and `roost.launch` opens a tab on any roost host.
+- **A stable desktop release refuses to ship an unsigned Mac build, and the release page
+  carries the curated release notes.**
+
+### Roost
+
+- **shed speaks roost's session protocol 6** (roost v0.0.20 was the first published release to
+  speak it; shed pins v0.0.21). **Protocol 5 retired the lease:** `session.connect`, the refusals that went with
+  it, and the driver/observer split of an event stream are gone, `session.set_agent_hooks` is
+  open to every same-UID client, and `SessionIdentify` drops `features`, so the generation
+  number is the whole negotiation. **Protocol 6 turns `session.set_agent_hooks` into a pure
+  raise:** shed sends its five wireable agent names (`claude, codex, cursor, grok, opencode`)
+  and the host unions them into its own hook set. There is no narrowing direction left on this
+  wire, and an agent name the host doesn't recognize comes back as skipped with reason
+  `"unknown"`. Removing a hook is a deliberate local act on the host (`roostctl agent
+  uninstall`). Go's `internal/roostprovider` mirrors the same generation, which is why this
+  also ships with `server`.
+  **A host speaking an older protocol is refused by name and offered the update, and its
+  running session is never stopped.** That covers a host the desktop bootstrapped earlier
+  (protocol 4), a host on protocol 5, and a `roost-session` from any roost release before
+  v0.0.20 (v0.0.19 speaks protocol 2). To recover, run `roostctl session stop` on that
+  target and reconnect; shed then sees a stale binary with no session running and replaces
+  and restarts it unattended, like any other Update. Installing roost-session from roost's release assets
+  now works against a fresh Linux target straight from roost's GitHub release,
+  checksum-verified against its published `.sha256`.
+- **`shed attach` starts a shed's stopped `roost-session` itself, and wires its agent hooks
+  when it does** (#383, #387). When roost reports a reachable shed with no session running,
+  `shed attach` runs `roost-session start` over the shed's own SSH connection instead of
+  ending at the "has no roost-session" message. It prints `starting roost-session on
+  shed-<name>…`, is bounded at 60 seconds, is attempted at most once per attach, and is gated
+  by a post-start `session.identify` (a session speaking another protocol is a hard error
+  naming both versions, never a retry). A shed with no `roost-session` *installed* keeps the
+  old message byte for byte. After a start it performed or accepted (another client winning
+  the start race) and only then, the attach raises shed's agent-hook set on that shed
+  (recorded as `"shed-cli"` in the shed's `~/.config/roost/agent-hooks.json`), so a shed
+  first reached from a terminal shows agent rows without the desktop ever bootstrapping it.
+  It prints one line naming what was wired, skipped or failed; a failure, or no answer within
+  15 seconds, is a `warning:` line and never fails the attach. An attach that finds the
+  session already running raises nothing, so a hook set narrowed by hand is not re-widened on
+  every attach. See [`shed attach`](https://charliek.github.io/shed/reference/cli/#shed-attach).
+- **`shed attach` and `shed sessions` are roost-native, with tmux as the unchanged floor.**
+  With a local roost app running, `shed attach <shed>` opens the shed as a roost tab instead
+  of a tmux session. With no local roost app, `--tmux`, or `SHED_ATTACH=tmux`, both commands
+  run byte-for-byte as before. `-S/--session` names the roost **tab title** on the roost
+  path. `shed sessions` lists a shed's roost tabs above its tmux rows (the shed list comes
+  from the server, so a shed used entirely through roost still shows up). `sessions kill`
+  closes a roost tab when exactly one match exists and refuses, naming `--tab`/`--tmux`,
+  when several tabs, or a tab and a tmux session, collide on one title. Known trade-offs:
+  renaming a roost tab defeats reuse and opens a new one; two concurrent attaches can race a
+  duplicate saved host; nothing removes the `Host shed-<name>` ssh alias or the saved roost
+  host on `shed delete`. See [`shed attach`](https://charliek.github.io/shed/reference/cli/#shed-attach)
+  and [`shed sessions`](https://charliek.github.io/shed/reference/cli/#shed-sessions).
+- **`shed roost-provider` puts kickoff in roost's own palette.** `shed roost-provider
+  list|activate` implements roost's dynamic provider contract: `list` enumerates running
+  sheds and `machines:` entries with no SSH; `activate` probes the chosen host over one SSH
+  round trip plus roost's own client-bridge wire and opens a tab running `claude` or
+  `opencode` under `bash -lc` in an absolute working directory (every other agent starts
+  through craze). Every expected non-actionable state (not installed, not running, protocol
+  mismatch, unreachable, no local `ssh`, no agents found) exits zero with an explanatory menu row.
+  `shed roost-provider --install [--dry-run] [--uninstall]` writes the launcher script roost
+  discovers, to `<dir>/providers/shed` where `<dir>` is the parent of a non-empty
+  `$ROOST_CONFIG` else `$HOME/.config/roost` (roost does not consult `$XDG_CONFIG_HOME`, so
+  neither does this). See
+  [`docs/extensions/roost-provider.md`](https://charliek.github.io/shed/extensions/roost-provider/).
+- The desktop no longer polls roost: it subscribes to roost's event stream and pushes a
+  snapshot only when a row actually changes. `SHED_ROOST_POLL_MS` is gone.
+
+### Server and images
+
+- **`shed-server` restarts no longer leave a running shed's credential channel broken**
+  (#315). The host only ever dials the guest, so a restart, which every brew/apt upgrade
+  performs, left every already-running shed silently credential-broken: `shed list` still
+  said `running` and `shed exec` still worked, but SSH-agent/AWS/Docker credential requests
+  failed, reading as an auth problem. Both backends now walk their running instances at
+  startup (in a goroutine, so boot never waits on it) and resume each one's message channel,
+  deliberately just the channel: no mounts, no provisioning, no hooks. It is gated on a
+  stricter liveness check than a bare PID match (the process family and its command line must
+  name *this* instance), so a recycled PID can never resurrect a dead record. Upgrading past
+  this release needs no `shed stop && shed start` dance; older servers still do.
+- **Stopping `shed-server` no longer kills every running Firecracker shed** (#372). The
+  firecracker-go-sdk forwards INT/QUIT/TERM/HUP/ABRT to each VMM child unless
+  `ForwardSignals` is an empty, non-nil slice, and the systemd unit carried no `KillMode`, so
+  one `systemctl restart shed-server` took down every shed on the host, while the same command
+  on VZ left vfkit untouched. The VM config now sets `ForwardSignals: []os.Signal{}` and the
+  unit gains `KillMode=process`. The surviving VMMs are re-attached by the startup resume walk
+  above; if the server can't come back, they stay alive and unmanaged until it does. The
+  egress helper is unaffected. **The 0.8.x to 0.9.0 upgrade itself still stops Firecracker
+  sheds once**, because the binary being stopped is the old one (see the warning above).
+- **The `extensions` rootfs image bakes `/usr/bin/roost-session`, the standalone headless
+  roost daemon (roost v0.0.21, session protocol 6), from its GitHub release asset.** No
+  headless deb exists, and the GUI deb would pull about 45 X11/Wayland packages. The version
+  and per-architecture sha256 digests are pinned in-tree and checked with `sha256sum -c` plus
+  a build-time `identify` assert. `make check-roost-pin` keeps both Dockerfiles' pin in
+  lockstep with `RELEASE_PIN`/`LATEST_KNOWN_RELEASE` in
+  `crates/shed-core/src/roost/bootstrap/source.rs`. No systemd unit is enabled; the CLI, the
+  desktop app and the phone app start it on first contact.
 - **The `extensions` rootfs image bakes `/usr/bin/craze`, craze v0.1.0, from its GitHub
-  release asset** (plan 025 §3.9 C13, `charliek/shed#394`). Folded into the same `RUN` as
-  the roost-session bake above, so the layer count is unchanged: `craze_linux_{amd64,arm64}.tar.gz`
-  is fetched, its sha256 checked against an in-tree digest (never fetched — a `.sha256`
-  from the same mutable release proves transport, not provenance), and `craze --version`
-  asserted to equal the pinned version at build time. `craze-pin.env`'s `CRAZE_RELEASE` is
-  now `0.1.0`; `make check-craze-pin` keeps both Dockerfiles' `CRAZE_VERSION` and digest
-  pairs in lockstep with it, and `scripts/release/check-craze-pin.sh --release v0.1.0`
-  now passes against the real tag. No systemd unit is enabled — `shed attach` starts a
-  lane's hub itself.
+  release asset.** It is folded into the same `RUN` as the roost-session bake, so the layer
+  count is unchanged: `craze_linux_{amd64,arm64}.tar.gz` is fetched, its sha256 checked
+  against an in-tree digest (never fetched; a `.sha256` from the same mutable release proves
+  transport, not provenance), and `craze --version` asserted to equal the pinned version at
+  build time. `make check-craze-pin` keeps both Dockerfiles' `CRAZE_VERSION` and digest pairs
+  in lockstep with `craze-pin.env`. No systemd unit is enabled. craze is the agent-lane CLI
+  the desktop and phone drive; the desktop's create sheet starts a remote hub.
+- The `extensions` and `full` images install `strix` (a TUI for staging and reviewing diffs)
+  and `prox` (a process manager with an HTTP API and TUI) from the stridelabs apt repo, in
+  place of the retired `shed-ext-rc` (about +32.6 MiB over a base that already carries
+  `strix`'s `git` dependency).
+
+### Retired
+
+- **The remote-control (RC) hub is retired, end to end.** The guest binary (`shed-ext-rc` is
+  no longer baked into the images), the server surface (the `rc-enrich`/`rc-events`/
+  `rc-proxy` feature tokens and `rc_capabilities` off `/api/overview` and `/api/info`, and
+  the RC routes), the hub half of the desktop's Agents pane, the Rust RC engine, and the
+  host-agent's RC hub role are removed. `shed-host-agent rc-hub` is now a tombstone that
+  names the retirement, and a host-agent config that still carries `rc_hub:` loads unchanged,
+  with the key ignored. The roost half of the Agents pane remains. A shed row's `state` is
+  pure **liveness** (`ready` while its roost tab exists). The claude, codex and cursor
+  RC lanes went with the hub; roost now derives their status.
+- **`shed create --wait` (shipped in 0.8.2, part of the RC surface) is removed** with the hub.
+- **`shed plan` and the Remote-Control flag set on `shed attach` are removed, not rebased**
+  (`--kind/--name/--slug/--workdir/--prompt/--prompt-file/--edit/--plan/--plan-edit/
+  --permission-mode/--skip/--detach`). Handing a plan to a shed is now `shed attach` for the
+  tab, then the agent inside it. [#371](https://github.com/charliek/shed/issues/371) tracks
+  the one capability with no successor yet.
+- **The `shed-machine-rc` component is retired.** The Go `shed-machine-rc` shipped through
+  0.8.2; `cmd/shed-machine-rc`, its release config and its wiring are deleted, and
+  `update-version.sh`/`release-plan.sh` reject the `machine-rc` token. The 0.8.2 brew and apt
+  artifacts are not withdrawn but are unsupported, and stay frozen at 0.8.2. The surviving
+  machine-side daemon is `shed-host-agent`; see the upgrade guide for the uninstall step.
+- **shed's codex, cursor, gx and grok kinds are retired.** A roost tab running one of those
+  agents directly is a **plain row**: its raw kind, roost's activity and directory, no typed
+  input, no lane. `RcKind::Craze` names a craze-owned tab. The `shed roost-provider` palette
+  and the desktop's launch dialog offer `claude` and `opencode`; every other agent starts
+  through craze.
+- **Retired before release, so nothing to migrate from 0.8.2:** the gx lane (craze replaces
+  it), the host-agent's RC hub (it never shipped), roost's observer event stream and `session.driver_changed` (gone with
+  protocol 5), the `rc.list` union of hub and roost rows, the
+  `{mode: "auto"}` hook-wiring call (protocol 6 replaced it), and `sx` (never published).
+
+### Agent lanes (developer-facing)
+
+- **The lane contract splits into a machine-level source and a session-scoped lane.**
+  `shed_core::lane::AgentLane` was server-scoped with static capabilities and a `create` no
+  client called. It is now an `AgentSource` (`subscribe` to the session list as
+  `SourceEvent`s, `create_options`, `create`, `open`) and the session-scoped `AgentLane` it
+  opens: no verb takes an id, and `settings`/`set`/`stop` join the verbs with no default
+  bodies. Capabilities ride the stream (`LaneEvent::Capabilities`, and `Settings` when they
+  say so) instead of a getter. `LaneEvent::Stale` is a non-terminal transport loss that a
+  silent resume clears, so a client reopens a lane only once it has ended (`Down`), and a
+  source's outage is the non-terminal `SourceEvent::Offline`. `Publisher<T>` is the one
+  bounded channel for both levels, and `lane::conformance` (behind `test-support`) checks
+  every adapter's streams. On the desktop's socket every `lane.*` op now takes `kind`,
+  `lane.open` answers `{session}`, and capabilities and settings are read from
+  `lane.messages`; `lane.stop`, `lane.settings` and `lane.set` are new.
+- **A live opencode transcript from a machine row** (`charliek/shed#320`).
+  `shed_core::lane` is the agent-lane contract, DTOs plus an `AgentLane` trait for "a coding
+  agent with sessions, a transcript and approvals", one adapter per agent.
+  `crates/shed-opencode` drives the same local HTTP server opencode's own TUI is already
+  running (never a sidecar), replaying and streaming its transcript over the legacy
+  `GET /event` feed and answering permission/question approvals. Reconnects are bracketed by
+  `Reset` … `Ready`, so a client's view never shows a half-seeded transcript. A machine row
+  whose roost tab reports a `server_url` gets a Transcript panel, reached directly when the
+  machine is local or through a shared `ssh -N -L` forward otherwise. Two sessions in one
+  directory never see each other's rows; a child session's approvals surface (attributed to
+  it) while its own transcript never renders. **Limits:** no interject (every send joins the
+  session's own runner); no resume-from-cursor (every reconnect refolds history from the
+  top); no credential source for a password-protected opencode server, which answers `401`
+  and surfaces as an inline "unauthorized" error. See
+  [Agent lanes](https://charliek.github.io/shed/desktop/agent-lanes/).
+- **The contract keeps what building the gx lane taught it:** the corrections numbered in
+  the `shed_core::lane` module doc, the silent resume a cursor-capable adapter is allowed,
+  and the refusal to guess an ambiguous decision. A real permission can offer five options,
+  two of them `allow_once`, so the panel renders every offered option under the agent's own
+  label and answers with its exact id (`LaneAnswer::Choice`) for every adapter. The Tauri
+  backend dispatches lanes by kind (`Arc<dyn AgentLane>`; an unrecognized kind answers
+  `unsupported_lane`).
+- **The client channel is bounded, and overflow becomes a reseed** (`charliek/shed#342`). A
+  lane subscription's frame channel was unbounded, so a client that stopped draining (a
+  phone backgrounded mid-session) let a watcher's backlog grow without limit. It is now
+  bounded at 1,024 frames, with the overflow policy in `shed_core::lane::LanePublisher`: a
+  full channel drops the frame and answers `Lagged`, and the generation ends at the first
+  dropped frame and reseeds with a fresh `Reset { reason: "lagged" } … Ready` rather than
+  resuming. The terminal `Down` is never dropped.
+- **A question's free-text answer reaches the agent** (`charliek/shed#341`).
+  `LaneAnswer::Question` gains a positional `custom_text` field, one entry per question,
+  `null` where nothing was typed. opencode appends the text as one more entry in that
+  question's `answers` array, matching what its own TUI posts. Text aimed at a question whose
+  `custom` is `false` is refused before anything reaches the wire (craze's questions take no
+  free text, so a lone single-choice craze question keeps the one-click answer path).
+- **opencode answers the approval its own panel addressed, in that session's own scope**
+  (`charliek/shed#345`). opencode has no by-id GET for a permission or question, so an
+  unscoped lookup across its two directory-wide lists could let one panel answer a sibling
+  session's request. `answer` now resolves the addressed approval inside the root session plus
+  its transitive descendants first; an id outside that scope is `unknown_approval`, an id
+  open in both lists is refused as ambiguous, and answering an approval whose session has
+  since been deleted is `unknown_session`. It costs four GETs per answer on a childless
+  session, where an agent with a by-id route (craze's `asks.get`) pays one.
+- **The staged transcript/approvals view moves into `shed_app::lane_view`.** `LaneView`,
+  `apply` and the 500-row cap move out of the Tauri client into the ungated `shed-app` crate,
+  so the phone folds the same subscription into the same view. `LaneView::snapshot(since_seq)`
+  returns a typed `LaneViewSnapshot`; pending approvals are now sorted `created_at` then `id`
+  (previously unsorted).
+
+### Release and test tooling
+
+- **The craze pins and their CI.** `craze-pin.env` pins `CRAZE_TEST_SHA`, a merged craze
+  `main` commit (craze v0.1.0's tag commit) that CI builds `craze`, `craze-fake-host` and
+  `craze-fake-agent` from (the `.github/actions/craze-binaries` composite action, which
+  shed-mobile's CI shares; `make craze-binaries` locally). shed-craze runs against the real
+  hub, its cells fail rather than skip under CI's `SHED_CRAZE_REQUIRE=1`, and it vendors
+  craze's wire fixtures at that sha (`wire.PIN`, diffed against craze's on every CI run).
+  `make check-craze-pin` joins `make check`, and a new `pins` CI job runs it beside
+  `check-roost-pin`. A new `machine-transport` CI job runs the live machine-transport leg on a
+  real sshd, where the craze remote command is pinned by its `craze-bridge-hub` and
+  `craze-providers-hub` scenarios.
+  **At release time,** `release-plan.sh` runs `scripts/release/check-craze-pin.sh` for every
+  stable tag that ships `server`: `CRAZE_RELEASE` must name a craze release whose tag commit
+  equals `CRAZE_TEST_SHA`, or the tag is refused (an empty `CRAZE_RELEASE` included).
+  `SHED_RELEASE_ALLOW_NO_CRAZE=<reason>` is the owner's loud emergency override, never set by
+  CI. See the "craze pin" section of `RELEASING.md`.
+- **The component recommender bootstraps a never-shipped component.**
+  `recommend-components.sh` carries a `NEVER_SHIPPED` list whose members report the basis
+  `(never shipped)` and are recommended unconditionally, instead of tripping the "no
+  historical basis" hard error. The list is currently empty; a synthetic test proves the
+  mechanism.
+- Three tests stop asserting wall-clock budgets that only failed under parallel compile load
+  (`charliek/shed#343`, covering `charliek/shed#335`): `shed-app`'s `wait_for` deadline is now
+  a 60 s hang bound, `shed-broker`'s dead-address leg gets a 10x margin over its 300 ms
+  budget, and `shed-core`'s TLS-rejection test classifies a typed `Stage` instead of matching
+  error substrings.
+- shedtest: `desktop/tools/shedtest/fake_lane_server.py` hosts the opencode lane fake over a
+  control HTTP port (a startup JSON line, a per-agent method allowlist, wire-envelope
+  builders, `/_/info`, `/_/stop`) so shed-mobile's Dart harness can drive it without
+  re-deriving the agent's wire format. It also gains `hold_seed`/`release_seed`, so "no
+  partial view before `Ready`" is observable rather than vacuous.
+
+### Known issues
+
+These are open at release time and affect users:
+
+- [#369](https://github.com/charliek/shed/issues/369): Firecracker does not re-serve
+  `--local-dir`/`--add-dir` 9P host mounts after a `shed-server` restart (VZ is unaffected).
+  The restart resume walk re-dials the credential channel but deliberately does not re-run
+  mounts.
+- [#370](https://github.com/charliek/shed/issues/370): the roost-session installer exists only
+  in the desktop and phone apps, so a CLI-only user on a shed with no `roost-session` has no
+  unattended install path (the baked `extensions` image covers new sheds).
+- [#371](https://github.com/charliek/shed/issues/371): `shed attach --run <cmd...>`, opening a
+  roost tab with a command already running non-interactively, has no successor to `shed plan`
+  yet.
+- [#404](https://github.com/charliek/shed/issues/404): CI does not build the rootfs
+  Dockerfiles before a tag, so the `extensions` stage's first CI build is the release itself.
+- [#405](https://github.com/charliek/shed/issues/405): a crashed or SIGKILLed desktop app
+  still orphans its ssh children (the orderly shutdown above covers quits and signals, not a
+  crash).
+- [craze#93](https://github.com/charliek/craze/issues/93): after a Stop, a session can be
+  listed once more for about a second before its removal.
+- [shed-mobile#37](https://github.com/charliek/shed-mobile/issues/37): the phone's craze
+  create sheet drops the held request id on a failed manual retry.
 
 ## v0.8.2 — 2026-08-17
 

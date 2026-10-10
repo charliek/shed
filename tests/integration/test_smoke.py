@@ -674,8 +674,8 @@ def _baked_image_verdict(
 def test_craze_baked(shed_server, test_shed_name):
     """`/usr/bin/craze` is baked into the `extensions` image (plan 025
     §3.9), the same way as `roost-session` above: a standalone release
-    asset, checksum-verified at build time, with no systemd unit —
-    `shed attach` starts a lane's hub itself.
+    asset, checksum-verified at build time, with no systemd unit — the
+    desktop's create sheet starts a remote hub; nothing in the CLI runs craze.
 
     Gated behind `SHED_IMAGE_HAS_CRAZE=<backends>`: the published images
     carry no craze until the 0.9.0 tag, so this stays skipped everywhere
