@@ -144,6 +144,25 @@ CHANGELOG entry and skip the check entirely.
   exits 1 and the whole workflow fails loudly — a silent no-op release
   is impossible. Fix by bumping the right manifest(s) and cutting a
   fresh tag.
+- **The desktop signing gate (fail closed)**: when `ship_desktop`, the
+  `release-plan` job runs `scripts/release/desktop-signing-gate.sh` right
+  after `release-plan.sh`. It takes six presence flags, built as
+  `${{ secrets.X != '' }}` for the six Apple secrets `CAN_NOTARIZE` reads,
+  and never a secret value. A **stable** desktop tag missing any of them
+  fails there, naming the missing ones, **before anything publishes**: no
+  images, no brew/apt, no GitHub release, no appcast entry. A prerelease
+  passes with an ad-hoc note (the rc rehearsal may build unsigned).
+  `desktop-macos` runs the same gate again right after its checkout,
+  before any build. The local pre-tag `release-plan.sh` run can't see
+  repository secrets, so confirm the six with
+  `gh secret list -R charliek/shed` before tagging a stable desktop
+  release. (One exception: when the tag's checkout has no gate script, a
+  `workflow_dispatch` of a bare `v0.Y.Z` tag with Y at most 8 and no
+  suffix (the tags that predate the gate; v0.8.0 and v0.8.1 ship desktop)
+  skips it with a warning so its image republish still works;
+  `desktop-macos` refuses those tags' mac republish anyway. Any other run
+  without the script fails closed: a tag push, any suffixed or malformed
+  tag, and a dispatch of 0.9.0 or later.)
 - **Interleaved component versions**: component versions advance
   independently — each component's "current version" is **the most
   recent tag that shipped it**, not the most recent tag overall. The
@@ -207,10 +226,14 @@ Moving `CRAZE_TEST_SHA` means re-vendoring craze's
 CI's `craze-binaries` action diffs the two trees on every run.
 
 **The release-time check.** `scripts/release/check-craze-pin.sh --release
-vX.Y.Z` (network) resolves `v$CRAZE_RELEASE` against
+v<CRAZE_RELEASE>` (network) takes **craze's own version**, e.g. `v0.1.0`,
+**not** the shed tag; `release-plan.sh` passes `v$CRAZE_RELEASE`. It resolves
+`v$CRAZE_RELEASE` against
 `github.com/charliek/craze` via `git ls-remote` and requires the resolved
 commit to equal `CRAZE_TEST_SHA` — O4's rule that "at the shed release the
 test SHA must equal the baked release's tag commit, enforced by a check."
+Passing the shed tag by mistake fails with "not found" plus a hint that the
+argument is craze's version from `craze-pin.env`.
 `release-plan.sh` calls it for every **stable tag whose component set
 includes `server`** (the images ship with the server component), in both
 the mandatory local pre-tag run and CI's `release-plan` job.
@@ -243,7 +266,9 @@ fails, and the seam is proven ignored without the self-test flag.
    - Runs `scripts/release/recommend-components.sh X.Y.Z`, presents the
      recommendation, and gets the human's confirmed/edited component
      set (see "Recommend + confirm" above).
-   - Drafts a CHANGELOG entry from `git log v<previous>..HEAD` with a
+   - Drafts a CHANGELOG entry from `git log v<previous>..HEAD` (or, when
+     `## Unreleased` is curated, folds it instead — see "Folding a
+     curated `## Unreleased`") with a
      `**Ships:**` line naming the confirmed set, commits as
      `docs(changelog): vX.Y.Z entry`
    - Runs `scripts/release/update-version.sh X.Y.Z --components
@@ -321,15 +346,18 @@ fails, and the seam is proven ignored without the self-test flag.
      - Both share `release.mode: keep-existing` +
        `release.replace_existing_artifacts: true`, identical
        `changelog`/`prerelease: auto`/`project_name: shed`. **The FIRST
-       shipping invocation creates the GitHub Release and writes the
-       changelog body**; later invocations in the same run only add
-       their own assets — they never touch the body. This makes re-runs
-       safe: `replace_existing_artifacts` lets a re-run replace its own
-       already-uploaded assets instead of failing on `already_exists`.
-     - A single-component tag's release notes still describe the
-       **entire** `last-tag..tag` commit range (the goreleaser changelog
-       is repo-level, not per-component-path-filtered) — don't read a
-       short notes body as "nothing else changed."
+       shipping invocation creates the GitHub Release, with the tag's
+       curated CHANGELOG section as its body**: the job extracts it with
+       `scripts/release/changelog-section.sh` into a file outside the
+       checkout and passes `--release-notes <file>` to that invocation
+       only (server, or host-agent when server doesn't ship). Later
+       invocations in the same run only add their own assets — they never
+       touch the body. This makes re-runs safe: `replace_existing_artifacts`
+       lets a re-run replace its own already-uploaded assets instead of
+       failing on `already_exists`.
+     - The body is the CHANGELOG section, not goreleaser's commit list,
+       so anything users must read on the release page (a one-time
+       upgrade warning, say) belongs in the CHANGELOG entry.
      - Before-hooks in every split config are constrained to **not
        mutate tracked files** — CI asserts `go mod tidy` leaves
        `go.mod`/`go.sum` clean and that `packaging/server.yaml.generated`
@@ -423,11 +451,41 @@ those need a source-tree bump.
 > identical story until plan 016 removed it.)
 
 `CHANGELOG.md` is maintained by the release skill for human-readable
-in-repo history. GoReleaser's auto-generated release notes (filtered:
-skip `docs:`, `test:`, `chore:`, `ci:`) go on the GitHub Release body.
+in-repo history, and **the tag's section is the GitHub Release body** on
+every stable tag. `scripts/release/changelog-section.sh vX.Y.Z` prints it
+(the same extractor `release-plan.sh`'s Ships check reads, so the section
+that passed the check is the one published). The section ends only at the
+next `## Unreleased` or `## v<digit>` heading, so any other `## ` line (an
+upgrade example's, say) stays in the body. **A curated section must not
+contain a line starting `## Unreleased` or `## v<digit>`**: it would end the
+release body there. The `release` job passes it
+to the first shipping goreleaser invocation as `--release-notes`;
+`desktop-release-create` passes it as `--notes-file` on a desktop-only
+tag, and `desktop-macos` then appends its notarization line. GoReleaser's
+generated changelog (`changelog: use: github`, filtered: skip `docs:`,
+`test:`, `chore:`, `ci:`) no longer reaches the body.
 
 `pyproject.toml` is for the docs site only and has its own version cadence;
 not touched by `update-version.sh`.
+
+### Folding a curated `## Unreleased`
+
+When the `## Unreleased` section was curated as release notes while the work
+landed (as 0.9.0's was), fold it instead of drafting a new entry:
+
+1. Rename the heading to `## vX.Y.Z — YYYY-MM-DD` (an em dash, as
+   `release-plan.sh` requires) and keep the `**Ships:**` line first under it.
+   Add a fresh empty `## Unreleased` above it if you want one.
+2. Do **not** let the release skill draft the entry from `git log
+   v<previous>..HEAD` when the section is curated: that replaces the curated
+   text with a commit list. Tell the skill to fold the existing section.
+3. Check it before tagging: `scripts/release/changelog-section.sh vX.Y.Z`
+   prints the section, and `scripts/release/release-plan.sh vX.Y.Z` passes.
+
+The folded section **is the release page body**: the `release` job publishes
+exactly what `changelog-section.sh` prints, so it must read as release notes
+from its first line, with any one-time upgrade warning near the top. It must
+not contain a line starting `## Unreleased` or `## v<digit>` (see above).
 
 ## Host-agent: Rust binary
 
@@ -489,7 +547,7 @@ release-time concern.
 | `RELEASE_BOT_CLIENT_ID` | `charliek-release-bot` GitHub App client ID (used by `actions/create-github-app-token`) | required |
 | `RELEASE_BOT_APP_KEY` | App private key (.pem) | required |
 | `GITHUB_TOKEN` (workflow-provided) | All 3 Docker push jobs (build-tools, VZ, FC) to ghcr.io as `${{ github.actor }}` | provided automatically; do not set |
-| Desktop secrets (six `CAN_NOTARIZE` + `SPARKLE_ED_PRIVATE_KEY`) | Desktop release leg — see [`desktop/RELEASING.md`](desktop/RELEASING.md) | required before the first desktop-shipping tag |
+| Desktop secrets (six `CAN_NOTARIZE` + `SPARKLE_ED_PRIVATE_KEY`) | Desktop release leg — see [`desktop/RELEASING.md`](desktop/RELEASING.md) | required for every stable desktop tag: without the six, the desktop signing gate fails the `release-plan` job before anything publishes |
 
 Retired (deleted from `gh secret list -R charliek/shed` during the
 convention adoption):
@@ -546,6 +604,7 @@ Run workflow). Each block must print the expected repo name.
 | Symptom | Cause | Fix |
 |---|---|---|
 | `git push` rejected from local | Pusher not in ruleset bypass | Confirm App + admin role in `main`'s ruleset `bypass_actors` |
+| `release-plan` job fails with "a stable desktop tag requires Developer ID signing and notarization; missing: …" | One or more of the six Apple secrets is unset (the desktop signing gate) | Add the named secrets (see [`desktop/RELEASING.md`](desktop/RELEASING.md), Secrets), then re-run the failed run: nothing has published, so the tag stands. An unsigned rehearsal needs a prerelease (`-rc.N`) tag instead |
 | `release-plan` job fails with "tag matches NO component manifest" (or a Ships cross-check mismatch) | A manifest wasn't bumped before tagging (forgotten `update-version.sh --components ...`), the CHANGELOG `**Ships:**` line disagrees with the manifests, or the tag was created against the wrong commit | Don't force-fix in CI — re-run `/release-workflows:release` against a corrected tag. This is exactly what the mandatory local `scripts/release/release-plan.sh` pre-tag run (see "Recommend + confirm") is meant to catch before the tag ever gets pushed |
 | GoReleaser fails at `brews` with `Bad credentials` | `RELEASE_BOT_CLIENT_ID` unset OR App not installed on `homebrew-tap` | Verify via `sanity-check-app.yml`'s homebrew-tap block; install the App on the tap |
 | apt-charliek dispatch fails after 3 retries | App not installed on `charliek/apt-charliek` OR scope mismatch | Verify via `sanity-check-app.yml`'s apt-charliek block; check `RELEASE_BOT_APP_KEY` is the current `.pem` |

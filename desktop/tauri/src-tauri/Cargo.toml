@@ -58,7 +58,10 @@ reqwest = { version = "0.12", default-features = false }
 # signatures would stop accepting these types. Bump both together.
 roost-ipc = { git = "https://github.com/charliek/roost", rev = "2bc71fa3848ddbf2d190aab6c4ef61ad2d432aa1" }
 # "process" backs the Linux AuthGate (the pkcheck subprocess; the notifier is zbus).
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "net", "io-util", "time", "process"] }
+# "signal" backs the orderly shutdown's signal thread (plan 026 §3.3) — DECLARED
+# here rather than left to roost-ipc's feature unification, which already
+# enables it (so the lock does not move).
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "net", "io-util", "time", "process", "signal"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 base64 = "0.22"
@@ -135,6 +138,12 @@ shed-opencode = { path = "../../../crates/shed-opencode", features = ["test-supp
 # cells drive (the host-removal races, the fold, the eviction hooks), and the
 # recipe's skip-or-require rule. Same feature-only switch as the two above.
 shed-craze = { path = "../../../crates/shed-craze", features = ["test-support"] }
+# `tauri::test` — the mock runtime, so a test drives a `#[tauri::command]` through
+# Tauri's own argument extraction (plan 026 §3.5: an argument a command does not
+# declare is dropped without a word, and only that layer can show it). `test = []`
+# in tauri's manifest: no package is added to the lock, and the shipped binary
+# never compiles it (a dev-dependency feature reaches test builds only).
+tauri = { version = "2", features = ["test"] }
 
 # A debug build is what the harness drives; keep it reasonably snappy.
 #

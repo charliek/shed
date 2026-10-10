@@ -105,7 +105,8 @@ fn machine_terminal_refusal() -> (String, String) {
 /// — plural, because one failed host is not the only case. Healthy = `[]`, never
 /// absent, so a consumer can read it unconditionally.
 /// **The single shaper for `rc.list`** — the roost sessions on every listed
-/// host, each host's contract, and each host's health.
+/// host, each host's contract, each host's health, and the unlisted hosts
+/// craze is offered on (`shed_craze`, plan 026 §3.2).
 ///
 /// Shared by the socket IPC op and the frontend's `rc_list` Tauri command, the
 /// same way [`sheds_payload`] is shared. Those two used to build this payload
@@ -148,7 +149,13 @@ pub(crate) async fn rc_list_payload(
     //
     // The filter is a SHED filter: it narrows sheds by server and name, and
     // omits machines outright, because a machine belongs to no server.
-    let (sessions, machine_status) =
+    //
+    // `shed_craze` is read under that same lock (plan 026 §3.2): the hosts this
+    // payload OFFERS craze on without listing them — a running shed whose craze
+    // probe says dormant (New craze session on its Sheds-pane row and in
+    // "Where"), or too old (its note) — so a host is never both a status row and
+    // an entry. The filter narrows it exactly as it narrows the status rows.
+    let (sessions, machine_status, shed_craze) =
         machines.snapshot(crate::roost_hosts::HostFilter { server: host, shed });
     // **Capabilities keyed by ORIGIN** (plan 013 §3.4) — `machine:<name>` or
     // `roost:<server>/<shed>`, the same string each row carries, so the UI has a
@@ -174,6 +181,7 @@ pub(crate) async fn rc_list_payload(
         "sessions": sessions,
         "capabilities": Value::Object(capabilities),
         "machines": machine_status,
+        "shed_craze": shed_craze,
     })
 }
 
@@ -303,6 +311,14 @@ fn run_command(params: &Value) -> Result<crate::roost_hosts::RunCommand, (String
         .map_err(|m| err("bad_request", m))
 }
 
+/// A [`LaunchError`](crate::roost_hosts::LaunchError) as the socket's error
+/// pair: `bad_request` for a request a roost launch refuses, `action_failed`
+/// for one it tried — the same codes the `rc_launch`/`machine_launch` commands
+/// put in front of their error string.
+fn launch_failure(e: crate::roost_hosts::LaunchError) -> (String, String) {
+    err(e.code(), e.message())
+}
+
 /// The one gate + router behind the New-session dialog's two driver doors
 /// (`ui.fill_launch` / `ui.submit_launch`, plan 025 C3): the event name and
 /// payload to emit, or the refusal.
@@ -315,9 +331,10 @@ fn run_command(params: &Value) -> Result<crate::roost_hosts::RunCommand, (String
 /// something a shipped app needs anyone to do; the production door onto the
 /// same backend is `roost.run`.
 ///
-/// `ui.fill_launch {mode?, target?, command?, workdir?}` sets those controls
-/// the way a person would (an absent key is left as it is); `mode` is `agent`
-/// (the kind picker) or `command` (the Command field). `ui.submit_launch`
+/// `ui.fill_launch {mode?, target?, command?, workdir?, name?}` sets those
+/// controls the way a person would (an absent key is left as it is); `mode` is
+/// `agent` (the kind picker) or `command` (the Command field), and `name` is the
+/// agent mode's Session name. `ui.submit_launch`
 /// presses Create, through the same gate the button has — a dialog that would
 /// not let a person submit does not let this door either.
 fn launch_door(
@@ -331,7 +348,7 @@ fn launch_door(
     match op {
         "ui.fill_launch" => {
             let mut fill = serde_json::Map::new();
-            for key in ["mode", "target", "command", "workdir"] {
+            for key in ["mode", "target", "command", "workdir", "name"] {
                 match params.get(key) {
                     None | Some(Value::Null) => {}
                     Some(Value::String(s)) => {
@@ -463,6 +480,107 @@ fn hold_view_door(env: &Env, params: &Value) -> Result<Value, (String, String)> 
     }
 }
 
+/// The gate behind `ui.report_history` (plan 026 §3.4, shed#400): whether to
+/// clear the ring after reading it, or the refusal.
+///
+/// **TEST-MODE ONLY**, the other driver doors' rule. It answers what every one
+/// of the dashboard's full reports carried ([`crate::state::ReportRecord`]), so
+/// a cell can assert that NO report zeroed the Hosts badge — a sampled read can
+/// fall between two reports and miss one. Nothing a shipped app needs.
+fn report_history_door(env: &Env, params: &Value) -> Result<bool, (String, String)> {
+    if !env.test_mode {
+        return Err(err("not_enabled", "ui.report_history requires test mode"));
+    }
+    match params.get("clear") {
+        None | Some(Value::Null) => Ok(false),
+        Some(Value::Bool(clear)) => Ok(*clear),
+        Some(_) => Err(err("bad_request", "'clear' must be true or false")),
+    }
+}
+
+/// The gate behind `app.quit` (plan 026 §3.3): the tray's Quit, drivable.
+///
+/// **TEST-MODE ONLY**, the other driver doors' rule. It is `app.exit(0)` —
+/// exactly what the tray's Quit and the popover's call — so the harness can
+/// prove the tray's path runs the orderly shutdown. A socket client that could
+/// quit the user's app is nothing a shipped app needs.
+fn app_quit_door(env: &Env) -> Result<(), (String, String)> {
+    if !env.test_mode {
+        return Err(err("not_enabled", "app.quit requires test mode"));
+    }
+    Ok(())
+}
+
+/// What `app.terminate` answers, in test mode, on every platform but macOS.
+const TERMINATE_NOT_SUPPORTED: &str = "app.terminate is the macOS system-quit path; use app.quit";
+
+/// The gate behind `app.terminate` (plan 026 AM7): the macOS system quit — a
+/// Dock Quit, a logout, an AppleScript `quit` — drivable.
+///
+/// **TEST-MODE ONLY**, [`app_quit_door`]'s rule: outside test mode it answers
+/// `not_enabled`, on every platform. In test mode it opens on macOS only.
+/// `[NSApplication terminate:]` is an AppKit path, so every other platform
+/// answers `not_supported` and points at `app.quit`.
+fn app_terminate_door(env: &Env) -> Result<(), (String, String)> {
+    if !env.test_mode {
+        return Err(err("not_enabled", "app.terminate requires test mode"));
+    }
+    if cfg!(target_os = "macos") {
+        Ok(())
+    } else {
+        Err(err("not_supported", TERMINATE_NOT_SUPPORTED))
+    }
+}
+
+/// `[NSApp terminate:nil]`: the AppKit path that a Dock Quit, a logout and an
+/// AppleScript `quit` all take. AppKit sends `applicationShouldTerminate:`,
+/// then `applicationWillTerminate:`, which tao turns into `RunEvent::Exit` and
+/// nothing else. That arm runs the orderly shutdown. AppKit then ends the
+/// process with its own `exit(0)`.
+///
+/// **Queued from the main thread, not sent inline.** A `run_on_main_thread`
+/// closure runs inside tao's event handler, which holds that handler's lock
+/// (tao `app_state.rs`, `Handler::handle_user_events`). A `terminate:` sent
+/// from inside it would reach `applicationWillTerminate:` and then
+/// `AppState::exit`, which takes the same lock again on the same thread: a
+/// deadlock. So the closure only queues the message, with
+/// `performSelectorOnMainThread:withObject:waitUntilDone:NO` in the common
+/// run-loop modes. The main run loop delivers it on its next pass, outside any
+/// tao callback, the way AppKit delivers a Dock or AppleScript quit. The IPC
+/// answer is on its way before then.
+#[cfg(target_os = "macos")]
+fn system_terminate(app: &AppHandle) -> Result<(), (String, String)> {
+    app.run_on_main_thread(|| {
+        use objc2::runtime::AnyObject;
+        use objc2::{msg_send, sel, MainThreadMarker};
+        use objc2_app_kit::NSApplication;
+        let Some(mtm) = MainThreadMarker::new() else {
+            eprintln!("shed-desktop-tauri: app.terminate: not on the main thread; nothing sent");
+            return;
+        };
+        let ns_app = NSApplication::sharedApplication(mtm);
+        let sender: Option<&AnyObject> = None;
+        // SAFETY: `performSelectorOnMainThread:withObject:waitUntilDone:` is
+        // NSObject's `(SEL, id, BOOL) -> void`, and `terminate:` takes one
+        // object argument, its sender, which may be nil.
+        unsafe {
+            let _: () = msg_send![
+                &*ns_app,
+                performSelectorOnMainThread: sel!(terminate:),
+                withObject: sender,
+                waitUntilDone: false
+            ];
+        }
+    })
+    .map_err(|e| err("internal", format!("app.terminate: {e}")))
+}
+#[cfg(not(target_os = "macos"))]
+fn system_terminate(_app: &AppHandle) -> Result<(), (String, String)> {
+    // Unreachable: [`app_terminate_door`] answers `not_supported` off macOS,
+    // before this is called.
+    Err(err("not_supported", TERMINATE_NOT_SUPPORTED))
+}
+
 /// An OPTIONAL string param: absent or `null` is `None`; a string is itself;
 /// anything else is `bad_request` — never read as absent, because absence has a
 /// meaning of its own (a default, or a freshly minted id).
@@ -489,6 +607,19 @@ fn craze_create_request(
         opt_str(params, "request_id")?,
     )
     .map_err(craze_err)
+}
+
+/// `craze.create`'s `held` from the socket's params (plan 026 §3.1): TYPED
+/// like every other field — absent or `null` is a fresh create, a non-bool is
+/// `bad_request` — and, set, it needs the `request_id` it replays
+/// ([`crate::craze::held_create`]).
+fn craze_create_held(params: &Value) -> Result<bool, (String, String)> {
+    let held = match params.get("held") {
+        None | Some(Value::Null) => false,
+        Some(Value::Bool(b)) => *b,
+        Some(_) => return Err(err("bad_request", "'held' must be true or false")),
+    };
+    crate::craze::held_create(held, opt_str(params, "request_id")?).map_err(craze_err)
 }
 
 /// A craze op's refusal as the IPC error envelope ([`crate::craze::CrazeFailure`]).
@@ -697,6 +828,15 @@ impl Handler {
             // The sidebar nav badge counts the shell reported {sheds, agents, hosts,
             // pending}, or null before its first report.
             "ui.badges" => Ok(json!({ "badges": self.ui_get("badges") })),
+            "ui.report_history" => {
+                let clear = report_history_door(&self.env, params)?;
+                let (reports, dropped) = self
+                    .ui
+                    .lock()
+                    .map(|mut s| s.report_history(clear))
+                    .unwrap_or_default();
+                Ok(json!({ "reports": reports, "dropped": dropped }))
+            }
             "ui.set_appearance" => self.set_appearance(params),
             "ui.show_window" | "app.activate" => {
                 present_main_window(&self.app);
@@ -717,6 +857,13 @@ impl Handler {
             "ui.show_launch" => {
                 present_main_window(&self.app);
                 let _ = self.app.emit("show-launch", json!({}));
+                Ok(json!({}))
+            }
+            // Its close (plan 026 §3.2): the dialog closes on Escape or Cancel
+            // — a key or a click — and a caller that opened it to read its
+            // "Where" choices must be able to put it away again.
+            "ui.close_launch" => {
+                let _ = self.app.emit("close-launch", json!({}));
                 Ok(json!({}))
             }
             // The New-session dialog's typing-and-clicking doors (plan 025 C3)
@@ -821,6 +968,24 @@ impl Handler {
                 Ok(json!({}))
             }
             "app.screenshot" => self.screenshot().await,
+            // The tray's Quit, drivable (plan 026 §3.3) — TEST-MODE ONLY, see
+            // [`app_quit_door`]. The answer goes out while the orderly
+            // shutdown runs; the app is gone once it finishes.
+            "app.quit" => {
+                app_quit_door(&self.env)?;
+                self.app.exit(0);
+                Ok(json!({}))
+            }
+            // The macOS system quit, drivable (plan 026 AM7): TEST-MODE ONLY
+            // and macOS only, see [`app_terminate_door`]. It reaches the
+            // orderly shutdown through `RunEvent::Exit` alone. As with
+            // `app.quit`, the answer goes out first: the terminate is only
+            // queued here, see [`system_terminate`].
+            "app.terminate" => {
+                app_terminate_door(&self.env)?;
+                system_terminate(&self.app)?;
+                Ok(json!({}))
+            }
             "sheds.list" => {
                 let reachability = self.backend.refresh().await;
                 observe_reachability(&self.machines, &reachability).await;
@@ -1279,7 +1444,8 @@ impl Handler {
     // the wire from the guest (where it is liveness now) and a machine row's from
     // roost; no client re-derives one from a pane.
 
-    /// `rc.list {host?, shed?}` → `{sessions, capabilities, machines}`. The
+    /// `rc.list {host?, shed?}` → `{sessions, capabilities, machines,
+    /// shed_craze}`. The
     /// roost tabs on every listed host. Which sheds are running comes from
     /// `Backend` (resolution stays in shed-app); the rows come from each host's
     /// own `roost-session`.
@@ -1377,10 +1543,10 @@ impl Handler {
     /// last report.
     ///
     /// It exists for the fields that are NOT there. Since S6 the dialog offers
-    /// no initial-prompt box — roost's `tab.open` is an argv and a cwd, and
-    /// delivering typed input is `charliek/shed#366` — and "the UI does not ask
-    /// for something it would silently drop" is only assertable against what was
-    /// actually painted.
+    /// no initial-prompt box — roost's `tab.open` is an argv and a cwd, and a
+    /// launch that carries a prompt is refused (plan 026 §3.5) — and "the UI does
+    /// not ask for something it cannot deliver" is only assertable against what
+    /// was actually painted.
     fn launch_dump(&self) -> Value {
         json!({ "launch": self.ui_get("launch_dialog").unwrap_or(Value::Null) })
     }
@@ -1422,8 +1588,11 @@ impl Handler {
     /// the two apart while that was true. Now there is one launch path, and
     /// [`Self::rc_launch`] is a second door onto it, held open for 0.9.x.
     ///
-    /// The full param set is still accepted; only `kind` and `workdir` reach
-    /// roost in M1 (see [`crate::roost_hosts::RoostHosts::launch`]).
+    /// `kind` and `workdir` are the `tab.open`, and a `display_name` is set as
+    /// the tab's title after it (the row's `title` says whether it took); an
+    /// `initial_prompt` or `permission_mode` is refused `bad_request` before any
+    /// tab opens, and a launch that was tried and failed is `action_failed`
+    /// ([`crate::roost_hosts::RoostHosts::launch`] has the rule, plan 026 §3.5).
     async fn roost_launch(&self, params: &Value) -> Result<Value, (String, String)> {
         let target = match params.get("target").and_then(Value::as_str) {
             Some(target) => target.to_string(),
@@ -1437,11 +1606,14 @@ impl Handler {
                 &kind,
                 opt("display_name"),
                 opt("workdir"),
-                opt("permission_mode"),
-                opt("initial_prompt"),
+                // TYPED, unlike the fields above: a first prompt or a mode in
+                // some other JSON shape is still one, and reading it as absent
+                // would drop it silently (plan 026 §3.5).
+                opt_str(params, "permission_mode")?,
+                opt_str(params, "initial_prompt")?,
             )
             .await
-            .map_err(|e| err("action_failed", e))
+            .map_err(launch_failure)
     }
 
     /// `roost.run {target | machine, command, workdir?}` → the tab it opened: a
@@ -1761,18 +1933,21 @@ impl Handler {
             .map_err(craze_err)
     }
 
-    /// `craze.create {machine, cwd, provider?, prompt?, request_id?}` →
+    /// `craze.create {machine, cwd, provider?, prompt?, request_id?, held?}` →
     /// `{session, host_id, prompt, prompt_error?, request_id}`: a new craze
     /// session, its row folded into the machine's listing at once. `cwd` must
     /// be absolute; a blank provider or prompt is absent
     /// ([`crate::craze::create_request`]); `request_id` is the caller's (reused
     /// only to retry an unknown outcome) or minted here — and answered back
-    /// either way.
+    /// either way. `held: true` says the call REPLAYS a request id kept from
+    /// an unknown outcome (plan 026 §3.1): only craze's own answer about that
+    /// request ends it, so anything else is `outcome_unknown` again.
     async fn craze_create(&self, params: &Value) -> Result<Value, (String, String)> {
         let machine = req_str(params, "machine")?.to_string();
+        let held = craze_create_held(params)?;
         let request = craze_create_request(params)?;
         self.machines
-            .craze_create(&machine, request)
+            .craze_create(&machine, request, held)
             .await
             .map_err(craze_err)
     }
@@ -1815,8 +1990,10 @@ impl Handler {
         Ok(format!("roost:{server}/{shed}"))
     }
 
-    /// `rc.launch {shed, kind, host?, display_name?, workdir?, initial_prompt?}` →
-    /// the opened row.
+    /// `rc.launch {shed, kind, host?, display_name?, workdir?, permission_mode?,
+    /// initial_prompt?}` → the opened row, under [`Self::roost_launch`]'s rule:
+    /// a name is set as the tab's title, a first prompt or a permission mode is
+    /// refused `bad_request`.
     ///
     /// **An ALIAS for [`Self::roost_launch`] since S6** (`charliek/shed#328`),
     /// kept for 0.9.x: it is the same `tab.open` on the same host, addressed by
@@ -1835,11 +2012,14 @@ impl Handler {
                 &kind,
                 opt("display_name"),
                 opt("workdir"),
-                opt("permission_mode"),
-                opt("initial_prompt"),
+                // TYPED, unlike the fields above: a first prompt or a mode in
+                // some other JSON shape is still one, and reading it as absent
+                // would drop it silently (plan 026 §3.5).
+                opt_str(params, "permission_mode")?,
+                opt_str(params, "initial_prompt")?,
             )
             .await
-            .map_err(|e| err("action_failed", e))
+            .map_err(launch_failure)
     }
 
     /// `rc.kill {shed, slug, host?}` → close the shed's roost tab.
@@ -2819,6 +2999,33 @@ mod tests {
                 .0,
             "bad_request"
         );
+        // The agent mode's Session name travels too (plan 026 §3.5's cell types
+        // one): it is the box a display name comes from.
+        let named = json!({ "mode": "agent", "target": "machine:mini3", "name": "My run" });
+        assert_eq!(
+            launch_door(&test, "ui.fill_launch", &named).unwrap(),
+            ("fill-launch", named.clone())
+        );
+    }
+
+    /// **Both launch codes, at the socket** (plan 026 §3.5): a request a roost
+    /// launch refuses is `bad_request`, and only a launch that was tried and
+    /// failed is `action_failed` — the distinction a caller acts on (fix the
+    /// request, or retry the host). The message is the refusal's, untouched.
+    #[test]
+    fn a_launch_error_keeps_its_code_at_the_socket() {
+        use crate::roost_hosts::LaunchError;
+        assert_eq!(
+            launch_failure(LaunchError::BadRequest("no prompts here".into())),
+            ("bad_request".to_string(), "no prompts here".to_string())
+        );
+        assert_eq!(
+            launch_failure(LaunchError::Failed("machine:mini3: unreachable".into())),
+            (
+                "action_failed".to_string(),
+                "machine:mini3: unreachable".to_string()
+            )
+        );
     }
 
     /// **`craze.create`'s `request_id` is read strictly** (C10 review): only an
@@ -2864,6 +3071,33 @@ mod tests {
                 "{key}: not a string"
             );
         }
+    }
+
+    /// `held` (plan 026 §3.1) is typed like every other field — absent or
+    /// `null` is a fresh create, a non-bool is `bad_request` — and a held
+    /// create needs the request id it replays.
+    #[test]
+    fn craze_create_reads_held_strictly() {
+        let base = json!({ "machine": "localhost", "cwd": "/w", "request_id": "shed-held-1" });
+        let with = |key: &str, v: Value| {
+            let mut p = base.clone();
+            p[key] = v;
+            p
+        };
+        assert_eq!(craze_create_held(&base), Ok(false));
+        assert_eq!(craze_create_held(&with("held", Value::Null)), Ok(false));
+        assert_eq!(craze_create_held(&with("held", json!(true))), Ok(true));
+        assert_eq!(craze_create_held(&with("held", json!(false))), Ok(false));
+        for bad in [json!(1), json!("true"), json!({})] {
+            assert_eq!(
+                craze_create_held(&with("held", bad.clone())).unwrap_err().0,
+                "bad_request",
+                "{bad}"
+            );
+        }
+        let mut no_id = with("held", json!(true));
+        no_id.as_object_mut().unwrap().remove("request_id");
+        assert_eq!(craze_create_held(&no_id).unwrap_err().0, "bad_request");
     }
 
     /// **The craze create sheet's driver doors are test-mode only** (plan 025
@@ -2943,6 +3177,35 @@ mod tests {
         }
     }
 
+    /// **The report history is test-mode only** (plan 026 §3.4): outside test
+    /// mode it answers `not_enabled`; in test mode `clear` is optional and must
+    /// be a boolean.
+    #[test]
+    fn the_report_history_door_is_test_mode_only() {
+        let mut prod = env(None);
+        prod.test_mode = false;
+        for params in [json!({}), json!({ "clear": true })] {
+            let (code, message) = report_history_door(&prod, &params)
+                .expect_err("a driver door must not be reachable in a shipped app");
+            assert_eq!(code, "not_enabled", "{params}");
+            assert!(message.contains("ui.report_history"), "{message}");
+        }
+        let test = env(None);
+        assert!(!report_history_door(&test, &json!({})).unwrap());
+        assert!(!report_history_door(&test, &json!({ "clear": null })).unwrap());
+        assert!(!report_history_door(&test, &json!({ "clear": false })).unwrap());
+        assert!(report_history_door(&test, &json!({ "clear": true })).unwrap());
+        for bad in [json!({ "clear": "yes" }), json!({ "clear": 1 })] {
+            assert_eq!(
+                report_history_door(&test, &bad)
+                    .expect_err("not a clear flag")
+                    .0,
+                "bad_request",
+                "{bad}"
+            );
+        }
+    }
+
     /// **The view hold is test-mode only** (Amendment A13's harness door): in
     /// test mode it carries the boolean, and anything else is a bad request.
     #[test]
@@ -2965,6 +3228,46 @@ mod tests {
                 hold_view_door(&test, &bad).expect_err("not a hold").0,
                 "bad_request",
                 "{bad}"
+            );
+        }
+    }
+
+    /// **`app.quit` is the tray's Quit, and a privilege**: outside test mode it
+    /// answers `not_enabled` (plan 026 §3.3).
+    #[test]
+    fn the_quit_door_is_test_mode_only() {
+        let mut prod = env(None);
+        prod.test_mode = false;
+        let (code, message) =
+            app_quit_door(&prod).expect_err("a driver door must not be reachable in a shipped app");
+        assert_eq!(code, "not_enabled");
+        assert!(message.contains("app.quit"), "{message}");
+        assert!(app_quit_door(&env(None)).is_ok());
+    }
+
+    /// **`app.terminate` is the macOS system quit, and a privilege** (plan
+    /// 026 AM7). Outside test mode it answers `not_enabled` on every
+    /// platform. In test mode it opens on macOS, and everywhere else it
+    /// answers `not_supported` and points at `app.quit`.
+    #[test]
+    fn the_terminate_door_is_test_mode_only() {
+        let mut prod = env(None);
+        prod.test_mode = false;
+        let (code, message) = app_terminate_door(&prod)
+            .expect_err("a driver door must not be reachable in a shipped app");
+        assert_eq!(code, "not_enabled");
+        assert!(message.contains("app.terminate"), "{message}");
+
+        let test = env(None);
+        if cfg!(target_os = "macos") {
+            assert!(app_terminate_door(&test).is_ok());
+        } else {
+            let (code, message) =
+                app_terminate_door(&test).expect_err("only macOS has the system-quit path");
+            assert_eq!(code, "not_supported");
+            assert_eq!(
+                message,
+                "app.terminate is the macOS system-quit path; use app.quit"
             );
         }
     }

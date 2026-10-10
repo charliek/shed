@@ -2302,6 +2302,21 @@ pub trait AgentSource: Send + Sync {
     /// through [`AgentSource::open`] — and what became of its first prompt.
     async fn create(&self, request: LaneCreateRequest) -> Result<LaneCreated, LaneError>;
 
+    /// [`AgentSource::create`] REPLAYING a held request: the caller sends a
+    /// `request_id` it kept because an earlier create under it had an unknown
+    /// outcome, so the agent may already have started that session (plan 026
+    /// §3.1). An adapter whose agent has create idempotency treats every
+    /// failure that says nothing about THAT request — a dial that never reached
+    /// the agent, an agent that could not tell whether it ran — as unknown
+    /// again, so the caller keeps the id; only the agent's own answer about the
+    /// request (a session, or a refusal of it) ends the id.
+    ///
+    /// The default is [`AgentSource::create`]: an adapter with no idempotency
+    /// (opencode, which accepts and ignores the id) has nothing to replay.
+    async fn create_held(&self, request: LaneCreateRequest) -> Result<LaneCreated, LaneError> {
+        self.create(request).await
+    }
+
     /// A session-scoped lane for one row's id ([`LaneSession::id`]).
     ///
     /// Opening is BINDING, not dialling: an adapter does no I/O here, and a

@@ -12,7 +12,7 @@ use serde_json::json;
 use shed_core::lane::SourceOffline;
 use shed_core::roost::testing::{ownership, FakeRoost};
 use shed_craze::testing::{full_hub_capabilities, roster_row, HookDial, HubEnd, ScriptedDial};
-use shed_craze::{CrazeDial, Probe};
+use shed_craze::{CrazeDial, DialError, Probe};
 use tokio::sync::mpsc::UnboundedReceiver;
 
 use super::*;
@@ -85,6 +85,8 @@ impl CrazeProbe for ProbeRef {
 /// attach-only host, its probe.
 struct Scripted {
     hook: Arc<HookDial>,
+    /// The scripted dial under `hook`, for a test that fails dials.
+    dial: Arc<ScriptedDial>,
     conns: tokio::sync::Mutex<UnboundedReceiver<HubEnd>>,
     probe: Option<Arc<ScriptedProbe>>,
 }
@@ -101,7 +103,8 @@ impl Scripted {
     fn new(probe: Option<Arc<ScriptedProbe>>) -> Arc<Scripted> {
         let (dial, conns) = ScriptedDial::new();
         Arc::new(Scripted {
-            hook: HookDial::new(dial as Arc<dyn CrazeDial>),
+            hook: HookDial::new(Arc::clone(&dial) as Arc<dyn CrazeDial>),
+            dial,
             conns: tokio::sync::Mutex::new(conns),
             probe,
         })
@@ -1149,7 +1152,7 @@ async fn a_created_session_is_listed_and_openable_at_once() {
         let hosts = Arc::clone(&hosts);
         tokio::spawn(async move {
             hosts
-                .craze_create(LOCALHOST, create_req("shed-req-1"))
+                .craze_create(LOCALHOST, create_req("shed-req-1"), false)
                 .await
         })
     };
@@ -1428,11 +1431,175 @@ async fn a_hub_too_old_to_create_is_refused_without_a_dial() {
         "{e:?}"
     );
     let e = hosts
-        .craze_create(LOCALHOST, create_req("shed-req-old"))
+        .craze_create(LOCALHOST, create_req("shed-req-old"), false)
         .await
         .unwrap_err();
     assert_eq!(e.code, "too_old", "{e:?}");
     assert_eq!(craze.hook.dials(), dials, "refused before any dial");
+}
+
+/// **A held create gets no definite answer but craze's** (plan 026 §3.1): a
+/// `craze.create` REPLAYING a kept request id whose host's craze is offline
+/// (not installed) or too old, or whose host is no longer registered, answers
+/// `outcome_unknown` — refused here before any dial, and without the
+/// definite code a fresh create gets — so the sheet keeps the id; and one
+/// whose dial never reaches craze is `outcome_unknown` too (the source's
+/// `create_held`), where a fresh one is a quiet `unavailable`.
+#[tokio::test]
+async fn a_held_create_on_an_offline_host_answers_outcome_unknown() {
+    // Not installed: every dial says so, the roster's and any create's.
+    let craze = Scripted::eager();
+    for _ in 0..10_000 {
+        craze
+            .dial
+            .fail_next(DialError::NotInstalled("craze: command not found".into()));
+    }
+    let hosts = start_scripted(
+        &ShedConfig::default(),
+        &test_options(&[]),
+        vec![(local(), Arc::clone(&craze))],
+    );
+    // A craze-only localhost is unlisted until a craze Ready: read its state.
+    wait_for("craze not installed", || {
+        let state = lock(&hosts.state);
+        (state.get(&local())?.craze.status()["cause"] == "not_installed").then_some(())
+    })
+    .await;
+    let dials = craze.hook.dials();
+    let held = hosts
+        .craze_create(LOCALHOST, create_req("shed-held-1"), true)
+        .await
+        .unwrap_err();
+    assert_eq!(held.code, "outcome_unknown", "{held:?}");
+    assert!(held.message.starts_with("outcome unknown: "), "{held:?}");
+    let fresh = hosts
+        .craze_create(LOCALHOST, create_req("shed-fresh-1"), false)
+        .await
+        .unwrap_err();
+    assert_eq!(fresh.code, "not_installed", "{fresh:?}");
+    // A host no longer registered: unknown when held, a bad request when not.
+    let gone = hosts
+        .craze_create("gone-machine", create_req("shed-held-2"), true)
+        .await
+        .unwrap_err();
+    assert_eq!(gone.code, "outcome_unknown", "{gone:?}");
+    let gone = hosts
+        .craze_create("gone-machine", create_req("shed-fresh-2"), false)
+        .await
+        .unwrap_err();
+    assert_eq!(gone.code, "bad_request", "{gone:?}");
+    // An address that names no machine at all is a bad request either way.
+    let unparsable = hosts
+        .craze_create("roost:no-server", create_req("shed-held-3"), true)
+        .await
+        .unwrap_err();
+    assert_eq!(unparsable.code, "bad_request", "{unparsable:?}");
+    assert!(
+        craze.hook.dials() - dials <= 1,
+        "refused before any dial (a roster redial aside)"
+    );
+
+    // Too old: a live hub that cannot create.
+    let craze = Scripted::eager();
+    let hosts = start_scripted(
+        &ShedConfig::default(),
+        &test_options(&[]),
+        vec![(local(), Arc::clone(&craze))],
+    );
+    let mut hub = craze.next().await;
+    let mut caps = full_hub_capabilities();
+    caps["sessionCreate"] = json!(false);
+    hub.hello(EPOCH, caps).await;
+    hub.subscribed("sub-1", EPOCH, json!([])).await;
+    wait_for("live", || {
+        (status_of(&hosts, LOCALHOST)?["craze"]["state"] == "live").then_some(())
+    })
+    .await;
+    let dials = craze.hook.dials();
+    let held = hosts
+        .craze_create(LOCALHOST, create_req("shed-held-4"), true)
+        .await
+        .unwrap_err();
+    assert_eq!(held.code, "outcome_unknown", "{held:?}");
+    let fresh = hosts
+        .craze_create(LOCALHOST, create_req("shed-fresh-4"), false)
+        .await
+        .unwrap_err();
+    assert_eq!(fresh.code, "too_old", "{fresh:?}");
+    assert_eq!(craze.hook.dials(), dials, "refused before any dial");
+
+    // Live and able, and the create's dial never reaches craze.
+    let craze = Scripted::eager();
+    let hosts = start_scripted(
+        &ShedConfig::default(),
+        &test_options(&[]),
+        vec![(local(), Arc::clone(&craze))],
+    );
+    let _roster = craze.roster(json!([])).await;
+    wait_for("live", || {
+        (status_of(&hosts, LOCALHOST)?["craze"]["state"] == "live").then_some(())
+    })
+    .await;
+    for _ in 0..3 {
+        craze
+            .dial
+            .fail_next(DialError::Unreachable("ssh: connection refused".into()));
+    }
+    let held = hosts
+        .craze_create(LOCALHOST, create_req("shed-held-5"), true)
+        .await
+        .unwrap_err();
+    assert_eq!(held.code, "outcome_unknown", "{held:?}");
+    let fresh = hosts
+        .craze_create(LOCALHOST, create_req("shed-fresh-5"), false)
+        .await
+        .unwrap_err();
+    assert_eq!(fresh.code, "unavailable", "{fresh:?}");
+}
+
+/// **A create answered ok with a result shed cannot read is
+/// `outcome_unknown`** (plan 026 AM1): craze may have started the session, so
+/// the sheet must keep its id — a definite `failed` here would end it while
+/// that session runs. Both attempts read nothing (the source's one retry), and
+/// nothing is listed.
+#[tokio::test]
+async fn an_unreadable_create_answer_is_outcome_unknown() {
+    let craze = Scripted::eager();
+    let hosts = Arc::new(start_scripted(
+        &ShedConfig::default(),
+        &test_options(&[]),
+        vec![(local(), Arc::clone(&craze))],
+    ));
+    let _roster = craze.roster(json!([])).await;
+    wait_for("live", || {
+        (status_of(&hosts, LOCALHOST)?["craze"]["state"] == "live").then_some(())
+    })
+    .await;
+    let create = {
+        let hosts = Arc::clone(&hosts);
+        tokio::spawn(async move {
+            hosts
+                .craze_create(LOCALHOST, create_req("shed-unreadable"), false)
+                .await
+        })
+    };
+    for _ in 0..2 {
+        let mut hub = craze.next().await;
+        hub.hello(EPOCH, full_hub_capabilities()).await;
+        let req = hub.expect("session.create").await;
+        assert_eq!(req["params"]["requestId"], "shed-unreadable");
+        hub.reply(
+            &req,
+            json!({"session": {"hostId": HOST_NEW}, "prompt": "accepted"}),
+        )
+        .await;
+    }
+    let e = create.await.unwrap().unwrap_err();
+    assert_eq!(e.code, "outcome_unknown", "{e:?}");
+    assert!(
+        !craze_rows(&hosts).iter().any(|r| r["slug"] == HOST_NEW),
+        "nothing listed from an answer shed cannot read"
+    );
 }
 
 /// **An opened tab attaches to ITS session** even when another row claims the
@@ -1762,7 +1929,11 @@ async fn create_answering(
     let create = {
         let hosts = Arc::clone(hosts);
         let request_id = request_id.to_string();
-        tokio::spawn(async move { hosts.craze_create(LOCALHOST, create_req(&request_id)).await })
+        tokio::spawn(async move {
+            hosts
+                .craze_create(LOCALHOST, create_req(&request_id), false)
+                .await
+        })
     };
     let mut hub = craze.next().await;
     hub.hello(EPOCH, full_hub_capabilities()).await;
@@ -1871,10 +2042,20 @@ fn start_counting(
     reaches: Vec<(HostId, Arc<Scripted>)>,
     changes: Arc<AtomicUsize>,
 ) -> RoostHosts {
+    start_counting_on(&ShedConfig::default(), options, reaches, changes)
+}
+
+/// [`start_counting`], under `config` (a server whose sheds can be observed).
+fn start_counting_on(
+    config: &ShedConfig,
+    options: &ReachOptions,
+    reaches: Vec<(HostId, Arc<Scripted>)>,
+    changes: Arc<AtomicUsize>,
+) -> RoostHosts {
     let map: BTreeMap<HostId, Arc<Scripted>> = reaches.into_iter().collect();
     RoostHosts::start_with(
         &tokio::runtime::Handle::current(),
-        &ShedConfig::default(),
+        config,
         options.clone(),
         false,
         Arc::new(move || {
@@ -2019,7 +2200,7 @@ async fn a_create_answered_as_the_roster_lets_it_go_is_not_listed_again() {
         let hosts = Arc::clone(&hosts);
         tokio::spawn(async move {
             hosts
-                .craze_create(LOCALHOST, create_req("shed-race-1"))
+                .craze_create(LOCALHOST, create_req("shed-race-1"), false)
                 .await
         })
     };
@@ -2044,4 +2225,360 @@ async fn a_create_answered_as_the_roster_lets_it_go_is_not_listed_again() {
         "a row the roster let go is not folded back"
     );
     assert_eq!(answer["ended"], true, "{answer}");
+}
+
+// ---------------------------------------------------------------------------
+// offer, don't list (plan 026 §3.2, shed#399)
+// ---------------------------------------------------------------------------
+
+/// The shed every cell below observes running.
+const SHED: &str = "roost:srv/s1";
+
+/// `rc.list`'s `shed_craze`, unfiltered.
+fn shed_craze_of(hosts: &RoostHosts) -> Vec<Value> {
+    hosts.snapshot(HostFilter::ALL).2
+}
+
+/// Answer the source's pending find-only probe with `answer`, and return once
+/// it has been FOLDED: the loop folds an answer (and repaints) before it waits
+/// and asks the next probe, so the next probe being asked is the proof.
+async fn probe_answers(probe: &ScriptedProbe, answer: Probe) {
+    wait_for("a probe pending", || {
+        (probe.calls.load(Ordering::SeqCst) >= 1).then_some(())
+    })
+    .await;
+    let asked = probe.calls.load(Ordering::SeqCst);
+    probe.answer(answer);
+    wait_for("the answer folded (the next probe asked)", || {
+        (probe.calls.load(Ordering::SeqCst) > asked).then_some(())
+    })
+    .await;
+}
+
+/// The shed `s1` on `srv`, its craze attach-only and scripted, the layer
+/// counting every repaint in `changes` — observed running by the
+/// authoritative refresh, so its source is started and probing. It has no
+/// roost (nothing is mapped), so only craze can ever list it.
+async fn observed_shed(changes: &Arc<AtomicUsize>) -> (RoostHosts, Arc<Scripted>) {
+    let (shed, config) = srv_shed("s1");
+    let craze = Scripted::attach_only();
+    let hosts = start_counting_on(
+        &config,
+        &test_options(&[]),
+        vec![(shed, Arc::clone(&craze))],
+        Arc::clone(changes),
+    );
+    refresh(&hosts, &["s1"]).await;
+    (hosts, craze)
+}
+
+fn too_old(reason: &str) -> Probe {
+    Probe::Offline {
+        cause: SourceOffline::TooOld,
+        reason: reason.to_string(),
+    }
+}
+
+/// **A dormant shed is OFFERED, not listed** (plan 026 §3.2, shed#399): a
+/// running shed whose find-only probe says no hub is running is an `rc.list`
+/// `shed_craze` entry — the status row's identity fields and the same `craze`
+/// object a status row carries — and NOT a status row: no sessions, not in
+/// `machines.list`. The entry honours `rc.list`'s shed filter as the status
+/// rows do, and nothing dialled `bridge --hub`: the probe is find-only.
+#[tokio::test]
+async fn a_dormant_shed_is_offered_not_listed() {
+    let changes = Arc::new(AtomicUsize::new(0));
+    let (hosts, craze) = observed_shed(&changes).await;
+    probe_answers(craze.probe.as_ref().unwrap(), Probe::NoHub).await;
+
+    let (sessions, status, offered) = hosts.snapshot(HostFilter::ALL);
+    assert!(
+        status.iter().all(|s| s["origin"] != SHED),
+        "a dormant shed is not a status row: {status:?}"
+    );
+    assert!(sessions.is_empty(), "and lists no sessions: {sessions:?}");
+    assert!(
+        status_of(&hosts, SHED).is_none(),
+        "nor is it in machines.list"
+    );
+    assert_eq!(
+        offered,
+        vec![
+            json!({"name": SHED, "label": "s1", "origin": SHED, "kind": "shed",
+                    "craze": {"state": "dormant", "cause": null,
+                              "create": false, "create_options": false}})
+        ]
+    );
+
+    let filtered = |server: Option<&str>, shed: Option<&str>| {
+        hosts.snapshot(HostFilter { server, shed }).2.len()
+    };
+    assert_eq!(filtered(Some("srv"), Some("s1")), 1, "its own filter");
+    assert_eq!(filtered(Some("srv"), None), 1, "its server's filter");
+    assert_eq!(
+        filtered(Some("srv"), Some("s2")),
+        0,
+        "another shed's filter"
+    );
+    assert_eq!(filtered(Some("other"), None), 0, "another server's filter");
+    assert_eq!(
+        craze.hook.dials(),
+        0,
+        "no bridge --hub: the probe is find-only"
+    );
+}
+
+/// **The entry follows the probe, and repaints once per change** (plan 026
+/// §3.2): dormant → too old → dormant changes the entry's `state`/`cause`
+/// and tells the UI to re-read once per change, though the shed is unlisted;
+/// a repeated probe — the 30 s dormant one, or a too-old one in other words —
+/// changes neither and repaints nothing. No `bridge --hub` throughout.
+#[tokio::test]
+async fn a_dormant_sheds_entry_follows_its_probe_and_repaints_once_per_change() {
+    let changes = Arc::new(AtomicUsize::new(0));
+    let (hosts, craze) = observed_shed(&changes).await;
+    let probe = craze.probe.as_ref().unwrap();
+    let repaints = || changes.load(Ordering::SeqCst);
+    let entry = || {
+        shed_craze_of(&hosts)
+            .first()
+            .map(|e| (e["craze"]["state"].clone(), e["craze"]["cause"].clone()))
+    };
+    let base = repaints();
+
+    probe_answers(probe, Probe::NoHub).await;
+    assert_eq!(entry(), Some((json!("dormant"), json!(null))));
+    assert_eq!(repaints(), base + 1, "dormant: one repaint");
+    probe_answers(probe, Probe::NoHub).await;
+    assert_eq!(repaints(), base + 1, "a repeated dormant probe: none");
+
+    probe_answers(probe, too_old("unknown flag: --hub")).await;
+    assert_eq!(entry(), Some((json!("offline"), json!("too_old"))));
+    assert_eq!(repaints(), base + 2, "too old: one repaint");
+    probe_answers(probe, too_old("unknown flag: --hub")).await;
+    probe_answers(probe, too_old("unknown flag: --hub, said otherwise")).await;
+    assert_eq!(
+        repaints(),
+        base + 2,
+        "a repeated too-old probe: none, whatever its words"
+    );
+
+    probe_answers(probe, Probe::NoHub).await;
+    assert_eq!(entry(), Some((json!("dormant"), json!(null))));
+    assert_eq!(repaints(), base + 3, "dormant again: one repaint");
+    assert!(status_of(&hosts, SHED).is_none(), "never listed");
+    assert_eq!(craze.hook.dials(), 0, "no bridge --hub");
+}
+
+/// **Not installed — or unreachable — drops the entry, with one repaint**
+/// (plan 026 §3.2): a shed whose craze turns out not installed (exit 127)
+/// says nothing, as a shed with no craze always has, and so does one the
+/// probe cannot ask. No `bridge --hub`.
+#[tokio::test]
+async fn a_dormant_shed_that_turns_out_not_installed_leaves_shed_craze() {
+    let changes = Arc::new(AtomicUsize::new(0));
+    let (hosts, craze) = observed_shed(&changes).await;
+    let probe = craze.probe.as_ref().unwrap();
+    let repaints = || changes.load(Ordering::SeqCst);
+    let not_installed = || Probe::Offline {
+        cause: SourceOffline::NotInstalled,
+        reason: "exit 127".to_string(),
+    };
+    let base = repaints();
+
+    probe_answers(probe, Probe::NoHub).await;
+    assert_eq!(shed_craze_of(&hosts).len(), 1);
+    probe_answers(probe, not_installed()).await;
+    assert!(shed_craze_of(&hosts).is_empty(), "not installed: no entry");
+    assert_eq!(repaints(), base + 2, "one repaint for the drop");
+    probe_answers(probe, not_installed()).await;
+    assert_eq!(repaints(), base + 2, "a repeated probe: none");
+
+    probe_answers(probe, Probe::NoHub).await;
+    assert_eq!(shed_craze_of(&hosts).len(), 1, "dormant again");
+    probe_answers(
+        probe,
+        Probe::Offline {
+            cause: SourceOffline::Unreachable,
+            reason: "ssh: connect to host: no route to host".to_string(),
+        },
+    )
+    .await;
+    assert!(shed_craze_of(&hosts).is_empty(), "unreachable: no entry");
+    assert_eq!(repaints(), base + 4, "one repaint each way");
+    assert!(status_of(&hosts, SHED).is_none(), "never listed");
+    assert_eq!(craze.hook.dials(), 0, "no bridge --hub");
+}
+
+/// **The first `Ready` moves a dormant shed from `shed_craze` to a listed
+/// row** (plan 026 §3.2): once the probe finds a hub (the sheet started one)
+/// and the roster seeds, the shed is listed — a status row, with its craze
+/// rows — and no longer an entry, in one answer: never both. Until the probe
+/// found that hub nothing dialled `bridge --hub`; the one dial after it is
+/// the roster's.
+#[tokio::test]
+async fn the_first_ready_moves_a_dormant_shed_from_shed_craze_to_a_listed_row() {
+    let changes = Arc::new(AtomicUsize::new(0));
+    let (hosts, craze) = observed_shed(&changes).await;
+    let probe = craze.probe.as_ref().unwrap();
+    probe_answers(probe, Probe::NoHub).await;
+    assert_eq!(shed_craze_of(&hosts).len(), 1);
+    assert_eq!(craze.hook.dials(), 0, "dormant: no bridge --hub");
+
+    probe.answer(Probe::Hub);
+    let _hub = craze.roster(json!([row(HOST_A, "ses-a")])).await;
+    wait_for("listed by its first Ready", || status_of(&hosts, SHED)).await;
+    let (sessions, status, offered) = hosts.snapshot(HostFilter::ALL);
+    let row = status
+        .iter()
+        .find(|s| s["origin"] == SHED)
+        .expect("a status row");
+    assert_eq!(row["craze"]["state"], "live", "{row}");
+    assert!(
+        offered.is_empty(),
+        "no longer an entry — never both: {offered:?}"
+    );
+    assert!(
+        sessions
+            .iter()
+            .any(|r| r["origin"] == SHED && r["slug"] == HOST_A),
+        "its craze rows are listed: {sessions:?}"
+    );
+    assert_eq!(
+        craze.hook.dials(),
+        1,
+        "one bridge --hub: the roster's, after the probe found a hub"
+    );
+}
+
+/// **A stopped (or deleted) shed leaves `shed_craze`, and the UI is told**
+/// (plan 026 §3.2): the authoritative refresh that no longer lists it removes
+/// the host, its entry goes with it, and the removal repaints though the shed
+/// was never listed — so "Where" never offers a stopped shed. (A stop and a
+/// delete are one thing here: a shed the answering server no longer lists
+/// running.)
+#[tokio::test]
+async fn a_stopped_dormant_shed_leaves_shed_craze_and_repaints() {
+    let changes = Arc::new(AtomicUsize::new(0));
+    let (hosts, craze) = observed_shed(&changes).await;
+    probe_answers(craze.probe.as_ref().unwrap(), Probe::NoHub).await;
+    assert_eq!(shed_craze_of(&hosts).len(), 1);
+    let base = changes.load(Ordering::SeqCst);
+
+    refresh(&hosts, &[]).await;
+    assert!(
+        shed_craze_of(&hosts).is_empty(),
+        "the entry went with the host"
+    );
+    assert_eq!(
+        changes.load(Ordering::SeqCst),
+        base + 1,
+        "its removal repaints"
+    );
+    assert_eq!(craze.hook.dials(), 0, "no bridge --hub");
+}
+
+/// **A configured machine is never in `shed_craze`** (plan 026 §3.2): it is
+/// listed from the start, so a dormant or a too-old craze there is its status
+/// row's to say, as it always was.
+#[tokio::test]
+async fn a_configured_machine_is_never_in_shed_craze() {
+    let craze = Scripted::attach_only();
+    let hosts = start_scripted(
+        &config_with(&["mini3"]),
+        &test_options(&[]),
+        vec![(HostId::Machine("mini3".to_string()), Arc::clone(&craze))],
+    );
+    let probe = craze.probe.as_ref().unwrap();
+    probe_answers(probe, Probe::NoHub).await;
+    assert_eq!(
+        status_of(&hosts, "mini3").unwrap()["craze"]["state"],
+        "dormant"
+    );
+    assert_eq!(
+        status_of(&hosts, "mini3").unwrap()["roost_watched"],
+        true,
+        "a configured machine is watched from the start: never craze only"
+    );
+    assert!(
+        shed_craze_of(&hosts).is_empty(),
+        "dormant: its status row's"
+    );
+    probe_answers(probe, too_old("unknown flag: --hub")).await;
+    assert_eq!(
+        status_of(&hosts, "mini3").unwrap()["craze"]["cause"],
+        "too_old"
+    );
+    assert!(
+        shed_craze_of(&hosts).is_empty(),
+        "too old: its status row's"
+    );
+    assert_eq!(craze.hook.dials(), 0, "no bridge --hub");
+}
+
+/// **A shed whose roost answered is WATCHED before its first inventory**
+/// (plan 026 §3.2, the C2 review's P2): the probe's `session.identify`
+/// answers and the watcher is installed, but no first inventory has arrived
+/// when the shed's craze `Ready` lists it — every subscribe here acks a
+/// DIFFERENT daemon incarnation than its identify, so the watcher resyncs and
+/// publishes nothing (`FakeRoost::restart_between_dials`; the probe only
+/// identifies, so it still answers). The status row says
+/// `roost_watched: true` with `connected_once` still false, so the UI does not
+/// read it as "craze only" (no roost watcher); once the daemon settles the
+/// inventory lands and it is simply reachable. A shed with no roost at all,
+/// listed by its craze, is `roost_watched: false`.
+#[tokio::test]
+async fn a_shed_whose_roost_answered_is_watched_before_its_first_inventory() {
+    let fake = FakeRoost::start().await;
+    fake.restart_between_dials(10_000);
+    let (shed, config) = srv_shed("s1");
+    let craze = Scripted::attach_only();
+    let hosts = start_scripted(
+        &config,
+        &test_options(&[(SHED, fake.socket_path())]),
+        vec![(shed.clone(), Arc::clone(&craze))],
+    );
+    refresh(&hosts, &["s1"]).await;
+    craze.probe.as_ref().unwrap().answer(Probe::Hub);
+    let _hub = craze.roster(json!([row(HOST_A, "ses-a")])).await;
+    let status = wait_for("listed by its craze Ready, its roost watched", || {
+        status_of(&hosts, SHED).filter(|s| s["roost_watched"] == true)
+    })
+    .await;
+    assert_eq!(status["craze"]["state"], "live", "{status}");
+    assert_eq!(
+        status["connected_once"], false,
+        "no inventory yet: {status}"
+    );
+    assert_eq!(status["reachable"], false, "{status}");
+
+    // The daemon settles: the first inventory lands, and it is reachable.
+    fake.restart_between_dials(0);
+    let status = wait_for("the first inventory", || {
+        status_of(&hosts, SHED).filter(|s| s["connected_once"] == true)
+    })
+    .await;
+    assert_eq!(status["reachable"], true, "{status}");
+    assert_eq!(status["roost_watched"], true, "{status}");
+
+    // A shed with no roost at all, listed by its craze alone: unwatched.
+    let (other, config) = srv_shed("s2");
+    let alone = Scripted::attach_only();
+    let hosts = start_scripted(
+        &config,
+        &test_options(&[]),
+        vec![(other, Arc::clone(&alone))],
+    );
+    refresh(&hosts, &["s2"]).await;
+    alone.probe.as_ref().unwrap().answer(Probe::Hub);
+    let _hub = alone.roster(json!([row(HOST_B, "ses-b")])).await;
+    let status = wait_for("listed by craze alone", || {
+        status_of(&hosts, "roost:srv/s2")
+    })
+    .await;
+    assert_eq!(
+        status["roost_watched"], false,
+        "no roost answered: {status}"
+    );
+    assert_eq!(status["connected_once"], false, "{status}");
 }

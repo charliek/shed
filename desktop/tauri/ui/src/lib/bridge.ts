@@ -3,6 +3,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import type { AgentsEmptyState, AgentsLoad } from "@/lib/agentsEmpty";
 import type { CrazeCreateOptions } from "@/lib/crazeCreate";
 import { killTarget } from "@/lib/crazeRows";
+import { initialReport } from "@/lib/report";
 
 export type Pane = "sheds" | "machines" | "approvals" | "agents" | "activity" | "egress" | "system";
 
@@ -114,8 +115,10 @@ async function invoke<T>(cmd: string, args?: Record<string, unknown>): Promise<T
 export type Badges = { sheds: number; agents: number; hosts: number; pending: number };
 
 /** One machine as the sidebar's status foot renders it: the WORD a person reads,
- *  never the raw transport error (which stays on hover). */
-export type SidebarMachineRow = { name: string; origin: string; status: string; note: string };
+ *  never the raw transport error (which stays on hover), and its dot's `tone`
+ *  (`ok` | `pending` | `off` | `neutral` — a host listed by craze alone, plan
+ *  026 §3.2, is neutral: neither up nor still connecting). */
+export type SidebarMachineRow = { name: string; origin: string; status: string; note: string; tone: string };
 
 /** What the shell knows about the sidebar's two sections before the host
  *  failures are folded in (which `report` does, since it holds them). */
@@ -144,22 +147,28 @@ export function hostFailureFor(hostErrors: HostFailure[], host: string): HostFai
   return hostErrors.find((e) => e.server === host);
 }
 
+/** Everything one full report is built from: what the shell rendered, before
+ *  `report` derives the send-time parts (the sampled style, each server's failure
+ *  `detail`, the pane-keyed empty state). `useUiBridge` keeps the latest one it
+ *  built, so its initial report can re-send it (`initialReport`, shed#400). */
+type ReportPayload = {
+  pane: Pane;
+  sheds: Shed[];
+  refreshToken: number;
+  modal: Modal;
+  badges: Badges;
+  sidebar: SidebarInput;
+  mode?: string;
+  hostErrors: HostFailure[];
+};
+
 /** Report the rendered snapshot Rust relays to the harness (`ui.current_pane` /
  *  `ui.computed_style` / `dashboard.dump` / `ui.badges`). ALWAYS a FULL blob — every
  *  key present — so no partial report can (a) create the `main` slot before the shell
  *  is ready and false-signal readiness to `sheds.refresh`, or (b) omit `sheds` and
  *  zero the mac tray running-count (lib.rs recomputes it from each report). A new
  *  reader is one more key. The refresh token is echoed so `sheds.refresh` blocks on it. */
-function report(
-  pane: Pane,
-  sheds: Shed[],
-  refreshToken: number,
-  modal: Modal,
-  badges: Badges,
-  sidebar: SidebarInput,
-  mode?: string,
-  hostErrors: HostFailure[] = [],
-) {
+function report({ pane, sheds, refreshToken, modal, badges, sidebar, mode, hostErrors }: ReportPayload) {
   void invoke("ui_report", {
     snapshot: {
       pane,
@@ -224,6 +233,10 @@ export function useUiBridge(
   const paneRef = useRef(pane);
   paneRef.current = pane;
   const ready = useRef(false);
+  // The latest complete report the report effect built — what the listener
+  // effect's initial report re-sends (with the current pane) instead of a seed
+  // that would undo it (shed#400). Null until the first one is built.
+  const latestReport = useRef<ReportPayload | null>(null);
   const fetchGen = useRef(0);
   // The highest refresh token not yet echoed. A token-bearing fetch records it
   // BEFORE awaiting, so whichever fetch ends up committing rows echoes it —
@@ -280,14 +293,14 @@ export function useUiBridge(
       }
       ready.current = true; // both listeners live → readiness signal + initial report
       await fetchSheds(0);
-      // Fresh sheds + real badges arrive via the report effect on the next render;
-      // this initial report just publishes the pane, so `current_pane != null` =
-      // "listeners live". No modal is open at mount; badges seed at zero.
-      report(
-        paneRef.current, [], 0, null,
-        { sheds: 0, agents: 0, hosts: 0, pending: 0 },
-        { servers: [], machines: [] },
-      );
+      // Fresh sheds arrive via the report effect on the next render; this initial
+      // report publishes the pane, so `current_pane != null` = "listeners live".
+      // It re-sends the latest report the effect built — which, while that first
+      // list was in flight, may already carry the real badges and sidebar (the
+      // host list answers on its own) — and seeds empty ONLY when none was built.
+      // A seed sent after a real report replaced its every key: the Hosts badge
+      // and the sidebar read empty until the next render (shed#400).
+      report(initialReport(latestReport.current, paneRef.current));
     })();
     return () => {
       cancelled = true;
@@ -373,7 +386,9 @@ export function useUiBridge(
     // `hosts` = the configured-host count (with reachability) the shell supplies —
     // covers zero-shed hosts, unlike a sheds-derived distinct-host count.
     const badges: Badges = { sheds: sheds.length, agents: agentCount, hosts: hostCount, pending };
-    report(pane, sheds, refreshToken, modal, badges, sidebar, mode, hostErrors);
+    const payload: ReportPayload = { pane, sheds, refreshToken, modal, badges, sidebar, mode, hostErrors };
+    latestReport.current = payload;
+    report(payload);
     // `sidebar` is rebuilt by the caller each render, so it is compared by VALUE
     // (a reference dep would re-report on every render — the flap this whole
     // shape exists to avoid).
@@ -410,6 +425,15 @@ export type HostDiskUsage = {
  *  serves the harness). An unreachable host comes back as an error row. */
 export async function fetchSystemDf(): Promise<HostDiskUsage[]> {
   return (await invoke<HostDiskUsage[]>("system_df")) ?? [];
+}
+
+/** The same `system_df` read for the shell's host list (the Hosts badge and the
+ *  sidebar's servers), except that a failed invoke REJECTS rather than reading
+ *  as "no hosts": the list's reload keeps its last rows on a failure
+ *  (`newestReload`, shed#400), which it can only do if it can tell one. */
+export async function fetchHostRows(): Promise<HostDiskUsage[]> {
+  const core = await import("@tauri-apps/api/core");
+  return (await core.invoke<HostDiskUsage[] | null>("system_df")) ?? [];
 }
 
 /* ---- egress (mac parity: profiles per host + the ns=="egress" activity) ---- */
@@ -1071,10 +1095,18 @@ export type CrazeStatus = {
 export type MachineStatus = {
   name: string;
   origin: string;
+  /** `machine` | `shed` — which kind of host this row is (a listed shed has a
+   *  status row too, once something has answered on it). */
+  kind?: string | null;
   reachable: boolean;
   /** Whether a snapshot has EVER arrived — distinguishes "still connecting"
    *  from "connected, and genuinely has no sessions". */
   connected_once: boolean;
+  /** Whether a roost watcher runs for this host (plan 026 §3.2): a machine's
+   *  from the start, a shed's once its roost answered — before its first
+   *  inventory (`connected_once`) arrives. A listed host with none, and a
+   *  craze source, is "craze only" (`crazeOnly`). */
+  roost_watched?: boolean | null;
   sessions: number;
   /** Why it is unreachable, verbatim from the watcher: "no route to host" and
    *  "nothing is listening on 1029" are different problems. */
@@ -1083,13 +1115,28 @@ export type MachineStatus = {
   craze?: CrazeStatus | null;
 };
 
+/** An UNLISTED host craze is offered on (plan 026 §3.2, "offer, don't
+ *  list"): a running shed whose craze probe proved craze there with no hub
+ *  roster to list — `dormant` (New craze session on its Sheds-pane row and in
+ *  "Where"; opening the sheet starts its hub) or too old (its note). It has no
+ *  status row and no sessions; once a create or its first craze `Ready` lists
+ *  it, it is a `MachineStatus` instead — never both. */
+export type ShedCrazeEntry = {
+  name: string;
+  label: string;
+  origin: string;
+  kind: string;
+  craze: CrazeStatus;
+};
+
 /** The `rc.list` result: live sessions (shed AND machine), the per-shed
- *  capabilities captured during the probe (keyed by `host/shed`), and each
- *  configured machine's health. */
+ *  capabilities captured during the probe (keyed by `host/shed`), each
+ *  configured machine's health, and the unlisted hosts craze is offered on. */
 export type RcListResult = {
   sessions: RcSession[];
   capabilities: Record<string, RcCapabilities>;
   machines: MachineStatus[];
+  shed_craze: ShedCrazeEntry[];
 };
 
 /** A session's stable row identity — the row's `origin` plus its slug. Every row
@@ -1124,10 +1171,11 @@ export async function fetchRcList(host?: string, shed?: string): Promise<RcListL
       sessions: r?.sessions ?? [],
       capabilities: r?.capabilities ?? {},
       machines: r?.machines ?? [],
+      shed_craze: r?.shed_craze ?? [],
       error: null,
     };
   } catch (e) {
-    return { sessions: [], capabilities: {}, machines: [], error: String(e) };
+    return { sessions: [], capabilities: {}, machines: [], shed_craze: [], error: String(e) };
   }
 }
 
@@ -1141,12 +1189,11 @@ export type RcLaunchFields = {
 };
 
 /** Launch a session IN A SHED — the `rc.launch` alias, which is
- *  [machineLaunch] on the shed's roost host since S6. THROWS on error (the pane
- *  surfaces it) — unlike the swallowing `invoke`, because a launch failure must
- *  be shown. */
+ *  [machineLaunch] on the shed's roost host since S6. THROWS a coded
+ *  [LaneFailure] on error (the dialog shows its message) — unlike the
+ *  swallowing `invoke`, because a launch failure must be shown. */
 export async function rcLaunch(fields: RcLaunchFields): Promise<RcSession> {
-  const core = await import("@tauri-apps/api/core");
-  return core.invoke<RcSession>("rc_launch", fields);
+  return launchInvoke("rc_launch", fields);
 }
 
 export type MachineLaunchFields = {
@@ -1154,7 +1201,6 @@ export type MachineLaunchFields = {
   kind: RcKind;
   displayName?: string;
   workdir?: string;
-  permissionMode?: string;
 };
 
 /** Launch a session ON a machine. THROWS on error, like [rcLaunch].
@@ -1164,13 +1210,28 @@ export type MachineLaunchFields = {
  *  `(host, shed)` through a server. Everything downstream is the SAME `tab.open`
  *  since S6, so the two creates differ in where they land and nothing else.
  *
- *  **Neither takes a kickoff prompt.** roost's `tab.open` is an argv and a
- *  working directory; there is no typed-input channel behind either door today,
- *  which is why the launch dialog offers no prompt field
- *  (`charliek/shed#366`). */
+ *  **A launch takes a name, never a kickoff** (plan 026 §3.5). roost's
+ *  `tab.open` is an argv and a working directory. `displayName` becomes the
+ *  tab's title once it is open (`tab.set_title`; the answered row's `title` is
+ *  `"applied"`, or `"failed: <cause>"` with the tab open anyway). A first prompt
+ *  or a permission mode is REFUSED, `bad_request`, before any tab opens: neither
+ *  door can deliver one, so the dialog asks for neither, and a craze session's
+ *  create is where a first prompt goes. The failure's `code` is `bad_request`
+ *  for such a request and `action_failed` for a launch that was tried. */
 export async function machineLaunch(fields: MachineLaunchFields): Promise<RcSession> {
+  return launchInvoke("machine_launch", fields);
+}
+
+/** Invoke a launch command, THROWING its `"<code>: <message>"` error as a coded
+ *  [LaneFailure] — the `rc_launch`/`machine_launch` agreement, the lane
+ *  commands' shape. */
+async function launchInvoke(cmd: string, args: Record<string, unknown>): Promise<RcSession> {
   const core = await import("@tauri-apps/api/core");
-  return core.invoke<RcSession>("machine_launch", fields);
+  try {
+    return await core.invoke<RcSession>(cmd, args);
+  } catch (e) {
+    throw laneFailure(e);
+  }
 }
 
 export type RoostRunFields = {
@@ -1265,7 +1326,7 @@ export async function killSession(s: RcSession): Promise<void> {
  *  person reads, and it earns a test that needs no React, no DOM and no Tauri
  *  runtime — the `newest.ts` / `roostBoard.ts` shape. */
 export type { AgentsLoad, AgentsEmptyState } from "@/lib/agentsEmpty";
-export { agentsEmptyState } from "@/lib/agentsEmpty";
+export { agentsEmptyState, crazeOnly } from "@/lib/agentsEmpty";
 
 /** The launch dialog as `launch.dump` reads it: its own rendered DOM text.
  *
@@ -1273,10 +1334,10 @@ export { agentsEmptyState } from "@/lib/agentsEmpty";
  *  of what the JSX draws, and the two would drift — the failure the consent
  *  card's `rendered` was added to prevent. This cannot claim a field the dialog
  *  does not show, which is exactly the property under test: since S6 there is no
- *  initial-prompt box, because nothing would deliver what was typed into it
- *  (`charliek/shed#366`). `values` and `create_enabled` (plan 025 C3, the "Run a
- *  command" mode) keep that rule: both are read off the same mounted DOM, never
- *  restated from React state. */
+ *  initial-prompt box, because nothing would deliver what was typed into it (a
+ *  launch that carries one is refused, plan 026 §3.5). `values` and
+ *  `create_enabled` (plan 025 C3, the "Run a command" mode) keep that rule: both
+ *  are read off the same mounted DOM, never restated from React state. */
 export type LaunchDialogDump = {
   rendered: string;
   /** Each labelled control's current value, keyed by its label ("Where",
@@ -1350,6 +1411,9 @@ export function useRcSessions(): {
   sessions: RcSession[];
   capabilities: Record<string, RcCapabilities>;
   machines: MachineStatus[];
+  /** `rc.list`'s `shed_craze` — read craze status through `crazeStatusFor`,
+   *  which falls back to it for a host with no status row. */
+  shedCraze: ShedCrazeEntry[];
   load: AgentsLoad;
   error: string | null;
   refresh: () => void;
@@ -1358,6 +1422,7 @@ export function useRcSessions(): {
     sessions: [],
     capabilities: {},
     machines: [],
+    shed_craze: [],
     load: inTauri() ? "loading" : "ready",
     error: null,
   });
@@ -1395,6 +1460,7 @@ export function useRcSessions(): {
     sessions: state.sessions,
     capabilities: state.capabilities,
     machines: state.machines,
+    shedCraze: state.shed_craze,
     load: state.load,
     error: state.error,
     refresh,
@@ -1908,13 +1974,16 @@ export async function crazeCreateOptions(machine: string): Promise<CrazeCreateOp
 }
 
 /** The fields of one create — the sheet's typed form and the request id it
- *  holds (`crazeCreate.ts`'s lifecycle). */
+ *  holds (`crazeCreate.ts`'s lifecycle). `held`: this submission REPLAYS that
+ *  id, kept from an unknown outcome (`replaysHeldRequest`, plan 026 §3.1) —
+ *  then only craze's own answer about the request ends it. */
 export type CrazeCreateFields = {
   machine: string;
   cwd: string;
   provider?: string | null;
   prompt?: string | null;
   requestId: string;
+  held: boolean;
 };
 
 /** What `craze_create` answers: the new session's row (already in the
@@ -1933,7 +2002,8 @@ export type CrazeCreated = {
 };
 
 /** Create a craze session. THROWS a coded failure — `outcome_unknown` when
- *  craze's answer was lost twice (keep the id; Try again resumes it). */
+ *  craze's answer was lost twice, or a held replay got no answer about its
+ *  request (keep the id; Try again resumes it). */
 export async function crazeCreate(f: CrazeCreateFields): Promise<CrazeCreated> {
   return crazeInvoke<CrazeCreated>("craze_create", {
     machine: f.machine,
@@ -1941,6 +2011,7 @@ export async function crazeCreate(f: CrazeCreateFields): Promise<CrazeCreated> {
     provider: f.provider ?? undefined,
     prompt: f.prompt ?? undefined,
     requestId: f.requestId,
+    held: f.held,
   });
 }
 

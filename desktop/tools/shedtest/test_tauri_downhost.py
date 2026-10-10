@@ -24,6 +24,7 @@ import os
 import shutil
 import subprocess
 import tempfile
+import time
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -32,6 +33,7 @@ import pytest
 import ui
 from client import TauriClient
 from fake_host_agent import FakeHostAgent
+from mockserver import MockShedServer
 
 pytestmark = pytest.mark.skipif(
     os.environ.get("SHED_TEST_TARGET", "mac") != "tauri",
@@ -146,12 +148,111 @@ def test_system_df_error_row_for_down_host(downhost):
     assert by_host["mock"].get("usage") is not None, f"mock host has no usage: {by_host['mock']}"
 
 
+def _shell_sample(client) -> dict:
+    """One read of the three surfaces the shell's report carries and a stray
+    seeded report used to blank (shed#400): the Hosts badge, the dashboard's
+    rows, and the sidebar's server rows."""
+    badges = client.badges() or {}
+    return {
+        "hosts": badges.get("hosts"),
+        "rows": len(client.dashboard_dump().get("rows") or []),
+        "servers": len((client.sidebar_dump() or {}).get("servers") or []),
+    }
+
+
+def _shell_samples(client, n: int = 20, every: float = 0.1) -> list[dict]:
+    """`n` samples spaced `every` seconds apart (~2 s at the defaults)."""
+    out = []
+    for _ in range(n):
+        out.append(_shell_sample(client))
+        time.sleep(every)
+    return out
+
+
+def _assert_never_zeroed(samples: list[dict]) -> None:
+    """Every sample shows both configured hosts — in the badge AND as sidebar
+    rows — and the dashboard's rows never drop to empty."""
+    assert samples, "no samples taken"
+    bad = [s for s in samples if s["hosts"] != 2 or s["servers"] != 2 or s["rows"] == 0]
+    assert not bad, f"the shell's report went back to empty in {len(bad)}/{len(samples)} samples: {bad}"
+
+
 def test_badges_count_both_configured_hosts(downhost):
     # `hosts` counts CONFIGURED hosts (derived from system.df, which keeps the down
     # host as a row) → 2 in this instance, even though one is unreachable.
     downhost.wait_until(lambda: (downhost.badges() or {}).get("hosts") == 2,
                         timeout=15, what="badges report 2 configured hosts")
     assert downhost.badges()["hosts"] == 2
+    # shed#400: the count must STAY 2. Three refreshes in a row each re-read the
+    # host list and the shed list, and none of their answers may take the badge,
+    # the sidebar or the rows back to empty — sampled after each refresh and then
+    # 20 times over ~2 s.
+    # A stability check, not a reordering test: newest-wins is pinned by the node cells.
+    downhost.wait_until(lambda: downhost.dashboard_dump()["rows"],
+                        timeout=15, what="the reachable host's rows to land")
+    samples = []
+    for _ in range(3):
+        downhost.sheds_refresh()
+        samples.append(_shell_sample(downhost))
+    samples += _shell_samples(downhost)
+    _assert_never_zeroed(samples)
+
+
+@pytest.fixture
+def held_mock():
+    """A PRIVATE mock server for the late-first-list cell. Its sheds-list hold
+    must catch THIS instance's first list: on the session mock, the session app's
+    own poll could be the request that parks on it."""
+    server = MockShedServer()
+    server.start()
+    try:
+        yield server
+    finally:
+        server.stop()
+
+
+def test_a_late_first_shed_list_never_zeroes_the_badges(held_mock):
+    # shed#400, deterministically: the shell's first shed list is held until the
+    # UI has ALREADY published a real `hosts: 2` report (the host list answers on
+    # its own). The bridge's initial report goes out when that first list lands;
+    # it used to be a hard-coded seed — zero badges, no rows, no sidebar — and,
+    # since `ui_report` merges by key, it replaced the real report until the next
+    # render's report repaired it. Now it re-sends the latest real report.
+    held_mock.hold_sheds_list()
+    with _downhost_app(held_mock.base_url) as client:
+        client.wait_until(lambda: (client.badges() or {}).get("hosts") == 2,
+                          timeout=15, what="badges report 2 configured hosts")
+        # The interleaving really is the one under test: the first list is still
+        # parked on the hold, and no row has reached the shell.
+        assert held_mock.sheds_waiting() >= 1, (
+            "the app's first shed list is not held — the cell is not testing the "
+            f"late-first-list interleaving (expired holds: {held_mock.sheds_hold_expired()})")
+        assert client.dashboard_dump()["rows"] == [], "the shed list landed before the release"
+
+        # From here on, EVERY report the shell sends is recorded app-side
+        # (`ui.report_history`): a sampled read can fall between the seed and
+        # the render that repairs it, the history cannot.
+        client.report_history(clear=True)
+        held_mock.release_sheds_list()
+        client.wait_until(lambda: client.dashboard_dump()["rows"],
+                          timeout=15, what="the held shed list to land")
+        assert held_mock.sheds_hold_expired() == 0, "the list answered at the hold's bound, not the release"
+
+        history = client.report_history()
+        assert history["dropped"] == 0, f"the report ring overflowed: {history}"
+        reports = history["reports"]
+        landed = next((i for i, r in enumerate(reports) if r["rows"] > 0), None)
+        assert landed is not None, f"no recorded report carried the landed rows: {reports}"
+        bad = [
+            (i, r) for i, r in enumerate(reports)
+            if r["hosts"] != 2 or r["servers"] != 2 or (i >= landed and r["rows"] == 0)
+        ]
+        assert not bad, (
+            f"{len(bad)} of the {len(reports)} reports sent across the landing took the "
+            f"shell back to empty (index, report): {bad[:5]}; all: {reports}")
+
+        # Secondary: the shell stays there.
+        _assert_never_zeroed(_shell_samples(client))
 
 
 def test_a_failed_host_is_still_carried_and_surfaced_in_the_sidebar(downhost):

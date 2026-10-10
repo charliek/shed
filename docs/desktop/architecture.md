@@ -1,26 +1,33 @@
 # Architecture
 
-shed-desktop is a native desktop app that ties the **shed** toolchain into one
-resident control surface: it lists and controls sheds (VMs) across hosts, launches
-remote-control agents, and brokers the credential-approval gate. It holds no credentials —
-it coordinates the processes that do. The shipped client is Tauri on both macOS (as of
-0.9.0) and Linux; a Swift/SwiftUI macOS menu-bar app also lives in the tree (sources
-retained pending demolition — see below for its architecture).
+shed-desktop is a desktop app that ties the **shed** toolchain into one resident control
+surface: it lists and controls sheds (VMs) across hosts, shows the agent sessions running in
+them as [roost](../extensions/roost-session-hosts.md) rows with live
+[craze and opencode lanes](agent-lanes.md), and brokers the credential-approval gate. It holds
+no credentials of its own to manage: the Swift app, and the Tauri app when it dials an external `shed-host-agent`, only coordinate the daemon that holds them, while the Tauri app's default **embedded broker** runs that credential brokering (SSH, AWS, Docker) in-process — see [The embedded credential broker](#the-embedded-credential-broker-tauri). There is no remote-control (RC)
+launcher: the RC stack was retired, and agents start through roost or craze.
 
-It is built as a SwiftUI app with a deliberate **core/UI split**: all I/O and logic live in
-a UI-free core (`ShedKit`) so they're unit-testable without a running app. The shed-server
-protocol layer (HTTP/SSE, decoding, control-token auth, TLS pinning) is extracted into a
-shared **Rust core** (`shed-core`) that backs both this macOS app and the **Tauri cross-platform
-client** (`tauri/`) without re-implementation — see [Rust core](rust-core.md). The Tauri client
-is built on the same core — plus **`shed-app`**, the UI-free app-logic layer the clients share —
-and is the **shipped Linux client** (WebKitGTK). It ships as the `shed-desktop` binary/package,
-built from `tauri/src-tauri` (bin `shed-desktop-tauri` → `/usr/bin/shed-desktop`) in an nfpm
-`.deb` — with a headless `shedctl` and the polkit action alongside — via `charliek/apt-charliek`
-(`apt install shed-desktop`). The Rust core is the macOS **default**; `SHED_DESKTOP_RUST_CORE=0`
-forces the legacy Swift path (a rollback escape hatch). A first-class design goal is that the app is
-**drivable and observable by an automated agent** over an IPC socket — see [IPC](ipc.md).
+The shipped client is **Tauri on both macOS (as of 0.9.0) and Linux**, built from
+`tauri/src-tauri` (bin `shed-desktop-tauri`). All protocol and app logic lives in the shared
+**Rust core**: `shed-core` (the shed-server protocol layer — HTTP/SSE, decoding, control-token
+auth, TLS pinning) and **`shed-app`**, the UI-free app-logic layer, with `shed-craze` and
+`shed-opencode` as the agent-lane adapters — see [Rust core](rust-core.md). On Linux it ships
+as the `shed-desktop` nfpm `.deb` (`/usr/bin/shed-desktop`, with a headless `shedctl` and the
+polkit action alongside) via `charliek/apt-charliek` (`apt install shed-desktop`); on macOS as
+the notarized DMG with Sparkle updates.
+
+A Swift/SwiftUI macOS menu-bar app also remains in the tree. Its sources are retained pending
+demolition, its release job was retired in 0.9.0, and it stays buildable; the sections below
+that describe `ShedKit` and the SPM targets are about that app. `SHED_DESKTOP_RUST_CORE=0`
+forces its legacy path (a rollback escape hatch). A first-class design goal for both is that
+the app is **drivable and observable by an automated agent** over an IPC socket — see
+[IPC](ipc.md).
 
 ## Why a native app
+
+!!! note "Historical rationale"
+    This section records why the Swift app was written natively. The shipped client is now
+    Tauri on both platforms.
 
 The app's whole job is to call HTTP endpoints, consume SSE streams, shell out and read
 pipes, and integrate deeply with macOS (menu bar, Touch ID, notifications, login item,
@@ -67,12 +74,14 @@ flowchart LR
     SD -.->|"Sparkle: check for updates"| PAGES
 ```
 
-The app is **never in the credential path**. A shed inside a VM asks its shed-server for a
+With the external host-agent (the Swift app, or Tauri in `external` mode) the app is **never in the credential path**; with Tauri's embedded broker (below) it is, since the broker runs in the app's process. A shed inside a VM asks its shed-server for a
 credential (SSH signature, AWS creds, docker login); that request flows out over the
 server's plugin bus to the host-agent, which holds the real keys. shed-desktop only sees
 request *metadata* and returns an approve/deny decision (see [the approval flow](#the-host-agent-unix-domain-socket)).
 
 ## Targets (SPM modules)
+
+These are the Swift app's modules (retained, not the shipped client).
 
 | Target | Role |
 |--------|------|
@@ -246,6 +255,45 @@ makes show/hide deterministic for the harness, where the built-in backing window
 private/unstable. The app is an accessory (`LSUIElement`): menu-bar only, no Dock icon.
 (On Linux the Tauri tray is a native menu — Tauri emits no Linux tray-click events, so there
 is no popover; this is expected.)
+
+## Shutting down (Tauri)
+
+The Tauri app ends every child process it owns from every way it can exit: the tray's or
+the popover's Quit, SIGTERM, SIGINT and SIGHUP, and on macOS a Dock Quit, a logout or an
+AppleScript `quit` (which reach the app only as Tauri's `RunEvent::Exit`). All of them run
+one bounded, orderly shutdown, once — a later trigger waits for the run already going. Two
+things deliberately cut it short: a **second** SIGTERM/SIGINT/SIGHUP, or the 20-second escape
+timeout, exits the process at once, so a wedged shutdown can never hang a quit; children the
+run had not reached by then are left to their own protocols (an ssh master's
+`ControlPersist`, a bridge's stdin closing).
+
+- **Nothing new starts once it begins.** The app holds one spawn gate, closed first. Every
+  place the app starts a child — a craze bridge (local or over ssh), an ssh exec, an opencode
+  `ssh -N -L` forward, a roost tunnel — takes a section of that gate across the spawn and the
+  child's registration, so a spawn either finished before the close (and the shutdown ends
+  it) or is refused with `shutting_down`; a spawn already under way when the close began
+  that lands after it kills its own child at registration. The UI's own calls (a refresh,
+  `lane.open`, `craze.create`, a bootstrap) are refused the same way.
+- **Then it ends what it owns, in a fixed order, each step bounded:** the app's own roost
+  watchers, probes and in-flight one-shots (a launch, a bootstrap, a tab close) are joined,
+  and cancelled past a short bound (they are the only clients of a roost tunnel, so no
+  connection can arrive while the tunnels close); the agent lanes and their forwards are
+  closed (on a thread of their own, the forward children killed and reaped); the craze
+  sources stop and every registered bridge child is killed and its exit seen, even one a
+  transcript request is still holding; each roost tunnel runs its own teardown; and each ssh
+  connection master is asked to exit — and, if it does not, is ended by its pid after
+  checking that pid is the master on this app's control socket.
+- **What the app does not own keeps running.** A craze hub and its sessions, and a remote
+  `roost-session`, are left alone: a session started from the app is still there, and still
+  attachable, after the app quits.
+
+The worst case is about 16 seconds and the usual case is well under 3. Each step's time is
+logged to stderr (`shed-desktop-tauri: shutdown: phase N …`), with anything it gave up on at
+its bound: work that could not finish in time is abandoned with the spawn gate still closed, so
+nothing it starts later survives its registration. A second signal, or a
+shutdown still running 20 seconds after the first signal, exits at once (status 128 + the
+signal number). A crash or a `kill -9` runs none of this; an ssh master left behind then
+exits on its own once its 60-second `ControlPersist` lapses.
 
 ## State + storage
 

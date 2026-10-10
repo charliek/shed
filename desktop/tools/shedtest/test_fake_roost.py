@@ -342,8 +342,49 @@ def test_every_mutation_commits_exactly_one_batch_from_the_vendored_envelopes(ro
         # On a SECOND connection: `w` is a stream now, and roost reads a
         # subscribed connection only to notice a peer that went away — anything
         # written on it is discarded, never dispatched.
+        roost_call(roost.socket_path, "tab.set_title", {"tab_id": "9", "title": "build"})
+        assert names() == ["tab.title_changed"]
+
         roost_call(roost.socket_path, "tab.close", {"tab_id": "9"})
         assert names() == ["tab.closed"]
+
+
+def test_a_title_is_sticky_and_every_decoded_call_is_recorded(roost):
+    """`tab.set_title` names a tab stickily, and is recorded either way.
+
+    The title and `user_titled` both land on the tab; a missing tab is
+    `not-found`; a seeded refusal is served once and leaves the tab as it was;
+    an unknown key is a decode refusal nobody records.
+
+    Mirrors `testing.rs::a_title_is_sticky_and_every_decoded_call_is_recorded`.
+    """
+    roost_call(roost.socket_path, "tab.set_title", {"tab_id": "5", "title": "my build"})
+    tab = next(t for p in roost_call(roost.socket_path, "tab.list")["projects"]
+               for t in p["tabs"] if t["id"] == "5")
+    assert tab["title"] == "my build"
+    assert tab["user_titled"] is True, "a set title is sticky"
+
+    with pytest.raises(RoostWireError) as missing:
+        roost_call(roost.socket_path, "tab.set_title", {"tab_id": "4242", "title": "x"})
+    assert missing.value.code == "not-found"
+
+    roost.refuse_next_set_title("internal", "the title store is wedged")
+    with pytest.raises(RoostWireError) as refused:
+        roost_call(roost.socket_path, "tab.set_title", {"tab_id": "5", "title": "second"})
+    assert refused.value.code == "internal"
+    roost_call(roost.socket_path, "tab.set_title", {"tab_id": "5", "title": "third"})
+
+    with pytest.raises(RoostWireError) as extra:
+        roost_call(roost.socket_path, "tab.set_title",
+                   {"tab_id": "5", "title": "x", "lease": "t"})
+    assert extra.value.code == "unknown-field"
+
+    assert roost.title_calls == [
+        {"tab_id": "5", "title": "my build"},
+        {"tab_id": "4242", "title": "x"},
+        {"tab_id": "5", "title": "second"},
+        {"tab_id": "5", "title": "third"},
+    ]
 
 
 def test_a_skipped_revision_leaves_a_hole_in_the_sequence(roost):

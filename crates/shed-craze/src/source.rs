@@ -60,7 +60,22 @@
 //! connection; a second unknown is [`errors::outcome_unknown`] and the caller
 //! keeps the id ([`errors::is_outcome_unknown`]). Any DEFINITE answer — a
 //! result, or any refusal, `unavailable` included — ends that id's life: the
-//! caller's next submission mints a new one ([`new_request_id`]).
+//! caller's next submission mints a new one ([`new_request_id`]). A success
+//! whose result shed cannot decode is NOT definite: craze answered ok, so a
+//! session may exist — it is unknown at any attempt (plan 026 AM1).
+//!
+//! **A replay is a retry from its first attempt** (plan 026 §3.1): a caller
+//! sending an id it HELD from an unknown outcome uses
+//! [`AgentSource::create_held`], whose every attempt has the retry's rules — a
+//! dial that never reached craze, or a hub that cannot create, is unknown
+//! again. On any retry (the source's own included), a craze refusal that does
+//! not state that request's outcome — `unavailable` with `host_unreachable`,
+//! `busy` or `closing`, and the rest of [`errors::REPLAY_UNKNOWN`]'s audit — is
+//! unknown too ([`errors::create_error`]). Only craze's answer about the
+//! request ends a held id — a decoded result, `bad_request`
+//! (`request_conflict` included), a replayed `spawn_failed`/`start_failed`.
+//! craze keeps the guarantee while the first session LIVES: a replay after it
+//! ended finds nothing and starts another.
 //!
 //! **A created session is openable at once** (plan 025 §3.6.4): a create's
 //! answer carries the new session's roster row, and the source keeps it beside
@@ -137,7 +152,7 @@ use shed_core::rc::RcActivity;
 
 use crate::conn::{lock, CallError, Conn, HubHello, Notifications, HELLO_DEADLINE};
 use crate::dial::{connect_hub, CrazeDial, DialError, DIAL_DEADLINE};
-use crate::errors::{create_error, lane_error, outcome_unknown};
+use crate::errors::{create_error, lane_error, outcome_unknown, unknown_why};
 use crate::lane::{CrazeLane, LaneTimings};
 use crate::wire::{
     self, method, notify, ClientInfo, ConnCapabilities, CreateOptionsResult, CreateParams,
@@ -572,11 +587,26 @@ impl CrazeSource {
             .request(method::SESSION_CREATE, params, self.timings.create)
             .await
         {
-            Ok(result) => Attempt::Done(created(result).map(|(created, session_id)| {
-                self.remember_created(&created.session, &session_id);
-                created
-            })),
-            Err(CallError::Refused(e)) => Attempt::Done(Err(create_error(&e))),
+            // craze answered OK, so a session may exist even when shed cannot
+            // read the answer: an undecodable result is an UNKNOWN outcome at
+            // any attempt (plan 026 AM1), never a definite failure that would
+            // end the id while the session runs.
+            Ok(result) => match created(result) {
+                Ok((created, session_id)) => {
+                    self.remember_created(&created.session, &session_id);
+                    Attempt::Done(Ok(created))
+                }
+                Err(why) => Attempt::Unknown(why),
+            },
+            // On a retry, craze's refusals that say nothing about this
+            // request leave it unknown (`create_error`'s replay rows).
+            Err(CallError::Refused(e)) => {
+                let answer = create_error(&e, retry);
+                match unknown_why(&answer) {
+                    Some(why) => Attempt::Unknown(why.to_string()),
+                    None => Attempt::Done(Err(answer)),
+                }
+            }
             Err(e) if e.outcome_unknown() => Attempt::Unknown(e.to_string()),
             Err(e) => Attempt::Done(Err(LaneError::Failed(e.to_string()))),
         }
@@ -597,17 +627,14 @@ enum Attempt {
 }
 
 /// `session.create`'s result as the contract's, with the new session's craze
-/// `sessionId` (what a lane opened on it carries).
-fn created(result: serde_json::Value) -> Result<(LaneCreated, String), LaneError> {
+/// `sessionId` (what a lane opened on it carries) — or why shed cannot read
+/// it (an unknown outcome: craze answered ok).
+fn created(result: serde_json::Value) -> Result<(LaneCreated, String), String> {
     let r: CreateResult = serde_json::from_value(result).map_err(|e| {
-        LaneError::Failed(format!(
-            "craze answered session.create with something shed cannot read: {e}"
-        ))
+        format!("craze answered session.create with something shed cannot read: {e}")
     })?;
     let row = RosterRow::from_value(&r.session).map_err(|e| {
-        LaneError::Failed(format!(
-            "craze created a session and answered with a row shed cannot read ({e})"
-        ))
+        format!("craze created a session and answered with a row shed cannot read ({e})")
     })?;
     let created = LaneCreated {
         session: lane_session(&row),
@@ -789,6 +816,40 @@ impl AgentSource for CrazeSource {
     /// `session.create`, on its own connection, retried once under the same
     /// `requestId` when its outcome is unknown (the module doc).
     async fn create(&self, request: LaneCreateRequest) -> Result<LaneCreated, LaneError> {
+        self.create_with(request, false).await
+    }
+
+    /// `session.create` REPLAYING a held request id (plan 026 §3.1, AM1):
+    /// every attempt — the first included — is a retry, so a dial that never
+    /// reached craze, a hub that cannot create, an answer shed cannot decode,
+    /// or a craze refusal that does not state the request's outcome
+    /// ([`crate::errors::REPLAY_UNKNOWN`]: `host_unreachable`, `busy`,
+    /// `closing`, …) is unknown again and the caller keeps the id. Only
+    /// craze's answer about the request ends it: a decoded result,
+    /// `bad_request` (`request_conflict` included), a replayed
+    /// `spawn_failed`/`start_failed`.
+    async fn create_held(&self, request: LaneCreateRequest) -> Result<LaneCreated, LaneError> {
+        self.create_with(request, true).await
+    }
+
+    /// A [`CrazeLane`] bound to the row's hostId — and to the row and its
+    /// craze session id when this source lists it — holding this source's
+    /// rows weakly, to say its session's end back to them. No I/O (the module
+    /// doc).
+    async fn open(&self, session_id: &str) -> Result<Arc<dyn AgentLane>, LaneError> {
+        Ok(Arc::new(self.open_lane(session_id)))
+    }
+}
+
+impl CrazeSource {
+    /// [`AgentSource::create`] and [`AgentSource::create_held`]: `held` says
+    /// the request id is one whose earlier create's outcome is unknown, so
+    /// even the first attempt is a retry.
+    async fn create_with(
+        &self,
+        request: LaneCreateRequest,
+        held: bool,
+    ) -> Result<LaneCreated, LaneError> {
         if !valid_request_id(&request.request_id) {
             return Err(LaneError::BadRequest(format!(
                 "request id {:?} is not craze's form (1–64 of [A-Za-z0-9._-]); mint one with new_request_id",
@@ -801,23 +862,15 @@ impl AgentSource for CrazeSource {
             provider: request.provider,
             request_id: request.request_id,
         };
-        match self.create_once(&params, false).await {
+        match self.create_once(&params, held).await {
             Attempt::Done(answer) => answer,
             Attempt::Unknown(_) => match self.create_once(&params, true).await {
                 Attempt::Done(answer) => answer,
                 Attempt::Unknown(why) => Err(outcome_unknown(&format!(
-                    "craze did not answer the create, twice ({why}); it may have started a session — check the session list, or try again with the same request id, which craze answers with that session"
+                    "craze gave no definite answer to the create, twice ({why}); it may have started a session — check the session list, or try again with the same request id, which craze answers with that session"
                 ))),
             },
         }
-    }
-
-    /// A [`CrazeLane`] bound to the row's hostId — and to the row and its
-    /// craze session id when this source lists it — holding this source's
-    /// rows weakly, to say its session's end back to them. No I/O (the module
-    /// doc).
-    async fn open(&self, session_id: &str) -> Result<Arc<dyn AgentLane>, LaneError> {
-        Ok(Arc::new(self.open_lane(session_id)))
     }
 }
 

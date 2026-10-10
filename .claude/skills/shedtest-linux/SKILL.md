@@ -158,8 +158,11 @@ exercise.
 
 **Driving the New-session dialog's "Run a command" mode** (plan 025 C3, `roost.run`). The mode
 is reachable only by typing and clicking, so it has TEST-MODE-ONLY doors beside
-`ui.show_launch`: `ui.fill_launch {mode?, target?, command?, workdir?}` types into the open
-dialog and `ui.submit_launch` presses Create through the button's own gate. The fill is an
+`ui.show_launch`: `ui.fill_launch {mode?, target?, command?, workdir?, name?}` types into the
+open dialog (`name` is the agent mode's Session name, which a launch sets as the tab's title
+with `tab.set_title` — both fakes record those as `title_calls` / `set_title_calls()`, and
+`refuse_next_set_title` fails one) and `ui.submit_launch` presses Create through the button's
+own gate. The fill is an
 event to a listener the dialog registers AFTER it mounts, so one sent the instant
 `ui.show_launch` returns can land on nobody — re-send it (it is idempotent) until
 `launch.dump`'s `values` / `create_enabled` show it, as `test_tauri_machines.py`'s dialog cell
@@ -261,6 +264,13 @@ SHED_CRAZE_REQUIRE=1 SHED_CRAZE_BIN_DIR=/work/desktop/tools/shedtest/.craze-bin 
   `outcome_unknown` with the same id twice in the log. `outage` makes every craze run exit 1
   before any hub (Unreachable — a short backoff, unlike not-installed's 30 s); SIGTERM the hub
   with it on to take a machine OFFLINE under an open sheet, then remove it to bring it back.
+  `refuse-dials` (with `proxy` on; plan 026) makes each NEW `bridge --hub` refuse the
+  connection (logged to `refused.log`, read with `rig.refused()`) while connections already up
+  — the roster's — stay, so the machine stays live: a create's dial fails without the machine
+  going offline under the sheet, which `outage` cannot do. A HELD retry (Try again after an
+  unknown outcome, sent `held: true`) dials twice into it and stays `unknown`; wait on the
+  dump's `error.message` naming the refusal, not on `state` (it reads `unknown` before the
+  press too).
 - **A start failure on demand**: point `[agents].grok` at `craze-fake-agent -script
   exit-two-lines` (`rig.set_grok(...)`); craze reads it at every create. Restore it (in a
   `finally`) before the next create.
@@ -279,6 +289,78 @@ SHED_CRAZE_REQUIRE=1 SHED_CRAZE_BIN_DIR=/work/desktop/tools/shedtest/.craze-bin 
 - **`laneFailure` must not be applied twice**: a wrapper that already threw a coded
   `LaneFailure` has a message WITHOUT the code, and re-splitting it read `outcome_unknown` as
   `failed`. `laneFailure` now returns a `LaneFailure` unchanged.
+
+### A running shed's craze — offer, don't list (plan 026 C2)
+
+- **`app_shed` is the shed instance**: a PRIVATE `MockShedServer` (so the session mock's
+  per-test reset never touches it) lists four sheds running under
+  `fixtures/config-craze-shed.yaml` (one server, NO machines — a configured machine's
+  unreachable backoff would repaint the listing and mask a "no repaint" control). A shed's ssh
+  user is its NAME, so each shed is its own jail of the same fake `ssh` (`Remote(bins,
+  jails=SHED_JAILS)`). None runs roost (the fake answers `client-bridge` `command not found`),
+  so only craze can list one; until then it is `rc.list`'s `shed_craze`, read on screen through
+  `shed_roost.dump`'s `craze_create`/`craze_note` and `launch.dump`'s rendered "Where".
+- **Two switches in a JAIL's root**: `probe-127` makes the find-only probe exit 127 (not
+  installed); `hold-roster` (content N) holds the (N+1)-th `bridge --hub` of that jail until
+  the switch goes, recording the held record's name in `held` — `1` holds the roster's bridge
+  behind the sheet's, so the sheet can be asserted while the shed is still unlisted. A held
+  bridge's `hello` times out at 30 s: assert inside that.
+- **The recorded pid is the bridge** (`Remote.records(user)` / `live_bridges(user)`, pids under
+  `<root>/pids/`): the fake EXECs a craze command, because dash does NOT exec the last
+  command of `sh -c` — without it the pid is an outer `/bin/sh` whose death leaves the craze
+  bridge (and its pipes) alive, and the app never sees the connection end. The remote command
+  arrives per-argument single-quoted (`'sh' '-c' '…'`), so a `case` on `sh -c *` never
+  matches; match `"'sh' '-c' "*`.
+- `commands(user)` is sorted by mktemp name (random), not time: use `records(user)` (by mtime)
+  for ORDER ("the first `bridge --hub` is the sheet's").
+- A dormant probe re-runs every 30 s, and so does a not-installed one: a cell that flips
+  `probe-127` waits ~45 s each way. Without a fresh `rc.list` re-read (a `refresh` event) the UI
+  keeps its last listing — `ui.show_launch` re-reads on mount, so open the dialog FIRST when a
+  control must reach a later assertion. `ui.close_launch` closes it.
+
+### The orderly shutdown cells (plan 026 C3)
+
+The app now handles SIGTERM/SIGINT/SIGHUP (a dedicated signal thread) and runs one bounded,
+idempotent shutdown of every child it owns — so **the harness's `ui.terminate` (SIGTERM) runs that
+shutdown too**. `test_tauri_craze.py`'s `_stop` times every stop and fails if the 5 s grace's
+SIGKILL was ever needed; a typical stop is ~0.03 s. The app logs each phase to its own log
+(`shed-desktop-tauri: shutdown: phase N … took M ms`).
+
+- **A signal cell signals an app instance of its OWN** (`SigRig`, a function-scoped rig), never
+  the module's shared `app`. Signal by the recorded pid; the test-mode `app.quit` op is the tray's
+  path (`app.exit(0)`).
+- **`app.terminate` is the macOS system quit** (plan 026 C3b). It drives `[NSApplication
+  terminate:]`, the path a Dock Quit, a logout and an AppleScript quit take, which reaches the
+  app only as `RunEvent::Exit`. It is test mode only and macOS only: Linux answers
+  `not_supported`, so `test_a_macos_system_quit_leaves_no_app_children` SKIPS here and runs in
+  CI's `tauri-mac`. Never send `terminate:` inline from a `run_on_main_thread` closure. The
+  closure runs inside tao's event handler, holding its lock, and `applicationWillTerminate:`
+  takes that lock again on the same thread: a deadlock. Queue it instead
+  (`performSelectorOnMainThread:…waitUntilDone:NO`), as `ipc.rs`'s `system_terminate` does.
+- **A descendant check alone cannot prove the orderly path in this rig.** Kill the app with no
+  handler and every descendant still dies within a second: the craze bridges exit on stdin EOF,
+  WebKit's helpers die with their parent. What a hard kill leaves behind is the `SshExec`
+  ControlMaster, which ssh daemonizes — it is never in the descendant tree. Its proof is the fake
+  ssh's `exits.log` (every `-O exit`, by control path); check it, and the exit status (an orderly
+  exit is 0).
+- **The craze hub is in the app's tree while the app runs** (the first bridge that Ensures it is
+  its parent until that bridge exits), so list it — and everything under it — apart, from its own
+  hub record, before asserting what died.
+- **The post-exit grace for recorded descendants is 0.5 s, not more** (C3 fix round 1): the
+  shutdown kills AND awaits its own children before the app exits, so they are gone already; the
+  half second is only for WebKit's helpers noticing their parent went and a killed child's zombie
+  being reaped once reparented. Don't widen it to make a cell pass — a bridge that needs longer
+  is a bug. Likewise `_launch` releases its own app, log and agent if it fails after the spawn,
+  and `SigRig.teardown` runs every step (holder, both namespaces) before re-raising the first
+  failure, so a forced kill never leaks a jail.
+- **Two signals sent back to back are ONE signal.** The OS and tokio coalesce a SIGTERM that
+  arrives before the signal thread consumed the previous one. A "second signal" cell must wait
+  for proof the first is being handled (a NEW `-O exit` past `phase 2` in the app's log) — not
+  for any `-O exit`: with the fake ssh's `wedge-exit` switch on from launch, roost's own replace
+  path logs (and is held by) some during normal operation.
+- **Every dir above a `CRAZE_RUNTIME_DIR` must be 0700**: a nested rig dir made with
+  `mkdir(parents=True)` is group-writable under a 002 umask, and craze then refuses the runtime
+  dir with no error the harness surfaces (the fake host just exits before its ready line).
 
 ### The settings sheet (plan 025 C11)
 
@@ -400,6 +482,13 @@ make -C desktop tauri-ui-build             # generate_context! panics at macro e
 cd desktop/tauri/src-tauri
 cargo clippy --locked --all-targets -- -D warnings
 ```
+
+With a `CARGO_TARGET_DIR` outside `src-tauri` (a scratch target dir you can delete afterwards),
+the sparkle-updater `build.rs` panics with `Sparkle.framework not found!` even though it is
+staged. It looks for the framework by walking `OUT_DIR`'s ancestors for `tauri.conf.json`, so
+name it: `export SPARKLE_FRAMEWORK_PATH=<worktree>/desktop/tauri/src-tauri`. And `npm` need not
+exist on the Mac: copying a built `desktop/tauri/ui/dist` over from Linux satisfies
+`generate_context!` for `cargo check`/`clippy`.
 
 **Unlike Linux, this baseline is CLEAN at `origin/main`** — there is no `tray.rs`/`zbus::proxy`
 pre-existing-findings exemption on macOS (those are Linux-only code paths). So on a Mac, run
@@ -582,6 +671,18 @@ deliver — neither of which a screenshot can be made to fail on.
   `env -u WAYLAND_DISPLAY -u DISPLAY XDG_SESSION_TYPE=x11 xvfb-run -a --server-args="-screen 0 1400x900x24" make -C desktop e2e-tauri`
   — and kill any `shed-desktop-tauri` the run leaves behind BY PID (`ps -o pid,ppid,lstart,args
   -C shed-desktop-tauri`), never one the owner started.
+- **A `#[tauri::command]` drops every invoke key it does not declare, silently** → the
+  frontend (or a harness) sending `permissionMode` to a command without a `permission_mode`
+  parameter gets the command run as if the key were absent — no error anywhere. A command's
+  argument shape is testable only above its body: drive it through Tauri's mock runtime
+  (`tauri::test::mock_builder` + `get_ipc_response`; the crate's dev-dependency turns on
+  tauri's `test` feature, which adds no package), as `src/launch_command_tests.rs` does.
+- **Run a subset of tauri modules in collection (alphabetical) order** →
+  `test_tauri_machines.py`'s self-managed apps `ui.quit("tauri")` the session app and do not
+  bring it back, so a module named AFTER it on the command line errors at setup with
+  `FileNotFoundError` from `client.py`'s `connect` (the session socket is gone). A full run is
+  fine — it sorts last — but `pytest test_tauri_machines.py test_tauri.py -k …` is not; list it
+  last.
 - **WebKitGTK web-process dies / JS never runs** → the render gate needs
   `--cap-add SYS_ADMIN --security-opt seccomp=unconfined` (already in the target) so WebKitGTK's
   bubblewrap sandbox can create user namespaces Docker's default seccomp blocks.

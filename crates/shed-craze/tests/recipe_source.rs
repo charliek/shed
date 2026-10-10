@@ -473,6 +473,161 @@ async fn a_start_failure_says_why_and_a_new_id_succeeds_once_fixed() {
     recipe.teardown().await.unwrap();
 }
 
+// ---- a held request id, replayed (plan 026 §3.1) ----
+
+/// **A held replay whose dial never reaches craze stays unknown** (no craze
+/// on the `PATH`, through the ladder): a FRESH create there is a definite,
+/// quiet `Unavailable` (nothing was sent), but a replay of a held id says
+/// nothing about the request it replays — both of its attempts are retries,
+/// and the caller keeps the id.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_held_create_whose_dial_never_reaches_craze_stays_unknown() {
+    let Some(bins) = bins("a_held_create_whose_dial_never_reaches_craze_stays_unknown") else {
+        return;
+    };
+    let recipe = Recipe::start_with(&bins, PathKind::Empty);
+    {
+        let hook = HookDial::new(Arc::new(recipe.ladder_dial()));
+        let source = recipe.source_on(Arc::clone(&hook) as Arc<dyn CrazeDial>);
+        let fresh = source
+            .create(request(&recipe, None, &new_request_id()))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&fresh, LaneError::Unavailable(m) if m.contains("not installed")),
+            "{fresh:?}"
+        );
+        assert!(!is_outcome_unknown(&fresh), "a fresh create sent nothing");
+        assert_eq!(hook.dials(), 1);
+
+        let held = source
+            .create_held(request(&recipe, None, &new_request_id()))
+            .await
+            .unwrap_err();
+        assert!(is_outcome_unknown(&held), "{held:?}");
+        assert_eq!(hook.dials(), 3, "the held attempt, then the one retry");
+    }
+    recipe.teardown().await.unwrap();
+}
+
+/// **craze could not tell whether the request started a session** — the REAL
+/// hub, a live `craze-fake-host` whose registry entry cannot be read: craze
+/// refuses any create its memory does not hold `unavailable`, reason
+/// `host_unreachable` ("whether a create of requestId X started a session
+/// already cannot be known: try again"), spawning nothing. A fresh create so
+/// refused started nothing (definite); a held replay so refused stays
+/// UNKNOWN, and the caller keeps its id.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_held_create_craze_cannot_answer_for_stays_unknown() {
+    let Some(bins) = bins("a_held_create_craze_cannot_answer_for_stays_unknown") else {
+        return;
+    };
+    let recipe = Recipe::start(&bins);
+    {
+        recipe.fake_host(FAKE, FAKE_SESSION).await;
+        let entry = recipe.home.join(format!(".cache/craze/hosts/{FAKE}.json"));
+        assert!(entry.exists(), "the fake host's registry entry");
+        std::fs::write(&entry, "{not json").unwrap();
+        let source = recipe.source();
+
+        let fresh = source
+            .create(request(&recipe, None, &new_request_id()))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&fresh, LaneError::Unavailable(m) if m.contains("cannot be read")),
+            "a fresh create craze refused: {fresh:?}"
+        );
+        assert!(!is_outcome_unknown(&fresh));
+
+        let held = source
+            .create_held(request(&recipe, None, &new_request_id()))
+            .await
+            .unwrap_err();
+        assert!(is_outcome_unknown(&held), "{held:?}");
+        assert!(
+            held.to_string().contains("cannot be read"),
+            "craze's own words: {held}"
+        );
+        assert_eq!(
+            recipe.registered_hosts(),
+            [FAKE.to_string()],
+            "craze spawned nothing"
+        );
+    }
+    recipe.teardown().await.unwrap();
+}
+
+/// **craze's own answer about the request ends a held id** — the REAL hub: a
+/// held replay of a created session is that session (exactly one); one with
+/// other params is `request_conflict`, a directory that does not exist is
+/// `bad_request`, and a start failure is replayed as itself — each definite,
+/// never `outcome_unknown`.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_held_create_ends_on_crazes_answer_about_the_request() {
+    let Some(bins) = bins("a_held_create_ends_on_crazes_answer_about_the_request") else {
+        return;
+    };
+    let recipe = Recipe::start(&bins);
+    {
+        let source = recipe.source();
+        let id = new_request_id();
+        let created = source.create(request(&recipe, None, &id)).await.unwrap();
+        let replayed = source
+            .create_held(request(&recipe, None, &id))
+            .await
+            .unwrap();
+        assert_eq!(replayed.session.id, created.session.id, "the same session");
+        assert_eq!(
+            recipe.registered_hosts(),
+            std::slice::from_ref(&created.session.id),
+            "exactly one session"
+        );
+
+        let conflict = source
+            .create_held(request(&recipe, Some("other params"), &id))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&conflict, LaneError::BadRequest(m) if m.contains("used already")),
+            "request_conflict: {conflict:?}"
+        );
+
+        let mut nowhere = request(&recipe, None, &new_request_id());
+        nowhere.cwd = recipe
+            .root()
+            .join("no-such-dir")
+            .to_string_lossy()
+            .into_owned();
+        let bad = source.create_held(nowhere).await.unwrap_err();
+        assert!(
+            matches!(&bad, LaneError::BadRequest(m) if m.contains("does not exist")),
+            "bad_request: {bad:?}"
+        );
+
+        recipe.set_grok_agent(&recipe.exit_two_lines_agent());
+        let failed_id = new_request_id();
+        let failed = source
+            .create(request(&recipe, Some("hi"), &failed_id))
+            .await
+            .unwrap_err();
+        let again = source
+            .create_held(request(&recipe, Some("hi"), &failed_id))
+            .await
+            .unwrap_err();
+        assert_eq!(again, failed, "the start failure, replayed");
+        assert!(
+            matches!(&again, LaneError::Failed(c) if c.contains("KEYCHAIN LOCKED")),
+            "{again:?}"
+        );
+        for e in [&conflict, &bad, &again] {
+            assert!(!is_outcome_unknown(e), "definite: {e:?}");
+        }
+        recipe.set_grok_agent(&bins.fake_agent);
+    }
+    recipe.teardown().await.unwrap();
+}
+
 /// No craze on the machine (an empty `PATH`, through the ladder): the roster is
 /// `Offline{NotInstalled}`, and so is the probe.
 #[tokio::test(flavor = "multi_thread")]

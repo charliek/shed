@@ -10,7 +10,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { newestWins } from "../dist-test/newest.js";
+import { newestReload, newestWins } from "../dist-test/newest.js";
 
 /** A promise this test resolves (or rejects) when it decides to. */
 function deferred() {
@@ -126,4 +126,90 @@ test("cancel stops every read still in flight", async () => {
 
   assert.deepEqual(out.committed, [], "a read committed after the panel unmounted");
   assert.deepEqual(out.failed, []);
+});
+
+/* ---- newestReload: the shell's host list (shed#400) ---------------------
+ *
+ * `App.tsx`'s host list re-reads `system_df` on every `refresh` and feeds the
+ * Hosts badge and the sidebar from whatever it committed. These pin the reload
+ * it goes through: a bare `read().then(commit)` there is what these turn red. */
+
+/** Two host rows, the shape `system_df` answers with (one host down). */
+const TWO_HOSTS = [
+  { host: "mock", usage: { totals: {} } },
+  { host: "down", usage: null, error: "connection refused" },
+];
+const ONE_HOST = [{ host: "mock", usage: { totals: {} } }];
+
+test("host list: an older answer landing after a newer one does not commit", async () => {
+  const committed = [];
+  const answers = [deferred(), deferred()];
+  let calls = 0;
+  const rows = newestReload(() => answers[calls++].promise, (r) => committed.push(r));
+
+  const older = rows.reload();
+  const newer = rows.reload();
+  // The newer read answers first: the host set changed between the two.
+  answers[1].resolve(TWO_HOSTS);
+  await newer;
+  answers[0].resolve(ONE_HOST);
+  await older;
+
+  assert.deepEqual(committed, [TWO_HOSTS], "a stale host list overwrote a fresh one");
+});
+
+test("host list: a failed reload keeps the last rows", async () => {
+  const committed = [];
+  const first = deferred();
+  const second = deferred();
+  const queue = [first, second];
+  const rows = newestReload(() => queue.shift().promise, (r) => committed.push(r));
+
+  const a = rows.reload();
+  first.resolve(TWO_HOSTS);
+  await a;
+  const b = rows.reload();
+  second.reject(new Error("ipc: the webview lost its channel"));
+  await b; // settles quietly: a failed read is not an answer about the hosts
+
+  assert.deepEqual(committed, [TWO_HOSTS], "a failed read replaced the host list");
+});
+
+test("host list: an older answer landing after a newer FAILURE does not commit either", async () => {
+  const committed = [];
+  const answers = [deferred(), deferred(), deferred()];
+  let calls = 0;
+  const rows = newestReload(() => answers[calls++].promise, (r) => committed.push(r));
+
+  const seed = rows.reload();
+  answers[0].resolve(TWO_HOSTS);
+  await seed;
+  const older = rows.reload();
+  const newer = rows.reload();
+  answers[2].reject(new Error("ipc: refused"));
+  await newer;
+  answers[1].resolve(ONE_HOST);
+  await older;
+
+  assert.deepEqual(committed, [TWO_HOSTS], "a stale answer committed past a newer read");
+});
+
+test("host list: in-order reloads both commit, and cancel stops the rest", async () => {
+  const committed = [];
+  const answers = [deferred(), deferred(), deferred()];
+  let calls = 0;
+  const rows = newestReload(() => answers[calls++].promise, (r) => committed.push(r));
+
+  const a = rows.reload();
+  answers[0].resolve(ONE_HOST);
+  await a;
+  const b = rows.reload();
+  answers[1].resolve(TWO_HOSTS);
+  await b;
+  const c = rows.reload();
+  rows.cancel();
+  answers[2].resolve(ONE_HOST);
+  await c;
+
+  assert.deepEqual(committed, [ONE_HOST, TWO_HOSTS], "in-order reads must both show; none after cancel");
 });

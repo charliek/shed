@@ -126,6 +126,13 @@ _EGRESS_PATH = "/api/egress/stream"
 # (matches synthetic_bus `_SSE_POLL`).
 _SSE_POLL = 0.1
 
+# The longest a held `GET /api/sheds` waits for its release (see
+# `hold_sheds_list`) before it answers anyway — under shed-core's 8 s GET timeout,
+# so a cell that forgets to release still gets an answer rather than a transport
+# error. A held request that hits it is counted (`sheds_hold_expired`), so the
+# cell can tell a released list from one that merely timed out.
+_SHEDS_HOLD_MAX = 6.0
+
 
 class MockShedServer:
     def __init__(self, require_auth: bool = False):
@@ -151,6 +158,11 @@ class MockShedServer:
         self.last_create_body: dict | None = None
         self._httpd: ThreadingHTTPServer | None = None
         self._thread: threading.Thread | None = None
+        # ---- the one-shot sheds-list hold (plan 026 §3.4, shed#400) ----
+        # Armed → every GET /api/sheds waits on this Event until the release.
+        self._sheds_hold: threading.Event | None = None
+        self._sheds_waiting = 0  # requests waiting on the hold right now
+        self._sheds_hold_expired = 0  # requests that gave up at _SHEDS_HOLD_MAX
         # ---- plugin message-bus state (leg 3a.2) ----
         # One Condition guards all cross-thread bus state (the SSE handler threads
         # touch it concurrently with the test thread), mirroring synthetic_bus.
@@ -204,6 +216,59 @@ class MockShedServer:
             self.sheds = [dict(s) for s in DEFAULT_SHEDS]
             self.create_should_fail = False
             self.last_create_body = None
+        self.release_sheds_list()  # never leave a handler thread parked
+
+    # -- the one-shot sheds-list hold (plan 026 §3.4, shed#400) ------------
+    def hold_sheds_list(self) -> None:
+        """Arm a ONE-SHOT hold on `GET /api/sheds`: from now until
+        `release_sheds_list()`, every sheds list waits for that one release (or
+        `_SHEDS_HOLD_MAX`) before it answers. The release consumes the arming,
+        so nothing is held after it. Arm it BEFORE the app launches and the app's
+        first shed list is held, whichever request is first: the shell's own
+        `list_sheds` and a background listing fan out to the same route.
+
+        The cell it exists for (`test_tauri_downhost.py`) holds that first list
+        until the UI has already published a real `hosts: 2` report — the exact
+        interleaving in which the bridge's initial report used to land a zero
+        seed over it."""
+        with self._lock:
+            if self._sheds_hold is None:
+                self._sheds_hold = threading.Event()
+            self._sheds_hold_expired = 0
+
+    def release_sheds_list(self) -> None:
+        """Answer every held sheds list now, and disarm the hold. Idempotent."""
+        with self._lock:
+            hold, self._sheds_hold = self._sheds_hold, None
+        if hold is not None:
+            hold.set()
+
+    def sheds_waiting(self) -> int:
+        """How many sheds lists are parked on the hold right now — what proves the
+        app's first list really is still in flight."""
+        with self._lock:
+            return self._sheds_waiting
+
+    def sheds_hold_expired(self) -> int:
+        """How many held sheds lists answered at `_SHEDS_HOLD_MAX` instead of at
+        the release (since the hold was last armed)."""
+        with self._lock:
+            return self._sheds_hold_expired
+
+    def _await_sheds_release(self) -> None:
+        """Called by the handler before it answers `GET /api/sheds`: park on the
+        hold if one is armed. The snapshot is taken AFTER, so the held list
+        answers with the state at the release."""
+        with self._lock:
+            hold = self._sheds_hold
+            if hold is None:
+                return
+            self._sheds_waiting += 1
+        released = hold.wait(timeout=_SHEDS_HOLD_MAX)
+        with self._lock:
+            self._sheds_waiting -= 1
+            if not released:
+                self._sheds_hold_expired += 1
 
     def last_create(self) -> dict | None:
         with self._lock:
@@ -387,6 +452,8 @@ class MockShedServer:
                 if m:
                     self._serve_sse(unquote(m.group(1)))
                     return
+                if self.path == "/api/sheds":
+                    state._await_sheds_release()
                 info, sheds = state.snapshot()
                 if self.path == "/api/info":
                     self._send(200, info)
@@ -549,6 +616,7 @@ class MockShedServer:
         # subscribe), so no socket lingers past shutdown (ResourceWarning-safe),
         # mirroring synthetic_bus.stop().
         self._bus_shutdown.set()
+        self.release_sheds_list()
         with self._bus_cond:
             for q in self._bus_queues.values():
                 q.put(None)  # per-queue teardown sentinel

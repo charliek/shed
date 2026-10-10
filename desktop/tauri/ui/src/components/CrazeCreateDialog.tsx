@@ -30,12 +30,12 @@ import { cn } from "@/lib/utils";
 import { renderedText, renderedValues } from "@/lib/roost";
 import {
   crazeCreateOptions, laneFailure, reportCrazeCreate,
-  type CrazeCreateProviderRow, type CrazeStatus,
+  type CrazeCreateProviderRow,
 } from "@/lib/bridge";
 import {
-  NO_PROVIDER_READY, OUTCOME_UNKNOWN_NOTE, crazeSheetNote, directoryProblem, preselectedProvider,
+  crazeCreateGate, crazeSheetNote, directoryProblem, preselectedProvider,
   primaryLabel, providerSelectable, reconcileProvider, refusalView,
-  type CrazeCreateOptions, type CrazeDraft,
+  type CrazeCreateOptions, type CrazeDraft, type CrazeStatusLike,
 } from "@/lib/crazeCreate";
 
 type OptionsLoad =
@@ -46,8 +46,10 @@ type OptionsLoad =
 export function CrazeCreateDialog({ machine, craze, draft, onEdit, onSubmit, onClose }: {
   machine: string;
   /** This machine's craze status as the shell last read it — what turns the
-   *  sheet's note on (offline, too old, not installed) while it is open. */
-  craze: CrazeStatus | null | undefined;
+   *  sheet's note on (offline, too old, not installed) while it is open. Read
+   *  through `crazeStatusFor`, so an unlisted dormant shed's comes from its
+   *  `shed_craze` entry (plan 026 §3.2). */
+  craze: CrazeStatusLike;
   draft: CrazeDraft;
   onEdit: (patch: Partial<Pick<CrazeDraft, "provider" | "cwd" | "prompt">>) => void;
   onSubmit: () => void;
@@ -71,12 +73,16 @@ export function CrazeCreateDialog({ machine, craze, draft, onEdit, onSubmit, onC
     return () => { live = false; };
   }, [machine, attempt]);
 
-  // The provider follows the options: a selection carried over from an
-  // earlier open survives only while still ready, else the default rule. A
-  // submission in flight is left alone (its controls are disabled).
+  // The provider follows the options — for an IDLE draft only: a selection
+  // carried over from an earlier open survives only while still ready, else
+  // the default rule. Any other phase is left alone (plan 026 §3.1): a
+  // submission in flight (its controls are disabled), an unknown outcome
+  // (reconciling would be an edit, and an edit drops the id it holds — the
+  // retry would then start a second session) and a refusal (it keeps its
+  // words and its provider until the person picks another).
   const options = load.phase === "ready" ? load.options : null;
   useEffect(() => {
-    if (!options || draft.phase === "submitting") return;
+    if (!options || draft.phase !== "idle") return;
     const want = reconcileProvider(draft.provider, options);
     if (want !== draft.provider) onEdit({ provider: want });
   }, [options, draft.provider, draft.phase]); // eslint-disable-line react-hooks/exhaustive-deps
@@ -95,12 +101,15 @@ export function CrazeCreateDialog({ machine, craze, draft, onEdit, onSubmit, onC
 
   const machineNote = crazeSheetNote(craze, machine);
   const providers = options?.providers ?? [];
-  const noneReady = !!options && !providers.some(providerSelectable);
-  const note = machineNote ?? (noneReady ? NO_PROVIDER_READY : null);
-  const selected = providers.find((p) => p.id === draft.provider && providerSelectable(p)) ?? null;
+  // Every gating rule is `crazeCreateGate`'s (node-tested): the selection,
+  // the note, and whether the button works — a held request replayed
+  // included.
+  const { selected, replaying, note, canCreate } = crazeCreateGate(draft, options, machineNote);
+  // A held provider the re-read no longer lists still names the request
+  // being replayed: it is shown as a held row of its own.
+  const heldAbsent = replaying && selected !== null && !!options && !providers.some((p) => p.id === selected);
   const cwdProblem = draft.cwd === "" && draft.phase === "idle" ? null : directoryProblem(draft.cwd);
   const refusal = draft.refusal ? refusalView(draft.refusal) : null;
-  const canCreate = !!options && !!selected && directoryProblem(draft.cwd) === null && !note && !submitting;
 
   // A click on a provider row: a dimmed one refuses it, as it refuses the
   // harness's door — the rule, not just the look.
@@ -247,7 +256,7 @@ export function CrazeCreateDialog({ machine, craze, draft, onEdit, onSubmit, onC
             <div className="flex flex-col gap-1.5" role="radiogroup" aria-label="Provider">
               {providers.map((p) => {
                 const ok = providerSelectable(p);
-                const on = ok && p.id === draft.provider;
+                const on = p.id === selected;
                 return (
                   <div
                     key={p.id}
@@ -261,7 +270,7 @@ export function CrazeCreateDialog({ machine, craze, draft, onEdit, onSubmit, onC
                     onClick={() => pick(p.id)}
                     className={cn("rounded-[9px] border px-3 py-2", ok && !submitting && "hbtn")}
                     style={{
-                      opacity: ok ? 1 : 0.5,
+                      opacity: ok ? 1 : on ? 0.8 : 0.5,
                       cursor: ok && !submitting ? "pointer" : "default",
                       borderColor: on ? "var(--shed-accent)" : "var(--shed-border)",
                       background: on ? "var(--shed-accent-subtle)" : "var(--shed-surface)",
@@ -273,6 +282,7 @@ export function CrazeCreateDialog({ machine, craze, draft, onEdit, onSubmit, onC
                         <span className="font-mono text-[11px] text-shed-text-muted">{p.state.replace(/_/g, " ")}</span>
                       )}
                     </div>
+                    {!ok && on && <HeldLine />}
                     {!ok && p.reason && (
                       <div data-reason className="mt-0.5 text-[12px] text-shed-text-secondary">{p.reason}</div>
                     )}
@@ -282,6 +292,25 @@ export function CrazeCreateDialog({ machine, craze, draft, onEdit, onSubmit, onC
                   </div>
                 );
               })}
+              {heldAbsent && (
+                <div
+                  role="radio"
+                  aria-checked
+                  aria-disabled
+                  data-provider={selected}
+                  data-state="absent"
+                  data-dimmed="true"
+                  data-selected="true"
+                  className="rounded-[9px] border px-3 py-2"
+                  style={{ opacity: 0.8, borderColor: "var(--shed-accent)", background: "var(--shed-accent-subtle)" }}
+                >
+                  <div className="flex items-center gap-2">
+                    <span data-provider-label className="text-[14px] font-semibold text-shed-text">{selected}</span>
+                    <span className="font-mono text-[11px] text-shed-text-muted">not listed now</span>
+                  </div>
+                  <HeldLine />
+                </div>
+              )}
             </div>
           )}
         </Field>
@@ -333,11 +362,6 @@ export function CrazeCreateDialog({ machine, craze, draft, onEdit, onSubmit, onC
           />
         </Field>
         <div ref={outcome} className="flex flex-col gap-3 empty:hidden">
-        {draft.phase === "unknown" && (
-          <div data-craze-unknown className="rounded-md px-3 py-2 text-[13px]" style={{ background: "var(--shed-inset)", color: "var(--shed-warn-fg)" }}>
-            {OUTCOME_UNKNOWN_NOTE}
-          </div>
-        )}
         {refusal?.where === "cause" && (
           <div className="flex flex-col gap-1">
             <div className="text-[12px] font-semibold" style={{ color: "var(--shed-danger)" }}>The session failed to start:</div>
@@ -359,4 +383,10 @@ export function CrazeCreateDialog({ machine, craze, draft, onEdit, onSubmit, onC
       </DialogShell>
     </Scrim>
   );
+}
+
+/** The line a held provider's row carries while its request is replayed: it
+ *  is selected for the retry, not for a new request. */
+function HeldLine() {
+  return <div data-held className="mt-0.5 text-[12px] text-shed-text-secondary">held for the retry</div>;
 }

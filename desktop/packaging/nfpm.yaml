@@ -13,7 +13,7 @@ section: utils
 priority: optional
 maintainer: Charlie Knudsen <charlie.knudsen@gmail.com>
 vendor: Stride Labs
-homepage: https://github.com/charliek/shed-desktop
+homepage: https://github.com/charliek/shed
 license: MIT
 description: |
   Tauri/WebKitGTK client for the shed toolchain.

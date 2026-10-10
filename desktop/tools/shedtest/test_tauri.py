@@ -703,9 +703,9 @@ def test_the_launch_dialog_does_not_ask_for_a_prompt_it_cannot_deliver(tauri):
     retired the hub and re-pointed that door at `roost.launch`, whose `tab.open`
     is an argv and a working directory and nothing else: the box stayed on
     screen with nothing at the far end, and what a user typed into it went
-    nowhere, silently. Delivering it through `tab.write` is #366's job (it has
-    to work the same for every agent kind, which a blind write does not), so
-    until that lands the honest UI is to not ask.
+    nowhere, silently. A launch that carries a first prompt is now refused
+    (`bad_request`, plan 026 §3.5) rather than dropped, so the honest UI does
+    not ask.
 
     Asserted against the dialog's own rendered text, so it is about what was
     painted rather than about what the source says. The three fields it DOES

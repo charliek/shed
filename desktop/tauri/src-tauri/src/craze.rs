@@ -92,6 +92,7 @@ use std::time::Duration;
 use serde_json::{json, Value};
 
 use shed_app::roost::SshExec;
+use shed_app::spawn_gate::{ChildExit, SpawnGate, SpawnSection};
 use shed_core::lane::backoff::{jittered, next_backoff};
 use shed_core::lane::{LaneSession, SourceCapabilities, SourceEvent, SourceOffline};
 use shed_core::roost::bootstrap::{Outcome, Stdin};
@@ -225,6 +226,12 @@ pub struct SshCrazeDial {
     bridge: String,
     /// `None` only for [`Self::ungated`].
     probe: Option<Arc<dyn CrazeProbe>>,
+    /// The app's spawn gate (plan 026 §3.3). This dial takes its section
+    /// around the `spawn_duplex` and the child's registration ALONE — not
+    /// around the find-only probe in front of them, which can take
+    /// `PROBE_DEADLINE` (30 s) and runs through the exec's own gate — so a
+    /// close never waits on somebody's probe.
+    gate: Option<SpawnGate>,
 }
 
 impl SshCrazeDial {
@@ -233,18 +240,27 @@ impl SshCrazeDial {
             exec,
             bridge,
             probe: Some(probe),
+            gate: None,
         }
     }
 
     /// The same bridge with NO probe in front: it Ensures a hub on the far side
     /// whether or not one runs. For [`CrazeReach::ensure`] only — the create
     /// sheet's `create_options` and the create, a user's explicit action.
+    /// ("Ungated" names the PROBE gate; the spawn gate is [`Self::with_spawn_gate`].)
     pub fn ungated(exec: Arc<SshExec>, bridge: String) -> Self {
         Self {
             exec,
             bridge,
             probe: None,
+            gate: None,
         }
+    }
+
+    /// Spawn only inside `gate`'s sections, registering every bridge child.
+    pub fn with_spawn_gate(mut self, gate: Option<SpawnGate>) -> Self {
+        self.gate = gate;
+        self
     }
 }
 
@@ -259,6 +275,11 @@ impl CrazeDial for SshCrazeDial {
     fn dial(&self) -> BoxFut<Result<CrazeStream, DialError>> {
         let exec = Arc::clone(&self.exec);
         let bridge = self.bridge.clone();
+        let gate = self.gate.clone();
+        // A closed gate refuses before the probe, too: a clean early answer.
+        if gate.as_ref().is_some_and(SpawnGate::is_closed) {
+            return Box::pin(async { Err(shutting_down_dial()) });
+        }
         let probe = self.probe.as_ref().map(|p| p.probe());
         Box::pin(async move {
             match probe {
@@ -276,11 +297,192 @@ impl CrazeDial for SshCrazeDial {
                     }
                 },
             }
+            // **The spawn section** (plan 026 §3.3): check → spawn →
+            // register, under the gate's shared guard.
+            let section = match &gate {
+                Some(gate) => Some(gate.enter().map_err(|_| shutting_down_dial())?),
+                None => None,
+            };
             let child = exec.spawn_duplex(&bridge).map_err(|e| {
                 DialError::Unreachable(format!("{}: could not run ssh: {e}", exec.label()))
             })?;
-            child_stream(child)
+            let stream = child_stream(child)?;
+            match (&gate, section.as_ref()) {
+                (Some(gate), Some(section)) => register_stream(gate, section, stream)
+                    .await
+                    .map_err(|_| shutting_down_dial()),
+                _ => Ok(stream),
+            }
         })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// the spawn gate (plan 026 §3.3)
+// ---------------------------------------------------------------------------
+
+/// What a gated dial answers once the app's spawn gate has closed.
+pub fn shutting_down_dial() -> DialError {
+    DialError::Unreachable(shed_app::spawn_gate::ShuttingDown.to_string())
+}
+
+/// A dial whose every spawn runs inside a section of the app's spawn gate
+/// (plan 026 §3.3) — the desktop's wrapper around its local
+/// [`shed_craze::ProcessDial`]. Dialers are the client's (plan 025 P8), so
+/// this is where shutting down is refused, with no change to shed-craze: the
+/// roster, every lane, every `create_options`, every create and every one of
+/// its automatic retries dials through it.
+///
+/// The section is held across polling the inner dial future THROUGH its
+/// spawn and the registration of the child it made: a close either waits for
+/// both, so the drain finds the child, or comes first, and the dial answers
+/// `shutting_down` without ever polling the inner one.
+pub struct GatedDial {
+    inner: Arc<dyn CrazeDial>,
+    gate: SpawnGate,
+    /// Test seam: a pause between the gate check and the inner dial.
+    #[cfg(test)]
+    pause: std::sync::Mutex<Option<crate::roost_hosts::TestGap>>,
+}
+
+/// `inner`, gated by `gate` when there is one; `inner` itself otherwise.
+pub fn gated(inner: Arc<dyn CrazeDial>, gate: Option<&SpawnGate>) -> Arc<dyn CrazeDial> {
+    match gate {
+        Some(gate) => Arc::new(GatedDial::new(inner, gate.clone())),
+        None => inner,
+    }
+}
+
+impl GatedDial {
+    pub fn new(inner: Arc<dyn CrazeDial>, gate: SpawnGate) -> GatedDial {
+        GatedDial {
+            inner,
+            gate,
+            #[cfg(test)]
+            pause: std::sync::Mutex::new(None),
+        }
+    }
+
+    /// Arm the next dial's pause between the check and the spawn (a test).
+    #[cfg(test)]
+    pub(crate) fn pause_next(&self, gap: crate::roost_hosts::TestGap) {
+        *self.pause.lock().unwrap() = Some(gap);
+    }
+}
+
+impl CrazeDial for GatedDial {
+    fn dial(&self) -> BoxFut<Result<CrazeStream, DialError>> {
+        let inner = Arc::clone(&self.inner);
+        let gate = self.gate.clone();
+        #[cfg(test)]
+        let pause = self.pause.lock().unwrap().take();
+        Box::pin(async move {
+            let section = gate.enter().map_err(|_| shutting_down_dial())?;
+            #[cfg(test)]
+            if let Some((reached, proceed)) = pause {
+                reached.notify_one();
+                proceed.notified().await;
+            }
+            let stream = inner.dial().await?;
+            register_stream(&gate, &section, stream)
+                .await
+                .map_err(|_| shutting_down_dial())
+        })
+    }
+}
+
+/// Register `stream`'s child — its [`ExitWatch`], the kill-and-await handle —
+/// with `gate`, inside the spawn's `section`. **On a gate that has closed, the
+/// child is killed and awaited here and the dial answers `shutting_down`**
+/// (plan 026 §3.3, F1): a section admitted before the close whose spawn came
+/// after it leaves nothing behind.
+///
+/// The registry keeps the entry until the child's exit has been SEEN, so the
+/// drain awaits even a bridge whose connection was let go a moment before it
+/// (that drop's kill is otherwise a detached task racing the process's exit).
+/// Its clone of the watch would then keep the child alive past its holder —
+/// the watch kills only once its LAST clone is gone — so the stream's write
+/// half kills it explicitly when it drops ([`RegisteredWrite`]): what letting
+/// the connection go always did.
+pub async fn register_stream(
+    gate: &SpawnGate,
+    section: &SpawnSection,
+    stream: CrazeStream,
+) -> Result<CrazeStream, shed_app::spawn_gate::ShuttingDown> {
+    let (reader, writer, tail, exit) = stream.into_parts();
+    let Some(exit) = exit else {
+        return Ok(CrazeStream::from_parts(reader, writer, tail, None));
+    };
+    gate.register_exit(section, Arc::new(ExitKill(exit.clone())))
+        .await?;
+    Ok(CrazeStream::from_parts(
+        reader,
+        Box::new(RegisteredWrite {
+            inner: writer,
+            exit: exit.clone(),
+        }),
+        tail,
+        Some(exit),
+    ))
+}
+
+/// A craze child's [`ExitWatch`] as the gate's drain uses it: kill, then wait
+/// (bounded) for its exit to be published.
+struct ExitKill(ExitWatch);
+
+impl ChildExit for ExitKill {
+    fn kill(&self) {
+        self.0.kill();
+    }
+
+    fn exited(&self, within: Duration) -> BoxFut<bool> {
+        let exit = self.0.clone();
+        Box::pin(async move { exit.wait(within).await.is_some() })
+    }
+
+    fn done(&self) -> bool {
+        self.0.now().is_some()
+    }
+
+    fn pid(&self) -> Option<u32> {
+        self.0.pid()
+    }
+}
+
+/// A registered stream's write half: the connection's end is its child's kill
+/// ([`register_stream`]).
+struct RegisteredWrite {
+    inner: shed_craze::dial::BoxWrite,
+    exit: ExitWatch,
+}
+
+impl Drop for RegisteredWrite {
+    fn drop(&mut self) {
+        self.exit.kill();
+    }
+}
+
+impl tokio::io::AsyncWrite for RegisteredWrite {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        Pin::new(&mut self.inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(cx)
     }
 }
 
@@ -562,6 +764,33 @@ impl CrazeState {
         }
     }
 
+    /// Where the source stands as a status reader can tell it: its phase and,
+    /// while offline, the CAUSE — never the reason's words. An UNLISTED host's
+    /// repaint is decided on a change of this (plan 026 §3.2), so a repeated
+    /// probe that says the same thing in other words repaints nothing.
+    pub fn standing(&self) -> (Option<CrazePhase>, Option<SourceOffline>) {
+        (
+            self.phase,
+            self.offline.as_ref().map(|(cause, _)| cause.clone()),
+        )
+    }
+
+    /// Whether the find-only probe has PROVED craze on this host with no hub
+    /// roster to list (plan 026 §3.2): **dormant** (craze is there and no hub
+    /// runs — somewhere to create a session, the sheet starting its hub), or
+    /// offline **too old** (craze is there, and the note says to update it).
+    /// What makes an UNLISTED host an `rc.list` `shed_craze` entry; not
+    /// installed, unreachable, any other offline, never probed and no craze
+    /// source at all are not.
+    pub fn proven_unattached(&self) -> bool {
+        match (self.gen, self.phase, &self.offline) {
+            (0, ..) => false,
+            (_, Some(CrazePhase::Dormant), _) => true,
+            (_, Some(CrazePhase::Offline), Some((SourceOffline::TooOld, _))) => true,
+            _ => false,
+        }
+    }
+
     /// The status row's `craze` half (plan 025 §3.6.2): `state` is `live`,
     /// `dormant`, `offline` or `absent` (never reached — and not installed,
     /// which renders as absent); `cause` names an offline (or not-installed)
@@ -604,8 +833,11 @@ impl CrazeState {
 /// plus the ones only a create sheet needs:
 ///
 /// * `outcome_unknown` — a create whose answer was lost, twice
-///   ([`shed_craze::is_outcome_unknown`]): the ONE refusal after which the
-///   sheet keeps its request id (plan 025 §3.8);
+///   ([`shed_craze::is_outcome_unknown`]), or a HELD create (a replay of a
+///   kept id, plan 026 §3.1) that got no answer about its request — not even
+///   this layer's own preflight (an unregistered host, craze offline or too
+///   old): the ONE refusal after which the sheet keeps its request id (plan
+///   025 §3.8);
 /// * `too_old` — this machine's craze cannot list providers or create
 ///   (`createOptions`/`sessionCreate` missing from its hub's `hello`, or a
 ///   v0.0.1): the sheet says "update craze on this machine";
@@ -697,6 +929,21 @@ pub fn create_request(
         prompt: prompt.filter(|s| !s.trim().is_empty()).map(str::to_string),
         request_id,
     })
+}
+
+/// Whether a `craze.create` REPLAYS a held request id (plan 026 §3.1) — what
+/// `held` means at both doors. The sheet sets it exactly when it re-sends the
+/// id it kept from an unknown outcome; the create then ends that id only on
+/// craze's own answer about it ([`shed_core::lane::AgentSource::create_held`]).
+/// A held create without a `request_id` is `bad_request`: there is nothing to
+/// replay, and minting one in its place would make the "replay" a new request.
+pub fn held_create(held: bool, request_id: Option<&str>) -> Result<bool, CrazeFailure> {
+    if held && request_id.is_none() {
+        return Err(CrazeFailure::bad_request(
+            "a held create replays the request id it was held under: send `request_id` with `held`",
+        ));
+    }
+    Ok(held)
 }
 
 // ---------------------------------------------------------------------------
@@ -1134,6 +1381,15 @@ mod tests {
         }
     }
 
+    /// `held` replays an id, so it needs one; absent, a create is fresh.
+    #[test]
+    fn a_held_create_needs_the_request_id_it_replays() {
+        assert_eq!(held_create(true, Some("shed-held")), Ok(true));
+        assert_eq!(held_create(false, Some("shed-held")), Ok(false));
+        assert_eq!(held_create(false, None), Ok(false));
+        assert_eq!(held_create(true, None).unwrap_err().code, "bad_request");
+    }
+
     /// The create ops' failures: the lane contract's codes, and a lost
     /// create's own `outcome_unknown` — the one the sheet keeps its id on.
     #[test]
@@ -1153,6 +1409,37 @@ mod tests {
             CrazeFailure::lane(LaneError::Unavailable("busy".into())).code,
             "unavailable"
         );
+    }
+
+    /// **Which states make an unlisted host a `shed_craze` entry** (plan 026
+    /// §3.2): dormant and too old — the probe proved craze there — and nothing
+    /// else; and the standing a repaint is decided on ignores the reason's
+    /// words.
+    #[test]
+    fn the_states_an_unlisted_host_is_offered_on() {
+        assert!(
+            !CrazeState::default().proven_unattached(),
+            "no craze source"
+        );
+        let mut s = CrazeState::new(4);
+        assert!(!s.proven_unattached(), "never probed");
+        s.dormant();
+        assert!(s.proven_unattached(), "dormant");
+        s.offline(SourceOffline::TooOld, "unknown flag: --hub".into());
+        assert!(s.proven_unattached(), "too old");
+        let too_old = s.standing();
+        s.offline(SourceOffline::TooOld, "said otherwise".into());
+        assert_eq!(s.standing(), too_old, "the words are not the standing");
+        for cause in [
+            SourceOffline::NotInstalled,
+            SourceOffline::Unreachable,
+            SourceOffline::Failed,
+        ] {
+            s.offline(cause.clone(), "x".into());
+            assert!(!s.proven_unattached(), "{cause:?}");
+        }
+        seed(&mut s, 1, &[]);
+        assert!(!s.proven_unattached(), "live: a roster lists it");
     }
 
     #[test]

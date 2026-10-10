@@ -153,7 +153,7 @@ Extension artifacts ship from the shed release pipeline, split by where they run
 
 | Component | Channel | How it is built |
 |-----------|---------|-----------------|
-| `shed-host-agent` (darwin + linux) | GitHub Release (GoReleaser) + Homebrew tap (brew-only) | Built from `crates/shed-host-agent` on the macOS release runner. Hosted the machine RC hub until it was retired in plan 022 (S6, [`charliek/shed#328`](https://github.com/charliek/shed/issues/328)); the retired `shed-machine-rc`'s brew/apt artifacts stay frozen at their last release |
+| `shed-host-agent` (darwin + linux) | GitHub Release (GoReleaser) + Homebrew tap (brew-only) | Built from `crates/shed-host-agent` on the macOS release runner. Credential brokering only (the machine RC hub it briefly carried was removed before release); the retired `shed-machine-rc`'s brew/apt artifacts stay frozen at their last release, v0.8.2 |
 | Guest binaries + systemd units + env config | Baked into the `extensions` / `full` rootfs images | Cross-compiled from `cmd/` and staged into the image build context by `scripts/stage-guest-binaries.sh`, alongside the `guest/extensions/etc/` overlay |
 
 The guest binaries (`shed-ext-ssh-agent`, `shed-ext-aws-credentials`,

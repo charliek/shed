@@ -521,6 +521,10 @@ def test_roost_session_baked(shed_server, test_shed_name):
     want_version = os.environ.get("SHED_ROOST_SESSION_VERSION", "0.0.21")
     want_protocol = os.environ.get("SHED_ROOST_SESSION_PROTOCOL", "6")
 
+    # A LISTED backend promised its dev store carries the bake, so a missing
+    # `extensions` image is a failure, not a skip (shed#398) -- the same
+    # verdict `test_craze_baked` reaches below.
+    image_present = True
     try:
         shed_server.create(test_shed_name, image="extensions")
     except AssertionError as e:
@@ -528,12 +532,21 @@ def test_roost_session_baked(shed_server, test_shed_name):
         if "extensions" in msg and (
             "no image tag" in msg or "not found" in msg or "unknown image" in msg
         ):
-            pytest.skip(
-                "server has no `extensions` image tag configured; this "
-                "gate only applies where the extensions variant is "
-                "installed."
-            )
-        raise
+            image_present = False
+        else:
+            raise
+
+    verdict = _baked_image_verdict(backend_key, _roost_baked_backends(), image_present)
+    if verdict == "fail":
+        pytest.fail(
+            f"SHED_IMAGE_HAS_ROOST lists {backend_key!r} but its dev store "
+            "has no `extensions` image; build it per "
+            "docs/development/testing.md (SHED_SOURCE_REF = the dev "
+            "config's alias) before running test-integration-dev"
+            f"{'-fc' if backend_key == 'fc' else ''}, or unset "
+            "SHED_IMAGE_HAS_ROOST to skip this check."
+        )
+    assert verdict == "run", f"unexpected _baked_image_verdict result: {verdict!r}"
 
     r = shed_server.exec(
         test_shed_name, ["test", "-f", "/usr/bin/roost-session", "-a", "-x", "/usr/bin/roost-session"]
@@ -661,8 +674,8 @@ def _baked_image_verdict(
 def test_craze_baked(shed_server, test_shed_name):
     """`/usr/bin/craze` is baked into the `extensions` image (plan 025
     §3.9), the same way as `roost-session` above: a standalone release
-    asset, checksum-verified at build time, with no systemd unit —
-    `shed attach` starts a lane's hub itself.
+    asset, checksum-verified at build time, with no systemd unit — the
+    desktop's create sheet starts a remote hub; nothing in the CLI runs craze.
 
     Gated behind `SHED_IMAGE_HAS_CRAZE=<backends>`: the published images
     carry no craze until the 0.9.0 tag, so this stays skipped everywhere

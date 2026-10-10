@@ -1,13 +1,14 @@
 # shed-desktop
 
 A native desktop application that ties the [shed](https://github.com/charliek/shed)
-toolchain into one resident control surface: list and create sheds across hosts, launch
-Claude remote-control agents, approve credential requests from the shed host agent, and
-watch a live activity feed. A **Tauri** cross-platform client on the shared Rust core is the
+toolchain into one resident control surface: list and create sheds across hosts, see and
+open the agent sessions running in them (roost rows, with craze and opencode lanes), approve
+credential requests from the shed host agent, and watch a live activity feed. A **Tauri** cross-platform client on the shared Rust core is the
 shipped client on both **macOS** (DMG + Sparkle auto-update) and **Linux**
 (`apt install shed-desktop`).
 
-It is a coordinator — it runs no sheds and holds no credentials. It observes and drives
+It is a coordinator — it runs no sheds. With an external host agent it holds no credentials;
+in its default embedded-broker mode (Tauri) the credential broker runs inside the app. It observes and drives
 components that already exist on the developer's Mac and on shed hosts (see
 [Architecture](architecture.md) for the full picture):
 
@@ -15,17 +16,19 @@ components that already exist on the developer's Mac and on shed hosts (see
   `~/.shed/config.yaml`; live create-progress over SSE.
 - **credentials / approvals** — a Unix-domain-socket channel to `shed-host-agent`
   (the headline feature; see [Credential approvals](approvals.md)).
-- **terminals + remote control** — SSH into a shed and drive `tmux`, launching the user's
-  terminal app for interactive attach.
+- **agents + terminals** — each host's [roost](../extensions/roost-session-hosts.md)
+  sessions are rows in the Agents pane, with live [craze and opencode
+  lanes](agent-lanes.md); the user's terminal app is launched for interactive attach.
 
-The macOS app and the Linux Tauri app are two thin shells over one shared **Rust core**
+The Tauri app on macOS and on Linux is one thin shell over a shared **Rust core**
 (`shed-core` + `shed-app`); see [Rust core](rust-core.md).
 
 ## Status
 
-Shipping. The dashboard, lifecycle/create, RC agent launcher, the credential-approval gate,
-the System (disk) pane, and Sparkle auto-update are all implemented on macOS, with the Tauri
-Linux client at full feature parity (the Egress pane included). Since the [monorepo
+Shipping. The dashboard, lifecycle/create, the Agents pane (roost rows and craze/opencode
+lanes), the credential-approval gate, the System (disk) pane, and Sparkle auto-update are all
+implemented in the Tauri client on macOS, with the Linux client at full feature parity (the
+Egress pane included). Since the [monorepo
 consolidation](https://github.com/charliek/shed) the app moved onto shed's shared `vX.Y.Z`
 release line — a `git tag` cuts the macOS DMG and the Linux `.deb` together when the desktop
 component ships.
@@ -34,8 +37,8 @@ component ships.
 |---|---|---|
 | Dashboard + IPC spine | Read-only dashboard across hosts; the drivability socket + screenshots | ✅ |
 | Lifecycle + create | start/stop/reset/delete, create with live SSE progress, terminal launch | ✅ |
-| Agents | Remote-control launcher (RC classifier), Agents pane | ✅ |
-| Machines | Native SSH hosts running the RC hub, listed and controlled beside sheds (Tauri) | ✅ |
+| Agents | Agents pane: roost session rows, craze and opencode lanes, New craze session | ✅ |
+| Machines | Native SSH hosts running `roost-session`, listed beside sheds (Tauri) | ✅ |
 | Approval gate | Multi-server SSH approval over UDS, policy engine, notifications, merged audit feed | ✅ |
 | System | Per-host disk usage (`/api/system/df`) | ✅ |
 | Packaging | Launch-at-login, preferences, DMG + Sparkle EdDSA auto-update (mac); nfpm `.deb` (Linux) | ✅ |
@@ -47,13 +50,15 @@ component ships.
 - **Drivable + testable.** The app exposes a JSON IPC control socket and an in-process
   screenshot op, so every change is verified by a no-sleep functional harness — not by a
   human clicking. See [Test automation](test-automation.md).
-- **Fail-closed security.** The app never holds secrets; a missing or unresponsive app
-  results in credential denial, matching the host agent's unanswered-prompt behavior.
+- **Fail-closed security.** Credential approval fails closed: a missing or unresponsive
+  app results in denial, matching the host agent's unanswered-prompt behavior. With an
+  external host agent the app holds no secrets; Tauri's default embedded broker holds them
+  in-process (see [Architecture](architecture.md#the-embedded-credential-broker-tauri)).
 
 ## Roadmap & directions
 
 Directions we may take, not a schedule. Today's app is a complete control surface on both
-platforms — dashboard + lifecycle, the remote-control launcher, the SSH-credential approval
+platforms — dashboard + lifecycle, the Agents pane, the SSH-credential approval
 gate, the System (disk) pane, plus notarized Sparkle auto-update on macOS and an
 `apt`-installable `.deb` on Linux.
 
@@ -83,7 +88,7 @@ core](rust-core.md).
 
 **Broader control surface.** The shed-server HTTP API exposes more than the app surfaces
 today. Natural additions, each independently useful: a **global sessions** view
-(`/api/sessions` + the RC list, merged), **snapshot** management (`/api/snapshots`), **image**
+(`/api/sessions`, merged across hosts), **snapshot** management (`/api/snapshots`), **image**
 management (`/api/images`), **system prune** (`/api/system/prune`), and a **port-forwarding**
 UI on top of `/api/sheds/{name}/connect/{port}`.
 

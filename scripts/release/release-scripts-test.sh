@@ -4,6 +4,9 @@
 #   scripts/release/update-version.sh        (component-selecting version bumper)
 #   scripts/release/release-plan.sh          (tag → per-component ship selector)
 #   scripts/release/recommend-components.sh  (next-tag component recommender)
+#   scripts/release/desktop-signing-gate.sh  (a stable desktop tag fails closed
+#                                             without the six Apple secrets)
+#   scripts/release/changelog-section.sh     (the curated release body)
 #
 # Runs every synthetic combination the release model depends on — per-component
 # (server / host-agent / desktop) and combined plans / neither→exit 1 /
@@ -40,6 +43,18 @@
 # git (the recommender fixture). The recommender's `gh` probe is forced off in
 # the fixture (RECOMMEND_NO_GH=1) — synthetic tags have no GitHub releases.
 #
+# Phase 5 (plan 026 §3.11) runs desktop-signing-gate.sh and
+# changelog-section.sh as deployed, and parses publish-images.yaml to assert the
+# workflow really calls the gate: in the `release-plan` job right after
+# release-plan.sh, conditioned on ship_desktop, and in desktop-macos right
+# after its checkout, each with the six `--has NAME=${{ secrets.NAME != '' }}`
+# flags CAN_NOTARIZE reads, as a top-level command no exit or open block can
+# skip. It then EXECUTES both steps' run scripts (secrets rendered true/false)
+# in scratch checkouts with and without the gate, which pins the missing-script
+# fallback to a dispatch of a pre-0.9.0 tag. The parse uses python3 with PyYAML when it imports,
+# else `yq -o=json` (mikefarah v4; the ubuntu runners carry it);
+# RELEASE_SELFTEST_YAML_LOADER=pyyaml|yq forces one, to exercise the other path.
+#
 # Wired into CI as a step of ci.yml's `plugin` job (gated go||ci; the `ci`
 # path filter includes scripts/release/**, so editing these scripts always
 # runs this test).
@@ -55,6 +70,7 @@ fi
 command -v cargo >/dev/null 2>&1 || { echo "error: cargo not found — the desktop bump regenerates Cargo locks" >&2; exit 1; }
 command -v jq >/dev/null 2>&1 || { echo "error: jq not found" >&2; exit 1; }
 command -v git >/dev/null 2>&1 || { echo "error: git not found — the recommender fixture builds a temp repo" >&2; exit 1; }
+command -v python3 >/dev/null 2>&1 || { echo "error: python3 not found — the signing-gate wiring guard parses publish-images.yaml" >&2; exit 1; }
 
 SCRATCH="$(mktemp -d -t shed-release-scripts-test.XXXXXX)"
 trap 'rm -rf "${SCRATCH}"' EXIT
@@ -72,6 +88,9 @@ tar -C "${REPO_ROOT}" -cf - \
   scripts/release/recommend-components.sh \
   scripts/release/check-craze-pin.sh \
   scripts/release/read-craze-pin.sh \
+  scripts/release/desktop-signing-gate.sh \
+  scripts/release/changelog-section.sh \
+  .github/workflows/publish-images.yaml \
   craze-pin.env \
   .claude-plugin/plugin.json \
   desktop/VERSION \
@@ -1190,6 +1209,756 @@ calls_after="$(calls_count)"
 [ "${PLAN_OUT}" = "$(expect_plan false true false true)" ] || fail "host-agent-only scope-case plan stdout: ${PLAN_OUT}"
 [ "${calls_before}" -eq "${calls_after}" ] || fail "host-agent-only tag invoked the craze ls-remote fake (the checker ran when SHIP_SERVER=false) — calls before=${calls_before} after=${calls_after}"
 ok "a host-agent-only stable tag plans cleanly and never touches the craze checker (call log unchanged)"
+
+step "check-craze-pin.sh: a not-found tag hints 'craze's version, not the shed tag' ONLY when the argument is the shed manifest version"
+# The seam emits NO rows (/bin/true), so the tag is "not found" whatever the
+# argument is. The hint must name the mistake (passing the shed tag), and must
+# not appear for an ordinary craze version that is merely absent.
+CCP="${SCRATCH}/scripts/release/check-craze-pin.sh"
+SHED_MANIFEST_V="$(jq -r '.version' "${SCRATCH}/.claude-plugin/plugin.json")"
+[[ "${SHED_MANIFEST_V}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || fail "scratch shed manifest version '${SHED_MANIFEST_V}' is not X.Y.Z"
+CCP_HINT="this takes craze's version from craze-pin.env, not the shed tag"
+ccp_shed_rc=0
+ccp_shed_out="$(CRAZE_PIN_LS_REMOTE=/bin/true "${CCP}" --release "v${SHED_MANIFEST_V}" 2>&1)" || ccp_shed_rc=$?
+[ "${ccp_shed_rc}" -eq 1 ] || fail "craze-hint (shed version) exited ${ccp_shed_rc} (want 1): ${ccp_shed_out}"
+echo "${ccp_shed_out}" | grep -qF "not found on charliek/craze" || fail "craze-hint (shed version): the not-found error is missing: ${ccp_shed_out}"
+echo "${ccp_shed_out}" | grep -qF "${CCP_HINT}" || fail "craze-hint (shed version): the hint is missing: ${ccp_shed_out}"
+ccp_other_rc=0
+ccp_other_out="$(CRAZE_PIN_LS_REMOTE=/bin/true "${CCP}" --release "v9.9.9" 2>&1)" || ccp_other_rc=$?
+[ "${ccp_other_rc}" -eq 1 ] || fail "craze-hint (other version) exited ${ccp_other_rc} (want 1): ${ccp_other_out}"
+echo "${ccp_other_out}" | grep -qF "not found on charliek/craze" || fail "craze-hint (other version): the not-found error is missing: ${ccp_other_out}"
+echo "${ccp_other_out}" | grep -qF "${CCP_HINT}" && fail "craze-hint (other version): the hint appeared for a version that is not the shed manifest's: ${ccp_other_out}"
+ok "the hint appears for the shed manifest version (${SHED_MANIFEST_V}) and not for an unrelated craze version"
+
+# ===========================================================================
+# Phase 5 (plan 026 §3.11): the desktop signing gate and the curated release
+# body. desktop-signing-gate.sh and changelog-section.sh run as deployed (the
+# scratch copies of the production scripts); the wiring guard parses the
+# scratch copy of the REAL publish-images.yaml. Nothing here depends on the
+# manifest state the phases above leave; the changelog cells write their own
+# scratch CHANGELOG.md.
+# ===========================================================================
+
+GATE="${SCRATCH}/scripts/release/desktop-signing-gate.sh"
+# The six presence flags, in the order the gate names them (CAN_NOTARIZE's).
+GATE_SECRETS="MACOS_CERTIFICATE_P12_BASE64 MACOS_CERTIFICATE_PASSWORD SHED_DESKTOP_DEVELOPER_ID_IDENTITY APPLE_ID APPLE_TEAM_ID APPLE_APP_SPECIFIC_PASSWORD"
+GATE_REFUSAL="::error::a stable desktop tag requires Developer ID signing and notarization; missing:"
+
+# gate_flags "<names to mark false>" → GATE_FLAGS, all six `--has NAME=…` pairs.
+GATE_FLAGS=()
+gate_flags() {
+  GATE_FLAGS=()
+  local n m v
+  for n in ${GATE_SECRETS}; do
+    v=true
+    for m in $1; do
+      if [ "${m}" = "${n}" ]; then v=false; fi
+    done
+    GATE_FLAGS+=(--has "${n}=${v}")
+  done
+}
+# run_gate <args...> → GATE_OUT (stdout+stderr), GATE_RC.
+GATE_OUT=""; GATE_RC=0
+run_gate() {
+  GATE_RC=0
+  GATE_OUT="$("${GATE}" "$@" 2>&1)" || GATE_RC=$?
+}
+# "A, B, C" from "A B C".
+comma_list() { printf '%s' "$1" | sed -E 's/ +/, /g'; }
+
+for n in ${GATE_SECRETS}; do
+  step "desktop-signing-gate.sh: a stable tag missing only ${n} exits 1, naming exactly it"
+  gate_flags "${n}"
+  run_gate v9.1.0 "${GATE_FLAGS[@]}"
+  [ "${GATE_RC}" -eq 1 ] || fail "stable tag missing ${n} exited ${GATE_RC} (want 1): ${GATE_OUT}"
+  printf '%s\n' "${GATE_OUT}" | grep -qxF "${GATE_REFUSAL} ${n}" \
+    || fail "stable tag missing ${n}: the refusal does not name exactly ${n}: ${GATE_OUT}"
+  ok "missing ${n} → exit 1, \"missing: ${n}\" and nothing else"
+done
+
+step "desktop-signing-gate.sh: a stable tag with all six present exits 0"
+gate_flags ""
+run_gate v9.1.0 "${GATE_FLAGS[@]}"
+[ "${GATE_RC}" -eq 0 ] || fail "stable tag with all six exited ${GATE_RC} (want 0): ${GATE_OUT}"
+echo "${GATE_OUT}" | grep -q "is stable and all six Apple secrets are present" || fail "all-present pass line missing: ${GATE_OUT}"
+echo "${GATE_OUT}" | grep -q "missing:" && fail "all-present run still reports something missing: ${GATE_OUT}"
+ok "all six present → exit 0"
+
+step "desktop-signing-gate.sh: a stable tag missing all six exits 1, naming all six"
+gate_flags "${GATE_SECRETS}"
+run_gate v9.1.0 "${GATE_FLAGS[@]}"
+[ "${GATE_RC}" -eq 1 ] || fail "stable tag missing all six exited ${GATE_RC} (want 1): ${GATE_OUT}"
+printf '%s\n' "${GATE_OUT}" | grep -qxF "${GATE_REFUSAL} $(comma_list "${GATE_SECRETS}")" \
+  || fail "the all-missing refusal does not name all six in order: ${GATE_OUT}"
+ok "all six missing → exit 1, all six named"
+
+step "desktop-signing-gate.sh: a prerelease missing all six exits 0 with the ad-hoc note"
+gate_flags "${GATE_SECRETS}"
+run_gate v9.1.0-rc.1 "${GATE_FLAGS[@]}"
+[ "${GATE_RC}" -eq 0 ] || fail "prerelease missing all six exited ${GATE_RC} (want 0): ${GATE_OUT}"
+echo "${GATE_OUT}" | grep -qF "is a prerelease, so an ad-hoc-signed, un-notarized Mac build is allowed (missing: $(comma_list "${GATE_SECRETS}"))" \
+  || fail "prerelease ad-hoc note missing or incomplete: ${GATE_OUT}"
+echo "${GATE_OUT}" | grep -qF "::error::" && fail "a prerelease printed an error annotation: ${GATE_OUT}"
+ok "prerelease (v9.1.0-rc.1), all six missing → exit 0 with the ad-hoc note"
+
+step "desktop-signing-gate.sh: malformed flags and tags exit 2"
+# Each case: a label, then the whole argv (the tag first, where there is one),
+# built from the six valid flags with one change.
+gate_flags ""
+malformed_case() {
+  # $1 label, rest = full argv
+  local label="$1"; shift
+  run_gate "$@"
+  [ "${GATE_RC}" -eq 2 ] || fail "malformed (${label}) exited ${GATE_RC} (want 2): ${GATE_OUT}"
+  ok "malformed: ${label} → exit 2"
+}
+malformed_case "a value that is not true|false" v9.1.0 "${GATE_FLAGS[@]:0:10}" --has APPLE_APP_SPECIFIC_PASSWORD=yes
+malformed_case "a flag with no =" v9.1.0 "${GATE_FLAGS[@]:0:10}" --has APPLE_APP_SPECIFIC_PASSWORD
+malformed_case "an unknown secret name" v9.1.0 "${GATE_FLAGS[@]}" --has SPARKLE_ED_PRIVATE_KEY=true
+malformed_case "a name given twice" v9.1.0 "${GATE_FLAGS[@]}" --has APPLE_ID=true
+malformed_case "a dangling --has" v9.1.0 "${GATE_FLAGS[@]}" --has
+malformed_case "a bare argument" v9.1.0 "${GATE_FLAGS[@]}" APPLE_ID=true
+malformed_case "a tag that is not vX.Y.Z" 9.1 "${GATE_FLAGS[@]}"
+malformed_case "no arguments at all"
+run_gate v9.1.0 "${GATE_FLAGS[@]:0:10}"
+[ "${GATE_RC}" -eq 2 ] || fail "malformed (only five flags) exited ${GATE_RC} (want 2): ${GATE_OUT}"
+echo "${GATE_OUT}" | grep -q "no --has flag for: APPLE_APP_SPECIFIC_PASSWORD" || fail "five-flag refusal doesn't name the absent flag: ${GATE_OUT}"
+ok "malformed: only five of the six flags → exit 2, naming the absent one"
+
+step "desktop-signing-gate.sh: a secret-shaped value is never echoed, wherever it is wired"
+# A distinctive sentinel stands in for a secret value wired in by mistake
+# (e.g. `--has APPLE_ID=${{ secrets.APPLE_ID }}`). Built at runtime.
+SENTINEL="sentinel-$(printf 'q%.0s' $(seq 1 12))-$$"
+sentinel_case() {
+  # $1 label, $2 expected rc, rest = argv
+  local label="$1" want="$2"; shift 2
+  run_gate "$@"
+  [ "${GATE_RC}" -eq "${want}" ] || fail "sentinel (${label}) exited ${GATE_RC} (want ${want}): ${GATE_OUT}"
+  case "${GATE_OUT}" in
+    *"${SENTINEL}"*) fail "sentinel (${label}): the output echoed the value: ${GATE_OUT}" ;;
+  esac
+  ok "sentinel ${label}: exit ${want}, value never echoed"
+}
+sentinel_case "as a flag value" 2 v9.1.0 "${GATE_FLAGS[@]:0:6}" --has "APPLE_ID=${SENTINEL}" "${GATE_FLAGS[@]:8:4}"
+sentinel_case "as a flag name" 2 v9.1.0 "${GATE_FLAGS[@]}" --has "${SENTINEL}=true"
+sentinel_case "as a bare argument" 2 v9.1.0 "${GATE_FLAGS[@]}" "${SENTINEL}"
+sentinel_case "as the tag" 2 "${SENTINEL}" "${GATE_FLAGS[@]}"
+# The gate reads no environment: the six names exported with the sentinel
+# change nothing (all six flags false → the normal refusal, no echo).
+gate_flags "${GATE_SECRETS}"
+GATE_RC=0
+GATE_OUT="$(MACOS_CERTIFICATE_P12_BASE64="${SENTINEL}" MACOS_CERTIFICATE_PASSWORD="${SENTINEL}" \
+  SHED_DESKTOP_DEVELOPER_ID_IDENTITY="${SENTINEL}" APPLE_ID="${SENTINEL}" APPLE_TEAM_ID="${SENTINEL}" \
+  APPLE_APP_SPECIFIC_PASSWORD="${SENTINEL}" "${GATE}" v9.1.0 "${GATE_FLAGS[@]}" 2>&1)" || GATE_RC=$?
+[ "${GATE_RC}" -eq 1 ] || fail "sentinel (in the environment) exited ${GATE_RC} (want 1): ${GATE_OUT}"
+case "${GATE_OUT}" in *"${SENTINEL}"*) fail "sentinel (in the environment): echoed: ${GATE_OUT}" ;; esac
+ok "sentinel in the six env vars: ignored (exit 1 from the flags alone), never echoed"
+
+# ---------------------------------------------------------------------------
+# The wiring guard: publish-images.yaml must CALL the gate (testing a copied
+# snippet would not prove that). One python3 helper, written to its own dir:
+#   check <workflow> <gate-script>  → exit 0, or 1 listing every violation
+#   mutate <in> <out> <mutation>    → a structurally mutated copy (as JSON,
+#                                     which both loaders read) for the
+#                                     negative cells below
+# ---------------------------------------------------------------------------
+WIRING_DIR="${SCRATCH}/wiring"
+mkdir -p "${WIRING_DIR}"
+WIRING="${WIRING_DIR}/wiring.py"
+cat > "${WIRING}" <<'PY'
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+
+GATE = "scripts/release/desktop-signing-gate.sh"
+TAG_EXPR = "github.event.inputs.version || github.ref_name"
+RP_IF = "steps.plan.outputs.ship_desktop == 'true'"
+# One `--has NAME=${{ secrets.NAME != '' }}` flag: FLAG captures both names,
+# FLAG_NC is the same pattern without groups, for the whole-line match.
+FLAG = r"--has ([A-Z0-9_]+)=\$\{\{ secrets\.([A-Z0-9_]+) != '' \}\}"
+FLAG_NC = r"--has [A-Z0-9_]+=\$\{\{ secrets\.[A-Z0-9_]+ != '' \}\}"
+LINE_RE = re.compile(re.escape(GATE) + r' "\$\{TAG\}"((?: ' + FLAG_NC + r")+)")
+
+
+def load(path):
+    want = os.environ.get("RELEASE_SELFTEST_YAML_LOADER", "auto")
+    if want not in ("auto", "pyyaml", "yq"):
+        sys.exit("wiring: RELEASE_SELFTEST_YAML_LOADER must be auto, pyyaml or yq, not %r" % want)
+    if want in ("auto", "pyyaml"):
+        try:
+            import yaml
+        except ImportError:
+            if want == "pyyaml":
+                sys.exit("wiring: RELEASE_SELFTEST_YAML_LOADER=pyyaml, but PyYAML does not import")
+        else:
+            with open(path) as f:
+                return yaml.safe_load(f), "PyYAML"
+    yq = shutil.which("yq")
+    if not yq:
+        sys.exit("wiring: parsing the workflow needs python3 with PyYAML, or yq (mikefarah v4)")
+    out = subprocess.run([yq, "-o=json", ".", path], check=True, capture_output=True, text=True).stdout
+    return json.loads(out), "yq"
+
+
+def expr(value):
+    """An `if:`/env value with any ${{ }} wrapper removed and whitespace collapsed."""
+    e = " ".join(str(value).split())
+    m = re.fullmatch(r"\$\{\{ ?(.*?) ?\}\}", e)
+    return m.group(1) if m else e
+
+
+def gate_lines(step):
+    """Lines of the step's run that execute the gate, continuations joined."""
+    run = re.sub(r"[ \t]*\\\n[ \t]*", " ", step.get("run") or "")
+    return [l.strip() for l in run.splitlines() if l.strip().startswith(GATE + " ")]
+
+
+def gate_indices(steps):
+    return [i for i, s in enumerate(steps) if gate_lines(s)]
+
+
+OPENERS = ("if", "case", "for", "while", "until", "select", "{", "(")
+CLOSERS = ("fi", "esac", "done", "}", ")")
+# The gate called behind a control operator on the same line (`true || gate`,
+# `false && gate`, `x; gate`, `x | gate`): a call that may never run, or whose
+# status is lost. The `[ ! -f <gate> ]` test and the messages naming the gate
+# never put it right after one of these.
+BEHIND_OPERATOR = re.compile(r"(\|\||&&|;|\|)\s*\"?" + re.escape(GATE) + r"\b")
+SET_PLUS_E = re.compile(r"(?m)^\s*set\s+(?:-\w*\s+)*\+\w*e|^\s*set\s+\+o\s+errexit\b")
+
+
+def unreachable(step):
+    """Why the gate line may not run as a top-level command, or None.
+
+    The rule fits these steps' shape: the invocation line BEGINS with the gate
+    (column 0, no prefix), the previous non-blank line does not end with an
+    operator or a continuation that would make it the tail of another command
+    (`||`, `&&`, `|`, `\\`), every if/case/loop/block opened in column 0 before
+    it is closed again, no column-0 exit/return/exec comes first, and nothing
+    in the step turns errexit off (`set +e`). Indented lines are bodies of such
+    blocks, and continuation lines belong to the line they continue.
+
+    It targets ACCIDENTAL restructuring. Deliberate obfuscation (the gate inside
+    a function that is never called, or inside a here-doc) is out of scope: the
+    execution cells, which run each step's real script, catch any change that
+    stops the gate from running at all.
+    """
+    run = step.get("run") or ""
+    if SET_PLUS_E.search(run):
+        return "the step turns errexit off (`set +e`), so a refusal could be ignored"
+    if BEHIND_OPERATOR.search(run):
+        return "the gate is called behind `||`/`&&`/`;`/`|` on its line, not at the start of a command"
+    depth, cont, prev = 0, False, ""
+    for raw in run.splitlines():
+        line = raw.rstrip()
+        text = line.strip()
+        if text.startswith(GATE + " "):
+            if cont or prev.endswith(("||", "&&", "|", "\\")):
+                return "the line before the gate line ends with %r, so the gate is the tail of another command" % prev.split()[-1]
+            if raw[:1] in (" ", "\t"):
+                return "the gate line is indented (the body of a branch or block), not a top-level command"
+            if depth != 0:
+                return "the gate line sits inside an if/case/loop/block left open in column 0"
+            return None
+        continued, cont = cont, line.endswith("\\")
+        if text and not text.startswith("#"):
+            prev = text
+        if continued or not text or text.startswith("#") or raw[:1] in (" ", "\t"):
+            continue
+        words = re.split(r"[\s;]+", text)
+        if words[0] in ("exit", "return", "exec"):
+            return "a top-level `%s` comes before the gate line" % words[0]
+        depth += sum(w in OPENERS for w in words) - sum(w in CLOSERS for w in words)
+    return "no gate line"
+
+
+# The only steps desktop-macos may run before its checkout, by name: anything
+# else there (a toolchain install, `go install`, a build) would run before the
+# backstop gate. Add a step here only if it builds and uploads nothing.
+PRE_CHECKOUT_ALLOWED = (
+    "Guard — republishing a pre-0.9.0 tag's mac assets is not idempotent",
+)
+
+
+def check_invocation(errors, where, step, job, six):
+    lines = gate_lines(step)
+    if len(lines) != 1:
+        errors.append("%s: %d lines run the gate (want exactly 1)" % (where, len(lines)))
+        return
+    m = LINE_RE.fullmatch(lines[0])
+    if not m:
+        errors.append("%s: the gate line is not exactly %s \"${TAG}\" followed by --has NAME=${{ secrets.NAME != '' }} flags, with nothing after them: %s" % (where, GATE, lines[0]))
+        return
+    pairs = re.findall(FLAG, m.group(1))
+    for name, secret in pairs:
+        if name != secret:
+            errors.append("%s: --has %s is built from secrets.%s" % (where, name, secret))
+    names = [n for n, _ in pairs]
+    if sorted(names) != sorted(six) or len(set(names)) != len(names):
+        errors.append("%s: --has flags %s are not CAN_NOTARIZE's six %s" % (where, names, six))
+    tag = (step.get("env") or {}).get("TAG", (job.get("env") or {}).get("TAG"))
+    if tag is None or expr(tag) != TAG_EXPR:
+        errors.append("%s: TAG is %r, not ${{ %s }}" % (where, tag, TAG_EXPR))
+    if step.get("continue-on-error") not in (None, False):
+        errors.append("%s: continue-on-error would let a refusal pass" % where)
+    why = unreachable(step)
+    if why:
+        errors.append("%s: the gate may never run: %s" % (where, why))
+
+
+def behind_operator(errors, where, steps):
+    """Every step, gate step or not: the invocation line must BEGIN with the gate."""
+    for j, s in enumerate(steps):
+        if BEHIND_OPERATOR.search(s.get("run") or ""):
+            errors.append("%s: step %d calls the gate behind `||`/`&&`/`;`/`|`; the invocation line must BEGIN with the gate" % (where, j))
+
+
+def check(path, gate_script):
+    wf, loader = load(path)
+    errors = []
+    jobs = wf.get("jobs") or {}
+    dm = jobs.get("desktop-macos") or {}
+    six = re.findall(r"secrets\.([A-Z0-9_]+) != ''", str((dm.get("env") or {}).get("CAN_NOTARIZE", "")))
+    if len(six) != 6 or len(set(six)) != 6:
+        errors.append("desktop-macos: CAN_NOTARIZE does not read six distinct secrets: %s" % six)
+    with open(gate_script) as f:
+        m = re.search(r'^NAMES="([^"]*)"', f.read(), re.M)
+    if not m or m.group(1).split() != six:
+        errors.append("%s's NAMES (%s) are not CAN_NOTARIZE's six, in order (%s)" % (GATE, m.group(1).split() if m else None, six))
+
+    rp = jobs.get("release-plan") or {}
+    steps = rp.get("steps") or []
+    plan = [i for i, s in enumerate(steps) if s.get("id") == "plan" and "scripts/release/release-plan.sh" in (s.get("run") or "")]
+    found = gate_indices(steps)
+    behind_operator(errors, "release-plan", steps)
+    if len(plan) != 1:
+        errors.append("release-plan: no single step with id `plan` runs release-plan.sh")
+    if len(found) != 1:
+        errors.append("release-plan: %d steps run the gate (want exactly 1)" % len(found))
+    elif plan:
+        i = found[0]
+        if i != plan[0] + 1:
+            errors.append("release-plan: the gate is step %d, not right after release-plan.sh (step %d)" % (i, plan[0]))
+        if expr(steps[i].get("if", "")) != RP_IF:
+            errors.append("release-plan: the gate step's if is %r, not %r" % (steps[i].get("if"), RP_IF))
+        check_invocation(errors, "release-plan", steps[i], rp, six)
+
+    steps = dm.get("steps") or []
+    checkout = [i for i, s in enumerate(steps) if str(s.get("uses", "")).startswith("actions/checkout@")]
+    found = gate_indices(steps)
+    behind_operator(errors, "desktop-macos", steps)
+    if len(checkout) != 1:
+        errors.append("desktop-macos: %d checkout steps (want exactly 1)" % len(checkout))
+    if len(found) != 1:
+        errors.append("desktop-macos: %d steps run the gate (want exactly 1)" % len(found))
+    elif checkout:
+        i = found[0]
+        if i != checkout[0] + 1:
+            errors.append("desktop-macos: the gate is step %d, not right after the checkout (step %d), before any build" % (i, checkout[0]))
+        if "if" in steps[i]:
+            errors.append("desktop-macos: the gate step has an if (%r); the backstop must always run" % steps[i]["if"])
+        for j, other in enumerate(steps[:checkout[0]]):
+            label = other.get("name") or other.get("id")
+            if label not in PRE_CHECKOUT_ALLOWED:
+                errors.append("desktop-macos: step %d (%s) runs before the checkout and the gate, and is not on PRE_CHECKOUT_ALLOWED" % (j, label or other.get("uses") or "unnamed"))
+        check_invocation(errors, "desktop-macos", steps[i], dm, six)
+
+    for e in errors:
+        print("wiring: " + e)
+    if errors:
+        return 1
+    print("wiring OK (parsed with %s): release-plan runs the gate right after release-plan.sh when ship_desktop, desktop-macos right after its checkout, each with the six flags" % loader)
+    return 0
+
+
+def mutate(src, dst, name):
+    wf, _ = load(src)
+    jobs = wf["jobs"]
+    rp, dm = jobs["release-plan"]["steps"], jobs["desktop-macos"]["steps"]
+
+    def one(steps):
+        found = gate_indices(steps)
+        if len(found) != 1:
+            sys.exit("mutate %s: expected one gate step, found %d" % (name, len(found)))
+        return found[0]
+
+    if name == "none":
+        pass
+    elif name == "rp-delete":
+        del rp[one(rp)]
+    elif name == "rp-before-plan":
+        rp.insert(0, rp.pop(one(rp)))
+    elif name == "rp-unconditioned":
+        rp[one(rp)].pop("if")
+    elif name == "rp-drop-flag":
+        s = rp[one(rp)]
+        new = re.sub(r"[ \t]*\\\n[ \t]*--has APPLE_APP_SPECIFIC_PASSWORD=\$\{\{[^}]*\}\}", "", s["run"])
+        if new == s["run"]:
+            sys.exit("mutate rp-drop-flag: the flag was not found")
+        s["run"] = new
+    elif name == "rp-or-true":
+        s = rp[one(rp)]
+        s["run"] = s["run"].rstrip("\n") + " || true\n"
+    elif name == "dm-delete":
+        del dm[one(dm)]
+    elif name == "dm-after-build":
+        step = dm.pop(one(dm))
+        build = [i for i, s in enumerate(dm) if "tauri-dmg-mac" in (s.get("run") or "")]
+        if len(build) != 1:
+            sys.exit("mutate dm-after-build: no single build step")
+        dm.insert(build[0] + 1, step)
+    elif name == "dm-conditioned":
+        dm[one(dm)]["if"] = "env.CAN_NOTARIZE == 'true'"
+    elif name == "dm-build-before-checkout":
+        rust = [s for s in dm if s.get("name") == "Rust toolchain"]
+        if len(rust) != 1:
+            sys.exit("mutate dm-build-before-checkout: no single Rust toolchain step")
+        dm.insert(0, dict(rust[0]))
+    elif name == "dm-go-install-before-checkout":
+        dm.insert(0, {"name": "Install a tool", "run": "go install example.com/tool@v1.2.3"})
+    elif name in ("rp-unreachable", "rp-after-exit", "rp-in-block", "rp-true-or", "rp-true-or-inline", "rp-set-plus-e"):
+        s = rp[one(rp)]
+        lines = s["run"].split("\n")
+        start = next(k for k, l in enumerate(lines) if l.startswith(GATE + " "))
+        end = start
+        while lines[end].rstrip().endswith("\\"):
+            end += 1
+        block = lines[start:end + 1]
+        if name == "rp-after-exit":
+            lines[start:start] = ["exit 0"]
+        elif name == "rp-true-or":
+            lines[start:start] = ["true ||"]
+        elif name == "rp-true-or-inline":
+            lines[start] = "true || " + lines[start]
+        elif name == "rp-set-plus-e":
+            lines[start:start] = ["set +e"]
+        elif name == "rp-in-block":
+            lines[start:end + 1] = ["if false; then"] + block + ["fi"]
+        else:
+            # Into the missing-script branch, after its `exit 1`: the text,
+            # flags, env and step index all survive, but the gate never runs.
+            del lines[start:end + 1]
+            fi = next(k for k, l in enumerate(lines) if l == "fi")
+            lines[fi:fi] = ["  " + l for l in block]
+        s["run"] = "\n".join(lines)
+    else:
+        sys.exit("mutate: unknown mutation %r" % name)
+    with open(dst, "w") as f:
+        json.dump(wf, f, indent=1, default=str)
+    return 0
+
+
+def extract(src, job, dst, missing):
+    """Write the job's gate step's run script with each ${{ secrets.X != '' }}
+    replaced by false (X listed in `missing`) or true, as GitHub renders it."""
+    wf, _ = load(src)
+    steps = wf["jobs"][job]["steps"]
+    found = gate_indices(steps)
+    if len(found) != 1:
+        sys.exit("extract %s: expected one gate step, found %d" % (job, len(found)))
+    run = re.sub(r"\$\{\{ secrets\.([A-Z0-9_]+) != '' \}\}",
+                 lambda m: "false" if m.group(1) in missing else "true", steps[found[0]]["run"])
+    if "${{" in run:
+        sys.exit("extract %s: an expression is left unrendered in the step" % job)
+    with open(dst, "w") as f:
+        f.write(run)
+    return 0
+
+
+if __name__ == "__main__":
+    if len(sys.argv) == 4 and sys.argv[1] == "check":
+        sys.exit(check(sys.argv[2], sys.argv[3]))
+    if len(sys.argv) == 5 and sys.argv[1] == "mutate":
+        sys.exit(mutate(sys.argv[2], sys.argv[3], sys.argv[4]))
+    if len(sys.argv) >= 5 and sys.argv[1] == "extract":
+        sys.exit(extract(sys.argv[2], sys.argv[3], sys.argv[4], set(sys.argv[5:])))
+    sys.exit("usage: wiring.py check <workflow> <gate-script> | mutate <in> <out> <mutation> | extract <workflow> <job> <out> [missing secret...]")
+PY
+
+WF="${SCRATCH}/.github/workflows/publish-images.yaml"
+WIRING_OUT=""; WIRING_RC=0
+run_wiring() {
+  WIRING_RC=0
+  WIRING_OUT="$(python3 "${WIRING}" check "$1" "${GATE}" 2>&1)" || WIRING_RC=$?
+}
+
+step "publish-images.yaml: release-plan and desktop-macos both call the signing gate, wired as required"
+run_wiring "${WF}"
+[ "${WIRING_RC}" -eq 0 ] || fail "the wiring guard rejects the real workflow (rc=${WIRING_RC}): ${WIRING_OUT}"
+ok "${WIRING_OUT#wiring OK }"
+
+step "the wiring guard: an unmutated JSON round-trip still passes (the mutation cells' baseline)"
+python3 "${WIRING}" mutate "${WF}" "${WIRING_DIR}/none.json" none || fail "mutate none failed"
+run_wiring "${WIRING_DIR}/none.json"
+[ "${WIRING_RC}" -eq 0 ] || fail "the unmutated round-trip is rejected (rc=${WIRING_RC}): ${WIRING_OUT}"
+ok "round-trip baseline passes"
+
+# mutation_case <mutation> <expected substring of the guard's complaint>
+mutation_case() {
+  python3 "${WIRING}" mutate "${WF}" "${WIRING_DIR}/$1.json" "$1" || fail "mutate $1 failed"
+  run_wiring "${WIRING_DIR}/$1.json"
+  [ "${WIRING_RC}" -eq 1 ] || fail "the wiring guard passed a workflow mutated by $1 (rc=${WIRING_RC}): ${WIRING_OUT}"
+  echo "${WIRING_OUT}" | grep -qF "$2" || fail "mutation $1 was refused for the wrong reason (want '$2'): ${WIRING_OUT}"
+  ok "mutation $1 → refused: $2"
+}
+step "the wiring guard: deleting, moving or weakening either invocation turns it red"
+mutation_case rp-delete "release-plan: 0 steps run the gate"
+mutation_case rp-before-plan "release-plan: the gate is step 0, not right after release-plan.sh"
+mutation_case rp-unconditioned "release-plan: the gate step's if is None"
+mutation_case rp-drop-flag "release-plan: --has flags"
+mutation_case rp-or-true "release-plan: the gate line is not exactly"
+mutation_case dm-delete "desktop-macos: 0 steps run the gate"
+mutation_case dm-after-build "desktop-macos: the gate is step"
+mutation_case dm-conditioned "desktop-macos: the gate step has an if"
+mutation_case rp-unreachable "release-plan: the gate may never run: the gate line is indented"
+mutation_case rp-after-exit "release-plan: the gate may never run: a top-level \`exit\` comes before the gate line"
+mutation_case rp-in-block "release-plan: the gate may never run: the gate line sits inside an if/case/loop/block"
+mutation_case rp-true-or "release-plan: the gate may never run: the gate is called behind"
+mutation_case rp-true-or-inline "release-plan: step 2 calls the gate behind"
+mutation_case rp-set-plus-e "release-plan: the gate may never run: the step turns errexit off"
+mutation_case dm-build-before-checkout "desktop-macos: step 0 (Rust toolchain) runs before the checkout and the gate, and is not on PRE_CHECKOUT_ALLOWED"
+mutation_case dm-go-install-before-checkout "desktop-macos: step 0 (Install a tool) runs before the checkout and the gate, and is not on PRE_CHECKOUT_ALLOWED"
+
+# ---------------------------------------------------------------------------
+# The two gate steps, EXECUTED: the workflow's own run scripts, with each
+# ${{ secrets.X != '' }} rendered true/false as GitHub would, run by
+# `bash -e` (the runner's default shell) in a scratch "checkout" with or
+# without scripts/release/desktop-signing-gate.sh (the real gate). This proves
+# what the text checks cannot: the gate is reached, the flags map to the
+# right names, and the missing-script fallback admits exactly a dispatch of a
+# pre-0.9.0 tag (the tags that predate the gate).
+# ---------------------------------------------------------------------------
+STEP_DIR="${SCRATCH}/step-exec"
+mkdir -p "${STEP_DIR}/no-gate" "${STEP_DIR}/with-gate/scripts/release"
+cp "${GATE}" "${STEP_DIR}/with-gate/scripts/release/"
+STEP_OUT=""; STEP_RC=0
+# run_step <workflow> <job> <checkout: no-gate|with-gate> <event> <tag> [missing secret...]
+run_step() {
+  local wf="$1" job="$2" co="${STEP_DIR}/$3" ev="$4" tag="$5"
+  shift 5
+  python3 "${WIRING}" extract "${wf}" "${job}" "${STEP_DIR}/step.sh" "$@" || fail "extract ${job} from ${wf} failed"
+  STEP_RC=0
+  STEP_OUT="$(cd "${co}" && env -i PATH="${PATH}" HOME="${HOME}" GITHUB_EVENT_NAME="${ev}" TAG="${tag}" \
+    bash -e "${STEP_DIR}/step.sh" 2>&1)" || STEP_RC=$?
+}
+# step_case <label> <want rc> <expected output substring> <run_step args...>
+step_case() {
+  local label="$1" want="$2" expect="$3"
+  shift 3
+  run_step "$@"
+  [ "${STEP_RC}" -eq "${want}" ] || fail "step (${label}) exited ${STEP_RC} (want ${want}): ${STEP_OUT}"
+  case "${STEP_OUT}" in
+    *"${expect}"*) ;;
+    *) fail "step (${label}) output lacks '${expect}': ${STEP_OUT}" ;;
+  esac
+  ok "step ${label} → exit ${want}"
+}
+SKIPPED="predates scripts/release/desktop-signing-gate.sh (a pre-0.9.0 tag); skipping the gate"
+NO_GATE="is missing from"
+
+step "release-plan's gate step, executed: the missing-script fallback admits only a dispatch of a pre-0.9.0 tag"
+step_case "no gate, dispatch v0.8.1" 0 "${SKIPPED}" "${WF}" release-plan no-gate workflow_dispatch v0.8.1
+step_case "no gate, dispatch v0.8.0" 0 "${SKIPPED}" "${WF}" release-plan no-gate workflow_dispatch v0.8.0
+step_case "no gate, dispatch v0.9.0" 1 "${NO_GATE}" "${WF}" release-plan no-gate workflow_dispatch v0.9.0
+step_case "no gate, dispatch v0.9.0-rc.1 (a 0.9.0 prerelease does not qualify)" 1 "${NO_GATE}" "${WF}" release-plan no-gate workflow_dispatch v0.9.0-rc.1
+step_case "no gate, dispatch v0.8.1-.. (a malformed suffix)" 1 "${NO_GATE}" "${WF}" release-plan no-gate workflow_dispatch v0.8.1-..
+step_case "no gate, dispatch v0.8.1-rc.1 (no suffix of any kind)" 1 "${NO_GATE}" "${WF}" release-plan no-gate workflow_dispatch v0.8.1-rc.1
+step_case "no gate, dispatch v0.8.1+build (no suffix of any kind)" 1 "${NO_GATE}" "${WF}" release-plan no-gate workflow_dispatch v0.8.1+build
+step_case "no gate, dispatch v0.10.0 (numeric, not lexical)" 1 "${NO_GATE}" "${WF}" release-plan no-gate workflow_dispatch v0.10.0
+step_case "no gate, dispatch v1.0.0" 1 "${NO_GATE}" "${WF}" release-plan no-gate workflow_dispatch v1.0.0
+step_case "no gate, dispatch of a malformed tag (v0.8)" 1 "${NO_GATE}" "${WF}" release-plan no-gate workflow_dispatch v0.8
+step_case "no gate, dispatch of a leading-zero tag (v0.08.1)" 1 "${NO_GATE}" "${WF}" release-plan no-gate workflow_dispatch v0.08.1
+step_case "no gate, a tag push of v0.8.1" 1 "${NO_GATE}" "${WF}" release-plan no-gate push v0.8.1
+
+step "release-plan's gate step, executed: with the script present, the gate always runs"
+step_case "gate present, dispatch v0.8.1, all six missing (no fallback when the script exists)" 1 "${GATE_REFUSAL} $(comma_list "${GATE_SECRETS}")" \
+  "${WF}" release-plan with-gate workflow_dispatch v0.8.1 ${GATE_SECRETS}
+step_case "gate present, push v9.1.0, all six present" 0 "is stable and all six Apple secrets are present" \
+  "${WF}" release-plan with-gate push v9.1.0
+step_case "gate present, push v9.1.0, secrets.APPLE_ID missing (the flag reaches the gate under its own name)" 1 "${GATE_REFUSAL} APPLE_ID" \
+  "${WF}" release-plan with-gate push v9.1.0 APPLE_ID
+step_case "gate present, push v9.1.0-rc.1, all six missing" 0 "ad-hoc-signed" \
+  "${WF}" release-plan with-gate push v9.1.0-rc.1 ${GATE_SECRETS}
+
+step "desktop-macos's backstop step, executed: the gate runs, and a missing script fails closed"
+step_case "backstop, push v9.1.0, all six missing" 1 "${GATE_REFUSAL} $(comma_list "${GATE_SECRETS}")" \
+  "${WF}" desktop-macos with-gate push v9.1.0 ${GATE_SECRETS}
+step_case "backstop, push v9.1.0, all six present" 0 "is stable and all six Apple secrets are present" \
+  "${WF}" desktop-macos with-gate push v9.1.0
+step_case "backstop, no gate script, dispatch v0.9.0" 127 "desktop-signing-gate.sh" \
+  "${WF}" desktop-macos no-gate workflow_dispatch v0.9.0
+
+step "the rp-unreachable mutation is a real bypass when executed, which the guard refuses (above)"
+run_step "${WIRING_DIR}/rp-unreachable.json" release-plan with-gate push v9.1.0 ${GATE_SECRETS}
+[ "${STEP_RC}" -eq 0 ] || fail "the rp-unreachable step was expected to pass a stable all-missing push (the gate never runs), got ${STEP_RC}: ${STEP_OUT}"
+case "${STEP_OUT}" in *"desktop signing gate"*|*"::error::"*) fail "the rp-unreachable step still ran the gate: ${STEP_OUT}" ;; esac
+ok "moved after the branch's exit, the gate never runs (a stable all-missing push exits 0), so the text checks alone were not enough"
+
+# ---------------------------------------------------------------------------
+# changelog-section.sh: the release body. Its own scratch CHANGELOG, with a
+# decoy Unreleased section above, a `## v3.2.10 — ` heading to prove the match
+# is exact (v3.2.1 must not read it), and a later section that must not leak.
+# ---------------------------------------------------------------------------
+SECTION="${SCRATCH}/scripts/release/changelog-section.sh"
+cat > "${SCRATCH}/CHANGELOG.md" <<'EOF'
+# Changelog
+
+## Unreleased
+
+**Ships:** server, host-agent, desktop
+
+- unreleased decoy (must never be printed)
+
+## v3.2.10 — 2026-03-03
+
+**Ships:** desktop
+
+- the 3.2.10 entry (v3.2.1 must not read this heading)
+
+## v3.2.1 — 2026-02-02
+
+**Ships:** server
+
+- the 3.2.1 entry
+- its second line
+
+### Fixed
+- a subsection stays in the body
+
+## v3.2.0 — 2026-01-01
+
+**Ships:** desktop
+
+- the 3.2.0 entry (must not leak into 3.2.1's body)
+EOF
+SEC_OUT=""; SEC_RC=0
+run_section() { SEC_RC=0; SEC_OUT="$("${SECTION}" "$@" 2>&1)" || SEC_RC=$?; }
+
+step "changelog-section.sh: prints exactly the tag's section body, stopping at the next ## heading"
+run_section v3.2.1
+[ "${SEC_RC}" -eq 0 ] || fail "v3.2.1 exited ${SEC_RC}: ${SEC_OUT}"
+expected="$(printf '\n**Ships:** server\n\n- the 3.2.1 entry\n- its second line\n\n### Fixed\n- a subsection stays in the body')"
+[ "${SEC_OUT}" = "${expected}" ] || fail "v3.2.1 body mismatch: [${SEC_OUT}]"
+ok "v3.2.1 → its own body (a ### subsection included), heading excluded, nothing from v3.2.0 or v3.2.10"
+
+step "changelog-section.sh: never reads ## Unreleased, and the last section runs to EOF"
+run_section v3.2.0
+[ "${SEC_RC}" -eq 0 ] || fail "v3.2.0 exited ${SEC_RC}: ${SEC_OUT}"
+[ "${SEC_OUT}" = "$(printf '\n**Ships:** desktop\n\n- the 3.2.0 entry (must not leak into 3.2.1'"'"'s body)')" ] || fail "v3.2.0 body mismatch: [${SEC_OUT}]"
+for t in v3.2.1 v3.2.0 v3.2.10; do
+  run_section "${t}"
+  case "${SEC_OUT}" in *"unreleased decoy"*) fail "${t}'s body includes the Unreleased decoy" ;; esac
+done
+ok "the Unreleased decoy is never printed; the final section ends at EOF"
+
+step "changelog-section.sh: a missing section (or a prerelease, which has none) exits 1"
+run_section v9.9.9
+[ "${SEC_RC}" -eq 1 ] || fail "missing section exited ${SEC_RC} (want 1): ${SEC_OUT}"
+echo "${SEC_OUT}" | grep -qF "no '## v9.9.9 — <date>' section" || fail "missing-section error unclear: ${SEC_OUT}"
+run_section v3.2.1-rc.1
+[ "${SEC_RC}" -eq 1 ] || fail "prerelease v3.2.1-rc.1 exited ${SEC_RC} (want 1): ${SEC_OUT}"
+ok "v9.9.9 and v3.2.1-rc.1 → exit 1"
+
+step "changelog-section.sh: a malformed tag exits 2"
+run_section 3.2
+[ "${SEC_RC}" -eq 2 ] || fail "malformed tag exited ${SEC_RC} (want 2): ${SEC_OUT}"
+run_section
+[ "${SEC_RC}" -eq 2 ] || fail "no tag exited ${SEC_RC} (want 2): ${SEC_OUT}"
+ok "'3.2' and no tag → exit 2"
+
+# ---------------------------------------------------------------------------
+# A `## ` line that is not a section heading is body text, fenced or not: the
+# section ends only at the next `## Unreleased` / `## v<digit>` line. The
+# fixture is assembled from three pieces so the expected v4.0.0 body is a file
+# compared byte for byte: a bash fence holding `## Upgrade commands`, a bare
+# `## Notes for upgraders` and `## version notes` (not `v<digit>`), a ~~~ fence
+# never closed, then the warning; then a real `## v3.9.0 — ` heading that
+# must still end it.
+# ---------------------------------------------------------------------------
+FENCE_DIR="${SCRATCH}/fence"
+mkdir -p "${FENCE_DIR}"
+cat > "${FENCE_DIR}/head.md" <<'MD'
+# Changelog
+
+## Unreleased
+
+**Ships:** server, host-agent, desktop
+
+- unreleased work
+
+## v4.0.0 — 2026-04-04
+MD
+cat > "${FENCE_DIR}/body.md" <<'MD'
+
+**Ships:** server
+
+- the upgrade, step by step:
+
+  ```bash
+  ## Upgrade commands (a comment in a shell example, not a heading)
+  sudo apt-get install shed-server
+  ```
+
+## Notes for upgraders
+
+## version notes (a `## v` that is not `## v<digit>`)
+
+~~~
+## inside a tilde fence that is never closed
+```
+
+- the warning after the examples (it must reach the release page)
+MD
+cat > "${FENCE_DIR}/tail.md" <<'MD'
+
+## v3.9.0 — 2026-03-03
+
+**Ships:** desktop
+
+- an older entry (must not leak into v4.0.0's body)
+MD
+cat "${FENCE_DIR}/head.md" "${FENCE_DIR}/body.md" "${FENCE_DIR}/tail.md" > "${SCRATCH}/CHANGELOG.md"
+
+step "changelog-section.sh: any ## line other than a section heading is body text; a real ## v<digit> heading still ends it"
+SEC_RC=0
+"${SECTION}" v4.0.0 > "${FENCE_DIR}/out.md" 2>"${FENCE_DIR}/out.err" || SEC_RC=$?
+[ "${SEC_RC}" -eq 0 ] || fail "v4.0.0 exited ${SEC_RC}: $(cat "${FENCE_DIR}/out.err")"
+cmp -s "${FENCE_DIR}/out.md" "${FENCE_DIR}/body.md" \
+  || fail "v4.0.0 body differs from the expected one: $(diff "${FENCE_DIR}/body.md" "${FENCE_DIR}/out.md" || true)"
+grep -q "an older entry" "${FENCE_DIR}/out.md" && fail "v4.0.0's body ran past the real ## v3.9.0 heading"
+ok "v4.0.0 → the whole body, byte for byte: the fenced ## Upgrade commands, the bare ## lines and an unclosed fence kept, the warning kept, stopped at ## v3.9.0"
+run_section v3.9.0
+[ "${SEC_RC}" -eq 0 ] || fail "v3.9.0 exited ${SEC_RC}: ${SEC_OUT}"
+[ "${SEC_OUT}" = "$(printf '\n**Ships:** desktop\n\n- an older entry (must not leak into v4.0.0'"'"'s body)')" ] || fail "v3.9.0 body mismatch: [${SEC_OUT}]"
+ok "the section after it extracts cleanly too"
+
+step "changelog-section.sh: a ## Unreleased line below a section ends it too (the other real heading form)"
+printf '# Changelog\n\n## v4.1.0 — 2026-06-06\n\n**Ships:** server\n\n- the entry\n\n## Unreleased\n\n- misplaced, must not leak\n' > "${SCRATCH}/CHANGELOG.md"
+run_section v4.1.0
+[ "${SEC_RC}" -eq 0 ] || fail "v4.1.0 exited ${SEC_RC}: ${SEC_OUT}"
+[ "${SEC_OUT}" = "$(printf '\n**Ships:** server\n\n- the entry')" ] || fail "v4.1.0 body mismatch: [${SEC_OUT}]"
+ok "## Unreleased is a boundary as well"
+
+step "release-plan.sh reads the same body: a Ships line after a fenced ## line is found; a ## v<digit> line in the body ends it"
+# The phases above leave host-agent at 8.8.10 alone (server 8.8.8, desktop
+# 8.8.9), so v8.8.10 is a stable host-agent-only tag with no craze check. The
+# Ships line sits AFTER a fenced `## step one` on purpose: an extractor that
+# stopped at it would hide the Ships line and fail the plan.
+printf '# Changelog\n\n## v8.8.10 — 2026-05-05\n\n```bash\n## step one\n```\n\n**Ships:** host-agent\n\n## v8.8.9 — 2026-04-04\n\n**Ships:** desktop\n' > "${SCRATCH}/CHANGELOG.md"
+run_plan v8.8.10
+[ "${PLAN_RC}" -eq 0 ] || fail "release-plan with a Ships line after a fenced ## exited ${PLAN_RC} (want 0)"
+[ "${PLAN_OUT}" = "$(expect_plan false true false true)" ] || fail "release-plan (Ships after a fenced ##) stdout: ${PLAN_OUT}"
+# The documented authoring rule, enforced loudly: a body line starting
+# `## v<digit>` ends the section, so a Ships line after it is not seen.
+printf '# Changelog\n\n## v8.8.10 — 2026-05-05\n\n- an entry\n\n## v1.0.0 was the first release (a misplaced line)\n\n**Ships:** host-agent\n' > "${SCRATCH}/CHANGELOG.md"
+rp_rule_rc=0
+rp_rule_out="$("${RP}" v8.8.10 2>&1 1>/dev/null)" || rp_rule_rc=$?
+[ "${rp_rule_rc}" -eq 1 ] || fail "release-plan with a ## v<digit> body line exited ${rp_rule_rc} (want 1): ${rp_rule_out}"
+echo "${rp_rule_out}" | grep -qF "has no **Ships:** line" || fail "release-plan does not report the hidden Ships line: ${rp_rule_out}"
+ok "Ships after a fenced ## → the host-agent-only plan; a ## v<digit> body line ends the section, and the plan fails loudly"
 
 echo
 echo "release-scripts-test: all ${PASS} checks passed"

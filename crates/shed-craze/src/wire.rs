@@ -141,14 +141,27 @@ pub mod code {
     pub const INDEX_WRITE: &str = "index_write";
 }
 
-/// The two `data.reason`s this crate reads — never to decide an error's
+/// The `data.reason`s this crate reads — never to decide an error's
 /// [`shed_core::lane::LaneError`] variant (that is `data.code` alone), only
-/// for the two places plan 025 pins a reason: a `hello` refused for want of a
-/// shared protocol is `TooOld` (§3.3.2), and a create whose session failed to
-/// start carries its cause (P14).
+/// for the places a plan pins a reason: a `hello` refused for want of a
+/// shared protocol is `TooOld` (plan 025 §3.3.2), a create whose session
+/// failed to start carries its cause (P14), and a REPLAYED create craze
+/// refused without saying whether that request started a session — admission
+/// (`host_unreachable`, `busy`, `closing`), a hub that cannot create, a
+/// connection without its `hello`, a success that could not be sent — leaves
+/// the outcome unknown (plan 026 §3.1 and AM1,
+/// [`crate::errors::REPLAY_UNKNOWN`]).
 pub mod reason {
     pub const PROTOCOL_VERSION: &str = "protocol_version";
     pub const START_FAILED: &str = "start_failed";
+    pub const HOST_UNREACHABLE: &str = "host_unreachable";
+    pub const BUSY: &str = "busy";
+    pub const CLOSING: &str = "closing";
+    pub const UNSUPPORTED: &str = "unsupported";
+    pub const UNKNOWN_METHOD: &str = "unknown_method";
+    pub const HELLO_REQUIRED: &str = "hello_required";
+    pub const FAILED: &str = "failed";
+    pub const RESPONSE_TOO_LARGE: &str = "response_too_large";
 }
 
 // ---- outbound ----

@@ -22,14 +22,16 @@ use std::sync::{Arc, Mutex};
 
 use serde_json::Value;
 
+use shed_app::roost::TeardownSink;
 use shed_app::roost::{
     LocalSession, RoostReach, SshBridge, SshBridgeOptions, SshExec, UnreachableReach,
 };
+use shed_app::spawn_gate::SpawnGate;
 use shed_core::config::{MachineEntry, ShedConfig};
 use shed_core::machine::display_line;
 use shed_craze::{EnvPolicy, ProcessDial};
 
-use crate::craze::{CrazeReach, SshCrazeDial, SshCrazeProbe};
+use crate::craze::{gated, CrazeReach, SshCrazeDial, SshCrazeProbe};
 
 use crate::roost_hosts::{lock, RoostHosts};
 
@@ -238,6 +240,16 @@ pub struct ReachOptions {
     /// environment — `HOME`, `CRAZE_HOME`, `CRAZE_RUNTIME_DIR`, those that are
     /// set — beside the seam's `PATH`. Read in test mode only.
     pub craze_env: Vec<(String, String)>,
+    /// The app's spawn gate (plan 026 §3.3), created once in `setup`: every
+    /// transport built from these options — a roost bridge, an exec runner, a
+    /// craze dial, an opencode forward — spawns only inside its sections.
+    /// `None` in the unit tests that build none.
+    pub spawn_gate: Option<SpawnGate>,
+    /// The app's shared roost-tunnel teardown sink (plan 026 §3.3, F4): every
+    /// bridge's teardowns run there, so one still running when its bridge is
+    /// dropped (a removed host) is joined by the shutdown. `None`: each bridge
+    /// keeps its own.
+    pub teardowns: Option<TeardownSink>,
 }
 
 impl ReachOptions {
@@ -247,6 +259,8 @@ impl ReachOptions {
     pub fn bridge_options(&self) -> SshBridgeOptions {
         SshBridgeOptions {
             ssh_bin: self.ssh_bin.clone(),
+            spawn_gate: self.spawn_gate.clone(),
+            teardowns: self.teardowns.clone(),
             ..SshBridgeOptions::default()
         }
     }
@@ -326,9 +340,15 @@ pub(crate) fn build_local_reach(options: &ReachOptions) -> Registered {
 /// not this host's own `/usr/local/bin/craze` — can answer a hermetic run.
 /// Without the seam there is no local craze source at all.
 pub(crate) fn build_local_craze(options: &ReachOptions) -> Option<CrazeReach> {
+    // Every local dial is GATED (plan 026 §3.3): the roster's, every lane's,
+    // every `create_options`, every create and its automatic retry — the dial
+    // is where the spawn is, so that is where shutting down is refused.
     if !options.test_mode {
         return Some(CrazeReach {
-            dial: Arc::new(ProcessDial::bridge_hub(EnvPolicy::Inherit)),
+            dial: gated(
+                Arc::new(ProcessDial::bridge_hub(EnvPolicy::Inherit)),
+                options.spawn_gate.as_ref(),
+            ),
             probe: None,
             ensure: None,
         });
@@ -337,7 +357,10 @@ pub(crate) fn build_local_craze(options: &ReachOptions) -> Option<CrazeReach> {
     let mut env = options.craze_env.clone();
     env.push(("PATH".to_string(), dir.display().to_string()));
     Some(CrazeReach {
-        dial: Arc::new(ProcessDial::bridge_hub_jailed(EnvPolicy::Exactly(env))),
+        dial: gated(
+            Arc::new(ProcessDial::bridge_hub_jailed(EnvPolicy::Exactly(env))),
+            options.spawn_gate.as_ref(),
+        ),
         probe: None,
         ensure: None,
     })
@@ -370,14 +393,19 @@ pub(crate) fn build_ssh_craze(exec: Arc<SshExec>, options: &ReachOptions) -> Opt
     };
     let probe: Arc<dyn crate::craze::CrazeProbe> =
         Arc::new(SshCrazeProbe::new(Arc::clone(&exec), probe));
+    // Both dials gate their own spawn (plan 026 §3.3) — around the
+    // `spawn_duplex` alone, not the find-only probe in front of it, which runs
+    // through the exec's own gate.
+    let gate = options.spawn_gate.clone();
     Some(CrazeReach {
-        dial: Arc::new(SshCrazeDial::new(
-            Arc::clone(&exec),
-            bridge.clone(),
-            Arc::clone(&probe),
-        )),
+        dial: Arc::new(
+            SshCrazeDial::new(Arc::clone(&exec), bridge.clone(), Arc::clone(&probe))
+                .with_spawn_gate(gate.clone()),
+        ),
         probe: Some(probe),
-        ensure: Some(Arc::new(SshCrazeDial::ungated(exec, bridge))),
+        ensure: Some(Arc::new(
+            SshCrazeDial::ungated(exec, bridge).with_spawn_gate(gate),
+        )),
     })
 }
 

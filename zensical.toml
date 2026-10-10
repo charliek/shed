@@ -89,7 +89,7 @@ nav = [
     { "shed-ext-rc (retired)" = "extensions/rc-helper.md" },
     { "roost Provider" = "extensions/roost-provider.md" },
     { "roost Session Hosts" = "extensions/roost-session-hosts.md" },
-    { "shed-machine-rc" = "extensions/shed-machine-rc.md" },
+    { "shed-machine-rc (retired)" = "extensions/shed-machine-rc.md" },
     { "sx (sunset)" = "extensions/sx.md" },
     { "Security Posture" = "extensions/security-posture.md" },
   ] },

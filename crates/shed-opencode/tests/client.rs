@@ -318,6 +318,43 @@ async fn create_without_a_prompt_sends_none() {
     assert_clean(&fake);
 }
 
+/// **`create_held` is `create` for opencode** (plan 026 §3.1): opencode has no
+/// create idempotency (it accepts the request id and ignores it), so the
+/// trait's default replays nothing — the same requests on the wire, the same
+/// answer's shape, a session per call.
+#[tokio::test]
+async fn create_held_is_create_for_opencode() {
+    let fake = FakeOpencode::start().await;
+    let created = source(&fake)
+        .create(create_request("/tmp/project", Some("first prompt")))
+        .await
+        .expect("create");
+    let by_create = fake.post_targets();
+    let held = source(&fake)
+        .create_held(create_request("/tmp/project", Some("first prompt")))
+        .await
+        .expect("create_held");
+    let by_held = fake.post_targets()[by_create.len()..].to_vec();
+    assert_eq!(
+        by_held,
+        [
+            "/session?directory=%2Ftmp%2Fproject".to_string(),
+            format!("/session/{}/prompt_async", held.session.id),
+        ],
+        "the same two requests a create makes"
+    );
+    assert_ne!(held.session.id, created.session.id, "nothing is replayed");
+    assert_eq!(
+        (&held.prompt, &held.prompt_error, &held.session.activity),
+        (
+            &created.prompt,
+            &created.prompt_error,
+            &created.session.activity
+        )
+    );
+    assert_clean(&fake);
+}
+
 /// A send that fails after the create is the CREATE's error — not swallowed
 /// into a `refused` outcome — exactly as before the split.
 #[tokio::test]

@@ -73,9 +73,10 @@ source ladder, the consent step, and the rollback promise.
 New sessions are opened through roost, not through this binary directly:
 `roost.launch`/`machine.launch` open a tab running the chosen agent binary in a chosen
 working directory — see [IPC § Agent sessions](ipc.md#agent-sessions) for the op surface.
-The launch dialog does not offer a prompt field: roost owns the tab from the moment it
-opens, and a typed kickoff has no wire to travel down yet
-([`charliek/shed#366`](https://github.com/charliek/shed/issues/366) tracks delivering one).
+The dialog's **Session name** becomes the tab's title, and it sticks: the agent's own
+terminal title does not replace it. The dialog offers no prompt or permission-mode field,
+because a roost launch cannot deliver either: a launch that carries one is refused rather
+than run without it. A first prompt belongs to a craze session's create sheet (below).
 Kicking off an agent from roost's own command palette instead of this dialog is
 [the `shed` roost provider](../extensions/roost-provider.md).
 

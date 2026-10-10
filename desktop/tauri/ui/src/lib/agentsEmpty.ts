@@ -30,10 +30,37 @@
 /** Where the shared `rc.list` read has got to. */
 export type AgentsLoad = "loading" | "failed" | "ready";
 
-/** The one fact this module needs about a machine row: whether the pane could
- *  see it. Structural rather than an import of `MachineStatus`, so this module
- *  stays free of everything `bridge.ts` pulls in. */
-export type EmptyMachine = { reachable: boolean };
+/** The facts this module needs about a machine row: whether the pane could
+ *  see it, and — for [crazeOnly] — whether a roost watcher runs for it,
+ *  whether its roost ever delivered an inventory, and its craze state.
+ *  Structural rather than an import of `MachineStatus`, so this module stays
+ *  free of everything `bridge.ts` pulls in. */
+export type EmptyMachine = {
+  reachable: boolean;
+  roost_watched?: boolean | null;
+  connected_once?: boolean | null;
+  craze?: { state?: string | null } | null;
+};
+
+/** **A host listed by craze alone** (plan 026 §3.2): listed by a create or its
+ *  first craze `Ready`, with NO roost watcher (`roost_watched` — a shed gets
+ *  one only once its roost answers; a configured machine and the implicit
+ *  `localhost` are watched from the start), no roost inventory ever, and a
+ *  craze source that is there — live, dormant or offline, whatever its
+ *  phase. Its card reads `craze only`, not "connecting" forever, and the
+ *  empty state does not count it unreachable: its craze sessions are what it
+ *  lists. A shed whose roost answered but whose first inventory has not
+ *  arrived yet is watched, and so is not craze only.
+ *
+ *  Lives here, beside the empty state that must read it, because this module
+ *  is compiled alone for node's test runner; the Machines pane's and the
+ *  sidebar's labels import it from here. */
+export function crazeOnly(m: EmptyMachine): boolean {
+  return !m.roost_watched
+    && !m.reachable
+    && !m.connected_once
+    && (m.craze?.state ?? "absent") !== "absent";
+}
 
 /** The Agents pane's empty state, as rendered and as `agents.dump` reports it.
  *
@@ -81,8 +108,9 @@ export function agentsEmptyState(
     };
   }
   // With machines configured but none reachable, "nothing is running" is a
-  // claim this pane cannot make — it has not been able to look.
-  const down = machines.filter((m) => !m.reachable).length;
+  // claim this pane cannot make — it has not been able to look. A host listed
+  // by craze alone is not down: its craze sessions are what it lists.
+  const down = machines.filter((m) => !m.reachable && !crazeOnly(m)).length;
   if (down > 0 && down === machines.length) {
     return {
       state: "unreachable",

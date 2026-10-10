@@ -68,15 +68,16 @@ The `extensions` variant adds [credential brokering](extensions.md) on top of `b
 - **`strix`** — TUI for staging and reviewing diffs, from the stridelabs apt repo.
 - **`prox`** — process manager with an HTTP API and TUI, from the stridelabs apt repo.
 - **`/usr/bin/roost-session`** — the headless [roost](https://github.com/charliek/roost) daemon, roost v0.0.21 (session protocol 6), baked from the standalone release asset and checksum-verified at build time with a build-time `identify` assert. No systemd unit is enabled — `shed attach`, the desktop app, and the phone app start it on first contact. Kept in lockstep with `crates/shed-core/src/roost/bootstrap/source.rs`'s `RELEASE_PIN` by `make check-roost-pin`.
-- **`/usr/bin/craze`** — the [craze](https://github.com/charliek/craze) agent-lane CLI that `shed attach` drives, craze v0.1.0, baked from the standalone release asset (a tarball holding the bare `craze` binary) and checksum-verified at build time with a `craze --version` equality assert. No systemd unit is enabled — `shed attach` starts a lane's hub itself. The version and per-architecture digests are pinned in-tree, never fetched: a `.sha256` from the same mutable release proves transport, not provenance. Kept in lockstep with `craze-pin.env`'s `CRAZE_RELEASE` by `make check-craze-pin`.
+- **`/usr/bin/craze`** — the [craze](https://github.com/charliek/craze) agent-lane CLI the desktop and phone drive (the desktop's create sheet starts a remote hub), craze v0.1.0, baked from the standalone release asset (a tarball holding the bare `craze` binary) and checksum-verified at build time with a `craze --version` equality assert. No systemd unit is enabled — the desktop's create sheet starts a remote hub. The version and per-architecture digests are pinned in-tree, never fetched: a `.sha256` from the same mutable release proves transport, not provenance. Kept in lockstep with `craze-pin.env`'s `CRAZE_RELEASE` by `make check-craze-pin`.
 - Pre-configured `SSH_AUTH_SOCK` and `AWS_CONTAINER_CREDENTIALS_FULL_URI` environment variables.
 
 **When to use it:** as a base for organization-specific images, or when you
 want credential brokering without the full coding-agent set.
 
-**Prerequisite:** the `shed-host-agent` binary must be running on your host.
-See the [macOS quickstart](../getting-started/macos-quickstart.md) for host-agent
-setup and the [Extensions configuration reference](../extensions/configuration.md).
+**Prerequisite:** a credential broker on your host: the desktop app's embedded broker
+(the Tauri app's default) or the `shed-host-agent` daemon. See the
+[macOS quickstart](../getting-started/macos-quickstart.md) for host-agent setup and the
+[Extensions configuration reference](../extensions/configuration.md).
 
 ```bash
 shed create mydev --image extensions

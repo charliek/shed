@@ -17,11 +17,15 @@ mod machines;
 mod prefs;
 mod roost_hosts;
 mod screenshot;
+mod shutdown;
 mod single_instance;
 mod state;
 mod termctl;
 mod tray;
 mod updater;
+
+#[cfg(test)]
+mod launch_command_tests;
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -286,9 +290,21 @@ fn shed_target(backend: &Backend, host: Option<&str>, shed: &str) -> Result<Stri
     Ok(format!("roost:{server}/{shed}"))
 }
 
+/// A launch request refused before the host is reached — an unknown kind, an
+/// unresolvable server — coded `bad_request`, as the socket ops answer it.
+fn bad_launch(message: String) -> String {
+    roost_hosts::LaunchError::BadRequest(message).command_string()
+}
+
 /// Launch a session IN a shed — an alias for [`machine_launch`] on the shed's
 /// roost host since S6, kept for 0.9.x. Same `tab.open`, addressed by
-/// `{shed, host?}` rather than by machine name.
+/// `{shed, host?}` rather than by machine name, and the same coded error.
+///
+/// **Every launch field is declared, the refused ones included** (plan 026
+/// §3.5): Tauri extracts only the arguments a command names and drops the rest
+/// without a word, so a `permissionMode` this command did not declare would open
+/// a tab instead of being refused. `launch_command_tests` drives this command
+/// through Tauri's own argument extraction to hold that.
 #[tauri::command]
 #[allow(clippy::too_many_arguments)] // a flat invoke arg list mirrors the launch form fields
 async fn rc_launch(
@@ -299,22 +315,24 @@ async fn rc_launch(
     host: Option<String>,
     display_name: Option<String>,
     workdir: Option<String>,
+    permission_mode: Option<String>,
     initial_prompt: Option<String>,
 ) -> Result<serde_json::Value, String> {
     // Serde preserves an unknown kind as `Other(raw)` (the unknown-kind read
     // policy), so launching must apply the same known-kind gate as the socket IPC.
-    ipc::ensure_known_kind(&kind)?;
-    let target = shed_target(&backend, host.as_deref(), &shed)?;
+    ipc::ensure_known_kind(&kind).map_err(bad_launch)?;
+    let target = shed_target(&backend, host.as_deref(), &shed).map_err(bad_launch)?;
     machines
         .launch(
             &target,
             &kind,
             display_name.as_deref(),
             workdir.as_deref(),
-            None,
+            permission_mode.as_deref(),
             initial_prompt.as_deref(),
         )
         .await
+        .map_err(|e| e.command_string())
 }
 
 #[tauri::command]
@@ -359,6 +377,12 @@ fn machine_capabilities(
 /// `machine_launch` — start a session on a MACHINE, the machine counterpart of
 /// [`rc_launch`]: a roost `tab.open` running the kind's agent, addressed by
 /// `(machine, …)` rather than by `(host, shed, …)` through a server.
+///
+/// A launch's failure crosses as `"<code>: <message>"` (`lane_error`'s shape,
+/// which `bridge.ts` splits back): `bad_request` for a first prompt or a
+/// permission mode, refused before any tab opens, and `action_failed` for a
+/// launch that was tried (plan 026 §3.5) — the socket ops' two codes. Both
+/// refused fields are declared here for [`rc_launch`]'s reason.
 #[tauri::command]
 #[allow(clippy::too_many_arguments)]
 async fn machine_launch(
@@ -373,7 +397,7 @@ async fn machine_launch(
     // The same known-kind gate the shed launch applies: serde preserves an
     // unknown kind as `Other(raw)`, and starting one would ask the far side to
     // run something this build has never heard of.
-    ipc::ensure_known_kind(&kind)?;
+    ipc::ensure_known_kind(&kind).map_err(bad_launch)?;
     machines
         .launch(
             &machine,
@@ -384,6 +408,7 @@ async fn machine_launch(
             initial_prompt.as_deref(),
         )
         .await
+        .map_err(|e| e.command_string())
 }
 
 /// `roost_run` — "Run a command in a tab" (plan 025 P5): the frontend's door
@@ -693,8 +718,10 @@ async fn craze_create_options(
 }
 
 /// `craze_create` — a new craze session; `request_id` is the sheet's own
-/// (reused only while the last outcome is unknown). Read through
-/// [`craze::create_request`], the socket door's one reading.
+/// (reused only while the last outcome is unknown), and `held` says this
+/// submission REPLAYS it (plan 026 §3.1). Read through
+/// [`craze::create_request`] and [`craze::held_create`], the socket door's
+/// one reading.
 #[tauri::command]
 async fn craze_create(
     machines: tauri::State<'_, Arc<roost_hosts::RoostHosts>>,
@@ -703,7 +730,10 @@ async fn craze_create(
     provider: Option<String>,
     prompt: Option<String>,
     request_id: Option<String>,
+    held: Option<bool>,
 ) -> Result<serde_json::Value, String> {
+    let held = craze::held_create(held.unwrap_or(false), request_id.as_deref())
+        .map_err(|f| f.command_string())?;
     let request = craze::create_request(
         cwd.as_deref(),
         provider.as_deref(),
@@ -712,7 +742,7 @@ async fn craze_create(
     )
     .map_err(|f| f.command_string())?;
     machines
-        .craze_create(&machine, request)
+        .craze_create(&machine, request, held)
         .await
         .map_err(|f| f.command_string())
 }
@@ -1511,10 +1541,21 @@ pub fn run() {
             let on_machine_change: roost_hosts::OnChange = Arc::new(move || {
                 let _ = refresh_handle.emit("refresh", serde_json::json!({}));
             });
+            // **The app's spawn gate** (plan 026 §3.3), created once: every
+            // transport the roost-host layer builds — roost bridges, exec
+            // runners, craze dials, opencode forwards — spawns only inside its
+            // sections, and the orderly shutdown closes it first.
+            let spawn_gate = shed_app::spawn_gate::SpawnGate::new();
+            let mut reach_options = env.reach_options();
+            reach_options.spawn_gate = Some(spawn_gate.clone());
+            // One roost-tunnel teardown sink for every bridge (F4), so a
+            // teardown a removed host's bridge left running is joined by the
+            // shutdown rather than detached.
+            reach_options.teardowns = Some(shed_app::roost::TeardownSink::default());
             let machines = Arc::new(roost_hosts::RoostHosts::start(
                 &tauri::async_runtime::handle().inner().clone(),
                 &shed_core::config::ShedConfig::load(&machine_config_path),
-                env.reach_options(),
+                reach_options,
                 env.roost_jail_fs_root,
                 on_machine_change,
             ));
@@ -1552,6 +1593,27 @@ pub fn run() {
                 },
             ));
             app.manage(lanes.clone());
+
+            // **The orderly shutdown** (plan 026 §3.3): one bounded,
+            // idempotent run, reached from the tray's quit, from
+            // `RunEvent::Exit` (macOS quit and logout) and from SIGTERM,
+            // SIGINT and SIGHUP — and the embedded broker's drain is its first
+            // step, so every one of those exits drains it.
+            let broker_app = app.handle().clone();
+            let broker_drain: shutdown::BrokerDrain = Box::new(move || {
+                if let Some(rt) = broker_app.try_state::<broker::BrokerRuntime>() {
+                    rt.signal_shutdown();
+                }
+            });
+            let orderly = shutdown::Shutdown::new(
+                spawn_gate,
+                machines.clone(),
+                lanes.clone(),
+                Some(broker_drain),
+                tauri::async_runtime::handle().inner().clone(),
+            );
+            app.manage(orderly.clone());
+            spawn_signal_thread(app.handle().clone(), orderly);
 
             // The terminal ops (preset resolution, launch, detection, the pref), shared
             // by the IPC handler + the frontend invoke commands (needs the Backend above).
@@ -1682,29 +1744,137 @@ pub fn run() {
             tauri::RunEvent::ExitRequested { code, api, .. } if code.is_none() => {
                 api.prevent_exit();
             }
-            // A deliberate quit (a code carried, e.g. tray → app.exit(0)) — best-effort
-            // drain the embedded broker on the way out (§3.6): flip the supervisor's
-            // shutdown watch. Non-blocking (it drains on its own task; server-side bus
-            // disconnects finish the cleanup), so this can't stall the exit.
+            // A deliberate quit (a code carried: the tray's Quit, the popover's,
+            // the test-mode `app.quit`, or the signal thread once its shutdown
+            // finished) — the orderly shutdown (plan 026 §3.3), blocked on
+            // here. This is the main thread, never a runtime worker, so
+            // `block_on` is legal; the run itself is on the app's runtime.
             tauri::RunEvent::ExitRequested { code: Some(_), .. } => {
-                if let Some(rt) = app_handle.try_state::<broker::BrokerRuntime>() {
-                    rt.signal_shutdown();
-                }
-                // Ask every bootstrap `ssh` ControlMaster to exit and take its
-                // scratch directory with it (plan 019 §3.6). `SshExec::Drop` does
-                // the same thing blockingly, but a process that is exiting does
-                // not reliably run drops — and a `ControlPersist` master
-                // outliving the app that opened it holds a live connection to
-                // somebody's shed with nothing left to close it.
-                //
-                // Blocking, and bounded: this is the one moment where waiting is
-                // both possible and correct, and `-O exit` against a local
-                // control socket is a round trip to a process on this machine.
-                if let Some(hosts) = app_handle.try_state::<Arc<roost_hosts::RoostHosts>>() {
-                    let hosts = Arc::clone(&hosts);
-                    tauri::async_runtime::block_on(async move { hosts.shutdown().await });
-                }
+                await_orderly_shutdown(app_handle);
+            }
+            // **The only event a macOS Dock Quit, logout or AppleScript quit
+            // produces** (tao's `applicationWillTerminate`): the same orderly
+            // shutdown. After any other exit path it is a wait for a run that
+            // has already finished.
+            tauri::RunEvent::Exit => {
+                await_orderly_shutdown(app_handle);
             }
             _ => {}
         });
+}
+
+/// Run the orderly shutdown (once — a later call waits for the first run) and
+/// block the calling thread until it has finished. Called from the event
+/// loop's own thread, never a runtime worker.
+///
+/// The wait is bounded by [`shutdown::ESCAPE`], and that bound cancels
+/// nothing: the run lives on the app's runtime, not in this wait, so only a
+/// runtime wedged past every phase's own bound can reach it. (Kept as
+/// designed, C3 review: it mirrors the signal path's 20 s escape — plan §9's
+/// "the worst case is a slower quit (≤ 20 s, by the escape timeout), never a
+/// hang" — and the phases are self-bounded at ≈ 16 s, so a compliant shutdown
+/// finishes well inside it.)
+fn await_orderly_shutdown(app: &tauri::AppHandle) {
+    let Some(orderly) = app.try_state::<Arc<shutdown::Shutdown>>() else {
+        return;
+    };
+    let orderly = Arc::clone(&orderly);
+    tauri::async_runtime::block_on(async move {
+        if tokio::time::timeout(shutdown::ESCAPE, orderly.run())
+            .await
+            .is_err()
+        {
+            eprintln!(
+                "shed-desktop-tauri: shutdown: not finished within {}s; exiting anyway",
+                shutdown::ESCAPE.as_secs()
+            );
+        }
+    });
+}
+
+/// **SIGTERM, SIGINT and SIGHUP, heard on a dedicated OS thread** (plan 026
+/// §3.3) — never on the app's runtime, so a wedged runtime cannot swallow a
+/// signal or block the escape.
+///
+/// The thread owns a tiny current-thread runtime of its own and selects over
+/// the three streams:
+///
+/// * the FIRST signal starts the orderly shutdown on the app's runtime
+///   ([`shutdown::Shutdown::start`] spawns it there; this thread never
+///   `block_on`s inside a runtime task) and keeps selecting;
+/// * when the shutdown completes it calls `app.exit(0)`, whose
+///   `ExitRequested` arm finds it done;
+/// * a SECOND signal before then, or the shutdown still running
+///   [`shutdown::ESCAPE`] after the first, ends the process at once with
+///   `128 + signo` — the escape hatch, which works with the app's runtime
+///   wedged.
+///
+/// Installing the handlers replaces the default disposition, under which
+/// SIGTERM killed the app outright and no teardown ran at all.
+fn spawn_signal_thread(app: tauri::AppHandle, orderly: Arc<shutdown::Shutdown>) {
+    let spawned = std::thread::Builder::new()
+        .name("shed-signals".to_string())
+        .spawn(move || {
+            let rt = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(rt) => rt,
+                Err(e) => {
+                    eprintln!(
+                        "shed-desktop-tauri: no signal runtime ({e}); signals end the app at once"
+                    );
+                    return;
+                }
+            };
+            rt.block_on(listen_for_signals(app, orderly));
+        });
+    if let Err(e) = spawned {
+        eprintln!("shed-desktop-tauri: no signal thread ({e}); signals end the app at once");
+    }
+}
+
+async fn listen_for_signals(app: tauri::AppHandle, orderly: Arc<shutdown::Shutdown>) {
+    use tokio::signal::unix::{signal, SignalKind};
+
+    let (Ok(mut term), Ok(mut int), Ok(mut hup)) = (
+        signal(SignalKind::terminate()),
+        signal(SignalKind::interrupt()),
+        signal(SignalKind::hangup()),
+    ) else {
+        eprintln!("shed-desktop-tauri: could not install the signal handlers");
+        return;
+    };
+    // Two signals that arrive before this first `recv` consumes the pending
+    // one are ONE signal (POSIX and tokio coalesce them) — kept as designed:
+    // the 20 s escape below still exits. A signal after this `recv` latches
+    // and completes the next one.
+    let first = tokio::select! {
+        _ = term.recv() => libc::SIGTERM,
+        _ = int.recv() => libc::SIGINT,
+        _ = hup.recv() => libc::SIGHUP,
+    };
+    eprintln!("shed-desktop-tauri: signal {first}: shutting down");
+    let mut done = orderly.start();
+    let escape = tokio::time::sleep(shutdown::ESCAPE);
+    tokio::pin!(escape);
+    let mut exiting = false;
+    loop {
+        let again = tokio::select! {
+            finished = done.wait_for(|finished| *finished), if !exiting => {
+                let finished = finished.is_ok();
+                exiting = true;
+                if finished {
+                    app.exit(0);
+                }
+                continue;
+            }
+            _ = term.recv() => libc::SIGTERM,
+            _ = int.recv() => libc::SIGINT,
+            _ = hup.recv() => libc::SIGHUP,
+            () = &mut escape => first,
+        };
+        eprintln!("shed-desktop-tauri: exiting now (signal {again})");
+        std::process::exit(128 + again);
+    }
 }

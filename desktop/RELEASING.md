@@ -28,9 +28,12 @@ the lockstep at workflow time and refuses to ship a drifted tree.
    invocation per shipping component (server → host-agent,
    `release.mode: keep-existing`), and the FIRST of those invocations
    creates the release and owns the
-   changelog body — later goreleaser invocations, and the desktop jobs
+   body — later goreleaser invocations, and the desktop jobs
    (which run strictly after `release` succeeds), only add assets and
-   never touch the body or clobber each other's uploads.
+   never touch the body or clobber each other's uploads. Either way, a
+   stable tag's body is its curated `CHANGELOG.md` section
+   (`scripts/release/changelog-section.sh`; this job passes it as
+   `--notes-file`); a prerelease gets a placeholder.
 
 2. **`desktop-macos`** (macos-15) — the Tauri build, the macOS client as
    of 0.9.0:
@@ -40,15 +43,19 @@ the lockstep at workflow time and refuses to ship a drifted tree.
      first by `scripts/fetch-sparkle.sh`), then runs
      `make -C desktop tauri-test` (the Tauri crate's unit tests).
    - **Developer ID signing + notarization** activate automatically
-     when ALL six Apple secrets exist (the `CAN_NOTARIZE` gate — any
-     missing secret means an ad-hoc-signed DMG with the FIRST-LAUNCH
-     Gatekeeper note, never a broken build). The cert is imported into
-     a throwaway keychain; `notarize.sh` submits and staples **before**
-     the EdDSA signing, because stapling rewrites the DMG bytes.
-   - Uploads the DMG to the release. Release notes: on combined
-     releases the notes are goreleaser's — never touched; on
-     desktop-only releases the notarization guidance is **appended**
-     (not overwritten).
+     when ALL six Apple secrets exist (`CAN_NOTARIZE`). **A stable tag
+     fails closed without them**: the desktop signing gate
+     (`scripts/release/desktop-signing-gate.sh`) runs in the
+     `release-plan` job, before anything publishes, and again as this
+     job's first step after checkout, and it names the missing secrets.
+     Only a **prerelease** may ship an ad-hoc-signed DMG with the
+     FIRST-LAUNCH Gatekeeper note. The cert is imported into a throwaway
+     keychain; `notarize.sh` submits and staples **before** the EdDSA
+     signing, because stapling rewrites the DMG bytes.
+   - Uploads the DMG to the release. Release notes: the body is already
+     the curated `CHANGELOG.md` section on a stable tag; on combined
+     releases this job never touches it, and on desktop-only releases it
+     **appends** the notarization line (not overwritten).
    - **Sparkle appcast**: signs the (stapled) DMG with
      `SPARKLE_ED_PRIVATE_KEY` via
      `desktop/tauri/src-tauri/.sparkle-dist/bin/sign_update` (staged by
@@ -91,6 +98,12 @@ All on `charliek/shed` (Settings → Secrets → Actions):
 | `SPARKLE_ED_PRIVATE_KEY` | EdDSA private key (base64) for appcast signing; the matching public key is baked into `desktop/tauri/src-tauri/Info.plist:33-36` (`SUPublicEDKey`) — never rotate one without the other |
 | `RELEASE_BOT_CLIENT_ID` / `RELEASE_BOT_APP_KEY` | release-bot GitHub App (shared with the Go leg) — mints the appcast-push and apt-dispatch tokens |
 
+A **stable** desktop tag requires all six `CAN_NOTARIZE` secrets: the
+signing gate refuses it in the `release-plan` job otherwise (see
+`desktop-macos` above). Confirm them with `gh secret list -R
+charliek/shed` before tagging, since the local pre-tag `release-plan.sh`
+run can't see repository secrets. An rc tag may run without them.
+
 Verify the App installation + the self-repo `contents: write` floor
 (the appcast push) via the `sanity-check-app.yml` workflow.
 
@@ -104,6 +117,8 @@ leg with two built-in guards:
   users are untouched.
 - `desktop-apt-dispatch` skips (`*-*` guard), so the rc deb never
   reaches the apt index.
+- The desktop signing gate lets an rc through without the Apple
+  secrets (an ad-hoc DMG), where a stable tag would fail closed.
 
 That makes `vX.Y.Z-rc.1` (with the desktop manifests bumped to match)
 the recommended dress rehearsal for DMG + notarize + EdDSA + appcast +
@@ -129,8 +144,11 @@ Sparkle update**, not a same-version no-op.
 ### Job specifics
 
 - Builds via `make -C desktop tauri-dmg-mac` (Sparkle staged first by
-  `scripts/fetch-sparkle.sh`, pinned Sparkle 2.8.1) and runs
-  `make -C desktop tauri-test` (the Tauri crate's unit tests).
+  `scripts/fetch-sparkle.sh`, pinned Sparkle 2.8.1, whose download
+  retries and honours a `SHED_SPARKLE_URL` override, the SHA256 pin
+  checked either way) and runs `make -C desktop tauri-test` (the Tauri
+  crate's unit tests). PR CI's `tauri-mac` job runs the same
+  `tauri-test`, so a macOS-only failure surfaces before a tag.
 - `sign_update` comes from
   `desktop/tauri/src-tauri/.sparkle-dist/bin/sign_update` (staged by
   `fetch-sparkle.sh`) — there is no SwiftPM artifacts path for this job.
@@ -145,8 +163,8 @@ Sparkle update**, not a same-version no-op.
 
 The Tauri app is the shipped macOS client as of 0.9.0 — the former
 Swift release job (which used to own stable tags) is retired; the Swift
-*sources* stay in the tree pending a later demolition (see the
-follow-up ticket filed alongside the promotion commit).
+*sources* stay in the tree pending a later demolition, tracked in
+[#364](https://github.com/charliek/shed/issues/364).
 
 The two-tag rc rehearsal described above (cut `vX.Y.Z-rc.1`, install by
 hand, cut `vX.Y.Z-rc.2`, verify a real in-place Sparkle update) remains

@@ -1,4 +1,4 @@
-.PHONY: build build-cli build-server build-egress-proxy build-agent build-firstboot build-tools build-fc-remote-server test test-integration test-host-agent-diff test-integration-dev test-integration-dev-fc dev-server-up dev-server-down dev-server-status dev-server-logs dev-server-restart dev-server-up-fc dev-server-down-fc dev-server-status-fc dev-server-logs-fc dev-server-restart-fc release clean dev-server dev-cli check check-kernel-pin check-roost-pin check-craze-pin craze-binaries coverage lint-all docs docs-serve firecracker-rootfs download-firecracker vz-rootfs vz-rootfs-base vz-rootfs-all
+.PHONY: build build-cli build-server build-egress-proxy build-agent build-firstboot build-tools build-fc-remote-server test test-integration test-integration-units test-host-agent-diff test-integration-dev test-integration-dev-fc dev-server-up dev-server-down dev-server-status dev-server-logs dev-server-restart dev-server-up-fc dev-server-down-fc dev-server-status-fc dev-server-logs-fc dev-server-restart-fc release clean dev-server dev-cli check check-kernel-pin check-roost-pin check-craze-pin craze-binaries coverage lint-all docs docs-serve firecracker-rootfs download-firecracker vz-rootfs vz-rootfs-base vz-rootfs-all
 
 GOARCH ?= $(shell go env GOARCH)
 
@@ -91,6 +91,16 @@ test-host-agent-diff:
 # `cargo test -p shed-core --test machine_transport_contract`, Dart in
 # shed-mobile. Needs uv and an sshd (skips cleanly without one).
 # See tests/machine-transport/README.md.
+# Server-free unit tests of the integration suite's own helpers and baked-image
+# test bodies (tests/integration/test_smoke_units.py). Runs in CI (integration-units).
+test-integration-units:
+	@command -v uv >/dev/null 2>&1 || { \
+	  echo "uv is required for the integration unit tests."; \
+	  echo "Install: brew install uv  (or https://docs.astral.sh/uv/getting-started/installation/)"; \
+	  exit 1; \
+	}
+	cd tests/integration && uv sync && uv run pytest test_smoke_units.py -v
+
 test-machine-transport:
 	@command -v uv >/dev/null 2>&1 || { \
 	  echo "uv is required for the machine-transport harness."; \

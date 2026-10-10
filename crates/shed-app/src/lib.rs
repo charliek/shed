@@ -36,6 +36,11 @@ pub mod machine;
 /// crate with default features, and reading a roost-session is exactly what it
 /// needs.
 pub mod roost;
+/// The spawn gate (plan 026 §3.3): the write barrier every spawn site takes a
+/// section of, so nothing is born once an orderly exit has begun. Ungated —
+/// the phone links this crate with default features and simply never builds
+/// one (every consumer's gate is optional).
+pub mod spawn_gate;
 pub mod timefmt;
 pub mod token_minter;
 pub mod traits;
@@ -64,9 +69,10 @@ pub use roost::{
     launch_argv, roost_capabilities, shed_reach_entry, tab_close, tab_dump, tab_open,
     BootstrapRunner, HooksRefresh, LabelledPort, LocalSession, ReachError, ReachKind,
     RecordedReach, RoostEndpoint, RoostPeek, RoostReach, RoostUpdate, RoostWatcher,
-    RoostWatcherOptions, SshBridge, SshBridgeOptions, SshExec, SystemSshTunnels, Tunnel,
-    TunnelOpener, UnreachableReach,
+    RoostWatcherOptions, SshBridge, SshBridgeOptions, SshExec, SystemSshTunnels, TeardownSink,
+    Tunnel, TunnelOpener, UnreachableReach,
 };
+pub use spawn_gate::{ChildExit, ShuttingDown, SlotClose, SpawnGate, SpawnSection, SHUTTING_DOWN};
 pub use token_minter::HostAgentTokenMinter;
 pub use traits::{
     AuthGate, AuthGateRef, AuthOutcome, AuthPrompt, Clock, ClockRef, CoordinatorEvent, EventSink,

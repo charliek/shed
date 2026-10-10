@@ -1,12 +1,18 @@
 # First Run
 
-This page walks the macOS app's first launch; the Linux Tauri client presents the same panes
-(the tray is a native menu — see [Architecture](architecture.md)).
+This page walks the first launch of the Tauri app, which is the client on both macOS and
+Linux and presents the same panes (on Linux the tray is a native menu — see
+[Architecture](architecture.md)).
 
-Launch `ShedDesktop.app`. It starts in the **menu bar only** (no Dock icon, no window) —
-look for the shippingbox icon. Open the dashboard from its dropdown. While a window is open
-the app becomes a regular app (Dock icon + ⌘-Tab + the top-left app menu); close the window
-and it returns to menu-bar-only, the icon staying put.
+**macOS:** launch `ShedDesktop.app`. It starts in the **menu bar only** (no Dock icon, no
+window) — look for the shippingbox icon. Open the dashboard from its popover. While a window
+is open the app becomes a regular app (Dock icon + ⌘-Tab + the top-left app menu); close the
+window and it returns to menu-bar-only, the icon staying put.
+
+**Linux:** launch `shed-desktop` (installed at `/usr/bin/shed-desktop`) from your launcher
+or a terminal. It lives in the system tray; clicking the tray icon opens a native menu with
+**Open Dashboard**, **Approvals**, **Preferences** and **Quit** (Tauri emits no tray click
+events on Linux, so there is no popover).
 
 ## The dashboard
 
@@ -19,11 +25,13 @@ The sidebar selects a pane:
   the server's configured aliases, defaulting to its `default_image`) + backend, and
   CPU/memory, then streams creation progress live (SSE). The list is kept current by polling
   each `shed-server`.
-- **Approvals** — pending credential-approval requests from `shed-host-agent`, with
-  Approve / Deny (optionally Touch ID) and "always allow". Empty unless the host agent is
-  configured to delegate — see [Credential approvals](approvals.md).
-- **Agents** — remote-control (Claude) sessions per shed, with state pills and "Open in
-  Claude" for ready ones.
+- **Approvals** — pending credential-approval requests, with Approve / Deny (optionally
+  Touch ID on macOS) and "always allow". They come from the app's own embedded broker by
+  default, or from a separate `shed-host-agent` configured to delegate — see
+  [Credential approvals](approvals.md).
+- **Agents** — the agent sessions on each shed and machine, as [roost](../extensions/roost-session-hosts.md)
+  rows with activity pills, plus craze and opencode sessions with a live transcript,
+  approvals and **New craze session**. See [Agent lanes](agent-lanes.md).
 - **Activity** — the merged audit feed (host-agent credentials + the app's decisions), with
   a "Reveal log" button.
 - **Egress** — per-host egress profiles (allow/deny rules, by source) plus an activity
@@ -33,9 +41,13 @@ The sidebar selects a pane:
 
 ## The menu bar
 
-The status item shows the running-shed count and a pending-approval badge. Its dropdown
-lists pending approvals (inline Approve/Deny) and running sheds, plus **Open dashboard**,
-**Preferences…**, **Check for Updates…** (Sparkle), and **Quit**.
+**macOS.** The status item shows the running-shed count and a pending-approval badge. Its
+popover lists pending approvals (inline Approve/Deny) and running sheds, plus **Open
+dashboard**, **Preferences…**, **Check for Updates…** (Sparkle), and **Quit**.
+
+**Linux.** The tray icon opens a native menu: **Open Dashboard**, **Approvals**,
+**Preferences** and **Quit**. There is no popover and no Sparkle item; the `.deb` updates
+through apt.
 
 ## Preferences
 

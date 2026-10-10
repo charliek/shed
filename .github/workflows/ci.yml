@@ -43,6 +43,7 @@ jobs:
       harness: ${{ steps.filter.outputs.harness }}
       hostagent: ${{ steps.filter.outputs.hostagent }}
       machinetransport: ${{ steps.filter.outputs.machinetransport }}
+      integrationunits: ${{ steps.filter.outputs.integrationunits }}
       docs: ${{ steps.filter.outputs.docs }}
       ci: ${{ steps.filter.outputs.ci }}
     steps:
@@ -140,6 +141,9 @@ jobs:
               - 'tests/machine-transport/**'
               - 'crates/shed-core/src/machine.rs'
               - 'crates/shed-core/src/craze.rs'
+            integrationunits:
+              # The integration suite's server-free unit tests (shed#398).
+              - 'tests/integration/**'
             docs:
               - 'docs/**'
               - 'zensical.toml'
@@ -675,6 +679,19 @@ jobs:
       - name: Live leg + forwarded-hub family (a missing sshd FAILS, never skips)
         run: MT_REQUIRE_SSHD=1 make test-machine-transport
 
+  # The integration suite's server-free unit tests (shed#398): the baked-image
+  # test bodies must fail, not skip, a listed backend's missing image. A unit
+  # nobody runs is that bug's own failure mode, hence a CI job.
+  integration-units:
+    name: integration-units
+    needs: changes
+    if: ${{ needs.changes.outputs.integrationunits == 'true' || needs.changes.outputs.ci == 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: astral-sh/setup-uv@v6
+      - run: make test-integration-units
+
   deb:
     name: deb
     needs: changes
@@ -807,6 +824,13 @@ jobs:
         run: cd desktop/tauri/ui && npm ci
       - name: Tauri clippy (standalone workspace)
         run: make -C desktop tauri-lint
+      - name: Tauri unit tests (macOS)
+        # publish-images.yaml's desktop-macos job runs this same target, after
+        # the GitHub release is out, so a macOS-only red cell must surface here
+        # first (plan 026 §3.11). Sparkle.framework is staged by now:
+        # tauri-lint's Darwin prerequisite ran fetch-sparkle, and tauri-test's
+        # own re-run of it is the idempotent no-op.
+        run: make -C desktop tauri-test
       - uses: astral-sh/setup-uv@v6
       # The craze cells run on the mac client too (plan 025 §3.5), against the
       # pinned craze binaries built for darwin on this runner; the action
@@ -919,12 +943,12 @@ jobs:
   ci-success:
     name: ci-success
     if: always()
-    needs: [changes, test, lint, plugin, pins, release-snapshot, swift, core-linux, host-agent-diff, machine-transport, deb, tauri-linux, tauri-mac, docs-build]
+    needs: [changes, test, lint, plugin, pins, release-snapshot, swift, core-linux, host-agent-diff, machine-transport, integration-units, deb, tauri-linux, tauri-mac, docs-build]
     runs-on: ubuntu-latest
     steps:
       - name: Require no job failed (skipped-by-filter counts as pass)
         run: |
-          results="${{ needs.changes.result }} ${{ needs.test.result }} ${{ needs.lint.result }} ${{ needs.plugin.result }} ${{ needs.pins.result }} ${{ needs.release-snapshot.result }} ${{ needs.swift.result }} ${{ needs.core-linux.result }} ${{ needs.host-agent-diff.result }} ${{ needs.machine-transport.result }} ${{ needs.deb.result }} ${{ needs.tauri-linux.result }} ${{ needs.tauri-mac.result }} ${{ needs.docs-build.result }}"
+          results="${{ needs.changes.result }} ${{ needs.test.result }} ${{ needs.lint.result }} ${{ needs.plugin.result }} ${{ needs.pins.result }} ${{ needs.release-snapshot.result }} ${{ needs.swift.result }} ${{ needs.core-linux.result }} ${{ needs.host-agent-diff.result }} ${{ needs.machine-transport.result }} ${{ needs.integration-units.result }} ${{ needs.deb.result }} ${{ needs.tauri-linux.result }} ${{ needs.tauri-mac.result }} ${{ needs.docs-build.result }}"
           echo "job results: ${results}"
           for r in ${results}; do
             case "${r}" in

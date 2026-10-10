@@ -12,7 +12,12 @@ name: Publish Images and Release
 #                                             a re-dispatched pre-retirement
 #                                             tag whose own release-plan.sh
 #                                             says ship_machine_rc=true (the
-#                                             component was retired, plan 010)
+#                                             component was retired, plan 010).
+#                                             When ship_desktop, it also runs
+#                                             the desktop signing gate: a
+#                                             STABLE tag without all six Apple
+#                                             secrets fails here, before
+#                                             anything publishes
 #
 #   Server component (ship_server):
 #   1. publish-build-tools          (~2 min)  shed-build-tools image
@@ -37,7 +42,7 @@ name: Publish Images and Release
 #                                             when NO goreleaser component
 #                                             ships (else the first shipping
 #                                             goreleaser invocation creates
-#                                             the release + changelog body)
+#                                             the release + its body)
 #   6. desktop-macos                          Tauri DMG + notarize + Sparkle
 #                                             appcast — the default macOS
 #                                             client as of 0.9.0; runs on
@@ -54,7 +59,9 @@ name: Publish Images and Release
 # ghcr images exist). The desktop chain orders uploads strictly AFTER
 # goreleaser on combined tags: whichever goreleaser invocation runs first
 # creates the release + owns the notes (`mode: keep-existing` — later
-# invocations and desktop jobs only add assets, never touch the body).
+# invocations and desktop jobs only add assets, never touch the body). On a
+# stable tag the body is the tag's curated CHANGELOG section
+# (scripts/release/changelog-section.sh), whichever job creates the release.
 #
 # Skipped-needs audit (every desktop job — and now `release` itself —
 # needs skippable jobs, so each carries an explicit `!cancelled() && …`
@@ -223,9 +230,53 @@ jobs:
           cat plan.out
           cat plan.out >> "$GITHUB_OUTPUT"
 
+      # The desktop signing gate (plan 026 §3.11, shed#402): a STABLE desktop
+      # tag must ship a Developer ID signed, notarized Mac build, so it fails
+      # closed here, in the job every other job needs, BEFORE anything
+      # publishes. (desktop-macos needs `release`, so by its first step the
+      # images, brew/apt artifacts and the GitHub release would already be out.)
+      # A prerelease passes with an ad-hoc note: the rc rehearsal path. Each
+      # flag is a presence boolean built from this workflow's own secrets — the
+      # same six CAN_NOTARIZE reads in desktop-macos — so no secret value ever
+      # reaches the script. desktop-macos re-runs the gate after its checkout
+      # as a backstop. release-scripts-test.sh asserts both invocations, their
+      # six flags, this step's ship_desktop condition and its position, and
+      # EXECUTES both steps' scripts (this fallback's version test included).
+      - name: Desktop signing gate (a stable desktop tag fails closed)
+        if: steps.plan.outputs.ship_desktop == 'true'
+        env:
+          TAG: ${{ github.event.inputs.version || github.ref_name }}
+        run: |
+          set -euo pipefail
+          if [ ! -f scripts/release/desktop-signing-gate.sh ]; then
+            # Only a manual dispatch checks out a tag older than its workflow,
+            # and the tags that predate the gate are the pre-0.9.0 ones (v0.8.0
+            # and v0.8.1 ship desktop). Those alone skip it, so their image
+            # republish keeps working: desktop-macos refuses a pre-0.9.0 mac
+            # republish at its first step. Only a bare v0.0.Z-v0.8.Z tag
+            # qualifies, no suffix of any kind. Anything else without the gate
+            # fails closed.
+            if [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ] \
+              && [[ "${TAG}" =~ ^v0\.[0-8]\.(0|[1-9][0-9]*)$ ]]; then
+              echo "::warning::${TAG} predates scripts/release/desktop-signing-gate.sh (a pre-0.9.0 tag); skipping the gate for this dispatch (desktop-macos refuses a pre-0.9.0 mac republish)."
+              exit 0
+            fi
+            echo "::error::scripts/release/desktop-signing-gate.sh is missing from ${TAG}'s checkout; only a workflow_dispatch of a pre-0.9.0 tag may run without it."
+            exit 1
+          fi
+          scripts/release/desktop-signing-gate.sh "${TAG}" \
+            --has MACOS_CERTIFICATE_P12_BASE64=${{ secrets.MACOS_CERTIFICATE_P12_BASE64 != '' }} \
+            --has MACOS_CERTIFICATE_PASSWORD=${{ secrets.MACOS_CERTIFICATE_PASSWORD != '' }} \
+            --has SHED_DESKTOP_DEVELOPER_ID_IDENTITY=${{ secrets.SHED_DESKTOP_DEVELOPER_ID_IDENTITY != '' }} \
+            --has APPLE_ID=${{ secrets.APPLE_ID != '' }} \
+            --has APPLE_TEAM_ID=${{ secrets.APPLE_TEAM_ID != '' }} \
+            --has APPLE_APP_SPECIFIC_PASSWORD=${{ secrets.APPLE_APP_SPECIFIC_PASSWORD != '' }}
+
   publish-build-tools:
     name: Publish shed-build-tools
     needs: release-plan
+    # No status function here, so GitHub's implicit success() applies: a failed
+    # release-plan (the desktop signing gate included) skips the image chain.
     if: needs.release-plan.outputs.ship_server == 'true'
     runs-on: ubuntu-latest
 
@@ -667,12 +718,40 @@ jobs:
           # formula).
           permission-contents: write
 
+      # The curated release body (plan 026 §3.11): the tag's own CHANGELOG
+      # section, written OUTSIDE the checkout (goreleaser's dirty check would
+      # refuse an untracked file in the tree). release-plan.sh's Ships check
+      # already proved that section exists, through the same extractor.
+      # Goreleaser components are stable-only, so this job never sees a
+      # prerelease; the `*-*` arm keeps goreleaser's own changelog there, as
+      # before.
+      - name: Curated release notes (the tag's CHANGELOG section)
+        id: notes
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          case "${TAG}" in
+            *-*)
+              echo "::notice::${TAG} is a prerelease; goreleaser writes its own changelog body."
+              echo "args=" >> "$GITHUB_OUTPUT"
+              ;;
+            *)
+              NOTES="${RUNNER_TEMP}/release-notes.md"
+              scripts/release/changelog-section.sh "${TAG}" > "${NOTES}"
+              echo "release body for ${TAG}: $(wc -l < "${NOTES}" | tr -d ' ') lines, starting:"
+              head -n 5 "${NOTES}"
+              echo "args=--release-notes=${NOTES}" >> "$GITHUB_OUTPUT"
+              ;;
+          esac
+
       # One invocation per SHIPPING component, fixed order server →
       # host-agent. Both configs use release.mode keep-existing +
-      # replace_existing_artifacts, so whichever runs FIRST
-      # creates the GH release with the goreleaser-changelog body (the
-      # changelog is derived from the repo tag range — identical whichever
-      # config generates it) and later invocations only add their assets.
+      # replace_existing_artifacts, so whichever runs FIRST creates the GH
+      # release and later invocations only add their assets. The FIRST one
+      # therefore takes `--release-notes` (the curated CHANGELOG section above)
+      # as the release body: server when it ships, else host-agent. A later
+      # invocation's own changelog never replaces it (keep-existing).
       # Skipping a component means its artifacts are never built — no
       # release asset exists for apt-charliek's asset scan to index, and
       # its brew formula is never pushed (the published formula stays at
@@ -684,7 +763,7 @@ jobs:
           # Pinned to match the CI release-snapshot job so the snapshot is a
           # faithful proof of what the release runs (was `latest`).
           version: v2.15.3
-          args: release --clean -f .goreleaser.server.yaml
+          args: release --clean -f .goreleaser.server.yaml ${{ steps.notes.outputs.args }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           # GoReleaser reads HOMEBREW_TAP_TOKEN from this env var (see the
@@ -698,7 +777,9 @@ jobs:
         uses: goreleaser/goreleaser-action@v7
         with:
           version: v2.15.3
-          args: release --clean -f .goreleaser.host-agent.yaml
+          # The release body only when this is the first shipping invocation
+          # (no server): otherwise server already created the release.
+          args: release --clean -f .goreleaser.host-agent.yaml ${{ needs.release-plan.outputs.ship_server != 'true' && steps.notes.outputs.args || '' }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           HOMEBREW_TAP_TOKEN: ${{ steps.tap.outputs.token }}
@@ -760,9 +841,10 @@ jobs:
 
   # Desktop-only tags need a GitHub Release to upload into; whenever ANY
   # goreleaser component ships, the first goreleaser invocation owns release
-  # creation + the changelog body (mode: keep-existing — a pre-created
-  # release would freeze the placeholder notes as the body, so this job must
-  # NOT run then). Runs ONLY when ship_desktop && !ship_goreleaser.
+  # creation + the release body (mode: keep-existing — a pre-created
+  # release would freeze this job's body, so this job must NOT run then).
+  # Runs ONLY when ship_desktop && !ship_goreleaser. A stable tag's body is
+  # its curated CHANGELOG section; a prerelease gets a placeholder.
   # Idempotent: reuses an existing release (e.g. a workflow_dispatch
   # republish of a desktop-only tag). `!cancelled()` (not `always()`): a
   # user-cancelled run must not create releases.
@@ -794,15 +876,26 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          set -euo pipefail
           if gh release view "$TAG" >/dev/null 2>&1; then
             echo "release $TAG already exists — reusing it"
           else
-            # Prerelease tags (the Tauri beta track) must not become the
-            # repo's "latest" release.
-            PRERELEASE_FLAG=""
-            case "$TAG" in *-*) PRERELEASE_FLAG="--prerelease" ;; esac
-            gh release create "$TAG" --title "$TAG" $PRERELEASE_FLAG \
-              --notes "Release $TAG — assets are uploading."
+            case "$TAG" in
+              *-*)
+                # Prerelease tags (the Tauri beta track) must not become the
+                # repo's "latest" release, and have no CHANGELOG section.
+                gh release create "$TAG" --title "$TAG" --prerelease \
+                  --notes "Release $TAG — assets are uploading."
+                ;;
+              *)
+                # A stable tag's body is its curated CHANGELOG section (plan
+                # 026 §3.11), the same extractor release-plan.sh's Ships check
+                # read. desktop-macos appends the notarization line after it.
+                NOTES="${RUNNER_TEMP}/release-notes.md"
+                scripts/release/changelog-section.sh "$TAG" > "$NOTES"
+                gh release create "$TAG" --title "$TAG" --notes-file "$NOTES"
+                ;;
+            esac
           fi
 
   # macOS (Tauri app): the default macOS client as of 0.9.0 — runs on every
@@ -810,7 +903,8 @@ jobs:
   # used to own stable tags is retired; Swift sources stay for a later
   # demolition — see the follow-up ticket). Bundle (Sparkle.framework via
   # fetch-sparkle) → notarize+staple when the six Apple secrets exist
-  # (CAN_NOTARIZE) → upload → EdDSA-sign for the Sparkle appcast → bot-push
+  # (CAN_NOTARIZE; a stable tag requires all six, enforced by the desktop
+  # signing gate) → upload → EdDSA-sign for the Sparkle appcast → bot-push
   # docs/appcast.xml to main. Skip-safe gating: a skipped `release`
   # (desktop-only tag) or skipped `desktop-release-create` (combined tag)
   # must not block; a FAILED one must. This job's `if:` is byte-identical to
@@ -837,7 +931,9 @@ jobs:
       TAG: ${{ github.event.inputs.version || github.ref_name }}
       # Sign + notarize only when the FULL six-secret prerequisite set is
       # present, else an ad-hoc (Gatekeeper-blocked) DMG. The identity
-      # reaches the build step only when this is true.
+      # reaches the build step only when this is true. Only a PRERELEASE can
+      # get here with it false: the desktop signing gate (release-plan, and
+      # the backstop step below) refuses a stable tag without all six.
       CAN_NOTARIZE: ${{ secrets.MACOS_CERTIFICATE_P12_BASE64 != '' && secrets.MACOS_CERTIFICATE_PASSWORD != '' && secrets.SHED_DESKTOP_DEVELOPER_ID_IDENTITY != '' && secrets.APPLE_ID != '' && secrets.APPLE_TEAM_ID != '' && secrets.APPLE_APP_SPECIFIC_PASSWORD != '' }}
     steps:
       # The macOS client changed implementation at 0.9.0 (Swift -> Tauri), so a
@@ -874,6 +970,22 @@ jobs:
           # Don't persist GITHUB_TOKEN creds, so the appcast bot push
           # authenticates as the App token (and docs.yml runs).
           persist-credentials: false
+
+      # Backstop for the release-plan job's desktop signing gate (plan 026
+      # §3.11): the same script and the same six presence flags, before any
+      # build, so this job can never build an ad-hoc DMG and push a STABLE
+      # appcast entry for it. CAN_NOTARIZE (this job's env) is unchanged: a
+      # prerelease still builds ad-hoc without the secrets. No fallback for a missing
+      # script: this job's first step already refused every pre-0.9.0 dispatch.
+      - name: Desktop signing gate (backstop, before any build)
+        run: |
+          scripts/release/desktop-signing-gate.sh "${TAG}" \
+            --has MACOS_CERTIFICATE_P12_BASE64=${{ secrets.MACOS_CERTIFICATE_P12_BASE64 != '' }} \
+            --has MACOS_CERTIFICATE_PASSWORD=${{ secrets.MACOS_CERTIFICATE_PASSWORD != '' }} \
+            --has SHED_DESKTOP_DEVELOPER_ID_IDENTITY=${{ secrets.SHED_DESKTOP_DEVELOPER_ID_IDENTITY != '' }} \
+            --has APPLE_ID=${{ secrets.APPLE_ID != '' }} \
+            --has APPLE_TEAM_ID=${{ secrets.APPLE_TEAM_ID != '' }} \
+            --has APPLE_APP_SPECIFIC_PASSWORD=${{ secrets.APPLE_APP_SPECIFIC_PASSWORD != '' }}
 
       - name: Rust toolchain
         # The Tauri workspace (the sparkle-updater crate's build.rs + the shed-core
@@ -1108,16 +1220,34 @@ jobs:
           cache-dependency-path: desktop/tauri/ui/package-lock.json
       - name: Frontend bundle (generate_context! needs tauri/ui/dist)
         run: cd tauri/ui && npm ci && npm run build
-      - name: Install nfpm (pinned)
+      - name: Install nfpm (pinned, digest-verified)
+        # Downloaded to a FILE with retries (a retry after a partial body must
+        # never feed `tar` duplicate bytes, as a curl | tar pipe would), then
+        # checked against an IN-TREE digest per arch — never a fetched
+        # checksums file. The digests were read once from nfpm v2.46.3's
+        # checksums.txt and cross-checked against the downloaded tarballs
+        # (plan 026 §3.11). A version bump moves NFPM_VERSION and both
+        # digests together.
         run: |
+          set -euo pipefail
           NFPM_VERSION=2.46.3
           case "${{ matrix.arch }}" in
-            amd64) NA=x86_64 ;;
-            arm64) NA=arm64 ;;
+            amd64) NA=x86_64; NFPM_SHA256=9170d25ea056d7329def38134b2bcad98d02d221f8331610dcd619e84d28c565 ;;
+            arm64) NA=arm64;  NFPM_SHA256=7871d72bb1035924eab56031f962ae3f004b1f7695151789ef018bdbc507a2fa ;;
             *) echo "::error::unsupported arch ${{ matrix.arch }}" >&2; exit 1 ;;
           esac
-          curl -sSfL "https://github.com/goreleaser/nfpm/releases/download/v${NFPM_VERSION}/nfpm_${NFPM_VERSION}_Linux_${NA}.tar.gz" \
-            | sudo tar -xz -C /usr/local/bin nfpm
+          TARBALL="${RUNNER_TEMP}/nfpm_${NFPM_VERSION}_Linux_${NA}.tar.gz"
+          curl -fsSL --retry 5 --retry-delay 2 --retry-all-errors -o "${TARBALL}" \
+            "https://github.com/goreleaser/nfpm/releases/download/v${NFPM_VERSION}/nfpm_${NFPM_VERSION}_Linux_${NA}.tar.gz"
+          echo "${NFPM_SHA256}  ${TARBALL}" | sha256sum -c -
+          sudo tar -xzf "${TARBALL}" -C /usr/local/bin nfpm
+          GOT="$(nfpm --version 2>&1)"
+          if ! grep -qxE "GitVersion:[[:space:]]+v?${NFPM_VERSION}" <<<"${GOT}"; then
+            echo "::error::nfpm --version does not report ${NFPM_VERSION}:" >&2
+            echo "${GOT}" >&2
+            exit 1
+          fi
+          echo "nfpm ${NFPM_VERSION} installed (sha256 ${NFPM_SHA256})"
       - name: Assert the runner arch matches the matrix
         # Runner-label availability isn't provable by actionlint; fail loudly here
         # rather than silently ship an amd64 .deb labelled arm64.

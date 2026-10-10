@@ -121,7 +121,10 @@ export function beginSubmit(d: CrazeDraft, mint: () => string = () => mintReques
 /** A submission settles. **Only an unknown outcome keeps the id** — craze
  *  stores a failure under its id and would replay that same failure for ten
  *  minutes, so after ANY definite answer (a session, or any refusal) the next
- *  submission mints a new one. The typed form is never touched. */
+ *  submission mints a new one. A HELD replay that still got no answer about
+ *  its request (a dial that never reached craze, craze offline) is
+ *  `outcome_unknown` too, so it keeps the id as well (plan 026 §3.1). The
+ *  typed form is never touched. */
 export function settle(d: CrazeDraft, outcome: { ok: true } | { ok: false; refusal: CrazeRefusal }): CrazeDraft {
   if (outcome.ok) return { ...d, requestId: null, phase: "created", refusal: null };
   if (outcome.refusal.code === "outcome_unknown") {
@@ -153,6 +156,61 @@ export function primaryLabel(d: CrazeDraft): string {
 /** What the sheet says about an UNKNOWN outcome (§3.8). */
 export const OUTCOME_UNKNOWN_NOTE =
   "craze did not answer, so the session may have been created: check the session list. Try again resumes the same request.";
+
+// ---- a held request, replayed (plan 026 §3.1) -------------------------------
+
+/** What the note adds while a request is held: an edit is the way out of it,
+ *  so it is said rather than disabled. */
+export const HELD_EDIT_NOTE = "Changing the form starts a new request instead.";
+
+/** **Whether the next submission REPLAYS a held request**: the last outcome is
+ *  unknown and its id is kept. While it is, the sheet re-sends the same id and
+ *  the same request (`held` on the wire, so only craze's own answer about it
+ *  ends the id), whatever has become of the provider since. */
+export function replaysHeldRequest(d: CrazeDraft): boolean {
+  return d.phase === "unknown" && d.requestId !== null;
+}
+
+/** The sheet's gate: what it renders as selected, whether it is replaying,
+ *  its note, and whether the primary button works. */
+export type CrazeCreateGate = {
+  /** The selected provider's id — the draft's, while it is ready, or ALWAYS
+   *  while a held request is replayed (dimmed, or absent from a re-read
+   *  list: craze answers a held id regardless). */
+  selected: string | null;
+  replaying: boolean;
+  /** The machine's note (offline, too old, not installed) first; else, while
+   *  replaying, the unknown outcome and what an edit does; else "no provider
+   *  is ready". */
+  note: string | null;
+  canCreate: boolean;
+};
+
+/** **The create sheet's gating, in one place** (the dialog renders from it and
+ *  holds no rule of its own). While a held request is replayed, readiness
+ *  does not gate: the held provider stays selected and "no provider is ready"
+ *  is not said. A machine note still blocks — the retry needs a hub. */
+export function crazeCreateGate(
+  d: CrazeDraft,
+  o: CrazeCreateOptions | null,
+  machineNote: string | null,
+): CrazeCreateGate {
+  const replaying = replaysHeldRequest(d);
+  const providers = o?.providers ?? [];
+  const current = providers.find((p) => p.id === d.provider);
+  const selected = d.provider !== null && (replaying || (current !== undefined && providerSelectable(current)))
+    ? d.provider
+    : null;
+  const noneReady = !!o && !providers.some(providerSelectable);
+  const note = machineNote
+    ?? (replaying ? `${OUTCOME_UNKNOWN_NOTE} ${HELD_EDIT_NOTE}` : noneReady ? NO_PROVIDER_READY : null);
+  const canCreate = !!o
+    && (selected !== null || replaying)
+    && directoryProblem(d.cwd) === null
+    && machineNote === null
+    && d.phase !== "submitting";
+  return { selected, replaying, note, canCreate };
+}
 
 /** Where and how a refusal is shown (§3.8, by code): `bad_request` beside the
  *  directory — except craze's `request_conflict` (an id reused with other
@@ -189,6 +247,42 @@ export type CrazeStatusLike = {
 export function crazeCreateOffered(craze: CrazeStatusLike): boolean {
   if (craze?.state === "dormant") return true;
   return craze?.state === "live" && !!craze.create && !!craze.create_options;
+}
+
+/** A host as far as the craze lookup needs it — structurally a `bridge.ts`
+ *  `MachineStatus` (a listed host's status row) or a `ShedCrazeEntry` (an
+ *  unlisted host craze is offered on). */
+export type CrazeHostLike = { name: string; origin: string; craze?: CrazeStatusLike };
+
+/** **A host's craze status, from wherever `rc.list` carries it** (plan 026
+ *  §3.2): the LISTED host's status row's `craze`, or else its `shed_craze`
+ *  entry's — a running shed whose probe says dormant (or too old) is offered
+ *  craze without being listed. `host` is the host's origin token or its
+ *  address (a status row's `name`, what the sheet is opened by): both name one
+ *  host. A host is never in both lists; the status row is read first.
+ *
+ *  **Every reader of a host's craze status goes through this** — the Sheds
+ *  pane, the New-session dialog's "Where" and the create sheet's note — so an
+ *  unlisted dormant shed is not read as "no craze" by one of them (the sheet
+ *  would then say "… has no craze" and disable Create). */
+export function crazeStatusFor(
+  host: string,
+  machines: CrazeHostLike[],
+  shedCraze: CrazeHostLike[],
+): CrazeStatusLike {
+  const named = (h: CrazeHostLike) => h.origin === host || h.name === host;
+  const listed = machines.find(named);
+  if (listed) return listed.craze;
+  return shedCraze.find(named)?.craze;
+}
+
+/** The hosts the New-session dialog's "Where" offers "— new craze session"
+ *  on: every listed host, then every `shed_craze` entry, whose craze offers
+ *  one ([`crazeCreateOffered`], read through [`crazeStatusFor`]) — in that
+ *  order, each once. */
+export function crazeCreateTargets(machines: CrazeHostLike[], shedCraze: CrazeHostLike[]): CrazeHostLike[] {
+  return [...machines, ...shedCraze].filter((h) =>
+    crazeCreateOffered(crazeStatusFor(h.origin, machines, shedCraze)));
 }
 
 /** The machine's line when its LIVE hub cannot create — listing still works,

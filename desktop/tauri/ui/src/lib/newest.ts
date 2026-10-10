@@ -60,3 +60,29 @@ export function newestWins(): NewestWins {
   };
   return guard;
 }
+
+/** A whole-slice RELOAD that commits only its newest answer, and keeps what it
+ *  has on a failure — the shell's host list (`system_df`, re-read on every
+ *  `refresh`), which feeds the Hosts badge and the sidebar (shed#400).
+ *
+ *  The shell's reload used to commit whatever came back, in arrival order, so
+ *  an older answer landing second overwrote a newer one. And a failed read is not
+ *  news about the hosts: it says the read failed, not that there are none, so
+ *  it commits nothing and the last rows stay. A failure still counts as an
+ *  answer for ordering — an OLDER success landing after a NEWER failure is
+ *  dropped like any other stale answer, so the rows only ever move to a read
+ *  that was started later than the one they came from. */
+export type NewestReload = {
+  /** Start one read; it commits iff nothing started after it has answered. */
+  reload(): Promise<void>;
+  /** Stop committing anything, for good — the unmount. */
+  cancel(): void;
+};
+
+export function newestReload<T>(read: () => Promise<T>, commit: (value: T) => void): NewestReload {
+  const reads = newestWins();
+  return {
+    reload: () => reads.run(read, commit, () => {}),
+    cancel: () => reads.cancel(),
+  };
+}

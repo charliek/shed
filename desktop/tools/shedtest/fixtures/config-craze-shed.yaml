@@ -1,0 +1,17 @@
+# Seed shed config for the running-shed craze cells (plan 026 §3.2, "offer,
+# don't list"): ONE server, whose sheds the module's private mock lists
+# running, and no machines — so nothing but those sheds can repaint the
+# listing while a cell watches it.
+#
+# Each running shed is reached only through the fake `ssh` the shed instance
+# installs (`SHED_TAURI_SSH_BIN`): a shed's ssh identity is `<shed>@<server
+# host>`, so its name is the jail the fake runs its remote commands in. None
+# runs a roost-session (the fake answers roost's client-bridge `command not
+# found`), so only craze can ever list one.
+servers:
+    mock:
+        host: 127.0.0.1
+        http_port: 8080
+        ssh_port: 2222
+default_server: mock
+sheds: {}

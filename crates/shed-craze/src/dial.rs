@@ -305,6 +305,8 @@ pub struct Exit {
 pub struct ExitWatch {
     status: watch::Receiver<Option<Exit>>,
     switch: Arc<KillSwitch>,
+    /// The process's pid, taken at [`ExitWatch::spawn`] — for a log line.
+    pid: Option<u32>,
 }
 
 struct KillSwitch(Mutex<Option<oneshot::Sender<()>>>);
@@ -327,6 +329,7 @@ impl ExitWatch {
     /// Watch `child` from a task of its own: its exit is published, and it is
     /// killed (and reaped) when the watch is dropped or killed first.
     pub fn spawn(mut child: Child) -> ExitWatch {
+        let pid = child.id();
         let (status_tx, status) = watch::channel(None);
         let (kill_tx, kill_rx) = oneshot::channel::<()>();
         tokio::spawn(async move {
@@ -346,7 +349,15 @@ impl ExitWatch {
         ExitWatch {
             status,
             switch: Arc::new(KillSwitch(Mutex::new(Some(kill_tx)))),
+            pid,
         }
+    }
+
+    /// The process's pid, taken when it was spawned (`None` if it had already
+    /// been reaped by then). For naming it in a log — never for signalling:
+    /// once reaped, the number can belong to someone else.
+    pub fn pid(&self) -> Option<u32> {
+        self.pid
     }
 
     /// How it ended, if it has.

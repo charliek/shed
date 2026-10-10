@@ -310,7 +310,8 @@ ARG ROOST_SESSION_PROTOCOL=6
 ARG ROOST_SESSION_SHA256_AMD64=cbf9ae38d9f613cff88b951a7a895cf2241a831476a42fcf9844488331a6e435
 ARG ROOST_SESSION_SHA256_ARM64=dca26f903c5815020e27f8cc87df1ec806ffe943637c08c5324c51a714238d2b
 
-# craze (the agent-lane CLI shed's `shed attach` drives) is baked the same way —
+# craze (the agent-lane CLI the desktop and phone drive; the desktop's create sheet
+# starts a remote hub) is baked the same way —
 # a standalone release asset, not a deb, fetched from charliek/craze's GitHub
 # release. Pinned to a NAMED release, never "whatever is latest": plan 025's O2
 # weighed baking latest-on-main so craze "works now" and rejected it — the bake

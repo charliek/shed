@@ -12,6 +12,15 @@ Background and decision rationale: see
 
 ## Running
 
+Server-free unit tests of the suite's own helpers and the baked-image test
+bodies (`test_smoke_units.py`) run without any shed-server, and in CI:
+
+```sh
+make test-integration-units
+```
+
+The live suite:
+
 ```sh
 make test-integration
 ```

@@ -20,6 +20,11 @@
 #
 # Usage:
 #   ./scripts/fetch-sparkle.sh          # or: make sparkle-framework
+#
+# SHED_SPARKLE_URL overrides where the tarball is fetched from (default: the
+# pinned GitHub release URL below), e.g. a mirror or a local test server. The
+# SHA256 pin is checked either way, so the override moves the source, never
+# what is accepted. The download retries transient failures (#379).
 
 set -euo pipefail
 
@@ -30,7 +35,8 @@ fi
 
 SPARKLE_VERSION="2.8.1"
 SPARKLE_SHA256="5cddb7695674ef7704268f38eccaee80e3accbf19e61c1689efff5b6116d85be"
-SPARKLE_URL="https://github.com/sparkle-project/Sparkle/releases/download/${SPARKLE_VERSION}/Sparkle-${SPARKLE_VERSION}.tar.xz"
+SPARKLE_PINNED_URL="https://github.com/sparkle-project/Sparkle/releases/download/${SPARKLE_VERSION}/Sparkle-${SPARKLE_VERSION}.tar.xz"
+SPARKLE_URL="${SHED_SPARKLE_URL:-${SPARKLE_PINNED_URL}}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
@@ -56,7 +62,12 @@ STAGE_DIR="$(mktemp -d "${DEST_DIR}/.sparkle-stage.XXXXXX")"
 trap 'rm -rf "${TMP_DIR}" "${STAGE_DIR}"' EXIT
 
 echo "==> Downloading Sparkle ${SPARKLE_VERSION}"
-curl -fsSL -o "${TMP_DIR}/sparkle.tar.xz" "${SPARKLE_URL}"
+if [ "${SPARKLE_URL}" != "${SPARKLE_PINNED_URL}" ]; then
+  echo "==> from SHED_SPARKLE_URL: ${SPARKLE_URL}"
+fi
+# Into a file, so a retry after a partial body restarts the file rather than
+# appending to a stream; the checksum below is the integrity check.
+curl -fsSL --retry 5 --retry-delay 2 --retry-all-errors -o "${TMP_DIR}/sparkle.tar.xz" "${SPARKLE_URL}"
 
 echo "==> Verifying checksum"
 echo "${SPARKLE_SHA256}  ${TMP_DIR}/sparkle.tar.xz" | shasum -a 256 -c - >/dev/null

@@ -9,7 +9,7 @@ reaches each one, and what the current build does not do.
 
 ## Lanes and sources
 
-`shed_core::lane` (plan 015, split in plan 025) is the contract every agent
+`shed_core::lane` is the contract every agent
 adapter implements, at two levels:
 
 - A **source** (`AgentSource`) is a machine's view of its sessions: it streams
@@ -100,6 +100,13 @@ The desktop runs one craze source per host: this machine, every `machines:`
 entry, and every running shed (a shed gets one when it is first seen running,
 whether or not roost is there).
 
+A shed shows in the Machines pane once something answers there: its
+roost-session, or its craze hub (the roster's first answer, or a session
+created there). Until then a running shed whose craze is **dormant** is
+offered **New craze session** on its Sheds-pane row and in the New-session
+dialog's "Where", without being listed, and one whose craze is **too old**
+says so on its row. A shed without craze says nothing.
+
 - **This machine is eager.** Its source holds one roster connection from
   launch. `bridge --hub` joins the hub already running there and starts one
   only when none is running yet — then in the app's own session, on a Mac the
@@ -117,7 +124,7 @@ every 30 s while craze is not installed or too old):
 | State | Meaning | What runs |
 |---|---|---|
 | `live` | Attached to the hub's roster | One `craze bridge --hub` roster connection |
-| `dormant` | craze is there, no hub is running; nothing is listed from craze | The probe again every 30 s |
+| `dormant` | craze is there, no hub is running; nothing is listed from craze (a dormant shed is offered New craze session without being listed) | The probe again every 30 s |
 | `offline` | The roster dropped, the probe could not ask (`cause: unreachable`), or craze is too old (`cause: too_old`) | The probe: about a second after a live roster ends, on a backoff (1 s → 30 s) while the host is unreachable, every 30 s while craze is too old |
 | `absent` | Never reached, or craze is not installed (`cause: not_installed`) | The probe; every 30 s while craze is not installed |
 
@@ -197,8 +204,8 @@ restart. While the source is not live, the rows it still holds show as last
 known (`stale`, `approximate`).
 
 A craze session can also be a roost tab: a craze TUI claims its tab, and roost
-reports it as owned by craze. For craze sessions **the hub row is the row**
-(plan 025 D4), computed per machine by `shed_app::craze_rows::fold_plan`:
+reports it as owned by craze. For craze sessions **the hub row is the row**,
+computed per machine by `shed_app::craze_rows::fold_plan`:
 
 - **While the hub feed is live,** every craze-owned roost tab is folded away. A
   tab that names a hub row's provider session id attaches to that row, which
@@ -217,11 +224,28 @@ the row's hostId); a row without one offers **Open in terminal**.
 
 ### Creating a session
 
-**New craze session** is offered on a machine's card, on its group in the
-Agents pane, and as a "Where" choice in the New-session dialog, when the
-machine's craze is live and its hub can create — or when it is dormant, in
-which case opening the sheet is the explicit action that starts its hub. A hub
-too old to create says "update craze on this machine to create sessions here".
+**New craze session** is offered where a host's craze can create a session:
+live with a hub that can create, or dormant, in which case opening the sheet
+is the explicit action that starts its hub.
+
+- A dormant **machine** is offered it on its Machines-pane card (and, once it
+  lists sessions, on its group in the Agents pane).
+- A dormant **shed** is offered it on its Sheds-pane row. Until its roost
+  answers or it has a hub, a shed is not listed, so its row is where it is
+  offered; once listed, its card and its Agents-pane group offer it too.
+- Both are a "Where" choice in the New-session dialog ("— new craze session").
+
+A hub too old to create says "update craze on this machine to create sessions
+here". A craze too old for shed says "craze on this machine is too old for
+shed; update it" on the machine's card or the shed's row, and offers nothing.
+
+A shed listed by craze alone — a session created there, or its hub's roster,
+listed it, and no roost-session has answered there (so nothing watches one) —
+reads **craze only**
+on its Machines-pane card and in the sidebar, with "no roost session here yet
+— craze sessions only" beneath its name, rather than "connecting". It ranks
+with the reachable hosts, its sidebar dot is neutral, and the Agents pane does
+not count it as unreachable. Its card still offers to set up roost.
 
 The sheet reads craze's create options afresh on every open; shed stores no
 defaults or history of its own.
@@ -261,6 +285,13 @@ retry (once, on a dropped connection or the 120 s deadline), a Try again after
 an unknown outcome, and reopening the sheet mid-submit all reuse it, so a lost
 answer never makes a second session. Any definite answer — a session or any
 refusal — and any edit of the form mint a new one.
+
+The boundary of that guarantee: Try again can never start a **second session
+while the first one is still running**. Within ten minutes of craze's original
+answer, a retry gets that same answer back, even if the session has since
+ended (shed does not resurrect the ended row). Only after that, and only if the
+session has ended and craze finds no live session for the request, does a retry
+start a new one.
 
 **A created session is listed at once.** The roster can list a new session a
 moment after the create answers, so `CrazeSource` keeps the created row apart
@@ -334,6 +365,14 @@ the craze session id every later call uses), then `session.attach`.
 - **Stop** ends the session, not just the transcript, behind an inline
   confirm. craze answers with a receipt; the lane ends with `session_closed`
   and the row leaves.
+- **End tab and Stop are different on a row hosted in a TUI.** **End tab**
+  closes only that roost tab; the session keeps running in craze's hub, and its
+  row stays (without the tab). **Stop** is what ends the session.
+- **A stopped session can reappear for about a second.** Right after Stop, a
+  craze roster update can list the session once more before the hub's next
+  update removes it. It is craze's roster behaviour
+  ([craze#93](https://github.com/charliek/craze/issues/93)), cosmetic, and
+  shed does not hide it, because the roster is the listing authority.
 
 **What the transcript draws.** craze's own fold updates rows in place; shed's
 rows are append-only, so the adapter segments: a streaming text or reasoning
@@ -403,6 +442,11 @@ attached craze TUI appears live.
   requested value on screen, the row just shows it. Otherwise it says "not
   confirmed" until the session's next `Settings` states the real value; a
   silent resume always restates the settings, so a reconnect clears it.
+
+- **A cursor model change is the machine's default.** Changing a cursor
+  session's model from the sheet changes cursor's own global default on that
+  machine (cursor keeps it in `~/.cursor/cli-config.json`), so sessions you
+  start there later begin on it too, not only this one.
 
 A session with nothing to set has no chip and no sheet.
 
@@ -573,7 +617,7 @@ otherwise.
 `LaneApprovalOption.kind` is an option's *semantic* kind (`allow_once` /
 `allow_always` / `reject_once` / `reject_always`); `id` is opaque and
 independent of it, and an agent can offer several options of the same kind. A
-live gx leader (plan 017's adapter, retired in plan 025) proved it: asked to
+live gx leader (an earlier adapter, since retired) proved it: asked to
 run `id -un`, it offered five options, two of them `allow_once` — "Yes,
 proceed" and "Yes, and don't ask again for anything (always-approve mode)". So
 a bare decision (`AllowOnce` / `AllowAlways` / `Reject`) is not always enough

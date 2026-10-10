@@ -1244,6 +1244,46 @@ def test_a_sheds_rows_are_roosts_and_a_filter_returns_them(boot, rig, mock):
     assert not _roost_rows(boot, "p19-new", {"host": SERVER, "shed": shed})
 
 
+def test_a_first_prompt_or_permission_mode_is_refused_on_a_shed(boot, rig, mock):
+    """**Refused, exactly `bad_request`, and nothing opens on the shed** (plan
+    026 §3.5) — the `roost:<server>/<shed>` twin of `test_tauri_machines.py`'s
+    machine-form cell, over the real bridge.
+
+    Every door a shed is addressed through: `rc.launch {shed}` (the pre-S6 op,
+    which can only name a shed) and `roost.launch`/`machine.launch` by the
+    grammar token. The last launch is the control: the same shed, asked for what
+    a roost launch does, opens a tab — so the zero `tab.open` above is the
+    refusal's, not a shed that could not have opened anything. It carries a name,
+    which is the shed path's half of the title rule.
+    """
+    shed = "p26-refused"
+    fake = rig.roost()
+    target = rig.host(shed, identity=IDENTITY_CURRENT, running=True, roost=fake)
+    doors = [
+        ("rc.launch", {"shed": shed}),
+        ("roost.launch", {"target": target}),
+        ("machine.launch", {"target": target}),
+    ]
+    for field, value in (("initial_prompt", "fix the build"), ("permission_mode", "plan")):
+        for op, address in doors:
+            with pytest.raises(ShedError) as excinfo:
+                boot.call(op, {**address, "kind": "opencode", field: value})
+            assert excinfo.value.code == "bad_request", (op, field, excinfo.value)
+            assert excinfo.value.message.startswith(
+                f"{field} is not supported by a roost launch"), excinfo.value
+    assert fake.opens == [], f"a refused launch opened a tab on the shed: {fake.opens}"
+    assert fake.title_calls == []
+
+    launched = boot.call(
+        "roost.launch",
+        {"target": target, "kind": "opencode", "display_name": "  Shed run  "},
+    )
+    assert len(fake.opens) == 1, fake.opens
+    assert launched["origin"] == target, launched
+    assert launched["title"] == "applied", launched
+    assert fake.title_calls == [{"tab_id": launched["slug"], "title": "Shed run"}]
+
+
 def test_a_down_kind_reaches_rc_list_and_a_flap_keeps_the_roost_rows(boot, rig, mock):
     """`Down.kind` end to end, and the flap that must not blank the card.
 

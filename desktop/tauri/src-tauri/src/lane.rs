@@ -196,6 +196,7 @@ use tauri::{AppHandle, Emitter};
 
 use shed_app::lane_view::LaneView;
 use shed_app::machine::{MachineForward, SshForward};
+use shed_app::spawn_gate::ShuttingDown;
 use shed_core::config::MachineEntry;
 use shed_core::lane::{
     AgentLane, AgentSource, LaneAnswer, LaneDecision, LaneError, LaneEvent, LaneSession,
@@ -225,6 +226,11 @@ pub const LANE_EVENT: &str = "lane-event";
 const RESUBSCRIBE_BASE: Duration = Duration::from_millis(200);
 /// See [`RESUBSCRIBE_BASE`].
 const RESUBSCRIBE_MAX: Duration = Duration::from_secs(5);
+
+/// How long [`Lanes::shutdown`] waits for its aborted pumps to have ended — an
+/// aborted task ends at its next poll, so this bounds only a pump stuck in
+/// something that never yields.
+const PUMP_JOIN_WAIT: Duration = Duration::from_secs(1);
 
 /// The [`LaneEvent::Down`] reason an adapter ends a lane with when the session
 /// does not exist (opencode: a reseed answered 404; craze: `unknown_session` on
@@ -348,6 +354,9 @@ pub enum LaneFailure {
     /// next `Settings` says what it is at (plan 025 §3.10), where a refusal is
     /// shown as one.
     OutcomeUnknown(String),
+    /// The app is quitting (plan 026 §3.3): the lane layer has closed, and no
+    /// lane opens again. `shutting_down`, the spawn gate's own code.
+    ShuttingDown,
     /// The adapter (or the transport under it) said no.
     Lane(LaneError),
 }
@@ -372,6 +381,7 @@ impl LaneFailure {
             LaneFailure::NoLane(_) => "no_lane",
             LaneFailure::UnsupportedLane(_) => "unsupported_lane",
             LaneFailure::OutcomeUnknown(_) => "outcome_unknown",
+            LaneFailure::ShuttingDown => shed_app::spawn_gate::SHUTTING_DOWN,
             LaneFailure::Lane(e) => match e {
                 LaneError::Unauthorized => "unauthorized",
                 LaneError::BadRequest(_) => "bad_request",
@@ -395,6 +405,7 @@ impl LaneFailure {
                  (it speaks {})",
                 LANE_KINDS.join(" and ")
             ),
+            LaneFailure::ShuttingDown => ShuttingDown.to_string(),
             LaneFailure::Lane(e) => e.to_string(),
         }
     }
@@ -474,6 +485,21 @@ impl LaneMachines for RoostHosts {
 
     fn craze_source(&self, machine: &str) -> Result<(CrazeSource, u64), String> {
         RoostHosts::craze_source(self, machine)
+    }
+
+    /// The default's forward, spawning only inside the app's spawn gate (plan
+    /// 026 §3.3) and registered with it.
+    fn forward(
+        &self,
+        entry: &MachineEntry,
+        remote_port: u16,
+    ) -> Result<Box<dyn MachineForward>, String> {
+        let forward =
+            SshForward::reserve_for(entry.clone(), remote_port).map_err(|e| e.to_string())?;
+        Ok(Box::new(match self.spawn_gate() {
+            Some(gate) => forward.with_spawn_gate(gate),
+            None => forward,
+        }))
     }
 }
 
@@ -681,7 +707,10 @@ struct LaneEntry {
     view: Arc<Mutex<LaneView>>,
     /// The supervision loop. Shares nothing with this struct but the view, so
     /// there is no reference cycle and dropping the entry really does end it.
-    pump: tokio::task::JoinHandle<()>,
+    /// Behind a lock so [`Lanes::shutdown`] can take the handle and AWAIT it
+    /// (plan 026 §3.3) — an abort alone leaves the loop running until its
+    /// next poll.
+    pump: Mutex<Option<tokio::task::JoinHandle<()>>>,
     /// For a craze lane, the generation of the craze source it was opened
     /// through; `None` for a roost-stamped one. [`Lanes::evict_craze`] ends
     /// only the lanes of the generation it names, so a stale source's eviction
@@ -699,8 +728,14 @@ impl LaneEntry {
     /// **must not be called under the `inner` lock** — releasing the last share
     /// takes it.
     fn retire(&self) {
-        self.pump.abort();
+        self.abort_pump();
         drop(lock(&self.forward).take());
+    }
+
+    fn abort_pump(&self) {
+        if let Some(pump) = lock(&self.pump).as_ref() {
+            pump.abort();
+        }
     }
 }
 
@@ -710,7 +745,7 @@ impl Drop for LaneEntry {
     ///
     /// A backstop: every eviction path calls [`LaneEntry::retire`] first.
     fn drop(&mut self) {
-        self.pump.abort();
+        self.abort_pump();
     }
 }
 
@@ -725,6 +760,10 @@ struct Inner {
     /// The opens currently between their first await and their commit. See
     /// [`Pending`].
     pending: HashMap<Key, Pending>,
+    /// Set when the app's orderly shutdown begins (plan 026 §3.3), never
+    /// cleared: read under this lock by every open's declaration and commit,
+    /// and by a pump before it re-`ensure`s its tunnel.
+    closing: bool,
 }
 
 /// The open gates, by key. See [`Lanes::gates`] and [`GateGuard`].
@@ -738,6 +777,20 @@ type Gates = HashMap<Key, Arc<tokio::sync::Mutex<()>>>;
 type EventSink = Arc<dyn Fn(&str, &str, &str, &LaneEvent) + Send + Sync>;
 
 /// Every open lane in this app, and the tunnels under them.
+/// What [`Lanes::shutdown`] closed — and what it abandoned at a bound (plan
+/// 026 AM4), for the shutdown's phase line.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LanesClosed {
+    pub lanes: usize,
+    pub forwards: usize,
+    /// Forwards whose close did not settle by its bound: a reap another thread
+    /// owns, or an `ensure` still in flight (the child SIGKILLed either way).
+    pub forwards_unsettled: usize,
+    pub pumps: usize,
+    /// Pumps aborted but not ended by [`PUMP_JOIN_WAIT`].
+    pub pumps_unjoined: usize,
+}
+
 pub struct Lanes {
     handle: tokio::runtime::Handle,
     sink: EventSink,
@@ -840,6 +893,9 @@ impl Lanes {
         session_id: &str,
     ) -> Result<Value, LaneFailure> {
         let key = key(machine, kind, session_id);
+        if self.closing() {
+            return Err(LaneFailure::ShuttingDown);
+        }
         // The row is resolved BEFORE a gate is registered for the key. Both IPC
         // doors take `machine` and `session_id` as free strings, so a call that
         // names nothing real must not be able to make this app remember it:
@@ -849,6 +905,13 @@ impl Lanes {
         self.lane_stamp(machine, kind, session_id)?;
         let gate = self.gate(&key);
         let _serialized = gate.lock().await;
+        // **An open that waited on its gate re-checks before going on** (plan
+        // 026 §3.3): the shutdown may have begun while it waited, and nothing
+        // below may build a tunnel or a subscription after that. The
+        // declaration below checks again, under the registry lock.
+        if self.closing() {
+            return Err(LaneFailure::ShuttingDown);
+        }
 
         // Re-resolved under the gate, and this is the value everything below
         // uses: the pre-gate one was read before waiting, and waiting is exactly
@@ -885,8 +948,9 @@ impl Lanes {
         crate::roost_hosts::at_gap(&self.open_gap).await;
 
         // Declared BEFORE the first await, so a `close` or a `reconcile` landing
-        // anywhere below has something to cancel.
-        let _pending = self.declare(&key, &stamp, craze_gen);
+        // anywhere below has something to cancel — and refused, under the
+        // same lock, once the shutdown has begun.
+        let _pending = self.declare(&key, &stamp, craze_gen)?;
 
         // **A craze source's generation is re-checked AFTER the declaration**
         // (C9 confirmation, N1). The source was resolved above, outside the
@@ -936,6 +1000,9 @@ impl Lanes {
         // lost — and the pump is not started until the commit is decided, so a
         // rolled-back open never had a subscription to leak either.
         let mut inner = lock(&self.inner);
+        if inner.closing {
+            return Err(LaneFailure::ShuttingDown);
+        }
         if !inner.pending.get(&key).is_some_and(|p| !p.cancelled) {
             return Err(LaneFailure::NoLane(format!(
                 "the lane for session {session_id:?} on machine {machine:?} was closed \
@@ -954,7 +1021,7 @@ impl Lanes {
             session,
             client,
             view,
-            pump,
+            pump: Mutex::new(Some(pump)),
             craze_gen,
         });
         let opened = entry.opened();
@@ -1264,8 +1331,19 @@ impl Lanes {
     // ---- internals ----
 
     /// Declare an open in flight for `key`. See [`Pending`].
-    fn declare(&self, key: &Key, stamp: &AgentLaneStamp, craze_gen: Option<u64>) -> PendingGuard {
-        lock(&self.inner).pending.insert(
+    fn declare(
+        &self,
+        key: &Key,
+        stamp: &AgentLaneStamp,
+        craze_gen: Option<u64>,
+    ) -> Result<PendingGuard, LaneFailure> {
+        let mut inner = lock(&self.inner);
+        // Under the lock the shutdown sets the flag under, so an open either
+        // declared before it (and is cancelled by it) or is refused here.
+        if inner.closing {
+            return Err(LaneFailure::ShuttingDown);
+        }
+        inner.pending.insert(
             key.clone(),
             Pending {
                 stamp: stamp.clone(),
@@ -1273,10 +1351,113 @@ impl Lanes {
                 craze_gen,
             },
         );
-        PendingGuard {
+        Ok(PendingGuard {
             inner: Arc::clone(&self.inner),
             key: key.clone(),
+        })
+    }
+
+    /// Whether the shutdown has begun — read under the registry lock.
+    fn closing(&self) -> bool {
+        lock(&self.inner).closing
+    }
+
+    /// **Refuse new lanes from now on** (plan 026 §3.3): set with the app's
+    /// spawn gate, at the start of its orderly shutdown. Every open not yet
+    /// declared is refused `shutting_down`; [`Self::shutdown`] tears down the
+    /// rest.
+    pub fn begin_closing(&self) {
+        lock(&self.inner).closing = true;
+    }
+
+    /// **The lanes phase of the orderly shutdown** (plan 026 §3.3, phase 1).
+    /// **Blocking**: run it on a dedicated OS thread, never an async worker —
+    /// it kills and reaps `ssh` children — and never on the blocking pool.
+    ///
+    /// * Every committed entry and every pending open is taken (the opens
+    ///   cancelled, so none commits).
+    /// * Every pump is aborted AND AWAITED (bounded by [`PUMP_JOIN_WAIT`]): an
+    ///   aborted pump keeps running until its next poll, holding its forward.
+    /// * Every forward is closed through the trait ([`MachineForward::close_now`]),
+    ///   all at once on threads of their own, overlapping the pump joins
+    ///   (F10), whatever its reference count —
+    ///   dropping is not enough: [`OwnedForward`]'s drop detaches a thread, and
+    ///   an aborted pump holds its `Arc` until its future drops. Each close is
+    ///   self-bounded (a bounded reap, then a bounded wait for an `ensure` in
+    ///   flight).
+    ///
+    /// Answers what it closed — and what it abandoned at a bound (plan 026
+    /// AM4) — for the shutdown's log ([`LanesClosed`]).
+    pub fn shutdown(&self) -> LanesClosed {
+        let (entries, forwards) = {
+            let mut inner = lock(&self.inner);
+            inner.closing = true;
+            for pending in inner.pending.values_mut() {
+                pending.cancelled = true;
+            }
+            let entries: Vec<Arc<LaneEntry>> = inner.entries.drain().map(|(_, e)| e).collect();
+            let forwards: Vec<Arc<OwnedForward>> = inner
+                .forwards
+                .values()
+                .map(|slot| Arc::clone(&slot.forward))
+                .collect();
+            (entries, forwards)
+        };
+        let pumps: Vec<tokio::task::JoinHandle<()>> = entries
+            .iter()
+            .filter_map(|entry| lock(&entry.pump).take())
+            .collect();
+        for pump in &pumps {
+            pump.abort();
         }
+        let pump_count = pumps.len();
+        // The forwards' closes and the pumps' joins OVERLAP (F10): each close
+        // on a thread of its own, the joins on this one. An aborted pump in its
+        // tunnel's `ensure` sees the slot closed and ends within about a poll.
+        let (forwards_unsettled, pumps_unjoined) = std::thread::scope(|scope| {
+            // Every close is started before anything is joined.
+            let mut closes = Vec::with_capacity(forwards.len());
+            for forward in &forwards {
+                closes.push(scope.spawn(move || forward.get().close_now()));
+            }
+            let pumps_unjoined = if pumps.is_empty() {
+                0
+            } else {
+                // Not a runtime worker (the caller's promise), so blocking on
+                // the app's runtime here is legal. One deadline for them all;
+                // a pump still running at it is aborted already and is left —
+                // counted — to end at its next poll.
+                self.handle.block_on(async move {
+                    let deadline = tokio::time::Instant::now() + PUMP_JOIN_WAIT;
+                    let mut unjoined = 0;
+                    for pump in pumps {
+                        if tokio::time::timeout_at(deadline, pump).await.is_err() {
+                            unjoined += 1;
+                        }
+                    }
+                    unjoined
+                })
+            };
+            let forwards_unsettled = closes
+                .into_iter()
+                .map(|close| close.join().unwrap_or(false))
+                .filter(|settled| !settled)
+                .count();
+            (forwards_unsettled, pumps_unjoined)
+        });
+        let closed = LanesClosed {
+            lanes: entries.len(),
+            forwards: forwards.len(),
+            forwards_unsettled,
+            pumps: pump_count,
+            pumps_unjoined,
+        };
+        // The shares go back here, on this thread: the last one out drops the
+        // forward (already closed) through [`OwnedForward`]'s own thread.
+        for entry in entries {
+            entry.retire();
+        }
+        closed
     }
 
     /// The per-key open gate, created on first use and dropped by the last
@@ -1493,10 +1674,11 @@ impl Lanes {
         forward: Option<Weak<OwnedForward>>,
     ) -> tokio::task::JoinHandle<()> {
         let sink = Arc::clone(&self.sink);
+        let inner = Arc::clone(&self.inner);
         self.handle.spawn(async move {
             let mut backoff = RESUBSCRIBE_BASE;
             loop {
-                match ensure_forward(&forward).await {
+                match ensure_forward(&forward, &inner).await {
                     Ensured::Ready => {}
                     Ensured::Gone => return,
                     Ensured::Failed(e) => {
@@ -1555,7 +1737,7 @@ impl Lanes {
                     lock(&view).apply(&event);
                     emit(&sink, &key, &event);
                     if generations > 1 && matches!(event, LaneEvent::Reset { .. }) {
-                        match ensure_forward(&forward).await {
+                        match ensure_forward(&forward, &inner).await {
                             Ensured::Ready => {}
                             // Every share is gone: this lane was evicted.
                             Ensured::Gone => return,
@@ -1603,10 +1785,15 @@ enum Ensured {
     Failed(String),
 }
 
-async fn ensure_forward(forward: &Option<Weak<OwnedForward>>) -> Ensured {
+async fn ensure_forward(forward: &Option<Weak<OwnedForward>>, inner: &Mutex<Inner>) -> Ensured {
     let Some(weak) = forward.as_ref() else {
         return Ensured::Ready;
     };
+    // **No re-`ensure` once the shutdown has begun** (plan 026 §3.3): the
+    // pump's work is over, and a respawned tunnel would outlive the drain.
+    if lock(inner).closing {
+        return Ensured::Gone;
+    }
     let Some(forward) = weak.upgrade() else {
         return Ensured::Gone;
     };
@@ -1916,6 +2103,12 @@ mod tests {
         }
         assert_eq!(LaneFailure::NoLane("nope".into()).code(), "no_lane");
         assert_eq!(LaneFailure::NoLane("nope".into()).message(), "nope");
+        // The app quitting (plan 026 §3.3): the spawn gate's own code.
+        assert_eq!(LaneFailure::ShuttingDown.code(), "shutting_down");
+        assert!(LaneFailure::ShuttingDown
+            .message()
+            .starts_with("shutting_down"));
+        assert!(seen.insert("shutting_down"));
         // A craze verb whose answer was lost: its own code, recognised by the
         // adapter's one test — the settings sheet's "not confirmed" (plan 025
         // §3.10) — and its message whole.
@@ -2306,6 +2499,28 @@ mod tests {
         dropped_on_runtime: AtomicUsize,
         /// When set, `ensure` FAILS — a tunnel that will not come back up.
         fail_ensure: AtomicBool,
+        /// `close_now` calls (plan 026 §3.3): the shutdown's close through the
+        /// trait, whatever the forward's reference count.
+        closed: AtomicUsize,
+        /// When non-zero, the `ensure` with this ordinal (1-based) HANGS until
+        /// the forward is closed — an `ensure` in flight at shutdown.
+        hang_on: AtomicUsize,
+        /// Wakes a hung `ensure` when the forward is closed.
+        unhang: tokio::sync::Notify,
+        /// Set — a moment late, on purpose — when a hung `ensure`'s future is
+        /// DROPPED: the proof a pump was awaited, not merely aborted.
+        hung_dropped: AtomicBool,
+    }
+
+    /// Marks a hung `ensure`'s future dropped, slowly — so a caller that
+    /// aborted the pump without awaiting it returns before this lands.
+    struct SlowDrop(Arc<ForwardLog>);
+
+    impl Drop for SlowDrop {
+        fn drop(&mut self) {
+            std::thread::sleep(Duration::from_millis(300));
+            self.0.hung_dropped.store(true, SeqCst);
+        }
     }
 
     /// A forward that is not a tunnel: it simply names the port a fake opencode
@@ -2322,7 +2537,17 @@ mod tests {
         }
 
         async fn ensure(&self) -> Result<(), ForwardError> {
-            self.log.ensures.fetch_add(1, SeqCst);
+            let n = self.log.ensures.fetch_add(1, SeqCst) + 1;
+            if self.log.hang_on.load(SeqCst) == n {
+                let _drop = SlowDrop(Arc::clone(&self.log));
+                loop {
+                    let unhang = self.log.unhang.notified();
+                    if self.log.closed.load(SeqCst) > 0 {
+                        return Err(ForwardError("the forward was closed".to_string()));
+                    }
+                    unhang.await;
+                }
+            }
             if self.log.fail_ensure.load(SeqCst) {
                 return Err(ForwardError("the ssh child will not start".to_string()));
             }
@@ -2334,6 +2559,68 @@ mod tests {
         /// `try_wait`, and a cell kills it by clearing the flag.
         fn looks_alive(&self) -> bool {
             self.log.alive.load(SeqCst)
+        }
+
+        fn close_now(&self) -> bool {
+            self.log.alive.store(false, SeqCst);
+            self.log.closed.fetch_add(1, SeqCst);
+            self.log.unhang.notify_waiters();
+            true
+        }
+    }
+
+    /// A forward whose `ensure` starts a REAL child (`/bin/sh` writing its pid,
+    /// then `sleep`) and then waits — an `ensure` mid-spawn — until closed.
+    struct SpawningForward {
+        port: u16,
+        pids: std::path::PathBuf,
+        child: Mutex<Option<std::process::Child>>,
+        closed: AtomicBool,
+        wake: tokio::sync::Notify,
+    }
+
+    #[async_trait::async_trait]
+    impl MachineForward for SpawningForward {
+        fn port(&self) -> u16 {
+            self.port
+        }
+
+        async fn ensure(&self) -> Result<(), ForwardError> {
+            let child = std::process::Command::new("/bin/sh")
+                .arg("-c")
+                .arg(format!(
+                    "printf '%s\\n' $$ >> '{}'; exec sleep 30",
+                    self.pids.display()
+                ))
+                .spawn()
+                .map_err(|e| ForwardError(e.to_string()))?;
+            *lock(&self.child) = Some(child);
+            loop {
+                let wake = self.wake.notified();
+                if self.closed.load(SeqCst) {
+                    return Err(ForwardError("the forward was closed".to_string()));
+                }
+                wake.await;
+            }
+        }
+
+        fn close_now(&self) -> bool {
+            self.closed.store(true, SeqCst);
+            if let Some(mut child) = lock(&self.child).take() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+            self.wake.notify_waiters();
+            true
+        }
+    }
+
+    impl Drop for SpawningForward {
+        fn drop(&mut self) {
+            if let Some(mut child) = lock(&self.child).take() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
         }
     }
 
@@ -2362,6 +2649,9 @@ mod tests {
         /// The machine's craze source and the hostIds it lists, for the cells
         /// about the craze namespace. `None` everywhere else.
         craze: Mutex<Option<(CrazeSource, Vec<String>)>>,
+        /// When set, every forward is a [`SpawningForward`] writing its child's
+        /// pid here (plan 026 §3.3's mid-spawn cell).
+        spawning: Mutex<Option<std::path::PathBuf>>,
     }
 
     impl LaneMachines for FakeMachines {
@@ -2410,6 +2700,15 @@ mod tests {
             _remote_port: u16,
         ) -> Result<Box<dyn MachineForward>, String> {
             self.log.built.fetch_add(1, SeqCst);
+            if let Some(pids) = lock(&self.spawning).clone() {
+                return Ok(Box::new(SpawningForward {
+                    port: self.port,
+                    pids,
+                    child: Mutex::new(None),
+                    closed: AtomicBool::new(false),
+                    wake: tokio::sync::Notify::new(),
+                }));
+            }
             Ok(Box::new(FakeForward {
                 port: self.port,
                 log: Arc::clone(&self.log),
@@ -2499,6 +2798,7 @@ mod tests {
             log: Arc::clone(&log),
             reach: ReachKind::Ssh(fake_entry()),
             craze: Mutex::new(craze),
+            spawning: Mutex::new(None),
         });
         let sink: EventSink = {
             let recorder = Arc::clone(&recorder);
@@ -3419,5 +3719,237 @@ mod tests {
             None,
             "lane.open keeps the row it opened with"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // the orderly shutdown's lanes phase (plan 026 §3.3, shed#389)
+    // -----------------------------------------------------------------------
+
+    /// An empty roost-host layer and the app's gate — what
+    /// `shutdown_children` needs beside the lanes under test.
+    fn empty_hosts() -> (Arc<RoostHosts>, shed_app::spawn_gate::SpawnGate) {
+        let gate = shed_app::spawn_gate::SpawnGate::new();
+        let hosts = Arc::new(RoostHosts::start(
+            &tokio::runtime::Handle::current(),
+            &shed_core::config::ShedConfig::default(),
+            crate::machines::ReachOptions {
+                test_mode: true,
+                spawn_gate: Some(gate.clone()),
+                ..crate::machines::ReachOptions::default()
+            },
+            false,
+            Arc::new(|| {}),
+        ));
+        (hosts, gate)
+    }
+
+    /// [`Lanes::shutdown`] on a plain OS thread of its own — the way the
+    /// coordinator runs it — joined by the caller.
+    async fn shutdown_on_a_thread(lanes: &Arc<Lanes>) -> (usize, usize) {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let lanes = Arc::clone(lanes);
+        std::thread::spawn(move || {
+            let _ = tx.send(lanes.shutdown());
+        });
+        let closed = rx.await.expect("the lanes thread");
+        assert_eq!(
+            (closed.forwards_unsettled, closed.pumps_unjoined),
+            (0, 0),
+            "nothing abandoned: {closed:?}"
+        );
+        (closed.lanes, closed.forwards)
+    }
+
+    fn pid_alive(pid: i32) -> bool {
+        // SAFETY: signal 0 performs only an existence/permission check.
+        unsafe { libc::kill(pid, 0) == 0 }
+    }
+
+    /// **A fake opencode forward is closed when the shutdown returns** (plan
+    /// 026 §3.3): `shutdown_children` over the real registries closes it
+    /// through the trait — `close_now`, whatever its reference count — the
+    /// lane is gone, and no lane opens again.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_fake_opencode_forward_is_closed_when_the_shutdown_returns() {
+        let fake = one_session("ses_a").await;
+        let (lanes, log, _events) = lanes_for(&fake, &["ses_a"]);
+        lanes
+            .open(MACHINE, OC, "ses_a")
+            .await
+            .expect("the lane opens");
+        assert!(log.alive.load(SeqCst));
+        let (hosts, gate) = empty_hosts();
+
+        let report = crate::shutdown::shutdown_children(&gate, &hosts, &lanes, None).await;
+        assert_eq!(
+            log.closed.load(SeqCst),
+            1,
+            "the forward was not closed through the trait"
+        );
+        assert!(
+            !log.alive.load(SeqCst),
+            "the forward's child is alive on return"
+        );
+        assert_eq!(
+            (report.lanes.lanes, report.lanes.forwards),
+            (1, 1),
+            "{report:?}"
+        );
+        assert!(!lanes.is_open(MACHINE, OC, "ses_a"));
+        let refused = lanes
+            .open(MACHINE, OC, "ses_a")
+            .await
+            .expect_err("no lane opens once the shutdown has begun");
+        assert_eq!(refused.code(), shed_app::spawn_gate::SHUTTING_DOWN);
+        assert_eq!(
+            log.built.load(SeqCst),
+            1,
+            "a tunnel was built after the shutdown"
+        );
+    }
+
+    /// **The lanes phase awaits every pump** (plan 026 §3.3): a pump parked in
+    /// its tunnel's re-`ensure` is aborted AND joined — its future has been
+    /// dropped by the time `shutdown` returns, not merely scheduled to be.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_lanes_phase_awaits_every_pump_before_it_returns() {
+        let fake = one_session("ses_a").await;
+        let (lanes, log, _events) = lanes_for(&fake, &["ses_a"]);
+        // The open's own ensure is the first; the pump's first is the second.
+        log.hang_on.store(2, SeqCst);
+        lanes
+            .open(MACHINE, OC, "ses_a")
+            .await
+            .expect("the lane opens");
+        wait_for("the pump to park in its ensure", || {
+            (log.ensures.load(SeqCst) >= 2).then_some(())
+        })
+        .await;
+
+        let (closed, forwards) = shutdown_on_a_thread(&lanes).await;
+        assert_eq!((closed, forwards), (1, 1));
+        assert!(
+            log.hung_dropped.load(SeqCst),
+            "shutdown returned while its aborted pump was still running"
+        );
+    }
+
+    /// **A forward whose `ensure` is mid-spawn when the shutdown starts: its
+    /// child is dead on return** (plan 026 §3.3). An open is in flight, its
+    /// tunnel's child spawned and its readiness still pending; the shutdown
+    /// closes that forward through the trait, the child dies, and the open
+    /// commits nothing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_forward_mid_spawn_when_shutdown_starts_is_dead_on_return() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pids = dir.path().join("pids");
+        let fake = one_session("ses_a").await;
+        let (lanes, log, _events) =
+            lanes_spawning(fake.addr().port(), lane_rows(&["ses_a"]), &pids);
+        let opening = tokio::spawn({
+            let lanes = Arc::clone(&lanes);
+            async move { lanes.open(MACHINE, OC, "ses_a").await }
+        });
+        let pid: i32 = wait_for("the forward's child to spawn", || {
+            std::fs::read_to_string(&pids).ok()?.trim().parse().ok()
+        })
+        .await;
+        assert!(pid_alive(pid));
+        let (hosts, gate) = empty_hosts();
+
+        crate::shutdown::shutdown_children(&gate, &hosts, &lanes, None).await;
+        assert!(
+            !pid_alive(pid),
+            "the mid-spawn forward's child {pid} outlived the shutdown"
+        );
+        let opened = tokio::time::timeout(Duration::from_secs(5), opening)
+            .await
+            .expect("the open in flight returned")
+            .expect("the open task");
+        assert!(opened.is_err(), "an open in flight at shutdown committed");
+        assert!(!lanes.is_open(MACHINE, OC, "ses_a"));
+        assert_eq!(log.built.load(SeqCst), 1);
+    }
+
+    /// **An open waiting on its gate when the shutdown begins is refused, and
+    /// builds no tunnel** (plan 026 §3.3): it re-checks the closing flag
+    /// before declaring itself, so it answers `shutting_down` without
+    /// reserving a forward.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_open_waiting_on_its_gate_is_refused_and_builds_no_tunnel() {
+        let fake = one_session("ses_a").await;
+        let (lanes, log, _events) = lanes_for(&fake, &["ses_a"]);
+        // The first open's ensure hangs, holding the key's gate.
+        log.hang_on.store(1, SeqCst);
+        let first = tokio::spawn({
+            let lanes = Arc::clone(&lanes);
+            async move { lanes.open(MACHINE, OC, "ses_a").await }
+        });
+        wait_for("the first open to hold the gate", || {
+            (log.ensures.load(SeqCst) == 1).then_some(())
+        })
+        .await;
+        let second = tokio::spawn({
+            let lanes = Arc::clone(&lanes);
+            async move { lanes.open(MACHINE, OC, "ses_a").await }
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(!second.is_finished(), "the second open waits on the gate");
+
+        shutdown_on_a_thread(&lanes).await;
+        let first = tokio::time::timeout(Duration::from_secs(5), first)
+            .await
+            .expect("the first open returned once its forward closed")
+            .expect("the first open task");
+        assert!(first.is_err());
+        let second = tokio::time::timeout(Duration::from_secs(5), second)
+            .await
+            .expect("the waiting open returned")
+            .expect("the second open task");
+        let refused = second.expect_err("an open that waited across the shutdown is refused");
+        assert_eq!(
+            refused.code(),
+            shed_app::spawn_gate::SHUTTING_DOWN,
+            "{}",
+            refused.message()
+        );
+        assert_eq!(log.built.load(SeqCst), 1, "the waiting open built a tunnel");
+        assert_eq!(
+            log.ensures.load(SeqCst),
+            1,
+            "the waiting open started a tunnel"
+        );
+    }
+
+    /// [`lanes_on`], every forward a [`SpawningForward`] writing to `pids`.
+    fn lanes_spawning(
+        port: u16,
+        rows: BTreeMap<String, AgentLaneStamp>,
+        pids: &std::path::Path,
+    ) -> (Arc<Lanes>, Arc<ForwardLog>, Arc<Recorder>) {
+        let log = Arc::new(ForwardLog::default());
+        let recorder = Arc::new(Recorder::default());
+        let machines = Arc::new(FakeMachines {
+            lanes: Mutex::new(rows),
+            port,
+            log: Arc::clone(&log),
+            reach: ReachKind::Ssh(fake_entry()),
+            craze: Mutex::new(None),
+            spawning: Mutex::new(Some(pids.to_path_buf())),
+        });
+        let sink: EventSink = {
+            let recorder = Arc::clone(&recorder);
+            Arc::new(
+                move |_machine: &str, _kind: &str, _session: &str, event: &LaneEvent| {
+                    recorder.record(event)
+                },
+            )
+        };
+        let lanes = Arc::new(Lanes::with_sink(
+            tokio::runtime::Handle::current(),
+            sink,
+            machines,
+        ));
+        (lanes, log, recorder)
     }
 }

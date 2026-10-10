@@ -93,6 +93,7 @@ use shed_core::roost::{local_session_socket, Admit, Conn, Fence, RoostError, Roo
 
 use crate::backoff;
 use crate::machine::{FixedPort, ForwardError};
+use crate::spawn_gate::{ChildExit, ShuttingDown, SpawnGate, SpawnSection};
 
 /// Re-exported so a client that drives roost never has to name `shed_core`'s
 /// module as well as this one: the endpoint shape the seam hands back, the
@@ -310,6 +311,18 @@ pub trait RoostReach: Send + Sync {
     async fn last_error(&self) -> Option<RecordedReach> {
         None
     }
+
+    /// **Tear the held transport down for good** (plan 026 §3.3): refuse any
+    /// new establishment, shut down what is live, and wait for every teardown
+    /// this reach owns — the app's orderly exit, after it has joined every
+    /// client of this reach.
+    ///
+    /// Defaulted to a no-op, so every implementor that owns no transport —
+    /// and the phone, which compiles against this trait — is unaffected.
+    /// [`SshBridge`] overrides it. It must bound itself: the caller puts no
+    /// timeout around it, because cancelling a transport's teardown mid-step is
+    /// exactly what this exists to avoid.
+    async fn shutdown(&self) {}
 }
 
 /// This machine's own `roost-session`, if one is running.
@@ -563,6 +576,72 @@ pub trait TunnelOpener: Send + Sync {
         target: &SshTarget,
         options: SshTunnelOptions,
     ) -> Result<Box<dyn Tunnel>, ReachError>;
+
+    /// [`Self::open`], with any teardown it has to do on the way out — a
+    /// tunnel that opened and then failed to establish — handed to `teardown`
+    /// instead of awaited inline (plan 026 §3.3): the caller may be cancelled
+    /// mid-open, and a teardown cancelled with it skips roost's own cleanup.
+    ///
+    /// Defaulted to [`Self::open`], for an opener with no teardown of its own
+    /// to hand over (a test's scripted one).
+    async fn open_owned(
+        &self,
+        host_id: &str,
+        target: &SshTarget,
+        options: SshTunnelOptions,
+        _teardown: &TeardownSink,
+    ) -> Result<Box<dyn Tunnel>, ReachError> {
+        self.open(host_id, target, options).await
+    }
+}
+
+/// Where a [`SshBridge`]'s tunnel teardowns run: a `JoinSet` the bridge OWNS,
+/// not its caller's future (plan 026 §3.3, R3).
+///
+/// roost's `SshTunnel::shutdown` marks the tunnel closed first, so its `Drop`
+/// then skips the cleanup; a shutdown cancelled midway — a watcher aborted
+/// while its `ensure` awaited the old tunnel's teardown — would leave the
+/// master and the scratch directory behind. Run here, the teardown finishes
+/// whatever happens to the caller, and [`RoostReach::shutdown`] joins every one
+/// still running.
+#[derive(Clone, Default)]
+pub struct TeardownSink {
+    set: Arc<std::sync::Mutex<tokio::task::JoinSet<()>>>,
+}
+
+impl TeardownSink {
+    fn set(&self) -> std::sync::MutexGuard<'_, tokio::task::JoinSet<()>> {
+        self.set.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Run `teardown` in a task this sink owns and wait for it. A caller
+    /// cancelled while it waits cancels only its wait; the teardown goes on.
+    pub async fn run(&self, teardown: futures::future::BoxFuture<'static, ()>) {
+        let (done, finished) = tokio::sync::oneshot::channel::<()>();
+        {
+            let mut set = self.set();
+            // Finished teardowns are reaped as new ones arrive, so the set holds
+            // only what is still running.
+            while set.try_join_next().is_some() {}
+            set.spawn(async move {
+                teardown.await;
+                let _ = done.send(());
+            });
+        }
+        let _ = finished.await;
+    }
+
+    /// Wait for every teardown still running. Nothing is aborted.
+    pub async fn join_all(&self) {
+        let mut set = std::mem::take(&mut *self.set());
+        while set.join_next().await.is_some() {}
+    }
+
+    /// Let every running teardown finish on its own — what a dropped bridge
+    /// does, rather than abort one midway (which is a `JoinSet`'s own `Drop`).
+    fn detach_all(&self) {
+        self.set().detach_all();
+    }
 }
 
 /// The production opener: roost's own [`SshTunnel`], opened and established.
@@ -589,13 +668,14 @@ fn reach_error(target: &str, error: &roost_ipc::ssh::SshTunnelError) -> ReachErr
     }
 }
 
-#[async_trait::async_trait]
-impl TunnelOpener for SystemSshTunnels {
-    async fn open(
-        &self,
+impl SystemSshTunnels {
+    /// Open and establish; a failed establish's teardown goes to `teardown`
+    /// when there is one, else it is awaited inline.
+    async fn open_with(
         host_id: &str,
         target: &SshTarget,
         options: SshTunnelOptions,
+        teardown: Option<&TeardownSink>,
     ) -> Result<Box<dyn Tunnel>, ReachError> {
         let tunnel = SshTunnel::open(host_id, target, options)
             .await
@@ -604,14 +684,44 @@ impl TunnelOpener for SystemSshTunnels {
             // The async teardown, not `Drop`'s blocking one: we are already in a
             // runtime, and roost's `Drop` explicitly exists for the case where
             // nobody could await. An establish that failed still owns a scratch
-            // directory and possibly a `ControlPersist` master.
-            tunnel.shutdown().await;
+            // directory and possibly a `ControlPersist` master — and the
+            // teardown is the bridge's to own (plan 026 §3.3), so a caller
+            // cancelled right here does not cancel it.
+            match teardown {
+                Some(sink) => {
+                    sink.run(Box::pin(async move { tunnel.shutdown().await }))
+                        .await
+                }
+                None => tunnel.shutdown().await,
+            }
             return Err(reach_error(&target.raw, &e));
         }
         Ok(Box::new(BridgeTunnel {
             inner: tunnel,
             target: target.raw.clone(),
         }))
+    }
+}
+
+#[async_trait::async_trait]
+impl TunnelOpener for SystemSshTunnels {
+    async fn open(
+        &self,
+        host_id: &str,
+        target: &SshTarget,
+        options: SshTunnelOptions,
+    ) -> Result<Box<dyn Tunnel>, ReachError> {
+        Self::open_with(host_id, target, options, None).await
+    }
+
+    async fn open_owned(
+        &self,
+        host_id: &str,
+        target: &SshTarget,
+        options: SshTunnelOptions,
+        teardown: &TeardownSink,
+    ) -> Result<Box<dyn Tunnel>, ReachError> {
+        Self::open_with(host_id, target, options, Some(teardown)).await
     }
 }
 
@@ -634,6 +744,15 @@ pub struct SshBridgeOptions {
     pub config_paths: Option<SshConfigPaths>,
     /// How a tunnel is obtained. The test seam.
     pub opener: Arc<dyn TunnelOpener>,
+    /// The app's spawn gate (plan 026 §3.3): a bridge establishes a tunnel,
+    /// and an [`SshExec`] spawns, only inside one of its sections. `None` — the
+    /// default, and the phone's — spawns freely.
+    pub spawn_gate: Option<SpawnGate>,
+    /// The app's shared teardown sink (plan 026 §3.3, F4): every bridge's
+    /// tunnel teardowns run there, so one still running when its bridge is
+    /// dropped — a removed host's — is joined by the app's shutdown rather
+    /// than detached. `None`: a sink of the bridge's own.
+    pub teardowns: Option<TeardownSink>,
 }
 
 impl Default for SshBridgeOptions {
@@ -643,6 +762,8 @@ impl Default for SshBridgeOptions {
             scratch_parents: Vec::new(),
             config_paths: None,
             opener: Arc::new(SystemSshTunnels),
+            spawn_gate: None,
+            teardowns: None,
         }
     }
 }
@@ -727,6 +848,22 @@ pub struct SshBridge {
     /// a live `ssh` master nothing ever tears down.
     held: tokio::sync::Mutex<Held>,
     invalidated: AtomicBool,
+    /// Where every tunnel teardown runs (plan 026 §3.3) — never the caller's
+    /// future, so a cancelled `ensure` never cancels one. The app's shared
+    /// sink when it passed one ([`SshBridgeOptions::teardowns`]), else this
+    /// bridge's own.
+    teardowns: TeardownSink,
+    /// Whether [`Self::teardowns`] is this bridge's alone.
+    owns_teardowns: bool,
+    /// Woken by [`RoostReach::shutdown`]: an establishment in flight gives up.
+    stop: tokio::sync::Notify,
+    /// The app's spawn gate, when it has one: a tunnel is established only
+    /// inside one of its sections, and once it has closed no endpoint is
+    /// handed out at all.
+    gate: Option<SpawnGate>,
+    /// Set by [`RoostReach::shutdown`], read under `held`: a bridge that has
+    /// shut down never establishes again.
+    closing: AtomicBool,
     /// Holds the generated per-machine `ssh_config` when the entry pins a
     /// `known_hosts` file. Never read — it is owned for its `Drop`, which is
     /// what removes the directory when the bridge goes.
@@ -759,6 +896,8 @@ impl SshBridge {
             scratch_parents,
             config_paths,
             opener,
+            spawn_gate,
+            teardowns,
         } = options;
         let target = ssh_target(entry)?;
         let host_id = host_id(&entry.name);
@@ -792,9 +931,42 @@ impl SshBridge {
             opener,
             held: tokio::sync::Mutex::new(Held::default()),
             invalidated: AtomicBool::new(false),
+            owns_teardowns: teardowns.is_none(),
+            teardowns: teardowns.unwrap_or_default(),
+            stop: tokio::sync::Notify::new(),
+            gate: spawn_gate,
+            closing: AtomicBool::new(false),
             _config_dir: config_dir,
             config_path,
         })
+    }
+
+    /// What a bridge that is shutting down answers.
+    fn shutting_down(&self) -> ReachError {
+        ReachError::other(format!("{}: {ShuttingDown}", target_token(&self.label)))
+    }
+
+    /// Resolve once the exit has begun for this bridge: its own
+    /// [`RoostReach::shutdown`], or the app's spawn gate closing.
+    async fn stopped(&self) {
+        let own = async {
+            loop {
+                let notified = self.stop.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
+                if self.closing.load(Ordering::SeqCst) {
+                    return;
+                }
+                notified.await;
+            }
+        };
+        match &self.gate {
+            Some(gate) => tokio::select! {
+                () = own => {}
+                () = gate.closing() => {}
+            },
+            None => own.await,
+        }
     }
 
     /// The ssh target string roost was handed — `ssh://[user@]host[:port]`.
@@ -817,6 +989,14 @@ impl RoostReach for SshBridge {
 
     async fn ensure(&self) -> Result<RoostEndpoint, ReachError> {
         let mut held = self.held.lock().await;
+        // **No endpoint once the exit has begun** (plan 026 §3.3, R10) — not
+        // even a held tunnel's: every connection to its bridge socket is an
+        // `ssh` roost spawns in a task of its own, past any gate here.
+        if self.closing.load(Ordering::SeqCst)
+            || self.gate.as_ref().is_some_and(SpawnGate::is_closed)
+        {
+            return Err(self.shutting_down());
+        }
         if !self.invalidated.load(Ordering::SeqCst) {
             if let Some(tunnel) = held.tunnel.as_ref() {
                 return Ok(RoostEndpoint::Unix(tunnel.bridge_socket().to_path_buf()));
@@ -846,26 +1026,58 @@ impl RoostReach for SshBridge {
                 .last_error()
                 .map_or(0, |recorded| recorded.generation);
             held.base = held.base.saturating_add(last).saturating_add(1);
-            tunnel.shutdown().await;
-            drop(tunnel);
+            // **The teardown is the bridge's, not this caller's** (plan 026
+            // §3.3, R3): it runs in the bridge's own `JoinSet` and this future
+            // only waits for it, so a watcher or probe aborted right here
+            // cancels its wait and never roost's shutdown midway.
+            self.teardowns
+                .run(Box::pin(async move {
+                    tunnel.shutdown().await;
+                    drop(tunnel);
+                }))
+                .await;
         }
         // Cleared before the open, not after: an `invalidate` that lands while
         // this open is in flight must survive it, or the tunnel it was warning
         // about would be kept.
         self.invalidated.store(false, Ordering::SeqCst);
 
-        let tunnel = self
-            .opener
-            .open(&self.host_id, &self.target, self.options.clone())
-            .await
-            // The message is prefixed, the KIND is not touched: roost classified
-            // this and shed's job is to say which reach it was about.
-            .map_err(|e| {
-                ReachError::new(
-                    e.kind,
-                    format!("{}: {}", target_token(&self.label), e.message),
-                )
-            })?;
+        // **The spawn section** (plan 026 §3.3): the establishment spawns the
+        // master, and it is held in `held` — where [`RoostReach::shutdown`]
+        // finds it — before the section ends.
+        let _section: Option<SpawnSection> = match &self.gate {
+            Some(gate) => Some(gate.enter().map_err(|_| self.shutting_down())?),
+            None => None,
+        };
+        // **An establishment is abandoned, never waited for, once the exit
+        // begins** (plan 026 §3.3, F3): roost gives one up to 30 s, and the
+        // gate's close or this bridge's own shutdown must not wait that long
+        // on `held`. On either signal the open future is DROPPED here. What
+        // that costs is roost's own cleanup of a partial tunnel, run inside
+        // the drop: the establishing `ssh` is a `kill_on_drop` child, SIGKILLed
+        // as its future goes, and `SshTunnel::Drop` asks any master it had
+        // already forked to exit (`blocking_exit_master`: bounded by roost's
+        // 2 s teardown budget, then a kill and a reap of that SIGKILLed
+        // `ssh -O exit`). It blocks the dropping worker only that long. The
+        // same path runs when phase 0 aborts a client mid-establishment.
+        let opened = tokio::select! {
+            biased;
+            () = self.stopped() => return Err(self.shutting_down()),
+            opened = self.opener.open_owned(
+                &self.host_id,
+                &self.target,
+                self.options.clone(),
+                &self.teardowns,
+            ) => opened,
+        };
+        // The message is prefixed, the KIND is not touched: roost classified
+        // this and shed's job is to say which reach it was about.
+        let tunnel = opened.map_err(|e| {
+            ReachError::new(
+                e.kind,
+                format!("{}: {}", target_token(&self.label), e.message),
+            )
+        })?;
         let socket = tunnel.bridge_socket().to_path_buf();
         held.tunnel = Some(tunnel);
         Ok(RoostEndpoint::Unix(socket))
@@ -892,6 +1104,46 @@ impl RoostReach for SshBridge {
             generation: held.base.saturating_add(recorded.generation),
             error: recorded.error,
         })
+    }
+
+    /// **Shut this bridge down for good** (plan 026 §3.3): refuse every later
+    /// establishment, hand the live tunnel's teardown to the bridge's own
+    /// `JoinSet`, and join every teardown there. No timeout here and none
+    /// around it: roost bounds its own shutdown (a 2 s drain, then a 2 s
+    /// `exit_master`), and cancelling it midway is what skips its `Drop`.
+    ///
+    /// The closing flag is set before `held` is taken, and `ensure` reads it
+    /// under `held`, so none starts after; one already in flight selects on
+    /// the stop signal sent below and is abandoned (F3) — its partial tunnel's
+    /// cleanup is roost's own `Drop`, bounded by a SIGKILLed reap — so `held`
+    /// is free within that, not after roost's 30 s establishment budget.
+    async fn shutdown(&self) {
+        self.closing.store(true, Ordering::SeqCst);
+        // An establishment in flight holds `held`: tell it to give up (it
+        // selects on this), so the lock below is not a wait on roost's 30 s.
+        self.stop.notify_waiters();
+        let tunnel = self.held.lock().await.tunnel.take();
+        if let Some(tunnel) = tunnel {
+            self.teardowns
+                .run(Box::pin(async move {
+                    tunnel.shutdown().await;
+                    drop(tunnel);
+                }))
+                .await;
+        }
+        self.teardowns.join_all().await;
+    }
+}
+
+impl Drop for SshBridge {
+    /// A bridge dropped with a teardown still running lets it FINISH: a
+    /// `JoinSet`'s own `Drop` would abort it midway, which is the failure the
+    /// set exists to prevent. A SHARED sink (the app's, F4) keeps the task, so
+    /// the app's shutdown still joins it; a bridge's own sink detaches it.
+    fn drop(&mut self) {
+        if self.owns_teardowns {
+            self.teardowns.detach_all();
+        }
     }
 }
 
@@ -1336,6 +1588,14 @@ impl RoostWatcher {
     /// connection; the reach is torn down when the last reference to it goes.
     pub fn stop(&self) {
         self.task.abort();
+    }
+
+    /// [`Self::stop`], and wait until the loop has actually ended — its
+    /// in-flight future dropped, its connection closed (plan 026 §3.3: the app
+    /// joins every roost client before it shuts the tunnels they ride).
+    pub async fn stop_and_join(mut self) {
+        self.task.abort();
+        let _ = (&mut self.task).await;
     }
 }
 
@@ -1817,11 +2077,13 @@ async fn finish<T>(reach: &dyn RoostReach, result: Result<T, RoostError>) -> Res
 /// Whether a failed request means **the wire** is suspect, rather than the
 /// request.
 ///
-/// A one-shot does not need this — it dials per call, so invalidating after any
-/// error costs it nothing. A held connection does: it is the only caller that
-/// can be told "that tab is gone" by a transport that is working perfectly, and
+/// A one-shot routed through [`finish`] does not ask — it dials per call and
+/// invalidates after any error. A held connection does: it is the caller most
+/// often told "that tab is gone" by a transport that is working perfectly, and
 /// tearing the transport down for that would make every stale tab id cost an
-/// `ssh` re-establish.
+/// `ssh` re-establish. [`tab_set_title`] asks too, for the same reason: its
+/// natural refusal (the tab closed between the open and the rename) arrives
+/// over a working, shared tunnel.
 ///
 /// Matched exhaustively on purpose: a new [`RoostError`] variant should fail to
 /// compile here rather than default into either answer.
@@ -1849,6 +2111,33 @@ fn is_transport_error(error: &RoostError) -> bool {
 pub async fn tab_open(reach: &dyn RoostReach, params: TabOpenParams) -> Result<Tab, String> {
     let mut conn = dial(reach).await?;
     finish(reach, conn.tab_open(params).await).await
+}
+
+/// `tab.set_title` — give a tab a sticky name.
+///
+/// A one-shot like [`tab_open`], and its follow-up: a `tab.open` title is a
+/// placeholder the foreground process's OSC title overwrites, so a name the user
+/// chose goes on afterwards through this (plan 026 §3.5). Its own dial rather
+/// than the open's connection, because the open is answered by then and a
+/// failed title must not cost the caller the tab it already has.
+///
+/// **Only a transport-shaped failure invalidates the reach**
+/// ([`is_transport_error`]), unlike the other one-shots' [`finish`]. A refusal
+/// roost minted — `not-found` for a tab closed between the open and the rename —
+/// is the session answering over a working wire, and the reach is SHARED: the
+/// host's watcher and its lanes ride the same tunnel, so tearing it down on the
+/// next `ensure` would cost all of them a re-establish over a rename.
+pub async fn tab_set_title(reach: &dyn RoostReach, tab_id: i64, title: &str) -> Result<(), String> {
+    let mut conn = dial(reach).await?;
+    match conn.tab_set_title(tab_id, title).await {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            if is_transport_error(&e) {
+                reach.invalidate().await;
+            }
+            Err(e.to_string())
+        }
+    }
 }
 
 /// Where a client is in ONE roost daemon's history: a revision, and the
@@ -2046,6 +2335,42 @@ const CONTROL_PERSIST: &str = "60s";
 /// keeping: a failing `ssh` puts its banner first and its diagnosis last.
 const STDERR_TAIL_CAP: usize = 4 * 1024;
 
+/// How long a master's `-O exit` may take — at shutdown and in `Drop` — before
+/// it is killed (plan 026 §3.3). A round trip to a process on this machine.
+const MASTER_EXIT_WAIT: Duration = Duration::from_secs(2);
+
+/// How long `-O check` may take to say whether the master still answers.
+const MASTER_CHECK_WAIT: Duration = Duration::from_secs(1);
+
+/// How long a wedged master gets between its SIGTERM and its SIGKILL.
+const MASTER_KILL_WAIT: Duration = Duration::from_secs(1);
+
+/// How long `ps` may take to show a pid's command line (the pid fallback's
+/// check that the pid is still this runner's master). An identity check tries
+/// twice, so it costs at most twice this.
+const PS_WAIT: Duration = Duration::from_millis(200);
+
+/// How long a killed `-O exit` (or `-O check`) is waited for after its kill.
+const CONTROL_REAP_WAIT: Duration = Duration::from_millis(200);
+
+/// **One runner's whole [`SshExec::shutdown`], every path** (R2-1): its
+/// `-O exit` (2 s + 0.2 s reap); then the fallback — `-O check` (1 s, retried
+/// once), the identity checks (2 × 0.2 s each), the SIGTERM wait (1 s), the
+/// SIGKILL's sighting — clamped to this deadline LESS [`MASTER_RETRY_RESERVE`];
+/// then, for a master it could not confirm, the retried `-O exit` its `Drop`
+/// would have run, in that reserve. The runners' shutdowns run in parallel, so
+/// the app's masters phase is this long whatever their number.
+pub const MASTER_SHUTDOWN_BOUND: Duration = Duration::from_secs(5);
+
+/// How long an unconfirmed master's retried `-O exit` may take before it is
+/// killed (the first one already had [`MASTER_EXIT_WAIT`]).
+const MASTER_RETRY_WAIT: Duration = Duration::from_secs(1);
+
+/// What the fallback may never spend (C3 round 4): the retried `-O exit` and
+/// its reap, kept back so a fallback that runs to its deadline still leaves
+/// the retry its whole budget.
+const MASTER_RETRY_RESERVE: Duration = Duration::from_millis(1_200);
+
 /// Runs the bootstrap machines' [`Step::Exec`] steps on a far side, over an
 /// `ssh` subprocess on a **private `ControlMaster`** (plan 019 §3.6).
 ///
@@ -2098,6 +2423,20 @@ pub struct SshExec {
     /// baked its path into the config `-F` points at, so it has to outlive that
     /// config and be removed with it.
     _pin_dir: Option<ScratchDir>,
+    /// The app's spawn gate (plan 026 §3.3): every exec — and so the master
+    /// it may establish — runs inside one of its sections, and a step's child
+    /// is registered with it. `None` by default.
+    gate: Option<SpawnGate>,
+    /// Set once [`SshExec::shutdown`] has done its bounded work, so `Drop` does
+    /// nothing more — whether or not the master was confirmed ended.
+    exited: AtomicBool,
+    /// Whether that shutdown CONFIRMED the master ended — what a repeat call
+    /// answers (C3 round 4). Meaningful once `exited` is set.
+    confirmed: AtomicBool,
+    /// Test seam: the `ps` the pid fallback runs (a slow one, for the
+    /// uncertain path). `ps` on the PATH otherwise.
+    #[cfg(test)]
+    ps_bin: Option<PathBuf>,
 }
 
 impl SshExec {
@@ -2165,6 +2504,11 @@ impl SshExec {
             config_path,
             dir,
             _pin_dir: pinned.dir,
+            gate: options.spawn_gate.clone(),
+            exited: AtomicBool::new(false),
+            confirmed: AtomicBool::new(false),
+            #[cfg(test)]
+            ps_bin: None,
         })
     }
 
@@ -2273,8 +2617,8 @@ impl SshExec {
         use tokio::io::AsyncReadExt as _;
         use tokio::io::AsyncWriteExt as _;
 
-        let mut child = match self.spawn_child(command) {
-            Ok(child) => child,
+        let (mut child, section) = match self.spawn_child(command) {
+            Ok(spawned) => spawned,
             Err(e) => {
                 return Outcome::Exec {
                     exit: None,
@@ -2283,10 +2627,31 @@ impl SshExec {
                 }
             }
         };
-
         let mut sink = child.stdin.take().expect("the child's stdin is piped");
         let mut out = child.stdout.take().expect("the child's stdout is piped");
         let mut err = child.stderr.take().expect("the child's stderr is piped");
+        // **The child belongs to a watcher of its own** (plan 026 §3.3, F8),
+        // which reaps it and publishes its exit — so the gate's drain sees this
+        // step's exit whoever is awaiting it, and a step whose future is
+        // dropped (a timed-out budget, a cancelled bootstrap) is killed by the
+        // guard below and STILL reaped and seen, not merely asked to die.
+        let watched = RunChild::spawn(child);
+        let _kill_if_dropped = KillOnDrop(Arc::clone(&watched));
+        // **Registered with the gate, inside the spawn's section**: the drain
+        // can end this step whoever is awaiting it — a bootstrap in flight when
+        // the app quits, say. On a gate that has already closed, the
+        // registration kills it at once and this step answers `shutting_down`.
+        if let (Some(gate), Some(section)) = (&self.gate, section.as_ref()) {
+            let handle: Arc<dyn ChildExit> = Arc::clone(&watched) as Arc<RunChild>;
+            if gate.register_exit(section, handle).await.is_err() {
+                return Outcome::Exec {
+                    exit: None,
+                    stdout: Vec::new(),
+                    stderr_tail: format!("{}: {ShuttingDown}", self.label),
+                };
+            }
+        }
+        drop(section);
 
         // **All three bands concurrently.** A stream step feeds tens of
         // megabytes into a pipe whose reader is the far side's `tee`; writing it
@@ -2328,8 +2693,10 @@ impl SshExec {
         };
         let stderr = rolling_tail(&mut err, STDERR_TAIL_CAP);
 
+        // A drain's kill ends the child (its watcher kills it), and with it the
+        // three bands.
         let (written, stdout, stderr) = tokio::join!(writer, reader, stderr);
-        let status = child.wait().await;
+        let exit = watched.wait().await;
 
         // Already at most `STDERR_TAIL_CAP` bytes — [`rolling_tail`] applied the
         // bound while reading rather than afterwards. What is left for `tail`
@@ -2346,7 +2713,7 @@ impl SshExec {
             }
         }
         Outcome::Exec {
-            exit: status.ok().and_then(|status| status.code()),
+            exit,
             stdout,
             stderr_tail,
         }
@@ -2364,12 +2731,29 @@ impl SshExec {
     /// and the same `kill_on_drop`: a dropped child is a killed one, so a
     /// connection that is let go never leaves its bridge running. Nothing here
     /// bounds the child's life; a duplex lives as long as its caller holds it.
+    ///
+    /// **Gated** (plan 026 §3.3): once the app's spawn gate has closed it
+    /// refuses with [`ShuttingDown`] and spawns nothing. Registering the child
+    /// is the caller's — it owns the child's kill handle — and a caller with a
+    /// gate holds a section of its own across this call and the registration.
     pub fn spawn_duplex(&self, command: &str) -> std::io::Result<tokio::process::Child> {
-        self.spawn_child(command)
+        self.spawn_child(command).map(|(child, _section)| child)
     }
 
-    fn spawn_child(&self, command: &str) -> std::io::Result<tokio::process::Child> {
-        tokio::process::Command::new(&self.ssh_bin)
+    /// Spawn one exec inside a section of the gate, if there is one — and hand
+    /// the section back, so the caller can register the child before it ends.
+    fn spawn_child(
+        &self,
+        command: &str,
+    ) -> std::io::Result<(tokio::process::Child, Option<SpawnSection>)> {
+        let section = match &self.gate {
+            Some(gate) => Some(
+                gate.enter()
+                    .map_err(|e| std::io::Error::other(e.to_string()))?,
+            ),
+            None => None,
+        };
+        let child = tokio::process::Command::new(&self.ssh_bin)
             .args(self.argv(command))
             // **`LC_ALL=C`.** Failures on this path are classified by English
             // substring (roost's `classify_ssh_failure`), so a non-English
@@ -2381,26 +2765,296 @@ impl SshExec {
             .stderr(std::process::Stdio::piped())
             // What makes the budget in `run` a kill and not merely a give-up.
             .kill_on_drop(true)
-            .spawn()
+            .spawn()?;
+        Ok((child, section))
     }
 
-    /// Ask the `ControlMaster` to exit. Idempotent; safe to call on a runner
-    /// that never opened one.
+    /// **End the `ControlMaster`, bounded** (plan 026 §3.3) — the app's
+    /// orderly exit. Idempotent; safe to call on a runner that never opened
+    /// one. Answers whether the master is known to be ended.
     ///
-    /// The explicit half of the teardown, for app quit. `Drop` does the same
-    /// thing blockingly for every other way a runner can end.
-    pub async fn shutdown(&self) {
-        if !self.ctl_path.exists() {
-            return;
+    /// * `-O exit`, waited for at most [`MASTER_EXIT_WAIT`] and killed past it;
+    /// * then `-O check` (bounded to [`MASTER_CHECK_WAIT`]). A check that finds
+    ///   no master is the confirmation. A master that still answers — wedged,
+    ///   it took no notice — is ended by its pid: read ONLY from the "Master
+    ///   running (pid=N)" record, its identity verified exactly (an argv token
+    ///   EQUAL to this runner's control path, or ssh's retitled `ssh: <path>
+    ///   [mux]` — never a substring), re-verified immediately before the
+    ///   SIGTERM and again before the SIGKILL that follows
+    ///   [`MASTER_KILL_WAIT`] later;
+    /// * a check or a `ps` that could not answer (timed out, could not run) is
+    ///   UNCERTAIN: the check gets one retry (`ps` gets its own), and a master
+    ///   still unconfirmed then — uncertain, or a pid that is not this
+    ///   runner's — gets the bounded `-O exit` its `Drop` would have sent,
+    ///   **here**, inside this runner's own task (R2-1): a drop doing it
+    ///   instead would be one blocking 2 s wait per runner, serially, as the
+    ///   masters phase lets go of them. What is still unconfirmed after that
+    ///   is abandoned and said (`tracing`); the answer is `false`.
+    ///
+    /// The runner is marked exited at the end either way, so its `Drop` does
+    /// nothing more. **Every step is clamped to one deadline,
+    /// [`MASTER_SHUTDOWN_BOUND`]**, and none needs this future to survive past
+    /// it, so it is safe to run beside other masters' shutdowns without an
+    /// outer timeout: N of them in parallel take one bound.
+    pub async fn shutdown(&self) -> bool {
+        // A repeat call answers what the first one CONFIRMED (C3 round 4) —
+        // `exited` alone only says the work is done.
+        if self.exited.load(Ordering::SeqCst) {
+            return self.confirmed.load(Ordering::SeqCst);
         }
-        let _ = tokio::process::Command::new(&self.ssh_bin)
-            .args(self.exit_argv())
+        // Only a socket that is reliably NOT THERE means no master was ever
+        // opened; a lookup that failed goes the normal way (C3 round 6).
+        if self.ctl_lookup() == Some(false) {
+            self.confirmed.store(true, Ordering::SeqCst);
+            self.exited.store(true, Ordering::SeqCst);
+            return true;
+        }
+        let deadline = tokio::time::Instant::now() + MASTER_SHUTDOWN_BOUND;
+        // The fallback's own deadline: the retry's budget is kept back first.
+        let fallback = deadline
+            .checked_sub(MASTER_RETRY_RESERVE)
+            .unwrap_or(deadline);
+        let _ = run_bounded(self.control_command(self.exit_argv()), MASTER_EXIT_WAIT).await;
+        let mut check = self.check_master(fallback).await;
+        if matches!(check, MasterCheck::Uncertain) {
+            check = self.check_master(fallback).await;
+        }
+        let unconfirmed = match check {
+            MasterCheck::Gone => None,
+            MasterCheck::Running(pid) => match self.identify(pid, fallback).await {
+                // The master `-O check` named exited before `ps` looked.
+                Identity::Gone => None,
+                // Confirmed ONLY if the pid fallback saw the master go: a
+                // master that outlived both signals, or whose identity could
+                // not be re-verified for the SIGKILL, takes the retry below
+                // and is counted unconfirmed (C3 round 3).
+                Identity::Ours => match self.end_master(pid, fallback).await {
+                    Ended::Gone => None,
+                    Ended::StillAlive => Some("the master outlived its SIGTERM and SIGKILL"),
+                    Ended::Uncertain => Some(
+                        "the master outlived its SIGTERM, and its identity could not be \
+                         re-verified for the SIGKILL",
+                    ),
+                },
+                Identity::NotOurs => Some("-O check names a pid that is not this runner's master"),
+                Identity::Uncertain => Some("the wedged master's identity could not be verified"),
+            },
+            MasterCheck::Uncertain => Some("-O check did not answer"),
+        };
+        if let Some(reason) = unconfirmed {
+            // The retry this runner's `Drop` would have made, made here, in
+            // the budget the fallback was not allowed to spend.
+            let left = deadline
+                .saturating_duration_since(tokio::time::Instant::now())
+                .saturating_sub(CONTROL_REAP_WAIT);
+            let retried = !left.is_zero();
+            if retried {
+                let _ = run_bounded(
+                    self.control_command(self.exit_argv()),
+                    left.min(MASTER_RETRY_WAIT),
+                )
+                .await;
+            }
+            if retried {
+                tracing::warn!(
+                    target = %self.label,
+                    reason,
+                    "ssh master: not confirmed ended after a retried -O exit; abandoned"
+                );
+            } else {
+                tracing::warn!(
+                    target = %self.label,
+                    reason,
+                    "ssh master: not confirmed ended, and no time was left to retry -O exit; \
+                     abandoned"
+                );
+            }
+        }
+        // Destructor suppression, kept apart from confirmation: every path
+        // has had its bounded attempts by now, so `Drop` does nothing more —
+        // and the answer, now and on any later call, says whether the master
+        // was CONFIRMED ended.
+        let confirmed = unconfirmed.is_none();
+        self.confirmed.store(confirmed, Ordering::SeqCst);
+        self.exited.store(true, Ordering::SeqCst);
+        confirmed
+    }
+
+    /// An `ssh -O <op>` command against this runner's master: no stdin, no
+    /// stdout, stderr piped (where `-O check` answers), killed on drop.
+    fn control_command(&self, argv: Vec<String>) -> tokio::process::Command {
+        let mut cmd = tokio::process::Command::new(&self.ssh_bin);
+        cmd.args(argv)
+            .env("LC_ALL", "C")
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .kill_on_drop(true)
-            .status()
-            .await;
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true);
+        cmd
+    }
+
+    /// `-O check`, within [`MASTER_CHECK_WAIT`] (clamped to `deadline`).
+    ///
+    /// **Only a reliable observation decides** (C3 round 5), the rule
+    /// [`Self::identify`] keeps:
+    /// * [`MasterCheck::Gone`] — the control socket itself reliably gone
+    ///   ([`Self::ctl_lookup`]), or ssh's OWN "no master" answer: exit 255 with
+    ///   one of its complete diagnostics for THIS control path
+    ///   ([`says_no_master`]; OpenSSH's wording, checked against OpenSSH 9.6);
+    /// * `Running(N)` — exit 0 with the "Master running (pid=N)" record;
+    /// * `Uncertain` — anything else: a check killed by a signal, another exit
+    ///   code or text, a spawn error, a timeout. It goes the unconfirmed way —
+    ///   the retry, then the count.
+    async fn check_master(&self, deadline: tokio::time::Instant) -> MasterCheck {
+        match self.ctl_lookup() {
+            Some(false) => return MasterCheck::Gone,
+            None => return MasterCheck::Uncertain,
+            Some(true) => {}
+        }
+        let wait =
+            MASTER_CHECK_WAIT.min(deadline.saturating_duration_since(tokio::time::Instant::now()));
+        if wait.is_zero() {
+            return MasterCheck::Uncertain;
+        }
+        let Ok(child) = self.control_command(self.check_argv()).spawn() else {
+            return MasterCheck::Uncertain;
+        };
+        match tokio::time::timeout(wait, child.wait_with_output()).await {
+            Ok(Ok(output)) => {
+                let said = String::from_utf8_lossy(&output.stderr);
+                match output.status.code() {
+                    Some(0) => match master_pid_in(&said) {
+                        Some(pid) => MasterCheck::Running(pid),
+                        None => MasterCheck::Uncertain,
+                    },
+                    Some(255) if says_no_master(&said, &self.ctl_path) => MasterCheck::Gone,
+                    _ => MasterCheck::Uncertain,
+                }
+            }
+            _ => MasterCheck::Uncertain,
+        }
+    }
+
+    /// Whether `pid` is this runner's master, by its command line — `ps -o
+    /// args= -p N` (POSIX: macOS and Linux alike, no `/proc`), bounded by
+    /// [`PS_WAIT`] and tried twice. Clamped to `deadline`.
+    ///
+    /// **Only a reliable observation decides** (C3 round 4), by `ps`'s exit
+    /// status as well as its output:
+    /// * exit 0 naming this runner's control path exactly → [`Identity::Ours`];
+    /// * exit 0 naming anything else → [`Identity::NotOurs`];
+    /// * exit 1 with nothing printed — "no such process", the answer of both
+    ///   procps (Linux) and BSD `ps` (macOS) for a pid that is gone, checked
+    ///   on both → [`Identity::Gone`];
+    /// * anything else — a `ps` killed by a signal, another exit code, a spawn
+    ///   error, a timeout — is no answer: tried again, then
+    ///   [`Identity::Uncertain`].
+    async fn identify(&self, pid: i32, deadline: tokio::time::Instant) -> Identity {
+        for _ in 0..2 {
+            let wait = PS_WAIT.min(deadline.saturating_duration_since(tokio::time::Instant::now()));
+            if wait.is_zero() {
+                break;
+            }
+            let probe = tokio::process::Command::new(self.ps_bin())
+                .args(["-ww", "-o", "args=", "-p", &pid.to_string()])
+                .stdin(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .kill_on_drop(true)
+                .output();
+            if let Ok(Ok(out)) = tokio::time::timeout(wait, probe).await {
+                let printed = String::from_utf8_lossy(&out.stdout);
+                match out.status.code() {
+                    Some(0) if names_exactly(&printed, &self.ctl_path) => return Identity::Ours,
+                    Some(0) if !printed.trim().is_empty() => return Identity::NotOurs,
+                    Some(1) if printed.trim().is_empty() => return Identity::Gone,
+                    // A signal, an odd code, or a success that printed nothing.
+                    _ => {}
+                }
+            }
+        }
+        Identity::Uncertain
+    }
+
+    /// Is the control socket there? `symlink_metadata` — it never follows a
+    /// symlink — and ONLY `NotFound` is "not there" (`Some(false)`); any other
+    /// lookup error (a permission, a loop) is no answer (`None`).
+    fn ctl_lookup(&self) -> Option<bool> {
+        match std::fs::symlink_metadata(&self.ctl_path) {
+            Ok(_) => Some(true),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Some(false),
+            Err(_) => None,
+        }
+    }
+
+    fn ps_bin(&self) -> &Path {
+        #[cfg(test)]
+        if let Some(ps) = &self.ps_bin {
+            return ps;
+        }
+        Path::new("ps")
+    }
+
+    /// SIGTERM the verified master, wait at most [`MASTER_KILL_WAIT`] for it to
+    /// go, then — its identity verified AGAIN — SIGKILL it. Answers what it
+    /// SAW ([`Ended`]): gone, still alive, or — a re-verification that could
+    /// not answer, so no SIGKILL was sent — uncertain.
+    ///
+    /// **The residual window, stated:** between a verification and the signal
+    /// after it the pid could, in principle, be reaped and recycled. POSIX has
+    /// no portable way to signal "this process" rather than "this number"
+    /// (Linux's pidfd is not portable to macOS), so the window is narrowed — a
+    /// verification immediately before each signal — not closed. The master is
+    /// a daemon reparented to init, which reaps it the moment it exits, so a
+    /// recycle inside that gap would need a fresh process to claim the very
+    /// same pid in microseconds.
+    async fn end_master(&self, pid: i32, deadline: tokio::time::Instant) -> Ended {
+        // SAFETY: a plain signal to a pid verified to be this runner's master
+        // immediately before this call.
+        unsafe {
+            libc::kill(pid, libc::SIGTERM);
+        }
+        // The SIGTERM wait leaves room, inside the runner's deadline, for the
+        // identity check before the SIGKILL.
+        let term_deadline = (tokio::time::Instant::now() + MASTER_KILL_WAIT)
+            .min(deadline.checked_sub(PS_WAIT * 2).unwrap_or(deadline));
+        while pid_exists(pid) && tokio::time::Instant::now() < term_deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        if !pid_exists(pid) {
+            return Ended::Gone;
+        }
+        match self.identify(pid, deadline).await {
+            // Reliably observed: the pid is gone, or now belongs to a different
+            // process — either way the master it named has ended.
+            Identity::Gone | Identity::NotOurs => Ended::Gone,
+            Identity::Uncertain => Ended::Uncertain,
+            Identity::Ours => {
+                // SAFETY: as above, re-verified a moment ago.
+                unsafe {
+                    libc::kill(pid, libc::SIGKILL);
+                }
+                // A SIGKILLed daemon is reaped by init at once; wait a moment,
+                // inside the deadline, to SEE it go.
+                let seen_by = (tokio::time::Instant::now() + CONTROL_REAP_WAIT).min(deadline);
+                while pid_exists(pid) && tokio::time::Instant::now() < seen_by {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                if pid_exists(pid) {
+                    Ended::StillAlive
+                } else {
+                    Ended::Gone
+                }
+            }
+        }
+    }
+
+    /// `-O check`: does a master answer on the control socket?
+    fn check_argv(&self) -> Vec<String> {
+        let mut argv = self.exit_argv();
+        if let Some(op) = argv.iter_mut().find(|a| *a == "exit") {
+            *op = "check".to_string();
+        }
+        argv
     }
 
     /// `-O exit`: ask the running master to close, taking every multiplexed
@@ -2429,18 +3083,258 @@ impl Drop for SshExec {
         // outlives the process that opened it by a minute, holding a connection
         // to somebody's shed with nothing left to close it. `-O exit` against a
         // live local socket is a round trip to a process on this machine.
-        if self.ctl_path.exists() {
-            let _ = std::process::Command::new(&self.ssh_bin)
+        //
+        // **And bounded** (plan 026 §3.3): `try_wait` polling for at most
+        // [`MASTER_EXIT_WAIT`], then killed — no destructor may block an exit
+        // on a master that does not answer. Nothing at all once
+        // [`SshExec::shutdown`] has ended the master.
+        if !self.exited.load(Ordering::SeqCst) && self.ctl_path.exists() {
+            let spawned = std::process::Command::new(&self.ssh_bin)
                 .args(self.exit_argv())
                 .stdin(std::process::Stdio::null())
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null())
-                .status();
+                .spawn();
+            if let Ok(mut child) = spawned {
+                let deadline = std::time::Instant::now() + MASTER_EXIT_WAIT;
+                loop {
+                    match child.try_wait() {
+                        Ok(Some(_)) | Err(_) => break,
+                        Ok(None) if std::time::Instant::now() >= deadline => {
+                            let _ = child.kill();
+                            let _ = child.try_wait();
+                            break;
+                        }
+                        Ok(None) => std::thread::sleep(Duration::from_millis(10)),
+                    }
+                }
+            }
         }
         // `self.dir`'s own `Drop` removes the directory, control socket and all,
         // immediately after this returns.
         let _ = &self.dir;
     }
+}
+
+/// One [`SshExec::run`] step's child, OWNED until it is reaped (plan 026 §3.3,
+/// F8): a task of its own holds the `Child`, waits for it — or kills it, on
+/// [`ChildExit::kill`] or once every handle is gone — and publishes the exit.
+/// So the gate's drain observes a real exit for every step, including one whose
+/// awaiting future was dropped.
+struct RunChild {
+    /// The child's pid, taken at the spawn — what a log names.
+    pid: Option<u32>,
+    /// `None` until the watcher is done with the child; then how it ended.
+    status: tokio::sync::watch::Receiver<Option<RunExit>>,
+    kill: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+}
+
+/// How a step's child ended, as its watcher saw it ([`RunChild`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RunExit {
+    /// Reaped: its exit code (`None` for a signal).
+    Reaped(Option<i32>),
+    /// `wait()` itself failed: no proof of a reap (R2-5). Not an exit — the
+    /// drain does not count it as one — and logged with the pid.
+    Unknown,
+}
+
+impl RunChild {
+    fn spawn(mut child: tokio::process::Child) -> Arc<RunChild> {
+        let pid = child.id();
+        let (status_tx, status) = tokio::sync::watch::channel(None);
+        let (kill_tx, kill_rx) = tokio::sync::oneshot::channel::<()>();
+        tokio::spawn(async move {
+            let done = tokio::select! {
+                done = child.wait() => done,
+                // A kill sent, or every handle gone: kill, then reap.
+                _ = kill_rx => {
+                    let _ = child.start_kill();
+                    child.wait().await
+                }
+            };
+            let exit = match done {
+                Ok(status) => RunExit::Reaped(status.code()),
+                Err(error) => {
+                    tracing::warn!(
+                        pid = ?pid,
+                        %error,
+                        "ssh step: waiting for the child failed; its exit is unknown"
+                    );
+                    RunExit::Unknown
+                }
+            };
+            let _ = status_tx.send(Some(exit));
+        });
+        Arc::new(RunChild {
+            pid,
+            status,
+            kill: std::sync::Mutex::new(Some(kill_tx)),
+        })
+    }
+
+    /// Wait for the watcher; the exit code (`None` for a signal, an unknown
+    /// exit, or a watcher that never reported).
+    async fn wait(&self) -> Option<i32> {
+        let mut status = self.status.clone();
+        let published = status.wait_for(Option::is_some).await.map(|exit| *exit);
+        match published {
+            Ok(Some(RunExit::Reaped(code))) => code,
+            _ => None,
+        }
+    }
+}
+
+impl ChildExit for RunChild {
+    fn kill(&self) {
+        if let Some(kill) = self.kill.lock().unwrap_or_else(|e| e.into_inner()).take() {
+            let _ = kill.send(());
+        }
+    }
+
+    fn exited(&self, within: Duration) -> futures::future::BoxFuture<'static, bool> {
+        let mut status = self.status.clone();
+        Box::pin(async move {
+            // Only a REAP the watcher actually published counts: the outer
+            // timeout, the inner result, and what was published (an unknown
+            // exit is not one, R2-5) are all checked.
+            let seen = tokio::time::timeout(within, status.wait_for(Option::is_some)).await;
+            matches!(seen, Ok(Ok(ref exit)) if matches!(**exit, Some(RunExit::Reaped(_))))
+        })
+    }
+
+    /// The watcher is finished — nothing more will be learned — whether it
+    /// saw a reap or an unknown exit.
+    fn done(&self) -> bool {
+        self.status.borrow().is_some()
+    }
+
+    fn pid(&self) -> Option<u32> {
+        self.pid
+    }
+}
+
+/// Kills a step's child if the step's future is dropped before the child
+/// ended — what `kill_on_drop` did when the future owned the child. The watcher
+/// still reaps it and publishes the exit.
+struct KillOnDrop(Arc<RunChild>);
+
+impl Drop for KillOnDrop {
+    fn drop(&mut self) {
+        if !self.0.done() {
+            self.0.kill();
+        }
+    }
+}
+
+/// Run `cmd`, waiting at most `budget`; past it, kill it (and wait a moment
+/// for the reap). Answers its exit status when it ended by itself.
+async fn run_bounded(
+    mut cmd: tokio::process::Command,
+    budget: Duration,
+) -> Option<std::process::ExitStatus> {
+    let mut child = cmd.spawn().ok()?;
+    match tokio::time::timeout(budget, child.wait()).await {
+        Ok(status) => status.ok(),
+        Err(_) => {
+            let _ = child.start_kill();
+            let _ = tokio::time::timeout(CONTROL_REAP_WAIT, child.wait()).await;
+            None
+        }
+    }
+}
+
+/// Whether `-O check`'s stderr is ssh's own "there is no master here" — one of
+/// its COMPLETE diagnostics, a whole line (trailing whitespace trimmed, so the
+/// `\r\n` goes), for THIS control path:
+/// * `Control socket connect(<ctl>): No such file or directory`;
+/// * `Control socket connect(<ctl>): Connection refused`;
+/// * `No ControlPath specified for "-O" command`.
+///
+/// Nothing looser: another path, a prefix of one of these, any other text is
+/// no answer. (OpenSSH prints at most 100 bytes of the path; a longer one never
+/// matches, and reads as no answer — the safe side.)
+fn says_no_master(stderr: &str, ctl: &Path) -> bool {
+    let ctl = ctl.display();
+    let absent = format!("Control socket connect({ctl}): No such file or directory");
+    let refused = format!("Control socket connect({ctl}): Connection refused");
+    stderr.lines().map(str::trim_end).any(|line| {
+        line == absent || line == refused || line == r#"No ControlPath specified for "-O" command"#
+    })
+}
+
+/// What `-O check` said about a master ([`SshExec::shutdown`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MasterCheck {
+    /// No master answers on the control socket.
+    Gone,
+    /// A master answers, with this pid.
+    Running(i32),
+    /// No answer to go on.
+    Uncertain,
+}
+
+/// What the pid fallback saw of a verified master ([`SshExec::end_master`]).
+enum Ended {
+    /// It went (or its pid stopped being this runner's master).
+    Gone,
+    /// Still there after SIGTERM and the SIGKILL that followed.
+    StillAlive,
+    /// Still there after SIGTERM, and the identity check before the SIGKILL
+    /// could not answer — so no SIGKILL was sent.
+    Uncertain,
+}
+
+/// Whether a pid is this runner's master ([`SshExec::identify`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Identity {
+    /// `ps` named this runner's control path exactly.
+    Ours,
+    /// `ps` named a different command line.
+    NotOurs,
+    /// `ps` reliably said there is no such process.
+    Gone,
+    /// No reliable answer.
+    Uncertain,
+}
+
+/// The pid in ssh's master-status record, `Master running (pid=N)` — that
+/// record ONLY: a `pid=` anywhere else in the output (a diagnostic) is not the
+/// master's.
+fn master_pid_in(text: &str) -> Option<i32> {
+    const RECORD: &str = "Master running (pid=";
+    text.lines().find_map(|line| {
+        let start = line.find(RECORD)? + RECORD.len();
+        let rest = &line[start..];
+        let end = rest.find(')')?;
+        rest[..end].parse().ok().filter(|pid: &i32| *pid > 1)
+    })
+}
+
+/// Whether a command line (`ps -o args=`) is EXACTLY a master on `ctl`: ssh's
+/// retitled master `ssh: <ctl> [mux]`, or an argv token equal to the path
+/// (`-S <ctl>`, `-S<ctl>`, `ControlPath=<ctl>`, `-oControlPath=<ctl>`). Never
+/// a substring — `<ctl>.log` or `<ctl>-other` is somebody else.
+fn names_exactly(args: &str, ctl: &Path) -> bool {
+    let ctl = ctl.to_string_lossy();
+    let args = args.trim();
+    if args == format!("ssh: {ctl} [mux]") {
+        return true;
+    }
+    let forms = [
+        ctl.to_string(),
+        format!("-S{ctl}"),
+        format!("ControlPath={ctl}"),
+        format!("-oControlPath={ctl}"),
+    ];
+    args.split_whitespace()
+        .any(|token| forms.iter().any(|form| token == form))
+}
+
+/// Does `pid` exist? `kill(pid, 0)` signals nothing.
+fn pid_exists(pid: i32) -> bool {
+    // SAFETY: signal 0 performs only an existence/permission check.
+    unsafe { libc::kill(pid, 0) == 0 }
 }
 
 /// Pump a verified descriptor into a child's stdin, a chunk at a time.
@@ -4036,6 +4930,78 @@ mod tests {
         assert!(gone.contains("not-found"), "{gone}");
     }
 
+    /// **A refused title leaves the reach alone; a dead wire invalidates it.**
+    /// The reach is shared with the host's watcher and lanes, so a `not-found`
+    /// roost minted (the tab closed between the open and the rename) — proof
+    /// the wire works — must not cost them a re-establish. A connection that
+    /// drops mid-request is the case `invalidate` exists for.
+    #[tokio::test]
+    async fn a_refused_title_keeps_the_reach_and_a_dead_wire_invalidates_it() {
+        let fake = FakeRoost::start().await;
+        let reach = FlakyReach::new(RoostEndpoint::Unix(fake.socket_path().to_path_buf()), 0);
+
+        let gone = tab_set_title(reach.as_ref(), 999_999, "x")
+            .await
+            .expect_err("no such tab");
+        assert!(gone.contains("not-found"), "{gone}");
+        fake.refuse_next_set_title("internal", "the title store is wedged");
+        tab_set_title(reach.as_ref(), TAB, "x")
+            .await
+            .expect_err("the seeded refusal");
+        assert_eq!(
+            reach.invalidations.load(Ordering::SeqCst),
+            0,
+            "a refusal roost minted is the wire working"
+        );
+
+        // A socket that takes the request and hangs up without an answer.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("hangup.sock");
+        let listener = tokio::net::UnixListener::bind(&path).expect("bind");
+        let hangup = tokio::spawn(async move {
+            use tokio::io::AsyncBufReadExt as _;
+            let (stream, _) = listener.accept().await.expect("accept");
+            let mut lines = tokio::io::BufReader::new(stream).lines();
+            let _ = lines.next_line().await;
+        });
+        let dead = FlakyReach::new(RoostEndpoint::Unix(path), 0);
+        let lost = tab_set_title(dead.as_ref(), TAB, "x")
+            .await
+            .expect_err("the connection dropped");
+        hangup.await.expect("the hang-up ran");
+        assert_eq!(
+            dead.invalidations.load(Ordering::SeqCst),
+            1,
+            "a dead wire must be rebuilt on the next ensure: {lost}"
+        );
+    }
+
+    /// `tab_set_title` names the tab on the wire roost reads (the string-int64
+    /// id and the title, verbatim), and a refusal comes back as an `Err` naming
+    /// roost's code rather than vanishing.
+    #[tokio::test]
+    async fn the_title_one_shot_names_a_tab_and_reports_a_refusal() {
+        let fake = FakeRoost::start().await;
+        let reach: Arc<dyn RoostReach> =
+            Arc::new(LocalSession::new("localhost", fake.socket_path()));
+        let tab = tab_open(reach.as_ref(), TabOpenParams::default())
+            .await
+            .expect("tab.open");
+
+        tab_set_title(reach.as_ref(), tab.id, "release notes")
+            .await
+            .expect("the tab exists");
+        assert_eq!(
+            fake.set_title_calls(),
+            vec![serde_json::json!({ "tab_id": tab.id.to_string(), "title": "release notes" })]
+        );
+
+        let gone = tab_set_title(reach.as_ref(), 4242, "x")
+            .await
+            .expect_err("no such tab");
+        assert!(gone.contains("not-found"), "{gone}");
+    }
+
     /// A failing one-shot invalidates the reach so the next call rebuilds it.
     #[tokio::test]
     async fn a_failed_one_shot_invalidates_the_reach() {
@@ -4447,6 +5413,41 @@ except Exception:
         std::fs::set_permissions(&staged, perms).expect("chmod");
         std::fs::rename(&staged, &final_path).expect("rename into place");
         final_path
+    }
+
+    /// Wait until the fake at `path` can be exec'd, and has been once (plan
+    /// 026 C3b), by running it with `args` until it runs. Two things delay a
+    /// script's FIRST exec, and a step bounded tighter than either fails on it:
+    /// * **ETXTBSY (Linux).** It was just written, so a sibling test's fork
+    ///   made while its write fd was open holds a copy of that fd until its
+    ///   own exec, and an exec of the script meanwhile fails. Once one exec
+    ///   succeeds no writer is left, and none can appear (this process closed
+    ///   its fd), so no later exec can fail that way.
+    /// * **macOS's first-exec assessment.** A freshly written executable's
+    ///   first exec waits on the system's check of it, about 0.25 s on macOS
+    ///   26, longer than [`PS_WAIT`]. Later execs do not.
+    ///
+    /// `args` must make the fake do nothing that a test counts or reads:
+    /// [`write_exec_ssh`]'s fake answers `-O exit` with a bare `exit 0`, and
+    /// the counting `ps` fakes answer `--settle` before they count. A
+    /// condition, not a clock: under load such a fork can take any time to
+    /// reach its exec.
+    fn settle_exec(path: &Path, args: &[&str]) {
+        loop {
+            match std::process::Command::new(path)
+                .args(args)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+            {
+                Err(e) if e.raw_os_error() == Some(libc::ETXTBSY) => {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(e) => panic!("could not run {}: {e}", path.display()),
+                Ok(_) => return,
+            }
+        }
     }
 
     fn ran(log: &Path) -> Vec<String> {
@@ -6162,5 +7163,1416 @@ esac
         );
         assert_eq!(calls[baseline + 1]["client"], "shed-desktop");
         watcher.stop();
+    }
+
+    // ---- plan 026 §3.3: the orderly shutdown's half of the reach ----
+
+    /// A tunnel whose teardown takes a while and says when it finished — the
+    /// `-O exit` roost's own shutdown ends with.
+    struct SlowTunnel {
+        socket: PathBuf,
+        log: Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Tunnel for SlowTunnel {
+        fn bridge_socket(&self) -> &Path {
+            &self.socket
+        }
+
+        fn last_error(&self) -> Option<RecordedReach> {
+            None
+        }
+
+        async fn shutdown(&self) {
+            self.log
+                .lock()
+                .unwrap()
+                .push("teardown started".to_string());
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            self.log.lock().unwrap().push("-O exit".to_string());
+        }
+    }
+
+    struct SlowOpener {
+        socket: PathBuf,
+        log: Arc<std::sync::Mutex<Vec<String>>>,
+        opened: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl TunnelOpener for SlowOpener {
+        async fn open(
+            &self,
+            _host_id: &str,
+            _target: &SshTarget,
+            _options: SshTunnelOptions,
+        ) -> Result<Box<dyn Tunnel>, ReachError> {
+            self.opened
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(Box::new(SlowTunnel {
+                socket: self.socket.clone(),
+                log: Arc::clone(&self.log),
+            }))
+        }
+    }
+
+    fn slow_bridge(
+        dir: &Path,
+        gate: Option<SpawnGate>,
+    ) -> (
+        Arc<SshBridge>,
+        Arc<SlowOpener>,
+        Arc<std::sync::Mutex<Vec<String>>>,
+    ) {
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let opener = Arc::new(SlowOpener {
+            socket: dir.join("bridge.sock"),
+            log: Arc::clone(&log),
+            opened: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let bridge = SshBridge::new(
+            &entry("mini9"),
+            SshBridgeOptions {
+                opener: opener.clone(),
+                config_paths: Some(SshConfigPaths {
+                    user: None,
+                    system: None,
+                }),
+                spawn_gate: gate,
+                ..SshBridgeOptions::default()
+            },
+        )
+        .expect("bridge");
+        (Arc::new(bridge), opener, log)
+    }
+
+    async fn logged(
+        log: &Arc<std::sync::Mutex<Vec<String>>>,
+        what: &str,
+        within: Duration,
+    ) -> bool {
+        let deadline = tokio::time::Instant::now() + within;
+        while tokio::time::Instant::now() < deadline {
+            if log.lock().unwrap().iter().any(|line| line == what) {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        false
+    }
+
+    /// **A probe aborted while `ensure` awaits an old tunnel's teardown does
+    /// not cancel the teardown** (plan 026 §3.3, R3): the bridge's own
+    /// `JoinSet` owns it, so its `-O exit` still lands.
+    #[tokio::test]
+    async fn a_probe_aborted_mid_teardown_does_not_cancel_the_teardown() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (bridge, _opener, log) = slow_bridge(dir.path(), None);
+        bridge.ensure().await.expect("the first tunnel");
+        bridge.invalidate().await;
+
+        let probing = Arc::clone(&bridge);
+        let probe = tokio::spawn(async move { probing.ensure().await });
+        assert!(
+            logged(&log, "teardown started", Duration::from_secs(5)).await,
+            "the replace path began its teardown"
+        );
+        probe.abort();
+        let _ = probe.await;
+        assert!(
+            logged(&log, "-O exit", Duration::from_secs(5)).await,
+            "aborting the probe cancelled the old tunnel's teardown midway: {:?}",
+            log.lock().unwrap()
+        );
+    }
+
+    /// **`shutdown` tears the live tunnel down, joins it, and leaves the bridge
+    /// closed**: its `-O exit` has landed when it returns, and no later
+    /// `ensure` establishes again.
+    #[tokio::test]
+    async fn a_bridge_shutdown_joins_its_teardown_and_refuses_every_later_ensure() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (bridge, opener, log) = slow_bridge(dir.path(), None);
+        bridge.ensure().await.expect("a tunnel");
+        RoostReach::shutdown(bridge.as_ref()).await;
+        assert!(
+            log.lock().unwrap().iter().any(|line| line == "-O exit"),
+            "shutdown returned before its teardown finished: {:?}",
+            log.lock().unwrap()
+        );
+        let err = bridge
+            .ensure()
+            .await
+            .expect_err("a shut-down bridge stays down");
+        assert!(
+            err.message.contains(crate::spawn_gate::SHUTTING_DOWN),
+            "{err}"
+        );
+        assert_eq!(
+            opener.opened.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "a shut-down bridge established again"
+        );
+    }
+
+    /// **A closed gate hands out no endpoint and establishes nothing**: not a
+    /// new tunnel, and not even the held one — every connection to its bridge
+    /// socket is a spawn inside roost (R10).
+    #[tokio::test]
+    async fn a_closed_gate_refuses_every_bridge_ensure() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let gate = SpawnGate::new();
+        let (held, held_opener, _) = slow_bridge(dir.path(), Some(gate.clone()));
+        held.ensure()
+            .await
+            .expect("a tunnel while the gate is open");
+        let fresh_dir = tempfile::tempdir().expect("tempdir");
+        let (fresh, fresh_opener, _) = slow_bridge(fresh_dir.path(), Some(gate.clone()));
+
+        assert!(gate.close(Duration::from_millis(100)).await);
+        for bridge in [&held, &fresh] {
+            let err = bridge
+                .ensure()
+                .await
+                .expect_err("a closed gate hands out nothing");
+            assert!(
+                err.message.contains(crate::spawn_gate::SHUTTING_DOWN),
+                "{err}"
+            );
+        }
+        assert_eq!(
+            held_opener.opened.load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        assert_eq!(
+            fresh_opener
+                .opened
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+    }
+
+    /// A fake `ssh` whose master WEDGES: an ordinary exec starts a "master" (a
+    /// background process whose command line names the control path, its pid
+    /// in `<ctl>.pid`); `-O exit` hangs for `wedge` seconds; `-O check` answers
+    /// "Master running (pid=N)" while that master lives.
+    fn write_wedged_ssh(dir: &Path, log: &Path, wedge: u32) -> PathBuf {
+        let script = format!(
+            r#"#!/bin/sh
+ctl=
+want=0
+prev=
+op=
+for arg in "$@"; do
+    if [ "$want" -eq 1 ]; then ctl="$arg"; want=0; fi
+    if [ "$arg" = "-S" ]; then want=1; fi
+    if [ "$prev" = "-O" ]; then op="$arg"; fi
+    prev="$arg"
+done
+case "$op" in
+  exit)
+    printf 'exit %s\n' "$ctl" >> '{log}'
+    exec sleep {wedge}
+    ;;
+  check)
+    if [ -e "$ctl.pid" ] && kill -0 "$(cat "$ctl.pid")" 2>/dev/null; then
+        printf 'Master running (pid=%s)\r\n' "$(cat "$ctl.pid")" >&2
+        exit 0
+    fi
+    printf 'Control socket connect(%s): No such file or directory\r\n' "$ctl" >&2
+    exit 255
+    ;;
+esac
+if [ ! -e "$ctl" ]; then
+    : > "$ctl"
+    /bin/sh -c 'while :; do sleep 0.2; done' "$ctl" </dev/null >/dev/null 2>&1 &
+    printf '%s' "$!" > "$ctl.pid"
+fi
+exit 0
+"#,
+            log = log.display(),
+        );
+        write_staged_script(dir, "wedged-ssh", script)
+    }
+
+    /// A runner's first exec, through a fake ssh this test has just written —
+    /// retried while it answers ETXTBSY: a sibling test thread's fork can hold
+    /// the script's write descriptor for an instant (the module's known flake).
+    async fn first_exec(exec: &SshExec) -> Outcome {
+        for _ in 0..20 {
+            let outcome = exec
+                .run("true", Stdin::Empty, Duration::from_secs(10), 1024, false)
+                .await;
+            match &outcome {
+                Outcome::Exec {
+                    exit: None,
+                    stderr_tail,
+                    ..
+                } if stderr_tail.contains("Text file busy") => {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                _ => return outcome,
+            }
+        }
+        exec.run("true", Stdin::Empty, Duration::from_secs(10), 1024, false)
+            .await
+    }
+
+    /// Fake masters a test's runners start, SIGKILLed when the test ends,
+    /// pass or fail, so a failing assertion never leaves one behind (the
+    /// fakes loop forever: `while :; do sleep 0.2; done`).
+    ///
+    /// **Armed before the first exec** (plan 026 C3b): it holds each runner's
+    /// control path and reads the master's pid from the fake's `<ctl>.pid`,
+    /// so a failure anywhere after the spawn is covered, even one before the
+    /// test read the pid itself. The pid is KEPT once read, because a
+    /// runner's directory, pid file included, goes when the runner drops,
+    /// which can be before this guard does (a runner local to a loop body).
+    /// [`Self::arm`] answers a [`KeepPid`] for exactly that. A pid is
+    /// signalled only if it is above 1 and its command line still names its
+    /// runner's control path: a master the code under test already ended may
+    /// have had its pid reused.
+    ///
+    /// Declare it before the runners. Arm each runner right after declaring
+    /// it, and bind the answer in the runner's own scope.
+    #[derive(Default)]
+    struct FakeMasters(std::sync::Mutex<Vec<(PathBuf, Option<i32>)>>);
+
+    impl FakeMasters {
+        /// Cover `exec`'s master. Call it before `exec`'s first run, and
+        /// bind the answer (`let _kept = …`) after `exec` in `exec`'s scope.
+        fn arm(&self, exec: &SshExec) -> KeepPid<'_> {
+            self.covered().push((exec.ctl_path.clone(), None));
+            KeepPid(self)
+        }
+
+        /// Every covered master's pid, read from its pid file once and kept.
+        fn pids(&self) -> Vec<i32> {
+            let mut covered = self.covered();
+            for (ctl, pid) in covered.iter_mut() {
+                if pid.is_none() {
+                    *pid = recorded_master_pid(ctl);
+                }
+            }
+            covered.iter().filter_map(|(_, pid)| *pid).collect()
+        }
+
+        fn covered(&self) -> std::sync::MutexGuard<'_, Vec<(PathBuf, Option<i32>)>> {
+            self.0.lock().unwrap_or_else(|e| e.into_inner())
+        }
+    }
+
+    /// Keeps its runner's master pid when the runner's scope ends, pass or
+    /// fail. Bound after the runner, it drops BEFORE the runner, so before the
+    /// runner's directory and the pid file in it go. The [`FakeMasters`] it
+    /// came from then has the pid to kill even if the runner went first.
+    #[must_use = "bind it after the runner, so it keeps the pid when the runner's scope ends"]
+    struct KeepPid<'a>(&'a FakeMasters);
+
+    impl Drop for KeepPid<'_> {
+        fn drop(&mut self) {
+            self.0.pids();
+        }
+    }
+
+    impl Drop for FakeMasters {
+        fn drop(&mut self) {
+            let covered = self.0.get_mut().unwrap_or_else(|e| e.into_inner());
+            for (ctl, pid) in covered.iter() {
+                let Some(pid) = pid
+                    .or_else(|| recorded_master_pid(ctl))
+                    .filter(|pid| *pid > 1)
+                else {
+                    continue;
+                };
+                let args = std::process::Command::new("ps")
+                    .args(["-ww", "-o", "args=", "-p", &pid.to_string()])
+                    .stderr(std::process::Stdio::null())
+                    .output();
+                let ours = args.is_ok_and(|out| {
+                    String::from_utf8_lossy(&out.stdout).contains(&*ctl.to_string_lossy())
+                });
+                if ours {
+                    // SAFETY: the pid is above 1 and its command line names
+                    // this test's own control path: a fake master it started.
+                    unsafe {
+                        libc::kill(pid, libc::SIGKILL);
+                    }
+                }
+            }
+        }
+    }
+
+    /// The pid a fake master recorded beside its control path, if it did.
+    fn recorded_master_pid(ctl: &Path) -> Option<i32> {
+        std::fs::read_to_string(format!("{}.pid", ctl.display()))
+            .ok()?
+            .trim()
+            .parse()
+            .ok()
+    }
+
+    fn master_of(exec: &SshExec) -> i32 {
+        let path = PathBuf::from(format!("{}.pid", exec.ctl_path.display()));
+        std::fs::read_to_string(path)
+            .expect("the fake master recorded its pid")
+            .trim()
+            .parse()
+            .expect("a pid")
+    }
+
+    async fn gone(pid: i32, within: Duration) -> bool {
+        let deadline = tokio::time::Instant::now() + within;
+        while tokio::time::Instant::now() < deadline {
+            if !pid_exists(pid) {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        !pid_exists(pid)
+    }
+
+    /// **Two masters whose `-O exit` wedges both end through the pid fallback,
+    /// within the bound** (plan 026 §3.3): `-O exit` is killed at 2 s, `-O
+    /// check` still finds each master, its command line names its runner's own
+    /// control path, and SIGTERM ends it — the two in parallel.
+    #[tokio::test]
+    async fn two_wedged_masters_end_through_the_pid_fallback_within_the_bound() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log = dir.path().join("control.log");
+        let ssh = write_wedged_ssh(dir.path(), &log, 30);
+        // Ended by the shutdown when it passes; by this guard when it fails.
+        let masters = FakeMasters::default();
+        let a = SshExec::new(&entry("wedge-a"), &exec_options(ssh.clone())).expect("exec a");
+        let _kept_a = masters.arm(&a);
+        let b = SshExec::new(&entry("wedge-b"), &exec_options(ssh)).expect("exec b");
+        let _kept_b = masters.arm(&b);
+        for exec in [&a, &b] {
+            let outcome = exec
+                .run("true", Stdin::Empty, Duration::from_secs(10), 1024, false)
+                .await;
+            assert!(
+                matches!(outcome, Outcome::Exec { exit: Some(0), .. }),
+                "{outcome:?}"
+            );
+        }
+        let (pa, pb) = (master_of(&a), master_of(&b));
+        masters.pids();
+        assert!(pid_exists(pa) && pid_exists(pb), "both fake masters run");
+
+        let started = std::time::Instant::now();
+        tokio::join!(a.shutdown(), b.shutdown());
+        let took = started.elapsed();
+        assert!(
+            took < MASTER_EXIT_WAIT + MASTER_CHECK_WAIT + MASTER_KILL_WAIT + Duration::from_secs(2),
+            "the masters' shutdown took {took:?}"
+        );
+        assert!(
+            gone(pa, Duration::from_secs(2)).await,
+            "master {pa} survived its shutdown"
+        );
+        assert!(
+            gone(pb, Duration::from_secs(2)).await,
+            "master {pb} survived its shutdown"
+        );
+        let exits = std::fs::read_to_string(&log).unwrap_or_default();
+        assert_eq!(
+            exits.lines().count(),
+            2,
+            "each master was asked to exit first: {exits}"
+        );
+        assert!(a.exited.load(Ordering::SeqCst) && b.exited.load(Ordering::SeqCst));
+    }
+
+    /// **`Drop`'s `-O exit` is bounded too**: a master whose `-O exit` wedges
+    /// cannot hold a destructor past [`MASTER_EXIT_WAIT`].
+    #[tokio::test]
+    async fn a_wedged_masters_drop_is_bounded() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log = dir.path().join("control.log");
+        let ssh = write_wedged_ssh(dir.path(), &log, 10);
+        // The fake master is this test's to clean up (`Drop` only asks), pass
+        // or fail. Its pid is kept before the drop removes the pid file.
+        let masters = FakeMasters::default();
+        let exec = SshExec::new(&entry("wedge-d"), &exec_options(ssh)).expect("exec");
+        let _kept = masters.arm(&exec);
+        let outcome = exec
+            .run("true", Stdin::Empty, Duration::from_secs(10), 1024, false)
+            .await;
+        assert!(
+            matches!(outcome, Outcome::Exec { exit: Some(0), .. }),
+            "{outcome:?}"
+        );
+        assert_eq!(masters.pids().len(), 1, "the fake master recorded its pid");
+
+        let started = std::time::Instant::now();
+        tokio::task::spawn_blocking(move || drop(exec))
+            .await
+            .expect("drop");
+        let took = started.elapsed();
+        assert!(
+            took < MASTER_EXIT_WAIT + Duration::from_secs(1),
+            "the destructor blocked {took:?} on a wedged -O exit"
+        );
+        assert!(std::fs::read_to_string(&log)
+            .unwrap_or_default()
+            .contains("exit "));
+    }
+
+    /// **A closed gate refuses every exec**: a step answers `shutting_down`
+    /// with no exit status, a duplex is refused, and the fake ssh never ran.
+    #[tokio::test]
+    async fn a_closed_gate_refuses_every_exec() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log = dir.path().join("ran.log");
+        let ssh = dir.path().join("logging-ssh");
+        write_exec(
+            &ssh,
+            &format!(
+                "#!/bin/sh\nprintf 'ran\\n' >> '{}'\nexit 0\n",
+                log.display()
+            ),
+        );
+        let gate = SpawnGate::new();
+        let mut options = exec_options(ssh);
+        options.spawn_gate = Some(gate.clone());
+        let exec = SshExec::new(&entry("gated"), &options).expect("exec");
+        assert!(gate.close(Duration::from_millis(100)).await);
+
+        match exec
+            .run("true", Stdin::Empty, Duration::from_secs(5), 1024, false)
+            .await
+        {
+            Outcome::Exec {
+                exit: None,
+                stderr_tail,
+                ..
+            } => assert!(
+                stderr_tail.contains(crate::spawn_gate::SHUTTING_DOWN),
+                "{stderr_tail}"
+            ),
+            other => panic!("a closed gate ran a step: {other:?}"),
+        }
+        let err = exec
+            .spawn_duplex("craze bridge --hub")
+            .expect_err("a closed gate spawns no duplex");
+        assert!(
+            err.to_string().contains(crate::spawn_gate::SHUTTING_DOWN),
+            "{err}"
+        );
+        assert!(!log.exists(), "the fake ssh ran past a closed gate");
+    }
+
+    /// **A step in flight is registered with the gate, and its drain ends it**
+    /// whoever is awaiting it — a bootstrap's step when the app quits.
+    ///
+    /// Robust under load (plan 026 C3b): the fake is settled before the step
+    /// ([`settle_exec`]), so the step's one spawn cannot be refused ETXTBSY,
+    /// and the step is awaited until it registers or ends, never against a
+    /// deadline counted from its spawn. Every bound left is counted from the
+    /// confirmed registration.
+    #[tokio::test]
+    async fn the_gates_drain_ends_a_step_in_flight() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let ssh = write_exec_ssh(dir.path(), &[("PATH", "/usr/bin:/bin".to_string())]);
+        settle_exec(&ssh, &["-O", "exit", "settle"]);
+        let gate = SpawnGate::new();
+        let mut options = exec_options(ssh);
+        options.spawn_gate = Some(gate.clone());
+        let exec = Arc::new(SshExec::new(&entry("drained"), &options).expect("exec"));
+
+        let running = Arc::clone(&exec);
+        let step = tokio::spawn(async move {
+            running
+                .run(
+                    "exec sleep 30",
+                    Stdin::Empty,
+                    Duration::from_secs(60),
+                    1024,
+                    false,
+                )
+                .await
+        });
+        // Registered, or ended without registering: a condition, not a clock
+        // (plan 026 C3b). Under load the step's task may start late, and a
+        // step that ends first says why.
+        while gate.registered_exits() == 0 && !step.is_finished() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        if gate.registered_exits() == 0 {
+            let outcome = step.await.expect("the step task");
+            panic!("the step ended before it registered its child: {outcome:?}");
+        }
+        assert_eq!(gate.registered_exits(), 1, "the step registered its child");
+
+        let drained = gate.kill_exits(Duration::from_secs(2)).await;
+        assert_eq!(
+            (drained.killed, drained.exited),
+            (1, 1),
+            "the drain killed the step and saw it end"
+        );
+        let outcome = tokio::time::timeout(Duration::from_secs(2), step)
+            .await
+            .expect("the killed step returned at once")
+            .expect("the step task");
+        assert!(
+            matches!(outcome, Outcome::Exec { exit: None, .. }),
+            "a killed step has no exit code: {outcome:?}"
+        );
+        assert_eq!(
+            gate.registered_exits(),
+            0,
+            "the finished step left the registry"
+        );
+    }
+
+    #[test]
+    fn the_master_pid_is_read_from_ssh_s_own_words() {
+        assert_eq!(master_pid_in("Master running (pid=4242)\r\n"), Some(4242));
+        assert_eq!(
+            master_pid_in("Control socket connect(/x/c): No such file"),
+            None
+        );
+        assert_eq!(master_pid_in("Master running (pid=1)"), None, "never init");
+        // F7: only the master-status record — a stray `pid=` elsewhere is not it.
+        assert_eq!(
+            master_pid_in(
+                "debug1: mux_client: pid=99 (a diagnostic)\nMaster running (pid=4242)\r\n"
+            ),
+            Some(4242)
+        );
+        assert_eq!(
+            master_pid_in("debug1: forked a helper (pid=99)\nMaster running (pid=4242)\r\n"),
+            Some(4242),
+            "a stray `(pid=N)` before the record"
+        );
+        assert_eq!(
+            master_pid_in("debug1: forked a helper (pid=99)\n"),
+            None,
+            "a stray `(pid=N)` and no record"
+        );
+        assert_eq!(master_pid_in("debug1: pid=99\n"), None);
+    }
+
+    /// **The master's identity is exact** (F7): the control path as a whole
+    /// argv token, or ssh's retitled master — never a substring.
+    #[test]
+    fn a_master_is_named_by_its_exact_control_path() {
+        let ctl = Path::new("/tmp/shed-roost-xmini-1-2/c");
+        assert!(names_exactly("ssh: /tmp/shed-roost-xmini-1-2/c [mux]", ctl));
+        assert!(names_exactly(
+            "ssh -F /x/cfg -S /tmp/shed-roost-xmini-1-2/c -N host",
+            ctl
+        ));
+        assert!(names_exactly("ssh -S/tmp/shed-roost-xmini-1-2/c host", ctl));
+        assert!(names_exactly(
+            "ssh -oControlPath=/tmp/shed-roost-xmini-1-2/c host",
+            ctl
+        ));
+        assert!(
+            !names_exactly("ssh -S /tmp/shed-roost-xmini-1-2/c.log host", ctl),
+            "a longer path"
+        );
+        assert!(
+            !names_exactly("tail -f /tmp/shed-roost-xmini-1-2/c-other", ctl),
+            "a prefix match"
+        );
+        assert!(!names_exactly(
+            "ssh: /tmp/shed-roost-xmini-1-2/cc [mux]",
+            ctl
+        ));
+        assert!(!names_exactly("", ctl), "a pid that is gone prints nothing");
+    }
+
+    // ---- plan 026 C3 fix round 1 ----
+
+    /// An opener whose establishment never completes: it starts a real child
+    /// (`kill_on_drop`, like roost's establishing `ssh`), records its pid, and
+    /// parks.
+    struct HungOpener {
+        pid: std::sync::Mutex<Option<i32>>,
+    }
+
+    #[async_trait::async_trait]
+    impl TunnelOpener for HungOpener {
+        async fn open(
+            &self,
+            _host_id: &str,
+            _target: &SshTarget,
+            _options: SshTunnelOptions,
+        ) -> Result<Box<dyn Tunnel>, ReachError> {
+            let child = tokio::process::Command::new("/bin/sh")
+                .args(["-c", "exec sleep 30"])
+                .kill_on_drop(true)
+                .spawn()
+                .expect("the establishing child starts");
+            *self.pid.lock().unwrap() = child.id().map(|id| id as i32);
+            let _child = child;
+            std::future::pending::<()>().await;
+            unreachable!()
+        }
+    }
+
+    fn hung_bridge(gate: Option<SpawnGate>) -> (Arc<SshBridge>, Arc<HungOpener>) {
+        let opener = Arc::new(HungOpener {
+            pid: std::sync::Mutex::new(None),
+        });
+        let bridge = SshBridge::new(
+            &entry("mini9"),
+            SshBridgeOptions {
+                opener: opener.clone(),
+                config_paths: Some(SshConfigPaths {
+                    user: None,
+                    system: None,
+                }),
+                spawn_gate: gate,
+                ..SshBridgeOptions::default()
+            },
+        )
+        .expect("bridge");
+        (Arc::new(bridge), opener)
+    }
+
+    async fn establishing_pid(opener: &HungOpener) -> i32 {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(pid) = *opener.pid.lock().unwrap() {
+                return pid;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the establishment never started"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    /// **A bridge's shutdown does not wait on an establishment in flight** (F3):
+    /// it never completes (roost allows 30 s), and phase 3 still finishes at
+    /// once — the establishment is abandoned, its child dead.
+    #[tokio::test]
+    async fn a_bridge_shutdown_abandons_an_establishment_in_flight() {
+        let (bridge, opener) = hung_bridge(None);
+        let ensuring = Arc::clone(&bridge);
+        let ensure = tokio::spawn(async move { ensuring.ensure().await });
+        let pid = establishing_pid(&opener).await;
+
+        let started = std::time::Instant::now();
+        tokio::time::timeout(
+            Duration::from_secs(3),
+            RoostReach::shutdown(bridge.as_ref()),
+        )
+        .await
+        .expect("the bridge's shutdown waited on the establishment");
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "took {:?}",
+            started.elapsed()
+        );
+        let err = tokio::time::timeout(Duration::from_secs(2), ensure)
+            .await
+            .expect("the abandoned ensure returned")
+            .expect("the ensure task")
+            .expect_err("an abandoned establishment hands out nothing");
+        assert!(
+            err.message.contains(crate::spawn_gate::SHUTTING_DOWN),
+            "{err}"
+        );
+        assert!(
+            gone(pid, Duration::from_secs(2)).await,
+            "the establishing child {pid} survived"
+        );
+    }
+
+    /// **The gate's close abandons an establishment too** (F3), so the close's
+    /// own wait is not spent on it: the section ends with the abandoned open,
+    /// and the close drains in time.
+    #[tokio::test]
+    async fn the_gates_close_abandons_an_establishment_in_flight() {
+        let gate = SpawnGate::new();
+        let (bridge, opener) = hung_bridge(Some(gate.clone()));
+        let ensuring = Arc::clone(&bridge);
+        let ensure = tokio::spawn(async move { ensuring.ensure().await });
+        let pid = establishing_pid(&opener).await;
+
+        assert!(
+            gate.close(Duration::from_secs(2)).await,
+            "the close waited out its bound on an establishment"
+        );
+        assert!(ensure.await.expect("the ensure task").is_err());
+        assert!(
+            gone(pid, Duration::from_secs(2)).await,
+            "the establishing child {pid} survived"
+        );
+    }
+
+    /// A fake `ssh` whose `-O check` names a DECOY: a process whose command
+    /// line carries this runner's control path only as a PREFIX (`<ctl>.log`).
+    fn write_decoy_ssh(dir: &Path) -> PathBuf {
+        let script = r#"#!/bin/sh
+ctl=
+want=0
+prev=
+op=
+for arg in "$@"; do
+    if [ "$want" -eq 1 ]; then ctl="$arg"; want=0; fi
+    if [ "$arg" = "-S" ]; then want=1; fi
+    if [ "$prev" = "-O" ]; then op="$arg"; fi
+    prev="$arg"
+done
+case "$op" in
+  exit) exec sleep 30 ;;
+  check)
+    printf 'Master running (pid=%s)\r\n' "$(cat "$ctl.pid")" >&2
+    exit 0
+    ;;
+esac
+if [ ! -e "$ctl" ]; then
+    : > "$ctl"
+    /bin/sh -c 'while :; do sleep 0.2; done' "$ctl.log" </dev/null >/dev/null 2>&1 &
+    printf '%s' "$!" > "$ctl.pid"
+fi
+exit 0
+"#
+        .to_string();
+        write_staged_script(dir, "decoy-ssh", script)
+    }
+
+    /// **A pid whose command line only CONTAINS the control path is not
+    /// signalled** (F7): the master is unconfirmed, gets its retried `-O exit`
+    /// inside the shutdown (R2-1), and is reported not ended.
+    #[tokio::test]
+    async fn a_prefix_path_decoy_is_never_signalled() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let ssh = write_decoy_ssh(dir.path());
+        let decoys = FakeMasters::default();
+        let exec = SshExec::new(&entry("decoy"), &exec_options(ssh)).expect("exec");
+        let _kept = decoys.arm(&exec);
+        let outcome = exec
+            .run("true", Stdin::Empty, Duration::from_secs(10), 1024, false)
+            .await;
+        assert!(
+            matches!(outcome, Outcome::Exec { exit: Some(0), .. }),
+            "{outcome:?}"
+        );
+        let decoy = master_of(&exec);
+        decoys.pids();
+
+        let ended = exec.shutdown().await;
+        assert!(
+            !ended,
+            "a master that was never matched is not reported ended"
+        );
+        assert!(pid_exists(decoy), "the decoy {decoy} was signalled");
+        assert!(
+            exec.exited.load(Ordering::SeqCst),
+            "its drop's retry ran inside the shutdown"
+        );
+    }
+
+    /// **Unconfirmed masters get their retry in parallel, inside one bound,
+    /// and their drops do nothing** (R2-1; F7, grok 3). Three runners whose
+    /// `-O exit` wedges and whose `ps` cannot answer: `ps` is retried, still
+    /// silent — so no master is signalled — and each runner's shutdown sends
+    /// the `-O exit` its `Drop` would have (a second `exit` each in the log),
+    /// all three side by side within [`MASTER_SHUTDOWN_BOUND`]. Each is
+    /// reported unconfirmed, and each runner is marked, so dropping all three
+    /// afterwards is free — not three serial 2 s destructor waits.
+    #[tokio::test]
+    async fn unconfirmed_masters_get_their_retry_in_parallel_and_their_drops_are_free() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log = dir.path().join("control.log");
+        let ssh = write_wedged_ssh(dir.path(), &log, 30);
+        let slow_ps =
+            write_staged_script(dir.path(), "slow-ps", "#!/bin/sh\nsleep 2\n".to_string());
+        let masters = FakeMasters::default();
+        let mut execs = Vec::new();
+        for name in ["uncertain-a", "uncertain-b", "uncertain-c"] {
+            let mut exec = SshExec::new(&entry(name), &exec_options(ssh.clone())).expect("exec");
+            // Keeps this runner's pid when the loop body ends, pass or fail,
+            // while the runner (loop-local until it is pushed) still exists.
+            let _kept = masters.arm(&exec);
+            exec.ps_bin = Some(slow_ps.clone());
+            let outcome = first_exec(&exec).await;
+            assert!(
+                matches!(outcome, Outcome::Exec { exit: Some(0), .. }),
+                "{outcome:?}"
+            );
+            execs.push(exec);
+        }
+        // Kept now: the runners are dropped below, and their pid files with them.
+        let pids = masters.pids();
+        assert_eq!(pids.len(), 3, "every fake master recorded its pid");
+
+        let started = std::time::Instant::now();
+        let ended = futures::future::join_all(execs.iter().map(SshExec::shutdown)).await;
+        let took = started.elapsed();
+        assert_eq!(
+            ended,
+            vec![false; 3],
+            "an unverified master is not reported ended"
+        );
+        assert!(
+            took < MASTER_SHUTDOWN_BOUND + Duration::from_secs(1),
+            "three runners' shutdowns took {took:?}, not one bound"
+        );
+        for pid in &pids {
+            assert!(pid_exists(*pid), "an unverified pid {pid} was signalled");
+        }
+        let exits = std::fs::read_to_string(&log).unwrap_or_default();
+        assert_eq!(
+            exits.lines().count(),
+            6,
+            "each runner sent its -O exit and its retry: {exits}"
+        );
+        assert!(
+            execs.iter().all(|exec| exec.exited.load(Ordering::SeqCst)),
+            "every runner is marked, so its drop does nothing more"
+        );
+
+        let dropping = std::time::Instant::now();
+        drop(execs);
+        let dropped = dropping.elapsed();
+        assert!(
+            dropped < Duration::from_millis(500),
+            "the drops did blocking work: {dropped:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&log)
+                .unwrap_or_default()
+                .lines()
+                .count(),
+            6,
+            "a drop asked a master to exit again"
+        );
+        drop(masters);
+    }
+
+    /// [`write_wedged_ssh`]'s fake, with a master that IGNORES SIGTERM.
+    fn write_stubborn_ssh(dir: &Path, log: &Path, wedge: u32) -> PathBuf {
+        let script = format!(
+            r#"#!/bin/sh
+ctl=
+want=0
+prev=
+op=
+for arg in "$@"; do
+    if [ "$want" -eq 1 ]; then ctl="$arg"; want=0; fi
+    if [ "$arg" = "-S" ]; then want=1; fi
+    if [ "$prev" = "-O" ]; then op="$arg"; fi
+    prev="$arg"
+done
+case "$op" in
+  exit)
+    printf 'exit %s\n' "$ctl" >> '{log}'
+    exec sleep {wedge}
+    ;;
+  check)
+    if [ -e "$ctl.pid" ] && kill -0 "$(cat "$ctl.pid")" 2>/dev/null; then
+        printf 'Master running (pid=%s)\r\n' "$(cat "$ctl.pid")" >&2
+        exit 0
+    fi
+    printf 'Control socket connect(%s): No such file or directory\r\n' "$ctl" >&2
+    exit 255
+    ;;
+esac
+if [ ! -e "$ctl" ]; then
+    : > "$ctl"
+    /bin/sh -c 'trap "" TERM; while :; do sleep 0.2; done' "$ctl" </dev/null >/dev/null 2>&1 &
+    printf '%s' "$!" > "$ctl.pid"
+fi
+exit 0
+"#,
+            log = log.display(),
+        );
+        write_staged_script(dir, "stubborn-ssh", script)
+    }
+
+    /// **A master that outlives its SIGTERM, whose re-verification cannot
+    /// answer, is UNCONFIRMED** (C3 round 3): `-O exit` wedges, the first
+    /// identity check matches, SIGTERM is ignored, and every `ps` after the
+    /// first times out — so no SIGKILL is sent. The runner is counted
+    /// unconfirmed (its shutdown answers `false`), the retried `-O exit` runs
+    /// inside its bound (a second `exit` in the log), and it is still marked
+    /// done, so its drop does nothing more.
+    #[tokio::test]
+    async fn a_master_outliving_sigterm_unverified_is_unconfirmed_and_retried() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log = dir.path().join("control.log");
+        let ssh = write_stubborn_ssh(dir.path(), &log, 30);
+        let calls = dir.path().join("ps-calls");
+        // The real `ps` for the first call, then one that never answers.
+        let flaky_ps = write_staged_script(
+            dir.path(),
+            "flaky-ps",
+            format!(
+                "#!/bin/sh\n[ \"$1\" = --settle ] && exit 0\n\
+                 n=$(cat '{calls}' 2>/dev/null || echo 0)\necho $((n + 1)) > '{calls}'\n\
+                 if [ \"$n\" -eq 0 ]; then exec ps \"$@\"; fi\nsleep 2\n",
+                calls = calls.display()
+            ),
+        );
+        // Run once, uncounted, so its first counted call answers within PS_WAIT.
+        settle_exec(&flaky_ps, &["--settle"]);
+        let masters = FakeMasters::default();
+        let mut exec = SshExec::new(&entry("stubborn"), &exec_options(ssh)).expect("exec");
+        let _kept = masters.arm(&exec);
+        exec.ps_bin = Some(flaky_ps);
+        let outcome = first_exec(&exec).await;
+        assert!(
+            matches!(outcome, Outcome::Exec { exit: Some(0), .. }),
+            "{outcome:?}"
+        );
+        let master = master_of(&exec);
+        // Kept now: the runner is dropped below, and its pid file with it.
+        masters.pids();
+
+        let started = std::time::Instant::now();
+        let ended = exec.shutdown().await;
+        let took = started.elapsed();
+        assert!(
+            !ended,
+            "a master that outlived SIGTERM, unverified, is not reported ended"
+        );
+        assert!(
+            took < MASTER_SHUTDOWN_BOUND + Duration::from_secs(1),
+            "the shutdown took {took:?}"
+        );
+        assert!(pid_exists(master), "an unverified master was SIGKILLed");
+        let ps_calls: u32 = std::fs::read_to_string(&calls)
+            .expect("ps ran")
+            .trim()
+            .parse()
+            .expect("a count");
+        assert!(ps_calls >= 2, "the identity was re-checked after SIGTERM");
+        let exits = std::fs::read_to_string(&log).unwrap_or_default();
+        assert_eq!(
+            exits.lines().count(),
+            2,
+            "its -O exit and the retry an unconfirmed master gets: {exits}"
+        );
+        assert!(
+            exec.exited.load(Ordering::SeqCst),
+            "suppression is kept apart from confirmation: the runner is marked done"
+        );
+        let dropping = std::time::Instant::now();
+        drop(exec);
+        assert!(
+            dropping.elapsed() < Duration::from_millis(500),
+            "the drop did blocking work"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&log)
+                .unwrap_or_default()
+                .lines()
+                .count(),
+            2,
+            "the drop asked the master to exit again"
+        );
+    }
+
+    /// A fake `ssh` whose `-O exit` WEDGES (logged), whose FIRST `-O check`
+    /// never answers and every later one answers "Master running" only after
+    /// half a second, and whose master ignores SIGTERM.
+    fn write_slow_check_ssh(dir: &Path, log: &Path) -> PathBuf {
+        let checks = dir.join("checks");
+        let script = format!(
+            r#"#!/bin/sh
+ctl=
+want=0
+prev=
+op=
+for arg in "$@"; do
+    if [ "$want" -eq 1 ]; then ctl="$arg"; want=0; fi
+    if [ "$arg" = "-S" ]; then want=1; fi
+    if [ "$prev" = "-O" ]; then op="$arg"; fi
+    prev="$arg"
+done
+case "$op" in
+  exit)
+    printf 'exit %s\n' "$ctl" >> '{log}'
+    exec sleep 30
+    ;;
+  check)
+    n=$(cat '{checks}' 2>/dev/null || echo 0)
+    echo $((n + 1)) > '{checks}'
+    if [ "$n" -eq 0 ]; then exec sleep 3; fi
+    sleep 0.5
+    printf 'Master running (pid=%s)\r\n' "$(cat "$ctl.pid")" >&2
+    exit 0
+    ;;
+esac
+if [ ! -e "$ctl" ]; then
+    : > "$ctl"
+    /bin/sh -c 'trap "" TERM; while :; do sleep 0.2; done' "$ctl" </dev/null >/dev/null 2>&1 &
+    printf '%s' "$!" > "$ctl.pid"
+fi
+exit 0
+"#,
+            log = log.display(),
+            checks = checks.display(),
+        );
+        write_staged_script(dir, "slow-check-ssh", script)
+    }
+
+    /// A `ps` that is the real one on its first call and never answers after.
+    ///
+    /// Settled before it is handed out (an uncounted `--settle` run), so its
+    /// first counted call answers within [`PS_WAIT`].
+    fn write_first_then_silent_ps(dir: &Path) -> PathBuf {
+        let calls = dir.join("ps-calls");
+        let ps = write_staged_script(
+            dir,
+            "first-then-silent-ps",
+            format!(
+                "#!/bin/sh\n[ \"$1\" = --settle ] && exit 0\n\
+                 n=$(cat '{calls}' 2>/dev/null || echo 0)\necho $((n + 1)) > '{calls}'\n\
+                 if [ \"$n\" -eq 0 ]; then exec ps \"$@\"; fi\nsleep 2\n",
+                calls = calls.display()
+            ),
+        );
+        settle_exec(&ps, &["--settle"]);
+        ps
+    }
+
+    /// **The retry keeps its budget when the fallback runs to its deadline**
+    /// (C3 round 4): the first `-O check` times out, the retried one answers
+    /// slowly, the identity matches, the master ignores SIGTERM and its
+    /// re-verification never answers — every step of the fallback spending
+    /// what it may. The retried `-O exit` still runs (a second `exit` in the
+    /// log), in the budget kept back for it, and the whole shutdown stays
+    /// within its bound; the master is reported unconfirmed.
+    #[tokio::test]
+    async fn the_retry_keeps_its_budget_when_the_fallback_runs_to_its_deadline() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log = dir.path().join("control.log");
+        let ssh = write_slow_check_ssh(dir.path(), &log);
+        let masters = FakeMasters::default();
+        let mut exec = SshExec::new(&entry("slow-check"), &exec_options(ssh)).expect("exec");
+        let _kept = masters.arm(&exec);
+        exec.ps_bin = Some(write_first_then_silent_ps(dir.path()));
+        let outcome = first_exec(&exec).await;
+        assert!(
+            matches!(outcome, Outcome::Exec { exit: Some(0), .. }),
+            "{outcome:?}"
+        );
+        assert_eq!(masters.pids().len(), 1, "the fake master recorded its pid");
+
+        let started = std::time::Instant::now();
+        let ended = exec.shutdown().await;
+        let took = started.elapsed();
+        assert!(!ended, "an unverified master is not reported ended");
+        let exits = std::fs::read_to_string(&log).unwrap_or_default();
+        assert_eq!(
+            exits.lines().count(),
+            2,
+            "the retried -O exit ran after a fallback that spent its whole budget: {exits}"
+        );
+        assert!(
+            took < MASTER_SHUTDOWN_BOUND + Duration::from_millis(500),
+            "the shutdown took {took:?}"
+        );
+    }
+
+    /// **Only a reliable `ps` observation decides an identity** (C3 round 4):
+    /// a `ps` killed by a signal, an odd exit code, or a success that printed
+    /// nothing is UNCERTAIN — never "gone" or "not ours"; exit 1 with nothing
+    /// printed is gone (procps and BSD `ps` alike); exit 0 names the master or
+    /// someone else.
+    #[tokio::test]
+    async fn identify_trusts_only_a_reliable_ps_observation() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let ssh = write_exec_ssh(dir.path(), &[]);
+        let mut exec = SshExec::new(&entry("identify"), &exec_options(ssh)).expect("exec");
+        let ctl = exec.ctl_path.display().to_string();
+        let cases = [
+            ("killed-ps", "kill -9 $$".to_string(), Identity::Uncertain),
+            ("odd-ps", "exit 2".to_string(), Identity::Uncertain),
+            ("silent-ps", "exit 0".to_string(), Identity::Uncertain),
+            ("gone-ps", "exit 1".to_string(), Identity::Gone),
+            (
+                "other-ps",
+                "echo 'sshd: somebody else'".to_string(),
+                Identity::NotOurs,
+            ),
+            (
+                "ours-ps",
+                format!("printf 'ssh: %s [mux]\\n' '{ctl}'"),
+                Identity::Ours,
+            ),
+        ];
+        let scripts: Vec<(PathBuf, Identity, &str)> = cases
+            .iter()
+            .map(|(name, body, want)| {
+                (
+                    write_staged_script(dir.path(), name, format!("#!/bin/sh\n{body}\n")),
+                    *want,
+                    *name,
+                )
+            })
+            .collect();
+        // Each fake run once first: within PS_WAIT, a first exec may be
+        // refused (ETXTBSY) or held by macOS's assessment of a new file.
+        for (ps, _, _) in &scripts {
+            settle_exec(ps, &["--settle"]);
+        }
+        for (ps, want, name) in scripts {
+            exec.ps_bin = Some(ps);
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            assert_eq!(exec.identify(4242, deadline).await, want, "{name}");
+        }
+    }
+
+    /// **A repeat `shutdown` answers what the first CONFIRMED** (C3 round 4):
+    /// an unconfirmed master stays unconfirmed on the second call — which does
+    /// no work — and a confirmed one stays confirmed.
+    #[tokio::test]
+    async fn a_repeat_shutdown_answers_the_first_ones_confirmation() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let ssh = write_decoy_ssh(dir.path());
+        let decoys = FakeMasters::default();
+        let exec = SshExec::new(&entry("repeat"), &exec_options(ssh.clone())).expect("exec");
+        let _kept = decoys.arm(&exec);
+        let outcome = first_exec(&exec).await;
+        assert!(
+            matches!(outcome, Outcome::Exec { exit: Some(0), .. }),
+            "{outcome:?}"
+        );
+        assert_eq!(decoys.pids().len(), 1, "the fake master recorded its pid");
+        assert!(!exec.shutdown().await, "the decoy is never confirmed");
+        let again = std::time::Instant::now();
+        assert!(
+            !exec.shutdown().await,
+            "a repeat call reported an unconfirmed master confirmed"
+        );
+        assert!(
+            again.elapsed() < Duration::from_millis(100),
+            "the repeat call did work"
+        );
+
+        // A runner that never opened a master: confirmed, and still on repeat.
+        let idle = SshExec::new(&entry("repeat-idle"), &exec_options(ssh)).expect("exec");
+        assert!(idle.shutdown().await);
+        assert!(idle.shutdown().await);
+    }
+
+    /// **Only ssh's own "no master" answer is Gone; a check killed before it
+    /// answers is UNCERTAIN, and the retry runs** (C3 round 5). The
+    /// classification, over fake checks, then the shutdown path: a check that
+    /// `kill -9`s itself reads `Uncertain` (twice), the master is reported
+    /// unconfirmed, and the retried `-O exit` runs — a second `exit` in the
+    /// log.
+    #[tokio::test]
+    async fn a_check_killed_before_it_answers_is_uncertain_and_the_retry_runs() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log = dir.path().join("control.log");
+        let fake = |name: &str, check: &str| {
+            write_staged_script(
+                dir.path(),
+                name,
+                format!(
+                    "#!/bin/sh\nop=\nprev=\nctl=\nwant=0\nfor arg in \"$@\"; do\n    if [ \"$want\" -eq 1 ]; then ctl=\"$arg\"; want=0; fi\n    if [ \"$arg\" = \"-S\" ]; then want=1; fi\n    if [ \"$prev\" = \"-O\" ]; then op=\"$arg\"; fi\n    prev=\"$arg\"\ndone\n\
+                     case \"$op\" in\n  exit) printf 'exit\\n' >> '{log}'; exit 0 ;;\n  check) {check} ;;\nesac\nexit 0\n",
+                    log = log.display()
+                ),
+            )
+        };
+        let killed = fake("killed-check", "kill -9 $$");
+        let cases = [
+            (killed.clone(), MasterCheck::Uncertain),
+            (
+                fake(
+                    "absent-check",
+                    "printf 'Control socket connect(%s): No such file or directory\\r\\n' \"$ctl\" >&2; exit 255",
+                ),
+                MasterCheck::Gone,
+            ),
+            (
+                fake(
+                    "refused-check",
+                    "printf 'Control socket connect(%s): Connection refused\\r\\n' \"$ctl\" >&2; exit 255",
+                ),
+                MasterCheck::Gone,
+            ),
+            (
+                fake(
+                    "no-path-check",
+                    "printf 'No ControlPath specified for \"-O\" command\\r\\n' >&2; exit 255",
+                ),
+                MasterCheck::Gone,
+            ),
+            (
+                fake(
+                    "other-255-check",
+                    "printf 'ssh: Could not resolve hostname x\\r\\n' >&2; exit 255",
+                ),
+                MasterCheck::Uncertain,
+            ),
+            (fake("odd-check", "exit 1"), MasterCheck::Uncertain),
+            // A prefix of ssh's wording is not its wording.
+            (
+                fake(
+                    "decoy-no-path-check",
+                    "printf 'No ControlPath specified: unexpected failure\\r\\n' >&2; exit 255",
+                ),
+                MasterCheck::Uncertain,
+            ),
+            // ssh's wording, for somebody else's control path.
+            (
+                fake(
+                    "other-path-check",
+                    "printf 'Control socket connect(/x/c): No such file or directory\\r\\n' >&2; exit 255",
+                ),
+                MasterCheck::Uncertain,
+            ),
+        ];
+        // Every script written and closed well before any is run (ETXTBSY).
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let mut exec =
+            SshExec::new(&entry("checked"), &exec_options(killed.clone())).expect("exec");
+        std::fs::write(&exec.ctl_path, "").expect("a control path to check");
+        for (ssh, want) in cases {
+            exec.ssh_bin = ssh.clone();
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            assert_eq!(exec.check_master(deadline).await, want, "{}", ssh.display());
+        }
+
+        // A control path whose lookup fails (EACCES under a 0000 directory) is
+        // no answer, not "missing" — skipped as root, which ignores the mode.
+        // SAFETY: geteuid has no preconditions.
+        if unsafe { libc::geteuid() } != 0 {
+            use std::os::unix::fs::PermissionsExt as _;
+            let locked = dir.path().join("locked");
+            std::fs::create_dir(&locked).expect("mkdir");
+            std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000))
+                .expect("chmod");
+            let ctl = std::mem::replace(&mut exec.ctl_path, locked.join("c"));
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            let unreadable = exec.check_master(deadline).await;
+            exec.ctl_path = ctl;
+            std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700))
+                .expect("chmod");
+            assert_eq!(
+                unreadable,
+                MasterCheck::Uncertain,
+                "an EACCES lookup read as missing"
+            );
+        }
+
+        exec.ssh_bin = killed;
+        let ended = exec.shutdown().await;
+        assert!(
+            !ended,
+            "a check killed before it answered confirmed the master"
+        );
+        let exits = std::fs::read_to_string(&log).unwrap_or_default();
+        assert_eq!(
+            exits.lines().count(),
+            2,
+            "its -O exit and the retry an unconfirmed master gets: {exits}"
+        );
+        assert!(
+            exec.exited.load(Ordering::SeqCst),
+            "its drop does nothing more"
+        );
+    }
+
+    /// **A step's exit counts only once its watcher PUBLISHED it** (F8): a
+    /// watcher gone without a report — its task cancelled, a runtime going
+    /// down — is not an exit, so the drain never counts it as one.
+    #[tokio::test]
+    async fn a_steps_exit_counts_only_once_published() {
+        let (report, status) = tokio::sync::watch::channel(None);
+        let child = RunChild {
+            pid: None,
+            status,
+            kill: std::sync::Mutex::new(None),
+        };
+        drop(report);
+        assert!(
+            !child.exited(Duration::from_millis(100)).await,
+            "a watcher that never reported was counted as an exit"
+        );
+        assert!(!child.done());
+    }
+
+    /// **A `wait()` that failed is an UNKNOWN exit, not an exit** (R2-5): the
+    /// watcher is done (nothing more will be learned, so the registry lets the
+    /// entry go), but the drain does not count it as seen, and the step has no
+    /// exit code.
+    #[tokio::test]
+    async fn a_failed_wait_is_an_unknown_exit_not_a_seen_one() {
+        let (report, status) = tokio::sync::watch::channel(None);
+        let child = RunChild {
+            pid: Some(4242),
+            status,
+            kill: std::sync::Mutex::new(None),
+        };
+        report.send(Some(RunExit::Unknown)).expect("a receiver");
+        assert!(
+            !child.exited(Duration::from_millis(100)).await,
+            "an unknown exit was counted as seen"
+        );
+        assert!(child.done(), "the watcher is finished");
+        assert_eq!(child.wait().await, None);
+        assert_eq!(ChildExit::pid(&child), Some(4242));
+        report
+            .send(Some(RunExit::Reaped(Some(0))))
+            .expect("a receiver");
+        assert!(child.exited(Duration::from_millis(100)).await, "a reap is");
+    }
+
+    /// **A step whose future is dropped is killed AND its exit seen** (F8): the
+    /// registry keeps the entry until the watcher has reaped the child, so the
+    /// drain never counts a cancellation as an exit.
+    #[tokio::test]
+    async fn a_cancelled_steps_child_is_killed_and_its_exit_seen() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let ssh = write_exec_ssh(dir.path(), &[("PATH", "/usr/bin:/bin".to_string())]);
+        let pidfile = dir.path().join("step.pid");
+        let gate = SpawnGate::new();
+        let mut options = exec_options(ssh);
+        options.spawn_gate = Some(gate.clone());
+        let exec = Arc::new(SshExec::new(&entry("cancelled"), &options).expect("exec"));
+
+        let running = Arc::clone(&exec);
+        let command = format!("printf '%s' $$ > '{}'; exec sleep 30", pidfile.display());
+        let step = tokio::spawn(async move {
+            running
+                .run(&command, Stdin::Empty, Duration::from_secs(60), 1024, false)
+                .await
+        });
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        let pid: i32 = loop {
+            if let Some(pid) = std::fs::read_to_string(&pidfile)
+                .ok()
+                .and_then(|text| text.trim().parse().ok())
+            {
+                break pid;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the step never started"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        };
+        assert_eq!(gate.registered_exits(), 1);
+
+        step.abort();
+        let _ = step.await;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        while gate.registered_exits() > 0 && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            gate.registered_exits(),
+            0,
+            "the cancelled step's exit was never seen"
+        );
+        assert!(
+            !pid_exists(pid),
+            "the cancelled step's child {pid} survived"
+        );
     }
 }
