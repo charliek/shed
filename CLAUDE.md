@@ -37,6 +37,7 @@ make fmt                # Format code with gofmt
 make check              # Run lint + test
 make coverage           # Tests with coverage report
 make test-integration   # Run the pytest-based integration suite (see below)
+make test-integration-units  # Server-free unit tests of the suite's own helpers/baked-image bodies (runs in CI)
 ```
 
 Tools are managed via [mise](https://mise.jdx.dev/) — run `mise install` to set up Go and golangci-lint, plus `goreleaser` (pinned to CI's exact version) and `zig` (release tooling; only needed for a local `make snapshot-<component>` run).

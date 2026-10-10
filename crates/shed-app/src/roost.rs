@@ -5415,20 +5415,27 @@ except Exception:
         final_path
     }
 
-    /// Wait until the fake ssh at `ssh` can be exec'd (plan 026 C3b). It was
-    /// just written, so a sibling test's fork made while its write fd was open
-    /// holds a copy of that fd until its own exec, and an exec of the script
-    /// meanwhile fails with ETXTBSY. The probe is `-O exit`, which
-    /// [`write_exec_ssh`]'s fake answers with a bare `exit 0`. Use it only on a
-    /// fake that does: one that logs every run would record the probe. Once one
-    /// exec succeeds no writer is left,
-    /// and none can appear (this process closed its fd), so no later exec of
-    /// it can fail that way. A condition, not a clock: under load such a fork
-    /// can take any time to reach its exec.
-    fn settle_exec(ssh: &Path) {
+    /// Wait until the fake at `path` can be exec'd, and has been once (plan
+    /// 026 C3b), by running it with `args` until it runs. Two things delay a
+    /// script's FIRST exec, and a step bounded tighter than either fails on it:
+    /// * **ETXTBSY (Linux).** It was just written, so a sibling test's fork
+    ///   made while its write fd was open holds a copy of that fd until its
+    ///   own exec, and an exec of the script meanwhile fails. Once one exec
+    ///   succeeds no writer is left, and none can appear (this process closed
+    ///   its fd), so no later exec can fail that way.
+    /// * **macOS's first-exec assessment.** A freshly written executable's
+    ///   first exec waits on the system's check of it, about 0.25 s on macOS
+    ///   26, longer than [`PS_WAIT`]. Later execs do not.
+    ///
+    /// `args` must make the fake do nothing that a test counts or reads:
+    /// [`write_exec_ssh`]'s fake answers `-O exit` with a bare `exit 0`, and
+    /// the counting `ps` fakes answer `--settle` before they count. A
+    /// condition, not a clock: under load such a fork can take any time to
+    /// reach its exec.
+    fn settle_exec(path: &Path, args: &[&str]) {
         loop {
-            match std::process::Command::new(ssh)
-                .args(["-O", "exit", "settle"])
+            match std::process::Command::new(path)
+                .args(args)
                 .stdin(std::process::Stdio::null())
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null())
@@ -5437,7 +5444,7 @@ except Exception:
                 Err(e) if e.raw_os_error() == Some(libc::ETXTBSY) => {
                     std::thread::sleep(Duration::from_millis(5));
                 }
-                Err(e) => panic!("could not run {}: {e}", ssh.display()),
+                Err(e) => panic!("could not run {}: {e}", path.display()),
                 Ok(_) => return,
             }
         }
@@ -7419,34 +7426,60 @@ exit 0
     /// **Armed before the first exec** (plan 026 C3b): it holds each runner's
     /// control path and reads the master's pid from the fake's `<ctl>.pid`,
     /// so a failure anywhere after the spawn is covered, even one before the
-    /// test read the pid itself. [`Self::pids`] reads and KEEPS them, because
-    /// a runner's directory, pid file included, goes when the runner drops.
-    /// A pid is signalled only if it is above 1 and its command line still
-    /// names its runner's control path: a master the code under test already
-    /// ended may have had its pid reused.
+    /// test read the pid itself. The pid is KEPT once read, because a
+    /// runner's directory, pid file included, goes when the runner drops,
+    /// which can be before this guard does (a runner local to a loop body).
+    /// [`Self::arm`] answers a [`KeepPid`] for exactly that. A pid is
+    /// signalled only if it is above 1 and its command line still names its
+    /// runner's control path: a master the code under test already ended may
+    /// have had its pid reused.
+    ///
+    /// Declare it before the runners. Arm each runner right after declaring
+    /// it, and bind the answer in the runner's own scope.
     #[derive(Default)]
-    struct FakeMasters(Vec<(PathBuf, Option<i32>)>);
+    struct FakeMasters(std::sync::Mutex<Vec<(PathBuf, Option<i32>)>>);
 
     impl FakeMasters {
-        /// Cover `exec`'s master. Call it before `exec`'s first run.
-        fn arm(&mut self, exec: &SshExec) {
-            self.0.push((exec.ctl_path.clone(), None));
+        /// Cover `exec`'s master. Call it before `exec`'s first run, and
+        /// bind the answer (`let _kept = …`) after `exec` in `exec`'s scope.
+        fn arm(&self, exec: &SshExec) -> KeepPid<'_> {
+            self.covered().push((exec.ctl_path.clone(), None));
+            KeepPid(self)
         }
 
         /// Every covered master's pid, read from its pid file once and kept.
-        fn pids(&mut self) -> Vec<i32> {
-            for (ctl, pid) in &mut self.0 {
+        fn pids(&self) -> Vec<i32> {
+            let mut covered = self.covered();
+            for (ctl, pid) in covered.iter_mut() {
                 if pid.is_none() {
                     *pid = recorded_master_pid(ctl);
                 }
             }
-            self.0.iter().filter_map(|(_, pid)| *pid).collect()
+            covered.iter().filter_map(|(_, pid)| *pid).collect()
+        }
+
+        fn covered(&self) -> std::sync::MutexGuard<'_, Vec<(PathBuf, Option<i32>)>> {
+            self.0.lock().unwrap_or_else(|e| e.into_inner())
+        }
+    }
+
+    /// Keeps its runner's master pid when the runner's scope ends, pass or
+    /// fail. Bound after the runner, it drops BEFORE the runner, so before the
+    /// runner's directory and the pid file in it go. The [`FakeMasters`] it
+    /// came from then has the pid to kill even if the runner went first.
+    #[must_use = "bind it after the runner, so it keeps the pid when the runner's scope ends"]
+    struct KeepPid<'a>(&'a FakeMasters);
+
+    impl Drop for KeepPid<'_> {
+        fn drop(&mut self) {
+            self.0.pids();
         }
     }
 
     impl Drop for FakeMasters {
         fn drop(&mut self) {
-            for (ctl, pid) in &self.0 {
+            let covered = self.0.get_mut().unwrap_or_else(|e| e.into_inner());
+            for (ctl, pid) in covered.iter() {
                 let Some(pid) = pid
                     .or_else(|| recorded_master_pid(ctl))
                     .filter(|pid| *pid > 1)
@@ -7509,12 +7542,12 @@ exit 0
         let dir = tempfile::tempdir().expect("tempdir");
         let log = dir.path().join("control.log");
         let ssh = write_wedged_ssh(dir.path(), &log, 30);
-        let a = SshExec::new(&entry("wedge-a"), &exec_options(ssh.clone())).expect("exec a");
-        let b = SshExec::new(&entry("wedge-b"), &exec_options(ssh)).expect("exec b");
         // Ended by the shutdown when it passes; by this guard when it fails.
-        let mut masters = FakeMasters::default();
-        masters.arm(&a);
-        masters.arm(&b);
+        let masters = FakeMasters::default();
+        let a = SshExec::new(&entry("wedge-a"), &exec_options(ssh.clone())).expect("exec a");
+        let _kept_a = masters.arm(&a);
+        let b = SshExec::new(&entry("wedge-b"), &exec_options(ssh)).expect("exec b");
+        let _kept_b = masters.arm(&b);
         for exec in [&a, &b] {
             let outcome = exec
                 .run("true", Stdin::Empty, Duration::from_secs(10), 1024, false)
@@ -7559,11 +7592,11 @@ exit 0
         let dir = tempfile::tempdir().expect("tempdir");
         let log = dir.path().join("control.log");
         let ssh = write_wedged_ssh(dir.path(), &log, 10);
-        let exec = SshExec::new(&entry("wedge-d"), &exec_options(ssh)).expect("exec");
         // The fake master is this test's to clean up (`Drop` only asks), pass
         // or fail. Its pid is kept before the drop removes the pid file.
-        let mut masters = FakeMasters::default();
-        masters.arm(&exec);
+        let masters = FakeMasters::default();
+        let exec = SshExec::new(&entry("wedge-d"), &exec_options(ssh)).expect("exec");
+        let _kept = masters.arm(&exec);
         let outcome = exec
             .run("true", Stdin::Empty, Duration::from_secs(10), 1024, false)
             .await;
@@ -7643,7 +7676,7 @@ exit 0
     async fn the_gates_drain_ends_a_step_in_flight() {
         let dir = tempfile::tempdir().expect("tempdir");
         let ssh = write_exec_ssh(dir.path(), &[("PATH", "/usr/bin:/bin".to_string())]);
-        settle_exec(&ssh);
+        settle_exec(&ssh, &["-O", "exit", "settle"]);
         let gate = SpawnGate::new();
         let mut options = exec_options(ssh);
         options.spawn_gate = Some(gate.clone());
@@ -7913,9 +7946,9 @@ exit 0
     async fn a_prefix_path_decoy_is_never_signalled() {
         let dir = tempfile::tempdir().expect("tempdir");
         let ssh = write_decoy_ssh(dir.path());
+        let decoys = FakeMasters::default();
         let exec = SshExec::new(&entry("decoy"), &exec_options(ssh)).expect("exec");
-        let mut decoys = FakeMasters::default();
-        decoys.arm(&exec);
+        let _kept = decoys.arm(&exec);
         let outcome = exec
             .run("true", Stdin::Empty, Duration::from_secs(10), 1024, false)
             .await;
@@ -7953,12 +7986,14 @@ exit 0
         let ssh = write_wedged_ssh(dir.path(), &log, 30);
         let slow_ps =
             write_staged_script(dir.path(), "slow-ps", "#!/bin/sh\nsleep 2\n".to_string());
+        let masters = FakeMasters::default();
         let mut execs = Vec::new();
-        let mut masters = FakeMasters::default();
         for name in ["uncertain-a", "uncertain-b", "uncertain-c"] {
             let mut exec = SshExec::new(&entry(name), &exec_options(ssh.clone())).expect("exec");
+            // Keeps this runner's pid when the loop body ends, pass or fail,
+            // while the runner (loop-local until it is pushed) still exists.
+            let _kept = masters.arm(&exec);
             exec.ps_bin = Some(slow_ps.clone());
-            masters.arm(&exec);
             let outcome = first_exec(&exec).await;
             assert!(
                 matches!(outcome, Outcome::Exec { exit: Some(0), .. }),
@@ -8072,15 +8107,18 @@ exit 0
             dir.path(),
             "flaky-ps",
             format!(
-                "#!/bin/sh\nn=$(cat '{calls}' 2>/dev/null || echo 0)\necho $((n + 1)) > '{calls}'\n\
+                "#!/bin/sh\n[ \"$1\" = --settle ] && exit 0\n\
+                 n=$(cat '{calls}' 2>/dev/null || echo 0)\necho $((n + 1)) > '{calls}'\n\
                  if [ \"$n\" -eq 0 ]; then exec ps \"$@\"; fi\nsleep 2\n",
                 calls = calls.display()
             ),
         );
+        // Run once, uncounted, so its first counted call answers within PS_WAIT.
+        settle_exec(&flaky_ps, &["--settle"]);
+        let masters = FakeMasters::default();
         let mut exec = SshExec::new(&entry("stubborn"), &exec_options(ssh)).expect("exec");
+        let _kept = masters.arm(&exec);
         exec.ps_bin = Some(flaky_ps);
-        let mut masters = FakeMasters::default();
-        masters.arm(&exec);
         let outcome = first_exec(&exec).await;
         assert!(
             matches!(outcome, Outcome::Exec { exit: Some(0), .. }),
@@ -8132,7 +8170,6 @@ exit 0
             2,
             "the drop asked the master to exit again"
         );
-        drop(masters);
     }
 
     /// A fake `ssh` whose `-O exit` WEDGES (logged), whose FIRST `-O check`
@@ -8180,17 +8217,23 @@ exit 0
     }
 
     /// A `ps` that is the real one on its first call and never answers after.
+    ///
+    /// Settled before it is handed out (an uncounted `--settle` run), so its
+    /// first counted call answers within [`PS_WAIT`].
     fn write_first_then_silent_ps(dir: &Path) -> PathBuf {
         let calls = dir.join("ps-calls");
-        write_staged_script(
+        let ps = write_staged_script(
             dir,
             "first-then-silent-ps",
             format!(
-                "#!/bin/sh\nn=$(cat '{calls}' 2>/dev/null || echo 0)\necho $((n + 1)) > '{calls}'\n\
+                "#!/bin/sh\n[ \"$1\" = --settle ] && exit 0\n\
+                 n=$(cat '{calls}' 2>/dev/null || echo 0)\necho $((n + 1)) > '{calls}'\n\
                  if [ \"$n\" -eq 0 ]; then exec ps \"$@\"; fi\nsleep 2\n",
                 calls = calls.display()
             ),
-        )
+        );
+        settle_exec(&ps, &["--settle"]);
+        ps
     }
 
     /// **The retry keeps its budget when the fallback runs to its deadline**
@@ -8205,10 +8248,10 @@ exit 0
         let dir = tempfile::tempdir().expect("tempdir");
         let log = dir.path().join("control.log");
         let ssh = write_slow_check_ssh(dir.path(), &log);
+        let masters = FakeMasters::default();
         let mut exec = SshExec::new(&entry("slow-check"), &exec_options(ssh)).expect("exec");
+        let _kept = masters.arm(&exec);
         exec.ps_bin = Some(write_first_then_silent_ps(dir.path()));
-        let mut masters = FakeMasters::default();
-        masters.arm(&exec);
         let outcome = first_exec(&exec).await;
         assert!(
             matches!(outcome, Outcome::Exec { exit: Some(0), .. }),
@@ -8269,8 +8312,11 @@ exit 0
                 )
             })
             .collect();
-        // Every script written and closed well before any is run (ETXTBSY).
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        // Each fake run once first: within PS_WAIT, a first exec may be
+        // refused (ETXTBSY) or held by macOS's assessment of a new file.
+        for (ps, _, _) in &scripts {
+            settle_exec(ps, &["--settle"]);
+        }
         for (ps, want, name) in scripts {
             exec.ps_bin = Some(ps);
             let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
@@ -8285,9 +8331,9 @@ exit 0
     async fn a_repeat_shutdown_answers_the_first_ones_confirmation() {
         let dir = tempfile::tempdir().expect("tempdir");
         let ssh = write_decoy_ssh(dir.path());
+        let decoys = FakeMasters::default();
         let exec = SshExec::new(&entry("repeat"), &exec_options(ssh.clone())).expect("exec");
-        let mut decoys = FakeMasters::default();
-        decoys.arm(&exec);
+        let _kept = decoys.arm(&exec);
         let outcome = first_exec(&exec).await;
         assert!(
             matches!(outcome, Outcome::Exec { exit: Some(0), .. }),

@@ -14,6 +14,8 @@ it's the "non-live helpers" home referenced by plan 025 C13 item 3
 
 from __future__ import annotations
 
+import pytest
+
 import test_smoke
 
 
@@ -73,3 +75,66 @@ def test_baked_image_verdict_listed_and_missing_fails():
         )
         == "fail"
     )
+
+
+# ---------------------------------------------------------------------------
+# The real test bodies (shed#398). The verdict helper being right is not
+# enough: `test_roost_session_baked` used to carry its own skip branch and
+# never called it. These call the bodies directly with fake fixtures.
+# ---------------------------------------------------------------------------
+
+
+class _FakeServer:
+    """Stands in for `shed_server`: `create()` raises the missing-image
+    error the real fixture raises; anything else the body touches fails
+    loudly (a listed-but-missing backend must stop at `create`)."""
+
+    def __init__(self, backend: str):
+        self.backend = backend
+
+    def create(self, name, image=None, **kwargs):
+        raise AssertionError(f"shed create {name}: no image tag {image!r} found")
+
+    def exec(self, *args, **kwargs):  # pragma: no cover - must not be reached
+        raise AssertionError("exec reached after a missing-image create")
+
+
+@pytest.mark.parametrize(
+    "body, env_var",
+    [
+        (test_smoke.test_roost_session_baked, "SHED_IMAGE_HAS_ROOST"),
+        (test_smoke.test_craze_baked, "SHED_IMAGE_HAS_CRAZE"),
+    ],
+    ids=["roost", "craze"],
+)
+@pytest.mark.parametrize(
+    "backend, key", [("firecracker", "fc"), ("vz", "vz")], ids=["fc", "vz"]
+)
+def test_baked_body_listed_backend_missing_image_fails(
+    monkeypatch, body, env_var, backend, key
+):
+    monkeypatch.setenv(env_var, key)
+    monkeypatch.setenv("SHED_CRAZE_VERSION", "0.0.0")  # skip the pin-file read
+    # A Skipped outcome would propagate out of `pytest.raises(Failed)` and be
+    # reported as a skip (exit 0), so convert it into a real failure.
+    try:
+        body(_FakeServer(backend), "unit-shed")
+    except pytest.fail.Exception:
+        return
+    except pytest.skip.Exception as e:
+        pytest.fail(f"{body.__name__} skipped a listed backend's missing image: {e}")
+    pytest.fail(f"{body.__name__} neither failed nor skipped")
+
+
+@pytest.mark.parametrize(
+    "body, env_var",
+    [
+        (test_smoke.test_roost_session_baked, "SHED_IMAGE_HAS_ROOST"),
+        (test_smoke.test_craze_baked, "SHED_IMAGE_HAS_CRAZE"),
+    ],
+    ids=["roost", "craze"],
+)
+def test_baked_body_unlisted_backend_skips(monkeypatch, body, env_var):
+    monkeypatch.setenv(env_var, "vz")
+    with pytest.raises(pytest.skip.Exception):
+        body(_FakeServer("firecracker"), "unit-shed")

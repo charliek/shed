@@ -960,9 +960,28 @@ mod tests {
             loop {
                 // SAFETY: plain socket(2)/bind(2) on memory this function owns.
                 unsafe {
+                    // Close-on-exec, so no child a sibling test forks keeps
+                    // the reservation. `SOCK_CLOEXEC` sets it atomically and
+                    // is Linux's; macOS has no such flag, so there `fcntl`
+                    // sets it straight after.
+                    #[cfg(any(target_os = "linux", target_os = "android"))]
                     let fd = libc::socket(libc::AF_INET, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0);
+                    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+                    let fd = libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0);
                     assert!(fd >= 0, "socket: {}", std::io::Error::last_os_error());
+                    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+                    assert_eq!(
+                        libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC),
+                        0,
+                        "fcntl(FD_CLOEXEC): {}",
+                        std::io::Error::last_os_error()
+                    );
                     let mut addr: libc::sockaddr_in = std::mem::zeroed();
+                    // BSD's sockaddr carries its own length.
+                    #[cfg(any(target_os = "macos", target_os = "ios"))]
+                    {
+                        addr.sin_len = std::mem::size_of::<libc::sockaddr_in>() as u8;
+                    }
                     addr.sin_family = libc::AF_INET as libc::sa_family_t;
                     addr.sin_port = port.to_be();
                     addr.sin_addr.s_addr = u32::from_ne_bytes([127, 0, 0, 1]);
@@ -1444,7 +1463,19 @@ mod tests {
     /// takes its fast path and never respawns. Deterministic here: the child
     /// is a bare `fork()` that waits, so the inherited copy lives as long as
     /// the cell needs it.
+    ///
+    /// **Linux only, by nature**: what it pins is Linux's `shutdown(2)` on a
+    /// listening socket, which takes the socket out of LISTEN for every
+    /// descriptor sharing it. BSD and macOS answer `ENOTCONN` and leave it
+    /// listening, so no `close_tunnel` can stop a forked copy there (seen on
+    /// macOS 26: "a closed tunnel still answers"). There `close_tunnel` is
+    /// only the plain drop. The re-ensure cells do not depend on this one:
+    /// the port reservation keeps them deterministic on both.
     #[test]
+    #[cfg_attr(
+        not(target_os = "linux"),
+        ignore = "shutdown(2) does not stop a listening socket off Linux"
+    )]
     fn closing_a_tunnel_stops_it_answering_even_with_a_forked_copy_of_its_fd() {
         fn forked_holder() -> libc::pid_t {
             // SAFETY: the child calls only async-signal-safe functions
@@ -1561,9 +1592,18 @@ mod tests {
             std::net::TcpListener::bind(("127.0.0.1", port)).is_err(),
             "another bind took a reserved port"
         );
-        let refused = std::net::TcpStream::connect(("127.0.0.1", port))
-            .expect_err("a reserved port must refuse connections");
-        assert_eq!(refused.kind(), std::io::ErrorKind::ConnectionRefused);
+        // The fast path's own probe reads the reserved port as dead...
+        assert!(!port_answers(port), "a reserved port answered a connect");
+        // ...and on Linux the refusal is immediate: the bound, non-listening
+        // socket answers with an RST. macOS sends no RST for it, so a connect
+        // there fails only by timing out (seen on macOS 26), which
+        // `port_answers` has already bounded.
+        #[cfg(target_os = "linux")]
+        {
+            let refused = std::net::TcpStream::connect(("127.0.0.1", port))
+                .expect_err("a reserved port must refuse connections");
+            assert_eq!(refused.kind(), std::io::ErrorKind::ConnectionRefused);
+        }
         assert!(
             pid_is_alive(first[0]),
             "the predecessor is alive before the re-ensure"
