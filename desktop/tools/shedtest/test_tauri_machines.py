@@ -797,10 +797,10 @@ def test_launching_on_a_machine_routes_over_the_machine_not_a_server(machine_app
     it is a `tab.open` of the kind's agent — addressed by machine name over that
     machine's own session, never by `(host, shed)` through a server.
 
-    M1's kickoff is deliberately minimal (plan 013 §4): the agent binary and a
-    cwd. No prompt, no permission mode, no title — roost owns the tab's title
-    (it follows the foreground process) and prompts need the provider script that
-    is a later slice.
+    The `tab.open` is minimal (plan 013 §4): the agent binary and a cwd, with
+    roost's placeholder title. A name, when one is given, goes on AFTER the open
+    (`tab.set_title`, the cells below); a first prompt or a permission mode is
+    refused before it (plan 026 §3.5).
     """
     before = len(fake_roost.opens)
     before_tabs = set(fake_roost.tab_ids())
@@ -846,6 +846,124 @@ def test_launching_an_unknown_kind_on_a_machine_is_refused(machine_app, fake_roo
     assert "shell" in str(excinfo.value), excinfo.value
 
     assert len(fake_roost.opens) == before, "a refused launch still opened a tab"
+
+
+def test_the_launch_dialogs_session_name_becomes_the_tabs_title(machine_app, fake_roost):
+    """**The dialog's Session name reaches roost as the opened tab's title**
+    (plan 026 §3.5, shed#366) — typed into the dialog and submitted through its
+    own Create button, so what lands is what a click sends: `machineLaunch` →
+    `machine_launch` → `RoostHosts::launch`.
+
+    A `tab.open` title is a placeholder the agent's OSC title overwrites, so the
+    open still carries roost's `""` and the name follows as a `tab.set_title`
+    on the tab the open created — nothing else would make it stick.
+    """
+    before = len(fake_roost.opens)
+    before_titles = len(fake_roost.title_calls)
+    before_tabs = set(fake_roost.tab_ids())
+    name = "Release notes"
+    fill = {"mode": "agent", "target": "machine:mini3", "workdir": "/home/shed/named",
+            "name": name}
+
+    def filled() -> bool:
+        machine_app.fill_launch(**fill)
+        dump = machine_app.launch_dump() or {}
+        values = dump.get("values") or {}
+        return (values.get("Where") == "machine:mini3"
+                and values.get("Session name") == name
+                and values.get("Working directory") == "/home/shed/named"
+                and dump.get("create_enabled") is True)
+
+    try:
+        machine_app.show_launch()
+        machine_app.wait_until(lambda: machine_app.modal() == "launch", timeout=15,
+                               what="the launch dialog to open")
+        machine_app.wait_until(filled, timeout=15, what="the agent fields, as typed")
+        machine_app.submit_launch()
+        machine_app.wait_until(lambda: len(fake_roost.title_calls) > before_titles,
+                               timeout=15, what="the dialog's tab.set_title to reach the machine")
+        machine_app.wait_until(lambda: machine_app.modal() is None, timeout=15,
+                               what="the dialog to close after the launch")
+        opened = set(fake_roost.tab_ids()) - before_tabs
+    finally:
+        _close_tabs_opened_since(fake_roost, before_tabs)
+
+    assert len(fake_roost.opens) == before + 1, f"one press is one tab: {fake_roost.opens[before:]}"
+    assert fake_roost.opens[-1]["title"] == "", "the open's title is still roost's placeholder"
+    assert fake_roost.opens[-1]["cwd"] == "/home/shed/named"
+    assert len(opened) == 1, opened
+    assert fake_roost.title_calls[before_titles:] == [
+        {"tab_id": str(next(iter(opened))), "title": name},
+    ], "the name, on the tab the launch opened"
+
+
+def test_a_launch_is_titled_only_when_its_name_is_not_blank(machine_app, fake_roost):
+    """`machine.launch` over the socket: a whitespace-only `display_name` is
+    absent — no `tab.set_title`, no `title` in the answer — and a real one is
+    trimmed, set on the opened tab, and answered `title: "applied"` (plan 026
+    §3.5)."""
+    before_titles = len(fake_roost.title_calls)
+    before_tabs = set(fake_roost.tab_ids())
+    try:
+        blank = machine_app.machine_launch("mini3", kind="opencode", display_name="  \t ")
+        assert "title" not in blank, blank
+        assert len(fake_roost.title_calls) == before_titles, (
+            f"a blank name sent a title: {fake_roost.title_calls[before_titles:]}"
+        )
+
+        named = machine_app.machine_launch("mini3", kind="opencode", display_name="  Named  ")
+    finally:
+        _close_tabs_opened_since(fake_roost, before_tabs)
+    assert named["title"] == "applied", named
+    assert named["display_name"] == "Named", named
+    assert fake_roost.title_calls[before_titles:] == [
+        {"tab_id": named["slug"], "title": "Named"},
+    ]
+
+
+@pytest.mark.parametrize("field,value", [("initial_prompt", "fix the build"),
+                                         ("permission_mode", "plan")])
+def test_a_first_prompt_or_permission_mode_is_refused_on_a_machine(
+        machine_app, fake_roost, field, value):
+    """**Refused, exactly `bad_request`, and nothing opens** (plan 026 §3.5):
+    roost's launch cannot deliver a first prompt or a permission mode, and
+    accepting one only to drop it told the caller it worked (shed#366).
+
+    Every door a machine is addressed through: `machine.launch` by its bare
+    name and by its `machine:<name>` token, and `roost.launch` by the token.
+    The shed form is `test_tauri_bootstrap.py`'s twin cell. The message names
+    the field; the mini3 session is live (the launch cells above open on it), so
+    the zero `tab.open` is the refusal's and not an unreachable host's.
+    """
+    before = len(fake_roost.opens)
+    before_titles = len(fake_roost.title_calls)
+    before_tabs = set(fake_roost.tab_ids())
+    doors = [
+        ("machine.launch", {"machine": "mini3"}),
+        ("machine.launch", {"target": "machine:mini3"}),
+        ("roost.launch", {"target": "machine:mini3"}),
+    ]
+    try:
+        for op, address in doors:
+            with pytest.raises(ShedError) as excinfo:
+                machine_app.call(op, {**address, "kind": "opencode",
+                                      "display_name": "named", field: value})
+            assert excinfo.value.code == "bad_request", (op, address, excinfo.value)
+            assert excinfo.value.message.startswith(
+                f"{field} is not supported by a roost launch"), excinfo.value
+        # The field in another JSON shape is still the field: refused, not read
+        # as absent (which would drop it silently, the bug this cell is about).
+        with pytest.raises(ShedError) as excinfo:
+            machine_app.call("roost.launch", {"target": "machine:mini3", "kind": "opencode",
+                                              field: [value]})
+        assert excinfo.value.code == "bad_request", excinfo.value
+        assert f"'{field}' must be a string" in excinfo.value.message, excinfo.value
+    finally:
+        # Only ever non-empty when the refusal is broken — and then the leaked
+        # tab would fail the cells below for a reason that is this one's.
+        _close_tabs_opened_since(fake_roost, before_tabs)
+    assert len(fake_roost.opens) == before, f"a refused launch opened a tab: {fake_roost.opens[before:]}"
+    assert len(fake_roost.title_calls) == before_titles, "or named one"
 
 
 # ---------------------------------------------------------------------------

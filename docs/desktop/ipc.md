@@ -90,7 +90,7 @@ guest binary and the hub are gone.)
 | op | params | result |
 |----|--------|--------|
 | `rc.list` | `host?`, `shed?` | `{sessions, capabilities, machines, shed_craze}` — `shed_craze` lists the unlisted sheds craze is offered on (below) |
-| `rc.launch` | `host?`, `shed`, `kind?`, `display_name?`, `workdir?`, `initial_prompt?` | the opened row — an **alias** for `roost.launch` on `roost:<host>/<shed>`, kept for 0.9.x |
+| `rc.launch` | `host?`, `shed`, `kind`, `display_name?`, `workdir?`, `permission_mode?`, `initial_prompt?` | the opened row — an **alias** for `roost.launch` on `roost:<host>/<shed>`, kept for 0.9.x, under the same launch rules (below) |
 | `rc.kill` | `host?`, `shed`, `slug` | `{}` — a roost `tab.close`; the slug IS the tab id, and must be one THIS host lists (ids are per-host, so one copied from elsewhere would close an unrelated tab) |
 | `machines.list` | — | `machines[]` — every configured machine's health, name-ordered, each with its `craze` source's state (below) |
 | `machine.kill` | `machine`, `slug` | `{}` (addressed by machine + slug, not host/shed). For a **craze row**, `slug` is the row's `tab_id` — its End tab closes the roost tab the session runs in; a craze row's own slug is its hostId, not a tab id |
@@ -98,7 +98,7 @@ guest binary and the hub are gone.)
 | `roost.probe` | `target` | `target`, `probe` (its `fingerprint` nested inside) and `plan` — a read-only look at a shed or machine's `roost-session` state. The plan matrix row comes back from here too, so a caller that needs only the row does not also have to call `roost.preview` |
 | `roost.preview` | `target` | the plan (Install/Update/Start/Report/nothing to do) plus the sentence naming where the bytes would come from |
 | `roost.bootstrap` | `target`, `fingerprint`, `consent: true` | installs/updates/starts `roost-session` on that target and wires its agent hooks; refuses without consent or against a stale fingerprint |
-| `roost.launch` | `target`, `kind?`, `workdir?`, … | generalizes `machine.launch` to any roost host (a shed or a machine); `machine.launch` stays as an alias |
+| `roost.launch` | `target`, `kind`, `display_name?`, `workdir?`, `permission_mode?`, `initial_prompt?` | the opened row, plus `title` when a name was given (below). Generalizes `machine.launch` to any roost host (a shed or a machine); `machine.launch` (addressed by `machine` or `target`) stays as an alias |
 | `roost.run` | `target` (or `machine`), `command`, `workdir?` | `{origin, machine, slug, cwd, argv}` — the tab it opened. **Run a command in a tab**: `command` split on ASCII whitespace into the argv, with **no shell and no quoting**; gated by no kind. `command` is required — absent, empty or whitespace-only is `bad_request` |
 
 `roost.probe`, `roost.preview`, `roost.bootstrap` and `roost.launch` are how the desktop
@@ -108,13 +108,33 @@ consent card, and the rollback promise are documented there, not here. Kicking o
 from roost's own command palette instead of the desktop app is [the `shed` roost
 provider](../extensions/roost-provider.md).
 
-`display_name`, `permission_mode` and `initial_prompt` are **accepted and not used** on
-either launch door: roost's `tab.open` is the agent binary plus a working directory, roost
-owns the tab's title, and typed prompts arrive with [the `shed` roost
-provider](../extensions/roost-provider.md). They stay in the wire so a caller written against
-the pre-0.9.0 op is not silently refused for sending what the hub accepted — but **the app's
-own launch dialog no longer offers a prompt field**, because a box whose contents go nowhere
-is worse than no box (`charliek/shed#366` tracks delivering one).
+**The launch rules** (`rc.launch`, `roost.launch`, `machine.launch`, and the app's own launch
+dialog). roost's `tab.open` is the agent binary plus a working directory, so:
+
+- **`display_name` is the tab's title.** Once the tab is open, a non-blank name (trimmed) is
+  set with roost's `tab.set_title`, which sticks: the agent's own terminal title no longer
+  replaces it. The answered row gains `title`: `"applied"`, or `"failed: <cause>"` when roost
+  refused it. The tab is open either way, so a failed title is still a successful launch (and
+  is logged). Without a name there is no `title` key and no `tab.set_title`.
+- **`initial_prompt` and `permission_mode` are refused** with `bad_request`, before any tab
+  opens and before the host is contacted: "initial_prompt is not supported by a roost launch;
+  type it into the tab, or start a craze session, whose create takes a first prompt", and
+  "permission_mode is not supported by a roost launch; set the mode in the agent once its tab
+  is open". A launch has no channel to deliver either, and accepting one to drop it would say
+  the launch did what it did not. A craze session's create takes a first prompt
+  ([`craze.create`](#craze-sessions-tauri)).
+- **Blank is absent** for every field: an empty or whitespace-only `display_name`,
+  `workdir`, `initial_prompt` or `permission_mode` is treated as not sent.
+- **Error codes:** `bad_request` for a request a launch refuses, and `action_failed` for a
+  launch that was tried and opened no tab. `bad_request` covers the two fields above (in any
+  JSON shape: a non-string one is refused too, never read as absent), a missing or unknown
+  `kind`, and an unresolvable `host`. `action_failed` covers an unknown or unreachable host, a
+  kind roost has no recipe for, a refused `tab.open`, and the app quitting. The
+  `rc_launch`/`machine_launch` commands the UI calls answer the same two codes, as
+  `"<code>: <message>"`.
+
+The app's own launch dialog offers a **Session name** but no prompt or permission-mode
+field, because neither could be delivered.
 
 **`roost.run` — run a command in a tab.** The launch dialog's second mode, beside the agent
 picker, and how an agent's own TUI is started now that the per-agent kinds are gone: a roost
@@ -181,8 +201,8 @@ Only **agent-owned tabs** are sessions; a plain shell tab in roost is not one. A
 itself). There is **no terminal action** on a roost row yet — roost's `vt` attach hasn't
 landed (`kind_features.attach = "native-remote"` gates it off) — so `kill` maps to
 `tab.close` and `launch` to `tab.open` with the chosen agent binary in the chosen working
-directory; typed prompts and permission modes arrive later with [the `shed` roost
-provider](../extensions/roost-provider.md).
+directory, named by the launch's `display_name`; a first prompt or a permission mode is refused
+(see the launch rules above).
 
 A **shed**, not just a `machines:` entry, is a roost host the same way: `roost.probe` /
 `roost.bootstrap` install and start a `roost-session` on it over the shed's
@@ -374,9 +394,9 @@ the moment between the lane folding a change and the panel showing it, held open
 option pressed then is still bound to the model the sheet displays).
 
 The New-session dialog is driven the same way: `ui.show_launch` opens it, and — **in test
-mode only** — `ui.fill_launch {mode?, target?, command?, workdir?}` types into it (`mode` is
-`agent` or `command`; `target` is a "Where" value, `machine:<name>` or `shed:<host>/<name>`; an
-absent key is left as it is) and `ui.submit_launch` presses Create, through the button's own
+mode only** — `ui.fill_launch {mode?, target?, command?, workdir?, name?}` types into it
+(`mode` is `agent` or `command`; `target` is a "Where" value, `machine:<name>` or
+`shed:<host>/<name>`; `name` is the agent mode's Session name; an absent key is left as it is) and `ui.submit_launch` presses Create, through the button's own
 gate. They exist because the "Run a command" mode is reachable only by typing and clicking;
 outside test mode both answer `not_enabled`, and the production door onto the same backend is
 `roost.run`. A `craze:<machine>` target (a host that offers New craze session — a machine, or

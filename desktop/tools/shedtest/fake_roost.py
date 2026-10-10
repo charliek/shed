@@ -69,6 +69,7 @@ wire it is on.
 | `tab.open` | appends a tab built from the `tab.open` vector, commits a `tab.opened` batch, answers `{tab}`; the params are recorded for the test |
 | `tab.close` | removes the tab and commits a `tab.closed` batch; `not-found` for an unknown id |
 | `tab.write` | decode, then the tab (`not-found`); open to every connection, no authority to check; records the base64-decoded bytes |
+| `tab.set_title` | `{tab_id, title}` (`unknown-field` on any other key); records the params, then the tab (`not-found`); sets the title and `user_titled` (what makes roost ignore OSC titles from then on) and commits a `tab.title_changed` batch, answers `{}`; `refuse_next_set_title()` refuses the next one after recording it |
 | `session.set_agent_hooks` | the generation-6 raise `{agents, client}`; open to every connection, last writer wins; `invalid-param` on a bad `agents`/`client`, `unknown-field` on a retired `mode`/`skip`/`lease`; `unknown-op` on a UI socket |
 | `events.subscribe` | the ack from the vendored vector with this fake's revision and `session_id`, then a one-way push stream; `invalid-param` for a non-zero `tab_id_filter`; `not-implemented` on a UI socket |
 | anything else | `unknown-op` |
@@ -472,6 +473,11 @@ class FakeRoost:
         self._stopped = False
         #: Every `tab.open` this fake served, params verbatim, in order.
         self.opens: list[dict] = []
+        #: Every `tab.set_title` this fake served, params verbatim, in order —
+        #: a refused one included. The twin of `testing.rs`'s `set_title_calls`.
+        self.title_calls: list[dict] = []
+        #: What the next `tab.set_title` is refused with, `(code, message)`.
+        self._set_title_refusal: tuple[str, str] | None = None
         #: Every `session.set_agent_hooks` this fake served, params verbatim, in
         #: order — the twin of `testing.rs`'s `agent_hooks_calls`.
         self.agent_hooks_calls: list[dict] = []
@@ -552,6 +558,13 @@ class FakeRoost:
         exactly as roost would send it."""
         with self._lock:
             self._agent_hooks_result = dict(result)
+
+    def refuse_next_set_title(self, code: str, message: str) -> None:
+        """Refuse the next `tab.set_title` with this code and message, once —
+        after it is recorded, leaving the tab untouched. The twin of
+        `testing.rs::refuse_next_set_title`."""
+        with self._lock:
+            self._set_title_refusal = (code, message)
 
     def stream_count(self) -> int:
         """Registered event streams — one per subscribed connection.
@@ -978,6 +991,8 @@ class FakeRoost:
                 return self._close(_require_tab_id(params))
             if op == "tab.write":
                 return self._write(_require_tab_id(params), params)
+            if op == "tab.set_title":
+                return self._set_title(params)
             if op == "session.set_agent_hooks":
                 return self._set_agent_hooks(params)
             # Everything else: the fake serves inventory and the one-shots, and
@@ -1059,6 +1074,36 @@ class FakeRoost:
             raise _Refusal("invalid-param", f"tab.write data: {e}") from e
         self._require(tab_id)
         self._writes[tab_id] = self._writes.get(tab_id, b"") + decoded
+        return {}
+
+    def _set_title(self, params: dict) -> dict:
+        """`tab.set_title {tab_id, title}` — name a tab stickily.
+
+        roost's order: decode (`TabSetTitleParams` is `deny_unknown_fields`,
+        both keys required), then the tab. The twin of `testing.rs`'s handler:
+        recorded once decoded, a seeded refusal served once, and the change
+        committed as a `tab.title_changed` batch. roost publishes no vector for
+        that event, so the envelope is a vendored one's and the data is the two
+        keys `roost_ipc::messages::TabTitleChangedEvent` serializes.
+        """
+        extra = next((k for k in params if k not in ("tab_id", "title")), None)
+        if extra is not None:
+            raise _Refusal("unknown-field", f"tab.set_title: unknown field `{extra}`")
+        tab_id = _require_tab_id(params)
+        title = params.get("title")
+        if not isinstance(title, str):
+            raise _Refusal("invalid-param", "tab.set_title needs a string `title`")
+        self.title_calls.append(copy.deepcopy(params))
+        refusal, self._set_title_refusal = self._set_title_refusal, None
+        if refusal is not None:
+            raise _Refusal(*refusal)
+        tab = self._require(tab_id)
+        tab["title"] = title
+        tab["user_titled"] = True
+        changed = copy.deepcopy(_TAB_CLOSED)
+        changed["event"] = "tab.title_changed"
+        changed["data"] = {"tab_id": str(tab_id), "title": title}
+        self._commit([changed])
         return {}
 
     def _set_agent_hooks(self, params: dict) -> dict:

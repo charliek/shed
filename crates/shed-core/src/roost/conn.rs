@@ -30,7 +30,8 @@ use roost_ipc::client::{EventFrame, EventStream, ServerCode};
 use roost_ipc::messages::{
     ops, AgentHooksOutcome, IdentifyParams, IdentifyResult, SessionIdentify, SessionIdentifyParams,
     SessionSetAgentHooksParams, Tab, TabCloseParams, TabDumpParams, TabDumpResult, TabListResult,
-    TabOpenParams, TabOpenResult, TabWriteParams, WireTabRef, SESSION_PROTOCOL_VERSION,
+    TabOpenParams, TabOpenResult, TabSetTitleParams, TabWriteParams, WireTabRef,
+    SESSION_PROTOCOL_VERSION,
 };
 use roost_ipc::{ClientError, IpcClient};
 use tokio::net::{TcpStream, UnixStream};
@@ -267,6 +268,27 @@ impl Conn {
                 TabWriteParams {
                     tab_id,
                     data: data.to_vec(),
+                },
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// `tab.set_title` — name a tab, **stickily**.
+    ///
+    /// The one way to give a tab a name that stays. A `tab.open` title is a
+    /// placeholder: roost marks it `user_titled: false`, so the first OSC title
+    /// the foreground process prints replaces it. This op sets `user_titled`,
+    /// after which roost ignores OSC titles for the tab. roost answers `{}`, and
+    /// `not-found` for a tab it does not hold. Like every op since session
+    /// protocol 5, it takes no token.
+    pub async fn tab_set_title(&mut self, tab_id: i64, title: &str) -> Result<(), RoostError> {
+        self.client
+            .call_raw(
+                ops::TAB_SET_TITLE,
+                TabSetTitleParams {
+                    tab_id,
+                    title: title.to_string(),
                 },
             )
             .await?;

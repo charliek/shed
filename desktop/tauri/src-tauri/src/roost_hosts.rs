@@ -72,8 +72,8 @@ use roost_ipc::agent::{AgentLifecycle, Ownership, ShellState};
 use roost_ipc::messages::{Tab, TabOpenParams};
 use shed_app::roost::{
     launch_argv, roost_capabilities, shed_reach_entry, tab_close, tab_open, tab_open_fenced,
-    BootstrapRunner, HooksRefresh, ReachKind as ReachFamily, RoostReach, RoostUpdate, RoostWatcher,
-    RoostWatcherOptions, SshExec, TabFence,
+    tab_set_title, BootstrapRunner, HooksRefresh, ReachKind as ReachFamily, RoostReach,
+    RoostUpdate, RoostWatcher, RoostWatcherOptions, SshExec, TabFence,
 };
 use shed_core::config::{MachineEntry, ShedConfig};
 use shed_core::rc::RcKind;
@@ -759,6 +759,99 @@ impl Refusal {
             | Refusal::ShuttingDown(m) => m,
         }
     }
+}
+
+/// Why [`RoostHosts::launch`] opened no tab (plan 026 §3.5).
+///
+/// Two kinds, because a caller has to tell them apart: a request this build
+/// will not carry out, whatever the host's state (`bad_request` at both doors),
+/// and a launch that was tried and failed (`action_failed`, which is what every
+/// launch failure answered before the distinction existed — an unknown host, a
+/// kind with no recipe, a host that cannot be reached, a refused `tab.open`, a
+/// quit in flight).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LaunchError {
+    /// The request asked for something a roost launch does not do. Refused
+    /// before any host is touched, so nothing was opened.
+    BadRequest(String),
+    /// The launch was tried and did not open a tab.
+    Failed(String),
+}
+
+impl LaunchError {
+    /// The IPC error code both doors answer with.
+    pub fn code(&self) -> &'static str {
+        match self {
+            LaunchError::BadRequest(_) => "bad_request",
+            LaunchError::Failed(_) => "action_failed",
+        }
+    }
+
+    /// The sentence.
+    pub fn message(&self) -> &str {
+        match self {
+            LaunchError::BadRequest(m) | LaunchError::Failed(m) => m,
+        }
+    }
+
+    /// The `#[tauri::command]` door's error string: `"<code>: <message>"`, the
+    /// shape `lane_error` and `CrazeFailure::command_string` use, which
+    /// `bridge.ts`'s `laneFailure` splits back.
+    pub fn command_string(&self) -> String {
+        format!("{}: {}", self.code(), self.message())
+    }
+}
+
+impl std::fmt::Display for LaunchError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.message())
+    }
+}
+
+/// Every failure below the request check is a launch that was tried.
+impl From<String> for LaunchError {
+    fn from(message: String) -> LaunchError {
+        LaunchError::Failed(message)
+    }
+}
+
+/// What a launch carrying a first prompt is refused with (plan 026 §3.5): the
+/// field, and the alternative.
+///
+/// roost's `tab.open` is an argv and a working directory, so a first prompt (or
+/// a permission mode, below) has no wire to travel down: a `tab.write` after the
+/// open races the agent's own startup, and a per-kind argv (`claude <prompt>`,
+/// `--permission-mode`) is new behaviour no client asks for. Accepting either and
+/// dropping it was shed#366's bug — the caller was told the launch worked.
+pub(crate) const PROMPT_REFUSED: &str = "initial_prompt is not supported by a roost launch; \
+     type it into the tab, or start a craze session, whose create takes a first prompt";
+
+/// What a launch carrying a permission mode is refused with — see
+/// [`PROMPT_REFUSED`]. craze's create takes no mode either, so the alternative
+/// is the agent's own.
+pub(crate) const MODE_REFUSED: &str = "permission_mode is not supported by a roost launch; \
+     set the mode in the agent once its tab is open";
+
+/// Refuse a launch that asks for a first prompt or a permission mode. Blank or
+/// whitespace-only is ABSENT (the [`RoostHosts::launch`] rule for every field),
+/// so a form that sends an empty box is not refused for it.
+fn refuse_unsupported(
+    initial_prompt: Option<&str>,
+    permission_mode: Option<&str>,
+) -> Result<(), LaunchError> {
+    if present(initial_prompt).is_some() {
+        return Err(LaunchError::BadRequest(PROMPT_REFUSED.to_string()));
+    }
+    if present(permission_mode).is_some() {
+        return Err(LaunchError::BadRequest(MODE_REFUSED.to_string()));
+    }
+    Ok(())
+}
+
+/// A caller-supplied launch field, trimmed — or `None` when it is blank, which
+/// is absent ([`RoostHosts::launch`]'s rule).
+fn present(field: Option<&str>) -> Option<&str> {
+    field.map(str::trim).filter(|s| !s.is_empty())
 }
 
 /// The app's roost-host layer: one watcher per live host, plus the state each
@@ -1488,20 +1581,51 @@ impl RoostHosts {
     }
 
     /// Open a session ON this host — a roost `tab.open` running the kind's
-    /// agent — and fold it into the local snapshot so the row appears immediately
-    /// rather than whenever the push feed next catches up (see [`Self::kill`] for
-    /// why "normally milliseconds" is not the same as "always").
+    /// agent, named `title` when one was given — and fold it into the local
+    /// snapshot so the row appears immediately rather than whenever the push
+    /// feed next catches up (see [`Self::kill`] for why "normally milliseconds"
+    /// is not the same as "always").
+    ///
+    /// **The title follows the open, and never fails it** (plan 026 §3.5): a
+    /// `tab.open` title is a placeholder the agent's own OSC title overwrites,
+    /// so the name goes on with `tab.set_title` once the tab exists — and since
+    /// it does exist, a refused title is reported (the row's `title`:
+    /// `"applied"` or `"failed: <cause>"`, present only when a name was given)
+    /// and logged, not turned into a failed launch.
     async fn create(
         &self,
         id: &HostId,
         kind: &RcKind,
         workdir: Option<&str>,
+        title: Option<&str>,
     ) -> Result<Value, String> {
         let reach = self.reach(id)?;
         let params = open_params(kind, workdir)?;
-        let tab = tab_open(reach.as_ref(), params).await?;
+        let mut tab = tab_open(reach.as_ref(), params).await?;
+        let titled = match title {
+            None => None,
+            Some(title) => Some(match tab_set_title(reach.as_ref(), tab.id, title).await {
+                Ok(()) => {
+                    // What roost now holds, so the optimistic row says it too
+                    // rather than the placeholder until the stream catches up.
+                    tab.title = title.to_string();
+                    tab.user_titled = true;
+                    "applied".to_string()
+                }
+                Err(e) => {
+                    eprintln!(
+                        "shed-desktop-tauri: {id}: tab {} opened, but its title was not set: {e}",
+                        tab.id
+                    );
+                    format!("failed: {e}")
+                }
+            }),
+        };
         let session = opened_session(id, kind, &tab);
-        let value = host_row(id, &session, false);
+        let mut value = host_row(id, &session, false);
+        if let (Some(titled), Some(obj)) = (titled, value.as_object_mut()) {
+            obj.insert("title".into(), json!(titled));
+        }
         {
             let mut guard = lock(&self.state);
             // Only if the watcher has not already delivered it. `get_mut` also
@@ -1530,19 +1654,29 @@ impl RoostHosts {
     /// Create a session from CALLER-SUPPLIED, un-normalized fields.
     ///
     /// The one place blank-vs-absent is decided, shared by the `machine.launch`
-    /// IPC op and the `machine_launch` Tauri command: the same request must not
-    /// mean two things depending on which door it came through. A field that is
-    /// blank or all whitespace is ABSENT — `"   "` as a working directory is
-    /// someone leaving the box empty, not a directory named three spaces.
+    /// / `roost.launch` / `rc.launch` IPC ops and the `machine_launch` /
+    /// `rc_launch` Tauri commands: the same request must not mean two things
+    /// depending on which door it came through. A field that is blank or all
+    /// whitespace is ABSENT — `"   "` as a working directory is someone leaving
+    /// the box empty, not a directory named three spaces.
     ///
-    /// **`display_name`, `permission_mode` and `initial_prompt` are accepted and
-    /// not used** in M1 (plan 013 §4). Kickoff is the minimal `tab.open`: the
-    /// agent binary and a cwd. roost owns the tab's title (it follows the
-    /// foreground process, and shed showing a second divergent name would be
-    /// worse than showing roost's), and prompts + permission modes need the
-    /// provider script that is S4's. They stay in the signature so both doors keep
-    /// one wire while that lands, and so a caller is not silently rejected for
-    /// sending what the old hub accepted.
+    /// What each field does (plan 026 §3.5):
+    ///
+    /// * `kind` and `workdir` are the `tab.open`: the kind's agent binary and a
+    ///   working directory.
+    /// * `display_name`, trimmed, becomes the tab's title through
+    ///   `tab.set_title` once it is open — sticky, so the agent's OSC title does
+    ///   not replace it. The row answered carries `title: "applied"`, or
+    ///   `"failed: <cause>"` when roost refused it (the tab is open either way,
+    ///   so that is still a successful launch); without a name there is no
+    ///   `title` key and no `tab.set_title`.
+    /// * `initial_prompt` and `permission_mode` are **refused** with
+    ///   [`LaunchError::BadRequest`] ([`PROMPT_REFUSED`], [`MODE_REFUSED`]) before
+    ///   anything is admitted, registered or opened: roost's launch has no way to
+    ///   deliver either, and accepting one to drop it would tell the caller it
+    ///   worked.
+    ///
+    /// Every other failure is [`LaunchError::Failed`].
     pub async fn launch(
         &self,
         host: &str,
@@ -1551,33 +1685,26 @@ impl RoostHosts {
         workdir: Option<&str>,
         permission_mode: Option<&str>,
         initial_prompt: Option<&str>,
-    ) -> Result<Value, String> {
+    ) -> Result<Value, LaunchError> {
+        refuse_unsupported(initial_prompt, permission_mode)?;
         let admitted = self.admit()?;
         admitted
             .run(
-                self.launch_admitted(
-                    host,
-                    kind,
-                    display_name,
-                    workdir,
-                    permission_mode,
-                    initial_prompt,
-                ),
-                || Err(cancelled()),
+                self.launch_admitted(host, kind, display_name, workdir),
+                || Err(LaunchError::Failed(cancelled())),
             )
             .await
     }
 
-    /// [`Self::launch`], admitted (plan 026 §3.3, F2).
+    /// [`Self::launch`], admitted (plan 026 §3.3, F2) — the open AND its title,
+    /// so a quit in flight is joined across both.
     async fn launch_admitted(
         &self,
         host: &str,
         kind: &RcKind,
-        _display_name: Option<&str>,
+        display_name: Option<&str>,
         workdir: Option<&str>,
-        _permission_mode: Option<&str>,
-        _initial_prompt: Option<&str>,
-    ) -> Result<Value, String> {
+    ) -> Result<Value, LaunchError> {
         let id = HostId::parse(host)?;
         // A launch is a user action on a host they are looking at, so it is
         // allowed to be the thing that FIRST reaches an unwatched shed: a shed
@@ -1585,7 +1712,7 @@ impl RoostHosts {
         // rather than at whatever later refresh happens to probe it.
         self.ensure_registered(&id)?;
         let row = self
-            .create(&id, kind, workdir.map(str::trim).filter(|s| !s.is_empty()))
+            .create(&id, kind, present(workdir), present(display_name))
             .await?;
         // A `tab.open` that answered IS a session answering, which is the
         // probe-then-watch rule's own condition (plan 019 §3.6) — so this host
@@ -4011,8 +4138,9 @@ fn parse_tab_id(slug: &str) -> Result<i64, String> {
 /// Everything but `argv` and `cwd` is deliberately zero/empty: `project_id: 0`
 /// lets roost put the tab in its own default project (shed has no opinion about
 /// somebody's project layout), `cols`/`rows` let roost size the PTY, and `title`
-/// stays roost's — it follows the foreground process, which is the name the user
-/// sees in roost's own sidebar.
+/// is left to roost — a `tab.open` title is only a placeholder the foreground
+/// process's OSC title replaces, so a name the caller gave goes on afterwards,
+/// with `tab.set_title` ([`RoostHosts::create`]), which sticks.
 ///
 /// A kind with no launch recipe (`shell`, `claude-broker`, `grok`, anything
 /// unknown) is refused HERE, before any connection is made, so the failure names
@@ -5475,7 +5603,10 @@ mod tests {
         assert_eq!(params.cwd, "/tmp/work");
         assert_eq!(params.project_id, 0, "roost picks the project");
         assert_eq!((params.cols, params.rows), (0, 0), "roost sizes the PTY");
-        assert_eq!(params.title, "", "the title is roost's");
+        assert_eq!(
+            params.title, "",
+            "the open's title is a placeholder; a name follows as tab.set_title"
+        );
         assert_eq!(
             params.activate, None,
             "the desktop leaves the tab it just opened selected"
@@ -5547,6 +5678,240 @@ mod tests {
             "the desktop sends no `activate` key at all: {}",
             opened[0]
         );
+    }
+
+    /// **A first prompt or a permission mode is refused before any tab opens**
+    /// (plan 026 §3.5): `bad_request` naming the field and the alternative, and
+    /// the session's revision never moves — no `tab.open`, no `tab.set_title`.
+    /// It is checked before the host is even resolved, so an unknown host with
+    /// a prompt is the same refusal rather than a host error. The last launch
+    /// is the control: the same request without either field lands, so the
+    /// refusals were not a host that could not have opened anything.
+    #[tokio::test]
+    async fn a_first_prompt_or_permission_mode_is_refused_before_any_tab_opens() {
+        let fake = FakeRoost::start().await;
+        let machines = start(
+            &config_with(&["mini3"]),
+            &sockets(&[("mini3", fake.socket_path())]),
+        );
+        let before = fake.revision();
+
+        for (host, prompt, mode, refusal) in [
+            ("mini3", Some("fix the build"), None, PROMPT_REFUSED),
+            ("mini3", None, Some("plan"), MODE_REFUSED),
+            ("mini3", Some("  both  "), Some("plan"), PROMPT_REFUSED),
+            (
+                "machine:nowhere",
+                Some("fix the build"),
+                None,
+                PROMPT_REFUSED,
+            ),
+        ] {
+            let e = machines
+                .launch(
+                    host,
+                    &RcKind::Opencode,
+                    Some("named"),
+                    Some("/tmp/x"),
+                    mode,
+                    prompt,
+                )
+                .await
+                .expect_err("refused");
+            assert_eq!(
+                fake.tab_open_calls(),
+                Vec::<Value>::new(),
+                "{host} {prompt:?} {mode:?}: a refused launch opened a tab"
+            );
+            assert_eq!(
+                e,
+                LaunchError::BadRequest(refusal.to_string()),
+                "{host} {prompt:?} {mode:?}"
+            );
+            assert_eq!(e.code(), "bad_request");
+        }
+        assert!(
+            PROMPT_REFUSED.starts_with("initial_prompt ")
+                && PROMPT_REFUSED.contains("type it into the tab")
+                && PROMPT_REFUSED.contains("craze session"),
+            "the refusal names the field and both alternatives: {PROMPT_REFUSED}"
+        );
+        assert!(
+            MODE_REFUSED.starts_with("permission_mode "),
+            "{MODE_REFUSED}"
+        );
+        assert!(
+            fake.tab_open_calls().is_empty(),
+            "a refused launch opened a tab"
+        );
+        assert!(fake.set_title_calls().is_empty(), "or named one");
+        assert_eq!(fake.revision(), before, "nothing was committed");
+
+        machines
+            .launch("mini3", &RcKind::Opencode, None, None, None, None)
+            .await
+            .expect("the same host, asked for what a launch does, opens a tab");
+        assert_eq!(fake.tab_open_calls().len(), 1);
+    }
+
+    /// **Blank is absent** for both refused fields — the rule every launch field
+    /// follows — so a form that posts an empty box launches as though it had
+    /// sent nothing.
+    #[tokio::test]
+    async fn a_blank_prompt_or_permission_mode_is_absent() {
+        let fake = FakeRoost::start().await;
+        let machines = start(
+            &config_with(&["mini3"]),
+            &sockets(&[("mini3", fake.socket_path())]),
+        );
+        for blank in ["", "   ", " \t\n "] {
+            machines
+                .launch(
+                    "mini3",
+                    &RcKind::Opencode,
+                    None,
+                    None,
+                    Some(blank),
+                    Some(blank),
+                )
+                .await
+                .unwrap_or_else(|e| panic!("{blank:?} is absent, not a refusal: {e:?}"));
+        }
+        assert_eq!(fake.tab_open_calls().len(), 3, "each one opened its tab");
+    }
+
+    /// **A display name becomes the tab's title, and only a real one is sent**
+    /// (plan 026 §3.5). No name, or a whitespace-only one, sends no
+    /// `tab.set_title` and answers no `title`; a name is trimmed, set on the tab
+    /// the launch opened, answered as `title: "applied"`, and shown on the
+    /// optimistic row at once.
+    #[tokio::test]
+    async fn a_display_name_is_set_as_the_tabs_title_and_a_blank_one_is_not() {
+        let fake = FakeRoost::start().await;
+        let machines = start(
+            &config_with(&["mini3"]),
+            &sockets(&[("mini3", fake.socket_path())]),
+        );
+
+        for name in [None, Some(""), Some("  \t ")] {
+            let row = machines
+                .launch("mini3", &RcKind::Opencode, name, None, None, None)
+                .await
+                .expect("the open lands");
+            assert!(row.get("title").is_none(), "{name:?}: {row}");
+        }
+        assert!(
+            fake.set_title_calls().is_empty(),
+            "no name, no tab.set_title: {:?}",
+            fake.set_title_calls()
+        );
+
+        let row = machines
+            .launch(
+                "mini3",
+                &RcKind::Opencode,
+                Some("  Release notes  "),
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("the open lands");
+        assert_eq!(row["title"], json!("applied"), "{row}");
+        assert_eq!(row["display_name"], json!("Release notes"), "trimmed");
+        assert_eq!(
+            fake.set_title_calls(),
+            vec![json!({ "tab_id": row["slug"], "title": "Release notes" })],
+            "the opened tab's id, and the name"
+        );
+        let shown = rows(&machines)
+            .into_iter()
+            .find(|r| r["slug"] == row["slug"])
+            .expect("the optimistic row");
+        assert_eq!(shown["display_name"], json!("Release notes"));
+    }
+
+    /// **A refused title is still a launched tab** (plan 026 §3.5): the tab is
+    /// open, so the launch answers success, with `title: "failed: <cause>"`
+    /// carrying roost's refusal — not an error that would tell the caller
+    /// nothing started.
+    #[tokio::test]
+    async fn a_refused_title_still_answers_the_launch() {
+        let fake = FakeRoost::start().await;
+        let machines = start(
+            &config_with(&["mini3"]),
+            &sockets(&[("mini3", fake.socket_path())]),
+        );
+        fake.refuse_next_set_title("internal", "the title store is wedged");
+
+        let row = machines
+            .launch("mini3", &RcKind::Opencode, Some("Named"), None, None, None)
+            .await
+            .expect("a refused title does not fail the launch");
+        let title = row["title"].as_str().unwrap_or_default();
+        assert!(
+            title.starts_with("failed: ") && title.contains("the title store is wedged"),
+            "the cause, as roost gave it: {row}"
+        );
+        assert_eq!(fake.tab_open_calls().len(), 1);
+        assert_eq!(fake.set_title_calls().len(), 1, "it was asked once");
+        assert!(
+            rows(&machines).iter().any(|r| r["slug"] == row["slug"]),
+            "and the tab it opened is a row"
+        );
+    }
+
+    /// **The `rc_launch`/`machine_launch` commands carry the same two codes**
+    /// as the socket ops, as `"<code>: <message>"` — the shape `bridge.ts`'s
+    /// `laneFailure` splits back — so the UI can tell a refused request from a
+    /// launch that failed.
+    #[test]
+    fn a_launch_errors_command_string_leads_with_its_code() {
+        assert_eq!(
+            LaunchError::BadRequest(PROMPT_REFUSED.to_string()).command_string(),
+            format!("bad_request: {PROMPT_REFUSED}")
+        );
+        assert_eq!(
+            LaunchError::Failed("machine:mini3: unreachable".into()).command_string(),
+            "action_failed: machine:mini3: unreachable"
+        );
+        assert_eq!(
+            LaunchError::Failed("x".into()).to_string(),
+            "x",
+            "Display is the sentence alone"
+        );
+    }
+
+    /// **A launch that was tried and failed stays `Failed`** — `action_failed`
+    /// at both doors, as every launch failure was before the distinction: an
+    /// unknown host, an unreachable one, and a launch during the quit.
+    /// (A kind with no recipe is
+    /// [`an_unknown_kind_is_rejected_without_opening_a_tab`].)
+    #[tokio::test]
+    async fn real_launch_failures_stay_failed() {
+        let fake = FakeRoost::start().await;
+        let machines = start(
+            &config_with(&["mini3", "ghost"]),
+            &sockets(&[("mini3", fake.socket_path())]),
+        );
+        for host in ["roost:", "ghost"] {
+            let e = machines
+                .launch(host, &RcKind::Opencode, Some("named"), None, None, None)
+                .await
+                .expect_err("nothing to open on");
+            assert!(matches!(e, LaunchError::Failed(_)), "{host}: {e:?}");
+            assert_eq!(e.code(), "action_failed");
+        }
+        machines.begin_closing();
+        let e = machines
+            .launch("mini3", &RcKind::Opencode, None, None, None, None)
+            .await
+            .expect_err("the app is quitting");
+        assert!(
+            matches!(&e, LaunchError::Failed(m) if m.contains(&ShuttingDown.to_string())),
+            "{e:?}"
+        );
+        assert!(fake.tab_open_calls().is_empty());
     }
 
     /// **A failed launch must not leave a ghost row.**
@@ -5809,7 +6174,10 @@ mod tests {
             )
             .await
             .expect_err("no launch recipe");
-        assert!(e.contains("borg"), "{e}");
+        assert!(
+            matches!(&e, LaunchError::Failed(m) if m.contains("borg")),
+            "a kind with no recipe is a launch that failed, naming the kind: {e:?}"
+        );
         assert_eq!(fake.revision(), before, "nothing was opened");
     }
 

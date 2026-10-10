@@ -24,6 +24,9 @@ mod termctl;
 mod tray;
 mod updater;
 
+#[cfg(test)]
+mod launch_command_tests;
+
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
@@ -287,9 +290,21 @@ fn shed_target(backend: &Backend, host: Option<&str>, shed: &str) -> Result<Stri
     Ok(format!("roost:{server}/{shed}"))
 }
 
+/// A launch request refused before the host is reached — an unknown kind, an
+/// unresolvable server — coded `bad_request`, as the socket ops answer it.
+fn bad_launch(message: String) -> String {
+    roost_hosts::LaunchError::BadRequest(message).command_string()
+}
+
 /// Launch a session IN a shed — an alias for [`machine_launch`] on the shed's
 /// roost host since S6, kept for 0.9.x. Same `tab.open`, addressed by
-/// `{shed, host?}` rather than by machine name.
+/// `{shed, host?}` rather than by machine name, and the same coded error.
+///
+/// **Every launch field is declared, the refused ones included** (plan 026
+/// §3.5): Tauri extracts only the arguments a command names and drops the rest
+/// without a word, so a `permissionMode` this command did not declare would open
+/// a tab instead of being refused. `launch_command_tests` drives this command
+/// through Tauri's own argument extraction to hold that.
 #[tauri::command]
 #[allow(clippy::too_many_arguments)] // a flat invoke arg list mirrors the launch form fields
 async fn rc_launch(
@@ -300,22 +315,24 @@ async fn rc_launch(
     host: Option<String>,
     display_name: Option<String>,
     workdir: Option<String>,
+    permission_mode: Option<String>,
     initial_prompt: Option<String>,
 ) -> Result<serde_json::Value, String> {
     // Serde preserves an unknown kind as `Other(raw)` (the unknown-kind read
     // policy), so launching must apply the same known-kind gate as the socket IPC.
-    ipc::ensure_known_kind(&kind)?;
-    let target = shed_target(&backend, host.as_deref(), &shed)?;
+    ipc::ensure_known_kind(&kind).map_err(bad_launch)?;
+    let target = shed_target(&backend, host.as_deref(), &shed).map_err(bad_launch)?;
     machines
         .launch(
             &target,
             &kind,
             display_name.as_deref(),
             workdir.as_deref(),
-            None,
+            permission_mode.as_deref(),
             initial_prompt.as_deref(),
         )
         .await
+        .map_err(|e| e.command_string())
 }
 
 #[tauri::command]
@@ -360,6 +377,12 @@ fn machine_capabilities(
 /// `machine_launch` — start a session on a MACHINE, the machine counterpart of
 /// [`rc_launch`]: a roost `tab.open` running the kind's agent, addressed by
 /// `(machine, …)` rather than by `(host, shed, …)` through a server.
+///
+/// A launch's failure crosses as `"<code>: <message>"` (`lane_error`'s shape,
+/// which `bridge.ts` splits back): `bad_request` for a first prompt or a
+/// permission mode, refused before any tab opens, and `action_failed` for a
+/// launch that was tried (plan 026 §3.5) — the socket ops' two codes. Both
+/// refused fields are declared here for [`rc_launch`]'s reason.
 #[tauri::command]
 #[allow(clippy::too_many_arguments)]
 async fn machine_launch(
@@ -374,7 +397,7 @@ async fn machine_launch(
     // The same known-kind gate the shed launch applies: serde preserves an
     // unknown kind as `Other(raw)`, and starting one would ask the far side to
     // run something this build has never heard of.
-    ipc::ensure_known_kind(&kind)?;
+    ipc::ensure_known_kind(&kind).map_err(bad_launch)?;
     machines
         .launch(
             &machine,
@@ -385,6 +408,7 @@ async fn machine_launch(
             initial_prompt.as_deref(),
         )
         .await
+        .map_err(|e| e.command_string())
 }
 
 /// `roost_run` — "Run a command in a tab" (plan 025 P5): the frontend's door

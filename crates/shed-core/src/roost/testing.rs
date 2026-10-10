@@ -243,6 +243,12 @@ struct FakeState {
     /// assert a key is **absent** from a launch — `activate` is
     /// `skip_serializing_if`, so a struct literal says nothing about the bytes.
     tab_open_calls: Vec<Value>,
+    /// Every `tab.set_title` this fake has served, params verbatim — a refused
+    /// one included, so a test can tell "never asked" from "asked and refused".
+    set_title_calls: Vec<Value>,
+    /// What the next `tab.set_title` is refused with. See
+    /// [`FakeRoost::refuse_next_set_title`].
+    set_title_refusal: Option<Refusal>,
     /// What the next `session.set_agent_hooks` answers with, on top of the
     /// vendored vector's shape. `None` is the vector as recorded.
     agent_hooks_result: Option<Value>,
@@ -303,6 +309,8 @@ impl FakeState {
             writes: BTreeMap::new(),
             agent_hooks_calls: Vec::new(),
             tab_open_calls: Vec::new(),
+            set_title_calls: Vec::new(),
+            set_title_refusal: None,
             agent_hooks_result: None,
             streams: BTreeSet::new(),
             restarts_between_dials: 0,
@@ -828,6 +836,25 @@ impl FakeRoost {
         self.lock().tab_open_calls.clone()
     }
 
+    /// Every `tab.set_title` this fake has served, params verbatim, in order —
+    /// including one [`Self::refuse_next_set_title`] refused.
+    ///
+    /// An empty list is what "no title was sent" looks like, which is the half a
+    /// launch without a name is asserted on.
+    pub fn set_title_calls(&self) -> Vec<Value> {
+        self.lock().set_title_calls.clone()
+    }
+
+    /// Refuse the next `tab.set_title` with this `code` and `message`, once.
+    ///
+    /// It is decoded and recorded first, and the tab is left untouched: what a
+    /// real daemon's refusal leaves behind. A tab that exists has no other way
+    /// to make the op fail, and "the title failed but the tab opened" is the
+    /// case a launch must still answer success for.
+    pub fn refuse_next_set_title(&self, code: &str, message: &str) {
+        self.lock().set_title_refusal = Some(refuse(code, message));
+    }
+
     /// Answer the next `session.set_agent_hooks` with this `result` instead of
     /// the vendored vector's.
     ///
@@ -1283,6 +1310,50 @@ fn dispatch(state: &Mutex<FakeState>, op: &str, params: &Value) -> Result<Value,
             state.commit(vec![closed]);
             Ok(json!({}))
         }
+        "tab.set_title" => {
+            // roost's order: decode (`TabSetTitleParams` is
+            // `deny_unknown_fields`, and both keys are required), then the tab.
+            if let Some(extra) = params.as_object().and_then(|params| {
+                params
+                    .keys()
+                    .find(|key| !matches!(key.as_str(), "tab_id" | "title"))
+            }) {
+                return Err(refuse(
+                    "unknown-field",
+                    format!("tab.set_title: unknown field `{extra}`"),
+                ));
+            }
+            let id = params_tab_id(params)?;
+            let title = params
+                .get("title")
+                .and_then(Value::as_str)
+                .ok_or_else(|| refuse("invalid-param", "tab.set_title needs a string `title`"))?
+                .to_string();
+            state.set_title_calls.push(params.clone());
+            if let Some(refusal) = state.set_title_refusal.take() {
+                return Err(refusal);
+            }
+            let tab = state
+                .tab_mut(id)
+                .ok_or_else(|| refuse("not-found", format!("no such tab: {id}")))?;
+            // **Sticky.** `user_titled` is what makes roost ignore the OSC titles
+            // the foreground process prints from now on; a `tab.open` title
+            // leaves it `false`, which is why it is only a placeholder.
+            tab["title"] = json!(title);
+            tab["user_titled"] = json!(true);
+            // roost publishes no `tab.title_changed` vector, so the envelope is
+            // a vendored one's (its two keys) and the data is `roost-ipc`'s own
+            // type, serialized: neither key name comes from memory.
+            let mut changed = vector(VECTOR_TAB_CLOSED);
+            changed["event"] = json!(roost_ipc::messages::ops::EVENT_TAB_TITLE_CHANGED);
+            changed["data"] = serde_json::to_value(roost_ipc::messages::TabTitleChangedEvent {
+                tab_id: id,
+                title,
+            })
+            .expect("a title event serializes");
+            state.commit(vec![changed]);
+            Ok(json!({}))
+        }
         "tab.write" => {
             // Decode, then look for the tab. Generation 4 ran roost's
             // `require_lease` between the two — deliberately, so a write to a
@@ -1664,6 +1735,79 @@ mod tests {
             .await
             .expect_err("the tab really is gone");
         assert_eq!(missing.server_code(), Some(ServerCode::NotFound));
+    }
+
+    /// **`tab.set_title` names a tab stickily, and is recorded either way.**
+    ///
+    /// The title and `user_titled` both land on the tab (the second is what
+    /// makes roost ignore OSC titles from then on). A missing tab is
+    /// `not-found`; a seeded refusal is served once and leaves the tab as it
+    /// was; an unknown key is a decode refusal, recorded by nobody — and every
+    /// call that decoded is in `set_title_calls`, refused or not.
+    #[tokio::test]
+    async fn a_title_is_sticky_and_every_decoded_call_is_recorded() {
+        let fake = FakeRoost::start().await;
+        let mut conn = Conn::unix(fake.socket_path()).await.expect("dial");
+        let opened = conn
+            .tab_open(roost_ipc::messages::TabOpenParams {
+                argv: vec!["opencode".into()],
+                ..Default::default()
+            })
+            .await
+            .expect("open");
+        assert!(
+            !opened.user_titled,
+            "an opened tab's title is a placeholder"
+        );
+
+        conn.tab_set_title(opened.id, "my build")
+            .await
+            .expect("the tab exists");
+        let listed = conn.tab_list().await.expect("list");
+        let tab = listed
+            .projects
+            .iter()
+            .flat_map(|p| p.tabs.iter())
+            .find(|t| t.id == opened.id)
+            .expect("the tab is listed");
+        assert_eq!(tab.title, "my build");
+        assert!(tab.user_titled, "a set title is sticky");
+
+        let missing = conn
+            .tab_set_title(4242, "x")
+            .await
+            .expect_err("no such tab");
+        assert_eq!(missing.server_code(), Some(ServerCode::NotFound));
+
+        fake.refuse_next_set_title("internal", "the title store is wedged");
+        let refused = conn
+            .tab_set_title(opened.id, "second")
+            .await
+            .expect_err("the seeded refusal");
+        assert_eq!(refused.server_code(), Some(ServerCode::Internal));
+        conn.tab_set_title(opened.id, "third")
+            .await
+            .expect("a refusal is served once");
+
+        let reply = raw_call(
+            &fake,
+            "tab.set_title",
+            json!({ "tab_id": opened.id.to_string(), "title": "x", "lease": "t" }),
+        )
+        .await;
+        assert_eq!(refusal_code(&reply), ServerCode::UnknownField);
+
+        let id = json!(opened.id.to_string());
+        assert_eq!(
+            fake.set_title_calls(),
+            vec![
+                json!({ "tab_id": id, "title": "my build" }),
+                json!({ "tab_id": "4242", "title": "x" }),
+                json!({ "tab_id": id, "title": "second" }),
+                json!({ "tab_id": id, "title": "third" }),
+            ],
+            "the string-int64 id and the title, verbatim, refused calls included"
+        );
     }
 
     /// `session.set_agent_hooks` is **open to every connection** at generation 5
@@ -2156,6 +2300,15 @@ mod tests {
         assert_eq!(
             names(&mut stream).await,
             vec!["agent_report.changed".to_string()]
+        );
+
+        driver
+            .tab_set_title(opened.id, "build")
+            .await
+            .expect("set title");
+        assert_eq!(
+            names(&mut stream).await,
+            vec!["tab.title_changed".to_string()]
         );
 
         driver.tab_close(opened.id).await.expect("close");

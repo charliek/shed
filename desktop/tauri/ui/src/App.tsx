@@ -1609,7 +1609,7 @@ function LaunchAgentDialog({ sheds, machines, shedCraze, capabilities, refresh, 
   // rule: from inside the dialog, so a report made beside the JSX cannot go on
   // answering after the JSX is gone, and read from the DOM after the commit so
   // it can never claim a field the dialog does not show. That is what makes
-  // "there is no prompt field" (#366) assertable without a screenshot.
+  // "there is no prompt field" assertable without a screenshot.
   //
   // `values` (what is typed into each labelled control) and `create_enabled`
   // (the Create button's own `disabled`) are read back off the same DOM, for the
@@ -1642,12 +1642,13 @@ function LaunchAgentDialog({ sheds, machines, shedCraze, capabilities, refresh, 
     let cancelled = false;
     void import("@tauri-apps/api/event").then(async ({ listen }) => {
       uns.push(
-        await listen<{ mode?: unknown; target?: unknown; command?: unknown; workdir?: unknown }>("fill-launch", (e) => {
+        await listen<{ mode?: unknown; target?: unknown; command?: unknown; workdir?: unknown; name?: unknown }>("fill-launch", (e) => {
           const fill = e.payload ?? {};
           if (fill.mode === "agent" || fill.mode === "command") setMode(fill.mode);
           if (typeof fill.target === "string") setTarget(fill.target);
           if (typeof fill.command === "string") setCommand(fill.command);
           if (typeof fill.workdir === "string") setWorkdir(fill.workdir);
+          if (typeof fill.name === "string") setDisplayName(fill.name);
         }),
       );
       uns.push(await listen("submit-launch", () => pressCreate.current()));
@@ -1695,7 +1696,8 @@ function LaunchAgentDialog({ sheds, machines, shedCraze, capabilities, refresh, 
       }
       onLaunched();
     } catch (e) {
-      setError(String(e));
+      // A launch throws a coded `LaneFailure`; its message is the sentence.
+      setError(e instanceof Error ? e.message : String(e));
       setBusy(false);
     }
   };
@@ -1782,11 +1784,11 @@ function LaunchAgentDialog({ sheds, machines, shedCraze, capabilities, refresh, 
             target, back when a shed launch went to the hub, which typed the
             kickoff into a tmux pane; S6 retired the hub and the shed door became
             `roost.launch`, so the box was still on screen with nothing at the far
-            end — what was typed went nowhere, silently. Delivering it through
-            `tab.write` instead is `charliek/shed#366`'s job (it has to work the
-            same for every agent kind, which a blind write does not), and until
-            that lands the honest UI is to not ask. Permission mode has never had
-            a field here, for the same reason. */}
+            end — what was typed went nowhere, silently. Now the backend REFUSES
+            a launch that carries a first prompt or a permission mode
+            (`bad_request`, before any tab opens; plan 026 §3.5) rather than
+            dropping it, so the honest UI does not ask for either. The session
+            name is different: it is delivered, as the tab's title. */}
         {error && (
           <div className="rounded-md px-3 py-2 font-mono text-[12px]" style={{ background: "var(--shed-deny-bg)", color: "var(--shed-danger)" }}>{error}</div>
         )}

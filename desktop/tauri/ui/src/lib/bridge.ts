@@ -1189,12 +1189,11 @@ export type RcLaunchFields = {
 };
 
 /** Launch a session IN A SHED — the `rc.launch` alias, which is
- *  [machineLaunch] on the shed's roost host since S6. THROWS on error (the pane
- *  surfaces it) — unlike the swallowing `invoke`, because a launch failure must
- *  be shown. */
+ *  [machineLaunch] on the shed's roost host since S6. THROWS a coded
+ *  [LaneFailure] on error (the dialog shows its message) — unlike the
+ *  swallowing `invoke`, because a launch failure must be shown. */
 export async function rcLaunch(fields: RcLaunchFields): Promise<RcSession> {
-  const core = await import("@tauri-apps/api/core");
-  return core.invoke<RcSession>("rc_launch", fields);
+  return launchInvoke("rc_launch", fields);
 }
 
 export type MachineLaunchFields = {
@@ -1202,7 +1201,6 @@ export type MachineLaunchFields = {
   kind: RcKind;
   displayName?: string;
   workdir?: string;
-  permissionMode?: string;
 };
 
 /** Launch a session ON a machine. THROWS on error, like [rcLaunch].
@@ -1212,13 +1210,28 @@ export type MachineLaunchFields = {
  *  `(host, shed)` through a server. Everything downstream is the SAME `tab.open`
  *  since S6, so the two creates differ in where they land and nothing else.
  *
- *  **Neither takes a kickoff prompt.** roost's `tab.open` is an argv and a
- *  working directory; there is no typed-input channel behind either door today,
- *  which is why the launch dialog offers no prompt field
- *  (`charliek/shed#366`). */
+ *  **A launch takes a name, never a kickoff** (plan 026 §3.5). roost's
+ *  `tab.open` is an argv and a working directory. `displayName` becomes the
+ *  tab's title once it is open (`tab.set_title`; the answered row's `title` is
+ *  `"applied"`, or `"failed: <cause>"` with the tab open anyway). A first prompt
+ *  or a permission mode is REFUSED, `bad_request`, before any tab opens: neither
+ *  door can deliver one, so the dialog asks for neither, and a craze session's
+ *  create is where a first prompt goes. The failure's `code` is `bad_request`
+ *  for such a request and `action_failed` for a launch that was tried. */
 export async function machineLaunch(fields: MachineLaunchFields): Promise<RcSession> {
+  return launchInvoke("machine_launch", fields);
+}
+
+/** Invoke a launch command, THROWING its `"<code>: <message>"` error as a coded
+ *  [LaneFailure] — the `rc_launch`/`machine_launch` agreement, the lane
+ *  commands' shape. */
+async function launchInvoke(cmd: string, args: Record<string, unknown>): Promise<RcSession> {
   const core = await import("@tauri-apps/api/core");
-  return core.invoke<RcSession>("machine_launch", fields);
+  try {
+    return await core.invoke<RcSession>(cmd, args);
+  } catch (e) {
+    throw laneFailure(e);
+  }
 }
 
 export type RoostRunFields = {
@@ -1321,10 +1334,10 @@ export { agentsEmptyState, crazeOnly } from "@/lib/agentsEmpty";
  *  of what the JSX draws, and the two would drift — the failure the consent
  *  card's `rendered` was added to prevent. This cannot claim a field the dialog
  *  does not show, which is exactly the property under test: since S6 there is no
- *  initial-prompt box, because nothing would deliver what was typed into it
- *  (`charliek/shed#366`). `values` and `create_enabled` (plan 025 C3, the "Run a
- *  command" mode) keep that rule: both are read off the same mounted DOM, never
- *  restated from React state. */
+ *  initial-prompt box, because nothing would deliver what was typed into it (a
+ *  launch that carries one is refused, plan 026 §3.5). `values` and
+ *  `create_enabled` (plan 025 C3, the "Run a command" mode) keep that rule: both
+ *  are read off the same mounted DOM, never restated from React state. */
 export type LaunchDialogDump = {
   rendered: string;
   /** Each labelled control's current value, keyed by its label ("Where",

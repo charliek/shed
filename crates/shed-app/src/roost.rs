@@ -2077,11 +2077,13 @@ async fn finish<T>(reach: &dyn RoostReach, result: Result<T, RoostError>) -> Res
 /// Whether a failed request means **the wire** is suspect, rather than the
 /// request.
 ///
-/// A one-shot does not need this — it dials per call, so invalidating after any
-/// error costs it nothing. A held connection does: it is the only caller that
-/// can be told "that tab is gone" by a transport that is working perfectly, and
+/// A one-shot routed through [`finish`] does not ask — it dials per call and
+/// invalidates after any error. A held connection does: it is the caller most
+/// often told "that tab is gone" by a transport that is working perfectly, and
 /// tearing the transport down for that would make every stale tab id cost an
-/// `ssh` re-establish.
+/// `ssh` re-establish. [`tab_set_title`] asks too, for the same reason: its
+/// natural refusal (the tab closed between the open and the rename) arrives
+/// over a working, shared tunnel.
 ///
 /// Matched exhaustively on purpose: a new [`RoostError`] variant should fail to
 /// compile here rather than default into either answer.
@@ -2109,6 +2111,33 @@ fn is_transport_error(error: &RoostError) -> bool {
 pub async fn tab_open(reach: &dyn RoostReach, params: TabOpenParams) -> Result<Tab, String> {
     let mut conn = dial(reach).await?;
     finish(reach, conn.tab_open(params).await).await
+}
+
+/// `tab.set_title` — give a tab a sticky name.
+///
+/// A one-shot like [`tab_open`], and its follow-up: a `tab.open` title is a
+/// placeholder the foreground process's OSC title overwrites, so a name the user
+/// chose goes on afterwards through this (plan 026 §3.5). Its own dial rather
+/// than the open's connection, because the open is answered by then and a
+/// failed title must not cost the caller the tab it already has.
+///
+/// **Only a transport-shaped failure invalidates the reach**
+/// ([`is_transport_error`]), unlike the other one-shots' [`finish`]. A refusal
+/// roost minted — `not-found` for a tab closed between the open and the rename —
+/// is the session answering over a working wire, and the reach is SHARED: the
+/// host's watcher and its lanes ride the same tunnel, so tearing it down on the
+/// next `ensure` would cost all of them a re-establish over a rename.
+pub async fn tab_set_title(reach: &dyn RoostReach, tab_id: i64, title: &str) -> Result<(), String> {
+    let mut conn = dial(reach).await?;
+    match conn.tab_set_title(tab_id, title).await {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            if is_transport_error(&e) {
+                reach.invalidate().await;
+            }
+            Err(e.to_string())
+        }
+    }
 }
 
 /// Where a client is in ONE roost daemon's history: a revision, and the
@@ -4898,6 +4927,78 @@ mod tests {
         let gone = tab_dump(reach.as_ref(), tab.id)
             .await
             .expect_err("a closed tab leaves the list");
+        assert!(gone.contains("not-found"), "{gone}");
+    }
+
+    /// **A refused title leaves the reach alone; a dead wire invalidates it.**
+    /// The reach is shared with the host's watcher and lanes, so a `not-found`
+    /// roost minted (the tab closed between the open and the rename) — proof
+    /// the wire works — must not cost them a re-establish. A connection that
+    /// drops mid-request is the case `invalidate` exists for.
+    #[tokio::test]
+    async fn a_refused_title_keeps_the_reach_and_a_dead_wire_invalidates_it() {
+        let fake = FakeRoost::start().await;
+        let reach = FlakyReach::new(RoostEndpoint::Unix(fake.socket_path().to_path_buf()), 0);
+
+        let gone = tab_set_title(reach.as_ref(), 999_999, "x")
+            .await
+            .expect_err("no such tab");
+        assert!(gone.contains("not-found"), "{gone}");
+        fake.refuse_next_set_title("internal", "the title store is wedged");
+        tab_set_title(reach.as_ref(), TAB, "x")
+            .await
+            .expect_err("the seeded refusal");
+        assert_eq!(
+            reach.invalidations.load(Ordering::SeqCst),
+            0,
+            "a refusal roost minted is the wire working"
+        );
+
+        // A socket that takes the request and hangs up without an answer.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("hangup.sock");
+        let listener = tokio::net::UnixListener::bind(&path).expect("bind");
+        let hangup = tokio::spawn(async move {
+            use tokio::io::AsyncBufReadExt as _;
+            let (stream, _) = listener.accept().await.expect("accept");
+            let mut lines = tokio::io::BufReader::new(stream).lines();
+            let _ = lines.next_line().await;
+        });
+        let dead = FlakyReach::new(RoostEndpoint::Unix(path), 0);
+        let lost = tab_set_title(dead.as_ref(), TAB, "x")
+            .await
+            .expect_err("the connection dropped");
+        hangup.await.expect("the hang-up ran");
+        assert_eq!(
+            dead.invalidations.load(Ordering::SeqCst),
+            1,
+            "a dead wire must be rebuilt on the next ensure: {lost}"
+        );
+    }
+
+    /// `tab_set_title` names the tab on the wire roost reads (the string-int64
+    /// id and the title, verbatim), and a refusal comes back as an `Err` naming
+    /// roost's code rather than vanishing.
+    #[tokio::test]
+    async fn the_title_one_shot_names_a_tab_and_reports_a_refusal() {
+        let fake = FakeRoost::start().await;
+        let reach: Arc<dyn RoostReach> =
+            Arc::new(LocalSession::new("localhost", fake.socket_path()));
+        let tab = tab_open(reach.as_ref(), TabOpenParams::default())
+            .await
+            .expect("tab.open");
+
+        tab_set_title(reach.as_ref(), tab.id, "release notes")
+            .await
+            .expect("the tab exists");
+        assert_eq!(
+            fake.set_title_calls(),
+            vec![serde_json::json!({ "tab_id": tab.id.to_string(), "title": "release notes" })]
+        );
+
+        let gone = tab_set_title(reach.as_ref(), 4242, "x")
+            .await
+            .expect_err("no such tab");
         assert!(gone.contains("not-found"), "{gone}");
     }
 

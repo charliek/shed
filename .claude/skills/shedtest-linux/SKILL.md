@@ -158,8 +158,11 @@ exercise.
 
 **Driving the New-session dialog's "Run a command" mode** (plan 025 C3, `roost.run`). The mode
 is reachable only by typing and clicking, so it has TEST-MODE-ONLY doors beside
-`ui.show_launch`: `ui.fill_launch {mode?, target?, command?, workdir?}` types into the open
-dialog and `ui.submit_launch` presses Create through the button's own gate. The fill is an
+`ui.show_launch`: `ui.fill_launch {mode?, target?, command?, workdir?, name?}` types into the
+open dialog (`name` is the agent mode's Session name, which a launch sets as the tab's title
+with `tab.set_title` — both fakes record those as `title_calls` / `set_title_calls()`, and
+`refuse_next_set_title` fails one) and `ui.submit_launch` presses Create through the button's
+own gate. The fill is an
 event to a listener the dialog registers AFTER it mounts, so one sent the instant
 `ui.show_launch` returns can land on nobody — re-send it (it is idempotent) until
 `launch.dump`'s `values` / `create_enabled` show it, as `test_tauri_machines.py`'s dialog cell
@@ -653,6 +656,18 @@ deliver — neither of which a screenshot can be made to fail on.
   `env -u WAYLAND_DISPLAY -u DISPLAY XDG_SESSION_TYPE=x11 xvfb-run -a --server-args="-screen 0 1400x900x24" make -C desktop e2e-tauri`
   — and kill any `shed-desktop-tauri` the run leaves behind BY PID (`ps -o pid,ppid,lstart,args
   -C shed-desktop-tauri`), never one the owner started.
+- **A `#[tauri::command]` drops every invoke key it does not declare, silently** → the
+  frontend (or a harness) sending `permissionMode` to a command without a `permission_mode`
+  parameter gets the command run as if the key were absent — no error anywhere. A command's
+  argument shape is testable only above its body: drive it through Tauri's mock runtime
+  (`tauri::test::mock_builder` + `get_ipc_response`; the crate's dev-dependency turns on
+  tauri's `test` feature, which adds no package), as `src/launch_command_tests.rs` does.
+- **Run a subset of tauri modules in collection (alphabetical) order** →
+  `test_tauri_machines.py`'s self-managed apps `ui.quit("tauri")` the session app and do not
+  bring it back, so a module named AFTER it on the command line errors at setup with
+  `FileNotFoundError` from `client.py`'s `connect` (the session socket is gone). A full run is
+  fine — it sorts last — but `pytest test_tauri_machines.py test_tauri.py -k …` is not; list it
+  last.
 - **WebKitGTK web-process dies / JS never runs** → the render gate needs
   `--cap-add SYS_ADMIN --security-opt seccomp=unconfined` (already in the target) so WebKitGTK's
   bubblewrap sandbox can create user namespaces Docker's default seccomp blocks.

@@ -411,7 +411,8 @@ class TauriClient(_ApprovalOps, _RcOps, _RustCoreClient):
 
         `rendered` is its DOM text rather than a list of fields, so it cannot
         claim a field the dialog does not show — which is what makes the ABSENCE
-        of one assertable (there is no initial-prompt box: charliek/shed#366).
+        of one assertable (there is no initial-prompt box: a launch carrying a
+        prompt is refused, plan 026 §3.5).
         `values` is each labelled control's current value keyed by its label
         (what was typed is not text content), and `create_enabled` is the Create
         button's own `disabled`, inverted — both read off the same DOM."""
@@ -420,7 +421,8 @@ class TauriClient(_ApprovalOps, _RcOps, _RustCoreClient):
     def fill_launch(self, **fields: str) -> None:
         """Type into the open New-session dialog — `mode` (`agent` | `command`),
         `target` (a `Where` value: `machine:<name>` or `shed:<host>/<name>`),
-        `command`, `workdir`; an absent key is left as it is. TEST MODE ONLY.
+        `command`, `workdir`, `name` (the agent mode's Session name); an absent
+        key is left as it is. TEST MODE ONLY.
 
         An event to a dialog that registers its listener after it mounts, so a
         fill sent the instant `ui.show_launch` returns can land before anyone is
@@ -499,8 +501,9 @@ class TauriClient(_ApprovalOps, _RcOps, _RustCoreClient):
                        workdir: str | None = None, display_name: str | None = None,
                        initial_prompt: str | None = None) -> dict:
         """Open a session ON a machine — a roost `tab.open` of the kind's argv in
-        `workdir`. `display_name`/`initial_prompt` are accepted and unused in M1
-        (kickoff is argv + cwd until the provider script lands)."""
+        `workdir`. A non-blank `display_name` becomes the tab's title (the answer's
+        `title` says whether it took); a non-blank `initial_prompt` is refused
+        `bad_request` before any tab opens (plan 026 §3.5)."""
         params: dict = {"machine": machine, "kind": kind}
         for k, v in (("workdir", workdir), ("display_name", display_name),
                      ("initial_prompt", initial_prompt)):

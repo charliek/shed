@@ -519,6 +519,8 @@ verbatim._
 - The desktop stops its ssh forwards, bridges and connection masters when it quits, on
   SIGTERM/SIGINT/SIGHUP, and on macOS quit or logout. craze sessions keep running.
 - The Hosts badge no longer flickers to 0 after a refresh.
+- A launched tab takes the dialog's display name; a launch with a first prompt or permission
+  mode is refused instead of silently ignored.
 - **The lane contract splits into a machine-level source and a session-scoped lane** (plan
   025 C4, `charliek/shed#391`). `shed_core::lane::AgentLane` was server-scoped, with static
   capabilities and a `create` no client called. It is now an `AgentSource` (`subscribe` to

@@ -138,6 +138,12 @@ shed-opencode = { path = "../../../crates/shed-opencode", features = ["test-supp
 # cells drive (the host-removal races, the fold, the eviction hooks), and the
 # recipe's skip-or-require rule. Same feature-only switch as the two above.
 shed-craze = { path = "../../../crates/shed-craze", features = ["test-support"] }
+# `tauri::test` — the mock runtime, so a test drives a `#[tauri::command]` through
+# Tauri's own argument extraction (plan 026 §3.5: an argument a command does not
+# declare is dropped without a word, and only that layer can show it). `test = []`
+# in tauri's manifest: no package is added to the lock, and the shipped binary
+# never compiles it (a dev-dependency feature reaches test builds only).
+tauri = { version = "2", features = ["test"] }
 
 # A debug build is what the harness drives; keep it reasonably snappy.
 #

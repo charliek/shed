@@ -311,6 +311,14 @@ fn run_command(params: &Value) -> Result<crate::roost_hosts::RunCommand, (String
         .map_err(|m| err("bad_request", m))
 }
 
+/// A [`LaunchError`](crate::roost_hosts::LaunchError) as the socket's error
+/// pair: `bad_request` for a request a roost launch refuses, `action_failed`
+/// for one it tried — the same codes the `rc_launch`/`machine_launch` commands
+/// put in front of their error string.
+fn launch_failure(e: crate::roost_hosts::LaunchError) -> (String, String) {
+    err(e.code(), e.message())
+}
+
 /// The one gate + router behind the New-session dialog's two driver doors
 /// (`ui.fill_launch` / `ui.submit_launch`, plan 025 C3): the event name and
 /// payload to emit, or the refusal.
@@ -323,9 +331,10 @@ fn run_command(params: &Value) -> Result<crate::roost_hosts::RunCommand, (String
 /// something a shipped app needs anyone to do; the production door onto the
 /// same backend is `roost.run`.
 ///
-/// `ui.fill_launch {mode?, target?, command?, workdir?}` sets those controls
-/// the way a person would (an absent key is left as it is); `mode` is `agent`
-/// (the kind picker) or `command` (the Command field). `ui.submit_launch`
+/// `ui.fill_launch {mode?, target?, command?, workdir?, name?}` sets those
+/// controls the way a person would (an absent key is left as it is); `mode` is
+/// `agent` (the kind picker) or `command` (the Command field), and `name` is the
+/// agent mode's Session name. `ui.submit_launch`
 /// presses Create, through the same gate the button has — a dialog that would
 /// not let a person submit does not let this door either.
 fn launch_door(
@@ -339,7 +348,7 @@ fn launch_door(
     match op {
         "ui.fill_launch" => {
             let mut fill = serde_json::Map::new();
-            for key in ["mode", "target", "command", "workdir"] {
+            for key in ["mode", "target", "command", "workdir", "name"] {
                 match params.get(key) {
                     None | Some(Value::Null) => {}
                     Some(Value::String(s)) => {
@@ -1454,10 +1463,10 @@ impl Handler {
     /// last report.
     ///
     /// It exists for the fields that are NOT there. Since S6 the dialog offers
-    /// no initial-prompt box — roost's `tab.open` is an argv and a cwd, and
-    /// delivering typed input is `charliek/shed#366` — and "the UI does not ask
-    /// for something it would silently drop" is only assertable against what was
-    /// actually painted.
+    /// no initial-prompt box — roost's `tab.open` is an argv and a cwd, and a
+    /// launch that carries a prompt is refused (plan 026 §3.5) — and "the UI does
+    /// not ask for something it cannot deliver" is only assertable against what
+    /// was actually painted.
     fn launch_dump(&self) -> Value {
         json!({ "launch": self.ui_get("launch_dialog").unwrap_or(Value::Null) })
     }
@@ -1499,8 +1508,11 @@ impl Handler {
     /// the two apart while that was true. Now there is one launch path, and
     /// [`Self::rc_launch`] is a second door onto it, held open for 0.9.x.
     ///
-    /// The full param set is still accepted; only `kind` and `workdir` reach
-    /// roost in M1 (see [`crate::roost_hosts::RoostHosts::launch`]).
+    /// `kind` and `workdir` are the `tab.open`, and a `display_name` is set as
+    /// the tab's title after it (the row's `title` says whether it took); an
+    /// `initial_prompt` or `permission_mode` is refused `bad_request` before any
+    /// tab opens, and a launch that was tried and failed is `action_failed`
+    /// ([`crate::roost_hosts::RoostHosts::launch`] has the rule, plan 026 §3.5).
     async fn roost_launch(&self, params: &Value) -> Result<Value, (String, String)> {
         let target = match params.get("target").and_then(Value::as_str) {
             Some(target) => target.to_string(),
@@ -1514,11 +1526,14 @@ impl Handler {
                 &kind,
                 opt("display_name"),
                 opt("workdir"),
-                opt("permission_mode"),
-                opt("initial_prompt"),
+                // TYPED, unlike the fields above: a first prompt or a mode in
+                // some other JSON shape is still one, and reading it as absent
+                // would drop it silently (plan 026 §3.5).
+                opt_str(params, "permission_mode")?,
+                opt_str(params, "initial_prompt")?,
             )
             .await
-            .map_err(|e| err("action_failed", e))
+            .map_err(launch_failure)
     }
 
     /// `roost.run {target | machine, command, workdir?}` → the tab it opened: a
@@ -1895,8 +1910,10 @@ impl Handler {
         Ok(format!("roost:{server}/{shed}"))
     }
 
-    /// `rc.launch {shed, kind, host?, display_name?, workdir?, initial_prompt?}` →
-    /// the opened row.
+    /// `rc.launch {shed, kind, host?, display_name?, workdir?, permission_mode?,
+    /// initial_prompt?}` → the opened row, under [`Self::roost_launch`]'s rule:
+    /// a name is set as the tab's title, a first prompt or a permission mode is
+    /// refused `bad_request`.
     ///
     /// **An ALIAS for [`Self::roost_launch`] since S6** (`charliek/shed#328`),
     /// kept for 0.9.x: it is the same `tab.open` on the same host, addressed by
@@ -1915,11 +1932,14 @@ impl Handler {
                 &kind,
                 opt("display_name"),
                 opt("workdir"),
-                opt("permission_mode"),
-                opt("initial_prompt"),
+                // TYPED, unlike the fields above: a first prompt or a mode in
+                // some other JSON shape is still one, and reading it as absent
+                // would drop it silently (plan 026 §3.5).
+                opt_str(params, "permission_mode")?,
+                opt_str(params, "initial_prompt")?,
             )
             .await
-            .map_err(|e| err("action_failed", e))
+            .map_err(launch_failure)
     }
 
     /// `rc.kill {shed, slug, host?}` → close the shed's roost tab.
@@ -2898,6 +2918,33 @@ mod tests {
                 .expect_err("not text")
                 .0,
             "bad_request"
+        );
+        // The agent mode's Session name travels too (plan 026 §3.5's cell types
+        // one): it is the box a display name comes from.
+        let named = json!({ "mode": "agent", "target": "machine:mini3", "name": "My run" });
+        assert_eq!(
+            launch_door(&test, "ui.fill_launch", &named).unwrap(),
+            ("fill-launch", named.clone())
+        );
+    }
+
+    /// **Both launch codes, at the socket** (plan 026 §3.5): a request a roost
+    /// launch refuses is `bad_request`, and only a launch that was tried and
+    /// failed is `action_failed` — the distinction a caller acts on (fix the
+    /// request, or retry the host). The message is the refusal's, untouched.
+    #[test]
+    fn a_launch_error_keeps_its_code_at_the_socket() {
+        use crate::roost_hosts::LaunchError;
+        assert_eq!(
+            launch_failure(LaunchError::BadRequest("no prompts here".into())),
+            ("bad_request".to_string(), "no prompts here".to_string())
+        );
+        assert_eq!(
+            launch_failure(LaunchError::Failed("machine:mini3: unreachable".into())),
+            (
+                "action_failed".to_string(),
+                "machine:mini3: unreachable".to_string()
+            )
         );
     }
 
