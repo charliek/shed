@@ -9,7 +9,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { agentsEmptyState } from "../dist-test/agentsEmpty.js";
+import { agentsEmptyState, crazeOnly } from "../dist-test/agentsEmpty.js";
 
 /** The bootstrap offer, which exactly one of the four states may make. */
 const OFFER = "Set up a roost-session";
@@ -67,4 +67,45 @@ test("loading and failed win over the machine list", () => {
   const machines = [{ reachable: false }];
   assert.equal(agentsEmptyState(machines, "loading", null).state, "loading");
   assert.equal(agentsEmptyState(machines, "failed", "boom").state, "failed");
+});
+
+// ---- a host listed by craze alone (plan 026 §3.2) --------------------------
+
+/** A shed a create (or its first craze `Ready`) listed, with no roost watcher
+ *  and no roost inventory. */
+const crazeListedShed = (state) => ({
+  roost_watched: false, reachable: false, connected_once: false, craze: { state },
+});
+
+test("CONTROL: a shed listed by craze alone is craze only, whatever its craze phase", () => {
+  for (const state of ["live", "dormant", "offline"]) {
+    assert.equal(crazeOnly(crazeListedShed(state)), true, state);
+  }
+  assert.equal(crazeOnly(crazeListedShed("absent")), false, "no craze source: not craze only");
+  assert.equal(crazeOnly({ ...crazeListedShed("live"), craze: null }), false);
+  assert.equal(crazeOnly({ ...crazeListedShed("live"), reachable: true }), false, "roost answers");
+  assert.equal(crazeOnly({ ...crazeListedShed("live"), connected_once: true }), false,
+    "roost answered once: unreachable, not craze only");
+});
+
+test("CONTROL: a host whose roost is watched is not craze only before its first inventory", () => {
+  // The C2 review's P2: the shed's roost answered and a watcher runs, but its
+  // first inventory has not landed (`connected_once` false) when its craze
+  // reaches Ready — "no roost session here yet" would be false.
+  const watched = { ...crazeListedShed("live"), roost_watched: true };
+  assert.equal(crazeOnly(watched), false);
+  // A machine is watched from the start (configured, or the implicit
+  // localhost): "connecting" and "unreachable" stay its words.
+  assert.equal(crazeOnly({ ...crazeListedShed("dormant"), roost_watched: true }), false);
+  // An old payload with no flag reads as unwatched.
+  const { roost_watched: _drop, ...legacy } = crazeListedShed("live");
+  assert.equal(crazeOnly(legacy), true);
+});
+
+test("CONTROL: a host listed by craze alone does not make the pane unreachable", () => {
+  const down = { reachable: false, roost_watched: true, connected_once: true, craze: { state: "absent" } };
+  assert.equal(agentsEmptyState([down, down], "ready", null).state, "unreachable");
+  const withCraze = agentsEmptyState([down, crazeListedShed("live")], "ready", null);
+  assert.equal(withCraze.state, "empty", "the craze-only shed is somewhere the pane can see");
+  assert.equal(agentsEmptyState([crazeListedShed("dormant")], "ready", null).state, "empty");
 });

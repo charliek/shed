@@ -88,7 +88,7 @@ guest binary and the hub are gone.)
 
 | op | params | result |
 |----|--------|--------|
-| `rc.list` | `host?`, `shed?` | `{sessions, capabilities, machines}` |
+| `rc.list` | `host?`, `shed?` | `{sessions, capabilities, machines, shed_craze}` — `shed_craze` lists the unlisted sheds craze is offered on (below) |
 | `rc.launch` | `host?`, `shed`, `kind?`, `display_name?`, `workdir?`, `initial_prompt?` | the opened row — an **alias** for `roost.launch` on `roost:<host>/<shed>`, kept for 0.9.x |
 | `rc.kill` | `host?`, `shed`, `slug` | `{}` — a roost `tab.close`; the slug IS the tab id, and must be one THIS host lists (ids are per-host, so one copied from elsewhere would close an unrelated tab) |
 | `machines.list` | — | `machines[]` — every configured machine's health, name-ordered, each with its `craze` source's state (below) |
@@ -147,9 +147,12 @@ Machine sessions appear in `rc.list` beside shed sessions, each stamped with
 slug would collide into one row. `machines.list` is separate from
 `rc.list` because a machine is worth showing even when it has no sessions and cannot be
 reached: that row IS the information ("mini3 is asleep"), and a sessions-only payload has
-nowhere to put it. Each entry carries `{name, origin, reachable, connected_once, sessions,
-detail?}`, where `detail` is why it is unreachable — verbatim, because "no route to host"
-and "nothing is listening" need different fixes.
+nowhere to put it. Each entry carries `{name, origin, reachable, connected_once, roost_watched,
+sessions, detail?}`, where `detail` is why it is unreachable — verbatim, because "no route to host"
+and "nothing is listening" need different fixes — and `roost_watched` says a roost watcher runs
+for the host: a configured machine's and the implicit `localhost`'s from the start, a shed's once
+its roost answered `session.identify`, which is before its first inventory sets
+`connected_once`.
 
 Unreachable is a first-class state, not an error: a machine that is asleep, off-network, or
 simply not running a `roost-session` is the everyday case, and it must never fail the
@@ -223,13 +226,35 @@ A machine whose craze is too old says so on its Machines-pane card ("craze on th
 too old for shed; update it", `machines.dump`'s `craze_note`); a machine without craze says
 nothing.
 
+**A running shed is offered craze before it is listed.** A shed has a status row only once
+something answers there — its roost-session, or its craze hub (the roster's first `Ready`, or a
+session created there). Before that, a running shed whose probe proved craze there is an entry
+of `rc.list`'s `shed_craze`, read under the same lock as the status rows, so a host is never
+both:
+
+| field | meaning |
+|-------|---------|
+| `name`, `label`, `origin`, `kind` | the status row's identity fields (`name` is the address, `roost:<server>/<shed>`) |
+| `craze` | the same object a status row carries: `state` is `dormant` (offered New craze session on the shed's Sheds-pane row and in "Where"; opening the sheet starts its hub) or `offline` with `cause: too_old` (its row shows the too-old note) |
+
+A shed whose craze is not installed, that the probe cannot reach, or that has not been probed
+yet has no entry. The probe stays find-only: nothing dials `bridge --hub` there until the sheet
+opens. `shed_craze` honours `rc.list`'s `{host, shed}` filter as the status rows do, and a
+change of the entry (dormant ↔ too old ↔ none, the shed stopping or being deleted) pushes the
+UI's re-read; a repeated probe that says the same thing does not. A host listed by craze alone
+— a listed status row with `roost_watched: false`, `connected_once: false` and a craze source —
+reads `craze only` (`machines.dump`'s `status`, and the sidebar's); a shed whose roost answered
+but whose first inventory has not arrived is watched, and reads as before.
+
 #### Creating a craze session, and Open in terminal
 
-A machine offers **New craze session** (its Machines-pane card, its group in the Agents pane,
-and a "— new craze session" entry in the New-session dialog's "Where") when its craze is
-**live** and its hub can list providers and create, or when it is **dormant** — opening the
-sheet is then the explicit action that starts its hub. A live hub that cannot create shows
-"update craze on this machine to create sessions here"; listing still works.
+A host offers **New craze session** when its craze is **live** and its hub can list providers
+and create, or when it is **dormant** — opening the sheet is then the explicit action that
+starts its hub. A dormant **machine** offers it on its Machines-pane card (and its group in the
+Agents pane); a dormant **shed** offers it on its Sheds-pane row (`shed_craze`, above); each is
+a "— new craze session" entry in the New-session dialog's "Where". A shed shows in the Machines
+pane once its roost answers or it has a hub. A live hub that cannot create shows "update craze
+on this machine to create sessions here"; listing still works.
 
 | op | params | result |
 |----|--------|--------|
@@ -318,7 +343,8 @@ backend's view — the two can disagree, and have.
 | `launch.dump` | while the New-session dialog is open | `{launch}` — `{rendered, values, create_enabled}`, `null` when none is mounted: the dialog's own rendered text, each labelled control's current value keyed by its label (what was typed is not text content), and whether its Create button is enabled — all three read off the mounted DOM |
 | `egress.profiles` | on the Egress pane | `{egress}` |
 | `machines.dump` | on the Machines pane | `{machines}` — a row per machine with its `status` word, `detail` line, and grouped session slugs, plus its `craze_note`: the note the card renders about the machine's craze ("craze on this machine is too old for shed; update it", or for a live hub that cannot create "update craze on this machine to create sessions here"), `null` when it says nothing — a machine without craze is not a problem to report — and `craze_create`: whether the card offers New craze session |
-| `sidebar.dump` | **always** | `{servers, machines}` — the sidebar's status foot |
+| `sidebar.dump` | **always** | `{servers, machines}` — the sidebar's status foot; each machine row is `{name, origin, status, note, tone}`, `tone` its dot: `ok`, `pending` (still connecting), `off`, or `neutral` (listed by craze alone, `craze only`) |
+| `shed_roost.dump` | on the Sheds pane | `{sheds}` — each RUNNING shed's row by its `roost:<server>/<shed>` target: its roost line (`status`, `button`, `busy`, `error`, `rendered`), and its craze: `craze_create` (whether the row shows New craze session) and `craze_note` (the too-old note it shows, else `null`) — read off the row |
 | `craze_create.dump` | while the craze create sheet is open | `{craze_create}` — what the sheet rendered: `machine`; `state` (`loading` \| `failed` (the options) \| `idle` \| `submitting` \| `refused` \| `unknown` \| `created`); `providers[]` — `{id, label, state, dimmed, selected, reason, fix}`, a non-ready one dimmed and never selectable — except the provider of a kept request id being replayed, which stays `selected` whatever its state (one the re-read no longer lists is a row of its own, `state: "absent"`); `preselected` (the default provider when listed and ready, else the first ready one) and `default_provider`; `recent_dirs`; `values` (the typed "Directory" and "First prompt"); the `request_id` it holds (only while a submission is in flight or its outcome is unknown); its `note` (offline / too old / not installed; else, while a kept request id is replayed, the unknown outcome and "Changing the form starts a new request instead."; else "no provider is ready on this machine"); the `error` as shown (`{code, message, where, text}`), a start failure's `cause` verbatim, the directory's own `cwd_problem`; `create_enabled` and the `primary` button's label (Create, Try again, Creating…) — read off the mounted DOM; `null` when none is mounted |
 | `lane.dump` | while the transcript panel is open | `{lane}` — what the panel rendered: its rows, approval cards, `kind` badge (and `lane_kind`, the kind it was opened with), the `permission` line (`bypass` reads "runs tools without asking"), Interject toggle, `can_cancel` and `stop` (`{confirming}`, or `null` with no Stop button) — all read off `lane.messages`' `capabilities`; Cancel, Interject and Stop exist only when the capabilities offer them, and Cancel/Interject are live only while the session is working — `settings_chip` (the header's `<model name> · <effort value> · fast`, from the current values; `null` — no chip — when the capabilities do not say `settings`), `stale`, `ended`, and its error; `null` when none is mounted |
 | `lane_settings.dump` | while the settings sheet is open | `{lane_settings}` — what the sheet rendered: its `machine`, `session_id`, `lane_kind` and `chip`; `rows[]` in render order (the model, the current model's options, the mode) — `{id, kind, name, category, control, current, current_name, values: [{id, name, selected}], state, text, enabled}`, where `control` is `list` (the model, and any row of more than four values) or `segmented`, `state` is `pending` (craze has not answered; the row takes no press), `refused` (`text` the refusal shown inline — "the model changed; try again" on an option whose model moved under it) or `not_confirmed` (the answer was lost; until the session's next settings), else `null`; and `usage` (`{tokens, window, percent, text}`, the context meter, when the session reports both) — `null` when none is open |
@@ -345,8 +371,9 @@ mode only** — `ui.fill_launch {mode?, target?, command?, workdir?}` types into
 absent key is left as it is) and `ui.submit_launch` presses Create, through the button's own
 gate. They exist because the "Run a command" mode is reachable only by typing and clicking;
 outside test mode both answer `not_enabled`, and the production door onto the same backend is
-`roost.run`. A `craze:<machine>` target (a machine that offers New craze session) leads on to
-the craze create sheet: its button reads Continue.
+`roost.run`. A `craze:<machine>` target (a host that offers New craze session — a machine, or
+a dormant shed, by its address) leads on to the craze create sheet: its button reads Continue.
+`ui.close_launch` closes the dialog (its Escape or Cancel).
 
 The craze create sheet is opened by `ui.show_craze_create {machine}` (the New craze session
 action, a click; opening it reads `craze.create_options`, so on a dormant machine it starts the

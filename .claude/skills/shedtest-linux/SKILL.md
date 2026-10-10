@@ -287,6 +287,34 @@ SHED_CRAZE_REQUIRE=1 SHED_CRAZE_BIN_DIR=/work/desktop/tools/shedtest/.craze-bin 
   `LaneFailure` has a message WITHOUT the code, and re-splitting it read `outcome_unknown` as
   `failed`. `laneFailure` now returns a `LaneFailure` unchanged.
 
+### A running shed's craze — offer, don't list (plan 026 C2)
+
+- **`app_shed` is the shed instance**: a PRIVATE `MockShedServer` (so the session mock's
+  per-test reset never touches it) lists four sheds running under
+  `fixtures/config-craze-shed.yaml` (one server, NO machines — a configured machine's
+  unreachable backoff would repaint the listing and mask a "no repaint" control). A shed's ssh
+  user is its NAME, so each shed is its own jail of the same fake `ssh` (`Remote(bins,
+  jails=SHED_JAILS)`). None runs roost (the fake answers `client-bridge` `command not found`),
+  so only craze can list one; until then it is `rc.list`'s `shed_craze`, read on screen through
+  `shed_roost.dump`'s `craze_create`/`craze_note` and `launch.dump`'s rendered "Where".
+- **Two switches in a JAIL's root**: `probe-127` makes the find-only probe exit 127 (not
+  installed); `hold-roster` (content N) holds the (N+1)-th `bridge --hub` of that jail until
+  the switch goes, recording the held record's name in `held` — `1` holds the roster's bridge
+  behind the sheet's, so the sheet can be asserted while the shed is still unlisted. A held
+  bridge's `hello` times out at 30 s: assert inside that.
+- **The recorded pid is the bridge** (`Remote.records(user)` / `live_bridges(user)`, pids under
+  `<root>/pids/`): the fake EXECs a craze command, because dash does NOT exec the last
+  command of `sh -c` — without it the pid is an outer `/bin/sh` whose death leaves the craze
+  bridge (and its pipes) alive, and the app never sees the connection end. The remote command
+  arrives per-argument single-quoted (`'sh' '-c' '…'`), so a `case` on `sh -c *` never
+  matches; match `"'sh' '-c' "*`.
+- `commands(user)` is sorted by mktemp name (random), not time: use `records(user)` (by mtime)
+  for ORDER ("the first `bridge --hub` is the sheet's").
+- A dormant probe re-runs every 30 s, and so does a not-installed one: a cell that flips
+  `probe-127` waits ~45 s each way. Without a fresh `rc.list` re-read (a `refresh` event) the UI
+  keeps its last listing — `ui.show_launch` re-reads on mount, so open the dialog FIRST when a
+  control must reach a later assertion. `ui.close_launch` closes it.
+
 ### The settings sheet (plan 025 C11)
 
 - **Drive it through its doors**: `ui.show_lane_settings {machine, kind, session_id}` mounts

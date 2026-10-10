@@ -10,7 +10,7 @@ and `craze-0.0.1` (the real v0.0.1, for the too-old cell). They come from
 `SHED_CRAZE_REQUIRE=1` (CI) it FAILS instead, so a run can never go green on
 skipped craze cells.
 
-Three independent app instances (`test_tauri_lane.py`'s fixture shape — each
+Four independent app instances (`test_tauri_lane.py`'s fixture shape — each
 its own throwaway HOME/XDG_RUNTIME_DIR, so its own socket and single-instance
 lock, the session app untouched):
 
@@ -36,6 +36,11 @@ lock, the session app untouched):
   `ssh` that runs each remote command in a per-machine jail and RECORDS every
   command — and refuses (and records) any command naming an absolute ladder
   rung, so the jailed composition is asserted without ever running one.
+* `app_shed` (plan 026 §3.2) — no local craze and no machines: one server,
+  served by a PRIVATE mock that lists four sheds running, each reached
+  through the same fake `ssh` in a jail of its own (a shed's ssh user is its
+  name) and none running a roost-session — the running sheds a dormant craze
+  is offered on without listing them.
 
 **Every craze process is torn down** at module end by its program path (each
 rig's private copies, never this host's own craze), checked just before each
@@ -65,6 +70,7 @@ from client import ShedError, TauriClient, scaled_timeout
 from fake_host_agent import FakeHostAgent
 from fake_opencode import FakeOpencode
 from fake_roost import FakeRoost
+from mockserver import MockShedServer
 
 pytestmark = pytest.mark.skipif(
     os.environ.get("SHED_TEST_TARGET", "mac") != "tauri",
@@ -472,7 +478,7 @@ class Bridge:
 
 
 def _launch(mock, *, runtime_dir: Path, craze: CrazeEnv | None, roost: FakeRoost | None,
-            ssh_bin: Path | None = None):
+            ssh_bin: Path | None = None, config: Path = FIXTURES / "config-craze.yaml"):
     """An independent app instance (`test_tauri_lane.py`'s shape): its own
     HOME/XDG_RUNTIME_DIR, its own fake host-agent, the session app untouched."""
     cfg = ui._SUBPROC["tauri"]
@@ -484,7 +490,7 @@ def _launch(mock, *, runtime_dir: Path, craze: CrazeEnv | None, roost: FakeRoost
     log = runtime_dir / "craze-ui.log"
     env = ui.subproc_env(
         cfg, runtime_dir=runtime_dir, mock_base_url=mock.base_url,
-        config_path=FIXTURES / "config-craze.yaml", host_agent_socket=agent.socket_path,
+        config_path=config, host_agent_socket=agent.socket_path,
         roost_sockets={LOCAL: roost.socket_path} if roost else None,
         ssh_bin=ssh_bin,
         craze_path=craze.path_dir if craze else None,
@@ -1705,7 +1711,16 @@ def _fake_ssh(root: Path) -> str:
       craze command and is left alone.)
     * Everything else runs as `/bin/sh -c "$cmd"` under exactly the jail's
       `HOME`, `CRAZE_HOME`, `CRAZE_RUNTIME_DIR` and `PATH` (its own `bin`,
-      which holds `sh` beside `craze`).
+      which holds `sh` beside `craze`). A craze command (one `'sh' '-c' '…'`:
+      the ladder, which `exec`s craze) is EXEC'd, so the process this fake ssh is
+      becomes the craze process itself: its recorded pid (`pids/<record>`) is
+      the bridge, and signalling it ends the connection the way a dropped ssh
+      would (plan 026 §3.2).
+    * Two switches in the JAIL's root (plan 026 §3.2): `probe-127` makes the
+      find-only probe exit 127 (the ladder's not-found) before running
+      anything; `hold-roster` (its content a number N) holds the (N+1)-th
+      `bridge --hub` of that jail — recording its record's name in `held` —
+      until the switch is removed, and lets every other one through.
     """
     return f"""#!/bin/sh
 set -u
@@ -1748,6 +1763,7 @@ case "$cmd" in
 esac
 rec=$(mktemp "$root/cmds/$user.XXXXXX")
 printf '%s' "$cmd" > "$rec"
+printf '%s' "$$" > "$root/pids/${{rec##*/}}"
 if [ "$refuse" -eq 1 ]; then
     printf '%s\\n' 'fake ssh: refused a craze command naming an absolute rung' >&2
     exit 255
@@ -1763,34 +1779,90 @@ if [ ! -d "$jail" ]; then
     printf '%s\\n' "ssh: Could not resolve hostname $dest" >&2
     exit 255
 fi
+case "$cmd" in
+  *"providers --hub --json"*)
+    if [ -e "$jail/probe-127" ]; then
+        printf '%s\\n' 'sh: 1: craze: not found' >&2
+        exit 127
+    fi
+    ;;
+  *"bridge --hub"*)
+    if [ -e "$jail/hold-roster" ]; then
+        n=$(grep -l -F 'bridge --hub' "$root/cmds/$user".* 2>/dev/null | wc -l)
+        pass=$(cat "$jail/hold-roster")
+        if [ "$n" -eq $((pass + 1)) ]; then
+            printf '%s' "${{rec##*/}}" > "$jail/held"
+            while [ -e "$jail/hold-roster" ]; do sleep 0.1; done
+        fi
+    fi
+    ;;
+esac
+case "$cmd" in
+  "'sh' '-c' "*craze*|"sh -c "*craze*) exec env -i HOME="$jail/h" CRAZE_HOME="$jail/ch" CRAZE_RUNTIME_DIR="$jail/r" \\
+      PATH="$jail/bin" /bin/sh -c "exec $cmd" ;;
+esac
 exec env -i HOME="$jail/h" CRAZE_HOME="$jail/ch" CRAZE_RUNTIME_DIR="$jail/r" \\
     PATH="$jail/bin" /bin/sh -c "$cmd"
 """
 
 
-class Remote:
-    """The remote module rig: a fake `ssh`, and one jail per machine — each a
-    `CrazeEnv` whose `bin` also holds `sh` (the remote command is `sh -c …`)."""
+#: The remote machines' jails: `(user, kind)` — `kind` as `CrazeEnv` takes it.
+MACHINE_JAILS = (("craze-dormant", "recipe"), ("craze-live", "recipe"), ("craze-old", "old"))
 
-    def __init__(self, bins: Path):
-        self.root = Path(tempfile.mkdtemp(prefix="shcr-", dir="/tmp")).resolve()
+
+class Record:
+    """One remote command the fake ssh recorded: its record's name, its text,
+    the pid the fake ssh ran as, and when it was recorded."""
+
+    def __init__(self, path: Path, pids: Path):
+        self.name = path.name
+        self.text = path.read_text()
+        pid = pids / path.name
+        self.pid = int(pid.read_text()) if pid.exists() and pid.read_text().isdigit() else 0
+        self.at = path.stat().st_mtime_ns
+
+    def __repr__(self) -> str:
+        return f"Record({self.name}, pid={self.pid}, {self.text[-40:]!r})"
+
+
+class Remote:
+    """The remote module rig: a fake `ssh`, and one jail per machine (or shed:
+    a shed's ssh user is its name) — each a `CrazeEnv` whose `bin` also holds
+    `sh` (the remote command is `sh -c …`)."""
+
+    def __init__(self, bins: Path, jails=MACHINE_JAILS, prefix: str = "shcr-"):
+        self.root = Path(tempfile.mkdtemp(prefix=prefix, dir="/tmp")).resolve()
         _mkdir_0700(self.root / "cmds")
+        _mkdir_0700(self.root / "pids")
         _mkdir_0700(self.root / "jails")
         self.jails: dict[str, CrazeEnv] = {}
-        for name, kind in (("craze-dormant", "recipe"), ("craze-live", "recipe"),
-                           ("craze-old", "old")):
+        for name, kind in jails:
             jail = self.root / "jails" / name
             env = CrazeEnv(bins, _mkdir_0700(jail), jail / "h", kind=kind)
             os.symlink("/bin/sh", env.path_dir / "sh")
             self.jails[name] = env
         # The dormant jail's sentinel: an absolute rung under ITS HOME.
         self.sentinel_log = self.root / "sentinel.log"
-        _write_exec(self.jails["craze-dormant"].home / ".nix-profile" / "bin" / "craze",
-                    f"#!/bin/sh\necho ran >> '{self.sentinel_log}'\nexit 2\n")
+        if "craze-dormant" in self.jails:
+            _write_exec(self.jails["craze-dormant"].home / ".nix-profile" / "bin" / "craze",
+                        f"#!/bin/sh\necho ran >> '{self.sentinel_log}'\nexit 2\n")
         self.ssh = _write_exec(self.root / "ssh", _fake_ssh(self.root))
 
     def commands(self, user: str) -> list[str]:
         return [p.read_text() for p in sorted((self.root / "cmds").glob(f"{user}.*"))]
+
+    def records(self, user: str) -> list[Record]:
+        """Every command `user`'s jail was sent, in the order recorded."""
+        recs = [Record(p, self.root / "pids") for p in (self.root / "cmds").glob(f"{user}.*")]
+        return sorted(recs, key=lambda r: (r.at, r.name))
+
+    def live_bridges(self, user: str) -> list[int]:
+        """The recorded pids of `user`'s `bridge --hub` commands that still run
+        that jail's craze — checked against its program path, so a reused pid
+        is never one of them."""
+        real = str(self.jails[user].real)
+        return [r.pid for r in self.records(user)
+                if "bridge --hub" in r.text and r.pid > 1 and _program_args(r.pid).startswith(real)]
 
     def teardown(self) -> list[int]:
         left: list[int] = []
@@ -1902,7 +1974,8 @@ def test_the_sheet_on_a_dormant_machine_starts_its_hub_and_attaches(app_remote, 
     test mode) where no hub ran — and the machine's source, WOKEN by it, probes
     and attaches at once rather than at its next 30 s dormant probe.
 
-    LAST in the module: craze-dormant is no longer dormant after it."""
+    LAST of the remote machines' cells: craze-dormant is no longer dormant
+    after it."""
     machine = "craze-dormant"
     jail = remote.jails[machine]
     app_remote.wait_until(lambda: _craze_state(app_remote, machine).get("state") == "dormant",
@@ -1927,3 +2000,337 @@ def test_the_sheet_on_a_dormant_machine_starts_its_hub_and_attaches(app_remote, 
     assert time.monotonic() - probed_at < 25, "woken by the sheet, not left to its next dormant probe"
     _shot(app_remote, "craze-create-dormant.png")
     _close_sheet(app_remote)
+
+
+# ---------------------------------------------------------------------------
+# (6) a running shed's craze: offer, don't list (plan 026 §3.2, shed#399)
+# ---------------------------------------------------------------------------
+
+SERVER = "mock"
+#: The sheds the shed instance's private mock lists running, each with its own
+#: jail (a shed's ssh user is its name) — so each cell's craze is its own:
+#: `czoffer` is created on, `czold` runs the real v0.0.1, `czprobe` has its
+#: probe switched, `czstop` is stopped.
+SHED_JAILS = (("czoffer", "recipe"), ("czold", "old"), ("czprobe", "recipe"), ("czstop", "recipe"))
+TOO_OLD_NOTE = "craze on this machine is too old for shed; update it"
+
+
+def _shed_target(name: str) -> str:
+    return f"roost:{SERVER}/{name}"
+
+
+def _running_shed(name: str) -> dict:
+    return {"name": name, "status": "running", "backend": "vz",
+            "created_at": "2026-10-09T12:00:00Z", "started_at": "2026-10-09T12:00:01Z"}
+
+
+@pytest.fixture(scope="module")
+def shed_rig(bins):
+    """The fake ssh and one jail per running shed."""
+    r = Remote(bins, jails=SHED_JAILS, prefix="shcs-")
+    try:
+        yield r
+    finally:
+        for env in r.jails.values():
+            for switch in ("hold-roster", "probe-127"):
+                (env.root / switch).unlink(missing_ok=True)
+        left = r.teardown()
+        assert not left, f"craze processes left behind: {left}"
+
+
+@pytest.fixture(scope="module")
+def shed_mock():
+    """A private mock shed-server listing the cells' sheds running — the
+    session mock's sheds (and its per-test reset) never reach this instance."""
+    m = MockShedServer()
+    m.set_sheds([_running_shed(name) for name, _ in SHED_JAILS])
+    m.start()
+    try:
+        yield m
+    finally:
+        m.stop()
+
+
+@pytest.fixture(scope="module")
+def app_shed(shed_rig, shed_mock):
+    """No local craze, no machines (`config-craze-shed.yaml`): one server whose
+    running sheds reach their jails through the fake ssh — so each shed has an
+    attach-only craze source, and no roost-session to list it."""
+    runtime_dir = Path(tempfile.mkdtemp(prefix="shsh-", dir="/tmp")).resolve()
+    started = _launch(shed_mock, runtime_dir=runtime_dir, craze=None, roost=None,
+                      ssh_bin=shed_rig.ssh, config=FIXTURES / "config-craze-shed.yaml")
+    try:
+        yield started[0]
+    finally:
+        _stop(*started)
+        shutil.rmtree(runtime_dir, ignore_errors=True)
+
+
+def _offered(app: TauriClient, name: str) -> dict | None:
+    """The shed's `rc.list` `shed_craze` entry, or None."""
+    return next((e for e in app.call("rc.list").get("shed_craze") or []
+                 if e["origin"] == _shed_target(name)), None)
+
+
+def _offered_as(app: TauriClient, name: str) -> dict:
+    return (_offered(app, name) or {}).get("craze") or {}
+
+
+def _listed(app: TauriClient, name: str) -> bool:
+    """Whether the shed is a LISTED host: a status row of `rc.list`."""
+    return any(m["origin"] == _shed_target(name) for m in app.call("rc.list")["machines"])
+
+
+def _shed_row(app: TauriClient, name: str) -> dict | None:
+    """The running shed's Sheds-pane row as rendered (`shed_roost.dump`)."""
+    return (app.call("shed_roost.dump")["sheds"] or {}).get(_shed_target(name))
+
+
+def _where(app: TauriClient) -> str:
+    """The New-session dialog's rendered text — its "Where" choices among it —
+    or "" while none is open."""
+    return (app.call("launch.dump")["launch"] or {}).get("rendered") or ""
+
+
+def _where_offers(app: TauriClient, name: str) -> bool:
+    return f"{_shed_target(name)} — new craze session" in _where(app)
+
+
+def _open_launch(app: TauriClient) -> None:
+    app.call("ui.show_launch")
+    app.wait_until(lambda: bool(app.call("launch.dump")["launch"]), timeout=20,
+                   what="the launch dialog")
+
+
+def _close_launch(app: TauriClient) -> None:
+    app.call("ui.close_launch")
+    app.wait_until(lambda: app.call("launch.dump")["launch"] is None, timeout=20,
+                   what="the launch dialog to close")
+
+
+def _shed_craze_commands(rig: Remote, name: str) -> list[str]:
+    return [r.text for r in rig.records(name) if "craze" in r.text]
+
+
+def _offered_on_its_row(app: TauriClient, name: str) -> None:
+    """Wait for the dormant shed's entry, then for its Sheds-pane row's New
+    craze session (the pane on screen)."""
+    app.wait_until(lambda: _offered_as(app, name).get("state") == "dormant", timeout=WAIT,
+                   what=f"{name} offered as dormant")
+    app.navigate("sheds")
+    app.wait_until(lambda: (_shed_row(app, name) or {}).get("craze_create") is True,
+                   timeout=20, what=f"{name}'s row to offer New craze session")
+
+
+def test_a_dormant_shed_offers_craze_on_its_row(app_shed, shed_rig):
+    """**A dormant shed is offered craze, not listed** (plan 026 §3.2, shed#399).
+    A running shed whose find-only probe says no hub runs there offers New
+    craze session on its Sheds-pane row and in the New-session dialog's
+    "Where", and is NOT a listed host (`rc.list.machines` lacks it); until the
+    click, the fake ssh carried only the probe.
+
+    The click opens the sheet with its options loaded — and with no note,
+    where reading the status rows alone would say "… has no craze" — while
+    the roster's `Ready` is HELD BACK (the fake ssh holds the roster's
+    `bridge --hub`, the second, behind the sheet's), so the shed is still
+    unlisted and only its `shed_craze` entry says what its craze is: Create
+    is enabled. A create then lists the shed, and its card — no roost there —
+    reads `craze only`, in the sidebar too."""
+    app = app_shed
+    name = "czoffer"
+    target = _shed_target(name)
+    jail = shed_rig.jails[name]
+    _offered_on_its_row(app, name)
+    assert not _listed(app, name), "a dormant shed is not a listed host"
+    assert _shed_row(app, name)["craze_note"] is None
+    _open_launch(app)
+    try:
+        app.wait_until(lambda: _where_offers(app, name), timeout=20,
+                       what="Where to offer the dormant shed")
+    finally:
+        _close_launch(app)
+    _shot(app, "craze-shed-offer.png")
+    cmds = _shed_craze_commands(shed_rig, name)
+    assert cmds and all("providers --hub --json" in c for c in cmds), \
+        f"before the click, the find-only probe and nothing else: {cmds}"
+    assert not jail.hub_pids(), "no hub before the click"
+
+    (jail.root / "hold-roster").write_text("1")
+    try:
+        app.call("ui.show_craze_create", {"machine": target})
+        seen: list[dict] = []
+
+        def loaded() -> bool:
+            d = _sheet(app)
+            if not (d and d["machine"] == target):
+                return False
+            seen.append(d)
+            return d["state"] != "loading"
+
+        app.wait_until(loaded, timeout=WAIT, what="the sheet's options")
+        d = seen[-1]
+        assert d["state"] == "idle", d
+        assert [p["id"] for p in d["providers"]] == ["cursor", "grok", "native"], d["providers"]
+        # The roster has dialled, and is held: still unlisted, still dormant.
+        app.wait_until(lambda: (jail.root / "held").exists(), timeout=WAIT,
+                       what="the roster's bridge --hub to be held")
+        assert not _listed(app, name), "the roster's Ready is held back: the shed is unlisted"
+        assert _offered_as(app, name).get("state") == "dormant"
+        d = _fill(app, cwd=str(jail.work))
+        assert d["create_enabled"] is True, f"Create is disabled before the roster's Ready: {d}"
+        assert d["note"] is None, d
+        assert all(d["note"] is None for d in seen), \
+            f"the sheet read the unlisted shed as without craze: {[d['note'] for d in seen]}"
+        # The first bridge --hub is the sheet's: none ran before the click, no
+        # hub ran (a probe-gated roster dial cannot run one without a hub), and
+        # the second — the one held — is the roster's.
+        bridges = [r for r in shed_rig.records(name) if "bridge --hub" in r.text]
+        held = (jail.root / "held").read_text().strip()
+        assert len(bridges) >= 2 and bridges[0].name != held and bridges[1].name == held, \
+            (bridges, held)
+        _shot(app, "craze-shed-sheet.png")
+
+        _submit_when_ready(app)
+        app.wait_until(lambda: _sheet(app) is None, timeout=WAIT, what="the sheet to close on Created")
+        app.wait_until(lambda: _listed(app, name), timeout=WAIT, what="the shed listed by its create")
+        assert _offered(app, name) is None, "listed now: no longer a shed_craze entry"
+        app.navigate("machines")
+        app.wait_until(lambda: any(m["origin"] == target for m in app.machines_dump() or []),
+                       timeout=20, what="the shed's card in the Machines pane")
+        card = next(m for m in app.machines_dump() if m["origin"] == target)
+        assert card["status"] == "craze only", card
+        assert card["detail"] == "no roost session here yet — craze sessions only", card
+        bar = next(m for m in app.sidebar_dump()["machines"] if m["origin"] == target)
+        assert (bar["status"], bar["note"], bar["tone"]) == ("craze only", "craze only", "neutral"), bar
+        _shot(app, "craze-shed-craze-only.png")
+    finally:
+        (jail.root / "hold-roster").unlink(missing_ok=True)
+        app.call("ui.close_craze_create")
+        app.call("ui.close_lane")
+    app.wait_until(lambda: _dump(app) is None, timeout=20, what="the transcript panel to unmount")
+
+
+def test_a_too_old_shed_says_so_on_its_row(app_shed, shed_rig):
+    """**A too-old shed says so on its row** (plan 026 §3.2): the real craze
+    v0.0.1 in a running shed reads too old — its `shed_craze` entry — and its
+    Sheds-pane row shows the note and no New craze session; "Where" offers it
+    nothing; it is not listed, and nothing but the probe reached it."""
+    app = app_shed
+    name = "czold"
+    app.wait_until(lambda: _offered_as(app, name).get("cause") == "too_old", timeout=WAIT,
+                   what=f"{name} read as too old")
+    assert not _listed(app, name), "a too-old shed is not a listed host"
+    app.navigate("sheds")
+    app.wait_until(lambda: (_shed_row(app, name) or {}).get("craze_note"), timeout=20,
+                   what="the too-old shed's row note")
+    row = _shed_row(app, name)
+    assert row["craze_note"] == TOO_OLD_NOTE, row
+    assert row["craze_create"] is False, "too old: no create entry"
+    _open_launch(app)
+    try:
+        # The dialog has rendered the running sheds — this one among them —
+        # before the absence of its craze choice means anything.
+        app.wait_until(lambda: f"{SERVER}/{name}" in _where(app), timeout=20,
+                       what="the dialog's shed targets")
+        assert not _where_offers(app, name), _where(app)
+    finally:
+        _close_launch(app)
+    cmds = _shed_craze_commands(shed_rig, name)
+    assert cmds and all("providers --hub --json" in c for c in cmds), cmds
+    _shot(app, "craze-shed-too-old.png")
+
+
+def test_a_dormant_shed_offer_follows_its_probe(app_shed, shed_rig):
+    """**The offer follows the probe** (plan 026 §3.2), with the sheet closed —
+    so the source stays dormant and keeps probing: a probe that exits 127 (not
+    installed) takes the row's New craze session away and "Where" drops it,
+    and a probe that says no hub again brings both back, each on the UI's own
+    re-read. No `bridge --hub` ran.
+
+    An OPEN sheet births the hub and the roster attaches, so the loop stops
+    probing; the sheet's half is therefore its own: with the probe switched
+    to exit 127, the roster's bridge is killed (by the pid the fake ssh
+    recorded), the source probes, and the open sheet shows the note and
+    disables Create."""
+    app = app_shed
+    name = "czprobe"
+    target = _shed_target(name)
+    jail = shed_rig.jails[name]
+    probe_127 = jail.root / "probe-127"
+    app.wait_until(lambda: _offered_as(app, name).get("state") == "dormant", timeout=WAIT,
+                   what=f"{name} offered as dormant")
+    app.navigate("sheds")
+    # The dialog re-reads `rc.list` as it opens, so the offer below is on screen
+    # whatever repainted before; what follows is the probe's own repaints.
+    _open_launch(app)
+    try:
+        app.wait_until(lambda: (_shed_row(app, name) or {}).get("craze_create") is True
+                       and _where_offers(app, name), timeout=20,
+                       what="its row and Where to offer it")
+        probe_127.touch()
+        # The next dormant probe (every 30 s) is the one that exits 127.
+        app.wait_until(lambda: (_shed_row(app, name) or {}).get("craze_create") is False
+                       and not _where_offers(app, name),
+                       timeout=45, what="the offer to go once the probe exits 127")
+        assert _offered(app, name) is None, "not installed: no entry"
+        probe_127.unlink()
+        # Not installed re-probes every 30 s too.
+        app.wait_until(lambda: (_shed_row(app, name) or {}).get("craze_create") is True
+                       and _where_offers(app, name),
+                       timeout=45, what="the offer back once the probe says no hub")
+    finally:
+        probe_127.unlink(missing_ok=True)
+        _close_launch(app)
+    assert not any("bridge --hub" in c for c in shed_rig.commands(name)), \
+        "the sheet was closed: nothing dialled bridge --hub"
+
+    d = _open_sheet(app, target)
+    assert d["state"] == "idle" and d["note"] is None, d
+    app.wait_until(lambda: _listed(app, name) and (_status(app, target) or {}).get("craze", {})
+                   .get("state") == "live", timeout=WAIT, what="the roster to attach")
+    d = _fill(app, cwd=str(jail.work))
+    assert d["create_enabled"] is True, d
+    probe_127.touch()
+    try:
+        pids = shed_rig.live_bridges(name)
+        assert pids, "the roster's bridge runs: " + repr(
+            [(r.pid, _program_args(r.pid)) for r in shed_rig.records(name) if "bridge --hub" in r.text])
+        for pid in pids:
+            # Guarded twice: `live_bridges` matched the program path, and it
+            # is read again just before the signal (a pid can be reused).
+            if pid > 1 and _program_args(pid).startswith(str(jail.real)):
+                os.kill(pid, signal.SIGTERM)
+        want = f"craze is not installed on {target}"
+        app.wait_until(lambda: (_sheet(app) or {}).get("note") == want, timeout=WAIT,
+                       what="the open sheet to say craze is gone")
+        d = _sheet(app)
+        assert d["create_enabled"] is False, d
+        assert d["values"].get("Directory") == str(jail.work), "the form is kept"
+        _shot(app, "craze-shed-sheet-gone.png")
+    finally:
+        probe_127.unlink(missing_ok=True)
+        _close_sheet(app)
+
+
+def test_a_stopped_dormant_shed_leaves_where(app_shed, shed_rig, shed_mock):
+    """**A stopped dormant shed leaves "Where"** (plan 026 §3.2): stopping it in
+    the mock server takes away its row's offer and its "Where" choice on the
+    app's own shed refresh — no refresh by hand: the removal of a shed that
+    was only OFFERED (never listed) still tells the UI to re-read."""
+    app = app_shed
+    name = "czstop"
+    _offered_on_its_row(app, name)
+    _open_launch(app)
+    try:
+        app.wait_until(lambda: _where_offers(app, name), timeout=20, what="Where to offer it")
+        _, sheds = shed_mock.snapshot()
+        shed_mock.set_sheds([dict(s, status="stopped") if s["name"] == name else s
+                             for s in sheds or []])
+        app.wait_until(lambda: not _where_offers(app, name), timeout=WAIT,
+                       what="Where to drop the stopped shed on the app's own refresh")
+        app.wait_until(lambda: _shed_row(app, name) is None, timeout=20,
+                       what="the stopped shed's row to offer nothing")
+    finally:
+        _close_launch(app)
+    assert _offered(app, name) is None, "a stopped shed is no entry"
+    assert not any("bridge --hub" in c for c in shed_rig.commands(name))

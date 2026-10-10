@@ -562,6 +562,33 @@ impl CrazeState {
         }
     }
 
+    /// Where the source stands as a status reader can tell it: its phase and,
+    /// while offline, the CAUSE — never the reason's words. An UNLISTED host's
+    /// repaint is decided on a change of this (plan 026 §3.2), so a repeated
+    /// probe that says the same thing in other words repaints nothing.
+    pub fn standing(&self) -> (Option<CrazePhase>, Option<SourceOffline>) {
+        (
+            self.phase,
+            self.offline.as_ref().map(|(cause, _)| cause.clone()),
+        )
+    }
+
+    /// Whether the find-only probe has PROVED craze on this host with no hub
+    /// roster to list (plan 026 §3.2): **dormant** (craze is there and no hub
+    /// runs — somewhere to create a session, the sheet starting its hub), or
+    /// offline **too old** (craze is there, and the note says to update it).
+    /// What makes an UNLISTED host an `rc.list` `shed_craze` entry; not
+    /// installed, unreachable, any other offline, never probed and no craze
+    /// source at all are not.
+    pub fn proven_unattached(&self) -> bool {
+        match (self.gen, self.phase, &self.offline) {
+            (0, ..) => false,
+            (_, Some(CrazePhase::Dormant), _) => true,
+            (_, Some(CrazePhase::Offline), Some((SourceOffline::TooOld, _))) => true,
+            _ => false,
+        }
+    }
+
     /// The status row's `craze` half (plan 025 §3.6.2): `state` is `live`,
     /// `dormant`, `offline` or `absent` (never reached — and not installed,
     /// which renders as absent); `cause` names an offline (or not-installed)
@@ -1180,6 +1207,37 @@ mod tests {
             CrazeFailure::lane(LaneError::Unavailable("busy".into())).code,
             "unavailable"
         );
+    }
+
+    /// **Which states make an unlisted host a `shed_craze` entry** (plan 026
+    /// §3.2): dormant and too old — the probe proved craze there — and nothing
+    /// else; and the standing a repaint is decided on ignores the reason's
+    /// words.
+    #[test]
+    fn the_states_an_unlisted_host_is_offered_on() {
+        assert!(
+            !CrazeState::default().proven_unattached(),
+            "no craze source"
+        );
+        let mut s = CrazeState::new(4);
+        assert!(!s.proven_unattached(), "never probed");
+        s.dormant();
+        assert!(s.proven_unattached(), "dormant");
+        s.offline(SourceOffline::TooOld, "unknown flag: --hub".into());
+        assert!(s.proven_unattached(), "too old");
+        let too_old = s.standing();
+        s.offline(SourceOffline::TooOld, "said otherwise".into());
+        assert_eq!(s.standing(), too_old, "the words are not the standing");
+        for cause in [
+            SourceOffline::NotInstalled,
+            SourceOffline::Unreachable,
+            SourceOffline::Failed,
+        ] {
+            s.offline(cause.clone(), "x".into());
+            assert!(!s.proven_unattached(), "{cause:?}");
+        }
+        seed(&mut s, 1, &[]);
+        assert!(!s.proven_unattached(), "live: a roster lists it");
     }
 
     #[test]

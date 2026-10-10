@@ -249,6 +249,42 @@ export function crazeCreateOffered(craze: CrazeStatusLike): boolean {
   return craze?.state === "live" && !!craze.create && !!craze.create_options;
 }
 
+/** A host as far as the craze lookup needs it — structurally a `bridge.ts`
+ *  `MachineStatus` (a listed host's status row) or a `ShedCrazeEntry` (an
+ *  unlisted host craze is offered on). */
+export type CrazeHostLike = { name: string; origin: string; craze?: CrazeStatusLike };
+
+/** **A host's craze status, from wherever `rc.list` carries it** (plan 026
+ *  §3.2): the LISTED host's status row's `craze`, or else its `shed_craze`
+ *  entry's — a running shed whose probe says dormant (or too old) is offered
+ *  craze without being listed. `host` is the host's origin token or its
+ *  address (a status row's `name`, what the sheet is opened by): both name one
+ *  host. A host is never in both lists; the status row is read first.
+ *
+ *  **Every reader of a host's craze status goes through this** — the Sheds
+ *  pane, the New-session dialog's "Where" and the create sheet's note — so an
+ *  unlisted dormant shed is not read as "no craze" by one of them (the sheet
+ *  would then say "… has no craze" and disable Create). */
+export function crazeStatusFor(
+  host: string,
+  machines: CrazeHostLike[],
+  shedCraze: CrazeHostLike[],
+): CrazeStatusLike {
+  const named = (h: CrazeHostLike) => h.origin === host || h.name === host;
+  const listed = machines.find(named);
+  if (listed) return listed.craze;
+  return shedCraze.find(named)?.craze;
+}
+
+/** The hosts the New-session dialog's "Where" offers "— new craze session"
+ *  on: every listed host, then every `shed_craze` entry, whose craze offers
+ *  one ([`crazeCreateOffered`], read through [`crazeStatusFor`]) — in that
+ *  order, each once. */
+export function crazeCreateTargets(machines: CrazeHostLike[], shedCraze: CrazeHostLike[]): CrazeHostLike[] {
+  return [...machines, ...shedCraze].filter((h) =>
+    crazeCreateOffered(crazeStatusFor(h.origin, machines, shedCraze)));
+}
+
 /** The machine's line when its LIVE hub cannot create — listing still works,
  *  creating does not (§3.8's "update craze on this machine"). `null`
  *  otherwise (a too-old craze has the machines pane's own note). */

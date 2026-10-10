@@ -114,8 +114,10 @@ async function invoke<T>(cmd: string, args?: Record<string, unknown>): Promise<T
 export type Badges = { sheds: number; agents: number; hosts: number; pending: number };
 
 /** One machine as the sidebar's status foot renders it: the WORD a person reads,
- *  never the raw transport error (which stays on hover). */
-export type SidebarMachineRow = { name: string; origin: string; status: string; note: string };
+ *  never the raw transport error (which stays on hover), and its dot's `tone`
+ *  (`ok` | `pending` | `off` | `neutral` — a host listed by craze alone, plan
+ *  026 §3.2, is neutral: neither up nor still connecting). */
+export type SidebarMachineRow = { name: string; origin: string; status: string; note: string; tone: string };
 
 /** What the shell knows about the sidebar's two sections before the host
  *  failures are folded in (which `report` does, since it holds them). */
@@ -1071,10 +1073,18 @@ export type CrazeStatus = {
 export type MachineStatus = {
   name: string;
   origin: string;
+  /** `machine` | `shed` — which kind of host this row is (a listed shed has a
+   *  status row too, once something has answered on it). */
+  kind?: string | null;
   reachable: boolean;
   /** Whether a snapshot has EVER arrived — distinguishes "still connecting"
    *  from "connected, and genuinely has no sessions". */
   connected_once: boolean;
+  /** Whether a roost watcher runs for this host (plan 026 §3.2): a machine's
+   *  from the start, a shed's once its roost answered — before its first
+   *  inventory (`connected_once`) arrives. A listed host with none, and a
+   *  craze source, is "craze only" (`crazeOnly`). */
+  roost_watched?: boolean | null;
   sessions: number;
   /** Why it is unreachable, verbatim from the watcher: "no route to host" and
    *  "nothing is listening on 1029" are different problems. */
@@ -1083,13 +1093,28 @@ export type MachineStatus = {
   craze?: CrazeStatus | null;
 };
 
+/** An UNLISTED host craze is offered on (plan 026 §3.2, "offer, don't
+ *  list"): a running shed whose craze probe proved craze there with no hub
+ *  roster to list — `dormant` (New craze session on its Sheds-pane row and in
+ *  "Where"; opening the sheet starts its hub) or too old (its note). It has no
+ *  status row and no sessions; once a create or its first craze `Ready` lists
+ *  it, it is a `MachineStatus` instead — never both. */
+export type ShedCrazeEntry = {
+  name: string;
+  label: string;
+  origin: string;
+  kind: string;
+  craze: CrazeStatus;
+};
+
 /** The `rc.list` result: live sessions (shed AND machine), the per-shed
- *  capabilities captured during the probe (keyed by `host/shed`), and each
- *  configured machine's health. */
+ *  capabilities captured during the probe (keyed by `host/shed`), each
+ *  configured machine's health, and the unlisted hosts craze is offered on. */
 export type RcListResult = {
   sessions: RcSession[];
   capabilities: Record<string, RcCapabilities>;
   machines: MachineStatus[];
+  shed_craze: ShedCrazeEntry[];
 };
 
 /** A session's stable row identity — the row's `origin` plus its slug. Every row
@@ -1124,10 +1149,11 @@ export async function fetchRcList(host?: string, shed?: string): Promise<RcListL
       sessions: r?.sessions ?? [],
       capabilities: r?.capabilities ?? {},
       machines: r?.machines ?? [],
+      shed_craze: r?.shed_craze ?? [],
       error: null,
     };
   } catch (e) {
-    return { sessions: [], capabilities: {}, machines: [], error: String(e) };
+    return { sessions: [], capabilities: {}, machines: [], shed_craze: [], error: String(e) };
   }
 }
 
@@ -1265,7 +1291,7 @@ export async function killSession(s: RcSession): Promise<void> {
  *  person reads, and it earns a test that needs no React, no DOM and no Tauri
  *  runtime — the `newest.ts` / `roostBoard.ts` shape. */
 export type { AgentsLoad, AgentsEmptyState } from "@/lib/agentsEmpty";
-export { agentsEmptyState } from "@/lib/agentsEmpty";
+export { agentsEmptyState, crazeOnly } from "@/lib/agentsEmpty";
 
 /** The launch dialog as `launch.dump` reads it: its own rendered DOM text.
  *
@@ -1350,6 +1376,9 @@ export function useRcSessions(): {
   sessions: RcSession[];
   capabilities: Record<string, RcCapabilities>;
   machines: MachineStatus[];
+  /** `rc.list`'s `shed_craze` — read craze status through `crazeStatusFor`,
+   *  which falls back to it for a host with no status row. */
+  shedCraze: ShedCrazeEntry[];
   load: AgentsLoad;
   error: string | null;
   refresh: () => void;
@@ -1358,6 +1387,7 @@ export function useRcSessions(): {
     sessions: [],
     capabilities: {},
     machines: [],
+    shed_craze: [],
     load: inTauri() ? "loading" : "ready",
     error: null,
   });
@@ -1395,6 +1425,7 @@ export function useRcSessions(): {
     sessions: state.sessions,
     capabilities: state.capabilities,
     machines: state.machines,
+    shedCraze: state.shed_craze,
     load: state.load,
     error: state.error,
     refresh,

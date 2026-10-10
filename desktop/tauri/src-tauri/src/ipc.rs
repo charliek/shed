@@ -105,7 +105,8 @@ fn machine_terminal_refusal() -> (String, String) {
 /// — plural, because one failed host is not the only case. Healthy = `[]`, never
 /// absent, so a consumer can read it unconditionally.
 /// **The single shaper for `rc.list`** — the roost sessions on every listed
-/// host, each host's contract, and each host's health.
+/// host, each host's contract, each host's health, and the unlisted hosts
+/// craze is offered on (`shed_craze`, plan 026 §3.2).
 ///
 /// Shared by the socket IPC op and the frontend's `rc_list` Tauri command, the
 /// same way [`sheds_payload`] is shared. Those two used to build this payload
@@ -148,7 +149,13 @@ pub(crate) async fn rc_list_payload(
     //
     // The filter is a SHED filter: it narrows sheds by server and name, and
     // omits machines outright, because a machine belongs to no server.
-    let (sessions, machine_status) =
+    //
+    // `shed_craze` is read under that same lock (plan 026 §3.2): the hosts this
+    // payload OFFERS craze on without listing them — a running shed whose craze
+    // probe says dormant (New craze session on its Sheds-pane row and in
+    // "Where"), or too old (its note) — so a host is never both a status row and
+    // an entry. The filter narrows it exactly as it narrows the status rows.
+    let (sessions, machine_status, shed_craze) =
         machines.snapshot(crate::roost_hosts::HostFilter { server: host, shed });
     // **Capabilities keyed by ORIGIN** (plan 013 §3.4) — `machine:<name>` or
     // `roost:<server>/<shed>`, the same string each row carries, so the UI has a
@@ -174,6 +181,7 @@ pub(crate) async fn rc_list_payload(
         "sessions": sessions,
         "capabilities": Value::Object(capabilities),
         "machines": machine_status,
+        "shed_craze": shed_craze,
     })
 }
 
@@ -730,6 +738,13 @@ impl Handler {
             "ui.show_launch" => {
                 present_main_window(&self.app);
                 let _ = self.app.emit("show-launch", json!({}));
+                Ok(json!({}))
+            }
+            // Its close (plan 026 §3.2): the dialog closes on Escape or Cancel
+            // — a key or a click — and a caller that opened it to read its
+            // "Where" choices must be able to put it away again.
+            "ui.close_launch" => {
+                let _ = self.app.emit("close-launch", json!({}));
                 Ok(json!({}))
             }
             // The New-session dialog's typing-and-clicking doors (plan 025 C3)
@@ -1292,7 +1307,8 @@ impl Handler {
     // the wire from the guest (where it is liveness now) and a machine row's from
     // roost; no client re-derives one from a pane.
 
-    /// `rc.list {host?, shed?}` → `{sessions, capabilities, machines}`. The
+    /// `rc.list {host?, shed?}` → `{sessions, capabilities, machines,
+    /// shed_craze}`. The
     /// roost tabs on every listed host. Which sheds are running comes from
     /// `Backend` (resolution stays in shed-app); the rows come from each host's
     /// own `roost-session`.

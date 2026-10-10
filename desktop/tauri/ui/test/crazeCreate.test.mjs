@@ -17,8 +17,10 @@ import {
   closesOntoTranscript,
   crazeCreateGate,
   crazeCreateOffered,
+  crazeCreateTargets,
   crazeCreateUpdateNote,
   crazeSheetNote,
+  crazeStatusFor,
   directoryProblem,
   edit,
   groupMachine,
@@ -362,4 +364,43 @@ test("CONTROL: a group header's machine is found by the ROWS' real origin, not t
 
   // An unknown origin finds nothing.
   assert.equal(groupMachine("machine:ghost", [{ origin: "machine:ghost" }], machines), undefined);
+});
+
+// ---- offer, don't list (plan 026 §3.2) ------------------------------------
+
+const DORMANT = { state: "dormant", cause: null, create: false, create_options: false };
+const TOO_OLD = { state: "offline", cause: "too_old", create: false, create_options: false };
+const LIVE = { state: "live", cause: null, create: true, create_options: true };
+
+/** A listed machine, an unlisted dormant shed and an unlisted too-old one —
+ *  the status rows and the `shed_craze` entries an `rc.list` carries. */
+const listedMachine = { name: "mini3", origin: "machine:mini3", craze: LIVE };
+const dormantShed = { name: "roost:mock/a", origin: "roost:mock/a", craze: DORMANT };
+const oldShed = { name: "roost:mock/b", origin: "roost:mock/b", craze: TOO_OLD };
+
+test("CONTROL: a host with no status row reads its craze from its shed_craze entry", () => {
+  const machines = [listedMachine];
+  const shedCraze = [dormantShed, oldShed];
+  // By origin (the Sheds pane) and by address (the sheet): one host.
+  assert.deepEqual(crazeStatusFor("roost:mock/a", machines, shedCraze), DORMANT);
+  assert.deepEqual(crazeStatusFor("roost:mock/b", machines, shedCraze), TOO_OLD);
+  assert.deepEqual(crazeStatusFor("machine:mini3", machines, shedCraze), LIVE);
+  assert.deepEqual(crazeStatusFor("mini3", machines, shedCraze), LIVE);
+  assert.equal(crazeStatusFor("roost:mock/ghost", machines, shedCraze), undefined);
+  // So the sheet on a dormant, unlisted shed has no note — where reading the
+  // status rows alone would say it has no craze, and disable Create.
+  assert.equal(crazeSheetNote(crazeStatusFor("roost:mock/a", machines, shedCraze), "roost:mock/a"), null);
+  assert.equal(crazeSheetNote(crazeStatusFor("roost:mock/a", machines, []), "roost:mock/a"), "roost:mock/a has no craze");
+});
+
+test("a listed host's status row is read first", () => {
+  const listed = { name: "roost:mock/a", origin: "roost:mock/a", craze: LIVE };
+  assert.deepEqual(crazeStatusFor("roost:mock/a", [listed], [dormantShed]), LIVE);
+});
+
+test("CONTROL: Where offers listed hosts, then shed_craze entries, whose craze can create", () => {
+  const notOffered = { name: "mini4", origin: "machine:mini4", craze: TOO_OLD };
+  const names = crazeCreateTargets([listedMachine, notOffered], [dormantShed, oldShed]).map((h) => h.name);
+  assert.deepEqual(names, ["mini3", "roost:mock/a"], "a too-old shed is not offered; a dormant one is");
+  assert.deepEqual(crazeCreateTargets([], []), []);
 });

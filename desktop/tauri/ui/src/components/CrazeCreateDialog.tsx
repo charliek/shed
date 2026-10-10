@@ -30,12 +30,12 @@ import { cn } from "@/lib/utils";
 import { renderedText, renderedValues } from "@/lib/roost";
 import {
   crazeCreateOptions, laneFailure, reportCrazeCreate,
-  type CrazeCreateProviderRow, type CrazeStatus,
+  type CrazeCreateProviderRow,
 } from "@/lib/bridge";
 import {
   crazeCreateGate, crazeSheetNote, directoryProblem, preselectedProvider,
   primaryLabel, providerSelectable, reconcileProvider, refusalView,
-  type CrazeCreateOptions, type CrazeDraft,
+  type CrazeCreateOptions, type CrazeDraft, type CrazeStatusLike,
 } from "@/lib/crazeCreate";
 
 type OptionsLoad =
@@ -46,8 +46,10 @@ type OptionsLoad =
 export function CrazeCreateDialog({ machine, craze, draft, onEdit, onSubmit, onClose }: {
   machine: string;
   /** This machine's craze status as the shell last read it — what turns the
-   *  sheet's note on (offline, too old, not installed) while it is open. */
-  craze: CrazeStatus | null | undefined;
+   *  sheet's note on (offline, too old, not installed) while it is open. Read
+   *  through `crazeStatusFor`, so an unlisted dormant shed's comes from its
+   *  `shed_craze` entry (plan 026 §3.2). */
+  craze: CrazeStatusLike;
   draft: CrazeDraft;
   onEdit: (patch: Partial<Pick<CrazeDraft, "provider" | "cwd" | "prompt">>) => void;
   onSubmit: () => void;

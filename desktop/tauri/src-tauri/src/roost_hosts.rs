@@ -413,6 +413,9 @@ struct Detached {
     id: HostId,
     /// Whether it was in a listing, so its going is a change to announce.
     was_listed: bool,
+    /// Whether it was an `rc.list` `shed_craze` entry (plan 026 §3.2) — a
+    /// change to announce too, so "Where" never offers a stopped shed.
+    was_offered: bool,
     /// Its craze source, to stop.
     craze: Option<CrazeHost>,
 }
@@ -465,6 +468,20 @@ struct HostState {
     /// Whether a snapshot has EVER arrived, so the UI can distinguish "still
     /// connecting" from "connected, and this host genuinely has no sessions".
     seen: bool,
+    /// Whether this host has a roost WATCHER (the status row's
+    /// `roost_watched`, plan 026 §3.2): set in the same critical section that
+    /// installs one — a configured machine's and the implicit `localhost`'s at
+    /// registration, a shed's once its roost probe answered (or a bootstrap
+    /// watched it) — and never cleared while the state lives, because the only
+    /// thing that takes a watcher away is [`RoostHosts::detach`], which takes
+    /// this state with it.
+    ///
+    /// Distinct from [`Self::seen`]: a watcher is installed the moment roost
+    /// answers `session.identify`, and its first inventory comes later, after
+    /// the subscribe and `tab.list`. A host listed by craze in between has a
+    /// confirmed roost session and no snapshot yet — and must not read as
+    /// "craze only".
+    watched: bool,
     /// Whether this host may appear in a listing at all.
     ///
     /// `true` from the start for every CONFIGURED machine — the user named it, so
@@ -479,6 +496,12 @@ struct HostState {
     /// **A craze `Ready` lists a host too** (plan 025 §3.6.2): a machine with
     /// ssh and craze but no roost still shows its craze sessions, and a
     /// craze-only `localhost` is somewhere to create one.
+    ///
+    /// **A probe alone never lists one** (plan 026 §3.2, "offer, don't list"):
+    /// an unlisted host whose probe proved craze there — dormant, or too old —
+    /// is carried beside the listing instead, as an `rc.list` `shed_craze`
+    /// entry ([`HostState::in_shed_craze`]), and nothing that reads this flag
+    /// changes.
     listed: bool,
     /// This host's craze roster (plan 025 §3.6.2), under THIS lock — so a
     /// listing reads the roost rows and the craze rows in one acquisition and
@@ -566,11 +589,21 @@ impl HostState {
             detail: None,
             down_kind: None,
             seen: false,
+            watched: false,
             listed,
             craze: CrazeState::default(),
             reg_gen: NEXT_REG_GEN.fetch_add(1, Ordering::Relaxed),
             opened_tabs: BTreeMap::new(),
         }
+    }
+
+    /// Whether this host is an `rc.list` `shed_craze` entry (plan 026 §3.2):
+    /// UNLISTED — so it has no status row — while its craze probe has proved
+    /// craze there ([`CrazeState::proven_unattached`]: dormant, or too old). A
+    /// host is never both a status row and an entry: the two are this one flag
+    /// read under one lock.
+    fn in_shed_craze(&self) -> bool {
+        !self.listed && self.craze.proven_unattached()
     }
 
     /// The row merge for this host (plan 025 §3.6.3): its roost tabs against
@@ -929,6 +962,28 @@ impl Registry {
     }
 }
 
+/// [`Registry::install_watcher`], and — in the SAME critical section, `state`
+/// then `reg` (the order the status rows are read in) — the host's
+/// [`HostState::watched`] flag set when the watcher is installed (plan 026
+/// §3.2), so a status row never sees a watcher whose flag is not yet set.
+fn install_and_flag(
+    state: &Mutex<BTreeMap<HostId, HostState>>,
+    reg: &Mutex<Registry>,
+    id: &HostId,
+    reach: &Arc<dyn RoostReach>,
+    watcher: RoostWatcher,
+) -> bool {
+    let mut state = lock(state);
+    let mut reg = lock(reg);
+    let installed = reg.install_watcher(id, reach, watcher);
+    if installed {
+        if let Some(m) = state.get_mut(id) {
+            m.watched = true;
+        }
+    }
+    installed
+}
+
 /// Per-host "may shed wire this host's agent hooks?" — see [`RoostHosts::armed`],
 /// which is where the whole rule is written down.
 type ArmedFlags = BTreeMap<HostId, Arc<AtomicBool>>;
@@ -1111,9 +1166,15 @@ impl RoostHosts {
             watcher_options(&self.armed, &id),
         );
         {
+            // `state`, then `reg` — the order the status rows are read in — so
+            // no status row sees the watcher without its flag (plan 026 §3.2).
+            let mut state = lock(&self.state);
             let mut reg = lock(&self.reg);
             reg.reaches.insert(id.clone(), reach);
             reg.watchers.insert(id.clone(), watcher);
+            if let Some(m) = state.get_mut(&id) {
+                m.watched = true;
+            }
         }
         self.handle.spawn(consume(
             id,
@@ -1166,12 +1227,51 @@ impl RoostHosts {
     /// used to do, by omitting its snapshot entirely — is exactly the bug §3.6
     /// names, because the shed card asks about one shed and would then see only
     /// its hub half.
-    pub fn snapshot(&self, filter: HostFilter<'_>) -> (Vec<Value>, Vec<Value>) {
+    ///
+    /// The third list is `rc.list`'s `shed_craze` (plan 026 §3.2), read under
+    /// the same lock, so a host is never both a status row and an entry in one
+    /// answer ([`Self::shed_craze_locked`]).
+    pub fn snapshot(&self, filter: HostFilter<'_>) -> (Vec<Value>, Vec<Value>, Vec<Value>) {
         let guard = lock(&self.state);
         (
             self.sessions_locked(&guard, filter),
             self.status_locked(&guard, filter),
+            self.shed_craze_locked(&guard, filter),
         )
+    }
+
+    /// **Offer, don't list** (plan 026 §3.2): every registered, UNLISTED host
+    /// whose craze probe has proved craze there ([`HostState::in_shed_craze`]
+    /// — dormant, or too old), in the status rows' order and under their
+    /// filter, as the status row's identity fields plus the same `craze`
+    /// object a status row carries. A running shed whose probe says dormant is
+    /// thereby a create target — its Sheds-pane row and the New-session
+    /// dialog's "Where" offer New craze session — without becoming a listed
+    /// host: nothing that reads `listed` changes, and no `bridge --hub` is
+    /// dialled until the sheet opens. A shed with no craze, or one the probe
+    /// could not ask, says nothing, as before.
+    fn shed_craze_locked(
+        &self,
+        guard: &BTreeMap<HostId, HostState>,
+        filter: HostFilter<'_>,
+    ) -> Vec<Value> {
+        // `reg` under the caller's `state` guard: the one order the two are
+        // held in.
+        let reg = lock(&self.reg);
+        reg.ids
+            .iter()
+            .filter(|id| filter.keeps(id))
+            .filter_map(|id| {
+                let m = guard.get(id).filter(|m| m.in_shed_craze())?;
+                Some(json!({
+                    "name": id.address(),
+                    "label": id.label(),
+                    "origin": id.token(),
+                    "kind": id.kind(),
+                    "craze": m.craze.status(),
+                }))
+            })
+            .collect()
     }
 
     /// Every listed host's rows, flattened for the sessions view, each stamped
@@ -2106,6 +2206,11 @@ impl RoostHosts {
                     "server": id.server(),
                     "reachable": m.is_some_and(|m| m.reachable),
                     "connected_once": m.is_some_and(|m| m.seen),
+                    // Whether a roost watcher runs for this host (plan 026
+                    // §3.2) — a confirmed roost session whose first inventory
+                    // may not have arrived yet (`connected_once` still false).
+                    // A host listed by craze with none is "craze only".
+                    "roost_watched": m.is_some_and(|m| m.watched),
                     // The rows this host lists — roost's, less the craze tabs
                     // the merge folded away, plus its craze rows — so the count
                     // beside a machine is the count of its cards.
@@ -2352,7 +2457,7 @@ impl RoostHosts {
             id.token(),
             watcher_options(&self.armed, id),
         );
-        if !lock(&self.reg).install_watcher(id, &reach, watcher) {
+        if !install_and_flag(&self.state, &self.reg, id, &reach, watcher) {
             return;
         }
         self.handle.spawn(consume(
@@ -2415,7 +2520,9 @@ impl RoostHosts {
                 observer(&r.id.address(), &BTreeMap::new());
             }
         }
-        if removed.iter().any(|r| r.was_listed) {
+        // A shed that was only OFFERED (a `shed_craze` entry) is a change too:
+        // its Sheds-pane offer and its "Where" choice must go with it.
+        if removed.iter().any(|r| r.was_listed || r.was_offered) {
             (self.on_change)();
         }
     }
@@ -2477,6 +2584,7 @@ impl RoostHosts {
         Detached {
             id: id.clone(),
             was_listed: removed.as_ref().is_some_and(|m| m.listed),
+            was_offered: removed.as_ref().is_some_and(HostState::in_shed_craze),
             craze,
         }
     }
@@ -2902,7 +3010,7 @@ impl WatchHandle {
             id.token(),
             watcher_options(&self.armed, id),
         );
-        if !lock(&self.reg).install_watcher(id, &reach, watcher) {
+        if !install_and_flag(&self.state, &self.reg, id, &reach, watcher) {
             return;
         }
         self.handle.spawn(consume(
@@ -2929,9 +3037,16 @@ struct HostCrazeSink {
 impl HostCrazeSink {
     /// Fold under the lock — only while this task's fence still holds — and
     /// act on what changed outside it: the departed rows' lanes go first, then
-    /// a listed host's UI is told to re-read.
+    /// the UI is told to re-read when a reader can see the change.
+    ///
+    /// **Who can see it** (plan 026 §3.2): a LISTED host's visible change, as
+    /// always — and an UNLISTED host's change of craze phase or cause
+    /// ([`CrazeState::standing`]), because that moves it into, out of or
+    /// within `rc.list`'s `shed_craze` (dormant ↔ too old ↔ not installed).
+    /// A repeated probe that says the same thing changes neither, so the 30 s
+    /// dormant probe repaints nothing.
     fn fold(&self, f: impl FnOnce(&mut CrazeState) -> crate::craze::Applied) -> bool {
-        let (applied, listed) = {
+        let (applied, listed, moved) = {
             let mut guard = lock(&self.state);
             let Some(m) = guard.get_mut(&self.id) else {
                 return false;
@@ -2939,19 +3054,20 @@ impl HostCrazeSink {
             if m.craze.gen != self.gen {
                 return false;
             }
+            let before = m.craze.standing();
             let applied = f(&mut m.craze);
             if applied.ready {
                 // A craze `Ready` is an answer — this host is real and listed
                 // from now on, roost or no roost (plan 025 §3.6.2).
                 m.listed = true;
             }
-            (applied, m.listed)
+            (applied, m.listed, m.craze.standing() != before)
         };
         // With THIS source's generation: by the time it lands, the host may
         // be registered again under another, and only this one's lanes are
         // this source's to end.
         publish_craze_gone(&self.on_craze, &self.id, self.gen, &applied.departed);
-        if listed && applied.visible {
+        if applied.visible && (listed || moved) {
             (self.on_change)();
         }
         true

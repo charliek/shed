@@ -2042,10 +2042,20 @@ fn start_counting(
     reaches: Vec<(HostId, Arc<Scripted>)>,
     changes: Arc<AtomicUsize>,
 ) -> RoostHosts {
+    start_counting_on(&ShedConfig::default(), options, reaches, changes)
+}
+
+/// [`start_counting`], under `config` (a server whose sheds can be observed).
+fn start_counting_on(
+    config: &ShedConfig,
+    options: &ReachOptions,
+    reaches: Vec<(HostId, Arc<Scripted>)>,
+    changes: Arc<AtomicUsize>,
+) -> RoostHosts {
     let map: BTreeMap<HostId, Arc<Scripted>> = reaches.into_iter().collect();
     RoostHosts::start_with(
         &tokio::runtime::Handle::current(),
-        &ShedConfig::default(),
+        config,
         options.clone(),
         false,
         Arc::new(move || {
@@ -2215,4 +2225,360 @@ async fn a_create_answered_as_the_roster_lets_it_go_is_not_listed_again() {
         "a row the roster let go is not folded back"
     );
     assert_eq!(answer["ended"], true, "{answer}");
+}
+
+// ---------------------------------------------------------------------------
+// offer, don't list (plan 026 §3.2, shed#399)
+// ---------------------------------------------------------------------------
+
+/// The shed every cell below observes running.
+const SHED: &str = "roost:srv/s1";
+
+/// `rc.list`'s `shed_craze`, unfiltered.
+fn shed_craze_of(hosts: &RoostHosts) -> Vec<Value> {
+    hosts.snapshot(HostFilter::ALL).2
+}
+
+/// Answer the source's pending find-only probe with `answer`, and return once
+/// it has been FOLDED: the loop folds an answer (and repaints) before it waits
+/// and asks the next probe, so the next probe being asked is the proof.
+async fn probe_answers(probe: &ScriptedProbe, answer: Probe) {
+    wait_for("a probe pending", || {
+        (probe.calls.load(Ordering::SeqCst) >= 1).then_some(())
+    })
+    .await;
+    let asked = probe.calls.load(Ordering::SeqCst);
+    probe.answer(answer);
+    wait_for("the answer folded (the next probe asked)", || {
+        (probe.calls.load(Ordering::SeqCst) > asked).then_some(())
+    })
+    .await;
+}
+
+/// The shed `s1` on `srv`, its craze attach-only and scripted, the layer
+/// counting every repaint in `changes` — observed running by the
+/// authoritative refresh, so its source is started and probing. It has no
+/// roost (nothing is mapped), so only craze can ever list it.
+async fn observed_shed(changes: &Arc<AtomicUsize>) -> (RoostHosts, Arc<Scripted>) {
+    let (shed, config) = srv_shed("s1");
+    let craze = Scripted::attach_only();
+    let hosts = start_counting_on(
+        &config,
+        &test_options(&[]),
+        vec![(shed, Arc::clone(&craze))],
+        Arc::clone(changes),
+    );
+    refresh(&hosts, &["s1"]).await;
+    (hosts, craze)
+}
+
+fn too_old(reason: &str) -> Probe {
+    Probe::Offline {
+        cause: SourceOffline::TooOld,
+        reason: reason.to_string(),
+    }
+}
+
+/// **A dormant shed is OFFERED, not listed** (plan 026 §3.2, shed#399): a
+/// running shed whose find-only probe says no hub is running is an `rc.list`
+/// `shed_craze` entry — the status row's identity fields and the same `craze`
+/// object a status row carries — and NOT a status row: no sessions, not in
+/// `machines.list`. The entry honours `rc.list`'s shed filter as the status
+/// rows do, and nothing dialled `bridge --hub`: the probe is find-only.
+#[tokio::test]
+async fn a_dormant_shed_is_offered_not_listed() {
+    let changes = Arc::new(AtomicUsize::new(0));
+    let (hosts, craze) = observed_shed(&changes).await;
+    probe_answers(craze.probe.as_ref().unwrap(), Probe::NoHub).await;
+
+    let (sessions, status, offered) = hosts.snapshot(HostFilter::ALL);
+    assert!(
+        status.iter().all(|s| s["origin"] != SHED),
+        "a dormant shed is not a status row: {status:?}"
+    );
+    assert!(sessions.is_empty(), "and lists no sessions: {sessions:?}");
+    assert!(
+        status_of(&hosts, SHED).is_none(),
+        "nor is it in machines.list"
+    );
+    assert_eq!(
+        offered,
+        vec![
+            json!({"name": SHED, "label": "s1", "origin": SHED, "kind": "shed",
+                    "craze": {"state": "dormant", "cause": null,
+                              "create": false, "create_options": false}})
+        ]
+    );
+
+    let filtered = |server: Option<&str>, shed: Option<&str>| {
+        hosts.snapshot(HostFilter { server, shed }).2.len()
+    };
+    assert_eq!(filtered(Some("srv"), Some("s1")), 1, "its own filter");
+    assert_eq!(filtered(Some("srv"), None), 1, "its server's filter");
+    assert_eq!(
+        filtered(Some("srv"), Some("s2")),
+        0,
+        "another shed's filter"
+    );
+    assert_eq!(filtered(Some("other"), None), 0, "another server's filter");
+    assert_eq!(
+        craze.hook.dials(),
+        0,
+        "no bridge --hub: the probe is find-only"
+    );
+}
+
+/// **The entry follows the probe, and repaints once per change** (plan 026
+/// §3.2): dormant → too old → dormant changes the entry's `state`/`cause`
+/// and tells the UI to re-read once per change, though the shed is unlisted;
+/// a repeated probe — the 30 s dormant one, or a too-old one in other words —
+/// changes neither and repaints nothing. No `bridge --hub` throughout.
+#[tokio::test]
+async fn a_dormant_sheds_entry_follows_its_probe_and_repaints_once_per_change() {
+    let changes = Arc::new(AtomicUsize::new(0));
+    let (hosts, craze) = observed_shed(&changes).await;
+    let probe = craze.probe.as_ref().unwrap();
+    let repaints = || changes.load(Ordering::SeqCst);
+    let entry = || {
+        shed_craze_of(&hosts)
+            .first()
+            .map(|e| (e["craze"]["state"].clone(), e["craze"]["cause"].clone()))
+    };
+    let base = repaints();
+
+    probe_answers(probe, Probe::NoHub).await;
+    assert_eq!(entry(), Some((json!("dormant"), json!(null))));
+    assert_eq!(repaints(), base + 1, "dormant: one repaint");
+    probe_answers(probe, Probe::NoHub).await;
+    assert_eq!(repaints(), base + 1, "a repeated dormant probe: none");
+
+    probe_answers(probe, too_old("unknown flag: --hub")).await;
+    assert_eq!(entry(), Some((json!("offline"), json!("too_old"))));
+    assert_eq!(repaints(), base + 2, "too old: one repaint");
+    probe_answers(probe, too_old("unknown flag: --hub")).await;
+    probe_answers(probe, too_old("unknown flag: --hub, said otherwise")).await;
+    assert_eq!(
+        repaints(),
+        base + 2,
+        "a repeated too-old probe: none, whatever its words"
+    );
+
+    probe_answers(probe, Probe::NoHub).await;
+    assert_eq!(entry(), Some((json!("dormant"), json!(null))));
+    assert_eq!(repaints(), base + 3, "dormant again: one repaint");
+    assert!(status_of(&hosts, SHED).is_none(), "never listed");
+    assert_eq!(craze.hook.dials(), 0, "no bridge --hub");
+}
+
+/// **Not installed — or unreachable — drops the entry, with one repaint**
+/// (plan 026 §3.2): a shed whose craze turns out not installed (exit 127)
+/// says nothing, as a shed with no craze always has, and so does one the
+/// probe cannot ask. No `bridge --hub`.
+#[tokio::test]
+async fn a_dormant_shed_that_turns_out_not_installed_leaves_shed_craze() {
+    let changes = Arc::new(AtomicUsize::new(0));
+    let (hosts, craze) = observed_shed(&changes).await;
+    let probe = craze.probe.as_ref().unwrap();
+    let repaints = || changes.load(Ordering::SeqCst);
+    let not_installed = || Probe::Offline {
+        cause: SourceOffline::NotInstalled,
+        reason: "exit 127".to_string(),
+    };
+    let base = repaints();
+
+    probe_answers(probe, Probe::NoHub).await;
+    assert_eq!(shed_craze_of(&hosts).len(), 1);
+    probe_answers(probe, not_installed()).await;
+    assert!(shed_craze_of(&hosts).is_empty(), "not installed: no entry");
+    assert_eq!(repaints(), base + 2, "one repaint for the drop");
+    probe_answers(probe, not_installed()).await;
+    assert_eq!(repaints(), base + 2, "a repeated probe: none");
+
+    probe_answers(probe, Probe::NoHub).await;
+    assert_eq!(shed_craze_of(&hosts).len(), 1, "dormant again");
+    probe_answers(
+        probe,
+        Probe::Offline {
+            cause: SourceOffline::Unreachable,
+            reason: "ssh: connect to host: no route to host".to_string(),
+        },
+    )
+    .await;
+    assert!(shed_craze_of(&hosts).is_empty(), "unreachable: no entry");
+    assert_eq!(repaints(), base + 4, "one repaint each way");
+    assert!(status_of(&hosts, SHED).is_none(), "never listed");
+    assert_eq!(craze.hook.dials(), 0, "no bridge --hub");
+}
+
+/// **The first `Ready` moves a dormant shed from `shed_craze` to a listed
+/// row** (plan 026 §3.2): once the probe finds a hub (the sheet started one)
+/// and the roster seeds, the shed is listed — a status row, with its craze
+/// rows — and no longer an entry, in one answer: never both. Until the probe
+/// found that hub nothing dialled `bridge --hub`; the one dial after it is
+/// the roster's.
+#[tokio::test]
+async fn the_first_ready_moves_a_dormant_shed_from_shed_craze_to_a_listed_row() {
+    let changes = Arc::new(AtomicUsize::new(0));
+    let (hosts, craze) = observed_shed(&changes).await;
+    let probe = craze.probe.as_ref().unwrap();
+    probe_answers(probe, Probe::NoHub).await;
+    assert_eq!(shed_craze_of(&hosts).len(), 1);
+    assert_eq!(craze.hook.dials(), 0, "dormant: no bridge --hub");
+
+    probe.answer(Probe::Hub);
+    let _hub = craze.roster(json!([row(HOST_A, "ses-a")])).await;
+    wait_for("listed by its first Ready", || status_of(&hosts, SHED)).await;
+    let (sessions, status, offered) = hosts.snapshot(HostFilter::ALL);
+    let row = status
+        .iter()
+        .find(|s| s["origin"] == SHED)
+        .expect("a status row");
+    assert_eq!(row["craze"]["state"], "live", "{row}");
+    assert!(
+        offered.is_empty(),
+        "no longer an entry — never both: {offered:?}"
+    );
+    assert!(
+        sessions
+            .iter()
+            .any(|r| r["origin"] == SHED && r["slug"] == HOST_A),
+        "its craze rows are listed: {sessions:?}"
+    );
+    assert_eq!(
+        craze.hook.dials(),
+        1,
+        "one bridge --hub: the roster's, after the probe found a hub"
+    );
+}
+
+/// **A stopped (or deleted) shed leaves `shed_craze`, and the UI is told**
+/// (plan 026 §3.2): the authoritative refresh that no longer lists it removes
+/// the host, its entry goes with it, and the removal repaints though the shed
+/// was never listed — so "Where" never offers a stopped shed. (A stop and a
+/// delete are one thing here: a shed the answering server no longer lists
+/// running.)
+#[tokio::test]
+async fn a_stopped_dormant_shed_leaves_shed_craze_and_repaints() {
+    let changes = Arc::new(AtomicUsize::new(0));
+    let (hosts, craze) = observed_shed(&changes).await;
+    probe_answers(craze.probe.as_ref().unwrap(), Probe::NoHub).await;
+    assert_eq!(shed_craze_of(&hosts).len(), 1);
+    let base = changes.load(Ordering::SeqCst);
+
+    refresh(&hosts, &[]).await;
+    assert!(
+        shed_craze_of(&hosts).is_empty(),
+        "the entry went with the host"
+    );
+    assert_eq!(
+        changes.load(Ordering::SeqCst),
+        base + 1,
+        "its removal repaints"
+    );
+    assert_eq!(craze.hook.dials(), 0, "no bridge --hub");
+}
+
+/// **A configured machine is never in `shed_craze`** (plan 026 §3.2): it is
+/// listed from the start, so a dormant or a too-old craze there is its status
+/// row's to say, as it always was.
+#[tokio::test]
+async fn a_configured_machine_is_never_in_shed_craze() {
+    let craze = Scripted::attach_only();
+    let hosts = start_scripted(
+        &config_with(&["mini3"]),
+        &test_options(&[]),
+        vec![(HostId::Machine("mini3".to_string()), Arc::clone(&craze))],
+    );
+    let probe = craze.probe.as_ref().unwrap();
+    probe_answers(probe, Probe::NoHub).await;
+    assert_eq!(
+        status_of(&hosts, "mini3").unwrap()["craze"]["state"],
+        "dormant"
+    );
+    assert_eq!(
+        status_of(&hosts, "mini3").unwrap()["roost_watched"],
+        true,
+        "a configured machine is watched from the start: never craze only"
+    );
+    assert!(
+        shed_craze_of(&hosts).is_empty(),
+        "dormant: its status row's"
+    );
+    probe_answers(probe, too_old("unknown flag: --hub")).await;
+    assert_eq!(
+        status_of(&hosts, "mini3").unwrap()["craze"]["cause"],
+        "too_old"
+    );
+    assert!(
+        shed_craze_of(&hosts).is_empty(),
+        "too old: its status row's"
+    );
+    assert_eq!(craze.hook.dials(), 0, "no bridge --hub");
+}
+
+/// **A shed whose roost answered is WATCHED before its first inventory**
+/// (plan 026 §3.2, the C2 review's P2): the probe's `session.identify`
+/// answers and the watcher is installed, but no first inventory has arrived
+/// when the shed's craze `Ready` lists it — every subscribe here acks a
+/// DIFFERENT daemon incarnation than its identify, so the watcher resyncs and
+/// publishes nothing (`FakeRoost::restart_between_dials`; the probe only
+/// identifies, so it still answers). The status row says
+/// `roost_watched: true` with `connected_once` still false, so the UI does not
+/// read it as "craze only" (no roost watcher); once the daemon settles the
+/// inventory lands and it is simply reachable. A shed with no roost at all,
+/// listed by its craze, is `roost_watched: false`.
+#[tokio::test]
+async fn a_shed_whose_roost_answered_is_watched_before_its_first_inventory() {
+    let fake = FakeRoost::start().await;
+    fake.restart_between_dials(10_000);
+    let (shed, config) = srv_shed("s1");
+    let craze = Scripted::attach_only();
+    let hosts = start_scripted(
+        &config,
+        &test_options(&[(SHED, fake.socket_path())]),
+        vec![(shed.clone(), Arc::clone(&craze))],
+    );
+    refresh(&hosts, &["s1"]).await;
+    craze.probe.as_ref().unwrap().answer(Probe::Hub);
+    let _hub = craze.roster(json!([row(HOST_A, "ses-a")])).await;
+    let status = wait_for("listed by its craze Ready, its roost watched", || {
+        status_of(&hosts, SHED).filter(|s| s["roost_watched"] == true)
+    })
+    .await;
+    assert_eq!(status["craze"]["state"], "live", "{status}");
+    assert_eq!(
+        status["connected_once"], false,
+        "no inventory yet: {status}"
+    );
+    assert_eq!(status["reachable"], false, "{status}");
+
+    // The daemon settles: the first inventory lands, and it is reachable.
+    fake.restart_between_dials(0);
+    let status = wait_for("the first inventory", || {
+        status_of(&hosts, SHED).filter(|s| s["connected_once"] == true)
+    })
+    .await;
+    assert_eq!(status["reachable"], true, "{status}");
+    assert_eq!(status["roost_watched"], true, "{status}");
+
+    // A shed with no roost at all, listed by its craze alone: unwatched.
+    let (other, config) = srv_shed("s2");
+    let alone = Scripted::attach_only();
+    let hosts = start_scripted(
+        &config,
+        &test_options(&[]),
+        vec![(other, Arc::clone(&alone))],
+    );
+    refresh(&hosts, &["s2"]).await;
+    alone.probe.as_ref().unwrap().answer(Probe::Hub);
+    let _hub = alone.roster(json!([row(HOST_B, "ses-b")])).await;
+    let status = wait_for("listed by craze alone", || {
+        status_of(&hosts, "roost:srv/s2")
+    })
+    .await;
+    assert_eq!(
+        status["roost_watched"], false,
+        "no roost answered: {status}"
+    );
+    assert_eq!(status["connected_once"], false, "{status}");
 }

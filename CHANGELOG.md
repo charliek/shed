@@ -514,6 +514,8 @@ verbatim._
 - After a lost create answer, the desktop's craze create sheet keeps the request id across a
   re-read and a failed retry, so Try again can't start a second session while the first one
   runs.
+- A running shed whose craze has no hub yet offers New craze session on its Sheds row and in
+  New session, and says so when its craze is too old.
 - **The lane contract splits into a machine-level source and a session-scoped lane** (plan
   025 C4, `charliek/shed#391`). `shed_core::lane::AgentLane` was server-scoped, with static
   capabilities and a `create` no client called. It is now an `AgentSource` (`subscribe` to

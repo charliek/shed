@@ -100,6 +100,13 @@ The desktop runs one craze source per host: this machine, every `machines:`
 entry, and every running shed (a shed gets one when it is first seen running,
 whether or not roost is there).
 
+A shed shows in the Machines pane once something answers there: its
+roost-session, or its craze hub (the roster's first answer, or a session
+created there). Until then a running shed whose craze is **dormant** is
+offered **New craze session** on its Sheds-pane row and in the New-session
+dialog's "Where", without being listed, and one whose craze is **too old**
+says so on its row. A shed without craze says nothing.
+
 - **This machine is eager.** Its source holds one roster connection from
   launch. `bridge --hub` joins the hub already running there and starts one
   only when none is running yet — then in the app's own session, on a Mac the
@@ -117,7 +124,7 @@ every 30 s while craze is not installed or too old):
 | State | Meaning | What runs |
 |---|---|---|
 | `live` | Attached to the hub's roster | One `craze bridge --hub` roster connection |
-| `dormant` | craze is there, no hub is running; nothing is listed from craze | The probe again every 30 s |
+| `dormant` | craze is there, no hub is running; nothing is listed from craze (a dormant shed is offered New craze session without being listed) | The probe again every 30 s |
 | `offline` | The roster dropped, the probe could not ask (`cause: unreachable`), or craze is too old (`cause: too_old`) | The probe: about a second after a live roster ends, on a backoff (1 s → 30 s) while the host is unreachable, every 30 s while craze is too old |
 | `absent` | Never reached, or craze is not installed (`cause: not_installed`) | The probe; every 30 s while craze is not installed |
 
@@ -217,11 +224,28 @@ the row's hostId); a row without one offers **Open in terminal**.
 
 ### Creating a session
 
-**New craze session** is offered on a machine's card, on its group in the
-Agents pane, and as a "Where" choice in the New-session dialog, when the
-machine's craze is live and its hub can create — or when it is dormant, in
-which case opening the sheet is the explicit action that starts its hub. A hub
-too old to create says "update craze on this machine to create sessions here".
+**New craze session** is offered where a host's craze can create a session:
+live with a hub that can create, or dormant, in which case opening the sheet
+is the explicit action that starts its hub.
+
+- A dormant **machine** is offered it on its Machines-pane card (and, once it
+  lists sessions, on its group in the Agents pane).
+- A dormant **shed** is offered it on its Sheds-pane row. Until its roost
+  answers or it has a hub, a shed is not listed, so its row is where it is
+  offered; once listed, its card and its Agents-pane group offer it too.
+- Both are a "Where" choice in the New-session dialog ("— new craze session").
+
+A hub too old to create says "update craze on this machine to create sessions
+here". A craze too old for shed says "craze on this machine is too old for
+shed; update it" on the machine's card or the shed's row, and offers nothing.
+
+A shed listed by craze alone — a session created there, or its hub's roster,
+listed it, and no roost-session has answered there (so nothing watches one) —
+reads **craze only**
+on its Machines-pane card and in the sidebar, with "no roost session here yet
+— craze sessions only" beneath its name, rather than "connecting". It ranks
+with the reachable hosts, its sidebar dot is neutral, and the Agents pane does
+not count it as unreachable. Its card still offers to set up roost.
 
 The sheet reads craze's create options afresh on every open; shed stores no
 defaults or history of its own.

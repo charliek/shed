@@ -442,6 +442,11 @@ export type RoostDumpRow = {
    *  this target is on screen, which is what stops the four fields above from
    *  being a parallel data structure. Filled by the reporting effect. */
   rendered?: string;
+  /** The Sheds pane only (plan 026 §3.2): whether the row SHOWS "New craze
+   *  session", and the craze note it shows (too old) or `null` — both read
+   *  off the row's own DOM by the reporting effect. */
+  craze_create?: boolean;
+  craze_note?: string | null;
 };
 
 /** Build a [`RoostDumpRow`] from a board entry — the SAME data [`RoostLine`]
