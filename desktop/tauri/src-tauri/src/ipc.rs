@@ -491,6 +491,19 @@ fn craze_create_request(
     .map_err(craze_err)
 }
 
+/// `craze.create`'s `held` from the socket's params (plan 026 §3.1): TYPED
+/// like every other field — absent or `null` is a fresh create, a non-bool is
+/// `bad_request` — and, set, it needs the `request_id` it replays
+/// ([`crate::craze::held_create`]).
+fn craze_create_held(params: &Value) -> Result<bool, (String, String)> {
+    let held = match params.get("held") {
+        None | Some(Value::Null) => false,
+        Some(Value::Bool(b)) => *b,
+        Some(_) => return Err(err("bad_request", "'held' must be true or false")),
+    };
+    crate::craze::held_create(held, opt_str(params, "request_id")?).map_err(craze_err)
+}
+
 /// A craze op's refusal as the IPC error envelope ([`crate::craze::CrazeFailure`]).
 fn craze_err(failure: crate::craze::CrazeFailure) -> (String, String) {
     err(failure.code, failure.message)
@@ -1761,18 +1774,21 @@ impl Handler {
             .map_err(craze_err)
     }
 
-    /// `craze.create {machine, cwd, provider?, prompt?, request_id?}` →
+    /// `craze.create {machine, cwd, provider?, prompt?, request_id?, held?}` →
     /// `{session, host_id, prompt, prompt_error?, request_id}`: a new craze
     /// session, its row folded into the machine's listing at once. `cwd` must
     /// be absolute; a blank provider or prompt is absent
     /// ([`crate::craze::create_request`]); `request_id` is the caller's (reused
     /// only to retry an unknown outcome) or minted here — and answered back
-    /// either way.
+    /// either way. `held: true` says the call REPLAYS a request id kept from
+    /// an unknown outcome (plan 026 §3.1): only craze's own answer about that
+    /// request ends it, so anything else is `outcome_unknown` again.
     async fn craze_create(&self, params: &Value) -> Result<Value, (String, String)> {
         let machine = req_str(params, "machine")?.to_string();
+        let held = craze_create_held(params)?;
         let request = craze_create_request(params)?;
         self.machines
-            .craze_create(&machine, request)
+            .craze_create(&machine, request, held)
             .await
             .map_err(craze_err)
     }
@@ -2864,6 +2880,33 @@ mod tests {
                 "{key}: not a string"
             );
         }
+    }
+
+    /// `held` (plan 026 §3.1) is typed like every other field — absent or
+    /// `null` is a fresh create, a non-bool is `bad_request` — and a held
+    /// create needs the request id it replays.
+    #[test]
+    fn craze_create_reads_held_strictly() {
+        let base = json!({ "machine": "localhost", "cwd": "/w", "request_id": "shed-held-1" });
+        let with = |key: &str, v: Value| {
+            let mut p = base.clone();
+            p[key] = v;
+            p
+        };
+        assert_eq!(craze_create_held(&base), Ok(false));
+        assert_eq!(craze_create_held(&with("held", Value::Null)), Ok(false));
+        assert_eq!(craze_create_held(&with("held", json!(true))), Ok(true));
+        assert_eq!(craze_create_held(&with("held", json!(false))), Ok(false));
+        for bad in [json!(1), json!("true"), json!({})] {
+            assert_eq!(
+                craze_create_held(&with("held", bad.clone())).unwrap_err().0,
+                "bad_request",
+                "{bad}"
+            );
+        }
+        let mut no_id = with("held", json!(true));
+        no_id.as_object_mut().unwrap().remove("request_id");
+        assert_eq!(craze_create_held(&no_id).unwrap_err().0, "bad_request");
     }
 
     /// **The craze create sheet's driver doors are test-mode only** (plan 025

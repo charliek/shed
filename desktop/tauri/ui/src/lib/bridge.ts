@@ -1908,13 +1908,16 @@ export async function crazeCreateOptions(machine: string): Promise<CrazeCreateOp
 }
 
 /** The fields of one create — the sheet's typed form and the request id it
- *  holds (`crazeCreate.ts`'s lifecycle). */
+ *  holds (`crazeCreate.ts`'s lifecycle). `held`: this submission REPLAYS that
+ *  id, kept from an unknown outcome (`replaysHeldRequest`, plan 026 §3.1) —
+ *  then only craze's own answer about the request ends it. */
 export type CrazeCreateFields = {
   machine: string;
   cwd: string;
   provider?: string | null;
   prompt?: string | null;
   requestId: string;
+  held: boolean;
 };
 
 /** What `craze_create` answers: the new session's row (already in the
@@ -1933,7 +1936,8 @@ export type CrazeCreated = {
 };
 
 /** Create a craze session. THROWS a coded failure — `outcome_unknown` when
- *  craze's answer was lost twice (keep the id; Try again resumes it). */
+ *  craze's answer was lost twice, or a held replay got no answer about its
+ *  request (keep the id; Try again resumes it). */
 export async function crazeCreate(f: CrazeCreateFields): Promise<CrazeCreated> {
   return crazeInvoke<CrazeCreated>("craze_create", {
     machine: f.machine,
@@ -1941,6 +1945,7 @@ export async function crazeCreate(f: CrazeCreateFields): Promise<CrazeCreated> {
     provider: f.provider ?? undefined,
     prompt: f.prompt ?? undefined,
     requestId: f.requestId,
+    held: f.held,
   });
 }
 

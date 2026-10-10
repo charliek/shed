@@ -12,7 +12,7 @@ use serde_json::json;
 use shed_core::lane::SourceOffline;
 use shed_core::roost::testing::{ownership, FakeRoost};
 use shed_craze::testing::{full_hub_capabilities, roster_row, HookDial, HubEnd, ScriptedDial};
-use shed_craze::{CrazeDial, Probe};
+use shed_craze::{CrazeDial, DialError, Probe};
 use tokio::sync::mpsc::UnboundedReceiver;
 
 use super::*;
@@ -85,6 +85,8 @@ impl CrazeProbe for ProbeRef {
 /// attach-only host, its probe.
 struct Scripted {
     hook: Arc<HookDial>,
+    /// The scripted dial under `hook`, for a test that fails dials.
+    dial: Arc<ScriptedDial>,
     conns: tokio::sync::Mutex<UnboundedReceiver<HubEnd>>,
     probe: Option<Arc<ScriptedProbe>>,
 }
@@ -101,7 +103,8 @@ impl Scripted {
     fn new(probe: Option<Arc<ScriptedProbe>>) -> Arc<Scripted> {
         let (dial, conns) = ScriptedDial::new();
         Arc::new(Scripted {
-            hook: HookDial::new(dial as Arc<dyn CrazeDial>),
+            hook: HookDial::new(Arc::clone(&dial) as Arc<dyn CrazeDial>),
+            dial,
             conns: tokio::sync::Mutex::new(conns),
             probe,
         })
@@ -1149,7 +1152,7 @@ async fn a_created_session_is_listed_and_openable_at_once() {
         let hosts = Arc::clone(&hosts);
         tokio::spawn(async move {
             hosts
-                .craze_create(LOCALHOST, create_req("shed-req-1"))
+                .craze_create(LOCALHOST, create_req("shed-req-1"), false)
                 .await
         })
     };
@@ -1428,11 +1431,175 @@ async fn a_hub_too_old_to_create_is_refused_without_a_dial() {
         "{e:?}"
     );
     let e = hosts
-        .craze_create(LOCALHOST, create_req("shed-req-old"))
+        .craze_create(LOCALHOST, create_req("shed-req-old"), false)
         .await
         .unwrap_err();
     assert_eq!(e.code, "too_old", "{e:?}");
     assert_eq!(craze.hook.dials(), dials, "refused before any dial");
+}
+
+/// **A held create gets no definite answer but craze's** (plan 026 §3.1): a
+/// `craze.create` REPLAYING a kept request id whose host's craze is offline
+/// (not installed) or too old, or whose host is no longer registered, answers
+/// `outcome_unknown` — refused here before any dial, and without the
+/// definite code a fresh create gets — so the sheet keeps the id; and one
+/// whose dial never reaches craze is `outcome_unknown` too (the source's
+/// `create_held`), where a fresh one is a quiet `unavailable`.
+#[tokio::test]
+async fn a_held_create_on_an_offline_host_answers_outcome_unknown() {
+    // Not installed: every dial says so, the roster's and any create's.
+    let craze = Scripted::eager();
+    for _ in 0..10_000 {
+        craze
+            .dial
+            .fail_next(DialError::NotInstalled("craze: command not found".into()));
+    }
+    let hosts = start_scripted(
+        &ShedConfig::default(),
+        &test_options(&[]),
+        vec![(local(), Arc::clone(&craze))],
+    );
+    // A craze-only localhost is unlisted until a craze Ready: read its state.
+    wait_for("craze not installed", || {
+        let state = lock(&hosts.state);
+        (state.get(&local())?.craze.status()["cause"] == "not_installed").then_some(())
+    })
+    .await;
+    let dials = craze.hook.dials();
+    let held = hosts
+        .craze_create(LOCALHOST, create_req("shed-held-1"), true)
+        .await
+        .unwrap_err();
+    assert_eq!(held.code, "outcome_unknown", "{held:?}");
+    assert!(held.message.starts_with("outcome unknown: "), "{held:?}");
+    let fresh = hosts
+        .craze_create(LOCALHOST, create_req("shed-fresh-1"), false)
+        .await
+        .unwrap_err();
+    assert_eq!(fresh.code, "not_installed", "{fresh:?}");
+    // A host no longer registered: unknown when held, a bad request when not.
+    let gone = hosts
+        .craze_create("gone-machine", create_req("shed-held-2"), true)
+        .await
+        .unwrap_err();
+    assert_eq!(gone.code, "outcome_unknown", "{gone:?}");
+    let gone = hosts
+        .craze_create("gone-machine", create_req("shed-fresh-2"), false)
+        .await
+        .unwrap_err();
+    assert_eq!(gone.code, "bad_request", "{gone:?}");
+    // An address that names no machine at all is a bad request either way.
+    let unparsable = hosts
+        .craze_create("roost:no-server", create_req("shed-held-3"), true)
+        .await
+        .unwrap_err();
+    assert_eq!(unparsable.code, "bad_request", "{unparsable:?}");
+    assert!(
+        craze.hook.dials() - dials <= 1,
+        "refused before any dial (a roster redial aside)"
+    );
+
+    // Too old: a live hub that cannot create.
+    let craze = Scripted::eager();
+    let hosts = start_scripted(
+        &ShedConfig::default(),
+        &test_options(&[]),
+        vec![(local(), Arc::clone(&craze))],
+    );
+    let mut hub = craze.next().await;
+    let mut caps = full_hub_capabilities();
+    caps["sessionCreate"] = json!(false);
+    hub.hello(EPOCH, caps).await;
+    hub.subscribed("sub-1", EPOCH, json!([])).await;
+    wait_for("live", || {
+        (status_of(&hosts, LOCALHOST)?["craze"]["state"] == "live").then_some(())
+    })
+    .await;
+    let dials = craze.hook.dials();
+    let held = hosts
+        .craze_create(LOCALHOST, create_req("shed-held-4"), true)
+        .await
+        .unwrap_err();
+    assert_eq!(held.code, "outcome_unknown", "{held:?}");
+    let fresh = hosts
+        .craze_create(LOCALHOST, create_req("shed-fresh-4"), false)
+        .await
+        .unwrap_err();
+    assert_eq!(fresh.code, "too_old", "{fresh:?}");
+    assert_eq!(craze.hook.dials(), dials, "refused before any dial");
+
+    // Live and able, and the create's dial never reaches craze.
+    let craze = Scripted::eager();
+    let hosts = start_scripted(
+        &ShedConfig::default(),
+        &test_options(&[]),
+        vec![(local(), Arc::clone(&craze))],
+    );
+    let _roster = craze.roster(json!([])).await;
+    wait_for("live", || {
+        (status_of(&hosts, LOCALHOST)?["craze"]["state"] == "live").then_some(())
+    })
+    .await;
+    for _ in 0..3 {
+        craze
+            .dial
+            .fail_next(DialError::Unreachable("ssh: connection refused".into()));
+    }
+    let held = hosts
+        .craze_create(LOCALHOST, create_req("shed-held-5"), true)
+        .await
+        .unwrap_err();
+    assert_eq!(held.code, "outcome_unknown", "{held:?}");
+    let fresh = hosts
+        .craze_create(LOCALHOST, create_req("shed-fresh-5"), false)
+        .await
+        .unwrap_err();
+    assert_eq!(fresh.code, "unavailable", "{fresh:?}");
+}
+
+/// **A create answered ok with a result shed cannot read is
+/// `outcome_unknown`** (plan 026 AM1): craze may have started the session, so
+/// the sheet must keep its id — a definite `failed` here would end it while
+/// that session runs. Both attempts read nothing (the source's one retry), and
+/// nothing is listed.
+#[tokio::test]
+async fn an_unreadable_create_answer_is_outcome_unknown() {
+    let craze = Scripted::eager();
+    let hosts = Arc::new(start_scripted(
+        &ShedConfig::default(),
+        &test_options(&[]),
+        vec![(local(), Arc::clone(&craze))],
+    ));
+    let _roster = craze.roster(json!([])).await;
+    wait_for("live", || {
+        (status_of(&hosts, LOCALHOST)?["craze"]["state"] == "live").then_some(())
+    })
+    .await;
+    let create = {
+        let hosts = Arc::clone(&hosts);
+        tokio::spawn(async move {
+            hosts
+                .craze_create(LOCALHOST, create_req("shed-unreadable"), false)
+                .await
+        })
+    };
+    for _ in 0..2 {
+        let mut hub = craze.next().await;
+        hub.hello(EPOCH, full_hub_capabilities()).await;
+        let req = hub.expect("session.create").await;
+        assert_eq!(req["params"]["requestId"], "shed-unreadable");
+        hub.reply(
+            &req,
+            json!({"session": {"hostId": HOST_NEW}, "prompt": "accepted"}),
+        )
+        .await;
+    }
+    let e = create.await.unwrap().unwrap_err();
+    assert_eq!(e.code, "outcome_unknown", "{e:?}");
+    assert!(
+        !craze_rows(&hosts).iter().any(|r| r["slug"] == HOST_NEW),
+        "nothing listed from an answer shed cannot read"
+    );
 }
 
 /// **An opened tab attaches to ITS session** even when another row claims the
@@ -1762,7 +1929,11 @@ async fn create_answering(
     let create = {
         let hosts = Arc::clone(hosts);
         let request_id = request_id.to_string();
-        tokio::spawn(async move { hosts.craze_create(LOCALHOST, create_req(&request_id)).await })
+        tokio::spawn(async move {
+            hosts
+                .craze_create(LOCALHOST, create_req(&request_id), false)
+                .await
+        })
     };
     let mut hub = craze.next().await;
     hub.hello(EPOCH, full_hub_capabilities()).await;
@@ -2019,7 +2190,7 @@ async fn a_create_answered_as_the_roster_lets_it_go_is_not_listed_again() {
         let hosts = Arc::clone(&hosts);
         tokio::spawn(async move {
             hosts
-                .craze_create(LOCALHOST, create_req("shed-race-1"))
+                .craze_create(LOCALHOST, create_req("shed-race-1"), false)
                 .await
         })
     };

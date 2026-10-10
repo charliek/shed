@@ -261,6 +261,13 @@ SHED_CRAZE_REQUIRE=1 SHED_CRAZE_BIN_DIR=/work/desktop/tools/shedtest/.craze-bin 
   `outcome_unknown` with the same id twice in the log. `outage` makes every craze run exit 1
   before any hub (Unreachable — a short backoff, unlike not-installed's 30 s); SIGTERM the hub
   with it on to take a machine OFFLINE under an open sheet, then remove it to bring it back.
+  `refuse-dials` (with `proxy` on; plan 026) makes each NEW `bridge --hub` refuse the
+  connection (logged to `refused.log`, read with `rig.refused()`) while connections already up
+  — the roster's — stay, so the machine stays live: a create's dial fails without the machine
+  going offline under the sheet, which `outage` cannot do. A HELD retry (Try again after an
+  unknown outcome, sent `held: true`) dials twice into it and stays `unknown`; wait on the
+  dump's `error.message` naming the refusal, not on `state` (it reads `unknown` before the
+  press too).
 - **A start failure on demand**: point `[agents].grok` at `craze-fake-agent -script
   exit-two-lines` (`rig.set_grok(...)`); craze reads it at every create. Restore it (in a
   `finally`) before the next create.

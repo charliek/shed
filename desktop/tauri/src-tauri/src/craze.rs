@@ -604,8 +604,11 @@ impl CrazeState {
 /// plus the ones only a create sheet needs:
 ///
 /// * `outcome_unknown` — a create whose answer was lost, twice
-///   ([`shed_craze::is_outcome_unknown`]): the ONE refusal after which the
-///   sheet keeps its request id (plan 025 §3.8);
+///   ([`shed_craze::is_outcome_unknown`]), or a HELD create (a replay of a
+///   kept id, plan 026 §3.1) that got no answer about its request — not even
+///   this layer's own preflight (an unregistered host, craze offline or too
+///   old): the ONE refusal after which the sheet keeps its request id (plan
+///   025 §3.8);
 /// * `too_old` — this machine's craze cannot list providers or create
 ///   (`createOptions`/`sessionCreate` missing from its hub's `hello`, or a
 ///   v0.0.1): the sheet says "update craze on this machine";
@@ -697,6 +700,21 @@ pub fn create_request(
         prompt: prompt.filter(|s| !s.trim().is_empty()).map(str::to_string),
         request_id,
     })
+}
+
+/// Whether a `craze.create` REPLAYS a held request id (plan 026 §3.1) — what
+/// `held` means at both doors. The sheet sets it exactly when it re-sends the
+/// id it kept from an unknown outcome; the create then ends that id only on
+/// craze's own answer about it ([`shed_core::lane::AgentSource::create_held`]).
+/// A held create without a `request_id` is `bad_request`: there is nothing to
+/// replay, and minting one in its place would make the "replay" a new request.
+pub fn held_create(held: bool, request_id: Option<&str>) -> Result<bool, CrazeFailure> {
+    if held && request_id.is_none() {
+        return Err(CrazeFailure::bad_request(
+            "a held create replays the request id it was held under: send `request_id` with `held`",
+        ));
+    }
+    Ok(held)
 }
 
 // ---------------------------------------------------------------------------
@@ -1132,6 +1150,15 @@ mod tests {
             let e = create_request(Some("/w"), None, None, Some(bad)).unwrap_err();
             assert_eq!(e.code, "bad_request", "{bad:?}");
         }
+    }
+
+    /// `held` replays an id, so it needs one; absent, a create is fresh.
+    #[test]
+    fn a_held_create_needs_the_request_id_it_replays() {
+        assert_eq!(held_create(true, Some("shed-held")), Ok(true));
+        assert_eq!(held_create(false, Some("shed-held")), Ok(false));
+        assert_eq!(held_create(false, None), Ok(false));
+        assert_eq!(held_create(true, None).unwrap_err().code, "bad_request");
     }
 
     /// The create ops' failures: the lane contract's codes, and a lost

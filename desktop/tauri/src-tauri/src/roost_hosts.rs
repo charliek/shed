@@ -1569,14 +1569,44 @@ impl RoostHosts {
     /// already applied — read before the lock, a session the roster listed
     /// and let go in between would be folded back by `listed_now`, a row no
     /// later frame removes.
+    ///
+    /// **`held`: the request REPLAYS a kept id** (plan 026 §3.1) — the sheet
+    /// re-sending the id it held from an unknown outcome. Then only craze's
+    /// own answer about that request ends the id: the create goes through
+    /// [`shed_core::lane::AgentSource::create_held`] (a dial that never
+    /// reached craze, or craze's `unavailable` with `host_unreachable` or
+    /// `busy`, is unknown again), and this layer's own preflight refusals —
+    /// the host no longer registered, craze offline (not installed) or too
+    /// old — answer `outcome_unknown` rather than a definite code the sheet
+    /// would end its id on. A host address that does not parse is still
+    /// `bad_request`: it names no machine at all.
     pub async fn craze_create(
         &self,
         host: &str,
         request: LaneCreateRequest,
+        held: bool,
     ) -> Result<Value, CrazeFailure> {
-        let (id, ask, gen, wake) = self.craze_ask(host, CrazeNeed::Create)?;
+        HostId::parse(host).map_err(CrazeFailure::bad_request)?;
+        let (id, ask, gen, wake) = match self.craze_ask(host, CrazeNeed::Create) {
+            Ok(asked) => asked,
+            Err(f) if held => {
+                return Err(CrazeFailure::new(
+                    "outcome_unknown",
+                    shed_craze::errors::outcome_unknown(&format!(
+                        "the retry did not reach craze on {host} ({}: {}); it may have started a session — try again once craze is back, with the same request id",
+                        f.code, f.message
+                    ))
+                    .to_string(),
+                ))
+            }
+            Err(f) => return Err(f),
+        };
         let request_id = request.request_id.clone();
-        let answer = ask.create(request).await;
+        let answer = if held {
+            ask.create_held(request).await
+        } else {
+            ask.create(request).await
+        };
         wake.notify_one();
         let created = answer.map_err(CrazeFailure::lane)?;
         let host_id = created.session.id.clone();

@@ -99,10 +99,20 @@ HELLO = {"protocols": [1], "client": {"kind": "test", "name": "shedtest"}}
 #: the create (and a waiter that disconnects does not cancel one), the client
 #: never sees its answer — an unknown outcome, exactly. A `session.set` (C11) is
 #: the same: logged to `sets.log` with its params, and cut while `drop-sets`
-#: exists — craze runs the change, and the lane never reads its answer.
+#: exists — craze runs the change, and the lane never reads its answer. While
+#: `refuse-dials` exists (plan 026 §3.1), a NEW bridge refuses the connection
+#: before any hub: logged to `refused.log`, a line on stderr, exit 1 — the
+#: dial never reaches craze (Unreachable), and connections already up (the
+#: roster's) are untouched.
 BRIDGE_PROXY = r"""
 import json, os, subprocess, sys, threading, time
 root = os.path.dirname(os.path.abspath(__file__))
+if os.path.exists(os.path.join(root, "refuse-dials")):
+    with open(os.path.join(root, "refused.log"), "a") as log:
+        log.write(json.dumps({"argv": sys.argv[2:]}) + "\n")
+    sys.stderr.write("shedtest: the bridge refused the connection\n")
+    sys.stderr.flush()
+    os._exit(1)
 child = subprocess.Popen(sys.argv[1:], stdin=subprocess.PIPE, stdout=subprocess.PIPE)
 cut = threading.Event()
 def down():
@@ -297,6 +307,13 @@ class CrazeEnv:
             return []
         return [json.loads(line) for line in log.read_text().splitlines() if line.strip()]
 
+    def refused(self) -> list[dict]:
+        """Every NEW bridge the proxy refused while `refuse-dials` was on."""
+        log = self.root / "refused.log"
+        if not log.exists():
+            return []
+        return [json.loads(line) for line in log.read_text().splitlines() if line.strip()]
+
     def set_grok(self, agent: Path) -> None:
         """Point `[agents].grok` at `agent` (craze reads it at every create)."""
         self.set_agents(grok=agent)
@@ -321,7 +338,7 @@ class CrazeEnv:
 
     def switch(self, name: str, on: bool) -> None:
         """Turn one of the wrapper's switches (`outage`, `proxy`,
-        `drop-creates`, `drop-sets`) on or off."""
+        `drop-creates`, `drop-sets`, `refuse-dials`) on or off."""
         flag = self.root / name
         if on:
             flag.touch()
@@ -969,6 +986,123 @@ def test_an_unknown_outcome_is_retried_under_the_same_id(app, rig):
     assert sent[-1]["dropped"] is False
     rig.switch("proxy", False)
     _exactly_one_session_in(app, cwd)
+    _unmount(app)
+
+
+def _lose_a_create(app: TauriClient, rig: CrazeEnv, cwd: Path) -> tuple[str, str, int]:
+    """Submit a create in `cwd` whose answer is LOST (the `drop-creates` seam:
+    the hub has it, the bridge is cut — and so is the source's one automatic
+    retry), wait for the sheet to say the outcome is unknown, and for the
+    session the hub started to be listed. Answers the held request id, that
+    session's hostId, and where `rig.creates()` stood before the submit. The
+    `proxy` switch is left ON (the caller logs its retries through it)."""
+    rig.switch("proxy", True)
+    rig.switch("drop-creates", True)
+    before = len(rig.creates())
+    try:
+        _open_sheet(app)
+        _fill(app, cwd=str(cwd), prompt="")
+        _submit_when_ready(app)
+        try:
+            app.wait_until(lambda: (_sheet(app) or {}).get("state") == "unknown", timeout=WAIT,
+                           what="the sheet to report an unknown outcome")
+        except Exception as e:
+            raise AssertionError(f"{e}: sheet={_sheet(app)} creates={rig.creates()}") from e
+    finally:
+        rig.switch("drop-creates", False)
+    held = _sheet(app)["request_id"]
+    assert held and held.startswith("shed-"), _sheet(app)
+    sent = rig.creates()[before:]
+    assert [c["requestId"] for c in sent] == [held, held], f"the source's own retry, same id: {sent}"
+    app.wait_until(lambda: len(_rows_in(app, cwd)) == 1, timeout=WAIT,
+                   what=f"the session the lost create started, in {cwd}")
+    return held, _rows_in(app, cwd)[0]["slug"], before
+
+
+def test_an_unknown_outcome_survives_its_provider_going_non_ready(app, rig):
+    """**A held request id survives a re-read** (plan 026 §3.1, shed#401): after
+    an unknown outcome, the create's provider goes non-ready (grok's agent no
+    longer configured) and the sheet is closed and re-opened, so its options
+    are read afresh. The held provider stays SELECTED (dimmed), the id is the
+    same, and "Try again" works — readiness does not gate a replay, because
+    craze answers a held id regardless. Pressed with grok STILL non-ready, it
+    re-sends that id and craze answers with the session the first create
+    started: its transcript opens, and exactly one session runs there."""
+    cwd = _mkdir_0700(rig.root / "w-held-dimmed")
+    held, host, before = _lose_a_create(app, rig, cwd)
+    try:
+        rig.set_agents()  # no [agents] at all: grok is not found, not ready
+        _close_sheet(app)
+        d = _open_sheet(app)
+        grok = next((p for p in d["providers"] if p["id"] == "grok"), None)
+        assert grok and grok["dimmed"] is True and grok["state"] != "ready", d["providers"]
+        assert not any(p["dimmed"] is False for p in d["providers"]), \
+            f"no provider is ready now: {d['providers']}"
+        assert d["state"] == "unknown", d
+        assert d["request_id"] == held, f"the same id after the re-read: {d}"
+        assert [p["id"] for p in d["providers"] if p["selected"]] == ["grok"], d["providers"]
+        assert d["primary"] == "Try again", d
+        assert d["create_enabled"] is True, d
+        assert "Changing the form starts a new request instead." in (d["note"] or ""), d["note"]
+        assert "no provider is ready" not in (d["note"] or ""), d["note"]
+        assert "held for the retry" in d["rendered"], d["rendered"]
+        _shot(app, "craze-create-held-dimmed.png")
+
+        _submit_when_ready(app)  # Try again, grok still not ready
+        app.wait_until(lambda: _sheet(app) is None, timeout=WAIT, what="the sheet to close on Created")
+        app.wait_until(lambda: (_dump(app) or {}).get("session_id") == host, timeout=WAIT,
+                       what=f"the transcript of the ORIGINAL session {host}")
+    finally:
+        rig.set_grok(rig.grok_echo)
+        rig.switch("proxy", False)
+    sent = rig.creates()[before:]
+    assert [c["requestId"] for c in sent] == [held, held, held], f"one id throughout: {sent}"
+    assert sent[-1]["dropped"] is False, sent
+    row = _exactly_one_session_in(app, cwd)
+    assert row["slug"] == host, row
+    _unmount(app)
+
+
+def test_a_failed_manual_retry_keeps_the_held_id(app, rig):
+    """**A held request id survives a failed retry** (plan 026 §3.1): after an
+    unknown outcome, "Try again" is pressed while every NEW bridge refuses the
+    connection — the retry never reaches craze, which says nothing about the
+    request — so the sheet stays unknown, holding the SAME id (a definite error
+    here would end it, and the next press would start a second session). With
+    the bridges back, "Try again" re-sends that id and craze answers with the
+    original session: one session, its hostId."""
+    cwd = _mkdir_0700(rig.root / "w-held-refused")
+    held, host, before = _lose_a_create(app, rig, cwd)
+    refused_before = len(rig.refused())
+    rig.switch("refuse-dials", True)
+    try:
+        _submit_when_ready(app)  # Try again, into a refused dial
+        app.wait_until(
+            lambda: "refused the connection" in (((_sheet(app) or {}).get("error") or {}).get("message") or ""),
+            timeout=WAIT, what="the failed retry to settle")
+        d = _sheet(app)
+        assert d["state"] == "unknown", f"a retry that never reached craze is still unknown: {d}"
+        assert d["request_id"] == held, f"the SAME id held: {d}"
+        assert d["error"]["code"] == "outcome_unknown", d["error"]
+        assert d["primary"] == "Try again" and d["create_enabled"] is True, d
+        assert len(rig.refused()) - refused_before == 2, \
+            f"the held attempt and its one retry, both refused: {rig.refused()}"
+        assert len(rig.creates()) - before == 2, f"no create reached the hub: {rig.creates()[before:]}"
+        _shot(app, "craze-create-held-refused.png")
+    finally:
+        rig.switch("refuse-dials", False)
+
+    try:
+        _submit_when_ready(app)  # Try again, the bridges back
+        app.wait_until(lambda: _sheet(app) is None, timeout=WAIT, what="the sheet to close on Created")
+        app.wait_until(lambda: (_dump(app) or {}).get("session_id") == host, timeout=WAIT,
+                       what=f"the transcript of the ORIGINAL session {host}")
+    finally:
+        rig.switch("proxy", False)
+    sent = rig.creates()[before:]
+    assert [c["requestId"] for c in sent] == [held, held, held], f"one id throughout: {sent}"
+    row = _exactly_one_session_in(app, cwd)
+    assert row["slug"] == host, row
     _unmount(app)
 
 

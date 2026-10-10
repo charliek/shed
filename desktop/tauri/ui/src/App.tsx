@@ -22,7 +22,7 @@ import { CrazeCreateDialog } from "@/components/CrazeCreateDialog";
 import { canOpenTerminal, crazeDoingLine, crazeMachineNote, killTarget } from "@/lib/crazeRows";
 import {
   EMPTY_DRAFT, beginSubmit, closesOntoTranscript, crazeCreateOffered, crazeCreateUpdateNote,
-  edit as editCrazeDraft, groupMachine, liveSetter, settle, sheetOnScreen,
+  edit as editCrazeDraft, groupMachine, liveSetter, replaysHeldRequest, settle, sheetOnScreen,
   type CrazeDraft,
 } from "@/lib/crazeCreate";
 import { RoostLine, RoostConsentDialog, Toast } from "@/components/RoostBootstrap";
@@ -2038,12 +2038,16 @@ export default function App() {
   }, [setCrazeMachine, setModal]);
   // Run one submission of `machine`'s draft. **The request id is the draft's**
   // — reused while an outcome is unknown, minted anew after any definite one
-  // (`beginSubmit`/`settle`). Created: the draft is spent, the rows refresh,
-  // a first prompt craze did not take is said, and — if this sheet is still
-  // the one open — it closes onto that session's transcript at once.
+  // (`beginSubmit`/`settle`) — and a reused one is sent as a held replay
+  // (`replaysHeldRequest`, read BEFORE the submission starts: plan 026 §3.1),
+  // so nothing but craze's own answer about it ends it. Created: the draft is
+  // spent, the rows refresh, a first prompt craze did not take is said, and —
+  // if this sheet is still the one open — it closes onto that session's
+  // transcript at once.
   const submitCraze = useCallback(async (machine: string) => {
     const current = crazeDrafts.current[machine] ?? EMPTY_DRAFT;
     if (current.phase === "submitting") return;
+    const held = replaysHeldRequest(current);
     const started = beginSubmit(current);
     updateDraft(machine, () => started);
     try {
@@ -2053,6 +2057,7 @@ export default function App() {
         provider: started.provider,
         prompt: started.prompt,
         requestId: started.requestId ?? "",
+        held,
       });
       updateDraft(machine, () => EMPTY_DRAFT);
       refreshRc();

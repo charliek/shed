@@ -1258,6 +1258,279 @@ async fn a_create_that_never_reached_craze_is_definite() {
     assert_eq!(dial.dials(), 1);
 }
 
+// ---- a held request id, replayed (plan 026 §3.1) ----
+
+/// **A held replay whose dial never reaches craze stays unknown**: the same
+/// failure that is a definite, quiet answer for a fresh create (above) says
+/// nothing about a request that may already have started a session — so both
+/// of the held create's attempts are retries, and the caller keeps its id.
+#[tokio::test]
+async fn a_held_create_that_never_reached_craze_stays_unknown() {
+    let (dial, _conns) = ScriptedDial::new();
+    for _ in 0..2 {
+        dial.fail_next(DialError::NotInstalled("craze: command not found".into()));
+    }
+    let got = source(Arc::clone(&dial))
+        .create_held(create_request("req-held-dial"))
+        .await
+        .unwrap_err();
+    assert!(crate::errors::is_outcome_unknown(&got), "{got:?}");
+    assert_eq!(dial.dials(), 2, "the held attempt, then the one retry");
+}
+
+/// **craze's `unavailable` that says nothing about the request** — reason
+/// `host_unreachable` (its registry could not be read) or `busy` — leaves a
+/// held replay unknown: retried once under the same id, then
+/// `outcome_unknown`. The retry is answered when craze can answer.
+#[tokio::test]
+async fn a_held_create_craze_could_not_answer_for_stays_unknown() {
+    for why in ["host_unreachable", "busy"] {
+        let (dial, mut conns) = ScriptedDial::new();
+        let src = source(Arc::clone(&dial));
+        let create =
+            tokio::spawn(async move { src.create_held(create_request("req-held-1")).await });
+        for epoch in ["epoch-1", "epoch-2"] {
+            let mut hub = next_conn(&mut conns).await;
+            hub.hello(epoch, full_hub_capabilities()).await;
+            let req = hub.expect("session.create").await;
+            assert_eq!(req["params"]["requestId"], "req-held-1", "{why}");
+            hub.refuse(&req, "unavailable", why, json!({})).await;
+        }
+        let got = create.await.unwrap().unwrap_err();
+        assert!(crate::errors::is_outcome_unknown(&got), "{why}: {got:?}");
+        assert_eq!(dial.dials(), 2, "{why}: one retry, no more");
+
+        // Refused once, answered on the retry: the session the id started.
+        let (dial, mut conns) = ScriptedDial::new();
+        let src = source(Arc::clone(&dial));
+        let create =
+            tokio::spawn(async move { src.create_held(create_request("req-held-2")).await });
+        let mut hub = next_conn(&mut conns).await;
+        hub.hello("epoch-1", full_hub_capabilities()).await;
+        let req = hub.expect("session.create").await;
+        hub.refuse(&req, "unavailable", why, json!({})).await;
+        let mut hub2 = next_conn(&mut conns).await;
+        hub2.hello("epoch-1", full_hub_capabilities()).await;
+        let again = hub2.expect("session.create").await;
+        assert_eq!(again["params"], req["params"], "{why}: the same request");
+        hub2.reply(&again, created_result()).await;
+        assert_eq!(
+            create.await.unwrap().unwrap().session.id,
+            "cccccccccccc",
+            "{why}"
+        );
+    }
+}
+
+/// **`closing` on a replay is unknown** (plan 026 AM1): craze v0.1.0's admit
+/// can find a held id's LIVE session in its registry and then refuse
+/// `unavailable`/`closing` from `beginCreate` without joining it (and join's
+/// own cut answers `closing` too). A held replay so refused — and the
+/// source's own retry so refused — keeps the id.
+#[tokio::test]
+async fn a_replayed_create_refused_closing_stays_unknown() {
+    let (dial, mut conns) = ScriptedDial::new();
+    let src = source(Arc::clone(&dial));
+    let create = tokio::spawn(async move { src.create_held(create_request("req-closing")).await });
+    for epoch in ["epoch-1", "epoch-2"] {
+        let mut hub = next_conn(&mut conns).await;
+        hub.hello(epoch, full_hub_capabilities()).await;
+        let req = hub.expect("session.create").await;
+        hub.refuse(&req, "unavailable", "closing", json!({})).await;
+    }
+    let got = create.await.unwrap().unwrap_err();
+    assert!(crate::errors::is_outcome_unknown(&got), "{got:?}");
+    assert_eq!(dial.dials(), 2, "the held attempt, then the one retry");
+
+    // The source's own retry, after a lost answer, refused closing.
+    let (dial, mut conns) = ScriptedDial::new();
+    let src = source(Arc::clone(&dial));
+    let create = tokio::spawn(async move { src.create(create_request("req-closing-2")).await });
+    let mut hub = next_conn(&mut conns).await;
+    hub.hello("epoch-1", full_hub_capabilities()).await;
+    hub.expect("session.create").await;
+    hub.close().await;
+    let mut hub2 = next_conn(&mut conns).await;
+    hub2.hello("epoch-2", full_hub_capabilities()).await;
+    let retry = hub2.expect("session.create").await;
+    hub2.refuse(&retry, "unavailable", "closing", json!({}))
+        .await;
+    let got = create.await.unwrap().unwrap_err();
+    assert!(crate::errors::is_outcome_unknown(&got), "{got:?}");
+}
+
+/// A FRESH create refused `closing` started nothing under its new id (a
+/// teardown ends what it cut): definite, and never retried.
+#[tokio::test]
+async fn a_fresh_create_refused_closing_is_definite() {
+    let (dial, mut conns) = ScriptedDial::new();
+    let src = source(Arc::clone(&dial));
+    let create = tokio::spawn(async move { src.create(create_request("req-fresh-closing")).await });
+    let mut hub = next_conn(&mut conns).await;
+    hub.hello("epoch-1", full_hub_capabilities()).await;
+    let req = hub.expect("session.create").await;
+    hub.refuse(&req, "unavailable", "closing", json!({})).await;
+    let got = create.await.unwrap().unwrap_err();
+    assert_eq!(got, LaneError::Unavailable("unavailable/closing".into()));
+    assert!(!crate::errors::is_outcome_unknown(&got));
+    assert_eq!(dial.dials(), 1, "no retry");
+}
+
+/// **A refusal standing in for a success craze could not send is unknown,
+/// even on a FRESH create** (plan 026 AM1): craze v0.1.0 answers
+/// `failed`/`response_too_large` (or `failed`/`failed`) only from
+/// `encodeReply`, in place of a create result it could not encode — the
+/// session exists. The id is kept (`outcome_unknown`), and the source's one
+/// automatic retry is the only one.
+#[tokio::test]
+async fn a_fresh_create_answered_response_too_large_is_unknown() {
+    let (dial, mut conns) = ScriptedDial::new();
+    let src = source(Arc::clone(&dial));
+    let create = tokio::spawn(async move { src.create(create_request("req-too-large")).await });
+    for epoch in ["epoch-1", "epoch-2"] {
+        let mut hub = next_conn(&mut conns).await;
+        hub.hello(epoch, full_hub_capabilities()).await;
+        let req = hub.expect("session.create").await;
+        assert_eq!(req["params"]["requestId"], "req-too-large");
+        hub.refuse(&req, "failed", "response_too_large", json!({}))
+            .await;
+    }
+    let got = create.await.unwrap().unwrap_err();
+    assert!(crate::errors::is_outcome_unknown(&got), "{got:?}");
+    assert_eq!(dial.dials(), 2, "the fresh attempt, then the one retry");
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), conns.recv())
+            .await
+            .is_err(),
+        "no third attempt"
+    );
+}
+
+/// **A success shed cannot decode is an unknown outcome** (plan 026 AM1):
+/// craze answered ok — a session may exist — so neither a result that does
+/// not read nor a session row that does not read ends the id. The source's
+/// automatic retry stays bounded to its one; a held replay is the same; and a
+/// retry that decodes is the session.
+#[tokio::test]
+async fn an_undecodable_create_result_is_an_unknown_outcome() {
+    let unreadable = [
+        json!("not a create result"),
+        json!({"session": {"hostId": "cccccccccccc"}, "prompt": "accepted"}),
+    ];
+    for bad in &unreadable {
+        for held in [false, true] {
+            let (dial, mut conns) = ScriptedDial::new();
+            let src = source(Arc::clone(&dial));
+            let create = tokio::spawn(async move {
+                if held {
+                    src.create_held(create_request("req-unreadable")).await
+                } else {
+                    src.create(create_request("req-unreadable")).await
+                }
+            });
+            for epoch in ["epoch-1", "epoch-2"] {
+                let mut hub = next_conn(&mut conns).await;
+                hub.hello(epoch, full_hub_capabilities()).await;
+                let req = hub.expect("session.create").await;
+                hub.reply(&req, bad.clone()).await;
+            }
+            let got = create.await.unwrap().unwrap_err();
+            assert!(
+                crate::errors::is_outcome_unknown(&got),
+                "{bad} (held {held}): {got:?}"
+            );
+            assert!(got.to_string().contains("cannot read"), "{got}");
+            assert_eq!(dial.dials(), 2, "{bad} (held {held}): one retry, no more");
+            assert!(
+                tokio::time::timeout(Duration::from_millis(200), conns.recv())
+                    .await
+                    .is_err(),
+                "no third attempt"
+            );
+        }
+    }
+    // Unreadable, then read on the retry: the session.
+    let (dial, mut conns) = ScriptedDial::new();
+    let src = source(Arc::clone(&dial));
+    let create = tokio::spawn(async move { src.create(create_request("req-unreadable-2")).await });
+    let mut hub = next_conn(&mut conns).await;
+    hub.hello("epoch-1", full_hub_capabilities()).await;
+    let req = hub.expect("session.create").await;
+    hub.reply(&req, unreadable[1].clone()).await;
+    let mut hub2 = next_conn(&mut conns).await;
+    hub2.hello("epoch-1", full_hub_capabilities()).await;
+    let again = hub2.expect("session.create").await;
+    assert_eq!(again["params"]["requestId"], "req-unreadable-2");
+    hub2.reply(&again, created_result()).await;
+    assert_eq!(create.await.unwrap().unwrap().session.id, "cccccccccccc");
+}
+
+/// The SOURCE'S OWN retry is a replay too: a create whose first answer was
+/// lost and whose retry craze refuses `host_unreachable` is `outcome_unknown`,
+/// not a definite `unavailable` the caller would end its id on.
+#[tokio::test]
+async fn a_lost_create_whose_retry_craze_cannot_answer_is_unknown() {
+    let (dial, mut conns) = ScriptedDial::new();
+    let src = source(Arc::clone(&dial));
+    let create = tokio::spawn(async move { src.create(create_request("req-lost")).await });
+    let mut hub = next_conn(&mut conns).await;
+    hub.hello("epoch-1", full_hub_capabilities()).await;
+    hub.expect("session.create").await;
+    hub.close().await;
+    let mut hub2 = next_conn(&mut conns).await;
+    hub2.hello("epoch-2", full_hub_capabilities()).await;
+    let retry = hub2.expect("session.create").await;
+    hub2.refuse(&retry, "unavailable", "host_unreachable", json!({}))
+        .await;
+    let got = create.await.unwrap().unwrap_err();
+    assert!(crate::errors::is_outcome_unknown(&got), "{got:?}");
+    assert_eq!(dial.dials(), 2);
+}
+
+/// **craze's own answer about the request ends a held id**: a refusal of it —
+/// `bad_request` (`request_conflict` included), a replayed start failure, any
+/// other `unavailable` — is definite on a replay exactly as on a fresh create,
+/// and is never retried.
+#[tokio::test]
+async fn a_held_create_ends_on_crazes_answer_about_the_request() {
+    for (code, reason, extra, want) in [
+        (
+            "bad_request",
+            "request_conflict",
+            json!({}),
+            LaneError::BadRequest("bad_request/request_conflict".into()),
+        ),
+        (
+            "bad_request",
+            "bad_request",
+            json!({}),
+            LaneError::BadRequest("bad_request/bad_request".into()),
+        ),
+        (
+            "not_accepting",
+            "start_failed",
+            json!({"cause": "Error: KEYCHAIN LOCKED"}),
+            LaneError::Failed("Error: KEYCHAIN LOCKED".into()),
+        ),
+        (
+            "unavailable",
+            "spawn_failed",
+            json!({}),
+            LaneError::Unavailable("unavailable/spawn_failed".into()),
+        ),
+    ] {
+        let (dial, mut conns) = ScriptedDial::new();
+        let src = source(Arc::clone(&dial));
+        let create = tokio::spawn(async move { src.create_held(create_request("req-x")).await });
+        let mut hub = next_conn(&mut conns).await;
+        hub.hello("epoch-1", full_hub_capabilities()).await;
+        let req = hub.expect("session.create").await;
+        hub.refuse(&req, code, reason, extra).await;
+        assert_eq!(create.await.unwrap().unwrap_err(), want, "{code}/{reason}");
+        assert_eq!(dial.dials(), 1, "{code}/{reason}: no retry");
+    }
+}
+
 /// `createOptions`: craze's order, states, reasons, the default and the recent
 /// directories (fixture 26's answer).
 #[tokio::test]

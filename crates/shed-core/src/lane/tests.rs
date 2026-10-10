@@ -947,6 +947,24 @@ fn both_traits_are_object_safe_and_the_lane_is_session_scoped() {
     fn assert_send<T: Send>(_: &T) {}
     assert_send(&source.subscribe());
     assert_send(&source.open("ses_1"));
+    // `create_held` is additive: NoSource never wrote it, and its default is
+    // `create` (plan 026 §3.1).
+    let request = LaneCreateRequest {
+        cwd: "/w".into(),
+        provider: None,
+        prompt: None,
+        request_id: "req-held".into(),
+    };
+    assert_send(&source.create_held(request.clone()));
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .expect("a runtime");
+    assert_eq!(
+        rt.block_on(source.create_held(request.clone()))
+            .unwrap_err(),
+        rt.block_on(source.create(request)).unwrap_err(),
+        "the default create_held answers what create does"
+    );
     let lane: Arc<dyn AgentLane> = Arc::new(NoLane("ses_1".into()));
     assert_eq!(lane.session_id(), "ses_1", "the id is bound, not passed");
     assert_send(&lane.send("hi", SendMode::Queue));

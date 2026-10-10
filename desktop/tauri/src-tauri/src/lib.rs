@@ -693,8 +693,10 @@ async fn craze_create_options(
 }
 
 /// `craze_create` — a new craze session; `request_id` is the sheet's own
-/// (reused only while the last outcome is unknown). Read through
-/// [`craze::create_request`], the socket door's one reading.
+/// (reused only while the last outcome is unknown), and `held` says this
+/// submission REPLAYS it (plan 026 §3.1). Read through
+/// [`craze::create_request`] and [`craze::held_create`], the socket door's
+/// one reading.
 #[tauri::command]
 async fn craze_create(
     machines: tauri::State<'_, Arc<roost_hosts::RoostHosts>>,
@@ -703,7 +705,10 @@ async fn craze_create(
     provider: Option<String>,
     prompt: Option<String>,
     request_id: Option<String>,
+    held: Option<bool>,
 ) -> Result<serde_json::Value, String> {
+    let held = craze::held_create(held.unwrap_or(false), request_id.as_deref())
+        .map_err(|f| f.command_string())?;
     let request = craze::create_request(
         cwd.as_deref(),
         provider.as_deref(),
@@ -712,7 +717,7 @@ async fn craze_create(
     )
     .map_err(|f| f.command_string())?;
     machines
-        .craze_create(&machine, request)
+        .craze_create(&machine, request, held)
         .await
         .map_err(|f| f.command_string())
 }

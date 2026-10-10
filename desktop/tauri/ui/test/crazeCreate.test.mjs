@@ -10,8 +10,12 @@ import assert from "node:assert/strict";
 
 import {
   EMPTY_DRAFT,
+  HELD_EDIT_NOTE,
+  NO_PROVIDER_READY,
+  OUTCOME_UNKNOWN_NOTE,
   beginSubmit,
   closesOntoTranscript,
+  crazeCreateGate,
   crazeCreateOffered,
   crazeCreateUpdateNote,
   crazeSheetNote,
@@ -25,6 +29,7 @@ import {
   providerSelectable,
   reconcileProvider,
   refusalView,
+  replaysHeldRequest,
   settle,
   sheetOnScreen,
 } from "../dist-test/crazeCreate.js";
@@ -148,6 +153,116 @@ test("an edit mints a new id and clears the settled outcome, not the form", () =
   // A submission in flight is not edited.
   const flying = beginSubmit(d, minted);
   assert.equal(edit(flying, { cwd: "/elsewhere" }), flying);
+});
+
+// ---- a held request, replayed (plan 026 §3.1) ------------------------------
+
+/** The recipe re-read with every provider non-ready: grok gone `needs_setup`
+ *  (dimmed), nothing ready. */
+const grokDimmed = {
+  ...recipe,
+  providers: recipe.providers.map((p) => (p.id === "grok" ? { ...p, state: "needs_setup", reason: "no key" } : p)),
+};
+
+/** A draft whose outcome is unknown, holding its id: grok, a directory. */
+const heldDraft = () =>
+  settle(beginSubmit({ ...EMPTY_DRAFT, provider: "grok", cwd: "/w/held" }, minted), {
+    ok: false,
+    refusal: { code: "outcome_unknown", message: "outcome unknown: lost twice" },
+  });
+
+test("a held request is replayed only from an unknown outcome that holds its id", () => {
+  const base = { ...EMPTY_DRAFT, provider: "grok", cwd: "/w" };
+  assert.equal(replaysHeldRequest({ ...base, phase: "idle", requestId: null }), false, "idle");
+  assert.equal(replaysHeldRequest({ ...base, phase: "idle", requestId: "shed-x" }), false, "idle, an id");
+  assert.equal(replaysHeldRequest({ ...base, phase: "submitting", requestId: "shed-x" }), false, "submitting");
+  assert.equal(replaysHeldRequest({ ...base, phase: "unknown", requestId: "shed-x" }), true, "unknown, held");
+  assert.equal(replaysHeldRequest({ ...base, phase: "unknown", requestId: null }), false, "unknown, no id");
+  assert.equal(replaysHeldRequest({ ...base, phase: "refused", requestId: null }), false, "refused");
+  assert.equal(replaysHeldRequest({ ...base, phase: "created", requestId: null }), false, "created");
+  assert.equal(replaysHeldRequest(heldDraft()), true, "settle's unknown");
+});
+
+test("CONTROL: an unknown outcome whose provider went dimmed keeps it selected, enabled, with no 'none ready'", () => {
+  const d = heldDraft();
+  const g = crazeCreateGate(d, grokDimmed, null);
+  assert.equal(g.replaying, true);
+  assert.equal(g.selected, "grok", "the held provider stays selected, dimmed");
+  assert.equal(g.canCreate, true, "Try again works");
+  assert.notEqual(g.note, NO_PROVIDER_READY, "readiness does not gate a replay");
+  // The same draft NOT held (a fresh idle one) on the same options: nothing
+  // to select, Create disabled, and the sheet says why.
+  const idle = { ...d, phase: "idle", requestId: null, refusal: null };
+  const fresh = crazeCreateGate(idle, grokDimmed, null);
+  assert.deepEqual([fresh.selected, fresh.canCreate, fresh.note], [null, false, NO_PROVIDER_READY]);
+});
+
+test("an unknown outcome whose provider is no longer listed, with none ready, is still enabled", () => {
+  const unlisted = { ...grokDimmed, providers: grokDimmed.providers.filter((p) => p.id !== "grok") };
+  const g = crazeCreateGate(heldDraft(), unlisted, null);
+  assert.deepEqual([g.selected, g.replaying, g.canCreate], ["grok", true, true]);
+});
+
+test("an unknown outcome on a machine with a note is disabled: the retry needs a hub", () => {
+  const offline = "craze on m is offline (unreachable) — your form is kept";
+  const g = crazeCreateGate(heldDraft(), recipe, offline);
+  assert.equal(g.selected, "grok");
+  assert.equal(g.canCreate, false);
+  assert.equal(g.note, offline, "the machine's note is the one said");
+  // A replay still needs a valid directory, and none runs twice at once.
+  assert.equal(crazeCreateGate({ ...heldDraft(), cwd: "relative" }, recipe, null).canCreate, false);
+  assert.equal(crazeCreateGate(beginSubmit(heldDraft(), minted), recipe, null).canCreate, false);
+  assert.equal(crazeCreateGate(heldDraft(), null, null).canCreate, false, "options not read yet");
+});
+
+test("while replaying, the note says the outcome is unknown and what an edit does", () => {
+  const g = crazeCreateGate(heldDraft(), recipe, null);
+  assert.equal(g.note, `${OUTCOME_UNKNOWN_NOTE} ${HELD_EDIT_NOTE}`);
+  assert.match(g.note, /check the session list/);
+  assert.match(g.note, /Changing the form starts a new request instead\./);
+});
+
+test("a refused draft whose provider went dimmed is disabled, and keeps its refusal", () => {
+  const refused = settle(beginSubmit({ ...EMPTY_DRAFT, provider: "grok", cwd: "/w" }, minted), {
+    ok: false,
+    refusal: { code: "failed", message: "Error: KEYCHAIN LOCKED" },
+  });
+  assert.equal(refused.requestId, null, "a refused draft holds no id");
+  const g = crazeCreateGate(refused, grokDimmed, null);
+  assert.deepEqual([g.selected, g.replaying, g.canCreate], [null, false, false]);
+  assert.equal(g.note, NO_PROVIDER_READY);
+  assert.deepEqual(refused.refusal, { code: "failed", message: "Error: KEYCHAIN LOCKED" }, "the refusal is kept");
+  assert.equal(refused.provider, "grok", "and so is its provider");
+});
+
+test("a refused draft with a ready provider picked is idle again, with no id", () => {
+  const nativeReady = {
+    ...grokDimmed,
+    providers: grokDimmed.providers.map((p) => (p.id === "native" ? { ...p, state: "ready" } : p)),
+  };
+  const refused = settle(beginSubmit({ ...EMPTY_DRAFT, provider: "grok", cwd: "/w" }, minted), {
+    ok: false,
+    refusal: { code: "failed", message: "no" },
+  });
+  const picked = edit(refused, { provider: "native" });
+  assert.deepEqual([picked.phase, picked.requestId, picked.refusal], ["idle", null, null]);
+  const g = crazeCreateGate(picked, nativeReady, null);
+  assert.deepEqual([g.selected, g.canCreate], ["native", true]);
+  assert.notEqual(beginSubmit(picked, minted).requestId, null, "the next submit mints a fresh id");
+});
+
+test("an outcome_unknown answered to a held submit keeps the id again", () => {
+  const d = heldDraft();
+  const held = d.requestId;
+  assert.equal(replaysHeldRequest(d), true);
+  const retried = beginSubmit(d, minted);
+  assert.equal(retried.requestId, held, "Try again re-sends the held id");
+  const again = settle(retried, {
+    ok: false,
+    refusal: { code: "outcome_unknown", message: "outcome unknown: the retry did not reach craze" },
+  });
+  assert.deepEqual([again.phase, again.requestId], ["unknown", held]);
+  assert.equal(replaysHeldRequest(again), true, "and the next press replays it too");
 });
 
 test("refusals are shown by code", () => {
