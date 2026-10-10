@@ -565,7 +565,18 @@ struct ChildSlot {
     /// proves the mutex is not held.
     #[cfg(test)]
     at_reap: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    /// Test seam: run by a [`ChildSlot::close`] that found another thread's
+    /// kill in progress, with that count, just before it waits. It runs under
+    /// the mutex, which the close holds until its wait releases it, so nothing
+    /// the hook sets off can settle that kill before the close is waiting.
+    #[cfg(test)]
+    at_wait: Mutex<Option<WaitHook>>,
 }
+
+/// [`ChildSlot::at_wait`]'s hook: told how many kills the close found in
+/// progress.
+#[cfg(test)]
+type WaitHook = Box<dyn FnOnce(usize) + Send>;
 
 #[derive(Default)]
 struct SlotState {
@@ -705,6 +716,17 @@ impl ChildSlot {
             self.reap_taken(child, deadline);
         }
         let state = self.lock();
+        #[cfg(test)]
+        if state.killing > 0 {
+            if let Some(hook) = self
+                .at_wait
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take()
+            {
+                hook(state.killing);
+            }
+        }
         let left = deadline.saturating_duration_since(Instant::now());
         let (state, _) = self
             .settled
@@ -1081,6 +1103,37 @@ mod tests {
         assert!(f.child_is_dead(), "nothing is spawned until ensure()");
     }
 
+    /// Whether `argv` names `port` as a WHOLE port number: an element equal to
+    /// it, or a `:`- or `=`-separated part of one (a `-L` spec's ports, an
+    /// `-oPort=` option). Never a substring of a longer number: an ephemeral
+    /// local port such as 41029 does not name 1029 (plan 026 C3b).
+    fn names_port(argv: &[String], port: u16) -> bool {
+        let port = port.to_string();
+        argv.iter()
+            .any(|arg| arg.split([':', '=']).any(|part| part == port))
+    }
+
+    /// **A port is named only whole**: the decoy is the false positive the
+    /// substring check had, an ephemeral local port (41029) whose digits
+    /// contain [`SOME_REMOTE_PORT`] (plan 026 C3b).
+    #[test]
+    fn a_port_is_named_only_whole() {
+        let argv = |args: &[&str]| args.iter().map(|a| a.to_string()).collect::<Vec<_>>();
+        let decoy = argv(&["-L", "127.0.0.1:41029:127.0.0.1:41811", "charliek@mini3"]);
+        assert!(
+            !names_port(&decoy, SOME_REMOTE_PORT),
+            "41029 named 1029: {decoy:?}"
+        );
+        for named in [
+            argv(&["-L", "127.0.0.1:41029:127.0.0.1:1029"]),
+            argv(&["-L", "127.0.0.1:1029:127.0.0.1:41811"]),
+            argv(&["-p", "1029"]),
+            argv(&["-oPort=1029"]),
+        ] {
+            assert!(names_port(&named, SOME_REMOTE_PORT), "{named:?}");
+        }
+    }
+
     /// **The lane's forward names its own far side** (plan 015 §3.4).
     ///
     /// `reserve_for` is what an opencode lane reserves with: the agent's HTTP
@@ -1103,9 +1156,7 @@ mod tests {
         assert!(argv.contains(&"-N".to_string()), "runs no remote command");
         assert!(argv.contains(&"ExitOnForwardFailure=yes".to_string()));
         assert!(
-            !argv
-                .iter()
-                .any(|a| a.contains(&SOME_REMOTE_PORT.to_string())),
+            !names_port(&argv, SOME_REMOTE_PORT),
             "another forward's port leaked into this one: {argv:?}"
         );
         // A second forward names its own far side independently — the port is
@@ -1777,6 +1828,15 @@ mod tests {
     /// (on `OwnedForward`'s thread) has taken the child and is descheduled
     /// before its reap; the shutdown's slot sweep finds the slot EMPTY — and
     /// waits for that reap (within its bound) instead of returning at once.
+    ///
+    /// Asserted by order, not by the clock (plan 026 C3b): a starved
+    /// scheduler may start the sweep's thread at any time. The destroy is
+    /// released only from the sweep's own `at_wait` seam, which runs once the
+    /// close has seen the kill in progress, under the slot's mutex, which it
+    /// holds until its wait releases it. So the destroy cannot settle the kill
+    /// before the sweep is waiting for it. A sweep that does not wait returns
+    /// with the destroy still unsettled, still holding that mutex. It cannot
+    /// pass by luck.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_slot_sweep_waits_for_a_destroy_in_progress() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -1796,30 +1856,37 @@ mod tests {
             let _ = reached_tx.send(());
             let _ = go_rx.recv();
         }));
+        // What the sweep's close saw in progress when it was about to wait:
+        // `usize::MAX` until it says, which it does only if it saw a kill.
+        let seen_in_progress = Arc::new(std::sync::atomic::AtomicUsize::new(usize::MAX));
+        {
+            let seen = Arc::clone(&seen_in_progress);
+            *forward.child.at_wait.lock().unwrap() = Some(Box::new(move |killing| {
+                seen.store(killing, std::sync::atomic::Ordering::SeqCst);
+                let _ = go_tx.send(());
+            }));
+        }
         let destroying = std::thread::spawn(move || drop(forward));
         reached_rx
             .recv()
             .expect("the destroy took the child and paused");
 
-        let sweep = {
-            let gate = gate.clone();
-            tokio::task::spawn_blocking(move || {
-                let started = std::time::Instant::now();
-                let closed = gate.close_slots();
-                assert_eq!(closed.unsettled, 0, "the sweep settled: {closed:?}");
-                started.elapsed()
-            })
-        };
-        tokio::time::sleep(Duration::from_millis(300)).await;
-        assert!(
-            !sweep.is_finished(),
-            "the sweep returned while a kill was still in progress"
+        let gate_for_sweep = gate.clone();
+        let closed = tokio::task::spawn_blocking(move || gate_for_sweep.close_slots())
+            .await
+            .expect("the sweep");
+        assert_eq!(
+            seen_in_progress.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the sweep never saw the destroy's kill in progress"
         );
-        go_tx.send(()).expect("release the destroy");
-        let took = sweep.await.expect("the sweep");
-        assert!(
-            took >= Duration::from_millis(250),
-            "the sweep did not wait: {took:?}"
+        assert_eq!(
+            closed,
+            crate::spawn_gate::SlotsClosed {
+                closed: 1,
+                unsettled: 0
+            },
+            "the sweep returned while a kill was still in progress"
         );
         assert!(
             !pid_is_alive(pid),

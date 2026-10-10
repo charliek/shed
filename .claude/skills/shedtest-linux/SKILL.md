@@ -329,6 +329,14 @@ SIGKILL was ever needed; a typical stop is ~0.03 s. The app logs each phase to i
 - **A signal cell signals an app instance of its OWN** (`SigRig`, a function-scoped rig), never
   the module's shared `app`. Signal by the recorded pid; the test-mode `app.quit` op is the tray's
   path (`app.exit(0)`).
+- **`app.terminate` is the macOS system quit** (plan 026 C3b). It drives `[NSApplication
+  terminate:]`, the path a Dock Quit, a logout and an AppleScript quit take, which reaches the
+  app only as `RunEvent::Exit`. It is test mode only and macOS only: Linux answers
+  `not_supported`, so `test_a_macos_system_quit_leaves_no_app_children` SKIPS here and runs in
+  CI's `tauri-mac`. Never send `terminate:` inline from a `run_on_main_thread` closure. The
+  closure runs inside tao's event handler, holding its lock, and `applicationWillTerminate:`
+  takes that lock again on the same thread: a deadlock. Queue it instead
+  (`performSelectorOnMainThread:…waitUntilDone:NO`), as `ipc.rs`'s `system_terminate` does.
 - **A descendant check alone cannot prove the orderly path in this rig.** Kill the app with no
   handler and every descendant still dies within a second: the craze bridges exit on stdin EOF,
   WebKit's helpers die with their parent. What a hard kill leaves behind is the `SshExec`
@@ -474,6 +482,13 @@ make -C desktop tauri-ui-build             # generate_context! panics at macro e
 cd desktop/tauri/src-tauri
 cargo clippy --locked --all-targets -- -D warnings
 ```
+
+With a `CARGO_TARGET_DIR` outside `src-tauri` (a scratch target dir you can delete afterwards),
+the sparkle-updater `build.rs` panics with `Sparkle.framework not found!` even though it is
+staged. It looks for the framework by walking `OUT_DIR`'s ancestors for `tauri.conf.json`, so
+name it: `export SPARKLE_FRAMEWORK_PATH=<worktree>/desktop/tauri/src-tauri`. And `npm` need not
+exist on the Mac: copying a built `desktop/tauri/ui/dist` over from Linux satisfies
+`generate_context!` for `cargo check`/`clippy`.
 
 **Unlike Linux, this baseline is CLEAN at `origin/main`** — there is no `tray.rs`/`zbus::proxy`
 pre-existing-findings exemption on macOS (those are Linux-only code paths). So on a Mac, run

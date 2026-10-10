@@ -35,6 +35,7 @@ Request structs reject unknown fields. Errors use stable codes: `unknown-op`,
 | `app.window_metrics` | — | `window_width`, `window_height`, `sidebar_width`, `visible_pane` |
 | `app.screenshot` | `surface` (window\|menu), `scale` (1\|2) | `png` (base64), `width`, `height`, `scale`, `surface` |
 | `app.quit` | — | `{}`, then the app exits (Tauri, test mode only): the tray's Quit, drivable — the orderly shutdown runs, then the process ends (see [Architecture](architecture.md#shutting-down-tauri)) |
+| `app.terminate` | — | `{}`, then the app exits (Tauri on macOS, test mode only): the macOS system quit, drivable — `[NSApplication terminate:]`, the path a Dock Quit, a logout and an AppleScript `quit` take, so the orderly shutdown runs from `RunEvent::Exit` alone and AppKit ends the process with status 0. Off macOS it answers `not_supported` (use `app.quit`) |
 
 The screenshot renders the target window's content view to a PNG in-process — no screen
 capture permission, works even when the window is occluded or off-screen. Capturing the

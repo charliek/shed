@@ -5415,6 +5415,34 @@ except Exception:
         final_path
     }
 
+    /// Wait until the fake ssh at `ssh` can be exec'd (plan 026 C3b). It was
+    /// just written, so a sibling test's fork made while its write fd was open
+    /// holds a copy of that fd until its own exec, and an exec of the script
+    /// meanwhile fails with ETXTBSY. The probe is `-O exit`, which
+    /// [`write_exec_ssh`]'s fake answers with a bare `exit 0`. Use it only on a
+    /// fake that does: one that logs every run would record the probe. Once one
+    /// exec succeeds no writer is left,
+    /// and none can appear (this process closed its fd), so no later exec of
+    /// it can fail that way. A condition, not a clock: under load such a fork
+    /// can take any time to reach its exec.
+    fn settle_exec(ssh: &Path) {
+        loop {
+            match std::process::Command::new(ssh)
+                .args(["-O", "exit", "settle"])
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+            {
+                Err(e) if e.raw_os_error() == Some(libc::ETXTBSY) => {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(e) => panic!("could not run {}: {e}", ssh.display()),
+                Ok(_) => return,
+            }
+        }
+    }
+
     fn ran(log: &Path) -> Vec<String> {
         std::fs::read_to_string(log)
             .unwrap_or_default()
@@ -7384,19 +7412,72 @@ exit 0
             .await
     }
 
-    /// Fake masters this test started, SIGKILLed when it ends — pass or fail —
-    /// so a failing assertion never leaves one behind.
-    struct FakeMasters(Vec<i32>);
+    /// Fake masters a test's runners start, SIGKILLed when the test ends,
+    /// pass or fail, so a failing assertion never leaves one behind (the
+    /// fakes loop forever: `while :; do sleep 0.2; done`).
+    ///
+    /// **Armed before the first exec** (plan 026 C3b): it holds each runner's
+    /// control path and reads the master's pid from the fake's `<ctl>.pid`,
+    /// so a failure anywhere after the spawn is covered, even one before the
+    /// test read the pid itself. [`Self::pids`] reads and KEEPS them, because
+    /// a runner's directory, pid file included, goes when the runner drops.
+    /// A pid is signalled only if it is above 1 and its command line still
+    /// names its runner's control path: a master the code under test already
+    /// ended may have had its pid reused.
+    #[derive(Default)]
+    struct FakeMasters(Vec<(PathBuf, Option<i32>)>);
+
+    impl FakeMasters {
+        /// Cover `exec`'s master. Call it before `exec`'s first run.
+        fn arm(&mut self, exec: &SshExec) {
+            self.0.push((exec.ctl_path.clone(), None));
+        }
+
+        /// Every covered master's pid, read from its pid file once and kept.
+        fn pids(&mut self) -> Vec<i32> {
+            for (ctl, pid) in &mut self.0 {
+                if pid.is_none() {
+                    *pid = recorded_master_pid(ctl);
+                }
+            }
+            self.0.iter().filter_map(|(_, pid)| *pid).collect()
+        }
+    }
 
     impl Drop for FakeMasters {
         fn drop(&mut self) {
-            for pid in self.0.iter().copied().filter(|pid| *pid > 1) {
-                // SAFETY: each pid is a fake master this test spawned itself.
-                unsafe {
-                    libc::kill(pid, libc::SIGKILL);
+            for (ctl, pid) in &self.0 {
+                let Some(pid) = pid
+                    .or_else(|| recorded_master_pid(ctl))
+                    .filter(|pid| *pid > 1)
+                else {
+                    continue;
+                };
+                let args = std::process::Command::new("ps")
+                    .args(["-ww", "-o", "args=", "-p", &pid.to_string()])
+                    .stderr(std::process::Stdio::null())
+                    .output();
+                let ours = args.is_ok_and(|out| {
+                    String::from_utf8_lossy(&out.stdout).contains(&*ctl.to_string_lossy())
+                });
+                if ours {
+                    // SAFETY: the pid is above 1 and its command line names
+                    // this test's own control path: a fake master it started.
+                    unsafe {
+                        libc::kill(pid, libc::SIGKILL);
+                    }
                 }
             }
         }
+    }
+
+    /// The pid a fake master recorded beside its control path, if it did.
+    fn recorded_master_pid(ctl: &Path) -> Option<i32> {
+        std::fs::read_to_string(format!("{}.pid", ctl.display()))
+            .ok()?
+            .trim()
+            .parse()
+            .ok()
     }
 
     fn master_of(exec: &SshExec) -> i32 {
@@ -7430,6 +7511,10 @@ exit 0
         let ssh = write_wedged_ssh(dir.path(), &log, 30);
         let a = SshExec::new(&entry("wedge-a"), &exec_options(ssh.clone())).expect("exec a");
         let b = SshExec::new(&entry("wedge-b"), &exec_options(ssh)).expect("exec b");
+        // Ended by the shutdown when it passes; by this guard when it fails.
+        let mut masters = FakeMasters::default();
+        masters.arm(&a);
+        masters.arm(&b);
         for exec in [&a, &b] {
             let outcome = exec
                 .run("true", Stdin::Empty, Duration::from_secs(10), 1024, false)
@@ -7440,6 +7525,7 @@ exit 0
             );
         }
         let (pa, pb) = (master_of(&a), master_of(&b));
+        masters.pids();
         assert!(pid_exists(pa) && pid_exists(pb), "both fake masters run");
 
         let started = std::time::Instant::now();
@@ -7474,6 +7560,10 @@ exit 0
         let log = dir.path().join("control.log");
         let ssh = write_wedged_ssh(dir.path(), &log, 10);
         let exec = SshExec::new(&entry("wedge-d"), &exec_options(ssh)).expect("exec");
+        // The fake master is this test's to clean up (`Drop` only asks), pass
+        // or fail. Its pid is kept before the drop removes the pid file.
+        let mut masters = FakeMasters::default();
+        masters.arm(&exec);
         let outcome = exec
             .run("true", Stdin::Empty, Duration::from_secs(10), 1024, false)
             .await;
@@ -7481,17 +7571,13 @@ exit 0
             matches!(outcome, Outcome::Exec { exit: Some(0), .. }),
             "{outcome:?}"
         );
-        let master = master_of(&exec);
+        assert_eq!(masters.pids().len(), 1, "the fake master recorded its pid");
 
         let started = std::time::Instant::now();
         tokio::task::spawn_blocking(move || drop(exec))
             .await
             .expect("drop");
         let took = started.elapsed();
-        // The fake master is this test's to clean up: `Drop` only asks.
-        unsafe {
-            libc::kill(master, libc::SIGKILL);
-        }
         assert!(
             took < MASTER_EXIT_WAIT + Duration::from_secs(1),
             "the destructor blocked {took:?} on a wedged -O exit"
@@ -7547,10 +7633,17 @@ exit 0
 
     /// **A step in flight is registered with the gate, and its drain ends it**
     /// whoever is awaiting it — a bootstrap's step when the app quits.
+    ///
+    /// Robust under load (plan 026 C3b): the fake is settled before the step
+    /// ([`settle_exec`]), so the step's one spawn cannot be refused ETXTBSY,
+    /// and the step is awaited until it registers or ends, never against a
+    /// deadline counted from its spawn. Every bound left is counted from the
+    /// confirmed registration.
     #[tokio::test]
     async fn the_gates_drain_ends_a_step_in_flight() {
         let dir = tempfile::tempdir().expect("tempdir");
         let ssh = write_exec_ssh(dir.path(), &[("PATH", "/usr/bin:/bin".to_string())]);
+        settle_exec(&ssh);
         let gate = SpawnGate::new();
         let mut options = exec_options(ssh);
         options.spawn_gate = Some(gate.clone());
@@ -7568,9 +7661,15 @@ exit 0
                 )
                 .await
         });
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-        while gate.registered_exits() == 0 && tokio::time::Instant::now() < deadline {
+        // Registered, or ended without registering: a condition, not a clock
+        // (plan 026 C3b). Under load the step's task may start late, and a
+        // step that ends first says why.
+        while gate.registered_exits() == 0 && !step.is_finished() {
             tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        if gate.registered_exits() == 0 {
+            let outcome = step.await.expect("the step task");
+            panic!("the step ended before it registered its child: {outcome:?}");
         }
         assert_eq!(gate.registered_exits(), 1, "the step registered its child");
 
@@ -7815,6 +7914,8 @@ exit 0
         let dir = tempfile::tempdir().expect("tempdir");
         let ssh = write_decoy_ssh(dir.path());
         let exec = SshExec::new(&entry("decoy"), &exec_options(ssh)).expect("exec");
+        let mut decoys = FakeMasters::default();
+        decoys.arm(&exec);
         let outcome = exec
             .run("true", Stdin::Empty, Duration::from_secs(10), 1024, false)
             .await;
@@ -7823,7 +7924,7 @@ exit 0
             "{outcome:?}"
         );
         let decoy = master_of(&exec);
-        let _decoys = FakeMasters(vec![decoy]);
+        decoys.pids();
 
         let ended = exec.shutdown().await;
         assert!(
@@ -7853,9 +7954,11 @@ exit 0
         let slow_ps =
             write_staged_script(dir.path(), "slow-ps", "#!/bin/sh\nsleep 2\n".to_string());
         let mut execs = Vec::new();
+        let mut masters = FakeMasters::default();
         for name in ["uncertain-a", "uncertain-b", "uncertain-c"] {
             let mut exec = SshExec::new(&entry(name), &exec_options(ssh.clone())).expect("exec");
             exec.ps_bin = Some(slow_ps.clone());
+            masters.arm(&exec);
             let outcome = first_exec(&exec).await;
             assert!(
                 matches!(outcome, Outcome::Exec { exit: Some(0), .. }),
@@ -7863,7 +7966,9 @@ exit 0
             );
             execs.push(exec);
         }
-        let masters = FakeMasters(execs.iter().map(master_of).collect());
+        // Kept now: the runners are dropped below, and their pid files with them.
+        let pids = masters.pids();
+        assert_eq!(pids.len(), 3, "every fake master recorded its pid");
 
         let started = std::time::Instant::now();
         let ended = futures::future::join_all(execs.iter().map(SshExec::shutdown)).await;
@@ -7877,7 +7982,7 @@ exit 0
             took < MASTER_SHUTDOWN_BOUND + Duration::from_secs(1),
             "three runners' shutdowns took {took:?}, not one bound"
         );
-        for pid in &masters.0 {
+        for pid in &pids {
             assert!(pid_exists(*pid), "an unverified pid {pid} was signalled");
         }
         let exits = std::fs::read_to_string(&log).unwrap_or_default();
@@ -7974,12 +8079,16 @@ exit 0
         );
         let mut exec = SshExec::new(&entry("stubborn"), &exec_options(ssh)).expect("exec");
         exec.ps_bin = Some(flaky_ps);
+        let mut masters = FakeMasters::default();
+        masters.arm(&exec);
         let outcome = first_exec(&exec).await;
         assert!(
             matches!(outcome, Outcome::Exec { exit: Some(0), .. }),
             "{outcome:?}"
         );
-        let masters = FakeMasters(vec![master_of(&exec)]);
+        let master = master_of(&exec);
+        // Kept now: the runner is dropped below, and its pid file with it.
+        masters.pids();
 
         let started = std::time::Instant::now();
         let ended = exec.shutdown().await;
@@ -7992,10 +8101,7 @@ exit 0
             took < MASTER_SHUTDOWN_BOUND + Duration::from_secs(1),
             "the shutdown took {took:?}"
         );
-        assert!(
-            pid_exists(masters.0[0]),
-            "an unverified master was SIGKILLed"
-        );
+        assert!(pid_exists(master), "an unverified master was SIGKILLed");
         let ps_calls: u32 = std::fs::read_to_string(&calls)
             .expect("ps ran")
             .trim()
@@ -8101,12 +8207,14 @@ exit 0
         let ssh = write_slow_check_ssh(dir.path(), &log);
         let mut exec = SshExec::new(&entry("slow-check"), &exec_options(ssh)).expect("exec");
         exec.ps_bin = Some(write_first_then_silent_ps(dir.path()));
+        let mut masters = FakeMasters::default();
+        masters.arm(&exec);
         let outcome = first_exec(&exec).await;
         assert!(
             matches!(outcome, Outcome::Exec { exit: Some(0), .. }),
             "{outcome:?}"
         );
-        let _masters = FakeMasters(vec![master_of(&exec)]);
+        assert_eq!(masters.pids().len(), 1, "the fake master recorded its pid");
 
         let started = std::time::Instant::now();
         let ended = exec.shutdown().await;
@@ -8178,12 +8286,14 @@ exit 0
         let dir = tempfile::tempdir().expect("tempdir");
         let ssh = write_decoy_ssh(dir.path());
         let exec = SshExec::new(&entry("repeat"), &exec_options(ssh.clone())).expect("exec");
+        let mut decoys = FakeMasters::default();
+        decoys.arm(&exec);
         let outcome = first_exec(&exec).await;
         assert!(
             matches!(outcome, Outcome::Exec { exit: Some(0), .. }),
             "{outcome:?}"
         );
-        let _decoys = FakeMasters(vec![master_of(&exec)]);
+        assert_eq!(decoys.pids().len(), 1, "the fake master recorded its pid");
         assert!(!exec.shutdown().await, "the decoy is never confirmed");
         let again = std::time::Instant::now();
         assert!(

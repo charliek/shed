@@ -511,6 +511,76 @@ fn app_quit_door(env: &Env) -> Result<(), (String, String)> {
     Ok(())
 }
 
+/// What `app.terminate` answers, in test mode, on every platform but macOS.
+const TERMINATE_NOT_SUPPORTED: &str = "app.terminate is the macOS system-quit path; use app.quit";
+
+/// The gate behind `app.terminate` (plan 026 AM7): the macOS system quit — a
+/// Dock Quit, a logout, an AppleScript `quit` — drivable.
+///
+/// **TEST-MODE ONLY**, [`app_quit_door`]'s rule: outside test mode it answers
+/// `not_enabled`, on every platform. In test mode it opens on macOS only.
+/// `[NSApplication terminate:]` is an AppKit path, so every other platform
+/// answers `not_supported` and points at `app.quit`.
+fn app_terminate_door(env: &Env) -> Result<(), (String, String)> {
+    if !env.test_mode {
+        return Err(err("not_enabled", "app.terminate requires test mode"));
+    }
+    if cfg!(target_os = "macos") {
+        Ok(())
+    } else {
+        Err(err("not_supported", TERMINATE_NOT_SUPPORTED))
+    }
+}
+
+/// `[NSApp terminate:nil]`: the AppKit path that a Dock Quit, a logout and an
+/// AppleScript `quit` all take. AppKit sends `applicationShouldTerminate:`,
+/// then `applicationWillTerminate:`, which tao turns into `RunEvent::Exit` and
+/// nothing else. That arm runs the orderly shutdown. AppKit then ends the
+/// process with its own `exit(0)`.
+///
+/// **Queued from the main thread, not sent inline.** A `run_on_main_thread`
+/// closure runs inside tao's event handler, which holds that handler's lock
+/// (tao `app_state.rs`, `Handler::handle_user_events`). A `terminate:` sent
+/// from inside it would reach `applicationWillTerminate:` and then
+/// `AppState::exit`, which takes the same lock again on the same thread: a
+/// deadlock. So the closure only queues the message, with
+/// `performSelectorOnMainThread:withObject:waitUntilDone:NO` in the common
+/// run-loop modes. The main run loop delivers it on its next pass, outside any
+/// tao callback, the way AppKit delivers a Dock or AppleScript quit. The IPC
+/// answer is on its way before then.
+#[cfg(target_os = "macos")]
+fn system_terminate(app: &AppHandle) -> Result<(), (String, String)> {
+    app.run_on_main_thread(|| {
+        use objc2::runtime::AnyObject;
+        use objc2::{msg_send, sel, MainThreadMarker};
+        use objc2_app_kit::NSApplication;
+        let Some(mtm) = MainThreadMarker::new() else {
+            eprintln!("shed-desktop-tauri: app.terminate: not on the main thread; nothing sent");
+            return;
+        };
+        let ns_app = NSApplication::sharedApplication(mtm);
+        let sender: Option<&AnyObject> = None;
+        // SAFETY: `performSelectorOnMainThread:withObject:waitUntilDone:` is
+        // NSObject's `(SEL, id, BOOL) -> void`, and `terminate:` takes one
+        // object argument, its sender, which may be nil.
+        unsafe {
+            let _: () = msg_send![
+                &*ns_app,
+                performSelectorOnMainThread: sel!(terminate:),
+                withObject: sender,
+                waitUntilDone: false
+            ];
+        }
+    })
+    .map_err(|e| err("internal", format!("app.terminate: {e}")))
+}
+#[cfg(not(target_os = "macos"))]
+fn system_terminate(_app: &AppHandle) -> Result<(), (String, String)> {
+    // Unreachable: [`app_terminate_door`] answers `not_supported` off macOS,
+    // before this is called.
+    Err(err("not_supported", TERMINATE_NOT_SUPPORTED))
+}
+
 /// An OPTIONAL string param: absent or `null` is `None`; a string is itself;
 /// anything else is `bad_request` — never read as absent, because absence has a
 /// meaning of its own (a default, or a freshly minted id).
@@ -904,6 +974,16 @@ impl Handler {
             "app.quit" => {
                 app_quit_door(&self.env)?;
                 self.app.exit(0);
+                Ok(json!({}))
+            }
+            // The macOS system quit, drivable (plan 026 AM7): TEST-MODE ONLY
+            // and macOS only, see [`app_terminate_door`]. It reaches the
+            // orderly shutdown through `RunEvent::Exit` alone. As with
+            // `app.quit`, the answer goes out first: the terminate is only
+            // queued here, see [`system_terminate`].
+            "app.terminate" => {
+                app_terminate_door(&self.env)?;
+                system_terminate(&self.app)?;
                 Ok(json!({}))
             }
             "sheds.list" => {
@@ -3163,5 +3243,32 @@ mod tests {
         assert_eq!(code, "not_enabled");
         assert!(message.contains("app.quit"), "{message}");
         assert!(app_quit_door(&env(None)).is_ok());
+    }
+
+    /// **`app.terminate` is the macOS system quit, and a privilege** (plan
+    /// 026 AM7). Outside test mode it answers `not_enabled` on every
+    /// platform. In test mode it opens on macOS, and everywhere else it
+    /// answers `not_supported` and points at `app.quit`.
+    #[test]
+    fn the_terminate_door_is_test_mode_only() {
+        let mut prod = env(None);
+        prod.test_mode = false;
+        let (code, message) = app_terminate_door(&prod)
+            .expect_err("a driver door must not be reachable in a shipped app");
+        assert_eq!(code, "not_enabled");
+        assert!(message.contains("app.terminate"), "{message}");
+
+        let test = env(None);
+        if cfg!(target_os = "macos") {
+            assert!(app_terminate_door(&test).is_ok());
+        } else {
+            let (code, message) =
+                app_terminate_door(&test).expect_err("only macOS has the system-quit path");
+            assert_eq!(code, "not_supported");
+            assert_eq!(
+                message,
+                "app.terminate is the macOS system-quit path; use app.quit"
+            );
+        }
     }
 }

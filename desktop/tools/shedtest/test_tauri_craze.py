@@ -2590,29 +2590,28 @@ def _app_owned(app_pid: int, rig: SigRig) -> tuple[dict[int, str], set[int]]:
 
 
 def _quit(app: TauriClient, proc: subprocess.Popen, how: str) -> None:
-    if how == "app.quit":
-        app.call("app.quit")
+    if how in ("app.quit", "app.terminate"):
+        app.call(how)
     else:
         os.kill(proc.pid, getattr(signal, how))
 
 
-@pytest.mark.parametrize("how", ["SIGTERM", "SIGINT", "SIGHUP", "app.quit"])
-def test_sigterm_leaves_no_app_children(sig_rig, mock, how):
-    """**Every exit path ends every child the app owns, and nothing it does
-    not** (plan 026 §3.3, shed#389). An app instance of the cell's own is set
-    up with a local craze lane (jailed), a session created through it, and a
-    remote fake-ssh machine with an open lane and its `SshExec` master; its
-    descendant tree is recorded; then it is sent SIGTERM, SIGINT or SIGHUP by
-    its RECORDED pid — or the test-mode `app.quit` door, the tray's own
-    `app.exit(0)`. Then:
+def _quit_leaves_no_app_children(rig: SigRig, mock, how: str) -> str:
+    """One exit path, end to end (plan 026 §3.3 and AM7). An app instance of
+    the rig's own is set up with a local craze lane (jailed), a session created
+    through it, and a remote fake-ssh machine with an open lane and its
+    `SshExec` master; its descendant tree is recorded; then it is quit by `how`
+    ([`_quit`]). Then:
 
-    * it exits by itself within 5 s (the harness's kill is never used);
+    * it exits by itself within 5 s (the harness's kill is never used), with
+      status 0;
     * every recorded app-owned descendant is dead — checked before any sweep;
     * the fake ssh logged `-O exit` for the remote host's `SshExec` master;
+    * the orderly shutdown ran to its end;
     * the craze hub and the created session still run, and `craze ps` lists
-      the session;
-    * a relaunched app re-opens its lane."""
-    rig = sig_rig
+      the session.
+
+    Answers the created session's hostId."""
     app, proc, _log_fh, _agent = rig.launch(mock)
     host = _set_up_children(app, rig)
     owned, persistent = _app_owned(proc.pid, rig)
@@ -2661,6 +2660,20 @@ def test_sigterm_leaves_no_app_children(sig_rig, mock, how):
     ps = subprocess.run([str(rig.local.real / "craze"), "ps", "--json"], env=rig.local.env(),
                         capture_output=True, text=True, timeout=30, cwd=str(rig.local.root))
     assert host in ps.stdout, f"{how}: craze ps no longer lists the session: {ps.stdout} {ps.stderr}"
+    return host
+
+
+@pytest.mark.parametrize("how", ["SIGTERM", "SIGINT", "SIGHUP", "app.quit"])
+def test_sigterm_leaves_no_app_children(sig_rig, mock, how):
+    """**Every exit path ends every child the app owns, and nothing it does
+    not** (plan 026 §3.3, shed#389). The app is sent SIGTERM, SIGINT or SIGHUP
+    by its RECORDED pid — or the test-mode `app.quit` door, the tray's own
+    `app.exit(0)` — and [`_quit_leaves_no_app_children`] checks the exit: by
+    itself within 5 s, every app-owned descendant dead, the remote `SshExec`
+    master asked to `-O exit`, the craze hub and the created session still
+    running. Then a relaunched app re-opens its lane."""
+    rig = sig_rig
+    host = _quit_leaves_no_app_children(rig, mock, how)
 
     # A relaunched app re-opens its lane (the first instance's own handles
     # released first: it has exited).
@@ -2672,6 +2685,22 @@ def test_sigterm_leaves_no_app_children(sig_rig, mock, how):
     app2.wait_until(lambda: _row(app2, host) is not None, timeout=WAIT,
                     what="the session's row after the relaunch")
     _ready(app2, host)
+
+
+@pytest.mark.skipif(sys.platform != "darwin",
+                    reason="app.terminate is the macOS system-quit path ([NSApplication terminate:])")
+def test_a_macos_system_quit_leaves_no_app_children(sig_rig, mock):
+    """**A macOS system quit ends every child the app owns, and nothing it
+    does not** (plan 026 AM7). A Dock Quit, a logout and an AppleScript `quit`
+    all take AppKit's `[NSApplication terminate:]`, which reaches the app ONLY
+    as `RunEvent::Exit` (never `ExitRequested`), so only C3's `Exit` arm can run
+    the orderly shutdown. The test-mode `app.terminate` door drives that path:
+    an AppleScript quit sent from a harness raises a TCC Automation prompt.
+    The same world and checks as `test_sigterm_leaves_no_app_children`'s
+    `app.quit` case ([`_quit_leaves_no_app_children`]): the app exits by
+    itself within 5 s with status 0, every recorded descendant is dead, the
+    remote master got `-O exit`, and the hub and the session survive."""
+    _quit_leaves_no_app_children(sig_rig, mock, "app.terminate")
 
 
 def test_a_second_signal_exits_at_once(wedged_rig, mock):
