@@ -916,18 +916,109 @@ mod tests {
         drop(listener);
     }
 
+    /// A freed loopback port held by a **bound, non-listening** socket (plan 026
+    /// §3.6, #397): `connect` to it is refused, so a re-`ensure` reads the port
+    /// as dead and respawns, and no other bind can take it meanwhile.
+    ///
+    /// Not a listener that never accepts — the kernel completes `connect` from
+    /// the backlog and the fast path would still be taken. And NOT
+    /// `SO_REUSEADDR`: on Linux that lets a second `SO_REUSEADDR` bind (which is
+    /// what `std`'s `TcpListener::bind` sets) share any non-listening bound
+    /// port, which would make the reservation a no-op.
+    struct PortReservation {
+        fd: libc::c_int,
+    }
+
+    impl PortReservation {
+        /// Take `port`, retrying while a descriptor inherited by another
+        /// thread's `fork()` still holds the old listener's binding (until that
+        /// child's `exec`, about a millisecond).
+        fn take(port: u16) -> Self {
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            loop {
+                // SAFETY: plain socket(2)/bind(2) on memory this function owns.
+                unsafe {
+                    let fd = libc::socket(libc::AF_INET, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0);
+                    assert!(fd >= 0, "socket: {}", std::io::Error::last_os_error());
+                    let mut addr: libc::sockaddr_in = std::mem::zeroed();
+                    addr.sin_family = libc::AF_INET as libc::sa_family_t;
+                    addr.sin_port = port.to_be();
+                    addr.sin_addr.s_addr = u32::from_ne_bytes([127, 0, 0, 1]);
+                    let rc = libc::bind(
+                        fd,
+                        std::ptr::addr_of!(addr).cast(),
+                        std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+                    );
+                    if rc == 0 {
+                        return Self { fd };
+                    }
+                    let err = std::io::Error::last_os_error();
+                    libc::close(fd);
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "could not reserve port {port}: {err}"
+                    );
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+    }
+
+    impl Drop for PortReservation {
+        fn drop(&mut self) {
+            // SAFETY: closes the descriptor this value owns, once.
+            unsafe {
+                libc::close(self.fd);
+            }
+        }
+    }
+
+    /// [`close_tunnel`], then hold the freed port until the reservation is
+    /// dropped (see [`PortReservation`]).
+    fn close_tunnel_and_reserve(listener: std::net::TcpListener, port: u16) -> PortReservation {
+        close_tunnel(listener);
+        PortReservation::take(port)
+    }
+
     fn tunnel_once_started(
         port: u16,
         log: &Path,
         spawns: usize,
     ) -> tokio::task::JoinHandle<std::net::TcpListener> {
+        tunnel_once_started_holding(port, log, spawns, None)
+    }
+
+    /// [`tunnel_once_started`] for a port a reservation holds: the reservation
+    /// is released just before the replacement tunnel binds.
+    fn tunnel_once_started_holding(
+        port: u16,
+        log: &Path,
+        spawns: usize,
+        reservation: Option<PortReservation>,
+    ) -> tokio::task::JoinHandle<std::net::TcpListener> {
         let log = log.to_path_buf();
         tokio::spawn(async move {
+            let held = reservation;
             wait_for("the forward process to start", || {
                 spawned_pids(&log).len() >= spawns
             })
             .await;
-            std::net::TcpListener::bind(("127.0.0.1", port)).expect("bind the forward's local port")
+            drop(held);
+            // A descriptor another thread's `fork()` inherited a moment ago
+            // (the reservation's, or the old listener's) holds the binding
+            // until that child's `exec`; the bind is retried across that
+            // window — milliseconds — and no longer.
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            loop {
+                match std::net::TcpListener::bind(("127.0.0.1", port)) {
+                    Ok(listener) => break listener,
+                    Err(e) if std::time::Instant::now() < deadline => {
+                        let _ = e;
+                        tokio::time::sleep(Duration::from_millis(1)).await;
+                    }
+                    Err(e) => panic!("bind the forward's local port: {e}"),
+                }
+            }
         })
     }
 
@@ -1052,8 +1143,8 @@ mod tests {
 
         // Kill the tunnel so the next ensure genuinely re-establishes rather
         // than short-circuiting on a healthy child.
-        close_tunnel(tunnel);
-        let tunnel = tunnel_once_started(port, &log, 2);
+        let reservation = close_tunnel_and_reserve(tunnel, port);
+        let tunnel = tunnel_once_started_holding(port, &log, 2, Some(reservation));
         forward.ensure().await.expect("the re-establish");
         let _tunnel = tunnel.await.expect("the tunnel task");
 
@@ -1268,13 +1359,13 @@ mod tests {
 
         // The tunnel stops forwarding while its process lives on — from here
         // the local port refuses, but the child is still very much running.
-        close_tunnel(tunnel);
+        let reservation = close_tunnel_and_reserve(tunnel, forward.port());
         assert!(
             !forward.child_is_dead(),
             "the wedged child is still running"
         );
 
-        let tunnel = tunnel_once_started(forward.port(), &log, 2);
+        let tunnel = tunnel_once_started_holding(forward.port(), &log, 2, Some(reservation));
         forward.ensure().await.expect("the re-establish");
         let _tunnel = tunnel.await.expect("the tunnel task");
 
@@ -1287,6 +1378,155 @@ mod tests {
             wedged[0]
         );
 
+        drop(forward);
+        assert!(
+            !pid_is_alive(pids[1]),
+            "the replacement outlived the forward"
+        );
+    }
+
+    /// **A tunnel that was closed while another process still holds a copy of
+    /// its listener is closed for good** (#397, plan 026 §3.6): the cause the
+    /// evidence found. Another test thread's `fork()` hands a child a copy of
+    /// every descriptor until its `exec`; a plain `drop` closes only one copy,
+    /// the kernel keeps accepting on the port, and a re-`ensure` probing it
+    /// takes its fast path and never respawns. Deterministic here: the child
+    /// is a bare `fork()` that waits, so the inherited copy lives as long as
+    /// the cell needs it.
+    #[test]
+    fn closing_a_tunnel_stops_it_answering_even_with_a_forked_copy_of_its_fd() {
+        fn forked_holder() -> libc::pid_t {
+            // SAFETY: the child calls only async-signal-safe functions
+            // (`pause`, `_exit`) between fork and its end.
+            let pid = unsafe { libc::fork() };
+            assert!(pid >= 0, "fork: {}", std::io::Error::last_os_error());
+            if pid == 0 {
+                unsafe {
+                    libc::pause();
+                    libc::_exit(0);
+                }
+            }
+            pid
+        }
+        fn reap(pid: libc::pid_t) {
+            assert!(pid > 1, "refusing to signal pid {pid}");
+            // SAFETY: signals and reaps only the child this cell forked.
+            unsafe {
+                libc::kill(pid, libc::SIGKILL);
+                libc::waitpid(pid, std::ptr::null_mut(), 0);
+            }
+        }
+
+        // The failure: a plain drop leaves the inherited copy answering.
+        let plain = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let plain_port = plain.local_addr().expect("addr").port();
+        let holder = forked_holder();
+        drop(plain);
+        let still_answers = port_answers(plain_port);
+        reap(holder);
+        assert!(
+            still_answers,
+            "premise: a plain drop leaves a forked copy of the listener answering"
+        );
+
+        // The fix: `close_tunnel` takes it out of LISTEN for every copy.
+        let closed = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let closed_port = closed.local_addr().expect("addr").port();
+        let holder = forked_holder();
+        close_tunnel(closed);
+        let answers = port_answers(closed_port);
+        reap(holder);
+        assert!(
+            !answers,
+            "a closed tunnel still answers through a forked copy of its fd"
+        );
+    }
+
+    /// **A freed port that something else listens on is a live tunnel to the
+    /// fast path** (#397, plan 026 §3.6 hypothesis: port theft). In production
+    /// that is right — a live `ssh -L` holds the port. This pins the mechanism
+    /// the reservation below exists to rule out in the rig: with a thief
+    /// listening on the freed port, `ensure` takes its fast path, does not
+    /// respawn, and leaves the wedged predecessor alone.
+    #[tokio::test]
+    async fn a_thief_listening_on_the_freed_port_makes_ensure_skip_its_respawn() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log = dir.path().join("spawns");
+        let forward =
+            SshForward::reserve_faked(entry(), fake_ssh(&log, "exec sleep 30")).expect("reserve");
+        let tunnel = tunnel_once_started(forward.port(), &log, 1);
+        forward.ensure().await.expect("the first ensure");
+        let tunnel = tunnel.await.expect("the tunnel task");
+        let first = spawned_pids(&log);
+        assert_eq!(first.len(), 1);
+
+        close_tunnel(tunnel);
+        // Another test binds and LISTENS on the freed port.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let thief = loop {
+            match std::net::TcpListener::bind(("127.0.0.1", forward.port())) {
+                Ok(l) => break l,
+                Err(e) => {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "the thief could not bind: {e}"
+                    );
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+            }
+        };
+        forward.ensure().await.expect("ensure over the thief");
+        assert_eq!(
+            spawned_pids(&log),
+            first,
+            "the fast path should have trusted the thief's listener and not respawned"
+        );
+        assert!(pid_is_alive(first[0]), "the predecessor was left alone");
+        drop(thief);
+        drop(forward);
+        assert!(!pid_is_alive(first[0]), "the forward outlived its drop");
+    }
+
+    /// **The reservation holds the freed port across the gap** (#397, plan 026
+    /// §3.6): the rig's fix for port theft. While it is held a bind on the port
+    /// fails and a `connect` is refused, so the re-`ensure` reads the tunnel as
+    /// dead, kills the wedged predecessor and respawns — deterministically,
+    /// whatever else is binding ports in the process.
+    #[tokio::test]
+    async fn a_reserved_freed_port_cannot_be_stolen_and_the_re_ensure_respawns() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log = dir.path().join("spawns");
+        let forward =
+            SshForward::reserve_faked(entry(), fake_ssh(&log, "exec sleep 30")).expect("reserve");
+        let port = forward.port();
+        let tunnel = tunnel_once_started(port, &log, 1);
+        forward.ensure().await.expect("the first ensure");
+        let tunnel = tunnel.await.expect("the tunnel task");
+        let first = spawned_pids(&log);
+        assert_eq!(first.len(), 1);
+
+        let reservation = close_tunnel_and_reserve(tunnel, port);
+        assert!(
+            std::net::TcpListener::bind(("127.0.0.1", port)).is_err(),
+            "another bind took a reserved port"
+        );
+        let refused = std::net::TcpStream::connect(("127.0.0.1", port))
+            .expect_err("a reserved port must refuse connections");
+        assert_eq!(refused.kind(), std::io::ErrorKind::ConnectionRefused);
+        assert!(
+            pid_is_alive(first[0]),
+            "the predecessor is alive before the re-ensure"
+        );
+
+        let tunnel = tunnel_once_started_holding(port, &log, 2, Some(reservation));
+        forward.ensure().await.expect("the re-establish");
+        let _tunnel = tunnel.await.expect("the tunnel task");
+        let pids = spawned_pids(&log);
+        assert_eq!(pids.len(), 2, "the re-ensure respawned");
+        assert!(
+            !pid_is_alive(first[0]),
+            "the re-ensure killed the predecessor"
+        );
         drop(forward);
         assert!(
             !pid_is_alive(pids[1]),
