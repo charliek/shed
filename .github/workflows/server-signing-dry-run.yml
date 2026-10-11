@@ -44,7 +44,9 @@ jobs:
         uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
-          cache: true
+          # No restored build cache in a job that signs with the Developer
+          # ID certificate (CodeRabbit, PR #420).
+          cache: false
 
       # The same import as publish-images.yaml's release job.
       - name: Import Developer ID certificate
@@ -62,6 +64,13 @@ jobs:
           echo "$MACOS_CERTIFICATE_P12_BASE64" | base64 --decode > "$RUNNER_TEMP/cert.p12"
           security import "$RUNNER_TEMP/cert.p12" -k "$kc" -P "$MACOS_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
           security set-key-partition-list -S apple-tool:,apple: -s -k "$kp" "$kc"
+          # The identity (certificate + key) must be in THIS keychain, so a failed
+          # import fails here. Its trust is checked after signing (--verify).
+          ids="$(security find-identity -p codesigning "$kc")"
+          if ! grep -Eq '^ *[1-9][0-9]* identities found' <<<"$ids"; then
+            echo "::error::no codesigning identity was imported into $kc"
+            exit 1
+          fi
           # shellcheck disable=SC2046
           security list-keychains -d user -s "$kc" $(security list-keychains -d user | sed 's/"//g')
           rm -f "$RUNNER_TEMP/cert.p12"
