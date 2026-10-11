@@ -419,6 +419,58 @@ jobs:
               print(f"{comp}: IDs OK; deb={'yes' if debs else 'no'}; checksums={spec['checksums']}; formulas parse OK")
           print(f"partition OK: {len(all_basenames)} unique upload basenames across {len(EXPECTED)} dists")
           PY
+          # (iii) plan 028 D4 (#304): ShedServer.app. This job has no secrets, so
+          # the build hook signed ad hoc: these checks prove the bundle's layout
+          # and signature integrity, not Developer ID trust or the macOS
+          # permission behavior. Each darwin shed-homebrew archive is exactly the
+          # three binaries plus the bundle's three files under
+          # ShedServer.app/Contents/ (no dist/… nesting); each linux one is
+          # exactly the three binaries.
+          want_bins="$(printf '%s\n' shed shed-egress-proxy shed-server | LC_ALL=C sort)"
+          want_darwin="$(printf '%s\n' shed shed-egress-proxy shed-server ShedServer.app/Contents/Info.plist ShedServer.app/Contents/MacOS/shed-server ShedServer.app/Contents/_CodeSignature/CodeResources | LC_ALL=C sort)"
+          for arch in amd64 arm64; do
+            tgz="dist/server/shed-homebrew_darwin_${arch}.tar.gz"
+            listing="$(tar tzf "$tgz" | LC_ALL=C sort)"
+            [ "$listing" = "$want_darwin" ] || { echo "::error::$tgz is not exactly shed, shed-egress-proxy, shed-server and ShedServer.app/Contents/{Info.plist,MacOS/shed-server,_CodeSignature/CodeResources}"; echo "$listing"; exit 1; }
+            mode="$(tar tvzf "$tgz" ShedServer.app/Contents/MacOS/shed-server | awk '{print $1}')"
+            [ "$mode" = "-rwxr-xr-x" ] || { echo "::error::$tgz: ShedServer.app/Contents/MacOS/shed-server is $mode, want -rwxr-xr-x (0755)"; exit 1; }
+            appdir="$(mktemp -d)"
+            tar xzf "$tgz" -C "$appdir"
+            codesign --verify --strict --verbose=2 "$appdir/ShedServer.app" || { echo "::error::$tgz: ShedServer.app fails codesign --verify --strict"; exit 1; }
+            plutil -lint "$appdir/ShedServer.app/Contents/Info.plist" || { echo "::error::$tgz: ShedServer.app Info.plist fails plutil -lint"; exit 1; }
+            bundle_id="$(plutil -extract CFBundleIdentifier raw -o - "$appdir/ShedServer.app/Contents/Info.plist")"
+            [ "$bundle_id" = "ai.stridelabs.shed-server" ] || { echo "::error::$tgz: CFBundleIdentifier is '$bundle_id', want ai.stridelabs.shed-server"; exit 1; }
+            # The release hook's own step-6 checks (signing identifier, exactly
+            # the virtualization entitlement) on the bundle and the raw binary.
+            scripts/release/macos-server-app.sh --verify "$appdir/ShedServer.app"
+            scripts/release/macos-server-app.sh --verify "$appdir/shed-server"
+            rm -rf "$appdir"
+          done
+          for arch in amd64 arm64; do
+            tgz="dist/server/shed-homebrew_linux_${arch}.tar.gz"
+            listing="$(tar tzf "$tgz" | LC_ALL=C sort)"
+            [ "$listing" = "$want_bins" ] || { echo "::error::$tgz is not exactly shed, shed-egress-proxy and shed-server (a linux archive carries no ShedServer.app)"; echo "$listing"; exit 1; }
+          done
+          # The formula. goreleaser renders `install` as one
+          # `define_method(:install) do` per OS/arch; a block ends at the `end`
+          # on its own indentation. Its install/post_install blocks install the
+          # bundle and never run codesign, the service still runs the opt_bin
+          # symlink, and the caveat names the bundle. (Files, not pipes:
+          # `grep -q` on a large pipe under pipefail can fail on SIGPIPE.)
+          formula=dist/server/homebrew/Formula/shed.rb
+          blocks="$(mktemp)"
+          awk '
+            !f && /(define_method\(:(install|post_install)\) do|def (install|post_install))$/ { f = 1; match($0, /^ */); ind = substr($0, 1, RLENGTH); print; next }
+            f { print; if ($0 == ind "end") f = 0 }
+          ' "$formula" > "$blocks"
+          grep -qF 'libexec.install "ShedServer.app"' "$blocks" || { echo "::error::$formula install does not install ShedServer.app into libexec"; cat "$blocks"; exit 1; }
+          grep -qF 'bin.install_symlink libexec/"ShedServer.app/Contents/MacOS/shed-server"' "$blocks" || { echo "::error::$formula install does not link bin/shed-server into the bundle"; exit 1; }
+          if grep -n codesign "$blocks"; then echo "::error::$formula install/post_install still runs codesign"; exit 1; fi
+          awk '/^  service do$/ { f = 1 } f { print } f && /^  end$/ { f = 0 }' "$formula" > "$blocks"
+          grep -qF 'run [opt_bin/"shed-server", "serve", "--config", etc/"shed/server.yaml"]' "$blocks" || { echo "::error::$formula service no longer runs opt_bin/\"shed-server\""; cat "$blocks"; exit 1; }
+          grep -qF '#{opt_libexec}/ShedServer.app' "$formula" || { echo "::error::$formula caveats do not name #{opt_libexec}/ShedServer.app"; exit 1; }
+          rm -f "$blocks"
+          echo "ShedServer.app OK: darwin archives carry the signed bundle, linux ones don't; the formula installs it and never runs codesign"
           echo "release snapshot artifacts OK"
       # The linux/amd64 server deb, for server-deb-upgrade's dpkg matrix. That
       # job needs a Linux runner with Docker; this one is macOS.

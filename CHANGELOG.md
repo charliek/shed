@@ -90,6 +90,13 @@ All notable changes to this project will be documented in this file.
   upgrades never touch the file, and purge deletes it. A host stuck by that failure recovers
   by installing this release. Rolling back to 0.9.0 or earlier needs
   `-o Dpkg::Options::=--force-confold` to keep an edited config without a prompt. (#109)
+- **macOS (brew): an external-drive permission now survives upgrades.** The formula installs
+  `shed-server` inside a Developer ID signed `ShedServer.app` (bundle ID
+  `ai.stridelabs.shed-server`) under `$(brew --prefix)/opt/shed/libexec`, and `bin/shed-server`
+  is a symlink into it. macOS keys the grant on the bundle ID and signature, not on the Cellar
+  path that changes every version. The brew service command is unchanged. macOS asks one more
+  time on the first start after this upgrade, because the identity changed; after that,
+  upgrades don't ask again. (#304)
 
 ## v0.9.0 — 2026-10-10
 

@@ -7,6 +7,8 @@
 #   scripts/release/desktop-signing-gate.sh  (a stable desktop tag fails closed
 #                                             without the six Apple secrets)
 #   scripts/release/changelog-section.sh     (the curated release body)
+#   scripts/release/macos-server-app.sh      (the darwin shed-server signing +
+#                                             ShedServer.app hook, plan 028 D4)
 #
 # Runs every synthetic combination the release model depends on — per-component
 # (server / host-agent / desktop) and combined plans / neither→exit 1 /
@@ -55,6 +57,12 @@
 # else `yq -o=json` (mikefarah v4; the ubuntu runners carry it);
 # RELEASE_SELFTEST_YAML_LOADER=pyyaml|yq forces one, to exercise the other path.
 #
+# Phase 6 (plan 028 D4, #304) runs macos-server-app.sh, the darwin shed-server
+# signing hook, with stub codesign/plutil/uname on PATH: a linux target is a
+# no-op; required signing fails closed (no identity or team, a non-macOS host,
+# an ad hoc, wrong-team, untimestamped or over-entitled signature); the
+# positive ad hoc and Developer ID stagings; and the standalone --verify.
+#
 # Wired into CI as a step of ci.yml's `plugin` job (gated go||ci; the `ci`
 # path filter includes scripts/release/**, so editing these scripts always
 # runs this test).
@@ -90,6 +98,8 @@ tar -C "${REPO_ROOT}" -cf - \
   scripts/release/read-craze-pin.sh \
   scripts/release/desktop-signing-gate.sh \
   scripts/release/changelog-section.sh \
+  scripts/release/macos-server-app.sh \
+  internal/vz/entitlements.plist \
   .github/workflows/publish-images.yaml \
   craze-pin.env \
   .claude-plugin/plugin.json \
@@ -1959,6 +1969,266 @@ rp_rule_out="$("${RP}" v8.8.10 2>&1 1>/dev/null)" || rp_rule_rc=$?
 [ "${rp_rule_rc}" -eq 1 ] || fail "release-plan with a ## v<digit> body line exited ${rp_rule_rc} (want 1): ${rp_rule_out}"
 echo "${rp_rule_out}" | grep -qF "has no **Ships:** line" || fail "release-plan does not report the hidden Ships line: ${rp_rule_out}"
 ok "Ships after a fenced ## → the host-agent-only plan; a ## v<digit> body line ends the section, and the plan fails loudly"
+
+# ===========================================================================
+# Phase 6 (plan 028 D4, #304): macos-server-app.sh, the shed-server build's
+# goreleaser hook that signs the darwin binary and assembles ShedServer.app,
+# plus its standalone --verify. It runs as deployed (the scratch copy, so its
+# staging lands under ${SCRATCH}/dist), with stub codesign, plutil and uname
+# ahead of the real tools on PATH: the stub uname plays the host OS, and the
+# stub codesign reports the signature each case needs (STUB_SIGNATURE
+# adhoc|devid, STUB_TEAM, STUB_TIMESTAMP yes|no, STUB_ENTITLEMENTS virt|extra).
+# Every stub logs its calls, so a case can prove nothing was signed.
+# ===========================================================================
+
+MSA="${SCRATCH}/scripts/release/macos-server-app.sh"
+MSA_STUBS="${SCRATCH}/msa-stubs"
+MSA_LOG="${SCRATCH}/msa-calls.log"
+MSA_BIN="${SCRATCH}/dist/server/shed-server_darwin_arm64_v8.0/shed-server"
+MSA_APP="${SCRATCH}/dist/server/macos-app/darwin_arm64/ShedServer.app"
+MSA_ENTITLEMENTS="${SCRATCH}/internal/vz/entitlements.plist"
+MSA_TEAM="TEAM123456"
+MSA_IDENTITY="Developer ID Application: Example Dev (${MSA_TEAM})"
+mkdir -p "${MSA_STUBS}"
+
+cat > "${MSA_STUBS}/codesign" <<'STUB'
+#!/bin/sh
+echo "codesign $*" >> "${STUB_LOG:-/dev/null}"
+for last in "$@"; do :; done
+case " $* " in
+  *" --verify "*) exit 0 ;;
+  *" --sign "*)
+    if [ -d "${last}" ]; then
+      mkdir -p "${last}/Contents/_CodeSignature"
+      echo sealed > "${last}/Contents/_CodeSignature/CodeResources"
+    fi
+    exit 0 ;;
+  *" -r- "*)
+    echo "Executable=${last}" >&2
+    if [ "${STUB_SIGNATURE:-devid}" = devid ]; then
+      echo "designated => identifier \"ai.stridelabs.shed-server\" and anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] /* exists */ and certificate leaf[field.1.2.840.113635.100.6.1.13] /* exists */ and certificate leaf[subject.OU] = ${STUB_TEAM:-TEAM123456}"
+    else
+      echo 'designated => cdhash H"0123456789abcdef0123456789abcdef01234567"'
+    fi
+    exit 0 ;;
+  *" --entitlements "*)
+    echo "Executable=${last}" >&2
+    printf '<?xml version="1.0" encoding="UTF-8"?>\n<plist version="1.0"><dict><key>com.apple.security.virtualization</key><true/>'
+    if [ "${STUB_ENTITLEMENTS:-virt}" = extra ]; then
+      printf '<key>com.apple.security.cs.disable-library-validation</key><true/>'
+    fi
+    printf '</dict></plist>\n'
+    exit 0 ;;
+  *" -d "*)
+    {
+      echo "Executable=${last}"
+      echo "Identifier=ai.stridelabs.shed-server"
+      if [ "${STUB_SIGNATURE:-devid}" = devid ]; then
+        echo "Authority=Developer ID Application: Example Dev (${STUB_TEAM:-TEAM123456})"
+        echo "Authority=Developer ID Certification Authority"
+        echo "Authority=Apple Root CA"
+        if [ "${STUB_TIMESTAMP:-yes}" = yes ]; then
+          echo "Timestamp=Oct 11, 2026 at 10:00:00"
+        else
+          echo "Signed Time=Oct 11, 2026 at 10:00:00"
+        fi
+        echo "TeamIdentifier=${STUB_TEAM:-TEAM123456}"
+      else
+        echo "Signature=adhoc"
+        echo "TeamIdentifier=not set"
+      fi
+    } >&2
+    exit 0 ;;
+esac
+echo "stub codesign: unexpected call: $*" >&2
+exit 64
+STUB
+
+cat > "${MSA_STUBS}/plutil" <<'STUB'
+#!/bin/sh
+echo "plutil $*" >> "${STUB_LOG:-/dev/null}"
+case "$1" in
+  -lint) echo "$2: OK"; exit 0 ;;
+  -extract)
+    # -extract KEY raw -o - FILE: the <string> on the line after <key>KEY</key>.
+    awk -v k="<key>$2</key>" 'f { sub(/.*<string>/, ""); sub(/<\/string>.*/, ""); print; exit } index($0, k) { f = 1 }' "$6"
+    exit 0 ;;
+  -convert)
+    # -convert json -o - FILE
+    if grep -q 'disable-library-validation' "$5"; then
+      printf '{"com.apple.security.cs.disable-library-validation":true,"com.apple.security.virtualization":true}'
+    elif grep -q '<key>com.apple.security.virtualization</key>' "$5"; then
+      printf '{"com.apple.security.virtualization":true}'
+    else
+      exit 1
+    fi
+    exit 0 ;;
+esac
+echo "stub plutil: unexpected call: $*" >&2
+exit 64
+STUB
+
+cat > "${MSA_STUBS}/uname" <<'STUB'
+#!/bin/sh
+echo "uname $*" >> "${STUB_LOG:-/dev/null}"
+echo "${STUB_UNAME:-Darwin}"
+STUB
+chmod 0755 "${MSA_STUBS}/codesign" "${MSA_STUBS}/plutil" "${MSA_STUBS}/uname"
+
+# msa_reset: a fresh dummy darwin binary, no staged bundle.
+msa_reset() {
+  rm -rf "${SCRATCH}/dist"
+  mkdir -p "$(dirname "${MSA_BIN}")"
+  printf 'not really a Mach-O\n' > "${MSA_BIN}"
+}
+# run_msa [NAME=value...] <script> <args...> → MSA_OUT (stdout+stderr), MSA_RC.
+# The signing variables are cleared first, so a case sets exactly what it names.
+MSA_OUT=""; MSA_RC=0
+run_msa() {
+  MSA_RC=0
+  : > "${MSA_LOG}"
+  MSA_OUT="$(env -u SHED_SERVER_SIGNING -u SHED_SERVER_SIGN_IDENTITY -u SHED_SERVER_TEAM_ID \
+    PATH="${MSA_STUBS}:${PATH}" STUB_LOG="${MSA_LOG}" "$@" 2>&1)" || MSA_RC=$?
+}
+msa_signed_nothing() {
+  if grep -q -- '--sign' "${MSA_LOG}"; then
+    fail "$1: codesign signed something: $(cat "${MSA_LOG}")"
+  fi
+}
+REQUIRED_ENV=(SHED_SERVER_SIGNING=required "SHED_SERVER_SIGN_IDENTITY=${MSA_IDENTITY}" "SHED_SERVER_TEAM_ID=${MSA_TEAM}")
+
+step "macos-server-app.sh: a non-darwin target is a no-op, before any host check"
+msa_reset
+run_msa SHED_SERVER_SIGNING=required STUB_UNAME=Linux "${MSA}" "${SCRATCH}/dist/server/shed-server_linux_arm64_v8.0/shed-server" linux arm64 0.9.1
+[ "${MSA_RC}" -eq 0 ] || fail "linux target exited ${MSA_RC} (want 0): ${MSA_OUT}"
+[ -z "${MSA_OUT}" ] || fail "linux target printed output: ${MSA_OUT}"
+[ ! -s "${MSA_LOG}" ] || fail "linux target ran a tool (uname, codesign or plutil): $(cat "${MSA_LOG}")"
+[ ! -e "${SCRATCH}/dist/server/macos-app" ] || fail "linux target staged a bundle"
+ok "linux target with required signing and nothing else set → exit 0, silent, no tool run, no bundle"
+
+step "macos-server-app.sh: required signing without an identity, or without a team, fails before signing"
+msa_reset
+run_msa SHED_SERVER_SIGNING=required "SHED_SERVER_TEAM_ID=${MSA_TEAM}" "${MSA}" "${MSA_BIN}" darwin arm64 0.9.1
+[ "${MSA_RC}" -eq 1 ] || fail "required without an identity exited ${MSA_RC} (want 1): ${MSA_OUT}"
+printf '%s\n' "${MSA_OUT}" | grep -qF "SHED_SERVER_SIGNING=required needs: SHED_SERVER_SIGN_IDENTITY" \
+  || fail "required without an identity does not name SHED_SERVER_SIGN_IDENTITY: ${MSA_OUT}"
+msa_signed_nothing "required without an identity"
+run_msa SHED_SERVER_SIGNING=required "SHED_SERVER_SIGN_IDENTITY=${MSA_IDENTITY}" "${MSA}" "${MSA_BIN}" darwin arm64 0.9.1
+[ "${MSA_RC}" -eq 1 ] || fail "required without a team exited ${MSA_RC} (want 1): ${MSA_OUT}"
+printf '%s\n' "${MSA_OUT}" | grep -qF "SHED_SERVER_SIGNING=required needs: SHED_SERVER_TEAM_ID" \
+  || fail "required without a team does not name SHED_SERVER_TEAM_ID: ${MSA_OUT}"
+msa_signed_nothing "required without a team"
+[ ! -e "${SCRATCH}/dist/server/macos-app" ] || fail "required without an identity or team staged a bundle"
+ok "no identity → exit 1 naming SHED_SERVER_SIGN_IDENTITY; no team → exit 1 naming SHED_SERVER_TEAM_ID; nothing signed"
+
+step "macos-server-app.sh: required signing on a non-macOS host fails"
+msa_reset
+run_msa "${REQUIRED_ENV[@]}" STUB_UNAME=Linux "${MSA}" "${MSA_BIN}" darwin arm64 0.9.1
+[ "${MSA_RC}" -eq 1 ] || fail "required on a Linux host exited ${MSA_RC} (want 1): ${MSA_OUT}"
+printf '%s\n' "${MSA_OUT}" | grep -qF "needs: a macOS host (this host is Linux)" \
+  || fail "required on a Linux host does not say it needs macOS: ${MSA_OUT}"
+msa_signed_nothing "required on a Linux host"
+ok "required on Linux → exit 1, nothing signed"
+
+# msa_required_refused <label> <expected message> <stub settings...>
+msa_required_refused() {
+  local label="$1" want="$2"
+  shift 2
+  msa_reset
+  run_msa "${REQUIRED_ENV[@]}" "$@" "${MSA}" "${MSA_BIN}" darwin arm64 0.9.1
+  [ "${MSA_RC}" -eq 1 ] || fail "required with ${label} exited ${MSA_RC} (want 1): ${MSA_OUT}"
+  printf '%s\n' "${MSA_OUT}" | grep -qF "${want}" || fail "required with ${label}: no '${want}' in: ${MSA_OUT}"
+  ok "required with ${label} → exit 1 (${want})"
+}
+step "macos-server-app.sh: required signing refuses a signature that is not a timestamped Developer ID one from the team"
+msa_required_refused "an ad hoc signature" "no signing Authority (an ad hoc signature?)" STUB_SIGNATURE=adhoc
+msa_required_refused "the wrong team" "TeamIdentifier is 'WRONGTEAM9', which is not SHED_SERVER_TEAM_ID" STUB_TEAM=WRONGTEAM9
+msa_required_refused "no secure timestamp" "no secure Timestamp" STUB_TIMESTAMP=no
+msa_required_refused "an extra entitlement" "want exactly {\"com.apple.security.virtualization\":true}" STUB_ENTITLEMENTS=extra
+
+step "macos-server-app.sh: required signing with a matching Developer ID passes and stages the bundle"
+msa_reset
+run_msa "${REQUIRED_ENV[@]}" "${MSA}" "${MSA_BIN}" darwin arm64 0.9.1-SNAPSHOT-abc1234
+[ "${MSA_RC}" -eq 0 ] || fail "required with a matching Developer ID exited ${MSA_RC} (want 0): ${MSA_OUT}"
+grep -qF -- "--sign ${MSA_IDENTITY} --timestamp --identifier ai.stridelabs.shed-server --entitlements ${MSA_ENTITLEMENTS} ${MSA_BIN}" "${MSA_LOG}" \
+  || fail "the raw binary was not signed in place with the identity, --timestamp, the identifier and the entitlements: $(cat "${MSA_LOG}")"
+grep -qF -- "--sign ${MSA_IDENTITY} --timestamp --entitlements ${MSA_ENTITLEMENTS} ${MSA_APP}" "${MSA_LOG}" \
+  || fail "the bundle was not signed with the identity, --timestamp and the entitlements: $(cat "${MSA_LOG}")"
+[ -f "${MSA_APP}/Contents/Info.plist" ] || fail "no Contents/Info.plist staged"
+[ -f "${MSA_APP}/Contents/_CodeSignature/CodeResources" ] || fail "no _CodeSignature/CodeResources staged"
+[ -n "$(find "${MSA_APP}/Contents/MacOS/shed-server" -perm 0755)" ] || fail "Contents/MacOS/shed-server is not mode 0755"
+[ -n "$(find "${MSA_APP}/Contents/Info.plist" -perm 0644)" ] || fail "Contents/Info.plist is not mode 0644"
+cmp -s "${MSA_BIN}" "${MSA_APP}/Contents/MacOS/shed-server" || fail "the bundle executable is not a copy of the binary"
+[ "$(grep -c '<string>0\.9\.1</string>' "${MSA_APP}/Contents/Info.plist")" -eq 2 ] \
+  || fail "CFBundleVersion and CFBundleShortVersionString are not both the stripped 0.9.1: $(cat "${MSA_APP}/Contents/Info.plist")"
+grep -q SNAPSHOT "${MSA_APP}/Contents/Info.plist" && fail "the snapshot suffix leaked into Info.plist"
+for kv in "CFBundleIdentifier=ai.stridelabs.shed-server" "CFBundleExecutable=shed-server" "CFBundlePackageType=APPL" "CFBundleName=Shed Server" "CFBundleDisplayName=Shed Server"; do
+  got="$(env PATH="${MSA_STUBS}:${PATH}" plutil -extract "${kv%%=*}" raw -o - "${MSA_APP}/Contents/Info.plist")"
+  [ "${got}" = "${kv#*=}" ] || fail "Info.plist ${kv%%=*} is '${got}', want '${kv#*=}'"
+done
+grep -A1 '<key>LSUIElement</key>' "${MSA_APP}/Contents/Info.plist" | grep -q '<true/>' || fail "Info.plist LSUIElement is not true"
+[ "$(printf '%s\n' "${MSA_OUT}" | grep -c "(ai.stridelabs.shed-server, Developer ID, team ${MSA_TEAM}, timestamped)")" -eq 2 ] \
+  || fail "the raw binary and the bundle were not both verified as Developer ID: ${MSA_OUT}"
+ok "matching Developer ID → exit 0; both signed with --timestamp; bundle staged (0755 executable, Info.plist 0.9.1, ID, LSUIElement); both verified"
+
+step "macos-server-app.sh: ad hoc signing on macOS signs with '-' and no --timestamp"
+msa_reset
+run_msa STUB_SIGNATURE=adhoc "SHED_SERVER_SIGN_IDENTITY=${MSA_IDENTITY}" "${MSA}" "${MSA_BIN}" darwin arm64 0.9.1
+[ "${MSA_RC}" -eq 0 ] || fail "ad hoc on macOS exited ${MSA_RC} (want 0): ${MSA_OUT}"
+grep -qF -- "--sign - --identifier ai.stridelabs.shed-server --entitlements ${MSA_ENTITLEMENTS} ${MSA_BIN}" "${MSA_LOG}" \
+  || fail "the ad hoc raw-binary signature is wrong: $(cat "${MSA_LOG}")"
+grep -qF -- "--sign - --entitlements ${MSA_ENTITLEMENTS} ${MSA_APP}" "${MSA_LOG}" || fail "the ad hoc bundle signature is wrong: $(cat "${MSA_LOG}")"
+grep -qF -- "--timestamp" "${MSA_LOG}" && fail "ad hoc signing asked for a timestamp: $(cat "${MSA_LOG}")"
+[ -f "${MSA_APP}/Contents/MacOS/shed-server" ] || fail "ad hoc on macOS staged no bundle"
+ok "ad hoc → '--sign -' without --timestamp (a set identity is ignored), bundle staged"
+
+step "macos-server-app.sh: ad hoc on a non-macOS host warns and builds no bundle"
+msa_reset
+run_msa STUB_UNAME=Linux "${MSA}" "${MSA_BIN}" darwin arm64 0.9.1
+[ "${MSA_RC}" -eq 0 ] || fail "ad hoc on Linux exited ${MSA_RC} (want 0): ${MSA_OUT}"
+printf '%s\n' "${MSA_OUT}" | grep -qF "warning: Linux host, so no ShedServer.app for darwin/arm64" || fail "ad hoc on Linux did not warn: ${MSA_OUT}"
+msa_signed_nothing "ad hoc on Linux"
+[ ! -e "${SCRATCH}/dist/server/macos-app" ] || fail "ad hoc on Linux staged a bundle"
+ok "ad hoc on Linux → exit 0 with a warning, nothing signed, no bundle"
+
+step "macos-server-app.sh: an unknown SHED_SERVER_SIGNING value fails closed"
+msa_reset
+run_msa SHED_SERVER_SIGNING=Required "${MSA}" "${MSA_BIN}" darwin arm64 0.9.1
+[ "${MSA_RC}" -eq 1 ] || fail "SHED_SERVER_SIGNING=Required exited ${MSA_RC} (want 1): ${MSA_OUT}"
+printf '%s\n' "${MSA_OUT}" | grep -qF "SHED_SERVER_SIGNING must be 'required' or unset" || fail "unknown mode message missing: ${MSA_OUT}"
+msa_signed_nothing "an unknown SHED_SERVER_SIGNING"
+ok "'Required' (a typo) → exit 1, not a silent ad hoc build"
+
+step "macos-server-app.sh --verify: the step-6 checks alone, on a bundle and on a Mach-O"
+msa_reset
+run_msa STUB_SIGNATURE=adhoc "${MSA}" "${MSA_BIN}" darwin arm64 0.9.1
+[ "${MSA_RC}" -eq 0 ] || fail "staging a bundle for --verify exited ${MSA_RC}: ${MSA_OUT}"
+run_msa SHED_SERVER_SIGNING=required "SHED_SERVER_TEAM_ID=${MSA_TEAM}" "${MSA}" --verify "${MSA_APP}"
+[ "${MSA_RC}" -eq 0 ] || fail "--verify (required, Developer ID) on the bundle exited ${MSA_RC} (want 0): ${MSA_OUT}"
+printf '%s\n' "${MSA_OUT}" | grep -qF "verified ${MSA_APP} (ai.stridelabs.shed-server, Developer ID, team ${MSA_TEAM}, timestamped)" \
+  || fail "--verify did not report the Developer ID bundle: ${MSA_OUT}"
+grep -q -- '-lint' "${MSA_LOG}" || fail "--verify on a bundle did not lint Info.plist: $(cat "${MSA_LOG}")"
+msa_signed_nothing "--verify"
+run_msa SHED_SERVER_SIGNING=required "SHED_SERVER_TEAM_ID=${MSA_TEAM}" STUB_SIGNATURE=adhoc "${MSA}" --verify "${MSA_BIN}"
+[ "${MSA_RC}" -eq 1 ] || fail "--verify (required) on an ad hoc Mach-O exited ${MSA_RC} (want 1): ${MSA_OUT}"
+run_msa SHED_SERVER_SIGNING=required "SHED_SERVER_TEAM_ID=${MSA_TEAM}" STUB_TEAM=WRONGTEAM9 "${MSA}" --verify "${MSA_APP}"
+[ "${MSA_RC}" -eq 1 ] || fail "--verify (required) on a wrong-team bundle exited ${MSA_RC} (want 1): ${MSA_OUT}"
+run_msa SHED_SERVER_SIGNING=required "${MSA}" --verify "${MSA_APP}"
+[ "${MSA_RC}" -eq 1 ] || fail "--verify (required) without SHED_SERVER_TEAM_ID exited ${MSA_RC} (want 1): ${MSA_OUT}"
+printf '%s\n' "${MSA_OUT}" | grep -qF "needs SHED_SERVER_TEAM_ID" || fail "--verify without a team does not name it: ${MSA_OUT}"
+run_msa STUB_SIGNATURE=adhoc "${MSA}" --verify "${MSA_BIN}"
+[ "${MSA_RC}" -eq 0 ] || fail "--verify (ad hoc) on the Mach-O exited ${MSA_RC} (want 0): ${MSA_OUT}"
+printf '%s\n' "${MSA_OUT}" | grep -qF "verified ${MSA_BIN} (ai.stridelabs.shed-server, ad hoc)" || fail "--verify (ad hoc) report missing: ${MSA_OUT}"
+grep -q -- '-lint' "${MSA_LOG}" && fail "--verify on a Mach-O linted an Info.plist it does not have: $(cat "${MSA_LOG}")"
+run_msa "${MSA}" --verify "${SCRATCH}/no-such-thing"
+[ "${MSA_RC}" -eq 1 ] || fail "--verify on a missing path exited ${MSA_RC} (want 1): ${MSA_OUT}"
+run_msa "${MSA}" --verify
+[ "${MSA_RC}" -eq 2 ] || fail "--verify with no path exited ${MSA_RC} (want 2): ${MSA_OUT}"
+run_msa "${MSA}" --verify "${MSA_APP}" "${MSA_BIN}"
+[ "${MSA_RC}" -eq 2 ] || fail "--verify with two paths exited ${MSA_RC} (want 2): ${MSA_OUT}"
+run_msa "${MSA}" "${MSA_BIN}" darwin arm64
+[ "${MSA_RC}" -eq 2 ] || fail "the hook with three arguments exited ${MSA_RC} (want 2): ${MSA_OUT}"
+ok "--verify: Developer ID bundle → 0; ad hoc or wrong team under required → 1; required without a team → 1; ad hoc Mach-O → 0 (no plist lint); missing path → 1; bad usage → 2"
 
 echo
 echo "release-scripts-test: all ${PASS} checks passed"

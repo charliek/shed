@@ -33,7 +33,9 @@ brew services start shed-host-agent
 
 `brew install charliek/tap/shed` installs the `shed` CLI and `shed-server`, pulls
 `vfkit` (the Apple Virtualization bridge), generates a default VZ server config,
-codesigns the server binary, and registers a launchd service.
+installs `shed-server` inside a signed app bundle (`ShedServer.app`, so macOS
+privacy grants such as external-drive access survive upgrades), and registers a
+launchd service.
 
 ## 2. Configure the server
 

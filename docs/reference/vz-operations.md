@@ -190,7 +190,7 @@ If nobody answers the prompt, for example on a headless Mac or a service started
 shed-server: startup is still waiting on /Volumes/ext/shed/vz (checking state directory) after 10s. macOS may be waiting for permission to access it (external drives, and folders like Documents, need it). Answer the "Shed Server" prompt on this Mac's screen, or grant Full Disk Access to <path> in System Settings → Privacy & Security → Full Disk Access. It continues on its own once access is granted.
 ```
 
-`<path>` is what to grant access to, with symlinks resolved. Answer the prompt or grant Full Disk Access, and startup continues without a restart. The same line with `resuming running sheds` in place of `startup` can appear later, from the background walk that reconnects running sheds.
+`<path>` is what to grant access to, with symlinks resolved. Under brew it is `$(brew --prefix)/opt/shed/libexec/ShedServer.app`. Answer the prompt or grant Full Disk Access, and startup continues without a restart. The same line with `resuming running sheds` in place of `startup` can appear later, from the background walk that reconnects running sheds.
 
 If the prompt was answered with **Don't Allow**, the read fails instead and the server logs a warning:
 
@@ -226,6 +226,14 @@ Whether a grant survives `brew upgrade shed` depends on what macOS records it ag
 |---|---|---|
 | A bare executable | Its absolute path, which includes the Homebrew version directory | macOS asks again |
 | An app bundle signed with the same identity in every release | The bundle identifier and its signing requirement | The grant carries over |
+
+From this release the brew formula installs `shed-server` as the second kind: `$(brew --prefix)/opt/shed/libexec/ShedServer.app`, bundle ID `ai.stridelabs.shed-server`, Developer ID signed by the release build. `bin/shed-server` is a symlink into it, and the brew service still runs `opt/shed/bin/shed-server`. The grant therefore persists across upgrades, as long as it is not revoked or reset.
+
+The upgrade that introduces the bundle prompts one more time, because the server's identity changed. Answer it on the Mac's screen, or grant Full Disk Access to the bundle path above before or after upgrading.
+
+When you start `shed-server` from Terminal instead of the brew service, the prompt names Terminal, not Shed Server, and the grant belongs to Terminal.
+
+The bundle has no Dock icon (`LSUIElement`), and opening it by double-click does nothing useful.
 
 ## Time synchronization
 

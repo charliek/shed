@@ -61,6 +61,15 @@ builds:
       - -X github.com/charliek/shed/internal/version.Version={{.Version}}
       - -X github.com/charliek/shed/internal/version.GitCommit={{.ShortCommit}}
       - -X github.com/charliek/shed/internal/version.BuildDate={{.Date}}
+    # Plan 028 D4 (#304): on a darwin target, sign this binary in place and
+    # assemble + sign dist/server/macos-app/darwin_<arch>/ShedServer.app, which
+    # the shed-homebrew archive carries. Developer ID when the environment sets
+    # SHED_SERVER_SIGNING=required (the release job), otherwise ad hoc; a
+    # non-macOS host builds no bundle (its warning shows with --verbose). A
+    # linux target is a no-op.
+    hooks:
+      post:
+        - ./scripts/release/macos-server-app.sh "{{ .Path }}" "{{ .Os }}" "{{ .Arch }}" "{{ .Version }}"
 
   - id: shed-egress-proxy
     binary: shed-egress-proxy
@@ -132,7 +141,12 @@ archives:
       - tar.gz
     name_template: "shed-homebrew_{{ .Os }}_{{ .Arch }}"
     files:
-      - none*
+      # The bundle the shed-server build hook staged, placed at
+      # ShedServer.app/Contents/… in the archive root (plan 028 D4, #304). On
+      # linux the glob matches nothing, which goreleaser only notes. Any
+      # entry here also keeps the default README/LICENSE files out.
+      - src: 'dist/server/macos-app/{{ .Os }}_{{ .Arch }}/**/*'
+        dst: ShedServer.app/Contents
 
 brews:
   - name: shed
@@ -154,7 +168,17 @@ brews:
       # erofs-utils. Kept the brew formula minimal.
     install: |
       bin.install "shed"
-      bin.install "shed-server"
+      if OS.mac?
+        # shed-server ships inside ShedServer.app (plan 028, #304): macOS keys
+        # an external drive's permission on the bundle's ID and signature,
+        # which survive upgrades, but a bare binary's on its Cellar path, which
+        # doesn't. bin/shed-server links into the bundle, so the service
+        # command is unchanged. The archive's raw shed-server isn't installed.
+        libexec.install "ShedServer.app"
+        bin.install_symlink libexec/"ShedServer.app/Contents/MacOS/shed-server"
+      else
+        bin.install "shed-server"
+      end
       bin.install "shed-egress-proxy"
       (etc/"shed").mkpath
       unless (etc/"shed/server.yaml").exist?
@@ -307,26 +331,12 @@ brews:
           YAML
         end
       end
-    post_install: |
-      if OS.mac?
-        require "tempfile"
-        tmp = Tempfile.new(["shed-entitlements", ".plist"])
-        tmp.write <<~XML
-          <?xml version="1.0" encoding="UTF-8"?>
-          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-          <plist version="1.0">
-          <dict>
-            <key>com.apple.security.virtualization</key>
-            <true/>
-          </dict>
-          </plist>
-        XML
-        tmp.flush
-        system "codesign", "--force", "--sign", "-",
-               "--entitlements", tmp.path,
-               "#{bin}/shed-server"
-        tmp.close!
-      end
+    # No post_install: the ad hoc re-sign that used to live here gave
+    # shed-server a new identity on every upgrade. The release build signs
+    # ShedServer.app instead (plan 028 D4, #304), and the service below still
+    # runs opt_bin/"shed-server": macOS attributes a launch through that
+    # symlink to the bundle.
+    #
     # stop_timeout: launchd's default exit timeout SIGKILLs shed-server in the
     # middle of its graceful shutdown (shutdownTimeout is 30 s); 35 s lets it
     # exit cleanly. Needs Homebrew >= 6.0.13. vfkit no longer depends on this
@@ -355,6 +365,10 @@ brews:
         brew install shed-host-agent
 
       Logs: #{var}/log/shed-server.log
+
+      With the VZ store on an external drive, macOS asks once for access the
+      first time ShedServer.app starts. Allow it on the Mac's screen, or grant
+      Full Disk Access to #{opt_libexec}/ShedServer.app
 
       Note: shed-server requires Docker for VM image management.
     test: |

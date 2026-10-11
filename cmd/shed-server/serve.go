@@ -276,7 +276,7 @@ func runServe(cmd *cobra.Command, args []string) error {
 	if cfg.Egress != nil && cfg.Egress.Enabled {
 		lo, hi := cfg.Egress.PortRangeBounds()
 		sockPath := filepath.Join(egressSocketDir, "egress-proxy.sock")
-		proxyBin, err := resolveEgressProxyBin(egressProxyBinDir())
+		proxyBin, err := resolveEgressProxyBin()
 		if err != nil {
 			return fmt.Errorf("egress enabled: %w", err)
 		}
@@ -328,7 +328,7 @@ func runServe(cmd *cobra.Command, args []string) error {
 			}
 		}
 		attachEgressStore(egressUserStore)
-		log.Printf("Initialized egress-control proxy (ports %d-%d, socket %s, audit %s, profiles %s)", lo, hi, sockPath, auditPath, storeDir)
+		log.Printf("Initialized egress-control proxy (proxy %s, ports %d-%d, socket %s, audit %s, profiles %s)", proxyBin, lo, hi, sockPath, auditPath, storeDir)
 	}
 
 	// Build the SSH key allowlist (default off = accept all). GitHub-seeded

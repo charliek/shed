@@ -26,7 +26,7 @@ The fastest way to get started. Homebrew handles vfkit, code signing, config gen
 brew install charliek/tap/shed
 ```
 
-This installs `shed` (CLI) and `shed-server`, installs the vfkit dependency, generates a default server config (image refs resolve from the server version — no pinned tags to bump on upgrade), and codesigns the server binary.
+This installs `shed` (CLI) and `shed-server`, installs the vfkit dependency, generates a default server config (image refs resolve from the server version — no pinned tags to bump on upgrade), and installs `shed-server` inside a signed app bundle (`ShedServer.app`, under `$(brew --prefix)/opt/shed/libexec`). `bin/shed-server` links into the bundle, so the brew service is unchanged. The bundle keeps macOS privacy grants, such as access to an external drive, across upgrades.
 
 For credential brokering (SSH agent forwarding, AWS credentials, Docker registry auth):
 
