@@ -58,6 +58,10 @@ All notable changes to this project will be documented in this file.
   `~/.config` owned by root, so `roost-session` could not start — breaking `shed attach` and
   Connect Host — and anything writing under `~/.local` or `~/.config` failed on `base` and
   `extensions` sheds. Existing sheds are repaired on their next `shed start`. (#410)
+- **Docs: remove `shed-host-agent` before applying the desktop update, or relaunch the app
+  afterwards.** The 0.8.2 to 0.9.0 upgrade guide and the desktop docs now say so, because in
+  `Automatic` broker mode the app chooses its broker once at launch and does not fall back
+  if the daemon disappears at runtime. A runtime fallback is still open. (#411)
 
 ## v0.9.0 — 2026-10-10
 

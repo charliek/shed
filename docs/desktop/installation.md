@@ -144,6 +144,12 @@ shared across tools. A **Preferences → Credential broker** setting (`Automatic
 | `In-app (embedded)` | Always starts the in-process broker, regardless of any running daemon. If a daemon is also running, the two race for each server's credential-bus namespace — the loser gets a per-namespace `409`, surfaced (not hidden) in `broker.status`; no double approval prompts. |
 | `External daemon` | Always dials the standalone daemon, never starts an in-process broker. |
 
+If the daemon `Automatic` chose at launch is stopped or uninstalled while the app runs, the
+app does not fall back to its embedded broker: there is no credential broker, and sheds lose
+ssh-agent and credential forwarding, until you relaunch the app. Relaunch after removing the
+daemon, or pin `In-app (embedded)`. A runtime fallback is tracked in
+[#411](https://github.com/charliek/shed/issues/411).
+
 The resolved mode is **fixed for the app's process lifetime** — changing the preference
 takes effect on the **next launch**, not live. The active mode, the probe evidence that
 produced it, and (for embedded) the resolved SSH backend and per-server connection state
