@@ -9,13 +9,16 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"net"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"sort"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/charliek/shed/internal/backend"
 	"github.com/charliek/shed/internal/config"
 	"github.com/charliek/shed/internal/plugin"
 	"github.com/charliek/shed/internal/vmutil"
@@ -980,6 +983,7 @@ func TestCheckNotRunningRefusesWhenIdentityUnknown(t *testing.T) {
 
 func TestDeleteShedRefusesWhenIdentityUnknown(t *testing.T) {
 	c, cfg, _ := unknownIdentityClient(t, "alpha")
+	srv := registerShedP9Server(t, c, "alpha")
 
 	err := c.DeleteShed(context.Background(), "alpha")
 	if err == nil {
@@ -987,5 +991,577 @@ func TestDeleteShedRefusesWhenIdentityUnknown(t *testing.T) {
 	}
 	if _, err := LoadMetadata(cfg.InstanceDir, "alpha"); err != nil {
 		t.Errorf("metadata was removed despite the refusal: %v", err)
+	}
+	// The possibly-live VMM keeps its mounts too (#284).
+	assertP9Servers(t, c, "alpha", []*P9Server{srv}, false)
+}
+
+// --- 9P servers live exactly as long as their VMM may (#284) ----------------
+//
+// A shed's 9P servers close only once its VMM is verifiably gone: after
+// stop/kill whatever they returned, on every delete path that releases the
+// shed, on the start/create rollback, and as a stale sweep when a start finds
+// the shed not running. Where the VMM may still be alive they stay registered
+// and listening, so a live guest's mounts keep working.
+
+// newP9TeardownClient builds a Client for the 9P-teardown tests: a network
+// manager (DeleteShed releases a TAP; a missing one is a no-op), an uppers
+// dir inside the test's temp dir, and a short stop_timeout so the graceful
+// path's guest calls — which fail fast against a VM that isn't there — and
+// stopByPID's wait stay quick. 500 ms still leaves a SIGTERMed child ample
+// time to exit and be reaped under -race before stopByPID gives up on it.
+func newP9TeardownClient(t *testing.T) (*Client, *config.FirecrackerConfig) {
+	t.Helper()
+	tmpDir := t.TempDir()
+	cfg := testFirecrackerConfig(tmpDir)
+	cfg.UppersDir = filepath.Join(tmpDir, "uppers")
+	cfg.StopTimeout = config.Duration(500 * time.Millisecond)
+	c, _ := newResumeTestClient(t, cfg, nil)
+	nm, err := NewNetworkManager(cfg.BridgeName, cfg.BridgeCIDR, cfg.TAPPrefix)
+	if err != nil {
+		t.Fatalf("NewNetworkManager: %v", err)
+	}
+	c.netMgr = nm
+	return c, cfg
+}
+
+// registerShedP9Server starts a real 9P server on 127.0.0.1 and registers it
+// under name, as startP9Server does for a mount.
+func registerShedP9Server(t *testing.T, c *Client, name string) *P9Server {
+	t.Helper()
+	srv := newStartedP9Server(t, t.TempDir())
+	c.mu.Lock()
+	c.p9Servers[name] = append(c.p9Servers[name], srv)
+	c.mu.Unlock()
+	return srv
+}
+
+// registerShedP9Servers registers two servers, as a shed with a project mount
+// and a credential mount would have.
+func registerShedP9Servers(t *testing.T, c *Client, name string) []*P9Server {
+	t.Helper()
+	return []*P9Server{registerShedP9Server(t, c, name), registerShedP9Server(t, c, name)}
+}
+
+// p9ServerListening reports whether srv still accepts connections. A closed
+// listener refuses at once; the generous timeout only guards a starved
+// scheduler from turning a live listener into a false "closed".
+func p9ServerListening(srv *P9Server) bool {
+	conn, err := net.DialTimeout("tcp", srv.Addr(), 2*time.Second)
+	if err != nil {
+		return false
+	}
+	_ = conn.Close()
+	return true
+}
+
+// assertP9Servers checks name's servers are closed (unregistered and refusing
+// connections) or kept (all still registered and listening).
+func assertP9Servers(t *testing.T, c *Client, name string, servers []*P9Server, wantClosed bool) {
+	t.Helper()
+	c.mu.Lock()
+	registered := len(c.p9Servers[name])
+	c.mu.Unlock()
+	for _, srv := range servers {
+		if listening := p9ServerListening(srv); listening == wantClosed {
+			t.Errorf("9P server %s listening = %v, want %v", srv.Addr(), listening, !wantClosed)
+		}
+	}
+	switch {
+	case wantClosed && registered != 0:
+		t.Errorf("%d 9P server(s) still registered for %s, want them closed and unregistered", registered, name)
+	case !wantClosed && registered != len(servers):
+		t.Errorf("%d 9P server(s) registered for %s, want all %d kept", registered, name, len(servers))
+	}
+}
+
+// mustDeadPID returns the pid of a child that has already exited and been
+// reaped: a VMM that is verifiably gone.
+func mustDeadPID(t *testing.T) int {
+	t.Helper()
+	cmd := exec.Command("true")
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("run true: %v", err)
+	}
+	return cmd.Process.Pid
+}
+
+// mustSpawnReapedChild returns a live pid that is reaped the moment it exits,
+// so once a stop kills it, it is gone from the process table — unlike
+// mustSpawnLiveChild's child, which lingers as a zombie (still answering
+// signal 0) until the test ends.
+func mustSpawnReapedChild(t *testing.T) int {
+	t.Helper()
+	cmd := exec.Command("sleep", "30")
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("start sleep child: %v", err)
+	}
+	exited := make(chan struct{})
+	go func() {
+		_ = cmd.Wait()
+		close(exited)
+	}()
+	t.Cleanup(func() {
+		_ = cmd.Process.Kill()
+		<-exited
+	})
+	return cmd.Process.Pid
+}
+
+// readerOwns makes pid read as this shed's firecracker VMM (and every other
+// pid as gone).
+func readerOwns(cfg *config.FirecrackerConfig, name string, pid int) func(int) ([]byte, error) {
+	return func(p int) ([]byte, error) {
+		if p == pid {
+			return []byte(fcCmdline(cfg, name)), nil
+		}
+		return nil, fs.ErrNotExist
+	}
+}
+
+// readerUnknown makes every pid's identity unreadable (UNKNOWN).
+func readerUnknown(int) ([]byte, error) { return nil, fs.ErrPermission }
+
+// readerSomeoneElse makes pid read as an unrelated process: a recycled pid.
+func readerSomeoneElse(int) ([]byte, error) { return []byte("/usr/bin/sleep\x0030"), nil }
+
+func TestStopShedLockedClosesP9ServersOnlyOnceVMMGone(t *testing.T) {
+	const name = "alpha"
+	tests := []struct {
+		name string
+		mode stopMode
+		// setup returns the recorded pid and may swap the /proc reader.
+		setup      func(t *testing.T, cfg *config.FirecrackerConfig) int
+		wantErr    error // nil: success; errAnyStopFailure: any error
+		wantClosed bool
+	}{
+		{
+			name:       "destroy, no recorded pid",
+			mode:       stopDestroy,
+			setup:      func(*testing.T, *config.FirecrackerConfig) int { return 0 },
+			wantClosed: true,
+		},
+		{
+			name:       "destroy, VMM already dead",
+			mode:       stopDestroy,
+			setup:      func(t *testing.T, _ *config.FirecrackerConfig) int { return mustDeadPID(t) },
+			wantClosed: true,
+		},
+		{
+			// vm.Kill fails (it cannot read the pid's identity), but the
+			// pid is not alive: gone, whatever Kill returned.
+			name: "destroy, kill error but VMM verifiably dead",
+			mode: stopDestroy,
+			setup: func(t *testing.T, _ *config.FirecrackerConfig) int {
+				pid := mustDeadPID(t)
+				swapPIDCmdlineReader(t, readerUnknown)
+				return pid
+			},
+			wantErr:    errAnyStopFailure,
+			wantClosed: true,
+		},
+		{
+			name: "graceful, vm.Stop error but VMM verifiably dead",
+			mode: stopGraceful,
+			setup: func(t *testing.T, _ *config.FirecrackerConfig) int {
+				pid := mustDeadPID(t)
+				swapPIDCmdlineReader(t, readerUnknown)
+				return pid
+			},
+			wantErr:    errAnyStopFailure,
+			wantClosed: true,
+		},
+		{
+			name: "graceful, VMM stops and is reaped",
+			mode: stopGraceful,
+			setup: func(t *testing.T, cfg *config.FirecrackerConfig) int {
+				pid := mustSpawnReapedChild(t)
+				swapPIDCmdlineReader(t, readerOwns(cfg, name, pid))
+				return pid
+			},
+			wantClosed: true,
+		},
+		{
+			name: "destroy, recorded pid recycled to another process",
+			mode: stopDestroy,
+			setup: func(t *testing.T, _ *config.FirecrackerConfig) int {
+				pid := mustSpawnLiveChild(t)
+				swapPIDCmdlineReader(t, readerSomeoneElse)
+				return pid
+			},
+			wantClosed: true,
+		},
+		{
+			name: "destroy, identity UNKNOWN",
+			mode: stopDestroy,
+			setup: func(t *testing.T, _ *config.FirecrackerConfig) int {
+				pid := mustSpawnLiveChild(t)
+				swapPIDCmdlineReader(t, readerUnknown)
+				return pid
+			},
+			wantErr:    errAnyStopFailure,
+			wantClosed: false,
+		},
+		{
+			name: "graceful, identity UNKNOWN",
+			mode: stopGraceful,
+			setup: func(t *testing.T, _ *config.FirecrackerConfig) int {
+				pid := mustSpawnLiveChild(t)
+				swapPIDCmdlineReader(t, readerUnknown)
+				return pid
+			},
+			wantErr:    errAnyStopFailure,
+			wantClosed: false,
+		},
+		{
+			// The stop returns nil but the pid is still this shed's VMM
+			// (a zombie still answers signal 0): the existing post-check's
+			// ErrStopIncomplete, reached from the same single probe.
+			name: "graceful, VMM still ours after the stop",
+			mode: stopGraceful,
+			setup: func(t *testing.T, cfg *config.FirecrackerConfig) int {
+				pid := mustSpawnLiveChild(t)
+				swapPIDCmdlineReader(t, readerOwns(cfg, name, pid))
+				return pid
+			},
+			wantErr:    config.ErrStopIncompleteSentinel,
+			wantClosed: false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			c, cfg := newP9TeardownClient(t)
+			pid := tt.setup(t, cfg)
+			writeResumeInstance(t, cfg.InstanceDir, name, config.StatusRunning, pid)
+			servers := registerShedP9Servers(t, c, name)
+			meta, err := LoadMetadata(cfg.InstanceDir, name)
+			if err != nil {
+				t.Fatalf("LoadMetadata: %v", err)
+			}
+
+			_, err = c.stopShedLocked(context.Background(), meta, tt.mode)
+			switch {
+			case tt.wantErr == nil && err != nil:
+				t.Fatalf("stopShedLocked() error = %v, want nil", err)
+			case tt.wantErr != nil && err == nil:
+				t.Fatalf("stopShedLocked() = nil, want an error")
+			case tt.wantErr != nil && tt.wantErr != errAnyStopFailure && !errors.Is(err, tt.wantErr):
+				t.Fatalf("stopShedLocked() error = %v, want %v", err, tt.wantErr)
+			}
+			assertP9Servers(t, c, name, servers, tt.wantClosed)
+
+			onDisk, err := LoadMetadata(cfg.InstanceDir, name)
+			if err != nil {
+				t.Fatalf("LoadMetadata after stop: %v", err)
+			}
+			wantStatus := config.StatusStopped
+			if tt.wantErr != nil {
+				wantStatus = config.StatusRunning
+			}
+			if onDisk.Status != wantStatus {
+				t.Errorf("persisted status = %q, want %q", onDisk.Status, wantStatus)
+			}
+		})
+	}
+}
+
+// errAnyStopFailure marks a table case that expects some error without
+// pinning which one.
+var errAnyStopFailure = errors.New("any stop failure")
+
+func TestDeleteShedClosesStaleP9ServersOfStoppedShed(t *testing.T) {
+	c, cfg := newP9TeardownClient(t)
+	writeResumeInstance(t, cfg.InstanceDir, "alpha", config.StatusStopped, 0)
+	// Left behind by a VMM exit that GetShed reconciled to Stopped.
+	servers := registerShedP9Servers(t, c, "alpha")
+
+	if err := c.DeleteShed(context.Background(), "alpha"); err != nil {
+		t.Fatalf("DeleteShed() error = %v", err)
+	}
+	assertP9Servers(t, c, "alpha", servers, true)
+	if _, err := LoadMetadata(cfg.InstanceDir, "alpha"); !errors.Is(err, ErrInstanceNotFound) {
+		t.Errorf("metadata still present after delete (err = %v)", err)
+	}
+}
+
+// The delete fallback used to log a VMM that survived SIGKILL and release its
+// TAP, reservations and upper anyway. It now refuses, as it already did for
+// UNKNOWN identity, and keeps everything — the 9P servers included.
+func TestDeleteShedRefusesWhenVMMSurvivesSIGKILL(t *testing.T) {
+	c, cfg := newP9TeardownClient(t)
+	// A child that is never reaped during the test: once SIGKILLed it is a
+	// zombie, which still answers signal 0 — a VMM that "survived" SIGKILL.
+	pid := mustSpawnLiveChild(t)
+	writeResumeInstance(t, cfg.InstanceDir, "alpha", config.StatusRunning, pid)
+	meta, err := LoadMetadata(cfg.InstanceDir, "alpha")
+	if err != nil {
+		t.Fatalf("LoadMetadata: %v", err)
+	}
+	c.RegisterInstance("alpha", meta.CID, meta.IPAddress)
+	upperDir := UpperDir(cfg.UppersDir, "alpha")
+	if err := os.MkdirAll(upperDir, 0o755); err != nil {
+		t.Fatalf("mkdir upper: %v", err)
+	}
+	servers := registerShedP9Servers(t, c, "alpha")
+
+	// The first identity read fails, so stopShedLocked's kill fails and
+	// DeleteShed falls back; every later read says "ours", so the fallback
+	// SIGKILLs and then waits on a pid that never goes away.
+	owns := readerOwns(cfg, "alpha", pid)
+	reads := 0
+	swapPIDCmdlineReader(t, func(p int) ([]byte, error) {
+		reads++
+		if reads == 1 {
+			return nil, fs.ErrPermission
+		}
+		return owns(p)
+	})
+
+	err = c.DeleteShed(context.Background(), "alpha")
+	if !errors.Is(err, config.ErrStopIncompleteSentinel) {
+		t.Fatalf("DeleteShed() error = %v, want ErrStopIncomplete: a VMM that survived SIGKILL must not have its resources released", err)
+	}
+	if _, err := LoadMetadata(cfg.InstanceDir, "alpha"); err != nil {
+		t.Errorf("metadata removed despite the refusal: %v", err)
+	}
+	if _, err := os.Stat(upperDir); err != nil {
+		t.Errorf("upper removed despite the refusal: %v", err)
+	}
+	c.mu.Lock()
+	_, cidHeld := c.usedCIDs[meta.CID]
+	_, ipHeld := c.usedIPs[meta.IPAddress]
+	c.mu.Unlock()
+	if !cidHeld || !ipHeld {
+		t.Errorf("reservations released despite the refusal: cid held = %v, ip held = %v", cidHeld, ipHeld)
+	}
+	assertP9Servers(t, c, "alpha", servers, false)
+}
+
+func TestCheckNotRunningSweepsStaleP9Servers(t *testing.T) {
+	const name = "alpha"
+	tests := []struct {
+		name   string
+		status string
+		// setup returns the recorded pid and may swap the /proc reader.
+		setup func(t *testing.T, cfg *config.FirecrackerConfig) int
+		// handlePID, when set, gives this server an in-process VM handle
+		// (c.vms) for the shed with the returned VMM pid. It runs after
+		// setup, so it may swap the /proc reader again.
+		handlePID  func(t *testing.T, cfg *config.FirecrackerConfig) int
+		wantErr    error // nil: not running; errAnyStopFailure: any error
+		wantClosed bool
+	}{
+		{
+			name:       "stopped, no recorded pid",
+			status:     config.StatusStopped,
+			setup:      func(*testing.T, *config.FirecrackerConfig) int { return 0 },
+			wantClosed: true,
+		},
+		{
+			// GetShed never got to reconcile this one; the start does.
+			name:       "running record, VMM exited unexpectedly",
+			status:     config.StatusRunning,
+			setup:      func(t *testing.T, _ *config.FirecrackerConfig) int { return mustDeadPID(t) },
+			wantClosed: true,
+		},
+		{
+			name:   "running and still ours",
+			status: config.StatusRunning,
+			setup: func(t *testing.T, cfg *config.FirecrackerConfig) int {
+				pid := mustSpawnLiveChild(t)
+				swapPIDCmdlineReader(t, readerOwns(cfg, name, pid))
+				return pid
+			},
+			wantErr:    config.ErrShedAlreadyRunningSentinel,
+			wantClosed: false,
+		},
+		{
+			name:   "running, identity UNKNOWN",
+			status: config.StatusRunning,
+			setup: func(t *testing.T, _ *config.FirecrackerConfig) int {
+				pid := mustSpawnLiveChild(t)
+				swapPIDCmdlineReader(t, readerUnknown)
+				return pid
+			},
+			wantErr:    errAnyStopFailure,
+			wantClosed: false,
+		},
+		{
+			name:   "stopped, but the recorded pid is a live VMM of ours",
+			status: config.StatusStopped,
+			setup: func(t *testing.T, cfg *config.FirecrackerConfig) int {
+				pid := mustSpawnLiveChild(t)
+				swapPIDCmdlineReader(t, readerOwns(cfg, name, pid))
+				return pid
+			},
+			wantErr:    config.ErrZombiePresentSentinel,
+			wantClosed: false,
+		},
+		{
+			// GetShed's unlocked lost update: the record says Stopped/PID=0,
+			// but this server's VM handle is a live VMM of ours. Its mounts
+			// must survive the sweep.
+			name:   "stale stopped record, in-process VM handle live and ours",
+			status: config.StatusStopped,
+			setup:  func(*testing.T, *config.FirecrackerConfig) int { return 0 },
+			handlePID: func(t *testing.T, cfg *config.FirecrackerConfig) int {
+				pid := mustSpawnLiveChild(t)
+				swapPIDCmdlineReader(t, readerOwns(cfg, name, pid))
+				return pid
+			},
+			wantClosed: false,
+		},
+		{
+			name:   "stale stopped record, in-process VM handle identity UNKNOWN",
+			status: config.StatusStopped,
+			setup:  func(*testing.T, *config.FirecrackerConfig) int { return 0 },
+			handlePID: func(t *testing.T, _ *config.FirecrackerConfig) int {
+				pid := mustSpawnLiveChild(t)
+				swapPIDCmdlineReader(t, readerUnknown)
+				return pid
+			},
+			wantClosed: false,
+		},
+		{
+			name:       "stopped, in-process VM handle whose VMM is dead",
+			status:     config.StatusStopped,
+			setup:      func(*testing.T, *config.FirecrackerConfig) int { return 0 },
+			handlePID:  func(t *testing.T, _ *config.FirecrackerConfig) int { return mustDeadPID(t) },
+			wantClosed: true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			c, cfg := newP9TeardownClient(t)
+			pid := tt.setup(t, cfg)
+			writeResumeInstance(t, cfg.InstanceDir, name, tt.status, pid)
+			if tt.handlePID != nil {
+				handle := testMetadata(name)
+				handle.Status = config.StatusRunning
+				handle.PID = tt.handlePID(t, cfg)
+				c.mu.Lock()
+				c.vms[name] = &VM{meta: handle, cfg: cfg}
+				c.mu.Unlock()
+			}
+			servers := registerShedP9Servers(t, c, name)
+			meta, err := LoadMetadata(cfg.InstanceDir, name)
+			if err != nil {
+				t.Fatalf("LoadMetadata: %v", err)
+			}
+
+			err = (&fcStarter{c: c}).CheckNotRunning(context.Background(), &fcMetaHandle{meta: meta})
+			switch {
+			case tt.wantErr == nil && err != nil:
+				t.Fatalf("CheckNotRunning() error = %v, want nil", err)
+			case tt.wantErr != nil && err == nil:
+				t.Fatalf("CheckNotRunning() = nil, want an error")
+			case tt.wantErr != nil && tt.wantErr != errAnyStopFailure && !errors.Is(err, tt.wantErr):
+				t.Fatalf("CheckNotRunning() error = %v, want %v", err, tt.wantErr)
+			}
+			assertP9Servers(t, c, name, servers, tt.wantClosed)
+		})
+	}
+}
+
+// The start/create rollback registers "stop 9P servers" before "stop VM", so
+// the LIFO unwind decides about the servers only after the VM stop — and
+// closes them only if the VMM is then verifiably gone.
+func TestRegisterStopVMCleanupsClosesP9ServersOnlyOnceVMMGone(t *testing.T) {
+	const name = "alpha"
+	tests := []struct {
+		name string
+		// setup returns the VM's pid and may swap the /proc reader.
+		setup      func(t *testing.T, cfg *config.FirecrackerConfig) int
+		wantClosed bool
+	}{
+		{
+			name:       "no recorded pid, stop succeeds",
+			setup:      func(*testing.T, *config.FirecrackerConfig) int { return 0 },
+			wantClosed: true,
+		},
+		{
+			name:       "VMM already dead",
+			setup:      func(t *testing.T, _ *config.FirecrackerConfig) int { return mustDeadPID(t) },
+			wantClosed: true,
+		},
+		{
+			// Alive and ours until "stop VM" kills it. Had "stop 9P
+			// servers" run first, it would have found a live VMM and kept
+			// the servers.
+			name: "VMM ours until the stop kills it",
+			setup: func(t *testing.T, cfg *config.FirecrackerConfig) int {
+				pid := mustSpawnReapedChild(t)
+				swapPIDCmdlineReader(t, readerOwns(cfg, name, pid))
+				return pid
+			},
+			wantClosed: true,
+		},
+		{
+			name: "identity UNKNOWN",
+			setup: func(t *testing.T, _ *config.FirecrackerConfig) int {
+				pid := mustSpawnLiveChild(t)
+				swapPIDCmdlineReader(t, readerUnknown)
+				return pid
+			},
+			wantClosed: false,
+		},
+		{
+			name: "VMM survives the stop",
+			setup: func(t *testing.T, cfg *config.FirecrackerConfig) int {
+				pid := mustSpawnLiveChild(t) // lingers as a zombie: still answers signal 0
+				swapPIDCmdlineReader(t, readerOwns(cfg, name, pid))
+				return pid
+			},
+			wantClosed: false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			c, cfg := newP9TeardownClient(t)
+			meta := testMetadata(name)
+			meta.Status = config.StatusRunning
+			meta.PID = tt.setup(t, cfg)
+			vm := &VM{meta: meta, cfg: cfg}
+			servers := registerShedP9Servers(t, c, name)
+
+			cleanup := backend.NewCleanup()
+			c.registerStopVMCleanups(cleanup, vm)
+			cleanup.Run() // a failed start/create unwinding
+
+			assertP9Servers(t, c, name, servers, tt.wantClosed)
+		})
+	}
+}
+
+// Daemon exit closes every shed's servers, in parallel, without waiting for
+// any guest to hang up — the #369 exception.
+func TestClientCloseClosesEveryShedsP9Servers(t *testing.T) {
+	c, _ := newP9TeardownClient(t)
+	var servers []*P9Server
+	var reads []<-chan error
+	for _, name := range []string{"alpha", "beta"} {
+		for _, srv := range registerShedP9Servers(t, c, name) {
+			servers = append(servers, srv)
+			reads = append(reads, readUntilHangup(dialMidTversion(t, srv)))
+		}
+	}
+
+	start := time.Now()
+	if err := c.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+	if elapsed := time.Since(start); elapsed >= closeBound {
+		t.Errorf("Client.Close() took %v with a guest connected to each server, want < %v (the 5 s backstop means it waited for the guests)", elapsed, closeBound)
+	}
+	for _, read := range reads {
+		assertHungUp(t, <-read)
+	}
+	for _, name := range []string{"alpha", "beta"} {
+		assertP9Servers(t, c, name, nil, true)
+	}
+	for _, srv := range servers {
+		if p9ServerListening(srv) {
+			t.Errorf("9P server %s still listening after Client.Close", srv.Addr())
+		}
 	}
 }

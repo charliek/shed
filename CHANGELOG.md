@@ -29,6 +29,15 @@ All notable changes to this project will be documented in this file.
   `shed create`, `shed image pull`, `shed image push`, `shed snapshot create` and the prune
   commands now re-mint and retry once on an expired or invalid credential, as the other
   commands already did, instead of surfacing the 401. (#412)
+- **Server (Firecracker): stopping or deleting a running shed with writable host mounts no
+  longer takes 25–30 s and ends in SIGKILL.** Each 9P mount server now closes only after the VM
+  is gone, force-closes its connections instead of waiting 5 s for the guest to hang up, and
+  closes in parallel with the shed's other mounts. The shutdown hook and the pre-stop sync run
+  before any mount closes, a failed start or a VM that exited unexpectedly no longer leaks 9P
+  listeners, and a `shed-server` restart no longer waits 5 s per mount. On both backends, a
+  client disconnect during `shed stop` no longer turns the graceful stop into a force-kill.
+  `shed delete` now refuses, and keeps the shed's resources, if its VM survives SIGKILL; retry
+  the delete once the VM is gone. (#284)
 
 ## v0.9.0 — 2026-10-10
 

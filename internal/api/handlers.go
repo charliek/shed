@@ -554,7 +554,16 @@ func (s *Server) handleStartShed(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleStopShed(w http.ResponseWriter, r *http.Request) {
 	name := chi.URLParam(r, "name")
 
-	shed, err := s.backend.StopShed(r.Context(), name)
+	// Detach the stop from client cancellation (as delete does): a client
+	// disconnect or its request timeout must not turn a graceful stop into a
+	// force-kill. Both backends' stop paths SIGKILL the VMM when their ctx is
+	// cancelled, which also cuts the shutdown hook and the sync short. Every
+	// step after the per-shed lock is self-bounded — hook ≤ 5 s, sync 2 s,
+	// graceful shutdown ≤ stop_timeout (10 s), SIGKILL wait 2 s; ~19 s worst
+	// case — so the stop still completes without a deadline. The lock wait
+	// itself is unbounded, as it is for delete: a stop queued behind a long
+	// create still runs (gracefully) after the client has given up.
+	shed, err := s.backend.StopShed(context.WithoutCancel(r.Context()), name)
 	if err != nil {
 		code, errCode, msg := mapBackendError(err)
 		writeError(w, code, errCode, msg)

@@ -92,14 +92,15 @@ test-host-agent-diff:
 # shed-mobile. Needs uv and an sshd (skips cleanly without one).
 # See tests/machine-transport/README.md.
 # Server-free unit tests of the integration suite's own helpers and baked-image
-# test bodies (tests/integration/test_smoke_units.py). Runs in CI (integration-units).
+# test bodies (tests/integration/test_smoke_units.py, test_fixture_units.py).
+# Runs in CI (integration-units).
 test-integration-units:
 	@command -v uv >/dev/null 2>&1 || { \
 	  echo "uv is required for the integration unit tests."; \
 	  echo "Install: brew install uv  (or https://docs.astral.sh/uv/getting-started/installation/)"; \
 	  exit 1; \
 	}
-	cd tests/integration && uv sync && uv run pytest test_smoke_units.py -v
+	cd tests/integration && uv sync && uv run pytest test_smoke_units.py test_fixture_units.py -v
 
 test-machine-transport:
 	@command -v uv >/dev/null 2>&1 || { \
