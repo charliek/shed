@@ -39,7 +39,8 @@ sudo dpkg -i shed-server_${VERSION}_amd64.deb
 This installs:
 
 - `shed` CLI and `shed-server` binaries to `/usr/local/bin/`
-- Default Firecracker server config at `/etc/shed/server.yaml`
+- Default Firecracker server config at `/etc/shed/server.yaml`, created on first install from
+  the packaged reference copy at `/usr/share/shed/server.yaml.default`
 - Systemd unit file (enabled but not started)
 
 ### Build from Source (Alternative)
@@ -106,7 +107,10 @@ the [upgrade cookbook](../reference/images.md#cookbook-upgrading-image-versions)
 
 ## 4. Configure
 
-Edit `/etc/shed/server.yaml` to configure mounts and extensions:
+Edit `/etc/shed/server.yaml` to configure mounts and extensions. The package never overwrites
+this file: an upgrade keeps your edits and does not prompt. New defaults appear in the
+reference copy, so compare after an upgrade with
+`diff /usr/share/shed/server.yaml.default /etc/shed/server.yaml`.
 
 ```yaml
 name: my-server

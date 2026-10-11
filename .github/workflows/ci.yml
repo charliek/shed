@@ -420,6 +420,34 @@ jobs:
           print(f"partition OK: {len(all_basenames)} unique upload basenames across {len(EXPECTED)} dists")
           PY
           echo "release snapshot artifacts OK"
+      # The linux/amd64 server deb, for server-deb-upgrade's dpkg matrix. That
+      # job needs a Linux runner with Docker; this one is macOS.
+      - name: Upload the linux/amd64 shed-server deb
+        uses: actions/upload-artifact@v7
+        with:
+          name: shed-server-deb-amd64
+          path: dist/server/shed-server_*_amd64.deb
+          if-no-files-found: error
+          retention-days: 7
+
+  # #109: /etc/shed/server.yaml is no longer a dpkg conffile. Installs this
+  # snapshot's deb in fresh ubuntu:24.04 containers over the pinned v0.7.10 and
+  # v0.9.0 release debs (upgrade, stuck host, reinstall, remove, purge, a later
+  # template change, downgrade), with stdin closed as an unattended upgrade
+  # has it, and asserts no prompt and an untouched config. Runs whenever
+  # release-snapshot runs, and is skipped with it.
+  server-deb-upgrade:
+    name: server deb upgrade (#109)
+    needs: release-snapshot
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/download-artifact@v8
+        with:
+          name: shed-server-deb-amd64
+          path: dist/server
+      - name: Config contract (A1, T1-T10)
+        run: bash scripts/release/test-deb-upgrade.sh dist/server/shed-server_*_amd64.deb
 
   # ---- desktop / crates legs (imported from shed-desktop's ci.yml) ----------
 
@@ -943,12 +971,12 @@ jobs:
   ci-success:
     name: ci-success
     if: always()
-    needs: [changes, test, lint, plugin, pins, release-snapshot, swift, core-linux, host-agent-diff, machine-transport, integration-units, deb, tauri-linux, tauri-mac, docs-build]
+    needs: [changes, test, lint, plugin, pins, release-snapshot, server-deb-upgrade, swift, core-linux, host-agent-diff, machine-transport, integration-units, deb, tauri-linux, tauri-mac, docs-build]
     runs-on: ubuntu-latest
     steps:
       - name: Require no job failed (skipped-by-filter counts as pass)
         run: |
-          results="${{ needs.changes.result }} ${{ needs.test.result }} ${{ needs.lint.result }} ${{ needs.plugin.result }} ${{ needs.pins.result }} ${{ needs.release-snapshot.result }} ${{ needs.swift.result }} ${{ needs.core-linux.result }} ${{ needs.host-agent-diff.result }} ${{ needs.machine-transport.result }} ${{ needs.integration-units.result }} ${{ needs.deb.result }} ${{ needs.tauri-linux.result }} ${{ needs.tauri-mac.result }} ${{ needs.docs-build.result }}"
+          results="${{ needs.changes.result }} ${{ needs.test.result }} ${{ needs.lint.result }} ${{ needs.plugin.result }} ${{ needs.pins.result }} ${{ needs.release-snapshot.result }} ${{ needs.server-deb-upgrade.result }} ${{ needs.swift.result }} ${{ needs.core-linux.result }} ${{ needs.host-agent-diff.result }} ${{ needs.machine-transport.result }} ${{ needs.integration-units.result }} ${{ needs.deb.result }} ${{ needs.tauri-linux.result }} ${{ needs.tauri-mac.result }} ${{ needs.docs-build.result }}"
           echo "job results: ${results}"
           for r in ${results}; do
             case "${r}" in

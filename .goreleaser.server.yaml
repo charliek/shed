@@ -385,9 +385,25 @@ nfpms:
       - src: packaging/shed-server.service
         dst: /etc/systemd/system/shed-server.service
         type: config
+      # /etc/shed/server.yaml is NOT shipped (#109). As a dpkg conffile, an
+      # operator's edits plus any template change made dpkg prompt, and an
+      # unattended upgrade died at that prompt with the package unconfigured.
+      # The rendered template ships as a reference copy instead;
+      # packaging/postinstall.sh copies it to /etc/shed/server.yaml on a fresh
+      # install only, and packaging/postremove.sh deletes the config on purge.
+      # scripts/release/test-deb-upgrade.sh (CI: server-deb-upgrade) holds both
+      # ends of that contract.
       - src: packaging/server.yaml.generated
-        dst: /etc/shed/server.yaml
-        type: "config|noreplace"
+        dst: /usr/share/shed/server.yaml.default
+        type: file
+        file_info:
+          mode: 0644
+      # Owned explicitly, now that no packaged file lives in it: dpkg keeps
+      # owning the directory the conffile-era packages created.
+      - dst: /etc/shed
+        type: dir
+        file_info:
+          mode: 0755
       - dst: /var/lib/shed/firecracker/instances
         type: dir
         file_info:
@@ -402,6 +418,7 @@ nfpms:
           mode: 0755
     scripts:
       postinstall: packaging/postinstall.sh
+      postremove: packaging/postremove.sh
 
 checksum:
   # Unique per-config name: all three configs publish to the SAME GH release

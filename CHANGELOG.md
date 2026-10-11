@@ -82,6 +82,14 @@ All notable changes to this project will be documented in this file.
   Disk Access, and a directory macOS has denied gets its own warning. A store that hangs on a
   read now holds startup at that line, instead of the server reaching `ready` while the resume
   of running sheds hangs silently. (#304)
+- **Server (deb): `/etc/shed/server.yaml` is no longer a dpkg conffile, so an upgrade never
+  prompts about it.** An edited config made dpkg prompt whenever a release changed the
+  packaged template, and an unattended `apt-get -y` upgrade then failed with `end of file on
+  stdin at conffile prompt`, leaving the package unconfigured. The template now ships at
+  `/usr/share/shed/server.yaml.default`: a fresh install copies it to `/etc/shed/server.yaml`,
+  upgrades never touch the file, and purge deletes it. A host stuck by that failure recovers
+  by installing this release. Rolling back to 0.9.0 or earlier needs
+  `-o Dpkg::Options::=--force-confold` to keep an edited config without a prompt. (#109)
 
 ## v0.9.0 — 2026-10-10
 
