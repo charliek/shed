@@ -38,9 +38,39 @@ allow_insecure_exposure: true
 default_backend: firecracker
 log_level: debug
 
-# No credentials, no extensions — see the rationale in the macOS
-# parallel-dev config. Dev sheds exist to exercise the server, not
-# to host the developer's working environment.
+# THROWAWAY writable mounts, never real credentials. They mirror the keys and
+# targets of mini3's deb server so the dev FC suite exercises the 9P mount
+# path. That path hid shed#284 (5 writable mounts x a 5 s 9P close made every
+# stop take 25-30 s), and shed#410's nested-parent test needs nested targets
+# (.local/share/opencode, .local/state/opencode, .config/gh). The source dirs
+# are created (root-owned, 0755) by `make dev-server-up-fc`, which derives the
+# list from the `source:` lines below -- keep them under
+# /var/lib/shed-dev/mounts/. Absolute paths on purpose: no ~ expansion here.
+mounts:
+  claude:
+    source: /var/lib/shed-dev/mounts/claude
+    target: /home/shed/.claude
+    readonly: false
+  codex:
+    source: /var/lib/shed-dev/mounts/codex
+    target: /home/shed/.codex
+    readonly: false
+  opencode_data:
+    source: /var/lib/shed-dev/mounts/opencode/share
+    target: /home/shed/.local/share/opencode
+    readonly: false
+  opencode_state:
+    source: /var/lib/shed-dev/mounts/opencode/state
+    target: /home/shed/.local/state/opencode
+    readonly: false
+  gh:
+    source: /var/lib/shed-dev/mounts/gh
+    target: /home/shed/.config/gh
+    readonly: false
+
+# Intentionally NO extensions block: dev sheds don't need ssh-agent /
+# docker-credentials brokering (same rationale as the macOS parallel-dev
+# config).
 
 firecracker:
   # Same as deb config — kernel + images pinned to the latest release
