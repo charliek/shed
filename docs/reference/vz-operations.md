@@ -190,7 +190,7 @@ If nobody answers the prompt, for example on a headless Mac or a service started
 shed-server: startup is still waiting on /Volumes/ext/shed/vz (checking state directory) after 10s. macOS may be waiting for permission to access it (external drives, and folders like Documents, need it). Answer the "Shed Server" prompt on this Mac's screen, or grant Full Disk Access to <path> in System Settings → Privacy & Security → Full Disk Access. It continues on its own once access is granted.
 ```
 
-`<path>` is what to grant access to, with symlinks resolved. Under brew it is `$(brew --prefix)/opt/shed/libexec/ShedServer.app`. Answer the prompt or grant Full Disk Access, and startup continues without a restart. The same line with `resuming running sheds` in place of `startup` can appear later, from the background walk that reconnects running sheds.
+`<path>` is what to grant access to, with symlinks resolved. Under brew it is `$(brew --prefix)/opt/shed/libexec/ShedServer.app`. A server that does not run from `ShedServer.app`, such as a development build, names its own executable in both places. Answer the prompt or grant Full Disk Access, and startup continues without a restart. The same line with `resuming running sheds` in place of `startup` can appear later, from the background walk that reconnects running sheds.
 
 If the prompt was answered with **Don't Allow**, the read fails instead and the server logs a warning:
 

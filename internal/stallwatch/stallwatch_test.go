@@ -303,7 +303,7 @@ func TestHint(t *testing.T) {
 			what: "checking state directory", elapsed: 10 * time.Second,
 			want: "shed-server: startup is still waiting on /Volumes/ext/shed (checking state directory) after 10s. " +
 				"macOS may be waiting for permission to access it (external drives, and folders like Documents, need it). " +
-				`Answer the "Shed Server" prompt on this Mac's screen, or grant Full Disk Access to ` + exe +
+				`Answer the "shed-server" prompt on this Mac's screen, or grant Full Disk Access to ` + exe +
 				" in System Settings → Privacy & Security → Full Disk Access. It continues on its own once access is granted.",
 		},
 		{
@@ -327,7 +327,7 @@ func TestHint(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := hint(tt.goos, exe, tt.phase, tt.what, "/Volumes/ext/shed", tt.elapsed)
+			got := hint(tt.goos, bundleOrSelf(exe), tt.phase, tt.what, "/Volumes/ext/shed", tt.elapsed)
 			if got != tt.want {
 				t.Errorf("hint()\n got: %s\nwant: %s", got, tt.want)
 			}
@@ -383,8 +383,8 @@ func TestGrantTarget(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := grantTarget(tt.exe); got != tt.want {
-				t.Errorf("grantTarget(%q) = %q, want %q", tt.exe, got, tt.want)
+			if got := grantTarget(tt.exe).path; got != tt.want {
+				t.Errorf("grantTarget(%q).path = %q, want %q", tt.exe, got, tt.want)
 			}
 		})
 	}
@@ -392,6 +392,33 @@ func TestGrantTarget(t *testing.T) {
 	t.Run("darwin hint names the bundle", func(t *testing.T) {
 		got := hint("darwin", grantTarget(filepath.Join(root, "opt/shed/bin/shed-server")), Startup, "checking state directory", "/p", 10*time.Second)
 		if want := "grant Full Disk Access to " + bundle + " in System Settings"; !strings.Contains(got, want) {
+			t.Errorf("hint %q does not contain %q", got, want)
+		}
+		if want := `Answer the "Shed Server" prompt`; !strings.Contains(got, want) {
+			t.Errorf("hint %q does not contain %q", got, want)
+		}
+	})
+}
+
+func TestPromptName(t *testing.T) {
+	tests := []struct {
+		name, exe, wantPath, wantPrompt string
+	}{
+		{"bundle executable", "/opt/shed/libexec/ShedServer.app/Contents/MacOS/shed-server", "/opt/shed/libexec/ShedServer.app", "Shed Server"},
+		{"bare binary", "/Users/me/wt/shed/bin/shed-server", "/Users/me/wt/shed/bin/shed-server", "shed-server"},
+		{"bare binary named like a bundle", "/tmp/shed-server.app", "/tmp/shed-server.app", "shed-server.app"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := bundleOrSelf(tt.exe); got.path != tt.wantPath || got.prompt != tt.wantPrompt {
+				t.Errorf("bundleOrSelf(%q) = %+v, want path %q prompt %q", tt.exe, got, tt.wantPath, tt.wantPrompt)
+			}
+		})
+	}
+
+	t.Run("an awkward executable name stays one quoted token", func(t *testing.T) {
+		got := hint("darwin", bundleOrSelf("/tmp/shed\"server\nx"), Startup, "checking state directory", "/p", 10*time.Second)
+		if want := `Answer the "shed\"server\nx" prompt`; !strings.Contains(got, want) {
 			t.Errorf("hint %q does not contain %q", got, want)
 		}
 	})

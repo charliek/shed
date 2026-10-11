@@ -22,6 +22,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -119,15 +120,15 @@ func WatchContext(ctx context.Context, phase Phase, what, path string) (stop fun
 var (
 	targetOnce     sync.Once
 	targetResolved = make(chan struct{})
-	resolvedTarget atomic.Pointer[string]
+	resolvedTarget atomic.Pointer[grant]
 )
 
 // resolveTarget starts resolving the Full Disk Access target, once per process.
 func resolveTarget() {
 	targetOnce.Do(func() {
 		go func() {
-			t := grantTarget(executable())
-			resolvedTarget.Store(&t)
+			g := grantTarget(executable())
+			resolvedTarget.Store(&g)
 			close(targetResolved)
 		}()
 	})
@@ -136,9 +137,9 @@ func resolveTarget() {
 // currentTarget returns the resolved target when it is ready, and otherwise
 // the unresolved executable (or its bundle, judged from the path alone). It
 // never touches the filesystem.
-func currentTarget() string {
-	if t := resolvedTarget.Load(); t != nil {
-		return *t
+func currentTarget() grant {
+	if g := resolvedTarget.Load(); g != nil {
+		return *g
 	}
 	return bundleOrSelf(executable())
 }
@@ -154,7 +155,7 @@ func FullDiskAccessTarget() string {
 	case <-targetResolved:
 	case <-time.After(2 * time.Second):
 	}
-	return currentTarget()
+	return currentTarget().path
 }
 
 // executable returns the running binary's path, or its name when the OS
@@ -172,10 +173,17 @@ func executable() string {
 // a macOS app bundle.
 const appBundleMarker = ".app/Contents/MacOS/"
 
+// grant is what the stall line tells an operator: the path to grant Full Disk
+// Access to, and the name macOS shows in its access prompt for it.
+type grant struct {
+	path   string
+	prompt string
+}
+
 // grantTarget resolves exePath's symlinks and returns the enclosing .app when
 // the resolved path is inside a bundle, otherwise the resolved executable. A
 // path that cannot be resolved is used as given.
-func grantTarget(exePath string) string {
+func grantTarget(exePath string) grant {
 	resolved, err := filepath.EvalSymlinks(exePath)
 	if err != nil {
 		resolved = exePath
@@ -184,20 +192,23 @@ func grantTarget(exePath string) string {
 }
 
 // bundleOrSelf returns the enclosing .app when p is inside a bundle, otherwise
-// p itself. It is purely lexical.
-func bundleOrSelf(p string) string {
+// p itself. It is purely lexical. macOS names the responsible process in its
+// prompt: the bundle's display name ("Shed Server", from ShedServer.app's
+// Info.plist) for a bundle, the executable's own name for a bare binary such
+// as a development build.
+func bundleOrSelf(p string) grant {
 	// LastIndex picks the innermost bundle, the one that is executing.
 	if i := strings.LastIndex(p, appBundleMarker); i >= 0 {
-		return p[:i+len(".app")]
+		return grant{path: p[:i+len(".app")], prompt: "Shed Server"}
 	}
-	return p
+	return grant{path: p, prompt: filepath.Base(p)}
 }
 
 // hint is the line a stalled watch logs. goos selects the wording: on darwin
 // the likely cause is an unanswered permission prompt, elsewhere an
-// unresponsive filesystem. target is what to grant Full Disk Access to,
-// already resolved; hint itself touches nothing.
-func hint(goos, target string, phase Phase, what, path string, elapsed time.Duration) string {
+// unresponsive filesystem. target is what to grant Full Disk Access to and the
+// prompt's name for it, already resolved; hint itself touches nothing.
+func hint(goos string, target grant, phase Phase, what, path string, elapsed time.Duration) string {
 	waiting := fmt.Sprintf("shed-server: %s is still waiting on %s (%s) after %s",
 		phase, path, what, formatElapsed(elapsed))
 	if goos != "darwin" {
@@ -205,8 +216,8 @@ func hint(goos, target string, phase Phase, what, path string, elapsed time.Dura
 	}
 	return waiting + ". macOS may be waiting for permission to access it " +
 		"(external drives, and folders like Documents, need it). " +
-		`Answer the "Shed Server" prompt on this Mac's screen, or grant Full Disk Access to ` +
-		target +
+		"Answer the " + strconv.Quote(target.prompt) + " prompt on this Mac's screen, or grant Full Disk Access to " +
+		target.path +
 		" in System Settings → Privacy & Security → Full Disk Access. " +
 		"It continues on its own once access is granted."
 }
