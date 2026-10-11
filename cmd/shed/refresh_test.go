@@ -1,9 +1,15 @@
 package main
 
 import (
+	"fmt"
+	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -351,6 +357,188 @@ func TestStreamingPaths401RefreshAndRetry(t *testing.T) {
 		}
 		if hits != 2 {
 			t.Errorf("server hits = %d, want 2 (initial + one retry)", hits)
+		}
+	})
+}
+
+// TestDoRequestWithTimeoutReauth covers the long-timeout path (StartShed
+// bodyless, CreateShed with a body) going through the shared re-auth policy.
+func TestDoRequestWithTimeoutReauth(t *testing.T) {
+	type rec struct {
+		auth, ctype, body string
+	}
+	shedJSON := `{"name":"myshed"}`
+
+	calls := map[string]func(c *APIClient) error{
+		"start": func(c *APIClient) error {
+			_, err := c.StartShed("myshed")
+			return err
+		},
+		"create": func(c *APIClient) error {
+			_, err := c.CreateShed(&config.CreateShedRequest{Name: "myshed"})
+			return err
+		},
+	}
+
+	// newServer answers with the status returned by respond(n) for the n-th
+	// request (1-based) and records every request.
+	newServer := func(t *testing.T, respond func(n int, w http.ResponseWriter)) (*httptest.Server, *[]rec) {
+		t.Helper()
+		var mu sync.Mutex
+		var recs []rec
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			b, _ := io.ReadAll(r.Body)
+			mu.Lock()
+			recs = append(recs, rec{r.Header.Get("Authorization"), r.Header.Get("Content-Type"), string(b)})
+			n := len(recs)
+			mu.Unlock()
+			respond(n, w)
+		}))
+		t.Cleanup(srv.Close)
+		return srv, &recs
+	}
+	ok := func(w http.ResponseWriter) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(shedJSON))
+	}
+
+	countingSource := func(mints *int) *clienttoken.Source {
+		return clienttoken.New(clienttoken.TokenCredential("stale", time.Now().Add(24*time.Hour)),
+			func() (clienttoken.Credential, error) {
+				*mints++
+				return clienttoken.TokenCredential("new", time.Now().Add(24*time.Hour)), nil
+			})
+	}
+
+	for name, call := range calls {
+		t.Run(name+"/401 then 200 retries with identical body and new token", func(t *testing.T) {
+			srv, recs := newServer(t, func(n int, w http.ResponseWriter) {
+				if n == 1 {
+					w.WriteHeader(http.StatusUnauthorized)
+					return
+				}
+				ok(w)
+			})
+			mints := 0
+			c := newAPIClientWithSource(srv.URL, "", countingSource(&mints), DefaultTimeout)
+			if err := call(c); err != nil {
+				t.Fatalf("call: %v", err)
+			}
+			if mints != 1 {
+				t.Errorf("mints = %d, want 1", mints)
+			}
+			if len(*recs) != 2 {
+				t.Fatalf("requests = %d, want 2", len(*recs))
+			}
+			first, second := (*recs)[0], (*recs)[1]
+			if first.auth != "Bearer stale" || second.auth != "Bearer new" {
+				t.Errorf("auth headers = %q then %q", first.auth, second.auth)
+			}
+			if first.body != second.body || first.ctype != second.ctype {
+				t.Errorf("retry differs: %+v vs %+v", first, second)
+			}
+			if name == "create" && (second.body == "" || second.ctype != "application/json") {
+				t.Errorf("create retry lost body/content-type: %+v", second)
+			}
+			if name == "start" && (second.body != "" || second.ctype != "") {
+				t.Errorf("start must stay bodyless: %+v", second)
+			}
+		})
+
+		t.Run(name+"/persistent 401 mints once then errors", func(t *testing.T) {
+			srv, recs := newServer(t, func(_ int, w http.ResponseWriter) { w.WriteHeader(http.StatusUnauthorized) })
+			mints := 0
+			c := newAPIClientWithSource(srv.URL, "", countingSource(&mints), DefaultTimeout)
+			if err := call(c); err == nil {
+				t.Fatal("expected the 401 to surface")
+			}
+			if mints != 1 || len(*recs) != 2 {
+				t.Errorf("mints = %d, requests = %d, want 1 and 2", mints, len(*recs))
+			}
+		})
+
+		for _, status := range []int{http.StatusForbidden, http.StatusInternalServerError} {
+			t.Run(fmt.Sprintf("%s/%d does not retry", name, status), func(t *testing.T) {
+				srv, recs := newServer(t, func(_ int, w http.ResponseWriter) { w.WriteHeader(status) })
+				mints := 0
+				c := newAPIClientWithSource(srv.URL, "", countingSource(&mints), DefaultTimeout)
+				if err := call(c); err == nil {
+					t.Fatal("expected an error")
+				}
+				if mints != 0 || len(*recs) != 1 {
+					t.Errorf("mints = %d, requests = %d, want 0 and 1", mints, len(*recs))
+				}
+			})
+		}
+
+		t.Run(name+"/transport error does not retry", func(t *testing.T) {
+			var hits int32
+			ln, err := net.Listen("tcp", "127.0.0.1:0")
+			if err != nil {
+				t.Fatal(err)
+			}
+			go func() {
+				for {
+					conn, err := ln.Accept()
+					if err != nil {
+						return
+					}
+					atomic.AddInt32(&hits, 1)
+					_ = conn.Close() // closed with no response
+				}
+			}()
+			defer ln.Close()
+			mints := 0
+			c := newAPIClientWithSource("http://"+ln.Addr().String(), "", countingSource(&mints), DefaultTimeout)
+			if err := call(c); err == nil {
+				t.Fatal("expected a transport error")
+			}
+			if mints != 0 || atomic.LoadInt32(&hits) != 1 {
+				t.Errorf("mints = %d, connections = %d, want 0 and 1", mints, atomic.LoadInt32(&hits))
+			}
+		})
+
+		t.Run(name+"/static source does not retry", func(t *testing.T) {
+			srv, recs := newServer(t, func(_ int, w http.ResponseWriter) { w.WriteHeader(http.StatusUnauthorized) })
+			c := newAPIClient(srv.URL, "static", "", DefaultTimeout)
+			if err := call(c); err == nil {
+				t.Fatal("expected an error")
+			}
+			if len(*recs) != 1 {
+				t.Errorf("requests = %d, want 1", len(*recs))
+			}
+		})
+	}
+
+	// The deadline is SHARED by both attempts: the first attempt spends most of
+	// it before its 401, so the retry — which would finish well inside a fresh
+	// per-attempt budget — must run out of time. Asserting the retry actually
+	// reached the server rules out a pass where the deadline expired before it.
+	t.Run("deadline shared across attempts expires during the retry", func(t *testing.T) {
+		retryEntered := make(chan struct{})
+		srv, _ := newServer(t, func(n int, w http.ResponseWriter) {
+			if n == 1 {
+				time.Sleep(400 * time.Millisecond)
+				w.WriteHeader(http.StatusUnauthorized)
+				return
+			}
+			close(retryEntered)
+			time.Sleep(500 * time.Millisecond)
+			ok(w)
+		})
+		mints := 0
+		c := newAPIClientWithSource(srv.URL, "", countingSource(&mints), DefaultTimeout)
+		err := c.doRequestWithTimeout(http.MethodPost, "/x", nil, nil, 700*time.Millisecond)
+		if err == nil || !strings.Contains(err.Error(), "--timeout") {
+			t.Fatalf("err = %v, want the --timeout hint", err)
+		}
+		if mints != 1 {
+			t.Errorf("mints = %d, want 1", mints)
+		}
+		select {
+		case <-retryEntered:
+		default:
+			t.Error("the retry never reached the server; the deadline expired before it was sent")
 		}
 	})
 }

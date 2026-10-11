@@ -21,6 +21,15 @@ All notable changes to this project will be documented in this file.
   archived charliek/shed-desktop repo.
 -->
 
+## Unreleased
+
+### Fixed
+
+- **CLI: the first command after a token-mode server restart no longer fails.** `shed start`,
+  `shed create`, `shed image pull`, `shed image push`, `shed snapshot create` and the prune
+  commands now re-mint and retry once on an expired or invalid credential, as the other
+  commands already did, instead of surfacing the 401. (#412)
+
 ## v0.9.0 — 2026-10-10
 
 **Ships:** server, host-agent, desktop

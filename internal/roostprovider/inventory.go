@@ -254,7 +254,7 @@ func fetchSheds(ctx context.Context, entry config.ServerEntry, timeout time.Dura
 	if err != nil {
 		return nil, err
 	}
-	// Pin the credential onto the request the same way APIClient.setAuth
+	// Pin the credential onto the request the same way cmd/shed pinCredential
 	// does: the Authorization header for token mode, the context value
 	// CertificateFor reads for mtls mode. Both channels read the SAME
 	// captured cred, so a request never presents a header and a certificate
