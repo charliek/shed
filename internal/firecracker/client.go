@@ -502,21 +502,28 @@ func closeP9ServerSet(servers []*P9Server) {
 	wg.Wait()
 }
 
-// mount9PInGuest executes the mount-9p subcommand inside the guest VM via the
-// agent exec channel. The mount command runs with sudo since syscall.Mount
-// requires root privileges.
-func (c *Client) mount9PInGuest(ctx context.Context, agent *vmutil.AgentClient, serverAddr, target string, readOnly bool, tag string) error {
-	cmd := []string{"sudo", "/usr/local/bin/shed-agent", "mount-9p",
-		"--addr", serverAddr,
+// mount9PArgv builds the guest argv that mounts the 9P server at addr on
+// target. It runs as root (syscall.Mount requires it) behind
+// vmutil.WithMountParents, so the directories the mount needs under the shed
+// user's home are created as (or repaired to) that user rather than left to
+// mount-9p's root MkdirAll (#410).
+func mount9PArgv(addr, target, tag string, readOnly bool) []string {
+	cmd := []string{"/usr/local/bin/shed-agent", "mount-9p",
+		"--addr", addr,
 		"--target", target,
 		"--tag", tag,
 	}
 	if readOnly {
 		cmd = append(cmd, "--readonly")
 	}
+	return vmutil.WithMountParents(target, cmd)
+}
 
+// mount9PInGuest executes the mount-9p subcommand inside the guest VM via the
+// agent exec channel (see mount9PArgv).
+func (c *Client) mount9PInGuest(ctx context.Context, agent *vmutil.AgentClient, serverAddr, target string, readOnly bool, tag string) error {
 	opts := backend.ExecOptions{
-		Cmd:    cmd,
+		Cmd:    mount9PArgv(serverAddr, target, tag, readOnly),
 		Stdout: vmutil.NopWriteCloser(os.Stderr), // mount output goes to server stderr for debugging
 		Stderr: vmutil.NopWriteCloser(os.Stderr),
 		TTY:    false,

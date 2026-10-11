@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"testing"
@@ -788,4 +789,34 @@ func TestResumeRunningInstances(t *testing.T) {
 			t.Fatalf("resumed = %v on a cancelled walk, want nothing", got)
 		}
 	})
+}
+
+// TestVzMountArgv pins the VirtioFS mount argv: the vmutil.WithMountParents
+// prelude prefix (sudo sh -c <prelude> sh <cleaned target> /home/shed shed),
+// then today's mount argv unchanged — the same script, with "$1" = target,
+// "$2" = opts, "$3" = tag (#410).
+func TestVzMountArgv(t *testing.T) {
+	const mountCmd = `modprobe virtiofs 2>/dev/null; mkdir -p "$1" && mount -t virtiofs -o "$2" "$3" "$1"`
+	prelude := vmutil.WithMountParents("/", nil)[3]
+
+	cases := []struct {
+		name, tag, target, opts, cleaned string
+	}{
+		{"credential rw", "cred-opencode_data", "/home/shed/.local/share/opencode", "rw", "/home/shed/.local/share/opencode"},
+		{"credential ro", "cred-gh", "/home/shed/.config/gh", "ro", "/home/shed/.config/gh"},
+		{"project mount", "proj-0", "/home/shed/myproj", "rw", "/home/shed/myproj"},
+		{"unclean target", "cred-gh", "/home/shed/.config//gh/", "ro", "/home/shed/.config/gh"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := vzMountArgv(tc.tag, tc.target, tc.opts)
+			want := []string{
+				"sudo", "sh", "-c", prelude, "sh", tc.cleaned, config.HomePath, config.ShedUser,
+				"sh", "-c", mountCmd, "sh", tc.target, tc.opts, tc.tag,
+			}
+			if !slices.Equal(got, want) {
+				t.Fatalf("vzMountArgv(%q, %q, %q):\n got %q\nwant %q", tc.tag, tc.target, tc.opts, got, want)
+			}
+		})
+	}
 }

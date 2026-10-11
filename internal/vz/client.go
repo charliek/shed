@@ -706,6 +706,17 @@ func metadataToShed(meta *Metadata, ipAddress string) *config.Shed {
 	}
 }
 
+// vzMountArgv builds the guest argv that mounts VirtioFS share tag at target
+// with mount options opts ("rw"/"ro"). The mount runs behind
+// vmutil.WithMountParents, so the directories it needs under the shed user's
+// home are created as (or repaired to) that user rather than left to the
+// mount's root `mkdir -p` (#410).
+func vzMountArgv(tag, target, opts string) []string {
+	// Use positional parameters to avoid shell interpolation of target/tag values.
+	mountCmd := `modprobe virtiofs 2>/dev/null; mkdir -p "$1" && mount -t virtiofs -o "$2" "$3" "$1"`
+	return vmutil.WithMountParents(target, []string{"sh", "-c", mountCmd, "sh", target, opts, tag})
+}
+
 // mountVirtioFSShare mounts a VirtioFS share inside the guest VM.
 // Apple's VirtioFS transparently maps UIDs, so no chown is needed.
 func (c *Client) mountVirtioFSShare(ctx context.Context, agent *vmutil.AgentClient, mountTag, target string, readOnly bool) error {
@@ -713,10 +724,8 @@ func (c *Client) mountVirtioFSShare(ctx context.Context, agent *vmutil.AgentClie
 	if readOnly {
 		mountOpts = "ro"
 	}
-	// Use positional parameters to avoid shell interpolation of target/tag values.
-	mountCmd := `modprobe virtiofs 2>/dev/null; mkdir -p "$1" && mount -t virtiofs -o "$2" "$3" "$1"`
 	opts := backend.ExecOptions{
-		Cmd:    []string{"sudo", "sh", "-c", mountCmd, "sh", target, mountOpts, mountTag},
+		Cmd:    vzMountArgv(mountTag, target, mountOpts),
 		Stdout: vmutil.NopWriteCloser(io.Discard),
 		Stderr: vmutil.NopWriteCloser(os.Stderr),
 		TTY:    false,

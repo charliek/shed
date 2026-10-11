@@ -38,6 +38,12 @@ All notable changes to this project will be documented in this file.
   client disconnect during `shed stop` no longer turns the graceful stop into a force-kill.
   `shed delete` now refuses, and keeps the shed's resources, if its VM survives SIGKILL; retry
   the delete once the VM is gone. (#284)
+- **Server (VZ and Firecracker): directories a mount needs under the shed user's home are now
+  created as `shed`, not root.** A server mount nested below the home directory (e.g.
+  `~/.local/share/opencode`, `~/.config/gh`) used to leave `~/.local`, `~/.local/share` or
+  `~/.config` owned by root, so `roost-session` could not start — breaking `shed attach` and
+  Connect Host — and anything writing under `~/.local` or `~/.config` failed on `base` and
+  `extensions` sheds. Existing sheds are repaired on their next `shed start`. (#410)
 
 ## v0.9.0 — 2026-10-10
 

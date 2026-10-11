@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"testing"
@@ -1563,5 +1564,36 @@ func TestClientCloseClosesEveryShedsP9Servers(t *testing.T) {
 		if p9ServerListening(srv) {
 			t.Errorf("9P server %s still listening after Client.Close", srv.Addr())
 		}
+	}
+}
+
+// TestMount9PArgv pins the 9P mount argv: the vmutil.WithMountParents prelude
+// prefix (sudo sh -c <prelude> sh <cleaned target> /home/shed shed), then the
+// shed-agent mount-9p argv unchanged and without its own sudo (#410).
+func TestMount9PArgv(t *testing.T) {
+	prelude := vmutil.WithMountParents("/", nil)[3]
+
+	cases := []struct {
+		name, addr, target, tag, cleaned string
+		readOnly                         bool
+	}{
+		{"writable", "172.30.0.1:41234", "/home/shed/.local/share/opencode", "cred-opencode_data", "/home/shed/.local/share/opencode", false},
+		{"readonly", "172.30.0.1:41235", "/home/shed/.config/gh", "cred-gh", "/home/shed/.config/gh", true},
+		{"unclean target", "172.30.0.1:41236", "/home/shed/.config//gh/", "cred-gh", "/home/shed/.config/gh", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := mount9PArgv(tc.addr, tc.target, tc.tag, tc.readOnly)
+			want := []string{
+				"sudo", "sh", "-c", prelude, "sh", tc.cleaned, config.HomePath, config.ShedUser,
+				"/usr/local/bin/shed-agent", "mount-9p", "--addr", tc.addr, "--target", tc.target, "--tag", tc.tag,
+			}
+			if tc.readOnly {
+				want = append(want, "--readonly")
+			}
+			if !slices.Equal(got, want) {
+				t.Fatalf("mount9PArgv(%q, %q, %q, %v):\n got %q\nwant %q", tc.addr, tc.target, tc.tag, tc.readOnly, got, want)
+			}
+		})
 	}
 }

@@ -799,6 +799,9 @@ func ValidGitHubUsername(s string) bool { return githubUsernamePattern.MatchStri
 // default (or in a project subdirectory when one is present).
 const HomePath = "/home/shed"
 
+// ShedUser is the guest's login user and primary group (UID 1000), owner of HomePath.
+const ShedUser = "shed"
+
 // CredentialMountTag returns the VirtioFS/9P mount tag for a credential share.
 // Tags use the format "cred-{name}" to avoid collisions with project mounts.
 func CredentialMountTag(name string) string {
