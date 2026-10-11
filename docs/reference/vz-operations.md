@@ -172,6 +172,61 @@ ps aux | grep vfkit
 cat ~/Library/Application\ Support/shed/vz/instances/myproject/metadata.json
 ```
 
+## Image store on an external drive
+
+macOS asks for permission before `shed-server` can read a state directory on an external drive (`/Volumes/...`). The same applies to protected folders such as `~/Documents`, `~/Desktop` and `~/Downloads`. The prompt asks to allow access to the volume or folder, and names the process macOS holds responsible: the server under the brew service, or your terminal app when you run `shed-server` from a terminal.
+
+### What the log shows
+
+Before it starts the backend, the server reads each state directory once and names them:
+
+```text
+Checking state directories: /Volumes/ext/shed/vz, /Volumes/ext/shed/vz/instances, /Volumes/ext/shed/vz/snapshots, /Volumes/ext/shed/vz/uppers, /Users/me/.shed/vz/sockets
+```
+
+If nobody answers the prompt, for example on a headless Mac or a service started at login, startup waits at that directory. After 10 seconds, and then every minute, it logs:
+
+```text
+shed-server: startup is still waiting on /Volumes/ext/shed/vz (checking state directory) after 10s. macOS may be waiting for permission to access it (external drives, and folders like Documents, need it). Answer the "Shed Server" prompt on this Mac's screen, or grant Full Disk Access to <path> in System Settings → Privacy & Security → Full Disk Access. It continues on its own once access is granted.
+```
+
+`<path>` is what to grant access to, with symlinks resolved. Answer the prompt or grant Full Disk Access, and startup continues without a restart. The same line with `resuming running sheds` in place of `startup` can appear later, from the background walk that reconnects running sheds.
+
+If the prompt was answered with **Don't Allow**, the read fails instead and the server logs a warning:
+
+```text
+Warning: cannot read /Volumes/ext/shed/vz: open /Volumes/ext/shed/vz: operation not permitted. macOS denied access; grant Full Disk Access to <path> in System Settings → Privacy & Security → Full Disk Access, then restart shed-server.
+```
+
+The check itself is not fatal, but a later step that needs the directory can still fail. With egress enabled, for example, opening the audit log next to `instance_dir` stops startup.
+
+Read the log with:
+
+```bash
+tail -f "$(brew --prefix)/var/log/shed-server.log"
+```
+
+### Grant Full Disk Access
+
+1. Open **System Settings → Privacy & Security → Full Disk Access**.
+2. Click **+**, press **Cmd-Shift-G**, paste the `<path>` from the log line, press **Return**, and click **Open**.
+3. Make sure its switch is on.
+
+After a **Don't Allow**, restart the server once access is granted. Running sheds keep running across the restart.
+
+```bash
+brew services restart shed
+```
+
+### Across upgrades
+
+Whether a grant survives `brew upgrade shed` depends on what macOS records it against:
+
+| Server installed as | Grant recorded against | After an upgrade |
+|---|---|---|
+| A bare executable | Its absolute path, which includes the Homebrew version directory | macOS asks again |
+| An app bundle signed with the same identity in every release | The bundle identifier and its signing requirement | The grant carries over |
+
 ## Time synchronization
 
 VZ guests keep their clock correct two ways:

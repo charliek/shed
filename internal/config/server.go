@@ -1460,6 +1460,16 @@ func LoadServerConfig() (*ServerConfig, error) {
 	return LoadServerConfigFromPath("")
 }
 
+// ServerConfigSearchPaths returns the standard locations LoadServerConfig
+// checks, in order, with ~ expanded. It does not touch the filesystem.
+func ServerConfigSearchPaths() []string {
+	return []string{
+		"./server.yaml",
+		ExpandPath("~/.config/shed/server.yaml"),
+		"/etc/shed/server.yaml",
+	}
+}
+
 // normalizeMounts applies the credentials→mounts backwards-compat fallback so
 // both the server and CLI config loaders behave identically. The deprecated
 // "credentials" key is used only when "mounts" is entirely ABSENT (nil map); an
@@ -1597,14 +1607,7 @@ func LoadServerConfigFromPath(path string) (*ServerConfig, error) {
 	if path != "" {
 		configPath = ExpandPath(path)
 	} else {
-		// Search standard locations
-		locations := []string{
-			"./server.yaml",
-			ExpandPath("~/.config/shed/server.yaml"),
-			"/etc/shed/server.yaml",
-		}
-
-		for _, loc := range locations {
+		for _, loc := range ServerConfigSearchPaths() {
 			if _, err := os.Stat(loc); err == nil {
 				configPath = loc
 				break

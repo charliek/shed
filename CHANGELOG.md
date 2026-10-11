@@ -75,6 +75,13 @@ All notable changes to this project will be documented in this file.
   error naming `--force` and sends no mutating request, instead of printing `Cancelled.` and
   exiting 0. A piped `y` still works. `shed tunnels start` without `--replace` now refuses
   `/dev/null` as stdin too. (#109)
+- **Server: a startup stalled on the filesystem now names the path.** `shed-server` reads
+  each state directory before starting the backend (`Checking state directories: …`), and a
+  startup step that waits on the filesystem logs a line naming the path after 10 s, then every
+  minute. On macOS the line points at the permission prompt for an external drive and at Full
+  Disk Access, and a directory macOS has denied gets its own warning. A store that hangs on a
+  read now holds startup at that line, instead of the server reaching `ready` while the resume
+  of running sheds hangs silently. (#304)
 
 ## v0.9.0 — 2026-10-10
 
