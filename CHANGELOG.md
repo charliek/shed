@@ -21,6 +21,55 @@ All notable changes to this project will be documented in this file.
   archived charliek/shed-desktop repo.
 -->
 
+## Unreleased
+
+> **macOS (VZ): upgrading from 0.9.0 stops every running VZ shed once.** The 0.9.0
+> `shed-server` started vfkit in the launchd job's process group, so the
+> `brew services restart shed` that applies 0.9.1 still takes running sheds down. Stop them
+> first (`shed stop`), or `shed start` them afterwards. From 0.9.1 on, restarts leave VMs
+> running.
+>
+> Read the [v0.9.0 to v0.9.1 upgrade guide](https://charliek.github.io/shed/upgrades/v0.9.0-to-v0.9.1/)
+> before upgrading.
+
+### Fixed
+
+- **macOS (VZ): VZ sheds no longer stop on `brew services restart shed`.** vfkit now runs in
+  its own process group, so launchd no longer kills it with the server. The restart that
+  applies 0.9.1 still stops running sheds once. The brew service now waits up to 35 s for a
+  graceful server exit (`stop_timeout`), which requires Homebrew 6.0.13 or later. (#409)
+- **Images: the base stage of both images now pre-creates `~/.local` (`bin`, `share`,
+  `state`), `~/.config` and `~/.cache` owned by `shed`.** Defense in depth for #410, so a mount
+  or tool under those paths never leaves a root-owned parent. Applies to newly built images,
+  from the next image release.
+- **CLI: the first command after a token-mode server restart no longer fails.** `shed start`,
+  `shed create`, `shed image pull`, `shed image push`, `shed snapshot create` and the prune
+  commands now re-mint and retry once on an expired or invalid credential, as the other
+  commands already did, instead of surfacing the 401. (#412)
+- **Server (Firecracker): stopping or deleting a running shed with writable host mounts is no
+  longer held up by its 9P mounts.** A stop took 25–30 s (and raced the CLI's 30 s timeout); it
+  now takes about `stop_timeout` (10 s). A delete took about 25 s; it now takes well under a
+  second. Each 9P mount server now closes only after the VM
+  is gone, force-closes its connections instead of waiting 5 s for the guest to hang up, and
+  closes in parallel with the shed's other mounts. The shutdown hook and the pre-stop sync run
+  before any mount closes, a failed start or a VM that exited unexpectedly no longer leaks 9P
+  listeners, and a `shed-server` restart no longer waits 5 s per mount. On both backends, a
+  client disconnect during `shed stop` no longer turns the graceful stop into a force-kill.
+  `shed delete` now refuses, and keeps the shed's resources, if its VM survives SIGKILL; retry
+  the delete once the VM is gone. A graceful Firecracker stop still ends in a force-kill at
+  `stop_timeout`: the guest kernel cannot receive the Ctrl-Alt-Del it is sent, which is tracked
+  separately. (#284)
+- **Server (VZ and Firecracker): directories a mount needs under the shed user's home are now
+  created as `shed`, not root.** A server mount nested below the home directory (e.g.
+  `~/.local/share/opencode`, `~/.config/gh`) used to leave `~/.local`, `~/.local/share` or
+  `~/.config` owned by root, so `roost-session` could not start — breaking `shed attach` and
+  Connect Host — and anything writing under `~/.local` or `~/.config` failed on `base` and
+  `extensions` sheds. Existing sheds are repaired on their next `shed start`. (#410)
+- **Docs: remove `shed-host-agent` before applying the desktop update, or relaunch the app
+  afterwards.** The 0.8.2 to 0.9.0 upgrade guide and the desktop docs now say so, because in
+  `Automatic` broker mode the app chooses its broker once at launch and does not fall back
+  if the daemon disappears at runtime. A runtime fallback is still open. (#411)
+
 ## v0.9.0 — 2026-10-10
 
 **Ships:** server, host-agent, desktop

@@ -180,6 +180,12 @@ immediately but only takes effect on the next launch; until then, `broker.status
 evidence (`desktop_socket_live`, `status_socket_live`) so the UI can explain an `auto`
 choice.
 
+One consequence: if the daemon the app chose at launch (`external`) goes away while the app
+runs, the app keeps trying to reach it and there is no credential broker until relaunch, so
+the sheds it brokers lose ssh-agent and credential forwarding. After removing the daemon,
+relaunch the app (or pin `In-app (embedded)`). A runtime fallback is tracked in
+[#411](https://github.com/charliek/shed/issues/411).
+
 **`extensions.yaml` handling.** The embedded broker reads the same
 `~/.config/shed/extensions.yaml` the daemon does (see [Extensions →
 Configuration](../extensions/configuration.md)), with two deliberate divergences from the

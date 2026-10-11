@@ -761,3 +761,77 @@ def test_craze_baked(shed_server, test_shed_name):
         raise AssertionError(
             f"`craze providers --json` did not print JSON: got {r.stdout!r}"
         )
+
+
+# ---------------------------------------------------------------------------
+# 12. shed-owned home dirs pre-created in the base stage (plan 027 D4, #410)
+# ---------------------------------------------------------------------------
+
+
+def _home_dirs_baked_backends() -> set[str]:
+    """`SHED_IMAGE_HAS_HOME_DIRS` is a comma list of the backends whose
+    `base` image was rebuilt with `~/.local` / `~/.config` / `~/.cache`
+    pre-created (`vz`, `fc`) -- same split as `SHED_IMAGE_HAS_ROOST`."""
+    raw = os.environ.get("SHED_IMAGE_HAS_HOME_DIRS", "")
+    return {b.strip() for b in raw.split(",") if b.strip()}
+
+
+@pytest.mark.skipif(
+    not _home_dirs_baked_backends(),
+    reason=(
+        "SHED_IMAGE_HAS_HOME_DIRS unset: the published images carry the "
+        "shed-owned home dirs only from the 0.9.1 tag"
+    ),
+)
+def test_home_dirs_owned_by_shed(shed_server, test_shed_name):
+    """The base stage pre-creates `~/.local/{bin,share,state}`, `~/.config`
+    and `~/.cache` owned by `shed:shed` (#410 defense in depth). A fresh
+    `base` shed must show `~/.local/bin` and `~/.cache` as `shed:shed`;
+    no mount prelude ever creates either directory, so this proves the
+    image itself carries them.
+
+    Gated behind `SHED_IMAGE_HAS_HOME_DIRS=<backends>`; a listed backend
+    whose dev store lacks the image FAILS rather than skips.
+    """
+    backend_key = "fc" if shed_server.backend == "firecracker" else "vz"
+    if backend_key not in _home_dirs_baked_backends():
+        pytest.skip(
+            f"SHED_IMAGE_HAS_HOME_DIRS does not list {backend_key}: this "
+            "backend still boots the published image"
+        )
+
+    image_present = True
+    try:
+        shed_server.create(test_shed_name, image="base")
+    except AssertionError as e:
+        msg = str(e)
+        if "base" in msg and (
+            "no image tag" in msg or "not found" in msg or "unknown image" in msg
+        ):
+            image_present = False
+        else:
+            raise
+
+    verdict = _baked_image_verdict(
+        backend_key, _home_dirs_baked_backends(), image_present
+    )
+    if verdict == "fail":
+        pytest.fail(
+            f"SHED_IMAGE_HAS_HOME_DIRS lists {backend_key!r} but its dev "
+            "store has no `base` image; build it per "
+            "docs/development/testing.md (SHED_SOURCE_REF = the dev "
+            "config's alias) before running test-integration-dev"
+            f"{'-fc' if backend_key == 'fc' else ''}, or unset "
+            "SHED_IMAGE_HAS_HOME_DIRS to skip this check."
+        )
+    assert verdict == "run", f"unexpected _baked_image_verdict result: {verdict!r}"
+
+    for path in ("/home/shed/.local/bin", "/home/shed/.cache"):
+        r = shed_server.exec(test_shed_name, ["stat", "-c", "%U:%G", path])
+        assert r.returncode == 0 and r.stdout.strip() == "shed:shed", (
+            f"{path} is not a shed:shed directory in the booted shed: "
+            f"exit={r.returncode} stdout={r.stdout!r} stderr={r.stderr!r}. "
+            f"Either the dev server's `base` image predates the D4 change "
+            f"(rebuild it into the dev store) or the `install -d` in the "
+            f"base stage of vz/Dockerfile / firecracker/Dockerfile regressed."
+        )

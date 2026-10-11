@@ -92,14 +92,15 @@ test-host-agent-diff:
 # shed-mobile. Needs uv and an sshd (skips cleanly without one).
 # See tests/machine-transport/README.md.
 # Server-free unit tests of the integration suite's own helpers and baked-image
-# test bodies (tests/integration/test_smoke_units.py). Runs in CI (integration-units).
+# test bodies (tests/integration/test_smoke_units.py, test_fixture_units.py).
+# Runs in CI (integration-units).
 test-integration-units:
 	@command -v uv >/dev/null 2>&1 || { \
 	  echo "uv is required for the integration unit tests."; \
 	  echo "Install: brew install uv  (or https://docs.astral.sh/uv/getting-started/installation/)"; \
 	  exit 1; \
 	}
-	cd tests/integration && uv sync && uv run pytest test_smoke_units.py -v
+	cd tests/integration && uv sync && uv run pytest test_smoke_units.py test_fixture_units.py -v
 
 test-machine-transport:
 	@command -v uv >/dev/null 2>&1 || { \
@@ -420,6 +421,7 @@ test-integration-dev: build
 	  SHED_DEV_AUTH_MODE=$(SHED_DEV_AUTH_MODE) \
 	  SHED_IMAGE_HAS_ROOST=vz \
 	  SHED_IMAGE_HAS_CRAZE=vz \
+	  SHED_IMAGE_HAS_HOME_DIRS=vz \
 	  $(MAKE) test-integration
 
 # Parallel dev shed-server lifecycle (FC remote).
@@ -543,6 +545,7 @@ dev-server-up-fc: build-fc-remote-server
 	  *) echo "ERROR: SHED_DEV_AUTH_MODE must be 'token' or 'mtls' (got '$(SHED_DEV_AUTH_MODE)')"; exit 1 ;; \
 	esac; \
 	echo "Uploading $$LOCAL_CFG (SHED_DEV_AUTH_MODE=$(SHED_DEV_AUTH_MODE))..."; \
+	MOUNT_SRCS=$$(grep -E '^[[:space:]]+source:[[:space:]]+/var/lib/shed-dev/mounts/' "$$LOCAL_CFG" | awk '{print $$2}' | tr '\n' ' '); \
 	UPLOAD_BIN=/tmp/shed-server-dev.upload.$$$$; \
 	 UPLOAD_CFG=/tmp/shed-server-dev.upload.$$$$.yaml; \
 	 UPLOAD_PROXY=/tmp/shed-egress-proxy-dev.upload.$$$$; \
@@ -554,6 +557,7 @@ dev-server-up-fc: build-fc-remote-server
 	   sudo install -m 755 $$UPLOAD_PROXY $(FC_DEV_PROXY_PATH); \
 	   sudo install -m 644 $$UPLOAD_CFG $(FC_DEV_CONFIG); \
 	   rm -f $$UPLOAD_BIN $$UPLOAD_PROXY $$UPLOAD_CFG; \
+	   if [ -n \"$$MOUNT_SRCS\" ]; then sudo install -d -m 0755 $$MOUNT_SRCS; fi; \
 	   sudo install -m 644 /dev/null $(FC_DEV_LOG_PATH); \
 	   sudo bash -c 'SHED_BUILD_TOOLS_REF=\"$(RELEASE_BUILD_TOOLS_REF)\" \
 	     nohup $(FC_DEV_BIN_PATH) serve --config $(FC_DEV_CONFIG) \
@@ -689,6 +693,7 @@ test-integration-dev-fc:
 	  SHED_DEV_AUTH_MODE=$(SHED_DEV_AUTH_MODE) \
 	  SHED_IMAGE_HAS_ROOST=fc \
 	  SHED_IMAGE_HAS_CRAZE=fc \
+	  SHED_IMAGE_HAS_HOME_DIRS=fc \
 	  $(MAKE) test-integration
 
 # Cross-compile for release

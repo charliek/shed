@@ -344,9 +344,7 @@ func (b *fcCreator) StartVM(ctx context.Context, metaRaw orchestrator.MetadataHa
 	if err := vm.Start(ctx); err != nil {
 		return nil, fmt.Errorf("failed to start VM: %w", err)
 	}
-	cleanup.Register("stop VM", func() error {
-		return vm.Stop(context.Background())
-	})
+	b.c.registerStopVMCleanups(cleanup, vm)
 	return fcVMHandle{vm: vm}, nil
 }
 
@@ -384,9 +382,10 @@ func (b *fcCreator) FinalizeStartedVM(ctx context.Context, metaRaw orchestrator.
 // 9P when set; no-op otherwise. Each 9P server runs in-process on the host; we
 // start them after VM boot, then ask the guest to mount each.
 //
-// The 9P servers are per-shed and live until shed deletion, so we don't
-// register per-server cleanups here; the wider shed cleanup (StopShed /
-// DeleteShed) calls stopP9Servers. On any mount failure we stop all of this
+// The 9P servers are per-shed and live as long as the VMM may, so we don't
+// register per-server cleanups here: StopShed / DeleteShed close them once the
+// VMM is gone, and on a failed create StartVM's "stop 9P servers" rollback
+// does (registerStopVMCleanups). On any mount failure we stop all of this
 // shed's servers (no leaked listeners) and fail the create.
 func (b *fcCreator) MountLocalDir(ctx context.Context, req config.CreateShedRequest, metaRaw orchestrator.MetadataHandle, _ orchestrator.VMHandle) error {
 	meta := metaRaw.(*fcMetaHandle).meta
@@ -533,6 +532,15 @@ func (b *fcStarter) LoadMetadata(_ context.Context, req orchestrator.StartReques
 // CheckNotRunning enforces the BackendStarter two-sentinel contract.
 // Falls through clearing meta.Status / meta.PID when the recorded
 // state turns out to be stale (status=Running but no live firecracker).
+//
+// Once the shed is established not running it also sweeps any 9P servers
+// still registered under its name (sweepStaleP9Servers). They are normally
+// stale: left by an unexpected VMM exit that GetShed reconciled to Stopped
+// (GetShed is not under the lifecycle lock and never closes servers), or by an
+// earlier failed start whose rollback could not prove the VMM gone. StartShed
+// holds the per-shed lifecycle lock (acquireCreateLock) around this whole
+// call, so no concurrent start can be registering servers for this name while
+// they are swept.
 func (b *fcStarter) CheckNotRunning(_ context.Context, metaRaw orchestrator.MetadataHandle) error {
 	meta := metaRaw.(*fcMetaHandle).meta
 
@@ -566,7 +574,38 @@ func (b *fcStarter) CheckNotRunning(_ context.Context, metaRaw orchestrator.Meta
 	}
 	meta.PID = 0
 
+	// Not running (either branch above), so whatever is still registered is
+	// stale — unless the metadata itself is stale; see sweepStaleP9Servers.
+	b.c.sweepStaleP9Servers(meta.Name)
+
 	return nil
+}
+
+// sweepStaleP9Servers closes the 9P servers still registered for a shed that
+// CheckNotRunning found not running — unless this process still holds a VM
+// handle for it whose VMM is alive (or whose identity is UNKNOWN).
+//
+// That guard exists because the metadata CheckNotRunning trusted can be stale
+// in a way the lifecycle lock does not prevent: GetShed is unlocked, so it can
+// observe the previous VMM (pid A) dead, lose the CPU while a start brings up
+// pid B and saves Running/B, then save its obsolete Stopped/PID=0 over B's
+// record. The next start then reads "stopped" while B is alive, and an
+// unguarded sweep would force-close B's live mounts. (The lost metadata update
+// itself predates #284; this only keeps the sweep from compounding it.) The
+// in-process c.vms handle is not written by GetShed, so its pid is the one to
+// trust here.
+func (c *Client) sweepStaleP9Servers(name string) {
+	c.mu.Lock()
+	vm := c.vms[name]
+	c.mu.Unlock()
+	if vm != nil && vm.meta != nil && vm.meta.PID > 0 {
+		pid := vm.meta.PID
+		if !c.vmmTeardown(name, pid, nil).gone {
+			log.Printf("Warning: %s: metadata says stopped, but this server's VM handle has VMM pid %d still running (or unverifiable); keeping its 9P servers", name, pid)
+			return
+		}
+	}
+	c.stopP9Servers(name)
 }
 
 // StartVM constructs and starts the per-shed firecracker VM. Mirrors
@@ -583,10 +622,45 @@ func (b *fcStarter) StartVM(ctx context.Context, metaRaw orchestrator.MetadataHa
 	if err := vm.Start(ctx); err != nil {
 		return nil, fmt.Errorf("failed to start VM: %w", err)
 	}
-	cleanup.Register("stop VM", func() error {
-		return vm.Stop(context.Background())
-	})
+	b.c.registerStopVMCleanups(cleanup, vm)
 	return fcVMHandle{vm: vm}, nil
+}
+
+// errStopVMNotRun is the rollback's "stop VM" result until that cleanup has
+// run. It only matters for a VM with no recorded pid, where the stop's own
+// result is the sole evidence the VMM is gone: a stop that never ran (or
+// panicked) proves nothing.
+var errStopVMNotRun = errors.New("stop-VM cleanup did not run")
+
+// registerStopVMCleanups registers a freshly started VM's rollback: "stop 9P
+// servers" FIRST, then "stop VM", so the LIFO unwind stops the VM and only
+// then decides about the servers. Any failure after StartVM — a failed
+// project mount, egress setup, a metadata save — unwinds through here, and the
+// shed's 9P servers (project and credential) used to stay registered with
+// their listeners open.
+//
+// The servers close only if the VMM is verifiably gone after the stop, on the
+// same evidence stopShedLocked uses (vmmTeardown). If it may still be alive
+// they stay registered, and the next stop, delete or start sweeps them.
+func (c *Client) registerStopVMCleanups(cleanup *backend.Cleanup, vm *VM) {
+	name := vm.meta.Name
+	stopErr := errStopVMNotRun
+	cleanup.Register("stop 9P servers", func() error {
+		// vm.meta.PID is read now, not at registration: vm.Start set it, and
+		// nothing on the unwind clears it before this runs (the start path's
+		// "restore stopped metadata" is registered earlier, so it runs later).
+		pid := vm.meta.PID
+		if !c.vmmTeardown(name, pid, stopErr).gone {
+			log.Printf("Warning: %s: VMM (pid %d) may still be running after the stop-VM cleanup; keeping its 9P servers", name, pid)
+			return nil
+		}
+		c.stopP9Servers(name)
+		return nil
+	})
+	cleanup.Register("stop VM", func() error {
+		stopErr = vm.Stop(context.Background())
+		return stopErr
+	})
 }
 
 // PersistRunningState flips the metadata to Running, persists the PID

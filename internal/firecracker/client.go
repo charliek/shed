@@ -296,19 +296,28 @@ func (c *Client) acquireCreateLock(name string) func() {
 	return c.shedLocks.Acquire(name)
 }
 
-// Close closes the client and releases resources.
+// Close closes the client and releases resources. It runs only at daemon exit.
+//
+// Every shed's 9P servers are closed here even though their VMs keep running
+// (KillMode=process): that is the documented #369 exception to "close a shed's
+// 9P servers only once its VMM is gone". The guest's 9P transport ends with
+// the daemon process regardless, so force-closing the connections first
+// changes nothing for the guest; it only keeps the daemon's own shutdown from
+// waiting out a drain per mount per running shed.
+//
+// The servers are copied into a fresh snapshot under c.mu and closed (in
+// parallel) after releasing it. A server registered after the snapshot — a
+// create racing daemon exit — dies with the process.
 func (c *Client) Close() error {
-	// Stop all P9 servers for all VMs
 	c.mu.Lock()
-	for name := range c.p9Servers {
-		for _, srv := range c.p9Servers[name] {
-			if err := srv.Close(); err != nil {
-				log.Printf("Warning: failed to close P9 server for %s: %v", name, err)
-			}
-		}
+	var servers []*P9Server
+	for _, set := range c.p9Servers {
+		servers = append(servers, set...)
 	}
 	c.p9Servers = make(map[string][]*P9Server)
 	c.mu.Unlock()
+
+	closeP9ServerSet(servers)
 
 	c.credMgr.Close()
 	return nil
@@ -461,34 +470,60 @@ func (c *Client) startP9Server(name, bridgeIP, hostPath, mountPath string, readO
 // stopP9Servers stops all P9 servers for a VM and removes them from the map.
 // This is nil-safe: after server restart, loadExistingInstances does not
 // restore P9 servers, so this may find an empty/nil slice.
+//
+// Callers close a shed's servers only once its VMM is verifiably gone (see
+// vmmTeardown), when a failed mount is unwinding, or on DeleteShed's pid-0
+// fallback (nothing to verify): Close force-closes the guest's connections,
+// so closing them under a live guest kills its mounts.
 func (c *Client) stopP9Servers(name string) {
 	c.mu.Lock()
 	servers := c.p9Servers[name]
 	delete(c.p9Servers, name)
 	c.mu.Unlock()
 
-	for _, srv := range servers {
-		if err := srv.Close(); err != nil {
-			log.Printf("Warning: failed to close P9 server for %s: %v", name, err)
-		}
-	}
+	closeP9ServerSet(servers)
 }
 
-// mount9PInGuest executes the mount-9p subcommand inside the guest VM via the
-// agent exec channel. The mount command runs with sudo since syscall.Mount
-// requires root privileges.
-func (c *Client) mount9PInGuest(ctx context.Context, agent *vmutil.AgentClient, serverAddr, target string, readOnly bool, tag string) error {
-	cmd := []string{"sudo", "/usr/local/bin/shed-agent", "mount-9p",
-		"--addr", serverAddr,
+// closeP9ServerSet closes servers concurrently and waits for all of them, so a
+// shed with N mounts closes in the time of its slowest server rather than the
+// sum (each Close is bounded by its drain backstop). Errors are logged per
+// server and never returned: a close failure leaves nothing to retry.
+func closeP9ServerSet(servers []*P9Server) {
+	var wg sync.WaitGroup
+	for _, srv := range servers {
+		wg.Add(1)
+		go func(srv *P9Server) {
+			defer wg.Done()
+			if err := srv.Close(); err != nil {
+				log.Printf("Warning: failed to close P9 server for %s: %v", srv.hostPath, err)
+			}
+		}(srv)
+	}
+	wg.Wait()
+}
+
+// mount9PArgv builds the guest argv that mounts the 9P server at addr on
+// target. It runs as root (syscall.Mount requires it) behind
+// vmutil.WithMountParents, so the directories the mount needs under the shed
+// user's home are created as (or repaired to) that user rather than left to
+// mount-9p's root MkdirAll (#410).
+func mount9PArgv(addr, target, tag string, readOnly bool) []string {
+	cmd := []string{"/usr/local/bin/shed-agent", "mount-9p",
+		"--addr", addr,
 		"--target", target,
 		"--tag", tag,
 	}
 	if readOnly {
 		cmd = append(cmd, "--readonly")
 	}
+	return vmutil.WithMountParents(target, cmd)
+}
 
+// mount9PInGuest executes the mount-9p subcommand inside the guest VM via the
+// agent exec channel (see mount9PArgv).
+func (c *Client) mount9PInGuest(ctx context.Context, agent *vmutil.AgentClient, serverAddr, target string, readOnly bool, tag string) error {
 	opts := backend.ExecOptions{
-		Cmd:    cmd,
+		Cmd:    mount9PArgv(serverAddr, target, tag, readOnly),
 		Stdout: vmutil.NopWriteCloser(os.Stderr), // mount output goes to server stderr for debugging
 		Stderr: vmutil.NopWriteCloser(os.Stderr),
 		TTY:    false,
@@ -800,12 +835,20 @@ func (c *Client) DeleteShed(ctx context.Context, name string) error {
 		// mutex we already hold (sync.Mutex is non-reentrant).
 		if _, err := c.stopShedLocked(ctx, meta, stopDestroy); err != nil {
 			log.Printf("Warning: stop failed during delete of %s: %v", name, err)
-			// stopShedLocked failed — clean up resources it would have released
+			// stopShedLocked failed — clean up resources it would have released.
+			// The 9P servers are NOT among them: they close below, once the
+			// VMM is established gone, and stay up with everything else when
+			// it is not.
 			c.credMgr.StopListener(name)
-			c.stopP9Servers(name)
 			c.mu.Lock()
 			delete(c.vms, name)
 			c.mu.Unlock()
+			// EXCEPTION, pid <= 0: with no recorded pid there is nothing to
+			// verify, so — as before #284 — a failed teardown of a pid-0
+			// VMM (vm.Kill's StopVMM fallback erroring) still falls through
+			// and releases the TAP and the upper, and now also closes its
+			// 9P servers. "9P servers close only once the VMM is gone" holds
+			// on every verifiable (pid > 0) path below.
 			if meta.PID > 0 {
 				// Pin the pid before asking whose it is, then signal through
 				// that handle (pidfd on Linux) — never by number after a
@@ -815,21 +858,34 @@ func (c *Client) DeleteShed(ctx context.Context, name string) error {
 				switch {
 				case verifyErr != nil:
 					// UNKNOWN identity: refuse to carry on. Everything below
-					// this branch releases the TAP, the CID/IP reservation and
-					// the upper, which would strand a VMM that may well still
-					// be running.
+					// this branch releases the TAP, the CID/IP reservation, the
+					// upper and the 9P servers, which would strand a VMM that
+					// may well still be running.
 					return fmt.Errorf("cannot verify pid %d while deleting %s; refusing to release its resources: %w", meta.PID, name, verifyErr)
 				case !owns:
 					log.Printf("Warning: PID %d is not %s's firecracker VMM (recycled pid?), skipping SIGKILL during delete of %s", meta.PID, name, name)
 				default:
 					_ = proc.Signal(syscall.SIGKILL)
 					if !waitForProcessExit(meta.PID, 2*time.Second) {
-						log.Printf("Warning: PID %d did not exit within timeout during delete of %s", meta.PID, name)
+						// The VMM survived SIGKILL. Refuse, exactly as for
+						// UNKNOWN identity: releasing its TAP, reservations,
+						// upper and 9P servers would strand a live VMM. A
+						// retried delete succeeds once it is gone.
+						return fmt.Errorf("%w: %s (pid %d did not exit after SIGKILL); refusing to release its resources", config.ErrStopIncompleteSentinel, name, meta.PID)
 					}
 				}
 			}
 		}
 	}
+
+	// Every path that reaches here releases the shed: Stopped metadata, a
+	// Running teardown that succeeded, or a fallback whose SIGKILL landed
+	// (or that found the recorded pid recycled, or unset — the pid-0
+	// exception above; both released before too). Close the shed's 9P
+	// servers immediately before its TAP/CID/IP/upper go. A Stopped shed
+	// can still hold servers: an unexpected VMM exit that GetShed
+	// reconciled to Stopped never closed them.
+	c.stopP9Servers(name)
 
 	backend.Status(ctx, "Releasing network...")
 	if err := c.netMgr.DeleteTAPDevice(meta.TAPDevice); err != nil {
@@ -897,10 +953,29 @@ func (c *Client) StopShed(ctx context.Context, name string) (*config.Shed, error
 // acquireCreateLock(meta.Name). This split exists so DeleteShed can stop a
 // running shed without re-entering the non-reentrant per-shed mutex it is
 // already holding. The public StopShed acquires the lock and delegates here.
+//
+// The shed's 9P servers outlive the guest work (#284): the shutdown hook and
+// the sync run with the host mounts still live, and the servers close only
+// once the VMM is verifiably gone — whatever vm.Stop / vm.Kill returned. On a
+// path where the VMM may still be alive they stay registered (its mounts keep
+// working, metadata still says Running), and the next stop or delete closes
+// them.
 func (c *Client) stopShedLocked(ctx context.Context, meta *Metadata, mode stopMode) (*config.Shed, error) {
 	if meta.Status != config.StatusRunning {
 		return nil, fmt.Errorf("%w: %s", config.ErrShedNotRunningSentinel, meta.Name)
 	}
+
+	// The pid the teardown targets, pinned before anything below can touch
+	// the metadata. The post-teardown verdict inspects exactly this pid.
+	pid := meta.PID
+	vmmGone := false
+	defer func() {
+		// Runs on every return once the verdict is in, including a
+		// meta.Save failure after the VMM is already gone.
+		if vmmGone {
+			c.stopP9Servers(meta.Name)
+		}
+	}()
 
 	// Stop notification listener before shutting down
 	c.credMgr.StopListener(meta.Name)
@@ -913,9 +988,6 @@ func (c *Client) stopShedLocked(ctx context.Context, meta *Metadata, mode stopMo
 		}
 	}
 
-	// Stop P9 servers before shutting down
-	c.stopP9Servers(meta.Name)
-
 	// Get or create VM handle
 	c.mu.Lock()
 	vm := c.vms[meta.Name]
@@ -925,17 +997,19 @@ func (c *Client) stopShedLocked(ctx context.Context, meta *Metadata, mode stopMo
 		vm = &VM{meta: meta, cfg: c.cfg}
 	}
 
+	var teardownErr error
 	switch mode {
 	case stopGraceful:
 		agent := c.newAgentClient(meta.Name)
 		// Run the shutdown hook, then ask the guest to flush dirty buffers to
 		// the virtio-blk devices before firecracker terminates. Without this,
 		// post-stop snapshots and any host-side read of upper.ext4 see a stale
-		// pre-sync state.
+		// pre-sync state. Both run while the 9P servers are still up, so a
+		// hook that writes to a host mount, and the sync's flush of it, land.
 		vmutil.RunShutdownSequence(ctx, agent, meta.Name, meta.LandingDir, c.cfg.StopTimeout.Duration(), os.Stdout, os.Stderr)
 		vmutil.SyncFilesystems(ctx, agent, c.cfg.StopTimeout.Duration())
 		if err := vm.Stop(ctx); err != nil {
-			return nil, fmt.Errorf("failed to stop VM: %w", err)
+			teardownErr = fmt.Errorf("failed to stop VM: %w", err)
 		}
 	case stopDestroy:
 		// Delete discards the upper, so the shutdown hook and the graceful VM
@@ -949,8 +1023,17 @@ func (c *Client) stopShedLocked(ctx context.Context, meta *Metadata, mode stopMo
 			vmutil.SyncFilesystems(ctx, agent, c.cfg.StopTimeout.Duration())
 		}
 		if err := vm.Kill(ctx); err != nil {
-			return nil, fmt.Errorf("failed to kill VM: %w", err)
+			teardownErr = fmt.Errorf("failed to kill VM: %w", err)
 		}
+	}
+
+	// One liveness/identity probe, after the teardown whatever it returned.
+	// It decides both whether the 9P servers may close and the post-check
+	// below — the pid is never inspected twice.
+	verdict := c.vmmTeardown(meta.Name, pid, teardownErr)
+	vmmGone = verdict.gone
+	if teardownErr != nil {
+		return nil, teardownErr
 	}
 
 	// The VM teardown above (vm.Stop or vm.Kill) swallows its post-SIGKILL
@@ -958,17 +1041,14 @@ func (c *Client) stopShedLocked(ctx context.Context, meta *Metadata, mode stopMo
 	// to die. Verify before flipping status — otherwise the next StartShed
 	// would find PID=0 in metadata and silently spawn a second firecracker
 	// under the same name.
-	if meta.PID > 0 && vmutil.IsProcessAlive(meta.PID) {
-		owns, verifyErr := isThisVMsProcess(meta.PID, instanceAPISocketPath(c.cfg.SocketDir, meta.Name))
-		if verifyErr != nil {
-			// UNKNOWN identity: do not flip the metadata to Stopped/PID=0.
-			// The caller (stop or delete) must fail loudly instead of
-			// releasing resources a live VMM may still hold.
-			return nil, fmt.Errorf("cannot verify pid %d after stopping %s: %w", meta.PID, meta.Name, verifyErr)
-		}
-		if owns {
-			return nil, fmt.Errorf("%w: %s (pid %d)", config.ErrStopIncompleteSentinel, meta.Name, meta.PID)
-		}
+	if verdict.verifyErr != nil {
+		// UNKNOWN identity: do not flip the metadata to Stopped/PID=0.
+		// The caller (stop or delete) must fail loudly instead of
+		// releasing resources a live VMM may still hold.
+		return nil, fmt.Errorf("cannot verify pid %d after stopping %s: %w", pid, meta.Name, verdict.verifyErr)
+	}
+	if verdict.alive {
+		return nil, fmt.Errorf("%w: %s (pid %d)", config.ErrStopIncompleteSentinel, meta.Name, pid)
 	}
 
 	meta.Status = config.StatusStopped
@@ -982,6 +1062,47 @@ func (c *Client) stopShedLocked(ctx context.Context, meta *Metadata, mode stopMo
 	c.mu.Unlock()
 
 	return metadataToShed(meta), nil
+}
+
+// vmmVerdict is what one post-teardown probe of a shed's recorded VMM pid
+// established.
+type vmmVerdict struct {
+	// gone: the VMM is verifiably gone, so the shed's 9P servers may close.
+	gone bool
+	// alive: the pid is live and is still this shed's VMM.
+	alive bool
+	// verifyErr: the pid is live but whose process it is could not be read
+	// (UNKNOWN identity, see isThisVMsProcess). Never "gone".
+	verifyErr error
+}
+
+// vmmTeardown probes a shed's VMM after vm.Stop / vm.Kill returned
+// teardownErr — whatever it returned — and reports whether it is gone.
+//
+//   - pid > 0: gone iff the process is dead, or alive but definitively not
+//     this shed's VMM (a recycled pid). UNKNOWN identity is not gone.
+//   - pid <= 0: there is no pid to inspect, and the SDK handle's own
+//     StopVMM / machine.Wait path is the only evidence: gone iff the
+//     teardown returned nil.
+//
+// stopShedLocked and the start/create rollback (registerStopVMCleanups) share
+// it so both close a shed's 9P servers on exactly the same evidence.
+func (c *Client) vmmTeardown(name string, pid int, teardownErr error) vmmVerdict {
+	if pid <= 0 {
+		return vmmVerdict{gone: teardownErr == nil}
+	}
+	if !vmutil.IsProcessAlive(pid) {
+		return vmmVerdict{gone: true}
+	}
+	owns, err := isThisVMsProcess(pid, instanceAPISocketPath(c.cfg.SocketDir, name))
+	switch {
+	case err != nil:
+		return vmmVerdict{verifyErr: err}
+	case owns:
+		return vmmVerdict{alive: true}
+	default:
+		return vmmVerdict{gone: true}
+	}
 }
 
 // DialService opens a connection to a service port inside a running Firecracker

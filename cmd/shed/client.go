@@ -72,16 +72,6 @@ func pinCredential(req *http.Request, cred clienttoken.Credential) *http.Request
 	return req
 }
 
-// setAuth pins the client's CURRENT credential onto a request that has no
-// re-auth retry wrapped around it (the long-timeout and streaming paths that
-// build their own client). Those cannot act on a rejection anyway, so capturing
-// at send time is all there is to do — but they still go through one atomic
-// capture, so header and handshake agree.
-func (c *APIClient) setAuth(req *http.Request) *http.Request {
-	cred, _ := c.tokens.Current()
-	return pinCredential(req, cred)
-}
-
 // closeIdleConnections drops pooled keep-alive connections on the pinned
 // transport.
 //
@@ -801,28 +791,20 @@ func (c *APIClient) doRequest(method, path string, body, result interface{}, exp
 
 // doRequestWithTimeout performs an HTTP request with a custom timeout using context.
 // Used for long-running operations like create and start that may need more time.
+// Like doRequest it re-mints and retries once on an auth-shaped failure; the
+// timeout context bounds both attempts.
 func (c *APIClient) doRequestWithTimeout(method, path string, body, result interface{}, timeout time.Duration, expectedStatus ...int) error {
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 
-	var bodyReader io.Reader
+	var bodyData []byte
 	if body != nil {
-		bodyData, err := json.Marshal(body)
+		var err error
+		bodyData, err = json.Marshal(body)
 		if err != nil {
 			return fmt.Errorf("failed to encode request: %w", err)
 		}
-		bodyReader = bytes.NewReader(bodyData)
 	}
-
-	req, err := http.NewRequestWithContext(ctx, method, c.baseURL+path, bodyReader)
-	if err != nil {
-		return fmt.Errorf("failed to create request: %w", err)
-	}
-	if body != nil {
-		req.Header.Set("Content-Type", "application/json")
-	}
-
-	req = c.setAuth(req)
 
 	// Create a client without a Timeout for long-running requests.
 	// Important: When both http.Client.Timeout and context deadline are set,
@@ -830,12 +812,33 @@ func (c *APIClient) doRequestWithTimeout(method, path string, body, result inter
 	// a separate client here to allow the context timeout (potentially minutes)
 	// to control cancellation. It still carries the pinning transport.
 	client := c.newHTTPClient(0)
-	resp, err := client.Do(req)
-	if err != nil {
+	send := func(cred clienttoken.Credential) (*http.Response, error) {
+		// Fresh request and body reader per attempt: the first send consumed
+		// the reader.
+		var bodyReader io.Reader
+		if bodyData != nil {
+			bodyReader = bytes.NewReader(bodyData)
+		}
+		req, err := http.NewRequestWithContext(ctx, method, c.baseURL+path, bodyReader)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create request: %w", err)
+		}
+		if bodyData != nil {
+			req.Header.Set("Content-Type", "application/json")
+		}
+		req = pinCredential(req, cred)
+		return client.Do(req)
+	}
+	wrapErr := func(err error) error {
 		if ctx.Err() == context.DeadlineExceeded {
 			return fmt.Errorf("request timed out after %v (use --timeout to increase)", timeout)
 		}
-		return fmt.Errorf("failed to connect to server: %w", err)
+		return connectFailure(err)
+	}
+
+	resp, err := c.sendWithReauth(send, wrapErr)
+	if err != nil {
+		return err
 	}
 	defer resp.Body.Close()
 

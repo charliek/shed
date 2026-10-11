@@ -327,9 +327,14 @@ brews:
                "#{bin}/shed-server"
         tmp.close!
       end
+    # stop_timeout: launchd's default exit timeout SIGKILLs shed-server in the
+    # middle of its graceful shutdown (shutdownTimeout is 30 s); 35 s lets it
+    # exit cleanly. Needs Homebrew >= 6.0.13. vfkit no longer depends on this
+    # (it runs in its own process group, Setpgid; #409).
     service: |
       run [opt_bin/"shed-server", "serve", "--config", etc/"shed/server.yaml"]
       keep_alive true
+      stop_timeout 35
       log_path var/"log/shed-server.log"
       error_log_path var/"log/shed-server.log"
       environment_variables PATH: "/usr/local/bin:#{std_service_path_env}"

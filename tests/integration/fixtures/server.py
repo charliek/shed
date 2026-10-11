@@ -30,14 +30,20 @@ unnecessary surface.
 from __future__ import annotations
 
 import json
+import re
 import shlex
 import shutil
+import ssl
 import subprocess
 import sys
 import time
+import urllib.error
+import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Union
+
+import pytest
 
 from .timing import PhaseTimings, parse_timing_line
 
@@ -125,6 +131,49 @@ def resolve_server_entry(name: str, timeout: int = 10) -> Optional[dict]:
     return None
 
 
+# A shed-server version string, as `GET /api/info` reports it: goreleaser's
+# `X.Y.Z` for a release, `git describe --tags --always --dirty` for a
+# `make build` (`vX.Y.Z`, `vX.Y.Z-N-gSHA`, `...-dirty`, or a bare SHA), and
+# `dev` for an un-stamped `go build`.
+_VERSION_RE = re.compile(r"^v?(\d+)\.(\d+)\.(\d+)(.*)$")
+# The only suffixes a RELEASE carries: none, or a prerelease tag's.
+_RELEASE_SUFFIX_RE = re.compile(r"^(-(rc|alpha|beta)(\.?\d+)*)?$")
+
+
+def parse_release_version(version: Optional[str]) -> Optional[tuple[int, int, int]]:
+    """Return `(major, minor, patch)` for a RELEASED shed-server version, or
+    None for anything that is not a release.
+
+    None means "a source build, or unknown": `dev`, a bare commit SHA, a
+    `git describe` build past or on top of its tag (`v0.9.0-3-gabc1234`,
+    `v0.9.0-dirty`), a goreleaser snapshot (`0.9.0-SNAPSHOT-abc1234`). Those
+    carry the version they name PLUS whatever changed since, so they must
+    count as new, never as the old release they name. A clean build exactly at
+    a tag (`v0.9.0`) is that release's code and parses as it. A prerelease
+    (`0.9.1-rc.1`) parses as its `X.Y.Z`: an rc of 0.9.1 carries 0.9.1's fixes.
+    """
+    if not version:
+        return None
+    m = _VERSION_RE.match(version.strip())
+    if m is None or not _RELEASE_SUFFIX_RE.match(m.group(4)):
+        return None
+    return int(m.group(1)), int(m.group(2)), int(m.group(3))
+
+
+def released_before(version: Optional[str], minimum: str) -> bool:
+    """Whether `version` is a released shed-server older than `minimum`.
+
+    Source builds and unknown versions are never "before" anything: the
+    version gate exists to skip released servers that predate a fix, not to
+    hide a dev build that should carry it.
+    """
+    floor = parse_release_version(minimum)
+    if floor is None:
+        raise ValueError(f"minimum {minimum!r} is not a release version")
+    got = parse_release_version(version)
+    return got is not None and got < floor
+
+
 @dataclass
 class ShedHandle:
     """A reference to a successfully-created shed.
@@ -201,6 +250,50 @@ class LocalServer:
         except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
             return False
         return r.returncode == 0
+
+    def server_version(self, timeout: float = 5.0) -> Optional[str]:
+        """The server's version string from `GET /api/info`, or None.
+
+        Reads the endpoint the CLI itself uses (the entry's `endpoint` in
+        `shed --json server list`). `/api/info` is unauthenticated in open and
+        token mode; a token-mode server's TLS certificate is pinned by the CLI,
+        not by a CA, so the read skips verification — it only needs the
+        version string. Under mtls the handshake needs a client certificate
+        and fails, so the version is unknown (None) there, as it is for any
+        unreachable server.
+        """
+        entry = resolve_server_entry(self.name)
+        endpoint = entry.get("endpoint") if entry else None
+        if not endpoint:
+            return None
+        url = endpoint.rstrip("/") + "/api/info"
+        ctx = None
+        if url.startswith("https://"):
+            ctx = ssl.create_default_context()
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+        try:
+            with urllib.request.urlopen(url, timeout=timeout, context=ctx) as resp:
+                info = json.loads(resp.read().decode("utf-8"))
+        except (urllib.error.URLError, OSError, ValueError):
+            return None
+        version = info.get("version") if isinstance(info, dict) else None
+        return version if isinstance(version, str) and version else None
+
+    def skip_if_released_before(self, minimum: str, needs: str) -> None:
+        """Skip the calling test when this server is a RELEASED version older
+        than `minimum` (see `released_before`); `needs` says what it lacks.
+
+        A source build (`make build`, any `git describe` shape) or an
+        unreadable version never skips: the gate is for released servers that
+        predate the fix, and a dev server is exactly what should be tested.
+        """
+        version = self.server_version()
+        if released_before(version, minimum):
+            pytest.skip(
+                f"{self.name} runs released shed-server {version}, older than "
+                f"{minimum}: {needs}"
+            )
 
     # ------------------------------------------------------------------
     # Shed lifecycle
@@ -661,6 +754,27 @@ class RemoteServer(LocalServer):
         except (subprocess.TimeoutExpired, FileNotFoundError):
             return False
         return r.returncode == 0
+
+    def ssh_run(self, command: str, timeout: int = 30) -> subprocess.CompletedProcess:
+        """Run a shell `command` on the server's HOST (not in a shed) over
+        plain ssh, as the ssh user. Returns the CompletedProcess unchecked.
+
+        For tests that need the host side of something the server sees — a
+        `--local-dir` that has to exist on the server's host, or a file a
+        mount wrote there. Quote any data with `shlex.quote`.
+        """
+        return subprocess.run(
+            [
+                "ssh",
+                "-o", "BatchMode=yes",
+                "-o", "ConnectTimeout=5",
+                self.ssh_host,
+                command,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
 
     def _log_offset(self) -> Union[int, str]:
         """Return an offset opaque to the caller but understood by

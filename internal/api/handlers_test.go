@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/charliek/shed/internal/backend"
 	"github.com/charliek/shed/internal/config"
@@ -705,5 +706,69 @@ func TestSSE_TimingLog_OnlyWithTimer(t *testing.T) {
 				t.Errorf("%q present=%v, want %v:\n%s", tt.needle, got, tt.wantTiming, buf.String())
 			}
 		})
+	}
+}
+
+// stopDetachBackend parks StopShed until released and reports what its
+// context looked like afterwards.
+type stopDetachBackend struct {
+	backend.Backend // only StopShed is called
+	entered         chan struct{}
+	release         chan struct{}
+	ctxErr          chan error
+}
+
+func (b *stopDetachBackend) StopShed(ctx context.Context, name string) (*config.Shed, error) {
+	close(b.entered)
+	<-b.release
+	b.ctxErr <- ctx.Err()
+	return &config.Shed{Name: name, Status: config.StatusStopped}, nil
+}
+
+// TestStopShed_DetachedFromClientCancellation: a client that disconnects (or
+// times out) mid-stop must not cancel the backend's stop. On both backends a
+// cancelled stop context force-kills the VMM, cutting the shutdown hook and
+// the sync short (#284).
+func TestStopShed_DetachedFromClientCancellation(t *testing.T) {
+	be := &stopDetachBackend{
+		entered: make(chan struct{}),
+		release: make(chan struct{}),
+		ctxErr:  make(chan error, 1),
+	}
+	srv := NewServer(be, &config.ServerConfig{Name: "test-server"}, "", nil, nil)
+
+	reqCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	r := httptest.NewRequest(http.MethodPost, "/api/sheds/myshed/stop", nil).WithContext(reqCtx)
+	w := httptest.NewRecorder()
+	served := make(chan struct{})
+	go func() {
+		defer close(served)
+		srv.Router().ServeHTTP(w, r)
+	}()
+
+	select {
+	case <-be.entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the stop request never reached the backend")
+	}
+	cancel() // the client goes away mid-stop
+	close(be.release)
+
+	select {
+	case err := <-be.ctxErr:
+		if err != nil {
+			t.Errorf("backend StopShed context err = %v after the client cancelled; the stop must not be cancelled with the request", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the backend StopShed never returned after release")
+	}
+	select {
+	case <-served:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the stop handler never returned")
+	}
+	if w.Code != http.StatusOK {
+		t.Errorf("status = %d, want 200 (body: %s)", w.Code, w.Body.String())
 	}
 }
