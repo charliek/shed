@@ -86,6 +86,17 @@ Provisioning hooks execute in the VM via vsock, identically to Firecracker. Moun
 
 For the full sequence of operations during create, start, stop, and delete (including how VZ differs from other backends), see [Shed Lifecycle](provisioning.md#shed-lifecycle). For hook configuration, see [Provisioning](provisioning.md).
 
+## Restarting the server
+
+From v0.9.1, VZ VMs outlive `shed-server`: `brew services restart shed` and `brew services stop shed` leave running sheds running, and the next server start re-adopts them. To stop sheds, run `shed stop <name>` first.
+
+```bash
+shed stop <name>              # for each shed you want stopped
+brew services restart shed
+```
+
+A restart can take up to about 30 s while `shed-server` shuts down gracefully. If the server cannot come back, the VMs keep running unmanaged until it does. A foreground `shed-server` stopped with Ctrl-C no longer stops its VMs either. Upgrading from 0.9.0 stops running sheds once; see the [v0.9.0 to v0.9.1 guide](../upgrades/v0.9.0-to-v0.9.1.md).
+
 ## Inspecting VMs
 
 ### Metadata
@@ -189,5 +200,5 @@ sudo timedatectl set-time "$(cat /sys/class/rtc/rtc0/date) $(cat /sys/class/rtc/
 - **Code signing**: The shed-server binary must be signed with the `com.apple.security.virtualization` entitlement.
 - **No `/proc`**: Process identification uses `ps -p <pid> -o comm=` instead of reading `/proc/<pid>/cmdline`.
 - **Console device**: VZ uses `hvc0` (virtio console) instead of Firecracker's `ttyS0`.
-- **vfkit subprocess model**: Each VM runs as a separate vfkit process. Stopping a VM sends SIGTERM, then SIGKILL after timeout.
+- **vfkit subprocess model**: Each VM runs as a separate vfkit process. Stopping a VM sends SIGTERM, then SIGKILL after timeout. vfkit runs in its own process group so a launchd restart of `shed-server` does not kill it (v0.9.1+).
 - **Socket naming**: Per-port sockets follow the pattern `<name>-<port>.sock` in the socket directory.

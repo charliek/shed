@@ -23,8 +23,21 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+> **macOS (VZ): upgrading from 0.9.0 stops every running VZ shed once.** The 0.9.0
+> `shed-server` started vfkit in the launchd job's process group, so the
+> `brew services restart shed` that applies 0.9.1 still takes running sheds down. Stop them
+> first (`shed stop`), or `shed start` them afterwards. From 0.9.1 on, restarts leave VMs
+> running.
+>
+> Read the [v0.9.0 to v0.9.1 upgrade guide](https://charliek.github.io/shed/upgrades/v0.9.0-to-v0.9.1/)
+> before upgrading.
+
 ### Fixed
 
+- **macOS (VZ): VZ sheds no longer stop on `brew services restart shed`.** vfkit now runs in
+  its own process group, so launchd no longer kills it with the server. The restart that
+  applies 0.9.1 still stops running sheds once. The brew service now waits up to 35 s for a
+  graceful server exit (`stop_timeout`), which requires Homebrew 6.0.13 or later. (#409)
 - **Images: the base stage of both images now pre-creates `~/.local` (`bin`, `share`, `state`), `~/.config` and `~/.cache` owned by `shed`.** Defense in depth for #410, so a mount or tool under those paths never leaves a root-owned parent. Applies to newly built images, from the next image release.
 - **CLI: the first command after a token-mode server restart no longer fails.** `shed start`,
   `shed create`, `shed image pull`, `shed image push`, `shed snapshot create` and the prune

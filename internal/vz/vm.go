@@ -79,7 +79,7 @@ func (vm *VM) Start(ctx context.Context) error {
 		return err
 	}
 
-	cmd := exec.Command(vm.cfg.VfkitPath, args...)
+	cmd := newVfkitCmd(vm.cfg.VfkitPath, args)
 
 	// Redirect vfkit output to the console log instead of server stderr.
 	// This captures vfkit INFO lines and tcpproxy retry noise for debugging
@@ -430,4 +430,17 @@ func isVfkitProcess(pid int) bool {
 	}
 	comm := strings.TrimSpace(string(out))
 	return strings.Contains(comm, "vfkit")
+}
+
+// newVfkitCmd builds the vfkit command with its own process group.
+//
+// launchd kills a job's whole process group when the job exits unless
+// AbandonProcessGroup is set, and Homebrew's service DSL can't set that key,
+// so vfkit must not share shed-server's group (#409). vfkit is still our
+// child (cmd.Wait reaps it), Stop/Kill signal its exact pid, and resume
+// identity is ps-based, so nothing signals a group.
+func newVfkitCmd(path string, args []string) *exec.Cmd {
+	cmd := exec.Command(path, args...)
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	return cmd
 }

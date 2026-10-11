@@ -47,6 +47,7 @@ nav = [
       { "v0.7.1 → v0.7.2" = "upgrades/v0.7.1-to-v0.7.2.md" },
       { "v0.7.3 → v0.7.4" = "upgrades/v0.7.3-to-v0.7.4.md" },
       { "v0.8.2 → v0.9.0" = "upgrades/v0.8.2-to-v0.9.0.md" },
+      { "v0.9.0 → v0.9.1" = "upgrades/v0.9.0-to-v0.9.1.md" },
     ] },
   ] },
   { "Tutorials" = [

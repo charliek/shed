@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -489,5 +490,32 @@ func TestCreateVM(t *testing.T) {
 	}
 	if vm.cfg != cfg {
 		t.Error("VM should reference the provided config")
+	}
+}
+
+// TestNewVfkitCmdOwnProcessGroup guards #409: vfkit must not share
+// shed-server's process group, or launchd kills it on a service restart.
+func TestNewVfkitCmdOwnProcessGroup(t *testing.T) {
+	cmd := newVfkitCmd("/bin/sleep", []string{"30"})
+	if cmd.SysProcAttr == nil || !cmd.SysProcAttr.Setpgid {
+		t.Fatal("SysProcAttr.Setpgid must be true")
+	}
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+	})
+	pid := cmd.Process.Pid
+	pgid, err := syscall.Getpgid(pid)
+	if err != nil {
+		t.Fatalf("Getpgid: %v", err)
+	}
+	if pgid == syscall.Getpgrp() {
+		t.Errorf("child pgid %d equals parent's group", pgid)
+	}
+	if pgid != pid {
+		t.Errorf("child pgid = %d, want its own pid %d", pgid, pid)
 	}
 }
