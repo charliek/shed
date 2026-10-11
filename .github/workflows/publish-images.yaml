@@ -17,9 +17,20 @@ name: Publish Images and Release
 #                                             the desktop signing gate: a
 #                                             STABLE tag without all six Apple
 #                                             secrets fails here, before
-#                                             anything publishes
+#                                             anything publishes. When
+#                                             ship_server on a tag push, the
+#                                             server signing gate likewise
+#                                             requires the four Developer ID
+#                                             secrets (plan 028 D4)
 #
 #   Server component (ship_server):
+#   0. server-signing-preflight     (~1 min)  tag push only: imports the
+#                                             Developer ID cert and signs +
+#                                             verifies a scratch binary, so a
+#                                             bad cert/password/identity/team
+#                                             or timestamp fails before any
+#                                             image publishes; every image job
+#                                             needs it
 #   1. publish-build-tools          (~2 min)  shed-build-tools image
 #   2. publish-vz, publish-fc       (~10 min) runtime images, need (1)
 #   3. smoke                        (~1 min)  reusable smoke-linux gate
@@ -69,19 +80,20 @@ name: Publish Images and Release
 # upstream must, and a user-cancelled run must publish nothing). Traced
 # per scenario (tag push; "helper" = host-agent with ship_server false):
 #
-#   job                    | server tag  | helper-only tag | desktop-only tag | combined (srv+desk)
-#   -----------------------|-------------|-----------------|------------------|--------------------
-#   release-plan           | run         | run             | run              | run
-#   publish-build-tools    | run         | skip (ship)     | skip (ship)      | run
-#   publish-vz/publish-fc  | run         | skip (needs)    | skip (needs)     | run
-#   smoke                  | run         | skip (ship)     | skip (ship)      | run
-#   release                | run         | run (images     | skip (if:        | run
-#                          |             |   skipped ok)   |   ship_goreleaser)|
-#   desktop-release-create | skip (ship) | skip (ship)     | run              | skip (goreleaser)
-#   desktop-macos          | skip (ship) | skip (ship)     | run, after       | run, after
-#                          |             |                 |   create ok      |   goreleaser ok
-#   desktop-linux          |             |                 |   (see below)    |   (see below)
-#   desktop-apt-dispatch   | skip (needs)| skip (needs)    | run              | run
+#   job                      | server tag  | helper-only tag | desktop-only tag | combined (srv+desk)
+#   -------------------------|-------------|-----------------|------------------|--------------------
+#   release-plan             | run         | run             | run              | run
+#   server-signing-preflight | run         | skip (ship)     | skip (ship)      | run
+#   publish-build-tools      | run         | skip (ship)     | skip (ship)      | run
+#   publish-vz/publish-fc    | run         | skip (needs)    | skip (needs)     | run
+#   smoke                    | run         | skip (ship)     | skip (ship)      | run
+#   release                  | run         | run (images     | skip (if:        | run
+#                            |             |   skipped ok)   |   ship_goreleaser)|
+#   desktop-release-create   | skip (ship) | skip (ship)     | run              | skip (goreleaser)
+#   desktop-macos            | skip (ship) | skip (ship)     | run, after       | run, after
+#                            |             |                 |   create ok      |   goreleaser ok
+#   desktop-linux            |             |                 |   (see below)    |   (see below)
+#   desktop-apt-dispatch     | skip (needs)| skip (needs)    | run              | run
 #
 #   A helper+desktop tag behaves like the combined column, except the
 #   image chain skips (ship_server=false) while `release` still runs
@@ -107,9 +119,11 @@ name: Publish Images and Release
 #
 #   Failure propagation: release-plan fails → everything skips (loud, by
 #   design — includes the no-manifest-matches tag). On a server-shipping
-#   tag, a failed/cancelled/skipped image job blocks `release` (its `if:`
-#   requires all four `== 'success'` when ship_server — stricter than
-#   `!= 'failure'` on purpose: cancellation must not ship), which leaves
+#   tag, a failed server-signing-preflight skips all three image jobs (see
+#   the truth table above publish-build-tools), and a failed/cancelled/
+#   skipped preflight or image job blocks `release` (its `if:` requires all
+#   five `== 'success'` when ship_server — stricter than `!= 'failure'` on
+#   purpose: cancellation must not ship), which leaves
 #   desktop-release-create skipped (ship_goreleaser=true) —
 #   desktop-macos/linux then run but fail fast at `gh release upload`
 #   (no release exists); re-run the failed job and the rerun restores
@@ -272,12 +286,142 @@ jobs:
             --has APPLE_TEAM_ID=${{ secrets.APPLE_TEAM_ID != '' }} \
             --has APPLE_APP_SPECIFIC_PASSWORD=${{ secrets.APPLE_APP_SPECIFIC_PASSWORD != '' }}
 
+      # The server signing gate (plan 028 D4, #304): a server tag must ship a
+      # Developer ID signed ShedServer.app, so the four secrets the server's
+      # signing reads must exist; missing ones fail here, before anything
+      # publishes. Any tag fails closed, prerelease included: the release job
+      # has no ad hoc server path. Presence booleans only, as for the desktop
+      # gate. Tag push only: `release`, the one job that signs, runs only on a
+      # tag push, and a tag push runs this workflow from the tag's own commit,
+      # so the script is always in the checkout. A workflow_dispatch republish
+      # (this file from main, an older tag checked out) signs nothing, so it
+      # skips this step and needs no missing-script fallback.
+      # release-scripts-test.sh asserts this step's condition, its four flags
+      # and its position (right after the desktop gate), and executes it.
+      - name: Server signing gate (a server tag fails closed)
+        if: steps.plan.outputs.ship_server == 'true' && github.event_name == 'push'
+        env:
+          TAG: ${{ github.event.inputs.version || github.ref_name }}
+        run: |
+          set -euo pipefail
+          scripts/release/server-signing-gate.sh "${TAG}" \
+            --has MACOS_CERTIFICATE_P12_BASE64=${{ secrets.MACOS_CERTIFICATE_P12_BASE64 != '' }} \
+            --has MACOS_CERTIFICATE_PASSWORD=${{ secrets.MACOS_CERTIFICATE_PASSWORD != '' }} \
+            --has SHED_DESKTOP_DEVELOPER_ID_IDENTITY=${{ secrets.SHED_DESKTOP_DEVELOPER_ID_IDENTITY != '' }} \
+            --has APPLE_TEAM_ID=${{ secrets.APPLE_TEAM_ID != '' }}
+
+  # Plan 028 D4 (#304): prove the server's Developer ID signing works before
+  # anything publishes. The gate above only knows the secrets exist; this job
+  # imports the certificate into a throwaway keychain, signs a scratch copy of
+  # a small Mach-O exactly as the release hook signs shed-server (identifier,
+  # entitlements, --timestamp), and runs the hook's own required checks
+  # (macos-server-app.sh --verify: Developer ID authority, Team ID, secure
+  # timestamp, designated requirement, entitlements). A bad certificate,
+  # password, identity string, team or timestamp server fails here, and every
+  # image job needs this one.
+  #
+  # Tag push only, like the gate: a workflow_dispatch image republish never
+  # runs `release`, so it needs no signing, and an older tag's checkout may
+  # lack the scripts. The image jobs therefore accept a SKIPPED preflight only
+  # off a tag push. The truth table, for the three image jobs:
+  #
+  #   event    | ships server | preflight         | publish-build-tools, publish-vz, publish-fc
+  #   ---------|--------------|-------------------|---------------------------------------------
+  #   push     | yes          | success           | run (vz/fc after build-tools succeeds)
+  #   push     | yes          | failure/cancelled | skip: nothing publishes, so `release` skips
+  #   push     | yes          | skipped (*)       | skip: fail closed
+  #   push     | no           | skipped           | skip (ship_server)
+  #   dispatch | yes          | skipped           | run: an image republish needs no signing
+  #   dispatch | no           | skipped           | skip (ship_server)
+  #   either   | (release-plan failed) skipped     | skip (release-plan must succeed)
+  #
+  #   (*) unreachable with this `if:`; if an edit ever skipped the preflight on
+  #   a tag push, the images would not publish rather than publish unproven.
+  #
+  # `release` also lists this job and, when ship_server, requires it to be
+  # 'success'; a host-agent-only or desktop-only tag never looks at it.
+  server-signing-preflight:
+    name: Server signing preflight
+    needs: release-plan
+    if: needs.release-plan.outputs.ship_server == 'true' && github.event_name == 'push'
+    runs-on: macos-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.inputs.version || github.ref_name }}
+          persist-credentials: false
+
+      # The same import as desktop-macos's, into this job's own keychain.
+      - name: Import Developer ID certificate
+        env:
+          MACOS_CERTIFICATE_P12_BASE64: ${{ secrets.MACOS_CERTIFICATE_P12_BASE64 }}
+          MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+        run: |
+          set -euo pipefail
+          trap 'rm -f "$RUNNER_TEMP/cert.p12"' EXIT
+          kc="$RUNNER_TEMP/shed-server-signing.keychain-db"
+          kp="$(openssl rand -base64 24)"
+          security create-keychain -p "$kp" "$kc"
+          security set-keychain-settings -lut 21600 "$kc"
+          security unlock-keychain -p "$kp" "$kc"
+          echo "$MACOS_CERTIFICATE_P12_BASE64" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security import "$RUNNER_TEMP/cert.p12" -k "$kc" -P "$MACOS_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$kp" "$kc"
+          # shellcheck disable=SC2046
+          security list-keychains -d user -s "$kc" $(security list-keychains -d user | sed 's/"//g')
+          rm -f "$RUNNER_TEMP/cert.p12"
+
+      # A copy of /usr/bin/true stands in for shed-server: a small Mach-O that
+      # every runner has. It is signed the way macos-server-app.sh signs the
+      # real binary, then checked by that script's own --verify.
+      - name: Sign and verify a scratch binary (Developer ID, timestamped)
+        env:
+          SHED_SERVER_SIGNING: required
+          SHED_SERVER_SIGN_IDENTITY: ${{ secrets.SHED_DESKTOP_DEVELOPER_ID_IDENTITY }}
+          SHED_SERVER_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          set -euo pipefail
+          scratch="$RUNNER_TEMP/server-signing-preflight/shed-server"
+          mkdir -p "$(dirname "$scratch")"
+          cp /usr/bin/true "$scratch"
+          case "$(file -b "$scratch")" in
+            *Mach-O*) ;;
+            *) echo "::error::/usr/bin/true is not a Mach-O on this runner: $(file -b "$scratch")"; exit 1 ;;
+          esac
+          codesign --force --sign "$SHED_SERVER_SIGN_IDENTITY" \
+            --identifier ai.stridelabs.shed-server \
+            --entitlements internal/vz/entitlements.plist \
+            --timestamp "$scratch"
+          scripts/release/macos-server-app.sh --verify "$scratch"
+
+      - name: Delete signing keychain
+        if: always()
+        run: |
+          set -euo pipefail
+          rm -f "$RUNNER_TEMP/cert.p12"
+          kc="$RUNNER_TEMP/shed-server-signing.keychain-db"
+          if [ -f "$kc" ]; then
+            security delete-keychain "$kc"
+          fi
+
   publish-build-tools:
     name: Publish shed-build-tools
-    needs: release-plan
-    # No status function here, so GitHub's implicit success() applies: a failed
-    # release-plan (the desktop signing gate included) skips the image chain.
-    if: needs.release-plan.outputs.ship_server == 'true'
+    needs: [release-plan, server-signing-preflight]
+    # Explicit status checks, not GitHub's implicit success(): a SKIPPED
+    # preflight (a workflow_dispatch republish) must not block the images, but
+    # a failed one must, and so must a preflight skipped on a tag push (the
+    # truth table above server-signing-preflight). A failed release-plan (the
+    # signing gates included) skips the image chain; a cancelled run publishes
+    # nothing.
+    if: >-
+      !cancelled() &&
+      needs.release-plan.result == 'success' &&
+      needs.release-plan.outputs.ship_server == 'true' &&
+      (needs.server-signing-preflight.result == 'success' ||
+       (github.event_name != 'push' && needs.server-signing-preflight.result == 'skipped'))
     runs-on: ubuntu-latest
 
     steps:
@@ -327,9 +471,18 @@ jobs:
 
   publish-vz:
     name: Publish VZ Images
-    # Transitively gated on ship_server: when publish-build-tools skips, this
-    # skips too (plain `needs` semantics — no `always()` here on purpose).
-    needs: publish-build-tools
+    # Gated on ship_server through publish-build-tools: unless it succeeded,
+    # this skips. The preflight is checked again here, directly, with the same
+    # skipped-vs-failed rule as publish-build-tools (the truth table above
+    # server-signing-preflight): a dispatch republish's skipped preflight
+    # passes, a failed one, or one skipped on a tag push, blocks. `!cancelled()`
+    # rather than the implicit success(), which a skipped preflight would fail.
+    needs: [publish-build-tools, server-signing-preflight]
+    if: >-
+      !cancelled() &&
+      needs.publish-build-tools.result == 'success' &&
+      (needs.server-signing-preflight.result == 'success' ||
+       (github.event_name != 'push' && needs.server-signing-preflight.result == 'skipped'))
     runs-on: ubuntu-24.04-arm
 
     steps:
@@ -466,8 +619,13 @@ jobs:
 
   publish-fc:
     name: Publish FC Images
-    # Transitively gated on ship_server via publish-build-tools (see publish-vz).
-    needs: publish-build-tools
+    # Gated exactly like publish-vz (see its comment).
+    needs: [publish-build-tools, server-signing-preflight]
+    if: >-
+      !cancelled() &&
+      needs.publish-build-tools.result == 'success' &&
+      (needs.server-signing-preflight.result == 'success' ||
+       (github.event_name != 'push' && needs.server-signing-preflight.result == 'skipped'))
     runs-on: ubuntu-latest
 
     steps:
@@ -608,14 +766,16 @@ jobs:
   #   nothing.
   # * GHA outputs are STRINGS and any non-empty string is truthy, so
   #   every comparison is an explicit == / != against 'true'.
-  # * On a server-shipping tag the four upstream jobs must be exactly
+  # * On a server-shipping tag the five upstream jobs must be exactly
   #   'success' — stricter than `!= 'failure'` on purpose: a cancelled or
   #   skipped image job must block the release (the v0.5.2-era race fix:
   #   apt-charliek must never index a deb whose referenced ghcr images
-  #   don't exist).
+  #   don't exist), and so must a preflight that did not prove the
+  #   Developer ID signing works (plan 028 D4). A host-agent-only tag skips
+  #   the preflight with the rest of the server chain and never looks at it.
   release:
     name: Build and Release
-    needs: [release-plan, publish-build-tools, publish-vz, publish-fc, smoke]
+    needs: [release-plan, server-signing-preflight, publish-build-tools, publish-vz, publish-fc, smoke]
     if: >-
       !cancelled() &&
       github.event_name == 'push' &&
@@ -623,7 +783,8 @@ jobs:
       needs.release-plan.result == 'success' &&
       needs.release-plan.outputs.ship_goreleaser == 'true' &&
       (needs.release-plan.outputs.ship_server != 'true' ||
-       (needs.publish-build-tools.result == 'success' &&
+       (needs.server-signing-preflight.result == 'success' &&
+        needs.publish-build-tools.result == 'success' &&
         needs.publish-vz.result == 'success' &&
         needs.publish-fc.result == 'success' &&
         needs.smoke.result == 'success'))
@@ -660,29 +821,6 @@ jobs:
           go mod tidy
           git diff --exit-code go.mod go.sum
           git check-ignore -q packaging/server.yaml.generated
-
-      # Rust + cross tooling for `builder: rust` (mirrors release-snapshot).
-      # goreleaser's rust builder shells out to `cargo zigbuild`, needing zig +
-      # cargo-zigbuild; it auto-runs `rustup target add`, but pre-adding fails
-      # fast if a target is unavailable. The build env SHED_HOST_AGENT_VERSION=
-      # {{ .Version }} lives in .goreleaser.host-agent.yaml, so it applies
-      # identically to the snapshot and this release — no per-job version
-      # munging.
-      # Only needed when the RUST component ships (the server config is pure Go)
-      # — skipping saves ~3 min on server-only tags.
-      - name: Rust toolchain + zig cross tooling
-        if: success() && needs.release-plan.outputs.ship_host_agent == 'true'
-        run: |
-          # Kept byte-identical to ci.yml's release-snapshot step (see the note
-          # there): explicit rustfmt+clippy (rust-toolchain.toml declares them),
-          # and cargo-zigbuild pinned to the validated version. zig is brew-current;
-          # a zig bump is a loud failure caught by release-snapshot pre-tag.
-          rustup toolchain install stable --profile minimal --component rustfmt --component clippy
-          rustup default stable
-          rustup target add aarch64-apple-darwin x86_64-apple-darwin \
-                            aarch64-unknown-linux-gnu x86_64-unknown-linux-gnu
-          brew install zig
-          cargo install --locked --version 0.23.0 cargo-zigbuild
 
       # The old inline "Verify plugin.json matches tag" step is gone: the
       # release-plan job owns manifest gating now (this job only runs when
@@ -756,6 +894,35 @@ jobs:
       # release asset exists for apt-charliek's asset scan to index, and
       # its brew formula is never pushed (the published formula stays at
       # the component's last-shipped version).
+      #
+      # The server's darwin shed-server and ShedServer.app are Developer ID
+      # signed by the build hook (plan 028 D4, #304), so the certificate is
+      # imported right before the server invocation, the same import as
+      # desktop-macos's. It adds the keychain to the user search list, which
+      # is where the hook's `codesign --sign <identity>` finds the identity.
+      # The keychain is deleted right after the server invocation (below), and
+      # every step that runs third-party build code (the Rust toolchain
+      # install, the host-agent invocation) comes after that delete.
+      - name: Import Developer ID certificate
+        if: success() && needs.release-plan.outputs.ship_server == 'true'
+        env:
+          MACOS_CERTIFICATE_P12_BASE64: ${{ secrets.MACOS_CERTIFICATE_P12_BASE64 }}
+          MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+        run: |
+          set -euo pipefail
+          trap 'rm -f "$RUNNER_TEMP/cert.p12"' EXIT
+          kc="$RUNNER_TEMP/shed-server-signing.keychain-db"
+          kp="$(openssl rand -base64 24)"
+          security create-keychain -p "$kp" "$kc"
+          security set-keychain-settings -lut 21600 "$kc"
+          security unlock-keychain -p "$kp" "$kc"
+          echo "$MACOS_CERTIFICATE_P12_BASE64" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security import "$RUNNER_TEMP/cert.p12" -k "$kc" -P "$MACOS_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$kp" "$kc"
+          # shellcheck disable=SC2046
+          security list-keychains -d user -s "$kc" $(security list-keychains -d user | sed 's/"//g')
+          rm -f "$RUNNER_TEMP/cert.p12"
+
       - name: Run GoReleaser (server)
         if: success() && needs.release-plan.outputs.ship_server == 'true'
         uses: goreleaser/goreleaser-action@v7
@@ -771,6 +938,62 @@ jobs:
           # App-minted token instead of a PAT (one mint, reused by both
           # invocations — token TTL 1h, the job runs well under it).
           HOMEBREW_TAP_TOKEN: ${{ steps.tap.outputs.token }}
+          # Read by scripts/release/macos-server-app.sh, the shed-server build
+          # hook: `required` makes it sign with this identity and refuse
+          # anything but a timestamped Developer ID signature from this team,
+          # so an unsigned or ad hoc ShedServer.app can never ship.
+          SHED_SERVER_SIGNING: required
+          SHED_SERVER_SIGN_IDENTITY: ${{ secrets.SHED_DESKTOP_DEVELOPER_ID_IDENTITY }}
+          SHED_SERVER_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+
+      # Right after the server invocation, whatever its outcome. No third-party
+      # build code runs while the certificate is imported: the two steps that
+      # run it, the Rust toolchain install (`cargo install` runs dependency
+      # build scripts, `brew install` formula code) and the host-agent
+      # invocation (cargo zigbuild runs build.rs), come after this delete.
+      # What runs before it is trusted at the release workflow's level: the
+      # actions this job uses, and the repo's own code (tests, lint, release
+      # notes, the server build) with the go.sum-pinned modules the shipped
+      # binaries link. A no-op when the server did not ship (nothing was
+      # imported). If the delete itself fails, the later steps' success()
+      # skips them.
+      - name: Delete signing keychain
+        if: always()
+        run: |
+          set -euo pipefail
+          rm -f "$RUNNER_TEMP/cert.p12"
+          kc="$RUNNER_TEMP/shed-server-signing.keychain-db"
+          if [ -f "$kc" ]; then
+            security delete-keychain "$kc"
+          fi
+
+      # Rust + cross tooling for `builder: rust` (mirrors release-snapshot).
+      # goreleaser's rust builder shells out to `cargo zigbuild`, needing zig +
+      # cargo-zigbuild; it auto-runs `rustup target add`, but pre-adding fails
+      # fast if a target is unavailable. The build env SHED_HOST_AGENT_VERSION=
+      # {{ .Version }} lives in .goreleaser.host-agent.yaml, so it applies
+      # identically to the snapshot and this release — no per-job version
+      # munging.
+      # Only needed when the RUST component ships (the server config is pure Go)
+      # — skipping saves ~3 min on server-only tags.
+      # It runs here, after the signing keychain is deleted, not up front: its
+      # `cargo install` runs dependency build scripts, which must not run while
+      # the certificate is imported (plan 028, #304). ci.yml's release-snapshot
+      # installs it first; that job imports no certificate, so its order there
+      # does not matter.
+      - name: Rust toolchain + zig cross tooling
+        if: success() && needs.release-plan.outputs.ship_host_agent == 'true'
+        run: |
+          # Kept byte-identical to ci.yml's release-snapshot step (see the note
+          # there): explicit rustfmt+clippy (rust-toolchain.toml declares them),
+          # and cargo-zigbuild pinned to the validated version. zig is brew-current;
+          # a zig bump is a loud failure caught by release-snapshot pre-tag.
+          rustup toolchain install stable --profile minimal --component rustfmt --component clippy
+          rustup default stable
+          rustup target add aarch64-apple-darwin x86_64-apple-darwin \
+                            aarch64-unknown-linux-gnu x86_64-unknown-linux-gnu
+          brew install zig
+          cargo install --locked --version 0.23.0 cargo-zigbuild
 
       - name: Run GoReleaser (host-agent)
         if: success() && needs.release-plan.outputs.ship_host_agent == 'true'

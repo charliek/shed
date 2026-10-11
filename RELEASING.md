@@ -297,20 +297,41 @@ fails, and the seam is proven ignored without the self-test flag.
    `desktop/RELEASING.md`). The image chain keeps its strict dependency
    ordering:
 
+   **Server signing, before anything publishes** (plan 028, #304; tag
+   pushes that ship `server`). On macOS, `shed-server` ships inside a
+   Developer ID signed `ShedServer.app`, signed by the goreleaser build
+   hook `scripts/release/macos-server-app.sh`. The release fails closed
+   without that signature:
+   - The `release-plan` job runs `scripts/release/server-signing-gate.sh`
+     right after the desktop gate. A server tag without the four signing
+     secrets (see "Secrets") fails there. A prerelease fails too: the
+     server has no ad hoc release path.
+   - **`server-signing-preflight`** (`macos-latest`, needs `release-plan`)
+     imports the certificate into a throwaway keychain and signs a
+     scratch binary the way the hook signs `shed-server`, `--timestamp`
+     included. It then runs the hook's required checks (`--verify`:
+     Developer ID authority, Team ID, secure timestamp, designated
+     requirement, entitlements). A bad certificate, password, identity
+     string or team, or an unreachable timestamp server, fails here.
+     Every image job and `release` need it.
+   - A `workflow_dispatch` republish signs nothing, so it skips both,
+     and the image jobs accept the skipped preflight. On a tag push they
+     run only after it succeeded.
+
    **`publish-build-tools`** (`ubuntu-latest`, multi-arch, `if:
-   ship_server`):
+   ship_server`, needs `server-signing-preflight`):
    - Builds + pushes `ghcr.io/charliek/shed-build-tools:vX.Y.Z` (and
      `:latest`) for `linux/amd64` + `linux/arm64`. The downstream
      image-publish jobs FROM/docker-run this image during their builds,
      so it must exist on ghcr.io before they start.
 
-   **`publish-vz`** (`ubuntu-24.04-arm`, needs build-tools; transitively
-   gated on `ship_server`):
+   **`publish-vz`** (`ubuntu-24.04-arm`, needs build-tools and the
+   preflight; transitively gated on `ship_server`):
    - Builds shed-overlay initramfs + 3 OCI images
      (`shed-vz-{base,extensions,full}` arm64), pushes to ghcr.io.
 
-   **`publish-fc`** (`ubuntu-latest`, needs build-tools; transitively
-   gated on `ship_server`):
+   **`publish-fc`** (`ubuntu-latest`, needs build-tools and the
+   preflight; transitively gated on `ship_server`):
    - Same as `publish-vz` but for `linux/amd64` Firecracker images.
      Runs in parallel with `publish-vz`.
 
@@ -321,9 +342,11 @@ fails, and the seam is proven ignored without the self-test flag.
      for the matching local script).
 
    **`release`** (`macos-latest`; needs `release-plan` +
+   `server-signing-preflight` +
    `publish-build-tools`/`publish-vz`/`publish-fc`/`smoke`; tag-push
    only; `if: ship_goreleaser`, and — when `ship_server` — additionally
-   requires all four image/smoke jobs to have `== 'success'`):
+   requires the preflight and all four image/smoke jobs to have
+   `== 'success'`):
    - Runs `go test ./...` + golangci-lint (unconditional — every
      goreleaser-shipping tag exercises the Go test suite, not just
      server tags).
@@ -336,13 +359,32 @@ fails, and the seam is proven ignored without the self-test flag.
      - `.goreleaser.server.yaml` — 3 Go binaries × OS/arch matrix with
        ldflag versioning, `checksums-server.txt`, `Formula/shed.rb`
        (pushed to homebrew-tap), `shed-server_*.deb` (via nfpm).
+       The step right before it imports the Developer ID certificate
+       into a throwaway keychain, and the invocation runs with
+       `SHED_SERVER_SIGNING=required`. The build hook therefore signs
+       the darwin `shed-server` and `ShedServer.app` with that identity,
+       and refuses anything but a timestamped Developer ID signature from
+       the team. The step right after it deletes the keychain, whatever
+       the outcome.
      - `.goreleaser.host-agent.yaml` — the Rust `shed-host-agent`
        binary (`builder: rust`, via `cargo zigbuild`), a GH linux
        tarball, `checksums-host-agent.txt`, `Formula/shed-host-agent.rb`
        — **no `.deb`**, brew-only. See "Host-agent" below.
      - The Rust toolchain + zig install step is gated on
        `ship_host_agent`, so a pure-Go server-only tag skips
-       it (~3 min).
+       it (~3 min). It runs right before the host-agent invocation,
+       after the keychain delete, not at the start of the job.
+     - **No third-party build code runs while the certificate is
+       imported.** The two steps that run it, the Rust toolchain install
+       (`cargo install` runs dependency build scripts) and the
+       host-agent invocation (`cargo zigbuild` runs `build.rs`), both
+       follow the keychain delete, and a failed delete skips them. What
+       runs earlier in the job is trusted at the release workflow's
+       level: the actions it uses, and the repo's own code (tests, lint,
+       release notes, the server build) with the `go.sum`-pinned modules
+       the shipped binaries link. `release-scripts-test.sh` fails if
+       either step, or any step running `cargo`, `rustup` or `brew`,
+       moves before the delete.
      - Both share `release.mode: keep-existing` +
        `release.replace_existing_artifacts: true`, identical
        `changelog`/`prerelease: auto`/`project_name: shed`. **The FIRST
@@ -540,6 +582,32 @@ against the in-progress build-tools image without colliding with the
 brew/.deb production server. See `make help` for details — not a
 release-time concern.
 
+## Server signing dry run
+
+`.github/workflows/server-signing-dry-run.yml` builds the server
+component as the release job does, Developer ID signed, and publishes
+nothing. It runs a goreleaser snapshot (`--skip=publish`) with
+`SHED_SERVER_SIGNING=required`, then re-runs the hook's required checks
+on each extracted darwin `shed-homebrew` tarball (the bundle, its
+executable and the standalone `shed-server`). It prints each signature
+and designated requirement, and uploads the darwin tarballs as an
+artifact for 3 days.
+
+Run it after any change to the server's signing (the hook, the
+goreleaser build or archive config, the entitlements, the certificate)
+or to the brew formula, and before tagging a release that ships it:
+
+```bash
+gh workflow run server-signing-dry-run.yml -R charliek/shed --ref main
+```
+
+The job runs only on `main`. That is workflow logic, not a secret
+boundary: anyone who can push a workflow and dispatch it can reach the
+repository secrets, as with the tag-triggered jobs. Two runs a few
+minutes apart give two builds with different CDHashes and the same
+designated requirement, which is what a Homebrew upgrade test of the
+"grant once" behavior needs.
+
 ## Secrets
 
 | Secret | Purpose | Required? |
@@ -548,6 +616,16 @@ release-time concern.
 | `RELEASE_BOT_APP_KEY` | App private key (.pem) | required |
 | `GITHUB_TOKEN` (workflow-provided) | All 3 Docker push jobs (build-tools, VZ, FC) to ghcr.io as `${{ github.actor }}` | provided automatically; do not set |
 | Desktop secrets (six `CAN_NOTARIZE` + `SPARKLE_ED_PRIVATE_KEY`) | Desktop release leg — see [`desktop/RELEASING.md`](desktop/RELEASING.md) | required for every stable desktop tag: without the six, the desktop signing gate fails the `release-plan` job before anything publishes |
+| Server signing: `MACOS_CERTIFICATE_P12_BASE64`, `MACOS_CERTIFICATE_PASSWORD`, `SHED_DESKTOP_DEVELOPER_ID_IDENTITY`, `APPLE_TEAM_ID` | Developer ID signing of `ShedServer.app` and the darwin `shed-server` (plan 028, #304). Four of the desktop's six: the same certificate, no notarization | required for every server tag: without them the server signing gate fails the `release-plan` job before anything publishes |
+
+The server shares the desktop's Developer ID Application certificate.
+macOS keys a user's external-drive grant on the bundle ID plus the
+designated requirement, which names the identifier and the Team ID. A
+renewed or rotated certificate from the same team therefore keeps
+users' grants; a different team makes every user answer the prompt once
+more. Confirm all four with `gh secret list -R charliek/shed` before
+tagging a server release: the local `release-plan.sh` run can't see
+repository secrets.
 
 Retired (deleted from `gh secret list -R charliek/shed` during the
 convention adoption):
@@ -605,6 +683,9 @@ Run workflow). Each block must print the expected repo name.
 |---|---|---|
 | `git push` rejected from local | Pusher not in ruleset bypass | Confirm App + admin role in `main`'s ruleset `bypass_actors` |
 | `release-plan` job fails with "a stable desktop tag requires Developer ID signing and notarization; missing: …" | One or more of the six Apple secrets is unset (the desktop signing gate) | Add the named secrets (see [`desktop/RELEASING.md`](desktop/RELEASING.md), Secrets), then re-run the failed run: nothing has published, so the tag stands. An unsigned rehearsal needs a prerelease (`-rc.N`) tag instead |
+| `release-plan` job fails with "a server tag requires a Developer ID signed ShedServer.app; missing: …" | One or more of the four server signing secrets is unset (the server signing gate) | Add the named secrets (see "Secrets"), then re-run the failed run: nothing has published, so the tag stands |
+| `server-signing-preflight` fails (import, `codesign` or `macos-server-app.sh --verify`) | The certificate, its password, the identity string or the team doesn't match, the certificate expired, or Apple's timestamp server was unreachable | Fix the secret, then re-run the failed jobs: no image job has started, so the tag stands. A timestamp failure usually passes on a plain re-run |
+| `Run GoReleaser (server)` fails in the `macos-server-app.sh` build hook | A signing failure the preflight didn't catch. The images are already published, but no server artifact, formula or deb is | Fix the cause, then re-run the failed `release` job (see "GoReleaser failed after some artifacts uploaded") |
 | `release-plan` job fails with "tag matches NO component manifest" (or a Ships cross-check mismatch) | A manifest wasn't bumped before tagging (forgotten `update-version.sh --components ...`), the CHANGELOG `**Ships:**` line disagrees with the manifests, or the tag was created against the wrong commit | Don't force-fix in CI — re-run `/release-workflows:release` against a corrected tag. This is exactly what the mandatory local `scripts/release/release-plan.sh` pre-tag run (see "Recommend + confirm") is meant to catch before the tag ever gets pushed |
 | GoReleaser fails at `brews` with `Bad credentials` | `RELEASE_BOT_CLIENT_ID` unset OR App not installed on `homebrew-tap` | Verify via `sanity-check-app.yml`'s homebrew-tap block; install the App on the tap |
 | apt-charliek dispatch fails after 3 retries | App not installed on `charliek/apt-charliek` OR scope mismatch | Verify via `sanity-check-app.yml`'s apt-charliek block; check `RELEASE_BOT_APP_KEY` is the current `.pem` |
@@ -633,6 +714,14 @@ re-uploads **its own** component's assets, replacing any it had already
 uploaded before the failure rather than erroring on `already_exists`.
 An invocation that never got to run in the failed attempt runs fresh, as
 normal.
+
+**A signing failure in the server build hook** is the one release-only
+failure the gate and the preflight can't rule out. It happens after the
+images are published but before goreleaser uploads any server artifact,
+formula or deb. Fix the cause and re-run the failed `release` job as
+above: the rerun imports the certificate again and rebuilds the server
+from scratch. To check a fix without a tag, run the server signing dry
+run first.
 
 **Checksums note (no mixed state)**: a release's goreleaser assets are
 never a *mix* of legacy and per-component checksums. The `release` job is
@@ -738,8 +827,8 @@ in the framework repo.
   confirm") exists so this rejection is caught pre-tag, not post-tag.
 - **GoReleaser pin**: `goreleaser-action@v7` is pinned to `version:
   v2.15.3` everywhere it's invoked (the `release` job here, ci.yml's
-  `release-snapshot` job, and `.mise.toml` for local
-  `make snapshot-server` / `make snapshot-host-agent` runs) — the
+  `release-snapshot` job, `server-signing-dry-run.yml`, and `.mise.toml`
+  for local `make snapshot-server` / `make snapshot-host-agent` runs) — the
   split-config model was spiked and proven against this line. v2.15.3
   ships the secret-redaction fix that prevents secrets from leaking
   into logs, so it's the security floor;
@@ -757,7 +846,9 @@ in the framework repo.
   referenced ghcr images exist, because the binary hard-fails on
   missing `io.shed.rootfs.erofs.digest` if it tries to pull an image
   the apt deb references but ghcr doesn't have yet. The dependency
-  chain `build-tools → vz+fc → smoke → release` enforces that.
+  chain `build-tools → vz+fc → smoke → release` enforces that. The
+  server signing preflight sits in front of the whole chain, so a
+  signing problem stops a server tag before any image publishes.
 - **`scripts/set-version.sh` is preserved**: the convention's
   `scripts/release/update-version.sh` delegates to it (with a
   jq-verify wrap), so the in-repo bumper isn't duplicated.

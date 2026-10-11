@@ -9,6 +9,9 @@
 #   scripts/release/changelog-section.sh     (the curated release body)
 #   scripts/release/macos-server-app.sh      (the darwin shed-server signing +
 #                                             ShedServer.app hook, plan 028 D4)
+#   scripts/release/server-signing-gate.sh   (a server tag fails closed
+#                                             without the four Developer ID
+#                                             secrets, plan 028 D4)
 #
 # Runs every synthetic combination the release model depends on — per-component
 # (server / host-agent / desktop) and combined plans / neither→exit 1 /
@@ -63,6 +66,16 @@
 # an ad hoc, wrong-team, untimestamped or over-entitled signature); the
 # positive ad hoc and Developer ID stagings; and the standalone --verify.
 #
+# Phase 7 (plan 028 D4, #304) runs server-signing-gate.sh as deployed and
+# extends Phase 5's wiring guard to the server's release signing: the
+# release-plan gate step (its four flags, its tag-push condition, right after
+# the desktop gate), the server-signing-preflight job and the skipped-vs-failed
+# conditions every image job and `release` put on it, the release job's
+# certificate import / signing env / keychain delete between the server and
+# host-agent goreleaser steps, and server-signing-dry-run.yml. Mutated copies
+# prove each rule bites; the gate step and the preflight's signing step are
+# EXECUTED (the latter against Phase 6's stub codesign/plutil).
+#
 # Wired into CI as a step of ci.yml's `plugin` job (gated go||ci; the `ci`
 # path filter includes scripts/release/**, so editing these scripts always
 # runs this test).
@@ -99,8 +112,10 @@ tar -C "${REPO_ROOT}" -cf - \
   scripts/release/desktop-signing-gate.sh \
   scripts/release/changelog-section.sh \
   scripts/release/macos-server-app.sh \
+  scripts/release/server-signing-gate.sh \
   internal/vz/entitlements.plist \
   .github/workflows/publish-images.yaml \
+  .github/workflows/server-signing-dry-run.yml \
   craze-pin.env \
   .claude-plugin/plugin.json \
   desktop/VERSION \
@@ -1367,10 +1382,16 @@ ok "sentinel in the six env vars: ignored (exit 1 from the flags alone), never e
 # ---------------------------------------------------------------------------
 # The wiring guard: publish-images.yaml must CALL the gate (testing a copied
 # snippet would not prove that). One python3 helper, written to its own dir:
-#   check <workflow> <gate-script>  → exit 0, or 1 listing every violation
+#   check <workflow> <gate-script> <server-gate-script> <dry-run-workflow>
+#                                   → exit 0, or 1 listing every violation
+#                                     (the server's signing wiring, Phase 7,
+#                                     included)
 #   mutate <in> <out> <mutation>    → a structurally mutated copy (as JSON,
 #                                     which both loaders read) for the
-#                                     negative cells below
+#                                     negative cells below (mutate-dry: the
+#                                     same for the dry-run workflow)
+#   extract… <workflow> …           → a step's run script (and env), rendered
+#                                     as GitHub would, for the execution cells
 # ---------------------------------------------------------------------------
 WIRING_DIR="${SCRATCH}/wiring"
 mkdir -p "${WIRING_DIR}"
@@ -1384,13 +1405,17 @@ import subprocess
 import sys
 
 GATE = "scripts/release/desktop-signing-gate.sh"
+SERVER_GATE = "scripts/release/server-signing-gate.sh"
 TAG_EXPR = "github.event.inputs.version || github.ref_name"
 RP_IF = "steps.plan.outputs.ship_desktop == 'true'"
 # One `--has NAME=${{ secrets.NAME != '' }}` flag: FLAG captures both names,
 # FLAG_NC is the same pattern without groups, for the whole-line match.
 FLAG = r"--has ([A-Z0-9_]+)=\$\{\{ secrets\.([A-Z0-9_]+) != '' \}\}"
 FLAG_NC = r"--has [A-Z0-9_]+=\$\{\{ secrets\.[A-Z0-9_]+ != '' \}\}"
-LINE_RE = re.compile(re.escape(GATE) + r' "\$\{TAG\}"((?: ' + FLAG_NC + r")+)")
+
+
+def line_re(gate):
+    return re.compile(re.escape(gate) + r' "\$\{TAG\}"((?: ' + FLAG_NC + r")+)")
 
 
 def load(path):
@@ -1420,27 +1445,32 @@ def expr(value):
     return m.group(1) if m else e
 
 
-def gate_lines(step):
+def gate_lines(step, gate=GATE):
     """Lines of the step's run that execute the gate, continuations joined."""
     run = re.sub(r"[ \t]*\\\n[ \t]*", " ", step.get("run") or "")
-    return [l.strip() for l in run.splitlines() if l.strip().startswith(GATE + " ")]
+    return [l.strip() for l in run.splitlines() if l.strip().startswith(gate + " ")]
 
 
-def gate_indices(steps):
-    return [i for i, s in enumerate(steps) if gate_lines(s)]
+def gate_indices(steps, gate=GATE):
+    return [i for i, s in enumerate(steps) if gate_lines(s, gate)]
 
 
 OPENERS = ("if", "case", "for", "while", "until", "select", "{", "(")
 CLOSERS = ("fi", "esac", "done", "}", ")")
-# The gate called behind a control operator on the same line (`true || gate`,
-# `false && gate`, `x; gate`, `x | gate`): a call that may never run, or whose
-# status is lost. The `[ ! -f <gate> ]` test and the messages naming the gate
-# never put it right after one of these.
-BEHIND_OPERATOR = re.compile(r"(\|\||&&|;|\|)\s*\"?" + re.escape(GATE) + r"\b")
+
+
+def behind_re(gate):
+    """The gate called behind a control operator on the same line (`true ||
+    gate`, `false && gate`, `x; gate`, `x | gate`): a call that may never run,
+    or whose status is lost. The `[ ! -f <gate> ]` test and the messages naming
+    the gate never put it right after one of these."""
+    return re.compile(r"(\|\||&&|;|\|)\s*\"?" + re.escape(gate) + r"\b")
+
+
 SET_PLUS_E = re.compile(r"(?m)^\s*set\s+(?:-\w*\s+)*\+\w*e|^\s*set\s+\+o\s+errexit\b")
 
 
-def unreachable(step):
+def unreachable(step, gate=GATE):
     """Why the gate line may not run as a top-level command, or None.
 
     The rule fits these steps' shape: the invocation line BEGINS with the gate
@@ -1459,13 +1489,13 @@ def unreachable(step):
     run = step.get("run") or ""
     if SET_PLUS_E.search(run):
         return "the step turns errexit off (`set +e`), so a refusal could be ignored"
-    if BEHIND_OPERATOR.search(run):
+    if behind_re(gate).search(run):
         return "the gate is called behind `||`/`&&`/`;`/`|` on its line, not at the start of a command"
     depth, cont, prev = 0, False, ""
     for raw in run.splitlines():
         line = raw.rstrip()
         text = line.strip()
-        if text.startswith(GATE + " "):
+        if text.startswith(gate + " "):
             if cont or prev.endswith(("||", "&&", "|", "\\")):
                 return "the line before the gate line ends with %r, so the gate is the tail of another command" % prev.split()[-1]
             if raw[:1] in (" ", "\t"):
@@ -1493,14 +1523,14 @@ PRE_CHECKOUT_ALLOWED = (
 )
 
 
-def check_invocation(errors, where, step, job, six):
-    lines = gate_lines(step)
+def check_invocation(errors, where, step, job, six, gate=GATE, which="CAN_NOTARIZE's six"):
+    lines = gate_lines(step, gate)
     if len(lines) != 1:
         errors.append("%s: %d lines run the gate (want exactly 1)" % (where, len(lines)))
         return
-    m = LINE_RE.fullmatch(lines[0])
+    m = line_re(gate).fullmatch(lines[0])
     if not m:
-        errors.append("%s: the gate line is not exactly %s \"${TAG}\" followed by --has NAME=${{ secrets.NAME != '' }} flags, with nothing after them: %s" % (where, GATE, lines[0]))
+        errors.append("%s: the gate line is not exactly %s \"${TAG}\" followed by --has NAME=${{ secrets.NAME != '' }} flags, with nothing after them: %s" % (where, gate, lines[0]))
         return
     pairs = re.findall(FLAG, m.group(1))
     for name, secret in pairs:
@@ -1508,25 +1538,289 @@ def check_invocation(errors, where, step, job, six):
             errors.append("%s: --has %s is built from secrets.%s" % (where, name, secret))
     names = [n for n, _ in pairs]
     if sorted(names) != sorted(six) or len(set(names)) != len(names):
-        errors.append("%s: --has flags %s are not CAN_NOTARIZE's six %s" % (where, names, six))
+        errors.append("%s: --has flags %s are not %s %s" % (where, names, which, six))
     tag = (step.get("env") or {}).get("TAG", (job.get("env") or {}).get("TAG"))
     if tag is None or expr(tag) != TAG_EXPR:
         errors.append("%s: TAG is %r, not ${{ %s }}" % (where, tag, TAG_EXPR))
     if step.get("continue-on-error") not in (None, False):
         errors.append("%s: continue-on-error would let a refusal pass" % where)
-    why = unreachable(step)
+    why = unreachable(step, gate)
     if why:
         errors.append("%s: the gate may never run: %s" % (where, why))
 
 
-def behind_operator(errors, where, steps):
+def behind_operator(errors, where, steps, gate=GATE):
     """Every step, gate step or not: the invocation line must BEGIN with the gate."""
     for j, s in enumerate(steps):
-        if BEHIND_OPERATOR.search(s.get("run") or ""):
+        if behind_re(gate).search(s.get("run") or ""):
             errors.append("%s: step %d calls the gate behind `||`/`&&`/`;`/`|`; the invocation line must BEGIN with the gate" % (where, j))
 
 
-def check(path, gate_script):
+# --- the server's release signing (plan 028 D4, #304) ----------------------
+PREFLIGHT = "server-signing-preflight"
+IMPORT_STEP = "Import Developer ID certificate"
+DELETE_STEP = "Delete signing keychain"
+KEYCHAIN = "shed-server-signing.keychain-db"
+SERVER_RP_IF = "steps.plan.outputs.ship_server == 'true' && github.event_name == 'push'"
+PREFLIGHT_IF = "needs.release-plan.outputs.ship_server == 'true' && github.event_name == 'push'"
+# A skipped preflight passes only off a tag push (a workflow_dispatch image
+# republish); a failed or cancelled one, or one skipped on a tag push, blocks.
+PF_OK = ("(needs.server-signing-preflight.result == 'success' || "
+         "(github.event_name != 'push' && needs.server-signing-preflight.result == 'skipped'))")
+IMAGE_IFS = {
+    "publish-build-tools": "!cancelled() && needs.release-plan.result == 'success' && "
+                           "needs.release-plan.outputs.ship_server == 'true' && " + PF_OK,
+    "publish-vz": "!cancelled() && needs.publish-build-tools.result == 'success' && " + PF_OK,
+    "publish-fc": "!cancelled() && needs.publish-build-tools.result == 'success' && " + PF_OK,
+}
+RELEASE_IF = ("!cancelled() && github.event_name == 'push' && startsWith(github.ref, 'refs/tags/') && "
+              "needs.release-plan.result == 'success' && needs.release-plan.outputs.ship_goreleaser == 'true' && "
+              "(needs.release-plan.outputs.ship_server != 'true' || "
+              "(needs.server-signing-preflight.result == 'success' && "
+              "needs.publish-build-tools.result == 'success' && needs.publish-vz.result == 'success' && "
+              "needs.publish-fc.result == 'success' && needs.smoke.result == 'success'))")
+SIGN_ENV = {
+    "SHED_SERVER_SIGNING": "required",
+    "SHED_SERVER_SIGN_IDENTITY": "${{ secrets.SHED_DESKTOP_DEVELOPER_ID_IDENTITY }}",
+    "SHED_SERVER_TEAM_ID": "${{ secrets.APPLE_TEAM_ID }}",
+}
+IMPORT_ENV = {
+    "MACOS_CERTIFICATE_P12_BASE64": "${{ secrets.MACOS_CERTIFICATE_P12_BASE64 }}",
+    "MACOS_CERTIFICATE_PASSWORD": "${{ secrets.MACOS_CERTIFICATE_PASSWORD }}",
+}
+DRY_RUN_ARGS = "release --snapshot --clean --skip=publish -f .goreleaser.server.yaml"
+# The release job's Rust install: its `cargo install` runs third-party build
+# scripts, so it (like every step running cargo, rustup or brew) must come
+# after the keychain delete, and only on success() (a failed delete skips it).
+RUST_STEP = "Rust toolchain + zig cross tooling"
+RUST_IF = "success() && needs.release-plan.outputs.ship_host_agent == 'true'"
+INSTALLER = re.compile(r"(?m)^[^#\n]*\b(cargo|rustup|brew)\b")
+
+
+def as_list(v):
+    return [v] if isinstance(v, str) else list(v or [])
+
+
+def joined(run):
+    return re.sub(r"[ \t]*\\\n[ \t]*", " ", run or "")
+
+
+def secrets_in(obj):
+    return set(re.findall(r"secrets\.([A-Z0-9_]+)", json.dumps(obj, default=str)))
+
+
+def named(steps, name):
+    return [i for i, s in enumerate(steps) if s.get("name") == name]
+
+
+def env_is(errors, where, step, want):
+    got = {k: " ".join(str(v).split()) for k, v in (step.get("env") or {}).items()}
+    if got != want:
+        errors.append("%s: env is %s, want exactly %s" % (where, got, want))
+
+
+def no_continue(errors, where, what, step):
+    if step.get("continue-on-error") not in (None, False):
+        errors.append("%s: the %s has continue-on-error, which would let its failure pass" % (where, what))
+
+
+def keychain_steps(errors, where, steps, before):
+    """The import step (exactly one, before index `before`) and the delete step
+    (exactly one, right after `before`, `if: always()`), as (import, delete).
+    None of the three (import, signing step, delete) may continue on error."""
+    imp, dele = named(steps, IMPORT_STEP), named(steps, DELETE_STEP)
+    if len(imp) != 1 or len(dele) != 1:
+        errors.append("%s: %d %r and %d %r steps (want exactly 1 each)" % (where, len(imp), IMPORT_STEP, len(dele), DELETE_STEP))
+        return None
+    i, d = imp[0], dele[0]
+    for what, k in (("certificate import", i), ("signing step", before), ("keychain delete", d)):
+        no_continue(errors, where, what, steps[k])
+    if i >= before:
+        errors.append("%s: the certificate import (step %d) is not before the signing step (step %d)" % (where, i, before))
+    if d != before + 1:
+        errors.append("%s: the keychain delete is step %d, not right after the signing step (step %d)" % (where, d, before))
+    if expr(steps[d].get("if", "")) != "always()":
+        errors.append("%s: the keychain delete's if is %r, not always()" % (where, steps[d].get("if")))
+    env_is(errors, where + " import", steps[i], IMPORT_ENV)
+    if KEYCHAIN not in (steps[i].get("run") or "") or "security delete-keychain" not in (steps[d].get("run") or ""):
+        errors.append("%s: the import does not create %s, or the delete does not run security delete-keychain" % (where, KEYCHAIN))
+    return steps[i], steps[d]
+
+
+def check_server(errors, wf, server_script, dry_path):
+    jobs = wf.get("jobs") or {}
+    with open(server_script) as f:
+        m = re.search(r'^NAMES="([^"]*)"', f.read(), re.M)
+    four = m.group(1).split() if m else []
+    if len(four) != 4 or len(set(four)) != 4:
+        errors.append("%s: NAMES is not four distinct secrets: %s" % (SERVER_GATE, four))
+
+    # The release-plan gate step: once, right after the desktop gate, on a tag
+    # push that ships server, with the four flags.
+    rp = jobs.get("release-plan") or {}
+    steps = rp.get("steps") or []
+    where = "release-plan (server gate)"
+    behind_operator(errors, where, steps, SERVER_GATE)
+    found, desktop = gate_indices(steps, SERVER_GATE), gate_indices(steps)
+    if len(found) != 1:
+        errors.append("%s: %d steps run the server gate (want exactly 1)" % (where, len(found)))
+    else:
+        i = found[0]
+        if len(desktop) != 1 or i != desktop[0] + 1:
+            errors.append("%s: the server gate is step %d, not right after the desktop gate (steps %s)" % (where, i, desktop))
+        if expr(steps[i].get("if", "")) != SERVER_RP_IF:
+            errors.append("%s: the server gate step's if is %r, not %r" % (where, steps[i].get("if"), SERVER_RP_IF))
+        check_invocation(errors, where, steps[i], rp, four, SERVER_GATE, "the server gate's four")
+
+    # The preflight: tag push + ship_server, after release-plan; imports the
+    # cert, signs a scratch binary the way the hook does and runs the hook's
+    # --verify under required signing, then always deletes the keychain. Its
+    # secrets are step-scoped and are exactly the gate's four.
+    pf = jobs.get(PREFLIGHT)
+    where = PREFLIGHT
+    if not pf:
+        errors.append("%s: no such job" % where)
+    else:
+        if as_list(pf.get("needs")) != ["release-plan"]:
+            errors.append("%s: needs is %r, not release-plan" % (where, pf.get("needs")))
+        if expr(pf.get("if", "")) != PREFLIGHT_IF:
+            errors.append("%s: if is %r, not %r" % (where, pf.get("if"), PREFLIGHT_IF))
+        if pf.get("runs-on") != "macos-latest":
+            errors.append("%s: runs-on is %r, not macos-latest" % (where, pf.get("runs-on")))
+        if secrets_in(pf.get("env")):
+            errors.append("%s: job-level env reads secrets; keep them step-scoped" % where)
+        if secrets_in(pf) != set(four):
+            errors.append("%s: reads secrets %s, not exactly the gate's four %s" % (where, sorted(secrets_in(pf)), four))
+        no_continue(errors, where, "job", pf)
+        steps = pf.get("steps") or []
+        sign = [i for i, s in enumerate(steps) if "scripts/release/macos-server-app.sh --verify" in (s.get("run") or "")]
+        if len(sign) != 1:
+            errors.append("%s: %d steps run macos-server-app.sh --verify (want exactly 1)" % (where, len(sign)))
+        else:
+            s = steps[sign[0]]
+            run = joined(s.get("run"))
+            for want in ("codesign --force --sign \"$SHED_SERVER_SIGN_IDENTITY\"", "--identifier ai.stridelabs.shed-server",
+                         "--entitlements internal/vz/entitlements.plist", "--timestamp"):
+                if want not in run:
+                    errors.append("%s: the scratch signature lacks %s" % (where, want))
+            env_is(errors, where + " sign step", s, SIGN_ENV)
+            # No if at all: it runs exactly when the import succeeded (the
+            # implicit success()), so an `if: false` cannot skip the proof.
+            if "if" in s:
+                errors.append("%s: the sign step has an if (%r); it must run whenever the import succeeded" % (where, s["if"]))
+            if keychain_steps(errors, where, steps, sign[0]) and sign[0] + 1 != len(steps) - 1:
+                errors.append("%s: the keychain delete is not the last step" % where)
+
+    # Every image job needs the preflight, with the skipped-vs-failed rule.
+    for job, want in sorted(IMAGE_IFS.items()):
+        j = jobs.get(job) or {}
+        if PREFLIGHT not in as_list(j.get("needs")):
+            errors.append("%s: needs %r does not list %s" % (job, j.get("needs"), PREFLIGHT))
+        if expr(j.get("if", "")) != want:
+            errors.append("%s: if is %r, not %r" % (job, expr(j.get("if", "")), want))
+
+    # The release job: needs the preflight; imports the cert right before the
+    # server goreleaser step (which gets the required-signing env) and deletes
+    # the keychain right after it, before the host-agent step; only those two
+    # steps read the signing secrets. No third-party build code runs while the
+    # cert is imported: the Rust toolchain step sits between the delete and
+    # the host-agent step, on success(), and no step before the delete runs
+    # cargo, rustup or brew.
+    rel = jobs.get("release") or {}
+    where = "release"
+    if PREFLIGHT not in as_list(rel.get("needs")):
+        errors.append("%s: needs %r does not list %s" % (where, rel.get("needs"), PREFLIGHT))
+    if expr(rel.get("if", "")) != RELEASE_IF:
+        errors.append("%s: if is %r, not %r" % (where, expr(rel.get("if", "")), RELEASE_IF))
+    steps = rel.get("steps") or []
+    srv = [i for i, s in enumerate(steps) if ".goreleaser.server.yaml" in str((s.get("with") or {}).get("args", ""))]
+    ha = [i for i, s in enumerate(steps) if ".goreleaser.host-agent.yaml" in str((s.get("with") or {}).get("args", ""))]
+    server_version = (steps[srv[0]].get("with") or {}).get("version") if len(srv) == 1 else None
+    if len(srv) != 1 or len(ha) != 1:
+        errors.append("%s: %d server and %d host-agent goreleaser steps (want 1 each)" % (where, len(srv), len(ha)))
+    else:
+        env = {k: v for k, v in (steps[srv[0]].get("env") or {}).items() if k in SIGN_ENV}
+        env_is(errors, where + " server goreleaser (signing)", {"env": env}, SIGN_ENV)
+        pair = keychain_steps(errors, where, steps, srv[0])
+        if pair:
+            imp = named(steps, IMPORT_STEP)[0]
+            if imp != srv[0] - 1:
+                errors.append("%s: the certificate import is step %d, not right before the server goreleaser step (%d)" % (where, imp, srv[0]))
+            if expr(steps[imp].get("if", "")) != "success() && needs.release-plan.outputs.ship_server == 'true'":
+                errors.append("%s: the certificate import's if is %r, not gated on ship_server" % (where, steps[imp].get("if")))
+            if not srv[0] + 1 < ha[0]:
+                errors.append("%s: the keychain delete is not before the host-agent goreleaser step" % where)
+            d = named(steps, DELETE_STEP)[0]
+            rust = named(steps, RUST_STEP)
+            if len(rust) != 1:
+                errors.append("%s: %d %r steps (want exactly 1)" % (where, len(rust), RUST_STEP))
+            else:
+                if not d < rust[0] < ha[0]:
+                    errors.append("%s: the Rust toolchain step is step %d, not after the keychain delete (step %d) and before the host-agent goreleaser step (step %d); its cargo install runs third-party build scripts" % (where, rust[0], d, ha[0]))
+                if expr(steps[rust[0]].get("if", "")) != RUST_IF:
+                    errors.append("%s: the Rust toolchain step's if is %r, not %r, so it could run after a failed keychain delete" % (where, steps[rust[0]].get("if"), RUST_IF))
+            early = [k for k, s in enumerate(steps[:d + 1]) if INSTALLER.search(s.get("run") or "")]
+            if early:
+                errors.append("%s: steps %s run cargo, rustup or brew before the keychain delete (step %d), while the certificate is imported" % (where, early, d))
+        if secrets_in(rel.get("env")) & set(four):
+            errors.append("%s: job-level env reads a signing secret; keep them step-scoped" % where)
+        readers = [i for i, s in enumerate(steps) if secrets_in(s) & set(four)]
+        if pair and readers != sorted([named(steps, IMPORT_STEP)[0], srv[0]]):
+            errors.append("%s: steps %s read the signing secrets; only the import and the server goreleaser step may" % (where, readers))
+
+    # server-signing-dry-run.yml: dispatch-only, read-only, main only; the
+    # release job's goreleaser version, snapshot without publishing, signed
+    # as required; the keychain deleted right after; the tarballs uploaded for
+    # 3 days.
+    dr, _ = load(dry_path)
+    where = "server-signing-dry-run.yml"
+    on = dr.get("on", dr.get(True))
+    if not isinstance(on, dict) or list(on) != ["workflow_dispatch"]:
+        errors.append("%s: on is %r, not workflow_dispatch alone" % (where, on))
+    if dr.get("permissions") != {"contents": "read"}:
+        errors.append("%s: permissions are %r, not contents: read" % (where, dr.get("permissions")))
+    djobs = list((dr.get("jobs") or {}).values())
+    if len(djobs) != 1:
+        errors.append("%s: %d jobs (want 1)" % (where, len(djobs)))
+    else:
+        dj = djobs[0]
+        if expr(dj.get("if", "")) != "github.ref == 'refs/heads/main'":
+            errors.append("%s: the job's if is %r, not github.ref == 'refs/heads/main'" % (where, dj.get("if")))
+        if "permissions" in dj:
+            errors.append("%s: the job sets its own permissions" % where)
+        if secrets_in(dj) != set(four):
+            errors.append("%s: reads secrets %s, not exactly the gate's four %s" % (where, sorted(secrets_in(dj)), four))
+        steps = dj.get("steps") or []
+        gr = [i for i, s in enumerate(steps) if str(s.get("uses", "")).startswith("goreleaser/goreleaser-action@")]
+        up = [i for i, s in enumerate(steps) if str(s.get("uses", "")).startswith("actions/upload-artifact@")]
+        ver = [i for i, s in enumerate(steps) if "scripts/release/macos-server-app.sh --verify" in (s.get("run") or "")]
+        if len(gr) != 1 or len(up) != 1 or len(ver) != 1:
+            errors.append("%s: %d goreleaser, %d upload and %d verify steps (want 1 each)" % (where, len(gr), len(up), len(ver)))
+        else:
+            g = steps[gr[0]].get("with") or {}
+            if g.get("args") != DRY_RUN_ARGS:
+                errors.append("%s: goreleaser args are %r, not %r" % (where, g.get("args"), DRY_RUN_ARGS))
+            if g.get("version") != server_version:
+                errors.append("%s: goreleaser version %r is not the release job's %r" % (where, g.get("version"), server_version))
+            env_is(errors, where + " goreleaser", steps[gr[0]], SIGN_ENV)
+            keychain_steps(errors, where, steps, gr[0])
+            if not gr[0] < ver[0] < up[0]:
+                errors.append("%s: the steps are not goreleaser, then verify, then upload" % where)
+            u = steps[up[0]].get("with") or {}
+            if str(u.get("retention-days")) != "3" or not re.fullmatch(r"dist/server/shed-homebrew_darwin_\*\.tar\.gz", str(u.get("path", ""))):
+                errors.append("%s: the upload is %r, not the darwin shed-homebrew tarballs for 3 days" % (where, u))
+        imports = [s for s in steps if s.get("name") == IMPORT_STEP]
+        deletes = [s for s in steps if s.get("name") == DELETE_STEP]
+        # The three copies of the import and the delete stay identical.
+        for job in (PREFLIGHT, "release"):
+            jsteps = (jobs.get(job) or {}).get("steps") or []
+            for name, mine in ((IMPORT_STEP, imports), (DELETE_STEP, deletes)):
+                theirs = [s.get("run") for s in jsteps if s.get("name") == name]
+                if mine and theirs and theirs != [mine[0].get("run")]:
+                    errors.append("%s: the %r step's run differs from %s's" % (where, name, job))
+
+
+def check(path, gate_script, server_script, dry_path):
     wf, loader = load(path)
     errors = []
     jobs = wf.get("jobs") or {}
@@ -1576,11 +1870,13 @@ def check(path, gate_script):
                 errors.append("desktop-macos: step %d (%s) runs before the checkout and the gate, and is not on PRE_CHECKOUT_ALLOWED" % (j, label or other.get("uses") or "unnamed"))
         check_invocation(errors, "desktop-macos", steps[i], dm, six)
 
+    check_server(errors, wf, server_script, dry_path)
+
     for e in errors:
         print("wiring: " + e)
     if errors:
         return 1
-    print("wiring OK (parsed with %s): release-plan runs the gate right after release-plan.sh when ship_desktop, desktop-macos right after its checkout, each with the six flags" % loader)
+    print("wiring OK (parsed with %s): release-plan runs the gate right after release-plan.sh when ship_desktop, desktop-macos right after its checkout, each with the six flags; the server gate follows the desktop gate on a server tag push, every image job and release need %s, and the signing keychain lives only around the server goreleaser step, with no cargo, rustup or brew before its delete" % (loader, PREFLIGHT))
     return 0
 
 
@@ -1654,19 +1950,149 @@ def mutate(src, dst, name):
             fi = next(k for k, l in enumerate(lines) if l == "fi")
             lines[fi:fi] = ["  " + l for l in block]
         s["run"] = "\n".join(lines)
-    else:
+    elif not mutate_server(jobs, name):
         sys.exit("mutate: unknown mutation %r" % name)
     with open(dst, "w") as f:
         json.dump(wf, f, indent=1, default=str)
     return 0
 
 
-def extract(src, job, dst, missing):
+def mutate_server(jobs, name):
+    """The server-signing mutations (plan 028 D4); False for an unknown name."""
+    rp = jobs["release-plan"]["steps"]
+    rel = jobs["release"]["steps"]
+
+    def server_gate():
+        found = gate_indices(rp, SERVER_GATE)
+        if len(found) != 1:
+            sys.exit("mutate %s: expected one server gate step, found %d" % (name, len(found)))
+        return found[0]
+
+    def by_name(steps, step_name):
+        found = named(steps, step_name)
+        if len(found) != 1:
+            sys.exit("mutate %s: expected one %r step, found %d" % (name, step_name, len(found)))
+        return found[0]
+
+    def goreleaser(config):
+        found = [i for i, s in enumerate(rel) if config in str((s.get("with") or {}).get("args", ""))]
+        if len(found) != 1:
+            sys.exit("mutate %s: expected one %s goreleaser step" % (name, config))
+        return found[0]
+
+    def replace_if(job, old, new):
+        cond = expr(jobs[job].get("if", ""))
+        if old not in cond:
+            sys.exit("mutate %s: %r is not in %s's if" % (name, old, job))
+        jobs[job]["if"] = cond.replace(old, new)
+
+    if name == "srv-delete":
+        del rp[server_gate()]
+    elif name == "srv-before-desktop":
+        step = rp.pop(server_gate())
+        rp.insert(gate_indices(rp)[0], step)
+    elif name == "srv-any-event":
+        rp[server_gate()]["if"] = "steps.plan.outputs.ship_server == 'true'"
+    elif name == "srv-drop-flag":
+        s = rp[server_gate()]
+        new = re.sub(r"[ \t]*\\\n[ \t]*--has APPLE_TEAM_ID=\$\{\{[^}]*\}\}", "", s["run"])
+        if new == s["run"]:
+            sys.exit("mutate srv-drop-flag: the flag was not found")
+        s["run"] = new
+    elif name == "pf-on-dispatch":
+        jobs[PREFLIGHT]["if"] = "needs.release-plan.outputs.ship_server == 'true'"
+    elif name == "pf-no-timestamp":
+        s = jobs[PREFLIGHT]["steps"][[i for i, s in enumerate(jobs[PREFLIGHT]["steps"]) if "--timestamp" in (s.get("run") or "")][0]]
+        s["run"] = s["run"].replace(" --timestamp", "")
+    elif name == "pf-job-secret":
+        jobs[PREFLIGHT]["env"] = {"SHED_SERVER_TEAM_ID": "${{ secrets.APPLE_TEAM_ID }}"}
+    elif name == "vz-no-preflight-need":
+        jobs["publish-vz"]["needs"] = "publish-build-tools"
+    elif name == "fc-implicit-success":
+        jobs["publish-fc"].pop("if")
+    elif name == "bt-skipped-on-push":
+        replace_if("publish-build-tools", PF_OK,
+                   "(needs.server-signing-preflight.result == 'success' || needs.server-signing-preflight.result == 'skipped')")
+    elif name == "bt-failed-ok":
+        replace_if("publish-build-tools", PF_OK, "needs.server-signing-preflight.result != 'cancelled'")
+    elif name == "rel-no-preflight":
+        replace_if("release", "needs.server-signing-preflight.result == 'success' && ", "")
+    elif name == "rel-import-early":
+        rel.insert(1, rel.pop(by_name(rel, IMPORT_STEP)))
+    elif name == "rel-delete-after-host-agent":
+        step = rel.pop(by_name(rel, DELETE_STEP))
+        rel.insert(goreleaser(".goreleaser.host-agent.yaml") + 1, step)
+    elif name == "rel-delete-on-success":
+        rel[by_name(rel, DELETE_STEP)]["if"] = "success()"
+    elif name == "rel-no-required":
+        rel[goreleaser(".goreleaser.server.yaml")]["env"].pop("SHED_SERVER_SIGNING")
+    elif name == "rel-identity-to-host-agent":
+        rel[goreleaser(".goreleaser.host-agent.yaml")]["env"]["SHED_SERVER_SIGN_IDENTITY"] = SIGN_ENV["SHED_SERVER_SIGN_IDENTITY"]
+    elif name in ("pf-sign-if-false", "pf-sign-continue", "pf-import-continue"):
+        pf = jobs[PREFLIGHT]["steps"]
+        if name == "pf-import-continue":
+            pf[by_name(pf, IMPORT_STEP)]["continue-on-error"] = True
+        else:
+            sign = [i for i, s in enumerate(pf) if "macos-server-app.sh --verify" in (s.get("run") or "")]
+            if len(sign) != 1:
+                sys.exit("mutate %s: no single sign step" % name)
+            if name == "pf-sign-if-false":
+                pf[sign[0]]["if"] = False
+            else:
+                pf[sign[0]]["continue-on-error"] = True
+    elif name == "pf-job-continue":
+        jobs[PREFLIGHT]["continue-on-error"] = True
+    elif name == "rel-server-continue":
+        rel[goreleaser(".goreleaser.server.yaml")]["continue-on-error"] = True
+    elif name == "rel-import-continue":
+        rel[by_name(rel, IMPORT_STEP)]["continue-on-error"] = True
+    elif name == "rel-delete-continue":
+        rel[by_name(rel, DELETE_STEP)]["continue-on-error"] = True
+    elif name == "rel-rust-before-import":
+        # Back to where it sat before plan 028's fix: ahead of Run Tests, long
+        # before the certificate import.
+        step = rel.pop(by_name(rel, RUST_STEP))
+        rel.insert(by_name(rel, "Run Tests"), step)
+    elif name == "rel-rust-always":
+        rel[by_name(rel, RUST_STEP)]["if"] = "always() && needs.release-plan.outputs.ship_host_agent == 'true'"
+    elif name == "rel-cargo-before-import":
+        rel.insert(by_name(rel, IMPORT_STEP), {"name": "Install a tool", "run": "cargo install --locked --version 1.2.3 some-tool"})
+    else:
+        return False
+    return True
+
+
+def mutate_dry(src, dst, name):
+    """Mutations of server-signing-dry-run.yml."""
+    wf, _ = load(src)
+    on = wf.pop(True, None)
+    if on is not None:
+        wf["on"] = on
+    job = list(wf["jobs"].values())[0]
+    gr = [s for s in job["steps"] if str(s.get("uses", "")).startswith("goreleaser/goreleaser-action@")][0]
+    if name == "none":
+        pass
+    elif name == "dr-publishes":
+        gr["with"]["args"] = "release --clean -f .goreleaser.server.yaml"
+    elif name == "dr-write-token":
+        wf["permissions"] = {"contents": "write"}
+    elif name == "dr-any-branch":
+        job.pop("if")
+    elif name == "dr-other-version":
+        gr["with"]["version"] = "latest"
+    else:
+        sys.exit("mutate-dry: unknown mutation %r" % name)
+    with open(dst, "w") as f:
+        json.dump(wf, f, indent=1, default=str)
+    return 0
+
+
+def extract(src, job, dst, missing, gate=GATE):
     """Write the job's gate step's run script with each ${{ secrets.X != '' }}
     replaced by false (X listed in `missing`) or true, as GitHub renders it."""
     wf, _ = load(src)
     steps = wf["jobs"][job]["steps"]
-    found = gate_indices(steps)
+    found = gate_indices(steps, gate)
     if len(found) != 1:
         sys.exit("extract %s: expected one gate step, found %d" % (job, len(found)))
     run = re.sub(r"\$\{\{ secrets\.([A-Z0-9_]+) != '' \}\}",
@@ -1678,21 +2104,57 @@ def extract(src, job, dst, missing):
     return 0
 
 
+def extract_step(src, job, step_name, dst, env_dst):
+    """Write the named step's run script, and its env as NAME=value lines with
+    each ${{ secrets.X }} rendered from this process's SECRET_X."""
+    wf, _ = load(src)
+    found = [s for s in wf["jobs"][job]["steps"] if s.get("name") == step_name]
+    if len(found) != 1:
+        sys.exit("extract-step %s: expected one %r step, found %d" % (job, step_name, len(found)))
+    run = found[0]["run"]
+    if "${{" in run:
+        sys.exit("extract-step %s: an expression is left unrendered in the step" % job)
+    lines = []
+    for k, v in (found[0].get("env") or {}).items():
+        v = re.sub(r"\$\{\{ secrets\.([A-Z0-9_]+) \}\}", lambda m: os.environ["SECRET_" + m.group(1)], str(v))
+        if "${{" in v or "\n" in v:
+            sys.exit("extract-step %s: env %s is not a plain value or one secret" % (job, k))
+        lines.append("%s=%s\n" % (k, v))
+    with open(dst, "w") as f:
+        f.write(run)
+    with open(env_dst, "w") as f:
+        f.writelines(lines)
+    return 0
+
+
 if __name__ == "__main__":
-    if len(sys.argv) == 4 and sys.argv[1] == "check":
-        sys.exit(check(sys.argv[2], sys.argv[3]))
+    if len(sys.argv) == 6 and sys.argv[1] == "check":
+        sys.exit(check(sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5]))
     if len(sys.argv) == 5 and sys.argv[1] == "mutate":
         sys.exit(mutate(sys.argv[2], sys.argv[3], sys.argv[4]))
+    if len(sys.argv) == 5 and sys.argv[1] == "mutate-dry":
+        sys.exit(mutate_dry(sys.argv[2], sys.argv[3], sys.argv[4]))
     if len(sys.argv) >= 5 and sys.argv[1] == "extract":
         sys.exit(extract(sys.argv[2], sys.argv[3], sys.argv[4], set(sys.argv[5:])))
-    sys.exit("usage: wiring.py check <workflow> <gate-script> | mutate <in> <out> <mutation> | extract <workflow> <job> <out> [missing secret...]")
+    if len(sys.argv) >= 4 and sys.argv[1] == "extract-server-gate":
+        sys.exit(extract(sys.argv[2], "release-plan", sys.argv[3], set(sys.argv[4:]), SERVER_GATE))
+    if len(sys.argv) == 7 and sys.argv[1] == "extract-step":
+        sys.exit(extract_step(*sys.argv[2:7]))
+    sys.exit("usage: wiring.py check <workflow> <gate-script> <server-gate-script> <dry-run-workflow>"
+             " | mutate <in> <out> <mutation> | mutate-dry <in> <out> <mutation>"
+             " | extract <workflow> <job> <out> [missing secret...]"
+             " | extract-server-gate <workflow> <out> [missing secret...]"
+             " | extract-step <workflow> <job> <step name> <out> <env out>")
 PY
 
 WF="${SCRATCH}/.github/workflows/publish-images.yaml"
+SERVER_GATE="${SCRATCH}/scripts/release/server-signing-gate.sh"
+DRY_RUN_WF="${SCRATCH}/.github/workflows/server-signing-dry-run.yml"
 WIRING_OUT=""; WIRING_RC=0
+# run_wiring <publish-images workflow> [<dry-run workflow>]
 run_wiring() {
   WIRING_RC=0
-  WIRING_OUT="$(python3 "${WIRING}" check "$1" "${GATE}" 2>&1)" || WIRING_RC=$?
+  WIRING_OUT="$(python3 "${WIRING}" check "$1" "${GATE}" "${SERVER_GATE}" "${2:-${DRY_RUN_WF}}" 2>&1)" || WIRING_RC=$?
 }
 
 step "publish-images.yaml: release-plan and desktop-macos both call the signing gate, wired as required"
@@ -2229,6 +2691,272 @@ run_msa "${MSA}" --verify "${MSA_APP}" "${MSA_BIN}"
 run_msa "${MSA}" "${MSA_BIN}" darwin arm64
 [ "${MSA_RC}" -eq 2 ] || fail "the hook with three arguments exited ${MSA_RC} (want 2): ${MSA_OUT}"
 ok "--verify: Developer ID bundle → 0; ad hoc or wrong team under required → 1; required without a team → 1; ad hoc Mach-O → 0 (no plist lint); missing path → 1; bad usage → 2"
+
+# ===========================================================================
+# Phase 7 (plan 028 D4, #304): the server's release signing fails closed.
+# server-signing-gate.sh runs as deployed. Phase 5's wiring guard already
+# passed the real workflows, server rules included (check_server); the
+# mutation cells here prove each of those rules bites. Then the release-plan
+# server gate step and the preflight's signing step are EXECUTED, the latter
+# against Phase 6's stub codesign/plutil.
+# ===========================================================================
+
+SGATE_SECRETS="MACOS_CERTIFICATE_P12_BASE64 MACOS_CERTIFICATE_PASSWORD SHED_DESKTOP_DEVELOPER_ID_IDENTITY APPLE_TEAM_ID"
+SGATE_REFUSAL="::error::a server tag requires a Developer ID signed ShedServer.app; missing:"
+SGATE_PASS="has all four signing secrets"
+# sgate_flags "<names to mark false>" → SGATE_FLAGS, all four `--has NAME=…` pairs.
+SGATE_FLAGS=()
+sgate_flags() {
+  SGATE_FLAGS=()
+  local n m v
+  for n in ${SGATE_SECRETS}; do
+    v=true
+    for m in $1; do
+      if [ "${m}" = "${n}" ]; then v=false; fi
+    done
+    SGATE_FLAGS+=(--has "${n}=${v}")
+  done
+}
+# run_sgate <args...> → SG_OUT (stdout+stderr), SG_RC.
+SG_OUT=""; SG_RC=0
+run_sgate() {
+  SG_RC=0
+  SG_OUT="$("${SERVER_GATE}" "$@" 2>&1)" || SG_RC=$?
+}
+
+for n in ${SGATE_SECRETS}; do
+  step "server-signing-gate.sh: a stable tag missing only ${n} exits 1, naming exactly it"
+  sgate_flags "${n}"
+  run_sgate v9.1.0 "${SGATE_FLAGS[@]}"
+  [ "${SG_RC}" -eq 1 ] || fail "stable tag missing ${n} exited ${SG_RC} (want 1): ${SG_OUT}"
+  printf '%s\n' "${SG_OUT}" | grep -qxF "${SGATE_REFUSAL} ${n}" \
+    || fail "stable tag missing ${n}: the refusal does not name exactly ${n}: ${SG_OUT}"
+  ok "missing ${n} → exit 1, \"missing: ${n}\" and nothing else"
+done
+
+step "server-signing-gate.sh: all four present exits 0; all four missing exits 1, naming all four"
+sgate_flags ""
+run_sgate v9.1.0 "${SGATE_FLAGS[@]}"
+[ "${SG_RC}" -eq 0 ] || fail "stable tag with all four exited ${SG_RC} (want 0): ${SG_OUT}"
+echo "${SG_OUT}" | grep -qF "${SGATE_PASS}" || fail "all-present pass line missing: ${SG_OUT}"
+echo "${SG_OUT}" | grep -q "missing:" && fail "all-present run still reports something missing: ${SG_OUT}"
+sgate_flags "${SGATE_SECRETS}"
+run_sgate v9.1.0 "${SGATE_FLAGS[@]}"
+[ "${SG_RC}" -eq 1 ] || fail "stable tag missing all four exited ${SG_RC} (want 1): ${SG_OUT}"
+printf '%s\n' "${SG_OUT}" | grep -qxF "${SGATE_REFUSAL} $(comma_list "${SGATE_SECRETS}")" \
+  || fail "the all-missing refusal does not name all four in order: ${SG_OUT}"
+ok "all four present → exit 0; all four missing → exit 1, all four named"
+
+step "server-signing-gate.sh: a prerelease fails closed too (unlike the desktop gate: the server has no ad hoc release)"
+sgate_flags "${SGATE_SECRETS}"
+run_sgate v9.1.0-rc.1 "${SGATE_FLAGS[@]}"
+[ "${SG_RC}" -eq 1 ] || fail "prerelease missing all four exited ${SG_RC} (want 1): ${SG_OUT}"
+printf '%s\n' "${SG_OUT}" | grep -qxF "${SGATE_REFUSAL} $(comma_list "${SGATE_SECRETS}")" \
+  || fail "the prerelease refusal does not name all four: ${SG_OUT}"
+echo "${SG_OUT}" | grep -qF "a prerelease (server tags are stable-only" || fail "the prerelease refusal does not say server tags are stable-only: ${SG_OUT}"
+sgate_flags ""
+run_sgate v9.1.0-rc.1 "${SGATE_FLAGS[@]}"
+[ "${SG_RC}" -eq 0 ] || fail "prerelease with all four exited ${SG_RC} (want 0): ${SG_OUT}"
+ok "v9.1.0-rc.1: all four missing → exit 1; all four present → exit 0"
+
+step "server-signing-gate.sh: malformed flags and tags exit 2"
+sgate_flags ""
+smalformed_case() {
+  # $1 label, rest = full argv
+  local label="$1"; shift
+  run_sgate "$@"
+  [ "${SG_RC}" -eq 2 ] || fail "malformed (${label}) exited ${SG_RC} (want 2): ${SG_OUT}"
+  ok "malformed: ${label} → exit 2"
+}
+smalformed_case "a value that is not true|false" v9.1.0 "${SGATE_FLAGS[@]:0:6}" --has APPLE_TEAM_ID=yes
+smalformed_case "a flag with no =" v9.1.0 "${SGATE_FLAGS[@]:0:6}" --has APPLE_TEAM_ID
+smalformed_case "a desktop-only secret (APPLE_ID) the server gate does not take" v9.1.0 "${SGATE_FLAGS[@]}" --has APPLE_ID=true
+smalformed_case "a name given twice" v9.1.0 "${SGATE_FLAGS[@]}" --has APPLE_TEAM_ID=true
+smalformed_case "a dangling --has" v9.1.0 "${SGATE_FLAGS[@]}" --has
+smalformed_case "a bare argument" v9.1.0 "${SGATE_FLAGS[@]}" APPLE_TEAM_ID=true
+smalformed_case "a tag that is not vX.Y.Z" 9.1 "${SGATE_FLAGS[@]}"
+smalformed_case "no arguments at all"
+run_sgate v9.1.0 "${SGATE_FLAGS[@]:0:6}"
+[ "${SG_RC}" -eq 2 ] || fail "malformed (only three flags) exited ${SG_RC} (want 2): ${SG_OUT}"
+echo "${SG_OUT}" | grep -q "no --has flag for: APPLE_TEAM_ID" || fail "three-flag refusal doesn't name the absent flag: ${SG_OUT}"
+ok "malformed: only three of the four flags → exit 2, naming the absent one"
+
+step "server-signing-gate.sh: a secret-shaped value is never echoed, wherever it is wired"
+ssentinel_case() {
+  # $1 label, rest = argv
+  local label="$1"; shift
+  run_sgate "$@"
+  [ "${SG_RC}" -eq 2 ] || fail "sentinel (${label}) exited ${SG_RC} (want 2): ${SG_OUT}"
+  case "${SG_OUT}" in *"${SENTINEL}"*) fail "sentinel (${label}): the output echoed the value: ${SG_OUT}" ;; esac
+  ok "sentinel ${label}: exit 2, value never echoed"
+}
+ssentinel_case "as a flag value" v9.1.0 "${SGATE_FLAGS[@]:0:6}" --has "APPLE_TEAM_ID=${SENTINEL}"
+ssentinel_case "as a flag name" v9.1.0 "${SGATE_FLAGS[@]}" --has "${SENTINEL}=true"
+ssentinel_case "as a bare argument" v9.1.0 "${SGATE_FLAGS[@]}" "${SENTINEL}"
+ssentinel_case "as the tag" "${SENTINEL}" "${SGATE_FLAGS[@]}"
+sgate_flags "${SGATE_SECRETS}"
+SG_RC=0
+SG_OUT="$(MACOS_CERTIFICATE_P12_BASE64="${SENTINEL}" MACOS_CERTIFICATE_PASSWORD="${SENTINEL}" \
+  SHED_DESKTOP_DEVELOPER_ID_IDENTITY="${SENTINEL}" APPLE_TEAM_ID="${SENTINEL}" \
+  "${SERVER_GATE}" v9.1.0 "${SGATE_FLAGS[@]}" 2>&1)" || SG_RC=$?
+[ "${SG_RC}" -eq 1 ] || fail "sentinel (in the environment) exited ${SG_RC} (want 1): ${SG_OUT}"
+case "${SG_OUT}" in *"${SENTINEL}"*) fail "sentinel (in the environment): echoed: ${SG_OUT}" ;; esac
+ok "sentinel in the four env vars: ignored (exit 1 from the flags alone), never echoed"
+
+step "the wiring guard, server rules: the real publish-images.yaml and server-signing-dry-run.yml pass"
+run_wiring "${WF}"
+[ "${WIRING_RC}" -eq 0 ] || fail "the wiring guard rejects the real workflows (rc=${WIRING_RC}): ${WIRING_OUT}"
+python3 "${WIRING}" mutate-dry "${DRY_RUN_WF}" "${WIRING_DIR}/dr-none.json" none || fail "mutate-dry none failed"
+run_wiring "${WF}" "${WIRING_DIR}/dr-none.json"
+[ "${WIRING_RC}" -eq 0 ] || fail "the unmutated dry-run round-trip is rejected (rc=${WIRING_RC}): ${WIRING_OUT}"
+ok "server gate after the desktop gate, the preflight and its needs/if wiring, the release keychain window (the Rust install after it) and the dry run all pass (and the dry-run round-trip baseline)"
+
+step "the wiring guard, server rules: moving, weakening or dropping any of them turns it red"
+mutation_case srv-delete "release-plan (server gate): 0 steps run the server gate"
+mutation_case srv-before-desktop "release-plan (server gate): the server gate is step 2, not right after the desktop gate"
+mutation_case srv-any-event "release-plan (server gate): the server gate step's if is"
+mutation_case srv-drop-flag "release-plan (server gate): --has flags"
+mutation_case pf-on-dispatch "server-signing-preflight: if is"
+mutation_case pf-no-timestamp "server-signing-preflight: the scratch signature lacks --timestamp"
+mutation_case pf-job-secret "server-signing-preflight: job-level env reads secrets"
+mutation_case vz-no-preflight-need "publish-vz: needs 'publish-build-tools' does not list server-signing-preflight"
+mutation_case fc-implicit-success "publish-fc: if is ''"
+mutation_case bt-skipped-on-push "publish-build-tools: if is"
+mutation_case bt-failed-ok "publish-build-tools: if is"
+mutation_case rel-no-preflight "release: if is"
+mutation_case rel-import-early "release: the certificate import is step 1, not right before the server goreleaser step"
+mutation_case rel-delete-after-host-agent "release: the keychain delete is step"
+mutation_case rel-delete-on-success "release: the keychain delete's if is 'success()', not always()"
+mutation_case rel-no-required "release server goreleaser (signing): env is"
+mutation_case rel-identity-to-host-agent "only the import and the server goreleaser step may"
+
+step "the wiring guard, server rules: a preflight that can skip or ignore its signing proof turns it red"
+mutation_case pf-sign-if-false "server-signing-preflight: the sign step has an if (False); it must run whenever the import succeeded"
+mutation_case pf-sign-continue "server-signing-preflight: the signing step has continue-on-error"
+mutation_case pf-import-continue "server-signing-preflight: the certificate import has continue-on-error"
+mutation_case pf-job-continue "server-signing-preflight: the job has continue-on-error"
+mutation_case rel-server-continue "release: the signing step has continue-on-error"
+mutation_case rel-import-continue "release: the certificate import has continue-on-error"
+mutation_case rel-delete-continue "release: the keychain delete has continue-on-error"
+
+step "the wiring guard, server rules: third-party build code before the keychain delete turns it red"
+mutation_case rel-rust-before-import "release: the Rust toolchain step is step 3, not after the keychain delete"
+mutation_case rel-rust-always "release: the Rust toolchain step's if is"
+mutation_case rel-cargo-before-import "run cargo, rustup or brew before the keychain delete"
+
+# dry_mutation_case <mutation> <expected substring of the guard's complaint>
+dry_mutation_case() {
+  python3 "${WIRING}" mutate-dry "${DRY_RUN_WF}" "${WIRING_DIR}/$1.json" "$1" || fail "mutate-dry $1 failed"
+  run_wiring "${WF}" "${WIRING_DIR}/$1.json"
+  [ "${WIRING_RC}" -eq 1 ] || fail "the wiring guard passed a dry run mutated by $1 (rc=${WIRING_RC}): ${WIRING_OUT}"
+  echo "${WIRING_OUT}" | grep -qF "$2" || fail "mutation $1 was refused for the wrong reason (want '$2'): ${WIRING_OUT}"
+  ok "mutation $1 → refused: $2"
+}
+dry_mutation_case dr-publishes "server-signing-dry-run.yml: goreleaser args are"
+dry_mutation_case dr-write-token "server-signing-dry-run.yml: permissions are"
+dry_mutation_case dr-any-branch "server-signing-dry-run.yml: the job's if is"
+dry_mutation_case dr-other-version "server-signing-dry-run.yml: goreleaser version 'latest' is not the release job's"
+
+# The release-plan server gate step, executed: its run script with each
+# ${{ secrets.X != '' }} rendered, in a scratch checkout with or without the
+# gate. A tag push is the only event it runs on, and a missing script fails
+# closed (no fallback).
+SSTEP_DIR="${SCRATCH}/server-step-exec"
+mkdir -p "${SSTEP_DIR}/no-gate" "${SSTEP_DIR}/with-gate/scripts/release"
+cp "${SERVER_GATE}" "${SSTEP_DIR}/with-gate/scripts/release/"
+# run_server_step <checkout: no-gate|with-gate> <tag> [missing secret...]
+run_server_step() {
+  local co="${SSTEP_DIR}/$1" tag="$2"
+  shift 2
+  python3 "${WIRING}" extract-server-gate "${WF}" "${SSTEP_DIR}/step.sh" "$@" || fail "extract the server gate step failed"
+  STEP_RC=0
+  STEP_OUT="$(cd "${co}" && env -i PATH="${PATH}" HOME="${HOME}" GITHUB_EVENT_NAME=push TAG="${tag}" \
+    bash -e "${SSTEP_DIR}/step.sh" 2>&1)" || STEP_RC=$?
+}
+# server_step_case <label> <want rc> <expected output substring> <run_server_step args...>
+server_step_case() {
+  local label="$1" want="$2" expect="$3"
+  shift 3
+  run_server_step "$@"
+  [ "${STEP_RC}" -eq "${want}" ] || fail "server gate step (${label}) exited ${STEP_RC} (want ${want}): ${STEP_OUT}"
+  case "${STEP_OUT}" in
+    *"${expect}"*) ;;
+    *) fail "server gate step (${label}) output lacks '${expect}': ${STEP_OUT}" ;;
+  esac
+  ok "server gate step ${label} → exit ${want}"
+}
+step "release-plan's server gate step, executed: each flag reaches the gate under its own name"
+server_step_case "push v9.1.0, all four present" 0 "${SGATE_PASS}" with-gate v9.1.0
+for n in ${SGATE_SECRETS}; do
+  server_step_case "push v9.1.0, secrets.${n} missing" 1 "${SGATE_REFUSAL} ${n}" with-gate v9.1.0 "${n}"
+done
+# shellcheck disable=SC2086  # one argument per secret name, on purpose
+server_step_case "push v9.1.0-rc.1, all four missing" 1 "${SGATE_REFUSAL} $(comma_list "${SGATE_SECRETS}")" \
+  with-gate v9.1.0-rc.1 ${SGATE_SECRETS}
+server_step_case "push v9.1.0, no gate script (fails closed, no fallback)" 127 "server-signing-gate.sh" no-gate v9.1.0
+
+# The preflight's signing step, executed: its run script and its env (each
+# ${{ secrets.X }} rendered from a test value), in a scratch checkout holding
+# the real macos-server-app.sh and entitlements, with Phase 6's stub
+# codesign/plutil and a stub `file` ahead on PATH. It must sign the scratch
+# copy as the hook signs shed-server, and the hook's required checks must
+# refuse anything but a timestamped Developer ID signature from the team.
+PF_DIR="${SCRATCH}/preflight-exec"
+PF_CO="${PF_DIR}/checkout"
+PF_STUBS="${PF_DIR}/stubs"
+mkdir -p "${PF_CO}/scripts/release" "${PF_CO}/internal/vz" "${PF_STUBS}"
+cp "${MSA}" "${PF_CO}/scripts/release/"
+cp "${MSA_ENTITLEMENTS}" "${PF_CO}/internal/vz/"
+cat > "${PF_STUBS}/file" <<'STUB'
+#!/bin/sh
+echo "file $*" >> "${STUB_LOG:-/dev/null}"
+echo "${STUB_FILE:-Mach-O universal binary with 2 architectures: [x86_64:Mach-O 64-bit executable x86_64] [arm64e]}"
+STUB
+chmod 0755 "${PF_STUBS}/file"
+PF_SIGN_STEP="Sign and verify a scratch binary (Developer ID, timestamped)"
+SECRET_SHED_DESKTOP_DEVELOPER_ID_IDENTITY="${MSA_IDENTITY}" SECRET_APPLE_TEAM_ID="${MSA_TEAM}" \
+  python3 "${WIRING}" extract-step "${WF}" server-signing-preflight "${PF_SIGN_STEP}" "${PF_DIR}/step.sh" "${PF_DIR}/step.env" \
+  || fail "extract the preflight's signing step failed"
+PF_ENV=()
+while IFS= read -r line; do PF_ENV+=("${line}"); done < "${PF_DIR}/step.env"
+PF_SCRATCH_BIN="${PF_DIR}/runner-temp/server-signing-preflight/shed-server"
+# run_pf [STUB_*=value...] → PF_OUT (stdout+stderr), PF_RC; the stubs log to MSA_LOG.
+PF_OUT=""; PF_RC=0
+run_pf() {
+  PF_RC=0
+  : > "${MSA_LOG}"
+  rm -rf "${PF_DIR}/runner-temp"
+  mkdir -p "${PF_DIR}/runner-temp"
+  PF_OUT="$(cd "${PF_CO}" && env -i PATH="${PF_STUBS}:${MSA_STUBS}:${PATH}" HOME="${HOME}" \
+    RUNNER_TEMP="${PF_DIR}/runner-temp" STUB_LOG="${MSA_LOG}" "${PF_ENV[@]}" "$@" \
+    bash -e "${PF_DIR}/step.sh" 2>&1)" || PF_RC=$?
+}
+
+step "server-signing-preflight's signing step, executed: signs like the hook and passes only a timestamped Developer ID from the team"
+[ "$(printf '%s\n' "${PF_ENV[@]}" | LC_ALL=C sort)" = "$(printf '%s\n' SHED_SERVER_SIGNING=required "SHED_SERVER_SIGN_IDENTITY=${MSA_IDENTITY}" "SHED_SERVER_TEAM_ID=${MSA_TEAM}" | LC_ALL=C sort)" ] \
+  || fail "the signing step's env does not map the identity and team secrets under required signing: ${PF_ENV[*]}"
+run_pf
+[ "${PF_RC}" -eq 0 ] || fail "the preflight signing step with a matching Developer ID exited ${PF_RC} (want 0): ${PF_OUT}"
+grep -qxF -- "codesign --force --sign ${MSA_IDENTITY} --identifier ai.stridelabs.shed-server --entitlements internal/vz/entitlements.plist --timestamp ${PF_SCRATCH_BIN}" "${MSA_LOG}" \
+  || fail "the scratch binary was not signed with the identity, the identifier, the entitlements and --timestamp: $(cat "${MSA_LOG}")"
+printf '%s\n' "${PF_OUT}" | grep -qF "verified ${PF_SCRATCH_BIN} (ai.stridelabs.shed-server, Developer ID, team ${MSA_TEAM}, timestamped)" \
+  || fail "the preflight did not run the hook's required --verify: ${PF_OUT}"
+ok "matching Developer ID → exit 0; signed like the hook; verified under required signing"
+# pf_refused <label> <expected message> <stub settings...>
+pf_refused() {
+  local label="$1" want="$2"
+  shift 2
+  run_pf "$@"
+  [ "${PF_RC}" -eq 1 ] || fail "the preflight signing step with ${label} exited ${PF_RC} (want 1): ${PF_OUT}"
+  printf '%s\n' "${PF_OUT}" | grep -qF "${want}" || fail "the preflight with ${label}: no '${want}' in: ${PF_OUT}"
+  ok "preflight with ${label} → exit 1 (${want})"
+}
+pf_refused "an ad hoc signature (no identity in the keychain)" "no signing Authority (an ad hoc signature?)" STUB_SIGNATURE=adhoc
+pf_refused "another team's certificate" "TeamIdentifier is 'WRONGTEAM9', which is not SHED_SERVER_TEAM_ID" STUB_TEAM=WRONGTEAM9
+pf_refused "no secure timestamp (the timestamp server failed)" "no secure Timestamp" STUB_TIMESTAMP=no
+pf_refused "an extra entitlement" "want exactly {\"com.apple.security.virtualization\":true}" STUB_ENTITLEMENTS=extra
+pf_refused "a scratch copy that is not a Mach-O" "is not a Mach-O on this runner" "STUB_FILE=POSIX shell script, ASCII text executable"
+msa_signed_nothing "the preflight with a non-Mach-O scratch copy"
 
 echo
 echo "release-scripts-test: all ${PASS} checks passed"
