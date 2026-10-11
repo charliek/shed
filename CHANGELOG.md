@@ -25,6 +25,7 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- **Images: the base stage of both images now pre-creates `~/.local` (`bin`, `share`, `state`), `~/.config` and `~/.cache` owned by `shed`.** Defense in depth for #410, so a mount or tool under those paths never leaves a root-owned parent. Applies to newly built images, from the next image release.
 - **CLI: the first command after a token-mode server restart no longer fails.** `shed start`,
   `shed create`, `shed image pull`, `shed image push`, `shed snapshot create` and the prune
   commands now re-mint and retry once on an expired or invalid credential, as the other

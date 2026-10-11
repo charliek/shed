@@ -421,6 +421,7 @@ test-integration-dev: build
 	  SHED_DEV_AUTH_MODE=$(SHED_DEV_AUTH_MODE) \
 	  SHED_IMAGE_HAS_ROOST=vz \
 	  SHED_IMAGE_HAS_CRAZE=vz \
+	  SHED_IMAGE_HAS_HOME_DIRS=vz \
 	  $(MAKE) test-integration
 
 # Parallel dev shed-server lifecycle (FC remote).
@@ -692,6 +693,7 @@ test-integration-dev-fc:
 	  SHED_DEV_AUTH_MODE=$(SHED_DEV_AUTH_MODE) \
 	  SHED_IMAGE_HAS_ROOST=fc \
 	  SHED_IMAGE_HAS_CRAZE=fc \
+	  SHED_IMAGE_HAS_HOME_DIRS=fc \
 	  $(MAKE) test-integration
 
 # Cross-compile for release

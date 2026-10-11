@@ -194,6 +194,11 @@ RUN set -euo pipefail && \
     # live under the home directory, created at create time.
     mkdir -p /var/log/shed && chown shed:shed /var/log/shed && \
     mkdir -p /home/shed/.ssh && chown shed:shed /home/shed/.ssh && chmod 700 /home/shed/.ssh && \
+    # Pre-create the shed-owned XDG/user dirs (#410): roost-session writes
+    # ~/.local/share, Connect Host drops binaries in ~/.local/bin. A mount
+    # under one of these makes the parent root-owned otherwise; nested mount
+    # targets are handled by the server's mount prelude.
+    install -d -o shed -g shed -m 0755 /home/shed/.local /home/shed/.local/bin /home/shed/.local/share /home/shed/.local/state /home/shed/.config /home/shed/.cache && \
     # Make machine-id transient (lives in /run, never persists to disk).
     # Without this, dbus's postinst bakes a single UUID into the image
     # and every shed (fresh or snapshot-spawned) inherits it. The

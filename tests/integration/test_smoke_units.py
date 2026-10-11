@@ -104,8 +104,9 @@ class _FakeServer:
     [
         (test_smoke.test_roost_session_baked, "SHED_IMAGE_HAS_ROOST"),
         (test_smoke.test_craze_baked, "SHED_IMAGE_HAS_CRAZE"),
+        (test_smoke.test_home_dirs_owned_by_shed, "SHED_IMAGE_HAS_HOME_DIRS"),
     ],
-    ids=["roost", "craze"],
+    ids=["roost", "craze", "home_dirs"],
 )
 @pytest.mark.parametrize(
     "backend, key", [("firecracker", "fc"), ("vz", "vz")], ids=["fc", "vz"]
@@ -131,8 +132,9 @@ def test_baked_body_listed_backend_missing_image_fails(
     [
         (test_smoke.test_roost_session_baked, "SHED_IMAGE_HAS_ROOST"),
         (test_smoke.test_craze_baked, "SHED_IMAGE_HAS_CRAZE"),
+        (test_smoke.test_home_dirs_owned_by_shed, "SHED_IMAGE_HAS_HOME_DIRS"),
     ],
-    ids=["roost", "craze"],
+    ids=["roost", "craze", "home_dirs"],
 )
 def test_baked_body_unlisted_backend_skips(monkeypatch, body, env_var):
     monkeypatch.setenv(env_var, "vz")
