@@ -664,7 +664,11 @@ func runImageDelete(_ *cobra.Command, args []string) error {
 			prompt += fmt.Sprintf(" (%s)", formatSize(targetImage.SizeBytes))
 		}
 		prompt += "? [y/N] "
-		if !confirmAction(prompt) {
+		ok, err := confirmAction(prompt, "--force")
+		if err != nil {
+			return err
+		}
+		if !ok {
 			fmt.Println("Cancelled.")
 			return nil
 		}
@@ -929,7 +933,11 @@ func runImagePrune(_ *cobra.Command, _ []string) error {
 			prompt += fmt.Sprintf(" (%s)", formatSize(totalSize))
 		}
 		prompt += "? [y/N] "
-		if !confirmAction(prompt) {
+		ok, err := confirmAction(prompt, "--force")
+		if err != nil {
+			return err
+		}
+		if !ok {
 			fmt.Println("Cancelled.")
 			return nil
 		}

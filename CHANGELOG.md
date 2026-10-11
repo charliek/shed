@@ -69,6 +69,12 @@ All notable changes to this project will be documented in this file.
   afterwards.** The 0.8.2 to 0.9.0 upgrade guide and the desktop docs now say so, because in
   `Automatic` broker mode the app chooses its broker once at launch and does not fall back
   if the daemon disappears at runtime. A runtime fallback is still open. (#411)
+- **CLI: `shed delete`, `reset`, `snapshot delete`, `image rm`, `image prune` and `system prune` no
+  longer report success when nobody answered.** When stdin is not a terminal and the confirmation
+  prompt gets no answer (EOF, for example under `</dev/null`), the command now exits 1 with an
+  error naming `--force` and sends no mutating request, instead of printing `Cancelled.` and
+  exiting 0. A piped `y` still works. `shed tunnels start` without `--replace` now refuses
+  `/dev/null` as stdin too. (#109)
 
 ## v0.9.0 — 2026-10-10
 
