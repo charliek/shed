@@ -402,10 +402,10 @@ func TestDoRequestWithTimeoutReauth(t *testing.T) {
 		_, _ = w.Write([]byte(shedJSON))
 	}
 
-	countingSource := func(mints *int) *clienttoken.Source {
+	countingSource := func(mints *atomic.Int32) *clienttoken.Source {
 		return clienttoken.New(clienttoken.TokenCredential("stale", time.Now().Add(24*time.Hour)),
 			func() (clienttoken.Credential, error) {
-				*mints++
+				mints.Add(1)
 				return clienttoken.TokenCredential("new", time.Now().Add(24*time.Hour)), nil
 			})
 	}
@@ -419,13 +419,13 @@ func TestDoRequestWithTimeoutReauth(t *testing.T) {
 				}
 				ok(w)
 			})
-			mints := 0
+			var mints atomic.Int32
 			c := newAPIClientWithSource(srv.URL, "", countingSource(&mints), DefaultTimeout)
 			if err := call(c); err != nil {
 				t.Fatalf("call: %v", err)
 			}
-			if mints != 1 {
-				t.Errorf("mints = %d, want 1", mints)
+			if mints.Load() != 1 {
+				t.Errorf("mints = %d, want 1", mints.Load())
 			}
 			if len(*recs) != 2 {
 				t.Fatalf("requests = %d, want 2", len(*recs))
@@ -447,26 +447,26 @@ func TestDoRequestWithTimeoutReauth(t *testing.T) {
 
 		t.Run(name+"/persistent 401 mints once then errors", func(t *testing.T) {
 			srv, recs := newServer(t, func(_ int, w http.ResponseWriter) { w.WriteHeader(http.StatusUnauthorized) })
-			mints := 0
+			var mints atomic.Int32
 			c := newAPIClientWithSource(srv.URL, "", countingSource(&mints), DefaultTimeout)
 			if err := call(c); err == nil {
 				t.Fatal("expected the 401 to surface")
 			}
-			if mints != 1 || len(*recs) != 2 {
-				t.Errorf("mints = %d, requests = %d, want 1 and 2", mints, len(*recs))
+			if mints.Load() != 1 || len(*recs) != 2 {
+				t.Errorf("mints = %d, requests = %d, want 1 and 2", mints.Load(), len(*recs))
 			}
 		})
 
 		for _, status := range []int{http.StatusForbidden, http.StatusInternalServerError} {
 			t.Run(fmt.Sprintf("%s/%d does not retry", name, status), func(t *testing.T) {
 				srv, recs := newServer(t, func(_ int, w http.ResponseWriter) { w.WriteHeader(status) })
-				mints := 0
+				var mints atomic.Int32
 				c := newAPIClientWithSource(srv.URL, "", countingSource(&mints), DefaultTimeout)
 				if err := call(c); err == nil {
 					t.Fatal("expected an error")
 				}
-				if mints != 0 || len(*recs) != 1 {
-					t.Errorf("mints = %d, requests = %d, want 0 and 1", mints, len(*recs))
+				if mints.Load() != 0 || len(*recs) != 1 {
+					t.Errorf("mints = %d, requests = %d, want 0 and 1", mints.Load(), len(*recs))
 				}
 			})
 		}
@@ -488,13 +488,13 @@ func TestDoRequestWithTimeoutReauth(t *testing.T) {
 				}
 			}()
 			defer ln.Close()
-			mints := 0
+			var mints atomic.Int32
 			c := newAPIClientWithSource("http://"+ln.Addr().String(), "", countingSource(&mints), DefaultTimeout)
 			if err := call(c); err == nil {
 				t.Fatal("expected a transport error")
 			}
-			if mints != 0 || atomic.LoadInt32(&hits) != 1 {
-				t.Errorf("mints = %d, connections = %d, want 0 and 1", mints, atomic.LoadInt32(&hits))
+			if mints.Load() != 0 || atomic.LoadInt32(&hits) != 1 {
+				t.Errorf("mints = %d, connections = %d, want 0 and 1", mints.Load(), atomic.LoadInt32(&hits))
 			}
 		})
 
@@ -518,22 +518,22 @@ func TestDoRequestWithTimeoutReauth(t *testing.T) {
 		retryEntered := make(chan struct{})
 		srv, _ := newServer(t, func(n int, w http.ResponseWriter) {
 			if n == 1 {
-				time.Sleep(400 * time.Millisecond)
+				time.Sleep(700 * time.Millisecond)
 				w.WriteHeader(http.StatusUnauthorized)
 				return
 			}
 			close(retryEntered)
-			time.Sleep(500 * time.Millisecond)
+			time.Sleep(1000 * time.Millisecond)
 			ok(w)
 		})
-		mints := 0
+		var mints atomic.Int32
 		c := newAPIClientWithSource(srv.URL, "", countingSource(&mints), DefaultTimeout)
-		err := c.doRequestWithTimeout(http.MethodPost, "/x", nil, nil, 700*time.Millisecond)
+		err := c.doRequestWithTimeout(http.MethodPost, "/x", nil, nil, 1500*time.Millisecond)
 		if err == nil || !strings.Contains(err.Error(), "--timeout") {
 			t.Fatalf("err = %v, want the --timeout hint", err)
 		}
-		if mints != 1 {
-			t.Errorf("mints = %d, want 1", mints)
+		if mints.Load() != 1 {
+			t.Errorf("mints = %d, want 1", mints.Load())
 		}
 		select {
 		case <-retryEntered:

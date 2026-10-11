@@ -58,7 +58,7 @@ def parse_path_facts(stdout: str) -> dict[str, PathFact]:
     """`PATH_FACTS_SH` output as {path: PathFact}."""
     facts = {}
     for line in stdout.splitlines():
-        path, kind, stat = line.split("\t")
+        path, kind, stat = line.rsplit("\t", 2)  # a tab inside the path stays in it
         dev, _, owner = stat.partition(" ")
         facts[path] = PathFact(kind, dev, owner)
     return facts
