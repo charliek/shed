@@ -36,6 +36,12 @@ pub mod machine;
 /// crate with default features, and reading a roost-session is exactly what it
 /// needs.
 pub mod roost;
+/// The `/` menu (plan 029 §3.4) — which of a session's slash-catalog rows a
+/// client shows, how a typed token matches them, and what sending a `/` draft
+/// or choosing a row does. Pure and ungated for the reason [`lane_view`] is:
+/// both clients call the same rules (the desktop through Tauri commands, the
+/// phone through FRB), so the dispatch guard is one implementation.
+pub mod slash_menu;
 /// The spawn gate (plan 026 §3.3): the write barrier every spawn site takes a
 /// section of, so nothing is born once an orderly exit has begun. Ungated —
 /// the phone links this crate with default features and simply never builds
@@ -71,6 +77,10 @@ pub use roost::{
     RecordedReach, RoostEndpoint, RoostPeek, RoostReach, RoostUpdate, RoostWatcher,
     RoostWatcherOptions, SshBridge, SshBridgeOptions, SshExec, SystemSshTunnels, TeardownSink,
     Tunnel, TunnelOpener, UnreachableReach,
+};
+pub use slash_menu::{
+    SlashAccept, SlashAcceptKey, SlashAction, SlashDispatch, SlashFilter, SlashFilterRow,
+    SlashHidden, SlashMenu, SlashMenuRow,
 };
 pub use spawn_gate::{ChildExit, ShuttingDown, SlotClose, SpawnGate, SpawnSection, SHUTTING_DOWN};
 pub use token_minter::HostAgentTokenMinter;

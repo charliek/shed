@@ -103,7 +103,17 @@ re-implemented per language. The root `CLAUDE.md` owns the monorepo layout + rel
   `LaneView::snapshot(since_seq)` is the typed projection both a full read and a delta
   poll go through. It is ungated because mobile links `shed-app` with default features
   and needs the identical fold — the phone showing the same view the desktop shows is
-  a property of one implementation, not two that have to agree.
+  a property of one implementation, not two that have to agree. Since plan 029 it also
+  stages the session's slash catalog with the seed (every `Reset` clears it, so a seed
+  with no `Slash` is no catalog; capabilities that drop `slash` drop it) and hands out
+  the RESOLVED menu as `LaneViewSnapshot.slash_menu`, recomputed only when the catalog
+  or the capabilities change. `slash_menu.rs` (plan 029 §3.4, ungated, pure) is the `/`
+  menu's one rule set — `resolve` (which rows show, each with its `SlashAction`, and the
+  hidden builtin names a typed command is refused for), `filter` (the open rule, craze's
+  four match buckets, UTF-16 carets, `dimmed` while working), `dispatch` (the
+  single-line grammar and its guard), `accept` (Enter/Tab/pick) and `is_working` — which
+  the desktop calls through Tauri commands and the phone through FRB, so neither client
+  re-derives a rule.
   `craze_rows.rs` (plan 025 §3.6.3, ungated for the same reason) is **the craze row
   merge, D4 literally**: `fold_plan(roost_tabs, hub_rows)` for ONE machine — with the
   hub feed live (`Some`) every craze-owned roost tab is absorbed (attached to the hub row
