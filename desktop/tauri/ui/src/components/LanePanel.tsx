@@ -58,8 +58,18 @@
    hidden, never disabled. The panel counts the session's `Settings` frames
    (the `lane-event` nudges that carry one) and moves the count only with the
    read that shows them: a change whose answer was lost is "not confirmed"
-   until that count moves. */
-import { useCallback, useEffect, useRef, useState } from "react";
+   until that count moves.
+
+   **The `/` menu** (plan 029 §3.5): on a session whose view carries a
+   resolved `slash_menu`, a `/` draft opens a menu above the composer. The
+   panel only RENDERS it and handles keys (`slashKeys.ts`); every rule is the
+   shared core's, through the `lane_slash_*` commands (`slash.rs`, P5). Send
+   goes through the same dispatch, so a typed `/help` is refused inline
+   rather than sent as text. Each command runs on the lane's own verb — a rename, a mode (`lane.set`, its errors in the composer,
+   P7), Stop behind its confirm, the model picker (the settings sheet), a
+   prompt row as a prompt. No menu on the view → the composer is as it always
+   was. */
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { ChevronDown, ChevronRight, OctagonX, ScrollText, Send, SlidersHorizontal, Square, X, Zap } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { laneVerbs, sendFailureText } from "@/lib/laneVerbs";
@@ -67,13 +77,20 @@ import { laneHeader } from "@/lib/crazeRows";
 import { newestWins } from "@/lib/newest";
 import { NO_SETTINGS, settingsChip, settingsOffered } from "@/lib/laneSettings";
 import { LaneSettingsSheet, useSettingChanges } from "@/components/LaneSettings";
+import { SlashMenuPanel } from "@/components/SlashMenu";
 import { cardCls, KindBadge, StatusChip, type Tone } from "@/components/primitives";
 import {
+  composerKey, dismissalAfter, highlightKey, isComposing, menuUp, moveHighlight, oneAtATime, owns, pressKey, revise,
+  settleFor, type ComposerNote, type DraftRev, type Guard, type SlashOutcome,
+} from "@/lib/slashKeys";
+import {
   LANE_EVENT, laneAnswer, laneApprovals, laneCancel, laneClose, laneFailure,
-  laneMessages, laneOpen, laneSend, laneStop, reportLane,
+  laneMessages, laneOpen, laneSend, laneSet, laneSetTitle, laneSlashAccept, laneSlashDispatch,
+  laneSlashFilter, laneStop, reportLane, reportLaneComposer,
   type LaneAnswer, type LaneApproval, type LaneApprovalCard, type LaneEventEnvelope,
   type LaneMessage, type LaneOpened, type LaneOption, type LaneReport, type LaneRow,
-  type LaneView,
+  type LaneComposerReport, type LaneView, type SlashAcceptKey, type SlashDispatch, type SlashFilter,
+  type SlashMenu,
 } from "@/lib/bridge";
 
 /** The batching fallback, in ms.
@@ -163,6 +180,28 @@ function toolLine(m: LaneMessage): string | null {
   return line || null;
 }
 
+/** One filter answer and the inputs it answered for — so a key that lands
+ *  before the next answer can tell it is reading a stale one. */
+type Filtered = { f: SlashFilter; menu: SlashMenu; draft: string; caret: number; activity: string };
+
+/** What an Enter, a Send or a pick was pressed ON — the draft, its caret and
+ *  its revision (`slashKeys.ts`' `DraftRev`), claimed before the first
+ *  round-trip and carried through every one after it. */
+type Claim = { draft: string; caret: number; rev: number };
+
+/** Report `value` through `send` whenever it changes BY VALUE — it is rebuilt
+ *  every render, so a reference dep would re-report on every keystroke — and
+ *  `null` exactly once, at unmount: a dump answering `null` is how a caller
+ *  learns there is no panel, and a report left behind would answer with a
+ *  transcript nobody is looking at. */
+function useReport<T>(value: T, send: (v: T | null) => void): void {
+  const json = JSON.stringify(value);
+  const latest = useRef(value);
+  latest.current = value;
+  useEffect(() => send(latest.current), [json]);
+  useEffect(() => () => send(null), []);
+}
+
 /** role → the colour its label is written in. Deliberately quiet: the roles are
  *  scanned down the left edge, not read. */
 function roleColor(role: string): string {
@@ -194,6 +233,11 @@ export function LanePanel({ machine, kind, sessionId, settingsOpen, onSettingsOp
   const [readError, setReadError] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
   const [prompt, setPrompt] = useState("");
+  /** The draft's text and REVISION, moved synchronously with every change
+   *  (`setDraft`) — what a keypress claims, and what its round-trips' answers
+   *  are checked against (`owns`): an answer for a draft that has since
+   *  changed never acts on, clears or overwrites the newer one. */
+  const draftRev = useRef<DraftRev>({ text: "", rev: 0 });
   const [busy, setBusy] = useState(false);
   /** Does the next Send interrupt the turn in flight, or queue behind it?
    *
@@ -211,9 +255,13 @@ export function LanePanel({ machine, kind, sessionId, settingsOpen, onSettingsOp
    *  cannot share a selection. */
   const [picks, setPicks] = useState<Record<string, string[][]>>({});
   const [typed, setTyped] = useState<Record<string, string[]>>({});
-  /** The Stop button's inline confirm is open. Stop ends the SESSION, so it
-   *  is never one click. */
-  const [confirmStop, setConfirmStop] = useState(false);
+  /** The Stop button's inline confirm is open, and what opened it: the
+   *  header's button, or `/exit` — whose Keep keeps the draft and whose stop
+   *  clears it (§3.5). Stop ends the SESSION, so it is never one click. */
+  const [confirmStop, setConfirmStop] = useState<"header" | "slash" | null>(null);
+  /** The draft revision a `/exit` confirm was opened on: its stop clears the
+   *  draft only while that is still the composer's. */
+  const stopRev = useRef(0);
   /** How many `Settings` frames the session has sent that a committed read
    *  reflects — what ends a lost change's "not confirmed". `arrived` counts
    *  them as the nudges come in; a read takes the count as it STARTS, and
@@ -227,6 +275,33 @@ export function LanePanel({ machine, kind, sessionId, settingsOpen, onSettingsOp
    *  rendering it, held open so a harness can act inside it. */
   const held = useRef(false);
   const changes = useSettingChanges(machine, kind, sessionId, settingsSeen, view?.settings ?? NO_SETTINGS);
+
+  // ---- the composer's `/` menu (plan 029 §3.5) ---------------------------
+  /** The session's resolved menu, as the view last carried it — replaced
+   *  only when it CHANGES (compared by value), so a streaming turn's reads do
+   *  not re-filter on every frame. `null`: no menu. */
+  const [menu, setMenu] = useState<SlashMenu | null>(null);
+  const menuJson = useRef("null");
+  /** The caret, in UTF-16 code units (`selectionStart`) — what the shared
+   *  filter's open rule reads (P28). */
+  const [caret, setCaret] = useState(0);
+  /** …and the same caret, moved synchronously (`placeCaret`), for a claim
+   *  made before the render that shows it. */
+  const caretNow = useRef(0);
+  const [filtered, setFiltered] = useState<Filtered | null>(null);
+  /** The highlighted row's index, and the filter answer it is an index into
+   *  (`highlightKey`: its token and rows). */
+  const [hl, setHl] = useState({ key: "", index: 0 });
+  /** The token the menu was dismissed for with Esc, until the token changes. */
+  const [dismissed, setDismissed] = useState<string | null>(null);
+  /** The composer's inline line: a refused command (the draft kept), or a
+   *  rename that took with a warning. */
+  const [note, setNote] = useState<ComposerNote | null>(null);
+  const composer = useRef<HTMLTextAreaElement | null>(null);
+  /** Where the caret goes once a programmatic draft (a completion, the type
+   *  door) has rendered. */
+  const nextCaret = useRef<number | null>(null);
+  const filterReads = useRef(newestWins());
 
   const list = useRef<HTMLDivElement | null>(null);
   /** Stick to the bottom only when the reader already IS at the bottom — a
@@ -259,6 +334,11 @@ export function LanePanel({ machine, kind, sessionId, settingsOpen, onSettingsOp
         () => Promise.all([laneMessages(machine, kind, sessionId), laneApprovals(machine, kind, sessionId)]),
         ([v, a]) => {
           if (held.current) return;
+          const json = JSON.stringify(v.slash_menu ?? null);
+          if (json !== menuJson.current) {
+            menuJson.current = json;
+            setMenu(v.slash_menu ?? null);
+          }
           setView(v);
           setApprovals(a);
           setReadError(null);
@@ -379,31 +459,424 @@ export function LanePanel({ machine, kind, sessionId, settingsOpen, onSettingsOp
     [act1, machine, kind, sessionId],
   );
 
-  /** Send the prompt. The text is cleared only once the agent took it: on a
-   *  refusal it stays to be edited, and on a LOST answer (`outcome_unknown` —
-   *  the prompt may or may not have started a turn, and it is never resent)
-   *  it stays too, with the panel saying to check the transcript before
-   *  sending again (`sendFailureText`): the person decides. */
-  const send = async () => {
-    const text = prompt.trim();
+  /** Every change to the draft's text goes through here: the text, and its
+   *  revision moved with it (`revise`) — synchronously, so a keypress that
+   *  lands next claims the new one. */
+  const setDraft = (text: string) => {
+    draftRev.current = revise(draftRev.current, text);
+    setPrompt(text);
+  };
+  const placeCaret = (at: number) => {
+    caretNow.current = at;
+    setCaret(at);
+  };
+  /** Whether `rev` — what a keypress claimed — is still the draft's. */
+  const ownsDraft = (rev: number) => owns(rev, draftRev.current.rev);
+
+  /** Send `text` as a prompt — a draft that is not a command, or any draft on
+   *  a session with no menu. The text is cleared only once the agent took it,
+   *  and only while it is still the draft that was sent (`rev`): one typed
+   *  while it was on its way stays. On a refusal it stays to be edited, and
+   *  on a LOST answer (`outcome_unknown` — the prompt may or may not have
+   *  started a turn, and it is never resent) it stays too, with the panel
+   *  saying to check the transcript before sending again
+   *  (`sendFailureText`): the person decides. */
+  const sendText = async (text: string, rev: number) => {
     if (!text) return;
     await act1(async () => {
-      // `undefined` rather than `"queue"` for the ordinary case: queue is the
-      // op's own default, and a client that always spelled the mode out would
-      // make every adapter's default this component's business.
-      await laneSend(machine, kind, sessionId, text, interjecting ? "interject" : undefined);
-      setPrompt("");
+      await postPrompt(text);
+      if (ownsDraft(rev)) {
+        setDraft("");
+        placeCaret(0);
+      }
     }, sendFailureText);
   };
+  /** `lane.send`, interjecting when the toggle says so. `undefined` rather
+   *  than `"queue"` for the ordinary case: queue is the op's own default, and
+   *  a client that always spelled the mode out would make every adapter's
+   *  default this component's business. */
+  const postPrompt = (text: string) =>
+    laneSend(machine, kind, sessionId, text, live.current.interjecting ? "interject" : undefined);
+
+  const activity = view?.activity ?? "unknown";
+  // A fresh guard per mount: StrictMode mounts, cleans up and mounts again,
+  // and a guard cancelled by the first cleanup would drop every later answer.
+  // Declared BEFORE the filter effect: effects run in declaration order, so
+  // the first filter of every mount already runs on that mount's guard.
+  useEffect(() => {
+    filterReads.current = newestWins();
+    return () => filterReads.current.cancel();
+  }, []);
+  // Re-filter whenever the draft, the caret, the menu or the activity moves —
+  // newest answer wins (`newest.ts`): two invokes can answer in either order.
+  useEffect(() => {
+    if (!menu) {
+      setFiltered(null);
+      return;
+    }
+    const want = { menu, draft: prompt, caret, activity };
+    void filterReads.current.run(
+      () => laneSlashFilter(menu, prompt, caret, activity),
+      (f) => setFiltered({ ...want, f }),
+      () => setFiltered(null),
+    );
+  }, [menu, prompt, caret, activity]);
+
+  /** The last answer — for THIS menu only: one that answered a menu since
+   *  replaced (or gone) is no menu on screen. */
+  const filter = filtered?.menu === menu ? filtered.f : null;
+  const token = filter?.token ?? "";
+  const menuRows = filter?.rows ?? [];
+  /** The menu is ON SCREEN: open, and not dismissed for this token. */
+  const menuShown = menuUp(filter, dismissed);
+  // An Esc dismissal ends when an ANSWER says the token changed (P9) — not
+  // while a replaced catalog awaits its filter (`null`: no news).
+  const answered = filter ? filter.token : null;
+  useEffect(() => setDismissed((d) => dismissalAfter(d, answered)), [answered]);
+  // The highlight goes back to the first row on every filter change — a new
+  // token or new rows, a new catalog included (P9) — adjusted WHILE
+  // rendering, so no render (and no report) shows the new filter under the
+  // old highlight.
+  const hlKey = useMemo(() => highlightKey(token, menuRows.map((r) => r.row.name)), [filter]);
+  if (hl.key !== hlKey) setHl({ key: hlKey, index: 0 });
+  const highlight = hl.key === hlKey ? hl.index : 0;
+  /** What the latest render knows, for the async continuations and the doors
+   *  (a door's listener is registered once). */
+  const rendered = { prompt, caret, menu, activity, filtered, filter, highlight, dismissed, interjecting, busy,
+                     confirming: confirmStop };
+  const live = useRef(rendered);
+  live.current = rendered;
+  // A programmatic draft (a completion, the type door) puts the caret where
+  // it was asked for once the textarea shows it.
+  useLayoutEffect(() => {
+    const at = nextCaret.current;
+    const ta = composer.current;
+    if (at === null || !ta) return;
+    nextCaret.current = null;
+    ta.focus();
+    ta.setSelectionRange(at, at);
+  });
+
+  /** Set the draft as if typed — the caret at `at` (its end by default), and
+   *  the composer's note gone, as a keystroke clears it. A new revision when
+   *  the text changed (`setDraft`). */
+  const putDraft = (text: string, at = text.length) => {
+    setDraft(text);
+    placeCaret(at);
+    setNote(null);
+    nextCaret.current = at;
+  };
+
+  /** What a key, Send or a pick is pressed ON — the draft, its caret and its
+   *  revision, read synchronously — claimed at once, BEFORE any round-trip,
+   *  and carried through all of them. */
+  const claim = (): Claim => ({ draft: draftRev.current.text, caret: caretNow.current, rev: draftRev.current.rev });
+
+  /** The filter for the draft a key was pressed on: the last answer when it
+   *  answered these very inputs, else a fresh one — so a key pressed before
+   *  the last keystroke's answer arrived decides by the draft it was pressed
+   *  on. */
+  const freshFilter = async (at: Claim): Promise<SlashFilter | null> => {
+    const now = live.current;
+    if (!now.menu) return null;
+    const f = now.filtered;
+    if (f && f.menu === now.menu && f.draft === at.draft && f.caret === at.caret && f.activity === now.activity) {
+      return f.f;
+    }
+    try {
+      return await laneSlashFilter(now.menu, at.draft, at.caret, now.activity);
+    } catch {
+      return null;
+    }
+  };
+
+  /** A command's outcome, applied by §3.5's table to the draft it was sent
+   *  from (`rev`, `settleFor`): what it has to say shows either way, but it
+   *  clears the draft only while that is still the composer's — never a
+   *  newer one typed while it was pending. */
+  const settleSlash = (o: SlashOutcome, rev: number) => {
+    const after = settleFor(o, ownsDraft(rev));
+    if (after.clear) putDraft("");
+    setNote(after.note);
+    if (after.openSettings) onSettingsOpen(true);
+  };
+
+  /** Run one command's verb — its outcome, or its failure (craze's words; an
+   *  answer lost is "may have applied"), settled on the draft it was sent
+   *  from (`rev`). */
+  const slashVerb = (run: () => Promise<SlashOutcome>, rev: number) =>
+    act1(async () => {
+      setNote(null);
+      let outcome: SlashOutcome;
+      try {
+        outcome = await run();
+      } catch (e) {
+        const f = laneFailure(e);
+        outcome = { kind: "failed", code: f.code, message: f.message };
+      }
+      settleSlash(outcome, rev);
+    });
+
+  /** Act on what the shared dispatch answered — Send's, Enter's, or a
+   *  chosen row's — for the draft `at` it judged, which the caller has JUST
+   *  checked is still the composer's: a draft that is not a command goes out
+   *  as THAT text, and every outcome settles on THAT revision. */
+  const runDispatch = async (d: SlashDispatch, at: Claim) => {
+    switch (d.kind) {
+      case "not_command":
+        return sendText(at.draft.trim(), at.rev);
+      case "refuse":
+        return settleSlash({ kind: "refused", reason: d.reason }, at.rev);
+      case "prompt":
+        // The row's own spelling and the argument (E8) — it queues during a
+        // turn like any prompt, and interjects when the toggle says so.
+        return slashVerb(async () => {
+          await postPrompt(d.text);
+          return { kind: "done" };
+        }, at.rev);
+      case "run": {
+        const action = d.action;
+        switch (action.kind) {
+          case "set_title":
+            return slashVerb(async () => {
+              const r = await laneSetTitle(machine, kind, sessionId, d.arg ?? "");
+              return r?.warning ? { kind: "warning", text: r.warning } : { kind: "done" };
+            }, at.rev);
+          case "set_mode":
+            // Through the composer's verb, its errors here — not the
+            // settings sheet's row marks (P7). Re-selecting the current
+            // mode still sends.
+            return slashVerb(async () => {
+              await laneSet(machine, kind, sessionId, action.change);
+              return { kind: "done" };
+            }, at.rev);
+          case "stop":
+            // The existing confirm: Stop ends the SESSION, never in one key.
+            setNote(null);
+            stopRev.current = at.rev;
+            setConfirmStop("slash");
+            return;
+          case "model_picker":
+            return settleSlash({ kind: "picker" }, at.rev);
+          default:
+            return;
+        }
+      }
+    }
+  };
+
+  /** One key's operation at a time (`slashKeys.ts`' `oneAtATime`, E15) —
+   *  Enter, Tab, Send and a pick alike, each holding it from the press until
+   *  its whole filter → accept/dispatch → verb has settled. `busy` rises only
+   *  once a verb starts, so without it a second Enter during the round-trips
+   *  would send the same draft twice. */
+  const keyGuard = useRef<Guard>({ held: false });
+
+  /** Send the draft `at` claimed: through the shared dispatch when the
+   *  session has a menu (the guard serves Send as it serves Enter, P5), as
+   *  text when it has none. A dispatch answered once the draft has moved on
+   *  was for a draft that no longer exists: dropped, silently, nothing sent. */
+  const submitAt = async (at: Claim) => {
+    const now = live.current;
+    if (now.busy || !at.draft.trim()) return;
+    if (!now.menu) return sendText(at.draft.trim(), at.rev);
+    let d: SlashDispatch;
+    try {
+      d = await laneSlashDispatch(now.menu, at.draft, now.activity);
+    } catch (e) {
+      if (ownsDraft(at.rev)) setActionError(laneFailure(e).message);
+      return;
+    }
+    if (!ownsDraft(at.rev)) return;
+    await runDispatch(d, at);
+  };
+
+  /** Accept the row `name` with `key` on the draft `at` claimed — the shared
+   *  rule decides whether that completes the draft, runs the row, or refuses
+   *  it. An answer for a draft that has since moved on is dropped: no
+   *  completion overwrites the newer text, and nothing runs. */
+  const acceptAt = async (name: string, key: SlashAcceptKey, at: Claim) => {
+    const now = live.current;
+    if (!now.menu || now.busy) return;
+    let a;
+    try {
+      a = await laneSlashAccept(now.menu, at.draft, name, key, now.activity);
+    } catch (e) {
+      if (ownsDraft(at.rev)) setActionError(laneFailure(e).message);
+      return;
+    }
+    // No answer: the menu moved under the highlight (the re-filter shows it).
+    if (!a || !ownsDraft(at.rev)) return;
+    if (a.kind === "complete") {
+      putDraft(a.draft, a.caret);
+      return;
+    }
+    await runDispatch(a.dispatch, at);
+  };
+
+  /** Send, the button: the draft as it is now. */
+  const submit = () => {
+    const at = claim();
+    return oneAtATime(keyGuard.current, () => submitAt(at));
+  };
+
+  /** Enter or Tab — decided by the draft it was pressed on (`at`) and THAT
+   *  draft's filter (`slashKeys.ts`' `pressKey`): the row highlighted on
+   *  screen when the fresh answer is the one on screen (`shown`), else its
+   *  first; a plain Send when the fresh menu turned out closed. The guard is
+   *  taken at the press, BEFORE the filter is asked for: a second key while
+   *  this one's round-trips are out is dropped, never queued behind it. A
+   *  key whose draft moved on while its filter was out is dropped too. */
+  const keyedAccept = (key: "enter" | "tab", at: Claim, shown: { key: string; index: number }) =>
+    pressKey(keyGuard.current, key, shown, {
+      filter: async () => {
+        const f = await freshFilter(at);
+        return f && { open: f.open, token: f.token, names: f.rows.map((r) => r.row.name) };
+      },
+      owned: () => ownsDraft(at.rev),
+      dismissed: () => live.current.dismissed,
+      send: () => submitAt(at),
+      accept: (name) => acceptAt(name, key, at),
+    });
+
+  /** The composer's keys (`slashKeys.ts`'s table, P9). */
+  const onComposerKey = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
+    const action = composerKey({ key: e.key, shift: e.shiftKey, composing: isComposing(e.nativeEvent) }, menuShown);
+    if (action === "none") return;
+    e.preventDefault();
+    switch (action) {
+      case "dismiss":
+        // One Esc closes one thing: the menu, and nothing an Esc handler
+        // further out would close (`useEscClose` ignores a handled Esc too).
+        e.stopPropagation();
+        setDismissed(token);
+        return;
+      case "up":
+      case "down":
+        setHl((h) => ({ key: h.key, index: moveHighlight(h.index, action === "up" ? -1 : 1, menuRows.length) }));
+        return;
+      case "accept":
+      case "send":
+      case "complete":
+        // The draft is claimed NOW, as pressed — before the round-trips. All
+        // three read the menu FRESH: one about to open (a `/` typed a moment
+        // ago, its answer not in yet) still takes this Enter, and with none a
+        // send is a send.
+        void keyedAccept(action === "complete" ? "tab" : "enter", claim(), { key: hlKey, index: highlight });
+        return;
+    }
+  };
+
+  /** A click on a menu row — and the `ui.pick_slash_row` door: only a row the
+   *  menu on screen lists takes it, on the draft as it is when picked. */
+  const pickRow = (name: string) => {
+    const at = claim();
+    const { filter: f, dismissed: d } = live.current;
+    if (!menuUp(f, d) || !f?.rows.some((r) => r.row.name === name)) return;
+    void oneAtATime(keyGuard.current, () => acceptAt(name, "pick", at));
+  };
+
+  // The composer's driver doors (`ui.type_lane_composer`,
+  // `ui.key_lane_composer`, `ui.pick_slash_row`, `ui.answer_lane_stop`; test
+  // mode only — the backend refuses them otherwise, plan 029 D13). Registered
+  // once; they act through `doors`, refreshed every render.
+  const doorActs = {
+    putDraft,
+    pickRow,
+    // The Stop confirm's two buttons (`ui.answer_lane_stop`): only while it
+    // is open, as only then are they on screen.
+    answerStop: (stopIt: boolean) => {
+      if (!live.current.confirming || live.current.busy) return;
+      if (stopIt) void stop();
+      else keep();
+    },
+  };
+  const doors = useRef(doorActs);
+  doors.current = doorActs;
+  /** A menu row's click — stable, so the memoised menu skips the panel's
+   *  other renders. */
+  const onPickRow = useCallback((name: string) => doors.current.pickRow(name), []);
+  useEffect(() => {
+    if (typeof window === "undefined" || !("__TAURI_INTERNALS__" in window)) return;
+    const uns: Array<() => void> = [];
+    let cancelled = false;
+    void import("@tauri-apps/api/event").then(async ({ listen }) => {
+      uns.push(
+        await listen<{ key?: unknown; shift?: unknown; composing?: unknown }>("key-lane-composer", (e) => {
+          const ta = composer.current;
+          const key = e.payload?.key;
+          if (!ta || typeof key !== "string") return;
+          const composing = e.payload?.composing === true;
+          // A REAL keydown on the textarea (P27): the composer's own handler
+          // runs, exactly as for a key a person pressed.
+          const ev = new KeyboardEvent("keydown", {
+            key,
+            shiftKey: e.payload?.shift === true,
+            isComposing: composing,
+            bubbles: true,
+            cancelable: true,
+          });
+          ta.dispatchEvent(ev);
+          // A synthetic event carries no default action, so the browser's
+          // own for an Enter nobody took — a newline at the caret — is
+          // applied here (an IME's Enter commits its composition instead).
+          if (key === "Enter" && !ev.defaultPrevented && !composing) {
+            const text = ta.value;
+            const at = ta.selectionStart ?? text.length;
+            const end = ta.selectionEnd ?? at;
+            doors.current.putDraft(`${text.slice(0, at)}\n${text.slice(end)}`, at + 1);
+          }
+        }),
+      );
+      uns.push(
+        await listen<{ name?: unknown }>("pick-slash-row", (e) => {
+          if (typeof e.payload?.name === "string") doors.current.pickRow(e.payload.name);
+        }),
+      );
+      uns.push(
+        await listen<{ stop?: unknown }>("answer-lane-stop", (e) => {
+          if (typeof e.payload?.stop === "boolean") doors.current.answerStop(e.payload.stop);
+        }),
+      );
+      // The type door LAST: a harness re-sends it until the draft shows
+      // (a listener registered after mount can miss the first), and once it
+      // has landed every door registered before it is live too.
+      uns.push(
+        await listen<{ text?: unknown }>("type-lane-composer", (e) => {
+          if (typeof e.payload?.text === "string") doors.current.putDraft(e.payload.text);
+        }),
+      );
+      if (cancelled) uns.forEach((u) => u());
+    });
+    return () => {
+      cancelled = true;
+      uns.forEach((u) => u());
+    };
+  }, []);
 
   const cancel = () => act1(() => laneCancel(machine, kind, sessionId));
   /** Stop the SESSION, from the confirm's own button. The lane ends when the
-   *  session's close arrives (the banner says `ended`), and the row leaves. */
-  const stop = () =>
-    act1(async () => {
+   *  session's close arrives (the banner says `ended`), and the row leaves.
+   *  A confirm `/exit` opened settles the draft by the composer's table: the
+   *  stop that goes through clears it, a refusal is said inline. */
+  const stop = () => {
+    const run = async () => {
       await laneStop(machine, kind, sessionId);
-      setConfirmStop(false);
-    });
+      setConfirmStop(null);
+    };
+    return confirmStop === "slash"
+      ? slashVerb(async () => {
+          await run();
+          return { kind: "done" };
+        }, stopRev.current)
+      : act1(run);
+  };
+  /** Keep: the confirm closes and nothing is sent — and a `/exit` draft stays
+   *  as it was (§3.5). */
+  const keep = () => {
+    setConfirmStop(null);
+    if (confirmStop === "slash") settleSlash({ kind: "cancelled" }, stopRev.current);
+  };
   /** Stop exists only when the session's streamed capabilities offer it — a
    *  TUI-hosted craze session, and every opencode one, has none. */
   const canStop = capabilities?.stop === true;
@@ -524,22 +997,29 @@ export function LanePanel({ machine, kind, sessionId, settingsOpen, onSettingsOp
     approvals: cards,
     can_cancel: verbs.cancel.enabled,
     interject: canInterject ? { on: interjecting, enabled: verbs.interject.enabled } : null,
-    stop: canStop ? { confirming: confirmStop } : null,
+    stop: canStop ? { confirming: confirmStop !== null } : null,
     settings_chip: chip,
     error,
   };
-  // Compared BY VALUE, not by reference: the report is rebuilt every render, so
-  // a reference dep would re-report on every keystroke in the prompt box.
-  const reported = JSON.stringify(report);
-  const latest = useRef(report);
-  latest.current = report;
-  useEffect(() => {
-    reportLane(latest.current);
-  }, [reported]);
-  // Clearing is its own effect so it runs exactly once, at unmount: `lane.dump`
-  // answering `null` is how a caller learns there is no panel, and a report left
-  // behind would answer with a transcript nobody is looking at.
-  useEffect(() => () => reportLane(null), []);
+  useReport(report, reportLane);
+  // The composer apart (`lane.dump` answers both as one `lane`): typing
+  // re-sends these few fields, never the transcript.
+  const composerReport: LaneComposerReport = {
+    draft: prompt,
+    slash_menu: menu
+      ? {
+          open: menuShown,
+          token,
+          rows: menuShown
+            ? menuRows.map((r, i) => ({ name: r.row.name, dimmed: r.dimmed, highlighted: i === highlight }))
+            : [],
+          draft: prompt,
+          refusal: note?.tone === "refusal" ? note.text : null,
+          warning: note?.tone === "warning" ? note.text : null,
+        }
+      : null,
+  };
+  useReport(composerReport, reportLaneComposer);
 
   return (
     // A flex SIBLING of the main column, not a fixed overlay: the panel takes
@@ -584,7 +1064,7 @@ export function LanePanel({ machine, kind, sessionId, settingsOpen, onSettingsOp
               confirm. */}
           {canStop && !confirmStop && (
             <button
-              onClick={() => setConfirmStop(true)}
+              onClick={() => setConfirmStop("header")}
               disabled={busy || !!view?.ended}
               title="Stop the session (craze ends it; the transcript stays until you close it)"
               className="hbtn inline-flex flex-none items-center gap-1.5 rounded-[9px] px-2.5 py-1.5 text-[12.5px] font-semibold"
@@ -627,7 +1107,7 @@ export function LanePanel({ machine, kind, sessionId, settingsOpen, onSettingsOp
         )}
       </header>
 
-      {canStop && confirmStop && (
+      {canStop && confirmStop !== null && (
         <div
           data-stop-confirm
           className="flex flex-none items-center gap-2 border-b border-shed-border px-4 py-2 text-[12.5px]"
@@ -643,7 +1123,7 @@ export function LanePanel({ machine, kind, sessionId, settingsOpen, onSettingsOp
             Stop session
           </button>
           <button
-            onClick={() => setConfirmStop(false)}
+            onClick={keep}
             disabled={busy}
             className="hbtn rounded-[9px] px-2.5 py-1.5 text-[12.5px] font-semibold"
             style={{ background: "var(--shed-surface)", color: "var(--shed-text-secondary)", border: "1px solid var(--shed-border)" }}
@@ -903,18 +1383,39 @@ export function LanePanel({ machine, kind, sessionId, settingsOpen, onSettingsOp
         </div>
       )}
 
+      {/* The `/` menu, above the composer — only on a session whose view
+          carries one, only while the shared filter says it is open, and not
+          once Esc dismissed it for this token. */}
+      {menuShown && <SlashMenuPanel rows={menuRows} highlight={highlight} onPick={onPickRow} />}
+      {/* What a command left to say: a refusal (the draft kept to fix) or a
+          rename that took with a caveat. */}
+      {note && (
+        <div
+          data-composer-note={note.tone}
+          className="flex-none border-t border-shed-border px-4 py-2 font-mono text-[12px]"
+          style={
+            note.tone === "refusal"
+              ? { background: "var(--shed-deny-bg)", color: "var(--shed-danger)" }
+              : { background: "var(--shed-warn-bg)", color: "var(--shed-warn-fg)" }
+          }
+        >
+          {note.text}
+        </div>
+      )}
+
       <div className="flex flex-none items-end gap-2 border-t border-shed-border bg-shed-surface px-4 py-3">
         <textarea
+          ref={composer}
           value={prompt}
-          onChange={(e) => setPrompt(e.target.value)}
-          onKeyDown={(e) => {
-            if (e.key === "Enter" && !e.shiftKey) {
-              e.preventDefault();
-              void send();
-            }
+          onChange={(e) => {
+            setDraft(e.target.value);
+            placeCaret(e.target.selectionStart ?? e.target.value.length);
+            setNote(null);
           }}
+          onSelect={(e) => placeCaret(e.currentTarget.selectionStart ?? 0)}
+          onKeyDown={onComposerKey}
           rows={2}
-          placeholder="Send a prompt…"
+          placeholder={menu ? "Send a prompt, or / for commands…" : "Send a prompt…"}
           className="min-w-0 flex-1 resize-none rounded-[9px] border border-shed-border bg-shed-inset px-3 py-2 text-[13px] text-shed-text outline-none focus:border-shed-accent"
         />
         <div className="flex flex-none flex-col gap-2">
@@ -948,7 +1449,7 @@ export function LanePanel({ machine, kind, sessionId, settingsOpen, onSettingsOp
             </button>
           )}
           <button
-            onClick={() => void send()}
+            onClick={() => void submit()}
             disabled={busy || !prompt.trim()}
             title={interjecting ? "Send (interject)" : "Send"}
             className="hbtn inline-flex h-9 w-9 items-center justify-center rounded-[9px]"

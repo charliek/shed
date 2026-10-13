@@ -115,6 +115,7 @@ async fn live_smoke() {
             provider: None,
             prompt: Some("Reply with the single word: pong".to_string()),
             request_id: "live-smoke".to_string(),
+            title: None,
         })
         .await
         .expect("create")

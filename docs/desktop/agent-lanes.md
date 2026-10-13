@@ -50,6 +50,8 @@ session row alone and `lane.messages` carries `capabilities` and `settings`.
 | `history_cursor` | `true` | `false` | A reconnect can resume from a cursor silently, with no reseed. |
 | `settings` | the session has a model, mode or option to show | `false` | The settings chip and sheet are offered. |
 | `stop` | craze's `stop` | `false` | The contract can end the session. A session hosted by a craze TUI cannot be stopped this way; hub-created and `craze serve` sessions can. |
+| `set_title` | `true` | `false` | The session can be renamed (`lane.set_title`, the composer's `/rename`). |
+| `slash` | craze's `slashCatalog` (craze 0.1.1) | `false` | The session publishes a slash catalog, and the composer offers a `/` menu once it has arrived. |
 
 The panel hides an affordance the session's capabilities do not offer, rather
 than showing it disabled.
@@ -258,6 +260,15 @@ defaults or history of its own.
   machine" and Create is disabled.
 - **Directory.** craze's recent directories, newest first, as one-tap choices,
   or a typed path. It must be absolute; craze checks that it exists.
+- **Name.** Optional, shown when the machine's live hub can name a session at
+  create (craze 0.1.1's `createTitle`; a dormant machine's sheet shows it once
+  the hub it starts is live). The session is titled from its first frame: the
+  create's own answer and the transcript's first snapshot already carry the
+  name, so it is never shown untitled and renamed after. The
+  name is sent trimmed, and not at all when blank; craze normalizes it and
+  refuses one that is blank once normalized, which the sheet shows under the
+  field. A retry of an unknown outcome sends exactly the name the first send
+  did; changing the name, like any edit, starts a new request.
 - **First prompt.** Optional, multi-line.
 - Not in the sheet: model, effort, fast and permission mode. A session starts
   on its provider's default model, and a sheet-created session runs in craze's
@@ -384,6 +395,49 @@ on its own), a cancelled turn, errors and "restored" after a replay draw rows
 in craze's own wording. A snapshot whose window was cut opens with one "earlier transcript
 omitted" row. Only the main agent draws rows: a sub-agent's events and
 transcript are not shown.
+
+### The `/` menu
+
+A craze 0.1.1 session publishes its **slash catalog** — every `/` command it
+offers, and how each runs — and the transcript's composer turns it into a menu
+(plan 029). Which rows show, what a typed token matches, what a key or a click
+does and when a command is refused are one implementation in the shared core
+(`shed_app::slash_menu`), so the desktop and the phone agree by construction;
+the panel only renders and handles keys.
+
+- **Typing `/`** as the first character of a one-line draft opens the menu
+  above the composer while the caret is in the first token; it lists the rows
+  this client can run, matched as craze's TUI does (name prefix, then the
+  plugin spelling, then substrings). It scrolls; a catalog has no row cap.
+- **Keys.** Enter accepts the highlighted row — it runs when the token already
+  spells the row, and otherwise selects it; Tab completes; ↑/↓ move the
+  highlight, which starts on the first row again whenever the typed filter or
+  the catalog changes; Esc closes the menu until the token changes (a catalog
+  update does not reopen it). With no menu up, Enter sends. Shift+Enter is a
+  newline, and no key acts while an input method is composing.
+- **What a row does.** A prompt row (the agent's own commands) is sent as
+  `/<name> <argument>` and queues during a turn like any prompt. `/rename
+  <title>` renames the session (`lane.set_title`); the header changes when
+  craze's update arrives. A mode row (`/plan`, `/ask`, `/agent`) changes the
+  mode at once, even to the mode it is in. `/exit` opens Stop's confirm.
+  `/model` opens the settings sheet's model list (no inline model yet).
+- **While a turn runs**, a row that cannot run until it ends (a mode,
+  `/model`) is shown dimmed, "after this turn", and choosing it says so —
+  rather than hidden, because the limit is temporary.
+- **Refused here, never sent.** A builtin this client does not run yet
+  (`/help`, `/clear`, `/btw` and craze's other local rows) is refused with a
+  reason when typed and sent — not passed to the agent as text. So is an
+  argument to a row that takes none, and `/rename` with no title.
+- **The draft.** It clears when a command succeeds and when `/model` opens the
+  sheet; it stays — with craze's words, or the reason — when a command is
+  refused, when its answer is lost ("may have applied — check the session"),
+  and when Stop's confirm is answered Keep. A rename craze made but could not
+  record shows as a warning, the draft cleared. A command only ever clears the
+  draft it was sent from: text typed while it is pending stays when it
+  answers, and an Enter or Send on a draft that changed before the command
+  went out does nothing.
+- A session without a catalog — an older craze, the fake host, every opencode
+  lane — has no menu, and a `/` draft is sent as text.
 
 ### Approvals
 
@@ -675,7 +729,8 @@ open subscription, **client-shared Rust, not Tauri-specific**. It folds a
 `Reset … Ready` staging the contract promises, and exposes them through a
 typed `LaneView::snapshot(since_seq)` (`LaneViewSnapshot { messages, full,
 activity, session, generation, stale, ended, capabilities, settings,
-approvals }`);
+slash_menu, approvals }`, `slash_menu` being the session's slash catalog
+resolved against its capabilities and cached until either changes);
 `None` returns everything, `Some` a delta honored only when the cursor still
 lands inside the live generation's `seq` window. It lives in `shed-app`,
 ungated, for the same reason `machine.rs` and `roost.rs` are — mobile links
@@ -703,6 +758,7 @@ namespaces.
 | `lane.stop` | Ends the SESSION (craze's `session.stop`), not just the transcript: answered on craze's receipt, after which the lane ends and the row leaves. The panel offers Stop only when the session's `capabilities.stop` is true, behind an inline confirm. |
 | `lane.settings` | The session's settings, read now — the model and models in craze's order, the mode and modes, the current model's own options and the usage. The panel renders the stream's copy, `lane.messages`' `settings`. |
 | `lane.set` | Changes one setting: `{kind: "model"\|"mode", id}` or `{kind: "config", id, value, for_model?}` (craze's `session.set`; `for_model` is the model the client displayed, else the lane's folded one). The new value arrives on the stream; craze's `stale_model` is `not_accepting`, and an answer lost to a drop is `outcome_unknown` — never resent. |
+| `lane.set_title` | Renames the SESSION (craze's `session.setTitle`; the composer's `/rename`): the title trimmed, a blank one refused unsent. The new title arrives on the stream; `{warning}` is a rename craze made but could not record. Refused by a session whose `capabilities.set_title` is false. |
 | `lane.close` | Ends the subscription; the last close on a shared SSH forward tears it down. |
 
 A failure comes back as `{code, message}` with the contract's own snake_case
@@ -762,7 +818,10 @@ lane reseeds.
   cannot be resumed from the desktop (craze#88).
 - **No sub-agent transcripts.** A sub-agent's asks are answerable; its own
   messages are not shown.
-- **No queue editing,** no send-now, no session rename.
+- **No queue editing,** no send-now.
+- **The `/` menu is phase 1.** craze's `local` rows (`/help`, `/clear`, …),
+  side questions (`/btw`) and an inline `/model <id>` are not offered yet;
+  typed, the builtins are refused.
 - **No resend.** A verb lost with its connection is reported `outcome_unknown`
   and never resent, even where craze could resume the command.
 - **A craze TUI run with its control socket off** has no host in the roster,

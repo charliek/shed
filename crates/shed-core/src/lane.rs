@@ -57,19 +57,20 @@
 //! - Nothing else moved. **`history` stays** (for craze it is
 //!   `session.snapshot`, and a future page view wants it).
 //!
-//! [`AgentLane::settings`], [`AgentLane::set`] and [`AgentLane::stop`] have **no
-//! default bodies**: every adapter states its answer. One that cannot do the
-//! thing answers [`LaneError::Failed`] (`"… is not supported by <agent>"`) and
-//! keeps the affordance off through its capabilities; a default answering
-//! [`LaneError::NotAccepting`] was rejected because "not now" is the wrong
-//! posture for "never".
+//! [`AgentLane::settings`], [`AgentLane::set`], [`AgentLane::stop`] and
+//! [`AgentLane::set_title`] have **no default bodies**: every adapter states
+//! its answer. One that cannot do the thing answers [`LaneError::Failed`]
+//! (`"… is not supported by <agent>"`) and keeps the affordance off through its
+//! capabilities; a default answering [`LaneError::NotAccepting`] was rejected
+//! because "not now" is the wrong posture for "never".
 //!
 //! # Semantics pinned for every adapter
 //!
 //! A **reseed** is bracketed by **[`LaneEvent::Reset`] … [`LaneEvent::Ready`]**:
 //! between them the adapter replays the full seed (messages, then the session
 //! row and its [`LaneEvent::Capabilities`] — and its [`LaneEvent::Settings`] when
-//! those capabilities say `settings` — then approvals; an adapter that resumes a
+//! those capabilities say `settings`, and its [`LaneEvent::Slash`] when they say
+//! `slash` and the session has a catalog — then approvals; an adapter that resumes a
 //! cursor's tail, craze's, appends those replayed events after them, still
 //! before `Ready`); a client **stages** everything it receives after `Reset` and
 //! swaps its view atomically on `Ready` (so a reseed never flickers), and
@@ -93,8 +94,9 @@
 //! tagged on a `kind` key, snake_case
 //! (`#[serde(tag = "kind", rename_all = "snake_case")]`); the enum-like strings
 //! ([`LaneApprovalKind`], [`LaneApprovalStatus`], [`LaneDecision`], [`SendMode`],
-//! [`SourceOffline`], [`LaneProviderState`], [`LanePromptOutcome`]) serialize as
-//! bare snake_case strings. [`LaneError`] is the exception whose wire form is
+//! [`SourceOffline`], [`LaneProviderState`], [`LanePromptOutcome`], and the slash
+//! catalog's [`LaneSlashSource`] … [`LaneSlashPicker`]) serialize as bare
+//! snake_case strings. [`LaneError`] is the exception whose wire form is
 //! **shape-heterogeneous**: its `BadRequest(String)`-style variants are newtypes
 //! over a non-map, which serde REFUSES to tag internally, so the error type uses
 //! external tagging with `rename_all = "snake_case"` — a unit variant crosses as
@@ -117,15 +119,17 @@
 //! of every type is chosen by DIRECTION: events and results inbound tolerant,
 //! requests and changes strict. Today it makes these tolerant:
 //! [`LaneApprovalKind`], [`LaneApprovalStatus`], [`SourceOffline`],
-//! [`LaneProviderState`] and [`LanePromptOutcome`], each preserving an
-//! unrecognized wire string in an `Other(String)` (hand-written serde, because
+//! [`LaneProviderState`] and [`LanePromptOutcome`], and the slash catalog's six
+//! ([`LaneSlashSource`], [`LaneSlashRequires`], [`LaneSlashKind`],
+//! [`LaneSlashArg`], [`LaneSlashMethod`], [`LaneSlashPicker`]), each preserving
+//! an unrecognized wire string in an `Other(String)` (hand-written serde, because
 //! derived serde would encode `Other("x")` as an object); [`LaneEvent`] and
 //! [`SourceEvent`], whose `Unknown` absorbs a `kind` this build has never heard
 //! of; and the result DTOs ([`LaneCreateOptions`], [`LaneCreated`],
-//! [`LaneSettings`] and their parts), which ignore an unknown field and default
-//! an absent list. It leaves [`LaneDecision`], [`SendMode`], [`LaneAnswer`],
-//! [`LaneError`], [`LaneCreateRequest`] and [`LaneSettingChange`] strict — the
-//! last two `deny_unknown_fields`.
+//! [`LaneSettings`], [`LaneSlashCatalog`] and their parts), which ignore an
+//! unknown field and default an absent list. It leaves [`LaneDecision`],
+//! [`SendMode`], [`LaneAnswer`], [`LaneError`], [`LaneCreateRequest`] and
+//! [`LaneSettingChange`] strict — the last two `deny_unknown_fields`.
 //!
 //! **Tolerance is about VALUES, not types.** A known field whose value has the
 //! wrong JSON TYPE (an object where a string belongs, a number past its width)
@@ -135,9 +139,10 @@
 //! malformed payload is the job of that adapter's wire layer (opencode's REST
 //! and SSE readers; craze's, plan 025 C7), which knows what the peer meant. The
 //! three plan-025 tolerant enums ([`SourceOffline`], [`LaneProviderState`],
-//! [`LanePromptOutcome`]) go one step further only because it costs nothing:
-//! ANY JSON value decodes there, a non-string as `Other(<its compact JSON>)`, so
-//! one odd cause or state never takes its whole frame with it.
+//! [`LanePromptOutcome`]) and the slash catalog's six go one step further only
+//! because it costs nothing: ANY JSON value decodes there, a non-string as
+//! `Other(<its compact JSON>)`, so one odd cause or state never takes its whole
+//! frame with it.
 //!
 //! The tolerant half matters most where it is least visible. This module already
 //! argues, on [`LaneQuestion`]'s optional booleans, that a strict FIELD fails the
@@ -212,6 +217,23 @@
 //! and [`AgentSource::create_options`] are properties of the machine, not of a
 //! session), and rides every source seed the same way.
 //!
+//! # The slash catalog (plan 029)
+//!
+//! [`LaneEvent::Slash`] carries the session's `/` commands and what running
+//! each does ([`LaneSlashCatalog`], craze's slash catalog read row by row).
+//! It is **optional in a seed**: on a session whose capabilities say `slash`,
+//! a seed carries one AFTER its `Capabilities` and before its `Ready` exactly
+//! when the session HAS a catalog — `slash: true` with no catalog yet is a
+//! catalog still to come, and a seed without one means the client holds none
+//! (a client clears its catalog with every seed, so "no `Slash` in this seed"
+//! IS "no catalog"). After `Ready`, each change is a live `Slash` that
+//! REPLACES the catalog whole (an empty one included); a silent resume
+//! restates it before its lone `Ready`, as it restates `Settings`. Never on a
+//! session whose capabilities do not say `slash` (the conformance kit's
+//! `SlashNotAdvertised`). It is not a part of [`LaneSettings`]: a catalog is
+//! not gated on `settings`, and hundreds of rows have no business riding
+//! every model change.
+//!
 //! # Generations are matched, not assumed
 //!
 //! A `Ready` swaps a staged seed **only when its generation equals the staged
@@ -251,9 +273,9 @@
 //! |---|---|---|
 //! | source `subscribe` | `GET /session` (every root on that server, the global store) plus one `GET /session/status?directory=` per distinct directory, polled every 5 s and diffed into `Session`/`Removed`; activity `busy\|retry → Working`, `idle → Idle`; a failed poll is `Offline{unreachable}` alone, and the next good one reseeds | `sessions.subscribe` on its own roster connection, after a hub `hello` that must offer `rosterSubscribe` and `connect`: the reply's rows seed `Reset … Ready`, each `roster` notification's `upserts`/`removes` become `Session`/`Removed` keyed by `hostId`; a roster `reset` resubscribes, EOF or `hub_closing` is `Offline{unreachable}` and a redial |
 //! | source `create_options` | one implicit `opencode` provider, `ready`; no default, no recent directories | `sessions.createOptions`, on its own connection, where the hub's `hello` says `createOptions` |
-//! | source `create` | `POST /session?directory=<cwd>`, then `prompt_async` when a prompt is given; `request_id` accepted and unused | `session.create{cwd, provider?, prompt?, requestId}`, on its own connection; an unknown outcome retries once under the same `requestId` |
+//! | source `create` | `POST /session?directory=<cwd>`, then `prompt_async` when a prompt is given; `request_id` accepted and unused; a `title` is [`LaneError::Failed`] before the first POST ([`SourceCapabilities::create_title`] false) | `session.create{cwd, provider?, prompt?, requestId, title?}`, on its own connection; an unknown outcome retries once under the same `requestId`; a `title` goes only to a hub whose `hello` says `createTitle` — a fresh create to one that does not is `Failed`, nothing sent, and a retry or a held replay there is outcome unknown, the id and the title kept |
 //! | source `open` | binds the session id; no I/O | binds the `hostId` (and the roster row's craze `sessionId` when the source holds it); no I/O |
-//! | `session` | `GET /session/{sessionID}` plus its `/session/status` and approval lists | the roster row the lane was opened with, refreshed by the watcher (attach's info document, the fold's activity); never dials |
+//! | `session` | `GET /session/{sessionID}` plus its `/session/status` and approval lists | the roster row the lane was opened with, refreshed by the watcher (attach's info document, the fold's activity and title); never dials |
 //! | `history` | `GET /session/{sessionID}/message` through a fresh fold (seq from 1); `cursor` ignored, `truncated` from the page cap | `session.snapshot` folded into rows; `cursor` ignored (craze has no paging); `truncated` when the snapshot was windowed or dropped, or its omitted ledger is non-empty |
 //! | `subscribe` | `GET /event?directory=<session dir>` opened **first**, then the REST seed while live frames buffer; `Reset` … `Ready` brackets every (re)connect; transcript frames filtered to the root id, approval frames to root + descendants; empty-id frames count as liveness | `session.connect{sessionId: <hostId>}` through the hub's splice, the host's `hello` pipelined behind it, the host's own `sessions.list` (the row, and the craze session id every call carries), then `session.attach{sessionId, cursor?}` (`when` at its default, `ready`): a reply with a `snapshot` seeds `Reset … Ready`; one without is the cursor honoured — a silent resume, `Stale` then a lone `Ready`; every `Ready` waits for the attachment's `synchronized` and for the fenced registry read (`approvals`, below) |
 //! | `send(Queue)` | `POST /session/{sessionID}/prompt_async` | `session.prompt{mode: "queue"}` |
@@ -266,6 +288,8 @@
 //! | `settings` | [`LaneSettings::default`] — capabilities say `settings: false` | the session info document's catalogs and the snapshot's settings, kept current by `meta` deltas (each section present replaces that section whole; a model catalog only at an equal or higher revision) |
 //! | `set` | [`LaneError::Failed`] — not supported | `session.set{setting: {kind, id?, value, forModel?}}` (plan 025's settings milestone, C11): a model or mode by its id; a config option by its id and value, bound (`forModel`) to the model the CLIENT displayed it for ([`LaneSettingChange::Config`]'s `for_model`, Amendment A13; the lane's folded model only when the client sent none) — refused `stale_model` (`NotAccepting`) once the session has left it. The new value returns on the stream, from the change's own `meta` delta (or, when craze could learn no revision, from its confirmed value) |
 //! | `stop` | [`LaneError::Failed`] — not supported | `session.stop` where the session capability `stop` is true — a receipt; the stream's `Down{"session_closed"}` is its completion |
+//! | `set_title` | [`LaneError::Failed`] — not supported | `session.setTitle{title}`; the new title returns on the stream (its `meta` delta re-emits `Session`), never from the reply; `index_write` (renamed, unrecorded) is `Failed` with craze's cause |
+//! | [`LaneEvent::Slash`] | never — capabilities say `slash: false` | the session's `slash` section (a snapshot's `settings.slash`, a `meta` delta's `state.slash`) where the session capability `slashCatalog` is true |
 //! | errors | 401 → [`LaneError::Unauthorized`]; 404 on a session route → [`LaneError::UnknownSession`], on a permission/question route → [`LaneError::UnknownApproval`]; 409/4xx with an opencode error body → `NotAccepting`/`BadRequest(message)` by body; other non-2xx → [`LaneError::Failed`]; dial failure → [`LaneError::Unavailable`] | the table below |
 //!
 //! craze publishes its own code → [`LaneError`] table (PM "The code → shed
@@ -1349,6 +1373,13 @@ pub enum LaneEvent {
     /// on a session whose capabilities say [`LaneCapabilities::settings`]: in
     /// every seed (after its `Capabilities`, before its `Ready`) and on change.
     Settings { settings: LaneSettings },
+    /// The session's slash catalog, WHOLE — it replaces the one a client
+    /// holds. Only on a session whose capabilities say
+    /// [`LaneCapabilities::slash`]: in a seed (after its `Capabilities`,
+    /// before its `Ready`) only when the session has a catalog, then on every
+    /// change, and restated before a silent resume's `Ready` (module doc, "The
+    /// slash catalog").
+    Slash { catalog: LaneSlashCatalog },
     /// The transport went away and the adapter is retrying **without** a reseed.
     /// **Non-terminal**: the client keeps its rows and shows them stale with
     /// `reason`. A lone [`LaneEvent::Ready`] of the SAME generation clears it (a
@@ -1467,6 +1498,11 @@ pub struct SourceCapabilities {
     pub kind: String,
     pub create: bool,
     pub create_options: bool,
+    /// A create may name the session ([`LaneCreateRequest::title`], plan 029
+    /// D5): a client shows the name field only where this is true. Absent
+    /// decodes to `false` — a producer from before the field offers none.
+    #[serde(default)]
+    pub create_title: bool,
 }
 
 /// Why a source is [`SourceEvent::Offline`].
@@ -1854,11 +1890,11 @@ pub enum SendMode {
 /// reads the latest from its view — it never caches them at open.
 ///
 /// opencode's row, in every seed:
-/// `{ kind: "opencode", interject: false, cancel: true, approvals: true, history_cursor: false, settings: false, stop: false }`.
+/// `{ kind: "opencode", interject: false, cancel: true, approvals: true, history_cursor: false, settings: false, stop: false, set_title: false, slash: false }`.
 /// craze's is the session's own (plan 025 §3.3.9): `interject`, `cancel` and
 /// `stop` as the session states them, `approvals` from its ask/plan cards,
 /// `history_cursor: true`, `settings` when it has a model, mode or option to
-/// show.
+/// show, `set_title: true` (plan 029 D4) and `slash` as its `slashCatalog`.
 ///
 /// `create` left this type in plan 025: creating is a machine-level act, and it
 /// is [`SourceCapabilities::create`] now. An older producer's `create` key is
@@ -1894,6 +1930,15 @@ pub struct LaneCapabilities {
     /// Absent decodes to `false`, the reading that offers no Stop button.
     #[serde(default)]
     pub stop: bool,
+    /// [`AgentLane::set_title`] works — the session can be renamed from this
+    /// client (plan 029 D4). Absent decodes to `false`.
+    #[serde(default)]
+    pub set_title: bool,
+    /// The session publishes a slash catalog ([`LaneEvent::Slash`], plan 029
+    /// D3). `true` with no `Slash` yet is a catalog still to come; absent
+    /// decodes to `false`, and such a session never sends one.
+    #[serde(default)]
+    pub slash: bool,
 }
 
 /// What a lane call can go wrong with.
@@ -2057,9 +2102,9 @@ impl<'de> Deserialize<'de> for LaneProviderState {
     }
 }
 
-/// A create, as a client asks for it (plan 025 D6: a provider, a directory and
-/// an optional first prompt — nothing else; the model is the provider's
-/// default).
+/// A create, as a client asks for it (plan 025 D6: a provider, a directory, an
+/// optional first prompt and — plan 029 D5 — an optional name; nothing else,
+/// the model is the provider's default).
 ///
 /// **Outbound, strict** (`deny_unknown_fields`): a create carrying a field this
 /// build cannot honour (a model, a permission mode a newer client grew) is
@@ -2083,6 +2128,14 @@ pub struct LaneCreateRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompt: Option<String>,
     pub request_id: String,
+    /// The session's name from its start (plan 029 D5), sent as given — the
+    /// agent normalizes it; `None` starts it untitled. Honoured only where
+    /// [`SourceCapabilities::create_title`] says so: an adapter that cannot
+    /// refuses a titled FRESH create before sending anything, and never
+    /// strips the title to make one go through. It is part of the request:
+    /// a retry under the same `request_id` carries exactly the same title.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
 }
 
 /// What a create answered: the new session's row, and what became of its first
@@ -2266,6 +2319,229 @@ pub enum LaneSettingChange {
     },
 }
 
+// ---- the slash catalog (plan 029) ----
+
+/// A session's `/` commands, in the order a menu lists them, each with what
+/// running it does — [`LaneEvent::Slash`]'s payload (plan 029 D2; module doc,
+/// "The slash catalog").
+///
+/// **Inbound, tolerant**, and RAW: the rows as the agent described them, every
+/// one it could read — a `local` help row, an `unavailable` mode row, a row
+/// requiring a capability this session lacks, two rows of one name. Which rows
+/// a client SHOWS, and which wins a name, is a rule over these rows and the
+/// session's capabilities that a client applies (`shed_app::slash_menu`), not
+/// something this type decides. No cap: a catalog is as long as the agent
+/// made it.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct LaneSlashCatalog {
+    #[serde(default)]
+    pub rows: Vec<LaneSlashRow>,
+}
+
+/// One `/` command.
+///
+/// `name` is the token without its `/` — one run of characters with no
+/// whitespace or control character, never empty (an adapter drops a row whose
+/// name is not one, craze's own rule) — and what a client matches, completes
+/// and runs the row by. `qualified` is the second spelling a plugin row answers
+/// to (`plugin:name`), only where it differs from `name`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LaneSlashRow {
+    pub name: String,
+    /// One line for the menu; `None` when the agent gave none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    pub source: LaneSlashSource,
+    /// The plugin a plugin row came from.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plugin: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub qualified: Option<String>,
+    /// The session capability the row needs; `None` for none. A row with one
+    /// claims no name until it is shown (craze's rule).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requires: Option<LaneSlashRequires>,
+    /// The row runs while a turn is running, rather than waiting for it to
+    /// end. Absent is `false`; a prompt row leaves it `false` — it queues.
+    #[serde(default)]
+    pub while_working: bool,
+    pub run: LaneSlashRun,
+}
+
+/// What selecting a [`LaneSlashRow`] does — its `kind`, and the fields that
+/// kind reads.
+///
+/// `mode` is the one field that is not the agent's verbatim: a `method` row
+/// whose setting is a MODE carries the mode's id here (craze's `run.setting`
+/// `{kind: "mode", value}`); any other setting leaves it `None`. It is an
+/// inbound string, never the strict outbound [`LaneSettingChange`] — only a
+/// client's resolved action builds `LaneSettingChange::Mode` from it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LaneSlashRun {
+    pub kind: LaneSlashKind,
+    /// Whether the row takes an argument. Absent decodes to
+    /// [`LaneSlashArg::None`].
+    #[serde(default)]
+    pub arg: LaneSlashArg,
+    /// How to show the argument (`<title>`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub arg_hint: Option<String>,
+    /// A `method` row's method.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub method: Option<LaneSlashMethod>,
+    /// The parameter the argument fills (`title`, `question`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub param: Option<String>,
+    /// A mode row's mode id (the type doc).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
+    /// A `picker` row's picker.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub picker: Option<LaneSlashPicker>,
+    /// A `local` row's action, the client's own (`help`, `clear`, …) — an open
+    /// string: a client runs only the ones it has.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local: Option<String>,
+    /// Why an `unavailable` row cannot run, in the agent's words.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+/// The catalog's tolerant enums, written once: unit variants with their wire
+/// words and an `Other(String)` that keeps an unrecognized one — exactly
+/// [`LanePromptOutcome`]'s shape (`as_str`, `from_wire`, `is_known`, a bare
+/// string each way, ANY JSON value read through `tolerant_word`), so a newer
+/// agent's value hides its row in a client rather than failing the catalog.
+/// The round-trip caveat on [`LaneApprovalKind`] applies to each identically:
+/// `from_wire` never mints an `Other` holding a known word.
+macro_rules! tolerant_enum {
+    (
+        $(#[$meta:meta])*
+        pub enum $name:ident {
+            $( $(#[$vmeta:meta])* $variant:ident => $word:literal, )+
+        }
+    ) => {
+        $(#[$meta])*
+        #[derive(Debug, Clone, PartialEq, Eq, Hash)]
+        pub enum $name {
+            $( $(#[$vmeta])* $variant, )+
+            /// An unrecognized value, its raw wire string preserved.
+            Other(String),
+        }
+
+        impl $name {
+            pub fn as_str(&self) -> &str {
+                match self {
+                    $( $name::$variant => $word, )+
+                    $name::Other(s) => s,
+                }
+            }
+
+            /// Parse a wire word, preserving an unrecognized one as `Other`.
+            pub fn from_wire(s: &str) -> $name {
+                match s {
+                    $( $word => $name::$variant, )+
+                    other => $name::Other(other.to_string()),
+                }
+            }
+
+            /// A recognized value. A `false` here hides the row.
+            pub fn is_known(&self) -> bool {
+                !matches!(self, $name::Other(_))
+            }
+        }
+
+        impl Serialize for $name {
+            fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+                s.serialize_str(self.as_str())
+            }
+        }
+
+        impl<'de> Deserialize<'de> for $name {
+            fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+                Ok($name::from_wire(&tolerant_word(d)?))
+            }
+        }
+    };
+}
+
+tolerant_enum! {
+    /// Where a [`LaneSlashRow`] came from.
+    pub enum LaneSlashSource {
+        /// The agent's own command (craze's builtins).
+        Builtin => "builtin",
+        /// A command the agent's provider advertised.
+        Agent => "agent",
+        /// A plugin command or skill the agent found and expands.
+        Plugin => "plugin",
+        /// A skill on disk the provider resolves.
+        Skill => "skill",
+    }
+}
+
+tolerant_enum! {
+    /// The session capability a [`LaneSlashRow`] needs.
+    pub enum LaneSlashRequires {
+        /// [`LaneCapabilities::stop`].
+        Stop => "stop",
+        /// Side questions (no contract verb yet, plan 029 X1).
+        Aside => "aside",
+    }
+}
+
+tolerant_enum! {
+    /// What selecting a [`LaneSlashRow`] does.
+    pub enum LaneSlashKind {
+        /// Send `/name` and the argument as a prompt.
+        Prompt => "prompt",
+        /// Call [`LaneSlashRun::method`].
+        Method => "method",
+        /// Open [`LaneSlashRun::picker`].
+        Picker => "picker",
+        /// Ask a side question.
+        Aside => "aside",
+        /// Run the client's own [`LaneSlashRun::local`] action.
+        Local => "local",
+        /// Nothing: it cannot run here, for [`LaneSlashRun::reason`].
+        Unavailable => "unavailable",
+    }
+}
+
+tolerant_enum! {
+    /// Whether a [`LaneSlashRow`] takes an argument.
+    #[derive(Default)]
+    pub enum LaneSlashArg {
+        /// It takes none — what an absent `arg` means.
+        #[default]
+        None => "none",
+        Optional => "optional",
+        Required => "required",
+    }
+}
+
+tolerant_enum! {
+    /// The method a `method` [`LaneSlashRow`] calls. Its words are craze's
+    /// method names verbatim, so every word the adapter keeps as `Other`
+    /// round-trips as `Other` — a bare `"stop"` from a later host can never
+    /// come back from this contract's JSON as [`Self::Stop`].
+    pub enum LaneSlashMethod {
+        /// [`AgentLane::set_title`], the argument as the title.
+        SetTitle => "session.setTitle",
+        /// [`AgentLane::set`] with [`LaneSlashRun::mode`].
+        Set => "session.set",
+        /// [`AgentLane::stop`].
+        Stop => "session.stop",
+    }
+}
+
+tolerant_enum! {
+    /// The picker a `picker` [`LaneSlashRow`] opens.
+    pub enum LaneSlashPicker {
+        /// The model picker (the settings sheet's model list).
+        Model => "model",
+    }
+}
+
 // ---- the traits ----
 
 /// A machine's (or an agent server's) sessions: list them, say what can be
@@ -2417,6 +2693,15 @@ pub trait AgentLane: Send + Sync {
     /// `stop: false`. Where it can, the stream's terminal `Down` is the stop's
     /// completion; this call's `Ok` is a receipt.
     async fn stop(&self) -> Result<(), LaneError>;
+
+    /// Rename the session (plan 029 D4). **No default body**: an adapter that
+    /// cannot answers [`LaneError::Failed`] naming itself, and its
+    /// capabilities say `set_title: false`. Where it can, `Ok` is the agent's
+    /// acceptance and NOT the new title: the title arrives on the stream as a
+    /// [`LaneEvent::Session`] row, so a client's header changes when the
+    /// session says it changed. A lost reply is "outcome unknown" like any
+    /// verb, never resent.
+    async fn set_title(&self, title: &str) -> Result<(), LaneError>;
 }
 
 #[cfg(test)]

@@ -1,4 +1,4 @@
-//! shed-craze against craze's own wire fixtures — `fixtures/wire/`, WIRE/01–26
+//! shed-craze against craze's own wire fixtures — `fixtures/wire/`, WIRE/01–32
 //! vendored verbatim at the pin `fixtures/wire.PIN` names (plan 025 §3.3.1),
 //! and diffed against craze's tree by CI's `craze-binaries` action.
 //!
@@ -7,21 +7,30 @@
 //! - **Every `s2c` line decodes**: as a reply or a notification, and — where
 //!   this crate reads that method's result — into its typed result (a hub's
 //!   and a host's `hello`, the roster, `createOptions`, a create, every
-//!   refusal's `data.code`).
+//!   refusal's `data.code`). The side-question (`aside`) notifications of
+//!   WIRE/27–28 are recognised and not read: shed asks no side question yet
+//!   (plan 029 X1).
 //! - **Every request this crate composes is the fixture's `c2s` line, field
 //!   for field**: `hello` (the hub's and the host's), `sessions.subscribe`,
 //!   `sessions.createOptions` and `session.create` — composed by the wire types
 //!   AND written by the source itself, replayed against the fixture's own
 //!   answers — and the lane's `session.connect`, `sessions.list`,
 //!   `session.attach` (with and without a cursor), `session.prompt`,
-//!   `session.cancel`, `asks.get`, `asks.answer`, `session.stop` and the
-//!   fenced read's `session.sync` (Amendment A11). `hello`'s `client` is the
-//!   one member that differs, by design (`{kind: "shed", name, version}`,
+//!   `session.cancel`, `asks.get`, `asks.answer`, `session.stop`, the
+//!   fenced read's `session.sync` (Amendment A11), `session.set` (WIRE/31's
+//!   mode change) and `session.setTitle` (WIRE/31's rename) — and
+//!   `session.create`'s `title` (WIRE/32, plan 029 C2). `hello`'s `client` is
+//!   the one member that differs, by design (`{kind: "shed", name, version}`,
 //!   plan 025 §3.3.2); everything else is compared exactly, ids included.
 //!   The lane requests no fixture line composes as this crate does —
-//!   `session.snapshot` at its default budget, the fenced read's `asks.list`
-//!   and the settings milestone's `session.set` (no fixture calls either) —
-//!   are pinned by hand.
+//!   `session.snapshot` at its default budget and the fenced read's
+//!   `asks.list` (no fixture calls either) — are pinned by hand, and so are
+//!   `session.set` whole (its model and config shapes, which no fixture line
+//!   carries) and `session.setTitle`.
+//! - **The slash catalog and the title (plan 029)**: WIRE/30's and WIRE/31's
+//!   catalogs — the snapshot's and each delta's — fold into the rows craze
+//!   wrote, the rename's delta into the title, and the hub's `createTitle`
+//!   and the session's `slashCatalog` into the contract's capabilities.
 //! - **What the source makes of those answers** is the contract's: rows keyed
 //!   by hostId, an upsert with an open ask, a remove; craze's provider order;
 //!   the created row and its prompt; P14's start failure with its cause.
@@ -33,7 +42,9 @@ use std::sync::Arc;
 use serde_json::{json, Value};
 use shed_core::lane::conformance::{drive_source, SourceChecker};
 use shed_core::lane::{
-    AgentSource, LaneCreateRequest, LaneError, LanePromptOutcome, LaneProviderState, SourceEvent,
+    AgentSource, LaneCreateRequest, LaneError, LanePromptOutcome, LaneProviderState,
+    LaneSettingChange, LaneSlashArg, LaneSlashKind, LaneSlashMethod, LaneSlashPicker,
+    LaneSlashRequires, LaneSlashRow, LaneSlashSource, SourceEvent,
 };
 use shed_core::rc::RcActivity;
 use shed_craze::conn::{check_protocol_and_codecs, judge_hub_hello};
@@ -81,7 +92,7 @@ fn fixture(prefix: &str) -> Vec<Value> {
 #[test]
 fn the_fixtures_are_vendored_whole_at_the_pin() {
     let all = fixtures();
-    assert_eq!(all.len(), 26, "WIRE/01–26");
+    assert_eq!(all.len(), 32, "WIRE/01–32");
     for (i, (name, _)) in all.iter().enumerate() {
         assert!(name.starts_with(&format!("{:02}-", i + 1)), "{name}");
     }
@@ -169,6 +180,12 @@ fn every_s2c_line_decodes() {
                         }
                         "ready" => {
                             let _: wire::ReadyParams = serde_json::from_value(params).unwrap();
+                        }
+                        // A side question's streamed answer (craze 0.1.1,
+                        // WIRE/27–28): recognised and skipped — shed asks no
+                        // side question yet (plan 029 X1), so nothing reads it.
+                        "aside" => {
+                            assert!(params["asideId"].is_string(), "{name}: {params}");
                         }
                         other => panic!("{name}: an unexpected notification {other}"),
                     }
@@ -323,6 +340,7 @@ fn composed(msg: &Value) -> Value {
                 prompt: p["prompt"].as_str().map(Into::into),
                 provider: p["provider"].as_str().map(Into::into),
                 request_id: p["requestId"].as_str().unwrap().into(),
+                title: p["title"].as_str().map(Into::into),
             },
         ),
         // The lane's (C8).
@@ -391,6 +409,44 @@ fn composed(msg: &Value) -> Value {
                 answer: p["answer"].clone(),
             },
         ),
+        // The rename (plan 029 D8): the title verbatim — the host normalizes.
+        m @ method::SESSION_SET_TITLE => wire::request_line(
+            id,
+            m,
+            &wire::SetTitleParams {
+                session_id: str_of(p, "sessionId"),
+                command_id: str_of(p, "commandId"),
+                title: str_of(p, "title"),
+            },
+        ),
+        // The change as a client asks for it, bound to no folded model: the
+        // fixture's `setting` is exactly what `setting_for` must make of it.
+        m @ method::SESSION_SET => {
+            let s = &p["setting"];
+            let change = match s["kind"].as_str().unwrap() {
+                "model" => LaneSettingChange::Model {
+                    id: str_of(s, "value"),
+                },
+                "mode" => LaneSettingChange::Mode {
+                    id: str_of(s, "value"),
+                },
+                "config" => LaneSettingChange::Config {
+                    id: str_of(s, "id"),
+                    value: str_of(s, "value"),
+                    for_model: s["forModel"].as_str().map(Into::into),
+                },
+                other => panic!("a setting kind this crate never sends: {other}"),
+            };
+            wire::request_line(
+                id,
+                m,
+                &wire::SetParams {
+                    session_id: str_of(p, "sessionId"),
+                    command_id: str_of(p, "commandId"),
+                    setting: shed_craze::setting_for(&change, None),
+                },
+            )
+        }
         other => panic!("not a method this crate composes: {other}"),
     };
     serde_json::from_slice(&line.unwrap()).unwrap()
@@ -403,11 +459,13 @@ fn str_of(p: &Value, k: &str) -> String {
 }
 
 /// Every c2s line of every method this crate composes is what `wire` composes
-/// — `session.create`'s `model` line excepted: D6 composes no model, and that
-/// line is the one that shows it.
+/// — `session.create`'s `model` lines excepted (D6 composes no model; WIRE/22
+/// and WIRE/32 each carry one). WIRE/32's titled creates are composed (plan
+/// 029 C2), the title verbatim.
 #[test]
 fn every_composed_request_is_the_fixtures_c2s_line() {
     let mut seen: HashMap<&str, usize> = HashMap::new();
+    let mut titled_creates = 0;
     for (name, lines) in fixtures() {
         for line in lines
             .iter()
@@ -429,11 +487,20 @@ fn every_composed_request_is_the_fixtures_c2s_line() {
                 method::ASKS_GET => method::ASKS_GET,
                 method::ASKS_ANSWER => method::ASKS_ANSWER,
                 method::SESSION_SYNC => method::SESSION_SYNC,
+                method::SESSION_SET => method::SESSION_SET,
+                method::SESSION_SET_TITLE => method::SESSION_SET_TITLE,
                 _ => continue,
             };
             if m == method::SESSION_CREATE && msg["params"].get("model").is_some() {
-                assert_eq!(name, "22-hub-create.ndjson");
+                assert!(
+                    name == "22-hub-create.ndjson" || name == "32-create-title.ndjson",
+                    "{name}"
+                );
                 continue;
+            }
+            if m == method::SESSION_CREATE && msg["params"].get("title").is_some() {
+                assert_eq!(name, "32-create-title.ndjson");
+                titled_creates += 1;
             }
             // A lowered budget (WIRE/04's deliberate slow consumer): the lane
             // attaches at the host's default.
@@ -453,7 +520,12 @@ fn every_composed_request_is_the_fixtures_c2s_line() {
     }
     assert_eq!(seen[method::SESSIONS_SUBSCRIBE], 1);
     assert_eq!(seen[method::SESSIONS_CREATE_OPTIONS], 2);
-    assert_eq!(seen[method::SESSION_CREATE], 3);
+    // WIRE/22's three, and WIRE/32's six: its five titled creates (its model
+    // line aside) and its one untitled replay of a titled request id.
+    assert_eq!(seen[method::SESSION_CREATE], 9);
+    assert_eq!(titled_creates, 5, "WIRE/32's titled creates, composed");
+    assert_eq!(seen[method::SESSION_SET], 1, "WIRE/31's mode change");
+    assert_eq!(seen[method::SESSION_SET_TITLE], 1, "WIRE/31's rename");
     assert!(seen[method::HELLO] >= 40, "{}", seen[method::HELLO]);
     // The lane's, each with at least one fixture line.
     for m in [
@@ -520,14 +592,14 @@ fn the_registry_request_is_pinned_by_hand() {
     assert_eq!(r.asks[0].id, "perm-1");
 }
 
-/// `session.set` (the settings milestone, C11), which no fixture line calls:
-/// pinned by hand against craze's closed schema (`session.set.json`) — the
+/// `session.set` (the settings milestone, C11), whose one fixture line
+/// (WIRE/31) changes a mode only: pinned by hand whole against craze's closed
+/// schema (`session.set.json`) — the
 /// session and command ids, and the setting: a model or a mode by its value
 /// alone, a config option by its id and value with `forModel`, the model it
 /// was chosen for. Its answer is the confirmed value and the delta's seq.
 #[test]
 fn the_set_request_is_pinned_by_hand() {
-    use shed_core::lane::LaneSettingChange;
     let line = |cmd: &str, change: LaneSettingChange, model: Option<&str>| {
         let l = wire::request_line(
             "9",
@@ -576,6 +648,246 @@ fn the_set_request_is_pinned_by_hand() {
     assert_eq!(r.rev, Some(0));
     let r: wire::SetResult = serde_json::from_value(json!({"value": "low"})).unwrap();
     assert_eq!(r.rev, None);
+}
+
+/// `session.setTitle` (plan 029 D8), whose one fixture line (WIRE/31) is
+/// composed above: pinned by hand whole against craze's closed schema
+/// (`session.setTitle.json`) — the session and command ids, and the title,
+/// verbatim — nothing else, and an answer of `{}`.
+#[test]
+fn the_set_title_request_is_pinned_by_hand() {
+    let line = wire::request_line(
+        "9",
+        method::SESSION_SET_TITLE,
+        &wire::SetTitleParams {
+            session_id: "session-fake-1".into(),
+            command_id: "6".into(),
+            title: "  plan 029 live ".into(),
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        std::str::from_utf8(&line).unwrap(),
+        r#"{"jsonrpc":"2.0","id":"9","method":"session.setTitle","params":{"sessionId":"session-fake-1","commandId":"6","title":"  plan 029 live "}}"#
+    );
+    // The schema's answer: `{}` — the delta, not the reply, says the title.
+    let reply = fixture("31-")
+        .into_iter()
+        .filter(|l| l["dir"] == "s2c")
+        .find(|l| l["msg"]["id"] == "4")
+        .unwrap();
+    assert_eq!(reply["msg"]["result"], json!({}));
+}
+
+/// The rows a catalog section folds into, by name.
+fn slash_names(rows: &[LaneSlashRow]) -> Vec<&str> {
+    rows.iter().map(|r| r.name.as_str()).collect()
+}
+
+/// The `s2c` messages of conn 1 of a fixture, in order.
+fn s2c(lines: &[Value]) -> Vec<Value> {
+    lines
+        .iter()
+        .filter(|l| l["dir"] == "s2c" && l["conn"] == 1)
+        .map(|l| l["msg"].clone())
+        .collect()
+}
+
+/// **WIRE/30 (an ACP session's catalog) folds into the rows craze wrote**
+/// (plan 029 AC3): the attach snapshot's `settings.slash` — every builtin of
+/// a cursor session that advertises its modes, the `local` help row, the
+/// picker, the rename, the mode rows resolved to ids, `/btw` requiring
+/// `aside` and `/exit` requiring `stop` — then each delta replacing it whole:
+/// the agent's own `/btw` listed BESIDE the builtin (a `requires` row claims
+/// no name), then a disk skill, the one its command shadows not listed
+/// twice. The second connection's snapshot carries the catalog as the
+/// deltas left it. The session says `slashCatalog`, so the lane's
+/// capabilities say `slash`.
+#[test]
+fn wire_30_folds_into_crazes_catalog() {
+    let lines = fixture("30-");
+    let msgs = s2c(&lines);
+    let attach: wire::AttachResult = serde_json::from_value(msgs[1]["result"].clone()).unwrap();
+    assert!(shed_craze::lane_capabilities(&attach.session.capabilities, true).slash);
+    let mut fold = shed_craze::fold::CrazeFold::new("0123456789ab");
+    fold.restore(attach.snapshot.as_ref().unwrap()).unwrap();
+    let seeded = fold
+        .slash()
+        .expect("the snapshot carries the catalog")
+        .clone();
+    assert_eq!(
+        slash_names(&seeded.rows),
+        [
+            "help", "model", "clear", "tasks", "theme", "rename", "plan", "ask", "agent", "btw",
+            "exit", "research"
+        ]
+    );
+    let row = |name: &str| seeded.rows.iter().find(|r| r.name == name).unwrap().clone();
+    let help = row("help");
+    assert_eq!(
+        (
+            &help.source,
+            help.while_working,
+            &help.run.kind,
+            help.run.local.as_deref()
+        ),
+        (
+            &LaneSlashSource::Builtin,
+            true,
+            &LaneSlashKind::Local,
+            Some("help")
+        )
+    );
+    let model = row("model");
+    assert_eq!(model.run.kind, LaneSlashKind::Picker);
+    assert_eq!(model.run.picker, Some(LaneSlashPicker::Model));
+    assert_eq!(model.run.arg, LaneSlashArg::Optional);
+    assert!(!model.while_working);
+    let rename = row("rename");
+    assert_eq!(rename.run.method, Some(LaneSlashMethod::SetTitle));
+    assert_eq!(rename.run.param.as_deref(), Some("title"));
+    assert_eq!(rename.run.arg, LaneSlashArg::Required);
+    assert_eq!(rename.run.arg_hint.as_deref(), Some("<title>"));
+    assert!(rename.while_working);
+    for mode in ["plan", "ask", "agent"] {
+        let r = row(mode);
+        assert_eq!(r.run.method, Some(LaneSlashMethod::Set), "{mode}");
+        assert_eq!(r.run.mode.as_deref(), Some(mode), "resolved to its id");
+    }
+    let btw = row("btw");
+    assert_eq!(btw.requires, Some(LaneSlashRequires::Aside));
+    assert_eq!(btw.run.kind, LaneSlashKind::Aside);
+    let exit = row("exit");
+    assert_eq!(exit.requires, Some(LaneSlashRequires::Stop));
+    assert_eq!(exit.run.method, Some(LaneSlashMethod::Stop));
+    let research = row("research");
+    assert_eq!(
+        (&research.source, &research.run.kind, research.while_working),
+        (&LaneSlashSource::Agent, &LaneSlashKind::Prompt, false)
+    );
+
+    // The agent's catalog changes: a delta carrying commands restates the
+    // catalog whole beside them.
+    let delta: wire::EventParams = serde_json::from_value(msgs[3]["params"].clone()).unwrap();
+    fold.apply(&delta.event);
+    assert!(fold.take_slash_changed());
+    let rows = &fold.slash().unwrap().rows;
+    assert_eq!(rows.len(), 14);
+    let btws: Vec<&LaneSlashRow> = rows.iter().filter(|r| r.name == "btw").collect();
+    assert_eq!(btws.len(), 2, "the agent's /btw beside the builtin");
+    assert_eq!(
+        (&btws[0].source, &btws[1].source),
+        (&LaneSlashSource::Builtin, &LaneSlashSource::Agent)
+    );
+    assert_eq!(btws[1].description.as_deref(), Some("The agent's own btw"));
+    assert_eq!(btws[1].run.kind, LaneSlashKind::Prompt);
+    // The same commands again: no delta at all (craze publishes nothing for
+    // an update that changes nothing). Then the disk skills: a slash-only
+    // delta, the shadowed `review` skill not listed twice.
+    let skills: wire::EventParams = serde_json::from_value(msgs[4]["params"].clone()).unwrap();
+    assert!(
+        skills.event["state"].get("commands").is_none(),
+        "slash alone"
+    );
+    fold.apply(&skills.event);
+    let rows = &fold.slash().unwrap().rows;
+    assert_eq!(rows.len(), 15);
+    let last = rows.last().unwrap();
+    assert_eq!(
+        (last.name.as_str(), &last.source),
+        ("deploy", &LaneSlashSource::Skill)
+    );
+    assert_eq!(rows.iter().filter(|r| r.name == "review").count(), 1);
+    let held = fold.slash().unwrap().clone();
+
+    // A second connection's attach: its snapshot carries the catalog the
+    // deltas left.
+    let reply = conn_lines(&lines, 2)
+        .into_iter()
+        .find(|l| l["dir"] == "s2c" && l["msg"]["id"] == "2")
+        .unwrap();
+    let again: wire::AttachResult = serde_json::from_value(reply["msg"]["result"].clone()).unwrap();
+    let mut reseeded = shed_craze::fold::CrazeFold::new("0123456789ab");
+    reseeded.restore(again.snapshot.as_ref().unwrap()).unwrap();
+    assert_eq!(reseeded.slash(), Some(&held), "snapshot = the deltas' fold");
+}
+
+/// **WIRE/31 (a native session's catalog, and a rename)**: the native rows —
+/// `/connect` local, a plugin row with its `qualified` spelling and one
+/// whose bare name a builtin took (listed as `pr-tools:help`, no second
+/// spelling) — then the rename: the composed `session.setTitle` line (above),
+/// its `meta` delta folding into the title, its reply `{}`.
+#[test]
+fn wire_31_folds_into_the_native_catalog_and_the_renamed_title() {
+    let msgs = s2c(&fixture("31-"));
+    let attach: wire::AttachResult = serde_json::from_value(msgs[1]["result"].clone()).unwrap();
+    assert!(shed_craze::lane_capabilities(&attach.session.capabilities, true).slash);
+    let mut fold = shed_craze::fold::CrazeFold::new("0123456789ab");
+    fold.restore(attach.snapshot.as_ref().unwrap()).unwrap();
+    assert_eq!(fold.title(), None, "an untitled session");
+    let rows = fold.slash().unwrap().rows.clone();
+    let connect = rows.iter().find(|r| r.name == "connect").unwrap();
+    assert_eq!(connect.run.local.as_deref(), Some("connect"));
+    assert!(!connect.while_working);
+    let review = rows.iter().find(|r| r.name == "review").unwrap();
+    assert_eq!(
+        (
+            &review.source,
+            review.plugin.as_deref(),
+            review.qualified.as_deref()
+        ),
+        (
+            &LaneSlashSource::Plugin,
+            Some("pr-tools"),
+            Some("pr-tools:review")
+        )
+    );
+    let help = rows.iter().find(|r| r.name == "pr-tools:help").unwrap();
+    assert_eq!(
+        (help.plugin.as_deref(), help.qualified.as_deref()),
+        (Some("pr-tools"), None)
+    );
+    assert_eq!(
+        rows.iter().filter(|r| r.name == "help").count(),
+        1,
+        "the builtin's"
+    );
+
+    let renamed = msgs
+        .iter()
+        .find(|m| m["params"]["event"]["state"].get("title").is_some())
+        .unwrap();
+    fold.apply(&renamed["params"]["event"]);
+    assert_eq!(fold.title(), Some("ship the release"));
+    assert!(
+        !fold.take_slash_changed(),
+        "a title-only delta leaves the catalog"
+    );
+}
+
+/// An older host's session (WIRE/01, craze 0.1.0's shape) says no
+/// `slashCatalog`: the lane's capabilities say no `slash` (plan 029 P18).
+#[test]
+fn an_older_hosts_session_has_no_slash_capability() {
+    let msgs = s2c(&fixture("01-"));
+    let attach = msgs
+        .iter()
+        .find_map(|m| serde_json::from_value::<wire::AttachResult>(m["result"].clone()).ok())
+        .unwrap();
+    let caps = shed_craze::lane_capabilities(&attach.session.capabilities, true);
+    assert!(!caps.slash && caps.set_title, "{caps:?}");
+}
+
+/// The create a fixture's `session.create` line asks for, every member as the
+/// line has it.
+fn create_request_of(p: &Value) -> LaneCreateRequest {
+    LaneCreateRequest {
+        cwd: p["cwd"].as_str().unwrap().into(),
+        provider: p["provider"].as_str().map(Into::into),
+        prompt: p["prompt"].as_str().map(Into::into),
+        request_id: p["requestId"].as_str().unwrap().into(),
+        title: p["title"].as_str().map(Into::into),
+    }
 }
 
 /// A fixture conn's lines, in order.
@@ -696,6 +1008,33 @@ fn the_capabilities_of_wire_19_and_26() {
     );
     let new = source_capabilities(&hello_of(&fixture("26-")).capabilities);
     assert_eq!((new.create, new.create_options), (true, true));
+    assert!(!new.create_title, "0.1.0's hub names no session at create");
+    // Plan 029: WIRE/32's hub takes a title.
+    let titled = source_capabilities(&hello_of(&fixture("32-")).capabilities);
+    assert!(titled.create && titled.create_title);
+}
+
+/// **WIRE/32 through the source** (plan 029 D8): a titled create is the
+/// fixture's own line — the title verbatim, unnormalized; the hub normalizes
+/// it — and the created row carries the title craze stored, from the first
+/// frame.
+#[tokio::test]
+async fn wire_32_through_the_source() {
+    let lines = fixture("32-");
+    let script: Vec<Value> = conn_lines(&lines, 1).into_iter().take(4).collect();
+    let request = create_request_of(&script[2]["msg"]["params"]);
+    assert!(request.title.as_deref().unwrap().starts_with("  Fix the\t"));
+    let (dial, mut conns) = ScriptedDial::new();
+    let source = CrazeSource::new(dial, "shed-wire-test");
+    let create = tokio::spawn(async move { source.create(request).await });
+    let mut hub = conns.recv().await.unwrap();
+    replay(&mut hub, &script).await;
+    let created = create.await.unwrap().unwrap();
+    assert_eq!(created.session.id, "cccccccccccc");
+    assert_eq!(
+        created.session.title, "Fix the login bug !",
+        "craze's normalized title"
+    );
 }
 
 /// WIRE/26 through the source: `createOptions`, its answer as the contract's.
@@ -743,13 +1082,7 @@ async fn wire_22_through_the_source() {
     let conn = conn_lines(&lines, 1);
     // hello, its answer, the first create, its answer.
     let script: Vec<Value> = conn.iter().take(4).cloned().collect();
-    let p = &script[2]["msg"]["params"];
-    let request = LaneCreateRequest {
-        cwd: p["cwd"].as_str().unwrap().into(),
-        provider: p["provider"].as_str().map(Into::into),
-        prompt: p["prompt"].as_str().map(Into::into),
-        request_id: p["requestId"].as_str().unwrap().into(),
-    };
+    let request = create_request_of(&script[2]["msg"]["params"]);
     let (dial, mut conns) = ScriptedDial::new();
     let source = Arc::new(CrazeSource::new(dial, "shed-wire-test"));
     let s = Arc::clone(&source);
@@ -774,6 +1107,7 @@ async fn wire_22_through_the_source() {
             provider: Some("cursor".into()),
             prompt: None,
             request_id: "fixture-22-b".into(),
+            title: None,
         })
         .await
     });
@@ -807,7 +1141,10 @@ fn every_fixture_refusal_maps_by_its_code() {
                 "already_resolved" => mapped == LaneError::AlreadyResolved,
                 "not_accepting" => mapped == LaneError::NotAccepting,
                 "unavailable" => matches!(mapped, LaneError::Unavailable(_)),
-                "unsupported" | "unknown_subagent" => matches!(mapped, LaneError::Failed(_)),
+                // `aborted`: WIRE/28's cancelled side question.
+                "unsupported" | "unknown_subagent" | "aborted" => {
+                    matches!(mapped, LaneError::Failed(_))
+                }
                 other => panic!("{name}: a code this test does not list: {other}"),
             };
             assert!(want, "{name}: {err} → {mapped:?}");

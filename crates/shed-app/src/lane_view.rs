@@ -41,6 +41,20 @@
 //! the settings with them, so a reader never sees `settings: false` beside a
 //! settings sheet.
 //!
+//! The session's **slash catalog** (plan 029 P4) is staged the same way: a
+//! seed's [`LaneEvent::Slash`] lands in the staging buffer and swaps in with
+//! its `Ready`, and since every `Reset` starts an empty buffer, a seed that
+//! brings no `Slash` swaps the old catalog OUT — "no `Slash` in this seed" IS
+//! "no catalog" (`shed_core::lane`'s module doc, P2/P3). Between seeds a
+//! `Slash` replaces the live catalog whole; capabilities that stop saying
+//! `slash` clear it, and a `Slash` under capabilities that do not say `slash`
+//! is dropped, so the flag coming back never resurrects an old one — only a
+//! fresh `Slash` does. What a reader is handed is the RESOLVED menu
+//! ([`crate::slash_menu::resolve`]), computed when the catalog or the
+//! capabilities change and cached beside them: a reader polls `snapshot` on
+//! every nudge (the phone converts each one over FRB), and a catalog can be
+//! hundreds of rows.
+//!
 //! # Generations are matched, not assumed
 //!
 //! The view keeps two counters and they are not the same thing. The
@@ -84,8 +98,12 @@
 
 use std::collections::{BTreeMap, VecDeque};
 
-use shed_core::lane::{LaneApproval, LaneCapabilities, LaneEvent, LaneSession, LaneSettings};
+use shed_core::lane::{
+    LaneApproval, LaneCapabilities, LaneEvent, LaneSession, LaneSettings, LaneSlashCatalog,
+};
 use shed_core::rc::{RcActivity, RcFeedMessage};
+
+use crate::slash_menu::{self, SlashMenu};
 
 /// How many transcript rows one lane keeps for the CURRENT generation.
 ///
@@ -117,6 +135,12 @@ struct Snapshot {
     session: Option<LaneSession>,
     capabilities: Option<LaneCapabilities>,
     settings: Option<LaneSettings>,
+    /// The raw catalog, held only under capabilities that say `slash`.
+    slash: Option<LaneSlashCatalog>,
+    /// `slash` resolved against `capabilities` — the cache a reader is
+    /// handed. Recomputed by [`Snapshot::resolve_slash_menu`] whenever either
+    /// input changes, never per read.
+    slash_menu: Option<SlashMenu>,
 }
 
 impl Snapshot {
@@ -125,6 +149,15 @@ impl Snapshot {
         while self.messages.len() > MAX_VIEW_MESSAGES {
             self.messages.pop_front();
         }
+    }
+
+    /// Re-resolve the cached menu from the catalog and the capabilities: a
+    /// menu exactly when both are here and the capabilities say `slash`.
+    fn resolve_slash_menu(&mut self) {
+        self.slash_menu = match (&self.capabilities, &self.slash) {
+            (Some(caps), Some(catalog)) if caps.slash => Some(slash_menu::resolve(catalog, caps)),
+            _ => None,
+        };
     }
 }
 
@@ -173,6 +206,15 @@ pub struct LaneViewSnapshot {
     /// The session's settings, as of the live generation; `None` when it has
     /// none to show (its capabilities say `settings: false`).
     pub settings: Option<LaneSettings>,
+    /// The session's `/` menu, as of the live generation: its slash catalog
+    /// RESOLVED against its capabilities ([`crate::slash_menu::resolve`] —
+    /// which rows show, each with its action, and the hidden builtin names a
+    /// typed command is refused for). `None` when the capabilities do not say
+    /// `slash` or the session has no catalog (yet); a client then offers no
+    /// menu and sends a `/` draft as text. `Some` with no `rows` is a catalog
+    /// of nothing this client can run — still what a typed `/x` dispatches
+    /// against.
+    pub slash_menu: Option<SlashMenu>,
     /// The asks still waiting on the human, oldest first, id as the tiebreak.
     /// Pending only — see [`LaneView::snapshot`].
     pub approvals: Vec<LaneApproval>,
@@ -248,13 +290,33 @@ impl LaneView {
                 let target = self.target();
                 // Capabilities that stop saying `settings` take the settings
                 // with them: a reader must never see `settings: false` beside a
-                // settings sheet from before the change.
+                // settings sheet from before the change. `slash` likewise
+                // takes the catalog (plan 029 P4).
                 if !capabilities.settings {
                     target.settings = None;
                 }
-                target.capabilities = Some(capabilities.clone());
+                if !capabilities.slash {
+                    target.slash = None;
+                }
+                // The menu reads `stop`, `set_title`, `settings` and `slash`:
+                // re-resolve on any change, and only on one — a producer may
+                // restate unchanged capabilities freely.
+                if target.capabilities.as_ref() != Some(capabilities) {
+                    target.capabilities = Some(capabilities.clone());
+                    target.resolve_slash_menu();
+                }
             }
             LaneEvent::Settings { settings } => self.target().settings = Some(settings.clone()),
+            LaneEvent::Slash { catalog } => {
+                let target = self.target();
+                // REPLACES the catalog whole (an empty one included); dropped
+                // under capabilities that do not say `slash` (the module doc,
+                // the conformance kit's `SlashNotAdvertised`).
+                if target.capabilities.as_ref().is_some_and(|c| c.slash) {
+                    target.slash = Some(catalog.clone());
+                    target.resolve_slash_menu();
+                }
+            }
             LaneEvent::Approval { approval } => {
                 let target = self.target();
                 // Last-write-wins, then DROP what is no longer waiting on the
@@ -350,9 +412,9 @@ impl LaneView {
     /// A cursor that fell out the back of the 500-row cap is refused by the same
     /// bound, for the same reason: the delta would have a hole in it.
     ///
-    /// `session`, `generation`, `stale`, `ended`, `capabilities` and `settings`
-    /// ride EVERY snapshot, delta or not, so a reader that wants to react to any
-    /// of them changing has them without a second call.
+    /// `session`, `generation`, `stale`, `ended`, `capabilities`, `settings`
+    /// and `slash_menu` ride EVERY snapshot, delta or not, so a reader that
+    /// wants to react to any of them changing has them without a second call.
     ///
     /// `approvals` is always the complete pending set — there is no cursor for
     /// it and it is bounded by what the human has not answered. `is_pending()`
@@ -413,6 +475,8 @@ impl LaneView {
                 .settings
                 .clone()
                 .filter(|_| self.live.capabilities.as_ref().is_some_and(|c| c.settings)),
+            // The cached resolution — cloned, never rebuilt here.
+            slash_menu: self.live.slash_menu.clone(),
             approvals,
         }
     }
@@ -454,7 +518,9 @@ impl LaneView {
 mod tests {
     use super::*;
 
-    use shed_core::lane::{LaneApprovalKind, LaneApprovalStatus};
+    use shed_core::lane::{LaneApprovalKind, LaneApprovalStatus, LaneSlashSource};
+
+    use crate::slash_menu::tests as slash_rows;
 
     /// A transcript row. `text` is the identity in these tests — the feed row
     /// has no id of its own, `seq` is the transport's, and the text is what a
@@ -512,6 +578,8 @@ mod tests {
             history_cursor: true,
             settings,
             stop: false,
+            set_title: false,
+            slash: false,
         }
     }
 
@@ -1014,6 +1082,280 @@ mod tests {
             settings: model("rogue"),
         });
         assert_eq!(view.snapshot(None).settings, None);
+    }
+
+    // ---- the slash catalog (plan 029 P4) ----
+
+    fn slash_caps(settings: bool, slash: bool) -> LaneCapabilities {
+        LaneCapabilities {
+            slash,
+            ..caps("craze", settings)
+        }
+    }
+
+    /// A catalog of agent prompt rows.
+    fn catalog(names: &[&str]) -> LaneSlashCatalog {
+        LaneSlashCatalog {
+            rows: names
+                .iter()
+                .map(|n| slash_rows::prompt(n, LaneSlashSource::Agent))
+                .collect(),
+        }
+    }
+
+    /// The menu a reader is handed: its shown rows' names, or `None`.
+    fn menu(view: &LaneView) -> Option<Vec<String>> {
+        view.snapshot(None)
+            .slash_menu
+            .map(|m| m.rows.into_iter().map(|r| r.name).collect())
+    }
+
+    fn some(names: &[&str]) -> Option<Vec<String>> {
+        Some(names.iter().map(|n| n.to_string()).collect())
+    }
+
+    /// A seed under `generation` with `capabilities` and, when given, a
+    /// catalog — staged after the capabilities (P2) — still short of its
+    /// `Ready`.
+    fn stage_slash(
+        view: &mut LaneView,
+        generation: u64,
+        capabilities: LaneCapabilities,
+        slash: Option<LaneSlashCatalog>,
+    ) {
+        view.apply(&LaneEvent::Reset {
+            reason: "seed".into(),
+            generation,
+        });
+        view.apply(&LaneEvent::Capabilities { capabilities });
+        if let Some(catalog) = slash {
+            view.apply(&LaneEvent::Slash { catalog });
+        }
+    }
+
+    /// [`stage_slash`] completed by its `Ready`.
+    fn slash_seed(
+        view: &mut LaneView,
+        generation: u64,
+        capabilities: LaneCapabilities,
+        slash: Option<LaneSlashCatalog>,
+    ) {
+        stage_slash(view, generation, capabilities, slash);
+        view.apply(&LaneEvent::Ready { generation });
+    }
+
+    /// **The catalog is staged and swapped with its seed** — mid-reseed the
+    /// reader keeps the live generation's menu — and a reseed that brings no
+    /// `Slash` swaps it OUT (P3: a snapshot without `settings.slash`,
+    /// truncated or not, is no catalog). The menu is resolved as the frames
+    /// arrive, not when a reader asks.
+    #[test]
+    fn the_slash_catalog_is_staged_and_swapped_with_the_seed() {
+        let mut view = LaneView::default();
+        assert_eq!(menu(&view), None, "nothing before a seed");
+        slash_seed(&mut view, 1, slash_caps(false, true), Some(catalog(&["a"])));
+        assert!(
+            view.live.slash_menu.is_some(),
+            "resolved and cached at the swap, before any read"
+        );
+        assert_eq!(menu(&view), some(&["a"]));
+
+        stage_slash(&mut view, 2, slash_caps(false, true), Some(catalog(&["b"])));
+        assert_eq!(menu(&view), some(&["a"]), "mid-seed: the live menu");
+        view.apply(&LaneEvent::Ready { generation: 2 });
+        assert_eq!(menu(&view), some(&["b"]));
+
+        // A reseed whose snapshot carried no catalog — `slash` still true.
+        slash_seed(&mut view, 3, slash_caps(false, true), None);
+        assert_eq!(menu(&view), None, "no Slash in the seed is no catalog");
+        assert_eq!(
+            view.snapshot(None).capabilities.map(|c| c.slash),
+            Some(true),
+            "a catalog still to come, not a capability lost"
+        );
+    }
+
+    /// Between seeds a `Slash` replaces the catalog WHOLE — an empty one
+    /// included, which leaves a menu with nothing in it rather than none.
+    #[test]
+    fn a_live_slash_replaces_the_catalog_whole() {
+        let mut view = LaneView::default();
+        slash_seed(
+            &mut view,
+            1,
+            slash_caps(false, true),
+            Some(catalog(&["a", "b"])),
+        );
+        view.apply(&LaneEvent::Slash {
+            catalog: catalog(&["c"]),
+        });
+        assert_eq!(menu(&view), some(&["c"]));
+        view.apply(&LaneEvent::Slash {
+            catalog: LaneSlashCatalog::default(),
+        });
+        assert_eq!(menu(&view), some(&[]), "slash: {{}} clears the rows");
+    }
+
+    /// **Capabilities that stop saying `slash` take the catalog with them** —
+    /// and the flag coming back does not resurrect it; only a fresh `Slash`
+    /// does. A `Slash` under capabilities that do not say `slash` (against
+    /// the contract) is dropped, so it cannot resurface later either.
+    #[test]
+    fn losing_the_slash_capability_drops_the_catalog() {
+        let mut view = LaneView::default();
+        slash_seed(&mut view, 1, slash_caps(false, true), Some(catalog(&["a"])));
+        view.apply(&LaneEvent::Capabilities {
+            capabilities: slash_caps(false, false),
+        });
+        assert_eq!(menu(&view), None, "slash: false must not sit beside a menu");
+        view.apply(&LaneEvent::Capabilities {
+            capabilities: slash_caps(false, true),
+        });
+        assert_eq!(menu(&view), None, "the flag alone brings nothing back");
+        view.apply(&LaneEvent::Slash {
+            catalog: catalog(&["b"]),
+        });
+        assert_eq!(menu(&view), some(&["b"]), "a fresh Slash does");
+
+        // Against the contract: a Slash while the capabilities say none.
+        view.apply(&LaneEvent::Capabilities {
+            capabilities: slash_caps(false, false),
+        });
+        view.apply(&LaneEvent::Slash {
+            catalog: catalog(&["rogue"]),
+        });
+        assert_eq!(menu(&view), None);
+        view.apply(&LaneEvent::Capabilities {
+            capabilities: slash_caps(false, true),
+        });
+        assert_eq!(menu(&view), None, "the rogue catalog was never held");
+
+        // And a seed that says no slash shows no menu, whatever it carried.
+        slash_seed(
+            &mut view,
+            2,
+            slash_caps(false, false),
+            Some(catalog(&["rogue"])),
+        );
+        assert_eq!(menu(&view), None);
+    }
+
+    /// **The menu follows the capabilities, not just the catalog**: `/model`
+    /// shows only under `settings`, so toggling `settings` re-resolves the
+    /// menu from the catalog it still holds — the row disappears (refused as
+    /// "not advertised" if typed) and comes back.
+    #[test]
+    fn the_model_row_follows_the_settings_capability() {
+        let mut view = LaneView::default();
+        let mut with_model = catalog(&["a"]);
+        with_model.rows.insert(0, slash_rows::model());
+        slash_seed(&mut view, 1, slash_caps(true, true), Some(with_model));
+        assert_eq!(menu(&view), some(&["model", "a"]));
+
+        view.apply(&LaneEvent::Capabilities {
+            capabilities: slash_caps(false, true),
+        });
+        assert_eq!(menu(&view), some(&["a"]));
+        let hidden = view.snapshot(None).slash_menu.map(|m| m.hidden);
+        assert_eq!(
+            hidden
+                .as_deref()
+                .map(|h| (h[0].name.as_str(), h[0].reason.as_str())),
+            Some(("model", "not advertised"))
+        );
+
+        view.apply(&LaneEvent::Capabilities {
+            capabilities: slash_caps(true, true),
+        });
+        assert_eq!(menu(&view), some(&["model", "a"]), "the catalog was kept");
+    }
+
+    /// **A mismatched `Ready` commits no catalog**: a late `Ready(1)` while
+    /// generation 2's seed is staged leaves the live menu alone; only
+    /// `Ready(2)` swaps generation 2's in.
+    #[test]
+    fn a_mismatched_ready_commits_no_catalog() {
+        let mut view = LaneView::default();
+        slash_seed(&mut view, 1, slash_caps(false, true), Some(catalog(&["a"])));
+        stage_slash(&mut view, 2, slash_caps(false, true), Some(catalog(&["b"])));
+        view.apply(&LaneEvent::Ready { generation: 1 });
+        assert_eq!(
+            menu(&view),
+            some(&["a"]),
+            "Ready(1) is not the staged seed's"
+        );
+        view.apply(&LaneEvent::Ready { generation: 2 });
+        assert_eq!(menu(&view), some(&["b"]));
+    }
+
+    /// **An interrupted seed's catalog never lands**: a `Reset` over a seed
+    /// that never reached its `Ready` starts an EMPTY buffer, so the next
+    /// seed, bringing no `Slash`, swaps in no catalog — not the interrupted
+    /// one's.
+    #[test]
+    fn an_interrupted_seeds_catalog_never_lands() {
+        let mut view = LaneView::default();
+        slash_seed(&mut view, 1, slash_caps(false, true), Some(catalog(&["a"])));
+        stage_slash(&mut view, 2, slash_caps(false, true), Some(catalog(&["b"])));
+        // Lagged: generation 3 replaces generation 2's seed before its Ready.
+        slash_seed(&mut view, 3, slash_caps(false, true), None);
+        assert_eq!(
+            menu(&view),
+            None,
+            "generation 2's catalog never reached the live view"
+        );
+        view.apply(&LaneEvent::Ready { generation: 2 });
+        assert_eq!(menu(&view), None);
+    }
+
+    /// **A silent resume keeps the catalog** (a lone `Ready` swaps nothing),
+    /// and the restatement it sends before that `Ready` replaces it on the
+    /// live view.
+    #[test]
+    fn a_silent_resume_keeps_the_catalog() {
+        let mut view = LaneView::default();
+        slash_seed(&mut view, 1, slash_caps(false, true), Some(catalog(&["a"])));
+        view.apply(&LaneEvent::Stale {
+            reason: "reconnecting".into(),
+        });
+        view.apply(&LaneEvent::Ready { generation: 1 });
+        assert_eq!(menu(&view), some(&["a"]), "the lone Ready keeps it");
+
+        view.apply(&LaneEvent::Stale {
+            reason: "reconnecting".into(),
+        });
+        view.apply(&LaneEvent::Capabilities {
+            capabilities: slash_caps(false, true),
+        });
+        view.apply(&LaneEvent::Slash {
+            catalog: catalog(&["a2"]),
+        });
+        view.apply(&LaneEvent::Ready { generation: 1 });
+        assert_eq!(menu(&view), some(&["a2"]), "the resume's restatement");
+        assert_eq!(view.snapshot(None).stale, None);
+    }
+
+    /// **`Down` wipes nothing, and abandons a staged catalog**: the live menu
+    /// stays (as the rows and capabilities do), the half seed's never lands —
+    /// not even on its own late `Ready` — and a fresh subscription's seed
+    /// with no catalog replaces it with none.
+    #[test]
+    fn down_keeps_the_live_catalog_and_abandons_a_staged_one() {
+        let mut view = LaneView::default();
+        slash_seed(&mut view, 1, slash_caps(false, true), Some(catalog(&["a"])));
+        stage_slash(&mut view, 2, slash_caps(false, true), Some(catalog(&["b"])));
+        view.apply(&LaneEvent::Down {
+            reason: "unknown_session".into(),
+        });
+        view.apply(&LaneEvent::Ready { generation: 2 });
+        let snap = view.snapshot(None);
+        assert!(snap.ended);
+        assert_eq!(menu(&view), some(&["a"]), "Down wipes nothing");
+
+        // A new subscription's seed, its count back at 1, with no catalog.
+        slash_seed(&mut view, 1, slash_caps(false, true), None);
+        assert!(!view.snapshot(None).ended);
+        assert_eq!(menu(&view), None);
     }
 
     /// **The whole point of staging**: between `Reset` and `Ready` a reader sees

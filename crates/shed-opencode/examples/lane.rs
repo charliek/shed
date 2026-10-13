@@ -227,6 +227,9 @@ fn print_event(event: &LaneEvent) {
             "+++ settings: model {:?}, mode {:?}",
             settings.model, settings.mode
         ),
+        LaneEvent::Slash { catalog } => {
+            println!("+++ slash catalog: {} rows", catalog.rows.len())
+        }
         LaneEvent::Stale { reason } => {
             println!("--- stale ({reason}): reconnecting, the view is kept")
         }

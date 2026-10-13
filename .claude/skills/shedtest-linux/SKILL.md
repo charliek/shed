@@ -245,7 +245,7 @@ SHED_CRAZE_REQUIRE=1 SHED_CRAZE_BIN_DIR=/work/desktop/tools/shedtest/.craze-bin 
 
 - **Drive the sheet through its doors**: `ui.show_craze_create {machine}` (opening it reads
   `craze.create_options` — on a DORMANT remote that is the explicit action that starts its hub),
-  `ui.fill_craze_create {provider?, cwd?, prompt?, recent?}` and `ui.submit_craze_create` (test
+  `ui.fill_craze_create {provider?, cwd?, title?, prompt?, recent?}` and `ui.submit_craze_create` (test
   mode only), `ui.close_craze_create`; read it with `craze_create.dump` (providers with
   `dimmed`/`selected`/`reason`/`fix`, `values`, the `request_id` it holds, `note`, `error`,
   `cause`, `create_enabled`, `primary`). **Wait for the dump to SHOW a fill** (its `values`, or
@@ -398,6 +398,66 @@ SIGKILL was ever needed; a typical stop is ~0.03 s. The app logs each phase to i
   wrapper reads the switch per spawn), `drop-sets` makes the proxy relay a `session.set` and
   cut its connection; with `outage` on too the redial fails, so "not confirmed" holds until
   both are off and the lane resumes. The resume restates the settings before its `Ready`.
+
+### The `/` menu, rename and Name at create (plan 029 C4)
+
+- **Drive the composer through its doors** (test mode only): `ui.type_lane_composer {text}` sets
+  the draft (caret at the end), `ui.key_lane_composer {key, shift?, composing?}` dispatches a REAL
+  `keydown` on the textarea (`key` ∈ Enter/Tab/Escape/ArrowUp/ArrowDown — a typo is
+  `bad_request`, so a "nothing happened" cell cannot pass on a key never pressed),
+  `ui.pick_slash_row {name}` clicks a menu row, `ui.answer_lane_stop {stop}` answers the Stop
+  confirm `/exit` opens. Read `lane.dump`'s `draft` and `slash_menu` (`{open, token, rows:
+  [{name, dimmed, highlighted}], refusal, warning}`); `lane.messages`' `slash_menu` is the
+  backend's resolved menu (different question).
+- **The type door is the LAST listener the panel registers**: re-send it until the dump's
+  `draft` shows it (`_type` in `test_tauri_craze.py` does), and every other door is live then.
+  Wait for the menu to have answered the token (`_wait_menu`: `token` and `open`) before a key —
+  the filter is an async invoke per keystroke.
+- **A synthetic keydown has no default action.** The door applies the browser's one default
+  that matters — a newline for an Enter nobody prevented (not while composing) — so Shift+Enter
+  is observable as `draft == "/\n"`. Arrows never move the caret through the door.
+- **Only HUB-CREATED sessions have a catalog.** The `craze-fake-host` binary has no slash flag
+  (its `fakehost.Options.Slash` is library-only), so the fake host's lane says `slash: false`
+  and has no menu — which is the "no catalog, no menu" cell. Create through the rig's bridge
+  (`_hub_create`); a grok-echo session shows `model, rename, plan, ask, agent, exit, research`.
+  `SET-COMMANDS a,b` sent as a prompt makes the fake agent re-advertise its commands live.
+- **What the commands put on the wire**: the proxy logs `session.setTitle`, `session.stop` and
+  `session.prompt` to `verbs.log` (`rig.verbs(method)`), `session.set` to `sets.log`, and a
+  create's `title` in `creates.log`. It also records what came BACK: the hub's reply to every
+  `session.create` (`create-replies.log`, `rig.create_replies()`: the `session` row it answered
+  with) and the reply to every `session.attach` (`attaches.log`, `rig.attaches()`: `cursor`,
+  `snapshot`, the snapshot's `settings.title`), each written before it is relayed — so it is on
+  record once the app has read it. Turn `proxy` on BEFORE the session's lane is first dialled
+  (the wrapper reads the switch per spawn), and `lane.close` a lane an earlier cell left open on
+  an unproxied connection before reusing it.
+- **A turn held open**: `craze-fake-agent -script sigint-hold` with `CRAZE_FAKE_GATE` a FIFO that
+  exists BEFORE the first held turn (the agent then holds it open and every byte releases one
+  turn; with no FIFO there, turns are released at once) and `CRAZE_FAKE_DUMP_PROMPTS` to see what
+  the agent READ. It is cursor's dialect, so it runs as `cursor` (restore `set_grok` at once).
+  Turn 1 is an echo; every later one — a queued prompt included — waits for its own byte.
+- **A rename held pending**: while `hold-titles` exists as a FIFO in the rig root (`with
+  SetGate(rig.root / "hold-titles", what="rename")`), the proxy logs a `session.setTitle` to
+  `verbs.log` and then HOLDS it until one byte is written (`gate.release()`); removing the FIFO
+  lets it through too, so a failing cell never wedges the lane. Wait for the verb in
+  `verbs.log` before acting "while it is pending" (the draft-ownership cell types a new draft
+  then). The permodel agent's set gate does NOT hold a mode change on its own: it holds only
+  `session/set_config_option`, and craze sends a mode as `session/set_mode`.
+- **"From the first frame" is asserted on the WIRE, never by polling** (P26): assert on the
+  proxy's recorded replies — the create's answer row (`rig.create_replies()`, `session.row.title`)
+  and the lane connection's FIRST attach reply for that session (`rig.attaches()`: `cursor`
+  false, `snapshot` true, its `title`). No poll proves a first frame, however tight: an untitled
+  seed (or row) followed by a title delta before the first read passes any poll, and a delta
+  moves `session.title` without moving `generation`. Polls of `rc.list`, `lane.messages` and
+  `lane.dump` (`_poll`) are fine as EVENTUAL checks of what the app shows — never call them
+  first-frame checks. Negative control: strip the create's `title` in the proxy and rename the
+  session right after it — before relaying the create's answer (the cell must fail on the
+  recorded reply row) or right after relaying the lane's first attach reply (with the reply
+  assertion off, it must fail on the recorded snapshot). Whether a poll ALSO catches either is
+  timing (the app's `rc.list` shows the create's own untitled answer row for a moment) — which
+  is exactly why a poll is never the first-frame assertion.
+- **A craze row's title is `display_name`** in `rc.list`; the lane's is `session.title`.
+- **The create sheet's `values` gained "Name"** on a live craze 0.1.1 hub (`createTitle`); it is
+  absent while the machine is offline or dormant (and on an older hub) unless a title is typed.
 
 ### Against a REAL local daemon
 

@@ -236,6 +236,8 @@ fn capabilities_round_trip_and_pin_opencodes_row() {
         history_cursor: false,
         settings: false,
         stop: false,
+        set_title: false,
+        slash: false,
     };
     assert_eq!(
         round_trip(&caps),
@@ -246,7 +248,9 @@ fn capabilities_round_trip_and_pin_opencodes_row() {
             "approvals": true,
             "history_cursor": false,
             "settings": false,
-            "stop": false
+            "stop": false,
+            "set_title": false,
+            "slash": false
         })
     );
 
@@ -919,6 +923,11 @@ fn both_traits_are_object_safe_and_the_lane_is_session_scoped() {
                 "stopping is not supported by nothing".into(),
             ))
         }
+        async fn set_title(&self, _title: &str) -> Result<(), LaneError> {
+            Err(LaneError::Failed(
+                "renaming is not supported by nothing".into(),
+            ))
+        }
     }
 
     struct NoSource;
@@ -954,6 +963,7 @@ fn both_traits_are_object_safe_and_the_lane_is_session_scoped() {
         provider: None,
         prompt: None,
         request_id: "req-held".into(),
+        title: None,
     };
     assert_send(&source.create_held(request.clone()));
     let rt = tokio::runtime::Builder::new_current_thread()
@@ -969,6 +979,13 @@ fn both_traits_are_object_safe_and_the_lane_is_session_scoped() {
     assert_eq!(lane.session_id(), "ses_1", "the id is bound, not passed");
     assert_send(&lane.send("hi", SendMode::Queue));
     assert_send(&lane.stop());
+    // `set_title` has no default body either (plan 029 D4): an adapter that
+    // cannot rename says so, naming itself.
+    assert_send(&lane.set_title("a name"));
+    assert_eq!(
+        rt.block_on(lane.set_title("a name")).unwrap_err(),
+        LaneError::Failed("renaming is not supported by nothing".into())
+    );
 }
 
 /// A `LaneQuestion` whose optional booleans are absent must decode — opencode
@@ -1742,6 +1759,8 @@ fn the_new_lane_frames_are_tagged_and_nested() {
         history_cursor: true,
         settings: true,
         stop: true,
+        set_title: true,
+        slash: true,
     };
     let encoded = round_trip(&LaneEvent::Capabilities {
         capabilities: caps.clone(),
@@ -1802,10 +1821,12 @@ fn source_event_is_tagged_on_kind_in_snake_case() {
                 kind: "opencode".into(),
                 create: true,
                 create_options: true,
+                create_title: false,
             }
         }),
         json!({"kind": "capabilities",
-               "capabilities": {"kind": "opencode", "create": true, "create_options": true}})
+               "capabilities": {"kind": "opencode", "create": true, "create_options": true,
+                                "create_title": false}})
     );
     assert_eq!(
         round_trip(&SourceEvent::Ready {
@@ -1930,15 +1951,18 @@ fn create_requests_and_setting_changes_refuse_unknown_fields() {
         provider: Some("grok".into()),
         prompt: Some("fix the flaky test".into()),
         request_id: "new-9c1f04ab".into(),
+        title: Some("Flaky test".into()),
     };
     assert_eq!(
         round_trip(&full),
         json!({"cwd": "/home/shed/lumen", "provider": "grok",
-               "prompt": "fix the flaky test", "request_id": "new-9c1f04ab"})
+               "prompt": "fix the flaky test", "request_id": "new-9c1f04ab",
+               "title": "Flaky test"})
     );
     let minimal = LaneCreateRequest {
         provider: None,
         prompt: None,
+        title: None,
         ..full.clone()
     };
     assert_eq!(
@@ -2163,4 +2187,343 @@ fn the_tolerant_enums_take_any_json_value() {
         serde_json::from_value::<SourceOffline>(json!("too_old")).expect("known"),
         SourceOffline::TooOld
     );
+}
+
+// ---- plan 029: the slash catalog, rename, a name at create ----
+
+/// A catalog with one row of every shape craze's fixtures 30/31 carry.
+fn sample_catalog() -> LaneSlashCatalog {
+    let run = |kind: LaneSlashKind| LaneSlashRun {
+        kind,
+        arg: LaneSlashArg::None,
+        arg_hint: None,
+        method: None,
+        param: None,
+        mode: None,
+        picker: None,
+        local: None,
+        reason: None,
+    };
+    let row = |name: &str, source: LaneSlashSource, run: LaneSlashRun| LaneSlashRow {
+        name: name.into(),
+        description: None,
+        source,
+        plugin: None,
+        qualified: None,
+        requires: None,
+        while_working: false,
+        run,
+    };
+    LaneSlashCatalog {
+        rows: vec![
+            LaneSlashRow {
+                description: Some("Keybindings and commands".into()),
+                while_working: true,
+                ..row(
+                    "help",
+                    LaneSlashSource::Builtin,
+                    LaneSlashRun {
+                        local: Some("help".into()),
+                        ..run(LaneSlashKind::Local)
+                    },
+                )
+            },
+            row(
+                "model",
+                LaneSlashSource::Builtin,
+                LaneSlashRun {
+                    arg: LaneSlashArg::Optional,
+                    arg_hint: Some("<model> [effort]".into()),
+                    picker: Some(LaneSlashPicker::Model),
+                    ..run(LaneSlashKind::Picker)
+                },
+            ),
+            LaneSlashRow {
+                while_working: true,
+                ..row(
+                    "rename",
+                    LaneSlashSource::Builtin,
+                    LaneSlashRun {
+                        arg: LaneSlashArg::Required,
+                        arg_hint: Some("<title>".into()),
+                        method: Some(LaneSlashMethod::SetTitle),
+                        param: Some("title".into()),
+                        ..run(LaneSlashKind::Method)
+                    },
+                )
+            },
+            row(
+                "plan",
+                LaneSlashSource::Builtin,
+                LaneSlashRun {
+                    method: Some(LaneSlashMethod::Set),
+                    mode: Some("plan".into()),
+                    ..run(LaneSlashKind::Method)
+                },
+            ),
+            row(
+                "ask",
+                LaneSlashSource::Builtin,
+                LaneSlashRun {
+                    reason: Some("mode ask is not advertised".into()),
+                    ..run(LaneSlashKind::Unavailable)
+                },
+            ),
+            LaneSlashRow {
+                requires: Some(LaneSlashRequires::Stop),
+                while_working: true,
+                ..row(
+                    "exit",
+                    LaneSlashSource::Builtin,
+                    LaneSlashRun {
+                        method: Some(LaneSlashMethod::Stop),
+                        ..run(LaneSlashKind::Method)
+                    },
+                )
+            },
+            LaneSlashRow {
+                requires: Some(LaneSlashRequires::Aside),
+                ..row(
+                    "btw",
+                    LaneSlashSource::Builtin,
+                    LaneSlashRun {
+                        arg: LaneSlashArg::Required,
+                        param: Some("question".into()),
+                        ..run(LaneSlashKind::Aside)
+                    },
+                )
+            },
+            row(
+                "btw",
+                LaneSlashSource::Agent,
+                LaneSlashRun {
+                    arg: LaneSlashArg::Optional,
+                    ..run(LaneSlashKind::Prompt)
+                },
+            ),
+            LaneSlashRow {
+                plugin: Some("pr-tools".into()),
+                qualified: Some("pr-tools:review".into()),
+                ..row(
+                    "review",
+                    LaneSlashSource::Plugin,
+                    LaneSlashRun {
+                        arg: LaneSlashArg::Optional,
+                        ..run(LaneSlashKind::Prompt)
+                    },
+                )
+            },
+            row(
+                "deploy",
+                LaneSlashSource::Skill,
+                LaneSlashRun {
+                    arg: LaneSlashArg::Optional,
+                    ..run(LaneSlashKind::Prompt)
+                },
+            ),
+        ],
+    }
+}
+
+/// **The catalog round-trips, and its shape is pinned** (plan 029 D2): every
+/// optional field omitted when absent, `arg` and `while_working` always
+/// written, the enums bare snake_case strings, a mode row's id under `mode`;
+/// the `Slash` frame nests it under `catalog` like its siblings.
+#[test]
+fn the_slash_catalog_round_trips_and_pins_its_shape() {
+    let catalog = sample_catalog();
+    let encoded = round_trip(&catalog);
+    assert_eq!(
+        encoded["rows"][0],
+        json!({"name": "help", "description": "Keybindings and commands", "source": "builtin",
+               "while_working": true, "run": {"kind": "local", "arg": "none", "local": "help"}})
+    );
+    assert_eq!(
+        encoded["rows"][2],
+        json!({"name": "rename", "source": "builtin", "while_working": true,
+               "run": {"kind": "method", "arg": "required", "arg_hint": "<title>",
+                       "method": "session.setTitle", "param": "title"}})
+    );
+    assert_eq!(
+        encoded["rows"][3]["run"],
+        json!({"kind": "method", "arg": "none", "method": "session.set", "mode": "plan"})
+    );
+    assert_eq!(encoded["rows"][4]["run"]["kind"], "unavailable");
+    assert_eq!(encoded["rows"][5]["requires"], "stop");
+    assert_eq!(
+        encoded["rows"][8],
+        json!({"name": "review", "source": "plugin", "plugin": "pr-tools",
+               "qualified": "pr-tools:review", "while_working": false,
+               "run": {"kind": "prompt", "arg": "optional"}})
+    );
+
+    let frame = round_trip(&LaneEvent::Slash {
+        catalog: catalog.clone(),
+    });
+    assert_eq!(frame["kind"], "slash");
+    assert_eq!(frame["catalog"]["rows"].as_array().unwrap().len(), 10);
+    assert_eq!(
+        round_trip(&LaneEvent::Slash {
+            catalog: LaneSlashCatalog::default()
+        }),
+        json!({"kind": "slash", "catalog": {"rows": []}}),
+        "an empty catalog is a catalog, not an absence"
+    );
+}
+
+/// The catalog's six tolerant enums follow [`LanePromptOutcome`]'s pattern
+/// exactly (P14): a bare snake_case string each way, an unknown word kept in
+/// `Other` and written back bare, ANY JSON value read as `Other(<its compact
+/// JSON>)` — and, nested, one odd value never fails its row.
+#[test]
+fn the_slash_enums_are_bare_strings_and_keep_an_unknown_word() {
+    fn check<T>(known: &[(T, &str)], other: impl Fn(String) -> T)
+    where
+        T: Serialize + DeserializeOwned + PartialEq + std::fmt::Debug,
+    {
+        for (v, wire) in known {
+            assert_eq!(round_trip(v), json!(wire));
+        }
+        let unknown: T = serde_json::from_value(json!("from_a_newer_agent")).expect("tolerated");
+        assert_eq!(unknown, other("from_a_newer_agent".into()));
+        assert_eq!(round_trip(&unknown), json!("from_a_newer_agent"));
+        for (value, text) in [
+            (json!(7), "7"),
+            (json!(null), "null"),
+            (json!(["a"]), r#"["a"]"#),
+            (json!({"x": 1}), r#"{"x":1}"#),
+        ] {
+            assert_eq!(
+                serde_json::from_value::<T>(value.clone()).expect("tolerated"),
+                other(text.into()),
+                "{value}"
+            );
+        }
+    }
+    check(
+        &[
+            (LaneSlashSource::Builtin, "builtin"),
+            (LaneSlashSource::Agent, "agent"),
+            (LaneSlashSource::Plugin, "plugin"),
+            (LaneSlashSource::Skill, "skill"),
+        ],
+        LaneSlashSource::Other,
+    );
+    check(
+        &[
+            (LaneSlashRequires::Stop, "stop"),
+            (LaneSlashRequires::Aside, "aside"),
+        ],
+        LaneSlashRequires::Other,
+    );
+    check(
+        &[
+            (LaneSlashKind::Prompt, "prompt"),
+            (LaneSlashKind::Method, "method"),
+            (LaneSlashKind::Picker, "picker"),
+            (LaneSlashKind::Aside, "aside"),
+            (LaneSlashKind::Local, "local"),
+            (LaneSlashKind::Unavailable, "unavailable"),
+        ],
+        LaneSlashKind::Other,
+    );
+    check(
+        &[
+            (LaneSlashArg::None, "none"),
+            (LaneSlashArg::Optional, "optional"),
+            (LaneSlashArg::Required, "required"),
+        ],
+        LaneSlashArg::Other,
+    );
+    check(
+        &[
+            (LaneSlashMethod::SetTitle, "session.setTitle"),
+            (LaneSlashMethod::Set, "session.set"),
+            (LaneSlashMethod::Stop, "session.stop"),
+        ],
+        LaneSlashMethod::Other,
+    );
+    // The words a later host might use bare stay unknown across a round trip:
+    // none of them may come back as an action this build would run.
+    for bare in ["stop", "set", "set_title", "setTitle"] {
+        let encoded = round_trip(&LaneSlashMethod::Other(bare.into()));
+        assert_eq!(encoded, json!(bare));
+        let back: LaneSlashMethod = serde_json::from_value(encoded).unwrap();
+        assert!(!back.is_known(), "{bare}");
+    }
+    check(&[(LaneSlashPicker::Model, "model")], LaneSlashPicker::Other);
+    assert!(LaneSlashKind::Prompt.is_known());
+    assert!(!LaneSlashKind::Other("dance".into()).is_known());
+    assert_eq!(LaneSlashArg::default(), LaneSlashArg::None);
+
+    // Nested: an unknown source, a numeric kind and an unknown method each
+    // keep their row — and the frame around it.
+    let ev: LaneEvent = serde_json::from_value(json!({"kind": "slash", "catalog": {"rows": [
+        {"name": "x", "source": "galaxy", "run": {"kind": 5, "method": "session.dance"}}]}}))
+    .expect("odd values must not fail the frame");
+    let LaneEvent::Slash { catalog } = ev else {
+        panic!("a Slash")
+    };
+    let r = &catalog.rows[0];
+    assert_eq!(r.source, LaneSlashSource::Other("galaxy".into()));
+    assert_eq!(r.run.kind, LaneSlashKind::Other("5".into()));
+    assert_eq!(
+        r.run.method,
+        Some(LaneSlashMethod::Other("session.dance".into()))
+    );
+}
+
+/// **AC2: a pre-029 producer still decodes** — and a pre-029 consumer's JSON
+/// is what this build writes for the fields it knew. Capabilities without
+/// `set_title`/`slash` read `false`; source capabilities without
+/// `create_title` read `false`; a create without a `title` is untitled (and
+/// still strict about anything else); a sparse catalog row defaults its
+/// `arg`, `while_working` and every option; a catalog with no rows is empty.
+#[test]
+fn a_pre_029_producer_decodes_with_the_new_fields_defaulted() {
+    let caps: LaneCapabilities = serde_json::from_value(json!({
+        "kind": "craze", "interject": true, "cancel": true, "approvals": true,
+        "history_cursor": true, "settings": true, "stop": true
+    }))
+    .expect("a pre-029 capabilities object decodes");
+    assert!(!caps.set_title && !caps.slash, "{caps:?}");
+    let ev: LaneEvent = serde_json::from_value(json!({"kind": "capabilities", "capabilities": {
+        "kind": "opencode", "interject": false, "cancel": true, "approvals": true,
+        "history_cursor": false}}))
+    .expect("and inside its frame");
+    assert!(matches!(ev, LaneEvent::Capabilities { capabilities } if !capabilities.slash));
+
+    let source: SourceCapabilities = serde_json::from_value(json!({
+        "kind": "craze", "create": true, "create_options": true
+    }))
+    .expect("a pre-029 source capabilities object decodes");
+    assert!(!source.create_title);
+
+    let request: LaneCreateRequest =
+        serde_json::from_value(json!({"cwd": "/w", "request_id": "r"})).expect("untitled");
+    assert_eq!(request.title, None);
+    let titled: LaneCreateRequest =
+        serde_json::from_value(json!({"cwd": "/w", "request_id": "r", "title": "Name"}))
+            .expect("a titled create");
+    assert_eq!(titled.title.as_deref(), Some("Name"));
+    assert!(
+        serde_json::from_value::<LaneCreateRequest>(
+            json!({"cwd": "/w", "request_id": "r", "name": "Name"})
+        )
+        .is_err(),
+        "still deny_unknown_fields: `name` is not `title`"
+    );
+
+    let row: LaneSlashRow = serde_json::from_value(json!({
+        "name": "research", "source": "agent", "run": {"kind": "prompt"}
+    }))
+    .expect("a sparse row");
+    assert_eq!(row.run.arg, LaneSlashArg::None);
+    assert!(!row.while_working);
+    assert_eq!(
+        (row.description, row.requires, row.run.method, row.run.mode),
+        (None, None, None, None)
+    );
+    let empty: LaneSlashCatalog = serde_json::from_value(json!({})).expect("no rows");
+    assert!(empty.rows.is_empty());
 }

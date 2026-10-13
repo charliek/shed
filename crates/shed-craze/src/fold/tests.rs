@@ -5,6 +5,7 @@
 //! notes, compaction, replay), and snapshot → rows.
 
 use super::*;
+use crate::testing::slash_items;
 use serde_json::json;
 
 const HOST: &str = "0123456789ab";
@@ -1282,4 +1283,132 @@ fn a_malformed_event_is_ignored() {
         f.apply(&v);
     }
     assert!(f.drain().is_empty());
+}
+
+// ---- plan 029: the slash catalog and the title ----
+
+/// A snapshot (codec 1) with `settings` as given.
+fn snapshot_settings(settings: Value) -> Value {
+    let mut snap = json!({"version": 1, "incarnation": "INC", "seq": 1, "main": {}});
+    snap["settings"] = settings;
+    snap
+}
+
+fn catalog_names(f: &CrazeFold) -> Option<Vec<String>> {
+    f.slash()
+        .map(|c| c.rows.iter().map(|r| r.name.clone()).collect())
+}
+
+/// **Replacement (P3)**: a snapshot's `settings.slash` is the catalog; a
+/// `meta` delta's replaces it whole (`{}` empties it) and marks it changed;
+/// a delta without one — or one carrying the same catalog — changes nothing;
+/// and a restore is a FRESH fold, so a snapshot without a catalog (truncated
+/// or not) leaves none.
+#[test]
+fn a_catalog_is_the_snapshots_then_each_deltas_and_never_crosses_a_restore() {
+    let mut f = fold();
+    f.restore(&snapshot_settings(
+        json!({"slash": slash_items(&["a", "b"])}),
+    ))
+    .unwrap();
+    assert_eq!(catalog_names(&f), Some(vec!["a".into(), "b".into()]));
+    assert!(!f.take_slash_changed(), "a snapshot's is not a change");
+
+    f.apply(&ev("meta", json!({"state": {"mode": "plan"}})));
+    assert!(!f.take_slash_changed(), "absent is unchanged");
+    assert_eq!(catalog_names(&f), Some(vec!["a".into(), "b".into()]));
+
+    f.apply(&ev(
+        "meta",
+        json!({"state": {"slash": slash_items(&["a", "b"])}}),
+    ));
+    assert!(!f.take_slash_changed(), "a restatement of the same catalog");
+
+    f.apply(&ev(
+        "meta",
+        json!({"state": {"commands": {}, "slash": slash_items(&["c"])}}),
+    ));
+    assert!(f.take_slash_changed());
+    assert_eq!(catalog_names(&f), Some(vec!["c".into()]));
+
+    f.apply(&ev("meta", json!({"state": {"slash": {}}})));
+    assert!(f.take_slash_changed());
+    assert_eq!(
+        catalog_names(&f),
+        Some(vec![]),
+        "present and empty: cleared, not absent"
+    );
+
+    f.apply(&ev(
+        "meta",
+        json!({"state": {"slash": slash_items(&["d"])}}),
+    ));
+    // A reseed whose snapshot dropped the catalog to its budget.
+    f.restore(&snapshot_settings(json!({"truncated": {"slash": true}})))
+        .unwrap();
+    assert_eq!(
+        catalog_names(&f),
+        None,
+        "truncated with no slash is no catalog"
+    );
+    f.restore(&snapshot_settings(json!({"slash": slash_items(&["e"])})))
+        .unwrap();
+    f.restore(&snapshot_settings(json!({"model": "grok"})))
+        .unwrap();
+    assert_eq!(
+        catalog_names(&f),
+        None,
+        "an untruncated snapshot without one: none"
+    );
+    f.restore(&snapshot_settings(
+        json!({"slash": slash_items(&["f"]), "truncated": {"slash": true}}),
+    ))
+    .unwrap();
+    assert_eq!(
+        catalog_names(&f),
+        Some(vec!["f".into()]),
+        "with one, exactly those rows — the mark changes nothing"
+    );
+    // A sub-agent's meta draws nothing, and changes no catalog.
+    f.apply(&ev("meta", json!({"agent": "a1", "state": {"slash": {}}})));
+    assert!(!f.take_slash_changed());
+}
+
+/// **The title overlay (P19)**: the snapshot's `settings.title` when it says
+/// something, then each `meta` `state.title` that does — an absent, empty or
+/// blank one changes nothing; `clear_title` forgets it (a fresh row read);
+/// a restore starts from the snapshot's alone. No row is drawn for it.
+#[test]
+fn the_title_is_the_snapshots_then_each_deltas_when_it_says_something() {
+    let mut f = fold();
+    f.restore(&snapshot_settings(json!({"title": "From the snapshot"})))
+        .unwrap();
+    assert_eq!(f.title(), Some("From the snapshot"));
+    let rows = rows_of(
+        &mut f,
+        &[
+            ev("meta", json!({"state": {"title": ""}})),
+            ev("meta", json!({"state": {"title": "   "}})),
+            ev("meta", json!({"state": {"model": "fast"}})),
+        ],
+    );
+    assert_eq!(f.title(), Some("From the snapshot"), "nothing said");
+    assert!(rows.is_empty(), "a title draws no row: {rows:?}");
+    f.apply(&ev("meta", json!({"state": {"title": "ship the release"}})));
+    assert_eq!(f.title(), Some("ship the release"));
+    f.clear_title();
+    assert_eq!(
+        f.title(),
+        None,
+        "a fresh row stands until the stream speaks"
+    );
+    f.apply(&ev("meta", json!({"state": {"title": "again"}})));
+    f.restore(&snapshot_settings(json!({"title": ""}))).unwrap();
+    assert_eq!(
+        f.title(),
+        None,
+        "a restore is fresh; an empty title says nothing"
+    );
+    f.restore(&snapshot_settings(json!({}))).unwrap();
+    assert_eq!(f.title(), None);
 }

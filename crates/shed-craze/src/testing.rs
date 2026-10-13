@@ -1083,8 +1083,16 @@ pub fn hub_hello_result(epoch: &str, capabilities: Value) -> Value {
     v
 }
 
-/// Every capability a v0.1.0 hub states.
+/// Every capability a v0.1.1 hub states (WIRE/32's: `createTitle` too).
 pub fn full_hub_capabilities() -> Value {
+    let mut caps = hub_capabilities_0_1_0();
+    caps["createTitle"] = json!(true);
+    caps
+}
+
+/// Every capability a v0.1.0 hub states — no `createTitle` (plan 029 P18's
+/// older hub).
+pub fn hub_capabilities_0_1_0() -> Value {
     json!({"rosterSubscribe": true, "sessionCreate": true, "multiplex": false, "connect": true,
            "snapshot": false, "attachWhenNow": false, "createOptions": true})
 }
@@ -1198,12 +1206,34 @@ pub fn ask_record(kind: &str, payload: &Value, opened_at: &str) -> Value {
            "body": { kind: payload }, "openedAt": opened_at})
 }
 
-/// WIRE/01's session capabilities, with `stop` as given.
+/// WIRE/01's session capabilities, with `stop` as given — an older host's
+/// shape: no `slashCatalog` (plan 029 P18).
 pub fn session_caps(stop: bool) -> Value {
     json!({"interject": false, "subagentCancel": false, "subagentBackground": false, "modes": true,
            "effort": true, "fastToggle": true, "subagentRows": true, "subagentTranscript": false,
            "todos": true, "askCards": true, "planCards": true, "parameterizedPicker": true,
            "cancel": true, "approvals": true, "historyCursor": true, "stop": stop})
+}
+
+/// [`session_caps`] on a host that publishes the slash catalog (WIRE/30's
+/// `slashCatalog: true`, craze 0.1.1).
+pub fn slash_session_caps(stop: bool) -> Value {
+    let mut caps = session_caps(stop);
+    caps["slashCatalog"] = json!(true);
+    caps
+}
+
+/// A `slash` section listing `names` as the agent's own prompt rows (WIRE/30's
+/// shape).
+pub fn slash_items(names: &[&str]) -> Value {
+    let items: Vec<Value> = names
+        .iter()
+        .map(|n| {
+            json!({"name": n, "description": "Agent-advertised command", "source": "agent",
+                   "run": {"kind": "prompt", "arg": "optional"}})
+        })
+        .collect();
+    json!({ "items": items })
 }
 
 /// A session info document (WIRE/01's shape) for `host_id` serving

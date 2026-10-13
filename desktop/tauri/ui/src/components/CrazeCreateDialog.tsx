@@ -1,6 +1,7 @@
 /* The craze create sheet (plan 025 §3.8, C10) — provider + directory + an
- * optional first prompt, nothing else (D6: no model, no effort, no permission
- * mode; craze's own defaults).
+ * optional name (plan 029 D14, on a hub that can take one) + an optional
+ * first prompt, nothing else (D6: no model, no effort, no permission mode;
+ * craze's own defaults).
  *
  * What it holds and what it does not:
  *
@@ -34,7 +35,7 @@ import {
 } from "@/lib/bridge";
 import {
   crazeCreateGate, crazeSheetNote, directoryProblem, preselectedProvider,
-  primaryLabel, providerSelectable, reconcileProvider, refusalView,
+  primaryLabel, providerSelectable, reconcileProvider, refusalView, titleFieldShown,
   type CrazeCreateOptions, type CrazeDraft, type CrazeStatusLike,
 } from "@/lib/crazeCreate";
 
@@ -51,7 +52,7 @@ export function CrazeCreateDialog({ machine, craze, draft, onEdit, onSubmit, onC
    *  `shed_craze` entry (plan 026 §3.2). */
   craze: CrazeStatusLike;
   draft: CrazeDraft;
-  onEdit: (patch: Partial<Pick<CrazeDraft, "provider" | "cwd" | "prompt">>) => void;
+  onEdit: (patch: Partial<Pick<CrazeDraft, "provider" | "cwd" | "title" | "prompt">>) => void;
   onSubmit: () => void;
   onClose: () => void;
 }) {
@@ -110,6 +111,9 @@ export function CrazeCreateDialog({ machine, craze, draft, onEdit, onSubmit, onC
   const heldAbsent = replaying && selected !== null && !!options && !providers.some((p) => p.id === selected);
   const cwdProblem = draft.cwd === "" && draft.phase === "idle" ? null : directoryProblem(draft.cwd);
   const refusal = draft.refusal ? refusalView(draft.refusal) : null;
+  // "Name (optional)" where the live hub can take a title at create (P10) —
+  // and while a typed one would be sent (`titleFieldShown`).
+  const titleField = titleFieldShown(craze, draft);
 
   // A click on a provider row: a dimmed one refuses it, as it refuses the
   // harness's door — the rule, not just the look.
@@ -138,7 +142,7 @@ export function CrazeCreateDialog({ machine, craze, draft, onEdit, onSubmit, onC
     let cancelled = false;
     void import("@tauri-apps/api/event").then(async ({ listen }) => {
       uns.push(
-        await listen<{ provider?: unknown; cwd?: unknown; prompt?: unknown; recent?: unknown }>("fill-craze-create", (e) => {
+        await listen<{ provider?: unknown; cwd?: unknown; title?: unknown; prompt?: unknown; recent?: unknown }>("fill-craze-create", (e) => {
           const fill = e.payload ?? {};
           if (typeof fill.provider === "string") doors.current.pick(fill.provider);
           if (typeof fill.recent === "number") {
@@ -146,6 +150,7 @@ export function CrazeCreateDialog({ machine, craze, draft, onEdit, onSubmit, onC
             if (dir !== undefined) doors.current.onEdit({ cwd: dir });
           }
           if (typeof fill.cwd === "string") doors.current.onEdit({ cwd: fill.cwd });
+          if (typeof fill.title === "string") doors.current.onEdit({ title: fill.title });
           if (typeof fill.prompt === "string") doors.current.onEdit({ prompt: fill.prompt });
         }),
       );
@@ -161,7 +166,7 @@ export function CrazeCreateDialog({ machine, craze, draft, onEdit, onSubmit, onC
   // Report what the sheet RENDERED (`craze_create.dump`), read back off its
   // DOM after the commit — the `launch.dump` rule — so the dump cannot claim a
   // provider row, a dimming or a value the sheet does not show.
-  const shape = JSON.stringify([load, draft, machineNote, canCreate]);
+  const shape = JSON.stringify([load, draft, machineNote, canCreate, titleField]);
   useEffect(() => {
     const root = document.querySelector("[data-craze-create]");
     const rows: CrazeCreateProviderRow[] = Array.from(
@@ -186,6 +191,8 @@ export function CrazeCreateDialog({ machine, craze, draft, onEdit, onSubmit, onC
         (el) => el.dataset.recentDir ?? "",
       ),
       values: renderedValues("[data-craze-create]"),
+      title_field: !!root?.querySelector("[data-craze-title]"),
+      title_problem: root?.querySelector("[data-title-problem]")?.textContent ?? null,
       request_id: draft.requestId,
       note: root?.querySelector("[data-craze-note]")?.textContent ?? null,
       error: draft.refusal && refusal ? { ...draft.refusal, where: refusal.where, text: refusal.text } : null,
@@ -350,6 +357,24 @@ export function CrazeCreateDialog({ machine, craze, draft, onEdit, onSubmit, onC
             </div>
           )}
         </Field>
+        {titleField && (
+          <Field label="Name" hint="optional" htmlFor={`${fid}-title`}>
+            <input
+              id={`${fid}-title`}
+              data-craze-title
+              value={draft.title}
+              disabled={submitting}
+              onChange={(e) => onEdit({ title: e.target.value })}
+              placeholder="what to call the session — craze names it otherwise"
+              className={cn(dialogInput, "text-[13px]")}
+            />
+            {refusal?.where === "title" && (
+              <div data-title-problem className="text-[12px]" style={{ color: "var(--shed-danger)" }}>
+                {refusal.text}
+              </div>
+            )}
+          </Field>
+        )}
         <Field label="First prompt" hint="optional" htmlFor={`${fid}-prompt`}>
           <textarea
             id={`${fid}-prompt`}

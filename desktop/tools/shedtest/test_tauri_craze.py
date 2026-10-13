@@ -25,7 +25,10 @@ lock, the session app untouched):
   (exit 1, before any hub — an unreachable machine), and `proxy` runs each NEW
   `bridge --hub` through `bridge_proxy.py`, which logs every `session.create`'s
   requestId to `creates.log` and — while `drop-creates` exists — cuts the
-  connection once the hub has the create, so its answer is lost. The settings
+  connection once the hub has the create, so its answer is lost. It records
+  the replies that come back too — every create's (`create-replies.log`) and
+  every `session.attach`'s (`attaches.log`) — which is where a first-frame
+  claim is asserted (P26): on what the app was told, not on a poll. The settings
   cells (C11) use the same proxy for `session.set`: every one is logged to
   `sets.log` (its params, so `forModel` and the commandId are on record), and
   while `drop-sets` exists the connection that carried it is cut the same way.
@@ -109,7 +112,18 @@ HELLO = {"protocols": [1], "client": {"kind": "test", "name": "shedtest"}}
 #: `refuse-dials` exists (plan 026 §3.1), a NEW bridge refuses the connection
 #: before any hub: logged to `refused.log`, a line on stderr, exit 1 — the
 #: dial never reaches craze (Unreachable), and connections already up (the
-#: roster's) are untouched.
+#: roster's) are untouched. A create's `title` is logged with its requestId,
+#: and every `session.setTitle`, `session.stop` and `session.prompt` (plan 029
+#: C4: what the `/` menu's commands put on the wire) goes to `verbs.log` with
+#: its params. While `hold-titles` (a FIFO, `SetGate`) exists, a logged
+#: `session.setTitle` is HELD — not relayed until one byte is written to it —
+#: so a rename stays pending for as long as a cell needs. The REPLY to every
+#: `session.create` (the `session` row the hub answers with) goes to
+#: `create-replies.log`, and the reply to every `session.attach` (whether it
+#: carried a snapshot, and that snapshot's `settings.title`) to
+#: `attaches.log` — each written as it comes DOWN the wire, before it is
+#: relayed, so it is on record by the time the client has read it: what a
+#: client was first told, which no poll of its state can prove (P26).
 BRIDGE_PROXY = r"""
 import json, os, subprocess, sys, threading, time
 root = os.path.dirname(os.path.abspath(__file__))
@@ -121,8 +135,61 @@ if os.path.exists(os.path.join(root, "refuse-dials")):
     os._exit(1)
 child = subprocess.Popen(sys.argv[1:], stdin=subprocess.PIPE, stdout=subprocess.PIPE)
 cut = threading.Event()
+# The requests whose REPLY is recorded too, by their id as JSON (so 1 and "1"
+# stay apart): the log it goes to, and what the request said.
+watched = {}
+def note(name, entry):
+    with open(os.path.join(root, name), "a") as log:
+        log.write(json.dumps(entry) + "\n")
+def answered(line):
+    # A reply to a watched request, recorded as it came down — before it is
+    # relayed (`relayed`: whether the client is given it at all).
+    if not watched:
+        return
+    try:
+        msg = json.loads(line)
+    except ValueError:
+        return
+    if not isinstance(msg, dict) or "method" in msg or "id" not in msg:
+        return
+    w = watched.pop(json.dumps(msg["id"]), None)
+    if w is None:
+        return
+    name, entry = w
+    result = msg.get("result") if isinstance(msg.get("result"), dict) else {}
+    entry["error"] = msg.get("error")
+    entry["relayed"] = not cut.is_set()
+    if name == "create-replies.log":
+        entry["session"] = result.get("session")
+    else:
+        snap = result.get("snapshot")
+        settings = (snap.get("settings") or {}) if isinstance(snap, dict) else {}
+        entry["hostId"] = (result.get("session") or {}).get("hostId")
+        entry["after"] = result.get("after")
+        entry["snapshot"] = isinstance(snap, dict)
+        entry["title"] = settings.get("title")
+    note(name, entry)
+def hold(gate):
+    # While `gate` (a FIFO) exists, the line is held — logged, not yet relayed —
+    # until one byte is read from it: the verb is on the wire and PENDING.
+    # Removing the gate lets it through too, so a cell that fails while one is
+    # held never wedges the lane's connection.
+    if not os.path.exists(gate):
+        return
+    fd = os.open(gate, os.O_RDONLY | os.O_NONBLOCK)
+    try:
+        while os.path.exists(gate):
+            try:
+                if os.read(fd, 1):
+                    return
+            except BlockingIOError:
+                pass
+            time.sleep(0.02)
+    finally:
+        os.close(fd)
 def down():
     for line in child.stdout:
+        answered(line)
         if cut.is_set():
             continue
         sys.stdout.buffer.write(line)
@@ -137,9 +204,23 @@ for line in sys.stdin.buffer:
         msg = None
     if isinstance(msg, dict) and msg.get("method") == "session.create":
         drop = os.path.exists(os.path.join(root, "drop-creates"))
-        rid = (msg.get("params") or {}).get("requestId")
+        params = msg.get("params") or {}
+        entry = {"requestId": params.get("requestId"), "dropped": drop}
+        if "title" in params:
+            entry["title"] = params["title"]
         with open(os.path.join(root, "creates.log"), "a") as log:
-            log.write(json.dumps({"requestId": rid, "dropped": drop}) + "\n")
+            log.write(json.dumps(entry) + "\n")
+        if "id" in msg:
+            watched[json.dumps(msg["id"])] = ("create-replies.log", {"requestId": params.get("requestId")})
+    if isinstance(msg, dict) and msg.get("method") == "session.attach" and "id" in msg:
+        params = msg.get("params") or {}
+        watched[json.dumps(msg["id"])] = ("attaches.log", {"sessionId": params.get("sessionId"),
+                                                           "cursor": params.get("cursor") is not None})
+    if isinstance(msg, dict) and msg.get("method") in ("session.setTitle", "session.stop", "session.prompt"):
+        with open(os.path.join(root, "verbs.log"), "a") as log:
+            log.write(json.dumps({"method": msg["method"], "params": msg.get("params")}) + "\n")
+        if msg["method"] == "session.setTitle":
+            hold(os.path.join(root, "hold-titles"))
     if isinstance(msg, dict) and msg.get("method") == "session.set":
         drop = os.path.exists(os.path.join(root, "drop-sets"))
         with open(os.path.join(root, "sets.log"), "a") as log:
@@ -305,20 +386,34 @@ class CrazeEnv:
         elif kind == "old":
             os.symlink(self.real / "craze-0.0.1", self.path_dir / "craze")
 
-    def creates(self) -> list[dict]:
-        """Every `session.create` a proxied bridge carried: `{requestId,
-        dropped}`, in order."""
-        log = self.root / "creates.log"
+    def _jsonl(self, name: str) -> list[dict]:
+        """The proxy's log `name`, one JSON object a line, in order."""
+        log = self.root / name
         if not log.exists():
             return []
         return [json.loads(line) for line in log.read_text().splitlines() if line.strip()]
 
+    def creates(self) -> list[dict]:
+        """Every `session.create` a proxied bridge carried: `{requestId,
+        dropped}`, in order."""
+        return self._jsonl("creates.log")
+
+    def create_replies(self) -> list[dict]:
+        """The hub's REPLY to every `session.create` a proxied bridge carried,
+        recorded as it came down the wire: `{requestId, session, error,
+        relayed}`, in order — `session` the roster row it answered with."""
+        return self._jsonl("create-replies.log")
+
+    def attaches(self) -> list[dict]:
+        """The reply to every `session.attach` a proxied bridge carried,
+        recorded as it came down the wire: `{sessionId, cursor, hostId,
+        after, snapshot, title, error, relayed}`, in order — `snapshot`
+        whether it carried one, `title` that snapshot's `settings.title`."""
+        return self._jsonl("attaches.log")
+
     def refused(self) -> list[dict]:
         """Every NEW bridge the proxy refused while `refuse-dials` was on."""
-        log = self.root / "refused.log"
-        if not log.exists():
-            return []
-        return [json.loads(line) for line in log.read_text().splitlines() if line.strip()]
+        return self._jsonl("refused.log")
 
     def set_grok(self, agent: Path) -> None:
         """Point `[agents].grok` at `agent` (craze reads it at every create)."""
@@ -334,13 +429,16 @@ class CrazeEnv:
             'provider = "grok"\nhost_idle_exit = "10m"\n\n'
             f'[agents]\n{lines}')
 
+    def verbs(self, method: str | None = None) -> list[dict]:
+        """Every `session.setTitle` / `session.stop` / `session.prompt` a
+        proxied bridge carried (`{method, params}`, in order) — `method`'s
+        alone when one is named."""
+        return [v for v in self._jsonl("verbs.log") if method is None or v["method"] == method]
+
     def sets(self) -> list[dict]:
         """Every `session.set` a proxied bridge carried: `{params, dropped}`,
         in order."""
-        log = self.root / "sets.log"
-        if not log.exists():
-            return []
-        return [json.loads(line) for line in log.read_text().splitlines() if line.strip()]
+        return self._jsonl("sets.log")
 
     def switch(self, name: str, on: bool) -> None:
         """Turn one of the wrapper's switches (`outage`, `proxy`,
@@ -850,7 +948,7 @@ def _close_sheet(app: TauriClient) -> None:
 def _fill(app: TauriClient, **fill) -> dict:
     """Fill the sheet (test-mode door) and wait until it SHOWS what was typed."""
     app.call("ui.fill_craze_create", fill)
-    labels = {"cwd": "Directory", "prompt": "First prompt"}
+    labels = {"cwd": "Directory", "title": "Name", "prompt": "First prompt"}
 
     def shown() -> bool:
         d = _sheet(app) or {}
@@ -1166,7 +1264,9 @@ def test_a_start_failure_shows_crazes_cause_and_try_again_mints_a_new_id(app, ri
     assert d["cause"] == d["error"]["message"], "craze's cause, verbatim"
     assert d["request_id"] is None, "a definite answer ends the id's life"
     assert d["primary"] == "Try again"
-    assert d["values"] == {"Directory": str(cwd), "First prompt": "this one will not start"}, d["values"]
+    # "Name" is the optional title field (plan 029 D14), shown on this hub.
+    assert d["values"] == {"Directory": str(cwd), "Name": "", "First prompt": "this one will not start"}, \
+        d["values"]
     app.wait_until(lambda: not _rows_in(app, cwd), timeout=WAIT,
                    what="the failed start to leave no session")
     _shot(app, "craze-create-start-failed.png")
@@ -1197,7 +1297,9 @@ def test_the_typed_form_survives_the_machine_going_offline(app, rig):
                        what="the sheet's offline note")
         d = _sheet(app)
         assert d["create_enabled"] is False, d
+        # Offline, no hub says it takes a title: no Name field (none typed).
         assert d["values"] == {"Directory": typed["cwd"], "First prompt": typed["prompt"]}, d["values"]
+        assert d["title_field"] is False, d
         assert [p["id"] for p in d["providers"] if p["selected"]] == ["grok"]
         _shot(app, "craze-create-offline.png")
     finally:
@@ -1207,7 +1309,8 @@ def test_the_typed_form_survives_the_machine_going_offline(app, rig):
     app.wait_until(lambda: (_sheet(app) or {}).get("note") is None, timeout=WAIT,
                    what="the offline note gone")
     d = _sheet(app)
-    assert d["values"] == {"Directory": typed["cwd"], "First prompt": typed["prompt"]}, d["values"]
+    # Back live, the hub takes a title again: its Name field is back (empty).
+    assert d["values"] == {"Directory": typed["cwd"], "Name": "", "First prompt": typed["prompt"]}, d["values"]
     assert d["create_enabled"] is True, d
     _fill(app, cwd="", prompt="")
     _close_sheet(app)
@@ -1304,25 +1407,29 @@ class SetGate:
     """The permodel agent's set gate (`CRAZE_FAKE_SET_GATE`): while the FIFO
     exists, each `set_config_option` waits for one byte before the agent
     answers — so a change stays PENDING, and the engine's one-at-a-time queue
-    holds every set behind it. Absent, sets run at once."""
+    holds every set behind it. Absent, sets run at once. Also the held
+    session's turn gate (`CRAZE_FAKE_GATE`, `what="turn"`): one byte lets one
+    held turn finish. And the proxy's rename hold (`hold-titles`,
+    `what="rename"`): one byte relays one held `session.setTitle`."""
 
-    def __init__(self, path: Path):
+    def __init__(self, path: Path, what: str = "set"):
         self.path = path
+        self.what = what
 
     def __enter__(self) -> "SetGate":
         os.mkfifo(self.path, 0o600)
         return self
 
     def release(self) -> None:
-        """Let one waiting set through (a reader holds the FIFO while one
-        waits; open for writing only once it does)."""
+        """Let one waiting set (or turn) through (a reader holds the FIFO while
+        one waits; open for writing only once it does)."""
         deadline = time.monotonic() + scaled_timeout(WAIT)
         while True:
             try:
                 fd = os.open(self.path, os.O_WRONLY | os.O_NONBLOCK)
                 break
             except OSError:
-                assert time.monotonic() < deadline, "no set is waiting at the gate"
+                assert time.monotonic() < deadline, f"no {self.what} is waiting at the gate"
                 time.sleep(0.05)
         try:
             os.write(fd, b"x")
@@ -1349,15 +1456,9 @@ def permodel(app, rig) -> dict:
         f"export CRAZE_FAKE_SET_GATE='{gate}'\n"
         f"exec '{rig.real / 'craze-fake-agent'}' -script permodel \"$@\"\n"))
     rig.set_agents(grok=rig.grok_echo, cursor=agent)
-    b = rig.bridge()
     try:
-        assert b.call("hello", HELLO)["endpoint"]["kind"] == "hub"
-        res = b.call("session.create", {"cwd": str(_mkdir_0700(rig.root / "w-settings")),
-                                        "provider": "cursor",
-                                        "requestId": "shedtest-settings-1"}, timeout=90)
-        host = res["session"]["hostId"]
+        host = _hub_create(rig, "shedtest-settings-1", "w-settings", provider="cursor")
     finally:
-        b.close()
         rig.set_grok(rig.grok_echo)
     app.wait_until(lambda: _row(app, host) is not None, timeout=WAIT,
                    what="the permodel session's craze row")
@@ -1631,6 +1732,10 @@ def test_no_settings_where_the_capabilities_say_none(app, roost):
         caps = app.call("lane.messages", target)["capabilities"]
         assert caps["settings"] is False, caps
         assert _dump(app)["settings_chip"] is None, "no chip"
+        # Nor a `/` menu (plan 029 X4): opencode publishes no catalog.
+        assert caps.get("slash") is False and caps.get("set_title") is False, caps
+        assert app.call("lane.messages", target)["slash_menu"] is None
+        assert _dump(app)["slash_menu"] is None
         time.sleep(scaled_timeout(0.5))
         assert _settings(app) is None, "no sheet, even when asked for"
         _shot(app, "craze-settings-none.png")
@@ -1639,6 +1744,696 @@ def test_no_settings_where_the_capabilities_say_none(app, roost):
         app.call("machine.kill", {"machine": LOCAL, "slug": str(tab)})
         app.wait_until(lambda: tab not in roost.tab_ids(), timeout=WAIT, what="the opencode tab gone")
         oc.stop()
+
+
+# ---------------------------------------------------------------------------
+# (2d) the `/` menu, a rename, and a name at create (plan 029 C4)
+# ---------------------------------------------------------------------------
+#
+# Every session here is created by the hub (a real `craze serve` running the
+# fake agent), so it publishes craze 0.1.1's slash catalog; its lane runs
+# through the rig's proxy, so what each command put on the wire is in
+# `verbs.log` (`session.setTitle`, `session.stop`, `session.prompt`) or
+# `sets.log` (`session.set`). The composer is driven through its doors —
+# `ui.type_lane_composer`, `ui.key_lane_composer` (a REAL keydown on the
+# textarea), `ui.pick_slash_row`, `ui.answer_lane_stop` — and read through
+# `lane.dump`'s `draft` and `slash_menu`.
+
+#: The rows a hub-created session's menu SHOWS (craze 0.1.1's builtins this
+#: client can run, then the agent's `research`), in catalog order; `help`,
+#: `clear`, `tasks`, `theme` (local) and `btw` (aside) are hidden in phase 1.
+MENU_ROWS = ["model", "rename", "plan", "ask", "agent", "exit", "research"]
+#: Rows that wait for the turn (no `whileWorking`, not a prompt): dimmed and
+#: refused while one runs.
+WAITING_ROWS = {"model", "plan", "ask", "agent"}
+
+
+def _hub_create(rig: CrazeEnv, request_id: str, workdir: str, **params) -> str:
+    """A session created through the harness's own bridge (`session.create`
+    on the rig's hub) in a fresh directory under the rig; its hostId."""
+    b = rig.bridge()
+    try:
+        assert b.call("hello", HELLO)["endpoint"]["kind"] == "hub"
+        res = b.call("session.create", {"cwd": str(_mkdir_0700(rig.root / workdir)),
+                                        "requestId": request_id, **params}, timeout=90)
+        return res["session"]["hostId"]
+    finally:
+        b.close()
+
+
+def _hub_session(app: TauriClient, rig: CrazeEnv, request_id: str, workdir: str) -> str:
+    """`_hub_create`, its row listed, and the proxy switched on BEFORE its
+    lane's first dial (so its verbs are logged). Its hostId."""
+    host = _hub_create(rig, request_id, workdir)
+    app.wait_until(lambda: _row(app, host) is not None, timeout=WAIT, what=f"{request_id}'s craze row")
+    rig.switch("proxy", True)
+    return host
+
+
+def _catalog(app: TauriClient, host: str) -> list[str]:
+    """The names of the resolved menu's rows on the lane (`lane.messages`)."""
+    return [r["name"] for r in (_messages(app, host).get("slash_menu") or {}).get("rows", [])]
+
+
+def _menu(app: TauriClient) -> dict | None:
+    """The composer's `/` menu as the panel rendered it (`lane.dump`)."""
+    return (_dump(app) or {}).get("slash_menu")
+
+
+def _draft(app: TauriClient) -> str | None:
+    return (_dump(app) or {}).get("draft")
+
+
+def _type(app: TauriClient, text: str) -> None:
+    """Set the composer's draft (test-mode door) and wait until the panel
+    SHOWS it. Re-sent until it lands (it is idempotent): the panel registers
+    the door's listener after it mounts, and an event sent before that lands
+    on nobody. It is the last door the panel registers, so once it lands the
+    others are live."""
+    def typed() -> bool:
+        app.call("ui.type_lane_composer", {"text": text})
+        return _draft(app) == text
+    app.wait_until(typed, timeout=20, what=f"the composer to hold {text!r}")
+
+
+def _key(app: TauriClient, key: str, **flags) -> None:
+    """A real keydown on the composer (test-mode door)."""
+    app.call("ui.key_lane_composer", {"key": key, **flags})
+
+
+def _wait_menu(app: TauriClient, token: str, open_: bool = True) -> dict:
+    """Wait for the menu to have answered `token`, open (or closed)."""
+    app.wait_until(lambda: bool((m := _menu(app)) and m["token"] == token and m["open"] is open_),
+                   timeout=20, what=f"the menu {'open' if open_ else 'closed'} for {token!r}")
+    return _menu(app)
+
+
+def _names(menu: dict) -> list[str]:
+    return [r["name"] for r in menu["rows"]]
+
+
+def _highlighted(menu: dict) -> str | None:
+    return next((r["name"] for r in menu["rows"] if r["highlighted"]), None)
+
+
+def _menu_ready(app: TauriClient, host: str) -> dict:
+    """The lane open and seeded, its resolved menu in, its panel mounted."""
+    _ready(app, host)
+    app.wait_until(lambda: bool(_catalog(app, host)), timeout=WAIT, what=f"the resolved slash menu on {host}")
+    _panel(app, host)
+    app.wait_until(lambda: _menu(app) is not None, timeout=20, what="the composer to have the menu")
+    return _messages(app, host)
+
+
+def _settle(seconds: float = 1.0) -> None:
+    """A bounded beat for a NEGATIVE assertion ("nothing was sent"): there is
+    no event to wait on for a thing that must not happen."""
+    time.sleep(scaled_timeout(seconds))
+
+
+def _poll(read, what: str, timeout: float = WAIT):
+    """Poll `read` until it answers something other than `None`, and return
+    THAT answer — the first one this poll saw, which is all a poll can say. It
+    is NOT a thing's first frame: an untitled seed renamed between two reads
+    is never seen. A first-frame claim (P26) is asserted on the wire — on the
+    replies the bridge proxy recorded (`rig.create_replies()`,
+    `rig.attaches()`) — never by polling. A `ShedError` (a lane not open yet)
+    counts as no answer."""
+    deadline = time.monotonic() + scaled_timeout(timeout)
+    while True:
+        try:
+            got = read()
+        except ShedError:
+            got = None
+        if got is not None:
+            return got
+        assert time.monotonic() < deadline, f"timed out waiting for {what}"
+        time.sleep(0.02)
+
+
+@pytest.fixture(scope="module")
+def slashed(app, rig) -> str:
+    """A hub-created grok session (the echo agent) for the menu cells, its
+    lane dialled through the proxy (switched on BEFORE the lane's first
+    dial). Its hostId."""
+    return _hub_session(app, rig, "shedtest-slash-1", "w-slash")
+
+
+def test_no_menu_without_a_slash_capability(app, rig):
+    """**No catalog, no menu** (plan 029 D11): the fake host's session states
+    no `slashCatalog`, so its capabilities say `slash: false`, its view has no
+    menu and the panel renders none — and a typed `/help` goes out as TEXT,
+    a prompt, exactly as before the menu existed."""
+    if _dump(app):
+        _unmount(app)
+    # Its own connection through the proxy: an earlier cell may have left the
+    # lane open on one that is not.
+    rig.switch("proxy", True)
+    _lane(app, "lane.close", FAKE_HOST)
+    view = _ready(app, FAKE_HOST)
+    assert view["capabilities"]["slash"] is False, view["capabilities"]
+    assert view["slash_menu"] is None
+    _panel(app, FAKE_HOST)
+    before = len(rig.verbs("session.prompt"))
+    _type(app, "/help")
+    _settle(0.5)
+    assert _menu(app) is None, "no menu on a session without a catalog"
+    _key(app, "Enter")
+    app.wait_until(lambda: any(v["params"]["text"] == "/help" for v in rig.verbs("session.prompt")[before:]),
+                   timeout=WAIT, what="`/help` sent to the fake host as a prompt")
+    app.wait_until(lambda: _draft(app) == "", timeout=20, what="the sent draft cleared")
+    _unmount(app)
+
+
+def test_slash_lists_the_sessions_commands(app, rig, slashed):
+    """**`/` lists what the session can run** (plan 029 §3.4-§3.5): the rows
+    the shared core shows for a hub-created session, in craze's order, the
+    first highlighted, none dimmed while idle — and not one of the phase-1
+    hidden builtins. The catalog is the AGENT's, live: a `SET-COMMANDS`
+    directive (the agent re-advertising its commands) replaces its row, and
+    the open menu follows."""
+    host = slashed
+    view = _menu_ready(app, host)
+    assert view["capabilities"]["slash"] is True and view["capabilities"]["set_title"] is True
+    hidden = {h["name"] for h in view["slash_menu"]["hidden"]}
+    assert {"help", "clear", "tasks", "theme", "btw"} <= hidden, hidden
+    _type(app, "/")
+    m = _wait_menu(app, "/")
+    assert _names(m) == MENU_ROWS, _names(m)
+    assert _highlighted(m) == "model" and not any(r["dimmed"] for r in m["rows"]), m["rows"]
+    _shot(app, "craze-slash-menu.png")
+
+    # P9: the highlight goes back to the first row on EVERY filter change —
+    # `/r` → `/re` lists the very same two rows, and still starts over.
+    _type(app, "/r")
+    m = _wait_menu(app, "/r")
+    assert _names(m) == ["rename", "research"], _names(m)
+    _key(app, "ArrowDown")
+    app.wait_until(lambda: _highlighted(_menu(app)) == "research", timeout=20, what="↓ to research")
+    _type(app, "/re")
+    m = _wait_menu(app, "/re")
+    assert _names(m) == ["rename", "research"], _names(m)
+    assert _highlighted(m) == "rename", f"a new filter starts on its first row: {m['rows']}"
+
+    # Dismissed with Esc, the menu STAYS closed when the catalog is replaced
+    # under the same token — only a token change ends a dismissal (P9), and a
+    # replaced menu awaiting its filter is no change of token.
+    _key(app, "Escape")
+    _wait_menu(app, "/re", open_=False)
+    _lane(app, "lane.send", host, text="SET-COMMANDS alpha-cmd,beta-cmd")
+    app.wait_until(lambda: _catalog(app, host)[-2:] == ["alpha-cmd", "beta-cmd"], timeout=WAIT,
+                   what="the agent's new catalog on the lane")
+    _settle()
+    m = _menu(app)
+    assert m["open"] is False and m["token"] == "/re" and _draft(app) == "/re", \
+        f"a catalog refresh reopened a dismissed menu: {m}"
+    _type(app, "/a")
+    m = _wait_menu(app, "/a")
+    assert _names(m) == ["ask", "agent", "alpha-cmd", "rename", "plan", "beta-cmd"], \
+        f"prefix matches in menu order, then substring ones: {_names(m)}"
+    _type(app, "/")
+    assert "research" not in _names(_wait_menu(app, "/")), "the agent dropped it"
+    _type(app, "")
+
+
+def test_a_six_hundred_row_catalog_renders_whole(app, rig, slashed):
+    """**No row cap** (plan 029 P16, P24): the agent re-advertises 600
+    commands — a live catalog delta, which craze does not cap — and the menu
+    lists every one of them after the builtins, the panel capped in height and
+    scrolling (↑ from the first row wraps the highlight to the 607th). The
+    agent's two-command catalog is put back for the cells after."""
+    host = slashed
+    _menu_ready(app, host)
+    names = [f"cmd-{i:03}" for i in range(600)]
+    _lane(app, "lane.send", host, text="SET-COMMANDS " + ",".join(names))
+    app.wait_until(lambda: len(_catalog(app, host)) == 606, timeout=WAIT,
+                   what="the 600-command catalog on the lane")
+    _type(app, "/")
+    app.wait_until(lambda: len((_menu(app) or {}).get("rows", [])) == 606, timeout=20,
+                   what="the menu listing all 606 rows")
+    m = _menu(app)
+    assert _names(m)[:6] == MENU_ROWS[:-1] and _names(m)[6:] == names, _names(m)[:8]
+    _key(app, "ArrowUp")
+    app.wait_until(lambda: _highlighted(_menu(app)) == "cmd-599", timeout=20,
+                   what="the highlight wrapped to the last row")
+    _shot(app, "craze-slash-600.png")
+    _type(app, "")
+    _lane(app, "lane.send", host, text="SET-COMMANDS alpha-cmd,beta-cmd")
+    app.wait_until(lambda: len(_catalog(app, host)) == 8, timeout=WAIT, what="the two-command catalog back")
+
+
+def test_a_hidden_builtin_typed_is_refused_and_nothing_is_sent(app, rig, slashed):
+    """**A builtin the menu hides is never sent as text** (plan 029 P5, E1):
+    `/help` (a `local` row, hidden in phase 1) typed and sent is refused
+    INLINE with the shared core's reason, the draft kept — and neither the
+    hub nor the agent ever sees it. So is ` /help` (E9: read as it would be
+    sent)."""
+    host = slashed
+    _menu_ready(app, host)
+    before = len(rig.verbs("session.prompt"))
+    for typed in ["/help", " /help"]:
+        _type(app, typed)
+        _key(app, "Enter")
+        app.wait_until(lambda: (_menu(app) or {}).get("refusal") == "/help: not available here yet",
+                       timeout=20, what=f"{typed!r} refused inline")
+        assert _draft(app) == typed, "the draft is kept"
+        if typed == "/help":
+            _shot(app, "craze-slash-refused.png")
+    _settle()
+    assert len(rig.verbs("session.prompt")) == before, f"nothing was sent: {rig.verbs('session.prompt')[before:]}"
+    assert not any("/help" in t for t in _texts(app, host)), "the agent never saw it"
+    _type(app, "")
+    app.wait_until(lambda: (_menu(app) or {}).get("refusal") is None, timeout=20,
+                   what="an edit to clear the refusal")
+
+
+def test_re_enter_accepts_then_enter_renames_via_the_delta(app, rig, slashed):
+    """**`/re` + Enter completes, then Enter renames** (plan 029 P9, P19): the
+    first Enter ACCEPTS the highlighted `rename` (the token does not spell it
+    yet) — the draft becomes `/rename ` and nothing is sent; with a title
+    typed, the second Enter runs it: ONE `session.setTitle` carrying exactly
+    the trimmed argument, and the header shows the new title once craze's
+    delta says so (the lane's session row). The draft clears, no note."""
+    host = slashed
+    _menu_ready(app, host)
+    before = len(rig.verbs("session.setTitle"))
+    _type(app, "/re")
+    m = _wait_menu(app, "/re")
+    assert _highlighted(m) == "rename", m["rows"]
+    _key(app, "Enter")
+    app.wait_until(lambda: _draft(app) == "/rename ", timeout=20, what="Enter to complete the token")
+    _settle(0.5)
+    assert len(rig.verbs("session.setTitle")) == before, "accepting sends nothing"
+    _wait_menu(app, "/rename", open_=False)
+
+    _type(app, "/rename   plan 029 desk ")
+    _key(app, "Enter")
+    app.wait_until(lambda: (_messages(app, host)["session"] or {}).get("title") == "plan 029 desk",
+                   timeout=WAIT, what="the new title on the lane's session row (the delta)")
+    app.wait_until(lambda: (_dump(app) or {}).get("title") == "plan 029 desk", timeout=20,
+                   what="the panel header's new title")
+    sent = rig.verbs("session.setTitle")[before:]
+    assert [v["params"]["title"] for v in sent] == ["plan 029 desk"], sent
+    app.wait_until(lambda: _draft(app) == "", timeout=20, what="the draft cleared on success")
+    m = _menu(app)
+    assert m["refusal"] is None and m["warning"] is None, m
+
+
+def test_a_rename_that_lands_late_leaves_a_newer_draft_alone(app, rig, slashed):
+    """**An earlier command's outcome never erases a newer draft** (plan 029
+    §3.5, P8 — draft revision ownership): `/rename held late` + Enter goes
+    out and is HELD on the wire (the proxy's `hold-titles` gate), pending,
+    the composer still editable. A new draft typed meanwhile SURVIVES the
+    rename's success: the rename lands — one `session.setTitle` with exactly
+    its title, the lane's row titled by craze's delta — and the composer
+    still holds the newer text, no note."""
+    host = slashed
+    _menu_ready(app, host)
+    before = len(rig.verbs("session.setTitle"))
+    newer = "a newer draft, typed while the rename was pending"
+    title = lambda: (_messages(app, host)["session"] or {}).get("title")  # noqa: E731
+    with SetGate(rig.root / "hold-titles", what="rename") as gate:
+        _type(app, "/rename held late")
+        _key(app, "Enter")
+        app.wait_until(lambda: len(rig.verbs("session.setTitle")) > before, timeout=WAIT,
+                       what="the rename on the wire, held")
+        _type(app, newer)
+        _settle(0.5)
+        assert title() != "held late", "the rename is still pending"
+        assert _draft(app) == newer
+        gate.release()
+        app.wait_until(lambda: title() == "held late", timeout=WAIT,
+                       what="the held rename landing (craze's delta)")
+    # The rename's own answer reaches the panel beside its delta; give it the
+    # beat a negative assertion needs.
+    _settle()
+    assert _draft(app) == newer, "the rename's success erased the draft typed while it was pending"
+    m = _menu(app)
+    assert m["refusal"] is None and m["warning"] is None, m
+    sent = rig.verbs("session.setTitle")[before:]
+    assert [v["params"]["title"] for v in sent] == ["held late"], sent
+    _type(app, "")
+
+
+def test_ime_composition_and_shift_enter_send_nothing(app, rig, slashed):
+    """**Every menu key is ignored while an IME composes, and Shift+Enter is
+    a newline** (plan 029 P9, P28): with the menu open, a composing Enter,
+    Tab, Esc or ↓ changes nothing; real ↑/↓ move the highlight (wrapping)
+    instead of the caret; Shift+Enter inserts a newline (the menu closes on a
+    multi-line draft) and sends nothing. A composing Enter on plain text sends
+    nothing either — the composer's own Enter-to-send got the same guard —
+    and a real Enter then sends it."""
+    host = slashed
+    _menu_ready(app, host)
+    titles, prompts = len(rig.verbs("session.setTitle")), len(rig.verbs("session.prompt"))
+    _type(app, "/")
+    m = _wait_menu(app, "/")
+    first, rows = _highlighted(m), _names(m)
+    for key in ("Enter", "Tab", "Escape", "ArrowDown"):
+        _key(app, key, composing=True)
+    _settle(0.5)
+    m = _menu(app)
+    assert m["open"] is True and _draft(app) == "/" and _highlighted(m) == first, m
+    _key(app, "ArrowDown")
+    app.wait_until(lambda: _highlighted(_menu(app)) == rows[1], timeout=20, what="↓ to move the highlight")
+    _key(app, "ArrowUp")
+    _key(app, "ArrowUp")
+    app.wait_until(lambda: _highlighted(_menu(app)) == rows[-1], timeout=20, what="↑ to wrap to the last row")
+    assert _draft(app) == "/", "the arrows moved the highlight, not the text"
+
+    _key(app, "Enter", shift=True)
+    app.wait_until(lambda: _draft(app) == "/\n", timeout=20, what="Shift+Enter's newline")
+    app.wait_until(lambda: (_menu(app) or {}).get("open") is False, timeout=20,
+                   what="the menu closed on a multi-line draft")
+
+    _type(app, "hello ime")
+    _key(app, "Enter", composing=True)
+    _settle()
+    assert _draft(app) == "hello ime", "a composing Enter does not send"
+    assert len(rig.verbs("session.prompt")) == prompts and len(rig.verbs("session.setTitle")) == titles
+    _key(app, "Enter")
+    app.wait_until(lambda: any(v["params"]["text"] == "hello ime" for v in rig.verbs("session.prompt")[prompts:]),
+                   timeout=WAIT, what="the real Enter to send the text")
+    app.wait_until(lambda: "echo: hello ime" in _texts(app, host), timeout=WAIT, what="the agent's echo")
+    app.wait_until(lambda: _draft(app) == "", timeout=20, what="the sent draft cleared")
+
+
+def test_double_escape_closes_the_menu_then_nothing_else(app, rig, slashed):
+    """**Esc ordering, with real key events** (plan 029 P27, P9): the first
+    Esc closes ONLY the menu — the draft, the panel and any open dialog stay
+    — and the menu stays dismissed while the token is the same; the second
+    Esc does nothing to the panel. With the craze create sheet open over it,
+    the first Esc still closes only the menu (the sheet's Esc handler ignores
+    an Esc the composer handled) and the second, no longer the composer's,
+    closes the sheet — the panel untouched. A new token reopens the menu."""
+    host = slashed
+    _menu_ready(app, host)
+    prompts = len(rig.verbs("session.prompt"))
+    _type(app, "/")
+    _wait_menu(app, "/")
+    before = _dump(app)
+    _key(app, "Escape")
+    app.wait_until(lambda: (_menu(app) or {}).get("open") is False, timeout=20,
+                   what="the first Esc to close the menu")
+    after = _dump(app)
+    assert after["session_id"] == host and after["draft"] == "/", after
+    assert after["stop"] == before["stop"] and _settings(app) is None
+    _key(app, "Escape")
+    _settle(0.5)
+    again = _dump(app)
+    assert again is not None and again["session_id"] == host, "the panel stays"
+    assert again["draft"] == "/" and again["slash_menu"]["open"] is False, again["slash_menu"]
+    assert again["stop"] == before["stop"] and _settings(app) is None
+    _type(app, "/r")
+    _wait_menu(app, "/r")
+
+    # With a dialog open over the panel.
+    _type(app, "")
+    _open_sheet(app)
+    _type(app, "/")
+    _wait_menu(app, "/")
+    _key(app, "Escape")
+    app.wait_until(lambda: (_menu(app) or {}).get("open") is False, timeout=20,
+                   what="Esc to close the menu under the open sheet")
+    _settle(0.5)
+    assert _sheet(app) is not None, "the composer's Esc did not also close the sheet"
+    _key(app, "Escape")
+    app.wait_until(lambda: _sheet(app) is None, timeout=20, what="the second Esc to close the sheet")
+    assert (_dump(app) or {}).get("session_id") == host and _draft(app) == "/", "the panel untouched"
+    assert len(rig.verbs("session.prompt")) == prompts, "no Esc sent anything"
+    _type(app, "")
+
+
+def test_a_mode_runs_from_the_composer(app, rig, permodel):
+    """**Modes from the composer** (plan 029 P7): `/ask` + Enter (the token
+    spells the row, so Enter runs it) and a click on `/plan` each send ONE
+    `session.set` mode change and the session moves — no settings sheet
+    involved; re-selecting the current mode still sends. The draft clears."""
+    host = permodel["host"]
+    _menu_ready(app, host)
+    mode = lambda: (_messages(app, host).get("settings") or {}).get("mode")  # noqa: E731
+    sent = lambda: [e["params"]["setting"] for e in rig.sets()  # noqa: E731
+                    if e["params"]["setting"].get("kind") == "mode"]
+    before = len(sent())
+    _type(app, "/ask")
+    _wait_menu(app, "/ask")
+    _key(app, "Enter")
+    app.wait_until(lambda: mode() == "ask", timeout=WAIT, what="the session in ask mode")
+    app.wait_until(lambda: _draft(app) == "", timeout=20, what="the draft cleared")
+    _type(app, "/pl")
+    m = _wait_menu(app, "/pl")
+    assert "plan" in _names(m), m
+    app.call("ui.pick_slash_row", {"name": "plan"})
+    app.wait_until(lambda: mode() == "plan", timeout=WAIT, what="the session in plan mode")
+    app.wait_until(lambda: _draft(app) == "", timeout=20, what="the draft cleared")
+    _type(app, "/plan")
+    _wait_menu(app, "/plan")
+    _key(app, "Enter")
+    app.wait_until(lambda: len(sent()) == before + 3, timeout=WAIT, what="the re-selected mode sent")
+    assert sent()[before:] == [{"kind": "mode", "value": "ask"}, {"kind": "mode", "value": "plan"},
+                               {"kind": "mode", "value": "plan"}], sent()[before:]
+    assert _settings(app) is None, "no sheet was opened for it"
+
+
+def test_model_opens_the_sheet_and_the_model_changes(app, rig, permodel):
+    """**`/model` opens the picker** (plan 029 X2, §3.5): Enter on `/model`
+    clears the draft and opens the settings sheet; a model pressed there
+    changes the session's model end to end (`session.set` on the wire, the
+    session's settings). `/model <id>` is refused inline (no inline model in
+    phase 1), nothing sent."""
+    host = permodel["host"]
+    _menu_ready(app, host)
+    before = len(rig.sets())
+    prompts = len(rig.verbs("session.prompt"))
+    _type(app, "/model composer-2.5")
+    _key(app, "Enter")
+    app.wait_until(lambda: (_menu(app) or {}).get("refusal")
+                   == "/model: takes no argument — pick a model from the list",
+                   timeout=20, what="an argument to /model refused")
+    assert _draft(app) == "/model composer-2.5", "the refused draft is kept to fix"
+    _settle()
+    assert len(rig.sets()) == before and _settings(app) is None
+    assert rig.verbs("session.prompt")[prompts:] == [], \
+        f"nothing went out as text: {rig.verbs('session.prompt')[prompts:]}"
+    assert _draft(app) == "/model composer-2.5", "still kept"
+    _type(app, "/model")
+    _wait_menu(app, "/model")
+    _key(app, "Enter")
+    app.wait_until(lambda: bool((d := _settings(app)) and d["session_id"] == host), timeout=WAIT,
+                   what="the settings sheet, opened by /model")
+    assert _draft(app) == "", "the picker clears the draft"
+    _press(app, "model", "composer-2.5")
+    app.wait_until(lambda: (_messages(app, host).get("settings") or {}).get("model") == "composer-2.5",
+                   timeout=WAIT, what="the session on composer-2.5")
+    assert {"kind": "model", "value": "composer-2.5"} in [e["params"]["setting"] for e in rig.sets()[before:]]
+    _press(app, "model", "grok-4.6")
+    app.wait_until(lambda: _row_of(app, "model").get("current") == "grok-4.6", timeout=WAIT,
+                   what="the session back on grok-4.6")
+    app.call("ui.close_lane_settings")
+    app.wait_until(lambda: _settings(app) is None, timeout=20, what="the sheet to close")
+
+
+@pytest.fixture(scope="module")
+def held(app, rig) -> dict:
+    """A hub-created session whose turns after the first HOLD until the
+    harness writes a byte (`craze-fake-agent -script sigint-hold` with
+    `CRAZE_FAKE_GATE` a FIFO; cursor's dialect, so it runs as `cursor` — grok
+    stays the default and the config is restored at once), recording every
+    prompt it reads (`CRAZE_FAKE_DUMP_PROMPTS`). Its first prompt is answered
+    at the create. Answers `{host, gate, prompts}`, `gate` a `SetGate`."""
+    prompts = rig.root / "hold-prompts.jsonl"
+    with SetGate(rig.root / "hold-gate", what="turn") as gate:
+        agent = _write_exec(rig.root / "hold-agent", (
+            "#!/bin/sh\n"
+            f"export CRAZE_FAKE_GATE='{gate.path}'\n"
+            f"export CRAZE_FAKE_DUMP_PROMPTS='{prompts}'\n"
+            f"exec '{rig.real / 'craze-fake-agent'}' -script sigint-hold \"$@\"\n"))
+        rig.set_agents(grok=rig.grok_echo, cursor=agent)
+        try:
+            host = _hub_create(rig, "shedtest-held-1", "w-held", provider="cursor", prompt="warm up")
+        finally:
+            rig.set_grok(rig.grok_echo)
+        app.wait_until(lambda: _row(app, host) is not None, timeout=WAIT, what="the held session's craze row")
+        rig.switch("proxy", True)
+        yield {"host": host, "gate": gate, "prompts": prompts}
+
+
+def _agent_read(prompts: Path, text: str) -> bool:
+    """Whether the agent has READ a prompt carrying `text`."""
+    return prompts.exists() and any(text in line for line in prompts.read_text().splitlines())
+
+
+def test_while_a_turn_runs_rows_dim_and_a_prompt_row_queues(app, rig, held):
+    """**While working** (plan 029 X7/P29, P23, P26): with a turn held open,
+    the rows that wait for the turn are listed DIMMED ("after this turn") —
+    `rename`, `exit` and the agent's prompt row are not — and a click on a
+    dimmed `/plan` is refused inline, no `session.set` sent. A PROMPT row
+    queues: `/research deep dive` + Enter goes out as one queued
+    `session.prompt` of the row's own spelling, the draft clears, and the
+    agent does not read it while the turn holds; released, the agent reads
+    the queued text and answers it."""
+    host = held["host"]
+    _menu_ready(app, host)
+    _lane(app, "lane.send", host, text="hold this turn")
+    app.wait_until(lambda: _messages(app, host)["activity"] == "working", timeout=WAIT,
+                   what="the held turn running")
+    app.wait_until(lambda: _agent_read(held["prompts"], "hold this turn"), timeout=WAIT,
+                   what="the agent holding the turn")
+    _type(app, "/")
+    app.wait_until(lambda: any(r["dimmed"] for r in (_menu(app) or {}).get("rows", [])), timeout=20,
+                   what="the waiting rows dimmed")
+    m = _wait_menu(app, "/")
+    assert {r["name"] for r in m["rows"] if r["dimmed"]} == WAITING_ROWS, m["rows"]
+    assert _names(m) == MENU_ROWS, _names(m)
+    _shot(app, "craze-slash-dimmed.png")
+
+    sets = len(rig.sets())
+    app.call("ui.pick_slash_row", {"name": "plan"})
+    app.wait_until(lambda: (_menu(app) or {}).get("refusal") == "/plan: runs after this turn",
+                   timeout=20, what="the dimmed row refused")
+    assert _draft(app) == "/", "the draft kept"
+    _settle(0.5)
+    assert len(rig.sets()) == sets, "nothing sent"
+
+    prompts = len(rig.verbs("session.prompt"))
+    _type(app, "/Research   deep dive ")
+    _key(app, "Enter")
+    app.wait_until(lambda: len(rig.verbs("session.prompt")) > prompts, timeout=WAIT,
+                   what="the prompt row on the wire")
+    sent = rig.verbs("session.prompt")[prompts:]
+    assert [(v["params"]["text"], v["params"]["mode"]) for v in sent] == [("/research deep dive", "queue")], sent
+    app.wait_until(lambda: _draft(app) == "", timeout=20, what="the queued prompt's draft cleared")
+    _settle()
+    assert not _agent_read(held["prompts"], "/research deep dive"), "queued: the agent has not read it"
+    assert _messages(app, host)["activity"] == "working"
+
+    held["gate"].release()  # the held turn ends; craze sends what it queued
+    app.wait_until(lambda: _agent_read(held["prompts"], "/research deep dive"), timeout=WAIT,
+                   what="the queued prompt reaching the agent")
+    held["gate"].release()  # and its own turn (held too) ends
+    app.wait_until(lambda: any("/research deep dive" in t and t.startswith("echo") for t in _texts(app, host)),
+                   timeout=WAIT, what="the agent's answer to the queued prompt")
+    app.wait_until(lambda: _messages(app, host)["activity"] != "working", timeout=WAIT,
+                   what="the session idle again")
+    _type(app, "")
+
+
+def test_exit_asks_first_and_keep_sends_nothing(app, rig):
+    """**`/exit` stops the session, behind the confirm** (plan 029 §3.5, P26),
+    on a session of its OWN: Enter on `/exit` opens Stop's confirm with the
+    draft kept; Keep closes it and sends NOTHING (no `session.stop`), the
+    draft still `/exit`; Enter again and Stop session sends one
+    `session.stop` — the session ends and its row leaves — and the draft
+    clears."""
+    host = _hub_session(app, rig, "shedtest-exit-1", "w-exit")
+    _menu_ready(app, host)
+    before = len(rig.verbs("session.stop"))
+    _type(app, "/exit")
+    _wait_menu(app, "/exit")
+    _key(app, "Enter")
+    app.wait_until(lambda: (_dump(app) or {}).get("stop") == {"confirming": True}, timeout=20,
+                   what="Stop's confirm, opened by /exit")
+    assert _draft(app) == "/exit"
+    app.call("ui.answer_lane_stop", {"stop": False})
+    app.wait_until(lambda: (_dump(app) or {}).get("stop") == {"confirming": False}, timeout=20,
+                   what="Keep to close the confirm")
+    _settle()
+    assert len(rig.verbs("session.stop")) == before, "Keep sent nothing"
+    assert _draft(app) == "/exit", "and kept the draft"
+    assert _row(app, host) is not None, "the session runs on"
+
+    _wait_menu(app, "/exit")
+    _key(app, "Enter")
+    app.wait_until(lambda: (_dump(app) or {}).get("stop") == {"confirming": True}, timeout=20,
+                   what="the confirm again")
+    app.call("ui.answer_lane_stop", {"stop": True})
+    app.wait_until(lambda: _row(app, host) is None, timeout=WAIT, what="the stopped session's row to leave")
+    assert len(rig.verbs("session.stop")) == before + 1, rig.verbs("session.stop")[before:]
+    app.wait_until(lambda: _draft(app) == "", timeout=20, what="the draft cleared once the stop took")
+    _unmount(app)
+
+
+def test_a_name_at_create_titles_the_session_from_its_first_frame(app, rig):
+    """**"Name (optional)" at create** (plan 029 D14, P26): the sheet offers
+    the field on this hub (it takes a title). A name craze normalizes to
+    nothing is refused `bad_request` and shown UNDER the field, no id held,
+    nothing listed; a real name goes out on the create (the wire carries
+    it), and the session is titled from its FIRST frame — never untitled and
+    renamed after.
+
+    The first frame is asserted on the WIRE, on what the bridge proxy
+    recorded coming down it before the app read it: the hub's answer to the
+    create — the session's row — already carries the name, and so does the
+    snapshot of the lane connection's FIRST attach. No poll of the app's
+    state can prove that (an untitled seed renamed before the first read
+    passes any poll). The app's own row, the lane's seeded view and the
+    transcript header are then checked to carry the name too — eventual
+    checks of what the app shows. One session in that directory."""
+    name = "plan 029 desk name"
+    cwd = _mkdir_0700(rig.root / "w-named")
+    rig.switch("proxy", True)
+    before = len(rig.creates())
+    replied = len(rig.create_replies())
+    d = _open_sheet(app)
+    assert d["title_field"] is True, "this hub takes a title"
+    _fill(app, cwd=str(cwd), title="\u200b\u202e", prompt="")
+    _submit_when_ready(app)
+    app.wait_until(lambda: (_sheet(app) or {}).get("state") == "refused", timeout=WAIT,
+                   what="craze's refusal of a blank-once-normalized name")
+    d = _sheet(app)
+    assert d["error"]["code"] == "bad_request" and d["error"]["where"] == "title", d["error"]
+    assert d["title_problem"] == "params.title is blank once normalized: send none instead", d
+    assert d["cwd_problem"] is None and d["request_id"] is None, d
+    assert _rows_in(app, cwd) == [], "the refused create listed nothing"
+
+    _fill(app, title=name)
+    _submit_when_ready(app)
+    # The FIRST frame, on the wire: the hub's answer to the create — the
+    # session's row, recorded before the app read it — already carries the
+    # name.
+    app.wait_until(lambda: len(rig.create_replies()) - replied >= 2, timeout=WAIT,
+                   what="the hub's answer to the titled create, on the wire")
+    sent = rig.creates()[before:]
+    assert [c.get("title") for c in sent] == ["\u200b\u202e", name], sent
+    replies = rig.create_replies()[replied:]
+    assert [r["requestId"] for r in replies] == [c["requestId"] for c in sent], (sent, replies)
+    refused, created = replies
+    assert ((refused["error"] or {}).get("data") or {}).get("code") == "bad_request", refused
+    assert created["error"] is None and created["relayed"], created
+    answer = created["session"]
+    assert (answer.get("row") or {}).get("title") == name, \
+        f"the create's own answer — the session's row — is already titled: {answer}"
+    host = answer["hostId"]
+
+    # What the app shows — EVENTUAL checks (`_poll`), not the first frame.
+    shown = _poll(lambda: next(iter(_rows_in(app, cwd)), None), "the new session's row in rc.list")
+    assert shown["slug"] == host, (shown, answer)
+    assert shown["display_name"] == name, f"the session's row is titled: {shown}"
+    seeded = _poll(lambda: v if (v := _messages(app, host))["generation"] >= 1 else None,
+                   "the lane's seeded view")
+    assert seeded["generation"] == 1, seeded["generation"]
+    assert (seeded["session"] or {}).get("title") == name, \
+        f"the lane's seeded view is titled: {seeded['session']}"
+
+    # The FIRST frame of the lane, on the wire: its connection's first attach
+    # for this session (recorded before the lane could seed from it) is a
+    # fresh one, answered with a snapshot that already carries the name.
+    first = next((a for a in rig.attaches() if a["sessionId"] == answer["sessionId"] and a["error"] is None),
+                 None)
+    assert first is not None, f"the lane's attach reply is on record: {rig.attaches()}"
+    assert first["hostId"] == host and first["relayed"], first
+    assert first["cursor"] is False and first["snapshot"] is True, \
+        f"the lane's first attach is a fresh one, answered with a snapshot: {first}"
+    assert first["title"] == name, f"the lane's FIRST attach snapshot is already titled: {first}"
+
+    app.wait_until(lambda: _sheet(app) is None, timeout=WAIT, what="the sheet to close on Created")
+    header = _poll(lambda: r if (r := _dump(app)) and r["session_id"] == host and r["generation"] >= 1 else None,
+                   "the transcript's seeded report")
+    assert header["lane_kind"] == KIND and header["title"] == name, \
+        f"the transcript header: {header['title']!r}"
+    row = _exactly_one_session_in(app, cwd)
+    assert row["slug"] == host and row["display_name"] == name, row
+    _unmount(app)
 
 
 # ---------------------------------------------------------------------------
@@ -2011,7 +2806,10 @@ def test_the_sheet_on_a_dormant_machine_starts_its_hub_and_attaches(app_remote, 
     sheet is the explicit action that starts a remote hub — its
     `create_options` dials `bridge --hub` (jailed, like every remote command in
     test mode) where no hub ran — and the machine's source, WOKEN by it, probes
-    and attaches at once rather than at its next 30 s dormant probe.
+    and attaches at once rather than at its next 30 s dormant probe. And the
+    sheet's "Name (optional)" (plan 029 P10): absent from the dormant status
+    (`create_title: false`, as `create_options`), the field appears on the
+    open sheet once the woken hub is live and says it takes a title.
 
     LAST of the remote machines' cells: craze-dormant is no longer dormant
     after it."""
@@ -2020,6 +2818,11 @@ def test_the_sheet_on_a_dormant_machine_starts_its_hub_and_attaches(app_remote, 
     app_remote.wait_until(lambda: _craze_state(app_remote, machine).get("state") == "dormant",
                           timeout=WAIT, what="craze-dormant dormant")
     assert not jail.hub_pids()
+    # Plan 029 P10: a dormant machine's status says it cannot name a session
+    # at create — no hub has said so yet — exactly as it says no
+    # `create_options`; its sheet offers "Name (optional)" once the hub is live.
+    dormant = _craze_state(app_remote, machine)
+    assert dormant.get("create_title") is False and dormant.get("create_options") is False, dormant
     # Anchor on a fresh dormant probe: without the wake, the next one — the
     # earliest the source could attach — is a full DORMANT_PROBE (30 s) later.
     probes = lambda: [c for c in remote.commands(machine) if "providers --hub --json" in c]  # noqa: E731
@@ -2037,6 +2840,11 @@ def test_the_sheet_on_a_dormant_machine_starts_its_hub_and_attaches(app_remote, 
     app_remote.wait_until(lambda: _craze_state(app_remote, machine).get("state") == "live",
                           timeout=WAIT, what="craze-dormant attached")
     assert time.monotonic() - probed_at < 25, "woken by the sheet, not left to its next dormant probe"
+    assert _craze_state(app_remote, machine).get("create_title") is True, "craze 0.1.1's hub takes a title"
+    # The open sheet grows its Name field once the hub is live (P10).
+    app_remote.wait_until(lambda: (_sheet(app_remote) or {}).get("title_field") is True, timeout=WAIT,
+                          what="the Name field on the now-live machine's sheet")
+    assert "Name" in _sheet(app_remote)["values"], _sheet(app_remote)["values"]
     _shot(app_remote, "craze-create-dormant.png")
     _close_sheet(app_remote)
 

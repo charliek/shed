@@ -91,6 +91,7 @@ pub fn shape(events: &[LaneEvent]) -> Vec<&'static str> {
             LaneEvent::Approval { .. } => "approval",
             LaneEvent::Capabilities { .. } => "capabilities",
             LaneEvent::Settings { .. } => "settings",
+            LaneEvent::Slash { .. } => "slash",
             LaneEvent::Stale { .. } => "stale",
             LaneEvent::Down { .. } => "down",
             LaneEvent::Unknown => "unknown",

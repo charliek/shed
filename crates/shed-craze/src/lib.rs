@@ -17,6 +17,7 @@
 //!   │                the approval book (craze's own wordings, ported)
 //!   ├─ segment.rs  — the streak segmenter and its flush clock (ported from shed-gx)
 //!   ├─ settings.rs — the session's settings: catalogs, sections, craze's order
+//!   ├─ slash.rs    — the session's slash catalog, read presence-aware, row by row
 //!   ├─ dial.rs   — the seam: one fresh duplex to `craze bridge --hub` per connection
 //!   │              (ProcessDial: a local /bin/sh; TcpDial: the phone's loopback port),
 //!   │              and the classification of a dial that never reached a hub
@@ -55,6 +56,7 @@ pub mod fold;
 pub mod lane;
 pub mod segment;
 pub mod settings;
+pub mod slash;
 pub mod source;
 pub mod watcher;
 pub mod wire;
@@ -66,7 +68,7 @@ pub use dial::{
     classify_pre_hello, classify_probe, connect_hub, probe_process, CrazeDial, CrazeStream,
     DialError, EnvPolicy, ExitWatch, Probe, ProcessDial, StderrTail, TcpDial,
 };
-pub use errors::{is_outcome_unknown, lane_error};
+pub use errors::{index_write_cause, is_outcome_unknown, lane_error};
 pub use lane::{answer_body, lane_capabilities, setting_for, CrazeLane, LaneTimings};
 pub use source::{
     lane_session, new_request_id, source_capabilities, valid_request_id, CrazeSource, Timings, KIND,

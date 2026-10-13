@@ -20,21 +20,21 @@
 //! | dialling | five consecutive other connect refusals | end | `Down{"connect refused: <code/reason>"}` |
 //! | dialling | craze not installed / too old | end | `Down{"craze unavailable: …"}` |
 //! | attaching | any attach answered (Amendment A11's fenced read) | read the engine's ask registry — `asks.list`, then `asks.get` per id — then `session.sync` (its `seq` is the FENCE); events after the attach queue meanwhile | — |
-//! | attaching | a no-cursor attach answered with a snapshot | flush; new generation; fresh fold under the session's cards: the snapshot's rows, the REGISTRY's approvals (a sub-agent's included; a snapshot ask the registry lacks is rows only) | `Reset{reason}`, the rows, `Session`, `Capabilities`, `Settings` (when they say so), one `Approval` per open registry ask |
+//! | attaching | a no-cursor attach answered with a snapshot | flush; new generation; fresh fold under the session's cards: the snapshot's rows, the REGISTRY's approvals (a sub-agent's included; a snapshot ask the registry lacks is rows only) | `Reset{reason}`, the rows, `Session`, `Capabilities`, `Settings` (when they say so), `Slash` (when they say so AND the snapshot carried a catalog), one `Approval` per open registry ask |
 //! | attaching | a cursor REFUSED (a snapshot came back) | the same reseed | `Reset{cursor_lost:<reason>}` … |
-//! | attaching | the cursor honoured (no snapshot) | keep the fold; re-read row, info and the registry (an approval it no longer lists resolved, one it lists opened) | `Session`/`Approval`/`Capabilities`/`Settings` when changed |
+//! | attaching | the cursor honoured (no snapshot) | keep the fold; re-read row, info and the registry (an approval it no longer lists resolved, one it lists opened) | `Session`/`Approval`/`Capabilities`/`Settings`/`Slash` when changed |
 //! | attaching | refused `unknown_session` / `not_accepting`+`start_failed` / any other `not_accepting` | end | `Down{"unknown_session"}` (`"session_closed"` when confirming a closing `omitted`) / `Down{"start_failed: <cause>"}` / `Down{"session_closed"}` |
 //! | attaching | refused `unavailable`/`in_progress` | wait, re-attach (counted) | — |
 //! | attaching | the 9th attach of an episode | end | `Down{"re-attach bound"}` |
-//! | following | `event` (contiguous seq, this subscription) | fold | `Message`s, `Session`/`Approval`/`Capabilities`/`Settings` on change |
+//! | following | `event` (contiguous seq, this subscription) | fold | `Message`s, `Session`/`Approval`/`Capabilities`/`Settings`/`Slash` on change (a title delta is a `Session`) |
 //! | following | 60 s ([`LaneTimings::sync_wait`]) without a notification of this attachment, before its `synchronized` — progress-based, so a long replay that keeps delivering is never cut | close; redial by the rules below (before the seed's `Ready`, reseed; after it, the cursor) | `Stale{"reconnecting"}` |
 //! | following | `synchronized` at the last seq held | the episode count and the outage reset | — |
 //! | following | the attachment SETTLED — its `synchronized` came AND every event through the fence is folded — while seeding | the seed is complete | `Ready{generation}` |
-//! | following | the same, after a loss | the resume is complete | `Session` (re-read), `Settings` (restated, changed or not), lone `Ready{same generation}` |
+//! | following | the same, after a loss | the resume is complete | `Session` (re-read), `Settings` and `Slash` (restated, changed or not, where the capabilities say so and a catalog is held), lone `Ready{same generation}` |
 //! | following | a hole or duplicate seq; a second, early, late or wrong-subscription `synchronized`; a frame that does not read | close; reseed | `Stale`, then `Reset{protocol}` … |
 //! | following | `presence` | — | `Session{attached}` |
 //! | following | a `session.set` this lane made was answered `rev: 0` (no `meta` delta will carry it) | apply its confirmed value to the fold | `Settings` when changed |
-//! | following | `ready` (the final info document) | — | `Capabilities`/`Settings` on change; `Down{"start_failed: …"}` when it failed |
+//! | following | `ready` (the final info document) | — | `Capabilities`/`Settings`/`Slash` on change; `Down{"start_failed: …"}` when it failed |
 //! | following | `reset{slow_consumer}` after readiness | re-attach WITH the cursor, same connection | — (a snapshot back reseeds) |
 //! | following | `reset{slow_consumer}` before readiness, `omitted`, `replay_failed`, an unknown reason | re-attach with NO cursor, same connection | `Reset{server_reset:<r>}` … |
 //! | following | `reset{omitted}`, and its re-attach then gets no answer (the connection ends, or the deadline passes) | that is how the closing `omitted` ends a connection — and how a dropped transport does: redial and CONFIRM with a no-cursor attach; a definite "no such session" answer ends it, a snapshot reseeds | `Stale`, then `Down{"session_closed"}` or `Reset{server_reset:omitted}` … |
@@ -44,6 +44,18 @@
 //! | following | the same, before the seed's `Ready` | flush; redial; reseed (never resume a half seed) | `Stale`, then `Reset{reconnect}` … |
 //! | any | the client channel full (`Lagged`), or the connection's notification queue (`ConnEnd::Backlog`) | drop the connection; wait for the drain holding nothing; backoff; reseed (correction 13 — never resume) | `Reset{lagged}` … |
 //! | any | the flush clock (2 s without growth) | flush the open segment | `Message` |
+//!
+//! **The slash catalog and the title (plan 029 P2, P3, P19).** A seed carries
+//! `Slash` only when its snapshot carried a catalog — a seed without one is
+//! no catalog, which the client's own staging (it clears the catalog with
+//! every seed) already reads as such, so nothing is sent to say so; the
+//! fold never carries one across a reseed. After `Ready`, every catalog a
+//! `meta` delta carries that differs from the last sent is a `Slash`; a
+//! silent resume restates the held one before its `Ready`. Capabilities that
+//! stop saying `slash` forget the last one sent, so the catalog is re-sent
+//! when they say it again. The session row's title is the row read at
+//! connect, then the fold's overlay (`CrazeFold::title`) — cleared at every
+//! fresh row, as the activity is — and a title delta re-emits the row.
 //!
 //! **A silent resume never changes the generation; any generation change has
 //! the full `Reset … Ready` bracket.** Every `Ready` waits for its
@@ -79,8 +91,8 @@ use serde_json::Value;
 use shed_core::lane::backoff::{jittered, next_backoff};
 use shed_core::lane::ring::MessageRing;
 use shed_core::lane::{
-    LaneApproval, LaneCapabilities, LaneEvent, LanePublisher, LaneSession, LaneSettings, LaneStop,
-    LaneSubscription, Publish,
+    LaneApproval, LaneCapabilities, LaneEvent, LanePublisher, LaneSession, LaneSettings,
+    LaneSlashCatalog, LaneStop, LaneSubscription, Publish,
 };
 use tokio::time::Instant;
 
@@ -132,6 +144,7 @@ pub(crate) fn spawn(shared: Arc<LaneShared>, hint: Option<String>) -> LaneSubscr
         last_session: None,
         last_caps: None,
         last_settings: None,
+        last_slash: None,
         flush: FlushClock::default(),
         attached_once: false,
         reattaches: 0,
@@ -236,6 +249,8 @@ struct Watcher {
     last_session: Option<LaneSession>,
     last_caps: Option<LaneCapabilities>,
     last_settings: Option<LaneSettings>,
+    /// The last catalog sent (the module doc, "The slash catalog").
+    last_slash: Option<LaneSlashCatalog>,
     flush: FlushClock,
     /// The subscription's first attach has been made: every later one counts.
     attached_once: bool,
@@ -396,6 +411,9 @@ impl Watcher {
         if let Some(activity) = self.fold.activity() {
             row.activity = activity;
         }
+        if let Some(title) = self.fold.title() {
+            title.clone_into(&mut row.title);
+        }
         row.pending_approvals = self.fold.open_approvals();
         if self.fold.compacting() {
             row.doing = Some(wording::COMPACTING.to_string());
@@ -429,6 +447,11 @@ impl Watcher {
             // Nothing to wait for: a config change has no model to bind.
             self.shared.settings_known.send_replace(true);
         }
+        if !caps.slash {
+            // The client drops its catalog with the capability: say it again
+            // should the capability come back.
+            self.last_slash = None;
+        }
         if self.last_caps.as_ref() == Some(&caps) {
             return Ok(());
         }
@@ -451,6 +474,24 @@ impl Watcher {
         lock(&self.shared.state).settings = Some(settings.clone());
         self.shared.settings_known.send_replace(true);
         self.emit(LaneEvent::Settings { settings })
+    }
+
+    /// The slash catalog, when it changed — and only on a session whose
+    /// capabilities say `slash`, and only once the fold holds one (no catalog
+    /// is no frame: the module doc).
+    fn emit_slash(&mut self) -> Emitted {
+        if !self.last_caps.as_ref().is_some_and(|c| c.slash) {
+            return Ok(());
+        }
+        let Some(catalog) = self.fold.slash() else {
+            return Ok(());
+        };
+        if self.last_slash.as_ref() == Some(catalog) {
+            return Ok(());
+        }
+        let catalog = catalog.clone();
+        self.last_slash = Some(catalog.clone());
+        self.emit(LaneEvent::Slash { catalog })
     }
 
     /// An `Approval` for every approval whose DTO changed, in id order (gx's
@@ -481,8 +522,9 @@ impl Watcher {
     }
 
     /// What a folded event may have changed, published in the seed's own
-    /// order: rows, the row, approvals (only when the book moved),
-    /// capabilities, settings.
+    /// order: rows, the row (its title included), approvals (only when the
+    /// book moved), capabilities, settings, the catalog (only when a delta
+    /// replaced it).
     fn after_fold(&mut self) -> Emitted {
         self.drain_rows()?;
         self.emit_session()?;
@@ -492,6 +534,9 @@ impl Watcher {
         if self.fold.take_settings_changed() {
             self.emit_capabilities()?;
             self.emit_settings()?;
+        }
+        if self.fold.take_slash_changed() {
+            self.emit_slash()?;
         }
         Ok(())
     }
@@ -638,6 +683,8 @@ impl Watcher {
         self.base_row = Some(session);
         self.presence = None;
         self.fold.clear_activity();
+        // The fresh row's title stands until the stream says another (P19).
+        self.fold.clear_title();
         let mut state = lock(&self.shared.state);
         let replaced = match &state.session_id {
             Some(held) => held != &info.session_id,
@@ -853,7 +900,8 @@ impl Watcher {
     /// A reseed from an attach reply's snapshot: the old generation's open
     /// segment flushed, `Reset`, a fresh fold — the session's cards, the
     /// snapshot's rows, the REGISTRY's approvals — then `Session`,
-    /// `Capabilities`, `Settings` (when they say so) and the approvals. The
+    /// `Capabilities`, `Settings` (when they say so), `Slash` (when they say
+    /// so and the snapshot carried a catalog: P2) and the approvals. The
     /// `Ready` waits for `synchronized` and the fence (`follow`).
     fn seed(
         &mut self,
@@ -919,10 +967,12 @@ impl Watcher {
         self.last_session = None;
         self.last_caps = None;
         self.last_settings = None;
+        self.last_slash = None;
         self.drain_rows()?;
         self.emit_session()?;
         self.emit_capabilities()?;
         self.emit_settings()?;
+        self.emit_slash()?;
         self.emit_approvals()
     }
 
@@ -938,7 +988,8 @@ impl Watcher {
             self.emit_approvals()?;
         }
         self.emit_capabilities()?;
-        self.emit_settings()
+        self.emit_settings()?;
+        self.emit_slash()
     }
 
     /// An info document — an attach reply's, or a `ready` notification's
@@ -1040,6 +1091,7 @@ impl Watcher {
         } else if self.stale {
             self.emit_session()?;
             self.restate_settings()?;
+            self.restate_slash()?;
             self.emit(LaneEvent::Ready {
                 generation: self.generation,
             })?;
@@ -1070,6 +1122,15 @@ impl Watcher {
     fn restate_settings(&mut self) -> Emitted {
         self.last_settings = None;
         self.emit_settings()
+    }
+
+    /// A silent resume's own `Slash` (plan 029 P2), said whether or not it
+    /// changed, as its `Settings` are — the catalog the fold holds once it has
+    /// folded everything through the resume's fence; nothing when it holds
+    /// none or the capabilities do not say `slash`.
+    fn restate_slash(&mut self) -> Emitted {
+        self.last_slash = None;
+        self.emit_slash()
     }
 
     /// One notification of the attachment `r`. `Ok(Some(_))` ends the
@@ -1155,10 +1216,11 @@ impl Watcher {
                 }
                 self.session_ready = true;
                 self.adopt_info(p.session);
-                // The final info document: capabilities (and so settings)
-                // may have changed (§3.9).
+                // The final info document: capabilities (and so settings, and
+                // whether the catalog is shown) may have changed (§3.9).
                 self.emit_capabilities()?;
                 self.emit_settings()?;
+                self.emit_slash()?;
             }
             notify::PRESENCE => {
                 let p: PresenceParams = read(conn, note.params, "a presence")?;

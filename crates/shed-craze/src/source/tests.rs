@@ -16,7 +16,9 @@ use shed_core::rc::RcActivity;
 use tokio::sync::mpsc::Receiver;
 
 use super::*;
-use crate::testing::{full_hub_capabilities, roster_row, HubEnd, ScriptedDial, SCRIPT_WAIT};
+use crate::testing::{
+    full_hub_capabilities, hub_capabilities_0_1_0, roster_row, HubEnd, ScriptedDial, SCRIPT_WAIT,
+};
 use crate::wire::RosterRow;
 
 fn fast() -> Timings {
@@ -324,7 +326,7 @@ async fn capabilities_are_the_hubs_hello() {
     assert!(
         seed.iter()
             .any(|e| matches!(e, SourceEvent::Capabilities { capabilities }
-        if !capabilities.create && !capabilities.create_options)),
+        if !capabilities.create && !capabilities.create_options && !capabilities.create_title)),
         "{seed:?}"
     );
 
@@ -391,6 +393,7 @@ fn create_request(id: &str) -> LaneCreateRequest {
         provider: Some("grok".into()),
         prompt: Some("hello".into()),
         request_id: id.into(),
+        title: None,
     }
 }
 
@@ -2018,4 +2021,167 @@ async fn a_held_dial_fails_create_options() {
         "{got:?}"
     );
     assert!(!crate::errors::is_outcome_unknown(&got));
+}
+
+// ---- plan 029: a name at create (D8, P11, P18) ----
+
+fn titled_request(id: &str, title: &str) -> LaneCreateRequest {
+    LaneCreateRequest {
+        title: Some(title.into()),
+        ..create_request(id)
+    }
+}
+
+/// The source's capabilities say `create_title` exactly where its hub's
+/// `hello` says `createTitle` (0.1.1's hub), and not on 0.1.0's (P18).
+#[tokio::test]
+async fn create_title_is_the_hubs_hello() {
+    for (caps, want) in [
+        (full_hub_capabilities(), true),
+        (hub_capabilities_0_1_0(), false),
+    ] {
+        let (dial, mut conns) = ScriptedDial::new();
+        let (mut rx, _stop) = source(Arc::clone(&dial))
+            .subscribe()
+            .await
+            .unwrap()
+            .into_parts();
+        let mut hub = next_conn(&mut conns).await;
+        hub.hello("epoch-1", caps).await;
+        hub.subscribed("r-1", "epoch-1", json!([])).await;
+        let seed = until(&mut rx, "the seed", is_ready).await;
+        assert!(
+            seed.iter()
+                .any(|e| matches!(e, SourceEvent::Capabilities { capabilities }
+                if capabilities.create && capabilities.create_title == want)),
+            "{seed:?}"
+        );
+    }
+}
+
+/// **A titled create sends its title, verbatim** — the hub normalizes it —
+/// after the four members; an untitled one sends no `title` key (as before
+/// plan 029), even to a hub that takes one.
+#[tokio::test]
+async fn a_titled_create_sends_its_title_and_an_untitled_one_none() {
+    let (dial, mut conns) = ScriptedDial::new();
+    let src = source(Arc::clone(&dial));
+    let s = src.clone();
+    let create =
+        tokio::spawn(async move { s.create(titled_request("req-t1", "  Flaky test ")).await });
+    let mut hub = next_conn(&mut conns).await;
+    hub.hello("epoch-1", full_hub_capabilities()).await;
+    let req = hub.expect("session.create").await;
+    assert_eq!(
+        req["params"],
+        json!({"cwd": "/w/new", "prompt": "hello", "provider": "grok", "requestId": "req-t1",
+               "title": "  Flaky test "})
+    );
+    hub.reply(&req, created_result()).await;
+    create.await.unwrap().unwrap();
+
+    let create = tokio::spawn(async move { src.create(create_request("req-t2")).await });
+    let mut hub = next_conn(&mut conns).await;
+    hub.hello("epoch-1", full_hub_capabilities()).await;
+    let req = hub.expect("session.create").await;
+    assert!(req["params"].get("title").is_none(), "{req}");
+    hub.reply(&req, created_result()).await;
+    create.await.unwrap().unwrap();
+}
+
+/// **P11, fresh**: a titled create whose hub does not say `createTitle` is
+/// `Failed` — not unknown, so the caller's next press mints a new id —
+/// NOTHING is sent (the connection just closes), and there is no retry. An
+/// untitled create to the same older hub goes through: the gate is the
+/// title's alone.
+#[tokio::test]
+async fn a_fresh_titled_create_to_a_hub_without_create_title_is_failed_and_sends_nothing() {
+    let (dial, mut conns) = ScriptedDial::new();
+    let src = source(Arc::clone(&dial));
+    let s = src.clone();
+    let create = tokio::spawn(async move { s.create(titled_request("req-t3", "Name")).await });
+    let mut hub = next_conn(&mut conns).await;
+    hub.hello("epoch-1", hub_capabilities_0_1_0()).await;
+    let got = create.await.unwrap().unwrap_err();
+    assert!(
+        matches!(&got, LaneError::Failed(m) if m.contains("too old to name a session")),
+        "{got:?}"
+    );
+    assert!(
+        !crate::errors::is_outcome_unknown(&got),
+        "definite: a new id next time"
+    );
+    assert!(
+        hub.recv().await.is_none(),
+        "nothing was sent: the connection closed"
+    );
+    assert_eq!(dial.dials(), 1, "no retry");
+
+    let create = tokio::spawn(async move { src.create(create_request("req-t4")).await });
+    let mut hub = next_conn(&mut conns).await;
+    hub.hello("epoch-1", hub_capabilities_0_1_0()).await;
+    let req = hub.expect("session.create").await;
+    hub.reply(&req, created_result()).await;
+    create
+        .await
+        .unwrap()
+        .expect("an untitled create is not gated");
+}
+
+/// **P11, retry**: a titled create lost after it was written retries under
+/// the same id — and when the retry reaches a hub without `createTitle` (an
+/// older hub came up mid-create), it is UNKNOWN, nothing sent there: the
+/// first attempt may have started the session. The caller keeps the id AND
+/// the exact title, and its held replay to a hub that takes titles sends
+/// the very same request.
+#[tokio::test]
+async fn a_titled_retry_to_a_hub_without_create_title_is_unknown_and_the_replay_keeps_the_title() {
+    let (dial, mut conns) = ScriptedDial::new();
+    let src = source(Arc::clone(&dial));
+    let s = src.clone();
+    let create =
+        tokio::spawn(async move { s.create(titled_request("req-t5", "Kept as is")).await });
+    let mut hub = next_conn(&mut conns).await;
+    hub.hello("epoch-1", full_hub_capabilities()).await;
+    let first = hub.expect("session.create").await;
+    hub.close().await;
+    let mut hub2 = next_conn(&mut conns).await;
+    hub2.hello("epoch-2", hub_capabilities_0_1_0()).await;
+    let got = create.await.unwrap().unwrap_err();
+    assert!(crate::errors::is_outcome_unknown(&got), "{got:?}");
+    assert!(hub2.recv().await.is_none(), "nothing sent to the older hub");
+
+    let replay = tokio::spawn(async move {
+        src.create_held(titled_request("req-t5", "Kept as is"))
+            .await
+    });
+    let mut hub3 = next_conn(&mut conns).await;
+    hub3.hello("epoch-3", full_hub_capabilities()).await;
+    let again = hub3.expect("session.create").await;
+    assert_eq!(
+        again["params"], first["params"],
+        "the same id, the same title"
+    );
+    hub3.reply(&again, created_result()).await;
+    assert_eq!(replay.await.unwrap().unwrap().session.id, "cccccccccccc");
+}
+
+/// **P11, held**: a held titled replay is a retry from its first attempt, so
+/// a hub without `createTitle` leaves it unknown at both — never `Failed`,
+/// which would end the id while the session may run — and nothing is sent to
+/// either.
+#[tokio::test]
+async fn a_held_titled_create_to_a_hub_without_create_title_stays_unknown() {
+    let (dial, mut conns) = ScriptedDial::new();
+    let src = source(Arc::clone(&dial));
+    let replay =
+        tokio::spawn(async move { src.create_held(titled_request("req-t6", "Name")).await });
+    for epoch in ["epoch-1", "epoch-2"] {
+        let mut hub = next_conn(&mut conns).await;
+        hub.hello(epoch, hub_capabilities_0_1_0()).await;
+        assert!(hub.recv().await.is_none(), "{epoch}: nothing sent");
+    }
+    let got = replay.await.unwrap().unwrap_err();
+    assert!(crate::errors::is_outcome_unknown(&got), "{got:?}");
+    assert_eq!(dial.dials(), 2);
 }

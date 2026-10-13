@@ -28,7 +28,8 @@ const MACHINE: &str = "mini3";
 
 /// One invoke of `cmd` with `body` as its arguments, answered the way the
 /// frontend's `invoke` sees it: the command's value, or its error string.
-fn invoke(
+/// Shared with `slash_command_tests`.
+pub(crate) fn invoke(
     webview: &tauri::WebviewWindow<tauri::test::MockRuntime>,
     cmd: &str,
     body: Value,

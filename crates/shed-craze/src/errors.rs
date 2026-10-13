@@ -35,17 +35,26 @@
 //!
 //! [`AgentSource::create_held`]: shed_core::lane::AgentSource::create_held
 //!
+//! **And a rename's `index_write`** (plan 029 P19): `session.setTitle`
+//! answered `index_write` RAN — the session is renamed and its `meta` delta
+//! says so — and only craze's session index could not record it. It stays the
+//! table's [`LaneError::Failed`], worded [`RENAMED_UNRECORDED`] + craze's
+//! `data.cause` ([`set_title_error`]), and [`index_write_cause`] is how a
+//! client tells it from a rename that failed: a warning beside the new
+//! title, never a rollback or a retry.
+//!
 //! A code this build does not know (or a refusal with no `data.code` at all)
 //! is [`LaneError::Failed`] with the message — the contract's rule that an
 //! unknown code is `Failed`'s job.
 //!
-//! **craze's words never wear shed's "outcome unknown"**: a client keeps a
-//! create's request id, and the desktop shows a change "not confirmed", only
-//! on [`is_outcome_unknown`] — which reads a `Failed`'s text prefix, because
-//! the contract's `LaneError` has no variant for it. So every text craze (or
-//! the far side of a dial) wrote that becomes a message here goes through
-//! [`craze_says`], which escapes one that happens to begin with that prefix:
-//! only shed's own [`outcome_unknown`] carries it.
+//! **craze's words never wear shed's "outcome unknown"** (nor its
+//! [`RENAMED_UNRECORDED`]): a client keeps a create's request id, and the
+//! desktop shows a change "not confirmed", only on [`is_outcome_unknown`] —
+//! which reads a `Failed`'s text prefix, because the contract's `LaneError`
+//! has no variant for it. So every text craze (or the far side of a dial)
+//! wrote that becomes a message here goes through [`craze_says`], which
+//! escapes one that happens to begin with either prefix: only shed's own
+//! [`outcome_unknown`] and [`set_title_error`] carry them.
 
 use shed_core::lane::LaneError;
 
@@ -54,12 +63,13 @@ use crate::wire::{code, reason, RpcError};
 /// craze's own text (a refusal's message, a start failure's cause, a refused
 /// `hello`'s or `session.connect`'s words) as a [`LaneError`]'s message:
 /// verbatim — unless it begins with shed's [`OUTCOME_UNKNOWN`], which marks a
-/// request whose answer was LOST and is never a definite answer's, so it is
-/// said as craze's (`craze: outcome unknown: …`) and [`is_outcome_unknown`]
-/// cannot mistake it for one.
+/// request whose answer was LOST and is never a definite answer's, or with
+/// its [`RENAMED_UNRECORDED`]: then it is said as craze's (`craze: outcome
+/// unknown: …`) and neither [`is_outcome_unknown`] nor [`index_write_cause`]
+/// can mistake it for shed's own.
 pub fn craze_says(text: impl Into<String>) -> String {
     let text = text.into();
-    if text.starts_with(OUTCOME_UNKNOWN) {
+    if text.starts_with(OUTCOME_UNKNOWN) || text.starts_with(RENAMED_UNRECORDED) {
         format!("craze: {text}")
     } else {
         text
@@ -106,10 +116,12 @@ pub const START_FAILED_FALLBACK: &str = "the session failed to start";
 /// [`START_FAILED_FALLBACK`] — a create's refusal, a lane's attach refusal and
 /// a `ready` that failed all word it this one way.
 pub fn start_failed_cause(cause: Option<&str>) -> &str {
-    cause
-        .map(str::trim)
-        .filter(|c| !c.is_empty())
-        .unwrap_or(START_FAILED_FALLBACK)
+    said_cause(cause).unwrap_or(START_FAILED_FALLBACK)
+}
+
+/// craze's `data.cause`, trimmed — `None` when it gave none, or a blank one.
+fn said_cause(cause: Option<&str>) -> Option<&str> {
+    cause.map(str::trim).filter(|c| !c.is_empty())
 }
 
 /// craze's `session.create` refusals that do NOT state the request's outcome
@@ -184,6 +196,28 @@ pub fn create_error(e: &RpcError, replays: bool) -> LaneError {
     lane_error(e)
 }
 
+/// What a rename that RAN but could not be recorded says, before craze's cause
+/// (plan 029 P19) — a client's warning, in the words it shows.
+pub const RENAMED_UNRECORDED: &str = "renamed, but craze could not record it: ";
+
+/// `session.setTitle`'s refusal: the table, except `index_write` — the rename
+/// happened and only the session index write failed — which is
+/// [`RENAMED_UNRECORDED`] and craze's `data.cause` (else its message).
+pub fn set_title_error(e: &RpcError) -> LaneError {
+    if e.data_code.as_deref() != Some(code::INDEX_WRITE) {
+        return lane_error(e);
+    }
+    let cause = said_cause(e.cause.as_deref()).map_or_else(|| e.text(), str::to_string);
+    LaneError::Failed(format!("{RENAMED_UNRECORDED}{cause}"))
+}
+
+/// craze's cause when `e` is [`set_title_error`]'s `index_write` — a rename
+/// that took and was not recorded, a warning and not a failure — else `None`.
+/// One implementation, so no client string-matches it on its own.
+pub fn index_write_cause(e: &LaneError) -> Option<&str> {
+    failed_after(e, RENAMED_UNRECORDED)
+}
+
 /// What every client-side "outcome unknown" error's text starts with.
 pub const OUTCOME_UNKNOWN: &str = "outcome unknown: ";
 
@@ -205,8 +239,13 @@ pub fn is_outcome_unknown(e: &LaneError) -> bool {
 /// Why [`outcome_unknown`]'s error is unknown — its text after the prefix —
 /// or `None` for any other error.
 pub fn unknown_why(e: &LaneError) -> Option<&str> {
+    failed_after(e, OUTCOME_UNKNOWN)
+}
+
+/// A `Failed`'s text after shed's own `prefix`, or `None`.
+fn failed_after<'a>(e: &'a LaneError, prefix: &str) -> Option<&'a str> {
     match e {
-        LaneError::Failed(m) => m.strip_prefix(OUTCOME_UNKNOWN),
+        LaneError::Failed(m) => m.strip_prefix(prefix),
         _ => None,
     }
 }
@@ -431,5 +470,67 @@ mod tests {
         assert!(!is_outcome_unknown(&create_error(&start, false)));
         assert!(!is_outcome_unknown(&create_error(&start, true)));
         assert_eq!(craze_says("craze says failed"), "craze says failed");
+        // Nor shed's rename warning.
+        let renamed = RpcError::from_value(
+            &json!({"code": -32000, "message": "renamed, but craze could not record it: x",
+                    "data": {"code": "failed", "reason": "failed"}}),
+        );
+        assert_eq!(index_write_cause(&lane_error(&renamed)), None);
+        assert_eq!(index_write_cause(&set_title_error(&renamed)), None);
+    }
+
+    /// **A rename's `index_write`** (plan 029 P19): the session WAS renamed;
+    /// only its index could not be written. `Failed` in the table's words
+    /// for every other refusal, and for this one [`RENAMED_UNRECORDED`] with
+    /// craze's `data.cause` (its message when it gives none) — which
+    /// [`index_write_cause`] reads back. Every other code keeps the table's
+    /// variant.
+    #[test]
+    fn a_renames_index_write_is_the_renamed_warning_with_crazes_cause() {
+        let index = RpcError::from_value(&json!({"code": -32000,
+            "message": "engine: the session index could not be written: open /x/index.json: permission denied",
+            "data": {"code": "index_write", "reason": "index_write",
+                     "cause": "open /x/index.json: permission denied"}}));
+        let e = set_title_error(&index);
+        assert_eq!(
+            e,
+            LaneError::Failed(
+                "renamed, but craze could not record it: open /x/index.json: permission denied"
+                    .into()
+            )
+        );
+        assert_eq!(
+            index_write_cause(&e),
+            Some("open /x/index.json: permission denied")
+        );
+        assert!(!is_outcome_unknown(&e), "it ran: a definite answer");
+        let no_cause = refusal("index_write", "index_write");
+        assert_eq!(
+            index_write_cause(&set_title_error(&no_cause)),
+            Some("craze says index_write"),
+            "no cause: craze's message"
+        );
+        // The table's own row for every method but this one.
+        assert_eq!(
+            lane_error(&index),
+            LaneError::Failed(
+                "engine: the session index could not be written: open /x/index.json: permission denied"
+                    .into()
+            )
+        );
+        assert_eq!(index_write_cause(&lane_error(&index)), None);
+        for (code, want) in [
+            (
+                "bad_request",
+                LaneError::BadRequest("craze says bad_request".into()),
+            ),
+            ("not_accepting", LaneError::NotAccepting),
+            (
+                "unsupported",
+                LaneError::Failed("craze says unsupported".into()),
+            ),
+        ] {
+            assert_eq!(set_title_error(&refusal(code, code)), want, "{code}");
+        }
     }
 }

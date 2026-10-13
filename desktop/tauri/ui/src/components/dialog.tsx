@@ -15,11 +15,14 @@ export const dialogInput =
 export const dialogBtnSecondary =
   "hlink rounded-[9px] border border-shed-border px-[18px] py-2.5 text-[14px] font-semibold text-shed-text-secondary";
 
-/** Close the dialog on Escape while `enabled` (window keydown, scoped to mount). */
+/** Close the dialog on Escape while `enabled` (window keydown, scoped to mount).
+ *  An Escape something else already handled (`defaultPrevented` — the lane
+ *  composer's `/` menu closing itself, plan 029 P9) is not the dialog's: one
+ *  Esc closes one thing. */
 export function useEscClose(onClose: () => void, enabled = true) {
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape" && enabled) onClose();
+      if (e.key === "Escape" && enabled && !e.defaultPrevented) onClose();
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);

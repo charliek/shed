@@ -454,8 +454,12 @@ def test_only_a_tab_that_reported_a_server_carries_a_lane(app, oc):
         "history_cursor": False,
         "settings": False,
         "stop": False,
+        # Plan 029 X4: opencode gains no rename and no `/` menu.
+        "set_title": False,
+        "slash": False,
     }, view["capabilities"]
     assert view["settings"] is None, "opencode has no settings to show"
+    assert view["slash_menu"] is None, "nor a slash menu"
     assert view["ended"] is False
 
     refused = _error(lambda: _open(app, BARE_SESSION))

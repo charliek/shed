@@ -23,13 +23,24 @@ re-implemented per language. The root `CLAUDE.md` owns the monorepo layout + rel
   the DTOs plus TWO async traits that normalize "a coding agent with sessions, a
   transcript and approvals": a machine-level `AgentSource` (`subscribe` → the live session
   list as `SourceEvent`s, `create_options`, `create`, `open(id)`) and the session-scoped
-  `AgentLane` it opens (no verb takes an id; `settings`/`set`/`stop` have no default
-  bodies). One adapter per agent implements both (opencode over its local HTTP server;
+  `AgentLane` it opens (no verb takes an id; `settings`/`set`/`stop`/`set_title` have no
+  default bodies). One adapter per agent implements both (opencode over its local HTTP server;
   craze over its per-machine hub, `shed-craze` — its source since plan 025 C7, its lane
   since C8 — in the slot plan 017's `gx` adapter held until plan 025 C1 retired it, shed#390).
   **Capabilities are per session and ride
   the stream** (`LaneEvent::Capabilities`, and `Settings` when they say so) — there is no
   capabilities getter, so a client reads them from its view, never caches them at open.
+  Plan 029 added the **slash catalog** — `LaneEvent::Slash{catalog}` (`LaneSlashCatalog` →
+  `LaneSlashRow` → `LaneSlashRun`, six tolerant `Other(String)` enums written once by a
+  private `tolerant_enum!` macro), only where `LaneCapabilities.slash` says so, and
+  OPTIONAL in a seed (after its `Capabilities`, before its `Ready`, exactly when the
+  session has a catalog: no `Slash` in a seed IS no catalog, since a client clears it
+  with every seed; conformance's `SlashNotAdvertised`, no completeness rule) — plus
+  `AgentLane::set_title` (`LaneCapabilities.set_title`; the new title returns on the
+  stream as a `Session` row, never from the reply) and a name at create
+  (`LaneCreateRequest.title`, honoured where `SourceCapabilities.create_title`; opencode
+  refuses a titled create before any POST). Every new field is `serde(default)`, so a
+  pre-029 producer decodes.
   `LaneEvent::Stale` is a non-terminal transport loss (a silent resume ends it with a lone
   `Ready` of the same generation); `Down` alone ends a lane; a source's outage is the
   non-terminal `SourceEvent::Offline`. Pure types, **no I/O** — the transport, fold, ring
@@ -92,7 +103,17 @@ re-implemented per language. The root `CLAUDE.md` owns the monorepo layout + rel
   `LaneView::snapshot(since_seq)` is the typed projection both a full read and a delta
   poll go through. It is ungated because mobile links `shed-app` with default features
   and needs the identical fold — the phone showing the same view the desktop shows is
-  a property of one implementation, not two that have to agree.
+  a property of one implementation, not two that have to agree. Since plan 029 it also
+  stages the session's slash catalog with the seed (every `Reset` clears it, so a seed
+  with no `Slash` is no catalog; capabilities that drop `slash` drop it) and hands out
+  the RESOLVED menu as `LaneViewSnapshot.slash_menu`, recomputed only when the catalog
+  or the capabilities change. `slash_menu.rs` (plan 029 §3.4, ungated, pure) is the `/`
+  menu's one rule set — `resolve` (which rows show, each with its `SlashAction`, and the
+  hidden builtin names a typed command is refused for), `filter` (the open rule, craze's
+  four match buckets, UTF-16 carets, `dimmed` while working), `dispatch` (the
+  single-line grammar and its guard), `accept` (Enter/Tab/pick) and `is_working` — which
+  the desktop calls through Tauri commands and the phone through FRB, so neither client
+  re-derives a rule.
   `craze_rows.rs` (plan 025 §3.6.3, ungated for the same reason) is **the craze row
   merge, D4 literally**: `fold_plan(roost_tabs, hub_rows)` for ONE machine — with the
   hub feed live (`Some`) every craze-owned roost tab is absorbed (attached to the hub row
@@ -267,7 +288,26 @@ re-implemented per language. The root `CLAUDE.md` owns the monorepo layout + rel
   message that happens to begin "outcome unknown: " from reading as shed's own. `tests/recipe_settings.rs` drives it against the real
   hub with `craze-fake-agent -script permodel` as `cursor` (cursor's per-model catalogs;
   `Recipe::set_agents`, and `script_agent_with` for the agent's own
-  `CRAZE_FAKE_DUMP_CALLS` record). Pure lib — serde, tokio, no `reqwest`, no `chrono` — not
+  `CRAZE_FAKE_DUMP_CALLS` record).
+  Plan 029 C2: `slash.rs` reads craze's `slash` section PRESENCE-AWARE and row by row
+  (craze's own `wireSlashIn` rule — a malformed row or a non-token name drops that row
+  alone, a `slash`/`items` of the wrong type is a present, EMPTY catalog, never an
+  absent one; unknown values kept as `Other`; no cap — 512 is craze's snapshot bound),
+  not through `SettingsSections::from_value`. The fold holds the catalog (a snapshot's
+  `settings.slash`, else none — never across a restore; a `meta` delta's replaces it
+  whole) and a title overlay (snapshot `settings.title`, then `meta` `state.title`; empty
+  says nothing; cleared at every fresh `sessions.list` row, as the activity is). The
+  watcher stages `Slash` in a seed only when the snapshot carried one, publishes each
+  change after `Ready`, restates it before a silent resume's `Ready`, and re-emits
+  `Session` on a title change. `set_title` is `session.setTitle` on the live connection,
+  like `stop` (never resent); its `index_write` is `errors::set_title_error`'s "renamed,
+  but craze could not record it: <cause>" (`index_write_cause`). A create's `title` goes only to a
+  hub whose `hello` says `createTitle`, judged on EACH attempt: fresh → `Failed`, nothing
+  sent; a retry or held replay → outcome unknown, id and title kept. `testing`'s
+  `full_hub_capabilities` is 0.1.1's (`createTitle`), `hub_capabilities_0_1_0` and
+  `session_caps` (no `slashCatalog`) the older shapes, `slash_session_caps` the newer.
+  The 0.1.0+gx golden's projection drops the two plan-029 capability bits (pinned by
+  their own cell), so the golden stays byte-identical. Pure lib — serde, tokio, no `reqwest`, no `chrono` — not
   FFI-exported, builds for `aarch64-linux-android` (mobile links it). In
   `default-members`. **Tests:** `tests/wire.rs` runs every vendored WIRE fixture
   (`fixtures/wire/`, craze's `internal/fakehost/testdata/wire` at the sha

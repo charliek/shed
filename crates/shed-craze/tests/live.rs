@@ -33,8 +33,10 @@ use shed_craze::testing::{bins, Recipe, TeeDial, TeeLine};
 use shed_craze::wire::{AttachResult, EventParams, ResetParams};
 use shed_craze::{lane_capabilities, new_request_id, CrazeDial};
 
-/// The recording this crate replays: craze v0.1.0 (the pin is its tag
-/// commit), a gx session.
+/// The recording this crate replays: craze v0.1.0 (the pin was its tag
+/// commit, `8d5676c`, when it was recorded), a gx session. A re-record runs
+/// the CURRENT pin's craze, so it records into a directory named for that
+/// version and repoints this (`fixtures/README.md`).
 const RECORDING: &str = "0.1.0+gx";
 /// How long one live step may take: a real model answering.
 const LIVE_WAIT: Duration = Duration::from_secs(240);
@@ -363,6 +365,12 @@ fn recording() -> Vec<Value> {
 /// approvals as held, the settings and capabilities, the activity verdict
 /// after each event (consecutive repeats collapsed), and how the stream
 /// ended.
+///
+/// The capabilities are projected with the keys the golden pinned: plan
+/// 029's `set_title` and `slash` postdate it, and
+/// [`the_0_1_0_recording_renames_and_has_no_catalog`] pins them — so the
+/// golden stays the recording's, byte for byte, and still says the fold did
+/// not move.
 fn replay(lines: &[Value]) -> Value {
     let mut fold: Option<CrazeFold> = None;
     let mut caps = Value::Null;
@@ -385,6 +393,10 @@ fn replay(lines: &[Value]) -> Value {
                     f.settings().has_any(),
                 ))
                 .unwrap();
+                if let Value::Object(c) = &mut caps {
+                    c.remove("set_title");
+                    c.remove("slash");
+                }
                 fold = Some(f);
             }
             continue;
@@ -440,6 +452,32 @@ fn the_recording_replays_into_its_golden() {
     let golden = std::fs::read_to_string(&golden_path)
         .expect("fold.golden.json (SHED_CRAZE_REGOLD=1 writes it)");
     assert_eq!(rendered, golden, "the fold's projection of the recording changed — read the diff as the change (fixtures/README.md)");
+}
+
+/// **The 0.1.0 recording under plan 029** (P18): its host predates the slash
+/// catalog — no `slashCatalog`, so no `slash` capability, and no catalog
+/// folded from its snapshot or any of its deltas — while its session can be
+/// renamed (`session.setTitle` is 0.1.0's too). The golden's projection
+/// leaves these two bits out; they are pinned here.
+#[test]
+fn the_0_1_0_recording_renames_and_has_no_catalog() {
+    let lines = recording();
+    let mut fold: Option<CrazeFold> = None;
+    for line in lines.iter().filter(|l| l["dir"] == "s2c") {
+        let msg = &line["msg"];
+        if let Ok(r) = serde_json::from_value::<AttachResult>(msg["result"].clone()) {
+            let caps = lane_capabilities(&r.session.capabilities, true);
+            assert!(!caps.slash && caps.set_title, "{caps:?}");
+            let mut f = CrazeFold::new(&r.session.host_id);
+            f.restore(r.snapshot.as_ref().unwrap()).unwrap();
+            fold = Some(f);
+        } else if msg["method"] == "event" {
+            let p: EventParams = serde_json::from_value(msg["params"].clone()).unwrap();
+            fold.as_mut().unwrap().apply(&p.event);
+        }
+    }
+    let f = fold.expect("the recording has an attach reply");
+    assert_eq!(f.slash(), None, "a 0.1.0 host carries no catalog");
 }
 
 /// The recording still carries what it is FOR (`fixtures/README.md`): a seed
@@ -691,6 +729,7 @@ async fn record_a_gx_session() {
                 provider: Some("gx".into()),
                 prompt: None,
                 request_id: new_request_id(),
+                title: None,
             })
             .await
             .expect("a gx session was created");

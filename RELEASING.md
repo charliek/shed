@@ -202,8 +202,8 @@ desktop and phone clients drive:
   `.github/actions/craze-binaries` composite action does the equivalent in
   CI, shared by both repos so their craze SHAs can't drift apart.
 - **`CRAZE_RELEASE`** — the craze release the shed images actually bake
-  (bare `X.Y.Z`), or empty before a bake lands. Set to `0.1.0` since plan
-  025 §3.9 / C13.
+  (bare `X.Y.Z`), or empty before a bake lands. First set to `0.1.0` by plan
+  025 §3.9 / C13; `0.1.1` since plan 029 C1.
 
 `craze-pin.env` is never sourced as shell by anything that reads it — every
 consumer (the Makefile targets, `check-craze-pin.sh`, the composite action,
@@ -226,7 +226,7 @@ Moving `CRAZE_TEST_SHA` means re-vendoring craze's
 CI's `craze-binaries` action diffs the two trees on every run.
 
 **The release-time check.** `scripts/release/check-craze-pin.sh --release
-v<CRAZE_RELEASE>` (network) takes **craze's own version**, e.g. `v0.1.0`,
+v<CRAZE_RELEASE>` (network) takes **craze's own version**, e.g. `v0.1.1`,
 **not** the shed tag; `release-plan.sh` passes `v$CRAZE_RELEASE`. It resolves
 `v$CRAZE_RELEASE` against
 `github.com/charliek/craze` via `git ls-remote` and requires the resolved
@@ -238,9 +238,10 @@ argument is craze's version from `craze-pin.env`.
 includes `server`** (the images ship with the server component), in both
 the mandatory local pre-tag run and CI's `release-plan` job.
 
-> **Consequence.** The craze bake landed in plan 025 §3.9 / C13:
-> `CRAZE_RELEASE=0.1.0` and `CRAZE_TEST_SHA` equals v0.1.0's tag commit, so
-> this check now passes against the real tag. Before the bake landed,
+> **Consequence.** The craze bake landed in plan 025 §3.9 / C13 (craze
+> 0.1.0) and moved to 0.1.1 in plan 029 C1: `CRAZE_RELEASE=0.1.1` and
+> `CRAZE_TEST_SHA` equals v0.1.1's tag commit, so this check passes against
+> the real tag. Before the bake landed,
 > `CRAZE_RELEASE` was empty and **every** stable tag that ships `server`
 > from `main`, a hotfix included, was refused — that was the rule working
 > as intended: 0.9.0 must bake craze. The same trap returns if `CRAZE_RELEASE`

@@ -19,7 +19,8 @@ use shed_core::lane::conformance::LaneChecker;
 use shed_core::lane::{AgentLane, LaneAnswer, LaneError, LaneEvent, LaneSettingChange, SendMode};
 use shed_core::rc::RcActivity;
 use shed_craze::testing::{
-    ask_record, attach_result, host_session_row, session_info, snapshot_at, SCRIPT_WAIT,
+    ask_record, attach_result, host_session_row, session_info, slash_items, snapshot_at,
+    SCRIPT_WAIT,
 };
 use shed_craze::{is_outcome_unknown, DialError};
 
@@ -2646,4 +2647,591 @@ async fn a_change_confirmed_at_rev_zero_reaches_the_settings() {
     set.await.unwrap().unwrap();
     let f = drive(&mut rx, &mut checker, "the confirmed mode", is_settings).await;
     assert_eq!(last_settings(&f).unwrap().mode.as_deref(), Some("plan"));
+}
+
+// ---- plan 029: the slash catalog, the title, rename ----
+
+/// An info document whose session publishes the slash catalog (craze 0.1.1).
+fn slash_info(session_id: &str, incarnation: &str) -> Value {
+    session_info(
+        HOST,
+        session_id,
+        incarnation,
+        shed_craze::testing::slash_session_caps(false),
+    )
+}
+
+/// A snapshot cut at `incarnation:seq` with `settings` members merged over
+/// WIRE/01's.
+fn snap_with(incarnation: &str, seq: u64, settings: Value) -> Value {
+    let mut snap = snapshot_at(incarnation, seq, json!({}));
+    if let Value::Object(extra) = settings {
+        for (k, v) in extra {
+            snap["settings"][k.as_str()] = v;
+        }
+    }
+    snap
+}
+
+/// One seeded connection: the splice, `row`, a no-cursor attach answered
+/// with `info` and `snap` (cut where `snap` says), the fenced read, and the
+/// `synchronized`.
+async fn seed_with(
+    conns: &mut tokio::sync::mpsc::UnboundedReceiver<shed_craze::testing::HubEnd>,
+    sub: &str,
+    info: &Value,
+    row: Value,
+    snap: Value,
+) -> shed_craze::testing::HubEnd {
+    let inc = snap["incarnation"].as_str().unwrap().to_string();
+    let seq = snap["seq"].as_u64().unwrap();
+    let result = attach_result(sub, info, (&inc, seq), Some(snap), None);
+    let (mut hub, _) = attach_with(conns, row, result).await;
+    hub.synchronized(sub, seq).await;
+    hub
+}
+
+/// One resumed connection: the splice, `row`, the cursor honoured at `at`
+/// (no snapshot), and the `synchronized`.
+async fn resume_with(
+    conns: &mut tokio::sync::mpsc::UnboundedReceiver<shed_craze::testing::HubEnd>,
+    sub: &str,
+    info: &Value,
+    row: Value,
+    at: (&str, u64),
+) -> shed_craze::testing::HubEnd {
+    let (mut hub, _) = attach_with(conns, row, attach_result(sub, info, at, None, None)).await;
+    hub.synchronized(sub, at.1).await;
+    hub
+}
+
+/// The catalogs among `frames`, as their rows' names.
+fn slashes(frames: &[LaneEvent]) -> Vec<Vec<String>> {
+    frames
+        .iter()
+        .filter_map(|e| match e {
+            LaneEvent::Slash { catalog } => {
+                Some(catalog.rows.iter().map(|r| r.name.clone()).collect())
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// The titles of the `Session` rows among `frames`.
+fn titles(frames: &[LaneEvent]) -> Vec<String> {
+    frames
+        .iter()
+        .filter_map(|e| match e {
+            LaneEvent::Session { session } => Some(session.title.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+fn position(frames: &[LaneEvent], f: impl Fn(&LaneEvent) -> bool) -> usize {
+    frames
+        .iter()
+        .position(f)
+        .unwrap_or_else(|| panic!("not in {frames:#?}"))
+}
+
+/// A turn's start: a user row at once — the marker a cell reads up to, to
+/// prove what came (and did not) before it.
+fn marker(t: &str) -> Value {
+    json!({"type": "turn", "turn": {"id": t, "phase": "started", "text": t}})
+}
+
+fn is_marker(t: &'static str) -> impl Fn(&LaneEvent) -> bool {
+    move |e| matches!(e, LaneEvent::Message { message, .. } if message.text.as_deref() == Some(t))
+}
+
+fn meta(state: Value) -> Value {
+    let mut ev = json!({"type": "meta", "at": "2026-01-01T00:00:00Z"});
+    ev["state"] = state;
+    ev
+}
+
+fn is_slash(e: &LaneEvent) -> bool {
+    matches!(e, LaneEvent::Slash { .. })
+}
+
+/// **P2: the catalog rides the seed after `Capabilities` and before `Ready`**
+/// — the snapshot's `settings.slash`, once — and then each delta that
+/// changes it is a live `Slash`, the catalog WHOLE (`{}` an empty one). A
+/// delta without `slash` sends nothing, and neither does one restating the
+/// same catalog (craze restates it beside every `commands` change).
+#[tokio::test]
+async fn the_seed_stages_the_catalog_and_each_change_is_a_live_slash() {
+    let (_dial, mut conns, lane) = scripted(fast());
+    let (mut rx, _stop) = subscribed(&lane).await;
+    let info = slash_info(SID, INC);
+    let mut hub = seed_with(
+        &mut conns,
+        SUB,
+        &info,
+        host_session_row(&info, json!({})),
+        snap_with(INC, 1, json!({"slash": slash_items(&["help", "rename"])})),
+    )
+    .await;
+    let mut checker = LaneChecker::new();
+    let seed = drive(&mut rx, &mut checker, "the seed", is_ready).await;
+    assert_eq!(slashes(&seed), [vec!["help", "rename"]], "{seed:#?}");
+    let caps = position(
+        &seed,
+        |e| matches!(e, LaneEvent::Capabilities { capabilities } if capabilities.slash && capabilities.set_title),
+    );
+    let slash = position(&seed, is_slash);
+    assert!(
+        caps < slash && slash < seed.len() - 1,
+        "after Capabilities, before Ready"
+    );
+
+    hub.event(SUB, 2, meta(json!({"mode": "agent"}))).await;
+    hub.event(
+        SUB,
+        3,
+        meta(json!({"commands": {}, "slash": slash_items(&["help", "rename"])})),
+    )
+    .await;
+    hub.event(SUB, 4, marker("m1")).await;
+    let quiet = drive(&mut rx, &mut checker, "the marker", is_marker("m1")).await;
+    assert!(slashes(&quiet).is_empty(), "nothing changed: {quiet:#?}");
+
+    hub.event(
+        SUB,
+        5,
+        meta(json!({"slash": slash_items(&["help", "rename", "research"])})),
+    )
+    .await;
+    let f = drive(&mut rx, &mut checker, "the live Slash", is_slash).await;
+    assert_eq!(slashes(&f), [vec!["help", "rename", "research"]]);
+    hub.event(SUB, 6, meta(json!({"slash": {}}))).await;
+    let f = drive(&mut rx, &mut checker, "the emptied catalog", is_slash).await;
+    assert_eq!(slashes(&f), [Vec::<String>::new()], "present and empty");
+}
+
+/// **P2: no completeness rule.** A session that says `slash` with no catalog
+/// yet seeds WITHOUT one — the client holds none — and its first catalog is
+/// a live `Slash` after `Ready`.
+#[tokio::test]
+async fn a_seed_with_no_catalog_carries_no_slash_and_the_first_delta_brings_one() {
+    let (_dial, mut conns, lane) = scripted(fast());
+    let (mut rx, _stop) = subscribed(&lane).await;
+    let info = slash_info(SID, INC);
+    let mut hub = seed_with(
+        &mut conns,
+        SUB,
+        &info,
+        host_session_row(&info, json!({})),
+        snapshot_at(INC, 1, json!({})),
+    )
+    .await;
+    let mut checker = LaneChecker::new();
+    let seed = drive(&mut rx, &mut checker, "the seed", is_ready).await;
+    assert!(slashes(&seed).is_empty(), "{seed:#?}");
+    assert!(checker.live_capabilities().unwrap().slash);
+    hub.event(SUB, 2, meta(json!({"slash": slash_items(&["research"])})))
+        .await;
+    let f = drive(&mut rx, &mut checker, "the first catalog", is_slash).await;
+    assert_eq!(slashes(&f), [vec!["research"]]);
+}
+
+/// **P2/P27: a silent resume restates the catalog before its lone `Ready`**
+/// — as it restates `Settings` — the one it folded through the resume's
+/// fence (here a change made while the lane was away), with no `Reset`.
+#[tokio::test]
+async fn a_silent_resume_restates_the_catalog_before_its_ready() {
+    let (_dial, mut conns, lane) = scripted(fast());
+    let (mut rx, _stop) = subscribed(&lane).await;
+    let info = slash_info(SID, INC);
+    let hub = seed_with(
+        &mut conns,
+        SUB,
+        &info,
+        host_session_row(&info, json!({})),
+        snap_with(INC, 1, json!({"slash": slash_items(&["help"])})),
+    )
+    .await;
+    let mut checker = LaneChecker::new();
+    drive(&mut rx, &mut checker, "the seed", is_ready).await;
+    hub.close().await;
+    drive(&mut rx, &mut checker, "Stale", |e| {
+        matches!(e, LaneEvent::Stale { .. })
+    })
+    .await;
+
+    let _hub = resume_with(
+        &mut conns,
+        "s-2",
+        &info,
+        host_session_row(&info, json!({})),
+        (INC, 1),
+    )
+    .await;
+    let resumed = drive(&mut rx, &mut checker, "the lone Ready", is_ready).await;
+    assert!(resets(&resumed).is_empty(), "a silent resume: {resumed:#?}");
+    assert_eq!(slashes(&resumed), [vec!["help"]], "restated, unchanged");
+    let slash = position(&resumed, is_slash);
+    assert_eq!(slash, resumed.len() - 2, "just before the lone Ready");
+}
+
+/// **P3: a snapshot without a catalog is NO catalog**, and the fold never
+/// carries one across a restore. A populated catalog; a refused cursor whose
+/// snapshot dropped the catalog to its budget (`truncated.slash`, no
+/// `slash`) — that reseed carries no `Slash` (the client, staging, holds
+/// none); a `session_replaced` whose new session has one — exactly those
+/// rows; another without — none again.
+#[tokio::test]
+async fn a_truncated_reseed_then_session_replaced_carry_no_stale_catalog() {
+    let (_dial, mut conns, lane) = scripted(fast());
+    let (mut rx, _stop) = subscribed(&lane).await;
+    let info = slash_info(SID, INC);
+    let hub = seed_with(
+        &mut conns,
+        SUB,
+        &info,
+        host_session_row(&info, json!({})),
+        snap_with(INC, 1, json!({"slash": slash_items(&["a", "b"])})),
+    )
+    .await;
+    let mut checker = LaneChecker::new();
+    let seed = drive(&mut rx, &mut checker, "the seed", is_ready).await;
+    assert_eq!(slashes(&seed), [vec!["a", "b"]]);
+    hub.close().await;
+
+    // The cursor refused: a snapshot whose catalog did not fit its budget.
+    let mut hub = next_conn(&mut conns).await;
+    hub.splice(HOST).await;
+    hub.listed(host_session_row(&info, json!({}))).await;
+    hub.attached(attach_result(
+        SUB,
+        &info,
+        (INC, 1),
+        Some(snap_with(INC, 1, json!({"truncated": {"slash": true}}))),
+        Some("foreign_incarnation"),
+    ))
+    .await;
+    hub.synchronized(SUB, 1).await;
+    let reseed = drive(&mut rx, &mut checker, "the truncated reseed", is_ready).await;
+    assert_eq!(resets(&reseed).len(), 1);
+    assert!(slashes(&reseed).is_empty(), "no catalog: {reseed:#?}");
+
+    // `session_replaced`: a new session, with a catalog of its own.
+    hub.reset(SUB, "session_replaced").await;
+    let replaced = slash_info("session-fake-2", "INCARNATION-2");
+    let mut hub2 = seed_with(
+        &mut conns,
+        SUB,
+        &replaced,
+        host_session_row(&replaced, json!({})),
+        snap_with("INCARNATION-2", 1, json!({"slash": slash_items(&["c"])})),
+    )
+    .await;
+    let frames = drive(&mut rx, &mut checker, "the replaced seed", is_ready).await;
+    assert_eq!(resets(&frames)[0].0, "server_reset:session_replaced");
+    assert_eq!(
+        slashes(&frames),
+        [vec!["c"]],
+        "exactly the new session's rows"
+    );
+
+    // …and one more replacement, with none.
+    hub2.reset(SUB, "session_replaced").await;
+    let again = slash_info("session-fake-3", "INCARNATION-3");
+    seed_with(
+        &mut conns,
+        SUB,
+        &again,
+        host_session_row(&again, json!({})),
+        snapshot_at("INCARNATION-3", 1, json!({})),
+    )
+    .await;
+    let frames = drive(&mut rx, &mut checker, "the second replacement", is_ready).await;
+    assert!(slashes(&frames).is_empty(), "{frames:#?}");
+    drop(hub);
+}
+
+/// **P18: an older host's session never sends a `Slash`** — its capabilities
+/// say no `slashCatalog`, so `slash: false`, and neither a snapshot's catalog
+/// nor a delta's is ever published (the conformance kit would refuse it).
+#[tokio::test]
+async fn an_older_hosts_session_never_sends_a_slash() {
+    let (_dial, mut conns, lane) = scripted(fast());
+    let (mut rx, _stop) = subscribed(&lane).await;
+    let mut hub = seed_with(
+        &mut conns,
+        SUB,
+        &info(false),
+        row(),
+        snap_with(INC, 1, json!({"slash": slash_items(&["help"])})),
+    )
+    .await;
+    let mut checker = LaneChecker::new();
+    let seed = drive(&mut rx, &mut checker, "the seed", is_ready).await;
+    let caps = checker.live_capabilities().unwrap().clone();
+    assert!(!caps.slash && caps.set_title, "{caps:?}");
+    hub.event(
+        SUB,
+        2,
+        meta(json!({"slash": slash_items(&["help", "research"])})),
+    )
+    .await;
+    hub.event(SUB, 3, marker("m1")).await;
+    let after = drive(&mut rx, &mut checker, "the marker", is_marker("m1")).await;
+    assert!(slashes(&[seed, after].concat()).is_empty());
+}
+
+/// The capability can move with the final info document (`ready`): a
+/// catalog folded while `slash` was off is published when it turns on —
+/// after the `Capabilities` that say so — and again after it turns off and
+/// on, since the client dropped it with the capability.
+#[tokio::test]
+async fn the_catalog_follows_the_capability_through_ready() {
+    let (_dial, mut conns, lane) = scripted(fast());
+    let (mut rx, _stop) = subscribed(&lane).await;
+    let mut hub = seed_with(
+        &mut conns,
+        SUB,
+        &info(false),
+        row(),
+        snap_with(INC, 1, json!({"slash": slash_items(&["help"])})),
+    )
+    .await;
+    let mut checker = LaneChecker::new();
+    let seed = drive(&mut rx, &mut checker, "the seed", is_ready).await;
+    assert!(slashes(&seed).is_empty());
+    let on = slash_info(SID, INC);
+    hub.notify(
+        "ready",
+        json!({"subscription": SUB, "session": on, "startFailed": false}),
+    )
+    .await;
+    let f = drive(&mut rx, &mut checker, "the catalog, shown", is_slash).await;
+    assert_eq!(slashes(&f), [vec!["help"]]);
+    hub.notify(
+        "ready",
+        json!({"subscription": SUB, "session": info(false), "startFailed": false}),
+    )
+    .await;
+    drive(
+        &mut rx,
+        &mut checker,
+        "the capability off",
+        |e| matches!(e, LaneEvent::Capabilities { capabilities } if !capabilities.slash),
+    )
+    .await;
+    hub.notify(
+        "ready",
+        json!({"subscription": SUB, "session": on, "startFailed": false}),
+    )
+    .await;
+    let f = drive(&mut rx, &mut checker, "the catalog, again", is_slash).await;
+    assert_eq!(slashes(&f), [vec!["help"]], "re-sent with the capability");
+}
+
+/// **P19: the title's precedence.** The row read at connect; over it the
+/// attach snapshot's `settings.title` when it says something; over that each
+/// `meta` `state.title` that does — an empty one changes nothing. A
+/// reconnect's fresh row resets the overlay (as it does the activity), and a
+/// `session_replaced` starts from the new session's row.
+#[tokio::test]
+async fn the_title_is_the_rows_then_the_snapshots_then_each_deltas() {
+    let (_dial, mut conns, lane) = scripted(fast());
+    let (mut rx, _stop) = subscribed(&lane).await;
+    let info = slash_info(SID, INC);
+    let row_titled = |t: &str| host_session_row(&info, json!({ "title": t }));
+    let mut hub = seed_with(
+        &mut conns,
+        SUB,
+        &info,
+        row_titled("From the row"),
+        snapshot_at(INC, 1, json!({})),
+    )
+    .await;
+    let mut checker = LaneChecker::new();
+    let seed = drive(&mut rx, &mut checker, "the seed", is_ready).await;
+    assert_eq!(
+        titles(&seed),
+        ["From the row"],
+        "no snapshot title: the row's"
+    );
+
+    hub.event(SUB, 2, meta(json!({"title": ""}))).await;
+    hub.event(SUB, 3, marker("m1")).await;
+    let f = drive(&mut rx, &mut checker, "the marker", is_marker("m1")).await;
+    assert!(
+        !titles(&f).iter().any(|t| t != "From the row"),
+        "an empty title changes nothing: {f:#?}"
+    );
+    hub.event(SUB, 4, meta(json!({"title": "From a delta"})))
+        .await;
+    drive(
+        &mut rx,
+        &mut checker,
+        "the delta's title",
+        |e| matches!(e, LaneEvent::Session { session } if session.title == "From a delta"),
+    )
+    .await;
+    assert_eq!(lane.session().await.unwrap().title, "From a delta");
+
+    // A reconnect: the fresh row resets the overlay; nothing replayed says
+    // otherwise, so the row stands.
+    hub.close().await;
+    let mut hub = resume_with(
+        &mut conns,
+        "s-2",
+        &info,
+        row_titled("From the fresh row"),
+        (INC, 4),
+    )
+    .await;
+    let resumed = drive(&mut rx, &mut checker, "the lone Ready", is_ready).await;
+    assert_eq!(titles(&resumed).last().unwrap(), "From the fresh row");
+
+    // A reseed whose snapshot names the session: over the row.
+    hub.reset("s-2", "replay_failed").await;
+    hub.attached(attach_result(
+        SUB,
+        &info,
+        (INC, 5),
+        Some(snap_with(INC, 5, json!({"title": "From the snapshot"}))),
+        None,
+    ))
+    .await;
+    hub.synchronized(SUB, 5).await;
+    let f = drive(&mut rx, &mut checker, "the reseed", is_ready).await;
+    assert_eq!(titles(&f), ["From the snapshot"]);
+
+    // `session_replaced`: the new session's row, nothing carried over.
+    hub.reset(SUB, "session_replaced").await;
+    let replaced = slash_info("session-fake-2", "INCARNATION-2");
+    seed_with(
+        &mut conns,
+        SUB,
+        &replaced,
+        host_session_row(&replaced, json!({"title": "The replacement"})),
+        snap_with("INCARNATION-2", 1, json!({"title": ""})),
+    )
+    .await;
+    let f = drive(&mut rx, &mut checker, "the replaced seed", is_ready).await;
+    assert_eq!(titles(&f), ["The replacement"]);
+}
+
+/// **D8/P19: `set_title` is `session.setTitle{sessionId, commandId, title}`,
+/// sent ONCE, and the header moves only on the delta.** Its `{}` reply alone
+/// changes nothing — no `Session` frame, `session()` unchanged; the title's
+/// `meta` delta is what re-emits the row with it.
+#[tokio::test]
+async fn set_title_is_sent_once_and_the_header_moves_only_on_the_delta() {
+    let (_dial, mut conns, lane) = scripted(fast());
+    let lane = Arc::new(lane);
+    let (mut rx, _stop) = subscribed(&lane).await;
+    let info = slash_info(SID, INC);
+    let mut hub = seed_with(
+        &mut conns,
+        SUB,
+        &info,
+        host_session_row(&info, json!({"title": "work"})),
+        snapshot_at(INC, 1, json!({})),
+    )
+    .await;
+    let mut checker = LaneChecker::new();
+    drive(&mut rx, &mut checker, "the seed", is_ready).await;
+
+    let l = Arc::clone(&lane);
+    let rename = tokio::spawn(async move { l.set_title("plan 029 live").await });
+    let req = hub.expect("session.setTitle").await;
+    assert_eq!(
+        req["params"],
+        json!({"sessionId": SID, "commandId": "1", "title": "plan 029 live"}),
+        "exactly its three members"
+    );
+    hub.reply(&req, json!({})).await;
+    rename.await.unwrap().unwrap();
+    assert_eq!(
+        lane.session().await.unwrap().title,
+        "work",
+        "the reply alone renamed the session"
+    );
+    hub.event(SUB, 2, marker("m1")).await;
+    let f = drive(&mut rx, &mut checker, "the marker", is_marker("m1")).await;
+    assert!(
+        !titles(&f).iter().any(|t| t == "plan 029 live"),
+        "the reply alone moved the header: {f:#?}"
+    );
+    assert_eq!(lane.session().await.unwrap().title, "work");
+
+    hub.event(SUB, 3, meta(json!({"title": "plan 029 live"})))
+        .await;
+    let f = drive(
+        &mut rx,
+        &mut checker,
+        "the delta",
+        |e| matches!(e, LaneEvent::Session { session } if session.title == "plan 029 live"),
+    )
+    .await;
+    assert_eq!(titles(&f).last().unwrap(), "plan 029 live");
+    assert_eq!(lane.session().await.unwrap().title, "plan 029 live");
+    assert!(
+        hub.recv_within(Duration::from_millis(300)).await.is_none(),
+        "sent once"
+    );
+}
+
+/// **A rename lost to a drop** is "outcome unknown" like every verb, and is
+/// NEVER resent on the next connection; a rename refused `index_write` —
+/// renamed, not recorded — is the warning with craze's cause (P19); any
+/// other refusal keeps the table's variant.
+#[tokio::test]
+async fn a_rename_lost_is_never_resent_and_index_write_is_the_warning() {
+    let (_dial, mut conns, lane) = scripted(fast());
+    let lane = Arc::new(lane);
+    let (mut rx, _stop) = subscribed(&lane).await;
+    let (mut hub, _) = seed_conn(&mut conns, SUB, 1, json!({})).await;
+    hub.synchronized(SUB, 1).await;
+    let mut checker = LaneChecker::new();
+    drive(&mut rx, &mut checker, "the seed", is_ready).await;
+
+    let l = Arc::clone(&lane);
+    let rename = tokio::spawn(async move { l.set_title("lost").await });
+    hub.expect("session.setTitle").await;
+    hub.close().await;
+    let got = rename.await.unwrap().unwrap_err();
+    assert!(is_outcome_unknown(&got), "{got:?}");
+    let mut hub = resume_with(&mut conns, "s-2", &info(false), row(), (INC, 1)).await;
+    drive(&mut rx, &mut checker, "resumed", is_ready).await;
+    assert!(
+        hub.recv_within(Duration::from_millis(300)).await.is_none(),
+        "the rename was resent"
+    );
+
+    let l = Arc::clone(&lane);
+    let rename = tokio::spawn(async move { l.set_title("unrecorded").await });
+    let req = hub.expect("session.setTitle").await;
+    assert_eq!(req["params"]["commandId"], "2", "a fresh commandId");
+    hub.refuse(
+        &req,
+        "index_write",
+        "index_write",
+        json!({"cause": "open index.json: read-only file system"}),
+    )
+    .await;
+    let got = rename.await.unwrap().unwrap_err();
+    assert_eq!(
+        shed_craze::index_write_cause(&got),
+        Some("open index.json: read-only file system"),
+        "{got:?}"
+    );
+    assert!(!is_outcome_unknown(&got));
+
+    let l = Arc::clone(&lane);
+    let rename = tokio::spawn(async move { l.set_title("").await });
+    let req = hub.expect("session.setTitle").await;
+    hub.refuse(&req, "bad_request", "bad_request", json!({}))
+        .await;
+    assert!(matches!(
+        rename.await.unwrap(),
+        Err(LaneError::BadRequest(_))
+    ));
 }

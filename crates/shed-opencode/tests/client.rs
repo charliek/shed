@@ -24,6 +24,7 @@ fn create_request(cwd: &str, prompt: Option<&str>) -> LaneCreateRequest {
         provider: None,
         prompt: prompt.map(str::to_string),
         request_id: "req-1".to_string(),
+        title: None,
     }
 }
 
@@ -58,6 +59,10 @@ async fn capabilities_are_opencodes_pinned_row_and_its_unsupported_verbs_say_so(
     );
     assert!(!caps.settings, "opencode has no settings to show");
     assert!(!caps.stop, "the contract cannot end an opencode session");
+    assert!(
+        !caps.set_title && !caps.slash,
+        "no rename and no slash catalog (plan 029 X4)"
+    );
 
     let fake = FakeOpencode::start().await;
     fake.add_session("ses_a", "a", "/w", None);
@@ -76,6 +81,12 @@ async fn capabilities_are_opencodes_pinned_row_and_its_unsupported_verbs_say_so(
                 .expect_err("set is unsupported"),
         ),
         ("stop", lane.stop().await.expect_err("stop is unsupported")),
+        (
+            "set_title",
+            lane.set_title("a name")
+                .await
+                .expect_err("set_title is unsupported"),
+        ),
     ] {
         match err {
             LaneError::Failed(m) => assert!(
@@ -408,6 +419,33 @@ async fn create_options_offer_opencode_alone_and_another_provider_is_refused() {
         })
         .await
         .expect("naming opencode itself is fine");
+}
+
+/// **A titled create is refused before the first POST** (plan 029 D5, AC2):
+/// opencode's source says `create_title: false`, and a request that names
+/// its session is `Failed` naming opencode — never a session created
+/// untitled — with nothing on the wire, the prompt's POST included.
+#[tokio::test]
+async fn a_titled_create_is_refused_before_any_post() {
+    let fake = FakeOpencode::start().await;
+    assert!(!shed_opencode::opencode_source_capabilities().create_title);
+    let err = source(&fake)
+        .create(LaneCreateRequest {
+            title: Some("Flaky test".into()),
+            ..create_request("/tmp/project", Some("hi"))
+        })
+        .await
+        .expect_err("opencode names no session at create");
+    match &err {
+        LaneError::Failed(m) => assert!(m.contains("not supported by opencode"), "{m}"),
+        other => panic!("must be Failed, never {other:?}"),
+    }
+    assert!(
+        fake.post_paths().is_empty() && fake.get_paths().is_empty(),
+        "refused before the wire: {:?}",
+        fake.post_paths()
+    );
+    assert_clean(&fake);
 }
 
 #[tokio::test]

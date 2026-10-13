@@ -1087,6 +1087,10 @@ export type CrazeStatus = {
   cause?: string | null;
   create: boolean;
   create_options: boolean;
+  /** The LIVE hub can name a session at create (`createTitle`, plan 029
+   *  P10) — `false` while dormant, offline or too old, exactly as
+   *  `create_options`. The create sheet offers "Name (optional)" on it. */
+  create_title?: boolean;
 };
 
 /** A configured machine's health, for the sessions view's group rows. A machine
@@ -1513,6 +1517,11 @@ export type LaneView = {
   ended: boolean;
   capabilities: LaneCapabilities | null;
   settings: LaneSettings | null;
+  /** The session's `/` menu, RESOLVED by the shared core (plan 029 §3.4):
+   *  `null` when the capabilities do not say `slash` or no catalog has
+   *  arrived — then the composer offers no menu and sends a `/` draft as
+   *  text. Handed back to the `lane_slash_*` commands as is; never edited. */
+  slash_menu?: SlashMenu | null;
 };
 
 /** One button an approval offers, exactly as the agent offered it.
@@ -1606,7 +1615,68 @@ export type LaneCapabilities = {
   history_cursor: boolean;
   settings: boolean;
   stop: boolean;
+  /** The session can be renamed (`lane_set_title`, plan 029 D4). */
+  set_title?: boolean;
+  /** The session publishes a slash catalog (plan 029 D3); `true` with no
+   *  `LaneView.slash_menu` yet is a catalog still to come. */
+  slash?: boolean;
 };
+
+/* ---- the `/` menu (plan 029 §3.4, `shed_app::slash_menu`) ---------------- *
+ * Mirrors of the shared core's types, as the `lane_slash_*` commands answer
+ * them; the panel renders these and hands them back. */
+
+/** What running a shown row does (`SlashAction`). */
+export type SlashAction =
+  | { kind: "prompt" }
+  | { kind: "set_title" }
+  | { kind: "set_mode"; change: LaneSettingChange }
+  | { kind: "stop" }
+  | { kind: "model_picker" };
+
+/** One shown row (`SlashMenuRow`). `arg` is the catalog's word (`none` |
+ *  `optional` | `required`), for display. */
+export type SlashMenuRow = {
+  name: string;
+  qualified?: string | null;
+  description?: string | null;
+  source: string;
+  arg: string;
+  arg_hint?: string | null;
+  while_working: boolean;
+  action: SlashAction;
+};
+
+/** A hidden builtin a typed command is refused for (`SlashHidden`). */
+export type SlashHidden = { name: string; reason: string };
+
+/** A session's resolved menu (`SlashMenu`). */
+export type SlashMenu = { rows: SlashMenuRow[]; hidden: SlashHidden[] };
+
+/** One row of an open menu: `dimmed` while a turn runs and the row would be
+ *  refused for it (X7). */
+export type SlashFilterRow = { row: SlashMenuRow; dimmed: boolean };
+
+/** What the menu panel shows for a draft and caret (`SlashFilter`). `open`
+ *  is exactly "at least one row"; `token` is the draft's first token, what an
+ *  Esc dismissal is keyed by. */
+export type SlashFilter = { open: boolean; token: string; rows: SlashFilterRow[] };
+
+/** What sending a draft does (`SlashDispatch`). */
+export type SlashDispatch =
+  | { kind: "not_command" }
+  | { kind: "prompt"; text: string }
+  | { kind: "run"; action: SlashAction; arg?: string | null }
+  | { kind: "refuse"; reason: string };
+
+/** What choosing a row does (`SlashAccept`): complete the draft (the caret in
+ *  UTF-16 code units, as `selectionStart` counts), or act on a dispatch. */
+export type SlashAccept =
+  | { kind: "complete"; draft: string; caret: number }
+  | { kind: "dispatch"; dispatch: SlashDispatch };
+
+/** How a row was chosen. */
+export type SlashAcceptKey = "enter" | "tab" | "pick";
 
 /** One selectable value — a model, a mode, an option's value
  *  (`shed_core::lane::LaneChoice`). `id` is what a change sends back. */
@@ -1766,6 +1836,52 @@ export async function laneStop(machine: string, kind: string, sessionId: string)
   await laneInvoke("lane_stop", { machine, kind, sessionId });
 }
 
+/** Rename the SESSION (`lane.set_title`; plan 029 D4/D12) — the composer's
+ *  `/rename <title>`. The new title arrives on the stream, in the session row
+ *  the header reads. Resolves `{}` — or `{warning}` for a rename that TOOK
+ *  and craze could not record (`index_write`): a success to clear the draft
+ *  on, with the warning shown. THROWS a coded failure otherwise
+ *  (`outcome_unknown` for a lost answer, never resent). */
+export async function laneSetTitle(
+  machine: string,
+  kind: string,
+  sessionId: string,
+  title: string,
+): Promise<{ warning?: string | null }> {
+  return laneInvoke<{ warning?: string | null }>("lane_set_title", { machine, kind, sessionId, title });
+}
+
+/** The menu panel for `draft` with the caret at `caret` (UTF-16 code units)
+ *  — `shed_app::slash_menu::filter`, the session's `activity` deciding what
+ *  is dimmed. THROWS a coded failure (a malformed menu). */
+export async function laneSlashFilter(
+  menu: SlashMenu,
+  draft: string,
+  caret: number,
+  activity: string,
+): Promise<SlashFilter> {
+  return laneInvoke<SlashFilter>("lane_slash_filter", { menu, draft, caret, activity });
+}
+
+/** What sending `draft` does — `shed_app::slash_menu::dispatch`: the command
+ *  grammar and its guard (P5, P6). */
+export async function laneSlashDispatch(menu: SlashMenu, draft: string, activity: string): Promise<SlashDispatch> {
+  return laneInvoke<SlashDispatch>("lane_slash_dispatch", { menu, draft, activity });
+}
+
+/** What choosing the row `row` with `key` does — `shed_app::slash_menu::
+ *  accept`; `null` when there is nothing to accept (the menu moved under the
+ *  highlight: re-filter). */
+export async function laneSlashAccept(
+  menu: SlashMenu,
+  draft: string,
+  row: string,
+  key: SlashAcceptKey,
+  activity: string,
+): Promise<SlashAccept | null> {
+  return laneInvoke<SlashAccept | null>("lane_slash_accept", { menu, draft, row, key, activity });
+}
+
 /** The session's settings, read now (`lane.settings`; plan 025 §3.10). The
  *  sheet renders the STREAM's copy — `LaneView.settings` — and this one-shot
  *  read is the socket op's twin. THROWS a coded failure. */
@@ -1904,12 +2020,45 @@ export type LaneReport = {
   error: string | null;
 };
 
+/** The panel's COMPOSER as rendered — reported apart from the transcript
+ *  (`reportLaneComposer`) so a keystroke re-sends these fields, not every
+ *  message; `lane.dump` answers them inside its `lane`. */
+export type LaneComposerReport = {
+  /** The composer's text, as typed. */
+  draft: string;
+  /** The composer's `/` menu (plan 029 D13), or `null` on a session that
+   *  offers none (its capabilities do not say `slash`, or no catalog yet).
+   *  `open`: the menu is ON SCREEN (the shared filter's open, less an Esc
+   *  dismissal); `rows`: what it lists, each `dimmed` while a turn runs and
+   *  the row would wait for it, the `highlighted` one what Enter/Tab accept;
+   *  `refusal`: the inline line a refused command left (the reason, craze's
+   *  words, or "may have applied — check the session"); `warning`: a rename
+   *  that took with a caveat. */
+  slash_menu: SlashMenuReport | null;
+};
+
+/** The `/` menu as the composer rendered it (`lane.dump`'s `slash_menu`). */
+export type SlashMenuReport = {
+  open: boolean;
+  token: string;
+  rows: { name: string; dimmed: boolean; highlighted: boolean }[];
+  draft: string;
+  refusal: string | null;
+  warning: string | null;
+};
+
 /** Report the transcript panel's rendered state (mounted-only, like
  *  `reportEgress`). Pass `null` on unmount to CLEAR the key — the merge
  *  overwrites `lane` with null rather than skipping it, so `lane.dump` answers
  *  `null` for "no panel" instead of the previous mount's stale snapshot. */
 export function reportLane(snapshot: LaneReport | null): void {
   void invoke("ui_report", { snapshot: { lane: snapshot } });
+}
+
+/** Report the transcript panel's composer (`LaneComposerReport`), `null` at
+ *  unmount. */
+export function reportLaneComposer(snapshot: LaneComposerReport | null): void {
+  void invoke("ui_report", { snapshot: { lane_composer: snapshot } });
 }
 
 /** The settings sheet as rendered — the UI truth `lane_settings.dump` reads
@@ -1982,6 +2131,9 @@ export type CrazeCreateFields = {
   cwd: string;
   provider?: string | null;
   prompt?: string | null;
+  /** "Name (optional)" (plan 029 D14), already trimmed — absent when blank
+   *  (`crazeCreate.ts`'s `createTitle`). */
+  title?: string | null;
   requestId: string;
   held: boolean;
 };
@@ -2010,6 +2162,7 @@ export async function crazeCreate(f: CrazeCreateFields): Promise<CrazeCreated> {
     cwd: f.cwd,
     provider: f.provider ?? undefined,
     prompt: f.prompt ?? undefined,
+    title: f.title ?? undefined,
     requestId: f.requestId,
     held: f.held,
   });
@@ -2055,8 +2208,14 @@ export type CrazeCreateDump = {
   preselected: string | null;
   default_provider: string | null;
   recent_dirs: string[];
-  /** Each labelled control's current value ("Directory", "First prompt"). */
+  /** Each labelled control's current value ("Directory", "Name", "First
+   *  prompt"). */
   values: Record<string, string>;
+  /** Whether the "Name (optional)" field is rendered (plan 029 D14): on a
+   *  live hub that can name a session at create, or while a title is typed. */
+  title_field: boolean;
+  /** A refusal about the title, as shown under Name. */
+  title_problem: string | null;
   /** The request id the sheet holds — set only while a submission is in
    *  flight or its outcome is unknown. */
   request_id: string | null;
