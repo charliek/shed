@@ -330,9 +330,9 @@ ARG ROOST_SESSION_SHA256_ARM64=dca26f903c5815020e27f8cc87df1ec806ffe943637c08c53
 # lockstep with craze-pin.env's CRAZE_RELEASE (the check-roost-pin precedent).
 # These ARGs are NOT forwarded by scripts/build-*-rootfs.sh; they exist so the
 # values are named here and overridable by --build-arg on a manual build.
-ARG CRAZE_VERSION=0.1.0
-ARG CRAZE_SHA256_AMD64=926954b32bd0fcc672f962813b61767a2615f49ae8e453e6c737826d7443f724
-ARG CRAZE_SHA256_ARM64=4bea888fcae1592f75552511b0144018584452dcd5e67254f11e3c9619a038d0
+ARG CRAZE_VERSION=0.1.1
+ARG CRAZE_SHA256_AMD64=a943b3a9610846dd26b15f0b3f8cbe0775b4a08dd481cb949b124d00dd67bbae
+ARG CRAZE_SHA256_ARM64=8fee4eda82c7bca45a4257510d2edf1a93a9933780f8735b6b95864ea24b5765
 
 RUN install -m 0755 -d /etc/apt/keyrings \
     && curl -fsSL https://apt.stridelabs.ai/pubkey.gpg -o /etc/apt/keyrings/stridelabs.gpg \

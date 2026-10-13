@@ -33,8 +33,10 @@ use shed_craze::testing::{bins, Recipe, TeeDial, TeeLine};
 use shed_craze::wire::{AttachResult, EventParams, ResetParams};
 use shed_craze::{lane_capabilities, new_request_id, CrazeDial};
 
-/// The recording this crate replays: craze v0.1.0 (the pin is its tag
-/// commit), a gx session.
+/// The recording this crate replays: craze v0.1.0 (the pin was its tag
+/// commit, `8d5676c`, when it was recorded), a gx session. A re-record runs
+/// the CURRENT pin's craze, so it records into a directory named for that
+/// version and repoints this (`fixtures/README.md`).
 const RECORDING: &str = "0.1.0+gx";
 /// How long one live step may take: a real model answering.
 const LIVE_WAIT: Duration = Duration::from_secs(240);

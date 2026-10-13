@@ -20,7 +20,7 @@ JSON object, one of:
   Stub without an agent: emitting text, opening an ask, restarting the engine
   (a new incarnation), and so on. `cmd/craze-fake-host`'s stdin reads the same
   shape.
-- A c2s line may also carry `"invalid": true` (fixtures 10 and 26): it is
+- A c2s line may also carry `"invalid": true` (fixtures 10, 26 and 32): it is
   deliberately not a well-formed request of a method protocol 1 defines with
   today's params (an unknown method, or a field no schema allows) — sent as it
   stands, and not held to the request schema, which such a line is designed
