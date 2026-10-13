@@ -18,7 +18,9 @@ import {
   isComposing,
   menuUp,
   moveHighlight,
+  oneAtATime,
   owns,
+  pressKey,
   revise,
   rowOnEnter,
   settleFor,
@@ -214,4 +216,177 @@ test("CONTROL: an outcome clears ONLY the draft it was sent from — a newer one
   d = revise(d, "a newer prompt");
   const after = settleFor({ kind: "done" }, owns(sent, d.rev));
   assert.equal(after.clear, false, "the rename's success left the newer prompt alone");
+});
+
+// ---- one key at a time (E15; the branch review's finding 4) ---------------
+
+/** A promise the test settles by hand — a round-trip held open. */
+function deferred() {
+  let resolve, reject;
+  const promise = new Promise((res, rej) => {
+    resolve = res;
+    reject = rej;
+  });
+  return { promise, resolve, reject };
+}
+
+/** Let every queued continuation run (the sequencer's awaits are on settled
+ *  promises once the test has answered them). */
+const drain = () => new Promise((r) => setImmediate(r));
+
+/** A composer for `pressKey`: each Enter's filter is a round-trip the test
+ *  answers (`filters[i]`), the draft is owned while `owned` says so, and
+ *  every send and accept is recorded. A send answers like a LOST verb
+ *  (`outcome_unknown`): the verb's own catch shows the note, and the draft is
+ *  KEPT — owned still. */
+function composer() {
+  const c = {
+    owned: true,
+    dismissed: null,
+    filters: [],
+    sends: 0,
+    accepts: [],
+    steps() {
+      return {
+        filter: () => {
+          const d = deferred();
+          c.filters.push(d);
+          return d.promise;
+        },
+        owned: () => c.owned,
+        dismissed: () => c.dismissed,
+        send: async () => {
+          c.sends += 1;
+        },
+        accept: async (name) => {
+          c.accepts.push(name);
+        },
+      };
+    },
+  };
+  return c;
+}
+
+const SHOWN = { key: "", index: 0 };
+/** Every sequencer cell is bounded: a regressed guard FAILS a cell, never
+ *  hangs the suite on a round-trip nobody answers. */
+const SEQ = { timeout: 5000 };
+/** `/research test` with the caret at its end: past the first token, so the
+ *  menu is CLOSED (P28) and Enter sends. */
+const CLOSED = { open: false, token: "/research", names: [] };
+
+test("CONTROL: two rapid Enters on one draft send it ONCE — the guard is taken before the filter (finding 4)", SEQ, async () => {
+  const g = { held: false };
+  const c = composer();
+  // Both Enters land before either's filter has answered.
+  const first = pressKey(g, "enter", SHOWN, c.steps());
+  const second = pressKey(g, "enter", SHOWN, c.steps());
+  // The first's filter answers; its send goes out, its answer is lost
+  // (`outcome_unknown`): the draft is kept, still owned, and the guard is
+  // released.
+  c.filters[0].resolve(CLOSED);
+  await first;
+  assert.equal(c.sends, 1);
+  assert.equal(g.held, false, "the first key released the guard");
+  // The second Enter's filter — if one was ever asked for — answers only
+  // now, on the same unchanged draft. It must NOT send it again: no key was
+  // pressed after the warning.
+  for (const d of c.filters.slice(1)) d.resolve(CLOSED);
+  await second;
+  await drain();
+  assert.equal(c.sends, 1, "the draft was sent once: the second Enter was dropped at the press");
+  assert.equal(c.filters.length, 1, "the dropped Enter never even asked for a filter");
+});
+
+test("a key pressed after the first settled goes through — the person's own resend", SEQ, async () => {
+  const g = { held: false };
+  const c = composer();
+  const first = pressKey(g, "enter", SHOWN, c.steps());
+  c.filters[0].resolve(CLOSED);
+  await first;
+  const again = pressKey(g, "enter", SHOWN, c.steps());
+  c.filters[1].resolve(CLOSED);
+  await again;
+  assert.equal(c.sends, 2);
+});
+
+test("CONTROL: a stale key is dropped without stranding the guard", SEQ, async () => {
+  const g = { held: false };
+  const c = composer();
+  const stale = pressKey(g, "enter", SHOWN, c.steps());
+  // The draft moves on while its filter is out.
+  c.owned = false;
+  c.filters[0].resolve(CLOSED);
+  await stale;
+  assert.equal(c.sends, 0, "a key for a draft that no longer exists sends nothing");
+  assert.equal(g.held, false, "and does not strand the guard");
+  c.owned = true;
+  const next = pressKey(g, "enter", SHOWN, c.steps());
+  c.filters[1].resolve(CLOSED);
+  await next;
+  assert.equal(c.sends, 1, "the next key goes through");
+});
+
+test("a round-trip that throws releases the guard", SEQ, async () => {
+  const g = { held: false };
+  const c = composer();
+  const k = pressKey(g, "enter", SHOWN, c.steps());
+  c.filters[0].reject(new Error("invoke failed"));
+  await assert.rejects(k, /invoke failed/);
+  assert.equal(g.held, false);
+  const boom = oneAtATime(g, async () => {
+    throw new Error("verb failed");
+  });
+  await assert.rejects(boom, /verb failed/);
+  assert.equal(g.held, false);
+});
+
+test("Send, a pick and Enter/Tab share the one guard: none starts while another is out", SEQ, async () => {
+  const g = { held: false };
+  const c = composer();
+  const verb = deferred();
+  let ran = 0;
+  // A Send whose verb is still out.
+  const send = oneAtATime(g, () => verb.promise);
+  // An Enter, a Tab and a pick pressed meanwhile are dropped at the press.
+  const pressed = [
+    pressKey(g, "enter", SHOWN, c.steps()),
+    pressKey(g, "tab", SHOWN, c.steps()),
+    oneAtATime(g, async () => {
+      ran += 1;
+    }),
+  ];
+  await drain();
+  assert.equal(c.filters.length, 0, "neither key asked for a filter");
+  assert.equal(ran, 0, "the pick did not run");
+  // Settle whatever a regressed guard let through, so the cell ends either way.
+  for (const d of c.filters) d.resolve(CLOSED);
+  verb.resolve();
+  await Promise.all([send, ...pressed]);
+  assert.equal(c.sends, 0);
+  await oneAtATime(g, async () => {
+    ran += 1;
+  });
+  assert.equal(ran, 1, "once the Send settled, the next key runs");
+});
+
+test("Enter or Tab on the fresh filter: a closed menu sends on Enter only; an open one accepts the row on screen", SEQ, async () => {
+  const run = async (key, filter, dismissed, shown = SHOWN) => {
+    const c = composer();
+    c.dismissed = dismissed;
+    const k = pressKey({ held: false }, key, shown, c.steps());
+    c.filters[0].resolve(filter);
+    await k;
+    return { sends: c.sends, accepts: c.accepts };
+  };
+  assert.deepEqual(await run("enter", null, null), { sends: 1, accepts: [] }, "no menu: Enter sends");
+  assert.deepEqual(await run("tab", null, null), { sends: 0, accepts: [] }, "no menu: Tab does nothing");
+  assert.deepEqual(await run("enter", CLOSED, null), { sends: 1, accepts: [] });
+  const open = { open: true, token: "/re", names: ["/rename", "/research"] };
+  const onScreen = { key: highlightKey("/re", ["/rename", "/research"]), index: 1 };
+  assert.deepEqual(await run("enter", open, null, onScreen), { sends: 0, accepts: ["/research"] },
+    "the highlighted row, when the fresh answer is the one on screen");
+  assert.deepEqual(await run("tab", open, null), { sends: 0, accepts: ["/rename"] }, "else the first row");
+  assert.deepEqual(await run("enter", open, "/re"), { sends: 1, accepts: [] },
+    "a menu dismissed for this token is not up: Enter sends");
 });

@@ -25,7 +25,10 @@ lock, the session app untouched):
   (exit 1, before any hub — an unreachable machine), and `proxy` runs each NEW
   `bridge --hub` through `bridge_proxy.py`, which logs every `session.create`'s
   requestId to `creates.log` and — while `drop-creates` exists — cuts the
-  connection once the hub has the create, so its answer is lost. The settings
+  connection once the hub has the create, so its answer is lost. It records
+  the replies that come back too — every create's (`create-replies.log`) and
+  every `session.attach`'s (`attaches.log`) — which is where a first-frame
+  claim is asserted (P26): on what the app was told, not on a poll. The settings
   cells (C11) use the same proxy for `session.set`: every one is logged to
   `sets.log` (its params, so `forModel` and the commandId are on record), and
   while `drop-sets` exists the connection that carried it is cut the same way.
@@ -114,7 +117,13 @@ HELLO = {"protocols": [1], "client": {"kind": "test", "name": "shedtest"}}
 #: C4: what the `/` menu's commands put on the wire) goes to `verbs.log` with
 #: its params. While `hold-titles` (a FIFO, `SetGate`) exists, a logged
 #: `session.setTitle` is HELD — not relayed until one byte is written to it —
-#: so a rename stays pending for as long as a cell needs.
+#: so a rename stays pending for as long as a cell needs. The REPLY to every
+#: `session.create` (the `session` row the hub answers with) goes to
+#: `create-replies.log`, and the reply to every `session.attach` (whether it
+#: carried a snapshot, and that snapshot's `settings.title`) to
+#: `attaches.log` — each written as it comes DOWN the wire, before it is
+#: relayed, so it is on record by the time the client has read it: what a
+#: client was first told, which no poll of its state can prove (P26).
 BRIDGE_PROXY = r"""
 import json, os, subprocess, sys, threading, time
 root = os.path.dirname(os.path.abspath(__file__))
@@ -126,6 +135,40 @@ if os.path.exists(os.path.join(root, "refuse-dials")):
     os._exit(1)
 child = subprocess.Popen(sys.argv[1:], stdin=subprocess.PIPE, stdout=subprocess.PIPE)
 cut = threading.Event()
+# The requests whose REPLY is recorded too, by their id as JSON (so 1 and "1"
+# stay apart): the log it goes to, and what the request said.
+watched = {}
+def note(name, entry):
+    with open(os.path.join(root, name), "a") as log:
+        log.write(json.dumps(entry) + "\n")
+def answered(line):
+    # A reply to a watched request, recorded as it came down — before it is
+    # relayed (`relayed`: whether the client is given it at all).
+    if not watched:
+        return
+    try:
+        msg = json.loads(line)
+    except ValueError:
+        return
+    if not isinstance(msg, dict) or "method" in msg or "id" not in msg:
+        return
+    w = watched.pop(json.dumps(msg["id"]), None)
+    if w is None:
+        return
+    name, entry = w
+    result = msg.get("result") if isinstance(msg.get("result"), dict) else {}
+    entry["error"] = msg.get("error")
+    entry["relayed"] = not cut.is_set()
+    if name == "create-replies.log":
+        entry["session"] = result.get("session")
+    else:
+        snap = result.get("snapshot")
+        settings = (snap.get("settings") or {}) if isinstance(snap, dict) else {}
+        entry["hostId"] = (result.get("session") or {}).get("hostId")
+        entry["after"] = result.get("after")
+        entry["snapshot"] = isinstance(snap, dict)
+        entry["title"] = settings.get("title")
+    note(name, entry)
 def hold(gate):
     # While `gate` (a FIFO) exists, the line is held — logged, not yet relayed —
     # until one byte is read from it: the verb is on the wire and PENDING.
@@ -146,6 +189,7 @@ def hold(gate):
         os.close(fd)
 def down():
     for line in child.stdout:
+        answered(line)
         if cut.is_set():
             continue
         sys.stdout.buffer.write(line)
@@ -166,6 +210,12 @@ for line in sys.stdin.buffer:
             entry["title"] = params["title"]
         with open(os.path.join(root, "creates.log"), "a") as log:
             log.write(json.dumps(entry) + "\n")
+        if "id" in msg:
+            watched[json.dumps(msg["id"])] = ("create-replies.log", {"requestId": params.get("requestId")})
+    if isinstance(msg, dict) and msg.get("method") == "session.attach" and "id" in msg:
+        params = msg.get("params") or {}
+        watched[json.dumps(msg["id"])] = ("attaches.log", {"sessionId": params.get("sessionId"),
+                                                           "cursor": params.get("cursor") is not None})
     if isinstance(msg, dict) and msg.get("method") in ("session.setTitle", "session.stop", "session.prompt"):
         with open(os.path.join(root, "verbs.log"), "a") as log:
             log.write(json.dumps({"method": msg["method"], "params": msg.get("params")}) + "\n")
@@ -347,6 +397,19 @@ class CrazeEnv:
         """Every `session.create` a proxied bridge carried: `{requestId,
         dropped}`, in order."""
         return self._jsonl("creates.log")
+
+    def create_replies(self) -> list[dict]:
+        """The hub's REPLY to every `session.create` a proxied bridge carried,
+        recorded as it came down the wire: `{requestId, session, error,
+        relayed}`, in order — `session` the roster row it answered with."""
+        return self._jsonl("create-replies.log")
+
+    def attaches(self) -> list[dict]:
+        """The reply to every `session.attach` a proxied bridge carried,
+        recorded as it came down the wire: `{sessionId, cursor, hostId,
+        after, snapshot, title, error, relayed}`, in order — `snapshot`
+        whether it carried one, `title` that snapshot's `settings.title`."""
+        return self._jsonl("attaches.log")
 
     def refused(self) -> list[dict]:
         """Every NEW bridge the proxy refused while `refuse-dials` was on."""
@@ -1788,11 +1851,13 @@ def _settle(seconds: float = 1.0) -> None:
     time.sleep(scaled_timeout(seconds))
 
 
-def _first(read, what: str, timeout: float = WAIT):
-    """Poll `read` — tightly — until it answers something other than `None`,
-    and return THAT answer: the first frame of a thing, for a cell that
-    asserts what the first frame already carries rather than waiting for the
-    property itself to turn up (P26). A `ShedError` (a lane not open yet)
+def _poll(read, what: str, timeout: float = WAIT):
+    """Poll `read` until it answers something other than `None`, and return
+    THAT answer — the first one this poll saw, which is all a poll can say. It
+    is NOT a thing's first frame: an untitled seed renamed between two reads
+    is never seen. A first-frame claim (P26) is asserted on the wire — on the
+    replies the bridge proxy recorded (`rig.create_replies()`,
+    `rig.attaches()`) — never by polling. A `ShedError` (a lane not open yet)
     counts as no answer."""
     deadline = time.monotonic() + scaled_timeout(timeout)
     while True:
@@ -2294,14 +2359,21 @@ def test_a_name_at_create_titles_the_session_from_its_first_frame(app, rig):
     nothing is refused `bad_request` and shown UNDER the field, no id held,
     nothing listed; a real name goes out on the create (the wire carries
     it), and the session is titled from its FIRST frame — never untitled and
-    renamed after: the very first row of it the roster lists (the create's
-    own answer or the hub's feed, whichever lands first) already carries the
-    name, and so does the lane's first seeded view, and the transcript
-    header from its first seeded report. One session in that directory."""
+    renamed after.
+
+    The first frame is asserted on the WIRE, on what the bridge proxy
+    recorded coming down it before the app read it: the hub's answer to the
+    create — the session's row — already carries the name, and so does the
+    snapshot of the lane connection's FIRST attach. No poll of the app's
+    state can prove that (an untitled seed renamed before the first read
+    passes any poll). The app's own row, the lane's seeded view and the
+    transcript header are then checked to carry the name too — eventual
+    checks of what the app shows. One session in that directory."""
     name = "plan 029 desk name"
     cwd = _mkdir_0700(rig.root / "w-named")
     rig.switch("proxy", True)
     before = len(rig.creates())
+    replied = len(rig.create_replies())
     d = _open_sheet(app)
     assert d["title_field"] is True, "this hub takes a title"
     _fill(app, cwd=str(cwd), title="​‮", prompt="")
@@ -2316,22 +2388,49 @@ def test_a_name_at_create_titles_the_session_from_its_first_frame(app, rig):
 
     _fill(app, title=name)
     _submit_when_ready(app)
-    # Polled for its FIRST appearance — never "until titled".
-    first = _first(lambda: next(iter(_rows_in(app, cwd)), None), "the new session's first row in rc.list")
-    host = first["slug"]
-    assert first["display_name"] == name, f"the session's first row is already titled: {first}"
-    seeded = _first(lambda: v if (v := _messages(app, host))["generation"] >= 1 else None,
-                    "the lane's first seeded view")
-    assert seeded["generation"] == 1, seeded["generation"]
-    assert (seeded["session"] or {}).get("title") == name, \
-        f"the lane's first seed is already titled: {seeded['session']}"
-    app.wait_until(lambda: _sheet(app) is None, timeout=WAIT, what="the sheet to close on Created")
-    header = _first(lambda: r if (r := _dump(app)) and r["session_id"] == host and r["generation"] >= 1 else None,
-                    "the transcript's first seeded report")
-    assert header["lane_kind"] == KIND and header["title"] == name, \
-        f"the transcript header, from its first seeded report: {header['title']!r}"
+    # The FIRST frame, on the wire: the hub's answer to the create — the
+    # session's row, recorded before the app read it — already carries the
+    # name.
+    app.wait_until(lambda: len(rig.create_replies()) - replied >= 2, timeout=WAIT,
+                   what="the hub's answer to the titled create, on the wire")
     sent = rig.creates()[before:]
     assert [c.get("title") for c in sent] == ["​‮", name], sent
+    replies = rig.create_replies()[replied:]
+    assert [r["requestId"] for r in replies] == [c["requestId"] for c in sent], (sent, replies)
+    refused, created = replies
+    assert ((refused["error"] or {}).get("data") or {}).get("code") == "bad_request", refused
+    assert created["error"] is None and created["relayed"], created
+    answer = created["session"]
+    assert (answer.get("row") or {}).get("title") == name, \
+        f"the create's own answer — the session's row — is already titled: {answer}"
+    host = answer["hostId"]
+
+    # What the app shows — EVENTUAL checks (`_poll`), not the first frame.
+    shown = _poll(lambda: next(iter(_rows_in(app, cwd)), None), "the new session's row in rc.list")
+    assert shown["slug"] == host, (shown, answer)
+    assert shown["display_name"] == name, f"the session's row is titled: {shown}"
+    seeded = _poll(lambda: v if (v := _messages(app, host))["generation"] >= 1 else None,
+                   "the lane's seeded view")
+    assert seeded["generation"] == 1, seeded["generation"]
+    assert (seeded["session"] or {}).get("title") == name, \
+        f"the lane's seeded view is titled: {seeded['session']}"
+
+    # The FIRST frame of the lane, on the wire: its connection's first attach
+    # for this session (recorded before the lane could seed from it) is a
+    # fresh one, answered with a snapshot that already carries the name.
+    first = next((a for a in rig.attaches() if a["sessionId"] == answer["sessionId"] and a["error"] is None),
+                 None)
+    assert first is not None, f"the lane's attach reply is on record: {rig.attaches()}"
+    assert first["hostId"] == host and first["relayed"], first
+    assert first["cursor"] is False and first["snapshot"] is True, \
+        f"the lane's first attach is a fresh one, answered with a snapshot: {first}"
+    assert first["title"] == name, f"the lane's FIRST attach snapshot is already titled: {first}"
+
+    app.wait_until(lambda: _sheet(app) is None, timeout=WAIT, what="the sheet to close on Created")
+    header = _poll(lambda: r if (r := _dump(app)) and r["session_id"] == host and r["generation"] >= 1 else None,
+                   "the transcript's seeded report")
+    assert header["lane_kind"] == KIND and header["title"] == name, \
+        f"the transcript header: {header['title']!r}"
     row = _exactly_one_session_in(app, cwd)
     assert row["slug"] == host and row["display_name"] == name, row
     _unmount(app)

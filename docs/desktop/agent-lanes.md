@@ -262,7 +262,9 @@ defaults or history of its own.
   or a typed path. It must be absolute; craze checks that it exists.
 - **Name.** Optional, shown when the machine's live hub can name a session at
   create (craze 0.1.1's `createTitle`; a dormant machine's sheet shows it once
-  the hub it starts is live). The session is titled from its first frame. The
+  the hub it starts is live). The session is titled from its first frame: the
+  create's own answer and the transcript's first snapshot already carry the
+  name, so it is never shown untitled and renamed after. The
   name is sent trimmed, and not at all when blank; craze normalizes it and
   refuses one that is blank once normalized, which the sheet shows under the
   field. A retry of an unknown outcome sends exactly the name the first send

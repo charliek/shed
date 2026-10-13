@@ -423,7 +423,11 @@ SIGKILL was ever needed; a typical stop is ~0.03 s. The app logs each phase to i
   `SET-COMMANDS a,b` sent as a prompt makes the fake agent re-advertise its commands live.
 - **What the commands put on the wire**: the proxy logs `session.setTitle`, `session.stop` and
   `session.prompt` to `verbs.log` (`rig.verbs(method)`), `session.set` to `sets.log`, and a
-  create's `title` in `creates.log`. Turn `proxy` on BEFORE the session's lane is first dialled
+  create's `title` in `creates.log`. It also records what came BACK: the hub's reply to every
+  `session.create` (`create-replies.log`, `rig.create_replies()`: the `session` row it answered
+  with) and the reply to every `session.attach` (`attaches.log`, `rig.attaches()`: `cursor`,
+  `snapshot`, the snapshot's `settings.title`), each written before it is relayed — so it is on
+  record once the app has read it. Turn `proxy` on BEFORE the session's lane is first dialled
   (the wrapper reads the switch per spawn), and `lane.close` a lane an earlier cell left open on
   an unproxied connection before reusing it.
 - **A turn held open**: `craze-fake-agent -script sigint-hold` with `CRAZE_FAKE_GATE` a FIFO that
@@ -438,10 +442,19 @@ SIGKILL was ever needed; a typical stop is ~0.03 s. The app logs each phase to i
   `verbs.log` before acting "while it is pending" (the draft-ownership cell types a new draft
   then). The permodel agent's set gate does NOT hold a mode change on its own: it holds only
   `session/set_config_option`, and craze sends a mode as `session/set_mode`.
-- **"From the first frame" is not an eventual poll** (P26): poll for the FIRST appearance (the
-  first `rc.list` row in the cell's own directory, the lane's first `generation >= 1` answer)
-  and assert that very answer carries the property (`_first` returns it) — a wait "until the
-  title appears" passes an untitled frame followed by a rename.
+- **"From the first frame" is asserted on the WIRE, never by polling** (P26): assert on the
+  proxy's recorded replies — the create's answer row (`rig.create_replies()`, `session.row.title`)
+  and the lane connection's FIRST attach reply for that session (`rig.attaches()`: `cursor`
+  false, `snapshot` true, its `title`). No poll proves a first frame, however tight: an untitled
+  seed (or row) followed by a title delta before the first read passes any poll, and a delta
+  moves `session.title` without moving `generation`. Polls of `rc.list`, `lane.messages` and
+  `lane.dump` (`_poll`) are fine as EVENTUAL checks of what the app shows — never call them
+  first-frame checks. Negative control: strip the create's `title` in the proxy and rename the
+  session right after it — before relaying the create's answer (the cell must fail on the
+  recorded reply row) or right after relaying the lane's first attach reply (with the reply
+  assertion off, it must fail on the recorded snapshot). Whether a poll ALSO catches either is
+  timing (the app's `rc.list` shows the create's own untitled answer row for a moment) — which
+  is exactly why a poll is never the first-frame assertion.
 - **A craze row's title is `display_name`** in `rc.list`; the lane's is `session.title`.
 - **The create sheet's `values` gained "Name"** on a live craze 0.1.1 hub (`createTitle`); it is
   absent while the machine is offline or dormant (and on an older hub) unless a title is typed.

@@ -7,8 +7,9 @@
  * nothing here filters, parses or decides a command. What is left for the
  * client is what only a keyboard and a screen have: which key does what to the
  * menu on screen, where the highlight goes, when an Esc dismissal ends, which
- * draft a keypress still owns once its round-trips answer, and what becomes
- * of the draft once an outcome is known. Those are pure and
+ * draft a keypress still owns once its round-trips answer, that one key's
+ * operation runs at a time, and what becomes of the draft once an outcome is
+ * known. Those are pure (the sequencer takes its round-trips injected) and
  * dependency-free so node's own test runner pins them (`test/slashKeys.test.mjs`,
  * the `laneVerbs.ts` arrangement) — the composer (`LanePanel.tsx`) and its
  * report both read them. */
@@ -137,6 +138,70 @@ export function revise(d: DraftRev, text: string): DraftRev {
  *  it is DROPPED, silently, before any verb is sent. */
 export function owns(claimed: number, current: number): boolean {
   return claimed === current;
+}
+
+// ---- one key at a time (E15) -----------------------------------------------
+
+/** The composer's one-at-a-time guard: held from the moment an Enter, Tab,
+ *  Send or pick is pressed until its whole operation — filter, accept,
+ *  dispatch, the verb — has settled. */
+export type Guard = { held: boolean };
+
+/** **Run `op` only if no other key's operation is running**, holding `guard`
+ *  until it settles — returned, dropped or thrown (`finally`: a dropped or
+ *  failed key never strands it). The guard is taken SYNCHRONOUSLY, before
+ *  `op`'s first await, so a second key pressed while the first's filter is
+ *  still out is dropped then and there: two pending answers for one draft
+ *  would otherwise each go on to send it (the branch review's finding 4: the
+ *  first's verb is lost — `outcome_unknown`, the draft kept — and the
+ *  second's filter answer, landing after, sends that draft AGAIN with no new
+ *  keypress). */
+export async function oneAtATime(guard: Guard, op: () => Promise<void>): Promise<void> {
+  if (guard.held) return;
+  guard.held = true;
+  try {
+    await op();
+  } finally {
+    guard.held = false;
+  }
+}
+
+/** A filter answer as an Enter or Tab reads it. */
+export type KeyFilter = { open: boolean; token: string; names: string[] };
+
+/** The round-trips an Enter or Tab makes, for the draft it claimed:
+ *
+ *  - `filter` — that draft's filter (the one on screen when it answered
+ *    these very inputs, else a fresh one); `null` with no menu;
+ *  - `owned` — whether the claim still owns the draft ([`owns`]), read after
+ *    the filter answered;
+ *  - `dismissed` — the Esc dismissal as it is once the filter answered;
+ *  - `send` — the draft sent (the shared dispatch, or text);
+ *  - `accept` — the row accepted with this key. */
+export type KeySteps = {
+  filter: () => Promise<KeyFilter | null>;
+  owned: () => boolean;
+  dismissed: () => string | null;
+  send: () => Promise<void>;
+  accept: (name: string) => Promise<void>;
+};
+
+/** **An Enter or Tab, start to finish** (P9, E15), inside the guard
+ *  ([`oneAtATime`]) for the WHOLE operation: the claimed draft's filter; a
+ *  key whose draft moved on meanwhile is dropped; with no menu up an Enter
+ *  sends and a Tab does nothing; with the menu up the row [`rowOnEnter`]
+ *  names is accepted. */
+export function pressKey(guard: Guard, key: "enter" | "tab", shown: { key: string; index: number }, s: KeySteps): Promise<void> {
+  return oneAtATime(guard, async () => {
+    const f = await s.filter();
+    if (!s.owned()) return;
+    if (!f || !menuUp(f, s.dismissed())) {
+      if (key === "enter") await s.send();
+      return;
+    }
+    const name = rowOnEnter(f, shown);
+    if (name) await s.accept(name);
+  });
 }
 
 // ---- the draft lifecycle (§3.5's table, P8) --------------------------------

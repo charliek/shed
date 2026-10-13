@@ -80,8 +80,8 @@ import { LaneSettingsSheet, useSettingChanges } from "@/components/LaneSettings"
 import { SlashMenuPanel } from "@/components/SlashMenu";
 import { cardCls, KindBadge, StatusChip, type Tone } from "@/components/primitives";
 import {
-  composerKey, dismissalAfter, highlightKey, isComposing, menuUp, moveHighlight, owns, revise, rowOnEnter,
-  settleFor, type ComposerNote, type DraftRev, type SlashOutcome,
+  composerKey, dismissalAfter, highlightKey, isComposing, menuUp, moveHighlight, oneAtATime, owns, pressKey, revise,
+  settleFor, type ComposerNote, type DraftRev, type Guard, type SlashOutcome,
 } from "@/lib/slashKeys";
 import {
   LANE_EVENT, laneAnswer, laneApprovals, laneCancel, laneClose, laneFailure,
@@ -658,19 +658,12 @@ export function LanePanel({ machine, kind, sessionId, settingsOpen, onSettingsOp
     }
   };
 
-  /** One send at a time. Set BEFORE the dispatch round-trip — `busy` rises
-   *  only once a verb starts, so without this a second Enter during the
-   *  round-trip would send the same draft twice. */
-  const sending = useRef(false);
-  const oneAtATime = async (run: () => Promise<void>) => {
-    if (sending.current) return;
-    sending.current = true;
-    try {
-      await run();
-    } finally {
-      sending.current = false;
-    }
-  };
+  /** One key's operation at a time (`slashKeys.ts`' `oneAtATime`, E15) —
+   *  Enter, Tab, Send and a pick alike, each holding it from the press until
+   *  its whole filter → accept/dispatch → verb has settled. `busy` rises only
+   *  once a verb starts, so without it a second Enter during the round-trips
+   *  would send the same draft twice. */
+  const keyGuard = useRef<Guard>({ held: false });
 
   /** Send the draft `at` claimed: through the shared dispatch when the
    *  session has a menu (the guard serves Send as it serves Enter, P5), as
@@ -717,26 +710,27 @@ export function LanePanel({ machine, kind, sessionId, settingsOpen, onSettingsOp
   /** Send, the button: the draft as it is now. */
   const submit = () => {
     const at = claim();
-    return oneAtATime(() => submitAt(at));
+    return oneAtATime(keyGuard.current, () => submitAt(at));
   };
 
   /** Enter or Tab — decided by the draft it was pressed on (`at`) and THAT
-   *  draft's filter: the row highlighted on screen when the fresh answer is
-   *  the one on screen (`shown`), else its first (`rowOnEnter`); a plain Send
-   *  when the fresh menu turned out closed. A key whose draft moved on while
-   *  its filter was asked for is dropped. */
-  const keyedAccept = async (key: "enter" | "tab", at: Claim, shown: { key: string; index: number }) => {
-    const f = await freshFilter(at);
-    if (!ownsDraft(at.rev)) return;
-    await oneAtATime(async () => {
-      if (!f || !menuUp(f, live.current.dismissed)) {
-        if (key === "enter") await submitAt(at);
-        return;
-      }
-      const name = rowOnEnter({ token: f.token, names: f.rows.map((r) => r.row.name) }, shown);
-      if (name) await acceptAt(name, key, at);
+   *  draft's filter (`slashKeys.ts`' `pressKey`): the row highlighted on
+   *  screen when the fresh answer is the one on screen (`shown`), else its
+   *  first; a plain Send when the fresh menu turned out closed. The guard is
+   *  taken at the press, BEFORE the filter is asked for: a second key while
+   *  this one's round-trips are out is dropped, never queued behind it. A
+   *  key whose draft moved on while its filter was out is dropped too. */
+  const keyedAccept = (key: "enter" | "tab", at: Claim, shown: { key: string; index: number }) =>
+    pressKey(keyGuard.current, key, shown, {
+      filter: async () => {
+        const f = await freshFilter(at);
+        return f && { open: f.open, token: f.token, names: f.rows.map((r) => r.row.name) };
+      },
+      owned: () => ownsDraft(at.rev),
+      dismissed: () => live.current.dismissed,
+      send: () => submitAt(at),
+      accept: (name) => acceptAt(name, key, at),
     });
-  };
 
   /** The composer's keys (`slashKeys.ts`'s table, P9). */
   const onComposerKey = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
@@ -772,7 +766,7 @@ export function LanePanel({ machine, kind, sessionId, settingsOpen, onSettingsOp
     const at = claim();
     const { filter: f, dismissed: d } = live.current;
     if (!menuUp(f, d) || !f?.rows.some((r) => r.row.name === name)) return;
-    void oneAtATime(() => acceptAt(name, "pick", at));
+    void oneAtATime(keyGuard.current, () => acceptAt(name, "pick", at));
   };
 
   // The composer's driver doors (`ui.type_lane_composer`,
