@@ -2376,7 +2376,7 @@ def test_a_name_at_create_titles_the_session_from_its_first_frame(app, rig):
     replied = len(rig.create_replies())
     d = _open_sheet(app)
     assert d["title_field"] is True, "this hub takes a title"
-    _fill(app, cwd=str(cwd), title="​‮", prompt="")
+    _fill(app, cwd=str(cwd), title="\u200b\u202e", prompt="")
     _submit_when_ready(app)
     app.wait_until(lambda: (_sheet(app) or {}).get("state") == "refused", timeout=WAIT,
                    what="craze's refusal of a blank-once-normalized name")
@@ -2394,7 +2394,7 @@ def test_a_name_at_create_titles_the_session_from_its_first_frame(app, rig):
     app.wait_until(lambda: len(rig.create_replies()) - replied >= 2, timeout=WAIT,
                    what="the hub's answer to the titled create, on the wire")
     sent = rig.creates()[before:]
-    assert [c.get("title") for c in sent] == ["​‮", name], sent
+    assert [c.get("title") for c in sent] == ["\u200b\u202e", name], sent
     replies = rig.create_replies()[replied:]
     assert [r["requestId"] for r in replies] == [c["requestId"] for c in sent], (sent, replies)
     refused, created = replies

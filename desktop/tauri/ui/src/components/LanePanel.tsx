@@ -499,6 +499,14 @@ export function LanePanel({ machine, kind, sessionId, settingsOpen, onSettingsOp
     laneSend(machine, kind, sessionId, text, live.current.interjecting ? "interject" : undefined);
 
   const activity = view?.activity ?? "unknown";
+  // A fresh guard per mount: StrictMode mounts, cleans up and mounts again,
+  // and a guard cancelled by the first cleanup would drop every later answer.
+  // Declared BEFORE the filter effect: effects run in declaration order, so
+  // the first filter of every mount already runs on that mount's guard.
+  useEffect(() => {
+    filterReads.current = newestWins();
+    return () => filterReads.current.cancel();
+  }, []);
   // Re-filter whenever the draft, the caret, the menu or the activity moves —
   // newest answer wins (`newest.ts`): two invokes can answer in either order.
   useEffect(() => {
@@ -513,7 +521,6 @@ export function LanePanel({ machine, kind, sessionId, settingsOpen, onSettingsOp
       () => setFiltered(null),
     );
   }, [menu, prompt, caret, activity]);
-  useEffect(() => () => filterReads.current.cancel(), []);
 
   /** The last answer — for THIS menu only: one that answered a menu since
    *  replaced (or gone) is no menu on screen. */
