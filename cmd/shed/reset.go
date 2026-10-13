@@ -51,7 +51,11 @@ func runReset(cmd *cobra.Command, args []string) error {
 			"Reset shed %q on %s? This wipes the writable upper (the home directory, "+
 				"including any cloned repo and uncommitted changes) but keeps "+
 				"--local-dir/--add-dir mounts and the lower image. [y/N] ", name, serverName)
-		if !confirmAction(prompt) {
+		ok, err := confirmAction(prompt, "--force")
+		if err != nil {
+			return err
+		}
+		if !ok {
 			fmt.Println("Cancelled.")
 			return nil
 		}

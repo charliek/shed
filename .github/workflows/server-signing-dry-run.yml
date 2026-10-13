@@ -1,0 +1,133 @@
+name: Server signing dry run
+
+# Plan 028 D4 (#304): builds the server component exactly as the release job
+# does, Developer ID signed, and publishes nothing. A goreleaser snapshot
+# (`--skip=publish`) runs with SHED_SERVER_SIGNING=required, so the shed-server
+# build hook (scripts/release/macos-server-app.sh) signs the darwin binaries
+# and ShedServer.app with the real certificate and refuses anything but a
+# timestamped Developer ID signature from the team. This job then extracts
+# each darwin shed-homebrew tarball, re-runs the hook's required checks on what
+# a user would install, prints each signature (for the grant-once test's
+# records) and uploads the tarballs for 3 days.
+#
+# Run it from the Actions UI, or `gh workflow run server-signing-dry-run.yml
+# --ref main`, after any change to the server's signing (the hook, the
+# goreleaser build/archive config, the entitlements, the certificate) or to
+# the brew formula, and before tagging a release that ships it. Two runs a few
+# minutes apart give two builds with different CDHashes and the same
+# designated requirement: the inputs of the Homebrew upgrade test (RELEASING.md).
+#
+# Trust model (plan 028 R8): the `main` condition below is workflow logic, not
+# a secret boundary. Anyone who can push a workflow revision and dispatch it
+# can reach repository secrets, exactly as for the tag-triggered release jobs.
+
+on:
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  dry-run:
+    name: Developer ID signed server snapshot (publishes nothing)
+    if: github.ref == 'refs/heads/main'
+    runs-on: macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          # goreleaser derives the snapshot version from the latest tag.
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          # No restored build cache in a job that signs with the Developer
+          # ID certificate (CodeRabbit, PR #420).
+          cache: false
+
+      # The same import as publish-images.yaml's release job.
+      - name: Import Developer ID certificate
+        env:
+          MACOS_CERTIFICATE_P12_BASE64: ${{ secrets.MACOS_CERTIFICATE_P12_BASE64 }}
+          MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+        run: |
+          set -euo pipefail
+          trap 'rm -f "$RUNNER_TEMP/cert.p12"' EXIT
+          kc="$RUNNER_TEMP/shed-server-signing.keychain-db"
+          kp="$(openssl rand -base64 24)"
+          security create-keychain -p "$kp" "$kc"
+          security set-keychain-settings -lut 21600 "$kc"
+          security unlock-keychain -p "$kp" "$kc"
+          echo "$MACOS_CERTIFICATE_P12_BASE64" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security import "$RUNNER_TEMP/cert.p12" -k "$kc" -P "$MACOS_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$kp" "$kc"
+          # The identity (certificate + key) must be in THIS keychain, so a failed
+          # import fails here. Its trust is checked after signing (--verify).
+          ids="$(security find-identity -p codesigning "$kc")"
+          if ! grep -Eq '^ *[1-9][0-9]* identities found' <<<"$ids"; then
+            echo "::error::no codesigning identity was imported into $kc"
+            exit 1
+          fi
+          # shellcheck disable=SC2046
+          security list-keychains -d user -s "$kc" $(security list-keychains -d user | sed 's/"//g')
+          rm -f "$RUNNER_TEMP/cert.p12"
+
+      - name: GoReleaser snapshot — server, Developer ID signed
+        uses: goreleaser/goreleaser-action@v7
+        with:
+          # The release job's exact version.
+          version: v2.15.3
+          args: release --snapshot --clean --skip=publish -f .goreleaser.server.yaml
+        env:
+          SHED_SERVER_SIGNING: required
+          SHED_SERVER_SIGN_IDENTITY: ${{ secrets.SHED_DESKTOP_DEVELOPER_ID_IDENTITY }}
+          SHED_SERVER_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+
+      # Right after the only step that signs, whatever its outcome.
+      - name: Delete signing keychain
+        if: always()
+        run: |
+          set -euo pipefail
+          rm -f "$RUNNER_TEMP/cert.p12"
+          kc="$RUNNER_TEMP/shed-server-signing.keychain-db"
+          if [ -f "$kc" ]; then
+            security delete-keychain "$kc"
+          fi
+
+      # What a user installs: each darwin tarball, extracted. The bundle, its
+      # executable and the archive's standalone shed-server each pass the
+      # hook's required checks, and each one's signature and designated
+      # requirement are printed (the upgrade test compares them across runs).
+      - name: Verify the extracted darwin bundles (required checks)
+        env:
+          SHED_SERVER_SIGNING: required
+          SHED_SERVER_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          set -euo pipefail
+          for arch in amd64 arm64; do
+            tgz="dist/server/shed-homebrew_darwin_${arch}.tar.gz"
+            [ -f "$tgz" ] || { echo "::error::$tgz was not built"; exit 1; }
+            dir="$RUNNER_TEMP/extracted/darwin_${arch}"
+            rm -rf "$dir"
+            mkdir -p "$dir"
+            tar xzf "$tgz" -C "$dir"
+            for p in "$dir/ShedServer.app" "$dir/ShedServer.app/Contents/MacOS/shed-server" "$dir/shed-server"; do
+              echo "=== darwin/${arch}: ${p#"$dir"/} ==="
+              scripts/release/macos-server-app.sh --verify "$p"
+              codesign -dvvv "$p" 2>&1
+              codesign -d -r- "$p" 2>&1
+            done
+          done
+
+      - name: Upload the signed darwin shed-homebrew tarballs
+        uses: actions/upload-artifact@v7
+        with:
+          name: shed-homebrew-darwin-signed
+          # The tarballs themselves: they keep the bundle's execute bits, which
+          # an artifact of loose files would lose.
+          path: dist/server/shed-homebrew_darwin_*.tar.gz
+          if-no-files-found: error
+          retention-days: 3

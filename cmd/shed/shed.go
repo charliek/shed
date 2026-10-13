@@ -696,7 +696,11 @@ func runDelete(cmd *cobra.Command, args []string) error {
 	// Confirm deletion unless --force
 	if !deleteForce {
 		prompt := fmt.Sprintf("Delete shed %q on %s? This will also delete the data volume. [y/N] ", name, serverName)
-		if !confirmAction(prompt) {
+		ok, err := confirmAction(prompt, "--force")
+		if err != nil {
+			return err
+		}
+		if !ok {
 			fmt.Println("Cancelled.")
 			return nil
 		}

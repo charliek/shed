@@ -27,6 +27,7 @@ import (
 	"github.com/charliek/shed/internal/lockmap"
 	"github.com/charliek/shed/internal/plugin"
 	"github.com/charliek/shed/internal/retry"
+	"github.com/charliek/shed/internal/stallwatch"
 	"github.com/charliek/shed/internal/vmimage"
 	"github.com/charliek/shed/internal/vmutil"
 )
@@ -120,7 +121,9 @@ var resumeInspectTimeout = 2 * time.Second
 // left to GetShed's staleness path. It only spawns NotifyConn goroutines,
 // which dial with backoff, so it is safe to run in the background.
 func (c *Client) ResumeRunningInstances(ctx context.Context) {
+	stop := stallwatch.WatchContext(ctx, stallwatch.Resume, "listing sheds", c.cfg.InstanceDir)
 	names, err := ListInstances(c.cfg.InstanceDir)
+	stop()
 	if err != nil {
 		log.Printf("Resume: failed to list instances: %v", err)
 		return
@@ -143,7 +146,9 @@ func (c *Client) resumeInstance(ctx context.Context, name string) {
 	// snapshot could already be stale by the time we get here.
 	defer c.acquireCreateLock(name)()
 
+	stop := stallwatch.WatchContext(ctx, stallwatch.Resume, "reading shed metadata", MetadataPath(c.cfg.InstanceDir, name))
 	meta, err := LoadMetadata(c.cfg.InstanceDir, name)
+	stop()
 	if err != nil {
 		log.Printf("Resume: skipping %q with unreadable metadata: %v", name, err)
 		return

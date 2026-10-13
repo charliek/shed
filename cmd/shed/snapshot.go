@@ -238,7 +238,11 @@ func runSnapshotDelete(cmd *cobra.Command, args []string) error {
 
 	if !snapshotDeleteForce {
 		prompt := fmt.Sprintf("Delete snapshot %q on %s? [y/N] ", name, serverName)
-		if !confirmAction(prompt) {
+		ok, err := confirmAction(prompt, "--force")
+		if err != nil {
+			return err
+		}
+		if !ok {
 			fmt.Println("Cancelled.")
 			return nil
 		}

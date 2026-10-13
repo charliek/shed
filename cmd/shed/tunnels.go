@@ -243,10 +243,14 @@ func runTunnelsStart(cmd *cobra.Command, args []string) error {
 					}
 					fmt.Printf("Tunnel already running for %s (profile: %s, PID %d).\n",
 						shedName, existingEntry.Profile, existingEntry.PID)
-					if stat, err := os.Stdin.Stat(); err == nil && (stat.Mode()&os.ModeCharDevice) == 0 {
+					if !stdinIsTTY() {
 						return fmt.Errorf("tunnel already running for %s; use --replace in non-interactive mode", shedName)
 					}
-					if !confirmAction("Replace? [y/N] ") {
+					ok, err := confirmAction("Replace? [y/N] ", "--replace")
+					if err != nil {
+						return err
+					}
+					if !ok {
 						fmt.Println("Cancelled.")
 						return nil
 					}

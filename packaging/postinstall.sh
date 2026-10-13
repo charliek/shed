@@ -3,7 +3,7 @@
 #
 # dpkg invokes this with:
 #   $1 = action  ("configure" on install/upgrade; abort-* on rollback)
-#   $2 = previous package version, empty on a fresh install
+#   $2 = previous package version, empty on a fresh install (or after a purge)
 #
 # Convention: a fresh install enables (but does NOT start) the unit and
 # prints the "edit config then start" hint, because the operator needs
@@ -12,7 +12,57 @@
 # v0.5.9 the postinst skipped the restart, leaving operators with a
 # 0.5.x-1 binary still serving while `dpkg-query` reported 0.5.x. See
 # docs/upgrades/v0.5.7-to-v0.5.8.md for the original incident.
+#
+# /etc/shed/server.yaml is not a dpkg conffile (#109). An edited config plus a
+# changed template made dpkg prompt, and an unattended upgrade died at that
+# prompt (exit 100, package left unconfigured). The package ships the template
+# at /usr/share/shed/server.yaml.default instead; this script creates the live
+# config from it on a fresh install only and never touches it afterwards.
+# scripts/release/test-deb-upgrade.sh asserts the upgrade/remove/purge matrix.
 set -e
+
+CONFIG=/etc/shed/server.yaml
+CONFIG_DEFAULT=/usr/share/shed/server.yaml.default
+config_missing=""
+
+case "$1" in
+    configure)
+        # Fresh install: create the config from the reference copy. Runs before
+        # the systemd guard so chroots and container builds get one too. A
+        # dangling symlink is the operator's config, so leave it alone.
+        if [ -z "${2:-}" ] && [ ! -e "$CONFIG" ] && [ ! -L "$CONFIG" ]; then
+            install -D -m 0644 "$CONFIG_DEFAULT" "$CONFIG"
+        fi
+
+        # Only a host stuck by #109 has this: the conffile-era package's
+        # unpacked template, left when configure died at the prompt. The
+        # reference copy replaces it.
+        if [ -e "$CONFIG.dpkg-new" ] || [ -L "$CONFIG.dpkg-new" ]; then
+            rm -f "$CONFIG.dpkg-new"
+            echo "Removed $CONFIG.dpkg-new left by an interrupted upgrade; the packaged default is $CONFIG_DEFAULT."
+        fi
+
+        # Upgrade with no config: the operator deleted it, and the package does
+        # not recreate it. Say where the default is; the systemd section below
+        # skips the validate and the restart.
+        if [ -n "${2:-}" ] && [ ! -e "$CONFIG" ] && [ ! -L "$CONFIG" ]; then
+            config_missing=1
+            echo ""
+            echo "shed-server was upgraded, but $CONFIG does not exist, so it was not"
+            echo "validated and the service was not restarted. To start from the packaged default:"
+            echo "  sudo install -m 0644 $CONFIG_DEFAULT $CONFIG"
+            echo "  sudo systemctl restart shed-server"
+            echo ""
+        fi
+        ;;
+    abort-upgrade|abort-remove|abort-deconfigure)
+        # There is no prerm, so a rolled-back operation has nothing to undo.
+        exit 0
+        ;;
+    *)
+        exit 0
+        ;;
+esac
 
 # Guard against non-systemd environments (chroots, container builds).
 # `systemctl --system` returns nonzero outside a real systemd host.
@@ -27,8 +77,14 @@ systemctl daemon-reload || true
 systemctl enable shed-server.service || true
 
 if [ -n "${2:-}" ]; then
-    # Upgrade path. Config files are installed `noreplace`, so an operator
-    # upgrading across a breaking config change keeps their old
+    # Upgrade with no config: the hint was printed above. There is nothing to
+    # validate, and a restart would only fail.
+    if [ -n "$config_missing" ]; then
+        exit 0
+    fi
+
+    # Upgrade path. The package never overwrites /etc/shed/server.yaml, so an
+    # operator upgrading across a breaking config change keeps their old
     # /etc/shed/server.yaml. v0.6.0 removed base_rootfs + images in favor of
     # default_image + image_aliases + pull_policy, and the new binary
     # rejects the old keys — so a blind restart would crash the service.

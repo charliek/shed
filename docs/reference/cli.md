@@ -251,7 +251,7 @@ shed delete <name> [flags]
 
 | Flag | Short | Default | Description |
 |------|-------|---------|-------------|
-| `--force` | `-f` | `false` | Skip confirmation |
+| `--force` | `-f` | `false` | Skip confirmation. Without a terminal, a prompt that gets no answer fails with exit 1; pass `--force`. |
 
 **Note:** When using `--json`, the `--force` flag is required (interactive confirmation is not supported in JSON mode).
 
@@ -346,6 +346,10 @@ spawning)` and a warning block points at the original image tag. See
 shed snapshot delete <snapshot-name> [-f]
 ```
 
+| Flag | Short | Default | Description |
+|------|-------|---------|-------------|
+| `--force` | `-f` | `false` | Skip confirmation prompt. Without a terminal, a prompt that gets no answer fails with exit 1; pass `--force`. Required with `--json`. |
+
 Removes a snapshot. Spawned sheds remain independent (each has its own
 rootfs copy).
 
@@ -377,7 +381,7 @@ shed reset <name> [flags]
 
 | Flag | Short | Default | Description |
 |------|-------|---------|-------------|
-| `--force` | `-f` | `false` | Skip confirmation prompt |
+| `--force` | `-f` | `false` | Skip confirmation prompt. Without a terminal, a prompt that gets no answer fails with exit 1; pass `--force`. |
 
 The writable upper holds the shed user's home directory (`/home/shed`),
 including any repo cloned via `--repo` — `shed reset` deletes it and re-creates
@@ -666,7 +670,7 @@ shed image rm <name> [flags]
 
 | Flag | Short | Default | Description |
 |------|-------|---------|-------------|
-| `--force` | | `false` | Skip confirmation prompt |
+| `--force` | | `false` | Skip confirmation prompt. Without a terminal, a prompt that gets no answer fails with exit 1; pass `--force`. |
 
 Accepts a Docker ref, a digest, or a cosmetic tag label. Following the Docker model, this drops the image's addressability (tags + ref-index entry) but leaves the underlying blob for `shed image prune` to garbage-collect once nothing references it. Removal is hard-blocked only when a live shed or snapshot still pins the manifest (matching `docker rmi`); removing an image referenced by server config (`default_image` / `image_aliases`) prompts for confirmation and means the next `shed create` for it re-pulls.
 
@@ -689,7 +693,7 @@ shed image prune [flags]
 
 | Flag | Short | Default | Description |
 |------|-------|---------|-------------|
-| `--force` | | `false` | Skip confirmation prompt |
+| `--force` | | `false` | Skip confirmation prompt. Without a terminal, a prompt that gets no answer fails with exit 1; pass `--force`. |
 | `--dry-run` | | `false` | List candidates without deleting |
 
 A blob is preserved if its digest is referenced by a tag, an existing shed's `metadata.json` (`lower_digest`), or a snapshot's `snapshot.json` (`lower_digest`). To delete a tagged blob the workflow is `shed image rm <tag>` first, then `shed image prune` (Docker model — `docker rmi` then `docker image prune`).
@@ -756,7 +760,7 @@ shed system prune [flags]
 | `--logs` | `false` | Truncate VZ `console.log` files (opt-in; no-op on Firecracker) |
 | `--orphans` | `false` | Remove `.tmp`/`.source` sidecars whose parent rootfs is gone |
 | `--dry-run` | `false` | Show candidates without mutating |
-| `--force` | `false` | Skip confirmation prompt; required with `--json` for the execute path |
+| `--force` | `false` | Skip confirmation prompt; required with `--json` for the execute path. Without a terminal, a prompt that gets no answer fails with exit 1; pass `--force`. |
 | `--until` | `72h` | Stopped-instance age threshold via `mtime(metadata.json)`. `0s` = any age |
 | `--log-tail-bytes` | `0` | Console log truncation target (`0` = server default, 5 MiB) |
 | `--all` | `false` | Prune on every configured server (client-side fan-out) |

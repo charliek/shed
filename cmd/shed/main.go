@@ -4,6 +4,7 @@ package main
 import (
 	"bufio"
 	"fmt"
+	"io"
 	"os"
 	"strings"
 
@@ -115,13 +116,61 @@ func getServerEntry() (*config.ServerEntry, string, error) {
 	return clientConfig.GetDefaultServer()
 }
 
-// confirmAction prints a prompt and returns true if the user confirms with y/yes.
-func confirmAction(prompt string) bool {
+// Test seams for confirmAction.
+var (
+	confirmIn  io.Reader = os.Stdin
+	stdinIsTTY           = isStdinTTY
+
+	// confirmReader is shared so several prompts in one process do not lose
+	// piped answers to a previous reader's read-ahead. confirmSrc records any
+	// read error, which bufio holds back when the same Read also returned a
+	// complete line.
+	confirmReader *bufio.Reader
+	confirmSrc    *errRecorder
+)
+
+// errRecorder remembers the first non-EOF error its reader returned.
+type errRecorder struct {
+	r   io.Reader
+	err error
+}
+
+func (e *errRecorder) Read(p []byte) (int, error) {
+	n, err := e.r.Read(p)
+	if err != nil && err != io.EOF && e.err == nil {
+		e.err = err
+	}
+	return n, err
+}
+
+// resetConfirmReader drops the shared reader (tests swap confirmIn between cases).
+func resetConfirmReader() { confirmReader, confirmSrc = nil, nil }
+
+// confirmAction prints a prompt and reports whether the user confirmed with
+// y/yes. Any other answer (or an empty line) is a plain "no" (false, nil).
+// When stdin is not a terminal and yields EOF with no answer, or a read fails,
+// it returns an error naming forceFlag: a failed read never authorizes.
+func confirmAction(prompt, forceFlag string) (bool, error) {
 	fmt.Print(prompt)
-	reader := bufio.NewReader(os.Stdin)
-	response, _ := reader.ReadString('\n')
+	if confirmReader == nil {
+		confirmSrc = &errRecorder{r: confirmIn}
+		confirmReader = bufio.NewReader(confirmSrc)
+	}
+	response, err := confirmReader.ReadString('\n')
+	if err != nil && err != io.EOF {
+		return false, fmt.Errorf("failed to read confirmation: %w", err)
+	}
+	if confirmSrc.err != nil {
+		return false, fmt.Errorf("failed to read confirmation: %w", confirmSrc.err)
+	}
+	if err == io.EOF && response == "" {
+		if stdinIsTTY() {
+			return false, nil // Ctrl-D at a terminal cancels
+		}
+		return false, fmt.Errorf("confirmation required but stdin is not a terminal and no answer was given; re-run with %s", forceFlag)
+	}
 	response = strings.TrimSpace(strings.ToLower(response))
-	return response == "y" || response == "yes"
+	return response == "y" || response == "yes", nil
 }
 
 // printSuccess prints a success message with a checkmark.

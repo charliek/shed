@@ -104,6 +104,22 @@ signing gate refuses it in the `release-plan` job otherwise (see
 charliek/shed` before tagging, since the local pre-tag `release-plan.sh`
 run can't see repository secrets. An rc tag may run without them.
 
+**The server shares the certificate** (plan 028, #304). Every server
+tag signs `ShedServer.app` with `MACOS_CERTIFICATE_P12_BASE64`,
+`MACOS_CERTIFICATE_PASSWORD`, `SHED_DESKTOP_DEVELOPER_ID_IDENTITY` and
+`APPLE_TEAM_ID`. The server signing gate and the
+`server-signing-preflight` job fail the tag before anything publishes
+when they're missing or broken (see [`RELEASING.md`](../RELEASING.md),
+"What happens" and "Server signing dry run"). So treat these four as
+server secrets too:
+- Renewing or rotating the certificate within the same team keeps the
+  designated requirement, and with it users' macOS permission grants,
+  for both apps.
+- Moving to a different team makes every user answer the prompt once
+  more.
+- After changing any of the four, run the server signing dry run before
+  the next server tag.
+
 Verify the App installation + the self-repo `contents: write` floor
 (the appcast push) via the `sanity-check-app.yml` workflow.
 

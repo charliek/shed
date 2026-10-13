@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
@@ -23,6 +24,7 @@ import (
 	"github.com/charliek/shed/internal/plugin"
 	"github.com/charliek/shed/internal/servertls"
 	"github.com/charliek/shed/internal/sshd"
+	"github.com/charliek/shed/internal/stallwatch"
 	"github.com/charliek/shed/internal/vz"
 )
 
@@ -147,8 +149,11 @@ var serveCmd = &cobra.Command{
 }
 
 func runServe(cmd *cobra.Command, args []string) error {
-	// Load configuration
+	// Load configuration. Validation stats kernel_path, initrd_path and
+	// local image paths, so an unreadable volume can stall it (#304).
+	stopWatch := stallwatch.Watch("loading the config, which also checks kernel_path, initrd_path and local image paths", configWatchPath())
 	cfg, err := loadConfig()
+	stopWatch()
 	if err != nil {
 		return fmt.Errorf("failed to load config: %w", err)
 	}
@@ -174,6 +179,11 @@ func runServe(cmd *cobra.Command, args []string) error {
 		log.Printf("HTTP listen: %s", cfg.HTTPListenAddr())
 	}
 	log.Printf("SSH listen: %s", cfg.SSHListenAddr())
+
+	// Touch every state directory before the backend does, so a store that is
+	// waiting on a macOS permission prompt (or a wedged network filesystem)
+	// stalls here, at a line naming the path (#304).
+	probeStateDirs(cfg)
 
 	// Initialize plugin system (before backends, since backends use the bridge)
 	pluginRegistry := plugin.NewRegistry()
@@ -266,12 +276,14 @@ func runServe(cmd *cobra.Command, args []string) error {
 	if cfg.Egress != nil && cfg.Egress.Enabled {
 		lo, hi := cfg.Egress.PortRangeBounds()
 		sockPath := filepath.Join(egressSocketDir, "egress-proxy.sock")
-		proxyBin, err := resolveEgressProxyBin(egressProxyBinDir())
+		proxyBin, err := resolveEgressProxyBin()
 		if err != nil {
 			return fmt.Errorf("egress enabled: %w", err)
 		}
 		auditPath := filepath.Join(egressStateDir, "egress-audit.jsonl")
+		stopWatch = stallwatch.Watch("opening the egress audit log", auditPath)
 		egressAudit, err = egress.OpenAuditLog(auditPath, 0)
+		stopWatch()
 		if err != nil {
 			return fmt.Errorf("egress: open audit log %s: %w", auditPath, err)
 		}
@@ -300,7 +312,9 @@ func runServe(cmd *cobra.Command, args []string) error {
 		// Runtime user-editable profile store (`shed egress profile ...`), in the
 		// state dir next to the audit log. Fails startup on a malformed file.
 		storeDir := filepath.Join(egressStateDir, "egress-profiles")
+		stopWatch = stallwatch.Watch("opening the egress profile store", storeDir)
 		egressUserStore, err = config.OpenUserProfileStore(storeDir)
+		stopWatch()
 		if err != nil {
 			return fmt.Errorf("egress: open user profile store: %w", err)
 		}
@@ -314,7 +328,7 @@ func runServe(cmd *cobra.Command, args []string) error {
 			}
 		}
 		attachEgressStore(egressUserStore)
-		log.Printf("Initialized egress-control proxy (ports %d-%d, socket %s, audit %s, profiles %s)", lo, hi, sockPath, auditPath, storeDir)
+		log.Printf("Initialized egress-control proxy (proxy %s, ports %d-%d, socket %s, audit %s, profiles %s)", proxyBin, lo, hi, sockPath, auditPath, storeDir)
 	}
 
 	// Build the SSH key allowlist (default off = accept all). GitHub-seeded
@@ -521,6 +535,15 @@ func runServe(cmd *cobra.Command, args []string) error {
 
 	log.Printf("Shutdown complete")
 	return nil
+}
+
+// configWatchPath names the config file in a startup stall line: the --config
+// path, or every location the default search checks when none was given.
+func configWatchPath() string {
+	if configPath != "" {
+		return config.ExpandPath(configPath)
+	}
+	return strings.Join(config.ServerConfigSearchPaths(), ", ")
 }
 
 // loadConfig loads the server configuration from the specified path or default locations.

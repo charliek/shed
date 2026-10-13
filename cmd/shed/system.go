@@ -457,7 +457,11 @@ func runSystemPruneSingle() error {
 		if !systemPruneFlagForce {
 			fmt.Println()
 			prompt := fmt.Sprintf("Proceed with prune on %s? [y/N] ", name)
-			if !confirmAction(prompt) {
+			ok, err := confirmAction(prompt, "--force")
+			if err != nil {
+				return err
+			}
+			if !ok {
 				fmt.Println("Cancelled.")
 				return nil
 			}
@@ -556,7 +560,11 @@ func runSystemPruneAll() error {
 	if !jsonFlag && !systemPruneFlagForce {
 		fmt.Println()
 		prompt := fmt.Sprintf("Proceed with prune across %d server(s)? [y/N] ", len(dryResults))
-		if !confirmAction(prompt) {
+		ok, err := confirmAction(prompt, "--force")
+		if err != nil {
+			return err
+		}
+		if !ok {
 			fmt.Println("Cancelled.")
 			return nil
 		}

@@ -69,6 +69,34 @@ All notable changes to this project will be documented in this file.
   afterwards.** The 0.8.2 to 0.9.0 upgrade guide and the desktop docs now say so, because in
   `Automatic` broker mode the app chooses its broker once at launch and does not fall back
   if the daemon disappears at runtime. A runtime fallback is still open. (#411)
+- **CLI: `shed delete`, `reset`, `snapshot delete`, `image rm`, `image prune` and `system prune` no
+  longer report success when nobody answered.** When stdin is not a terminal and the confirmation
+  prompt gets no answer (EOF, for example under `</dev/null`), the command now exits 1 with an
+  error naming `--force` and sends no mutating request, instead of printing `Cancelled.` and
+  exiting 0. A piped `y` still works. `shed tunnels start` without `--replace` now refuses
+  `/dev/null` as stdin too. (#109)
+- **Server: a startup stalled on the filesystem now names the path.** `shed-server` reads
+  each state directory before starting the backend (`Checking state directories: …`), and a
+  startup step that waits on the filesystem logs a line naming the path after 10 s, then every
+  minute. On macOS the line points at the permission prompt for an external drive and at Full
+  Disk Access, and a directory macOS has denied gets its own warning. A store that hangs on a
+  read now holds startup at that line, instead of the server reaching `ready` while the resume
+  of running sheds hangs silently. (#304)
+- **Server (deb): `/etc/shed/server.yaml` is no longer a dpkg conffile, so an upgrade never
+  prompts about it.** An edited config made dpkg prompt whenever a release changed the
+  packaged template, and an unattended `apt-get -y` upgrade then failed with `end of file on
+  stdin at conffile prompt`, leaving the package unconfigured. The template now ships at
+  `/usr/share/shed/server.yaml.default`: a fresh install copies it to `/etc/shed/server.yaml`,
+  upgrades never touch the file, and purge deletes it. A host stuck by that failure recovers
+  by installing this release. Rolling back to 0.9.0 or earlier needs
+  `-o Dpkg::Options::=--force-confold` to keep an edited config without a prompt. (#109)
+- **macOS (brew): an external-drive permission now survives upgrades.** The formula installs
+  `shed-server` inside a Developer ID signed `ShedServer.app` (bundle ID
+  `ai.stridelabs.shed-server`) under `$(brew --prefix)/opt/shed/libexec`, and `bin/shed-server`
+  is a symlink into it. macOS keys the grant on the bundle ID and signature, not on the Cellar
+  path that changes every version. The brew service command is unchanged. macOS asks one more
+  time on the first start after this upgrade, because the identity changed; after that,
+  upgrades don't ask again. (#304)
 
 ## v0.9.0 — 2026-10-10
 
