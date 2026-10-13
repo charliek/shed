@@ -15,8 +15,10 @@ use std::time::Duration;
 use serde_json::{json, Value};
 use shed_core::lane::conformance::{drive_lane, Drive, DriveEnd, LaneChecker};
 use shed_core::lane::{
-    AgentLane, AgentSource, LaneAnswer, LaneApprovalKind, LaneCreateRequest, LaneError, LaneEvent,
-    SendMode, SourceEvent, LANE_CHANNEL_CAPACITY,
+    AgentLane, AgentSource, LaneAnswer, LaneApprovalKind, LaneCreateRequest, LaneCreated,
+    LaneError, LaneEvent, LaneSlashArg, LaneSlashCatalog, LaneSlashKind, LaneSlashMethod,
+    LaneSlashPicker, LaneSlashRequires, LaneSlashSource, SendMode, SourceEvent,
+    LANE_CHANNEL_CAPACITY,
 };
 use shed_core::rc::RcActivity;
 use shed_craze::testing::{bins, HookDial, Recipe, TeeDial, RECIPE_WAIT};
@@ -170,6 +172,7 @@ async fn a_created_session_opens_at_once_with_no_roster_wait() {
                 provider: None,
                 prompt: Some("hello at once".into()),
                 request_id: new_request_id(),
+                title: None,
             })
             .await
             .unwrap();
@@ -236,6 +239,7 @@ async fn interject_on_an_idle_session_that_can_is_refused_not_accepting() {
                 provider: None,
                 prompt: None,
                 request_id: new_request_id(),
+                title: None,
             })
             .await
             .unwrap();
@@ -454,6 +458,7 @@ async fn stop_ends_the_lane_after_its_closing_records() {
                 provider: None,
                 prompt: None,
                 request_id: new_request_id(),
+                title: None,
             })
             .await
             .unwrap();
@@ -519,6 +524,7 @@ async fn a_session_created_and_stopped_at_once_leaves_the_source() {
             provider: None,
             prompt: None,
             request_id: new_request_id(),
+            title: None,
         };
         let created = source.create(request.clone()).await.unwrap();
         let host = created.session.id.clone();
@@ -776,6 +782,216 @@ async fn every_session_call_carries_the_craze_session_id() {
             connects >= 1 && scoped >= 4,
             "{connects} connects, {scoped} session calls"
         );
+    }
+    recipe.teardown().await.unwrap();
+}
+
+// ---- plan 029: the slash catalog, rename, a name at create — against the
+// REAL compiled craze 0.1.1 (its fake agent's SET-COMMANDS and SET-TITLE
+// directives exist only from 0.1.1) ----
+
+/// A grok session the hub creates, `title` as given.
+async fn create_grok(source: &CrazeSource, recipe: &Recipe, title: Option<&str>) -> LaneCreated {
+    source
+        .create(LaneCreateRequest {
+            cwd: recipe.work.to_string_lossy().into_owned(),
+            provider: None,
+            prompt: None,
+            request_id: new_request_id(),
+            title: title.map(str::to_string),
+        })
+        .await
+        .unwrap()
+}
+
+/// The last catalog among `frames`.
+fn last_catalog(frames: &[LaneEvent]) -> Option<LaneSlashCatalog> {
+    frames.iter().rev().find_map(|e| match e {
+        LaneEvent::Slash { catalog } => Some(catalog.clone()),
+        _ => None,
+    })
+}
+
+/// The titles of the session rows among `frames`.
+fn titles(frames: &[LaneEvent]) -> Vec<String> {
+    frames
+        .iter()
+        .filter_map(|e| match e {
+            LaneEvent::Session { session } => Some(session.title.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// **The agent's commands reach the lane as a `Slash`** (plan 029 AC3): a
+/// grok session craze serves says `slash` (and `set_title`); the fake agent's
+/// `SET-COMMANDS alpha,beta` directive re-advertises its catalog, and craze's
+/// `meta` delta arrives as a live `Slash` — the catalog WHOLE, as craze built
+/// it: its builtins (the picker, the rename, `/exit` requiring `stop`, the
+/// mode rows resolved to the modes the session advertised) and exactly the
+/// agent's new commands, the old `research` gone.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_agents_set_commands_reach_the_lane_as_a_slash() {
+    let Some(bins) = bins("the_agents_set_commands_reach_the_lane_as_a_slash") else {
+        return;
+    };
+    let recipe = Recipe::start(&bins);
+    {
+        let source = recipe.source();
+        let host = create_grok(&source, &recipe, None).await.session.id;
+        let (lane, _sub) = lane_on(&source, &host).await;
+        let (mut rx, _stop, mut checker) = seeded(&lane).await;
+        let caps = checker.live_capabilities().unwrap().clone();
+        assert!(caps.slash && caps.set_title, "{caps:?}");
+
+        lane.send("SET-COMMANDS alpha,beta", SendMode::Queue)
+            .await
+            .unwrap();
+        let f = drive(&mut rx, &mut checker, "the new catalog", |e| {
+            matches!(e, LaneEvent::Slash { catalog } if catalog.rows.iter().any(|r| r.name == "alpha"))
+        })
+        .await;
+        let catalog = last_catalog(&f).unwrap();
+        let row = |name: &str| {
+            catalog
+                .rows
+                .iter()
+                .find(|r| r.name == name)
+                .unwrap_or_else(|| panic!("no /{name} in {catalog:#?}"))
+        };
+        for name in ["alpha", "beta"] {
+            let r = row(name);
+            assert_eq!(
+                (&r.source, &r.run.kind, &r.run.arg, r.while_working),
+                (
+                    &LaneSlashSource::Agent,
+                    &LaneSlashKind::Prompt,
+                    &LaneSlashArg::Optional,
+                    false
+                ),
+                "{name}"
+            );
+        }
+        assert!(
+            !catalog.rows.iter().any(|r| r.name == "research"),
+            "the catalog is replaced whole"
+        );
+        let rename = row("rename");
+        assert_eq!(rename.run.method, Some(LaneSlashMethod::SetTitle));
+        assert_eq!(rename.run.param.as_deref(), Some("title"));
+        assert_eq!(row("model").run.picker, Some(LaneSlashPicker::Model));
+        assert_eq!(row("exit").requires, Some(LaneSlashRequires::Stop));
+        assert_eq!(row("help").run.kind, LaneSlashKind::Local);
+        // The fake's session/new advertises its modes (only its `grok-load`
+        // result has none), so the mode rows are `session.set` rows.
+        let plan = row("plan");
+        assert_eq!(plan.run.method, Some(LaneSlashMethod::Set));
+        assert!(plan.run.mode.is_some(), "{plan:?}");
+    }
+    recipe.teardown().await.unwrap();
+}
+
+/// **`set_title` renames the lane through the delta** (plan 029 AC3, P19):
+/// the session row takes the title the rename's `meta` delta carries.
+/// (craze 0.1.1 stores a `session.setTitle` title VERBATIM — unlike a
+/// create's, which the hub normalizes — so what is sent here is plain.)
+#[tokio::test(flavor = "multi_thread")]
+async fn set_title_renames_the_lane_through_its_delta() {
+    let Some(bins) = bins("set_title_renames_the_lane_through_its_delta") else {
+        return;
+    };
+    let recipe = Recipe::start(&bins);
+    {
+        let source = recipe.source();
+        let host = create_grok(&source, &recipe, None).await.session.id;
+        let (lane, _sub) = lane_on(&source, &host).await;
+        let (mut rx, _stop, mut checker) = seeded(&lane).await;
+        lane.set_title("plan 029 live").await.unwrap();
+        drive(
+            &mut rx,
+            &mut checker,
+            "the renamed row",
+            |e| matches!(e, LaneEvent::Session { session } if session.title == "plan 029 live"),
+        )
+        .await;
+        assert_eq!(lane.session().await.unwrap().title, "plan 029 live");
+    }
+    recipe.teardown().await.unwrap();
+}
+
+/// **A titled create is named from its first frame, and the agent cannot
+/// rename it** (plan 029 AC3; craze pins a title given at create): the
+/// source says `create_title` (0.1.1's hub); the create's answer row and the
+/// lane's seed carry craze's normalized title; the fake agent's `SET-TITLE`
+/// — an agent naming its own session — changes nothing; only `set_title`
+/// does. The control: on an UNTITLED session the same directive does rename
+/// it, so the pin, not a dead directive, is what held the title.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_titled_create_is_named_from_its_first_frame_and_the_agent_cannot_rename_it() {
+    let Some(bins) =
+        bins("a_titled_create_is_named_from_its_first_frame_and_the_agent_cannot_rename_it")
+    else {
+        return;
+    };
+    let recipe = Recipe::start(&bins);
+    {
+        let source = recipe.source();
+        let (mut srx, _sstop) = source.subscribe().await.unwrap().into_parts();
+        let deadline = tokio::time::Instant::now() + RECIPE_WAIT;
+        let caps = loop {
+            let ev = tokio::time::timeout_at(deadline, srx.recv())
+                .await
+                .expect("the roster seeds")
+                .expect("the roster stream is alive");
+            if let SourceEvent::Capabilities { capabilities } = ev {
+                break capabilities;
+            }
+        };
+        assert!(caps.create && caps.create_title, "{caps:?}");
+
+        let created = create_grok(&source, &recipe, Some("  Named\tat create ")).await;
+        assert_eq!(created.session.title, "Named at create", "the answer row");
+        let (lane, _sub) = lane_on(&source, &created.session.id).await;
+        let (mut rx, _stop) = lane.subscribe(None).await.unwrap().into_parts();
+        let mut checker = LaneChecker::new();
+        let seed = drive(&mut rx, &mut checker, "the seed", is_ready).await;
+        assert_eq!(
+            titles(&seed),
+            ["Named at create"],
+            "from the first frame: {seed:#?}"
+        );
+
+        lane.send("SET-TITLE the agent's own name", SendMode::Queue)
+            .await
+            .unwrap();
+        let turn = drive(&mut rx, &mut checker, "the echo", |e| {
+            matches!(e, LaneEvent::Message { message, .. }
+                if message.text.as_deref() == Some("echo: SET-TITLE the agent's own name"))
+        })
+        .await;
+        assert!(
+            titles(&turn).iter().all(|t| t == "Named at create"),
+            "the agent renamed a pinned session: {turn:#?}"
+        );
+        assert_eq!(lane.session().await.unwrap().title, "Named at create");
+        lane.set_title("Renamed by the user").await.unwrap();
+        drive(&mut rx, &mut checker, "the rename", |e| {
+            matches!(e, LaneEvent::Session { session } if session.title == "Renamed by the user")
+        })
+        .await;
+
+        // The control: an untitled session takes the agent's name.
+        let host = create_grok(&source, &recipe, None).await.session.id;
+        let (other, _sub2) = lane_on(&source, &host).await;
+        let (mut orx, _ostop, mut ochecker) = seeded(&other).await;
+        other
+            .send("SET-TITLE the agent's own name", SendMode::Queue)
+            .await
+            .unwrap();
+        drive(&mut orx, &mut ochecker, "the agent's name", |e| {
+            matches!(e, LaneEvent::Session { session } if session.title == "the agent's own name")
+        })
+        .await;
     }
     recipe.teardown().await.unwrap();
 }

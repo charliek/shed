@@ -68,6 +68,7 @@ fn request(recipe: &Recipe, prompt: Option<&str>, id: &str) -> LaneCreateRequest
         provider: None,
         prompt: prompt.map(str::to_string),
         request_id: id.to_string(),
+        title: None,
     }
 }
 

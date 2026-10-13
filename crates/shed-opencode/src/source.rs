@@ -66,12 +66,14 @@ pub const SOURCE_POLL_INTERVAL: Duration = Duration::from_secs(5);
 const PROVIDER: &str = KIND;
 
 /// What an opencode source can do, as it rides every seed: it creates, and it
-/// answers create options (trivially).
+/// answers create options (trivially) — but names no session at create
+/// (plan 029 X4).
 pub fn opencode_source_capabilities() -> SourceCapabilities {
     SourceCapabilities {
         kind: KIND.to_string(),
         create: true,
         create_options: true,
+        create_title: false,
     }
 }
 
@@ -167,10 +169,13 @@ impl AgentSource for OpencodeSource {
     ///
     /// A provider other than opencode's one is refused up front rather than
     /// ignored: creating an opencode session for a request that named another
-    /// agent would be the wrong thing done quietly. `request_id` is accepted and
-    /// unused (the module doc). A send that fails after the session was created
-    /// is the create's error, exactly as before the split; the session it
-    /// created stays on the server, where the next poll lists it.
+    /// agent would be the wrong thing done quietly. So is a `title` (plan 029
+    /// D5; the capabilities say `create_title: false`), before the first POST:
+    /// an untitled session for a request that named one would be the same
+    /// quiet wrong thing. `request_id` is accepted and unused (the module
+    /// doc). A send that fails after the session was created is the create's
+    /// error, exactly as before the split; the session it created stays on the
+    /// server, where the next poll lists it.
     async fn create(&self, request: LaneCreateRequest) -> Result<LaneCreated, LaneError> {
         if let Some(provider) = request.provider.as_deref() {
             if provider != PROVIDER {
@@ -178,6 +183,11 @@ impl AgentSource for OpencodeSource {
                     "opencode offers one provider, {PROVIDER:?}; {provider:?} is not it"
                 )));
             }
+        }
+        if request.title.is_some() {
+            return Err(LaneError::Failed(
+                "naming a session at create is not supported by opencode".to_string(),
+            ));
         }
         let created = self.client.create_session(&request.cwd).await?;
         let (activity, prompt) = match request.prompt.as_deref() {

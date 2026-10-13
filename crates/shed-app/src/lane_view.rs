@@ -255,6 +255,10 @@ impl LaneView {
                 target.capabilities = Some(capabilities.clone());
             }
             LaneEvent::Settings { settings } => self.target().settings = Some(settings.clone()),
+            // C3 (plan 029 P4): the catalog is staged with the seed and swapped
+            // on its `Ready`, like the settings; until then this view ignores
+            // it, as a client with no menu would.
+            LaneEvent::Slash { .. } => {}
             LaneEvent::Approval { approval } => {
                 let target = self.target();
                 // Last-write-wins, then DROP what is no longer waiting on the
@@ -512,6 +516,8 @@ mod tests {
             history_cursor: true,
             settings,
             stop: false,
+            set_title: false,
+            slash: false,
         }
     }
 

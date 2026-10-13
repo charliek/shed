@@ -23,7 +23,8 @@
 //! `session.connect`, `sessions.list` on a host, `session.attach`,
 //! `session.snapshot`, `asks.get`, and the verbs `session.prompt`,
 //! `session.cancel`, `asks.answer` and `session.stop` — and the settings
-//! milestone's `session.set` (C11). The attachment's notifications (`event`,
+//! milestone's `session.set` (C11), and plan 029's `session.setTitle` (and
+//! `session.create`'s `title`). The attachment's notifications (`event`,
 //! `synchronized`, `ready`, `presence`, `reset`) decode here as envelopes; an
 //! event's body is the fold's to read (`crate::fold`).
 
@@ -77,6 +78,8 @@ pub mod method {
     pub const SESSION_STOP: &str = "session.stop";
     /// One settings change (the settings milestone, C11).
     pub const SESSION_SET: &str = "session.set";
+    /// A rename (plan 029 D8).
+    pub const SESSION_SET_TITLE: &str = "session.setTitle";
 }
 
 /// The notifications this crate reads: the roster's (the source) and an
@@ -233,9 +236,12 @@ impl ClientInfo {
     }
 }
 
-/// `session.create`'s params — **only** `cwd`, `prompt?`, `provider?` and
-/// `requestId` (plan 025 D6: no model, no effort, no fast, craze's default
-/// permission mode), in the fixtures' member order.
+/// `session.create`'s params — **only** `cwd`, `prompt?`, `provider?`,
+/// `requestId` and (plan 029 D8) `title?` (plan 025 D6: no model, no effort,
+/// no fast, craze's default permission mode), in the fixtures' member order.
+/// `title` is OMITTED when absent, never sent empty (PM "`session.create`"),
+/// and goes only to a hub whose `hello` says `createTitle` — an older hub
+/// refuses it `unknown_field` (`crate::source`'s gate).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CreateParams {
@@ -245,6 +251,8 @@ pub struct CreateParams {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub provider: Option<String>,
     pub request_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
 }
 
 // ---- outbound: the lane's (C8) ----
@@ -336,6 +344,17 @@ pub struct SetParams {
     pub session_id: String,
     pub command_id: String,
     pub setting: Setting,
+}
+
+/// `session.setTitle`'s params (plan 029 D8): the title, as the client gave
+/// it — the host normalizes it. The reply is `{}`; the title's `meta` delta is
+/// how a client learns it took (PM: "the delta, not the reply").
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetTitleParams {
+    pub session_id: String,
+    pub command_id: String,
+    pub title: String,
 }
 
 /// One settings change as craze names it (PM's `setting{kind, id?, value,
@@ -567,8 +586,9 @@ pub struct Endpoint {
 }
 
 /// The CONNECTION's capability set (PM "Capabilities"), distinct from a
-/// session's. Every member absent reads `false`: `createOptions` is omitted
-/// when false by design, and an older hub lacks the newer ones.
+/// session's. Every member absent reads `false`: `createOptions` and
+/// `createTitle` are omitted when false by design, and an older hub lacks the
+/// newer ones.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ConnCapabilities {
@@ -586,6 +606,9 @@ pub struct ConnCapabilities {
     pub attach_when_now: bool,
     #[serde(default)]
     pub create_options: bool,
+    /// The hub's `session.create` takes a `title` (craze 0.1.1, plan 029 D8).
+    #[serde(default)]
+    pub create_title: bool,
 }
 
 /// `hello`'s `codecs`.
@@ -797,6 +820,11 @@ pub struct SessionCapabilities {
     pub row_facts: bool,
     #[serde(default)]
     pub presence: bool,
+    /// The session publishes its slash catalog (craze 0.1.1, plan 029 D6):
+    /// `LaneCapabilities::slash`. Omitted when false, so an older host's
+    /// session reads `false` and never has one.
+    #[serde(default)]
+    pub slash_catalog: bool,
 }
 
 /// `session.attach`'s result. `subscription` and `after` are required — an
@@ -1137,10 +1165,20 @@ mod tests {
             prompt: None,
             provider: None,
             request_id: "r-1".into(),
+            title: None,
         };
         assert_eq!(
             serde_json::to_value(&p).unwrap(),
-            json!({"cwd": "/w", "requestId": "r-1"})
+            json!({"cwd": "/w", "requestId": "r-1"}),
+            "no title is no `title` key — never null, never empty"
+        );
+        let titled = CreateParams {
+            title: Some("Flaky test".into()),
+            ..p
+        };
+        assert_eq!(
+            serde_json::to_value(&titled).unwrap(),
+            json!({"cwd": "/w", "requestId": "r-1", "title": "Flaky test"})
         );
     }
 

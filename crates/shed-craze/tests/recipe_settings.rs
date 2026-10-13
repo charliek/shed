@@ -119,6 +119,7 @@ async fn create_cursor(source: &CrazeSource, recipe: &Recipe) -> String {
             provider: Some("cursor".into()),
             prompt: None,
             request_id: new_request_id(),
+            title: None,
         })
         .await
         .unwrap()

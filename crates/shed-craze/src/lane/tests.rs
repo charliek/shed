@@ -293,14 +293,16 @@ fn the_plan_rows() {
 }
 
 /// §3.9: `approvals` is craze's own session capability, never the cards;
-/// `history_cursor` always; the rest as the session states them.
+/// `history_cursor` always; `set_title` always (plan 029 D4); `slash` the
+/// session's `slashCatalog` (absent on an older host: P18); the rest as the
+/// session states them.
 #[test]
 fn the_capability_mapping() {
     let caps = |v: Value| -> SessionCapabilities { serde_json::from_value(v).unwrap() };
     let c = lane_capabilities(
         &caps(
             json!({"interject": true, "cancel": true, "askCards": false, "planCards": true,
-                   "approvals": true, "stop": true}),
+                   "approvals": true, "stop": true, "slashCatalog": true}),
         ),
         true,
     );
@@ -313,12 +315,21 @@ fn the_capability_mapping() {
             approvals: true,
             history_cursor: true,
             settings: true,
-            stop: true
+            stop: true,
+            set_title: true,
+            slash: true,
         }
     );
     let c = lane_capabilities(&caps(json!({})), false);
     assert!(
-        !c.interject && !c.cancel && !c.approvals && !c.stop && !c.settings && c.history_cursor
+        !c.interject
+            && !c.cancel
+            && !c.approvals
+            && !c.stop
+            && !c.settings
+            && !c.slash
+            && c.history_cursor
+            && c.set_title
     );
     // Neither card, `approvals` stated: approvals — a permission is never
     // hidden (A11 item 5), so a session with no cards still raises one.

@@ -1,6 +1,6 @@
 //! The **fold** (plan 025 §3.3.6, P13): craze's events and snapshots in,
-//! append-only transcript rows, an activity verdict, the approval book and the
-//! settings out.
+//! append-only transcript rows, an activity verdict, the approval book, the
+//! settings, and (plan 029) the slash catalog and the title out.
 //!
 //! No I/O, no clock, no transport — everything it knows is what it was handed,
 //! which is what lets the same code fold an attach's snapshot, a cursor
@@ -65,6 +65,7 @@
 //! | `compaction` | `started`: flush, and the session row's "compacting context…" state; `ended`: `compactionNote` |
 //! | `command` | `system/status` `⤷ <qualified> (<kind>)` |
 //! | `meta` settings sections | no row; the settings ([`crate::settings`]) |
+//! | `meta` `slash` / `title` | no row; the catalog ([`crate::slash`]) replaced whole, the title (when not empty) |
 //! | `turn` `ended`, `queue`, `subagent` | no row |
 //! | a kind this build does not know | ignored |
 //!
@@ -91,6 +92,18 @@
 //! row at the top when non-empty. The open asks are booked (an `approval_request`
 //! row each, after the entries), automatic ones never.
 //!
+//! # The slash catalog and the title (plan 029 P3, P19)
+//!
+//! A restore is a FRESH fold, so a catalog never crosses one: the snapshot's
+//! `settings.slash`, when it carries one, is the catalog; a snapshot without
+//! one — truncated or not — leaves none. A `meta` delta's `slash` replaces it
+//! (an empty one included); a delta without one changes nothing. The title is
+//! an overlay on the session row the lane read at connect: the snapshot's
+//! `settings.title`, then each `meta` `state.title`, each only when it says
+//! something (an absent or empty title changes nothing); the watcher clears it
+//! whenever it reads a fresh row ([`CrazeFold::clear_title`]), as it does the
+//! activity.
+//!
 //! # Bounds
 //!
 //! The tool map ([`MAX_TOOLS`]) never evicts a call still in flight; the book
@@ -111,7 +124,7 @@ use shed_core::lane::feed::{
 };
 use shed_core::lane::{
     option_kind, LaneApproval, LaneApprovalKind, LaneApprovalOption, LaneApprovalStatus,
-    LaneQuestion,
+    LaneQuestion, LaneSlashCatalog,
 };
 use shed_core::rc::{RcActivity, RcFeedApproval, RcFeedMessage, RcFeedTool};
 
@@ -593,6 +606,14 @@ pub struct CrazeFold {
     activity: Option<RcActivity>,
     settings: SettingsState,
     settings_changed: bool,
+    /// The slash catalog: `None` until a section says one (the module doc).
+    slash: Option<LaneSlashCatalog>,
+    /// A `meta` delta changed the catalog since
+    /// [`CrazeFold::take_slash_changed`].
+    slash_changed: bool,
+    /// The session's title as the stream last said it, over the row's (the
+    /// module doc).
+    title: Option<String>,
     /// The book changed — an ask opened, ended, read whole or evicted — since
     /// [`CrazeFold::take_approvals_changed`].
     approvals_changed: bool,
@@ -619,6 +640,9 @@ impl CrazeFold {
             activity: None,
             settings: SettingsState::new(),
             settings_changed: false,
+            slash: None,
+            slash_changed: false,
+            title: None,
             approvals_changed: false,
             cards: Cards::default(),
         }
@@ -737,6 +761,32 @@ impl CrazeFold {
     /// capabilities and settings after every seed, resume and `ready`.)
     pub fn take_settings_changed(&mut self) -> bool {
         std::mem::take(&mut self.settings_changed)
+    }
+
+    /// The slash catalog as folded — `None` when the session has none (the
+    /// module doc).
+    pub fn slash(&self) -> Option<&LaneSlashCatalog> {
+        self.slash.as_ref()
+    }
+
+    /// Whether a `meta` delta changed the catalog since the last call. (A
+    /// snapshot's never sets it: the watcher re-emits after every seed,
+    /// resume and `ready`.)
+    pub fn take_slash_changed(&mut self) -> bool {
+        std::mem::take(&mut self.slash_changed)
+    }
+
+    /// The session's title as the stream last said it, `None` until it said
+    /// one since the last [`CrazeFold::clear_title`].
+    pub fn title(&self) -> Option<&str> {
+        self.title.as_deref()
+    }
+
+    /// Forget the title overlay: a session row read from the host is newer
+    /// than anything folded before it, and its title stands until the stream
+    /// says another (P19 — as [`CrazeFold::clear_activity`]).
+    pub fn clear_title(&mut self) {
+        self.title = None;
     }
 
     /// Whether the book changed since the last call — so a caller re-reads
@@ -867,6 +917,10 @@ impl CrazeFold {
         if let Some(settings) = snap.get("settings") {
             self.settings
                 .apply_sections(&SettingsSections::from_value(settings));
+            // The catalog the snapshot carries is the catalog; none is none
+            // (P3: `truncated.slash` with no `slash` included).
+            self.slash = crate::slash::section(settings);
+            self.title = said_title(settings);
         }
         // The open asks, after the closed entries and BEFORE the open run: a
         // non-automatic opening ends the run above it, so a run still open at
@@ -1108,6 +1162,16 @@ impl CrazeFold {
                 let sections = SettingsSections::from_value(state);
                 if self.settings.apply_sections(&sections) {
                     self.settings_changed = true;
+                }
+                // Present replaces the catalog whole; absent is unchanged.
+                if let Some(catalog) = crate::slash::section(state) {
+                    if self.slash.as_ref() != Some(&catalog) {
+                        self.slash = Some(catalog);
+                        self.slash_changed = true;
+                    }
+                }
+                if let Some(title) = said_title(state) {
+                    self.title = Some(title);
                 }
                 for report in ["detail", "indexErr"] {
                     self.status(str_of(fields, report), at);
@@ -1707,6 +1771,16 @@ pub fn command_line(qualified: &str, kind: &str) -> String {
     } else {
         format!("{}{name} ({kind})", wording::COMMAND_MARK)
     }
+}
+
+/// A `title` that says something — a snapshot's `settings.title`, a delta's
+/// `state.title` — or `None` for an absent, empty or blank one (P19: such a
+/// title changes nothing).
+fn said_title(holder: &Value) -> Option<String> {
+    holder
+        .get("title")
+        .and_then(Value::as_str)
+        .and_then(non_empty)
 }
 
 /// craze's `questionTitle`: the title, else the first question's prompt, else

@@ -928,6 +928,8 @@ pub fn create_request(
             .map(str::to_string),
         prompt: prompt.filter(|s| !s.trim().is_empty()).map(str::to_string),
         request_id,
+        // C4 (plan 029 D14) fills this from the sheet's "Name (optional)".
+        title: None,
     })
 }
 
@@ -1092,6 +1094,7 @@ mod tests {
             kind: "craze".to_string(),
             create: true,
             create_options: true,
+            create_title: true,
         }
     }
 

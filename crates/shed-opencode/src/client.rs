@@ -782,9 +782,9 @@ pub(crate) const KIND: &str = "opencode";
 /// (`prompt_async` joins the running turn, it does not preempt it), no
 /// resumable stream (every reconnect refolds from the top, so
 /// `history_cursor: false`), no settings to show or change, and no way to end a
-/// session from this contract. The same for every opencode session — but it
-/// rides the stream all the same, because a client reads capabilities from
-/// there for every adapter.
+/// session from this contract — nor (plan 029 X4) to rename one, nor a slash
+/// catalog. The same for every opencode session — but it rides the stream all
+/// the same, because a client reads capabilities from there for every adapter.
 pub fn opencode_capabilities() -> LaneCapabilities {
     LaneCapabilities {
         kind: KIND.to_string(),
@@ -794,6 +794,8 @@ pub fn opencode_capabilities() -> LaneCapabilities {
         history_cursor: false,
         settings: false,
         stop: false,
+        set_title: false,
+        slash: false,
     }
 }
 
@@ -1071,6 +1073,14 @@ impl AgentLane for OpencodeLane {
     async fn stop(&self) -> Result<(), LaneError> {
         Err(LaneError::Failed(
             "stopping a session is not supported by opencode".to_string(),
+        ))
+    }
+
+    /// Refused the same way (plan 029 X4): the capabilities say
+    /// `set_title: false`.
+    async fn set_title(&self, _title: &str) -> Result<(), LaneError> {
+        Err(LaneError::Failed(
+            "renaming is not supported by opencode".to_string(),
         ))
     }
 }

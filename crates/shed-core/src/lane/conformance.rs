@@ -27,7 +27,10 @@
 //!   seed. A source has no silent resume, so its every `Ready` closes a seed.
 //! - **`Capabilities` before `Ready`**, in every seed; and on a lane, `Settings`
 //!   in every seed whose capabilities say `settings` — and NEVER on a session
-//!   whose capabilities do not.
+//!   whose capabilities do not. `Slash` likewise never on a session whose
+//!   capabilities do not say `slash` (plan 029 P2) — but it is not required in
+//!   a seed that says it: a session may have no catalog yet, and a seed without
+//!   one is that.
 //! - **`seq` strictly increasing within one subscription**, across reseeds.
 //! - **A silent resume keeps the generation**: a lone `Ready` names the live one
 //!   — and is only the END of a resume, so it follows a `Stale` on that
@@ -68,6 +71,9 @@ pub enum Rule {
     /// `Settings` on a session whose capabilities do not say `settings` (or
     /// before any capabilities at all).
     SettingsNotAdvertised,
+    /// `Slash` on a session whose capabilities do not say `slash` (or before
+    /// any capabilities at all).
+    SlashNotAdvertised,
     /// A message `seq` not above every earlier one in the subscription.
     SeqMonotonic,
     /// A lone `Ready` (no seed staged) that is not the live generation.
@@ -332,10 +338,7 @@ impl LaneChecker {
             }
             LaneEvent::Settings { .. } => {
                 self.bracket.opened("Settings", at)?;
-                let governing = match self.bracket.staged.as_ref() {
-                    Some(seed) => seed.capabilities.as_ref(),
-                    None => self.live_capabilities.as_ref(),
-                };
+                let governing = self.governing();
                 if !governing.is_some_and(|c| c.settings) {
                     return fail(
                         Rule::SettingsNotAdvertised,
@@ -344,6 +347,16 @@ impl LaneChecker {
                 }
                 if let Some(seed) = self.bracket.staged.as_mut() {
                     seed.settings = true;
+                }
+            }
+            LaneEvent::Slash { .. } => {
+                self.bracket.opened("Slash", at)?;
+                let governing = self.governing();
+                if !governing.is_some_and(|c| c.slash) {
+                    return fail(
+                        Rule::SlashNotAdvertised,
+                        format!("Slash under capabilities {governing:?}"),
+                    );
                 }
             }
             LaneEvent::Message { message, .. } => {
@@ -380,6 +393,15 @@ impl LaneChecker {
             }
         }
         Ok(())
+    }
+
+    /// The capabilities a frame arriving now is judged under: the staged
+    /// seed's (once it carried them), else the live view's.
+    fn governing(&self) -> Option<&LaneCapabilities> {
+        match self.bracket.staged.as_ref() {
+            Some(seed) => seed.capabilities.as_ref(),
+            None => self.live_capabilities.as_ref(),
+        }
     }
 
     /// The subscription's channel closed. A lane stream ends with `Down` and
@@ -668,10 +690,14 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::lane::{LaneSettings, SourceCapabilities, SourceOffline};
+    use crate::lane::{LaneSettings, LaneSlashCatalog, SourceCapabilities, SourceOffline};
     use crate::rc::RcFeedMessage;
 
     fn caps(settings: bool) -> LaneEvent {
+        caps_with(settings, false)
+    }
+
+    fn caps_with(settings: bool, slash: bool) -> LaneEvent {
         LaneEvent::Capabilities {
             capabilities: LaneCapabilities {
                 kind: "test".into(),
@@ -681,7 +707,15 @@ mod tests {
                 history_cursor: true,
                 settings,
                 stop: false,
+                set_title: false,
+                slash,
             },
+        }
+    }
+
+    fn slash() -> LaneEvent {
+        LaneEvent::Slash {
+            catalog: LaneSlashCatalog::default(),
         }
     }
 
@@ -873,6 +907,57 @@ mod tests {
         );
     }
 
+    /// **The slash catalog (plan 029 P2).** A seed whose capabilities say
+    /// `slash` may carry one after its `Capabilities` — or none at all (a
+    /// catalog still to come); live changes and a silent resume's restatement
+    /// follow. One on a session that does not say `slash` breaks the rule: in a
+    /// seed, ahead of the seed's capabilities, in steady state, and after the
+    /// capabilities stop saying it.
+    #[test]
+    fn slash_rides_only_a_session_that_says_slash() {
+        check_lane(&[
+            reset(1),
+            caps_with(true, true),
+            settings(),
+            slash(),
+            ready(1),
+            slash(),
+            stale(),
+            settings(),
+            slash(),
+            ready(1),
+        ])
+        .expect("a seed's catalog, a live change and a resume's restatement");
+        check_lane(&[reset(1), caps_with(false, true), ready(1)])
+            .expect("caps say slash and no catalog yet: a valid seed (no completeness rule)");
+        assert_eq!(
+            rule_of(&[reset(1), caps(false), slash()]),
+            Rule::SlashNotAdvertised
+        );
+        assert_eq!(
+            rule_of(&[reset(1), slash(), caps_with(false, true)]),
+            Rule::SlashNotAdvertised,
+            "before the seed's capabilities"
+        );
+        assert_eq!(
+            rule_of(&[reset(1), caps(false), ready(1), slash()]),
+            Rule::SlashNotAdvertised,
+            "in steady state"
+        );
+        assert_eq!(
+            rule_of(&[
+                reset(1),
+                caps_with(false, true),
+                ready(1),
+                caps(false),
+                slash()
+            ]),
+            Rule::SlashNotAdvertised,
+            "after the capabilities stopped saying it"
+        );
+        assert_eq!(rule_of(&[slash()]), Rule::Opening);
+    }
+
     #[test]
     fn seq_climbs_across_the_whole_subscription() {
         assert_eq!(rule_of(&[reset(1), msg(2), msg(2)]), Rule::SeqMonotonic);
@@ -981,6 +1066,7 @@ mod tests {
                 kind: "test".into(),
                 create: true,
                 create_options: true,
+                create_title: false,
             },
         }
     }

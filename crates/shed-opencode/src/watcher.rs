@@ -1292,6 +1292,7 @@ mod tests {
             LaneEvent::Approval { .. } => "approval",
             LaneEvent::Capabilities { .. } => "capabilities",
             LaneEvent::Settings { .. } => "settings",
+            LaneEvent::Slash { .. } => "slash",
             LaneEvent::Stale { .. } => "stale",
             LaneEvent::Ready { .. } => "ready",
             LaneEvent::Down { .. } => "down",

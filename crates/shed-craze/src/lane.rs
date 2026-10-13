@@ -45,6 +45,17 @@
 //!
 //! No token resume and no command resend in this plan (§9's future work).
 //!
+//! # Rename (plan 029 D8, P19)
+//!
+//! [`AgentLane::set_title`] is `session.setTitle{sessionId, commandId,
+//! title}` on the live connection, like `stop`: a fresh commandId, never
+//! resent after an unknown outcome. Its reply is `{}` and says nothing — the
+//! title's `meta` delta reaches the attachment ahead of it (the reply
+//! barrier), and the watcher's fold re-emits the session row from it, so a
+//! client's header changes only when the session says the title changed.
+//! `index_write` — renamed, and only craze's session index could not record
+//! it — is [`crate::errors::set_title_error`]'s warning with craze's cause.
+//!
 //! # Settings (plan 025 §3.10)
 //!
 //! [`AgentLane::set`] is `session.set{sessionId, commandId, setting}`:
@@ -144,14 +155,14 @@ use crate::conn::{
     Notifications, HELLO_DEADLINE,
 };
 use crate::dial::{connect_hub, CrazeDial, DialError, DIAL_DEADLINE};
-use crate::errors::{craze_says, lane_error, outcome_unknown};
+use crate::errors::{craze_says, lane_error, outcome_unknown, set_title_error};
 use crate::fold::{plan_option, record_approval, Cards, CrazeFold, Restored};
 use crate::settings::{SettingsSections, SettingsState};
 use crate::source::{SourceRows, KIND};
 use crate::wire::{
     self, code, method, AskGetResult, AskParams, AsksListResult, ClientInfo, CommandParams,
-    ConnectParams, Empty, HelloParams, PromptParams, RosterRow, SessionCapabilities, SessionInfo,
-    SessionParams, SessionsListResult, SetParams, SetResult, Setting,
+    ConnectParams, Empty, HelloParams, PromptParams, RosterRow, RpcError, SessionCapabilities,
+    SessionInfo, SessionParams, SessionsListResult, SetParams, SetResult, SetTitleParams, Setting,
 };
 
 /// Every verb's deadline: the write and the reply (§3.3.4). The host answers
@@ -238,7 +249,9 @@ impl Default for LaneTimings {
 /// `planCards` still raises permissions, which are never hidden (Amendment A11
 /// item 5), and a client must not suppress the only way to answer one —
 /// `history_cursor` always (protocol 1), `settings` when it has a model, mode
-/// or option to show.
+/// or option to show — and (plan 029) `set_title` always (`session.setTitle`
+/// is the engine's, on every protocol-1 host), `slash` as the session's
+/// `slashCatalog` (absent on an older host: no catalog, ever).
 pub fn lane_capabilities(caps: &SessionCapabilities, settings: bool) -> LaneCapabilities {
     LaneCapabilities {
         kind: KIND.to_string(),
@@ -248,6 +261,8 @@ pub fn lane_capabilities(caps: &SessionCapabilities, settings: bool) -> LaneCapa
         history_cursor: true,
         settings,
         stop: caps.stop,
+        set_title: true,
+        slash: caps.slash_catalog,
     }
 }
 
@@ -476,9 +491,22 @@ impl LaneShared {
         method: &str,
         params: &P,
     ) -> Result<Value, LaneError> {
+        self.call_mapped(conn, method, params, lane_error).await
+    }
+
+    /// [`LaneShared::call_on`] with its refusals mapped by `refused` — for a
+    /// verb whose answer reads one code its own way (`session.setTitle`'s
+    /// `index_write`, [`set_title_error`]).
+    async fn call_mapped<P: Serialize>(
+        &self,
+        conn: &Conn,
+        method: &str,
+        params: &P,
+        refused: fn(&RpcError) -> LaneError,
+    ) -> Result<Value, LaneError> {
         match conn.request(method, params, self.timings.request).await {
             Ok(v) => Ok(v),
-            Err(CallError::Refused(e)) => Err(lane_error(&e)),
+            Err(CallError::Refused(e)) => Err(refused(&e)),
             Err(CallError::Deadline(d)) => {
                 conn.close(&format!(
                     "{method} had no answer within {d:?}: the connection is taken for dead"
@@ -1297,6 +1325,30 @@ impl AgentLane for CrazeLane {
             .await?;
         self.shared.took_stop();
         Ok(())
+    }
+
+    /// `session.setTitle` on the live connection (the module doc, "Rename"):
+    /// `Ok` is craze's acceptance and nothing more — the new title arrives on
+    /// the stream, from the rename's own `meta` delta, as a `Session` row. A
+    /// refusal maps through the table but for `index_write` (renamed, not
+    /// recorded: [`crate::errors::index_write_cause`]); a reply lost to a drop
+    /// is "outcome unknown", never resent.
+    async fn set_title(&self, title: &str) -> Result<(), LaneError> {
+        let live = self.shared.connected("rename").await?;
+        let params = SetTitleParams {
+            session_id: live.session_id.clone(),
+            command_id: self.shared.command_id(),
+            title: title.to_string(),
+        };
+        self.shared
+            .call_mapped(
+                &live.conn,
+                method::SESSION_SET_TITLE,
+                &params,
+                set_title_error,
+            )
+            .await
+            .map(|_| ())
     }
 }
 

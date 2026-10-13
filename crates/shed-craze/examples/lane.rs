@@ -193,6 +193,7 @@ async fn run() -> Result<(), String> {
                     provider: flag(&args, "--provider"),
                     prompt: flag(&args, "--prompt"),
                     request_id: request_id.clone(),
+                    title: None,
                 })
                 .await
                 .map_err(|e| {
@@ -292,6 +293,11 @@ async fn lane_verb(lane: &dyn AgentLane, verb: &str, rest: &[String]) -> Result<
                         settings.model.as_deref().unwrap_or("-"),
                         settings.mode.as_deref().unwrap_or("-")
                     ),
+                    LaneEvent::Slash { catalog } => {
+                        let names: Vec<&str> =
+                            catalog.rows.iter().map(|r| r.name.as_str()).collect();
+                        println!("+++ slash /{}", names.join(" /"))
+                    }
                     LaneEvent::Stale { reason } => println!("--- stale: {reason}"),
                     LaneEvent::Reset { reason, generation } => {
                         println!("--- reset ({reason}) generation {generation}")

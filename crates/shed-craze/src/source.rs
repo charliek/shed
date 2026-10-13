@@ -12,7 +12,8 @@
 //! # `subscribe`
 //!
 //! dial → hub `hello` (protocol 1, codecs 1/1, `rosterSubscribe` + `connect`;
-//! `sessionCreate` and `createOptions` recorded into [`SourceCapabilities`]) →
+//! `sessionCreate`, `createOptions` and `createTitle` recorded into
+//! [`SourceCapabilities`]) →
 //! `sessions.subscribe` → `Reset`, one `Session` per row, `Capabilities`,
 //! `Ready{truncated}` → each `roster` notification's `upserts` as `Session` and
 //! its `removes` — host ids, which ARE this source's row ids (P11) — as
@@ -50,7 +51,8 @@
 //!
 //! Each on its own short connection. `create` refuses a `request_id` that is not
 //! craze's form ([`valid_request_id`]) before it dials, then sends
-//! `session.create{cwd, provider?, prompt?, requestId}` and nothing else (D6)
+//! `session.create{cwd, provider?, prompt?, requestId, title?}` and nothing
+//! else (D6; plan 029 D8)
 //! under a [`CREATE_DEADLINE`] that covers the write as well as the reply (a
 //! hub that stops reading mid-prompt is an unknown outcome, not a hang). **The retry rule** (craze joins a running duplicate
 //! and replays the stored answer — failures included — for 10 minutes, across
@@ -76,6 +78,15 @@
 //! (`request_conflict` included), a replayed `spawn_failed`/`start_failed`.
 //! craze keeps the guarantee while the first session LIVES: a replay after it
 //! ended finds nothing and starts another.
+//!
+//! **A titled create is gated on EACH attempt's hub** (plan 029 P11): a
+//! `title` goes only to a hub whose `hello` says `createTitle` (an older one
+//! refuses it `unknown_field`). A FRESH create reaching a hub without it is
+//! `Failed` — nothing sent, the id's life over, as craze's own `craze new
+//! --title` refuses; a retry or a held replay reaching one (a hub restarted
+//! older mid-create) is UNKNOWN, the id and the exact title kept — the first
+//! attempt may have started the session, and a title is never stripped to
+//! make an attempt go through.
 //!
 //! **A created session is openable at once** (plan 025 §3.6.4): a create's
 //! answer carries the new session's roster row, and the source keeps it beside
@@ -214,6 +225,7 @@ pub fn source_capabilities(caps: &ConnCapabilities) -> SourceCapabilities {
         kind: KIND.to_string(),
         create: caps.session_create,
         create_options: caps.create_options,
+        create_title: caps.create_title,
     }
 }
 
@@ -576,12 +588,11 @@ impl CrazeSource {
             Err(e) => return Attempt::Done(Err(e.into_lane_error())),
         };
         if !hello.capabilities.session_create {
-            let why = "craze on this machine is too old to create sessions; update it";
-            return if retry {
-                Attempt::Unknown(format!("the retry reached a hub that cannot create: {why}"))
-            } else {
-                Attempt::Done(Err(LaneError::Failed(why.to_string())))
-            };
+            return Attempt::too_old(retry, "create", "create sessions");
+        }
+        // P11: a title only where THIS hub takes one — the module doc.
+        if params.title.is_some() && !hello.capabilities.create_title {
+            return Attempt::too_old(retry, "name a session", "name a session at create");
         }
         match conn
             .request(method::SESSION_CREATE, params, self.timings.create)
@@ -624,6 +635,21 @@ enum Attempt {
     Done(Result<LaneCreated, LaneError>),
     /// Sent, and no answer: whether it ran is unknown.
     Unknown(String),
+}
+
+impl Attempt {
+    /// A hub too old to `do_what` this create needs, nothing sent: `Failed` on
+    /// a fresh attempt, but UNKNOWN on a retry — the first may have run.
+    fn too_old(retry: bool, cannot: &str, do_what: &str) -> Attempt {
+        let why = format!("craze on this machine is too old to {do_what}; update it");
+        if retry {
+            Attempt::Unknown(format!(
+                "the retry reached a hub that cannot {cannot}: {why}"
+            ))
+        } else {
+            Attempt::Done(Err(LaneError::Failed(why)))
+        }
+    }
 }
 
 /// `session.create`'s result as the contract's, with the new session's craze
@@ -861,6 +887,7 @@ impl CrazeSource {
             prompt: request.prompt,
             provider: request.provider,
             request_id: request.request_id,
+            title: request.title,
         };
         match self.create_once(&params, held).await {
             Attempt::Done(answer) => answer,

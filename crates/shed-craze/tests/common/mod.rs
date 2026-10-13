@@ -88,18 +88,31 @@ pub async fn seed_conn(
     seq: u64,
     main: Value,
 ) -> (HubEnd, Value) {
-    let mut hub = next_conn(conns).await;
-    hub.splice(HOST).await;
-    hub.listed(row()).await;
-    let req = hub
-        .attached(attach_result(
+    attach_with(
+        conns,
+        row(),
+        attach_result(
             sub,
             &info(false),
             (INC, seq),
             Some(snapshot_at(INC, seq, main)),
             None,
-        ))
-        .await;
+        ),
+    )
+    .await
+}
+
+/// The lane's next connection up to its attach: the splice, `row`, and the
+/// attach answered with `result`. Returns craze's end and the attach request.
+pub async fn attach_with(
+    conns: &mut UnboundedReceiver<HubEnd>,
+    row: Value,
+    result: Value,
+) -> (HubEnd, Value) {
+    let mut hub = next_conn(conns).await;
+    hub.splice(HOST).await;
+    hub.listed(row).await;
+    let req = hub.attached(result).await;
     (hub, req)
 }
 
