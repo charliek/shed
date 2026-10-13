@@ -79,6 +79,10 @@ export type CrazeRefusal = { code: string; message: string };
 export type CrazeDraft = {
   provider: string | null;
   cwd: string;
+  /** "Name (optional)" (plan 029 D14), as typed. Sent trimmed, and only when
+   *  something is left ([`createTitle`]); part of the request the held id
+   *  stands for, so an edit of it mints a new id like any other edit. */
+  title: string;
   prompt: string;
   /** Held ONLY while the last submission's outcome is unknown (or while it is
    *  in flight): the retry that follows reuses it, so a lost answer never
@@ -91,6 +95,7 @@ export type CrazeDraft = {
 export const EMPTY_DRAFT: CrazeDraft = {
   provider: null,
   cwd: "",
+  title: "",
   prompt: "",
   requestId: null,
   phase: "idle",
@@ -138,12 +143,34 @@ export function settle(d: CrazeDraft, outcome: { ok: true } | { ok: false; refus
  *  is craze's `request_conflict`), and a settled refusal or unknown outcome no
  *  longer describes the form. Nothing typed is cleared. A submission in flight
  *  is not edited (its controls are disabled). */
-export function edit(d: CrazeDraft, patch: Partial<Pick<CrazeDraft, "provider" | "cwd" | "prompt">>): CrazeDraft {
+export function edit(d: CrazeDraft, patch: Partial<Pick<CrazeDraft, "provider" | "cwd" | "title" | "prompt">>): CrazeDraft {
   if (d.phase === "submitting") return d;
   const next = { ...d, ...patch };
-  const changed = next.provider !== d.provider || next.cwd !== d.cwd || next.prompt !== d.prompt;
+  const changed = next.provider !== d.provider || next.cwd !== d.cwd || next.title !== d.title
+    || next.prompt !== d.prompt;
   if (!changed) return d;
   return { ...next, requestId: null, phase: "idle", refusal: null };
+}
+
+/** **The title a create sends** (plan 029 D14): the Name field trimmed, or
+ *  nothing at all when that leaves it blank — never an empty title (craze
+ *  refuses one). Read off the draft the submission is FOR: a retry of an
+ *  unknown outcome replays the same draft (an edit would have minted a new
+ *  id), so the held request carries exactly the title it was first sent
+ *  with (P11) — never stripped to make a retry work. */
+export function createTitle(d: Pick<CrazeDraft, "title">): string | undefined {
+  const title = d.title.trim();
+  return title === "" ? undefined : title;
+}
+
+/** **Whether the sheet shows "Name (optional)"**: when the machine's LIVE hub
+ *  can take a title at create (`create_title`, which a dormant machine's
+ *  status learns once its hub is live, as it learns `create_options` — P10)
+ *  — and while the draft holds one, so a title that would be sent is never
+ *  out of sight (a hub that went away under the open sheet; a held request
+ *  being replayed). */
+export function titleFieldShown(craze: CrazeStatusLike, d: Pick<CrazeDraft, "title">): boolean {
+  return !!craze?.create_title || d.title.trim() !== "";
 }
 
 /** The primary button's label. */
@@ -214,14 +241,17 @@ export function crazeCreateGate(
 
 /** Where and how a refusal is shown (§3.8, by code): `bad_request` beside the
  *  directory — except craze's `request_conflict` (an id reused with other
- *  params, which this sheet never does on purpose), an internal error; a
+ *  params, which this sheet never does on purpose), an internal error, and
+ *  one about the TITLE (plan 029 D14: craze's `params.title …` wording,
+ *  fixture 32 — a name that is blank once normalized), shown under Name; a
  *  start failure (`failed`) as craze's own cause, VERBATIM and monospace;
  *  `unavailable` as "try again"; anything else as said. */
-export function refusalView(r: CrazeRefusal): { where: "cwd" | "cause" | "general"; text: string } {
+export function refusalView(r: CrazeRefusal): { where: "cwd" | "title" | "cause" | "general"; text: string } {
   if (r.code === "bad_request") {
     if (/requestId .* was used already/.test(r.message)) {
       return { where: "general", text: `internal error (a new request id is used next time): ${r.message}` };
     }
+    if (/\bparams\.title\b/.test(r.message)) return { where: "title", text: r.message };
     return { where: "cwd", text: r.message };
   }
   if (r.code === "failed") return { where: "cause", text: r.message };
@@ -237,6 +267,8 @@ export type CrazeStatusLike = {
   cause?: string | null;
   create?: boolean | null;
   create_options?: boolean | null;
+  /** The live hub can name a session at create (plan 029 P10). */
+  create_title?: boolean | null;
 } | null | undefined;
 
 /** **Whether a machine offers "New craze session"** — its craze is LIVE and

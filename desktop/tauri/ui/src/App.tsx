@@ -22,7 +22,7 @@ import { CrazeCreateDialog } from "@/components/CrazeCreateDialog";
 import { canOpenTerminal, crazeDoingLine, crazeMachineNote, killTarget } from "@/lib/crazeRows";
 import { newestReload } from "@/lib/newest";
 import {
-  EMPTY_DRAFT, beginSubmit, closesOntoTranscript, crazeCreateOffered, crazeCreateTargets,
+  EMPTY_DRAFT, beginSubmit, closesOntoTranscript, crazeCreateOffered, crazeCreateTargets, createTitle,
   crazeCreateUpdateNote, crazeStatusFor, edit as editCrazeDraft, groupMachine, liveSetter,
   replaysHeldRequest, settle, sheetOnScreen,
   type CrazeDraft, type CrazeStatusLike,
@@ -2130,6 +2130,9 @@ export default function App() {
         cwd: started.cwd.trim(),
         provider: started.provider,
         prompt: started.prompt,
+        // Off the draft this submission is for: a held retry carries the
+        // title it was first sent with (`createTitle`).
+        title: createTitle(started),
         requestId: started.requestId ?? "",
         held,
       });

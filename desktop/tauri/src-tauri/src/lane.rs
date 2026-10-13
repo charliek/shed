@@ -423,6 +423,25 @@ impl From<LaneError> for LaneFailure {
     }
 }
 
+/// `lane.set_title`'s answer from the adapter's (plan 029 P19, E4): `{}` on a
+/// rename that took; `{warning: <the message>}` on one that TOOK and that
+/// craze could not record (`index_write`) — the adapter words it
+/// `"renamed, but craze could not record it: <cause>"` and
+/// [`shed_craze::index_write_cause`] is the one test that recognises it, so
+/// this layer never reads text. The header already shows the new title (the
+/// delta carried it), so a client shows the warning beside it, clears the
+/// draft, and neither rolls back nor retries. Every other error stays an
+/// error under its own code — `outcome_unknown` included.
+pub fn renamed(result: Result<(), LaneError>) -> Result<Value, LaneFailure> {
+    match result {
+        Ok(()) => Ok(json!({})),
+        Err(e) if shed_craze::index_write_cause(&e).is_some() => {
+            Ok(json!({ "warning": e.to_string() }))
+        }
+        Err(e) => Err(e.into()),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // the transport, and who owns it
 // ---------------------------------------------------------------------------
@@ -1112,6 +1131,13 @@ impl Lanes {
             "ended": snap.ended,
             "capabilities": snap.capabilities,
             "settings": snap.settings,
+            // The session's `/` menu, RESOLVED (plan 029 §3.4, P4/P10):
+            // `shed_app::slash_menu::resolve` of its catalog against its
+            // capabilities, cached by the view — `null` when the
+            // capabilities do not say `slash` or no catalog has arrived, and
+            // then the composer offers no menu. The panel hands it back to
+            // the `lane_slash_*` commands; it never re-derives a rule.
+            "slash_menu": snap.slash_menu,
         }))
     }
 
@@ -1214,6 +1240,31 @@ impl Lanes {
         let entry = self.open_entry(machine, kind, session_id)?;
         entry.client.set(change).await?;
         Ok(json!({}))
+    }
+
+    /// `lane.set_title` — rename the SESSION (plan 029 D4, D12): craze's
+    /// `session.setTitle`, the composer's `/rename <title>`. The title is
+    /// trimmed and a blank one is refused here, `bad_request`, with nothing
+    /// sent (craze would refuse it too; a client never sends one empty). The
+    /// new title reaches the header on the stream — the `meta` delta craze
+    /// sends with it, re-emitted as `Session` — never from this answer, which
+    /// is [`renamed`]'s. A session whose capabilities say `set_title: false`
+    /// (every opencode one) refuses it, `failed`.
+    pub async fn set_title(
+        &self,
+        machine: &str,
+        kind: &str,
+        session_id: &str,
+        title: &str,
+    ) -> Result<Value, LaneFailure> {
+        let title = title.trim();
+        if title.is_empty() {
+            return Err(LaneFailure::bad_request(
+                "a session's title must not be blank".to_string(),
+            ));
+        }
+        let entry = self.open_entry(machine, kind, session_id)?;
+        renamed(entry.client.set_title(title).await)
     }
 
     /// `lane.answer` — resolve one approval.
@@ -3720,6 +3771,148 @@ mod tests {
             None,
             "lane.open keeps the row it opened with"
         );
+    }
+
+    /// **`lane.set_title`'s answer** (plan 029 P19, E4): a rename that took is
+    /// `{}`; one that took and craze could not RECORD is a success carrying
+    /// the adapter's whole warning — never an error, so the panel clears the
+    /// draft and shows it; every other error keeps its code, an unknown
+    /// outcome included.
+    #[test]
+    fn a_rename_craze_could_not_record_is_a_warning_not_a_failure() {
+        assert_eq!(renamed(Ok(())).unwrap(), json!({}));
+        let unrecorded = LaneError::Failed(format!(
+            "{}disk full",
+            shed_craze::errors::RENAMED_UNRECORDED
+        ));
+        assert_eq!(
+            renamed(Err(unrecorded)).unwrap(),
+            json!({ "warning": "renamed, but craze could not record it: disk full" })
+        );
+        for (e, code) in [
+            (LaneError::Failed("index_write".into()), "failed"),
+            (LaneError::BadRequest("params.title".into()), "bad_request"),
+            (LaneError::NotAccepting, "not_accepting"),
+            (
+                shed_craze::errors::outcome_unknown("the connection dropped"),
+                "outcome_unknown",
+            ),
+            // craze's OWN words that happen to begin like the warning are
+            // escaped by the adapter, and are a failure here.
+            (
+                LaneError::Failed(shed_craze::errors::craze_says(
+                    "renamed, but craze could not record it: no",
+                )),
+                "failed",
+            ),
+        ] {
+            let what = e.to_string();
+            assert_eq!(renamed(Err(e)).unwrap_err().code(), code, "{what}");
+        }
+    }
+
+    /// **The slash menu rides `lane.messages`, and a rename goes out as
+    /// `session.setTitle`** (plan 029 D12, P10): a craze session whose
+    /// capabilities say `slashCatalog` and whose snapshot carries a `slash`
+    /// section is answered with the RESOLVED menu (the agent's prompt row,
+    /// shown); `lane.set_title` trims and sends the title once, and craze's
+    /// `index_write` comes back as `{warning}`, a definite refusal as its own
+    /// code — and a blank title is refused with nothing sent.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_craze_lane_answers_its_slash_menu_and_renames() {
+        use shed_core::lane::AgentSource as _;
+        use shed_craze::testing::{
+            attach_result, full_hub_capabilities, host_session_row, roster_row, session_info,
+            slash_items, slash_session_caps, snapshot_at, ScriptedDial,
+        };
+
+        const HOST: &str = "0123456789ab";
+        const SID: &str = "craze-1";
+        const INC: &str = "INCARNATION-1";
+        let (dial, mut conns) = ScriptedDial::new();
+        let source = CrazeSource::new(dial, "shed-desktop-test");
+        let _roster = source.subscribe().await.expect("subscribe");
+        let mut hub = conns.recv().await.expect("the roster dialled");
+        hub.hello("0a1b2c3d4e5f", full_hub_capabilities()).await;
+        hub.subscribed(
+            "sub-1",
+            "0a1b2c3d4e5f",
+            json!([roster_row(HOST, SID, "/w", json!({"title": "before"}))]),
+        )
+        .await;
+        wait_for("the source lists the row", || {
+            source.listed(HOST).map(|_| ())
+        })
+        .await;
+        let (lanes, _log, _recorder) = lanes_with_craze(
+            REMOTE_PORT,
+            BTreeMap::new(),
+            Some((source, vec![HOST.to_string()])),
+        );
+        lanes
+            .open(MACHINE, CRAZE, HOST)
+            .await
+            .expect("the craze lane");
+        let mut conn = conns.recv().await.expect("the lane dialled");
+        conn.splice(HOST).await;
+        let info = session_info(HOST, SID, INC, slash_session_caps(true));
+        conn.listed(host_session_row(&info, json!({"title": "before"})))
+            .await;
+        let mut snap = snapshot_at(INC, 1, json!({}));
+        snap["settings"]["slash"] = slash_items(&["research"]);
+        conn.attached(attach_result("s-1", &info, (INC, 1), Some(snap), None))
+            .await;
+        conn.synchronized("s-1", 1).await;
+
+        let view = wait_for("the seed's slash menu on lane.messages", || {
+            let v = lanes.messages(MACHINE, CRAZE, HOST).ok()?;
+            (!v["slash_menu"].is_null()).then_some(v)
+        })
+        .await;
+        assert_eq!(view["capabilities"]["slash"], true, "{view}");
+        assert_eq!(view["capabilities"]["set_title"], true, "{view}");
+        let rows = view["slash_menu"]["rows"].as_array().expect("rows");
+        assert_eq!(rows.len(), 1, "{view}");
+        assert_eq!(rows[0]["name"], "research");
+        assert_eq!(rows[0]["action"], json!({"kind": "prompt"}));
+
+        // A blank title: refused here, nothing sent.
+        let blank = lanes.set_title(MACHINE, CRAZE, HOST, "  \t ").await;
+        assert_eq!(blank.unwrap_err().code(), "bad_request");
+
+        // index_write: the rename took, the index did not record it.
+        let renaming = {
+            let lanes = Arc::clone(&lanes);
+            tokio::spawn(async move {
+                lanes
+                    .set_title(MACHINE, CRAZE, HOST, "  the new name ")
+                    .await
+            })
+        };
+        let req = conn.expect("session.setTitle").await;
+        assert_eq!(req["params"]["title"], "the new name", "trimmed: {req}");
+        assert_eq!(req["params"]["sessionId"], SID);
+        conn.refuse(
+            &req,
+            "index_write",
+            "index_write",
+            json!({"cause": "disk full"}),
+        )
+        .await;
+        assert_eq!(
+            renaming.await.unwrap().expect("a warning, not a failure"),
+            json!({ "warning": "renamed, but craze could not record it: disk full" })
+        );
+
+        // A definite refusal keeps its code.
+        let refusing = {
+            let lanes = Arc::clone(&lanes);
+            tokio::spawn(async move { lanes.set_title(MACHINE, CRAZE, HOST, "again").await })
+        };
+        let req = conn.expect("session.setTitle").await;
+        conn.refuse(&req, "bad_request", "bad_request", json!({}))
+            .await;
+        assert_eq!(refusing.await.unwrap().unwrap_err().code(), "bad_request");
     }
 
     // -----------------------------------------------------------------------

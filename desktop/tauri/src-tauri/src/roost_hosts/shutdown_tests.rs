@@ -802,6 +802,7 @@ async fn an_admitted_creates_retry_is_refused_by_the_gated_dialer() {
                 Some("/work/new"),
                 Some("grok"),
                 Some("hello"),
+                None,
                 Some("shed-retry-1"),
             )
             .expect("a request");
@@ -997,8 +998,9 @@ async fn a_create_and_a_bootstrap_racing_the_shutdown_are_refused() {
     let mut done = orderly.start();
     wait_for("the shutdown to begin", || gate.is_closed().then_some(())).await;
 
-    let request = crate::craze::create_request(Some("/work/new"), None, None, Some("shed-late-1"))
-        .expect("a request");
+    let request =
+        crate::craze::create_request(Some("/work/new"), None, None, None, Some("shed-late-1"))
+            .expect("a request");
     let refused = hosts
         .craze_create(LOCALHOST, request, false)
         .await

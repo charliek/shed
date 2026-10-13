@@ -794,8 +794,10 @@ impl CrazeState {
     /// The status row's `craze` half (plan 025 §3.6.2): `state` is `live`,
     /// `dormant`, `offline` or `absent` (never reached — and not installed,
     /// which renders as absent); `cause` names an offline (or not-installed)
-    /// state's reason class; `create`/`create_options` are the LIVE hub's
-    /// capabilities, `false` otherwise.
+    /// state's reason class; `create`/`create_options`/`create_title` are the
+    /// LIVE hub's capabilities, `false` otherwise — so a dormant machine's
+    /// create sheet offers "Name (optional)" once its hub is live, exactly as
+    /// it learns `create_options` (plan 029 P10).
     pub fn status(&self) -> Value {
         let (state, cause) = match (self.gen, self.phase, &self.offline) {
             (0, ..) | (_, None, _) => ("absent", None),
@@ -815,6 +817,7 @@ impl CrazeState {
             "cause": cause,
             "create": caps.is_some_and(|c| c.create),
             "create_options": caps.is_some_and(|c| c.create_options),
+            "create_title": caps.is_some_and(|c| c.create_title),
         })
     }
 }
@@ -890,6 +893,9 @@ impl CrazeFailure {
 /// * a blank `provider` is absent (craze's default provider);
 /// * a blank `prompt` is absent (an idle session); any other prompt goes
 ///   EXACTLY as typed, newlines and all;
+/// * `title` (plan 029 D14, the sheet's "Name (optional)") is trimmed, and a
+///   blank one is absent — never sent empty (craze refuses an empty title);
+///   a hub that cannot take one is `shed_craze`'s create gate's (P11);
 /// * `request_id`, when PRESENT, must be craze's form
 ///   ([`shed_craze::valid_request_id`]) and is used exactly as given — the
 ///   caller is retrying an unknown outcome under it, or minted it itself. A
@@ -903,6 +909,7 @@ pub fn create_request(
     cwd: Option<&str>,
     provider: Option<&str>,
     prompt: Option<&str>,
+    title: Option<&str>,
     request_id: Option<&str>,
 ) -> Result<shed_core::lane::LaneCreateRequest, CrazeFailure> {
     let cwd = cwd.map(str::trim).unwrap_or_default();
@@ -920,16 +927,17 @@ pub fn create_request(
         }
         None => shed_craze::new_request_id(),
     };
+    let trimmed = |s: Option<&str>| {
+        s.map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    };
     Ok(shed_core::lane::LaneCreateRequest {
         cwd: cwd.to_string(),
-        provider: provider
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(str::to_string),
+        provider: trimmed(provider),
         prompt: prompt.filter(|s| !s.trim().is_empty()).map(str::to_string),
         request_id,
-        // C4 (plan 029 D14) fills this from the sheet's "Name (optional)".
-        title: None,
+        title: trimmed(title),
     })
 }
 
@@ -1348,12 +1356,14 @@ mod tests {
             Some("relative/dir"),
             Some("~/w"),
         ] {
-            let e = create_request(bad, None, None, None).unwrap_err();
+            let e = create_request(bad, None, None, None, None).unwrap_err();
             assert_eq!(e.code, "bad_request", "{bad:?}");
         }
-        let r = create_request(Some(" /w/x "), Some("  "), Some(" \n "), None).unwrap();
+        let r =
+            create_request(Some(" /w/x "), Some("  "), Some(" \n "), Some(" \t "), None).unwrap();
         assert_eq!(r.cwd, "/w/x");
         assert_eq!((r.provider, r.prompt), (None, None));
+        assert_eq!(r.title, None, "a blank title is absent, never sent empty");
         assert!(
             shed_craze::valid_request_id(&r.request_id),
             "{}",
@@ -1363,11 +1373,13 @@ mod tests {
             Some("/w"),
             Some("grok"),
             Some("two\nlines\n"),
+            Some("  Fix the login bug "),
             Some("shed-abc"),
         )
         .unwrap();
         assert_eq!(r.provider.as_deref(), Some("grok"));
         assert_eq!(r.prompt.as_deref(), Some("two\nlines\n"), "as typed");
+        assert_eq!(r.title.as_deref(), Some("Fix the login bug"), "trimmed");
         assert_eq!(r.request_id, "shed-abc", "a caller's id is kept");
         // A PRESENT id that is not craze's form is refused — blank and empty
         // included — never replaced by a fresh one (a retry under it would
@@ -1379,7 +1391,7 @@ mod tests {
             " shed-abc",
             "x".repeat(65).as_str(),
         ] {
-            let e = create_request(Some("/w"), None, None, Some(bad)).unwrap_err();
+            let e = create_request(Some("/w"), None, None, None, Some(bad)).unwrap_err();
             assert_eq!(e.code, "bad_request", "{bad:?}");
         }
     }
@@ -1464,7 +1476,8 @@ mod tests {
         seed(&mut s, 1, &[]);
         assert_eq!(
             s.status(),
-            json!({"state": "live", "cause": null, "create": true, "create_options": true})
+            json!({"state": "live", "cause": null, "create": true, "create_options": true,
+                   "create_title": true})
         );
     }
 }

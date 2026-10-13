@@ -15,6 +15,7 @@ import {
   OUTCOME_UNKNOWN_NOTE,
   beginSubmit,
   closesOntoTranscript,
+  createTitle,
   crazeCreateGate,
   crazeCreateOffered,
   crazeCreateTargets,
@@ -34,6 +35,7 @@ import {
   replaysHeldRequest,
   settle,
   sheetOnScreen,
+  titleFieldShown,
 } from "../dist-test/crazeCreate.js";
 
 /** craze's own createOptions on the recipe rig (cursor missing, native with no
@@ -155,6 +157,87 @@ test("an edit mints a new id and clears the settled outcome, not the form", () =
   // A submission in flight is not edited.
   const flying = beginSubmit(d, minted);
   assert.equal(edit(flying, { cwd: "/elsewhere" }), flying);
+});
+
+// ---- "Name (optional)" (plan 029 D14, P10, P11) -----------------------------
+
+test("the title is part of the draft: empty in a fresh one, never cleared by an outcome", () => {
+  assert.equal(EMPTY_DRAFT.title, "");
+  let d = edit({ ...EMPTY_DRAFT, provider: "grok", cwd: "/w" }, { title: "Fix the login bug" });
+  assert.equal(d.title, "Fix the login bug");
+  for (const outcome of [
+    { ok: false, refusal: { code: "outcome_unknown", message: "lost" } },
+    { ok: false, refusal: { code: "bad_request", message: "params.title is blank once normalized: send none instead" } },
+    { ok: true },
+  ]) {
+    d = settle(beginSubmit(d, minted), outcome);
+    assert.equal(d.title, "Fix the login bug", JSON.stringify(outcome));
+  }
+});
+
+test("CONTROL: a blank title is omitted — never sent empty — and a real one goes trimmed", () => {
+  for (const blank of ["", "   ", "\t \n"]) {
+    assert.equal(createTitle({ title: blank }), undefined, JSON.stringify(blank));
+  }
+  assert.equal(createTitle({ title: "  Fix the login bug " }), "Fix the login bug");
+  assert.equal(createTitle({ title: "a  b" }), "a  b", "inner spacing is craze's to normalize");
+});
+
+test("CONTROL: the held request keeps the EXACT title — the retry sends what the first send did", () => {
+  let d = edit({ ...EMPTY_DRAFT, provider: "grok", cwd: "/w" }, { title: " Named " });
+  d = beginSubmit(d, minted);
+  const id = d.requestId;
+  const sent = createTitle(d);
+  d = settle(d, { ok: false, refusal: { code: "outcome_unknown", message: "outcome unknown: lost twice" } });
+  assert.equal(replaysHeldRequest(d), true);
+  d = beginSubmit(d, minted);
+  assert.equal(d.requestId, id, "the same request");
+  assert.equal(createTitle(d), sent, "the same title, never stripped to make the retry work");
+  assert.equal(sent, "Named");
+});
+
+test("CONTROL: a title edit mints a new id — another request now — and ends a held replay", () => {
+  let d = settle(beginSubmit(edit({ ...EMPTY_DRAFT, provider: "grok", cwd: "/w" }, { title: "one" }), minted), {
+    ok: false,
+    refusal: { code: "outcome_unknown", message: "lost" },
+  });
+  assert.ok(d.requestId);
+  d = edit(d, { title: "two" });
+  assert.equal(d.requestId, null, "a new id next time");
+  assert.equal(d.phase, "idle");
+  assert.equal(replaysHeldRequest(d), false);
+  assert.equal(d.title, "two");
+  const same = { ...d, requestId: "kept" };
+  assert.equal(edit(same, { title: "two" }), same, "the same title is no edit");
+});
+
+test("the Name field shows on a hub that can take a title — or while one is typed", () => {
+  const live = (create_title) => ({ state: "live", create: true, create_options: true, create_title });
+  assert.equal(titleFieldShown(live(true), { title: "" }), true);
+  assert.equal(titleFieldShown(live(false), { title: "" }), false, "an older hub: no field");
+  assert.equal(titleFieldShown({ state: "dormant", create: false, create_options: false, create_title: false }, { title: "" }),
+    false, "dormant: the field comes once the hub is live (P10)");
+  assert.equal(titleFieldShown(null, { title: "" }), false);
+  assert.equal(titleFieldShown({ state: "offline", cause: "unreachable" }, { title: "kept" }), true,
+    "a typed title that would be sent is never out of sight");
+  assert.equal(titleFieldShown(live(false), { title: "  " }), false);
+});
+
+test("CONTROL: a bad_request about the title shows under Name (fixture 32's wording); others as before", () => {
+  for (const message of [
+    "params.title is blank once normalized: send none instead",
+    "params.title must not be empty",
+  ]) {
+    assert.deepEqual(refusalView({ code: "bad_request", message }), { where: "title", text: message });
+  }
+  assert.equal(refusalView({ code: "bad_request", message: "cwd /home/me/title is no directory" }).where, "cwd",
+    "a path that says title is still the directory's");
+  assert.equal(
+    refusalView({ code: "bad_request", message: "requestId fixture-32-a was used already for a create with other params" }).where,
+    "general",
+    "request_conflict stays an internal error",
+  );
+  assert.equal(refusalView({ code: "failed", message: "params.title" }).where, "cause", "only a bad_request moves");
 });
 
 // ---- a held request, replayed (plan 026 §3.1) ------------------------------

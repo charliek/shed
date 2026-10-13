@@ -19,6 +19,7 @@ mod roost_hosts;
 mod screenshot;
 mod shutdown;
 mod single_instance;
+mod slash;
 mod state;
 mod termctl;
 mod tray;
@@ -26,6 +27,8 @@ mod updater;
 
 #[cfg(test)]
 mod launch_command_tests;
+#[cfg(test)]
+mod slash_command_tests;
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -667,6 +670,62 @@ async fn lane_set(
         .map_err(lane_error)
 }
 
+/// `lane_set_title` — rename the SESSION (plan 029 D12), the twin of the
+/// `lane.set_title` socket op: the composer's `/rename <title>`. `{}`, or
+/// `{warning}` ([`lane::renamed`]); every refusal crosses with its code.
+#[tauri::command]
+async fn lane_set_title(
+    lanes: tauri::State<'_, Arc<lane::Lanes>>,
+    machine: String,
+    kind: String,
+    session_id: String,
+    title: String,
+) -> Result<serde_json::Value, String> {
+    lanes
+        .set_title(&machine, &kind, &session_id, &title)
+        .await
+        .map_err(lane_error)
+}
+
+// -- the composer's `/` menu (plan 029 §3.6 D12): pure, see [`slash`] --------
+
+/// `lane_slash_filter` — what the menu panel shows for `draft` with the caret
+/// at `caret` (UTF-16 code units): `{open, token, rows: [{row, dimmed}]}`.
+#[tauri::command]
+fn lane_slash_filter(
+    menu: serde_json::Value,
+    draft: String,
+    caret: u32,
+    activity: Option<String>,
+) -> Result<serde_json::Value, String> {
+    slash::filter(menu, &draft, caret, activity.as_deref()).map_err(lane_error)
+}
+
+/// `lane_slash_dispatch` — what sending `draft` does: `not_command`,
+/// `prompt {text}`, `run {action, arg?}` or `refuse {reason}`.
+#[tauri::command]
+fn lane_slash_dispatch(
+    menu: serde_json::Value,
+    draft: String,
+    activity: Option<String>,
+) -> Result<serde_json::Value, String> {
+    slash::dispatch(menu, &draft, activity.as_deref()).map_err(lane_error)
+}
+
+/// `lane_slash_accept` — what choosing the menu row `row` with `key`
+/// (`enter` | `tab` | `pick`) does: `complete {draft, caret}`, `dispatch
+/// {dispatch}`, or `null` (nothing to accept: re-filter).
+#[tauri::command]
+fn lane_slash_accept(
+    menu: serde_json::Value,
+    draft: String,
+    row: String,
+    key: String,
+    activity: Option<String>,
+) -> Result<serde_json::Value, String> {
+    slash::accept(menu, &draft, &row, &key, activity.as_deref()).map_err(lane_error)
+}
+
 /// `lane_answer` — resolve one approval. See [`lane::parse_answer`] for the
 /// three shapes `answer` takes.
 #[tauri::command]
@@ -719,16 +778,19 @@ async fn craze_create_options(
 
 /// `craze_create` — a new craze session; `request_id` is the sheet's own
 /// (reused only while the last outcome is unknown), and `held` says this
-/// submission REPLAYS it (plan 026 §3.1). Read through
-/// [`craze::create_request`] and [`craze::held_create`], the socket door's
-/// one reading.
+/// submission REPLAYS it (plan 026 §3.1). `title` is the sheet's "Name
+/// (optional)" (plan 029 D14; blank is absent), kept exactly with a held
+/// request. Read through [`craze::create_request`] and
+/// [`craze::held_create`], the socket door's one reading.
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
 async fn craze_create(
     machines: tauri::State<'_, Arc<roost_hosts::RoostHosts>>,
     machine: String,
     cwd: Option<String>,
     provider: Option<String>,
     prompt: Option<String>,
+    title: Option<String>,
     request_id: Option<String>,
     held: Option<bool>,
 ) -> Result<serde_json::Value, String> {
@@ -738,6 +800,7 @@ async fn craze_create(
         cwd.as_deref(),
         provider.as_deref(),
         prompt.as_deref(),
+        title.as_deref(),
         request_id.as_deref(),
     )
     .map_err(|f| f.command_string())?;
@@ -1363,6 +1426,10 @@ pub fn run() {
             lane_stop,
             lane_settings,
             lane_set,
+            lane_set_title,
+            lane_slash_filter,
+            lane_slash_dispatch,
+            lane_slash_accept,
             craze_create_options,
             craze_create,
             craze_open_terminal,

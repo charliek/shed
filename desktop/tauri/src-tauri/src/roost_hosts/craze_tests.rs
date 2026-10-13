@@ -1095,8 +1095,14 @@ const HOST_NEW: &str = "cccccccccccc";
 
 /// A create request the scripted hub answers.
 fn create_req(id: &str) -> LaneCreateRequest {
-    crate::craze::create_request(Some("/work/new"), Some("grok"), Some("hello"), Some(id))
-        .expect("a well-formed request")
+    crate::craze::create_request(
+        Some("/work/new"),
+        Some("grok"),
+        Some("hello"),
+        None,
+        Some(id),
+    )
+    .expect("a well-formed request")
 }
 
 /// `session.create`'s result for [`HOST_NEW`], its provider session `psid`.
@@ -2306,7 +2312,8 @@ async fn a_dormant_shed_is_offered_not_listed() {
         vec![
             json!({"name": SHED, "label": "s1", "origin": SHED, "kind": "shed",
                     "craze": {"state": "dormant", "cause": null,
-                              "create": false, "create_options": false}})
+                              "create": false, "create_options": false,
+                              "create_title": false}})
         ]
     );
 

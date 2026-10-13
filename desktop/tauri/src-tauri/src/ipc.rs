@@ -381,11 +381,12 @@ fn launch_door(
 /// Filling a person's sheet and pressing Create for them is nothing a shipped
 /// app needs; the production door onto the same backend is `craze.create`.
 ///
-/// `ui.fill_craze_create {provider?, cwd?, prompt?, recent?}` sets those
-/// controls the way a person would (an absent key is left as it is): `provider`
-/// clicks that provider's row (a dimmed one refuses the click, as it refuses a
-/// pointer), `cwd` and `prompt` type into their fields, and `recent: <n>` taps
-/// the n-th recent-directory chip. `ui.submit_craze_create` presses the sheet's
+/// `ui.fill_craze_create {provider?, cwd?, title?, prompt?, recent?}` sets
+/// those controls the way a person would (an absent key is left as it is):
+/// `provider` clicks that provider's row (a dimmed one refuses the click, as it
+/// refuses a pointer), `cwd`, `title` ("Name (optional)", plan 029 D14) and
+/// `prompt` type into their fields, and `recent: <n>` taps the n-th
+/// recent-directory chip. `ui.submit_craze_create` presses the sheet's
 /// primary button — Create, or Try again — through the button's own gate.
 fn craze_create_door(
     env: &Env,
@@ -398,7 +399,7 @@ fn craze_create_door(
     match op {
         "ui.fill_craze_create" => {
             let mut fill = serde_json::Map::new();
-            for key in ["provider", "cwd", "prompt"] {
+            for key in ["provider", "cwd", "title", "prompt"] {
                 match params.get(key) {
                     None | Some(Value::Null) => {}
                     Some(Value::String(s)) => {
@@ -474,9 +475,95 @@ fn hold_view_door(env: &Env, params: &Value) -> Result<Value, (String, String)> 
     if !env.test_mode {
         return Err(err("not_enabled", "ui.hold_lane_view requires test mode"));
     }
-    match params.get("hold") {
-        Some(Value::Bool(hold)) => Ok(json!({ "hold": hold })),
-        _ => Err(err("bad_request", "'hold' must be true or false")),
+    Ok(json!({ "hold": req_bool(params, "hold")? }))
+}
+
+/// The keys `ui.key_lane_composer` presses — the ones the composer's `/` menu
+/// and its Send handle (plan 029 P9). A closed set, so a typo (`Esc`) is a
+/// refusal rather than a key the composer silently ignores: a cell asserting
+/// "nothing happened" must not pass because nothing was pressed.
+const COMPOSER_KEYS: [&str; 5] = ["Enter", "Tab", "Escape", "ArrowUp", "ArrowDown"];
+
+/// The one gate + router behind the transcript composer's driver doors (plan
+/// 029 D13): the event name and payload to emit, or the refusal.
+///
+/// **TEST-MODE ONLY**, [`craze_create_door`]'s rule and for its reason: the
+/// `/` menu is reachable only by typing into the composer and pressing keys —
+/// what a harness has no keyboard for — while `lane.dump`'s `slash_menu` (the
+/// panel's own rendered truth) is what proves it. The production doors onto
+/// the same backend are the lane verbs (`lane.send`, `lane.set`,
+/// `lane.set_title`, `lane.stop`).
+///
+/// * `ui.type_lane_composer {text}` — the composer's draft becomes `text`, the
+///   caret at its end, as if typed (an empty `text` clears it).
+/// * `ui.key_lane_composer {key, shift?, composing?}` — a REAL `keydown`
+///   (`KeyboardEvent`, P27) dispatched on the composer's textarea: `key` one
+///   of [`COMPOSER_KEYS`], `shift` its Shift, `composing` an IME composition
+///   in progress (`isComposing`). The browser's own default for an Enter the
+///   composer did not take — a newline — is applied by the door, since a
+///   synthetic event carries none.
+/// * `ui.pick_slash_row {name}` — a click on the open menu's row named
+///   `name`, through the menu's own gate (a row it does not list takes none).
+/// * `ui.answer_lane_stop {stop}` — a click on the open Stop confirm's
+///   buttons: `true` is Stop session, `false` is Keep (the confirm `/exit`
+///   opens, §3.5: Keep sends nothing and keeps the draft). Nothing while no
+///   confirm is open.
+fn composer_door(
+    env: &Env,
+    op: &str,
+    params: &Value,
+) -> Result<(&'static str, Value), (String, String)> {
+    if !env.test_mode {
+        return Err(err("not_enabled", format!("{op} requires test mode")));
+    }
+    match op {
+        "ui.type_lane_composer" => {
+            let text = req_str(params, "text")?;
+            Ok(("type-lane-composer", json!({ "text": text })))
+        }
+        "ui.key_lane_composer" => {
+            let key = req_str(params, "key")?;
+            if !COMPOSER_KEYS.contains(&key) {
+                return Err(err(
+                    "bad_request",
+                    format!(
+                        "unknown composer key {key:?} ({})",
+                        COMPOSER_KEYS.join(" | ")
+                    ),
+                ));
+            }
+            Ok((
+                "key-lane-composer",
+                json!({ "key": key, "shift": opt_bool(params, "shift")?,
+                        "composing": opt_bool(params, "composing")? }),
+            ))
+        }
+        "ui.pick_slash_row" => {
+            let name = req_str(params, "name")?;
+            if name.is_empty() {
+                return Err(err("bad_request", "'name' names a menu row"));
+            }
+            Ok(("pick-slash-row", json!({ "name": name })))
+        }
+        "ui.answer_lane_stop" => Ok((
+            "answer-lane-stop",
+            json!({ "stop": req_bool(params, "stop")? }),
+        )),
+        other => Err(err("unknown_op", format!("{other} is not a composer door"))),
+    }
+}
+
+/// `lane.dump`'s `lane`: the transcript panel's report with its composer's
+/// (`draft`, `slash_menu`) joined in. The panel reports the composer apart so
+/// a keystroke re-sends a few fields rather than the whole transcript; no
+/// panel (`lane` absent or `null`) is `null`, whatever the composer said last.
+fn lane_report(lane: Option<Value>, composer: Option<Value>) -> Value {
+    match (lane, composer) {
+        (Some(Value::Object(mut lane)), Some(Value::Object(composer))) => {
+            lane.extend(composer);
+            Value::Object(lane)
+        }
+        (lane, _) => lane.unwrap_or(Value::Null),
     }
 }
 
@@ -491,11 +578,7 @@ fn report_history_door(env: &Env, params: &Value) -> Result<bool, (String, Strin
     if !env.test_mode {
         return Err(err("not_enabled", "ui.report_history requires test mode"));
     }
-    match params.get("clear") {
-        None | Some(Value::Null) => Ok(false),
-        Some(Value::Bool(clear)) => Ok(*clear),
-        Some(_) => Err(err("bad_request", "'clear' must be true or false")),
-    }
+    opt_bool(params, "clear")
 }
 
 /// The gate behind `app.quit` (plan 026 §3.3): the tray's Quit, drivable.
@@ -592,6 +675,23 @@ fn opt_str<'a>(params: &'a Value, key: &str) -> Result<Option<&'a str>, (String,
     }
 }
 
+/// An OPTIONAL bool param: absent or `null` is `false`; anything but a bool is
+/// `bad_request` — never read as absent.
+fn opt_bool(params: &Value, key: &str) -> Result<bool, (String, String)> {
+    match params.get(key) {
+        None | Some(Value::Null) => Ok(false),
+        _ => req_bool(params, key),
+    }
+}
+
+/// A REQUIRED bool param, or `bad_request`.
+fn req_bool(params: &Value, key: &str) -> Result<bool, (String, String)> {
+    params
+        .get(key)
+        .and_then(Value::as_bool)
+        .ok_or_else(|| err("bad_request", format!("'{key}' must be true or false")))
+}
+
 /// `craze.create`'s request from the socket's params: every field TYPED
 /// ([`opt_str`]) — a `request_id: 7` is `bad_request`, not an absent id that
 /// [`crate::craze::create_request`] would replace with a fresh one, which would
@@ -604,6 +704,7 @@ fn craze_create_request(
         opt_str(params, "cwd")?,
         opt_str(params, "provider")?,
         opt_str(params, "prompt")?,
+        opt_str(params, "title")?,
         opt_str(params, "request_id")?,
     )
     .map_err(craze_err)
@@ -614,12 +715,8 @@ fn craze_create_request(
 /// `bad_request` — and, set, it needs the `request_id` it replays
 /// ([`crate::craze::held_create`]).
 fn craze_create_held(params: &Value) -> Result<bool, (String, String)> {
-    let held = match params.get("held") {
-        None | Some(Value::Null) => false,
-        Some(Value::Bool(b)) => *b,
-        Some(_) => return Err(err("bad_request", "'held' must be true or false")),
-    };
-    crate::craze::held_create(held, opt_str(params, "request_id")?).map_err(craze_err)
+    crate::craze::held_create(opt_bool(params, "held")?, opt_str(params, "request_id")?)
+        .map_err(craze_err)
 }
 
 /// A craze op's refusal as the IPC error envelope ([`crate::craze::CrazeFailure`]).
@@ -960,6 +1057,17 @@ impl Handler {
                 let _ = self.app.emit("pick-lane-setting", payload);
                 Ok(json!({}))
             }
+            // The composer's typing, key, menu-click and Stop-confirm doors
+            // (plan 029 D13) — TEST-MODE ONLY, see [`composer_door`]. They act
+            // on a transcript panel that is already open.
+            "ui.type_lane_composer"
+            | "ui.key_lane_composer"
+            | "ui.pick_slash_row"
+            | "ui.answer_lane_stop" => {
+                let (event, payload) = composer_door(&self.env, op, params)?;
+                let _ = self.app.emit(event, payload);
+                Ok(json!({}))
+            }
             // The transcript panel's view hold — TEST-MODE ONLY, see
             // [`hold_view_door`].
             "ui.hold_lane_view" => {
@@ -1051,6 +1159,7 @@ impl Handler {
             "lane.stop" => self.lane_stop(params).await,
             "lane.settings" => self.lane_settings(params).await,
             "lane.set" => self.lane_set(params).await,
+            "lane.set_title" => self.lane_set_title(params).await,
             "lane.dump" => Ok(self.lane_dump()),
             "lane_settings.dump" => Ok(self.lane_settings_dump()),
             "craze.create_options" => self.craze_create_options(params).await,
@@ -1784,9 +1893,9 @@ impl Handler {
     }
 
     /// `lane.messages {machine, kind, session_id}` → `{messages, activity,
-    /// generation, stale, ended, capabilities, settings}` — the
+    /// generation, stale, ended, capabilities, settings, slash_menu}` — the
     /// staged-then-swapped view, never a half-seeded one, and the one place a
-    /// client reads what the session can do.
+    /// client reads what the session can do (its `/` menu included, resolved).
     fn lane_messages(&self, params: &Value) -> Result<Value, (String, String)> {
         let (machine, kind, session_id) = lane_target(params)?;
         self.lanes
@@ -1867,6 +1976,22 @@ impl Handler {
             .map_err(lane_err)
     }
 
+    /// `lane.set_title {machine, kind, session_id, title}` → `{}`, or
+    /// `{warning}` — rename the session (plan 029 D4/D12, craze's
+    /// `session.setTitle`). The title is trimmed and a blank one is
+    /// `bad_request`, unsent. The new title arrives on the stream (the
+    /// session row, `lane.messages`' `session.title`). `{warning}` is a rename
+    /// that TOOK and craze could not record (`index_write`): a success, never
+    /// a failure; an answer lost to a drop is `outcome_unknown`, never resent.
+    async fn lane_set_title(&self, params: &Value) -> Result<Value, (String, String)> {
+        let (machine, kind, session_id) = lane_target(params)?;
+        let title = req_str(params, "title")?.to_string();
+        self.lanes
+            .set_title(&machine, &kind, &session_id, &title)
+            .await
+            .map_err(lane_err)
+    }
+
     /// `lane.answer {machine, kind, session_id, approval_id, answer}` → `{}`.
     ///
     /// `answer` is one of `{choice: "<option id>"}` (the offered option, by its
@@ -1902,7 +2027,7 @@ impl Handler {
     /// clears the key on unmount — so absence here means "no panel", which is
     /// exactly the question a caller is asking.
     fn lane_dump(&self) -> Value {
-        json!({ "lane": self.ui_get("lane").unwrap_or(Value::Null) })
+        json!({ "lane": lane_report(self.ui_get("lane"), self.ui_get("lane_composer")) })
     }
 
     /// `lane_settings.dump` → what the settings SHEET rendered (UI truth, the
@@ -1933,7 +2058,8 @@ impl Handler {
             .map_err(craze_err)
     }
 
-    /// `craze.create {machine, cwd, provider?, prompt?, request_id?, held?}` →
+    /// `craze.create {machine, cwd, provider?, prompt?, title?, request_id?,
+    /// held?}` →
     /// `{session, host_id, prompt, prompt_error?, request_id}`: a new craze
     /// session, its row folded into the machine's listing at once. `cwd` must
     /// be absolute; a blank provider or prompt is absent
@@ -3064,11 +3190,29 @@ mod tests {
             let minted = craze_create_request(&absent).unwrap().request_id;
             assert!(minted.starts_with("shed-"), "{minted}");
         }
-        for key in ["cwd", "provider", "prompt"] {
+        for key in ["cwd", "provider", "prompt", "title"] {
             assert_eq!(
                 craze_create_request(&with(key, json!(7))).unwrap_err().0,
                 "bad_request",
                 "{key}: not a string"
+            );
+        }
+        // The sheet's "Name (optional)" (plan 029 D14): trimmed, and a blank
+        // one is absent — never sent empty.
+        assert_eq!(
+            craze_create_request(&with("title", json!("  Fix the login bug ")))
+                .unwrap()
+                .title
+                .as_deref(),
+            Some("Fix the login bug")
+        );
+        for blank in [json!(""), json!(" \t "), Value::Null] {
+            assert_eq!(
+                craze_create_request(&with("title", blank.clone()))
+                    .unwrap()
+                    .title,
+                None,
+                "{blank}"
             );
         }
     }
@@ -3106,7 +3250,8 @@ mod tests {
     /// is a bad request.
     #[test]
     fn the_craze_create_doors_are_test_mode_only() {
-        let fill = json!({ "provider": "grok", "cwd": "/w", "prompt": "two\nlines", "recent": 1 });
+        let fill = json!({ "provider": "grok", "cwd": "/w", "title": " Fix it ", "prompt": "two\nlines",
+                           "recent": 1 });
         let mut prod = env(None);
         prod.test_mode = false;
         for op in ["ui.fill_craze_create", "ui.submit_craze_create"] {
@@ -3131,6 +3276,7 @@ mod tests {
         );
         for bad in [
             json!({ "prompt": 7 }),
+            json!({ "title": false }),
             json!({ "recent": -1 }),
             json!({ "recent": "0" }),
         ] {
@@ -3142,6 +3288,127 @@ mod tests {
                 "{bad}"
             );
         }
+    }
+
+    /// **The composer's driver doors are test-mode only** (plan 029 D13), the
+    /// craze create doors' rule; in test mode each routes to its event: the
+    /// typed text verbatim (an empty one clears), a key from the composer's
+    /// closed set with its Shift and IME flags (absent is `false`), a row by
+    /// name, the Stop confirm's answer. A key outside the set — a typo — and a wrong type are refused,
+    /// so no cell can pass on a key that was never pressed.
+    #[test]
+    fn the_composer_doors_are_test_mode_only() {
+        let mut prod = env(None);
+        prod.test_mode = false;
+        for (op, params) in [
+            ("ui.type_lane_composer", json!({ "text": "/re" })),
+            ("ui.key_lane_composer", json!({ "key": "Enter" })),
+            ("ui.pick_slash_row", json!({ "name": "rename" })),
+            ("ui.answer_lane_stop", json!({ "stop": false })),
+        ] {
+            let (code, message) = composer_door(&prod, op, &params)
+                .expect_err("a driver door must not be reachable in a shipped app");
+            assert_eq!(code, "not_enabled", "{op}");
+            assert!(message.contains(op), "{message}");
+        }
+
+        let test = env(None);
+        for text in ["/rename  a  b ", "", "two\nlines"] {
+            assert_eq!(
+                composer_door(&test, "ui.type_lane_composer", &json!({ "text": text })).unwrap(),
+                ("type-lane-composer", json!({ "text": text })),
+                "verbatim"
+            );
+        }
+        for key in COMPOSER_KEYS {
+            assert_eq!(
+                composer_door(&test, "ui.key_lane_composer", &json!({ "key": key })).unwrap(),
+                (
+                    "key-lane-composer",
+                    json!({ "key": key, "shift": false, "composing": false })
+                )
+            );
+        }
+        assert_eq!(
+            composer_door(
+                &test,
+                "ui.key_lane_composer",
+                &json!({ "key": "Enter", "shift": true, "composing": null })
+            )
+            .unwrap(),
+            (
+                "key-lane-composer",
+                json!({ "key": "Enter", "shift": true, "composing": false })
+            )
+        );
+        assert_eq!(
+            composer_door(
+                &test,
+                "ui.key_lane_composer",
+                &json!({ "key": "Escape", "composing": true })
+            )
+            .unwrap()
+            .1["composing"],
+            true
+        );
+        assert_eq!(
+            composer_door(&test, "ui.pick_slash_row", &json!({ "name": "rename" })).unwrap(),
+            ("pick-slash-row", json!({ "name": "rename" }))
+        );
+        for stop in [true, false] {
+            assert_eq!(
+                composer_door(&test, "ui.answer_lane_stop", &json!({ "stop": stop })).unwrap(),
+                ("answer-lane-stop", json!({ "stop": stop }))
+            );
+        }
+        for (op, bad) in [
+            ("ui.type_lane_composer", json!({})),
+            ("ui.type_lane_composer", json!({ "text": 7 })),
+            ("ui.key_lane_composer", json!({})),
+            ("ui.key_lane_composer", json!({ "key": "Esc" })),
+            ("ui.key_lane_composer", json!({ "key": "enter" })),
+            (
+                "ui.key_lane_composer",
+                json!({ "key": "Enter", "shift": "yes" }),
+            ),
+            (
+                "ui.key_lane_composer",
+                json!({ "key": "Enter", "composing": 1 }),
+            ),
+            ("ui.pick_slash_row", json!({})),
+            ("ui.pick_slash_row", json!({ "name": "" })),
+            ("ui.pick_slash_row", json!({ "name": ["rename"] })),
+            ("ui.answer_lane_stop", json!({})),
+            ("ui.answer_lane_stop", json!({ "stop": "yes" })),
+        ] {
+            assert_eq!(
+                composer_door(&test, op, &bad)
+                    .expect_err("not a door call")
+                    .0,
+                "bad_request",
+                "{op} {bad}"
+            );
+        }
+    }
+
+    /// **`lane.dump` joins the composer's report into the panel's**: its
+    /// fields beside the transcript's, and no panel is `null` even with a
+    /// composer report left over.
+    #[test]
+    fn the_lane_dump_joins_the_composer_report() {
+        let lane = json!({ "session_id": "s1", "rows": [] });
+        let composer = json!({ "draft": "/re", "slash_menu": null });
+        assert_eq!(
+            lane_report(Some(lane.clone()), Some(composer.clone())),
+            json!({ "session_id": "s1", "rows": [], "draft": "/re", "slash_menu": null })
+        );
+        assert_eq!(lane_report(Some(lane.clone()), None), lane);
+        assert_eq!(lane_report(Some(lane.clone()), Some(Value::Null)), lane);
+        assert_eq!(
+            lane_report(Some(Value::Null), Some(composer.clone())),
+            Value::Null
+        );
+        assert_eq!(lane_report(None, Some(composer)), Value::Null);
     }
 
     /// **The settings sheet's press door is test-mode only** (plan 025 C11),
